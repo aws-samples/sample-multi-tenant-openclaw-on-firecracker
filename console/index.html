@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OpenClaw Management Console</title>
+<link rel="stylesheet" href="style.css">
+<script src="config.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+</head>
+<body x-data="app()" x-init="init()">
+
+<!-- Header -->
+<div class="header">
+  <h1>OpenClaw Management Console</h1>
+  <span class="status-dot" :class="connected ? 'ok' : 'err'"></span>
+  <span class="status-label" x-text="connected ? 'Connected' : 'Disconnected'"></span>
+  <input type="text" x-model="apiUrl" @change="saveSettings(); refresh()" placeholder="https://api.example.com/v1/">
+  <input type="password" x-model="apiKey" @change="saveSettings(); refresh()" placeholder="🔒 API Key" style="width:200px">
+</div>
+
+<!-- Main -->
+<div class="main">
+
+  <!-- Hosts -->
+  <div class="hosts-panel">
+    <div class="panel-header">
+      <span class="panel-title">Hosts</span>
+      <button class="btn-icon" @click="loadHosts()">
+        <span :class="loadingHosts && 'spin'">⟳</span>
+      </button>
+    </div>
+    <template x-if="hosts.length === 0 && !loadingHosts">
+      <div class="empty">No hosts</div>
+    </template>
+    <template x-for="h in hosts" :key="h.instance_id">
+      <div class="host-card" :class="selectedHost === h.instance_id && 'selected'"
+           @click="selectedHost = selectedHost === h.instance_id ? null : h.instance_id">
+        <div class="host-top">
+          <span class="host-id" x-text="h.instance_id"></span>
+          <span class="badge" :class="h.status==='active' ? 'badge-active' : 'badge-inactive'" x-text="h.status"></span>
+          <button class="btn-icon" style="font-size:16px" @click="loadHosts()">⟳</button>
+        </div>
+        <div class="host-row">
+          <span class="host-label">CPU</span>
+          <div class="bar-bg"><div class="bar-fill bar-cpu" :style="'width:'+cpuPct(h)+'%'"></div></div>
+          <span class="host-val" x-text="h.used_vcpu+'/'+h.total_vcpu"></span>
+        </div>
+        <div class="host-row">
+          <span class="host-label">Mem</span>
+          <div class="bar-bg"><div class="bar-fill bar-mem" :style="'width:'+memPct(h)+'%'"></div></div>
+          <span class="host-val" x-text="h.used_mem_mb+' MB'"></span>
+        </div>
+        <div class="host-row">
+          <span class="host-label">VM</span>
+          <span style="color:#fff" x-text="h.vm_count"></span>
+        </div>
+      </div>
+    </template>
+  </div>
+
+  <!-- Tenants -->
+  <div class="tenants-panel">
+    <div class="panel-header">
+      <span class="panel-title">Tenants <template x-if="selectedHost"><span style="font-size:12px;color:var(--cyan-dim)">— <span x-text="selectedHost"></span> <button class="btn-icon" @click="selectedHost=null" style="font-size:12px">✕</button></span></template></span>
+      <div style="display:flex;gap:10px;align-items:center">
+        <button class="btn btn-cyan" @click="showModal=true">New Tenant</button>
+        <button class="btn-icon" @click="loadTenants()">
+          <span :class="loadingTenants && 'spin'">⟳</span>
+        </button>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th><th>Name</th><th>vCPU</th><th>Mem (MB)</th><th>Guest IP</th>
+            <th>Port</th><th>Host ID</th><th>VM Health</th><th>App Health</th><th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          <template x-if="filteredTenants.length === 0 && !loadingTenants">
+            <tr><td colspan="10" class="empty">No tenants</td></tr>
+          </template>
+          <template x-for="t in filteredTenants" :key="t.id">
+            <tr>
+              <td x-text="t.id"></td>
+              <td x-text="t.name || '-'"></td>
+              <td x-text="t.vcpu"></td>
+              <td x-text="t.mem_mb"></td>
+              <td x-text="t.guest_ip || '-'"></td>
+              <td x-text="t.host_port || '-'"></td>
+              <td x-text="(t.host_id||'').substring(0,12)+'…'"></td>
+              <td><span class="health-dot" :class="healthClass(t.vm_health)"></span></td>
+              <td><span class="health-dot" :class="healthClass(t.app_health)"></span></td>
+              <td><button class="btn-del" @click="deleteTenant(t.id)">🗑</button></td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- Create Tenant Modal -->
+<template x-if="showModal">
+  <div class="overlay" @click.self="showModal=false">
+    <div class="modal">
+      <button class="close-btn" @click="showModal=false">✕</button>
+      <h2>New Tenant</h2>
+      <label>Name <span class="req">*</span></label>
+      <input type="text" x-model="form.name" placeholder="e.g. my-tenant" @keydown.enter="createTenant()">
+      <label>vCPU <span class="opt">optional</span></label>
+      <input type="number" x-model.number="form.vcpu" placeholder="2">
+      <label>Memory (MB) <span class="opt">optional</span></label>
+      <input type="number" x-model.number="form.memory_mb" placeholder="4096">
+      <div class="modal-actions">
+        <button class="btn btn-cyan" @click="showModal=false">Cancel</button>
+        <button class="btn btn-create" @click="createTenant()" :disabled="!form.name">Create</button>
+      </div>
+    </div>
+  </div>
+</template>
+
+<script>
+function app() {
+  return {
+    apiUrl: '', apiKey: '', connected: false,
+    hosts: [], tenants: [], selectedHost: null,
+    loadingHosts: false, loadingTenants: false,
+    showModal: false,
+    form: { name: '', vcpu: null, memory_mb: null },
+
+    init() {
+      this.apiUrl = localStorage.getItem('oc_api_url') || window.OC_DEFAULT_API_URL || '';
+      this.apiKey = localStorage.getItem('oc_api_key') || window.OC_DEFAULT_API_KEY || '';
+      if (this.apiUrl && this.apiKey) this.refresh();
+    },
+    saveSettings() {
+      localStorage.setItem('oc_api_url', this.apiUrl);
+      localStorage.setItem('oc_api_key', this.apiKey);
+    },
+    async api(method, path, body) {
+      const url = this.apiUrl.replace(/\/+$/, '') + '/' + path.replace(/^\/+/, '');
+      const opts = { method, headers: { 'x-api-key': this.apiKey, 'Content-Type': 'application/json' } };
+      if (body) opts.body = JSON.stringify(body);
+      const r = await fetch(url, opts);
+      this.connected = r.ok;
+      return r.json();
+    },
+    async refresh() {
+      await Promise.all([this.loadHosts(), this.loadTenants()]);
+    },
+    async loadHosts() {
+      if (!this.apiUrl || !this.apiKey) return;
+      this.loadingHosts = true;
+      try { this.hosts = await this.api('GET', 'hosts'); this.connected = true; }
+      catch { this.connected = false; }
+      this.loadingHosts = false;
+    },
+    async loadTenants() {
+      if (!this.apiUrl || !this.apiKey) return;
+      this.loadingTenants = true;
+      try { this.tenants = await this.api('GET', 'tenants'); this.connected = true; }
+      catch { this.connected = false; }
+      this.loadingTenants = false;
+    },
+    async createTenant() {
+      if (!this.form.name) return;
+      const body = { name: this.form.name };
+      if (this.form.vcpu) body.vcpu = this.form.vcpu;
+      if (this.form.memory_mb) body.memory_mb = this.form.memory_mb;
+      await this.api('POST', 'tenants', body);
+      this.form = { name: '', vcpu: null, memory_mb: null };
+      this.showModal = false;
+      this.loadTenants();
+    },
+    async deleteTenant(id) {
+      if (!confirm('Delete tenant ' + id + '?')) return;
+      await this.api('DELETE', 'tenants/' + id);
+      this.loadTenants();
+    },
+    cpuPct(h) { return h.total_vcpu ? Math.round(h.used_vcpu / h.total_vcpu * 100) : 0; },
+    memPct(h) { return h.total_mem_mb ? Math.round(h.used_mem_mb / h.total_mem_mb * 100) : 0; },
+    healthClass(v) { return v === 'up' ? 'health-up' : v === 'down' ? 'health-down' : 'health-unknown'; },
+    get filteredTenants() { return this.selectedHost ? this.tenants.filter(t => t.host_id === this.selectedHost) : this.tenants; },
+  };
+}
+</script>
+</body>
+</html>

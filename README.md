@@ -1,29 +1,19 @@
 # OpenClaw on EC2 microVM
 
-基于 AWS EC2 嵌套虚拟化，通过 Firecracker microVM 实现 OpenClaw 多租户隔离部署，ASG 自动管理宿主机生命周期。
+![Version](https://img.shields.io/badge/version-0.3.1-blue)
 
-> 本项目依赖 EC2 [嵌套虚拟化 (Nested Virtualization)](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/nested-virtualization.html) 功能，在 EC2 实例内运行 KVM + Firecracker microVM。目前仅 Intel 系列 (c8i/m8i/r8i 等) 支持该功能。
+基于 AWS Firecracker microVM 的 OpenClaw 多租户隔离部署方案。每个租户运行在独立的 microVM 中，通过 API 统一管理，ASG 自动扩缩宿主机，空闲主机自动回收。
 
-## 项目结构
+> 本项目使用 EC2 [嵌套虚拟化](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/nested-virtualization.html) 功能，在 EC2 实例内运行 KVM + Firecracker microVM。目前支持 Intel 系列 (c8i/m8i/r8i 等) 实例家族。
 
-```
-openclaw-firecracker/
-├── config.yml                # 全局配置 (宿主机规格、VM 参数、S3、ASG)
-├── setup.sh                  # 一键部署 + 导出环境变量到 .env.deploy
-├── build-rootfs.sh           # rootfs 镜像构建 + S3 上传
-├── connect-vm.sh             # 快速登录 microVM: ./connect-vm.sh <tenant-id>
-├── deploy/                   # CDK 项目
-│   ├── stack.py              # 基础设施定义 (ASG/LT/DynamoDB/Lambda/API GW/S3/IAM)
-│   ├── app.py                # CDK 入口
-│   ├── lambda/               # Orchestrator 业务逻辑
-│   │   ├── api/handler.py    # 租户 CRUD + 宿主机管理 API
-│   │   └── health_check/handler.py  # 定时健康检查 + 自动重启
-│   └── userdata/             # 宿主机脚本 (synth 时内联到 UserData)
-│       ├── init-host.sh      # 宿主机初始化 (KVM/Firecracker/rootfs/自注册)
-│       ├── launch-vm.sh      # microVM 启动
-│       └── stop-vm.sh        # microVM 停止
-└── README.md                 # 用户手册 (本文件)
-```
+## 功能概览
+
+- **租户管理** — 通过 API 创建/删除/查询租户，每个租户独占一个 microVM
+- **自动调度** — 创建租户时自动选择有空闲资源的宿主机，资源不足时自动扩容
+- **自动缩容** — 空闲宿主机超时后自动回收，节省成本（两轮确认防误杀）
+- **健康检查** — 每分钟探活所有 VM，连续失败自动重启
+- **Web 管理控制台** — 可视化管理 Host/Tenant，实时状态展示
+- **Rootfs 预构建** — 统一镜像通过 S3 分发，宿主机启动时自动下载
 
 ## 部署架构
 
@@ -38,20 +28,19 @@ Lambda Functions ──── DynamoDB
     │                 ├── tenants (租户状态)
     │                 └── hosts (宿主机资源)
     │
-    ├── SSM Run Command ──→ EC2 Host A (m8i.xl, SSM Agent)
+    ├── SSM Run Command ──→ EC2 Host A
     │                       ├── microVM 01 (172.16.1.2)
     │                       ├── microVM 02 (172.16.2.2)
-    │                       └── microVM 03 (172.16.3.2)
+    │                       └── ...
     │
     ├── SSM Run Command ──→ EC2 Host B ...
     │
-    ├── S3 (rootfs 分发 + 数据卷备份)
-    │
-    └── SNS (告警通知)
+    └── S3 (rootfs 分发 + 数据卷备份)
 
-ASG: 宿主机自动扩缩管理 (参数见 config.yml)
-EventBridge: 健康检查 (5min) + 数据备份 (6hr)
+ASG: 宿主机自动扩缩 (配置参见: config.yml)
+EventBridge: 健康检查 + 空闲回收
 ```
+
 <details>
 <summary>系统架构图 (详细)</summary>
 
@@ -59,132 +48,187 @@ EventBridge: 健康检查 (5min) + 数据备份 (6hr)
 
 </details>
 
+## 项目结构
+
+```
+openclaw-firecracker/
+├── config.yml                 # 全局配置 (唯一配置源)
+├── setup.sh                   # 一键部署 + 导出 .env.deploy
+├── build-rootfs.sh            # rootfs 镜像构建 + S3 上传
+├── oc-connect.sh              # 登录 OpenClaw microVM
+├── oc-dashboard.sh            #  OpenClaw 控制面板
+├── open-console.sh            # 启动 Web 管理控制台
+├── console/                   # 管理控制台前端
+│   ├── index.html             # Alpine.js SPA
+│   ├── style.css              # 赛博朋克主题
+│   └── config.js              # 自动生成 (open-console.sh)
+├── deploy/                    # CDK 项目
+│   ├── stack.py               # 基础设施定义
+│   ├── lambda/
+│   │   ├── api/handler.py     # 租户 CRUD + 宿主机管理
+│   │   ├── health_check/handler.py  # 定时健康检查
+│   │   └── scaler/handler.py  # 空闲宿主机回收
+│   └── userdata/
+│       ├── init-host.sh       # 宿主机初始化
+│       ├── launch-vm.sh       # microVM 启动
+│       └── stop-vm.sh         # microVM 停止
+└── docs/
+```
+
 ## 前置条件
 
 - AWS 账号 + CLI 配置
 - CDK CLI + Python 3.12+
-- S3 上已有 rootfs 镜像 (见 Rootfs 管理)
-- 宿主机配置通过 `config.yml` 管理 (见下方配置说明)
+- uv (Python 包管理)
 
 ## 快速开始
 
 ```bash
-# 1. 部署基础设施 (ASG 会自动启动宿主机并完成初始化)
+# 1. 部署基础设施
 ./setup.sh ap-northeast-1 lab
-# 部署完成后环境变量保存在 .env.deploy
+# 完成后环境变量保存在 .env.deploy
 
-# 2. 加载环境变量 + 获取 API Key
+# 2. 构建并上传 rootfs (首次部署)
+./build-rootfs.sh v1.0
+
+# 3. 创建租户
 source .env.deploy
-API_KEY=$(aws apigateway get-api-key --api-key $ApiKeyId \
-  --include-value --query value --output text --profile $PROFILE --region $REGION)
-
-# 3. 创建租户 (自动选择有空闲资源的宿主机)
-curl -s -X POST "$ApiUrl/tenants" -H "x-api-key: $API_KEY" \
+curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" \
   -d '{"name":"my-agent","vcpu":2,"mem_mb":4096}' | jq .
 
-# 4. SSH 进 microVM 完成 OpenClaw 初始化
-sshpass -p openclaw ssh root@<guest_ip>
-openclaw onboard
+# 4. 查看租户状态
+curl -s "${API_URL}tenants" -H "x-api-key: ${API_KEY}" | jq .
 
-# 5. 停止租户
-curl -s -X POST "$ApiUrl/tenants/openclaw-01/stop" -H "x-api-key: $API_KEY"
+# 5. SSH 登录 microVM
+./oc-connect.sh <tenant-id>
+
+# 6. 删除租户
+curl -s -X DELETE "${API_URL}tenants/<tenant-id>" -H "x-api-key: ${API_KEY}" | jq .
 ```
 
-## 配置文件 (config.yml)
+## Management Console
 
-项目根目录的 `config.yml` 是所有组件 (CDK stack / Lambda / UserData) 的唯一配置源。
+Web 管理控制台，支持 Host/Tenant 可视化管理。
+
+```bash
+./open-console.sh    # 自动读取 .env.deploy，启动 http://localhost:8080
+```
+
+![Management Console](docs/web_console.png)
+
+功能：
+- 查看宿主机资源使用情况 (vCPU / 内存 / VM 数量)
+- 创建 / 删除 Tenant
+- 按宿主机筛选 Tenant
+- 健康状态实时展示 (vm_health / app_health)
+- API 地址和 Key 自动注入，支持手动修改
+
+## 自动扩缩容
+
+**扩容** — 创建租户时无可用宿主机 → 租户进入 pending → ASG 自动启动新实例 → 初始化完成后自动分配 pending 租户
+
+**缩容** — Scaler Lambda 每 5 分钟检测空闲宿主机：
+1. 宿主机 `vm_count=0` 超过 `idle_timeout_minutes` → 标记 `idle`
+2. 下一轮确认仍空闲且 ASG 实例数 > min → 终止实例
+3. 期间如有新租户分配到该宿主机 → 自动恢复 `active`，取消回收
+
+## 配置说明 (config.yml)
 
 | 分类 | 配置项 | 默认值 | 说明 |
 |------|--------|--------|------|
-| host | instance_type | m8i.xlarge | 需支持 NestedVirtualization (c8i/m8i/r8i) |
-| host | root_volume_gb | 20 | 系统卷 |
-| host | data_volume_gb | 100 | 数据卷，挂载到 /data |
-| host | reserved_vcpu | 1 | 预留给宿主机 |
-| host | reserved_mem_mb | 2048 | 预留给宿主机 |
-| asg | min/max/desired | 0 / 5 / 1 | ASG 容量 |
+| host | instance_type | c8i.2xlarge | 需支持 NestedVirtualization (c8i/m8i/r8i) |
+| host | reserved_vcpu | 1 | 预留给宿主机 OS |
+| host | reserved_mem_mb | 2048 | 预留给宿主机 OS |
+| asg | min_capacity | 1 | 最小实例数 |
+| asg | max_capacity | 5 | 最大实例数 |
 | asg | use_spot | false | Spot 实例 (省 ~60-70%，可能被回收) |
-| vm | default_vcpu | 2 | 每个 microVM 的 vCPU |
-| vm | default_mem_mb | 4096 | 每个 microVM 的内存 |
-| vm | data_disk_mb | 4096 | 每个 microVM 的数据盘 |
+| vm | default_vcpu | 2 | 默认 vCPU |
+| vm | default_mem_mb | 4096 | 默认内存 (MB) |
+| vm | data_disk_mb | 4096 | 数据盘大小 (MB) |
 | health_check | interval_minutes | 1 | 探活间隔 |
 | health_check | max_failures | 3 | 连续失败后自动重启 |
+| scaler | interval_minutes | 5 | 空闲检测间隔 |
+| scaler | idle_timeout_minutes | 10 | 空闲超时 (分钟) |
 
-修改后重新部署即可生效：`./setup.sh <region> <profile>`
+修改后重新部署：`./setup.sh <region> <profile>`
 
-## 宿主机管理 (ASG)
+## API 参考
 
-宿主机由 Auto Scaling Group 全自动管理，无需手动创建 EC2。
+所有请求需携带 `x-api-key` header。
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | /tenants | 列出所有租户 |
+| POST | /tenants | 创建租户 `{"name":"xx","vcpu":2,"mem_mb":4096}` |
+| GET | /tenants/{id} | 查询单个租户 |
+| DELETE | /tenants/{id} | 删除租户 (`?keep_data=true` 保留数据盘) |
+| GET | /hosts | 列出所有宿主机 |
+| POST | /hosts | 注册宿主机 (UserData 自动调用) |
+| DELETE | /hosts/{id} | 注销宿主机 |
+
+## 网络模型
+
+每个 VM 使用独立 /24 子网，通过 TAP 设备与宿主机通信：
+
+```
+VM1: tap-vm1  host=172.16.1.1/24  guest=172.16.1.2/24
+VM2: tap-vm2  host=172.16.2.1/24  guest=172.16.2.2/24
+VMn: tap-vmN  host=172.16.N.1/24  guest=172.16.N.2/24
+```
+
+- 出站：iptables MASQUERADE → 外网
+- 入站：DNAT 端口转发 (host_port → guest:18789)
+- VM 间：完全隔离，不同子网无路由
+
+## Rootfs 管理
+
+```bash
+# 构建并上传 (版本号 + latest)
+./build-rootfs.sh v1.2
+
+# 宿主机启动时自动从 S3 下载 latest 版本
+# 更新 rootfs 后新建的 VM 自动使用新版本，已有 VM 不受影响
+```
+
+## 宿主机管理
+
+宿主机由 ASG 全自动管理，通常无需手动操作。
 
 ```bash
 # 查看 ASG 状态
-aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names openclaw-hosts-asg \
-  --query 'AutoScalingGroups[0].{Desired:DesiredCapacity,Instances:Instances[*].{Id:InstanceId,State:LifecycleState}}' \
+aws autoscaling describe-auto-scaling-groups \
+  --auto-scaling-group-names openclaw-hosts-asg \
+  --query 'AutoScalingGroups[0].{Desired:DesiredCapacity,Min:MinSize,Max:MaxSize}' \
   --profile lab --region ap-northeast-1
 
-# 扩容
-aws autoscaling set-desired-capacity --auto-scaling-group-name openclaw-hosts-asg \
-  --desired-capacity 2 --profile lab --region ap-northeast-1
+# 手动扩容
+aws autoscaling set-desired-capacity \
+  --auto-scaling-group-name openclaw-hosts-asg \
+  --desired-capacity 3 --profile lab --region ap-northeast-1
 
-# 缩容到 0
-aws autoscaling set-desired-capacity --auto-scaling-group-name openclaw-hosts-asg \
-  --desired-capacity 0 --profile lab --region ap-northeast-1
-
-# 查看实例初始化日志
-aws ssm send-command --instance-ids <id> --document-name AWS-RunShellScript \
-  --parameters 'commands=["cat /var/log/openclaw-init.log"]' \
-  --profile lab --region ap-northeast-1
+# 查看初始化日志
+./oc-connect.sh 后在宿主机上: cat /var/log/openclaw-init.log
 ```
 
-## 多实例部署
+## API Key 管理
 
 ```bash
-curl -s -X POST "$ApiUrl/tenants" -H "x-api-key: $API_KEY" \
-  -d '{"name":"agent-a","vcpu":2,"mem_mb":4096}' | jq .   # → 172.16.1.2
-curl -s -X POST "$ApiUrl/tenants" -H "x-api-key: $API_KEY" \
-  -d '{"name":"agent-b","vcpu":1,"mem_mb":2048}' | jq .   # → 172.16.2.2
-curl -s -X POST "$ApiUrl/tenants" -H "x-api-key: $API_KEY" \
-  -d '{"name":"agent-c","vcpu":1,"mem_mb":2048}' | jq .   # → 172.16.3.2
-```
+source .env.deploy
 
-## API 认证
-
-所有 API 请求需携带 `x-api-key` header，否则返回 403。
-
-```bash
-# 查看当前 key
-aws apigateway get-api-key --api-key <key-id> --include-value --query 'value' --output text --profile lab --region ap-northeast-1
-
-# 调用示例
-curl -H "x-api-key: <your-key>" https://<api-url>/v1/tenants
-```
-
-### API Key 管理
-
-```bash
-REGION=ap-northeast-1
-PROFILE=lab
-
-# 创建新 key (每个运维人员一个)
+# 创建新 key
 aws apigateway create-api-key --name "operator-alice" --enabled \
   --profile $PROFILE --region $REGION
 
-# 关联到 usage plan (从 CDK output 或控制台获取 plan ID)
-PLAN_ID=$(aws apigateway get-usage-plans --query "items[?name=='openclaw-plan'].id" --output text --profile $PROFILE --region $REGION)
+# 关联到 usage plan
+PLAN_ID=$(aws apigateway get-usage-plans \
+  --query "items[?name=='openclaw-plan'].id" --output text \
+  --profile $PROFILE --region $REGION)
 aws apigateway create-usage-plan-key --usage-plan-id $PLAN_ID \
   --key-id <new-key-id> --key-type API_KEY \
   --profile $PROFILE --region $REGION
 
-# 禁用 key (人员离职)
+# 禁用 / 删除 key
 aws apigateway update-api-key --api-key <key-id> \
   --patch-operations op=replace,path=/enabled,value=false \
   --profile $PROFILE --region $REGION
-
-# 删除 key
-aws apigateway delete-api-key --api-key <key-id> \
-  --profile $PROFILE --region $REGION
-
-# 列出所有 key
-aws apigateway get-api-keys --include-values \
-  --query "items[*].{name:name,id:id,enabled:enabled}" \
-  --output table --profile $PROFILE --region $REGION
 ```

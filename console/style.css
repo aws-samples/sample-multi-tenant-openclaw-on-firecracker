@@ -91,3 +91,5 @@ tr:hover td { background: #0ff05; }
 .empty { text-align: center; padding: 40px; color: #445; }
 .spin { animation: spin 1s linear infinite; display: inline-block; }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+.footer { text-align: center; padding: 12px; color: #555; font-size: 12px; letter-spacing: 1px; }

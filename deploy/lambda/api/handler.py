@@ -124,8 +124,9 @@ def create_tenant(body=None):
 
     hosts_table.update_item(
         Key={"instance_id": host["instance_id"]},
-        UpdateExpression="SET used_vcpu = used_vcpu + :v, used_mem_mb = used_mem_mb + :m, vm_count = vm_count + :one, next_vm_num = :next",
-        ExpressionAttributeValues={":v": vcpu, ":m": mem_mb, ":one": 1, ":next": vm_num + 1},
+        UpdateExpression="SET used_vcpu = used_vcpu + :v, used_mem_mb = used_mem_mb + :m, vm_count = vm_count + :one, next_vm_num = :next, #s = :a REMOVE idle_since",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":v": vcpu, ":m": mem_mb, ":one": 1, ":next": vm_num + 1, ":a": "active"},
     )
 
     _launch_vm(host["instance_id"], tenant_id, vm_num, vcpu, mem_mb, guest_ip, host_port)
@@ -158,13 +159,21 @@ def delete_tenant(tenant_id, query_params):
         )
 
     # Update host counters
-    hosts_table.update_item(
+    host_resp = hosts_table.update_item(
         Key={"instance_id": item["host_id"]},
         UpdateExpression="SET used_vcpu = used_vcpu - :v, used_mem_mb = used_mem_mb - :m, vm_count = vm_count - :one",
         ExpressionAttributeValues={
             ":v": item["vcpu"], ":m": item["mem_mb"], ":one": 1,
         },
+        ReturnValues="ALL_NEW",
     )
+    # Record idle_since when host becomes empty
+    if int(host_resp["Attributes"].get("vm_count", 0)) == 0:
+        hosts_table.update_item(
+            Key={"instance_id": item["host_id"]},
+            UpdateExpression="SET idle_since = :t",
+            ExpressionAttributeValues={":t": _now()},
+        )
 
     tenants_table.update_item(
         Key={"id": tenant_id},
@@ -234,6 +243,7 @@ def register_host(body):
         "vm_count": 0,
         "next_vm_num": 1,
         "status": "active",
+        "idle_since": _now(),
     })
     return _resp(201, {"instance_id": instance_id, "status": "active"})
 
@@ -323,11 +333,11 @@ def _scale_out():
 
 
 def _find_host(vcpu_needed, mem_needed):
-    """Find an active host with enough free resources."""
+    """Find an active or idle host with enough free resources."""
     hosts = hosts_table.scan(
-        FilterExpression="#s = :a",
+        FilterExpression="#s IN (:a, :i)",
         ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":a": "active"},
+        ExpressionAttributeValues={":a": "active", ":i": "idle"},
     ).get("Items", [])
 
     for h in hosts:

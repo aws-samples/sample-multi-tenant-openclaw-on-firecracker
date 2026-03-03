@@ -1,8 +1,8 @@
 #!/bin/bash
 # 通过 SSM 端口转发访问 VM 的 Mission Control Dashboard
-# 用法: ./open-dashboard.sh <tenant-id> [local-port]
-# 示例: ./open-dashboard.sh test-vm-a634
-#       ./open-dashboard.sh test-vm-a634 8080
+# 用法: ./oc-dashboard.sh <tenant-id> [local-port]
+# 示例: ./oc-dashboard.sh test-vm-a634
+#       ./oc-dashboard.sh test-vm-a634 8080
 set -euo pipefail
 
 TENANT_ID="${1:?Usage: $0 <tenant-id> [local-port]}"

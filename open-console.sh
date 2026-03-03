@@ -9,9 +9,11 @@ ENV_FILE="$SCRIPT_DIR/.env.deploy"
 CONFIG_JS="$SCRIPT_DIR/console/config.js"
 if [ -f "$ENV_FILE" ]; then
   source "$ENV_FILE"
+  VERSION=$(cat "$SCRIPT_DIR/VERSION" 2>/dev/null || echo "dev")
   cat > "$CONFIG_JS" << EOF
 window.OC_DEFAULT_API_URL = "${API_URL:-}";
 window.OC_DEFAULT_API_KEY = "${API_KEY:-}";
+window.OC_VERSION = "${VERSION}";
 EOF
   echo "✓ 已从 .env.deploy 加载配置"
 else

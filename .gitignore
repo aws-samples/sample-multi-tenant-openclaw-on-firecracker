@@ -14,3 +14,4 @@ __pycache__/
 # CDK
 deploy/cdk.out/
 deploy/cdk.context.json
+console/config.js

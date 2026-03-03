@@ -153,6 +153,31 @@ class OpenClawOrchestratorStack(cdk.Stack):
             targets=[targets.LambdaFunction(health_fn)],
         )
 
+        # ========== Scaler Lambda (idle host reclaim) ==========
+        scaler_fn = _lambda.Function(self, "Scaler",
+            function_name="openclaw-scaler",
+            runtime=_lambda.Runtime.PYTHON_3_12,
+            handler="handler.lambda_handler",
+            code=_lambda.Code.from_asset("lambda/scaler"),
+            timeout=Duration.seconds(30),
+            memory_size=128,
+            environment={
+                "HOSTS_TABLE": hosts_table.table_name,
+                "ASG_NAME": "openclaw-hosts-asg",
+                "IDLE_TIMEOUT_MINUTES": str(CFG["scaler"]["idle_timeout_minutes"]),
+            },
+        )
+        hosts_table.grant_read_write_data(scaler_fn)
+        scaler_fn.add_to_role_policy(iam.PolicyStatement(
+            actions=["autoscaling:DescribeAutoScalingGroups",
+                     "autoscaling:TerminateInstanceInAutoScalingGroup"],
+            resources=["*"],
+        ))
+        events.Rule(self, "ScalerSchedule",
+            schedule=events.Schedule.rate(Duration.minutes(CFG["scaler"]["interval_minutes"])),
+            targets=[targets.LambdaFunction(scaler_fn)],
+        )
+
         # ========== Host EC2 Role (SSM + S3 backup + self-register) ==========
         host_role = iam.Role(self, "HostRole",
             assumed_by=iam.ServicePrincipal("ec2.amazonaws.com"),

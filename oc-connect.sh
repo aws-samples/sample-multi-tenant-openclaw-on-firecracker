@@ -1,5 +1,5 @@
 #!/bin/bash
-# 快速登录 microVM: ./connect-vm.sh openclaw-01
+# 快速登录 microVM: ./oc-connect.sh openclaw-01
 set -euo pipefail
 
 # 检查 Session Manager 插件

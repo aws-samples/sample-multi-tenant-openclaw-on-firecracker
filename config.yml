@@ -9,13 +9,6 @@ host:
   reserved_vcpu: 1                 # 预留给宿主机的 vCPU
   reserved_mem_mb: 2048            # 预留给宿主机的内存 (MB)
 
-# ========== Auto Scaling ==========
-asg:
-  min_capacity: 1
-  max_capacity: 5
-  lifecycle_hook_timeout: 600      # 初始化超时 (秒), 超时后 ABANDON
-  use_spot: false                  # 使用 Spot 实例 (约省 60-70%, 但可能被回收)
-
 # ========== microVM 默认配置 ==========
 vm:
   default_vcpu: 2
@@ -30,6 +23,18 @@ s3:
   rootfs_filename: "openclaw-rootfs-latest.ext4"
   backup_prefix: "backups"         # 数据卷备份路径前缀
   backup_retention_days: 7
+
+# ========== Auto Scaling ==========
+asg:
+  min_capacity: 1
+  max_capacity: 5
+  lifecycle_hook_timeout: 600      # 初始化超时 (秒), 超时后 ABANDON
+  use_spot: false                  # 使用 Spot 实例 (约省 60-70%, 但可能被回收)
+
+  # ========== 缩容 ==========
+scaler:
+  interval_minutes: 3              # 空闲检测频率
+  idle_timeout_minutes: 10         # 空闲超时后标记 idle, 下一轮确认后回收
 
 # ========== 健康检查 ==========
 health_check:

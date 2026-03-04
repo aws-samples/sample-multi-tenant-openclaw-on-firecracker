@@ -4,7 +4,9 @@ TENANT_ID="${1:?Usage: launch-vm.sh <tenant_id> <vm_num> [vcpu] [mem_mb]}"
 VM_NUM="${2:?Usage: launch-vm.sh <tenant_id> <vm_num> [vcpu] [mem_mb]}"
 VCPU="${3:-2}"
 MEM_MB="${4:-4096}"
-SOCK="/tmp/fc-${TENANT_ID}.sock"
+VM_DIR="/data/firecracker-vms/${TENANT_ID}"
+mkdir -p ${VM_DIR}
+SOCK="${VM_DIR}/fc.sock"
 TAP="tap-vm${VM_NUM}"
 GUEST_IP="{{SUBNET_PREFIX}}.${VM_NUM}.2"
 HOST_TAP_IP="{{SUBNET_PREFIX}}.${VM_NUM}.1"
@@ -15,13 +17,13 @@ pkill -f "api-sock ${SOCK}" 2>/dev/null || true
 sudo ip link del ${TAP} 2>/dev/null || true
 rm -f ${SOCK}; sleep 0.5
 
-# Prepare disks
-cp ~/firecracker-assets/openclaw-rootfs.ext4 /tmp/${TENANT_ID}-rootfs.ext4
-DATA_VOL="$HOME/firecracker-assets/${TENANT_ID}-data.ext4"
+# Prepare disks (parallel cp)
+cp ~/firecracker-assets/openclaw-rootfs.ext4 ${VM_DIR}/rootfs.ext4 &
+DATA_VOL="${VM_DIR}/data.ext4"
 if [ ! -f "${DATA_VOL}" ]; then
-  dd if=/dev/zero of=${DATA_VOL} bs=1M count={{DATA_DISK_MB}} status=none
-  mkfs.ext4 -q ${DATA_VOL}
+  cp ~/firecracker-assets/openclaw-data-template.ext4 ${DATA_VOL} &
 fi
+wait
 
 # Network setup
 sudo ip tuntap add dev ${TAP} mode tap
@@ -37,7 +39,7 @@ sudo iptables -C FORWARD -i ${TAP} -o ${HOST_IFACE} -j ACCEPT 2>/dev/null || \
   sudo iptables -A FORWARD -i ${TAP} -o ${HOST_IFACE} -j ACCEPT
 
 # Start Firecracker
-nohup firecracker --api-sock ${SOCK} --log-path /tmp/fc-${TENANT_ID}.log --level Info &>/dev/null & disown
+nohup firecracker --api-sock ${SOCK} --log-path ${VM_DIR}/fc.log --level Info &>/dev/null & disown
 sleep 1
 
 # Configure VM
@@ -47,7 +49,7 @@ curl -s --unix-socket ${SOCK} -X PUT http://localhost/boot-source \
 
 curl -s --unix-socket ${SOCK} -X PUT http://localhost/drives/rootfs \
   -H 'Content-Type: application/json' \
-  -d '{"drive_id":"rootfs","path_on_host":"/tmp/'${TENANT_ID}'-rootfs.ext4","is_root_device":true,"is_read_only":false}'
+  -d '{"drive_id":"rootfs","path_on_host":"'${VM_DIR}'/rootfs.ext4","is_root_device":true,"is_read_only":false}'
 
 curl -s --unix-socket ${SOCK} -X PUT http://localhost/drives/data \
   -H 'Content-Type: application/json' \

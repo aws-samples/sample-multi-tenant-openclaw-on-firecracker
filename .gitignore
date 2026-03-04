@@ -3,6 +3,7 @@
 .idear
 
 # Environment
+.venv
 .env.deploy
 logs/*
 

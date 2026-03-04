@@ -42,6 +42,7 @@ def lambda_handler(event, context):
         ),
         ("GET", "/hosts"): list_hosts,
         ("POST", "/hosts"): lambda: register_host(json.loads(event["body"])),
+        ("POST", "/hosts/refresh-rootfs"): refresh_rootfs,
         ("DELETE", "/hosts/{instance_id}"): lambda: deregister_host(
             path_params["instance_id"]
         ),
@@ -155,7 +156,7 @@ def delete_tenant(tenant_id, query_params):
 
     if not keep_data:
         _ssm_run(item["host_id"],
-            f"rm -f ~/firecracker-assets/{tenant_id}-data.ext4"
+            f"rm -rf /data/firecracker-vms/{tenant_id}"
         )
 
     # Update host counters
@@ -256,6 +257,40 @@ def deregister_host(instance_id):
         ExpressionAttributeValues={":s": "draining"},
     )
     return _resp(200, {"instance_id": instance_id, "status": "draining"})
+
+
+def refresh_rootfs():
+    """Download latest rootfs + data template from S3 to all active/idle hosts."""
+    bucket = os.environ.get("ASSETS_BUCKET", "")
+    prefix = os.environ.get("ROOTFS_PREFIX", "rootfs")
+    filename = os.environ.get("ROOTFS_FILENAME", "openclaw-rootfs-latest.ext4")
+    data_filename = os.environ.get("DATA_TEMPLATE_FILENAME", "openclaw-data-template-latest.ext4")
+    region = os.environ.get("AWS_REGION", "ap-northeast-1")
+
+    hosts = hosts_table.scan(
+        FilterExpression="#s IN (:a, :i)",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":a": "active", ":i": "idle"},
+    ).get("Items", [])
+
+    if not hosts:
+        return _resp(200, {"message": "no active hosts", "updated": 0})
+
+    ids = [h["instance_id"] for h in hosts]
+    cmds = [
+        f"aws s3 cp s3://{bucket}/{prefix}/{filename} /data/firecracker-assets/openclaw-rootfs.ext4 --region {region}",
+        f"aws s3 cp s3://{bucket}/{prefix}/{data_filename} /data/firecracker-assets/openclaw-data-template.ext4 --region {region}",
+    ]
+    try:
+        ssm.send_command(
+            InstanceIds=ids,
+            DocumentName="AWS-RunShellScript",
+            Parameters={"commands": cmds, "executionTimeout": ["300"]},
+        )
+    except Exception as e:
+        return _resp(500, {"error": str(e)})
+
+    return _resp(200, {"message": "refresh started", "hosts": ids})
 
 
 # ========== Pending Tenant Processing ==========
@@ -360,7 +395,7 @@ def _launch_vm(instance_id, tenant_id, vm_num, vcpu, mem_mb, guest_ip, host_port
     cmd = (f"~/launch-vm.sh {tenant_id} {vm_num} {vcpu} {mem_mb} && "
            f"sudo iptables -t nat -A PREROUTING -i $(ip route show default | awk '{{print $5}}' | head -1) "
            f"-p tcp --dport {host_port} -j DNAT --to-destination {guest_ip}:{VM_PORT_BASE}")
-    _ssm_send(instance_id, cmd)
+    _ssm_send(instance_id, cmd, timeout=300)
 
 
 def _ssm_send(instance_id, command, timeout=120):
@@ -408,8 +443,6 @@ def _ssm_run(instance_id, command, timeout=30):
         return False
     except Exception as e:
         print(f"SSM error: {e}")
-        return False
-    except Exception:
         return False
 
 

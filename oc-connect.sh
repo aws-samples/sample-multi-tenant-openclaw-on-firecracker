@@ -16,7 +16,8 @@ if ! command -v session-manager-plugin &>/dev/null; then
   fi
 fi
 
-TENANT_ID="${1:?Usage: $0 <tenant-id>}"
+TENANT_ID="${1:?Usage: $0 <tenant-id> [user]}"
+SSH_USER="${2:-agent}"
 
 # 加载部署环境信息
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -44,8 +45,8 @@ STATUS=$(echo "$ITEM" | jq -r .status)
 [ "$HOST_ID" = "null" ] && echo "❌ Tenant '${TENANT_ID}' not found" && exit 1
 [ "$STATUS" != "running" ] && echo "⚠️  Tenant status: ${STATUS} (not running)" && exit 1
 
-echo "→ ${TENANT_ID} @ ${HOST_ID} (${GUEST_IP})"
+echo "→ ${TENANT_ID} @ ${HOST_ID} (${SSH_USER}@${GUEST_IP})"
 aws ssm start-session --target "$HOST_ID" \
   --document-name AWS-StartInteractiveCommand \
-  --parameters "{\"command\":[\"sshpass -p openclaw ssh -o StrictHostKeyChecking=no root@${GUEST_IP}\"]}" \
+  --parameters "{\"command\":[\"SSHPASS='OpenCl@w2026' sshpass -e ssh -o StrictHostKeyChecking=no ${SSH_USER}@${GUEST_IP}\"]}" \
   --profile "$PROFILE" --region "$REGION"

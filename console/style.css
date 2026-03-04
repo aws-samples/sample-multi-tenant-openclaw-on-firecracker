@@ -37,6 +37,9 @@ input { font-family: inherit; }
 .btn-icon:hover { color: var(--cyan); }
 .btn-del { background: none; border: none; color: #f445; cursor: pointer; font-size: 16px; padding: 4px; }
 .btn-del:hover { color: var(--red); }
+.btn-act { background: none; border: none; color: var(--cyan-dim); cursor: pointer; font-size: 16px; padding: 4px; }
+.btn-act:hover { color: var(--cyan); }
+.toast { position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%); background: var(--cyan); color: #000; padding: 6px 14px; border-radius: 6px; font-size: 11px; font-weight: 600; z-index: 999; }
 
 /* Host cards */
 .host-card {
@@ -92,4 +95,4 @@ tr:hover td { background: #0ff05; }
 .spin { animation: spin 1s linear infinite; display: inline-block; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-.footer { text-align: center; padding: 12px; color: #555; font-size: 12px; letter-spacing: 1px; }
+.footer { position: fixed; bottom: 0; left: 0; width: 100%; text-align: center; padding: 12px; color: #555; font-size: 12px; letter-spacing: 1px; }

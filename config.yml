@@ -13,7 +13,7 @@ host:
 vm:
   default_vcpu: 2
   default_mem_mb: 4096
-  data_disk_mb: 4096               # 每个 VM 的数据盘大小 (MB)
+  data_disk_mb: 8192               # 每个 VM 的数据盘大小 (MB)
   gateway_port_base: 18789         # 第 N 个 VM 的宿主机端口 = base + N - 1
   subnet_prefix: "172.16"          # VM 网段: 172.16.{N}.2
 
@@ -21,6 +21,7 @@ vm:
 s3:
   rootfs_prefix: "rootfs"          # rootfs 镜像路径前缀
   rootfs_filename: "openclaw-rootfs-latest.ext4"
+  data_template_filename: "openclaw-data-template-latest.ext4"
   backup_prefix: "backups"         # 数据卷备份路径前缀
   backup_retention_days: 7
 

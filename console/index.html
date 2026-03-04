@@ -15,6 +15,9 @@
   <h1>OpenClaw Management Console</h1>
   <span class="status-dot" :class="connected ? 'ok' : 'err'"></span>
   <span class="status-label" x-text="connected ? 'Connected' : 'Disconnected'"></span>
+  <button class="btn-icon" @click="refresh()" style="font-size:24px;margin-left:4px">
+    <span :class="(loadingHosts||loadingTenants) && 'spin'">⟳</span>
+  </button>
   <input type="text" x-model="apiUrl" @change="saveSettings(); refresh()" placeholder="https://api.example.com/v1/">
   <input type="password" x-model="apiKey" @change="saveSettings(); refresh()" placeholder="🔒 API Key" style="width:200px">
 </div>
@@ -26,9 +29,6 @@
   <div class="hosts-panel">
     <div class="panel-header">
       <span class="panel-title">Hosts</span>
-      <button class="btn-icon" @click="loadHosts()">
-        <span :class="loadingHosts && 'spin'">⟳</span>
-      </button>
     </div>
     <template x-if="hosts.length === 0 && !loadingHosts">
       <div class="empty">No hosts</div>
@@ -39,7 +39,7 @@
         <div class="host-top">
           <span class="host-id" x-text="h.instance_id"></span>
           <span class="badge" :class="h.status==='active' ? 'badge-active' : 'badge-inactive'" x-text="h.status"></span>
-          <button class="btn-icon" style="font-size:16px" @click="loadHosts()">⟳</button>
+          <button class="btn-icon" style="font-size:16px" @click="refresh()">⟳</button>
         </div>
         <div class="host-row">
           <span class="host-label">CPU</span>
@@ -47,9 +47,9 @@
           <span class="host-val" x-text="h.used_vcpu+'/'+h.total_vcpu"></span>
         </div>
         <div class="host-row">
-          <span class="host-label">Mem</span>
+          <span class="host-label">Mem(GB)</span>
           <div class="bar-bg"><div class="bar-fill bar-mem" :style="'width:'+memPct(h)+'%'"></div></div>
-          <span class="host-val" x-text="h.used_mem_mb+' MB'"></span>
+          <span class="host-val" x-text="(h.used_mem_mb/1024).toFixed(1)+'/'+(h.total_mem_mb/1024).toFixed(1)"></span>
         </div>
         <div class="host-row">
           <span class="host-label">VM</span>
@@ -65,9 +65,6 @@
       <span class="panel-title">Tenants <template x-if="selectedHost"><span style="font-size:12px;color:var(--cyan-dim)">— <span x-text="selectedHost"></span> <button class="btn-icon" @click="selectedHost=null" style="font-size:12px">✕</button></span></template></span>
       <div style="display:flex;gap:10px;align-items:center">
         <button class="btn btn-cyan" @click="showModal=true">New Tenant</button>
-        <button class="btn-icon" @click="loadTenants()">
-          <span :class="loadingTenants && 'spin'">⟳</span>
-        </button>
       </div>
     </div>
     <div class="table-wrap">
@@ -75,7 +72,7 @@
         <thead>
           <tr>
             <th>ID</th><th>Name</th><th>vCPU</th><th>Mem (MB)</th><th>Guest IP</th>
-            <th>Port</th><th>Host ID</th><th>VM Health</th><th>App Health</th><th>Actions</th>
+            <th>Port</th><th>Host ID</th><th>VM Health</th><th>Gateway Health</th><th>Actions</th>
           </tr>
         </thead>
         <tbody>
@@ -93,7 +90,11 @@
               <td x-text="(t.host_id||'').substring(0,12)+'…'"></td>
               <td><span class="health-dot" :class="healthClass(t.vm_health)"></span></td>
               <td><span class="health-dot" :class="healthClass(t.app_health)"></span></td>
-              <td><button class="btn-del" @click="deleteTenant(t.id)">🗑</button></td>
+              <td>
+                <button class="btn-act" title="Copy oc-connect.sh command" @click="copyCmd('oc-connect.sh '+t.id)">🔗</button>
+                <button class="btn-act" title="Copy oc-dashboard.sh command" @click="copyCmd('oc-dashboard.sh '+t.id)">📊</button>
+                <button class="btn-del" @click="deleteTenant(t.id)">🗑</button>
+              </td>
             </tr>
           </template>
         </tbody>
@@ -125,7 +126,7 @@
 <script>
 function app() {
   return {
-    apiUrl: '', apiKey: '', connected: false,
+    apiUrl: '', apiKey: '', connected: false, toast: '',
     hosts: [], tenants: [], selectedHost: null,
     loadingHosts: false, loadingTenants: false,
     showModal: false,
@@ -169,7 +170,7 @@ function app() {
       if (!this.form.name) return;
       const body = { name: this.form.name };
       if (this.form.vcpu) body.vcpu = this.form.vcpu;
-      if (this.form.memory_mb) body.memory_mb = this.form.memory_mb;
+      if (this.form.memory_mb) body.mem_mb = this.form.memory_mb;
       await this.api('POST', 'tenants', body);
       this.form = { name: '', vcpu: null, memory_mb: null };
       this.showModal = false;
@@ -180,6 +181,11 @@ function app() {
       await this.api('DELETE', 'tenants/' + id);
       this.loadTenants();
     },
+    copyCmd(cmd) {
+      navigator.clipboard.writeText(cmd);
+      this.toast = cmd;
+      setTimeout(() => this.toast = '', 2000);
+    },
     cpuPct(h) { return h.total_vcpu ? Math.round(h.used_vcpu / h.total_vcpu * 100) : 0; },
     memPct(h) { return h.total_mem_mb ? Math.round(h.used_mem_mb / h.total_mem_mb * 100) : 0; },
     healthClass(v) { return v === 'up' ? 'health-up' : v === 'down' ? 'health-down' : 'health-unknown'; },
@@ -187,6 +193,7 @@ function app() {
   };
 }
 </script>
+<div class="toast" x-show="toast" x-transition x-text="'✓ Copied: ' + toast"></div>
 <footer class="footer" x-data>
   <span>OpenClaw</span> <span x-text="'v' + (window.OC_VERSION || 'dev')"></span>
 </footer>

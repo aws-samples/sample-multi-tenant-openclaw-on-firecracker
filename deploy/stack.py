@@ -70,6 +70,9 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 "TENANTS_TABLE": tenants_table.table_name,
                 "HOSTS_TABLE": hosts_table.table_name,
                 "ASSETS_BUCKET": assets_bucket.bucket_name,
+                "ROOTFS_PREFIX": CFG["s3"]["rootfs_prefix"],
+                "ROOTFS_FILENAME": CFG["s3"]["rootfs_filename"],
+                "DATA_TEMPLATE_FILENAME": CFG["s3"].get("data_template_filename", "openclaw-data-template-latest.ext4"),
                 "HOST_RESERVED_VCPU": str(CFG["host"]["reserved_vcpu"]),
                 "HOST_RESERVED_MEM": str(CFG["host"]["reserved_mem_mb"]),
                 "VM_DEFAULT_VCPU": str(CFG["vm"]["default_vcpu"]),
@@ -127,6 +130,9 @@ class OpenClawOrchestratorStack(cdk.Stack):
         hosts_resource = api.root.add_resource("hosts")
         hosts_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
         hosts_resource.add_method("POST", apigw.LambdaIntegration(api_fn), **key_required)
+
+        refresh_rootfs_resource = hosts_resource.add_resource("refresh-rootfs")
+        refresh_rootfs_resource.add_method("POST", apigw.LambdaIntegration(api_fn), **key_required)
 
         host_resource = hosts_resource.add_resource("{instance_id}")
         host_resource.add_method("DELETE", apigw.LambdaIntegration(api_fn), **key_required)
@@ -221,14 +227,14 @@ class OpenClawOrchestratorStack(cdk.Stack):
         # Load scripts from userdata/ and inject config
         ud_dir = Path(__file__).parent / "userdata"
         launch_vm_sh = (ud_dir / "launch-vm.sh").read_text().replace(
-            "{{SUBNET_PREFIX}}", CFG["vm"]["subnet_prefix"]).replace(
-            "{{DATA_DISK_MB}}", str(CFG["vm"]["data_disk_mb"]))
+            "{{SUBNET_PREFIX}}", CFG["vm"]["subnet_prefix"])
         stop_vm_sh = (ud_dir / "stop-vm.sh").read_text()
 
         init_sh = (ud_dir / "init-host.sh").read_text()
         init_sh = init_sh.replace("{{ASSETS_BUCKET}}", "PLACEHOLDER_BUCKET")
         init_sh = init_sh.replace("{{ROOTFS_PREFIX}}", CFG["s3"]["rootfs_prefix"])
         init_sh = init_sh.replace("{{ROOTFS_FILENAME}}", CFG["s3"]["rootfs_filename"])
+        init_sh = init_sh.replace("{{DATA_TEMPLATE_FILENAME}}", CFG["s3"].get("data_template_filename", "openclaw-data-template-latest.ext4"))
         init_sh = init_sh.replace("{{HOSTS_TABLE}}", "PLACEHOLDER_TABLE")
         init_sh = init_sh.replace("{{AVAIL_VCPU}}", str(_avail_vcpu))
         init_sh = init_sh.replace("{{AVAIL_MEM}}", str(_avail_mem))
@@ -241,12 +247,15 @@ class OpenClawOrchestratorStack(cdk.Stack):
             "chmod +x /home/ubuntu/stop-vm.sh && chown ubuntu:ubuntu /home/ubuntu/stop-vm.sh")
 
         # Split script around CDK token placeholders, inject as Fn::Join
+        # PLACEHOLDER_BUCKET appears twice (rootfs + data template downloads)
+        # PLACEHOLDER_TABLE appears once (dynamodb put-item)
         parts = init_sh.split("PLACEHOLDER_BUCKET")
-        # parts[0] ... bucket ... parts[1] ... table ... parts[2]
-        table_split = parts[1].split("PLACEHOLDER_TABLE")
+        # parts = [before_bucket1, between_buckets, after_bucket2_with_table]
+        table_split = parts[2].split("PLACEHOLDER_TABLE")
         user_data = ec2.UserData.for_linux()
         user_data.add_commands(cdk.Fn.join("", [
             parts[0], assets_bucket.bucket_name,
+            parts[1], assets_bucket.bucket_name,
             table_split[0], hosts_table.table_name,
             table_split[1],
         ]))

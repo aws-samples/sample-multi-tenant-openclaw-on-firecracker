@@ -59,6 +59,7 @@ ASSETS=/home/ubuntu/firecracker-assets
 FC_MAJOR=$(echo ${FC_VER} | grep -oP "v\d+\.\d+")
 curl -fsSL -o ${ASSETS}/vmlinux "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${FC_MAJOR}/${ARCH}/vmlinux-5.10.245-no-acpi"
 aws s3 cp s3://{{ASSETS_BUCKET}}/{{ROOTFS_PREFIX}}/{{ROOTFS_FILENAME}} ${ASSETS}/openclaw-rootfs.ext4 --region ${REGION}
+aws s3 cp s3://{{ASSETS_BUCKET}}/{{ROOTFS_PREFIX}}/{{DATA_TEMPLATE_FILENAME}} ${ASSETS}/openclaw-data-template.ext4 --region ${REGION}
 chown -R ubuntu:ubuntu ${ASSETS}
 
 # Step 4: Deploy launch/stop scripts

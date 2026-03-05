@@ -5,6 +5,7 @@ import time
 import boto3
 
 ssm = boto3.client("ssm")
+s3 = boto3.client("s3")
 asg_client = boto3.client("autoscaling")
 ddb = boto3.resource("dynamodb")
 tenants_table = ddb.Table(os.environ["TENANTS_TABLE"])
@@ -43,6 +44,7 @@ def lambda_handler(event, context):
         ("GET", "/hosts"): list_hosts,
         ("POST", "/hosts"): lambda: register_host(json.loads(event["body"])),
         ("POST", "/hosts/refresh-rootfs"): refresh_rootfs,
+        ("GET", "/hosts/rootfs-version"): rootfs_version,
         ("DELETE", "/hosts/{instance_id}"): lambda: deregister_host(
             path_params["instance_id"]
         ),
@@ -341,6 +343,17 @@ def deregister_host(instance_id):
         print(f"Failed to terminate {instance_id}: {e}")
 
     return _resp(200, {"instance_id": instance_id, "status": "draining", "tenants_stopped": len(tenants)})
+
+
+def rootfs_version():
+    bucket = os.environ.get("ASSETS_BUCKET", "")
+    prefix = os.environ.get("ROOTFS_PREFIX", "rootfs")
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=f"{prefix}/version.txt")
+        version = obj["Body"].read().decode().strip()
+    except Exception:
+        version = "unknown"
+    return _resp(200, {"version": version})
 
 
 def refresh_rootfs():

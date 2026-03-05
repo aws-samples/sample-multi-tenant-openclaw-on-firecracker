@@ -76,4 +76,5 @@ curl -s --unix-socket ${SOCK} -X PUT http://localhost/network-interfaces/eth0 \
 RESULT=$(curl -s --unix-socket ${SOCK} -X PUT http://localhost/actions \
   -H 'Content-Type: application/json' -d '{"action_type":"InstanceStart"}')
 [ -n "${RESULT}" ] && log "ERROR: ${RESULT}" && exit 1
+ssh-keygen -R ${GUEST_IP} 2>/dev/null || true
 log "DONE ${TENANT_ID} IP:${GUEST_IP} (total $((SECONDS))s)"

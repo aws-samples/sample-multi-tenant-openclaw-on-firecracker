@@ -15,8 +15,8 @@
   <h1>OpenClaw Management Console</h1>
   <span class="status-dot" :class="connected ? 'ok' : 'err'"></span>
   <span class="status-label" x-text="connected ? 'Connected' : 'Disconnected'"></span>
-  <button class="btn-icon" @click="refresh()" style="font-size:24px;margin-left:4px">
-    <span :class="(loadingHosts||loadingTenants) && 'spin'">⟳</span>
+  <button class="btn btn-outline" @click="refresh()" :disabled="loadingHosts||loadingTenants">
+    Refresh <span :class="(loadingHosts||loadingTenants) && 'spin'">⟳</span>
   </button>
   <input type="text" x-model="apiUrl" @change="saveSettings(); refresh()" placeholder="https://api.example.com/v1/">
   <input type="password" x-model="apiKey" @change="saveSettings(); refresh()" placeholder="🔒 API Key" style="width:200px">
@@ -28,7 +28,11 @@
   <!-- Hosts -->
   <div class="hosts-panel">
     <div class="panel-header">
-      <span class="panel-title">Hosts</span>
+      <span class="panel-title">Hosts (Group)</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;padding:0 4px 6px;font-size:12px">
+      <span style="color:var(--gray)" x-text="'Latest rootfs: '+(rootfsVersion||'…')"></span>
+      <button class="btn-outline" title="Pull latest rootfs to all hosts" @click="refreshRootfs()"> ▼ </button>
     </div>
     <template x-if="hosts.length === 0 && !loadingHosts">
       <div class="empty">No hosts</div>
@@ -39,7 +43,6 @@
         <div class="host-top">
           <span class="host-id" x-text="h.instance_id"></span>
           <span class="badge" :class="h.status==='active' ? 'badge-active' : 'badge-inactive'" x-text="h.status"></span>
-          <button class="btn-icon" style="font-size:16px" @click="refresh()">⟳</button>
         </div>
         <div class="host-row">
           <span class="host-label">CPU</span>
@@ -97,21 +100,21 @@
                   <button class="btn-act" title="Copy oc-dashboard.sh command" @click="copyCmd('oc-dashboard.sh '+t.id)">📊</button>
                   <template x-if="t.status==='running'">
                     <span>
-                      <button class="btn-act" title="Pause" @click="tenantAction(t.id,'pause')">⏸</button>
-                      <button class="btn-act" title="Stop" @click="tenantAction(t.id,'stop')">⏹</button>
-                      <button class="btn-act" title="Restart" @click="tenantAction(t.id,'restart')">🔄</button>
+                      <button class="btn-act" title="Pause" @click="tenantAction(t.id,'pause')">⏸︎</button>
+                      <button class="btn-act" title="Stop" @click="tenantAction(t.id,'stop')">⏻</button>
+                      <button class="btn-act" title="Restart" @click="tenantAction(t.id,'restart')">↻</button>
                     </span>
                   </template>
                   <template x-if="t.status==='stopped'">
                     <span>
-                      <button class="btn-act" title="Start" @click="tenantAction(t.id,'start')">▶️</button>
-                      <button class="btn-act" title="Reset rootfs" @click="tenantAction(t.id,'reset')">♻️</button>
+                      <button class="btn-act" title="Start" @click="tenantAction(t.id,'start')">▶︎</button>
+                      <button class="btn-act" title="Reset rootfs" @click="tenantAction(t.id,'reset')">⟲</button>
                     </span>
                   </template>
                   <template x-if="t.status==='paused'">
-                    <button class="btn-act" title="Resume" @click="tenantAction(t.id,'resume')">▶️</button>
+                    <button class="btn-act" title="Resume" @click="tenantAction(t.id,'resume')">▶︎</button>
                   </template>
-                  <button class="btn-del" @click="deleteTenant(t.id)">🗑</button>
+                  <button class="btn-del" @click="deleteTenant(t.id)">✕</button>
                 </div>
               </td>
             </tr>
@@ -146,7 +149,7 @@
 function app() {
   return {
     apiUrl: '', apiKey: '', connected: false, toast: '',
-    hosts: [], tenants: [], selectedHost: null,
+    hosts: [], tenants: [], selectedHost: null, rootfsVersion: '',
     loadingHosts: false, loadingTenants: false,
     showModal: false,
     form: { name: '', vcpu: null, memory_mb: null },
@@ -177,6 +180,7 @@ function app() {
       try { this.hosts = await this.api('GET', 'hosts'); this.connected = true; }
       catch { this.connected = false; }
       this.loadingHosts = false;
+      try { this.rootfsVersion = (await this.api('GET', 'hosts/rootfs-version')).version; } catch {}
     },
     async loadTenants() {
       if (!this.apiUrl || !this.apiKey) return;
@@ -207,9 +211,15 @@ function app() {
       setTimeout(() => this.toast = '', 2000);
       this.loadTenants();
     },
+    async refreshRootfs() {
+      this.toast = 'refresh-rootfs…';
+      await this.api('POST', 'hosts/refresh-rootfs');
+      this.toast = '✓ refresh-rootfs sent';
+      setTimeout(() => this.toast = '', 3000);
+    },
     copyCmd(cmd) {
       navigator.clipboard.writeText(cmd);
-      this.toast = cmd;
+      this.toast = '✓ Copied: ' + cmd;
       setTimeout(() => this.toast = '', 2000);
     },
     cpuPct(h) { return h.total_vcpu ? Math.round(h.used_vcpu / h.total_vcpu * 100) : 0; },
@@ -219,7 +229,7 @@ function app() {
   };
 }
 </script>
-<div class="toast" x-show="toast" x-transition x-text="'✓ Copied: ' + toast"></div>
+<div class="toast" x-show="toast" x-transition x-text="toast"></div>
 <footer class="footer" x-data>
   <span>OpenClaw</span> <span x-text="'v' + (window.OC_VERSION || 'dev')"></span>
 </footer>

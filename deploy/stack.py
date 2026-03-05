@@ -85,6 +85,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
         )
         tenants_table.grant_read_write_data(api_fn)
         hosts_table.grant_read_write_data(api_fn)
+        assets_bucket.grant_read(api_fn)
         api_fn.add_to_role_policy(ssm_policy)
         api_fn.add_to_role_policy(ec2_describe_policy)
         api_fn.add_to_role_policy(iam.PolicyStatement(
@@ -131,11 +132,14 @@ class OpenClawOrchestratorStack(cdk.Stack):
         hosts_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
         hosts_resource.add_method("POST", apigw.LambdaIntegration(api_fn), **key_required)
 
+        host_resource = hosts_resource.add_resource("{instance_id}")
+        host_resource.add_method("DELETE", apigw.LambdaIntegration(api_fn), **key_required)
+
         refresh_rootfs_resource = hosts_resource.add_resource("refresh-rootfs")
         refresh_rootfs_resource.add_method("POST", apigw.LambdaIntegration(api_fn), **key_required)
 
-        host_resource = hosts_resource.add_resource("{instance_id}")
-        host_resource.add_method("DELETE", apigw.LambdaIntegration(api_fn), **key_required)
+        rootfs_version_resource = hosts_resource.add_resource("rootfs-version")
+        rootfs_version_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
 
         # ========== Health Check Lambda ==========
         health_fn = _lambda.Function(self, "HealthCheck",

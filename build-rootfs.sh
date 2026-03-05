@@ -230,10 +230,12 @@ sudo rm -rf ${ROOTFS_DIR}/home/agent/.[!.]*
 sudo umount ${ROOTFS_DIR}
 
 echo "=== Uploading to S3 ==="
-aws s3 cp ${ROOTFS_IMG} s3://${BUCKET}/rootfs/openclaw-rootfs-${VERSION}.ext4 --profile ${PROFILE}
-aws s3 cp ${ROOTFS_IMG} s3://${BUCKET}/rootfs/openclaw-rootfs-latest.ext4 --profile ${PROFILE}
-aws s3 cp ${DATA_IMG} s3://${BUCKET}/rootfs/openclaw-data-template-${VERSION}.ext4 --profile ${PROFILE}
-aws s3 cp ${DATA_IMG} s3://${BUCKET}/rootfs/openclaw-data-template-latest.ext4 --profile ${PROFILE}
+PROFILE_FLAG="${PROFILE:+--profile ${PROFILE}}"
+aws s3 cp ${ROOTFS_IMG} s3://${BUCKET}/rootfs/openclaw-rootfs-${VERSION}.ext4 ${PROFILE_FLAG}
+aws s3 cp ${ROOTFS_IMG} s3://${BUCKET}/rootfs/openclaw-rootfs-latest.ext4 ${PROFILE_FLAG}
+aws s3 cp ${DATA_IMG} s3://${BUCKET}/rootfs/openclaw-data-template-${VERSION}.ext4 ${PROFILE_FLAG}
+aws s3 cp ${DATA_IMG} s3://${BUCKET}/rootfs/openclaw-data-template-latest.ext4 ${PROFILE_FLAG}
+echo "${VERSION}" | aws s3 cp - s3://${BUCKET}/rootfs/version.txt ${PROFILE_FLAG}
 
 ROOTFS_SIZE=$(ls -lh ${ROOTFS_IMG} | awk '{print $5}')
 DATA_SIZE=$(ls -lh ${DATA_IMG} | awk '{print $5}')

@@ -71,8 +71,6 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 "HOSTS_TABLE": hosts_table.table_name,
                 "ASSETS_BUCKET": assets_bucket.bucket_name,
                 "ROOTFS_PREFIX": CFG["s3"]["rootfs_prefix"],
-                "ROOTFS_FILENAME": CFG["s3"]["rootfs_filename"],
-                "DATA_TEMPLATE_FILENAME": CFG["s3"].get("data_template_filename", "openclaw-data-template-latest.ext4"),
                 "HOST_RESERVED_VCPU": str(CFG["host"]["reserved_vcpu"]),
                 "HOST_RESERVED_MEM": str(CFG["host"]["reserved_mem_mb"]),
                 "VM_DEFAULT_VCPU": str(CFG["vm"]["default_vcpu"]),
@@ -237,8 +235,6 @@ class OpenClawOrchestratorStack(cdk.Stack):
         init_sh = (ud_dir / "init-host.sh").read_text()
         init_sh = init_sh.replace("{{ASSETS_BUCKET}}", "PLACEHOLDER_BUCKET")
         init_sh = init_sh.replace("{{ROOTFS_PREFIX}}", CFG["s3"]["rootfs_prefix"])
-        init_sh = init_sh.replace("{{ROOTFS_FILENAME}}", CFG["s3"]["rootfs_filename"])
-        init_sh = init_sh.replace("{{DATA_TEMPLATE_FILENAME}}", CFG["s3"].get("data_template_filename", "openclaw-data-template-latest.ext4"))
         init_sh = init_sh.replace("{{HOSTS_TABLE}}", "PLACEHOLDER_TABLE")
         init_sh = init_sh.replace("{{AVAIL_VCPU}}", str(_avail_vcpu))
         init_sh = init_sh.replace("{{AVAIL_MEM}}", str(_avail_mem))
@@ -251,15 +247,16 @@ class OpenClawOrchestratorStack(cdk.Stack):
             "chmod +x /home/ubuntu/stop-vm.sh && chown ubuntu:ubuntu /home/ubuntu/stop-vm.sh")
 
         # Split script around CDK token placeholders, inject as Fn::Join
-        # PLACEHOLDER_BUCKET appears twice (rootfs + data template downloads)
+        # PLACEHOLDER_BUCKET appears 3 times (manifest + rootfs + data template downloads)
         # PLACEHOLDER_TABLE appears once (dynamodb put-item)
         parts = init_sh.split("PLACEHOLDER_BUCKET")
-        # parts = [before_bucket1, between_buckets, after_bucket2_with_table]
-        table_split = parts[2].split("PLACEHOLDER_TABLE")
+        # parts = [before_bucket1, between_1_2, between_2_3, after_bucket3_with_table]
+        table_split = parts[3].split("PLACEHOLDER_TABLE")
         user_data = ec2.UserData.for_linux()
         user_data.add_commands(cdk.Fn.join("", [
             parts[0], assets_bucket.bucket_name,
             parts[1], assets_bucket.bucket_name,
+            parts[2], assets_bucket.bucket_name,
             table_split[0], hosts_table.table_name,
             table_split[1],
         ]))

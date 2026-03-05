@@ -64,10 +64,17 @@ T0=$SECONDS
 ASSETS=/home/ubuntu/firecracker-assets
 FC_MAJOR=$(echo ${FC_VER} | grep -oP "v\d+\.\d+")
 curl -fsSL -o ${ASSETS}/vmlinux "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${FC_MAJOR}/${ARCH}/vmlinux-5.10.245-no-acpi"
-aws s3 cp s3://{{ASSETS_BUCKET}}/{{ROOTFS_PREFIX}}/{{ROOTFS_FILENAME}} ${ASSETS}/openclaw-rootfs.ext4 --region ${REGION}
-aws s3 cp s3://{{ASSETS_BUCKET}}/{{ROOTFS_PREFIX}}/{{DATA_TEMPLATE_FILENAME}} ${ASSETS}/openclaw-data-template.ext4 --region ${REGION}
+aws s3 cp s3://{{ASSETS_BUCKET}}/{{ROOTFS_PREFIX}}/manifest.json ${ASSETS}/manifest.json --region ${REGION}
+eval $(python3 -c "
+import json; m=json.load(open('${ASSETS}/manifest.json'))
+print(f'ROOTFS_KEY={m[\"rootfs\"]}')
+print(f'DATA_KEY={m[\"data_template\"]}')
+print(f'ROOTFS_VER={m[\"version\"]}')
+")
+aws s3 cp s3://{{ASSETS_BUCKET}}/{{ROOTFS_PREFIX}}/${ROOTFS_KEY} ${ASSETS}/openclaw-rootfs.ext4 --region ${REGION}
+aws s3 cp s3://{{ASSETS_BUCKET}}/{{ROOTFS_PREFIX}}/${DATA_KEY} ${ASSETS}/openclaw-data-template.ext4 --region ${REGION}
 chown -R ubuntu:ubuntu ${ASSETS}
-log "assets downloaded ($((SECONDS-T0))s)"
+log "assets downloaded: rootfs=${ROOTFS_VER} ($((SECONDS-T0))s)"
 
 # Step 4: Deploy launch/stop scripts
 log "step4: deploying scripts"
@@ -76,7 +83,7 @@ log "step4: deploying scripts"
 
 # Step 5: Self-register to DynamoDB
 log "step5: registering to DynamoDB"
-aws dynamodb put-item --table-name {{HOSTS_TABLE}} --region ${REGION} --item '{"instance_id":{"S":"'${INSTANCE_ID}'"},"private_ip":{"S":"'${PRIVATE_IP}'"},"total_vcpu":{"N":"{{AVAIL_VCPU}}"},"total_mem_mb":{"N":"{{AVAIL_MEM}}"},"used_vcpu":{"N":"0"},"used_mem_mb":{"N":"0"},"vm_count":{"N":"0"},"next_vm_num":{"N":"1"},"status":{"S":"active"}}'
+aws dynamodb put-item --table-name {{HOSTS_TABLE}} --region ${REGION} --item '{"instance_id":{"S":"'${INSTANCE_ID}'"},"private_ip":{"S":"'${PRIVATE_IP}'"},"total_vcpu":{"N":"{{AVAIL_VCPU}}"},"total_mem_mb":{"N":"{{AVAIL_MEM}}"},"used_vcpu":{"N":"0"},"used_mem_mb":{"N":"0"},"vm_count":{"N":"0"},"next_vm_num":{"N":"1"},"status":{"S":"active"},"rootfs_version":{"S":"'${ROOTFS_VER}'"}}'
 
 # Step 6: Complete lifecycle hook
 log "step6: completing lifecycle hook"

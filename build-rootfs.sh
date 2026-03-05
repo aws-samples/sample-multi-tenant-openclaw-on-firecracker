@@ -231,11 +231,15 @@ sudo umount ${ROOTFS_DIR}
 
 echo "=== Uploading to S3 ==="
 PROFILE_FLAG="${PROFILE:+--profile ${PROFILE}}"
-aws s3 cp ${ROOTFS_IMG} s3://${BUCKET}/rootfs/openclaw-rootfs-${VERSION}.ext4 ${PROFILE_FLAG}
-aws s3 cp ${ROOTFS_IMG} s3://${BUCKET}/rootfs/openclaw-rootfs-latest.ext4 ${PROFILE_FLAG}
-aws s3 cp ${DATA_IMG} s3://${BUCKET}/rootfs/openclaw-data-template-${VERSION}.ext4 ${PROFILE_FLAG}
-aws s3 cp ${DATA_IMG} s3://${BUCKET}/rootfs/openclaw-data-template-latest.ext4 ${PROFILE_FLAG}
-echo "${VERSION}" | aws s3 cp - s3://${BUCKET}/rootfs/version.txt ${PROFILE_FLAG}
+ROOTFS_KEY="openclaw-rootfs-${VERSION}.ext4"
+DATA_KEY="openclaw-data-template-${VERSION}.ext4"
+aws s3 cp ${ROOTFS_IMG} s3://${BUCKET}/rootfs/${ROOTFS_KEY} ${PROFILE_FLAG}
+aws s3 cp ${DATA_IMG} s3://${BUCKET}/rootfs/${DATA_KEY} ${PROFILE_FLAG}
+
+# Upload manifest (version pointer)
+cat <<EOF | aws s3 cp - s3://${BUCKET}/rootfs/manifest.json ${PROFILE_FLAG} --content-type application/json
+{"version":"${VERSION}","rootfs":"${ROOTFS_KEY}","data_template":"${DATA_KEY}"}
+EOF
 
 ROOTFS_SIZE=$(ls -lh ${ROOTFS_IMG} | awk '{print $5}')
 DATA_SIZE=$(ls -lh ${DATA_IMG} | awk '{print $5}')
@@ -243,9 +247,10 @@ rm -f ${ROOTFS_IMG} ${DATA_IMG}
 
 echo ""
 echo "✓ rootfs ${VERSION} uploaded (${ROOTFS_SIZE})"
-echo "  s3://${BUCKET}/rootfs/openclaw-rootfs-${VERSION}.ext4"
+echo "  s3://${BUCKET}/rootfs/${ROOTFS_KEY}"
 echo "✓ data template ${VERSION} uploaded (${DATA_SIZE})"
-echo "  s3://${BUCKET}/rootfs/openclaw-data-template-${VERSION}.ext4"
+echo "  s3://${BUCKET}/rootfs/${DATA_KEY}"
+echo "✓ manifest.json → ${VERSION}"
 
 # Refresh on active hosts
 if [ -n "${API_URL:-}" ] && [ -n "${API_KEY:-}" ]; then

@@ -57,6 +57,7 @@
         <div class="host-row">
           <span class="host-label">VM</span>
           <span style="color:#fff" x-text="h.vm_count"></span>
+          <span style="margin-left:auto;font-size:11px;color:var(--gray)" x-text="h.rootfs_version||''"></span>
         </div>
       </div>
     </template>
@@ -75,7 +76,7 @@
         <thead>
           <tr>
             <th>ID</th><th>Name</th><th>Status</th><th>vCPU</th><th>Mem (MB)</th><th>Guest IP</th>
-            <th>Port</th><th>Host ID</th><th>VM Health</th><th>Gateway Health</th><th>Actions</th>
+            <th>Port</th><th>Host ID</th><th>Rootfs</th><th>VM Health</th><th>Gateway Health</th><th>Actions</th>
           </tr>
         </thead>
         <tbody>
@@ -92,6 +93,7 @@
               <td x-text="t.guest_ip || '-'"></td>
               <td x-text="t.host_port || '-'"></td>
               <td x-text="(t.host_id||'').substring(0,12)+'…'"></td>
+              <td style="font-size:11px;color:var(--gray)" x-text="t.rootfs_version||'-'"></td>
               <td><span class="health-dot" :class="healthClass(t.vm_health)"></span></td>
               <td><span class="health-dot" :class="healthClass(t.app_health)"></span></td>
               <td>

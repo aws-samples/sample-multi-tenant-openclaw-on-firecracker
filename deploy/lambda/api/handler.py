@@ -121,6 +121,7 @@ def create_tenant(body=None):
         "mem_mb": mem_mb,
         "status": "creating",
         "health_failures": 0,
+        "rootfs_version": host.get("rootfs_version", ""),
         "created_at": now,
         "updated_at": now,
     })
@@ -269,11 +270,18 @@ def tenant_action(tenant_id, action):
     else:
         return _resp(400, {"error": f"unknown action: {action}"})
 
+    update_expr = "SET #s = :s, updated_at = :t"
+    expr_values = {":s": new_status, ":t": _now()}
+    if action == "reset":
+        host = hosts_table.get_item(Key={"instance_id": item["host_id"]}).get("Item", {})
+        update_expr += ", rootfs_version = :rv"
+        expr_values[":rv"] = host.get("rootfs_version", "")
+
     tenants_table.update_item(
         Key={"id": tenant_id},
-        UpdateExpression="SET #s = :s, updated_at = :t",
+        UpdateExpression=update_expr,
         ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":s": new_status, ":t": _now()},
+        ExpressionAttributeValues=expr_values,
     )
     return _resp(200, {"id": tenant_id, "status": new_status})
 
@@ -346,23 +354,31 @@ def deregister_host(instance_id):
 
 
 def rootfs_version():
+    manifest = _get_manifest()
+    return _resp(200, {"version": manifest.get("version", "unknown")})
+
+
+def _get_manifest():
+    """Read manifest.json from S3, return dict."""
     bucket = os.environ.get("ASSETS_BUCKET", "")
     prefix = os.environ.get("ROOTFS_PREFIX", "rootfs")
     try:
-        obj = s3.get_object(Bucket=bucket, Key=f"{prefix}/version.txt")
-        version = obj["Body"].read().decode().strip()
+        obj = s3.get_object(Bucket=bucket, Key=f"{prefix}/manifest.json")
+        return json.loads(obj["Body"].read().decode())
     except Exception:
-        version = "unknown"
-    return _resp(200, {"version": version})
+        return {}
 
 
 def refresh_rootfs():
-    """Download latest rootfs + data template from S3 to all active/idle hosts."""
+    """Download rootfs + data template per manifest.json to all active/idle hosts."""
+    manifest = _get_manifest()
+    if not manifest:
+        return _resp(500, {"error": "manifest.json not found"})
+
     bucket = os.environ.get("ASSETS_BUCKET", "")
     prefix = os.environ.get("ROOTFS_PREFIX", "rootfs")
-    filename = os.environ.get("ROOTFS_FILENAME", "openclaw-rootfs-latest.ext4")
-    data_filename = os.environ.get("DATA_TEMPLATE_FILENAME", "openclaw-data-template-latest.ext4")
     region = os.environ.get("AWS_REGION", "ap-northeast-1")
+    version = manifest["version"]
 
     hosts = hosts_table.scan(
         FilterExpression="#s IN (:a, :i)",
@@ -374,9 +390,11 @@ def refresh_rootfs():
         return _resp(200, {"message": "no active hosts", "updated": 0})
 
     ids = [h["instance_id"] for h in hosts]
+    assets = "/data/firecracker-assets"
     cmds = [
-        f"aws s3 cp s3://{bucket}/{prefix}/{filename} /data/firecracker-assets/openclaw-rootfs.ext4 --region {region}",
-        f"aws s3 cp s3://{bucket}/{prefix}/{data_filename} /data/firecracker-assets/openclaw-data-template.ext4 --region {region}",
+        f"aws s3 cp s3://{bucket}/{prefix}/manifest.json {assets}/manifest.json --region {region}",
+        f"aws s3 cp s3://{bucket}/{prefix}/{manifest['rootfs']} {assets}/openclaw-rootfs.ext4 --region {region}",
+        f"aws s3 cp s3://{bucket}/{prefix}/{manifest['data_template']} {assets}/openclaw-data-template.ext4 --region {region}",
     ]
     try:
         ssm.send_command(
@@ -387,7 +405,15 @@ def refresh_rootfs():
     except Exception as e:
         return _resp(500, {"error": str(e)})
 
-    return _resp(200, {"message": "refresh started", "hosts": ids})
+    # Update hosts table with new version
+    for host_id in ids:
+        hosts_table.update_item(
+            Key={"instance_id": host_id},
+            UpdateExpression="SET rootfs_version = :v",
+            ExpressionAttributeValues={":v": version},
+        )
+
+    return _resp(200, {"message": "refresh started", "version": version, "hosts": ids})
 
 
 # ========== Pending Tenant Processing ==========

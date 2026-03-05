@@ -12,7 +12,11 @@ IDLE_TIMEOUT = int(os.environ["IDLE_TIMEOUT_MINUTES"])
 
 def lambda_handler(event, context):
     now = datetime.now(timezone.utc)
-    hosts = hosts_table.scan().get("Items", [])
+    hosts = hosts_table.scan(
+        FilterExpression="#s <> :d",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":d": "deleted"},
+    ).get("Items", [])
 
     for h in hosts:
         instance_id = h["instance_id"]
@@ -46,7 +50,6 @@ def lambda_handler(event, context):
                         InstanceId=instance_id,
                         ShouldDecrementDesiredCapacity=True,
                     )
-                    hosts_table.delete_item(Key={"instance_id": instance_id})
                 except Exception as e:
                     print(f"terminate failed: {e}")
             else:

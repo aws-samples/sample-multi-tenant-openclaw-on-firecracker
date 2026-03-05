@@ -13,6 +13,14 @@ else
   exit 1
 fi
 
+OC_ENV_FILE="$SCRIPT_DIR/.env.openclaw"
+if [ -f "$OC_ENV_FILE" ]; then
+  source "$OC_ENV_FILE"
+else
+  echo "❌ 未找到 .env.openclaw，请创建并填写 OpenClaw 应用配置"
+  exit 1
+fi
+
 VERSION="${1:-v1.0}"
 BUCKET="${ASSETS_BUCKET}"
 ROOTFS_IMG="/tmp/openclaw-rootfs-${VERSION}.ext4"
@@ -21,12 +29,12 @@ ROOTFS_DIR="/tmp/openclaw-rootfs-build"
 
 # 依赖检查
 MISSING=()
-for cmd in debootstrap aws mkfs.ext4 curl; do
+for cmd in debootstrap aws mkfs.ext4 curl pigz e2fsck resize2fs; do
   command -v $cmd &>/dev/null || MISSING+=($cmd)
 done
 if [ ${#MISSING[@]} -gt 0 ]; then
   echo "❌ 缺少依赖: ${MISSING[*]}"
-  echo "   sudo apt-get install -y debootstrap e2fsprogs awscli curl"
+  echo "   sudo apt-get install -y debootstrap e2fsprogs awscli curl pigz"
   exit 1
 fi
 
@@ -58,6 +66,9 @@ sudo debootstrap --include=curl,ca-certificates,systemd,dbus,iproute2,iputils-pi
 sudo mount --bind /proc ${ROOTFS_DIR}/proc
 sudo mount --bind /sys ${ROOTFS_DIR}/sys
 sudo mount --bind /dev ${ROOTFS_DIR}/dev
+
+# 将 openclaw 变量注入 chroot（heredoc 'CHROOT' 不展开变量）
+sudo cp "$OC_ENV_FILE" ${ROOTFS_DIR}/tmp/.env.openclaw
 
 sudo chroot ${ROOTFS_DIR} /bin/bash << 'CHROOT'
 set -e
@@ -137,9 +148,28 @@ echo "node=$(node --version) npm=$(npm --version)"
 npm install -g openclaw
 chown -R agent:agent /usr/lib/node_modules
 
-# Configure gateway to listen on LAN (0.0.0.0) and disable auth
-HOME=/home/agent su -s /bin/bash agent -c "openclaw config set 'gateway.bind' 'lan'"
-HOME=/home/agent su -s /bin/bash agent -c "openclaw config set 'gateway.auth.mode' 'none'"
+# Configure gateway via onboard (platform-level defaults, from .env.openclaw)
+source /tmp/.env.openclaw
+OC_BASE_URL="${OPENCLAW_BASE_URL:?OPENCLAW_BASE_URL required}"
+OC_MODEL_ID="${OPENCLAW_MODEL_ID:?OPENCLAW_MODEL_ID required}"
+OC_API_KEY="${OPENCLAW_API_KEY:?OPENCLAW_API_KEY required}"
+OC_TOOLS_PROFILE="${OPENCLAW_TOOLS_PROFILE:-coding}"
+OC_DM_SCOPE="${OPENCLAW_DM_SCOPE:-per-peer}"
+
+HOME=/home/agent su -s /bin/bash agent -c "openclaw onboard --non-interactive \
+  --accept-risk \
+  --mode local \
+  --auth-choice custom-api-key \
+  --custom-base-url '${OC_BASE_URL}' \
+  --custom-model-id '${OC_MODEL_ID}' \
+  --custom-api-key '${OC_API_KEY}' \
+  --gateway-bind lan \
+  --gateway-auth token \
+  --skip-health"
+
+HOME=/home/agent su -s /bin/bash agent -c "openclaw config set 'tools.profile' '${OC_TOOLS_PROFILE}'"
+HOME=/home/agent su -s /bin/bash agent -c "openclaw config set 'session.dmScope' '${OC_DM_SCOPE}'"
+rm -f /tmp/.env.openclaw
 
 # --- Gateway service file (built into /home/agent, will be in data template) ---
 NODE_BIN=$(which node)
@@ -229,21 +259,25 @@ sudo rm -rf ${ROOTFS_DIR}/home/agent/.[!.]*
 
 sudo umount ${ROOTFS_DIR}
 
+echo "=== Compressing images ==="
+pigz -f ${ROOTFS_IMG}
+pigz -f ${DATA_IMG}
+
 echo "=== Uploading to S3 ==="
 PROFILE_FLAG="${PROFILE:+--profile ${PROFILE}}"
-ROOTFS_KEY="openclaw-rootfs-${VERSION}.ext4"
-DATA_KEY="openclaw-data-template-${VERSION}.ext4"
-aws s3 cp ${ROOTFS_IMG} s3://${BUCKET}/rootfs/${ROOTFS_KEY} ${PROFILE_FLAG}
-aws s3 cp ${DATA_IMG} s3://${BUCKET}/rootfs/${DATA_KEY} ${PROFILE_FLAG}
+ROOTFS_KEY="openclaw-rootfs-${VERSION}.ext4.gz"
+DATA_KEY="openclaw-data-template-${VERSION}.ext4.gz"
+aws s3 cp ${ROOTFS_IMG}.gz s3://${BUCKET}/rootfs/${ROOTFS_KEY} ${PROFILE_FLAG}
+aws s3 cp ${DATA_IMG}.gz s3://${BUCKET}/rootfs/${DATA_KEY} ${PROFILE_FLAG}
 
 # Upload manifest (version pointer)
 cat <<EOF | aws s3 cp - s3://${BUCKET}/rootfs/manifest.json ${PROFILE_FLAG} --content-type application/json
 {"version":"${VERSION}","rootfs":"${ROOTFS_KEY}","data_template":"${DATA_KEY}"}
 EOF
 
-ROOTFS_SIZE=$(ls -lh ${ROOTFS_IMG} | awk '{print $5}')
-DATA_SIZE=$(ls -lh ${DATA_IMG} | awk '{print $5}')
-rm -f ${ROOTFS_IMG} ${DATA_IMG}
+ROOTFS_SIZE=$(ls -lh ${ROOTFS_IMG}.gz | awk '{print $5}')
+DATA_SIZE=$(ls -lh ${DATA_IMG}.gz | awk '{print $5}')
+rm -f ${ROOTFS_IMG}.gz ${DATA_IMG}.gz
 
 echo ""
 echo "✓ rootfs ${VERSION} uploaded (${ROOTFS_SIZE})"

@@ -25,6 +25,9 @@ ASG_NAME = os.environ.get("ASG_NAME", "openclaw-hosts-asg")
 def lambda_handler(event, context):
     # EventBridge: new host InService → process pending tenants
     if event.get("source") == "aws.autoscaling":
+        detail_type = event.get("detail-type", "")
+        if "terminate" in detail_type.lower():
+            return cleanup_terminated_host(event)
         return process_pending()
 
     method = event["httpMethod"]
@@ -290,7 +293,12 @@ def tenant_action(tenant_id, action):
 
 
 def list_hosts():
-    return _resp(200, hosts_table.scan().get("Items", []))
+    items = hosts_table.scan(
+        FilterExpression="#s <> :d",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":d": "deleted"},
+    ).get("Items", [])
+    return _resp(200, items)
 
 
 def register_host(body):
@@ -322,7 +330,30 @@ def register_host(body):
 
 
 def deregister_host(instance_id):
-    # Stop all tenants on this host
+    hosts_table.update_item(
+        Key={"instance_id": instance_id},
+        UpdateExpression="SET #s = :s",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":s": "draining"},
+    )
+    # Terminate via ASG API to trigger termination lifecycle hook
+    try:
+        asg_client.terminate_instance_in_auto_scaling_group(
+            InstanceId=instance_id,
+            ShouldDecrementDesiredCapacity=False,
+        )
+    except Exception as e:
+        print(f"Failed to terminate {instance_id}: {e}")
+    return _resp(200, {"instance_id": instance_id, "status": "draining"})
+
+
+def cleanup_terminated_host(event):
+    """Called by termination lifecycle hook — cleanup DynamoDB then complete hook."""
+    detail = event["detail"]
+    instance_id = detail["EC2InstanceId"]
+    print(f"cleanup_terminated_host: {instance_id}")
+
+    # Delete all tenants on this host
     tenants = tenants_table.scan(
         FilterExpression="host_id = :h AND #s <> :d",
         ExpressionAttributeNames={"#s": "status"},
@@ -333,24 +364,28 @@ def deregister_host(instance_id):
             Key={"id": t["id"]},
             UpdateExpression="SET #s = :s, updated_at = :t",
             ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={":s": "stopped", ":t": _now()},
+            ExpressionAttributeValues={":s": "deleted", ":t": _now()},
         )
 
+    # Delete host
     hosts_table.update_item(
         Key={"instance_id": instance_id},
-        UpdateExpression="SET #s = :s",
+        UpdateExpression="SET #s = :s, updated_at = :t",
         ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":s": "draining"},
+        ExpressionAttributeValues={":s": "deleted", ":t": _now()},
     )
+    print(f"cleaned up host {instance_id}, {len(tenants)} tenants deleted")
 
-    # Terminate EC2 instance (ASG will launch replacement)
+    # Complete lifecycle hook
     try:
-        ec2 = boto3.client("ec2")
-        ec2.terminate_instances(InstanceIds=[instance_id])
+        asg_client.complete_lifecycle_action(
+            LifecycleHookName=detail["LifecycleHookName"],
+            AutoScalingGroupName=detail["AutoScalingGroupName"],
+            LifecycleActionResult="CONTINUE",
+            InstanceId=instance_id,
+        )
     except Exception as e:
-        print(f"Failed to terminate {instance_id}: {e}")
-
-    return _resp(200, {"instance_id": instance_id, "status": "draining", "tenants_stopped": len(tenants)})
+        print(f"complete_lifecycle_action failed: {e}")
 
 
 def rootfs_version():
@@ -393,8 +428,10 @@ def refresh_rootfs():
     assets = "/data/firecracker-assets"
     cmds = [
         f"aws s3 cp s3://{bucket}/{prefix}/manifest.json {assets}/manifest.json --region {region}",
-        f"aws s3 cp s3://{bucket}/{prefix}/{manifest['rootfs']} {assets}/openclaw-rootfs.ext4 --region {region}",
-        f"aws s3 cp s3://{bucket}/{prefix}/{manifest['data_template']} {assets}/openclaw-data-template.ext4 --region {region}",
+        f"aws s3 cp s3://{bucket}/{prefix}/{manifest['rootfs']} {assets}/rootfs.gz --region {region}",
+        f"aws s3 cp s3://{bucket}/{prefix}/{manifest['data_template']} {assets}/data.gz --region {region}",
+        f"pigz -dc {assets}/rootfs.gz > {assets}/openclaw-rootfs.ext4 && rm -f {assets}/rootfs.gz",
+        f"pigz -dc {assets}/data.gz > {assets}/openclaw-data-template.ext4 && rm -f {assets}/data.gz",
     ]
     try:
         ssm.send_command(

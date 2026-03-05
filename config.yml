@@ -20,8 +20,6 @@ vm:
 # ========== S3 ==========
 s3:
   rootfs_prefix: "rootfs"          # rootfs 镜像路径前缀
-  rootfs_filename: "openclaw-rootfs-latest.ext4"
-  data_template_filename: "openclaw-data-template-latest.ext4"
   backup_prefix: "backups"         # 数据卷备份路径前缀
   backup_retention_days: 7
 

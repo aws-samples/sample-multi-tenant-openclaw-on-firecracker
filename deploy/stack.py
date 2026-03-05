@@ -87,7 +87,9 @@ class OpenClawOrchestratorStack(cdk.Stack):
         api_fn.add_to_role_policy(ssm_policy)
         api_fn.add_to_role_policy(ec2_describe_policy)
         api_fn.add_to_role_policy(iam.PolicyStatement(
-            actions=["autoscaling:DescribeAutoScalingGroups", "autoscaling:SetDesiredCapacity"],
+            actions=["autoscaling:DescribeAutoScalingGroups", "autoscaling:SetDesiredCapacity",
+                     "autoscaling:CompleteLifecycleAction",
+                     "autoscaling:TerminateInstanceInAutoScalingGroup"],
             resources=["*"],
         ))
 
@@ -369,12 +371,27 @@ class OpenClawOrchestratorStack(cdk.Stack):
             heartbeat_timeout=Duration.seconds(CFG["asg"]["lifecycle_hook_timeout"]),
             default_result=autoscaling.DefaultResult.ABANDON,
         )
+        asg.add_lifecycle_hook("TerminateHook",
+            lifecycle_hook_name="openclaw-host-terminate",
+            lifecycle_transition=autoscaling.LifecycleTransition.INSTANCE_TERMINATING,
+            heartbeat_timeout=Duration.seconds(120),
+            default_result=autoscaling.DefaultResult.CONTINUE,
+        )
 
         # When a new host completes init → process pending tenants
         events.Rule(self, "HostReadyRule",
             event_pattern=events.EventPattern(
                 source=["aws.autoscaling"],
                 detail_type=["EC2 Instance Launch Successful"],
+            ),
+            targets=[targets.LambdaFunction(api_fn)],
+        )
+
+        # When a host is terminating → cleanup DynamoDB records
+        events.Rule(self, "HostTerminateRule",
+            event_pattern=events.EventPattern(
+                source=["aws.autoscaling"],
+                detail_type=["EC2 Instance-terminate Lifecycle Action"],
             ),
             targets=[targets.LambdaFunction(api_fn)],
         )

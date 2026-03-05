@@ -1,6 +1,6 @@
 # OpenClaw on EC2 microVM
 
-![Version](https://img.shields.io/badge/version-0.4.4-blue)
+![Version](https://img.shields.io/badge/version-0.5.0-blue)
 
 基于 AWS Firecracker microVM 的 OpenClaw 多租户隔离部署方案。每个租户运行在独立的 microVM 中，通过 API 统一管理，ASG 自动扩缩宿主机，空闲主机自动回收。
 
@@ -8,7 +8,8 @@
 
 ## 功能概览
 
-- **租户管理** — 通过 API 创建/删除/查询租户，每个租户独占一个 microVM
+- **租户管理** — 通过 API 创建/删除/查询租户。每个租户是一个运行在独立 Firecracker microVM 中的 OpenClaw 实例，拥有独立的系统盘、数据盘和网络
+- **安全隔离** — 基于 Firecracker microVM 实现租户间隔离，独立内核、独立网络，互不可见
 - **自动调度** — 创建租户时自动选择有空闲资源的宿主机，资源不足时自动扩容
 - **自动缩容** — 空闲宿主机超时后自动回收，节省成本（两轮确认防误杀）
 - **健康检查** — 每分钟探活所有 VM，连续失败自动重启
@@ -88,10 +89,20 @@ openclaw-firecracker/
 ./setup.sh ap-northeast-1 lab
 # 完成后环境变量保存在 .env.deploy
 
-# 2. 构建并上传 rootfs (首次部署)
+# 2. 配置 OpenClaw 应用参数 (首次)
+cat > .env.openclaw << 'EOF'
+# OpenClaw 默认配置 (烧入 data template)
+OPENCLAW_API_KEY=your-api-key
+OPENCLAW_BASE_URL=https://your-provider/v1
+OPENCLAW_MODEL_ID=your-model-id
+OPENCLAW_TOOLS_PROFILE=coding
+OPENCLAW_DM_SCOPE=per-peer
+EOF
+
+# 3. 构建并上传 rootfs
 ./build-rootfs.sh v1.0
 
-# 3. 创建租户
+# 4. 创建租户(Openclaw 实例)
 source .env.deploy
 curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" \
   -d '{"name":"my-agent","vcpu":2,"mem_mb":4096}' | jq .
@@ -133,7 +144,17 @@ Web 管理控制台，支持 Host/Tenant 可视化管理。
 2. 下一轮确认仍空闲且 ASG 实例数 > min → 终止实例
 3. 期间如有新租户分配到该宿主机 → 自动恢复 `active`，取消回收
 
-## 配置说明 (config.yml)
+## 配置说明
+
+### 配置文件
+
+| 文件 | 用途 |
+|------|------|--------|
+| `config.yml` | 基础设施参数 (实例类型、VM 规格、S3 前缀、ASG) |
+| `.env.deploy` | 部署环境 (region、API URL/Key、bucket) |
+| `.env.openclaw` | OpenClaw 应用配置 (模型、API key、tools profile) |
+
+### config.yml
 
 | 分类 | 配置项 | 默认值 | 说明 |
 |------|--------|--------|------|
@@ -193,15 +214,20 @@ VMn: tap-vmN  host=172.16.N.1/24  guest=172.16.N.2/24
 
 构建脚本生成两个镜像：rootfs (系统+软件) 和 data template (/home/agent 预配置内容)。
 
-```bash
-# 构建并上传 (版本号 + latest, 共 4 个文件)
-./build-rootfs.sh v1.6
+镜像版本通过 S3 `manifest.json` 管理，hosts/tenants 表记录各自使用的 `rootfs_version`。
 
-# 更新已有宿主机上的镜像
+```bash
+# 构建并上传 (更新 manifest.json + refresh 宿主机)
+./build-rootfs.sh v1.8
+
+# 手动刷新宿主机镜像
 source .env.deploy
 curl -s -X POST "${API_URL}hosts/refresh-rootfs" -H "x-api-key: ${API_KEY}" | jq .
 
-# 新建的 VM 自动使用新版本，已有 VM 不受影响
+# 查询当前版本
+curl -s "${API_URL}hosts/rootfs-version" -H "x-api-key: ${API_KEY}" | jq .
+
+# 新建的 VM 自动使用新版本，已有 VM 需 reset 才会更新
 ```
 
 ## 宿主机管理

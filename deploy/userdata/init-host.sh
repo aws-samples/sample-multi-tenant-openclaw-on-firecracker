@@ -16,7 +16,7 @@ echo 'KERNEL=="kvm", MODE="0666"' > /etc/udev/rules.d/99-kvm.rules
 # Step 2: Install tools + Firecracker
 log "step2: installing tools + firecracker"
 apt-get update -qq
-apt-get install -y -qq curl jq sshpass unzip > /dev/null 2>&1
+apt-get install -y -qq curl jq sshpass unzip pigz > /dev/null 2>&1
 if ! command -v aws &>/dev/null; then
   curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
   cd /tmp && unzip -qo awscliv2.zip && ./aws/install &>/dev/null; cd -
@@ -71,8 +71,10 @@ print(f'ROOTFS_KEY={m[\"rootfs\"]}')
 print(f'DATA_KEY={m[\"data_template\"]}')
 print(f'ROOTFS_VER={m[\"version\"]}')
 ")
-aws s3 cp s3://{{ASSETS_BUCKET}}/{{ROOTFS_PREFIX}}/${ROOTFS_KEY} ${ASSETS}/openclaw-rootfs.ext4 --region ${REGION}
-aws s3 cp s3://{{ASSETS_BUCKET}}/{{ROOTFS_PREFIX}}/${DATA_KEY} ${ASSETS}/openclaw-data-template.ext4 --region ${REGION}
+aws s3 cp s3://{{ASSETS_BUCKET}}/{{ROOTFS_PREFIX}}/${ROOTFS_KEY} ${ASSETS}/rootfs.gz --region ${REGION}
+aws s3 cp s3://{{ASSETS_BUCKET}}/{{ROOTFS_PREFIX}}/${DATA_KEY} ${ASSETS}/data.gz --region ${REGION}
+pigz -dc ${ASSETS}/rootfs.gz > ${ASSETS}/openclaw-rootfs.ext4 && rm -f ${ASSETS}/rootfs.gz
+pigz -dc ${ASSETS}/data.gz > ${ASSETS}/openclaw-data-template.ext4 && rm -f ${ASSETS}/data.gz
 chown -R ubuntu:ubuntu ${ASSETS}
 log "assets downloaded: rootfs=${ROOTFS_VER} ($((SECONDS-T0))s)"
 

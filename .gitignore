@@ -4,7 +4,7 @@
 
 # Environment
 .venv
-.env.deploy
+.env.*
 logs/*
 
 # Python

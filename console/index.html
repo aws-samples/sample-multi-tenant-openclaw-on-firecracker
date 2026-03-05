@@ -214,6 +214,7 @@ function app() {
       this.loadTenants();
     },
     async refreshRootfs() {
+      if (!confirm('Pull latest rootfs to all hosts?')) return;
       this.toast = 'refresh-rootfs…';
       await this.api('POST', 'hosts/refresh-rootfs');
       this.toast = '✓ refresh-rootfs sent';

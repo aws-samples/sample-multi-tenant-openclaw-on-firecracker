@@ -13,7 +13,8 @@ host:
 vm:
   default_vcpu: 2
   default_mem_mb: 4096
-  data_disk_mb: 8192               # 每个 VM 的数据盘大小 (MB)
+  rootfs_size_mb: 6144             # 每个 VM 系统盘大小 (MB)
+  data_disk_mb: 8192               # 每个 VM 数据盘大小 (MB)
   gateway_port_base: 18789         # 第 N 个 VM 的宿主机端口 = base + N - 1
   subnet_prefix: "172.16"          # VM 网段: 172.16.{N}.2
 

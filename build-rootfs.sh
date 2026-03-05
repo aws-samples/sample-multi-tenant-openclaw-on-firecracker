@@ -55,12 +55,13 @@ sudo umount -l ${ROOTFS_DIR}/proc ${ROOTFS_DIR}/sys ${ROOTFS_DIR}/dev 2>/dev/nul
 sudo umount -l ${ROOTFS_DIR} 2>/dev/null || true
 rm -f ${ROOTFS_IMG} ${DATA_IMG}
 
-truncate -s 8G ${ROOTFS_IMG}
+ROOTFS_SIZE_MB=$(grep 'rootfs_size_mb:' "${SCRIPT_DIR}/config.yml" | awk '{print $2}')
+truncate -s ${ROOTFS_SIZE_MB}M ${ROOTFS_IMG}
 mkfs.ext4 -q ${ROOTFS_IMG}
 sudo mkdir -p ${ROOTFS_DIR}
 sudo mount ${ROOTFS_IMG} ${ROOTFS_DIR}
 
-sudo debootstrap --include=curl,ca-certificates,systemd,dbus,iproute2,iputils-ping,git \
+sudo debootstrap --include=curl,ca-certificates,systemd,dbus,iproute2,iputils-ping,git,jq \
   noble ${ROOTFS_DIR} ${MIRROR}
 
 sudo mount --bind /proc ${ROOTFS_DIR}/proc
@@ -200,34 +201,6 @@ WantedBy=default.target
 GWSVC
 ln -sf ../openclaw-gateway.service /home/agent/.config/systemd/user/default.target.wants/openclaw-gateway.service
 chown -R agent:agent /home/agent
-
-# --- Mission Control Dashboard ---
-NODE_BIN_DIR=$(dirname $(which node))
-git clone --depth 1 https://github.com/robsannaa/openclaw-mission-control.git /opt/openclaw-mission-control
-cd /opt/openclaw-mission-control
-npm install
-npm run build
-
-cat > /etc/systemd/system/openclaw-dashboard.service << DASHSVC
-[Unit]
-Description=OpenClaw Mission Control Dashboard
-After=network.target
-
-[Service]
-Type=simple
-User=agent
-WorkingDirectory=/opt/openclaw-mission-control
-Environment=PORT=3333
-Environment=HOST=0.0.0.0
-Environment=PATH=${NODE_BIN_DIR}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=${NODE_BIN_DIR}/npm run start -- -H 0.0.0.0 -p 3333
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-DASHSVC
-systemctl enable openclaw-dashboard
 
 # --- Cleanup ---
 apt-get clean

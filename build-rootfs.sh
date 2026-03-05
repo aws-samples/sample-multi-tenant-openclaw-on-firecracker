@@ -97,6 +97,11 @@ useradd -m -s /bin/bash agent
 echo "agent:OpenCl@w2026" | chpasswd
 echo "agent ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/agent
 
+# npm global prefix for agent user (avoids writing to /usr/bin)
+mkdir -p /home/agent/.npm-global/bin
+echo "prefix=/home/agent/.npm-global" > /home/agent/.npmrc
+echo 'export PATH="/home/agent/.npm-global/bin:$PATH"' >> /home/agent/.bashrc
+
 # Enable systemd user session for agent
 mkdir -p /var/lib/systemd/linger
 touch /var/lib/systemd/linger/agent
@@ -130,7 +135,7 @@ echo "node=$(node --version) npm=$(npm --version)"
 
 # --- OpenClaw CLI ---
 npm install -g openclaw
-chown -R agent:agent /usr/lib/node_modules /usr/bin
+chown -R agent:agent /usr/lib/node_modules
 
 # Configure gateway to listen on LAN (0.0.0.0) and disable auth
 HOME=/home/agent su -s /bin/bash agent -c "openclaw config set 'gateway.bind' 'lan'"

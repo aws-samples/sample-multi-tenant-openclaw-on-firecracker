@@ -1,6 +1,6 @@
 # OpenClaw on EC2 microVM
 
-![Version](https://img.shields.io/badge/version-0.4.1-blue)
+![Version](https://img.shields.io/badge/version-0.4.2-blue)
 
 基于 AWS Firecracker microVM 的 OpenClaw 多租户隔离部署方案。每个租户运行在独立的 microVM 中，通过 API 统一管理，ASG 自动扩缩宿主机，空闲主机自动回收。
 
@@ -163,9 +163,12 @@ Web 管理控制台，支持 Host/Tenant 可视化管理。
 | POST | /tenants | 创建租户 `{"name":"xx","vcpu":2,"mem_mb":4096}` |
 | GET | /tenants/{id} | 查询单个租户 |
 | DELETE | /tenants/{id} | 删除租户 (`?keep_data=true` 保留数据盘) |
-| POST | /tenants/{id}/restart | 重启租户 VM |
-| POST | /tenants/{id}/stop | 停止租户 VM |
-| POST | /tenants/{id}/start | 启动租户 VM |
+| POST | /tenants/{id}/restart | 重启租户 VM（复用磁盘，快速） |
+| POST | /tenants/{id}/stop | 停止租户 VM（磁盘保留） |
+| POST | /tenants/{id}/start | 启动已停止的租户 VM |
+| POST | /tenants/{id}/pause | 冻结 vCPU（Firecracker 原生，即时） |
+| POST | /tenants/{id}/resume | 恢复已暂停的租户 VM |
+| POST | /tenants/{id}/reset | 重装系统盘（data 卷保留） |
 | GET | /hosts | 列出所有宿主机 |
 | POST | /hosts | 注册宿主机 (UserData 自动调用) |
 | POST | /hosts/refresh-rootfs | 推送最新 rootfs + data template 到所有宿主机 |

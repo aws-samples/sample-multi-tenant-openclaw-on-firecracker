@@ -147,7 +147,7 @@ def delete_tenant(tenant_id, query_params):
 
     # Stop VM via SSM
     vm_num = int(item.get("vm_num", 1))
-    _ssm_run(item["host_id"], f"~/stop-vm.sh {tenant_id} {vm_num}")
+    _ssm_run(item["host_id"], f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num}")
 
     # Remove DNAT rule (best effort)
     _ssm_run(item["host_id"],
@@ -192,15 +192,77 @@ def tenant_action(tenant_id, action):
 
     if action == "restart":
         vm_num = int(item.get("vm_num", 1))
-        _ssm_run(item["host_id"], f"~/stop-vm.sh {tenant_id} {vm_num} && sleep 2 && ~/launch-vm.sh {tenant_id} {vm_num} {item['vcpu']} {item['mem_mb']}")
+        guest_ip = item.get("guest_ip", "")
+        host_port = item.get("host_port", "")
+        stop_cmd = f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num}"
+        launch_cmd = f"/home/ubuntu/launch-vm.sh {tenant_id} {vm_num} {item['vcpu']} {item['mem_mb']}"
+        # Re-add DNAT after restart
+        dnat_cmd = (
+            f"sudo iptables -t nat -A PREROUTING -i $(ip route show default | awk '{{print $5}}' | head -1) "
+            f"-p tcp --dport {host_port} -j DNAT --to-destination {guest_ip}:{VM_PORT_BASE}"
+        ) if guest_ip and host_port else ""
+        full_cmd = f"{stop_cmd} && sleep 2 && {launch_cmd}"
+        if dnat_cmd:
+            full_cmd += f" && {dnat_cmd}"
+        _ssm_run(item["host_id"], full_cmd, timeout=300)
         new_status = "running"
     elif action == "stop":
         vm_num = int(item.get("vm_num", 1))
-        _ssm_run(item["host_id"], f"~/stop-vm.sh {tenant_id} {vm_num}")
+        guest_ip = item.get("guest_ip", "")
+        host_port = item.get("host_port", "")
+        stop_cmd = f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num}"
+        # Remove DNAT rule
+        dnat_del = (
+            f"sudo iptables -t nat -D PREROUTING -i $(ip route show default | awk '{{print $5}}' | head -1) "
+            f"-p tcp --dport {host_port} -j DNAT --to-destination {guest_ip}:{VM_PORT_BASE} 2>/dev/null || true"
+        ) if guest_ip and host_port else ""
+        full_cmd = stop_cmd
+        if dnat_del:
+            full_cmd += f" && {dnat_del}"
+        _ssm_run(item["host_id"], full_cmd)
         new_status = "stopped"
     elif action == "start":
         vm_num = int(item.get("vm_num", 1))
-        _ssm_run(item["host_id"], f"~/launch-vm.sh {tenant_id} {vm_num} {item['vcpu']} {item['mem_mb']}")
+        guest_ip = item.get("guest_ip", "")
+        host_port = item.get("host_port", "")
+        launch_cmd = f"/home/ubuntu/launch-vm.sh {tenant_id} {vm_num} {item['vcpu']} {item['mem_mb']}"
+        dnat_cmd = (
+            f"sudo iptables -t nat -A PREROUTING -i $(ip route show default | awk '{{print $5}}' | head -1) "
+            f"-p tcp --dport {host_port} -j DNAT --to-destination {guest_ip}:{VM_PORT_BASE}"
+        ) if guest_ip and host_port else ""
+        full_cmd = launch_cmd
+        if dnat_cmd:
+            full_cmd += f" && {dnat_cmd}"
+        _ssm_run(item["host_id"], full_cmd, timeout=300)
+        new_status = "running"
+    elif action == "reset":
+        vm_num = int(item.get("vm_num", 1))
+        guest_ip = item.get("guest_ip", "")
+        host_port = item.get("host_port", "")
+        # Stop, delete rootfs (force fresh copy), then launch
+        stop_cmd = f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num}"
+        reset_cmd = f"rm -f /data/firecracker-vms/{tenant_id}/rootfs.ext4"
+        launch_cmd = f"/home/ubuntu/launch-vm.sh {tenant_id} {vm_num} {item['vcpu']} {item['mem_mb']}"
+        dnat_cmd = (
+            f"sudo iptables -t nat -A PREROUTING -i $(ip route show default | awk '{{print $5}}' | head -1) "
+            f"-p tcp --dport {host_port} -j DNAT --to-destination {guest_ip}:{VM_PORT_BASE}"
+        ) if guest_ip and host_port else ""
+        full_cmd = f"{stop_cmd} && {reset_cmd} && sleep 2 && {launch_cmd}"
+        if dnat_cmd:
+            full_cmd += f" && {dnat_cmd}"
+        _ssm_run(item["host_id"], full_cmd, timeout=300)
+        new_status = "running"
+    elif action == "pause":
+        vm_dir = f"/data/firecracker-vms/{tenant_id}"
+        _ssm_run(item["host_id"],
+            f'curl -s --unix-socket {vm_dir}/fc.sock -X PATCH http://localhost/vm '
+            f'-H "Content-Type: application/json" -d \'{{"state":"Paused"}}\'')
+        new_status = "paused"
+    elif action == "resume":
+        vm_dir = f"/data/firecracker-vms/{tenant_id}"
+        _ssm_run(item["host_id"],
+            f'curl -s --unix-socket {vm_dir}/fc.sock -X PATCH http://localhost/vm '
+            f'-H "Content-Type: application/json" -d \'{{"state":"Resumed"}}\'')
         new_status = "running"
     else:
         return _resp(400, {"error": f"unknown action: {action}"})
@@ -250,13 +312,35 @@ def register_host(body):
 
 
 def deregister_host(instance_id):
+    # Stop all tenants on this host
+    tenants = tenants_table.scan(
+        FilterExpression="host_id = :h AND #s <> :d",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":h": instance_id, ":d": "deleted"},
+    ).get("Items", [])
+    for t in tenants:
+        tenants_table.update_item(
+            Key={"id": t["id"]},
+            UpdateExpression="SET #s = :s, updated_at = :t",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":s": "stopped", ":t": _now()},
+        )
+
     hosts_table.update_item(
         Key={"instance_id": instance_id},
         UpdateExpression="SET #s = :s",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":s": "draining"},
     )
-    return _resp(200, {"instance_id": instance_id, "status": "draining"})
+
+    # Terminate EC2 instance (ASG will launch replacement)
+    try:
+        ec2 = boto3.client("ec2")
+        ec2.terminate_instances(InstanceIds=[instance_id])
+    except Exception as e:
+        print(f"Failed to terminate {instance_id}: {e}")
+
+    return _resp(200, {"instance_id": instance_id, "status": "draining", "tenants_stopped": len(tenants)})
 
 
 def refresh_rootfs():
@@ -392,7 +476,7 @@ def _gen_id(name):
 
 def _launch_vm(instance_id, tenant_id, vm_num, vcpu, mem_mb, guest_ip, host_port):
     """Fire-and-forget: launch VM + set up DNAT."""
-    cmd = (f"~/launch-vm.sh {tenant_id} {vm_num} {vcpu} {mem_mb} && "
+    cmd = (f"/home/ubuntu/launch-vm.sh {tenant_id} {vm_num} {vcpu} {mem_mb} && "
            f"sudo iptables -t nat -A PREROUTING -i $(ip route show default | awk '{{print $5}}' | head -1) "
            f"-p tcp --dport {host_port} -j DNAT --to-destination {guest_ip}:{VM_PORT_BASE}")
     _ssm_send(instance_id, cmd, timeout=300)

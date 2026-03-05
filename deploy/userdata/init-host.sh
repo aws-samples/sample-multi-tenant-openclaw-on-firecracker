@@ -1,6 +1,7 @@
 set -e
 exec > /var/log/openclaw-init.log 2>&1
-echo '[openclaw] Starting host setup...'
+log() { echo "[oc:init] $(date +%H:%M:%S) $*"; }
+log "Starting host setup..."
 
 TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')
 REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
@@ -8,10 +9,12 @@ INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.2
 PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
 
 # Step 1: KVM
+log "step1: KVM setup"
 chmod 666 /dev/kvm
 echo 'KERNEL=="kvm", MODE="0666"' > /etc/udev/rules.d/99-kvm.rules
 
 # Step 2: Install tools + Firecracker
+log "step2: installing tools + firecracker"
 apt-get update -qq
 apt-get install -y -qq curl jq sshpass unzip > /dev/null 2>&1
 if ! command -v aws &>/dev/null; then
@@ -25,6 +28,7 @@ curl -sL ${FC_URL}/download/${FC_VER}/firecracker-${FC_VER}-${ARCH}.tgz | tar -x
 mv release-${FC_VER}-${ARCH}/firecracker-${FC_VER}-${ARCH} /usr/local/bin/firecracker
 mv release-${FC_VER}-${ARCH}/jailer-${FC_VER}-${ARCH} /usr/local/bin/jailer
 rm -rf release-${FC_VER}-${ARCH}
+log "firecracker ${FC_VER} installed"
 
 # Step 3: Mount data volume (before downloading to avoid filling root partition)
 # Nitro instances map /dev/sdf to unpredictable /dev/nvmeXn1.
@@ -39,8 +43,8 @@ else
     lsblk -n "$d" | grep -q part || echo "$d"
   done | head -1)
 fi
-if [ -z "$DATA_DEV" ]; then echo "ERROR: data volume not found"; exit 1; fi
-echo "[openclaw] Data volume: ${DATA_DEV}"
+if [ -z "$DATA_DEV" ]; then log "ERROR: data volume not found"; exit 1; fi
+log "step3: mounting data volume ${DATA_DEV}"
 if ! blkid ${DATA_DEV} | grep -q ext4; then mkfs.ext4 -q ${DATA_DEV}; fi
 mkdir -p /data
 mount ${DATA_DEV} /data
@@ -55,23 +59,29 @@ DATA_VOL_ID=$(aws ec2 describe-volumes --filters Name=attachment.instance-id,Val
 aws ec2 create-tags --resources ${DATA_VOL_ID} --tags Key=Name,Value=openclaw-data-${INSTANCE_ID} Key=openclaw:role,Value=host-data --region ${REGION}
 
 # Step 3b: Kernel + rootfs from S3 (downloads directly to data volume via symlink)
+log "step3b: downloading assets from S3..."
+T0=$SECONDS
 ASSETS=/home/ubuntu/firecracker-assets
 FC_MAJOR=$(echo ${FC_VER} | grep -oP "v\d+\.\d+")
 curl -fsSL -o ${ASSETS}/vmlinux "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${FC_MAJOR}/${ARCH}/vmlinux-5.10.245-no-acpi"
 aws s3 cp s3://{{ASSETS_BUCKET}}/{{ROOTFS_PREFIX}}/{{ROOTFS_FILENAME}} ${ASSETS}/openclaw-rootfs.ext4 --region ${REGION}
 aws s3 cp s3://{{ASSETS_BUCKET}}/{{ROOTFS_PREFIX}}/{{DATA_TEMPLATE_FILENAME}} ${ASSETS}/openclaw-data-template.ext4 --region ${REGION}
 chown -R ubuntu:ubuntu ${ASSETS}
+log "assets downloaded ($((SECONDS-T0))s)"
 
 # Step 4: Deploy launch/stop scripts
+log "step4: deploying scripts"
 {{LAUNCH_VM_SCRIPT}}
 {{STOP_VM_SCRIPT}}
 
 # Step 5: Self-register to DynamoDB
+log "step5: registering to DynamoDB"
 aws dynamodb put-item --table-name {{HOSTS_TABLE}} --region ${REGION} --item '{"instance_id":{"S":"'${INSTANCE_ID}'"},"private_ip":{"S":"'${PRIVATE_IP}'"},"total_vcpu":{"N":"{{AVAIL_VCPU}}"},"total_mem_mb":{"N":"{{AVAIL_MEM}}"},"used_vcpu":{"N":"0"},"used_mem_mb":{"N":"0"},"vm_count":{"N":"0"},"next_vm_num":{"N":"1"},"status":{"S":"active"}}'
 
 # Step 6: Complete lifecycle hook
+log "step6: completing lifecycle hook"
 aws autoscaling complete-lifecycle-action --lifecycle-hook-name openclaw-host-init \
   --auto-scaling-group-name openclaw-hosts-asg --lifecycle-action-result CONTINUE \
   --instance-id ${INSTANCE_ID} --region ${REGION} || true
 
-echo '[openclaw] Host ready!'
+log "DONE host ready (total $((SECONDS))s)"

@@ -71,18 +71,19 @@
       <table>
         <thead>
           <tr>
-            <th>ID</th><th>Name</th><th>vCPU</th><th>Mem (MB)</th><th>Guest IP</th>
+            <th>ID</th><th>Name</th><th>Status</th><th>vCPU</th><th>Mem (MB)</th><th>Guest IP</th>
             <th>Port</th><th>Host ID</th><th>VM Health</th><th>Gateway Health</th><th>Actions</th>
           </tr>
         </thead>
         <tbody>
           <template x-if="filteredTenants.length === 0 && !loadingTenants">
-            <tr><td colspan="10" class="empty">No tenants</td></tr>
+            <tr><td colspan="11" class="empty">No tenants</td></tr>
           </template>
           <template x-for="t in filteredTenants" :key="t.id">
             <tr>
               <td x-text="t.id"></td>
               <td x-text="t.name || '-'"></td>
+              <td><span class="badge" :class="'badge-'+t.status" x-text="t.status"></span></td>
               <td x-text="t.vcpu"></td>
               <td x-text="t.mem_mb"></td>
               <td x-text="t.guest_ip || '-'"></td>
@@ -91,9 +92,27 @@
               <td><span class="health-dot" :class="healthClass(t.vm_health)"></span></td>
               <td><span class="health-dot" :class="healthClass(t.app_health)"></span></td>
               <td>
-                <button class="btn-act" title="Copy oc-connect.sh command" @click="copyCmd('oc-connect.sh '+t.id)">🔗</button>
-                <button class="btn-act" title="Copy oc-dashboard.sh command" @click="copyCmd('oc-dashboard.sh '+t.id)">📊</button>
-                <button class="btn-del" @click="deleteTenant(t.id)">🗑</button>
+                <div class="act-group">
+                  <button class="btn-act" title="Copy oc-connect.sh command" @click="copyCmd('oc-connect.sh '+t.id)">🔗</button>
+                  <button class="btn-act" title="Copy oc-dashboard.sh command" @click="copyCmd('oc-dashboard.sh '+t.id)">📊</button>
+                  <template x-if="t.status==='running'">
+                    <span>
+                      <button class="btn-act" title="Pause" @click="tenantAction(t.id,'pause')">⏸</button>
+                      <button class="btn-act" title="Stop" @click="tenantAction(t.id,'stop')">⏹</button>
+                      <button class="btn-act" title="Restart" @click="tenantAction(t.id,'restart')">🔄</button>
+                    </span>
+                  </template>
+                  <template x-if="t.status==='stopped'">
+                    <span>
+                      <button class="btn-act" title="Start" @click="tenantAction(t.id,'start')">▶️</button>
+                      <button class="btn-act" title="Reset rootfs" @click="tenantAction(t.id,'reset')">♻️</button>
+                    </span>
+                  </template>
+                  <template x-if="t.status==='paused'">
+                    <button class="btn-act" title="Resume" @click="tenantAction(t.id,'resume')">▶️</button>
+                  </template>
+                  <button class="btn-del" @click="deleteTenant(t.id)">🗑</button>
+                </div>
               </td>
             </tr>
           </template>
@@ -179,6 +198,13 @@ function app() {
     async deleteTenant(id) {
       if (!confirm('Delete tenant ' + id + '?')) return;
       await this.api('DELETE', 'tenants/' + id);
+      this.loadTenants();
+    },
+    async tenantAction(id, action) {
+      this.toast = action + '…';
+      await this.api('POST', 'tenants/' + id + '/' + action);
+      this.toast = '✓ ' + action;
+      setTimeout(() => this.toast = '', 2000);
       this.loadTenants();
     },
     copyCmd(cmd) {

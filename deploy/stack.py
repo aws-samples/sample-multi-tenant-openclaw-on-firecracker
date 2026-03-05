@@ -54,7 +54,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
             resources=["*"],
         )
         ec2_describe_policy = iam.PolicyStatement(
-            actions=["ec2:DescribeInstances"],
+            actions=["ec2:DescribeInstances", "ec2:TerminateInstances"],
             resources=["*"],
         )
 

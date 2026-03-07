@@ -46,7 +46,15 @@
         </div>
         <div class="host-row">
           <span class="host-label">CPU</span>
-          <div class="bar-bg"><div class="bar-fill bar-cpu" :style="'width:'+cpuPct(h)+'%'"></div></div>
+          <template x-if="(h.cpu_overcommit_ratio||1) > 1">
+            <span class="overcommit-badge" x-text="'×'+(h.cpu_overcommit_ratio||1)"></span>
+          </template>
+          <div class="bar-bg" style="position:relative">
+            <div class="bar-fill" :class="cpuBarClass(h)" :style="'width:'+cpuPct(h)+'%'"></div>
+            <template x-if="(h.cpu_overcommit_ratio||1) > 1">
+              <div class="bar-physical-mark" :style="'left:'+(100/(h.cpu_overcommit_ratio||1))+'%'"></div>
+            </template>
+          </div>
           <span class="host-val" x-text="h.used_vcpu+'/'+h.total_vcpu"></span>
         </div>
         <div class="host-row">
@@ -225,7 +233,14 @@ function app() {
       this.toast = '✓ Copied: ' + cmd;
       setTimeout(() => this.toast = '', 2000);
     },
-    cpuPct(h) { return h.total_vcpu ? Math.round(h.used_vcpu / h.total_vcpu * 100) : 0; },
+    cpuPct(h) {
+      const ratio = h.cpu_overcommit_ratio || 1;
+      const allocatable = h.total_vcpu * ratio;
+      return allocatable ? Math.min(100, Math.round(h.used_vcpu / allocatable * 100)) : 0;
+    },
+    cpuBarClass(h) {
+      return h.used_vcpu > h.total_vcpu ? 'bar-cpu-over' : 'bar-cpu';
+    },
     memPct(h) { return h.total_mem_mb ? Math.round(h.used_mem_mb / h.total_mem_mb * 100) : 0; },
     healthClass(v) { return v === 'up' ? 'health-up' : v === 'down' ? 'health-down' : 'health-unknown'; },
     get filteredTenants() { return this.selectedHost ? this.tenants.filter(t => t.host_id === this.selectedHost) : this.tenants; },

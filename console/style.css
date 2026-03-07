@@ -62,10 +62,13 @@ input { font-family: inherit; }
 .act-group { display:flex; gap:2px; align-items:center; flex-wrap:nowrap; }
 .host-row { display: flex; align-items: center; font-size: 11px; margin-bottom: 4px; gap: 8px; }
 .host-label { width: 42px; color: #6b7a8d; }
-.bar-bg { flex: 1; height: 6px; background: #1a2332; border-radius: 3px; overflow: hidden; }
+.bar-bg { flex: 1; height: 6px; background: #1a2332; border-radius: 3px; overflow: hidden; position: relative; }
 .bar-fill { height: 100%; border-radius: 3px; transition: width .3s; }
 .bar-cpu { background: linear-gradient(90deg, #0ff, #06f); }
+.bar-cpu-over { background: linear-gradient(90deg, #0ff, #f90); }
 .bar-mem { background: linear-gradient(90deg, #0af, #06d); }
+.bar-physical-mark { position: absolute; top: -2px; bottom: -2px; width: 2px; background: rgba(255,255,255,0.5); pointer-events: none; }
+.overcommit-badge { font-size: 10px; color: #f90; margin-right: 4px; }
 .host-val { width: 60px; text-align: right; font-size: 11px; }
 
 /* Tenants table */

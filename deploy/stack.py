@@ -73,6 +73,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 "ROOTFS_PREFIX": CFG["s3"]["rootfs_prefix"],
                 "HOST_RESERVED_VCPU": str(CFG["host"]["reserved_vcpu"]),
                 "HOST_RESERVED_MEM": str(CFG["host"]["reserved_mem_mb"]),
+                "CPU_OVERCOMMIT_RATIO": str(CFG["host"].get("cpu_overcommit_ratio", 1.0)),
                 "VM_DEFAULT_VCPU": str(CFG["vm"]["default_vcpu"]),
                 "VM_DEFAULT_MEM": str(CFG["vm"]["default_mem_mb"]),
                 "VM_DATA_DISK_MB": str(CFG["vm"]["data_disk_mb"]),

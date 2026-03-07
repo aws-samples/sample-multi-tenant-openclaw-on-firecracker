@@ -1,6 +1,6 @@
 # OpenClaw on EC2 microVM
 
-![Version](https://img.shields.io/badge/version-0.5.1-blue)
+![Version](https://img.shields.io/badge/version-0.5.2-blue)
 
 基于 AWS Firecracker microVM 的 OpenClaw 多租户隔离部署方案。每个租户运行在独立的 microVM 中，通过 API 统一管理，ASG 自动扩缩宿主机，空闲主机自动回收。
 
@@ -58,11 +58,11 @@ openclaw-firecracker/
 ├── build-rootfs.sh            # rootfs + data template 构建 + S3 上传
 ├── oc-connect.sh              # 登录 OpenClaw microVM
 ├── oc-dashboard.sh            #  OpenClaw 控制面板
-├── open-console.sh            # 启动 Web 管理控制台
+├── web-console.sh            # 启动 Web 管理控制台
 ├── console/                   # 管理控制台前端
 │   ├── index.html             # Alpine.js SPA
-│   ├── style.css              # 赛博朋克主题
-│   └── config.js              # 自动生成 (open-console.sh)
+│   ├── style.css              # 控制台UI样式
+│   └── config.js              # 动态生成
 ├── deploy/                    # CDK 项目
 │   ├── stack.py               # 基础设施定义
 │   ├── lambda/
@@ -92,9 +92,9 @@ openclaw-firecracker/
 # 2. 配置 OpenClaw 应用参数 (首次)
 cat > .env.openclaw << 'EOF'
 # OpenClaw 默认配置 (烧入 data template)
-OPENCLAW_API_KEY=your-api-key
-OPENCLAW_BASE_URL=https://your-provider/v1
-OPENCLAW_MODEL_ID=your-model-id
+OPENCLAW_API_KEY=your-bedrock-api-key
+OPENCLAW_BASE_URL=https://bedrock-mantle.us-west-2.api.aws/v1
+OPENCLAW_MODEL_ID=deepseek.v3.2
 OPENCLAW_TOOLS_PROFILE=coding
 OPENCLAW_DM_SCOPE=per-peer
 EOF
@@ -122,7 +122,7 @@ curl -s -X DELETE "${API_URL}tenants/<tenant-id>" -H "x-api-key: ${API_KEY}" | j
 Web 管理控制台，支持 Host/Tenant 可视化管理。
 
 ```bash
-./open-console.sh    # 自动读取 .env.deploy，启动 http://localhost:8080
+./web-console.sh    # 自动读取 .env.deploy，启动 http://localhost:8080
 ```
 
 ![Management Console](docs/web_console.png)
@@ -161,6 +161,7 @@ Web 管理控制台，支持 Host/Tenant 可视化管理。
 | host | instance_type | c8i.2xlarge | 需支持 NestedVirtualization (c8i/m8i/r8i) |
 | host | reserved_vcpu | 1 | 预留给宿主机 OS |
 | host | reserved_mem_mb | 2048 | 预留给宿主机 OS |
+| host | cpu_overcommit_ratio | 1.0 | CPU 超配比例 (2.0=可分配 2 倍 vCPU，内存不超配) |
 | asg | min_capacity | 1 | 最小实例数 |
 | asg | max_capacity | 5 | 最大实例数 |
 | asg | use_spot | false | Spot 实例 (省 ~60-70%，可能被回收) |

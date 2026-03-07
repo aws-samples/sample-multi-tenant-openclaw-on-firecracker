@@ -8,6 +8,7 @@ host:
   data_volume_gb: 100              # 数据卷: rootfs 模板 + VM 数据盘, 挂载到 /data
   reserved_vcpu: 1                 # 预留给宿主机的 vCPU
   reserved_mem_mb: 2048            # 预留给宿主机的内存 (MB)
+  cpu_overcommit_ratio: 2.0        # CPU 超配比例 (1.0=不超配, 2.0=可分配2倍vCPU)
 
 # ========== microVM 默认配置 ==========
 vm:

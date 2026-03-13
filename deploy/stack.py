@@ -250,19 +250,21 @@ class OpenClawOrchestratorStack(cdk.Stack):
             "chmod +x /home/ubuntu/stop-vm.sh && chown ubuntu:ubuntu /home/ubuntu/stop-vm.sh")
 
         # Split script around CDK token placeholders, inject as Fn::Join
-        # PLACEHOLDER_BUCKET appears 3 times (manifest + rootfs + data template downloads)
+        # PLACEHOLDER_BUCKET appears 5 times (manifest + rootfs + data template + skills sync + skills cron)
         # PLACEHOLDER_TABLE appears once (dynamodb put-item)
         parts = init_sh.split("PLACEHOLDER_BUCKET")
-        # parts = [before_bucket1, between_1_2, between_2_3, after_bucket3_with_table]
-        table_split = parts[3].split("PLACEHOLDER_TABLE")
+        # parts = [before_bucket1, ..., after_bucket5_with_table]
+        table_split = parts[-1].split("PLACEHOLDER_TABLE")
         user_data = ec2.UserData.for_linux()
-        user_data.add_commands(cdk.Fn.join("", [
-            parts[0], assets_bucket.bucket_name,
-            parts[1], assets_bucket.bucket_name,
-            parts[2], assets_bucket.bucket_name,
-            table_split[0], hosts_table.table_name,
-            table_split[1],
-        ]))
+        join_parts = [parts[0]]
+        for i in range(1, len(parts) - 1):
+            join_parts.append(assets_bucket.bucket_name)
+            join_parts.append(parts[i])
+        join_parts.append(assets_bucket.bucket_name)
+        join_parts.append(table_split[0])
+        join_parts.append(hosts_table.table_name)
+        join_parts.append(table_split[1])
+        user_data.add_commands(cdk.Fn.join("", join_parts))
 
         # AMI lookup
         ami = ec2.MachineImage.lookup(

@@ -77,7 +77,11 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update -qq
-apt-get install -y -qq openssh-server sudo dbus-user-session
+apt-get install -y -qq software-properties-common 2>/dev/null || true
+add-apt-repository -y universe 2>/dev/null || true
+apt-get update -qq
+apt-get install -y -qq openssh-server sudo dbus-user-session \
+  wget htop tmux vim-tiny tree python3-venv build-essential
 ssh-keygen -A
 echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
 
@@ -200,6 +204,11 @@ Environment=OPENCLAW_SERVICE_KIND=gateway
 WantedBy=default.target
 GWSVC
 ln -sf ../openclaw-gateway.service /home/agent/.config/systemd/user/default.target.wants/openclaw-gateway.service
+# --- Shared Skills directory ---
+mkdir -p /home/agent/.openclaw/skills
+# Skills will be synced from host's /data/shared-skills/ at VM launch time
+# This directory is on the data disk, so it persists across rootfs resets
+
 chown -R agent:agent /home/agent
 
 # --- Cleanup ---

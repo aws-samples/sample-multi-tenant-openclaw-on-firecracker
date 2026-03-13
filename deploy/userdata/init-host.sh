@@ -78,6 +78,15 @@ pigz -dc ${ASSETS}/data.gz > ${ASSETS}/openclaw-data-template.ext4 && rm -f ${AS
 chown -R ubuntu:ubuntu ${ASSETS}
 log "assets downloaded: rootfs=${ROOTFS_VER} ($((SECONDS-T0))s)"
 
+# Step 3c: Sync shared skills from S3
+log "step3c: syncing shared skills"
+mkdir -p /data/shared-skills
+aws s3 sync s3://{{ASSETS_BUCKET}}/skills/ /data/shared-skills/ --region ${REGION} 2>/dev/null || true
+chown -R ubuntu:ubuntu /data/shared-skills
+# Cron job to sync skills every 5 minutes
+echo "*/5 * * * * root aws s3 sync s3://{{ASSETS_BUCKET}}/skills/ /data/shared-skills/ --region ${REGION} 2>/dev/null" > /etc/cron.d/openclaw-skills-sync
+log "shared skills ready ($(ls /data/shared-skills/ 2>/dev/null | wc -l) skills)"
+
 # Step 4: Deploy launch/stop scripts
 log "step4: deploying scripts"
 {{LAUNCH_VM_SCRIPT}}

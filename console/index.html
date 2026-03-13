@@ -73,6 +73,16 @@
 
   <!-- Tenants -->
   <div class="tenants-panel">
+
+    <!-- Skills mini-panel -->
+    <div style="margin-bottom:12px;padding:8px 12px;border:1px solid var(--border);border-radius:6px;background:var(--panel)">
+      <span style="font-size:13px;color:var(--cyan)">🧠 Shared Skills</span>
+      <span style="font-size:11px;color:var(--gray)" x-text="'('+skills.length+')'"></span>
+      <template x-for="s in skills" :key="s.id">
+        <span style="display:inline-block;margin:4px 4px 0 0;padding:2px 8px;border:1px solid var(--border);border-radius:10px;font-size:11px;color:var(--text)" x-text="s.title"></span>
+      </template>
+    </div>
+
     <div class="panel-header">
       <span class="panel-title">Tenants <template x-if="selectedHost"><span style="font-size:12px;color:var(--cyan-dim)">— <span x-text="selectedHost"></span> <button class="btn-icon" @click="selectedHost=null" style="font-size:12px">✕</button></span></template></span>
       <div style="display:flex;gap:10px;align-items:center">
@@ -84,7 +94,7 @@
         <thead>
           <tr>
             <th>ID</th><th>Name</th><th>Status</th><th>vCPU</th><th>Mem (MB)</th><th>Guest IP</th>
-            <th>Port</th><th>Host ID</th><th>Rootfs</th><th>VM Health</th><th>Gateway</th><th>Actions</th>
+            <th>Port</th><th>Host ID</th><th>Rootfs</th><th>Model</th><th>VM Health</th><th>Gateway</th><th>Actions</th>
           </tr>
         </thead>
         <tbody>
@@ -102,12 +112,16 @@
               <td x-text="t.host_port || '-'"></td>
               <td x-text="(t.host_id||'').substring(0,12)+'…'"></td>
               <td style="font-size:11px;color:var(--gray)" x-text="t.rootfs_version||'-'"></td>
+              <td style="font-size:11px;color:var(--cyan-dim)" x-text="tenantModels[t.id]||'-'"></td>
               <td><span class="health-dot" :class="healthClass(t.vm_health)"></span></td>
               <td><span class="health-dot" :class="healthClass(t.app_health)"></span></td>
               <td>
                 <div class="act-group">
                   <button class="btn-act" title="Copy oc-connect.sh command" @click="copyCmd('oc-connect.sh '+t.id)">🔗</button>
                   <button class="btn-act" title="Copy oc-dashboard.sh command" @click="copyCmd('oc-dashboard.sh '+t.id)">📊</button>
+                  <template x-if="t.status==='running'">
+                    <a class="btn-act" :href="'/vm/'+t.id+'/'" target="_blank" title="Open Dashboard">🌐</a>
+                  </template>
                   <template x-if="t.status==='running'">
                     <span>
                       <button class="btn-act" title="Pause" @click="tenantAction(t.id,'pause')">⏸︎</button>
@@ -162,6 +176,7 @@ function app() {
     hosts: [], tenants: [], selectedHost: null, rootfsVersion: '',
     loadingHosts: false, loadingTenants: false,
     showModal: false,
+    skills: [], tenantModels: {},
     form: { name: '', vcpu: null, memory_mb: null },
 
     init() {
@@ -191,6 +206,17 @@ function app() {
       catch { this.connected = false; }
       this.loadingHosts = false;
       try { this.rootfsVersion = (await this.api('GET', 'hosts/rootfs-version')).version; } catch {}
+      // Load skills and tenant models from router API
+      try {
+        const base = window.location.origin;
+        const sk = await fetch(base + '/api/skills').then(r=>r.json());
+        this.skills = sk.skills || [];
+        const tm = await fetch(base + '/api/tenants').then(r=>r.json());
+        this.tenantModels = {};
+        for (const [tid, info] of Object.entries(tm.tenants || {})) {
+          this.tenantModels[tid] = (info.model || '').split('/').slice(-1)[0] || '?';
+        }
+      } catch {}
     },
     async loadTenants() {
       if (!this.apiUrl || !this.apiKey) return;

@@ -33,6 +33,21 @@ fi
 wait
 log "disks ready ($((SECONDS-T0))s)"
 
+# Inject shared skills into data disk
+SHARED_SKILLS="/data/shared-skills"
+if [ -d "${SHARED_SKILLS}" ] && [ "$(ls -A ${SHARED_SKILLS} 2>/dev/null)" ]; then
+  log "injecting shared skills..."
+  MOUNT_TMP="/tmp/data-mount-${TENANT_ID}"
+  mkdir -p ${MOUNT_TMP}
+  sudo mount ${DATA_VOL} ${MOUNT_TMP}
+  mkdir -p ${MOUNT_TMP}/.openclaw/skills
+  cp -r ${SHARED_SKILLS}/* ${MOUNT_TMP}/.openclaw/skills/ 2>/dev/null || true
+  sudo chown -R 1000:1000 ${MOUNT_TMP}/.openclaw/skills
+  sudo umount ${MOUNT_TMP}
+  rmdir ${MOUNT_TMP}
+  log "skills injected"
+fi
+
 # Network setup
 log "setting up network tap=${TAP}..."
 sudo ip tuntap add dev ${TAP} mode tap

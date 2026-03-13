@@ -1,6 +1,6 @@
 # OpenClaw on EC2 microVM
 
-![Version](https://img.shields.io/badge/version-0.6.0-blue)
+![Version](https://img.shields.io/badge/version-0.6.1-blue)
 
 基于 AWS Firecracker microVM 的 OpenClaw 多租户隔离部署方案。每个租户运行在独立的 microVM 中，通过 API 统一管理，ASG 自动扩缩宿主机，空闲主机自动回收。
 
@@ -58,11 +58,12 @@ EventBridge: 健康检查 + 空闲回收
 ```
 openclaw-firecracker/
 ├── config.yml                 # 全局配置 (唯一配置源)
-├── setup.sh                   # 一键部署 + 导出 .env.deploy
 ├── build-rootfs.sh            # rootfs + data template 构建 + S3 上传
+├── setup.sh                   # 一键部署 + 导出 .env.deploy
+├── destroy.sh                 # 销毁环境 (--purge 彻底清理)
+├── web-console.sh             # 启动 Web 管理控制台
 ├── oc-connect.sh              # 登录 OpenClaw microVM
 ├── oc-dashboard.sh            #  OpenClaw 控制面板
-├── web-console.sh            # 启动 Web 管理控制台
 ├── console/                   # 管理控制台前端
 │   ├── index.html             # Alpine.js SPA
 │   ├── style.css              # 控制台UI样式
@@ -226,6 +227,13 @@ s3://{bucket}/skills/
 | scaler | idle_timeout_minutes | 10 | 空闲超时 (分钟) |
 
 修改后重新部署：`./setup.sh <region> <profile>`
+
+### 销毁环境
+
+```bash
+./destroy.sh           # 销毁 stack，保留 S3 bucket 和 DynamoDB 表
+./destroy.sh --purge   # 彻底清理，包括 S3 数据和 DynamoDB 表
+```
 
 ## API 参考
 

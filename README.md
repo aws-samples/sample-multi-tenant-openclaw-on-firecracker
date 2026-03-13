@@ -1,6 +1,6 @@
 # OpenClaw on EC2 microVM
 
-![Version](https://img.shields.io/badge/version-0.5.2-blue)
+![Version](https://img.shields.io/badge/version-0.6.0-blue)
 
 基于 AWS Firecracker microVM 的 OpenClaw 多租户隔离部署方案。每个租户运行在独立的 microVM 中，通过 API 统一管理，ASG 自动扩缩宿主机，空闲主机自动回收。
 
@@ -15,6 +15,10 @@
 - **健康检查** — 每分钟探活所有 VM，连续失败自动重启
 - **Web 管理控制台** — 可视化管理 Host/Tenant，实时状态展示
 - **Rootfs 预构建** — rootfs + data template 双镜像通过 S3 分发，宿主机启动时自动下载
+- **Dashboard 直达** — 每只租户的 OpenClaw Dashboard 通过统一域名 `/vm/{tenant-id}/` 直接访问，无需 SSM 隧道
+- **共享 Skills** — 所有租户共享统一的 Skills（S3 集中管理，自动同步到所有 VM），记忆独立
+- **默认工具链** — 每个 VM 预装 Python3/uv/git/gh/Node.js/htop/tmux/tree 等开发工具
+- **统一配置管理** — 控制台展示每个租户的模型配置和共享 Skills 列表
 
 ## 部署架构
 
@@ -134,6 +138,54 @@ Web 管理控制台，支持 Host/Tenant 可视化管理。
 - 健康状态实时展示 (vm_health / app_health)
 - 快捷复制连接命令 (oc-connect.sh) 和 Dashboard 命令 (oc-dashboard.sh)
 - API 地址和 Key 自动注入，支持手动修改
+
+## Dashboard 直达
+
+每只租户的 OpenClaw Dashboard 通过路由代理直接访问，无需 SSM 隧道：
+
+```
+https://{your-domain}/vm/{tenant-id}/    → 租户 Dashboard
+https://{your-domain}/api/tenants        → 租户列表 + 模型信息
+https://{your-domain}/api/skills         → 共享 Skills 列表
+```
+
+路由代理运行在宿主机上（端口 8080），自动发现所有运行中的 VM 并按路径转发。新建/删除租户无需任何配置变更。
+
+## 共享 Skills
+
+所有租户共享统一的 Skills（SKILL.md 文件），记忆各自独立。
+
+```bash
+# 上传 Skills 到 S3（所有 VM 自动同步）
+aws s3 sync ./my-skills/ s3://${ASSETS_BUCKET}/skills/ --profile $PROFILE
+
+# Skills 同步链路：
+# S3 → 宿主机 /data/shared-skills/ (cron 5min) → 所有运行中的 VM
+# 新建 VM 时自动注入到数据盘
+```
+
+Skills 目录结构：
+```
+s3://{bucket}/skills/
+├── code-review/SKILL.md
+├── summarizer/SKILL.md
+└── web-search/SKILL.md
+```
+
+## 默认工具链
+
+每个 VM 预装以下工具（rootfs v1.1+）：
+
+| 工具 | 用途 |
+|------|------|
+| Python 3.12 + venv | Python 开发 |
+| uv | Python 包管理 |
+| Node.js 22 + npm | JavaScript 运行时 |
+| OpenClaw CLI | AI Agent 框架 |
+| git + gh | 版本控制 + GitHub CLI |
+| curl / wget / jq | HTTP 请求 + JSON 处理 |
+| htop / tmux / tree | 系统监控 + 终端复用 + 目录浏览 |
+| vim / build-essential | 编辑器 + 编译工具链 |
 
 ## 自动扩缩容
 

@@ -45,6 +45,9 @@ def lambda_handler(event, context):
         ("POST", "/tenants/{id}/{action}"): lambda: tenant_action(
             path_params["id"], path_params["action"]
         ),
+        ("GET", "/tenants/{id}/{action}"): lambda: tenant_get_action(
+            path_params["id"], path_params["action"]
+        ),
         ("GET", "/hosts"): list_hosts,
         ("POST", "/hosts"): lambda: register_host(json.loads(event["body"])),
         ("POST", "/hosts/refresh-rootfs"): refresh_rootfs,
@@ -271,6 +274,17 @@ def tenant_action(tenant_id, action):
             f'curl -s --unix-socket {vm_dir}/fc.sock -X PATCH http://localhost/vm '
             f'-H "Content-Type: application/json" -d \'{{"state":"Resumed"}}\'')
         new_status = "running"
+    elif action == "backup":
+        bucket = os.environ.get("ASSETS_BUCKET", "")
+        prefix = os.environ.get("BACKUP_PREFIX", "backups")
+        cmd = f"/home/ubuntu/backup-data.sh {tenant_id} {bucket} {prefix}"
+        _ssm_run(item["host_id"], cmd, timeout=300)
+        tenants_table.update_item(
+            Key={"id": tenant_id},
+            UpdateExpression="SET last_backup_at = :t",
+            ExpressionAttributeValues={":t": _now()},
+        )
+        return _resp(200, {"id": tenant_id, "action": "backup", "status": "completed"})
     else:
         return _resp(400, {"error": f"unknown action: {action}"})
 
@@ -288,6 +302,27 @@ def tenant_action(tenant_id, action):
         ExpressionAttributeValues=expr_values,
     )
     return _resp(200, {"id": tenant_id, "status": new_status})
+
+
+def list_backups(tenant_id):
+    bucket = os.environ.get("ASSETS_BUCKET", "")
+    prefix = os.environ.get("BACKUP_PREFIX", "backups")
+    resp = s3.list_objects_v2(Bucket=bucket, Prefix=f"{prefix}/{tenant_id}/")
+    backups = []
+    for obj in sorted(resp.get("Contents", []), key=lambda o: o["Key"], reverse=True):
+        name = obj["Key"].rsplit("/", 1)[-1]
+        backups.append({
+            "key": obj["Key"],
+            "timestamp": name.replace(".gz", ""),
+            "size_mb": round(obj["Size"] / 1048576, 1),
+        })
+    return _resp(200, {"tenant_id": tenant_id, "backups": backups})
+
+
+def tenant_get_action(tenant_id, action):
+    if action == "backups":
+        return list_backups(tenant_id)
+    return _resp(400, {"error": f"unknown GET action: {action}"})
 
 
 # ========== Host Operations ==========

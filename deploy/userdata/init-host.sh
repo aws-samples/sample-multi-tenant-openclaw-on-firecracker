@@ -59,12 +59,18 @@ DATA_VOL_ID=$(aws ec2 describe-volumes --filters Name=attachment.instance-id,Val
 aws ec2 create-tags --resources ${DATA_VOL_ID} --tags Key=Name,Value=openclaw-data-${INSTANCE_ID} Key=openclaw:role,Value=host-data --region ${REGION}
 
 # Step 3b: Kernel + rootfs from S3 (downloads directly to data volume via symlink)
-log "step3b: downloading assets from S3..."
+log "step3b: waiting for rootfs in S3..."
 T0=$SECONDS
 ASSETS=/home/ubuntu/firecracker-assets
 FC_MAJOR=$(echo ${FC_VER} | grep -oP "v\d+\.\d+")
 curl -fsSL -o ${ASSETS}/vmlinux "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${FC_MAJOR}/${ARCH}/vmlinux-5.10.245-no-acpi"
-aws s3 cp s3://{{ASSETS_BUCKET}}/{{ROOTFS_PREFIX}}/manifest.json ${ASSETS}/manifest.json --region ${REGION}
+MANIFEST_URL="s3://{{ASSETS_BUCKET}}/{{ROOTFS_PREFIX}}/manifest.json"
+for i in $(seq 1 20); do
+  aws s3 cp ${MANIFEST_URL} ${ASSETS}/manifest.json --region ${REGION} 2>/dev/null && break
+  log "manifest.json not found, retrying in 30s ($i/20)..."
+  sleep 30
+done
+[ -f ${ASSETS}/manifest.json ] || { log "ERROR: manifest.json not available after 10min"; exit 1; }
 eval $(python3 -c "
 import json; m=json.load(open('${ASSETS}/manifest.json'))
 print(f'ROOTFS_KEY={m[\"rootfs\"]}')
@@ -91,6 +97,7 @@ log "shared skills ready ($(ls /data/shared-skills/ 2>/dev/null | wc -l) skills)
 log "step4: deploying scripts"
 {{LAUNCH_VM_SCRIPT}}
 {{STOP_VM_SCRIPT}}
+{{BACKUP_DATA_SCRIPT}}
 
 # Step 5: Self-register to DynamoDB
 log "step5: registering to DynamoDB"

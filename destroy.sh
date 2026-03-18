@@ -39,6 +39,15 @@ if $PURGE; then
   for table in "${TENANTS_TABLE:-openclaw-tenants}" "${HOSTS_TABLE:-openclaw-hosts}"; do
     aws dynamodb delete-table --table-name "$table" --profile "$PROFILE" --region "$REGION" 2>/dev/null && echo "  ✓ DynamoDB table $table deleted" || echo "  ⚠ $table already gone"
   done
+  # Delete orphaned IAM roles (CDK API Gateway CloudWatch role not auto-cleaned)
+  ROLES=$(aws iam list-roles --query "Roles[?starts_with(RoleName,'OpenClawOrchestrator-')].RoleName" --output text --profile "$PROFILE" 2>/dev/null || true)
+  for role in $ROLES; do
+    # Detach managed policies then delete
+    for arn in $(aws iam list-attached-role-policies --role-name "$role" --query 'AttachedPolicies[*].PolicyArn' --output text --profile "$PROFILE" 2>/dev/null); do
+      aws iam detach-role-policy --role-name "$role" --policy-arn "$arn" --profile "$PROFILE" 2>/dev/null
+    done
+    aws iam delete-role --role-name "$role" --profile "$PROFILE" 2>/dev/null && echo "  ✓ IAM role $role deleted" || echo "  ⚠ Failed to delete $role"
+  done
   # Delete orphaned data volumes
   VOLS=$(aws ec2 describe-volumes --filters Name=tag:openclaw:role,Values=host-data Name=status,Values=available \
     --query 'Volumes[*].VolumeId' --output text --profile "$PROFILE" --region "$REGION" 2>/dev/null || true)

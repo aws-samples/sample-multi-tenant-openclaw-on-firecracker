@@ -48,7 +48,8 @@ log "step3: mounting data volume ${DATA_DEV}"
 if ! blkid ${DATA_DEV} | grep -q ext4; then mkfs.ext4 -q ${DATA_DEV}; fi
 mkdir -p /data
 mount ${DATA_DEV} /data
-echo "${DATA_DEV} /data ext4 defaults,nofail 0 2" >> /etc/fstab
+DATA_UUID=$(blkid -s UUID -o value ${DATA_DEV})
+echo "UUID=${DATA_UUID} /data ext4 defaults,nofail 0 2" >> /etc/fstab
 mkdir -p /data/firecracker-assets
 chown ubuntu:ubuntu /data /data/firecracker-assets
 rm -rf /home/ubuntu/firecracker-assets

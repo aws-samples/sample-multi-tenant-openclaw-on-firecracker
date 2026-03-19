@@ -240,6 +240,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
         tenants_table.grant_read_write_data(backup_fn)
         assets_bucket.grant_read_write(backup_fn)
         backup_fn.add_to_role_policy(ssm_policy)
+        backup_fn.grant_invoke(api_fn)  # API Lambda async invokes Backup Lambda
 
         events.Rule(self, "BackupSchedule",
             schedule=events.Schedule.expression(CFG["s3"]["backup_cron"]),

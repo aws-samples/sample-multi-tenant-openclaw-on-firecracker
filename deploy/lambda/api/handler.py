@@ -275,16 +275,14 @@ def tenant_action(tenant_id, action):
             f'-H "Content-Type: application/json" -d \'{{"state":"Resumed"}}\'')
         new_status = "running"
     elif action == "backup":
-        bucket = os.environ.get("ASSETS_BUCKET", "")
-        prefix = os.environ.get("BACKUP_PREFIX", "backups")
-        cmd = f"/home/ubuntu/backup-data.sh {tenant_id} {bucket} {prefix}"
-        _ssm_run(item["host_id"], cmd, timeout=300)
-        tenants_table.update_item(
-            Key={"id": tenant_id},
-            UpdateExpression="SET last_backup_at = :t",
-            ExpressionAttributeValues={":t": _now()},
+        # Async invoke Backup Lambda with single tenant
+        lambda_client = boto3.client("lambda")
+        lambda_client.invoke(
+            FunctionName=os.environ.get("BACKUP_FUNCTION", "openclaw-backup"),
+            InvocationType="Event",  # async, returns immediately
+            Payload=json.dumps({"tenant_id": tenant_id}).encode(),
         )
-        return _resp(200, {"id": tenant_id, "action": "backup", "status": "completed"})
+        return _resp(202, {"id": tenant_id, "action": "backup", "status": "started"})
     else:
         return _resp(400, {"error": f"unknown action: {action}"})
 

@@ -1,6 +1,6 @@
 # OpenClaw on EC2 microVM
 
-![Version](https://img.shields.io/badge/version-0.6.1-blue)
+![Version](https://img.shields.io/badge/version-0.7.0-blue)
 
 基于 AWS Firecracker microVM 的 OpenClaw 多租户隔离部署方案。每个租户运行在独立的 microVM 中，通过 API 统一管理，ASG 自动扩缩宿主机，空闲主机自动回收。
 
@@ -25,25 +25,22 @@
 ```
 用户/管理员
     │
-    ▼
-API Gateway (HTTPS, x-api-key)
+    ├── API Gateway (HTTPS, x-api-key) ──→ Lambda ──→ DynamoDB
+    │                                                  ├── tenants
+    │                                                  └── hosts
     │
-    ▼
-Lambda Functions ──── DynamoDB
-    │                 ├── tenants (租户状态)
-    │                 └── hosts (宿主机资源)
-    │
-    ├── SSM Run Command ──→ EC2 Host A
-    │                       ├── microVM 01 (172.16.1.2)
-    │                       ├── microVM 02 (172.16.2.2)
-    │                       └── ...
-    │
-    ├── SSM Run Command ──→ EC2 Host B ...
-    │
-    └── S3 (rootfs 分发 + 数据卷备份)
+    └── ALB (HTTPS) ──→ Host Nginx:80 ──→ VM Gateway:18789
+                        ├── /vm/{tenant-a}/ → 172.16.1.2
+                        └── /vm/{tenant-b}/ → 172.16.2.2
 
-ASG: 宿主机自动扩缩 (配置参见: config.yml)
-EventBridge: 健康检查 + 空闲回收
+Lambda ── SSM Run Command ──→ EC2 Host
+                               ├── microVM 01 (172.16.1.2)
+                               ├── microVM 02 (172.16.2.2)
+                               └── ...
+
+S3: rootfs 分发 + 数据卷备份 + 共享 Skills
+ASG: 宿主机自动扩缩
+EventBridge: 健康检查 + 空闲回收 + 定时备份
 ```
 
 <details>
@@ -142,15 +139,24 @@ Web 管理控制台，支持 Host/Tenant 可视化管理。
 
 ## Dashboard 直达
 
-每只租户的 OpenClaw Dashboard 通过路由代理直接访问，无需 SSM 隧道：
+每只租户的 OpenClaw Dashboard 通过 ALB + Nginx 反向代理直接访问，无需 SSM 隧道：
 
 ```
-https://{your-domain}/vm/{tenant-id}/    → 租户 Dashboard
-https://{your-domain}/api/tenants        → 租户列表 + 模型信息
-https://{your-domain}/api/skills         → 共享 Skills 列表
+https://{your-domain}/vm/{tenant-id}/    → 租户 Dashboard (WebSocket)
 ```
 
-路由代理运行在宿主机上（端口 8080），自动发现所有运行中的 VM 并按路径转发。新建/删除租户无需任何配置变更。
+**前置条件：HTTPS 必须**
+
+OpenClaw Gateway Dashboard 要求 Secure Context（HTTPS）进行设备配对，因此需要：
+
+1. 自定义域名（如 `dashboard.example.com`）
+2. ACM 证书（免费，DNS 验证）
+3. Route53 / DNS CNAME 指向 ALB
+4. CDK stack 中 ALB listener 添加 HTTPS（443）
+
+链路：`用户浏览器 → ALB:443 → Host Nginx:80 → VM Gateway:18789`
+
+Nginx 配置由 launch-vm.sh / stop-vm.sh 自动管理，创建/删除租户无需手动操作。
 
 ## 共享 Skills
 
@@ -251,6 +257,8 @@ s3://{bucket}/skills/
 | POST | /tenants/{id}/pause | 冻结 vCPU（Firecracker 原生，即时） |
 | POST | /tenants/{id}/resume | 恢复已暂停的租户 VM |
 | POST | /tenants/{id}/reset | 重装系统盘（data 卷保留） |
+| POST | /tenants/{id}/backup | 手动备份数据卷（异步，返回 202） |
+| GET | /tenants/{id}/backups | 查询备份列表 |
 | GET | /hosts | 列出所有宿主机 |
 | POST | /hosts | 注册宿主机 (UserData 自动调用) |
 | POST | /hosts/refresh-rootfs | 推送最新 rootfs + data template 到所有宿主机 |

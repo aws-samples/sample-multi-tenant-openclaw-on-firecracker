@@ -10,6 +10,7 @@ from aws_cdk import (
     aws_s3 as s3,
     aws_ec2 as ec2,
     aws_autoscaling as autoscaling,
+    aws_elasticloadbalancingv2 as elbv2,
     custom_resources as cr,
     Duration, Fn, RemovalPolicy,
 )
@@ -461,6 +462,21 @@ class OpenClawOrchestratorStack(cdk.Stack):
             targets=[targets.LambdaFunction(api_fn)],
         )
 
+        # ========== ALB (Dashboard Proxy) ==========
+        alb = elbv2.ApplicationLoadBalancer(self, "DashboardALB",
+            load_balancer_name="openclaw-dashboard",
+            vpc=vpc,
+            internet_facing=True,
+        )
+        listener = alb.add_listener("HTTP", port=80)
+        listener.add_targets("Hosts",
+            port=80,
+            targets=[asg],
+            health_check=elbv2.HealthCheck(path="/health", interval=Duration.seconds(30)),
+        )
+        sg.add_ingress_rule(ec2.Peer.security_group_id(alb.connections.security_groups[0].security_group_id),
+            ec2.Port.tcp(80), "ALB to Nginx")
+
         # ========== Outputs ==========
         for key, val in {
             "ApiUrl": api.url,
@@ -469,5 +485,6 @@ class OpenClawOrchestratorStack(cdk.Stack):
             "HostsTable": hosts_table.table_name,
             "AssetsBucket": assets_bucket.bucket_name,
             "HostInstanceProfileArn": instance_profile.attr_arn,
+            "DashboardUrl": f"http://{alb.load_balancer_dns_name}",
         }.items():
             cdk.CfnOutput(self, key, value=val)

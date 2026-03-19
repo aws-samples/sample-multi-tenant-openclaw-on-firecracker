@@ -13,6 +13,7 @@ if [ -f "$ENV_FILE" ]; then
   cat > "$CONFIG_JS" << EOF
 window.OC_DEFAULT_API_URL = "${API_URL:-}";
 window.OC_DEFAULT_API_KEY = "${API_KEY:-}";
+window.OC_DASHBOARD_BASE = "${DASHBOARD_URL:-}";
 window.OC_VERSION = "${VERSION}";
 EOF
   echo "✓ 已从 .env.deploy 加载配置"

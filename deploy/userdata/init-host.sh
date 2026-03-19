@@ -16,7 +16,7 @@ echo 'KERNEL=="kvm", MODE="0666"' > /etc/udev/rules.d/99-kvm.rules
 # Step 2: Install tools + Firecracker
 log "step2: installing tools + firecracker"
 apt-get update -qq
-apt-get install -y -qq curl jq sshpass unzip pigz > /dev/null 2>&1
+apt-get install -y -qq curl jq sshpass unzip pigz nginx > /dev/null 2>&1
 if ! command -v aws &>/dev/null; then
   curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
   cd /tmp && unzip -qo awscliv2.zip && ./aws/install &>/dev/null; cd -
@@ -29,6 +29,24 @@ mv release-${FC_VER}-${ARCH}/firecracker-${FC_VER}-${ARCH} /usr/local/bin/firecr
 mv release-${FC_VER}-${ARCH}/jailer-${FC_VER}-${ARCH} /usr/local/bin/jailer
 rm -rf release-${FC_VER}-${ARCH}
 log "firecracker ${FC_VER} installed"
+
+# Nginx reverse proxy for tenant dashboards
+mkdir -p /etc/nginx/conf.d/tenants
+cat > /etc/nginx/conf.d/openclaw-proxy.conf <<'NGINX'
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+server {
+    listen 80 default_server;
+    location /health { return 200 'ok'; add_header Content-Type text/plain; }
+    include /etc/nginx/conf.d/tenants/*.conf;
+}
+NGINX
+rm -f /etc/nginx/sites-enabled/default
+systemctl enable nginx
+systemctl restart nginx
+log "nginx proxy configured"
 
 # Step 3: Mount data volume (before downloading to avoid filling root partition)
 # Nitro instances map /dev/sdf to unpredictable /dev/nvmeXn1.

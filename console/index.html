@@ -9,6 +9,22 @@
 <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
 </head>
 <body x-data="app()" x-init="init()">
+<svg xmlns="http://www.w3.org/2000/svg" style="display:none">
+  <symbol id="i-refresh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+  <symbol id="i-brain" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/><path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/><path d="M17.599 6.5a3 3 0 0 0 .399-1.375"/><path d="M6.003 5.125A3 3 0 0 0 6.401 6.5"/><path d="M3.477 10.896a4 4 0 0 1 .585-.396"/><path d="M19.938 10.5a4 4 0 0 1 .585.396"/><path d="M6 18a4 4 0 0 1-1.967-.516"/><path d="M19.967 17.484A4 4 0 0 1 18 18"/></symbol>
+  <symbol id="i-terminal" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></symbol>
+  <symbol id="i-dashboard" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></symbol>
+  <symbol id="i-globe" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></symbol>
+  <symbol id="i-pause" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></symbol>
+  <symbol id="i-power" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+  <symbol id="i-rotate-ccw" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+  <symbol id="i-zap" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+</svg>
 
 <!-- Header -->
 <div class="header">
@@ -16,7 +32,7 @@
   <span class="status-dot" :class="connected ? 'ok' : 'err'"></span>
   <span class="status-label" x-text="connected ? 'Connected' : 'Disconnected'"></span>
   <button class="btn btn-outline" @click="refresh()" :disabled="loadingHosts||loadingTenants">
-    Refresh <span :class="(loadingHosts||loadingTenants) && 'spin'">⟳</span>
+    Refresh <span :class="(loadingHosts||loadingTenants) && 'spin'"><svg class="icon s13"><use href="#i-refresh"/></svg></span>
   </button>
   <input type="text" x-model="apiUrl" @change="saveSettings(); refresh()" placeholder="https://api.example.com/v1/">
   <input type="password" x-model="apiKey" @change="saveSettings(); refresh()" placeholder="🔒 API Key" style="width:200px">
@@ -32,7 +48,7 @@
     </div>
     <div style="display:flex;align-items:center;gap:8px;padding:0 4px 6px;font-size:12px">
       <span style="color:var(--gray)" x-text="'Latest rootfs: '+(rootfsVersion||'…')"></span>
-      <button class="btn-outline" title="Pull latest rootfs to all hosts" @click="refreshRootfs()"> ▼ </button>
+      <button class="btn-act" title="Pull latest rootfs to all hosts" @click="refreshRootfs()"><svg class="icon s13"><use href="#i-download"/></svg></button>
     </div>
     <template x-if="hosts.length === 0 && !loadingHosts">
       <div class="empty">No hosts</div>
@@ -45,10 +61,7 @@
           <span class="badge" :class="h.status==='active' ? 'badge-active' : 'badge-inactive'" x-text="h.status"></span>
         </div>
         <div class="host-row">
-          <span class="host-label">CPU</span>
-          <template x-if="(h.cpu_overcommit_ratio||1) > 1">
-            <span class="overcommit-badge" x-text="'×'+(h.cpu_overcommit_ratio||1)"></span>
-          </template>
+          <span class="host-label">CPU<span class="overcommit-badge" x-show="(h.cpu_overcommit_ratio||1) > 1" x-text="' (×'+(h.cpu_overcommit_ratio||1)+')'"></span></span>
           <div class="bar-bg" style="position:relative">
             <div class="bar-fill" :class="cpuBarClass(h)" :style="'width:'+cpuPct(h)+'%'"></div>
             <template x-if="(h.cpu_overcommit_ratio||1) > 1">
@@ -76,7 +89,7 @@
 
     <!-- Skills mini-panel -->
     <div style="margin-bottom:12px;padding:8px 12px;border:1px solid var(--border);border-radius:6px;background:var(--panel)">
-      <span style="font-size:13px;color:var(--cyan)">🧠 Shared Skills</span>
+      <span style="font-size:13px;color:var(--cyan)"><svg class="icon s14" style="vertical-align:-2px"><use href="#i-brain"/></svg> Shared Skills</span>
       <span style="font-size:11px;color:var(--gray)" x-text="'('+skills.length+')'"></span>
       <template x-for="s in skills" :key="s.id">
         <span style="display:inline-block;margin:4px 4px 0 0;padding:2px 8px;border:1px solid var(--border);border-radius:10px;font-size:11px;color:var(--text)" x-text="s.title"></span>
@@ -84,7 +97,7 @@
     </div>
 
     <div class="panel-header">
-      <span class="panel-title">Tenants <template x-if="selectedHost"><span style="font-size:12px;color:var(--cyan-dim)">— <span x-text="selectedHost"></span> <button class="btn-icon" @click="selectedHost=null" style="font-size:12px">✕</button></span></template></span>
+      <span class="panel-title">Tenants <template x-if="selectedHost"><span style="font-size:12px;color:var(--cyan-dim)">— <span x-text="selectedHost"></span> <button class="btn-icon" @click="selectedHost=null" style="font-size:12px"><svg class="icon s12"><use href="#i-x"/></svg></button></span></template></span>
       <div style="display:flex;gap:10px;align-items:center">
         <button class="btn btn-cyan" @click="showModal=true">New Tenant</button>
       </div>
@@ -117,28 +130,28 @@
               <td><span class="health-dot" :class="healthClass(t.app_health)"></span></td>
               <td>
                 <div class="act-group">
-                  <button class="btn-act" title="Copy oc-connect.sh command" @click="copyCmd('oc-connect.sh '+t.id)">🔗</button>
-                  <button class="btn-act" title="Copy oc-dashboard.sh command" @click="copyCmd('oc-dashboard.sh '+t.id)">📊</button>
+                  <button class="btn-act" title="oc-connect.sh command" @click="copyCmd('oc-connect.sh '+t.id)"><svg class="icon s13"><use href="#i-terminal"/></svg></button>
+                  <button class="btn-act" title="oc-dashboard.sh command" @click="copyCmd('oc-dashboard.sh '+t.id)"><svg class="icon s13"><use href="#i-dashboard"/></svg></button>
                   <template x-if="t.status==='running'">
-                    <a class="btn-act" :href="'/vm/'+t.id+'/'" target="_blank" title="Open Dashboard">🌐</a>
+                    <a class="btn-act" :href="(window.OC_DASHBOARD_BASE||'')+'/vm/'+t.id+'/'" target="_blank" title="Open Dashboard"><svg class="icon s13"><use href="#i-globe"/></svg></a>
                   </template>
                   <template x-if="t.status==='running'">
                     <span>
-                      <button class="btn-act" title="Pause" @click="tenantAction(t.id,'pause')">⏸︎</button>
-                      <button class="btn-act" title="Stop" @click="tenantAction(t.id,'stop')">⏻</button>
-                      <button class="btn-act" title="Restart" @click="tenantAction(t.id,'restart')">↻</button>
+                      <button class="btn-act" title="Pause" @click="tenantAction(t.id,'pause')"><svg class="icon s13"><use href="#i-pause"/></svg></button>
+                      <button class="btn-act" title="Stop" @click="tenantAction(t.id,'stop')"><svg class="icon s13"><use href="#i-power"/></svg></button>
+                      <button class="btn-act" title="Restart" @click="tenantAction(t.id,'restart')"><svg class="icon s13"><use href="#i-zap"/></svg></button>
                     </span>
                   </template>
                   <template x-if="t.status==='stopped'">
                     <span>
-                      <button class="btn-act" title="Start" @click="tenantAction(t.id,'start')">▶︎</button>
-                      <button class="btn-act" title="Reset rootfs" @click="tenantAction(t.id,'reset')">⟲</button>
+                      <button class="btn-act" title="Start" @click="tenantAction(t.id,'start')"><svg class="icon s13"><use href="#i-play"/></svg></button>
+                      <button class="btn-act" title="Reset rootfs" @click="tenantAction(t.id,'reset')"><svg class="icon s13"><use href="#i-rotate-ccw"/></svg></button>
                     </span>
                   </template>
                   <template x-if="t.status==='paused'">
-                    <button class="btn-act" title="Resume" @click="tenantAction(t.id,'resume')">▶︎</button>
+                    <button class="btn-act" title="Resume" @click="tenantAction(t.id,'resume')"><svg class="icon s13"><use href="#i-play"/></svg></button>
                   </template>
-                  <button class="btn-del" @click="deleteTenant(t.id)">✕</button>
+                  <button class="btn-del" @click="deleteTenant(t.id)"><svg class="icon s13"><use href="#i-trash"/></svg></button>
                 </div>
               </td>
             </tr>
@@ -153,7 +166,7 @@
 <template x-if="showModal">
   <div class="overlay" @click.self="showModal=false">
     <div class="modal">
-      <button class="close-btn" @click="showModal=false">✕</button>
+      <button class="close-btn" @click="showModal=false"><svg class="icon s16"><use href="#i-x"/></svg></button>
       <h2>New Tenant</h2>
       <label>Name <span class="req">*</span></label>
       <input type="text" x-model="form.name" placeholder="e.g. my-tenant" @keydown.enter="createTenant()">

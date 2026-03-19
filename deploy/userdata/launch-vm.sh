@@ -35,18 +35,26 @@ log "disks ready ($((SECONDS-T0))s)"
 
 # Inject shared skills into data disk
 SHARED_SKILLS="/data/shared-skills"
+MOUNT_TMP="/tmp/data-mount-${TENANT_ID}"
+mkdir -p ${MOUNT_TMP}
+sudo mount ${DATA_VOL} ${MOUNT_TMP}
+# Skills
 if [ -d "${SHARED_SKILLS}" ] && [ "$(ls -A ${SHARED_SKILLS} 2>/dev/null)" ]; then
   log "injecting shared skills..."
-  MOUNT_TMP="/tmp/data-mount-${TENANT_ID}"
-  mkdir -p ${MOUNT_TMP}
-  sudo mount ${DATA_VOL} ${MOUNT_TMP}
   mkdir -p ${MOUNT_TMP}/.openclaw/skills
   cp -r ${SHARED_SKILLS}/* ${MOUNT_TMP}/.openclaw/skills/ 2>/dev/null || true
   sudo chown -R 1000:1000 ${MOUNT_TMP}/.openclaw/skills
-  sudo umount ${MOUNT_TMP}
-  rmdir ${MOUNT_TMP}
   log "skills injected"
 fi
+# Allow dashboard access from any origin (token auth is the security layer)
+OC_JSON="${MOUNT_TMP}/.openclaw/openclaw.json"
+if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
+  jq '.gateway.controlUi.allowedOrigins = ["*"]' "${OC_JSON}" > "${OC_JSON}.tmp" && mv "${OC_JSON}.tmp" "${OC_JSON}"
+  sudo chown 1000:1000 "${OC_JSON}"
+  log "gateway allowedOrigins set to *"
+fi
+sudo umount ${MOUNT_TMP}
+rmdir ${MOUNT_TMP}
 
 # Network setup
 log "setting up network tap=${TAP}..."
@@ -70,7 +78,7 @@ sleep 1
 # Configure VM
 curl -s --unix-socket ${SOCK} -X PUT http://localhost/boot-source \
   -H 'Content-Type: application/json' \
-  -d '{"kernel_image_path":"'$HOME'/firecracker-assets/vmlinux","boot_args":"console=ttyS0 reboot=k panic=1 pci=off ip='${GUEST_IP}'::'${HOST_TAP_IP}':255.255.255.0::eth0:off"}'
+  -d '{"kernel_image_path":"/home/ubuntu/firecracker-assets/vmlinux","boot_args":"console=ttyS0 reboot=k panic=1 pci=off ip='${GUEST_IP}'::'${HOST_TAP_IP}':255.255.255.0::eth0:off"}'
 
 curl -s --unix-socket ${SOCK} -X PUT http://localhost/drives/rootfs \
   -H 'Content-Type: application/json' \
@@ -92,4 +100,22 @@ RESULT=$(curl -s --unix-socket ${SOCK} -X PUT http://localhost/actions \
   -H 'Content-Type: application/json' -d '{"action_type":"InstanceStart"}')
 [ -n "${RESULT}" ] && log "ERROR: ${RESULT}" && exit 1
 ssh-keygen -R ${GUEST_IP} 2>/dev/null || true
+
+# Nginx reverse proxy for this tenant's dashboard
+sudo tee /etc/nginx/conf.d/tenants/${TENANT_ID}.conf > /dev/null <<EOF
+location ~ ^/vm/${TENANT_ID}(/.*)?$ {
+    proxy_pass http://${GUEST_IP}:18789\$1;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection \$connection_upgrade;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_read_timeout 86400s;
+    proxy_send_timeout 86400s;
+}
+EOF
+sudo nginx -s reload 2>/dev/null || true
+
 log "DONE ${TENANT_ID} IP:${GUEST_IP} (total $((SECONDS))s)"

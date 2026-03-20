@@ -8,7 +8,7 @@ set -euo pipefail
 TENANT_ID="${1:?Usage: $0 <tenant-id> [local-port]}"
 LOCAL_PORT="${2:-18789}"
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 ENV_FILE="$SCRIPT_DIR/.env.deploy"
 if [ -f "$ENV_FILE" ]; then
   source "$ENV_FILE"

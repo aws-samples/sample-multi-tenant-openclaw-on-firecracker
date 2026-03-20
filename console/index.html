@@ -130,8 +130,8 @@
               <td><span class="health-dot" :class="healthClass(t.app_health)"></span></td>
               <td>
                 <div class="act-group">
-                  <button class="btn-act" title="oc-connect.sh command" @click="copyCmd('oc-connect.sh '+t.id)"><svg class="icon s13"><use href="#i-terminal"/></svg></button>
-                  <button class="btn-act" title="oc-dashboard.sh command" @click="copyCmd('oc-dashboard.sh '+t.id)"><svg class="icon s13"><use href="#i-dashboard"/></svg></button>
+                  <button class="btn-act" title="oc-connect.sh command" @click="copyCmd('./scripts/oc-connect.sh '+t.id)"><svg class="icon s13"><use href="#i-terminal"/></svg></button>
+                  <button class="btn-act" title="oc-dashboard.sh command" @click="copyCmd('./scripts/oc-dashboard.sh '+t.id)"><svg class="icon s13"><use href="#i-dashboard"/></svg></button>
                   <template x-if="t.status==='running'">
                     <a class="btn-act" :href="(window.OC_DASHBOARD_BASE||'')+'/vm/'+t.id+'/'" target="_blank" title="Open Dashboard"><svg class="icon s13"><use href="#i-globe"/></svg></a>
                   </template>

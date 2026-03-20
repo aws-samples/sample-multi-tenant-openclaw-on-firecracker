@@ -20,7 +20,7 @@ TENANT_ID="${1:?Usage: $0 <tenant-id> [user]}"
 SSH_USER="${2:-agent}"
 
 # 加载部署环境信息
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 ENV_FILE="$SCRIPT_DIR/.env.deploy"
 if [ -f "$ENV_FILE" ]; then
   source "$ENV_FILE"

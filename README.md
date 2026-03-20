@@ -1,29 +1,31 @@
-# OpenClaw on EC2 microVM
+# OpenClaw Pool on EC2 microVM
 
-![Version](https://img.shields.io/badge/version-0.7.0-blue)
+![Version](https://img.shields.io/badge/version-0.7.2-blue)
 
-基于 AWS Firecracker microVM 的 OpenClaw 多租户隔离部署方案。每个租户运行在独立的 microVM 中，通过 API 统一管理，ASG 自动扩缩宿主机，空闲主机自动回收。
+**[English](README.md)** | **[中文](docs/README-CN.md)**
 
-> 本项目使用 EC2 [嵌套虚拟化](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/nested-virtualization.html) 功能，在 EC2 实例内运行 KVM + Firecracker microVM。目前支持 Intel 系列 (c8i/m8i/r8i 等) 实例家族。
+Multi-tenant isolated deployment of OpenClaw AI agents on AWS using Firecracker microVMs. Each tenant runs in its own microVM with independent kernel, filesystem, and network. Managed via API, with auto-scaling hosts and idle reclamation.
 
-## 功能概览
+> This project uses EC2 [nested virtualization](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/nested-virtualization.html) to run KVM + Firecracker inside EC2 instances. Currently supports Intel instance families (c8i/m8i/r8i, etc.).
 
-- **租户管理** — 通过 API 创建/删除/查询租户。每个租户是一个运行在独立 Firecracker microVM 中的 OpenClaw 实例，拥有独立的系统盘、数据盘和网络
-- **安全隔离** — 基于 Firecracker microVM 实现租户间隔离，独立内核、独立网络，互不可见
-- **自动调度** — 创建租户时自动选择有空闲资源的宿主机，资源不足时自动扩容
-- **自动缩容** — 空闲宿主机超时后自动回收，节省成本（两轮确认防误杀）
-- **健康检查** — 每分钟探活所有 VM，连续失败自动重启
-- **Web 管理控制台** — 可视化管理 Host/Tenant，实时状态展示
-- **Rootfs 预构建** — rootfs + data template 双镜像通过 S3 分发，宿主机启动时自动下载
-- **Dashboard 直达** — 每只租户的 OpenClaw Dashboard 通过统一域名 `/vm/{tenant-id}/` 直接访问，无需 SSM 隧道
-- **共享 Skills** — 所有租户共享统一的 Skills（S3 集中管理，自动同步到所有 VM），记忆独立
-- **默认工具链** — 每个 VM 预装 Python3/uv/git/gh/Node.js/htop/tmux/tree 等开发工具
-- **统一配置管理** — 控制台展示每个租户的模型配置和共享 Skills 列表
+## Features
 
-## 部署架构
+- **Tenant Management** — Create/delete/query tenants via API. Each tenant is an OpenClaw instance running in an isolated Firecracker microVM with its own rootfs, data volume, and network
+- **Security Isolation** — Firecracker microVM-based isolation: independent kernel, network, and filesystem per tenant
+- **Auto Scheduling** — Automatically selects a host with available resources; scales out when capacity is insufficient
+- **Auto Scale-in** — Idle hosts are reclaimed after timeout (two-round confirmation to prevent false kills)
+- **Health Checks** — All VMs probed every minute; auto-restart on consecutive failures
+- **Web Console** — Visual management of hosts and tenants with real-time status
+- **Rootfs Pre-build** — Rootfs + data template distributed via S3, downloaded on host init
+- **Dashboard Access** — Each tenant's OpenClaw Dashboard accessible at `/vm/{tenant-id}/` via ALB, no SSM tunnel needed
+- **Shared Skills** — All tenants share a unified skill set (S3-managed, auto-synced to all VMs), with independent memory
+- **Default Toolchain** — Each VM comes with Python3/uv/git/gh/Node.js/htop/tmux/tree pre-installed
+- **Data Backup** — Automated daily backup + manual backup API, Firecracker pause/resume for consistency
+
+## Architecture
 
 ```
-用户/管理员
+Admin / User
     │
     ├── API Gateway (HTTPS, x-api-key) ──→ Lambda ──→ DynamoDB
     │                                                  ├── tenants
@@ -38,62 +40,70 @@ Lambda ── SSM Run Command ──→ EC2 Host
                                ├── microVM 02 (172.16.2.2)
                                └── ...
 
-S3: rootfs 分发 + 数据卷备份 + 共享 Skills
-ASG: 宿主机自动扩缩
-EventBridge: 健康检查 + 空闲回收 + 定时备份
+S3: rootfs distribution + data backup + shared skills
+ASG: auto-scaling hosts
+EventBridge: health checks + idle reclamation + scheduled backup
 ```
 
 <details>
-<summary>系统架构图 (详细)</summary>
+<summary>System Architecture</summary>
 
-![部署架构](docs/system_arch.png)
+![System Architecture](docs/oc-system-arch.png)
 
 </details>
 
-## 项目结构
+<details>
+<summary>Deployment Architecture</summary>
+
+![Deployment Architecture](docs/oc-deploy-arch.png)
+
+</details>
+
+## Project Structure
 
 ```
 openclaw-firecracker/
-├── config.yml                 # 全局配置 (唯一配置源)
-├── build-rootfs.sh            # rootfs + data template 构建 + S3 上传
-├── setup.sh                   # 一键部署 + 导出 .env.deploy
-├── destroy.sh                 # 销毁环境 (--purge 彻底清理)
-├── web-console.sh             # 启动 Web 管理控制台
-├── oc-connect.sh              # 登录 OpenClaw microVM
-├── oc-dashboard.sh            #  OpenClaw 控制面板
-├── console/                   # 管理控制台前端
-│   ├── index.html             # Alpine.js SPA
-│   ├── style.css              # 控制台UI样式
-│   └── config.js              # 动态生成
-├── deploy/                    # CDK 项目
-│   ├── stack.py               # 基础设施定义
+├── deploy/                    # CDK project
+│   ├── stack.py               # Infrastructure definition
 │   ├── lambda/
-│   │   ├── api/handler.py     # 租户 CRUD + 宿主机管理
-│   │   ├── health_check/handler.py  # 定时健康检查
-│   │   └── scaler/handler.py  # 空闲宿主机回收
+│   │   ├── api/handler.py     # Tenant CRUD + host management
+│   │   ├── health_check/handler.py  # Scheduled health checks
+│   │   └── scaler/handler.py  # Idle host reclamation
 │   └── userdata/
-│       ├── init-host.sh       # 宿主机初始化
-│       ├── launch-vm.sh       # microVM 启动
-│       └── stop-vm.sh         # microVM 停止
+│       ├── init-host.sh       # Host initialization
+│       ├── launch-vm.sh       # microVM launch
+│       └── stop-vm.sh         # microVM stop
+├── console/                   # Web management console
+│   ├── index.html             # Alpine.js SPA
+│   ├── style.css
+│   └── config.js              # Auto-generated
+├── config.yml                 # Global config (single source of truth)
+├── setup.sh                   # One-click deploy + export .env.deploy
+├── build-rootfs.sh            # Build rootfs + data template, upload to S3
+├── web-console.sh             # Start web management console
+├── scripts/
+│   ├── bind-domain.sh         # Bind custom domain + HTTPS to ALB
+│   ├── destroy.sh             # Tear down environment (--purge for full cleanup)
+│   ├── oc-connect.sh          # SSH into OpenClaw microVM
+│   └── oc-dashboard.sh        # Access OpenClaw dashboard
 └── docs/
 ```
 
-## 前置条件
+## Prerequisites
 
-- AWS 账号 + CLI 配置
+- AWS account + CLI configured
 - CDK CLI + Python 3.12+
-- uv (Python 包管理)
+- uv (Python package manager)
 
-## 快速开始
+## Quick Start
 
 ```bash
-# 1. 部署基础设施
+# 1. Deploy infrastructure
 ./setup.sh ap-northeast-1 lab
-# 完成后环境变量保存在 .env.deploy
+# Environment variables saved to .env.deploy
 
-# 2. 配置 OpenClaw 应用参数 (首次)
+# 2. Configure OpenClaw app settings (first time)
 cat > .env.openclaw << 'EOF'
-# OpenClaw 默认配置 (烧入 data template)
 OPENCLAW_API_KEY=your-bedrock-api-key
 OPENCLAW_BASE_URL=https://bedrock-mantle.us-west-2.api.aws/v1
 OPENCLAW_MODEL_ID=deepseek.v3.2
@@ -101,173 +111,155 @@ OPENCLAW_TOOLS_PROFILE=coding
 OPENCLAW_DM_SCOPE=per-peer
 EOF
 
-# 3. 构建并上传 rootfs
+# 3. Build and upload rootfs
 ./build-rootfs.sh v1.0
 
-# 4. 创建租户(Openclaw 实例)
+# 4. Create a tenant (OpenClaw instance)
 source .env.deploy
 curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" \
   -d '{"name":"my-agent","vcpu":2,"mem_mb":4096}' | jq .
 
-# 4. 查看租户状态
+# 5. Check tenant status
 curl -s "${API_URL}tenants" -H "x-api-key: ${API_KEY}" | jq .
 
-# 5. SSH 登录 microVM
-./oc-connect.sh <tenant-id>
+# 6. SSH into microVM
+./scripts/oc-connect.sh <tenant-id>
 
-# 6. 删除租户
+# 7. Delete tenant
 curl -s -X DELETE "${API_URL}tenants/<tenant-id>" -H "x-api-key: ${API_KEY}" | jq .
 ```
 
 ## Management Console
 
-Web 管理控制台，支持 Host/Tenant 可视化管理。
+Web-based console for visual host/tenant management.
 
 ```bash
-./web-console.sh    # 自动读取 .env.deploy，启动 http://localhost:8080
+./web-console.sh    # Reads .env.deploy, starts http://localhost:8080
 ```
 
 ![Management Console](docs/web_console.png)
 
-功能：
-- 查看宿主机资源使用情况 (vCPU / 内存 / VM 数量)
-- 创建 / 删除 Tenant
-- 按宿主机筛选 Tenant
-- 健康状态实时展示 (vm_health / app_health)
-- 快捷复制连接命令 (oc-connect.sh) 和 Dashboard 命令 (oc-dashboard.sh)
-- API 地址和 Key 自动注入，支持手动修改
+Features:
+- Host resource usage (vCPU / memory / VM count)
+- Create / delete tenants
+- Filter tenants by host
+- Real-time health status (vm_health / app_health)
+- Quick-copy connect and dashboard commands
+- Auto-injected API URL and key
 
-## Dashboard 直达
+## Dashboard Access
 
-每只租户的 OpenClaw Dashboard 通过 ALB + Nginx 反向代理直接访问，无需 SSM 隧道：
+Each tenant's OpenClaw Dashboard is accessible via ALB + Nginx reverse proxy, no SSM tunnel required:
 
 ```
-https://{your-domain}/vm/{tenant-id}/    → 租户 Dashboard (WebSocket)
+https://{your-domain}/vm/{tenant-id}/    → Tenant Dashboard (WebSocket)
 ```
 
-**前置条件：HTTPS 必须**
+**Prerequisite: HTTPS Required**
 
-OpenClaw Gateway Dashboard 要求 Secure Context（HTTPS）进行设备配对，因此需要：
+OpenClaw Gateway Dashboard requires a Secure Context (HTTPS) for device pairing:
 
-1. 自定义域名（如 `dashboard.example.com`）
-2. ACM 证书（免费，DNS 验证）
-3. Route53 / DNS CNAME 指向 ALB
-4. CDK stack 中 ALB listener 添加 HTTPS（443）
-
-链路：`用户浏览器 → ALB:443 → Host Nginx:80 → VM Gateway:18789`
-
-Nginx 配置由 launch-vm.sh / stop-vm.sh 自动管理，创建/删除租户无需手动操作。
-
-## 共享 Skills
-
-所有租户共享统一的 Skills（SKILL.md 文件），记忆各自独立。
+1. Custom domain + DNS CNAME pointing to ALB
+2. ACM certificate (free, DNS validation)
 
 ```bash
-# 上传 Skills 到 S3（所有 VM 自动同步）
+# After ACM certificate is issued and DNS validated:
+./scripts/bind-domain.sh dashboard.example.com arn:aws:acm:ap-northeast-1:xxx:certificate/xxx
+```
+
+The script creates/updates the ALB HTTPS listener and writes `DASHBOARD_URL` to `.env.deploy`.
+
+Traffic flow: `Browser → ALB:443 → Host Nginx:80 → VM Gateway:18789`
+
+Nginx config is automatically managed by launch-vm.sh / stop-vm.sh.
+
+## Shared Skills
+
+All tenants share a unified skill set (SKILL.md files), with independent memory per tenant.
+
+```bash
+# Upload skills to S3 (auto-synced to all VMs)
 aws s3 sync ./my-skills/ s3://${ASSETS_BUCKET}/skills/ --profile $PROFILE
 
-# Skills 同步链路：
-# S3 → 宿主机 /data/shared-skills/ (cron 5min) → 所有运行中的 VM
-# 新建 VM 时自动注入到数据盘
+# Sync chain:
+# S3 → Host /data/shared-skills/ (cron 5min) → All running VMs
+# New VMs get skills injected into data volume at launch
 ```
 
-Skills 目录结构：
-```
-s3://{bucket}/skills/
-├── code-review/SKILL.md
-├── summarizer/SKILL.md
-└── web-search/SKILL.md
-```
+## Auto Scaling
 
-## 默认工具链
+**Scale-out** — No available host when creating a tenant → tenant enters `pending` → ASG launches new instance → pending tenants auto-assigned after init
 
-每个 VM 预装以下工具（rootfs v1.1+）：
+**Scale-in** — Scaler Lambda checks every 5 minutes:
+1. Host with `vm_count=0` exceeding `idle_timeout_minutes` → marked `idle`
+2. Next round confirms still idle and ASG instances > min → terminate
+3. If a tenant is assigned during this window → auto-recover to `active`
 
-| 工具 | 用途 |
-|------|------|
-| Python 3.12 + venv | Python 开发 |
-| uv | Python 包管理 |
-| Node.js 22 + npm | JavaScript 运行时 |
-| OpenClaw CLI | AI Agent 框架 |
-| git + gh | 版本控制 + GitHub CLI |
-| curl / wget / jq | HTTP 请求 + JSON 处理 |
-| htop / tmux / tree | 系统监控 + 终端复用 + 目录浏览 |
-| vim / build-essential | 编辑器 + 编译工具链 |
+## Configuration
 
-## 自动扩缩容
+### Config Files
 
-**扩容** — 创建租户时无可用宿主机 → 租户进入 pending → ASG 自动启动新实例 → 初始化完成后自动分配 pending 租户
-
-**缩容** — Scaler Lambda 每 5 分钟检测空闲宿主机：
-1. 宿主机 `vm_count=0` 超过 `idle_timeout_minutes` → 标记 `idle`
-2. 下一轮确认仍空闲且 ASG 实例数 > min → 终止实例
-3. 期间如有新租户分配到该宿主机 → 自动恢复 `active`，取消回收
-
-## 配置说明
-
-### 配置文件
-
-| 文件 | 用途 |
-|------|------|--------|
-| `config.yml` | 基础设施参数 (实例类型、VM 规格、S3 前缀、ASG) |
-| `.env.deploy` | 部署环境 (region、API URL/Key、bucket) |
-| `.env.openclaw` | OpenClaw 应用配置 (模型、API key、tools profile) |
+| File | Purpose |
+|------|---------|
+| `config.yml` | Infrastructure params (instance type, VM specs, S3 prefix, ASG) |
+| `.env.deploy` | Deploy environment (region, API URL/Key, bucket) — auto-generated |
+| `.env.openclaw` | OpenClaw app config (model, API key, tools profile) |
 
 ### config.yml
 
-| 分类 | 配置项 | 默认值 | 说明 |
-|------|--------|--------|------|
-| host | instance_type | c8i.2xlarge | 需支持 NestedVirtualization (c8i/m8i/r8i) |
-| host | reserved_vcpu | 1 | 预留给宿主机 OS |
-| host | reserved_mem_mb | 2048 | 预留给宿主机 OS |
-| host | cpu_overcommit_ratio | 1.0 | CPU 超配比例 (2.0=可分配 2 倍 vCPU，内存不超配) |
-| asg | min_capacity | 1 | 最小实例数 |
-| asg | max_capacity | 5 | 最大实例数 |
-| asg | use_spot | false | Spot 实例 (省 ~60-70%，可能被回收) |
-| vm | default_vcpu | 2 | 默认 vCPU |
-| vm | default_mem_mb | 4096 | 默认内存 (MB) |
-| vm | data_disk_mb | 4096 | 数据盘大小 (MB) |
-| health_check | interval_minutes | 1 | 探活间隔 |
-| health_check | max_failures | 3 | 连续失败后自动重启 |
-| scaler | interval_minutes | 5 | 空闲检测间隔 |
-| scaler | idle_timeout_minutes | 10 | 空闲超时 (分钟) |
+| Section | Key | Default | Description |
+|---------|-----|---------|-------------|
+| host | instance_type | c8i.2xlarge | Must support NestedVirtualization (c8i/m8i/r8i) |
+| host | reserved_vcpu | 1 | Reserved for host OS |
+| host | reserved_mem_mb | 2048 | Reserved for host OS |
+| host | cpu_overcommit_ratio | 1.0 | CPU overcommit ratio (2.0 = allocate 2x vCPU, memory not overcommitted) |
+| asg | min_capacity | 1 | Minimum instances |
+| asg | max_capacity | 5 | Maximum instances |
+| asg | use_spot | false | Spot instances (save ~60-70%, may be reclaimed) |
+| vm | default_vcpu | 2 | Default vCPU per tenant |
+| vm | default_mem_mb | 4096 | Default memory (MB) |
+| vm | data_disk_mb | 4096 | Data volume size (MB) |
+| health_check | interval_minutes | 1 | Health check interval |
+| health_check | max_failures | 3 | Auto-restart after consecutive failures |
+| scaler | interval_minutes | 5 | Idle detection interval |
+| scaler | idle_timeout_minutes | 10 | Idle timeout (minutes) |
 
-修改后重新部署：`./setup.sh <region> <profile>`
+Redeploy after changes: `./setup.sh <region> <profile>`
 
-### 销毁环境
+### Tear Down
 
 ```bash
-./destroy.sh           # 销毁 stack，保留 S3 bucket 和 DynamoDB 表
-./destroy.sh --purge   # 彻底清理，包括 S3 数据和 DynamoDB 表
+./scripts/destroy.sh           # Destroy stack, keep S3 bucket and DynamoDB tables
+./scripts/destroy.sh --purge   # Full cleanup including S3 data and DynamoDB tables
 ```
 
-## API 参考
+## API Reference
 
-所有请求需携带 `x-api-key` header。
+All requests require `x-api-key` header.
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | /tenants | 列出所有租户 |
-| POST | /tenants | 创建租户 `{"name":"xx","vcpu":2,"mem_mb":4096}` |
-| GET | /tenants/{id} | 查询单个租户 |
-| DELETE | /tenants/{id} | 删除租户 (`?keep_data=true` 保留数据盘) |
-| POST | /tenants/{id}/restart | 重启租户 VM（复用磁盘，快速） |
-| POST | /tenants/{id}/stop | 停止租户 VM（磁盘保留） |
-| POST | /tenants/{id}/start | 启动已停止的租户 VM |
-| POST | /tenants/{id}/pause | 冻结 vCPU（Firecracker 原生，即时） |
-| POST | /tenants/{id}/resume | 恢复已暂停的租户 VM |
-| POST | /tenants/{id}/reset | 重装系统盘（data 卷保留） |
-| POST | /tenants/{id}/backup | 手动备份数据卷（异步，返回 202） |
-| GET | /tenants/{id}/backups | 查询备份列表 |
-| GET | /hosts | 列出所有宿主机 |
-| POST | /hosts | 注册宿主机 (UserData 自动调用) |
-| POST | /hosts/refresh-rootfs | 推送最新 rootfs + data template 到所有宿主机 |
-| GET | /hosts/rootfs-version | 查询 S3 上当前 rootfs 版本 (manifest.json) |
-| DELETE | /hosts/{id} | 注销宿主机 |
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | /tenants | List all tenants |
+| POST | /tenants | Create tenant `{"name":"xx","vcpu":2,"mem_mb":4096}` |
+| GET | /tenants/{id} | Get tenant details |
+| DELETE | /tenants/{id} | Delete tenant (`?keep_data=true` to preserve data volume) |
+| POST | /tenants/{id}/restart | Restart VM (reuse disks, fast) |
+| POST | /tenants/{id}/stop | Stop VM (disks preserved) |
+| POST | /tenants/{id}/start | Start a stopped VM |
+| POST | /tenants/{id}/pause | Freeze vCPU (Firecracker native, instant) |
+| POST | /tenants/{id}/resume | Resume a paused VM |
+| POST | /tenants/{id}/reset | Reinstall rootfs (data volume preserved) |
+| POST | /tenants/{id}/backup | Manual data backup (async, returns 202) |
+| GET | /tenants/{id}/backups | List backups |
+| GET | /hosts | List all hosts |
+| POST | /hosts | Register host (called by UserData) |
+| POST | /hosts/refresh-rootfs | Push latest rootfs to all hosts |
+| GET | /hosts/rootfs-version | Query current rootfs version (manifest.json) |
+| DELETE | /hosts/{id} | Deregister host |
 
-## 网络模型
+## Network Model
 
-每个 VM 使用独立 /24 子网，通过 TAP 设备与宿主机通信：
+Each VM uses an independent /24 subnet, communicating with the host via TAP device:
 
 ```
 VM1: tap-vm1  host=172.16.1.1/24  guest=172.16.1.2/24
@@ -275,69 +267,26 @@ VM2: tap-vm2  host=172.16.2.1/24  guest=172.16.2.2/24
 VMn: tap-vmN  host=172.16.N.1/24  guest=172.16.N.2/24
 ```
 
-- 出站：iptables MASQUERADE → 外网
-- 入站：DNAT 端口转发 (host_port → guest:18789)
-- VM 间：完全隔离，不同子网无路由
+- Outbound: iptables MASQUERADE → internet
+- Inbound: ALB → Nginx reverse proxy → VM:18789
+- Inter-VM: fully isolated, no routing between subnets
 
-## Rootfs 管理
+## Rootfs Management
 
-构建脚本生成两个镜像：rootfs (系统+软件) 和 data template (/home/agent 预配置内容)。
+The build script produces two images: rootfs (OS + software) and data template (/home/agent pre-configured content).
 
-镜像版本通过 S3 `manifest.json` 管理，hosts/tenants 表记录各自使用的 `rootfs_version`。
+Versions managed via S3 `manifest.json`. Hosts and tenants track their `rootfs_version`.
 
 ```bash
-# 构建并上传 (更新 manifest.json + refresh 宿主机)
+# Build and upload (updates manifest.json + refreshes hosts)
 ./build-rootfs.sh v1.8
 
-# 手动刷新宿主机镜像
+# Manually refresh host images
 source .env.deploy
 curl -s -X POST "${API_URL}hosts/refresh-rootfs" -H "x-api-key: ${API_KEY}" | jq .
 
-# 查询当前版本
+# Query current version
 curl -s "${API_URL}hosts/rootfs-version" -H "x-api-key: ${API_KEY}" | jq .
 
-# 新建的 VM 自动使用新版本，已有 VM 需 reset 才会更新
-```
-
-## 宿主机管理
-
-宿主机由 ASG 全自动管理，通常无需手动操作。
-
-```bash
-# 查看 ASG 状态
-aws autoscaling describe-auto-scaling-groups \
-  --auto-scaling-group-names openclaw-hosts-asg \
-  --query 'AutoScalingGroups[0].{Desired:DesiredCapacity,Min:MinSize,Max:MaxSize}' \
-  --profile lab --region ap-northeast-1
-
-# 手动扩容
-aws autoscaling set-desired-capacity \
-  --auto-scaling-group-name openclaw-hosts-asg \
-  --desired-capacity 3 --profile lab --region ap-northeast-1
-
-# 查看初始化日志
-./oc-connect.sh 后在宿主机上: cat /var/log/openclaw-init.log
-```
-
-## API Key 管理
-
-```bash
-source .env.deploy
-
-# 创建新 key
-aws apigateway create-api-key --name "operator-alice" --enabled \
-  --profile $PROFILE --region $REGION
-
-# 关联到 usage plan
-PLAN_ID=$(aws apigateway get-usage-plans \
-  --query "items[?name=='openclaw-plan'].id" --output text \
-  --profile $PROFILE --region $REGION)
-aws apigateway create-usage-plan-key --usage-plan-id $PLAN_ID \
-  --key-id <new-key-id> --key-type API_KEY \
-  --profile $PROFILE --region $REGION
-
-# 禁用 / 删除 key
-aws apigateway update-api-key --api-key <key-id> \
-  --patch-operations op=replace,path=/enabled,value=false \
-  --profile $PROFILE --region $REGION
+# New VMs use the latest version; existing VMs need reset to update
 ```

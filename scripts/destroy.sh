@@ -4,7 +4,7 @@
 #   --purge  同时删除 RETAIN 的 S3 bucket 和 DynamoDB 表
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 ENV_FILE="$SCRIPT_DIR/.env.deploy"
 
 if [ ! -f "$ENV_FILE" ]; then

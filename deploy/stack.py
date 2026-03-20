@@ -474,6 +474,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
             targets=[asg],
             health_check=elbv2.HealthCheck(path="/health", interval=Duration.seconds(30)),
         )
+        alb.connections.allow_from_any_ipv4(ec2.Port.tcp(443), "HTTPS inbound")
         sg.add_ingress_rule(ec2.Peer.security_group_id(alb.connections.security_groups[0].security_group_id),
             ec2.Port.tcp(80), "ALB to Nginx")
 

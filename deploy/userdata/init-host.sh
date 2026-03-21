@@ -16,7 +16,7 @@ echo 'KERNEL=="kvm", MODE="0666"' > /etc/udev/rules.d/99-kvm.rules
 # Step 2: Install tools + Firecracker
 log "step2: installing tools + firecracker"
 apt-get update -qq
-apt-get install -y -qq curl jq sshpass unzip pigz > /dev/null 2>&1
+apt-get install -y -qq curl jq sshpass unzip pigz nginx > /dev/null 2>&1
 if ! command -v aws &>/dev/null; then
   curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
   cd /tmp && unzip -qo awscliv2.zip && ./aws/install &>/dev/null; cd -
@@ -29,6 +29,24 @@ mv release-${FC_VER}-${ARCH}/firecracker-${FC_VER}-${ARCH} /usr/local/bin/firecr
 mv release-${FC_VER}-${ARCH}/jailer-${FC_VER}-${ARCH} /usr/local/bin/jailer
 rm -rf release-${FC_VER}-${ARCH}
 log "firecracker ${FC_VER} installed"
+
+# Nginx reverse proxy for tenant dashboards
+mkdir -p /etc/nginx/conf.d/tenants
+cat > /etc/nginx/conf.d/openclaw-proxy.conf <<'NGINX'
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+server {
+    listen 80 default_server;
+    location /health { return 200 'ok'; add_header Content-Type text/plain; }
+    include /etc/nginx/conf.d/tenants/*.conf;
+}
+NGINX
+rm -f /etc/nginx/sites-enabled/default
+systemctl enable nginx
+systemctl restart nginx
+log "nginx proxy configured"
 
 # Step 3: Mount data volume (before downloading to avoid filling root partition)
 # Nitro instances map /dev/sdf to unpredictable /dev/nvmeXn1.
@@ -48,7 +66,8 @@ log "step3: mounting data volume ${DATA_DEV}"
 if ! blkid ${DATA_DEV} | grep -q ext4; then mkfs.ext4 -q ${DATA_DEV}; fi
 mkdir -p /data
 mount ${DATA_DEV} /data
-echo "${DATA_DEV} /data ext4 defaults,nofail 0 2" >> /etc/fstab
+DATA_UUID=$(blkid -s UUID -o value ${DATA_DEV})
+echo "UUID=${DATA_UUID} /data ext4 defaults,nofail 0 2" >> /etc/fstab
 mkdir -p /data/firecracker-assets
 chown ubuntu:ubuntu /data /data/firecracker-assets
 rm -rf /home/ubuntu/firecracker-assets
@@ -59,12 +78,18 @@ DATA_VOL_ID=$(aws ec2 describe-volumes --filters Name=attachment.instance-id,Val
 aws ec2 create-tags --resources ${DATA_VOL_ID} --tags Key=Name,Value=openclaw-data-${INSTANCE_ID} Key=openclaw:role,Value=host-data --region ${REGION}
 
 # Step 3b: Kernel + rootfs from S3 (downloads directly to data volume via symlink)
-log "step3b: downloading assets from S3..."
+log "step3b: waiting for rootfs in S3..."
 T0=$SECONDS
 ASSETS=/home/ubuntu/firecracker-assets
 FC_MAJOR=$(echo ${FC_VER} | grep -oP "v\d+\.\d+")
 curl -fsSL -o ${ASSETS}/vmlinux "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${FC_MAJOR}/${ARCH}/vmlinux-5.10.245-no-acpi"
-aws s3 cp s3://{{ASSETS_BUCKET}}/{{ROOTFS_PREFIX}}/manifest.json ${ASSETS}/manifest.json --region ${REGION}
+MANIFEST_URL="s3://{{ASSETS_BUCKET}}/{{ROOTFS_PREFIX}}/manifest.json"
+for i in $(seq 1 20); do
+  aws s3 cp ${MANIFEST_URL} ${ASSETS}/manifest.json --region ${REGION} 2>/dev/null && break
+  log "manifest.json not found, retrying in 30s ($i/20)..."
+  sleep 30
+done
+[ -f ${ASSETS}/manifest.json ] || { log "ERROR: manifest.json not available after 10min"; exit 1; }
 eval $(python3 -c "
 import json; m=json.load(open('${ASSETS}/manifest.json'))
 print(f'ROOTFS_KEY={m[\"rootfs\"]}')
@@ -91,6 +116,7 @@ log "shared skills ready ($(ls /data/shared-skills/ 2>/dev/null | wc -l) skills)
 log "step4: deploying scripts"
 {{LAUNCH_VM_SCRIPT}}
 {{STOP_VM_SCRIPT}}
+{{BACKUP_DATA_SCRIPT}}
 
 # Step 5: Self-register to DynamoDB
 log "step5: registering to DynamoDB"

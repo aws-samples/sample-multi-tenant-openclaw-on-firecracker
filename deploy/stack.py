@@ -10,6 +10,7 @@ from aws_cdk import (
     aws_s3 as s3,
     aws_ec2 as ec2,
     aws_autoscaling as autoscaling,
+    aws_elasticloadbalancingv2 as elbv2,
     custom_resources as cr,
     Duration, Fn, RemovalPolicy,
 )
@@ -41,11 +42,43 @@ class OpenClawOrchestratorStack(cdk.Stack):
         # ========== S3 Assets Bucket ==========
         assets_bucket = s3.Bucket(self, "Assets",
             bucket_name=f"openclaw-assets-{self.account}",
-            lifecycle_rules=[s3.LifecycleRule(
-                prefix=f"{CFG['s3']['backup_prefix']}/",
-                expiration=Duration.days(CFG["s3"]["backup_retention_days"]),
-            )],
             removal_policy=RemovalPolicy.RETAIN,
+        )
+
+        # Lifecycle rule managed via CustomResource (RETAIN bucket won't update inline rules)
+        cr.AwsCustomResource(self, "BackupLifecycle",
+            install_latest_aws_sdk=False,
+            on_create=cr.AwsSdkCall(
+                service="S3",
+                action="putBucketLifecycleConfiguration",
+                parameters={
+                    "Bucket": assets_bucket.bucket_name,
+                    "LifecycleConfiguration": {"Rules": [{
+                        "ID": "backup-expiration",
+                        "Filter": {"Prefix": f"{CFG['s3']['backup_prefix']}/"},
+                        "Status": "Enabled",
+                        "Expiration": {"Days": CFG["s3"]["backup_retention_days"]},
+                    }]},
+                },
+                physical_resource_id=cr.PhysicalResourceId.of("backup-lifecycle"),
+            ),
+            on_update=cr.AwsSdkCall(
+                service="S3",
+                action="putBucketLifecycleConfiguration",
+                parameters={
+                    "Bucket": assets_bucket.bucket_name,
+                    "LifecycleConfiguration": {"Rules": [{
+                        "ID": "backup-expiration",
+                        "Filter": {"Prefix": f"{CFG['s3']['backup_prefix']}/"},
+                        "Status": "Enabled",
+                        "Expiration": {"Days": CFG["s3"]["backup_retention_days"]},
+                    }]},
+                },
+                physical_resource_id=cr.PhysicalResourceId.of("backup-lifecycle"),
+            ),
+            policy=cr.AwsCustomResourcePolicy.from_statements([
+                iam.PolicyStatement(actions=["s3:PutLifecycleConfiguration"], resources=[assets_bucket.bucket_arn]),
+            ]),
         )
 
         # ========== Lambda Shared Policy ==========
@@ -80,6 +113,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 "VM_PORT_BASE": str(CFG["vm"]["gateway_port_base"]),
                 "VM_SUBNET_PREFIX": CFG["vm"]["subnet_prefix"],
                 "ASG_NAME": "openclaw-hosts-asg",
+                "BACKUP_PREFIX": CFG["s3"]["backup_prefix"],
             },
         )
         tenants_table.grant_read_write_data(api_fn)
@@ -128,6 +162,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
 
         tenant_action = tenant_resource.add_resource("{action}")
         tenant_action.add_method("POST", apigw.LambdaIntegration(api_fn), **key_required)
+        tenant_action.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
 
         hosts_resource = api.root.add_resource("hosts")
         hosts_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
@@ -189,6 +224,30 @@ class OpenClawOrchestratorStack(cdk.Stack):
             targets=[targets.LambdaFunction(scaler_fn)],
         )
 
+        # ========== Backup Lambda (daily data backup) ==========
+        backup_fn = _lambda.Function(self, "Backup",
+            function_name="openclaw-backup",
+            runtime=_lambda.Runtime.PYTHON_3_12,
+            handler="handler.lambda_handler",
+            code=_lambda.Code.from_asset("lambda/backup"),
+            timeout=Duration.seconds(900),
+            memory_size=256,
+            environment={
+                "TENANTS_TABLE": tenants_table.table_name,
+                "ASSETS_BUCKET": assets_bucket.bucket_name,
+                "BACKUP_PREFIX": CFG["s3"]["backup_prefix"],
+            },
+        )
+        tenants_table.grant_read_write_data(backup_fn)
+        assets_bucket.grant_read_write(backup_fn)
+        backup_fn.add_to_role_policy(ssm_policy)
+        backup_fn.grant_invoke(api_fn)  # API Lambda async invokes Backup Lambda
+
+        events.Rule(self, "BackupSchedule",
+            schedule=events.Schedule.expression(CFG["s3"]["backup_cron"]),
+            targets=[targets.LambdaFunction(backup_fn)],
+        )
+
         # ========== Host EC2 Role (SSM + S3 backup + self-register) ==========
         host_role = iam.Role(self, "HostRole",
             assumed_by=iam.ServicePrincipal("ec2.amazonaws.com"),
@@ -234,6 +293,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
         launch_vm_sh = (ud_dir / "launch-vm.sh").read_text().replace(
             "{{SUBNET_PREFIX}}", CFG["vm"]["subnet_prefix"])
         stop_vm_sh = (ud_dir / "stop-vm.sh").read_text()
+        backup_data_sh = (ud_dir / "backup-data.sh").read_text()
 
         init_sh = (ud_dir / "init-host.sh").read_text()
         init_sh = init_sh.replace("{{ASSETS_BUCKET}}", "PLACEHOLDER_BUCKET")
@@ -248,6 +308,9 @@ class OpenClawOrchestratorStack(cdk.Stack):
         init_sh = init_sh.replace("{{STOP_VM_SCRIPT}}",
             f"cat > /home/ubuntu/stop-vm.sh << 'STOPEOF'\n{stop_vm_sh}STOPEOF\n"
             "chmod +x /home/ubuntu/stop-vm.sh && chown ubuntu:ubuntu /home/ubuntu/stop-vm.sh")
+        init_sh = init_sh.replace("{{BACKUP_DATA_SCRIPT}}",
+            f"cat > /home/ubuntu/backup-data.sh << 'BACKUPEOF'\n{backup_data_sh}BACKUPEOF\n"
+            "chmod +x /home/ubuntu/backup-data.sh && chown ubuntu:ubuntu /home/ubuntu/backup-data.sh")
 
         # Split script around CDK token placeholders, inject as Fn::Join
         # PLACEHOLDER_BUCKET appears 5 times (manifest + rootfs + data template + skills sync + skills cron)
@@ -399,6 +462,22 @@ class OpenClawOrchestratorStack(cdk.Stack):
             targets=[targets.LambdaFunction(api_fn)],
         )
 
+        # ========== ALB (Dashboard Proxy) ==========
+        alb = elbv2.ApplicationLoadBalancer(self, "DashboardALB",
+            load_balancer_name="openclaw-dashboard",
+            vpc=vpc,
+            internet_facing=True,
+        )
+        listener = alb.add_listener("HTTP", port=80)
+        listener.add_targets("Hosts",
+            port=80,
+            targets=[asg],
+            health_check=elbv2.HealthCheck(path="/health", interval=Duration.seconds(30)),
+        )
+        alb.connections.allow_from_any_ipv4(ec2.Port.tcp(443), "HTTPS inbound")
+        sg.add_ingress_rule(ec2.Peer.security_group_id(alb.connections.security_groups[0].security_group_id),
+            ec2.Port.tcp(80), "ALB to Nginx")
+
         # ========== Outputs ==========
         for key, val in {
             "ApiUrl": api.url,
@@ -407,5 +486,6 @@ class OpenClawOrchestratorStack(cdk.Stack):
             "HostsTable": hosts_table.table_name,
             "AssetsBucket": assets_bucket.bucket_name,
             "HostInstanceProfileArn": instance_profile.attr_arn,
+            "DashboardUrl": f"http://{alb.load_balancer_dns_name}",
         }.items():
             cdk.CfnOutput(self, key, value=val)

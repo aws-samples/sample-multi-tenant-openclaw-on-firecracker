@@ -10,4 +10,6 @@ sleep 2
 pkill -f "api-sock ${VM_DIR}/fc.sock" 2>/dev/null || true
 sudo ip link del tap-vm${VM_NUM} 2>/dev/null || true
 rm -f ${VM_DIR}/fc.sock ${VM_DIR}/fc.log
+sudo rm -f /etc/nginx/conf.d/tenants/${TENANT_ID}.conf
+sudo nginx -s reload 2>/dev/null || true
 log "DONE ${TENANT_ID} (data volume preserved)"

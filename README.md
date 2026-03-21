@@ -1,6 +1,6 @@
 # OpenClaw on EC2 microVM
 
-![Version](https://img.shields.io/badge/version-0.6.1-blue)
+![Version](https://img.shields.io/badge/version-0.8.0-blue)
 
 基于 AWS Firecracker microVM 的 OpenClaw 多租户隔离部署方案。每个租户运行在独立的 microVM 中，通过 API 统一管理，ASG 自动扩缩宿主机，空闲主机自动回收。
 
@@ -333,3 +333,32 @@ aws apigateway update-api-key --api-key <key-id> \
   --patch-operations op=replace,path=/enabled,value=false \
   --profile $PROFILE --region $REGION
 ```
+
+## Changelog
+
+### v0.8.0 — Bugfix + ALB Dashboard + Backup System
+
+**Bug Fixes:**
+- **SSM 队列堵塞修复** — 健康检查对 creating 状态 VM 增加 10 分钟 grace period，不发 SSM 命令；过了 grace 只做轻量 ping 提升，不自动重启。彻底解决同时创建多个 VM 时 SSM 命令堆积问题
+- **ALB 多实例路由修复** — 创建/删除租户时自动同步 nginx 代理配置到所有宿主机，ALB 无论路由到哪台宿主机都能正确转发到 tenant 所在主机
+- **launch-vm.sh rmdir 容错** — `rmdir` 加 `|| true`，防止 umount 异步未完成时脚本退出导致 VM 启动失败
+- **磁盘拷贝完整性校验** — 拷贝前校验文件大小是否与模板一致，损坏文件自动删除重新拷贝
+- **fstab UUID** — 数据卷挂载改用 UUID 替代设备名，避免 NVMe 重启后设备名变化
+- **manifest.json 重试** — 宿主机初始化时等待 S3 上的 manifest.json，最多重试 10 分钟
+
+**New Features:**
+- **ALB Dashboard 代理** — ALB (internet-facing) → Host Nginx → VM Gateway，支持 WebSocket，自定义域名 + HTTPS
+- **自动备份系统** — Backup Lambda + EventBridge 定时备份所有 running 租户数据盘到 S3；支持手动触发 `POST /tenants/{id}/backup`；查询备份 `GET /tenants/{id}/backups`
+- **bind-domain.sh** — 一键绑定自定义域名 + ACM 证书到 ALB
+- **Gateway allowedOrigins** — 自动设置 `allowedOrigins=["*"]`，Dashboard 可从任意域名访问
+
+**Infrastructure:**
+- S3 lifecycle 改用 CustomResource（RETAIN bucket 也能更新）
+- 数据卷默认 200GB（支持 ~12 个 VM）
+- Nginx 安装到宿主机 + 每个 VM 自动生成/清理 nginx conf
+
+### v0.7.2 — Merged from aleck31/openclaw-firecracker
+
+### v0.6.1 — Dashboard Proxy + Shared Skills + Default Tools
+
+### v0.5.2 — Initial Release

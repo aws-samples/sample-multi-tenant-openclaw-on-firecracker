@@ -5,7 +5,7 @@
 host:
   instance_type: c8i.2xlarge        # 需支持 NestedVirtualization (c8i/m8i/r8i)
   root_volume_gb: 20               # 系统卷: OS + tools + Firecracker
-  data_volume_gb: 100              # 数据卷: rootfs 模板 + VM 数据盘, 挂载到 /data
+  data_volume_gb: 200              # 数据卷: rootfs 模板 + VM 数据盘, 挂载到 /data
   reserved_vcpu: 1                 # 预留给宿主机的 vCPU
   reserved_mem_mb: 2048            # 预留给宿主机的内存 (MB)
   cpu_overcommit_ratio: 2.0        # CPU 超配比例 (1.0=不超配, 2.0=可分配2倍vCPU)
@@ -24,6 +24,7 @@ s3:
   rootfs_prefix: "rootfs"          # rootfs 镜像路径前缀
   backup_prefix: "backups"         # 数据卷备份路径前缀
   backup_retention_days: 7
+  backup_cron: "cron(0 19 * * ? *)" # 每日备份时间 (UTC), 默认 UTC 19:00 = CST 03:00
 
 # ========== Auto Scaling ==========
 asg:

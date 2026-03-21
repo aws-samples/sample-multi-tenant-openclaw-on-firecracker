@@ -20,33 +20,47 @@ pkill -f "api-sock ${SOCK}" 2>/dev/null || true
 sudo ip link del ${TAP} 2>/dev/null || true
 rm -f ${SOCK}; sleep 0.5
 
-# Prepare disks (parallel cp)
+# Prepare disks (parallel cp with integrity check)
 log "copying disks..."
 T0=$SECONDS
-if [ ! -f "${VM_DIR}/rootfs.ext4" ]; then
-  cp /data/firecracker-assets/openclaw-rootfs.ext4 ${VM_DIR}/rootfs.ext4 &
+ROOTFS_TPL="/data/firecracker-assets/openclaw-rootfs.ext4"
+DATA_TPL="/data/firecracker-assets/openclaw-data-template.ext4"
+ROOTFS_SIZE=$(stat -c%s ${ROOTFS_TPL})
+DATA_SIZE=$(stat -c%s ${DATA_TPL})
+if [ ! -f "${VM_DIR}/rootfs.ext4" ] || [ "$(stat -c%s ${VM_DIR}/rootfs.ext4 2>/dev/null)" != "${ROOTFS_SIZE}" ]; then
+  rm -f ${VM_DIR}/rootfs.ext4
+  cp ${ROOTFS_TPL} ${VM_DIR}/rootfs.ext4 &
 fi
 DATA_VOL="${VM_DIR}/data.ext4"
-if [ ! -f "${DATA_VOL}" ]; then
-  cp /data/firecracker-assets/openclaw-data-template.ext4 ${DATA_VOL} &
+if [ ! -f "${DATA_VOL}" ] || [ "$(stat -c%s ${DATA_VOL} 2>/dev/null)" != "${DATA_SIZE}" ]; then
+  rm -f ${DATA_VOL}
+  cp ${DATA_TPL} ${DATA_VOL} &
 fi
 wait
 log "disks ready ($((SECONDS-T0))s)"
 
 # Inject shared skills into data disk
 SHARED_SKILLS="/data/shared-skills"
+MOUNT_TMP="/tmp/data-mount-${TENANT_ID}"
+mkdir -p ${MOUNT_TMP}
+sudo mount ${DATA_VOL} ${MOUNT_TMP}
+# Skills
 if [ -d "${SHARED_SKILLS}" ] && [ "$(ls -A ${SHARED_SKILLS} 2>/dev/null)" ]; then
   log "injecting shared skills..."
-  MOUNT_TMP="/tmp/data-mount-${TENANT_ID}"
-  mkdir -p ${MOUNT_TMP}
-  sudo mount ${DATA_VOL} ${MOUNT_TMP}
   mkdir -p ${MOUNT_TMP}/.openclaw/skills
   cp -r ${SHARED_SKILLS}/* ${MOUNT_TMP}/.openclaw/skills/ 2>/dev/null || true
   sudo chown -R 1000:1000 ${MOUNT_TMP}/.openclaw/skills
-  sudo umount ${MOUNT_TMP}
-  rmdir ${MOUNT_TMP}
   log "skills injected"
 fi
+# Allow dashboard access from any origin (token auth is the security layer)
+OC_JSON="${MOUNT_TMP}/.openclaw/openclaw.json"
+if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
+  jq '.gateway.controlUi.allowedOrigins = ["*"]' "${OC_JSON}" > "${OC_JSON}.tmp" && mv "${OC_JSON}.tmp" "${OC_JSON}"
+  sudo chown 1000:1000 "${OC_JSON}"
+  log "gateway allowedOrigins set to *"
+fi
+sudo umount ${MOUNT_TMP}
+rmdir ${MOUNT_TMP} 2>/dev/null || true
 
 # Network setup
 log "setting up network tap=${TAP}..."
@@ -92,4 +106,22 @@ RESULT=$(curl -s --unix-socket ${SOCK} -X PUT http://localhost/actions \
   -H 'Content-Type: application/json' -d '{"action_type":"InstanceStart"}')
 [ -n "${RESULT}" ] && log "ERROR: ${RESULT}" && exit 1
 ssh-keygen -R ${GUEST_IP} 2>/dev/null || true
+
+# Nginx reverse proxy for this tenant's dashboard
+sudo tee /etc/nginx/conf.d/tenants/${TENANT_ID}.conf > /dev/null <<EOF
+location ~ ^/vm/${TENANT_ID}(/.*)?$ {
+    proxy_pass http://${GUEST_IP}:18789\$1;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection \$connection_upgrade;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_read_timeout 86400s;
+    proxy_send_timeout 86400s;
+}
+EOF
+sudo nginx -s reload 2>/dev/null || true
+
 log "DONE ${TENANT_ID} IP:${GUEST_IP} (total $((SECONDS))s)"

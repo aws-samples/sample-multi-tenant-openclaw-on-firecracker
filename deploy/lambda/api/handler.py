@@ -45,6 +45,9 @@ def lambda_handler(event, context):
         ("POST", "/tenants/{id}/{action}"): lambda: tenant_action(
             path_params["id"], path_params["action"]
         ),
+        ("GET", "/tenants/{id}/{action}"): lambda: tenant_get_action(
+            path_params["id"], path_params["action"]
+        ),
         ("GET", "/hosts"): list_hosts,
         ("POST", "/hosts"): lambda: register_host(json.loads(event["body"])),
         ("POST", "/hosts/refresh-rootfs"): refresh_rootfs,
@@ -126,6 +129,7 @@ def create_tenant(body=None):
         "status": "creating",
         "health_failures": 0,
         "rootfs_version": host.get("rootfs_version", ""),
+        "creation_started_at": now,
         "created_at": now,
         "updated_at": now,
     })
@@ -138,6 +142,9 @@ def create_tenant(body=None):
     )
 
     _launch_vm(host["instance_id"], tenant_id, vm_num, vcpu, mem_mb, guest_ip, host_port)
+
+    # Sync nginx proxy config to all OTHER hosts so ALB can route from any host
+    _sync_nginx_to_other_hosts(host["instance_id"], tenant_id, host["private_ip"], host_port)
 
     return _resp(201, {
         "id": tenant_id, "host_id": host["instance_id"],
@@ -155,6 +162,9 @@ def delete_tenant(tenant_id, query_params):
     # Stop VM via SSM
     vm_num = int(item.get("vm_num", 1))
     _ssm_run(item["host_id"], f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num}")
+
+    # Remove nginx conf from ALL hosts (local conf removed by stop-vm.sh, remote confs here)
+    _remove_nginx_from_all_hosts(tenant_id)
 
     # Remove DNAT rule (best effort)
     _ssm_run(item["host_id"],
@@ -271,6 +281,15 @@ def tenant_action(tenant_id, action):
             f'curl -s --unix-socket {vm_dir}/fc.sock -X PATCH http://localhost/vm '
             f'-H "Content-Type: application/json" -d \'{{"state":"Resumed"}}\'')
         new_status = "running"
+    elif action == "backup":
+        # Async invoke Backup Lambda with single tenant
+        lambda_client = boto3.client("lambda")
+        lambda_client.invoke(
+            FunctionName=os.environ.get("BACKUP_FUNCTION", "openclaw-backup"),
+            InvocationType="Event",  # async, returns immediately
+            Payload=json.dumps({"tenant_id": tenant_id}).encode(),
+        )
+        return _resp(202, {"id": tenant_id, "action": "backup", "status": "started"})
     else:
         return _resp(400, {"error": f"unknown action: {action}"})
 
@@ -288,6 +307,27 @@ def tenant_action(tenant_id, action):
         ExpressionAttributeValues=expr_values,
     )
     return _resp(200, {"id": tenant_id, "status": new_status})
+
+
+def list_backups(tenant_id):
+    bucket = os.environ.get("ASSETS_BUCKET", "")
+    prefix = os.environ.get("BACKUP_PREFIX", "backups")
+    resp = s3.list_objects_v2(Bucket=bucket, Prefix=f"{prefix}/{tenant_id}/")
+    backups = []
+    for obj in sorted(resp.get("Contents", []), key=lambda o: o["Key"], reverse=True):
+        name = obj["Key"].rsplit("/", 1)[-1]
+        backups.append({
+            "key": obj["Key"],
+            "timestamp": name.replace(".gz", ""),
+            "size_mb": round(obj["Size"] / 1048576, 1),
+        })
+    return _resp(200, {"tenant_id": tenant_id, "backups": backups})
+
+
+def tenant_get_action(tenant_id, action):
+    if action == "backups":
+        return list_backups(tenant_id)
+    return _resp(400, {"error": f"unknown GET action: {action}"})
 
 
 # ========== Host Operations ==========
@@ -488,7 +528,7 @@ def process_pending():
         # Update pending tenant with host assignment
         tenants_table.update_item(
             Key={"id": tenant["id"]},
-            UpdateExpression="SET #s = :s, host_id = :h, vm_num = :n, guest_ip = :g, host_port = :p, updated_at = :t",
+            UpdateExpression="SET #s = :s, host_id = :h, vm_num = :n, guest_ip = :g, host_port = :p, creation_started_at = :t, updated_at = :t",
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
                 ":s": "creating", ":h": host["instance_id"],
@@ -503,6 +543,7 @@ def process_pending():
         )
 
         _launch_vm(host["instance_id"], tenant["id"], vm_num, vcpu, mem_mb, guest_ip, host_port)
+        _sync_nginx_to_other_hosts(host["instance_id"], tenant["id"], host["private_ip"], host_port)
         assigned += 1
 
     return {"statusCode": 200, "body": f"assigned {assigned}/{len(pending)} pending tenants"}
@@ -552,6 +593,58 @@ def _gen_id(name):
     raw = f"{name}{time.time()}"
     short = hashlib.sha256(raw.encode()).hexdigest()[:4]
     return f"{name}-{short}"
+
+
+def _sync_nginx_to_other_hosts(tenant_host_id, tenant_id, host_private_ip, host_port):
+    """Add remote nginx proxy config on all OTHER active hosts so ALB can route from any host."""
+    hosts = hosts_table.scan(
+        FilterExpression="#s IN (:a, :i)",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":a": "active", ":i": "idle"},
+    ).get("Items", [])
+    other_ids = [h["instance_id"] for h in hosts if h["instance_id"] != tenant_host_id]
+    if not other_ids:
+        return
+    # Remote proxy: ALB → this host's nginx → tenant's host private_ip:host_port → DNAT → guest
+    nginx_conf = (
+        f"location ~ ^/vm/{tenant_id}(/.*)?$ {{\n"
+        f"    proxy_pass http://{host_private_ip}:{host_port}$1;\n"
+        f"    proxy_http_version 1.1;\n"
+        f"    proxy_set_header Upgrade $http_upgrade;\n"
+        f"    proxy_set_header Connection $connection_upgrade;\n"
+        f"    proxy_set_header Host $host;\n"
+        f"    proxy_read_timeout 86400s;\n"
+        f"    proxy_send_timeout 86400s;\n"
+        f"}}\n"
+    )
+    cmd = (
+        f"cat > /etc/nginx/conf.d/tenants/{tenant_id}.conf << 'CONFEOF'\n"
+        f"{nginx_conf}CONFEOF\n"
+        f"nginx -s reload 2>/dev/null || true"
+    )
+    try:
+        ssm.send_command(InstanceIds=other_ids, DocumentName="AWS-RunShellScript",
+                         Parameters={"commands": [cmd]})
+    except Exception as e:
+        print(f"sync nginx to other hosts failed: {e}")
+
+
+def _remove_nginx_from_all_hosts(tenant_id):
+    """Remove tenant nginx conf from ALL active hosts."""
+    hosts = hosts_table.scan(
+        FilterExpression="#s IN (:a, :i)",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":a": "active", ":i": "idle"},
+    ).get("Items", [])
+    ids = [h["instance_id"] for h in hosts]
+    if not ids:
+        return
+    cmd = f"rm -f /etc/nginx/conf.d/tenants/{tenant_id}.conf && nginx -s reload 2>/dev/null || true"
+    try:
+        ssm.send_command(InstanceIds=ids, DocumentName="AWS-RunShellScript",
+                         Parameters={"commands": [cmd]})
+    except Exception as e:
+        print(f"remove nginx from all hosts failed: {e}")
 
 
 def _launch_vm(instance_id, tenant_id, vm_num, vcpu, mem_mb, guest_ip, host_port):

@@ -599,7 +599,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
             health_check_interval_seconds=30,
         )
         cfn_asg.add_property_override("TargetGroupARNs", [cfn_tg.ref])
-        elbv2.CfnListener(self, "ALBHTTPListener",
+        http_listener = elbv2.CfnListener(self, "ALBHTTPListener",
             load_balancer_arn=alb.load_balancer_arn,
             port=80, protocol="HTTP",
             default_actions=[elbv2.CfnListener.ActionProperty(
@@ -609,17 +609,18 @@ class OpenClawOrchestratorStack(cdk.Stack):
         )
         alb.connections.allow_from_any_ipv4(ec2.Port.tcp(80), "HTTP inbound")
         alb.connections.allow_from_any_ipv4(ec2.Port.tcp(443), "HTTPS inbound")
+        # Allow ALB to reach hosts and IP targets
+        alb.connections.allow_to_any_ipv4(ec2.Port.tcp(80), "ALB to hosts")
         sg.add_ingress_rule(ec2.Peer.any_ipv4(), ec2.Port.tcp(80), "ALB to Nginx")
-        # Host-to-host DNAT ports for cross-host nginx proxy
-        # Use separate SecurityGroupIngress resource to avoid self-ref circular dependency
-        ec2.CfnSecurityGroupIngress(self, "HostSGSelfIngress",
-            group_id=sg.security_group_id,
-            ip_protocol="tcp",
-            from_port=18789,
-            to_port=18900,
-            source_security_group_id=sg.security_group_id,
-            description="Host-to-host DNAT",
-        )
+
+        # Pass ALB/VPC info to API Lambda for path-based routing
+        api_fn.add_environment("ALB_LISTENER_ARN", http_listener.ref)
+        api_fn.add_environment("VPC_ID", vpc.vpc_id)
+        api_fn.add_to_role_policy(iam.PolicyStatement(
+            actions=["elasticloadbalancingv2:*"],
+            resources=["*"],
+        ))
+        # Note: Host-to-host DNAT SG rule removed — ALB path-based routing handles cross-host traffic
 
         # ========== Outputs ==========
         for key, val in {

@@ -161,7 +161,9 @@ http://{ALB-DNS}/vm/{tenant-id}/     → 租户 Dashboard
 https://{your-domain}/vm/{tenant-id}/ → 绑定自定义域名后 (HTTPS)
 ```
 
-**多宿主机路由原理**：创建租户时，API 自动在所有宿主机上生成 nginx 配置。本机租户直接代理到 guest IP，远程租户通过宿主机间 DNAT 端口转发。ALB 无论路由到哪台宿主机，nginx 都能正确转发。
+**多宿主机路由原理**：创建租户时，API 自动在 ALB 上创建 path-based listener rule（`/vm/{tenant-id}/*` → 宿主机 IP target group）。每台宿主机有独立的 IP target group，ALB 根据路径直接路由到正确的宿主机，无需跨主机流量。Nginx 负责宿主机内部的 VM 代理。
+
+> **限制**：ALB 每个 listener 最多 100 条 rules，即最多支持约 100 个租户。对于更大规模，需要使用多个 ALB 或 CloudFront + Lambda@Edge 方案。
 
 ## 自定义域名
 

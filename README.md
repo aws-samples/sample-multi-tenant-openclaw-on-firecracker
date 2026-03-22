@@ -392,6 +392,28 @@ aws apigateway update-api-key --api-key <key-id> \
 
 ## Changelog
 
+### v0.9.0 — AgentCore Integration + Grace Period Fix
+
+**AgentCore Integration (可选开关):**
+- **Gateway** — MCP 工具中心，Lambda 工具自动注册，所有 VM 通过 `streamable-http` 连接
+- **Memory** — 托管记忆（semantic + user_preference），per-tenant namespace 自动隔离
+- **Code Interpreter** — 安全沙箱 Python 执行
+- **Browser** — 云端浏览器自动化
+- **Identity** — WorkloadIdentity 代理 AWS 资源访问
+- **Observability** — CloudWatch 自动集成 + Console 状态面板
+- **API** — `GET /agentcore/status` 查询 AgentCore 状态
+- **示例工具** — hello / system_info / timestamp 三个 Lambda 工具注册到 Gateway
+
+**Bug Fixes:**
+- **Grace period 优化** — 10 分钟 → 3 分钟，创建到 running 总时间从 11 分钟降到 4 分钟
+- **CDK 循环依赖** — SG 自引用改为 CfnSecurityGroupIngress；lifecycle hooks 内嵌 ASG；ALB 用 L1 CfnListener/CfnTargetGroup
+- **ALB SG 出站规则** — 允许 ALB 到 Host port 80
+
+**Infrastructure:**
+- CDK AgentCore alpha construct (`@aws-cdk/aws-bedrock-agentcore-alpha`)
+- NestedVirtualization 通过 CustomResource（CFN 不支持 CpuOptions）
+- 条件创建：`agentcore.enabled=false` 时不创建任何 AgentCore 资源
+
 ### v0.8.0 — Bugfix + ALB Dashboard + Backup System
 
 **Bug Fixes:**

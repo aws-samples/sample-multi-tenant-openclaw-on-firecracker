@@ -587,6 +587,8 @@ class OpenClawOrchestratorStack(cdk.Stack):
             vpc=vpc,
             internet_facing=True,
         )
+        # Allow ALB to reach hosts on port 80
+        alb.connections.allow_to_any_ipv4(ec2.Port.tcp(80), "ALB to hosts")
         # Use L1 to avoid circular dependency between ALB SG ↔ Host SG ↔ ASG
         cfn_tg = elbv2.CfnTargetGroup(self, "HostsTG",
             name="openclaw-hosts-tg",

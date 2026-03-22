@@ -58,6 +58,15 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
   jq '.gateway.controlUi.allowedOrigins = ["*"]' "${OC_JSON}" > "${OC_JSON}.tmp" && mv "${OC_JSON}.tmp" "${OC_JSON}"
   sudo chown 1000:1000 "${OC_JSON}"
   log "gateway allowedOrigins set to *"
+  # AgentCore Gateway MCP injection (if configured)
+  if [ -f /data/agentcore.env ]; then
+    source /data/agentcore.env
+    if [ -n "${AGENTCORE_GATEWAY_URL:-}" ]; then
+      jq --arg url "$AGENTCORE_GATEWAY_URL" '.mcpServers["agentcore-gateway"] = {"url": $url, "transport": "streamable-http"}' "${OC_JSON}" > "${OC_JSON}.tmp" && mv "${OC_JSON}.tmp" "${OC_JSON}"
+      sudo chown 1000:1000 "${OC_JSON}"
+      log "AgentCore Gateway MCP injected: ${AGENTCORE_GATEWAY_URL}"
+    fi
+  fi
 fi
 sudo umount ${MOUNT_TMP}
 rmdir ${MOUNT_TMP} 2>/dev/null || true

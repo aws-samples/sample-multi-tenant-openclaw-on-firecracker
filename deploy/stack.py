@@ -302,6 +302,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
         init_sh = init_sh.replace("{{HOSTS_TABLE}}", "PLACEHOLDER_TABLE")
         init_sh = init_sh.replace("{{AVAIL_VCPU}}", str(_avail_vcpu))
         init_sh = init_sh.replace("{{AVAIL_MEM}}", str(_avail_mem))
+        init_sh = init_sh.replace("{{AGENTCORE_GATEWAY_URL}}", gateway_url if ac_enabled and gateway_url else "none")
         # Embed launch/stop scripts as heredocs
         init_sh = init_sh.replace("{{LAUNCH_VM_SCRIPT}}",
             f"cat > /home/ubuntu/launch-vm.sh << 'LAUNCHEOF'\n{launch_vm_sh}LAUNCHEOF\n"

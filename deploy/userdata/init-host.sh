@@ -118,6 +118,14 @@ log "step4: deploying scripts"
 {{STOP_VM_SCRIPT}}
 {{BACKUP_DATA_SCRIPT}}
 
+# Step 4b: AgentCore config (if enabled)
+AGENTCORE_GW_URL="{{AGENTCORE_GATEWAY_URL}}"
+if [ -n "${AGENTCORE_GW_URL}" ] && [ "${AGENTCORE_GW_URL}" != "none" ]; then
+  echo "AGENTCORE_GATEWAY_URL=${AGENTCORE_GW_URL}" > /data/agentcore.env
+  chown ubuntu:ubuntu /data/agentcore.env
+  log "AgentCore config written: gateway=${AGENTCORE_GW_URL}"
+fi
+
 # Step 5: Self-register to DynamoDB
 log "step5: registering to DynamoDB"
 aws dynamodb put-item --table-name {{HOSTS_TABLE}} --region ${REGION} --item '{"instance_id":{"S":"'${INSTANCE_ID}'"},"private_ip":{"S":"'${PRIVATE_IP}'"},"total_vcpu":{"N":"{{AVAIL_VCPU}}"},"total_mem_mb":{"N":"{{AVAIL_MEM}}"},"used_vcpu":{"N":"0"},"used_mem_mb":{"N":"0"},"vm_count":{"N":"0"},"next_vm_num":{"N":"1"},"status":{"S":"active"},"rootfs_version":{"S":"'${ROOTFS_VER}'"}}'

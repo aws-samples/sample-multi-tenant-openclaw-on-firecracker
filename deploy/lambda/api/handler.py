@@ -52,6 +52,7 @@ def lambda_handler(event, context):
         ("POST", "/hosts"): lambda: register_host(json.loads(event["body"])),
         ("POST", "/hosts/refresh-rootfs"): refresh_rootfs,
         ("GET", "/hosts/rootfs-version"): rootfs_version,
+        ("GET", "/agentcore/status"): agentcore_status,
         ("DELETE", "/hosts/{instance_id}"): lambda: deregister_host(
             path_params["instance_id"]
         ),
@@ -129,6 +130,7 @@ def create_tenant(body=None):
         "status": "creating",
         "health_failures": 0,
         "rootfs_version": host.get("rootfs_version", ""),
+        "creation_started_at": now,
         "created_at": now,
         "updated_at": now,
     })
@@ -141,6 +143,9 @@ def create_tenant(body=None):
     )
 
     _launch_vm(host["instance_id"], tenant_id, vm_num, vcpu, mem_mb, guest_ip, host_port)
+
+    # Sync nginx proxy config to all OTHER hosts so ALB can route from any host
+    _sync_nginx_to_other_hosts(host["instance_id"], tenant_id, host["private_ip"], host_port)
 
     return _resp(201, {
         "id": tenant_id, "host_id": host["instance_id"],
@@ -158,6 +163,9 @@ def delete_tenant(tenant_id, query_params):
     # Stop VM via SSM
     vm_num = int(item.get("vm_num", 1))
     _ssm_run(item["host_id"], f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num}")
+
+    # Remove nginx conf from ALL hosts (local conf removed by stop-vm.sh, remote confs here)
+    _remove_nginx_from_all_hosts(tenant_id)
 
     # Remove DNAT rule (best effort)
     _ssm_run(item["host_id"],
@@ -429,6 +437,15 @@ def rootfs_version():
     return _resp(200, {"version": manifest.get("version", "unknown")})
 
 
+def agentcore_status():
+    enabled = os.environ.get("AGENTCORE_ENABLED", "false") == "true"
+    gateway_url = os.environ.get("AGENTCORE_GATEWAY_URL", "")
+    return _resp(200, {
+        "enabled": enabled,
+        "gateway_url": gateway_url if enabled else None,
+    })
+
+
 def _get_manifest():
     """Read manifest.json from S3, return dict."""
     bucket = os.environ.get("ASSETS_BUCKET", "")
@@ -521,7 +538,7 @@ def process_pending():
         # Update pending tenant with host assignment
         tenants_table.update_item(
             Key={"id": tenant["id"]},
-            UpdateExpression="SET #s = :s, host_id = :h, vm_num = :n, guest_ip = :g, host_port = :p, updated_at = :t",
+            UpdateExpression="SET #s = :s, host_id = :h, vm_num = :n, guest_ip = :g, host_port = :p, creation_started_at = :t, updated_at = :t",
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
                 ":s": "creating", ":h": host["instance_id"],
@@ -536,6 +553,7 @@ def process_pending():
         )
 
         _launch_vm(host["instance_id"], tenant["id"], vm_num, vcpu, mem_mb, guest_ip, host_port)
+        _sync_nginx_to_other_hosts(host["instance_id"], tenant["id"], host["private_ip"], host_port)
         assigned += 1
 
     return {"statusCode": 200, "body": f"assigned {assigned}/{len(pending)} pending tenants"}
@@ -585,6 +603,58 @@ def _gen_id(name):
     raw = f"{name}{time.time()}"
     short = hashlib.sha256(raw.encode()).hexdigest()[:4]
     return f"{name}-{short}"
+
+
+def _sync_nginx_to_other_hosts(tenant_host_id, tenant_id, host_private_ip, host_port):
+    """Add remote nginx proxy config on all OTHER active hosts so ALB can route from any host."""
+    hosts = hosts_table.scan(
+        FilterExpression="#s IN (:a, :i)",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":a": "active", ":i": "idle"},
+    ).get("Items", [])
+    other_ids = [h["instance_id"] for h in hosts if h["instance_id"] != tenant_host_id]
+    if not other_ids:
+        return
+    # Remote proxy: ALB → this host's nginx → tenant's host private_ip:host_port → DNAT → guest
+    nginx_conf = (
+        f"location ~ ^/vm/{tenant_id}(/.*)?$ {{\n"
+        f"    proxy_pass http://{host_private_ip}:{host_port}$1;\n"
+        f"    proxy_http_version 1.1;\n"
+        f"    proxy_set_header Upgrade $http_upgrade;\n"
+        f"    proxy_set_header Connection $connection_upgrade;\n"
+        f"    proxy_set_header Host $host;\n"
+        f"    proxy_read_timeout 86400s;\n"
+        f"    proxy_send_timeout 86400s;\n"
+        f"}}\n"
+    )
+    cmd = (
+        f"cat > /etc/nginx/conf.d/tenants/{tenant_id}.conf << 'CONFEOF'\n"
+        f"{nginx_conf}CONFEOF\n"
+        f"nginx -s reload 2>/dev/null || true"
+    )
+    try:
+        ssm.send_command(InstanceIds=other_ids, DocumentName="AWS-RunShellScript",
+                         Parameters={"commands": [cmd]})
+    except Exception as e:
+        print(f"sync nginx to other hosts failed: {e}")
+
+
+def _remove_nginx_from_all_hosts(tenant_id):
+    """Remove tenant nginx conf from ALL active hosts."""
+    hosts = hosts_table.scan(
+        FilterExpression="#s IN (:a, :i)",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":a": "active", ":i": "idle"},
+    ).get("Items", [])
+    ids = [h["instance_id"] for h in hosts]
+    if not ids:
+        return
+    cmd = f"rm -f /etc/nginx/conf.d/tenants/{tenant_id}.conf && nginx -s reload 2>/dev/null || true"
+    try:
+        ssm.send_command(InstanceIds=ids, DocumentName="AWS-RunShellScript",
+                         Parameters={"commands": [cmd]})
+    except Exception as e:
+        print(f"remove nginx from all hosts failed: {e}")
 
 
 def _launch_vm(instance_id, tenant_id, vm_num, vcpu, mem_mb, guest_ip, host_port):

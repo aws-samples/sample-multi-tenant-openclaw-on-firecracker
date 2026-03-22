@@ -1,8 +1,8 @@
 #!/bin/bash
 # 将自定义域名 + ACM 证书关联到 Dashboard ALB
 # 前置条件: 用户已自行申请 ACM 证书并完成验证，DNS CNAME 已指向 ALB
-# 用法: ./setup-domain.sh <domain> <acm-certificate-arn>
-# 示例: ./setup-domain.sh oc.aws.creast.win arn:aws:acm:ap-northeast-1:123456:certificate/xxx
+# 用法: ./bind-domain.sh <domain> <acm-certificate-arn>
+# 示例: ./bind-domain.sh oc.example.com arn:aws:acm:ap-northeast-1:123456:certificate/xxx
 set -euo pipefail
 
 DOMAIN="${1:?Usage: $0 <domain> <acm-certificate-arn>}"

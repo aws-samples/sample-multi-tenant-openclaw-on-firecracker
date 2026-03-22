@@ -5,7 +5,7 @@
 host:
   instance_type: m8i.xlarge        # 需支持 NestedVirtualization (c8i/m8i/r8i)
   root_volume_gb: 20               # 系统卷: OS + tools + Firecracker
-  data_volume_gb: 100              # 数据卷: rootfs 模板 + VM 数据盘, 挂载到 /data
+  data_volume_gb: 200              # 数据卷: rootfs 模板 + VM 数据盘, 挂载到 /data
   reserved_vcpu: 1                 # 预留给宿主机的 vCPU
   reserved_mem_mb: 2048            # 预留给宿主机的内存 (MB)
   cpu_overcommit_ratio: 2.0        # CPU 超配比例 (1.0=不超配, 2.0=可分配2倍vCPU)
@@ -43,3 +43,21 @@ health_check:
   interval_minutes: 1
   max_failures: 3                  # 连续失败次数后自动重启
   app_port: 18789                  # OpenClaw Gateway 端口 (VM 内)
+
+# ========== AgentCore 集成 (可选) ==========
+agentcore:
+  enabled: false                   # 总开关，客户决定是否开启
+  gateway:
+    enabled: true                  # 随 agentcore.enabled 自动开启
+  memory:
+    enabled: true
+    strategies:
+      - semantic                   # 语义记忆 (事实、知识)
+      - user_preference            # 用户偏好学习
+    expiration_days: 90
+  code_interpreter:
+    enabled: true
+  browser:
+    enabled: true
+  observability:
+    enabled: true

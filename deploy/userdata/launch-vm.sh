@@ -20,15 +20,21 @@ pkill -f "api-sock ${SOCK}" 2>/dev/null || true
 sudo ip link del ${TAP} 2>/dev/null || true
 rm -f ${SOCK}; sleep 0.5
 
-# Prepare disks (parallel cp)
+# Prepare disks (parallel cp with integrity check)
 log "copying disks..."
 T0=$SECONDS
-if [ ! -f "${VM_DIR}/rootfs.ext4" ]; then
-  cp /data/firecracker-assets/openclaw-rootfs.ext4 ${VM_DIR}/rootfs.ext4 &
+ROOTFS_TPL="/data/firecracker-assets/openclaw-rootfs.ext4"
+DATA_TPL="/data/firecracker-assets/openclaw-data-template.ext4"
+ROOTFS_SIZE=$(stat -c%s ${ROOTFS_TPL})
+DATA_SIZE=$(stat -c%s ${DATA_TPL})
+if [ ! -f "${VM_DIR}/rootfs.ext4" ] || [ "$(stat -c%s ${VM_DIR}/rootfs.ext4 2>/dev/null)" != "${ROOTFS_SIZE}" ]; then
+  rm -f ${VM_DIR}/rootfs.ext4
+  cp ${ROOTFS_TPL} ${VM_DIR}/rootfs.ext4 &
 fi
 DATA_VOL="${VM_DIR}/data.ext4"
-if [ ! -f "${DATA_VOL}" ]; then
-  cp /data/firecracker-assets/openclaw-data-template.ext4 ${DATA_VOL} &
+if [ ! -f "${DATA_VOL}" ] || [ "$(stat -c%s ${DATA_VOL} 2>/dev/null)" != "${DATA_SIZE}" ]; then
+  rm -f ${DATA_VOL}
+  cp ${DATA_TPL} ${DATA_VOL} &
 fi
 wait
 log "disks ready ($((SECONDS-T0))s)"
@@ -52,9 +58,18 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
   jq '.gateway.controlUi.allowedOrigins = ["*"]' "${OC_JSON}" > "${OC_JSON}.tmp" && mv "${OC_JSON}.tmp" "${OC_JSON}"
   sudo chown 1000:1000 "${OC_JSON}"
   log "gateway allowedOrigins set to *"
+  # AgentCore Gateway MCP injection (if configured)
+  if [ -f /data/agentcore.env ]; then
+    source /data/agentcore.env
+    if [ -n "${AGENTCORE_GATEWAY_URL:-}" ]; then
+      jq --arg url "$AGENTCORE_GATEWAY_URL" '.mcpServers["agentcore-gateway"] = {"url": $url, "transport": "streamable-http"}' "${OC_JSON}" > "${OC_JSON}.tmp" && mv "${OC_JSON}.tmp" "${OC_JSON}"
+      sudo chown 1000:1000 "${OC_JSON}"
+      log "AgentCore Gateway MCP injected: ${AGENTCORE_GATEWAY_URL}"
+    fi
+  fi
 fi
 sudo umount ${MOUNT_TMP}
-rmdir ${MOUNT_TMP}
+rmdir ${MOUNT_TMP} 2>/dev/null || true
 
 # Network setup
 log "setting up network tap=${TAP}..."

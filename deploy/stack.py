@@ -11,6 +11,7 @@ from aws_cdk import (
     aws_ec2 as ec2,
     aws_autoscaling as autoscaling,
     aws_elasticloadbalancingv2 as elbv2,
+    aws_bedrockagentcore as agentcore,
     custom_resources as cr,
     Duration, Fn, RemovalPolicy,
 )
@@ -177,6 +178,10 @@ class OpenClawOrchestratorStack(cdk.Stack):
         rootfs_version_resource = hosts_resource.add_resource("rootfs-version")
         rootfs_version_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
 
+        agentcore_resource = api.root.add_resource("agentcore")
+        agentcore_status_resource = agentcore_resource.add_resource("status")
+        agentcore_status_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
+
         # ========== Health Check Lambda ==========
         health_fn = _lambda.Function(self, "HealthCheck",
             function_name="openclaw-health-check",
@@ -301,6 +306,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
         init_sh = init_sh.replace("{{HOSTS_TABLE}}", "PLACEHOLDER_TABLE")
         init_sh = init_sh.replace("{{AVAIL_VCPU}}", str(_avail_vcpu))
         init_sh = init_sh.replace("{{AVAIL_MEM}}", str(_avail_mem))
+        init_sh = init_sh.replace("{{AGENTCORE_GATEWAY_URL}}", "none")
         # Embed launch/stop scripts as heredocs
         init_sh = init_sh.replace("{{LAUNCH_VM_SCRIPT}}",
             f"cat > /home/ubuntu/launch-vm.sh << 'LAUNCHEOF'\n{launch_vm_sh}LAUNCHEOF\n"
@@ -462,6 +468,60 @@ class OpenClawOrchestratorStack(cdk.Stack):
             targets=[targets.LambdaFunction(api_fn)],
         )
 
+        # ========== AgentCore (optional) ==========
+        ac_cfg = CFG.get("agentcore", {})
+        ac_enabled = ac_cfg.get("enabled", False)
+        gateway_url = ""
+
+        if ac_enabled:
+            # Gateway — MCP tool hub for all VMs
+            if ac_cfg.get("gateway", {}).get("enabled", True):
+                ac_gateway = agentcore.Gateway(self, "AgentCoreGateway",
+                    name="openclaw-gateway",
+                    description="OpenClaw Agent tool gateway",
+                )
+                gateway_url = ac_gateway.gateway_url
+                ac_gateway.grant_invoke(host_role)
+
+            # Memory — persistent cross-session memory
+            if ac_cfg.get("memory", {}).get("enabled", True):
+                strategies = []
+                for s in ac_cfg.get("memory", {}).get("strategies", ["semantic"]):
+                    if s == "semantic":
+                        strategies.append(agentcore.MemoryStrategy.using_semantic(
+                            name="openclaw-semantic",
+                            namespaces=["/openclaw/tenant/{actorId}/semantic"],
+                        ))
+                    elif s == "user_preference":
+                        strategies.append(agentcore.MemoryStrategy.using_user_preference(
+                            name="openclaw-preferences",
+                            namespaces=["/openclaw/tenant/{actorId}/preferences"],
+                        ))
+                ac_memory = agentcore.Memory(self, "AgentCoreMemory",
+                    memory_name="openclaw-memory",
+                    description="OpenClaw per-tenant memory",
+                    expiration_duration=Duration.days(ac_cfg.get("memory", {}).get("expiration_days", 90)),
+                    memory_strategies=strategies,
+                )
+
+            # Code Interpreter — secure sandboxed Python execution
+            if ac_cfg.get("code_interpreter", {}).get("enabled", True):
+                agentcore.CodeInterpreterCustom(self, "AgentCoreCodeInterpreter",
+                    name="openclaw-code-interpreter",
+                )
+
+            # Browser — cloud-based web automation
+            if ac_cfg.get("browser", {}).get("enabled", True):
+                agentcore.BrowserCustom(self, "AgentCoreBrowser",
+                    name="openclaw-browser",
+                )
+
+        # Pass AgentCore config to API Lambda
+        if ac_enabled and gateway_url:
+            api_fn.add_environment("AGENTCORE_ENABLED", "true")
+            api_fn.add_environment("AGENTCORE_GATEWAY_URL", gateway_url)
+
+
         # ========== ALB (Dashboard Proxy) ==========
         alb = elbv2.ApplicationLoadBalancer(self, "DashboardALB",
             load_balancer_name="openclaw-dashboard",
@@ -477,6 +537,13 @@ class OpenClawOrchestratorStack(cdk.Stack):
         alb.connections.allow_from_any_ipv4(ec2.Port.tcp(443), "HTTPS inbound")
         sg.add_ingress_rule(ec2.Peer.security_group_id(alb.connections.security_groups[0].security_group_id),
             ec2.Port.tcp(80), "ALB to Nginx")
+        # Host-to-host DNAT ports for cross-host nginx proxy
+        sg.add_ingress_rule(ec2.Peer.security_group_id(sg.security_group_id),
+            ec2.Port.tcp_range(18789, 18900), "Host-to-host DNAT")
+
+        # Pass ALB info to API Lambda for cross-host nginx routing
+        api_fn.add_environment("ALB_LISTENER_ARN", listener.listener_arn)
+        api_fn.add_environment("VPC_ID", vpc.vpc_id)
 
         # ========== Outputs ==========
         for key, val in {

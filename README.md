@@ -1,6 +1,6 @@
 # OpenClaw Pool on EC2 microVM
 
-![Version](https://img.shields.io/badge/version-0.7.2-blue)
+![Version](https://img.shields.io/badge/version-0.8.0-blue)
 
 **[English](README.md)** | **[中文](docs/README-CN.md)**
 
@@ -14,10 +14,11 @@ Multi-tenant isolated deployment of OpenClaw AI agents on AWS using Firecracker 
 - **Security Isolation** — Firecracker microVM-based isolation: independent kernel, network, and filesystem per tenant
 - **Auto Scheduling** — Automatically selects a host with available resources; scales out when capacity is insufficient
 - **Auto Scale-in** — Idle hosts are reclaimed after timeout (two-round confirmation to prevent false kills)
-- **Health Checks** — All VMs probed every minute; auto-restart on consecutive failures
+- **Health Checks** — All VMs probed every minute; auto-restart on consecutive failures. Creating VMs get a 10-minute grace period with no SSM commands
 - **Web Console** — Visual management of hosts and tenants with real-time status
 - **Rootfs Pre-build** — Rootfs + data template distributed via S3, downloaded on host init
-- **Dashboard Access** — Each tenant's OpenClaw Dashboard accessible at `/vm/{tenant-id}/` via ALB, no SSM tunnel needed
+- **Dashboard Access** — Each tenant's OpenClaw Dashboard accessible at `/vm/{tenant-id}/` via ALB + Nginx, supports WebSocket, auto-routes across multiple hosts
+- **Auto Backup** — EventBridge scheduled backup of all tenant data volumes to S3, with manual trigger and backup query API
 - **Shared Skills** — All tenants share a unified skill set (S3-managed, auto-synced to all VMs), with independent memory
 - **Default Toolchain** — Each VM comes with Python3/uv/git/gh/Node.js/htop/tmux/tree pre-installed
 - **Data Backup** — Automated daily backup + manual backup API, Firecracker pause/resume for consistency
@@ -172,6 +173,44 @@ The script creates/updates the ALB HTTPS listener and writes `DASHBOARD_URL` to 
 Traffic flow: `Browser → ALB:443 → Host Nginx:80 → VM Gateway:18789`
 
 Nginx config is automatically managed by launch-vm.sh / stop-vm.sh.
+
+## Custom Domain
+
+Bind a custom domain + HTTPS to the Dashboard ALB:
+
+```bash
+# Prerequisites:
+# 1. Request ACM certificate and complete DNS validation
+# 2. CNAME your domain to the ALB DNS (see DASHBOARD_URL in .env.deploy)
+
+./scripts/bind-domain.sh oc.example.com arn:aws:acm:ap-northeast-1:xxx:certificate/xxx
+
+# Access: https://oc.example.com/vm/{tenant-id}/
+```
+
+The script creates the ALB HTTPS listener, attaches the ACM certificate, and updates `DASHBOARD_URL` in `.env.deploy`.
+
+## Auto Backup
+
+EventBridge schedules daily backups of all running tenant data volumes to S3. Manual trigger also supported.
+
+**Backup flow**: pause VM → pigz compress data.ext4 → resume VM → upload to S3. VM auto-resumes even on failure (trap cleanup).
+
+```bash
+source .env.deploy
+
+# Manual backup (async, returns 202)
+curl -s -X POST "${API_URL}tenants/{id}/backup" -H "x-api-key: ${API_KEY}" | jq .
+
+# List backups
+curl -s "${API_URL}tenants/{id}/backups" -H "x-api-key: ${API_KEY}" | jq .
+
+# Config (config.yml):
+# backup_cron: "cron(0 19 * * ? *)"  # UTC 19:00 = Beijing 03:00
+# backup_retention_days: 7            # S3 lifecycle auto-cleanup
+```
+
+Backups stored at `s3://{bucket}/backups/{tenant-id}/{timestamp}.gz`.
 
 ## Shared Skills
 

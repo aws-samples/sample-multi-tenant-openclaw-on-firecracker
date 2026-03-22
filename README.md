@@ -12,38 +12,39 @@
 - **安全隔离** — 基于 Firecracker microVM 实现租户间隔离，独立内核、独立网络，互不可见
 - **自动调度** — 创建租户时自动选择有空闲资源的宿主机，资源不足时自动扩容
 - **自动缩容** — 空闲宿主机超时后自动回收，节省成本（两轮确认防误杀）
-- **健康检查** — 每分钟探活所有 VM，连续失败自动重启
+- **健康检查** — 每分钟探活所有 VM，连续失败自动重启；创建中的 VM 有 10 分钟 grace period 不干扰
 - **Web 管理控制台** — 可视化管理 Host/Tenant，实时状态展示
 - **Rootfs 预构建** — rootfs + data template 双镜像通过 S3 分发，宿主机启动时自动下载
-- **Dashboard 直达** — 每只租户的 OpenClaw Dashboard 通过统一域名 `/vm/{tenant-id}/` 直接访问，无需 SSM 隧道
+- **Dashboard 直达** — 每只租户的 OpenClaw Dashboard 通过 ALB + Nginx 反向代理直接访问，支持 WebSocket，多宿主机自动路由
+- **自动备份** — EventBridge 定时备份所有租户数据盘到 S3，支持手动触发和备份查询
 - **共享 Skills** — 所有租户共享统一的 Skills（S3 集中管理，自动同步到所有 VM），记忆独立
 - **默认工具链** — 每个 VM 预装 Python3/uv/git/gh/Node.js/htop/tmux/tree 等开发工具
 - **统一配置管理** — 控制台展示每个租户的模型配置和共享 Skills 列表
+- **自定义域名** — 一键绑定域名 + ACM 证书到 ALB，HTTPS 访问 Dashboard
 
 ## 部署架构
 
 ```
 用户/管理员
     │
-    ▼
-API Gateway (HTTPS, x-api-key)
+    ├── API Gateway (HTTPS, x-api-key) → Lambda → DynamoDB
+    │                                     │         ├── tenants (租户状态)
+    │                                     │         └── hosts (宿主机资源)
+    │                                     │
+    │                                     ├── SSM Run Command ──→ EC2 Host A
+    │                                     │                       ├── Nginx (ALB 反向代理)
+    │                                     │                       ├── microVM 01 (172.16.1.2)
+    │                                     │                       ├── microVM 02 (172.16.2.2)
+    │                                     │                       └── ...
+    │                                     │
+    │                                     └── SSM Run Command ──→ EC2 Host B ...
     │
-    ▼
-Lambda Functions ──── DynamoDB
-    │                 ├── tenants (租户状态)
-    │                 └── hosts (宿主机资源)
-    │
-    ├── SSM Run Command ──→ EC2 Host A
-    │                       ├── microVM 01 (172.16.1.2)
-    │                       ├── microVM 02 (172.16.2.2)
-    │                       └── ...
-    │
-    ├── SSM Run Command ──→ EC2 Host B ...
-    │
-    └── S3 (rootfs 分发 + 数据卷备份)
+    └── ALB (Dashboard) ──→ Host Nginx:80 ──→ VM Gateway:18789
+                            (跨主机自动路由)
 
+S3: rootfs 分发 + 数据卷备份
 ASG: 宿主机自动扩缩 (配置参见: config.yml)
-EventBridge: 健康检查 + 空闲回收
+EventBridge: 健康检查 + 空闲回收 + 定时备份
 ```
 
 <details>
@@ -68,16 +69,20 @@ openclaw-firecracker/
 │   ├── index.html             # Alpine.js SPA
 │   ├── style.css              # 控制台UI样式
 │   └── config.js              # 动态生成
+├── scripts/
+│   └── bind-domain.sh         # 绑定自定义域名 + ACM 证书到 ALB
 ├── deploy/                    # CDK 项目
 │   ├── stack.py               # 基础设施定义
 │   ├── lambda/
 │   │   ├── api/handler.py     # 租户 CRUD + 宿主机管理
 │   │   ├── health_check/handler.py  # 定时健康检查
+│   │   ├── backup/handler.py  # 定时/手动数据备份
 │   │   └── scaler/handler.py  # 空闲宿主机回收
 │   └── userdata/
 │       ├── init-host.sh       # 宿主机初始化
 │       ├── launch-vm.sh       # microVM 启动
-│       └── stop-vm.sh         # microVM 停止
+│       ├── stop-vm.sh         # microVM 停止
+│       └── backup-data.sh     # 数据盘备份 (宿主机上执行)
 └── docs/
 ```
 
@@ -142,15 +147,61 @@ Web 管理控制台，支持 Host/Tenant 可视化管理。
 
 ## Dashboard 直达
 
-每只租户的 OpenClaw Dashboard 通过路由代理直接访问，无需 SSM 隧道：
+每只租户的 OpenClaw Dashboard 通过 ALB + Nginx 反向代理直接访问，支持 WebSocket，多宿主机自动路由：
 
 ```
-https://{your-domain}/vm/{tenant-id}/    → 租户 Dashboard
-https://{your-domain}/api/tenants        → 租户列表 + 模型信息
-https://{your-domain}/api/skills         → 共享 Skills 列表
+ALB → 任意宿主机 Nginx:80 → 租户所在宿主机 → VM Gateway:18789
 ```
 
-路由代理运行在宿主机上（端口 8080），自动发现所有运行中的 VM 并按路径转发。新建/删除租户无需任何配置变更。
+访问路径：
+```
+http://{ALB-DNS}/vm/{tenant-id}/     → 租户 Dashboard
+https://{your-domain}/vm/{tenant-id}/ → 绑定自定义域名后 (HTTPS)
+```
+
+**多宿主机路由原理**：创建租户时，API 自动在所有宿主机上生成 nginx 配置。本机租户直接代理到 guest IP，远程租户通过宿主机间 DNAT 端口转发。ALB 无论路由到哪台宿主机，nginx 都能正确转发。
+
+## 自定义域名
+
+一键绑定自定义域名 + HTTPS 到 Dashboard ALB：
+
+```bash
+# 前置条件：
+# 1. 在 ACM 中申请证书并完成 DNS 验证
+# 2. 将域名 CNAME 指向 ALB DNS（见 .env.deploy 中的 DASHBOARD_URL）
+
+# 绑定
+./scripts/bind-domain.sh oc.example.com arn:aws:acm:ap-northeast-1:123456:certificate/xxx
+
+# 完成后访问
+https://oc.example.com/vm/{tenant-id}/
+```
+
+脚本会自动：创建 ALB HTTPS listener → 关联 ACM 证书 → 更新 `.env.deploy` 中的 `DASHBOARD_URL`
+
+## 自动备份
+
+EventBridge 定时备份所有 running 租户的数据盘到 S3，也支持手动触发。
+
+**备份流程**：pause VM → pigz 压缩 data.ext4 → resume VM → 上传 S3。即使备份失败，VM 也会自动恢复运行（trap cleanup）。
+
+```bash
+source .env.deploy
+
+# 手动触发单个租户备份
+curl -s -X POST "${API_URL}tenants/{tenant-id}/backup" -H "x-api-key: ${API_KEY}" | jq .
+# 返回 {"status": "started"} — 异步执行，不阻塞
+
+# 查询租户的备份列表
+curl -s "${API_URL}tenants/{tenant-id}/backups" -H "x-api-key: ${API_KEY}" | jq .
+# 返回 {"backups": [{"key": "backups/alice-xxx/2026-03-22T03:00:00Z.gz", "size_mb": 1.2}, ...]}
+
+# 定时备份配置（config.yml）
+# backup_cron: "cron(0 19 * * ? *)"  # UTC 19:00 = 北京时间 03:00
+# backup_retention_days: 7            # S3 lifecycle 自动清理 7 天前的备份
+```
+
+备份文件存储在 `s3://{bucket}/backups/{tenant-id}/{timestamp}.gz`。
 
 ## 共享 Skills
 
@@ -221,6 +272,9 @@ s3://{bucket}/skills/
 | vm | default_vcpu | 2 | 默认 vCPU |
 | vm | default_mem_mb | 4096 | 默认内存 (MB) |
 | vm | data_disk_mb | 4096 | 数据盘大小 (MB) |
+| host | data_volume_gb | 200 | 宿主机数据卷 (rootfs 模板 + VM 数据盘) |
+| s3 | backup_cron | cron(0 19 * * ? *) | 每日备份时间 (UTC 19:00 = CST 03:00) |
+| s3 | backup_retention_days | 7 | S3 lifecycle 自动清理天数 |
 | health_check | interval_minutes | 1 | 探活间隔 |
 | health_check | max_failures | 3 | 连续失败后自动重启 |
 | scaler | interval_minutes | 5 | 空闲检测间隔 |
@@ -251,6 +305,8 @@ s3://{bucket}/skills/
 | POST | /tenants/{id}/pause | 冻结 vCPU（Firecracker 原生，即时） |
 | POST | /tenants/{id}/resume | 恢复已暂停的租户 VM |
 | POST | /tenants/{id}/reset | 重装系统盘（data 卷保留） |
+| POST | /tenants/{id}/backup | 手动触发数据盘备份（异步） |
+| GET | /tenants/{id}/backups | 查询租户的备份列表 |
 | GET | /hosts | 列出所有宿主机 |
 | POST | /hosts | 注册宿主机 (UserData 自动调用) |
 | POST | /hosts/refresh-rootfs | 推送最新 rootfs + data template 到所有宿主机 |

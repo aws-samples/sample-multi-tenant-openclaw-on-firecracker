@@ -46,7 +46,7 @@ health_check:
 
 # ========== AgentCore 集成 (可选) ==========
 agentcore:
-  enabled: false                   # 总开关，客户决定是否开启
+  enabled: true                    # 总开关，客户决定是否开启
   gateway:
     enabled: true                  # 随 agentcore.enabled 自动开启
   memory:

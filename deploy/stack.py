@@ -480,7 +480,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
             # Gateway — MCP tool hub for all VMs
             if ac_cfg.get("gateway", {}).get("enabled", True):
                 ac_gateway = agentcore.Gateway(self, "AgentCoreGateway",
-                    name="openclaw-gateway",
+                    gateway_name="openclaw-gateway",
                     description="OpenClaw Agent tool gateway",
                 )
                 gateway_url = ac_gateway.gateway_url
@@ -492,16 +492,16 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 for s in ac_cfg.get("memory", {}).get("strategies", ["semantic"]):
                     if s == "semantic":
                         strategies.append(agentcore.MemoryStrategy.using_semantic(
-                            name="openclaw-semantic",
+                            name="openclaw_semantic",
                             namespaces=["/openclaw/tenant/{actorId}/semantic"],
                         ))
                     elif s == "user_preference":
                         strategies.append(agentcore.MemoryStrategy.using_user_preference(
-                            name="openclaw-preferences",
+                            name="openclaw_preferences",
                             namespaces=["/openclaw/tenant/{actorId}/preferences"],
                         ))
                 ac_memory = agentcore.Memory(self, "AgentCoreMemory",
-                    memory_name="openclaw-memory",
+                    memory_name="openclaw_memory",
                     description="OpenClaw per-tenant memory",
                     expiration_duration=Duration.days(ac_cfg.get("memory", {}).get("expiration_days", 90)),
                     memory_strategies=strategies,
@@ -510,39 +510,30 @@ class OpenClawOrchestratorStack(cdk.Stack):
             # Code Interpreter — secure sandboxed Python execution
             if ac_cfg.get("code_interpreter", {}).get("enabled", True):
                 agentcore.CodeInterpreterCustom(self, "AgentCoreCodeInterpreter",
-                    name="openclaw-code-interpreter",
+                    code_interpreter_custom_name="openclaw_code_interpreter",
                 )
 
             # Browser — cloud-based web automation
             if ac_cfg.get("browser", {}).get("enabled", True):
                 agentcore.BrowserCustom(self, "AgentCoreBrowser",
-                    name="openclaw-browser",
+                    browser_custom_name="openclaw_browser",
                 )
 
             # Identity — workload identity for agent AWS access
             ac_identity = cfn_agentcore.CfnWorkloadIdentity(self, "AgentCoreIdentity",
-                name="openclaw-identity",
+                name="openclaw_identity",
             )
 
-            # Policy — Cedar-based access control for Gateway tools
-            if ac_cfg.get("gateway", {}).get("enabled", True) and gateway_url:
-                cfn_agentcore.CfnPolicy(self, "AgentCorePolicy",
-                    name="openclaw-tenant-policy",
-                    policy_type="GATEWAY",
-                    policy=json.dumps({
-                        "cedar": {
-                            "text": 'permit(principal, action, resource) when { resource.gateway == "openclaw-gateway" };'
-                        }
-                    }),
-                )
+            # Policy — Cedar-based access control (configure via AgentCore console)
+            # CfnPolicy requires PolicyEngine setup; deferred to console for initial deployment
 
             # Observability — enabled automatically via CloudWatch when Gateway/Memory are created
-            # No separate resource needed; AgentCore emits metrics/traces to CloudWatch by default
 
         # Pass AgentCore config to API Lambda
-        if ac_enabled and gateway_url:
+        if ac_enabled:
             api_fn.add_environment("AGENTCORE_ENABLED", "true")
-            api_fn.add_environment("AGENTCORE_GATEWAY_URL", gateway_url)
+            if gateway_url:
+                api_fn.add_environment("AGENTCORE_GATEWAY_URL", gateway_url)
 
         # ========== ALB (Dashboard Proxy) ==========
         alb = elbv2.ApplicationLoadBalancer(self, "DashboardALB",

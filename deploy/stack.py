@@ -279,6 +279,10 @@ class OpenClawOrchestratorStack(cdk.Stack):
         )
 
         # ========== ASG (P1-4) ==========
+        ac_cfg = CFG.get("agentcore", {})
+        ac_enabled = ac_cfg.get("enabled", False)
+        gateway_url = ""
+
         vpc = ec2.Vpc.from_lookup(self, "Vpc", is_default=True)
 
         sg = ec2.SecurityGroup(self, "HostSG",
@@ -471,10 +475,6 @@ class OpenClawOrchestratorStack(cdk.Stack):
         )
 
         # ========== AgentCore (optional) ==========
-        ac_cfg = CFG.get("agentcore", {})
-        ac_enabled = ac_cfg.get("enabled", False)
-        gateway_url = ""
-
         if ac_enabled:
             # Gateway — MCP tool hub for all VMs
             if ac_cfg.get("gateway", {}).get("enabled", True):
@@ -549,15 +549,27 @@ class OpenClawOrchestratorStack(cdk.Stack):
             vpc=vpc,
             internet_facing=True,
         )
-        listener = alb.add_listener("HTTP", port=80)
-        listener.add_targets("Hosts",
-            port=80,
-            targets=[asg],
-            health_check=elbv2.HealthCheck(path="/health", interval=Duration.seconds(30)),
+        # Use L1 to avoid circular dependency between ALB SG ↔ Host SG ↔ ASG
+        cfn_tg = elbv2.CfnTargetGroup(self, "HostsTG",
+            name="openclaw-hosts-tg",
+            port=80, protocol="HTTP",
+            vpc_id=vpc.vpc_id,
+            target_type="instance",
+            health_check_path="/health",
+            health_check_interval_seconds=30,
         )
+        cfn_asg.add_property_override("TargetGroupARNs", [cfn_tg.ref])
+        elbv2.CfnListener(self, "ALBHTTPListener",
+            load_balancer_arn=alb.load_balancer_arn,
+            port=80, protocol="HTTP",
+            default_actions=[elbv2.CfnListener.ActionProperty(
+                type="forward",
+                target_group_arn=cfn_tg.ref,
+            )],
+        )
+        alb.connections.allow_from_any_ipv4(ec2.Port.tcp(80), "HTTP inbound")
         alb.connections.allow_from_any_ipv4(ec2.Port.tcp(443), "HTTPS inbound")
-        sg.add_ingress_rule(ec2.Peer.security_group_id(alb.connections.security_groups[0].security_group_id),
-            ec2.Port.tcp(80), "ALB to Nginx")
+        sg.add_ingress_rule(ec2.Peer.any_ipv4(), ec2.Port.tcp(80), "ALB to Nginx")
         # Host-to-host DNAT ports for cross-host nginx proxy
         sg.add_ingress_rule(ec2.Peer.security_group_id(sg.security_group_id),
             ec2.Port.tcp_range(18789, 18900), "Host-to-host DNAT")

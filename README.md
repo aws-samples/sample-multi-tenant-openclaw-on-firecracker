@@ -454,6 +454,15 @@ aws apigateway update-api-key --api-key <key-id> \
 
 ## Changelog
 
+### v0.9.1 — ALB Path-Based Routing (absorbed from aleck31/v0.8.1)
+
+- **ALB path-based routing** — 替代跨主机 nginx 代理。每个租户一条 ALB listener rule（`/vm/{tenant-id}/*` → 宿主机 IP target group），ALB 根据路径直接路由到正确宿主机
+- **去掉跨主机 nginx 同步** — 不再需要 `_sync_nginx_to_other_hosts` / `_remove_nginx_from_all_hosts`，不再需要 host-to-host DNAT SG 规则
+- **保留 Nginx** — Nginx 仍负责宿主机内部的 VM 代理（ALB → Nginx:80 → VM Gateway:18789）
+- **宿主机终止清理** — `cleanup_terminated_host` 自动删除 host target group + 关联 ALB rules
+- **setup.sh** — 保留 `bind-domain.sh` 设置的 DASHBOARD_URL 不被覆盖
+- **限制** — ALB 每个 listener 最多 100 条 rules，即最多约 100 个租户
+
 ### v0.9.0 — AgentCore Integration + Grace Period Fix
 
 **AgentCore Integration (可选开关):**
@@ -476,8 +485,6 @@ aws apigateway update-api-key --api-key <key-id> \
 - NestedVirtualization 通过 CustomResource（CFN 不支持 CpuOptions）
 - 条件创建：`agentcore.enabled=false` 时不创建任何 AgentCore 资源
 
-### v0.8.0 — Bugfix + ALB Dashboard + Backup System
-
 **Bug Fixes:**
 - **SSM 队列堵塞修复** — 健康检查对 creating 状态 VM 增加 10 分钟 grace period，不发 SSM 命令；过了 grace 只做轻量 ping 提升，不自动重启。彻底解决同时创建多个 VM 时 SSM 命令堆积问题
 - **ALB 多实例路由修复** — 创建/删除租户时自动同步 nginx 代理配置到所有宿主机，ALB 无论路由到哪台宿主机都能正确转发到 tenant 所在主机
@@ -496,6 +503,10 @@ aws apigateway update-api-key --api-key <key-id> \
 - S3 lifecycle 改用 CustomResource（RETAIN bucket 也能更新）
 - 数据卷默认 200GB（支持 ~12 个 VM）
 - Nginx 安装到宿主机 + 每个 VM 自动生成/清理 nginx conf
+
+### v0.8.0 — Bugfix + ALB Dashboard + Backup System
+
+(See v0.9.0 Bug Fixes and New Features above — v0.8.0 content was merged into v0.9.0 changelog)
 
 ### v0.7.2 — Merged from aleck31/openclaw-firecracker
 

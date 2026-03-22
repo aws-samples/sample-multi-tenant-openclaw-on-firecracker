@@ -488,6 +488,50 @@ class OpenClawOrchestratorStack(cdk.Stack):
         if ac_enabled:
             # Gateway already created above (before userdata processing)
 
+            # Register Lambda tools on Gateway
+            if ac_cfg.get("gateway", {}).get("enabled", True):
+                tools_fn = _lambda.Function(self, "AgentCoreTools",
+                    function_name="openclaw-agentcore-tools",
+                    runtime=_lambda.Runtime.PYTHON_3_12,
+                    handler="handler.lambda_handler",
+                    code=_lambda.Code.from_asset("lambda/agentcore_tools"),
+                    timeout=Duration.seconds(30),
+                    memory_size=128,
+                )
+                ac_gateway.add_lambda_target("tools",
+                    lambda_function=tools_fn,
+                    tool_schema=agentcore.ToolSchema.from_inline([
+                        agentcore.ToolDefinition(
+                            name="hello",
+                            description="Say hello — test tool for verifying AgentCore Gateway connectivity",
+                            input_schema=agentcore.SchemaDefinition(
+                                type=agentcore.SchemaDefinitionType.OBJECT,
+                                properties={"name": agentcore.SchemaDefinition(
+                                    type=agentcore.SchemaDefinitionType.STRING,
+                                    description="Name to greet",
+                                )},
+                            ),
+                        ),
+                        agentcore.ToolDefinition(
+                            name="system_info",
+                            description="Get Lambda runtime system information",
+                            input_schema=agentcore.SchemaDefinition(type=agentcore.SchemaDefinitionType.OBJECT),
+                        ),
+                        agentcore.ToolDefinition(
+                            name="timestamp",
+                            description="Get current UTC timestamp",
+                            input_schema=agentcore.SchemaDefinition(
+                                type=agentcore.SchemaDefinitionType.OBJECT,
+                                properties={"format": agentcore.SchemaDefinition(
+                                    type=agentcore.SchemaDefinitionType.STRING,
+                                    description="iso or unix",
+                                )},
+                            ),
+                        ),
+                    ]),
+                    gateway_target_name="openclaw-tools",
+                )
+
             # Memory — persistent cross-session memory
             if ac_cfg.get("memory", {}).get("enabled", True):
                 strategies = []

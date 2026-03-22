@@ -283,6 +283,15 @@ class OpenClawOrchestratorStack(cdk.Stack):
         ac_enabled = ac_cfg.get("enabled", False)
         gateway_url = ""
 
+        # Create AgentCore Gateway early (needed for userdata placeholder)
+        if ac_enabled and ac_cfg.get("gateway", {}).get("enabled", True):
+            ac_gateway = agentcore.Gateway(self, "AgentCoreGateway",
+                gateway_name="openclaw-gateway",
+                description="OpenClaw Agent tool gateway",
+            )
+            gateway_url = ac_gateway.gateway_url
+            ac_gateway.grant_invoke(host_role)
+
         vpc = ec2.Vpc.from_lookup(self, "Vpc", is_default=True)
 
         sg = ec2.SecurityGroup(self, "HostSG",
@@ -475,16 +484,9 @@ class OpenClawOrchestratorStack(cdk.Stack):
             targets=[targets.LambdaFunction(api_fn)],
         )
 
-        # ========== AgentCore (optional) ==========
+        # ========== AgentCore (optional, continued) ==========
         if ac_enabled:
-            # Gateway — MCP tool hub for all VMs
-            if ac_cfg.get("gateway", {}).get("enabled", True):
-                ac_gateway = agentcore.Gateway(self, "AgentCoreGateway",
-                    gateway_name="openclaw-gateway",
-                    description="OpenClaw Agent tool gateway",
-                )
-                gateway_url = ac_gateway.gateway_url
-                ac_gateway.grant_invoke(host_role)
+            # Gateway already created above (before userdata processing)
 
             # Memory — persistent cross-session memory
             if ac_cfg.get("memory", {}).get("enabled", True):

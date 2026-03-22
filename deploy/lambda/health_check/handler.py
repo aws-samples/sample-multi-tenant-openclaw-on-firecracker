@@ -8,7 +8,7 @@ tenants_table = ddb.Table(os.environ["TENANTS_TABLE"])
 hosts_table = ddb.Table(os.environ["HOSTS_TABLE"])
 
 MAX_FAILURES = 3
-CREATING_GRACE_MINUTES = 10  # Don't touch creating VMs for this long
+CREATING_GRACE_MINUTES = 2  # Don't touch creating VMs for this long
 
 
 def lambda_handler(event, context):

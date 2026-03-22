@@ -21,6 +21,9 @@ VM_DATA_DISK_MB = int(os.environ.get("VM_DATA_DISK_MB", 2048))
 VM_PORT_BASE = int(os.environ.get("VM_PORT_BASE", 18789))
 VM_SUBNET_PREFIX = os.environ.get("VM_SUBNET_PREFIX", "172.16")
 ASG_NAME = os.environ.get("ASG_NAME", "openclaw-hosts-asg")
+ALB_LISTENER_ARN = os.environ.get("ALB_LISTENER_ARN", "")
+VPC_ID = os.environ.get("VPC_ID", "")
+elbv2 = boto3.client("elbv2")
 
 
 def lambda_handler(event, context):
@@ -144,8 +147,9 @@ def create_tenant(body=None):
 
     _launch_vm(host["instance_id"], tenant_id, vm_num, vcpu, mem_mb, guest_ip, host_port)
 
-    # Sync nginx proxy config to all OTHER hosts so ALB can route from any host
-    _sync_nginx_to_other_hosts(host["instance_id"], tenant_id, host["private_ip"], host_port)
+    # ALB path-based routing
+    tg_arn = _ensure_host_tg(host["instance_id"], host["private_ip"])
+    _add_alb_rule(tenant_id, tg_arn)
 
     return _resp(201, {
         "id": tenant_id, "host_id": host["instance_id"],
@@ -164,8 +168,8 @@ def delete_tenant(tenant_id, query_params):
     vm_num = int(item.get("vm_num", 1))
     _ssm_run(item["host_id"], f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num}")
 
-    # Remove nginx conf from ALL hosts (local conf removed by stop-vm.sh, remote confs here)
-    _remove_nginx_from_all_hosts(tenant_id)
+    # Remove ALB rule
+    _remove_alb_rule(tenant_id)
 
     # Remove DNAT rule (best effort)
     _ssm_run(item["host_id"],
@@ -404,12 +408,16 @@ def cleanup_terminated_host(event):
         ExpressionAttributeValues={":h": instance_id, ":d": "deleted"},
     ).get("Items", [])
     for t in tenants:
+        _remove_alb_rule(t["id"])
         tenants_table.update_item(
             Key={"id": t["id"]},
             UpdateExpression="SET #s = :s, updated_at = :t",
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={":s": "deleted", ":t": _now()},
         )
+
+    # Remove host target group
+    _remove_host_tg(instance_id)
 
     # Delete host
     hosts_table.update_item(
@@ -553,7 +561,11 @@ def process_pending():
         )
 
         _launch_vm(host["instance_id"], tenant["id"], vm_num, vcpu, mem_mb, guest_ip, host_port)
-        _sync_nginx_to_other_hosts(host["instance_id"], tenant["id"], host["private_ip"], host_port)
+
+        # ALB path-based routing
+        tg_arn = _ensure_host_tg(host["instance_id"], host["private_ip"])
+        _add_alb_rule(tenant["id"], tg_arn)
+
         assigned += 1
 
     return {"statusCode": 200, "body": f"assigned {assigned}/{len(pending)} pending tenants"}
@@ -605,56 +617,87 @@ def _gen_id(name):
     return f"{name}-{short}"
 
 
-def _sync_nginx_to_other_hosts(tenant_host_id, tenant_id, host_private_ip, host_port):
-    """Add remote nginx proxy config on all OTHER active hosts so ALB can route from any host."""
-    hosts = hosts_table.scan(
-        FilterExpression="#s IN (:a, :i)",
-        ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":a": "active", ":i": "idle"},
-    ).get("Items", [])
-    other_ids = [h["instance_id"] for h in hosts if h["instance_id"] != tenant_host_id]
-    if not other_ids:
-        return
-    # Remote proxy: ALB → this host's nginx → tenant's host private_ip:host_port → DNAT → guest
-    nginx_conf = (
-        f"location ~ ^/vm/{tenant_id}(/.*)?$ {{\n"
-        f"    proxy_pass http://{host_private_ip}:{host_port}$1;\n"
-        f"    proxy_http_version 1.1;\n"
-        f"    proxy_set_header Upgrade $http_upgrade;\n"
-        f"    proxy_set_header Connection $connection_upgrade;\n"
-        f"    proxy_set_header Host $host;\n"
-        f"    proxy_read_timeout 86400s;\n"
-        f"    proxy_send_timeout 86400s;\n"
-        f"}}\n"
-    )
-    cmd = (
-        f"cat > /etc/nginx/conf.d/tenants/{tenant_id}.conf << 'CONFEOF'\n"
-        f"{nginx_conf}CONFEOF\n"
-        f"nginx -s reload 2>/dev/null || true"
-    )
+## ── ALB path-based routing ──
+
+def _get_https_listener_arn():
+    """Get HTTPS (443) listener ARN, fallback to HTTP listener from env."""
+    if not ALB_LISTENER_ARN:
+        return ""
     try:
-        ssm.send_command(InstanceIds=other_ids, DocumentName="AWS-RunShellScript",
-                         Parameters={"commands": [cmd]})
+        alb_arn = ALB_LISTENER_ARN.replace(":listener/", ":loadbalancer/").rsplit("/", 1)[0]
+        resp = elbv2.describe_listeners(LoadBalancerArn=alb_arn)
+        for l in resp["Listeners"]:
+            if l["Port"] == 443:
+                return l["ListenerArn"]
     except Exception as e:
-        print(f"sync nginx to other hosts failed: {e}")
+        print(f"_get_https_listener_arn error: {e}")
+    return ALB_LISTENER_ARN
 
 
-def _remove_nginx_from_all_hosts(tenant_id):
-    """Remove tenant nginx conf from ALL active hosts."""
-    hosts = hosts_table.scan(
-        FilterExpression="#s IN (:a, :i)",
-        ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":a": "active", ":i": "idle"},
-    ).get("Items", [])
-    ids = [h["instance_id"] for h in hosts]
-    if not ids:
-        return
-    cmd = f"rm -f /etc/nginx/conf.d/tenants/{tenant_id}.conf && nginx -s reload 2>/dev/null || true"
+def _ensure_host_tg(instance_id, private_ip):
+    """Create or return target group ARN for a host."""
+    tg_name = f"oc-{instance_id[-8:]}"
     try:
-        ssm.send_command(InstanceIds=ids, DocumentName="AWS-RunShellScript",
-                         Parameters={"commands": [cmd]})
-    except Exception as e:
-        print(f"remove nginx from all hosts failed: {e}")
+        resp = elbv2.describe_target_groups(Names=[tg_name])
+        return resp["TargetGroups"][0]["TargetGroupArn"]
+    except Exception:
+        pass
+    resp = elbv2.create_target_group(
+        Name=tg_name, Protocol="HTTP", Port=80, VpcId=VPC_ID,
+        TargetType="ip", HealthCheckPath="/health",
+        HealthCheckIntervalSeconds=10, HealthyThresholdCount=2,
+    )
+    tg_arn = resp["TargetGroups"][0]["TargetGroupArn"]
+    elbv2.register_targets(TargetGroupArn=tg_arn, Targets=[{"Id": private_ip, "Port": 80}])
+    return tg_arn
+
+
+def _add_alb_rule(tenant_id, tg_arn):
+    """Add ALB listener rule for /vm/{tenant_id}*."""
+    arn = _get_https_listener_arn()
+    if not arn:
+        return
+    rules = elbv2.describe_rules(ListenerArn=arn)["Rules"]
+    if any(f"/vm/{tenant_id}" in v for r in rules for c in r.get("Conditions", []) for v in c.get("Values", [])):
+        return
+    used = {int(r["Priority"]) for r in rules if r["Priority"] != "default"}
+    priority = next(i for i in range(1, 500) if i not in used)
+    elbv2.create_rule(
+        ListenerArn=arn, Priority=priority,
+        Conditions=[{"Field": "path-pattern", "Values": [f"/vm/{tenant_id}", f"/vm/{tenant_id}/*"]}],
+        Actions=[{"Type": "forward", "TargetGroupArn": tg_arn}],
+    )
+
+
+def _remove_alb_rule(tenant_id):
+    """Remove ALB listener rule for a tenant."""
+    arn = _get_https_listener_arn()
+    if not arn:
+        return
+    rules = elbv2.describe_rules(ListenerArn=arn)["Rules"]
+    for r in rules:
+        for c in r.get("Conditions", []):
+            if c.get("Field") == "path-pattern" and f"/vm/{tenant_id}" in c.get("Values", []):
+                elbv2.delete_rule(RuleArn=r["RuleArn"])
+                return
+
+
+def _remove_host_tg(instance_id):
+    """Delete target group for a host."""
+    tg_name = f"oc-{instance_id[-8:]}"
+    try:
+        resp = elbv2.describe_target_groups(Names=[tg_name])
+        tg_arn = resp["TargetGroups"][0]["TargetGroupArn"]
+        arn = _get_https_listener_arn()
+        if arn:
+            rules = elbv2.describe_rules(ListenerArn=arn)["Rules"]
+            for r in rules:
+                for a in r.get("Actions", []):
+                    if a.get("TargetGroupArn") == tg_arn:
+                        elbv2.delete_rule(RuleArn=r["RuleArn"])
+        elbv2.delete_target_group(TargetGroupArn=tg_arn)
+    except Exception:
+        pass
 
 
 def _launch_vm(instance_id, tenant_id, vm_num, vcpu, mem_mb, guest_ip, host_port):

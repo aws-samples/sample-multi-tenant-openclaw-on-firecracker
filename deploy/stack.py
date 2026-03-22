@@ -528,22 +528,29 @@ class OpenClawOrchestratorStack(cdk.Stack):
             vpc=vpc,
             internet_facing=True,
         )
-        listener = alb.add_listener("HTTP", port=80)
-        listener.add_targets("Hosts",
-            port=80,
-            targets=[asg],
-            health_check=elbv2.HealthCheck(path="/health", interval=Duration.seconds(30)),
+        listener = alb.add_listener("HTTP", port=80,
+            default_action=elbv2.ListenerAction.fixed_response(404, content_type="text/plain", message_body="not found"),
         )
         alb.connections.allow_from_any_ipv4(ec2.Port.tcp(443), "HTTPS inbound")
+        alb.connections.allow_to(ec2.Peer.ipv4(vpc.vpc_cidr_block), ec2.Port.tcp(80), "ALB to host Nginx")
         sg.add_ingress_rule(ec2.Peer.security_group_id(alb.connections.security_groups[0].security_group_id),
             ec2.Port.tcp(80), "ALB to Nginx")
-        # Host-to-host DNAT ports for cross-host nginx proxy
-        sg.add_ingress_rule(ec2.Peer.security_group_id(sg.security_group_id),
-            ec2.Port.tcp_range(18789, 18900), "Host-to-host DNAT")
+        sg.add_ingress_rule(ec2.Peer.ipv4(vpc.vpc_cidr_block),
+            ec2.Port.tcp(80), "VPC to Nginx (ALB IP target health check)")
 
-        # Pass ALB info to API Lambda for cross-host nginx routing
+        # Pass ALB info to API Lambda for path-based routing
         api_fn.add_environment("ALB_LISTENER_ARN", listener.listener_arn)
         api_fn.add_environment("VPC_ID", vpc.vpc_id)
+        api_fn.add_to_role_policy(iam.PolicyStatement(
+            actions=[
+                "elasticloadbalancing:CreateTargetGroup", "elasticloadbalancing:DeleteTargetGroup",
+                "elasticloadbalancing:RegisterTargets", "elasticloadbalancing:DeregisterTargets",
+                "elasticloadbalancing:CreateRule", "elasticloadbalancing:DeleteRule",
+                "elasticloadbalancing:DescribeRules", "elasticloadbalancing:DescribeTargetGroups",
+                "elasticloadbalancing:DescribeListeners",
+            ],
+            resources=["*"],
+        ))
 
         # ========== Outputs ==========
         for key, val in {

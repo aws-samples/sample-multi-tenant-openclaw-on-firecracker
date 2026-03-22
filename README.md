@@ -1,8 +1,8 @@
 # OpenClaw Pool on EC2 microVM
 
-![Version](https://img.shields.io/badge/version-0.8.0-blue)
+![Version](https://img.shields.io/badge/version-0.8.1-blue)
 
-**[English](README.md)** | **[中文](docs/README-CN.md)**
+**[English](README.md)** | **[中文](docs/README-CN.md)** | **[Changelog](docs/CHANGELOG.md)**
 
 Multi-tenant isolated deployment of OpenClaw AI agents on AWS using Firecracker microVMs. Each tenant runs in its own microVM with independent kernel, filesystem, and network. Managed via API, with auto-scaling hosts and idle reclamation.
 

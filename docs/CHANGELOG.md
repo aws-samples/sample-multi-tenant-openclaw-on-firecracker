@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.8.1 — ALB Path-Based Routing
+
+**架构改进:**
+- **ALB path-based routing** — 替代 v0.8.0 的跨主机 nginx 方案。每个 tenant 一条 ALB listener rule，精确路由到对应 host 的 IP target group。无跨主机流量，无状态同步，host 替换透明
+- **ALB SG 出站修复** — CDK 生成的 ALB SG 默认禁止出站（因 listener 无 target group），导致 health check 和请求转发失败。添加 VPC CIDR 出站规则
+- **Health check grace period** — 从 10 分钟缩短为 3 分钟，VM 实际启动仅需 ~30s
+- **setup.sh 保留 DASHBOARD_URL** — 部署时不覆盖 bind-domain.sh 设置的 HTTPS 自定义域名
+
+**清理:**
+- 移除跨主机 nginx 代理代码（`_sync_nginx_to_other_hosts` / `_remove_nginx_from_all_hosts`）
+- 移除 host 间 SG 互通规则（不再需要跨主机流量）
+- 移除 DNAT iptables 相关代码
+
 ## v0.8.0 — Bug Fixes + AgentCore 集成
 
 **Bug Fixes:**

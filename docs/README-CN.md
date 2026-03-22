@@ -1,8 +1,8 @@
 # OpenClaw Pool on EC2 microVM
 
-![Version](https://img.shields.io/badge/version-0.8.0-blue)
+![Version](https://img.shields.io/badge/version-0.8.1-blue)
 
-**[English](../README.md)** | **[中文](README-CN.md)**
+**[English](../README.md)** | **[中文](README-CN.md)** | **[Changelog](CHANGELOG.md)**
 
 基于 AWS Firecracker microVM 的 OpenClaw 多租户隔离部署方案。每个租户运行在独立的 microVM 中，通过 API 统一管理，ASG 自动扩缩宿主机，空闲主机自动回收。
 
@@ -137,7 +137,7 @@ Web 管理控制台，支持 Host/Tenant 可视化管理。
 ./web-console.sh    # 自动读取 .env.deploy，启动 http://localhost:8080
 ```
 
-![Management Console](docs/web_console.png)
+![Management Console](web_console.png)
 
 功能：
 - 查看宿主机资源使用情况 (vCPU / 内存 / VM 数量)

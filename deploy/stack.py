@@ -477,6 +477,9 @@ class OpenClawOrchestratorStack(cdk.Stack):
         alb.connections.allow_from_any_ipv4(ec2.Port.tcp(443), "HTTPS inbound")
         sg.add_ingress_rule(ec2.Peer.security_group_id(alb.connections.security_groups[0].security_group_id),
             ec2.Port.tcp(80), "ALB to Nginx")
+        # Host-to-host DNAT ports for cross-host nginx proxy
+        sg.add_ingress_rule(ec2.Peer.security_group_id(sg.security_group_id),
+            ec2.Port.tcp_range(18789, 18900), "Host-to-host DNAT")
 
         # ========== Outputs ==========
         for key, val in {

@@ -376,10 +376,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 "SpotOptions": {"SpotInstanceType": "one-time"},
             })
 
-        # CFN doesn't support CpuOptions.NestedVirtualization yet.
-        # Workaround: create a new LT version with nested virt via EC2 API, set as default.
-        # Use $Latest as source so each CDK deploy (which creates a new LT version) triggers
-        # a new nested-virt version on top of it.
+        # Enable nested virtualization via CustomResource (CFN doesn't support CpuOptions.NestedVirtualization)
         cfn_lt = launch_template.node.default_child
         create_ver_call = cr.AwsSdkCall(
             service="EC2",
@@ -391,7 +388,6 @@ class OpenClawOrchestratorStack(cdk.Stack):
                     "CpuOptions": {"NestedVirtualization": "enabled"},
                 },
             },
-            # Include CDK LT version hash so update triggers when LT changes
             physical_resource_id=cr.PhysicalResourceId.of(
                 Fn.join("-", ["nested-virt", cfn_lt.ref, Fn.get_att(cfn_lt.logical_id, "LatestVersionNumber").to_string()])
             ),
@@ -410,20 +406,23 @@ class OpenClawOrchestratorStack(cdk.Stack):
         )
         nested_virt.node.add_dependency(launch_template)
 
-        # Set the new version as default
-        set_default_call = cr.AwsSdkCall(
-            service="EC2",
-            action="modifyLaunchTemplate",
-            parameters={
-                "LaunchTemplateId": launch_template.launch_template_id,
-                "DefaultVersion": nested_virt.get_response_field("LaunchTemplateVersion.VersionNumber"),
-            },
-            physical_resource_id=cr.PhysicalResourceId.of("set-default-lt"),
-            output_paths=["LaunchTemplate.DefaultVersionNumber"],
-        )
         set_default = cr.AwsCustomResource(self, "SetDefaultLTVersion",
-            on_create=set_default_call,
-            on_update=set_default_call,
+            on_create=cr.AwsSdkCall(
+                service="EC2", action="modifyLaunchTemplate",
+                parameters={
+                    "LaunchTemplateId": launch_template.launch_template_id,
+                    "DefaultVersion": nested_virt.get_response_field("LaunchTemplateVersion.VersionNumber"),
+                },
+                physical_resource_id=cr.PhysicalResourceId.of("set-default-lt"),
+            ),
+            on_update=cr.AwsSdkCall(
+                service="EC2", action="modifyLaunchTemplate",
+                parameters={
+                    "LaunchTemplateId": launch_template.launch_template_id,
+                    "DefaultVersion": nested_virt.get_response_field("LaunchTemplateVersion.VersionNumber"),
+                },
+                physical_resource_id=cr.PhysicalResourceId.of("set-default-lt"),
+            ),
             install_latest_aws_sdk=False,
             policy=cr.AwsCustomResourcePolicy.from_statements([
                 iam.PolicyStatement(actions=["ec2:ModifyLaunchTemplate"], resources=["*"]),
@@ -440,21 +439,23 @@ class OpenClawOrchestratorStack(cdk.Stack):
         )
         asg.node.add_dependency(set_default)
         cfn_asg = asg.node.default_child
-        # Override LT version to the nested-virt version created by AwsCustomResource
         cfn_asg.add_property_override("LaunchTemplate.Version",
             nested_virt.get_response_field("LaunchTemplateVersion.VersionNumber"))
-        asg.add_lifecycle_hook("InitHook",
-            lifecycle_hook_name="openclaw-host-init",
-            lifecycle_transition=autoscaling.LifecycleTransition.INSTANCE_LAUNCHING,
-            heartbeat_timeout=Duration.seconds(CFG["asg"]["lifecycle_hook_timeout"]),
-            default_result=autoscaling.DefaultResult.ABANDON,
-        )
-        asg.add_lifecycle_hook("TerminateHook",
-            lifecycle_hook_name="openclaw-host-terminate",
-            lifecycle_transition=autoscaling.LifecycleTransition.INSTANCE_TERMINATING,
-            heartbeat_timeout=Duration.seconds(120),
-            default_result=autoscaling.DefaultResult.CONTINUE,
-        )
+        # Embed lifecycle hooks directly in ASG to avoid circular dependency
+        cfn_asg.add_property_override("LifecycleHookSpecificationList", [
+            {
+                "LifecycleHookName": "openclaw-host-init",
+                "LifecycleTransition": "autoscaling:EC2_INSTANCE_LAUNCHING",
+                "HeartbeatTimeout": CFG["asg"]["lifecycle_hook_timeout"],
+                "DefaultResult": "ABANDON",
+            },
+            {
+                "LifecycleHookName": "openclaw-host-terminate",
+                "LifecycleTransition": "autoscaling:EC2_INSTANCE_TERMINATING",
+                "HeartbeatTimeout": 120,
+                "DefaultResult": "CONTINUE",
+            },
+        ])
 
         # When a new host completes init → process pending tenants
         events.Rule(self, "HostReadyRule",
@@ -571,8 +572,15 @@ class OpenClawOrchestratorStack(cdk.Stack):
         alb.connections.allow_from_any_ipv4(ec2.Port.tcp(443), "HTTPS inbound")
         sg.add_ingress_rule(ec2.Peer.any_ipv4(), ec2.Port.tcp(80), "ALB to Nginx")
         # Host-to-host DNAT ports for cross-host nginx proxy
-        sg.add_ingress_rule(ec2.Peer.security_group_id(sg.security_group_id),
-            ec2.Port.tcp_range(18789, 18900), "Host-to-host DNAT")
+        # Use separate SecurityGroupIngress resource to avoid self-ref circular dependency
+        ec2.CfnSecurityGroupIngress(self, "HostSGSelfIngress",
+            group_id=sg.security_group_id,
+            ip_protocol="tcp",
+            from_port=18789,
+            to_port=18900,
+            source_security_group_id=sg.security_group_id,
+            description="Host-to-host DNAT",
+        )
 
         # ========== Outputs ==========
         for key, val in {

@@ -504,6 +504,18 @@ class OpenClawOrchestratorStack(cdk.Stack):
                     memory_strategies=strategies,
                 )
 
+            # Code Interpreter — secure sandboxed Python execution
+            if ac_cfg.get("code_interpreter", {}).get("enabled", True):
+                agentcore.CodeInterpreterCustom(self, "AgentCoreCodeInterpreter",
+                    name="openclaw-code-interpreter",
+                )
+
+            # Browser — cloud-based web automation
+            if ac_cfg.get("browser", {}).get("enabled", True):
+                agentcore.BrowserCustom(self, "AgentCoreBrowser",
+                    name="openclaw-browser",
+                )
+
         # Pass AgentCore config to API Lambda
         if ac_enabled and gateway_url:
             api_fn.add_environment("AGENTCORE_ENABLED", "true")

@@ -178,6 +178,10 @@ class OpenClawOrchestratorStack(cdk.Stack):
         rootfs_version_resource = hosts_resource.add_resource("rootfs-version")
         rootfs_version_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
 
+        agentcore_resource = api.root.add_resource("agentcore")
+        agentcore_status_resource = agentcore_resource.add_resource("status")
+        agentcore_status_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
+
         # ========== Health Check Lambda ==========
         health_fn = _lambda.Function(self, "HealthCheck",
             function_name="openclaw-health-check",

@@ -52,6 +52,7 @@ def lambda_handler(event, context):
         ("POST", "/hosts"): lambda: register_host(json.loads(event["body"])),
         ("POST", "/hosts/refresh-rootfs"): refresh_rootfs,
         ("GET", "/hosts/rootfs-version"): rootfs_version,
+        ("GET", "/agentcore/status"): agentcore_status,
         ("DELETE", "/hosts/{instance_id}"): lambda: deregister_host(
             path_params["instance_id"]
         ),
@@ -434,6 +435,15 @@ def cleanup_terminated_host(event):
 def rootfs_version():
     manifest = _get_manifest()
     return _resp(200, {"version": manifest.get("version", "unknown")})
+
+
+def agentcore_status():
+    enabled = os.environ.get("AGENTCORE_ENABLED", "false") == "true"
+    gateway_url = os.environ.get("AGENTCORE_GATEWAY_URL", "")
+    return _resp(200, {
+        "enabled": enabled,
+        "gateway_url": gateway_url if enabled else None,
+    })
 
 
 def _get_manifest():

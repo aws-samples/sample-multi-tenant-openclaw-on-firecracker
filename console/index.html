@@ -74,6 +74,15 @@
   <!-- Tenants -->
   <div class="tenants-panel">
 
+    <!-- AgentCore status mini-panel -->
+    <template x-if="agentcoreStatus.enabled">
+      <div style="margin-bottom:12px;padding:8px 12px;border:1px solid #0f83;border-radius:6px;background:var(--panel)">
+        <span style="font-size:13px;color:var(--green)">⚡ AgentCore</span>
+        <span style="font-size:11px;color:var(--gray)">enabled</span>
+        <a :href="'https://'+agentcoreRegion+'.console.aws.amazon.com/cloudwatch/home?region='+agentcoreRegion+'#dashboards'" target="_blank" style="font-size:11px;color:var(--cyan);margin-left:8px">📊 CloudWatch</a>
+      </div>
+    </template>
+
     <!-- Skills mini-panel -->
     <div style="margin-bottom:12px;padding:8px 12px;border:1px solid var(--border);border-radius:6px;background:var(--panel)">
       <span style="font-size:13px;color:var(--cyan)">🧠 Shared Skills</span>
@@ -177,6 +186,7 @@ function app() {
     loadingHosts: false, loadingTenants: false,
     showModal: false,
     skills: [], tenantModels: {},
+    agentcoreStatus: { enabled: false }, agentcoreRegion: 'ap-northeast-1',
     form: { name: '', vcpu: null, memory_mb: null },
 
     init() {
@@ -206,6 +216,7 @@ function app() {
       catch { this.connected = false; }
       this.loadingHosts = false;
       try { this.rootfsVersion = (await this.api('GET', 'hosts/rootfs-version')).version; } catch {}
+      try { this.agentcoreStatus = await this.api('GET', 'agentcore/status'); } catch {}
       // Load skills and tenant models from router API
       try {
         const base = window.location.origin;

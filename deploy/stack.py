@@ -1,3 +1,4 @@
+import json
 import yaml
 import aws_cdk as cdk
 from aws_cdk import (
@@ -12,6 +13,7 @@ from aws_cdk import (
     aws_autoscaling as autoscaling,
     aws_elasticloadbalancingv2 as elbv2,
     aws_bedrock_agentcore_alpha as agentcore,
+    aws_bedrockagentcore as cfn_agentcore,
     custom_resources as cr,
     Duration, Fn, RemovalPolicy,
 )
@@ -515,6 +517,26 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 agentcore.BrowserCustom(self, "AgentCoreBrowser",
                     name="openclaw-browser",
                 )
+
+            # Identity — workload identity for agent AWS access
+            ac_identity = cfn_agentcore.CfnWorkloadIdentity(self, "AgentCoreIdentity",
+                name="openclaw-identity",
+            )
+
+            # Policy — Cedar-based access control for Gateway tools
+            if ac_cfg.get("gateway", {}).get("enabled", True) and gateway_url:
+                cfn_agentcore.CfnPolicy(self, "AgentCorePolicy",
+                    name="openclaw-tenant-policy",
+                    policy_type="GATEWAY",
+                    policy=json.dumps({
+                        "cedar": {
+                            "text": 'permit(principal, action, resource) when { resource.gateway == "openclaw-gateway" };'
+                        }
+                    }),
+                )
+
+            # Observability — enabled automatically via CloudWatch when Gateway/Memory are created
+            # No separate resource needed; AgentCore emits metrics/traces to CloudWatch by default
 
         # Pass AgentCore config to API Lambda
         if ac_enabled and gateway_url:

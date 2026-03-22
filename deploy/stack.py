@@ -11,6 +11,7 @@ from aws_cdk import (
     aws_ec2 as ec2,
     aws_autoscaling as autoscaling,
     aws_elasticloadbalancingv2 as elbv2,
+    aws_bedrock_agentcore_alpha as agentcore,
     custom_resources as cr,
     Duration, Fn, RemovalPolicy,
 )
@@ -461,6 +462,47 @@ class OpenClawOrchestratorStack(cdk.Stack):
             ),
             targets=[targets.LambdaFunction(api_fn)],
         )
+
+        # ========== AgentCore (optional) ==========
+        ac_cfg = CFG.get("agentcore", {})
+        ac_enabled = ac_cfg.get("enabled", False)
+        gateway_url = ""
+
+        if ac_enabled:
+            # Gateway — MCP tool hub for all VMs
+            if ac_cfg.get("gateway", {}).get("enabled", True):
+                ac_gateway = agentcore.Gateway(self, "AgentCoreGateway",
+                    name="openclaw-gateway",
+                    description="OpenClaw Agent tool gateway",
+                )
+                gateway_url = ac_gateway.gateway_url
+                ac_gateway.grant_invoke(host_role)
+
+            # Memory — persistent cross-session memory
+            if ac_cfg.get("memory", {}).get("enabled", True):
+                strategies = []
+                for s in ac_cfg.get("memory", {}).get("strategies", ["semantic"]):
+                    if s == "semantic":
+                        strategies.append(agentcore.MemoryStrategy.using_semantic(
+                            name="openclaw-semantic",
+                            namespaces=["/openclaw/tenant/{actorId}/semantic"],
+                        ))
+                    elif s == "user_preference":
+                        strategies.append(agentcore.MemoryStrategy.using_user_preference(
+                            name="openclaw-preferences",
+                            namespaces=["/openclaw/tenant/{actorId}/preferences"],
+                        ))
+                ac_memory = agentcore.Memory(self, "AgentCoreMemory",
+                    memory_name="openclaw-memory",
+                    description="OpenClaw per-tenant memory",
+                    expiration_duration=Duration.days(ac_cfg.get("memory", {}).get("expiration_days", 90)),
+                    memory_strategies=strategies,
+                )
+
+        # Pass AgentCore config to API Lambda
+        if ac_enabled and gateway_url:
+            api_fn.add_environment("AGENTCORE_ENABLED", "true")
+            api_fn.add_environment("AGENTCORE_GATEWAY_URL", gateway_url)
 
         # ========== ALB (Dashboard Proxy) ==========
         alb = elbv2.ApplicationLoadBalancer(self, "DashboardALB",

@@ -49,7 +49,7 @@ fi
 
 # Restore custom DASHBOARD_URL if it was set by bind-domain.sh
 if [ -n "$SAVED_DASHBOARD_URL" ]; then
-  sed -i '/^DASHBOARD_URL=/d' "$SCRIPT_DIR/.env.deploy"
+  sed -i.bak '/^DASHBOARD_URL=/d' "$SCRIPT_DIR/.env.deploy" && rm -f "$SCRIPT_DIR/.env.deploy.bak"
   echo "$SAVED_DASHBOARD_URL" >> "$SCRIPT_DIR/.env.deploy"
 fi
 

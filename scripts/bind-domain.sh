@@ -39,7 +39,7 @@ else
 fi
 
 # Update .env.deploy
-sed -i '/^DASHBOARD_URL=/d' "$SCRIPT_DIR/.env.deploy"
+sed -i.bak '/^DASHBOARD_URL=/d' "$SCRIPT_DIR/.env.deploy" && rm -f "$SCRIPT_DIR/.env.deploy.bak"
 echo "DASHBOARD_URL=https://${DOMAIN}" >> "$SCRIPT_DIR/.env.deploy"
 
 echo ""

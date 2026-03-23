@@ -1,6 +1,6 @@
 # OpenClaw Pool on EC2 microVM
 
-![Version](https://img.shields.io/badge/version-0.8.1-blue)
+![Version](https://img.shields.io/badge/version-0.8.2-blue)
 
 **[English](README.md)** | **[中文](docs/README-CN.md)** | **[Changelog](docs/CHANGELOG.md)**
 
@@ -17,8 +17,9 @@ Multi-tenant isolated deployment of OpenClaw AI agents on AWS using Firecracker 
 - **Health Checks** — All VMs probed every minute; auto-restart on consecutive failures. Creating VMs get a 10-minute grace period with no SSM commands
 - **Web Console** — Visual management of hosts and tenants with real-time status
 - **Rootfs Pre-build** — Rootfs + data template distributed via S3, downloaded on host init
-- **Dashboard Access** — Each tenant's OpenClaw Dashboard accessible at `/vm/{tenant-id}/` via ALB + Nginx, supports WebSocket, auto-routes across multiple hosts
+- **Dashboard Access** — Each tenant's OpenClaw Dashboard accessible at `/vm/{tenant-id}/` via ALB path-based routing + Nginx, supports WebSocket, auto-routes across multiple hosts
 - **Auto Backup** — EventBridge scheduled backup of all tenant data volumes to S3, with manual trigger and backup query API
+- **AgentCore Integration** — Optional toggle; when enabled, all VMs auto-connect to AgentCore Gateway (MCP tool hub), Memory, Code Interpreter, and Browser
 - **Shared Skills** — All tenants share a unified skill set (S3-managed, auto-synced to all VMs), with independent memory
 - **Default Toolchain** — Each VM comes with Python3/uv/git/gh/Node.js/htop/tmux/tree pre-installed
 - **Data Backup** — Automated daily backup + manual backup API, Firecracker pause/resume for consistency
@@ -69,6 +70,7 @@ openclaw-firecracker/
 │   ├── lambda/
 │   │   ├── api/handler.py     # Tenant CRUD + host management
 │   │   ├── health_check/handler.py  # Scheduled health checks
+│   │   ├── agentcore_tools/handler.py  # AgentCore Gateway Lambda tools
 │   │   └── scaler/handler.py  # Idle host reclamation
 │   └── userdata/
 │       ├── init-host.sh       # Host initialization

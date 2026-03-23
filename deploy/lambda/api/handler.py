@@ -561,11 +561,8 @@ def process_pending():
         )
 
         _launch_vm(host["instance_id"], tenant["id"], vm_num, vcpu, mem_mb, guest_ip, host_port)
-
-        # ALB path-based routing
         tg_arn = _ensure_host_tg(host["instance_id"], host["private_ip"])
         _add_alb_rule(tenant["id"], tg_arn)
-
         assigned += 1
 
     return {"statusCode": 200, "body": f"assigned {assigned}/{len(pending)} pending tenants"}

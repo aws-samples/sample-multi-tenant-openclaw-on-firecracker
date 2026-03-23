@@ -1,3 +1,4 @@
+import json
 import yaml
 import aws_cdk as cdk
 from aws_cdk import (
@@ -11,7 +12,8 @@ from aws_cdk import (
     aws_ec2 as ec2,
     aws_autoscaling as autoscaling,
     aws_elasticloadbalancingv2 as elbv2,
-    aws_bedrockagentcore as agentcore,
+    aws_bedrock_agentcore_alpha as agentcore,
+    aws_bedrockagentcore as agentcore_l1,
     custom_resources as cr,
     Duration, Fn, RemovalPolicy,
 )
@@ -277,6 +279,19 @@ class OpenClawOrchestratorStack(cdk.Stack):
         )
 
         # ========== ASG (P1-4) ==========
+        ac_cfg = CFG.get("agentcore", {})
+        ac_enabled = ac_cfg.get("enabled", False)
+        gateway_url = ""
+
+        # Create AgentCore Gateway early (needed for userdata placeholder)
+        if ac_enabled and ac_cfg.get("gateway", {}).get("enabled", True):
+            ac_gateway = agentcore.Gateway(self, "AgentCoreGateway",
+                gateway_name="openclaw-gateway",
+                description="OpenClaw Agent tool gateway",
+            )
+            gateway_url = ac_gateway.gateway_url
+            ac_gateway.grant_invoke(host_role)
+
         vpc = ec2.Vpc.from_lookup(self, "Vpc", is_default=True)
 
         sg = ec2.SecurityGroup(self, "HostSG",
@@ -370,10 +385,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 "SpotOptions": {"SpotInstanceType": "one-time"},
             })
 
-        # CFN doesn't support CpuOptions.NestedVirtualization yet.
-        # Workaround: create a new LT version with nested virt via EC2 API, set as default.
-        # Use $Latest as source so each CDK deploy (which creates a new LT version) triggers
-        # a new nested-virt version on top of it.
+        # Enable nested virtualization via CustomResource (CFN doesn't support CpuOptions.NestedVirtualization)
         cfn_lt = launch_template.node.default_child
         create_ver_call = cr.AwsSdkCall(
             service="EC2",
@@ -385,7 +397,6 @@ class OpenClawOrchestratorStack(cdk.Stack):
                     "CpuOptions": {"NestedVirtualization": "enabled"},
                 },
             },
-            # Include CDK LT version hash so update triggers when LT changes
             physical_resource_id=cr.PhysicalResourceId.of(
                 Fn.join("-", ["nested-virt", cfn_lt.ref, Fn.get_att(cfn_lt.logical_id, "LatestVersionNumber").to_string()])
             ),
@@ -404,20 +415,23 @@ class OpenClawOrchestratorStack(cdk.Stack):
         )
         nested_virt.node.add_dependency(launch_template)
 
-        # Set the new version as default
-        set_default_call = cr.AwsSdkCall(
-            service="EC2",
-            action="modifyLaunchTemplate",
-            parameters={
-                "LaunchTemplateId": launch_template.launch_template_id,
-                "DefaultVersion": nested_virt.get_response_field("LaunchTemplateVersion.VersionNumber"),
-            },
-            physical_resource_id=cr.PhysicalResourceId.of("set-default-lt"),
-            output_paths=["LaunchTemplate.DefaultVersionNumber"],
-        )
         set_default = cr.AwsCustomResource(self, "SetDefaultLTVersion",
-            on_create=set_default_call,
-            on_update=set_default_call,
+            on_create=cr.AwsSdkCall(
+                service="EC2", action="modifyLaunchTemplate",
+                parameters={
+                    "LaunchTemplateId": launch_template.launch_template_id,
+                    "DefaultVersion": nested_virt.get_response_field("LaunchTemplateVersion.VersionNumber"),
+                },
+                physical_resource_id=cr.PhysicalResourceId.of("set-default-lt"),
+            ),
+            on_update=cr.AwsSdkCall(
+                service="EC2", action="modifyLaunchTemplate",
+                parameters={
+                    "LaunchTemplateId": launch_template.launch_template_id,
+                    "DefaultVersion": nested_virt.get_response_field("LaunchTemplateVersion.VersionNumber"),
+                },
+                physical_resource_id=cr.PhysicalResourceId.of("set-default-lt"),
+            ),
             install_latest_aws_sdk=False,
             policy=cr.AwsCustomResourcePolicy.from_statements([
                 iam.PolicyStatement(actions=["ec2:ModifyLaunchTemplate"], resources=["*"]),
@@ -434,21 +448,23 @@ class OpenClawOrchestratorStack(cdk.Stack):
         )
         asg.node.add_dependency(set_default)
         cfn_asg = asg.node.default_child
-        # Override LT version to the nested-virt version created by AwsCustomResource
         cfn_asg.add_property_override("LaunchTemplate.Version",
             nested_virt.get_response_field("LaunchTemplateVersion.VersionNumber"))
-        asg.add_lifecycle_hook("InitHook",
-            lifecycle_hook_name="openclaw-host-init",
-            lifecycle_transition=autoscaling.LifecycleTransition.INSTANCE_LAUNCHING,
-            heartbeat_timeout=Duration.seconds(CFG["asg"]["lifecycle_hook_timeout"]),
-            default_result=autoscaling.DefaultResult.ABANDON,
-        )
-        asg.add_lifecycle_hook("TerminateHook",
-            lifecycle_hook_name="openclaw-host-terminate",
-            lifecycle_transition=autoscaling.LifecycleTransition.INSTANCE_TERMINATING,
-            heartbeat_timeout=Duration.seconds(120),
-            default_result=autoscaling.DefaultResult.CONTINUE,
-        )
+        # Embed lifecycle hooks directly in ASG to avoid circular dependency
+        cfn_asg.add_property_override("LifecycleHookSpecificationList", [
+            {
+                "LifecycleHookName": "openclaw-host-init",
+                "LifecycleTransition": "autoscaling:EC2_INSTANCE_LAUNCHING",
+                "HeartbeatTimeout": CFG["asg"]["lifecycle_hook_timeout"],
+                "DefaultResult": "ABANDON",
+            },
+            {
+                "LifecycleHookName": "openclaw-host-terminate",
+                "LifecycleTransition": "autoscaling:EC2_INSTANCE_TERMINATING",
+                "HeartbeatTimeout": 120,
+                "DefaultResult": "CONTINUE",
+            },
+        ])
 
         # When a new host completes init → process pending tenants
         events.Rule(self, "HostReadyRule",
@@ -468,20 +484,53 @@ class OpenClawOrchestratorStack(cdk.Stack):
             targets=[targets.LambdaFunction(api_fn)],
         )
 
-        # ========== AgentCore (optional) ==========
-        ac_cfg = CFG.get("agentcore", {})
-        ac_enabled = ac_cfg.get("enabled", False)
-        gateway_url = ""
-
+        # ========== AgentCore (optional, continued) ==========
         if ac_enabled:
-            # Gateway — MCP tool hub for all VMs
+            # Gateway already created above (before userdata processing)
+
+            # Register Lambda tools on Gateway
             if ac_cfg.get("gateway", {}).get("enabled", True):
-                ac_gateway = agentcore.Gateway(self, "AgentCoreGateway",
-                    name="openclaw-gateway",
-                    description="OpenClaw Agent tool gateway",
+                tools_fn = _lambda.Function(self, "AgentCoreTools",
+                    function_name="openclaw-agentcore-tools",
+                    runtime=_lambda.Runtime.PYTHON_3_12,
+                    handler="handler.lambda_handler",
+                    code=_lambda.Code.from_asset("lambda/agentcore_tools"),
+                    timeout=Duration.seconds(30),
+                    memory_size=128,
                 )
-                gateway_url = ac_gateway.gateway_url
-                ac_gateway.grant_invoke(host_role)
+                ac_gateway.add_lambda_target("tools",
+                    lambda_function=tools_fn,
+                    tool_schema=agentcore.ToolSchema.from_inline([
+                        agentcore.ToolDefinition(
+                            name="hello",
+                            description="Say hello — test tool for verifying AgentCore Gateway connectivity",
+                            input_schema=agentcore.SchemaDefinition(
+                                type=agentcore.SchemaDefinitionType.OBJECT,
+                                properties={"name": agentcore.SchemaDefinition(
+                                    type=agentcore.SchemaDefinitionType.STRING,
+                                    description="Name to greet",
+                                )},
+                            ),
+                        ),
+                        agentcore.ToolDefinition(
+                            name="system_info",
+                            description="Get Lambda runtime system information",
+                            input_schema=agentcore.SchemaDefinition(type=agentcore.SchemaDefinitionType.OBJECT),
+                        ),
+                        agentcore.ToolDefinition(
+                            name="timestamp",
+                            description="Get current UTC timestamp",
+                            input_schema=agentcore.SchemaDefinition(
+                                type=agentcore.SchemaDefinitionType.OBJECT,
+                                properties={"format": agentcore.SchemaDefinition(
+                                    type=agentcore.SchemaDefinitionType.STRING,
+                                    description="iso or unix",
+                                )},
+                            ),
+                        ),
+                    ]),
+                    gateway_target_name="openclaw-tools",
+                )
 
             # Memory — persistent cross-session memory
             if ac_cfg.get("memory", {}).get("enabled", True):
@@ -489,16 +538,16 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 for s in ac_cfg.get("memory", {}).get("strategies", ["semantic"]):
                     if s == "semantic":
                         strategies.append(agentcore.MemoryStrategy.using_semantic(
-                            name="openclaw-semantic",
+                            name="openclaw_semantic",
                             namespaces=["/openclaw/tenant/{actorId}/semantic"],
                         ))
                     elif s == "user_preference":
                         strategies.append(agentcore.MemoryStrategy.using_user_preference(
-                            name="openclaw-preferences",
+                            name="openclaw_preferences",
                             namespaces=["/openclaw/tenant/{actorId}/preferences"],
                         ))
                 ac_memory = agentcore.Memory(self, "AgentCoreMemory",
-                    memory_name="openclaw-memory",
+                    memory_name="openclaw_memory",
                     description="OpenClaw per-tenant memory",
                     expiration_duration=Duration.days(ac_cfg.get("memory", {}).get("expiration_days", 90)),
                     memory_strategies=strategies,
@@ -507,19 +556,30 @@ class OpenClawOrchestratorStack(cdk.Stack):
             # Code Interpreter — secure sandboxed Python execution
             if ac_cfg.get("code_interpreter", {}).get("enabled", True):
                 agentcore.CodeInterpreterCustom(self, "AgentCoreCodeInterpreter",
-                    name="openclaw-code-interpreter",
+                    code_interpreter_custom_name="openclaw_code_interpreter",
                 )
 
             # Browser — cloud-based web automation
             if ac_cfg.get("browser", {}).get("enabled", True):
                 agentcore.BrowserCustom(self, "AgentCoreBrowser",
-                    name="openclaw-browser",
+                    browser_custom_name="openclaw_browser",
                 )
 
+            # Identity — workload identity for agent AWS access
+            ac_identity = agentcore_l1.CfnWorkloadIdentity(self, "AgentCoreIdentity",
+                name="openclaw_identity",
+            )
+
+            # Policy — Cedar-based access control (configure via AgentCore console)
+            # CfnPolicy requires PolicyEngine setup; deferred to console for initial deployment
+
+            # Observability — enabled automatically via CloudWatch when Gateway/Memory are created
+
         # Pass AgentCore config to API Lambda
-        if ac_enabled and gateway_url:
+        if ac_enabled:
             api_fn.add_environment("AGENTCORE_ENABLED", "true")
-            api_fn.add_environment("AGENTCORE_GATEWAY_URL", gateway_url)
+            if gateway_url:
+                api_fn.add_environment("AGENTCORE_GATEWAY_URL", gateway_url)
 
 
         # ========== ALB (Dashboard Proxy) ==========

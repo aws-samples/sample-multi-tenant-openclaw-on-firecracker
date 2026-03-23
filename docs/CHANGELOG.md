@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.8.2 — AgentCore 深化 + 协作规范
+
+**AgentCore 深化:**
+- **Gateway Lambda 工具注册** — hello/system_info/timestamp 三个示例工具通过 ToolSchema 注册到 Gateway
+- **WorkloadIdentity** — 代理 agent AWS 资源访问
+- **CDK 循环依赖修复** — lifecycle hooks 内嵌 ASG，Gateway 创建提前到 ASG 之前
+- **AgentCore 资源命名** — 统一使用下划线（`openclaw_semantic`）
+
+**改进:**
+- **Health check 加速** — Target group interval 30s→10s，healthy threshold 5→2，新 tenant ~20s 可访问
+- **跨平台 sed** — `sed -i.bak` 替代 `sed -i`，兼容 macOS/Linux
+- **CDK AgentCore L2** — 统一使用 `aws_bedrock_agentcore_alpha` L2 构造
+
+**协作:**
+- 新增 CONTRIBUTING.md 协同开发规范
+
 ## v0.8.1 — ALB Path-Based Routing
 
 **架构改进:**
@@ -11,7 +27,6 @@
 **清理:**
 - 移除跨主机 nginx 代理代码（`_sync_nginx_to_other_hosts` / `_remove_nginx_from_all_hosts`）
 - 移除 host 间 SG 互通规则（不再需要跨主机流量）
-- 移除 DNAT iptables 相关代码
 
 ## v0.8.0 — Bug Fixes + AgentCore 集成
 

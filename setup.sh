@@ -28,7 +28,6 @@ REGION=$REGION
 PROFILE=$PROFILE
 $(echo "$OUTPUTS" | awk '{
   key=$1
-  # PascalCase → UPPER_SNAKE_CASE: insert _ before each uppercase letter, then toupper
   out=""
   for(i=1;i<=length(key);i++){
     c=substr(key,i,1)

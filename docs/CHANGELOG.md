@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.8.7 — Console 在线托管 + Cognito 认证
+
+- **Console S3 托管** — Console 通过 CloudFront `/console/` 路径在线访问，无需本地运行
+- **Cognito 认证** — User Pool + Hosted UI，OAuth2 implicit flow 保护 Console 访问
+- **bind-domain.sh 更新** — 支持 CloudFront 绑定自定义域名（需 us-east-1 ACM 证书）
+- **config.yml.example** — 新增示例配置文件
+
 ## v0.8.6 — CloudFront + Dashboard Token
 
 - **CloudFront** — ALB 前加 CloudFront，`*.cloudfront.net` 自带 HTTPS，无需自定义域名和 ACM 证书
@@ -17,7 +24,7 @@
 
 - **去除 SSM 健康检查依赖** — 探活从 N 次 SSM/分钟降为 0，SSM 仅用于生命周期操作（launch/stop/backup）
 - **init-host.sh 运行时获取表名** — 通过 CloudFormation output 查询，去掉 CDK placeholder split 复杂度
-- **S3 下载大脚本** — backup-data.sh、host-agent.py 从 S3 下载，解决 userdata 16KB 限制
+- **S3 下载脚本** — backup-data.sh、host-agent.py 从 S3 下载，解决 userdata 16KB 限制
 - **S3 下载日志精简** — `aws s3 cp --no-progress`
 
 ## v0.8.3 — Bug Fixes

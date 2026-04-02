@@ -6,6 +6,39 @@
 <title>OpenClaw Management Console</title>
 <link rel="stylesheet" href="style.css">
 <script src="config.js"></script>
+<script>
+// Cognito OAuth2 implicit flow (skip if not configured)
+(function() {
+  var domain = window.OC_COGNITO_DOMAIN;
+  var clientId = window.OC_COGNITO_CLIENT_ID;
+  var redirectUri = window.OC_COGNITO_REDIRECT_URI;
+  if (!domain || !clientId) return; // Auth not configured, allow access
+
+  // Check for token in URL hash (callback from Cognito)
+  var hash = window.location.hash.substring(1);
+  if (hash) {
+    var params = {};
+    hash.split('&').forEach(function(p) { var kv = p.split('='); params[kv[0]] = decodeURIComponent(kv[1]); });
+    if (params.id_token) {
+      localStorage.setItem('oc_id_token', params.id_token);
+      localStorage.setItem('oc_token_exp', Date.now() + (parseInt(params.expires_in || '3600') * 1000));
+      window.location.hash = '';
+      return;
+    }
+  }
+
+  // Check stored token
+  var token = localStorage.getItem('oc_id_token');
+  var exp = parseInt(localStorage.getItem('oc_token_exp') || '0');
+  if (token && exp > Date.now()) return; // Valid token, allow access
+
+  // No valid token — redirect to Cognito Hosted UI
+  localStorage.removeItem('oc_id_token');
+  var url = 'https://' + domain + '/login?client_id=' + clientId +
+    '&response_type=token&scope=openid+email&redirect_uri=' + encodeURIComponent(redirectUri);
+  window.location.href = url;
+})();
+</script>
 <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
 </head>
 <body x-data="app()" x-init="init()">

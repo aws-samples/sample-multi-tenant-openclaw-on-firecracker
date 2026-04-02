@@ -1,6 +1,6 @@
 # OpenClaw Pool on EC2 microVM
 
-![Version](https://img.shields.io/badge/version-0.8.6-blue)
+![Version](https://img.shields.io/badge/version-0.8.7-blue)
 
 **[English](../README.md)** | **[中文](README-CN.md)** | **[Changelog](CHANGELOG.md)**
 
@@ -15,7 +15,7 @@
 - **自动调度** — 创建租户时自动选择有空闲资源的宿主机，资源不足时自动扩容
 - **自动缩容** — 空闲宿主机超时后自动回收，节省成本（两轮确认防误杀）
 - **健康检查** — 实时 VM 健康监控，状态自动更新
-- **Web 管理控制台** — 可视化管理 Host/Tenant，实时状态展示
+- **Web 管理控制台** — 在线管理控制台，Cognito 认证保护，实时 Host/Tenant 状态
 - **Rootfs 预构建** — rootfs + data template 双镜像通过 S3 分发，宿主机启动时自动下载
 - **Dashboard 直达** — 一键 HTTPS 访问每个租户的 OpenClaw Dashboard，无需自定义域名
 - **自动备份** — EventBridge 定时备份所有租户数据盘到 S3，支持手动触发和备份查询
@@ -264,34 +264,31 @@ s3://{bucket}/skills/
 ### 配置文件
 
 | 文件 | 用途 |
-|------|------|--------|
-| `config.yml` | 基础设施参数 (实例类型、VM 规格、S3 前缀、ASG) |
-| `.env.deploy` | 部署环境 (region、API URL/Key、bucket) |
+|------|------|
+| `config.yml` | 基础设施配置 — 从 `config.yml.example` 复制后按需修改 |
+| `.env.deploy` | 部署环境 (region、API URL/Key、bucket) — setup.sh 自动生成 |
 | `.env.openclaw` | OpenClaw 应用配置 (模型、API key、tools profile) |
 
 ### config.yml
 
 | 分类 | 配置项 | 默认值 | 说明 |
 |------|--------|--------|------|
-| host | instance_type | c8i.2xlarge | 需支持 NestedVirtualization (c8i/m8i/r8i) |
-| host | reserved_vcpu | 1 | 预留给宿主机 OS |
-| host | reserved_mem_mb | 2048 | 预留给宿主机 OS |
-| host | cpu_overcommit_ratio | 1.0 | CPU 超配比例 (2.0=可分配 2 倍 vCPU，内存不超配) |
+| host | instance_type | m8i.xlarge | 需支持 NestedVirtualization (c8i/m8i/r8i) |
+| host | data_volume_gb | 200 | 宿主机数据卷 (rootfs 模板 + VM 数据盘) |
+| host | cpu_overcommit_ratio | 2.0 | CPU 超配比例 (1.0=不超配, 2.0=可分配 2 倍 vCPU) |
+| vm | default_vcpu | 2 | 默认 vCPU |
+| vm | default_mem_mb | 4096 | 默认内存 (MB) |
+| vm | data_disk_mb | 8192 | 数据盘大小 (MB) |
 | asg | min_capacity | 1 | 最小实例数 |
 | asg | max_capacity | 5 | 最大实例数 |
 | asg | use_spot | false | Spot 实例 (省 ~60-70%，可能被回收) |
-| vm | default_vcpu | 2 | 默认 vCPU |
-| vm | default_mem_mb | 4096 | 默认内存 (MB) |
-| vm | data_disk_mb | 4096 | 数据盘大小 (MB) |
-| host | data_volume_gb | 200 | 宿主机数据卷 (rootfs 模板 + VM 数据盘) |
-| s3 | backup_cron | cron(0 19 * * ? *) | 每日备份时间 (UTC 19:00 = CST 03:00) |
-| s3 | backup_retention_days | 7 | S3 lifecycle 自动清理天数 |
-| health_check | interval_minutes | 1 | 探活间隔 |
-| health_check | max_failures | 3 | 连续失败后自动重启 |
-| scaler | interval_minutes | 5 | 空闲检测间隔 |
-| scaler | idle_timeout_minutes | 10 | 空闲超时 (分钟) |
+| scaler | idle_timeout_minutes | 10 | 空闲超时后回收宿主机 |
+| health_check | interval_minutes | 5 | Lambda watchdog 间隔 |
+| agentcore | enabled | false | AgentCore Gateway/Memory/CodeInterpreter/Browser |
+| console_auth | enabled | false | Console Cognito 认证 |
+| console_auth | self_sign_up | false | 允许用户自注册 |
 
-修改后重新部署：`./setup.sh <region> <profile>`
+完整配置参见 `config.yml.example`。修改后重新部署：`./setup.sh <region> <profile>`
 
 ### 销毁环境
 

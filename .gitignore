@@ -5,6 +5,7 @@
 .venv
 .env.*
 .dev
+config.yml
 logs/*
 
 # Python

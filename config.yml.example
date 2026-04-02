@@ -1,0 +1,65 @@
+# 部署配置 - 示例
+# 复制为 config.yml 后按需修改
+
+# ========== 宿主机 (EC2) ==========
+host:
+  instance_type: m8i.xlarge        # 支持嵌套虚拟化: c8i/m8i/r8i 系列
+  root_volume_gb: 20
+  data_volume_gb: 200              # 建议每个 VM 预留 ~16GB
+  reserved_vcpu: 1
+  reserved_mem_mb: 2048
+  cpu_overcommit_ratio: 2.0        # 1.0=不超配, 2.0=可分配 2 倍 vCPU
+
+# ========== microVM ==========
+vm:
+  default_vcpu: 2
+  default_mem_mb: 4096
+  rootfs_size_mb: 6144
+  data_disk_mb: 8192
+  gateway_port_base: 18789
+  subnet_prefix: "172.16"
+
+# ========== S3 ==========
+s3:
+  rootfs_prefix: "rootfs"
+  backup_prefix: "backups"
+  backup_retention_days: 7
+  backup_cron: "cron(0 19 * * ? *)"  # UTC 19:00 = 北京时间 03:00
+
+# ========== Auto Scaling ==========
+asg:
+  min_capacity: 1
+  max_capacity: 5
+  lifecycle_hook_timeout: 600
+  use_spot: false
+
+scaler:
+  interval_minutes: 3
+  idle_timeout_minutes: 10
+
+# ========== 健康检查 ==========
+health_check:
+  interval_minutes: 5
+  max_failures: 3
+  app_port: 18789
+
+# ========== AgentCore (可选) ==========
+agentcore:
+  enabled: false                   # 开启后所有 VM 自动连接 AgentCore
+  # gateway:
+  #   enabled: true
+  # memory:
+  #   enabled: true
+  #   strategies: [semantic, user_preference]
+  #   expiration_days: 90
+  # code_interpreter:
+  #   enabled: true
+  # browser:
+  #   enabled: true
+
+# ========== Console 认证 (可选) ==========
+console_auth:
+  enabled: false                   # 开启后 Console 需要 Cognito 登录
+  self_sign_up: false              # 允许用户自注册
+  # user_pool_id: ""              # 已有 User Pool ID，留空自动创建
+  # user_pool_client_id: ""       # 已有 App Client ID

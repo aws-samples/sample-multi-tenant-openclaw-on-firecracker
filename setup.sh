@@ -51,3 +51,20 @@ fi
 
 echo "✓ 环境信息已保存到 .env.deploy"
 cat "$SCRIPT_DIR/.env.deploy"
+
+# Upload console to S3 (generate config.js first)
+source "$SCRIPT_DIR/.env.deploy"
+VERSION=$(cat "$SCRIPT_DIR/VERSION" 2>/dev/null || echo "dev")
+cat > "$SCRIPT_DIR/console/config.js" << CFGEOF
+window.OC_DEFAULT_API_URL = "${API_URL:-}";
+window.OC_DEFAULT_API_KEY = "${API_KEY:-}";
+window.OC_DASHBOARD_BASE = "${DASHBOARD_URL:-}";
+window.OC_VERSION = "${VERSION}";
+window.OC_COGNITO_DOMAIN = "${COGNITO_DOMAIN:-}";
+window.OC_COGNITO_CLIENT_ID = "${COGNITO_CLIENT_ID:-}";
+window.OC_COGNITO_REDIRECT_URI = "${DASHBOARD_URL:-}/console/index.html";
+CFGEOF
+aws s3 sync "$SCRIPT_DIR/console/" "s3://${ASSETS_BUCKET}/console/" \
+  --profile "$PROFILE" --region "$REGION" --quiet --delete
+echo "✓ Console uploaded to s3://${ASSETS_BUCKET}/console/"
+echo "→ Console URL: ${DASHBOARD_URL}/console/index.html"

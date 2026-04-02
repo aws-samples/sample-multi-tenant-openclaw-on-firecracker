@@ -14,6 +14,7 @@ from aws_cdk import (
     aws_elasticloadbalancingv2 as elbv2,
     aws_cloudfront as cloudfront,
     aws_cloudfront_origins as origins,
+    aws_cognito as cognito,
     aws_bedrock_agentcore_alpha as agentcore,
     aws_bedrockagentcore as agentcore_l1,
     custom_resources as cr,
@@ -616,6 +617,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
         ))
 
         # ========== CloudFront (HTTPS without custom domain) ==========
+        s3_origin = origins.S3BucketOrigin.with_origin_access_control(assets_bucket)
         cf_distribution = cloudfront.Distribution(self, "DashboardCF",
             comment="OpenClaw Dashboard",
             default_behavior=cloudfront.BehaviorOptions(
@@ -630,7 +632,55 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
                 origin_request_policy=cloudfront.OriginRequestPolicy.ALL_VIEWER,
             ),
+            additional_behaviors={
+                "/console/*": cloudfront.BehaviorOptions(
+                    origin=s3_origin,
+                    viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+                    cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
+                ),
+            },
+            default_root_object="",
         )
+
+        # ========== Console Auth (Cognito) ==========
+        auth_cfg = CFG.get("console_auth", {})
+        cognito_outputs = {}
+        if auth_cfg.get("enabled", False):
+            existing_pool_id = auth_cfg.get("user_pool_id", "")
+            existing_client_id = auth_cfg.get("user_pool_client_id", "")
+
+            if existing_pool_id and existing_client_id:
+                user_pool = cognito.UserPool.from_user_pool_id(self, "ConsoleUserPool", existing_pool_id)
+                cognito_outputs["CognitoUserPoolId"] = existing_pool_id
+                cognito_outputs["CognitoClientId"] = existing_client_id
+            else:
+                user_pool = cognito.UserPool(self, "ConsoleUserPool",
+                    user_pool_name="openclaw-console",
+                    self_sign_up_enabled=auth_cfg.get("self_sign_up", False),
+                    sign_in_aliases=cognito.SignInAliases(email=True),
+                    password_policy=cognito.PasswordPolicy(
+                        min_length=8, require_digits=True, require_lowercase=True,
+                    ),
+                    removal_policy=RemovalPolicy.RETAIN,
+                )
+                cf_domain = cf_distribution.distribution_domain_name
+                callback_url = f"https://{cf_domain}/console/index.html"
+                user_pool.add_domain("ConsoleDomain",
+                    cognito_domain=cognito.CognitoDomainOptions(
+                        domain_prefix="openclaw-console",
+                    ),
+                )
+                client = user_pool.add_client("ConsoleClient",
+                    o_auth=cognito.OAuthSettings(
+                        flows=cognito.OAuthFlows(implicit_code_grant=True),
+                        scopes=[cognito.OAuthScope.OPENID, cognito.OAuthScope.EMAIL],
+                        callback_urls=[callback_url],
+                        logout_urls=[callback_url],
+                    ),
+                )
+                cognito_outputs["CognitoUserPoolId"] = user_pool.user_pool_id
+                cognito_outputs["CognitoClientId"] = client.user_pool_client_id
+                cognito_outputs["CognitoDomain"] = f"openclaw-console.auth.{cdk.Stack.of(self).region}.amazoncognito.com"
 
         # ========== Outputs ==========
         for key, val in {
@@ -641,5 +691,6 @@ class OpenClawOrchestratorStack(cdk.Stack):
             "AssetsBucket": assets_bucket.bucket_name,
             "HostInstanceProfileArn": instance_profile.attr_arn,
             "DashboardUrl": f"https://{cf_distribution.distribution_domain_name}",
+            **cognito_outputs,
         }.items():
             cdk.CfnOutput(self, key, value=val)

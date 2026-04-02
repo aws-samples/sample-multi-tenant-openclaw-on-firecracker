@@ -89,7 +89,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
             actions=["ssm:SendCommand", "ssm:GetCommandInvocation"],
             resources=["*"],
         )
-        ec2_describe_policy = iam.PolicyStatement(
+        ec2_policy = iam.PolicyStatement(
             actions=["ec2:DescribeInstances", "ec2:TerminateInstances"],
             resources=["*"],
         )
@@ -123,7 +123,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
         hosts_table.grant_read_write_data(api_fn)
         assets_bucket.grant_read(api_fn)
         api_fn.add_to_role_policy(ssm_policy)
-        api_fn.add_to_role_policy(ec2_describe_policy)
+        api_fn.add_to_role_policy(ec2_policy)
         api_fn.add_to_role_policy(iam.PolicyStatement(
             actions=["autoscaling:DescribeAutoScalingGroups", "autoscaling:SetDesiredCapacity",
                      "autoscaling:CompleteLifecycleAction",
@@ -264,12 +264,17 @@ class OpenClawOrchestratorStack(cdk.Stack):
         )
         assets_bucket.grant_read_write(host_role)
         hosts_table.grant_read_write_data(host_role)
+        tenants_table.grant_read_write_data(host_role)  # host-agent writes health status
         host_role.add_to_policy(iam.PolicyStatement(
             actions=["autoscaling:CompleteLifecycleAction"],
             resources=["*"],
         ))
         host_role.add_to_policy(iam.PolicyStatement(
             actions=["ec2:DescribeVolumes", "ec2:CreateTags"],
+            resources=["*"],
+        ))
+        host_role.add_to_policy(iam.PolicyStatement(
+            actions=["cloudformation:DescribeStacks"],
             resources=["*"],
         ))
 
@@ -282,6 +287,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
         ac_cfg = CFG.get("agentcore", {})
         ac_enabled = ac_cfg.get("enabled", False)
         gateway_url = ""
+        ac_gateway = None
 
         # Create AgentCore Gateway early (needed for userdata placeholder)
         if ac_enabled and ac_cfg.get("gateway", {}).get("enabled", True):
@@ -313,16 +319,13 @@ class OpenClawOrchestratorStack(cdk.Stack):
         launch_vm_sh = (ud_dir / "launch-vm.sh").read_text().replace(
             "{{SUBNET_PREFIX}}", CFG["vm"]["subnet_prefix"])
         stop_vm_sh = (ud_dir / "stop-vm.sh").read_text()
-        backup_data_sh = (ud_dir / "backup-data.sh").read_text()
 
         init_sh = (ud_dir / "init-host.sh").read_text()
-        init_sh = init_sh.replace("{{ASSETS_BUCKET}}", "PLACEHOLDER_BUCKET")
         init_sh = init_sh.replace("{{ROOTFS_PREFIX}}", CFG["s3"]["rootfs_prefix"])
-        init_sh = init_sh.replace("{{HOSTS_TABLE}}", "PLACEHOLDER_TABLE")
         init_sh = init_sh.replace("{{AVAIL_VCPU}}", str(_avail_vcpu))
         init_sh = init_sh.replace("{{AVAIL_MEM}}", str(_avail_mem))
-        init_sh = init_sh.replace("{{AGENTCORE_GATEWAY_URL}}", "none")
-        # Embed launch/stop scripts as heredocs
+        init_sh = init_sh.replace("{{AGENTCORE_GATEWAY_URL}}", gateway_url if gateway_url else "none")
+        # Embed small scripts as heredocs; large ones (backup-data, host-agent) from S3
         init_sh = init_sh.replace("{{LAUNCH_VM_SCRIPT}}",
             f"cat > /home/ubuntu/launch-vm.sh << 'LAUNCHEOF'\n{launch_vm_sh}LAUNCHEOF\n"
             "chmod +x /home/ubuntu/launch-vm.sh && chown ubuntu:ubuntu /home/ubuntu/launch-vm.sh")
@@ -330,24 +333,23 @@ class OpenClawOrchestratorStack(cdk.Stack):
             f"cat > /home/ubuntu/stop-vm.sh << 'STOPEOF'\n{stop_vm_sh}STOPEOF\n"
             "chmod +x /home/ubuntu/stop-vm.sh && chown ubuntu:ubuntu /home/ubuntu/stop-vm.sh")
         init_sh = init_sh.replace("{{BACKUP_DATA_SCRIPT}}",
-            f"cat > /home/ubuntu/backup-data.sh << 'BACKUPEOF'\n{backup_data_sh}BACKUPEOF\n"
+            "aws s3 cp s3://{{ASSETS_BUCKET}}/scripts/backup-data.sh /home/ubuntu/backup-data.sh --region ${REGION}\n"
             "chmod +x /home/ubuntu/backup-data.sh && chown ubuntu:ubuntu /home/ubuntu/backup-data.sh")
 
-        # Split script around CDK token placeholders, inject as Fn::Join
-        # PLACEHOLDER_BUCKET appears 5 times (manifest + rootfs + data template + skills sync + skills cron)
-        # PLACEHOLDER_TABLE appears once (dynamodb put-item)
+        host_agent_svc = (ud_dir / "host-agent.service").read_text()
+        init_sh = init_sh.replace("{{HOST_AGENT_SCRIPT}}",
+            f"cat > /etc/systemd/system/host-agent.service << 'SVCEOF'\n{host_agent_svc}SVCEOF")
+
+        # MUST be after all script injections (they may contain {{ASSETS_BUCKET}})
+        init_sh = init_sh.replace("{{ASSETS_BUCKET}}", "PLACEHOLDER_BUCKET")
+
+        # Split script around PLACEHOLDER_BUCKET, inject actual bucket name via Fn::Join
         parts = init_sh.split("PLACEHOLDER_BUCKET")
-        # parts = [before_bucket1, ..., after_bucket5_with_table]
-        table_split = parts[-1].split("PLACEHOLDER_TABLE")
         user_data = ec2.UserData.for_linux()
         join_parts = [parts[0]]
-        for i in range(1, len(parts) - 1):
+        for i in range(1, len(parts)):
             join_parts.append(assets_bucket.bucket_name)
             join_parts.append(parts[i])
-        join_parts.append(assets_bucket.bucket_name)
-        join_parts.append(table_split[0])
-        join_parts.append(hosts_table.table_name)
-        join_parts.append(table_split[1])
         user_data.add_commands(cdk.Fn.join("", join_parts))
 
         # AMI lookup
@@ -378,15 +380,15 @@ class OpenClawOrchestratorStack(cdk.Stack):
             ],
         )
 
+        cfn_lt = launch_template.node.default_child
+
         if CFG["asg"].get("use_spot"):
-            cfn_lt = launch_template.node.default_child
             cfn_lt.add_property_override("LaunchTemplateData.InstanceMarketOptions", {
                 "MarketType": "spot",
                 "SpotOptions": {"SpotInstanceType": "one-time"},
             })
 
         # Enable nested virtualization via CustomResource (CFN doesn't support CpuOptions.NestedVirtualization)
-        cfn_lt = launch_template.node.default_child
         create_ver_call = cr.AwsSdkCall(
             service="EC2",
             action="createLaunchTemplateVersion",
@@ -489,7 +491,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
             # Gateway already created above (before userdata processing)
 
             # Register Lambda tools on Gateway
-            if ac_cfg.get("gateway", {}).get("enabled", True):
+            if ac_gateway and ac_cfg.get("gateway", {}).get("enabled", True):
                 tools_fn = _lambda.Function(self, "AgentCoreTools",
                     function_name="openclaw-agentcore-tools",
                     runtime=_lambda.Runtime.PYTHON_3_12,
@@ -546,7 +548,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
                             name="openclaw_preferences",
                             namespaces=["/openclaw/tenant/{actorId}/preferences"],
                         ))
-                ac_memory = agentcore.Memory(self, "AgentCoreMemory",
+                agentcore.Memory(self, "AgentCoreMemory",
                     memory_name="openclaw_memory",
                     description="OpenClaw per-tenant memory",
                     expiration_duration=Duration.days(ac_cfg.get("memory", {}).get("expiration_days", 90)),
@@ -566,7 +568,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 )
 
             # Identity — workload identity for agent AWS access
-            ac_identity = agentcore_l1.CfnWorkloadIdentity(self, "AgentCoreIdentity",
+            agentcore_l1.CfnWorkloadIdentity(self, "AgentCoreIdentity",
                 name="openclaw_identity",
             )
 

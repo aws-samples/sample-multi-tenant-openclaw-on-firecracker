@@ -8,6 +8,12 @@ REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/la
 INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
 PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
 
+# Query stack outputs
+_stack_output() {
+  aws cloudformation describe-stacks --stack-name OpenClawOrchestrator \
+    --query "Stacks[0].Outputs[?OutputKey==\`$1\`].OutputValue" --output text --region ${REGION}
+}
+
 # Step 1: KVM
 log "step1: KVM setup"
 chmod 666 /dev/kvm
@@ -30,6 +36,11 @@ mv release-${FC_VER}-${ARCH}/jailer-${FC_VER}-${ARCH} /usr/local/bin/jailer
 rm -rf release-${FC_VER}-${ARCH}
 log "firecracker ${FC_VER} installed"
 
+# Resolve table names from stack outputs
+HOSTS_TABLE=$(_stack_output HostsTable)
+TENANTS_TABLE=$(_stack_output TenantsTable)
+log "tables: hosts=${HOSTS_TABLE} tenants=${TENANTS_TABLE}"
+
 # Nginx reverse proxy for tenant dashboards
 mkdir -p /etc/nginx/conf.d/tenants
 cat > /etc/nginx/conf.d/openclaw-proxy.conf <<'NGINX'
@@ -40,6 +51,7 @@ map $http_upgrade $connection_upgrade {
 server {
     listen 80 default_server;
     location /health { return 200 'ok'; add_header Content-Type text/plain; }
+    location /agent/health { proxy_pass http://127.0.0.1:8899/health; }
     include /etc/nginx/conf.d/tenants/*.conf;
 }
 NGINX
@@ -47,6 +59,17 @@ rm -f /etc/nginx/sites-enabled/default
 systemctl enable nginx
 systemctl restart nginx
 log "nginx proxy configured"
+
+# Host agent — probes all local VMs, writes health to DynamoDB
+{{HOST_AGENT_SCRIPT}}
+mkdir -p /opt/openclaw
+aws s3 cp s3://{{ASSETS_BUCKET}}/scripts/host-agent.py /opt/openclaw/host-agent.py --region ${REGION} --no-progress
+# Inject tenants table name into service (same mechanism as hosts table)
+sed -i.bak "/\[Service\]/a Environment=OC_TENANTS_TABLE=${TENANTS_TABLE}" /etc/systemd/system/host-agent.service && rm -f /etc/systemd/system/host-agent.service.bak
+systemctl daemon-reload
+systemctl enable host-agent
+systemctl start host-agent
+log "host agent started on :8899"
 
 # Step 3: Mount data volume (before downloading to avoid filling root partition)
 # Nitro instances map /dev/sdf to unpredictable /dev/nvmeXn1.
@@ -85,7 +108,7 @@ FC_MAJOR=$(echo ${FC_VER} | grep -oP "v\d+\.\d+")
 curl -fsSL -o ${ASSETS}/vmlinux "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${FC_MAJOR}/${ARCH}/vmlinux-5.10.245-no-acpi"
 MANIFEST_URL="s3://{{ASSETS_BUCKET}}/{{ROOTFS_PREFIX}}/manifest.json"
 for i in $(seq 1 20); do
-  aws s3 cp ${MANIFEST_URL} ${ASSETS}/manifest.json --region ${REGION} 2>/dev/null && break
+  aws s3 cp ${MANIFEST_URL} ${ASSETS}/manifest.json --region ${REGION} --no-progress 2>/dev/null && break
   log "manifest.json not found, retrying in 30s ($i/20)..."
   sleep 30
 done
@@ -96,8 +119,8 @@ print(f'ROOTFS_KEY={m[\"rootfs\"]}')
 print(f'DATA_KEY={m[\"data_template\"]}')
 print(f'ROOTFS_VER={m[\"version\"]}')
 ")
-aws s3 cp s3://{{ASSETS_BUCKET}}/{{ROOTFS_PREFIX}}/${ROOTFS_KEY} ${ASSETS}/rootfs.gz --region ${REGION}
-aws s3 cp s3://{{ASSETS_BUCKET}}/{{ROOTFS_PREFIX}}/${DATA_KEY} ${ASSETS}/data.gz --region ${REGION}
+aws s3 cp s3://{{ASSETS_BUCKET}}/{{ROOTFS_PREFIX}}/${ROOTFS_KEY} ${ASSETS}/rootfs.gz --region ${REGION} --no-progress
+aws s3 cp s3://{{ASSETS_BUCKET}}/{{ROOTFS_PREFIX}}/${DATA_KEY} ${ASSETS}/data.gz --region ${REGION} --no-progress
 pigz -dc ${ASSETS}/rootfs.gz > ${ASSETS}/openclaw-rootfs.ext4 && rm -f ${ASSETS}/rootfs.gz
 pigz -dc ${ASSETS}/data.gz > ${ASSETS}/openclaw-data-template.ext4 && rm -f ${ASSETS}/data.gz
 chown -R ubuntu:ubuntu ${ASSETS}
@@ -128,7 +151,7 @@ fi
 
 # Step 5: Self-register to DynamoDB
 log "step5: registering to DynamoDB"
-aws dynamodb put-item --table-name {{HOSTS_TABLE}} --region ${REGION} --item '{"instance_id":{"S":"'${INSTANCE_ID}'"},"private_ip":{"S":"'${PRIVATE_IP}'"},"total_vcpu":{"N":"{{AVAIL_VCPU}}"},"total_mem_mb":{"N":"{{AVAIL_MEM}}"},"used_vcpu":{"N":"0"},"used_mem_mb":{"N":"0"},"vm_count":{"N":"0"},"next_vm_num":{"N":"1"},"status":{"S":"active"},"rootfs_version":{"S":"'${ROOTFS_VER}'"}}'
+aws dynamodb put-item --table-name ${HOSTS_TABLE} --region ${REGION} --item '{"instance_id":{"S":"'${INSTANCE_ID}'"},"private_ip":{"S":"'${PRIVATE_IP}'"},"total_vcpu":{"N":"{{AVAIL_VCPU}}"},"total_mem_mb":{"N":"{{AVAIL_MEM}}"},"used_vcpu":{"N":"0"},"used_mem_mb":{"N":"0"},"vm_count":{"N":"0"},"next_vm_num":{"N":"1"},"status":{"S":"active"},"rootfs_version":{"S":"'${ROOTFS_VER}'"}}'
 
 # Step 6: Complete lifecycle hook
 log "step6: completing lifecycle hook"

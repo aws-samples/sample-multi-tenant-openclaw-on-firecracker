@@ -10,6 +10,15 @@ cd "$SCRIPT_DIR/deploy"
 
 PATH=".venv/bin:$PATH" cdk deploy -c region="$REGION" --profile "$PROFILE" --require-approval never "${@:3}"
 
+# Upload scripts to S3
+BUCKET=$(aws cloudformation describe-stacks --stack-name OpenClawOrchestrator \
+  --query 'Stacks[0].Outputs[?OutputKey==`AssetsBucket`].OutputValue' --output text \
+  --profile "$PROFILE" --region "$REGION")
+aws s3 cp "$SCRIPT_DIR/deploy/userdata/host-agent.py" "s3://${BUCKET}/scripts/host-agent.py" \
+  --profile "$PROFILE" --region "$REGION" --quiet
+aws s3 cp "$SCRIPT_DIR/deploy/userdata/backup-data.sh" "s3://${BUCKET}/scripts/backup-data.sh" \
+  --profile "$PROFILE" --region "$REGION" --quiet
+
 # 导出 stack outputs
 echo "→ 导出部署信息..."
 OUTPUTS=$(aws cloudformation describe-stacks --stack-name OpenClawOrchestrator \

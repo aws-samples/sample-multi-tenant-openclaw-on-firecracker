@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.8.5 — Host Agent
+
+- **host-agent daemon** — 宿主机常驻服务，每 5s 探活所有本机 VM（ping + curl），直写 DynamoDB
+- **creating → running 实时提升** — agent 检测到 VM up 后立即提升状态，无需等待 Lambda
+- **Health check Lambda 降级为 watchdog** — 5 分钟一次，仅检测 stale agent 数据 + 预留告警
+
+## v0.8.4 — 架构优化
+
+- **去除 SSM 健康检查依赖** — 探活从 N 次 SSM/分钟降为 0，SSM 仅用于生命周期操作（launch/stop/backup）
+- **init-host.sh 运行时获取表名** — 通过 CloudFormation output 查询，去掉 CDK placeholder split 复杂度
+- **S3 下载大脚本** — backup-data.sh、host-agent.py 从 S3 下载，解决 userdata 16KB 限制
+- **S3 下载日志精简** — `aws s3 cp --no-progress`
+
+## v0.8.3 — Bug Fixes
+
+- **AgentCore gateway URL 注入** — 修复 `{{AGENTCORE_GATEWAY_URL}}` 始终为 "none" 的问题
+- **`{{ASSETS_BUCKET}}` 替换顺序** — 移到所有 script 注入之后，避免后插入的 placeholder 未替换
+- **`ac_gateway` 未绑定** — 初始化为 None，使用前检查
+- **`cfn_lt` 重复赋值** — 提前到 spot 判断之前
+- **IAM policy 命名** — `ec2_describe_policy` → `ec2_policy`（包含 TerminateInstances）
+
 ## v0.8.2 — AgentCore 深化 + 协作规范
 
 **AgentCore 深化:**

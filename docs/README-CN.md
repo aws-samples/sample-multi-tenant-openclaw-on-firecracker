@@ -1,6 +1,6 @@
 # OpenClaw Pool on EC2 microVM
 
-![Version](https://img.shields.io/badge/version-0.8.2-blue)
+![Version](https://img.shields.io/badge/version-0.8.5-blue)
 
 **[English](../README.md)** | **[中文](README-CN.md)** | **[Changelog](CHANGELOG.md)**
 
@@ -51,9 +51,16 @@ EventBridge: 健康检查 + 空闲回收 + 定时备份
 ```
 
 <details>
-<summary>系统架构图 (详细)</summary>
+<summary>系统架构图</summary>
 
-![部署架构](docs/system_arch.png)
+![系统架构](./oc-system-arch.png)
+
+</details>
+
+<details>
+<summary>部署架构图</summary>
+
+![部署架构](./oc-deploy-arch.png)
 
 </details>
 

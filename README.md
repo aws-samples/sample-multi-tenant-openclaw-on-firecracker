@@ -1,6 +1,6 @@
 # OpenClaw Pool on EC2 microVM
 
-![Version](https://img.shields.io/badge/version-0.8.2-blue)
+![Version](https://img.shields.io/badge/version-0.8.5-blue)
 
 **[English](README.md)** | **[中文](docs/README-CN.md)** | **[Changelog](docs/CHANGELOG.md)**
 

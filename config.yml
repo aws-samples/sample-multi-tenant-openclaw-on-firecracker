@@ -40,7 +40,7 @@ scaler:
 
 # ========== 健康检查 ==========
 health_check:
-  interval_minutes: 1
+  interval_minutes: 5              # Watchdog only; host-agent does real-time health
   max_failures: 3                  # 连续失败次数后自动重启
   app_port: 18789                  # OpenClaw Gateway 端口 (VM 内)
 

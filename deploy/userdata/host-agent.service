@@ -1,0 +1,13 @@
+[Unit]
+Description=Host Agent
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/openclaw/host-agent.py
+Restart=always
+RestartSec=5
+Environment=OC_AGENT_PORT=8899
+Environment=OC_AGENT_POLL_INTERVAL=5
+
+[Install]
+WantedBy=multi-user.target

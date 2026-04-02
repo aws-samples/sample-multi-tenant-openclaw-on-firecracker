@@ -13,6 +13,11 @@ HOST_TAP_IP="{{SUBNET_PREFIX}}.${VM_NUM}.1"
 GUEST_MAC="AA:FC:00:00:00:$(printf '%02x' ${VM_NUM})"
 log() { echo "[oc:launch] $(date +%H:%M:%S) $*"; }
 
+# Write VM metadata for host-agent discovery
+cat > "${VM_DIR}/vm.json" << VMEOF
+{"tenant_id":"${TENANT_ID}","vm_num":${VM_NUM},"guest_ip":"${GUEST_IP}","vcpu":${VCPU},"mem_mb":${MEM_MB}}
+VMEOF
+
 log "START ${TENANT_ID} vm${VM_NUM} ${VCPU}vCPU/${MEM_MB}MB"
 
 # Cleanup previous instance

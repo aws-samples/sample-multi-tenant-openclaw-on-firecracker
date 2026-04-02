@@ -97,6 +97,22 @@ def _probe_all():
     return results
 
 
+def _read_gateway_token(guest_ip):
+    """SSH into VM and read gateway token from openclaw.json."""
+    try:
+        r = subprocess.run(
+            ["sshpass", "-e", "ssh", "-o", "StrictHostKeyChecking=no",
+             f"agent@{guest_ip}", "jq -r .gateway.auth.token .openclaw/openclaw.json"],
+            capture_output=True, text=True, timeout=10,
+            env={**os.environ, "SSHPASS": "OpenCl@w2026"},
+        )
+        token = r.stdout.strip()
+        return token if token and token != "null" else ""
+    except Exception as e:
+        print(f"read token from {guest_ip}: {e}")
+        return ""
+
+
 def _write_ddb(results):
     """Update tenant health in DynamoDB. Promote creating → running when VM is up."""
     if not TENANTS_TABLE or not results:
@@ -106,19 +122,25 @@ def _write_ddb(results):
     for tid, info in results.items():
         try:
             if info["vm_health"] == "up":
-                # Promote creating → running (conditional: only if status is creating)
+                # Promote creating → running + read gateway token
+                token = _read_gateway_token(info["guest_ip"])
+                update_expr = "SET #s = :r, vm_health = :vh, app_health = :ah, health_failures = :z, last_health_check = :t, updated_at = :t"
+                update_vals = {
+                    ":r": "running", ":c": "creating",
+                    ":vh": info["vm_health"], ":ah": info["app_health"],
+                    ":z": 0, ":t": now,
+                }
+                if token:
+                    update_expr += ", gateway_token = :tk"
+                    update_vals[":tk"] = token
                 table.update_item(
                     Key={"id": tid},
-                    UpdateExpression="SET #s = :r, vm_health = :vh, app_health = :ah, health_failures = :z, last_health_check = :t, updated_at = :t",
+                    UpdateExpression=update_expr,
                     ConditionExpression="#s = :c",
                     ExpressionAttributeNames={"#s": "status"},
-                    ExpressionAttributeValues={
-                        ":r": "running", ":c": "creating",
-                        ":vh": info["vm_health"], ":ah": info["app_health"],
-                        ":z": 0, ":t": now,
-                    },
+                    ExpressionAttributeValues=update_vals,
                 )
-                print(f"promoted {tid} creating → running")
+                print(f"promoted {tid} creating → running (token={'yes' if token else 'no'})")
             else:
                 table.update_item(
                     Key={"id": tid},

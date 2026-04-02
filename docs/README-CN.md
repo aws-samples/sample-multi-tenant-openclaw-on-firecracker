@@ -1,6 +1,6 @@
 # OpenClaw Pool on EC2 microVM
 
-![Version](https://img.shields.io/badge/version-0.8.5-blue)
+![Version](https://img.shields.io/badge/version-0.8.6-blue)
 
 **[English](../README.md)** | **[中文](README-CN.md)** | **[Changelog](CHANGELOG.md)**
 
@@ -14,10 +14,10 @@
 - **安全隔离** — 基于 Firecracker microVM 实现租户间隔离，独立内核、独立网络，互不可见
 - **自动调度** — 创建租户时自动选择有空闲资源的宿主机，资源不足时自动扩容
 - **自动缩容** — 空闲宿主机超时后自动回收，节省成本（两轮确认防误杀）
-- **健康检查** — 每分钟探活所有 VM，连续失败自动重启；创建中的 VM 有 3 分钟 grace period 不干扰
+- **健康检查** — 实时 VM 健康监控，状态自动更新
 - **Web 管理控制台** — 可视化管理 Host/Tenant，实时状态展示
 - **Rootfs 预构建** — rootfs + data template 双镜像通过 S3 分发，宿主机启动时自动下载
-- **Dashboard 直达** — 每只租户的 OpenClaw Dashboard 通过 ALB path-based routing + Nginx 反向代理直接访问，支持 WebSocket，多宿主机自动路由
+- **Dashboard 直达** — 一键 HTTPS 访问每个租户的 OpenClaw Dashboard，无需自定义域名
 - **自动备份** — EventBridge 定时备份所有租户数据盘到 S3，支持手动触发和备份查询
 - **AgentCore 集成** — 可选开关，开启后所有 VM 自动连接 AgentCore Gateway（MCP 工具中心）、Memory（托管记忆）、Code Interpreter（安全沙箱）、Browser（云端浏览器）
 - **共享 Skills** — 所有租户共享统一的 Skills（S3 集中管理，自动同步到所有 VM），记忆独立

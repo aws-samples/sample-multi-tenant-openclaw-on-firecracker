@@ -616,18 +616,8 @@ def _gen_id(name):
 
 ## ── ALB path-based routing ──
 
-def _get_https_listener_arn():
-    """Get HTTPS (443) listener ARN, fallback to HTTP listener from env."""
-    if not ALB_LISTENER_ARN:
-        return ""
-    try:
-        alb_arn = ALB_LISTENER_ARN.replace(":listener/", ":loadbalancer/").rsplit("/", 1)[0]
-        resp = elbv2.describe_listeners(LoadBalancerArn=alb_arn)
-        for l in resp["Listeners"]:
-            if l["Port"] == 443:
-                return l["ListenerArn"]
-    except Exception as e:
-        print(f"_get_https_listener_arn error: {e}")
+def _get_listener_arn():
+    """Get ALB listener ARN for path-based routing rules."""
     return ALB_LISTENER_ARN
 
 
@@ -651,7 +641,7 @@ def _ensure_host_tg(instance_id, private_ip):
 
 def _add_alb_rule(tenant_id, tg_arn):
     """Add ALB listener rule for /vm/{tenant_id}*."""
-    arn = _get_https_listener_arn()
+    arn = _get_listener_arn()
     if not arn:
         return
     rules = elbv2.describe_rules(ListenerArn=arn)["Rules"]
@@ -668,7 +658,7 @@ def _add_alb_rule(tenant_id, tg_arn):
 
 def _remove_alb_rule(tenant_id):
     """Remove ALB listener rule for a tenant."""
-    arn = _get_https_listener_arn()
+    arn = _get_listener_arn()
     if not arn:
         return
     rules = elbv2.describe_rules(ListenerArn=arn)["Rules"]
@@ -685,7 +675,7 @@ def _remove_host_tg(instance_id):
     try:
         resp = elbv2.describe_target_groups(Names=[tg_name])
         tg_arn = resp["TargetGroups"][0]["TargetGroupArn"]
-        arn = _get_https_listener_arn()
+        arn = _get_listener_arn()
         if arn:
             rules = elbv2.describe_rules(ListenerArn=arn)["Rules"]
             for r in rules:

@@ -1,6 +1,6 @@
 # OpenClaw Pool on EC2 microVM
 
-![Version](https://img.shields.io/badge/version-0.8.5-blue)
+![Version](https://img.shields.io/badge/version-0.8.6-blue)
 
 **[English](README.md)** | **[中文](docs/README-CN.md)** | **[Changelog](docs/CHANGELOG.md)**
 
@@ -14,10 +14,10 @@ Multi-tenant isolated deployment of OpenClaw AI agents on AWS using Firecracker 
 - **Security Isolation** — Firecracker microVM-based isolation: independent kernel, network, and filesystem per tenant
 - **Auto Scheduling** — Automatically selects a host with available resources; scales out when capacity is insufficient
 - **Auto Scale-in** — Idle hosts are reclaimed after timeout (two-round confirmation to prevent false kills)
-- **Health Checks** — All VMs probed every minute; auto-restart on consecutive failures. Creating VMs get a 10-minute grace period with no SSM commands
+- **Health Checks** — Real-time VM health monitoring with automatic status updates
 - **Web Console** — Visual management of hosts and tenants with real-time status
 - **Rootfs Pre-build** — Rootfs + data template distributed via S3, downloaded on host init
-- **Dashboard Access** — Each tenant's OpenClaw Dashboard accessible at `/vm/{tenant-id}/` via ALB path-based routing + Nginx, supports WebSocket, auto-routes across multiple hosts
+- **Dashboard Access** — One-click HTTPS access to each tenant's OpenClaw Dashboard, no custom domain required
 - **Auto Backup** — EventBridge scheduled backup of all tenant data volumes to S3, with manual trigger and backup query API
 - **AgentCore Integration** — Optional toggle; when enabled, all VMs auto-connect to AgentCore Gateway (MCP tool hub), Memory, Code Interpreter, and Browser
 - **Shared Skills** — All tenants share a unified skill set (S3-managed, auto-synced to all VMs), with independent memory
@@ -152,33 +152,21 @@ Features:
 
 ## Dashboard Access
 
-Each tenant's OpenClaw Dashboard is accessible via ALB + Nginx reverse proxy, no SSM tunnel required:
+Each tenant's OpenClaw Dashboard is accessible via CloudFront + ALB + Nginx reverse proxy:
 
 ```
-https://{your-domain}/vm/{tenant-id}/    → Tenant Dashboard (WebSocket)
+https://{cloudfront-domain}/vm/{tenant-id}/    → Tenant Dashboard (WebSocket)
 ```
 
-**Prerequisite: HTTPS Required**
+HTTPS is provided by CloudFront out of the box — no custom domain or ACM certificate required. The Console's "Open Dashboard" button includes the gateway token for one-click access.
 
-OpenClaw Gateway Dashboard requires a Secure Context (HTTPS) for device pairing:
-
-1. Custom domain + DNS CNAME pointing to ALB
-2. ACM certificate (free, DNS validation)
-
-```bash
-# After ACM certificate is issued and DNS validated:
-./scripts/bind-domain.sh dashboard.example.com arn:aws:acm:ap-northeast-1:xxx:certificate/xxx
-```
-
-The script creates/updates the ALB HTTPS listener and writes `DASHBOARD_URL` to `.env.deploy`.
-
-Traffic flow: `Browser → ALB:443 → Host Nginx:80 → VM Gateway:18789`
+Traffic flow: `Browser → CloudFront:443 → ALB:80 → Host Nginx:80 → VM Gateway:18789`
 
 Nginx config is automatically managed by launch-vm.sh / stop-vm.sh.
 
-## Custom Domain
+## Custom Domain (Optional)
 
-Bind a custom domain + HTTPS to the Dashboard ALB:
+Optionally bind a custom domain + HTTPS directly to the ALB:
 
 ```bash
 # Prerequisites:

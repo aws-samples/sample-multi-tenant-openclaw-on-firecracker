@@ -12,6 +12,8 @@ from aws_cdk import (
     aws_ec2 as ec2,
     aws_autoscaling as autoscaling,
     aws_elasticloadbalancingv2 as elbv2,
+    aws_cloudfront as cloudfront,
+    aws_cloudfront_origins as origins,
     aws_bedrock_agentcore_alpha as agentcore,
     aws_bedrockagentcore as agentcore_l1,
     custom_resources as cr,
@@ -593,7 +595,6 @@ class OpenClawOrchestratorStack(cdk.Stack):
         listener = alb.add_listener("HTTP", port=80,
             default_action=elbv2.ListenerAction.fixed_response(404, content_type="text/plain", message_body="not found"),
         )
-        alb.connections.allow_from_any_ipv4(ec2.Port.tcp(443), "HTTPS inbound")
         alb.connections.allow_to(ec2.Peer.ipv4(vpc.vpc_cidr_block), ec2.Port.tcp(80), "ALB to host Nginx")
         sg.add_ingress_rule(ec2.Peer.security_group_id(alb.connections.security_groups[0].security_group_id),
             ec2.Port.tcp(80), "ALB to Nginx")
@@ -614,6 +615,23 @@ class OpenClawOrchestratorStack(cdk.Stack):
             resources=["*"],
         ))
 
+        # ========== CloudFront (HTTPS without custom domain) ==========
+        cf_distribution = cloudfront.Distribution(self, "DashboardCF",
+            comment="OpenClaw Dashboard",
+            default_behavior=cloudfront.BehaviorOptions(
+                origin=origins.HttpOrigin(alb.load_balancer_dns_name,
+                    protocol_policy=cloudfront.OriginProtocolPolicy.HTTP_ONLY,
+                    http_port=80,
+                    read_timeout=Duration.seconds(60),
+                    keepalive_timeout=Duration.seconds(60),
+                ),
+                viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+                allowed_methods=cloudfront.AllowedMethods.ALLOW_ALL,
+                cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
+                origin_request_policy=cloudfront.OriginRequestPolicy.ALL_VIEWER,
+            ),
+        )
+
         # ========== Outputs ==========
         for key, val in {
             "ApiUrl": api.url,
@@ -622,6 +640,6 @@ class OpenClawOrchestratorStack(cdk.Stack):
             "HostsTable": hosts_table.table_name,
             "AssetsBucket": assets_bucket.bucket_name,
             "HostInstanceProfileArn": instance_profile.attr_arn,
-            "DashboardUrl": f"http://{alb.load_balancer_dns_name}",
+            "DashboardUrl": f"https://{cf_distribution.distribution_domain_name}",
         }.items():
             cdk.CfnOutput(self, key, value=val)

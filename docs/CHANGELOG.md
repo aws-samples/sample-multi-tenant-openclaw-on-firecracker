@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.8.6 — CloudFront + Dashboard Token
+
+- **CloudFront** — ALB 前加 CloudFront，`*.cloudfront.net` 自带 HTTPS，无需自定义域名和 ACM 证书
+- **Gateway Token 自动注入** — host-agent 在 VM 就绪时自动读取 gateway token 写入 DynamoDB
+- **Console 一键访问** — "Open Dashboard" 按钮直接带 token 打开，无需手动输入
+- **自定义域名变为可选** — bind-domain.sh 保留，不再是必需步骤
+
 ## v0.8.5 — Host Agent
 
 - **host-agent daemon** — 宿主机常驻服务，每 5s 探活所有本机 VM（ping + curl），直写 DynamoDB

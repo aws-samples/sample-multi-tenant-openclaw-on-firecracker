@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.9.0 — OverlayFS 共享 Rootfs
+
+- **OverlayFS** — 所有 VM 共享只读 rootfs，每个 VM 仅创建稀疏 overlay 文件（~66MB），省去 6GB rootfs 拷贝
+- **Data 卷稀疏拷贝** — `fallocate --dig-holes` + `cp --sparse=always`，data 卷拷贝从 ~50s 降到秒级
+- **VM 创建加速** — 不再 cp rootfs，创建到 ready 约 20 秒（之前 60+s）
+- **overlay-init** — Firecracker 启动时自动合并 rootfs(lower) + overlay(upper)，tmpfs /tmp
+- **Rootfs v3.0** — 内置 overlay-init 脚本，data 卷挂载改为 /dev/vdc
+
 ## v0.8.7 — Console 在线托管 + Cognito 认证
 
 - **Console S3 托管** — Console 通过 CloudFront `/console/` 路径在线访问，无需本地运行

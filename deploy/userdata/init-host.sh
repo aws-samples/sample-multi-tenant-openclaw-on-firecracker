@@ -123,6 +123,7 @@ aws s3 cp s3://{{ASSETS_BUCKET}}/{{ROOTFS_PREFIX}}/${ROOTFS_KEY} ${ASSETS}/rootf
 aws s3 cp s3://{{ASSETS_BUCKET}}/{{ROOTFS_PREFIX}}/${DATA_KEY} ${ASSETS}/data.gz --region ${REGION} --no-progress
 pigz -dc ${ASSETS}/rootfs.gz > ${ASSETS}/openclaw-rootfs.ext4 && rm -f ${ASSETS}/rootfs.gz
 pigz -dc ${ASSETS}/data.gz > ${ASSETS}/openclaw-data-template.ext4 && rm -f ${ASSETS}/data.gz
+fallocate --dig-holes ${ASSETS}/openclaw-data-template.ext4
 chown -R ubuntu:ubuntu ${ASSETS}
 log "assets downloaded: rootfs=${ROOTFS_VER} ($((SECONDS-T0))s)"
 

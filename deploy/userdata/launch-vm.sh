@@ -25,23 +25,26 @@ pkill -f "api-sock ${SOCK}" 2>/dev/null || true
 sudo ip link del ${TAP} 2>/dev/null || true
 rm -f ${SOCK}; sleep 0.5
 
-# Prepare disks (parallel cp with integrity check)
-log "copying disks..."
+# Prepare disks
+log "preparing disks..."
 T0=$SECONDS
-ROOTFS_TPL="/data/firecracker-assets/openclaw-rootfs.ext4"
+ROOTFS="/data/firecracker-assets/openclaw-rootfs.ext4"
 DATA_TPL="/data/firecracker-assets/openclaw-data-template.ext4"
-ROOTFS_SIZE=$(stat -c%s ${ROOTFS_TPL})
 DATA_SIZE=$(stat -c%s ${DATA_TPL})
-if [ ! -f "${VM_DIR}/rootfs.ext4" ] || [ "$(stat -c%s ${VM_DIR}/rootfs.ext4 2>/dev/null)" != "${ROOTFS_SIZE}" ]; then
-  rm -f ${VM_DIR}/rootfs.ext4
-  cp ${ROOTFS_TPL} ${VM_DIR}/rootfs.ext4 &
+
+# Overlay: sparse file for rootfs copy-on-write (shared read-only rootfs + per-VM writable layer)
+OVERLAY="${VM_DIR}/overlay.ext4"
+if [ ! -f "${OVERLAY}" ]; then
+  truncate -s 2G ${OVERLAY}
+  mkfs.ext4 -q ${OVERLAY}
 fi
+
+# Data volume: first-time cp from template, subsequent launches reuse existing
 DATA_VOL="${VM_DIR}/data.ext4"
 if [ ! -f "${DATA_VOL}" ] || [ "$(stat -c%s ${DATA_VOL} 2>/dev/null)" != "${DATA_SIZE}" ]; then
   rm -f ${DATA_VOL}
-  cp ${DATA_TPL} ${DATA_VOL} &
+  cp --sparse=always ${DATA_TPL} ${DATA_VOL}
 fi
-wait
 log "disks ready ($((SECONDS-T0))s)"
 
 # Inject shared skills into data disk
@@ -98,11 +101,15 @@ sleep 1
 # Configure VM
 curl -s --unix-socket ${SOCK} -X PUT http://localhost/boot-source \
   -H 'Content-Type: application/json' \
-  -d '{"kernel_image_path":"/home/ubuntu/firecracker-assets/vmlinux","boot_args":"console=ttyS0 reboot=k panic=1 pci=off ip='${GUEST_IP}'::'${HOST_TAP_IP}':255.255.255.0::eth0:off"}'
+  -d '{"kernel_image_path":"/home/ubuntu/firecracker-assets/vmlinux","boot_args":"console=ttyS0 reboot=k panic=1 pci=off init=/sbin/overlay-init overlay_root=vdb ip='${GUEST_IP}'::'${HOST_TAP_IP}':255.255.255.0::eth0:off"}'
 
 curl -s --unix-socket ${SOCK} -X PUT http://localhost/drives/rootfs \
   -H 'Content-Type: application/json' \
-  -d '{"drive_id":"rootfs","path_on_host":"'${VM_DIR}'/rootfs.ext4","is_root_device":true,"is_read_only":false}'
+  -d '{"drive_id":"rootfs","path_on_host":"'${ROOTFS}'","is_root_device":true,"is_read_only":true}'
+
+curl -s --unix-socket ${SOCK} -X PUT http://localhost/drives/overlay \
+  -H 'Content-Type: application/json' \
+  -d '{"drive_id":"overlay","path_on_host":"'${OVERLAY}'","is_root_device":false,"is_read_only":false}'
 
 curl -s --unix-socket ${SOCK} -X PUT http://localhost/drives/data \
   -H 'Content-Type: application/json' \

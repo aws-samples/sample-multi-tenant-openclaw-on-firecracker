@@ -261,9 +261,9 @@ def tenant_action(tenant_id, action):
         vm_num = int(item.get("vm_num", 1))
         guest_ip = item.get("guest_ip", "")
         host_port = item.get("host_port", "")
-        # Stop, delete rootfs (force fresh copy), then launch
+        # Stop, delete overlay (force fresh layer), then launch
         stop_cmd = f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num}"
-        reset_cmd = f"rm -f /data/firecracker-vms/{tenant_id}/rootfs.ext4"
+        reset_cmd = f"rm -f /data/firecracker-vms/{tenant_id}/overlay.ext4"
         launch_cmd = f"/home/ubuntu/launch-vm.sh {tenant_id} {vm_num} {item['vcpu']} {item['mem_mb']}"
         dnat_cmd = (
             f"sudo iptables -t nat -A PREROUTING -i $(ip route show default | awk '{{print $5}}' | head -1) "

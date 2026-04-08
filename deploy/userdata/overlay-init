@@ -1,0 +1,41 @@
+#!/bin/sh
+# OverlayFS init for Firecracker microVM
+# Mounts overlay (upper) on top of rootfs (lower), then pivots root and execs real init.
+# Kernel args: init=/sbin/overlay-init overlay_root=vdb (or overlay_root=ram)
+
+pivot() {
+    local rw_root="$1" work_dir="$2"
+    /bin/mount -o noatime,lowerdir=/,upperdir=${rw_root},workdir=${work_dir} \
+        -t overlay "overlayfs:${rw_root}" /mnt
+    pivot_root /mnt /mnt/rom
+}
+
+do_overlay() {
+    if [ "$overlay_root" = ram ] || [ -z "$overlay_root" ]; then
+        /bin/mount -t tmpfs -o noatime,mode=0755 tmpfs /overlay
+    else
+        /bin/mount -t ext4 "/dev/$overlay_root" /overlay
+    fi
+    mkdir -p /overlay/root /overlay/work
+    pivot /overlay/root /overlay/work
+}
+
+# Parse kernel cmdline for overlay_root
+for arg in $(cat /proc/cmdline); do
+    case "$arg" in
+        overlay_root=*) overlay_root="${arg#overlay_root=}" ;;
+    esac
+done
+
+# Ensure mount points exist
+mkdir -p /overlay /mnt
+
+if [ -n "$overlay_root" ] && [ "$overlay_root" != ram ] && [ ! -b "/dev/$overlay_root" ]; then
+    echo "FATAL: overlay_root=$overlay_root but /dev/$overlay_root does not exist"
+    exit 1
+fi
+
+do_overlay
+# Ensure /tmp is writable (lower layer may have stale files)
+/bin/mount -t tmpfs -o noatime,mode=1777 tmpfs /tmp
+exec /sbin/init "$@"

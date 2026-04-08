@@ -1,6 +1,6 @@
 # OpenClaw Pool on EC2 microVM
 
-![Version](https://img.shields.io/badge/version-0.8.7-blue)
+![Version](https://img.shields.io/badge/version-0.9.0-blue)
 
 **[English](../README.md)** | **[中文](README-CN.md)** | **[Changelog](CHANGELOG.md)**
 
@@ -116,8 +116,10 @@ cat > .env.openclaw << 'EOF'
 OPENCLAW_API_KEY=your-bedrock-api-key
 OPENCLAW_BASE_URL=https://bedrock-mantle.us-west-2.api.aws/v1
 OPENCLAW_MODEL_ID=deepseek.v3.2
+OPENCLAW_CONTEXT_WINDOW=131072
 OPENCLAW_TOOLS_PROFILE=coding
 OPENCLAW_DM_SCOPE=per-peer
+OPENCLAW_DISABLE_DEVICE_AUTH=true
 EOF
 
 # 3. 构建并上传 rootfs

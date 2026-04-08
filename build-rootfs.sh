@@ -140,7 +140,7 @@ After=local-fs.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/bash -c "mount /dev/vdb /home/agent && chown agent:agent /home/agent"
+ExecStart=/bin/bash -c "mount /dev/vdc /home/agent && chown agent:agent /home/agent"
 ExecStartPost=/bin/bash -c "test -d /home/agent/.config && echo 'data mounted' || echo 'WARNING: mount failed'"
 [Install]
 WantedBy=multi-user.target
@@ -157,6 +157,7 @@ chown -R agent:agent /usr/lib/node_modules
 source /tmp/.env.openclaw
 OC_BASE_URL="${OPENCLAW_BASE_URL:?OPENCLAW_BASE_URL required}"
 OC_MODEL_ID="${OPENCLAW_MODEL_ID:?OPENCLAW_MODEL_ID required}"
+OC_CONTEXT_WINDOW="${OPENCLAW_CONTEXT_WINDOW:-131072}"
 OC_API_KEY="${OPENCLAW_API_KEY:?OPENCLAW_API_KEY required}"
 OC_TOOLS_PROFILE="${OPENCLAW_TOOLS_PROFILE:-coding}"
 OC_DM_SCOPE="${OPENCLAW_DM_SCOPE:-per-peer}"
@@ -174,6 +175,18 @@ HOME=/home/agent su -s /bin/bash agent -c "openclaw onboard --non-interactive \
 
 HOME=/home/agent su -s /bin/bash agent -c "openclaw config set 'tools.profile' '${OC_TOOLS_PROFILE}'"
 HOME=/home/agent su -s /bin/bash agent -c "openclaw config set 'session.dmScope' '${OC_DM_SCOPE}'"
+
+# Set contextWindow (openclaw onboard defaults to 16000 for custom API)
+OC_CFG="/home/agent/.openclaw/openclaw.json"
+PROVIDER_KEY=$(jq -r '.models.providers | keys[0]' "${OC_CFG}")
+HOME=/home/agent su -s /bin/bash agent -c "openclaw config set 'models.providers.${PROVIDER_KEY}.models[0].contextWindow' '${OC_CONTEXT_WINDOW}'"
+
+# Disable device pairing if configured
+if [ "${OPENCLAW_DISABLE_DEVICE_AUTH:-}" = "true" ]; then
+  HOME=/home/agent su -s /bin/bash agent -c "openclaw config set 'gateway.controlUi.dangerouslyDisableDeviceAuth' 'true'"
+  echo "device auth disabled"
+fi
+
 rm -f /tmp/.env.openclaw
 
 # --- Gateway service file (built into /home/agent, will be in data template) ---
@@ -217,7 +230,16 @@ rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/* /root/.npm /tmp/*
 rm -rf /opt/openclaw-mission-control/.next/cache /opt/openclaw-mission-control/node_modules/.cache
 
 echo "openclaw=$(openclaw --version 2>&1 || echo 'installed')"
+
+# OverlayFS init script (enables shared read-only rootfs across VMs)
+mkdir -p /overlay /mnt
+rm -rf /tmp/*
 CHROOT
+
+# Install overlay-init from deploy/userdata
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+sudo cp "${SCRIPT_DIR}/deploy/userdata/overlay-init" "${ROOTFS_DIR}/sbin/overlay-init"
+sudo chmod +x "${ROOTFS_DIR}/sbin/overlay-init"
 
 # Unmount chroot binds first
 sudo umount -l ${ROOTFS_DIR}/proc ${ROOTFS_DIR}/sys ${ROOTFS_DIR}/dev

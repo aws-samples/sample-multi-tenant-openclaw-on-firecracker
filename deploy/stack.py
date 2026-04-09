@@ -1,4 +1,3 @@
-import json
 import yaml
 import aws_cdk as cdk
 from aws_cdk import (
@@ -208,6 +207,20 @@ class OpenClawOrchestratorStack(cdk.Stack):
             schedule=events.Schedule.rate(Duration.minutes(CFG["health_check"]["interval_minutes"])),
             targets=[targets.LambdaFunction(health_fn)],
         )
+
+        # ========== Skills Lambda ==========
+        skills_fn = _lambda.Function(self, "Skills",
+            function_name="openclaw-skills",
+            runtime=_lambda.Runtime.PYTHON_3_12,
+            handler="handler.lambda_handler",
+            code=_lambda.Code.from_asset("lambda/skills"),
+            timeout=Duration.seconds(30),
+            memory_size=128,
+            environment={"ASSETS_BUCKET": assets_bucket.bucket_name},
+        )
+        assets_bucket.grant_read(skills_fn)
+        skills_resource = api.root.add_resource("skills")
+        skills_resource.add_method("GET", apigw.LambdaIntegration(skills_fn), **key_required)
 
         # ========== Scaler Lambda (idle host reclaim) ==========
         scaler_fn = _lambda.Function(self, "Scaler",

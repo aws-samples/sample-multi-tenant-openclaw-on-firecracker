@@ -493,6 +493,7 @@ def refresh_rootfs():
         f"aws s3 cp s3://{bucket}/{prefix}/{manifest['data_template']} {assets}/data.gz --region {region}",
         f"pigz -dc {assets}/rootfs.gz > {assets}/openclaw-rootfs.ext4 && rm -f {assets}/rootfs.gz",
         f"pigz -dc {assets}/data.gz > {assets}/openclaw-data-template.ext4 && rm -f {assets}/data.gz",
+        f"fallocate --dig-holes {assets}/openclaw-data-template.ext4",
     ]
     try:
         ssm.send_command(

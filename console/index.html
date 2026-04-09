@@ -134,7 +134,7 @@
       <span style="font-size:13px;color:var(--cyan)"><svg class="icon s14" style="vertical-align:-2px"><use href="#i-brain"/></svg> Shared Skills</span>
       <span style="font-size:11px;color:var(--gray)" x-text="'('+skills.length+')'"></span>
       <template x-for="s in skills" :key="s.id">
-        <span style="display:inline-block;margin:4px 4px 0 0;padding:2px 8px;border:1px solid var(--border);border-radius:10px;font-size:11px;color:var(--text)" x-text="s.title"></span>
+        <span style="display:inline-block;margin:4px 4px 0 0;padding:2px 8px;border:1px solid var(--border);border-radius:10px;font-size:11px;color:var(--text)" x-text="s.name" :title="s.description"></span>
       </template>
     </div>
 
@@ -265,8 +265,7 @@ function app() {
       try { this.agentcoreStatus = await this.api('GET', 'agentcore/status'); } catch {}
       // Load skills and tenant models from router API
       try {
-        const base = window.location.origin;
-        const sk = await fetch(base + '/api/skills').then(r=>r.json());
+        const sk = await this.api('GET', 'skills');
         this.skills = sk.skills || [];
         const tm = await fetch(base + '/api/tenants').then(r=>r.json());
         this.tenantModels = {};

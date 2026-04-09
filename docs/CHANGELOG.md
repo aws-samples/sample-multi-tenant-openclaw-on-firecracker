@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.9.1 — Lifecycle Hook 修复 + VM 自动恢复
+
+- **Lifecycle hook 修复** — 从 LifecycleHookSpecificationList 改为独立 CfnLifecycleHook 资源，修复 host 终止后 DDB 记录未清理
+- **VM 自动恢复** — host-agent 检测到 VM 未运行时自动调用 launch-vm.sh 恢复
+- **Delete pending tenant** — 修复删除 pending 状态 tenant 时 500 错误（无 host_id）
+- **refresh_rootfs** — 加 `fallocate --dig-holes` 保持 data template 稀疏
+
 ## v0.9.0 — OverlayFS 共享 Rootfs
 
 - **OverlayFS** — 所有 VM 共享只读 rootfs，每个 VM 仅创建稀疏 overlay 文件（~66MB），省去 6GB rootfs 拷贝

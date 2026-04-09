@@ -47,6 +47,28 @@ def _get_ddb():
     return _ddb
 
 
+_recovering = set()  # Track VMs being recovered to avoid duplicate launches
+
+
+def _recover_vm(tenant_id, cfg):
+    """Launch VM that has vm.json but no running Firecracker process."""
+    if tenant_id in _recovering:
+        return
+    _recovering.add(tenant_id)
+    vm_num = cfg.get("vm_num", 1)
+    vcpu = cfg.get("vcpu", 2)
+    mem_mb = cfg.get("mem_mb", 4096)
+    print(f"recovering {tenant_id} (vm{vm_num} {vcpu}vCPU/{mem_mb}MB)")
+    try:
+        subprocess.Popen(
+            ["bash", "/home/ubuntu/launch-vm.sh", str(tenant_id), str(vm_num), str(vcpu), str(mem_mb)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        print(f"recover {tenant_id} failed: {e}")
+        _recovering.discard(tenant_id)
+
+
 def _probe_all():
     """Probe all local VMs."""
     results = {}
@@ -69,6 +91,24 @@ def _probe_all():
             continue
         if not guest_ip:
             continue
+
+        # Skip intentionally stopped VMs
+        stopped_marker = os.path.join(vm_path, ".stopped")
+        if os.path.exists(stopped_marker):
+            continue
+
+        # Auto-recover: vm.json exists but Firecracker not running
+        sock_file = os.path.join(vm_path, "fc.sock")
+        fc_running = subprocess.run(
+            ["pgrep", "-f", f"api-sock {sock_file}"],
+            capture_output=True).returncode == 0
+
+        if not fc_running:
+            _recover_vm(tenant_id, cfg)
+            results[tenant_id] = {"vm_health": "recovering", "app_health": "down", "guest_ip": guest_ip}
+            continue
+
+        _recovering.discard(tenant_id)
 
         vm_health = "down"
         app_health = "down"

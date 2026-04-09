@@ -6,6 +6,7 @@ VCPU="${3:-2}"
 MEM_MB="${4:-4096}"
 VM_DIR="/data/firecracker-vms/${TENANT_ID}"
 mkdir -p ${VM_DIR}
+rm -f ${VM_DIR}/.stopped
 SOCK="${VM_DIR}/fc.sock"
 TAP="tap-vm${VM_NUM}"
 GUEST_IP="{{SUBNET_PREFIX}}.${VM_NUM}.2"
@@ -41,9 +42,11 @@ fi
 
 # Data volume: first-time cp from template, subsequent launches reuse existing
 DATA_VOL="${VM_DIR}/data.ext4"
+NEW_DATA=false
 if [ ! -f "${DATA_VOL}" ] || [ "$(stat -c%s ${DATA_VOL} 2>/dev/null)" != "${DATA_SIZE}" ]; then
   rm -f ${DATA_VOL}
   cp --sparse=always ${DATA_TPL} ${DATA_VOL}
+  NEW_DATA=true
 fi
 log "disks ready ($((SECONDS-T0))s)"
 
@@ -63,9 +66,16 @@ fi
 # Allow dashboard access from any origin (token auth is the security layer)
 OC_JSON="${MOUNT_TMP}/.openclaw/openclaw.json"
 if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
-  jq '.gateway.controlUi.allowedOrigins = ["*"]' "${OC_JSON}" > "${OC_JSON}.tmp" && mv "${OC_JSON}.tmp" "${OC_JSON}"
+  if [ "$NEW_DATA" = "true" ]; then
+    # First-time: generate unique gateway token (template token is shared)
+    NEW_TOKEN=$(openssl rand -hex 24)
+    jq --arg t "$NEW_TOKEN" '.gateway.auth.token = $t | .gateway.controlUi.allowedOrigins = ["*"]' "${OC_JSON}" > "${OC_JSON}.tmp" && mv "${OC_JSON}.tmp" "${OC_JSON}"
+    log "gateway token generated + allowedOrigins set"
+  else
+    jq '.gateway.controlUi.allowedOrigins = ["*"]' "${OC_JSON}" > "${OC_JSON}.tmp" && mv "${OC_JSON}.tmp" "${OC_JSON}"
+    log "gateway allowedOrigins set to *"
+  fi
   sudo chown 1000:1000 "${OC_JSON}"
-  log "gateway allowedOrigins set to *"
   # AgentCore Gateway MCP injection (if configured)
   if [ -f /data/agentcore.env ]; then
     source /data/agentcore.env

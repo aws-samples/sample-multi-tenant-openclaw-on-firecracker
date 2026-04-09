@@ -468,21 +468,21 @@ class OpenClawOrchestratorStack(cdk.Stack):
         cfn_asg = asg.node.default_child
         cfn_asg.add_property_override("LaunchTemplate.Version",
             nested_virt.get_response_field("LaunchTemplateVersion.VersionNumber"))
-        # Embed lifecycle hooks directly in ASG to avoid circular dependency
-        cfn_asg.add_property_override("LifecycleHookSpecificationList", [
-            {
-                "LifecycleHookName": "openclaw-host-init",
-                "LifecycleTransition": "autoscaling:EC2_INSTANCE_LAUNCHING",
-                "HeartbeatTimeout": CFG["asg"]["lifecycle_hook_timeout"],
-                "DefaultResult": "ABANDON",
-            },
-            {
-                "LifecycleHookName": "openclaw-host-terminate",
-                "LifecycleTransition": "autoscaling:EC2_INSTANCE_TERMINATING",
-                "HeartbeatTimeout": 120,
-                "DefaultResult": "CONTINUE",
-            },
-        ])
+        # Lifecycle hooks (standalone resources, not inline LifecycleHookSpecificationList)
+        autoscaling.CfnLifecycleHook(self, "InitHook",
+            auto_scaling_group_name=asg.auto_scaling_group_name,
+            lifecycle_hook_name="openclaw-host-init",
+            lifecycle_transition="autoscaling:EC2_INSTANCE_LAUNCHING",
+            heartbeat_timeout=CFG["asg"]["lifecycle_hook_timeout"],
+            default_result="ABANDON",
+        )
+        autoscaling.CfnLifecycleHook(self, "TerminateHook",
+            auto_scaling_group_name=asg.auto_scaling_group_name,
+            lifecycle_hook_name="openclaw-host-terminate",
+            lifecycle_transition="autoscaling:EC2_INSTANCE_TERMINATING",
+            heartbeat_timeout=120,
+            default_result="CONTINUE",
+        )
 
         # When a new host completes init → process pending tenants
         events.Rule(self, "HostReadyRule",

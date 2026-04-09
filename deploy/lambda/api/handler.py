@@ -163,40 +163,43 @@ def delete_tenant(tenant_id, query_params):
         return _resp(404, {"error": "tenant not found"})
 
     keep_data = query_params.get("keep_data", "true").lower() == "true"
+    host_id = item.get("host_id")
 
-    # Stop VM via SSM
-    vm_num = int(item.get("vm_num", 1))
-    _ssm_run(item["host_id"], f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num}")
+    if host_id:
+        # Stop VM via SSM
+        vm_num = int(item.get("vm_num", 1))
+        _ssm_run(host_id, f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num}")
+        # Remove vm.json so host-agent won't try to recover
+        _ssm_run(host_id, f"rm -f /data/firecracker-vms/{tenant_id}/vm.json")
 
     # Remove ALB rule
     _remove_alb_rule(tenant_id)
 
-    # Remove DNAT rule (best effort)
-    _ssm_run(item["host_id"],
-        f"sudo iptables -t nat -D PREROUTING -i $(ip route show default | awk '{{print $5}}' | head -1) -p tcp --dport {item['host_port']} -j DNAT --to-destination {item['guest_ip']}:{VM_PORT_BASE} 2>/dev/null || true"
-    )
-
-    if not keep_data:
-        _ssm_run(item["host_id"],
-            f"rm -rf /data/firecracker-vms/{tenant_id}"
+    if host_id:
+        # Remove DNAT rule (best effort)
+        _ssm_run(host_id,
+            f"sudo iptables -t nat -D PREROUTING -i $(ip route show default | awk '{{print $5}}' | head -1) -p tcp --dport {item.get('host_port',0)} -j DNAT --to-destination {item.get('guest_ip','')}:{VM_PORT_BASE} 2>/dev/null || true"
         )
 
-    # Update host counters
-    host_resp = hosts_table.update_item(
-        Key={"instance_id": item["host_id"]},
-        UpdateExpression="SET used_vcpu = used_vcpu - :v, used_mem_mb = used_mem_mb - :m, vm_count = vm_count - :one",
-        ExpressionAttributeValues={
-            ":v": item["vcpu"], ":m": item["mem_mb"], ":one": 1,
-        },
-        ReturnValues="ALL_NEW",
-    )
-    # Record idle_since when host becomes empty
-    if int(host_resp["Attributes"].get("vm_count", 0)) == 0:
-        hosts_table.update_item(
-            Key={"instance_id": item["host_id"]},
-            UpdateExpression="SET idle_since = :t",
-            ExpressionAttributeValues={":t": _now()},
+        if not keep_data:
+            _ssm_run(host_id, f"rm -rf /data/firecracker-vms/{tenant_id}")
+
+        # Update host counters
+        host_resp = hosts_table.update_item(
+            Key={"instance_id": host_id},
+            UpdateExpression="SET used_vcpu = used_vcpu - :v, used_mem_mb = used_mem_mb - :m, vm_count = vm_count - :one",
+            ExpressionAttributeValues={
+                ":v": item["vcpu"], ":m": item["mem_mb"], ":one": 1,
+            },
+            ReturnValues="ALL_NEW",
         )
+        # Record idle_since when host becomes empty
+        if int(host_resp["Attributes"].get("vm_count", 0)) == 0:
+            hosts_table.update_item(
+                Key={"instance_id": host_id},
+                UpdateExpression="SET idle_since = :t",
+                ExpressionAttributeValues={":t": _now()},
+            )
 
     tenants_table.update_item(
         Key={"id": tenant_id},

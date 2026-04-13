@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>OpenClaw Management Console</title>
+<title>OpenClaw Pool Management Console</title>
 <link rel="stylesheet" href="style.css">
 <script src="config.js"></script>
 <script>
@@ -54,180 +54,260 @@
   <symbol id="i-play" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
   <symbol id="i-rotate-ccw" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></symbol>
   <symbol id="i-trash" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></symbol>
-  <symbol id="i-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+  <symbol id="i-delete" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
   <symbol id="i-zap" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
   <symbol id="i-link" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-eye-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></symbol>
 </svg>
 
 <!-- Header -->
 <div class="header">
-  <h1>OpenClaw Management Console</h1>
+  <h1>OpenClaw Pool Management Console</h1>
   <span class="status-dot" :class="connected ? 'ok' : 'err'"></span>
   <span class="status-label" x-text="connected ? 'Connected' : 'Disconnected'"></span>
-  <button class="btn btn-outline" @click="refresh()" :disabled="loadingHosts||loadingTenants">
-    Refresh <span :class="(loadingHosts||loadingTenants) && 'spin'"><svg class="icon s13"><use href="#i-refresh"/></svg></span>
-  </button>
-  <input type="text" x-model="apiUrl" @change="saveSettings(); refresh()" placeholder="https://api.example.com/v1/">
-  <input type="password" x-model="apiKey" @change="saveSettings(); refresh()" placeholder="🔒 API Key" style="width:200px">
 </div>
 
-<!-- Main -->
-<div class="main">
+<!-- Nav Tabs -->
+<div class="nav-tabs">
+  <button class="nav-tab" :class="page==='tenants' && 'active'" @click="page='tenants'">Tenants</button>
+  <button class="nav-tab" :class="page==='app' && 'active'" @click="page='app'">Application</button>
+  <button class="nav-tab" :class="page==='settings' && 'active'" @click="page='settings'">Settings</button>
+</div>
 
-  <!-- Hosts -->
-  <div class="hosts-panel">
-    <div class="panel-header">
-      <span class="panel-title">Hosts (Group)</span>
-    </div>
-    <div style="display:flex;align-items:center;gap:8px;padding:0 4px 6px;font-size:12px">
-      <span style="color:var(--gray)" x-text="'Latest rootfs: '+(rootfsVersion||'…')"></span>
-      <button class="btn-act" title="Pull latest rootfs to all hosts" @click="refreshRootfs()"><svg class="icon s13"><use href="#i-download"/></svg></button>
-    </div>
-    <template x-if="hosts.length === 0 && !loadingHosts">
-      <div class="empty">No hosts</div>
-    </template>
-    <template x-for="h in hosts" :key="h.instance_id">
-      <div class="host-card" :class="selectedHost === h.instance_id && 'selected'"
-           @click="selectedHost = selectedHost === h.instance_id ? null : h.instance_id">
-        <div class="host-top">
-          <span class="host-id" x-text="h.instance_id"></span>
-          <span class="badge" :class="h.status==='active' ? 'badge-active' : 'badge-inactive'" x-text="h.status"></span>
-        </div>
-        <div class="host-row">
-          <span class="host-label">CPU<span class="overcommit-badge" x-show="(h.cpu_overcommit_ratio||1) > 1" x-text="' (×'+(h.cpu_overcommit_ratio||1)+')'"></span></span>
-          <div class="bar-bg" style="position:relative">
-            <div class="bar-fill" :class="cpuBarClass(h)" :style="'width:'+cpuPct(h)+'%'"></div>
-            <template x-if="(h.cpu_overcommit_ratio||1) > 1">
-              <div class="bar-physical-mark" :style="'left:'+(100/(h.cpu_overcommit_ratio||1))+'%'"></div>
-            </template>
+<!-- Page: Tenants (main) -->
+<div x-show="page==='tenants'" class="page-content">
+  <h2>🖥 Tenants Management</h2>
+  <div class="flex-layout">
+
+    <!-- Hosts -->
+    <div class="hosts-panel">
+      <div class="panel-header">
+        <span class="panel-title">Hosts (Group)</span>
+        <button class="btn btn-outline" style="margin-left:auto;font-size:12px;padding:4px 10px" @click="refresh()" :disabled="loadingHosts||loadingTenants">
+          Refresh <span :class="(loadingHosts||loadingTenants) && 'spin'"><svg class="icon s13"><use href="#i-refresh"/></svg></span>
+        </button>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;padding:0 4px 6px;font-size:12px">
+        <span style="color:var(--gray)" x-text="'Latest rootfs: '+(rootfsVersion||'…')"></span>
+        <button class="btn-act" title="Pull latest rootfs to all hosts" @click="refreshRootfs()"><svg class="icon s13"><use href="#i-download"/></svg></button>
+      </div>
+      <template x-if="hosts.length === 0 && !loadingHosts">
+        <div class="empty">No hosts</div>
+      </template>
+      <template x-for="h in hosts" :key="h.instance_id">
+        <div class="host-card" :class="selectedHost === h.instance_id && 'selected'"
+            @click="selectedHost = selectedHost === h.instance_id ? null : h.instance_id">
+          <div class="host-top">
+            <span class="host-id" x-text="h.instance_id"></span>
+            <span class="badge" :class="h.status==='active' ? 'badge-active' : 'badge-inactive'" x-text="h.status"></span>
           </div>
-          <span class="host-val" x-text="h.used_vcpu+'/'+h.total_vcpu"></span>
+          <div class="host-row">
+            <span class="host-label">CPU<span class="overcommit-badge" x-show="(h.cpu_overcommit_ratio||1) > 1" x-text="' (×'+(h.cpu_overcommit_ratio||1)+')'"></span></span>
+            <div class="bar-bg" style="position:relative">
+              <div class="bar-fill" :class="cpuBarClass(h)" :style="'width:'+cpuPct(h)+'%'"></div>
+              <template x-if="(h.cpu_overcommit_ratio||1) > 1">
+                <div class="bar-physical-mark" :style="'left:'+(100/(h.cpu_overcommit_ratio||1))+'%'"></div>
+              </template>
+            </div>
+            <span class="host-val" x-text="h.used_vcpu+'/'+h.total_vcpu"></span>
+          </div>
+          <div class="host-row">
+            <span class="host-label">Mem(GB)</span>
+            <div class="bar-bg"><div class="bar-fill bar-mem" :style="'width:'+memPct(h)+'%'"></div></div>
+            <span class="host-val" x-text="(h.used_mem_mb/1024).toFixed(1)+'/'+(h.total_mem_mb/1024).toFixed(1)"></span>
+          </div>
+          <div class="host-row">
+            <span class="host-label">VM</span>
+            <span style="color:#fff" x-text="h.vm_count"></span>
+            <span style="margin-left:auto;font-size:11px;color:var(--gray)" x-text="h.rootfs_version||''"></span>
+          </div>
         </div>
-        <div class="host-row">
-          <span class="host-label">Mem(GB)</span>
-          <div class="bar-bg"><div class="bar-fill bar-mem" :style="'width:'+memPct(h)+'%'"></div></div>
-          <span class="host-val" x-text="(h.used_mem_mb/1024).toFixed(1)+'/'+(h.total_mem_mb/1024).toFixed(1)"></span>
-        </div>
-        <div class="host-row">
-          <span class="host-label">VM</span>
-          <span style="color:#fff" x-text="h.vm_count"></span>
-          <span style="margin-left:auto;font-size:11px;color:var(--gray)" x-text="h.rootfs_version||''"></span>
-        </div>
-      </div>
-    </template>
-  </div>
-
-  <!-- Tenants -->
-  <div class="tenants-panel">
-
-    <!-- AgentCore status mini-panel -->
-    <template x-if="agentcoreStatus.enabled">
-      <div style="margin-bottom:12px;padding:8px 12px;border:1px solid #0f83;border-radius:6px;background:var(--panel)">
-        <span style="font-size:13px;color:var(--green)">⚡ AgentCore</span>
-        <span style="font-size:11px;color:var(--gray)">enabled</span>
-        <a :href="'https://'+agentcoreRegion+'.console.aws.amazon.com/cloudwatch/home?region='+agentcoreRegion+'#dashboards'" target="_blank" style="font-size:11px;color:var(--cyan);margin-left:8px">📊 CloudWatch</a>
-      </div>
-    </template>
-
-    <!-- Skills mini-panel -->
-    <div style="margin-bottom:12px;padding:8px 12px;border:1px solid var(--border);border-radius:6px;background:var(--panel)">
-      <span style="font-size:13px;color:var(--cyan)"><svg class="icon s14" style="vertical-align:-2px"><use href="#i-brain"/></svg> Shared Skills</span>
-      <span style="font-size:11px;color:var(--gray)" x-text="'('+skills.length+')'"></span>
-      <template x-for="s in skills" :key="s.id">
-        <span style="display:inline-block;margin:4px 4px 0 0;padding:2px 8px;border:1px solid var(--border);border-radius:10px;font-size:11px;color:var(--text)" x-text="s.name" :title="s.description"></span>
       </template>
     </div>
 
-    <div class="panel-header">
-      <span class="panel-title">Tenants <template x-if="selectedHost"><span style="font-size:12px;color:var(--cyan-dim)">— <span x-text="selectedHost"></span> <button class="btn-icon" @click="selectedHost=null" style="font-size:12px"><svg class="icon s12"><use href="#i-x"/></svg></button></span></template></span>
-      <div style="display:flex;gap:10px;align-items:center">
-        <button class="btn btn-cyan" @click="showModal=true">New Tenant</button>
+    <!-- Tenants -->
+    <div class="tenants-panel">
+
+      <!-- AgentCore status mini-panel -->
+      <template x-if="agentcoreStatus.enabled">
+        <div style="margin-bottom:12px;padding:8px 12px;border:1px solid #0f83;border-radius:6px;background:var(--panel)">
+          <span style="font-size:13px;color:var(--green)">⚡ AgentCore</span>
+          <span style="font-size:11px;color:var(--gray)">enabled</span>
+          <a :href="'https://'+agentcoreRegion+'.console.aws.amazon.com/cloudwatch/home?region='+agentcoreRegion+'#dashboards'" target="_blank" style="font-size:11px;color:var(--cyan);margin-left:8px">📊 CloudWatch</a>
+        </div>
+      </template>
+
+      <!-- Skills mini-panel -->
+      <div style="margin-bottom:12px;padding:8px 12px;border:1px solid var(--border);border-radius:6px;background:var(--panel)">
+        <span style="font-size:13px;color:var(--cyan)"><svg class="icon s14" style="vertical-align:-2px"><use href="#i-brain"/></svg> Shared Skills</span>
+        <span style="font-size:11px;color:var(--gray)" x-text="'('+skills.length+')'"></span>
+        <template x-for="s in skills" :key="s.id">
+          <span style="display:inline-block;margin:4px 4px 0 0;padding:2px 8px;border:1px solid var(--border);border-radius:10px;font-size:11px;color:var(--text)" x-text="s.name" :title="s.description"></span>
+        </template>
+      </div>
+
+      <div class="panel-header">
+        <span class="panel-title">Tenants <template x-if="selectedHost"><span style="font-size:12px;color:var(--cyan-dim)">— <span x-text="selectedHost"></span> <button class="btn-icon" @click="selectedHost=null" style="font-size:12px"><svg class="icon s12"><use href="#i-delete"/></svg></button></span></template></span>
+        <div style="display:flex;gap:10px;align-items:center">
+          <button class="btn btn-cyan" @click="showModal=true">New Tenant</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th><th>Name</th><th>Status</th><th>vCPU</th><th>Mem (MB)</th><th>Guest IP</th>
+              <th>Port</th><th>Host ID</th><th>Rootfs</th><th>Model</th><th>VM Health</th><th>Gateway</th><th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <template x-if="filteredTenants.length === 0 && !loadingTenants">
+              <tr><td colspan="11" class="empty">No tenants</td></tr>
+            </template>
+            <template x-for="t in filteredTenants" :key="t.id">
+              <tr>
+                <td x-text="t.id"></td>
+                <td x-text="t.name || '-'"></td>
+                <td><span class="badge" :class="'badge-'+t.status" x-text="t.status"></span></td>
+                <td x-text="t.vcpu"></td>
+                <td x-text="t.mem_mb"></td>
+                <td x-text="t.guest_ip || '-'"></td>
+                <td x-text="t.host_port || '-'"></td>
+                <td x-text="(t.host_id||'').substring(0,12)+'…'"></td>
+                <td style="font-size:11px;color:var(--gray)" x-text="t.rootfs_version||'-'"></td>
+                <td style="font-size:11px;color:var(--cyan-dim)" x-text="tenantModels[t.id]||'-'"></td>
+                <td><span class="health-dot" :class="healthClass(t.vm_health)"></span></td>
+                <td><span class="health-dot" :class="healthClass(t.app_health)"></span></td>
+                <td>
+                  <div class="act-group">
+                    <button class="btn-act" title="oc-connect.sh command" @click="copyCmd('./scripts/oc-connect.sh '+t.id)"><svg class="icon s13"><use href="#i-terminal"/></svg></button>
+                    <button class="btn-act" title="oc-dashboard.sh command" @click="copyCmd('./scripts/oc-dashboard.sh '+t.id)"><svg class="icon s13"><use href="#i-dashboard"/></svg></button>
+                    <template x-if="t.status==='running'">
+                      <a class="btn-act" :href="(window.OC_DASHBOARD_BASE||'')+'/vm/'+t.id+'/'+(t.gateway_token?'?token='+t.gateway_token:'')" target="_blank" title="Open Dashboard"><svg class="icon s13"><use href="#i-globe"/></svg></a>
+                    </template>
+                    <template x-if="t.status==='running'">
+                      <span>
+                        <button class="btn-act" title="Pause" @click="tenantAction(t.id,'pause')"><svg class="icon s13"><use href="#i-pause"/></svg></button>
+                        <button class="btn-act" title="Stop" @click="tenantAction(t.id,'stop')"><svg class="icon s13"><use href="#i-power"/></svg></button>
+                        <button class="btn-act" title="Restart" @click="tenantAction(t.id,'restart')"><svg class="icon s13"><use href="#i-zap"/></svg></button>
+                      </span>
+                    </template>
+                    <template x-if="t.status==='stopped'">
+                      <span>
+                        <button class="btn-act" title="Start" @click="tenantAction(t.id,'start')"><svg class="icon s13"><use href="#i-play"/></svg></button>
+                        <button class="btn-act" title="Reset rootfs" @click="tenantAction(t.id,'reset')"><svg class="icon s13"><use href="#i-rotate-ccw"/></svg></button>
+                      </span>
+                    </template>
+                    <template x-if="t.status==='paused'">
+                      <button class="btn-act" title="Resume" @click="tenantAction(t.id,'resume')"><svg class="icon s13"><use href="#i-play"/></svg></button>
+                    </template>
+                    <button class="btn-del" @click="deleteTenant(t.id)"><svg class="icon s13"><use href="#i-trash"/></svg></button>
+                  </div>
+                </td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
       </div>
     </div>
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>ID</th><th>Name</th><th>Status</th><th>vCPU</th><th>Mem (MB)</th><th>Guest IP</th>
-            <th>Port</th><th>Host ID</th><th>Rootfs</th><th>Model</th><th>VM Health</th><th>Gateway</th><th>Actions</th>
-          </tr>
-        </thead>
-        <tbody>
-          <template x-if="filteredTenants.length === 0 && !loadingTenants">
-            <tr><td colspan="11" class="empty">No tenants</td></tr>
-          </template>
-          <template x-for="t in filteredTenants" :key="t.id">
-            <tr>
-              <td x-text="t.id"></td>
-              <td x-text="t.name || '-'"></td>
-              <td><span class="badge" :class="'badge-'+t.status" x-text="t.status"></span></td>
-              <td x-text="t.vcpu"></td>
-              <td x-text="t.mem_mb"></td>
-              <td x-text="t.guest_ip || '-'"></td>
-              <td x-text="t.host_port || '-'"></td>
-              <td x-text="(t.host_id||'').substring(0,12)+'…'"></td>
-              <td style="font-size:11px;color:var(--gray)" x-text="t.rootfs_version||'-'"></td>
-              <td style="font-size:11px;color:var(--cyan-dim)" x-text="tenantModels[t.id]||'-'"></td>
-              <td><span class="health-dot" :class="healthClass(t.vm_health)"></span></td>
-              <td><span class="health-dot" :class="healthClass(t.app_health)"></span></td>
-              <td>
-                <div class="act-group">
-                  <button class="btn-act" title="oc-connect.sh command" @click="copyCmd('./scripts/oc-connect.sh '+t.id)"><svg class="icon s13"><use href="#i-terminal"/></svg></button>
-                  <button class="btn-act" title="oc-dashboard.sh command" @click="copyCmd('./scripts/oc-dashboard.sh '+t.id)"><svg class="icon s13"><use href="#i-dashboard"/></svg></button>
-                  <template x-if="t.status==='running'">
-                    <a class="btn-act" :href="(window.OC_DASHBOARD_BASE||'')+'/vm/'+t.id+'/'+(t.gateway_token?'?token='+t.gateway_token:'')" target="_blank" title="Open Dashboard"><svg class="icon s13"><use href="#i-globe"/></svg></a>
-                  </template>
-                  <template x-if="t.status==='running'">
-                    <span>
-                      <button class="btn-act" title="Pause" @click="tenantAction(t.id,'pause')"><svg class="icon s13"><use href="#i-pause"/></svg></button>
-                      <button class="btn-act" title="Stop" @click="tenantAction(t.id,'stop')"><svg class="icon s13"><use href="#i-power"/></svg></button>
-                      <button class="btn-act" title="Restart" @click="tenantAction(t.id,'restart')"><svg class="icon s13"><use href="#i-zap"/></svg></button>
-                    </span>
-                  </template>
-                  <template x-if="t.status==='stopped'">
-                    <span>
-                      <button class="btn-act" title="Start" @click="tenantAction(t.id,'start')"><svg class="icon s13"><use href="#i-play"/></svg></button>
-                      <button class="btn-act" title="Reset rootfs" @click="tenantAction(t.id,'reset')"><svg class="icon s13"><use href="#i-rotate-ccw"/></svg></button>
-                    </span>
-                  </template>
-                  <template x-if="t.status==='paused'">
-                    <button class="btn-act" title="Resume" @click="tenantAction(t.id,'resume')"><svg class="icon s13"><use href="#i-play"/></svg></button>
-                  </template>
-                  <button class="btn-del" @click="deleteTenant(t.id)"><svg class="icon s13"><use href="#i-trash"/></svg></button>
-                </div>
-              </td>
-            </tr>
-          </template>
-        </tbody>
-      </table>
+  </div><!-- /flex-layout -->
+
+  <!-- Create Tenant Modal -->
+  <template x-if="showModal">
+    <div class="overlay" @click.self="showModal=false">
+      <div class="modal">
+        <button class="close-btn" @click="showModal=false"><svg class="icon s16"><use href="#i-delete"/></svg></button>
+        <h2>New Tenant</h2>
+        <label>Name <span class="req">*</span></label>
+        <input type="text" x-model="form.name" placeholder="e.g. my-tenant" @keydown.enter="createTenant()">
+        <label>vCPU <span class="opt">optional</span></label>
+        <input type="number" x-model.number="form.vcpu" placeholder="2">
+        <label>Memory (MB) <span class="opt">optional</span></label>
+        <input type="number" x-model.number="form.memory_mb" placeholder="4096">
+        <div class="modal-actions">
+          <button class="btn btn-cyan" @click="showModal=false">Cancel</button>
+          <button class="btn btn-create" @click="createTenant()" :disabled="!form.name">Create</button>
+        </div>
+      </div>
     </div>
+  </template>
+</div><!-- /page:tenants -->
+
+<!-- Page: App Config -->
+<div x-show="page==='app'" class="page-content">
+  <h2>⚙ Claw Configuration</h2>
+
+  <!-- Skills -->
+  <div class="section-card">
+    <h3>Shared Skills</h3>
+    <p style="color:var(--gray);font-size:13px">Skills are shared across all tenants. Managed in S3 and synced to VMs automatically.</p>
+    <div style="margin-top:8px">
+      <template x-for="s in skills" :key="s.id">
+        <div class="config-item">
+          <span class="config-name" x-text="s.name"></span>
+          <span class="config-desc" x-text="s.description"></span>
+        </div>
+      </template>
+      <div x-show="skills.length===0" style="color:var(--gray);font-size:12px">No skills configured</div>
+    </div>
+  </div>
+
+  <!-- Config Templates (placeholder) -->
+  <div class="section-card">
+    <h3>Config Templates</h3>
+    <p style="color:var(--gray);font-size:13px">OpenClaw configuration templates for different LLM providers and models. Coming soon.</p>
   </div>
 </div>
 
-<!-- Create Tenant Modal -->
-<template x-if="showModal">
-  <div class="overlay" @click.self="showModal=false">
-    <div class="modal">
-      <button class="close-btn" @click="showModal=false"><svg class="icon s16"><use href="#i-x"/></svg></button>
-      <h2>New Tenant</h2>
-      <label>Name <span class="req">*</span></label>
-      <input type="text" x-model="form.name" placeholder="e.g. my-tenant" @keydown.enter="createTenant()">
-      <label>vCPU <span class="opt">optional</span></label>
-      <input type="number" x-model.number="form.vcpu" placeholder="2">
-      <label>Memory (MB) <span class="opt">optional</span></label>
-      <input type="number" x-model.number="form.memory_mb" placeholder="4096">
-      <div class="modal-actions">
-        <button class="btn btn-cyan" @click="showModal=false">Cancel</button>
-        <button class="btn btn-create" @click="createTenant()" :disabled="!form.name">Create</button>
+<!-- Page: Settings -->
+<div x-show="page==='settings'" class="page-content">
+  <h2>🔧 Settings</h2>
+
+  <!-- API Connection -->
+  <div class="section-card">
+    <h3>API Connection</h3>
+    <div style="display:flex;flex-direction:column;gap:8px;max-width:680px">
+      <label style="font-size:12px;color:var(--gray)">API URL</label>
+      <input class="settings-input" type="text" x-model="apiUrl" placeholder="https://api.example.com/v1/">
+      <label style="font-size:12px;color:var(--gray)">API Key</label>
+      <div style="position:relative">
+        <input class="settings-input" :type="showApiKey ? 'text' : 'password'" x-model="apiKey" placeholder="API Key" style="width:100%;padding-right:36px">
+        <button class="btn-toggle-pw" @click="showApiKey = !showApiKey" title="Toggle visibility"><svg class="icon s14"><use :href="showApiKey ? '#i-eye-off' : '#i-eye'"/></svg></button>
       </div>
+      <button class="btn btn-cyan" style="align-self:flex-start;margin-top:4px" @click="saving=true; saveSettings(); refresh().then(()=>{saving=false; toast='Settings saved ✓'; setTimeout(()=>toast='',2000)})" :disabled="saving">
+        <span x-text="saving ? 'Connecting...' : 'Save & Connect'"></span>
+      </button>
     </div>
   </div>
-</template>
+
+  <!-- AgentCore -->
+  <div class="section-card" x-show="agentcoreStatus">
+    <h3>AgentCore</h3>
+    <div style="font-size:13px">
+      <span>Status: </span><span :class="agentcoreStatus.enabled ? 'text-green' : 'text-gray'" x-text="agentcoreStatus.enabled ? 'Enabled' : 'Disabled'"></span>
+      <template x-if="agentcoreStatus.gateway_url">
+        <div style="margin-top:4px;color:var(--gray)">Gateway: <span x-text="agentcoreStatus.gateway_url" style="font-size:11px"></span></div>
+      </template>
+    </div>
+  </div>
+
+  <!-- System Info -->
+  <div class="section-card">
+    <h3>System</h3>
+    <div style="font-size:13px;color:var(--gray)">
+      <div>Dashboard: <span x-text="window.OC_DASHBOARD_BASE || '-'"></span></div>
+    </div>
+  </div>
+</div>
 
 <script>
 function app() {
   return {
     apiUrl: '', apiKey: '', connected: false, toast: '',
+    page: 'tenants',
+    showApiKey: false,
+    saving: false,
     hosts: [], tenants: [], selectedHost: null, rootfsVersion: '',
     loadingHosts: false, loadingTenants: false,
     showModal: false,

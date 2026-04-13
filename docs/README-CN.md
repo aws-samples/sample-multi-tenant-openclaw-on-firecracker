@@ -1,6 +1,6 @@
-# OpenClaw Pool on EC2 microVM
+# OpenClaw Pool on EC2 Firecracker
 
-![Version](https://img.shields.io/badge/version-0.9.0-blue)
+![Version](https://img.shields.io/badge/version-0.9.3-blue)
 
 **[English](../README.md)** | **[中文](README-CN.md)** | **[Changelog](CHANGELOG.md)**
 
@@ -21,6 +21,7 @@
 - **自动备份** — EventBridge 定时备份所有租户数据盘到 S3，支持手动触发和备份查询
 - **AgentCore 集成** — 可选开关，开启后所有 VM 自动连接 AgentCore Gateway（MCP 工具中心）、Memory（托管记忆）、Code Interpreter（安全沙箱）、Browser（云端浏览器）
 - **共享 Skills** — 所有租户共享统一的 Skills（S3 集中管理，自动同步到所有 VM），记忆独立
+- **配置模板** — 自定义 OpenClaw 配置模板（支持不同 LLM 提供商/模型），创建租户时可选模板
 - **默认工具链** — 每个 VM 预装 Python3/uv/git/gh/Node.js/htop/tmux/tree 等开发工具
 - **统一配置管理** — 控制台展示每个租户的模型配置和共享 Skills 列表
 - **自定义域名** — 一键绑定域名 + ACM 证书到 ALB，HTTPS 访问 Dashboard
@@ -106,57 +107,37 @@ openclaw-firecracker/
 ## 快速开始
 
 ```bash
-# 1. 部署基础设施
+# 1. 配置
+cp config.yml.example config.yml          # 编辑基础设施配置
+cp templates/openclaw.json.example templates/openclaw.json  # 设置 API key、模型 provider 等
+
+# 2. 部署基础设施
 ./setup.sh ap-northeast-1 lab
 # 完成后环境变量保存在 .env.deploy
 
-# 2. 配置 OpenClaw 应用参数 (首次)
-cat > .env.openclaw << 'EOF'
-# OpenClaw 默认配置 (烧入 data template)
-OPENCLAW_API_KEY=your-bedrock-api-key
-OPENCLAW_BASE_URL=https://bedrock-mantle.us-west-2.api.aws/v1
-OPENCLAW_MODEL_ID=deepseek.v3.2
-OPENCLAW_CONTEXT_WINDOW=131072
-OPENCLAW_TOOLS_PROFILE=coding
-OPENCLAW_DM_SCOPE=per-peer
-OPENCLAW_DISABLE_DEVICE_AUTH=true
-EOF
-
-# 3. 构建并上传 rootfs
+# 3. 构建 rootfs（自动上传 S3 + 推送到 host）
+source .env.deploy
 ./build-rootfs.sh v1.0
 
-# 4. 创建租户(Openclaw 实例)
+# 4. 创建租户（OpenClaw 实例）
 source .env.deploy
 curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" \
   -d '{"name":"my-agent","vcpu":2,"mem_mb":4096}' | jq .
 
-# 4. 查看租户状态
-curl -s "${API_URL}tenants" -H "x-api-key: ${API_KEY}" | jq .
-
-# 5. SSH 登录 microVM
-./oc-connect.sh <tenant-id>
-
-# 6. 删除租户
-curl -s -X DELETE "${API_URL}tenants/<tenant-id>" -H "x-api-key: ${API_KEY}" | jq .
+# 5. 打开 Console 管理租户、模板和设置
+# Console URL 在部署完成后输出
 ```
 
 ## Management Console
 
-Web 管理控制台，支持 Host/Tenant 可视化管理。
-
-```bash
-./web-console.sh    # 自动读取 .env.deploy，启动 http://localhost:8080
-```
+Web 管理控制台，通过 CloudFront (`/console/`) 在线访问，Cognito 认证。
 
 ![Management Console](web_console.png)
 
 功能：
-- 查看宿主机资源使用情况 (vCPU / 内存 / VM 数量)
-- 创建 / 删除 Tenant
-- 按宿主机筛选 Tenant
-- 健康状态实时展示 (vm_health / app_health)
-- 快捷复制连接命令 (oc-connect.sh) 和 Dashboard 命令 (oc-dashboard.sh)
-- API 地址和 Key 自动注入，支持手动修改
+- **Tenants** — 宿主机资源概览，创建/删除租户，一键打开 Dashboard
+- **App Config** — 共享 Skills 列表，配置模板管理（创建/编辑/删除）
+- **Settings** — API 连接、AgentCore 状态、系统信息
 
 ## Dashboard 直达
 
@@ -268,8 +249,8 @@ s3://{bucket}/skills/
 | 文件 | 用途 |
 |------|------|
 | `config.yml` | 基础设施配置 — 从 `config.yml.example` 复制后按需修改 |
+| `templates/openclaw.json` | OpenClaw 应用配置（模型、API key、provider）— 从 `.example` 复制 |
 | `.env.deploy` | 部署环境 (region、API URL/Key、bucket) — setup.sh 自动生成 |
-| `.env.openclaw` | OpenClaw 应用配置 (模型、API key、tools profile) |
 
 ### config.yml
 

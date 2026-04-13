@@ -52,6 +52,7 @@ input { font-family: inherit; }
 .btn-outline:hover { border-color: var(--cyan); color: var(--cyan); box-shadow: 0 0 8px #0ff2; }
 .btn-icon { background: none; border: none; color: var(--cyan-dim); cursor: pointer; font-size: 32px; padding: 4px; }
 .btn-icon:hover { color: var(--cyan); }
+.btn-sm { padding: 4px 10px; font-size: 12px; }
 .btn-act { background: none; border: none; color: var(--cyan-dim); cursor: pointer; font-size: 16px; padding: 4px; display: inline-flex; align-items: center; }
 .btn-act:hover { color: var(--cyan); }
 .btn-del { background: none; border: none; color: #f445; cursor: pointer; font-size: 16px; padding: 4px; display: inline-flex; align-items: center; }

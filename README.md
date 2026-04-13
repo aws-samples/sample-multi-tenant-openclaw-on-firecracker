@@ -1,6 +1,6 @@
-# OpenClaw Pool on EC2 microVM
+# OpenClaw Pool on EC2 Firecracker
 
-![Version](https://img.shields.io/badge/version-0.9.0-blue)
+![Version](https://img.shields.io/badge/version-0.9.3-blue)
 
 **[English](README.md)** | **[中文](docs/README-CN.md)** | **[Changelog](docs/CHANGELOG.md)**
 
@@ -21,6 +21,7 @@ Multi-tenant isolated deployment of OpenClaw AI agents on AWS using Firecracker 
 - **Auto Backup** — EventBridge scheduled backup of all tenant data volumes to S3, with manual trigger and backup query API
 - **AgentCore Integration** — Optional toggle; when enabled, all VMs auto-connect to AgentCore Gateway (MCP tool hub), Memory, Code Interpreter, and Browser
 - **Shared Skills** — All tenants share a unified skill set (S3-managed, auto-synced to all VMs), with independent memory
+- **Config Templates** — Custom OpenClaw configuration templates for different LLM providers/models, selectable when creating tenants
 - **Default Toolchain** — Each VM comes with Python3/uv/git/gh/Node.js/htop/tmux/tree pre-installed
 - **Data Backup** — Automated daily backup + manual backup API, Firecracker pause/resume for consistency
 
@@ -69,23 +70,28 @@ openclaw-firecracker/
 │   ├── stack.py               # Infrastructure definition
 │   ├── lambda/
 │   │   ├── api/handler.py     # Tenant CRUD + host management
+│   │   ├── templates/handler.py  # Config template CRUD
+│   │   ├── skills/handler.py  # Shared skills list
 │   │   ├── health_check/handler.py  # Scheduled health checks
 │   │   ├── agentcore_tools/handler.py  # AgentCore Gateway Lambda tools
 │   │   └── scaler/handler.py  # Idle host reclamation
 │   └── userdata/
 │       ├── init-host.sh       # Host initialization
+│       ├── host-agent.py      # VM health polling + DDB writes
 │       ├── launch-vm.sh       # microVM launch
 │       └── stop-vm.sh         # microVM stop
 ├── console/                   # Web management console
-│   ├── index.html             # Alpine.js SPA
+│   ├── index.html             # Alpine.js SPA (3 tabs)
 │   ├── style.css
 │   └── config.js              # Auto-generated
+├── templates/                 # OpenClaw config templates
+│   ├── openclaw.json.example  # Example config
+│   └── openclaw.json          # User config (gitignored)
 ├── config.yml                 # Global config (single source of truth)
 ├── setup.sh                   # One-click deploy + export .env.deploy
 ├── build-rootfs.sh            # Build rootfs + data template, upload to S3
-├── web-console.sh             # Start web management console
 ├── scripts/
-│   ├── bind-domain.sh         # Bind custom domain + HTTPS to ALB
+│   ├── bind-domain.sh         # Bind custom domain + HTTPS to CloudFront
 │   ├── destroy.sh             # Tear down environment (--purge for full cleanup)
 │   ├── oc-connect.sh          # SSH into OpenClaw microVM
 │   └── oc-dashboard.sh        # Access OpenClaw dashboard
@@ -101,22 +107,16 @@ openclaw-firecracker/
 ## Quick Start
 
 ```bash
-# 1. Deploy infrastructure
+# 1. Configure
+cp config.yml.example config.yml          # Edit infrastructure config
+cp templates/openclaw.json.example templates/openclaw.json  # Set your API key, model provider, etc.
+
+# 2. Deploy infrastructure
 ./setup.sh ap-northeast-1 lab
 # Environment variables saved to .env.deploy
 
-# 2. Configure OpenClaw app settings (first time)
-cat > .env.openclaw << 'EOF'
-OPENCLAW_API_KEY=your-bedrock-api-key
-OPENCLAW_BASE_URL=https://bedrock-mantle.us-west-2.api.aws/v1
-OPENCLAW_MODEL_ID=deepseek.v3.2
-OPENCLAW_CONTEXT_WINDOW=131072
-OPENCLAW_TOOLS_PROFILE=coding
-OPENCLAW_DM_SCOPE=per-peer
-OPENCLAW_DISABLE_DEVICE_AUTH=true
-EOF
-
-# 3. Build and upload rootfs
+# 3. Build rootfs (auto-uploads to S3 + pushes to hosts)
+source .env.deploy
 ./build-rootfs.sh v1.0
 
 # 4. Create a tenant (OpenClaw instance)
@@ -124,33 +124,20 @@ source .env.deploy
 curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" \
   -d '{"name":"my-agent","vcpu":2,"mem_mb":4096}' | jq .
 
-# 5. Check tenant status
-curl -s "${API_URL}tenants" -H "x-api-key: ${API_KEY}" | jq .
-
-# 6. SSH into microVM
-./scripts/oc-connect.sh <tenant-id>
-
-# 7. Delete tenant
-curl -s -X DELETE "${API_URL}tenants/<tenant-id>" -H "x-api-key: ${API_KEY}" | jq .
+# 5. Open Console — manage tenants, templates, and settings
+# Console URL is printed after deploy
 ```
 
 ## Management Console
 
-Web-based console for visual host/tenant management.
-
-```bash
-./web-console.sh    # Reads .env.deploy, starts http://localhost:8080
-```
+Web-based console hosted on CloudFront (`/console/`), with Cognito authentication.
 
 ![Management Console](docs/web_console.png)
 
 Features:
-- Host resource usage (vCPU / memory / VM count)
-- Create / delete tenants
-- Filter tenants by host
-- Real-time health status (vm_health / app_health)
-- Quick-copy connect and dashboard commands
-- Auto-injected API URL and key
+- **Tenants** — Host resource overview, create/delete tenants, one-click Dashboard access
+- **App Config** — Shared skills list, config template management (create/edit/delete)
+- **Settings** — API connection, AgentCore status, system info
 
 ## Dashboard Access
 
@@ -233,8 +220,8 @@ aws s3 sync ./my-skills/ s3://${ASSETS_BUCKET}/skills/ --profile $PROFILE
 | File | Purpose |
 |------|---------|
 | `config.yml` | Infrastructure config — copy from `config.yml.example` and customize |
+| `templates/openclaw.json` | OpenClaw app config (model, API key, provider) — copy from `.example` |
 | `.env.deploy` | Deploy environment (region, API URL/Key, bucket) — auto-generated by setup.sh |
-| `.env.openclaw` | OpenClaw app config (model, API key, tools profile) |
 
 ### config.yml
 

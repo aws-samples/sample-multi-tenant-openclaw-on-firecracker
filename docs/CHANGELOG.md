@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.9.3 — Config Templates + Platform Env 重构
+
+- **Config Templates** — 支持自定义 OpenClaw 配置模板（S3 存储），创建 tenant 时可选模板
+- **Templates Lambda** — CRUD API（`/templates`），Console App Config 页面管理模板
+- **Console 三页签** — Tenants / App Config / Settings 分页导航
+- **platform.env** — 统一 `/etc/platform.env` 管理平台变量，host-agent 通过 EnvironmentFile 读取
+- **脚本 S3 化** — launch-vm.sh / stop-vm.sh 从 S3 下载，彻底解决 userdata 16KB 限制
+- **build-rootfs 简化** — 用模板文件替代 `.env.openclaw`，onboard 仅生成 bootstrap files
+- **Token 写入修复** — agent 必须读到 token 才 promote（修复 race condition）
+
 ## v0.9.1 — Lifecycle Hook 修复 + VM 自动恢复
 
 - **Lifecycle hook 修复** — 从 LifecycleHookSpecificationList 改为独立 CfnLifecycleHook 资源，修复 host 终止后 DDB 记录未清理

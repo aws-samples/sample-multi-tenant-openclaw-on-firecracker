@@ -222,6 +222,24 @@ class OpenClawOrchestratorStack(cdk.Stack):
         skills_resource = api.root.add_resource("skills")
         skills_resource.add_method("GET", apigw.LambdaIntegration(skills_fn), **key_required)
 
+        # ========== Templates Lambda ==========
+        templates_fn = _lambda.Function(self, "Templates",
+            function_name="openclaw-templates",
+            runtime=_lambda.Runtime.PYTHON_3_12,
+            handler="handler.lambda_handler",
+            code=_lambda.Code.from_asset("lambda/templates"),
+            timeout=Duration.seconds(30),
+            memory_size=128,
+            environment={"ASSETS_BUCKET": assets_bucket.bucket_name},
+        )
+        assets_bucket.grant_read_write(templates_fn)
+        templates_resource = api.root.add_resource("templates")
+        templates_resource.add_method("GET", apigw.LambdaIntegration(templates_fn), **key_required)
+        template_item = templates_resource.add_resource("{name}")
+        template_item.add_method("GET", apigw.LambdaIntegration(templates_fn), **key_required)
+        template_item.add_method("PUT", apigw.LambdaIntegration(templates_fn), **key_required)
+        template_item.add_method("DELETE", apigw.LambdaIntegration(templates_fn), **key_required)
+
         # ========== Scaler Lambda (idle host reclaim) ==========
         scaler_fn = _lambda.Function(self, "Scaler",
             function_name="openclaw-scaler",
@@ -332,22 +350,14 @@ class OpenClawOrchestratorStack(cdk.Stack):
 
         # Load scripts from userdata/ and inject config
         ud_dir = Path(__file__).parent / "userdata"
-        launch_vm_sh = (ud_dir / "launch-vm.sh").read_text().replace(
-            "{{SUBNET_PREFIX}}", CFG["vm"]["subnet_prefix"])
-        stop_vm_sh = (ud_dir / "stop-vm.sh").read_text()
 
         init_sh = (ud_dir / "init-host.sh").read_text()
         init_sh = init_sh.replace("{{ROOTFS_PREFIX}}", CFG["s3"]["rootfs_prefix"])
         init_sh = init_sh.replace("{{AVAIL_VCPU}}", str(_avail_vcpu))
         init_sh = init_sh.replace("{{AVAIL_MEM}}", str(_avail_mem))
+        init_sh = init_sh.replace("{{SUBNET_PREFIX}}", CFG["vm"]["subnet_prefix"])
         init_sh = init_sh.replace("{{AGENTCORE_GATEWAY_URL}}", gateway_url if gateway_url else "none")
-        # Embed small scripts as heredocs; large ones (backup-data, host-agent) from S3
-        init_sh = init_sh.replace("{{LAUNCH_VM_SCRIPT}}",
-            f"cat > /home/ubuntu/launch-vm.sh << 'LAUNCHEOF'\n{launch_vm_sh}LAUNCHEOF\n"
-            "chmod +x /home/ubuntu/launch-vm.sh && chown ubuntu:ubuntu /home/ubuntu/launch-vm.sh")
-        init_sh = init_sh.replace("{{STOP_VM_SCRIPT}}",
-            f"cat > /home/ubuntu/stop-vm.sh << 'STOPEOF'\n{stop_vm_sh}STOPEOF\n"
-            "chmod +x /home/ubuntu/stop-vm.sh && chown ubuntu:ubuntu /home/ubuntu/stop-vm.sh")
+        # Large scripts downloaded from S3 (userdata 16KB limit)
         init_sh = init_sh.replace("{{BACKUP_DATA_SCRIPT}}",
             "aws s3 cp s3://{{ASSETS_BUCKET}}/scripts/backup-data.sh /home/ubuntu/backup-data.sh --region ${REGION}\n"
             "chmod +x /home/ubuntu/backup-data.sh && chown ubuntu:ubuntu /home/ubuntu/backup-data.sh")

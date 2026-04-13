@@ -13,11 +13,9 @@ else
   exit 1
 fi
 
-OC_ENV_FILE="$SCRIPT_DIR/.env.openclaw"
-if [ -f "$OC_ENV_FILE" ]; then
-  source "$OC_ENV_FILE"
-else
-  echo "❌ 未找到 .env.openclaw，请创建并填写 OpenClaw 应用配置"
+OC_TEMPLATE="$SCRIPT_DIR/templates/openclaw.json"
+if [ ! -f "$OC_TEMPLATE" ]; then
+  echo "❌ 未找到 templates/openclaw.json，请从 openclaw.json.example 复制并配置"
   exit 1
 fi
 
@@ -68,8 +66,8 @@ sudo mount --bind /proc ${ROOTFS_DIR}/proc
 sudo mount --bind /sys ${ROOTFS_DIR}/sys
 sudo mount --bind /dev ${ROOTFS_DIR}/dev
 
-# 将 openclaw 变量注入 chroot（heredoc 'CHROOT' 不展开变量）
-sudo cp "$OC_ENV_FILE" ${ROOTFS_DIR}/tmp/.env.openclaw
+# Copy openclaw config template into chroot
+sudo cp "$OC_TEMPLATE" ${ROOTFS_DIR}/tmp/openclaw.json
 
 sudo chroot ${ROOTFS_DIR} /bin/bash << 'CHROOT'
 set -e
@@ -153,41 +151,16 @@ echo "node=$(node --version) npm=$(npm --version)"
 npm install -g openclaw
 chown -R agent:agent /usr/lib/node_modules
 
-# Configure gateway via onboard (platform-level defaults, from .env.openclaw)
-source /tmp/.env.openclaw
-OC_BASE_URL="${OPENCLAW_BASE_URL:?OPENCLAW_BASE_URL required}"
-OC_MODEL_ID="${OPENCLAW_MODEL_ID:?OPENCLAW_MODEL_ID required}"
-OC_CONTEXT_WINDOW="${OPENCLAW_CONTEXT_WINDOW:-131072}"
-OC_API_KEY="${OPENCLAW_API_KEY:?OPENCLAW_API_KEY required}"
-OC_TOOLS_PROFILE="${OPENCLAW_TOOLS_PROFILE:-coding}"
-OC_DM_SCOPE="${OPENCLAW_DM_SCOPE:-per-peer}"
-
+# Onboard to generate bootstrap files (AGENTS.md, SOUL.md, etc.)
+# Config will be overwritten by template — onboard params are placeholders
 HOME=/home/agent su -s /bin/bash agent -c "openclaw onboard --non-interactive \
-  --accept-risk \
-  --mode local \
-  --auth-choice custom-api-key \
-  --custom-base-url '${OC_BASE_URL}' \
-  --custom-model-id '${OC_MODEL_ID}' \
-  --custom-api-key '${OC_API_KEY}' \
-  --gateway-bind lan \
-  --gateway-auth token \
-  --skip-health"
-
-HOME=/home/agent su -s /bin/bash agent -c "openclaw config set 'tools.profile' '${OC_TOOLS_PROFILE}'"
-HOME=/home/agent su -s /bin/bash agent -c "openclaw config set 'session.dmScope' '${OC_DM_SCOPE}'"
-
-# Set contextWindow (openclaw onboard defaults to 16000 for custom API)
-OC_CFG="/home/agent/.openclaw/openclaw.json"
-PROVIDER_KEY=$(jq -r '.models.providers | keys[0]' "${OC_CFG}")
-HOME=/home/agent su -s /bin/bash agent -c "openclaw config set 'models.providers.${PROVIDER_KEY}.models[0].contextWindow' '${OC_CONTEXT_WINDOW}'"
-
-# Disable device pairing if configured
-if [ "${OPENCLAW_DISABLE_DEVICE_AUTH:-}" = "true" ]; then
-  HOME=/home/agent su -s /bin/bash agent -c "openclaw config set 'gateway.controlUi.dangerouslyDisableDeviceAuth' 'true'"
-  echo "device auth disabled"
-fi
-
-rm -f /tmp/.env.openclaw
+  --accept-risk --mode local --auth-choice custom-api-key \
+  --custom-base-url 'http://placeholder' --custom-model-id 'placeholder' \
+  --custom-api-key 'placeholder' --gateway-bind lan --gateway-auth token --skip-health"
+# Overwrite config with our template (onboard config replaced, bootstrap files kept)
+cp /tmp/openclaw.json /home/agent/.openclaw/openclaw.json
+chown agent:agent /home/agent/.openclaw/openclaw.json
+rm -f /tmp/openclaw.json
 
 # --- Gateway service file (built into /home/agent, will be in data template) ---
 NODE_BIN=$(which node)

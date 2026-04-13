@@ -3,6 +3,7 @@ Description=Host Agent
 After=network.target
 
 [Service]
+EnvironmentFile=/etc/platform.env
 ExecStart=/usr/bin/python3 /opt/openclaw/host-agent.py
 Restart=always
 RestartSec=5

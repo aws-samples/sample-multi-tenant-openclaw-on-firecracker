@@ -17,7 +17,7 @@ POLL_INTERVAL = int(os.environ.get("OC_AGENT_POLL_INTERVAL", "15"))
 PORT = int(os.environ.get("OC_AGENT_PORT", "8899"))
 VM_DIR = "/data/firecracker-vms"
 GATEWAY_PORT = 18789
-TENANTS_TABLE = os.environ.get("OC_TENANTS_TABLE", "")
+TENANTS_TABLE = os.environ.get("TENANTS_TABLE", "")
 
 # DynamoDB client (region auto-detected from instance metadata)
 _ddb = None
@@ -164,15 +164,14 @@ def _write_ddb(results):
             if info["vm_health"] == "up":
                 # Promote creating → running + read gateway token
                 token = _read_gateway_token(info["guest_ip"])
-                update_expr = "SET #s = :r, vm_health = :vh, app_health = :ah, health_failures = :z, last_health_check = :t, updated_at = :t"
+                if not token:
+                    continue  # Wait for SSH/gateway to be ready
+                update_expr = "SET #s = :r, vm_health = :vh, app_health = :ah, health_failures = :z, last_health_check = :t, updated_at = :t, gateway_token = :tk"
                 update_vals = {
                     ":r": "running", ":c": "creating",
                     ":vh": info["vm_health"], ":ah": info["app_health"],
-                    ":z": 0, ":t": now,
+                    ":z": 0, ":t": now, ":tk": token,
                 }
-                if token:
-                    update_expr += ", gateway_token = :tk"
-                    update_vals[":tk"] = token
                 table.update_item(
                     Key={"id": tid},
                     UpdateExpression=update_expr,

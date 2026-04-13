@@ -1,22 +1,24 @@
 #!/bin/bash
 set -euo pipefail
-TENANT_ID="${1:?Usage: launch-vm.sh <tenant_id> <vm_num> [vcpu] [mem_mb]}"
-VM_NUM="${2:?Usage: launch-vm.sh <tenant_id> <vm_num> [vcpu] [mem_mb]}"
+TENANT_ID="${1:?Usage: launch-vm.sh <tenant_id> <vm_num> [vcpu] [mem_mb] [config_template]}"
+VM_NUM="${2:?Usage: launch-vm.sh <tenant_id> <vm_num> [vcpu] [mem_mb] [config_template]}"
 VCPU="${3:-2}"
 MEM_MB="${4:-4096}"
+CONFIG_TEMPLATE="${5:-}"
 VM_DIR="/data/firecracker-vms/${TENANT_ID}"
+[ -f /etc/platform.env ] && source /etc/platform.env
 mkdir -p ${VM_DIR}
 rm -f ${VM_DIR}/.stopped
 SOCK="${VM_DIR}/fc.sock"
 TAP="tap-vm${VM_NUM}"
-GUEST_IP="{{SUBNET_PREFIX}}.${VM_NUM}.2"
-HOST_TAP_IP="{{SUBNET_PREFIX}}.${VM_NUM}.1"
+GUEST_IP="${SUBNET_PREFIX:-10.0}.${VM_NUM}.2"
+HOST_TAP_IP="${SUBNET_PREFIX:-10.0}.${VM_NUM}.1"
 GUEST_MAC="AA:FC:00:00:00:$(printf '%02x' ${VM_NUM})"
 log() { echo "[oc:launch] $(date +%H:%M:%S) $*"; }
 
 # Write VM metadata for host-agent discovery
 cat > "${VM_DIR}/vm.json" << VMEOF
-{"tenant_id":"${TENANT_ID}","vm_num":${VM_NUM},"guest_ip":"${GUEST_IP}","vcpu":${VCPU},"mem_mb":${MEM_MB}}
+{"tenant_id":"${TENANT_ID}","vm_num":${VM_NUM},"guest_ip":"${GUEST_IP}","vcpu":${VCPU},"mem_mb":${MEM_MB},"config_template":"${CONFIG_TEMPLATE}"}
 VMEOF
 
 log "START ${TENANT_ID} vm${VM_NUM} ${VCPU}vCPU/${MEM_MB}MB"
@@ -63,17 +65,23 @@ if [ -d "${SHARED_SKILLS}" ] && [ "$(ls -A ${SHARED_SKILLS} 2>/dev/null)" ]; the
   sudo chown -R 1000:1000 ${MOUNT_TMP}/.openclaw/skills
   log "skills injected"
 fi
-# Allow dashboard access from any origin (token auth is the security layer)
+# Configure openclaw.json
 OC_JSON="${MOUNT_TMP}/.openclaw/openclaw.json"
 if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
   if [ "$NEW_DATA" = "true" ]; then
-    # First-time: generate unique gateway token (template token is shared)
+    # Download custom template from S3 (if specified)
+    if [ -n "${CONFIG_TEMPLATE}" ] && [ -n "${ASSETS_BUCKET:-}" ]; then
+      aws s3 cp "s3://${ASSETS_BUCKET}/templates/openclaw/${CONFIG_TEMPLATE}/openclaw.json" "${OC_JSON}" --region "${OC_REGION:-ap-northeast-1}" --quiet
+      log "config template '${CONFIG_TEMPLATE}' applied"
+    fi
+    # Inject platform config: unique token + allowedOrigins + disableDeviceAuth
     NEW_TOKEN=$(openssl rand -hex 24)
-    jq --arg t "$NEW_TOKEN" '.gateway.auth.token = $t | .gateway.controlUi.allowedOrigins = ["*"]' "${OC_JSON}" > "${OC_JSON}.tmp" && mv "${OC_JSON}.tmp" "${OC_JSON}"
-    log "gateway token generated + allowedOrigins set"
-  else
-    jq '.gateway.controlUi.allowedOrigins = ["*"]' "${OC_JSON}" > "${OC_JSON}.tmp" && mv "${OC_JSON}.tmp" "${OC_JSON}"
-    log "gateway allowedOrigins set to *"
+    jq --arg t "$NEW_TOKEN" '
+      .gateway.auth.token = $t |
+      .gateway.controlUi.allowedOrigins = ["*"] |
+      .gateway.controlUi.dangerouslyDisableDeviceAuth = true
+    ' "${OC_JSON}" > "${OC_JSON}.tmp" && mv "${OC_JSON}.tmp" "${OC_JSON}"
+    log "gateway token generated"
   fi
   sudo chown 1000:1000 "${OC_JSON}"
   # AgentCore Gateway MCP injection (if configured)

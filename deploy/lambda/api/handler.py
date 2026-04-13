@@ -99,6 +99,7 @@ def create_tenant(body=None):
     name = body.get("name", "")
     vcpu = int(body.get("vcpu", VM_DEFAULT_VCPU))
     mem_mb = int(body.get("mem_mb", VM_DEFAULT_MEM))
+    config_template = body.get("config_template", "")
     tenant_id = _gen_id(name)
     now = _now()
 
@@ -133,6 +134,7 @@ def create_tenant(body=None):
         "status": "creating",
         "health_failures": 0,
         "rootfs_version": host.get("rootfs_version", ""),
+        "config_template": config_template,
         "creation_started_at": now,
         "created_at": now,
         "updated_at": now,
@@ -145,7 +147,7 @@ def create_tenant(body=None):
         ExpressionAttributeValues={":v": vcpu, ":m": mem_mb, ":one": 1, ":next": vm_num + 1, ":a": "active"},
     )
 
-    _launch_vm(host["instance_id"], tenant_id, vm_num, vcpu, mem_mb, guest_ip, host_port)
+    _launch_vm(host["instance_id"], tenant_id, vm_num, vcpu, mem_mb, guest_ip, host_port, config_template)
 
     # ALB path-based routing
     tg_arn = _ensure_host_tg(host["instance_id"], host["private_ip"])
@@ -691,9 +693,9 @@ def _remove_host_tg(instance_id):
         pass
 
 
-def _launch_vm(instance_id, tenant_id, vm_num, vcpu, mem_mb, guest_ip, host_port):
+def _launch_vm(instance_id, tenant_id, vm_num, vcpu, mem_mb, guest_ip, host_port, config_template=""):
     """Fire-and-forget: launch VM + set up DNAT."""
-    cmd = (f"/home/ubuntu/launch-vm.sh {tenant_id} {vm_num} {vcpu} {mem_mb} && "
+    cmd = (f"/home/ubuntu/launch-vm.sh {tenant_id} {vm_num} {vcpu} {mem_mb} {config_template} && "
            f"sudo iptables -t nat -A PREROUTING -i $(ip route show default | awk '{{print $5}}' | head -1) "
            f"-p tcp --dport {host_port} -j DNAT --to-destination {guest_ip}:{VM_PORT_BASE}")
     _ssm_send(instance_id, cmd, timeout=300)

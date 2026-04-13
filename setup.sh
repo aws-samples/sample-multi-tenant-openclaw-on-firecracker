@@ -18,6 +18,10 @@ aws s3 cp "$SCRIPT_DIR/deploy/userdata/host-agent.py" "s3://${BUCKET}/scripts/ho
   --profile "$PROFILE" --region "$REGION" --quiet
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/backup-data.sh" "s3://${BUCKET}/scripts/backup-data.sh" \
   --profile "$PROFILE" --region "$REGION" --quiet
+aws s3 cp "$SCRIPT_DIR/deploy/userdata/launch-vm.sh" "s3://${BUCKET}/scripts/launch-vm.sh" \
+  --profile "$PROFILE" --region "$REGION" --quiet
+aws s3 cp "$SCRIPT_DIR/deploy/userdata/stop-vm.sh" "s3://${BUCKET}/scripts/stop-vm.sh" \
+  --profile "$PROFILE" --region "$REGION" --quiet
 
 # 导出 stack outputs
 echo "→ 导出部署信息..."

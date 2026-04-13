@@ -41,6 +41,15 @@ HOSTS_TABLE=$(_stack_output HostsTable)
 TENANTS_TABLE=$(_stack_output TenantsTable)
 log "tables: hosts=${HOSTS_TABLE} tenants=${TENANTS_TABLE}"
 
+# Write env for launch-vm.sh and host-agent
+cat > /etc/platform.env << ENVEOF
+OC_REGION=${REGION}
+ASSETS_BUCKET={{ASSETS_BUCKET}}
+TENANTS_TABLE=${TENANTS_TABLE}
+HOSTS_TABLE=${HOSTS_TABLE}
+SUBNET_PREFIX={{SUBNET_PREFIX}}
+ENVEOF
+
 # Nginx reverse proxy for tenant dashboards
 mkdir -p /etc/nginx/conf.d/tenants
 cat > /etc/nginx/conf.d/openclaw-proxy.conf <<'NGINX'
@@ -65,7 +74,6 @@ log "nginx proxy configured"
 mkdir -p /opt/openclaw
 aws s3 cp s3://{{ASSETS_BUCKET}}/scripts/host-agent.py /opt/openclaw/host-agent.py --region ${REGION} --no-progress
 # Inject tenants table name into service (same mechanism as hosts table)
-sed -i.bak "/\[Service\]/a Environment=OC_TENANTS_TABLE=${TENANTS_TABLE}" /etc/systemd/system/host-agent.service && rm -f /etc/systemd/system/host-agent.service.bak
 systemctl daemon-reload
 systemctl enable host-agent
 systemctl start host-agent
@@ -138,8 +146,10 @@ log "shared skills ready ($(ls /data/shared-skills/ 2>/dev/null | wc -l) skills)
 
 # Step 4: Deploy launch/stop scripts
 log "step4: deploying scripts"
-{{LAUNCH_VM_SCRIPT}}
-{{STOP_VM_SCRIPT}}
+aws s3 cp s3://{{ASSETS_BUCKET}}/scripts/launch-vm.sh /home/ubuntu/launch-vm.sh --region ${REGION} --no-progress
+chmod +x /home/ubuntu/launch-vm.sh && chown ubuntu:ubuntu /home/ubuntu/launch-vm.sh
+aws s3 cp s3://{{ASSETS_BUCKET}}/scripts/stop-vm.sh /home/ubuntu/stop-vm.sh --region ${REGION} --no-progress
+chmod +x /home/ubuntu/stop-vm.sh && chown ubuntu:ubuntu /home/ubuntu/stop-vm.sh
 {{BACKUP_DATA_SCRIPT}}
 
 # Step 4b: AgentCore config (if enabled)

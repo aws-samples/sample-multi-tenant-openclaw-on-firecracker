@@ -1,0 +1,42 @@
+{
+  "agents": {
+    "defaults": {
+      "workspace": "/home/agent/.openclaw/workspace",
+      "model": {
+        "primary": "PROVIDER_NAME/MODEL_ID"
+      }
+    }
+  },
+  "gateway": {
+    "mode": "local",
+    "auth": {
+      "mode": "token"
+    },
+    "port": 18789,
+    "bind": "lan"
+  },
+  "session": {
+    "dmScope": "per-peer"
+  },
+  "tools": {
+    "profile": "coding"
+  },
+  "models": {
+    "providers": {
+      "PROVIDER_NAME": {
+        "baseUrl": "https://your-api-endpoint/v1",
+        "api": "openai-completions",
+        "apiKey": "YOUR_API_KEY",
+        "models": [
+          {
+            "id": "MODEL_ID",
+            "name": "Model Display Name",
+            "contextWindow": 131072,
+            "maxTokens": 4096,
+            "input": ["text"]
+          }
+        ]
+      }
+    }
+  }
+}

@@ -21,7 +21,7 @@ vm:
 
 # ========== S3 ==========
 s3:
-  rootfs_prefix: "rootfs"
+  rootfs_prefix: "deployment/rootfs"
   backup_prefix: "backups"
   backup_retention_days: 7
   backup_cron: "cron(0 19 * * ? *)"  # UTC 19:00 = 北京时间 03:00

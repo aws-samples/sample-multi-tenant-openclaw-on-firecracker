@@ -359,7 +359,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
         init_sh = init_sh.replace("{{AGENTCORE_GATEWAY_URL}}", gateway_url if gateway_url else "none")
         # Large scripts downloaded from S3 (userdata 16KB limit)
         init_sh = init_sh.replace("{{BACKUP_DATA_SCRIPT}}",
-            "aws s3 cp s3://{{ASSETS_BUCKET}}/scripts/backup-data.sh /home/ubuntu/backup-data.sh --region ${REGION}\n"
+            "aws s3 cp s3://{{ASSETS_BUCKET}}/deployment/scripts/backup-data.sh /home/ubuntu/backup-data.sh --region ${REGION}\n"
             "chmod +x /home/ubuntu/backup-data.sh && chown ubuntu:ubuntu /home/ubuntu/backup-data.sh")
 
         host_agent_svc = (ud_dir / "host-agent.service").read_text()

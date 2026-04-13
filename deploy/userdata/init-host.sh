@@ -72,7 +72,7 @@ log "nginx proxy configured"
 # Host agent — probes all local VMs, writes health to DynamoDB
 {{HOST_AGENT_SCRIPT}}
 mkdir -p /opt/openclaw
-aws s3 cp s3://{{ASSETS_BUCKET}}/scripts/host-agent.py /opt/openclaw/host-agent.py --region ${REGION} --no-progress
+aws s3 cp s3://{{ASSETS_BUCKET}}/deployment/scripts/host-agent.py /opt/openclaw/host-agent.py --region ${REGION} --no-progress
 # Inject tenants table name into service (same mechanism as hosts table)
 systemctl daemon-reload
 systemctl enable host-agent
@@ -146,9 +146,9 @@ log "shared skills ready ($(ls /data/shared-skills/ 2>/dev/null | wc -l) skills)
 
 # Step 4: Deploy launch/stop scripts
 log "step4: deploying scripts"
-aws s3 cp s3://{{ASSETS_BUCKET}}/scripts/launch-vm.sh /home/ubuntu/launch-vm.sh --region ${REGION} --no-progress
+aws s3 cp s3://{{ASSETS_BUCKET}}/deployment/scripts/launch-vm.sh /home/ubuntu/launch-vm.sh --region ${REGION} --no-progress
 chmod +x /home/ubuntu/launch-vm.sh && chown ubuntu:ubuntu /home/ubuntu/launch-vm.sh
-aws s3 cp s3://{{ASSETS_BUCKET}}/scripts/stop-vm.sh /home/ubuntu/stop-vm.sh --region ${REGION} --no-progress
+aws s3 cp s3://{{ASSETS_BUCKET}}/deployment/scripts/stop-vm.sh /home/ubuntu/stop-vm.sh --region ${REGION} --no-progress
 chmod +x /home/ubuntu/stop-vm.sh && chown ubuntu:ubuntu /home/ubuntu/stop-vm.sh
 {{BACKUP_DATA_SCRIPT}}
 

@@ -14,13 +14,13 @@ PATH=".venv/bin:$PATH" cdk deploy -c region="$REGION" --profile "$PROFILE" --req
 BUCKET=$(aws cloudformation describe-stacks --stack-name OpenClawOrchestrator \
   --query 'Stacks[0].Outputs[?OutputKey==`AssetsBucket`].OutputValue' --output text \
   --profile "$PROFILE" --region "$REGION")
-aws s3 cp "$SCRIPT_DIR/deploy/userdata/host-agent.py" "s3://${BUCKET}/scripts/host-agent.py" \
+aws s3 cp "$SCRIPT_DIR/deploy/userdata/host-agent.py" "s3://${BUCKET}/deployment/scripts/host-agent.py" \
   --profile "$PROFILE" --region "$REGION" --quiet
-aws s3 cp "$SCRIPT_DIR/deploy/userdata/backup-data.sh" "s3://${BUCKET}/scripts/backup-data.sh" \
+aws s3 cp "$SCRIPT_DIR/deploy/userdata/backup-data.sh" "s3://${BUCKET}/deployment/scripts/backup-data.sh" \
   --profile "$PROFILE" --region "$REGION" --quiet
-aws s3 cp "$SCRIPT_DIR/deploy/userdata/launch-vm.sh" "s3://${BUCKET}/scripts/launch-vm.sh" \
+aws s3 cp "$SCRIPT_DIR/deploy/userdata/launch-vm.sh" "s3://${BUCKET}/deployment/scripts/launch-vm.sh" \
   --profile "$PROFILE" --region "$REGION" --quiet
-aws s3 cp "$SCRIPT_DIR/deploy/userdata/stop-vm.sh" "s3://${BUCKET}/scripts/stop-vm.sh" \
+aws s3 cp "$SCRIPT_DIR/deploy/userdata/stop-vm.sh" "s3://${BUCKET}/deployment/scripts/stop-vm.sh" \
   --profile "$PROFILE" --region "$REGION" --quiet
 
 # 导出 stack outputs

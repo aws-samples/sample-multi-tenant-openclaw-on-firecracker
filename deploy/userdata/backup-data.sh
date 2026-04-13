@@ -3,7 +3,8 @@
 # 用法: backup-data.sh <tenant_id> [bucket] [prefix]
 set -uo pipefail
 TENANT_ID="${1:?Usage: backup-data.sh <tenant_id> [bucket] [prefix]}"
-BUCKET="${2:-{{ASSETS_BUCKET}}}"
+[ -f /etc/platform.env ] && source /etc/platform.env
+BUCKET="${2:-${ASSETS_BUCKET}}"
 PREFIX="${3:-backups}"
 TOKEN=$(curl -sf -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
 REGION=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)

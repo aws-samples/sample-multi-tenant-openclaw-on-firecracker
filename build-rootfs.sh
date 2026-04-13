@@ -244,11 +244,11 @@ echo "=== Uploading to S3 ==="
 PROFILE_FLAG="${PROFILE:+--profile ${PROFILE}}"
 ROOTFS_KEY="openclaw-rootfs-${VERSION}.ext4.gz"
 DATA_KEY="openclaw-data-template-${VERSION}.ext4.gz"
-aws s3 cp ${ROOTFS_IMG}.gz s3://${BUCKET}/rootfs/${ROOTFS_KEY} ${PROFILE_FLAG}
-aws s3 cp ${DATA_IMG}.gz s3://${BUCKET}/rootfs/${DATA_KEY} ${PROFILE_FLAG}
+aws s3 cp ${ROOTFS_IMG}.gz s3://${BUCKET}/deployment/rootfs/${ROOTFS_KEY} ${PROFILE_FLAG}
+aws s3 cp ${DATA_IMG}.gz s3://${BUCKET}/deployment/rootfs/${DATA_KEY} ${PROFILE_FLAG}
 
 # Upload manifest (version pointer)
-cat <<EOF | aws s3 cp - s3://${BUCKET}/rootfs/manifest.json ${PROFILE_FLAG} --content-type application/json
+cat <<EOF | aws s3 cp - s3://${BUCKET}/deployment/rootfs/manifest.json ${PROFILE_FLAG} --content-type application/json
 {"version":"${VERSION}","rootfs":"${ROOTFS_KEY}","data_template":"${DATA_KEY}"}
 EOF
 
@@ -258,9 +258,9 @@ rm -f ${ROOTFS_IMG}.gz ${DATA_IMG}.gz
 
 echo ""
 echo "✓ rootfs ${VERSION} uploaded (${ROOTFS_SIZE})"
-echo "  s3://${BUCKET}/rootfs/${ROOTFS_KEY}"
+echo "  s3://${BUCKET}/deployment/rootfs/${ROOTFS_KEY}"
 echo "✓ data template ${VERSION} uploaded (${DATA_SIZE})"
-echo "  s3://${BUCKET}/rootfs/${DATA_KEY}"
+echo "  s3://${BUCKET}/deployment/rootfs/${DATA_KEY}"
 echo "✓ manifest.json → ${VERSION}"
 
 # Refresh on active hosts

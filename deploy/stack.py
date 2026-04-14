@@ -101,7 +101,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
             function_name="openclaw-api",
             runtime=_lambda.Runtime.PYTHON_3_12,
             handler="handler.lambda_handler",
-            code=_lambda.Code.from_asset("lambda/api"),
+            code=_lambda.Code.from_asset("deploy/lambda/api"),
             timeout=Duration.seconds(120),
             memory_size=256,
             environment={
@@ -192,7 +192,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
             function_name="openclaw-health-check",
             runtime=_lambda.Runtime.PYTHON_3_12,
             handler="handler.lambda_handler",
-            code=_lambda.Code.from_asset("lambda/health_check"),
+            code=_lambda.Code.from_asset("deploy/lambda/health_check"),
             timeout=Duration.seconds(120),
             memory_size=256,
             environment={
@@ -214,7 +214,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
             function_name="openclaw-skills",
             runtime=_lambda.Runtime.PYTHON_3_12,
             handler="handler.lambda_handler",
-            code=_lambda.Code.from_asset("lambda/skills"),
+            code=_lambda.Code.from_asset("deploy/lambda/skills"),
             timeout=Duration.seconds(30),
             memory_size=128,
             environment={"ASSETS_BUCKET": assets_bucket.bucket_name},
@@ -228,7 +228,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
             function_name="openclaw-templates",
             runtime=_lambda.Runtime.PYTHON_3_12,
             handler="handler.lambda_handler",
-            code=_lambda.Code.from_asset("lambda/templates"),
+            code=_lambda.Code.from_asset("deploy/lambda/templates"),
             timeout=Duration.seconds(30),
             memory_size=128,
             environment={"ASSETS_BUCKET": assets_bucket.bucket_name},
@@ -246,7 +246,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
             function_name="openclaw-scaler",
             runtime=_lambda.Runtime.PYTHON_3_12,
             handler="handler.lambda_handler",
-            code=_lambda.Code.from_asset("lambda/scaler"),
+            code=_lambda.Code.from_asset("deploy/lambda/scaler"),
             timeout=Duration.seconds(30),
             memory_size=128,
             environment={
@@ -271,7 +271,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
             function_name="openclaw-backup",
             runtime=_lambda.Runtime.PYTHON_3_12,
             handler="handler.lambda_handler",
-            code=_lambda.Code.from_asset("lambda/backup"),
+            code=_lambda.Code.from_asset("deploy/lambda/backup"),
             timeout=Duration.seconds(900),
             memory_size=256,
             environment={
@@ -531,7 +531,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
                     function_name="openclaw-agentcore-tools",
                     runtime=_lambda.Runtime.PYTHON_3_12,
                     handler="handler.lambda_handler",
-                    code=_lambda.Code.from_asset("lambda/agentcore_tools"),
+                    code=_lambda.Code.from_asset("deploy/lambda/agentcore_tools"),
                     timeout=Duration.seconds(30),
                     memory_size=128,
                 )
@@ -650,6 +650,19 @@ class OpenClawOrchestratorStack(cdk.Stack):
 
         # ========== CloudFront (HTTPS without custom domain) ==========
         s3_origin = origins.S3BucketOrigin.with_origin_access_control(assets_bucket)
+        # CloudFront Function: rewrite /console/ → /console/index.html, / → /console/index.html
+        url_rewrite_fn = cloudfront.Function(self, "UrlRewrite",
+            function_name="openclaw-url-rewrite",
+            code=cloudfront.FunctionCode.from_inline("""
+function handler(event) {
+  var uri = event.request.uri;
+  if (uri === '/console' || uri === '/console/') {
+    event.request.uri = '/console/index.html';
+  }
+  return event.request;
+}"""),
+        )
+
         cf_distribution = cloudfront.Distribution(self, "DashboardCF",
             comment="OpenClaw Dashboard",
             default_behavior=cloudfront.BehaviorOptions(
@@ -669,6 +682,10 @@ class OpenClawOrchestratorStack(cdk.Stack):
                     origin=s3_origin,
                     viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
                     cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
+                    function_associations=[cloudfront.FunctionAssociation(
+                        function=url_rewrite_fn,
+                        event_type=cloudfront.FunctionEventType.VIEWER_REQUEST,
+                    )],
                 ),
             },
             default_root_object="",

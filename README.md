@@ -1,6 +1,6 @@
 # OpenClaw Pool on EC2 Firecracker
 
-![Version](https://img.shields.io/badge/version-0.9.5-blue)
+![Version](https://img.shields.io/badge/version-0.9.6-blue)
 
 **[English](README.md)** | **[中文](docs/README-CN.md)** | **[Changelog](docs/CHANGELOG.md)**
 
@@ -67,6 +67,7 @@ EventBridge: health checks + idle reclamation + scheduled backup
 ```
 openclaw-firecracker/
 ├── deploy/                    # CDK project
+│   ├── app.py                 # CDK app entry
 │   ├── stack.py               # Infrastructure definition
 │   ├── lambda/
 │   │   ├── api/handler.py     # Tenant CRUD + host management
@@ -77,24 +78,22 @@ openclaw-firecracker/
 │   │   └── scaler/handler.py  # Idle host reclamation
 │   └── userdata/
 │       ├── init-host.sh       # Host initialization
-│       ├── host-agent.py      # VM health polling + DDB writes
+│       ├── host-agent.py      # VM health polling + DDB writes + balloon
 │       ├── launch-vm.sh       # microVM launch
 │       └── stop-vm.sh         # microVM stop
 ├── console/                   # Web management console
 │   ├── index.html             # Alpine.js SPA (3 tabs)
-│   ├── style.css
-│   └── config.js              # Auto-generated
+│   └── style.css
+├── tests/                     # Test suite (unit + e2e)
 ├── templates/                 # OpenClaw config templates
-│   ├── openclaw.json.example  # Example config
-│   └── openclaw.json          # User config (gitignored)
-├── config.yml                 # Global config (single source of truth)
+│   └── openclaw.json.example  # Example config
+├── pyproject.toml             # Python project config + dependencies
+├── cdk.json                   # CDK app config + feature flags
+├── config.yml                 # Infrastructure config (single source of truth)
 ├── setup.sh                   # One-click deploy + export .env.deploy
 ├── build-rootfs.sh            # Build rootfs + data template, upload to S3
 ├── scripts/
-│   ├── bind-domain.sh         # Bind custom domain + HTTPS to CloudFront
-│   ├── destroy.sh             # Tear down environment (--purge for full cleanup)
-│   ├── oc-connect.sh          # SSH into OpenClaw microVM
-│   └── oc-dashboard.sh        # Access OpenClaw dashboard
+│   └── bind-domain.sh         # Bind custom domain + HTTPS to CloudFront
 └── docs/
 ```
 
@@ -136,7 +135,7 @@ Web-based console hosted on CloudFront (`/console/`), with Cognito authenticatio
 
 Features:
 - **Tenants** — Host resource overview, create/delete tenants, one-click Dashboard access
-- **App Config** — Shared skills list, config template management (create/edit/delete)
+- **Application** — Shared skills list, config template management (create/edit/delete)
 - **Settings** — API connection, AgentCore status, system info
 
 ## Dashboard Access
@@ -230,9 +229,14 @@ aws s3 sync ./my-skills/ s3://${ASSETS_BUCKET}/skills/ --profile $PROFILE
 | host | instance_type | m8i.2xlarge | Must support NestedVirtualization (c8i/m8i/r8i) |
 | host | data_volume_gb | 200 | Data volume for rootfs templates + VM disks |
 | host | cpu_overcommit_ratio | 2.0 | CPU overcommit (1.0=none, 2.0=allocate 2x vCPU) |
+| host | mem_overcommit_ratio | 1.0 | Memory overcommit (requires balloon enabled) |
+| host | keep_data_volume | true | Keep EBS data volume after instance termination |
 | vm | default_vcpu | 2 | Default vCPU per tenant |
 | vm | default_mem_mb | 4096 | Default memory (MB) per tenant |
 | vm | data_disk_mb | 8192 | Data volume size (MB) per tenant |
+| balloon | enabled | false | Firecracker balloon device for memory overcommit |
+| balloon | max_inflate_ratio | 0.4 | Max reclaimable ratio of VM declared memory |
+| balloon | min_guest_available_mb | 512 | Min available memory kept in guest |
 | asg | min_capacity | 1 | Minimum host instances |
 | asg | max_capacity | 5 | Maximum host instances |
 | asg | use_spot | false | Spot instances (save ~60-70%, may be reclaimed) |

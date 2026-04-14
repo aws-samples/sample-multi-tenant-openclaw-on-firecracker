@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-import os
+import os, sys
+sys.path.insert(0, os.path.dirname(__file__))
 import aws_cdk as cdk
 from stack import OpenClawOrchestratorStack
 

@@ -1,6 +1,6 @@
 # OpenClaw Pool on EC2 Firecracker
 
-![Version](https://img.shields.io/badge/version-0.9.5-blue)
+![Version](https://img.shields.io/badge/version-0.9.6-blue)
 
 **[English](../README.md)** | **[中文](README-CN.md)** | **[Changelog](CHANGELOG.md)**
 
@@ -69,32 +69,34 @@ EventBridge: 健康检查 + 空闲回收 + 定时备份
 
 ```
 openclaw-firecracker/
-├── config.yml                 # 全局配置 (唯一配置源)
-├── build-rootfs.sh            # rootfs + data template 构建 + S3 上传
-├── setup.sh                   # 一键部署 + 导出 .env.deploy
-├── destroy.sh                 # 销毁环境 (--purge 彻底清理)
-├── web-console.sh             # 启动 Web 管理控制台
-├── oc-connect.sh              # 登录 OpenClaw microVM
-├── oc-dashboard.sh            #  OpenClaw 控制面板
-├── console/                   # 管理控制台前端
-│   ├── index.html             # Alpine.js SPA
-│   ├── style.css              # 控制台UI样式
-│   └── config.js              # 动态生成
-├── scripts/
-│   └── bind-domain.sh         # 绑定自定义域名 + ACM 证书到 ALB
 ├── deploy/                    # CDK 项目
+│   ├── app.py                 # CDK 入口
 │   ├── stack.py               # 基础设施定义
 │   ├── lambda/
 │   │   ├── api/handler.py     # 租户 CRUD + 宿主机管理
+│   │   ├── templates/handler.py  # 配置模板 CRUD
+│   │   ├── skills/handler.py  # 共享 Skills 列表
 │   │   ├── health_check/handler.py  # 定时健康检查
-│   │   ├── backup/handler.py  # 定时/手动数据备份
 │   │   ├── agentcore_tools/handler.py  # AgentCore Gateway Lambda 工具
 │   │   └── scaler/handler.py  # 空闲宿主机回收
 │   └── userdata/
 │       ├── init-host.sh       # 宿主机初始化
+│       ├── host-agent.py      # VM 健康探活 + DDB 写入 + balloon
 │       ├── launch-vm.sh       # microVM 启动
-│       ├── stop-vm.sh         # microVM 停止
-│       └── backup-data.sh     # 数据盘备份 (宿主机上执行)
+│       └── stop-vm.sh         # microVM 停止
+├── console/                   # Web 管理控制台
+│   ├── index.html             # Alpine.js SPA (3 页签)
+│   └── style.css
+├── tests/                     # 测试套件 (unit + e2e)
+├── templates/                 # OpenClaw 配置模板
+│   └── openclaw.json.example  # 示例配置
+├── pyproject.toml             # Python 项目配置 + 依赖
+├── cdk.json                   # CDK 应用配置
+├── config.yml                 # 基础设施配置 (唯一配置源)
+├── setup.sh                   # 一键部署 + 导出 .env.deploy
+├── build-rootfs.sh            # rootfs + data template 构建 + S3 上传
+├── scripts/
+│   └── bind-domain.sh         # 绑定自定义域名 + HTTPS 到 CloudFront
 └── docs/
 ```
 
@@ -136,39 +138,33 @@ Web 管理控制台，通过 CloudFront (`/console/`) 在线访问，Cognito 认
 
 功能：
 - **Tenants** — 宿主机资源概览，创建/删除租户，一键打开 Dashboard
-- **App Config** — 共享 Skills 列表，配置模板管理（创建/编辑/删除）
+- **Application** — 共享 Skills 列表，配置模板管理（创建/编辑/删除）
 - **Settings** — API 连接、AgentCore 状态、系统信息
 
-## Dashboard 直达
+## Dashboard 访问
 
-每只租户的 OpenClaw Dashboard 通过 ALB + Nginx 反向代理直接访问，支持 WebSocket，多宿主机自动路由：
+每个租户的 OpenClaw Dashboard 通过 CloudFront + ALB + Nginx 反向代理访问：
 
 ```
-ALB → 任意宿主机 Nginx:80 → 租户所在宿主机 → VM Gateway:18789
+https://{cloudfront-domain}/vm/{tenant-id}/    → 租户 Dashboard (WebSocket)
 ```
 
-访问路径：
-```
-http://{ALB-DNS}/vm/{tenant-id}/     → 租户 Dashboard
-https://{your-domain}/vm/{tenant-id}/ → 绑定自定义域名后 (HTTPS)
-```
+CloudFront 自动提供 HTTPS，无需自定义域名或 ACM 证书。Console 的 "Open Dashboard" 按钮自动带上 gateway token，一键访问。
 
-**多宿主机路由原理**：创建租户时，API 自动在所有宿主机上生成 nginx 配置。本机租户直接代理到 guest IP，远程租户通过宿主机间 DNAT 端口转发。ALB 无论路由到哪台宿主机，nginx 都能正确转发。
+流量路径：`Browser → CloudFront:443 → ALB:80 → Host Nginx:80 → VM Gateway:18789`
 
-## 自定义域名
+Nginx 配置由 launch-vm.sh / stop-vm.sh 自动管理。
 
-一键绑定自定义域名 + HTTPS 到 Dashboard ALB：
+## 自定义域名（可选）
+
+绑定自定义域名到 CloudFront：
 
 ```bash
 # 前置条件：
-# 1. 在 ACM 中申请证书并完成 DNS 验证
-# 2. 将域名 CNAME 指向 ALB DNS（见 .env.deploy 中的 DASHBOARD_URL）
+# 1. 在 us-east-1 ACM 中申请证书并完成 DNS 验证
+# 2. 将域名 CNAME 指向 CloudFront 域名
 
-# 绑定
-./scripts/bind-domain.sh oc.example.com arn:aws:acm:ap-northeast-1:123456:certificate/xxx
-
-# 完成后访问
-https://oc.example.com/vm/{tenant-id}/
+./scripts/bind-domain.sh oc.example.com arn:aws:acm:us-east-1:123456:certificate/xxx
 ```
 
 脚本会自动：创建 ALB HTTPS listener → 关联 ACM 证书 → 更新 `.env.deploy` 中的 `DASHBOARD_URL`
@@ -259,9 +255,14 @@ s3://{bucket}/skills/
 | host | instance_type | m8i.xlarge | 需支持 NestedVirtualization (c8i/m8i/r8i) |
 | host | data_volume_gb | 200 | 宿主机数据卷 (rootfs 模板 + VM 数据盘) |
 | host | cpu_overcommit_ratio | 2.0 | CPU 超配比例 (1.0=不超配, 2.0=可分配 2 倍 vCPU) |
+| host | mem_overcommit_ratio | 1.0 | 内存超配比例 (需启用 balloon) |
+| host | keep_data_volume | true | 实例终止时保留 EBS 数据卷 |
 | vm | default_vcpu | 2 | 默认 vCPU |
 | vm | default_mem_mb | 4096 | 默认内存 (MB) |
 | vm | data_disk_mb | 8192 | 数据盘大小 (MB) |
+| balloon | enabled | false | Firecracker balloon 设备实现内存超配 |
+| balloon | max_inflate_ratio | 0.4 | 最多回收 VM 声明内存的比例 |
+| balloon | min_guest_available_mb | 512 | guest 至少保留的可用内存 |
 | asg | min_capacity | 1 | 最小实例数 |
 | asg | max_capacity | 5 | 最大实例数 |
 | asg | use_spot | false | Spot 实例 (省 ~60-70%，可能被回收) |

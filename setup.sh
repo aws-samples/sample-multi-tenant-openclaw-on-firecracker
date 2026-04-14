@@ -6,7 +6,7 @@ REGION="${1:?Usage: ./setup.sh <region> <profile>}"
 PROFILE="${2:?Usage: ./setup.sh <region> <profile>}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$SCRIPT_DIR/deploy"
+cd "$SCRIPT_DIR"
 
 PATH=".venv/bin:$PATH" cdk deploy -c region="$REGION" --profile "$PROFILE" --require-approval never "${@:3}"
 
@@ -58,7 +58,7 @@ cat "$SCRIPT_DIR/.env.deploy"
 
 # Upload console to S3 (generate config.js first)
 source "$SCRIPT_DIR/.env.deploy"
-VERSION=$(cat "$SCRIPT_DIR/VERSION" 2>/dev/null || echo "dev")
+VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('$SCRIPT_DIR/pyproject.toml','rb'))['project']['version'])" 2>/dev/null || echo "dev")
 cat > "$SCRIPT_DIR/console/config.js" << CFGEOF
 window.OC_DEFAULT_API_URL = "${API_URL:-}";
 window.OC_DEFAULT_API_KEY = "${API_KEY:-}";

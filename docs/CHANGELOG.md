@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.9.6 — 项目结构整理 + Web Console URL 调整
+
+- **项目结构统一** — 根目录 pyproject.toml + cdk.json + uv.lock，去掉 deploy/ 下重复配置
+- **版本号统一管理** — 版本号统一从 pyproject.toml 读取，移除 VERSION 文件
+- **CloudFront URL 重写** — `/console/` 自动跳转到 `/console/index.html`
+
 ## v0.9.5 — Balloon Memory Overcommit
 
 - **Balloon 内存超配** — Firecracker balloon device + free_page_reporting，host-agent 根据内存压力动态 inflate/deflate

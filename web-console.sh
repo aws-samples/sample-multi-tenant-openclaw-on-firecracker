@@ -9,7 +9,7 @@ ENV_FILE="$SCRIPT_DIR/.env.deploy"
 CONFIG_JS="$SCRIPT_DIR/console/config.js"
 if [ -f "$ENV_FILE" ]; then
   source "$ENV_FILE"
-  VERSION=$(cat "$SCRIPT_DIR/VERSION" 2>/dev/null || echo "dev")
+  VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('$SCRIPT_DIR/pyproject.toml','rb'))['project']['version'])" 2>/dev/null || echo "dev")
   cat > "$CONFIG_JS" << EOF
 window.OC_DEFAULT_API_URL = "${API_URL:-}";
 window.OC_DEFAULT_API_KEY = "${API_KEY:-}";

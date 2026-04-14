@@ -358,6 +358,14 @@ class OpenClawOrchestratorStack(cdk.Stack):
         init_sh = init_sh.replace("{{AVAIL_MEM}}", str(_avail_mem))
         init_sh = init_sh.replace("{{SUBNET_PREFIX}}", CFG["vm"]["subnet_prefix"])
         init_sh = init_sh.replace("{{AGENTCORE_GATEWAY_URL}}", gateway_url if gateway_url else "none")
+        # Balloon config
+        balloon_cfg = CFG.get("balloon", {})
+        init_sh = init_sh.replace("{{BALLOON_ENABLED}}", str(balloon_cfg.get("enabled", False)).lower())
+        init_sh = init_sh.replace("{{BALLOON_DEFLATE_ON_OOM}}", str(balloon_cfg.get("deflate_on_oom", True)).lower())
+        init_sh = init_sh.replace("{{BALLOON_STATS_INTERVAL}}", str(balloon_cfg.get("stats_polling_interval_s", 5)))
+        init_sh = init_sh.replace("{{BALLOON_FREE_PAGE_REPORTING}}", str(balloon_cfg.get("free_page_reporting", True)).lower())
+        init_sh = init_sh.replace("{{BALLOON_MAX_INFLATE_RATIO}}", str(balloon_cfg.get("max_inflate_ratio", 0.4)))
+        init_sh = init_sh.replace("{{BALLOON_MIN_GUEST_AVAILABLE_MB}}", str(balloon_cfg.get("min_guest_available_mb", 512)))
         # Large scripts downloaded from S3 (userdata 16KB limit)
         init_sh = init_sh.replace("{{BACKUP_DATA_SCRIPT}}",
             "aws s3 cp s3://{{ASSETS_BUCKET}}/deployment/scripts/backup-data.sh /home/ubuntu/backup-data.sh --region ${REGION}\n"

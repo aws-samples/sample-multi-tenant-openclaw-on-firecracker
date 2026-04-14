@@ -141,6 +141,18 @@ curl -s --unix-socket ${SOCK} -X PUT http://localhost/network-interfaces/eth0 \
   -H 'Content-Type: application/json' \
   -d '{"iface_id":"eth0","guest_mac":"'${GUEST_MAC}'","host_dev_name":"'${TAP}'"}'
 
+# Balloon device for memory overcommit (configured via /etc/platform.env or defaults)
+BALLOON_ENABLED="${BALLOON_ENABLED:-false}"
+if [ "${BALLOON_ENABLED}" = "true" ]; then
+  BALLOON_DEFLATE_ON_OOM="${BALLOON_DEFLATE_ON_OOM:-true}"
+  BALLOON_STATS_INTERVAL="${BALLOON_STATS_INTERVAL:-5}"
+  BALLOON_FREE_PAGE_REPORTING="${BALLOON_FREE_PAGE_REPORTING:-true}"
+  curl -s --unix-socket ${SOCK} -X PUT http://localhost/balloon \
+    -H 'Content-Type: application/json' \
+    -d '{"amount_mib":0,"deflate_on_oom":'${BALLOON_DEFLATE_ON_OOM}',"stats_polling_interval_s":'${BALLOON_STATS_INTERVAL}',"free_page_reporting":'${BALLOON_FREE_PAGE_REPORTING}'}'
+  log "balloon configured: deflate_on_oom=${BALLOON_DEFLATE_ON_OOM} stats=${BALLOON_STATS_INTERVAL}s free_page_reporting=${BALLOON_FREE_PAGE_REPORTING}"
+fi
+
 RESULT=$(curl -s --unix-socket ${SOCK} -X PUT http://localhost/actions \
   -H 'Content-Type: application/json' -d '{"action_type":"InstanceStart"}')
 [ -n "${RESULT}" ] && log "ERROR: ${RESULT}" && exit 1

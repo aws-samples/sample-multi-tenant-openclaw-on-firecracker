@@ -11,6 +11,15 @@ host:
   cpu_overcommit_ratio: 2.0        # 1.0=不超配, 2.0=可分配 2 倍 vCPU
   mem_overcommit_ratio: 1.5        # 1.0=不超配, 1.5=可分配 1.5 倍内存
 
+# ========== Balloon 内存回收 (配合 mem_overcommit) ==========
+balloon:
+  enabled: true                    # 启用 balloon 设备实现真正的内存超配
+  max_inflate_ratio: 0.4           # 最多回收 VM 声明内存的 40%
+  min_guest_available_mb: 512      # guest 至少保留 512MB 可用内存
+  stats_polling_interval_s: 5      # balloon 统计采集间隔
+  deflate_on_oom: true             # guest OOM 时自动归还内存
+  free_page_reporting: true        # guest 主动报告空闲页
+
 # ========== microVM ==========
 vm:
   default_vcpu: 2

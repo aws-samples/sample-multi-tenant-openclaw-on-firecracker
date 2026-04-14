@@ -1,0 +1,27 @@
+[project]
+name = "openclaw-firecracker"
+version = "0.9.4"
+requires-python = ">=3.12"
+dependencies = [
+    "aws-cdk-lib>=2.170.0",
+    "constructs>=10.0.0",
+    "pyyaml>=6.0",
+]
+
+[dependency-groups]
+test = ["pytest", "moto", "boto3"]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "unit: Unit tests (mock AWS, fast)",
+    "e2e: End-to-end tests (real AWS resources, slow)",
+    "regression: Regression tests (verify existing features)",
+]

@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.9.5 — Balloon Memory Overcommit
+
+- **Balloon 内存超配** — Firecracker balloon device + free_page_reporting，host-agent 根据内存压力动态 inflate/deflate
+- **Balloon 配置** — config.yml `balloon` section，6 个参数可调（enabled/max_inflate_ratio/min_guest_available_mb 等）
+- **Balloon 验证报告** — `docs/balloon-verification.md`
+
 ## v0.9.4 — Watchdog Recovery + Test Suite + S3 整理
 
 - **Watchdog auto-recovery** — health_check Lambda 检测 stale host-agent 后通过 SSM 自动重启

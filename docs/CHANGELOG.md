@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.10.0 — Balloon Memory Overcommit + Test Suite
+
+- **Balloon Memory Overcommit** — Firecracker balloon device with `free_page_reporting` enables real memory overcommit. 4 VMs × 4GB = 16GB declared, actual RSS 4.4GB (73% savings). Verified on AWS EC2.
+- **mem_overcommit_ratio** — Memory scheduling overcommit (default 1.5), safe with balloon enabled. Console memory bar shows overcommit badge + physical mark.
+- **Health Check Recovery** — Watchdog auto-restarts host-agent via SSM when all tenants on a host show stale health data. 10-minute cooldown prevents repeated restarts.
+- **Test Suite** — 52 unit tests (API scheduling, balloon adjustment, health check, scaler) + 9 E2E tests (real AWS API Gateway). `pytest tests/ -m unit` for fast local testing.
+- **Deployment Options Doc** — 5 deployment approaches comparison (EC2+FC / EKS+Kata / EKS+Privileged / gVisor / AgentCore Runtime)
+- **Balloon Verification Report** — `docs/balloon-verification.md` with full test data from AWS EC2
+
 ## v0.9.3 — Config Templates + Platform Env 重构
 
 - **Config Templates** — 支持自定义 OpenClaw 配置模板（S3 存储），创建 tenant 时可选模板

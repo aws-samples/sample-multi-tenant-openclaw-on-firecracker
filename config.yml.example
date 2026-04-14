@@ -9,6 +9,7 @@ host:
   reserved_vcpu: 1
   reserved_mem_mb: 2048
   cpu_overcommit_ratio: 2.0        # 1.0=不超配, 2.0=可分配 2 倍 vCPU
+  mem_overcommit_ratio: 1.5        # 1.0=不超配, 1.5=可分配 1.5 倍内存
 
 # ========== microVM ==========
 vm:

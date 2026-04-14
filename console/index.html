@@ -114,8 +114,13 @@
             <span class="host-val" x-text="h.used_vcpu+'/'+h.total_vcpu"></span>
           </div>
           <div class="host-row">
-            <span class="host-label">Mem(GB)</span>
-            <div class="bar-bg"><div class="bar-fill bar-mem" :style="'width:'+memPct(h)+'%'"></div></div>
+            <span class="host-label">Mem<span class="overcommit-badge" x-show="(h.mem_overcommit_ratio||1) > 1" x-text="' (×'+(h.mem_overcommit_ratio||1)+')'"></span></span>
+            <div class="bar-bg" style="position:relative">
+              <div class="bar-fill" :class="memBarClass(h)" :style="'width:'+memPct(h)+'%'"></div>
+              <template x-if="(h.mem_overcommit_ratio||1) > 1">
+                <div class="bar-physical-mark" :style="'left:'+(100/(h.mem_overcommit_ratio||1))+'%'"></div>
+              </template>
+            </div>
             <span class="host-val" x-text="(h.used_mem_mb/1024).toFixed(1)+'/'+(h.total_mem_mb/1024).toFixed(1)"></span>
           </div>
           <div class="host-row">
@@ -461,7 +466,14 @@ function app() {
     cpuBarClass(h) {
       return h.used_vcpu > h.total_vcpu ? 'bar-cpu-over' : 'bar-cpu';
     },
-    memPct(h) { return h.total_mem_mb ? Math.round(h.used_mem_mb / h.total_mem_mb * 100) : 0; },
+    memPct(h) {
+      const ratio = h.mem_overcommit_ratio || 1;
+      const allocatable = h.total_mem_mb * ratio;
+      return allocatable ? Math.min(100, Math.round(h.used_mem_mb / allocatable * 100)) : 0;
+    },
+    memBarClass(h) {
+      return h.used_mem_mb > h.total_mem_mb ? 'bar-mem-over' : 'bar-mem';
+    },
     healthClass(v) { return v === 'up' ? 'health-up' : v === 'down' ? 'health-down' : 'health-unknown'; },
     get filteredTenants() { return this.selectedHost ? this.tenants.filter(t => t.host_id === this.selectedHost) : this.tenants; },
   };

@@ -83,6 +83,7 @@ input { font-family: inherit; }
 .bar-cpu { background: linear-gradient(90deg, #0ff, #06f); }
 .bar-cpu-over { background: linear-gradient(90deg, #0ff, #f90); }
 .bar-mem { background: linear-gradient(90deg, #0af, #06d); }
+.bar-mem-over { background: linear-gradient(90deg, #0af, #f90); }
 .bar-physical-mark { position: absolute; top: -2px; bottom: -2px; width: 2px; background: rgba(255,255,255,0.5); pointer-events: none; }
 .overcommit-badge { font-size: 10px; color: #f90; }
 .icon { display: inline-block; vertical-align: middle; fill: none; stroke: currentColor; }

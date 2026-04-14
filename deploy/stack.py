@@ -402,7 +402,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
                     device_name="/dev/sdf",
                     volume=ec2.BlockDeviceVolume.ebs(CFG["host"]["data_volume_gb"],
                         volume_type=ec2.EbsDeviceVolumeType.GP3,
-                        delete_on_termination=False),
+                        delete_on_termination=not CFG["host"].get("keep_data_volume", False)),
                 ),
             ],
         )

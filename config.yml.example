@@ -6,6 +6,7 @@ host:
   instance_type: m8i.xlarge        # 支持嵌套虚拟化: c8i/m8i/r8i 系列
   root_volume_gb: 20
   data_volume_gb: 200              # 建议每个 VM 预留 ~16GB
+  keep_data_volume:  true          # 实例删除后是否保留EBS卷
   reserved_vcpu: 1
   reserved_mem_mb: 2048
   cpu_overcommit_ratio: 2.0        # 1.0=不超配, 2.0=可分配 2 倍 vCPU

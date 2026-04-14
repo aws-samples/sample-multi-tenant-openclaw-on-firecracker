@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.9.4 — Watchdog Recovery + Test Suite + S3 整理
+
+- **Watchdog auto-recovery** — health_check Lambda 检测 stale host-agent 后通过 SSM 自动重启
+- **mem_overcommit_ratio** — 调度层面内存超配参数（默认 1.0 不超配）
+- **Test suite** — 50 个测试用例（unit + e2e + regression）
+- **备份 bug 修复** — backup-data.sh bash 花括号解析错误导致备份静默失败
+- **keep_data_volume** — 可配置 EBS 数据卷是否随实例终止删除（默认不保留）
+- **部署方案对比文档** — EC2+FC / EKS+Kata / EKS+Privileged / gVisor / AgentCore 五种方案
+
 ## v0.9.3 — Config Templates + Platform Env 重构
 
 - **Config Templates** — 支持自定义 OpenClaw 配置模板（S3 存储），创建 tenant 时可选模板

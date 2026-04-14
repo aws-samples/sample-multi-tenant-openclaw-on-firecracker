@@ -15,6 +15,7 @@ hosts_table = ddb.Table(os.environ["HOSTS_TABLE"])
 HOST_RESERVED_VCPU = int(os.environ.get("HOST_RESERVED_VCPU", 1))
 HOST_RESERVED_MEM = int(os.environ.get("HOST_RESERVED_MEM", 2048))
 CPU_OVERCOMMIT_RATIO = float(os.environ.get("CPU_OVERCOMMIT_RATIO", 1.0))
+MEM_OVERCOMMIT_RATIO = float(os.environ.get("MEM_OVERCOMMIT_RATIO", 1.0))
 VM_DEFAULT_VCPU = int(os.environ.get("VM_DEFAULT_VCPU", 2))
 VM_DEFAULT_MEM = int(os.environ.get("VM_DEFAULT_MEM", 4096))
 VM_DATA_DISK_MB = int(os.environ.get("VM_DATA_DISK_MB", 2048))
@@ -351,6 +352,7 @@ def list_hosts():
     ).get("Items", [])
     for item in items:
         item["cpu_overcommit_ratio"] = CPU_OVERCOMMIT_RATIO
+        item["mem_overcommit_ratio"] = MEM_OVERCOMMIT_RATIO
     return _resp(200, items)
 
 
@@ -607,7 +609,8 @@ def _find_host(vcpu_needed, mem_needed):
     for h in hosts:
         allocatable_vcpu = int(int(h["total_vcpu"]) * CPU_OVERCOMMIT_RATIO)
         free_vcpu = allocatable_vcpu - int(h["used_vcpu"])
-        free_mem = int(h["total_mem_mb"]) - int(h["used_mem_mb"])
+        allocatable_mem = int(int(h["total_mem_mb"]) * MEM_OVERCOMMIT_RATIO)
+        free_mem = allocatable_mem - int(h["used_mem_mb"])
         if free_vcpu >= vcpu_needed and free_mem >= mem_needed:
             return h
     return None

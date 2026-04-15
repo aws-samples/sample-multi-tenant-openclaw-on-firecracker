@@ -124,7 +124,7 @@
             <span class="host-val" x-text="(h.used_mem_mb/1024).toFixed(1)+'/'+(h.total_mem_mb/1024).toFixed(1)"></span>
           </div>
           <div class="host-row">
-            <span class="host-label">VM</span>
+            <span class="host-label">VM(s)</span>
             <span style="color:#fff" x-text="h.vm_count"></span>
             <span style="margin-left:auto;font-size:11px;color:var(--gray)" x-text="h.rootfs_version||''"></span>
           </div>
@@ -346,7 +346,7 @@
   <div class="section-card">
     <h3>System</h3>
     <div style="font-size:13px;color:var(--gray)">
-      <div>Dashboard: <span x-text="window.OC_DASHBOARD_BASE || '-'"></span></div>
+      <div>Site URL: <span x-text="window.OC_DASHBOARD_BASE || '-'"></span></div>
     </div>
   </div>
 </div>

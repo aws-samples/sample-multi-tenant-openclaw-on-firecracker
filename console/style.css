@@ -19,7 +19,7 @@ input { font-family: inherit; }
 /* Layout */
 /* tenants two-column layout is inline on page-content */
 .flex-layout { display: flex; gap: 20px; align-items: flex-start; }
-.hosts-panel { width: 320px; flex-shrink: 0; }
+.hosts-panel { width: 330px; flex-shrink: 0; }
 .tenants-panel { flex: 1; min-width: 0; }
 .panel-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
 .panel-title { font-size: 18px; color: #fff; }
@@ -77,7 +77,7 @@ input { font-family: inherit; }
 .badge-draining { border: 1px solid var(--gray); color: var(--gray); }
 .act-group { display:flex; gap:2px; align-items:center; flex-wrap:nowrap; }
 .host-row { display: flex; align-items: center; font-size: 11px; margin-bottom: 4px; gap: 8px; }
-.host-label { width: 50px; color: #6b7a8d; }
+.host-label { width: 62px; color: #6b7a8d; white-space: nowrap; }
 .bar-bg { flex: 1; height: 6px; background: #1a2332; border-radius: 3px; overflow: hidden; position: relative; }
 .bar-fill { height: 100%; border-radius: 3px; transition: width .3s; }
 .bar-cpu { background: linear-gradient(90deg, #0ff, #06f); }

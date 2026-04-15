@@ -554,11 +554,12 @@ def process_pending():
         # Update pending tenant with host assignment
         tenants_table.update_item(
             Key={"id": tenant["id"]},
-            UpdateExpression="SET #s = :s, host_id = :h, vm_num = :n, guest_ip = :g, host_port = :p, creation_started_at = :t, updated_at = :t",
+            UpdateExpression="SET #s = :s, host_id = :h, vm_num = :n, guest_ip = :g, host_port = :p, rootfs_version = :rv, creation_started_at = :t, updated_at = :t",
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
                 ":s": "creating", ":h": host["instance_id"],
-                ":n": vm_num, ":g": guest_ip, ":p": host_port, ":t": now,
+                ":n": vm_num, ":g": guest_ip, ":p": host_port,
+                ":rv": host.get("rootfs_version", ""), ":t": now,
             },
         )
 

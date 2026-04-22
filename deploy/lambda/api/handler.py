@@ -164,6 +164,8 @@ def delete_tenant(tenant_id, query_params):
     item = tenants_table.get_item(Key={"id": tenant_id}).get("Item")
     if not item:
         return _resp(404, {"error": "tenant not found"})
+    if item.get("status") == "deleted":
+        return _resp(200, {"id": tenant_id, "status": "deleted"})
 
     keep_data = query_params.get("keep_data", "true").lower() == "true"
     host_id = item.get("host_id")

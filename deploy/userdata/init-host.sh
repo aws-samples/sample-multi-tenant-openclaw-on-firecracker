@@ -21,8 +21,8 @@ echo 'KERNEL=="kvm", MODE="0666"' > /etc/udev/rules.d/99-kvm.rules
 
 # Step 2: Install tools + Firecracker
 log "step2: installing tools + firecracker"
-apt-get update -qq
-apt-get install -y -qq curl jq sshpass unzip pigz nginx > /dev/null 2>&1
+apt-get -o DPkg::Lock::Timeout=60 update -qq
+apt-get -o DPkg::Lock::Timeout=60 install -y -qq curl jq sshpass unzip pigz nginx > /dev/null 2>&1
 if ! command -v aws &>/dev/null; then
   curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
   cd /tmp && unzip -qo awscliv2.zip && ./aws/install &>/dev/null; cd -

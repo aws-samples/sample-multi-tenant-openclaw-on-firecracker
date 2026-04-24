@@ -36,16 +36,17 @@ _lock = threading.Lock()
 def _get_ddb():
     global _ddb
     if _ddb is None:
-        # Get region from IMDS
+        # Get region from IMDS (IMDSv2 with session token)
+        # EC2 IMDS only supports http:// on link-local 169.254.169.254
         try:
             import urllib.request
-            tok = urllib.request.urlopen(urllib.request.Request(
-                "http://169.254.169.254/latest/api/token",
+            tok = urllib.request.urlopen(urllib.request.Request(  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected
+                "http://169.254.169.254/latest/api/token",  # nosemgrep: python.lang.security.audit.insecure-transport.urllib.insecure-urllib-request
                 headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"},
                 method="PUT",
             ), timeout=2).read().decode()
-            region = urllib.request.urlopen(urllib.request.Request(
-                "http://169.254.169.254/latest/meta-data/placement/region",
+            region = urllib.request.urlopen(urllib.request.Request(  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected
+                "http://169.254.169.254/latest/meta-data/placement/region",  # nosemgrep: python.lang.security.audit.insecure-transport.urllib.insecure-urllib-request
                 headers={"X-aws-ec2-metadata-token": tok},
             ), timeout=2).read().decode()
         except Exception:

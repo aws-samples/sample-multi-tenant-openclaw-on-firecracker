@@ -1,20 +1,41 @@
+
 # OS
 .DS_Store
+Thumbs.db
 
-# Environment
-.venv
+# Environment & Secrets
+.venv/
+.env
 .env.*
 .dev
 config.yml
 openclaw.json
-logs/*
+
+# Logs
+logs/
+*.log
 
 # Python
 __pycache__/
-*.pyc
+*.py[cod]
 *.egg-info/
+dist/
+build/
+*.egg
 
 # CDK
 cdk.out/
-deploy/cdk.context.json
+cdk.context.json
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Node (if console has dependencies)
+node_modules/
+
+# Generated files
 console/config.js

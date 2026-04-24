@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
 """Unit tests for deploy/lambda/scaler/handler.py.
 Covers: two-round idle reclamation, ASG min protection, recovery.
 """

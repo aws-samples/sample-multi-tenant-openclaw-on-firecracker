@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
 """OpenClaw Host Agent — probes local VMs and writes health status to DynamoDB.
 Replaces per-tenant SSM health checks. Runs as systemd service on each host.
 """

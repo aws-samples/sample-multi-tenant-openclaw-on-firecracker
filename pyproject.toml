@@ -1,5 +1,5 @@
 [project]
-name = "openclaw-firecracker"
+name = "sample-multi-tenant-openclaw-on-firecracker"
 version = "0.9.6"
 requires-python = ">=3.12"
 dependencies = [

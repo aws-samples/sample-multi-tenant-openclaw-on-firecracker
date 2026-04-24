@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
 # 通过 SSM 端口转发访问 OpenClaw Gateway Dashboard
 # 用法: ./oc-console.sh <tenant-id> [local-port]
 # 示例: ./oc-dashboard.sh test-vm-a634

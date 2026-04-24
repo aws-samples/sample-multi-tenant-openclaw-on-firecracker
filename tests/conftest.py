@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
 """Shared fixtures for all tests."""
 
 import os
@@ -45,7 +48,7 @@ def make_ddb_table():
 def load_env_deploy():
     """Load .env.deploy for E2E tests. Returns dict or None if not found."""
     for path in ["../.env.deploy", ".env.deploy",
-                  os.path.expanduser("~/Code/openclaw-firecracker-on-ec2/.env.deploy")]:
+                  os.path.expanduser("~/Code/sample-multi-tenant-openclaw-on-firecracker/.env.deploy")]:
         if os.path.isfile(path):
             env = {}
             with open(path) as f:

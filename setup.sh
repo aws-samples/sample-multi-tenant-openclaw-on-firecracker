@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
 # 部署 CDK stack 并导出环境信息到 .env.deploy
 set -euo pipefail
 

@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
 TENANT_ID="${1:?Usage: stop-vm.sh <tenant_id> <vm_num>}"
 VM_NUM="${2:?Usage: stop-vm.sh <tenant_id> <vm_num>}"
 VM_DIR="/data/firecracker-vms/${TENANT_ID}"

@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
 """E2E tests — real AWS API Gateway calls.
 Requires: .env.deploy with API_URL and API_KEY.
 Run: pytest tests/test_e2e.py -m e2e -v

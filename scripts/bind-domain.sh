@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
 # 将自定义域名 + ACM 证书关联到 CloudFront
 # 前置条件: 用户已申请 ACM 证书(在 us-east-1 区域)并完成验证
 # 用法: ./bind-domain.sh <domain> <acm-certificate-arn>

@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
 # 备份指定租户的 data.ext4 到 S3
 # 用法: backup-data.sh <tenant_id> [bucket] [prefix]
 set -uo pipefail

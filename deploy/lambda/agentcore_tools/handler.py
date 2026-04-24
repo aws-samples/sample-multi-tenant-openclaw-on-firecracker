@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
 """AgentCore Gateway tool: hello-world + system info.
 Registered as MCP tool via Gateway, available to all OpenClaw agents."""
 

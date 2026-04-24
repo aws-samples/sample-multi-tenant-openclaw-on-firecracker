@@ -1,12 +1,12 @@
-# OpenClaw Pool on EC2 Firecracker
+# Multi-Tenant OpenClaw on Firecracker
 
-![Version](https://img.shields.io/badge/version-0.9.6-blue)
+**[English](README.md)** | **[中文](docs/README-CN.md)**
 
-**[English](README.md)** | **[中文](docs/README-CN.md)** | **[Changelog](docs/CHANGELOG.md)**
+Multi-tenant isolated deployment of OpenClaw AI agents on AWS using Firecracker microVMs, also known as **OpenClaw Pool**. Each tenant runs in its own microVM with independent kernel, filesystem, and network. Managed via API, with auto-scaling hosts and idle reclamation.
 
-Multi-tenant isolated deployment of OpenClaw AI agents on AWS using Firecracker microVMs. Each tenant runs in its own microVM with independent kernel, filesystem, and network. Managed via API, with auto-scaling hosts and idle reclamation.
+> This project uses AWS EC2 [nested virtualization](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/nested-virtualization.html) to run KVM + Firecracker inside EC2 instances. Currently supports Intel instance families (c8i/m8i/r8i, etc.).
 
-> This project uses EC2 [nested virtualization](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/nested-virtualization.html) to run KVM + Firecracker inside EC2 instances. Currently supports Intel instance families (c8i/m8i/r8i, etc.).
+> ⚠️ This sample is for demonstration purposes only and is not intended for production use. Deploy at your own risk.
 
 ## Features
 
@@ -65,7 +65,7 @@ EventBridge: health checks + idle reclamation + scheduled backup
 ## Project Structure
 
 ```
-openclaw-firecracker/
+sample-multi-tenant-openclaw-on-firecracker/
 ├── deploy/                    # CDK project
 │   ├── app.py                 # CDK app entry
 │   ├── stack.py               # Infrastructure definition
@@ -312,3 +312,11 @@ curl -s "${API_URL}hosts/rootfs-version" -H "x-api-key: ${API_KEY}" | jq .
 
 # New VMs use the latest version; existing VMs need reset to update
 ```
+
+## Security
+
+See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
+
+## License
+
+This library is licensed under the MIT-0 License. See the [LICENSE](LICENSE) file.

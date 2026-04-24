@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
 set -e
 exec > /var/log/openclaw-init.log 2>&1
 log() { echo "[oc:init] $(date +%H:%M:%S) $*"; }

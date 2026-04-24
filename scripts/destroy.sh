@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
 # 销毁 CDK stack 并清理资源
 # 用法: ./destroy.sh [--purge]
 #   --purge  同时删除 RETAIN 的 S3 bucket 和 DynamoDB 表

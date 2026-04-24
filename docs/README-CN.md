@@ -1,12 +1,12 @@
-# OpenClaw Pool on EC2 Firecracker
+# Multi-Tenant OpenClaw on Firecracker
 
-![Version](https://img.shields.io/badge/version-0.9.6-blue)
+**[English](../README.md)** | **[中文](README-CN.md)**
 
-**[English](../README.md)** | **[中文](README-CN.md)** | **[Changelog](CHANGELOG.md)**
+基于 AWS Firecracker microVM 的 OpenClaw 多租户隔离部署方案，俗称 **龙虾池**。每个租户运行在独立的 microVM 中，通过 API 统一管理，ASG 自动扩缩宿主机，空闲主机自动回收。
 
-基于 AWS Firecracker microVM 的 OpenClaw 多租户隔离部署方案。每个租户运行在独立的 microVM 中，通过 API 统一管理，ASG 自动扩缩宿主机，空闲主机自动回收。
+> 本项目使用 AWS EC2 [嵌套虚拟化](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/nested-virtualization.html) 功能，在 EC2 实例内运行 KVM + Firecracker microVM。目前支持 Intel 系列 (c8i/m8i/r8i 等) 实例家族。
 
-> 本项目使用 EC2 [嵌套虚拟化](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/nested-virtualization.html) 功能，在 EC2 实例内运行 KVM + Firecracker microVM。目前支持 Intel 系列 (c8i/m8i/r8i 等) 实例家族。
+> ⚠️ 本项目仅用于演示目的，不适用于生产环境。使用风险自负。
 
 ## 功能概览
 
@@ -68,7 +68,7 @@ EventBridge: 健康检查 + 空闲回收 + 定时备份
 ## 项目结构
 
 ```
-openclaw-firecracker/
+sample-multi-tenant-openclaw-on-firecracker/
 ├── deploy/                    # CDK 项目
 │   ├── app.py                 # CDK 入口
 │   ├── stack.py               # 基础设施定义

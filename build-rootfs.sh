@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
 # 构建 OpenClaw rootfs + data template 镜像并上传到 S3
 # 用法: ./build-rootfs.sh [version]
 # 示例: ./build-rootfs.sh v1.6

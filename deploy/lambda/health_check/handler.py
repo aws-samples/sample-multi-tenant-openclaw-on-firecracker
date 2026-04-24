@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
 """Health check Lambda — watchdog for host-agent.
 Runs every 5 minutes. Detects stale agent data and recovers host-agent.
 

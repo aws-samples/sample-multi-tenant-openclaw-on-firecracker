@@ -1,3 +1,6 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
 """Unit tests for deploy/lambda/health_check/handler.py.
 Covers: stale detection, host-agent recovery, cooldown, edge cases.
 """

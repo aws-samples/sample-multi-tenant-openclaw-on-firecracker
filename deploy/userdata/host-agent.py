@@ -93,7 +93,7 @@ def _probe_all():
             continue
 
         try:
-            with open(cfg_file) as f:
+            with open(cfg_file, encoding="utf-8") as f:
                 cfg = json.load(f)
             guest_ip = cfg.get("guest_ip", "")
         except Exception:
@@ -241,7 +241,7 @@ def _set_balloon_target(sock_file, amount_mib):
 def _get_host_mem_info():
     """Read host /proc/meminfo, return (total_mb, available_mb)."""
     try:
-        with open("/proc/meminfo") as f:
+        with open("/proc/meminfo", encoding="utf-8") as f:
             info = {}
             for line in f:
                 parts = line.split()
@@ -282,7 +282,7 @@ def _adjust_balloons(probe_results):
         # Read VM config for declared memory
         cfg_file = os.path.join(VM_DIR, tid, "vm.json")
         try:
-            with open(cfg_file) as f:
+            with open(cfg_file, encoding="utf-8") as f:
                 cfg = json.load(f)
             vm_mem_mb = cfg.get("mem_mb", 4096)
         except Exception:

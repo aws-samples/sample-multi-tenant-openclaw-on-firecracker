@@ -477,37 +477,6 @@ wheels = [
 ]
 
 [[package]]
-name = "openclaw-firecracker"
-version = "0.9.4"
-source = { editable = "." }
-dependencies = [
-    { name = "aws-cdk-lib" },
-    { name = "constructs" },
-    { name = "pyyaml" },
-]
-
-[package.dev-dependencies]
-test = [
-    { name = "boto3" },
-    { name = "moto" },
-    { name = "pytest" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "aws-cdk-lib", specifier = ">=2.170.0" },
-    { name = "constructs", specifier = ">=10.0.0" },
-    { name = "pyyaml", specifier = ">=6.0" },
-]
-
-[package.metadata.requires-dev]
-test = [
-    { name = "boto3" },
-    { name = "moto" },
-    { name = "pytest" },
-]
-
-[[package]]
 name = "packaging"
 version = "26.0"
 source = { registry = "https://pypi.org/simple" }
@@ -665,6 +634,37 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/05/04/74127fc843314818edfa81b5540e26dd537353b123a4edc563109d8f17dd/s3transfer-0.16.0.tar.gz", hash = "sha256:8e990f13268025792229cd52fa10cb7163744bf56e719e0b9cb925ab79abf920", size = 153827, upload-time = "2025-12-01T02:30:59.114Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/fc/51/727abb13f44c1fcf6d145979e1535a35794db0f6e450a0cb46aa24732fe2/s3transfer-0.16.0-py3-none-any.whl", hash = "sha256:18e25d66fed509e3868dc1572b3f427ff947dd2c56f844a5bf09481ad3f3b2fe", size = 86830, upload-time = "2025-12-01T02:30:57.729Z" },
+]
+
+[[package]]
+name = "sample-multi-tenant-openclaw-on-firecracker"
+version = "0.9.6"
+source = { editable = "." }
+dependencies = [
+    { name = "aws-cdk-lib" },
+    { name = "constructs" },
+    { name = "pyyaml" },
+]
+
+[package.dev-dependencies]
+test = [
+    { name = "boto3" },
+    { name = "moto" },
+    { name = "pytest" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "aws-cdk-lib", specifier = ">=2.170.0" },
+    { name = "constructs", specifier = ">=10.0.0" },
+    { name = "pyyaml", specifier = ">=6.0" },
+]
+
+[package.metadata.requires-dev]
+test = [
+    { name = "boto3" },
+    { name = "moto" },
+    { name = "pytest" },
 ]
 
 [[package]]

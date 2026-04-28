@@ -180,6 +180,9 @@ class OpenClawOrchestratorStack(cdk.Stack):
         host_resource = hosts_resource.add_resource("{instance_id}")
         host_resource.add_method("DELETE", apigw.LambdaIntegration(api_fn), **key_required)
 
+        backups_resource = api.root.add_resource("backups")
+        backups_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
+
         refresh_rootfs_resource = hosts_resource.add_resource("refresh-rootfs")
         refresh_rootfs_resource.add_method("POST", apigw.LambdaIntegration(api_fn), **key_required)
 

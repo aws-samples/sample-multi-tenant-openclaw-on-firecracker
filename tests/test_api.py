@@ -170,6 +170,169 @@ class TestCreateTenant:
         assert resp["statusCode"] == 400
 
 
+class TestCreateTenantRestore:
+    """restore_from branch in create_tenant."""
+
+    def _prep_host(self):
+        """Common setup: one host with capacity."""
+        api.tenants_table = make_ddb_table()
+        api.hosts_table = make_ddb_table()
+        api.hosts_table.scan.return_value = {"Items": [
+            {"instance_id": "i-test", "total_vcpu": 8, "total_mem_mb": 16384,
+             "used_vcpu": 0, "used_mem_mb": 0, "status": "active",
+             "next_vm_num": 1, "private_ip": "10.0.0.1", "rootfs_version": "v1.0"},
+        ]}
+
+    @pytest.mark.unit
+    def test_restore_latest_backup(self):
+        """No timestamp → pick most recent backup from S3."""
+        self._prep_host()
+        import datetime
+        _mock_s3.list_objects_v2.return_value = {"Contents": [
+            {"Key": "backups/src/20260101-000000.gz", "LastModified": datetime.datetime(2026, 1, 1), "Size": 100},
+            {"Key": "backups/src/20260301-000000.gz", "LastModified": datetime.datetime(2026, 3, 1), "Size": 200},
+        ]}
+        resp = api.create_tenant(json.dumps({
+            "name": "restored", "restore_from": {"tenant_id": "src"}
+        }))
+        assert resp["statusCode"] == 201
+        # put_item should have been called with restore_backup_key = the latest
+        put_calls = api.tenants_table.put_item.call_args_list
+        assert len(put_calls) >= 1
+        saved = put_calls[-1].kwargs["Item"]
+        assert saved["restore_backup_key"] == "backups/src/20260301-000000.gz"
+
+    @pytest.mark.unit
+    def test_restore_specific_timestamp(self):
+        """With timestamp → must match exact key."""
+        self._prep_host()
+        import datetime
+        _mock_s3.list_objects_v2.return_value = {"Contents": [
+            {"Key": "backups/src/20260101-000000.gz", "LastModified": datetime.datetime(2026, 1, 1), "Size": 100},
+            {"Key": "backups/src/20260301-000000.gz", "LastModified": datetime.datetime(2026, 3, 1), "Size": 200},
+        ]}
+        resp = api.create_tenant(json.dumps({
+            "name": "restored",
+            "restore_from": {"tenant_id": "src", "timestamp": "20260101-000000"}
+        }))
+        assert resp["statusCode"] == 201
+        saved = api.tenants_table.put_item.call_args_list[-1].kwargs["Item"]
+        assert saved["restore_backup_key"] == "backups/src/20260101-000000.gz"
+
+    @pytest.mark.unit
+    def test_restore_source_has_no_backups_returns_404(self):
+        self._prep_host()
+        _mock_s3.list_objects_v2.return_value = {"Contents": []}
+        resp = api.create_tenant(json.dumps({
+            "name": "restored", "restore_from": {"tenant_id": "src-gone"}
+        }))
+        assert resp["statusCode"] == 404
+        assert "no backups found" in json.loads(resp["body"])["error"]
+
+    @pytest.mark.unit
+    def test_restore_timestamp_not_found_returns_404(self):
+        self._prep_host()
+        import datetime
+        _mock_s3.list_objects_v2.return_value = {"Contents": [
+            {"Key": "backups/src/20260101-000000.gz", "LastModified": datetime.datetime(2026, 1, 1), "Size": 100},
+        ]}
+        resp = api.create_tenant(json.dumps({
+            "name": "restored",
+            "restore_from": {"tenant_id": "src", "timestamp": "20990101-000000"}
+        }))
+        assert resp["statusCode"] == 404
+        assert "backup not found" in json.loads(resp["body"])["error"]
+
+    @pytest.mark.unit
+    def test_restore_from_missing_tenant_id_returns_400(self):
+        self._prep_host()
+        resp = api.create_tenant(json.dumps({
+            "name": "restored", "restore_from": {"timestamp": "20260101-000000"}
+        }))
+        assert resp["statusCode"] == 400
+
+    @pytest.mark.unit
+    def test_restore_when_source_tenant_deleted(self):
+        """Source tenant doesn't need to exist in DDB — only S3 backup matters."""
+        self._prep_host()
+        # tenants_table.get_item not consulted; only s3 list
+        import datetime
+        _mock_s3.list_objects_v2.return_value = {"Contents": [
+            {"Key": "backups/src-deleted/20260101-000000.gz", "LastModified": datetime.datetime(2026, 1, 1), "Size": 100},
+        ]}
+        resp = api.create_tenant(json.dumps({
+            "name": "restored", "restore_from": {"tenant_id": "src-deleted"}
+        }))
+        assert resp["statusCode"] == 201
+
+    @pytest.mark.unit
+    def test_normal_create_unaffected(self):
+        """Without restore_from, restore_backup_key persisted as empty."""
+        self._prep_host()
+        resp = api.create_tenant(json.dumps({"name": "normal"}))
+        assert resp["statusCode"] == 201
+        saved = api.tenants_table.put_item.call_args_list[-1].kwargs["Item"]
+        assert saved.get("restore_backup_key", "") == ""
+
+
+class TestListAllBackups:
+    """GET /backups — cross-tenant aggregate."""
+
+    @pytest.mark.unit
+    def test_marks_orphan_vs_active(self):
+        api.tenants_table = make_ddb_table()
+        api.tenants_table.scan.return_value = {"Items": [
+            {"id": "alive", "name": "my-agent", "status": "running"},
+            {"id": "soft-deleted", "name": "old", "status": "deleted"},
+            # "orphan-in-s3" has no DDB row at all
+        ]}
+        import datetime
+        # Mock paginator → returns one page
+        page = {"Contents": [
+            {"Key": "backups/alive/20260301-000000.gz",
+             "LastModified": datetime.datetime(2026, 3, 1), "Size": 1000},
+            {"Key": "backups/soft-deleted/20260201-000000.gz",
+             "LastModified": datetime.datetime(2026, 2, 1), "Size": 2000},
+            {"Key": "backups/orphan-in-s3/20260101-000000.gz",
+             "LastModified": datetime.datetime(2026, 1, 1), "Size": 3000},
+        ]}
+        paginator = MagicMock()
+        paginator.paginate.return_value = [page]
+        _mock_s3.get_paginator.return_value = paginator
+
+        resp = api.list_all_backups()
+        assert resp["statusCode"] == 200
+        backups = json.loads(resp["body"])
+        # Sorted by last_modified desc
+        assert [b["tenant_id"] for b in backups] == ["alive", "soft-deleted", "orphan-in-s3"]
+        # alive → tenant_exists true, orphan/deleted → false
+        by_id = {b["tenant_id"]: b for b in backups}
+        assert by_id["alive"]["tenant_exists"] is True
+        assert by_id["alive"]["tenant_name"] == "my-agent"
+        assert by_id["soft-deleted"]["tenant_exists"] is False
+        assert by_id["orphan-in-s3"]["tenant_exists"] is False
+        assert by_id["orphan-in-s3"]["tenant_name"] is None
+
+    @pytest.mark.unit
+    def test_skips_non_gz_and_malformed_keys(self):
+        api.tenants_table = make_ddb_table()
+        api.tenants_table.scan.return_value = {"Items": []}
+        import datetime
+        page = {"Contents": [
+            {"Key": "backups/", "LastModified": datetime.datetime(2026, 1, 1), "Size": 0},        # malformed
+            {"Key": "backups/tenant/readme.txt", "LastModified": datetime.datetime(2026, 1, 1), "Size": 10},  # not .gz
+            {"Key": "backups/tenant/20260101-000000.gz", "LastModified": datetime.datetime(2026, 1, 1), "Size": 100},
+        ]}
+        paginator = MagicMock()
+        paginator.paginate.return_value = [page]
+        _mock_s3.get_paginator.return_value = paginator
+
+        resp = api.list_all_backups()
+        backups = json.loads(resp["body"])
+        assert len(backups) == 1
+        assert backups[0]["timestamp"] == "20260101-000000"
+
+
 class TestGetTenant:
     @pytest.mark.unit
     def test_not_found(self):

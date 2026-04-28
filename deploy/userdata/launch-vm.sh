@@ -3,11 +3,14 @@
 # SPDX-License-Identifier: MIT-0
 
 set -euo pipefail
-TENANT_ID="${1:?Usage: launch-vm.sh <tenant_id> <vm_num> [vcpu] [mem_mb] [config_template]}"
-VM_NUM="${2:?Usage: launch-vm.sh <tenant_id> <vm_num> [vcpu] [mem_mb] [config_template]}"
+TENANT_ID="${1:?Usage: launch-vm.sh <tenant_id> <vm_num> [vcpu] [mem_mb] [config_template] [restore_backup_key]}"
+VM_NUM="${2:?Usage: launch-vm.sh <tenant_id> <vm_num> [vcpu] [mem_mb] [config_template] [restore_backup_key]}"
 VCPU="${3:-2}"
 MEM_MB="${4:-4096}"
 CONFIG_TEMPLATE="${5:-}"
+RESTORE_KEY="${6:-}"
+# Caller may pass literal "" (quoted) as placeholder when only restore_key is set.
+[ "${CONFIG_TEMPLATE}" = '""' ] && CONFIG_TEMPLATE=""
 VM_DIR="/data/firecracker-vms/${TENANT_ID}"
 [ -f /etc/platform.env ] && source /etc/platform.env
 mkdir -p ${VM_DIR}
@@ -45,12 +48,31 @@ if [ ! -f "${OVERLAY}" ]; then
   mkfs.ext4 -q ${OVERLAY}
 fi
 
-# Data volume: first-time cp from template, subsequent launches reuse existing
+# Data volume: first-time initialize, subsequent launches reuse existing.
+#   - With RESTORE_KEY: download backup from S3, decompress, e2fsck. Size is whatever the backup is.
+#   - Without:          sparse-copy from template. Size must match DATA_SIZE.
 DATA_VOL="${VM_DIR}/data.ext4"
 NEW_DATA=false
-if [ ! -f "${DATA_VOL}" ] || [ "$(stat -c%s ${DATA_VOL} 2>/dev/null)" != "${DATA_SIZE}" ]; then
+NEEDS_INIT=false
+if [ ! -f "${DATA_VOL}" ]; then
+  NEEDS_INIT=true
+elif [ -z "${RESTORE_KEY}" ] && [ "$(stat -c%s ${DATA_VOL})" != "${DATA_SIZE}" ]; then
+  # Template size drift — rebuild only if we're using the template path.
+  NEEDS_INIT=true
+fi
+if [ "${NEEDS_INIT}" = "true" ]; then
   rm -f ${DATA_VOL}
-  cp --sparse=always ${DATA_TPL} ${DATA_VOL}
+  if [ -n "${RESTORE_KEY}" ]; then
+    log "restoring from s3://${ASSETS_BUCKET}/${RESTORE_KEY}"
+    aws s3 cp "s3://${ASSETS_BUCKET}/${RESTORE_KEY}" "/tmp/restore-${TENANT_ID}.gz" \
+      --region "${OC_REGION:-ap-northeast-1}" --quiet
+    pigz -d -c "/tmp/restore-${TENANT_ID}.gz" > ${DATA_VOL}
+    rm -f "/tmp/restore-${TENANT_ID}.gz"
+    e2fsck -fy ${DATA_VOL} >/dev/null 2>&1 || { log "FATAL: backup filesystem check failed"; exit 1; }
+    log "restored $(stat -c%s ${DATA_VOL}) bytes"
+  else
+    cp --sparse=always ${DATA_TPL} ${DATA_VOL}
+  fi
   NEW_DATA=true
 fi
 log "disks ready ($((SECONDS-T0))s)"

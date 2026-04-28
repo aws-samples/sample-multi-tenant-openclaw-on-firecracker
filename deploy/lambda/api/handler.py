@@ -55,6 +55,7 @@ def lambda_handler(event, context):
         ("GET", "/tenants/{id}/{action}"): lambda: tenant_get_action(
             path_params["id"], path_params["action"]
         ),
+        ("GET", "/backups"): list_all_backups,
         ("GET", "/hosts"): list_hosts,
         ("POST", "/hosts"): lambda: register_host(json.loads(event["body"])),
         ("POST", "/hosts/refresh-rootfs"): refresh_rootfs,
@@ -104,18 +105,35 @@ def create_tenant(body=None):
     vcpu = int(body.get("vcpu", VM_DEFAULT_VCPU))
     mem_mb = int(body.get("mem_mb", VM_DEFAULT_MEM))
     config_template = body.get("config_template", "")
+    restore_from = body.get("restore_from")
+
+    restore_backup_key = ""
+    if restore_from:
+        src_id = restore_from.get("tenant_id")
+        if not src_id:
+            return _resp(400, {"error": "restore_from.tenant_id required"})
+        ts = restore_from.get("timestamp")
+        restore_backup_key = _resolve_backup(src_id, ts)
+        if not restore_backup_key:
+            if ts:
+                return _resp(404, {"error": f"backup not found: {src_id}/{ts}"})
+            return _resp(404, {"error": f"no backups found for tenant_id={src_id}"})
+
     tenant_id = _gen_id(name)
     now = _now()
 
     # Find host with capacity
     host = _find_host(vcpu, mem_mb)
     if not host:
-        # No capacity — save as pending and scale out
+        # No capacity — save as pending and scale out.
+        # Persist config_template and restore_backup_key so process_pending() can apply them.
         tenants_table.put_item(Item={
             "id": tenant_id, "name": name,
             "vcpu": vcpu, "mem_mb": mem_mb,
             "status": "pending",
             "health_failures": 0,
+            "config_template": config_template,
+            "restore_backup_key": restore_backup_key,
             "created_at": now, "updated_at": now,
         })
         _scale_out()
@@ -139,6 +157,7 @@ def create_tenant(body=None):
         "health_failures": 0,
         "rootfs_version": host.get("rootfs_version", ""),
         "config_template": config_template,
+        "restore_backup_key": restore_backup_key,
         "creation_started_at": now,
         "created_at": now,
         "updated_at": now,
@@ -151,7 +170,7 @@ def create_tenant(body=None):
         ExpressionAttributeValues={":v": vcpu, ":m": mem_mb, ":one": 1, ":next": vm_num + 1, ":a": "active"},
     )
 
-    _launch_vm(host["instance_id"], tenant_id, vm_num, vcpu, mem_mb, guest_ip, host_port, config_template)
+    _launch_vm(host["instance_id"], tenant_id, vm_num, vcpu, mem_mb, guest_ip, host_port, config_template, restore_backup_key)
 
     # ALB path-based routing
     tg_arn = _ensure_host_tg(host["instance_id"], host["private_ip"])
@@ -338,6 +357,43 @@ def list_backups(tenant_id):
             "size_mb": round(obj["Size"] / 1048576, 1),
         })
     return _resp(200, {"tenant_id": tenant_id, "backups": backups})
+
+
+def list_all_backups():
+    """List all backups across all tenants, left-joined with tenants table to mark orphans."""
+    bucket = os.environ.get("ASSETS_BUCKET", "")
+    prefix = os.environ.get("BACKUP_PREFIX", "backups")
+
+    # Build tenant_id → (name, exists) map from DDB (include soft-deleted for name resolution)
+    tenants = tenants_table.scan().get("Items", [])
+    tenant_info = {
+        t["id"]: {"name": t.get("name", ""), "exists": t.get("status") != "deleted"}
+        for t in tenants
+    }
+
+    # Paginate S3 list to avoid missing objects when > 1000 backups exist
+    paginator = s3.get_paginator("list_objects_v2")
+    backups = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=f"{prefix}/"):
+        for obj in page.get("Contents", []):
+            parts = obj["Key"].split("/")
+            # Expect: {prefix}/{tenant_id}/{timestamp}.gz
+            if len(parts) < 3 or not parts[-1].endswith(".gz"):
+                continue
+            src_tenant_id = parts[-2]
+            timestamp = parts[-1][:-3]  # strip ".gz"
+            info = tenant_info.get(src_tenant_id, {"name": None, "exists": False})
+            backups.append({
+                "tenant_id": src_tenant_id,
+                "tenant_name": info["name"],
+                "tenant_exists": info["exists"],
+                "timestamp": timestamp,
+                "size_bytes": obj["Size"],
+                "last_modified": obj["LastModified"].isoformat(),
+            })
+
+    backups.sort(key=lambda b: b["last_modified"], reverse=True)
+    return _resp(200, backups)
 
 
 def tenant_get_action(tenant_id, action):
@@ -574,7 +630,8 @@ def process_pending():
             ExpressionAttributeValues={":v": vcpu, ":m": mem_mb, ":one": 1, ":next": vm_num + 1},
         )
 
-        _launch_vm(host["instance_id"], tenant["id"], vm_num, vcpu, mem_mb, guest_ip, host_port)
+        _launch_vm(host["instance_id"], tenant["id"], vm_num, vcpu, mem_mb, guest_ip, host_port,
+                   tenant.get("config_template", ""), tenant.get("restore_backup_key", ""))
         tg_arn = _ensure_host_tg(host["instance_id"], host["private_ip"])
         _add_alb_rule(tenant["id"], tg_arn)
         assigned += 1
@@ -627,6 +684,23 @@ def _gen_id(name):
     raw = f"{name}{time.time()}"
     short = hashlib.sha256(raw.encode()).hexdigest()[:4]
     return f"{name}-{short}"
+
+
+def _resolve_backup(src_tenant_id, timestamp=None):
+    """Return the S3 key of a backup, or empty string if not found.
+    If timestamp is given, look up that exact backup. Otherwise return the most recent.
+    """
+    bucket = os.environ.get("ASSETS_BUCKET", "")
+    prefix = os.environ.get("BACKUP_PREFIX", "backups")
+    resp = s3.list_objects_v2(Bucket=bucket, Prefix=f"{prefix}/{src_tenant_id}/")
+    objs = resp.get("Contents", [])
+    if not objs:
+        return ""
+    if timestamp:
+        key = f"{prefix}/{src_tenant_id}/{timestamp}.gz"
+        return key if any(o["Key"] == key for o in objs) else ""
+    # Latest = highest LastModified
+    return max(objs, key=lambda o: o["LastModified"])["Key"]
 
 
 ## ── ALB path-based routing ──
@@ -702,9 +776,13 @@ def _remove_host_tg(instance_id):
         pass
 
 
-def _launch_vm(instance_id, tenant_id, vm_num, vcpu, mem_mb, guest_ip, host_port, config_template=""):
-    """Fire-and-forget: launch VM + set up DNAT."""
-    cmd = (f"/home/ubuntu/launch-vm.sh {tenant_id} {vm_num} {vcpu} {mem_mb} {config_template} && "
+def _launch_vm(instance_id, tenant_id, vm_num, vcpu, mem_mb, guest_ip, host_port, config_template="", restore_backup_key=""):
+    """Fire-and-forget: launch VM + set up DNAT.
+    If restore_backup_key is non-empty, launch-vm.sh will restore data.ext4 from that S3 key instead of using the template.
+    """
+    # When restore is used but no template, still need a placeholder in arg 5 so positional args align.
+    tpl_arg = config_template or '""'
+    cmd = (f"/home/ubuntu/launch-vm.sh {tenant_id} {vm_num} {vcpu} {mem_mb} {tpl_arg} {restore_backup_key} && "
            f"sudo iptables -t nat -A PREROUTING -i $(ip route show default | awk '{{print $5}}' | head -1) "
            f"-p tcp --dport {host_port} -j DNAT --to-destination {guest_ip}:{VM_PORT_BASE}")
     _ssm_send(instance_id, cmd, timeout=300)

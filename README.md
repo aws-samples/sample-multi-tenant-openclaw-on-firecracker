@@ -18,92 +18,19 @@ Multi-tenant isolated deployment of OpenClaw AI agents on AWS using Firecracker 
 - **Web Console** — Online management console with Cognito authentication, real-time host/tenant status
 - **Rootfs Pre-build** — Rootfs + data template distributed via S3, downloaded on host init
 - **Dashboard Access** — One-click HTTPS access to each tenant's OpenClaw Dashboard, no custom domain required
-- **Auto Backup** — EventBridge scheduled backup of all tenant data volumes to S3, with manual trigger and backup query API
+- **Auto Backup & Restore** — EventBridge scheduled backup of all tenant data volumes to S3, with manual trigger, cross-tenant backup query, and one-click restore into a new tenant (orphan-safe — source tenant need not exist)
 - **AgentCore Integration** — Optional toggle; when enabled, all VMs auto-connect to AgentCore Gateway (MCP tool hub), Memory, Code Interpreter, and Browser
 - **Shared Skills** — All tenants share a unified skill set (S3-managed, auto-synced to all VMs), with independent memory
 - **Config Templates** — Custom OpenClaw configuration templates for different LLM providers/models, selectable when creating tenants
 - **Default Toolchain** — Each VM comes with Python3/uv/git/gh/Node.js/htop/tmux/tree pre-installed
-- **Data Backup** — Automated daily backup + manual backup API, Firecracker pause/resume for consistency
 
-## Architecture
+## Quick Start
 
-```
-Admin / User
-    │
-    ├── API Gateway (HTTPS, x-api-key) ──→ Lambda ──→ DynamoDB
-    │                                                  ├── tenants
-    │                                                  └── hosts
-    │
-    └── ALB (HTTPS) ──→ Host Nginx:80 ──→ VM Gateway:18789
-                        ├── /vm/{tenant-a}/ → 172.16.1.2
-                        └── /vm/{tenant-b}/ → 172.16.2.2
-
-Lambda ── SSM Run Command ──→ EC2 Host
-                               ├── microVM 01 (172.16.1.2)
-                               ├── microVM 02 (172.16.2.2)
-                               └── ...
-
-S3: rootfs distribution + data backup + shared skills
-ASG: auto-scaling hosts
-EventBridge: health checks + idle reclamation + scheduled backup
-```
-
-<details>
-<summary>System Architecture</summary>
-
-![System Architecture](docs/oc-system-arch.png)
-
-</details>
-
-<details>
-<summary>Deployment Architecture</summary>
-
-![Deployment Architecture](docs/oc-deploy-arch.png)
-
-</details>
-
-## Project Structure
-
-```
-sample-multi-tenant-openclaw-on-firecracker/
-├── deploy/                    # CDK project
-│   ├── app.py                 # CDK app entry
-│   ├── stack.py               # Infrastructure definition
-│   ├── lambda/
-│   │   ├── api/handler.py     # Tenant CRUD + host management
-│   │   ├── templates/handler.py  # Config template CRUD
-│   │   ├── skills/handler.py  # Shared skills list
-│   │   ├── health_check/handler.py  # Scheduled health checks
-│   │   ├── agentcore_tools/handler.py  # AgentCore Gateway Lambda tools
-│   │   └── scaler/handler.py  # Idle host reclamation
-│   └── userdata/
-│       ├── init-host.sh       # Host initialization
-│       ├── host-agent.py      # VM health polling + DDB writes + balloon
-│       ├── launch-vm.sh       # microVM launch
-│       └── stop-vm.sh         # microVM stop
-├── console/                   # Web management console
-│   ├── index.html             # Alpine.js SPA (3 tabs)
-│   └── style.css
-├── tests/                     # Test suite (unit + e2e)
-├── templates/                 # OpenClaw config templates
-│   └── openclaw.json.example  # Example config
-├── pyproject.toml             # Python project config + dependencies
-├── cdk.json                   # CDK app config + feature flags
-├── config.yml                 # Infrastructure config (single source of truth)
-├── setup.sh                   # One-click deploy + export .env.deploy
-├── build-rootfs.sh            # Build rootfs + data template, upload to S3
-├── scripts/
-│   └── bind-domain.sh         # Bind custom domain + HTTPS to CloudFront
-└── docs/
-```
-
-## Prerequisites
+**Prerequisites:**
 
 - AWS account + CLI configured
 - CDK CLI + Python 3.12+
 - uv (Python package manager)
-
-## Quick Start
 
 ```bash
 # 1. Configure
@@ -131,12 +58,17 @@ curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" \
 
 Web-based console hosted on CloudFront (`/console/`), with Cognito authentication.
 
-![Management Console](docs/web_console.png)
-
 Features:
 - **Tenants** — Host resource overview, create/delete tenants, one-click Dashboard access
 - **Application** — Shared skills list, config template management (create/edit/delete)
+- **Backups** — Cross-tenant backup explorer with per-tenant grouping, orphan filter, and one-click restore into a new tenant
 - **Settings** — API connection, AgentCore status, system info
+
+### Screenshots
+
+![Tenants tab](docs/web_console.png)
+
+![Backups tab](docs/web_console_backup.png)
 
 ## Dashboard Access
 
@@ -168,7 +100,7 @@ Optionally bind a custom domain + HTTPS directly to the ALB:
 
 The script creates the ALB HTTPS listener, attaches the ACM certificate, and updates `DASHBOARD_URL` in `.env.deploy`.
 
-## Auto Backup
+## Auto Backup & Restore
 
 EventBridge schedules daily backups of all running tenant data volumes to S3. Manual trigger also supported.
 
@@ -180,8 +112,11 @@ source .env.deploy
 # Manual backup (async, returns 202)
 curl -s -X POST "${API_URL}tenants/{id}/backup" -H "x-api-key: ${API_KEY}" | jq .
 
-# List backups
+# List backups for one tenant
 curl -s "${API_URL}tenants/{id}/backups" -H "x-api-key: ${API_KEY}" | jq .
+
+# List all backups across all tenants (marks orphan vs active)
+curl -s "${API_URL}backups" -H "x-api-key: ${API_KEY}" | jq .
 
 # Config (config.yml):
 # backup_cron: "cron(0 19 * * ? *)"  # UTC 19:00 = Beijing 03:00
@@ -189,6 +124,29 @@ curl -s "${API_URL}tenants/{id}/backups" -H "x-api-key: ${API_KEY}" | jq .
 ```
 
 Backups stored at `s3://{bucket}/backups/{tenant-id}/{timestamp}.gz`.
+
+### Restore from Backup
+
+Restore creates a **new** tenant using a backup's data volume. The source tenant does not need to exist — orphan backups from deleted tenants are fully restorable.
+
+```bash
+# Restore from the latest backup of a (possibly deleted) tenant
+curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" -d '{
+  "name": "restored-agent",
+  "vcpu": 2, "mem_mb": 4096,
+  "restore_from": {"tenant_id": "my-agent-ab12"}
+}' | jq .
+
+# Restore from a specific backup timestamp
+curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" -d '{
+  "name": "restored-agent",
+  "restore_from": {"tenant_id": "my-agent-ab12", "timestamp": "20260428-125402"}
+}' | jq .
+```
+
+- `restore_from` is decoupled from `vcpu`/`mem_mb`/`config_template` — those follow the new tenant's spec
+- Data volume size equals the backup's actual size (no resize)
+- The new tenant gets a fresh ID; the source's identity is not inherited
 
 ## Shared Skills
 
@@ -255,6 +213,78 @@ See `config.yml.example` for all options. Redeploy after changes: `./setup.sh <r
 ./scripts/destroy.sh --purge   # Full cleanup including S3 data and DynamoDB tables
 ```
 
+## Architecture
+
+```
+Admin / User
+    │
+    ├── API Gateway (HTTPS, x-api-key) ──→ Lambda ──→ DynamoDB
+    │                                                  ├── tenants
+    │                                                  └── hosts
+    │
+    └── ALB (HTTPS) ──→ Host Nginx:80 ──→ VM Gateway:18789
+                        ├── /vm/{tenant-a}/ → 172.16.1.2
+                        └── /vm/{tenant-b}/ → 172.16.2.2
+
+Lambda ── SSM Run Command ──→ EC2 Host
+                               ├── microVM 01 (172.16.1.2)
+                               ├── microVM 02 (172.16.2.2)
+                               └── ...
+
+S3: rootfs distribution + data backup + shared skills
+ASG: auto-scaling hosts
+EventBridge: health checks + idle reclamation + scheduled backup
+```
+
+<details>
+<summary>System Architecture</summary>
+
+![System Architecture](docs/oc-system-arch.png)
+
+</details>
+
+<details>
+<summary>Deployment Architecture</summary>
+
+![Deployment Architecture](docs/oc-deploy-arch.png)
+
+</details>
+
+## Project Structure
+
+```
+sample-multi-tenant-openclaw-on-firecracker/
+├── deploy/                    # CDK project
+│   ├── app.py                 # CDK app entry
+│   ├── stack.py               # Infrastructure definition
+│   ├── lambda/
+│   │   ├── api/handler.py     # Tenant CRUD + host management
+│   │   ├── templates/handler.py  # Config template CRUD
+│   │   ├── skills/handler.py  # Shared skills list
+│   │   ├── health_check/handler.py  # Scheduled health checks
+│   │   ├── agentcore_tools/handler.py  # AgentCore Gateway Lambda tools
+│   │   └── scaler/handler.py  # Idle host reclamation
+│   └── userdata/
+│       ├── init-host.sh       # Host initialization
+│       ├── host-agent.py      # VM health polling + DDB writes + balloon
+│       ├── launch-vm.sh       # microVM launch
+│       └── stop-vm.sh         # microVM stop
+├── console/                   # Web management console
+│   ├── index.html             # Alpine.js SPA (4 tabs)
+│   └── style.css
+├── tests/                     # Test suite (unit + e2e)
+├── templates/                 # OpenClaw config templates
+│   └── openclaw.json.example  # Example config
+├── pyproject.toml             # Python project config + dependencies
+├── cdk.json                   # CDK app config + feature flags
+├── config.yml                 # Infrastructure config (single source of truth)
+├── setup.sh                   # One-click deploy + export .env.deploy
+├── build-rootfs.sh            # Build rootfs + data template, upload to S3
+├── scripts/
+│   └── bind-domain.sh         # Bind custom domain + HTTPS to CloudFront
+└── docs/
+```
+
 ## API Reference
 
 All requests require `x-api-key` header.
@@ -262,7 +292,7 @@ All requests require `x-api-key` header.
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | /tenants | List all tenants |
-| POST | /tenants | Create tenant `{"name":"xx","vcpu":2,"mem_mb":4096}` |
+| POST | /tenants | Create tenant `{"name":"xx","vcpu":2,"mem_mb":4096}` — add `"restore_from":{"tenant_id":"..."}` to restore from a backup |
 | GET | /tenants/{id} | Get tenant details |
 | DELETE | /tenants/{id} | Delete tenant (`?keep_data=true` to preserve data volume) |
 | POST | /tenants/{id}/restart | Restart VM (reuse disks, fast) |
@@ -272,7 +302,8 @@ All requests require `x-api-key` header.
 | POST | /tenants/{id}/resume | Resume a paused VM |
 | POST | /tenants/{id}/reset | Reinstall rootfs (data volume preserved) |
 | POST | /tenants/{id}/backup | Manual data backup (async, returns 202) |
-| GET | /tenants/{id}/backups | List backups |
+| GET | /tenants/{id}/backups | List backups for one tenant |
+| GET | /backups | List all backups across tenants (includes orphan flag) |
 | GET | /hosts | List all hosts |
 | POST | /hosts | Register host (called by UserData) |
 | POST | /hosts/refresh-rootfs | Push latest rootfs to all hosts |

@@ -414,7 +414,9 @@
   <div class="section-card">
     <h3>System</h3>
     <div style="font-size:13px;color:var(--gray)">
+      <div>Version: <span x-text="'v' + (window.OC_VERSION || 'dev')"></span></div>
       <div>Site URL: <span x-text="window.OC_DASHBOARD_BASE || '-'"></span></div>
+      <div>GitHub: <a href="https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker" target="_blank" style="color:var(--cyan)">aws-samples/sample-multi-tenant-openclaw-on-firecracker</a></div>
     </div>
   </div>
 </div>

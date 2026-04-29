@@ -60,6 +60,8 @@
   <symbol id="i-eye" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
   <symbol id="i-eye-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></symbol>
   <symbol id="i-edit" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></symbol>
+  <symbol id="i-restore" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="21 8 21 21 3 21 3 8"/><rect x="1" y="3" width="22" height="5"/><line x1="10" y1="12" x2="14" y2="12"/><polyline points="16 16 12 20 8 16"/></symbol>
+  <symbol id="i-chevron-right" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></symbol>
 </svg>
 
 <!-- Header -->
@@ -73,6 +75,7 @@
 <div class="nav-tabs">
   <button class="nav-tab" :class="page==='tenants' && 'active'" @click="page='tenants'">Tenants</button>
   <button class="nav-tab" :class="page==='app' && 'active'" @click="page='app'">Application</button>
+  <button class="nav-tab" :class="page==='backups' && 'active'" @click="page='backups'; loadBackups()">Backups</button>
   <button class="nav-tab" :class="page==='settings' && 'active'" @click="page='settings'">Settings</button>
 </div>
 
@@ -85,9 +88,6 @@
     <div class="hosts-panel">
       <div class="panel-header">
         <span class="panel-title">Hosts (Group)</span>
-        <button class="btn btn-outline" style="margin-left:auto;font-size:12px;padding:4px 10px" @click="refresh()" :disabled="loadingHosts||loadingTenants">
-          Refresh <span :class="(loadingHosts||loadingTenants) && 'spin'"><svg class="icon s13"><use href="#i-refresh"/></svg></span>
-        </button>
       </div>
       <div style="display:flex;align-items:center;gap:8px;padding:0 4px 6px;font-size:12px">
         <span style="color:var(--gray)" x-text="'Latest rootfs: '+(rootfsVersion||'…')"></span>
@@ -137,7 +137,7 @@
 
       <!-- AgentCore status mini-panel -->
       <template x-if="agentcoreStatus.enabled">
-        <div style="margin-bottom:12px;padding:8px 12px;border:1px solid #0f83;border-radius:6px;background:var(--panel)">
+        <div class="section-card mini-panel" style="border-color:#0f83">
           <span style="font-size:13px;color:var(--green)">⚡ AgentCore</span>
           <span style="font-size:11px;color:var(--gray)">enabled</span>
           <a :href="'https://'+agentcoreRegion+'.console.aws.amazon.com/cloudwatch/home?region='+agentcoreRegion+'#dashboards'" target="_blank" style="font-size:11px;color:var(--cyan);margin-left:8px">📊 CloudWatch</a>
@@ -145,7 +145,7 @@
       </template>
 
       <!-- Skills mini-panel -->
-      <div style="margin-bottom:12px;padding:8px 12px;border:1px solid var(--border);border-radius:6px;background:var(--panel)">
+      <div class="section-card mini-panel">
         <span style="font-size:13px;color:var(--cyan)"><svg class="icon s14" style="vertical-align:-2px"><use href="#i-brain"/></svg> Shared Skills</span>
         <span style="font-size:11px;color:var(--gray)" x-text="'('+skills.length+')'"></span>
         <template x-for="s in skills" :key="s.id">
@@ -155,8 +155,23 @@
 
       <div class="panel-header">
         <span class="panel-title">Tenants <template x-if="selectedHost"><span style="font-size:12px;color:var(--cyan-dim)">— <span x-text="selectedHost"></span> <button class="btn-icon" @click="selectedHost=null" style="font-size:12px"><svg class="icon s12"><use href="#i-delete"/></svg></button></span></template></span>
-        <div style="display:flex;gap:10px;align-items:center">
-          <button class="btn btn-cyan" @click="showModal=true">New Tenant</button>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button class="btn btn-cyan btn-sm" @click="restoreSource=null; showModal=true">+ New</button>
+          <button class="btn btn-outline btn-sm" @click="refresh()" :disabled="loadingHosts||loadingTenants">
+            Refresh <span :class="(loadingHosts||loadingTenants) && 'spin'"><svg class="icon s13"><use href="#i-refresh"/></svg></span>
+          </button>
+        </div>
+      </div>
+      <div class="panel-header">
+        <div style="display:flex;align-items:center;gap:12px">
+          <label style="font-size:12px;color:var(--gray)">Status</label>
+          <select class="settings-input" x-model="statusFilter" style="width:140px;padding:4px 8px;font-size:12px">
+            <option value="all">All</option>
+            <template x-for="s in tenantStatuses" :key="s">
+              <option :value="s" x-text="s"></option>
+            </template>
+          </select>
+          <span style="font-size:12px;color:var(--gray)" x-text="filteredTenants.length + ' tenant(s)'"></span>
         </div>
       </div>
       <div class="table-wrap">
@@ -217,33 +232,6 @@
       </div>
     </div>
   </div><!-- /flex-layout -->
-
-  <!-- Create Tenant Modal -->
-  <template x-if="showModal">
-    <div class="overlay" @click.self="showModal=false">
-      <div class="modal">
-        <button class="close-btn" @click="showModal=false"><svg class="icon s16"><use href="#i-delete"/></svg></button>
-        <h2>New Tenant</h2>
-        <label>Name <span class="req">*</span></label>
-        <input type="text" x-model="form.name" placeholder="e.g. my-tenant" @keydown.enter="createTenant()">
-        <label>vCPU <span class="opt">optional</span></label>
-        <input type="number" x-model.number="form.vcpu" placeholder="2">
-        <label>Memory (MB) <span class="opt">optional</span></label>
-        <input type="number" x-model.number="form.memory_mb" placeholder="4096">
-        <label>Config Template <span class="opt">optional</span></label>
-        <select x-model="form.config_template" class="settings-input">
-          <option value="">Default (built-in)</option>
-          <template x-for="t in templates" :key="t.name">
-            <option :value="t.name" x-text="t.name"></option>
-          </template>
-        </select>
-        <div class="modal-actions">
-          <button class="btn btn-cyan" @click="showModal=false">Cancel</button>
-          <button class="btn btn-create" @click="createTenant()" :disabled="!form.name">Create</button>
-        </div>
-      </div>
-    </div>
-  </template>
 </div><!-- /page:tenants -->
 
 <!-- Page: App Config -->
@@ -310,6 +298,86 @@
   </div>
 </div>
 
+<!-- Page: Backups -->
+<div x-show="page==='backups'" class="page-content">
+  <h2>💾 Backups</h2>
+  <div class="panel-header">
+    <div style="display:flex;align-items:center;gap:12px">
+      <label style="font-size:12px;color:var(--gray)">Filter</label>
+      <select class="settings-input" x-model="backupFilter" style="width:160px">
+        <option value="all">All</option>
+        <option value="orphan">Orphan only</option>
+      </select>
+      <span style="font-size:12px;color:var(--gray)" x-text="backupGroups.length + ' tenant(s), ' + filteredBackups.length + ' backup(s)'"></span>
+    </div>
+    <button class="btn btn-outline btn-sm" @click="loadBackups()" :disabled="loadingBackups">
+      Refresh <span :class="loadingBackups && 'spin'"><svg class="icon s13"><use href="#i-refresh"/></svg></span>
+    </button>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Tenant</th><th>Source Status</th><th>Backup Time</th><th>Size</th><th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        <template x-if="backupGroups.length === 0 && !loadingBackups">
+          <tr><td colspan="5" class="empty" x-text="backupFilter==='orphan' ? 'No orphan backups' : 'No backups'"></td></tr>
+        </template>
+        <template x-for="g in backupGroups" :key="g.tenant_id">
+          <template x-for="(b, i) in (expandedGroups.has(g.tenant_id) ? g.backups : [g.backups[0]])" :key="b.timestamp">
+            <tr :class="i > 0 && 'backup-child-row'">
+              <td>
+                <template x-if="i === 0">
+                  <span style="display:inline-flex;align-items:center;gap:6px">
+                    <template x-if="g.backups.length > 1">
+                      <button class="btn-icon backup-toggle" :class="expandedGroups.has(g.tenant_id) && 'expanded'"
+                              @click="toggleGroup(g.tenant_id)" :title="expandedGroups.has(g.tenant_id) ? 'Collapse' : 'Expand history'">
+                        <svg class="icon s12"><use href="#i-chevron-right"/></svg>
+                      </button>
+                    </template>
+                    <template x-if="g.backups.length === 1">
+                      <span style="display:inline-block;width:12px"></span>
+                    </template>
+                    <span x-text="g.tenant_name || g.tenant_id"></span>
+                    <template x-if="g.tenant_name">
+                      <span style="color:var(--gray);font-size:11px" x-text="g.tenant_id"></span>
+                    </template>
+                    <template x-if="g.backups.length > 1">
+                      <span class="badge badge-count" x-text="'+' + (g.backups.length - 1) + ' more'"></span>
+                    </template>
+                  </span>
+                </template>
+                <template x-if="i > 0">
+                  <span style="color:var(--gray);font-size:11px;padding-left:30px">↳ previous backup</span> 
+                </template>
+              </td>
+              <td>
+                <template x-if="i === 0">
+                  <span class="badge" :class="b.tenant_exists ? 'badge-active' : 'badge-inactive'"
+                        x-text="b.tenant_exists ? 'active' : 'orphan'"></span>
+                </template>
+              </td>
+              <td x-text="formatTs(b.timestamp)"></td>
+              <td x-text="formatBytes(b.size_bytes)"></td>
+              <td>
+                <button class="btn-act" :title="i === 0 ? 'Restore latest — create a new tenant from this backup' : 'Restore this version'" @click="openRestore(b)">
+                  <svg class="icon s13"><use href="#i-restore"/></svg>
+                </button>
+              </td>
+            </tr>
+          </template>
+        </template>
+      </tbody>
+    </table>
+  </div>
+  <p style="color:var(--gray);font-size:12px;margin-top:12px">
+    Backups are retained for 7 days (S3 lifecycle). Orphan backups are from tenants that have been deleted —
+    restoring creates a new tenant with the backup's data volume.
+  </p>
+</div>
+
 <!-- Page: Settings -->
 <div x-show="page==='settings'" class="page-content">
   <h2>🔧 Settings</h2>
@@ -351,6 +419,48 @@
   </div>
 </div>
 
+<!-- Create / Restore Tenant Modal (global — not nested in any tab so it's visible from Tenants and Backups) -->
+<template x-if="showModal">
+  <div class="overlay" @click.self="closeCreateModal()">
+    <div class="modal">
+      <button class="close-btn" @click="closeCreateModal()"><svg class="icon s16"><use href="#i-delete"/></svg></button>
+      <h2 x-text="restoreSource ? 'Create from Backup' : 'New Tenant'"></h2>
+      <template x-if="restoreSource">
+        <div style="margin:-4px 0 12px;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);font-size:12px">
+          <div style="color:var(--gray)">Source backup</div>
+          <div style="color:var(--text);margin-top:2px">
+            <span x-text="restoreSource.tenant_name || restoreSource.tenant_id"></span>
+            <span style="color:var(--gray)"> · </span>
+            <span x-text="formatTs(restoreSource.timestamp)"></span>
+            <span style="color:var(--gray)"> · </span>
+            <span x-text="formatBytes(restoreSource.size_bytes)"></span>
+            <template x-if="!restoreSource.tenant_exists">
+              <span class="badge badge-inactive" style="margin-left:8px;font-size:10px">orphan</span>
+            </template>
+          </div>
+        </div>
+      </template>
+      <label>Name <span class="req">*</span></label>
+      <input type="text" x-model="form.name" placeholder="e.g. my-tenant" @keydown.enter="createTenant()">
+      <label>vCPU <span class="opt">optional</span></label>
+      <input type="number" x-model.number="form.vcpu" placeholder="2">
+      <label>Memory (MB) <span class="opt">optional</span></label>
+      <input type="number" x-model.number="form.memory_mb" placeholder="4096">
+      <label>Config Template <span class="opt">optional</span></label>
+      <select x-model="form.config_template" class="settings-input">
+        <option value="">Default (built-in)</option>
+        <template x-for="t in templates" :key="t.name">
+          <option :value="t.name" x-text="t.name"></option>
+        </template>
+      </select>
+      <div class="modal-actions">
+        <button class="btn btn-cyan" @click="closeCreateModal()">Cancel</button>
+        <button class="btn btn-create" @click="createTenant()" :disabled="!form.name" x-text="restoreSource ? 'Create from Backup' : 'Create'"></button>
+      </div>
+    </div>
+  </div>
+</template>
+
 <script>
 function app() {
   return {
@@ -365,6 +475,10 @@ function app() {
     editTpl: null,
     agentcoreStatus: { enabled: false }, agentcoreRegion: 'ap-northeast-1',
     form: { name: '', vcpu: null, memory_mb: null, config_template: '' },
+    backups: [], backupFilter: 'all', loadingBackups: false,
+    expandedGroups: new Set(),   // tenant_ids whose history rows are expanded
+    restoreSource: null,   // set when modal opened from Backups tab; null = normal create
+    statusFilter: 'all',   // filter for tenants list
 
     init() {
       this.apiUrl = localStorage.getItem('oc_api_url') || window.OC_DEFAULT_API_URL || '';
@@ -413,10 +527,85 @@ function app() {
       if (this.form.vcpu) body.vcpu = this.form.vcpu;
       if (this.form.memory_mb) body.mem_mb = this.form.memory_mb;
       if (this.form.config_template) body.config_template = this.form.config_template;
-      await this.api('POST', 'tenants', body);
-      this.form = { name: '', vcpu: null, memory_mb: null, config_template: '' };
-      this.showModal = false;
+      if (this.restoreSource) {
+        body.restore_from = {
+          tenant_id: this.restoreSource.tenant_id,
+          timestamp: this.restoreSource.timestamp,
+        };
+      }
+      const r = await this.api('POST', 'tenants', body);
+      if (r && r.error) {
+        this.toast = '✗ ' + r.error;
+        setTimeout(() => this.toast = '', 4000);
+        return;
+      }
+      const wasRestore = !!this.restoreSource;
+      this.closeCreateModal();
+      if (wasRestore) {
+        this.page = 'tenants';    // jump to Tenants tab to watch the new VM come up
+      }
       this.loadTenants();
+    },
+    closeCreateModal() {
+      this.showModal = false;
+      this.restoreSource = null;
+      this.form = { name: '', vcpu: null, memory_mb: null, config_template: '' };
+    },
+    async loadBackups() {
+      if (!this.apiUrl || !this.apiKey) return;
+      this.loadingBackups = true;
+      try { this.backups = await this.api('GET', 'backups'); this.connected = true; }
+      catch { this.connected = false; this.backups = []; }
+      this.loadingBackups = false;
+    },
+    openRestore(backup) {
+      this.restoreSource = backup;
+      this.form = {
+        name: (backup.tenant_name || backup.tenant_id) + '-restored',
+        vcpu: null, memory_mb: null, config_template: '',
+      };
+      this.showModal = true;
+    },
+    formatTs(ts) {
+      if (!ts) return '-';
+      // API returns ISO 8601 like "2026-04-27T19:00:39Z"
+      const d = new Date(ts);
+      return isNaN(d) ? ts : d.toLocaleString();
+    },
+    formatBytes(n) {
+      if (!n) return '-';
+      const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+      let i = 0;
+      while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+      return n.toFixed(i ? 1 : 0) + ' ' + units[i];
+    },
+    get filteredBackups() {
+      if (this.backupFilter === 'orphan') return this.backups.filter(b => !b.tenant_exists);
+      return this.backups;
+    },
+    get backupGroups() {
+      // Group by tenant_id, sort groups so most recently backed-up tenant is at top.
+      const groups = new Map();
+      for (const b of this.filteredBackups) {
+        if (!groups.has(b.tenant_id)) {
+          groups.set(b.tenant_id, {
+            tenant_id: b.tenant_id,
+            tenant_name: b.tenant_name,
+            tenant_exists: b.tenant_exists,
+            backups: [],
+          });
+        }
+        groups.get(b.tenant_id).backups.push(b);
+      }
+      return [...groups.values()].sort((a, b) =>
+        a.backups[0].last_modified.localeCompare(b.backups[0].last_modified)
+      );
+    },
+    toggleGroup(tenantId) {
+      // Reassign to a new Set so Alpine's reactivity picks up the change.
+      const s = new Set(this.expandedGroups);
+      if (s.has(tenantId)) s.delete(tenantId); else s.add(tenantId);
+      this.expandedGroups = s;
     },
     async loadTemplates() {
       try { const r = await this.api('GET', 'templates'); this.templates = r.templates || []; } catch {}
@@ -475,7 +664,15 @@ function app() {
       return h.used_mem_mb > h.total_mem_mb ? 'bar-mem-over' : 'bar-mem';
     },
     healthClass(v) { return v === 'up' ? 'health-up' : v === 'down' ? 'health-down' : 'health-unknown'; },
-    get filteredTenants() { return this.selectedHost ? this.tenants.filter(t => t.host_id === this.selectedHost) : this.tenants; },
+    get filteredTenants() {
+      let list = this.tenants;
+      if (this.selectedHost) list = list.filter(t => t.host_id === this.selectedHost);
+      if (this.statusFilter !== 'all') list = list.filter(t => t.status === this.statusFilter);
+      return list;
+    },
+    get tenantStatuses() {
+      return [...new Set(this.tenants.map(t => t.status).filter(Boolean))].sort();
+    },
   };
 }
 </script>

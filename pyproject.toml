@@ -1,9 +1,10 @@
 [project]
 name = "sample-multi-tenant-openclaw-on-firecracker"
-version = "0.9.6"
+version = "1.0.0"
 requires-python = ">=3.12"
 dependencies = [
-    "aws-cdk-lib>=2.170.0",
+    "aws-cdk-lib>=2.251.0",
+    "aws-cdk.aws-bedrock-agentcore-alpha==2.251.0a0",
     "constructs>=10.0.0",
     "pyyaml>=6.0",
 ]

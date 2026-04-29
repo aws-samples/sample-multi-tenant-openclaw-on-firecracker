@@ -35,6 +35,8 @@ input { font-family: inherit; }
 .page-content h2 { font-size:18px; margin-bottom:16px; color:var(--text); }
 .section-card { border:1px solid var(--border); border-radius:8px; padding:16px; margin-bottom:16px; background:var(--panel); max-width:1080px; }
 .section-card h3 { font-size:14px; color:var(--cyan); margin-bottom:8px; }
+/* Compact variant: same visual container as section-card but slimmer padding for inline status/skills strips */
+.mini-panel { padding:8px 12px; margin-bottom:12px; max-width:none; }
 .config-item { display:flex; align-items:baseline; gap:12px; padding:6px 0; border-bottom:1px solid var(--border); }
 .config-item:last-child { border-bottom:none; }
 .config-name { font-size:13px; font-weight:600; color:var(--text); min-width:160px; }
@@ -75,6 +77,12 @@ input { font-family: inherit; }
 .badge-stopped { border: 1px solid var(--red, #f44); color: var(--red, #f44); }
 .badge-paused { border: 1px solid var(--yellow, #fa0); color: var(--yellow, #fa0); }
 .badge-draining { border: 1px solid var(--gray); color: var(--gray); }
+.badge-count { font-size: 9px; padding: 1px 6px; border: 1px solid var(--cyan-dim); color: var(--cyan-dim); font-weight: 400; }
+.backup-toggle { color: var(--cyan-dim); transition: transform .15s; font-size: 14px; }
+.backup-toggle:hover { color: var(--cyan); }
+.backup-toggle.expanded { transform: rotate(90deg); }
+.backup-child-row td { background: rgba(0, 255, 255, 0.02); border-bottom-color: #1a2332; font-size: 11px; color: var(--cyan-dim); }
+.backup-child-row:last-child td { border-bottom: 1px solid var(--border); }
 .act-group { display:flex; gap:2px; align-items:center; flex-wrap:nowrap; }
 .host-row { display: flex; align-items: center; font-size: 11px; margin-bottom: 4px; gap: 8px; }
 .host-label { width: 62px; color: #6b7a8d; white-space: nowrap; }
@@ -91,7 +99,7 @@ input { font-family: inherit; }
 .host-val { width: 60px; text-align: right; font-size: 11px; }
 
 /* Tenants table */
-.table-wrap { overflow-x: auto; }
+.table-wrap { overflow-x: auto; border:1px solid var(--border); border-radius:8px; background:var(--panel); }
 table { width: 100%; border-collapse: collapse; font-size: 12px; }
 th { text-align: left; padding: 8px 10px; color: var(--cyan); border-bottom: 1px solid var(--border); font-weight: 600; white-space: nowrap; }
 td { padding: 8px 10px; border-bottom: 1px solid #1a2332; white-space: nowrap; }

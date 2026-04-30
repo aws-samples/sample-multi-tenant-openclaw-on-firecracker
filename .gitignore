@@ -40,8 +40,10 @@ node_modules/
 # Generated files
 console/config.js
 
-# Articles (not for repo)
+# Articles & Blog drafts (not for repo)
 article*.md
+blog*.md
+blog*.docx
 
 # Temp files
 ~$*

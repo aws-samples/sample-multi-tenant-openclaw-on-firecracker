@@ -39,3 +39,9 @@ node_modules/
 
 # Generated files
 console/config.js
+
+# Articles (not for repo)
+article*.md
+
+# Temp files
+~$*

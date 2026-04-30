@@ -412,3 +412,60 @@ class TestGenId:
             ids.add(api._gen_id("vm"))
             time.sleep(0.001)  # Ensure different time.time()
         assert len(ids) == 20
+
+
+# ═══════════════════════════════════════════
+# AgentCore status
+# ═══════════════════════════════════════════
+
+class TestAgentCoreStatus:
+    @pytest.mark.unit
+    def test_disabled_by_default(self):
+        """When AGENTCORE_ENABLED not set, status returns disabled."""
+        import os
+        orig = os.environ.pop("AGENTCORE_ENABLED", None)
+        try:
+            # Re-read env in handler
+            api.os.environ.pop("AGENTCORE_ENABLED", None)
+            resp = api.agentcore_status()
+            body = json.loads(resp["body"])
+            assert body["enabled"] is False
+            assert body["gateway_url"] is None
+        finally:
+            if orig:
+                os.environ["AGENTCORE_ENABLED"] = orig
+
+    @pytest.mark.unit
+    def test_enabled_with_gateway(self):
+        """When enabled with gateway URL, both are returned."""
+        import os
+        orig_enabled = os.environ.get("AGENTCORE_ENABLED")
+        orig_url = os.environ.get("AGENTCORE_GATEWAY_URL")
+        try:
+            os.environ["AGENTCORE_ENABLED"] = "true"
+            os.environ["AGENTCORE_GATEWAY_URL"] = "https://gateway.example.com"
+            resp = api.agentcore_status()
+            body = json.loads(resp["body"])
+            assert body["enabled"] is True
+            assert body["gateway_url"] == "https://gateway.example.com"
+        finally:
+            if orig_enabled is None:
+                os.environ.pop("AGENTCORE_ENABLED", None)
+            else:
+                os.environ["AGENTCORE_ENABLED"] = orig_enabled
+            if orig_url is None:
+                os.environ.pop("AGENTCORE_GATEWAY_URL", None)
+            else:
+                os.environ["AGENTCORE_GATEWAY_URL"] = orig_url
+
+    @pytest.mark.unit
+    @pytest.mark.regression
+    def test_status_route_accessible(self):
+        """GET /agentcore/status should be routable."""
+        resp = api.lambda_handler({
+            "httpMethod": "GET", "resource": "/agentcore/status",
+            "pathParameters": {},
+        }, None)
+        assert resp["statusCode"] == 200
+        body = json.loads(resp["body"])
+        assert "enabled" in body

@@ -1,5 +1,26 @@
 # Changelog
 
+## [1.1.0] - 2026-04-30
+
+### Added
+- **AgentCore integration verified on real AWS infrastructure** — Full end-to-end deployment and testing of Gateway, Memory, Code Interpreter, Browser, and Workload Identity
+- **AgentCore tools Lambda** — hello, system_info, timestamp MCP tools registered on Gateway
+- **AgentCore toggle test** — Verified disabled → enabled → disabled lifecycle with resource creation/deletion
+- **AgentCore unit tests** — 13 new tests covering tools Lambda and status endpoint
+- **AWS Blog posts** — blog.md (EN) and blog-cn.md (CN) with Word versions, covering architecture, cost optimization, and AgentCore integration
+- **AWS Blog Writer Skill** — Reusable skill for writing AWS-style technical blog posts
+- **CHANGELOG.md** — Project changelog
+- **Console improvements** — Version display and GitHub link in Settings page
+
+### Verified (real AWS deployment)
+- CDK stack deployment: 144 base resources + 17 AgentCore resources
+- Tenant lifecycle: create → running (20s) → Dashboard 200 OK → delete
+- AgentCore MCP injection: Gateway URL auto-injected into VM openclaw.json
+- Lambda tools invocation: hello/system_info/timestamp all return correct results
+- Toggle test: disabled (no MCP) → enabled (MCP injected) → disabled (MCP removed)
+- Backup/restore roundtrip: create → backup → restore from backup → running
+- All 94 tests passed: 74 unit + 12 E2E + 8 regression
+
 ## [1.0.0] - 2026-04-30
 
 ### Features

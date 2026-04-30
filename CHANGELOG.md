@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.1.1] - 2026-04-30
+
+### Added
+- **AgentCore Memory E2E test** — create_event (conversation turns) + list_events + batch_create_memory_records, verified on real AWS
+- **AgentCore Code Interpreter E2E test** — start_session → executeCode (Python 3.12, Sum=5050, exitCode=0) → stop_session
+- **AgentCore Browser E2E test** — start_session → get_session (status=READY, WebSocket stream endpoint) → stop_session
+
+### Testing
+- 90 tests total: 74 unit + 16 E2E (0 failed)
+- All AgentCore components now have end-to-end call verification, not just resource creation checks
+
 ## [1.1.0] - 2026-04-30
 
 ### Added

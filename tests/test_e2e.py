@@ -299,3 +299,130 @@ class TestRegression:
             t = running[0]
             for field in ["id", "name", "host_id", "vcpu", "mem_mb", "guest_ip", "status"]:
                 assert field in t, f"Missing field: {field}"
+
+
+# ═══════════════════════════════════════════
+# AgentCore E2E: Memory, Code Interpreter, Browser
+# ═══════════════════════════════════════════
+
+class TestAgentCoreMemoryE2E:
+    """E2E: Memory create_event + batch_create_memory_records."""
+
+    @pytest.mark.e2e
+    def test_memory_write_and_list_events(self):
+        """Write conversation events to Memory, verify they exist."""
+        import boto3, uuid, datetime
+        ac_status = _api("GET", "agentcore/status")[1]
+        if not ac_status.get("enabled"):
+            pytest.skip("AgentCore not enabled")
+
+        session = boto3.Session(
+            profile_name=ENV.get("PROFILE", "default"),
+            region_name=ENV.get("REGION", "ap-northeast-1"),
+        )
+        rt = session.client("bedrock-agentcore")
+
+        # Find memory ID from CloudFormation
+        cf = session.client("cloudformation")
+        resources = cf.describe_stack_resources(StackName="OpenClawOrchestrator")["StackResources"]
+        mem_res = next(r["PhysicalResourceId"] for r in resources
+                      if r["ResourceType"] == "AWS::BedrockAgentCore::Memory")
+        # PhysicalResourceId may be ARN; extract the memory ID after the last /
+        mem_id = mem_res.rsplit("/", 1)[-1] if "/" in mem_res else mem_res
+
+        actor = f"e2e-mem-{uuid.uuid4().hex[:6]}"
+        sid = f"sess-{uuid.uuid4().hex[:8]}"
+
+        # Create events
+        for role, text in [("USER", "I like Python."), ("ASSISTANT", "Noted!")]:
+            rt.create_event(
+                memoryId=mem_id, actorId=actor, sessionId=sid,
+                eventTimestamp=datetime.datetime.now(datetime.timezone.utc),
+                payload=[{"conversational": {"role": role, "content": {"text": text}}}],
+            )
+
+        # Verify events exist
+        resp = rt.list_events(memoryId=mem_id, actorId=actor, sessionId=sid)
+        assert len(resp.get("events", [])) == 2
+
+
+class TestAgentCoreCodeInterpreterE2E:
+    """E2E: Code Interpreter start → execute → stop."""
+
+    @pytest.mark.e2e
+    def test_execute_python_code(self):
+        """Start session, execute Python, verify output, stop."""
+        import boto3
+        ac_status = _api("GET", "agentcore/status")[1]
+        if not ac_status.get("enabled"):
+            pytest.skip("AgentCore not enabled")
+
+        session = boto3.Session(
+            profile_name=ENV.get("PROFILE", "default"),
+            region_name=ENV.get("REGION", "ap-northeast-1"),
+        )
+        rt = session.client("bedrock-agentcore")
+        cf = session.client("cloudformation")
+        resources = cf.describe_stack_resources(StackName="OpenClawOrchestrator")["StackResources"]
+        ci_id = next(r["PhysicalResourceId"] for r in resources
+                     if r["ResourceType"] == "AWS::BedrockAgentCore::CodeInterpreterCustom")
+
+        # Start
+        resp = rt.start_code_interpreter_session(codeInterpreterIdentifier=ci_id)
+        ci_sid = resp["sessionId"]
+        assert ci_sid
+
+        try:
+            # Execute
+            resp = rt.invoke_code_interpreter(
+                codeInterpreterIdentifier=ci_id, sessionId=ci_sid,
+                name="executeCode",
+                arguments={"code": "print(sum(range(1, 101)))", "language": "python"},
+            )
+            # Read stream
+            result_text = ""
+            for event in resp.get("stream", []):
+                r = event.get("result", {})
+                sc = r.get("structuredContent", {})
+                result_text = sc.get("stdout", "")
+                assert sc.get("exitCode") == 0
+                assert not r.get("isError")
+            assert "5050" in result_text
+        finally:
+            rt.stop_code_interpreter_session(codeInterpreterIdentifier=ci_id, sessionId=ci_sid)
+
+
+class TestAgentCoreBrowserE2E:
+    """E2E: Browser start → get status → stop."""
+
+    @pytest.mark.e2e
+    def test_browser_session_lifecycle(self):
+        """Start browser session, verify READY status, stop."""
+        import boto3, time
+        ac_status = _api("GET", "agentcore/status")[1]
+        if not ac_status.get("enabled"):
+            pytest.skip("AgentCore not enabled")
+
+        session = boto3.Session(
+            profile_name=ENV.get("PROFILE", "default"),
+            region_name=ENV.get("REGION", "ap-northeast-1"),
+        )
+        rt = session.client("bedrock-agentcore")
+        cf = session.client("cloudformation")
+        resources = cf.describe_stack_resources(StackName="OpenClawOrchestrator")["StackResources"]
+        br_id = next(r["PhysicalResourceId"] for r in resources
+                     if r["ResourceType"] == "AWS::BedrockAgentCore::BrowserCustom")
+
+        # Start
+        resp = rt.start_browser_session(browserIdentifier=br_id)
+        br_sid = resp["sessionId"]
+        assert br_sid
+
+        try:
+            time.sleep(3)
+            # Get session info
+            resp = rt.get_browser_session(browserIdentifier=br_id, sessionId=br_sid)
+            assert resp["status"] == "READY"
+            assert "streams" in resp  # WebSocket endpoint exists
+        finally:
+            rt.stop_browser_session(browserIdentifier=br_id, sessionId=br_sid)

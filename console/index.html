@@ -197,8 +197,8 @@
                 <td x-text="t.host_port || '-'"></td>
                 <td x-text="(t.host_id||'').substring(0,12)+'…'"></td>
                 <td style="font-size:11px;color:var(--gray)" x-text="t.rootfs_version||'-'"></td>
-                <td><span class="health-dot" :class="healthClass(t.vm_health)"></span></td>
-                <td><span class="health-dot" :class="healthClass(t.app_health)"></span></td>
+                <td><span class="health-dot" :class="healthClass(t.vm_health, t.status)"></span></td>
+                <td><span class="health-dot" :class="healthClass(t.app_health, t.status)"></span></td>
                 <td>
                   <div class="act-group">
                     <button class="btn-act" title="oc-connect.sh command" @click="copyCmd('./scripts/oc-connect.sh '+t.id)"><svg class="icon s13"><use href="#i-terminal"/></svg></button>
@@ -665,7 +665,11 @@ function app() {
     memBarClass(h) {
       return h.used_mem_mb > h.total_mem_mb ? 'bar-mem-over' : 'bar-mem';
     },
-    healthClass(v) { return v === 'up' ? 'health-up' : v === 'down' ? 'health-down' : 'health-unknown'; },
+    healthClass(v, status) {
+      // Only running tenants have meaningful live health; others show grey.
+      if (status && status !== 'running') return 'health-unknown';
+      return v === 'up' ? 'health-up' : v === 'down' ? 'health-down' : 'health-unknown';
+    },
     get filteredTenants() {
       let list = this.tenants;
       if (this.selectedHost) list = list.filter(t => t.host_id === this.selectedHost);

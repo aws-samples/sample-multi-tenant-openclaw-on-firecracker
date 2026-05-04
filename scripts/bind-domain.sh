@@ -74,5 +74,77 @@ CF_DOMAIN=$(aws cloudfront get-distribution --id "$CF_ID" --profile "$PROFILE" \
 echo ""
 echo "✓ CloudFront distribution updated"
 echo "✓ DASHBOARD_URL=https://${DOMAIN} → .env.deploy"
+
+# Re-source updated .env.deploy so downstream steps see new DASHBOARD_URL
+source "$SCRIPT_DIR/.env.deploy"
+
+# ========== Cognito: add new callback/logout URLs (keep existing for smooth cutover) ==========
+if [ -n "${COGNITO_USER_POOL_ID:-}" ] && [ -n "${COGNITO_CLIENT_ID:-}" ]; then
+  echo ""
+  echo "→ Updating Cognito App Client callback URLs..."
+  NEW_CALLBACK="https://${DOMAIN}/console/index.html"
+
+  # Fetch existing URLs, append new one if not present
+  CLIENT_JSON=$(aws cognito-idp describe-user-pool-client \
+    --user-pool-id "$COGNITO_USER_POOL_ID" \
+    --client-id "$COGNITO_CLIENT_ID" \
+    --profile "$PROFILE" --region "$REGION" --output json)
+
+  NEW_CALLBACK="$NEW_CALLBACK" CLIENT_JSON="$CLIENT_JSON" python3 <<'PYEOF' > /tmp/cognito-update-args.json
+import json, os, sys
+client = json.loads(os.environ["CLIENT_JSON"])["UserPoolClient"]
+new_url = os.environ["NEW_CALLBACK"]
+callbacks = list(dict.fromkeys(client.get("CallbackURLs", []) + [new_url]))
+logouts   = list(dict.fromkeys(client.get("LogoutURLs", []) + [new_url]))
+args = {
+    "UserPoolId": client["UserPoolId"],
+    "ClientId": client["ClientId"],
+    "CallbackURLs": callbacks,
+    "LogoutURLs": logouts,
+    "SupportedIdentityProviders": client.get("SupportedIdentityProviders", ["COGNITO"]),
+    "AllowedOAuthFlows": client.get("AllowedOAuthFlows", ["implicit"]),
+    "AllowedOAuthScopes": client.get("AllowedOAuthScopes", ["openid", "email"]),
+    "AllowedOAuthFlowsUserPoolClient": client.get("AllowedOAuthFlowsUserPoolClient", True),
+}
+json.dump(args, sys.stdout)
+PYEOF
+
+  aws cognito-idp update-user-pool-client \
+    --cli-input-json "file:///tmp/cognito-update-args.json" \
+    --profile "$PROFILE" --region "$REGION" --output text --query 'UserPoolClient.ClientId' > /dev/null
+  rm -f /tmp/cognito-update-args.json
+  echo "✓ Cognito CallbackURLs now include: ${NEW_CALLBACK}"
+fi
+
+# ========== Console: regenerate config.js + upload to S3 ==========
+if [ -n "${ASSETS_BUCKET:-}" ]; then
+  echo ""
+  echo "→ Regenerating console/config.js with new domain..."
+  VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('$SCRIPT_DIR/pyproject.toml','rb'))['project']['version'])" 2>/dev/null || echo "dev")
+  cat > "$SCRIPT_DIR/console/config.js" << CFGEOF
+window.OC_DEFAULT_API_URL = "${API_URL:-}";
+window.OC_DEFAULT_API_KEY = "${API_KEY:-}";
+window.OC_DASHBOARD_BASE = "${DASHBOARD_URL:-}";
+window.OC_VERSION = "${VERSION}";
+window.OC_COGNITO_DOMAIN = "${COGNITO_DOMAIN:-}";
+window.OC_COGNITO_CLIENT_ID = "${COGNITO_CLIENT_ID:-}";
+window.OC_COGNITO_REDIRECT_URI = "${DASHBOARD_URL:-}/console/index.html";
+CFGEOF
+  aws s3 cp "$SCRIPT_DIR/console/config.js" "s3://${ASSETS_BUCKET}/console/config.js" \
+    --profile "$PROFILE" --region "$REGION" --quiet
+  echo "✓ config.js uploaded to s3://${ASSETS_BUCKET}/console/config.js"
+
+  # Invalidate CloudFront cache for config.js so browsers pick up new redirect
+  aws cloudfront create-invalidation --distribution-id "$CF_ID" \
+    --paths "/console/config.js" "/console/index.html" \
+    --profile "$PROFILE" --output text --query 'Invalidation.Id' > /dev/null
+  echo "✓ CloudFront cache invalidated for /console/*"
+fi
+
 echo ""
-echo "确保 DNS 已配置: ${DOMAIN} CNAME → ${CF_DOMAIN}"
+echo "═══════════════════════════════════════════════"
+echo "  All done. Next step: point DNS to CloudFront."
+echo "═══════════════════════════════════════════════"
+echo "  ${DOMAIN} CNAME → ${CF_DOMAIN}"
+echo ""
+echo "  Console URL: https://${DOMAIN}/console/index.html"

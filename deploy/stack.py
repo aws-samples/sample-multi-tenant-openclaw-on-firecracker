@@ -662,6 +662,10 @@ class OpenClawOrchestratorStack(cdk.Stack):
             code=cloudfront.FunctionCode.from_inline("""
 function handler(event) {
   var uri = event.request.uri;
+  if (uri === '/') {
+    return { statusCode: 302, statusDescription: 'Found',
+      headers: { location: { value: '/console/' } } };
+  }
   if (uri === '/console' || uri === '/console/') {
     event.request.uri = '/console/index.html';
   }
@@ -682,6 +686,10 @@ function handler(event) {
                 allowed_methods=cloudfront.AllowedMethods.ALLOW_ALL,
                 cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
                 origin_request_policy=cloudfront.OriginRequestPolicy.ALL_VIEWER,
+                function_associations=[cloudfront.FunctionAssociation(
+                    function=url_rewrite_fn,
+                    event_type=cloudfront.FunctionEventType.VIEWER_REQUEST,
+                )],
             ),
             additional_behaviors={
                 "/console/*": cloudfront.BehaviorOptions(

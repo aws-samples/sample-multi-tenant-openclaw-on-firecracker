@@ -25,8 +25,8 @@ balloon:
 vm:
   default_vcpu: 2
   default_mem_mb: 4096
-  rootfs_size_mb: 6144
-  data_disk_mb: 8192
+  rootfs_overlay_mb: 8192          # 每个 VM 可写层上限 (sparse, 不预占空间)
+  data_disk_mb: 8192               # 每个 VM 数据盘 /home/agent 上限 (sparse)
   gateway_port_base: 18789
   subnet_prefix: "172.16"
 

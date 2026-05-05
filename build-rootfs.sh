@@ -56,7 +56,9 @@ sudo umount -l ${ROOTFS_DIR}/proc ${ROOTFS_DIR}/sys ${ROOTFS_DIR}/dev 2>/dev/nul
 sudo umount -l ${ROOTFS_DIR} 2>/dev/null || true
 rm -f ${ROOTFS_IMG} ${DATA_IMG}
 
-ROOTFS_SIZE_MB=$(grep 'rootfs_size_mb:' "${SCRIPT_DIR}/config.yml" | awk '{print $2}')
+# Build-time ext4 image size for base rootfs. Only needs to fit debootstrap + tools
+# (~2-3GB), then shrunk via resize2fs if zerofree is used. Not a runtime limit.
+ROOTFS_SIZE_MB="${ROOTFS_SIZE_MB:-6144}"
 truncate -s ${ROOTFS_SIZE_MB}M ${ROOTFS_IMG}
 mkfs.ext4 -q ${ROOTFS_IMG}
 sudo mkdir -p ${ROOTFS_DIR}

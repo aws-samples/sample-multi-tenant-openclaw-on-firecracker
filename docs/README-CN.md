@@ -204,7 +204,8 @@ s3://{bucket}/skills/
 | host | keep_data_volume | true | 实例终止时保留 EBS 数据卷 |
 | vm | default_vcpu | 2 | 默认 vCPU |
 | vm | default_mem_mb | 4096 | 默认内存 (MB) |
-| vm | data_disk_mb | 8192 | 数据盘大小 (MB) |
+| vm | rootfs_overlay_mb | 8192 | 每 VM 可写层上限 (sparse, 不预占空间) |
+| vm | data_disk_mb | 8192 | 每 VM 数据盘 `/home/agent` 上限 (sparse) |
 | balloon | enabled | false | Firecracker balloon 设备实现内存超配 |
 | balloon | max_inflate_ratio | 0.4 | 最多回收 VM 声明内存的比例 |
 | balloon | min_guest_available_mb | 512 | guest 至少保留的可用内存 |

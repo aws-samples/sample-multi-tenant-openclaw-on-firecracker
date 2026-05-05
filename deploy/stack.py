@@ -364,6 +364,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
         init_sh = init_sh.replace("{{AVAIL_VCPU}}", str(_avail_vcpu))
         init_sh = init_sh.replace("{{AVAIL_MEM}}", str(_avail_mem))
         init_sh = init_sh.replace("{{SUBNET_PREFIX}}", CFG["vm"]["subnet_prefix"])
+        init_sh = init_sh.replace("{{ROOTFS_OVERLAY_MB}}", str(CFG["vm"].get("rootfs_overlay_mb", 8192)))
         init_sh = init_sh.replace("{{AGENTCORE_GATEWAY_URL}}", gateway_url if gateway_url else "none")
         # Balloon config
         balloon_cfg = CFG.get("balloon", {})

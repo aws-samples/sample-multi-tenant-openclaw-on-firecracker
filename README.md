@@ -195,7 +195,8 @@ aws s3 sync ./my-skills/ s3://${ASSETS_BUCKET}/skills/ --profile $PROFILE
 | host | keep_data_volume | true | Keep EBS data volume after instance termination |
 | vm | default_vcpu | 2 | Default vCPU per tenant |
 | vm | default_mem_mb | 4096 | Default memory (MB) per tenant |
-| vm | data_disk_mb | 8192 | Data volume size (MB) per tenant |
+| vm | rootfs_overlay_mb | 8192 | Per-VM writable rootfs layer cap (sparse, doesn't pre-allocate) |
+| vm | data_disk_mb | 8192 | Per-VM data volume `/home/agent` cap (sparse) |
 | balloon | enabled | false | Firecracker balloon device for memory overcommit |
 | balloon | max_inflate_ratio | 0.4 | Max reclaimable ratio of VM declared memory |
 | balloon | min_guest_available_mb | 512 | Min available memory kept in guest |

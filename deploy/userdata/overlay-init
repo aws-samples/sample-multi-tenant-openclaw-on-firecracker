@@ -2,12 +2,18 @@
 # OverlayFS init for Firecracker microVM
 # Mounts overlay (upper) on top of rootfs (lower), then pivots root and execs real init.
 # Kernel args: init=/sbin/overlay-init overlay_root=vdb (or overlay_root=ram)
+set -e
 
 pivot() {
     local rw_root="$1" work_dir="$2"
     /bin/mount -o noatime,lowerdir=/,upperdir=${rw_root},workdir=${work_dir} \
         -t overlay "overlayfs:${rw_root}" /mnt
+    # pivot_root requires put_old to exist inside new_root
+    mkdir -p /mnt/rom
+    # pivot_root requires new_root not to be a shared mount
+    /bin/mount --make-private /mnt 2>/dev/null || true
     pivot_root /mnt /mnt/rom
+    cd /
 }
 
 do_overlay() {

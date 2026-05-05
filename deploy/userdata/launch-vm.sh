@@ -44,7 +44,7 @@ DATA_SIZE=$(stat -c%s ${DATA_TPL})
 # Overlay: sparse file for rootfs copy-on-write (shared read-only rootfs + per-VM writable layer)
 OVERLAY="${VM_DIR}/overlay.ext4"
 if [ ! -f "${OVERLAY}" ]; then
-  truncate -s 2G ${OVERLAY}
+  truncate -s "${ROOTFS_OVERLAY_MB:-8192}M" ${OVERLAY}
   mkfs.ext4 -q ${OVERLAY}
 fi
 

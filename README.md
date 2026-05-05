@@ -86,19 +86,23 @@ Nginx config is automatically managed by launch-vm.sh / stop-vm.sh.
 
 ## Custom Domain (Optional)
 
-Optionally bind a custom domain + HTTPS directly to the ALB:
+Bind a custom domain + HTTPS to CloudFront. Configuration lives in `config.yml` under `cloudfront:`; you can edit the file directly or pass flags to `setup.sh`:
 
 ```bash
 # Prerequisites:
-# 1. Request ACM certificate and complete DNS validation
-# 2. CNAME your domain to the ALB DNS (see DASHBOARD_URL in .env.deploy)
+# 1. Request an ACM certificate in us-east-1 (required by CloudFront) and complete DNS validation
+# 2. CNAME your domain to the CloudFront domain (see DashboardUrl output)
 
-./scripts/bind-domain.sh oc.example.com arn:aws:acm:ap-northeast-1:xxx:certificate/xxx
+# One-liner: sets config.yml + deploys in a single run
+./setup.sh ap-northeast-1 lab \
+  --domain claw.example.com \
+  --cert   arn:aws:acm:us-east-1:xxx:certificate/xxx
 
-# Access: https://oc.example.com/vm/{tenant-id}/
+# Or edit config.yml manually then run setup.sh with no flags.
+# To unbind the custom domain: --domain "" and re-run setup.sh.
 ```
 
-The script creates the ALB HTTPS listener, attaches the ACM certificate, and updates `DASHBOARD_URL` in `.env.deploy`.
+The custom domain and certificate flow through CDK (not out-of-band), so subsequent `setup.sh` runs preserve the binding.
 
 ## Auto Backup & Restore
 
@@ -281,7 +285,9 @@ sample-multi-tenant-openclaw-on-firecracker/
 ├── setup.sh                   # One-click deploy + export .env.deploy
 ├── build-rootfs.sh            # Build rootfs + data template, upload to S3
 ├── scripts/
-│   └── bind-domain.sh         # Bind custom domain + HTTPS to CloudFront
+│   ├── destroy.sh             # Tear down stack
+│   ├── oc-connect.sh          # SSH-style helper to reach a tenant VM
+│   └── oc-dashboard.sh        # Open a tenant's Dashboard URL
 └── docs/
 ```
 

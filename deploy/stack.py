@@ -16,6 +16,7 @@ from aws_cdk import (
     aws_elasticloadbalancingv2 as elbv2,
     aws_cloudfront as cloudfront,
     aws_cloudfront_origins as origins,
+    aws_certificatemanager as acm,
     aws_cognito as cognito,
     aws_bedrock_agentcore_alpha as agentcore,
     aws_bedrockagentcore as agentcore_l1,
@@ -673,8 +674,20 @@ function handler(event) {
 }"""),
         )
 
+        # Optional: custom domain + ACM certificate (cert must be in us-east-1)
+        cf_cfg = CFG.get("cloudfront", {}) or {}
+        custom_domain = (cf_cfg.get("custom_domain") or "").strip()
+        acm_cert_arn = (cf_cfg.get("acm_cert_arn") or "").strip()
+        domain_names = [custom_domain] if custom_domain else None
+        certificate = (
+            acm.Certificate.from_certificate_arn(self, "CustomCert", acm_cert_arn)
+            if custom_domain and acm_cert_arn else None
+        )
+
         cf_distribution = cloudfront.Distribution(self, "DashboardCF",
             comment="OpenClaw Dashboard",
+            domain_names=domain_names,
+            certificate=certificate,
             default_behavior=cloudfront.BehaviorOptions(
                 origin=origins.HttpOrigin(alb.load_balancer_dns_name,
                     protocol_policy=cloudfront.OriginProtocolPolicy.HTTP_ONLY,
@@ -705,6 +718,9 @@ function handler(event) {
             default_root_object="",
         )
 
+        # Dashboard URL — prefer custom domain when configured
+        dashboard_host = custom_domain if custom_domain else cf_distribution.distribution_domain_name
+
         # ========== Console Auth (Cognito) ==========
         auth_cfg = CFG.get("console_auth", {})
         cognito_outputs = {}
@@ -726,8 +742,12 @@ function handler(event) {
                     ),
                     removal_policy=RemovalPolicy.RETAIN,
                 )
-                cf_domain = cf_distribution.distribution_domain_name
-                callback_url = f"https://{cf_domain}/console/index.html"
+                # Include both the CloudFront default domain (for testing/fallback)
+                # and the custom domain (if configured) so both URLs work.
+                cf_default = cf_distribution.distribution_domain_name
+                callback_urls = [f"https://{cf_default}/console/index.html"]
+                if custom_domain:
+                    callback_urls.append(f"https://{custom_domain}/console/index.html")
                 user_pool.add_domain("ConsoleDomain",
                     cognito_domain=cognito.CognitoDomainOptions(
                         domain_prefix="openclaw-console",
@@ -737,8 +757,8 @@ function handler(event) {
                     o_auth=cognito.OAuthSettings(
                         flows=cognito.OAuthFlows(implicit_code_grant=True),
                         scopes=[cognito.OAuthScope.OPENID, cognito.OAuthScope.EMAIL],
-                        callback_urls=[callback_url],
-                        logout_urls=[callback_url],
+                        callback_urls=callback_urls,
+                        logout_urls=callback_urls,
                     ),
                 )
                 cognito_outputs["CognitoUserPoolId"] = user_pool.user_pool_id
@@ -753,7 +773,7 @@ function handler(event) {
             "HostsTable": hosts_table.table_name,
             "AssetsBucket": assets_bucket.bucket_name,
             "HostInstanceProfileArn": instance_profile.attr_arn,
-            "DashboardUrl": f"https://{cf_distribution.distribution_domain_name}",
+            "DashboardUrl": f"https://{dashboard_host}",
             **cognito_outputs,
         }.items():
             cdk.CfnOutput(self, key, value=val)

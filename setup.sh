@@ -3,15 +3,62 @@
 # SPDX-License-Identifier: MIT-0
 
 # 部署 CDK stack 并导出环境信息到 .env.deploy
+# Usage: ./setup.sh <region> <profile> [--domain <domain>] [--cert <acm-arn>] [cdk-args...]
+#   --domain "<domain>" 设置自定义域名 (留空 "" 取消)
+#   --cert   "<arn>"    us-east-1 ACM 证书 ARN
 set -euo pipefail
 
-REGION="${1:?Usage: ./setup.sh <region> <profile>}"
-PROFILE="${2:?Usage: ./setup.sh <region> <profile>}"
+REGION="${1:?Usage: ./setup.sh <region> <profile> [--domain <domain>] [--cert <acm-arn>]}"
+PROFILE="${2:?Usage: ./setup.sh <region> <profile> [--domain <domain>] [--cert <acm-arn>]}"
+shift 2
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-PATH=".venv/bin:$PATH" cdk deploy -c region="$REGION" --profile "$PROFILE" --require-approval never "${@:3}"
+# Parse optional --domain / --cert flags, leave the rest for CDK
+DOMAIN_FLAG=""; CERT_FLAG=""
+DOMAIN_SET=false; CERT_SET=false
+CDK_ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --domain) DOMAIN_FLAG="$2"; DOMAIN_SET=true; shift 2 ;;
+    --cert)   CERT_FLAG="$2";   CERT_SET=true;   shift 2 ;;
+    *) CDK_ARGS+=("$1"); shift ;;
+  esac
+done
+
+# If --domain/--cert provided, write into config.yml (overrides existing values)
+if $DOMAIN_SET || $CERT_SET; then
+  DOMAIN="$DOMAIN_FLAG" CERT="$CERT_FLAG" DS="$DOMAIN_SET" CS="$CERT_SET" python3 - <<'PYEOF'
+import os, re, sys, pathlib
+cfg_path = pathlib.Path("config.yml")
+text = cfg_path.read_text()
+has_section = re.search(r"^cloudfront:\s*$", text, re.MULTILINE)
+if not has_section:
+    sep = "" if text.endswith("\n") else "\n"
+    text += f"{sep}\n# ========== CloudFront 自定义域名 (可选) ==========\ncloudfront:\n  custom_domain: \"\"\n  acm_cert_arn: \"\"\n"
+
+def set_key(text, key, val):
+    pat = re.compile(rf"^(\s*{re.escape(key)}:\s*)(?:\"[^\"]*\"|'[^']*'|\S*)(\s*(?:#.*)?)$", re.MULTILINE)
+    repl = lambda m: f'{m.group(1)}"{val}"{m.group(2)}'
+    new, n = pat.subn(repl, text, count=1)
+    if n == 0:
+        # Key missing under cloudfront: append under the section
+        new = re.sub(r"(^cloudfront:\s*$)", rf"\1\n  {key}: \"{val}\"", text, count=1, flags=re.MULTILINE)
+    return new
+
+if os.environ["DS"] == "True":
+    text = set_key(text, "custom_domain", os.environ["DOMAIN"])
+if os.environ["CS"] == "True":
+    text = set_key(text, "acm_cert_arn", os.environ["CERT"])
+
+cfg_path.write_text(text)
+print(f"✓ config.yml updated (custom_domain={os.environ.get('DOMAIN','<unchanged>')}, "
+      f"acm_cert_arn={'<set>' if os.environ['CS']=='True' else '<unchanged>'})")
+PYEOF
+fi
+
+PATH=".venv/bin:$PATH" cdk deploy -c region="$REGION" --profile "$PROFILE" --require-approval never "${CDK_ARGS[@]}"
 
 # Upload scripts to S3
 BUCKET=$(aws cloudformation describe-stacks --stack-name OpenClawOrchestrator \

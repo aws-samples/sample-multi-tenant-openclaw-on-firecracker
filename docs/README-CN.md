@@ -86,17 +86,23 @@ Nginx 配置由 launch-vm.sh / stop-vm.sh 自动管理。
 
 ## 自定义域名（可选）
 
-绑定自定义域名到 CloudFront：
+绑定自定义域名到 CloudFront。配置位于 `config.yml` 的 `cloudfront:` section，可以直接编辑文件，也可以通过 `setup.sh` 参数传入：
 
 ```bash
 # 前置条件：
-# 1. 在 us-east-1 ACM 中申请证书并完成 DNS 验证
-# 2. 将域名 CNAME 指向 CloudFront 域名
+# 1. 在 us-east-1 申请 ACM 证书（CloudFront 要求）并完成 DNS 验证
+# 2. 将域名 CNAME 指向 CloudFront 域名（见 DashboardUrl output）
 
-./scripts/bind-domain.sh oc.example.com arn:aws:acm:us-east-1:123456:certificate/xxx
+# 一条命令：写入 config.yml 并部署
+./setup.sh ap-northeast-1 lab \
+  --domain claw.example.com \
+  --cert   arn:aws:acm:us-east-1:xxx:certificate/xxx
+
+# 或手动编辑 config.yml 后不带 flag 跑 setup.sh。
+# 取消绑定：--domain "" 然后重跑 setup.sh。
 ```
 
-脚本会自动：创建 ALB HTTPS listener → 关联 ACM 证书 → 更新 `.env.deploy` 中的 `DASHBOARD_URL`
+自定义域名/证书通过 CDK 管理，不会被下次 `setup.sh` 覆盖。
 
 ## 自动备份与恢复
 
@@ -290,7 +296,9 @@ sample-multi-tenant-openclaw-on-firecracker/
 ├── setup.sh                   # 一键部署 + 导出 .env.deploy
 ├── build-rootfs.sh            # rootfs + data template 构建 + S3 上传
 ├── scripts/
-│   └── bind-domain.sh         # 绑定自定义域名 + HTTPS 到 CloudFront
+│   ├── destroy.sh             # 销毁 stack
+│   ├── oc-connect.sh          # 快速登录某个租户 VM
+│   └── oc-dashboard.sh        # 打开某个租户的 Dashboard URL
 └── docs/
 ```
 

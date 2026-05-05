@@ -74,3 +74,9 @@ console_auth:
   self_sign_up: false              # 允许用户自注册
   # user_pool_id: ""              # 已有 User Pool ID，留空自动创建
   # user_pool_client_id: ""       # 已有 App Client ID
+
+# ========== CloudFront 自定义域名 (可选) ==========
+# 可通过 ./setup.sh <region> <profile> --domain <domain> --cert <acm-arn> 一键配置
+cloudfront:
+  custom_domain: ""                # 例: claw.aws.xin，留空则使用默认 *.cloudfront.net
+  acm_cert_arn: ""                 # us-east-1 ACM 证书 ARN (CloudFront 必须 us-east-1)

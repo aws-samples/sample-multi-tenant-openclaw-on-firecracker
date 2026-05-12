@@ -220,6 +220,17 @@ See `config.yml.example` for all options. Redeploy after changes: `./setup.sh <r
 
 ## Architecture
 
+### System Architecture
+
+![System Architecture](docs/oc-system-arch.png)
+
+### Deployment Architecture
+
+![Deployment Architecture](docs/oc-deploy-arch.png)
+
+<details>
+<summary>ASCII version (for AI/text access)</summary>
+
 ```
 Admin / User
     │
@@ -240,18 +251,6 @@ S3: rootfs distribution + data backup + shared skills
 ASG: auto-scaling hosts
 EventBridge: health checks + idle reclamation + scheduled backup
 ```
-
-<details>
-<summary>System Architecture</summary>
-
-![System Architecture](docs/oc-system-arch.png)
-
-</details>
-
-<details>
-<summary>Deployment Architecture</summary>
-
-![Deployment Architecture](docs/oc-deploy-arch.png)
 
 </details>
 

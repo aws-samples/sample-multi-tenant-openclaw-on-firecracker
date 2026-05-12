@@ -229,6 +229,17 @@ s3://{bucket}/skills/
 
 ## 架构
 
+### 系统架构
+
+![系统架构](./oc-system-arch.png)
+
+### 部署架构
+
+![部署架构](./oc-deploy-arch.png)
+
+<details>
+<summary>ASCII 版本（方便 AI/文本访问）</summary>
+
 ```
 用户/管理员
     │
@@ -251,18 +262,6 @@ S3: rootfs 分发 + 数据卷备份
 ASG: 宿主机自动扩缩 (配置参见: config.yml)
 EventBridge: 健康检查 + 空闲回收 + 定时备份
 ```
-
-<details>
-<summary>系统架构图</summary>
-
-![系统架构](./oc-system-arch.png)
-
-</details>
-
-<details>
-<summary>部署架构图</summary>
-
-![部署架构](./oc-deploy-arch.png)
 
 </details>
 

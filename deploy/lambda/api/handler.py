@@ -29,6 +29,13 @@ ALB_LISTENER_ARN = os.environ.get("ALB_LISTENER_ARN", "")
 VPC_ID = os.environ.get("VPC_ID", "")
 elbv2 = boto3.client("elbv2")
 
+# Issue #9 — per-tenant resource quotas. When enabled, create_tenant rejects
+# requests above any configured ceiling. 0 = no limit on that dimension.
+QUOTAS_ENABLED = os.environ.get("QUOTAS_ENABLED", "false").lower() == "true"
+QUOTAS_MAX_VCPU = int(os.environ.get("QUOTAS_MAX_VCPU", "0") or "0")
+QUOTAS_MAX_MEM_MB = int(os.environ.get("QUOTAS_MAX_MEM_MB", "0") or "0")
+QUOTAS_MAX_DATA_DISK_MB = int(os.environ.get("QUOTAS_MAX_DATA_DISK_MB", "0") or "0")
+
 
 def lambda_handler(event, context):
     # EventBridge: new host InService → process pending tenants
@@ -104,8 +111,14 @@ def create_tenant(body=None):
     name = body.get("name", "")
     vcpu = int(body.get("vcpu", VM_DEFAULT_VCPU))
     mem_mb = int(body.get("mem_mb", VM_DEFAULT_MEM))
+    data_disk_mb = int(body.get("data_disk_mb", VM_DATA_DISK_MB))
     config_template = body.get("config_template", "")
     restore_from = body.get("restore_from")
+
+    # Issue #9 — enforce per-tenant quotas (defence against noisy neighbour).
+    quota_err = _check_quota(vcpu, mem_mb, data_disk_mb)
+    if quota_err:
+        return _resp(400, {"error": quota_err})
 
     restore_backup_key = ""
     if restore_from:
@@ -839,6 +852,25 @@ def _ssm_run(instance_id, command, timeout=30):
 def _now():
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
+
+
+# ── Quotas (issue #9) ──
+
+
+def _check_quota(vcpu, mem_mb, data_disk_mb):
+    """Return None if all dimensions are within quota, else an error message.
+
+    No-op when QUOTAS_ENABLED is False or a specific limit is 0 (= unlimited).
+    """
+    if not QUOTAS_ENABLED:
+        return None
+    if QUOTAS_MAX_VCPU and vcpu > QUOTAS_MAX_VCPU:
+        return f"vcpu={vcpu} exceeds quota (max {QUOTAS_MAX_VCPU})"
+    if QUOTAS_MAX_MEM_MB and mem_mb > QUOTAS_MAX_MEM_MB:
+        return f"mem_mb={mem_mb} exceeds quota (max {QUOTAS_MAX_MEM_MB})"
+    if QUOTAS_MAX_DATA_DISK_MB and data_disk_mb > QUOTAS_MAX_DATA_DISK_MB:
+        return f"data_disk_mb={data_disk_mb} exceeds quota (max {QUOTAS_MAX_DATA_DISK_MB})"
+    return None
 
 
 def _resp(code, body):

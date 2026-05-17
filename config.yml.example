@@ -54,6 +54,15 @@ health_check:
   max_failures: 3
   app_port: 18789
 
+# ========== 租户配额 (可选, 防 noisy-neighbor) ==========
+# 启用后, create_tenant 会拒绝任何超过上限的请求 (返回 400)
+# 0 = 该维度无限制 (向后兼容)
+quotas:
+  enabled: false                   # 默认关闭
+  max_vcpu_per_tenant: 4           # 单租户最多 vCPU
+  max_mem_mb_per_tenant: 8192      # 单租户最多内存 (MB)
+  max_data_disk_mb: 16384          # 单租户最大数据盘 (MB)
+
 # ========== AgentCore (可选) ==========
 agentcore:
   enabled: false                   # 开启后所有 VM 自动连接 AgentCore

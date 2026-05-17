@@ -124,6 +124,11 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 "VM_SUBNET_PREFIX": CFG["vm"]["subnet_prefix"],
                 "ASG_NAME": "openclaw-hosts-asg",
                 "BACKUP_PREFIX": CFG["s3"]["backup_prefix"],
+                # Issue #9 — per-tenant quotas (0 = unlimited)
+                "QUOTAS_ENABLED": str(CFG.get("quotas", {}).get("enabled", False)).lower(),
+                "QUOTAS_MAX_VCPU": str(CFG.get("quotas", {}).get("max_vcpu_per_tenant", 0)),
+                "QUOTAS_MAX_MEM_MB": str(CFG.get("quotas", {}).get("max_mem_mb_per_tenant", 0)),
+                "QUOTAS_MAX_DATA_DISK_MB": str(CFG.get("quotas", {}).get("max_data_disk_mb", 0)),
             },
         )
         tenants_table.grant_read_write_data(api_fn)

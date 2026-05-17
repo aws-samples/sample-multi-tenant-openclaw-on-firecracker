@@ -80,3 +80,10 @@ console_auth:
 cloudfront:
   custom_domain: ""                # 例: claw.aws.xin，留空则使用默认 *.cloudfront.net
   acm_cert_arn: ""                 # us-east-1 ACM 证书 ARN (CloudFront 必须 us-east-1)
+
+# ========== Lifecycle Notifications (可选, SNS) ==========
+# 启用后, API Lambda 在 tenant 创建/删除/启停等事件时 publish 到 SNS topic
+# 操作员可订阅该 topic (Email, SQS, Lambda, HTTPS) 实现实时通知
+notifications:
+  enabled: false                   # 启用后创建 openclaw-tenant-events SNS topic
+  # 部署完成后从 NotificationsTopicArn output 订阅

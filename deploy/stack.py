@@ -11,6 +11,7 @@ from aws_cdk import (
     aws_events_targets as targets,
     aws_iam as iam,
     aws_s3 as s3,
+    aws_sns as sns,
     aws_ec2 as ec2,
     aws_autoscaling as autoscaling,
     aws_elasticloadbalancingv2 as elbv2,
@@ -100,6 +101,17 @@ class OpenClawOrchestratorStack(cdk.Stack):
             resources=["*"],
         )
 
+        # ========== SNS Lifecycle Notifications (issue #13, optional) ==========
+        notif_cfg = CFG.get("notifications", {}) or {}
+        notifications_topic = None
+        notifications_topic_arn = ""
+        if notif_cfg.get("enabled", False):
+            notifications_topic = sns.Topic(self, "TenantEvents",
+                topic_name="openclaw-tenant-events",
+                display_name="OpenClaw Tenant Lifecycle Events",
+            )
+            notifications_topic_arn = notifications_topic.topic_arn
+
         # ========== API Lambda ==========
         api_fn = _lambda.Function(self, "ApiHandler",
             function_name="openclaw-api",
@@ -112,6 +124,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 "TENANTS_TABLE": tenants_table.table_name,
                 "HOSTS_TABLE": hosts_table.table_name,
                 "ASSETS_BUCKET": assets_bucket.bucket_name,
+                "NOTIFICATIONS_TOPIC_ARN": notifications_topic_arn,
                 "ROOTFS_PREFIX": CFG["s3"]["rootfs_prefix"],
                 "HOST_RESERVED_VCPU": str(CFG["host"]["reserved_vcpu"]),
                 "HOST_RESERVED_MEM": str(CFG["host"]["reserved_mem_mb"]),
@@ -129,6 +142,9 @@ class OpenClawOrchestratorStack(cdk.Stack):
         tenants_table.grant_read_write_data(api_fn)
         hosts_table.grant_read_write_data(api_fn)
         assets_bucket.grant_read(api_fn)
+        # Issue #13 — allow publishing tenant lifecycle events
+        if notifications_topic is not None:
+            notifications_topic.grant_publish(api_fn)
         api_fn.add_to_role_policy(ssm_policy)
         api_fn.add_to_role_policy(ec2_policy)
         api_fn.add_to_role_policy(iam.PolicyStatement(
@@ -775,6 +791,7 @@ function handler(event) {
             "AssetsBucket": assets_bucket.bucket_name,
             "HostInstanceProfileArn": instance_profile.attr_arn,
             "DashboardUrl": f"https://{dashboard_host}",
+            **({"NotificationsTopicArn": notifications_topic_arn} if notifications_topic_arn else {}),
             **cognito_outputs,
         }.items():
             cdk.CfnOutput(self, key, value=val)

@@ -184,6 +184,11 @@ class OpenClawOrchestratorStack(cdk.Stack):
         backups_resource = api.root.add_resource("backups")
         backups_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
 
+        # Issue #23 — batch operations: POST /batch/tenants
+        batch_resource = api.root.add_resource("batch")
+        batch_tenants_resource = batch_resource.add_resource("tenants")
+        batch_tenants_resource.add_method("POST", apigw.LambdaIntegration(api_fn), **key_required)
+
         refresh_rootfs_resource = hosts_resource.add_resource("refresh-rootfs")
         refresh_rootfs_resource.add_method("POST", apigw.LambdaIntegration(api_fn), **key_required)
 

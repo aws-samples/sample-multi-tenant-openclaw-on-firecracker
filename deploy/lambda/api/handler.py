@@ -56,6 +56,7 @@ def lambda_handler(event, context):
             path_params["id"], path_params["action"]
         ),
         ("GET", "/backups"): list_all_backups,
+        ("POST", "/batch/tenants"): lambda: batch_tenants(event.get("body")),
         ("GET", "/hosts"): list_hosts,
         ("POST", "/hosts"): lambda: register_host(json.loads(event["body"])),
         ("POST", "/hosts/refresh-rootfs"): refresh_rootfs,
@@ -839,6 +840,97 @@ def _ssm_run(instance_id, command, timeout=30):
 def _now():
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
+
+
+# ── Batch operations (issue #23) ──
+
+_BATCH_VALID_ACTIONS = {"stop", "start", "delete", "backup"}
+_BATCH_VALID_FILTER_KEYS = {"tag"}
+_BATCH_MAX_IDS = 100
+
+
+def batch_tenants(body=None):
+    """POST /batch/tenants — apply one action to many tenants in a single call.
+
+    Body:
+        action: "stop" | "start" | "delete" | "backup"     (required)
+        ids:    list of tenant ids                          (xor with filter)
+        filter: { "tag": "key:value" }                      (xor with ids)
+
+    Returns: 200 with {"succeeded": [...], "failed": [...]}.
+    Per-tenant errors do not abort the batch — they go into "failed".
+    """
+    if body is None:
+        return _resp(400, {"error": "missing body"})
+    body = json.loads(body) if isinstance(body, str) else body
+
+    action = body.get("action")
+    if action not in _BATCH_VALID_ACTIONS:
+        return _resp(400, {"error": f"action must be one of {sorted(_BATCH_VALID_ACTIONS)}"})
+
+    ids = body.get("ids")
+    flt = body.get("filter")
+    if ids is not None and flt is not None:
+        return _resp(400, {"error": "specify exactly one of 'ids' or 'filter'"})
+    if ids is None and flt is None:
+        return _resp(400, {"error": "specify exactly one of 'ids' or 'filter'"})
+
+    if ids is not None:
+        if not isinstance(ids, list):
+            return _resp(400, {"error": "ids must be an array"})
+        if len(ids) > _BATCH_MAX_IDS:
+            return _resp(400, {"error": f"too many ids (max {_BATCH_MAX_IDS})"})
+        target_ids = list(ids)
+    else:
+        if not isinstance(flt, dict):
+            return _resp(400, {"error": "filter must be an object"})
+        unknown = set(flt.keys()) - _BATCH_VALID_FILTER_KEYS
+        if unknown:
+            return _resp(400, {"error": f"unknown filter key(s): {sorted(unknown)}"})
+        target_ids = _resolve_filter(flt)
+
+    succeeded, failed = [], []
+    for tid in target_ids:
+        try:
+            tenant = tenants_table.get_item(Key={"id": tid}).get("Item")
+            if not tenant:
+                failed.append({"id": tid, "error": "tenant not found"})
+                continue
+            if action == "delete":
+                # delete_tenant expects (tenant_id, query_params)
+                result = delete_tenant(tid, {})
+            else:
+                result = tenant_action(tid, action)
+            if result.get("statusCode", 500) >= 400:
+                err = json.loads(result.get("body", "{}")).get("error", "unknown error")
+                failed.append({"id": tid, "error": err})
+            else:
+                succeeded.append({"id": tid, "action": action})
+        except Exception as e:
+            failed.append({"id": tid, "error": str(e)})
+
+    return _resp(200, {"succeeded": succeeded, "failed": failed})
+
+
+def _resolve_filter(flt):
+    """Convert filter dict → list of matching tenant ids (excludes soft-deleted)."""
+    items = tenants_table.scan(
+        FilterExpression="#s <> :d",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":d": "deleted"},
+    ).get("Items", [])
+    # Defensive client-side dedupe of soft-deleted in case the FilterExpression
+    # was bypassed (e.g. older boto3 / mocks not applying it).
+    items = [it for it in items if it.get("status") != "deleted"]
+
+    tag_expr = flt.get("tag", "")
+    if tag_expr and ":" in tag_expr:
+        k, v = tag_expr.split(":", 1)
+        items = [it for it in items if (it.get("tags") or {}).get(k) == v]
+    elif tag_expr:
+        # malformed expression — match nothing (defensive)
+        items = []
+    return [it["id"] for it in items]
 
 
 def _resp(code, body):

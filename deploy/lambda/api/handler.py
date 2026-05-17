@@ -29,6 +29,12 @@ ALB_LISTENER_ARN = os.environ.get("ALB_LISTENER_ARN", "")
 VPC_ID = os.environ.get("VPC_ID", "")
 elbv2 = boto3.client("elbv2")
 
+# Issue #16 / #9 — quota ceilings (0 = unlimited; ENABLED=false → no checks)
+QUOTAS_ENABLED = os.environ.get("QUOTAS_ENABLED", "false").lower() == "true"
+QUOTAS_MAX_VCPU = int(os.environ.get("QUOTAS_MAX_VCPU", "0") or "0")
+QUOTAS_MAX_MEM_MB = int(os.environ.get("QUOTAS_MAX_MEM_MB", "0") or "0")
+QUOTAS_MAX_DATA_DISK_MB = int(os.environ.get("QUOTAS_MAX_DATA_DISK_MB", "0") or "0")
+
 
 def lambda_handler(event, context):
     # EventBridge: new host InService → process pending tenants
@@ -50,7 +56,7 @@ def lambda_handler(event, context):
             path_params["id"], event.get("queryStringParameters") or {}
         ),
         ("POST", "/tenants/{id}/{action}"): lambda: tenant_action(
-            path_params["id"], path_params["action"]
+            path_params["id"], path_params["action"], event.get("body")
         ),
         ("GET", "/tenants/{id}/{action}"): lambda: tenant_get_action(
             path_params["id"], path_params["action"]
@@ -237,7 +243,12 @@ def delete_tenant(tenant_id, query_params):
     return _resp(200, {"id": tenant_id, "status": "deleted"})
 
 
-def tenant_action(tenant_id, action):
+def tenant_action(tenant_id, action, body=None):
+    # Issue #16 — resize is dispatched here because API Gateway routes all
+    # POST /tenants/{id}/{action} variants through the same {action} parameter.
+    if action == "resize":
+        return tenant_resize(tenant_id, body)
+
     item = tenants_table.get_item(Key={"id": tenant_id}).get("Item")
     if not item:
         return _resp(404, {"error": "tenant not found"})
@@ -839,6 +850,107 @@ def _ssm_run(instance_id, command, timeout=30):
 def _now():
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
+
+
+# ── Live VM resize (issue #16) ──
+
+
+def tenant_resize(tenant_id, body):
+    """POST /tenants/{id}/resize — hot-add vCPU on a running tenant.
+
+    Body:
+        vcpu:    int — new total vCPU count (must be > current; cannot shrink)
+        mem_mb:  int — REJECTED in this PR (Firecracker memory hot-add needs
+                       balloon-pre-allocated memory, which the current
+                       launch-vm.sh does not provide). Caller must stop +
+                       restart for memory changes.
+    """
+    if body is None:
+        return _resp(400, {"error": "missing body"})
+    body = json.loads(body) if isinstance(body, str) else body
+
+    new_vcpu = body.get("vcpu")
+    new_mem = body.get("mem_mb")
+    if new_vcpu is None and new_mem is None:
+        return _resp(400, {"error": "specify vcpu (memory live-resize not supported)"})
+    if new_mem is not None:
+        return _resp(400, {
+            "error": "memory live-resize is not supported; "
+                     "stop the tenant, recreate with new mem_mb, then start"
+        })
+    try:
+        new_vcpu = int(new_vcpu)
+    except (TypeError, ValueError):
+        return _resp(400, {"error": "vcpu must be an integer"})
+
+    item = tenants_table.get_item(Key={"id": tenant_id}).get("Item")
+    if not item:
+        return _resp(404, {"error": "tenant not found"})
+    if item.get("status") != "running":
+        return _resp(400, {"error": f"tenant must be running (current: {item.get('status')})"})
+
+    current_vcpu = int(item.get("vcpu", 0))
+    if new_vcpu <= current_vcpu:
+        return _resp(400, {
+            "error": f"vcpu must be greater than current ({current_vcpu}); "
+                     "Firecracker cannot shrink — restart to decrease"
+        })
+
+    # Optional quota check (issue #9 — gracefully no-op if helper not present)
+    quota_check = globals().get("_check_quota")
+    if quota_check is not None:
+        quota_err = quota_check(new_vcpu, int(item.get("mem_mb", 0)),
+                                int(item.get("data_disk_mb", 0)))
+        if quota_err:
+            return _resp(400, {"error": quota_err})
+    elif QUOTAS_ENABLED and QUOTAS_MAX_VCPU and new_vcpu > QUOTAS_MAX_VCPU:
+        return _resp(400, {
+            "error": f"vcpu={new_vcpu} exceeds quota (max {QUOTAS_MAX_VCPU})"
+        })
+
+    # Host capacity check (respects overcommit ratio)
+    host_id = item.get("host_id", "")
+    if not host_id:
+        return _resp(400, {"error": "tenant has no host assigned"})
+    host = hosts_table.get_item(Key={"instance_id": host_id}).get("Item")
+    if not host:
+        return _resp(400, {"error": f"host {host_id} not found"})
+    delta = new_vcpu - current_vcpu
+    allocatable = int(int(host["total_vcpu"]) * CPU_OVERCOMMIT_RATIO)
+    free = allocatable - int(host["used_vcpu"])
+    if delta > free:
+        return _resp(400, {
+            "error": f"insufficient host capacity: need {delta} more vCPU, "
+                     f"host has {free} free (allocatable={allocatable}, used={host['used_vcpu']})"
+        })
+
+    # Firecracker PATCH /machine-config — must succeed before DDB updates
+    vm_dir = f"/data/firecracker-vms/{tenant_id}"
+    cmd = (f'curl -sf --unix-socket {vm_dir}/fc.sock -X PATCH http://localhost/machine-config '
+           f'-H "Content-Type: application/json" '
+           f"-d '{{\"vcpu_count\":{new_vcpu},\"mem_size_mib\":{int(item['mem_mb'])}}}'")
+    if not _ssm_run(host_id, cmd, timeout=30):
+        return _resp(502, {"error": "Firecracker machine-config PATCH failed; tenant unchanged"})
+
+    # Update DDB only after the live resize succeeded
+    now = _now()
+    tenants_table.update_item(
+        Key={"id": tenant_id},
+        UpdateExpression="SET vcpu = :v, updated_at = :t",
+        ExpressionAttributeValues={":v": new_vcpu, ":t": now},
+    )
+    hosts_table.update_item(
+        Key={"instance_id": host_id},
+        UpdateExpression="SET used_vcpu = used_vcpu + :v",
+        ExpressionAttributeValues={":v": delta},
+    )
+
+    return _resp(200, {
+        "id": tenant_id,
+        "vcpu": new_vcpu,
+        "mem_mb": int(item["mem_mb"]),
+        "delta": delta,
+    })
 
 
 def _resp(code, body):

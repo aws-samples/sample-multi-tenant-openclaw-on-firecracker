@@ -13,6 +13,9 @@ asg_client = boto3.client("autoscaling")
 ddb = boto3.resource("dynamodb")
 tenants_table = ddb.Table(os.environ["TENANTS_TABLE"])
 hosts_table = ddb.Table(os.environ["HOSTS_TABLE"])
+# Issue #17 — optional audit log; absent in legacy deployments
+audit_table = ddb.Table(os.environ["AUDIT_TABLE"]) if os.environ.get("AUDIT_TABLE") else None
+AUDIT_TTL_DAYS = int(os.environ.get("AUDIT_TTL_DAYS", "90"))
 
 # Per-host limits (from config.yml via env)
 HOST_RESERVED_VCPU = int(os.environ.get("HOST_RESERVED_VCPU", 1))
@@ -56,6 +59,9 @@ def lambda_handler(event, context):
             path_params["id"], path_params["action"]
         ),
         ("GET", "/backups"): list_all_backups,
+        ("GET", "/audit-log"): lambda: list_audit_log(
+            event.get("queryStringParameters") or {}
+        ),
         ("GET", "/hosts"): list_hosts,
         ("POST", "/hosts"): lambda: register_host(json.loads(event["body"])),
         ("POST", "/hosts/refresh-rootfs"): refresh_rootfs,
@@ -68,13 +74,23 @@ def lambda_handler(event, context):
 
     handler = routes.get((method, resource))
     if not handler:
-        return _resp(404, {"error": "not found"})
-    try:
-        return handler() if callable(handler) else handler
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return _resp(500, {"error": str(e)})
+        result = _resp(404, {"error": "not found"})
+    else:
+        try:
+            result = handler() if callable(handler) else handler
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            result = _resp(500, {"error": str(e)})
+
+    # Issue #17 — record mutations to the audit log (best effort, never blocks).
+    if method in ("POST", "PUT", "DELETE"):
+        try:
+            _audit_write(method, resource, path_params, event, result)
+        except Exception as e:
+            print(f"audit write failed (operation still succeeded): {e}")
+
+    return result
 
 
 # ========== Tenant Operations ==========
@@ -839,6 +855,82 @@ def _ssm_run(instance_id, command, timeout=30):
 def _now():
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
+
+
+# ── Audit log (issue #17) ──
+
+_AUDIT_MAX_LIMIT = 500
+_AUDIT_DEFAULT_LIMIT = 50
+
+
+def list_audit_log(query_params=None):
+    """GET /audit-log — list recent audit entries (newest first).
+
+    Query params:
+        limit: int, default 50, capped at 500
+        since: ISO8601 lower bound on `ts` (sort key range filter)
+    """
+    if audit_table is None:
+        return _resp(503, {"error": "audit log not configured"})
+    qp = query_params or {}
+    limit = _AUDIT_DEFAULT_LIMIT
+    try:
+        if qp.get("limit"):
+            limit = max(1, min(_AUDIT_MAX_LIMIT, int(qp["limit"])))
+    except ValueError:
+        return _resp(400, {"error": "limit must be an integer"})
+
+    since = qp.get("since")
+    from boto3.dynamodb.conditions import Key
+    if since:
+        cond = Key("pk").eq("audit") & Key("ts").gte(since)
+    else:
+        cond = Key("pk").eq("audit")
+
+    resp = audit_table.query(
+        KeyConditionExpression=cond,
+        ScanIndexForward=False,  # newest first
+        Limit=limit,
+    )
+    return _resp(200, resp.get("Items", []))
+
+
+def _audit_write(method, resource, path_params, event, result):
+    """Record a mutation in the audit log. Best-effort — caller catches."""
+    if audit_table is None:
+        return
+    import time as _t
+    request_ctx = event.get("requestContext") or {}
+    identity = request_ctx.get("identity") or {}
+    api_key_id = identity.get("apiKeyId", "") or ""
+    resource_id = (path_params or {}).get("id") or (path_params or {}).get("instance_id") or ""
+
+    # Capture small body summary; avoid persisting full request bodies that
+    # may contain secrets.
+    body_summary = {}
+    try:
+        raw = event.get("body")
+        if raw:
+            body = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(body, dict):
+                # whitelist of safe summary fields
+                for k in ("name", "vcpu", "mem_mb", "tags", "ttl_hours",
+                          "on_expiry", "schedule", "action", "ids", "filter"):
+                    if k in body:
+                        body_summary[k] = body[k]
+    except Exception:
+        body_summary = {}
+
+    audit_table.put_item(Item={
+        "pk": "audit",
+        "ts": _now(),
+        "operation": f"{method} {resource}",
+        "resource_id": resource_id,
+        "api_key_id": api_key_id,
+        "request_summary": body_summary,
+        "response_status": int(result.get("statusCode", 0)) if isinstance(result, dict) else 0,
+        "expires_ttl": int(_t.time()) + AUDIT_TTL_DAYS * 86400,
+    })
 
 
 def _resp(code, body):

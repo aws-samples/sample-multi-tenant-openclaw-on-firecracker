@@ -48,6 +48,20 @@ class OpenClawOrchestratorStack(cdk.Stack):
             removal_policy=RemovalPolicy.RETAIN,
         )
 
+        # Issue #17 — Audit log table. Single-partition by design (`pk="audit"`)
+        # for time-range queries; ts as sort key. DDB TTL auto-expires entries
+        # after `audit.retention_days` (default 90).
+        audit_cfg = CFG.get("audit", {}) or {}
+        audit_retention_days = int(audit_cfg.get("retention_days", 90))
+        audit_table = dynamodb.Table(self, "AuditLog",
+            table_name="openclaw-audit-log",
+            partition_key=dynamodb.Attribute(name="pk", type=dynamodb.AttributeType.STRING),
+            sort_key=dynamodb.Attribute(name="ts", type=dynamodb.AttributeType.STRING),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            time_to_live_attribute="expires_ttl",
+            removal_policy=RemovalPolicy.RETAIN,
+        )
+
         # ========== S3 Assets Bucket ==========
         assets_bucket = s3.Bucket(self, "Assets",
             bucket_name=f"openclaw-assets-{self.account}",
@@ -111,6 +125,8 @@ class OpenClawOrchestratorStack(cdk.Stack):
             environment={
                 "TENANTS_TABLE": tenants_table.table_name,
                 "HOSTS_TABLE": hosts_table.table_name,
+                "AUDIT_TABLE": audit_table.table_name,
+                "AUDIT_TTL_DAYS": str(audit_retention_days),
                 "ASSETS_BUCKET": assets_bucket.bucket_name,
                 "ROOTFS_PREFIX": CFG["s3"]["rootfs_prefix"],
                 "HOST_RESERVED_VCPU": str(CFG["host"]["reserved_vcpu"]),
@@ -128,6 +144,8 @@ class OpenClawOrchestratorStack(cdk.Stack):
         )
         tenants_table.grant_read_write_data(api_fn)
         hosts_table.grant_read_write_data(api_fn)
+        # Issue #17 — api Lambda writes audits and reads them back via GET /audit-log
+        audit_table.grant_read_write_data(api_fn)
         assets_bucket.grant_read(api_fn)
         api_fn.add_to_role_policy(ssm_policy)
         api_fn.add_to_role_policy(ec2_policy)
@@ -183,6 +201,10 @@ class OpenClawOrchestratorStack(cdk.Stack):
 
         backups_resource = api.root.add_resource("backups")
         backups_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
+
+        # Issue #17 — audit log read endpoint
+        audit_log_resource = api.root.add_resource("audit-log")
+        audit_log_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
 
         refresh_rootfs_resource = hosts_resource.add_resource("refresh-rootfs")
         refresh_rootfs_resource.add_method("POST", apigw.LambdaIntegration(api_fn), **key_required)

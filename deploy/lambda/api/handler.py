@@ -107,6 +107,11 @@ def create_tenant(body=None):
     config_template = body.get("config_template", "")
     restore_from = body.get("restore_from")
 
+    # Issue #11 — optional schedule
+    schedule, sched_err = _parse_schedule(body.get("schedule"))
+    if sched_err:
+        return _resp(400, {"error": sched_err})
+
     restore_backup_key = ""
     if restore_from:
         src_id = restore_from.get("tenant_id")
@@ -127,7 +132,7 @@ def create_tenant(body=None):
     if not host:
         # No capacity — save as pending and scale out.
         # Persist config_template and restore_backup_key so process_pending() can apply them.
-        tenants_table.put_item(Item={
+        item = {
             "id": tenant_id, "name": name,
             "vcpu": vcpu, "mem_mb": mem_mb,
             "status": "pending",
@@ -135,7 +140,10 @@ def create_tenant(body=None):
             "config_template": config_template,
             "restore_backup_key": restore_backup_key,
             "created_at": now, "updated_at": now,
-        })
+        }
+        if schedule:
+            item["schedule"] = schedule
+        tenants_table.put_item(Item=item)
         _scale_out()
         return _resp(201, {"id": tenant_id, "status": "pending", "message": "scaling out, VM will be created when host is ready"})
 
@@ -144,7 +152,7 @@ def create_tenant(body=None):
     guest_ip = f"{VM_SUBNET_PREFIX}.{vm_num}.2"
     host_port = VM_PORT_BASE + vm_num - 1
 
-    tenants_table.put_item(Item={
+    item = {
         "id": tenant_id,
         "name": name,
         "host_id": host["instance_id"],
@@ -161,7 +169,10 @@ def create_tenant(body=None):
         "creation_started_at": now,
         "created_at": now,
         "updated_at": now,
-    })
+    }
+    if schedule:
+        item["schedule"] = schedule
+    tenants_table.put_item(Item=item)
 
     hosts_table.update_item(
         Key={"instance_id": host["instance_id"]},
@@ -839,6 +850,61 @@ def _ssm_run(instance_id, command, timeout=30):
 def _now():
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
+
+
+# ── Schedule helpers (issue #11) ──
+
+_SCHED_VALID_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+def _parse_schedule(raw):
+    """Validate + normalize a schedule dict.
+
+    Returns (normalized_dict_or_None, error_message_or_None).
+    `None` schedule is allowed → no schedule field is persisted.
+    """
+    if raw is None:
+        return None, None
+    if not isinstance(raw, dict):
+        return None, "schedule must be an object"
+
+    start = raw.get("start")
+    stop = raw.get("stop")
+    if not start or not stop:
+        return None, "schedule.start and schedule.stop are required"
+    if not _valid_hhmm(start):
+        return None, f"schedule.start must be HH:MM 24h format, got {start!r}"
+    if not _valid_hhmm(stop):
+        return None, f"schedule.stop must be HH:MM 24h format, got {stop!r}"
+    if start == stop:
+        return None, "schedule.start must differ from schedule.stop"
+
+    tz = raw.get("timezone") or "UTC"
+    try:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        ZoneInfo(tz)  # validate
+    except Exception:
+        return None, f"schedule.timezone {tz!r} is not a valid IANA name"
+
+    days = raw.get("days") or list(_SCHED_VALID_DAYS)
+    if not isinstance(days, list) or not days:
+        return None, "schedule.days must be a non-empty array"
+    invalid = [d for d in days if d not in _SCHED_VALID_DAYS]
+    if invalid:
+        return None, f"schedule.days has invalid value(s): {invalid}"
+
+    return {"start": start, "stop": stop, "timezone": tz, "days": days}, None
+
+
+def _valid_hhmm(s):
+    """True iff s is a 'HH:MM' string in [00:00, 23:59]."""
+    if not isinstance(s, str) or len(s) != 5 or s[2] != ":":
+        return False
+    h, m = s[:2], s[3:]
+    if not (h.isdigit() and m.isdigit()):
+        return False
+    h, m = int(h), int(m)
+    return 0 <= h < 24 and 0 <= m < 60
 
 
 def _resp(code, body):

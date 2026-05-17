@@ -107,6 +107,11 @@ def create_tenant(body=None):
     config_template = body.get("config_template", "")
     restore_from = body.get("restore_from")
 
+    # Issue #15 — optional TTL fields
+    ttl_fields, ttl_err = _parse_ttl(body.get("ttl_hours"), body.get("on_expiry"))
+    if ttl_err:
+        return _resp(400, {"error": ttl_err})
+
     restore_backup_key = ""
     if restore_from:
         src_id = restore_from.get("tenant_id")
@@ -127,7 +132,7 @@ def create_tenant(body=None):
     if not host:
         # No capacity — save as pending and scale out.
         # Persist config_template and restore_backup_key so process_pending() can apply them.
-        tenants_table.put_item(Item={
+        item = {
             "id": tenant_id, "name": name,
             "vcpu": vcpu, "mem_mb": mem_mb,
             "status": "pending",
@@ -135,7 +140,9 @@ def create_tenant(body=None):
             "config_template": config_template,
             "restore_backup_key": restore_backup_key,
             "created_at": now, "updated_at": now,
-        })
+        }
+        item.update(ttl_fields)
+        tenants_table.put_item(Item=item)
         _scale_out()
         return _resp(201, {"id": tenant_id, "status": "pending", "message": "scaling out, VM will be created when host is ready"})
 
@@ -144,7 +151,7 @@ def create_tenant(body=None):
     guest_ip = f"{VM_SUBNET_PREFIX}.{vm_num}.2"
     host_port = VM_PORT_BASE + vm_num - 1
 
-    tenants_table.put_item(Item={
+    item = {
         "id": tenant_id,
         "name": name,
         "host_id": host["instance_id"],
@@ -161,7 +168,9 @@ def create_tenant(body=None):
         "creation_started_at": now,
         "created_at": now,
         "updated_at": now,
-    })
+    }
+    item.update(ttl_fields)
+    tenants_table.put_item(Item=item)
 
     hosts_table.update_item(
         Key={"instance_id": host["instance_id"]},
@@ -839,6 +848,50 @@ def _ssm_run(instance_id, command, timeout=30):
 def _now():
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
+
+
+# ── TTL helpers (issue #15) ──
+
+_TTL_VALID_ON_EXPIRY = {"stop", "delete"}
+# Future: "backup_and_delete" — needs cross-Lambda backup invocation, deferred.
+
+# Cap at 1 year — guard against accidental "ttl_hours: 87600000".
+_TTL_MAX_HOURS = 8760
+
+
+def _parse_ttl(ttl_hours_raw, on_expiry_raw):
+    """Validate and compute TTL fields.
+
+    Returns (fields_dict, error_message). fields_dict is empty when no TTL is
+    requested; otherwise contains {ttl_hours, on_expiry, expires_at}.
+    """
+    if ttl_hours_raw is None:
+        # Not requested. Reject `on_expiry` without `ttl_hours` to fail loudly.
+        if on_expiry_raw is not None:
+            return {}, "on_expiry requires ttl_hours"
+        return {}, None
+    # Reject non-int strings, but accept str-int from JS clients via int().
+    try:
+        if isinstance(ttl_hours_raw, bool):
+            raise TypeError
+        ttl_hours = int(ttl_hours_raw)
+    except (TypeError, ValueError):
+        return {}, "ttl_hours must be a positive integer"
+    if ttl_hours <= 0:
+        return {}, "ttl_hours must be a positive integer"
+    if ttl_hours > _TTL_MAX_HOURS:
+        return {}, f"ttl_hours must be <= {_TTL_MAX_HOURS} (1 year)"
+    on_expiry = on_expiry_raw or "stop"
+    if on_expiry not in _TTL_VALID_ON_EXPIRY:
+        return {}, (f"on_expiry must be one of {sorted(_TTL_VALID_ON_EXPIRY)}; "
+                    f"got {on_expiry!r}")
+    from datetime import datetime, timedelta, timezone
+    expires_at = (datetime.now(timezone.utc) + timedelta(hours=ttl_hours)).isoformat()
+    return {
+        "ttl_hours": ttl_hours,
+        "on_expiry": on_expiry,
+        "expires_at": expires_at,
+    }, None
 
 
 def _resp(code, body):

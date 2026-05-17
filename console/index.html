@@ -179,12 +179,12 @@
           <thead>
             <tr>
               <th>ID</th><th>Name</th><th>Status</th><th>vCPU</th><th>Mem (MB)</th><th>Guest IP</th>
-              <th>Port</th><th>Host ID</th><th>Rootfs</th><th>VM Health</th><th>Gateway</th><th>Actions</th>
+              <th>Port</th><th>Host ID</th><th>Rootfs</th><th>VM Health</th><th>Gateway</th><th>Metrics</th><th>Actions</th>
             </tr>
           </thead>
           <tbody>
             <template x-if="filteredTenants.length === 0 && !loadingTenants">
-              <tr><td colspan="11" class="empty">No tenants</td></tr>
+              <tr><td colspan="13" class="empty">No tenants</td></tr>
             </template>
             <template x-for="t in filteredTenants" :key="t.id">
               <tr>
@@ -199,6 +199,7 @@
                 <td style="font-size:11px;color:var(--gray)" x-text="t.rootfs_version||'-'"></td>
                 <td><span class="health-dot" :class="healthClass(t.vm_health, t.status)"></span></td>
                 <td><span class="health-dot" :class="healthClass(t.app_health, t.status)"></span></td>
+                <td style="font-size:11px;color:var(--gray);white-space:nowrap" x-text="formatMetrics(t.metrics)"></td>
                 <td>
                   <div class="act-group">
                     <button class="btn-act" title="oc-connect.sh command" @click="copyCmd('./scripts/oc-connect.sh '+t.id)"><svg class="icon s13"><use href="#i-terminal"/></svg></button>
@@ -668,6 +669,14 @@ function app() {
       // Only running tenants have meaningful live health; others show grey.
       if (status && status !== 'running') return 'health-unknown';
       return v === 'up' ? 'health-up' : v === 'down' ? 'health-down' : 'health-unknown';
+    },
+    formatMetrics(m) {
+      // Issue #3: per-VM resource snapshot. Compact format keeps the row
+      // legible: "mem 2.0G • disk 45%" rather than 4 separate columns.
+      if (!m || (typeof m === 'object' && Object.keys(m).length === 0)) return '-';
+      const memG = m.memory_used_mb ? (m.memory_used_mb / 1024).toFixed(1) + 'G' : '-';
+      const diskPct = (m.disk_used_pct != null) ? m.disk_used_pct + '%' : '-';
+      return `mem ${memG} • disk ${diskPct}`;
     },
     get filteredTenants() {
       let list = this.tenants;

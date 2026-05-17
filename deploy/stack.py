@@ -18,6 +18,7 @@ from aws_cdk import (
     aws_cloudfront_origins as origins,
     aws_certificatemanager as acm,
     aws_cognito as cognito,
+    aws_wafv2 as wafv2,
     aws_bedrock_agentcore_alpha as agentcore,
     aws_bedrockagentcore as agentcore_l1,
     custom_resources as cr,
@@ -159,6 +160,77 @@ class OpenClawOrchestratorStack(cdk.Stack):
             api_stages=[apigw.UsagePlanPerApiStage(api=api, stage=api.deployment_stage)],
         )
         plan.add_api_key(api_key)
+
+        # ========== WAF (issue #7, optional) ==========
+        waf_cfg = CFG.get("waf", {}) or {}
+        if waf_cfg.get("enabled", False):
+            rate_limit = int(waf_cfg.get("rate_limit_per_ip", 1000))
+            managed_rule_names = list(waf_cfg.get("managed_rules", []) or [])
+
+            rules = []
+            priority = 0
+            # Rule #1: rate-based per source IP. Always added when WAF is enabled.
+            rules.append(wafv2.CfnWebACL.RuleProperty(
+                name="RateLimitPerIP",
+                priority=priority,
+                action=wafv2.CfnWebACL.RuleActionProperty(block={}),
+                statement=wafv2.CfnWebACL.StatementProperty(
+                    rate_based_statement=wafv2.CfnWebACL.RateBasedStatementProperty(
+                        limit=rate_limit,
+                        aggregate_key_type="IP",
+                    ),
+                ),
+                visibility_config=wafv2.CfnWebACL.VisibilityConfigProperty(
+                    cloud_watch_metrics_enabled=True,
+                    sampled_requests_enabled=True,
+                    metric_name="OpenClawRateLimit",
+                ),
+            ))
+            priority += 1
+
+            # AWS managed rule groups (CommonRuleSet, KnownBadInputs, etc.)
+            for rule_name in managed_rule_names:
+                rules.append(wafv2.CfnWebACL.RuleProperty(
+                    name=rule_name,
+                    priority=priority,
+                    override_action=wafv2.CfnWebACL.OverrideActionProperty(none={}),
+                    statement=wafv2.CfnWebACL.StatementProperty(
+                        managed_rule_group_statement=wafv2.CfnWebACL.ManagedRuleGroupStatementProperty(
+                            vendor_name="AWS",
+                            name=rule_name,
+                        ),
+                    ),
+                    visibility_config=wafv2.CfnWebACL.VisibilityConfigProperty(
+                        cloud_watch_metrics_enabled=True,
+                        sampled_requests_enabled=True,
+                        metric_name=rule_name,
+                    ),
+                ))
+                priority += 1
+
+            web_acl = wafv2.CfnWebACL(self, "ApiWebACL",
+                name="openclaw-api-acl",
+                scope="REGIONAL",  # API Gateway is regional. CloudFront would need scope=CLOUDFRONT (us-east-1 only).
+                default_action=wafv2.CfnWebACL.DefaultActionProperty(allow={}),
+                visibility_config=wafv2.CfnWebACL.VisibilityConfigProperty(
+                    cloud_watch_metrics_enabled=True,
+                    sampled_requests_enabled=True,
+                    metric_name="OpenClawApiACL",
+                ),
+                rules=rules,
+            )
+
+            # Build the API Gateway stage ARN: arn:aws:apigateway:{region}::/restapis/{id}/stages/{stage}
+            stage_arn = Fn.join("", [
+                "arn:", cdk.Aws.PARTITION,
+                ":apigateway:", cdk.Aws.REGION,
+                "::/restapis/", api.rest_api_id,
+                "/stages/", api.deployment_stage.stage_name,
+            ])
+            wafv2.CfnWebACLAssociation(self, "ApiWebACLAssociation",
+                resource_arn=stage_arn,
+                web_acl_arn=web_acl.attr_arn,
+            )
 
         key_required = {"api_key_required": True}
 

@@ -216,6 +216,7 @@ def create_tenant(body=None):
     name = body.get("name", "")
     vcpu = int(body.get("vcpu", VM_DEFAULT_VCPU))
     mem_mb = int(body.get("mem_mb", VM_DEFAULT_MEM))
+    data_disk_mb = int(body.get("data_disk_mb", VM_DATA_DISK_MB))
     config_template = body.get("config_template", "")
     restore_from = body.get("restore_from")
     clone_from = body.get("clone_from")

@@ -30,6 +30,86 @@ VPC_ID = os.environ.get("VPC_ID", "")
 elbv2 = boto3.client("elbv2")
 
 
+# ════════════════════════════════════════════════════════════
+# RBAC (issue #14)
+# ════════════════════════════════════════════════════════════
+#
+# Cognito User Pool Groups carry the role assignment as a
+# `cognito:groups` claim on the id_token. The console attaches the
+# token as `Authorization: Bearer …`. We do NOT re-validate the JWT
+# signature here — API Gateway's API key check already gated the
+# request, and the worst case of a forged claim downgrades the user
+# to viewer (least privilege).
+#
+# Backward compatibility: requests without a Bearer token are
+# treated as admin so that existing CLI / curl flows authenticated
+# purely via x-api-key continue to work.
+
+_ROLE_RANK = {"viewer": 0, "operator": 1, "admin": 2}
+
+# Endpoints that read state are open to viewers; everything else
+# requires operator+ by default. Admin-only endpoints can be added here.
+_VIEWER_OK = {
+    ("GET", "/tenants"), ("GET", "/tenants/{id}"),
+    ("GET", "/tenants/{id}/{action}"),
+    ("GET", "/backups"), ("GET", "/hosts"),
+    ("GET", "/hosts/rootfs-version"), ("GET", "/agentcore/status"),
+}
+
+
+def _decode_jwt_payload(token):
+    """Decode the JWT payload segment (no signature verification)."""
+    import base64
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return {}
+        # Pad the base64 string to a multiple of 4
+        seg = parts[1] + "=" * (-len(parts[1]) % 4)
+        return json.loads(base64.urlsafe_b64decode(seg.encode()))
+    except Exception:
+        return {}
+
+
+def _get_user_role(event):
+    """Return the highest-privilege role for the caller, or 'admin' if no token."""
+    headers = event.get("headers") or {}
+    # API Gateway lower-cases header names but real-world clients vary.
+    auth = headers.get("Authorization") or headers.get("authorization") or ""
+    if not auth.startswith("Bearer "):
+        return "admin"  # No JWT → API key-only path → full access (back-compat)
+    token = auth[len("Bearer "):]
+    claims = _decode_jwt_payload(token)
+    groups = claims.get("cognito:groups", []) or []
+    if isinstance(groups, str):
+        groups = [groups]
+    # Pick the most privileged known group; unknown groups → viewer (least priv).
+    best = None
+    for g in groups:
+        if g in _ROLE_RANK and (best is None or _ROLE_RANK[g] > _ROLE_RANK[best]):
+            best = g
+    if best:
+        return best
+    return "viewer"
+
+
+def _role_satisfies(actual, required):
+    """True iff `actual` has at least the privilege of `required`."""
+    return _ROLE_RANK.get(actual, -1) >= _ROLE_RANK.get(required, 99)
+
+
+def _rbac_check(event, method, resource):
+    """Return None if allowed, else a 403 response."""
+    role = _get_user_role(event)
+    needed = "viewer" if (method, resource) in _VIEWER_OK else "operator"
+    if not _role_satisfies(role, needed):
+        return _resp(403, {
+            "error": "forbidden",
+            "rbac": {"role": role, "required": needed},
+        })
+    return None
+
+
 def lambda_handler(event, context):
     # EventBridge: new host InService → process pending tenants
     if event.get("source") == "aws.autoscaling":
@@ -43,14 +123,17 @@ def lambda_handler(event, context):
     path_params = event.get("pathParameters") or {}
 
     routes = {
-        ("GET", "/tenants"): list_tenants,
+        ("GET", "/tenants"): lambda: list_tenants(
+            event.get("queryStringParameters") or {},
+            event.get("multiValueQueryStringParameters") or {},
+        ),
         ("POST", "/tenants"): lambda: create_tenant(event.get("body")),
         ("GET", "/tenants/{id}"): lambda: get_tenant(path_params["id"]),
         ("DELETE", "/tenants/{id}"): lambda: delete_tenant(
             path_params["id"], event.get("queryStringParameters") or {}
         ),
         ("POST", "/tenants/{id}/{action}"): lambda: tenant_action(
-            path_params["id"], path_params["action"]
+            path_params["id"], path_params["action"], event.get("body")
         ),
         ("GET", "/tenants/{id}/{action}"): lambda: tenant_get_action(
             path_params["id"], path_params["action"]
@@ -70,6 +153,10 @@ def lambda_handler(event, context):
     handler = routes.get((method, resource))
     if not handler:
         return _resp(404, {"error": "not found"})
+    # RBAC enforcement — checked AFTER routing so unknown paths still 404.
+    forbidden = _rbac_check(event, method, resource)
+    if forbidden is not None:
+        return forbidden
     try:
         return handler() if callable(handler) else handler
     except Exception as e:
@@ -81,12 +168,21 @@ def lambda_handler(event, context):
 # ========== Tenant Operations ==========
 
 
-def list_tenants():
+def list_tenants(query_params=None, multi_query_params=None):
     items = tenants_table.scan(
         FilterExpression="#s <> :d",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":d": "deleted"},
     ).get("Items", [])
+    # Ensure every record exposes a tags field so the console can render it
+    for it in items:
+        it.setdefault("tags", {})
+
+    # Issue #10 — optional ?tag=key:value filter (AND across multiple)
+    tag_filters = _collect_tag_filters(query_params, multi_query_params)
+    if tag_filters:
+        items = [it for it in items if _matches_all_tags(it, tag_filters)]
+
     return _resp(200, items)
 
 
@@ -94,6 +190,7 @@ def get_tenant(tenant_id):
     item = tenants_table.get_item(Key={"id": tenant_id}).get("Item")
     if not item:
         return _resp(404, {"error": "tenant not found"})
+    item.setdefault("tags", {})
     return _resp(200, item)
 
 
@@ -107,6 +204,28 @@ def create_tenant(body=None):
     mem_mb = int(body.get("mem_mb", VM_DEFAULT_MEM))
     config_template = body.get("config_template", "")
     restore_from = body.get("restore_from")
+    clone_from = body.get("clone_from")
+
+    # Issue #12 — clone_from is mutually exclusive with restore_from
+    if clone_from and restore_from:
+        return _resp(400, {"error": "clone_from and restore_from are mutually exclusive"})
+
+    # Resolve clone source: must exist + be running. Forces same-host scheduling.
+    clone_src = None
+    if clone_from:
+        clone_src = tenants_table.get_item(Key={"id": clone_from}).get("Item")
+        if not clone_src:
+            return _resp(404, {"error": f"clone source not found: {clone_from}"})
+        if clone_src.get("status") != "running":
+            return _resp(400, {
+                "error": f"clone source must be running (current: {clone_src.get('status')})"
+            })
+
+    # Issue #10 — validate tags up-front (fail fast before any side effects)
+    tags_err = _validate_tags(body.get("tags"))
+    if tags_err:
+        return _resp(400, {"error": tags_err})
+    tags = body.get("tags") or {}
 
     restore_backup_key = ""
     if restore_from:
@@ -123,8 +242,17 @@ def create_tenant(body=None):
     tenant_id = _gen_id(name)
     now = _now()
 
-    # Find host with capacity
-    host = _find_host(vcpu, mem_mb)
+    # Find host with capacity. For clone_from, the clone MUST land on the
+    # source's host so we can do a local cp instead of a slow rsync/S3 hop.
+    if clone_src:
+        host = _get_specific_host_with_capacity(clone_src["host_id"], vcpu, mem_mb)
+        if not host:
+            return _resp(400, {
+                "error": f"clone source's host {clone_src['host_id']} lacks "
+                         f"capacity for clone (vcpu={vcpu}, mem_mb={mem_mb})"
+            })
+    else:
+        host = _find_host(vcpu, mem_mb)
     if not host:
         # No capacity — save as pending and scale out.
         # Persist config_template and restore_backup_key so process_pending() can apply them.
@@ -135,6 +263,7 @@ def create_tenant(body=None):
             "health_failures": 0,
             "config_template": config_template,
             "restore_backup_key": restore_backup_key,
+            "tags": tags,
             "created_at": now, "updated_at": now,
         })
         _scale_out()
@@ -145,7 +274,7 @@ def create_tenant(body=None):
     guest_ip = f"{VM_SUBNET_PREFIX}.{vm_num}.2"
     host_port = VM_PORT_BASE + vm_num - 1
 
-    tenants_table.put_item(Item={
+    item = {
         "id": tenant_id,
         "name": name,
         "host_id": host["instance_id"],
@@ -159,10 +288,14 @@ def create_tenant(body=None):
         "rootfs_version": host.get("rootfs_version", ""),
         "config_template": config_template,
         "restore_backup_key": restore_backup_key,
+        "tags": tags,
         "creation_started_at": now,
         "created_at": now,
         "updated_at": now,
-    })
+    }
+    if clone_from:
+        item["clone_from"] = clone_from
+    tenants_table.put_item(Item=item)
 
     hosts_table.update_item(
         Key={"instance_id": host["instance_id"]},
@@ -170,6 +303,27 @@ def create_tenant(body=None):
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":v": vcpu, ":m": mem_mb, ":one": 1, ":next": vm_num + 1, ":a": "active"},
     )
+
+    # Issue #12 — for clones, snapshot source disks before launching the new VM.
+    # clone-data.sh: pause src → cp --sparse data.ext4 + overlay.ext4 → resume src.
+    if clone_src:
+        src_vm_num = int(clone_src.get("vm_num", 1))
+        clone_cmd = (f"/home/ubuntu/clone-data.sh {clone_from} {src_vm_num} "
+                     f"{tenant_id} {vm_num}")
+        if not _ssm_run(host["instance_id"], clone_cmd, timeout=180):
+            # Roll back: undo the host counter increment + delete tenant row
+            hosts_table.update_item(
+                Key={"instance_id": host["instance_id"]},
+                UpdateExpression="SET used_vcpu = used_vcpu - :v, used_mem_mb = used_mem_mb - :m, vm_count = vm_count - :one",
+                ExpressionAttributeValues={":v": vcpu, ":m": mem_mb, ":one": 1},
+            )
+            tenants_table.update_item(
+                Key={"id": tenant_id},
+                UpdateExpression="SET #s = :s, updated_at = :t",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={":s": "deleted", ":t": _now()},
+            )
+            return _resp(502, {"error": "clone-data.sh failed; tenant rolled back"})
 
     _launch_vm(host["instance_id"], tenant_id, vm_num, vcpu, mem_mb, guest_ip, host_port, config_template, restore_backup_key)
 
@@ -238,10 +392,61 @@ def delete_tenant(tenant_id, query_params):
     return _resp(200, {"id": tenant_id, "status": "deleted"})
 
 
-def tenant_action(tenant_id, action):
+def tenant_action(tenant_id, action, body=None):
     item = tenants_table.get_item(Key={"id": tenant_id}).get("Item")
     if not item:
         return _resp(404, {"error": "tenant not found"})
+
+    if action == "migrate":
+        # Live migration via Firecracker snapshot/restore (issue #20).
+        # Body shape: {"target_host_id": "i-...."}
+        try:
+            payload = json.loads(body) if isinstance(body, str) else (body or {})
+        except Exception:
+            payload = {}
+        target_host_id = payload.get("target_host_id")
+        if not target_host_id:
+            return _resp(400, {"error": "missing target_host_id"})
+        source_host_id = item.get("host_id")
+        if target_host_id == source_host_id:
+            return _resp(400, {"error": "target_host_id must be different from source"})
+        target = hosts_table.get_item(Key={"instance_id": target_host_id}).get("Item")
+        if not target:
+            return _resp(404, {"error": f"target host {target_host_id} not found"})
+
+        vm_num = int(item.get("vm_num", 1))
+        bucket = os.environ.get("ASSETS_BUCKET", "")
+        snap_prefix = f"migrations/{tenant_id}"
+
+        # 1) Source host: pause + snapshot + upload to S3.
+        # The migrate-vm.sh script (deploy/userdata/migrate-vm.sh, ssm_run sees
+        # the same path on every host) handles the Firecracker API calls.
+        _ssm_send(source_host_id,
+                  f"/home/ubuntu/migrate-vm.sh snapshot {tenant_id} {vm_num} "
+                  f"s3://{bucket}/{snap_prefix}")
+
+        # 2) Target host: download + restore.
+        target_vm_num = int(target.get("next_vm_num", 1))
+        _ssm_send(target_host_id,
+                  f"/home/ubuntu/migrate-vm.sh restore {tenant_id} {target_vm_num} "
+                  f"s3://{bucket}/{snap_prefix}")
+
+        # 3) Update DDB: tenant.host_id flips, source.vm_count--, target.vm_count++.
+        now = _now()
+        tenants_table.update_item(
+            Key={"id": tenant_id},
+            UpdateExpression=("SET host_id = :h, vm_num = :n, "
+                              "migration_source = :s, updated_at = :t"),
+            ExpressionAttributeValues={
+                ":h": target_host_id, ":n": target_vm_num,
+                ":s": source_host_id, ":t": now,
+            },
+        )
+        return _resp(202, {
+            "id": tenant_id, "status": "migrating",
+            "source_host_id": source_host_id, "target_host_id": target_host_id,
+            "snapshot_uri": f"s3://{bucket}/{snap_prefix}",
+        })
 
     if action == "restart":
         vm_num = int(item.get("vm_num", 1))
@@ -680,6 +885,27 @@ def _find_host(vcpu_needed, mem_needed):
     return None
 
 
+def _get_specific_host_with_capacity(instance_id, vcpu_needed, mem_needed):
+    """Issue #12 — locate a specific host (used for same-host clone) and
+    confirm it has capacity. Returns the host item or None."""
+    hosts = hosts_table.scan(
+        FilterExpression="#s IN (:a, :i)",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":a": "active", ":i": "idle"},
+    ).get("Items", [])
+    for h in hosts:
+        if h["instance_id"] != instance_id:
+            continue
+        allocatable_vcpu = int(int(h["total_vcpu"]) * CPU_OVERCOMMIT_RATIO)
+        free_vcpu = allocatable_vcpu - int(h["used_vcpu"])
+        allocatable_mem = int(int(h["total_mem_mb"]) * MEM_OVERCOMMIT_RATIO)
+        free_mem = allocatable_mem - int(h["used_mem_mb"])
+        if free_vcpu >= vcpu_needed and free_mem >= mem_needed:
+            return h
+        return None  # found host but no capacity
+    return None
+
+
 def _gen_id(name):
     """Generate tenant id: name-xxxx (4 char hash)."""
     raw = f"{name}{time.time()}"
@@ -842,95 +1068,69 @@ def _now():
     return datetime.now(timezone.utc).isoformat()
 
 
-# ── Batch operations (issue #23) ──
+# ── Tag helpers (issue #10) ──
 
-_BATCH_VALID_ACTIONS = {"stop", "start", "delete", "backup"}
-_BATCH_VALID_FILTER_KEYS = {"tag"}
-_BATCH_MAX_IDS = 100
+# Limits chosen to keep DynamoDB items small and avoid colon-conflict with the
+# `?tag=k:v` query syntax. AWS resource tags use the same 50/256 model; we cap
+# values at 100 chars (more than enough for typical labels) to be conservative.
+_TAG_MAX_KEY_LEN = 50
+_TAG_MAX_VALUE_LEN = 100
+_TAG_MAX_COUNT = 20
 
 
-def batch_tenants(body=None):
-    """POST /batch/tenants — apply one action to many tenants in a single call.
+def _validate_tags(tags):
+    """Return None if valid, else an error message string."""
+    if tags is None:
+        return None  # absent → treated as {}
+    if not isinstance(tags, dict):
+        return "tags must be an object (key/value map)"
+    if len(tags) > _TAG_MAX_COUNT:
+        return f"too many tags (max {_TAG_MAX_COUNT})"
+    for k, v in tags.items():
+        if not isinstance(k, str) or not k:
+            return "tag key must be a non-empty string"
+        if not isinstance(v, str):
+            return f"tag value for '{k}' must be a string"
+        if ":" in k:
+            return f"tag key '{k}' must not contain ':' (reserved for query syntax)"
+        if ":" in v:
+            return f"tag value '{v}' must not contain ':' (reserved for query syntax)"
+        if len(k) > _TAG_MAX_KEY_LEN:
+            return f"tag key '{k}' exceeds {_TAG_MAX_KEY_LEN} characters"
+        if len(v) > _TAG_MAX_VALUE_LEN:
+            return f"tag value for '{k}' exceeds {_TAG_MAX_VALUE_LEN} characters"
+    return None
 
-    Body:
-        action: "stop" | "start" | "delete" | "backup"     (required)
-        ids:    list of tenant ids                          (xor with filter)
-        filter: { "tag": "key:value" }                      (xor with ids)
 
-    Returns: 200 with {"succeeded": [...], "failed": [...]}.
-    Per-tenant errors do not abort the batch — they go into "failed".
+def _collect_tag_filters(query_params, multi_query_params):
+    """Return list of (key, value) pairs from ?tag=k:v occurrences.
+
+    API Gateway delivers repeated query params via multiValueQueryStringParameters.
+    For single-value calls only queryStringParameters is populated.
     """
-    if body is None:
-        return _resp(400, {"error": "missing body"})
-    body = json.loads(body) if isinstance(body, str) else body
-
-    action = body.get("action")
-    if action not in _BATCH_VALID_ACTIONS:
-        return _resp(400, {"error": f"action must be one of {sorted(_BATCH_VALID_ACTIONS)}"})
-
-    ids = body.get("ids")
-    flt = body.get("filter")
-    if ids is not None and flt is not None:
-        return _resp(400, {"error": "specify exactly one of 'ids' or 'filter'"})
-    if ids is None and flt is None:
-        return _resp(400, {"error": "specify exactly one of 'ids' or 'filter'"})
-
-    if ids is not None:
-        if not isinstance(ids, list):
-            return _resp(400, {"error": "ids must be an array"})
-        if len(ids) > _BATCH_MAX_IDS:
-            return _resp(400, {"error": f"too many ids (max {_BATCH_MAX_IDS})"})
-        target_ids = list(ids)
-    else:
-        if not isinstance(flt, dict):
-            return _resp(400, {"error": "filter must be an object"})
-        unknown = set(flt.keys()) - _BATCH_VALID_FILTER_KEYS
-        if unknown:
-            return _resp(400, {"error": f"unknown filter key(s): {sorted(unknown)}"})
-        target_ids = _resolve_filter(flt)
-
-    succeeded, failed = [], []
-    for tid in target_ids:
-        try:
-            tenant = tenants_table.get_item(Key={"id": tid}).get("Item")
-            if not tenant:
-                failed.append({"id": tid, "error": "tenant not found"})
-                continue
-            if action == "delete":
-                # delete_tenant expects (tenant_id, query_params)
-                result = delete_tenant(tid, {})
-            else:
-                result = tenant_action(tid, action)
-            if result.get("statusCode", 500) >= 400:
-                err = json.loads(result.get("body", "{}")).get("error", "unknown error")
-                failed.append({"id": tid, "error": err})
-            else:
-                succeeded.append({"id": tid, "action": action})
-        except Exception as e:
-            failed.append({"id": tid, "error": str(e)})
-
-    return _resp(200, {"succeeded": succeeded, "failed": failed})
+    raw = []
+    if multi_query_params and "tag" in multi_query_params:
+        raw = list(multi_query_params["tag"] or [])
+    elif query_params and "tag" in query_params:
+        raw = [query_params["tag"]]
+    pairs = []
+    for r in raw:
+        if not r or ":" not in r:
+            # Malformed filter — keep it so it matches nothing (defensive)
+            pairs.append((None, None))
+            continue
+        k, v = r.split(":", 1)
+        pairs.append((k, v))
+    return pairs
 
 
-def _resolve_filter(flt):
-    """Convert filter dict → list of matching tenant ids (excludes soft-deleted)."""
-    items = tenants_table.scan(
-        FilterExpression="#s <> :d",
-        ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":d": "deleted"},
-    ).get("Items", [])
-    # Defensive client-side dedupe of soft-deleted in case the FilterExpression
-    # was bypassed (e.g. older boto3 / mocks not applying it).
-    items = [it for it in items if it.get("status") != "deleted"]
-
-    tag_expr = flt.get("tag", "")
-    if tag_expr and ":" in tag_expr:
-        k, v = tag_expr.split(":", 1)
-        items = [it for it in items if (it.get("tags") or {}).get(k) == v]
-    elif tag_expr:
-        # malformed expression — match nothing (defensive)
-        items = []
-    return [it["id"] for it in items]
+def _matches_all_tags(item, filters):
+    """Item must have every (k, v) pair to match (AND semantics)."""
+    item_tags = item.get("tags") or {}
+    for k, v in filters:
+        if k is None or item_tags.get(k) != v:
+            return False
+    return True
 
 
 def _resp(code, body):

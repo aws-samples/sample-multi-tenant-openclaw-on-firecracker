@@ -72,6 +72,8 @@ aws s3 cp "$SCRIPT_DIR/deploy/userdata/launch-vm.sh" "s3://${BUCKET}/deployment/
   --profile "$PROFILE" --region "$REGION" --quiet
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/stop-vm.sh" "s3://${BUCKET}/deployment/scripts/stop-vm.sh" \
   --profile "$PROFILE" --region "$REGION" --quiet
+aws s3 cp "$SCRIPT_DIR/deploy/userdata/clone-data.sh" "s3://${BUCKET}/deployment/scripts/clone-data.sh" \
+  --profile "$PROFILE" --region "$REGION" --quiet
 
 # 导出 stack outputs
 echo "→ 导出部署信息..."

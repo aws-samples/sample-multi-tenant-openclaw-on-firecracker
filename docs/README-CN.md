@@ -31,6 +31,8 @@
 - AWS 账号 + CLI 配置
 - CDK CLI + Python 3.12+
 - uv (Python 包管理)
+- 运行 `build-rootfs.sh` 还需要：`sudo` 权限；`debootstrap` / `pigz` / `e2fsprogs` 工具；
+  ≥2GB 可用内存, `/tmp` ≥10GB 可用空间
 
 ```bash
 # 1. 配置
@@ -41,7 +43,8 @@ cp templates/openclaw.json.example templates/openclaw.json  # 设置 API key、�
 ./setup.sh ap-northeast-1 lab
 # 完成后环境变量保存在 .env.deploy
 
-# 3. 构建 rootfs（自动上传 S3 + 推送到 host）
+# 3. 构建 rootfs —— 创建任何租户前都必须先做这一步
+#    (自动上传 S3 + 推送到 host)
 source .env.deploy
 ./build-rootfs.sh v1.0
 

@@ -54,6 +54,14 @@ health_check:
   max_failures: 3
   app_port: 18789
 
+# ========== AWS WAF (可选, 关联到 API Gateway) ==========
+waf:
+  enabled: false                   # 启用后保护 API Gateway 免受常见攻击
+  rate_limit_per_ip: 1000          # 每 IP 5 分钟内的请求数上限 (超过则 block)
+  managed_rules:                   # AWS 托管规则集
+    - AWSManagedRulesCommonRuleSet
+    - AWSManagedRulesKnownBadInputsRuleSet
+
 # ========== AgentCore (可选) ==========
 agentcore:
   enabled: false                   # 开启后所有 VM 自动连接 AgentCore

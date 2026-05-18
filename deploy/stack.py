@@ -347,8 +347,10 @@ class OpenClawOrchestratorStack(cdk.Stack):
             allow_all_outbound=True,
         )
 
-        # Compute allocatable resources from instance type
-        _itype = CFG["host"]["instance_type"]
+        # Compute allocatable resources from instance type. Fallback to the
+        # arch-aware default if config.yml omits instance_type (issue #19).
+        _arch_default = "m8g.xlarge" if (CFG.get("host", {}) or {}).get("arch") == "arm64" else "m8i.xlarge"
+        _itype = (CFG.get("host", {}) or {}).get("instance_type") or _arch_default
         _sizes = {"medium":1,"large":2,"xlarge":4,"2xlarge":8,"4xlarge":16,"8xlarge":32,"12xlarge":48,"16xlarge":64,"24xlarge":96}
         _mem_ratio = {"c":2048,"m":4096,"r":8192}
         _vcpu_total = _sizes[_itype.split(".")[1]]
@@ -395,15 +397,24 @@ class OpenClawOrchestratorStack(cdk.Stack):
             join_parts.append(parts[i])
         user_data.add_commands(cdk.Fn.join("", join_parts))
 
-        # AMI lookup
+        # AMI lookup — selects Ubuntu Noble for the configured CPU arch.
+        # Graviton hosts (arch=arm64) need a *-arm64-server AMI; mismatched
+        # AMI + instance type fails to boot, so we couple the two.
+        _arch = (CFG.get("host", {}) or {}).get("arch", "x86_64")
+        _ami_arch = "arm64" if _arch == "arm64" else "amd64"
         ami = ec2.MachineImage.lookup(
-            name="ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*",
+            name=f"ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-{_ami_arch}-server-*",
             owners=["099720109477"],
         )
 
+        # InstanceType: honor an explicit override, otherwise pick a sensible
+        # default per arch (m8g for Graviton, m8i for Intel).
+        _instance_type_str = (CFG.get("host", {}) or {}).get("instance_type") \
+            or ("m8g.xlarge" if _arch == "arm64" else "m8i.xlarge")
+
         launch_template = ec2.LaunchTemplate(self, "HostLT",
             launch_template_name="openclaw-host-lt",
-            instance_type=ec2.InstanceType(CFG["host"]["instance_type"]),
+            instance_type=ec2.InstanceType(_instance_type_str),
             machine_image=ami,
             security_group=sg,
             role=host_role,

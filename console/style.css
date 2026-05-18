@@ -109,6 +109,19 @@ tr:hover td { background: #0ff1; }
 .health-down { background: var(--red); box-shadow: 0 0 6px var(--red); }
 .health-unknown { background: var(--gray); }
 
+/* Tag badges (issue #10) */
+.tag-badge {
+  display: inline-block;
+  margin: 1px 3px 1px 0;
+  padding: 1px 6px;
+  border: 1px solid var(--cyan-dim);
+  border-radius: 8px;
+  font-size: 10px;
+  color: var(--cyan-dim);
+  background: rgba(0, 255, 255, 0.04);
+  white-space: nowrap;
+}
+
 /* Modal */
 .overlay { position: fixed; inset: 0; background: #000a; display: flex; align-items: center; justify-content: center; z-index: 50; }
 .modal {

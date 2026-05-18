@@ -11,6 +11,7 @@ from aws_cdk import (
     aws_events_targets as targets,
     aws_iam as iam,
     aws_s3 as s3,
+    aws_sns as sns,
     aws_ec2 as ec2,
     aws_autoscaling as autoscaling,
     aws_elasticloadbalancingv2 as elbv2,
@@ -115,6 +116,17 @@ class OpenClawOrchestratorStack(cdk.Stack):
             resources=["*"],
         )
 
+        # ========== SNS Lifecycle Notifications (issue #13, optional) ==========
+        notif_cfg = CFG.get("notifications", {}) or {}
+        notifications_topic = None
+        notifications_topic_arn = ""
+        if notif_cfg.get("enabled", False):
+            notifications_topic = sns.Topic(self, "TenantEvents",
+                topic_name="openclaw-tenant-events",
+                display_name="OpenClaw Tenant Lifecycle Events",
+            )
+            notifications_topic_arn = notifications_topic.topic_arn
+
         # ========== API Lambda ==========
         api_fn = _lambda.Function(self, "ApiHandler",
             function_name="openclaw-api",
@@ -129,6 +141,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 "AUDIT_TABLE": audit_table.table_name,
                 "AUDIT_TTL_DAYS": str(audit_retention_days),
                 "ASSETS_BUCKET": assets_bucket.bucket_name,
+                "NOTIFICATIONS_TOPIC_ARN": notifications_topic_arn,
                 "ROOTFS_PREFIX": CFG["s3"]["rootfs_prefix"],
                 "HOST_RESERVED_VCPU": str(CFG["host"]["reserved_vcpu"]),
                 "HOST_RESERVED_MEM": str(CFG["host"]["reserved_mem_mb"]),
@@ -148,6 +161,9 @@ class OpenClawOrchestratorStack(cdk.Stack):
         # Issue #17 — api Lambda writes audits and reads them back via GET /audit-log
         audit_table.grant_read_write_data(api_fn)
         assets_bucket.grant_read(api_fn)
+        # Issue #13 — allow publishing tenant lifecycle events
+        if notifications_topic is not None:
+            notifications_topic.grant_publish(api_fn)
         api_fn.add_to_role_policy(ssm_policy)
         api_fn.add_to_role_policy(ec2_policy)
         api_fn.add_to_role_policy(iam.PolicyStatement(
@@ -274,9 +290,10 @@ class OpenClawOrchestratorStack(cdk.Stack):
         backups_resource = api.root.add_resource("backups")
         backups_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
 
-        # Issue #17 — audit log read endpoint
-        audit_log_resource = api.root.add_resource("audit-log")
-        audit_log_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
+        # Issue #23 — batch operations: POST /batch/tenants
+        batch_resource = api.root.add_resource("batch")
+        batch_tenants_resource = batch_resource.add_resource("tenants")
+        batch_tenants_resource.add_method("POST", apigw.LambdaIntegration(api_fn), **key_required)
 
         refresh_rootfs_resource = hosts_resource.add_resource("refresh-rootfs")
         refresh_rootfs_resource.add_method("POST", apigw.LambdaIntegration(api_fn), **key_required)
@@ -348,15 +365,19 @@ class OpenClawOrchestratorStack(cdk.Stack):
             runtime=_lambda.Runtime.PYTHON_3_12,
             handler="handler.lambda_handler",
             code=_lambda.Code.from_asset("deploy/lambda/scaler"),
-            timeout=Duration.seconds(30),
+            timeout=Duration.seconds(60),
             memory_size=128,
             environment={
                 "HOSTS_TABLE": hosts_table.table_name,
+                "TENANTS_TABLE": tenants_table.table_name,
                 "ASG_NAME": "openclaw-hosts-asg",
                 "IDLE_TIMEOUT_MINUTES": str(CFG["scaler"]["idle_timeout_minutes"]),
             },
         )
         hosts_table.grant_read_write_data(scaler_fn)
+        # Issue #15 — TTL processing reads tenants and updates status (stop/delete)
+        tenants_table.grant_read_write_data(scaler_fn)
+        scaler_fn.add_to_role_policy(ssm_policy)  # SSM stop-vm.sh on TTL expiry
         scaler_fn.add_to_role_policy(iam.PolicyStatement(
             actions=["autoscaling:DescribeAutoScalingGroups",
                      "autoscaling:TerminateInstanceInAutoScalingGroup"],
@@ -414,6 +435,50 @@ class OpenClawOrchestratorStack(cdk.Stack):
             resources=["*"],
         ))
 
+        # ========== Amazon Managed Prometheus + Grafana (issue #4) ==========
+        # Host-agent exposes /metrics on :9090; an ADOT collector on each host
+        # remote-writes to AMP using SigV4. AMG reads from AMP for dashboards.
+        # Cost knob: metrics.enabled: false in config.yml skips both workspaces
+        # (AMP is billed per sample/GB, AMG per active user).
+        metrics_cfg = CFG.get("metrics", {})
+        amp_remote_write_url = "none"
+        if metrics_cfg.get("enabled", False):
+            amp_workspace = aps.CfnWorkspace(self, "AmpWorkspace",
+                alias=metrics_cfg.get("workspace_alias", "openclaw"),
+            )
+            # Host EC2 role can remote-write to this workspace.
+            host_role.add_to_policy(iam.PolicyStatement(
+                actions=["aps:RemoteWrite", "aps:GetSeries", "aps:GetLabels", "aps:GetMetricMetadata"],
+                resources=[amp_workspace.attr_arn],
+            ))
+            # AMG service role with read access to AMP.
+            grafana_role = iam.Role(self, "GrafanaServiceRole",
+                assumed_by=iam.ServicePrincipal("grafana.amazonaws.com"),
+            )
+            grafana_role.add_to_policy(iam.PolicyStatement(
+                actions=["aps:QueryMetrics", "aps:GetSeries", "aps:GetLabels", "aps:GetMetricMetadata"],
+                resources=[amp_workspace.attr_arn],
+            ))
+            # AMG workspace itself. AWS_SSO is required when not using SAML.
+            amg_workspace = grafana.CfnWorkspace(self, "GrafanaWorkspace",
+                account_access_type="CURRENT_ACCOUNT",
+                authentication_providers=["AWS_SSO"],
+                permission_type="SERVICE_MANAGED",
+                role_arn=grafana_role.role_arn,
+                data_sources=["PROMETHEUS"],
+                name=metrics_cfg.get("grafana_name", "openclaw-metrics"),
+            )
+            # Build remote_write URL for the host-agent template substitution.
+            # Format: https://aps-workspaces.<region>.amazonaws.com/workspaces/<id>/api/v1/remote_write
+            amp_remote_write_url = (
+                f"https://aps-workspaces.{self.region}.amazonaws.com/"
+                f"workspaces/{amp_workspace.attr_workspace_id}/api/v1/remote_write"
+            )
+            cdk.CfnOutput(self, "AmpWorkspaceArn", value=amp_workspace.attr_arn)
+            cdk.CfnOutput(self, "AmpRemoteWriteUrl", value=amp_remote_write_url)
+            cdk.CfnOutput(self, "GrafanaWorkspaceUrl",
+                value=f"https://{amg_workspace.attr_endpoint}")
+
         instance_profile = iam.CfnInstanceProfile(self, "HostInstanceProfile",
             roles=[host_role.role_name],
             instance_profile_name="openclaw-host-profile",
@@ -469,6 +534,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
         init_sh = init_sh.replace("{{SUBNET_PREFIX}}", CFG["vm"]["subnet_prefix"])
         init_sh = init_sh.replace("{{ROOTFS_OVERLAY_MB}}", str(CFG["vm"].get("rootfs_overlay_mb", 8192)))
         init_sh = init_sh.replace("{{AGENTCORE_GATEWAY_URL}}", gateway_url if gateway_url else "none")
+        init_sh = init_sh.replace("{{AMP_REMOTE_WRITE_URL}}", amp_remote_write_url)
         # Balloon config
         balloon_cfg = CFG.get("balloon", {})
         init_sh = init_sh.replace("{{BALLOON_ENABLED}}", str(balloon_cfg.get("enabled", False)).lower())
@@ -912,6 +978,7 @@ function handler(event) {
             "AssetsBucket": assets_bucket.bucket_name,
             "HostInstanceProfileArn": instance_profile.attr_arn,
             "DashboardUrl": f"https://{dashboard_host}",
+            **({"NotificationsTopicArn": notifications_topic_arn} if notifications_topic_arn else {}),
             **cognito_outputs,
         }.items():
             cdk.CfnOutput(self, key, value=val)

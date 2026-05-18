@@ -10,12 +10,17 @@ import boto3
 ssm = boto3.client("ssm")
 s3 = boto3.client("s3")
 asg_client = boto3.client("autoscaling")
+sns = boto3.client("sns")
 ddb = boto3.resource("dynamodb")
 tenants_table = ddb.Table(os.environ["TENANTS_TABLE"])
 hosts_table = ddb.Table(os.environ["HOSTS_TABLE"])
 # Issue #17 — optional audit log; absent in legacy deployments
 audit_table = ddb.Table(os.environ["AUDIT_TABLE"]) if os.environ.get("AUDIT_TABLE") else None
 AUDIT_TTL_DAYS = int(os.environ.get("AUDIT_TTL_DAYS", "90"))
+
+# Issue #13 — optional SNS topic for tenant lifecycle events.
+# Empty string disables publishing (no-op).
+NOTIFICATIONS_TOPIC_ARN = os.environ.get("NOTIFICATIONS_TOPIC_ARN", "")
 
 # Per-host limits (from config.yml via env)
 HOST_RESERVED_VCPU = int(os.environ.get("HOST_RESERVED_VCPU", 1))
@@ -31,6 +36,12 @@ ASG_NAME = os.environ.get("ASG_NAME", "openclaw-hosts-asg")
 ALB_LISTENER_ARN = os.environ.get("ALB_LISTENER_ARN", "")
 VPC_ID = os.environ.get("VPC_ID", "")
 elbv2 = boto3.client("elbv2")
+
+# Issue #16 / #9 — quota ceilings (0 = unlimited; ENABLED=false → no checks)
+QUOTAS_ENABLED = os.environ.get("QUOTAS_ENABLED", "false").lower() == "true"
+QUOTAS_MAX_VCPU = int(os.environ.get("QUOTAS_MAX_VCPU", "0") or "0")
+QUOTAS_MAX_MEM_MB = int(os.environ.get("QUOTAS_MAX_MEM_MB", "0") or "0")
+QUOTAS_MAX_DATA_DISK_MB = int(os.environ.get("QUOTAS_MAX_DATA_DISK_MB", "0") or "0")
 
 
 # ════════════════════════════════════════════════════════════
@@ -142,9 +153,7 @@ def lambda_handler(event, context):
             path_params["id"], path_params["action"]
         ),
         ("GET", "/backups"): list_all_backups,
-        ("GET", "/audit-log"): lambda: list_audit_log(
-            event.get("queryStringParameters") or {}
-        ),
+        ("POST", "/batch/tenants"): lambda: batch_tenants(event.get("body")),
         ("GET", "/hosts"): list_hosts,
         ("POST", "/hosts"): lambda: register_host(json.loads(event["body"])),
         ("POST", "/hosts/refresh-rootfs"): refresh_rootfs,
@@ -232,6 +241,11 @@ def create_tenant(body=None):
         return _resp(400, {"error": tags_err})
     tags = body.get("tags") or {}
 
+    # Issue #15 — optional TTL fields
+    ttl_fields, ttl_err = _parse_ttl(body.get("ttl_hours"), body.get("on_expiry"))
+    if ttl_err:
+        return _resp(400, {"error": ttl_err})
+
     restore_backup_key = ""
     if restore_from:
         src_id = restore_from.get("tenant_id")
@@ -261,7 +275,7 @@ def create_tenant(body=None):
     if not host:
         # No capacity — save as pending and scale out.
         # Persist config_template and restore_backup_key so process_pending() can apply them.
-        tenants_table.put_item(Item={
+        item = {
             "id": tenant_id, "name": name,
             "vcpu": vcpu, "mem_mb": mem_mb,
             "status": "pending",
@@ -270,8 +284,13 @@ def create_tenant(body=None):
             "restore_backup_key": restore_backup_key,
             "tags": tags,
             "created_at": now, "updated_at": now,
-        })
+        }
+        item.update(ttl_fields)
+        tenants_table.put_item(Item=item)
         _scale_out()
+        _publish_event("tenant.created", tenant_id, {
+            "name": name, "vcpu": vcpu, "mem_mb": mem_mb, "status": "pending",
+        })
         return _resp(201, {"id": tenant_id, "status": "pending", "message": "scaling out, VM will be created when host is ready"})
 
     # Allocate vm_num from host
@@ -336,6 +355,11 @@ def create_tenant(body=None):
     tg_arn = _ensure_host_tg(host["instance_id"], host["private_ip"])
     _add_alb_rule(tenant_id, tg_arn)
 
+    _publish_event("tenant.created", tenant_id, {
+        "name": name, "vcpu": vcpu, "mem_mb": mem_mb,
+        "host_id": host["instance_id"], "guest_ip": guest_ip,
+    })
+
     return _resp(201, {
         "id": tenant_id, "host_id": host["instance_id"],
         "guest_ip": guest_ip, "host_port": host_port, "status": "creating",
@@ -394,6 +418,7 @@ def delete_tenant(tenant_id, query_params):
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":s": "deleted", ":t": _now()},
     )
+    _publish_event("tenant.deleted", tenant_id, {"keep_data": keep_data})
     return _resp(200, {"id": tenant_id, "status": "deleted"})
 
 
@@ -535,6 +560,7 @@ def tenant_action(tenant_id, action, body=None):
             InvocationType="Event",  # async, returns immediately
             Payload=json.dumps({"tenant_id": tenant_id}).encode(),
         )
+        _publish_event("tenant.backup_started", tenant_id, {})
         return _resp(202, {"id": tenant_id, "action": "backup", "status": "started"})
     else:
         return _resp(400, {"error": f"unknown action: {action}"})
@@ -552,6 +578,18 @@ def tenant_action(tenant_id, action, body=None):
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues=expr_values,
     )
+    # Issue #13 — publish lifecycle event for the action.
+    # Map action verbs to lifecycle event names so consumers can filter.
+    _action_to_event = {
+        "stop": "tenant.stopped",
+        "start": "tenant.started",
+        "restart": "tenant.restarted",
+        "pause": "tenant.paused",
+        "resume": "tenant.resumed",
+        "reset": "tenant.reset",
+    }
+    event_name = _action_to_event.get(action, f"tenant.{new_status}")
+    _publish_event(event_name, tenant_id, {"action": action, "status": new_status})
     return _resp(200, {"id": tenant_id, "status": new_status})
 
 

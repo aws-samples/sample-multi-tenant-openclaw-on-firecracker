@@ -208,6 +208,7 @@
                 <td style="font-size:11px;color:var(--gray)" x-text="t.rootfs_version||'-'"></td>
                 <td><span class="health-dot" :class="healthClass(t.vm_health, t.status)"></span></td>
                 <td><span class="health-dot" :class="healthClass(t.app_health, t.status)"></span></td>
+                <td style="font-size:11px;color:var(--gray);white-space:nowrap" x-text="formatMetrics(t.metrics)"></td>
                 <td>
                   <div class="act-group">
                     <button class="btn-act" title="oc-connect.sh command" @click="copyCmd('./scripts/oc-connect.sh '+t.id)"><svg class="icon s13"><use href="#i-terminal"/></svg></button>

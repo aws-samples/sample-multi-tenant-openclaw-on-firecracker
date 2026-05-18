@@ -3,7 +3,10 @@
 
 # ========== 宿主机 (EC2) ==========
 host:
-  instance_type: m8i.xlarge        # 支持嵌套虚拟化: c8i/m8i/r8i 系列
+  # CPU arch (issue #19). x86_64 = Intel/AMD (m8i默认); arm64 = Graviton (m8g默认).
+  # 切换 arch 后必须用 ./build-rootfs.sh --arch <arch> 重建 rootfs.
+  arch: x86_64                     # x86_64 | arm64
+  instance_type: m8i.xlarge        # 留空使用 arch 默认 (m8i.xlarge | m8g.xlarge)
   root_volume_gb: 20
   data_volume_gb: 200              # 建议每个 VM 预留 ~16GB
   keep_data_volume:  true          # 实例删除后是否保留EBS卷

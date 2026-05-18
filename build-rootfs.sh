@@ -80,6 +80,21 @@ sudo umount -l ${ROOTFS_DIR}/proc ${ROOTFS_DIR}/sys ${ROOTFS_DIR}/dev 2>/dev/nul
 sudo umount -l ${ROOTFS_DIR} 2>/dev/null || true
 rm -f ${ROOTFS_IMG} ${DATA_IMG}
 
+# CPU arch selection (issue #19). Defaults to host arch; pass --arch arm64
+# (or x86_64) to cross-build for Graviton vs Intel/AMD hosts.
+ARCH="${ARCH:-$(dpkg --print-architecture 2>/dev/null || uname -m)}"
+case "$ARCH" in
+  x86_64|amd64) ARCH=amd64 ;;
+  aarch64|arm64) ARCH=arm64 ;;
+esac
+for arg in "$@"; do
+  case "$arg" in
+    --arch=*) ARCH="${arg#--arch=}" ;;
+    --arch) shift; ARCH="$1" ;;
+  esac
+done
+echo "→ building for ${ARCH}"
+
 # Build-time ext4 image size for base rootfs. Only needs to fit debootstrap + tools
 # (~2-3GB), then shrunk via resize2fs if zerofree is used. Not a runtime limit.
 ROOTFS_SIZE_MB="${ROOTFS_SIZE_MB:-6144}"
@@ -88,7 +103,7 @@ mkfs.ext4 -q ${ROOTFS_IMG}
 sudo mkdir -p ${ROOTFS_DIR}
 sudo mount ${ROOTFS_IMG} ${ROOTFS_DIR}
 
-sudo debootstrap --include=curl,ca-certificates,systemd,dbus,iproute2,iputils-ping,git,jq \
+sudo debootstrap --arch=${ARCH} --include=curl,ca-certificates,systemd,dbus,iproute2,iputils-ping,git,jq \
   noble ${ROOTFS_DIR} ${MIRROR}
 
 sudo mount --bind /proc ${ROOTFS_DIR}/proc

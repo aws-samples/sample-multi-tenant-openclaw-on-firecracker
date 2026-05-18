@@ -49,6 +49,13 @@ asg:
   lifecycle_hook_timeout: 600
   use_spot: false
 
+# ========== Multi-AZ HA (issue #8) ==========
+# 跨 AZ 部署 ASG + ALB 实现高可用. 默认关闭 (single AZ 减少跨 AZ 数据传输费用).
+# 启用后 az_count 控制最多使用几个 AZ; 实际数量受 region 可用 AZ 数限制.
+multi_az:
+  enabled: false
+  az_count: 2
+
 scaler:
   interval_minutes: 3
   idle_timeout_minutes: 10

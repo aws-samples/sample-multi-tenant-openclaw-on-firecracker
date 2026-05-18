@@ -669,6 +669,24 @@ function app() {
       if (status && status !== 'running') return 'health-unknown';
       return v === 'up' ? 'health-up' : v === 'down' ? 'health-down' : 'health-unknown';
     },
+    role() {
+      // RBAC (issue #14): inspect the JWT id_token, return the most-privileged
+      // group name. No JWT (e.g. when console_auth.enabled: false) → admin.
+      var token = localStorage.getItem('oc_id_token');
+      if (!token) return 'admin';
+      try {
+        var p = JSON.parse(atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
+        var groups = p['cognito:groups'] || [];
+        if (typeof groups === 'string') groups = [groups];
+        var rank = { viewer: 0, operator: 1, admin: 2 };
+        var best = null, bestRank = -1;
+        groups.forEach(function(g) {
+          if (rank[g] !== undefined && rank[g] > bestRank) { best = g; bestRank = rank[g]; }
+        });
+        return best || 'viewer';
+      } catch (e) { return 'viewer'; }
+    },
+    canWrite() { return this.role() !== 'viewer'; },
     get filteredTenants() {
       let list = this.tenants;
       if (this.selectedHost) list = list.filter(t => t.host_id === this.selectedHost);

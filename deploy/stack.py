@@ -18,6 +18,7 @@ from aws_cdk import (
     aws_cloudfront_origins as origins,
     aws_certificatemanager as acm,
     aws_cognito as cognito,
+    aws_wafv2 as wafv2,
     aws_bedrock_agentcore_alpha as agentcore,
     aws_bedrockagentcore as agentcore_l1,
     custom_resources as cr,
@@ -164,6 +165,77 @@ class OpenClawOrchestratorStack(cdk.Stack):
             api_stages=[apigw.UsagePlanPerApiStage(api=api, stage=api.deployment_stage)],
         )
         plan.add_api_key(api_key)
+
+        # ========== WAF (issue #7, optional) ==========
+        waf_cfg = CFG.get("waf", {}) or {}
+        if waf_cfg.get("enabled", False):
+            rate_limit = int(waf_cfg.get("rate_limit_per_ip", 1000))
+            managed_rule_names = list(waf_cfg.get("managed_rules", []) or [])
+
+            rules = []
+            priority = 0
+            # Rule #1: rate-based per source IP. Always added when WAF is enabled.
+            rules.append(wafv2.CfnWebACL.RuleProperty(
+                name="RateLimitPerIP",
+                priority=priority,
+                action=wafv2.CfnWebACL.RuleActionProperty(block={}),
+                statement=wafv2.CfnWebACL.StatementProperty(
+                    rate_based_statement=wafv2.CfnWebACL.RateBasedStatementProperty(
+                        limit=rate_limit,
+                        aggregate_key_type="IP",
+                    ),
+                ),
+                visibility_config=wafv2.CfnWebACL.VisibilityConfigProperty(
+                    cloud_watch_metrics_enabled=True,
+                    sampled_requests_enabled=True,
+                    metric_name="OpenClawRateLimit",
+                ),
+            ))
+            priority += 1
+
+            # AWS managed rule groups (CommonRuleSet, KnownBadInputs, etc.)
+            for rule_name in managed_rule_names:
+                rules.append(wafv2.CfnWebACL.RuleProperty(
+                    name=rule_name,
+                    priority=priority,
+                    override_action=wafv2.CfnWebACL.OverrideActionProperty(none={}),
+                    statement=wafv2.CfnWebACL.StatementProperty(
+                        managed_rule_group_statement=wafv2.CfnWebACL.ManagedRuleGroupStatementProperty(
+                            vendor_name="AWS",
+                            name=rule_name,
+                        ),
+                    ),
+                    visibility_config=wafv2.CfnWebACL.VisibilityConfigProperty(
+                        cloud_watch_metrics_enabled=True,
+                        sampled_requests_enabled=True,
+                        metric_name=rule_name,
+                    ),
+                ))
+                priority += 1
+
+            web_acl = wafv2.CfnWebACL(self, "ApiWebACL",
+                name="openclaw-api-acl",
+                scope="REGIONAL",  # API Gateway is regional. CloudFront would need scope=CLOUDFRONT (us-east-1 only).
+                default_action=wafv2.CfnWebACL.DefaultActionProperty(allow={}),
+                visibility_config=wafv2.CfnWebACL.VisibilityConfigProperty(
+                    cloud_watch_metrics_enabled=True,
+                    sampled_requests_enabled=True,
+                    metric_name="OpenClawApiACL",
+                ),
+                rules=rules,
+            )
+
+            # Build the API Gateway stage ARN: arn:aws:apigateway:{region}::/restapis/{id}/stages/{stage}
+            stage_arn = Fn.join("", [
+                "arn:", cdk.Aws.PARTITION,
+                ":apigateway:", cdk.Aws.REGION,
+                "::/restapis/", api.rest_api_id,
+                "/stages/", api.deployment_stage.stage_name,
+            ])
+            wafv2.CfnWebACLAssociation(self, "ApiWebACLAssociation",
+                resource_arn=stage_arn,
+                web_acl_arn=web_acl.attr_arn,
+            )
 
         key_required = {"api_key_required": True}
 
@@ -347,13 +419,22 @@ class OpenClawOrchestratorStack(cdk.Stack):
 
         vpc = ec2.Vpc.from_lookup(self, "Vpc", is_default=True)
 
+        # ========== Multi-AZ HA (issue #8) ==========
+        # `_az_count` controls how many AZs the ASG and ALB span. Default is
+        # single-AZ to minimize cross-AZ data-transfer charges; opt in via
+        # config.yml `multi_az.enabled: true`.
+        _multi_az = CFG.get("multi_az", {}) or {}
+        _az_count = int(_multi_az.get("az_count", 2)) if _multi_az.get("enabled", False) else 1
+
         sg = ec2.SecurityGroup(self, "HostSG",
             vpc=vpc, security_group_name="openclaw-host-sg",
             allow_all_outbound=True,
         )
 
-        # Compute allocatable resources from instance type
-        _itype = CFG["host"]["instance_type"]
+        # Compute allocatable resources from instance type. Fallback to the
+        # arch-aware default if config.yml omits instance_type (issue #19).
+        _arch_default = "m8g.xlarge" if (CFG.get("host", {}) or {}).get("arch") == "arm64" else "m8i.xlarge"
+        _itype = (CFG.get("host", {}) or {}).get("instance_type") or _arch_default
         _sizes = {"medium":1,"large":2,"xlarge":4,"2xlarge":8,"4xlarge":16,"8xlarge":32,"12xlarge":48,"16xlarge":64,"24xlarge":96}
         _mem_ratio = {"c":2048,"m":4096,"r":8192}
         _vcpu_total = _sizes[_itype.split(".")[1]]
@@ -400,15 +481,24 @@ class OpenClawOrchestratorStack(cdk.Stack):
             join_parts.append(parts[i])
         user_data.add_commands(cdk.Fn.join("", join_parts))
 
-        # AMI lookup
+        # AMI lookup — selects Ubuntu Noble for the configured CPU arch.
+        # Graviton hosts (arch=arm64) need a *-arm64-server AMI; mismatched
+        # AMI + instance type fails to boot, so we couple the two.
+        _arch = (CFG.get("host", {}) or {}).get("arch", "x86_64")
+        _ami_arch = "arm64" if _arch == "arm64" else "amd64"
         ami = ec2.MachineImage.lookup(
-            name="ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*",
+            name=f"ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-{_ami_arch}-server-*",
             owners=["099720109477"],
         )
 
+        # InstanceType: honor an explicit override, otherwise pick a sensible
+        # default per arch (m8g for Graviton, m8i for Intel).
+        _instance_type_str = (CFG.get("host", {}) or {}).get("instance_type") \
+            or ("m8g.xlarge" if _arch == "arm64" else "m8i.xlarge")
+
         launch_template = ec2.LaunchTemplate(self, "HostLT",
             launch_template_name="openclaw-host-lt",
-            instance_type=ec2.InstanceType(CFG["host"]["instance_type"]),
+            instance_type=ec2.InstanceType(_instance_type_str),
             machine_image=ami,
             security_group=sg,
             role=host_role,
@@ -421,8 +511,11 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 ),
                 ec2.BlockDevice(
                     device_name="/dev/sdf",
+                    # Encrypt at rest with AWS-managed KMS key.
+                    # Tenant data (rootfs overlays, data volumes, backups in transit) live here.
                     volume=ec2.BlockDeviceVolume.ebs(CFG["host"]["data_volume_gb"],
                         volume_type=ec2.EbsDeviceVolumeType.GP3,
+                        encrypted=True,
                         delete_on_termination=not CFG["host"].get("keep_data_volume", False)),
                 ),
             ],
@@ -492,6 +585,9 @@ class OpenClawOrchestratorStack(cdk.Stack):
         asg = autoscaling.AutoScalingGroup(self, "HostASG",
             auto_scaling_group_name="openclaw-hosts-asg",
             vpc=vpc,
+            vpc_subnets=ec2.SubnetSelection(
+                subnets=vpc.public_subnets[:_az_count] or vpc.private_subnets[:_az_count]
+            ),
             launch_template=launch_template,
             min_capacity=CFG["asg"]["min_capacity"],
             max_capacity=CFG["asg"]["max_capacity"],
@@ -636,6 +732,9 @@ class OpenClawOrchestratorStack(cdk.Stack):
         alb = elbv2.ApplicationLoadBalancer(self, "DashboardALB",
             load_balancer_name="openclaw-dashboard",
             vpc=vpc,
+            vpc_subnets=ec2.SubnetSelection(
+                subnets=vpc.public_subnets[:_az_count] or vpc.private_subnets[:_az_count]
+            ),
             internet_facing=True,
         )
         listener = alb.add_listener("HTTP", port=80,
@@ -770,6 +869,22 @@ function handler(event) {
                 cognito_outputs["CognitoUserPoolId"] = user_pool.user_pool_id
                 cognito_outputs["CognitoClientId"] = client.user_pool_client_id
                 cognito_outputs["CognitoDomain"] = f"openclaw-console.auth.{cdk.Stack.of(self).region}.amazoncognito.com"
+
+            # RBAC groups (issue #14): admin / operator / viewer.
+            # Created on both new and existing pools so an imported pool also
+            # gets the role groups. The handler maps `cognito:groups` claim →
+            # role hierarchy (admin > operator > viewer).
+            for group_name, description, precedence in (
+                ("admin",    "Full access — RBAC + CRUD + actions", 1),
+                ("operator", "CRUD + lifecycle actions (no RBAC mgmt)", 2),
+                ("viewer",   "Read-only access",                       3),
+            ):
+                cognito.CfnUserPoolGroup(self, f"Role{group_name.capitalize()}",
+                    user_pool_id=user_pool.user_pool_id,
+                    group_name=group_name,
+                    description=description,
+                    precedence=precedence,
+                )
 
         # ========== Outputs ==========
         for key, val in {

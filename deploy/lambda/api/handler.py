@@ -34,6 +34,12 @@ ALB_LISTENER_ARN = os.environ.get("ALB_LISTENER_ARN", "")
 VPC_ID = os.environ.get("VPC_ID", "")
 elbv2 = boto3.client("elbv2")
 
+# Issue #16 / #9 — quota ceilings (0 = unlimited; ENABLED=false → no checks)
+QUOTAS_ENABLED = os.environ.get("QUOTAS_ENABLED", "false").lower() == "true"
+QUOTAS_MAX_VCPU = int(os.environ.get("QUOTAS_MAX_VCPU", "0") or "0")
+QUOTAS_MAX_MEM_MB = int(os.environ.get("QUOTAS_MAX_MEM_MB", "0") or "0")
+QUOTAS_MAX_DATA_DISK_MB = int(os.environ.get("QUOTAS_MAX_DATA_DISK_MB", "0") or "0")
+
 
 # ════════════════════════════════════════════════════════════
 # RBAC (issue #14)

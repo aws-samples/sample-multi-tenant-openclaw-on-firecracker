@@ -50,7 +50,7 @@ def lambda_handler(event, context):
             path_params["id"], event.get("queryStringParameters") or {}
         ),
         ("POST", "/tenants/{id}/{action}"): lambda: tenant_action(
-            path_params["id"], path_params["action"]
+            path_params["id"], path_params["action"], event.get("body")
         ),
         ("GET", "/tenants/{id}/{action}"): lambda: tenant_get_action(
             path_params["id"], path_params["action"]
@@ -237,10 +237,42 @@ def delete_tenant(tenant_id, query_params):
     return _resp(200, {"id": tenant_id, "status": "deleted"})
 
 
-def tenant_action(tenant_id, action):
+def tenant_action(tenant_id, action, body=None):
     item = tenants_table.get_item(Key={"id": tenant_id}).get("Item")
     if not item:
         return _resp(404, {"error": "tenant not found"})
+
+    if action == "resize-disk":
+        # Offline data-disk grow (issue #22).
+        # Body: {"new_size_mb": int}. Refuse shrinks (data loss risk) and
+        # > 1 TiB (sanity check). resize-disk.sh on the host pauses VM,
+        # truncates the sparse ext4 file, runs e2fsck + resize2fs, resumes.
+        try:
+            payload = json.loads(body) if isinstance(body, str) else (body or {})
+        except Exception:
+            payload = {}
+        new_size = payload.get("new_size_mb")
+        if not isinstance(new_size, int):
+            return _resp(400, {"error": "missing or invalid new_size_mb"})
+        current = int(item.get("data_disk_mb", VM_DATA_DISK_MB))
+        if new_size <= current:
+            return _resp(400, {"error": f"new_size_mb must be larger (current {current}MB); shrink not supported"})
+        if new_size > 1024 * 1024:  # 1 TiB ceiling
+            return _resp(400, {"error": "new_size_mb exceeds 1 TiB ceiling"})
+        host_id = item.get("host_id")
+        vm_num = int(item.get("vm_num", 1))
+        if not host_id:
+            return _resp(400, {"error": "tenant has no host (still pending?)"})
+        _ssm_send(host_id, f"/home/ubuntu/resize-disk.sh {tenant_id} {vm_num} {new_size}")
+        tenants_table.update_item(
+            Key={"id": tenant_id},
+            UpdateExpression="SET data_disk_mb = :s, updated_at = :t",
+            ExpressionAttributeValues={":s": new_size, ":t": _now()},
+        )
+        return _resp(202, {
+            "id": tenant_id, "status": "resizing",
+            "old_size_mb": current, "new_size_mb": new_size,
+        })
 
     if action == "restart":
         vm_num = int(item.get("vm_num", 1))

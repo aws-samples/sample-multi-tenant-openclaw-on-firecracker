@@ -226,6 +226,11 @@ def create_tenant(body=None):
         return _resp(400, {"error": tags_err})
     tags = body.get("tags") or {}
 
+    # Issue #15 — optional TTL fields
+    ttl_fields, ttl_err = _parse_ttl(body.get("ttl_hours"), body.get("on_expiry"))
+    if ttl_err:
+        return _resp(400, {"error": ttl_err})
+
     restore_backup_key = ""
     if restore_from:
         src_id = restore_from.get("tenant_id")
@@ -255,7 +260,7 @@ def create_tenant(body=None):
     if not host:
         # No capacity — save as pending and scale out.
         # Persist config_template and restore_backup_key so process_pending() can apply them.
-        tenants_table.put_item(Item={
+        item = {
             "id": tenant_id, "name": name,
             "vcpu": vcpu, "mem_mb": mem_mb,
             "status": "pending",
@@ -264,7 +269,9 @@ def create_tenant(body=None):
             "restore_backup_key": restore_backup_key,
             "tags": tags,
             "created_at": now, "updated_at": now,
-        })
+        }
+        item.update(ttl_fields)
+        tenants_table.put_item(Item=item)
         _scale_out()
         return _resp(201, {"id": tenant_id, "status": "pending", "message": "scaling out, VM will be created when host is ready"})
 

@@ -326,15 +326,19 @@ class OpenClawOrchestratorStack(cdk.Stack):
             runtime=_lambda.Runtime.PYTHON_3_12,
             handler="handler.lambda_handler",
             code=_lambda.Code.from_asset("deploy/lambda/scaler"),
-            timeout=Duration.seconds(30),
+            timeout=Duration.seconds(60),
             memory_size=128,
             environment={
                 "HOSTS_TABLE": hosts_table.table_name,
+                "TENANTS_TABLE": tenants_table.table_name,
                 "ASG_NAME": "openclaw-hosts-asg",
                 "IDLE_TIMEOUT_MINUTES": str(CFG["scaler"]["idle_timeout_minutes"]),
             },
         )
         hosts_table.grant_read_write_data(scaler_fn)
+        # Issue #15 — TTL processing reads tenants and updates status (stop/delete)
+        tenants_table.grant_read_write_data(scaler_fn)
+        scaler_fn.add_to_role_policy(ssm_policy)  # SSM stop-vm.sh on TTL expiry
         scaler_fn.add_to_role_policy(iam.PolicyStatement(
             actions=["autoscaling:DescribeAutoScalingGroups",
                      "autoscaling:TerminateInstanceInAutoScalingGroup"],

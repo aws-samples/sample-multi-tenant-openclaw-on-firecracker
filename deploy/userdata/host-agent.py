@@ -169,17 +169,39 @@ def _write_ddb(results):
     table = _get_ddb().Table(TENANTS_TABLE)
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     for tid, info in results.items():
+        # Compute per-VM metrics for healthy VMs (issue #3).
+        # Skipped for down/recovering VMs to keep their last-known metrics
+        # rather than overwriting with zeros (which would mask the failure).
+        metrics = None
+        if info["vm_health"] == "up":
+            sock_file = os.path.join(VM_DIR, tid, "fc.sock")
+            data_file = os.path.join(VM_DIR, tid, "data.ext4")
+            cfg_file = os.path.join(VM_DIR, tid, "vm.json")
+            vm_mem_mb = 4096
+            try:
+                with open(cfg_file, encoding="utf-8") as f:
+                    vm_mem_mb = json.load(f).get("mem_mb", 4096)
+            except Exception:
+                pass
+            try:
+                metrics = _compose_metrics(tid, vm_mem_mb, sock_file, data_file)
+            except Exception as e:
+                print(f"compose_metrics {tid}: {e}")
+
         try:
             if info["vm_health"] == "up":
                 # Promote creating → running + read gateway token
                 token = _read_gateway_token(info["guest_ip"])
                 if not token:
                     continue  # Wait for SSH/gateway to be ready
-                update_expr = "SET #s = :r, vm_health = :vh, app_health = :ah, health_failures = :z, last_health_check = :t, updated_at = :t, gateway_token = :tk"
+                update_expr = ("SET #s = :r, vm_health = :vh, app_health = :ah, "
+                               "health_failures = :z, last_health_check = :t, "
+                               "updated_at = :t, gateway_token = :tk, metrics = :m")
                 update_vals = {
                     ":r": "running", ":c": "creating",
                     ":vh": info["vm_health"], ":ah": info["app_health"],
                     ":z": 0, ":t": now, ":tk": token,
+                    ":m": metrics or {},
                 }
                 table.update_item(
                     Key={"id": tid},
@@ -198,19 +220,125 @@ def _write_ddb(results):
                     },
                 )
         except table.meta.client.exceptions.ConditionalCheckFailedException:
-            # Not in creating status, just update health
+            # Not in creating status — already running. Refresh health + metrics.
             try:
-                table.update_item(
-                    Key={"id": tid},
-                    UpdateExpression="SET vm_health = :vh, app_health = :ah, last_health_check = :t",
-                    ExpressionAttributeValues={
-                        ":vh": info["vm_health"], ":ah": info["app_health"], ":t": now,
-                    },
-                )
+                if metrics is not None:
+                    table.update_item(
+                        Key={"id": tid},
+                        UpdateExpression=("SET vm_health = :vh, app_health = :ah, "
+                                          "last_health_check = :t, metrics = :m"),
+                        ExpressionAttributeValues={
+                            ":vh": info["vm_health"], ":ah": info["app_health"],
+                            ":t": now, ":m": metrics,
+                        },
+                    )
+                else:
+                    table.update_item(
+                        Key={"id": tid},
+                        UpdateExpression="SET vm_health = :vh, app_health = :ah, last_health_check = :t",
+                        ExpressionAttributeValues={
+                            ":vh": info["vm_health"], ":ah": info["app_health"], ":t": now,
+                        },
+                    )
             except Exception as e:
                 print(f"ddb update {tid}: {e}")
         except Exception as e:
             print(f"ddb update {tid}: {e}")
+
+
+# ═══════════════════════════════════════════
+# Per-VM resource metrics (issue #3)
+# ═══════════════════════════════════════════
+#
+# Sources:
+#   memory_used_mb / memory_balloon_mib  : Firecracker /balloon/statistics
+#   disk_used_mb / disk_total_mb / pct   : dumpe2fs -h on data.ext4 (host-side)
+#   cpu_pct                               : reserved (0 in this PR)
+#
+# Tenants without a probe failure get a `metrics` field on their DDB record.
+
+
+def _parse_dumpe2fs_blocks(output):
+    """Extract (used_mb, total_mb) from dumpe2fs -h output.
+
+    dumpe2fs prints many irrelevant lines (features, UUIDs, etc.); we only
+    need three keys. Returns (0, 0) on malformed input rather than raising
+    so the polling loop never crashes from a transient FS-tool failure.
+    """
+    import re
+    block_count = block_size = free_blocks = None
+    for line in output.splitlines():
+        m = re.match(r"^Block count:\s+(\d+)", line)
+        if m:
+            block_count = int(m.group(1))
+            continue
+        m = re.match(r"^Block size:\s+(\d+)", line)
+        if m:
+            block_size = int(m.group(1))
+            continue
+        m = re.match(r"^Free blocks:\s+(\d+)", line)
+        if m:
+            free_blocks = int(m.group(1))
+    if block_count is None or block_size is None or free_blocks is None:
+        return 0, 0
+    total_bytes = block_count * block_size
+    used_bytes = (block_count - free_blocks) * block_size
+    return used_bytes // (1024 * 1024), total_bytes // (1024 * 1024)
+
+
+def _get_disk_usage(data_file):
+    """Run `dumpe2fs -h` on data.ext4 and return (used_mb, total_mb, pct).
+
+    Host-side: avoids SSH into the guest. Safe even when the file does not
+    exist (newly-creating VM) — returns zeros instead of raising.
+    """
+    if not data_file or not os.path.exists(data_file):
+        return 0, 0, 0
+    try:
+        r = subprocess.run(["dumpe2fs", "-h", data_file],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return 0, 0, 0
+        used_mb, total_mb = _parse_dumpe2fs_blocks(r.stdout)
+        pct = int(used_mb * 100 / total_mb) if total_mb else 0
+        return used_mb, total_mb, pct
+    except Exception:
+        return 0, 0, 0
+
+
+def _get_memory_usage(stats, vm_mem_mb):
+    """Compute (used_mb, balloon_mib) from balloon /statistics response.
+
+    `available_memory` reflects what the guest kernel could hand out, so
+    `vm_mem_mb - available_mb` is a good proxy for "memory in active use".
+    Pure function — no I/O — so it can be tested without a running VM.
+    """
+    if not stats:
+        return 0, 0
+    available_bytes = stats.get("stats", {}).get("available_memory", 0)
+    available_mb = available_bytes // (1024 * 1024)
+    used_mb = max(0, vm_mem_mb - available_mb)
+    balloon_mib = stats.get("actual_mib", 0)
+    return used_mb, balloon_mib
+
+
+def _compose_metrics(tenant_id, vm_mem_mb, sock_file, data_file):
+    """Build the per-VM metrics dict written to DDB.
+
+    cpu_pct is a stub (0) for this PR — a future change can plug in cgroup
+    accounting or Firecracker host-side stats.
+    """
+    stats = _get_balloon_stats(sock_file) if sock_file else None
+    mem_used, balloon_mib = _get_memory_usage(stats, vm_mem_mb)
+    disk_used, disk_total, disk_pct = _get_disk_usage(data_file)
+    return {
+        "memory_used_mb": int(mem_used),
+        "memory_balloon_mib": int(balloon_mib),
+        "disk_used_mb": int(disk_used),
+        "disk_total_mb": int(disk_total),
+        "disk_used_pct": int(disk_pct),
+        "cpu_pct": 0,
+    }
 
 
 def _get_balloon_stats(sock_file):

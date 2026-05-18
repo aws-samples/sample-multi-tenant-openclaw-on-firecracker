@@ -66,6 +66,8 @@ BUCKET=$(aws cloudformation describe-stacks --stack-name OpenClawOrchestrator \
   --profile "$PROFILE" --region "$REGION")
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/host-agent.py" "s3://${BUCKET}/deployment/scripts/host-agent.py" \
   --profile "$PROFILE" --region "$REGION" --quiet
+aws s3 cp "$SCRIPT_DIR/deploy/userdata/adot-config.yaml" "s3://${BUCKET}/deployment/scripts/adot-config.yaml" \
+  --profile "$PROFILE" --region "$REGION" --quiet
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/backup-data.sh" "s3://${BUCKET}/deployment/scripts/backup-data.sh" \
   --profile "$PROFILE" --region "$REGION" --quiet
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/launch-vm.sh" "s3://${BUCKET}/deployment/scripts/launch-vm.sh" \

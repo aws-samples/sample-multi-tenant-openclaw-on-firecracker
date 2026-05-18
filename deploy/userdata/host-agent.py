@@ -21,6 +21,59 @@ PORT = int(os.environ.get("OC_AGENT_PORT", "8899"))
 VM_DIR = "/data/firecracker-vms"
 GATEWAY_PORT = 18789
 TENANTS_TABLE = os.environ.get("TENANTS_TABLE", "")
+PROM_PORT = int(os.environ.get("OC_AGENT_PROM_PORT", "9090"))
+
+
+# ═══════════════════════════════════════════
+# Prometheus exporter (issue #4)
+# ═══════════════════════════════════════════
+#
+# Exposes a /metrics endpoint in Prom text-exposition format on port 9090
+# (same HTTPServer as /health to avoid a second listener). An ADOT collector
+# running as a sibling systemd service scrapes this and remote-writes to AMP.
+#
+# Why text-format and not the prometheus_client library?
+# - We already have BaseHTTPRequestHandler. Adding prometheus_client just for
+#   text rendering pulls in a dependency tree we don't otherwise need.
+# - The exposition format is stable and trivially correct to emit by hand.
+# - Pure function (input dict → string) is testable without a live server.
+
+_PROM_GAUGES = (
+    ("openclaw_vm_memory_used_mb",   "Per-VM memory in active use (MB)",     "memory_used_mb"),
+    ("openclaw_vm_memory_balloon_mib", "Balloon size held by the host (MiB)", "memory_balloon_mib"),
+    ("openclaw_vm_disk_used_mb",     "Per-VM data disk used (MB)",            "disk_used_mb"),
+    ("openclaw_vm_disk_total_mb",    "Per-VM data disk capacity (MB)",        "disk_total_mb"),
+    ("openclaw_vm_disk_used_pct",    "Per-VM data disk used (percent)",       "disk_used_pct"),
+    ("openclaw_vm_cpu_pct",          "Per-VM CPU usage (percent, reserved)",  "cpu_pct"),
+)
+
+
+def _render_metrics_text(snapshots):
+    """Render the in-memory snapshots dict as Prometheus exposition text.
+
+    Pure function — no I/O — so it is easy to assert against in unit tests.
+    Always emits HELP/TYPE headers (even with zero samples) so that scrapers
+    that validate metadata don't choke on a quiet host.
+    """
+    out = []
+    for metric_name, help_text, key in _PROM_GAUGES:
+        out.append(f"# HELP {metric_name} {help_text}")
+        out.append(f"# TYPE {metric_name} gauge")
+        for tid, info in snapshots.items():
+            metrics = info.get("metrics") if isinstance(info, dict) else None
+            if not metrics:
+                continue
+            value = metrics.get(key, 0)
+            out.append(f'{metric_name}{{tenant="{tid}"}} {int(value)}')
+    # vm_health as 0/1 — useful for alerting even when metrics are missing.
+    out.append("# HELP openclaw_vm_health 1 if the VM responded to ping, else 0")
+    out.append("# TYPE openclaw_vm_health gauge")
+    for tid, info in snapshots.items():
+        if not isinstance(info, dict):
+            continue
+        v = 1 if info.get("vm_health") == "up" else 0
+        out.append(f'openclaw_vm_health{{tenant="{tid}"}} {v}')
+    return "\n".join(out) + "\n"
 
 # Balloon config (from /etc/platform.env)
 BALLOON_ENABLED = os.environ.get("BALLOON_ENABLED", "false") == "true"
@@ -463,7 +516,18 @@ def _poll_loop():
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path in ("/health", "/"):
+        if self.path == "/metrics":
+            # Prometheus text exposition (issue #4). Scraped by sibling
+            # ADOT collector that remote-writes to AMP.
+            with _lock:
+                data = dict(_status)
+            body = _render_metrics_text(data).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path in ("/health", "/"):
             with _lock:
                 data = dict(_status)
             self.send_response(200)

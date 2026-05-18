@@ -417,6 +417,50 @@ class OpenClawOrchestratorStack(cdk.Stack):
             resources=["*"],
         ))
 
+        # ========== Amazon Managed Prometheus + Grafana (issue #4) ==========
+        # Host-agent exposes /metrics on :9090; an ADOT collector on each host
+        # remote-writes to AMP using SigV4. AMG reads from AMP for dashboards.
+        # Cost knob: metrics.enabled: false in config.yml skips both workspaces
+        # (AMP is billed per sample/GB, AMG per active user).
+        metrics_cfg = CFG.get("metrics", {})
+        amp_remote_write_url = "none"
+        if metrics_cfg.get("enabled", False):
+            amp_workspace = aps.CfnWorkspace(self, "AmpWorkspace",
+                alias=metrics_cfg.get("workspace_alias", "openclaw"),
+            )
+            # Host EC2 role can remote-write to this workspace.
+            host_role.add_to_policy(iam.PolicyStatement(
+                actions=["aps:RemoteWrite", "aps:GetSeries", "aps:GetLabels", "aps:GetMetricMetadata"],
+                resources=[amp_workspace.attr_arn],
+            ))
+            # AMG service role with read access to AMP.
+            grafana_role = iam.Role(self, "GrafanaServiceRole",
+                assumed_by=iam.ServicePrincipal("grafana.amazonaws.com"),
+            )
+            grafana_role.add_to_policy(iam.PolicyStatement(
+                actions=["aps:QueryMetrics", "aps:GetSeries", "aps:GetLabels", "aps:GetMetricMetadata"],
+                resources=[amp_workspace.attr_arn],
+            ))
+            # AMG workspace itself. AWS_SSO is required when not using SAML.
+            amg_workspace = grafana.CfnWorkspace(self, "GrafanaWorkspace",
+                account_access_type="CURRENT_ACCOUNT",
+                authentication_providers=["AWS_SSO"],
+                permission_type="SERVICE_MANAGED",
+                role_arn=grafana_role.role_arn,
+                data_sources=["PROMETHEUS"],
+                name=metrics_cfg.get("grafana_name", "openclaw-metrics"),
+            )
+            # Build remote_write URL for the host-agent template substitution.
+            # Format: https://aps-workspaces.<region>.amazonaws.com/workspaces/<id>/api/v1/remote_write
+            amp_remote_write_url = (
+                f"https://aps-workspaces.{self.region}.amazonaws.com/"
+                f"workspaces/{amp_workspace.attr_workspace_id}/api/v1/remote_write"
+            )
+            cdk.CfnOutput(self, "AmpWorkspaceArn", value=amp_workspace.attr_arn)
+            cdk.CfnOutput(self, "AmpRemoteWriteUrl", value=amp_remote_write_url)
+            cdk.CfnOutput(self, "GrafanaWorkspaceUrl",
+                value=f"https://{amg_workspace.attr_endpoint}")
+
         instance_profile = iam.CfnInstanceProfile(self, "HostInstanceProfile",
             roles=[host_role.role_name],
             instance_profile_name="openclaw-host-profile",
@@ -472,6 +516,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
         init_sh = init_sh.replace("{{SUBNET_PREFIX}}", CFG["vm"]["subnet_prefix"])
         init_sh = init_sh.replace("{{ROOTFS_OVERLAY_MB}}", str(CFG["vm"].get("rootfs_overlay_mb", 8192)))
         init_sh = init_sh.replace("{{AGENTCORE_GATEWAY_URL}}", gateway_url if gateway_url else "none")
+        init_sh = init_sh.replace("{{AMP_REMOTE_WRITE_URL}}", amp_remote_write_url)
         # Balloon config
         balloon_cfg = CFG.get("balloon", {})
         init_sh = init_sh.replace("{{BALLOON_ENABLED}}", str(balloon_cfg.get("enabled", False)).lower())

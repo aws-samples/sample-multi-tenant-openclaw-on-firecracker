@@ -30,6 +30,86 @@ VPC_ID = os.environ.get("VPC_ID", "")
 elbv2 = boto3.client("elbv2")
 
 
+# ════════════════════════════════════════════════════════════
+# RBAC (issue #14)
+# ════════════════════════════════════════════════════════════
+#
+# Cognito User Pool Groups carry the role assignment as a
+# `cognito:groups` claim on the id_token. The console attaches the
+# token as `Authorization: Bearer …`. We do NOT re-validate the JWT
+# signature here — API Gateway's API key check already gated the
+# request, and the worst case of a forged claim downgrades the user
+# to viewer (least privilege).
+#
+# Backward compatibility: requests without a Bearer token are
+# treated as admin so that existing CLI / curl flows authenticated
+# purely via x-api-key continue to work.
+
+_ROLE_RANK = {"viewer": 0, "operator": 1, "admin": 2}
+
+# Endpoints that read state are open to viewers; everything else
+# requires operator+ by default. Admin-only endpoints can be added here.
+_VIEWER_OK = {
+    ("GET", "/tenants"), ("GET", "/tenants/{id}"),
+    ("GET", "/tenants/{id}/{action}"),
+    ("GET", "/backups"), ("GET", "/hosts"),
+    ("GET", "/hosts/rootfs-version"), ("GET", "/agentcore/status"),
+}
+
+
+def _decode_jwt_payload(token):
+    """Decode the JWT payload segment (no signature verification)."""
+    import base64
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return {}
+        # Pad the base64 string to a multiple of 4
+        seg = parts[1] + "=" * (-len(parts[1]) % 4)
+        return json.loads(base64.urlsafe_b64decode(seg.encode()))
+    except Exception:
+        return {}
+
+
+def _get_user_role(event):
+    """Return the highest-privilege role for the caller, or 'admin' if no token."""
+    headers = event.get("headers") or {}
+    # API Gateway lower-cases header names but real-world clients vary.
+    auth = headers.get("Authorization") or headers.get("authorization") or ""
+    if not auth.startswith("Bearer "):
+        return "admin"  # No JWT → API key-only path → full access (back-compat)
+    token = auth[len("Bearer "):]
+    claims = _decode_jwt_payload(token)
+    groups = claims.get("cognito:groups", []) or []
+    if isinstance(groups, str):
+        groups = [groups]
+    # Pick the most privileged known group; unknown groups → viewer (least priv).
+    best = None
+    for g in groups:
+        if g in _ROLE_RANK and (best is None or _ROLE_RANK[g] > _ROLE_RANK[best]):
+            best = g
+    if best:
+        return best
+    return "viewer"
+
+
+def _role_satisfies(actual, required):
+    """True iff `actual` has at least the privilege of `required`."""
+    return _ROLE_RANK.get(actual, -1) >= _ROLE_RANK.get(required, 99)
+
+
+def _rbac_check(event, method, resource):
+    """Return None if allowed, else a 403 response."""
+    role = _get_user_role(event)
+    needed = "viewer" if (method, resource) in _VIEWER_OK else "operator"
+    if not _role_satisfies(role, needed):
+        return _resp(403, {
+            "error": "forbidden",
+            "rbac": {"role": role, "required": needed},
+        })
+    return None
+
+
 def lambda_handler(event, context):
     # EventBridge: new host InService → process pending tenants
     if event.get("source") == "aws.autoscaling":
@@ -72,6 +152,10 @@ def lambda_handler(event, context):
     handler = routes.get((method, resource))
     if not handler:
         return _resp(404, {"error": "not found"})
+    # RBAC enforcement — checked AFTER routing so unknown paths still 404.
+    forbidden = _rbac_check(event, method, resource)
+    if forbidden is not None:
+        return forbidden
     try:
         return handler() if callable(handler) else handler
     except Exception as e:

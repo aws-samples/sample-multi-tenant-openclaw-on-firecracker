@@ -841,6 +841,22 @@ function handler(event) {
                 cognito_outputs["CognitoClientId"] = client.user_pool_client_id
                 cognito_outputs["CognitoDomain"] = f"openclaw-console.auth.{cdk.Stack.of(self).region}.amazoncognito.com"
 
+            # RBAC groups (issue #14): admin / operator / viewer.
+            # Created on both new and existing pools so an imported pool also
+            # gets the role groups. The handler maps `cognito:groups` claim →
+            # role hierarchy (admin > operator > viewer).
+            for group_name, description, precedence in (
+                ("admin",    "Full access — RBAC + CRUD + actions", 1),
+                ("operator", "CRUD + lifecycle actions (no RBAC mgmt)", 2),
+                ("viewer",   "Read-only access",                       3),
+            ):
+                cognito.CfnUserPoolGroup(self, f"Role{group_name.capitalize()}",
+                    user_pool_id=user_pool.user_pool_id,
+                    group_name=group_name,
+                    description=description,
+                    precedence=precedence,
+                )
+
         # ========== Outputs ==========
         for key, val in {
             "ApiUrl": api.url,

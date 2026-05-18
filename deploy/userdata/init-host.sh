@@ -87,7 +87,32 @@ aws s3 cp s3://{{ASSETS_BUCKET}}/deployment/scripts/host-agent.py /opt/openclaw/
 systemctl daemon-reload
 systemctl enable host-agent
 systemctl start host-agent
-log "host agent started on :8899"
+log "host agent started on :8899 (health) and :9090 (prom metrics)"
+
+# AWS Distro for OpenTelemetry (ADOT) collector — scrapes localhost:9090
+# and remote-writes to Amazon Managed Prometheus (issue #4). Skipped if
+# AMP_REMOTE_WRITE_URL is unset (metrics.enabled: false in config.yml).
+AMP_REMOTE_WRITE_URL="{{AMP_REMOTE_WRITE_URL}}"
+if [ -n "${AMP_REMOTE_WRITE_URL}" ] && [ "${AMP_REMOTE_WRITE_URL}" != "none" ]; then
+  log "step2b: installing aws-otel-collector"
+  ARCH_DEB="amd64"; [ "$(uname -m)" = "aarch64" ] && ARCH_DEB="arm64"
+  curl -fsSL "https://aws-otel-collector.s3.amazonaws.com/ubuntu/${ARCH_DEB}/latest/aws-otel-collector.deb" \
+    -o /tmp/aws-otel-collector.deb
+  dpkg -i /tmp/aws-otel-collector.deb >/dev/null 2>&1 || apt-get -f install -y -qq
+  rm -f /tmp/aws-otel-collector.deb
+  # Pull the templated config from S3 and substitute env vars.
+  aws s3 cp s3://{{ASSETS_BUCKET}}/deployment/scripts/adot-config.yaml \
+    /opt/aws/aws-otel-collector/etc/config.yaml --region ${REGION} --no-progress
+  AWS_REGION=${REGION} INSTANCE_ID=${INSTANCE_ID} AMP_REMOTE_WRITE_URL="${AMP_REMOTE_WRITE_URL}" \
+    envsubst < /opt/aws/aws-otel-collector/etc/config.yaml \
+    > /opt/aws/aws-otel-collector/etc/config.rendered.yaml
+  mv /opt/aws/aws-otel-collector/etc/config.rendered.yaml /opt/aws/aws-otel-collector/etc/config.yaml
+  systemctl enable aws-otel-collector
+  systemctl restart aws-otel-collector
+  log "adot collector started → ${AMP_REMOTE_WRITE_URL}"
+else
+  log "metrics disabled (no AMP url) — skipping ADOT collector"
+fi
 
 # Step 3: Mount data volume (before downloading to avoid filling root partition)
 # Nitro instances map /dev/sdf to unpredictable /dev/nvmeXn1.

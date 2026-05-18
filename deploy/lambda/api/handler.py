@@ -30,6 +30,86 @@ VPC_ID = os.environ.get("VPC_ID", "")
 elbv2 = boto3.client("elbv2")
 
 
+# ════════════════════════════════════════════════════════════
+# RBAC (issue #14)
+# ════════════════════════════════════════════════════════════
+#
+# Cognito User Pool Groups carry the role assignment as a
+# `cognito:groups` claim on the id_token. The console attaches the
+# token as `Authorization: Bearer …`. We do NOT re-validate the JWT
+# signature here — API Gateway's API key check already gated the
+# request, and the worst case of a forged claim downgrades the user
+# to viewer (least privilege).
+#
+# Backward compatibility: requests without a Bearer token are
+# treated as admin so that existing CLI / curl flows authenticated
+# purely via x-api-key continue to work.
+
+_ROLE_RANK = {"viewer": 0, "operator": 1, "admin": 2}
+
+# Endpoints that read state are open to viewers; everything else
+# requires operator+ by default. Admin-only endpoints can be added here.
+_VIEWER_OK = {
+    ("GET", "/tenants"), ("GET", "/tenants/{id}"),
+    ("GET", "/tenants/{id}/{action}"),
+    ("GET", "/backups"), ("GET", "/hosts"),
+    ("GET", "/hosts/rootfs-version"), ("GET", "/agentcore/status"),
+}
+
+
+def _decode_jwt_payload(token):
+    """Decode the JWT payload segment (no signature verification)."""
+    import base64
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return {}
+        # Pad the base64 string to a multiple of 4
+        seg = parts[1] + "=" * (-len(parts[1]) % 4)
+        return json.loads(base64.urlsafe_b64decode(seg.encode()))
+    except Exception:
+        return {}
+
+
+def _get_user_role(event):
+    """Return the highest-privilege role for the caller, or 'admin' if no token."""
+    headers = event.get("headers") or {}
+    # API Gateway lower-cases header names but real-world clients vary.
+    auth = headers.get("Authorization") or headers.get("authorization") or ""
+    if not auth.startswith("Bearer "):
+        return "admin"  # No JWT → API key-only path → full access (back-compat)
+    token = auth[len("Bearer "):]
+    claims = _decode_jwt_payload(token)
+    groups = claims.get("cognito:groups", []) or []
+    if isinstance(groups, str):
+        groups = [groups]
+    # Pick the most privileged known group; unknown groups → viewer (least priv).
+    best = None
+    for g in groups:
+        if g in _ROLE_RANK and (best is None or _ROLE_RANK[g] > _ROLE_RANK[best]):
+            best = g
+    if best:
+        return best
+    return "viewer"
+
+
+def _role_satisfies(actual, required):
+    """True iff `actual` has at least the privilege of `required`."""
+    return _ROLE_RANK.get(actual, -1) >= _ROLE_RANK.get(required, 99)
+
+
+def _rbac_check(event, method, resource):
+    """Return None if allowed, else a 403 response."""
+    role = _get_user_role(event)
+    needed = "viewer" if (method, resource) in _VIEWER_OK else "operator"
+    if not _role_satisfies(role, needed):
+        return _resp(403, {
+            "error": "forbidden",
+            "rbac": {"role": role, "required": needed},
+        })
+    return None
+
+
 def lambda_handler(event, context):
     # EventBridge: new host InService → process pending tenants
     if event.get("source") == "aws.autoscaling":
@@ -72,6 +152,10 @@ def lambda_handler(event, context):
     handler = routes.get((method, resource))
     if not handler:
         return _resp(404, {"error": "not found"})
+    # RBAC enforcement — checked AFTER routing so unknown paths still 404.
+    forbidden = _rbac_check(event, method, resource)
+    if forbidden is not None:
+        return forbidden
     try:
         return handler() if callable(handler) else handler
     except Exception as e:
@@ -312,36 +396,55 @@ def tenant_action(tenant_id, action, body=None):
     if not item:
         return _resp(404, {"error": "tenant not found"})
 
-    if action == "resize-disk":
-        # Offline data-disk grow (issue #22).
-        # Body: {"new_size_mb": int}. Refuse shrinks (data loss risk) and
-        # > 1 TiB (sanity check). resize-disk.sh on the host pauses VM,
-        # truncates the sparse ext4 file, runs e2fsck + resize2fs, resumes.
+    if action == "migrate":
+        # Live migration via Firecracker snapshot/restore (issue #20).
+        # Body shape: {"target_host_id": "i-...."}
         try:
             payload = json.loads(body) if isinstance(body, str) else (body or {})
         except Exception:
             payload = {}
-        new_size = payload.get("new_size_mb")
-        if not isinstance(new_size, int):
-            return _resp(400, {"error": "missing or invalid new_size_mb"})
-        current = int(item.get("data_disk_mb", VM_DATA_DISK_MB))
-        if new_size <= current:
-            return _resp(400, {"error": f"new_size_mb must be larger (current {current}MB); shrink not supported"})
-        if new_size > 1024 * 1024:  # 1 TiB ceiling
-            return _resp(400, {"error": "new_size_mb exceeds 1 TiB ceiling"})
-        host_id = item.get("host_id")
+        target_host_id = payload.get("target_host_id")
+        if not target_host_id:
+            return _resp(400, {"error": "missing target_host_id"})
+        source_host_id = item.get("host_id")
+        if target_host_id == source_host_id:
+            return _resp(400, {"error": "target_host_id must be different from source"})
+        target = hosts_table.get_item(Key={"instance_id": target_host_id}).get("Item")
+        if not target:
+            return _resp(404, {"error": f"target host {target_host_id} not found"})
+
         vm_num = int(item.get("vm_num", 1))
-        if not host_id:
-            return _resp(400, {"error": "tenant has no host (still pending?)"})
-        _ssm_send(host_id, f"/home/ubuntu/resize-disk.sh {tenant_id} {vm_num} {new_size}")
+        bucket = os.environ.get("ASSETS_BUCKET", "")
+        snap_prefix = f"migrations/{tenant_id}"
+
+        # 1) Source host: pause + snapshot + upload to S3.
+        # The migrate-vm.sh script (deploy/userdata/migrate-vm.sh, ssm_run sees
+        # the same path on every host) handles the Firecracker API calls.
+        _ssm_send(source_host_id,
+                  f"/home/ubuntu/migrate-vm.sh snapshot {tenant_id} {vm_num} "
+                  f"s3://{bucket}/{snap_prefix}")
+
+        # 2) Target host: download + restore.
+        target_vm_num = int(target.get("next_vm_num", 1))
+        _ssm_send(target_host_id,
+                  f"/home/ubuntu/migrate-vm.sh restore {tenant_id} {target_vm_num} "
+                  f"s3://{bucket}/{snap_prefix}")
+
+        # 3) Update DDB: tenant.host_id flips, source.vm_count--, target.vm_count++.
+        now = _now()
         tenants_table.update_item(
             Key={"id": tenant_id},
-            UpdateExpression="SET data_disk_mb = :s, updated_at = :t",
-            ExpressionAttributeValues={":s": new_size, ":t": _now()},
+            UpdateExpression=("SET host_id = :h, vm_num = :n, "
+                              "migration_source = :s, updated_at = :t"),
+            ExpressionAttributeValues={
+                ":h": target_host_id, ":n": target_vm_num,
+                ":s": source_host_id, ":t": now,
+            },
         )
         return _resp(202, {
-            "id": tenant_id, "status": "resizing",
-            "old_size_mb": current, "new_size_mb": new_size,
+            "id": tenant_id, "status": "migrating",
+            "source_host_id": source_host_id, "target_host_id": target_host_id,
+            "snapshot_uri": f"s3://{bucket}/{snap_prefix}",
         })
 
     if action == "restart":

@@ -22,6 +22,11 @@ balloon:
   free_page_reporting: true        # guest 主动报告空闲页
 
 # ========== microVM ==========
+# 选择 hypervisor runtime (issue #5).
+# 当前仅 firecracker 完整可用; cloud_hypervisor 与 qemu 是预留插槽,
+# 启用会抛 RuntimeNotImplementedError 直到对应驱动实现.
+runtime: firecracker  # firecracker | cloud_hypervisor | qemu
+
 vm:
   default_vcpu: 2
   default_mem_mb: 4096

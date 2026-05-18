@@ -14,6 +14,9 @@ sns = boto3.client("sns")
 ddb = boto3.resource("dynamodb")
 tenants_table = ddb.Table(os.environ["TENANTS_TABLE"])
 hosts_table = ddb.Table(os.environ["HOSTS_TABLE"])
+# Issue #17 — optional audit log; absent in legacy deployments
+audit_table = ddb.Table(os.environ["AUDIT_TABLE"]) if os.environ.get("AUDIT_TABLE") else None
+AUDIT_TTL_DAYS = int(os.environ.get("AUDIT_TTL_DAYS", "90"))
 
 # Issue #13 — optional SNS topic for tenant lifecycle events.
 # Empty string disables publishing (no-op).

@@ -10,9 +10,14 @@ import boto3
 ssm = boto3.client("ssm")
 s3 = boto3.client("s3")
 asg_client = boto3.client("autoscaling")
+sns = boto3.client("sns")
 ddb = boto3.resource("dynamodb")
 tenants_table = ddb.Table(os.environ["TENANTS_TABLE"])
 hosts_table = ddb.Table(os.environ["HOSTS_TABLE"])
+
+# Issue #13 — optional SNS topic for tenant lifecycle events.
+# Empty string disables publishing (no-op).
+NOTIFICATIONS_TOPIC_ARN = os.environ.get("NOTIFICATIONS_TOPIC_ARN", "")
 
 # Per-host limits (from config.yml via env)
 HOST_RESERVED_VCPU = int(os.environ.get("HOST_RESERVED_VCPU", 1))
@@ -274,6 +279,9 @@ def create_tenant(body=None):
         item.update(ttl_fields)
         tenants_table.put_item(Item=item)
         _scale_out()
+        _publish_event("tenant.created", tenant_id, {
+            "name": name, "vcpu": vcpu, "mem_mb": mem_mb, "status": "pending",
+        })
         return _resp(201, {"id": tenant_id, "status": "pending", "message": "scaling out, VM will be created when host is ready"})
 
     # Allocate vm_num from host
@@ -338,6 +346,11 @@ def create_tenant(body=None):
     tg_arn = _ensure_host_tg(host["instance_id"], host["private_ip"])
     _add_alb_rule(tenant_id, tg_arn)
 
+    _publish_event("tenant.created", tenant_id, {
+        "name": name, "vcpu": vcpu, "mem_mb": mem_mb,
+        "host_id": host["instance_id"], "guest_ip": guest_ip,
+    })
+
     return _resp(201, {
         "id": tenant_id, "host_id": host["instance_id"],
         "guest_ip": guest_ip, "host_port": host_port, "status": "creating",
@@ -396,6 +409,7 @@ def delete_tenant(tenant_id, query_params):
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":s": "deleted", ":t": _now()},
     )
+    _publish_event("tenant.deleted", tenant_id, {"keep_data": keep_data})
     return _resp(200, {"id": tenant_id, "status": "deleted"})
 
 
@@ -537,6 +551,7 @@ def tenant_action(tenant_id, action, body=None):
             InvocationType="Event",  # async, returns immediately
             Payload=json.dumps({"tenant_id": tenant_id}).encode(),
         )
+        _publish_event("tenant.backup_started", tenant_id, {})
         return _resp(202, {"id": tenant_id, "action": "backup", "status": "started"})
     else:
         return _resp(400, {"error": f"unknown action: {action}"})
@@ -554,6 +569,18 @@ def tenant_action(tenant_id, action, body=None):
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues=expr_values,
     )
+    # Issue #13 — publish lifecycle event for the action.
+    # Map action verbs to lifecycle event names so consumers can filter.
+    _action_to_event = {
+        "stop": "tenant.stopped",
+        "start": "tenant.started",
+        "restart": "tenant.restarted",
+        "pause": "tenant.paused",
+        "resume": "tenant.resumed",
+        "reset": "tenant.reset",
+    }
+    event_name = _action_to_event.get(action, f"tenant.{new_status}")
+    _publish_event(event_name, tenant_id, {"action": action, "status": new_status})
     return _resp(200, {"id": tenant_id, "status": new_status})
 
 

@@ -50,7 +50,7 @@ def lambda_handler(event, context):
             path_params["id"], event.get("queryStringParameters") or {}
         ),
         ("POST", "/tenants/{id}/{action}"): lambda: tenant_action(
-            path_params["id"], path_params["action"]
+            path_params["id"], path_params["action"], event.get("body")
         ),
         ("GET", "/tenants/{id}/{action}"): lambda: tenant_get_action(
             path_params["id"], path_params["action"]
@@ -237,10 +237,61 @@ def delete_tenant(tenant_id, query_params):
     return _resp(200, {"id": tenant_id, "status": "deleted"})
 
 
-def tenant_action(tenant_id, action):
+def tenant_action(tenant_id, action, body=None):
     item = tenants_table.get_item(Key={"id": tenant_id}).get("Item")
     if not item:
         return _resp(404, {"error": "tenant not found"})
+
+    if action == "migrate":
+        # Live migration via Firecracker snapshot/restore (issue #20).
+        # Body shape: {"target_host_id": "i-...."}
+        try:
+            payload = json.loads(body) if isinstance(body, str) else (body or {})
+        except Exception:
+            payload = {}
+        target_host_id = payload.get("target_host_id")
+        if not target_host_id:
+            return _resp(400, {"error": "missing target_host_id"})
+        source_host_id = item.get("host_id")
+        if target_host_id == source_host_id:
+            return _resp(400, {"error": "target_host_id must be different from source"})
+        target = hosts_table.get_item(Key={"instance_id": target_host_id}).get("Item")
+        if not target:
+            return _resp(404, {"error": f"target host {target_host_id} not found"})
+
+        vm_num = int(item.get("vm_num", 1))
+        bucket = os.environ.get("ASSETS_BUCKET", "")
+        snap_prefix = f"migrations/{tenant_id}"
+
+        # 1) Source host: pause + snapshot + upload to S3.
+        # The migrate-vm.sh script (deploy/userdata/migrate-vm.sh, ssm_run sees
+        # the same path on every host) handles the Firecracker API calls.
+        _ssm_send(source_host_id,
+                  f"/home/ubuntu/migrate-vm.sh snapshot {tenant_id} {vm_num} "
+                  f"s3://{bucket}/{snap_prefix}")
+
+        # 2) Target host: download + restore.
+        target_vm_num = int(target.get("next_vm_num", 1))
+        _ssm_send(target_host_id,
+                  f"/home/ubuntu/migrate-vm.sh restore {tenant_id} {target_vm_num} "
+                  f"s3://{bucket}/{snap_prefix}")
+
+        # 3) Update DDB: tenant.host_id flips, source.vm_count--, target.vm_count++.
+        now = _now()
+        tenants_table.update_item(
+            Key={"id": tenant_id},
+            UpdateExpression=("SET host_id = :h, vm_num = :n, "
+                              "migration_source = :s, updated_at = :t"),
+            ExpressionAttributeValues={
+                ":h": target_host_id, ":n": target_vm_num,
+                ":s": source_host_id, ":t": now,
+            },
+        )
+        return _resp(202, {
+            "id": tenant_id, "status": "migrating",
+            "source_host_id": source_host_id, "target_host_id": target_host_id,
+            "snapshot_uri": f"s3://{bucket}/{snap_prefix}",
+        })
 
     if action == "restart":
         vm_num = int(item.get("vm_num", 1))

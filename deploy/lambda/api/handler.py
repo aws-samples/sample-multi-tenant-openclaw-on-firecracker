@@ -139,6 +139,7 @@ def lambda_handler(event, context):
             path_params["id"], path_params["action"]
         ),
         ("GET", "/backups"): list_all_backups,
+        ("POST", "/batch/tenants"): lambda: batch_tenants(event.get("body")),
         ("GET", "/hosts"): list_hosts,
         ("POST", "/hosts"): lambda: register_host(json.loads(event["body"])),
         ("POST", "/hosts/refresh-rootfs"): refresh_rootfs,

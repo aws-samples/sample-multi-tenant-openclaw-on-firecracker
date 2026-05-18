@@ -163,7 +163,7 @@
         </div>
       </div>
       <div class="panel-header">
-        <div style="display:flex;align-items:center;gap:12px">
+        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
           <label style="font-size:12px;color:var(--gray)">Status</label>
           <select class="settings-input" x-model="statusFilter" style="width:140px;padding:4px 8px;font-size:12px">
             <option value="all">All</option>
@@ -171,6 +171,10 @@
               <option :value="s" x-text="s"></option>
             </template>
           </select>
+          <label style="font-size:12px;color:var(--gray)">Tag</label>
+          <input type="text" x-model="tagFilter" placeholder="key:value (e.g. team:ml)"
+                 class="settings-input" style="width:200px;padding:4px 8px;font-size:12px"
+                 title="Filter by tag — comma separated for AND (e.g. team:ml,env:dev)">
           <span style="font-size:12px;color:var(--gray)" x-text="filteredTenants.length + ' tenant(s)'"></span>
         </div>
       </div>
@@ -178,19 +182,24 @@
         <table>
           <thead>
             <tr>
-              <th>ID</th><th>Name</th><th>Status</th><th>vCPU</th><th>Mem (MB)</th><th>Guest IP</th>
+              <th>ID</th><th>Name</th><th>Status</th><th>Tags</th><th>vCPU</th><th>Mem (MB)</th><th>Guest IP</th>
               <th>Port</th><th>Host ID</th><th>Rootfs</th><th>VM Health</th><th>Gateway</th><th>Actions</th>
             </tr>
           </thead>
           <tbody>
             <template x-if="filteredTenants.length === 0 && !loadingTenants">
-              <tr><td colspan="11" class="empty">No tenants</td></tr>
+              <tr><td colspan="13" class="empty">No tenants</td></tr>
             </template>
             <template x-for="t in filteredTenants" :key="t.id">
               <tr>
                 <td x-text="t.id"></td>
                 <td x-text="t.name || '-'"></td>
                 <td><span class="badge" :class="'badge-'+t.status" x-text="t.status"></span></td>
+                <td>
+                  <template x-for="(v, k) in (t.tags || {})" :key="k">
+                    <span class="tag-badge" x-text="k + ':' + v"></span>
+                  </template>
+                </td>
                 <td x-text="t.vcpu"></td>
                 <td x-text="t.mem_mb"></td>
                 <td x-text="t.guest_ip || '-'"></td>
@@ -454,6 +463,9 @@
           <option :value="t.name" x-text="t.name"></option>
         </template>
       </select>
+      <label>Tags <span class="opt">optional — one per line, key:value</span></label>
+      <textarea x-model="form.tags_text" placeholder="team:ml&#10;env:dev"
+                style="width:100%;background:#0a0e17;border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:4px;font-size:12px;font-family:monospace;height:60px;margin-bottom:14px;resize:vertical"></textarea>
       <div class="modal-actions">
         <button class="btn btn-cyan" @click="closeCreateModal()">Cancel</button>
         <button class="btn btn-create" @click="createTenant()" :disabled="!form.name" x-text="restoreSource ? 'Create from Backup' : 'Create'"></button>
@@ -475,11 +487,12 @@ function app() {
     skills: [], templates: [],
     editTpl: null,
     agentcoreStatus: { enabled: false }, agentcoreRegion: 'ap-northeast-1',
-    form: { name: '', vcpu: null, memory_mb: null, config_template: '' },
+    form: { name: '', vcpu: null, memory_mb: null, config_template: '', tags_text: '' },
     backups: [], backupFilter: 'all', loadingBackups: false,
     expandedGroups: new Set(),   // tenant_ids whose history rows are expanded
     restoreSource: null,   // set when modal opened from Backups tab; null = normal create
     statusFilter: 'all',   // filter for tenants list
+    tagFilter: '',         // filter expression: "k1:v1,k2:v2" — AND across pairs
 
     init() {
       this.apiUrl = localStorage.getItem('oc_api_url') || window.OC_DEFAULT_API_URL || '';
@@ -528,6 +541,9 @@ function app() {
       if (this.form.vcpu) body.vcpu = this.form.vcpu;
       if (this.form.memory_mb) body.mem_mb = this.form.memory_mb;
       if (this.form.config_template) body.config_template = this.form.config_template;
+      // Parse tags from textarea — supports "key:value" per line, also comma-separated.
+      const tags = this.parseTagsInput(this.form.tags_text);
+      if (Object.keys(tags).length > 0) body.tags = tags;
       if (this.restoreSource) {
         body.restore_from = {
           tenant_id: this.restoreSource.tenant_id,
@@ -550,7 +566,21 @@ function app() {
     closeCreateModal() {
       this.showModal = false;
       this.restoreSource = null;
-      this.form = { name: '', vcpu: null, memory_mb: null, config_template: '' };
+      this.form = { name: '', vcpu: null, memory_mb: null, config_template: '', tags_text: '' };
+    },
+    parseTagsInput(text) {
+      // Accepts "key:value" pairs separated by newline or comma. Empty → {}.
+      const tags = {};
+      if (!text) return tags;
+      const parts = text.split(/[\n,]/).map(s => s.trim()).filter(Boolean);
+      for (const p of parts) {
+        const idx = p.indexOf(':');
+        if (idx <= 0) continue;
+        const k = p.slice(0, idx).trim();
+        const v = p.slice(idx + 1).trim();
+        if (k && v) tags[k] = v;
+      }
+      return tags;
     },
     async loadBackups() {
       if (!this.apiUrl || !this.apiKey) return;
@@ -691,6 +721,14 @@ function app() {
       let list = this.tenants;
       if (this.selectedHost) list = list.filter(t => t.host_id === this.selectedHost);
       if (this.statusFilter !== 'all') list = list.filter(t => t.status === this.statusFilter);
+      const tagPairs = this.parseTagsInput(this.tagFilter);
+      const required = Object.entries(tagPairs);
+      if (required.length) {
+        list = list.filter(t => {
+          const tags = t.tags || {};
+          return required.every(([k, v]) => tags[k] === v);
+        });
+      }
       return list;
     },
     get tenantStatuses() {

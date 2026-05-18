@@ -123,7 +123,10 @@ def lambda_handler(event, context):
     path_params = event.get("pathParameters") or {}
 
     routes = {
-        ("GET", "/tenants"): list_tenants,
+        ("GET", "/tenants"): lambda: list_tenants(
+            event.get("queryStringParameters") or {},
+            event.get("multiValueQueryStringParameters") or {},
+        ),
         ("POST", "/tenants"): lambda: create_tenant(event.get("body")),
         ("GET", "/tenants/{id}"): lambda: get_tenant(path_params["id"]),
         ("DELETE", "/tenants/{id}"): lambda: delete_tenant(
@@ -164,12 +167,21 @@ def lambda_handler(event, context):
 # ========== Tenant Operations ==========
 
 
-def list_tenants():
+def list_tenants(query_params=None, multi_query_params=None):
     items = tenants_table.scan(
         FilterExpression="#s <> :d",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":d": "deleted"},
     ).get("Items", [])
+    # Ensure every record exposes a tags field so the console can render it
+    for it in items:
+        it.setdefault("tags", {})
+
+    # Issue #10 — optional ?tag=key:value filter (AND across multiple)
+    tag_filters = _collect_tag_filters(query_params, multi_query_params)
+    if tag_filters:
+        items = [it for it in items if _matches_all_tags(it, tag_filters)]
+
     return _resp(200, items)
 
 
@@ -177,6 +189,7 @@ def get_tenant(tenant_id):
     item = tenants_table.get_item(Key={"id": tenant_id}).get("Item")
     if not item:
         return _resp(404, {"error": "tenant not found"})
+    item.setdefault("tags", {})
     return _resp(200, item)
 
 
@@ -190,6 +203,28 @@ def create_tenant(body=None):
     mem_mb = int(body.get("mem_mb", VM_DEFAULT_MEM))
     config_template = body.get("config_template", "")
     restore_from = body.get("restore_from")
+    clone_from = body.get("clone_from")
+
+    # Issue #12 — clone_from is mutually exclusive with restore_from
+    if clone_from and restore_from:
+        return _resp(400, {"error": "clone_from and restore_from are mutually exclusive"})
+
+    # Resolve clone source: must exist + be running. Forces same-host scheduling.
+    clone_src = None
+    if clone_from:
+        clone_src = tenants_table.get_item(Key={"id": clone_from}).get("Item")
+        if not clone_src:
+            return _resp(404, {"error": f"clone source not found: {clone_from}"})
+        if clone_src.get("status") != "running":
+            return _resp(400, {
+                "error": f"clone source must be running (current: {clone_src.get('status')})"
+            })
+
+    # Issue #10 — validate tags up-front (fail fast before any side effects)
+    tags_err = _validate_tags(body.get("tags"))
+    if tags_err:
+        return _resp(400, {"error": tags_err})
+    tags = body.get("tags") or {}
 
     restore_backup_key = ""
     if restore_from:
@@ -206,8 +241,17 @@ def create_tenant(body=None):
     tenant_id = _gen_id(name)
     now = _now()
 
-    # Find host with capacity
-    host = _find_host(vcpu, mem_mb)
+    # Find host with capacity. For clone_from, the clone MUST land on the
+    # source's host so we can do a local cp instead of a slow rsync/S3 hop.
+    if clone_src:
+        host = _get_specific_host_with_capacity(clone_src["host_id"], vcpu, mem_mb)
+        if not host:
+            return _resp(400, {
+                "error": f"clone source's host {clone_src['host_id']} lacks "
+                         f"capacity for clone (vcpu={vcpu}, mem_mb={mem_mb})"
+            })
+    else:
+        host = _find_host(vcpu, mem_mb)
     if not host:
         # No capacity — save as pending and scale out.
         # Persist config_template and restore_backup_key so process_pending() can apply them.
@@ -218,6 +262,7 @@ def create_tenant(body=None):
             "health_failures": 0,
             "config_template": config_template,
             "restore_backup_key": restore_backup_key,
+            "tags": tags,
             "created_at": now, "updated_at": now,
         })
         _scale_out()
@@ -228,7 +273,7 @@ def create_tenant(body=None):
     guest_ip = f"{VM_SUBNET_PREFIX}.{vm_num}.2"
     host_port = VM_PORT_BASE + vm_num - 1
 
-    tenants_table.put_item(Item={
+    item = {
         "id": tenant_id,
         "name": name,
         "host_id": host["instance_id"],
@@ -242,10 +287,14 @@ def create_tenant(body=None):
         "rootfs_version": host.get("rootfs_version", ""),
         "config_template": config_template,
         "restore_backup_key": restore_backup_key,
+        "tags": tags,
         "creation_started_at": now,
         "created_at": now,
         "updated_at": now,
-    })
+    }
+    if clone_from:
+        item["clone_from"] = clone_from
+    tenants_table.put_item(Item=item)
 
     hosts_table.update_item(
         Key={"instance_id": host["instance_id"]},
@@ -253,6 +302,27 @@ def create_tenant(body=None):
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":v": vcpu, ":m": mem_mb, ":one": 1, ":next": vm_num + 1, ":a": "active"},
     )
+
+    # Issue #12 — for clones, snapshot source disks before launching the new VM.
+    # clone-data.sh: pause src → cp --sparse data.ext4 + overlay.ext4 → resume src.
+    if clone_src:
+        src_vm_num = int(clone_src.get("vm_num", 1))
+        clone_cmd = (f"/home/ubuntu/clone-data.sh {clone_from} {src_vm_num} "
+                     f"{tenant_id} {vm_num}")
+        if not _ssm_run(host["instance_id"], clone_cmd, timeout=180):
+            # Roll back: undo the host counter increment + delete tenant row
+            hosts_table.update_item(
+                Key={"instance_id": host["instance_id"]},
+                UpdateExpression="SET used_vcpu = used_vcpu - :v, used_mem_mb = used_mem_mb - :m, vm_count = vm_count - :one",
+                ExpressionAttributeValues={":v": vcpu, ":m": mem_mb, ":one": 1},
+            )
+            tenants_table.update_item(
+                Key={"id": tenant_id},
+                UpdateExpression="SET #s = :s, updated_at = :t",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={":s": "deleted", ":t": _now()},
+            )
+            return _resp(502, {"error": "clone-data.sh failed; tenant rolled back"})
 
     _launch_vm(host["instance_id"], tenant_id, vm_num, vcpu, mem_mb, guest_ip, host_port, config_template, restore_backup_key)
 
@@ -763,6 +833,27 @@ def _find_host(vcpu_needed, mem_needed):
     return None
 
 
+def _get_specific_host_with_capacity(instance_id, vcpu_needed, mem_needed):
+    """Issue #12 — locate a specific host (used for same-host clone) and
+    confirm it has capacity. Returns the host item or None."""
+    hosts = hosts_table.scan(
+        FilterExpression="#s IN (:a, :i)",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":a": "active", ":i": "idle"},
+    ).get("Items", [])
+    for h in hosts:
+        if h["instance_id"] != instance_id:
+            continue
+        allocatable_vcpu = int(int(h["total_vcpu"]) * CPU_OVERCOMMIT_RATIO)
+        free_vcpu = allocatable_vcpu - int(h["used_vcpu"])
+        allocatable_mem = int(int(h["total_mem_mb"]) * MEM_OVERCOMMIT_RATIO)
+        free_mem = allocatable_mem - int(h["used_mem_mb"])
+        if free_vcpu >= vcpu_needed and free_mem >= mem_needed:
+            return h
+        return None  # found host but no capacity
+    return None
+
+
 def _gen_id(name):
     """Generate tenant id: name-xxxx (4 char hash)."""
     raw = f"{name}{time.time()}"
@@ -923,6 +1014,71 @@ def _ssm_run(instance_id, command, timeout=30):
 def _now():
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
+
+
+# ── Tag helpers (issue #10) ──
+
+# Limits chosen to keep DynamoDB items small and avoid colon-conflict with the
+# `?tag=k:v` query syntax. AWS resource tags use the same 50/256 model; we cap
+# values at 100 chars (more than enough for typical labels) to be conservative.
+_TAG_MAX_KEY_LEN = 50
+_TAG_MAX_VALUE_LEN = 100
+_TAG_MAX_COUNT = 20
+
+
+def _validate_tags(tags):
+    """Return None if valid, else an error message string."""
+    if tags is None:
+        return None  # absent → treated as {}
+    if not isinstance(tags, dict):
+        return "tags must be an object (key/value map)"
+    if len(tags) > _TAG_MAX_COUNT:
+        return f"too many tags (max {_TAG_MAX_COUNT})"
+    for k, v in tags.items():
+        if not isinstance(k, str) or not k:
+            return "tag key must be a non-empty string"
+        if not isinstance(v, str):
+            return f"tag value for '{k}' must be a string"
+        if ":" in k:
+            return f"tag key '{k}' must not contain ':' (reserved for query syntax)"
+        if ":" in v:
+            return f"tag value '{v}' must not contain ':' (reserved for query syntax)"
+        if len(k) > _TAG_MAX_KEY_LEN:
+            return f"tag key '{k}' exceeds {_TAG_MAX_KEY_LEN} characters"
+        if len(v) > _TAG_MAX_VALUE_LEN:
+            return f"tag value for '{k}' exceeds {_TAG_MAX_VALUE_LEN} characters"
+    return None
+
+
+def _collect_tag_filters(query_params, multi_query_params):
+    """Return list of (key, value) pairs from ?tag=k:v occurrences.
+
+    API Gateway delivers repeated query params via multiValueQueryStringParameters.
+    For single-value calls only queryStringParameters is populated.
+    """
+    raw = []
+    if multi_query_params and "tag" in multi_query_params:
+        raw = list(multi_query_params["tag"] or [])
+    elif query_params and "tag" in query_params:
+        raw = [query_params["tag"]]
+    pairs = []
+    for r in raw:
+        if not r or ":" not in r:
+            # Malformed filter — keep it so it matches nothing (defensive)
+            pairs.append((None, None))
+            continue
+        k, v = r.split(":", 1)
+        pairs.append((k, v))
+    return pairs
+
+
+def _matches_all_tags(item, filters):
+    """Item must have every (k, v) pair to match (AND semantics)."""
+    item_tags = item.get("tags") or {}
+    for k, v in filters:
+        if k is None or item_tags.get(k) != v:
+            return False
+    return True
 
 
 def _resp(code, body):

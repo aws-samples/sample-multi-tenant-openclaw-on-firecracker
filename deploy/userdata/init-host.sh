@@ -185,6 +185,9 @@ aws s3 cp s3://{{ASSETS_BUCKET}}/deployment/scripts/launch-vm.sh /home/ubuntu/la
 chmod +x /home/ubuntu/launch-vm.sh && chown ubuntu:ubuntu /home/ubuntu/launch-vm.sh
 aws s3 cp s3://{{ASSETS_BUCKET}}/deployment/scripts/stop-vm.sh /home/ubuntu/stop-vm.sh --region ${REGION} --no-progress
 chmod +x /home/ubuntu/stop-vm.sh && chown ubuntu:ubuntu /home/ubuntu/stop-vm.sh
+# Issue #12 — clone-data.sh: same-host snapshot/clone helper
+aws s3 cp s3://{{ASSETS_BUCKET}}/deployment/scripts/clone-data.sh /home/ubuntu/clone-data.sh --region ${REGION} --no-progress
+chmod +x /home/ubuntu/clone-data.sh && chown ubuntu:ubuntu /home/ubuntu/clone-data.sh
 {{BACKUP_DATA_SCRIPT}}
 
 # Step 4b: AgentCore config (if enabled)

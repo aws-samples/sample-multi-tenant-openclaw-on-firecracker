@@ -1177,6 +1177,120 @@ def _matches_all_tags(item, filters):
     return True
 
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Helpers restored after the v1.0.0-milestone-q2-2026 cross-PR merge.
+# Issue #48 tracks the rationale: each helper was added by an early PR but
+# lost when later PRs auto-resolved merge conflicts with `-X theirs`.
+# Sources noted alongside each block. — fix/post-merge-regression
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ----- TTL (#28 / issue #15, original 47158d2) -----
+_TTL_MAX_HOURS = 8760  # 1 year
+_TTL_VALID_ON_EXPIRY = ("stop", "delete")
+
+
+def _parse_ttl(ttl_hours_raw, on_expiry_raw):
+    """Validate and compute TTL fields.
+
+    Returns (fields_dict, error_message). fields_dict is empty when no TTL is
+    requested; otherwise contains {ttl_hours, on_expiry, expires_at}.
+    """
+    if ttl_hours_raw is None:
+        if on_expiry_raw is not None:
+            return {}, "on_expiry requires ttl_hours"
+        return {}, None
+    try:
+        if isinstance(ttl_hours_raw, bool):
+            raise TypeError
+        ttl_hours = int(ttl_hours_raw)
+    except (TypeError, ValueError):
+        return {}, "ttl_hours must be a positive integer"
+    if ttl_hours <= 0:
+        return {}, "ttl_hours must be a positive integer"
+    if ttl_hours > _TTL_MAX_HOURS:
+        return {}, f"ttl_hours must be <= {_TTL_MAX_HOURS} (1 year)"
+    on_expiry = on_expiry_raw or "stop"
+    if on_expiry not in _TTL_VALID_ON_EXPIRY:
+        return {}, (f"on_expiry must be one of {sorted(_TTL_VALID_ON_EXPIRY)}; "
+                    f"got {on_expiry!r}")
+    from datetime import datetime, timedelta, timezone
+    expires_at = (datetime.now(timezone.utc) + timedelta(hours=ttl_hours)).isoformat()
+    return {"ttl_hours": ttl_hours, "on_expiry": on_expiry, "expires_at": expires_at}, None
+
+
+# ----- Schedule (#30 / issue #11, original af9434b). Validation only — the
+# scaler's _schedule_should_run lives in deploy/lambda/scaler/handler.py.
+_SCHED_DAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+def _parse_schedule(raw):
+    """Validate a {start, stop, timezone, days} schedule. Returns (dict, err)."""
+    if raw is None:
+        return None, None
+    if not isinstance(raw, dict):
+        return None, "schedule must be an object"
+    start = raw.get("start"); stop = raw.get("stop")
+    if not start: return None, "schedule.start required"
+    if not stop:  return None, "schedule.stop required"
+    import re
+    if not re.match(r"^\d{2}:\d{2}$", str(start)) or not re.match(r"^\d{2}:\d{2}$", str(stop)):
+        return None, "schedule.start/stop must be HH:MM"
+    if start == stop:
+        return None, "schedule.start must differ from schedule.stop"
+    tz = raw.get("timezone", "UTC")
+    try:
+        from zoneinfo import ZoneInfo  # noqa
+        ZoneInfo(tz)
+    except Exception:
+        return None, f"unknown timezone: {tz}"
+    days = raw.get("days") or list(_SCHED_DAYS)
+    if not isinstance(days, list) or any(d not in _SCHED_DAYS for d in days):
+        return None, f"schedule.days must be a subset of {list(_SCHED_DAYS)}"
+    return {"start": start, "stop": stop, "timezone": tz, "days": days}, None
+
+
+# ----- Audit log (#32 / issue #17, original 96d7496) -----
+AUDIT_TABLE = os.environ.get("AUDIT_TABLE", "")
+_audit_table = ddb.Table(AUDIT_TABLE) if AUDIT_TABLE else None
+
+
+def _audit_write(method, resource, path_params, event, result):
+    """Best-effort audit-log writer; failures must NEVER break the API."""
+    if not _audit_table:
+        return
+    try:
+        import uuid
+        _audit_table.put_item(Item={
+            "id": str(uuid.uuid4()),
+            "ts": _now(),
+            "method": method,
+            "resource": resource,
+            "path_params": path_params or {},
+            "status": result.get("statusCode") if isinstance(result, dict) else None,
+            "actor": (event.get("headers") or {}).get("Authorization", "")[:32],
+        })
+    except Exception as e:
+        print(f"audit_write failed: {e}")
+
+
+# ----- Quota (#34 / issue #9, original 79000fa) -----
+QUOTAS_MAX_VCPU = int(os.environ.get("QUOTAS_MAX_VCPU", 0))
+QUOTAS_MAX_MEM_MB = int(os.environ.get("QUOTAS_MAX_MEM_MB", 0))
+QUOTAS_MAX_DATA_DISK_MB = int(os.environ.get("QUOTAS_MAX_DATA_DISK_MB", 0))
+
+
+def _check_quota(vcpu, mem_mb, data_disk_mb):
+    """Return None if within quota, else an error string."""
+    if QUOTAS_MAX_VCPU and vcpu > QUOTAS_MAX_VCPU:
+        return f"vcpu={vcpu} exceeds quota (max {QUOTAS_MAX_VCPU})"
+    if QUOTAS_MAX_MEM_MB and mem_mb > QUOTAS_MAX_MEM_MB:
+        return f"mem_mb={mem_mb} exceeds quota (max {QUOTAS_MAX_MEM_MB})"
+    if QUOTAS_MAX_DATA_DISK_MB and data_disk_mb > QUOTAS_MAX_DATA_DISK_MB:
+        return f"data_disk_mb={data_disk_mb} exceeds quota (max {QUOTAS_MAX_DATA_DISK_MB})"
+    return None
+
+
 def _resp(code, body):
     return {
         "statusCode": code,

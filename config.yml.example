@@ -3,7 +3,10 @@
 
 # ========== 宿主机 (EC2) ==========
 host:
-  instance_type: m8i.xlarge        # 支持嵌套虚拟化: c8i/m8i/r8i 系列
+  # CPU arch (issue #19). x86_64 = Intel/AMD (m8i默认); arm64 = Graviton (m8g默认).
+  # 切换 arch 后必须用 ./build-rootfs.sh --arch <arch> 重建 rootfs.
+  arch: x86_64                     # x86_64 | arm64
+  instance_type: m8i.xlarge        # 留空使用 arch 默认 (m8i.xlarge | m8g.xlarge)
   root_volume_gb: 20
   data_volume_gb: 200              # 建议每个 VM 预留 ~16GB
   keep_data_volume:  true          # 实例删除后是否保留EBS卷
@@ -22,6 +25,11 @@ balloon:
   free_page_reporting: true        # guest 主动报告空闲页
 
 # ========== microVM ==========
+# 选择 hypervisor runtime (issue #5).
+# 当前仅 firecracker 完整可用; cloud_hypervisor 与 qemu 是预留插槽,
+# 启用会抛 RuntimeNotImplementedError 直到对应驱动实现.
+runtime: firecracker  # firecracker | cloud_hypervisor | qemu
+
 vm:
   default_vcpu: 2
   default_mem_mb: 4096
@@ -44,6 +52,13 @@ asg:
   lifecycle_hook_timeout: 600
   use_spot: false
 
+# ========== Multi-AZ HA (issue #8) ==========
+# 跨 AZ 部署 ASG + ALB 实现高可用. 默认关闭 (single AZ 减少跨 AZ 数据传输费用).
+# 启用后 az_count 控制最多使用几个 AZ; 实际数量受 region 可用 AZ 数限制.
+multi_az:
+  enabled: false
+  az_count: 2
+
 scaler:
   interval_minutes: 3
   idle_timeout_minutes: 10
@@ -53,6 +68,14 @@ health_check:
   interval_minutes: 5
   max_failures: 3
   app_port: 18789
+
+# ========== AWS WAF (可选, 关联到 API Gateway) ==========
+waf:
+  enabled: false                   # 启用后保护 API Gateway 免受常见攻击
+  rate_limit_per_ip: 1000          # 每 IP 5 分钟内的请求数上限 (超过则 block)
+  managed_rules:                   # AWS 托管规则集
+    - AWSManagedRulesCommonRuleSet
+    - AWSManagedRulesKnownBadInputsRuleSet
 
 # ========== AgentCore (可选) ==========
 agentcore:

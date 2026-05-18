@@ -31,6 +31,8 @@ Multi-tenant isolated deployment of OpenClaw AI agents on AWS using Firecracker 
 - AWS account + CLI configured
 - CDK CLI + Python 3.12+
 - uv (Python package manager)
+- For `build-rootfs.sh`: `sudo` access; tools `debootstrap` / `pigz` / `e2fsprogs`;
+  ≥2GB available RAM, ≥10GB free in `/tmp`
 
 ```bash
 # 1. Configure
@@ -41,7 +43,8 @@ cp templates/openclaw.json.example templates/openclaw.json  # Set your API key, 
 ./setup.sh ap-northeast-1 lab
 # Environment variables saved to .env.deploy
 
-# 3. Build rootfs (auto-uploads to S3 + pushes to hosts)
+# 3. Build rootfs — REQUIRED before creating any tenant
+#    (auto-uploads to S3 + pushes to hosts)
 source .env.deploy
 ./build-rootfs.sh v1.0
 

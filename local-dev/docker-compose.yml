@@ -1,0 +1,75 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# Local development stack (issue #24).
+# - LocalStack mocks DDB, S3, Lambda, IAM, SSM so the orchestrator
+#   Lambda can run end-to-end without an AWS account.
+# - host-agent stub: a tiny Python HTTP server that mimics the real
+#   host-agent's /health and /metrics endpoints with synthetic data.
+# - api-lambda: bind-mounts deploy/lambda/api/ and runs handler with
+#   AWS_ENDPOINT_URL pointed at LocalStack.
+
+services:
+  localstack:
+    image: localstack/localstack:3
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: "dynamodb,s3,lambda,iam,ssm,apigateway,events,autoscaling,elbv2"
+      DEBUG: "0"
+      LAMBDA_EXECUTOR: "local"
+      DEFAULT_REGION: "us-east-1"
+    volumes:
+      - "./localstack-init:/etc/localstack/init/ready.d"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      retries: 6
+
+  host-agent:
+    image: python:3.12-slim
+    working_dir: /app
+    command: ["python", "-u", "/app/stub.py"]
+    volumes:
+      - "./host-agent-stub:/app:ro"
+    environment:
+      OC_AGENT_PORT: "8899"
+      OC_AGENT_PROM_PORT: "9090"
+      TENANTS_TABLE: "openclaw-tenants"
+      AWS_ENDPOINT_URL: "http://localstack:4566"
+      AWS_ACCESS_KEY_ID: "test"
+      AWS_SECRET_ACCESS_KEY: "test"
+      AWS_DEFAULT_REGION: "us-east-1"
+    ports:
+      - "8899:8899"
+      - "9090:9090"
+    depends_on:
+      localstack:
+        condition: service_healthy
+
+  api-lambda:
+    image: python:3.12-slim
+    working_dir: /var/task
+    command:
+      - bash
+      - -c
+      - |
+        pip install -q boto3 && python -c 'import handler; import os, json;
+        ev={"httpMethod":"GET","resource":"/tenants","headers":{"x-api-key":"test"}};
+        print(json.dumps(handler.lambda_handler(ev, None)))'
+    volumes:
+      - "../deploy/lambda/api:/var/task:ro"
+    environment:
+      TENANTS_TABLE: "openclaw-tenants"
+      HOSTS_TABLE: "openclaw-hosts"
+      ASSETS_BUCKET: "openclaw-assets-test"
+      ROOTFS_PREFIX: "deployment/rootfs"
+      AWS_ENDPOINT_URL: "http://localstack:4566"
+      AWS_ACCESS_KEY_ID: "test"
+      AWS_SECRET_ACCESS_KEY: "test"
+      AWS_DEFAULT_REGION: "us-east-1"
+    depends_on:
+      localstack:
+        condition: service_healthy
+    profiles:
+      - full

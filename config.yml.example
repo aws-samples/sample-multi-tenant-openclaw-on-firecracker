@@ -54,6 +54,14 @@ health_check:
   max_failures: 3
   app_port: 18789
 
+# ========== 监控 (Amazon Managed Prometheus + Grafana, issue #4) ==========
+# 启用后 host-agent 暴露 :9090/metrics, ADOT collector remote-write 到 AMP,
+# AMG workspace 提供 PromQL dashboard. 默认关闭以避免 AMP/AMG 用量计费.
+metrics:
+  enabled: false                   # 开启后自动创建 AMP + AMG workspace
+  workspace_alias: openclaw        # AMP workspace alias
+  grafana_name: openclaw-metrics   # AMG workspace name
+
 # ========== AgentCore (可选) ==========
 agentcore:
   enabled: false                   # 开启后所有 VM 自动连接 AgentCore

@@ -342,6 +342,13 @@ class OpenClawOrchestratorStack(cdk.Stack):
 
         vpc = ec2.Vpc.from_lookup(self, "Vpc", is_default=True)
 
+        # ========== Multi-AZ HA (issue #8) ==========
+        # `_az_count` controls how many AZs the ASG and ALB span. Default is
+        # single-AZ to minimize cross-AZ data-transfer charges; opt in via
+        # config.yml `multi_az.enabled: true`.
+        _multi_az = CFG.get("multi_az", {}) or {}
+        _az_count = int(_multi_az.get("az_count", 2)) if _multi_az.get("enabled", False) else 1
+
         sg = ec2.SecurityGroup(self, "HostSG",
             vpc=vpc, security_group_name="openclaw-host-sg",
             allow_all_outbound=True,
@@ -487,6 +494,9 @@ class OpenClawOrchestratorStack(cdk.Stack):
         asg = autoscaling.AutoScalingGroup(self, "HostASG",
             auto_scaling_group_name="openclaw-hosts-asg",
             vpc=vpc,
+            vpc_subnets=ec2.SubnetSelection(
+                subnets=vpc.public_subnets[:_az_count] or vpc.private_subnets[:_az_count]
+            ),
             launch_template=launch_template,
             min_capacity=CFG["asg"]["min_capacity"],
             max_capacity=CFG["asg"]["max_capacity"],
@@ -631,6 +641,9 @@ class OpenClawOrchestratorStack(cdk.Stack):
         alb = elbv2.ApplicationLoadBalancer(self, "DashboardALB",
             load_balancer_name="openclaw-dashboard",
             vpc=vpc,
+            vpc_subnets=ec2.SubnetSelection(
+                subnets=vpc.public_subnets[:_az_count] or vpc.private_subnets[:_az_count]
+            ),
             internet_facing=True,
         )
         listener = alb.add_listener("HTTP", port=80,

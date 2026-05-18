@@ -416,8 +416,11 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 ),
                 ec2.BlockDevice(
                     device_name="/dev/sdf",
+                    # Encrypt at rest with AWS-managed KMS key.
+                    # Tenant data (rootfs overlays, data volumes, backups in transit) live here.
                     volume=ec2.BlockDeviceVolume.ebs(CFG["host"]["data_volume_gb"],
                         volume_type=ec2.EbsDeviceVolumeType.GP3,
+                        encrypted=True,
                         delete_on_termination=not CFG["host"].get("keep_data_volume", False)),
                 ),
             ],

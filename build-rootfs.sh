@@ -7,6 +7,9 @@
 # 示例: ./build-rootfs.sh v1.6
 set -euo pipefail
 
+# Show line number + exit code on any failure so users know exactly where things broke
+trap 'rc=$?; echo "❌ build-rootfs.sh failed at line $LINENO (exit $rc)" >&2; echo "💡 To capture full log next run: ./build-rootfs.sh ${1:-v1.0} 2>&1 | tee build.log" >&2' ERR
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="$SCRIPT_DIR/.env.deploy"
 if [ -f "$ENV_FILE" ]; then
@@ -39,6 +42,27 @@ if [ ${#MISSING[@]} -gt 0 ]; then
   exit 1
 fi
 
+# 内存预检
+MEM_AVAIL_MB=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)
+SWAP_TOTAL_MB=$(awk '/SwapTotal/ {print int($2/1024)}' /proc/meminfo)
+TOTAL_MB=$((MEM_AVAIL_MB + SWAP_TOTAL_MB))
+if [ "$TOTAL_MB" -lt 2048 ]; then
+  echo "❌ 可用内存不足 (available=${MEM_AVAIL_MB}MB + swap=${SWAP_TOTAL_MB}MB = ${TOTAL_MB}MB, 建议 ≥2048MB)"
+  echo "   npm install -g openclaw 容易因 OOM 被静默杀掉。"
+  echo "   建议: 增加内存容量 或 增加 swap"
+  exit 1
+elif [ "$TOTAL_MB" -lt 3072 ]; then
+  echo "⚠️  可用内存偏少 (${TOTAL_MB}MB)，构建可能较慢。建议 ≥4GB。"
+fi
+
+# /tmp 空间预检
+TMP_AVAIL_MB=$(df -BM --output=avail /tmp 2>/dev/null | tail -1 | tr -d ' M')
+if [ -n "${TMP_AVAIL_MB}" ] && [ "${TMP_AVAIL_MB}" -lt 10240 ]; then
+  echo "❌ /tmp 空间不足 (${TMP_AVAIL_MB}MB, 需要 ≥10240MB / 10GB)"
+  echo "   rootfs 镜像 + data template + 压缩临时文件 都写在 /tmp"
+  exit 1
+fi
+
 # 根据 region 选择镜像源
 case ${REGION} in
   ap-northeast-1) MIRROR="http://ap-northeast-1.ec2.archive.ubuntu.com/ubuntu" ;;
@@ -56,6 +80,21 @@ sudo umount -l ${ROOTFS_DIR}/proc ${ROOTFS_DIR}/sys ${ROOTFS_DIR}/dev 2>/dev/nul
 sudo umount -l ${ROOTFS_DIR} 2>/dev/null || true
 rm -f ${ROOTFS_IMG} ${DATA_IMG}
 
+# CPU arch selection (issue #19). Defaults to host arch; pass --arch arm64
+# (or x86_64) to cross-build for Graviton vs Intel/AMD hosts.
+ARCH="${ARCH:-$(dpkg --print-architecture 2>/dev/null || uname -m)}"
+case "$ARCH" in
+  x86_64|amd64) ARCH=amd64 ;;
+  aarch64|arm64) ARCH=arm64 ;;
+esac
+for arg in "$@"; do
+  case "$arg" in
+    --arch=*) ARCH="${arg#--arch=}" ;;
+    --arch) shift; ARCH="$1" ;;
+  esac
+done
+echo "→ building for ${ARCH}"
+
 # Build-time ext4 image size for base rootfs. Only needs to fit debootstrap + tools
 # (~2-3GB), then shrunk via resize2fs if zerofree is used. Not a runtime limit.
 ROOTFS_SIZE_MB="${ROOTFS_SIZE_MB:-6144}"
@@ -64,7 +103,7 @@ mkfs.ext4 -q ${ROOTFS_IMG}
 sudo mkdir -p ${ROOTFS_DIR}
 sudo mount ${ROOTFS_IMG} ${ROOTFS_DIR}
 
-sudo debootstrap --include=curl,ca-certificates,systemd,dbus,iproute2,iputils-ping,git,jq \
+sudo debootstrap --arch=${ARCH} --include=curl,ca-certificates,systemd,dbus,iproute2,iputils-ping,git,jq \
   noble ${ROOTFS_DIR} ${MIRROR}
 
 sudo mount --bind /proc ${ROOTFS_DIR}/proc
@@ -76,29 +115,36 @@ sudo cp "$OC_TEMPLATE" ${ROOTFS_DIR}/tmp/openclaw.json
 
 sudo chroot ${ROOTFS_DIR} /bin/bash << 'CHROOT'
 set -e
+trap 'rc=$?; echo "❌ chroot script failed at line $LINENO (exit $rc)" >&2; if [ "$rc" = "137" ] || [ "$rc" = "9" ]; then echo "   killed by SIGKILL — almost certainly OOM. Increase RAM or add swap." >&2; fi' ERR
+
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export DEBIAN_FRONTEND=noninteractive
 
+echo "[1/8] apt-get update + base repos"
 apt-get update -qq
 apt-get install -y -qq software-properties-common 2>/dev/null || true
 add-apt-repository -y universe 2>/dev/null || true
 apt-get update -qq
+
+echo "[2/8] system packages (openssh, build-essential, ...)"
 apt-get install -y -qq openssh-server sudo dbus-user-session \
   wget htop tmux vim-tiny tree python3-venv build-essential
 ssh-keygen -A
 echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
 
+echo "[3/8] Node.js 22.x"
 curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
 apt-get install -y -qq nodejs
 
-# GitHub CLI
+echo "[4/8] GitHub CLI"
 curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list
 apt-get update -qq && apt-get install -y -qq gh
 
-# uv (Python package manager)
+echo "[5/8] uv (Python package manager)"
 curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
 
+echo "[6/8] systemd + user/agent + DNS"
 systemctl enable systemd-networkd systemd-resolved
 
 mkdir -p /etc/systemd/resolved.conf.d
@@ -152,11 +198,11 @@ systemctl enable openclaw-data.service
 
 echo "node=$(node --version) npm=$(npm --version)"
 
-# --- OpenClaw CLI ---
+echo "[7/8] OpenClaw CLI (npm install -g openclaw — peak ~1GB RAM)"
 npm install -g openclaw
 chown -R agent:agent /usr/lib/node_modules
 
-# Onboard to generate bootstrap files (AGENTS.md, SOUL.md, etc.)
+echo "[8/8] OpenClaw onboard (bootstrap files)"
 # Config will be overwritten by template — onboard params are placeholders
 HOME=/home/agent su -s /bin/bash agent -c "openclaw onboard --non-interactive \
   --accept-risk --mode local --auth-choice custom-api-key \

@@ -1,5 +1,32 @@
 # Changelog
 
+## [1.0-final] - 2026-05-19
+
+Aggregate milestone tag. Closes the Q2 2026 work cycle: v1.0.0 + v1.0.1 + v1.0.2.
+
+### Snapshot at this tag
+
+| Metric | Value |
+|---|---|
+| New PRs merged | **27** (24 features + 3 patches) |
+| Net new unit tests | **~250** (84 → 368) |
+| Test status | **368 / 368 passed**, 0 failed |
+| Issues closed | **25** (24 features + #48 regression) |
+| Git tags | **18** (11 per-issue + 4 release + 3 historical) |
+| GitHub Releases | **4** (v1.0.0, v1.0.1, v1.0.2, v1.0-final) |
+| Real-AWS deploy | ✅ CFN `CREATE_COMPLETE` in 450s, control plane verified end-to-end |
+| Open issues / PRs | **0 / 0** |
+
+### Known limitations / future work
+
+These are explicit non-goals at v1.0; raise an issue if any block your use case.
+
+- **Multi-agent runtime abstraction** — OpenClaw is hard-coded into `build-rootfs.sh` (`npm install -g openclaw`, `openclaw onboard`, `templates/openclaw.json`). Supporting LangGraph / CrewAI / Bedrock Agent / custom Python agents needs a new agent-runtime ABC (the same pattern PR #41 used for Firecracker / Cloud Hypervisor / QEMU).
+- **VM data plane on real AWS** — `./build-rootfs.sh` requires a Linux build host with `debootstrap`; rootfs upload to S3 is a separate workflow. The v1.0 E2E verified the **control plane** (API → DDB → ASG → host registration → tenant lifecycle), not Firecracker boot.
+- **Cross-arch rootfs caching** — `--arch arm64` switch rebuilds from scratch. S3 caching by arch + version would speed up Graviton deploys.
+- **Cross-region / cross-account federation** — single region per CDK stack today.
+- **Pre-copy live migration** — current snapshot/restore (#20) pauses for the duration of memory transfer. Pre-copy iterations would drop downtime to sub-second.
+
 ## [1.0.2-e2e-fixes] - 2026-05-19
 
 Patch release — real-world AWS deploy bugs surfaced during E2E verification.
@@ -45,46 +72,50 @@ Patch release — full regression repair after the v1.0.0 cross-PR squash-merge.
 
 ## [1.0.0-milestone-q2-2026] - 2026-05-18
 
-First major milestone — 24 features merged, 25 issues closed.
+First major milestone — **24 features merged, 25 issues closed**, ~250 new unit tests.
 
-### Added — Observability
-- **#3** Per-VM CPU/memory/disk metrics in DynamoDB ([#37])
-- **#4** Amazon Managed Prometheus + Grafana ([#38])
+### Added — Observability (2)
+- **#3 Per-VM CPU/memory/disk metrics in DynamoDB** ([#37]) — host-agent samples every 30s, writes per-VM resource usage to the tenants table; console shows live values per row.
+- **#4 Amazon Managed Prometheus + Grafana** ([#38]) — Prom remote-write from host-agent, AMG datasource + dashboards, alerts wiring.
 
-### Added — Security
-- **#6** EBS encryption at rest ([#26])
-- **#7** Optional AWS WAF ([#31])
-- **#14** RBAC via Cognito Groups ([#39])
-- **#17** Audit log for mutations ([#32])
+### Added — Security (4)
+- **#6 EBS encryption at rest for host data volumes** ([#26]) — KMS-encrypted by default; compliance-friendly.
+- **#7 Optional AWS WAF integration for API Gateway** ([#31]) — rate-limit + geo-block + AWS managed OWASP rule sets.
+- **#14 RBAC via Cognito Groups (admin/operator/viewer)** ([#39]) — role attached to id-token, dispatcher gates per-route; admin = full, operator = CRUD, viewer = read-only.
+- **#17 Audit log for all mutating API operations** ([#32]) — every POST/PUT/DELETE writes an entry to the audit DDB table with TTL = 90 days; `GET /audit-log?since=…&limit=…`.
 
-### Added — Tenant lifecycle
-- **#9** Per-tenant quotas ([#34])
-- **#10** Tagging + search ([#27])
-- **#11** Scheduled stop/start ([#30])
-- **#12** Snapshot/clone ([#36])
-- **#13** SNS notifications ([#33])
-- **#15** TTL with auto-stop/delete ([#28])
-- **#16** Live VM resize ([#35])
-- **#22** Offline disk resize ([#47])
-- **#23** Batch operations ([#29])
+### Added — Tenant lifecycle (9)
+- **#9 Per-tenant resource quotas** ([#34]) — `QUOTAS_MAX_VCPU/MEM/DATA_DISK_MB`, fail-fast in `create_tenant`; defends against noisy neighbors.
+- **#10 Tenant tagging, grouping, and search** ([#27]) — `tags: {key: value}` field; `GET /tenants?tag=team:sre` AND-filter across multiple tags.
+- **#11 Scheduled tenant auto-stop/start (office-hours mode)** ([#30]) — `schedule: {start, stop, timezone, days}`; scaler reconciles every tick.
+- **#12 Tenant snapshot/clone via local cp on the same host** ([#36]) — `clone_from: <id>` co-schedules onto the source's host so `cp --sparse data.ext4` is sub-second.
+- **#13 SNS lifecycle notifications for tenant events** ([#33]) — `tenant.created/deleted/migrated/expired` events to a configurable SNS topic.
+- **#15 Tenant TTL with auto-stop or auto-delete on expiry** ([#28]) — `ttl_hours` + `on_expiry: stop|delete`; scaler scans expired tenants every tick.
+- **#16 Live VM resize — hot-add vCPU without restart** ([#35]) — `POST /tenants/{id}/resize {vcpu}` calls Firecracker `/machine-config` PATCH; refuses shrinks (Firecracker limitation) and memory live-resize.
+- **#22 Offline auto-resize for tenant data disks** ([#47]) — `POST /tenants/{id}/resize-disk {new_size_mb}` pauses VM → `truncate -s` sparse file → `e2fsck` + `resize2fs` → resume; pause window ~seconds.
+- **#23 Batch tenant operations endpoint** ([#29]) — `POST /batch/tenants {action: stop|start|delete|backup, ids|filter}`; per-tenant errors collected into `failed[]`, never abort the batch.
 
-### Added — Platform
-- **#5** Pluggable runtime protocol ([#41])
-- **#8** Multi-AZ HA ([#42])
-- **#19** Graviton (ARM64) ([#44])
-- **#20** Live VM migration ([#45])
+### Added — Platform (4)
+- **#5 Pluggable VM runtime protocol (Firecracker / CHV / QEMU stub)** ([#41]) — `Runtime` ABC + factory; only Firecracker fully implemented, the other two are reserved seams.
+- **#8 Multi-AZ HA opt-in** ([#42]) — `multi_az.enabled` + `az_count`; ASG fan-out across AZs (ALB always ≥2 AZ — clarified in v1.0.2/#53).
+- **#19 Graviton (ARM64) host support** ([#44]) — `host.arch: arm64` switches AMI lookup to Ubuntu Noble arm64 + InstanceType default `m8g.xlarge`; `build-rootfs.sh --arch arm64` cross-builds rootfs.
+- **#20 Live VM migration via Firecracker snapshot/restore** ([#45]) — `POST /tenants/{id}/migrate {target_host_id}`; SSM on source pauses + snaps + S3-uploads, SSM on target downloads + restores; DDB `host_id` flips.
 
-### Added — DevX
-- **#21** Unified `oc` CLI ([#40])
-- **#24** Local dev with LocalStack ([#46])
+### Added — DevX (2)
+- **#21 Unified `oc` CLI** ([#40]) — single-file argparse Python tool; subcommands: `list / get / create / delete / restart / start / stop / pause / resume / backup / reset / backups / hosts / version`; reads `OC_API_URL`/`OC_API_KEY` or `.env.deploy`.
+- **#24 Local development mode with LocalStack + stub host-agent** ([#46]) — `local-dev/docker-compose.yml` + LocalStack 3 + Python stub host-agent; iterate on Lambda + console without an AWS account.
 
-### Added — Deployment
-- **#18** Terraform module ([#43])
+### Added — Deployment (1)
+- **#18 Terraform module at parity with CDK core** ([#43]) — DDB tables, S3 bucket + lifecycle, Lambda + IAM, API Gateway routes; `terraform/README.md` documents the CDK ↔ TF mapping. Advanced features (CloudFront, Cognito, WAF, AMP/AMG, AgentCore) intentionally omitted.
+
+### Added — Other
+- **dependabot/urllib3 2.7.0** ([#25]) — security patch.
 
 ### Testing
-- ~250 new unit tests, every PR shipped TDD red→green
-- Per-issue tags `v0.3.0-issue3` … `v0.13.0-issue22`
+- ~250 new unit tests across the 24 PRs; every PR shipped TDD red→green with a full-suite gate.
+- Per-issue tags `v0.3.0-issue3` … `v0.13.0-issue22` for surgical rollback (each tag points at the feature branch's last commit before merge).
 
+[#25]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/pull/25
 [#26]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/pull/26
 [#27]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/pull/27
 [#28]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/pull/28

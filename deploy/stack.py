@@ -819,12 +819,17 @@ class OpenClawOrchestratorStack(cdk.Stack):
 
 
         # ========== ALB (Dashboard Proxy) ==========
+        # ALB requires ≥2 subnets in different AZs (AWS API constraint).
+        # The multi_az.az_count knob controls ASG fan-out; ALB independently
+        # always claims max(2, az_count) subnets so single-AZ ASG mode still
+        # produces a valid load balancer.
+        _alb_az_count = max(2, _az_count)
+        _alb_subnets = (vpc.public_subnets[:_alb_az_count]
+                        or vpc.private_subnets[:_alb_az_count])
         alb = elbv2.ApplicationLoadBalancer(self, "DashboardALB",
             load_balancer_name="openclaw-dashboard",
             vpc=vpc,
-            vpc_subnets=ec2.SubnetSelection(
-                subnets=vpc.public_subnets[:_az_count] or vpc.private_subnets[:_az_count]
-            ),
+            vpc_subnets=ec2.SubnetSelection(subnets=_alb_subnets),
             internet_facing=True,
         )
         listener = alb.add_listener("HTTP", port=80,

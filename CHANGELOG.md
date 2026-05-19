@@ -1,5 +1,96 @@
 # Changelog
 
+## [1.0.1-fix-issue48] - 2026-05-19
+
+Patch release — full regression repair after the v1.0.0 cross-PR squash-merge.
+
+### Fixed
+- **#48** — Restored helpers + call-sites lost during v1.0.0 batch merge (`-X theirs` auto-resolution discarded code from earlier PRs):
+  - `_parse_ttl` + `_TTL_*` constants ([#28] / issue #15)
+  - `_parse_schedule` + scaler `_schedule_should_run` + reconciliation ([#30] / issue #11)
+  - `_audit_write` + GET `/audit-log` route + `_list_audit_log` ([#32] / issue #17)
+  - `_check_quota` + `QUOTAS_*` env knobs ([#34] / issue #9)
+  - `_publish_event` + SNS client ([#33] / issue #13)
+  - `batch_tenants` + `_resolve_filter` ([#29] / issue #23)
+  - `tenant_resize` + 'resize' action branch ([#35] / issue #16)
+  - 'resize-disk' action branch ([#47] / issue #22)
+- **stack.py**: re-added `aws_aps` + `aws_grafana` imports
+- **setup.sh**: `${CDK_ARGS[@]+"${CDK_ARGS[@]}"}` to handle `set -u` + empty array on zsh
+
+### Testing
+- **368 passed / 1 skipped / 0 failed** (was 123 failed at v1.0.0)
+
+### Process
+- Documented best practices in release notes:
+  - Limit ≤10 concurrent same-file PRs per batch
+  - Avoid `git merge -X theirs` for cross-PR conflicts
+  - Per-PR tags (`v0.N.0-issueX`) for surgical rollback
+
+## [1.0.0-milestone-q2-2026] - 2026-05-18
+
+First major milestone — 24 features merged, 25 issues closed.
+
+### Added — Observability
+- **#3** Per-VM CPU/memory/disk metrics in DynamoDB ([#37])
+- **#4** Amazon Managed Prometheus + Grafana ([#38])
+
+### Added — Security
+- **#6** EBS encryption at rest ([#26])
+- **#7** Optional AWS WAF ([#31])
+- **#14** RBAC via Cognito Groups ([#39])
+- **#17** Audit log for mutations ([#32])
+
+### Added — Tenant lifecycle
+- **#9** Per-tenant quotas ([#34])
+- **#10** Tagging + search ([#27])
+- **#11** Scheduled stop/start ([#30])
+- **#12** Snapshot/clone ([#36])
+- **#13** SNS notifications ([#33])
+- **#15** TTL with auto-stop/delete ([#28])
+- **#16** Live VM resize ([#35])
+- **#22** Offline disk resize ([#47])
+- **#23** Batch operations ([#29])
+
+### Added — Platform
+- **#5** Pluggable runtime protocol ([#41])
+- **#8** Multi-AZ HA ([#42])
+- **#19** Graviton (ARM64) ([#44])
+- **#20** Live VM migration ([#45])
+
+### Added — DevX
+- **#21** Unified `oc` CLI ([#40])
+- **#24** Local dev with LocalStack ([#46])
+
+### Added — Deployment
+- **#18** Terraform module ([#43])
+
+### Testing
+- ~250 new unit tests, every PR shipped TDD red→green
+- Per-issue tags `v0.3.0-issue3` … `v0.13.0-issue22`
+
+[#26]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/pull/26
+[#27]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/pull/27
+[#28]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/pull/28
+[#29]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/pull/29
+[#30]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/pull/30
+[#31]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/pull/31
+[#32]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/pull/32
+[#33]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/pull/33
+[#34]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/pull/34
+[#35]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/pull/35
+[#36]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/pull/36
+[#37]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/pull/37
+[#38]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/pull/38
+[#39]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/pull/39
+[#40]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/pull/40
+[#41]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/pull/41
+[#42]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/pull/42
+[#43]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/pull/43
+[#44]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/pull/44
+[#45]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/pull/45
+[#46]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/pull/46
+[#47]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/pull/47
+
 ## [1.1.1] - 2026-04-30
 
 ### Added

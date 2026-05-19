@@ -24,6 +24,60 @@ Multi-tenant isolated deployment of OpenClaw AI agents on AWS using Firecracker 
 - **Config Templates** — Custom OpenClaw configuration templates for different LLM providers/models, selectable when creating tenants
 - **Default Toolchain** — Each VM comes with Python3/uv/git/gh/Node.js/htop/tmux/tree pre-installed
 
+## v1.0 Feature Matrix
+
+> **Latest release**: [v1.0.1-fix-issue48](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/releases/tag/v1.0.1-fix-issue48) (368 unit tests passing). See [CHANGELOG.md](CHANGELOG.md) for details.
+
+24 features merged in the Q2 2026 milestone, each with TDD coverage and a per-issue rollback tag.
+
+| Category | Feature | Issue | PR |
+|---|---|---|---|
+| **Observability** | Per-VM CPU/memory/disk metrics in DynamoDB | [#3] | [#37] |
+| | Amazon Managed Prometheus + Grafana | [#4] | [#38] |
+| **Security** | EBS encryption at rest | [#6] | [#26] |
+| | Optional AWS WAF integration | [#7] | [#31] |
+| | RBAC via Cognito Groups (admin/operator/viewer) | [#14] | [#39] |
+| | Audit log for all mutating API operations | [#17] | [#32] |
+| **Tenant lifecycle** | Per-tenant resource quotas | [#9] | [#34] |
+| | Tagging, grouping, and search | [#10] | [#27] |
+| | Scheduled auto-stop/start (office-hours mode) | [#11] | [#30] |
+| | Snapshot/clone via local cp on the same host | [#12] | [#36] |
+| | SNS lifecycle notifications | [#13] | [#33] |
+| | TTL with auto-stop or auto-delete on expiry | [#15] | [#28] |
+| | Live VM resize — hot-add vCPU without restart | [#16] | [#35] |
+| | Offline auto-resize for tenant data disks | [#22] | [#47] |
+| | Batch tenant operations endpoint | [#23] | [#29] |
+| **Platform** | Pluggable VM runtime protocol (Firecracker / CHV / QEMU stub) | [#5] | [#41] |
+| | Multi-AZ HA opt-in | [#8] | [#42] |
+| | Graviton (ARM64) host support | [#19] | [#44] |
+| | Live VM migration via Firecracker snapshot/restore | [#20] | [#45] |
+| **DevX** | Unified `oc` CLI | [#21] | [#40] |
+| | Local development mode with LocalStack + stub host-agent | [#24] | [#46] |
+| **Deployment** | Terraform module at parity with CDK core | [#18] | [#43] |
+
+[#3]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/3
+[#4]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/4
+[#5]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/5
+[#6]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/6
+[#7]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/7
+[#8]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/8
+[#9]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/9
+[#10]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/10
+[#11]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/11
+[#12]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/12
+[#13]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/13
+[#14]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/14
+[#15]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/15
+[#16]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/16
+[#17]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/17
+[#18]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/18
+[#19]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/19
+[#20]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/20
+[#21]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/21
+[#22]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/22
+[#23]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/23
+[#24]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/24
+
 ## Quick Start
 
 **Prerequisites:**

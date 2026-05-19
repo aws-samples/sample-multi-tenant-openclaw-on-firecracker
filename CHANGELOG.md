@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.0.2-e2e-fixes] - 2026-05-19
+
+Patch release — real-world AWS deploy bugs surfaced during E2E verification.
+
+### Fixed
+- **#52** `init-host.sh` race condition: ASG launches the host the moment `cdk deploy` creates the LaunchTemplate, but `setup.sh` uploads `host-agent.py` / `launch-vm.sh` / `stop-vm.sh` *after* deploy returns. The host's user-data ran first and 404'd on those S3 paths, then failed to register because the CFN output query also returned `None` mid-deploy. `_stack_output` and `_s3_get` now retry up to 5 minutes.
+- **#53** ALB tried to launch in a single AZ when `multi_az.enabled: false` (default `az_count=1`). AWS rejects with *At least two subnets in two different Availability Zones must be specified*. ALB now independently uses `max(2, az_count)` regardless of ASG mode — single-AZ ASG mode still works for cost-conscious deployments.
+- **#51 / setup.sh** Pre-existing `${CDK_ARGS[@]}` expansion broke under `set -u` + empty array on zsh / bash <4.4. Guarded with `${CDK_ARGS[@]+"${CDK_ARGS[@]}"}` pattern.
+
+### Verified
+- `./setup.sh ap-northeast-1 …` finishes CFN `CREATE_COMPLETE` in ~450s on a clean account.
+- Host registers to DDB via init-host's retry path.
+- Tenant lifecycle (`oc create` → pending → creating → `oc delete`) end-to-end on real AWS.
+
+### Out of scope
+- VM data plane (Firecracker boot from rootfs) — requires a Linux host running `./build-rootfs.sh` first; control plane is now 100% verified end-to-end.
+
 ## [1.0.1-fix-issue48] - 2026-05-19
 
 Patch release — full regression repair after the v1.0.0 cross-PR squash-merge.

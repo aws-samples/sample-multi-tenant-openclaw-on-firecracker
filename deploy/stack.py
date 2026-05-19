@@ -20,6 +20,8 @@ from aws_cdk import (
     aws_certificatemanager as acm,
     aws_cognito as cognito,
     aws_wafv2 as wafv2,
+    aws_aps as aps,
+    aws_grafana as grafana,
     aws_bedrock_agentcore_alpha as agentcore,
     aws_bedrockagentcore as agentcore_l1,
     custom_resources as cr,

@@ -26,7 +26,7 @@ Multi-tenant isolated deployment of OpenClaw AI agents on AWS using Firecracker 
 
 ## v1.0 Feature Matrix
 
-> **Latest release**: [v1.0.1-fix-issue48](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/releases/tag/v1.0.1-fix-issue48) (368 unit tests passing). See [CHANGELOG.md](CHANGELOG.md) for details.
+> **Latest release**: [v1.0.2-e2e-fixes](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/releases/tag/v1.0.2-e2e-fixes) (368 unit tests passing, control plane verified end-to-end on real AWS). See [CHANGELOG.md](CHANGELOG.md) for details.
 
 24 features merged in the Q2 2026 milestone, each with TDD coverage and a per-issue rollback tag.
 

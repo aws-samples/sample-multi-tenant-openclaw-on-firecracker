@@ -26,7 +26,7 @@
 
 ## v1.0 功能矩阵
 
-> **最新版本**: [v1.0.1-fix-issue48](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/releases/tag/v1.0.1-fix-issue48) (368 单元测试通过). 详见 [CHANGELOG.md](../CHANGELOG.md).
+> **最新版本**: [v1.0.2-e2e-fixes](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/releases/tag/v1.0.2-e2e-fixes) (368 单元测试通过, 控制面已在真实 AWS 端到端验证). 详见 [CHANGELOG.md](../CHANGELOG.md).
 
 Q2 2026 里程碑共合并 24 个特性, 每个都有 TDD 覆盖 + 单 issue 回滚 tag.
 

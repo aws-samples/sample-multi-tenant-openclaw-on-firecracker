@@ -11,10 +11,30 @@ REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/la
 INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
 PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
 
-# Query stack outputs
+# Query stack outputs — retries because the host can race ahead of CFN
+# finalising outputs / setup.sh uploading scripts to S3 (issue: real-deploy
+# regression surfaced in v1.0 E2E).
 _stack_output() {
-  aws cloudformation describe-stacks --stack-name OpenClawOrchestrator \
-    --query "Stacks[0].Outputs[?OutputKey==\`$1\`].OutputValue" --output text --region ${REGION}
+  for _i in $(seq 1 20); do
+    val=$(aws cloudformation describe-stacks --stack-name OpenClawOrchestrator \
+      --query "Stacks[0].Outputs[?OutputKey==\`$1\`].OutputValue" --output text --region ${REGION} 2>/dev/null)
+    if [ -n "$val" ] && [ "$val" != "None" ]; then echo "$val"; return; fi
+    sleep 15
+  done
+  echo "" # 5 minutes elapsed; give up
+}
+
+# S3 download with retries (scripts are uploaded by setup.sh AFTER cdk deploy
+# completes, but the host's user-data starts as soon as ASG creates it).
+_s3_get() {
+  local src="$1" dst="$2"
+  for _i in $(seq 1 20); do
+    if aws s3 cp "$src" "$dst" --region ${REGION} --no-progress 2>/dev/null; then
+      return 0
+    fi
+    sleep 15
+  done
+  return 1
 }
 
 # Step 1: KVM
@@ -82,7 +102,8 @@ log "nginx proxy configured"
 # Host agent — probes all local VMs, writes health to DynamoDB
 {{HOST_AGENT_SCRIPT}}
 mkdir -p /opt/openclaw
-aws s3 cp s3://{{ASSETS_BUCKET}}/deployment/scripts/host-agent.py /opt/openclaw/host-agent.py --region ${REGION} --no-progress
+aws s3 cp s3://{{ASSETS_BUCKET}}/deployment/scripts/host-agent.py /opt/openclaw/host-agent.py --region ${REGION} --no-progress 2>/dev/null || \
+  _s3_get s3://{{ASSETS_BUCKET}}/deployment/scripts/host-agent.py /opt/openclaw/host-agent.py
 # Inject tenants table name into service (same mechanism as hosts table)
 systemctl daemon-reload
 systemctl enable host-agent
@@ -181,12 +202,15 @@ log "shared skills ready ($(ls /data/shared-skills/ 2>/dev/null | wc -l) skills)
 
 # Step 4: Deploy launch/stop scripts
 log "step4: deploying scripts"
-aws s3 cp s3://{{ASSETS_BUCKET}}/deployment/scripts/launch-vm.sh /home/ubuntu/launch-vm.sh --region ${REGION} --no-progress
+aws s3 cp s3://{{ASSETS_BUCKET}}/deployment/scripts/launch-vm.sh /home/ubuntu/launch-vm.sh --region ${REGION} --no-progress 2>/dev/null || \
+  _s3_get s3://{{ASSETS_BUCKET}}/deployment/scripts/launch-vm.sh /home/ubuntu/launch-vm.sh
 chmod +x /home/ubuntu/launch-vm.sh && chown ubuntu:ubuntu /home/ubuntu/launch-vm.sh
-aws s3 cp s3://{{ASSETS_BUCKET}}/deployment/scripts/stop-vm.sh /home/ubuntu/stop-vm.sh --region ${REGION} --no-progress
+aws s3 cp s3://{{ASSETS_BUCKET}}/deployment/scripts/stop-vm.sh /home/ubuntu/stop-vm.sh --region ${REGION} --no-progress 2>/dev/null || \
+  _s3_get s3://{{ASSETS_BUCKET}}/deployment/scripts/stop-vm.sh /home/ubuntu/stop-vm.sh
 chmod +x /home/ubuntu/stop-vm.sh && chown ubuntu:ubuntu /home/ubuntu/stop-vm.sh
 # Issue #12 — clone-data.sh: same-host snapshot/clone helper
-aws s3 cp s3://{{ASSETS_BUCKET}}/deployment/scripts/clone-data.sh /home/ubuntu/clone-data.sh --region ${REGION} --no-progress
+aws s3 cp s3://{{ASSETS_BUCKET}}/deployment/scripts/clone-data.sh /home/ubuntu/clone-data.sh --region ${REGION} --no-progress 2>/dev/null || \
+  _s3_get s3://{{ASSETS_BUCKET}}/deployment/scripts/clone-data.sh /home/ubuntu/clone-data.sh || true
 chmod +x /home/ubuntu/clone-data.sh && chown ubuntu:ubuntu /home/ubuntu/clone-data.sh
 {{BACKUP_DATA_SCRIPT}}
 

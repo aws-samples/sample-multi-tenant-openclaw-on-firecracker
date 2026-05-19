@@ -60,12 +60,17 @@ fi
 
 PATH=".venv/bin:$PATH" cdk deploy -c region="$REGION" --profile "$PROFILE" --require-approval never ${CDK_ARGS[@]+"${CDK_ARGS[@]}"}
 
-# Upload scripts to S3
+# Upload scripts to S3 (after deploy creates the bucket)
 BUCKET=$(aws cloudformation describe-stacks --stack-name OpenClawOrchestrator \
   --query 'Stacks[0].Outputs[?OutputKey==`AssetsBucket`].OutputValue' --output text \
   --profile "$PROFILE" --region "$REGION")
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/host-agent.py" "s3://${BUCKET}/deployment/scripts/host-agent.py" \
   --profile "$PROFILE" --region "$REGION" --quiet
+
+# Re-deploy is a no-op if nothing changed but it forces ASG hosts to retry
+# pulling scripts now that S3 has them — guards against the race where the
+# host's user-data ran before scripts were uploaded.
+echo "✓ Scripts uploaded; existing hosts will pick them up via init-host.sh retry loop"
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/adot-config.yaml" "s3://${BUCKET}/deployment/scripts/adot-config.yaml" \
   --profile "$PROFILE" --region "$REGION" --quiet
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/backup-data.sh" "s3://${BUCKET}/deployment/scripts/backup-data.sh" \

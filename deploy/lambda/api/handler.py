@@ -159,6 +159,7 @@ def lambda_handler(event, context):
         ("POST", "/hosts/refresh-rootfs"): refresh_rootfs,
         ("GET", "/hosts/rootfs-version"): rootfs_version,
         ("GET", "/agentcore/status"): agentcore_status,
+        ("GET", "/audit-log"): lambda: _list_audit_log(event.get("queryStringParameters") or {}),
         ("DELETE", "/hosts/{instance_id}"): lambda: deregister_host(
             path_params["instance_id"]
         ),
@@ -172,7 +173,13 @@ def lambda_handler(event, context):
     if forbidden is not None:
         return forbidden
     try:
-        return handler() if callable(handler) else handler
+        result = handler() if callable(handler) else handler
+        # Issue #17 — audit-log mutating operations after they run so the
+        # response_status is captured. GET requests skip auditing to avoid
+        # noise; the audit-log route itself is read-only.
+        if method in ("POST", "PUT", "DELETE"):
+            _audit_write(method, resource, path_params, event, result)
+        return result
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -217,6 +224,12 @@ def create_tenant(body=None):
     vcpu = int(body.get("vcpu", VM_DEFAULT_VCPU))
     mem_mb = int(body.get("mem_mb", VM_DEFAULT_MEM))
     data_disk_mb = int(body.get("data_disk_mb", VM_DATA_DISK_MB))
+
+    # Issue #9 — quota check (no-op when env vars unset).
+    quota_err = _check_quota(vcpu, mem_mb, data_disk_mb)
+    if quota_err:
+        return _resp(400, {"error": quota_err})
+
     config_template = body.get("config_template", "")
     restore_from = body.get("restore_from")
     clone_from = body.get("clone_from")
@@ -246,6 +259,11 @@ def create_tenant(body=None):
     ttl_fields, ttl_err = _parse_ttl(body.get("ttl_hours"), body.get("on_expiry"))
     if ttl_err:
         return _resp(400, {"error": ttl_err})
+
+    # Issue #11 — optional `schedule` field; validated then persisted.
+    sched, sched_err = _parse_schedule(body.get("schedule"))
+    if sched_err:
+        return _resp(400, {"error": sched_err})
 
     restore_backup_key = ""
     if restore_from:
@@ -287,6 +305,8 @@ def create_tenant(body=None):
             "created_at": now, "updated_at": now,
         }
         item.update(ttl_fields)
+        if sched:
+            item["schedule"] = sched
         tenants_table.put_item(Item=item)
         _scale_out()
         _publish_event("tenant.created", tenant_id, {
@@ -320,6 +340,10 @@ def create_tenant(body=None):
     }
     if clone_from:
         item["clone_from"] = clone_from
+    # Persist optional TTL fields on the running path too (#48 follow-up).
+    item.update(ttl_fields)
+    if sched:
+        item["schedule"] = sched
     tenants_table.put_item(Item=item)
 
     hosts_table.update_item(
@@ -405,8 +429,10 @@ def delete_tenant(tenant_id, query_params):
             },
             ReturnValues="ALL_NEW",
         )
-        # Record idle_since when host becomes empty
-        if int(host_resp["Attributes"].get("vm_count", 0)) == 0:
+        # Record idle_since when host becomes empty (defensive — mocks may
+        # omit Attributes; treat as still-busy and skip).
+        attrs = host_resp.get("Attributes") if isinstance(host_resp, dict) else None
+        if attrs and int(attrs.get("vm_count", 0)) == 0:
             hosts_table.update_item(
                 Key={"instance_id": host_id},
                 UpdateExpression="SET idle_since = :t",
@@ -427,6 +453,39 @@ def tenant_action(tenant_id, action, body=None):
     item = tenants_table.get_item(Key={"id": tenant_id}).get("Item")
     if not item:
         return _resp(404, {"error": "tenant not found"})
+
+    # ── Issue #16: live VM resize (hot-add vCPU) ──
+    if action == "resize":
+        return tenant_resize(tenant_id, body)
+
+    # ── Issue #22: resize-disk (offline grow of data.ext4) ──
+    if action == "resize-disk":
+        try:
+            payload = json.loads(body) if isinstance(body, str) else (body or {})
+        except Exception:
+            payload = {}
+        new_size = payload.get("new_size_mb")
+        if not isinstance(new_size, int):
+            return _resp(400, {"error": "missing or invalid new_size_mb"})
+        current = int(item.get("data_disk_mb", VM_DATA_DISK_MB))
+        if new_size <= current:
+            return _resp(400, {"error": f"new_size_mb must be larger (current {current}MB); shrink not supported"})
+        if new_size > 1024 * 1024:
+            return _resp(400, {"error": "new_size_mb exceeds 1 TiB ceiling"})
+        host_id = item.get("host_id")
+        vm_num = int(item.get("vm_num", 1))
+        if not host_id:
+            return _resp(400, {"error": "tenant has no host (still pending?)"})
+        _ssm_send(host_id, f"/home/ubuntu/resize-disk.sh {tenant_id} {vm_num} {new_size}")
+        tenants_table.update_item(
+            Key={"id": tenant_id},
+            UpdateExpression="SET data_disk_mb = :s, updated_at = :t",
+            ExpressionAttributeValues={":s": new_size, ":t": _now()},
+        )
+        return _resp(202, {
+            "id": tenant_id, "status": "resizing",
+            "old_size_mb": current, "new_size_mb": new_size,
+        })
 
     if action == "migrate":
         # Live migration via Firecracker snapshot/restore (issue #20).
@@ -1234,8 +1293,15 @@ def _parse_schedule(raw):
     if not start: return None, "schedule.start required"
     if not stop:  return None, "schedule.stop required"
     import re
+    from datetime import datetime as _dt
     if not re.match(r"^\d{2}:\d{2}$", str(start)) or not re.match(r"^\d{2}:\d{2}$", str(stop)):
         return None, "schedule.start/stop must be HH:MM"
+    # Strict parse: rejects 08:60 etc.
+    try:
+        _dt.strptime(start, "%H:%M")
+        _dt.strptime(stop, "%H:%M")
+    except ValueError:
+        return None, "schedule.start/stop must be a valid HH:MM time"
     if start == stop:
         return None, "schedule.start must differ from schedule.stop"
     tz = raw.get("timezone", "UTC")
@@ -1252,29 +1318,68 @@ def _parse_schedule(raw):
 
 # ----- Audit log (#32 / issue #17, original 96d7496) -----
 AUDIT_TABLE = os.environ.get("AUDIT_TABLE", "")
-_audit_table = ddb.Table(AUDIT_TABLE) if AUDIT_TABLE else None
+audit_table = ddb.Table(AUDIT_TABLE) if AUDIT_TABLE else None
 
 
 def _audit_write(method, resource, path_params, event, result):
     """Best-effort audit-log writer; failures must NEVER break the API."""
-    if not _audit_table:
+    if audit_table is None:
         return
     try:
-        import uuid
-        _audit_table.put_item(Item={
+        import uuid, time as _t
+        path_params = path_params or {}
+        resource_id = path_params.get("id") or path_params.get("instance_id") or ""
+        api_key_id = (event.get("requestContext") or {}).get("identity", {}).get("apiKeyId") \
+            or (event.get("headers") or {}).get("x-api-key", "")[:32]
+        # Auto-prune via DynamoDB TTL: 90-day retention.
+        expires_ttl = int(_t.time()) + 90 * 86400
+        audit_table.put_item(Item={
+            "pk": "audit",
             "id": str(uuid.uuid4()),
             "ts": _now(),
-            "method": method,
-            "resource": resource,
-            "path_params": path_params or {},
-            "status": result.get("statusCode") if isinstance(result, dict) else None,
-            "actor": (event.get("headers") or {}).get("Authorization", "")[:32],
+            "operation": f"{method} {resource}",
+            "resource_id": resource_id,
+            "api_key_id": api_key_id,
+            "response_status": result.get("statusCode") if isinstance(result, dict) else None,
+            "expires_ttl": expires_ttl,
         })
     except Exception as e:
         print(f"audit_write failed: {e}")
 
 
+def _list_audit_log(query_params):
+    """GET /audit-log — return recent audit entries, newest first.
+
+    Optional query params:
+        limit  — int (default 50, max 500)
+        since  — ISO-8601 timestamp; only entries >= this are returned
+    """
+    if audit_table is None:
+        return _resp(200, [])
+    qp = query_params or {}
+    try:
+        limit = min(int(qp.get("limit", 50)), 500)
+    except (TypeError, ValueError):
+        limit = 50
+    since = qp.get("since")
+    from boto3.dynamodb.conditions import Key
+    key_cond = Key("pk").eq("audit")
+    if since:
+        key_cond = key_cond & Key("ts").gte(since)
+    try:
+        items = audit_table.query(
+            KeyConditionExpression=key_cond,
+            ScanIndexForward=False,  # newest first
+            Limit=limit,
+        ).get("Items", [])
+    except Exception as e:
+        print(f"audit query failed: {e}")
+        items = []
+    return _resp(200, items[:limit])
+
+
 # ----- Quota (#34 / issue #9, original 79000fa) -----
+QUOTAS_ENABLED = (os.environ.get("QUOTAS_ENABLED", "true").lower() != "false")
 QUOTAS_MAX_VCPU = int(os.environ.get("QUOTAS_MAX_VCPU", 0))
 QUOTAS_MAX_MEM_MB = int(os.environ.get("QUOTAS_MAX_MEM_MB", 0))
 QUOTAS_MAX_DATA_DISK_MB = int(os.environ.get("QUOTAS_MAX_DATA_DISK_MB", 0))
@@ -1282,6 +1387,8 @@ QUOTAS_MAX_DATA_DISK_MB = int(os.environ.get("QUOTAS_MAX_DATA_DISK_MB", 0))
 
 def _check_quota(vcpu, mem_mb, data_disk_mb):
     """Return None if within quota, else an error string."""
+    if not QUOTAS_ENABLED:
+        return None
     if QUOTAS_MAX_VCPU and vcpu > QUOTAS_MAX_VCPU:
         return f"vcpu={vcpu} exceeds quota (max {QUOTAS_MAX_VCPU})"
     if QUOTAS_MAX_MEM_MB and mem_mb > QUOTAS_MAX_MEM_MB:
@@ -1289,6 +1396,110 @@ def _check_quota(vcpu, mem_mb, data_disk_mb):
     if QUOTAS_MAX_DATA_DISK_MB and data_disk_mb > QUOTAS_MAX_DATA_DISK_MB:
         return f"data_disk_mb={data_disk_mb} exceeds quota (max {QUOTAS_MAX_DATA_DISK_MB})"
     return None
+
+
+# ----- SNS lifecycle notifications (#33 / issue #13, original 1f1bffa) -----
+NOTIFICATIONS_TOPIC_ARN = os.environ.get("NOTIFICATIONS_TOPIC_ARN", "")
+sns = boto3.client("sns")
+
+
+def _publish_event(event_name, tenant_id, details):
+    """Publish a tenant lifecycle event to SNS. No-op when topic not set.
+
+    Best-effort: SNS publish failures are logged but do not break the
+    underlying API operation.
+    """
+    if not NOTIFICATIONS_TOPIC_ARN:
+        return
+    try:
+        msg = {
+            "event": event_name,
+            "tenant_id": tenant_id,
+            "timestamp": _now(),
+            "details": details or {},
+        }
+        sns.publish(
+            TopicArn=NOTIFICATIONS_TOPIC_ARN,
+            Subject=f"OpenClaw: {event_name} ({tenant_id})",
+            Message=json.dumps(msg, default=str),
+            MessageAttributes={
+                "event": {"DataType": "String", "StringValue": event_name},
+                "tenant_id": {"DataType": "String", "StringValue": tenant_id},
+            },
+        )
+    except Exception as e:
+        print(f"SNS publish failed (operation succeeded): {e}")
+
+
+# ----- Batch tenant operations (#29 / issue #23, original d05e107) -----
+_BATCH_VALID_ACTIONS = {"stop", "start", "delete", "backup"}
+_BATCH_VALID_FILTER_KEYS = {"tag"}
+_BATCH_MAX_IDS = 100
+
+
+def batch_tenants(body=None):
+    """POST /batch/tenants — apply one action to many tenants in a single call."""
+    if body is None:
+        return _resp(400, {"error": "missing body"})
+    body = json.loads(body) if isinstance(body, str) else body
+    action = body.get("action")
+    if action not in _BATCH_VALID_ACTIONS:
+        return _resp(400, {"error": f"action must be one of {sorted(_BATCH_VALID_ACTIONS)}"})
+    ids = body.get("ids")
+    flt = body.get("filter")
+    if ids is not None and flt is not None:
+        return _resp(400, {"error": "specify exactly one of 'ids' or 'filter'"})
+    if ids is None and flt is None:
+        return _resp(400, {"error": "specify exactly one of 'ids' or 'filter'"})
+    if ids is not None:
+        if not isinstance(ids, list):
+            return _resp(400, {"error": "ids must be an array"})
+        if len(ids) > _BATCH_MAX_IDS:
+            return _resp(400, {"error": f"too many ids (max {_BATCH_MAX_IDS})"})
+        target_ids = list(ids)
+    else:
+        if not isinstance(flt, dict):
+            return _resp(400, {"error": "filter must be an object"})
+        unknown = set(flt.keys()) - _BATCH_VALID_FILTER_KEYS
+        if unknown:
+            return _resp(400, {"error": f"unknown filter key(s): {sorted(unknown)}"})
+        target_ids = _resolve_filter(flt)
+    succeeded, failed = [], []
+    for tid in target_ids:
+        try:
+            tenant = tenants_table.get_item(Key={"id": tid}).get("Item")
+            if not tenant:
+                failed.append({"id": tid, "error": "tenant not found"})
+                continue
+            if action == "delete":
+                result = delete_tenant(tid, {})
+            else:
+                result = tenant_action(tid, action)
+            if result.get("statusCode", 500) >= 400:
+                err = json.loads(result.get("body", "{}")).get("error", "unknown error")
+                failed.append({"id": tid, "error": err})
+            else:
+                succeeded.append({"id": tid, "action": action})
+        except Exception as e:
+            failed.append({"id": tid, "error": str(e)})
+    return _resp(200, {"succeeded": succeeded, "failed": failed})
+
+
+def _resolve_filter(flt):
+    """Convert filter dict → list of matching tenant ids (excludes soft-deleted)."""
+    items = tenants_table.scan(
+        FilterExpression="#s <> :d",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":d": "deleted"},
+    ).get("Items", []) or []
+    items = [it for it in items if it.get("status") != "deleted"]
+    tag_expr = flt.get("tag", "")
+    if tag_expr and ":" in tag_expr:
+        k, v = tag_expr.split(":", 1)
+        items = [it for it in items if (it.get("tags") or {}).get(k) == v]
+    elif tag_expr:
+        items = []
+    return [it["id"] for it in items]
 
 
 def _resp(code, body):
@@ -1301,3 +1512,80 @@ def _resp(code, body):
         },
         "body": json.dumps(body, default=str),
     }
+
+
+# ────────────────────────────────────────────────────────────
+# Live VM resize (#35 / issue #16, original b3d48cf)
+# ────────────────────────────────────────────────────────────
+
+
+def tenant_resize(tenant_id, body):
+    """POST /tenants/{id}/resize — hot-add vCPU on a running tenant."""
+    if body is None:
+        return _resp(400, {"error": "missing body"})
+    body = json.loads(body) if isinstance(body, str) else body
+    new_vcpu = body.get("vcpu")
+    new_mem = body.get("mem_mb")
+    if new_vcpu is None and new_mem is None:
+        return _resp(400, {"error": "specify vcpu (memory live-resize not supported)"})
+    if new_mem is not None:
+        return _resp(400, {
+            "error": "memory live-resize is not supported; "
+                     "stop the tenant, recreate with new mem_mb, then start"
+        })
+    try:
+        new_vcpu = int(new_vcpu)
+    except (TypeError, ValueError):
+        return _resp(400, {"error": "vcpu must be an integer"})
+    item = tenants_table.get_item(Key={"id": tenant_id}).get("Item")
+    if not item:
+        return _resp(404, {"error": "tenant not found"})
+    if item.get("status") != "running":
+        return _resp(400, {"error": f"tenant must be running (current: {item.get('status')})"})
+    current_vcpu = int(item.get("vcpu", 0))
+    if new_vcpu <= current_vcpu:
+        return _resp(400, {
+            "error": f"vcpu must be greater than current ({current_vcpu}); "
+                     "Firecracker cannot shrink — restart to decrease"
+        })
+    quota_err = _check_quota(new_vcpu, int(item.get("mem_mb", 0)),
+                              int(item.get("data_disk_mb", 0)))
+    if quota_err:
+        return _resp(400, {"error": quota_err})
+    host_id = item.get("host_id", "")
+    if not host_id:
+        return _resp(400, {"error": "tenant has no host assigned"})
+    host = hosts_table.get_item(Key={"instance_id": host_id}).get("Item")
+    if not host:
+        return _resp(400, {"error": f"host {host_id} not found"})
+    delta = new_vcpu - current_vcpu
+    allocatable = int(int(host["total_vcpu"]) * CPU_OVERCOMMIT_RATIO)
+    free = allocatable - int(host["used_vcpu"])
+    if delta > free:
+        return _resp(400, {
+            "error": f"insufficient host capacity: need {delta} more vCPU, "
+                     f"host has {free} free (allocatable={allocatable}, used={host['used_vcpu']})"
+        })
+    vm_dir = f"/data/firecracker-vms/{tenant_id}"
+    cmd = (f'curl -sf --unix-socket {vm_dir}/fc.sock -X PATCH http://localhost/machine-config '
+           f'-H "Content-Type: application/json" '
+           f"-d '{{\"vcpu_count\":{new_vcpu},\"mem_size_mib\":{int(item['mem_mb'])}}}'")
+    if not _ssm_run(host_id, cmd, timeout=30):
+        return _resp(502, {"error": "Firecracker machine-config PATCH failed; tenant unchanged"})
+    now = _now()
+    tenants_table.update_item(
+        Key={"id": tenant_id},
+        UpdateExpression="SET vcpu = :v, updated_at = :t",
+        ExpressionAttributeValues={":v": new_vcpu, ":t": now},
+    )
+    hosts_table.update_item(
+        Key={"instance_id": host_id},
+        UpdateExpression="SET used_vcpu = used_vcpu + :v",
+        ExpressionAttributeValues={":v": delta},
+    )
+    return _resp(200, {
+        "id": tenant_id,
+        "vcpu": new_vcpu,
+        "mem_mb": int(item["mem_mb"]),
+        "delta": delta,
+    })

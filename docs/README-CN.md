@@ -24,6 +24,60 @@
 - **配置模板** — 自定义 OpenClaw 配置模板（支持不同 LLM 提供商/模型），创建租户时可选模板
 - **默认工具链** — 每个 VM 预装 Python3/uv/git/gh/Node.js/htop/tmux/tree 等开发工具
 
+## v1.0 功能矩阵
+
+> **最新版本**: [v1.0.1-fix-issue48](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/releases/tag/v1.0.1-fix-issue48) (368 单元测试通过). 详见 [CHANGELOG.md](../CHANGELOG.md).
+
+Q2 2026 里程碑共合并 24 个特性, 每个都有 TDD 覆盖 + 单 issue 回滚 tag.
+
+| 类别 | 特性 | Issue | PR |
+|---|---|---|---|
+| **可观测性** | 每 VM CPU/内存/磁盘指标到 DynamoDB | [#3] | [#37] |
+| | Amazon Managed Prometheus + Grafana | [#4] | [#38] |
+| **安全** | EBS 静态加密 | [#6] | [#26] |
+| | 可选 AWS WAF 集成 | [#7] | [#31] |
+| | RBAC (admin/operator/viewer) via Cognito Groups | [#14] | [#39] |
+| | 所有写操作审计日志 | [#17] | [#32] |
+| **租户生命周期** | 单租户资源配额 | [#9] | [#34] |
+| | 标签、分组、搜索 | [#10] | [#27] |
+| | 定时自动停启 (Office Hours 模式) | [#11] | [#30] |
+| | 同主机本地 cp 快照/克隆 | [#12] | [#36] |
+| | SNS 生命周期事件通知 | [#13] | [#33] |
+| | TTL 到期自动停止/删除 | [#15] | [#28] |
+| | 在线 VM 扩容 — 热加 vCPU 无需重启 | [#16] | [#35] |
+| | 离线数据盘自动扩容 | [#22] | [#47] |
+| | 批量租户操作端点 | [#23] | [#29] |
+| **平台** | 可插拔 VM Runtime 协议 (Firecracker / CHV / QEMU stub) | [#5] | [#41] |
+| | 多 AZ 高可用 (可选) | [#8] | [#42] |
+| | Graviton (ARM64) 主机支持 | [#19] | [#44] |
+| | Firecracker 快照/恢复实时 VM 迁移 | [#20] | [#45] |
+| **开发体验** | 统一 `oc` CLI | [#21] | [#40] |
+| | LocalStack + 桩 host-agent 本地开发模式 | [#24] | [#46] |
+| **部署** | Terraform 模块 (与 CDK core 对齐) | [#18] | [#43] |
+
+[#3]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/3
+[#4]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/4
+[#5]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/5
+[#6]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/6
+[#7]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/7
+[#8]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/8
+[#9]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/9
+[#10]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/10
+[#11]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/11
+[#12]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/12
+[#13]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/13
+[#14]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/14
+[#15]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/15
+[#16]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/16
+[#17]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/17
+[#18]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/18
+[#19]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/19
+[#20]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/20
+[#21]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/21
+[#22]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/22
+[#23]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/23
+[#24]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/24
+
 ## 快速开始
 
 **前置条件:**

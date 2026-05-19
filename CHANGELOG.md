@@ -1,5 +1,19 @@
 # Changelog
 
+> **Versioning note (2026-05-19)**: Tags `v1.0.0-milestone-q2-2026` /
+> `v1.0.1-fix-issue48` / `v1.0.2-e2e-fixes` / `v1.0-final` were created in this
+> work cycle but break SemVer monotonicity (the previous release was already
+> 1.1.x). They are kept as descriptive aliases. The SemVer-correct version
+> ladder for this cycle is `1.2.0 → 1.2.1 → 1.2.2 → 1.2.3`. `pyproject.toml`
+> tracks **1.2.3** as of this entry.
+
+## [1.2.3] — 2026-05-19
+
+Aliases: tag `v1.0-final`. Marks the end of the Q2 2026 milestone; identical content to v1.0-final.
+
+### Changed
+- `pyproject.toml` version bumped 1.1.3 → 1.2.3 to restore SemVer monotonicity.
+
 ## [1.0-final] - 2026-05-19
 
 Aggregate milestone tag. Closes the Q2 2026 work cycle: v1.0.0 + v1.0.1 + v1.0.2.

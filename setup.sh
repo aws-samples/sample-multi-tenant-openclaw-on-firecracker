@@ -58,7 +58,7 @@ print(f"✓ config.yml updated (custom_domain={os.environ.get('DOMAIN','<unchang
 PYEOF
 fi
 
-PATH=".venv/bin:$PATH" cdk deploy -c region="$REGION" --profile "$PROFILE" --require-approval never "${CDK_ARGS[@]}"
+PATH=".venv/bin:$PATH" cdk deploy -c region="$REGION" --profile "$PROFILE" --require-approval never ${CDK_ARGS[@]+"${CDK_ARGS[@]}"}
 
 # Upload scripts to S3
 BUCKET=$(aws cloudformation describe-stacks --stack-name OpenClawOrchestrator \

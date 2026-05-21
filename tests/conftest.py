@@ -46,9 +46,21 @@ def make_ddb_table():
 
 
 def load_env_deploy():
-    """Load .env.deploy for E2E tests. Returns dict or None if not found."""
-    for path in ["../.env.deploy", ".env.deploy",
-                  os.path.expanduser("~/Code/sample-multi-tenant-openclaw-on-firecracker/.env.deploy")]:
+    """Load .env.deploy for E2E tests. Returns dict or None if not found.
+
+    Searches relative to the test file's parent (the repo root) and the
+    current working directory — covers `pytest` invoked from anywhere
+    inside the project. Avoids any hard-coded absolute path so the suite
+    runs cleanly in CI / on contributor machines / inside containers.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(here)
+    candidates = [
+        os.path.join(repo_root, ".env.deploy"),
+        os.path.join(os.getcwd(), ".env.deploy"),
+        os.path.join(os.getcwd(), "..", ".env.deploy"),
+    ]
+    for path in candidates:
         if os.path.isfile(path):
             env = {}
             with open(path) as f:

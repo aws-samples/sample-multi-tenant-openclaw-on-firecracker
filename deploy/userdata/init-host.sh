@@ -62,6 +62,12 @@ log "firecracker ${FC_VER} installed"
 # Resolve table names from stack outputs
 HOSTS_TABLE=$(_stack_output HostsTable)
 TENANTS_TABLE=$(_stack_output TenantsTable)
+# Fallback to known constants if stack outputs aren't ready yet (chicken-
+# and-egg: outputs only become visible AFTER the stack reaches
+# CREATE_COMPLETE, but the host is launched mid-CREATE by the ASG).
+# Both tables are stack-defined with these exact names in deploy/stack.py.
+[ -z "$HOSTS_TABLE" ] || [ "$HOSTS_TABLE" = "None" ] && HOSTS_TABLE="openclaw-hosts"
+[ -z "$TENANTS_TABLE" ] || [ "$TENANTS_TABLE" = "None" ] && TENANTS_TABLE="openclaw-tenants"
 log "tables: hosts=${HOSTS_TABLE} tenants=${TENANTS_TABLE}"
 
 # Write env for launch-vm.sh and host-agent
@@ -176,7 +182,25 @@ for i in $(seq 1 20); do
   log "manifest.json not found, retrying in 30s ($i/20)..."
   sleep 30
 done
-[ -f ${ASSETS}/manifest.json ] || { log "ERROR: manifest.json not available after 10min"; exit 1; }
+if [ ! -f ${ASSETS}/manifest.json ]; then
+  log "ERROR: manifest.json not available after 10min"
+  log ""
+  log "  This means rootfs has not been built yet. To finish bringing up the data plane,"
+  log "  run ONE of the following from a machine that has AWS CLI access to this account:"
+  log ""
+  log "    Option A — cloud build (recommended; works from macOS / Windows / Cloud9):"
+  log "      ./scripts/build-rootfs-on-ec2.sh v1.0"
+  log "      (Spins up a one-shot t3.medium Ubuntu builder, runs the build via SSM,"
+  log "       uploads to S3, then terminates the builder.)"
+  log ""
+  log "    Option B — local Linux host (faster if you already have one):"
+  log "      source .env.deploy && ./build-rootfs.sh v1.0"
+  log ""
+  log "  Either uploads ${MANIFEST_URL} and triggers refresh-rootfs."
+  log "  This host will be replaced by the ASG on the next health-check cycle."
+  log ""
+  exit 1
+fi
 eval $(python3 -c "
 import json; m=json.load(open('${ASSETS}/manifest.json'))
 print(f'ROOTFS_KEY={m[\"rootfs\"]}')

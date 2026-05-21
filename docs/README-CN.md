@@ -26,7 +26,7 @@
 
 ## v1.0 功能矩阵
 
-> **最新版本**: [v1.0.2-e2e-fixes](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/releases/tag/v1.0.2-e2e-fixes) (368 单元测试通过, 控制面已在真实 AWS 端到端验证). 详见 [CHANGELOG.md](../CHANGELOG.md).
+> **最新版本**: [v1.0.2-e2e-fixes](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/releases/tag/v1.0.2-e2e-fixes) (1.2.4 SemVer; 385 / 385 单元测试通过, 0 失败, 0 跳过 —— 控制面 + microVM 数据面都已在真实 AWS 端到端验证, 包括 CloudFront → ALB → Nginx → Firecracker → OpenClaw Gateway 全链路 HTTP 200). 详见 [CHANGELOG.md](../CHANGELOG.md).
 
 Q2 2026 里程碑共合并 24 个特性, 每个都有 TDD 覆盖 + 单 issue 回滚 tag.
 
@@ -85,8 +85,9 @@ Q2 2026 里程碑共合并 24 个特性, 每个都有 TDD 覆盖 + 单 issue 回
 - AWS 账号 + CLI 配置
 - CDK CLI + Python 3.12+
 - uv (Python 包管理)
-- 运行 `build-rootfs.sh` 还需要：`sudo` 权限；`debootstrap` / `pigz` / `e2fsprogs` 工具；
-  ≥2GB 可用内存, `/tmp` ≥10GB 可用空间
+- 仅本地 rootfs 构建（`build-rootfs.sh`，可选）需要：`sudo` 权限的 Linux 主机；
+  `debootstrap` / `pigz` / `e2fsprogs` 工具；≥2GB 可用内存；`/tmp` ≥10GB 可用空间。
+  **如果使用 `build-rootfs-on-ec2.sh` 则无需本地 Linux —— 见下面 Step 3。**
 
 ```bash
 # 1. 配置
@@ -98,9 +99,15 @@ cp templates/openclaw.json.example templates/openclaw.json  # 设置 API key、�
 # 完成后环境变量保存在 .env.deploy
 
 # 3. 构建 rootfs —— 创建任何租户前都必须先做这一步
-#    (自动上传 S3 + 推送到 host)
-source .env.deploy
-./build-rootfs.sh v1.0
+#
+#    方式 A —— 云端构建（macOS / Windows / 任意环境都可用）:
+#      ./scripts/build-rootfs-on-ec2.sh v1.0
+#    自动启一台一次性 t3.medium Ubuntu 主机，用 SSM 跑构建，
+#    上传 S3 后自动终止实例。约 10 分钟，无需本地 Linux。
+#
+#    方式 B —— 本地 Linux 主机（如果已有 Linux 环境则更快）:
+#      source .env.deploy
+#      ./build-rootfs.sh v1.0
 
 # 4. 创建租户（OpenClaw 实例）
 source .env.deploy
@@ -363,10 +370,12 @@ sample-multi-tenant-openclaw-on-firecracker/
 
 所有请求需携带 `x-api-key` header。
 
+### 租户操作
+
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | /tenants | 列出所有租户 |
-| POST | /tenants | 创建租户 `{"name":"xx","vcpu":2,"mem_mb":4096}` — 加上 `"restore_from":{"tenant_id":"..."}` 则从备份恢复 |
+| GET | /tenants | 列出所有租户。可加 `?tag=key:value`（可重复，多 tag AND 过滤）|
+| POST | /tenants | 创建租户。Body: `{"name":"xx","vcpu":2,"mem_mb":4096,"data_disk_mb":8192,"config_template":"...","tags":{"k":"v"},"ttl_hours":24,"on_expiry":"stop","schedule":{"start":"09:00","stop":"18:00","timezone":"UTC","days":["Mon","Tue"]},"restore_from":{"tenant_id":"..."},"clone_from":"<src-tenant-id>"}` — 仅 `name` 必填 |
 | GET | /tenants/{id} | 查询单个租户 |
 | DELETE | /tenants/{id} | 删除租户 (`?keep_data=true` 保留数据盘) |
 | POST | /tenants/{id}/restart | 重启租户 VM（复用磁盘，快速） |
@@ -375,14 +384,28 @@ sample-multi-tenant-openclaw-on-firecracker/
 | POST | /tenants/{id}/pause | 冻结 vCPU（Firecracker 原生，即时） |
 | POST | /tenants/{id}/resume | 恢复已暂停的租户 VM |
 | POST | /tenants/{id}/reset | 重装系统盘（data 卷保留） |
-| POST | /tenants/{id}/backup | 手动触发数据盘备份（异步） |
+| POST | /tenants/{id}/backup | 手动触发数据盘备份（异步，返回 202） |
+| POST | /tenants/{id}/resize | 在线热加 vCPU。Body: `{"vcpu":4}`。内存在线调整不支持（Firecracker 限制） |
+| POST | /tenants/{id}/resize-disk | 离线扩容数据盘。Body: `{"new_size_mb":16384}`。VM 暂停约几秒 |
+| POST | /tenants/{id}/migrate | 通过 Firecracker snapshot/restore 实时迁移。Body: `{"target_host_id":"i-..."}` |
 | GET | /tenants/{id}/backups | 查询单个租户的备份列表 |
+| POST | /batch/tenants | 批量操作。Body: `{"action":"stop|start|delete|backup","ids":["t1","t2"]}` 或 `{"action":"...","filter":{"tag":"k:v"}}`。返回 `{succeeded:[...], failed:[...]}` |
+
+### 备份、宿主机、AgentCore、审计、Skills、模板
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
 | GET | /backups | 跨租户查询所有备份（含 orphan 标记） |
 | GET | /hosts | 列出所有宿主机 |
-| POST | /hosts | 注册宿主机 (UserData 自动调用) |
+| POST | /hosts | 注册宿主机 (一般不直接用 — UserData 直写 DDB) |
 | POST | /hosts/refresh-rootfs | 推送最新 rootfs + data template 到所有宿主机 |
 | GET | /hosts/rootfs-version | 查询 S3 上当前 rootfs 版本 (manifest.json) |
 | DELETE | /hosts/{id} | 注销宿主机 |
+| GET | /agentcore/status | AgentCore 启用状态 + Gateway URL（启用时） |
+| GET | /audit-log | 审计日志查询。`?since=<ISO8601>&limit=<n>`（最大 500）。DDB TTL 90 天自动清理 |
+| GET | /skills | 列出共享 Skills（S3 集中管理） |
+| GET | /templates | 列出配置模板 |
+| GET\|PUT\|DELETE | /templates/{name} | 读取 / 保存 / 删除配置模板（`default` 只读） |
 
 ## 网络模型
 

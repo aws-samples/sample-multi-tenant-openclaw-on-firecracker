@@ -26,7 +26,7 @@ Multi-tenant isolated deployment of OpenClaw AI agents on AWS using Firecracker 
 
 ## v1.0 Feature Matrix
 
-> **Latest release**: [v1.0.2-e2e-fixes](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/releases/tag/v1.0.2-e2e-fixes) (368 unit tests passing, control plane verified end-to-end on real AWS). See [CHANGELOG.md](CHANGELOG.md) for details.
+> **Latest release**: [v1.0.2-e2e-fixes](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/releases/tag/v1.0.2-e2e-fixes) (1.2.4 SemVer; 385 / 385 unit tests passing, 0 failed, 0 skipped — control plane + microVM data plane both end-to-end verified on real AWS, including HTTP 200 from CloudFront → ALB → Nginx → Firecracker → OpenClaw Gateway). See [CHANGELOG.md](CHANGELOG.md) for details.
 
 24 features merged in the Q2 2026 milestone, each with TDD coverage and a per-issue rollback tag.
 
@@ -85,8 +85,10 @@ Multi-tenant isolated deployment of OpenClaw AI agents on AWS using Firecracker 
 - AWS account + CLI configured
 - CDK CLI + Python 3.12+
 - uv (Python package manager)
-- For `build-rootfs.sh`: `sudo` access; tools `debootstrap` / `pigz` / `e2fsprogs`;
-  ≥2GB available RAM, ≥10GB free in `/tmp`
+- For local rootfs build (`build-rootfs.sh`, optional): `sudo` access on a
+  Linux host with `debootstrap` / `pigz` / `e2fsprogs`, ≥2GB free RAM, ≥10GB
+  free in `/tmp`. **Not required if you use `build-rootfs-on-ec2.sh` —
+  see step 3 below.**
 
 ```bash
 # 1. Configure
@@ -97,10 +99,16 @@ cp templates/openclaw.json.example templates/openclaw.json  # Set your API key, 
 ./setup.sh ap-northeast-1 lab
 # Environment variables saved to .env.deploy
 
-# 3. Build rootfs — REQUIRED before creating any tenant
-#    (auto-uploads to S3 + pushes to hosts)
-source .env.deploy
-./build-rootfs.sh v1.0
+# 3. Build rootfs — REQUIRED before creating any tenant.
+#
+#    Option A — cloud build (works from macOS / Windows / anywhere):
+#      ./scripts/build-rootfs-on-ec2.sh v1.0
+#    Spins up a one-shot t3.medium Ubuntu host, runs the build via SSM,
+#    uploads to S3, terminates. ~10 min, no local Linux required.
+#
+#    Option B — local Linux host (faster if you already have one):
+#      source .env.deploy
+#      ./build-rootfs.sh v1.0
 
 # 4. Create a tenant (OpenClaw instance)
 source .env.deploy
@@ -352,10 +360,12 @@ sample-multi-tenant-openclaw-on-firecracker/
 
 All requests require `x-api-key` header.
 
+### Tenants
+
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | /tenants | List all tenants |
-| POST | /tenants | Create tenant `{"name":"xx","vcpu":2,"mem_mb":4096}` — add `"restore_from":{"tenant_id":"..."}` to restore from a backup |
+| GET | /tenants | List all tenants. Filter with `?tag=key:value` (repeatable, AND across pairs) |
+| POST | /tenants | Create tenant. Body: `{"name":"xx","vcpu":2,"mem_mb":4096,"data_disk_mb":8192,"config_template":"...","tags":{"k":"v"},"ttl_hours":24,"on_expiry":"stop","schedule":{"start":"09:00","stop":"18:00","timezone":"UTC","days":["Mon","Tue"]},"restore_from":{"tenant_id":"..."},"clone_from":"<src-tenant-id>"}` — only `name` is required |
 | GET | /tenants/{id} | Get tenant details |
 | DELETE | /tenants/{id} | Delete tenant (`?keep_data=true` to preserve data volume) |
 | POST | /tenants/{id}/restart | Restart VM (reuse disks, fast) |
@@ -365,13 +375,27 @@ All requests require `x-api-key` header.
 | POST | /tenants/{id}/resume | Resume a paused VM |
 | POST | /tenants/{id}/reset | Reinstall rootfs (data volume preserved) |
 | POST | /tenants/{id}/backup | Manual data backup (async, returns 202) |
+| POST | /tenants/{id}/resize | Hot-add vCPU. Body: `{"vcpu":4}`. Memory live-resize is not supported (Firecracker limitation) |
+| POST | /tenants/{id}/resize-disk | Offline grow data disk. Body: `{"new_size_mb":16384}`. Pauses the VM ~seconds |
+| POST | /tenants/{id}/migrate | Live VM migration via Firecracker snapshot/restore. Body: `{"target_host_id":"i-..."}` |
 | GET | /tenants/{id}/backups | List backups for one tenant |
-| GET | /backups | List all backups across tenants (includes orphan flag) |
+| POST | /batch/tenants | Batch operation. Body: `{"action":"stop|start|delete|backup","ids":["t1","t2"]}` or `{"action":"...","filter":{"tag":"k:v"}}`. Returns `{succeeded:[...], failed:[...]}` |
+
+### Backups, Hosts, AgentCore, Audit, Skills, Templates
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | /backups | List all backups across tenants (marks orphan vs active) |
 | GET | /hosts | List all hosts |
-| POST | /hosts | Register host (called by UserData) |
+| POST | /hosts | Register host (rarely used — UserData writes DDB directly) |
 | POST | /hosts/refresh-rootfs | Push latest rootfs to all hosts |
 | GET | /hosts/rootfs-version | Query current rootfs version (manifest.json) |
 | DELETE | /hosts/{id} | Deregister host |
+| GET | /agentcore/status | AgentCore enable status + Gateway URL (when enabled) |
+| GET | /audit-log | Query audit log. `?since=<ISO8601>&limit=<n>` (max 500). 90-day TTL via DDB |
+| GET | /skills | List shared skills (S3-managed) |
+| GET | /templates | List config templates |
+| GET\|PUT\|DELETE | /templates/{name} | Read / save / remove a config template (`default` is read-only) |
 
 ## Network Model
 

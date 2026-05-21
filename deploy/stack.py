@@ -114,7 +114,8 @@ class OpenClawOrchestratorStack(cdk.Stack):
             resources=["*"],
         )
         ec2_policy = iam.PolicyStatement(
-            actions=["ec2:DescribeInstances", "ec2:TerminateInstances"],
+            actions=["ec2:DescribeInstances", "ec2:DescribeInstanceTypes",
+                     "ec2:TerminateInstances"],
             resources=["*"],
         )
 
@@ -950,7 +951,10 @@ function handler(event) {
                     callback_urls.append(f"https://{custom_domain}/console/index.html")
                 user_pool.add_domain("ConsoleDomain",
                     cognito_domain=cognito.CognitoDomainOptions(
-                        domain_prefix="openclaw-console",
+                        # account_id suffix keeps the domain prefix globally
+                        # unique across stacks/accounts and survives RETAIN
+                        # cleanup races (the prefix is global, not regional).
+                        domain_prefix=f"openclaw-console-{self.account}",
                     ),
                 )
                 client = user_pool.add_client("ConsoleClient",
@@ -963,7 +967,7 @@ function handler(event) {
                 )
                 cognito_outputs["CognitoUserPoolId"] = user_pool.user_pool_id
                 cognito_outputs["CognitoClientId"] = client.user_pool_client_id
-                cognito_outputs["CognitoDomain"] = f"openclaw-console.auth.{cdk.Stack.of(self).region}.amazoncognito.com"
+                cognito_outputs["CognitoDomain"] = f"openclaw-console-{self.account}.auth.{cdk.Stack.of(self).region}.amazoncognito.com"
 
             # RBAC groups (issue #14): admin / operator / viewer.
             # Created on both new and existing pools so an imported pool also

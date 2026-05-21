@@ -155,7 +155,7 @@ def lambda_handler(event, context):
         ("GET", "/backups"): list_all_backups,
         ("POST", "/batch/tenants"): lambda: batch_tenants(event.get("body")),
         ("GET", "/hosts"): list_hosts,
-        ("POST", "/hosts"): lambda: register_host(json.loads(event["body"])),
+        ("POST", "/hosts"): lambda: register_host(event.get("body")),
         ("POST", "/hosts/refresh-rootfs"): refresh_rootfs,
         ("GET", "/hosts/rootfs-version"): rootfs_version,
         ("GET", "/agentcore/status"): agentcore_status,
@@ -726,18 +726,70 @@ def list_hosts():
     return _resp(200, items)
 
 
+# Same _sizes / _mem_ratio fallback as deploy/stack.py (kept in sync
+# manually because both are intentionally tiny constant tables — adding
+# a shared module just to dedupe two dicts isn't worth the import cost
+# in cold-start). When EC2 describe_instance_types() works this table
+# is unused; it only triggers if the API call fails.
+_SIZE_TO_VCPU = {"medium": 1, "large": 2, "xlarge": 4, "2xlarge": 8,
+                 "4xlarge": 16, "8xlarge": 32, "12xlarge": 48,
+                 "16xlarge": 64, "24xlarge": 96}
+_FAMILY_LETTER_TO_MEM_PER_VCPU = {"c": 2048, "m": 4096, "r": 8192}
+
+
+def _resolve_instance_memory_mb(ec2_client, instance_type):
+    """Return the advertised RAM (MiB) for an EC2 instance type.
+
+    Tries the authoritative AWS API first (describe_instance_types →
+    MemoryInfo.SizeInMiB), falling back to a static lookup table when
+    the API call fails (permission, throttling, malformed instance_type).
+    The fallback keeps register_host() functional in environments that
+    haven't granted ec2:DescribeInstanceTypes, but we log loudly so the
+    operator notices.
+    """
+    if instance_type:
+        try:
+            resp = ec2_client.describe_instance_types(InstanceTypes=[instance_type])
+            return int(resp["InstanceTypes"][0]["MemoryInfo"]["SizeInMiB"])
+        except Exception as exc:
+            print(f"register_host: ec2.describe_instance_types({instance_type}) "
+                  f"failed: {exc}; falling back to static lookup")
+    # Fallback: parse e.g. "m8i.xlarge" → family=m, size=xlarge → 4 * 4096 = 16384 MiB
+    try:
+        family, size = instance_type.split(".")
+        vcpu = _SIZE_TO_VCPU[size]
+        return vcpu * _FAMILY_LETTER_TO_MEM_PER_VCPU[family[0]]
+    except (ValueError, KeyError, IndexError):
+        # Last-ditch sane default. Logged so the operator notices.
+        print(f"register_host: unable to parse instance_type={instance_type!r}; "
+              f"defaulting mem_total to 16384 MiB. Add the type to "
+              f"_SIZE_TO_VCPU or grant ec2:DescribeInstanceTypes.")
+        return 16384
+
+
+
 def register_host(body):
-    instance_id = body["instance_id"]
+    if body is None:
+        return _resp(400, {"error": "missing body"})
+    body = json.loads(body) if isinstance(body, str) else body
+    instance_id = body.get("instance_id")
+    if not instance_id:
+        return _resp(400, {"error": "missing instance_id"})
 
     # Fetch instance info
     ec2 = boto3.client("ec2")
     resp = ec2.describe_instances(InstanceIds=[instance_id])
     inst = resp["Reservations"][0]["Instances"][0]
     private_ip = inst["PrivateIpAddress"]
-    # m8i.xlarge = 4 vCPU / 16384 MB
+    instance_type = inst.get("InstanceType", "")
     vcpu_total = inst["CpuOptions"]["CoreCount"] * inst["CpuOptions"]["ThreadsPerCore"]
-    # Approximate memory from instance type (API doesn't return RAM directly)
-    mem_total = 16384  # TODO: lookup from instance type
+
+    # Resolve memory from the instance type via the EC2 API rather than
+    # hard-coding 16384 (which silently wrote wrong values for any host
+    # larger than xlarge — see register_host TODO removed in 1.2.4).
+    # describe_instance_types returns SizeInMiB which IS exactly the
+    # advertised RAM; we fall back to a heuristic only if the API errors.
+    mem_total = _resolve_instance_memory_mb(ec2, instance_type)
 
     hosts_table.put_item(Item={
         "instance_id": instance_id,
@@ -1317,8 +1369,9 @@ def _parse_schedule(raw):
 
 
 # ----- Audit log (#32 / issue #17, original 96d7496) -----
-AUDIT_TABLE = os.environ.get("AUDIT_TABLE", "")
-audit_table = ddb.Table(AUDIT_TABLE) if AUDIT_TABLE else None
+# audit_table is defined above (top of module). No re-binding needed here —
+# the post-merge regression repair (#48) accidentally re-declared it; the
+# top-of-module definition is authoritative.
 
 
 def _audit_write(method, resource, path_params, event, result):
@@ -1379,10 +1432,10 @@ def _list_audit_log(query_params):
 
 
 # ----- Quota (#34 / issue #9, original 79000fa) -----
-QUOTAS_ENABLED = (os.environ.get("QUOTAS_ENABLED", "true").lower() != "false")
-QUOTAS_MAX_VCPU = int(os.environ.get("QUOTAS_MAX_VCPU", 0))
-QUOTAS_MAX_MEM_MB = int(os.environ.get("QUOTAS_MAX_MEM_MB", 0))
-QUOTAS_MAX_DATA_DISK_MB = int(os.environ.get("QUOTAS_MAX_DATA_DISK_MB", 0))
+# QUOTAS_ENABLED / QUOTAS_MAX_* are defined at the top of the module
+# (default disabled, matches README "enabled: false default — no checks").
+# The post-merge regression repair (#48) accidentally re-declared them with
+# a different default; that re-declaration has been removed.
 
 
 def _check_quota(vcpu, mem_mb, data_disk_mb):
@@ -1399,8 +1452,9 @@ def _check_quota(vcpu, mem_mb, data_disk_mb):
 
 
 # ----- SNS lifecycle notifications (#33 / issue #13, original 1f1bffa) -----
-NOTIFICATIONS_TOPIC_ARN = os.environ.get("NOTIFICATIONS_TOPIC_ARN", "")
-sns = boto3.client("sns")
+# NOTIFICATIONS_TOPIC_ARN and the sns client are defined at the top of the
+# module. The post-merge regression repair (#48) accidentally re-bound them;
+# that duplication has been removed.
 
 
 def _publish_event(event_name, tenant_id, details):

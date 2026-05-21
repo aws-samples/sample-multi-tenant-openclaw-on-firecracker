@@ -40,6 +40,14 @@ node_modules/
 # Generated files
 console/config.js
 
+# Config backups
+config.yml.bak
+*.bak
+
+# Agent / IDE state (per-developer)
+.omc/
+.kiro/
+
 # Articles & Blog drafts (not for repo)
 article*.md
 blog*.md

@@ -88,9 +88,13 @@ class TestEnvLoading:
         url = cli._build_url("https://api.example.com/v1/", "/tenants")
         assert url == "https://api.example.com/v1/tenants"
 
-    def test_handles_missing_credentials_gracefully(self, monkeypatch):
+    def test_handles_missing_credentials_gracefully(self, monkeypatch, tmp_path):
         monkeypatch.delenv("OC_API_URL", raising=False)
         monkeypatch.delenv("OC_API_KEY", raising=False)
+        # Isolate from the project's real `.env.deploy`: oc.py walks up from
+        # the cwd looking for one. Run the test inside an empty tmp directory
+        # so the file lookup walks above the project root and finds nothing.
+        monkeypatch.chdir(tmp_path)
         # Force fixture-less behavior; expect _load_env returns (None, None)
         cli = _load_cli()
         api_url, api_key = cli._load_env()
@@ -246,9 +250,12 @@ class TestErrorHandling:
             rc = cli.main(["list"])
         assert rc != 0
 
-    def test_missing_credentials_errors(self, monkeypatch, capsys):
+    def test_missing_credentials_errors(self, monkeypatch, capsys, tmp_path):
         monkeypatch.delenv("OC_API_URL", raising=False)
         monkeypatch.delenv("OC_API_KEY", raising=False)
+        # See test_handles_missing_credentials_gracefully — chdir away from
+        # the project root so oc.py's `.env.deploy` lookup finds nothing.
+        monkeypatch.chdir(tmp_path)
         cli = _load_cli()
         # Force missing-creds path via a method that needs them
         rc = cli.main(["list"])

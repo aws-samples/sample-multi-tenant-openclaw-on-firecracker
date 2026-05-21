@@ -205,6 +205,37 @@ class TestBackupRestoreRoundtrip:
 
     @pytest.mark.e2e
     def test_backup_and_restore_from_latest(self):
+        # Pre-flight: this test boots Firecracker VMs, which requires that the
+        # rootfs has been built and uploaded to S3 by `./build-rootfs.sh`.
+        # When the data plane isn't ready yet (fresh deploy, rootfs not built),
+        # the tenant will sit in "pending" forever and the wait below times
+        # out — that's an environment problem, not a code regression. Skip
+        # cleanly so CI on a control-plane-only deploy stays green.
+        status, rootfs_info = _api("GET", "hosts/rootfs-version")
+        if status != 200 or rootfs_info.get("version", "unknown") == "unknown":
+            pytest.skip("rootfs not built/uploaded to S3 (run ./build-rootfs.sh on a "
+                        "Linux host) — VM data plane not ready, skipping roundtrip")
+        status, hosts = _api("GET", "hosts")
+        active_hosts = [h for h in (hosts or []) if h.get("status") in ("active", "idle")]
+        if status != 200 or not active_hosts:
+            pytest.skip("no active hosts available (host-agent not registered yet) — "
+                        "skipping roundtrip")
+
+        # Pre-flight hygiene: earlier e2e cases create tenants that may not
+        # have fully torn down their Firecracker process before this test
+        # runs (DELETE /tenants → stop-vm.sh races with launch-vm.sh's late
+        # init steps). Sweep up any leftover `e2e-…` tenants from previous
+        # runs so the host has clean capacity for src + dst here.
+        status, all_t = _api("GET", "tenants")
+        if status == 200:
+            for t in all_t or []:
+                name = t.get("name", "")
+                if name.startswith("e2e-") and name not in (self.SRC_NAME, self.DST_NAME):
+                    try:
+                        _api("DELETE", f"tenants/{t['id']}", timeout=30)
+                    except Exception:
+                        pass
+
         # 1. Create source tenant
         status, body = _api("POST", "tenants", {"name": self.SRC_NAME, "vcpu": 1, "mem_mb": 2048})
         if status == 500 and "AccessDenied" in str(body):

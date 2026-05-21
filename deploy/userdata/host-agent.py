@@ -247,9 +247,14 @@ def _write_ddb(results):
                 token = _read_gateway_token(info["guest_ip"])
                 if not token:
                     continue  # Wait for SSH/gateway to be ready
+                # NOTE: `metrics` is a DynamoDB reserved keyword, so it must be
+                # referenced via an ExpressionAttributeNames placeholder (#m).
+                # Same for `status` (#s, already aliased). Without #m the
+                # update_item call returns ValidationException and the tenant
+                # never gets promoted to running.
                 update_expr = ("SET #s = :r, vm_health = :vh, app_health = :ah, "
                                "health_failures = :z, last_health_check = :t, "
-                               "updated_at = :t, gateway_token = :tk, metrics = :m")
+                               "updated_at = :t, gateway_token = :tk, #m = :m")
                 update_vals = {
                     ":r": "running", ":c": "creating",
                     ":vh": info["vm_health"], ":ah": info["app_health"],
@@ -260,7 +265,7 @@ def _write_ddb(results):
                     Key={"id": tid},
                     UpdateExpression=update_expr,
                     ConditionExpression="#s = :c",
-                    ExpressionAttributeNames={"#s": "status"},
+                    ExpressionAttributeNames={"#s": "status", "#m": "metrics"},
                     ExpressionAttributeValues=update_vals,
                 )
                 print(f"promoted {tid} creating → running (token={'yes' if token else 'no'})")
@@ -276,10 +281,12 @@ def _write_ddb(results):
             # Not in creating status — already running. Refresh health + metrics.
             try:
                 if metrics is not None:
+                    # `metrics` is a DDB reserved keyword — alias via #m.
                     table.update_item(
                         Key={"id": tid},
                         UpdateExpression=("SET vm_health = :vh, app_health = :ah, "
-                                          "last_health_check = :t, metrics = :m"),
+                                          "last_health_check = :t, #m = :m"),
+                        ExpressionAttributeNames={"#m": "metrics"},
                         ExpressionAttributeValues={
                             ":vh": info["vm_health"], ":ah": info["app_health"],
                             ":t": now, ":m": metrics,

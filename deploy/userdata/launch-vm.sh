@@ -109,13 +109,27 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
     log "gateway token generated"
   fi
   sudo chown 1000:1000 "${OC_JSON}"
-  # AgentCore Gateway MCP injection (if configured)
+  # AgentCore Gateway MCP injection (if configured).
+  #
+  # OpenClaw 2026.5+ moved MCP servers from a top-level `mcpServers` key to
+  # `mcp.servers.<name>` (verified against `openclaw mcp set` output;
+  # `openclaw mcp list` reads from this same path). The old top-level
+  # location and a brief intermediate `tools.mcpServers` location both
+  # fail config validation now. We write through `.mcp.servers` to match
+  # what the CLI itself uses.
   if [ -f /data/agentcore.env ]; then
     source /data/agentcore.env
     if [ -n "${AGENTCORE_GATEWAY_URL:-}" ]; then
-      jq --arg url "$AGENTCORE_GATEWAY_URL" '.mcpServers["agentcore-gateway"] = {"url": $url, "transport": "streamable-http"}' "${OC_JSON}" > "${OC_JSON}.tmp" && mv "${OC_JSON}.tmp" "${OC_JSON}"
+      jq --arg url "$AGENTCORE_GATEWAY_URL" '
+        (.mcp // {}) as $mcp |
+        .mcp = ($mcp + {
+          "servers": ((($mcp.servers // {})) + {
+            "agentcore-gateway": {"url": $url, "transport": "streamable-http"}
+          })
+        })
+      ' "${OC_JSON}" > "${OC_JSON}.tmp" && mv "${OC_JSON}.tmp" "${OC_JSON}"
       sudo chown 1000:1000 "${OC_JSON}"
-      log "AgentCore Gateway MCP injected: ${AGENTCORE_GATEWAY_URL}"
+      log "AgentCore Gateway MCP injected at .mcp.servers: ${AGENTCORE_GATEWAY_URL}"
     fi
   fi
 fi

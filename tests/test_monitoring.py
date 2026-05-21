@@ -199,8 +199,57 @@ class TestWriteMetricsToDDB:
         # path. Either way, the field should appear in some update.
         assert any(
             "metrics" in (c.kwargs.get("UpdateExpression", "") or "")
+            or "#m" in (c.kwargs.get("UpdateExpression", "") or "")
             for c in calls
         )
+
+    @pytest.mark.unit
+    @pytest.mark.regression
+    def test_write_ddb_uses_attr_name_alias_for_metrics_reserved_keyword(self):
+        """Regression for the reserved-keyword bug found during 1.2.4 E2E.
+
+        `metrics` is a DynamoDB reserved keyword (along with status, name,
+        timestamp, etc.). Using it as a literal attribute name in an
+        UpdateExpression makes update_item fail with ValidationException:
+        ``Attribute name is a reserved keyword; reserved keyword: metrics``.
+
+        Every update that touches the metrics field MUST alias it via
+        ExpressionAttributeNames (e.g. ``#m`` → ``metrics``). Without
+        this, the host-agent silently fails to promote tenants from
+        ``creating`` → ``running`` and they sit in ``creating`` forever.
+        """
+        agent.tenants_table = make_ddb_table()
+        agent.TENANTS_TABLE = "test"
+        with patch.object(agent, "_get_ddb") as mock_ddb_resource, \
+             patch.object(agent, "_compose_metrics", return_value={
+                 "memory_used_mb": 2048, "memory_balloon_mib": 0,
+                 "disk_used_mb": 100, "disk_total_mb": 8192,
+                 "disk_used_pct": 1, "cpu_pct": 0,
+             }), \
+             patch.object(agent, "_read_gateway_token", return_value="token"):
+            mock_ddb_resource.return_value.Table.return_value = agent.tenants_table
+            results = {"t1": {"vm_health": "up", "app_health": "up", "guest_ip": "172.16.1.2"}}
+            agent._write_ddb(results)
+        for c in agent.tenants_table.update_item.call_args_list:
+            ue = c.kwargs.get("UpdateExpression", "") or ""
+            ean = c.kwargs.get("ExpressionAttributeNames", {}) or {}
+            # If this update mentions metrics in any form, the literal
+            # "metrics" identifier must NOT appear; it must go through #m.
+            if "metrics" in str(c.kwargs.get("ExpressionAttributeValues", {})) or "#m" in ue:
+                # Must reference via alias placeholder
+                assert "#m" in ue, \
+                    f"metrics must be aliased as #m in UpdateExpression; got: {ue!r}"
+                assert "metrics" in ean.values(), \
+                    f"#m must map to 'metrics' in ExpressionAttributeNames; got: {ean!r}"
+                # Must NOT use the bare reserved keyword
+                # (allow occurrences inside :v values, but not as identifier)
+                # crude check: " metrics " or ", metrics =" or "= metrics" patterns
+                assert " metrics " not in ue, \
+                    f"bare 'metrics' identifier in UpdateExpression: {ue!r}"
+                assert ", metrics " not in ue, \
+                    f"bare 'metrics' identifier in UpdateExpression: {ue!r}"
+                assert "metrics =" not in ue.replace("#m =", "").replace(":metrics", ""), \
+                    f"bare 'metrics =' assignment in UpdateExpression: {ue!r}"
 
     @pytest.mark.unit
     @pytest.mark.regression

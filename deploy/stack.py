@@ -444,8 +444,10 @@ class OpenClawOrchestratorStack(cdk.Stack):
         ))
 
         # ========== Amazon Managed Prometheus + Grafana (issue #4) ==========
-        # Host-agent exposes /metrics on :9090; an ADOT collector on each host
-        # remote-writes to AMP using SigV4. AMG reads from AMP for dashboards.
+        # Host-agent exposes /metrics on :8899 (same listener as /health);
+        # an ADOT collector on each host remote-writes to AMP using SigV4.
+        # AMG reads from AMP for dashboards. (NOTE: 1.2.5 fixed a wiring
+        # bug where ADOT was scraping :9090 — host-agent never bound 9090.)
         # Cost knob: metrics.enabled: false in config.yml skips both workspaces
         # (AMP is billed per sample/GB, AMG per active user).
         metrics_cfg = CFG.get("metrics", {})

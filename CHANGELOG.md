@@ -9,6 +9,76 @@
 > with the SemVer name; the descriptive tag is kept as an alias on each entry.
 > `pyproject.toml` is **1.2.4** as of the most recent entry.
 
+## [1.2.5] — 2026-05-21
+
+Closes the **observability** gap. The 1.2.4 release verified the data
+plane all the way to "HTTP 200 from CloudFront → ALB → Nginx → Firecracker"
+but never actually checked that AMP / Grafana were receiving samples.
+A live probe today found two stacked bugs that meant zero metrics had
+ever flowed into AMP since the feature shipped (issue #4 / PR #38).
+
+### Fixed (real production bugs found via live AMP probe)
+- **`deploy/userdata/adot-config.yaml` / `host-agent.py` — split-port
+  mismatch.** ADOT was configured to scrape `127.0.0.1:9090`, but
+  `host-agent.py main()` only ever bound the single HTTPServer on
+  `OC_AGENT_PORT` (8899). The agent's own comment block stated the
+  design as "/metrics on the same HTTPServer as /health to avoid a
+  second listener" — so the architecture was correct, the wiring was
+  not. Result: every ADOT scrape since the metrics feature shipped
+  failed with "Failed to scrape Prometheus endpoint". Fix: ADOT now
+  scrapes `127.0.0.1:8899`; the dead `OC_AGENT_PROM_PORT` variable
+  was removed.
+- **`deploy/userdata/host-agent.py` — `_status` did not include the
+  computed metrics.** `_write_ddb()` computed per-VM metrics
+  (`memory_used_mb`, `disk_used_mb`, etc.) and wrote them to DynamoDB,
+  but never assigned them back into the in-memory `info` dict that
+  `_status` is rebuilt from each poll cycle. The `/metrics` endpoint
+  reads `_status`, so it could only ever emit `openclaw_vm_health`
+  (which is derived directly from `vm_health`). Every other gauge
+  was empty in AMP, even when DDB had the values. Fix: mirror the
+  computed `metrics` dict back into `info["metrics"]` before the DDB
+  write so the Prometheus exporter sees it.
+- **`deploy/stack.py` + `tests/test_prometheus.py` + `init-host.sh`
+  — stale `:9090` references.** Comments and assertions still pointed
+  at the never-bound 9090 port. Updated to `:8899` and added two
+  regression tests that fail loudly if either bug recurs:
+  `test_collector_config_has_amp_endpoint` now asserts
+  `127.0.0.1:8899` is the scrape target (and explicitly bans 9090);
+  `test_write_ddb_mirrors_metrics_back_into_status_for_prom_exporter`
+  asserts the back-mirror line stays in `_write_ddb`.
+- **`uv.lock` — bumped `idna` 3.11 → 3.15** to close the medium-severity
+  Dependabot CVE alert (CVE-2024-3651-related; idna < 3.15 lets
+  specially-crafted inputs to `idna.encode()` bypass the original
+  patch). Pure transitive bump (boto3 → urllib3 → idna), no API change.
+  Verified by full unit-test re-run.
+
+### Verified end-to-end on real AWS (live AMP probe, this exact tag)
+- ✅ ADOT collector active + `Everything is ready. Begin running and
+  processing data.` (no more `Failed to scrape Prometheus endpoint`).
+- ✅ `host-agent /metrics` emits all 6 gauges with per-tenant labels
+  (`openclaw_vm_memory_used_mb`, `openclaw_vm_memory_balloon_mib`,
+  `openclaw_vm_disk_used_mb`, `openclaw_vm_disk_total_mb`,
+  `openclaw_vm_disk_used_pct`, `openclaw_vm_health`).
+- ✅ AMP PromQL `query` API returns real values for all 6 gauges
+  (probed via SigV4-signed HTTPS GET). Example: `openclaw_vm_health
+  {tenant="obs-test-366f", instance="i-0bb45368534d350e2"} = 1`.
+- ✅ Grafana workspace `g-5e6517493c` ACTIVE on Grafana 10.4 with
+  AWS_SSO authentication; AMP shows up under PROMETHEUS data sources.
+
+### Test status
+- **386 passed / 0 failed / 0 skipped** locally (1.2.5 adds 2 new
+  regression tests on top of the 1.2.4 baseline of 384).
+
+### Operator notes
+- After upgrading from 1.2.4 → 1.2.5, redeploy the stack and roll the
+  ASG (or push the new `host-agent.py` + `adot-config.yaml` via SSM)
+  to pick up the fixes on existing hosts. New hosts launched by
+  `setup.sh` get the fix automatically.
+- `metrics.enabled: false` (default in `config.yml.example`) skips
+  AMP and Grafana entirely — there is no cost surprise for users
+  who don't opt in.
+
+
 ## [1.2.4] — 2026-05-21
 
 End-to-end microVM validation pass. Closes the long-standing "data plane

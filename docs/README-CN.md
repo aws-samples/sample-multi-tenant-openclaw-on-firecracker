@@ -26,7 +26,7 @@
 
 ## v1.0 功能矩阵
 
-> **最新版本**: [v1.0.2-e2e-fixes](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/releases/tag/v1.0.2-e2e-fixes) (1.2.4 SemVer; 385 / 385 单元测试通过, 0 失败, 0 跳过 —— 控制面 + microVM 数据面都已在真实 AWS 端到端验证, 包括 CloudFront → ALB → Nginx → Firecracker → OpenClaw Gateway 全链路 HTTP 200). 详见 [CHANGELOG.md](../CHANGELOG.md).
+> **最新版本**: [v1.2.5](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/releases/tag/v1.2.5) (386 / 386 单元 + e2e 测试通过, 0 失败, 0 跳过 —— 控制面 + microVM 数据面 + 可观测性都已在真实 AWS 端到端验证, 包括 CloudFront → ALB → Nginx → Firecracker → OpenClaw Gateway 全链路 HTTP 200, 以及 6/6 个 Prometheus gauge 进入 Amazon Managed Prometheus). 详见 [CHANGELOG.md](../CHANGELOG.md).
 
 Q2 2026 里程碑共合并 24 个特性, 每个都有 TDD 覆盖 + 单 issue 回滚 tag.
 

@@ -26,7 +26,7 @@ Multi-tenant isolated deployment of OpenClaw AI agents on AWS using Firecracker 
 
 ## v1.0 Feature Matrix
 
-> **Latest release**: [v1.0.2-e2e-fixes](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/releases/tag/v1.0.2-e2e-fixes) (1.2.4 SemVer; 385 / 385 unit tests passing, 0 failed, 0 skipped — control plane + microVM data plane both end-to-end verified on real AWS, including HTTP 200 from CloudFront → ALB → Nginx → Firecracker → OpenClaw Gateway). See [CHANGELOG.md](CHANGELOG.md) for details.
+> **Latest release**: [v1.2.5](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/releases/tag/v1.2.5) (386 / 386 unit + e2e tests passing, 0 failed, 0 skipped — control plane + microVM data plane + observability all end-to-end verified on real AWS, including HTTP 200 from CloudFront → ALB → Nginx → Firecracker → OpenClaw Gateway, and 6/6 Prometheus gauges flowing into Amazon Managed Prometheus). See [CHANGELOG.md](CHANGELOG.md) for details.
 
 24 features merged in the Q2 2026 milestone, each with TDD coverage and a per-issue rollback tag.
 

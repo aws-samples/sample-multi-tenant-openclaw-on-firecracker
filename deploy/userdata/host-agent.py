@@ -18,19 +18,23 @@ from botocore.config import Config as BotoConfig
 
 POLL_INTERVAL = int(os.environ.get("OC_AGENT_POLL_INTERVAL", "15"))
 PORT = int(os.environ.get("OC_AGENT_PORT", "8899"))
+# Health/control AND Prometheus /metrics are served by the SAME HTTPServer
+# on PORT (8899). The earlier OC_AGENT_PROM_PORT=9090 split-port design was
+# never wired into main(), causing the ADOT collector to fail every scrape
+# (issue #4 regression, fixed in 1.2.5).
 VM_DIR = "/data/firecracker-vms"
 GATEWAY_PORT = 18789
 TENANTS_TABLE = os.environ.get("TENANTS_TABLE", "")
-PROM_PORT = int(os.environ.get("OC_AGENT_PROM_PORT", "9090"))
 
 
 # ═══════════════════════════════════════════
 # Prometheus exporter (issue #4)
 # ═══════════════════════════════════════════
 #
-# Exposes a /metrics endpoint in Prom text-exposition format on port 9090
-# (same HTTPServer as /health to avoid a second listener). An ADOT collector
-# running as a sibling systemd service scrapes this and remote-writes to AMP.
+# Exposes a /metrics endpoint in Prom text-exposition format on the same
+# HTTPServer (and therefore the same PORT, 8899) as /health, to avoid a
+# second listener. An ADOT collector running as a sibling systemd service
+# scrapes 127.0.0.1:8899/metrics and remote-writes to AMP.
 #
 # Why text-format and not the prometheus_client library?
 # - We already have BaseHTTPRequestHandler. Adding prometheus_client just for
@@ -240,6 +244,14 @@ def _write_ddb(results):
                 metrics = _compose_metrics(tid, vm_mem_mb, sock_file, data_file)
             except Exception as e:
                 print(f"compose_metrics {tid}: {e}")
+            # Mirror computed metrics back into the in-memory snapshot so
+            # the Prometheus exporter (/metrics endpoint scraped by ADOT
+            # → AMP) sees the actual per-VM gauges. Without this only
+            # vm_health was being exposed, leaving openclaw_vm_memory_used_mb
+            # / disk_used_mb / disk_used_pct etc. empty in AMP. (Companion
+            # fix to the 8899/9090 port-mismatch — both shipped 1.2.5.)
+            if metrics is not None:
+                info["metrics"] = metrics
 
         try:
             if info["vm_health"] == "up":

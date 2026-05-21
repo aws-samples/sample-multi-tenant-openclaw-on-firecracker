@@ -20,7 +20,7 @@ receivers:
         - job_name: "openclaw-host-agent"
           scrape_interval: 30s
           static_configs:
-            - targets: ["127.0.0.1:9090"]
+            - targets: ["127.0.0.1:8899"]
           relabel_configs:
             # Add the host instance ID as a label so we can group per-host
             - source_labels: [__address__]

@@ -5,9 +5,10 @@
 
 Architecture
 ------------
-host-agent.py exposes Prometheus metrics on :9090/metrics. A systemd-managed
-ADOT (AWS Distro for OpenTelemetry) collector on each host scrapes localhost
-and remote-writes to AMP using SigV4. AMG reads from AMP for dashboards.
+host-agent.py exposes Prometheus metrics on :8899/metrics (same HTTPServer
+as /health to avoid a second listener). A systemd-managed ADOT (AWS Distro
+for OpenTelemetry) collector on each host scrapes localhost and remote-
+writes to AMP using SigV4. AMG reads from AMP for dashboards.
 
 What this PR validates (and what it deliberately does NOT)
 ----------------------------------------------------------
@@ -202,6 +203,24 @@ class TestPromExporter:
         # But health is still exported (0)
         assert 'openclaw_vm_health{tenant="t1"} 0' in text
 
+    def test_write_ddb_mirrors_metrics_back_into_status_for_prom_exporter(self):
+        """Regression for 1.2.5: per-VM metrics computed in _write_ddb()
+        must also be assigned back into the in-memory `info` dict so the
+        /metrics Prometheus endpoint (read from the same dict via _status)
+        actually exposes them. Before the fix only openclaw_vm_health was
+        ever scraped — every other gauge was empty in AMP because _status
+        only ever held the bare _probe_all() output."""
+        import inspect
+        src = inspect.getsource(agent._write_ddb)
+        # The function MUST assign metrics back into info before / alongside
+        # the DDB write. We don't care about the exact phrasing, only that
+        # the assignment exists.
+        assert "info[\"metrics\"] = metrics" in src or 'info["metrics"] = metrics' in src, (
+            "_write_ddb must mirror computed metrics back into info[] so the "
+            "Prometheus exporter sees them. See deploy/userdata/host-agent.py "
+            "comment block referencing 1.2.5 + the AMP scrape fix."
+        )
+
 
 @pytest.mark.unit
 class TestPromHTTP:
@@ -234,14 +253,25 @@ class TestADOTConfig:
             "init-host.sh must install the ADOT collector"
 
     def test_collector_config_has_amp_endpoint(self):
-        """The shipped collector YAML references AMP remote_write + sigv4."""
+        """The shipped collector YAML references AMP remote_write + sigv4
+        and scrapes the host-agent on the SAME port that host-agent listens
+        on (8899). Regression guard for the 1.2.4 split-port mismatch where
+        ADOT was scraping :9090 but host-agent only ever bound :8899."""
         cfg = ROOT / "deploy" / "userdata" / "adot-config.yaml"
         assert cfg.exists(), "ADOT collector config missing"
         text = cfg.read_text()
         assert "prometheusremotewrite" in text or "awsprometheusremotewrite" in text
         assert "sigv4" in text.lower()
-        # Must scrape the local host-agent
-        assert "9090" in text
+        # Must scrape the local host-agent on the port host-agent ACTUALLY
+        # listens on (PORT, defaulting to 8899). The earlier 9090 wiring
+        # never received a single sample.
+        assert "127.0.0.1:8899" in text, (
+            "ADOT must scrape host-agent on :8899 (the only port the agent "
+            "actually binds — see deploy/userdata/host-agent.py main())"
+        )
+        assert "127.0.0.1:9090" not in text, (
+            "Stale 9090 scrape target — host-agent does not bind 9090"
+        )
 
 
 # ═══════════════════════════════════════════

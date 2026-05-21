@@ -114,9 +114,9 @@ aws s3 cp s3://{{ASSETS_BUCKET}}/deployment/scripts/host-agent.py /opt/openclaw/
 systemctl daemon-reload
 systemctl enable host-agent
 systemctl start host-agent
-log "host agent started on :8899 (health) and :9090 (prom metrics)"
+log "host agent started on :8899 (health + prom metrics)"
 
-# AWS Distro for OpenTelemetry (ADOT) collector — scrapes localhost:9090
+# AWS Distro for OpenTelemetry (ADOT) collector — scrapes localhost:8899/metrics
 # and remote-writes to Amazon Managed Prometheus (issue #4). Skipped if
 # AMP_REMOTE_WRITE_URL is unset (metrics.enabled: false in config.yml).
 AMP_REMOTE_WRITE_URL="{{AMP_REMOTE_WRITE_URL}}"

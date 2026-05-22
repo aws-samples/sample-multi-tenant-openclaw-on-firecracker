@@ -26,7 +26,7 @@
 
 ## v1.2 功能矩阵
 
-> **最新版本**: [v1.2.5](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/releases/tag/v1.2.5) (386 / 386 单元 + e2e 测试通过, 0 失败, 0 跳过 —— 控制面 + microVM 数据面 + 可观测性都已在真实 AWS 端到端验证, 包括 CloudFront → ALB → Nginx → Firecracker → OpenClaw Gateway 全链路 HTTP 200, 以及 6/6 个 Prometheus gauge 进入 Amazon Managed Prometheus). 详见 [CHANGELOG.md](../CHANGELOG.md).
+> **最新版本**: [见 GitHub Releases](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/releases/latest). 详见 [CHANGELOG.md](../CHANGELOG.md).
 
 Q2 2026 里程碑共合并 24 个特性, 每个都有 TDD 覆盖 + 单 issue 回滚 tag.
 
@@ -52,7 +52,6 @@ Q2 2026 里程碑共合并 24 个特性, 每个都有 TDD 覆盖 + 单 issue 回
 | | Graviton (ARM64) 主机支持 | [#19] | [#44] |
 | | Firecracker 快照/恢复实时 VM 迁移 | [#20] | [#45] |
 | **开发体验** | 统一 `oc` CLI | [#21] | [#40] |
-| | LocalStack + 桩 host-agent 本地开发模式 | [#24] | [#46] |
 | **部署** | Terraform 模块 (与 CDK core 对齐) | [#18] | [#43] |
 
 [#3]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/3

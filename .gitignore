@@ -8,6 +8,7 @@ Thumbs.db
 .env
 .env.*
 .dev
+local-dev
 config.yml
 openclaw.json
 

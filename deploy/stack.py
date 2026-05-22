@@ -1028,6 +1028,7 @@ function handler(event) {
             "AssetsBucket": assets_bucket.bucket_name,
             "HostInstanceProfileArn": instance_profile.attr_arn,
             "DashboardUrl": f"https://{dashboard_host}",
+            "CloudfrontDistributionId": cf_distribution.distribution_id,
             **({"NotificationsTopicArn": notifications_topic_arn} if notifications_topic_arn else {}),
             **cognito_outputs,
         }.items():

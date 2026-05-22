@@ -26,7 +26,7 @@ Multi-tenant isolated deployment of OpenClaw AI agents on AWS using Firecracker 
 
 ## v1.2 Feature Matrix
 
-> **Latest release**: [v1.2.5](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/releases/tag/v1.2.5) (386 / 386 unit + e2e tests passing, 0 failed, 0 skipped — control plane + microVM data plane + observability all end-to-end verified on real AWS, including HTTP 200 from CloudFront → ALB → Nginx → Firecracker → OpenClaw Gateway, and 6/6 Prometheus gauges flowing into Amazon Managed Prometheus). See [CHANGELOG.md](CHANGELOG.md) for details.
+> **Latest release**: [see GitHub Releases](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/releases/latest). See [CHANGELOG.md](CHANGELOG.md) for details.
 
 24 features merged in the Q2 2026 milestone, each with TDD coverage and a per-issue rollback tag.
 
@@ -52,7 +52,6 @@ Multi-tenant isolated deployment of OpenClaw AI agents on AWS using Firecracker 
 | | Graviton (ARM64) host support | [#19] | [#44] |
 | | Live VM migration via Firecracker snapshot/restore | [#20] | [#45] |
 | **DevX** | Unified `oc` CLI | [#21] | [#40] |
-| | Local development mode with LocalStack + stub host-agent | [#24] | [#46] |
 | **Deployment** | Terraform module at parity with CDK core | [#18] | [#43] |
 
 [#3]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/3

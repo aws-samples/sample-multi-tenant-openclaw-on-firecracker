@@ -105,6 +105,14 @@ th { text-align: left; padding: 8px 10px; color: var(--cyan); border-bottom: 1px
 td { padding: 8px 10px; border-bottom: 1px solid #1a2332; white-space: nowrap; }
 tr:hover td { background: #0ff1; }
 .health-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+/* Disk column — bar on top, exact "used/total (pct%)" text below */
+.disk-cell { display: flex; flex-direction: column; gap: 3px; min-width: 100px; }
+.disk-track { height: 5px; background: #1a2332; border-radius: 2px; overflow: hidden; }
+.disk-fill { height: 100%; transition: width .3s; }
+.disk-text { font-size: 11px; color: var(--cyan-dim); white-space: nowrap; }
+.metric-ok   { background: var(--cyan-dim); }
+.metric-warn { background: #fb3; box-shadow: 0 0 4px #fb38; }
+.metric-crit { background: var(--red);  box-shadow: 0 0 4px #f448; }
 .health-up { background: var(--green); box-shadow: 0 0 6px var(--green); }
 .health-down { background: var(--red); box-shadow: 0 0 6px var(--red); }
 .health-unknown { background: var(--gray); }
@@ -137,6 +145,9 @@ tr:hover td { background: #0ff1; }
   padding: 8px 12px; border-radius: 4px; font-size: 13px; margin-bottom: 14px;
 }
 .modal input:focus { outline: none; border-color: var(--cyan); box-shadow: 0 0 8px #0ff2; }
+.modal input.invalid { border-color: var(--red); box-shadow: 0 0 8px #f442; }
+.modal .hint { font-size: 11px; color: #667; margin: -10px 0 14px 2px; }
+.modal .hint.err { color: var(--red); }
 .modal-actions { display: flex; gap: 12px; justify-content: flex-end; margin-top: 6px; }
 .modal .close-btn { position: absolute; top: 12px; right: 14px; background: none; border: none; color: var(--cyan); font-size: 20px; cursor: pointer; }
 
@@ -152,3 +163,11 @@ tr:hover td { background: #0ff1; }
 .settings-input:focus { outline:none; border-color:var(--cyan); box-shadow:0 0 8px #0ff2; }
 .btn-toggle-pw { position:absolute; right:8px; top:50%; transform:translateY(-50%); background:none; border:none; cursor:pointer; padding:2px; color:var(--text); }
 .btn-toggle-pw:hover { color:var(--cyan); }
+
+/* Scrollbars — match the dark/cyan theme */
+* { scrollbar-width: thin; scrollbar-color: #0ff4 var(--panel); }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: var(--panel); }
+::-webkit-scrollbar-thumb { background: #0ff4; border: 2px solid var(--panel); border-radius: 5px; }
+::-webkit-scrollbar-thumb:hover { background: var(--cyan-dim); }
+::-webkit-scrollbar-corner { background: var(--panel); }

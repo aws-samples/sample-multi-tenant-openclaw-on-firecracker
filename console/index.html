@@ -182,8 +182,8 @@
         <table>
           <thead>
             <tr>
-              <th>ID</th><th>Name</th><th>Status</th><th>Tags</th><th>vCPU</th><th>Mem (MB)</th><th>Guest IP</th>
-              <th>Port</th><th>Host ID</th><th>Rootfs</th><th>VM Health</th><th>Gateway</th><th>Actions</th>
+              <th>ID</th><th>Name</th><th>Status</th><th>Tags</th><th>vCPU</th><th>Mem (MB)</th><th>Disk</th><th>Guest IP</th>
+              <th>Port</th><th>Rootfs</th><th>VM Health</th><th>Gateway</th><th>Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -202,13 +202,18 @@
                 </td>
                 <td x-text="t.vcpu"></td>
                 <td x-text="t.mem_mb"></td>
+                <td>
+                  <div class="disk-cell" x-show="t.status==='running' && t.metrics">
+                    <div class="disk-track"><div class="disk-fill" :class="metricLevel(_n(t.metrics?.disk_used_pct))" :style="'width:'+_n(t.metrics?.disk_used_pct)+'%'"></div></div>
+                    <span class="disk-text" x-text="diskText(t)"></span>
+                  </div>
+                  <span x-show="t.status!=='running' || !t.metrics" style="color:#445;font-size:11px">—</span>
+                </td>
                 <td x-text="t.guest_ip || '-'"></td>
                 <td x-text="t.host_port || '-'"></td>
-                <td x-text="(t.host_id||'').substring(0,12)+'…'"></td>
                 <td style="font-size:11px;color:var(--gray)" x-text="t.rootfs_version||'-'"></td>
                 <td><span class="health-dot" :class="healthClass(t.vm_health, t.status)"></span></td>
                 <td><span class="health-dot" :class="healthClass(t.app_health, t.status)"></span></td>
-                <td style="font-size:11px;color:var(--gray);white-space:nowrap" x-text="formatMetrics(t.metrics)"></td>
                 <td>
                   <div class="act-group">
                     <button class="btn-act" title="oc-connect.sh command" @click="copyCmd('./scripts/oc-connect.sh '+t.id)"><svg class="icon s13"><use href="#i-terminal"/></svg></button>
@@ -452,7 +457,11 @@
         </div>
       </template>
       <label>Name <span class="req">*</span></label>
-      <input type="text" x-model="form.name" placeholder="e.g. my-tenant" @keydown.enter="createTenant()">
+      <input type="text" x-model="form.name" placeholder="e.g. my-tenant"
+             maxlength="32" @keydown.enter="!nameError && createTenant()"
+             :class="{'invalid': form.name && nameError}">
+      <div class="hint" :class="{'err': form.name && nameError}"
+           x-text="form.name && nameError ? nameError : '1–32 chars: lowercase letters, digits, hyphens (no leading/trailing hyphen)'"></div>
       <label>vCPU <span class="opt">optional</span></label>
       <input type="number" x-model.number="form.vcpu" placeholder="2">
       <label>Memory (MB) <span class="opt">optional</span></label>
@@ -469,7 +478,7 @@
                 style="width:100%;background:#0a0e17;border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:4px;font-size:12px;font-family:monospace;height:60px;margin-bottom:14px;resize:vertical"></textarea>
       <div class="modal-actions">
         <button class="btn btn-cyan" @click="closeCreateModal()">Cancel</button>
-        <button class="btn btn-create" @click="createTenant()" :disabled="!form.name" x-text="restoreSource ? 'Create from Backup' : 'Create'"></button>
+        <button class="btn btn-create" @click="createTenant()" :disabled="!form.name || !!nameError" x-text="restoreSource ? 'Create from Backup' : 'Create'"></button>
       </div>
     </div>
   </div>
@@ -536,8 +545,18 @@ function app() {
       catch { this.connected = false; }
       this.loadingTenants = false;
     },
+    // Mirror of API _NAME_RE in deploy/lambda/api/handler.py — keep in sync.
+    get nameError() {
+      const n = (this.form.name || '').trim();
+      if (!n) return '';
+      if (n.length > 32) return 'Name exceeds 32 characters';
+      if (!/^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$/.test(n)) {
+        return 'Name must be lowercase letters, digits, or hyphens (no leading/trailing hyphen)';
+      }
+      return '';
+    },
     async createTenant() {
-      if (!this.form.name) return;
+      if (!this.form.name || this.nameError) return;
       const body = { name: this.form.name };
       if (this.form.vcpu) body.vcpu = this.form.vcpu;
       if (this.form.memory_mb) body.mem_mb = this.form.memory_mb;
@@ -699,6 +718,22 @@ function app() {
       // Only running tenants have meaningful live health; others show grey.
       if (status && status !== 'running') return 'health-unknown';
       return v === 'up' ? 'health-up' : v === 'down' ? 'health-down' : 'health-unknown';
+    },
+    // host-agent.py: cpu_pct is a stub (always 0) and balloon stats often report
+    // available_memory=0, making memory_used_mb unreliable. Only disk_* are
+    // trustworthy today. DDB returns Number attributes as strings → coerce.
+    _n(v) { return Number(v) || 0; },
+    metricLevel(pct) {
+      return pct >= 90 ? 'metric-crit' : pct >= 70 ? 'metric-warn' : 'metric-ok';
+    },
+    diskText(t) {
+      const m = t.metrics;
+      if (!m) return '';
+      const fmt = mb => mb >= 1024 ? (mb/1024).toFixed(1)+'G' : mb+'M';
+      const used = this._n(m.disk_used_mb);
+      const total = this._n(m.disk_total_mb);
+      const pct = this._n(m.disk_used_pct);
+      return `${fmt(used)}/${fmt(total)} (${pct}%)`;
     },
     role() {
       // RBAC (issue #14): inspect the JWT id_token, return the most-privileged

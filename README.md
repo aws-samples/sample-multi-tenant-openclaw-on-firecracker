@@ -24,7 +24,7 @@ Multi-tenant isolated deployment of OpenClaw AI agents on AWS using Firecracker 
 - **Config Templates** — Custom OpenClaw configuration templates for different LLM providers/models, selectable when creating tenants
 - **Default Toolchain** — Each VM comes with Python3/uv/git/gh/Node.js/htop/tmux/tree pre-installed
 
-## v1.0 Feature Matrix
+## v1.2 Feature Matrix
 
 > **Latest release**: [v1.2.5](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/releases/tag/v1.2.5) (386 / 386 unit + e2e tests passing, 0 failed, 0 skipped — control plane + microVM data plane + observability all end-to-end verified on real AWS, including HTTP 200 from CloudFront → ALB → Nginx → Firecracker → OpenClaw Gateway, and 6/6 Prometheus gauges flowing into Amazon Managed Prometheus). See [CHANGELOG.md](CHANGELOG.md) for details.
 
@@ -77,6 +77,25 @@ Multi-tenant isolated deployment of OpenClaw AI agents on AWS using Firecracker 
 [#22]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/22
 [#23]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/23
 [#24]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/24
+
+## Upgrade Guide
+
+Upgrading a new version typically involves **two layers**: control plane (CDK stack) and data plane (rootfs + host-agent). The control plane is updated by redeploying; the data plane requires rebuilding the rootfs.
+
+### Standard procedure (any version)
+
+```bash
+git pull                                  # pull latest main
+git diff HEAD@{1} HEAD -- config.yml.example   # check for new config keys
+# If new keys exist, merge them into your local config.yml manually
+
+./setup.sh <region> <profile>             # redeploy CDK stack (idempotent)
+
+# Rebuild rootfs (see "Quick Start" Step 3)
+source .env.deploy && ./build-rootfs.sh <new_version>
+
+# New tenants use the new rootfs immediately; existing tenants need a reset API call to switch over
+```
 
 ## Quick Start
 

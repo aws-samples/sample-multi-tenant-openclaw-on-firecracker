@@ -7,7 +7,25 @@
 > The SemVer-authoritative version ladder for this cycle is
 > `1.2.0 → 1.2.1 → 1.2.2 → 1.2.3 → 1.2.4` and the entries below are headed
 > with the SemVer name; the descriptive tag is kept as an alias on each entry.
-> `pyproject.toml` is **1.2.4** as of the most recent entry.
+> `pyproject.toml` is **1.2.6** as of the most recent entry.
+
+## [1.2.6] — 2026-05-22
+
+### Fixed
+- **`refresh_rootfs()`: 0-byte rootfs hotfix.** Decompress now writes to a `.tmp` sibling, checks `[ -s ]`, then atomically `mv`s — replaces a `pigz -dc > rootfs.ext4` redirect that could leave a 0-byte file on any pigz failure, blocking new tenant creates.
+- **API: tenant name validation.** `_validate_name()` rejects names that aren't DNS-label safe (`^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$`). Previously, names with spaces or uppercase were accepted but couldn't be deleted via the API path.
+
+### Changed
+- **Cognito: import-and-recreate.** When `console_auth.user_pool_id` is set, the stack imports the pool but recreates `UserPoolDomain` + `UserPoolClient` as stack-owned resources (was: assumed to already exist, producing drift). Existing user accounts unchanged. Removes the `console_auth.user_pool_client_id` config key.
+- **Audit table: per-deploy naming.** Table name now suffixed with `Aws.STACK_ID` first segment (e.g. `openclaw-audit-log-a63eaa70`). Prevents collision on `cdk destroy` + redeploy. **One-time table replacement on upgrade** — old table preserved as orphan; delete it manually if history isn't needed.
+
+### Added
+- **`scripts/cleanup-bad-name-tenants.sh`** — removes legacy bad-name tenants (SSM stop-vm + dir cleanup, ALB rule, host counters, DDB mark deleted). Supports `--dry-run` / `--yes`.
+
+### Operator notes
+- Upgrade is a single `./setup.sh <region> <profile>`.
+- If you have legacy tenants with spaces or uppercase in their names, run `./scripts/cleanup-bad-name-tenants.sh <region> <profile> --dry-run` to preview, then drop `--dry-run` to clean up.
+
 
 ## [1.2.5] — 2026-05-21
 

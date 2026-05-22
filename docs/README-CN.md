@@ -24,7 +24,7 @@
 - **配置模板** — 自定义 OpenClaw 配置模板（支持不同 LLM 提供商/模型），创建租户时可选模板
 - **默认工具链** — 每个 VM 预装 Python3/uv/git/gh/Node.js/htop/tmux/tree 等开发工具
 
-## v1.0 功能矩阵
+## v1.2 功能矩阵
 
 > **最新版本**: [v1.2.5](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/releases/tag/v1.2.5) (386 / 386 单元 + e2e 测试通过, 0 失败, 0 跳过 —— 控制面 + microVM 数据面 + 可观测性都已在真实 AWS 端到端验证, 包括 CloudFront → ALB → Nginx → Firecracker → OpenClaw Gateway 全链路 HTTP 200, 以及 6/6 个 Prometheus gauge 进入 Amazon Managed Prometheus). 详见 [CHANGELOG.md](../CHANGELOG.md).
 
@@ -77,6 +77,25 @@ Q2 2026 里程碑共合并 24 个特性, 每个都有 TDD 覆盖 + 单 issue 回
 [#22]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/22
 [#23]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/23
 [#24]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/24
+
+## 升级指南
+
+升级新版本通常涉及**两个层面**: 控制面 (CDK stack) 和数据面 (rootfs + host-agent). 控制面通过重新部署更新，数据面需要重建 rootfs.
+
+### 通用流程 (任意版本)
+
+```bash
+git pull                                  # 拉取最新 main
+git diff HEAD@{1} HEAD -- config.yml.example   # 检查是否有新增配置项
+# 如有新增 key, 手动合并到本地 config.yml
+
+./setup.sh <region> <profile>             # 重新部署 CDK stack (幂等)
+
+# 重建 rootfs (详见 "快速开始" Step 3)
+source .env.deploy && ./build-rootfs.sh <new_version>
+
+# 新建租户立刻使用新 rootfs; 已有租户需调用 reset API 才会切换
+```
 
 ## 快速开始
 

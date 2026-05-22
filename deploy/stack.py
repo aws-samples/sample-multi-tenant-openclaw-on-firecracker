@@ -55,10 +55,18 @@ class OpenClawOrchestratorStack(cdk.Stack):
         # Issue #17 — Audit log table. Single-partition by design (`pk="audit"`)
         # for time-range queries; ts as sort key. DDB TTL auto-expires entries
         # after `audit.retention_days` (default 90).
+        # Table name carries a per-deploy suffix derived from Aws.STACK_ID so
+        # that `cdk destroy` + redeploy never collides with the RETAIN-ed
+        # orphan table from the previous stack incarnation.
         audit_cfg = CFG.get("audit", {}) or {}
         audit_retention_days = int(audit_cfg.get("retention_days", 90))
+        # Aws.STACK_ID format: arn:aws:cloudformation:<region>:<acct>:stack/<name>/<uuid>
+        # Take the first 5 hex chars of the UUID's leading segment as the suffix.
+        stack_uuid = Fn.select(2, Fn.split("/", cdk.Aws.STACK_ID))
+        audit_suffix = Fn.select(0, Fn.split("-", stack_uuid))
         audit_table = dynamodb.Table(self, "AuditLog",
-            table_name="openclaw-audit-log",
+            # Final name e.g. openclaw-audit-log-a1b2c3d4 (UUID first segment, 8 hex)
+            table_name=Fn.join("-", ["openclaw-audit-log", audit_suffix]),
             partition_key=dynamodb.Attribute(name="pk", type=dynamodb.AttributeType.STRING),
             sort_key=dynamodb.Attribute(name="ts", type=dynamodb.AttributeType.STRING),
             billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
@@ -929,12 +937,42 @@ function handler(event) {
         cognito_outputs = {}
         if auth_cfg.get("enabled", False):
             existing_pool_id = auth_cfg.get("user_pool_id", "")
-            existing_client_id = auth_cfg.get("user_pool_client_id", "")
 
-            if existing_pool_id and existing_client_id:
+            # Callback URLs are needed by both branches
+            cf_default = cf_distribution.distribution_domain_name
+            callback_urls = [f"https://{cf_default}/console/index.html"]
+            if custom_domain:
+                callback_urls.append(f"https://{custom_domain}/console/index.html")
+
+            if existing_pool_id:
+                # Import the existing pool but recreate the domain + client as stack-owned resources.
                 user_pool = cognito.UserPool.from_user_pool_id(self, "ConsoleUserPool", existing_pool_id)
                 cognito_outputs["CognitoUserPoolId"] = existing_pool_id
-                cognito_outputs["CognitoClientId"] = existing_client_id
+
+                # Legacy prefix (no account suffix) matches what 1.1.x created,
+                # so existing users' bookmarked Cognito URLs keep working.
+                domain_prefix = "openclaw-console"
+                cognito.CfnUserPoolDomain(self, "ConsoleDomain",
+                    user_pool_id=existing_pool_id,
+                    domain=domain_prefix,
+                )
+                cfn_client = cognito.CfnUserPoolClient(self, "ConsoleClient",
+                    user_pool_id=existing_pool_id,
+                    generate_secret=False,
+                    callback_ur_ls=callback_urls,
+                    logout_ur_ls=callback_urls,
+                    supported_identity_providers=["COGNITO"],
+                    allowed_o_auth_flows=["implicit"],
+                    allowed_o_auth_scopes=["openid", "email"],
+                    allowed_o_auth_flows_user_pool_client=True,
+                    explicit_auth_flows=[
+                        "ALLOW_USER_PASSWORD_AUTH",
+                        "ALLOW_USER_SRP_AUTH",
+                        "ALLOW_REFRESH_TOKEN_AUTH",
+                    ],
+                )
+                cognito_outputs["CognitoClientId"] = cfn_client.ref
+                cognito_outputs["CognitoDomain"] = f"{domain_prefix}.auth.{self.region}.amazoncognito.com"
             else:
                 user_pool = cognito.UserPool(self, "ConsoleUserPool",
                     user_pool_name="openclaw-console",
@@ -945,12 +983,6 @@ function handler(event) {
                     ),
                     removal_policy=RemovalPolicy.RETAIN,
                 )
-                # Include both the CloudFront default domain (for testing/fallback)
-                # and the custom domain (if configured) so both URLs work.
-                cf_default = cf_distribution.distribution_domain_name
-                callback_urls = [f"https://{cf_default}/console/index.html"]
-                if custom_domain:
-                    callback_urls.append(f"https://{custom_domain}/console/index.html")
                 user_pool.add_domain("ConsoleDomain",
                     cognito_domain=cognito.CognitoDomainOptions(
                         # account_id suffix keeps the domain prefix globally

@@ -52,7 +52,7 @@ asg:
   lifecycle_hook_timeout: 600
   use_spot: false
 
-# ========== Multi-AZ HA (issue #8) ==========
+# ========== Multi-AZ HA ==========
 # 跨 AZ 部署 ASG + ALB 实现高可用. 默认关闭 (single AZ 减少跨 AZ 数据传输费用).
 # 启用后 az_count 控制最多使用几个 AZ; 实际数量受 region 可用 AZ 数限制.
 multi_az:
@@ -95,8 +95,7 @@ agentcore:
 console_auth:
   enabled: false                   # 开启后 Console 需要 Cognito 登录
   self_sign_up: false              # 允许用户自注册
-  # user_pool_id: ""              # 已有 User Pool ID，留空自动创建
-  # user_pool_client_id: ""       # 已有 App Client ID
+  # user_pool_id: ""              # 复用已有 User Pool（留空自动创建）
 
 # ========== CloudFront 自定义域名 (可选) ==========
 # 可通过 ./setup.sh <region> <profile> --domain <domain> --cert <acm-arn> 一键配置

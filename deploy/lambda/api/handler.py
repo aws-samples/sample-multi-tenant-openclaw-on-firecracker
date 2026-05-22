@@ -4,6 +4,7 @@
 import json
 import hashlib
 import os
+import re
 import time
 import boto3
 
@@ -221,6 +222,9 @@ def create_tenant(body=None):
     body = json.loads(body) if isinstance(body, str) else body
 
     name = body.get("name", "")
+    name_err = _validate_name(name)
+    if name_err:
+        return _resp(400, {"error": name_err})
     vcpu = int(body.get("vcpu", VM_DEFAULT_VCPU))
     mem_mb = int(body.get("mem_mb", VM_DEFAULT_MEM))
     data_disk_mb = int(body.get("data_disk_mb", VM_DATA_DISK_MB))
@@ -916,24 +920,40 @@ def refresh_rootfs():
 
     ids = [h["instance_id"] for h in hosts]
     assets = "/data/firecracker-assets"
-    cmds = [
-        f"aws s3 cp s3://{bucket}/{prefix}/manifest.json {assets}/manifest.json --region {region}",
-        f"aws s3 cp s3://{bucket}/{prefix}/{manifest['rootfs']} {assets}/rootfs.gz --region {region}",
-        f"aws s3 cp s3://{bucket}/{prefix}/{manifest['data_template']} {assets}/data.gz --region {region}",
-        f"pigz -dc {assets}/rootfs.gz > {assets}/openclaw-rootfs.ext4 && rm -f {assets}/rootfs.gz",
-        f"pigz -dc {assets}/data.gz > {assets}/openclaw-data-template.ext4 && rm -f {assets}/data.gz",
-        f"fallocate --dig-holes {assets}/openclaw-data-template.ext4",
-    ]
+    # Decompress to .tmp then rename — `pigz -dc src > dst` truncates dst at
+    # redirect time, so a mid-pipe failure leaves a 0-byte rootfs that boots
+    # silently into a kernel panic (issue surfaced 2026-05-22 on a v3.5 push).
+    script = f"""
+set -euo pipefail
+ASSETS={assets}
+BUCKET={bucket}
+PREFIX={prefix}
+REGION={region}
+ROOTFS_GZ={manifest['rootfs']}
+DATA_GZ={manifest['data_template']}
+aws s3 cp "s3://$BUCKET/$PREFIX/manifest.json" "$ASSETS/manifest.json" --region "$REGION"
+aws s3 cp "s3://$BUCKET/$PREFIX/$ROOTFS_GZ" "$ASSETS/rootfs.gz" --region "$REGION"
+aws s3 cp "s3://$BUCKET/$PREFIX/$DATA_GZ" "$ASSETS/data.gz" --region "$REGION"
+pigz -dc "$ASSETS/rootfs.gz" > "$ASSETS/openclaw-rootfs.ext4.tmp"
+[ -s "$ASSETS/openclaw-rootfs.ext4.tmp" ]
+mv "$ASSETS/openclaw-rootfs.ext4.tmp" "$ASSETS/openclaw-rootfs.ext4"
+rm -f "$ASSETS/rootfs.gz"
+pigz -dc "$ASSETS/data.gz" > "$ASSETS/openclaw-data-template.ext4.tmp"
+[ -s "$ASSETS/openclaw-data-template.ext4.tmp" ]
+mv "$ASSETS/openclaw-data-template.ext4.tmp" "$ASSETS/openclaw-data-template.ext4"
+rm -f "$ASSETS/data.gz"
+fallocate --dig-holes "$ASSETS/openclaw-data-template.ext4"
+""".strip()
     try:
         ssm.send_command(
             InstanceIds=ids,
             DocumentName="AWS-RunShellScript",
-            Parameters={"commands": cmds, "executionTimeout": ["300"]},
+            Parameters={"commands": [script], "executionTimeout": ["600"]},
         )
     except Exception as e:
         return _resp(500, {"error": str(e)})
 
-    # Update hosts table with new version
+    # Mark version as in-flight; host-agent confirms after files are on disk.
     for host_id in ids:
         hosts_table.update_item(
             Key={"instance_id": host_id},
@@ -1231,6 +1251,23 @@ def _now():
 _TAG_MAX_KEY_LEN = 50
 _TAG_MAX_VALUE_LEN = 100
 _TAG_MAX_COUNT = 20
+
+
+_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$")
+
+
+def _validate_name(name):
+    """Tenant name: lowercase DNS-label. Drives the tenant id, which gets
+    embedded in URLs, Firecracker socket paths, and ALB rule conditions —
+    all of which choke on whitespace or special chars."""
+    if not isinstance(name, str) or not name:
+        return "name is required"
+    if len(name) > 32:
+        return "name exceeds 32 characters"
+    if not _NAME_RE.match(name):
+        return ("name must match ^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$ "
+                "(lowercase letters, digits, hyphens; cannot start/end with hyphen)")
+    return None
 
 
 def _validate_tags(tags):

@@ -58,6 +58,43 @@ print(f"✓ config.yml updated (custom_domain={os.environ.get('DOMAIN','<unchang
 PYEOF
 fi
 
+# Auto-detect existing Cognito pool from prior deploy (1.1.x → 1.2.x upgrade path).
+# 1.2.x changed the UserPoolDomain prefix; importing the pool keeps users from
+# losing their accounts. The stack always recreates the domain + client itself,
+# so only user_pool_id needs to be carried forward.
+EXISTING_POOL=$(aws cloudformation describe-stacks --stack-name OpenClawOrchestrator \
+  --query 'Stacks[0].Outputs[?OutputKey==`CognitoUserPoolId`].OutputValue' \
+  --output text --profile "$PROFILE" --region "$REGION" 2>/dev/null || true)
+if [ -n "${EXISTING_POOL:-}" ] && [ "$EXISTING_POOL" != "None" ]; then
+  POOL="$EXISTING_POOL" python3 - <<'PYEOF'
+import os, re, pathlib
+cfg_path = pathlib.Path("config.yml")
+text = cfg_path.read_text()
+pool = os.environ["POOL"]
+
+def current_value(key):
+    m = re.search(rf'^\s*{re.escape(key)}:\s*"([^"]*)"', text, re.MULTILINE)
+    return m.group(1) if m else None
+
+if current_value("user_pool_id") == pool:
+    raise SystemExit(0)
+
+def upsert(text, key, val):
+    pat = re.compile(rf'^(\s*){re.escape(key)}:\s*"[^"]*"\s*(?:#.*)?$', re.MULTILINE)
+    if pat.search(text):
+        return pat.sub(rf'\g<1>{key}: "{val}"', text, count=1)
+    cpat = re.compile(rf'^(\s*)#\s*{re.escape(key)}:\s*"[^"]*"\s*(?:#.*)?$', re.MULTILINE)
+    if cpat.search(text):
+        return cpat.sub(rf'\g<1>{key}: "{val}"', text, count=1)
+    return re.sub(r'(^console_auth:\s*\n(?:[ \t]+.*\n)*)',
+                  rf'\g<1>  {key}: "{val}"\n', text, count=1, flags=re.MULTILINE)
+
+text = upsert(text, "user_pool_id", pool)
+cfg_path.write_text(text)
+print(f"✓ config.yml: imported existing Cognito pool {pool[:25]}… (1.1.x → 1.2.x upgrade path)")
+PYEOF
+fi
+
 PATH=".venv/bin:$PATH" cdk deploy -c region="$REGION" --profile "$PROFILE" --require-approval never ${CDK_ARGS[@]+"${CDK_ARGS[@]}"}
 
 # Upload scripts to S3 (after deploy creates the bucket)

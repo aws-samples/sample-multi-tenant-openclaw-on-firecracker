@@ -247,6 +247,34 @@ s3://{bucket}/skills/
 2. 下一轮确认仍空闲且 ASG 实例数 > min → 终止实例
 3. 期间如有新租户分配到该宿主机 → 自动恢复 `active`，取消回收
 
+## 可观测性（可选）
+
+当 `config.yml` 中 `metrics.enabled: true` 时，CDK 会一并创建 Amazon Managed Prometheus (AMP) 工作区和 Amazon Managed Grafana (AMG) 工作区。每台宿主机上 ADOT collector 作为独立 systemd 服务运行，每 30 秒抓取一次 host-agent 的 `/metrics` 端点，通过 SigV4 签名 remote-write 到 AMP（**无需静态密钥**）。
+
+每个 VM 暴露的 Prometheus gauge（带 `tenant=<租户ID>` 和 `instance=<宿主机ID>` 标签）：
+
+```
+openclaw_vm_memory_used_mb        openclaw_vm_disk_used_mb
+openclaw_vm_memory_balloon_mib    openclaw_vm_disk_total_mb
+openclaw_vm_health (0|1)          openclaw_vm_disk_used_pct
+```
+
+PromQL 示例：
+```promql
+# 某个租户所有 VM 的总内存使用
+sum by (tenant) (openclaw_vm_memory_used_mb)
+
+# 最近 1 分钟内有 VM 异常的宿主机
+min_over_time(openclaw_vm_health[1m]) == 0
+```
+
+Grafana 接入使用 **AWS IAM Identity Center**：
+1. Deploy 完成后，CFN 输出的 `GrafanaWorkspaceUrl` 即工作区 URL；
+2. 在 IAM Identity Center 中将自己（或一个 group）分配到该 AMG 工作区；
+3. 首次登录后，在 Grafana → *Connections → Data sources → Add → Prometheus*，从下拉中选择对应 AMP 工作区即可（AMG 服务角色已被授予 `aps:QueryMetrics`）。
+
+如需关闭，将 `metrics.enabled` 改回 `false` 重新执行 `setup.sh`，AMP 和 AMG 会一起被删除，停止对应的样本/活跃用户计费。
+
 ## 配置说明
 
 ### 配置文件
@@ -279,6 +307,9 @@ s3://{bucket}/skills/
 | scaler | idle_timeout_minutes | 10 | 空闲超时后回收宿主机 |
 | health_check | interval_minutes | 5 | Lambda watchdog 间隔 |
 | agentcore | enabled | false | AgentCore Gateway/Memory/CodeInterpreter/Browser |
+| metrics | enabled | false | 是否创建 Amazon Managed Prometheus + Grafana，并让每台宿主机的 ADOT collector remote-write 每个 VM 的 gauge（`openclaw_vm_memory_used_mb` / `disk_used_pct` / `vm_health` 等）。详见上文 [可观测性](#可观测性可选) |
+| metrics | workspace_alias | openclaw | AMP 工作区别名（仅 `metrics.enabled: true` 时生效） |
+| metrics | grafana_name | openclaw-metrics | AMG 工作区名称（仅 `metrics.enabled: true` 时生效） |
 | console_auth | enabled | false | Console Cognito 认证 |
 | console_auth | self_sign_up | false | 允许用户自注册 |
 
@@ -358,8 +389,9 @@ sample-multi-tenant-openclaw-on-firecracker/
 ├── cdk.json                   # CDK 应用配置
 ├── config.yml                 # 基础设施配置 (唯一配置源)
 ├── setup.sh                   # 一键部署 + 导出 .env.deploy
-├── build-rootfs.sh            # rootfs + data template 构建 + S3 上传
+├── build-rootfs.sh            # 在本地 Linux 上构建 rootfs（debootstrap）
 ├── scripts/
+│   ├── build-rootfs-on-ec2.sh # 云端构建（无需本地 Linux）— 推荐 macOS / Windows / Cloud9 用户使用
 │   ├── destroy.sh             # 销毁 stack
 │   ├── oc-connect.sh          # 快速登录某个租户 VM
 │   └── oc-dashboard.sh        # 打开某个租户的 Dashboard URL

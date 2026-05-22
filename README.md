@@ -239,6 +239,34 @@ aws s3 sync ./my-skills/ s3://${ASSETS_BUCKET}/skills/ --profile $PROFILE
 2. Next round confirms still idle and ASG instances > min → terminate
 3. If a tenant is assigned during this window → auto-recover to `active`
 
+## Observability (Optional)
+
+When `metrics.enabled: true` in `config.yml`, the stack provisions an Amazon Managed Prometheus (AMP) workspace and an Amazon Managed Grafana (AMG) workspace. Each host runs an ADOT collector as a sibling systemd service that scrapes `host-agent`'s `/metrics` endpoint every 30 s and SigV4-signs a remote-write to AMP — no static credentials.
+
+Per-VM gauges exposed (with `tenant=<tenant_id>` and `instance=<host_instance_id>` labels):
+
+```
+openclaw_vm_memory_used_mb        openclaw_vm_disk_used_mb
+openclaw_vm_memory_balloon_mib    openclaw_vm_disk_total_mb
+openclaw_vm_health (0|1)          openclaw_vm_disk_used_pct
+```
+
+Sample PromQL:
+```promql
+# Memory used by all running VMs of a tenant
+sum by (tenant) (openclaw_vm_memory_used_mb)
+
+# Hosts with at least one unhealthy VM in the last minute
+min_over_time(openclaw_vm_health[1m]) == 0
+```
+
+Grafana access uses **AWS IAM Identity Center**:
+1. After deploy, the `GrafanaWorkspaceUrl` CFN output gives you the workspace URL.
+2. In IAM Identity Center, assign yourself (or a group) to that AMG workspace.
+3. First login: in Grafana → *Connections → Data sources → Add → Prometheus*, pick the AMP workspace from the dropdown (the AMG service role already has `aps:QueryMetrics` for it).
+
+To disable observability later, set `metrics.enabled: false` and re-run `setup.sh` — AMP and AMG are removed and you stop being billed for samples / active users.
+
 ## Configuration
 
 ### Config Files
@@ -271,6 +299,9 @@ aws s3 sync ./my-skills/ s3://${ASSETS_BUCKET}/skills/ --profile $PROFILE
 | scaler | idle_timeout_minutes | 10 | Idle host reclaim timeout |
 | health_check | interval_minutes | 5 | Lambda watchdog interval |
 | agentcore | enabled | false | AgentCore Gateway/Memory/CodeInterpreter/Browser |
+| metrics | enabled | false | Provision Amazon Managed Prometheus + Grafana and have each host's ADOT collector remote-write per-VM gauges (`openclaw_vm_memory_used_mb`, `disk_used_pct`, `vm_health`, …). See [Observability](#observability-optional) below |
+| metrics | workspace_alias | openclaw | AMP workspace alias (only used when `metrics.enabled: true`) |
+| metrics | grafana_name | openclaw-metrics | AMG workspace name (only used when `metrics.enabled: true`) |
 | console_auth | enabled | false | Cognito authentication for Console |
 | console_auth | self_sign_up | false | Allow user self-registration |
 
@@ -348,8 +379,9 @@ sample-multi-tenant-openclaw-on-firecracker/
 ├── cdk.json                   # CDK app config + feature flags
 ├── config.yml                 # Infrastructure config (single source of truth)
 ├── setup.sh                   # One-click deploy + export .env.deploy
-├── build-rootfs.sh            # Build rootfs + data template, upload to S3
+├── build-rootfs.sh            # Build rootfs locally on Linux (debootstrap)
 ├── scripts/
+│   ├── build-rootfs-on-ec2.sh # Cloud build (no local Linux required) — recommended for macOS / Windows / Cloud9
 │   ├── destroy.sh             # Tear down stack
 │   ├── oc-connect.sh          # SSH-style helper to reach a tenant VM
 │   └── oc-dashboard.sh        # Open a tenant's Dashboard URL

@@ -96,6 +96,56 @@ source .env.deploy && ./build-rootfs.sh <new_version>
 # New tenants use the new rootfs immediately; existing tenants need a reset API call to switch over
 ```
 
+### Upgrading from v1.2.7 → v1.2.9
+
+The 1.2.8 + 1.2.9 releases stack a lot of console-surface fixes and metric correctness on top of an unchanged data plane. Most of it picks up automatically on `setup.sh`, but a few items need a one-time touch:
+
+```bash
+git pull && ./setup.sh <region> <profile>     # creates new API GW resources
+                                                # (/system/info, /agentcore/tools,
+                                                # /audit-log) and Lambda env vars
+                                                # (MULTI_AZ_ENABLED, etc.)
+```
+
+After the redeploy:
+
+- **Existing hosts won't have an `az` field on their DDB record** until they re-register. The console gracefully handles the empty case (column shows `-`), but if you want the AZ column / Hosts-grouped-by-AZ to populate immediately, either:
+
+  ```bash
+  # Option A: roll the ASG (clean — terminate triggers re-launch with new init-host.sh):
+  aws autoscaling set-desired-capacity --auto-scaling-group-name openclaw-hosts-asg --desired-capacity 0
+  # wait, then bring back up
+  aws autoscaling set-desired-capacity --auto-scaling-group-name openclaw-hosts-asg --desired-capacity 1
+
+  # Option B: manual backfill (faster, no service interruption):
+  aws ec2 describe-instances --filters Name=tag:aws:autoscaling:groupName,Values=openclaw-hosts-asg \
+      --query 'Reservations[].Instances[].[InstanceId,Placement.AvailabilityZone]' --output text |
+    while read iid az; do
+      aws dynamodb update-item --table-name openclaw-hosts \
+        --key "{\"instance_id\":{\"S\":\"$iid\"}}" \
+        --update-expression 'SET az = :a' \
+        --expression-attribute-values "{\":a\":{\"S\":\"$az\"}}"
+    done
+  ```
+
+- **Existing hosts run the old `host-agent.py` until it's reloaded.** The 1.2.9 metrics fix (real CPU% from `/proc/<fc_pid>/stat`, real memory from VmRSS) only takes effect once the new agent is on the box. To push it without rolling the ASG:
+
+  ```bash
+  source .env.deploy
+  aws s3 cp deploy/userdata/host-agent.py s3://${ASSETS_BUCKET}/deployment/scripts/host-agent.py
+  # Then on each host (or via SSM Run Command):
+  aws ssm send-command --document-name AWS-RunShellScript \
+      --targets Key=tag:aws:autoscaling:groupName,Values=openclaw-hosts-asg \
+      --parameters 'commands=[
+        "aws s3 cp s3://'${ASSETS_BUCKET}'/deployment/scripts/host-agent.py /opt/openclaw/host-agent.py",
+        "systemctl restart host-agent"
+      ]'
+  ```
+
+- **No tenant migration is required.** All v1.2.x DDB schema changes are additive (new optional fields). Existing tenant records keep working unchanged.
+
+- **Console refresh:** `setup.sh` re-uploads `console/index.html` to S3. Hard-refresh in the browser (or wait for CloudFront's ~24h TTL) to pick up the new tabs. The version banner in the footer is the easiest way to verify the new build is live.
+
 ## Quick Start
 
 **Prerequisites:**

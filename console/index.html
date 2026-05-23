@@ -62,6 +62,11 @@
   <symbol id="i-edit" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></symbol>
   <symbol id="i-restore" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="21 8 21 21 3 21 3 8"/><rect x="1" y="3" width="22" height="5"/><line x1="10" y1="12" x2="14" y2="12"/><polyline points="16 16 12 20 8 16"/></symbol>
   <symbol id="i-chevron-right" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+  <symbol id="i-move" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="5 9 2 12 5 15"/><polyline points="9 5 12 2 15 5"/><polyline points="15 19 12 22 9 19"/><polyline points="19 9 22 12 19 15"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="12" y1="2" x2="12" y2="22"/></symbol>
+  <symbol id="i-tool" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></symbol>
+  <symbol id="i-bar-chart" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
 </svg>
 
 <!-- Header -->
@@ -74,9 +79,10 @@
 <!-- Nav Tabs -->
 <div class="nav-tabs">
   <button class="nav-tab" :class="page==='tenants' && 'active'" @click="page='tenants'">Tenants</button>
-  <button class="nav-tab" :class="page==='app' && 'active'" @click="page='app'">Application</button>
+  <button class="nav-tab" :class="page==='app' && 'active'" @click="page='app'; loadAgentCoreTools()">Application</button>
+  <button class="nav-tab" :class="page==='monitoring' && 'active'" @click="page='monitoring'; loadSystemInfo()">Monitoring</button>
   <button class="nav-tab" :class="page==='backups' && 'active'" @click="page='backups'; loadBackups()">Backups</button>
-  <button class="nav-tab" :class="page==='settings' && 'active'" @click="page='settings'">Settings</button>
+  <button class="nav-tab" :class="page==='settings' && 'active'" @click="page='settings'; loadSystemInfo()">Settings</button>
 </div>
 
 <!-- Page: Tenants (main) -->
@@ -96,38 +102,51 @@
       <template x-if="hosts.length === 0 && !loadingHosts">
         <div class="empty">No hosts</div>
       </template>
-      <template x-for="h in hosts" :key="h.instance_id">
-        <div class="host-card" :class="selectedHost === h.instance_id && 'selected'"
-            @click="selectedHost = selectedHost === h.instance_id ? null : h.instance_id">
-          <div class="host-top">
-            <span class="host-id" x-text="h.instance_id"></span>
-            <span class="badge" :class="h.status==='active' ? 'badge-active' : 'badge-inactive'" x-text="h.status"></span>
-          </div>
-          <div class="host-row">
-            <span class="host-label">CPU<span class="overcommit-badge" x-show="(h.cpu_overcommit_ratio||1) > 1" x-text="' (×'+(h.cpu_overcommit_ratio||1)+')'"></span></span>
-            <div class="bar-bg" style="position:relative">
-              <div class="bar-fill" :class="cpuBarClass(h)" :style="'width:'+cpuPct(h)+'%'"></div>
-              <template x-if="(h.cpu_overcommit_ratio||1) > 1">
-                <div class="bar-physical-mark" :style="'left:'+(100/(h.cpu_overcommit_ratio||1))+'%'"></div>
-              </template>
+      <!-- 1.2.9 — hosts grouped by AZ when multi-AZ is enabled, flat list otherwise. -->
+      <template x-for="grp in groupedHosts" :key="grp.az || 'all'">
+        <div>
+          <template x-if="grp.az !== null">
+            <div style="display:flex;align-items:center;gap:6px;margin:8px 0 4px;font-size:11px;color:var(--cyan-dim);font-family:monospace">
+              <svg class="icon s12"><use href="#i-globe"/></svg>
+              <span x-text="grp.az"></span>
+              <span style="color:var(--gray)" x-text="' · '+grp.hosts.length+' host(s) · '+grp.hosts.reduce((s,h)=>s+(h.vm_count||0),0)+' VM(s)'"></span>
             </div>
-            <span class="host-val" x-text="h.used_vcpu+'/'+h.total_vcpu"></span>
-          </div>
-          <div class="host-row">
-            <span class="host-label">Mem<span class="overcommit-badge" x-show="(h.mem_overcommit_ratio||1) > 1" x-text="' (×'+(h.mem_overcommit_ratio||1)+')'"></span></span>
-            <div class="bar-bg" style="position:relative">
-              <div class="bar-fill" :class="memBarClass(h)" :style="'width:'+memPct(h)+'%'"></div>
-              <template x-if="(h.mem_overcommit_ratio||1) > 1">
-                <div class="bar-physical-mark" :style="'left:'+(100/(h.mem_overcommit_ratio||1))+'%'"></div>
-              </template>
+          </template>
+          <template x-for="h in grp.hosts" :key="h.instance_id">
+            <div class="host-card" :class="selectedHost === h.instance_id && 'selected'"
+                @click="selectedHost = selectedHost === h.instance_id ? null : h.instance_id">
+              <div class="host-top">
+                <span class="host-id" x-text="h.instance_id"></span>
+                <span x-show="h.az" style="font-size:10px;color:var(--gray);font-family:monospace" x-text="h.az"></span>
+                <span class="badge" :class="h.status==='active' ? 'badge-active' : 'badge-inactive'" x-text="h.status"></span>
+              </div>
+              <div class="host-row">
+                <span class="host-label">CPU<span class="overcommit-badge" x-show="(h.cpu_overcommit_ratio||1) > 1" x-text="' (×'+(h.cpu_overcommit_ratio||1)+')'"></span></span>
+                <div class="bar-bg" style="position:relative">
+                  <div class="bar-fill" :class="cpuBarClass(h)" :style="'width:'+cpuPct(h)+'%'"></div>
+                  <template x-if="(h.cpu_overcommit_ratio||1) > 1">
+                    <div class="bar-physical-mark" :style="'left:'+(100/(h.cpu_overcommit_ratio||1))+'%'"></div>
+                  </template>
+                </div>
+                <span class="host-val" x-text="h.used_vcpu+'/'+h.total_vcpu"></span>
+              </div>
+              <div class="host-row">
+                <span class="host-label">Mem<span class="overcommit-badge" x-show="(h.mem_overcommit_ratio||1) > 1" x-text="' (×'+(h.mem_overcommit_ratio||1)+')'"></span></span>
+                <div class="bar-bg" style="position:relative">
+                  <div class="bar-fill" :class="memBarClass(h)" :style="'width:'+memPct(h)+'%'"></div>
+                  <template x-if="(h.mem_overcommit_ratio||1) > 1">
+                    <div class="bar-physical-mark" :style="'left:'+(100/(h.mem_overcommit_ratio||1))+'%'"></div>
+                  </template>
+                </div>
+                <span class="host-val" x-text="(h.used_mem_mb/1024).toFixed(1)+'/'+(h.total_mem_mb/1024).toFixed(1)"></span>
+              </div>
+              <div class="host-row">
+                <span class="host-label">VM(s)</span>
+                <span style="color:#fff" x-text="h.vm_count"></span>
+                <span style="margin-left:auto;font-size:11px;color:var(--gray)" x-text="h.rootfs_version||''"></span>
+              </div>
             </div>
-            <span class="host-val" x-text="(h.used_mem_mb/1024).toFixed(1)+'/'+(h.total_mem_mb/1024).toFixed(1)"></span>
-          </div>
-          <div class="host-row">
-            <span class="host-label">VM(s)</span>
-            <span style="color:#fff" x-text="h.vm_count"></span>
-            <span style="margin-left:auto;font-size:11px;color:var(--gray)" x-text="h.rootfs_version||''"></span>
-          </div>
+          </template>
         </div>
       </template>
     </div>
@@ -182,13 +201,13 @@
         <table>
           <thead>
             <tr>
-              <th>ID</th><th>Name</th><th>Status</th><th>Tags</th><th>vCPU</th><th>Mem (MB)</th><th>Disk</th><th>Guest IP</th>
-              <th>Port</th><th>Rootfs</th><th>VM Health</th><th>Gateway</th><th>Actions</th>
+              <th>ID</th><th>Name</th><th>Status</th><th>Tags</th><th>vCPU</th><th>Memory</th><th>Disk</th><th>Guest IP</th>
+              <th>Port</th><th>AZ</th><th>Rootfs</th><th>VM Health</th><th>Gateway</th><th>Actions</th>
             </tr>
           </thead>
           <tbody>
             <template x-if="filteredTenants.length === 0 && !loadingTenants">
-              <tr><td colspan="13" class="empty">No tenants</td></tr>
+              <tr><td colspan="14" class="empty">No tenants</td></tr>
             </template>
             <template x-for="t in filteredTenants" :key="t.id">
               <tr>
@@ -200,8 +219,20 @@
                     <span class="tag-badge" x-text="k + ':' + v"></span>
                   </template>
                 </td>
-                <td x-text="t.vcpu"></td>
-                <td x-text="t.mem_mb"></td>
+                <td>
+                  <div class="disk-cell" x-show="t.status==='running' && t.metrics">
+                    <div class="disk-track"><div class="disk-fill" :class="metricLevel(_n(t.metrics?.cpu_pct))" :style="'width:'+_n(t.metrics?.cpu_pct)+'%'"></div></div>
+                    <span class="disk-text" x-text="cpuText(t)"></span>
+                  </div>
+                  <span x-show="t.status!=='running' || !t.metrics" style="color:#445;font-size:11px" x-text="t.vcpu"></span>
+                </td>
+                <td>
+                  <div class="disk-cell" x-show="t.status==='running' && t.metrics">
+                    <div class="disk-track"><div class="disk-fill" :class="metricLevel(memPctOfTenant(t))" :style="'width:'+memPctOfTenant(t)+'%'"></div></div>
+                    <span class="disk-text" x-text="memText(t)"></span>
+                  </div>
+                  <span x-show="t.status!=='running' || !t.metrics" style="color:#445;font-size:11px" x-text="t.mem_mb"></span>
+                </td>
                 <td>
                   <div class="disk-cell" x-show="t.status==='running' && t.metrics">
                     <div class="disk-track"><div class="disk-fill" :class="metricLevel(_n(t.metrics?.disk_used_pct))" :style="'width:'+_n(t.metrics?.disk_used_pct)+'%'"></div></div>
@@ -211,6 +242,7 @@
                 </td>
                 <td x-text="t.guest_ip || '-'"></td>
                 <td x-text="t.host_port || '-'"></td>
+                <td style="font-size:11px;color:var(--gray)" x-text="hostAz(t.host_id) || '-'"></td>
                 <td style="font-size:11px;color:var(--gray)" x-text="t.rootfs_version||'-'"></td>
                 <td><span class="health-dot" :class="healthClass(t.vm_health, t.status)"></span></td>
                 <td><span class="health-dot" :class="healthClass(t.app_health, t.status)"></span></td>
@@ -226,6 +258,7 @@
                         <button class="btn-act" title="Pause" @click="tenantAction(t.id,'pause')"><svg class="icon s13"><use href="#i-pause"/></svg></button>
                         <button class="btn-act" title="Stop" @click="tenantAction(t.id,'stop')"><svg class="icon s13"><use href="#i-power"/></svg></button>
                         <button class="btn-act" title="Restart" @click="tenantAction(t.id,'restart')"><svg class="icon s13"><use href="#i-zap"/></svg></button>
+                        <button class="btn-act" title="Migrate to another host" @click="openMigrate(t)"><svg class="icon s13"><use href="#i-move"/></svg></button>
                       </span>
                     </template>
                     <template x-if="t.status==='stopped'">
@@ -297,18 +330,157 @@
     </div>
   </template>
 
-  <!-- Skills -->
-  <div class="section-card">
-    <h3>Shared Skills</h3>
-    <p style="color:var(--gray);font-size:13px">Skills are shared across all tenants. Managed in S3 and synced to VMs automatically.</p>
+  <!-- AgentCore MCP Tools (issue: surface what tools VMs gain when AgentCore is on) -->
+  <div class="section-card" x-show="agentcoreStatus.enabled">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <h3><svg class="icon s14" style="vertical-align:-2px"><use href="#i-tool"/></svg> MCP Tools (via AgentCore Gateway)</h3>
+      <span class="badge badge-active" x-text="(agentcoreTools.length || 0) + ' tools'"></span>
+    </div>
+    <p style="color:var(--gray);font-size:13px">
+      All tenant VMs auto-connect to the AgentCore Gateway and gain these MCP tools.
+      Tool definitions live in <code>deploy/lambda/agentcore_tools/</code> + <code>deploy/stack.py</code>.
+    </p>
     <div style="margin-top:8px">
-      <template x-for="s in skills" :key="s.id">
-        <div class="config-item">
-          <span class="config-name" x-text="s.name"></span>
-          <span class="config-desc" x-text="s.description"></span>
+      <template x-for="tool in agentcoreTools" :key="tool.name">
+        <div class="config-item" style="flex-direction:column;align-items:flex-start;gap:4px">
+          <span style="display:flex;align-items:baseline;gap:8px">
+            <span class="config-name" x-text="tool.name"></span>
+            <span style="font-size:11px;color:var(--cyan-dim);font-family:monospace">
+              <template x-for="(prop, key) in (tool.input_schema?.properties || {})" :key="key">
+                <span x-text="key + ', '"></span>
+              </template>
+              <span x-show="!Object.keys(tool.input_schema?.properties || {}).length">no params</span>
+            </span>
+          </span>
+          <span class="config-desc" style="margin-left:0" x-text="tool.description"></span>
         </div>
       </template>
-      <div x-show="skills.length===0" style="color:var(--gray);font-size:12px">No skills configured</div>
+      <div x-show="agentcoreTools.length === 0" style="color:var(--gray);font-size:12px">
+        AgentCore not enabled, or no tools registered yet. Set <code>agentcore.enabled: true</code> in <code>config.yml</code> and redeploy.
+      </div>
+    </div>
+  </div>
+
+  <!-- Skills -->
+  <div class="section-card">
+    <h3><svg class="icon s14" style="vertical-align:-2px"><use href="#i-brain"/></svg> Shared Skills <span style="font-size:11px;color:var(--gray)" x-text="'(' + skills.length + ')'"></span></h3>
+    <p style="color:var(--gray);font-size:13px">
+      Skills are shared across all tenants. They're plain markdown files in
+      <code>s3://${ASSETS_BUCKET}/skills/&lt;name&gt;/SKILL.md</code> and are synced to every VM
+      every 5 minutes via cron. Each tenant has its own memory; skills themselves are read-only.
+    </p>
+    <div style="margin-top:8px">
+      <template x-for="s in skills" :key="s.id">
+        <div class="config-item" style="flex-direction:column;align-items:flex-start;gap:4px">
+          <span style="display:flex;align-items:baseline;gap:8px;width:100%">
+            <span class="config-name" x-text="s.name"></span>
+            <a class="btn-act" style="margin-left:auto;font-size:11px;color:var(--cyan)"
+               :href="skillS3Url(s)" target="_blank" rel="noopener"
+               title="Open S3 console at this skill's prefix">
+              <svg class="icon s12" style="vertical-align:-1px"><use href="#i-link"/></svg> S3
+            </a>
+          </span>
+          <span class="config-desc" style="margin-left:0" x-text="s.description || 'No description (add YAML frontmatter to SKILL.md)'"></span>
+        </div>
+      </template>
+      <div x-show="skills.length===0" style="color:var(--gray);font-size:12px">
+        No skills configured. Upload a SKILL.md to <code>s3://${ASSETS_BUCKET}/skills/&lt;name&gt;/</code>
+        and wait up to 5 minutes for the host cron to pick it up.
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Page: Monitoring -->
+<div x-show="page==='monitoring'" class="page-content">
+  <h2><svg class="icon s14" style="vertical-align:-2px"><use href="#i-bar-chart"/></svg> Observability</h2>
+
+  <!-- Live status -->
+  <div class="section-card">
+    <h3>Status</h3>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-top:8px">
+      <div>
+        <div style="font-size:11px;color:var(--gray)">Prometheus (AMP)</div>
+        <div style="font-size:13px">
+          <span :class="systemInfo?.metrics?.enabled ? 'text-green' : 'text-gray'"
+                x-text="systemInfo?.metrics?.enabled ? '● Enabled' : '○ Disabled'"></span>
+        </div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--gray)">Grafana (AMG)</div>
+        <div style="font-size:13px">
+          <template x-if="systemInfo?.metrics?.grafana_url">
+            <a :href="systemInfo.metrics.grafana_url" target="_blank" style="color:var(--cyan)">Open Grafana →</a>
+          </template>
+          <template x-if="!systemInfo?.metrics?.grafana_url">
+            <span class="text-gray">Not provisioned</span>
+          </template>
+        </div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--gray)">SNS Notifications</div>
+        <div style="font-size:13px">
+          <span :class="systemInfo?.notifications?.enabled ? 'text-green' : 'text-gray'"
+                x-text="systemInfo?.notifications?.enabled ? '● Enabled' : '○ Disabled'"></span>
+        </div>
+      </div>
+    </div>
+    <div x-show="!systemInfo?.metrics?.enabled" style="margin-top:12px;padding:8px 12px;background:#1a2332;border-radius:6px;font-size:12px;color:var(--gray)">
+      💡 To enable: set <code>metrics.enabled: true</code> in <code>config.yml</code> and redeploy.
+      The stack will provision Amazon Managed Prometheus + Grafana, and ADOT collectors on each
+      host start scraping in ~3 minutes after rollout.
+    </div>
+  </div>
+
+  <!-- Per-VM metrics list -->
+  <div class="section-card">
+    <h3>Per-VM Metrics</h3>
+    <p style="color:var(--gray);font-size:13px">
+      Each host's <code>host-agent</code> exposes these gauges on
+      <code>:8899/metrics</code>. ADOT scrapes every 30s and remote-writes
+      to AMP via SigV4 (no static credentials).
+    </p>
+    <table style="margin-top:8px">
+      <thead>
+        <tr><th>Metric</th><th>Type</th><th>Labels</th><th>Description</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>openclaw_vm_health</code></td><td>gauge (0/1)</td><td>tenant</td><td>1 if VM responded to ping, else 0</td></tr>
+        <tr><td><code>openclaw_vm_memory_used_mb</code></td><td>gauge</td><td>tenant</td><td>Per-VM memory in active use (MB)</td></tr>
+        <tr><td><code>openclaw_vm_memory_balloon_mib</code></td><td>gauge</td><td>tenant</td><td>Balloon size held by the host (MiB)</td></tr>
+        <tr><td><code>openclaw_vm_disk_used_mb</code></td><td>gauge</td><td>tenant</td><td>Per-VM data disk used (MB)</td></tr>
+        <tr><td><code>openclaw_vm_disk_total_mb</code></td><td>gauge</td><td>tenant</td><td>Per-VM data disk capacity (MB)</td></tr>
+        <tr><td><code>openclaw_vm_disk_used_pct</code></td><td>gauge</td><td>tenant</td><td>Per-VM data disk used (percent)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- PromQL examples -->
+  <div class="section-card">
+    <h3>Sample PromQL</h3>
+    <p style="color:var(--gray);font-size:13px">Copy into Grafana → Explore → AMP datasource.</p>
+    <div style="margin-top:8px;display:flex;flex-direction:column;gap:8px">
+      <div>
+        <div style="font-size:11px;color:var(--cyan-dim);margin-bottom:2px">Memory used by all running VMs of a tenant</div>
+        <pre style="background:#0a0e17;border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:11px;color:var(--text);overflow-x:auto;margin:0">sum by (tenant) (openclaw_vm_memory_used_mb)</pre>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--cyan-dim);margin-bottom:2px">Hosts with at least one unhealthy VM in the last minute</div>
+        <pre style="background:#0a0e17;border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:11px;color:var(--text);overflow-x:auto;margin:0">min_over_time(openclaw_vm_health[1m]) == 0</pre>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--cyan-dim);margin-bottom:2px">Tenants over 90% disk usage</div>
+        <pre style="background:#0a0e17;border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:11px;color:var(--text);overflow-x:auto;margin:0">openclaw_vm_disk_used_pct &gt; 90</pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- AMP / Grafana wiring -->
+  <div class="section-card" x-show="systemInfo?.metrics?.amp_remote_write_url">
+    <h3>Endpoints</h3>
+    <div style="font-size:12px;color:var(--gray);font-family:monospace;word-break:break-all">
+      <div><span style="color:var(--cyan-dim)">AMP remote_write:</span> <span x-text="systemInfo.metrics.amp_remote_write_url"></span></div>
+      <div style="margin-top:4px"><span style="color:var(--cyan-dim)">Grafana:</span> <span x-text="systemInfo.metrics.grafana_url || '-'"></span></div>
     </div>
   </div>
 </div>
@@ -425,6 +597,105 @@
     </div>
   </div>
 
+  <!-- Infrastructure feature flags (issue: surface multi_az / metrics / waf / quotas / RBAC) -->
+  <div class="section-card" x-show="systemInfo">
+    <h3><svg class="icon s14" style="vertical-align:-2px"><use href="#i-shield"/></svg> Infrastructure</h3>
+    <p style="color:var(--gray);font-size:13px">Optional features and their current status. Toggle in <code>config.yml</code> and re-run <code>./setup.sh</code>.</p>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-top:8px">
+      <!-- Multi-AZ -->
+      <div>
+        <div style="font-size:11px;color:var(--gray)">Multi-AZ HA</div>
+        <div style="font-size:13px">
+          <span :class="systemInfo?.multi_az?.enabled ? 'text-green' : 'text-gray'"
+                x-text="systemInfo?.multi_az?.enabled
+                          ? '● ' + (systemInfo.multi_az.az_count || 1) + ' AZ'
+                          : '○ Single AZ (default)'"></span>
+        </div>
+      </div>
+      <!-- Metrics / AMP -->
+      <div>
+        <div style="font-size:11px;color:var(--gray)">Prometheus + Grafana</div>
+        <div style="font-size:13px">
+          <span :class="systemInfo?.metrics?.enabled ? 'text-green' : 'text-gray'"
+                x-text="systemInfo?.metrics?.enabled ? '● Provisioned' : '○ Disabled'"></span>
+        </div>
+      </div>
+      <!-- WAF -->
+      <div>
+        <div style="font-size:11px;color:var(--gray)">AWS WAF</div>
+        <div style="font-size:13px">
+          <span :class="systemInfo?.waf?.enabled ? 'text-green' : 'text-gray'"
+                x-text="systemInfo?.waf?.enabled ? '● Enabled' : '○ Disabled'"></span>
+        </div>
+      </div>
+      <!-- Cognito / RBAC -->
+      <div>
+        <div style="font-size:11px;color:var(--gray)">Cognito + RBAC</div>
+        <div style="font-size:13px">
+          <span :class="systemInfo?.cognito?.enabled ? 'text-green' : 'text-gray'"
+                x-text="systemInfo?.cognito?.enabled ? '● Enabled (admin/operator/viewer)' : '○ API key only'"></span>
+        </div>
+      </div>
+      <!-- Notifications -->
+      <div>
+        <div style="font-size:11px;color:var(--gray)">SNS Lifecycle Events</div>
+        <div style="font-size:13px">
+          <span :class="systemInfo?.notifications?.enabled ? 'text-green' : 'text-gray'"
+                x-text="systemInfo?.notifications?.enabled ? '● Publishing' : '○ Disabled'"></span>
+        </div>
+      </div>
+      <!-- Quotas -->
+      <div>
+        <div style="font-size:11px;color:var(--gray)">Per-tenant Quotas</div>
+        <div style="font-size:13px">
+          <span :class="systemInfo?.quotas?.enabled ? 'text-green' : 'text-gray'"
+                x-text="systemInfo?.quotas?.enabled ? '● Enforced' : '○ Unlimited'"></span>
+        </div>
+        <div x-show="systemInfo?.quotas?.enabled" style="font-size:11px;color:var(--gray);margin-top:2px">
+          <span x-text="'vCPU: ' + (systemInfo?.quotas?.max_vcpu_per_tenant || 0) + ', Mem: ' + (systemInfo?.quotas?.max_mem_mb_per_tenant || 0) + 'MB, Disk: ' + (systemInfo?.quotas?.max_data_disk_mb || 0) + 'MB'"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Host overcommit -->
+  <div class="section-card" x-show="systemInfo?.host_config">
+    <h3>Host Overcommit Ratios</h3>
+    <p style="color:var(--gray);font-size:13px">
+      Allocatable resources = physical × ratio. Tune in <code>config.yml</code> under <code>host:</code>.
+    </p>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-top:8px;font-size:13px">
+      <div><span style="color:var(--gray)">CPU overcommit:</span> <span x-text="'×' + (systemInfo?.host_config?.cpu_overcommit_ratio || 1)"></span></div>
+      <div><span style="color:var(--gray)">Memory overcommit:</span> <span x-text="'×' + (systemInfo?.host_config?.mem_overcommit_ratio || 1)"></span></div>
+      <div><span style="color:var(--gray)">Default per tenant:</span> <span x-text="(systemInfo?.host_config?.vm_default_vcpu || '?') + ' vCPU, ' + (systemInfo?.host_config?.vm_default_mem_mb || '?') + ' MB'"></span></div>
+    </div>
+  </div>
+
+  <!-- 1.2.9 — Fleet distribution across AZs (visible regardless of multi_az
+       so single-AZ deployments also see "all in 1a"). -->
+  <div class="section-card" x-show="hosts.length > 0">
+    <h3><svg class="icon s14" style="vertical-align:-2px"><use href="#i-globe"/></svg> Fleet by AZ</h3>
+    <p style="color:var(--gray);font-size:13px">
+      Live distribution of registered hosts and their tenants across Availability Zones.
+      Set <code>multi_az.enabled: true</code> in <code>config.yml</code> to spread the ASG.
+    </p>
+    <table style="margin-top:8px;font-size:12px">
+      <thead>
+        <tr><th>Availability Zone</th><th>Hosts</th><th>VMs</th><th>vCPU used / total</th></tr>
+      </thead>
+      <tbody>
+        <template x-for="g in fleetByAz" :key="g.az">
+          <tr>
+            <td x-text="g.az"></td>
+            <td x-text="g.hosts"></td>
+            <td x-text="g.vms"></td>
+            <td x-text="g.vcpu_used + ' / ' + g.vcpu_total"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+
   <!-- System Info -->
   <div class="section-card">
     <h3>System</h3>
@@ -473,12 +744,60 @@
           <option :value="t.name" x-text="t.name"></option>
         </template>
       </select>
+      <label>Target host <span class="opt">optional — admin/operator only</span></label>
+      <select x-model="form.preferred_host_id" class="settings-input" style="margin-bottom:14px">
+        <option value="">Auto (scheduler picks first host with capacity)</option>
+        <template x-for="h in availableHostsForCreate()" :key="h.instance_id">
+          <option :value="h.instance_id"
+                  x-text="h.instance_id + (h.az ? ' (' + h.az + ')' : '') + ' — ' + (h.total_vcpu - h.used_vcpu) + ' free vCPU, ' + h.vm_count + ' VM(s)'"></option>
+        </template>
+      </select>
       <label>Tags <span class="opt">optional — one per line, key:value</span></label>
       <textarea x-model="form.tags_text" placeholder="team:ml&#10;env:dev"
                 style="width:100%;background:#0a0e17;border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:4px;font-size:12px;font-family:monospace;height:60px;margin-bottom:14px;resize:vertical"></textarea>
       <div class="modal-actions">
         <button class="btn btn-cyan" @click="closeCreateModal()">Cancel</button>
         <button class="btn btn-create" @click="createTenant()" :disabled="!form.name || !!nameError" x-text="restoreSource ? 'Create from Backup' : 'Create'"></button>
+      </div>
+    </div>
+  </div>
+</template>
+
+<!-- Migrate Tenant Modal (issue: API has /tenants/{id}/migrate but no UI surfaced it) -->
+<template x-if="migrateSource">
+  <div class="overlay" @click.self="migrateSource=null">
+    <div class="modal">
+      <button class="close-btn" @click="migrateSource=null"><svg class="icon s16"><use href="#i-delete"/></svg></button>
+      <h2>Migrate Tenant</h2>
+      <div style="margin:-4px 0 12px;padding:8px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);font-size:12px">
+        <div style="color:var(--gray)">Tenant</div>
+        <div style="color:var(--text);margin-top:2px">
+          <span x-text="migrateSource.name || migrateSource.id"></span>
+          <span style="color:var(--gray)"> · current host </span>
+          <span x-text="migrateSource.host_id"></span>
+          <span style="color:var(--gray)" x-show="hostAz(migrateSource.host_id)"
+                x-text="' · ' + hostAz(migrateSource.host_id)"></span>
+        </div>
+      </div>
+      <p style="font-size:12px;color:var(--gray);margin-bottom:8px">
+        Live migration via Firecracker snapshot/restore. The VM is paused on the source,
+        snapshotted to S3, restored on the target host, then resumed. Pause window is on
+        the order of seconds, not user-perceptible for most agents.
+      </p>
+      <label>Target host <span class="req">*</span></label>
+      <select class="settings-input" x-model="migrateTarget" style="margin-bottom:14px">
+        <option value="">Choose a host…</option>
+        <template x-for="h in availableMigrationTargets()" :key="h.instance_id">
+          <option :value="h.instance_id"
+                  x-text="h.instance_id + (h.az ? ' (' + h.az + ')' : '') + ' — ' + h.used_vcpu + '/' + h.total_vcpu + ' vCPU, ' + h.vm_count + ' VM(s)'"></option>
+        </template>
+      </select>
+      <div x-show="availableMigrationTargets().length === 0" class="hint err">
+        No other active hosts available. Scale ASG out first or wait for capacity.
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-cyan" @click="migrateSource=null">Cancel</button>
+        <button class="btn btn-create" @click="migrateTenant()" :disabled="!migrateTarget">Migrate</button>
       </div>
     </div>
   </div>
@@ -497,12 +816,18 @@ function app() {
     skills: [], templates: [],
     editTpl: null,
     agentcoreStatus: { enabled: false }, agentcoreRegion: 'ap-northeast-1',
-    form: { name: '', vcpu: null, memory_mb: null, config_template: '', tags_text: '' },
+    form: { name: '', vcpu: null, memory_mb: null, config_template: '', preferred_host_id: '', tags_text: '' },
     backups: [], backupFilter: 'all', loadingBackups: false,
     expandedGroups: new Set(),   // tenant_ids whose history rows are expanded
     restoreSource: null,   // set when modal opened from Backups tab; null = normal create
     statusFilter: 'all',   // filter for tenants list
     tagFilter: '',         // filter expression: "k1:v1,k2:v2" — AND across pairs
+
+    // v1.2.8 — surfaces for features that already had an API but no UI.
+    agentcoreTools: [],   // populated when Application tab is opened (and AgentCore enabled)
+    systemInfo: null,     // populated when Monitoring/Settings tab is opened
+    migrateSource: null,  // tenant being migrated; modal opens when truthy
+    migrateTarget: '',    // selected target host_id
 
     init() {
       this.apiUrl = localStorage.getItem('oc_api_url') || window.OC_DEFAULT_API_URL || '';
@@ -561,6 +886,7 @@ function app() {
       if (this.form.vcpu) body.vcpu = this.form.vcpu;
       if (this.form.memory_mb) body.mem_mb = this.form.memory_mb;
       if (this.form.config_template) body.config_template = this.form.config_template;
+      if (this.form.preferred_host_id) body.preferred_host_id = this.form.preferred_host_id;
       // Parse tags from textarea — supports "key:value" per line, also comma-separated.
       const tags = this.parseTagsInput(this.form.tags_text);
       if (Object.keys(tags).length > 0) body.tags = tags;
@@ -586,7 +912,7 @@ function app() {
     closeCreateModal() {
       this.showModal = false;
       this.restoreSource = null;
-      this.form = { name: '', vcpu: null, memory_mb: null, config_template: '', tags_text: '' };
+      this.form = { name: '', vcpu: null, memory_mb: null, config_template: '', preferred_host_id: '', tags_text: '' };
     },
     parseTagsInput(text) {
       // Accepts "key:value" pairs separated by newline or comma. Empty → {}.
@@ -686,6 +1012,75 @@ function app() {
       setTimeout(() => this.toast = '', 2000);
       this.loadTenants();
     },
+    // v1.2.8 — host AZ lookup for the new "AZ" column in the tenants table.
+    hostAz(host_id) {
+      if (!host_id) return '';
+      const h = this.hosts.find(h => h.instance_id === host_id);
+      return h ? (h.az || '') : '';
+    },
+    // v1.2.8 — Migrate flow. API: POST /tenants/{id}/migrate {target_host_id}.
+    openMigrate(t) {
+      this.migrateSource = t;
+      this.migrateTarget = '';
+    },
+    availableMigrationTargets() {
+      // Active hosts that aren't the source's current host.
+      if (!this.migrateSource) return [];
+      return this.hosts.filter(h =>
+        h.status === 'active' && h.instance_id !== this.migrateSource.host_id
+      );
+    },
+    async migrateTenant() {
+      if (!this.migrateSource || !this.migrateTarget) return;
+      const id = this.migrateSource.id;
+      const r = await this.api('POST', 'tenants/' + id + '/migrate',
+        { target_host_id: this.migrateTarget });
+      if (r && r.error) {
+        this.toast = '✗ ' + r.error;
+        setTimeout(() => this.toast = '', 4000);
+        return;
+      }
+      this.toast = '✓ migrating ' + id;
+      setTimeout(() => this.toast = '', 3000);
+      this.migrateSource = null;
+      this.migrateTarget = '';
+      this.loadTenants();
+    },
+    // v1.2.8 — Application tab: list MCP tools registered on AgentCore Gateway.
+    async loadAgentCoreTools() {
+      if (!this.apiUrl || !this.apiKey) return;
+      try {
+        const r = await this.api('GET', 'agentcore/tools');
+        this.agentcoreTools = (r && r.tools) || [];
+      } catch {
+        this.agentcoreTools = [];
+      }
+    },
+    // v1.2.8/9 — Monitoring + Settings tabs: feature flags + grafana url
+    // + a fresh hosts snapshot so the Fleet-by-AZ table has up-to-date data.
+    async loadSystemInfo() {
+      if (!this.apiUrl || !this.apiKey) return;
+      try {
+        this.systemInfo = await this.api('GET', 'system/info');
+      } catch {
+        this.systemInfo = null;
+      }
+      // Refresh hosts so groupedHosts / fleetByAz reflect any new hosts that
+      // came up since the user last opened the Tenants tab.
+      this.loadHosts();
+    },
+    // v1.2.8 — link to the S3 console at this skill's prefix so operators
+    // can edit/upload the SKILL.md without leaving the browser.
+    skillS3Url(skill) {
+      // Use the deployed bucket name + region from the .env.deploy-injected globals.
+      // Falls back to the AWS console list page when we can't compute the deep link.
+      const region = (this.systemInfo?.region) || (window.OC_REGION || 'us-east-1');
+      const bucket = (this.systemInfo?.assets_bucket) || window.OC_ASSETS_BUCKET || '';
+      if (bucket && skill?.id) {
+        return `https://${region}.console.aws.amazon.com/s3/buckets/${bucket}?prefix=skills/${skill.id}/&region=${region}`;
+      }
+      return 'https://s3.console.aws.amazon.com/s3/home';
+    },
     async refreshRootfs() {
       if (!confirm('Pull latest rootfs to all hosts?')) return;
       this.toast = 'refresh-rootfs…';
@@ -719,9 +1114,11 @@ function app() {
       if (status && status !== 'running') return 'health-unknown';
       return v === 'up' ? 'health-up' : v === 'down' ? 'health-down' : 'health-unknown';
     },
-    // host-agent.py: cpu_pct is a stub (always 0) and balloon stats often report
-    // available_memory=0, making memory_used_mb unreliable. Only disk_* are
-    // trustworthy today. DDB returns Number attributes as strings → coerce.
+    // 1.2.9 — host-agent now samples cpu_pct from /proc/<fc_pid>/stat
+    // and memory_used_mb from VmRSS (the previous balloon-stats path was
+    // unreliable: available_memory often returned 0). All three metrics
+    // are now meaningful — DDB returns Number attributes as strings so
+    // we coerce here.
     _n(v) { return Number(v) || 0; },
     metricLevel(pct) {
       return pct >= 90 ? 'metric-crit' : pct >= 70 ? 'metric-warn' : 'metric-ok';
@@ -734,6 +1131,25 @@ function app() {
       const total = this._n(m.disk_total_mb);
       const pct = this._n(m.disk_used_pct);
       return `${fmt(used)}/${fmt(total)} (${pct}%)`;
+    },
+    cpuText(t) {
+      // "12% / 2 vCPU" — pct is of the allocated vcpu count; show the
+      // raw vcpu allocation for context so 50% on 1 vcpu vs 2 vcpu reads right.
+      const pct = this._n(t.metrics?.cpu_pct);
+      return `${pct}% / ${t.vcpu} vCPU`;
+    },
+    memText(t) {
+      // "1.2G/4G (30%)" — used is from VmRSS; total is the configured mem_mb.
+      const used = this._n(t.metrics?.memory_used_mb);
+      const total = this._n(t.mem_mb);
+      const pct = total > 0 ? Math.min(100, Math.round((used / total) * 100)) : 0;
+      const fmt = mb => mb >= 1024 ? (mb / 1024).toFixed(1) + 'G' : mb + 'M';
+      return `${fmt(used)}/${fmt(total)} (${pct}%)`;
+    },
+    memPctOfTenant(t) {
+      const used = this._n(t.metrics?.memory_used_mb);
+      const total = this._n(t.mem_mb);
+      return total > 0 ? Math.min(100, Math.round((used / total) * 100)) : 0;
     },
     role() {
       // RBAC (issue #14): inspect the JWT id_token, return the most-privileged
@@ -769,6 +1185,43 @@ function app() {
     },
     get tenantStatuses() {
       return [...new Set(this.tenants.map(t => t.status).filter(Boolean))].sort();
+    },
+    // 1.2.9 — group hosts by AZ when multi_az is enabled, otherwise return
+    // a single un-titled group so the existing flat layout still works.
+    // Sorted alphabetically by AZ for stable rendering.
+    get groupedHosts() {
+      const multiAz = !!(this.systemInfo?.multi_az?.enabled);
+      if (!multiAz) return [{ az: null, hosts: this.hosts }];
+      const groups = new Map();
+      for (const h of this.hosts) {
+        const az = h.az || '(no az)';
+        if (!groups.has(az)) groups.set(az, []);
+        groups.get(az).push(h);
+      }
+      return [...groups.keys()].sort().map(az => ({ az, hosts: groups.get(az) }));
+    },
+    // 1.2.9 — Fleet by AZ summary for Settings: counts/aggregates per AZ.
+    get fleetByAz() {
+      const groups = new Map();
+      for (const h of this.hosts) {
+        const az = h.az || '(no az)';
+        if (!groups.has(az)) {
+          groups.set(az, { az, hosts: 0, vms: 0, vcpu_used: 0, vcpu_total: 0 });
+        }
+        const g = groups.get(az);
+        g.hosts++;
+        g.vms += this._n(h.vm_count);
+        g.vcpu_used += this._n(h.used_vcpu);
+        g.vcpu_total += this._n(h.total_vcpu);
+      }
+      return [...groups.values()].sort((a, b) => a.az.localeCompare(b.az));
+    },
+    // 1.2.9 — for the create-tenant modal's preferred-host picker. Lists
+    // active hosts with their az + remaining capacity. Sorted by az.
+    availableHostsForCreate() {
+      return this.hosts
+        .filter(h => h.status === 'active' || h.status === 'idle')
+        .sort((a, b) => (a.az || '').localeCompare(b.az || ''));
     },
   };
 }

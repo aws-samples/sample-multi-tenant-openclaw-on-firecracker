@@ -33,6 +33,19 @@ from pathlib import Path
 CFG = yaml.safe_load((Path(__file__).parent.parent / "config.yml").read_text())
 
 
+def _read_pyproject_version():
+    """Best-effort read of the project version so the API can advertise it
+    via /system/info. Falls back to "dev" if pyproject.toml is unreadable
+    (e.g. during a test that mocks the filesystem)."""
+    try:
+        import re
+        text = (Path(__file__).parent.parent / "pyproject.toml").read_text()
+        m = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
+        return m.group(1) if m else "dev"
+    except Exception:
+        return "dev"
+
+
 class OpenClawOrchestratorStack(cdk.Stack):
     def __init__(self, scope: Construct, id: str, **kwargs):
         super().__init__(scope, id, **kwargs)
@@ -170,6 +183,14 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 "QUOTAS_MAX_VCPU": str(CFG.get("quotas", {}).get("max_vcpu_per_tenant", 0)),
                 "QUOTAS_MAX_MEM_MB": str(CFG.get("quotas", {}).get("max_mem_mb_per_tenant", 0)),
                 "QUOTAS_MAX_DATA_DISK_MB": str(CFG.get("quotas", {}).get("max_data_disk_mb", 0)),
+                # Surface feature flags to the API so /system/info can render
+                # accurate state to the console without the console having to
+                # re-parse config.yml. Empty / "false" when feature is off.
+                "MULTI_AZ_ENABLED": str(CFG.get("multi_az", {}).get("enabled", False)).lower(),
+                "MULTI_AZ_COUNT": str(CFG.get("multi_az", {}).get("az_count", 1)),
+                "WAF_ENABLED": str(CFG.get("waf", {}).get("enabled", False)).lower(),
+                "COGNITO_USER_POOL_ID": (CFG.get("console_auth", {}) or {}).get("user_pool_id", ""),
+                "PROJECT_VERSION": _read_pyproject_version(),
             },
         )
         tenants_table.grant_read_write_data(api_fn)
@@ -320,6 +341,18 @@ class OpenClawOrchestratorStack(cdk.Stack):
         agentcore_resource = api.root.add_resource("agentcore")
         agentcore_status_resource = agentcore_resource.add_resource("status")
         agentcore_status_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
+        agentcore_tools_resource = agentcore_resource.add_resource("tools")
+        agentcore_tools_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
+
+        # /system/info — feature flags + config snapshot for the console
+        system_resource = api.root.add_resource("system")
+        system_info_resource = system_resource.add_resource("info")
+        system_info_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
+
+        # /audit-log — already created earlier in the routes, but the
+        # resource needs to exist on the REST API; declare it here once.
+        audit_log_resource = api.root.add_resource("audit-log")
+        audit_log_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
 
         # ========== Health Check Lambda ==========
         health_fn = _lambda.Function(self, "HealthCheck",
@@ -494,8 +527,12 @@ class OpenClawOrchestratorStack(cdk.Stack):
             )
             cdk.CfnOutput(self, "AmpWorkspaceArn", value=amp_workspace.attr_arn)
             cdk.CfnOutput(self, "AmpRemoteWriteUrl", value=amp_remote_write_url)
-            cdk.CfnOutput(self, "GrafanaWorkspaceUrl",
-                value=f"https://{amg_workspace.attr_endpoint}")
+            grafana_url = f"https://{amg_workspace.attr_endpoint}"
+            cdk.CfnOutput(self, "GrafanaWorkspaceUrl", value=grafana_url)
+            # Surface to API Lambda so /system/info can advertise it to the
+            # console (Settings → Monitoring shows a clickable Grafana link).
+            api_fn.add_environment("AMP_REMOTE_WRITE_URL", amp_remote_write_url)
+            api_fn.add_environment("GRAFANA_WORKSPACE_URL", grafana_url)
 
         instance_profile = iam.CfnInstanceProfile(self, "HostInstanceProfile",
             roles=[host_role.role_name],

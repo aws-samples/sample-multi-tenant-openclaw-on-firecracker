@@ -33,7 +33,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.6.0"  # bumped per issue tag (v0.6.0-issue21)
+VERSION = "0.7.0"  # bumped for v1.2.x action coverage (resize/migrate/batch/audit)
 
 ACTION_VERBS = ("restart", "start", "stop", "pause", "resume", "backup", "reset")
 
@@ -162,6 +162,60 @@ def cmd_action(args):
     return 0
 
 
+def cmd_resize(args):
+    """POST /tenants/{id}/resize {vcpu} — hot-add vCPU on a running tenant."""
+    _, body = _request("POST", f"/tenants/{args.id}/resize", body={"vcpu": args.vcpu})
+    print(_fmt_response(body))
+    return 0
+
+
+def cmd_resize_disk(args):
+    """POST /tenants/{id}/resize-disk {new_size_mb} — grow data disk in place."""
+    _, body = _request("POST", f"/tenants/{args.id}/resize-disk",
+                       body={"new_size_mb": args.new_size_mb})
+    print(_fmt_response(body))
+    return 0
+
+
+def cmd_migrate(args):
+    """POST /tenants/{id}/migrate {target_host_id} — Firecracker snapshot/restore live migration."""
+    _, body = _request("POST", f"/tenants/{args.id}/migrate",
+                       body={"target_host_id": args.target_host_id})
+    print(_fmt_response(body))
+    return 0
+
+
+def cmd_batch(args):
+    """POST /batch/tenants — apply one action to many tenants.
+
+    Either --ids id1,id2,... or --tag k:v must be provided.
+    """
+    payload = {"action": args.action}
+    if args.ids:
+        payload["ids"] = [t.strip() for t in args.ids.split(",") if t.strip()]
+    elif args.tag:
+        payload["filter"] = {"tag": args.tag}
+    else:
+        print("error: provide --ids or --tag", file=sys.stderr)
+        return 2
+    _, body = _request("POST", "/batch/tenants", body=payload)
+    print(_fmt_response(body))
+    return 0
+
+
+def cmd_audit_log(args):
+    """GET /audit-log?since=...&limit=... — query the API audit trail."""
+    params = []
+    if args.since:
+        params.append(f"since={urllib.parse.quote(args.since)}")
+    if args.limit:
+        params.append(f"limit={args.limit}")
+    qs = ("?" + "&".join(params)) if params else ""
+    _, body = _request("GET", f"/audit-log{qs}")
+    print(_fmt_response(body))
+    return 0
+
+
 def cmd_backups(_args):
     _, body = _request("GET", "/backups")
     print(_fmt_response(body))
@@ -210,6 +264,34 @@ def _build_parser():
         a = sub.add_parser(verb, help=f"{verb} a tenant's VM")
         a.add_argument("id")
         a.set_defaults(func=cmd_action, action=verb)
+
+    # ── v1.2.x actions ──
+    rs = sub.add_parser("resize", help="Hot-add vCPU on a running tenant")
+    rs.add_argument("id")
+    rs.add_argument("--vcpu", type=int, required=True, help="new vCPU count (must be > current)")
+    rs.set_defaults(func=cmd_resize)
+
+    rd = sub.add_parser("resize-disk", help="Grow data disk in place (offline, ~seconds)")
+    rd.add_argument("id")
+    rd.add_argument("--new-size-mb", type=int, required=True,
+                    help="new data disk size in MB (must be > current)")
+    rd.set_defaults(func=cmd_resize_disk)
+
+    mg = sub.add_parser("migrate", help="Live-migrate a tenant to a different host")
+    mg.add_argument("id")
+    mg.add_argument("--target-host-id", required=True, help="destination EC2 instance id (i-...)")
+    mg.set_defaults(func=cmd_migrate)
+
+    bt = sub.add_parser("batch", help="Apply one action to many tenants in one call")
+    bt.add_argument("action", choices=("stop", "start", "delete", "backup"))
+    bt.add_argument("--ids", help="comma-separated tenant ids")
+    bt.add_argument("--tag", help="tag filter, e.g. team:ml")
+    bt.set_defaults(func=cmd_batch)
+
+    al = sub.add_parser("audit-log", help="Query API audit log (mutating ops only)")
+    al.add_argument("--since", help="ISO 8601 timestamp, e.g. 2026-05-01T00:00:00Z")
+    al.add_argument("--limit", type=int, help="max entries to return (default 50, max 500)")
+    al.set_defaults(func=cmd_audit_log)
 
     sub.add_parser("backups", help="List all backups").set_defaults(func=cmd_backups)
     sub.add_parser("hosts", help="List all hosts").set_defaults(func=cmd_hosts)

@@ -69,6 +69,8 @@ _VIEWER_OK = {
     ("GET", "/tenants/{id}/{action}"),
     ("GET", "/backups"), ("GET", "/hosts"),
     ("GET", "/hosts/rootfs-version"), ("GET", "/agentcore/status"),
+    ("GET", "/agentcore/tools"), ("GET", "/system/info"),
+    ("GET", "/audit-log"),
 }
 
 
@@ -160,6 +162,8 @@ def lambda_handler(event, context):
         ("POST", "/hosts/refresh-rootfs"): refresh_rootfs,
         ("GET", "/hosts/rootfs-version"): rootfs_version,
         ("GET", "/agentcore/status"): agentcore_status,
+        ("GET", "/agentcore/tools"): agentcore_tools,
+        ("GET", "/system/info"): system_info,
         ("GET", "/audit-log"): lambda: _list_audit_log(event.get("queryStringParameters") or {}),
         ("DELETE", "/hosts/{instance_id}"): lambda: deregister_host(
             path_params["instance_id"]
@@ -284,14 +288,32 @@ def create_tenant(body=None):
     tenant_id = _gen_id(name)
     now = _now()
 
-    # Find host with capacity. For clone_from, the clone MUST land on the
-    # source's host so we can do a local cp instead of a slow rsync/S3 hop.
+    # Find host with capacity. The scheduler is normally automatic, but
+    # operators occasionally need to pin a tenant to a specific host (e.g.
+    # to drain a host before terminating it, or to keep two related VMs on
+    # the same hardware). Three modes, in priority order:
+    #   1. clone_from → must land on the source's host (local `cp` only)
+    #   2. preferred_host_id (admin/operator) → land there or fail
+    #   3. default → first host with capacity
+    preferred_host_id = (body.get("preferred_host_id") or "").strip()
     if clone_src:
         host = _get_specific_host_with_capacity(clone_src["host_id"], vcpu, mem_mb)
         if not host:
             return _resp(400, {
                 "error": f"clone source's host {clone_src['host_id']} lacks "
                          f"capacity for clone (vcpu={vcpu}, mem_mb={mem_mb})"
+            })
+    elif preferred_host_id:
+        host = _get_specific_host_with_capacity(preferred_host_id, vcpu, mem_mb)
+        if not host:
+            # Distinguish "host doesn't exist" from "host full" so the
+            # console can render the right message.
+            existing = hosts_table.get_item(Key={"instance_id": preferred_host_id}).get("Item")
+            if not existing or existing.get("status") in ("deleted", "draining"):
+                return _resp(404, {"error": f"preferred_host_id {preferred_host_id} not found or draining"})
+            return _resp(400, {
+                "error": f"preferred_host_id {preferred_host_id} lacks capacity "
+                         f"(vcpu={vcpu}, mem_mb={mem_mb})"
             })
     else:
         host = _find_host(vcpu, mem_mb)
@@ -786,6 +808,10 @@ def register_host(body):
     inst = resp["Reservations"][0]["Instances"][0]
     private_ip = inst["PrivateIpAddress"]
     instance_type = inst.get("InstanceType", "")
+    # Capture the AZ so the console can group/filter hosts and tenants by AZ
+    # without an extra describe_instances call. Falls back to "" rather than
+    # failing if Placement is missing (would be unusual but defensive).
+    az = (inst.get("Placement") or {}).get("AvailabilityZone", "")
     vcpu_total = inst["CpuOptions"]["CoreCount"] * inst["CpuOptions"]["ThreadsPerCore"]
 
     # Resolve memory from the instance type via the EC2 API rather than
@@ -798,6 +824,7 @@ def register_host(body):
     hosts_table.put_item(Item={
         "instance_id": instance_id,
         "private_ip": private_ip,
+        "az": az,
         "total_vcpu": vcpu_total - HOST_RESERVED_VCPU,
         "total_mem_mb": mem_total - HOST_RESERVED_MEM,
         "used_vcpu": 0,
@@ -807,7 +834,7 @@ def register_host(body):
         "status": "active",
         "idle_since": _now(),
     })
-    return _resp(201, {"instance_id": instance_id, "status": "active"})
+    return _resp(201, {"instance_id": instance_id, "status": "active", "az": az})
 
 
 def deregister_host(instance_id):
@@ -884,6 +911,117 @@ def agentcore_status():
     return _resp(200, {
         "enabled": enabled,
         "gateway_url": gateway_url if enabled else None,
+    })
+
+
+# ════════════════════════════════════════════════════════════
+# AgentCore tools listing (for console display)
+# ════════════════════════════════════════════════════════════
+#
+# When AgentCore Gateway is enabled, three Lambda-backed MCP tools are
+# registered (see deploy/stack.py — tools=hello/system_info/timestamp).
+# The console wants to surface this list so operators can see what tools
+# their VMs get for free without having to read the CDK code. The list is
+# static (defined at deploy time), so the response is hard-coded here
+# rather than calling out to bedrock-agentcore at request time — which
+# would cost a control-plane API call per page load.
+#
+# If AgentCore is disabled, we return an empty list with a hint so the
+# console can render an "AgentCore not enabled" placeholder.
+
+_AGENTCORE_BUILTIN_TOOLS = [
+    {
+        "name": "hello",
+        "description": "Say hello — test tool for verifying AgentCore Gateway connectivity",
+        "input_schema": {
+            "type": "object",
+            "properties": {"name": {"type": "string", "description": "Name to greet"}},
+        },
+    },
+    {
+        "name": "system_info",
+        "description": "Get Lambda runtime system information",
+        "input_schema": {"type": "object"},
+    },
+    {
+        "name": "timestamp",
+        "description": "Get current UTC timestamp",
+        "input_schema": {
+            "type": "object",
+            "properties": {"format": {"type": "string", "description": "iso or unix"}},
+        },
+    },
+]
+
+
+def agentcore_tools():
+    """GET /agentcore/tools — list MCP tools registered with the Gateway.
+
+    Today this is a static list (the tools are defined declaratively in
+    stack.py at deploy time). A future PR can replace this with a live
+    `bedrock-agentcore.list_targets()` call when the Gateway grows
+    user-defined tools.
+    """
+    enabled = os.environ.get("AGENTCORE_ENABLED", "false") == "true"
+    if not enabled:
+        return _resp(200, {"enabled": False, "tools": []})
+    return _resp(200, {"enabled": True, "tools": _AGENTCORE_BUILTIN_TOOLS})
+
+
+# ════════════════════════════════════════════════════════════
+# System info — feature flags / config snapshot for the console
+# ════════════════════════════════════════════════════════════
+#
+# The console's Settings tab wants to surface "is multi-AZ on?",
+# "is metrics on?", "is WAF on?" etc. without parsing config.yml.
+# We expose the relevant env-derived flags here so the UI can render
+# accurate state without an out-of-band copy of config.yml.
+
+def system_info():
+    """GET /system/info — feature flags + config snapshot for the console.
+
+    Returns the subset of stack config the console needs to render
+    Settings → Infrastructure: which optional features are enabled, and
+    where to find their associated AWS resources (Grafana URL, SNS topic
+    ARN, etc.). Values come from env vars wired in stack.py.
+    """
+    return _resp(200, {
+        "version": os.environ.get("PROJECT_VERSION", "dev"),
+        "region": os.environ.get("AWS_REGION", ""),
+        "agentcore": {
+            "enabled": os.environ.get("AGENTCORE_ENABLED", "false") == "true",
+            "gateway_url": os.environ.get("AGENTCORE_GATEWAY_URL", "") or None,
+        },
+        "metrics": {
+            "enabled": bool(os.environ.get("AMP_REMOTE_WRITE_URL")),
+            "amp_remote_write_url": os.environ.get("AMP_REMOTE_WRITE_URL", "") or None,
+            "grafana_url": os.environ.get("GRAFANA_WORKSPACE_URL", "") or None,
+        },
+        "multi_az": {
+            "enabled": os.environ.get("MULTI_AZ_ENABLED", "false") == "true",
+            "az_count": int(os.environ.get("MULTI_AZ_COUNT", "1") or "1"),
+        },
+        "waf": {"enabled": os.environ.get("WAF_ENABLED", "false") == "true"},
+        "cognito": {
+            "enabled": bool(os.environ.get("COGNITO_USER_POOL_ID")),
+            "user_pool_id": os.environ.get("COGNITO_USER_POOL_ID", "") or None,
+        },
+        "notifications": {
+            "enabled": bool(NOTIFICATIONS_TOPIC_ARN),
+            "topic_arn": NOTIFICATIONS_TOPIC_ARN or None,
+        },
+        "quotas": {
+            "enabled": QUOTAS_ENABLED,
+            "max_vcpu_per_tenant": QUOTAS_MAX_VCPU,
+            "max_mem_mb_per_tenant": QUOTAS_MAX_MEM_MB,
+            "max_data_disk_mb": QUOTAS_MAX_DATA_DISK_MB,
+        },
+        "host_config": {
+            "cpu_overcommit_ratio": CPU_OVERCOMMIT_RATIO,
+            "mem_overcommit_ratio": MEM_OVERCOMMIT_RATIO,
+            "vm_default_vcpu": VM_DEFAULT_VCPU,
+            "vm_default_mem_mb": VM_DEFAULT_MEM,
+        },
     })
 
 

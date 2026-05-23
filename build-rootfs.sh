@@ -2,20 +2,58 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-# 构建 OpenClaw rootfs + data template 镜像并上传到 S3
-# 用法: ./build-rootfs.sh [version]
-# 示例: ./build-rootfs.sh v1.6
+# Build the OpenClaw rootfs + data template and upload to S3.
+# Usage: ./build-rootfs.sh [version]
+#        ./build-rootfs.sh v1.6
+#
+# Linux-only: relies on debootstrap (Linux package), KVM-friendly chroot,
+# pigz, e2fsprogs. macOS users hit the OS guard below and are pointed at
+# scripts/build-rootfs-on-ec2.sh, which spins up a one-shot Linux builder
+# and runs the same script remotely.
 set -euo pipefail
 
 # Show line number + exit code on any failure so users know exactly where things broke
 trap 'rc=$?; echo "❌ build-rootfs.sh failed at line $LINENO (exit $rc)" >&2; echo "💡 To capture full log next run: ./build-rootfs.sh ${1:-v1.0} 2>&1 | tee build.log" >&2' ERR
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# OS guard. The chroot+debootstrap path is Linux-only — no point in waiting
+# for the "command not found" deep into the script when we know up front
+# the host can't run this. Override with FORCE_LOCAL_BUILD=1 if you really
+# want the script to keep going (e.g. you're on Linux but `uname -s` is
+# unusual, or you've shimmed debootstrap somehow).
+case "$(uname -s)" in
+  Linux) ;;
+  Darwin)
+    if [ "${FORCE_LOCAL_BUILD:-0}" != "1" ]; then
+      echo "❌ build-rootfs.sh requires Linux (debootstrap is Linux-only)."
+      echo
+      echo "  You're on macOS. Use the cloud builder instead — it spins up a"
+      echo "  one-shot t3.medium / t4g.medium Ubuntu host in your AWS account,"
+      echo "  runs this same build via SSM, uploads to S3, and terminates the"
+      echo "  builder. ~10 minutes, no local Linux required:"
+      echo
+      echo "      ./scripts/build-rootfs-on-ec2.sh ${1:-v1.0}"
+      echo
+      echo "  If you have a real Linux build host nearby, ssh into it and run"
+      echo "  this script there instead."
+      echo
+      echo "  Override (not recommended): FORCE_LOCAL_BUILD=1 ./build-rootfs.sh"
+      exit 1
+    fi
+    echo "⚠ FORCE_LOCAL_BUILD=1 set on Darwin — proceeding anyway, but expect"
+    echo "  debootstrap / mount / mkfs.ext4 etc. to fail."
+    ;;
+  *)
+    echo "⚠ Untested host OS: $(uname -s). Continuing (set FORCE_LOCAL_BUILD=1 to silence)."
+    ;;
+esac
+
 ENV_FILE="$SCRIPT_DIR/.env.deploy"
 if [ -f "$ENV_FILE" ]; then
   source "$ENV_FILE"
 else
-  echo "❌ 未找到 .env.deploy，请先运行 ./setup.sh"
+  echo "❌ .env.deploy not found — run ./setup.sh first."
   exit 1
 fi
 

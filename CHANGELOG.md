@@ -1,5 +1,89 @@
 # Changelog
 
+## [1.2.9] — 2026-05-23
+
+Closes the metric-correctness + multi-AZ visibility gaps that 1.2.8 didn't reach. The 2026-05-22 sync flagged that operators "can only see disk usage" in the console — CPU was a hard-coded 0 stub since 1.2.0, and memory often read 0 because balloon stats returned `available_memory: 0` on most kernels. The same sync also asked for "where does multi-AZ show up in the UI" and "let admins pick which host a new tenant lands on". This release does all three at the data layer + UI.
+
+### Fixed — real CPU & memory metrics
+
+- **`host-agent.py` — CPU% from `/proc/<fc_pid>/stat`.** Sample utime+stime jiffies on each poll, diff against the previous sample, divide by the elapsed wall time and the configured vcpu count. Result: `cpu_pct` is now an actual percentage (0–100, capped) instead of the previous hard-coded 0. The Prometheus gauge `openclaw_vm_cpu_pct` carries the same value into AMP, so Grafana dashboards built before today's release start showing real numbers immediately.
+- **`host-agent.py` — memory from `/proc/<fc_pid>/status` VmRSS.** The previous proxy `vm_mem_mb − available_memory` evaluated to 100% on any kernel where balloon stats returned 0. Switched to reading VmRSS from the Firecracker process's `/proc/.../status` (always populated on Linux), which approximately equals guest used + Firecracker overhead. Balloon stats are kept as a fallback for kernels with `VIRTIO_BALLOON_F_STATS_VQ` actually working.
+- **First-sample handling.** The CPU sampler returns 0 on the first poll for a tenant (correct: you can't compute a rate from one point) and on pid reuse (jiffies counter went backwards). 7 dedicated unit tests in `tests/test_monitoring.py::TestComputeCpuPct` cover the boundary cases.
+
+### Added — Console UI
+
+- **Tenants table — vCPU column with usage bar.** Same colored bar style as the disk column (cyan-dim → amber → red at 70/90%), with text "12% / 2 vCPU" so 50% on 1 vcpu vs 2 vcpu reads correctly. Renders the raw `t.vcpu` allocation when the tenant isn't running yet.
+- **Tenants table — Memory column with usage bar.** "1.2G/4G (30%)" — uses the new VmRSS-backed `memory_used_mb` from host-agent. Falls back to the configured `mem_mb` text when metrics aren't available yet.
+- **Hosts panel — group by AZ when multi-AZ is enabled.** When `multi_az.enabled: true`, the Hosts panel splits into per-AZ sections with a small "AZ: ap-northeast-1a · 2 host(s) · 5 VM(s)" header above each group. Single-AZ deployments keep the flat list. Each host card now shows its AZ tag in the header row.
+- **Tenants table — host AZ badge already shipped in 1.2.8** but now shows real data once you've followed the upgrade backfill (see operator notes).
+- **Create-tenant modal — Target host picker.** New optional dropdown lets operator+ pick the exact host for a tenant (admin/operator both can use it; viewer is gated by RBAC at the API layer). Options show `instance_id (az) — N free vCPU, M VM(s)` so you can see capacity at a glance. "Auto" remains the default.
+- **Settings → Fleet by AZ table.** Live distribution of registered hosts and their tenants across AZs, regardless of multi_az setting (so single-AZ deployments also see "all my hosts in 1a"). Refreshes when you load Settings or Monitoring tab.
+
+### Added — API
+
+- **`POST /tenants` accepts `preferred_host_id`.** Three scheduling modes now: clone_from (must same-host), preferred_host_id (admin/operator pin), default (first-fit). 404 when host doesn't exist or is draining; 400 with explicit reason when the host exists but lacks capacity.
+- **`/system/info` now includes `assets_bucket` and `region`** so the console's "open in S3 console" deep links work without needing to embed the bucket name in `console/config.js`.
+
+### Tests
+
+- **+24 net new tests** in `tests/test_monitoring.py` covering `_read_proc_stat_cpu_jiffies` (with comm-with-spaces edge case), `_read_proc_status_rss_kb`, the pure `_compute_cpu_pct` function (8 boundary cases incl. cap, negative delta, zero divisor), and `_sample_cpu_pct` integration.
+- **Status:** 386 passed / 0 failed locally on `pytest -m unit`.
+
+### Operator notes
+
+**Existing fleet won't pick up the metric fixes until the host-agent is reloaded.** Three options in order of intrusiveness — see the new `## Upgrade Guide → Upgrading from v1.2.7 → v1.2.9` section in `README.md` for the exact commands:
+
+1. Roll the ASG: `aws autoscaling set-desired-capacity ... --desired-capacity 0` then back to your normal count. Clean and terminates anything stale, but ~3 min of host warmup before tenants can be created on the new ones.
+2. Push host-agent.py to S3 + run an SSM `AWS-RunShellScript` against the ASG tag to copy + restart. Zero downtime, fastest.
+3. Wait for natural recycling (idle reclamation will eventually replace hosts).
+
+**Same applies to the AZ field on host records.** Existing hosts have no `az` until they re-register. The console gracefully renders `-`; either roll the ASG or run the manual backfill snippet in the upgrade guide.
+
+**Console hard-refresh required.** `setup.sh` re-uploads `console/index.html` to S3. Browser caches the file, so users will see the old layout until they hit Cmd-Shift-R (or wait for CloudFront's ~24 h TTL). Verify with the version banner in the footer (`v1.2.9`).
+
+## [1.2.8] — 2026-05-23
+
+Closes a stack of "feature exists in code but the console hides it" gaps that surfaced in the 2026-05-22 sync between Neo and Xue. The product itself was already at 1.2.7, but several v1.2.x features (live VM migration, Prometheus metrics, AgentCore tools, multi-AZ / WAF / Cognito flags, host AZ) had no UI surface — operators had to read CDK code or `oc` CLI to confirm anything was wired. This release pulls all of that to the console, plus tidies up the CLI / build / test footprint that 1.2.7 left in flux.
+
+### Added — Console UI surfaces
+
+- **Application tab → MCP Tools card.** When `agentcore.enabled: true`, the Application tab now shows the three Lambda-backed MCP tools registered with the Gateway (`hello`, `system_info`, `timestamp`) with description + input schema. Backed by a new `GET /agentcore/tools` endpoint. Empty + helpful "AgentCore not enabled, here's how to turn it on" placeholder otherwise.
+- **Application tab → Skills card enriched.** Each skill row now lays out as a card with a hover-target name, a real description (was clipping to one line), and a deep-link button to the skill's S3 prefix in the AWS console (so editors can update SKILL.md without leaving the browser). Empty state explains the upload + cron pickup flow instead of just "No skills configured".
+- **Monitoring tab (new).** Demo-friendly observability page: live status of AMP / Grafana / SNS, the six per-VM Prometheus gauges with type/labels/description, three sample PromQL queries, and the AMP `remote_write` + Grafana endpoints when `metrics.enabled: true`. Closes the "we have monitoring but the demo doesn't show it" gap from the sync.
+- **Tenants table → AZ column.** New `AZ` column between `Port` and `Rootfs` shows which Availability Zone each tenant's host is in. Powered by the host record's `az` field (see backend changes).
+- **Tenants table → Migrate button.** New 🔀 icon in the Actions column on running tenants opens a modal that lists candidate target hosts (other active hosts, with their AZ + free vCPU + VM count) and POSTs to the existing `/tenants/{id}/migrate`. The Firecracker snapshot/restore round-trip (#20) shipped in 1.2.0 — this release just exposes it.
+- **Settings tab → Infrastructure card.** Enabled / disabled state for multi-AZ, Prometheus+Grafana, WAF, Cognito+RBAC, SNS notifications, per-tenant quotas. Plus a Host Overcommit card showing the current CPU / memory ratios + default per-tenant sizing. Both populated by a new `GET /system/info` endpoint.
+
+### Added — Backend
+
+- **`GET /system/info`.** Feature flags + config snapshot (region, version, multi_az, metrics, waf, cognito, notifications, quotas, host_config). Read-only; available to viewer role; populated from the API Lambda's environment variables (which are now wired in `stack.py`).
+- **`GET /agentcore/tools`.** Returns the static list of Lambda-backed MCP tools registered with the Gateway, with input schema. Static today (the tools are declared in `stack.py` at deploy time); future PRs can swap in a live `bedrock-agentcore.list_targets()` call when the Gateway grows user-defined tools.
+- **Host record now carries `az`.** `init-host.sh` reads the AZ from IMDS during `step5: registering to DynamoDB` and writes it alongside the existing host metadata; the API Lambda's `register_host()` path also populates `az` from `ec2.describe_instances()` Placement. Existing hosts can be backfilled with a manual `aws dynamodb update-item`; new hosts pick it up automatically.
+
+### Fixed
+
+- **`/audit-log` was unreachable from API Gateway.** The Lambda router has had `("GET", "/audit-log")` since 1.2.0 (#48 helper restoration), but the matching `api.root.add_resource("audit-log")` was never declared in `stack.py`, so the route returned API-Gateway-level 404s in production. Added the missing resource. Existing handler code unchanged.
+
+### Changed
+
+- **`build-rootfs.sh` now refuses to run on macOS by default.** debootstrap is Linux-only, and the previous behaviour was to start the build then fail deep into the chroot with a confusing dependency error. The new OS guard prints the cloud-builder one-liner (`./scripts/build-rootfs-on-ec2.sh`) and exits cleanly. `FORCE_LOCAL_BUILD=1 ./build-rootfs.sh` overrides for unusual setups.
+- **`oc` CLI bumped to v0.7.0 with v1.2.x action coverage.** New subcommands: `oc resize <id> --vcpu N`, `oc resize-disk <id> --new-size-mb N`, `oc migrate <id> --target-host-id i-…`, `oc batch <action> --ids a,b,c | --tag k:v`, `oc audit-log [--since ISO] [--limit N]`. Brings the CLI back to parity with the API surface (it had been stuck at v1.0 actions).
+
+### Removed
+
+- **`tests/test_local_dev.py`.** 1.2.7 unshipped the `local-dev/` directory but left this test file in place, asserting the deleted files still existed — guaranteed-fail since 1.2.7. Removed cleanly; LocalStack contributors keep their own private copy under `.dev/` per Neo's note.
+
+### Tests
+
+- **Net new tests:** 12 added in `tests/test_console_api_contract.py` (regex parity, role-list parity, tab-loader parity, new endpoint reachability). Removed: ~10 in `tests/test_local_dev.py` (file deleted).
+- **Status:** 367 passed / 0 failed locally on `pytest -m unit` after the 1.2.8 changes. (The contract tests fail loudly on a typo in either side of the regex, role list, tab declaration, or new endpoint name — designed to catch the kind of "console and API drifted" bug that 1.2.7's name-validation work could have introduced.)
+
+### Operator notes
+
+- **Upgrade path:** `git pull && ./setup.sh <region> <profile>`. The new Lambda env vars (`MULTI_AZ_ENABLED`, `WAF_ENABLED`, `PROJECT_VERSION`, etc.) and new API Gateway resources (`/system/info`, `/agentcore/tools`, `/audit-log`) are added by CDK on the next `cdk deploy`. No DDB migration needed; new fields are additive.
+- **Existing hosts won't backfill `az` until they re-register.** Either roll the ASG (terminate-and-launch) or run `aws dynamodb update-item --table-name openclaw-hosts --key '{"instance_id":{"S":"i-..."}}' --update-expression 'SET az = :a' --expression-attribute-values '{":a":{"S":"ap-northeast-1c"}}'` per host. The console gracefully handles the empty case (column shows `-`).
+- **Console rebuild:** `setup.sh` regenerates `console/config.js` with the new `OC_REGION` + `OC_ASSETS_BUCKET` globals required by the skill S3 deep-link.
+
 ## [1.2.7] — 2026-05-22
 
 ### Changed

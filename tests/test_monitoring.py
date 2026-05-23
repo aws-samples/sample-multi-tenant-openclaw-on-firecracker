@@ -141,7 +141,9 @@ class TestComposeMetrics:
     def test_compose_returns_full_dict(self):
         """_compose_metrics packages all sources into a single dict."""
         with patch.object(agent, "_get_memory_usage", return_value=(2048, 512)), \
-             patch.object(agent, "_get_disk_usage", return_value=(3000, 8192, 36)):
+             patch.object(agent, "_get_disk_usage", return_value=(3000, 8192, 36)), \
+             patch.object(agent, "_read_proc_status_rss_kb", return_value=None), \
+             patch.object(agent, "_sample_cpu_pct", return_value=0):
             m = agent._compose_metrics(
                 tenant_id="t1", vm_mem_mb=4096, sock_file="/tmp/fc.sock",
                 data_file="/tmp/data.ext4")
@@ -150,20 +152,222 @@ class TestComposeMetrics:
         assert m["disk_used_mb"] == 3000
         assert m["disk_total_mb"] == 8192
         assert m["disk_used_pct"] == 36
-        # CPU is reserved for a future PR
+        # cpu_pct is now real (1.2.9), but with a None pid the sampler
+        # short-circuits to 0 — verify the path still produces an int.
         assert "cpu_pct" in m
-        assert m["cpu_pct"] == 0
+        assert isinstance(m["cpu_pct"], int)
+
+    @pytest.mark.unit
+    def test_compose_prefers_vmrss_when_available(self):
+        """1.2.9 — when /proc/<pid>/status returns VmRSS, prefer it over balloon."""
+        with patch.object(agent, "_read_proc_status_rss_kb", return_value=512 * 1024), \
+             patch.object(agent, "_get_balloon_stats", return_value=None), \
+             patch.object(agent, "_get_disk_usage", return_value=(0, 0, 0)), \
+             patch.object(agent, "_sample_cpu_pct", return_value=42):
+            m = agent._compose_metrics(
+                tenant_id="t1", vm_mem_mb=4096, sock_file="/tmp/fc.sock",
+                data_file="/tmp/data.ext4", fc_pid=12345, vcpu=2)
+        # 512 * 1024 KB = 524288 KB → 524288 // 1024 = 512 MB
+        assert m["memory_used_mb"] == 512
+        assert m["cpu_pct"] == 42  # passed through from sampler
 
     @pytest.mark.unit
     def test_compose_returns_zeros_when_sock_missing(self):
         """No socket → memory metrics zeroed but disk still reported."""
         with patch.object(agent, "_get_memory_usage", return_value=(0, 0)), \
-             patch.object(agent, "_get_disk_usage", return_value=(1, 8, 12)):
+             patch.object(agent, "_get_disk_usage", return_value=(1, 8, 12)), \
+             patch.object(agent, "_read_proc_status_rss_kb", return_value=None), \
+             patch.object(agent, "_sample_cpu_pct", return_value=0):
             m = agent._compose_metrics(
                 tenant_id="t1", vm_mem_mb=4096, sock_file=None,
                 data_file="/tmp/data.ext4")
         assert m["memory_used_mb"] == 0
         assert m["disk_used_mb"] == 1
+
+
+# ═══════════════════════════════════════════
+# Real CPU / memory sampling (1.2.9)
+# ═══════════════════════════════════════════
+
+
+class TestProcStatJiffies:
+    """Verify _read_proc_stat_cpu_jiffies parses the /proc/<pid>/stat format
+    correctly, including the comm field with parens + spaces.
+    """
+
+    @pytest.mark.unit
+    def test_returns_none_for_no_pid(self):
+        assert agent._read_proc_stat_cpu_jiffies(None) is None
+        assert agent._read_proc_stat_cpu_jiffies(0) is None
+
+    @pytest.mark.unit
+    def test_returns_none_when_proc_missing(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        # PID guaranteed not to exist for this test
+        assert agent._read_proc_stat_cpu_jiffies(99999999) is None
+
+    @pytest.mark.unit
+    def test_parses_simple_stat_line(self, tmp_path, monkeypatch):
+        """Pid 1234 with utime=100, stime=200 → 300."""
+        proc_pid = tmp_path / "proc" / "1234"
+        proc_pid.mkdir(parents=True)
+        # Field positions (1-indexed): pid=1, comm=2, state=3, ppid=4, pgrp=5,
+        # session=6, tty_nr=7, tpgid=8, flags=9, minflt=10, cminflt=11,
+        # majflt=12, cmajflt=13, utime=14, stime=15, ...
+        # After ')' we drop fields 1+2, so remaining indices are 0=state, ...
+        # utime is at index 11, stime at index 12 in the post-')' split.
+        (proc_pid / "stat").write_text(
+            "1234 (firecracker) S 1 1234 0 0 -1 4194304 0 0 0 0 100 200 0 0 20 0 1 0 0\n"
+        )
+        # Patch open() to read from our fake /proc tree
+        original_open = open
+
+        def fake_open(path, *args, **kwargs):
+            if str(path).startswith("/proc/1234/"):
+                return original_open(str(proc_pid / path.split("/")[-1]), *args, **kwargs)
+            return original_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", fake_open)
+        assert agent._read_proc_stat_cpu_jiffies(1234) == 300
+
+    @pytest.mark.unit
+    def test_handles_comm_with_spaces_and_parens(self, tmp_path, monkeypatch):
+        """comm can contain spaces + parens. We split on the *trailing* `)`."""
+        proc_pid = tmp_path / "proc" / "5678"
+        proc_pid.mkdir(parents=True)
+        (proc_pid / "stat").write_text(
+            "5678 (weird (name) with) S 1 5678 0 0 -1 4194304 0 0 0 0 50 75 0 0\n"
+        )
+        original_open = open
+
+        def fake_open(path, *args, **kwargs):
+            if str(path).startswith("/proc/5678/"):
+                return original_open(str(proc_pid / path.split("/")[-1]), *args, **kwargs)
+            return original_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", fake_open)
+        assert agent._read_proc_stat_cpu_jiffies(5678) == 125  # 50 + 75
+
+
+class TestProcStatusRss:
+    @pytest.mark.unit
+    def test_returns_none_for_no_pid(self):
+        assert agent._read_proc_status_rss_kb(None) is None
+        assert agent._read_proc_status_rss_kb(0) is None
+
+    @pytest.mark.unit
+    def test_parses_vmrss_line(self, tmp_path, monkeypatch):
+        proc_pid = tmp_path / "proc" / "1234"
+        proc_pid.mkdir(parents=True)
+        (proc_pid / "status").write_text(
+            "Name:\tfirecracker\n"
+            "State:\tS (sleeping)\n"
+            "VmPeak:\t  524288 kB\n"
+            "VmSize:\t  524288 kB\n"
+            "VmRSS:\t  102400 kB\n"  # 100 MB
+            "VmData:\t  100000 kB\n"
+        )
+        original_open = open
+
+        def fake_open(path, *args, **kwargs):
+            if str(path).startswith("/proc/1234/"):
+                return original_open(str(proc_pid / path.split("/")[-1]), *args, **kwargs)
+            return original_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", fake_open)
+        assert agent._read_proc_status_rss_kb(1234) == 102400
+
+
+class TestComputeCpuPct:
+    @pytest.mark.unit
+    def test_first_sample_returns_zero(self):
+        # No prior baseline → 0 (correct: we can't compute a rate from one point).
+        assert agent._compute_cpu_pct(None, None, 100, 1.0, vcpu=1) == 0
+
+    @pytest.mark.unit
+    def test_steady_50_percent_one_vcpu(self):
+        """Over 1 second, 50 jiffies of CPU on 100 jiffies/sec clock + 1 vcpu = 50%."""
+        pct = agent._compute_cpu_pct(
+            prev_jiffies=1000, prev_ts=0.0,
+            cur_jiffies=1050, cur_ts=1.0,
+            vcpu=1, clk_tck=100,
+        )
+        assert pct == 50
+
+    @pytest.mark.unit
+    def test_full_load_one_vcpu(self):
+        """100 jiffies in 1s on 1 vcpu = 100%."""
+        pct = agent._compute_cpu_pct(1000, 0.0, 1100, 1.0, vcpu=1, clk_tck=100)
+        assert pct == 100
+
+    @pytest.mark.unit
+    def test_full_load_two_vcpus_is_50_percent_of_allocated(self):
+        """100 jiffies in 1s on 2 vcpus = 50% of allocated."""
+        pct = agent._compute_cpu_pct(1000, 0.0, 1100, 1.0, vcpu=2, clk_tck=100)
+        assert pct == 50
+
+    @pytest.mark.unit
+    def test_capped_at_100(self):
+        """Burst beyond 100% (cgroup catch-up) is clamped to 100."""
+        pct = agent._compute_cpu_pct(1000, 0.0, 1500, 1.0, vcpu=1, clk_tck=100)
+        assert pct == 100
+
+    @pytest.mark.unit
+    def test_negative_delta_returns_zero(self):
+        """Pid reuse / counter wrap → discard, don't return a negative %."""
+        pct = agent._compute_cpu_pct(2000, 0.0, 1000, 1.0, vcpu=1, clk_tck=100)
+        assert pct == 0
+
+    @pytest.mark.unit
+    def test_zero_elapsed_returns_zero(self):
+        pct = agent._compute_cpu_pct(1000, 1.0, 1100, 1.0, vcpu=1, clk_tck=100)
+        assert pct == 0
+
+    @pytest.mark.unit
+    def test_zero_vcpu_returns_zero(self):
+        # Defensive: vm.json with vcpu=0 should not divide-by-zero.
+        pct = agent._compute_cpu_pct(1000, 0.0, 1100, 1.0, vcpu=0, clk_tck=100)
+        assert pct == 0
+
+
+class TestSampleCpuPct:
+    """Integration of _compute_cpu_pct with the rolling-sample state."""
+
+    def setup_method(self):
+        agent._CPU_SAMPLES.clear()
+
+    @pytest.mark.unit
+    def test_first_call_returns_zero_and_records_baseline(self, monkeypatch):
+        """First sample → 0%, baseline cached."""
+        monkeypatch.setattr(agent, "_read_proc_stat_cpu_jiffies", lambda pid: 1000)
+        pct = agent._sample_cpu_pct("t1", 1234, vcpu=1)
+        assert pct == 0
+        assert "t1" in agent._CPU_SAMPLES
+
+    @pytest.mark.unit
+    def test_second_call_uses_baseline(self, monkeypatch):
+        """Second sample → real %, baseline updated."""
+        # Seed t1 with a known prior baseline.
+        agent._CPU_SAMPLES["t1"] = (1000, 0.0)
+        # Now read 1100 jiffies "1 second later" (we patch monotonic to do so).
+        monkeypatch.setattr(agent, "_read_proc_stat_cpu_jiffies", lambda pid: 1100)
+        monkeypatch.setattr(agent.time, "monotonic", lambda: 1.0)
+        pct = agent._sample_cpu_pct("t1", 1234, vcpu=1)
+        # 100 jiffies / 100 hz / 1 vcpu = 100%
+        assert pct == 100
+
+    @pytest.mark.unit
+    def test_no_pid_short_circuits(self):
+        pct = agent._sample_cpu_pct("t1", None, vcpu=1)
+        assert pct == 0
+
+    @pytest.mark.unit
+    def test_proc_unreadable_returns_zero_no_baseline(self, monkeypatch):
+        """If /proc read fails, don't leave a stale baseline."""
+        monkeypatch.setattr(agent, "_read_proc_stat_cpu_jiffies", lambda pid: None)
+        pct = agent._sample_cpu_pct("t1", 1234, vcpu=1)
+        assert pct == 0
+        assert "t1" not in agent._CPU_SAMPLES
 
 
 # ═══════════════════════════════════════════

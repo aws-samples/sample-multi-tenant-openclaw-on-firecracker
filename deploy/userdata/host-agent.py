@@ -48,7 +48,7 @@ _PROM_GAUGES = (
     ("openclaw_vm_disk_used_mb",     "Per-VM data disk used (MB)",            "disk_used_mb"),
     ("openclaw_vm_disk_total_mb",    "Per-VM data disk capacity (MB)",        "disk_total_mb"),
     ("openclaw_vm_disk_used_pct",    "Per-VM data disk used (percent)",       "disk_used_pct"),
-    ("openclaw_vm_cpu_pct",          "Per-VM CPU usage (percent, reserved)",  "cpu_pct"),
+    ("openclaw_vm_cpu_pct",          "Per-VM CPU usage (percent of allocated vcpus)",  "cpu_pct"),
 )
 
 
@@ -163,11 +163,22 @@ def _probe_all():
         if os.path.exists(stopped_marker):
             continue
 
-        # Auto-recover: vm.json exists but Firecracker not running
+        # Auto-recover: vm.json exists but Firecracker not running.
+        # Capture pid here too so the metrics composer can read /proc/<pid>
+        # without re-running pgrep on every gauge.
         sock_file = os.path.join(vm_path, "fc.sock")
-        fc_running = subprocess.run(
+        pgrep = subprocess.run(
             ["pgrep", "-f", f"api-sock {sock_file}"],
-            capture_output=True).returncode == 0
+            capture_output=True, text=True)
+        fc_pid = None
+        if pgrep.returncode == 0:
+            pids = pgrep.stdout.strip().split()
+            if pids:
+                try:
+                    fc_pid = int(pids[0])
+                except (ValueError, IndexError):
+                    pass
+        fc_running = fc_pid is not None
 
         if not fc_running:
             _recover_vm(tenant_id, cfg)
@@ -198,7 +209,8 @@ def _probe_all():
             except Exception:
                 pass
 
-        results[tenant_id] = {"vm_health": vm_health, "app_health": app_health, "guest_ip": guest_ip}
+        results[tenant_id] = {"vm_health": vm_health, "app_health": app_health,
+                              "guest_ip": guest_ip, "fc_pid": fc_pid}
 
     return results
 
@@ -235,13 +247,18 @@ def _write_ddb(results):
             data_file = os.path.join(VM_DIR, tid, "data.ext4")
             cfg_file = os.path.join(VM_DIR, tid, "vm.json")
             vm_mem_mb = 4096
+            vm_vcpu = 1
             try:
                 with open(cfg_file, encoding="utf-8") as f:
-                    vm_mem_mb = json.load(f).get("mem_mb", 4096)
+                    cfg = json.load(f)
+                    vm_mem_mb = cfg.get("mem_mb", 4096)
+                    vm_vcpu = cfg.get("vcpu", 1) or 1
             except Exception:
                 pass
+            fc_pid = info.get("fc_pid")
             try:
-                metrics = _compose_metrics(tid, vm_mem_mb, sock_file, data_file)
+                metrics = _compose_metrics(tid, vm_mem_mb, sock_file, data_file,
+                                           fc_pid=fc_pid, vcpu=vm_vcpu)
             except Exception as e:
                 print(f"compose_metrics {tid}: {e}")
             # Mirror computed metrics back into the in-memory snapshot so
@@ -394,14 +411,156 @@ def _get_memory_usage(stats, vm_mem_mb):
     return used_mb, balloon_mib
 
 
-def _compose_metrics(tenant_id, vm_mem_mb, sock_file, data_file):
+# ───────────────────────────────────────────────
+# Real CPU / memory sampling from /proc/<pid>/* (issue: meeting note
+# 2026-05-22 — "可观测性里你那个内存是读不到的，CPU 也读不到").
+#
+# Background: balloon /statistics often returns available_memory=0 on
+# kernels without VIRTIO_BALLOON_F_STATS_VQ enabled, so the previous
+# proxy `vm_mem_mb - available_mb` evaluated to vm_mem_mb (= 100% RSS,
+# obviously wrong). And cpu_pct was a hard-coded 0 stub. Both surfaced
+# as "—" placeholders in the console.
+#
+# Fix: read straight from /proc/<fc_pid>/* on the host. Firecracker is a
+# normal Linux process, so its CPU time and RSS are first-class kernel
+# stats — no balloon protocol negotiation, no in-guest agent.
+#
+# Memory: VmRSS reflects host-resident memory of the Firecracker process,
+# which is approximately guest_used + Firecracker overhead (~30–60 MB).
+# That's good enough to render a usage bar; we don't subtract overhead so
+# the number is the number you'd see in `top` for the firecracker pid.
+#
+# CPU: utime+stime are cumulative jiffies. We diff against the previous
+# sample for the same tenant and divide by the sampling interval to get
+# the percentage of one CPU. Then we divide by vcpu_count to express it
+# as percent-of-allocated-vcpus (which is what operators want to see —
+# 100% means "all configured vCPUs are pegged").
+# ───────────────────────────────────────────────
+
+
+# Per-tenant rolling window for CPU sampling. {tid → (jiffies, monotonic_ts)}
+# Module-global is fine: the polling thread is the only writer and a
+# missing entry just means "first sample, return 0".
+_CPU_SAMPLES = {}
+
+try:
+    _CLK_TCK = os.sysconf("SC_CLK_TCK")
+except (ValueError, OSError):
+    _CLK_TCK = 100  # Linux default; kept for portability + test isolation.
+
+
+def _read_proc_stat_cpu_jiffies(pid):
+    """Sum of utime + stime from /proc/<pid>/stat, in jiffies. None on failure.
+
+    Pure function (input pid → integer jiffies) so the unit test can drive
+    it through a tmpfs fixture without monkey-patching subprocess. The
+    /proc/PID/stat format is documented in proc(5); fields 14 + 15 (1-indexed)
+    are utime and stime. Note that the comm field (#2) can contain spaces +
+    parentheses, so we split on the *trailing* `)` rather than naïve split.
+    """
+    if not pid:
+        return None
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+            line = f.read()
+    except (FileNotFoundError, PermissionError):
+        return None
+    rparen = line.rfind(")")
+    if rparen < 0:
+        return None
+    fields = line[rparen + 1:].split()
+    # After the trailing `)` we lose fields 1 + 2; field 14 (utime) becomes
+    # index 11, field 15 (stime) becomes index 12.
+    try:
+        return int(fields[11]) + int(fields[12])
+    except (IndexError, ValueError):
+        return None
+
+
+def _read_proc_status_rss_kb(pid):
+    """VmRSS in KB from /proc/<pid>/status. None if unavailable.
+
+    Pure function, easy to fixture in tests.
+    """
+    if not pid:
+        return None
+    try:
+        with open(f"/proc/{pid}/status", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1])
+    except (FileNotFoundError, PermissionError, ValueError):
+        return None
+    return None
+
+
+def _compute_cpu_pct(prev_jiffies, prev_ts, cur_jiffies, cur_ts, vcpu, clk_tck=_CLK_TCK):
+    """Compute CPU% (of allocated vcpus) from two /proc/stat samples.
+
+    Pure function. Returns 0 on the first sample (no prior baseline) and
+    on bogus inputs (negative delta means pid was reused, vcpu==0 means
+    the caller forgot to populate it). Caps at 100 — overshoot can happen
+    if the guest briefly outruns its quota and the host accounting catches
+    up unevenly.
+    """
+    if prev_jiffies is None or cur_jiffies is None:
+        return 0
+    if prev_ts is None or cur_ts is None or cur_ts <= prev_ts:
+        return 0
+    if cur_jiffies < prev_jiffies:
+        return 0  # pid reused or counter wrapped — discard
+    if not vcpu or vcpu <= 0 or clk_tck <= 0:
+        return 0
+    elapsed_s = cur_ts - prev_ts
+    cpu_seconds = (cur_jiffies - prev_jiffies) / clk_tck
+    pct = int((cpu_seconds / elapsed_s / vcpu) * 100)
+    return max(0, min(100, pct))
+
+
+def _sample_cpu_pct(tenant_id, fc_pid, vcpu):
+    """Read current jiffies, compare to last sample, return CPU%.
+
+    Side effect: updates _CPU_SAMPLES so the next call has a baseline.
+    Returns 0 on the first sample for a tenant.
+    """
+    now = time.monotonic()
+    cur_jiffies = _read_proc_stat_cpu_jiffies(fc_pid)
+    prev = _CPU_SAMPLES.get(tenant_id)
+    pct = 0
+    if prev is not None and cur_jiffies is not None:
+        prev_jiffies, prev_ts = prev
+        pct = _compute_cpu_pct(prev_jiffies, prev_ts, cur_jiffies, now, vcpu)
+    if cur_jiffies is not None:
+        _CPU_SAMPLES[tenant_id] = (cur_jiffies, now)
+    return pct
+
+
+def _compose_metrics(tenant_id, vm_mem_mb, sock_file, data_file, fc_pid=None, vcpu=1):
     """Build the per-VM metrics dict written to DDB.
 
-    cpu_pct is a stub (0) for this PR — a future change can plug in cgroup
-    accounting or Firecracker host-side stats.
+    1.2.9 fix: cpu_pct now comes from /proc/<fc_pid>/stat sampling rather
+    than the previous hard-coded 0; memory_used_mb now prefers VmRSS over
+    the unreliable balloon stats path. The balloon-stats path is kept as a
+    fallback so hosts on older kernels still report something sensible.
     """
+    # CPU — real %, sampled across two polls.
+    cpu_pct = _sample_cpu_pct(tenant_id, fc_pid, vcpu)
+
+    # Memory — VmRSS first (always readable on Linux), balloon as fallback.
+    mem_used = 0
+    rss_kb = _read_proc_status_rss_kb(fc_pid) if fc_pid else None
+    if rss_kb:
+        mem_used = rss_kb // 1024  # KB → MB
+
+    # Balloon stats are still useful for `memory_balloon_mib` (how much the
+    # host has reclaimed) regardless of whether available_memory is reliable.
     stats = _get_balloon_stats(sock_file) if sock_file else None
-    mem_used, balloon_mib = _get_memory_usage(stats, vm_mem_mb)
+    balloon_used_mb, balloon_mib = _get_memory_usage(stats, vm_mem_mb)
+    if not mem_used:
+        mem_used = balloon_used_mb  # last-ditch fallback
+
     disk_used, disk_total, disk_pct = _get_disk_usage(data_file)
     return {
         "memory_used_mb": int(mem_used),
@@ -409,7 +568,7 @@ def _compose_metrics(tenant_id, vm_mem_mb, sock_file, data_file):
         "disk_used_mb": int(disk_used),
         "disk_total_mb": int(disk_total),
         "disk_used_pct": int(disk_pct),
-        "cpu_pct": 0,
+        "cpu_pct": int(cpu_pct),
     }
 
 

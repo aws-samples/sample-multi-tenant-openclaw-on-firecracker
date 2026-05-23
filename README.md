@@ -96,6 +96,54 @@ source .env.deploy && ./build-rootfs.sh <new_version>
 # New tenants use the new rootfs immediately; existing tenants need a reset API call to switch over
 ```
 
+### Upgrading from v1.2.9 → v1.3.0
+
+The 1.3.0 release adds **automatic AZ-level failover** + **default 2-host multi-AZ deployment**. Two layers of attention:
+
+```bash
+git pull && ./setup.sh <region> <profile>     # bumps ASG min_capacity to 2,
+                                              # multi_az.enabled to true,
+                                              # adds health_check.az_failover
+                                              # config block, gives the
+                                              # health_check Lambda new IAM
+                                              # (write hosts, write audit,
+                                              # publish SNS) and 4 new env vars.
+```
+
+After the redeploy:
+
+- **The ASG will scale up by one host on first redeploy** (`min_capacity` 1 → 2). The new host will land in a different AZ from the existing one if `multi_az.enabled: true` and the region has ≥ 2 AZs. Cost impact: one additional EC2 instance (default `m8i.2xlarge` = ~$0.50/hr in ap-northeast-1). Set `min_capacity: 1` in your `config.yml` if you want to keep single-host.
+
+- **Existing hosts won't be writing heartbeats to the hosts table** until the v1.3.0 host-agent is rolled out. The `is_host_unhealthy` predicate treats missing timestamps as unhealthy → first health_check Lambda invocation may flag your existing AZ as down. **Two safe paths:**
+
+  ```bash
+  # Option A: temporarily disable AZ failover during the agent rollout, re-enable after.
+  # Edit config.yml: set health_check.az_failover.enabled: false
+  ./setup.sh <region> <profile>     # redeploy with failover off
+  source .env.deploy
+  aws s3 cp deploy/userdata/host-agent.py s3://${ASSETS_BUCKET}/deployment/scripts/host-agent.py
+  aws ssm send-command --document-name AWS-RunShellScript \
+      --targets Key=tag:aws:autoscaling:groupName,Values=openclaw-hosts-asg \
+      --parameters 'commands=[
+        "aws s3 cp s3://'${ASSETS_BUCKET}'/deployment/scripts/host-agent.py /opt/openclaw/host-agent.py",
+        "if ! grep -q ^INSTANCE_ID= /etc/platform.env; then TOKEN=$(curl -s -X PUT -H X-aws-ec2-metadata-token-ttl-seconds:600 http://169.254.169.254/latest/api/token); IID=$(curl -s -H X-aws-ec2-metadata-token:$TOKEN http://169.254.169.254/latest/meta-data/instance-id); echo INSTANCE_ID=$IID >> /etc/platform.env; fi",
+        "systemctl restart host-agent"
+      ]'
+  # Wait 1 minute for at least one heartbeat per host, then re-enable failover.
+  # Edit config.yml: set health_check.az_failover.enabled: true
+  ./setup.sh <region> <profile>
+
+  # Option B (faster, slightly less safe): roll the ASG and let the new init-host.sh
+  # take care of populating last_health_check from scratch.
+  aws autoscaling set-desired-capacity --auto-scaling-group-name openclaw-hosts-asg --desired-capacity 0
+  # wait for instances to drain, then bring back up
+  aws autoscaling set-desired-capacity --auto-scaling-group-name openclaw-hosts-asg --desired-capacity 2
+  ```
+
+- **Synthetic `__az_failover_state__` record.** The first AZ outage will create a synthetic host record with that key in the `openclaw-hosts` table to remember per-AZ cooldown across Lambda invocations. It's filtered out of `/hosts` API responses (no console / CLI / dashboard impact) and kept indefinitely so cooldown survives Lambda redeploys.
+
+- **Console refresh:** new tabs / Hosts grouping / Fleet by AZ are picked up by hard-refreshing the browser. The v1.3.0 footer is the easiest sanity check.
+
 ### Upgrading from v1.2.7 → v1.2.9
 
 The 1.2.8 + 1.2.9 releases stack a lot of console-surface fixes and metric correctness on top of an unchanged data plane. Most of it picks up automatically on `setup.sh`, but a few items need a one-time touch:

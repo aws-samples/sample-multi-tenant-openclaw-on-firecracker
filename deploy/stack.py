@@ -356,6 +356,8 @@ class OpenClawOrchestratorStack(cdk.Stack):
         audit_log_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
 
         # ========== Health Check Lambda ==========
+        hc_cfg = CFG.get("health_check", {}) or {}
+        az_failover_cfg = hc_cfg.get("az_failover", {}) or {}
         health_fn = _lambda.Function(self, "HealthCheck",
             function_name="openclaw-health-check",
             runtime=_lambda.Runtime.PYTHON_3_12,
@@ -366,10 +368,19 @@ class OpenClawOrchestratorStack(cdk.Stack):
             environment={
                 "TENANTS_TABLE": tenants_table.table_name,
                 "HOSTS_TABLE": hosts_table.table_name,
+                "AUDIT_TABLE": audit_table.table_name,
+                "SNS_TOPIC_ARN": notifications_topic_arn,
+                "ASSETS_BUCKET": assets_bucket.bucket_name,
+                "AZ_FAILOVER_ENABLED": str(bool(az_failover_cfg.get("enabled", True))).lower(),
+                "AZ_UNHEALTHY_THRESHOLD_MINUTES": str(int(az_failover_cfg.get("unhealthy_threshold_minutes", 10))),
+                "AZ_COOLDOWN_MINUTES": str(int(az_failover_cfg.get("cooldown_minutes", 30))),
             },
         )
         tenants_table.grant_read_write_data(health_fn)
-        hosts_table.grant_read_data(health_fn)
+        hosts_table.grant_read_write_data(health_fn)
+        audit_table.grant_write_data(health_fn)
+        if notifications_topic is not None:
+            notifications_topic.grant_publish(health_fn)
         health_fn.add_to_role_policy(ssm_policy)
 
         events.Rule(self, "HealthCheckSchedule",

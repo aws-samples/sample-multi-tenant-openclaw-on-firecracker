@@ -147,6 +147,27 @@ class TestListHosts:
         body = json.loads(api.list_hosts()["body"])
         assert body == []
 
+    @pytest.mark.unit
+    def test_filters_out_synthetic_state_records(self):
+        """1.3.0 — the health_check Lambda stores AZ-failover cooldown state
+        on a synthetic host record with instance_id='__az_failover_state__'.
+        list_hosts must not leak that to the console / API consumers, who
+        expect every returned record to be a real EC2 host with private_ip,
+        total_vcpu, etc.
+        """
+        api.hosts_table = make_ddb_table()
+        api.hosts_table.scan.return_value = {"Items": [
+            {"instance_id": "i-real", "status": "active", "vm_count": 0,
+             "private_ip": "10.0.0.1"},
+            {"instance_id": "__az_failover_state__",
+             "az_last_failover": {"az-a": "2026-01-01T00:00:00Z"}},
+            {"instance_id": "__future_state__", "some_field": "x"},
+        ]}
+        body = json.loads(api.list_hosts()["body"])
+        ids = [h["instance_id"] for h in body]
+        assert ids == ["i-real"]
+        assert all(not i.startswith("__") for i in ids)
+
 
 # ═══════════════════════════════════════════
 # Tenant CRUD

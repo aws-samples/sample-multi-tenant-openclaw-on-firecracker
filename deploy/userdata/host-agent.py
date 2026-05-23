@@ -25,6 +25,11 @@ PORT = int(os.environ.get("OC_AGENT_PORT", "8899"))
 VM_DIR = "/data/firecracker-vms"
 GATEWAY_PORT = 18789
 TENANTS_TABLE = os.environ.get("TENANTS_TABLE", "")
+# Since 1.3.0: host-agent also writes a heartbeat to the hosts table so the
+# health_check Lambda can do AZ-level failover (it needs to know which hosts
+# are still alive at the host level, not just whether their tenants reported).
+HOSTS_TABLE = os.environ.get("HOSTS_TABLE", "")
+INSTANCE_ID = os.environ.get("INSTANCE_ID", "")
 
 
 # ═══════════════════════════════════════════
@@ -229,6 +234,28 @@ def _read_gateway_token(guest_ip):
     except Exception as e:
         print(f"read token from {guest_ip}: {e}")
         return ""
+
+
+def _write_host_heartbeat():
+    """Update this host's ``last_seen`` and ``last_health_check`` timestamps in
+    the hosts table. Called every poll so the health_check Lambda can detect
+    AZ-level outages by checking host-level freshness (not just tenant-level
+    health, which goes stale only when a tenant exists). Best-effort; never
+    raises.
+    """
+    if not HOSTS_TABLE or not INSTANCE_ID:
+        return
+    try:
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        table = _get_ddb().Table(HOSTS_TABLE)
+        table.update_item(
+            Key={"instance_id": INSTANCE_ID},
+            UpdateExpression="SET last_seen = :t, last_health_check = :t",
+            ExpressionAttributeValues={":t": ts},
+        )
+    except Exception as e:
+        # Heartbeat failures must never crash the poll loop.
+        print(f"host heartbeat failed (non-fatal): {e}")
 
 
 def _write_ddb(results):
@@ -678,6 +705,9 @@ def _adjust_balloons(probe_results):
 def _poll_loop():
     while True:
         try:
+            # 1.3.0: heartbeat at the start so failures in tenant probing
+            # don't suppress the host-level liveness signal.
+            _write_host_heartbeat()
             results = _probe_all()
             ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             with _lock:

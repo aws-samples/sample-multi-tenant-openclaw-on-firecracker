@@ -185,3 +185,18 @@ class TestNewEndpointsWired:
         """Console's migrate modal posts to /tenants/{id}/migrate."""
         assert "tenants/' + id + '/migrate'" in INDEX_HTML or \
                "tenants/' + id + '/migrate" in INDEX_HTML
+
+    def test_refresh_loads_system_info(self):
+        """refresh() must include loadSystemInfo so the Tenants tab can
+        render hosts grouped by AZ when multi_az is enabled (1.3.0).
+        Otherwise the group header silently disappears and the UI
+        regresses to a flat list even though the data is correct.
+        """
+        # Find the body of refresh() and assert loadSystemInfo is in it.
+        m = re.search(r"async\s+refresh\s*\(\s*\)\s*\{([^}]*)\}", INDEX_HTML)
+        assert m, "could not locate refresh() in console/index.html"
+        body = m.group(1)
+        assert "loadSystemInfo" in body, (
+            "refresh() must call loadSystemInfo() so all tabs see "
+            "systemInfo (multi_az flag, fleet-by-AZ, etc.)"
+        )

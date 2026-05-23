@@ -1,5 +1,44 @@
 # Changelog
 
+## [1.3.0] — 2026-05-24
+
+Closes the AZ-level failover gap that v1.2.x left open and finally answers the 2026-05-22 sync ask **"if an AZ goes down, can the tenants on it auto-restart somewhere else?"** — yes, automatically, every five minutes, with cooldown protection. Plus default deployments now actually run in two AZs out of the box, instead of single-AZ with a config flag you had to remember to flip.
+
+### Added — automatic AZ failover
+
+- **`health_check` Lambda gains AZ-level failover orchestration.** Every poll (default every 5 minutes) the watchdog now also groups hosts by AZ and treats an AZ as unavailable if every host in it has gone stale (no `last_health_check` heartbeat from host-agent for ≥ `unhealthy_threshold_minutes`, default 10). When an outage is confirmed, the Lambda picks a healthy target host in another AZ (sorted by spare vCPU, deterministic instance_id tie-break), relaunches each affected `running` tenant on it via SSM `launch-vm.sh --restore-from <latest-backup>`, flips DDB ownership, writes audit-log entries, and publishes an SNS event. A per-AZ cooldown (default 30 minutes) prevents flapping.
+- **5 pure-function helpers** carry the orchestration logic so it's all unit-testable without AWS access: `is_host_unhealthy`, `group_hosts_by_az`, `detect_unhealthy_azs`, `pick_target_host`, `should_skip_az_for_cooldown`. Plus `_check_and_handle_az_failover` (orchestrator) and `_failover_tenant_to_host` (per-tenant relaunch).
+- **`host-agent.py` now writes a heartbeat to the hosts table.** Every poll cycle the agent updates `last_seen` + `last_health_check` on its own DDB host record. This is what the AZ-failover Lambda watches — without it, host-level liveness would be invisible (the previous tenant-level signal goes stale only when a tenant exists).
+- **New `INSTANCE_ID` env on host-agent**, populated by `init-host.sh` from IMDS into `/etc/platform.env` so the agent knows which host record to update.
+
+### Changed — defaults
+
+- **Default ASG capacity is now 2 hosts in 2 AZs.** `config.yml.example` ships `asg.min_capacity: 2`, `asg.max_capacity: 8`, and `multi_az.enabled: true` by default. Single-AZ stays a one-line opt-out for cost-sensitive non-prod environments. The bump is needed for AZ failover to have an actual fallback target — a 1-host fleet has no place to migrate to.
+- **`health_check.az_failover` block in `config.yml`** with `enabled` (default true), `unhealthy_threshold_minutes` (default 10), `cooldown_minutes` (default 30). Set `enabled: false` to keep the watchdog active but disable the failover side.
+
+### Fixed — UX bugs surfaced during validation
+
+- **Console didn't load `systemInfo` on the Tenants tab,** so the "Hosts by AZ" group header silently never rendered even when multi_az was enabled. `refresh()` now calls `loadSystemInfo()` alongside `loadHosts/Tenants/Templates`. Discovered by Playwright + DOM inspection during the v1.3.0 multi-AZ proof shoot.
+- **`/hosts` API leaked the synthetic `__az_failover_state__` record.** The orchestrator stores per-AZ cooldown state on a host record with that special key. `list_hosts()` now filters out any `instance_id` starting with `__` so the console / regression tests never see these internal bookkeeping rows. Caught by the existing `test_hosts_have_expected_fields` regression check, which started failing as soon as the first AZ failover state was persisted.
+
+### Tests — 441 passed / 0 failed (excluding 1 pre-existing flaky E2E)
+
+- **+34 tests** in `tests/test_az_failover.py`: pure-function boundary cases (threshold edges, missing fields, sorting determinism, exclusion rules) + orchestration mocks (cooldown skip, no-target-AZ behaviour, SSM/audit/SNS side-effects, `audit_table.put_item` failure non-fatality, feature-flag noop).
+- **+4 tests** in `tests/test_monitoring.py::TestHostHeartbeat`: `_write_host_heartbeat` writes both fields with same timestamp; skips when `HOSTS_TABLE` empty; skips when `INSTANCE_ID` empty; swallows DDB throttle exceptions.
+- **+1 console-contract test** in `tests/test_console_api_contract.py::test_refresh_loads_system_info` — fails loudly if a future refactor pulls `loadSystemInfo` out of `refresh()` again.
+- **+1 API regression test** in `tests/test_api.py::test_filters_out_synthetic_state_records` — guards `list_hosts` against future internal-record leakage.
+- Existing 12 `tests/test_health_check.py` cases all still pass — the new AZ failover code is appended in a separate function, so the v1.0 watchdog path is unchanged.
+
+Total: **441 passed** locally (up from v1.2.9's 386, **+55 tests**). One E2E (`test_backup_and_restore_from_latest`) is a pre-existing flaky test that fails on transient SSL/network errors — independent of this release.
+
+### Operator notes
+
+- **Existing fleet (1.2.x hosts) won't pick up the heartbeat code until host-agent is reloaded.** Push the new agent to S3 (`aws s3 cp deploy/userdata/host-agent.py s3://${ASSETS_BUCKET}/deployment/scripts/host-agent.py`) and rollout via SSM Run Command — the upgrade snippet in the README now also injects `INSTANCE_ID` into `/etc/platform.env` for hosts launched on older init-host.sh.
+- **Existing host records won't have `last_seen` / `last_health_check`** until the new agent runs at least once. The `is_host_unhealthy` predicate treats missing-timestamps as unhealthy, which means the first health_check Lambda invocation after upgrade may briefly report `az_outages_detected: N` for every AZ. The cooldown protects against bogus failover, and a single agent poll (≤5s) populates the fields. **Safer rollout**: stop the EventBridge schedule for 1–2 minutes during the rollout, or set `health_check.az_failover.enabled: false` in config and re-deploy → roll the agent → re-enable.
+- **The synthetic `__az_failover_state__` record** lives in the hosts DDB table once an outage triggers. It contains only cooldown state (no PII) and is intentionally not garbage-collected — kept indefinitely so cooldown survives across Lambda redeploys.
+
+---
+
 ## [1.2.9] — 2026-05-23
 
 Closes the metric-correctness + multi-AZ visibility gaps that 1.2.8 didn't reach. The 2026-05-22 sync flagged that operators "can only see disk usage" in the console — CPU was a hard-coded 0 stub since 1.2.0, and memory often read 0 because balloon stats returned `available_memory: 0` on most kernels. The same sync also asked for "where does multi-AZ show up in the UI" and "let admins pick which host a new tenant lands on". This release does all three at the data layer + UI.

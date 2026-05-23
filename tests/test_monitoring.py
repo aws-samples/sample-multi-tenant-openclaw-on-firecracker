@@ -468,3 +468,79 @@ class TestWriteMetricsToDDB:
         for c in agent.tenants_table.update_item.call_args_list:
             ue = c.kwargs.get("UpdateExpression", "")
             assert "metrics" not in ue
+
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Host-level heartbeat (1.3.0) — required for AZ failover
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestHostHeartbeat:
+    """The 1.3.0 AZ-failover path needs host-level liveness to distinguish
+    "host alive but tenant misbehaving" from "host (and AZ) actually down".
+    These tests verify the heartbeat writes the right shape and that
+    failures degrade gracefully (the poll loop must NEVER crash on a
+    transient DDB error).
+    """
+
+    @pytest.mark.unit
+    def test_heartbeat_writes_last_seen_and_last_health_check(self):
+        """Both fields are required: last_seen for the human eye in the
+        console, last_health_check for the AZ-failover threshold check.
+        """
+        with patch.object(agent, "HOSTS_TABLE", "openclaw-hosts"), \
+             patch.object(agent, "INSTANCE_ID", "i-test"), \
+             patch.object(agent, "_get_ddb") as mock_ddb_resource:
+            mock_table = MagicMock()
+            mock_ddb_resource.return_value.Table.return_value = mock_table
+            agent._write_host_heartbeat()
+        # Exactly one update_item call.
+        assert mock_table.update_item.call_count == 1
+        call = mock_table.update_item.call_args
+        assert call.kwargs["Key"] == {"instance_id": "i-test"}
+        ue = call.kwargs["UpdateExpression"]
+        assert "last_seen" in ue and "last_health_check" in ue
+        # Both fields share the same timestamp value.
+        vals = call.kwargs["ExpressionAttributeValues"]
+        assert ":t" in vals
+        # ISO-8601-ish format (YYYY-MM-DDTHH:MM:SSZ).
+        assert "T" in vals[":t"] and vals[":t"].endswith("Z")
+
+    @pytest.mark.unit
+    def test_heartbeat_skips_when_table_not_configured(self):
+        """Older deployments without HOSTS_TABLE in /etc/platform.env must
+        not crash — heartbeat is a 1.3.0 addition; the rest of the agent
+        keeps working on legacy hosts.
+        """
+        with patch.object(agent, "HOSTS_TABLE", ""), \
+             patch.object(agent, "INSTANCE_ID", "i-test"), \
+             patch.object(agent, "_get_ddb") as mock_ddb_resource:
+            agent._write_host_heartbeat()
+            mock_ddb_resource.assert_not_called()
+
+    @pytest.mark.unit
+    def test_heartbeat_skips_when_instance_id_missing(self):
+        """If IMDS lookup failed at boot, INSTANCE_ID is empty — better to
+        skip than to write a heartbeat under the wrong key.
+        """
+        with patch.object(agent, "HOSTS_TABLE", "openclaw-hosts"), \
+             patch.object(agent, "INSTANCE_ID", ""), \
+             patch.object(agent, "_get_ddb") as mock_ddb_resource:
+            agent._write_host_heartbeat()
+            mock_ddb_resource.assert_not_called()
+
+    @pytest.mark.unit
+    def test_heartbeat_swallows_ddb_failure(self):
+        """A DDB throttle / network error must NEVER take down the poll
+        loop. The next poll will retry; one missed heartbeat will not flip
+        AZ failover (10-min threshold by default, polls every 5s).
+        """
+        with patch.object(agent, "HOSTS_TABLE", "openclaw-hosts"), \
+             patch.object(agent, "INSTANCE_ID", "i-test"), \
+             patch.object(agent, "_get_ddb") as mock_ddb_resource:
+            mock_table = MagicMock()
+            mock_table.update_item.side_effect = Exception("Throttled")
+            mock_ddb_resource.return_value.Table.return_value = mock_table
+            # Must not raise.
+            agent._write_host_heartbeat()

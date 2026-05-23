@@ -746,6 +746,11 @@ def list_hosts():
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":d": "deleted"},
     ).get("Items", [])
+    # Filter out synthetic records (e.g. __az_failover_state__ used by the
+    # health_check Lambda to remember per-AZ cooldown — added in 1.3.0).
+    # Anything starting with "__" is reserved for internal bookkeeping and
+    # must not appear in user-facing host lists.
+    items = [h for h in items if not str(h.get("instance_id", "")).startswith("__")]
     for item in items:
         item["cpu_overcommit_ratio"] = CPU_OVERCOMMIT_RATIO
         item["mem_overcommit_ratio"] = MEM_OVERCOMMIT_RATIO

@@ -96,6 +96,33 @@ source .env.deploy && ./build-rootfs.sh <new_version>
 # 新建租户立刻使用新 rootfs; 已有租户需调用 reset API 才会切换
 ```
 
+### 从 v1.2.9 升级到 v1.3.0
+
+1.3.0 加入**自动 AZ 故障切换**，并默认部署 2 台 host 到 2 个不同 AZ。两点需要注意:
+
+```bash
+git pull && ./setup.sh <region> <profile>     # ASG min_capacity 1 → 2
+                                              # multi_az.enabled 默认开
+                                              # health_check 加 az_failover 块
+                                              # health_check Lambda 多 4 个 env
+```
+
+部署后:
+
+- **首次重新部署后 ASG 会自动起一台新 host** (min_capacity 1 → 2). 新 host 会落到与现有 host 不同的 AZ. 成本: 多一个 EC2 实例 (默认 m8i.2xlarge, ap-northeast-1 ~$0.50/小时). 想保持单 host 请把 `min_capacity: 1` 写回 `config.yml`.
+- **现有 host 还没向 hosts 表写心跳**, 直到 v1.3.0 host-agent rollout 到位为止. `is_host_unhealthy` 把缺时间戳判定为 unhealthy → 第一次 health_check Lambda 调用可能误判 AZ 全部 down.
+- **安全做法**: 在 host-agent rollout 期间临时关闭 `health_check.az_failover.enabled`, rollout 完后再开. 详细命令见英文 README 的 "Upgrade Guide → Upgrading from v1.2.9 → v1.3.0" 章节.
+- **新建合成记录 `__az_failover_state__`** 会在第一次 AZ 故障切换时出现在 hosts 表里, 仅记录 cooldown 状态, `/hosts` API 已过滤, 不会污染 console / CLI / dashboard.
+
+### 从 v1.2.7 升级到 v1.2.9
+
+1.2.8 + 1.2.9 主要是 console UI 表面化 + metric 修复. 数据面没改, `setup.sh` 后:
+
+- **现有 host 没有 `az` 字段**, 要么滚动 ASG 让重新注册, 要么用英文 README 的 backfill 脚本批量更新 `az` 字段.
+- **现有 host-agent 还是旧版本**, 推送新版到 S3 + SSM Run Command 重启即可 (详细命令见英文 README).
+- **DDB schema 全部 additive**, 已有租户记录无需迁移.
+- **Console 硬刷新**或等 CloudFront TTL 才能看到新 tab.
+
 ## 快速开始
 
 **前置条件:**

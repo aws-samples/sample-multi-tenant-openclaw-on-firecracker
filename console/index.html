@@ -848,7 +848,7 @@ function app() {
       return r.json();
     },
     async refresh() {
-      await Promise.all([this.loadHosts(), this.loadTenants(), this.loadTemplates()]);
+      await Promise.all([this.loadHosts(), this.loadTenants(), this.loadTemplates(), this.loadSystemInfo()]);
     },
     async loadHosts() {
       if (!this.apiUrl || !this.apiKey) return;

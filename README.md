@@ -194,14 +194,33 @@ Web-based console hosted on CloudFront (`/console/`), with Cognito authenticatio
 Features:
 - **Tenants** — Host resource overview, create/delete tenants, one-click Dashboard access
 - **Application** — Shared skills list, config template management (create/edit/delete)
+- **Tenants** — Host resource overview, create/delete tenants, one-click Dashboard access, per-VM CPU/memory/disk progress bars, AZ column, live migration
+- **Application** — Shared skills, AgentCore MCP tools surface (when enabled), config template management
+- **Monitoring** — Prometheus metrics inventory, sample PromQL, one-click Grafana access
 - **Backups** — Cross-tenant backup explorer with per-tenant grouping, orphan filter, and one-click restore into a new tenant
-- **Settings** — API connection, AgentCore status, system info
+- **Settings** — API connection, infrastructure feature flags (multi-AZ / WAF / RBAC / SNS / quotas), Host overcommit ratios, Fleet by AZ distribution
 
 ### Screenshots
 
+**Tenants** — vCPU / Memory / Disk progress bars on each running tenant, AZ column, Migrate button:
+
 ![Tenants tab](docs/web_console.png)
 
+**Application** — Shared Skills + MCP Tools (the latter surfaces when AgentCore is enabled, listing each Lambda-backed tool registered with the Gateway):
+
+![Application tab](docs/web_console_application.png)
+
+**Monitoring** — observability page: AMP/Grafana status, full per-VM Prometheus gauge inventory with types + labels + descriptions, copy-pasteable PromQL examples, AMP / Grafana endpoints:
+
+![Monitoring tab](docs/web_console_monitoring.png)
+
+**Backups** — cross-tenant explorer; orphan backups (from deleted tenants) are still restorable into a fresh tenant:
+
 ![Backups tab](docs/web_console_backup.png)
+
+**Settings** — at-a-glance infrastructure status: multi-AZ HA, Prometheus + Grafana, AWS WAF, Cognito + RBAC, SNS lifecycle events, per-tenant quotas, host overcommit ratios, and a live Fleet-by-AZ table:
+
+![Settings tab](docs/web_console_settings.png)
 
 ## Dashboard Access
 

@@ -190,6 +190,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 "MULTI_AZ_COUNT": str(CFG.get("multi_az", {}).get("az_count", 1)),
                 "WAF_ENABLED": str(CFG.get("waf", {}).get("enabled", False)).lower(),
                 "COGNITO_USER_POOL_ID": (CFG.get("console_auth", {}) or {}).get("user_pool_id", ""),
+                "CONSOLE_AUTH_ENABLED": str((CFG.get("console_auth", {}) or {}).get("enabled", False)).lower(),
                 "PROJECT_VERSION": _read_pyproject_version(),
             },
         )

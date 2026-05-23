@@ -446,7 +446,8 @@
       </thead>
       <tbody>
         <tr><td><code>openclaw_vm_health</code></td><td>gauge (0/1)</td><td>tenant</td><td>1 if VM responded to ping, else 0</td></tr>
-        <tr><td><code>openclaw_vm_memory_used_mb</code></td><td>gauge</td><td>tenant</td><td>Per-VM memory in active use (MB)</td></tr>
+        <tr><td><code>openclaw_vm_cpu_pct</code></td><td>gauge</td><td>tenant</td><td>Per-VM CPU usage (percent of allocated vcpus)</td></tr>
+        <tr><td><code>openclaw_vm_memory_used_mb</code></td><td>gauge</td><td>tenant</td><td>Per-VM memory in active use (MB, from VmRSS)</td></tr>
         <tr><td><code>openclaw_vm_memory_balloon_mib</code></td><td>gauge</td><td>tenant</td><td>Balloon size held by the host (MiB)</td></tr>
         <tr><td><code>openclaw_vm_disk_used_mb</code></td><td>gauge</td><td>tenant</td><td>Per-VM data disk used (MB)</td></tr>
         <tr><td><code>openclaw_vm_disk_total_mb</code></td><td>gauge</td><td>tenant</td><td>Per-VM data disk capacity (MB)</td></tr>

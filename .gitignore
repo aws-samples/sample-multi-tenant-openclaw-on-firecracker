@@ -48,6 +48,7 @@ config.yml.bak
 # Agent / IDE state (per-developer)
 .omc/
 .kiro/
+.playwright-mcp/
 
 # Articles & Blog drafts (not for repo)
 article*.md

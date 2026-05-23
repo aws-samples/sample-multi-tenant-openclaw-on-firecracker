@@ -143,14 +143,33 @@ Web 管理控制台，通过 CloudFront (`/console/`) 在线访问，Cognito 认
 功能：
 - **Tenants** — 宿主机资源概览，创建/删除租户，一键打开 Dashboard
 - **Application** — 共享 Skills 列表，配置模板管理（创建/编辑/删除）
+- **Tenants** — Host 资源总览、创建/删除租户、一键访问 Dashboard、每 VM CPU/内存/磁盘进度条、AZ 列、Live migration
+- **Application** — 共享 Skills、AgentCore MCP 工具列表（启用时显示）、配置模板管理
+- **Monitoring** — Prometheus metrics 清单、PromQL 示例、一键打开 Grafana
 - **Backups** — 跨租户备份浏览器，按租户分组聚合、孤儿备份过滤、一键恢复到新租户
-- **Settings** — API 连接、AgentCore 状态、系统信息
+- **Settings** — API 连接、基础设施特性开关（多 AZ / WAF / RBAC / SNS / 配额）、Host 超分比、各 AZ 资源分布
 
 ### 截图
 
+**Tenants** — 每行租户的 vCPU / Memory / Disk 进度条 + AZ 列 + Migrate 按钮：
+
 ![Tenants 页签](web_console.png)
 
+**Application** — Shared Skills + MCP Tools（启用 AgentCore 时显示已注册的 Lambda 工具）：
+
+![Application 页签](web_console_application.png)
+
+**Monitoring** — 可观测性页面：AMP / Grafana 状态、所有 per-VM Prometheus gauges 清单（类型 + 标签 + 描述）、可复制的 PromQL 示例、AMP / Grafana endpoint：
+
+![Monitoring 页签](web_console_monitoring.png)
+
+**Backups** — 跨租户浏览，孤儿备份（源租户已删）也能恢复到新租户：
+
 ![Backups 页签](web_console_backup.png)
+
+**Settings** — 基础设施一览：多 AZ HA、Prometheus + Grafana、AWS WAF、Cognito + RBAC、SNS 生命周期事件、租户配额、Host 超分比，以及实时的 Fleet-by-AZ 分布表：
+
+![Settings 页签](web_console_settings.png)
 
 ## Dashboard 访问
 

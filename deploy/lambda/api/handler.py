@@ -1003,7 +1003,13 @@ def system_info():
         },
         "waf": {"enabled": os.environ.get("WAF_ENABLED", "false") == "true"},
         "cognito": {
-            "enabled": bool(os.environ.get("COGNITO_USER_POOL_ID")),
+            # 1.2.9 fix: was checking COGNITO_USER_POOL_ID which is only
+            # populated when console_auth.user_pool_id is *explicitly* set
+            # in config.yml. The auto-created pool path leaves that env
+            # empty even though Cognito IS deployed and the user is
+            # actively logged in via OAuth — read CONSOLE_AUTH_ENABLED
+            # (driven by config.yml console_auth.enabled) instead.
+            "enabled": os.environ.get("CONSOLE_AUTH_ENABLED", "false") == "true",
             "user_pool_id": os.environ.get("COGNITO_USER_POOL_ID", "") or None,
         },
         "notifications": {

@@ -96,6 +96,38 @@ source .env.deploy && ./build-rootfs.sh <new_version>
 # New tenants use the new rootfs immediately; existing tenants need a reset API call to switch over
 ```
 
+### Upgrading from v1.3.1 → v1.3.2
+
+**Critical**: v1.3.1 fixed AZ failover for the happy-path single-tenant case. v1.3.2 fixes everything that surfaces under real load — concurrent Lambda invocations, multi-tenant batch failover, transient kernel races, host-agent ⇄ Lambda race conditions where SSM exit code disagrees with VM truth. **Strongly recommended for any multi-tenant deployment.**
+
+```bash
+git pull && ./setup.sh <region> <profile>     # adds reserved_concurrent_executions=1
+                                              # to health_check Lambda
+```
+
+After redeploy:
+
+- **Re-roll `launch-vm.sh`** on existing hosts so the new EBUSY retry + post-InstanceStart `set +e` are in place:
+
+  ```bash
+  source .env.deploy
+  aws s3 cp deploy/userdata/launch-vm.sh s3://${ASSETS_BUCKET}/deployment/scripts/launch-vm.sh
+  aws ssm send-command --document-name AWS-RunShellScript \
+      --targets Key=tag:aws:autoscaling:groupName,Values=openclaw-hosts-asg \
+      --parameters 'commands=[
+        "aws s3 cp s3://'${ASSETS_BUCKET}'/deployment/scripts/launch-vm.sh /home/ubuntu/launch-vm.sh",
+        "chmod +x /home/ubuntu/launch-vm.sh"
+      ]'
+  ```
+
+- **New audit-log entries to monitor:**
+  - `AZ_FAILOVER_RECOVERED_BY_VERIFY` — informational; SSM exit code was misleading but the VM is actually running (host-agent recovered it)
+  - `AZ_FAILOVER_SKIPPED_CONCURRENT` — informational; concurrent Lambda backed off cleanly
+  - `AZ_FAILOVER_TENANT_FAILED` — actionable; verify probe confirmed the migration genuinely failed
+  - `AZ_FAILOVER_NO_BACKUP` — actionable; tenant has no backup, refuse-to-fail-over engaged
+
+- **Summary buckets are now disjoint.** `tenants_failed_over`, `tenants_failed`, `tenants_blocked` are independent. `tenants_blocked` is the new "we refused to migrate to avoid data loss" bucket (path-A no-backup).
+
 ### Upgrading from v1.3.0 → v1.3.1
 
 **Critical**: v1.3.0 had three integration bugs that prevented AZ failover from actually working end-to-end (detection worked, but VM relaunch on target host failed silently). v1.3.1 fixes them and adds real-environment E2E validation. **Strongly recommended for any deployment using the AZ failover feature.**

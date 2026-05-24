@@ -365,6 +365,14 @@ class OpenClawOrchestratorStack(cdk.Stack):
             code=_lambda.Code.from_asset("deploy/lambda/health_check"),
             timeout=Duration.seconds(180),  # 1.3.1: room for synchronous SSM wait during failover
             memory_size=256,
+            # 1.3.2: prevent concurrent invocations from racing on the same
+            # tenant migration. EventBridge fires every 5 min, but failover
+            # can take 60-90s of synchronous SSM waits — if a long-running
+            # invocation hasn't finished when the next tick fires, we used
+            # to get two Lambdas both trying to migrate the same stale
+            # tenants. Reserved concurrency=1 makes Lambda queue the second
+            # invocation behind the first, restoring serialization.
+            reserved_concurrent_executions=1,
             environment={
                 "TENANTS_TABLE": tenants_table.table_name,
                 "HOSTS_TABLE": hosts_table.table_name,

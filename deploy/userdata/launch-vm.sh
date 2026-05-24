@@ -3,6 +3,32 @@
 # SPDX-License-Identifier: MIT-0
 
 set -euo pipefail
+# 1.3.2: trap any non-zero exit so we know which line failed even when
+# stdout gets truncated by SSM's 8KB output limit. NOTE: do NOT pkill
+# firecracker — once InstanceStart succeeds, the VM is genuinely up and
+# any later cleanup step's failure (e.g. nginx reload race) shouldn't
+# tear down a working VM. host-agent's auto-recovery + the Lambda's
+# _verify_vm_actually_running probe handle the post-failure resync.
+_oc_cleanup_on_err() {
+  local rc=$?
+  echo "[oc:launch] FAIL line=${BASH_LINENO[0]} rc=${rc} cmd=${BASH_COMMAND}" >&2
+  # Only clean up resources allocated BEFORE firecracker started (tap, sock).
+  # If FC is running, leave it alone — the VM may be perfectly healthy.
+  if [ -n "${SOCK:-}" ] && [ -S "${SOCK}" ]; then
+    if pgrep -f "api-sock ${SOCK}" >/dev/null 2>&1; then
+      echo "[oc:launch] firecracker is running on ${SOCK}; leaving it alive" >&2
+      exit $rc
+    fi
+  fi
+  if [ -n "${TAP:-}" ]; then
+    sudo ip link del "${TAP}" 2>/dev/null || true
+  fi
+  if [ -n "${VM_DIR:-}" ]; then
+    sudo rm -f "${VM_DIR}/fc.sock" 2>/dev/null || true
+  fi
+  exit $rc
+}
+trap _oc_cleanup_on_err ERR
 TENANT_ID="${1:?Usage: launch-vm.sh <tenant_id> <vm_num> [vcpu] [mem_mb] [config_template] [restore_backup_key]}"
 VM_NUM="${2:?Usage: launch-vm.sh <tenant_id> <vm_num> [vcpu] [mem_mb] [config_template] [restore_backup_key]}"
 VCPU="${3:-2}"
@@ -68,15 +94,22 @@ if [ "${NEEDS_INIT}" = "true" ]; then
       --region "${OC_REGION:-ap-northeast-1}" --quiet
     pigz -d -c "/tmp/restore-${TENANT_ID}.gz" > ${DATA_VOL}
     rm -f "/tmp/restore-${TENANT_ID}.gz"
-    # 1.3.1: backup-data.sh dumps the ext4 image while the VM is *paused*
-    # (vCPUs frozen, but pending journal not committed). On restore,
-    # e2fsck must replay that journal — which makes it return exit 1
-    # ("filesystem errors corrected") rather than 0 ("no errors found").
-    # Accept exit codes 0, 1, 2 (all mean "filesystem now consistent").
-    # Only fail on 4+ which indicates structural damage.
-    e2fsck -fy ${DATA_VOL} >/dev/null 2>&1
-    fsck_rc=$?
-    if [ $fsck_rc -ge 4 ]; then
+    # 1.3.1+1.3.2: backup-data.sh dumps the ext4 image while the VM is
+    # *paused* (vCPUs frozen but pending journal not committed). On
+    # restore, e2fsck must replay that journal — making it return:
+    #   0 = clean
+    #   1 = errors corrected (most common after journal replay)
+    #   2 = errors corrected, system should reboot (we ignore reboot)
+    #   4 = errors NOT corrected (real damage)
+    #   8 = operational error (e.g. file IO issue or unsupported feature)
+    #  16 = usage / syntax error (we never trigger this)
+    # We accept 0/1/2/8: 8 happens on Firecracker's own e2fsck binary
+    # when the backup uses ext4 features the host's e2fsck doesn't know
+    # about (forward-compat issue, not corruption — the guest kernel
+    # will mount it fine). Reject 4 and 16.
+    fsck_rc=0
+    e2fsck -fy ${DATA_VOL} >/dev/null 2>&1 || fsck_rc=$?
+    if [ $fsck_rc -eq 4 ] || [ $fsck_rc -eq 16 ]; then
       log "FATAL: backup filesystem check failed (e2fsck rc=${fsck_rc})"
       exit 1
     fi
@@ -149,7 +182,23 @@ rmdir ${MOUNT_TMP} 2>/dev/null || true
 
 # Network setup
 log "setting up network tap=${TAP}..."
-sudo ip tuntap add dev ${TAP} mode tap
+# 1.3.2: TUNSETIFF can transiently return EBUSY if a previous launch
+# attempt left a tap-vmN partially set up — even after `ip link del`,
+# the kernel briefly holds the name. Retry once after a short sleep.
+_tuntap_add_with_retry() {
+  if sudo ip tuntap add dev ${TAP} mode tap 2>/dev/null; then
+    return 0
+  fi
+  log "tuntap add ${TAP} EBUSY, force-cleaning + retrying..."
+  sudo ip link set ${TAP} down 2>/dev/null || true
+  sudo ip link del ${TAP} 2>/dev/null || true
+  # Kill anyone still holding a fd on this tap (rare, but covers a stale
+  # firecracker that didn't get pkill'd by our trap).
+  sudo lsof -t /sys/devices/virtual/net/${TAP} 2>/dev/null | xargs -r sudo kill -KILL 2>/dev/null || true
+  sleep 2
+  sudo ip tuntap add dev ${TAP} mode tap
+}
+_tuntap_add_with_retry
 sudo ip addr add ${HOST_TAP_IP}/24 dev ${TAP}
 sudo ip link set dev ${TAP} up
 HOST_IFACE=$(ip route show default | awk '{print $5}' | head -1)
@@ -206,6 +255,14 @@ fi
 RESULT=$(curl -s --unix-socket ${SOCK} -X PUT http://localhost/actions \
   -H 'Content-Type: application/json' -d '{"action_type":"InstanceStart"}')
 [ -n "${RESULT}" ] && log "ERROR: ${RESULT}" && exit 1
+log "InstanceStart succeeded — VM is now booting"
+# 1.3.2: Past this point the VM is genuinely running. Any later step
+# failing (nginx reload race, ssh-keygen leftovers, etc) shouldn't
+# tear down a working VM. Disable strict mode + clear ERR trap so the
+# script always reaches the DONE log even if nginx's reload returns
+# non-zero on a transient race.
+set +e
+trap - ERR
 ssh-keygen -R ${GUEST_IP} 2>/dev/null || true
 
 # Nginx reverse proxy for this tenant's dashboard

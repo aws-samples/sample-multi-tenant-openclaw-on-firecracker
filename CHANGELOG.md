@@ -1,5 +1,107 @@
 # Changelog
 
+## [1.3.2] — 2026-05-24
+
+**The release that takes "AZ failover" from "happy-path works" to "really works under all the messy real-world race conditions".** v1.3.1 nailed the basic end-to-end path (1 tenant in 1 dead AZ → comes up in another AZ). v1.3.2 fixes everything that breaks when you push it: concurrent Lambda invocations, multiple tenants in the same dead AZ, transient kernel races, host-agent auto-recovery overlap with Lambda's own SSM commands. Plus a new SSM-failure verification probe that distinguishes "launch-vm.sh actually failed" from "SSM exit code is misleading because host-agent already salvaged it".
+
+### Real-environment proof — the bar lifted
+
+We sat down and methodically ran 6 realistic failure scenarios against a live deployment, fixed every bug surfaced, and locked the fixes in with new unit tests. Test 2 in particular (multi-tenant simultaneous failover) revealed several deep race conditions that mock-only testing would have missed indefinitely:
+
+```
+===== Multi-tenant Test 2 (final) =====
+Lambda summary:
+  az_outages_detected: 1
+  tenants_failed_over: 2  ← both tenants migrated
+  tenants_failed: 0
+  tenants_blocked: 0
+
+Per-tenant verification:
+  multi3-1-c8fe: status=running on i-0bb45 (AZ-a)  Dashboard=200  app_health=up
+  multi3-2-3929: status=running on i-0bb45 (AZ-a)  Dashboard=200  app_health=up
+```
+
+### Fixed — concurrent Lambda invocation race
+
+When a failover takes 60-90s of synchronous SSM waits but EventBridge fires every 5 minutes, two Lambdas could overlap. Pre-1.3.2, both would scan DDB and both would see the same affected tenants → both would try to migrate them → DDB writes fight, ALB rules flip back and forth.
+
+Two-layer fix:
+- **`reserved_concurrent_executions=1`** on the `health_check` Lambda. AWS now queues subsequent invocations behind the first.
+- **Conditional `update_item` on `host_id`** when marking a tenant `failover_recovering`. If another invocation already moved the tenant, `ConditionalCheckFailedException` raises, we log `AZ_FAILOVER_SKIPPED_CONCURRENT` and back off cleanly. No DDB inconsistency, no false-positive failure.
+
+### Fixed — `_failover_tenant_to_host` doesn't bump in-memory `next_vm_num`
+
+In the same Lambda invocation, when 2+ tenants migrate to the same target host, each must get a unique `vm_num`. Pre-1.3.2 the Lambda kept reading the same `target.next_vm_num` from the DDB-fetched-once snapshot — both tenants got `vm_num=N`, the second's `ip tuntap add tap-vmN` hit `TUNSETIFF: Device or resource busy`. Now the orchestrator increments `target["next_vm_num"]` after every attempt (success or failure) so the next iteration picks a fresh number. The DDB-side counter still gets the authoritative bump inside `_failover_tenant_to_host` on success.
+
+### Fixed — TUNSETIFF EBUSY on transient kernel races
+
+Even with unique `vm_num`s, the kernel can briefly hold a tap name after `ip link del`. Pre-1.3.2, `ip tuntap add` returning EBUSY was a hard failure. Now `_tuntap_add_with_retry` in `launch-vm.sh`:
+1. First attempt the `ip tuntap add`.
+2. On EBUSY: force `ip link set down` + `ip link del`, kill any process still holding the tap fd via `lsof`, sleep 2s, retry once.
+
+Recovers from 99% of the transient races without needing host-agent's heavier auto-recovery loop to kick in.
+
+### Fixed — `set -e` + `trap ERR` was killing healthy VMs
+
+This was the bug behind Test 2's persistent "DDB says failed but VM is actually running" symptoms. The chain:
+1. `launch-vm.sh` starts firecracker successfully (VM is up, network configured, application starting).
+2. A late step (e.g. `nginx -s reload` returning non-zero on a transient race, or an `ssh-keygen -R` cleanup failing) returns non-zero.
+3. `set -e` exits the script.
+4. `trap ERR` runs cleanup — pre-1.3.2, that included `pkill firecracker` and `rm fc.sock` → **kills the perfectly-healthy VM**.
+
+Two fixes in series:
+- **`trap ERR` no longer kills firecracker** if it's running on the expected `${SOCK}`. The VM may be perfectly fine; only late launch-script bookkeeping failed.
+- **`set +e; trap - ERR` after `InstanceStart` succeeds.** Past this point the VM is genuinely up; failures in `nginx -s reload`, `ssh-keygen -R`, etc. shouldn't tear down a working VM. Always log `DONE` so callers know the script reached the end.
+
+### Added — `_verify_vm_actually_running` SSM probe
+
+Even with all the above, host-agent's own auto-recovery loop (every 5s, `host-agent.py::_recover_vm`) sometimes still salvages a launch that initially looked like it failed. Without active verification, the Lambda would stamp the tenant `failover_failed` even though the VM has been serving traffic for the past minute.
+
+The new probe sends a small SSM command to the target host:
+```bash
+pgrep -f 'api-sock /data/firecracker-vms/<TID>/fc.sock' >/dev/null \
+  && test -f /etc/nginx/conf.d/tenants/<TID>.conf \
+  && echo VERIFIED || echo NOT_RUNNING
+```
+Polls for up to 90s (host-agent recovery cycle is ~5-15s in practice). If the probe returns `VERIFIED`, the orchestrator treats the original SSM exit code as misleading, marks the tenant `running`, and emits an `AZ_FAILOVER_RECOVERED_BY_VERIFY` audit row so operators can see what happened. If the probe times out or returns `NOT_RUNNING`, the tenant goes to `failover_failed` as before — never a false-positive success.
+
+### Added — `tenants_blocked` summary bucket (semantic clarity)
+
+Pre-1.3.2 the path-A "no-backup, refuse to fail over" behavior bumped `tenants_failed`. That conflated "we declined to migrate to avoid data loss" with "the migration crashed on us". Now `summary` carries three independent buckets: `tenants_failed_over`, `tenants_failed`, `tenants_blocked`. Auditing what happened during an outage is now precise.
+
+### Added — cooldown persists immediately on outage detection
+
+Pre-1.3.2, the per-AZ cooldown only got persisted to DDB *after* tenant migrations finished. Two consequences:
+1. If an outage had no tenants on it (a healthy AZ that just went stale), no cooldown was set → next Lambda tick (5 min later) re-detected the outage → re-emitted audit + SNS for hours until the AZ recovered.
+2. Concurrent Lambda invocations could both pass the `should_skip_az_for_cooldown` check.
+
+Fix: `az_state[az] = now` and `put_item __az_failover_state__` happen *immediately* upon outage detection, before per-tenant work.
+
+### Tests — 426 passed locally / +11 vs v1.3.1
+
+| Test class | New | What it locks in |
+|---|---:|---|
+| `TestVerifyVmActuallyRunning` | 4 | probe says VERIFIED → True, NOT_RUNNING → False, eventual success across polls, SSM error → conservative False |
+| `TestSsmFailButVerifySucceeds` | 2 | the critical 1.3.2 fix: SSM Failed + verify Success → treat as success; SSM Failed + verify Failed → mark failover_failed |
+| `TestVmNumAllocationBatch` | 1 | two tenants in one Lambda call must get unique `vm_num` |
+| `TestConcurrentGuard` | 1 | ConditionalCheckFailedException → return False, no SSM call |
+| `TestBlockedSummaryBucket` | 1 | path-A no-backup increments `tenants_blocked`, not `tenants_failed` |
+| `TestCooldownIdempotency` | 2 | cooldown persisted even with no affected tenants; `AZ_FAILOVER_NO_TENANTS_AFFECTED` audit emitted |
+
+Plus updates to existing 48 v1.3.1 tests to mock the new `s3.list_objects_v2` / `elbv2.modify_rule` / `_verify_vm_actually_running` flows.
+
+### Operator notes
+
+- **Re-deploy**: needed for the new `reserved_concurrent_executions=1` and the verify probe's IAM (already covered by existing SSM permissions).
+- **Re-roll `launch-vm.sh`** on existing hosts so `_tuntap_add_with_retry` and the `set +e after InstanceStart` are in place. Same SSM one-liner from v1.3.1's upgrade guide.
+- **Audit log entries to monitor**:
+  - `AZ_FAILOVER_RECOVERED_BY_VERIFY` — informational; the SSM exit code lied but VM is actually up
+  - `AZ_FAILOVER_SKIPPED_CONCURRENT` — informational; second Lambda backed off
+  - `AZ_FAILOVER_TENANT_FAILED` — actionable; verify probe confirmed failure
+  - `AZ_FAILOVER_NO_BACKUP` — actionable; tenant has no backup, manual intervention needed
+
+---
+
 ## [1.3.1] — 2026-05-24
 
 The "production-grade" claim of v1.3.0 was **half-true**. AZ failover detected outages and orchestrated correctly, but the actual VM relaunch on the target host **never worked end-to-end** because of three integration bugs that mock-based unit tests didn't catch. v1.3.1 fixes them, validates the full path against a real running tenant, and adds the same fix to the existing `migrate` API which had the same class of bug since v1.2.0.

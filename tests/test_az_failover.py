@@ -54,6 +54,12 @@ def _load_hc_module(env_overrides=None):
     # Tests that need failure can override this on mod._test_mocks["ssm"].
     mock_ssm.get_command_invocation.return_value = {"Status": "Success"}
     mock_ssm.send_command.return_value = {"Command": {"CommandId": "test-cmd-id"}}
+    # 1.3.2: ssm.exceptions.InvocationDoesNotExist must be a real
+    # Exception class — _wait_ssm_done has `except ssm.exceptions.InvocationDoesNotExist:`
+    # which raises TypeError if it's a plain MagicMock.
+    class _FakeInvocationDoesNotExist(Exception):
+        pass
+    mock_ssm.exceptions.InvocationDoesNotExist = _FakeInvocationDoesNotExist
     # Default S3 list returns a single fake backup so _find_latest_backup_key
     # works in the happy-path tests. Tests that need empty can override.
     from datetime import datetime, timezone as _tz
@@ -593,6 +599,8 @@ class TestFailoverTenant:
 
         Better to leave the tenant blocked + alert a human than to silently
         boot an empty VM and lose all data.
+        1.3.2: returns sentinel 'blocked' (not False) so the orchestrator
+        can bucket blocked vs failed in the summary.
         """
         hc = self._make_hc()
         # Simulate empty backup list.
@@ -601,11 +609,11 @@ class TestFailoverTenant:
         tenant = {"id": "t1", "host_id": "i-old", "vcpu": 2, "mem_mb": 4096}
         target = {"instance_id": "i-new", "az": "az-c", "next_vm_num": 1,
                   "private_ip": "10.0.2.5"}
-        ok = hc._failover_tenant_to_host(tenant, target, source_az="az-a", now=now)
-        assert ok is False
+        outcome = hc._failover_tenant_to_host(tenant, target, source_az="az-a", now=now)
+        assert outcome == "blocked", \
+            "1.3.2: path-A no-backup must return sentinel 'blocked', not False"
         # No SSM launch was attempted.
         ssm = hc._test_mocks["ssm"]
-        # Filter out any cleanup calls — there should be NO launch.
         for call in ssm.send_command.call_args_list:
             cmd = call.kwargs.get("Parameters", {}).get("commands", [""])[0]
             assert "launch-vm.sh" not in cmd, \
@@ -787,6 +795,165 @@ class TestWaitSsmDone:
 
 
 # ══════════════════════════════════════════════════════════════════════
+# 9.5. _verify_vm_actually_running (1.3.2) — SSM exit code is unreliable
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestVerifyVmActuallyRunning:
+    """1.3.2: Cross-verify that a tenant VM is truly up on the target host
+    after a failed SSM launch. host-agent's auto-recovery often salvages
+    transient launch failures (e.g. TUNSETIFF EBUSY); without this verify
+    we'd mark such tenants failover_failed even though they're actually
+    serving traffic.
+    """
+
+    def _make_hc(self):
+        return _load_hc_module()
+
+    @pytest.mark.unit
+    def test_returns_true_when_probe_outputs_VERIFIED(self):
+        hc = self._make_hc()
+        ssm = hc._test_mocks["ssm"]
+        ssm.send_command.return_value = {"Command": {"CommandId": "probe-1"}}
+        # _verify_vm_actually_running calls get_command_invocation TWICE per
+        # probe attempt: once via _wait_ssm_done, once to fetch stdout.
+        ssm.get_command_invocation.side_effect = [
+            {"Status": "Success"},                                          # _wait_ssm_done
+            {"Status": "Success", "StandardOutputContent": "VERIFIED\n"},  # fetch stdout
+        ]
+        assert hc._verify_vm_actually_running("i-new", "t1",
+                                              timeout_sec=10, poll_sec=0) is True
+
+    @pytest.mark.unit
+    def test_returns_false_when_probe_outputs_NOT_RUNNING(self):
+        hc = self._make_hc()
+        ssm = hc._test_mocks["ssm"]
+        ssm.send_command.return_value = {"Command": {"CommandId": "probe-1"}}
+        # NOT_RUNNING returns Success status but the stdout doesn't contain VERIFIED.
+        ssm.get_command_invocation.return_value = {
+            "Status": "Success", "StandardOutputContent": "NOT_RUNNING\n",
+        }
+        assert hc._verify_vm_actually_running("i-new", "t1",
+                                              timeout_sec=2, poll_sec=0) is False
+
+    @pytest.mark.unit
+    def test_eventual_success_within_timeout(self):
+        """host-agent auto-recovery may take a few seconds. The probe should
+        keep polling until it sees VERIFIED or hits timeout.
+        """
+        hc = self._make_hc()
+        ssm = hc._test_mocks["ssm"]
+        ssm.send_command.return_value = {"Command": {"CommandId": "probe-1"}}
+        # Each verify iteration consumes 2 get_command_invocation calls
+        # (wait_ssm_done + fetch stdout). We give a NOT_RUNNING pair, then
+        # a VERIFIED pair.
+        ssm.get_command_invocation.side_effect = [
+            {"Status": "Success"},  # iter 1: _wait_ssm_done says ok
+            {"Status": "Success", "StandardOutputContent": "NOT_RUNNING\n"},  # iter 1: stdout
+            {"Status": "Success"},  # iter 2: _wait_ssm_done says ok
+            {"Status": "Success", "StandardOutputContent": "VERIFIED\n"},     # iter 2: VERIFIED
+        ]
+        assert hc._verify_vm_actually_running("i-new", "t1",
+                                              timeout_sec=10, poll_sec=0) is True
+
+    @pytest.mark.unit
+    def test_ssm_error_returns_false_conservatively(self):
+        """If the probe SSM call itself errors, return False so we don't
+        false-positive a 'success' in the orchestrator.
+        """
+        hc = self._make_hc()
+        ssm = hc._test_mocks["ssm"]
+        ssm.send_command.side_effect = Exception("ssm transient")
+        assert hc._verify_vm_actually_running("i-new", "t1",
+                                              timeout_sec=2, poll_sec=0) is False
+
+
+class TestSsmFailButVerifySucceeds:
+    """1.3.2 critical fix: when SSM reports failure but verify says VM is
+    actually running, _failover_tenant_to_host must STILL succeed (return
+    True) so the tenant's DDB status flips to running and ALB rule swings
+    over. This is the bug Test 2 in the real environment exposed.
+    """
+
+    def _make_hc(self):
+        return _load_hc_module(env_overrides={
+            "AZ_FAILOVER_ENABLED": "true",
+            "ASSETS_BUCKET": "openclaw-assets-test",
+            "ALB_LISTENER_ARN": "arn:aws:elasticloadbalancing:ap-northeast-1:123:listener/app/test/abc/def",
+            "AUDIT_TABLE": "openclaw-audit-log",
+        })
+
+    @pytest.mark.unit
+    def test_ssm_fail_but_verified_running_treats_as_success(self):
+        hc = self._make_hc()
+        from datetime import datetime as _dt, timezone as _tz
+        hc._test_mocks["s3"].list_objects_v2.return_value = {
+            "Contents": [{
+                "Key": "backups/t1/2026-05-23T18:00:00Z.gz",
+                "LastModified": _dt(2026, 5, 23, 18, 0, 0, tzinfo=_tz.utc),
+            }],
+        }
+        ssm = hc._test_mocks["ssm"]
+        # First send_command is launch-vm.sh; second+ are verify probes.
+        ssm.send_command.side_effect = [
+            {"Command": {"CommandId": "launch-1"}},  # initial launch
+            {"Command": {"CommandId": "probe-1"}},   # verify probe
+            {"Command": {"CommandId": "cleanup-1"}}, # source-host cleanup
+        ]
+        # get_command_invocation returns:
+        #   1. launch-1 polled by _wait_ssm_done → Failed (SSM didn't see DONE)
+        #   2. probe-1 polled by _wait_ssm_done → Success
+        #   3. probe-1 fetched for stdout → VERIFIED
+        ssm.get_command_invocation.side_effect = [
+            {"Status": "Failed", "StandardErrorContent": "exit 1"},
+            {"Status": "Success"},
+            {"Status": "Success", "StandardOutputContent": "VERIFIED\n"},
+        ]
+        now = datetime.now(timezone.utc)
+        tenant = {"id": "t1", "host_id": "i-old", "vcpu": 2, "mem_mb": 4096}
+        target = {"instance_id": "i-new", "az": "az-c", "next_vm_num": 1,
+                  "private_ip": "10.0.2.5"}
+        outcome = hc._failover_tenant_to_host(tenant, target, source_az="az-a", now=now)
+        # Critical: must return True even though initial SSM said Failed.
+        assert outcome is True, \
+            "1.3.2: when verify confirms VM is up, treat SSM failure as success"
+        # Tenant DDB status must end at 'running', not 'failover_failed'.
+        last_update = hc.tenants_table.update_item.call_args_list[-1].kwargs
+        assert ":running" in str(last_update["ExpressionAttributeValues"])
+
+    @pytest.mark.unit
+    def test_ssm_fail_and_verify_fail_marks_failover_failed(self):
+        """Verify negative: if SSM says Failed AND verify says NOT_RUNNING,
+        we DO mark tenant failover_failed (no false-positive success).
+        """
+        hc = self._make_hc()
+        from datetime import datetime as _dt, timezone as _tz
+        hc._test_mocks["s3"].list_objects_v2.return_value = {
+            "Contents": [{
+                "Key": "backups/t1/2026-05-23T18:00:00Z.gz",
+                "LastModified": _dt(2026, 5, 23, 18, 0, 0, tzinfo=_tz.utc),
+            }],
+        }
+        ssm = hc._test_mocks["ssm"]
+        ssm.send_command.return_value = {"Command": {"CommandId": "launch-1"}}
+        # All polls return Failed/NOT_RUNNING.
+        ssm.get_command_invocation.return_value = {
+            "Status": "Failed",
+            "StandardErrorContent": "exit 1",
+            "StandardOutputContent": "NOT_RUNNING\n",
+        }
+        now = datetime.now(timezone.utc)
+        tenant = {"id": "t1", "host_id": "i-old", "vcpu": 2, "mem_mb": 4096}
+        target = {"instance_id": "i-new", "az": "az-c", "next_vm_num": 1,
+                  "private_ip": "10.0.2.5"}
+        outcome = hc._failover_tenant_to_host(tenant, target, source_az="az-a", now=now)
+        assert outcome is False
+        seen_status = [c.kwargs["ExpressionAttributeValues"]
+                       for c in hc.tenants_table.update_item.call_args_list]
+        assert any("failover_failed" in str(v) for v in seen_status)
+
+
+# ══════════════════════════════════════════════════════════════════════
 # 10. _repoint_alb_rule — cross-host traffic switching
 # ══════════════════════════════════════════════════════════════════════
 
@@ -875,6 +1042,239 @@ class TestRepointAlbRule:
 
 # ══════════════════════════════════════════════════════════════════════
 # 11. Feature flag — disabled = noop in lambda_handler
+# ══════════════════════════════════════════════════════════════════════
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 11. v1.3.2: concurrent invocation guard + blocked summary + cooldown idempotency
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestConcurrentGuard:
+    """1.3.2 fixes: when EventBridge fires the watchdog every 5 min but a
+    failover takes 60-90s, two Lambdas could overlap and both try to migrate
+    the same tenant. We now use a ConditionalCheckFailedException on the
+    'mark recovering' update so the second invocation backs off cleanly.
+    """
+
+    def _make_hc(self):
+        return _load_hc_module(env_overrides={
+            "AZ_FAILOVER_ENABLED": "true",
+            "ASSETS_BUCKET": "openclaw-assets-test",
+            "ALB_LISTENER_ARN": "arn:aws:elasticloadbalancing:ap-northeast-1:123:listener/app/test/abc/def",
+        })
+
+    @pytest.mark.unit
+    def test_concurrent_invocation_skipped(self):
+        """If another Lambda already moved the tenant, the conditional
+        update raises ConditionalCheckFailedException — we must bail
+        gracefully (return False) and emit AZ_FAILOVER_SKIPPED_CONCURRENT,
+        NOT crash and NOT report success.
+        """
+        hc = self._make_hc()
+        from datetime import datetime as _dt, timezone as _tz
+        hc._test_mocks["s3"].list_objects_v2.return_value = {
+            "Contents": [{
+                "Key": "backups/t1/2026-05-23T18:00:00Z.gz",
+                "LastModified": _dt(2026, 5, 23, 18, 0, 0, tzinfo=_tz.utc),
+            }],
+        }
+        # Make the conditional update raise — simulating "another Lambda
+        # already moved this tenant".
+        ccf = hc.tenants_table.meta.client.exceptions.ConditionalCheckFailedException
+        hc.tenants_table.update_item.side_effect = [
+            ccf("mock conditional check failed"),
+        ]
+        now = datetime.now(timezone.utc)
+        tenant = {"id": "t1", "host_id": "i-old", "vcpu": 2, "mem_mb": 4096}
+        target = {"instance_id": "i-new", "az": "az-c", "next_vm_num": 1,
+                  "private_ip": "10.0.2.5"}
+        outcome = hc._failover_tenant_to_host(tenant, target, source_az="az-a", now=now)
+        # Returns False (not 'blocked', not True). SSM never called.
+        assert outcome is False
+        ssm = hc._test_mocks["ssm"]
+        for call in ssm.send_command.call_args_list:
+            cmd = call.kwargs.get("Parameters", {}).get("commands", [""])[0]
+            assert "launch-vm.sh" not in cmd, \
+                "must NOT launch VM when concurrent invocation already moved tenant"
+
+
+class TestBlockedSummaryBucket:
+    """1.3.2: summary.tenants_blocked is distinct from tenants_failed.
+    Path-A (no backup) is BLOCKED, not FAILED.
+    """
+
+    def _make_hc(self):
+        return _load_hc_module(env_overrides={
+            "AZ_FAILOVER_ENABLED": "true",
+            "AUDIT_TABLE": "openclaw-audit-log",
+            "SNS_TOPIC_ARN": "arn:aws:sns:ap-northeast-1:123:openclaw",
+            "ASSETS_BUCKET": "openclaw-assets-test",
+            "ALB_LISTENER_ARN": "arn:aws:elasticloadbalancing:ap-northeast-1:123:listener/app/test/abc/def",
+        })
+
+    @pytest.mark.unit
+    def test_no_backup_increments_blocked_not_failed(self):
+        hc = self._make_hc()
+        # AZ-a is dead; AZ-c has healthy host with capacity.
+        hc.hosts_table.scan.return_value = {"Items": [
+            {"instance_id": "i-1a", "az": "az-a", "last_health_check": _ago_iso(15 * 60),
+             "total_vcpu": 16, "vm_count": 1},
+            {"instance_id": "i-2c", "az": "az-c", "last_health_check": _ago_iso(60),
+             "total_vcpu": 16, "vm_count": 1, "next_vm_num": 2,
+             "private_ip": "10.0.2.5"},
+        ]}
+        hc.hosts_table.get_item.return_value = {"Item": {}}
+        # Tenant has no backup → must be bucketed as BLOCKED.
+        hc._test_mocks["s3"].list_objects_v2.return_value = {"Contents": []}
+        tenants = [{"id": "t-stuck", "host_id": "i-1a", "status": "running",
+                    "vcpu": 2, "mem_mb": 4096}]
+        result = hc._check_and_handle_az_failover(now=datetime.now(timezone.utc),
+                                                  tenants=tenants)
+        # Critical: counted as blocked, NOT failed.
+        assert result.get("tenants_blocked", 0) == 1, \
+            f"path-A no-backup must increment tenants_blocked, got {result}"
+        assert result["tenants_failed_over"] == 0
+        assert result["tenants_failed"] == 0
+
+
+class TestVmNumAllocationBatch:
+    """1.3.2: when a single Lambda invocation migrates multiple tenants to
+    the same target host, vm_num must be incremented in-memory between
+    iterations. Otherwise tenant 1 takes vm_num=N, tenant 2 also tries
+    vm_num=N, hits TUNSETIFF 'Device or resource busy' on tap-vmN.
+    """
+
+    def _make_hc(self):
+        return _load_hc_module(env_overrides={
+            "AZ_FAILOVER_ENABLED": "true",
+            "ASSETS_BUCKET": "openclaw-assets-test",
+            "ALB_LISTENER_ARN": "arn:aws:elasticloadbalancing:ap-northeast-1:123:listener/app/test/abc/def",
+            "AUDIT_TABLE": "openclaw-audit-log",
+            "SNS_TOPIC_ARN": "arn:aws:sns:ap-northeast-1:123:openclaw",
+        })
+
+    @pytest.mark.unit
+    def test_vm_num_increments_between_tenants(self):
+        """Two tenants migrate to the same target host in one Lambda call.
+        Each must get a unique vm_num. Without the in-memory bump we
+        regressed pre-1.3.2 — second tenant got the same vm_num and
+        TAP device creation failed.
+        """
+        hc = self._make_hc()
+        # Both tenants in the dead AZ; one healthy target host.
+        hc.hosts_table.scan.return_value = {"Items": [
+            {"instance_id": "i-1a", "az": "az-a", "last_health_check": _ago_iso(15 * 60),
+             "total_vcpu": 16, "vm_count": 2},
+            {"instance_id": "i-2c", "az": "az-c", "last_health_check": _ago_iso(60),
+             "total_vcpu": 16, "vm_count": 0, "next_vm_num": 5,
+             "private_ip": "10.0.2.5"},
+        ]}
+        hc.hosts_table.get_item.return_value = {"Item": {}}
+        # Each tenant has its own backup.
+        from datetime import datetime as _dt, timezone as _tz
+        hc._test_mocks["s3"].list_objects_v2.return_value = {
+            "Contents": [{
+                "Key": "backups/dummy/2026-05-23T18:00:00Z.gz",
+                "LastModified": _dt(2026, 5, 23, 18, 0, 0, tzinfo=_tz.utc),
+            }],
+        }
+        tenants = [
+            {"id": "t-A", "host_id": "i-1a", "status": "running",
+             "vcpu": 1, "mem_mb": 1024},
+            {"id": "t-B", "host_id": "i-1a", "status": "running",
+             "vcpu": 1, "mem_mb": 1024},
+        ]
+        result = hc._check_and_handle_az_failover(now=datetime.now(timezone.utc),
+                                                  tenants=tenants)
+        assert result["tenants_failed_over"] == 2, \
+            f"both tenants must migrate, got {result}"
+        # Inspect the SSM commands — they should have DIFFERENT vm_num.
+        ssm = hc._test_mocks["ssm"]
+        cmds = [c.kwargs.get("Parameters", {}).get("commands", [""])[0]
+                for c in ssm.send_command.call_args_list]
+        launch_cmds = [c for c in cmds if "/home/ubuntu/launch-vm.sh" in c]
+        # Extract vm_num from each command (positional arg 2 after script).
+        import re
+        vm_nums = []
+        for c in launch_cmds:
+            m = re.search(r"launch-vm\.sh \S+ (\d+)", c)
+            if m:
+                vm_nums.append(m.group(1))
+        # First migration uses vm_num=5, second must use 6 (incremented),
+        # not 5 again.
+        assert "5" in vm_nums and "6" in vm_nums, \
+            f"each tenant must get a unique vm_num; got {vm_nums}"
+
+
+class TestCooldownIdempotency:
+    """1.3.2: cooldown state is set BEFORE per-tenant work starts, so
+    repeated outage detections (and concurrent Lambda invocations) don't
+    spam audit / SNS / repeat migrations.
+    """
+
+    def _make_hc(self):
+        return _load_hc_module(env_overrides={
+            "AZ_FAILOVER_ENABLED": "true",
+            "AZ_COOLDOWN_MINUTES": "30",
+            "AUDIT_TABLE": "openclaw-audit-log",
+            "ASSETS_BUCKET": "openclaw-assets-test",
+            "ALB_LISTENER_ARN": "arn:aws:elasticloadbalancing:ap-northeast-1:123:listener/app/test/abc/def",
+        })
+
+    @pytest.mark.unit
+    def test_cooldown_persisted_even_when_no_tenants_to_migrate(self):
+        """Critical: AZ outage detected but no tenants live there → still
+        update cooldown so EventBridge re-firing doesn't repeat audit + SNS.
+        """
+        hc = self._make_hc()
+        hc.hosts_table.scan.return_value = {"Items": [
+            {"instance_id": "i-1a", "az": "az-a", "last_health_check": _ago_iso(15 * 60),
+             "total_vcpu": 16, "vm_count": 0},
+            {"instance_id": "i-2c", "az": "az-c", "last_health_check": _ago_iso(60),
+             "total_vcpu": 16, "vm_count": 0, "next_vm_num": 1,
+             "private_ip": "10.0.2.5"},
+        ]}
+        hc.hosts_table.get_item.return_value = {"Item": {}}
+        # No tenants on the dead AZ.
+        result = hc._check_and_handle_az_failover(now=datetime.now(timezone.utc),
+                                                  tenants=[])
+        assert result["az_outages_detected"] == 1
+        # Cooldown persisted: __az_failover_state__ put_item was called.
+        put_calls = hc.hosts_table.put_item.call_args_list
+        assert len(put_calls) >= 1
+        state_put = next(
+            (c for c in put_calls
+             if c.kwargs.get("Item", {}).get("instance_id") == "__az_failover_state__"),
+            None,
+        )
+        assert state_put is not None, \
+            "1.3.2: cooldown state must persist even when no tenants need migration"
+
+    @pytest.mark.unit
+    def test_no_tenants_audit_emitted_once(self):
+        """Outage detected but nothing to migrate → emit
+        AZ_FAILOVER_NO_TENANTS_AFFECTED audit so operators know.
+        """
+        hc = self._make_hc()
+        hc.hosts_table.scan.return_value = {"Items": [
+            {"instance_id": "i-1a", "az": "az-a", "last_health_check": _ago_iso(15 * 60),
+             "total_vcpu": 16, "vm_count": 0},
+            {"instance_id": "i-2c", "az": "az-c", "last_health_check": _ago_iso(60),
+             "total_vcpu": 16, "vm_count": 0, "next_vm_num": 1,
+             "private_ip": "10.0.2.5"},
+        ]}
+        hc.hosts_table.get_item.return_value = {"Item": {}}
+        hc._check_and_handle_az_failover(now=datetime.now(timezone.utc), tenants=[])
+        # An audit row with op AZ_FAILOVER_NO_TENANTS_AFFECTED should exist.
+        audit_calls = hc.audit_table.put_item.call_args_list
+        ops = [c.kwargs.get("Item", {}).get("operation") for c in audit_calls]
+        assert any(op == "AZ_FAILOVER_NO_TENANTS_AFFECTED" for op in ops), \
+            f"expected NO_TENANTS_AFFECTED audit, got ops={ops}"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 12. Feature flag — disabled = noop in lambda_handler
 # ══════════════════════════════════════════════════════════════════════
 
 

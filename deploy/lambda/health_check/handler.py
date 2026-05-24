@@ -279,6 +279,10 @@ def _check_and_handle_az_failover(now, tenants):
         "az_outages_detected": 0,
         "tenants_failed_over": 0,
         "tenants_failed": 0,
+        # 1.3.2: split out path-A "blocked" (no backup, refused to lose data)
+        # from "failed" (SSM error, capacity exhausted, etc.) so summaries
+        # accurately reflect WHY a tenant didn't migrate.
+        "tenants_blocked": 0,
         "skipped_cooldown": [],
     }
 
@@ -313,13 +317,40 @@ def _check_and_handle_az_failover(now, tenants):
             summary["skipped_cooldown"].append(az)
             continue
 
+        # 1.3.2: Mark cooldown as soon as we *act* on the outage, even
+        # before tenant-level work. Reasons:
+        #   1. Prevents alert spam — without this, an outage with no
+        #      affected tenants would re-detect every Lambda tick (5 min)
+        #      and re-emit audit + SNS until the AZ recovers.
+        #   2. Provides idempotency for concurrent Lambda invocations: the
+        #      second invocation sees az_state[az] set, hits the
+        #      should_skip_az_for_cooldown guard, and bails before
+        #      duplicating tenant migrations.
+        # We persist immediately rather than at end-of-loop so concurrent
+        # invokes pick this up.
+        az_state[az] = now.isoformat()
+        try:
+            hosts_table.put_item(Item={
+                "instance_id": "__az_failover_state__",
+                "az_last_failover": az_state,
+                "updated_at": now.isoformat(),
+            })
+        except Exception as e:
+            print(f"persist cooldown state failed (non-fatal): {e}")
+
         # 4) Find tenants on the failed AZ.
         affected_tenant_ids = set()
         for t in tenants:
             host_id = t.get("host_id", "")
             if host_id in outage["host_ids"]:
                 affected_tenant_ids.add(t["id"])
+
+        # Even if no tenants need migration, still emit audit + SNS once
+        # so an operator knows an AZ went down. Cooldown above prevents repeat.
         if not affected_tenant_ids:
+            _emit_audit("AZ_FAILOVER_NO_TENANTS_AFFECTED",
+                        {"az": az, "host_ids": outage["host_ids"]})
+            _emit_sns_notification(az, outage, recovered_count=0)
             continue
 
         for tenant in tenants:
@@ -336,26 +367,29 @@ def _check_and_handle_az_failover(now, tenants):
                 _emit_audit("AZ_FAILOVER_NO_TARGET",
                             {"tenant_id": tenant["id"], "from_az": az})
                 continue
-            ok = _failover_tenant_to_host(tenant, target, az, now)
-            if ok:
+            outcome = _failover_tenant_to_host(tenant, target, az, now)
+            # 1.3.2: outcome can be True (migrated), False (real failure),
+            # or "blocked" (path-A no-backup refusal — accounted separately).
+            if outcome is True:
                 summary["tenants_failed_over"] += 1
+                target["vm_count"] = int(target.get("vm_count") or 0) + 1
+            elif outcome == "blocked":
+                summary["tenants_blocked"] += 1
             else:
                 summary["tenants_failed"] += 1
-
-        # 5) Update cooldown state for this AZ.
-        az_state[az] = now.isoformat()
+            # 1.3.2: bump in-memory next_vm_num on the target REGARDLESS of
+            # outcome. Even on failure, launch-vm.sh has likely already
+            # created a partially-set-up tap-vmN device that's left behind.
+            # Re-using the same vm_num for the next tenant in the same
+            # batch then trips ioctl(TUNSETIFF) 'Device or resource busy'.
+            # Skip this only on 'blocked' since path-A doesn't touch SSM.
+            if outcome != "blocked":
+                target["next_vm_num"] = int(target.get("next_vm_num") or 1) + 1
 
         # 6) SNS notification (best-effort).
         _emit_sns_notification(az, outage, summary["tenants_failed_over"])
 
-    # 7) Persist state.
-    if outages:
-        hosts_table.put_item(Item={
-            "instance_id": "__az_failover_state__",
-            "az_last_failover": az_state,
-            "updated_at": now.isoformat(),
-        })
-
+    # State already persisted at the start of each outage handling above.
     return summary
 
 
@@ -428,23 +462,34 @@ def _failover_tenant_to_host(tenant, target_host, source_az, now):
                 )
             except Exception:
                 pass
-        return False
+        return "blocked"  # 1.3.2: distinct from failures — caller buckets separately
 
     try:
-        # 2) Mark recovering.
-        tenants_table.update_item(
-            Key={"id": tenant_id},
-            UpdateExpression=("SET previous_host_id = :p, "
-                              "failover_from_az = :az, failover_at = :t, "
-                              "#s = :recover"),
-            ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={
-                ":p": source_host_id,
-                ":az": source_az,
-                ":t": now.isoformat(),
-                ":recover": "failover_recovering",
-            },
-        )
+        # 2) Mark recovering — with conditional update on host_id to prevent
+        # concurrent Lambda invocations from both trying to migrate the same
+        # tenant. If another invocation already moved it, ConditionalCheckFailed
+        # raises; we skip cleanly and don't report failure.
+        try:
+            tenants_table.update_item(
+                Key={"id": tenant_id},
+                UpdateExpression=("SET previous_host_id = :p, "
+                                  "failover_from_az = :az, failover_at = :t, "
+                                  "#s = :recover"),
+                ConditionExpression="host_id = :p",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={
+                    ":p": source_host_id,
+                    ":az": source_az,
+                    ":t": now.isoformat(),
+                    ":recover": "failover_recovering",
+                },
+            )
+        except tenants_table.meta.client.exceptions.ConditionalCheckFailedException:
+            # Another invocation already migrated this tenant — back off cleanly.
+            print(f"skip {tenant_id}: already migrated by concurrent invocation")
+            _emit_audit("AZ_FAILOVER_SKIPPED_CONCURRENT",
+                        {"tenant_id": tenant_id, "from_az": source_az})
+            return False
 
         # 3) Launch on target host via SSM with POSITIONAL args.
         #    launch-vm.sh signature:
@@ -467,7 +512,26 @@ def _failover_tenant_to_host(tenant, target_host, source_az, now):
         # launch-vm.sh runs in <60s on a warm host with cached rootfs.
         ok, ssm_err = _wait_ssm_done(cmd_id, target_host_id, timeout_sec=90)
         if not ok:
-            raise RuntimeError(f"launch-vm.sh failed on target: {ssm_err}")
+            # 1.3.2: SSM exit code may not reflect reality. host-agent's
+            # auto-recovery loop (every 5s) might salvage a launch that
+            # transiently failed (e.g. TUNSETIFF EBUSY on a stale tap).
+            # Cross-verify by SSM-probing the target host for the firecracker
+            # process + nginx tenant conf. If both are present the VM is
+            # genuinely up — proceed as success. Only declare failure if
+            # the verification ALSO comes back NOT_RUNNING.
+            print(f"SSM reported failure ({ssm_err}); verifying VM state...")
+            if _verify_vm_actually_running(target_host_id, tenant_id, timeout_sec=90):
+                print(f"VM {tenant_id} is actually running on {target_host_id} "
+                      f"despite SSM exit code — host-agent likely auto-recovered. "
+                      f"Treating as successful failover.")
+                _emit_audit("AZ_FAILOVER_RECOVERED_BY_VERIFY", {
+                    "tenant_id": tenant_id,
+                    "from_az": source_az,
+                    "to_host": target_host_id,
+                    "ssm_err": ssm_err[:200] if ssm_err else "",
+                })
+            else:
+                raise RuntimeError(f"launch-vm.sh failed on target: {ssm_err}")
 
         # 4) Repoint ALB rule to the target host's target group.
         if ALB_LISTENER_ARN:
@@ -601,6 +665,56 @@ def _wait_ssm_done(command_id, instance_id, timeout_sec=90, poll_sec=3):
             return False, f"SSM {last_status}: {err}"
         # else: keep polling (InProgress, Pending, Delayed)
     return False, f"SSM timeout after {timeout_sec}s (last_status={last_status})"
+
+
+def _verify_vm_actually_running(host_id, tenant_id, timeout_sec=90, poll_sec=10):
+    """Cross-verify that a tenant's VM is really running on a host.
+
+    Why this exists (1.3.2):
+      SSM exit code from launch-vm.sh isn't always reliable. A transient
+      kernel race (TUNSETIFF EBUSY on a stale tap, e.g.) can make the
+      first launch attempt exit non-zero, but host-agent's auto-recovery
+      loop (every 5s, see host-agent.py::_recover_vm) often picks it up
+      and retries successfully a few seconds later. Without this verify
+      step, the Lambda would mark the tenant ``failover_failed`` even
+      though the VM is up.
+
+    What we check:
+      1. Firecracker process exists with the right ``api-sock`` path.
+      2. The nginx tenant config file exists.
+      Both → return True.
+
+    Implementation: send a small SSM probe and poll get_command_invocation.
+    Returns True iff both signals are present within ``timeout_sec``.
+    Best-effort; on any AWS error we conservatively return False so the
+    Lambda still marks failure (no false-positive success reports).
+    """
+    import time as _t
+    deadline = _t.time() + timeout_sec
+    probe_cmd = (
+        f"pgrep -f 'api-sock /data/firecracker-vms/{tenant_id}/fc.sock' >/dev/null "
+        f"&& test -f /etc/nginx/conf.d/tenants/{tenant_id}.conf "
+        f"&& echo VERIFIED || echo NOT_RUNNING"
+    )
+    while _t.time() < deadline:
+        try:
+            resp = ssm.send_command(
+                InstanceIds=[host_id],
+                DocumentName="AWS-RunShellScript",
+                Parameters={"commands": [probe_cmd], "executionTimeout": ["10"]},
+            )
+            cmd_id = resp["Command"]["CommandId"]
+            ok, _ = _wait_ssm_done(cmd_id, host_id, timeout_sec=15, poll_sec=2)
+            if ok:
+                inv = ssm.get_command_invocation(
+                    CommandId=cmd_id, InstanceId=host_id,
+                )
+                if "VERIFIED" in (inv.get("StandardOutputContent") or ""):
+                    return True
+        except Exception as e:
+            print(f"verify_vm_actually_running probe error: {e}")
+        _t.sleep(poll_sec)
+    return False
 
 
 def _repoint_alb_rule(tenant_id, target_host_id, target_private_ip):

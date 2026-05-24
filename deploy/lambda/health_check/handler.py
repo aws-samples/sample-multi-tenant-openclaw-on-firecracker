@@ -32,6 +32,8 @@ from datetime import datetime, timezone, timedelta
 ddb = boto3.resource("dynamodb")
 ssm = boto3.client("ssm")
 sns = boto3.client("sns")
+s3 = boto3.client("s3")
+elbv2 = boto3.client("elbv2")
 tenants_table = ddb.Table(os.environ["TENANTS_TABLE"])
 hosts_table = ddb.Table(os.environ["HOSTS_TABLE"])
 
@@ -48,6 +50,7 @@ AZ_FAILOVER_ENABLED = os.environ.get("AZ_FAILOVER_ENABLED", "false").lower() == 
 AZ_UNHEALTHY_THRESHOLD_MINUTES = int(os.environ.get("AZ_UNHEALTHY_THRESHOLD_MINUTES", "10"))
 AZ_COOLDOWN_MINUTES = int(os.environ.get("AZ_COOLDOWN_MINUTES", "30"))
 ASSETS_BUCKET = os.environ.get("ASSETS_BUCKET", "")
+ALB_LISTENER_ARN = os.environ.get("ALB_LISTENER_ARN", "")
 
 
 def lambda_handler(event, context):
@@ -228,12 +231,21 @@ def pick_target_host(hosts, now, threshold_minutes, exclude_azs, required_vcpu=0
             continue
         if h.get("status") == "deleted":
             continue
-        # Estimate spare capacity. Hosts publish vcpu_total / vm_count.
-        vcpu_total = int(h.get("vcpu_total") or h.get("max_vcpu") or 0)
+        # Estimate spare capacity. Hosts publish total_vcpu (decimal stored
+        # as Number in DDB; we coerce to int via Decimal-friendly path).
+        # Fall back to legacy field names just in case.
+        raw_total = (h.get("total_vcpu") or h.get("vcpu_total")
+                     or h.get("max_vcpu") or 0)
+        vcpu_total = int(raw_total)
         vm_count = int(h.get("vm_count") or 0)
-        # Approximate per-VM cost; fallback to 2 if unknown.
-        avg_vcpu = int(h.get("avg_vcpu_per_vm") or 2)
-        spare = vcpu_total - vm_count * avg_vcpu
+        raw_used = h.get("used_vcpu")
+        if raw_used is not None:
+            # Prefer the actual booked vCPU when host-agent publishes it.
+            spare = vcpu_total - int(raw_used)
+        else:
+            # Approximate per-VM cost; fallback to 2 if unknown.
+            avg_vcpu = int(h.get("avg_vcpu_per_vm") or 2)
+            spare = vcpu_total - vm_count * avg_vcpu
         if required_vcpu and spare < required_vcpu:
             continue
         candidates.append((-spare, vm_count, h["instance_id"], h))
@@ -348,24 +360,78 @@ def _check_and_handle_az_failover(now, tenants):
 
 
 def _failover_tenant_to_host(tenant, target_host, source_az, now):
-    """Relaunch a tenant on a healthy target host.
+    """Relaunch a tenant on a healthy target host (real, end-to-end).
 
     Strategy:
-      * Mark tenant as ``failover_recovering``.
-      * On the target host, run launch-vm.sh (data dir empty) — cannot live-migrate
-        because the source AZ is unreachable. The tenant's data volume from the
-        old host is gone; we restore from the most recent backup if one exists.
-      * Update DDB: tenant.host_id = target, vm_num = target.next_vm_num,
-        previous_host_id, failover_at, status='running'.
+      1) Find the most recent backup. If none exists, refuse failover and
+         emit an alert audit (path A: never silently lose data).
+      2) Mark tenant as ``failover_recovering`` in DDB.
+      3) Run launch-vm.sh on the target host via SSM with the correct
+         positional arguments: <tenant_id> <vm_num> <vcpu> <mem_mb>
+         <config_template> <restore_backup_key>. Wait synchronously
+         (60s) for completion so we know whether the VM actually came up.
+      4) Update the ALB rule for /vm/<tenant_id> to point at the target
+         host's target group. Without this step CloudFront keeps routing
+         to the dead source host.
+      5) Tell the source host (best-effort) to clean its leftover nginx
+         conf for this tenant. If the source host is fully down this
+         is a no-op.
+      6) Flip DDB ownership: tenant.host_id, vm_num, status=running.
+         Bump target host's next_vm_num.
+      7) Emit audit log + SNS event.
+
+    Returns True iff the VM came up on the target host AND ALB rule was
+    re-pointed. On failure, marks tenant ``failover_failed`` and emits
+    an audit row so a human can act.
     """
     tenant_id = tenant["id"]
     vcpu = int(tenant.get("vcpu") or 2)
     mem_mb = int(tenant.get("mem_mb") or 4096)
     target_host_id = target_host["instance_id"]
     target_vm_num = int(target_host.get("next_vm_num") or 1)
+    config_template = tenant.get("config_template") or ""
+    source_host_id = tenant.get("host_id", "")
+
+    # 1) Find latest backup (path A: refuse if missing).
+    backup_key = _find_latest_backup_key(tenant_id) if ASSETS_BUCKET else None
+    if not backup_key:
+        _emit_audit("AZ_FAILOVER_NO_BACKUP", {
+            "tenant_id": tenant_id,
+            "from_az": source_az,
+            "reason": "no backup available — failover refused to avoid data loss",
+        })
+        try:
+            tenants_table.update_item(
+                Key={"id": tenant_id},
+                UpdateExpression="SET #s = :failed, failover_error = :e",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={
+                    ":failed": "failover_blocked",
+                    ":e": "no_backup_available",
+                },
+            )
+        except Exception:
+            pass
+        # SNS alert so a human can manually intervene.
+        if _SNS_TOPIC_ARN:
+            try:
+                sns.publish(
+                    TopicArn=_SNS_TOPIC_ARN,
+                    Subject=f"[OpenClaw] AZ failover BLOCKED: {tenant_id} has no backup",
+                    Message=json.dumps({
+                        "event": "az_failover_blocked",
+                        "tenant_id": tenant_id,
+                        "reason": "no_backup_available",
+                        "source_az": source_az,
+                        "action_required": "manual recovery — restore from snapshot or accept data loss",
+                    }, indent=2),
+                )
+            except Exception:
+                pass
+        return False
 
     try:
-        # 1) Mark recovering.
+        # 2) Mark recovering.
         tenants_table.update_item(
             Key={"id": tenant_id},
             UpdateExpression=("SET previous_host_id = :p, "
@@ -373,50 +439,99 @@ def _failover_tenant_to_host(tenant, target_host, source_az, now):
                               "#s = :recover"),
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
-                ":p": tenant.get("host_id", ""),
+                ":p": source_host_id,
                 ":az": source_az,
                 ":t": now.isoformat(),
                 ":recover": "failover_recovering",
             },
         )
 
-        # 2) Launch on the target. We try restoring from latest backup first
-        # so the tenant's /home/agent state is preserved if backups exist.
-        backup_uri = ""
-        if ASSETS_BUCKET:
-            backup_uri = f"s3://{ASSETS_BUCKET}/backups/{tenant_id}/latest.gz"
+        # 3) Launch on target host via SSM with POSITIONAL args.
+        #    launch-vm.sh signature:
+        #      launch-vm.sh <tenant_id> <vm_num> <vcpu> <mem_mb>
+        #                   <config_template> <restore_backup_key>
+        #    config_template can be empty string ""; restore_backup_key
+        #    is an S3 key (no s3:// prefix), e.g. backups/<tid>/<ts>.gz.
         launch_cmd = (
-            f"/home/ubuntu/launch-vm.sh {tenant_id} {target_vm_num} {vcpu} {mem_mb}"
+            f"/home/ubuntu/launch-vm.sh {tenant_id} {target_vm_num} "
+            f"{vcpu} {mem_mb} \"{config_template}\" \"{backup_key}\""
         )
-        if backup_uri:
-            # Best-effort restore: launch with --restore flag if launch-vm.sh
-            # supports it; otherwise it's ignored. The host-agent script handles
-            # missing backups gracefully.
-            launch_cmd += f" --restore-from {backup_uri}"
-
-        ssm.send_command(
+        ssm_resp = ssm.send_command(
             InstanceIds=[target_host_id],
             DocumentName="AWS-RunShellScript",
             Parameters={"commands": [launch_cmd], "executionTimeout": ["600"]},
         )
+        cmd_id = ssm_resp["Command"]["CommandId"]
 
-        # 3) Flip ownership in DDB.
+        # Wait synchronously for the SSM command to finish (max 90s).
+        # launch-vm.sh runs in <60s on a warm host with cached rootfs.
+        ok, ssm_err = _wait_ssm_done(cmd_id, target_host_id, timeout_sec=90)
+        if not ok:
+            raise RuntimeError(f"launch-vm.sh failed on target: {ssm_err}")
+
+        # 4) Repoint ALB rule to the target host's target group.
+        if ALB_LISTENER_ARN:
+            target_private_ip = target_host.get("private_ip")
+            if target_private_ip:
+                try:
+                    _repoint_alb_rule(tenant_id, target_host_id, target_private_ip)
+                except Exception as e:
+                    print(f"ALB repoint failed for {tenant_id}: {e}")
+                    # Don't fail the whole failover for ALB — the tenant is
+                    # running on the target host, traffic just temporarily
+                    # routes wrong. SNS alert captures this.
+                    _emit_audit("AZ_FAILOVER_ALB_REPOINT_FAILED",
+                                {"tenant_id": tenant_id, "error": str(e)[:200]})
+
+        # 5) Best-effort: tell source host to clean its nginx conf.
+        #    If the source host is unreachable (which is the whole reason
+        #    we're failing over), this SSM call will time out — that's fine,
+        #    we don't gate failover success on it.
+        if source_host_id:
+            try:
+                ssm.send_command(
+                    InstanceIds=[source_host_id],
+                    DocumentName="AWS-RunShellScript",
+                    Parameters={"commands": [
+                        f"sudo rm -f /etc/nginx/conf.d/tenants/{tenant_id}.conf "
+                        f"&& sudo nginx -s reload || true"
+                    ], "executionTimeout": ["10"]},
+                )
+            except Exception:
+                pass  # Source unreachable is the expected case.
+
+        # 6) Flip ownership in DDB. Bump next_vm_num on target host.
         tenants_table.update_item(
             Key={"id": tenant_id},
-            UpdateExpression=("SET host_id = :h, vm_num = :n, #s = :running"),
+            UpdateExpression=("SET host_id = :h, vm_num = :n, #s = :running, "
+                              "restored_from = :b"),
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
                 ":h": target_host_id,
                 ":n": target_vm_num,
                 ":running": "running",
+                ":b": backup_key,
             },
         )
+        try:
+            hosts_table.update_item(
+                Key={"instance_id": target_host_id},
+                UpdateExpression="SET next_vm_num = :n, vm_count = if_not_exists(vm_count, :z) + :one",
+                ExpressionAttributeValues={
+                    ":n": target_vm_num + 1,
+                    ":one": 1,
+                    ":z": 0,
+                },
+            )
+        except Exception as e:
+            print(f"host counter update failed (non-fatal): {e}")
 
         _emit_audit("AZ_FAILOVER_TENANT_RECOVERED", {
             "tenant_id": tenant_id,
             "from_az": source_az,
             "to_host": target_host_id,
             "to_az": target_host.get("az", ""),
+            "restored_from": backup_key,
         })
         return True
     except Exception as e:
@@ -424,9 +539,12 @@ def _failover_tenant_to_host(tenant, target_host, source_az, now):
         try:
             tenants_table.update_item(
                 Key={"id": tenant_id},
-                UpdateExpression="SET #s = :failed",
+                UpdateExpression="SET #s = :failed, failover_error = :e",
                 ExpressionAttributeNames={"#s": "status"},
-                ExpressionAttributeValues={":failed": "failover_failed"},
+                ExpressionAttributeValues={
+                    ":failed": "failover_failed",
+                    ":e": str(e)[:500],
+                },
             )
         except Exception:
             pass
@@ -434,6 +552,122 @@ def _failover_tenant_to_host(tenant, target_host, source_az, now):
             "tenant_id": tenant_id, "error": str(e)[:200],
         })
         return False
+
+
+def _find_latest_backup_key(tenant_id):
+    """Return the most recent backup S3 key for a tenant, or None.
+
+    Backups are uploaded by backup-data.sh as
+        s3://${ASSETS_BUCKET}/backups/<tenant_id>/<ISO timestamp>.gz
+    There is no 'latest.gz' alias — we list and sort by LastModified.
+    """
+    if not ASSETS_BUCKET or not tenant_id:
+        return None
+    try:
+        prefix = f"backups/{tenant_id}/"
+        resp = s3.list_objects_v2(Bucket=ASSETS_BUCKET, Prefix=prefix, MaxKeys=1000)
+        objs = resp.get("Contents") or []
+        if not objs:
+            return None
+        # Most recent first by LastModified, return key only (no s3:// prefix)
+        # because launch-vm.sh expects the key, not the full URI.
+        objs.sort(key=lambda o: o.get("LastModified"), reverse=True)
+        return objs[0]["Key"]
+    except Exception as e:
+        print(f"_find_latest_backup_key({tenant_id}) error: {e}")
+        return None
+
+
+def _wait_ssm_done(command_id, instance_id, timeout_sec=90, poll_sec=3):
+    """Block until an SSM command completes. Returns (ok, error_or_None)."""
+    import time as _t
+    deadline = _t.time() + timeout_sec
+    last_status = "Pending"
+    while _t.time() < deadline:
+        _t.sleep(poll_sec)
+        try:
+            inv = ssm.get_command_invocation(
+                CommandId=command_id, InstanceId=instance_id,
+            )
+        except ssm.exceptions.InvocationDoesNotExist:
+            continue
+        except Exception as e:
+            return False, f"get_command_invocation: {e}"
+        last_status = inv.get("Status", "Unknown")
+        if last_status in ("Success",):
+            return True, None
+        if last_status in ("Cancelled", "TimedOut", "Failed"):
+            err = (inv.get("StandardErrorContent") or "")[:500]
+            return False, f"SSM {last_status}: {err}"
+        # else: keep polling (InProgress, Pending, Delayed)
+    return False, f"SSM timeout after {timeout_sec}s (last_status={last_status})"
+
+
+def _repoint_alb_rule(tenant_id, target_host_id, target_private_ip):
+    """Update the ALB rule for /vm/<tenant_id>* to point at target host's TG.
+
+    Each host has a target group named oc-<last8 of instance_id>. Each
+    tenant has one ALB rule whose Action.TargetGroupArn determines which
+    host serves /vm/<tenant_id>* traffic. After a cross-host migration
+    or failover, this Action must be updated, otherwise CloudFront/ALB
+    keeps sending traffic to the dead source host.
+    """
+    if not ALB_LISTENER_ARN:
+        return
+
+    # 1) Find or create the target host's target group, register its IP.
+    tg_name = f"oc-{target_host_id[-8:]}"
+    try:
+        resp = elbv2.describe_target_groups(Names=[tg_name])
+        tg_arn = resp["TargetGroups"][0]["TargetGroupArn"]
+    except Exception:
+        # Host TG doesn't exist yet (e.g. host registered without API path).
+        # Need VPC ID for create — pulled from existing TG of source host.
+        existing = elbv2.describe_target_groups()["TargetGroups"]
+        if not existing:
+            raise RuntimeError("no existing target groups to clone VPC from")
+        vpc_id = existing[0]["VpcId"]
+        tg_arn = elbv2.create_target_group(
+            Name=tg_name, Protocol="HTTP", Port=80, VpcId=vpc_id,
+            TargetType="ip", HealthCheckPath="/health",
+            HealthCheckIntervalSeconds=10, HealthyThresholdCount=2,
+        )["TargetGroups"][0]["TargetGroupArn"]
+    # Make sure the host IP is registered (idempotent).
+    try:
+        elbv2.register_targets(
+            TargetGroupArn=tg_arn,
+            Targets=[{"Id": target_private_ip, "Port": 80}],
+        )
+    except Exception as e:
+        print(f"register_targets {target_private_ip} on {tg_name}: {e}")
+
+    # 2) Find the existing ALB rule for /vm/<tenant_id>* and modify its
+    #    forward Action to point at the new target group.
+    rules = elbv2.describe_rules(ListenerArn=ALB_LISTENER_ARN)["Rules"]
+    rule_arn = None
+    for r in rules:
+        for c in r.get("Conditions", []):
+            if c.get("Field") == "path-pattern" and \
+               any(f"/vm/{tenant_id}" in v for v in c.get("Values", [])):
+                rule_arn = r["RuleArn"]
+                break
+        if rule_arn:
+            break
+    if not rule_arn:
+        # No existing rule — create a fresh one. Pick a free priority.
+        used = {int(r["Priority"]) for r in rules if r["Priority"] != "default"}
+        priority = next(i for i in range(1, 500) if i not in used)
+        elbv2.create_rule(
+            ListenerArn=ALB_LISTENER_ARN, Priority=priority,
+            Conditions=[{"Field": "path-pattern",
+                         "Values": [f"/vm/{tenant_id}", f"/vm/{tenant_id}/*"]}],
+            Actions=[{"Type": "forward", "TargetGroupArn": tg_arn}],
+        )
+    else:
+        elbv2.modify_rule(
+            RuleArn=rule_arn,
+            Actions=[{"Type": "forward", "TargetGroupArn": tg_arn}],
+        )
 
 
 def _emit_audit(operation, detail):

@@ -558,6 +558,28 @@ def tenant_action(tenant_id, action, body=None):
                 ":s": source_host_id, ":t": now,
             },
         )
+
+        # 4) 1.3.1: Repoint ALB rule to target host's TG so CloudFront stops
+        # sending /vm/<tenant_id>* traffic to the old host. Without this
+        # the migration completes on the data plane but routing is stale.
+        try:
+            target_private_ip = target.get("private_ip", "")
+            if target_private_ip:
+                target_tg = _ensure_host_tg(target_host_id, target_private_ip)
+                _repoint_alb_rule_to_tg(tenant_id, target_tg)
+        except Exception as e:
+            print(f"migrate: ALB repoint failed for {tenant_id}: {e}")
+
+        # 5) 1.3.1: Clean up source host's nginx tenant config so it stops
+        # advertising itself as a backend. Best-effort — if source is dead
+        # the cleanup will happen when the host is decommissioned.
+        try:
+            _ssm_send(source_host_id,
+                      f"sudo rm -f /etc/nginx/conf.d/tenants/{tenant_id}.conf "
+                      f"&& sudo nginx -s reload")
+        except Exception:
+            pass
+
         return _resp(202, {
             "id": tenant_id, "status": "migrating",
             "source_host_id": source_host_id, "target_host_id": target_host_id,
@@ -1294,6 +1316,37 @@ def _add_alb_rule(tenant_id, tg_arn):
         Conditions=[{"Field": "path-pattern", "Values": [f"/vm/{tenant_id}", f"/vm/{tenant_id}/*"]}],
         Actions=[{"Type": "forward", "TargetGroupArn": tg_arn}],
     )
+
+
+def _repoint_alb_rule_to_tg(tenant_id, tg_arn):
+    """1.3.1: Repoint /vm/<tenant_id>* to a different target group.
+
+    Used by migrate (cross-host live migration) and AZ failover. If no rule
+    exists yet for this tenant, creates one. If one exists pointing at the
+    old host's TG, modifies it in place to point at the new TG. Without
+    this, traffic keeps hitting the dead/old host after a host change.
+    """
+    arn = _get_listener_arn()
+    if not arn:
+        return
+    rules = elbv2.describe_rules(ListenerArn=arn)["Rules"]
+    rule_arn = None
+    for r in rules:
+        for c in r.get("Conditions", []):
+            if c.get("Field") == "path-pattern" and \
+               any(f"/vm/{tenant_id}" in v for v in c.get("Values", [])):
+                rule_arn = r["RuleArn"]
+                break
+        if rule_arn:
+            break
+    if rule_arn:
+        elbv2.modify_rule(
+            RuleArn=rule_arn,
+            Actions=[{"Type": "forward", "TargetGroupArn": tg_arn}],
+        )
+    else:
+        # No existing rule — fall back to creating it.
+        _add_alb_rule(tenant_id, tg_arn)
 
 
 def _remove_alb_rule(tenant_id):

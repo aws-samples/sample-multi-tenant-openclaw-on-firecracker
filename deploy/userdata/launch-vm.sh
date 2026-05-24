@@ -68,8 +68,19 @@ if [ "${NEEDS_INIT}" = "true" ]; then
       --region "${OC_REGION:-ap-northeast-1}" --quiet
     pigz -d -c "/tmp/restore-${TENANT_ID}.gz" > ${DATA_VOL}
     rm -f "/tmp/restore-${TENANT_ID}.gz"
-    e2fsck -fy ${DATA_VOL} >/dev/null 2>&1 || { log "FATAL: backup filesystem check failed"; exit 1; }
-    log "restored $(stat -c%s ${DATA_VOL}) bytes"
+    # 1.3.1: backup-data.sh dumps the ext4 image while the VM is *paused*
+    # (vCPUs frozen, but pending journal not committed). On restore,
+    # e2fsck must replay that journal — which makes it return exit 1
+    # ("filesystem errors corrected") rather than 0 ("no errors found").
+    # Accept exit codes 0, 1, 2 (all mean "filesystem now consistent").
+    # Only fail on 4+ which indicates structural damage.
+    e2fsck -fy ${DATA_VOL} >/dev/null 2>&1
+    fsck_rc=$?
+    if [ $fsck_rc -ge 4 ]; then
+      log "FATAL: backup filesystem check failed (e2fsck rc=${fsck_rc})"
+      exit 1
+    fi
+    log "restored $(stat -c%s ${DATA_VOL}) bytes (e2fsck rc=${fsck_rc})"
   else
     cp --sparse=always ${DATA_TPL} ${DATA_VOL}
   fi

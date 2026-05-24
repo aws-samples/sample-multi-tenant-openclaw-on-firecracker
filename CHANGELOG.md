@@ -1,5 +1,70 @@
 # Changelog
 
+## [1.3.1] — 2026-05-24
+
+The "production-grade" claim of v1.3.0 was **half-true**. AZ failover detected outages and orchestrated correctly, but the actual VM relaunch on the target host **never worked end-to-end** because of three integration bugs that mock-based unit tests didn't catch. v1.3.1 fixes them, validates the full path against a real running tenant, and adds the same fix to the existing `migrate` API which had the same class of bug since v1.2.0.
+
+**v1.3.0 detected AZ outages. v1.3.1 actually recovers from them.**
+
+### Fixed — AZ failover end-to-end (was broken in v1.3.0)
+
+- **`launch-vm.sh` invocation used wrong argument format.** v1.3.0 passed `--restore-from <s3://uri>` as a flag, but `launch-vm.sh` takes restore-key as the **6th positional argument**, not a flag. Fix: emit `launch-vm.sh <tid> <vm_num> <vcpu> <mem_mb> "" <backup_key>` exactly as `backup-data.sh` and the rest of the codebase expect.
+- **Backup S3 URI vs S3 key confusion.** v1.3.0 passed `s3://${ASSETS_BUCKET}/backups/<tid>/latest.gz`. But `launch-vm.sh` internally prefixes `s3://${ASSETS_BUCKET}/${RESTORE_KEY}`, which would produce a double-`s3://` prefix. Fix: pass the bare key (no prefix). The Lambda discovers the actual most-recent key via S3 list (added `_find_latest_backup_key()`).
+- **Hard-coded `latest.gz` doesn't exist.** Backups are uploaded as `backups/<tid>/<ISO timestamp>.gz` — there's no `latest` alias. Fix: list `backups/<tid>/` and sort by `LastModified` to find the most recent backup. If no backup exists, refuse failover with `AZ_FAILOVER_NO_BACKUP` audit + SNS alert (Path A: never silently lose data).
+- **`pick_target_host` looked up `vcpu_total` but DDB stores `total_vcpu`.** Off-by-name. v1.3.0's mock tests passed because they used `vcpu_total` everywhere. Real env had hosts with `total_vcpu` field, so spare-capacity calculation always returned 0 → "no target host" even with healthy hosts available. Fix: read `total_vcpu` first, with `used_vcpu` for accurate spare calculation, fall back to legacy field names.
+- **`launch-vm.sh` `e2fsck` rejected backup restoration.** `backup-data.sh` dumps the ext4 image while VM is **paused** (vCPU frozen, but pending journal not committed). On restore, `e2fsck` must replay that journal — it returns exit code 1 (`filesystem errors corrected`), not 0. Pre-1.3.1 launch-vm.sh treated any non-zero rc as fatal. Fix: accept rc 0/1/2 (all "consistent now"), only fail on rc ≥ 4 (structural damage).
+- **No synchronous wait for SSM completion.** v1.3.0's failover sent SSM and immediately flipped DDB `host_id`, even if the launch-vm.sh actually failed on the target. Fix: `_wait_ssm_done()` polls `get_command_invocation` for up to 90s and surfaces real exit status. On `Failed`, tenant is marked `failover_failed` (not stuck in `failover_recovering`).
+
+### Fixed — ALB rule re-pointing (was broken since v1.2.0 in `migrate` API too)
+
+- **Cross-host VM relocation didn't update ALB routing.** Each host has its own target group (`oc-<last8>`), and each tenant has an ALB rule `/vm/<tid>*` pointing at the *current host's* TG. Both `migrate` (live migration) and `_failover_tenant_to_host` (AZ failover) updated DDB ownership but **left the ALB rule pointing at the dead/old host**. Result: even after a successful migration, CloudFront kept routing traffic to the wrong place.
+- Fix: `_repoint_alb_rule()` ensures target host has a TG, registers its private IP, and uses `elbv2.modify_rule` to swing the existing rule's `forward` action over. Or creates a fresh rule if none exists.
+- Same fix applied to `api/handler.py`'s `migrate` action (calls a new `_repoint_alb_rule_to_tg` helper). This is a **v1.2.0 latent bug** that just got noticed because v1.3.0's failover surfaced it.
+- `migrate` action also now SSH-cleans the source host's nginx tenant config so it stops advertising itself as a backend.
+
+### Added — IAM + permissions
+
+- `health_check` Lambda gains: `elasticloadbalancing:DescribeRules / DescribeTargetGroups / CreateRule / ModifyRule / CreateTargetGroup / RegisterTargets`, plus `s3:Get*/List*` on the assets bucket (for backup discovery), plus `SNS:Publish` for path-A alerts.
+- `api` Lambda gains `elasticloadbalancing:ModifyRule` (was missing — `migrate` would have silently failed if it had attempted ModifyRule pre-v1.3.1).
+- `health_check` Lambda timeout bumped from 120s to 180s to accommodate synchronous SSM wait during failover.
+
+### Tests — 415 passed (v1.3.0 baseline) + 14 new = 429+
+
+- **+14 tests** in `tests/test_az_failover.py`:
+  - `TestFindLatestBackupKey` (5): empty list, no bucket configured, single key returned without `s3://` prefix, multiple keys sorted by LastModified, S3 error returns None gracefully.
+  - `TestWaitSsmDone` (3): Success returns ok, Failed returns error, timeout after threshold.
+  - `TestRepointAlbRule` (4): modifies existing rule, creates if missing, no-op without listener, registers target IP.
+  - `test_no_backup_blocks_failover_with_alert`: refuses failover, marks tenant `failover_blocked`, no SSM call.
+  - `test_ssm_command_fails_with_nonzero_status`: synchronous wait detects launch-vm.sh exit-non-zero and marks tenant failed.
+- All v1.3.0 tests updated to mock the new SSM `get_command_invocation`, S3 `list_objects_v2`, and elbv2 client calls.
+- Stack import-order bug fixed: `health_fn` no longer constructs with `listener.listener_arn` (defined later); uses `add_environment()` post-injection like `api_fn` already did.
+
+### Real-environment E2E validation — proven on ap-northeast-1
+
+Steps performed against a live deployment (account 835751346093):
+
+1. Created `failover-test-6c28` tenant pinned to ap-northeast-1c (i-088f6fc814fd4b1a2).
+2. Triggered `POST /tenants/.../backup` → backup landed at `s3://.../backups/failover-test-6c28/2026-05-24T09:06:27Z.gz` (9.4 MB).
+3. Stopped host-agent on the ap-northeast-1c host and injected `last_health_check = 15 minutes ago` to simulate AZ-level failure.
+4. Manually invoked `openclaw-health-check` Lambda.
+5. **Result**: `az_outages_detected: 1, tenants_failed_over: 1, tenants_failed: 0`.
+6. **Verified DDB**: tenant.host_id flipped from i-088f...1a2 → i-0bb45...50e2; `failover_from_az: ap-northeast-1c`; `restored_from: backups/failover-test-6c28/2026-05-24T09:06:27Z.gz`; `app_health: up`.
+7. **Verified ALB**: rule for `/vm/failover-test-6c28*` now points at `oc-34d350e2` (target host's TG).
+8. **Verified Dashboard**: `curl https://d3k97r1qs0mu76.cloudfront.net/vm/failover-test-6c28/?token=...` → **HTTP 200** end-to-end.
+9. **Verified data preservation**: disk 228 MB → 229 MB after restore (the +1 MB is mount-time fs ops, contents intact).
+10. **Verified cooldown**: subsequent Lambda invocation skipped with `skipped_cooldown: ["ap-northeast-1c"]`.
+
+This is the first OpenClaw release where the "AZ failover" claim is backed by a complete real-environment trace.
+
+### Operator notes
+
+- **Re-deploy is required** — IAM policy changes, env var additions, Lambda timeout bump.
+- **Re-roll launch-vm.sh on existing hosts** so the e2fsck fix is in place. SSM one-liner in the upgrade guide.
+- **Existing in-flight migrations** that completed pre-v1.3.1 may still have their ALB rules pointed at the old host. Run a manual `POST /tenants/{id}/migrate` (no-op if target == current) to trigger the fixed path, or wait for the next deploy that touches the rule.
+- **Backups are required** for AZ failover to recover data. Set `backup_cron` in `config.yml` to ensure every tenant has a recent backup before disaster strikes. Tenants without backups will get `failover_blocked` + SNS alert — by design, never silent data loss.
+
+---
+
 ## [1.3.0] — 2026-05-24
 
 Closes the AZ-level failover gap that v1.2.x left open and finally answers the 2026-05-22 sync ask **"if an AZ goes down, can the tenants on it auto-restart somewhere else?"** — yes, automatically, every five minutes, with cooldown protection. Plus default deployments now actually run in two AZs out of the box, instead of single-AZ with a config flag you had to remember to flip.

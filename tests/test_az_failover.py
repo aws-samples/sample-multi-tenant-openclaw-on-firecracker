@@ -47,8 +47,36 @@ def _load_hc_module(env_overrides=None):
     mock_ddb = MagicMock()
     mock_ssm = MagicMock()
     mock_sns = MagicMock()
-    # Per-name table cache so the module gets distinct mocks for
-    # tenants/hosts/audit and the test can poke each one.
+    mock_s3 = MagicMock()
+    mock_elbv2 = MagicMock()
+    # 1.3.1: default SSM get_command_invocation returns Success so the
+    # synchronous wait inside _failover_tenant_to_host doesn't time out.
+    # Tests that need failure can override this on mod._test_mocks["ssm"].
+    mock_ssm.get_command_invocation.return_value = {"Status": "Success"}
+    mock_ssm.send_command.return_value = {"Command": {"CommandId": "test-cmd-id"}}
+    # Default S3 list returns a single fake backup so _find_latest_backup_key
+    # works in the happy-path tests. Tests that need empty can override.
+    from datetime import datetime, timezone as _tz
+    mock_s3.list_objects_v2.return_value = {
+        "Contents": [{
+            "Key": "backups/t-stuck/2026-05-23T18:00:00Z.gz",
+            "LastModified": datetime(2026, 5, 23, 18, 0, 0, tzinfo=_tz.utc),
+        }],
+    }
+    # Default elbv2 mocks for _repoint_alb_rule.
+    mock_elbv2.describe_target_groups.return_value = {
+        "TargetGroups": [{"TargetGroupArn": "arn:tg:target", "VpcId": "vpc-1"}],
+    }
+    mock_elbv2.describe_rules.return_value = {
+        "Rules": [{
+            "RuleArn": "arn:rule:1",
+            "Priority": "10",
+            "Conditions": [{"Field": "path-pattern",
+                            "Values": ["/vm/t-stuck", "/vm/t-stuck/*"]}],
+            "Actions": [{"Type": "forward", "TargetGroupArn": "arn:tg:source"}],
+        }],
+    }
+
     table_cache = {}
 
     def _table_factory(name):
@@ -59,7 +87,10 @@ def _load_hc_module(env_overrides=None):
     mock_ddb.Table.side_effect = _table_factory
 
     def _client_factory(svc):
-        return {"ssm": mock_ssm, "sns": mock_sns}.get(svc, MagicMock())
+        return {
+            "ssm": mock_ssm, "sns": mock_sns,
+            "s3": mock_s3, "elbv2": mock_elbv2,
+        }.get(svc, MagicMock())
 
     with patch("boto3.resource", return_value=mock_ddb), \
          patch("boto3.client", side_effect=_client_factory):
@@ -69,9 +100,10 @@ def _load_hc_module(env_overrides=None):
         mod = importlib.util.module_from_spec(spec)
         sys.modules["hc_handler_az"] = mod
         spec.loader.exec_module(mod)
-    # Expose the mocks for the test to poke.
-    mod._test_mocks = {"ddb": mock_ddb, "ssm": mock_ssm, "sns": mock_sns,
-                       "tables": table_cache}
+    mod._test_mocks = {
+        "ddb": mock_ddb, "ssm": mock_ssm, "sns": mock_sns,
+        "s3": mock_s3, "elbv2": mock_elbv2, "tables": table_cache,
+    }
 
     # Restore the env after import so the module captures it.
     for k, v in saved.items():
@@ -376,6 +408,7 @@ class TestAZFailoverOrchestration:
             "AUDIT_TABLE": "openclaw-audit-log",
             "SNS_TOPIC_ARN": "arn:aws:sns:ap-northeast-1:123:openclaw",
             "ASSETS_BUCKET": "openclaw-assets-test",
+            "ALB_LISTENER_ARN": "arn:aws:elasticloadbalancing:ap-northeast-1:123:listener/app/test/abc/def",
         })
 
     @pytest.mark.unit
@@ -404,7 +437,7 @@ class TestAZFailoverOrchestration:
              "vcpu_total": 16, "vm_count": 1},
             {"instance_id": "i-2c", "az": "az-c", "last_health_check": _ago_iso(60),
              "vcpu_total": 16, "vm_count": 1, "next_vm_num": 2,
-             "avg_vcpu_per_vm": 2},
+             "avg_vcpu_per_vm": 2, "private_ip": "10.0.2.5"},
         ]}
         hc.hosts_table.get_item.return_value = {"Item": {}}  # no cooldown state
 
@@ -412,16 +445,26 @@ class TestAZFailoverOrchestration:
             {"id": "t-stuck", "host_id": "i-1a", "status": "running",
              "vcpu": 2, "mem_mb": 4096},
         ]
+        # _find_latest_backup_key returns the seeded fake key.
+        # SSM get_command_invocation returns Success (default mock).
         result = hc._check_and_handle_az_failover(now, tenants)
         assert result["az_outages_detected"] == 1
-        assert result["tenants_failed_over"] == 1
-        # SSM was called to launch on the target host.
+        assert result["tenants_failed_over"] == 1, \
+            f"failover_full_path: expected 1, got {result}"
+        # SSM was called for launch (target host) + nginx cleanup (source host).
         ssm = hc._test_mocks["ssm"]
         assert ssm.send_command.called
-        sent_args = ssm.send_command.call_args
-        assert sent_args.kwargs["InstanceIds"] == ["i-2c"]
-        cmd = sent_args.kwargs["Parameters"]["commands"][0]
-        assert "launch-vm.sh t-stuck" in cmd
+        # First send_command must be the launch-vm.sh on target host.
+        first_call = ssm.send_command.call_args_list[0]
+        assert first_call.kwargs["InstanceIds"] == ["i-2c"]
+        cmd = first_call.kwargs["Parameters"]["commands"][0]
+        # 1.3.1: positional args + real backup key (not --restore-from flag).
+        assert "/home/ubuntu/launch-vm.sh t-stuck 2 2 4096" in cmd
+        assert "backups/t-stuck/" in cmd  # real backup key from S3 list
+        assert "--restore-from" not in cmd, "1.3.1 must NOT use the broken flag form"
+        # ALB rule was repointed to target's TG.
+        elbv2 = hc._test_mocks["elbv2"]
+        assert elbv2.modify_rule.called or elbv2.create_rule.called
         # SNS notification fired.
         sns = hc._test_mocks["sns"]
         assert sns.publish.called
@@ -501,18 +544,28 @@ class TestFailoverTenant:
         return _load_hc_module(env_overrides={
             "AZ_FAILOVER_ENABLED": "true",
             "ASSETS_BUCKET": "openclaw-assets-test",
+            "ALB_LISTENER_ARN": "arn:aws:elasticloadbalancing:ap-northeast-1:123:listener/app/test/abc/def",
         })
 
     @pytest.mark.unit
     def test_happy_path_updates_ddb_and_calls_ssm(self):
         hc = self._make_hc()
+        # 1.3.1: seed S3 list with a real backup key for tenant t1.
+        from datetime import datetime as _dt, timezone as _tz
+        hc._test_mocks["s3"].list_objects_v2.return_value = {
+            "Contents": [{
+                "Key": "backups/t1/2026-05-23T18:00:00Z.gz",
+                "LastModified": _dt(2026, 5, 23, 18, 0, 0, tzinfo=_tz.utc),
+            }],
+        }
         now = datetime.now(timezone.utc)
         tenant = {"id": "t1", "host_id": "i-old", "vcpu": 4, "mem_mb": 8192,
                   "status": "running"}
-        target = {"instance_id": "i-new", "az": "az-c", "next_vm_num": 5}
+        target = {"instance_id": "i-new", "az": "az-c", "next_vm_num": 5,
+                  "private_ip": "10.0.2.5"}
         ok = hc._failover_tenant_to_host(tenant, target, source_az="az-a", now=now)
         assert ok is True
-        # tenants_table.update_item called twice: (1) mark recovering, (2) flip ownership.
+        # tenants_table.update_item called at least twice: mark recovering + flip ownership.
         update_calls = hc.tenants_table.update_item.call_args_list
         assert len(update_calls) >= 2
         first = update_calls[0].kwargs
@@ -520,31 +573,308 @@ class TestFailoverTenant:
         last = update_calls[-1].kwargs
         assert last["ExpressionAttributeValues"][":h"] == "i-new"
         assert last["ExpressionAttributeValues"][":n"] == 5
-        # SSM launch command targeted the new host.
+        # SSM launch command — POSITIONAL args, real backup key, no flag form.
         ssm = hc._test_mocks["ssm"]
-        cmd = ssm.send_command.call_args.kwargs["Parameters"]["commands"][0]
-        assert "launch-vm.sh t1 5 4 8192" in cmd
-        # restore-from S3 backup hint should be appended.
-        assert "--restore-from s3://openclaw-assets-test/backups/t1/latest.gz" in cmd
+        first_call = ssm.send_command.call_args_list[0]
+        cmd = first_call.kwargs["Parameters"]["commands"][0]
+        assert "/home/ubuntu/launch-vm.sh t1 5 4 8192" in cmd
+        assert 'backups/t1/2026-05-23T18:00:00Z.gz' in cmd
+        # 1.3.1: NO --restore-from flag (broken in 1.3.0).
+        assert "--restore-from" not in cmd
+        # 1.3.1: NO double s3:// prefix.
+        assert cmd.count("s3://") == 0  # backup key has no prefix
+        # ALB rule modified or created.
+        elbv2 = hc._test_mocks["elbv2"]
+        assert elbv2.modify_rule.called or elbv2.create_rule.called
+
+    @pytest.mark.unit
+    def test_no_backup_blocks_failover_with_alert(self):
+        """1.3.1: Path A — refuse to failover if no backup exists.
+
+        Better to leave the tenant blocked + alert a human than to silently
+        boot an empty VM and lose all data.
+        """
+        hc = self._make_hc()
+        # Simulate empty backup list.
+        hc._test_mocks["s3"].list_objects_v2.return_value = {"Contents": []}
+        now = datetime.now(timezone.utc)
+        tenant = {"id": "t1", "host_id": "i-old", "vcpu": 2, "mem_mb": 4096}
+        target = {"instance_id": "i-new", "az": "az-c", "next_vm_num": 1,
+                  "private_ip": "10.0.2.5"}
+        ok = hc._failover_tenant_to_host(tenant, target, source_az="az-a", now=now)
+        assert ok is False
+        # No SSM launch was attempted.
+        ssm = hc._test_mocks["ssm"]
+        # Filter out any cleanup calls — there should be NO launch.
+        for call in ssm.send_command.call_args_list:
+            cmd = call.kwargs.get("Parameters", {}).get("commands", [""])[0]
+            assert "launch-vm.sh" not in cmd, \
+                "must not launch VM when no backup is available"
+        # tenant marked failover_blocked.
+        last_update = hc.tenants_table.update_item.call_args_list[-1].kwargs
+        assert "failover_blocked" in str(last_update)
 
     @pytest.mark.unit
     def test_ssm_failure_marks_tenant_failed(self):
         hc = self._make_hc()
+        # Seed S3 with a real backup so we get past the path-A check.
+        from datetime import datetime as _dt, timezone as _tz
+        hc._test_mocks["s3"].list_objects_v2.return_value = {
+            "Contents": [{
+                "Key": "backups/t1/2026-05-23T18:00:00Z.gz",
+                "LastModified": _dt(2026, 5, 23, 18, 0, 0, tzinfo=_tz.utc),
+            }],
+        }
         now = datetime.now(timezone.utc)
         hc._test_mocks["ssm"].send_command.side_effect = Exception("ssm down")
         tenant = {"id": "t1", "host_id": "i-old", "vcpu": 2, "mem_mb": 4096}
-        target = {"instance_id": "i-new", "az": "az-c", "next_vm_num": 1}
+        target = {"instance_id": "i-new", "az": "az-c", "next_vm_num": 1,
+                  "private_ip": "10.0.2.5"}
         ok = hc._failover_tenant_to_host(tenant, target, source_az="az-a", now=now)
         assert ok is False
         # The status should be set to failover_failed at some point.
         seen = [c.kwargs["ExpressionAttributeValues"]
                 for c in hc.tenants_table.update_item.call_args_list]
-        assert any(":failed" in vals.get("__dummy__", "") or
-                   "failover_failed" in str(vals) for vals in seen)
+        assert any("failover_failed" in str(vals) for vals in seen)
+
+    @pytest.mark.unit
+    def test_ssm_command_fails_with_nonzero_status(self):
+        """1.3.1: synchronous SSM wait detects launch-vm.sh failure (e.g.
+        the script exits non-zero on target host) and marks tenant failed.
+        """
+        hc = self._make_hc()
+        from datetime import datetime as _dt, timezone as _tz
+        hc._test_mocks["s3"].list_objects_v2.return_value = {
+            "Contents": [{
+                "Key": "backups/t1/2026-05-23T18:00:00Z.gz",
+                "LastModified": _dt(2026, 5, 23, 18, 0, 0, tzinfo=_tz.utc),
+            }],
+        }
+        # SSM accepts the command, but get_command_invocation reports Failed.
+        hc._test_mocks["ssm"].get_command_invocation.return_value = {
+            "Status": "Failed",
+            "StandardErrorContent": "launch-vm.sh: data volume restore failed",
+        }
+        now = datetime.now(timezone.utc)
+        tenant = {"id": "t1", "host_id": "i-old", "vcpu": 2, "mem_mb": 4096}
+        target = {"instance_id": "i-new", "az": "az-c", "next_vm_num": 1,
+                  "private_ip": "10.0.2.5"}
+        ok = hc._failover_tenant_to_host(tenant, target, source_az="az-a", now=now)
+        assert ok is False
+        # Tenant marked failover_failed (not stuck in failover_recovering).
+        seen = [c.kwargs["ExpressionAttributeValues"]
+                for c in hc.tenants_table.update_item.call_args_list]
+        assert any("failover_failed" in str(vals) for vals in seen)
 
 
 # ══════════════════════════════════════════════════════════════════════
 # 8. Feature flag — disabled = noop in lambda_handler
+# ══════════════════════════════════════════════════════════════════════
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 8. _find_latest_backup_key — 1.3.1 helper
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestFindLatestBackupKey:
+    """The S3 key returned by this function is what failover passes verbatim
+    to launch-vm.sh as the 6th positional arg (RESTORE_KEY). Wrong format
+    here = silent failure on target host. These tests lock in the contract.
+    """
+
+    def _make_hc(self):
+        return _load_hc_module(env_overrides={
+            "ASSETS_BUCKET": "openclaw-assets-test",
+        })
+
+    @pytest.mark.unit
+    def test_returns_none_when_no_backups(self):
+        hc = self._make_hc()
+        hc._test_mocks["s3"].list_objects_v2.return_value = {"Contents": []}
+        assert hc._find_latest_backup_key("t-fresh") is None
+
+    @pytest.mark.unit
+    def test_returns_none_when_no_assets_bucket(self):
+        # No ASSETS_BUCKET env → can't list, must return None.
+        hc = _load_hc_module(env_overrides={"ASSETS_BUCKET": ""})
+        assert hc._find_latest_backup_key("t-anything") is None
+
+    @pytest.mark.unit
+    def test_single_backup_returned_as_key_only(self):
+        """Critical: must NOT include 's3://' prefix. launch-vm.sh assembles
+        s3://${ASSETS_BUCKET}/${RESTORE_KEY} itself; double prefix breaks it.
+        """
+        hc = self._make_hc()
+        from datetime import datetime as _dt, timezone as _tz
+        hc._test_mocks["s3"].list_objects_v2.return_value = {
+            "Contents": [{
+                "Key": "backups/t1/2026-05-23T18:00:00Z.gz",
+                "LastModified": _dt(2026, 5, 23, 18, 0, 0, tzinfo=_tz.utc),
+            }],
+        }
+        key = hc._find_latest_backup_key("t1")
+        assert key == "backups/t1/2026-05-23T18:00:00Z.gz"
+        assert not key.startswith("s3://"), \
+            "must return S3 key only, no s3:// prefix"
+
+    @pytest.mark.unit
+    def test_multiple_backups_returns_most_recent(self):
+        hc = self._make_hc()
+        from datetime import datetime as _dt, timezone as _tz
+        hc._test_mocks["s3"].list_objects_v2.return_value = {
+            "Contents": [
+                {"Key": "backups/t1/2026-05-20T12:00:00Z.gz",
+                 "LastModified": _dt(2026, 5, 20, 12, 0, 0, tzinfo=_tz.utc)},
+                {"Key": "backups/t1/2026-05-23T18:00:00Z.gz",
+                 "LastModified": _dt(2026, 5, 23, 18, 0, 0, tzinfo=_tz.utc)},
+                {"Key": "backups/t1/2026-05-22T09:00:00Z.gz",
+                 "LastModified": _dt(2026, 5, 22, 9, 0, 0, tzinfo=_tz.utc)},
+            ],
+        }
+        key = hc._find_latest_backup_key("t1")
+        assert key == "backups/t1/2026-05-23T18:00:00Z.gz"
+
+    @pytest.mark.unit
+    def test_s3_error_returns_none_not_raises(self):
+        """A transient S3 error must not crash failover orchestrator —
+        return None and let the caller go down the path-A 'no backup' branch.
+        """
+        hc = self._make_hc()
+        hc._test_mocks["s3"].list_objects_v2.side_effect = Exception("S3 down")
+        assert hc._find_latest_backup_key("t1") is None
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 9. _wait_ssm_done — synchronous SSM polling
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestWaitSsmDone:
+    def _make_hc(self):
+        return _load_hc_module()
+
+    @pytest.mark.unit
+    def test_success_returns_ok(self):
+        hc = self._make_hc()
+        hc._test_mocks["ssm"].get_command_invocation.return_value = {
+            "Status": "Success"
+        }
+        ok, err = hc._wait_ssm_done("cmd-1", "i-new", timeout_sec=10, poll_sec=0)
+        assert ok is True and err is None
+
+    @pytest.mark.unit
+    def test_failed_status_returns_error(self):
+        hc = self._make_hc()
+        hc._test_mocks["ssm"].get_command_invocation.return_value = {
+            "Status": "Failed",
+            "StandardErrorContent": "exit code 1",
+        }
+        ok, err = hc._wait_ssm_done("cmd-1", "i-new", timeout_sec=10, poll_sec=0)
+        assert ok is False
+        assert "Failed" in err
+
+    @pytest.mark.unit
+    def test_timeout_returns_error(self):
+        hc = self._make_hc()
+        # Always return InProgress → loop until timeout.
+        hc._test_mocks["ssm"].get_command_invocation.return_value = {
+            "Status": "InProgress"
+        }
+        ok, err = hc._wait_ssm_done("cmd-1", "i-new", timeout_sec=1, poll_sec=0.1)
+        assert ok is False
+        assert "timeout" in err.lower()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 10. _repoint_alb_rule — cross-host traffic switching
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestRepointAlbRule:
+    """Without this, traffic keeps hitting the dead source host even after
+    the VM is running on the target. This is what makes failover real.
+    """
+
+    def _make_hc(self):
+        return _load_hc_module(env_overrides={
+            "ALB_LISTENER_ARN": "arn:aws:elasticloadbalancing:ap-northeast-1:123:listener/app/test/abc/def",
+        })
+
+    @pytest.mark.unit
+    def test_modifies_existing_rule(self):
+        hc = self._make_hc()
+        elbv2 = hc._test_mocks["elbv2"]
+        elbv2.describe_target_groups.return_value = {
+            "TargetGroups": [{"TargetGroupArn": "arn:tg:newhost", "VpcId": "vpc-1"}],
+        }
+        elbv2.describe_rules.return_value = {
+            "Rules": [{
+                "RuleArn": "arn:rule:1",
+                "Priority": "10",
+                "Conditions": [{"Field": "path-pattern",
+                                "Values": ["/vm/t1", "/vm/t1/*"]}],
+                "Actions": [{"Type": "forward", "TargetGroupArn": "arn:tg:oldhost"}],
+            }],
+        }
+        hc._repoint_alb_rule("t1", "i-newhost", "10.0.2.5")
+        # Should call modify_rule pointing at the new host's TG.
+        assert elbv2.modify_rule.called
+        modify_args = elbv2.modify_rule.call_args.kwargs
+        assert modify_args["RuleArn"] == "arn:rule:1"
+        assert modify_args["Actions"][0]["TargetGroupArn"] == "arn:tg:newhost"
+
+    @pytest.mark.unit
+    def test_creates_rule_if_missing(self):
+        hc = self._make_hc()
+        elbv2 = hc._test_mocks["elbv2"]
+        elbv2.describe_target_groups.return_value = {
+            "TargetGroups": [{"TargetGroupArn": "arn:tg:newhost", "VpcId": "vpc-1"}],
+        }
+        # No matching rule for /vm/t-new — only an unrelated rule exists.
+        elbv2.describe_rules.return_value = {
+            "Rules": [{
+                "RuleArn": "arn:rule:99",
+                "Priority": "20",
+                "Conditions": [{"Field": "path-pattern",
+                                "Values": ["/vm/some-other"]}],
+                "Actions": [{"Type": "forward", "TargetGroupArn": "arn:tg:other"}],
+            }],
+        }
+        hc._repoint_alb_rule("t-new", "i-newhost", "10.0.2.5")
+        assert elbv2.create_rule.called
+
+    @pytest.mark.unit
+    def test_noop_when_listener_not_configured(self):
+        # No ALB_LISTENER_ARN env → nothing to repoint, should not raise.
+        # Force-clear any inherited env from earlier tests.
+        hc = _load_hc_module(env_overrides={"ALB_LISTENER_ARN": ""})
+        hc._repoint_alb_rule("t1", "i-newhost", "10.0.2.5")
+        # No elbv2 calls expected (early return).
+        elbv2 = hc._test_mocks["elbv2"]
+        assert not elbv2.modify_rule.called
+        assert not elbv2.create_rule.called
+
+    @pytest.mark.unit
+    def test_registers_target_with_host_ip(self):
+        """Target group must have the host's private IP registered before
+        traffic can flow to it.
+        """
+        hc = self._make_hc()
+        elbv2 = hc._test_mocks["elbv2"]
+        elbv2.describe_target_groups.return_value = {
+            "TargetGroups": [{"TargetGroupArn": "arn:tg:newhost", "VpcId": "vpc-1"}],
+        }
+        elbv2.describe_rules.return_value = {"Rules": []}
+        hc._repoint_alb_rule("t1", "i-newhost", "10.0.2.5")
+        assert elbv2.register_targets.called
+        reg_args = elbv2.register_targets.call_args.kwargs
+        assert reg_args["TargetGroupArn"] == "arn:tg:newhost"
+        assert reg_args["Targets"] == [{"Id": "10.0.2.5", "Port": 80}]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 11. Feature flag — disabled = noop in lambda_handler
 # ══════════════════════════════════════════════════════════════════════
 
 

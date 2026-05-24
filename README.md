@@ -96,6 +96,40 @@ source .env.deploy && ./build-rootfs.sh <new_version>
 # New tenants use the new rootfs immediately; existing tenants need a reset API call to switch over
 ```
 
+### Upgrading from v1.3.0 → v1.3.1
+
+**Critical**: v1.3.0 had three integration bugs that prevented AZ failover from actually working end-to-end (detection worked, but VM relaunch on target host failed silently). v1.3.1 fixes them and adds real-environment E2E validation. **Strongly recommended for any deployment using the AZ failover feature.**
+
+```bash
+git pull && ./setup.sh <region> <profile>     # IAM policy + Lambda env updates
+```
+
+After redeploy:
+
+- **Re-roll launch-vm.sh on existing hosts** so the e2fsck-on-restore fix is in place:
+
+  ```bash
+  source .env.deploy
+  aws s3 cp deploy/userdata/launch-vm.sh s3://${ASSETS_BUCKET}/deployment/scripts/launch-vm.sh
+  aws ssm send-command --document-name AWS-RunShellScript \
+      --targets Key=tag:aws:autoscaling:groupName,Values=openclaw-hosts-asg \
+      --parameters 'commands=[
+        "aws s3 cp s3://'${ASSETS_BUCKET}'/deployment/scripts/launch-vm.sh /home/ubuntu/launch-vm.sh",
+        "chmod +x /home/ubuntu/launch-vm.sh"
+      ]'
+  ```
+
+- **Existing in-flight migrations** that completed pre-v1.3.1 may have ALB rules still pointing at the old host. Run a `POST /tenants/{id}/migrate` (no-op if target == current host) to trigger the fixed path on each affected tenant, or wait for the next deploy event that touches the rule.
+
+- **Backups are now mandatory for AZ failover to preserve data.** v1.3.1 implements Path A: if a tenant has no backup at the time of AZ failure, failover is **refused** with an SNS alert + `failover_blocked` status, rather than booting an empty VM and silently losing data. Set `backup_cron` in `config.yml` so every tenant has a recent snapshot before disaster strikes:
+
+  ```yaml
+  backup_cron: "cron(0 19 * * ? *)"  # daily at UTC 19:00 / Beijing 03:00
+  backup_retention_days: 7
+  ```
+
+- **Cooldown state** lives at `__az_failover_state__` synthetic record. Filtered from `/hosts` API responses, kept indefinitely so the 30-minute cooldown survives Lambda redeploys.
+
 ### Upgrading from v1.2.9 → v1.3.0
 
 The 1.3.0 release adds **automatic AZ-level failover** + **default 2-host multi-AZ deployment**. Two layers of attention:

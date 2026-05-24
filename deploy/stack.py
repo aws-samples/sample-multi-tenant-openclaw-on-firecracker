@@ -363,7 +363,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
             runtime=_lambda.Runtime.PYTHON_3_12,
             handler="handler.lambda_handler",
             code=_lambda.Code.from_asset("deploy/lambda/health_check"),
-            timeout=Duration.seconds(120),
+            timeout=Duration.seconds(180),  # 1.3.1: room for synchronous SSM wait during failover
             memory_size=256,
             environment={
                 "TENANTS_TABLE": tenants_table.table_name,
@@ -371,6 +371,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 "AUDIT_TABLE": audit_table.table_name,
                 "SNS_TOPIC_ARN": notifications_topic_arn,
                 "ASSETS_BUCKET": assets_bucket.bucket_name,
+                # ALB_LISTENER_ARN injected after listener creation (see below)
                 "AZ_FAILOVER_ENABLED": str(bool(az_failover_cfg.get("enabled", True))).lower(),
                 "AZ_UNHEALTHY_THRESHOLD_MINUTES": str(int(az_failover_cfg.get("unhealthy_threshold_minutes", 10))),
                 "AZ_COOLDOWN_MINUTES": str(int(az_failover_cfg.get("cooldown_minutes", 30))),
@@ -379,8 +380,21 @@ class OpenClawOrchestratorStack(cdk.Stack):
         tenants_table.grant_read_write_data(health_fn)
         hosts_table.grant_read_write_data(health_fn)
         audit_table.grant_write_data(health_fn)
+        assets_bucket.grant_read(health_fn)  # 1.3.1: list backups for failover
         if notifications_topic is not None:
             notifications_topic.grant_publish(health_fn)
+        # 1.3.1: ALB rule re-pointing during cross-host failover.
+        health_fn.add_to_role_policy(iam.PolicyStatement(
+            actions=[
+                "elasticloadbalancing:DescribeRules",
+                "elasticloadbalancing:DescribeTargetGroups",
+                "elasticloadbalancing:CreateRule",
+                "elasticloadbalancing:ModifyRule",
+                "elasticloadbalancing:CreateTargetGroup",
+                "elasticloadbalancing:RegisterTargets",
+            ],
+            resources=["*"],
+        ))
         health_fn.add_to_role_policy(ssm_policy)
 
         events.Rule(self, "HealthCheckSchedule",
@@ -904,11 +918,15 @@ class OpenClawOrchestratorStack(cdk.Stack):
         # Pass ALB info to API Lambda for path-based routing
         api_fn.add_environment("ALB_LISTENER_ARN", listener.listener_arn)
         api_fn.add_environment("VPC_ID", vpc.vpc_id)
+        # 1.3.1: health_check Lambda needs ALB listener for AZ failover
+        # to repoint /vm/<tenant_id>* rules across hosts.
+        health_fn.add_environment("ALB_LISTENER_ARN", listener.listener_arn)
         api_fn.add_to_role_policy(iam.PolicyStatement(
             actions=[
                 "elasticloadbalancing:CreateTargetGroup", "elasticloadbalancing:DeleteTargetGroup",
                 "elasticloadbalancing:RegisterTargets", "elasticloadbalancing:DeregisterTargets",
                 "elasticloadbalancing:CreateRule", "elasticloadbalancing:DeleteRule",
+                "elasticloadbalancing:ModifyRule",
                 "elasticloadbalancing:DescribeRules", "elasticloadbalancing:DescribeTargetGroups",
                 "elasticloadbalancing:DescribeListeners",
             ],

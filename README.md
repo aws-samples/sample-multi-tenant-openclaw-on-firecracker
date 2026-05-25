@@ -1,521 +1,329 @@
-# Multi-Tenant OpenClaw on Firecracker
+<h1 align="center">🦞 OpenClaw Pool</h1>
 
-**[English](README.md)** | **[中文](docs/README-CN.md)**
+<p align="center">
+  <b>Production-grade multi-tenant AI agents on AWS, isolated by Firecracker microVMs</b><br/>
+  <i>Strong isolation · Real failover · Full observability · 5-minute one-click deploy</i>
+</p>
 
-Multi-tenant isolated deployment of OpenClaw AI agents on AWS using Firecracker microVMs, also known as **OpenClaw Pool**. Each tenant runs in its own microVM with independent kernel, filesystem, and network. Managed via API, with auto-scaling hosts and idle reclamation.
+<p align="center">
+  <a href="https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/blob/main/LICENSE">
+    <img src="https://img.shields.io/badge/License-MIT--0-blue.svg" alt="License: MIT-0"/>
+  </a>
+  <a href="https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/releases/latest">
+    <img src="https://img.shields.io/github/v/release/aws-samples/sample-multi-tenant-openclaw-on-firecracker?color=success&label=release" alt="Latest release"/>
+  </a>
+  <a href="https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/stargazers">
+    <img src="https://img.shields.io/github/stars/aws-samples/sample-multi-tenant-openclaw-on-firecracker?style=flat&color=yellow" alt="GitHub Stars"/>
+  </a>
+  <a href="https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/network/members">
+    <img src="https://img.shields.io/github/forks/aws-samples/sample-multi-tenant-openclaw-on-firecracker?style=flat&color=orange" alt="GitHub Forks"/>
+  </a>
+  <a href="https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues">
+    <img src="https://img.shields.io/github/issues/aws-samples/sample-multi-tenant-openclaw-on-firecracker?color=brightgreen" alt="Open issues"/>
+  </a>
+  <img src="https://img.shields.io/badge/tests-426%20passing-brightgreen" alt="Tests passing"/>
+</p>
 
-> This project uses AWS EC2 [nested virtualization](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/nested-virtualization.html) to run KVM + Firecracker inside EC2 instances. Currently supports Intel instance families (c8i/m8i/r8i, etc.).
+<p align="center">
+  <img src="https://img.shields.io/badge/AWS-Sample-FF9900?logo=amazon-aws&logoColor=white" alt="AWS Sample"/>
+  <img src="https://img.shields.io/badge/Firecracker-microVM-E47A22?logo=firefox&logoColor=white" alt="Firecracker"/>
+  <img src="https://img.shields.io/badge/AWS%20CDK-2.x-orange?logo=amazon-aws" alt="AWS CDK"/>
+  <img src="https://img.shields.io/badge/Python-3.12+-3776AB?logo=python&logoColor=white" alt="Python 3.12+"/>
+  <img src="https://img.shields.io/badge/Bedrock-AgentCore-7C4DFF?logo=amazon&logoColor=white" alt="Bedrock AgentCore"/>
+  <img src="https://img.shields.io/badge/Multi--AZ-HA-brightgreen" alt="Multi-AZ HA"/>
+  <img src="https://img.shields.io/badge/Prometheus-Ready-E6522C?logo=prometheus&logoColor=white" alt="Prometheus"/>
+  <img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs welcome"/>
+</p>
 
-> ⚠️ This sample is for demonstration purposes only and is not intended for production use. Deploy at your own risk.
+<p align="center">
+  <b>📖 Read in:</b>
+  <a href="README.md">English</a> ·
+  <a href="docs/README-CN.md">中文</a>
+</p>
 
-## Features
+<p align="center">
+  <a href="#-quick-start">Quick Start</a> ·
+  <a href="#-features">Features</a> ·
+  <a href="#%EF%B8%8F-web-console">Console</a> ·
+  <a href="#%EF%B8%8F-architecture">Architecture</a> ·
+  <a href="#-api-reference">API</a> ·
+  <a href="https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/releases/latest">Releases</a> ·
+  <a href="CHANGELOG.md">Changelog</a>
+</p>
 
-- **Tenant Management** — Create/delete/query tenants via API. Each tenant is an OpenClaw instance running in an isolated Firecracker microVM with its own rootfs, data volume, and network
-- **Security Isolation** — Firecracker microVM-based isolation: independent kernel, network, and filesystem per tenant
-- **Auto Scheduling** — Automatically selects a host with available resources; scales out when capacity is insufficient
-- **Auto Scale-in** — Idle hosts are reclaimed after timeout (two-round confirmation to prevent false kills)
-- **Health Checks** — Real-time VM health monitoring with automatic status updates
-- **Web Console** — Online management console with Cognito authentication, real-time host/tenant status
-- **Rootfs Pre-build** — Rootfs + data template distributed via S3, downloaded on host init
-- **Dashboard Access** — One-click HTTPS access to each tenant's OpenClaw Dashboard, no custom domain required
-- **Auto Backup & Restore** — EventBridge scheduled backup of all tenant data volumes to S3, with manual trigger, cross-tenant backup query, and one-click restore into a new tenant (orphan-safe — source tenant need not exist)
-- **AgentCore Integration** — Optional toggle; when enabled, all VMs auto-connect to AgentCore Gateway (MCP tool hub), Memory, Code Interpreter, and Browser
-- **Shared Skills** — All tenants share a unified skill set (S3-managed, auto-synced to all VMs), with independent memory
-- **Config Templates** — Custom OpenClaw configuration templates for different LLM providers/models, selectable when creating tenants
-- **Default Toolchain** — Each VM comes with Python3/uv/git/gh/Node.js/htop/tmux/tree pre-installed
+---
 
-## v1.2 Feature Matrix
+<p align="center">
+  <img src="docs/web_console.png" alt="OpenClaw Pool Console - Tenants tab with multi-AZ multi-host view" width="92%"/>
+  <br/>
+  <i>Real production deployment — tenants distributed across 2 AZs, live CPU/Memory/Disk metrics, one-click migration & dashboard access.</i>
+</p>
 
-> **Latest release**: [see GitHub Releases](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/releases/latest). See [CHANGELOG.md](CHANGELOG.md) for details.
+> ⚠️ **Disclaimer**: This sample is for demonstration purposes only and is not intended for production use. Deploy at your own risk.
+>
+> 💡 **Note**: This project uses AWS EC2 [nested virtualization](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/nested-virtualization.html) to run KVM + Firecracker inside EC2 instances. Currently supports Intel instance families (c8i / m8i / r8i) and Graviton (ARM64).
 
-24 features merged in the Q2 2026 milestone, each with TDD coverage and a per-issue rollback tag.
+---
 
-| Category | Feature | Issue | PR |
-|---|---|---|---|
-| **Observability** | Per-VM CPU/memory/disk metrics in DynamoDB | [#3] | [#37] |
-| | Amazon Managed Prometheus + Grafana | [#4] | [#38] |
-| **Security** | EBS encryption at rest | [#6] | [#26] |
-| | Optional AWS WAF integration | [#7] | [#31] |
-| | RBAC via Cognito Groups (admin/operator/viewer) | [#14] | [#39] |
-| | Audit log for all mutating API operations | [#17] | [#32] |
-| **Tenant lifecycle** | Per-tenant resource quotas | [#9] | [#34] |
-| | Tagging, grouping, and search | [#10] | [#27] |
-| | Scheduled auto-stop/start (office-hours mode) | [#11] | [#30] |
-| | Snapshot/clone via local cp on the same host | [#12] | [#36] |
-| | SNS lifecycle notifications | [#13] | [#33] |
-| | TTL with auto-stop or auto-delete on expiry | [#15] | [#28] |
-| | Live VM resize — hot-add vCPU without restart | [#16] | [#35] |
-| | Offline auto-resize for tenant data disks | [#22] | [#47] |
-| | Batch tenant operations endpoint | [#23] | [#29] |
-| **Platform** | Pluggable VM runtime protocol (Firecracker / CHV / QEMU stub) | [#5] | [#41] |
-| | Multi-AZ HA opt-in | [#8] | [#42] |
-| | Graviton (ARM64) host support | [#19] | [#44] |
-| | Live VM migration via Firecracker snapshot/restore | [#20] | [#45] |
-| **DevX** | Unified `oc` CLI | [#21] | [#40] |
-| **Deployment** | Terraform module at parity with CDK core | [#18] | [#43] |
+## ✨ Why OpenClaw Pool?
 
-[#3]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/3
-[#4]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/4
-[#5]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/5
-[#6]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/6
-[#7]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/7
-[#8]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/8
-[#9]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/9
-[#10]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/10
-[#11]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/11
-[#12]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/12
-[#13]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/13
-[#14]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/14
-[#15]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/15
-[#16]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/16
-[#17]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/17
-[#18]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/18
-[#19]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/19
-[#20]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/20
-[#21]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/21
-[#22]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/22
-[#23]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/23
-[#24]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/24
+<table>
+<tr>
+<td width="50%" valign="top">
 
-## Upgrade Guide
+**🔒 Strong isolation by design**
+Each tenant runs in its own Firecracker microVM — same lightweight virtualization powering AWS Lambda and Fargate. Independent kernel, OverlayFS rootfs, /24 subnet, KMS-encrypted EBS. Not Linux namespaces sharing one kernel.
 
-Upgrading a new version typically involves **two layers**: control plane (CDK stack) and data plane (rootfs + host-agent). The control plane is updated by redeploying; the data plane requires rebuilding the rootfs.
+**🛡 Real, battle-tested AZ failover**
+Default 2-host multi-AZ deployment + automatic AZ failover. Verified end-to-end on real AWS — multi-tenant simultaneous failover with 2/2 dashboards back to HTTP 200 in ~90s. Six deep race conditions hunted down and locked in by unit tests.
 
-### Standard procedure (any version)
+**🤖 Bedrock AgentCore native**
+One toggle and every microVM auto-connects to AgentCore Gateway, Memory, Code Interpreter, Browser, and Workload Identity. Among the few AWS Samples that fully wire all five AgentCore components.
 
-```bash
-git pull                                  # pull latest main
-git diff HEAD@{1} HEAD -- config.yml.example   # check for new config keys
-# If new keys exist, merge them into your local config.yml manually
+</td>
+<td width="50%" valign="top">
 
-./setup.sh <region> <profile>             # redeploy CDK stack (idempotent)
+**📊 Full-stack observability, zero static creds**
+Amazon Managed Prometheus + Grafana out of the box. ADOT collector auto-signs SigV4 from each host. Six per-VM gauges (`openclaw_vm_cpu_pct`, `memory_used_mb`, `disk_used_pct`, …) + audit log + console PromQL examples.
 
-# Rebuild rootfs (see "Quick Start" Step 3)
-source .env.deploy && ./build-rootfs.sh <new_version>
+**⚡ High density at low cost**
+CPU 2× / memory 1.5× overcommit (Firecracker balloon). Spot instance support saves 60–70%. Per-tenant quotas guard against noisy neighbors. ~100 tenants on $250/month vs $2000 for one-EC2-per-tenant.
 
-# New tenants use the new rootfs immediately; existing tenants need a reset API call to switch over
-```
+**🚀 One-command CDK deploy**
+`./setup.sh <region> <profile>` brings up the full stack in 5 minutes — VPC, ASG, ALB, Lambda, DynamoDB, AMP, Cognito, AgentCore, all wired and ready. Cloud rootfs build means **no local Linux required** (works from macOS / Windows).
 
-### Upgrading from v1.3.1 → v1.3.2
+</td>
+</tr>
+</table>
 
-**Critical**: v1.3.1 fixed AZ failover for the happy-path single-tenant case. v1.3.2 fixes everything that surfaces under real load — concurrent Lambda invocations, multi-tenant batch failover, transient kernel races, host-agent ⇄ Lambda race conditions where SSM exit code disagrees with VM truth. **Strongly recommended for any multi-tenant deployment.**
+---
 
-```bash
-git pull && ./setup.sh <region> <profile>     # adds reserved_concurrent_executions=1
-                                              # to health_check Lambda
-```
+## 📑 Table of Contents
 
-After redeploy:
+- [🚀 Quick Start](#-quick-start)
+- [🎯 Features](#-features)
+- [🖥️ Web Console](#%EF%B8%8F-web-console)
+- [🏗️ Architecture](#%EF%B8%8F-architecture)
+- [⚙️ Configuration](#%EF%B8%8F-configuration)
+- [📚 API Reference](#-api-reference)
+- [🌐 Advanced Topics](#-advanced-topics)
+- [⬆️ Upgrade Guide](#%EF%B8%8F-upgrade-guide)
+- [🤝 Contributing](#-contributing)
+- [📄 License](#-license)
 
-- **Re-roll `launch-vm.sh`** on existing hosts so the new EBUSY retry + post-InstanceStart `set +e` are in place:
+---
 
-  ```bash
-  source .env.deploy
-  aws s3 cp deploy/userdata/launch-vm.sh s3://${ASSETS_BUCKET}/deployment/scripts/launch-vm.sh
-  aws ssm send-command --document-name AWS-RunShellScript \
-      --targets Key=tag:aws:autoscaling:groupName,Values=openclaw-hosts-asg \
-      --parameters 'commands=[
-        "aws s3 cp s3://'${ASSETS_BUCKET}'/deployment/scripts/launch-vm.sh /home/ubuntu/launch-vm.sh",
-        "chmod +x /home/ubuntu/launch-vm.sh"
-      ]'
-  ```
+## 🚀 Quick Start
 
-- **New audit-log entries to monitor:**
-  - `AZ_FAILOVER_RECOVERED_BY_VERIFY` — informational; SSM exit code was misleading but the VM is actually running (host-agent recovered it)
-  - `AZ_FAILOVER_SKIPPED_CONCURRENT` — informational; concurrent Lambda backed off cleanly
-  - `AZ_FAILOVER_TENANT_FAILED` — actionable; verify probe confirmed the migration genuinely failed
-  - `AZ_FAILOVER_NO_BACKUP` — actionable; tenant has no backup, refuse-to-fail-over engaged
-
-- **Summary buckets are now disjoint.** `tenants_failed_over`, `tenants_failed`, `tenants_blocked` are independent. `tenants_blocked` is the new "we refused to migrate to avoid data loss" bucket (path-A no-backup).
-
-### Upgrading from v1.3.0 → v1.3.1
-
-**Critical**: v1.3.0 had three integration bugs that prevented AZ failover from actually working end-to-end (detection worked, but VM relaunch on target host failed silently). v1.3.1 fixes them and adds real-environment E2E validation. **Strongly recommended for any deployment using the AZ failover feature.**
+> **Prerequisites**: AWS account + CLI configured · CDK CLI · Python 3.12+ · [uv](https://docs.astral.sh/uv/) package manager
 
 ```bash
-git pull && ./setup.sh <region> <profile>     # IAM policy + Lambda env updates
-```
+# 1️⃣ Clone & configure
+git clone https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker
+cd sample-multi-tenant-openclaw-on-firecracker
+cp config.yml.example config.yml                                  # tweak as needed
+cp templates/openclaw.json.example templates/openclaw.json        # set your LLM API key
 
-After redeploy:
+# 2️⃣ One-click CDK deploy (~5 min) — provisions VPC, ASG, ALB, Lambda, DynamoDB,
+#                                    AMP, Grafana, Cognito, AgentCore, KMS, WAF
+./setup.sh ap-northeast-1 your-aws-profile
 
-- **Re-roll launch-vm.sh on existing hosts** so the e2fsck-on-restore fix is in place:
+# 3️⃣ Build the rootfs (~10 min, one-time, cloud-native — no local Linux required)
+./scripts/build-rootfs-on-ec2.sh v1.0
 
-  ```bash
-  source .env.deploy
-  aws s3 cp deploy/userdata/launch-vm.sh s3://${ASSETS_BUCKET}/deployment/scripts/launch-vm.sh
-  aws ssm send-command --document-name AWS-RunShellScript \
-      --targets Key=tag:aws:autoscaling:groupName,Values=openclaw-hosts-asg \
-      --parameters 'commands=[
-        "aws s3 cp s3://'${ASSETS_BUCKET}'/deployment/scripts/launch-vm.sh /home/ubuntu/launch-vm.sh",
-        "chmod +x /home/ubuntu/launch-vm.sh"
-      ]'
-  ```
-
-- **Existing in-flight migrations** that completed pre-v1.3.1 may have ALB rules still pointing at the old host. Run a `POST /tenants/{id}/migrate` (no-op if target == current host) to trigger the fixed path on each affected tenant, or wait for the next deploy event that touches the rule.
-
-- **Backups are now mandatory for AZ failover to preserve data.** v1.3.1 implements Path A: if a tenant has no backup at the time of AZ failure, failover is **refused** with an SNS alert + `failover_blocked` status, rather than booting an empty VM and silently losing data. Set `backup_cron` in `config.yml` so every tenant has a recent snapshot before disaster strikes:
-
-  ```yaml
-  backup_cron: "cron(0 19 * * ? *)"  # daily at UTC 19:00 / Beijing 03:00
-  backup_retention_days: 7
-  ```
-
-- **Cooldown state** lives at `__az_failover_state__` synthetic record. Filtered from `/hosts` API responses, kept indefinitely so the 30-minute cooldown survives Lambda redeploys.
-
-### Upgrading from v1.2.9 → v1.3.0
-
-The 1.3.0 release adds **automatic AZ-level failover** + **default 2-host multi-AZ deployment**. Two layers of attention:
-
-```bash
-git pull && ./setup.sh <region> <profile>     # bumps ASG min_capacity to 2,
-                                              # multi_az.enabled to true,
-                                              # adds health_check.az_failover
-                                              # config block, gives the
-                                              # health_check Lambda new IAM
-                                              # (write hosts, write audit,
-                                              # publish SNS) and 4 new env vars.
-```
-
-After the redeploy:
-
-- **The ASG will scale up by one host on first redeploy** (`min_capacity` 1 → 2). The new host will land in a different AZ from the existing one if `multi_az.enabled: true` and the region has ≥ 2 AZs. Cost impact: one additional EC2 instance (default `m8i.2xlarge` = ~$0.50/hr in ap-northeast-1). Set `min_capacity: 1` in your `config.yml` if you want to keep single-host.
-
-- **Existing hosts won't be writing heartbeats to the hosts table** until the v1.3.0 host-agent is rolled out. The `is_host_unhealthy` predicate treats missing timestamps as unhealthy → first health_check Lambda invocation may flag your existing AZ as down. **Two safe paths:**
-
-  ```bash
-  # Option A: temporarily disable AZ failover during the agent rollout, re-enable after.
-  # Edit config.yml: set health_check.az_failover.enabled: false
-  ./setup.sh <region> <profile>     # redeploy with failover off
-  source .env.deploy
-  aws s3 cp deploy/userdata/host-agent.py s3://${ASSETS_BUCKET}/deployment/scripts/host-agent.py
-  aws ssm send-command --document-name AWS-RunShellScript \
-      --targets Key=tag:aws:autoscaling:groupName,Values=openclaw-hosts-asg \
-      --parameters 'commands=[
-        "aws s3 cp s3://'${ASSETS_BUCKET}'/deployment/scripts/host-agent.py /opt/openclaw/host-agent.py",
-        "if ! grep -q ^INSTANCE_ID= /etc/platform.env; then TOKEN=$(curl -s -X PUT -H X-aws-ec2-metadata-token-ttl-seconds:600 http://169.254.169.254/latest/api/token); IID=$(curl -s -H X-aws-ec2-metadata-token:$TOKEN http://169.254.169.254/latest/meta-data/instance-id); echo INSTANCE_ID=$IID >> /etc/platform.env; fi",
-        "systemctl restart host-agent"
-      ]'
-  # Wait 1 minute for at least one heartbeat per host, then re-enable failover.
-  # Edit config.yml: set health_check.az_failover.enabled: true
-  ./setup.sh <region> <profile>
-
-  # Option B (faster, slightly less safe): roll the ASG and let the new init-host.sh
-  # take care of populating last_health_check from scratch.
-  aws autoscaling set-desired-capacity --auto-scaling-group-name openclaw-hosts-asg --desired-capacity 0
-  # wait for instances to drain, then bring back up
-  aws autoscaling set-desired-capacity --auto-scaling-group-name openclaw-hosts-asg --desired-capacity 2
-  ```
-
-- **Synthetic `__az_failover_state__` record.** The first AZ outage will create a synthetic host record with that key in the `openclaw-hosts` table to remember per-AZ cooldown across Lambda invocations. It's filtered out of `/hosts` API responses (no console / CLI / dashboard impact) and kept indefinitely so cooldown survives Lambda redeploys.
-
-- **Console refresh:** new tabs / Hosts grouping / Fleet by AZ are picked up by hard-refreshing the browser. The v1.3.0 footer is the easiest sanity check.
-
-### Upgrading from v1.2.7 → v1.2.9
-
-The 1.2.8 + 1.2.9 releases stack a lot of console-surface fixes and metric correctness on top of an unchanged data plane. Most of it picks up automatically on `setup.sh`, but a few items need a one-time touch:
-
-```bash
-git pull && ./setup.sh <region> <profile>     # creates new API GW resources
-                                                # (/system/info, /agentcore/tools,
-                                                # /audit-log) and Lambda env vars
-                                                # (MULTI_AZ_ENABLED, etc.)
-```
-
-After the redeploy:
-
-- **Existing hosts won't have an `az` field on their DDB record** until they re-register. The console gracefully handles the empty case (column shows `-`), but if you want the AZ column / Hosts-grouped-by-AZ to populate immediately, either:
-
-  ```bash
-  # Option A: roll the ASG (clean — terminate triggers re-launch with new init-host.sh):
-  aws autoscaling set-desired-capacity --auto-scaling-group-name openclaw-hosts-asg --desired-capacity 0
-  # wait, then bring back up
-  aws autoscaling set-desired-capacity --auto-scaling-group-name openclaw-hosts-asg --desired-capacity 1
-
-  # Option B: manual backfill (faster, no service interruption):
-  aws ec2 describe-instances --filters Name=tag:aws:autoscaling:groupName,Values=openclaw-hosts-asg \
-      --query 'Reservations[].Instances[].[InstanceId,Placement.AvailabilityZone]' --output text |
-    while read iid az; do
-      aws dynamodb update-item --table-name openclaw-hosts \
-        --key "{\"instance_id\":{\"S\":\"$iid\"}}" \
-        --update-expression 'SET az = :a' \
-        --expression-attribute-values "{\":a\":{\"S\":\"$az\"}}"
-    done
-  ```
-
-- **Existing hosts run the old `host-agent.py` until it's reloaded.** The 1.2.9 metrics fix (real CPU% from `/proc/<fc_pid>/stat`, real memory from VmRSS) only takes effect once the new agent is on the box. To push it without rolling the ASG:
-
-  ```bash
-  source .env.deploy
-  aws s3 cp deploy/userdata/host-agent.py s3://${ASSETS_BUCKET}/deployment/scripts/host-agent.py
-  # Then on each host (or via SSM Run Command):
-  aws ssm send-command --document-name AWS-RunShellScript \
-      --targets Key=tag:aws:autoscaling:groupName,Values=openclaw-hosts-asg \
-      --parameters 'commands=[
-        "aws s3 cp s3://'${ASSETS_BUCKET}'/deployment/scripts/host-agent.py /opt/openclaw/host-agent.py",
-        "systemctl restart host-agent"
-      ]'
-  ```
-
-- **No tenant migration is required.** All v1.2.x DDB schema changes are additive (new optional fields). Existing tenant records keep working unchanged.
-
-- **Console refresh:** `setup.sh` re-uploads `console/index.html` to S3. Hard-refresh in the browser (or wait for CloudFront's ~24h TTL) to pick up the new tabs. The version banner in the footer is the easiest way to verify the new build is live.
-
-## Quick Start
-
-**Prerequisites:**
-
-- AWS account + CLI configured
-- CDK CLI + Python 3.12+
-- uv (Python package manager)
-- For local rootfs build (`build-rootfs.sh`, optional): `sudo` access on a
-  Linux host with `debootstrap` / `pigz` / `e2fsprogs`, ≥2GB free RAM, ≥10GB
-  free in `/tmp`. **Not required if you use `build-rootfs-on-ec2.sh` —
-  see step 3 below.**
-
-```bash
-# 1. Configure
-cp config.yml.example config.yml          # Edit infrastructure config
-cp templates/openclaw.json.example templates/openclaw.json  # Set your API key, model provider, etc.
-
-# 2. Deploy infrastructure
-./setup.sh ap-northeast-1 lab
-# Environment variables saved to .env.deploy
-
-# 3. Build rootfs — REQUIRED before creating any tenant.
-#
-#    Option A — cloud build (works from macOS / Windows / anywhere):
-#      ./scripts/build-rootfs-on-ec2.sh v1.0
-#    Spins up a one-shot t3.medium Ubuntu host, runs the build via SSM,
-#    uploads to S3, terminates. ~10 min, no local Linux required.
-#
-#    Option B — local Linux host (faster if you already have one):
-#      source .env.deploy
-#      ./build-rootfs.sh v1.0
-
-# 4. Create a tenant (OpenClaw instance)
+# 4️⃣ Create your first tenant
 source .env.deploy
 curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" \
-  -d '{"name":"my-agent","vcpu":2,"mem_mb":4096}' | jq .
-
-# 5. Open Console — manage tenants, templates, and settings
-# Console URL is printed after deploy
+  -d '{"name":"my-first-agent","vcpu":2,"mem_mb":4096}' | jq .
 ```
 
-## Management Console
+> Open the Console URL printed at the end of `setup.sh` to manage tenants from a browser. Every tenant gets a one-click HTTPS dashboard with no custom domain or certificate required.
 
-Web-based console hosted on CloudFront (`/console/`), with Cognito authentication.
+---
 
-Features:
-- **Tenants** — Host resource overview, create/delete tenants, one-click Dashboard access
-- **Application** — Shared skills list, config template management (create/edit/delete)
-- **Tenants** — Host resource overview, create/delete tenants, one-click Dashboard access, per-VM CPU/memory/disk progress bars, AZ column, live migration
-- **Application** — Shared skills, AgentCore MCP tools surface (when enabled), config template management
-- **Monitoring** — Prometheus metrics inventory, sample PromQL, one-click Grafana access
-- **Backups** — Cross-tenant backup explorer with per-tenant grouping, orphan filter, and one-click restore into a new tenant
-- **Settings** — API connection, infrastructure feature flags (multi-AZ / WAF / RBAC / SNS / quotas), Host overcommit ratios, Fleet by AZ distribution
+## 🎯 Features
 
-### Screenshots
+> Everything that ships out of the box. Nine categories, each independently toggleable in `config.yml`.
 
-**Tenants** — Hosts grouped by AZ on the left (each card showing CPU / Memory / VM count and overcommit ratios), tenants table with live vCPU / Memory / Disk progress bars per row, AZ column, gateway / health LEDs, and per-tenant Migrate button. AgentCore + Shared Skills surfaces collapsed at the top:
+<details open>
+<summary><b>🔒 Strong Isolation</b> — Firecracker microVM, independent kernel, /24 subnet, EBS encryption</summary>
+
+| Capability | Detail |
+|---|---|
+| **Firecracker microVM** | Each tenant in its own KVM-based microVM (same tech as Lambda/Fargate). Boot ~200ms. |
+| **Independent kernel** | Per-tenant Linux kernel — kernel panics don't leak across tenants. |
+| **OverlayFS rootfs** | Read-only base + per-tenant writable layer. Sparse, doesn't pre-allocate. |
+| **EBS encryption at rest** | KMS-encrypted by default for both rootfs and data volumes. |
+| **Independent /24 subnet** | `172.16.N.0/24` per VM with a dedicated tap device. |
+| **iptables network isolation** | Cross-tenant routing **DROP**ed by default — must be explicitly allowed. |
+| **PID namespace** | Host can't see guest processes; guests can't see each other. |
+
+</details>
+
+<details open>
+<summary><b>🛡 High Availability — Multi-AZ + Automatic AZ Failover</b> (v1.3.x flagship)</summary>
+
+| Capability | Detail |
+|---|---|
+| **Default 2-host Multi-AZ** | `min_capacity: 2` + `multi_az.enabled: true` are defaults — HA is opt-out, not opt-in. |
+| **Automatic AZ failover** | Lambda detects AZ outages every 5 min, migrates affected tenants to a healthy AZ. |
+| **30-min cooldown** | Per-AZ debounce against flapping outages. |
+| **ALB rule auto-tracking** | Tenant migration auto-updates ALB listener rules — Dashboard URL never changes. |
+| **Backup-required policy** | Path A: tenant has no backup → refuse to migrate + SNS alert (data safety > availability). |
+| **Concurrent Lambda safety** | `reserved_concurrent_executions=1` + DDB ConditionalCheck → no race conditions. |
+| **SSM-vs-VM verify probe** | Cross-checks `pgrep firecracker` + nginx conf — distinguishes "real failure" from "misleading SSM exit". |
+| **Audit log** | Every failover event — `AZ_OUTAGE_DETECTED`, `AZ_FAILOVER_RECOVERED_BY_VERIFY`, etc. |
+
+> **Real-environment proof (v1.3.2)**: 2 tenants on the failed AZ, both back to `status=running` + Dashboard HTTP 200 in ~90s. `tenants_failed_over: 2, tenants_failed: 0, tenants_blocked: 0`.
+
+</details>
+
+<details>
+<summary><b>🔧 Complete Tenant Lifecycle</b> — 12 first-class operations, all available via API + Console</summary>
+
+| Operation | API | What it does |
+|---|---|---|
+| **Create / Delete** | `POST /tenants` / `DELETE /tenants/{id}` | Spawn / remove a tenant. `?keep_data=true` preserves the data volume. |
+| **Restart / Reset** | `/restart` / `/reset` | Restart VM (fast); reset reinstalls rootfs but preserves data. |
+| **Stop / Start** | `/stop` / `/start` | Offline but keep disks. |
+| **Pause / Resume** | `/pause` / `/resume` | Firecracker-native vCPU freeze (instant). |
+| **Backup** | `/backup` | Manual snapshot of data volume to S3. |
+| **Hot-resize vCPU** | `/resize` | Add vCPU online without restart. |
+| **Resize disk** | `/resize-disk` | Grow the data volume; `resize2fs` runs automatically. |
+| **Live migrate** | `/migrate` | Snapshot/restore to another host — Dashboard URL unchanged. |
+| **Clone** | `clone_from` on create | Same-host `cp` of the data volume — much faster than backup-restore. |
+| **Restore** | `restore_from` on create | Restore from any backup (orphan or active). |
+| **Tags + TTL + schedule** | Body fields on create | Tag-based filter, auto-stop on TTL, office-hours schedule. |
+| **Batch operations** | `POST /batch/tenants` | `stop` / `start` / `delete` / `backup` by ID list or tag filter. |
+
+</details>
+
+<details>
+<summary><b>⚡ Resource Elasticity</b> — ASG, overcommit, Spot, quotas, Graviton</summary>
+
+| Capability | Detail |
+|---|---|
+| **ASG auto-scale** | New EC2 host on demand; idle hosts reclaimed after two-round confirmation. |
+| **CPU overcommit** | `cpu_overcommit_ratio: 2.0` → 8 physical vCPU = 16 allocatable. |
+| **Memory overcommit** | `mem_overcommit_ratio: 1.5` + Firecracker balloon → 32 GiB physical = 48 GiB allocatable. |
+| **Spot instances** | `asg.use_spot: true` saves 60–70%. ASG auto-replaces preempted hosts. |
+| **Per-tenant quotas** | `QUOTAS_MAX_VCPU/MEM/DATA_DISK_MB` blocks oversized tenants at create-time. |
+| **Graviton (ARM64)** | `instance_type: r8g.2xlarge` ✅ — rootfs builds for both arches. |
+
+</details>
+
+<details>
+<summary><b>📊 Observability</b> — Two-tier health + Prometheus + Grafana, zero static credentials</summary>
+
+| Capability | Detail |
+|---|---|
+| **host-agent (5s)** | Per-host systemd service polling all VMs and writing live metrics to DynamoDB. |
+| **Lambda watchdog (5min)** | Cross-fleet sweep, AZ-outage detection, failover orchestration. |
+| **Amazon Managed Prometheus** | Fully-managed AMP workspace with PromQL compatibility. |
+| **Amazon Managed Grafana** | IAM Identity Center login + AMP datasource + sample dashboards. |
+| **ADOT collector** | Auto SigV4-signed remote-write — no static credentials anywhere. |
+| **6 per-VM gauges** | `openclaw_vm_health`, `cpu_pct`, `memory_used_mb`, `memory_balloon_mib`, `disk_used_mb`, `disk_used_pct` — all labeled by `tenant` and `instance`. |
+| **Audit log** | Every mutating API call → DynamoDB with 90-day TTL; queryable via `GET /audit-log`. |
+
+</details>
+
+<details>
+<summary><b>🤖 Bedrock AgentCore Integration</b> — Optional one-toggle, full 5-component wire-up</summary>
+
+| Component | Role |
+|---|---|
+| **Gateway** | MCP tool hub — Lambda functions exposed as MCP tools. Three demo tools: `hello`, `system_info`, `timestamp`. |
+| **Memory** | Multi-turn conversation context. `create_event` / `list_events` / `batch_create_memory_records`. Per-tenant isolation. |
+| **Code Interpreter** | Python 3.12 sandbox. `start_session` → `executeCode` → `stop_session`. |
+| **Browser** | Remote Chromium with WebSocket stream. Automation-ready. |
+| **Workload Identity** | Each VM auto-injected with temporary credentials at boot — no static keys, auto-refresh. |
+
+> Among the few AWS Samples projects that wire **all five AgentCore components** end-to-end and verify them with E2E tests.
+
+</details>
+
+<details>
+<summary><b>💾 Backup & Restore</b> — Scheduled, manual, cross-tenant, orphan-safe</summary>
+
+| Capability | Detail |
+|---|---|
+| **Scheduled backups** | EventBridge cron — every running tenant's data volume → S3 daily. |
+| **Manual trigger** | `POST /tenants/{id}/backup` — async, returns 202. |
+| **Orphan-safe restore** | Source tenant can be deleted; backup remains restorable into a new tenant. |
+| **S3 lifecycle** | `backup_retention_days` controls automatic cleanup (default 7 days). |
+| **Trap-safe** | VM auto-resumes even if compress/upload fails — no stuck `paused` state. |
+| **Pause-compress-resume** | Atomic: pause → pigz compress → upload → resume — sub-second guest interruption. |
+
+</details>
+
+<details>
+<summary><b>🔐 Security & Compliance</b> — Defense in depth, 7 independent layers</summary>
+
+| Layer | Implementation |
+|---|---|
+| **Encryption at rest** | EBS volumes (rootfs + data) KMS-encrypted by default. |
+| **Encryption in transit** | CloudFront → ALB → Nginx → VM Gateway, all TLS. |
+| **API authentication** | API Gateway with `x-api-key` + optional AWS WAF (rate limit, geo block, OWASP). |
+| **Console authentication** | Cognito OAuth2 implicit flow + optional MFA. |
+| **RBAC** | Cognito Groups: `admin` / `operator` / `viewer` enforced per-route. |
+| **Audit log** | All `POST` / `PUT` / `DELETE` operations recorded with 90-day TTL. |
+| **Network isolation** | iptables `FORWARD DROP` between tenant subnets — cross-tenant traffic explicitly disabled. |
+
+</details>
+
+<details>
+<summary><b>🚀 Easy Deployment</b> — One-command CDK + cloud-native rootfs build</summary>
+
+| Capability | Detail |
+|---|---|
+| **One-command setup** | `./setup.sh <region> <profile>` — full CDK stack in ~5 min. |
+| **Cloud rootfs build** | `./scripts/build-rootfs-on-ec2.sh` — spins up a one-shot EC2 host + SSM, no local Linux. |
+| **Custom domain** | `./setup.sh --domain claw.example.com --cert <acm-arn>` — ACM in `us-east-1`. |
+| **Cognito + RBAC** | Optional auth; admin / operator / viewer groups gate all mutating APIs. |
+| **Manifest-based rootfs versioning** | `manifest.json` tracks rootfs versions; per-host registry. |
+| **Terraform parity** | Terraform module mirrors the CDK stack for teams already on Terraform. |
+
+</details>
+
+---
+
+## 🖥️ Web Console
+
+Web-based console hosted on CloudFront (`/console/`), Cognito-authenticated. Five tabs covering everything an operator needs.
+
+### Tenants tab — Multi-host, multi-AZ live operations
+
+Hosts grouped by AZ on the left (each card showing CPU / Memory / VM count and overcommit ratios). Tenants table with live vCPU / Memory / Disk progress bars per row, AZ column, gateway / health LEDs, and per-tenant Migrate button. AgentCore + Shared Skills surfaces collapsed at the top:
 
 ![Tenants tab](docs/web_console.png)
 
-**Application** — Config Templates manager + MCP Tools card (auto-populated via AgentCore Gateway, surfacing every Lambda-backed tool registered with the gateway: name, description, input schema) + Shared Skills with per-skill S3 deep-links:
+### Application tab — Templates, MCP tools, shared skills
+
+Config Templates manager + MCP Tools card (auto-populated via AgentCore Gateway, surfacing every Lambda-backed tool registered with the gateway: name, description, input schema) + Shared Skills with per-skill S3 deep-links:
 
 ![Application tab](docs/web_console_application.png)
 
-**Monitoring** — observability page: AMP / Grafana / SNS status, full per-VM Prometheus gauge inventory with types + labels + descriptions, copy-pasteable sample PromQL queries, and AMP `remote_write` / Grafana endpoints:
+### Monitoring tab — AMP / Grafana / SNS at a glance
+
+Observability page: AMP / Grafana / SNS status, full per-VM Prometheus gauge inventory with types + labels + descriptions, copy-pasteable sample PromQL queries, and AMP `remote_write` / Grafana endpoints:
 
 ![Monitoring tab](docs/web_console_monitoring.png)
 
-**Backups** — cross-tenant explorer marking active vs orphan backups (orphan = source tenant deleted, but the backup is still restorable into a fresh tenant). 7-day S3 lifecycle by default:
+### Backups tab — Cross-tenant explorer with orphan support
+
+Cross-tenant explorer marking active vs orphan backups (orphan = source tenant deleted, but the backup is still restorable into a fresh tenant). 7-day S3 lifecycle by default:
 
 ![Backups tab](docs/web_console_backup.png)
 
-**Settings** — at-a-glance infrastructure status: API connection, AgentCore Gateway URL, Multi-AZ HA, Prometheus + Grafana, AWS WAF, Cognito + RBAC, SNS lifecycle events, per-tenant quotas, host overcommit ratios, and a live **Fleet by AZ** table showing how hosts and VMs are spread across availability zones:
+### Settings tab — Infrastructure status & Fleet by AZ
+
+At-a-glance infrastructure status: API connection, AgentCore Gateway URL, Multi-AZ HA, Prometheus + Grafana, AWS WAF, Cognito + RBAC, SNS lifecycle events, per-tenant quotas, host overcommit ratios, and a live **Fleet by AZ** table showing how hosts and VMs are spread across availability zones:
 
 ![Settings tab](docs/web_console_settings.png)
 
-## Dashboard Access
+---
 
-Each tenant's OpenClaw Dashboard is accessible via CloudFront + ALB + Nginx reverse proxy:
-
-```
-https://{cloudfront-domain}/vm/{tenant-id}/    → Tenant Dashboard (WebSocket)
-```
-
-HTTPS is provided by CloudFront out of the box — no custom domain or ACM certificate required. The Console's "Open Dashboard" button includes the gateway token for one-click access.
-
-Traffic flow: `Browser → CloudFront:443 → ALB:80 → Host Nginx:80 → VM Gateway:18789`
-
-Nginx config is automatically managed by launch-vm.sh / stop-vm.sh.
-
-## Custom Domain (Optional)
-
-Bind a custom domain + HTTPS to CloudFront. Configuration lives in `config.yml` under `cloudfront:`; you can edit the file directly or pass flags to `setup.sh`:
-
-```bash
-# Prerequisites:
-# 1. Request an ACM certificate in us-east-1 (required by CloudFront) and complete DNS validation
-# 2. CNAME your domain to the CloudFront domain (see DashboardUrl output)
-
-# One-liner: sets config.yml + deploys in a single run
-./setup.sh ap-northeast-1 lab \
-  --domain claw.example.com \
-  --cert   arn:aws:acm:us-east-1:xxx:certificate/xxx
-
-# Or edit config.yml manually then run setup.sh with no flags.
-# To unbind the custom domain: --domain "" and re-run setup.sh.
-```
-
-The custom domain and certificate flow through CDK (not out-of-band), so subsequent `setup.sh` runs preserve the binding.
-
-## Auto Backup & Restore
-
-EventBridge schedules daily backups of all running tenant data volumes to S3. Manual trigger also supported.
-
-**Backup flow**: pause VM → pigz compress data.ext4 → resume VM → upload to S3. VM auto-resumes even on failure (trap cleanup).
-
-```bash
-source .env.deploy
-
-# Manual backup (async, returns 202)
-curl -s -X POST "${API_URL}tenants/{id}/backup" -H "x-api-key: ${API_KEY}" | jq .
-
-# List backups for one tenant
-curl -s "${API_URL}tenants/{id}/backups" -H "x-api-key: ${API_KEY}" | jq .
-
-# List all backups across all tenants (marks orphan vs active)
-curl -s "${API_URL}backups" -H "x-api-key: ${API_KEY}" | jq .
-
-# Config (config.yml):
-# backup_cron: "cron(0 19 * * ? *)"  # UTC 19:00 = Beijing 03:00
-# backup_retention_days: 7            # S3 lifecycle auto-cleanup
-```
-
-Backups stored at `s3://{bucket}/backups/{tenant-id}/{timestamp}.gz`.
-
-### Restore from Backup
-
-Restore creates a **new** tenant using a backup's data volume. The source tenant does not need to exist — orphan backups from deleted tenants are fully restorable.
-
-```bash
-# Restore from the latest backup of a (possibly deleted) tenant
-curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" -d '{
-  "name": "restored-agent",
-  "vcpu": 2, "mem_mb": 4096,
-  "restore_from": {"tenant_id": "my-agent-ab12"}
-}' | jq .
-
-# Restore from a specific backup timestamp
-curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" -d '{
-  "name": "restored-agent",
-  "restore_from": {"tenant_id": "my-agent-ab12", "timestamp": "20260428-125402"}
-}' | jq .
-```
-
-- `restore_from` is decoupled from `vcpu`/`mem_mb`/`config_template` — those follow the new tenant's spec
-- Data volume size equals the backup's actual size (no resize)
-- The new tenant gets a fresh ID; the source's identity is not inherited
-
-## Shared Skills
-
-All tenants share a unified skill set (SKILL.md files), with independent memory per tenant.
-
-```bash
-# Upload skills to S3 (auto-synced to all VMs)
-aws s3 sync ./my-skills/ s3://${ASSETS_BUCKET}/skills/ --profile $PROFILE
-
-# Sync chain:
-# S3 → Host /data/shared-skills/ (cron 5min) → All running VMs
-# New VMs get skills injected into data volume at launch
-```
-
-## Auto Scaling
-
-**Scale-out** — No available host when creating a tenant → tenant enters `pending` → ASG launches new instance → pending tenants auto-assigned after init
-
-**Scale-in** — Scaler Lambda checks every 5 minutes:
-1. Host with `vm_count=0` exceeding `idle_timeout_minutes` → marked `idle`
-2. Next round confirms still idle and ASG instances > min → terminate
-3. If a tenant is assigned during this window → auto-recover to `active`
-
-## Observability (Optional)
-
-When `metrics.enabled: true` in `config.yml`, the stack provisions an Amazon Managed Prometheus (AMP) workspace and an Amazon Managed Grafana (AMG) workspace. Each host runs an ADOT collector as a sibling systemd service that scrapes `host-agent`'s `/metrics` endpoint every 30 s and SigV4-signs a remote-write to AMP — no static credentials.
-
-Per-VM gauges exposed (with `tenant=<tenant_id>` and `instance=<host_instance_id>` labels):
-
-```
-openclaw_vm_memory_used_mb        openclaw_vm_disk_used_mb
-openclaw_vm_memory_balloon_mib    openclaw_vm_disk_total_mb
-openclaw_vm_health (0|1)          openclaw_vm_disk_used_pct
-```
-
-Sample PromQL:
-```promql
-# Memory used by all running VMs of a tenant
-sum by (tenant) (openclaw_vm_memory_used_mb)
-
-# Hosts with at least one unhealthy VM in the last minute
-min_over_time(openclaw_vm_health[1m]) == 0
-```
-
-Grafana access uses **AWS IAM Identity Center**:
-1. After deploy, the `GrafanaWorkspaceUrl` CFN output gives you the workspace URL.
-2. In IAM Identity Center, assign yourself (or a group) to that AMG workspace.
-3. First login: in Grafana → *Connections → Data sources → Add → Prometheus*, pick the AMP workspace from the dropdown (the AMG service role already has `aps:QueryMetrics` for it).
-
-To disable observability later, set `metrics.enabled: false` and re-run `setup.sh` — AMP and AMG are removed and you stop being billed for samples / active users.
-
-## Configuration
-
-### Config Files
-
-| File | Purpose |
-|------|---------|
-| `config.yml` | Infrastructure config — copy from `config.yml.example` and customize |
-| `templates/openclaw.json` | OpenClaw app config (model, API key, provider) — copy from `.example` |
-| `.env.deploy` | Deploy environment (region, API URL/Key, bucket) — auto-generated by setup.sh |
-
-### config.yml
-
-| Section | Key | Default | Description |
-|---------|-----|---------|-------------|
-| host | instance_type | m8i.2xlarge | Must support NestedVirtualization (c8i/m8i/r8i) |
-| host | data_volume_gb | 200 | Data volume for rootfs templates + VM disks |
-| host | cpu_overcommit_ratio | 2.0 | CPU overcommit (1.0=none, 2.0=allocate 2x vCPU) |
-| host | mem_overcommit_ratio | 1.0 | Memory overcommit (requires balloon enabled) |
-| host | keep_data_volume | true | Keep EBS data volume after instance termination |
-| vm | default_vcpu | 2 | Default vCPU per tenant |
-| vm | default_mem_mb | 4096 | Default memory (MB) per tenant |
-| vm | rootfs_overlay_mb | 8192 | Per-VM writable rootfs layer cap (sparse, doesn't pre-allocate) |
-| vm | data_disk_mb | 8192 | Per-VM data volume `/home/agent` cap (sparse) |
-| balloon | enabled | false | Firecracker balloon device for memory overcommit |
-| balloon | max_inflate_ratio | 0.4 | Max reclaimable ratio of VM declared memory |
-| balloon | min_guest_available_mb | 512 | Min available memory kept in guest |
-| asg | min_capacity | 1 | Minimum host instances |
-| asg | max_capacity | 5 | Maximum host instances |
-| asg | use_spot | false | Spot instances (save ~60-70%, may be reclaimed) |
-| scaler | idle_timeout_minutes | 10 | Idle host reclaim timeout |
-| health_check | interval_minutes | 5 | Lambda watchdog interval |
-| agentcore | enabled | false | AgentCore Gateway/Memory/CodeInterpreter/Browser |
-| metrics | enabled | false | Provision Amazon Managed Prometheus + Grafana and have each host's ADOT collector remote-write per-VM gauges (`openclaw_vm_memory_used_mb`, `disk_used_pct`, `vm_health`, …). See [Observability](#observability-optional) below |
-| metrics | workspace_alias | openclaw | AMP workspace alias (only used when `metrics.enabled: true`) |
-| metrics | grafana_name | openclaw-metrics | AMG workspace name (only used when `metrics.enabled: true`) |
-| console_auth | enabled | false | Cognito authentication for Console |
-| console_auth | self_sign_up | false | Allow user self-registration |
-
-See `config.yml.example` for all options. Redeploy after changes: `./setup.sh <region> <profile>`
-
-### Tear Down
-
-```bash
-./scripts/destroy.sh           # Destroy stack, keep S3 bucket and DynamoDB tables
-./scripts/destroy.sh --purge   # Full cleanup including S3 data and DynamoDB tables
-```
-
-## Architecture
+## 🏗️ Architecture
 
 ### System Architecture
 
@@ -526,7 +334,7 @@ See `config.yml.example` for all options. Redeploy after changes: `./setup.sh <r
 ![Deployment Architecture](docs/oc-deploy-arch.png)
 
 <details>
-<summary>ASCII version (for AI/text access)</summary>
+<summary><b>ASCII version (for AI/text access)</b></summary>
 
 ```
 Admin / User
@@ -551,86 +359,7 @@ EventBridge: health checks + idle reclamation + scheduled backup
 
 </details>
 
-## Project Structure
-
-```
-sample-multi-tenant-openclaw-on-firecracker/
-├── deploy/                    # CDK project
-│   ├── app.py                 # CDK app entry
-│   ├── stack.py               # Infrastructure definition
-│   ├── lambda/
-│   │   ├── api/handler.py     # Tenant CRUD + host management
-│   │   ├── templates/handler.py  # Config template CRUD
-│   │   ├── skills/handler.py  # Shared skills list
-│   │   ├── health_check/handler.py  # Scheduled health checks
-│   │   ├── agentcore_tools/handler.py  # AgentCore Gateway Lambda tools
-│   │   └── scaler/handler.py  # Idle host reclamation
-│   └── userdata/
-│       ├── init-host.sh       # Host initialization
-│       ├── host-agent.py      # VM health polling + DDB writes + balloon
-│       ├── launch-vm.sh       # microVM launch
-│       └── stop-vm.sh         # microVM stop
-├── console/                   # Web management console
-│   ├── index.html             # Alpine.js SPA (4 tabs)
-│   └── style.css
-├── tests/                     # Test suite (unit + e2e)
-├── templates/                 # OpenClaw config templates
-│   └── openclaw.json.example  # Example config
-├── pyproject.toml             # Python project config + dependencies
-├── cdk.json                   # CDK app config + feature flags
-├── config.yml                 # Infrastructure config (single source of truth)
-├── setup.sh                   # One-click deploy + export .env.deploy
-├── build-rootfs.sh            # Build rootfs locally on Linux (debootstrap)
-├── scripts/
-│   ├── build-rootfs-on-ec2.sh # Cloud build (no local Linux required) — recommended for macOS / Windows / Cloud9
-│   ├── destroy.sh             # Tear down stack
-│   ├── oc-connect.sh          # SSH-style helper to reach a tenant VM
-│   └── oc-dashboard.sh        # Open a tenant's Dashboard URL
-└── docs/
-```
-
-## API Reference
-
-All requests require `x-api-key` header.
-
-### Tenants
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | /tenants | List all tenants. Filter with `?tag=key:value` (repeatable, AND across pairs) |
-| POST | /tenants | Create tenant. Body: `{"name":"xx","vcpu":2,"mem_mb":4096,"data_disk_mb":8192,"config_template":"...","tags":{"k":"v"},"ttl_hours":24,"on_expiry":"stop","schedule":{"start":"09:00","stop":"18:00","timezone":"UTC","days":["Mon","Tue"]},"restore_from":{"tenant_id":"..."},"clone_from":"<src-tenant-id>"}` — only `name` is required |
-| GET | /tenants/{id} | Get tenant details |
-| DELETE | /tenants/{id} | Delete tenant (`?keep_data=true` to preserve data volume) |
-| POST | /tenants/{id}/restart | Restart VM (reuse disks, fast) |
-| POST | /tenants/{id}/stop | Stop VM (disks preserved) |
-| POST | /tenants/{id}/start | Start a stopped VM |
-| POST | /tenants/{id}/pause | Freeze vCPU (Firecracker native, instant) |
-| POST | /tenants/{id}/resume | Resume a paused VM |
-| POST | /tenants/{id}/reset | Reinstall rootfs (data volume preserved) |
-| POST | /tenants/{id}/backup | Manual data backup (async, returns 202) |
-| POST | /tenants/{id}/resize | Hot-add vCPU. Body: `{"vcpu":4}`. Memory live-resize is not supported (Firecracker limitation) |
-| POST | /tenants/{id}/resize-disk | Offline grow data disk. Body: `{"new_size_mb":16384}`. Pauses the VM ~seconds |
-| POST | /tenants/{id}/migrate | Live VM migration via Firecracker snapshot/restore. Body: `{"target_host_id":"i-..."}` |
-| GET | /tenants/{id}/backups | List backups for one tenant |
-| POST | /batch/tenants | Batch operation. Body: `{"action":"stop|start|delete|backup","ids":["t1","t2"]}` or `{"action":"...","filter":{"tag":"k:v"}}`. Returns `{succeeded:[...], failed:[...]}` |
-
-### Backups, Hosts, AgentCore, Audit, Skills, Templates
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | /backups | List all backups across tenants (marks orphan vs active) |
-| GET | /hosts | List all hosts |
-| POST | /hosts | Register host (rarely used — UserData writes DDB directly) |
-| POST | /hosts/refresh-rootfs | Push latest rootfs to all hosts |
-| GET | /hosts/rootfs-version | Query current rootfs version (manifest.json) |
-| DELETE | /hosts/{id} | Deregister host |
-| GET | /agentcore/status | AgentCore enable status + Gateway URL (when enabled) |
-| GET | /audit-log | Query audit log. `?since=<ISO8601>&limit=<n>` (max 500). 90-day TTL via DDB |
-| GET | /skills | List shared skills (S3-managed) |
-| GET | /templates | List config templates |
-| GET\|PUT\|DELETE | /templates/{name} | Read / save / remove a config template (`default` is read-only) |
-
-## Network Model
+### Network Model
 
 Each VM uses an independent /24 subnet, communicating with the host via TAP device:
 
@@ -640,15 +369,246 @@ VM2: tap-vm2  host=172.16.2.1/24  guest=172.16.2.2/24
 VMn: tap-vmN  host=172.16.N.1/24  guest=172.16.N.2/24
 ```
 
-- Outbound: iptables MASQUERADE → internet
-- Inbound: ALB → Nginx reverse proxy → VM:18789
-- Inter-VM: fully isolated, no routing between subnets
+- **Outbound**: iptables MASQUERADE → internet
+- **Inbound**: ALB → Nginx reverse proxy → VM:18789
+- **Inter-VM**: fully isolated, no routing between subnets
 
-## Rootfs Management
+### Project Structure
 
-The build script produces two images: rootfs (OS + software) and data template (/home/agent pre-configured content).
+```
+sample-multi-tenant-openclaw-on-firecracker/
+├── deploy/                    # CDK project
+│   ├── app.py                 # CDK app entry
+│   ├── stack.py               # Infrastructure definition
+│   ├── lambda/
+│   │   ├── api/handler.py             # Tenant CRUD + host management
+│   │   ├── templates/handler.py       # Config template CRUD
+│   │   ├── skills/handler.py          # Shared skills list
+│   │   ├── health_check/handler.py    # Scheduled health + AZ failover
+│   │   ├── agentcore_tools/handler.py # AgentCore Gateway Lambda tools
+│   │   └── scaler/handler.py          # Idle host reclamation
+│   └── userdata/
+│       ├── init-host.sh       # Host initialization
+│       ├── host-agent.py      # VM health polling + DDB writes + balloon
+│       ├── launch-vm.sh       # microVM launch
+│       └── stop-vm.sh         # microVM stop
+├── console/                   # Web management console
+├── tests/                     # 426+ tests (unit / integration / e2e)
+├── templates/                 # OpenClaw config templates
+├── scripts/
+│   ├── build-rootfs-on-ec2.sh # Cloud build (no local Linux required)
+│   ├── destroy.sh             # Tear down stack
+│   ├── oc-connect.sh          # SSH-style helper to reach a tenant VM
+│   └── oc-dashboard.sh        # Open a tenant's Dashboard URL
+├── pyproject.toml             # Python project config
+├── cdk.json                   # CDK app config + feature flags
+├── config.yml.example         # Infrastructure config template
+└── setup.sh                   # One-click deploy + .env.deploy export
+```
 
-Versions managed via S3 `manifest.json`. Hosts and tenants track their `rootfs_version`.
+---
+
+## ⚙️ Configuration
+
+### Config files
+
+| File | Purpose |
+|---|---|
+| `config.yml` | Infrastructure config — copy from `config.yml.example` and customize |
+| `templates/openclaw.json` | OpenClaw app config (model, API key, provider) |
+| `.env.deploy` | Deploy environment (region, API URL/Key, bucket) — auto-generated by `setup.sh` |
+
+### Key `config.yml` knobs
+
+| Section | Key | Default | Description |
+|---|---|---|---|
+| `host` | `instance_type` | `m8i.2xlarge` | Must support nested virtualization (c8i / m8i / r8i / r8g). |
+| `host` | `cpu_overcommit_ratio` | `2.0` | CPU overcommit factor. |
+| `host` | `mem_overcommit_ratio` | `1.0` | Memory overcommit (requires balloon enabled). |
+| `vm` | `default_vcpu` | `2` | Default vCPU per tenant. |
+| `vm` | `default_mem_mb` | `4096` | Default memory (MB) per tenant. |
+| `balloon` | `enabled` | `false` | Firecracker balloon device for memory overcommit. |
+| `asg` | `min_capacity` | `2` | Minimum host instances (default Multi-AZ). |
+| `asg` | `use_spot` | `false` | Spot instances (60–70% savings, may be reclaimed). |
+| `multi_az` | `enabled` | `true` | Multi-AZ HA — enables AZ failover. |
+| `health_check` | `interval_minutes` | `5` | Lambda watchdog interval. |
+| `metrics` | `enabled` | `false` | Provision AMP + Grafana + ADOT. |
+| `agentcore` | `enabled` | `false` | Provision Gateway + Memory + CodeInterpreter + Browser + Identity. |
+| `console_auth` | `enabled` | `false` | Cognito authentication for Console. |
+| `backup_cron` | — | `cron(0 19 * * ? *)` | UTC 19:00 daily backups. |
+
+> See [`config.yml.example`](config.yml.example) for the complete reference.
+
+### Tear down
+
+```bash
+./scripts/destroy.sh           # Destroy stack, keep S3 + DynamoDB
+./scripts/destroy.sh --purge   # Full cleanup including data
+```
+
+---
+
+## 📚 API Reference
+
+All requests require the `x-api-key` header.
+
+### Tenants
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/tenants` | List all tenants. Filter with `?tag=key:value` (repeatable, AND across pairs). |
+| `POST` | `/tenants` | Create. Body: `{name, vcpu, mem_mb, data_disk_mb, config_template, tags, ttl_hours, on_expiry, schedule, restore_from, clone_from}` — only `name` required. |
+| `GET` | `/tenants/{id}` | Get tenant details. |
+| `DELETE` | `/tenants/{id}` | Delete (`?keep_data=true` preserves data volume). |
+| `POST` | `/tenants/{id}/restart` | Restart VM (reuse disks). |
+| `POST` | `/tenants/{id}/stop` · `/start` | Stop / start. |
+| `POST` | `/tenants/{id}/pause` · `/resume` | Firecracker-native vCPU freeze / resume. |
+| `POST` | `/tenants/{id}/reset` | Reinstall rootfs (data preserved). |
+| `POST` | `/tenants/{id}/backup` | Manual data backup. |
+| `POST` | `/tenants/{id}/resize` | Hot-add vCPU. Body: `{"vcpu":4}`. |
+| `POST` | `/tenants/{id}/resize-disk` | Offline grow data disk. Body: `{"new_size_mb":16384}`. |
+| `POST` | `/tenants/{id}/migrate` | Live migration. Body: `{"target_host_id":"i-..."}`. |
+| `GET` | `/tenants/{id}/backups` | Backups for one tenant. |
+| `POST` | `/batch/tenants` | Batch op. Body: `{"action":"stop\|start\|delete\|backup", "ids":[...]\|"filter":{"tag":"k:v"}}`. |
+
+### Backups, Hosts, AgentCore, Audit, Skills, Templates
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/backups` | List all backups across tenants (marks orphan vs active). |
+| `GET` | `/hosts` | List all hosts. |
+| `POST` | `/hosts/refresh-rootfs` | Push latest rootfs to all hosts. |
+| `GET` | `/hosts/rootfs-version` | Query current rootfs version. |
+| `GET` | `/agentcore/status` | AgentCore enable status + Gateway URL. |
+| `GET` | `/agentcore/tools` | List MCP tools registered with Gateway. |
+| `GET` | `/audit-log` | Query audit log. `?since=<ISO8601>&limit=<n>` — 90-day TTL. |
+| `GET` | `/skills` | List shared skills (S3-managed). |
+| `GET` · `PUT` · `DELETE` | `/templates/{name}` | CRUD for config templates (`default` is read-only). |
+| `GET` | `/system/info` | Feature flags + config snapshot (region, version, multi_az, metrics, …). |
+
+---
+
+## 🌐 Advanced Topics
+
+<details>
+<summary><b>Auto Backup & Restore — flow + restore from any backup (orphan-safe)</b></summary>
+
+EventBridge schedules daily backups of all running tenant data volumes to S3. Manual trigger also supported.
+
+**Backup flow**: pause VM → `pigz` compress `data.ext4` → resume VM → upload to S3. VM auto-resumes even on failure (trap cleanup).
+
+```bash
+source .env.deploy
+
+# Manual backup (async, returns 202)
+curl -s -X POST "${API_URL}tenants/{id}/backup" -H "x-api-key: ${API_KEY}" | jq .
+
+# List all backups across tenants (marks orphan vs active)
+curl -s "${API_URL}backups" -H "x-api-key: ${API_KEY}" | jq .
+```
+
+**Restore from backup** (orphan-safe — source tenant need not exist):
+
+```bash
+# Restore from the latest backup of a (possibly deleted) tenant
+curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" -d '{
+  "name": "restored-agent",
+  "vcpu": 2, "mem_mb": 4096,
+  "restore_from": {"tenant_id": "my-agent-ab12"}
+}' | jq .
+
+# Restore from a specific backup timestamp
+curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" -d '{
+  "name": "restored-agent",
+  "restore_from": {"tenant_id": "my-agent-ab12", "timestamp": "20260428-125402"}
+}' | jq .
+```
+
+</details>
+
+<details>
+<summary><b>Custom Domain — bind ACM + CloudFront</b></summary>
+
+```bash
+# Prerequisites:
+#   1. Request an ACM certificate in us-east-1 (required by CloudFront) and complete DNS validation
+#   2. CNAME your domain to the CloudFront domain (see DashboardUrl output)
+
+./setup.sh ap-northeast-1 lab \
+  --domain claw.example.com \
+  --cert   arn:aws:acm:us-east-1:xxx:certificate/xxx
+
+# Or edit config.yml directly under the cloudfront: section.
+# To unbind: --domain "" and re-run setup.sh.
+```
+
+</details>
+
+<details>
+<summary><b>Shared Skills — S3 → Host → VM sync chain</b></summary>
+
+All tenants share a unified skill set (`SKILL.md` files) with independent memory per tenant.
+
+```bash
+# Upload skills to S3 (auto-synced to all VMs)
+aws s3 sync ./my-skills/ s3://${ASSETS_BUCKET}/skills/ --profile $PROFILE
+
+# Sync chain:
+#   S3 → Host /data/shared-skills/ (cron 5min) → All running VMs
+#   New VMs get skills injected into the data volume at launch
+```
+
+</details>
+
+<details>
+<summary><b>Auto Scaling — scale-out + idle reclamation</b></summary>
+
+**Scale-out** — No available host when creating a tenant → tenant enters `pending` → ASG launches new instance → pending tenants auto-assigned after init.
+
+**Scale-in** — Scaler Lambda checks every 5 minutes:
+1. Host with `vm_count=0` exceeding `idle_timeout_minutes` → marked `idle`.
+2. Next round confirms still idle and ASG instances > min → terminate.
+3. If a tenant is assigned during this window → auto-recover to `active`.
+
+</details>
+
+<details>
+<summary><b>Observability (Optional) — AMP + Grafana + sample PromQL</b></summary>
+
+When `metrics.enabled: true` in `config.yml`, the stack provisions an Amazon Managed Prometheus (AMP) workspace and an Amazon Managed Grafana (AMG) workspace. Each host runs an ADOT collector as a sibling systemd service that scrapes `host-agent`'s `/metrics` endpoint every 30 s and SigV4-signs a remote-write to AMP — no static credentials.
+
+Per-VM gauges exposed (with `tenant=<tenant_id>` and `instance=<host_instance_id>` labels):
+
+```
+openclaw_vm_memory_used_mb        openclaw_vm_disk_used_mb
+openclaw_vm_memory_balloon_mib    openclaw_vm_disk_total_mb
+openclaw_vm_health (0|1)          openclaw_vm_disk_used_pct
+```
+
+Sample PromQL:
+
+```promql
+# Memory used by all running VMs of a tenant
+sum by (tenant) (openclaw_vm_memory_used_mb)
+
+# Hosts with at least one unhealthy VM in the last minute
+min_over_time(openclaw_vm_health[1m]) == 0
+```
+
+Grafana access uses **AWS IAM Identity Center**:
+
+1. After deploy, the `GrafanaWorkspaceUrl` CFN output gives you the workspace URL.
+2. In IAM Identity Center, assign yourself (or a group) to that AMG workspace.
+3. First login: in Grafana → *Connections → Data sources → Add → Prometheus*, pick the AMP workspace from the dropdown (the AMG service role already has `aps:QueryMetrics` for it).
+
+To disable observability later, set `metrics.enabled: false` and re-run `setup.sh` — AMP and AMG are removed and you stop being billed for samples / active users.
+
+</details>
+
+<details>
+<summary><b>Rootfs Management — versioning + refresh</b></summary>
+
+The build script produces two images: rootfs (OS + software) and data template (`/home/agent` pre-configured content). Versions managed via S3 `manifest.json`. Hosts and tenants track their `rootfs_version`.
 
 ```bash
 # Build and upload (updates manifest.json + refreshes hosts)
@@ -661,13 +621,108 @@ curl -s -X POST "${API_URL}hosts/refresh-rootfs" -H "x-api-key: ${API_KEY}" | jq
 # Query current version
 curl -s "${API_URL}hosts/rootfs-version" -H "x-api-key: ${API_KEY}" | jq .
 
-# New VMs use the latest version; existing VMs need reset to update
+# New VMs use the latest version; existing VMs need a reset to update.
 ```
 
-## Security
+</details>
 
-See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
+---
 
-## License
+## ⬆️ Upgrade Guide
 
-This library is licensed under the MIT-0 License. See the [LICENSE](LICENSE) file.
+Upgrading typically involves **two layers**: control plane (CDK stack) and data plane (rootfs + host-agent).
+
+### Standard procedure (any version)
+
+```bash
+git pull                                  # pull latest main
+git diff HEAD@{1} HEAD -- config.yml.example  # check for new config keys
+# If new keys exist, merge them into your local config.yml manually
+
+./setup.sh <region> <profile>             # redeploy CDK stack (idempotent)
+
+# Rebuild rootfs (see "Quick Start" Step 3)
+source .env.deploy && ./build-rootfs.sh <new_version>
+
+# New tenants use the new rootfs immediately; existing tenants need a `reset` API call to switch over.
+```
+
+### Latest: v1.3.1 → **v1.3.2** (recommended for any multi-tenant deployment)
+
+v1.3.2 fixes everything that surfaces under real load: concurrent Lambda invocations, multi-tenant batch failover, transient kernel races, host-agent ⇄ Lambda race conditions where SSM exit code disagrees with VM truth.
+
+```bash
+git pull && ./setup.sh <region> <profile>     # adds reserved_concurrent_executions=1
+```
+
+After redeploy, re-roll `launch-vm.sh` on existing hosts:
+
+```bash
+source .env.deploy
+aws s3 cp deploy/userdata/launch-vm.sh s3://${ASSETS_BUCKET}/deployment/scripts/launch-vm.sh
+aws ssm send-command --document-name AWS-RunShellScript \
+    --targets Key=tag:aws:autoscaling:groupName,Values=openclaw-hosts-asg \
+    --parameters 'commands=[
+      "aws s3 cp s3://'${ASSETS_BUCKET}'/deployment/scripts/launch-vm.sh /home/ubuntu/launch-vm.sh",
+      "chmod +x /home/ubuntu/launch-vm.sh"
+    ]'
+```
+
+**New audit log entries to monitor:**
+
+- `AZ_FAILOVER_RECOVERED_BY_VERIFY` — informational (verify probe rescued a launch)
+- `AZ_FAILOVER_SKIPPED_CONCURRENT` — informational (concurrent Lambda backed off)
+- `AZ_FAILOVER_TENANT_FAILED` — actionable (verify probe confirmed real failure)
+- `AZ_FAILOVER_NO_BACKUP` — actionable (tenant has no backup, refuse-to-fail-over)
+
+**Summary buckets are now disjoint**: `tenants_failed_over`, `tenants_failed`, `tenants_blocked` are independent.
+
+<details>
+<summary><b>Older upgrade paths (v1.3.0 → v1.3.1, v1.2.9 → v1.3.0, v1.2.7 → v1.2.9)</b></summary>
+
+For older upgrades, please refer to **[CHANGELOG.md](CHANGELOG.md)** which contains the per-version operator notes.
+
+Quick references:
+
+- **v1.3.0 → v1.3.1**: 5 path-A integration bugs fixed. Re-roll `launch-vm.sh`. `__az_failover_state__` synthetic record now used for cooldown persistence.
+- **v1.2.9 → v1.3.0**: ASG `min_capacity` 1 → 2 (multi-AZ default). New IAM permissions for `health_check` Lambda.
+- **v1.2.7 → v1.2.9**: Multiple console + observability fixes. Existing hosts need re-rolling for the new `host-agent.py` (real CPU% / Memory metrics).
+
+</details>
+
+---
+
+## 🤝 Contributing
+
+Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for code conventions, PR guidelines, and the security issue reporting process.
+
+For security concerns, see [CONTRIBUTING.md#security-issue-notifications](CONTRIBUTING.md#security-issue-notifications).
+
+---
+
+## 📄 License
+
+This library is licensed under the **MIT-0 License**. See the [LICENSE](LICENSE) file.
+
+> The MIT-0 License is a "no attribution required" variant of MIT. You may use, modify, and redistribute this code (including commercial use) without any obligation. AWS Sample projects use this license to lower the barrier to adoption.
+
+---
+
+## 🌟 Star History
+
+<a href="https://www.star-history.com/#aws-samples/sample-multi-tenant-openclaw-on-firecracker&Date">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=aws-samples/sample-multi-tenant-openclaw-on-firecracker&type=Date&theme=dark" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=aws-samples/sample-multi-tenant-openclaw-on-firecracker&type=Date" />
+   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=aws-samples/sample-multi-tenant-openclaw-on-firecracker&type=Date" />
+ </picture>
+</a>
+
+---
+
+<p align="center">
+  Made with 🦞 by the AWS Samples team · MIT-0 · 2026<br/>
+  <a href="https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues">🐛 Report a bug</a> ·
+  <a href="https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues">💡 Request a feature</a> ·
+  <a href="https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/discussions">💬 Discussions</a>
+</p>

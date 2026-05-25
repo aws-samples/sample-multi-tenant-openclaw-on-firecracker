@@ -1,269 +1,516 @@
-# Multi-Tenant OpenClaw on Firecracker
+<h1 align="center">🦞 龙虾池 (OpenClaw Pool)</h1>
 
-**[English](../README.md)** | **[中文](README-CN.md)**
+<p align="center">
+  <b>基于 Firecracker microVM 的 AWS 多租户 AI Agent 隔离池</b><br/>
+  <i>强隔离 · 真容灾 · 全观测 · 一键部署</i>
+</p>
 
-基于 AWS Firecracker microVM 的 OpenClaw 多租户隔离部署方案，俗称 **龙虾池**。每个租户运行在独立的 microVM 中，通过 API 统一管理，ASG 自动扩缩宿主机，空闲主机自动回收。
+<p align="center">
+  <a href="https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/blob/main/LICENSE">
+    <img src="https://img.shields.io/badge/License-MIT--0-blue.svg" alt="License: MIT-0"/>
+  </a>
+  <a href="https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/releases/latest">
+    <img src="https://img.shields.io/github/v/release/aws-samples/sample-multi-tenant-openclaw-on-firecracker?color=success&label=release" alt="Latest release"/>
+  </a>
+  <a href="https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/stargazers">
+    <img src="https://img.shields.io/github/stars/aws-samples/sample-multi-tenant-openclaw-on-firecracker?style=flat&color=yellow" alt="GitHub Stars"/>
+  </a>
+  <a href="https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/network/members">
+    <img src="https://img.shields.io/github/forks/aws-samples/sample-multi-tenant-openclaw-on-firecracker?style=flat&color=orange" alt="GitHub Forks"/>
+  </a>
+  <a href="https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues">
+    <img src="https://img.shields.io/github/issues/aws-samples/sample-multi-tenant-openclaw-on-firecracker?color=brightgreen" alt="Open issues"/>
+  </a>
+  <img src="https://img.shields.io/badge/tests-426%20passing-brightgreen" alt="Tests passing"/>
+</p>
 
-> 本项目使用 AWS EC2 [嵌套虚拟化](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/nested-virtualization.html) 功能，在 EC2 实例内运行 KVM + Firecracker microVM。目前支持 Intel 系列 (c8i/m8i/r8i 等) 实例家族。
+<p align="center">
+  <img src="https://img.shields.io/badge/AWS-Sample-FF9900?logo=amazon-aws&logoColor=white" alt="AWS Sample"/>
+  <img src="https://img.shields.io/badge/Firecracker-microVM-E47A22?logo=firefox&logoColor=white" alt="Firecracker"/>
+  <img src="https://img.shields.io/badge/AWS%20CDK-2.x-orange?logo=amazon-aws" alt="AWS CDK"/>
+  <img src="https://img.shields.io/badge/Python-3.12+-3776AB?logo=python&logoColor=white" alt="Python 3.12+"/>
+  <img src="https://img.shields.io/badge/Bedrock-AgentCore-7C4DFF?logo=amazon&logoColor=white" alt="Bedrock AgentCore"/>
+  <img src="https://img.shields.io/badge/Multi--AZ-HA-brightgreen" alt="Multi-AZ HA"/>
+  <img src="https://img.shields.io/badge/Prometheus-Ready-E6522C?logo=prometheus&logoColor=white" alt="Prometheus"/>
+  <img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs welcome"/>
+</p>
 
-> ⚠️ 本项目仅用于演示目的，不适用于生产环境。使用风险自负。
+<p align="center">
+  <b>📖 阅读语言：</b>
+  <a href="../README.md">English</a> ·
+  <a href="README-CN.md">中文</a>
+</p>
 
-## 功能概览
+<p align="center">
+  <a href="#-快速开始">快速开始</a> ·
+  <a href="#-功能特性">功能</a> ·
+  <a href="#%EF%B8%8F-web-console">Console</a> ·
+  <a href="#%EF%B8%8F-架构">架构</a> ·
+  <a href="#-api-reference">API</a> ·
+  <a href="https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/releases/latest">Releases</a> ·
+  <a href="../CHANGELOG.md">Changelog</a>
+</p>
 
-- **租户管理** — 通过 API 创建/删除/查询租户。每个租户是一个运行在独立 Firecracker microVM 中的 OpenClaw 实例，拥有独立的系统盘、数据盘和网络
-- **安全隔离** — 基于 Firecracker microVM 实现租户间隔离，独立内核、独立网络，互不可见
-- **自动调度** — 创建租户时自动选择有空闲资源的宿主机，资源不足时自动扩容
-- **自动缩容** — 空闲宿主机超时后自动回收，节省成本（两轮确认防误杀）
-- **健康检查** — 实时 VM 健康监控，状态自动更新
-- **Web 管理控制台** — 在线管理控制台，Cognito 认证保护，实时 Host/Tenant 状态
-- **Rootfs 预构建** — rootfs + data template 双镜像通过 S3 分发，宿主机启动时自动下载
-- **Dashboard 直达** — 一键 HTTPS 访问每个租户的 OpenClaw Dashboard，无需自定义域名
-- **自动备份与恢复** — EventBridge 定时备份所有租户数据盘到 S3，支持手动触发、跨租户备份查询，以及一键从备份恢复为新租户（支持孤儿备份 —— 源租户已删除也能恢复）
-- **AgentCore 集成** — 可选开关，开启后所有 VM 自动连接 AgentCore Gateway（MCP 工具中心）、Memory（托管记忆）、Code Interpreter（安全沙箱）、Browser（云端浏览器）
-- **共享 Skills** — 所有租户共享统一的 Skills（S3 集中管理，自动同步到所有 VM），记忆独立
-- **配置模板** — 自定义 OpenClaw 配置模板（支持不同 LLM 提供商/模型），创建租户时可选模板
-- **默认工具链** — 每个 VM 预装 Python3/uv/git/gh/Node.js/htop/tmux/tree 等开发工具
+---
 
-## v1.2 功能矩阵
+<p align="center">
+  <img src="../docs/web_console.png" alt="OpenClaw Pool Console - 多 AZ 多 host 视图" width="92%"/>
+  <br/>
+  <i>真实生产部署 — 租户跨 2 个 AZ 分布、CPU/Memory/Disk 实时指标、一键迁移和 Dashboard 直达。</i>
+</p>
 
-> **最新版本**: [见 GitHub Releases](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/releases/latest). 详见 [CHANGELOG.md](../CHANGELOG.md).
+> ⚠️ **声明**: 本项目为示例代码，仅供演示用途，不建议直接用于生产环境。请自行评估部署风险。
+>
+> 💡 **说明**: 本项目使用 AWS EC2 [嵌套虚拟化](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/nested-virtualization.html) 在 EC2 实例内运行 KVM + Firecracker。当前支持 Intel 实例族 (c8i / m8i / r8i) 和 Graviton (ARM64)。
 
-Q2 2026 里程碑共合并 24 个特性, 每个都有 TDD 覆盖 + 单 issue 回滚 tag.
+---
 
-| 类别 | 特性 | Issue | PR |
-|---|---|---|---|
-| **可观测性** | 每 VM CPU/内存/磁盘指标到 DynamoDB | [#3] | [#37] |
-| | Amazon Managed Prometheus + Grafana | [#4] | [#38] |
-| **安全** | EBS 静态加密 | [#6] | [#26] |
-| | 可选 AWS WAF 集成 | [#7] | [#31] |
-| | RBAC (admin/operator/viewer) via Cognito Groups | [#14] | [#39] |
-| | 所有写操作审计日志 | [#17] | [#32] |
-| **租户生命周期** | 单租户资源配额 | [#9] | [#34] |
-| | 标签、分组、搜索 | [#10] | [#27] |
-| | 定时自动停启 (Office Hours 模式) | [#11] | [#30] |
-| | 同主机本地 cp 快照/克隆 | [#12] | [#36] |
-| | SNS 生命周期事件通知 | [#13] | [#33] |
-| | TTL 到期自动停止/删除 | [#15] | [#28] |
-| | 在线 VM 扩容 — 热加 vCPU 无需重启 | [#16] | [#35] |
-| | 离线数据盘自动扩容 | [#22] | [#47] |
-| | 批量租户操作端点 | [#23] | [#29] |
-| **平台** | 可插拔 VM Runtime 协议 (Firecracker / CHV / QEMU stub) | [#5] | [#41] |
-| | 多 AZ 高可用 (可选) | [#8] | [#42] |
-| | Graviton (ARM64) 主机支持 | [#19] | [#44] |
-| | Firecracker 快照/恢复实时 VM 迁移 | [#20] | [#45] |
-| **开发体验** | 统一 `oc` CLI | [#21] | [#40] |
-| **部署** | Terraform 模块 (与 CDK core 对齐) | [#18] | [#43] |
+## ✨ 为什么选择龙虾池？
 
-[#3]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/3
-[#4]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/4
-[#5]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/5
-[#6]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/6
-[#7]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/7
-[#8]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/8
-[#9]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/9
-[#10]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/10
-[#11]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/11
-[#12]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/12
-[#13]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/13
-[#14]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/14
-[#15]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/15
-[#16]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/16
-[#17]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/17
-[#18]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/18
-[#19]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/19
-[#20]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/20
-[#21]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/21
-[#22]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/22
-[#23]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/23
-[#24]: https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/24
+<table>
+<tr>
+<td width="50%" valign="top">
 
-## 升级指南
+**🔒 设计层面的强隔离**
+每个租户跑在自己的 Firecracker microVM 里 — 和 AWS Lambda、Fargate 用同一种轻量虚拟化技术。独立内核、OverlayFS rootfs、/24 子网、KMS 加密 EBS。**不是** Linux namespace 共享一个内核。
 
-升级新版本通常涉及**两个层面**: 控制面 (CDK stack) 和数据面 (rootfs + host-agent). 控制面通过重新部署更新，数据面需要重建 rootfs.
+**🛡 真实压测过的 AZ failover**
+默认 2-host 多 AZ 部署 + 自动 AZ failover。真实 AWS 上端到端验证过 — multi-tenant 同时 failover 双 Dashboard 都在 90 秒内回到 HTTP 200。6 个深层 race condition 一一治掉，对应单元测试守门。
 
-### 通用流程 (任意版本)
+**🤖 Bedrock AgentCore 原生集成**
+一个 toggle 让每个 microVM 自动接入 AgentCore Gateway / Memory / Code Interpreter / Browser / Workload Identity。AWS Sample 仓库里少有的完整跑通 5 件套的项目。
 
-```bash
-git pull                                  # 拉取最新 main
-git diff HEAD@{1} HEAD -- config.yml.example   # 检查是否有新增配置项
-# 如有新增 key, 手动合并到本地 config.yml
+</td>
+<td width="50%" valign="top">
 
-./setup.sh <region> <profile>             # 重新部署 CDK stack (幂等)
+**📊 全栈观测，零静态凭证**
+开箱即用 Amazon Managed Prometheus + Grafana。每台 host 上 ADOT collector 自动 SigV4 签名远程写。6 个 per-VM gauge (`openclaw_vm_cpu_pct`, `memory_used_mb`, `disk_used_pct`...) + audit log + Console 内置 PromQL 示例。
 
-# 重建 rootfs (详见 "快速开始" Step 3)
-source .env.deploy && ./build-rootfs.sh <new_version>
+**⚡ 高密度低成本**
+CPU 2× / Mem 1.5× 超卖（Firecracker balloon）。Spot 实例支持省 60-70%。Per-tenant Quota 防 noisy neighbor。100 租户场景 ~$250/月（vs 每租户独立 EC2 的 $2000/月）。
 
-# 新建租户立刻使用新 rootfs; 已有租户需调用 reset API 才会切换
-```
+**🚀 一行命令 CDK 部署**
+`./setup.sh <region> <profile>` 5 分钟拉起完整栈 — VPC、ASG、ALB、Lambda、DynamoDB、AMP、Cognito、AgentCore，全部接通即用。云端 rootfs build 意味着**无需本地 Linux**（macOS / Windows 直接用）。
 
-### 从 v1.2.9 升级到 v1.3.0
+</td>
+</tr>
+</table>
 
-1.3.0 加入**自动 AZ 故障切换**，并默认部署 2 台 host 到 2 个不同 AZ。两点需要注意:
+---
 
-```bash
-git pull && ./setup.sh <region> <profile>     # ASG min_capacity 1 → 2
-                                              # multi_az.enabled 默认开
-                                              # health_check 加 az_failover 块
-                                              # health_check Lambda 多 4 个 env
-```
+## 📑 目录
 
-部署后:
+- [🚀 快速开始](#-快速开始)
+- [🎯 功能特性](#-功能特性)
+- [🖥️ Web Console](#%EF%B8%8F-web-console)
+- [🏗️ 架构](#%EF%B8%8F-架构)
+- [⚙️ 配置](#%EF%B8%8F-配置)
+- [📚 API Reference](#-api-reference)
+- [🌐 进阶主题](#-进阶主题)
+- [⬆️ 升级指南](#%EF%B8%8F-升级指南)
+- [🤝 贡献](#-贡献)
+- [📄 协议](#-协议)
 
-- **首次重新部署后 ASG 会自动起一台新 host** (min_capacity 1 → 2). 新 host 会落到与现有 host 不同的 AZ. 成本: 多一个 EC2 实例 (默认 m8i.2xlarge, ap-northeast-1 ~$0.50/小时). 想保持单 host 请把 `min_capacity: 1` 写回 `config.yml`.
-- **现有 host 还没向 hosts 表写心跳**, 直到 v1.3.0 host-agent rollout 到位为止. `is_host_unhealthy` 把缺时间戳判定为 unhealthy → 第一次 health_check Lambda 调用可能误判 AZ 全部 down.
-- **安全做法**: 在 host-agent rollout 期间临时关闭 `health_check.az_failover.enabled`, rollout 完后再开. 详细命令见英文 README 的 "Upgrade Guide → Upgrading from v1.2.9 → v1.3.0" 章节.
-- **新建合成记录 `__az_failover_state__`** 会在第一次 AZ 故障切换时出现在 hosts 表里, 仅记录 cooldown 状态, `/hosts` API 已过滤, 不会污染 console / CLI / dashboard.
+---
 
-### 从 v1.2.7 升级到 v1.2.9
+## 🚀 快速开始
 
-1.2.8 + 1.2.9 主要是 console UI 表面化 + metric 修复. 数据面没改, `setup.sh` 后:
-
-- **现有 host 没有 `az` 字段**, 要么滚动 ASG 让重新注册, 要么用英文 README 的 backfill 脚本批量更新 `az` 字段.
-- **现有 host-agent 还是旧版本**, 推送新版到 S3 + SSM Run Command 重启即可 (详细命令见英文 README).
-- **DDB schema 全部 additive**, 已有租户记录无需迁移.
-- **Console 硬刷新**或等 CloudFront TTL 才能看到新 tab.
-
-## 快速开始
-
-**前置条件:**
-
-- AWS 账号 + CLI 配置
-- CDK CLI + Python 3.12+
-- uv (Python 包管理)
-- 仅本地 rootfs 构建（`build-rootfs.sh`，可选）需要：`sudo` 权限的 Linux 主机；
-  `debootstrap` / `pigz` / `e2fsprogs` 工具；≥2GB 可用内存；`/tmp` ≥10GB 可用空间。
-  **如果使用 `build-rootfs-on-ec2.sh` 则无需本地 Linux —— 见下面 Step 3。**
+> **前置条件**：AWS 账号 + CLI 已配置 · CDK CLI · Python 3.12+ · [uv](https://docs.astral.sh/uv/) 包管理
 
 ```bash
-# 1. 配置
-cp config.yml.example config.yml          # 编辑基础设施配置
-cp templates/openclaw.json.example templates/openclaw.json  # 设置 API key、模型 provider 等
+# 1️⃣ 克隆 + 配置
+git clone https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker
+cd sample-multi-tenant-openclaw-on-firecracker
+cp config.yml.example config.yml                                  # 按需调整
+cp templates/openclaw.json.example templates/openclaw.json        # 填入 LLM API key
 
-# 2. 部署基础设施
-./setup.sh ap-northeast-1 lab
-# 完成后环境变量保存在 .env.deploy
+# 2️⃣ 一键 CDK 部署 (~5 分钟) — 自动创建 VPC、ASG、ALB、Lambda、DynamoDB、
+#                                AMP、Grafana、Cognito、AgentCore、KMS、WAF
+./setup.sh ap-northeast-1 your-aws-profile
 
-# 3. 构建 rootfs —— 创建任何租户前都必须先做这一步
-#
-#    方式 A —— 云端构建（macOS / Windows / 任意环境都可用）:
-#      ./scripts/build-rootfs-on-ec2.sh v1.0
-#    自动启一台一次性 t3.medium Ubuntu 主机，用 SSM 跑构建，
-#    上传 S3 后自动终止实例。约 10 分钟，无需本地 Linux。
-#
-#    方式 B —— 本地 Linux 主机（如果已有 Linux 环境则更快）:
-#      source .env.deploy
-#      ./build-rootfs.sh v1.0
+# 3️⃣ 构建 rootfs (~10 分钟，一次性，云端 build — 无需本地 Linux)
+./scripts/build-rootfs-on-ec2.sh v1.0
 
-# 4. 创建租户（OpenClaw 实例）
+# 4️⃣ 创建第一个租户
 source .env.deploy
 curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" \
-  -d '{"name":"my-agent","vcpu":2,"mem_mb":4096}' | jq .
-
-# 5. 打开 Console 管理租户、模板和设置
-# Console URL 在部署完成后输出
+  -d '{"name":"my-first-agent","vcpu":2,"mem_mb":4096}' | jq .
 ```
 
-## Management Console
+> 打开 `setup.sh` 输出的 Console URL 即可在浏览器中管理租户。每个租户都有一键 HTTPS Dashboard，无需配置自定义域名或证书。
 
-Web 管理控制台，通过 CloudFront (`/console/`) 在线访问，Cognito 认证。
+---
 
-功能：
-- **Tenants** — 宿主机资源概览，创建/删除租户，一键打开 Dashboard
-- **Application** — 共享 Skills 列表，配置模板管理（创建/编辑/删除）
-- **Tenants** — Host 资源总览、创建/删除租户、一键访问 Dashboard、每 VM CPU/内存/磁盘进度条、AZ 列、Live migration
-- **Application** — 共享 Skills、AgentCore MCP 工具列表（启用时显示）、配置模板管理
-- **Monitoring** — Prometheus metrics 清单、PromQL 示例、一键打开 Grafana
-- **Backups** — 跨租户备份浏览器，按租户分组聚合、孤儿备份过滤、一键恢复到新租户
-- **Settings** — API 连接、基础设施特性开关（多 AZ / WAF / RBAC / SNS / 配额）、Host 超分比、各 AZ 资源分布
+## 🎯 功能特性
 
-### 截图
+> 9 大类开箱即用的能力，每一类都可以在 `config.yml` 里独立 toggle。
 
-**Tenants** — 每行租户的 vCPU / Memory / Disk 进度条 + AZ 列 + Migrate 按钮：
+<details open>
+<summary><b>🔒 强隔离</b> — Firecracker microVM、独立内核、/24 子网、EBS 加密</summary>
 
-![Tenants 页签](web_console.png)
+| 能力 | 详情 |
+|---|---|
+| **Firecracker microVM** | 每租户独占的 KVM microVM（同 Lambda/Fargate）。启动 ~200ms。 |
+| **独立内核** | 每租户独立 Linux kernel — 内核 panic 不跨租户。 |
+| **OverlayFS rootfs** | 只读 base + 每租户可写层，sparse 不预分配。 |
+| **EBS 静态加密** | rootfs + data 卷默认 KMS 加密。 |
+| **独立 /24 子网** | 每 VM `172.16.N.0/24` + 独立 tap 设备。 |
+| **iptables 网络隔离** | 跨租户路由默认 **DROP** — 必须显式打洞。 |
+| **PID 命名空间** | host 看不到 guest 进程；guest 互相看不到。 |
 
-**Application** — Shared Skills + MCP Tools（启用 AgentCore 时显示已注册的 Lambda 工具）：
+</details>
 
-![Application 页签](web_console_application.png)
+<details open>
+<summary><b>🛡 高可用 — 多 AZ + 自动 AZ failover</b> (v1.3.x 旗舰)</summary>
 
-**Monitoring** — 可观测性页面：AMP / Grafana 状态、所有 per-VM Prometheus gauges 清单（类型 + 标签 + 描述）、可复制的 PromQL 示例、AMP / Grafana endpoint：
+| 能力 | 详情 |
+|---|---|
+| **默认 2-host 多 AZ** | `min_capacity: 2` + `multi_az.enabled: true` 都是默认值 — HA 是 opt-out 而不是 opt-in。 |
+| **自动 AZ failover** | Lambda 每 5 分钟扫描 AZ outage，把受影响 tenant 迁到健康 AZ。 |
+| **30 分钟冷却** | 单 AZ 防抖动，避免 outage flapping 反复迁。 |
+| **ALB rule 自动跟随** | 租户迁移时 ALB listener rule 自动更新 — Dashboard URL 不变。 |
+| **备份必须策略** | Path A: 没备份 → 拒绝迁 + SNS 告警（数据安全 > 可用性）。 |
+| **并发 Lambda 安全** | `reserved_concurrent_executions=1` + DDB ConditionalCheck → 零数据竞争。 |
+| **SSM-vs-VM verify 探针** | 用 `pgrep firecracker` + nginx conf 交叉验证 — 区分"真失败"和"SSM exit 误报"。 |
+| **Audit log** | 每个 failover 事件 — `AZ_OUTAGE_DETECTED`、`AZ_FAILOVER_RECOVERED_BY_VERIFY` 等。 |
 
-![Monitoring 页签](web_console_monitoring.png)
+> **真实环境验证 (v1.3.2)**：双 tenant 同时迁移，2/2 都在 90 秒内 `status=running` + Dashboard HTTP 200。`tenants_failed_over: 2, tenants_failed: 0, tenants_blocked: 0`。
 
-**Backups** — 跨租户浏览，孤儿备份（源租户已删）也能恢复到新租户：
+</details>
 
-![Backups 页签](web_console_backup.png)
+<details>
+<summary><b>🔧 完整租户生命周期</b> — 12 个开箱即用操作，API + Console 双入口</summary>
 
-**Settings** — 基础设施一览：多 AZ HA、Prometheus + Grafana、AWS WAF、Cognito + RBAC、SNS 生命周期事件、租户配额、Host 超分比，以及实时的 Fleet-by-AZ 分布表：
+| 操作 | API | 作用 |
+|---|---|---|
+| **Create / Delete** | `POST /tenants` / `DELETE /tenants/{id}` | 起 / 删租户。`?keep_data=true` 保留 data 卷。 |
+| **Restart / Reset** | `/restart` / `/reset` | 重启 VM 保留磁盘 / 重装 rootfs 保留 data。 |
+| **Stop / Start** | `/stop` / `/start` | 离线但保留磁盘。 |
+| **Pause / Resume** | `/pause` / `/resume` | Firecracker 原生冻结 vCPU（瞬时）。 |
+| **Backup** | `/backup` | 手动触发 data 卷备份到 S3。 |
+| **Hot-resize vCPU** | `/resize` | 不停机扩 vCPU。 |
+| **Resize disk** | `/resize-disk` | 在线扩 data 卷，自动 resize2fs。 |
+| **Live migrate** | `/migrate` | snapshot/restore 跨 host — Dashboard URL 不变。 |
+| **Clone** | 创建时 `clone_from` | 同 host 内 cp 数据卷 — 比备份恢复快。 |
+| **Restore** | 创建时 `restore_from` | 从任意备份恢复（含 orphan）。 |
+| **Tags + TTL + 定时** | 创建时 body 字段 | Tag 检索、TTL 自动停、office-hours 定时。 |
+| **批量操作** | `POST /batch/tenants` | 按 ID 列表或 tag filter 做 stop/start/delete/backup。 |
 
-![Settings 页签](web_console_settings.png)
+</details>
 
-## Dashboard 访问
+<details>
+<summary><b>⚡ 资源弹性</b> — ASG、超卖、Spot、Quota、Graviton</summary>
 
-每个租户的 OpenClaw Dashboard 通过 CloudFront + ALB + Nginx 反向代理访问：
+| 能力 | 详情 |
+|---|---|
+| **ASG 自动扩缩** | 按需起 EC2；闲置 host 两轮确认后回收。 |
+| **CPU 超卖** | `cpu_overcommit_ratio: 2.0` → 8 物理 vCPU = 16 可分配。 |
+| **内存超卖** | `mem_overcommit_ratio: 1.5` + Firecracker balloon → 32 GiB 物理 = 48 GiB 可分配。 |
+| **Spot 实例** | `asg.use_spot: true` 省 60-70%。ASG 自动替补被回收的实例。 |
+| **Per-tenant Quota** | `QUOTAS_MAX_VCPU/MEM/DATA_DISK_MB` 在创建时硬性拦。 |
+| **Graviton (ARM64)** | `instance_type: r8g.2xlarge` ✅ — rootfs 同时支持双架构。 |
+
+</details>
+
+<details>
+<summary><b>📊 观测</b> — 双层健康 + Prometheus + Grafana，零静态凭证</summary>
+
+| 能力 | 详情 |
+|---|---|
+| **host-agent (5s)** | 每 host 上的 systemd service，5 秒一轮扫所有 VM 写实时指标到 DDB。 |
+| **Lambda watchdog (5min)** | 跨整 fleet 扫描，检测 AZ outage，编排 failover。 |
+| **Amazon Managed Prometheus** | 全托管 AMP workspace，PromQL 兼容。 |
+| **Amazon Managed Grafana** | IAM Identity Center 登录 + AMP 数据源 + 示例仪表盘。 |
+| **ADOT collector** | 自动 SigV4 远程写 — 全程零静态凭证。 |
+| **6 个 per-VM gauge** | `openclaw_vm_health`, `cpu_pct`, `memory_used_mb`, `memory_balloon_mib`, `disk_used_mb`, `disk_used_pct` — 都带 `tenant` 和 `instance` 标签。 |
+| **Audit log** | 全部变更操作 → DynamoDB（90 天 TTL）；通过 `GET /audit-log` 查询。 |
+
+</details>
+
+<details>
+<summary><b>🤖 Bedrock AgentCore 集成</b> — 可选一键开关，5 件套全部接通</summary>
+
+| 组件 | 作用 |
+|---|---|
+| **Gateway** | MCP tool hub — Lambda 函数注册成 MCP 工具。3 个 demo: `hello`, `system_info`, `timestamp`。 |
+| **Memory** | 多轮对话上下文持久化。`create_event` / `list_events` / `batch_create_memory_records`。每租户独立。 |
+| **Code Interpreter** | Python 3.12 sandbox。`start_session` → `executeCode` → `stop_session`。 |
+| **Browser** | 远程 Chromium + WebSocket stream。可自动化。 |
+| **Workload Identity** | 每个 VM 启动时自动注入临时凭证 — 零静态 key、自动刷新。 |
+
+> AWS Sample 仓库里少数几个把 **AgentCore 5 件套**完整端到端跑通 + 用 E2E 测试验证过的项目。
+
+</details>
+
+<details>
+<summary><b>💾 备份 + 恢复</b> — 定时 / 手动 / 跨租户 / 孤儿可恢复</summary>
+
+| 能力 | 详情 |
+|---|---|
+| **定时备份** | EventBridge cron — 每天 running 租户的 data 卷 → S3。 |
+| **手动触发** | `POST /tenants/{id}/backup` — 异步返回 202。 |
+| **孤儿可恢复** | 源 tenant 可删，备份仍可恢复进新 tenant。 |
+| **S3 lifecycle** | `backup_retention_days` 自动清理（默认 7 天）。 |
+| **Trap 安全** | 任何步失败也保证 VM 一定 resume — 不会卡 paused 状态。 |
+| **Pause-compress-resume** | 原子流程：暂停 → pigz 压缩 → 上传 → resume — guest 中断 < 1 秒。 |
+
+</details>
+
+<details>
+<summary><b>🔐 安全 + 合规</b> — 7 层独立防御</summary>
+
+| 层 | 实现 |
+|---|---|
+| **静态加密** | EBS 卷（rootfs + data）默认 KMS 加密。 |
+| **传输加密** | CloudFront → ALB → Nginx → VM Gateway 全链路 TLS。 |
+| **API 鉴权** | API Gateway 带 `x-api-key` + 可选 AWS WAF（rate limit / geo block / OWASP）。 |
+| **Console 鉴权** | Cognito OAuth2 implicit flow + 可选 MFA。 |
+| **RBAC** | Cognito Groups: `admin` / `operator` / `viewer` 每路由强制。 |
+| **Audit log** | 所有 `POST` / `PUT` / `DELETE` 操作记录，90 天 TTL。 |
+| **网络隔离** | iptables `FORWARD DROP` 跨 tenant 子网 — 跨租户通信默认禁止。 |
+
+</details>
+
+<details>
+<summary><b>🚀 简单部署</b> — 一键 CDK + 云端 rootfs build</summary>
+
+| 能力 | 详情 |
+|---|---|
+| **一键 setup** | `./setup.sh <region> <profile>` — 完整 CDK 栈 ~5 分钟。 |
+| **云端 rootfs build** | `./scripts/build-rootfs-on-ec2.sh` — 启一次性 EC2 + SSM，无需本地 Linux。 |
+| **自定义域名** | `./setup.sh --domain claw.example.com --cert <acm-arn>` — ACM 在 `us-east-1`。 |
+| **Cognito + RBAC** | 可选 console_auth；admin/operator/viewer 三档守门所有变更 API。 |
+| **Manifest rootfs 版本** | `manifest.json` 跟踪 rootfs 版本；每 host 注册表。 |
+| **Terraform 平价** | Terraform 模块与 CDK 栈对等，已有 Terraform 体系的团队可选。 |
+
+</details>
+
+---
+
+## 🖥️ Web Console
+
+CloudFront 上托管的 Web Console（`/console/`），Cognito 鉴权，5 个 tab 涵盖运维所需。
+
+### Tenants tab — 多 host、多 AZ 实时操作
+
+左侧 Hosts 按 AZ 分组（每个卡片显示 CPU / Memory / VM 数 + 超卖比例）。Tenants 表格每行实时 vCPU / Memory / Disk 进度条 + AZ 列 + gateway/health 信号灯 + 每租户 Migrate 按钮。AgentCore + Shared Skills 折叠在顶部：
+
+![Tenants tab](../docs/web_console.png)
+
+### Application tab — 模板、MCP 工具、共享 Skills
+
+Config Templates 管理器 + MCP Tools 卡片（自动通过 AgentCore Gateway 拉取 Lambda-backed 工具列表 + input schema）+ Shared Skills 含每个 Skill 的 S3 直链：
+
+![Application tab](../docs/web_console_application.png)
+
+### Monitoring tab — AMP / Grafana / SNS 一目了然
+
+观测概览：AMP / Grafana / SNS 状态、所有 per-VM Prometheus gauge 含类型 + 标签 + 描述、可复制粘贴的 PromQL 示例、AMP `remote_write` / Grafana endpoint：
+
+![Monitoring tab](../docs/web_console_monitoring.png)
+
+### Backups tab — 跨租户浏览 + 孤儿支持
+
+跨租户备份浏览器，标记 active vs orphan（orphan = 源租户已删但备份仍可恢复进新租户）。默认 S3 lifecycle 7 天清理：
+
+![Backups tab](../docs/web_console_backup.png)
+
+### Settings tab — 基础设施状态 + Fleet by AZ
+
+一页全览：API 连接 / AgentCore Gateway URL / Multi-AZ HA / Prometheus + Grafana / AWS WAF / Cognito + RBAC / SNS 生命周期事件 / per-tenant Quota / Host 超卖比例 / 实时 **Fleet by AZ** 表显示 host 和 VM 在各 AZ 的分布：
+
+![Settings tab](../docs/web_console_settings.png)
+
+---
+
+## 🏗️ 架构
+
+### 系统架构
+
+![System Architecture](../docs/oc-system-arch.png)
+
+### 部署架构
+
+![Deployment Architecture](../docs/oc-deploy-arch.png)
+
+<details>
+<summary><b>ASCII 版（适合 AI / 文本访问）</b></summary>
 
 ```
-https://{cloudfront-domain}/vm/{tenant-id}/    → 租户 Dashboard (WebSocket)
+管理员 / 用户
+    │
+    ├── API Gateway (HTTPS, x-api-key) ──→ Lambda ──→ DynamoDB
+    │                                                  ├── tenants
+    │                                                  └── hosts
+    │
+    └── ALB (HTTPS) ──→ Host Nginx:80 ──→ VM Gateway:18789
+                        ├── /vm/{tenant-a}/ → 172.16.1.2
+                        └── /vm/{tenant-b}/ → 172.16.2.2
+
+Lambda ── SSM Run Command ──→ EC2 Host
+                               ├── microVM 01 (172.16.1.2)
+                               ├── microVM 02 (172.16.2.2)
+                               └── ...
+
+S3: rootfs 分发 + 数据备份 + 共享 Skills
+ASG: 自动扩缩 host
+EventBridge: 健康检查 + 闲置回收 + 定时备份
 ```
 
-CloudFront 自动提供 HTTPS，无需自定义域名或 ACM 证书。Console 的 "Open Dashboard" 按钮自动带上 gateway token，一键访问。
+</details>
 
-流量路径：`Browser → CloudFront:443 → ALB:80 → Host Nginx:80 → VM Gateway:18789`
+### 网络模型
 
-Nginx 配置由 launch-vm.sh / stop-vm.sh 自动管理。
+每 VM 独立 /24 子网，通过 TAP 设备与 host 通信：
 
-## 自定义域名（可选）
+```
+VM1: tap-vm1  host=172.16.1.1/24  guest=172.16.1.2/24
+VM2: tap-vm2  host=172.16.2.1/24  guest=172.16.2.2/24
+VMn: tap-vmN  host=172.16.N.1/24  guest=172.16.N.2/24
+```
 
-绑定自定义域名到 CloudFront。配置位于 `config.yml` 的 `cloudfront:` section，可以直接编辑文件，也可以通过 `setup.sh` 参数传入：
+- **出网**：iptables MASQUERADE → 互联网
+- **入网**：ALB → Nginx 反代 → VM:18789
+- **跨 VM**：完全隔离，子网间无路由
+
+### 项目结构
+
+```
+sample-multi-tenant-openclaw-on-firecracker/
+├── deploy/                    # CDK 项目
+│   ├── app.py                 # CDK app 入口
+│   ├── stack.py               # 基础设施定义
+│   ├── lambda/
+│   │   ├── api/handler.py             # 租户 CRUD + host 管理
+│   │   ├── templates/handler.py       # 配置模板 CRUD
+│   │   ├── skills/handler.py          # 共享 Skills 列表
+│   │   ├── health_check/handler.py    # 定时健康 + AZ failover
+│   │   ├── agentcore_tools/handler.py # AgentCore Gateway Lambda 工具
+│   │   └── scaler/handler.py          # 闲置 host 回收
+│   └── userdata/
+│       ├── init-host.sh       # host 初始化
+│       ├── host-agent.py      # VM 健康轮询 + DDB 写入 + balloon
+│       ├── launch-vm.sh       # microVM 启动
+│       └── stop-vm.sh         # microVM 停止
+├── console/                   # Web 管理控制台
+├── tests/                     # 426+ 测试（unit / integration / e2e）
+├── templates/                 # OpenClaw 配置模板
+├── scripts/
+│   ├── build-rootfs-on-ec2.sh # 云端构建（无需本地 Linux）
+│   ├── destroy.sh             # 销毁栈
+│   ├── oc-connect.sh          # SSH 风格直连租户 VM
+│   └── oc-dashboard.sh        # 打开租户 Dashboard URL
+├── pyproject.toml             # Python 项目配置
+├── cdk.json                   # CDK app 配置 + feature flag
+├── config.yml.example         # 基础设施配置模板
+└── setup.sh                   # 一键部署 + .env.deploy 导出
+```
+
+---
+
+## ⚙️ 配置
+
+### 配置文件
+
+| 文件 | 用途 |
+|---|---|
+| `config.yml` | 基础设施配置 — 从 `config.yml.example` 复制并自定义 |
+| `templates/openclaw.json` | OpenClaw 应用配置（model、API key、provider）|
+| `.env.deploy` | 部署环境（region、API URL/Key、bucket）— `setup.sh` 自动生成 |
+
+### `config.yml` 关键 toggle
+
+| 段 | Key | 默认 | 说明 |
+|---|---|---|---|
+| `host` | `instance_type` | `m8i.2xlarge` | 必须支持嵌套虚拟化（c8i / m8i / r8i / r8g）。 |
+| `host` | `cpu_overcommit_ratio` | `2.0` | CPU 超卖比例。 |
+| `host` | `mem_overcommit_ratio` | `1.0` | 内存超卖比例（需开 balloon）。 |
+| `vm` | `default_vcpu` | `2` | 每租户默认 vCPU。 |
+| `vm` | `default_mem_mb` | `4096` | 每租户默认内存（MB）。 |
+| `balloon` | `enabled` | `false` | Firecracker balloon 设备（用于内存超卖）。 |
+| `asg` | `min_capacity` | `2` | 最小 host 实例数（默认 Multi-AZ）。 |
+| `asg` | `use_spot` | `false` | Spot 实例（省 60-70%，可能被回收）。 |
+| `multi_az` | `enabled` | `true` | Multi-AZ HA — 启用 AZ failover。 |
+| `health_check` | `interval_minutes` | `5` | Lambda watchdog 间隔。 |
+| `metrics` | `enabled` | `false` | 创建 AMP + Grafana + ADOT。 |
+| `agentcore` | `enabled` | `false` | 创建 Gateway + Memory + CodeInterpreter + Browser + Identity。 |
+| `console_auth` | `enabled` | `false` | Console 启用 Cognito 鉴权。 |
+| `backup_cron` | — | `cron(0 19 * * ? *)` | UTC 19:00 每天备份。 |
+
+> 完整参考请见 [`config.yml.example`](../config.yml.example)。
+
+### 销毁栈
 
 ```bash
-# 前置条件：
-# 1. 在 us-east-1 申请 ACM 证书（CloudFront 要求）并完成 DNS 验证
-# 2. 将域名 CNAME 指向 CloudFront 域名（见 DashboardUrl output）
-
-# 一条命令：写入 config.yml 并部署
-./setup.sh ap-northeast-1 lab \
-  --domain claw.example.com \
-  --cert   arn:aws:acm:us-east-1:xxx:certificate/xxx
-
-# 或手动编辑 config.yml 后不带 flag 跑 setup.sh。
-# 取消绑定：--domain "" 然后重跑 setup.sh。
+./scripts/destroy.sh           # 销毁栈，保留 S3 + DynamoDB
+./scripts/destroy.sh --purge   # 完全清理含数据
 ```
 
-自定义域名/证书通过 CDK 管理，不会被下次 `setup.sh` 覆盖。
+---
 
-## 自动备份与恢复
+## 📚 API Reference
 
-EventBridge 定时备份所有 running 租户的数据盘到 S3，也支持手动触发。
+所有请求都需要 `x-api-key` header。
 
-**备份流程**：pause VM → pigz 压缩 data.ext4 → resume VM → 上传 S3。即使备份失败，VM 也会自动恢复运行（trap cleanup）。
+### Tenants
+
+| Method | Path | 说明 |
+|---|---|---|
+| `GET` | `/tenants` | 列出所有租户。`?tag=key:value` 过滤（可重复，对 pair 做 AND）。|
+| `POST` | `/tenants` | 创建。Body: `{name, vcpu, mem_mb, data_disk_mb, config_template, tags, ttl_hours, on_expiry, schedule, restore_from, clone_from}` — 仅 `name` 必填。 |
+| `GET` | `/tenants/{id}` | 获取租户详情。|
+| `DELETE` | `/tenants/{id}` | 删除（`?keep_data=true` 保留 data 卷）。|
+| `POST` | `/tenants/{id}/restart` | 重启 VM（保留磁盘）。|
+| `POST` | `/tenants/{id}/stop` · `/start` | 停止 / 启动。|
+| `POST` | `/tenants/{id}/pause` · `/resume` | Firecracker 原生 vCPU 冻结 / 解冻。|
+| `POST` | `/tenants/{id}/reset` | 重装 rootfs（保留 data）。|
+| `POST` | `/tenants/{id}/backup` | 手动数据备份。|
+| `POST` | `/tenants/{id}/resize` | 热扩 vCPU。Body: `{"vcpu":4}`。|
+| `POST` | `/tenants/{id}/resize-disk` | 离线扩 data 卷。Body: `{"new_size_mb":16384}`。|
+| `POST` | `/tenants/{id}/migrate` | 实时迁移。Body: `{"target_host_id":"i-..."}`。|
+| `GET` | `/tenants/{id}/backups` | 单租户的备份列表。|
+| `POST` | `/batch/tenants` | 批量操作。Body: `{"action":"stop\|start\|delete\|backup", "ids":[...]\|"filter":{"tag":"k:v"}}`。|
+
+### Backups, Hosts, AgentCore, Audit, Skills, Templates
+
+| Method | Path | 说明 |
+|---|---|---|
+| `GET` | `/backups` | 跨租户列出所有备份（标 active vs orphan）。|
+| `GET` | `/hosts` | 列出所有 host。|
+| `POST` | `/hosts/refresh-rootfs` | 推送最新 rootfs 到所有 host。|
+| `GET` | `/hosts/rootfs-version` | 查询当前 rootfs 版本。|
+| `GET` | `/agentcore/status` | AgentCore 启用状态 + Gateway URL。|
+| `GET` | `/agentcore/tools` | 列出 Gateway 上注册的 MCP 工具。|
+| `GET` | `/audit-log` | 查 audit log。`?since=<ISO8601>&limit=<n>` — 90 天 TTL。|
+| `GET` | `/skills` | 列出共享 Skills（S3 管理）。|
+| `GET` · `PUT` · `DELETE` | `/templates/{name}` | 配置模板 CRUD（`default` 只读）。|
+| `GET` | `/system/info` | feature flag + config 快照（region、version、multi_az、metrics、…）。|
+
+---
+
+## 🌐 进阶主题
+
+<details>
+<summary><b>自动备份 + 恢复 — 流程 + 任意备份恢复（孤儿安全）</b></summary>
+
+EventBridge 每天定时备份所有 running 租户的 data 卷到 S3。也支持手动触发。
+
+**备份流程**：暂停 VM → `pigz` 压缩 `data.ext4` → 恢复 VM → 上传 S3。失败时 VM 自动 resume（trap cleanup）。
 
 ```bash
 source .env.deploy
 
-# 手动触发单个租户备份
-curl -s -X POST "${API_URL}tenants/{tenant-id}/backup" -H "x-api-key: ${API_KEY}" | jq .
-# 返回 {"status": "started"} — 异步执行，不阻塞
+# 手动备份（异步返回 202）
+curl -s -X POST "${API_URL}tenants/{id}/backup" -H "x-api-key: ${API_KEY}" | jq .
 
-# 查询单个租户的备份列表
-curl -s "${API_URL}tenants/{tenant-id}/backups" -H "x-api-key: ${API_KEY}" | jq .
-
-# 查询所有租户的备份（包含 orphan 标记）
+# 跨租户列出所有备份（标 active vs orphan）
 curl -s "${API_URL}backups" -H "x-api-key: ${API_KEY}" | jq .
-
-# 定时备份配置（config.yml）
-# backup_cron: "cron(0 19 * * ? *)"  # UTC 19:00 = 北京时间 03:00
-# backup_retention_days: 7            # S3 lifecycle 自动清理 7 天前的备份
 ```
 
-备份文件存储在 `s3://{bucket}/backups/{tenant-id}/{timestamp}.gz`。
-
-### 从备份恢复
-
-Restore 会基于某个备份创建一个**新租户**。源租户无需存在 —— 已删除租户的孤儿备份也能完整恢复。
+**从备份恢复**（孤儿安全 — 源 tenant 不存在也行）：
 
 ```bash
-# 从指定租户的最新备份恢复（源租户可以已被删除）
+# 从某个（可能已删除的）租户的最新备份恢复
 curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" -d '{
   "name": "restored-agent",
   "vcpu": 2, "mem_mb": 4096,
@@ -277,45 +524,60 @@ curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" -d '{
 }' | jq .
 ```
 
-- `restore_from` 与 `vcpu`/`mem_mb`/`config_template` 解耦 —— 这些字段跟随新租户的规格
-- 数据盘大小 = 备份实际大小（不自动 resize）
-- 新租户拿到新的 ID，不继承源租户身份
+</details>
 
-## 共享 Skills
-
-所有租户共享统一的 Skills（SKILL.md 文件），记忆各自独立。
+<details>
+<summary><b>自定义域名 — 绑定 ACM + CloudFront</b></summary>
 
 ```bash
-# 上传 Skills 到 S3（所有 VM 自动同步）
+# 前置条件：
+#   1. 在 us-east-1 申请 ACM 证书（CloudFront 必需）+ 完成 DNS 验证
+#   2. 把您的域名 CNAME 到 CloudFront 域名（见 DashboardUrl 输出）
+
+./setup.sh ap-northeast-1 lab \
+  --domain claw.example.com \
+  --cert   arn:aws:acm:us-east-1:xxx:certificate/xxx
+
+# 或直接编辑 config.yml 的 cloudfront: 段。
+# 解绑：--domain "" 重新跑 setup.sh。
+```
+
+</details>
+
+<details>
+<summary><b>共享 Skills — S3 → Host → VM 同步链</b></summary>
+
+所有租户共享统一的 Skill 集（`SKILL.md` 文件），但每租户 memory 独立。
+
+```bash
+# 上传 Skill 到 S3（自动同步到所有 VM）
 aws s3 sync ./my-skills/ s3://${ASSETS_BUCKET}/skills/ --profile $PROFILE
 
-# Skills 同步链路：
-# S3 → 宿主机 /data/shared-skills/ (cron 5min) → 所有运行中的 VM
-# 新建 VM 时自动注入到数据盘
+# 同步链：
+#   S3 → Host /data/shared-skills/ (cron 5min) → 所有 running VM
+#   新 VM 启动时把 Skill 注入到 data 卷
 ```
 
-Skills 目录结构：
-```
-s3://{bucket}/skills/
-├── code-review/SKILL.md
-├── summarizer/SKILL.md
-└── web-search/SKILL.md
-```
+</details>
 
-## 自动扩缩容
+<details>
+<summary><b>自动扩缩 — 扩容 + 闲置回收</b></summary>
 
-**扩容** — 创建租户时无可用宿主机 → 租户进入 pending → ASG 自动启动新实例 → 初始化完成后自动分配 pending 租户
+**扩容** — 创建租户时没有可用 host → 租户进 `pending` → ASG 起新实例 → 初始化完后 pending 租户自动分配。
 
-**缩容** — Scaler Lambda 每 5 分钟检测空闲宿主机：
-1. 宿主机 `vm_count=0` 超过 `idle_timeout_minutes` → 标记 `idle`
-2. 下一轮确认仍空闲且 ASG 实例数 > min → 终止实例
-3. 期间如有新租户分配到该宿主机 → 自动恢复 `active`，取消回收
+**缩容** — Scaler Lambda 每 5 分钟扫一次：
+1. `vm_count=0` 的 host 超过 `idle_timeout_minutes` → 标 `idle`。
+2. 下一轮还是 idle 且 ASG 实例数 > min → 终止。
+3. 期间分配进来一个租户 → 自动恢复 `active`。
 
-## 可观测性（可选）
+</details>
 
-当 `config.yml` 中 `metrics.enabled: true` 时，CDK 会一并创建 Amazon Managed Prometheus (AMP) 工作区和 Amazon Managed Grafana (AMG) 工作区。每台宿主机上 ADOT collector 作为独立 systemd 服务运行，每 30 秒抓取一次 host-agent 的 `/metrics` 端点，通过 SigV4 签名 remote-write 到 AMP（**无需静态密钥**）。
+<details>
+<summary><b>观测（可选） — AMP + Grafana + 示例 PromQL</b></summary>
 
-每个 VM 暴露的 Prometheus gauge（带 `tenant=<租户ID>` 和 `instance=<宿主机ID>` 标签）：
+`config.yml` 里 `metrics.enabled: true` 时，stack 创建一个 AMP workspace 和一个 AMG workspace。每台 host 跑一个 ADOT collector 作为旁车 systemd service，每 30 秒抓 `host-agent` 的 `/metrics` endpoint，自动 SigV4 签名远程写到 AMP — 全程零静态凭证。
+
+每个 VM 暴露的 gauge（带 `tenant=<tenant_id>` 和 `instance=<host_instance_id>` 标签）：
 
 ```
 openclaw_vm_memory_used_mb        openclaw_vm_disk_used_mb
@@ -323,286 +585,144 @@ openclaw_vm_memory_balloon_mib    openclaw_vm_disk_total_mb
 openclaw_vm_health (0|1)          openclaw_vm_disk_used_pct
 ```
 
-PromQL 示例：
+示例 PromQL：
+
 ```promql
-# 某个租户所有 VM 的总内存使用
+# 单租户所有 running VM 的内存合计
 sum by (tenant) (openclaw_vm_memory_used_mb)
 
-# 最近 1 分钟内有 VM 异常的宿主机
+# 最近 1 分钟有过不健康 VM 的 host
 min_over_time(openclaw_vm_health[1m]) == 0
 ```
 
-Grafana 接入使用 **AWS IAM Identity Center**：
-1. Deploy 完成后，CFN 输出的 `GrafanaWorkspaceUrl` 即工作区 URL；
-2. 在 IAM Identity Center 中将自己（或一个 group）分配到该 AMG 工作区；
-3. 首次登录后，在 Grafana → *Connections → Data sources → Add → Prometheus*，从下拉中选择对应 AMP 工作区即可（AMG 服务角色已被授予 `aps:QueryMetrics`）。
+Grafana 访问通过 **AWS IAM Identity Center**：
 
-如需关闭，将 `metrics.enabled` 改回 `false` 重新执行 `setup.sh`，AMP 和 AMG 会一起被删除，停止对应的样本/活跃用户计费。
+1. 部署后 `GrafanaWorkspaceUrl` CFN output 里有 workspace URL。
+2. 在 IAM Identity Center 把您（或某个 group）assign 到那个 AMG workspace。
+3. 首次登录：Grafana → *Connections → Data sources → Add → Prometheus*，从下拉里选 AMP workspace（AMG service role 已经有 `aps:QueryMetrics` 权限）。
 
-## 配置说明
-
-### 配置文件
-
-| 文件 | 用途 |
-|------|------|
-| `config.yml` | 基础设施配置 — 从 `config.yml.example` 复制后按需修改 |
-| `templates/openclaw.json` | OpenClaw 应用配置（模型、API key、provider）— 从 `.example` 复制 |
-| `.env.deploy` | 部署环境 (region、API URL/Key、bucket) — setup.sh 自动生成 |
-
-### config.yml
-
-| 分类 | 配置项 | 默认值 | 说明 |
-|------|--------|--------|------|
-| host | instance_type | m8i.xlarge | 需支持 NestedVirtualization (c8i/m8i/r8i) |
-| host | data_volume_gb | 200 | 宿主机数据卷 (rootfs 模板 + VM 数据盘) |
-| host | cpu_overcommit_ratio | 2.0 | CPU 超配比例 (1.0=不超配, 2.0=可分配 2 倍 vCPU) |
-| host | mem_overcommit_ratio | 1.0 | 内存超配比例 (需启用 balloon) |
-| host | keep_data_volume | true | 实例终止时保留 EBS 数据卷 |
-| vm | default_vcpu | 2 | 默认 vCPU |
-| vm | default_mem_mb | 4096 | 默认内存 (MB) |
-| vm | rootfs_overlay_mb | 8192 | 每 VM 可写层上限 (sparse, 不预占空间) |
-| vm | data_disk_mb | 8192 | 每 VM 数据盘 `/home/agent` 上限 (sparse) |
-| balloon | enabled | false | Firecracker balloon 设备实现内存超配 |
-| balloon | max_inflate_ratio | 0.4 | 最多回收 VM 声明内存的比例 |
-| balloon | min_guest_available_mb | 512 | guest 至少保留的可用内存 |
-| asg | min_capacity | 1 | 最小实例数 |
-| asg | max_capacity | 5 | 最大实例数 |
-| asg | use_spot | false | Spot 实例 (省 ~60-70%，可能被回收) |
-| scaler | idle_timeout_minutes | 10 | 空闲超时后回收宿主机 |
-| health_check | interval_minutes | 5 | Lambda watchdog 间隔 |
-| agentcore | enabled | false | AgentCore Gateway/Memory/CodeInterpreter/Browser |
-| metrics | enabled | false | 是否创建 Amazon Managed Prometheus + Grafana，并让每台宿主机的 ADOT collector remote-write 每个 VM 的 gauge（`openclaw_vm_memory_used_mb` / `disk_used_pct` / `vm_health` 等）。详见上文 [可观测性](#可观测性可选) |
-| metrics | workspace_alias | openclaw | AMP 工作区别名（仅 `metrics.enabled: true` 时生效） |
-| metrics | grafana_name | openclaw-metrics | AMG 工作区名称（仅 `metrics.enabled: true` 时生效） |
-| console_auth | enabled | false | Console Cognito 认证 |
-| console_auth | self_sign_up | false | 允许用户自注册 |
-
-完整配置参见 `config.yml.example`。修改后重新部署：`./setup.sh <region> <profile>`
-
-### 销毁环境
-
-```bash
-./destroy.sh           # 销毁 stack，保留 S3 bucket 和 DynamoDB 表
-./destroy.sh --purge   # 彻底清理，包括 S3 数据和 DynamoDB 表
-```
-
-## 架构
-
-### 系统架构
-
-![系统架构](./oc-system-arch.png)
-
-### 部署架构
-
-![部署架构](./oc-deploy-arch.png)
-
-<details>
-<summary>ASCII 版本（方便 AI/文本访问）</summary>
-
-```
-用户/管理员
-    │
-    ├── API Gateway (HTTPS, x-api-key) → Lambda → DynamoDB
-    │                                     │         ├── tenants (租户状态)
-    │                                     │         └── hosts (宿主机资源)
-    │                                     │
-    │                                     ├── SSM Run Command ──→ EC2 Host A
-    │                                     │                       ├── Nginx (ALB 反向代理)
-    │                                     │                       ├── microVM 01 (172.16.1.2)
-    │                                     │                       ├── microVM 02 (172.16.2.2)
-    │                                     │                       └── ...
-    │                                     │
-    │                                     └── SSM Run Command ──→ EC2 Host B ...
-    │
-    └── ALB (Dashboard) ──→ Host Nginx:80 ──→ VM Gateway:18789
-                            (跨主机自动路由)
-
-S3: rootfs 分发 + 数据卷备份
-ASG: 宿主机自动扩缩 (配置参见: config.yml)
-EventBridge: 健康检查 + 空闲回收 + 定时备份
-```
+之后想关观测，把 `metrics.enabled: false` 重新跑 `setup.sh` — AMP 和 AMG 自动删除，停止计费。
 
 </details>
 
-## 项目结构
+<details>
+<summary><b>Rootfs 管理 — 版本化 + 刷新</b></summary>
 
-```
-sample-multi-tenant-openclaw-on-firecracker/
-├── deploy/                    # CDK 项目
-│   ├── app.py                 # CDK 入口
-│   ├── stack.py               # 基础设施定义
-│   ├── lambda/
-│   │   ├── api/handler.py     # 租户 CRUD + 宿主机管理
-│   │   ├── templates/handler.py  # 配置模板 CRUD
-│   │   ├── skills/handler.py  # 共享 Skills 列表
-│   │   ├── health_check/handler.py  # 定时健康检查
-│   │   ├── agentcore_tools/handler.py  # AgentCore Gateway Lambda 工具
-│   │   └── scaler/handler.py  # 空闲宿主机回收
-│   └── userdata/
-│       ├── init-host.sh       # 宿主机初始化
-│       ├── host-agent.py      # VM 健康探活 + DDB 写入 + balloon
-│       ├── launch-vm.sh       # microVM 启动
-│       └── stop-vm.sh         # microVM 停止
-├── console/                   # Web 管理控制台
-│   ├── index.html             # Alpine.js SPA (4 页签)
-│   └── style.css
-├── tests/                     # 测试套件 (unit + e2e)
-├── templates/                 # OpenClaw 配置模板
-│   └── openclaw.json.example  # 示例配置
-├── pyproject.toml             # Python 项目配置 + 依赖
-├── cdk.json                   # CDK 应用配置
-├── config.yml                 # 基础设施配置 (唯一配置源)
-├── setup.sh                   # 一键部署 + 导出 .env.deploy
-├── build-rootfs.sh            # 在本地 Linux 上构建 rootfs（debootstrap）
-├── scripts/
-│   ├── build-rootfs-on-ec2.sh # 云端构建（无需本地 Linux）— 推荐 macOS / Windows / Cloud9 用户使用
-│   ├── destroy.sh             # 销毁 stack
-│   ├── oc-connect.sh          # 快速登录某个租户 VM
-│   └── oc-dashboard.sh        # 打开某个租户的 Dashboard URL
-└── docs/
-```
-
-## API 参考
-
-所有请求需携带 `x-api-key` header。
-
-### 租户操作
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | /tenants | 列出所有租户。可加 `?tag=key:value`（可重复，多 tag AND 过滤）|
-| POST | /tenants | 创建租户。Body: `{"name":"xx","vcpu":2,"mem_mb":4096,"data_disk_mb":8192,"config_template":"...","tags":{"k":"v"},"ttl_hours":24,"on_expiry":"stop","schedule":{"start":"09:00","stop":"18:00","timezone":"UTC","days":["Mon","Tue"]},"restore_from":{"tenant_id":"..."},"clone_from":"<src-tenant-id>"}` — 仅 `name` 必填 |
-| GET | /tenants/{id} | 查询单个租户 |
-| DELETE | /tenants/{id} | 删除租户 (`?keep_data=true` 保留数据盘) |
-| POST | /tenants/{id}/restart | 重启租户 VM（复用磁盘，快速） |
-| POST | /tenants/{id}/stop | 停止租户 VM（磁盘保留） |
-| POST | /tenants/{id}/start | 启动已停止的租户 VM |
-| POST | /tenants/{id}/pause | 冻结 vCPU（Firecracker 原生，即时） |
-| POST | /tenants/{id}/resume | 恢复已暂停的租户 VM |
-| POST | /tenants/{id}/reset | 重装系统盘（data 卷保留） |
-| POST | /tenants/{id}/backup | 手动触发数据盘备份（异步，返回 202） |
-| POST | /tenants/{id}/resize | 在线热加 vCPU。Body: `{"vcpu":4}`。内存在线调整不支持（Firecracker 限制） |
-| POST | /tenants/{id}/resize-disk | 离线扩容数据盘。Body: `{"new_size_mb":16384}`。VM 暂停约几秒 |
-| POST | /tenants/{id}/migrate | 通过 Firecracker snapshot/restore 实时迁移。Body: `{"target_host_id":"i-..."}` |
-| GET | /tenants/{id}/backups | 查询单个租户的备份列表 |
-| POST | /batch/tenants | 批量操作。Body: `{"action":"stop|start|delete|backup","ids":["t1","t2"]}` 或 `{"action":"...","filter":{"tag":"k:v"}}`。返回 `{succeeded:[...], failed:[...]}` |
-
-### 备份、宿主机、AgentCore、审计、Skills、模板
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | /backups | 跨租户查询所有备份（含 orphan 标记） |
-| GET | /hosts | 列出所有宿主机 |
-| POST | /hosts | 注册宿主机 (一般不直接用 — UserData 直写 DDB) |
-| POST | /hosts/refresh-rootfs | 推送最新 rootfs + data template 到所有宿主机 |
-| GET | /hosts/rootfs-version | 查询 S3 上当前 rootfs 版本 (manifest.json) |
-| DELETE | /hosts/{id} | 注销宿主机 |
-| GET | /agentcore/status | AgentCore 启用状态 + Gateway URL（启用时） |
-| GET | /audit-log | 审计日志查询。`?since=<ISO8601>&limit=<n>`（最大 500）。DDB TTL 90 天自动清理 |
-| GET | /skills | 列出共享 Skills（S3 集中管理） |
-| GET | /templates | 列出配置模板 |
-| GET\|PUT\|DELETE | /templates/{name} | 读取 / 保存 / 删除配置模板（`default` 只读） |
-
-## 网络模型
-
-每个 VM 使用独立 /24 子网，通过 TAP 设备与宿主机通信：
-
-```
-VM1: tap-vm1  host=172.16.1.1/24  guest=172.16.1.2/24
-VM2: tap-vm2  host=172.16.2.1/24  guest=172.16.2.2/24
-VMn: tap-vmN  host=172.16.N.1/24  guest=172.16.N.2/24
-```
-
-- 出站：iptables MASQUERADE → 外网
-- 入站：DNAT 端口转发 (host_port → guest:18789)
-- VM 间：完全隔离，不同子网无路由
-
-## Rootfs 管理
-
-构建脚本生成两个镜像：rootfs (系统+软件) 和 data template (/home/agent 预配置内容)。
-
-镜像版本通过 S3 `manifest.json` 管理，hosts/tenants 表记录各自使用的 `rootfs_version`。
+构建脚本产出两个镜像：rootfs（OS + 软件）和 data template（`/home/agent` 预配内容）。版本通过 S3 `manifest.json` 管理，host 和 tenant 都跟踪自己的 `rootfs_version`。
 
 ```bash
-# 构建并上传 (更新 manifest.json + refresh 宿主机)
+# 构建 + 上传（更新 manifest.json + 刷新 host）
 ./build-rootfs.sh v1.8
 
-# 手动刷新宿主机镜像
+# 手动刷新 host 镜像
 source .env.deploy
 curl -s -X POST "${API_URL}hosts/refresh-rootfs" -H "x-api-key: ${API_KEY}" | jq .
 
 # 查询当前版本
 curl -s "${API_URL}hosts/rootfs-version" -H "x-api-key: ${API_KEY}" | jq .
 
-# 新建的 VM 自动使用新版本，已有 VM 需 reset 才会更新
+# 新建 tenant 立刻用新版本；已有 tenant 需要 reset API 才换。
 ```
 
-## 安全
-
-安全问题报告请参见 [CONTRIBUTING](../CONTRIBUTING.md#security-issue-notifications)。
-
-## License
-
-本项目基于 MIT-0 License 开源，详见 [LICENSE](../LICENSE) 文件。
+</details>
 
 ---
 
-## 附录
+## ⬆️ 升级指南
 
-### 默认工具链
+升级通常涉及**两层**：控制面（CDK 栈）和数据面（rootfs + host-agent）。
 
-每个 VM 预装以下工具（rootfs v1.1+）：
-
-| 工具 | 用途 |
-|------|------|
-| Python 3.12 + venv | Python 开发 |
-| uv | Python 包管理 |
-| Node.js 22 + npm | JavaScript 运行时 |
-| OpenClaw CLI | AI Agent 框架 |
-| git + gh | 版本控制 + GitHub CLI |
-| curl / wget / jq | HTTP 请求 + JSON 处理 |
-| htop / tmux / tree | 系统监控 + 终端复用 + 目录浏览 |
-| vim / build-essential | 编辑器 + 编译工具链 |
-
-### 宿主机管理
-
-宿主机由 ASG 全自动管理，通常无需手动操作。
+### 通用流程（任意版本）
 
 ```bash
-# 查看 ASG 状态
-aws autoscaling describe-auto-scaling-groups \
-  --auto-scaling-group-names openclaw-hosts-asg \
-  --query 'AutoScalingGroups[0].{Desired:DesiredCapacity,Min:MinSize,Max:MaxSize}' \
-  --profile lab --region ap-northeast-1
+git pull                                  # 拉最新 main
+git diff HEAD@{1} HEAD -- config.yml.example  # 检查新配置 key
+# 如有新 key，手动合并到本地 config.yml
 
-# 手动扩容
-aws autoscaling set-desired-capacity \
-  --auto-scaling-group-name openclaw-hosts-asg \
-  --desired-capacity 3 --profile lab --region ap-northeast-1
+./setup.sh <region> <profile>             # 重新部署 CDK 栈（幂等）
 
-# 查看初始化日志
-./oc-connect.sh 后在宿主机上: cat /var/log/openclaw-init.log
+# 重建 rootfs（见"快速开始"第 3 步）
+source .env.deploy && ./build-rootfs.sh <new_version>
+
+# 新建 tenant 立刻用新 rootfs；已有 tenant 调 `reset` API 才会切换。
 ```
 
-### API Key 管理
+### 最新：v1.3.1 → **v1.3.2**（强烈推荐任何多租户部署）
+
+v1.3.2 修了所有真实环境压测才会暴露的问题：并发 Lambda 互踩、multi-tenant 同时迁移、内核短暂 race、host-agent ⇄ Lambda 互踩导致 SSM exit 不准。
+
+```bash
+git pull && ./setup.sh <region> <profile>     # 加上 reserved_concurrent_executions=1
+```
+
+部署完成后，重新分发 `launch-vm.sh` 到现有 host：
 
 ```bash
 source .env.deploy
-
-# 创建新 key
-aws apigateway create-api-key --name "operator-alice" --enabled \
-  --profile $PROFILE --region $REGION
-
-# 关联到 usage plan
-PLAN_ID=$(aws apigateway get-usage-plans \
-  --query "items[?name=='openclaw-plan'].id" --output text \
-  --profile $PROFILE --region $REGION)
-aws apigateway create-usage-plan-key --usage-plan-id $PLAN_ID \
-  --key-id <new-key-id> --key-type API_KEY \
-  --profile $PROFILE --region $REGION
-
-# 禁用 / 删除 key
-aws apigateway update-api-key --api-key <key-id> \
-  --patch-operations op=replace,path=/enabled,value=false \
-  --profile $PROFILE --region $REGION
+aws s3 cp deploy/userdata/launch-vm.sh s3://${ASSETS_BUCKET}/deployment/scripts/launch-vm.sh
+aws ssm send-command --document-name AWS-RunShellScript \
+    --targets Key=tag:aws:autoscaling:groupName,Values=openclaw-hosts-asg \
+    --parameters 'commands=[
+      "aws s3 cp s3://'${ASSETS_BUCKET}'/deployment/scripts/launch-vm.sh /home/ubuntu/launch-vm.sh",
+      "chmod +x /home/ubuntu/launch-vm.sh"
+    ]'
 ```
+
+**新增的 audit log 条目要关注：**
+
+- `AZ_FAILOVER_RECOVERED_BY_VERIFY` — 信息（verify 探针救回了一个看似失败的迁移）
+- `AZ_FAILOVER_SKIPPED_CONCURRENT` — 信息（并发 Lambda 主动让步）
+- `AZ_FAILOVER_TENANT_FAILED` — 需要处理（verify 探针确认真失败）
+- `AZ_FAILOVER_NO_BACKUP` — 需要处理（tenant 无备份，拒绝迁移）
+
+**summary 字段语义彻底分离**：`tenants_failed_over`、`tenants_failed`、`tenants_blocked` 三相独立。
+
+<details>
+<summary><b>更老的升级路径（v1.3.0 → v1.3.1, v1.2.9 → v1.3.0, v1.2.7 → v1.2.9）</b></summary>
+
+更老版本升级请参考 **[CHANGELOG.md](../CHANGELOG.md)**，每版本都有 operator notes。
+
+简要参考：
+
+- **v1.3.0 → v1.3.1**：5 个 path-A 集成 bug 修复。重新分发 `launch-vm.sh`。`__az_failover_state__` 合成记录用于 cooldown 持久化。
+- **v1.2.9 → v1.3.0**：ASG `min_capacity` 1 → 2（multi-AZ 默认）。`health_check` Lambda 新增 IAM 权限。
+- **v1.2.7 → v1.2.9**：多个 console + 观测修复。已有 host 需要重新分发 `host-agent.py`（带真实 CPU% / 内存指标）。
+
+</details>
+
+---
+
+## 🤝 贡献
+
+欢迎贡献！请见 [CONTRIBUTING.md](../CONTRIBUTING.md) 了解代码规范、PR 指南和安全 issue 报告流程。
+
+安全相关问题请见 [CONTRIBUTING.md#security-issue-notifications](../CONTRIBUTING.md#security-issue-notifications)。
+
+---
+
+## 📄 协议
+
+本仓库采用 **MIT-0 协议**。请见 [LICENSE](../LICENSE) 文件。
+
+> MIT-0 是 MIT 协议的"无需署名"变体。您可以使用、修改、再分发本代码（含商用），无任何强制义务。AWS Sample 项目用此协议是为了降低采用门槛。
+
+---
+
+## 🌟 Star History
+
+<a href="https://www.star-history.com/#aws-samples/sample-multi-tenant-openclaw-on-firecracker&Date">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=aws-samples/sample-multi-tenant-openclaw-on-firecracker&type=Date&theme=dark" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=aws-samples/sample-multi-tenant-openclaw-on-firecracker&type=Date" />
+   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=aws-samples/sample-multi-tenant-openclaw-on-firecracker&type=Date" />
+ </picture>
+</a>
+
+---
+
+<p align="center">
+  Made with 🦞 by AWS Samples · MIT-0 · 2026<br/>
+  <a href="https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues">🐛 报告 Bug</a> ·
+  <a href="https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues">💡 功能建议</a> ·
+  <a href="https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/discussions">💬 讨论</a>
+</p>

@@ -43,6 +43,7 @@ console/config.js
 # Config backups
 config.yml.bak
 *.bak
+*.bak.*
 
 # Agent / IDE state (per-developer)
 .omc/

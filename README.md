@@ -316,23 +316,23 @@ Features:
 
 ### Screenshots
 
-**Tenants** — vCPU / Memory / Disk progress bars on each running tenant, AZ column, Migrate button:
+**Tenants** — Hosts grouped by AZ on the left (each card showing CPU / Memory / VM count and overcommit ratios), tenants table with live vCPU / Memory / Disk progress bars per row, AZ column, gateway / health LEDs, and per-tenant Migrate button. AgentCore + Shared Skills surfaces collapsed at the top:
 
 ![Tenants tab](docs/web_console.png)
 
-**Application** — Shared Skills + MCP Tools (the latter surfaces when AgentCore is enabled, listing each Lambda-backed tool registered with the Gateway):
+**Application** — Config Templates manager + MCP Tools card (auto-populated via AgentCore Gateway, surfacing every Lambda-backed tool registered with the gateway: name, description, input schema) + Shared Skills with per-skill S3 deep-links:
 
 ![Application tab](docs/web_console_application.png)
 
-**Monitoring** — observability page: AMP/Grafana status, full per-VM Prometheus gauge inventory with types + labels + descriptions, copy-pasteable PromQL examples, AMP / Grafana endpoints:
+**Monitoring** — observability page: AMP / Grafana / SNS status, full per-VM Prometheus gauge inventory with types + labels + descriptions, copy-pasteable sample PromQL queries, and AMP `remote_write` / Grafana endpoints:
 
 ![Monitoring tab](docs/web_console_monitoring.png)
 
-**Backups** — cross-tenant explorer; orphan backups (from deleted tenants) are still restorable into a fresh tenant:
+**Backups** — cross-tenant explorer marking active vs orphan backups (orphan = source tenant deleted, but the backup is still restorable into a fresh tenant). 7-day S3 lifecycle by default:
 
 ![Backups tab](docs/web_console_backup.png)
 
-**Settings** — at-a-glance infrastructure status: multi-AZ HA, Prometheus + Grafana, AWS WAF, Cognito + RBAC, SNS lifecycle events, per-tenant quotas, host overcommit ratios, and a live Fleet-by-AZ table:
+**Settings** — at-a-glance infrastructure status: API connection, AgentCore Gateway URL, Multi-AZ HA, Prometheus + Grafana, AWS WAF, Cognito + RBAC, SNS lifecycle events, per-tenant quotas, host overcommit ratios, and a live **Fleet by AZ** table showing how hosts and VMs are spread across availability zones:
 
 ![Settings tab](docs/web_console_settings.png)
 

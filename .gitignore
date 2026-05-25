@@ -56,4 +56,6 @@ blog*.md
 blog*.docx
 
 # Temp files
-~$*
+2026-*.md
+
+docs/v132-screenshots/

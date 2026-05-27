@@ -529,6 +529,22 @@ def tenant_action(tenant_id, action, body=None):
         target = hosts_table.get_item(Key={"instance_id": target_host_id}).get("Item")
         if not target:
             return _resp(404, {"error": f"target host {target_host_id} not found"})
+        if target.get("status") in ("draining", "deleted"):
+            return _resp(409, {"error": f"target host {target_host_id} is {target['status']}"})
+
+        # Capacity check — same allocatable formula as _find_host().
+        vcpu = int(item.get("vcpu", 0))
+        mem_mb = int(item.get("mem_mb", 0))
+        allocatable_vcpu = int(int(target["total_vcpu"]) * CPU_OVERCOMMIT_RATIO)
+        free_vcpu = allocatable_vcpu - int(target.get("used_vcpu", 0))
+        allocatable_mem = int(int(target["total_mem_mb"]) * MEM_OVERCOMMIT_RATIO)
+        free_mem = allocatable_mem - int(target.get("used_mem_mb", 0))
+        if free_vcpu < vcpu or free_mem < mem_mb:
+            return _resp(409, {"error": (
+                f"target host has insufficient capacity "
+                f"(free vcpu={free_vcpu}, free mem={free_mem}MB; "
+                f"need vcpu={vcpu}, mem={mem_mb}MB)"
+            )})
 
         vm_num = int(item.get("vm_num", 1))
         bucket = os.environ.get("ASSETS_BUCKET", "")
@@ -547,7 +563,7 @@ def tenant_action(tenant_id, action, body=None):
                   f"/home/ubuntu/migrate-vm.sh restore {tenant_id} {target_vm_num} "
                   f"s3://{bucket}/{snap_prefix}")
 
-        # 3) Update DDB: tenant.host_id flips, source.vm_count--, target.vm_count++.
+        # 3) Update DDB: tenant.host_id flips, source counters --, target counters ++.
         now = _now()
         tenants_table.update_item(
             Key={"id": tenant_id},
@@ -556,6 +572,24 @@ def tenant_action(tenant_id, action, body=None):
             ExpressionAttributeValues={
                 ":h": target_host_id, ":n": target_vm_num,
                 ":s": source_host_id, ":t": now,
+            },
+        )
+        hosts_table.update_item(
+            Key={"instance_id": source_host_id},
+            UpdateExpression=("SET used_vcpu = used_vcpu - :v, "
+                              "used_mem_mb = used_mem_mb - :m, "
+                              "vm_count = vm_count - :one"),
+            ExpressionAttributeValues={":v": vcpu, ":m": mem_mb, ":one": 1},
+        )
+        hosts_table.update_item(
+            Key={"instance_id": target_host_id},
+            UpdateExpression=("SET used_vcpu = used_vcpu + :v, "
+                              "used_mem_mb = used_mem_mb + :m, "
+                              "vm_count = vm_count + :one, "
+                              "next_vm_num = :next"),
+            ExpressionAttributeValues={
+                ":v": vcpu, ":m": mem_mb, ":one": 1,
+                ":next": target_vm_num + 1,
             },
         )
 

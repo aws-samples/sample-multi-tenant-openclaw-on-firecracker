@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.3.3] — 2026-05-27
+
+Migrate-path correctness fixes — two latent bugs since v1.2.0 that surfaced during production demo verification.
+
+### Fixed
+
+- **`POST /tenants/{id}/migrate` didn't update host capacity counters (#59).** The code comment at `deploy/lambda/api/handler.py:550` said *"source.vm_count--, target.vm_count++"* but the implementation was missing entirely. Source host kept showing fictional `vm_count / used_vcpu / used_mem_mb` after a successful migrate; target host counters never incremented. Drift accumulated over every migrate, eventually corrupting `_find_host()` capacity scheduling and the console host cards. Same partial-update bug existed in AZ failover (`deploy/lambda/health_check/handler.py:567`) — target got `vm_count + 1` but `used_vcpu` / `used_mem_mb` were never bumped. Both paths now write all three fields in a single atomic update.
+- **`POST /tenants/{id}/migrate` didn't validate target host capacity (#60).** The endpoint only checked that the target existed and differed from the source. It would happily accept a `vcpu=2` tenant onto a host with 1 vCPU free, pushing the host past its configured `cpu_overcommit_ratio`. Added the same allocatable-vs-used check that `_find_host()` already uses. Returns **409** with explicit `(free vcpu=N, free mem=M; need vcpu=X, mem=Y)` when the migrate would exceed capacity, and **409** when the target is `draining` / `deleted`.
+
+### Added
+
+- **4 regression tests in `tests/test_migration.py`:** `test_updates_both_host_counters`, `test_rejects_insufficient_vcpu`, `test_rejects_insufficient_mem`, `test_rejects_draining_target`. Existing migration test fixtures gained `total_vcpu` / `total_mem_mb` / `status` fields to match real `init-host.sh` writes.
+
+### Verified end-to-end on real AWS (this exact tag)
+
+Demo deployment in `ap-northeast-1`:
+- ✅ Migrated `migrate-test-1-60e4` (vcpu=2, mem=4096) from `i-07acc…` (used 7/3 vcpu, 14336 mem) to `i-0b1c…` (used 2/4 vcpu, 4096 mem). Source host counters dropped to `vms=3, used_vcpu=5, used_mem=10240`; target rose to `vms=2, used_vcpu=4, used_mem=8192`. Math matches exactly.
+- ✅ Attempted migrate `nhost-70f2` (vcpu=2) to `i-07acc…` (only 1 vcpu free): rejected with `409 target host has insufficient capacity (free vcpu=1, free mem=11264MB; need vcpu=2, mem=4096MB)`.
+- ✅ Same-host migrate still rejected with `400 target_host_id must be different from source` (existing logic preserved).
+
+### Test status
+
+- **455 passed / 0 failed / 0 skipped** locally (451 baseline + 4 new regression tests).
+
 ## [1.3.2] — 2026-05-24
 
 **The release that takes "AZ failover" from "happy-path works" to "really works under all the messy real-world race conditions".** v1.3.1 nailed the basic end-to-end path (1 tenant in 1 dead AZ → comes up in another AZ). v1.3.2 fixes everything that breaks when you push it: concurrent Lambda invocations, multiple tenants in the same dead AZ, transient kernel races, host-agent auto-recovery overlap with Lambda's own SSM commands. Plus a new SSM-failure verification probe that distinguishes "launch-vm.sh actually failed" from "SSM exit code is misleading because host-agent already salvaged it".

@@ -157,7 +157,8 @@ class TestMigrationOrchestration:
         handler.hosts_table.get_item.return_value = {
             "Item": {"instance_id": "i-target", "private_ip": "10.0.0.5",
                      "next_vm_num": 1, "used_vcpu": 0, "used_mem_mb": 0,
-                     "vm_count": 0},
+                     "vm_count": 0, "total_vcpu": 4, "total_mem_mb": 16384,
+                     "status": "active"},
         }
         with patch.object(handler, "_ssm_send") as mock_send:
             mock_send.return_value = "cmd-123"
@@ -179,7 +180,8 @@ class TestMigrationOrchestration:
         handler.hosts_table.get_item.return_value = {
             "Item": {"instance_id": "i-target", "private_ip": "10.0.0.5",
                      "next_vm_num": 1, "used_vcpu": 0, "used_mem_mb": 0,
-                     "vm_count": 0},
+                     "vm_count": 0, "total_vcpu": 4, "total_mem_mb": 16384,
+                     "status": "active"},
         }
         with patch.object(handler, "_ssm_send") as mock_send:
             mock_send.return_value = "cmd-1"
@@ -198,7 +200,8 @@ class TestMigrationOrchestration:
         handler.hosts_table.get_item.return_value = {
             "Item": {"instance_id": "i-target", "private_ip": "10.0.0.5",
                      "next_vm_num": 1, "used_vcpu": 0, "used_mem_mb": 0,
-                     "vm_count": 0},
+                     "vm_count": 0, "total_vcpu": 4, "total_mem_mb": 16384,
+                     "status": "active"},
         }
         handler.tenants_table.update_item.reset_mock()
         with patch.object(handler, "_ssm_send", return_value="cmd-1"):
@@ -212,3 +215,98 @@ class TestMigrationOrchestration:
                 updated = True
                 break
         assert updated, "tenant.host_id was not updated to i-target"
+
+    def test_updates_both_host_counters(self):
+        """Regression: #59 — migrate must -= source counters, += target counters."""
+        handler.tenants_table.get_item.return_value = {
+            "Item": {"id": "t1", "host_id": "i-source", "vm_num": 1,
+                     "vcpu": 2, "mem_mb": 4096, "status": "running"},
+        }
+        handler.hosts_table.get_item.return_value = {
+            "Item": {"instance_id": "i-target", "private_ip": "10.0.0.5",
+                     "next_vm_num": 1, "used_vcpu": 0, "used_mem_mb": 0,
+                     "vm_count": 0, "total_vcpu": 4, "total_mem_mb": 16384,
+                     "status": "active"},
+        }
+        handler.hosts_table.update_item.reset_mock()
+        with patch.object(handler, "_ssm_send", return_value="cmd-1"):
+            ev = _migrate_event("t1", body={"target_host_id": "i-target"})
+            handler.lambda_handler(ev, None)
+
+        calls_by_host = {}
+        for c in handler.hosts_table.update_item.call_args_list:
+            iid = c.kwargs.get("Key", {}).get("instance_id")
+            calls_by_host.setdefault(iid, []).append(c)
+        assert "i-source" in calls_by_host, "source host was not updated"
+        assert "i-target" in calls_by_host, "target host was not updated"
+
+        # Source decrements
+        src_expr = " ".join(c.kwargs["UpdateExpression"] for c in calls_by_host["i-source"])
+        assert "used_vcpu - :v" in src_expr
+        assert "used_mem_mb - :m" in src_expr
+        assert "vm_count - :one" in src_expr
+
+        # Target increments
+        tgt_expr = " ".join(c.kwargs["UpdateExpression"] for c in calls_by_host["i-target"])
+        assert "used_vcpu + :v" in tgt_expr
+        assert "used_mem_mb + :m" in tgt_expr
+        assert "vm_count + :one" in tgt_expr
+
+
+# ═══════════════════════════════════════════
+# Capacity check (issue #60)
+# ═══════════════════════════════════════════
+
+
+@pytest.mark.unit
+class TestMigrationCapacityCheck:
+    """Regression: #60 — migrate must reject targets without free vcpu/mem."""
+
+    def _set_tenant_and_target(self, target_used_vcpu=0, target_used_mem_mb=0,
+                                target_total_vcpu=4, target_total_mem_mb=16384,
+                                target_status="active"):
+        handler.tenants_table.get_item.return_value = {
+            "Item": {"id": "t1", "host_id": "i-source", "vm_num": 1,
+                     "vcpu": 2, "mem_mb": 4096, "status": "running"},
+        }
+        handler.hosts_table.get_item.return_value = {
+            "Item": {"instance_id": "i-target", "private_ip": "10.0.0.5",
+                     "next_vm_num": 1,
+                     "used_vcpu": target_used_vcpu,
+                     "used_mem_mb": target_used_mem_mb,
+                     "vm_count": 1,
+                     "total_vcpu": target_total_vcpu,
+                     "total_mem_mb": target_total_mem_mb,
+                     "status": target_status},
+        }
+
+    def test_rejects_insufficient_vcpu(self):
+        # Tenant needs vcpu=2. Build target with allocatable < 2.
+        # allocatable = total_vcpu × CPU_OVERCOMMIT_RATIO; pick numbers that
+        # work regardless of overcommit ratio: total_vcpu=1, used=0 → max
+        # allocatable is `total_vcpu × ratio`, but for any ratio ≤ 2 the free
+        # vcpu is at most 2 and used_vcpu raises that. We force free < 2 by
+        # setting used_vcpu high relative to total.
+        self._set_tenant_and_target(target_total_vcpu=1, target_used_vcpu=1)
+        ev = _migrate_event("t1", body={"target_host_id": "i-target"})
+        with patch.object(handler, "_ssm_send"):
+            r = handler.lambda_handler(ev, None)
+        assert r["statusCode"] == 409, f"expected 409 got {r}"
+        assert "capacity" in r["body"].lower() or "vcpu" in r["body"].lower()
+
+    def test_rejects_insufficient_mem(self):
+        # Tenant needs mem_mb=4096. Set used close to total so free < 4096.
+        self._set_tenant_and_target(target_total_mem_mb=4096, target_used_mem_mb=3000)
+        ev = _migrate_event("t1", body={"target_host_id": "i-target"})
+        with patch.object(handler, "_ssm_send"):
+            r = handler.lambda_handler(ev, None)
+        assert r["statusCode"] == 409
+        assert "capacity" in r["body"].lower() or "mem" in r["body"].lower()
+
+    def test_rejects_draining_target(self):
+        self._set_tenant_and_target(target_status="draining")
+        ev = _migrate_event("t1", body={"target_host_id": "i-target"})
+        with patch.object(handler, "_ssm_send"):
+            r = handler.lambda_handler(ev, None)
+        assert r["statusCode"] == 409
+        assert "draining" in r["body"].lower()

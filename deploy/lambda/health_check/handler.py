@@ -580,10 +580,15 @@ def _failover_tenant_to_host(tenant, target_host, source_az, now):
         try:
             hosts_table.update_item(
                 Key={"instance_id": target_host_id},
-                UpdateExpression="SET next_vm_num = :n, vm_count = if_not_exists(vm_count, :z) + :one",
+                UpdateExpression=("SET next_vm_num = :n, "
+                                  "vm_count = if_not_exists(vm_count, :z) + :one, "
+                                  "used_vcpu = if_not_exists(used_vcpu, :z) + :v, "
+                                  "used_mem_mb = if_not_exists(used_mem_mb, :z) + :m"),
                 ExpressionAttributeValues={
                     ":n": target_vm_num + 1,
                     ":one": 1,
+                    ":v": vcpu,
+                    ":m": mem_mb,
                     ":z": 0,
                 },
             )

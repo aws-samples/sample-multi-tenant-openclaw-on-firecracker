@@ -941,7 +941,21 @@ class OpenClawOrchestratorStack(cdk.Stack):
             resources=["*"],
         ))
 
-        # ========== CloudFront (HTTPS without custom domain) ==========
+        # ========== CloudFront ==========
+        # 1.3.4 (#61): support two-distribution mode for security boundary between
+        # operator console and per-tenant dashboards. Configured via:
+        #
+        #   cloudfront:
+        #     console_domain: "console.example.com"     # operator console (S3)
+        #     console_cert_arn: "arn:aws:acm:us-east-1:..."
+        #     app_domain:     "app.example.com"         # per-tenant dashboards (ALB)
+        #     app_cert_arn:   "arn:aws:acm:us-east-1:..."
+        #
+        # If both pairs are set → DUAL mode: two distinct CloudFront distributions
+        # with independent ACM certs. Cognito session cookie scoped to console_domain
+        # only — tenant dashboards on app_domain physically cannot read it.
+        # If unset (or only legacy custom_domain set) → LEGACY single-distribution
+        # mode, kept for backward-compat with v1.3.3 and earlier deployments.
         s3_origin = origins.S3BucketOrigin.with_origin_access_control(assets_bucket)
         # CloudFront Function: rewrite /console/ → /console/index.html, / → /console/index.html
         url_rewrite_fn = cloudfront.Function(self, "UrlRewrite",
@@ -960,38 +974,26 @@ function handler(event) {
 }"""),
         )
 
-        # Optional: custom domain + ACM certificate (cert must be in us-east-1)
         cf_cfg = CFG.get("cloudfront", {}) or {}
+        # ----- DUAL mode candidates -----
+        console_domain = (cf_cfg.get("console_domain") or "").strip()
+        console_cert_arn = (cf_cfg.get("console_cert_arn") or "").strip()
+        app_domain = (cf_cfg.get("app_domain") or "").strip()
+        app_cert_arn = (cf_cfg.get("app_cert_arn") or "").strip()
+        dual_mode = bool(console_domain and console_cert_arn and app_domain and app_cert_arn)
+        # ----- LEGACY single-domain fallback -----
         custom_domain = (cf_cfg.get("custom_domain") or "").strip()
         acm_cert_arn = (cf_cfg.get("acm_cert_arn") or "").strip()
-        domain_names = [custom_domain] if custom_domain else None
-        certificate = (
-            acm.Certificate.from_certificate_arn(self, "CustomCert", acm_cert_arn)
-            if custom_domain and acm_cert_arn else None
-        )
 
-        cf_distribution = cloudfront.Distribution(self, "DashboardCF",
-            comment="OpenClaw Dashboard",
-            domain_names=domain_names,
-            certificate=certificate,
-            default_behavior=cloudfront.BehaviorOptions(
-                origin=origins.HttpOrigin(alb.load_balancer_dns_name,
-                    protocol_policy=cloudfront.OriginProtocolPolicy.HTTP_ONLY,
-                    http_port=80,
-                    read_timeout=Duration.seconds(60),
-                    keepalive_timeout=Duration.seconds(60),
-                ),
-                viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-                allowed_methods=cloudfront.AllowedMethods.ALLOW_ALL,
-                cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
-                origin_request_policy=cloudfront.OriginRequestPolicy.ALL_VIEWER,
-                function_associations=[cloudfront.FunctionAssociation(
-                    function=url_rewrite_fn,
-                    event_type=cloudfront.FunctionEventType.VIEWER_REQUEST,
-                )],
-            ),
-            additional_behaviors={
-                "/console/*": cloudfront.BehaviorOptions(
+        if dual_mode:
+            # ===== DUAL mode: two distributions, two certs, two aliases =====
+            # Distribution A: console — S3 origin only, /console/* + redirect / → /console/
+            console_cf = cloudfront.Distribution(self, "ConsoleCF",
+                comment="OpenClaw Operator Console",
+                domain_names=[console_domain],
+                certificate=acm.Certificate.from_certificate_arn(
+                    self, "ConsoleCert", console_cert_arn),
+                default_behavior=cloudfront.BehaviorOptions(
                     origin=s3_origin,
                     viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
                     cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
@@ -1000,12 +1002,80 @@ function handler(event) {
                         event_type=cloudfront.FunctionEventType.VIEWER_REQUEST,
                     )],
                 ),
-            },
-            default_root_object="",
-        )
+                default_root_object="",
+            )
+            # Distribution B: per-tenant dashboards — ALB origin only, /vm/*
+            app_cf = cloudfront.Distribution(self, "AppCF",
+                comment="OpenClaw Per-Tenant Dashboards",
+                domain_names=[app_domain],
+                certificate=acm.Certificate.from_certificate_arn(
+                    self, "AppCert", app_cert_arn),
+                default_behavior=cloudfront.BehaviorOptions(
+                    origin=origins.HttpOrigin(alb.load_balancer_dns_name,
+                        protocol_policy=cloudfront.OriginProtocolPolicy.HTTP_ONLY,
+                        http_port=80,
+                        read_timeout=Duration.seconds(60),
+                        keepalive_timeout=Duration.seconds(60),
+                    ),
+                    viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+                    allowed_methods=cloudfront.AllowedMethods.ALLOW_ALL,
+                    cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
+                    origin_request_policy=cloudfront.OriginRequestPolicy.ALL_VIEWER,
+                ),
+                default_root_object="",
+            )
+            console_host = console_domain
+            dashboard_host = app_domain
+            console_cf_id = console_cf.distribution_id
+            app_cf_id = app_cf.distribution_id
+            cf_distribution = console_cf  # for downstream Cognito wiring
+        else:
+            # ===== LEGACY single-distribution mode =====
+            domain_names = [custom_domain] if custom_domain else None
+            certificate = (
+                acm.Certificate.from_certificate_arn(self, "CustomCert", acm_cert_arn)
+                if custom_domain and acm_cert_arn else None
+            )
 
-        # Dashboard URL — prefer custom domain when configured
-        dashboard_host = custom_domain if custom_domain else cf_distribution.distribution_domain_name
+            cf_distribution = cloudfront.Distribution(self, "DashboardCF",
+                comment="OpenClaw Dashboard (single-domain mode)",
+                domain_names=domain_names,
+                certificate=certificate,
+                default_behavior=cloudfront.BehaviorOptions(
+                    origin=origins.HttpOrigin(alb.load_balancer_dns_name,
+                        protocol_policy=cloudfront.OriginProtocolPolicy.HTTP_ONLY,
+                        http_port=80,
+                        read_timeout=Duration.seconds(60),
+                        keepalive_timeout=Duration.seconds(60),
+                    ),
+                    viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+                    allowed_methods=cloudfront.AllowedMethods.ALLOW_ALL,
+                    cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
+                    origin_request_policy=cloudfront.OriginRequestPolicy.ALL_VIEWER,
+                    function_associations=[cloudfront.FunctionAssociation(
+                        function=url_rewrite_fn,
+                        event_type=cloudfront.FunctionEventType.VIEWER_REQUEST,
+                    )],
+                ),
+                additional_behaviors={
+                    "/console/*": cloudfront.BehaviorOptions(
+                        origin=s3_origin,
+                        viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+                        cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
+                        function_associations=[cloudfront.FunctionAssociation(
+                            function=url_rewrite_fn,
+                            event_type=cloudfront.FunctionEventType.VIEWER_REQUEST,
+                        )],
+                    ),
+                },
+                default_root_object="",
+            )
+
+            # Single mode: console and dashboard share the same host
+            console_host = custom_domain or cf_distribution.distribution_domain_name
+            dashboard_host = console_host
+            console_cf_id = cf_distribution.distribution_id
+            app_cf_id = cf_distribution.distribution_id
 
         # ========== Console Auth (Cognito) ==========
         auth_cfg = CFG.get("console_auth", {})
@@ -1013,11 +1083,19 @@ function handler(event) {
         if auth_cfg.get("enabled", False):
             existing_pool_id = auth_cfg.get("user_pool_id", "")
 
-            # Callback URLs are needed by both branches
-            cf_default = cf_distribution.distribution_domain_name
-            callback_urls = [f"https://{cf_default}/console/index.html"]
-            if custom_domain:
-                callback_urls.append(f"https://{custom_domain}/console/index.html")
+            # 1.3.4: callback URLs only target the console host (where the
+            # operator actually logs in). In dual-mode, app_domain is NOT
+            # listed here — the Cognito session cookie is therefore physically
+            # scoped to console_domain and cannot be sent to per-tenant
+            # dashboards on app_domain.
+            callback_urls = [f"https://{console_host}/console/index.html"]
+            # In legacy single-mode, also add the *.cloudfront.net default
+            # so direct CF URL access still works during DNS migration.
+            if not dual_mode and not custom_domain:
+                pass  # console_host is already cf default domain
+            elif not dual_mode and custom_domain:
+                callback_urls.append(
+                    f"https://{cf_distribution.distribution_domain_name}/console/index.html")
 
             if existing_pool_id:
                 # Import the existing pool but recreate the domain + client as stack-owned resources.
@@ -1102,8 +1180,16 @@ function handler(event) {
             "HostsTable": hosts_table.table_name,
             "AssetsBucket": assets_bucket.bucket_name,
             "HostInstanceProfileArn": instance_profile.attr_arn,
+            # 1.3.4: dual-mode outputs.
+            #   ConsoleUrl    — operator console (Cognito-protected, S3-served)
+            #   DashboardUrl  — per-tenant dashboards (ALB-served, app_domain in dual mode)
+            # In legacy single-mode the two URLs are equal and point to the
+            # combined CloudFront distribution, preserving backward compat.
+            "ConsoleUrl": f"https://{console_host}",
             "DashboardUrl": f"https://{dashboard_host}",
-            "CloudfrontDistributionId": cf_distribution.distribution_id,
+            "DualDomainMode": "true" if dual_mode else "false",
+            "CloudfrontDistributionId": console_cf_id,
+            "AppCloudfrontDistributionId": app_cf_id,
             **({"NotificationsTopicArn": notifications_topic_arn} if notifications_topic_arn else {}),
             **cognito_outputs,
         }.items():

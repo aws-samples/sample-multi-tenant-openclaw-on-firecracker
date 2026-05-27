@@ -527,7 +527,48 @@ curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" -d '{
 </details>
 
 <details>
-<summary><b>Custom Domain — bind ACM + CloudFront</b></summary>
+<summary><b>🔐 Multi-Domain Setup — Security Hardening (v1.3.4+, recommended for production)</b></summary>
+
+**Why split domains?** When `console/*` and `vm/*` share one CloudFront distribution and one domain:
+
+- Cognito session cookie is set on the parent domain → automatically sent to `/vm/*` requests
+- A tenant dashboard rendering unescaped user input (XSS) gets full same-origin access to the operator console DOM → can steal admin tokens
+- All tenant dashboards share the same blast radius
+
+**Dual-domain mode** creates two independent CloudFront distributions, each with its own ACM cert. Cognito session cookie is physically scoped to `console_domain` and cannot be sent to `app_domain` — browser policy enforces this at the protocol level.
+
+```bash
+# Prerequisites:
+#   1. Request TWO ACM certs in us-east-1 (one for console_domain, one for app_domain)
+#   2. CNAME both domains to their respective CloudFront distributions after deploy
+
+./setup.sh ap-northeast-1 lab \
+  --console-domain console.example.com --console-cert arn:aws:acm:us-east-1:xxx:certificate/console-xxx \
+  --app-domain     app.example.com     --app-cert     arn:aws:acm:us-east-1:xxx:certificate/app-xxx
+```
+
+After deploy, `setup.sh` prints two distinct URLs:
+
+```
+→ Console URL:    https://console.example.com/console/index.html  (operator login)
+→ Dashboard URL:  https://app.example.com/vm/<tenant-id>/         (per-tenant)
+  ✓ Dual-domain mode active — Cognito session physically isolated from tenant dashboards
+```
+
+| Property | Single-domain (legacy) | **Dual-domain (recommended)** |
+|---|---|---|
+| CloudFront distributions | 1 | 2 |
+| ACM certificates | 1 | 2 |
+| Cookie scope | shared origin | **console_domain only** |
+| XSS blast radius | all dashboards + console | tenant only |
+| `OC_CONSOLE_BASE` / `OC_DASHBOARD_BASE` | same | different |
+
+The legacy `--domain` / `--cert` flags still work for dev/sample deployments.
+
+</details>
+
+<details>
+<summary><b>Custom Domain — bind ACM + CloudFront (legacy single-domain mode)</b></summary>
 
 ```bash
 # Prerequisites:
@@ -647,7 +688,37 @@ source .env.deploy && ./build-rootfs.sh <new_version>
 # New tenants use the new rootfs immediately; existing tenants need a `reset` API call to switch over.
 ```
 
-### Latest: v1.3.1 → **v1.3.2** (recommended for any multi-tenant deployment)
+### Latest: v1.3.3 → **v1.3.4** (security hardening — recommended for any production multi-tenant deployment)
+
+v1.3.4 fixes [#61](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/61): operator console (`/console/*`) and per-tenant dashboards (`/vm/*`) used to share one CloudFront distribution and one domain, meaning the Cognito session cookie was sent to tenant DOM. v1.3.4 adds a **dual-domain mode** that creates two independent CloudFront distributions with two ACM certs — the Cognito session cookie is physically scoped to `console_domain` and the browser will not send it to `app_domain`.
+
+**Backward compatible**: existing v1.3.3 deployments without the new fields continue to work unchanged in legacy single-domain mode. **No forced migration**, but production multi-tenant deployments are strongly recommended to switch.
+
+```bash
+# Prepare two ACM certs in us-east-1 for console_domain and app_domain.
+git pull && ./setup.sh <region> <profile> \
+  --console-domain console.example.com --console-cert <acm-arn> \
+  --app-domain     app.example.com     --app-cert     <acm-arn>
+```
+
+After redeploy:
+
+- Setup prints **two distinct URLs** — operator console (Cognito-protected) and per-tenant dashboard
+- `OC_CONSOLE_BASE` and `OC_DASHBOARD_BASE` injected into `console/config.js` separately
+- `DualDomainMode: true` in CloudFormation outputs
+- See [Multi-Domain Setup](#-advanced-topics) in Advanced Topics for full security rationale
+
+### v1.3.2 → v1.3.3 (host capacity counter consistency)
+
+v1.3.3 fixes [#59](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/59) and [#60](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/60): the `/migrate` API didn't update host capacity counters (source `used_vcpu` not decremented, target not incremented) and didn't preflight target capacity. v1.3.3 adds both, plus extends AZ failover to update the target's `used_vcpu` / `used_mem_mb` (was only `vm_count`).
+
+```bash
+git pull && ./setup.sh <region> <profile>
+```
+
+No data migration needed — the fix only affects new migrations after deploy. 4 new regression tests in `tests/test_migration.py`.
+
+### v1.3.1 → **v1.3.2** (recommended for any multi-tenant deployment)
 
 v1.3.2 fixes everything that surfaces under real load: concurrent Lambda invocations, multi-tenant batch failover, transient kernel races, host-agent ⇄ Lambda race conditions where SSM exit code disagrees with VM truth.
 

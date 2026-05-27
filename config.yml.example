@@ -105,8 +105,23 @@ console_auth:
   # user_pool_id: ""              # 复用已有 User Pool（留空自动创建）
 
 # ========== CloudFront 自定义域名 (可选) ==========
-# 可通过 ./setup.sh <region> <profile> --domain <domain> --cert <acm-arn> 一键配置
+# 1.3.4+ 推荐使用双域名模式分离 console 和 tenant dashboard，物理隔离 Cognito
+# session 与租户应用代码（防 XSS / cookie 跨域风险）。
+#
+#   双域名模式（推荐生产用）：
+#     ./setup.sh <region> <profile> \
+#       --console-domain console.example.com --console-cert <acm-arn> \
+#       --app-domain     app.example.com     --app-cert     <acm-arn>
+#
+#   单域名模式（legacy / dev-only）：
+#     ./setup.sh <region> <profile> --domain <domain> --cert <acm-arn>
 cloudfront:
+  # ----- 双域名模式（v1.3.4+ 推荐） -----
+  console_domain: ""               # 例: console.aws.xin（操作员控制台）
+  console_cert_arn: ""             # us-east-1 ACM cert ARN
+  app_domain: ""                   # 例: app.aws.xin（per-tenant dashboard）
+  app_cert_arn: ""                 # us-east-1 ACM cert ARN
+  # ----- 单域名模式（legacy 兼容） -----
   custom_domain: ""                # 例: claw.aws.xin，留空则使用默认 *.cloudfront.net
   acm_cert_arn: ""                 # us-east-1 ACM 证书 ARN (CloudFront 必须 us-east-1)
 

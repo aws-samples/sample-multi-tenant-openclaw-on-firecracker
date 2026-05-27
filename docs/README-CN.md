@@ -527,7 +527,48 @@ curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" -d '{
 </details>
 
 <details>
-<summary><b>自定义域名 — 绑定 ACM + CloudFront</b></summary>
+<summary><b>🔐 双域名安全分离（v1.3.4+，生产环境强烈推荐）</b></summary>
+
+**为什么要分？** 当 `console/*` 和 `vm/*` 共用一个 CloudFront + 一个域名时：
+
+- Cognito session cookie 设在父域 → 自动发给 `/vm/*` 请求
+- 某个租户 dashboard 渲染未转义的输入（XSS）→ 同源策略下能访问 console DOM → 偷走 admin token
+- 一个租户被攻破 = 全平台 admin 权限沦陷
+
+**双域名模式**：创建两个独立的 CloudFront distribution，各自 ACM cert。Cognito session cookie 物理 scope 到 `console_domain`，浏览器原生不允许把它发到 `app_domain`。
+
+```bash
+# 前置条件：
+#   1. 在 us-east-1 申请 2 张 ACM 证书（console_domain 一张，app_domain 一张）
+#   2. 部署后把两个域名分别 CNAME 到对应的 CloudFront
+
+./setup.sh ap-northeast-1 lab \
+  --console-domain console.example.com --console-cert arn:aws:acm:us-east-1:xxx:certificate/console-xxx \
+  --app-domain     app.example.com     --app-cert     arn:aws:acm:us-east-1:xxx:certificate/app-xxx
+```
+
+部署完成后 `setup.sh` 会打印两个独立的 URL：
+
+```
+→ Console URL:    https://console.example.com/console/index.html  (操作员登录)
+→ Dashboard URL:  https://app.example.com/vm/<tenant-id>/         (每租户)
+  ✓ Dual-domain mode active — Cognito session 物理隔离于 tenant dashboards
+```
+
+| 属性 | 单域名（legacy）| **双域名（推荐）** |
+|---|---|---|
+| CloudFront 分发数 | 1 | 2 |
+| ACM 证书数 | 1 | 2 |
+| Cookie scope | 共享同源 | **仅 console_domain** |
+| XSS 影响范围 | 全 dashboard + console | 单租户 |
+| `OC_CONSOLE_BASE` / `OC_DASHBOARD_BASE` | 相同 | 不同 |
+
+老的 `--domain` / `--cert` 仍兼容（适合 dev / sample 部署）。
+
+</details>
+
+<details>
+<summary><b>自定义域名 — 绑定 ACM + CloudFront（legacy 单域名模式）</b></summary>
 
 ```bash
 # 前置条件：
@@ -646,6 +687,36 @@ source .env.deploy && ./build-rootfs.sh <new_version>
 
 # 新建 tenant 立刻用新 rootfs；已有 tenant 调 `reset` API 才会切换。
 ```
+
+### 最新：v1.3.3 → **v1.3.4**（安全加固 — 任何生产多租户部署强烈推荐）
+
+v1.3.4 修复 [#61](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/61)：v1.3.3 及之前的版本里，操作员控制台（`/console/*`）和每个租户的 dashboard（`/vm/*`）共用一个 CloudFront + 一个域名，意味着 Cognito session cookie 会被发到 tenant DOM 上。v1.3.4 引入**双域名模式**：创建两个独立的 CloudFront distribution + 两张 ACM cert，Cognito session cookie 物理上 scope 到 `console_domain`，浏览器不会把它发到 `app_domain`。
+
+**向前兼容**：v1.3.3 老部署不设新字段时继续用 legacy 单域名模式。**不强制迁移**，但生产多租户部署强烈建议切换。
+
+```bash
+# 在 us-east-1 准备两张 ACM 证书（console_domain 一张，app_domain 一张）
+git pull && ./setup.sh <region> <profile> \
+  --console-domain console.example.com --console-cert <acm-arn> \
+  --app-domain     app.example.com     --app-cert     <acm-arn>
+```
+
+部署后：
+
+- setup 打印**两个独立 URL** —— 操作员控制台（Cognito 鉴权）和每租户 dashboard
+- `OC_CONSOLE_BASE` 和 `OC_DASHBOARD_BASE` 在 `console/config.js` 里独立注入
+- CloudFormation outputs 多了 `DualDomainMode: true`
+- 完整安全推理见进阶主题里的 [双域名安全分离](#-进阶主题)
+
+### v1.3.2 → v1.3.3（host 容量计数器一致性）
+
+v1.3.3 修复 [#59](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/59) 和 [#60](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/60)：`/migrate` API 没更新 host 容量计数器（源 host `used_vcpu` 未减、目标 host 未加），也没做目标容量预检。v1.3.3 加上这两点，并把 AZ failover 也补上 `used_vcpu`/`used_mem_mb` 增量更新（之前只更新 `vm_count`）。
+
+```bash
+git pull && ./setup.sh <region> <profile>
+```
+
+无数据迁移需求 — 修复仅影响部署后的新迁移。`tests/test_migration.py` 加了 4 个回归测试。
 
 ### 最新：v1.3.1 → **v1.3.2**（强烈推荐任何多租户部署）
 

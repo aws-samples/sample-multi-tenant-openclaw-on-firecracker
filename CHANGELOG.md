@@ -1,5 +1,42 @@
 # Changelog
 
+## [1.3.4] — 2026-05-28
+
+Security hardening: split operator console domain from per-tenant dashboard domain so that the Cognito session cookie is physically scoped to the console origin and cannot reach tenant-rendered DOM.
+
+### Why this matters
+
+Pre-1.3.4 deployments serve `console/*` (operator login + admin actions) and `vm/*` (per-tenant dashboards rendered by tenant-controlled OpenClaw apps) from a single CloudFront distribution on a single domain. The Cognito session cookie set on the parent host is automatically sent on every `/vm/*` request — meaning any XSS in a tenant dashboard can read the operator's session, escalate to admin, and reach every other tenant. Same-origin policy, by design, doesn't isolate `/console/*` from `/vm/*`.
+
+The fix is structural rather than mitigation-stack: put the two surfaces on **two different origins** (different hostnames), so the browser itself refuses to send the console cookie to the tenant origin. This is closing #61.
+
+### Added
+
+- **Dual-domain mode for CloudFront** (#61). New `cloudfront.console_domain` / `console_cert_arn` / `app_domain` / `app_cert_arn` fields in `config.yml`. When all four are set, `stack.py` synthesizes **two distinct CloudFront distributions** (`ConsoleCF` for `/console/*` from S3, `AppCF` for `/vm/*` from ALB) each with its own ACM certificate. Cognito User Pool Client `CallbackURLs` lists **only** `console_domain` — the session cookie is therefore set with `Domain=console.example.com` and the browser refuses to send it to `app.example.com` per RFC 6265 origin scoping. Single-domain (legacy) mode remains the default and works unchanged for v1.3.3 and earlier deploys, so no forced migration.
+- **`setup.sh` accepts 4 new flags:** `--console-domain` / `--console-cert` / `--app-domain` / `--app-cert`. Old `--domain` / `--cert` continue to write the legacy `custom_domain` / `acm_cert_arn` fields. After deploy, setup prints two distinct URLs (or one in legacy mode) plus a security note nudging users toward dual-mode for production.
+- **`OC_CONSOLE_BASE` JS global** in `console/config.js` (alongside existing `OC_DASHBOARD_BASE`). `OC_COGNITO_REDIRECT_URI` is now derived from `CONSOLE_BASE` (was `DASHBOARD_URL`), so OAuth implicit-flow redirects always land on the console origin and never on the tenant origin even if an operator clicks an attacker-controlled link from a tenant page.
+- **`DualDomainMode` + `ConsoleUrl` + `AppCloudfrontDistributionId` CloudFormation outputs.** In legacy mode `ConsoleUrl == DashboardUrl` (preserves backward-compat for tooling that reads `DashboardUrl`).
+- **18 new unit tests in `tests/test_dual_domain.py`** covering: config schema, setup.sh flag parsing, dual-mode synthesis (2 distributions + correct aliases + outputs), legacy single-mode synthesis, partial dual-config falling back to legacy (don't half-deploy on accident), Cognito callback URLs containing only `console_domain` (the actual security boundary), legacy callback URLs still working.
+
+### Operator notes
+
+- **Backward compatible.** Existing deploys without the four new fields stay on single-distribution mode. No data migration. No forced redeploy. The 1.3.4 stack synthesizes byte-for-byte the same CloudFormation as 1.3.3 when none of the new fields are set.
+- **Recommended for production multi-tenant deployments.** Prepare two ACM certs in `us-east-1` (one each for the console and app domains), then:
+  ```bash
+  ./setup.sh <region> <profile> \
+    --console-domain console.example.com --console-cert <acm-arn> \
+    --app-domain     app.example.com     --app-cert     <acm-arn>
+  ```
+- **CNAME both domains to their respective CloudFront distributions** after deploy — the two distributions have different `*.cloudfront.net` defaults. `setup.sh` prints both URLs explicitly.
+- **The legacy `--domain` / `--cert` flags still work** for dev / sample / single-tenant deployments where the security split isn't needed.
+- **Existing tenant dashboard URLs change** if you migrate from legacy to dual-mode (they move from `claw.example.com/vm/<id>/` to `app.example.com/vm/<id>/`). Communicate to tenants before flipping.
+
+### Test status
+
+- **448 passed / 0 failed** locally on the v1.3.4 tag, including the 18 new dual-domain tests in `tests/test_dual_domain.py`.
+
+---
+
 ## [1.3.3] — 2026-05-27
 
 Migrate-path correctness fixes — two latent bugs since v1.2.0 that surfaced during production demo verification.

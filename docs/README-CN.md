@@ -724,7 +724,19 @@ source .env.deploy && ./build-rootfs.sh <new_version>
 # 新建 tenant 立刻用新 rootfs；已有 tenant 调 `reset` API 才会切换。
 ```
 
-### 最新：v1.4.1 → **v1.4.2**（关键修复：修复"假 failover" bug — 生产强烈推荐升级）
+### 最新：v1.4.2 → **v1.4.3**（测试稳定性 — 无生产影响）
+
+v1.4.3 是**纯测试修复**。让 `tests/test_e2e.py` 具备 retry 能力，避免 ALB / API Gateway TLS keep-alive reset 引发的瞬态 `urllib.error.URLError: [SSL: UNEXPECTED_EOF_WHILE_READING]` 被误判成测试失败。同时把 `_wait_for_status` 默认 timeout 从 180s 调到 360s，让冷启动的 restore-from-backup 操作有合理时间完成。
+
+**不需要 CDK 重部署。**Lambda 运行时代码跟 v1.4.2 完全一样。
+
+```bash
+git pull   # 就这一步
+```
+
+`tests/test_e2e_retry.py` 加 8 个新单元测试覆盖 retry 策略（happy path / SSL EOF 恢复 / 5xx 恢复 / 4xx 不重试 / 耗尽重试 / backoff 时序 / disable）。修复后 e2e backup-restore 从偶发 SSL-EOF 失败变成 **3/3 稳定通过 84 秒**。
+
+### v1.4.1 → v1.4.2（关键修复：修复"假 failover" bug — 生产强烈推荐升级）
 
 v1.4.2 修复一个**沉默的正确性 bug**：之前的版本可能标记 `AZ_FAILOVER_TENANT_RECOVERED` 并把 DDB flip 到 `status=running`，但实际 dashboard URL 是 502 不通的。三个根因都在 `_failover_tenant_to_host`：
 

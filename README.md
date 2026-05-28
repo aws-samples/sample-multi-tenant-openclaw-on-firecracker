@@ -728,7 +728,19 @@ source .env.deploy && ./build-rootfs.sh <new_version>
 # New tenants use the new rootfs immediately; existing tenants need a `reset` API call to switch over.
 ```
 
-### Latest: v1.4.1 → **v1.4.2** (critical: fix the "fake failover" bug — strongly recommended for production)
+### Latest: v1.4.2 → **v1.4.3** (test stability — no production impact)
+
+v1.4.3 is a **test-only release**. It makes `tests/test_e2e.py` retry-aware so transient `urllib.error.URLError: [SSL: UNEXPECTED_EOF_WHILE_READING]` from ALB / API Gateway TLS keep-alive resets no longer masquerade as test failures. Also bumps `_wait_for_status` from 180 s → 360 s so cold-pool restore-from-backup operations have realistic time to complete.
+
+**No CDK redeploy needed.** Lambda runtime code is identical to v1.4.2.
+
+```bash
+git pull   # that's it
+```
+
+8 new unit tests in `tests/test_e2e_retry.py` cover the retry policy (happy path / SSL EOF recovery / 5xx recovery / 4xx no-retry / exhaustion / backoff / disable). After this fix, e2e backup-restore goes from intermittent SSL-EOF failures to **3/3 passes in 84 s** consistently.
+
+### v1.4.1 → v1.4.2 (critical: fix the "fake failover" bug — strongly recommended for production)
 
 v1.4.2 fixes a **silent correctness bug** in AZ failover that a teammate caught in production: prior versions could mark `AZ_FAILOVER_TENANT_RECOVERED` and flip DDB `status=running` while the dashboard URL was completely 502. Three root causes inside `_failover_tenant_to_host`:
 

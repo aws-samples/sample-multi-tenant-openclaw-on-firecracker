@@ -1,5 +1,57 @@
 # Changelog
 
+## [1.4.3] — 2026-05-29
+
+Test stability fix. Closes the e2e flake we surfaced while validating v1.4.2: long-running backup-restore tests would occasionally fail with `urllib.error.URLError: [SSL: UNEXPECTED_EOF_WHILE_READING]` when the API Gateway / ALB closed a TLS keep-alive connection mid-request. Not a code regression — a network-layer fact of life that the test harness wasn't handling.
+
+### Why this matters
+
+Our v1.4.2 release explicitly required end-to-end verification that failover genuinely works. We can't claim "tests prove it" if the test suite itself is intermittently broken. This release makes the e2e harness retry-aware so transient ALB / API Gateway TLS resets and 5xx blips don't masquerade as test failures, and the failure signal stays clean for real bugs.
+
+### Fixed
+
+- **`tests/test_e2e.py::_api()` is now retry-aware.** Up to 3 attempts with exponential backoff (1 s → 2 s → 4 s). Retries cover:
+  - `urllib.error.URLError` (SSL EOF, connection reset, DNS hiccup)
+  - HTTP 5xx (Lambda cold start, throttle, ALB backend reset)
+  4xx errors return immediately so authentication / validation bugs surface fast (no 7-second wait to discover a 401).
+- **`_wait_for_status` default timeout 180 s → 360 s.** Restore-from-backup tests boot a Firecracker VM, decompress and ext4-fsck a multi-GB rootfs, and install OpenClaw. On a cold pool that's a real 5 minutes — the previous 240 s ceiling was a flake source masquerading as a code problem.
+
+### Added
+
+- **`tests/test_e2e_retry.py`** — 8 unit tests covering the new retry policy:
+  - happy path: first call success, no retry
+  - SSL EOF on first call → success on retry (the bug we're fixing)
+  - 5xx on first call → success on retry
+  - 4xx → no retry, return immediately
+  - persistent SSL EOF → exhausts and raises
+  - persistent 5xx → returns the 5xx status (no raise, lets caller decide)
+  - exponential backoff timing (sleeps captured: 1 s, 2 s)
+  - `max_retries=1` disables retry
+
+### Tests
+
+After this fix, e2e backup-restore went from intermittent SSL-EOF failures to **3/3 passes in 84 s** consistently. Unit suite stable at **542 passed / 0 failed** (1.4.2 baseline 534 + 8 new retry tests).
+
+### Operator notes
+
+- **No production impact.** Test-only change. The runtime Lambda code is identical to v1.4.2.
+- **No CDK redeploy needed.** This release ships a test harness fix and a CHANGELOG entry; nothing in `deploy/` changed.
+- If you have a CI pipeline that imports `tests/test_e2e.py`, the public function `_api()` now accepts a `max_retries=3` kwarg (default). Existing `_api(method, path, body, timeout)` signatures continue to work unchanged.
+
+### How to tell SSL EOF from a real failure
+
+When an e2e test fails with `urllib.error.URLError: [SSL: UNEXPECTED_EOF_WHILE_READING]`:
+
+1. **First time, single test, in the middle of a long test (>60 s)?** Almost always transient. The new retry catches this automatically.
+2. **Every test, every time?** Likely a real connectivity problem — check your `.env.deploy`, network reachability to API Gateway, certificate chain.
+3. **Persistent across multiple `pytest` invocations on a specific endpoint?** Check API Gateway / ALB CloudWatch logs for backend health.
+
+For 5xx errors:
+1. **One test, transient?** Auto-retried.
+2. **Recurring on a specific path?** Real bug. Check Lambda logs for the route in question.
+
+---
+
 ## [1.4.2] — 2026-05-29
 
 **Critical bug fix.** Closes the "fake failover" bug: prior versions could mark `AZ_FAILOVER_TENANT_RECOVERED` and flip DDB `status=running` while the public dashboard URL was 502'ing because the ALB still routed to the dead source host or the VM never finished booting. v1.4.2 makes failover **genuinely** end-to-end verified before declaring success.

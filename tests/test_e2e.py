@@ -29,23 +29,60 @@ if not API_URL or not API_KEY:
     pytest.skip("API_URL or API_KEY not set — skipping E2E tests", allow_module_level=True)
 
 
-def _api(method, path, body=None, timeout=30):
-    """Call the real API Gateway."""
+def _api(method, path, body=None, timeout=30, max_retries=3):
+    """Call the real API Gateway with automatic retry on transient errors.
+
+    1.4.3: long-running e2e flows (backup → restore takes ~5 minutes,
+    spanning many _api() calls) occasionally hit ``urllib.error.URLError``
+    with ``[SSL: UNEXPECTED_EOF_WHILE_READING]`` when the API Gateway /
+    ALB closes a TLS keep-alive connection mid-request. urllib has no
+    built-in retry, so a one-off TLS reset would fail an otherwise
+    healthy backup-restore test.
+
+    The retry policy is conservative — only network-layer / 5xx errors
+    are retried. 4xx (auth / validation) are returned immediately so
+    bugs surface fast. Exponential backoff: 1 s, 2 s, 4 s.
+
+    The fix lives only in this helper because the test cases above
+    already treat _api() as the atomic API call. Any test calling
+    _api() inherits the retry transparently.
+    """
+    import time
     url = f"{API_URL}/{path.lstrip('/')}"
     data = json.dumps(body).encode() if body else None
     req = urllib.request.Request(url, data=data, method=method, headers={
         "x-api-key": API_KEY,
         "Content-Type": "application/json",
     })
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, json.loads(resp.read().decode())
-    except urllib.error.HTTPError as e:
-        raw = e.read().decode()
+    last_err = None
+    for attempt in range(max_retries):
         try:
-            return e.code, json.loads(raw) if raw else {"error": str(e)}
-        except json.JSONDecodeError:
-            return e.code, {"error": raw or str(e)}
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status, json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            # 5xx may be transient (Lambda cold start, throttle, ALB
+            # backend reset); 4xx is a real client error and surfaces
+            # immediately so tests don't waste 7 seconds retrying a 401.
+            if 500 <= e.code < 600 and attempt < max_retries - 1:
+                last_err = f"HTTP {e.code}"
+                time.sleep(2 ** attempt)
+                continue
+            raw = e.read().decode()
+            try:
+                return e.code, json.loads(raw) if raw else {"error": str(e)}
+            except json.JSONDecodeError:
+                return e.code, {"error": raw or str(e)}
+        except urllib.error.URLError as e:
+            # SSL: UNEXPECTED_EOF_WHILE_READING, Connection reset, etc.
+            # All transient — retry with backoff.
+            last_err = f"URLError: {getattr(e, 'reason', str(e))}"
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise
+    # Exhausted retries on transient error. Re-raise the last one as
+    # a URLError so callers see the same exception shape as before.
+    raise urllib.error.URLError(f"exhausted {max_retries} retries: {last_err}")
 
 
 # ═══════════════════════════════════════════
@@ -169,8 +206,15 @@ class TestListAllBackups:
 # Backup → Restore roundtrip
 # ═══════════════════════════════════════════
 
-def _wait_for_status(tenant_id, expected, timeout=180, interval=5):
-    """Poll GET /tenants/{id} until status matches expected, or timeout."""
+def _wait_for_status(tenant_id, expected, timeout=360, interval=5):
+    """Poll GET /tenants/{id} until status matches expected, or timeout.
+
+    1.4.3: bumped default 180→360s. Restore-from-backup tests boot a
+    Firecracker VM, decompress and ext4-fsck a multi-GB rootfs, and
+    install OpenClaw — on a cold pool that's a real ~5min not a flaky
+    240s. The retry _api() helper handles SSL flakes; this timeout is
+    about giving real cold-start work time to complete.
+    """
     deadline = time.time() + timeout
     last_status = None
     while time.time() < deadline:

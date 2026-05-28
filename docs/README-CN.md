@@ -568,6 +568,58 @@ curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" -d '{
 </details>
 
 <details>
+<summary><b>共享 Skills — S3 → Host → VM 同步链（带 per-tenant / per-group 分发）</b></summary>
+
+所有租户共享统一的 Skill 集（`SKILL.md` 文件），但每租户 memory 独立。
+
+```bash
+# 上传 Skill 到 S3（自动同步到所有 host，新 VM 启动时注入）
+aws s3 sync ./my-skills/ s3://${ASSETS_BUCKET}/skills/ --profile $PROFILE
+
+# 同步链：
+#   S3 → Host /data/shared-skills/ (cron 5min) → 新 VM 启动时
+```
+
+**1.4.0 (#62) — per-tenant / per-group skill 分发**：默认每个 VM 拿全部 skill（广播，v1.3.x 行为）。要限制某租户只拿子集：
+
+```bash
+# 1) 定义一个 skill 组（可选）
+curl -s -X POST "${API_URL}groups" -H "x-api-key: ${API_KEY}" -d '{
+  "name": "team-sre",
+  "skills": ["k8s-debug", "incident-response"],
+  "description": "SRE 团队标准工具"
+}'
+
+# 2a) 单租户 scoping（启动时只 cp 这些 skill 子目录）
+curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" -d '{
+  "name": "research-agent",
+  "vcpu": 2, "mem_mb": 4096,
+  "skills": ["web-search", "code-review"]
+}'
+
+# 2b) 仅 group scoping
+curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" -d '{
+  "name": "sre-bot",
+  "group": "team-sre"
+}'
+
+# 2c) 两者都设 — effective set = tenant.skills ∪ group.skills
+curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" -d '{
+  "name": "sre-extras",
+  "skills": ["pagerduty"],
+  "group": "team-sre"
+}'
+
+# 检查某租户实际会拿到哪些 skill
+curl -s "${API_URL}tenants/{id}" -H "x-api-key: ${API_KEY}" | jq .effective_skills
+# → ["incident-response", "k8s-debug", "pagerduty"]   （或 "*" 表示广播）
+```
+
+老租户（无 `skills`、无 `group`）继续拿到所有 skill — **完全向后兼容**，从 v1.3.x 升级无需迁移。
+
+</details>
+
+<details>
 <summary><b>自定义域名 — 绑定 ACM + CloudFront（legacy 单域名模式）</b></summary>
 
 ```bash
@@ -581,22 +633,6 @@ curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" -d '{
 
 # 或直接编辑 config.yml 的 cloudfront: 段。
 # 解绑：--domain "" 重新跑 setup.sh。
-```
-
-</details>
-
-<details>
-<summary><b>共享 Skills — S3 → Host → VM 同步链</b></summary>
-
-所有租户共享统一的 Skill 集（`SKILL.md` 文件），但每租户 memory 独立。
-
-```bash
-# 上传 Skill 到 S3（自动同步到所有 VM）
-aws s3 sync ./my-skills/ s3://${ASSETS_BUCKET}/skills/ --profile $PROFILE
-
-# 同步链：
-#   S3 → Host /data/shared-skills/ (cron 5min) → 所有 running VM
-#   新 VM 启动时把 Skill 注入到 data 卷
 ```
 
 </details>
@@ -688,7 +724,19 @@ source .env.deploy && ./build-rootfs.sh <new_version>
 # 新建 tenant 立刻用新 rootfs；已有 tenant 调 `reset` API 才会切换。
 ```
 
-### 最新：v1.3.3 → **v1.3.4**（安全加固 — 任何生产多租户部署强烈推荐）
+### 最新：v1.3.4 → **v1.4.0**（per-tenant skill 分发 — 可选的安全加固）
+
+v1.4.0 修复 [#62](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/62)：v1.4.0 之前每个 VM 启动时都会被 `cp -r` 整个 `s3://${ASSETS_BUCKET}/skills/` —— 没法把 SRE 团队的应急响应 skill 隔离到只给 SRE 团队的 tenant。v1.4.0 加上 tenant 级 + group 级的 skill scoping；不设 scope 的 tenant 仍然拿到全部 skill，**完全向后兼容**。
+
+```bash
+git pull && ./setup.sh <region> <profile>
+```
+
+新增 `openclaw-groups` DDB 表 + 4 个 API 端点（`GET/POST /groups`、`POST /groups/{name}/skills`、`DELETE /groups/{name}/skills/{skill}`）。`POST /tenants` body 现在接受 `skills: [...]` 和/或 `group: "..."` 字段。`GET /tenants/{id}` 返回 `effective_skills`（resolved 后的 union，或 `"*"` 表示广播）。用法见进阶主题里的 [共享 Skills](#-进阶主题) 章节。
+
+`tests/test_skill_scoping.py` 加 29 个新单元测试，覆盖 issue 中提到的 6 个语义场景：空 / 单 / 仅 group / 仅 tenant / 都设 / 未知 group。
+
+### v1.3.3 → v1.3.4（安全加固 — 任何生产多租户部署强烈推荐）
 
 v1.3.4 修复 [#61](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/61)：v1.3.3 及之前的版本里，操作员控制台（`/console/*`）和每个租户的 dashboard（`/vm/*`）共用一个 CloudFront + 一个域名，意味着 Cognito session cookie 会被发到 tenant DOM 上。v1.3.4 引入**双域名模式**：创建两个独立的 CloudFront distribution + 两张 ACM cert，Cognito session cookie 物理上 scope 到 `console_domain`，浏览器不会把它发到 `app_domain`。
 

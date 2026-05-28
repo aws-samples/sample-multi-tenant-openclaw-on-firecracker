@@ -12,6 +12,7 @@ from unittest.mock import MagicMock
 _DEFAULTS = {
     "TENANTS_TABLE": "openclaw-tenants",
     "HOSTS_TABLE": "openclaw-hosts",
+    "GROUPS_TABLE": "openclaw-groups",
     "ASSETS_BUCKET": "test-bucket",
     "ROOTFS_PREFIX": "deployment/rootfs",
     "BACKUP_PREFIX": "backups",

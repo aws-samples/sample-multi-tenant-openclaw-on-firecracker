@@ -15,6 +15,10 @@ sns = boto3.client("sns")
 ddb = boto3.resource("dynamodb")
 tenants_table = ddb.Table(os.environ["TENANTS_TABLE"])
 hosts_table = ddb.Table(os.environ["HOSTS_TABLE"])
+# 1.4.0 (#62) — per-tenant / per-group skill scoping. Optional table:
+# legacy deployments without GROUPS_TABLE simply skip the group-resolution
+# branch in _resolve_effective_skills() and continue with broadcast behavior.
+groups_table = ddb.Table(os.environ["GROUPS_TABLE"]) if os.environ.get("GROUPS_TABLE") else None
 # Issue #17 — optional audit log; absent in legacy deployments
 audit_table = ddb.Table(os.environ["AUDIT_TABLE"]) if os.environ.get("AUDIT_TABLE") else None
 AUDIT_TTL_DAYS = int(os.environ.get("AUDIT_TTL_DAYS", "90"))
@@ -71,6 +75,8 @@ _VIEWER_OK = {
     ("GET", "/hosts/rootfs-version"), ("GET", "/agentcore/status"),
     ("GET", "/agentcore/tools"), ("GET", "/system/info"),
     ("GET", "/audit-log"),
+    # 1.4.0 (#62) — listing groups is read-only.
+    ("GET", "/groups"),
 }
 
 
@@ -113,6 +119,149 @@ def _get_user_role(event):
 def _role_satisfies(actual, required):
     """True iff `actual` has at least the privilege of `required`."""
     return _ROLE_RANK.get(actual, -1) >= _ROLE_RANK.get(required, 99)
+
+
+def _resolve_effective_skills(tenant_item):
+    """Compute the set of skill names a tenant should receive at launch time.
+
+    1.4.0 (#62): per-tenant / per-group skill distribution.
+
+    Returns:
+        None  → tenant has no per-tenant or group scope set; launch-vm.sh
+                 falls back to broadcast (legacy v1.3.x behavior).
+        list  → sorted unique list of skill names from
+                 (tenant.skills) ∪ (groups[tenant.group].skills).
+                 If the union is empty, also returns None to avoid lock-out
+                 (an explicit empty-list scope would otherwise prevent any
+                 skill from reaching the VM, which is rarely intended).
+
+    Unknown groups are silently dropped from the union — the operator gets
+    a warning at /groups admin time, not at every launch.
+    """
+    if not tenant_item:
+        return None
+    tenant_skills = tenant_item.get("skills") or []
+    group_name = (tenant_item.get("group") or "").strip()
+    # No scoping configured → broadcast.
+    if not tenant_skills and not group_name:
+        return None
+
+    effective = set(s for s in tenant_skills if s)
+    if group_name and groups_table is not None:
+        try:
+            grp = groups_table.get_item(Key={"name": group_name}).get("Item") or {}
+            for s in (grp.get("skills") or []):
+                if s:
+                    effective.add(s)
+        except Exception:
+            # Group lookup failure is non-fatal — proceed with tenant.skills only.
+            pass
+
+    return sorted(effective) if effective else None
+
+
+# ============================================================
+# Groups CRUD (1.4.0 / #62)
+# ============================================================
+
+def list_groups():
+    """GET /groups — list all groups."""
+    if groups_table is None:
+        return _resp(503, {"error": "groups table not configured (1.3.x deployment?)"})
+    try:
+        resp = groups_table.scan()
+        return _resp(200, {"groups": resp.get("Items", [])})
+    except Exception as e:
+        return _resp(500, {"error": str(e)})
+
+
+def create_group(body_str):
+    """POST /groups — create a new group with optional initial skills.
+
+    Body: {"name": "team-sre", "skills": ["a", "b"], "description": "..."}
+    """
+    if groups_table is None:
+        return _resp(503, {"error": "groups table not configured (1.3.x deployment?)"})
+    try:
+        body = json.loads(body_str or "{}")
+    except json.JSONDecodeError:
+        return _resp(400, {"error": "invalid JSON"})
+    name = (body.get("name") or "").strip()
+    if not name:
+        return _resp(400, {"error": "name is required"})
+    # Reuse tenant DNS-label rules — group names show up in audit logs and
+    # potentially in DNS-related artifacts later, so keep them safe.
+    if not _NAME_RE.match(name):
+        return _resp(400, {"error": "name must match ^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$"})
+    skills = body.get("skills") or []
+    if not isinstance(skills, list) or not all(isinstance(s, str) for s in skills):
+        return _resp(400, {"error": "skills must be a list of strings"})
+    description = (body.get("description") or "").strip()
+    from datetime import datetime, timezone
+    item = {
+        "name": name,
+        "skills": sorted(set(s for s in skills if s)),
+        "description": description,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        groups_table.put_item(
+            Item=item,
+            ConditionExpression="attribute_not_exists(#n)",
+            ExpressionAttributeNames={"#n": "name"},
+        )
+    except groups_table.meta.client.exceptions.ConditionalCheckFailedException:
+        return _resp(409, {"error": f"group '{name}' already exists"})
+    except Exception as e:
+        return _resp(500, {"error": str(e)})
+    return _resp(201, item)
+
+
+def add_skill_to_group(name, body_str):
+    """POST /groups/{name}/skills — append a skill to a group's list (idempotent)."""
+    if groups_table is None:
+        return _resp(503, {"error": "groups table not configured"})
+    try:
+        body = json.loads(body_str or "{}")
+    except json.JSONDecodeError:
+        return _resp(400, {"error": "invalid JSON"})
+    skill = (body.get("skill") or "").strip()
+    if not skill:
+        return _resp(400, {"error": "skill is required"})
+    try:
+        existing = groups_table.get_item(Key={"name": name}).get("Item")
+        if not existing:
+            return _resp(404, {"error": f"group '{name}' not found"})
+        cur = set(existing.get("skills") or [])
+        cur.add(skill)
+        groups_table.update_item(
+            Key={"name": name},
+            UpdateExpression="SET skills = :s",
+            ExpressionAttributeValues={":s": sorted(cur)},
+        )
+        return _resp(200, {"name": name, "skills": sorted(cur)})
+    except Exception as e:
+        return _resp(500, {"error": str(e)})
+
+
+def remove_skill_from_group(name, skill):
+    """DELETE /groups/{name}/skills/{skill} — remove a skill from a group's list."""
+    if groups_table is None:
+        return _resp(503, {"error": "groups table not configured"})
+    try:
+        existing = groups_table.get_item(Key={"name": name}).get("Item")
+        if not existing:
+            return _resp(404, {"error": f"group '{name}' not found"})
+        cur = set(existing.get("skills") or [])
+        cur.discard(skill)
+        groups_table.update_item(
+            Key={"name": name},
+            UpdateExpression="SET skills = :s",
+            ExpressionAttributeValues={":s": sorted(cur)},
+        )
+        return _resp(200, {"name": name, "skills": sorted(cur)})
+    except Exception as e:
+        return _resp(500, {"error": str(e)})
 
 
 def _rbac_check(event, method, resource):
@@ -168,6 +317,15 @@ def lambda_handler(event, context):
         ("DELETE", "/hosts/{instance_id}"): lambda: deregister_host(
             path_params["instance_id"]
         ),
+        # 1.4.0 (#62) — per-tenant / per-group skill scoping
+        ("GET", "/groups"): list_groups,
+        ("POST", "/groups"): lambda: create_group(event.get("body")),
+        ("POST", "/groups/{name}/skills"): lambda: add_skill_to_group(
+            path_params["name"], event.get("body")
+        ),
+        ("DELETE", "/groups/{name}/skills/{skill}"): lambda: remove_skill_from_group(
+            path_params["name"], path_params["skill"]
+        ),
     }
 
     handler = routes.get((method, resource))
@@ -217,6 +375,11 @@ def get_tenant(tenant_id):
     if not item:
         return _resp(404, {"error": "tenant not found"})
     item.setdefault("tags", {})
+    # 1.4.0 (#62) — surface the resolved effective skill set to the caller.
+    # None means "broadcast all" (legacy behavior); a list means scoping is
+    # active and only those skills will be injected at next launch.
+    eff = _resolve_effective_skills(item)
+    item["effective_skills"] = eff if eff is not None else "*"
     return _resp(200, item)
 
 
@@ -241,6 +404,26 @@ def create_tenant(body=None):
     config_template = body.get("config_template", "")
     restore_from = body.get("restore_from")
     clone_from = body.get("clone_from")
+
+    # 1.4.0 (#62) — per-tenant skill list and optional group membership.
+    # Validate up-front so we don't half-create a tenant with a malformed scope.
+    skills_in = body.get("skills")
+    if skills_in is not None:
+        if not isinstance(skills_in, list) or not all(isinstance(s, str) for s in skills_in):
+            return _resp(400, {"error": "skills must be a list of strings"})
+        skills_in = sorted(set(s.strip() for s in skills_in if s and s.strip()))
+    group_in = (body.get("group") or "").strip()
+    if group_in and not _NAME_RE.match(group_in):
+        return _resp(400, {"error": "group must match ^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$"})
+    if group_in and groups_table is not None:
+        # Soft-validate: warn at create time if the group doesn't exist yet,
+        # rather than silently allowing a typo to drop tenant from any scope.
+        try:
+            grp_chk = groups_table.get_item(Key={"name": group_in}).get("Item")
+            if not grp_chk:
+                return _resp(404, {"error": f"group '{group_in}' not found — create it first via POST /groups"})
+        except Exception:
+            pass
 
     # Issue #12 — clone_from is mutually exclusive with restore_from
     if clone_from and restore_from:
@@ -330,6 +513,10 @@ def create_tenant(body=None):
             "tags": tags,
             "created_at": now, "updated_at": now,
         }
+        if skills_in is not None:
+            item["skills"] = skills_in
+        if group_in:
+            item["group"] = group_in
         item.update(ttl_fields)
         if sched:
             item["schedule"] = sched
@@ -364,6 +551,10 @@ def create_tenant(body=None):
         "created_at": now,
         "updated_at": now,
     }
+    if skills_in is not None:
+        item["skills"] = skills_in
+    if group_in:
+        item["group"] = group_in
     if clone_from:
         item["clone_from"] = clone_from
     # Persist optional TTL fields on the running path too (#48 follow-up).
@@ -400,7 +591,8 @@ def create_tenant(body=None):
             )
             return _resp(502, {"error": "clone-data.sh failed; tenant rolled back"})
 
-    _launch_vm(host["instance_id"], tenant_id, vm_num, vcpu, mem_mb, guest_ip, host_port, config_template, restore_backup_key)
+    _launch_vm(host["instance_id"], tenant_id, vm_num, vcpu, mem_mb, guest_ip, host_port, config_template, restore_backup_key,
+               scoped_skills=_resolve_effective_skills(item))
 
     # ALB path-based routing
     tg_arn = _ensure_host_tg(host["instance_id"], host["private_ip"])
@@ -1217,7 +1409,8 @@ def process_pending():
         )
 
         _launch_vm(host["instance_id"], tenant["id"], vm_num, vcpu, mem_mb, guest_ip, host_port,
-                   tenant.get("config_template", ""), tenant.get("restore_backup_key", ""))
+                   tenant.get("config_template", ""), tenant.get("restore_backup_key", ""),
+                   scoped_skills=_resolve_effective_skills(tenant))
         tg_arn = _ensure_host_tg(host["instance_id"], host["private_ip"])
         _add_alb_rule(tenant["id"], tg_arn)
         assigned += 1
@@ -1414,13 +1607,24 @@ def _remove_host_tg(instance_id):
         pass
 
 
-def _launch_vm(instance_id, tenant_id, vm_num, vcpu, mem_mb, guest_ip, host_port, config_template="", restore_backup_key=""):
+def _launch_vm(instance_id, tenant_id, vm_num, vcpu, mem_mb, guest_ip, host_port,
+               config_template="", restore_backup_key="", scoped_skills=None):
     """Fire-and-forget: launch VM + set up DNAT.
+
     If restore_backup_key is non-empty, launch-vm.sh will restore data.ext4 from that S3 key instead of using the template.
+
+    1.4.0 (#62): scoped_skills is None or [] for the legacy "broadcast"
+    behavior, or a list of skill names for per-tenant scoping. Passed as
+    a comma-separated string to launch-vm.sh as the 7th positional arg
+    (empty string == broadcast, comma-list == only those subdirs cp'd).
     """
     # When restore is used but no template, still need a placeholder in arg 5 so positional args align.
     tpl_arg = config_template or '""'
-    cmd = (f"/home/ubuntu/launch-vm.sh {tenant_id} {vm_num} {vcpu} {mem_mb} {tpl_arg} {restore_backup_key} && "
+    # Placeholder for restore_backup_key (arg 6) so arg 7 always lines up.
+    restore_arg = restore_backup_key or '""'
+    # 1.4.0: 7th positional arg — comma-separated skill list (or empty for broadcast).
+    skills_arg = ",".join(scoped_skills) if scoped_skills else '""'
+    cmd = (f"/home/ubuntu/launch-vm.sh {tenant_id} {vm_num} {vcpu} {mem_mb} {tpl_arg} {restore_arg} {skills_arg} && "
            f"sudo iptables -t nat -A PREROUTING -i $(ip route show default | awk '{{print $5}}' | head -1) "
            f"-p tcp --dport {host_port} -j DNAT --to-destination {guest_ip}:{VM_PORT_BASE}")
     _ssm_send(instance_id, cmd, timeout=300)

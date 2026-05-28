@@ -671,7 +671,7 @@ wheels = [
 
 [[package]]
 name = "sample-multi-tenant-openclaw-on-firecracker"
-version = "1.3.4"
+version = "1.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "aws-cdk-aws-bedrock-agentcore-alpha" },

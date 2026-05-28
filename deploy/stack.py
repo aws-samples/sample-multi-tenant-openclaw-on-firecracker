@@ -65,6 +65,19 @@ class OpenClawOrchestratorStack(cdk.Stack):
             removal_policy=RemovalPolicy.RETAIN,
         )
 
+        # 1.4.0 (#62): per-tenant / per-group skill distribution.
+        # When a tenant doesn't carry a `skills` list and isn't assigned a
+        # `group`, the launch path falls back to the legacy "broadcast all
+        # shared skills" behavior. Otherwise the effective set is computed
+        # as tenant.skills ∪ group.skills (with unknown groups silently
+        # dropped from the union — see api/handler.py::_resolve_effective_skills).
+        groups_table = dynamodb.Table(self, "Groups",
+            table_name="openclaw-groups",
+            partition_key=dynamodb.Attribute(name="name", type=dynamodb.AttributeType.STRING),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            removal_policy=RemovalPolicy.RETAIN,
+        )
+
         # Issue #17 — Audit log table. Single-partition by design (`pk="audit"`)
         # for time-range queries; ts as sort key. DDB TTL auto-expires entries
         # after `audit.retention_days` (default 90).
@@ -162,6 +175,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
             environment={
                 "TENANTS_TABLE": tenants_table.table_name,
                 "HOSTS_TABLE": hosts_table.table_name,
+                "GROUPS_TABLE": groups_table.table_name,
                 "AUDIT_TABLE": audit_table.table_name,
                 "AUDIT_TTL_DAYS": str(audit_retention_days),
                 "ASSETS_BUCKET": assets_bucket.bucket_name,
@@ -196,6 +210,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
         )
         tenants_table.grant_read_write_data(api_fn)
         hosts_table.grant_read_write_data(api_fn)
+        groups_table.grant_read_write_data(api_fn)
         # Issue #17 — api Lambda writes audits and reads them back via GET /audit-log
         audit_table.grant_read_write_data(api_fn)
         assets_bucket.grant_read(api_fn)
@@ -328,6 +343,16 @@ class OpenClawOrchestratorStack(cdk.Stack):
         backups_resource = api.root.add_resource("backups")
         backups_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
 
+        # 1.4.0 (#62) — Groups CRUD endpoints
+        groups_resource = api.root.add_resource("groups")
+        groups_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
+        groups_resource.add_method("POST", apigw.LambdaIntegration(api_fn), **key_required)
+        group_resource = groups_resource.add_resource("{name}")
+        group_skills_resource = group_resource.add_resource("skills")
+        group_skills_resource.add_method("POST", apigw.LambdaIntegration(api_fn), **key_required)
+        group_skill_resource = group_skills_resource.add_resource("{skill}")
+        group_skill_resource.add_method("DELETE", apigw.LambdaIntegration(api_fn), **key_required)
+
         # Issue #23 — batch operations: POST /batch/tenants
         batch_resource = api.root.add_resource("batch")
         batch_tenants_resource = batch_resource.add_resource("tenants")
@@ -418,9 +443,17 @@ class OpenClawOrchestratorStack(cdk.Stack):
             code=_lambda.Code.from_asset("deploy/lambda/skills"),
             timeout=Duration.seconds(30),
             memory_size=128,
-            environment={"ASSETS_BUCKET": assets_bucket.bucket_name},
+            environment={
+                "ASSETS_BUCKET": assets_bucket.bucket_name,
+                # 1.4.0 (#62) — needed for ?tenant=... per-tenant scope filtering
+                "TENANTS_TABLE": tenants_table.table_name,
+                "GROUPS_TABLE": groups_table.table_name,
+            },
         )
         assets_bucket.grant_read(skills_fn)
+        # 1.4.0 (#62) — read-only access to compute effective skill sets
+        tenants_table.grant_read_data(skills_fn)
+        groups_table.grant_read_data(skills_fn)
         skills_resource = api.root.add_resource("skills")
         skills_resource.add_method("GET", apigw.LambdaIntegration(skills_fn), **key_required)
 

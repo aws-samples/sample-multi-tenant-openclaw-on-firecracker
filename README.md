@@ -568,6 +568,58 @@ The legacy `--domain` / `--cert` flags still work for dev/sample deployments.
 </details>
 
 <details>
+<summary><b>Shared Skills — S3 → Host → VM sync chain (with per-tenant / per-group scoping)</b></summary>
+
+All tenants share a unified skill catalog (`SKILL.md` files) with independent memory per tenant.
+
+```bash
+# Upload skills to S3 (auto-synced to all hosts, then injected at VM launch)
+aws s3 sync ./my-skills/ s3://${ASSETS_BUCKET}/skills/ --profile $PROFILE
+
+# Sync chain:
+#   S3 → Host /data/shared-skills/ (cron 5min) → New VMs at launch
+```
+
+**1.4.0 (#62) — per-tenant / per-group skill distribution**: by default every VM gets every skill (broadcast, legacy v1.3.x behavior). To restrict which skills a particular tenant receives:
+
+```bash
+# 1) Define a group of skills (optional)
+curl -s -X POST "${API_URL}groups" -H "x-api-key: ${API_KEY}" -d '{
+  "name": "team-sre",
+  "skills": ["k8s-debug", "incident-response"],
+  "description": "SRE team standard tools"
+}'
+
+# 2a) Per-tenant scoping (only this tenant's skills get cp'd at launch)
+curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" -d '{
+  "name": "research-agent",
+  "vcpu": 2, "mem_mb": 4096,
+  "skills": ["web-search", "code-review"]
+}'
+
+# 2b) Group-only scoping
+curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" -d '{
+  "name": "sre-bot",
+  "group": "team-sre"
+}'
+
+# 2c) Both — effective set = tenant.skills ∪ group.skills
+curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" -d '{
+  "name": "sre-extras",
+  "skills": ["pagerduty"],
+  "group": "team-sre"
+}'
+
+# Inspect what a tenant will actually receive
+curl -s "${API_URL}tenants/{id}" -H "x-api-key: ${API_KEY}" | jq .effective_skills
+# → ["incident-response", "k8s-debug", "pagerduty"]   (or "*" for broadcast)
+```
+
+Existing tenants (no `skills` and no `group`) keep receiving every skill — **fully backward compatible**, no migration required when upgrading from v1.3.x.
+
+</details>
+
+<details>
 <summary><b>Custom Domain — bind ACM + CloudFront (legacy single-domain mode)</b></summary>
 
 ```bash
@@ -581,22 +633,6 @@ The legacy `--domain` / `--cert` flags still work for dev/sample deployments.
 
 # Or edit config.yml directly under the cloudfront: section.
 # To unbind: --domain "" and re-run setup.sh.
-```
-
-</details>
-
-<details>
-<summary><b>Shared Skills — S3 → Host → VM sync chain</b></summary>
-
-All tenants share a unified skill set (`SKILL.md` files) with independent memory per tenant.
-
-```bash
-# Upload skills to S3 (auto-synced to all VMs)
-aws s3 sync ./my-skills/ s3://${ASSETS_BUCKET}/skills/ --profile $PROFILE
-
-# Sync chain:
-#   S3 → Host /data/shared-skills/ (cron 5min) → All running VMs
-#   New VMs get skills injected into the data volume at launch
 ```
 
 </details>
@@ -688,7 +724,19 @@ source .env.deploy && ./build-rootfs.sh <new_version>
 # New tenants use the new rootfs immediately; existing tenants need a `reset` API call to switch over.
 ```
 
-### Latest: v1.3.3 → **v1.3.4** (security hardening — recommended for any production multi-tenant deployment)
+### Latest: v1.3.4 → **v1.4.0** (per-tenant skill scoping — opt-in security feature)
+
+v1.4.0 closes [#62](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/62): pre-1.4.0 every tenant VM got `cp -r` of every skill in `s3://${ASSETS_BUCKET}/skills/` — there was no way to keep an SRE team's incident-response skill out of every other tenant's filesystem. v1.4.0 adds tenant-level + group-level skill scoping; tenants without scoping continue to receive everything, so the upgrade is **fully backward compatible**.
+
+```bash
+git pull && ./setup.sh <region> <profile>
+```
+
+Adds a new `openclaw-groups` DDB table + 4 new API endpoints (`GET/POST /groups`, `POST /groups/{name}/skills`, `DELETE /groups/{name}/skills/{skill}`). Tenant `POST /tenants` body now accepts `skills: [...]` and/or `group: "..."` fields. `GET /tenants/{id}` returns `effective_skills` (resolved union, or `"*"` for broadcast). See [Shared Skills](#-advanced-topics) in Advanced Topics for usage examples.
+
+29 new unit tests in `tests/test_skill_scoping.py` cover all six semantic cases from the issue: empty / single / group-only / tenant-only / both / unknown-group.
+
+### v1.3.3 → v1.3.4 (security hardening — recommended for any production multi-tenant deployment)
 
 v1.3.4 fixes [#61](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/61): operator console (`/console/*`) and per-tenant dashboards (`/vm/*`) used to share one CloudFront distribution and one domain, meaning the Cognito session cookie was sent to tenant DOM. v1.3.4 adds a **dual-domain mode** that creates two independent CloudFront distributions with two ACM certs — the Cognito session cookie is physically scoped to `console_domain` and the browser will not send it to `app_domain`.
 

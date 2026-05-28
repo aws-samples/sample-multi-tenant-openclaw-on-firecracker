@@ -1,5 +1,63 @@
 # Changelog
 
+## [1.4.0] — 2026-05-28
+
+Per-tenant / per-group skill distribution. Closes [#62](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/62) — first-class scoping for shared skills so an SRE team's incident-response skill no longer ends up in every other tenant's filesystem.
+
+### Why this matters
+
+Pre-1.4.0 every shared skill (`s3://${ASSETS_BUCKET}/skills/<name>/SKILL.md`) was broadcast indiscriminately at VM launch — `launch-vm.sh` did an unconditional `cp -r ${SHARED_SKILLS}/* ${MOUNT_TMP}/.openclaw/skills/`. That's fine when the operator owns every tenant but breaks down when a single deployment hosts agents from unrelated teams or organizations. There was simply no way to express "this skill is only for tenants in the SRE group".
+
+### Added
+
+- **`openclaw-groups` DynamoDB table** with partition key `name`. Stores the per-group skill allow-list (`skills: [...]`) plus optional description. Pay-per-request, RETAIN policy.
+- **Tenant skill scope on `POST /tenants`** — body now accepts:
+  - `skills: ["a", "b"]` — explicit per-tenant allow-list
+  - `group: "team-sre"` — inherit the group's skill list
+  - Both — effective set = `tenant.skills ∪ group.skills`
+  - Neither — fall back to broadcast (legacy v1.3.x behavior, **fully backward compatible**)
+- **Groups CRUD endpoints** (4 new routes; `viewer` can read, `operator+` can write):
+  - `GET /groups` — list all groups
+  - `POST /groups` — create with optional initial skill list
+  - `POST /groups/{name}/skills` — append a skill (idempotent)
+  - `DELETE /groups/{name}/skills/{skill}` — remove a skill
+- **`GET /tenants/{id}` returns `effective_skills`** — the resolved union (or `"*"` when broadcast) so operators can see exactly what a tenant will get without reading code.
+- **`GET /skills?tenant=<id>` filters** the returned skill catalog to that tenant's effective set, so the Console (or any client) can render a per-tenant skills view directly from the API.
+- **`launch-vm.sh` 7th positional arg `SCOPED_SKILLS`** — comma-separated allow-list (or empty / `*` for broadcast). When present, only the listed skill subdirectories are `cp`'d into the VM at launch. Existing 6-arg invocations keep working unchanged because the 7th arg defaults to empty (= broadcast).
+
+### Changed
+
+- **`api/handler.py::_resolve_effective_skills`** is the central resolver — used by `create_tenant`, `process_pending`, and `GET /tenants/{id}`. Same logic mirrored in `skills/handler.py` for the `?tenant=...` query path so the front-end gets identical answers.
+- **`skills/handler.py`** now declares `TENANTS_TABLE` + `GROUPS_TABLE` env vars and is granted read access in CDK (so the `?tenant=` filter can resolve effective skills server-side).
+- **Unknown-group rejection at create time.** `POST /tenants` with a `group` that doesn't exist returns `404` instead of silently accepting the typo and dropping the group from the union forever. (The runtime resolver `_resolve_effective_skills` still tolerates unknown groups defensively in case the group is deleted while a tenant references it.)
+
+### Tests
+
+- **29 new unit tests in `tests/test_skill_scoping.py`** covering five surfaces:
+  1. **`_resolve_effective_skills` — 8 semantic scenarios.** broadcast / single / group-only / tenant-only / both / unknown-group / empty-union-falls-back-to-broadcast / DDB exception during group lookup.
+  2. **Groups CRUD — 11 tests.** create writes 201 with item; rejects invalid name / missing name / non-string skills; 409 on duplicate; list returns all; add-skill idempotent; remove-skill works; remove-nonexistent-skill is a noop; unknown-group on add returns 404.
+  3. **`POST /tenants` validation — 3 tests.** skills must be list-of-strings; group must match DNS-label regex; unknown-group rejected at create.
+  4. **`launch-vm.sh` argument schema — 4 grammar tests.** 7th positional is `SCOPED_SKILLS`; empty/`*` keeps broadcast branch; comma-list iterates via `IFS=','`; missing skill subdir is logged not fatal.
+  5. **`_launch_vm` command wiring — 3 tests.** None passes `""` placeholder, list passes comma-separated, template + skills both wired correctly.
+
+Total: locally **477 passed / 0 failed** (v1.3.4 baseline 448 + 29 new skill-scoping tests).
+
+### Operator notes
+
+- **Backward compatible.** Existing tenants without `skills` or `group` fields continue to receive every skill at launch. No data migration. No forced redeploy. Operators opt into scoping per-tenant by setting one or both fields.
+- **DDB schema impact**: the new `openclaw-groups` table is created on `cdk deploy`. Existing `openclaw-tenants` rows are not modified (new optional `skills` / `group` attributes appear only on tenants created with scoping after 1.4.0).
+- **Check what a tenant gets**: `curl ${API_URL}tenants/<id> | jq .effective_skills` — returns either a sorted list or the literal string `"*"` (broadcast).
+- **Skill scoping is enforced at launch time only** — already-running VMs from before 1.4.0 keep their full skill snapshot until they're restarted/reset. The intended use is "set scope on `create`", not "retroactively shrink running tenants".
+- **Group typos**: `POST /tenants` with a non-existent group returns `404` so you can't accidentally create a tenant scoped to a group that doesn't exist. To "remove" a group from a tenant, recreate the tenant with the desired skill set (or wait for #63 console group editor).
+
+### Known limitations
+
+- **No console UI yet** — group + per-tenant skill management requires `curl` for now. Console UI is tracked in [#63](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/63), planned for v1.4.1.
+- **No cross-tenant skill auditing** — `GET /audit-log` records the `POST /tenants` and `POST /groups` events, but there's no dashboard yet that shows "which tenants currently include skill X". Easy to build on top of `?tenant=` filter.
+- **Skill scope is enforced at launch only**, not at runtime. A tenant that's already running with broadcast-mode skills won't lose them on a `POST /groups/.../skills` removal until the VM is reset/restarted.
+
+---
+
 ## [1.3.4] — 2026-05-28
 
 Security hardening: split operator console domain from per-tenant dashboard domain so that the Cognito session cookie is physically scoped to the console origin and cannot reach tenant-rendered DOM.

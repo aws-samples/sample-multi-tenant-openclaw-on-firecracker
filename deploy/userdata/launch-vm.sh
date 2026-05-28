@@ -29,14 +29,20 @@ _oc_cleanup_on_err() {
   exit $rc
 }
 trap _oc_cleanup_on_err ERR
-TENANT_ID="${1:?Usage: launch-vm.sh <tenant_id> <vm_num> [vcpu] [mem_mb] [config_template] [restore_backup_key]}"
-VM_NUM="${2:?Usage: launch-vm.sh <tenant_id> <vm_num> [vcpu] [mem_mb] [config_template] [restore_backup_key]}"
+TENANT_ID="${1:?Usage: launch-vm.sh <tenant_id> <vm_num> [vcpu] [mem_mb] [config_template] [restore_backup_key] [scoped_skills]}"
+VM_NUM="${2:?Usage: launch-vm.sh <tenant_id> <vm_num> [vcpu] [mem_mb] [config_template] [restore_backup_key] [scoped_skills]}"
 VCPU="${3:-2}"
 MEM_MB="${4:-4096}"
 CONFIG_TEMPLATE="${5:-}"
 RESTORE_KEY="${6:-}"
+# 1.4.0 (#62) — comma-separated allow-list of skill names. Empty / "*"
+# preserves the legacy v1.3.x broadcast behavior so old SSM commands
+# without this 7th arg keep working unchanged.
+SCOPED_SKILLS="${7:-}"
 # Caller may pass literal "" (quoted) as placeholder when only restore_key is set.
 [ "${CONFIG_TEMPLATE}" = '""' ] && CONFIG_TEMPLATE=""
+[ "${RESTORE_KEY}" = '""' ] && RESTORE_KEY=""
+[ "${SCOPED_SKILLS}" = '""' ] && SCOPED_SKILLS=""
 VM_DIR="/data/firecracker-vms/${TENANT_ID}"
 [ -f /etc/platform.env ] && source /etc/platform.env
 mkdir -p ${VM_DIR}
@@ -126,11 +132,25 @@ SHARED_SKILLS="/data/shared-skills"
 MOUNT_TMP="/tmp/data-mount-${TENANT_ID}"
 mkdir -p ${MOUNT_TMP}
 sudo mount ${DATA_VOL} ${MOUNT_TMP}
-# Skills
+# Skills (1.4.0 #62: optional per-tenant scope via $SCOPED_SKILLS comma-list)
 if [ -d "${SHARED_SKILLS}" ] && [ "$(ls -A ${SHARED_SKILLS} 2>/dev/null)" ]; then
-  log "injecting shared skills..."
-  mkdir -p ${MOUNT_TMP}/.openclaw/skills
-  cp -r ${SHARED_SKILLS}/* ${MOUNT_TMP}/.openclaw/skills/ 2>/dev/null || true
+  if [ -z "${SCOPED_SKILLS}" ] || [ "${SCOPED_SKILLS}" = "*" ]; then
+    log "injecting all shared skills (broadcast mode)"
+    mkdir -p ${MOUNT_TMP}/.openclaw/skills
+    cp -r ${SHARED_SKILLS}/* ${MOUNT_TMP}/.openclaw/skills/ 2>/dev/null || true
+  else
+    log "injecting scoped skills: ${SCOPED_SKILLS}"
+    mkdir -p ${MOUNT_TMP}/.openclaw/skills
+    IFS=',' read -ra SKILL_LIST <<< "${SCOPED_SKILLS}"
+    for skill in "${SKILL_LIST[@]}"; do
+      skill_dir="${SHARED_SKILLS}/${skill}"
+      if [ -d "${skill_dir}" ]; then
+        cp -r "${skill_dir}" ${MOUNT_TMP}/.openclaw/skills/ 2>/dev/null || true
+      else
+        log "  skipped unknown skill: ${skill}"
+      fi
+    done
+  fi
   sudo chown -R 1000:1000 ${MOUNT_TMP}/.openclaw/skills
   log "skills injected"
 fi

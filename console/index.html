@@ -6,6 +6,9 @@
 <title>OpenClaw Pool Management Console</title>
 <link rel="stylesheet" href="style.css">
 <script src="config.js"></script>
+<!-- 1.4.1 (#63) — Marked for SKILL.md preview rendering. Tiny (~30KB), no
+     bundler needed, fits the existing Alpine.js / no-build approach. -->
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script>
 // Cognito OAuth2 implicit flow (skip if not configured)
 (function() {
@@ -361,31 +364,113 @@
     </div>
   </div>
 
-  <!-- Skills -->
+  <!-- Groups (1.4.0 #62 / 1.4.1 #63) -->
   <div class="section-card">
-    <h3><svg class="icon s14" style="vertical-align:-2px"><use href="#i-brain"/></svg> Shared Skills <span style="font-size:11px;color:var(--gray)" x-text="'(' + skills.length + ')'"></span></h3>
+    <h3 style="display:flex;align-items:center;gap:8px">
+      <svg class="icon s14" style="vertical-align:-2px"><use href="#i-brain"/></svg>
+      Skill Groups <span style="font-size:11px;color:var(--gray)" x-text="'(' + groups.length + ')'"></span>
+      <button x-show="canWrite()" class="btn btn-cyan btn-sm" style="margin-left:auto"
+              @click="showGroupModal=true">+ New Group</button>
+    </h3>
+    <p style="color:var(--gray);font-size:13px">
+      Groups bundle skills together so a tenant can subscribe via <code>group: "team-sre"</code>
+      instead of listing every skill. A tenant's effective skill set =
+      <code>tenant.skills ∪ group.skills</code>. Tenants without scoping fields get every skill (legacy broadcast).
+    </p>
+    <div style="margin-top:8px">
+      <template x-for="g in groups" :key="g.name">
+        <div class="config-item" style="flex-direction:column;align-items:flex-start;gap:6px;padding:10px 12px">
+          <span style="display:flex;align-items:baseline;gap:8px;width:100%">
+            <span class="config-name" x-text="g.name"></span>
+            <span class="config-desc" style="margin-left:0;flex:1" x-text="g.description || 'No description'"></span>
+            <span style="font-size:11px;color:var(--gray)" x-text="(g.skills||[]).length + ' skills'"></span>
+            <button x-show="canWrite()" class="btn-act" style="font-size:11px;color:var(--cyan)"
+                    @click="expandedGroup = (expandedGroup===g.name ? null : g.name); addSkillToGroupName=''"
+                    x-text="expandedGroup===g.name?'▾ Hide':'▸ Edit'"></button>
+          </span>
+          <!-- Inline group editor -->
+          <div x-show="expandedGroup===g.name" style="width:100%;margin-top:6px;border-top:1px dashed var(--border);padding-top:8px">
+            <div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px">
+              <template x-for="sk in (g.skills||[])" :key="sk">
+                <span style="display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border:1px solid var(--border);border-radius:10px;font-size:12px;background:var(--bg-mid)">
+                  <span x-text="sk"></span>
+                  <button x-show="canWrite()" class="btn-act" style="color:var(--red);padding:0 0 0 4px;font-size:14px;line-height:1"
+                          title="Remove from group" @click="removeSkillFromGroup(g.name, sk)">×</button>
+                </span>
+              </template>
+              <span x-show="!(g.skills||[]).length" style="color:var(--gray);font-size:12px;font-style:italic">empty group</span>
+            </div>
+            <div x-show="canWrite()" style="display:flex;gap:6px;align-items:center">
+              <select x-model="addSkillToGroupName" style="flex:1;padding:6px 8px;background:var(--bg-mid);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:12px">
+                <option value="">— pick a skill to add —</option>
+                <template x-for="s in skills.filter(x => !(g.skills||[]).includes(x.name))" :key="s.id">
+                  <option :value="s.name" x-text="s.name"></option>
+                </template>
+              </select>
+              <button class="btn btn-cyan btn-sm" :disabled="!addSkillToGroupName"
+                      @click="addSkillToGroup(g.name)">Add</button>
+            </div>
+          </div>
+        </div>
+      </template>
+      <div x-show="groups.length===0" style="color:var(--gray);font-size:12px">
+        No groups defined. Click <b>+ New Group</b> to bundle skills for a team.
+      </div>
+    </div>
+  </div>
+
+  <!-- Skills (1.4.1 #63 — full CRUD) -->
+  <div class="section-card">
+    <h3 style="display:flex;align-items:center;gap:8px">
+      <svg class="icon s14" style="vertical-align:-2px"><use href="#i-brain"/></svg>
+      Shared Skills <span style="font-size:11px;color:var(--gray)" x-text="'(' + skills.length + ')'"></span>
+      <button x-show="canWrite()" class="btn btn-cyan btn-sm" style="margin-left:auto"
+              @click="showSkillUpload=true">+ New Skill</button>
+    </h3>
     <p style="color:var(--gray);font-size:13px">
       Skills are shared across all tenants. They're plain markdown files in
-      <code>s3://${ASSETS_BUCKET}/skills/&lt;name&gt;/SKILL.md</code> and are synced to every VM
-      every 5 minutes via cron. Each tenant has its own memory; skills themselves are read-only.
+      <code>s3://${ASSETS_BUCKET}/skills/&lt;name&gt;/SKILL.md</code> and are synced to every host
+      every 5 minutes via cron, then injected into VMs at launch.
+      <span x-show="canWrite()">Click a row to view / edit. Use Groups (above) to scope skills to specific tenants.</span>
     </p>
     <div style="margin-top:8px">
       <template x-for="s in skills" :key="s.id">
-        <div class="config-item" style="flex-direction:column;align-items:flex-start;gap:4px">
+        <div class="config-item" style="flex-direction:column;align-items:flex-start;gap:6px;padding:10px 12px">
           <span style="display:flex;align-items:baseline;gap:8px;width:100%">
-            <span class="config-name" x-text="s.name"></span>
-            <a class="btn-act" style="margin-left:auto;font-size:11px;color:var(--cyan)"
+            <span class="config-name" x-text="s.name" style="cursor:pointer"
+                  @click="toggleSkill(s.name)"></span>
+            <span class="config-desc" style="margin-left:0;flex:1" x-text="s.description || 'No description'"></span>
+            <button class="btn-act" style="font-size:11px;color:var(--cyan)"
+                    @click="toggleSkill(s.name)" x-text="expandedSkill===s.name?'▾ Hide':'▸ View'"></button>
+            <a class="btn-act" style="font-size:11px;color:var(--cyan)"
                :href="skillS3Url(s)" target="_blank" rel="noopener"
                title="Open S3 console at this skill's prefix">
               <svg class="icon s12" style="vertical-align:-1px"><use href="#i-link"/></svg> S3
             </a>
+            <button x-show="canWrite()" class="btn-act" style="font-size:11px;color:var(--red)"
+                    @click="deleteSkill(s.name)">Delete</button>
           </span>
-          <span class="config-desc" style="margin-left:0" x-text="s.description || 'No description (add YAML frontmatter to SKILL.md)'"></span>
+          <!-- Inline preview / editor -->
+          <div x-show="expandedSkill===s.name" style="width:100%;margin-top:6px;border-top:1px dashed var(--border);padding-top:8px">
+            <div style="display:flex;gap:6px;margin-bottom:6px">
+              <button class="btn btn-outline btn-sm" @click="skillEditMode=false" :class="!skillEditMode && 'btn-cyan'">Preview</button>
+              <button x-show="canWrite()" class="btn btn-outline btn-sm"
+                      @click="skillEditMode=true" :class="skillEditMode && 'btn-cyan'">Edit</button>
+              <button x-show="canWrite() && skillEditMode" class="btn btn-cyan btn-sm" style="margin-left:auto"
+                      @click="saveSkill(s.name)" :disabled="skillSaving"
+                      x-text="skillSaving?'Saving...':'Save'"></button>
+            </div>
+            <div x-show="!skillEditMode" class="skill-md-preview"
+                 style="padding:8px 12px;background:var(--bg-mid);border-radius:6px;max-height:400px;overflow:auto;font-size:13px"
+                 x-html="renderMd(skillContent)"></div>
+            <textarea x-show="skillEditMode" x-model="skillContent"
+                      style="width:100%;height:340px;font-family:monospace;font-size:12px;padding:8px;background:var(--bg-mid);border:1px solid var(--border);border-radius:6px;color:var(--text);resize:vertical"
+                      spellcheck="false"></textarea>
+          </div>
         </div>
       </template>
       <div x-show="skills.length===0" style="color:var(--gray);font-size:12px">
-        No skills configured. Upload a SKILL.md to <code>s3://${ASSETS_BUCKET}/skills/&lt;name&gt;/</code>
-        and wait up to 5 minutes for the host cron to pick it up.
+        No skills configured. Click <b>+ New Skill</b> above (or upload to <code>s3://${ASSETS_BUCKET}/skills/&lt;name&gt;/</code> directly).
       </div>
     </div>
   </div>
@@ -708,6 +793,66 @@
 </div>
 
 <!-- Create / Restore Tenant Modal (global — not nested in any tab so it's visible from Tenants and Backups) -->
+<!-- 1.4.1 (#63) — Skill upload modal -->
+<template x-if="showSkillUpload">
+  <div class="modal-overlay" @click.self="showSkillUpload=false">
+    <div class="modal" style="max-width:720px">
+      <h3>Upload New Skill</h3>
+      <div class="form-row">
+        <label>Name</label>
+        <input type="text" x-model="skillUploadForm.name"
+               placeholder="lowercase-with-hyphens"
+               pattern="^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$"
+               style="width:100%">
+      </div>
+      <div class="form-row">
+        <label>SKILL.md content</label>
+        <textarea x-model="skillUploadForm.content"
+                  style="width:100%;height:300px;font-family:monospace;font-size:12px;padding:8px;background:var(--bg-mid);border:1px solid var(--border);border-radius:4px;color:var(--text);resize:vertical"
+                  spellcheck="false"></textarea>
+        <small style="color:var(--gray);font-size:11px">Must contain at least one top-level <code># Title</code> line. Max 256 KiB.</small>
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">
+        <button class="btn btn-outline btn-sm" @click="showSkillUpload=false">Cancel</button>
+        <button class="btn btn-cyan btn-sm" @click="uploadSkill()">Upload</button>
+      </div>
+    </div>
+  </div>
+</template>
+
+<!-- 1.4.1 (#63) — Group create modal -->
+<template x-if="showGroupModal">
+  <div class="modal-overlay" @click.self="showGroupModal=false">
+    <div class="modal" style="max-width:560px">
+      <h3>Create Skill Group</h3>
+      <div class="form-row">
+        <label>Name</label>
+        <input type="text" x-model="groupForm.name"
+               placeholder="team-sre"
+               pattern="^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$"
+               style="width:100%">
+      </div>
+      <div class="form-row">
+        <label>Description (optional)</label>
+        <input type="text" x-model="groupForm.description"
+               placeholder="SRE team standard tools"
+               style="width:100%">
+      </div>
+      <div class="form-row">
+        <label>Initial skills (comma-separated, optional)</label>
+        <input type="text" x-model="groupForm.skills_text"
+               placeholder="k8s-debug, incident-response"
+               style="width:100%">
+        <small style="color:var(--gray);font-size:11px">You can add/remove skills later via the group's edit panel.</small>
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">
+        <button class="btn btn-outline btn-sm" @click="showGroupModal=false">Cancel</button>
+        <button class="btn btn-cyan btn-sm" @click="createGroup()">Create</button>
+      </div>
+    </div>
+  </div>
+</template>
+
 <template x-if="showModal">
   <div class="overlay" @click.self="closeCreateModal()">
     <div class="modal">
@@ -816,6 +961,19 @@ function app() {
     showModal: false,
     skills: [], templates: [],
     editTpl: null,
+    // 1.4.1 (#63) — Console skills CRUD state
+    expandedSkill: null,         // skill name whose preview/edit panel is open
+    skillEditMode: false,        // true = textarea editor visible, false = preview only
+    skillContent: '',            // current SKILL.md content in the editor
+    skillSaving: false,          // disables save button during PUT
+    showSkillUpload: false,      // upload modal visibility
+    skillUploadForm: { name: '', content: '# New Skill\n\nDescribe what this skill does.\n' },
+    // 1.4.0 (#62) / 1.4.1 (#63) — Groups CRUD state
+    groups: [],
+    showGroupModal: false,
+    groupForm: { name: '', description: '', skills_text: '' },
+    expandedGroup: null,         // group name whose skills picker is open
+    addSkillToGroupName: '',     // skill name being typed into the picker
     agentcoreStatus: { enabled: false }, agentcoreRegion: 'ap-northeast-1',
     form: { name: '', vcpu: null, memory_mb: null, config_template: '', preferred_host_id: '', tags_text: '' },
     backups: [], backupFilter: 'all', loadingBackups: false,
@@ -858,11 +1016,9 @@ function app() {
       this.loadingHosts = false;
       try { this.rootfsVersion = (await this.api('GET', 'hosts/rootfs-version')).version; } catch {}
       try { this.agentcoreStatus = await this.api('GET', 'agentcore/status'); } catch {}
-      // Load skills
-      try {
-        const sk = await this.api('GET', 'skills');
-        this.skills = sk.skills || [];
-      } catch {}
+      // Load skills + groups (v1.4.0/1.4.1)
+      this.loadSkills();
+      this.loadGroups();
     },
     async loadTenants() {
       if (!this.apiUrl || !this.apiKey) return;
@@ -1081,6 +1237,146 @@ function app() {
         return `https://${region}.console.aws.amazon.com/s3/buckets/${bucket}?prefix=skills/${skill.id}/&region=${region}`;
       }
       return 'https://s3.console.aws.amazon.com/s3/home';
+    },
+
+    // ===== 1.4.1 (#63) — Skill CRUD =====
+    async loadSkills() {
+      try {
+        const sk = await this.api('GET', 'skills');
+        this.skills = sk.skills || [];
+      } catch {}
+    },
+    renderMd(text) {
+      // Use Marked if loaded, otherwise just escape and show as <pre>
+      if (window.marked) return window.marked.parse(text || '');
+      const esc = (text || '').replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
+      return `<pre style="white-space:pre-wrap">${esc}</pre>`;
+    },
+    async toggleSkill(name) {
+      if (this.expandedSkill === name) {
+        this.expandedSkill = null;
+        this.skillEditMode = false;
+        this.skillContent = '';
+        return;
+      }
+      this.expandedSkill = name;
+      this.skillEditMode = false;
+      try {
+        const r = await this.api('GET', 'skills/' + encodeURIComponent(name));
+        this.skillContent = r.content || '';
+      } catch (e) {
+        this.toast = '✗ Load failed: ' + (e.message || e);
+        setTimeout(() => this.toast = '', 4000);
+        this.expandedSkill = null;
+      }
+    },
+    async saveSkill(name) {
+      if (this.skillSaving) return;
+      // Quick client-side sanity — server enforces this too but fail fast in UI.
+      const hasH1 = this.skillContent.split('\n').some(ln => /^\s*#\s+\S/.test(ln));
+      if (!hasH1) {
+        this.toast = '✗ SKILL.md must have a top-level "# Title" line';
+        setTimeout(() => this.toast = '', 4000);
+        return;
+      }
+      this.skillSaving = true;
+      try {
+        const r = await this.api('PUT', 'skills/' + encodeURIComponent(name), { content: this.skillContent });
+        if (r.error) throw new Error(r.error);
+        this.toast = '✓ Saved ' + name;
+        this.skillEditMode = false;
+        await this.loadSkills();
+      } catch (e) {
+        this.toast = '✗ Save failed: ' + (e.message || e);
+      }
+      this.skillSaving = false;
+      setTimeout(() => this.toast = '', 3000);
+    },
+    async deleteSkill(name) {
+      if (!confirm(`Delete skill "${name}"?\n\nThis removes the entire s3://${this.systemInfo?.assets_bucket || '<bucket>'}/skills/${name}/ prefix and is not reversible.`)) return;
+      try {
+        const r = await this.api('DELETE', 'skills/' + encodeURIComponent(name));
+        if (r.error) throw new Error(r.error);
+        this.toast = '✓ Deleted ' + name;
+        if (this.expandedSkill === name) this.expandedSkill = null;
+        await this.loadSkills();
+      } catch (e) {
+        this.toast = '✗ Delete failed: ' + (e.message || e);
+      }
+      setTimeout(() => this.toast = '', 3000);
+    },
+    async uploadSkill() {
+      const name = (this.skillUploadForm.name || '').trim();
+      if (!/^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$/.test(name)) {
+        this.toast = '✗ Invalid skill name (lowercase letters, digits, hyphens; 1-64 chars)';
+        setTimeout(() => this.toast = '', 4000);
+        return;
+      }
+      try {
+        const r = await this.api('PUT', 'skills/' + encodeURIComponent(name), { content: this.skillUploadForm.content });
+        if (r.error) throw new Error(r.error);
+        this.toast = '✓ Uploaded ' + name;
+        this.showSkillUpload = false;
+        this.skillUploadForm = { name: '', content: '# New Skill\n\nDescribe what this skill does.\n' };
+        await this.loadSkills();
+      } catch (e) {
+        this.toast = '✗ Upload failed: ' + (e.message || e);
+      }
+      setTimeout(() => this.toast = '', 3000);
+    },
+
+    // ===== 1.4.1 (#63) — Groups CRUD (uses v1.4.0 endpoints) =====
+    async loadGroups() {
+      try {
+        const r = await this.api('GET', 'groups');
+        this.groups = r.groups || [];
+      } catch {}
+    },
+    async createGroup() {
+      const name = (this.groupForm.name || '').trim();
+      if (!/^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$/.test(name)) {
+        this.toast = '✗ Invalid group name (same rules as tenant name)';
+        setTimeout(() => this.toast = '', 4000);
+        return;
+      }
+      const skills = (this.groupForm.skills_text || '')
+        .split(',').map(s => s.trim()).filter(Boolean);
+      try {
+        const r = await this.api('POST', 'groups', {
+          name, description: this.groupForm.description || '', skills,
+        });
+        if (r.error) throw new Error(r.error);
+        this.toast = '✓ Created group ' + name;
+        this.showGroupModal = false;
+        this.groupForm = { name: '', description: '', skills_text: '' };
+        await this.loadGroups();
+      } catch (e) {
+        this.toast = '✗ Create failed: ' + (e.message || e);
+      }
+      setTimeout(() => this.toast = '', 3000);
+    },
+    async addSkillToGroup(groupName) {
+      const sk = (this.addSkillToGroupName || '').trim();
+      if (!sk) return;
+      try {
+        const r = await this.api('POST', `groups/${encodeURIComponent(groupName)}/skills`, { skill: sk });
+        if (r.error) throw new Error(r.error);
+        this.addSkillToGroupName = '';
+        await this.loadGroups();
+      } catch (e) {
+        this.toast = '✗ Add failed: ' + (e.message || e);
+        setTimeout(() => this.toast = '', 3000);
+      }
+    },
+    async removeSkillFromGroup(groupName, skill) {
+      if (!confirm(`Remove "${skill}" from group "${groupName}"?`)) return;
+      try {
+        await this.api('DELETE', `groups/${encodeURIComponent(groupName)}/skills/${encodeURIComponent(skill)}`);
+        await this.loadGroups();
+      } catch (e) {
+        this.toast = '✗ Remove failed: ' + (e.message || e);
+        setTimeout(() => this.toast = '', 3000);
+      }
     },
     async refreshRootfs() {
       if (!confirm('Pull latest rootfs to all hosts?')) return;

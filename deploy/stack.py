@@ -214,6 +214,11 @@ class OpenClawOrchestratorStack(cdk.Stack):
         # Issue #17 — api Lambda writes audits and reads them back via GET /audit-log
         audit_table.grant_read_write_data(api_fn)
         assets_bucket.grant_read(api_fn)
+        # 1.4.1 (#63) — Console skills CRUD: api Lambda writes SKILL.md
+        # via PUT /skills/{name} and removes the skills/{name}/ prefix
+        # via DELETE /skills/{name}.
+        assets_bucket.grant_put(api_fn)
+        assets_bucket.grant_delete(api_fn)
         # Issue #13 — allow publishing tenant lifecycle events
         if notifications_topic is not None:
             notifications_topic.grant_publish(api_fn)
@@ -456,6 +461,11 @@ class OpenClawOrchestratorStack(cdk.Stack):
         groups_table.grant_read_data(skills_fn)
         skills_resource = api.root.add_resource("skills")
         skills_resource.add_method("GET", apigw.LambdaIntegration(skills_fn), **key_required)
+        # 1.4.1 (#63) — per-skill CRUD goes through api Lambda (reuses RBAC + audit log)
+        skill_resource = skills_resource.add_resource("{name}")
+        skill_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
+        skill_resource.add_method("PUT", apigw.LambdaIntegration(api_fn), **key_required)
+        skill_resource.add_method("DELETE", apigw.LambdaIntegration(api_fn), **key_required)
 
         # ========== Templates Lambda ==========
         templates_fn = _lambda.Function(self, "Templates",

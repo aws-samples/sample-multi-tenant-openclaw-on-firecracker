@@ -1,5 +1,72 @@
 # Changelog
 
+## [1.4.1] — 2026-05-28
+
+Console UI for skills CRUD + Skill Groups management. Closes [#63](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/63) and rounds out the v1.4.0 (#62) work by giving the Application tab a real management surface for skills and groups, no terminal needed.
+
+### Why this matters
+
+v1.4.0 added the data model + API for per-tenant / per-group skill scoping but every operator still had to `aws s3 cp ./SKILL.md s3://${ASSETS_BUCKET}/skills/{name}/SKILL.md` and wait 5 min for the cron sync to pick it up. There was no audit trail of who changed what, no in-browser preview, no way to scope skills to groups without `curl`. v1.4.1 closes that gap.
+
+### Added
+
+- **Console — Application tab → Skills card gains full CRUD**:
+  - **List** with description (existing) + skill count
+  - **View** — click a row to expand inline; `SKILL.md` is rendered with [Marked.js](https://marked.js.org/) (~30 KB CDN)
+  - **Edit** — toggle to a `<textarea>` editor, "Save" calls `PUT /skills/{name}`
+  - **Upload** — modal accepts `name` + `content` and `PUT`s a new skill
+  - **Delete** — confirmation dialog, then `DELETE /skills/{name}` removes the entire prefix (SKILL.md plus any auxiliary files)
+  - **RBAC** — viewer sees read-only list (no Edit / Delete / + New buttons)
+- **Console — Application tab → new "Skill Groups" card** (above Skills):
+  - List groups with their description + skill count
+  - **+ New Group** modal (name + description + comma-separated initial skills)
+  - Click a group to expand inline; add skills via dropdown picker (filtered to skills not already in the group); remove skills via per-tag `×` button
+  - Wired to v1.4.0's existing `GET/POST /groups`, `POST /groups/{name}/skills`, `DELETE /groups/{name}/skills/{skill}` endpoints
+- **API — three new routes on the api Lambda** (reusing existing RBAC + audit-log infrastructure):
+  - `GET /skills/{name}` — return the SKILL.md content for the editor (open to viewer)
+  - `PUT /skills/{name}` — create or replace SKILL.md (operator+; validates UTF-8, ≤256 KiB, must contain at least one top-level `# Title`)
+  - `DELETE /skills/{name}` — recursive delete of the `s3://${ASSETS_BUCKET}/skills/{name}/` prefix (operator+; idempotent — 404 if missing)
+- **Audit log entries** for every PUT / DELETE on skills, via the existing `_audit_write` hook (no new audit code)
+
+### Changed
+
+- **`stack.py`** — `/skills/{name}` resource added with GET/PUT/DELETE methods all routed to the api Lambda (which already has RBAC + audit). The list endpoint `GET /skills` stays on the dedicated skills Lambda. `assets_bucket.grant_put(api_fn)` and `grant_delete(api_fn)` added so the api Lambda can write/delete skill objects.
+- **Console state** — `loadHosts()` now calls `loadSkills()` and `loadGroups()` instead of inlining the GET; both can be refreshed independently after CRUD operations.
+
+### Tests
+
+- **16 new unit tests in `tests/test_skill_crud.py`**:
+  - `read_skill` — 3 tests (existing skill returns content, missing → 404, invalid name → 400)
+  - `update_skill` — 8 tests (create returns 201, replace returns 200, content without `# Title` → 400, empty content → 400, oversized content → 400, invalid name → 400, invalid JSON → 400, H1 after blank lines accepted)
+  - `delete_skill` — 3 tests (deletes all objects under prefix, empty prefix → 404, invalid name → 400)
+  - RBAC routing — 2 tests (`GET /skills/{name}` is in `_VIEWER_OK`, PUT/DELETE are not)
+
+**493 passed / 0 failed locally** (v1.4.0 baseline 477 + 16 new).
+
+### Operator notes
+
+- **No data migration.** The new endpoints write to the same `s3://${ASSETS_BUCKET}/skills/{name}/SKILL.md` keys the host cron has always synced from. Existing skills are visible in the console immediately.
+- **Cron sync timing unchanged**: PUT writes the file → host cron picks it up within 5 min → next VM launch on that host injects it. To deliver immediately, run the existing `POST /hosts/refresh-rootfs` flow or restart the affected VMs.
+- **DELETE removes the whole prefix**, not just SKILL.md. If you uploaded auxiliary files (diagrams, helper docs) under `skills/{name}/`, they are removed too.
+- **Marked.js is loaded from `cdn.jsdelivr.net`.** If your console is behind a strict CSP that blocks third-party CDNs, replace with a vendored copy or remove the script tag (the editor falls back to plain `<pre>` rendering).
+- **Console RBAC**: `viewer` users see the Skills + Groups lists and can preview SKILL.md, but Edit / Save / Delete / + New buttons are hidden. Server-side checks block the same writes via `_rbac_check`.
+
+### Known limitations
+
+- **No file upload of binary assets yet** — SKILL.md content is text-only via the editor. Upload diagrams/PNGs via S3 directly for now.
+- **Skill name is fixed at upload time** — no rename UI. Workaround: upload under the new name, delete the old one.
+- **No "which tenants use this skill" view** — operators can compute it from `GET /tenants` + `effective_skills` filter, but no dashboard yet.
+
+### Upgrade path
+
+```bash
+git pull && ./setup.sh <region> <profile>
+```
+
+No data migration. Console picks up the new UI on the next CloudFront cache flush.
+
+---
+
 ## [1.4.0] — 2026-05-28
 
 Per-tenant / per-group skill distribution. Closes [#62](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/62) — first-class scoping for shared skills so an SRE team's incident-response skill no longer ends up in every other tenant's filesystem.

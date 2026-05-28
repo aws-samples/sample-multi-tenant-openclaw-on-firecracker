@@ -724,7 +724,19 @@ source .env.deploy && ./build-rootfs.sh <new_version>
 # 新建 tenant 立刻用新 rootfs；已有 tenant 调 `reset` API 才会切换。
 ```
 
-### 最新：v1.3.4 → **v1.4.0**（per-tenant skill 分发 — 可选的安全加固）
+### 最新：v1.4.0 → **v1.4.1**（Console 的 skills + groups CRUD UI）
+
+v1.4.1 修复 [#63](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/63)：v1.4.0 (#62) 落地了 per-tenant skill scoping 的数据模型 + API，但运维还得开终端 `aws s3 cp` 才能编辑/上传 skill，用 `curl` 才能管 group。v1.4.1 把 Application tab 升级成真正的管理界面 —— `GET/PUT/DELETE /skills/{name}` 撑起的 Edit/Upload/Delete 按钮，加上一张连到 v1.4.0 端点的 Skill Groups 卡。
+
+```bash
+git pull && ./setup.sh <region> <profile>
+```
+
+无数据迁移。`s3://${ASSETS_BUCKET}/skills/<name>/SKILL.md` 在新编辑器里立刻可见。Console 在下一次 CloudFront 刷新生效。RBAC：`viewer` 看到只读列表 + 预览；`operator+` 看到 Edit / Delete / + New / Group 管理按钮。
+
+`tests/test_skill_crud.py` 加 16 个单元测试，覆盖 read/update/delete + content 校验（必须含 `# Title`、≤256 KiB、合法 name 正则）+ RBAC routing。**493 passed / 0 failed**（1.4.0 baseline 477 + 16 new）。
+
+### v1.3.4 → v1.4.0（per-tenant skill 分发 — 可选的安全加固）
 
 v1.4.0 修复 [#62](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/62)：v1.4.0 之前每个 VM 启动时都会被 `cp -r` 整个 `s3://${ASSETS_BUCKET}/skills/` —— 没法把 SRE 团队的应急响应 skill 隔离到只给 SRE 团队的 tenant。v1.4.0 加上 tenant 级 + group 级的 skill scoping；不设 scope 的 tenant 仍然拿到全部 skill，**完全向后兼容**。
 

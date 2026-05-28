@@ -482,7 +482,11 @@ All requests require the `x-api-key` header.
 | `GET` | `/agentcore/status` | AgentCore enable status + Gateway URL. |
 | `GET` | `/agentcore/tools` | List MCP tools registered with Gateway. |
 | `GET` | `/audit-log` | Query audit log. `?since=<ISO8601>&limit=<n>` — 90-day TTL. |
-| `GET` | `/skills` | List shared skills (S3-managed). |
+| `GET` | `/skills` | List shared skills (S3-managed). `?tenant=<id>` filters to that tenant's effective set. |
+| `GET` · `PUT` · `DELETE` | `/skills/{name}` | CRUD on individual SKILL.md (1.4.1). PUT body: `{"content":"<markdown>"}`. |
+| `GET` · `POST` | `/groups` | List / create skill groups (1.4.0). |
+| `POST` | `/groups/{name}/skills` | Add a skill to a group. Body: `{"skill":"<name>"}`. |
+| `DELETE` | `/groups/{name}/skills/{skill}` | Remove a skill from a group. |
 | `GET` · `PUT` · `DELETE` | `/templates/{name}` | CRUD for config templates (`default` is read-only). |
 | `GET` | `/system/info` | Feature flags + config snapshot (region, version, multi_az, metrics, …). |
 
@@ -724,7 +728,19 @@ source .env.deploy && ./build-rootfs.sh <new_version>
 # New tenants use the new rootfs immediately; existing tenants need a `reset` API call to switch over.
 ```
 
-### Latest: v1.3.4 → **v1.4.0** (per-tenant skill scoping — opt-in security feature)
+### Latest: v1.4.0 → **v1.4.1** (Console UI for skills + groups CRUD)
+
+v1.4.1 closes [#63](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/63): the v1.4.0 (#62) work shipped the data model + API for per-tenant skill scoping, but operators still had to `aws s3 cp` from a terminal to actually edit / upload skills, and `curl` to manage groups. v1.4.1 gives the Application tab a real management surface — Edit / Upload / Delete buttons backed by `GET/PUT/DELETE /skills/{name}`, plus a Skill Groups card wired to the v1.4.0 endpoints.
+
+```bash
+git pull && ./setup.sh <region> <profile>
+```
+
+No data migration. Existing `s3://${ASSETS_BUCKET}/skills/<name>/SKILL.md` files are visible in the new editor immediately. Console picks up the UI on the next CloudFront cache flush. RBAC: `viewer` sees read-only list + preview; `operator+` sees Edit / Delete / + New / Group management buttons.
+
+16 new unit tests in `tests/test_skill_crud.py` cover read / update / delete + content validation (must contain `# Title`, max 256 KiB, valid name regex) + RBAC routing. **493 passed / 0 failed locally** (1.4.0 baseline 477 + 16 new).
+
+### v1.3.4 → v1.4.0 (per-tenant skill scoping — opt-in security feature)
 
 v1.4.0 closes [#62](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/62): pre-1.4.0 every tenant VM got `cp -r` of every skill in `s3://${ASSETS_BUCKET}/skills/` — there was no way to keep an SRE team's incident-response skill out of every other tenant's filesystem. v1.4.0 adds tenant-level + group-level skill scoping; tenants without scoping continue to receive everything, so the upgrade is **fully backward compatible**.
 

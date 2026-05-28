@@ -50,6 +50,13 @@ AZ_FAILOVER_ENABLED = os.environ.get("AZ_FAILOVER_ENABLED", "false").lower() == 
 AZ_UNHEALTHY_THRESHOLD_MINUTES = int(os.environ.get("AZ_UNHEALTHY_THRESHOLD_MINUTES", "10"))
 AZ_COOLDOWN_MINUTES = int(os.environ.get("AZ_COOLDOWN_MINUTES", "30"))
 ASSETS_BUCKET = os.environ.get("ASSETS_BUCKET", "")
+# 1.4.2 (#fake-failover fix): public URL of the ALB (or CloudFront domain
+# in single-domain mode, or app domain in dual-domain mode) used to
+# cross-verify that a tenant's dashboard is genuinely reachable through
+# the public path before flipping DDB to status=running. Empty string
+# disables the gate, in which case the legacy 1.3.x behavior applies
+# (and operators get a CloudWatch warning each failover).
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "")
 ALB_LISTENER_ARN = os.environ.get("ALB_LISTENER_ARN", "")
 
 
@@ -515,39 +522,75 @@ def _failover_tenant_to_host(tenant, target_host, source_az, now):
             # 1.3.2: SSM exit code may not reflect reality. host-agent's
             # auto-recovery loop (every 5s) might salvage a launch that
             # transiently failed (e.g. TUNSETIFF EBUSY on a stale tap).
-            # Cross-verify by SSM-probing the target host for the firecracker
-            # process + nginx tenant conf. If both are present the VM is
-            # genuinely up — proceed as success. Only declare failure if
-            # the verification ALSO comes back NOT_RUNNING.
-            print(f"SSM reported failure ({ssm_err}); verifying VM state...")
-            if _verify_vm_actually_running(target_host_id, tenant_id, timeout_sec=90):
-                print(f"VM {tenant_id} is actually running on {target_host_id} "
-                      f"despite SSM exit code — host-agent likely auto-recovered. "
-                      f"Treating as successful failover.")
-                _emit_audit("AZ_FAILOVER_RECOVERED_BY_VERIFY", {
-                    "tenant_id": tenant_id,
-                    "from_az": source_az,
-                    "to_host": target_host_id,
-                    "ssm_err": ssm_err[:200] if ssm_err else "",
-                })
-            else:
-                raise RuntimeError(f"launch-vm.sh failed on target: {ssm_err}")
+            # Fall through to verify gate — verify is the source of truth.
+            print(f"SSM reported failure ({ssm_err}); verify gate decides.")
 
-        # 4) Repoint ALB rule to the target host's target group.
+        # 4) GATE: verify the VM is genuinely running on the target host.
+        #    1.4.2: this now includes a curl probe against
+        #    http://127.0.0.1/vm/<tid>/ to catch the case where the
+        #    Firecracker process exists but the guest never finished
+        #    booting / nginx never reloaded the new conf. Without this
+        #    gate, the previous code would return True for "VM half-up"
+        #    and the dashboard would 502 in production.
+        if not _verify_vm_actually_running(target_host_id, tenant_id, timeout_sec=120):
+            raise RuntimeError(
+                f"VM verify gate failed on target {target_host_id} "
+                f"(process / nginx conf / local HTTP all checked); "
+                f"refusing to flip DDB to running. SSM err: {ssm_err or '(none)'}"
+            )
+        # If we got here despite SSM failure, host-agent's auto-recovery
+        # likely salvaged the launch — emit an informational audit row.
+        if not ok:
+            _emit_audit("AZ_FAILOVER_RECOVERED_BY_VERIFY", {
+                "tenant_id": tenant_id,
+                "from_az": source_az,
+                "to_host": target_host_id,
+                "ssm_err": ssm_err[:200] if ssm_err else "",
+            })
+
+        # 5) GATE: re-point ALB rule to the target host's target group.
+        #    1.4.2: this MUST succeed. The previous code swallowed ALB
+        #    errors and continued to flip DDB, producing the canonical
+        #    "fake failover" where audit shows RECOVERED but the public
+        #    dashboard URL still 502s because traffic still routes to the
+        #    dead source host. We refuse to silently leave that state.
         if ALB_LISTENER_ARN:
             target_private_ip = target_host.get("private_ip")
-            if target_private_ip:
-                try:
-                    _repoint_alb_rule(tenant_id, target_host_id, target_private_ip)
-                except Exception as e:
-                    print(f"ALB repoint failed for {tenant_id}: {e}")
-                    # Don't fail the whole failover for ALB — the tenant is
-                    # running on the target host, traffic just temporarily
-                    # routes wrong. SNS alert captures this.
-                    _emit_audit("AZ_FAILOVER_ALB_REPOINT_FAILED",
-                                {"tenant_id": tenant_id, "error": str(e)[:200]})
+            if not target_private_ip:
+                raise RuntimeError(
+                    f"target host {target_host_id} has no private_ip in DDB; "
+                    f"cannot re-point ALB. Refusing to flip status to running."
+                )
+            try:
+                _repoint_alb_rule(tenant_id, target_host_id, target_private_ip)
+            except Exception as e:
+                _emit_audit("AZ_FAILOVER_ALB_REPOINT_FAILED",
+                            {"tenant_id": tenant_id, "error": str(e)[:200]})
+                raise RuntimeError(f"ALB repoint failed: {e}") from e
 
-        # 5) Best-effort: tell source host to clean its nginx conf.
+        # 6) GATE: cross-ALB reachability check. Hit the public URL the
+        #    way a real user would. This is the bug-fix gate that turns
+        #    "DDB says running" into "dashboard genuinely opens".
+        #
+        #    Skipped (with a CW warning) when PUBLIC_BASE_URL isn't set —
+        #    e.g. when the operator hasn't redeployed since 1.4.2 and the
+        #    env var was never injected. In that case we fall back to the
+        #    1.4.1 gates (process + conf + local curl) which still catch
+        #    most fake-failover cases.
+        if PUBLIC_BASE_URL:
+            if not _verify_dashboard_reachable_via_alb(
+                tenant_id, PUBLIC_BASE_URL, timeout_sec=30, poll_sec=3
+            ):
+                raise RuntimeError(
+                    f"dashboard not reachable via ALB at {PUBLIC_BASE_URL}/vm/{tenant_id}/ "
+                    f"after 30s of polling (5xx or connection refused). "
+                    f"Refusing to flip DDB — operator must investigate."
+                )
+        else:
+            print("WARN: PUBLIC_BASE_URL not set; skipping cross-ALB verify gate. "
+                  "Redeploy with 1.4.2+ stack to enable end-to-end dashboard verification.")
+
+        # 7) Best-effort: tell source host to clean its nginx conf.
         #    If the source host is unreachable (which is the whole reason
         #    we're failing over), this SSM call will time out — that's fine,
         #    we don't gate failover success on it.
@@ -564,7 +607,8 @@ def _failover_tenant_to_host(tenant, target_host, source_az, now):
             except Exception:
                 pass  # Source unreachable is the expected case.
 
-        # 6) Flip ownership in DDB. Bump next_vm_num on target host.
+        # 8) Flip ownership in DDB. ONLY now that every gate has passed.
+        #    Bump next_vm_num on target host as part of the same flip.
         tenants_table.update_item(
             Key={"id": tenant_id},
             UpdateExpression=("SET host_id = :h, vm_num = :n, #s = :running, "
@@ -605,20 +649,36 @@ def _failover_tenant_to_host(tenant, target_host, source_az, now):
         return True
     except Exception as e:
         print(f"failover failed for {tenant_id}: {e}")
+        # 1.4.2: distinguish three failure shapes so operators / tests
+        # can tell what was actually wrong:
+        #   - failover_failed_partial: VM verified up on target, but ALB
+        #     repoint or cross-ALB probe failed → DDB still points at
+        #     source. Manual ALB cleanup may be needed.
+        #   - failover_failed: VM verify itself failed → target is in an
+        #     unknown state. host-agent should garbage-collect.
+        err_str = str(e)
+        is_partial = (
+            "ALB repoint failed" in err_str
+            or "dashboard not reachable" in err_str
+            or "no private_ip" in err_str
+        )
+        new_status = "failover_failed_partial" if is_partial else "failover_failed"
         try:
             tenants_table.update_item(
                 Key={"id": tenant_id},
                 UpdateExpression="SET #s = :failed, failover_error = :e",
                 ExpressionAttributeNames={"#s": "status"},
                 ExpressionAttributeValues={
-                    ":failed": "failover_failed",
-                    ":e": str(e)[:500],
+                    ":failed": new_status,
+                    ":e": err_str[:500],
                 },
             )
         except Exception:
             pass
         _emit_audit("AZ_FAILOVER_TENANT_FAILED", {
-            "tenant_id": tenant_id, "error": str(e)[:200],
+            "tenant_id": tenant_id,
+            "error": err_str[:200],
+            "status_set": new_status,
         })
         return False
 
@@ -675,7 +735,7 @@ def _wait_ssm_done(command_id, instance_id, timeout_sec=90, poll_sec=3):
 def _verify_vm_actually_running(host_id, tenant_id, timeout_sec=90, poll_sec=10):
     """Cross-verify that a tenant's VM is really running on a host.
 
-    Why this exists (1.3.2):
+    Why this exists (1.3.2 / strengthened 1.4.2):
       SSM exit code from launch-vm.sh isn't always reliable. A transient
       kernel race (TUNSETIFF EBUSY on a stale tap, e.g.) can make the
       first launch attempt exit non-zero, but host-agent's auto-recovery
@@ -684,41 +744,138 @@ def _verify_vm_actually_running(host_id, tenant_id, timeout_sec=90, poll_sec=10)
       step, the Lambda would mark the tenant ``failover_failed`` even
       though the VM is up.
 
-    What we check:
+    What we check (1.4.2 — three signals, all must pass):
       1. Firecracker process exists with the right ``api-sock`` path.
       2. The nginx tenant config file exists.
-      Both → return True.
+      3. **NEW (#fake-failover fix)**: ``curl`` against
+         ``http://127.0.0.1/vm/<tid>/`` returns a *non-5xx* status.
+         A 200/302/401/403 all count as "service is alive and serving"
+         — only 5xx or connection-refused mean nginx is up but the VM
+         backend is dead. Without this, a Firecracker process whose
+         guest never finished booting would still pass verification
+         and we'd flip DDB to ``running`` for a dashboard nobody can
+         actually open. That is exactly the bug operators reported.
 
     Implementation: send a small SSM probe and poll get_command_invocation.
-    Returns True iff both signals are present within ``timeout_sec``.
+    Returns True iff all three signals are present within ``timeout_sec``.
     Best-effort; on any AWS error we conservatively return False so the
     Lambda still marks failure (no false-positive success reports).
     """
     import time as _t
     deadline = _t.time() + timeout_sec
+    # The probe runs as one shell command that prints VERIFIED only when
+    # all three checks pass. Using `--max-time 5` keeps the probe itself
+    # fast; the host-side nginx → VM:18789 path should respond in <500ms.
     probe_cmd = (
-        f"pgrep -f 'api-sock /data/firecracker-vms/{tenant_id}/fc.sock' >/dev/null "
-        f"&& test -f /etc/nginx/conf.d/tenants/{tenant_id}.conf "
-        f"&& echo VERIFIED || echo NOT_RUNNING"
+        f"pgrep -f 'api-sock /data/firecracker-vms/{tenant_id}/fc.sock' "
+        f">/dev/null || (echo NOT_RUNNING_NO_PROCESS; exit 1); "
+        f"test -f /etc/nginx/conf.d/tenants/{tenant_id}.conf "
+        f"|| (echo NOT_RUNNING_NO_NGINX_CONF; exit 1); "
+        # curl returns the HTTP status code only. We accept anything < 500
+        # as proof the VM backend is at least reachable through nginx.
+        # 000 = curl could not connect (nginx not reloaded, backend down).
+        # 5xx = nginx returned a backend error.
+        # Anything else = the request reached *some* HTTP-speaking process.
+        f"code=$(curl -s -o /dev/null -w '%{{http_code}}' --max-time 5 "
+        f"http://127.0.0.1/vm/{tenant_id}/); "
+        f"if [ \"$code\" = \"000\" ] || [ \"$code\" -ge 500 ] 2>/dev/null; then "
+        f"echo NOT_RUNNING_HTTP_$code; exit 1; "
+        f"else echo VERIFIED_HTTP_$code; fi"
     )
     while _t.time() < deadline:
         try:
             resp = ssm.send_command(
                 InstanceIds=[host_id],
                 DocumentName="AWS-RunShellScript",
-                Parameters={"commands": [probe_cmd], "executionTimeout": ["10"]},
+                Parameters={"commands": [probe_cmd], "executionTimeout": ["15"]},
             )
             cmd_id = resp["Command"]["CommandId"]
-            ok, _ = _wait_ssm_done(cmd_id, host_id, timeout_sec=15, poll_sec=2)
+            ok, _ = _wait_ssm_done(cmd_id, host_id, timeout_sec=20, poll_sec=2)
             if ok:
                 inv = ssm.get_command_invocation(
                     CommandId=cmd_id, InstanceId=host_id,
                 )
-                if "VERIFIED" in (inv.get("StandardOutputContent") or ""):
+                stdout = inv.get("StandardOutputContent") or ""
+                if "VERIFIED" in stdout:
                     return True
+                # Probe ran successfully but reports NOT_RUNNING_*.
+                # Print the reason to CloudWatch logs so operators can
+                # diagnose whether it's process / config / HTTP failure.
+                print(f"verify_vm probe says: {stdout.strip()[:200]}")
         except Exception as e:
             print(f"verify_vm_actually_running probe error: {e}")
         _t.sleep(poll_sec)
+    return False
+
+
+def _verify_dashboard_reachable_via_alb(tenant_id, public_base_url, timeout_sec=30, poll_sec=3):
+    """Cross-check that the tenant's dashboard URL is **reachable through
+    the public path** (ALB → nginx → VM), not just locally on the host.
+
+    Why this exists (1.4.2 — the core fix for the 'fake failover' bug):
+      The previous health_check Lambda flipped DDB ``status=running`` and
+      emitted ``AZ_FAILOVER_TENANT_RECOVERED`` as long as
+      (a) launch-vm.sh exited 0 OR the local SSM verify probe passed, and
+      (b) ALB rule re-pointing didn't throw — and even ALB throwing was
+      swallowed and didn't fail the failover. That meant operators saw
+      audit-log success while the dashboard URL still 502'd because:
+        - ALB rule was never updated to point at the new host's TG, or
+        - the new host's nginx config never reloaded, or
+        - the VM came up but the OpenClaw service inside hadn't started.
+
+      This verify gate is the public-path reality check: hit the same URL
+      a real user would hit, through CloudFront's origin (the ALB), and
+      only declare success if the response code is **non-5xx** within
+      ``timeout_sec``. That guarantees that flipping DDB → running
+      coincides with the dashboard actually working for end users.
+
+    Returns True iff a non-5xx response is received within the deadline.
+    Returns False on connection refused, timeout, or persistent 5xx.
+
+    NOTE: ``public_base_url`` should be the ALB DNS (or CloudFront domain)
+    *without* trailing slash, e.g.
+    ``http://openclaw-alb-12345.ap-northeast-1.elb.amazonaws.com``. When
+    the deployment uses a custom domain via CloudFront, the API Gateway's
+    ALB origin is still the right target — CloudFront caches don't matter
+    here because we're probing freshness anyway.
+    """
+    import time as _t
+    import urllib.request
+    import urllib.error
+
+    if not public_base_url:
+        # Couldn't resolve a base URL — fail closed. Operator must inject
+        # PUBLIC_BASE_URL via CDK or skip this gate explicitly.
+        print("cross-ALB verify SKIPPED: PUBLIC_BASE_URL not set")
+        return False
+
+    base = public_base_url.rstrip("/")
+    url = f"{base}/vm/{tenant_id}/"
+    deadline = _t.time() + timeout_sec
+    last_status = None
+    last_err = None
+    while _t.time() < deadline:
+        try:
+            req = urllib.request.Request(url, method="GET")
+            # Force IPv4-friendly behavior; ALB targets are usually private
+            # IPv4 only. Don't follow redirects — a 302 is fine evidence.
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                last_status = resp.status
+                if last_status < 500:
+                    return True
+        except urllib.error.HTTPError as e:
+            # 4xx is reachable evidence (auth challenge, CORS preflight,
+            # etc.) — only 5xx counts as backend dead.
+            last_status = e.code
+            if e.code < 500:
+                return True
+        except urllib.error.URLError as e:
+            last_err = str(e.reason) if hasattr(e, "reason") else str(e)
+        except Exception as e:
+            last_err = str(e)
+        _t.sleep(poll_sec)
+    print(f"cross-ALB verify FAILED for {tenant_id}: "
+          f"last_status={last_status}, last_err={last_err}")
     return False
 
 

@@ -728,7 +728,39 @@ source .env.deploy && ./build-rootfs.sh <new_version>
 # New tenants use the new rootfs immediately; existing tenants need a `reset` API call to switch over.
 ```
 
-### Latest: v1.4.0 → **v1.4.1** (Console UI for skills + groups CRUD)
+### Latest: v1.4.1 → **v1.4.2** (critical: fix the "fake failover" bug — strongly recommended for production)
+
+v1.4.2 fixes a **silent correctness bug** in AZ failover that a teammate caught in production: prior versions could mark `AZ_FAILOVER_TENANT_RECOVERED` and flip DDB `status=running` while the dashboard URL was completely 502. Three root causes inside `_failover_tenant_to_host`:
+
+1. The verify probe only checked process + nginx config file existence — neither proves the guest finished booting or that nginx reloaded the new conf.
+2. ALB repoint failures were silently swallowed and the failover was marked "recovered" anyway.
+3. There was no public-path probe to confirm the dashboard URL actually opens before flipping DDB.
+
+v1.4.2 makes failover **genuinely** end-to-end verified before declaring success:
+
+- **Strengthened verify probe**: now also `curl http://127.0.0.1/vm/<tid>/` and rejects 5xx / connection-refused
+- **ALB repoint failures now raise** — no more silent swallowing
+- **NEW cross-ALB reachability gate**: hits `http://<ALB_DNS>/vm/<tid>/` for up to 30s; only flips DDB after a non-5xx response
+- **NEW status `failover_failed_partial`**: VM up on target but ALB/cross-ALB failed → operator must manually fix the ALB rule
+
+```bash
+git pull && ./setup.sh <region> <profile>
+```
+
+After redeploy, the new `PUBLIC_BASE_URL` env var on the health_check Lambda activates the cross-ALB gate. Watch CloudWatch for `failover failed` log lines — they now distinguish "VM never came up" from "VM came up but ALB never updated" instead of silently emitting fake successes.
+
+**16 new unit tests in `tests/test_failover_genuine.py`** explicitly cover the three root causes (6 false-positive guards + 4 happy-path + 6 cross-ALB probe). **534 passed / 0 failed** locally.
+
+To find tenants potentially affected by the old bug:
+```bash
+aws dynamodb scan --table-name openclaw-tenants \
+  --filter-expression 'attribute_exists(failover_at) AND #s = :running' \
+  --expression-attribute-names '{"#s":"status"}' \
+  --expression-attribute-values '{":running":{"S":"running"}}' --profile $PROFILE
+# Then manually probe each dashboard URL — if any 502, that tenant was a fake-failover.
+```
+
+### v1.4.0 → v1.4.1 (Console UI for skills + groups CRUD)
 
 v1.4.1 closes [#63](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/63): the v1.4.0 (#62) work shipped the data model + API for per-tenant skill scoping, but operators still had to `aws s3 cp` from a terminal to actually edit / upload skills, and `curl` to manage groups. v1.4.1 gives the Application tab a real management surface — Edit / Upload / Delete buttons backed by `GET/PUT/DELETE /skills/{name}`, plus a Skill Groups card wired to the v1.4.0 endpoints.
 

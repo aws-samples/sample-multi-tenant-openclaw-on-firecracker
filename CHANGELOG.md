@@ -1,5 +1,79 @@
 # Changelog
 
+## [1.4.2] — 2026-05-29
+
+**Critical bug fix.** Closes the "fake failover" bug: prior versions could mark `AZ_FAILOVER_TENANT_RECOVERED` and flip DDB `status=running` while the public dashboard URL was 502'ing because the ALB still routed to the dead source host or the VM never finished booting. v1.4.2 makes failover **genuinely** end-to-end verified before declaring success.
+
+### Why this matters
+
+A teammate observed that audit logs showed `AZ_FAILOVER_TENANT_RECOVERED` for several tenants whose dashboards remained completely inaccessible. Investigation found three root causes inside `_failover_tenant_to_host`:
+
+1. **The verify probe was a paper tiger.** It only checked that a Firecracker process existed and an nginx config file was present on disk. Neither proves the guest finished booting, that nginx reloaded the new conf, or that the VM backend was actually serving HTTP.
+2. **ALB repoint failures were silently swallowed.** The previous `try/except` block caught `RuntimeError` from `_repoint_alb_rule`, logged it, and let the failover continue to flip DDB. The result: traffic kept going to the dead source host but DDB / audit / console all said "running".
+3. **No public-path verification before DDB flip.** Nothing actually opened `https://<alb>/vm/<tenant>/` to check if the failover succeeded from a real user's perspective.
+
+### Fixed
+
+- **Strengthened `_verify_vm_actually_running`** (now an unconditional gate, not a fallback). The probe checks **three** signals in one shell command:
+  1. Firecracker process with the right `api-sock` exists
+  2. `/etc/nginx/conf.d/tenants/{tid}.conf` exists
+  3. **NEW**: `curl --max-time 5 http://127.0.0.1/vm/{tid}/` returns a non-5xx HTTP status (200/302/4xx all count as "service alive"; 5xx and connection-refused mean the VM is dead-on-arrival)
+  Prints the failure reason (`NOT_RUNNING_NO_PROCESS`, `NOT_RUNNING_NO_NGINX_CONF`, `NOT_RUNNING_HTTP_502`) to CloudWatch so operators can diagnose without SSH.
+- **NEW `_verify_dashboard_reachable_via_alb`** — the gate that closes the "fake failover" hole. Hits `http://<ALB_DNS>/vm/{tid}/` directly (bypasses CloudFront cache) for up to 30 s. 4xx auth challenges and 302 redirects count as reachable; 5xx and connection errors do not. Fails closed if `PUBLIC_BASE_URL` is unset.
+- **`_failover_tenant_to_host` rewritten as 8 explicit gated steps**:
+  1. find latest backup
+  2. DDB conditional update → `failover_recovering`
+  3. SSM `launch-vm.sh` on target host
+  4. **GATE: VM verify** — must pass (any of the 3 signals fails → raise)
+  5. **GATE: ALB repoint** — must succeed (no more swallowing exceptions)
+  6. **GATE: cross-ALB reachability** — must get non-5xx within 30 s
+  7. best-effort source host nginx cleanup
+  8. **DDB flip to `running` ONLY after all gates passed** + audit `RECOVERED`
+- **New status `failover_failed_partial`** for the case where the VM verified up on the target but ALB repoint or cross-ALB probe failed. Operators can grep `failover_failed_partial` in DDB to find tenants needing manual ALB cleanup, separately from `failover_failed` (target host in unknown state).
+
+### Added
+
+- `PUBLIC_BASE_URL` env var on the health_check Lambda (CDK injects `http://<alb.load_balancer_dns_name>`). Set to empty string to disable the cross-ALB gate (fall back to 1.4.1 behavior with a CloudWatch warning).
+- `tests/test_failover_genuine.py` — **16 unit tests** explicitly covering the three root causes:
+  - 6 false-positive guards: local-curl-5xx blocks failover; ALB-fail blocks; missing `private_ip` blocks; cross-ALB-5xx blocks; cross-ALB-timeout blocks; no-`PUBLIC_BASE_URL` falls back to 1.4.1
+  - 4 happy-path tests: all gates pass returns True; emits `RECOVERED` audit; cross-ALB probe accepts 4xx as reachable; accepts 302 as reachable
+  - 6 cross-ALB probe unit tests: 200 / 4xx returns True; 5xx / connection-refused / empty-base-url returns False; transient 5xx then 200 still returns True
+
+### Tests
+
+**534 passed / 0 failed** locally (1.4.1 baseline 493 + 27 regression + 16 new failover_genuine - 2 dedup). e2e backup-restore (3 tests) also pass against the live deployment.
+
+Every false-positive scenario test asserts:
+1. `_failover_tenant_to_host` returns `False`
+2. Final tenant status is `failover_failed_partial` or `failover_failed` (never `running`)
+3. `AZ_FAILOVER_TENANT_RECOVERED` is **not** in the audit log
+
+This is the regression that the previous test suite missed.
+
+### Operator notes
+
+- **CDK redeploy required.** `./setup.sh <region> <profile>` injects the new `PUBLIC_BASE_URL` env var. Without it, the Lambda falls back to 1.4.1 behavior (still better than 1.3.x because of the strengthened verify probe) but the cross-ALB gate is skipped.
+- **No data migration.** Existing tenants with `status=failover_recovering` from interrupted older invocations are untouched.
+- **New audit operations** to monitor:
+  - `AZ_FAILOVER_ALB_REPOINT_FAILED` — ALB repoint exception (now causes failure instead of being swallowed)
+  - `AZ_FAILOVER_TENANT_FAILED` with `status_set=failover_failed_partial` — VM is up but ALB / cross-ALB gate failed; operator must manually fix ALB rule
+  - `AZ_FAILOVER_TENANT_FAILED` with `status_set=failover_failed` — VM verify itself failed; host-agent should garbage-collect
+
+### Upgrade path
+
+```bash
+git pull && ./setup.sh <region> <profile>
+```
+
+After redeploy, watch CloudWatch logs for `failover failed` lines — they now distinguish "VM never came up" from "VM came up but ALB never updated" instead of silently emitting fake successes.
+
+### Known limitations
+
+- **Cross-ALB gate uses unauthenticated HTTP.** If the deployment runs behind WAF rules that block unauthenticated traffic from outside the VPC, the gate can false-fail. Workaround: leave `PUBLIC_BASE_URL` unset (Lambda falls back to local-only verification with a CW warning).
+- **Existing already-running fake-failovered tenants are not auto-detected.** v1.4.2 only fixes new failovers. To find tenants currently in the bad state from earlier versions: `aws dynamodb scan --filter-expression 'attribute_exists(failover_at)'` and manually probe each dashboard URL.
+
+---
+
 ## [1.4.1] — 2026-05-28
 
 Console UI for skills CRUD + Skill Groups management. Closes [#63](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/63) and rounds out the v1.4.0 (#62) work by giving the Application tab a real management surface for skills and groups, no terminal needed.

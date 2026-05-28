@@ -972,6 +972,14 @@ class OpenClawOrchestratorStack(cdk.Stack):
         # 1.3.1: health_check Lambda needs ALB listener for AZ failover
         # to repoint /vm/<tenant_id>* rules across hosts.
         health_fn.add_environment("ALB_LISTENER_ARN", listener.listener_arn)
+        # 1.4.2 (#fake-failover fix): the failover gate verifies the
+        # tenant's dashboard URL is genuinely reachable through the public
+        # path (ALB → nginx → VM) before flipping DDB to running. We use
+        # the ALB DNS directly because (a) it's already public, (b) it
+        # bypasses the CloudFront cache, (c) no extra DNS hop. The probe
+        # hits http://<alb_dns>/vm/<tenant_id>/ — same path CloudFront
+        # would forward to anyway.
+        health_fn.add_environment("PUBLIC_BASE_URL", f"http://{alb.load_balancer_dns_name}")
         api_fn.add_to_role_policy(iam.PolicyStatement(
             actions=[
                 "elasticloadbalancing:CreateTargetGroup", "elasticloadbalancing:DeleteTargetGroup",

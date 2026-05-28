@@ -51,8 +51,15 @@ def _load_hc_module(env_overrides=None):
     mock_elbv2 = MagicMock()
     # 1.3.1: default SSM get_command_invocation returns Success so the
     # synchronous wait inside _failover_tenant_to_host doesn't time out.
-    # Tests that need failure can override this on mod._test_mocks["ssm"].
-    mock_ssm.get_command_invocation.return_value = {"Status": "Success"}
+    # 1.4.2: also returns VERIFIED_HTTP_200 stdout so the verify-gate
+    # probe (now an unconditional gate, not just a fallback) reports
+    # "VM is genuinely up" by default. Tests that need probe failure
+    # can override this on mod._test_mocks["ssm"] (see e.g.
+    # test_failover_genuine.py::TestFakeFailoverGuards).
+    mock_ssm.get_command_invocation.return_value = {
+        "Status": "Success",
+        "StandardOutputContent": "VERIFIED_HTTP_200\n",
+    }
     mock_ssm.send_command.return_value = {"Command": {"CommandId": "test-cmd-id"}}
     # 1.3.2: ssm.exceptions.InvocationDoesNotExist must be a real
     # Exception class — _wait_ssm_done has `except ssm.exceptions.InvocationDoesNotExist:`
@@ -485,7 +492,10 @@ class TestAZFailoverOrchestration:
             {"instance_id": "i-1a", "az": "az-a", "last_health_check": _ago_iso(15 * 60),
              "vcpu_total": 16, "vm_count": 0},
             {"instance_id": "i-2c", "az": "az-c", "last_health_check": _ago_iso(60),
-             "vcpu_total": 16, "vm_count": 0, "next_vm_num": 1, "avg_vcpu_per_vm": 2},
+             "vcpu_total": 16, "vm_count": 0, "next_vm_num": 1, "avg_vcpu_per_vm": 2,
+             # 1.4.2: private_ip is required by the fake-failover guard so
+             # _failover_tenant_to_host can re-point the ALB rule.
+             "private_ip": "172.16.2.10"},
         ]}
         # Cooldown still active (10 min ago, threshold 30 min).
         hc.hosts_table.get_item.return_value = {"Item": {
@@ -528,7 +538,10 @@ class TestAZFailoverOrchestration:
             {"instance_id": "i-1a", "az": "az-a", "last_health_check": _ago_iso(15 * 60),
              "vcpu_total": 16, "vm_count": 0},
             {"instance_id": "i-2c", "az": "az-c", "last_health_check": _ago_iso(60),
-             "vcpu_total": 16, "vm_count": 0, "next_vm_num": 1, "avg_vcpu_per_vm": 2},
+             "vcpu_total": 16, "vm_count": 0, "next_vm_num": 1, "avg_vcpu_per_vm": 2,
+             # 1.4.2: private_ip is required by the fake-failover guard so
+             # _failover_tenant_to_host can re-point the ALB rule.
+             "private_ip": "172.16.2.10"},
         ]}
         hc.hosts_table.get_item.return_value = {"Item": {}}
         # Force audit_table.put_item to raise.

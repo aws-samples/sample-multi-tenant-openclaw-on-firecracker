@@ -724,7 +724,39 @@ source .env.deploy && ./build-rootfs.sh <new_version>
 # 新建 tenant 立刻用新 rootfs；已有 tenant 调 `reset` API 才会切换。
 ```
 
-### 最新：v1.4.0 → **v1.4.1**（Console 的 skills + groups CRUD UI）
+### 最新：v1.4.1 → **v1.4.2**（关键修复：修复"假 failover" bug — 生产强烈推荐升级）
+
+v1.4.2 修复一个**沉默的正确性 bug**：之前的版本可能标记 `AZ_FAILOVER_TENANT_RECOVERED` 并把 DDB flip 到 `status=running`，但实际 dashboard URL 是 502 不通的。三个根因都在 `_failover_tenant_to_host`：
+
+1. verify probe 只检查 firecracker 进程和 nginx conf 文件存在 —— 既不能证明 guest 启动完了，也不能证明 nginx reload 了新 conf
+2. ALB repoint 失败被静默 swallow，failover 仍标记成 "recovered"
+3. flip DDB 之前没有任何一步真去确认 dashboard URL 能打开
+
+v1.4.2 让 failover **真正** end-to-end 验证之后才标 success：
+
+- **强化 verify probe**：加 `curl http://127.0.0.1/vm/<tid>/` 检查，5xx / connection-refused 都视为失败
+- **ALB repoint 失败现在 raise** — 不再 swallow
+- **新增跨 ALB 可达性 gate**：直接打 `http://<ALB_DNS>/vm/<tid>/`，30s 内必须回非 5xx，否则不 flip DDB
+- **新状态 `failover_failed_partial`**：VM 起来了但 ALB/跨-ALB 失败 → 运维必须人工修 ALB rule
+
+```bash
+git pull && ./setup.sh <region> <profile>
+```
+
+redeploy 后，health_check Lambda 多了 `PUBLIC_BASE_URL` 环境变量（由 CDK 自动注入 `http://<alb_dns>`），跨 ALB gate 启用。CloudWatch 日志现在会区分 "VM 没起来" 和 "VM 起来了但 ALB 没更新"，不再静默吐 fake success。
+
+`tests/test_failover_genuine.py` 加 16 个新单测明确覆盖三个根因（6 假阳性 + 4 happy-path + 6 跨 ALB probe）。**534 passed / 0 failed**。
+
+要找出可能被老 bug 影响的租户：
+```bash
+aws dynamodb scan --table-name openclaw-tenants \
+  --filter-expression 'attribute_exists(failover_at) AND #s = :running' \
+  --expression-attribute-names '{"#s":"status"}' \
+  --expression-attribute-values '{":running":{"S":"running"}}' --profile $PROFILE
+# 然后人工 probe 每个 dashboard URL — 502 的就是 fake-failover 受害者
+```
+
+### v1.4.0 → v1.4.1（Console 的 skills + groups CRUD UI）
 
 v1.4.1 修复 [#63](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/63)：v1.4.0 (#62) 落地了 per-tenant skill scoping 的数据模型 + API，但运维还得开终端 `aws s3 cp` 才能编辑/上传 skill，用 `curl` 才能管 group。v1.4.1 把 Application tab 升级成真正的管理界面 —— `GET/PUT/DELETE /skills/{name}` 撑起的 Edit/Upload/Delete 按钮，加上一张连到 v1.4.0 端点的 Skill Groups 卡。
 

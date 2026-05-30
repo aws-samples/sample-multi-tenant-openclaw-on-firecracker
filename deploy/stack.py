@@ -326,64 +326,93 @@ class OpenClawOrchestratorStack(cdk.Stack):
 
         key_required = {"api_key_required": True}
 
+        # ── Lambda permission policy size fix (deploy-blocking) ──
+        # Each `LambdaIntegration(api_fn)` makes CDK attach a *separate*
+        # AWS::Lambda::Permission scoped to that one method's ARN. With ~29
+        # routes the function's resource-based policy crossed Lambda's hard
+        # 20480-byte limit, so EVERY `cdk deploy` failed with
+        # "The final policy size (20485) is bigger than the limit (20480)".
+        # Fix: grant API Gateway invoke ONCE via a wildcard source ARN, and
+        # build integrations against an *imported* view of the function.
+        # CDK does not auto-add per-method permissions for an imported
+        # IFunction (it assumes it doesn't own it), so the policy stays at a
+        # single statement regardless of how many routes we add.
+        api_fn.add_permission("ApiGwInvoke",
+            principal=iam.ServicePrincipal("apigateway.amazonaws.com"),
+            action="lambda:InvokeFunction",
+            source_arn=Fn.join("", [
+                "arn:", cdk.Aws.PARTITION, ":execute-api:", cdk.Aws.REGION,
+                ":", cdk.Aws.ACCOUNT_ID, ":", api.rest_api_id, "/*/*",
+            ]),
+        )
+        _api_fn_view = _lambda.Function.from_function_arn(
+            self, "ApiHandlerView", api_fn.function_arn,
+        )
+
+        def _li():
+            """A LambdaIntegration that does NOT add a per-method permission
+            (built against the imported view). The single wildcard permission
+            above authorises every method."""
+            return apigw.LambdaIntegration(_api_fn_view)
+
         tenants_resource = api.root.add_resource("tenants")
-        tenants_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
-        tenants_resource.add_method("POST", apigw.LambdaIntegration(api_fn), **key_required)
+        tenants_resource.add_method("GET", _li(), **key_required)
+        tenants_resource.add_method("POST", _li(), **key_required)
 
         tenant_resource = tenants_resource.add_resource("{id}")
-        tenant_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
-        tenant_resource.add_method("DELETE", apigw.LambdaIntegration(api_fn), **key_required)
+        tenant_resource.add_method("GET", _li(), **key_required)
+        tenant_resource.add_method("DELETE", _li(), **key_required)
 
         tenant_action = tenant_resource.add_resource("{action}")
-        tenant_action.add_method("POST", apigw.LambdaIntegration(api_fn), **key_required)
-        tenant_action.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
+        tenant_action.add_method("POST", _li(), **key_required)
+        tenant_action.add_method("GET", _li(), **key_required)
 
         hosts_resource = api.root.add_resource("hosts")
-        hosts_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
-        hosts_resource.add_method("POST", apigw.LambdaIntegration(api_fn), **key_required)
+        hosts_resource.add_method("GET", _li(), **key_required)
+        hosts_resource.add_method("POST", _li(), **key_required)
 
         host_resource = hosts_resource.add_resource("{instance_id}")
-        host_resource.add_method("DELETE", apigw.LambdaIntegration(api_fn), **key_required)
+        host_resource.add_method("DELETE", _li(), **key_required)
 
         backups_resource = api.root.add_resource("backups")
-        backups_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
+        backups_resource.add_method("GET", _li(), **key_required)
 
         # 1.4.0 (#62) — Groups CRUD endpoints
         groups_resource = api.root.add_resource("groups")
-        groups_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
-        groups_resource.add_method("POST", apigw.LambdaIntegration(api_fn), **key_required)
+        groups_resource.add_method("GET", _li(), **key_required)
+        groups_resource.add_method("POST", _li(), **key_required)
         group_resource = groups_resource.add_resource("{name}")
         group_skills_resource = group_resource.add_resource("skills")
-        group_skills_resource.add_method("POST", apigw.LambdaIntegration(api_fn), **key_required)
+        group_skills_resource.add_method("POST", _li(), **key_required)
         group_skill_resource = group_skills_resource.add_resource("{skill}")
-        group_skill_resource.add_method("DELETE", apigw.LambdaIntegration(api_fn), **key_required)
+        group_skill_resource.add_method("DELETE", _li(), **key_required)
 
         # Issue #23 — batch operations: POST /batch/tenants
         batch_resource = api.root.add_resource("batch")
         batch_tenants_resource = batch_resource.add_resource("tenants")
-        batch_tenants_resource.add_method("POST", apigw.LambdaIntegration(api_fn), **key_required)
+        batch_tenants_resource.add_method("POST", _li(), **key_required)
 
         refresh_rootfs_resource = hosts_resource.add_resource("refresh-rootfs")
-        refresh_rootfs_resource.add_method("POST", apigw.LambdaIntegration(api_fn), **key_required)
+        refresh_rootfs_resource.add_method("POST", _li(), **key_required)
 
         rootfs_version_resource = hosts_resource.add_resource("rootfs-version")
-        rootfs_version_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
+        rootfs_version_resource.add_method("GET", _li(), **key_required)
 
         agentcore_resource = api.root.add_resource("agentcore")
         agentcore_status_resource = agentcore_resource.add_resource("status")
-        agentcore_status_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
+        agentcore_status_resource.add_method("GET", _li(), **key_required)
         agentcore_tools_resource = agentcore_resource.add_resource("tools")
-        agentcore_tools_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
+        agentcore_tools_resource.add_method("GET", _li(), **key_required)
 
         # /system/info — feature flags + config snapshot for the console
         system_resource = api.root.add_resource("system")
         system_info_resource = system_resource.add_resource("info")
-        system_info_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
+        system_info_resource.add_method("GET", _li(), **key_required)
 
         # /audit-log — already created earlier in the routes, but the
         # resource needs to exist on the REST API; declare it here once.
         audit_log_resource = api.root.add_resource("audit-log")
-        audit_log_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
+        audit_log_resource.add_method("GET", _li(), **key_required)
 
         # ========== Health Check Lambda ==========
         hc_cfg = CFG.get("health_check", {}) or {}
@@ -463,9 +492,9 @@ class OpenClawOrchestratorStack(cdk.Stack):
         skills_resource.add_method("GET", apigw.LambdaIntegration(skills_fn), **key_required)
         # 1.4.1 (#63) — per-skill CRUD goes through api Lambda (reuses RBAC + audit log)
         skill_resource = skills_resource.add_resource("{name}")
-        skill_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
-        skill_resource.add_method("PUT", apigw.LambdaIntegration(api_fn), **key_required)
-        skill_resource.add_method("DELETE", apigw.LambdaIntegration(api_fn), **key_required)
+        skill_resource.add_method("GET", _li(), **key_required)
+        skill_resource.add_method("PUT", _li(), **key_required)
+        skill_resource.add_method("DELETE", _li(), **key_required)
 
         # ========== Templates Lambda ==========
         templates_fn = _lambda.Function(self, "Templates",
@@ -738,6 +767,19 @@ class OpenClawOrchestratorStack(cdk.Stack):
 
         cfn_lt = launch_template.node.default_child
 
+        # ── SECURITY (defense-in-depth for IMDS): require IMDSv2 + hop-limit 1 ──
+        # The primary guest→IMDS egress block is the iptables DROP in
+        # launch-vm.sh; this hardens the host side. Requiring session tokens
+        # (HttpTokens=required) kills IMDSv1 credential theft via simple SSRF,
+        # and HttpPutResponseHopLimit=1 stops a process one network hop away
+        # from obtaining a token. host-agent.py / the AWS SDK use the IMDSv2
+        # flow, so this is transparent to legitimate callers.
+        cfn_lt.add_property_override("LaunchTemplateData.MetadataOptions", {
+            "HttpTokens": "required",
+            "HttpPutResponseHopLimit": 1,
+            "HttpEndpoint": "enabled",
+        })
+
         if CFG["asg"].get("use_spot"):
             cfn_lt.add_property_override("LaunchTemplateData.InstanceMarketOptions", {
                 "MarketType": "spot",
@@ -753,6 +795,16 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 "SourceVersion": "$Latest",
                 "LaunchTemplateData": {
                     "CpuOptions": {"NestedVirtualization": "enabled"},
+                    # Carry the IMDSv2/hop-limit hardening into the nested-virt
+                    # version too. CreateLaunchTemplateVersion merges onto
+                    # SourceVersion=$Latest so this would normally be inherited,
+                    # but we restate it so the security posture is explicit and
+                    # cannot silently regress if the base override is removed.
+                    "MetadataOptions": {
+                        "HttpTokens": "required",
+                        "HttpPutResponseHopLimit": 1,
+                        "HttpEndpoint": "enabled",
+                    },
                 },
             },
             physical_resource_id=cr.PhysicalResourceId.of(

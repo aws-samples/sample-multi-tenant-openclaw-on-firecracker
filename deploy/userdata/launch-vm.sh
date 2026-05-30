@@ -223,6 +223,20 @@ sudo ip addr add ${HOST_TAP_IP}/24 dev ${TAP}
 sudo ip link set dev ${TAP} up
 HOST_IFACE=$(ip route show default | awk '{print $5}' | head -1)
 sudo sysctl -q -w net.ipv4.ip_forward=1
+# ── SECURITY (multi-tenant isolation): block guest → instance metadata ──
+# Without this, a tenant inside its microVM can reach the host's IMDS at
+# 169.254.169.254 through the MASQUERADE rule below and steal the host EC2
+# instance-profile credentials (which can read/write the shared assets bucket
+# and the tenants/hosts tables — i.e. every other tenant's data). Drop all
+# guest-originated traffic to the link-local IMDS range BEFORE the ACCEPT
+# rules. -I inserts at the top so it always precedes the FORWARD ACCEPT.
+# Also covers IMDSv6 (fd00:ec2::254) defensively.
+sudo iptables -C FORWARD -i ${TAP} -d 169.254.169.254 -j DROP 2>/dev/null || \
+  sudo iptables -I FORWARD 1 -i ${TAP} -d 169.254.169.254 -j DROP
+sudo iptables -C FORWARD -i ${TAP} -d 169.254.169.253 -j DROP 2>/dev/null || \
+  sudo iptables -I FORWARD 1 -i ${TAP} -d 169.254.169.253 -j DROP
+sudo iptables -t nat -C PREROUTING -i ${TAP} -d 169.254.169.254 -j DROP 2>/dev/null || \
+  sudo iptables -t nat -I PREROUTING 1 -i ${TAP} -d 169.254.169.254 -j DROP
 sudo iptables -t nat -C POSTROUTING -o ${HOST_IFACE} -j MASQUERADE 2>/dev/null || \
   sudo iptables -t nat -A POSTROUTING -o ${HOST_IFACE} -j MASQUERADE
 sudo iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \

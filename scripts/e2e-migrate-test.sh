@@ -89,17 +89,36 @@ for h in "${HOSTS[@]}"; do [ "$h" != "$SRC" ] && TARGET="$h" && break; done
 say "migrating $TENANT  ${SRC} → ${TARGET}"
 [ -n "$TARGET" ] || { echo "no target host distinct from source"; exit 1; }
 
-# ── 3. Drive the migrate API and verify ──
-RESP=$(curl -s -X POST "${API_URL%/}/tenants/$TENANT/migrate" \
+# ── 3. Drive the migrate API (async) and poll to completion ──
+# migrate is async (1.4.4): the API returns 202 immediately and the
+# health_check sweep finishes the move out-of-band (snapshot → restore →
+# verify → flip). We POST, expect 202, then poll GET /tenants/{id} until the
+# status leaves `migrating` (→ running on success, or back to running with
+# migration_failed set on failure). The sweep runs on the health_check
+# schedule (every few minutes), so allow generous time.
+RESP=$(curl -s -w '\n%{http_code}' -X POST "${API_URL%/}/tenants/$TENANT/migrate" \
   -H "x-api-key: ${API_KEY}" -H "Content-Type: application/json" \
   -d "{\"target_host_id\":\"$TARGET\"}")
-echo "  API response: $RESP"
+CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+echo "  POST /migrate → HTTP $CODE"
+echo "  body: $BODY"
+[ "$CODE" = "202" ] || { echo "  ✗ expected 202 Accepted, got $CODE"; exit 1; }
 
-NEWHOST=$("${AWS[@]}" dynamodb get-item --table-name "$TENANTS_TABLE" \
-  --key "{\"id\":{\"S\":\"$TENANT\"}}" --query 'Item.host_id.S' --output text)
-STATUS=$("${AWS[@]}" dynamodb get-item --table-name "$TENANTS_TABLE" \
-  --key "{\"id\":{\"S\":\"$TENANT\"}}" --query 'Item.status.S' --output text)
-say "post-migrate DDB: host_id=$NEWHOST status=$STATUS (expected host=$TARGET status=running)"
+say "polling GET /tenants/$TENANT until migration settles (max ~12 min)"
+NEWHOST=""; STATUS="migrating"; MFAIL=""
+for i in $(seq 1 72); do   # 72 × 10s = 12 min
+  sleep 10
+  T=$(curl -s "${API_URL%/}/tenants/$TENANT" -H "x-api-key: ${API_KEY}")
+  STATUS=$(echo "$T" | sed -n 's/.*"status"[ ]*:[ ]*"\([^"]*\)".*/\1/p')
+  NEWHOST=$(echo "$T" | sed -n 's/.*"host_id"[ ]*:[ ]*"\([^"]*\)".*/\1/p')
+  MFAIL=$(echo "$T" | sed -n 's/.*"migration_failed"[ ]*:[ ]*"\([^"]*\)".*/\1/p')
+  printf '  [%2d] status=%s host=%s\n' "$i" "${STATUS:-?}" "${NEWHOST:-?}"
+  # Terminal: either flipped to target+running, or migration_failed surfaced.
+  if [ "$STATUS" = "running" ] && [ "$NEWHOST" = "$TARGET" ]; then break; fi
+  if [ -n "$MFAIL" ]; then echo "  migration_failed: $MFAIL"; break; fi
+done
+say "post-migrate: host_id=$NEWHOST status=$STATUS (expected host=$TARGET status=running)"
 
 # Source host must no longer run the tenant's firecracker process.
 say "checking source host no longer runs the VM"

@@ -890,124 +890,71 @@ def tenant_action(tenant_id, action, body=None):
         target_vm_num = int(target.get("next_vm_num", 1))
         now = _now()
 
-        # ── Issue #64 — synchronous, fail-safe migration ──
-        # Prior to this fix the migrate path used fire-and-forget _ssm_send and
-        # flipped DDB within ~1s, while snapshot+restore actually take 30-60s.
-        # If migrate-vm.sh failed (it was never even deployed — see setup.sh /
-        # init-host.sh), DDB was already mutated and routing was already torn
-        # down, leaving the tenant pointing at a host with no VM. We now mirror
-        # the AZ-failover pattern: mark `migrating` first, wait for SSM on BOTH
-        # hosts, and only mutate the source-of-truth (DDB + counters + routing)
-        # after both succeed. Any failure returns 5xx with DDB untouched.
+        # ── Issue #64 — ASYNC, fail-safe migration ──
+        # A correct migration runs snapshot(source)+restore(target), which now
+        # ship multi-GB disk images and take *minutes*. API Gateway caps a
+        # synchronous integration at 29s, so we cannot block here (an earlier
+        # synchronous version returned "Endpoint request timed out" and could
+        # leave the tenant stuck in `migrating`). Instead:
+        #   1. Do all the cheap validation synchronously (done above).
+        #   2. Fire-and-forget the snapshot via _ssm_send (returns a CommandId).
+        #   3. Record migrating + the async context in DDB and return 202.
+        # The health_check Lambda's 5-min sweep (_advance_migration) polls the
+        # SSM CommandId, triggers restore when snapshot succeeds, verifies the
+        # dashboard through the public path, and only then flips host_id /
+        # counters / routing → running. Any failure (or a 15-min watchdog)
+        # rolls status back to running with host_id untouched, so the tenant
+        # is never left pointing at a host with no VM. The source of truth is
+        # only mutated after the whole move is proven — same fail-safe contract
+        # as before, just driven out-of-band instead of in the request path.
 
-        # 0) Mark `migrating` BEFORE any data-plane work so the console doesn't
-        #    show a stale `running` during the 30-60s in-flight window.
-        tenants_table.update_item(
-            Key={"id": tenant_id},
-            UpdateExpression="SET #s = :s, updated_at = :t",
-            ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={":s": "migrating", ":t": now},
-        )
-
-        def _abort(code, msg):
-            # Restore the tenant's prior status; DDB host_id / counters / routing
-            # were never touched, so the tenant is still genuinely on the source.
-            tenants_table.update_item(
-                Key={"id": tenant_id},
-                UpdateExpression="SET #s = :s, updated_at = :t",
-                ExpressionAttributeNames={"#s": "status"},
-                ExpressionAttributeValues={":s": item.get("status", "running"), ":t": _now()},
-            )
-            print(f"migrate {tenant_id}: ABORT {code} — {msg}")
-            return _resp(code, {"error": msg, "id": tenant_id,
-                                "source_host_id": source_host_id,
-                                "target_host_id": target_host_id})
-
-        # 1) Source host: pause + snapshot + upload to S3. _ssm_run BLOCKS and
-        #    returns False on any non-Success status (incl. exit 127 if the
-        #    script is missing). Snapshot can take ~30s, so allow 120s.
-        snap_ok = _ssm_run(
+        snap_cmd = _ssm_send(
             source_host_id,
             f"/home/ubuntu/migrate-vm.sh snapshot {tenant_id} {vm_num} "
             f"s3://{bucket}/{snap_prefix}",
-            timeout=120,
+            timeout=600,   # snapshot + multi-GB disk upload to S3
         )
-        if not snap_ok:
-            # Source VM is still running (migrate-vm.sh resumes it after the
-            # snapshot, and on failure we never paused → never moved it).
-            return _abort(502, "snapshot failed on source host; tenant left on source")
+        if not snap_cmd:
+            # Couldn't even submit the SSM command — nothing started, DDB clean.
+            return _resp(502, {"error": "failed to start migration (SSM submit)",
+                               "id": tenant_id,
+                               "source_host_id": source_host_id,
+                               "target_host_id": target_host_id})
 
-        # 2) Target host: download + restore. Also ~30s.
-        restore_ok = _ssm_run(
-            target_host_id,
-            f"/home/ubuntu/migrate-vm.sh restore {tenant_id} {target_vm_num} "
-            f"s3://{bucket}/{snap_prefix}",
-            timeout=120,
-        )
-        if not restore_ok:
-            # Best-effort rollback: the source VM still exists (we only paused
-            # briefly for the snapshot, then resumed). Nothing to undo in DDB.
-            return _abort(502, "restore failed on target host; tenant left on source")
-
-        # 3) Both SSM commands succeeded — NOW mutate the source of truth.
-        #    tenant.host_id flips, source counters --, target counters ++,
-        #    status back to running.
-        now = _now()
+        # Mark migrating + stash everything the sweep needs to finish the move.
+        # No host_id / counter / routing change happens here — only after the
+        # sweep proves snapshot+restore+dashboard all succeeded.
         tenants_table.update_item(
             Key={"id": tenant_id},
-            UpdateExpression=("SET host_id = :h, vm_num = :n, "
-                              "migration_source = :src, #s = :st, updated_at = :t"),
+            UpdateExpression=(
+                "SET #s = :s, migration_target = :tgt, "
+                "migration_target_vm_num = :tvn, migration_source = :src, "
+                "migration_snap_cmd = :scmd, migration_phase = :ph, "
+                "migration_started_at = :st, migration_snapshot_uri = :uri, "
+                "updated_at = :t"
+            ),
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
-                ":h": target_host_id, ":n": target_vm_num,
-                ":src": source_host_id, ":st": "running", ":t": now,
-            },
-        )
-        hosts_table.update_item(
-            Key={"instance_id": source_host_id},
-            UpdateExpression=("SET used_vcpu = used_vcpu - :v, "
-                              "used_mem_mb = used_mem_mb - :m, "
-                              "vm_count = vm_count - :one"),
-            ExpressionAttributeValues={":v": vcpu, ":m": mem_mb, ":one": 1},
-        )
-        hosts_table.update_item(
-            Key={"instance_id": target_host_id},
-            UpdateExpression=("SET used_vcpu = used_vcpu + :v, "
-                              "used_mem_mb = used_mem_mb + :m, "
-                              "vm_count = vm_count + :one, "
-                              "next_vm_num = :next"),
-            ExpressionAttributeValues={
-                ":v": vcpu, ":m": mem_mb, ":one": 1,
-                ":next": target_vm_num + 1,
+                ":s": "migrating",
+                ":tgt": target_host_id,
+                ":tvn": target_vm_num,
+                ":src": source_host_id,
+                ":scmd": snap_cmd,
+                ":ph": "snapshot",
+                ":st": now,
+                ":uri": f"s3://{bucket}/{snap_prefix}",
+                ":t": now,
             },
         )
 
-        # 4) 1.3.1: Repoint ALB rule to target host's TG so CloudFront stops
-        # sending /vm/<tenant_id>* traffic to the old host. Without this
-        # the migration completes on the data plane but routing is stale.
-        try:
-            target_private_ip = target.get("private_ip", "")
-            if target_private_ip:
-                target_tg = _ensure_host_tg(target_host_id, target_private_ip)
-                _repoint_alb_rule_to_tg(tenant_id, target_tg)
-        except Exception as e:
-            print(f"migrate: ALB repoint failed for {tenant_id}: {e}")
-
-        # 5) 1.3.1: Clean up source host's nginx tenant config + stop the old VM
-        # so it stops advertising itself as a backend and frees the source slot.
-        # Best-effort — if source is dead the cleanup happens at decommission.
-        try:
-            _ssm_send(source_host_id,
-                      f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num} ; "
-                      f"sudo rm -f /etc/nginx/conf.d/tenants/{tenant_id}.conf "
-                      f"&& sudo nginx -s reload")
-        except Exception:
-            pass
-
-        return _resp(200, {
-            "id": tenant_id, "status": "running",
+        # 202 Accepted: the move is in flight. Clients poll GET /tenants/{id}
+        # until status is `running` (success) or back to its prior value with
+        # migration_failed set (failure).
+        return _resp(202, {
+            "id": tenant_id, "status": "migrating",
             "source_host_id": source_host_id, "target_host_id": target_host_id,
             "snapshot_uri": f"s3://{bucket}/{snap_prefix}",
+            "poll": f"/tenants/{tenant_id}",
         })
 
     if action == "restart":
@@ -1829,17 +1776,23 @@ def _launch_vm(instance_id, tenant_id, vm_num, vcpu, mem_mb, guest_ip, host_port
 
 
 def _ssm_send(instance_id, command, timeout=120):
-    """Fire-and-forget SSM command. Status tracked by health check."""
+    """Fire-and-forget SSM command. Returns the CommandId (str) so callers can
+    later poll get_command_invocation for completion, or None if submission
+    failed. Existing call sites that ignore the return value are unaffected;
+    the async migrate path (issue #64) stores the CommandId in DynamoDB so the
+    health_check sweep can advance the migration out-of-band."""
     try:
         wrapped = f'export HOME=/home/ubuntu && cd /home/ubuntu && {command}'
-        ssm.send_command(
+        resp = ssm.send_command(
             InstanceIds=[instance_id],
             DocumentName="AWS-RunShellScript",
             Parameters={"commands": [wrapped], "executionTimeout": [str(timeout)]},
             TimeoutSeconds=timeout + 10,
         )
+        return resp["Command"]["CommandId"]
     except Exception as e:
         print(f"SSM send error: {e}")
+        return None
 
 
 def _ssm_run(instance_id, command, timeout=30):

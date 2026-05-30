@@ -831,14 +831,23 @@ def tenant_action(tenant_id, action, body=None):
         vm_num = int(item.get("vm_num", 1))
         if not host_id:
             return _resp(400, {"error": "tenant has no host (still pending?)"})
-        _ssm_send(host_id, f"/home/ubuntu/resize-disk.sh {tenant_id} {vm_num} {new_size}")
+        # Issue #64-class fix: resize-disk.sh was never deployed (same defect
+        # as migrate-vm.sh) AND this path was fire-and-forget — it flipped
+        # data_disk_mb in DDB before the host had even run the script, so DDB
+        # claimed the new size whether or not the ext4 grow actually happened.
+        # Now: run synchronously, and only persist the new size on Success.
+        if not _ssm_run(host_id,
+                        f"/home/ubuntu/resize-disk.sh {tenant_id} {vm_num} {new_size}",
+                        timeout=120):
+            return _resp(502, {"error": "resize-disk.sh failed on host; size unchanged",
+                               "id": tenant_id, "data_disk_mb": current})
         tenants_table.update_item(
             Key={"id": tenant_id},
             UpdateExpression="SET data_disk_mb = :s, updated_at = :t",
             ExpressionAttributeValues={":s": new_size, ":t": _now()},
         )
-        return _resp(202, {
-            "id": tenant_id, "status": "resizing",
+        return _resp(200, {
+            "id": tenant_id, "status": "running",
             "old_size_mb": current, "new_size_mb": new_size,
         })
 
@@ -878,29 +887,80 @@ def tenant_action(tenant_id, action, body=None):
         vm_num = int(item.get("vm_num", 1))
         bucket = os.environ.get("ASSETS_BUCKET", "")
         snap_prefix = f"migrations/{tenant_id}"
-
-        # 1) Source host: pause + snapshot + upload to S3.
-        # The migrate-vm.sh script (deploy/userdata/migrate-vm.sh, ssm_run sees
-        # the same path on every host) handles the Firecracker API calls.
-        _ssm_send(source_host_id,
-                  f"/home/ubuntu/migrate-vm.sh snapshot {tenant_id} {vm_num} "
-                  f"s3://{bucket}/{snap_prefix}")
-
-        # 2) Target host: download + restore.
         target_vm_num = int(target.get("next_vm_num", 1))
-        _ssm_send(target_host_id,
-                  f"/home/ubuntu/migrate-vm.sh restore {tenant_id} {target_vm_num} "
-                  f"s3://{bucket}/{snap_prefix}")
+        now = _now()
 
-        # 3) Update DDB: tenant.host_id flips, source counters --, target counters ++.
+        # ── Issue #64 — synchronous, fail-safe migration ──
+        # Prior to this fix the migrate path used fire-and-forget _ssm_send and
+        # flipped DDB within ~1s, while snapshot+restore actually take 30-60s.
+        # If migrate-vm.sh failed (it was never even deployed — see setup.sh /
+        # init-host.sh), DDB was already mutated and routing was already torn
+        # down, leaving the tenant pointing at a host with no VM. We now mirror
+        # the AZ-failover pattern: mark `migrating` first, wait for SSM on BOTH
+        # hosts, and only mutate the source-of-truth (DDB + counters + routing)
+        # after both succeed. Any failure returns 5xx with DDB untouched.
+
+        # 0) Mark `migrating` BEFORE any data-plane work so the console doesn't
+        #    show a stale `running` during the 30-60s in-flight window.
+        tenants_table.update_item(
+            Key={"id": tenant_id},
+            UpdateExpression="SET #s = :s, updated_at = :t",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":s": "migrating", ":t": now},
+        )
+
+        def _abort(code, msg):
+            # Restore the tenant's prior status; DDB host_id / counters / routing
+            # were never touched, so the tenant is still genuinely on the source.
+            tenants_table.update_item(
+                Key={"id": tenant_id},
+                UpdateExpression="SET #s = :s, updated_at = :t",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={":s": item.get("status", "running"), ":t": _now()},
+            )
+            print(f"migrate {tenant_id}: ABORT {code} — {msg}")
+            return _resp(code, {"error": msg, "id": tenant_id,
+                                "source_host_id": source_host_id,
+                                "target_host_id": target_host_id})
+
+        # 1) Source host: pause + snapshot + upload to S3. _ssm_run BLOCKS and
+        #    returns False on any non-Success status (incl. exit 127 if the
+        #    script is missing). Snapshot can take ~30s, so allow 120s.
+        snap_ok = _ssm_run(
+            source_host_id,
+            f"/home/ubuntu/migrate-vm.sh snapshot {tenant_id} {vm_num} "
+            f"s3://{bucket}/{snap_prefix}",
+            timeout=120,
+        )
+        if not snap_ok:
+            # Source VM is still running (migrate-vm.sh resumes it after the
+            # snapshot, and on failure we never paused → never moved it).
+            return _abort(502, "snapshot failed on source host; tenant left on source")
+
+        # 2) Target host: download + restore. Also ~30s.
+        restore_ok = _ssm_run(
+            target_host_id,
+            f"/home/ubuntu/migrate-vm.sh restore {tenant_id} {target_vm_num} "
+            f"s3://{bucket}/{snap_prefix}",
+            timeout=120,
+        )
+        if not restore_ok:
+            # Best-effort rollback: the source VM still exists (we only paused
+            # briefly for the snapshot, then resumed). Nothing to undo in DDB.
+            return _abort(502, "restore failed on target host; tenant left on source")
+
+        # 3) Both SSM commands succeeded — NOW mutate the source of truth.
+        #    tenant.host_id flips, source counters --, target counters ++,
+        #    status back to running.
         now = _now()
         tenants_table.update_item(
             Key={"id": tenant_id},
             UpdateExpression=("SET host_id = :h, vm_num = :n, "
-                              "migration_source = :s, updated_at = :t"),
+                              "migration_source = :src, #s = :st, updated_at = :t"),
+            ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
                 ":h": target_host_id, ":n": target_vm_num,
-                ":s": source_host_id, ":t": now,
+                ":src": source_host_id, ":st": "running", ":t": now,
             },
         )
         hosts_table.update_item(
@@ -933,18 +993,19 @@ def tenant_action(tenant_id, action, body=None):
         except Exception as e:
             print(f"migrate: ALB repoint failed for {tenant_id}: {e}")
 
-        # 5) 1.3.1: Clean up source host's nginx tenant config so it stops
-        # advertising itself as a backend. Best-effort — if source is dead
-        # the cleanup will happen when the host is decommissioned.
+        # 5) 1.3.1: Clean up source host's nginx tenant config + stop the old VM
+        # so it stops advertising itself as a backend and frees the source slot.
+        # Best-effort — if source is dead the cleanup happens at decommission.
         try:
             _ssm_send(source_host_id,
+                      f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num} ; "
                       f"sudo rm -f /etc/nginx/conf.d/tenants/{tenant_id}.conf "
                       f"&& sudo nginx -s reload")
         except Exception:
             pass
 
-        return _resp(202, {
-            "id": tenant_id, "status": "migrating",
+        return _resp(200, {
+            "id": tenant_id, "status": "running",
             "source_host_id": source_host_id, "target_host_id": target_host_id,
             "snapshot_uri": f"s3://{bucket}/{snap_prefix}",
         })

@@ -1,5 +1,42 @@
 # Changelog
 
+## [1.4.5] — 2026-05-30
+
+Live migration is now asynchronous and proven end-to-end against the live fleet. 1.4.4 fixed the data plane (disks now ship with the snapshot) but left a control-plane wall: a real snapshot+restore moves multiple GB and takes minutes, while API Gateway caps a synchronous integration at 29 s, so `POST /migrate` returned `{"message":"Endpoint request timed out"}` and could strand a tenant in `migrating`. This release moves execution off the request path and verifies a real host→host move through the public API.
+
+### Why this matters
+
+The fail-safe migration state machine from 1.4.4 was correct, but running it synchronously inside the API request was structurally incompatible with API Gateway's 29 s ceiling. Making migration asynchronous is the only way `POST /migrate` can be both honest (don't claim success before the VM has moved) and within platform limits. AZ failover already drove migration outside API Gateway, so it was never affected — this brings operator-initiated migration up to the same standard.
+
+### Changed
+
+- **`POST /tenants/{id}/migrate` is now asynchronous (202 + poll).** It validates synchronously (target exists / not draining / capacity), fires the snapshot SSM command fire-and-forget, records `status=migrating` plus the async context (`migration_target` / `migration_source` / `migration_snap_cmd` / `migration_phase` / `migration_started_at` / `migration_snapshot_uri`), and returns **202** with a `poll` hint. No `host_id` / counter / routing mutation happens in the request path. Clients poll `GET /tenants/{id}` until `running` (success) or until `migration_failed` is set with status back to `running` (failure).
+- **`_ssm_send` now returns the SSM CommandId** (previously discarded) so the sweep can poll the command it fired.
+
+### Added
+
+- **`_advance_migration` sweep in the health_check Lambda.** The existing 5-min EventBridge schedule now also advances in-flight migrations — a state machine that polls the snapshot command → fires restore → polls restore → repoints the ALB → gates on the public-path dashboard check (`_verify_dashboard_reachable_via_alb`, the 1.4.2 "no fake failover" guarantee) → and only then flips `host_id` / counters / `status=running` and clears the async context. Any SSM failure, dashboard-verify failure, unknown phase, or a 15-min watchdog rolls status back to `running` with `host_id` untouched (the source VM was only briefly paused for the snapshot, so `running` is the truthful state). Reuses the existing schedule, IAM (`ssm:SendCommand`/`GetCommandInvocation` + elbv2 rule perms, already present for AZ failover), and `reserved_concurrent_executions=1` (serializes the sweep — no migration race). Zero new infrastructure.
+- **`tests/test_migration_sweep.py`** — 10 unit tests for `_advance_migration`: snapshot Success→fire restore / Failed→rollback / InProgress→noop; restore Success→flip host_id+counters / Failed→rollback / dashboard-unreachable→rollback; watchdog timeout, unknown phase, and missing CommandId all roll back to `running`.
+
+### Tests
+
+- `tests/test_migration.py` rewritten for the async contract: 202 + `status=migrating`, snapshot `_ssm_send` fires once on the source, the `migration_*` context is persisted, `host_id` is **not** flipped in the request path, and an SSM-submit failure returns 502 without marking `migrating`.
+- Full offline suite: **475 passed** (excluding the real-AWS e2e/failover tests that need a live deployment).
+
+### Verified live (issue #64 AC #6)
+
+Ran `scripts/e2e-migrate-test.sh` against the live fleet (ap-northeast-1, 2 active hosts across 1a/1c):
+- `POST /migrate` → **HTTP 202** immediately (no more 29 s timeout).
+- Polled `GET /tenants/{id}`; the health_check sweep advanced snapshot→restore→flip and the tenant reached `status=running` on the **target** host.
+- Authoritative checks: DDB `host_id` flipped to the target, `migration_phase`/`migration_failed` cleared, **source host ran 0 firecracker processes for the tenant**, target host ran 1, and the dashboard answered non-5xx through CloudFront. First time a tenant microVM has migrated host→host through the public API end-to-end.
+- Verified **both directions**: 1c→1a and then the reverse 1a→1c, each reaching the green verdict (host flipped, source drained, target running).
+
+### Operator notes
+
+- **No infrastructure change** beyond the two Lambda code updates — the health_check schedule, IAM, and EventBridge rules are unchanged. A `cdk deploy` ships the new `openclaw-api` + `openclaw-health-check` code.
+- Migration completion is now eventually-consistent on the health_check cadence (default 5 min). The data plane moves within the first sweep; control-plane status flips on the tick that observes restore success. Tune `health_check.interval_minutes` for a tighter SLO if needed.
+- Clients must treat `202` from `POST /migrate` as "accepted, in progress" and poll `GET /tenants/{id}`. The old `200`/synchronous contract is gone.
+
 ## [1.4.4] — 2026-05-30
 
 Live-migration actually works now. v1.4.2 claimed to "genuinely verify failover," but cross-host live migration had **never once succeeded end-to-end** — the script it depends on was never deployed, and even once deployed it shipped the wrong files. We found this by running a *real* migration against the live fleet (not a mock), and fixed every layer the failure passed through. Also closes a guest→host credential-theft path and a deploy-blocking Lambda policy-size bug surfaced along the way.
@@ -24,7 +61,7 @@ Issue #64: `POST /tenants/{id}/migrate` returned `202 migrating` and the console
 
 ### Known limitations / next
 
-- **migrate over API Gateway is bounded by the 29 s integration timeout.** With the disks now shipped correctly, a real snapshot+restore moves multiple GB and takes minutes — longer than API Gateway will hold a synchronous request (`{"message":"Endpoint request timed out"}`). The synchronous `_ssm_run` design is correct and fail-safe, but the *trigger* must move off the API request path. The data-plane path is proven working via direct SSM; making `POST /migrate` return `202` + a pollable status (async completion handler flips DDB) is the tracked follow-up. AZ failover, which drives migration outside API Gateway, is unaffected.
+- **migrate over API Gateway is bounded by the 29 s integration timeout.** With the disks now shipped correctly, a real snapshot+restore moves multiple GB and takes minutes — longer than API Gateway will hold a synchronous request (`{"message":"Endpoint request timed out"}`). **Resolved in 1.4.5** by making `POST /migrate` asynchronous (returns `202` + a pollable status; the health_check sweep finishes the move out-of-band). AZ failover, which drives migration outside API Gateway, was unaffected.
 - **RBAC fail-open** (`_get_user_role` defaults to admin when no role claim is present) and the **SSH-password host bootstrap** remain known risks, recorded here and deferred per owner decision — not yet fixed.
 
 ### Operator notes

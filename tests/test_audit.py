@@ -90,6 +90,23 @@ class TestMutationAudits:
              "used_vcpu": 0, "used_mem_mb": 0, "status": "active",
              "next_vm_num": 1, "private_ip": "10.0.0.1", "rootfs_version": "v1.0"},
         ]}
+        # Stub the SSM helpers directly. These tests only assert that a mutation
+        # writes an audit row — they must not exercise the real SSM polling
+        # loop. _ssm_run in particular polls get_command_invocation for up to
+        # `timeout` seconds; under a bare module-level MagicMock the status
+        # never reads "Success", so without this stub a POST /{action} (stop)
+        # hangs ~30s. Patch the bound names on the handler module so behaviour
+        # is deterministic regardless of test ordering / mock leakage.
+        self._patchers = [
+            patch.object(api, "_ssm_run", return_value=True),
+            patch.object(api, "_ssm_send", return_value=None),
+        ]
+        for p in self._patchers:
+            p.start()
+
+    def teardown_method(self):
+        for p in getattr(self, "_patchers", []):
+            p.stop()
 
     @pytest.mark.unit
     def test_create_tenant_writes_audit(self):

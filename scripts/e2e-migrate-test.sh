@@ -121,15 +121,20 @@ done
 say "post-migrate: host_id=$NEWHOST status=$STATUS (expected host=$TARGET status=running)"
 
 # Source host must no longer run the tenant's firecracker process.
+# NOTE: `pgrep -fc PATTERN` already prints the count (0 when none match) but
+# *exits non-zero* on no-match, so `pgrep -fc ... || echo 0` would print the
+# count AND the fallback ("0\n0" → "00"). Capture stdout only and let the
+# count stand on its own.
 say "checking source host no longer runs the VM"
 chk=$("${AWS[@]}" ssm send-command --instance-ids "$SRC" \
   --document-name AWS-RunShellScript \
-  --parameters "commands=[\"pgrep -fc 'api-sock /data/firecracker-vms/$TENANT/fc.sock' || echo 0\"]" \
+  --parameters "commands=[\"pgrep -fc 'firecracker-vms/$TENANT/fc.sock' || true\"]" \
   --query 'Command.CommandId' --output text)
 sleep 8
 procs=$("${AWS[@]}" ssm get-command-invocation --command-id "$chk" --instance-id "$SRC" \
   --query 'StandardOutputContent' --output text 2>/dev/null | tr -d '[:space:]')
-echo "  firecracker procs for $TENANT on source: ${procs:-?}"
+procs="${procs:-0}"
+echo "  firecracker procs for $TENANT on source: ${procs}"
 
 # Dashboard reachable through CloudFront.
 say "dashboard reachability via CloudFront"

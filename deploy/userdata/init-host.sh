@@ -238,6 +238,17 @@ chmod +x /home/ubuntu/stop-vm.sh && chown ubuntu:ubuntu /home/ubuntu/stop-vm.sh
 aws s3 cp s3://{{ASSETS_BUCKET}}/deployment/scripts/clone-data.sh /home/ubuntu/clone-data.sh --region ${REGION} --no-progress 2>/dev/null || \
   _s3_get s3://{{ASSETS_BUCKET}}/deployment/scripts/clone-data.sh /home/ubuntu/clone-data.sh || true
 chmod +x /home/ubuntu/clone-data.sh && chown ubuntu:ubuntu /home/ubuntu/clone-data.sh
+# Issue #64 — migrate-vm.sh: cross-host live migration (snapshot on source,
+# restore on target). Was missing from this download list → migrate API hit
+# a non-existent /home/ubuntu/migrate-vm.sh and failed with exit 127.
+aws s3 cp s3://{{ASSETS_BUCKET}}/deployment/scripts/migrate-vm.sh /home/ubuntu/migrate-vm.sh --region ${REGION} --no-progress 2>/dev/null || \
+  _s3_get s3://{{ASSETS_BUCKET}}/deployment/scripts/migrate-vm.sh /home/ubuntu/migrate-vm.sh || true
+chmod +x /home/ubuntu/migrate-vm.sh && chown ubuntu:ubuntu /home/ubuntu/migrate-vm.sh
+# Issue #22 (same defect class) — resize-disk.sh: offline ext4 grow of the
+# tenant data volume. Was missing here too → resize-disk API failed exit 127.
+aws s3 cp s3://{{ASSETS_BUCKET}}/deployment/scripts/resize-disk.sh /home/ubuntu/resize-disk.sh --region ${REGION} --no-progress 2>/dev/null || \
+  _s3_get s3://{{ASSETS_BUCKET}}/deployment/scripts/resize-disk.sh /home/ubuntu/resize-disk.sh || true
+chmod +x /home/ubuntu/resize-disk.sh && chown ubuntu:ubuntu /home/ubuntu/resize-disk.sh
 {{BACKUP_DATA_SCRIPT}}
 
 # Step 4b: AgentCore config (if enabled)

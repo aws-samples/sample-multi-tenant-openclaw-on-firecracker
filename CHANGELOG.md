@@ -1,5 +1,37 @@
 # Changelog
 
+## [1.4.4] — 2026-05-30
+
+Live-migration actually works now. v1.4.2 claimed to "genuinely verify failover," but cross-host live migration had **never once succeeded end-to-end** — the script it depends on was never deployed, and even once deployed it shipped the wrong files. We found this by running a *real* migration against the live fleet (not a mock), and fixed every layer the failure passed through. Also closes a guest→host credential-theft path and a deploy-blocking Lambda policy-size bug surfaced along the way.
+
+### Why this matters
+
+Issue #64: `POST /tenants/{id}/migrate` returned `202 migrating` and the console showed success, but the VM never moved. Three independent defects stacked on top of each other, each masking the next. A static test couldn't catch them because the script *exists in source* — only driving the real data plane revealed it. This release is the first time a tenant microVM has demonstrably moved host→host with its disk intact.
+
+### Fixed
+
+- **`migrate-vm.sh` / `resize-disk.sh` were never deployed (issue #64, #22).** Both have lived in `deploy/userdata/` since the live-migration / disk-resize features landed, but neither `setup.sh` (S3 upload) nor `init-host.sh` (per-host download) referenced them. The migrate/resize APIs SSM-invoked `/home/ubuntu/migrate-vm.sh`, hit a non-existent file, and failed with **exit 127**. Now uploaded by `setup.sh` and pulled by `init-host.sh` alongside the other host scripts.
+- **`migrate-vm.sh` never shipped the disk images.** A Firecracker snapshot records only the *path* of each virtio-block backing file, not its contents. The `snapshot` mode uploaded `snapshot.vm`/`.mem`/`vm.json` but **not `data.ext4`/`overlay.ext4`**, so `restore` on the target host failed with `400 Bad Request: ... No such file or directory (os error 2) .../data.ext4`. Verified live: the very first real cross-host migration died here with curl **exit 22**. Snapshot now uploads the backing files and restore downloads them *before* `PUT /snapshot/load`; load failures now surface Firecracker's own error body instead of a bare exit code.
+- **migrate / resize-disk were fire-and-forget and mutated DynamoDB optimistically.** migrate flipped `host_id`/counters and tore down routing within ~1 s while snapshot+restore actually take 30-60 s; on failure the tenant was left pointing at a host with no VM. Reworked to the AZ-failover pattern: mark `migrating`, run snapshot then restore via blocking `_ssm_run`, and only flip the source of truth + status after **both** succeed. Any SSM failure returns 502 with DDB untouched — verified live: when restore failed, status rolled back to `running` on the source and `host_id` never moved.
+- **Guest→host IMDS credential theft (multi-tenant isolation).** A tenant microVM could reach `169.254.169.254` through the host MASQUERADE rule and steal the host instance-profile credentials (read/write to the shared assets bucket + tenants/hosts tables = every other tenant's data). Added iptables `DROP` for the link-local IMDS range on the tap interface *before* the FORWARD/PREROUTING ACCEPT rules, plus `HttpTokens=required` + `HopLimit=1` on the launch template (base + nested-virt) as host-side defense-in-depth.
+- **Lambda resource-policy exceeded the 20 KB limit (deploy-blocking).** Each `LambdaIntegration(api_fn)` attached a per-method `AWS::Lambda::Permission`; at ~29 routes the policy crossed Lambda's 20480-byte hard limit and **every** `cdk deploy` failed. Grant API Gateway invoke once via a wildcard source ARN and build integrations against an imported view of the function (CDK adds no per-method permission for an imported `IFunction`), collapsing 29 statements into 1.
+
+### Added
+
+- **`scripts/e2e-migrate-test.sh`** — real end-to-end live-migration test (issue #64 AC #6). Drives the actual data plane: uploads host scripts → SSM-pushes them to every active host → migrates a running tenant to a different host → verifies SSM Success on snapshot+restore, the DDB `host_id` flip, the source VM is gone, and the dashboard is reachable through CloudFront. This is what proved the disk-image bug that mocked tests structurally cannot catch.
+- **`tests/test_script_manifest.py`** — static regression guard: every host `.sh` the API SSM-invokes must be both uploaded by `setup.sh` *and* delivered via `init-host.sh` (or the `stack.py` `BACKUP_DATA_SCRIPT` injection). Would have caught issue #64 at PR time.
+- **Migration failure-path unit tests** (`tests/test_migration.py`): snapshot-fail and restore-fail (via `_ssm_run` `side_effect`) assert status recovers to `running` and `host_id` never flips. `tests/test_resize_disk.py` asserts an SSM failure does not persist the new `data_disk_mb`.
+
+### Known limitations / next
+
+- **migrate over API Gateway is bounded by the 29 s integration timeout.** With the disks now shipped correctly, a real snapshot+restore moves multiple GB and takes minutes — longer than API Gateway will hold a synchronous request (`{"message":"Endpoint request timed out"}`). The synchronous `_ssm_run` design is correct and fail-safe, but the *trigger* must move off the API request path. The data-plane path is proven working via direct SSM; making `POST /migrate` return `202` + a pollable status (async completion handler flips DDB) is the tracked follow-up. AZ failover, which drives migration outside API Gateway, is unaffected.
+- **RBAC fail-open** (`_get_user_role` defaults to admin when no role claim is present) and the **SSH-password host bootstrap** remain known risks, recorded here and deferred per owner decision — not yet fixed.
+
+### Operator notes
+
+- **Requires `./setup.sh` (or manual S3 upload of `migrate-vm.sh` + `resize-disk.sh`) AND a CDK redeploy.** Existing hosts pick up the new scripts on next ASG roll or via an SSM push; `scripts/e2e-migrate-test.sh` performs that push as step 1.
+- The IMDS hardening changes the launch template — new hosts get it on boot; roll the ASG to apply fleet-wide.
+
 ## [1.4.3] — 2026-05-29
 
 Test stability fix. Closes the e2e flake we surfaced while validating v1.4.2: long-running backup-restore tests would occasionally fail with `urllib.error.URLError: [SSL: UNEXPECTED_EOF_WHILE_READING]` when the API Gateway / ALB closed a TLS keep-alive connection mid-request. Not a code regression — a network-layer fact of life that the test harness wasn't handling.

@@ -54,6 +54,15 @@ with patch("boto3.resource", return_value=_mock_ddb), \
     spec.loader.exec_module(api)
 
 
+# 1.5.0: RBAC fail-safes no-token requests to `viewer`, which would 403 these
+# write-path tests before they reach resize logic. RBAC is covered by
+# tests/test_rbac.py; here we assume an authenticated admin.
+@pytest.fixture(autouse=True)
+def _authenticated_admin():
+    with patch.object(api, "_get_user_role", return_value="admin"):
+        yield
+
+
 def _running_tenant(tid="t1", vcpu=2, mem_mb=4096):
     return {"id": tid, "name": tid, "status": "running",
             "host_id": "i-1", "vm_num": 1,

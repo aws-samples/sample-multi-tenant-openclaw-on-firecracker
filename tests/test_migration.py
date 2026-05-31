@@ -76,6 +76,15 @@ handler.tenants_table = _tenants_mock
 handler.hosts_table = _hosts_mock
 
 
+# 1.5.0: RBAC fail-safes no-token requests to `viewer`, which would 403 these
+# write-path tests before they reach migrate logic. RBAC is covered by
+# tests/test_rbac.py; here we assume an authenticated admin.
+@pytest.fixture(autouse=True)
+def _authenticated_admin():
+    with patch.object(handler, "_get_user_role", return_value="admin"):
+        yield
+
+
 def _migrate_event(tenant_id, body=None):
     """Build the API Gateway event for POST /tenants/{id}/migrate."""
     return {

@@ -51,6 +51,15 @@ with patch("boto3.resource", return_value=_mock_ddb), \
     spec.loader.exec_module(api)
 
 
+# 1.5.0: RBAC fail-safes no-token requests to `viewer`, which would 403 these
+# write-path tests before they reach the audited mutation. RBAC is covered by
+# tests/test_rbac.py; here we assume an authenticated admin.
+@pytest.fixture(autouse=True)
+def _authenticated_admin():
+    with patch.object(api, "_get_user_role", return_value="admin"):
+        yield
+
+
 def _api_event(method, resource, path_params=None, body=None, api_key_id="abc-key"):
     """Build an API Gateway-style event with x-api-key context."""
     evt = {

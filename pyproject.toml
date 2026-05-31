@@ -1,6 +1,6 @@
 [project]
 name = "sample-multi-tenant-openclaw-on-firecracker"
-version = "1.4.5"
+version = "1.5.0"
 requires-python = ">=3.12"
 dependencies = [
     "aws-cdk-lib>=2.251.0",
@@ -10,7 +10,11 @@ dependencies = [
 ]
 
 [dependency-groups]
-test = ["pytest", "moto", "boto3"]
+# 1.5.0: pyjwt + cryptography let the offline RBAC tests import the same
+# JWT verification path the Lambda uses (sign a test RS256 token, assert the
+# handler verifies/rejects it). The Lambda gets these via CDK bundling
+# (deploy/lambda/api/requirements.txt), not from this group.
+test = ["pytest", "moto", "boto3", "pyjwt>=2.8.0", "cryptography>=42.0.0"]
 
 [build-system]
 requires = ["setuptools"]

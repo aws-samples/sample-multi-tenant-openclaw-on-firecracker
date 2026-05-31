@@ -51,6 +51,16 @@ with patch("boto3.resource", return_value=_mock_ddb), \
     spec.loader.exec_module(handler)
 
 
+# 1.5.0: RBAC now fail-safes no-token requests to `viewer`, which would 403
+# these write-path tests before they reach resize-disk logic. RBAC itself is
+# covered by tests/test_rbac.py; here we assume an authenticated admin so we
+# can exercise the business logic.
+@pytest.fixture(autouse=True)
+def _authenticated_admin():
+    with patch.object(handler, "_get_user_role", return_value="admin"):
+        yield
+
+
 def _ev(tenant_id, body=None):
     return {
         "httpMethod": "POST",

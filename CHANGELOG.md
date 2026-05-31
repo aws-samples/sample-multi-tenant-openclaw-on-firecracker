@@ -1,5 +1,48 @@
 # Changelog
 
+## [1.5.0] — 2026-05-31
+
+Security hardening. Two real, exploitable vulnerabilities recorded as "Known limitations" in 1.4.4 are now fixed at the root: the API's JWT was never signature-verified and failed **open** to `admin`, and every microVM shipped the **same hardcoded SSH password** with root login enabled. Both are closed. This release changes auth semantics — read **Breaking** before deploying.
+
+### Why this matters
+
+The 1.4.4 notes were honest about deferring these, but they were not cosmetic:
+
+- **RBAC fail-open + unsigned JWT.** `_get_user_role` returned `admin` whenever a request carried no `Authorization: Bearer` token, and when a token *was* present the handler base64-decoded the payload **without verifying the signature**. An attacker could base64-craft `{"cognito:groups":["admin"]}` (even with `alg:none`, no signature) and the handler would grant admin — or simply omit the token entirely and still get admin. The API key alone gated mutations; the role layer was decorative.
+- **Shared SSH password + root login.** `build-rootfs.sh` baked `root:OpenCl@w2026` / `agent:OpenCl@w2026` into the rootfs shared by **all** tenants, with `PermitRootLogin yes` and password auth on. The same password was hardcoded in three more places and passed to guests over SSM (landing in CloudTrail). Anyone holding it could `ssh root@<any guest_ip>` — tenant isolation did not exist at the SSH layer. This directly violated the project's "no hardcoded secrets" rule.
+
+### Breaking
+
+- **No Bearer token now resolves to `viewer`, not `admin`.** Requests authenticated only by `x-api-key` (CLI / curl / automation) can still **read** (viewer is allowed on all GETs) but **writes return 403**. Automation that mutates state must now present a valid Cognito **id_token** as `Authorization: Bearer …`. The fallback role is configurable per environment via `DEFAULT_NO_JWT_ROLE` (default `viewer`); set it to `admin` only for a trusted, network-isolated automation deployment.
+- **`POST /migrate` etc. from the e2e scripts will 403 without a token.** Run write-path automation with a real admin id_token, or deploy with `DEFAULT_NO_JWT_ROLE=admin` for the test environment.
+- **microVM SSH is pubkey-only.** Password login and root login are disabled in the image. Host→guest access uses a per-host key; there is no shared password to distribute. Existing VMs launched from the *old* rootfs keep the old password until rolled — roll hosts to fully retire it.
+
+### Security
+
+- **Cognito JWT RS256 signature verification (fail-safe).** New `_verify_and_decode` fetches the User Pool's JWKS (`PyJWKClient`, module-cached) and calls `jwt.decode(..., algorithms=["RS256"], issuer=…, options={"require":["exp","iss"]})`. A token that fails verification — forged signature, `alg:none`, expired, wrong issuer, or (when `COGNITO_CLIENT_ID` is set) wrong audience — yields `None`, and the caller is downgraded to `viewer`. `_get_user_role` is now three-state: no token → `DEFAULT_NO_JWT_ROLE`; token present but untrusted → `viewer`; verified → role from `cognito:groups`. The pre-1.5.0 fail-open `return "admin"` is gone, and the unsigned `_decode_jwt_payload` helper was deleted (zero call sites).
+- **Per-host SSH public-key authentication; shared password removed.** `init-host.sh` generates a per-host `ed25519` keypair at boot (`/etc/openclaw/host_vm_key`); the private key never leaves the host. `launch-vm.sh` injects that host's **public** key into each VM's data disk at launch, so every host trusts only its own key (a leaked key on one host cannot reach VMs on another). `build-rootfs.sh` locks both `root` and `agent` passwords (`passwd -l`), sets `PermitRootLogin no` / `PasswordAuthentication no` / `PubkeyAuthentication yes`, and pre-creates `/home/agent/.ssh` (700, agent-owned) — `authorized_keys` is **never** baked into the shared image. `host-agent.py` and the `oc-connect.sh` / `oc-dashboard.sh` operator scripts use `ssh -i /etc/openclaw/host_vm_key -o IdentitiesOnly=yes` instead of `sshpass`. The hardcoded `OpenCl@w2026` is gone from the entire repository (`grep` clean), and the secret no longer transits SSM/CloudTrail.
+
+### Changed
+
+- **api Lambda is now bundled with Docker** (`BundlingOptions`) to ship PyJWT + cryptography. cryptography has a native extension, so the wheel is built inside the Lambda Linux image (`deploy/lambda/api/requirements.txt`), not copied from the dev machine.
+- **api Lambda runs on `ARM_64` (Graviton)** with the bundling image pinned to `platform="linux/arm64"`, so the manylinux `aarch64` cryptography wheel deterministically matches the Lambda runtime regardless of the build host (a default x86_64 Lambda with an aarch64 wheel would crash at import).
+- **Real Cognito pool id is injected into the api Lambda** via `api_fn.add_environment("COGNITO_USER_POOL_ID", cognito_outputs["CognitoUserPoolId"])` after the Cognito section computes it, plus `COGNITO_CLIENT_ID`. The construction-time `COGNITO_USER_POOL_ID` (which read an often-empty `config.yml` value) is gone — signature verification needs the genuine pool id to reach JWKS.
+
+### Fixed
+
+- **`config.yml` had two `console_auth:` blocks**; YAML last-key-wins silently dropped `user_pool_id`, leaving the deployed pool id empty and making JWT verification impossible. Merged into one block (`enabled: true`, `user_pool_id`, `default_no_jwt_role: viewer`).
+
+### Tests
+
+- **`tests/test_rbac.py` rewritten for signature verification** (26 tests). Generates an in-process RSA keypair, signs real RS256 tokens, and points verification at the matching public key by patching the single seam (`_get_jwks_client`). Anti-forgery cases sign with a *different* attacker key and assert downgrade to `viewer`: forged signature, `alg:none`, expired, wrong issuer, wrong audience, garbage token — plus an end-to-end `POST /tenants` with a forged admin token that gets 403. Fail-safe-default cases cover no-token → `DEFAULT_NO_JWT_ROLE`, non-Bearer auth, and verification-unavailable.
+- **`test_resize.py` / `test_resize_disk.py` / `test_migration.py`** gained an autouse fixture asserting an authenticated admin caller — they exercise business logic, not RBAC (which `test_rbac.py` owns), and would otherwise 403 under the new fail-safe default.
+
+### Operator notes
+
+- **Deploy requires Docker** at `cdk synth` / `cdk deploy` time (the cryptography wheel is built in a container). `cdk synth` exit 0 with `jwt/` + `cryptography/` present in the asset confirms bundling worked.
+- **`cdk deploy` ships new `openclaw-api` (ARM_64) code + the injected Cognito env.** After deploy: a write without a Bearer token must 403; a write with a valid admin id_token must succeed; a forged/`alg:none` token must be rejected.
+- **Retiring the old SSH password requires rolling hosts** so VMs relaunch from the hardened rootfs (rebuild rootfs → refresh-rootfs → roll). Until a host is rolled, its existing VMs keep the old password.
+
 ## [1.4.5] — 2026-05-30
 
 Live migration is now asynchronous and proven end-to-end against the live fleet. 1.4.4 fixed the data plane (disks now ship with the snapshot) but left a control-plane wall: a real snapshot+restore moves multiple GB and takes minutes, while API Gateway caps a synchronous integration at 29 s, so `POST /migrate` returned `{"message":"Endpoint request timed out"}` and could strand a tenant in `migrating`. This release moves execution off the request path and verifies a real host→host move through the public API.

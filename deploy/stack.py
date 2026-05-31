@@ -25,7 +25,7 @@ from aws_cdk import (
     aws_bedrock_agentcore_alpha as agentcore,
     aws_bedrockagentcore as agentcore_l1,
     custom_resources as cr,
-    Duration, Fn, RemovalPolicy,
+    BundlingOptions, Duration, Fn, RemovalPolicy,
 )
 from constructs import Construct
 from pathlib import Path
@@ -168,8 +168,33 @@ class OpenClawOrchestratorStack(cdk.Stack):
         api_fn = _lambda.Function(self, "ApiHandler",
             function_name="openclaw-api",
             runtime=_lambda.Runtime.PYTHON_3_12,
+            # 1.5.0: ARM_64 (Graviton) — cheaper/faster, and it makes the
+            # bundled cryptography native wheel deterministic: we pin the
+            # bundling image platform to linux/arm64 below so the manylinux
+            # aarch64 wheel always matches the Lambda runtime arch, regardless
+            # of the dev machine. (A default x86_64 Lambda with an aarch64
+            # wheel would crash at import with "invalid ELF header".)
+            architecture=_lambda.Architecture.ARM_64,
             handler="handler.lambda_handler",
-            code=_lambda.Code.from_asset("deploy/lambda/api"),
+            # 1.5.0: bundle PyJWT + cryptography for Cognito JWT signature
+            # verification. cryptography ships a native extension, so it must
+            # be pip-installed inside the Lambda Linux image (manylinux wheel),
+            # not copied from the dev machine. The handler source is copied on
+            # top of the installed deps. Requires Docker at synth/deploy time.
+            code=_lambda.Code.from_asset(
+                "deploy/lambda/api",
+                bundling=BundlingOptions(
+                    image=_lambda.Runtime.PYTHON_3_12.bundling_image,
+                    # Pin the build platform to the Lambda arch so pip fetches
+                    # the matching manylinux wheel (aarch64) deterministically.
+                    platform="linux/arm64",
+                    command=[
+                        "bash", "-c",
+                        "pip install --no-cache-dir -r requirements.txt -t /asset-output "
+                        "&& cp -au . /asset-output",
+                    ],
+                ),
+            ),
             timeout=Duration.seconds(120),
             memory_size=256,
             environment={
@@ -203,8 +228,17 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 "MULTI_AZ_ENABLED": str(CFG.get("multi_az", {}).get("enabled", False)).lower(),
                 "MULTI_AZ_COUNT": str(CFG.get("multi_az", {}).get("az_count", 1)),
                 "WAF_ENABLED": str(CFG.get("waf", {}).get("enabled", False)).lower(),
-                "COGNITO_USER_POOL_ID": (CFG.get("console_auth", {}) or {}).get("user_pool_id", ""),
+                # COGNITO_USER_POOL_ID / COGNITO_CLIENT_ID are injected AFTER the
+                # Cognito section computes the real, stack-owned pool/client ids
+                # (see add_environment below). The config.yml value is unreliable
+                # (often empty), so we never read it here — fail-safe RBAC needs
+                # the genuine pool id to fetch JWKS for signature verification.
                 "CONSOLE_AUTH_ENABLED": str((CFG.get("console_auth", {}) or {}).get("enabled", False)).lower(),
+                # Fail-safe default role when a request carries no Bearer token
+                # (API-key-only path). "viewer" = least privilege. Override per
+                # environment only for trusted automation that cannot present a
+                # Cognito id_token.
+                "DEFAULT_NO_JWT_ROLE": str(CFG.get("console_auth", {}).get("default_no_jwt_role", "viewer")),
                 "PROJECT_VERSION": _read_pyproject_version(),
             },
         )
@@ -1274,6 +1308,17 @@ function handler(event) {
                     description=description,
                     precedence=precedence,
                 )
+
+            # Fail-safe RBAC (1.5.0): inject the REAL, stack-owned Cognito ids so
+            # the api Lambda can fetch JWKS and verify id_token signatures
+            # (RS256). These override the construction-time placeholders — the
+            # Cognito pool id is only known here, after the pool is created or
+            # imported above. Without a genuine pool id the handler cannot
+            # verify signatures and every request fails safe to `viewer`.
+            api_fn.add_environment("COGNITO_USER_POOL_ID",
+                                   cognito_outputs.get("CognitoUserPoolId", ""))
+            api_fn.add_environment("COGNITO_CLIENT_ID",
+                                   cognito_outputs.get("CognitoClientId", ""))
 
         # ========== Outputs ==========
         for key, val in {

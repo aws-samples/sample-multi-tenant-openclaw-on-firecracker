@@ -48,6 +48,90 @@ QUOTAS_MAX_VCPU = int(os.environ.get("QUOTAS_MAX_VCPU", "0") or "0")
 QUOTAS_MAX_MEM_MB = int(os.environ.get("QUOTAS_MAX_MEM_MB", "0") or "0")
 QUOTAS_MAX_DATA_DISK_MB = int(os.environ.get("QUOTAS_MAX_DATA_DISK_MB", "0") or "0")
 
+# ── 1.5.0 security hardening: Cognito JWT signature verification ──
+# COGNITO_USER_POOL_ID is injected by CDK from the genuine, stack-owned pool
+# (deploy/stack.py add_environment). Empty when console_auth is disabled — in
+# which case signature verification is impossible and every Bearer token fails
+# safe to `viewer`. AWS_REGION is provided by the Lambda runtime.
+COGNITO_USER_POOL_ID = os.environ.get("COGNITO_USER_POOL_ID", "")
+COGNITO_CLIENT_ID = os.environ.get("COGNITO_CLIENT_ID", "")
+COGNITO_REGION = os.environ.get("AWS_REGION", "") or os.environ.get("AWS_DEFAULT_REGION", "")
+# Fall-back role for requests with NO Bearer token (API-key-only path).
+# "viewer" = least privilege (fail-safe). Trusted automation that needs write
+# access must present a Cognito id_token.
+DEFAULT_NO_JWT_ROLE = os.environ.get("DEFAULT_NO_JWT_ROLE", "viewer")
+
+# Lazily-built, module-cached JWKS client. Cognito rotates signing keys
+# rarely; PyJWKClient caches fetched keys in-process, so we pay the JWKS
+# HTTP fetch at most once per cold container (and on key rotation).
+_JWKS_CLIENT = None
+
+
+def _get_jwks_client():
+    """Return a cached PyJWKClient for the configured Cognito pool, or None.
+
+    None means verification is impossible (no pool id, or PyJWT/cryptography
+    unavailable) — callers must then fail safe.
+    """
+    global _JWKS_CLIENT
+    if not COGNITO_USER_POOL_ID or not COGNITO_REGION:
+        return None
+    if _JWKS_CLIENT is not None:
+        return _JWKS_CLIENT
+    try:
+        import jwt  # PyJWT — bundled into the Lambda asset (requirements.txt)
+        jwks_url = (
+            f"https://cognito-idp.{COGNITO_REGION}.amazonaws.com/"
+            f"{COGNITO_USER_POOL_ID}/.well-known/jwks.json"
+        )
+        _JWKS_CLIENT = jwt.PyJWKClient(jwks_url)
+        return _JWKS_CLIENT
+    except Exception:
+        # Import error or malformed config → cannot verify → fail safe.
+        return None
+
+
+def _verify_and_decode(token):
+    """Verify a Cognito id_token's RS256 signature and return its claims.
+
+    Returns the decoded claims dict on success, or None if the token cannot be
+    cryptographically trusted (bad/alg:none signature, expired, wrong issuer,
+    or verification is unavailable). Callers MUST treat None as untrusted and
+    fall back to least privilege — NEVER read claims from an unverified token.
+    """
+    client = _get_jwks_client()
+    if client is None or not token:
+        return None
+    try:
+        import jwt
+        signing_key = client.get_signing_key_from_jwt(token)
+        issuer = (
+            f"https://cognito-idp.{COGNITO_REGION}.amazonaws.com/"
+            f"{COGNITO_USER_POOL_ID}"
+        )
+        # verify_aud is OFF: Cognito id_tokens carry `aud`=app client id, but
+        # access_tokens use `client_id` and omit `aud`. We accept either token
+        # type for RBAC (the signature + issuer are what establish trust). If a
+        # client id is configured we still cross-check it below, best-effort.
+        claims = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            issuer=issuer,
+            options={"verify_aud": False, "require": ["exp", "iss"]},
+        )
+        # Best-effort audience pinning: reject tokens minted for a DIFFERENT
+        # Cognito app client when we know our own client id.
+        if COGNITO_CLIENT_ID:
+            aud = claims.get("aud") or claims.get("client_id")
+            if aud and aud != COGNITO_CLIENT_ID:
+                return None
+        return claims
+    except Exception:
+        # Any verification failure (signature, expiry, issuer, alg) → untrusted.
+        return None
+
+
 
 # ════════════════════════════════════════════════════════════
 # RBAC (issue #14)
@@ -55,14 +139,16 @@ QUOTAS_MAX_DATA_DISK_MB = int(os.environ.get("QUOTAS_MAX_DATA_DISK_MB", "0") or 
 #
 # Cognito User Pool Groups carry the role assignment as a
 # `cognito:groups` claim on the id_token. The console attaches the
-# token as `Authorization: Bearer …`. We do NOT re-validate the JWT
-# signature here — API Gateway's API key check already gated the
-# request, and the worst case of a forged claim downgrades the user
-# to viewer (least privilege).
+# token as `Authorization: Bearer …`. As of 1.5.0 we VERIFY the JWT's
+# RS256 signature against the pool's JWKS before trusting any claim
+# (_verify_and_decode). A token that fails verification — forged,
+# expired, alg:none, wrong issuer/audience — is treated as untrusted and
+# the caller is downgraded to `viewer` (least privilege).
 #
-# Backward compatibility: requests without a Bearer token are
-# treated as admin so that existing CLI / curl flows authenticated
-# purely via x-api-key continue to work.
+# Fail-safe default: a request with NO Bearer token (API-key-only path)
+# resolves to DEFAULT_NO_JWT_ROLE (default `viewer`), NOT admin. This
+# closes the pre-1.5.0 fail-open hole where missing/forged tokens granted
+# full access. Trusted automation must present a real Cognito id_token.
 
 _ROLE_RANK = {"viewer": 0, "operator": 1, "admin": 2}
 
@@ -82,40 +168,42 @@ _VIEWER_OK = {
 }
 
 
-def _decode_jwt_payload(token):
-    """Decode the JWT payload segment (no signature verification)."""
-    import base64
-    try:
-        parts = token.split(".")
-        if len(parts) < 2:
-            return {}
-        # Pad the base64 string to a multiple of 4
-        seg = parts[1] + "=" * (-len(parts[1]) % 4)
-        return json.loads(base64.urlsafe_b64decode(seg.encode()))
-    except Exception:
-        return {}
-
-
-def _get_user_role(event):
-    """Return the highest-privilege role for the caller, or 'admin' if no token."""
-    headers = event.get("headers") or {}
-    # API Gateway lower-cases header names but real-world clients vary.
-    auth = headers.get("Authorization") or headers.get("authorization") or ""
-    if not auth.startswith("Bearer "):
-        return "admin"  # No JWT → API key-only path → full access (back-compat)
-    token = auth[len("Bearer "):]
-    claims = _decode_jwt_payload(token)
-    groups = claims.get("cognito:groups", []) or []
+def _role_from_claims(claims):
+    """Map a verified claims dict → highest-privilege role, else 'viewer'."""
+    groups = (claims or {}).get("cognito:groups", []) or []
     if isinstance(groups, str):
         groups = [groups]
-    # Pick the most privileged known group; unknown groups → viewer (least priv).
     best = None
     for g in groups:
         if g in _ROLE_RANK and (best is None or _ROLE_RANK[g] > _ROLE_RANK[best]):
             best = g
-    if best:
-        return best
-    return "viewer"
+    return best or "viewer"
+
+
+def _get_user_role(event):
+    """Return the caller's role from a SIGNATURE-VERIFIED Cognito id_token.
+
+    Fail-safe (1.5.0):
+      • No Bearer token            → DEFAULT_NO_JWT_ROLE (default: viewer).
+      • Token present, unverifiable → viewer (forged/expired/alg:none → denied).
+      • Token verified             → role from cognito:groups (admin>operator>viewer).
+
+    This replaces the pre-1.5.0 behavior where a missing token meant `admin`
+    (fail-open) and claims were trusted without verifying the signature (any
+    attacker could forge `{"cognito:groups":["admin"]}`).
+    """
+    headers = event.get("headers") or {}
+    # API Gateway lower-cases header names but real-world clients vary.
+    auth = headers.get("Authorization") or headers.get("authorization") or ""
+    if not auth.startswith("Bearer "):
+        # No JWT → API key-only path. Fail safe to the configured default.
+        return DEFAULT_NO_JWT_ROLE
+    token = auth[len("Bearer "):].strip()
+    claims = _verify_and_decode(token)
+    if claims is None:
+        # Token present but could not be cryptographically trusted → deny.
+        return "viewer"
+    return _role_from_claims(claims)
 
 
 def _role_satisfies(actual, required):

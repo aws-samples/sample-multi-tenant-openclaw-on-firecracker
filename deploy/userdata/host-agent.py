@@ -223,11 +223,16 @@ def _probe_all():
 def _read_gateway_token(guest_ip):
     """SSH into VM and read gateway token from openclaw.json."""
     try:
+        # 1.5.0 security: key-based SSH. The private key is per-host
+        # (/etc/openclaw/host_vm_key, generated at boot by init-host.sh) and
+        # never leaves this host; the matching public key was injected into
+        # the VM's data disk at launch. No shared password, no secret over SSM.
         r = subprocess.run(
-            ["sshpass", "-e", "ssh", "-o", "StrictHostKeyChecking=no",
+            ["ssh", "-i", "/etc/openclaw/host_vm_key",
+             "-o", "StrictHostKeyChecking=no",
+             "-o", "IdentitiesOnly=yes",
              f"agent@{guest_ip}", "jq -r .gateway.auth.token .openclaw/openclaw.json"],
             capture_output=True, text=True, timeout=10,
-            env={**os.environ, "SSHPASS": "OpenCl@w2026"},
         )
         token = r.stdout.strip()
         return token if token and token != "null" else ""

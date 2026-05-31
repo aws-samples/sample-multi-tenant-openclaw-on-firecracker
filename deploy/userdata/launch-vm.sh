@@ -197,6 +197,18 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
     fi
   fi
 fi
+# 1.5.0 security: inject THIS host's public key so host-agent can SSH into
+# the guest with key auth (no shared password). The key is per-host
+# (init-host.sh generates it), so each VM trusts only its own host. uid/gid
+# 1000 = the in-guest `agent` user that owns /home/agent (this data disk).
+if [ -f /etc/openclaw/host_vm_key.pub ]; then
+  sudo mkdir -p "${MOUNT_TMP}/.ssh"
+  sudo cp /etc/openclaw/host_vm_key.pub "${MOUNT_TMP}/.ssh/authorized_keys"
+  sudo chmod 700 "${MOUNT_TMP}/.ssh"
+  sudo chmod 600 "${MOUNT_TMP}/.ssh/authorized_keys"
+  sudo chown -R 1000:1000 "${MOUNT_TMP}/.ssh"
+  log "injected host SSH public key into VM data disk"
+fi
 sudo umount ${MOUNT_TMP}
 rmdir ${MOUNT_TMP} 2>/dev/null || true
 

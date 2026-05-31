@@ -46,7 +46,18 @@ echo 'KERNEL=="kvm", MODE="0666"' > /etc/udev/rules.d/99-kvm.rules
 # Step 2: Install tools + Firecracker
 log "step2: installing tools + firecracker"
 apt-get -o DPkg::Lock::Timeout=60 update -qq
-apt-get -o DPkg::Lock::Timeout=60 install -y -qq curl jq sshpass unzip pigz nginx > /dev/null 2>&1
+apt-get -o DPkg::Lock::Timeout=60 install -y -qq curl jq unzip pigz nginx > /dev/null 2>&1
+
+# 1.5.0 security: per-host ed25519 key for host→guest SSH. The PRIVATE key
+# stays on this host (root-only); the PUBLIC key is injected into each VM's
+# data disk by launch-vm.sh. Every host therefore holds a DISTINCT key — a
+# leaked/compromised key on one host cannot reach VMs on another. Guard the
+# keygen because init-host.sh runs under `set -e` and may re-run.
+mkdir -p /etc/openclaw
+if [ ! -f /etc/openclaw/host_vm_key ]; then
+  ssh-keygen -t ed25519 -N "" -C "openclaw-host-$(hostname)" -f /etc/openclaw/host_vm_key
+  chmod 600 /etc/openclaw/host_vm_key
+fi
 if ! command -v aws &>/dev/null; then
   curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
   cd /tmp && unzip -qo awscliv2.zip && ./aws/install &>/dev/null; cd -

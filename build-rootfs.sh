@@ -168,7 +168,15 @@ echo "[2/8] system packages (openssh, build-essential, ...)"
 apt-get install -y -qq openssh-server sudo dbus-user-session \
   wget htop tmux vim-tiny tree python3-venv build-essential
 ssh-keygen -A
-echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
+# 1.5.0 security: pubkey-only SSH. No password auth, no root login. The
+# per-host public key is injected into each VM's data disk at launch
+# (launch-vm.sh), so authorized_keys is NEVER baked into the shared image.
+cat >> /etc/ssh/sshd_config << 'SSHD'
+PermitRootLogin no
+PasswordAuthentication no
+PubkeyAuthentication yes
+ChallengeResponseAuthentication no
+SSHD
 
 echo "[3/8] Node.js 22.x"
 curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
@@ -193,11 +201,17 @@ FallbackDNS=1.1.1.1
 DNSCONF
 echo "openclaw-vm" > /etc/hostname
 echo "127.0.0.1 localhost openclaw-vm" > /etc/hosts
-echo "root:OpenCl@w2026" | chpasswd
+passwd -l root   # lock root password — pubkey-only, no console/password login
 
 # Create agent user for openclaw
 useradd -m -s /bin/bash agent
-echo "agent:OpenCl@w2026" | chpasswd
+passwd -l agent  # lock agent password — SSH is pubkey-only (key injected at launch)
+# pre-create the agent .ssh dir so launch-vm.sh can drop authorized_keys into
+# the data template at runtime (700 / agent-owned). Empty here on purpose:
+# each host injects its OWN public key, so every host gets a distinct key.
+mkdir -p /home/agent/.ssh
+chmod 700 /home/agent/.ssh
+chown agent:agent /home/agent/.ssh
 echo "agent ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/agent
 
 # npm global prefix for agent user (avoids writing to /usr/bin)

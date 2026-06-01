@@ -48,6 +48,90 @@ QUOTAS_MAX_VCPU = int(os.environ.get("QUOTAS_MAX_VCPU", "0") or "0")
 QUOTAS_MAX_MEM_MB = int(os.environ.get("QUOTAS_MAX_MEM_MB", "0") or "0")
 QUOTAS_MAX_DATA_DISK_MB = int(os.environ.get("QUOTAS_MAX_DATA_DISK_MB", "0") or "0")
 
+# ── 1.5.0 security hardening: Cognito JWT signature verification ──
+# COGNITO_USER_POOL_ID is injected by CDK from the genuine, stack-owned pool
+# (deploy/stack.py add_environment). Empty when console_auth is disabled — in
+# which case signature verification is impossible and every Bearer token fails
+# safe to `viewer`. AWS_REGION is provided by the Lambda runtime.
+COGNITO_USER_POOL_ID = os.environ.get("COGNITO_USER_POOL_ID", "")
+COGNITO_CLIENT_ID = os.environ.get("COGNITO_CLIENT_ID", "")
+COGNITO_REGION = os.environ.get("AWS_REGION", "") or os.environ.get("AWS_DEFAULT_REGION", "")
+# Fall-back role for requests with NO Bearer token (API-key-only path).
+# "viewer" = least privilege (fail-safe). Trusted automation that needs write
+# access must present a Cognito id_token.
+DEFAULT_NO_JWT_ROLE = os.environ.get("DEFAULT_NO_JWT_ROLE", "viewer")
+
+# Lazily-built, module-cached JWKS client. Cognito rotates signing keys
+# rarely; PyJWKClient caches fetched keys in-process, so we pay the JWKS
+# HTTP fetch at most once per cold container (and on key rotation).
+_JWKS_CLIENT = None
+
+
+def _get_jwks_client():
+    """Return a cached PyJWKClient for the configured Cognito pool, or None.
+
+    None means verification is impossible (no pool id, or PyJWT/cryptography
+    unavailable) — callers must then fail safe.
+    """
+    global _JWKS_CLIENT
+    if not COGNITO_USER_POOL_ID or not COGNITO_REGION:
+        return None
+    if _JWKS_CLIENT is not None:
+        return _JWKS_CLIENT
+    try:
+        import jwt  # PyJWT — bundled into the Lambda asset (requirements.txt)
+        jwks_url = (
+            f"https://cognito-idp.{COGNITO_REGION}.amazonaws.com/"
+            f"{COGNITO_USER_POOL_ID}/.well-known/jwks.json"
+        )
+        _JWKS_CLIENT = jwt.PyJWKClient(jwks_url)
+        return _JWKS_CLIENT
+    except Exception:
+        # Import error or malformed config → cannot verify → fail safe.
+        return None
+
+
+def _verify_and_decode(token):
+    """Verify a Cognito id_token's RS256 signature and return its claims.
+
+    Returns the decoded claims dict on success, or None if the token cannot be
+    cryptographically trusted (bad/alg:none signature, expired, wrong issuer,
+    or verification is unavailable). Callers MUST treat None as untrusted and
+    fall back to least privilege — NEVER read claims from an unverified token.
+    """
+    client = _get_jwks_client()
+    if client is None or not token:
+        return None
+    try:
+        import jwt
+        signing_key = client.get_signing_key_from_jwt(token)
+        issuer = (
+            f"https://cognito-idp.{COGNITO_REGION}.amazonaws.com/"
+            f"{COGNITO_USER_POOL_ID}"
+        )
+        # verify_aud is OFF: Cognito id_tokens carry `aud`=app client id, but
+        # access_tokens use `client_id` and omit `aud`. We accept either token
+        # type for RBAC (the signature + issuer are what establish trust). If a
+        # client id is configured we still cross-check it below, best-effort.
+        claims = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            issuer=issuer,
+            options={"verify_aud": False, "require": ["exp", "iss"]},
+        )
+        # Best-effort audience pinning: reject tokens minted for a DIFFERENT
+        # Cognito app client when we know our own client id.
+        if COGNITO_CLIENT_ID:
+            aud = claims.get("aud") or claims.get("client_id")
+            if aud and aud != COGNITO_CLIENT_ID:
+                return None
+        return claims
+    except Exception:
+        # Any verification failure (signature, expiry, issuer, alg) → untrusted.
+        return None
+
+
 
 # ════════════════════════════════════════════════════════════
 # RBAC (issue #14)
@@ -55,14 +139,16 @@ QUOTAS_MAX_DATA_DISK_MB = int(os.environ.get("QUOTAS_MAX_DATA_DISK_MB", "0") or 
 #
 # Cognito User Pool Groups carry the role assignment as a
 # `cognito:groups` claim on the id_token. The console attaches the
-# token as `Authorization: Bearer …`. We do NOT re-validate the JWT
-# signature here — API Gateway's API key check already gated the
-# request, and the worst case of a forged claim downgrades the user
-# to viewer (least privilege).
+# token as `Authorization: Bearer …`. As of 1.5.0 we VERIFY the JWT's
+# RS256 signature against the pool's JWKS before trusting any claim
+# (_verify_and_decode). A token that fails verification — forged,
+# expired, alg:none, wrong issuer/audience — is treated as untrusted and
+# the caller is downgraded to `viewer` (least privilege).
 #
-# Backward compatibility: requests without a Bearer token are
-# treated as admin so that existing CLI / curl flows authenticated
-# purely via x-api-key continue to work.
+# Fail-safe default: a request with NO Bearer token (API-key-only path)
+# resolves to DEFAULT_NO_JWT_ROLE (default `viewer`), NOT admin. This
+# closes the pre-1.5.0 fail-open hole where missing/forged tokens granted
+# full access. Trusted automation must present a real Cognito id_token.
 
 _ROLE_RANK = {"viewer": 0, "operator": 1, "admin": 2}
 
@@ -82,40 +168,42 @@ _VIEWER_OK = {
 }
 
 
-def _decode_jwt_payload(token):
-    """Decode the JWT payload segment (no signature verification)."""
-    import base64
-    try:
-        parts = token.split(".")
-        if len(parts) < 2:
-            return {}
-        # Pad the base64 string to a multiple of 4
-        seg = parts[1] + "=" * (-len(parts[1]) % 4)
-        return json.loads(base64.urlsafe_b64decode(seg.encode()))
-    except Exception:
-        return {}
-
-
-def _get_user_role(event):
-    """Return the highest-privilege role for the caller, or 'admin' if no token."""
-    headers = event.get("headers") or {}
-    # API Gateway lower-cases header names but real-world clients vary.
-    auth = headers.get("Authorization") or headers.get("authorization") or ""
-    if not auth.startswith("Bearer "):
-        return "admin"  # No JWT → API key-only path → full access (back-compat)
-    token = auth[len("Bearer "):]
-    claims = _decode_jwt_payload(token)
-    groups = claims.get("cognito:groups", []) or []
+def _role_from_claims(claims):
+    """Map a verified claims dict → highest-privilege role, else 'viewer'."""
+    groups = (claims or {}).get("cognito:groups", []) or []
     if isinstance(groups, str):
         groups = [groups]
-    # Pick the most privileged known group; unknown groups → viewer (least priv).
     best = None
     for g in groups:
         if g in _ROLE_RANK and (best is None or _ROLE_RANK[g] > _ROLE_RANK[best]):
             best = g
-    if best:
-        return best
-    return "viewer"
+    return best or "viewer"
+
+
+def _get_user_role(event):
+    """Return the caller's role from a SIGNATURE-VERIFIED Cognito id_token.
+
+    Fail-safe (1.5.0):
+      • No Bearer token            → DEFAULT_NO_JWT_ROLE (default: viewer).
+      • Token present, unverifiable → viewer (forged/expired/alg:none → denied).
+      • Token verified             → role from cognito:groups (admin>operator>viewer).
+
+    This replaces the pre-1.5.0 behavior where a missing token meant `admin`
+    (fail-open) and claims were trusted without verifying the signature (any
+    attacker could forge `{"cognito:groups":["admin"]}`).
+    """
+    headers = event.get("headers") or {}
+    # API Gateway lower-cases header names but real-world clients vary.
+    auth = headers.get("Authorization") or headers.get("authorization") or ""
+    if not auth.startswith("Bearer "):
+        # No JWT → API key-only path. Fail safe to the configured default.
+        return DEFAULT_NO_JWT_ROLE
+    token = auth[len("Bearer "):].strip()
+    claims = _verify_and_decode(token)
+    if claims is None:
+        # Token present but could not be cryptographically trusted → deny.
+        return "viewer"
+    return _role_from_claims(claims)
 
 
 def _role_satisfies(actual, required):
@@ -831,14 +919,23 @@ def tenant_action(tenant_id, action, body=None):
         vm_num = int(item.get("vm_num", 1))
         if not host_id:
             return _resp(400, {"error": "tenant has no host (still pending?)"})
-        _ssm_send(host_id, f"/home/ubuntu/resize-disk.sh {tenant_id} {vm_num} {new_size}")
+        # Issue #64-class fix: resize-disk.sh was never deployed (same defect
+        # as migrate-vm.sh) AND this path was fire-and-forget — it flipped
+        # data_disk_mb in DDB before the host had even run the script, so DDB
+        # claimed the new size whether or not the ext4 grow actually happened.
+        # Now: run synchronously, and only persist the new size on Success.
+        if not _ssm_run(host_id,
+                        f"/home/ubuntu/resize-disk.sh {tenant_id} {vm_num} {new_size}",
+                        timeout=120):
+            return _resp(502, {"error": "resize-disk.sh failed on host; size unchanged",
+                               "id": tenant_id, "data_disk_mb": current})
         tenants_table.update_item(
             Key={"id": tenant_id},
             UpdateExpression="SET data_disk_mb = :s, updated_at = :t",
             ExpressionAttributeValues={":s": new_size, ":t": _now()},
         )
-        return _resp(202, {
-            "id": tenant_id, "status": "resizing",
+        return _resp(200, {
+            "id": tenant_id, "status": "running",
             "old_size_mb": current, "new_size_mb": new_size,
         })
 
@@ -878,75 +975,74 @@ def tenant_action(tenant_id, action, body=None):
         vm_num = int(item.get("vm_num", 1))
         bucket = os.environ.get("ASSETS_BUCKET", "")
         snap_prefix = f"migrations/{tenant_id}"
-
-        # 1) Source host: pause + snapshot + upload to S3.
-        # The migrate-vm.sh script (deploy/userdata/migrate-vm.sh, ssm_run sees
-        # the same path on every host) handles the Firecracker API calls.
-        _ssm_send(source_host_id,
-                  f"/home/ubuntu/migrate-vm.sh snapshot {tenant_id} {vm_num} "
-                  f"s3://{bucket}/{snap_prefix}")
-
-        # 2) Target host: download + restore.
         target_vm_num = int(target.get("next_vm_num", 1))
-        _ssm_send(target_host_id,
-                  f"/home/ubuntu/migrate-vm.sh restore {tenant_id} {target_vm_num} "
-                  f"s3://{bucket}/{snap_prefix}")
-
-        # 3) Update DDB: tenant.host_id flips, source counters --, target counters ++.
         now = _now()
+
+        # ── Issue #64 — ASYNC, fail-safe migration ──
+        # A correct migration runs snapshot(source)+restore(target), which now
+        # ship multi-GB disk images and take *minutes*. API Gateway caps a
+        # synchronous integration at 29s, so we cannot block here (an earlier
+        # synchronous version returned "Endpoint request timed out" and could
+        # leave the tenant stuck in `migrating`). Instead:
+        #   1. Do all the cheap validation synchronously (done above).
+        #   2. Fire-and-forget the snapshot via _ssm_send (returns a CommandId).
+        #   3. Record migrating + the async context in DDB and return 202.
+        # The health_check Lambda's 5-min sweep (_advance_migration) polls the
+        # SSM CommandId, triggers restore when snapshot succeeds, verifies the
+        # dashboard through the public path, and only then flips host_id /
+        # counters / routing → running. Any failure (or a 15-min watchdog)
+        # rolls status back to running with host_id untouched, so the tenant
+        # is never left pointing at a host with no VM. The source of truth is
+        # only mutated after the whole move is proven — same fail-safe contract
+        # as before, just driven out-of-band instead of in the request path.
+
+        snap_cmd = _ssm_send(
+            source_host_id,
+            f"/home/ubuntu/migrate-vm.sh snapshot {tenant_id} {vm_num} "
+            f"s3://{bucket}/{snap_prefix}",
+            timeout=600,   # snapshot + multi-GB disk upload to S3
+        )
+        if not snap_cmd:
+            # Couldn't even submit the SSM command — nothing started, DDB clean.
+            return _resp(502, {"error": "failed to start migration (SSM submit)",
+                               "id": tenant_id,
+                               "source_host_id": source_host_id,
+                               "target_host_id": target_host_id})
+
+        # Mark migrating + stash everything the sweep needs to finish the move.
+        # No host_id / counter / routing change happens here — only after the
+        # sweep proves snapshot+restore+dashboard all succeeded.
         tenants_table.update_item(
             Key={"id": tenant_id},
-            UpdateExpression=("SET host_id = :h, vm_num = :n, "
-                              "migration_source = :s, updated_at = :t"),
+            UpdateExpression=(
+                "SET #s = :s, migration_target = :tgt, "
+                "migration_target_vm_num = :tvn, migration_source = :src, "
+                "migration_snap_cmd = :scmd, migration_phase = :ph, "
+                "migration_started_at = :st, migration_snapshot_uri = :uri, "
+                "updated_at = :t"
+            ),
+            ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
-                ":h": target_host_id, ":n": target_vm_num,
-                ":s": source_host_id, ":t": now,
-            },
-        )
-        hosts_table.update_item(
-            Key={"instance_id": source_host_id},
-            UpdateExpression=("SET used_vcpu = used_vcpu - :v, "
-                              "used_mem_mb = used_mem_mb - :m, "
-                              "vm_count = vm_count - :one"),
-            ExpressionAttributeValues={":v": vcpu, ":m": mem_mb, ":one": 1},
-        )
-        hosts_table.update_item(
-            Key={"instance_id": target_host_id},
-            UpdateExpression=("SET used_vcpu = used_vcpu + :v, "
-                              "used_mem_mb = used_mem_mb + :m, "
-                              "vm_count = vm_count + :one, "
-                              "next_vm_num = :next"),
-            ExpressionAttributeValues={
-                ":v": vcpu, ":m": mem_mb, ":one": 1,
-                ":next": target_vm_num + 1,
+                ":s": "migrating",
+                ":tgt": target_host_id,
+                ":tvn": target_vm_num,
+                ":src": source_host_id,
+                ":scmd": snap_cmd,
+                ":ph": "snapshot",
+                ":st": now,
+                ":uri": f"s3://{bucket}/{snap_prefix}",
+                ":t": now,
             },
         )
 
-        # 4) 1.3.1: Repoint ALB rule to target host's TG so CloudFront stops
-        # sending /vm/<tenant_id>* traffic to the old host. Without this
-        # the migration completes on the data plane but routing is stale.
-        try:
-            target_private_ip = target.get("private_ip", "")
-            if target_private_ip:
-                target_tg = _ensure_host_tg(target_host_id, target_private_ip)
-                _repoint_alb_rule_to_tg(tenant_id, target_tg)
-        except Exception as e:
-            print(f"migrate: ALB repoint failed for {tenant_id}: {e}")
-
-        # 5) 1.3.1: Clean up source host's nginx tenant config so it stops
-        # advertising itself as a backend. Best-effort — if source is dead
-        # the cleanup will happen when the host is decommissioned.
-        try:
-            _ssm_send(source_host_id,
-                      f"sudo rm -f /etc/nginx/conf.d/tenants/{tenant_id}.conf "
-                      f"&& sudo nginx -s reload")
-        except Exception:
-            pass
-
+        # 202 Accepted: the move is in flight. Clients poll GET /tenants/{id}
+        # until status is `running` (success) or back to its prior value with
+        # migration_failed set (failure).
         return _resp(202, {
             "id": tenant_id, "status": "migrating",
             "source_host_id": source_host_id, "target_host_id": target_host_id,
             "snapshot_uri": f"s3://{bucket}/{snap_prefix}",
+            "poll": f"/tenants/{tenant_id}",
         })
 
     if action == "restart":
@@ -1768,17 +1864,23 @@ def _launch_vm(instance_id, tenant_id, vm_num, vcpu, mem_mb, guest_ip, host_port
 
 
 def _ssm_send(instance_id, command, timeout=120):
-    """Fire-and-forget SSM command. Status tracked by health check."""
+    """Fire-and-forget SSM command. Returns the CommandId (str) so callers can
+    later poll get_command_invocation for completion, or None if submission
+    failed. Existing call sites that ignore the return value are unaffected;
+    the async migrate path (issue #64) stores the CommandId in DynamoDB so the
+    health_check sweep can advance the migration out-of-band."""
     try:
         wrapped = f'export HOME=/home/ubuntu && cd /home/ubuntu && {command}'
-        ssm.send_command(
+        resp = ssm.send_command(
             InstanceIds=[instance_id],
             DocumentName="AWS-RunShellScript",
             Parameters={"commands": [wrapped], "executionTimeout": [str(timeout)]},
             TimeoutSeconds=timeout + 10,
         )
+        return resp["Command"]["CommandId"]
     except Exception as e:
         print(f"SSM send error: {e}")
+        return None
 
 
 def _ssm_run(instance_id, command, timeout=30):

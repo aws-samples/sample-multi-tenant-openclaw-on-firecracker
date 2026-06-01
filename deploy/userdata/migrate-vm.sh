@@ -50,10 +50,31 @@ case "$MODE" in
     aws s3 cp "$SNAPSHOT_PATH" "${S3_URI}/snapshot.vm" --quiet
     aws s3 cp "$MEMFILE_PATH"  "${S3_URI}/snapshot.mem" --quiet
     aws s3 cp "${VM_DIR}/vm.json" "${S3_URI}/vm.json" --quiet
+    # 5) Upload the block-device backing files too. A Firecracker snapshot only
+    #    records the *path* of each virtio-block backing file, not its contents,
+    #    so restore on another host fails with "No such file or directory ...
+    #    data.ext4" unless the disks are shipped alongside snapshot.vm/.mem.
+    #    Ship whichever of the standard tenant disks exist (data = persistent
+    #    tenant volume, overlay = copy-on-write rootfs layer).
+    for disk in data.ext4 overlay.ext4 rootfs.ext4; do
+      if [ -f "${VM_DIR}/${disk}" ]; then
+        aws s3 cp "${VM_DIR}/${disk}" "${S3_URI}/${disk}" --quiet && echo "  uploaded ${disk}"
+      fi
+    done
     echo "snapshot ${TENANT} → ${S3_URI}"
     ;;
   restore)
     mkdir -p "$VM_DIR"
+    # Download the block-device backing files FIRST — Firecracker opens them by
+    # the absolute path baked into snapshot.vm during /snapshot/load, so they
+    # must already be on local disk before the load call below. Missing disks
+    # are what caused the "os error 2 ... data.ext4" 400 on the first real
+    # cross-host migration (the snapshot mode never shipped them). Tolerate a
+    # disk that doesn't exist in S3 (not every tenant has an overlay).
+    for disk in data.ext4 overlay.ext4 rootfs.ext4; do
+      aws s3 cp "${S3_URI}/${disk}" "${VM_DIR}/${disk}" --quiet 2>/dev/null \
+        && echo "  fetched ${disk}" || true
+    done
     aws s3 cp "${S3_URI}/snapshot.vm"  "${VM_DIR}/snapshot.vm" --quiet
     aws s3 cp "${S3_URI}/snapshot.mem" "${VM_DIR}/snapshot.mem" --quiet
     aws s3 cp "${S3_URI}/vm.json"      "${VM_DIR}/vm.json" --quiet
@@ -61,10 +82,16 @@ case "$MODE" in
     rm -f "$SOCK"
     nohup firecracker --api-sock "$SOCK" >"${VM_DIR}/fc.log" 2>&1 &
     sleep 1
-    # Load the snapshot.
-    curl -sf --unix-socket "$SOCK" -X PUT "http://localhost/snapshot/load" \
+    # Load the snapshot. Surface Firecracker's own error body on failure so the
+    # SSM output explains *why* (e.g. a missing backing file) instead of just
+    # curl exit 22.
+    if ! curl -sf --unix-socket "$SOCK" -X PUT "http://localhost/snapshot/load" \
       -H "Content-Type: application/json" \
-      -d "{\"snapshot_path\":\"${VM_DIR}/snapshot.vm\",\"mem_file_path\":\"${VM_DIR}/snapshot.mem\",\"resume_vm\":true}"
+      -d "{\"snapshot_path\":\"${VM_DIR}/snapshot.vm\",\"mem_file_path\":\"${VM_DIR}/snapshot.mem\",\"resume_vm\":true}"; then
+      echo "snapshot/load failed; firecracker said:" >&2
+      tail -5 "${VM_DIR}/fc.log" >&2 || true
+      exit 22
+    fi
     echo "restored ${TENANT} on this host"
     ;;
   *)

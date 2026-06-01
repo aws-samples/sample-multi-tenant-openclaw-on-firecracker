@@ -1,5 +1,127 @@
 # Changelog
 
+## [1.5.0] — 2026-05-31
+
+Security hardening. Two real, exploitable vulnerabilities recorded as "Known limitations" in 1.4.4 are now fixed at the root: the API's JWT was never signature-verified and failed **open** to `admin`, and every microVM shipped the **same hardcoded SSH password** with root login enabled. Both are closed. This release changes auth semantics — read **Breaking** before deploying.
+
+### Why this matters
+
+The 1.4.4 notes were honest about deferring these, but they were not cosmetic:
+
+- **RBAC fail-open + unsigned JWT.** `_get_user_role` returned `admin` whenever a request carried no `Authorization: Bearer` token, and when a token *was* present the handler base64-decoded the payload **without verifying the signature**. An attacker could base64-craft `{"cognito:groups":["admin"]}` (even with `alg:none`, no signature) and the handler would grant admin — or simply omit the token entirely and still get admin. The API key alone gated mutations; the role layer was decorative.
+- **Shared SSH password + root login.** `build-rootfs.sh` baked `root:OpenCl@w2026` / `agent:OpenCl@w2026` into the rootfs shared by **all** tenants, with `PermitRootLogin yes` and password auth on. The same password was hardcoded in three more places and passed to guests over SSM (landing in CloudTrail). Anyone holding it could `ssh root@<any guest_ip>` — tenant isolation did not exist at the SSH layer. This directly violated the project's "no hardcoded secrets" rule.
+
+### Breaking
+
+- **No Bearer token now resolves to `viewer`, not `admin`.** Requests authenticated only by `x-api-key` (CLI / curl / automation) can still **read** (viewer is allowed on all GETs) but **writes return 403**. Automation that mutates state must now present a valid Cognito **id_token** as `Authorization: Bearer …`. The fallback role is configurable per environment via `DEFAULT_NO_JWT_ROLE` (default `viewer`); set it to `admin` only for a trusted, network-isolated automation deployment.
+- **`POST /migrate` etc. from the e2e scripts will 403 without a token.** Run write-path automation with a real admin id_token, or deploy with `DEFAULT_NO_JWT_ROLE=admin` for the test environment.
+- **microVM SSH is pubkey-only.** Password login and root login are disabled in the image. Host→guest access uses a per-host key; there is no shared password to distribute. Existing VMs launched from the *old* rootfs keep the old password until rolled — roll hosts to fully retire it.
+
+### Security
+
+- **Cognito JWT RS256 signature verification (fail-safe).** New `_verify_and_decode` fetches the User Pool's JWKS (`PyJWKClient`, module-cached) and calls `jwt.decode(..., algorithms=["RS256"], issuer=…, options={"require":["exp","iss"]})`. A token that fails verification — forged signature, `alg:none`, expired, wrong issuer, or (when `COGNITO_CLIENT_ID` is set) wrong audience — yields `None`, and the caller is downgraded to `viewer`. `_get_user_role` is now three-state: no token → `DEFAULT_NO_JWT_ROLE`; token present but untrusted → `viewer`; verified → role from `cognito:groups`. The pre-1.5.0 fail-open `return "admin"` is gone, and the unsigned `_decode_jwt_payload` helper was deleted (zero call sites).
+- **Per-host SSH public-key authentication; shared password removed.** `init-host.sh` generates a per-host `ed25519` keypair at boot (`/etc/openclaw/host_vm_key`); the private key never leaves the host. `launch-vm.sh` injects that host's **public** key into each VM's data disk at launch, so every host trusts only its own key (a leaked key on one host cannot reach VMs on another). `build-rootfs.sh` locks both `root` and `agent` passwords (`passwd -l`), sets `PermitRootLogin no` / `PasswordAuthentication no` / `PubkeyAuthentication yes`, and pre-creates `/home/agent/.ssh` (700, agent-owned) — `authorized_keys` is **never** baked into the shared image. `host-agent.py` and the `oc-connect.sh` / `oc-dashboard.sh` operator scripts use `ssh -i /etc/openclaw/host_vm_key -o IdentitiesOnly=yes` instead of `sshpass`. The hardcoded `OpenCl@w2026` is gone from the entire repository (`grep` clean), and the secret no longer transits SSM/CloudTrail.
+
+### Changed
+
+- **api Lambda is now bundled with Docker** (`BundlingOptions`) to ship PyJWT + cryptography. cryptography has a native extension, so the wheel is built inside the Lambda Linux image (`deploy/lambda/api/requirements.txt`), not copied from the dev machine.
+- **api Lambda runs on `ARM_64` (Graviton)** with the bundling image pinned to `platform="linux/arm64"`, so the manylinux `aarch64` cryptography wheel deterministically matches the Lambda runtime regardless of the build host (a default x86_64 Lambda with an aarch64 wheel would crash at import).
+- **Real Cognito pool id is injected into the api Lambda** via `api_fn.add_environment("COGNITO_USER_POOL_ID", cognito_outputs["CognitoUserPoolId"])` after the Cognito section computes it, plus `COGNITO_CLIENT_ID`. The construction-time `COGNITO_USER_POOL_ID` (which read an often-empty `config.yml` value) is gone — signature verification needs the genuine pool id to reach JWKS.
+
+### Fixed
+
+- **`config.yml` had two `console_auth:` blocks**; YAML last-key-wins silently let the second override the first. Merged into one block. **`user_pool_id` is intentionally left UNSET**: the stack already manages the Console Cognito pool via the "new pool" branch (stable logical id + `RETAIN`), so the pool, its users, RBAC groups, and domain persist across deploys. Setting `user_pool_id` flips the stack to the "import existing pool" branch, which re-creates the `openclaw-console` domain for a pool whose domain CFN already owns — Cognito allows one domain per pool, so the deploy fails with `domain … AlreadyExists`. The api Lambda still receives the genuine pool id at deploy time via `add_environment(cognito_outputs["CognitoUserPoolId"])`, so verification works without pinning it here.
+- **`launch-vm.sh` inserted an illegal `iptables -t nat -I PREROUTING … -j DROP`** IMDS rule. The nat table does not permit filtering verbs — nft returns "the use of DROP is therefore inhibited" (rc=2), and under `set -e` this aborted *every* new VM launch on nft-backed hosts (a freshly scaled-out host could start no microVM). Removed; the FORWARD-chain DROP already blocks guest→IMDS before MASQUERADE, so isolation is unchanged. Found during live SSH-hardening verification.
+
+### Verified live
+
+Deployed to ap-northeast-1 (`cdk deploy -c region=ap-northeast-1`) and verified against the running fleet — note `deploy/app.py` defaults the region to `us-east-1` via CDK context (not `AWS_REGION`), so the `-c region=…` flag is **required**; without it CDK stages assets to a non-existent us-east-1 bucket and fails with a misleading `EPROTO`.
+
+- **api Lambda flipped x86_64 → arm64**; `COGNITO_USER_POOL_ID` now the genuine `ap-northeast-1_yvmL2GT3P` (was empty), `DEFAULT_NO_JWT_ROLE=viewer`. CFN completed with no rollback — proof the arm64 cryptography wheel imports on the Lambda runtime.
+- **RBAC, through API Gateway** (`scripts/e2e-rbac-test.sh`): no-token `POST /tenants` → **403** `{"role":"viewer","required":"operator"}`; no-token `GET /tenants` → **200**; no-token `DELETE` → **403**; an attacker-signed RS256 admin token → **403**; an `alg:none` admin token → **403**. The exact pre-1.5.0 forgery now yields viewer/403.
+- **SSH, on a scaled-out host (zero-downtime, old hosts/tenants untouched)**: `init-host.sh` generated `/etc/openclaw/host_vm_key` (600, root) and removed `sshpass`; `launch-vm.sh` logged `injected host SSH public key into VM data disk` and the VM reached `InstanceStart succeeded`. The hardened **v1.1 rootfs** image was inspected directly: `PermitRootLogin no` / `PasswordAuthentication no` / `PubkeyAuthentication yes` / `ChallengeResponseAuthentication no`, both `root` and `agent` shadow entries `LOCKED`, and a full-image `grep` for the old password returns **zero** hits.
+
+
+### Tests
+
+- **`tests/test_rbac.py` rewritten for signature verification** (26 tests). Generates an in-process RSA keypair, signs real RS256 tokens, and points verification at the matching public key by patching the single seam (`_get_jwks_client`). Anti-forgery cases sign with a *different* attacker key and assert downgrade to `viewer`: forged signature, `alg:none`, expired, wrong issuer, wrong audience, garbage token — plus an end-to-end `POST /tenants` with a forged admin token that gets 403. Fail-safe-default cases cover no-token → `DEFAULT_NO_JWT_ROLE`, non-Bearer auth, and verification-unavailable.
+- **`test_resize.py` / `test_resize_disk.py` / `test_migration.py`** gained an autouse fixture asserting an authenticated admin caller — they exercise business logic, not RBAC (which `test_rbac.py` owns), and would otherwise 403 under the new fail-safe default.
+
+### Operator notes
+
+- **Deploy requires Docker** at `cdk synth` / `cdk deploy` time (the cryptography wheel is built in a container). `cdk synth` exit 0 with `jwt/` + `cryptography/` present in the asset confirms bundling worked.
+- **`cdk deploy` ships new `openclaw-api` (ARM_64) code + the injected Cognito env.** After deploy: a write without a Bearer token must 403; a write with a valid admin id_token must succeed; a forged/`alg:none` token must be rejected.
+- **Retiring the old SSH password requires rolling hosts** so VMs relaunch from the hardened rootfs (rebuild rootfs → refresh-rootfs → roll). Until a host is rolled, its existing VMs keep the old password.
+
+## [1.4.5] — 2026-05-30
+
+Live migration is now asynchronous and proven end-to-end against the live fleet. 1.4.4 fixed the data plane (disks now ship with the snapshot) but left a control-plane wall: a real snapshot+restore moves multiple GB and takes minutes, while API Gateway caps a synchronous integration at 29 s, so `POST /migrate` returned `{"message":"Endpoint request timed out"}` and could strand a tenant in `migrating`. This release moves execution off the request path and verifies a real host→host move through the public API.
+
+### Why this matters
+
+The fail-safe migration state machine from 1.4.4 was correct, but running it synchronously inside the API request was structurally incompatible with API Gateway's 29 s ceiling. Making migration asynchronous is the only way `POST /migrate` can be both honest (don't claim success before the VM has moved) and within platform limits. AZ failover already drove migration outside API Gateway, so it was never affected — this brings operator-initiated migration up to the same standard.
+
+### Changed
+
+- **`POST /tenants/{id}/migrate` is now asynchronous (202 + poll).** It validates synchronously (target exists / not draining / capacity), fires the snapshot SSM command fire-and-forget, records `status=migrating` plus the async context (`migration_target` / `migration_source` / `migration_snap_cmd` / `migration_phase` / `migration_started_at` / `migration_snapshot_uri`), and returns **202** with a `poll` hint. No `host_id` / counter / routing mutation happens in the request path. Clients poll `GET /tenants/{id}` until `running` (success) or until `migration_failed` is set with status back to `running` (failure).
+- **`_ssm_send` now returns the SSM CommandId** (previously discarded) so the sweep can poll the command it fired.
+
+### Added
+
+- **`_advance_migration` sweep in the health_check Lambda.** The existing 5-min EventBridge schedule now also advances in-flight migrations — a state machine that polls the snapshot command → fires restore → polls restore → repoints the ALB → gates on the public-path dashboard check (`_verify_dashboard_reachable_via_alb`, the 1.4.2 "no fake failover" guarantee) → and only then flips `host_id` / counters / `status=running` and clears the async context. Any SSM failure, dashboard-verify failure, unknown phase, or a 15-min watchdog rolls status back to `running` with `host_id` untouched (the source VM was only briefly paused for the snapshot, so `running` is the truthful state). Reuses the existing schedule, IAM (`ssm:SendCommand`/`GetCommandInvocation` + elbv2 rule perms, already present for AZ failover), and `reserved_concurrent_executions=1` (serializes the sweep — no migration race). Zero new infrastructure.
+- **`tests/test_migration_sweep.py`** — 10 unit tests for `_advance_migration`: snapshot Success→fire restore / Failed→rollback / InProgress→noop; restore Success→flip host_id+counters / Failed→rollback / dashboard-unreachable→rollback; watchdog timeout, unknown phase, and missing CommandId all roll back to `running`.
+
+### Tests
+
+- `tests/test_migration.py` rewritten for the async contract: 202 + `status=migrating`, snapshot `_ssm_send` fires once on the source, the `migration_*` context is persisted, `host_id` is **not** flipped in the request path, and an SSM-submit failure returns 502 without marking `migrating`.
+- Full offline suite: **475 passed** (excluding the real-AWS e2e/failover tests that need a live deployment).
+
+### Verified live (issue #64 AC #6)
+
+Ran `scripts/e2e-migrate-test.sh` against the live fleet (ap-northeast-1, 2 active hosts across 1a/1c):
+- `POST /migrate` → **HTTP 202** immediately (no more 29 s timeout).
+- Polled `GET /tenants/{id}`; the health_check sweep advanced snapshot→restore→flip and the tenant reached `status=running` on the **target** host.
+- Authoritative checks: DDB `host_id` flipped to the target, `migration_phase`/`migration_failed` cleared, **source host ran 0 firecracker processes for the tenant**, target host ran 1, and the dashboard answered non-5xx through CloudFront. First time a tenant microVM has migrated host→host through the public API end-to-end.
+- Verified **both directions**: 1c→1a and then the reverse 1a→1c, each reaching the green verdict (host flipped, source drained, target running).
+
+### Operator notes
+
+- **No infrastructure change** beyond the two Lambda code updates — the health_check schedule, IAM, and EventBridge rules are unchanged. A `cdk deploy` ships the new `openclaw-api` + `openclaw-health-check` code.
+- Migration completion is now eventually-consistent on the health_check cadence (default 5 min). The data plane moves within the first sweep; control-plane status flips on the tick that observes restore success. Tune `health_check.interval_minutes` for a tighter SLO if needed.
+- Clients must treat `202` from `POST /migrate` as "accepted, in progress" and poll `GET /tenants/{id}`. The old `200`/synchronous contract is gone.
+
+## [1.4.4] — 2026-05-30
+
+Live-migration actually works now. v1.4.2 claimed to "genuinely verify failover," but cross-host live migration had **never once succeeded end-to-end** — the script it depends on was never deployed, and even once deployed it shipped the wrong files. We found this by running a *real* migration against the live fleet (not a mock), and fixed every layer the failure passed through. Also closes a guest→host credential-theft path and a deploy-blocking Lambda policy-size bug surfaced along the way.
+
+### Why this matters
+
+Issue #64: `POST /tenants/{id}/migrate` returned `202 migrating` and the console showed success, but the VM never moved. Three independent defects stacked on top of each other, each masking the next. A static test couldn't catch them because the script *exists in source* — only driving the real data plane revealed it. This release is the first time a tenant microVM has demonstrably moved host→host with its disk intact.
+
+### Fixed
+
+- **`migrate-vm.sh` / `resize-disk.sh` were never deployed (issue #64, #22).** Both have lived in `deploy/userdata/` since the live-migration / disk-resize features landed, but neither `setup.sh` (S3 upload) nor `init-host.sh` (per-host download) referenced them. The migrate/resize APIs SSM-invoked `/home/ubuntu/migrate-vm.sh`, hit a non-existent file, and failed with **exit 127**. Now uploaded by `setup.sh` and pulled by `init-host.sh` alongside the other host scripts.
+- **`migrate-vm.sh` never shipped the disk images.** A Firecracker snapshot records only the *path* of each virtio-block backing file, not its contents. The `snapshot` mode uploaded `snapshot.vm`/`.mem`/`vm.json` but **not `data.ext4`/`overlay.ext4`**, so `restore` on the target host failed with `400 Bad Request: ... No such file or directory (os error 2) .../data.ext4`. Verified live: the very first real cross-host migration died here with curl **exit 22**. Snapshot now uploads the backing files and restore downloads them *before* `PUT /snapshot/load`; load failures now surface Firecracker's own error body instead of a bare exit code.
+- **migrate / resize-disk were fire-and-forget and mutated DynamoDB optimistically.** migrate flipped `host_id`/counters and tore down routing within ~1 s while snapshot+restore actually take 30-60 s; on failure the tenant was left pointing at a host with no VM. Reworked to the AZ-failover pattern: mark `migrating`, run snapshot then restore via blocking `_ssm_run`, and only flip the source of truth + status after **both** succeed. Any SSM failure returns 502 with DDB untouched — verified live: when restore failed, status rolled back to `running` on the source and `host_id` never moved.
+- **Guest→host IMDS credential theft (multi-tenant isolation).** A tenant microVM could reach `169.254.169.254` through the host MASQUERADE rule and steal the host instance-profile credentials (read/write to the shared assets bucket + tenants/hosts tables = every other tenant's data). Added iptables `DROP` for the link-local IMDS range on the tap interface *before* the FORWARD/PREROUTING ACCEPT rules, plus `HttpTokens=required` + `HopLimit=1` on the launch template (base + nested-virt) as host-side defense-in-depth.
+- **Lambda resource-policy exceeded the 20 KB limit (deploy-blocking).** Each `LambdaIntegration(api_fn)` attached a per-method `AWS::Lambda::Permission`; at ~29 routes the policy crossed Lambda's 20480-byte hard limit and **every** `cdk deploy` failed. Grant API Gateway invoke once via a wildcard source ARN and build integrations against an imported view of the function (CDK adds no per-method permission for an imported `IFunction`), collapsing 29 statements into 1.
+
+### Added
+
+- **`scripts/e2e-migrate-test.sh`** — real end-to-end live-migration test (issue #64 AC #6). Drives the actual data plane: uploads host scripts → SSM-pushes them to every active host → migrates a running tenant to a different host → verifies SSM Success on snapshot+restore, the DDB `host_id` flip, the source VM is gone, and the dashboard is reachable through CloudFront. This is what proved the disk-image bug that mocked tests structurally cannot catch.
+- **`tests/test_script_manifest.py`** — static regression guard: every host `.sh` the API SSM-invokes must be both uploaded by `setup.sh` *and* delivered via `init-host.sh` (or the `stack.py` `BACKUP_DATA_SCRIPT` injection). Would have caught issue #64 at PR time.
+- **Migration failure-path unit tests** (`tests/test_migration.py`): snapshot-fail and restore-fail (via `_ssm_run` `side_effect`) assert status recovers to `running` and `host_id` never flips. `tests/test_resize_disk.py` asserts an SSM failure does not persist the new `data_disk_mb`.
+
+### Known limitations / next
+
+- **migrate over API Gateway is bounded by the 29 s integration timeout.** With the disks now shipped correctly, a real snapshot+restore moves multiple GB and takes minutes — longer than API Gateway will hold a synchronous request (`{"message":"Endpoint request timed out"}`). **Resolved in 1.4.5** by making `POST /migrate` asynchronous (returns `202` + a pollable status; the health_check sweep finishes the move out-of-band). AZ failover, which drives migration outside API Gateway, was unaffected.
+- **RBAC fail-open** (`_get_user_role` defaults to admin when no role claim is present) and the **SSH-password host bootstrap** remain known risks, recorded here and deferred per owner decision — not yet fixed.
+
+### Operator notes
+
+- **Requires `./setup.sh` (or manual S3 upload of `migrate-vm.sh` + `resize-disk.sh`) AND a CDK redeploy.** Existing hosts pick up the new scripts on next ASG roll or via an SSM push; `scripts/e2e-migrate-test.sh` performs that push as step 1.
+- The IMDS hardening changes the launch template — new hosts get it on boot; roll the ASG to apply fleet-wide.
+
 ## [1.4.3] — 2026-05-29
 
 Test stability fix. Closes the e2e flake we surfaced while validating v1.4.2: long-running backup-restore tests would occasionally fail with `urllib.error.URLError: [SSL: UNEXPECTED_EOF_WHILE_READING]` when the API Gateway / ALB closed a TLS keep-alive connection mid-request. Not a code regression — a network-layer fact of life that the test harness wasn't handling.

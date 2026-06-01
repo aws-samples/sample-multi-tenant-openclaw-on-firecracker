@@ -51,6 +51,15 @@ with patch("boto3.resource", return_value=_mock_ddb), \
     spec.loader.exec_module(api)
 
 
+# 1.5.0: RBAC fail-safes no-token requests to `viewer`, which would 403 these
+# write-path tests before they reach the audited mutation. RBAC is covered by
+# tests/test_rbac.py; here we assume an authenticated admin.
+@pytest.fixture(autouse=True)
+def _authenticated_admin():
+    with patch.object(api, "_get_user_role", return_value="admin"):
+        yield
+
+
 def _api_event(method, resource, path_params=None, body=None, api_key_id="abc-key"):
     """Build an API Gateway-style event with x-api-key context."""
     evt = {
@@ -90,6 +99,23 @@ class TestMutationAudits:
              "used_vcpu": 0, "used_mem_mb": 0, "status": "active",
              "next_vm_num": 1, "private_ip": "10.0.0.1", "rootfs_version": "v1.0"},
         ]}
+        # Stub the SSM helpers directly. These tests only assert that a mutation
+        # writes an audit row — they must not exercise the real SSM polling
+        # loop. _ssm_run in particular polls get_command_invocation for up to
+        # `timeout` seconds; under a bare module-level MagicMock the status
+        # never reads "Success", so without this stub a POST /{action} (stop)
+        # hangs ~30s. Patch the bound names on the handler module so behaviour
+        # is deterministic regardless of test ordering / mock leakage.
+        self._patchers = [
+            patch.object(api, "_ssm_run", return_value=True),
+            patch.object(api, "_ssm_send", return_value=None),
+        ]
+        for p in self._patchers:
+            p.start()
+
+    def teardown_method(self):
+        for p in getattr(self, "_patchers", []):
+            p.stop()
 
     @pytest.mark.unit
     def test_create_tenant_writes_audit(self):

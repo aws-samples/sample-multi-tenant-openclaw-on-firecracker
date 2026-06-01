@@ -76,6 +76,15 @@ handler.tenants_table = _tenants_mock
 handler.hosts_table = _hosts_mock
 
 
+# 1.5.0: RBAC fail-safes no-token requests to `viewer`, which would 403 these
+# write-path tests before they reach migrate logic. RBAC is covered by
+# tests/test_rbac.py; here we assume an authenticated admin.
+@pytest.fixture(autouse=True)
+def _authenticated_admin():
+    with patch.object(handler, "_get_user_role", return_value="admin"):
+        yield
+
+
 def _migrate_event(tenant_id, body=None):
     """Build the API Gateway event for POST /tenants/{id}/migrate."""
     return {
@@ -141,57 +150,24 @@ class TestMigrationValidation:
 
 
 # ═══════════════════════════════════════════
-# Successful path
+# Successful path — ASYNC (1.4.4, issue #64)
+#
+# migrate is now async: API Gateway caps a synchronous request at 29s, far
+# less than a multi-GB snapshot+restore. POST /migrate validates, fires the
+# snapshot SSM command (fire-and-forget via _ssm_send, which returns a
+# CommandId), records `migrating` + the async context in DDB, and returns 202.
+# The health_check sweep (_advance_migration, tested in test_migration_sweep.py)
+# polls the command, triggers restore, verifies the dashboard, and only then
+# flips host_id/counters/routing. So here we assert the *trigger* contract, not
+# the completed move.
 # ═══════════════════════════════════════════
 
 
 @pytest.mark.unit
 class TestMigrationOrchestration:
-    def test_invokes_ssm_on_both_hosts(self):
-        """Migration triggers SSM on source AND target."""
-        handler.tenants_table.get_item.return_value = {
-            "Item": {"id": "t1", "host_id": "i-source", "vm_num": 1,
-                     "vcpu": 2, "mem_mb": 4096, "guest_ip": "172.16.1.2",
-                     "host_port": 18789, "status": "running"},
-        }
-        handler.hosts_table.get_item.return_value = {
-            "Item": {"instance_id": "i-target", "private_ip": "10.0.0.5",
-                     "next_vm_num": 1, "used_vcpu": 0, "used_mem_mb": 0,
-                     "vm_count": 0, "total_vcpu": 4, "total_mem_mb": 16384,
-                     "status": "active"},
-        }
-        with patch.object(handler, "_ssm_send") as mock_send:
-            mock_send.return_value = "cmd-123"
-            ev = _migrate_event("t1", body={"target_host_id": "i-target"})
-            r = handler.lambda_handler(ev, None)
-        assert r["statusCode"] in (200, 202), f"expected 200/202 got {r}"
-        # _ssm_send should have been called for both source and target
-        called_hosts = {c.args[0] for c in mock_send.call_args_list}
-        assert "i-source" in called_hosts, f"source not called: {called_hosts}"
-        assert "i-target" in called_hosts, f"target not called: {called_hosts}"
-
-    def test_ssm_command_references_snapshot(self):
-        """The SSM payload must mention snapshot operations."""
-        handler.tenants_table.get_item.return_value = {
-            "Item": {"id": "t1", "host_id": "i-source", "vm_num": 1,
-                     "vcpu": 2, "mem_mb": 4096, "guest_ip": "172.16.1.2",
-                     "host_port": 18789, "status": "running"},
-        }
-        handler.hosts_table.get_item.return_value = {
-            "Item": {"instance_id": "i-target", "private_ip": "10.0.0.5",
-                     "next_vm_num": 1, "used_vcpu": 0, "used_mem_mb": 0,
-                     "vm_count": 0, "total_vcpu": 4, "total_mem_mb": 16384,
-                     "status": "active"},
-        }
-        with patch.object(handler, "_ssm_send") as mock_send:
-            mock_send.return_value = "cmd-1"
-            ev = _migrate_event("t1", body={"target_host_id": "i-target"})
-            handler.lambda_handler(ev, None)
-        all_cmds = " ".join(c.args[1] for c in mock_send.call_args_list)
-        assert "snapshot" in all_cmds.lower() or "migrate-vm" in all_cmds.lower()
-
-    def test_updates_tenant_host_id(self):
-        """After migration, tenant.host_id flips to the target."""
+    def test_returns_202_and_marks_migrating(self):
+        """A valid migrate request returns 202 and marks the tenant migrating
+        without flipping host_id (the move happens out-of-band)."""
         handler.tenants_table.get_item.return_value = {
             "Item": {"id": "t1", "host_id": "i-source", "vm_num": 1,
                      "vcpu": 2, "mem_mb": 4096, "guest_ip": "172.16.1.2",
@@ -204,20 +180,52 @@ class TestMigrationOrchestration:
                      "status": "active"},
         }
         handler.tenants_table.update_item.reset_mock()
-        with patch.object(handler, "_ssm_send", return_value="cmd-1"):
+        with patch.object(handler, "_ssm_send", return_value="cmd-abc") as mock_send:
+            ev = _migrate_event("t1", body={"target_host_id": "i-target"})
+            r = handler.lambda_handler(ev, None)
+        assert r["statusCode"] == 202, f"expected 202 got {r}"
+        body = json.loads(r["body"])
+        assert body["status"] == "migrating"
+        assert body["target_host_id"] == "i-target"
+        # The snapshot command must be fired on the SOURCE host exactly once.
+        assert mock_send.call_count == 1, "expected one snapshot _ssm_send"
+        assert mock_send.call_args.args[0] == "i-source"
+        assert "migrate-vm.sh snapshot" in mock_send.call_args.args[1]
+
+    def test_persists_async_migration_context(self):
+        """The 202 path must stash everything the sweep needs: target, source,
+        snapshot CommandId, phase=snapshot, and status=migrating."""
+        handler.tenants_table.get_item.return_value = {
+            "Item": {"id": "t1", "host_id": "i-source", "vm_num": 1,
+                     "vcpu": 2, "mem_mb": 4096, "status": "running"},
+        }
+        handler.hosts_table.get_item.return_value = {
+            "Item": {"instance_id": "i-target", "private_ip": "10.0.0.5",
+                     "next_vm_num": 3, "used_vcpu": 0, "used_mem_mb": 0,
+                     "vm_count": 0, "total_vcpu": 4, "total_mem_mb": 16384,
+                     "status": "active"},
+        }
+        handler.tenants_table.update_item.reset_mock()
+        with patch.object(handler, "_ssm_send", return_value="cmd-xyz"):
             ev = _migrate_event("t1", body={"target_host_id": "i-target"})
             handler.lambda_handler(ev, None)
-        # Look for an update that sets host_id to i-target
-        updated = False
+        # Find the update that set status=migrating and assert the context.
+        ctx = None
         for c in handler.tenants_table.update_item.call_args_list:
             vals = c.kwargs.get("ExpressionAttributeValues", {})
-            if any("i-target" in str(v) for v in vals.values()):
-                updated = True
+            if vals.get(":s") == "migrating":
+                ctx = vals
                 break
-        assert updated, "tenant.host_id was not updated to i-target"
+        assert ctx is not None, "no status=migrating write observed"
+        assert ctx[":tgt"] == "i-target"
+        assert ctx[":src"] == "i-source"
+        assert ctx[":scmd"] == "cmd-xyz"
+        assert ctx[":ph"] == "snapshot"
+        assert ctx[":tvn"] == 3, "target_vm_num should come from next_vm_num"
 
-    def test_updates_both_host_counters(self):
-        """Regression: #59 — migrate must -= source counters, += target counters."""
+    def test_does_not_flip_host_id_synchronously(self):
+        """The 202 path must NOT flip host_id — that only happens in the sweep
+        after the whole move is proven."""
         handler.tenants_table.get_item.return_value = {
             "Item": {"id": "t1", "host_id": "i-source", "vm_num": 1,
                      "vcpu": 2, "mem_mb": 4096, "status": "running"},
@@ -228,29 +236,51 @@ class TestMigrationOrchestration:
                      "vm_count": 0, "total_vcpu": 4, "total_mem_mb": 16384,
                      "status": "active"},
         }
+        handler.tenants_table.update_item.reset_mock()
         handler.hosts_table.update_item.reset_mock()
-        with patch.object(handler, "_ssm_send", return_value="cmd-1"):
+        with patch.object(handler, "_ssm_send", return_value="cmd-abc"):
             ev = _migrate_event("t1", body={"target_host_id": "i-target"})
             handler.lambda_handler(ev, None)
+        for c in handler.tenants_table.update_item.call_args_list:
+            expr = c.kwargs.get("UpdateExpression", "")
+            assert "host_id = :h" not in expr, "host_id flipped synchronously"
+        # No host counter mutation in the request path either.
+        assert handler.hosts_table.update_item.call_count == 0, (
+            "host counters mutated synchronously"
+        )
 
-        calls_by_host = {}
-        for c in handler.hosts_table.update_item.call_args_list:
-            iid = c.kwargs.get("Key", {}).get("instance_id")
-            calls_by_host.setdefault(iid, []).append(c)
-        assert "i-source" in calls_by_host, "source host was not updated"
-        assert "i-target" in calls_by_host, "target host was not updated"
+    def test_502_when_ssm_submit_fails(self):
+        """If the snapshot SSM command can't even be submitted (_ssm_send →
+        None), return 502 and do NOT mark migrating."""
+        handler.tenants_table.get_item.return_value = {
+            "Item": {"id": "t1", "host_id": "i-source", "vm_num": 1,
+                     "vcpu": 2, "mem_mb": 4096, "status": "running"},
+        }
+        handler.hosts_table.get_item.return_value = {
+            "Item": {"instance_id": "i-target", "private_ip": "10.0.0.5",
+                     "next_vm_num": 1, "used_vcpu": 0, "used_mem_mb": 0,
+                     "vm_count": 0, "total_vcpu": 4, "total_mem_mb": 16384,
+                     "status": "active"},
+        }
+        handler.tenants_table.update_item.reset_mock()
+        with patch.object(handler, "_ssm_send", return_value=None):
+            ev = _migrate_event("t1", body={"target_host_id": "i-target"})
+            r = handler.lambda_handler(ev, None)
+        assert r["statusCode"] == 502, f"expected 502 got {r}"
+        for c in handler.tenants_table.update_item.call_args_list:
+            vals = c.kwargs.get("ExpressionAttributeValues", {})
+            assert vals.get(":s") != "migrating", (
+                "tenant marked migrating despite SSM submit failure"
+            )
 
-        # Source decrements
-        src_expr = " ".join(c.kwargs["UpdateExpression"] for c in calls_by_host["i-source"])
-        assert "used_vcpu - :v" in src_expr
-        assert "used_mem_mb - :m" in src_expr
-        assert "vm_count - :one" in src_expr
 
-        # Target increments
-        tgt_expr = " ".join(c.kwargs["UpdateExpression"] for c in calls_by_host["i-target"])
-        assert "used_vcpu + :v" in tgt_expr
-        assert "used_mem_mb + :m" in tgt_expr
-        assert "vm_count + :one" in tgt_expr
+# ═══════════════════════════════════════════
+# Failure-path fail-safe is now enforced by the health_check sweep
+# (_advance_migration), covered in tests/test_migration_sweep.py. The API
+# request path itself can only fail at SSM submit (above) — every other
+# failure (snapshot/restore command failure, dashboard verify) is handled
+# out-of-band, where the rollback-to-running contract lives.
+# ═══════════════════════════════════════════
 
 
 # ═══════════════════════════════════════════

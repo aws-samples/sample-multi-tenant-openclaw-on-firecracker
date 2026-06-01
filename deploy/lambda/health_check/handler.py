@@ -118,6 +118,288 @@ def lambda_handler(event, context):
             # AZ failover failures must NEVER take down the watchdog.
             print(f"az_failover error (non-fatal): {e}")
 
+    # ------- In-flight live-migration sweep (1.4.4, issue #64) -------
+    # POST /tenants/{id}/migrate is async: it fires the snapshot SSM command,
+    # marks the tenant `migrating` with the async context, and returns 202
+    # (API Gateway caps a synchronous request at 29s, far less than a multi-GB
+    # snapshot+restore). This sweep is the out-of-band driver that advances
+    # each in-flight migration: poll the snapshot command → trigger restore →
+    # verify the dashboard → flip host_id/counters/routing → running. A failure
+    # at any step (or a watchdog timeout) rolls status back to running with
+    # host_id untouched, so the tenant is never stranded. `migrating` tenants
+    # are NOT in the `running` scan above, so query them separately.
+    try:
+        migrating = tenants_table.scan(
+            FilterExpression="#s = :m",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":m": "migrating"},
+        ).get("Items", [])
+        for tenant in migrating:
+            # Defensive re-filter: only advance tenants that are *actually*
+            # migrating with an in-flight phase. Guards against a scan that
+            # over-returns (and keeps unit tests that stub scan with a single
+            # return_value from accidentally feeding running tenants here).
+            if tenant.get("status") != "migrating" or not tenant.get("migration_phase"):
+                continue
+            try:
+                _advance_migration(tenant, now)
+            except Exception as e:
+                # One stuck migration must not break the others or the watchdog.
+                print(f"_advance_migration error for {tenant.get('id')}: {e}")
+    except Exception as e:
+        print(f"migration sweep scan error (non-fatal): {e}")
+
+
+# Watchdog: a migration that hasn't reached a terminal state within this many
+# minutes is force-rolled-back to `running` (the source VM is still there).
+MIGRATION_WATCHDOG_MINUTES = int(os.environ.get("MIGRATION_WATCHDOG_MINUTES", "15"))
+
+
+def _rollback_migration(tenant, reason):
+    """Roll a failed/stuck migration back to `running` and clear the async
+    context. The source VM was only briefly paused for the snapshot and then
+    resumed by migrate-vm.sh, and host_id / counters / routing were never
+    touched — so 'running' is the truthful state and there is nothing to undo
+    on the data plane. We record migration_failed + the reason for operators.
+    """
+    tid = tenant["id"]
+    tenants_table.update_item(
+        Key={"id": tid},
+        UpdateExpression=(
+            "SET #s = :r, migration_failed = :reason, updated_at = :t "
+            "REMOVE migration_target, migration_target_vm_num, migration_source, "
+            "migration_snap_cmd, migration_restore_cmd, migration_phase, "
+            "migration_started_at, migration_snapshot_uri"
+        ),
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={
+            ":r": "running", ":reason": reason[:500],
+            ":t": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    _emit_audit("MIGRATION_FAILED", {"tenant_id": tid, "reason": reason[:200]})
+    print(f"migration rollback {tid}: {reason}")
+
+
+def _advance_migration(tenant, now):
+    """Advance one in-flight migration by exactly one step per sweep tick.
+
+    State machine (migration_phase):
+      snapshot → (SSM snapshot Success) → fire restore, phase=restore
+               → (SSM Failed/TimedOut)  → rollback to running
+      restore  → (SSM restore Success)  → verify dashboard → flip → running
+               → (SSM Failed/TimedOut)  → rollback to running
+    InProgress at either phase: do nothing, re-check next tick. A watchdog
+    rolls back migrations stuck past MIGRATION_WATCHDOG_MINUTES.
+    """
+    tid = tenant["id"]
+    phase = tenant.get("migration_phase", "")
+    # Guard: only tenants with an explicit migration_phase are mid-migration.
+    # A tenant with status=migrating but no phase (shouldn't happen via the
+    # API, but be defensive against stray scans / manual DDB edits) is left
+    # untouched rather than force-rolled-back. Empty phase = nothing to advance.
+    if not phase:
+        return
+    source_host_id = tenant.get("migration_source", "")
+    target_host_id = tenant.get("migration_target", "")
+    target_vm_num = int(tenant.get("migration_target_vm_num", 1))
+    snap_uri = tenant.get("migration_snapshot_uri", "")
+    vm_num = int(tenant.get("vm_num", 1))
+
+    # Watchdog — never let a tenant sit in `migrating` forever.
+    started = tenant.get("migration_started_at", "")
+    if started:
+        try:
+            elapsed_min = (now - datetime.fromisoformat(started)).total_seconds() / 60.0
+            if elapsed_min > MIGRATION_WATCHDOG_MINUTES:
+                _rollback_migration(tenant, f"watchdog: stuck in {phase} for "
+                                            f"{int(elapsed_min)}min")
+                return
+        except Exception:
+            pass
+
+    if phase == "snapshot":
+        cmd_id = tenant.get("migration_snap_cmd", "")
+        if not cmd_id:
+            _rollback_migration(tenant, "snapshot phase but no migration_snap_cmd")
+            return
+        done, ok = _poll_ssm(cmd_id, source_host_id)
+        if not done:
+            return  # still running; check again next tick
+        if not ok:
+            _rollback_migration(tenant, "snapshot command failed on source host")
+            return
+        # Snapshot done — fire restore on the target host.
+        restore_cmd = _ssm_send_hc(
+            target_host_id,
+            f"/home/ubuntu/migrate-vm.sh restore {tid} {target_vm_num} {snap_uri}",
+            timeout=600,
+        )
+        if not restore_cmd:
+            _rollback_migration(tenant, "failed to submit restore SSM command")
+            return
+        tenants_table.update_item(
+            Key={"id": tid},
+            UpdateExpression=("SET migration_phase = :p, "
+                              "migration_restore_cmd = :rc, updated_at = :t"),
+            ExpressionAttributeValues={
+                ":p": "restore", ":rc": restore_cmd,
+                ":t": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        print(f"migration {tid}: snapshot done → restore fired ({restore_cmd})")
+        return
+
+    if phase == "restore":
+        cmd_id = tenant.get("migration_restore_cmd", "")
+        if not cmd_id:
+            _rollback_migration(tenant, "restore phase but no migration_restore_cmd")
+            return
+        done, ok = _poll_ssm(cmd_id, target_host_id)
+        if not done:
+            return
+        if not ok:
+            _rollback_migration(tenant, "restore command failed on target host")
+            return
+
+        # Restore succeeded on the data plane. Before flipping the source of
+        # truth, gate on the public-path dashboard check — the same reality
+        # check AZ failover uses (1.4.2). If the dashboard isn't reachable
+        # through the ALB, the move isn't really done; roll back.
+        target = hosts_table.get_item(
+            Key={"instance_id": target_host_id}).get("Item") or {}
+        target_ip = target.get("private_ip", "")
+        try:
+            if target_ip:
+                _repoint_alb_rule(tid, target_host_id, target_ip)
+            else:
+                _rollback_migration(tenant, "target host has no private_ip")
+                return
+        except Exception as e:
+            _rollback_migration(tenant, f"ALB repoint failed: {e}")
+            return
+
+        if PUBLIC_BASE_URL and not _verify_dashboard_reachable_via_alb(
+                tid, PUBLIC_BASE_URL, timeout_sec=30, poll_sec=3):
+            _rollback_migration(tenant, "dashboard not reachable via ALB after restore")
+            return
+
+        # Every gate passed — flip ownership + counters, status → running,
+        # clear the async context. vcpu/mem come from the tenant record.
+        vcpu = int(tenant.get("vcpu", 0))
+        mem_mb = int(tenant.get("mem_mb", 0))
+        tenants_table.update_item(
+            Key={"id": tid},
+            UpdateExpression=(
+                "SET host_id = :h, vm_num = :n, #s = :running, updated_at = :t "
+                "REMOVE migration_target, migration_target_vm_num, migration_source, "
+                "migration_snap_cmd, migration_restore_cmd, migration_phase, "
+                "migration_started_at, migration_snapshot_uri, migration_failed"
+            ),
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":h": target_host_id, ":n": target_vm_num, ":running": "running",
+                ":t": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        # Source counters -- , target counters ++ (if_not_exists guards cold rows).
+        if source_host_id:
+            try:
+                hosts_table.update_item(
+                    Key={"instance_id": source_host_id},
+                    UpdateExpression=("SET used_vcpu = if_not_exists(used_vcpu, :z) - :v, "
+                                      "used_mem_mb = if_not_exists(used_mem_mb, :z) - :m, "
+                                      "vm_count = if_not_exists(vm_count, :z) - :one"),
+                    ExpressionAttributeValues={":v": vcpu, ":m": mem_mb,
+                                               ":one": 1, ":z": 0},
+                )
+            except Exception as e:
+                print(f"source counter dec failed (non-fatal): {e}")
+        try:
+            hosts_table.update_item(
+                Key={"instance_id": target_host_id},
+                UpdateExpression=("SET next_vm_num = :nn, "
+                                  "vm_count = if_not_exists(vm_count, :z) + :one, "
+                                  "used_vcpu = if_not_exists(used_vcpu, :z) + :v, "
+                                  "used_mem_mb = if_not_exists(used_mem_mb, :z) + :m"),
+                ExpressionAttributeValues={":nn": target_vm_num + 1, ":one": 1,
+                                           ":v": vcpu, ":m": mem_mb, ":z": 0},
+            )
+        except Exception as e:
+            print(f"target counter inc failed (non-fatal): {e}")
+
+        # Best-effort: stop the old VM on the source + clean its nginx conf so
+        # the slot is freed and it stops advertising as a backend.
+        if source_host_id:
+            try:
+                _ssm_send_hc(
+                    source_host_id,
+                    f"/home/ubuntu/stop-vm.sh {tid} {vm_num} ; "
+                    f"sudo rm -f /etc/nginx/conf.d/tenants/{tid}.conf "
+                    f"&& sudo nginx -s reload",
+                    timeout=60,
+                )
+            except Exception:
+                pass
+
+        _emit_audit("MIGRATION_COMPLETED", {
+            "tenant_id": tid, "source_host_id": source_host_id,
+            "target_host_id": target_host_id,
+        })
+        print(f"migration {tid}: COMPLETE → {target_host_id}")
+        return
+
+    # Unknown phase — don't strand the tenant.
+    _rollback_migration(tenant, f"unknown migration_phase: {phase!r}")
+
+
+def _poll_ssm(command_id, instance_id):
+    """Single, instantaneous check of an SSM command's status. Returns
+    (done, ok):
+      (False, _)    — Pending / InProgress / Delayed / not yet registered;
+                      re-check on the next sweep tick (do NOT block here)
+      (True, True)  — Success
+      (True, False) — Failed / TimedOut / Cancelled
+
+    Deliberately does NOT reuse _wait_ssm_done: that helper blocks in a sleep
+    loop and collapses 'still running' and 'failed' into the same (False, msg),
+    which the sweep must distinguish. We read Status once and return."""
+    try:
+        inv = ssm.get_command_invocation(
+            CommandId=command_id, InstanceId=instance_id,
+        )
+    except ssm.exceptions.InvocationDoesNotExist:
+        return False, False  # not registered yet; try next tick
+    except Exception as e:
+        print(f"_poll_ssm error {command_id}/{instance_id}: {e}")
+        return False, False
+    status = inv.get("Status", "Pending")
+    if status == "Success":
+        return True, True
+    if status in ("Failed", "TimedOut", "Cancelled"):
+        print(f"_poll_ssm {command_id}: {status} - "
+              f"{(inv.get('StandardErrorContent') or '')[:200]}")
+        return True, False
+    return False, False  # Pending / InProgress / Delayed
+
+
+def _ssm_send_hc(instance_id, command, timeout=120):
+    """Fire-and-forget SSM from the health_check Lambda; returns CommandId or
+    None. Mirrors the api Lambda's _ssm_send (wraps HOME/cd, returns the id so
+    the sweep can poll it on the next tick)."""
+    try:
+        wrapped = f'export HOME=/home/ubuntu && cd /home/ubuntu && {command}'
+        resp = ssm.send_command(
+            InstanceIds=[instance_id],
+            DocumentName="AWS-RunShellScript",
+            Parameters={"commands": [wrapped], "executionTimeout": [str(timeout)]},
+            TimeoutSeconds=timeout + 10,
+        )
+        return resp["Command"]["CommandId"]
+    except Exception as e:
+        print(f"_ssm_send_hc error: {e}")
+        return None
+
 
 def _restart_host_agent(host_id, now):
     """Restart host-agent service via SSM. Returns True if restart was issued."""

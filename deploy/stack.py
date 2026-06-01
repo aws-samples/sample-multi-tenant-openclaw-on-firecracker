@@ -25,7 +25,7 @@ from aws_cdk import (
     aws_bedrock_agentcore_alpha as agentcore,
     aws_bedrockagentcore as agentcore_l1,
     custom_resources as cr,
-    Duration, Fn, RemovalPolicy,
+    BundlingOptions, Duration, Fn, RemovalPolicy,
 )
 from constructs import Construct
 from pathlib import Path
@@ -168,8 +168,33 @@ class OpenClawOrchestratorStack(cdk.Stack):
         api_fn = _lambda.Function(self, "ApiHandler",
             function_name="openclaw-api",
             runtime=_lambda.Runtime.PYTHON_3_12,
+            # 1.5.0: ARM_64 (Graviton) — cheaper/faster, and it makes the
+            # bundled cryptography native wheel deterministic: we pin the
+            # bundling image platform to linux/arm64 below so the manylinux
+            # aarch64 wheel always matches the Lambda runtime arch, regardless
+            # of the dev machine. (A default x86_64 Lambda with an aarch64
+            # wheel would crash at import with "invalid ELF header".)
+            architecture=_lambda.Architecture.ARM_64,
             handler="handler.lambda_handler",
-            code=_lambda.Code.from_asset("deploy/lambda/api"),
+            # 1.5.0: bundle PyJWT + cryptography for Cognito JWT signature
+            # verification. cryptography ships a native extension, so it must
+            # be pip-installed inside the Lambda Linux image (manylinux wheel),
+            # not copied from the dev machine. The handler source is copied on
+            # top of the installed deps. Requires Docker at synth/deploy time.
+            code=_lambda.Code.from_asset(
+                "deploy/lambda/api",
+                bundling=BundlingOptions(
+                    image=_lambda.Runtime.PYTHON_3_12.bundling_image,
+                    # Pin the build platform to the Lambda arch so pip fetches
+                    # the matching manylinux wheel (aarch64) deterministically.
+                    platform="linux/arm64",
+                    command=[
+                        "bash", "-c",
+                        "pip install --no-cache-dir -r requirements.txt -t /asset-output "
+                        "&& cp -au . /asset-output",
+                    ],
+                ),
+            ),
             timeout=Duration.seconds(120),
             memory_size=256,
             environment={
@@ -203,8 +228,17 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 "MULTI_AZ_ENABLED": str(CFG.get("multi_az", {}).get("enabled", False)).lower(),
                 "MULTI_AZ_COUNT": str(CFG.get("multi_az", {}).get("az_count", 1)),
                 "WAF_ENABLED": str(CFG.get("waf", {}).get("enabled", False)).lower(),
-                "COGNITO_USER_POOL_ID": (CFG.get("console_auth", {}) or {}).get("user_pool_id", ""),
+                # COGNITO_USER_POOL_ID / COGNITO_CLIENT_ID are injected AFTER the
+                # Cognito section computes the real, stack-owned pool/client ids
+                # (see add_environment below). The config.yml value is unreliable
+                # (often empty), so we never read it here — fail-safe RBAC needs
+                # the genuine pool id to fetch JWKS for signature verification.
                 "CONSOLE_AUTH_ENABLED": str((CFG.get("console_auth", {}) or {}).get("enabled", False)).lower(),
+                # Fail-safe default role when a request carries no Bearer token
+                # (API-key-only path). "viewer" = least privilege. Override per
+                # environment only for trusted automation that cannot present a
+                # Cognito id_token.
+                "DEFAULT_NO_JWT_ROLE": str(CFG.get("console_auth", {}).get("default_no_jwt_role", "viewer")),
                 "PROJECT_VERSION": _read_pyproject_version(),
             },
         )
@@ -326,64 +360,93 @@ class OpenClawOrchestratorStack(cdk.Stack):
 
         key_required = {"api_key_required": True}
 
+        # ── Lambda permission policy size fix (deploy-blocking) ──
+        # Each `LambdaIntegration(api_fn)` makes CDK attach a *separate*
+        # AWS::Lambda::Permission scoped to that one method's ARN. With ~29
+        # routes the function's resource-based policy crossed Lambda's hard
+        # 20480-byte limit, so EVERY `cdk deploy` failed with
+        # "The final policy size (20485) is bigger than the limit (20480)".
+        # Fix: grant API Gateway invoke ONCE via a wildcard source ARN, and
+        # build integrations against an *imported* view of the function.
+        # CDK does not auto-add per-method permissions for an imported
+        # IFunction (it assumes it doesn't own it), so the policy stays at a
+        # single statement regardless of how many routes we add.
+        api_fn.add_permission("ApiGwInvoke",
+            principal=iam.ServicePrincipal("apigateway.amazonaws.com"),
+            action="lambda:InvokeFunction",
+            source_arn=Fn.join("", [
+                "arn:", cdk.Aws.PARTITION, ":execute-api:", cdk.Aws.REGION,
+                ":", cdk.Aws.ACCOUNT_ID, ":", api.rest_api_id, "/*/*",
+            ]),
+        )
+        _api_fn_view = _lambda.Function.from_function_arn(
+            self, "ApiHandlerView", api_fn.function_arn,
+        )
+
+        def _li():
+            """A LambdaIntegration that does NOT add a per-method permission
+            (built against the imported view). The single wildcard permission
+            above authorises every method."""
+            return apigw.LambdaIntegration(_api_fn_view)
+
         tenants_resource = api.root.add_resource("tenants")
-        tenants_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
-        tenants_resource.add_method("POST", apigw.LambdaIntegration(api_fn), **key_required)
+        tenants_resource.add_method("GET", _li(), **key_required)
+        tenants_resource.add_method("POST", _li(), **key_required)
 
         tenant_resource = tenants_resource.add_resource("{id}")
-        tenant_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
-        tenant_resource.add_method("DELETE", apigw.LambdaIntegration(api_fn), **key_required)
+        tenant_resource.add_method("GET", _li(), **key_required)
+        tenant_resource.add_method("DELETE", _li(), **key_required)
 
         tenant_action = tenant_resource.add_resource("{action}")
-        tenant_action.add_method("POST", apigw.LambdaIntegration(api_fn), **key_required)
-        tenant_action.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
+        tenant_action.add_method("POST", _li(), **key_required)
+        tenant_action.add_method("GET", _li(), **key_required)
 
         hosts_resource = api.root.add_resource("hosts")
-        hosts_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
-        hosts_resource.add_method("POST", apigw.LambdaIntegration(api_fn), **key_required)
+        hosts_resource.add_method("GET", _li(), **key_required)
+        hosts_resource.add_method("POST", _li(), **key_required)
 
         host_resource = hosts_resource.add_resource("{instance_id}")
-        host_resource.add_method("DELETE", apigw.LambdaIntegration(api_fn), **key_required)
+        host_resource.add_method("DELETE", _li(), **key_required)
 
         backups_resource = api.root.add_resource("backups")
-        backups_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
+        backups_resource.add_method("GET", _li(), **key_required)
 
         # 1.4.0 (#62) — Groups CRUD endpoints
         groups_resource = api.root.add_resource("groups")
-        groups_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
-        groups_resource.add_method("POST", apigw.LambdaIntegration(api_fn), **key_required)
+        groups_resource.add_method("GET", _li(), **key_required)
+        groups_resource.add_method("POST", _li(), **key_required)
         group_resource = groups_resource.add_resource("{name}")
         group_skills_resource = group_resource.add_resource("skills")
-        group_skills_resource.add_method("POST", apigw.LambdaIntegration(api_fn), **key_required)
+        group_skills_resource.add_method("POST", _li(), **key_required)
         group_skill_resource = group_skills_resource.add_resource("{skill}")
-        group_skill_resource.add_method("DELETE", apigw.LambdaIntegration(api_fn), **key_required)
+        group_skill_resource.add_method("DELETE", _li(), **key_required)
 
         # Issue #23 — batch operations: POST /batch/tenants
         batch_resource = api.root.add_resource("batch")
         batch_tenants_resource = batch_resource.add_resource("tenants")
-        batch_tenants_resource.add_method("POST", apigw.LambdaIntegration(api_fn), **key_required)
+        batch_tenants_resource.add_method("POST", _li(), **key_required)
 
         refresh_rootfs_resource = hosts_resource.add_resource("refresh-rootfs")
-        refresh_rootfs_resource.add_method("POST", apigw.LambdaIntegration(api_fn), **key_required)
+        refresh_rootfs_resource.add_method("POST", _li(), **key_required)
 
         rootfs_version_resource = hosts_resource.add_resource("rootfs-version")
-        rootfs_version_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
+        rootfs_version_resource.add_method("GET", _li(), **key_required)
 
         agentcore_resource = api.root.add_resource("agentcore")
         agentcore_status_resource = agentcore_resource.add_resource("status")
-        agentcore_status_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
+        agentcore_status_resource.add_method("GET", _li(), **key_required)
         agentcore_tools_resource = agentcore_resource.add_resource("tools")
-        agentcore_tools_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
+        agentcore_tools_resource.add_method("GET", _li(), **key_required)
 
         # /system/info — feature flags + config snapshot for the console
         system_resource = api.root.add_resource("system")
         system_info_resource = system_resource.add_resource("info")
-        system_info_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
+        system_info_resource.add_method("GET", _li(), **key_required)
 
         # /audit-log — already created earlier in the routes, but the
         # resource needs to exist on the REST API; declare it here once.
         audit_log_resource = api.root.add_resource("audit-log")
-        audit_log_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
+        audit_log_resource.add_method("GET", _li(), **key_required)
 
         # ========== Health Check Lambda ==========
         hc_cfg = CFG.get("health_check", {}) or {}
@@ -463,9 +526,9 @@ class OpenClawOrchestratorStack(cdk.Stack):
         skills_resource.add_method("GET", apigw.LambdaIntegration(skills_fn), **key_required)
         # 1.4.1 (#63) — per-skill CRUD goes through api Lambda (reuses RBAC + audit log)
         skill_resource = skills_resource.add_resource("{name}")
-        skill_resource.add_method("GET", apigw.LambdaIntegration(api_fn), **key_required)
-        skill_resource.add_method("PUT", apigw.LambdaIntegration(api_fn), **key_required)
-        skill_resource.add_method("DELETE", apigw.LambdaIntegration(api_fn), **key_required)
+        skill_resource.add_method("GET", _li(), **key_required)
+        skill_resource.add_method("PUT", _li(), **key_required)
+        skill_resource.add_method("DELETE", _li(), **key_required)
 
         # ========== Templates Lambda ==========
         templates_fn = _lambda.Function(self, "Templates",
@@ -738,6 +801,19 @@ class OpenClawOrchestratorStack(cdk.Stack):
 
         cfn_lt = launch_template.node.default_child
 
+        # ── SECURITY (defense-in-depth for IMDS): require IMDSv2 + hop-limit 1 ──
+        # The primary guest→IMDS egress block is the iptables DROP in
+        # launch-vm.sh; this hardens the host side. Requiring session tokens
+        # (HttpTokens=required) kills IMDSv1 credential theft via simple SSRF,
+        # and HttpPutResponseHopLimit=1 stops a process one network hop away
+        # from obtaining a token. host-agent.py / the AWS SDK use the IMDSv2
+        # flow, so this is transparent to legitimate callers.
+        cfn_lt.add_property_override("LaunchTemplateData.MetadataOptions", {
+            "HttpTokens": "required",
+            "HttpPutResponseHopLimit": 1,
+            "HttpEndpoint": "enabled",
+        })
+
         if CFG["asg"].get("use_spot"):
             cfn_lt.add_property_override("LaunchTemplateData.InstanceMarketOptions", {
                 "MarketType": "spot",
@@ -753,6 +829,16 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 "SourceVersion": "$Latest",
                 "LaunchTemplateData": {
                     "CpuOptions": {"NestedVirtualization": "enabled"},
+                    # Carry the IMDSv2/hop-limit hardening into the nested-virt
+                    # version too. CreateLaunchTemplateVersion merges onto
+                    # SourceVersion=$Latest so this would normally be inherited,
+                    # but we restate it so the security posture is explicit and
+                    # cannot silently regress if the base override is removed.
+                    "MetadataOptions": {
+                        "HttpTokens": "required",
+                        "HttpPutResponseHopLimit": 1,
+                        "HttpEndpoint": "enabled",
+                    },
                 },
             },
             physical_resource_id=cr.PhysicalResourceId.of(
@@ -1222,6 +1308,17 @@ function handler(event) {
                     description=description,
                     precedence=precedence,
                 )
+
+            # Fail-safe RBAC (1.5.0): inject the REAL, stack-owned Cognito ids so
+            # the api Lambda can fetch JWKS and verify id_token signatures
+            # (RS256). These override the construction-time placeholders — the
+            # Cognito pool id is only known here, after the pool is created or
+            # imported above. Without a genuine pool id the handler cannot
+            # verify signatures and every request fails safe to `viewer`.
+            api_fn.add_environment("COGNITO_USER_POOL_ID",
+                                   cognito_outputs.get("CognitoUserPoolId", ""))
+            api_fn.add_environment("COGNITO_CLIENT_ID",
+                                   cognito_outputs.get("CognitoClientId", ""))
 
         # ========== Outputs ==========
         for key, val in {

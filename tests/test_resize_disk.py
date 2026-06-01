@@ -51,6 +51,16 @@ with patch("boto3.resource", return_value=_mock_ddb), \
     spec.loader.exec_module(handler)
 
 
+# 1.5.0: RBAC now fail-safes no-token requests to `viewer`, which would 403
+# these write-path tests before they reach resize-disk logic. RBAC itself is
+# covered by tests/test_rbac.py; here we assume an authenticated admin so we
+# can exercise the business logic.
+@pytest.fixture(autouse=True)
+def _authenticated_admin():
+    with patch.object(handler, "_get_user_role", return_value="admin"):
+        yield
+
+
 def _ev(tenant_id, body=None):
     return {
         "httpMethod": "POST",
@@ -104,7 +114,9 @@ class TestResizeDiskOrchestration:
             "Item": {"id": "t1", "host_id": "i-1", "vm_num": 1,
                      "data_disk_mb": 8192, "status": "running"},
         }
-        with patch.object(handler, "_ssm_send", return_value="cmd-1") as mock_send:
+        # Issue #64-class fix: resize-disk now runs synchronously via _ssm_run
+        # (blocks on SSM completion) and only persists the new size on success.
+        with patch.object(handler, "_ssm_run", return_value=True) as mock_send:
             r = handler.lambda_handler(_ev("t1", body={"new_size_mb": 16384}), None)
         assert r["statusCode"] in (200, 202)
         called = {c.args[0] for c in mock_send.call_args_list}
@@ -115,7 +127,7 @@ class TestResizeDiskOrchestration:
             "Item": {"id": "t1", "host_id": "i-1", "vm_num": 1,
                      "data_disk_mb": 8192, "status": "running"},
         }
-        with patch.object(handler, "_ssm_send", return_value="cmd-1") as mock_send:
+        with patch.object(handler, "_ssm_run", return_value=True) as mock_send:
             handler.lambda_handler(_ev("t1", body={"new_size_mb": 16384}), None)
         all_cmds = " ".join(c.args[1] for c in mock_send.call_args_list)
         assert "resize" in all_cmds.lower() or "resize-disk" in all_cmds.lower()
@@ -126,7 +138,7 @@ class TestResizeDiskOrchestration:
                      "data_disk_mb": 8192, "status": "running"},
         }
         _tenants.update_item.reset_mock()
-        with patch.object(handler, "_ssm_send", return_value="cmd-1"):
+        with patch.object(handler, "_ssm_run", return_value=True):
             handler.lambda_handler(_ev("t1", body={"new_size_mb": 16384}), None)
         updated = False
         for c in _tenants.update_item.call_args_list:
@@ -135,6 +147,24 @@ class TestResizeDiskOrchestration:
                 updated = True
                 break
         assert updated, "tenant.data_disk_mb was not updated to 16384"
+
+    def test_ssm_failure_does_not_persist_new_size(self):
+        """Issue #64-class: if resize-disk.sh fails on the host, DDB must NOT
+        claim the new size and the API must return 5xx."""
+        _tenants.get_item.return_value = {
+            "Item": {"id": "t1", "host_id": "i-1", "vm_num": 1,
+                     "data_disk_mb": 8192, "status": "running"},
+        }
+        _tenants.update_item.reset_mock()
+        with patch.object(handler, "_ssm_run", return_value=False):
+            r = handler.lambda_handler(_ev("t1", body={"new_size_mb": 16384}), None)
+        assert r["statusCode"] >= 500, f"expected 5xx on resize failure, got {r}"
+        # data_disk_mb must NOT have been bumped to the requested size.
+        for c in _tenants.update_item.call_args_list:
+            vals = c.kwargs.get("ExpressionAttributeValues", {})
+            assert not any(v == 16384 for v in vals.values()), (
+                "data_disk_mb persisted to 16384 despite the host resize failing"
+            )
 
 
 @pytest.mark.unit

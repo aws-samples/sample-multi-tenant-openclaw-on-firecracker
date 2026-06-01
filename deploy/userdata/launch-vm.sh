@@ -197,6 +197,18 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
     fi
   fi
 fi
+# 1.5.0 security: inject THIS host's public key so host-agent can SSH into
+# the guest with key auth (no shared password). The key is per-host
+# (init-host.sh generates it), so each VM trusts only its own host. uid/gid
+# 1000 = the in-guest `agent` user that owns /home/agent (this data disk).
+if [ -f /etc/openclaw/host_vm_key.pub ]; then
+  sudo mkdir -p "${MOUNT_TMP}/.ssh"
+  sudo cp /etc/openclaw/host_vm_key.pub "${MOUNT_TMP}/.ssh/authorized_keys"
+  sudo chmod 700 "${MOUNT_TMP}/.ssh"
+  sudo chmod 600 "${MOUNT_TMP}/.ssh/authorized_keys"
+  sudo chown -R 1000:1000 "${MOUNT_TMP}/.ssh"
+  log "injected host SSH public key into VM data disk"
+fi
 sudo umount ${MOUNT_TMP}
 rmdir ${MOUNT_TMP} 2>/dev/null || true
 
@@ -223,6 +235,24 @@ sudo ip addr add ${HOST_TAP_IP}/24 dev ${TAP}
 sudo ip link set dev ${TAP} up
 HOST_IFACE=$(ip route show default | awk '{print $5}' | head -1)
 sudo sysctl -q -w net.ipv4.ip_forward=1
+# ── SECURITY (multi-tenant isolation): block guest → instance metadata ──
+# Without this, a tenant inside its microVM can reach the host's IMDS at
+# 169.254.169.254 through the MASQUERADE rule below and steal the host EC2
+# instance-profile credentials (which can read/write the shared assets bucket
+# and the tenants/hosts tables — i.e. every other tenant's data). Drop all
+# guest-originated traffic to the link-local IMDS range BEFORE the ACCEPT
+# rules. -I inserts at the top so it always precedes the FORWARD ACCEPT.
+# Also covers IMDSv6 (fd00:ec2::254) defensively.
+sudo iptables -C FORWARD -i ${TAP} -d 169.254.169.254 -j DROP 2>/dev/null || \
+  sudo iptables -I FORWARD 1 -i ${TAP} -d 169.254.169.254 -j DROP
+sudo iptables -C FORWARD -i ${TAP} -d 169.254.169.253 -j DROP 2>/dev/null || \
+  sudo iptables -I FORWARD 1 -i ${TAP} -d 169.254.169.253 -j DROP
+# NOTE: the IMDS DROP lives ONLY in the FORWARD chain (above). The nat table
+# is for address translation, not filtering — nft rejects `-j DROP` in
+# nat/PREROUTING ("the use of DROP is therefore inhibited"), which under
+# `set -e` aborts VM launch entirely. The FORWARD DROP already blocks all
+# guest→IMDS traffic before it can be MASQUERADEd, so a nat-table drop is
+# both illegal and redundant.
 sudo iptables -t nat -C POSTROUTING -o ${HOST_IFACE} -j MASQUERADE 2>/dev/null || \
   sudo iptables -t nat -A POSTROUTING -o ${HOST_IFACE} -j MASQUERADE
 sudo iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \

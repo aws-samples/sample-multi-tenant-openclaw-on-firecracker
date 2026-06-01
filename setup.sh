@@ -176,6 +176,15 @@ aws s3 cp "$SCRIPT_DIR/deploy/userdata/stop-vm.sh" "s3://${BUCKET}/deployment/sc
   --profile "$PROFILE" --region "$REGION" --quiet
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/clone-data.sh" "s3://${BUCKET}/deployment/scripts/clone-data.sh" \
   --profile "$PROFILE" --region "$REGION" --quiet
+# Issue #64 — migrate-vm.sh (Firecracker live migration snapshot/restore).
+# Shipped in source since v1.2.0 (#20/#45) but never uploaded → SSM hit a
+# missing file (exit 127) and live migration silently failed end-to-end.
+aws s3 cp "$SCRIPT_DIR/deploy/userdata/migrate-vm.sh" "s3://${BUCKET}/deployment/scripts/migrate-vm.sh" \
+  --profile "$PROFILE" --region "$REGION" --quiet
+# Issue #22 (same defect class as #64) — resize-disk.sh (offline ext4 grow of
+# the tenant data volume). Referenced by the resize-disk API but never uploaded.
+aws s3 cp "$SCRIPT_DIR/deploy/userdata/resize-disk.sh" "s3://${BUCKET}/deployment/scripts/resize-disk.sh" \
+  --profile "$PROFILE" --region "$REGION" --quiet
 
 # 导出 stack outputs
 echo "→ 导出部署信息..."

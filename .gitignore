@@ -77,3 +77,7 @@ svg/
 # Local screenshot working directories
 docs/v132-screenshots/
 docs/screenshots-tmp/
+
+# Local AI-assistant runtime state (oh-my-claudecode scheduled-task locks,
+# session scratch). Machine-local; never part of the deliverable.
+.claude/

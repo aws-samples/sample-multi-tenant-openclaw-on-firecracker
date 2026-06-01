@@ -51,5 +51,5 @@ STATUS=$(echo "$ITEM" | jq -r .status)
 echo "→ ${TENANT_ID} @ ${HOST_ID} (${SSH_USER}@${GUEST_IP})"
 aws ssm start-session --target "$HOST_ID" \
   --document-name AWS-StartInteractiveCommand \
-  --parameters "{\"command\":[\"SSHPASS='OpenCl@w2026' sshpass -e ssh -o StrictHostKeyChecking=no ${SSH_USER}@${GUEST_IP}\"]}" \
+  --parameters "{\"command\":[\"ssh -i /etc/openclaw/host_vm_key -o StrictHostKeyChecking=no -o IdentitiesOnly=yes ${SSH_USER}@${GUEST_IP}\"]}" \
   --profile "$PROFILE" --region "$REGION"

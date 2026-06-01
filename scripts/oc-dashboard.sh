@@ -38,7 +38,7 @@ STATUS=$(echo "$ITEM" | jq -r .status)
 # Extract gateway token from VM
 CMD_ID=$(aws ssm send-command --instance-ids "$HOST_ID" \
   --document-name AWS-RunShellScript \
-  --parameters "{\"commands\":[\"SSHPASS='OpenCl@w2026' sshpass -e ssh -o StrictHostKeyChecking=no agent@${GUEST_IP} jq -r .gateway.auth.token .openclaw/openclaw.json\"]}" \
+  --parameters "{\"commands\":[\"ssh -i /etc/openclaw/host_vm_key -o StrictHostKeyChecking=no -o IdentitiesOnly=yes agent@${GUEST_IP} jq -r .gateway.auth.token .openclaw/openclaw.json\"]}" \
   --query 'Command.CommandId' --output text --profile "$PROFILE" --region "$REGION")
 printf "⏳ Fetching gateway token"
 TOKEN=""

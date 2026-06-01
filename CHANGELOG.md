@@ -30,7 +30,17 @@ The 1.4.4 notes were honest about deferring these, but they were not cosmetic:
 
 ### Fixed
 
-- **`config.yml` had two `console_auth:` blocks**; YAML last-key-wins silently dropped `user_pool_id`, leaving the deployed pool id empty and making JWT verification impossible. Merged into one block (`enabled: true`, `user_pool_id`, `default_no_jwt_role: viewer`).
+- **`config.yml` had two `console_auth:` blocks**; YAML last-key-wins silently let the second override the first. Merged into one block. **`user_pool_id` is intentionally left UNSET**: the stack already manages the Console Cognito pool via the "new pool" branch (stable logical id + `RETAIN`), so the pool, its users, RBAC groups, and domain persist across deploys. Setting `user_pool_id` flips the stack to the "import existing pool" branch, which re-creates the `openclaw-console` domain for a pool whose domain CFN already owns — Cognito allows one domain per pool, so the deploy fails with `domain … AlreadyExists`. The api Lambda still receives the genuine pool id at deploy time via `add_environment(cognito_outputs["CognitoUserPoolId"])`, so verification works without pinning it here.
+- **`launch-vm.sh` inserted an illegal `iptables -t nat -I PREROUTING … -j DROP`** IMDS rule. The nat table does not permit filtering verbs — nft returns "the use of DROP is therefore inhibited" (rc=2), and under `set -e` this aborted *every* new VM launch on nft-backed hosts (a freshly scaled-out host could start no microVM). Removed; the FORWARD-chain DROP already blocks guest→IMDS before MASQUERADE, so isolation is unchanged. Found during live SSH-hardening verification.
+
+### Verified live
+
+Deployed to ap-northeast-1 (`cdk deploy -c region=ap-northeast-1`) and verified against the running fleet — note `deploy/app.py` defaults the region to `us-east-1` via CDK context (not `AWS_REGION`), so the `-c region=…` flag is **required**; without it CDK stages assets to a non-existent us-east-1 bucket and fails with a misleading `EPROTO`.
+
+- **api Lambda flipped x86_64 → arm64**; `COGNITO_USER_POOL_ID` now the genuine `ap-northeast-1_yvmL2GT3P` (was empty), `DEFAULT_NO_JWT_ROLE=viewer`. CFN completed with no rollback — proof the arm64 cryptography wheel imports on the Lambda runtime.
+- **RBAC, through API Gateway** (`scripts/e2e-rbac-test.sh`): no-token `POST /tenants` → **403** `{"role":"viewer","required":"operator"}`; no-token `GET /tenants` → **200**; no-token `DELETE` → **403**; an attacker-signed RS256 admin token → **403**; an `alg:none` admin token → **403**. The exact pre-1.5.0 forgery now yields viewer/403.
+- **SSH, on a scaled-out host (zero-downtime, old hosts/tenants untouched)**: `init-host.sh` generated `/etc/openclaw/host_vm_key` (600, root) and removed `sshpass`; `launch-vm.sh` logged `injected host SSH public key into VM data disk` and the VM reached `InstanceStart succeeded`. The hardened **v1.1 rootfs** image was inspected directly: `PermitRootLogin no` / `PasswordAuthentication no` / `PubkeyAuthentication yes` / `ChallengeResponseAuthentication no`, both `root` and `agent` shadow entries `LOCKED`, and a full-image `grep` for the old password returns **zero** hits.
+
 
 ### Tests
 

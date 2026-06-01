@@ -247,8 +247,12 @@ sudo iptables -C FORWARD -i ${TAP} -d 169.254.169.254 -j DROP 2>/dev/null || \
   sudo iptables -I FORWARD 1 -i ${TAP} -d 169.254.169.254 -j DROP
 sudo iptables -C FORWARD -i ${TAP} -d 169.254.169.253 -j DROP 2>/dev/null || \
   sudo iptables -I FORWARD 1 -i ${TAP} -d 169.254.169.253 -j DROP
-sudo iptables -t nat -C PREROUTING -i ${TAP} -d 169.254.169.254 -j DROP 2>/dev/null || \
-  sudo iptables -t nat -I PREROUTING 1 -i ${TAP} -d 169.254.169.254 -j DROP
+# NOTE: the IMDS DROP lives ONLY in the FORWARD chain (above). The nat table
+# is for address translation, not filtering — nft rejects `-j DROP` in
+# nat/PREROUTING ("the use of DROP is therefore inhibited"), which under
+# `set -e` aborts VM launch entirely. The FORWARD DROP already blocks all
+# guest→IMDS traffic before it can be MASQUERADEd, so a nat-table drop is
+# both illegal and redundant.
 sudo iptables -t nat -C POSTROUTING -o ${HOST_IFACE} -j MASQUERADE 2>/dev/null || \
   sudo iptables -t nat -A POSTROUTING -o ${HOST_IFACE} -j MASQUERADE
 sudo iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \

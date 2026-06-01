@@ -265,9 +265,10 @@ curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" \
 | **Encryption in transit** | CloudFront → ALB → Nginx → VM Gateway, all TLS. |
 | **API authentication** | API Gateway with `x-api-key` + optional AWS WAF (rate limit, geo block, OWASP). |
 | **Console authentication** | Cognito OAuth2 implicit flow + optional MFA. |
-| **RBAC** | Cognito Groups: `admin` / `operator` / `viewer` enforced per-route. |
+| **RBAC** | Cognito Groups: `admin` / `operator` / `viewer`. The id_token's **RS256 signature is verified** against the pool JWKS before any claim is trusted (1.5.0); a forged / `alg:none` / expired token is rejected and downgraded to `viewer`. **Fail-safe**: a request with no Bearer token defaults to `viewer` (least privilege), so writes 403 unless a genuine Cognito token is presented. |
+| **microVM SSH** | **Pubkey-only** (1.5.0). Each host self-generates an `ed25519` keypair at boot; the public key is injected per-VM at launch (one key per host). Root login and password auth are disabled in the rootfs and both accounts are locked — no shared password anywhere. |
 | **Audit log** | All `POST` / `PUT` / `DELETE` operations recorded with 90-day TTL. |
-| **Network isolation** | iptables `FORWARD DROP` between tenant subnets — cross-tenant traffic explicitly disabled. |
+| **Network isolation** | iptables `FORWARD DROP` between tenant subnets *and* to the host IMDS (`169.254.169.254`) — cross-tenant and credential-theft paths explicitly disabled. |
 
 </details>
 
@@ -279,7 +280,7 @@ curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" \
 | **One-command setup** | `./setup.sh <region> <profile>` — full CDK stack in ~5 min. |
 | **Cloud rootfs build** | `./scripts/build-rootfs-on-ec2.sh` — spins up a one-shot EC2 host + SSM, no local Linux. |
 | **Custom domain** | `./setup.sh --domain claw.example.com --cert <acm-arn>` — ACM in `us-east-1`. |
-| **Cognito + RBAC** | Optional auth; admin / operator / viewer groups gate all mutating APIs. |
+| **Cognito + RBAC** | Optional auth; signature-verified id_tokens map `admin` / `operator` / `viewer` groups, fail-safe to `viewer` with no token (1.5.0). |
 | **Manifest-based rootfs versioning** | `manifest.json` tracks rootfs versions; per-host registry. |
 | **Terraform parity** | Terraform module mirrors the CDK stack for teams already on Terraform. |
 
@@ -728,7 +729,38 @@ source .env.deploy && ./build-rootfs.sh <new_version>
 # New tenants use the new rootfs immediately; existing tenants need a `reset` API call to switch over.
 ```
 
-### Latest: v1.4.2 → **v1.4.3** (test stability — no production impact)
+### Latest: v1.4.5 → **v1.5.0** (security hardening — ⚠️ breaking auth change)
+
+v1.5.0 fixes two **real, exploitable** vulnerabilities that 1.4.4 had recorded as known limitations:
+
+- **RBAC was fail-open and the JWT was never signature-verified.** A request with no Bearer token resolved to `admin`, and a present token was base64-decoded *without* verifying its signature — so a forged `{"cognito:groups":["admin"]}` (even `alg:none`) granted admin. Now the id_token's **RS256 signature is verified** against the pool JWKS; anything that fails (forged / `alg:none` / expired / wrong issuer-or-audience) is downgraded to `viewer`, and **no token fails safe to `viewer`** (`DEFAULT_NO_JWT_ROLE`, configurable).
+- **Every microVM shipped the same hardcoded SSH password with root login enabled.** Now SSH is **pubkey-only**: each host self-generates an `ed25519` key at boot, the public key is injected per-VM at launch (one key per host), root + password login are disabled, both accounts are locked, and the shared password is gone from the entire repo.
+
+> ⚠️ **Breaking — read before upgrading.** Automation that mutates state (any non-GET) must now present a valid Cognito **id_token** as `Authorization: Bearer …`. `x-api-key`-only callers can still **read** (GETs return 200) but **writes return 403**. For a trusted, network-isolated automation deployment you may set `DEFAULT_NO_JWT_ROLE=admin`, but the secure default is `viewer`. microVM SSH is pubkey-only after a rootfs rebuild + host roll; existing VMs keep the old password until their host is rolled.
+
+```bash
+git pull
+# 1. control plane — REQUIRES Docker (builds the cryptography wheel) and the
+#    region context flag (deploy/app.py defaults to us-east-1 via context):
+AWS_PROFILE=<profile> uv run cdk deploy -c region=<region> --require-approval never
+#    → api Lambda flips to ARM_64, gets PyJWT+cryptography bundled, and is
+#      injected with the real Cognito pool id + DEFAULT_NO_JWT_ROLE=viewer.
+# 2. data plane — rebuild the hardened rootfs, then roll hosts to retire the
+#    old shared-password image:
+source .env.deploy && ./scripts/build-rootfs-on-ec2.sh v1.1 <arch>
+```
+
+Verified live: `scripts/e2e-rbac-test.sh` proves no-token write → 403, forged / `alg:none` admin token → 403, read → 200 through API Gateway; the v1.1 rootfs was inspected to confirm `PermitRootLogin no` / `PasswordAuthentication no`, both accounts locked, and zero password residue. **583 offline tests pass** (26 RBAC signature/forgery cases included).
+
+### v1.4.3 → v1.4.5 (async live migration)
+
+v1.4.4 shipped the data-plane fix for live migration (the snapshot now ships the disk backing files) plus IMDS isolation and a collapsed Lambda invoke policy. v1.4.5 then made `POST /tenants/{id}/migrate` **asynchronous** — it returns **202** immediately and the health_check sweep finishes the snapshot → restore → ALB repoint → dashboard-verify → host_id flip out-of-band, because a multi-GB snapshot+restore far exceeds API Gateway's 29 s integration cap. Clients poll `GET /tenants/{id}` until `running` (success) or `migration_failed` (rollback). Verified live both directions (1a↔1c). See **[CHANGELOG.md](CHANGELOG.md)** for the full notes.
+
+```bash
+git pull && AWS_PROFILE=<profile> uv run cdk deploy -c region=<region> --require-approval never
+```
+
+### v1.4.2 → v1.4.3 (test stability — no production impact)
 
 v1.4.3 is a **test-only release**. It makes `tests/test_e2e.py` retry-aware so transient `urllib.error.URLError: [SSL: UNEXPECTED_EOF_WHILE_READING]` from ALB / API Gateway TLS keep-alive resets no longer masquerade as test failures. Also bumps `_wait_for_status` from 180 s → 360 s so cold-pool restore-from-backup operations have realistic time to complete.
 

@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.5.2] — 2026-06-01
+
+Console RBAC wiring fix. 1.5.0 gated API writes by Cognito `cognito:groups`, but the Console never sent the token and CORS never allowed the header, so every Console write 403'd as `viewer`. #66 and #67 must land together: sending the Bearer header triggers the preflight that allowing the header must permit.
+
+### Fixed
+
+- **Console sends `Authorization: Bearer <id_token>` (#66)** so RBAC sees the real role instead of downgrading to `viewer`.
+- **CORS allow-list permits `Authorization` (#67)** in both the API Gateway preflight (`stack.py`) and Lambda responses (`_resp`); the browser preflight previously blocked all authed requests (curl was unaffected — no preflight).
+- **Monitoring tab no longer throws when metrics is disabled (#68)** — `systemInfo?.metrics?.…` optional chaining.
+
+### Changed
+
+- **Console favicon** — inline SVG (cyan microVM-grid on dark), removes the `/favicon.ico` 404.
+
 ## [1.5.1] — 2026-06-01
 
 Deploy portability fix. 1.5.0 flipped the `openclaw-api` Lambda to ARM_64 (Graviton) and pinned the CDK bundling image to `platform="linux/arm64"` so the bundled `cryptography` native wheel would deterministically match the runtime arch. That pin had an unintended consequence: it forced an **arm64 build container**, so `cdk synth`/`cdk deploy` from an **x86_64 deploy host** required QEMU/binfmt emulation — without it, bundling failed and the deploy looked like it demanded an arm64 machine. A teammate hit exactly this deploying from x86_64.

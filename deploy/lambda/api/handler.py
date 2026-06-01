@@ -2278,7 +2278,7 @@ def _resp(code, body):
         "headers": {
             "Content-Type": "application/json",
             "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Headers": "Content-Type,x-api-key",
+            "Access-Control-Allow-Headers": "Content-Type,x-api-key,Authorization",
         },
         "body": json.dumps(body, default=str),
     }

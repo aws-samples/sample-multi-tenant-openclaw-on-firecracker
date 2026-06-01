@@ -274,7 +274,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
             default_cors_preflight_options=apigw.CorsOptions(
                 allow_origins=apigw.Cors.ALL_ORIGINS,
                 allow_methods=apigw.Cors.ALL_METHODS,
-                allow_headers=["Content-Type", "x-api-key"],
+                allow_headers=["Content-Type", "x-api-key", "Authorization"],
             ),
         )
 

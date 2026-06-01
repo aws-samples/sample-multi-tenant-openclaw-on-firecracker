@@ -1,6 +1,6 @@
 [project]
 name = "sample-multi-tenant-openclaw-on-firecracker"
-version = "1.5.2"
+version = "1.5.3"
 requires-python = ">=3.12"
 dependencies = [
     "aws-cdk-lib>=2.251.0",

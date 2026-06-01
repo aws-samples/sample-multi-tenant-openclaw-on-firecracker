@@ -1,6 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
+import platform as _platform
 import yaml
 import aws_cdk as cdk
 from aws_cdk import (
@@ -31,6 +32,15 @@ from constructs import Construct
 from pathlib import Path
 
 CFG = yaml.safe_load((Path(__file__).parent.parent / "config.yml").read_text())
+
+
+def _sam_build_image_for_host():
+    """SAM build image tag for the deploy host's arch (avoids QEMU). pip still
+    cross-downloads the aarch64 wheel to match the ARM_64 Lambda."""
+    machine = _platform.machine().lower()
+    if machine in ("arm64", "aarch64"):
+        return "public.ecr.aws/sam/build-python3.12:latest-arm64"
+    return "public.ecr.aws/sam/build-python3.12:latest-x86_64"
 
 
 def _read_pyproject_version():
@@ -168,24 +178,16 @@ class OpenClawOrchestratorStack(cdk.Stack):
         api_fn = _lambda.Function(self, "ApiHandler",
             function_name="openclaw-api",
             runtime=_lambda.Runtime.PYTHON_3_12,
-            # 1.5.0: ARM_64 (Graviton) — cheaper/faster. The api Lambda bundles
-            # PyJWT + cryptography for Cognito JWT RS256 signature verification.
+            # 1.5.0: ARM_64 (Graviton) — cheaper/faster. Bundles PyJWT + cryptography
+            # for Cognito JWT RS256 verification (cryptography has a native ext).
             architecture=_lambda.Architecture.ARM_64,
             handler="handler.lambda_handler",
-            # 1.5.0: bundle PyJWT + cryptography. cryptography ships a native
-            # extension, so we need the aarch64 manylinux wheel to match the
-            # ARM_64 Lambda runtime. CRITICAL: we do NOT pin the bundling image
-            # platform to linux/arm64 — that forced an arm64 *container* and
-            # broke deploys from x86_64 machines without QEMU/binfmt ("the
-            # deploy host must be arm"). Instead the container runs on the host's
-            # NATIVE arch and pip cross-downloads the prebuilt aarch64 wheel via
-            # --platform/--only-binary (no compilation, no emulation). cryptography
-            # publishes an abi3 manylinux2014_aarch64 wheel and PyJWT is pure
-            # python (none-any), so this resolves on any build host.
             code=_lambda.Code.from_asset(
                 "deploy/lambda/api",
                 bundling=BundlingOptions(
-                    image=_lambda.Runtime.PYTHON_3_12.bundling_image,
+                    # Image arch = build host (not Lambda) to avoid arm64-on-x86
+                    # exec format error; pip cross-downloads the aarch64 wheel.
+                    image=cdk.DockerImage.from_registry(_sam_build_image_for_host()),
                     command=[
                         "bash", "-c",
                         "pip install --no-cache-dir "
@@ -230,6 +232,10 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 "MULTI_AZ_ENABLED": str(CFG.get("multi_az", {}).get("enabled", False)).lower(),
                 "MULTI_AZ_COUNT": str(CFG.get("multi_az", {}).get("az_count", 1)),
                 "WAF_ENABLED": str(CFG.get("waf", {}).get("enabled", False)).lower(),
+                # Balloon blocks Firecracker snapshot, so live migrate is
+                # unavailable when it's on (issue #72). API uses this to reject
+                # migrate fast instead of failing deep in the snapshot step.
+                "BALLOON_ENABLED": str(CFG.get("balloon", {}).get("enabled", False)).lower(),
                 # COGNITO_USER_POOL_ID / COGNITO_CLIENT_ID are injected AFTER the
                 # Cognito section computes the real, stack-owned pool/client ids
                 # (see add_environment below). The config.yml value is unreliable

@@ -48,6 +48,10 @@ QUOTAS_MAX_VCPU = int(os.environ.get("QUOTAS_MAX_VCPU", "0") or "0")
 QUOTAS_MAX_MEM_MB = int(os.environ.get("QUOTAS_MAX_MEM_MB", "0") or "0")
 QUOTAS_MAX_DATA_DISK_MB = int(os.environ.get("QUOTAS_MAX_DATA_DISK_MB", "0") or "0")
 
+# Firecracker can't snapshot a VM with an active balloon device, so live
+# migrate is unavailable while balloon is on (issue #72). Reject early.
+BALLOON_ENABLED = os.environ.get("BALLOON_ENABLED", "false").lower() == "true"
+
 # ── 1.5.0 security hardening: Cognito JWT signature verification ──
 # COGNITO_USER_POOL_ID is injected by CDK from the genuine, stack-owned pool
 # (deploy/stack.py add_environment). Empty when console_auth is disabled — in
@@ -942,6 +946,13 @@ def tenant_action(tenant_id, action, body=None):
     if action == "migrate":
         # Live migration via Firecracker snapshot/restore (issue #20).
         # Body shape: {"target_host_id": "i-...."}
+        # Firecracker can't snapshot a VM with an active balloon device, live migrate is unavailable while balloon is on (issue #72). 
+        # Reject up front instead of failing ~minutes later in the snapshot step.
+        if BALLOON_ENABLED:
+            return _resp(409, {
+                "error": "Live migration isn't available while memory overcommit (balloon) is on. To move this tenant, back it up, recreate it on the target host, then restore the backup — no data is lost.",
+                "reason": "balloon_enabled"
+            })
         try:
             payload = json.loads(body) if isinstance(body, str) else (body or {})
         except Exception:

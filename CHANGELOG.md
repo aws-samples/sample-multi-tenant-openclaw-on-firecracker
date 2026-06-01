@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.5.3] — 2026-06-01
+
+Reliability fixes surfaced while exercising the live deployment: a VM stuck-`creating` dead zone and an x86 bundling failure. Plus a clearer up-front message when migrate isn't usable.
+
+### Fixed
+
+- **host-agent: VM stuck `creating` when Firecracker is alive but the guest network is dead (#69).** A partial launch could leave FC running with its TAP `DOWN`; the old recovery only fired when FC was *absent*, so nothing repaired it and the tenant sat in `creating` indefinitely. host-agent now counts consecutive "FC alive but guest unreachable" polls and force-relaunches (stop-vm + launch-vm to rebuild the network) past a threshold, resetting on any reachable poll.
+- **deploy: api Lambda bundling still pulled the arm64 image on x86 hosts (#70).** 1.5.1 dropped the `platform` pin but left `Runtime.PYTHON_3_12.bundling_image`, which resolves to the Lambda's arch (arm64) and fails on x86 without QEMU (`exec format error`) — breaking `cdk synth` and the test suite. The bundling image now tracks the build host's arch; pip still cross-downloads the aarch64 wheel for the ARM_64 runtime.
+
+### Changed
+
+- **api: migrate rejects balloon-enabled tenants up front with a clear message.** Live migration is incompatible with the balloon device (#72, still open). Instead of failing minutes later inside the snapshot step, the API now returns `409` immediately explaining to back up + recreate. This is only a guard rail — the underlying balloon migration support is tracked in #72.
+
+### Added
+
+- **`tests/test_dead_zone_recovery.py`** — covers the #69 counter/threshold logic and force-relaunch ordering (stop before launch).
+
 ## [1.5.2] — 2026-06-01
 
 Console RBAC wiring fix. 1.5.0 gated API writes by Cognito `cognito:groups`, but the Console never sent the token and CORS never allowed the header, so every Console write 403'd as `viewer`. #66 and #67 must land together: sending the Bearer header triggers the preflight that allowing the header must permit.

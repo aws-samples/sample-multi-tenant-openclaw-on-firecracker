@@ -120,6 +120,27 @@ def _get_ddb():
 
 _recovering = set()  # Track VMs being recovered to avoid duplicate launches
 
+# Dead-zone guard: FC alive but guest unreachable (e.g. TAP DOWN after a partial
+# launch) is invisible to _recover_vm, which only fires when FC is absent. After
+# this many consecutive unreachable polls, force a stop+relaunch.
+_net_dead_polls = {}  # tenant_id -> consecutive polls: fc alive, guest unreachable
+_NET_DEAD_THRESHOLD = 3
+
+
+def _register_net_poll(tenant_id, guest_reachable):
+    """Track consecutive 'FC alive but guest unreachable' polls. Returns True
+    when the count crosses _NET_DEAD_THRESHOLD (caller should force-relaunch).
+    A reachable poll resets the counter. Pure/testable — no I/O."""
+    if guest_reachable:
+        _net_dead_polls.pop(tenant_id, None)
+        return False
+    n = _net_dead_polls.get(tenant_id, 0) + 1
+    _net_dead_polls[tenant_id] = n
+    if n >= _NET_DEAD_THRESHOLD:
+        _net_dead_polls.pop(tenant_id, None)
+        return True
+    return False
+
 
 def _recover_vm(tenant_id, cfg):
     """Launch VM that has vm.json but no running Firecracker process."""
@@ -137,6 +158,31 @@ def _recover_vm(tenant_id, cfg):
         )
     except Exception as e:
         print(f"recover {tenant_id} failed: {e}")
+        _recovering.discard(tenant_id)
+
+
+def _force_relaunch_vm(tenant_id, cfg):
+    """stop-vm + launch-vm to rebuild a VM whose FC is alive but guest network
+    is dead. Unlike _recover_vm, handles the FC-alive case."""
+    if tenant_id in _recovering:
+        return
+    _recovering.add(tenant_id)
+    vm_num = cfg.get("vm_num", 1)
+    vcpu = cfg.get("vcpu", 2)
+    mem_mb = cfg.get("mem_mb", 4096)
+    print(f"force-relaunch {tenant_id} (vm{vm_num}): FC alive but guest unreachable "
+          f"for {_NET_DEAD_THRESHOLD} polls — rebuilding network")
+    try:
+        subprocess.run(
+            ["bash", "/home/ubuntu/stop-vm.sh", str(tenant_id), str(vm_num)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
+        )
+        subprocess.Popen(
+            ["bash", "/home/ubuntu/launch-vm.sh", str(tenant_id), str(vm_num), str(vcpu), str(mem_mb)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        print(f"force-relaunch {tenant_id} failed: {e}")
         _recovering.discard(tenant_id)
 
 
@@ -204,6 +250,7 @@ def _probe_all():
             pass
 
         if vm_health == "up":
+            _register_net_poll(tenant_id, guest_reachable=True)
             try:
                 r = subprocess.run(
                     ["curl", "-sf", "-o", "/dev/null", "--connect-timeout", "3",
@@ -213,6 +260,12 @@ def _probe_all():
                     app_health = "up"
             except Exception:
                 pass
+        elif _register_net_poll(tenant_id, guest_reachable=False):
+            # FC alive but guest unreachable past the threshold — rebuild network.
+            _force_relaunch_vm(tenant_id, cfg)
+            results[tenant_id] = {"vm_health": "recovering", "app_health": "down",
+                                  "guest_ip": guest_ip}
+            continue
 
         results[tenant_id] = {"vm_health": vm_health, "app_health": app_health,
                               "guest_ip": guest_ip, "fc_pid": fc_pid}

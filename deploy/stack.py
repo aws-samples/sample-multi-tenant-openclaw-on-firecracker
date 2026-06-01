@@ -168,29 +168,31 @@ class OpenClawOrchestratorStack(cdk.Stack):
         api_fn = _lambda.Function(self, "ApiHandler",
             function_name="openclaw-api",
             runtime=_lambda.Runtime.PYTHON_3_12,
-            # 1.5.0: ARM_64 (Graviton) — cheaper/faster, and it makes the
-            # bundled cryptography native wheel deterministic: we pin the
-            # bundling image platform to linux/arm64 below so the manylinux
-            # aarch64 wheel always matches the Lambda runtime arch, regardless
-            # of the dev machine. (A default x86_64 Lambda with an aarch64
-            # wheel would crash at import with "invalid ELF header".)
+            # 1.5.0: ARM_64 (Graviton) — cheaper/faster. The api Lambda bundles
+            # PyJWT + cryptography for Cognito JWT RS256 signature verification.
             architecture=_lambda.Architecture.ARM_64,
             handler="handler.lambda_handler",
-            # 1.5.0: bundle PyJWT + cryptography for Cognito JWT signature
-            # verification. cryptography ships a native extension, so it must
-            # be pip-installed inside the Lambda Linux image (manylinux wheel),
-            # not copied from the dev machine. The handler source is copied on
-            # top of the installed deps. Requires Docker at synth/deploy time.
+            # 1.5.0: bundle PyJWT + cryptography. cryptography ships a native
+            # extension, so we need the aarch64 manylinux wheel to match the
+            # ARM_64 Lambda runtime. CRITICAL: we do NOT pin the bundling image
+            # platform to linux/arm64 — that forced an arm64 *container* and
+            # broke deploys from x86_64 machines without QEMU/binfmt ("the
+            # deploy host must be arm"). Instead the container runs on the host's
+            # NATIVE arch and pip cross-downloads the prebuilt aarch64 wheel via
+            # --platform/--only-binary (no compilation, no emulation). cryptography
+            # publishes an abi3 manylinux2014_aarch64 wheel and PyJWT is pure
+            # python (none-any), so this resolves on any build host.
             code=_lambda.Code.from_asset(
                 "deploy/lambda/api",
                 bundling=BundlingOptions(
                     image=_lambda.Runtime.PYTHON_3_12.bundling_image,
-                    # Pin the build platform to the Lambda arch so pip fetches
-                    # the matching manylinux wheel (aarch64) deterministically.
-                    platform="linux/arm64",
                     command=[
                         "bash", "-c",
-                        "pip install --no-cache-dir -r requirements.txt -t /asset-output "
+                        "pip install --no-cache-dir "
+                        "--platform manylinux2014_aarch64 "
+                        "--implementation cp --python-version 3.12 "
+                        "--only-binary=:all: --upgrade "
+                        "-r requirements.txt -t /asset-output "
                         "&& cp -au . /asset-output",
                     ],
                 ),

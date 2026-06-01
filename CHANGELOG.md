@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.5.1] — 2026-06-01
+
+Deploy portability fix. 1.5.0 flipped the `openclaw-api` Lambda to ARM_64 (Graviton) and pinned the CDK bundling image to `platform="linux/arm64"` so the bundled `cryptography` native wheel would deterministically match the runtime arch. That pin had an unintended consequence: it forced an **arm64 build container**, so `cdk synth`/`cdk deploy` from an **x86_64 deploy host** required QEMU/binfmt emulation — without it, bundling failed and the deploy looked like it demanded an arm64 machine. A teammate hit exactly this deploying from x86_64.
+
+### Fixed
+
+- **`openclaw-api` Lambda bundling no longer requires the build host to match the Lambda arch.** Removed `platform="linux/arm64"` from the `BundlingOptions`. The bundling container now runs on the **host's native architecture**, and `pip` **cross-downloads** the prebuilt aarch64 wheel instead of compiling/emulating:
+  ```
+  pip install --no-cache-dir --platform manylinux2014_aarch64 \
+    --implementation cp --python-version 3.12 --only-binary=:all: \
+    --upgrade -r requirements.txt -t /asset-output
+  ```
+  `cryptography` publishes an `abi3` `manylinux2014_aarch64` wheel and `PyJWT` is pure-python (`none-any`), so this resolves on **any** build host (x86_64 or arm64) with no QEMU. The Lambda stays `ARM_64` (Graviton) — only the build path changed. This is the **5th** "only-real-deployment-surfaces-it" bug in the 1.5.x line (after region-context, Cognito domain `AlreadyExists`, and the nat-table illegal `DROP`).
+
+### Verified
+
+- **x86_64 build host simulated** (`docker run --platform linux/amd64`): the cross-download installs `cryptography 48.0.0` + `PyJWT 2.13.0`, and the resulting `cryptography/hazmat/bindings/_rust.abi3.so` + `_cffi_backend*.so` are ELF `e_machine=0xB7` (**AArch64**) — i.e. an x86 host produces genuine arm64 binaries for the Graviton runtime.
+- **Real `cdk synth -c region=ap-northeast-1`** completes (`Successfully installed PyJWT-2.13.0 … cryptography-48.0.0`, exit 0); every `_rust.abi3.so` in the synthesized `cdk.out` assets is AArch64.
+- **Live `openclaw-api` (the 2026-05-31 1.5.0 deploy) is healthy and arm64**: `Architectures=[arm64]`, `State=Active`, real pool `ap-northeast-1_yvmL2GT3P`, `DEFAULT_NO_JWT_ROLE=viewer`. `scripts/e2e-rbac-test.sh` passes 5/5 through API Gateway (no-token write → 403, read → 200, forged-RS256 → 403, alg:none → 403) — proving `cryptography` imports and runs RS256 verification on the arm64 runtime (a failed import would 5xx, not return a precise 403).
+
+### Operator notes
+
+- **No code/behavior change to the running Lambda** — this only fixes the *build path*. The live function from the 1.5.0 deploy is already correct (arm64, verified). Redeploy is only needed to (a) deploy from an x86_64 host that previously failed, or (b) pick up future changes; `cdk deploy -c region=<region>` now works from any host with Docker, no QEMU required.
+
 ## [1.5.0] — 2026-05-31
 
 Security hardening. Two real, exploitable vulnerabilities recorded as "Known limitations" in 1.4.4 are now fixed at the root: the API's JWT was never signature-verified and failed **open** to `admin`, and every microVM shipped the **same hardcoded SSH password** with root login enabled. Both are closed. This release changes auth semantics — read **Breaking** before deploying.

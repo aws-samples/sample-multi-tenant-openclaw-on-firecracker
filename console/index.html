@@ -132,7 +132,7 @@
                     <div class="bar-physical-mark" :style="'left:'+(100/(h.cpu_overcommit_ratio||1))+'%'"></div>
                   </template>
                 </div>
-                <span class="host-val" x-text="h.used_vcpu+'/'+h.total_vcpu"></span>
+                <span class="host-val" x-text="(h.total_vcpu == null) ? '—' : (h.used_vcpu||0)+'/'+h.total_vcpu"></span>
               </div>
               <div class="host-row">
                 <span class="host-label">Mem<span class="overcommit-badge" x-show="(h.mem_overcommit_ratio||1) > 1" x-text="' (×'+(h.mem_overcommit_ratio||1)+')'"></span></span>
@@ -142,7 +142,7 @@
                     <div class="bar-physical-mark" :style="'left:'+(100/(h.mem_overcommit_ratio||1))+'%'"></div>
                   </template>
                 </div>
-                <span class="host-val" x-text="(h.used_mem_mb/1024).toFixed(1)+'/'+(h.total_mem_mb/1024).toFixed(1)"></span>
+                <span class="host-val" x-text="(h.total_mem_mb == null) ? '—' : ((h.used_mem_mb||0)/1024).toFixed(1)+'/'+(h.total_mem_mb/1024).toFixed(1)"></span>
               </div>
               <div class="host-row">
                 <span class="host-label">VM(s)</span>
@@ -179,10 +179,10 @@
       <div class="panel-header">
         <span class="panel-title">Tenants <template x-if="selectedHost"><span style="font-size:12px;color:var(--cyan-dim)">— <span x-text="selectedHost"></span> <button class="btn-icon" @click="selectedHost=null" style="font-size:12px"><svg class="icon s12"><use href="#i-delete"/></svg></button></span></template></span>
         <div style="display:flex;gap:8px;align-items:center">
-          <button class="btn btn-cyan btn-sm" @click="restoreSource=null; showModal=true">+ New</button>
           <button class="btn btn-outline btn-sm" @click="refresh()" :disabled="loadingHosts||loadingTenants">
             Refresh <span :class="(loadingHosts||loadingTenants) && 'spin'"><svg class="icon s13"><use href="#i-refresh"/></svg></span>
           </button>
+          <button class="btn btn-cyan btn-sm" @click="restoreSource=null; showModal=true">+ New</button>
         </div>
       </div>
       <div class="panel-header">
@@ -206,12 +206,12 @@
           <thead>
             <tr>
               <th>ID</th><th>Name</th><th>Status</th><th>Tags</th><th>vCPU</th><th>Memory</th><th>Disk</th><th>Guest IP</th>
-              <th>Port</th><th>AZ</th><th>Rootfs</th><th>VM Health</th><th>Gateway</th><th>Actions</th>
+              <th>Port</th><th>Rootfs</th><th>VM Health</th><th>Gateway</th><th>Actions</th>
             </tr>
           </thead>
           <tbody>
             <template x-if="filteredTenants.length === 0 && !loadingTenants">
-              <tr><td colspan="14" class="empty">No tenants</td></tr>
+              <tr><td colspan="13" class="empty">No tenants</td></tr>
             </template>
             <template x-for="t in filteredTenants" :key="t.id">
               <tr>
@@ -246,7 +246,6 @@
                 </td>
                 <td x-text="t.guest_ip || '-'"></td>
                 <td x-text="t.host_port || '-'"></td>
-                <td style="font-size:11px;color:var(--gray)" x-text="hostAz(t.host_id) || '-'"></td>
                 <td style="font-size:11px;color:var(--gray)" x-text="t.rootfs_version||'-'"></td>
                 <td><span class="health-dot" :class="healthClass(t.vm_health, t.status)"></span></td>
                 <td><span class="health-dot" :class="healthClass(t.app_health, t.status)"></span></td>

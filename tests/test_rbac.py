@@ -310,11 +310,15 @@ def _role_event(method, path, role):
 
 @pytest.mark.unit
 class TestEndpointEnforcement:
+    """Role-gating behavior when RBAC is ENABLED (RBAC_ENABLED defaults off, so
+    these tests force it on — they verify the enforcement wiring itself)."""
+
     def _run(self, method, path, role, **ev_extra):
         ev = _event(method, path, token="dummy")
         ev.update(ev_extra)
         claims = {"cognito:groups": [role]} if role else {}
-        with patch.object(handler, "_verify_and_decode", return_value=claims):
+        with patch.object(handler, "RBAC_ENABLED", True), \
+             patch.object(handler, "_verify_and_decode", return_value=claims):
             return handler.lambda_handler(ev, None)
 
     def test_viewer_can_list_tenants(self):
@@ -353,9 +357,36 @@ class TestEndpointEnforcement:
         forged = _sign(_claims(["admin"]), key=_ATTACKER_KEY)
         ev = _event("POST", "/tenants", token=forged)
         ev["body"] = json.dumps({"name": "demo"})
-        with _install_real_jwks():
+        with patch.object(handler, "RBAC_ENABLED", True), _install_real_jwks():
             r = handler.lambda_handler(ev, None)
         assert r["statusCode"] == 403
+
+
+@pytest.mark.unit
+class TestRbacDisabled:
+    """RBAC_ENABLED is its own switch, default OFF: a write must NOT be 403'd
+    just because the caller is a viewer / has no token. Cognito login
+    (console_auth) and role-gating are independent."""
+
+    def test_no_token_write_allowed_when_rbac_off(self):
+        ev = _event("POST", "/tenants", token=None)
+        ev["body"] = json.dumps({"name": "demo"})
+        with patch.object(handler, "RBAC_ENABLED", False), \
+             patch.object(handler, "create_tenant",
+                          return_value=handler._resp(201, {"id": "t1"})):
+            r = handler.lambda_handler(ev, None)
+        assert r["statusCode"] == 201, "RBAC off must not 403 a token-less write"
+
+    def test_viewer_write_allowed_when_rbac_off(self):
+        ev = _event("POST", "/tenants", token="dummy")
+        ev["body"] = json.dumps({"name": "demo"})
+        with patch.object(handler, "RBAC_ENABLED", False), \
+             patch.object(handler, "_verify_and_decode",
+                          return_value={"cognito:groups": ["viewer"]}), \
+             patch.object(handler, "create_tenant",
+                          return_value=handler._resp(201, {"id": "t1"})):
+            r = handler.lambda_handler(ev, None)
+        assert r["statusCode"] == 201, "RBAC off must not gate by role"
 
 
 # ═══════════════════════════════════════════

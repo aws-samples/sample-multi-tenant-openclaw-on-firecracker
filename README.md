@@ -265,7 +265,7 @@ curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" \
 | **Encryption in transit** | CloudFront → ALB → Nginx → VM Gateway, all TLS. |
 | **API authentication** | API Gateway with `x-api-key` + optional AWS WAF (rate limit, geo block, OWASP). |
 | **Console authentication** | Cognito OAuth2 implicit flow + optional MFA. |
-| **RBAC** | Cognito Groups: `admin` / `operator` / `viewer`. The id_token's **RS256 signature is verified** against the pool JWKS before any claim is trusted (1.5.0); a forged / `alg:none` / expired token is rejected and downgraded to `viewer`. **Fail-safe**: a request with no Bearer token defaults to `viewer` (least privilege), so writes 403 unless a genuine Cognito token is presented. |
+| **RBAC** | Cognito Groups: `admin` / `operator` / `viewer`. Opt-in via `console_auth.rbac_enabled` (default off, independent of login — 1.5.4). When enabled, the id_token's **RS256 signature is verified** against the pool JWKS before any claim is trusted (1.5.0); a forged / `alg:none` / expired token is downgraded to `viewer`, and a request with no Bearer token fail-safes to `viewer` so writes 403 unless a genuine Cognito token is presented. |
 | **microVM SSH** | **Pubkey-only** (1.5.0). Each host self-generates an `ed25519` keypair at boot; the public key is injected per-VM at launch (one key per host). Root login and password auth are disabled in the rootfs and both accounts are locked — no shared password anywhere. |
 | **Audit log** | All `POST` / `PUT` / `DELETE` operations recorded with 90-day TTL. |
 | **Network isolation** | iptables `FORWARD DROP` between tenant subnets *and* to the host IMDS (`169.254.169.254`) — cross-tenant and credential-theft paths explicitly disabled. |
@@ -436,6 +436,7 @@ sample-multi-tenant-openclaw-on-firecracker/
 | `metrics` | `enabled` | `false` | Provision AMP + Grafana + ADOT. |
 | `agentcore` | `enabled` | `false` | Provision Gateway + Memory + CodeInterpreter + Browser + Identity. |
 | `console_auth` | `enabled` | `false` | Cognito authentication for Console. |
+| `console_auth` | `rbac_enabled` | `false` | Enforce viewer/operator/admin role checks on writes (independent of login). |
 | `backup_cron` | — | `cron(0 19 * * ? *)` | UTC 19:00 daily backups. |
 
 > See [`config.yml.example`](config.yml.example) for the complete reference.

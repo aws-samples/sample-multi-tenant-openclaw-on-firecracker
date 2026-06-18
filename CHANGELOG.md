@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.5.4] — 2026-06-18
+
+Host init reliability — newly-launched hosts were getting stuck `MidLifecycleAction` and ABANDONed. Root-caused to upstream drift and a boot-time reboot race; verified end-to-end on a fresh host (init → InService → DDB-registered → carries a tenant).
+
+### Fixed
+
+- **init-host: pin Firecracker version, don't track `latest` (#74).** `latest` bumped to v1.16.0, whose CI guest-kernel assets (`firecracker-ci/v1.16/.../vmlinux`) don't exist yet, so step3b 404'd under `set -e` and bricked every new host. Pinned to `v1.15.1` (overridable via `FC_VERSION`); the binary and the derived guest-kernel URL both resolve again.
+- **init-host: stop the boot-time auto-upgrade reboot race (#74).** A stale AMI installs a kernel update at boot and can reboot mid-init, orphaning the lifecycle hook. init now `systemctl stop`s `unattended-upgrades` + `apt-daily-upgrade` for the duration (timers still fire later — daily updates keep working).
+- **init-host: never hang the lifecycle hook (#73).** An EXIT trap always settles the ASG hook — `CONTINUE` on success, `ABANDON` on any failure — so a broken init is replaced promptly instead of waiting out the 600s timeout. DDB self-register now retries (concurrent launches throttle writes) and `exit 1`s if it never succeeds, so an unregistered host ABANDONs rather than coming up invisible to the scheduler.
+- **init-host: mirror init output to the serial console (#73).** `aws ec2 get-console-output` now shows the full `[oc:init]` progress without SSH/SSM — essential when a host fails before SSM is up or gets terminated.
+
+### Changed
+
+- **RBAC role-gating is now its own switch, default off.** `console_auth.rbac_enabled` (env `RBAC_ENABLED`) is independent of Cognito login: a deployment can require login for the console without forcing every write to carry an id_token. Set it `true` to enforce viewer/operator/admin per-route checks.
+- **init-host trimmed under the 16 KB user-data limit.** Verbose comments + the three clone/migrate/resize downloads (collapsed into one loop) brought the rendered user-data back under EC2's hard cap (it had overflowed at 16693 bytes).
+- **Console:** Tenants table drops the redundant AZ column (already shown per-host); Refresh/+ New buttons reordered; host CPU/Mem cards render `—` instead of `undefined`/`NaN` when a host record is incomplete.
+
 ## [1.5.3] — 2026-06-01
 
 Reliability fixes surfaced while exercising the live deployment: a VM stuck-`creating` dead zone and an x86 bundling failure. Plus a clearer up-front message when migrate isn't usable.

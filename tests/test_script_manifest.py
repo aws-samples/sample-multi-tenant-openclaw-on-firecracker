@@ -84,6 +84,12 @@ def _rendered_init_host_text():
     for line in stack_text.splitlines():
         if "deployment/scripts/" in line and "/home/ubuntu/" in line:
             init_text += "\n" + line
+    # init-host downloads clone/migrate/resize via a `for _s in a b c; do ...
+    # ${_s}.sh` loop. Expand the loop names so the per-script literal check
+    # (deployment/scripts/<name>.sh) still recognises them.
+    for m in re.finditer(r"for\s+_s\s+in\s+([^\n;]+?)\s*;?\s*do", init_text):
+        for nm in m.group(1).split():
+            init_text += f"\ndeployment/scripts/{nm}.sh"
     return init_text
 
 

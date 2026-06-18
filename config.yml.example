@@ -102,6 +102,7 @@ agentcore:
 console_auth:
   enabled: false                   # 开启后 Console 需要 Cognito 登录
   self_sign_up: false              # 允许用户自注册
+  rbac_enabled: false              # 角色鉴权(viewer/operator/admin)开关, 独立于登录; true=按角色限制写操作
   # user_pool_id: ""              # 复用已有 User Pool（留空自动创建）
 
 # ========== CloudFront 自定义域名 (可选) ==========

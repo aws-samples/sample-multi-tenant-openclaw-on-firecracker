@@ -265,7 +265,7 @@ curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" \
 | **传输加密** | CloudFront → ALB → Nginx → VM Gateway 全链路 TLS。 |
 | **API 鉴权** | API Gateway 带 `x-api-key` + 可选 AWS WAF（rate limit / geo block / OWASP）。 |
 | **Console 鉴权** | Cognito OAuth2 implicit flow + 可选 MFA。 |
-| **RBAC** | Cognito Groups: `admin` / `operator` / `viewer` 每路由强制。 |
+| **RBAC** | Cognito Groups: `admin` / `operator` / `viewer`。通过 `console_auth.rbac_enabled` 开启（默认关，独立于登录 — 1.5.4）；开启后 id_token 的 RS256 签名经 JWKS 校验，伪造/`alg:none`/过期 token 降级为 `viewer`，无 token 则 fail-safe 到 `viewer`、写操作 403。 |
 | **Audit log** | 所有 `POST` / `PUT` / `DELETE` 操作记录，90 天 TTL。 |
 | **网络隔离** | iptables `FORWARD DROP` 跨 tenant 子网 — 跨租户通信默认禁止。 |
 
@@ -435,6 +435,7 @@ sample-multi-tenant-openclaw-on-firecracker/
 | `metrics` | `enabled` | `false` | 创建 AMP + Grafana + ADOT。 |
 | `agentcore` | `enabled` | `false` | 创建 Gateway + Memory + CodeInterpreter + Browser + Identity。 |
 | `console_auth` | `enabled` | `false` | Console 启用 Cognito 鉴权。 |
+| `console_auth` | `rbac_enabled` | `false` | 对写操作强制 viewer/operator/admin 角色校验（独立于登录）。 |
 | `backup_cron` | — | `cron(0 19 * * ? *)` | UTC 19:00 每天备份。 |
 
 > 完整参考请见 [`config.yml.example`](../config.yml.example)。

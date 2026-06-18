@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: MIT-0
 
 set -e
-exec > /var/log/openclaw-init.log 2>&1
+# Mirror to serial console so get-console-output shows [oc:init] progress (#73)
+exec > >(tee /var/log/openclaw-init.log > /dev/console) 2>&1
 log() { echo "[oc:init] $(date +%H:%M:%S) $*"; }
 log "Starting host setup..."
 
@@ -11,6 +12,21 @@ REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/la
 AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
 INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
 PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
+
+# IMDS values required to settle the hook; bail loudly if empty (#73).
+[ -n "${INSTANCE_ID}" ] && [ -n "${REGION}" ] || { echo "[oc:init] FATAL: empty INSTANCE_ID/REGION" > /dev/console; exit 1; }
+
+# Always settle the ASG hook on exit: CONTINUE on success, ABANDON on any
+# failure, so a broken init never hangs until hook timeout (#73).
+_complete_hook() {
+  rc=$?; trap - EXIT
+  result=$([ "$rc" -eq 0 ] && echo CONTINUE || echo ABANDON)
+  log "init exiting rc=$rc → lifecycle $result"
+  aws autoscaling complete-lifecycle-action --lifecycle-hook-name openclaw-host-init \
+    --auto-scaling-group-name openclaw-hosts-asg --lifecycle-action-result "$result" \
+    --instance-id "${INSTANCE_ID}" --region "${REGION}" || true
+}
+trap _complete_hook EXIT
 
 # Query stack outputs — retries because the host can race ahead of CFN
 # finalising outputs / setup.sh uploading scripts to S3 (issue: real-deploy
@@ -38,6 +54,10 @@ _s3_get() {
   return 1
 }
 
+# Step 0: stop (not disable) the boot auto-upgrade run so a stale AMI's kernel
+# update can't reboot mid-init and orphan the lifecycle hook (#74).
+systemctl stop unattended-upgrades apt-daily-upgrade.service 2>/dev/null || true
+
 # Step 1: KVM
 log "step1: KVM setup"
 chmod 666 /dev/kvm
@@ -48,11 +68,8 @@ log "step2: installing tools + firecracker"
 apt-get -o DPkg::Lock::Timeout=60 update -qq
 apt-get -o DPkg::Lock::Timeout=60 install -y -qq curl jq unzip pigz nginx > /dev/null 2>&1
 
-# 1.5.0 security: per-host ed25519 key for host→guest SSH. The PRIVATE key
-# stays on this host (root-only); the PUBLIC key is injected into each VM's
-# data disk by launch-vm.sh. Every host therefore holds a DISTINCT key — a
-# leaked/compromised key on one host cannot reach VMs on another. Guard the
-# keygen because init-host.sh runs under `set -e` and may re-run.
+# 1.5.0: per-host ed25519 key for host→guest SSH (private stays here, public
+# injected into each VM by launch-vm.sh). Guarded for set -e re-runs.
 mkdir -p /etc/openclaw
 if [ ! -f /etc/openclaw/host_vm_key ]; then
   ssh-keygen -t ed25519 -N "" -C "openclaw-host-$(hostname)" -f /etc/openclaw/host_vm_key
@@ -64,7 +81,8 @@ if ! command -v aws &>/dev/null; then
 fi
 ARCH="$(uname -m)"
 FC_URL="https://github.com/firecracker-microvm/firecracker/releases"
-FC_VER=$(basename $(curl -fsSLI -o /dev/null -w %{url_effective} ${FC_URL}/latest))
+# Pin Firecracker version — `latest` may not have CI guest-kernel yet, 404s step3b (#74)
+FC_VER="${FC_VERSION:-v1.15.1}"
 curl -sL ${FC_URL}/download/${FC_VER}/firecracker-${FC_VER}-${ARCH}.tgz | tar -xz
 mv release-${FC_VER}-${ARCH}/firecracker-${FC_VER}-${ARCH} /usr/local/bin/firecracker
 mv release-${FC_VER}-${ARCH}/jailer-${FC_VER}-${ARCH} /usr/local/bin/jailer
@@ -196,22 +214,7 @@ for i in $(seq 1 20); do
   sleep 30
 done
 if [ ! -f ${ASSETS}/manifest.json ]; then
-  log "ERROR: manifest.json not available after 10min"
-  log ""
-  log "  This means rootfs has not been built yet. To finish bringing up the data plane,"
-  log "  run ONE of the following from a machine that has AWS CLI access to this account:"
-  log ""
-  log "    Option A — cloud build (recommended; works from macOS / Windows / Cloud9):"
-  log "      ./scripts/build-rootfs-on-ec2.sh v1.0"
-  log "      (Spins up a one-shot t3.medium Ubuntu builder, runs the build via SSM,"
-  log "       uploads to S3, then terminates the builder.)"
-  log ""
-  log "    Option B — local Linux host (faster if you already have one):"
-  log "      source .env.deploy && ./build-rootfs.sh v1.0"
-  log ""
-  log "  Either uploads ${MANIFEST_URL} and triggers refresh-rootfs."
-  log "  This host will be replaced by the ASG on the next health-check cycle."
-  log ""
+  log "ERROR: no manifest.json after 10min — run ./build-rootfs.sh (or scripts/build-rootfs-on-ec2.sh) to build+upload rootfs"
   exit 1
 fi
 eval $(python3 -c "
@@ -245,21 +248,13 @@ chmod +x /home/ubuntu/launch-vm.sh && chown ubuntu:ubuntu /home/ubuntu/launch-vm
 aws s3 cp s3://{{ASSETS_BUCKET}}/deployment/scripts/stop-vm.sh /home/ubuntu/stop-vm.sh --region ${REGION} --no-progress 2>/dev/null || \
   _s3_get s3://{{ASSETS_BUCKET}}/deployment/scripts/stop-vm.sh /home/ubuntu/stop-vm.sh
 chmod +x /home/ubuntu/stop-vm.sh && chown ubuntu:ubuntu /home/ubuntu/stop-vm.sh
-# Issue #12 — clone-data.sh: same-host snapshot/clone helper
-aws s3 cp s3://{{ASSETS_BUCKET}}/deployment/scripts/clone-data.sh /home/ubuntu/clone-data.sh --region ${REGION} --no-progress 2>/dev/null || \
-  _s3_get s3://{{ASSETS_BUCKET}}/deployment/scripts/clone-data.sh /home/ubuntu/clone-data.sh || true
-chmod +x /home/ubuntu/clone-data.sh && chown ubuntu:ubuntu /home/ubuntu/clone-data.sh
-# Issue #64 — migrate-vm.sh: cross-host live migration (snapshot on source,
-# restore on target). Was missing from this download list → migrate API hit
-# a non-existent /home/ubuntu/migrate-vm.sh and failed with exit 127.
-aws s3 cp s3://{{ASSETS_BUCKET}}/deployment/scripts/migrate-vm.sh /home/ubuntu/migrate-vm.sh --region ${REGION} --no-progress 2>/dev/null || \
-  _s3_get s3://{{ASSETS_BUCKET}}/deployment/scripts/migrate-vm.sh /home/ubuntu/migrate-vm.sh || true
-chmod +x /home/ubuntu/migrate-vm.sh && chown ubuntu:ubuntu /home/ubuntu/migrate-vm.sh
-# Issue #22 (same defect class) — resize-disk.sh: offline ext4 grow of the
-# tenant data volume. Was missing here too → resize-disk API failed exit 127.
-aws s3 cp s3://{{ASSETS_BUCKET}}/deployment/scripts/resize-disk.sh /home/ubuntu/resize-disk.sh --region ${REGION} --no-progress 2>/dev/null || \
-  _s3_get s3://{{ASSETS_BUCKET}}/deployment/scripts/resize-disk.sh /home/ubuntu/resize-disk.sh || true
-chmod +x /home/ubuntu/resize-disk.sh && chown ubuntu:ubuntu /home/ubuntu/resize-disk.sh
+# clone(#12) / migrate(#64) / resize(#22) helpers — all must reach the host or
+# the matching API hits a missing /home/ubuntu/*.sh and fails exit 127.
+for _s in clone-data migrate-vm resize-disk; do
+  aws s3 cp s3://{{ASSETS_BUCKET}}/deployment/scripts/${_s}.sh /home/ubuntu/${_s}.sh --region ${REGION} --no-progress 2>/dev/null \
+    || _s3_get s3://{{ASSETS_BUCKET}}/deployment/scripts/${_s}.sh /home/ubuntu/${_s}.sh || true
+  chmod +x /home/ubuntu/${_s}.sh && chown ubuntu:ubuntu /home/ubuntu/${_s}.sh
+done
 {{BACKUP_DATA_SCRIPT}}
 
 # Step 4b: AgentCore config (if enabled)
@@ -270,14 +265,16 @@ if [ -n "${AGENTCORE_GW_URL}" ] && [ "${AGENTCORE_GW_URL}" != "none" ]; then
   log "AgentCore config written: gateway=${AGENTCORE_GW_URL}"
 fi
 
-# Step 5: Self-register to DynamoDB
+# Step 5: register to DDB. Retry (concurrent launches throttle writes); on
+# total failure exit non-zero → trap ABANDONs (unregistered host is useless) (#73)
 log "step5: registering to DynamoDB (az=${AZ})"
-aws dynamodb put-item --table-name ${HOSTS_TABLE} --region ${REGION} --item '{"instance_id":{"S":"'${INSTANCE_ID}'"},"private_ip":{"S":"'${PRIVATE_IP}'"},"az":{"S":"'${AZ}'"},"total_vcpu":{"N":"{{AVAIL_VCPU}}"},"total_mem_mb":{"N":"{{AVAIL_MEM}}"},"used_vcpu":{"N":"0"},"used_mem_mb":{"N":"0"},"vm_count":{"N":"0"},"next_vm_num":{"N":"1"},"status":{"S":"active"},"rootfs_version":{"S":"'${ROOTFS_VER}'"}}'
+_registered=0
+for _r in $(seq 1 10); do
+  aws dynamodb put-item --table-name ${HOSTS_TABLE} --region ${REGION} --item '{"instance_id":{"S":"'${INSTANCE_ID}'"},"private_ip":{"S":"'${PRIVATE_IP}'"},"az":{"S":"'${AZ}'"},"total_vcpu":{"N":"{{AVAIL_VCPU}}"},"total_mem_mb":{"N":"{{AVAIL_MEM}}"},"used_vcpu":{"N":"0"},"used_mem_mb":{"N":"0"},"vm_count":{"N":"0"},"next_vm_num":{"N":"1"},"status":{"S":"active"},"rootfs_version":{"S":"'${ROOTFS_VER}'"}}' && { _registered=1; break; }
+  log "register attempt $_r failed, retrying in 15s..."
+  sleep 15
+done
+[ "$_registered" -eq 1 ] || { log "ERROR: DDB registration failed after 10 attempts — ABANDON"; exit 1; }
 
-# Step 6: Complete lifecycle hook
-log "step6: completing lifecycle hook"
-aws autoscaling complete-lifecycle-action --lifecycle-hook-name openclaw-host-init \
-  --auto-scaling-group-name openclaw-hosts-asg --lifecycle-action-result CONTINUE \
-  --instance-id ${INSTANCE_ID} --region ${REGION} || true
-
+# Lifecycle hook is settled by the EXIT trap (_complete_hook) — CONTINUE on success, ABANDON on any failure.
 log "DONE host ready (total $((SECONDS))s)"

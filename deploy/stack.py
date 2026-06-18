@@ -247,6 +247,8 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 # environment only for trusted automation that cannot present a
                 # Cognito id_token.
                 "DEFAULT_NO_JWT_ROLE": str(CFG.get("console_auth", {}).get("default_no_jwt_role", "viewer")),
+                # RBAC role-gating — independent of console_auth, default off.
+                "RBAC_ENABLED": str((CFG.get("console_auth", {}) or {}).get("rbac_enabled", False)).lower(),
                 "PROJECT_VERSION": _read_pyproject_version(),
             },
         )

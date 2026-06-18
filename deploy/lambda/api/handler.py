@@ -64,6 +64,10 @@ COGNITO_REGION = os.environ.get("AWS_REGION", "") or os.environ.get("AWS_DEFAULT
 # "viewer" = least privilege (fail-safe). Trusted automation that needs write
 # access must present a Cognito id_token.
 DEFAULT_NO_JWT_ROLE = os.environ.get("DEFAULT_NO_JWT_ROLE", "viewer")
+# RBAC role-gating is its own switch, independent of console_auth (Cognito login). 
+# Default OFF: login can be required for the console UI without forcing every write to carry a Cognito id_token. 
+# Set RBAC_ENABLED=true to enforce per-route role checks (viewer/operator/admin).
+RBAC_ENABLED = os.environ.get("RBAC_ENABLED", "false").lower() == "true"
 
 # Lazily-built, module-cached JWKS client. Cognito rotates signing keys
 # rarely; PyJWKClient caches fetched keys in-process, so we pay the JWKS
@@ -491,6 +495,8 @@ def delete_skill(name):
 
 def _rbac_check(event, method, resource):
     """Return None if allowed, else a 403 response."""
+    if not RBAC_ENABLED:
+        return None  # role-gating disabled — all routes open
     role = _get_user_role(event)
     needed = "viewer" if (method, resource) in _VIEWER_OK else "operator"
     if not _role_satisfies(role, needed):

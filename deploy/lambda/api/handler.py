@@ -1514,6 +1514,8 @@ def system_info():
             # (driven by config.yml console_auth.enabled) instead.
             "enabled": os.environ.get("CONSOLE_AUTH_ENABLED", "false") == "true",
             "user_pool_id": os.environ.get("COGNITO_USER_POOL_ID", "") or None,
+            # 1.5.4: RBAC is an independent switch from login — a deployment can require Cognito login without enforcing per-route role checks.
+            "rbac_enabled": RBAC_ENABLED,
         },
         "notifications": {
             "enabled": bool(NOTIFICATIONS_TOPIC_ARN),

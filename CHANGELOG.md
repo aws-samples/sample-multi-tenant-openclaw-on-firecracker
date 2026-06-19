@@ -1,5 +1,27 @@
 # Changelog
 
+## [1.5.5] — 2026-06-19
+
+Closes the skill-group → tenant chain in the console (the backend already supported it; the create form just never sent a group), plus console refactor and UI fixes.
+
+### Added
+
+- **Assign a tenant to a skill group at creation (#62).** The New Tenant form now has a Skill Group dropdown; picking a group sends `group` on `POST /tenants`, so the VM only gets that group's skills (`tenant.skills ∪ group.skills`) instead of every shared skill. The API, `_resolve_effective_skills()`, and `launch-vm.sh` scoping were already in place — only the form field was missing, so the chain was unreachable from the UI.
+- **Tenants table shows each tenant's group.** A Group column renders the assigned group (or `—` for broadcast), so scoping is visible at a glance rather than write-only.
+- **Monitoring tab: Grafana data source setup card.** Surfaces the exact values to connect Grafana to AMP — Prometheus server URL (the workspace root, derived from the remote_write URL), SigV4 on, Authentication Provider `AWS SDK Default`, and the region — since picking the wrong auth provider returns a 403 that looks like (but isn't) a permissions problem.
+
+### Fixed
+
+- **New Skill / New Group modals rendered inline instead of centered.** Both used a `modal-overlay` class that doesn't exist in `style.css`, so they laid out in the document flow with no backdrop; switched to the shared `.overlay` class used by every other modal.
+- **Settings conflated Cognito login with RBAC.** The Infrastructure panel showed a single "Cognito + RBAC: Enabled (admin/operator/viewer)" even when RBAC was off, hiding the login-on/RBAC-off state that 1.5.4 made possible. `/system/info` now returns `cognito.rbac_enabled` and the panel shows Login and RBAC as two separate switches.
+
+### Changed
+
+- **Console JavaScript split by domain (no build step).** The ~620-line inline `app()` is now `console/js/app.<domain>.js` modules (core, tenants, hosts, migrations, backups, templates, skills, groups, monitoring, format) merged in `app.js`. The merge copies property descriptors (`Object.defineProperties`/`getOwnPropertyDescriptors`) rather than `Object.assign`, so Alpine getters stay reactive. Same no-bundler approach; `setup.sh` syncs the whole `console/` dir, so the new `js/` ships automatically.
+- **Renamed the Application tab to Agent Config.** The tab and page title now match ("Agent Config"), better describing its contents: config templates, MCP tools, skills, and skill groups.
+- **Modal widths normalised.** `.modal` defaults to a wider 560px so the New Tenant / Create Group / Migrate dialogs aren't cramped; editor-heavy modals (New Template, Upload Skill) override to 680px.
+- **Tenants tab: Shared Skills strip replaced with a summary + link.** It listed every global skill, which read as "all tenants get all skills" once per-tenant Group scoping existed; now shows the count plus a pointer to scope via Groups, linking to Agent Config.
+
 ## [1.5.4] — 2026-06-18
 
 Host init reliability — newly-launched hosts were getting stuck `MidLifecycleAction` and ABANDONed. Root-caused to upstream drift and a boot-time reboot race; verified end-to-end on a fresh host (init → InService → DDB-registered → carries a tenant).

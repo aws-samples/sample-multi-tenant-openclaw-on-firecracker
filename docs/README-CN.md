@@ -293,15 +293,15 @@ CloudFront 上托管的 Web Console（`/console/`），Cognito 鉴权，5 个 ta
 
 ### Tenants tab — 多 host、多 AZ 实时操作
 
-左侧 Hosts 按 AZ 分组（每个卡片显示 CPU / Memory / VM 数 + 超卖比例）。Tenants 表格每行实时 vCPU / Memory / Disk 进度条 + AZ 列 + gateway/health 信号灯 + 每租户 Migrate 按钮。AgentCore + Shared Skills 折叠在顶部：
+左侧 Hosts 按 AZ 分组（每个卡片显示 CPU / Memory / VM 数 + 超卖比例）。Tenants 表格每行实时 vCPU / Memory / Disk 进度条 + 所属 skill Group + gateway/health 信号灯 + 每租户 Migrate 按钮。AgentCore + Shared Skills 折叠在顶部：
 
 ![Tenants tab](../docs/web_console.png)
 
-### Application tab — 模板、MCP 工具、共享 Skills
+### Agent Config tab — 模板、MCP 工具、Skills 与分组
 
 Config Templates 管理器 + MCP Tools 卡片（自动通过 AgentCore Gateway 拉取 Lambda-backed 工具列表 + input schema）+ Shared Skills 含每个 Skill 的 S3 直链：
 
-![Application tab](../docs/web_console_application.png)
+![Agent Config tab](../docs/web_console_application.png)
 
 ### Monitoring tab — AMP / Grafana / SNS 一目了然
 
@@ -581,7 +581,7 @@ aws s3 sync ./my-skills/ s3://${ASSETS_BUCKET}/skills/ --profile $PROFILE
 #   S3 → Host /data/shared-skills/ (cron 5min) → 新 VM 启动时
 ```
 
-**1.4.0 (#62) — per-tenant / per-group skill 分发**：默认每个 VM 拿全部 skill（广播，v1.3.x 行为）。要限制某租户只拿子集：
+**1.4.0 (#62) — per-tenant / per-group skill 分发**：默认每个 VM 拿全部 skill（广播，v1.3.x 行为）。要限制某租户只拿子集，可在 Console 的 New Tenant 表单里选 Skill Group（1.5.5），或直接调 API：
 
 ```bash
 # 1) 定义一个 skill 组（可选）
@@ -708,163 +708,59 @@ curl -s "${API_URL}hosts/rootfs-version" -H "x-api-key: ${API_KEY}" | jq .
 
 ## ⬆️ 升级指南
 
-升级通常涉及**两层**：控制面（CDK 栈）和数据面（rootfs + host-agent）。
-
-### 通用流程（任意版本）
+任意版本一次性升到最新 —— `setup.sh` 在单次部署里带上全部控制面增量。逐版本说明见 [CHANGELOG.md](../CHANGELOG.md)。
 
 ```bash
-git pull                                  # 拉最新 main
-git diff HEAD@{1} HEAD -- config.yml.example  # 检查新配置 key
-# 如有新 key，手动合并到本地 config.yml
-
-./setup.sh <region> <profile>             # 重新部署 CDK 栈（幂等）
-
-# 重建 rootfs（见"快速开始"第 3 步）
-source .env.deploy && ./build-rootfs.sh <new_version>
-
-# 新建 tenant 立刻用新 rootfs；已有 tenant 调 `reset` API 才会切换。
+git pull
+git diff HEAD@{1} HEAD -- config.yml.example   # 把新增的配置 key 合并进你的 config.yml
+./setup.sh <region> <profile>
 ```
 
-### 最新：v1.4.2 → **v1.4.3**（测试稳定性 — 无生产影响）
+对现有部署的影响（任意规模）—— 重部署不会扰动正在运行的 host 或 tenant；代价是引导路径（boot-path）和 rootfs 的修复不会自动到达它们，需要你主动 roll 进去：
 
-v1.4.3 是**纯测试修复**。让 `tests/test_e2e.py` 具备 retry 能力，避免 ALB / API Gateway TLS keep-alive reset 引发的瞬态 `urllib.error.URLError: [SSL: UNEXPECTED_EOF_WHILE_READING]` 被误判成测试失败。同时把 `_wait_for_status` 默认 timeout 从 180s 调到 360s，让冷启动的 restore-from-backup 操作有合理时间完成。
+| 操作 | 运行中的 host | 运行中的 tenant |
+|---|---|---|
+| `git pull` + `./setup.sh` | 不动 —— ASG 没有 rolling/replacing UpdatePolicy，更新 Launch Template **不会**替换在跑的实例 | 不动 |
+| Lambda 代码更新（在 `setup.sh` 内） | 不动 —— Lambda 属控制面，仅短暂冷启动 | 不动 |
+| 新的 `init-host.sh` / Launch Template | 不动，直到你替换该 host —— UserData 只在首次 boot 执行 | 不动 |
+| `POST /hosts/refresh-rootfs` | 就地推送新 rootfs，不替换 host | 保持当前 rootfs，直到逐个 `reset` |
+| 替换一台 host（为拿到新 `init-host.sh`） | 仅这一台 —— 其余不动 | 先把它上面的 tenant 迁走 |
 
-**不需要 CDK 重部署。**Lambda 运行时代码跟 v1.4.2 完全一样。
+**环境前提** —— Docker 只属于控制面：
 
-```bash
-git pull   # 就这一步
-```
+- `setup.sh` 需要 **Docker**（CDK 在容器里给 api Lambda 打包 `cryptography` 原生扩展以匹配 ARM64 运行时），自 v1.5.0 起，与 RBAC 是否开启无关。
+- `build-rootfs.sh` 需要 **Linux** + `debootstrap`/`mkfs.ext4`/`pigz`，不需要 Docker。macOS 上用 `scripts/build-rootfs-on-ec2.sh`，它在一台一次性 EC2 上构建 —— 本机只需 AWS 凭证。
 
-`tests/test_e2e_retry.py` 加 8 个新单元测试覆盖 retry 策略（happy path / SSL EOF 恢复 / 5xx 恢复 / 4xx 不重试 / 耗尽重试 / backoff 时序 / disable）。修复后 e2e backup-restore 从偶发 SSL-EOF 失败变成 **3/3 稳定通过 84 秒**。
-
-### v1.4.1 → v1.4.2（关键修复：修复"假 failover" bug — 生产强烈推荐升级）
-
-v1.4.2 修复一个**沉默的正确性 bug**：之前的版本可能标记 `AZ_FAILOVER_TENANT_RECOVERED` 并把 DDB flip 到 `status=running`，但实际 dashboard URL 是 502 不通的。三个根因都在 `_failover_tenant_to_host`：
-
-1. verify probe 只检查 firecracker 进程和 nginx conf 文件存在 —— 既不能证明 guest 启动完了，也不能证明 nginx reload 了新 conf
-2. ALB repoint 失败被静默 swallow，failover 仍标记成 "recovered"
-3. flip DDB 之前没有任何一步真去确认 dashboard URL 能打开
-
-v1.4.2 让 failover **真正** end-to-end 验证之后才标 success：
-
-- **强化 verify probe**：加 `curl http://127.0.0.1/vm/<tid>/` 检查，5xx / connection-refused 都视为失败
-- **ALB repoint 失败现在 raise** — 不再 swallow
-- **新增跨 ALB 可达性 gate**：直接打 `http://<ALB_DNS>/vm/<tid>/`，30s 内必须回非 5xx，否则不 flip DDB
-- **新状态 `failover_failed_partial`**：VM 起来了但 ALB/跨-ALB 失败 → 运维必须人工修 ALB rule
-
-```bash
-git pull && ./setup.sh <region> <profile>
-```
-
-redeploy 后，health_check Lambda 多了 `PUBLIC_BASE_URL` 环境变量（由 CDK 自动注入 `http://<alb_dns>`），跨 ALB gate 启用。CloudWatch 日志现在会区分 "VM 没起来" 和 "VM 起来了但 ALB 没更新"，不再静默吐 fake success。
-
-`tests/test_failover_genuine.py` 加 16 个新单测明确覆盖三个根因（6 假阳性 + 4 happy-path + 6 跨 ALB probe）。**534 passed / 0 failed**。
-
-要找出可能被老 bug 影响的租户：
-```bash
-aws dynamodb scan --table-name openclaw-tenants \
-  --filter-expression 'attribute_exists(failover_at) AND #s = :running' \
-  --expression-attribute-names '{"#s":"status"}' \
-  --expression-attribute-values '{":running":{"S":"running"}}' --profile $PROFILE
-# 然后人工 probe 每个 dashboard URL — 502 的就是 fake-failover 受害者
-```
-
-### v1.4.0 → v1.4.1（Console 的 skills + groups CRUD UI）
-
-v1.4.1 修复 [#63](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/63)：v1.4.0 (#62) 落地了 per-tenant skill scoping 的数据模型 + API，但运维还得开终端 `aws s3 cp` 才能编辑/上传 skill，用 `curl` 才能管 group。v1.4.1 把 Application tab 升级成真正的管理界面 —— `GET/PUT/DELETE /skills/{name}` 撑起的 Edit/Upload/Delete 按钮，加上一张连到 v1.4.0 端点的 Skill Groups 卡。
-
-```bash
-git pull && ./setup.sh <region> <profile>
-```
-
-无数据迁移。`s3://${ASSETS_BUCKET}/skills/<name>/SKILL.md` 在新编辑器里立刻可见。Console 在下一次 CloudFront 刷新生效。RBAC：`viewer` 看到只读列表 + 预览；`operator+` 看到 Edit / Delete / + New / Group 管理按钮。
-
-`tests/test_skill_crud.py` 加 16 个单元测试，覆盖 read/update/delete + content 校验（必须含 `# Title`、≤256 KiB、合法 name 正则）+ RBAC routing。**493 passed / 0 failed**（1.4.0 baseline 477 + 16 new）。
-
-### v1.3.4 → v1.4.0（per-tenant skill 分发 — 可选的安全加固）
-
-v1.4.0 修复 [#62](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/62)：v1.4.0 之前每个 VM 启动时都会被 `cp -r` 整个 `s3://${ASSETS_BUCKET}/skills/` —— 没法把 SRE 团队的应急响应 skill 隔离到只给 SRE 团队的 tenant。v1.4.0 加上 tenant 级 + group 级的 skill scoping；不设 scope 的 tenant 仍然拿到全部 skill，**完全向后兼容**。
-
-```bash
-git pull && ./setup.sh <region> <profile>
-```
-
-新增 `openclaw-groups` DDB 表 + 4 个 API 端点（`GET/POST /groups`、`POST /groups/{name}/skills`、`DELETE /groups/{name}/skills/{skill}`）。`POST /tenants` body 现在接受 `skills: [...]` 和/或 `group: "..."` 字段。`GET /tenants/{id}` 返回 `effective_skills`（resolved 后的 union，或 `"*"` 表示广播）。用法见进阶主题里的 [共享 Skills](#-进阶主题) 章节。
-
-`tests/test_skill_scoping.py` 加 29 个新单元测试，覆盖 issue 中提到的 6 个语义场景：空 / 单 / 仅 group / 仅 tenant / 都设 / 未知 group。
-
-### v1.3.3 → v1.3.4（安全加固 — 任何生产多租户部署强烈推荐）
-
-v1.3.4 修复 [#61](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/61)：v1.3.3 及之前的版本里，操作员控制台（`/console/*`）和每个租户的 dashboard（`/vm/*`）共用一个 CloudFront + 一个域名，意味着 Cognito session cookie 会被发到 tenant DOM 上。v1.3.4 引入**双域名模式**：创建两个独立的 CloudFront distribution + 两张 ACM cert，Cognito session cookie 物理上 scope 到 `console_domain`，浏览器不会把它发到 `app_domain`。
-
-**向前兼容**：v1.3.3 老部署不设新字段时继续用 legacy 单域名模式。**不强制迁移**，但生产多租户部署强烈建议切换。
-
-```bash
-# 在 us-east-1 准备两张 ACM 证书（console_domain 一张，app_domain 一张）
-git pull && ./setup.sh <region> <profile> \
-  --console-domain console.example.com --console-cert <acm-arn> \
-  --app-domain     app.example.com     --app-cert     <acm-arn>
-```
-
-部署后：
-
-- setup 打印**两个独立 URL** —— 操作员控制台（Cognito 鉴权）和每租户 dashboard
-- `OC_CONSOLE_BASE` 和 `OC_DASHBOARD_BASE` 在 `console/config.js` 里独立注入
-- CloudFormation outputs 多了 `DualDomainMode: true`
-- 完整安全推理见进阶主题里的 [双域名安全分离](#-进阶主题)
-
-### v1.3.2 → v1.3.3（host 容量计数器一致性）
-
-v1.3.3 修复 [#59](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/59) 和 [#60](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/60)：`/migrate` API 没更新 host 容量计数器（源 host `used_vcpu` 未减、目标 host 未加），也没做目标容量预检。v1.3.3 加上这两点，并把 AZ failover 也补上 `used_vcpu`/`used_mem_mb` 增量更新（之前只更新 `vm_count`）。
-
-```bash
-git pull && ./setup.sh <region> <profile>
-```
-
-无数据迁移需求 — 修复仅影响部署后的新迁移。`tests/test_migration.py` 加了 4 个回归测试。
-
-### 最新：v1.3.1 → **v1.3.2**（强烈推荐任何多租户部署）
-
-v1.3.2 修了所有真实环境压测才会暴露的问题：并发 Lambda 互踩、multi-tenant 同时迁移、内核短暂 race、host-agent ⇄ Lambda 互踩导致 SSM exit 不准。
-
-```bash
-git pull && ./setup.sh <region> <profile>     # 加上 reserved_concurrent_executions=1
-```
-
-部署完成后，重新分发 `launch-vm.sh` 到现有 host：
+### 把修复 roll 进现有 host/tenant
 
 ```bash
 source .env.deploy
+# rootfs —— 就地推送到在跑的 host；现有 tenant 在下次 `reset` 时切换
+curl -s -X POST "${API_URL}hosts/refresh-rootfs" -H "x-api-key: ${API_KEY}" | jq .
+# launch-vm.sh 等 host 端脚本 —— 通过 SSM
 aws s3 cp deploy/userdata/launch-vm.sh s3://${ASSETS_BUCKET}/deployment/scripts/launch-vm.sh
 aws ssm send-command --document-name AWS-RunShellScript \
     --targets Key=tag:aws:autoscaling:groupName,Values=openclaw-hosts-asg \
-    --parameters 'commands=[
-      "aws s3 cp s3://'${ASSETS_BUCKET}'/deployment/scripts/launch-vm.sh /home/ubuntu/launch-vm.sh",
-      "chmod +x /home/ubuntu/launch-vm.sh"
-    ]'
+    --parameters 'commands=["aws s3 cp s3://'${ASSETS_BUCKET}'/deployment/scripts/launch-vm.sh /home/ubuntu/launch-vm.sh","chmod +x /home/ubuntu/launch-vm.sh"]'
 ```
 
-**新增的 audit log 条目要关注：**
+`init-host.sh` 的改动需要替换 host（UserData 只跑一次）。逐台、零停机：把 tenant 迁走 → 终止该 host → ASG 用新 Launch Template 重新拉起 → 等 `InService` → 下一台。
 
-- `AZ_FAILOVER_RECOVERED_BY_VERIFY` — 信息（verify 探针救回了一个看似失败的迁移）
-- `AZ_FAILOVER_SKIPPED_CONCURRENT` — 信息（并发 Lambda 主动让步）
-- `AZ_FAILOVER_TENANT_FAILED` — 需要处理（verify 探针确认真失败）
-- `AZ_FAILOVER_NO_BACKUP` — 需要处理（tenant 无备份，拒绝迁移）
+### Breaking changes
 
-**summary 字段语义彻底分离**：`tenants_failed_over`、`tenants_failed`、`tenants_blocked` 三相独立。
+其余一切都由 `git pull && ./setup.sh` 覆盖。
 
-<details>
-<summary><b>更老的升级路径（v1.3.0 → v1.3.1, v1.2.9 → v1.3.0, v1.2.7 → v1.2.9）</b></summary>
+| 版本 | 改动 | 你要做的 |
+|---|---|---|
+| **v1.5.0** | Cognito id_token RS256 验签；microVM SSH 改为仅公钥（移除共享密码） | 带 Docker 部署；为 SSH 改动重建 rootfs + roll host（见下） |
+| **v1.3.4** | 双域名模式把 Cognito cookie scope 到 console 域名（[#61](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/61)）—— opt-in | 若采用：在 us-east-1 备两张 ACM 证书 + `--console-domain/--console-cert/--app-domain/--app-cert` |
+| **v1.3.0** | ASG 默认 → 2 host / 2 AZ（AZ failover 需要一个目标） | 无需操作，或设 `asg.min_capacity: 1` / `multi_az.enabled: false` 保持单 AZ |
 
-更老版本升级请参考 **[CHANGELOG.md](../CHANGELOG.md)**，每版本都有 operator notes。
+**v1.5.0 细节。** RBAC 角色鉴权是 opt-in（`console_auth.rbac_enabled: false` 为默认 —— `x-api-key` 读写照旧，不需要 Bearer）。设 `rbac_enabled: true` 后，写操作需带合法的 Cognito id_token（`Authorization: Bearer …`）；伪造 / `alg:none` / 过期的 token 回退到 `DEFAULT_NO_JWT_ROLE`（默认 `viewer`）。SSH 改动属数据面 —— 现有 VM 在其 host 被 roll 之前仍用旧密码：
 
-简要参考：
-
-- **v1.3.0 → v1.3.1**：5 个 path-A 集成 bug 修复。重新分发 `launch-vm.sh`。`__az_failover_state__` 合成记录用于 cooldown 持久化。
-- **v1.2.9 → v1.3.0**：ASG `min_capacity` 1 → 2（multi-AZ 默认）。`health_check` Lambda 新增 IAM 权限。
-- **v1.2.7 → v1.2.9**：多个 console + 观测修复。已有 host 需要重新分发 `host-agent.py`（带真实 CPU% / 内存指标）。
-
-</details>
+```bash
+source .env.deploy && ./scripts/build-rootfs-on-ec2.sh <rootfs_version> <arch>   # rootfs 内容 tag（如 v1.1），不是产品版本号
+```
 
 ---
 

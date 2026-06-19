@@ -294,15 +294,15 @@ Web-based console hosted on CloudFront (`/console/`), Cognito-authenticated. Fiv
 
 ### Tenants tab — Multi-host, multi-AZ live operations
 
-Hosts grouped by AZ on the left (each card showing CPU / Memory / VM count and overcommit ratios). Tenants table with live vCPU / Memory / Disk progress bars per row, AZ column, gateway / health LEDs, and per-tenant Migrate button. AgentCore + Shared Skills surfaces collapsed at the top:
+Hosts grouped by AZ on the left (each card showing CPU / Memory / VM count and overcommit ratios). Tenants table with live vCPU / Memory / Disk progress bars per row, the assigned skill Group, gateway / health LEDs, and per-tenant Migrate button. AgentCore + Shared Skills surfaces collapsed at the top:
 
 ![Tenants tab](docs/web_console.png)
 
-### Application tab — Templates, MCP tools, shared skills
+### Agent Config tab — Templates, MCP tools, skills & groups
 
 Config Templates manager + MCP Tools card (auto-populated via AgentCore Gateway, surfacing every Lambda-backed tool registered with the gateway: name, description, input schema) + Shared Skills with per-skill S3 deep-links:
 
-![Application tab](docs/web_console_application.png)
+![Agent Config tab](docs/web_console_application.png)
 
 ### Monitoring tab — AMP / Grafana / SNS at a glance
 
@@ -586,7 +586,7 @@ aws s3 sync ./my-skills/ s3://${ASSETS_BUCKET}/skills/ --profile $PROFILE
 #   S3 → Host /data/shared-skills/ (cron 5min) → New VMs at launch
 ```
 
-**1.4.0 (#62) — per-tenant / per-group skill distribution**: by default every VM gets every skill (broadcast, legacy v1.3.x behavior). To restrict which skills a particular tenant receives:
+**1.4.0 (#62) — per-tenant / per-group skill distribution**: by default every VM gets every skill (broadcast, legacy v1.3.x behavior). To restrict which skills a particular tenant receives, pick a Skill Group in the Console's New Tenant form (1.5.5), or call the API directly:
 
 ```bash
 # 1) Define a group of skills (optional)
@@ -713,194 +713,59 @@ curl -s "${API_URL}hosts/rootfs-version" -H "x-api-key: ${API_KEY}" | jq .
 
 ## ⬆️ Upgrade Guide
 
-Upgrading typically involves **two layers**: control plane (CDK stack) and data plane (rootfs + host-agent).
-
-### Standard procedure (any version)
-
-```bash
-git pull                                  # pull latest main
-git diff HEAD@{1} HEAD -- config.yml.example  # check for new config keys
-# If new keys exist, merge them into your local config.yml manually
-
-./setup.sh <region> <profile>             # redeploy CDK stack (idempotent)
-
-# Rebuild rootfs (see "Quick Start" Step 3)
-source .env.deploy && ./build-rootfs.sh <new_version>
-
-# New tenants use the new rootfs immediately; existing tenants need a `reset` API call to switch over.
-```
-
-### Latest: v1.4.5 → **v1.5.0** (security hardening — ⚠️ breaking auth change)
-
-v1.5.0 fixes two **real, exploitable** vulnerabilities that 1.4.4 had recorded as known limitations:
-
-- **RBAC was fail-open and the JWT was never signature-verified.** A request with no Bearer token resolved to `admin`, and a present token was base64-decoded *without* verifying its signature — so a forged `{"cognito:groups":["admin"]}` (even `alg:none`) granted admin. Now the id_token's **RS256 signature is verified** against the pool JWKS; anything that fails (forged / `alg:none` / expired / wrong issuer-or-audience) is downgraded to `viewer`, and **no token fails safe to `viewer`** (`DEFAULT_NO_JWT_ROLE`, configurable).
-- **Every microVM shipped the same hardcoded SSH password with root login enabled.** Now SSH is **pubkey-only**: each host self-generates an `ed25519` key at boot, the public key is injected per-VM at launch (one key per host), root + password login are disabled, both accounts are locked, and the shared password is gone from the entire repo.
-
-> ⚠️ **Breaking — read before upgrading.** Automation that mutates state (any non-GET) must now present a valid Cognito **id_token** as `Authorization: Bearer …`. `x-api-key`-only callers can still **read** (GETs return 200) but **writes return 403**. For a trusted, network-isolated automation deployment you may set `DEFAULT_NO_JWT_ROLE=admin`, but the secure default is `viewer`. microVM SSH is pubkey-only after a rootfs rebuild + host roll; existing VMs keep the old password until their host is rolled.
+Upgrade from any version to latest in one pass — `setup.sh` carries the full control-plane delta in a single deploy. Per-version notes are in [CHANGELOG.md](CHANGELOG.md).
 
 ```bash
 git pull
-# 1. control plane — REQUIRES Docker (builds the cryptography wheel) and the
-#    region context flag (deploy/app.py defaults to us-east-1 via context):
-AWS_PROFILE=<profile> uv run cdk deploy -c region=<region> --require-approval never
-#    → api Lambda flips to ARM_64, gets PyJWT+cryptography bundled, and is
-#      injected with the real Cognito pool id + DEFAULT_NO_JWT_ROLE=viewer.
-# 2. data plane — rebuild the hardened rootfs, then roll hosts to retire the
-#    old shared-password image:
-source .env.deploy && ./scripts/build-rootfs-on-ec2.sh v1.1 <arch>
+git diff HEAD@{1} HEAD -- config.yml.example   # merge any new config keys into your config.yml
+./setup.sh <region> <profile>
 ```
 
-Verified live: `scripts/e2e-rbac-test.sh` proves no-token write → 403, forged / `alg:none` admin token → 403, read → 200 through API Gateway; the v1.1 rootfs was inspected to confirm `PermitRootLogin no` / `PasswordAuthentication no`, both accounts locked, and zero password residue. **583 offline tests pass** (26 RBAC signature/forgery cases included).
+Impact on an existing deployment (any size) — a redeploy never disturbs running hosts or tenants; the trade-off is that boot-path and rootfs fixes don't reach them until you roll them in:
 
-### v1.4.3 → v1.4.5 (async live migration)
+| Action | Running hosts | Running tenants |
+|---|---|---|
+| `git pull` + `./setup.sh` | Untouched — the ASG has no rolling/replacing UpdatePolicy, so a new Launch Template does **not** replace live instances | Untouched |
+| Lambda code update (in `setup.sh`) | Untouched — Lambdas are control-plane; brief cold-start only | Untouched |
+| New `init-host.sh` / Launch Template | Untouched until you replace a host — UserData runs only at first boot | Untouched |
+| `POST /hosts/refresh-rootfs` | New rootfs pushed in place; no replacement | Keep current rootfs until each is `reset` |
+| Replace a host (to pick up `init-host.sh`) | That host only — others untouched | Drain/migrate its tenants off first |
 
-v1.4.4 shipped the data-plane fix for live migration (the snapshot now ships the disk backing files) plus IMDS isolation and a collapsed Lambda invoke policy. v1.4.5 then made `POST /tenants/{id}/migrate` **asynchronous** — it returns **202** immediately and the health_check sweep finishes the snapshot → restore → ALB repoint → dashboard-verify → host_id flip out-of-band, because a multi-GB snapshot+restore far exceeds API Gateway's 29 s integration cap. Clients poll `GET /tenants/{id}` until `running` (success) or `migration_failed` (rollback). Verified live both directions (1a↔1c). See **[CHANGELOG.md](CHANGELOG.md)** for the full notes.
+**Prerequisites** — Docker is control-plane only:
 
-```bash
-git pull && AWS_PROFILE=<profile> uv run cdk deploy -c region=<region> --require-approval never
-```
+- `setup.sh` needs **Docker** (CDK bundles the api Lambda's `cryptography` native ext for the ARM64 runtime), since v1.5.0, regardless of RBAC.
+- `build-rootfs.sh` needs **Linux** + `debootstrap`/`mkfs.ext4`/`pigz`, no Docker. On macOS use `scripts/build-rootfs-on-ec2.sh`, which builds on a throwaway EC2 instance — local machine needs only AWS creds.
 
-### v1.4.2 → v1.4.3 (test stability — no production impact)
-
-v1.4.3 is a **test-only release**. It makes `tests/test_e2e.py` retry-aware so transient `urllib.error.URLError: [SSL: UNEXPECTED_EOF_WHILE_READING]` from ALB / API Gateway TLS keep-alive resets no longer masquerade as test failures. Also bumps `_wait_for_status` from 180 s → 360 s so cold-pool restore-from-backup operations have realistic time to complete.
-
-**No CDK redeploy needed.** Lambda runtime code is identical to v1.4.2.
-
-```bash
-git pull   # that's it
-```
-
-8 new unit tests in `tests/test_e2e_retry.py` cover the retry policy (happy path / SSL EOF recovery / 5xx recovery / 4xx no-retry / exhaustion / backoff / disable). After this fix, e2e backup-restore goes from intermittent SSL-EOF failures to **3/3 passes in 84 s** consistently.
-
-### v1.4.1 → v1.4.2 (critical: fix the "fake failover" bug — strongly recommended for production)
-
-v1.4.2 fixes a **silent correctness bug** in AZ failover that a teammate caught in production: prior versions could mark `AZ_FAILOVER_TENANT_RECOVERED` and flip DDB `status=running` while the dashboard URL was completely 502. Three root causes inside `_failover_tenant_to_host`:
-
-1. The verify probe only checked process + nginx config file existence — neither proves the guest finished booting or that nginx reloaded the new conf.
-2. ALB repoint failures were silently swallowed and the failover was marked "recovered" anyway.
-3. There was no public-path probe to confirm the dashboard URL actually opens before flipping DDB.
-
-v1.4.2 makes failover **genuinely** end-to-end verified before declaring success:
-
-- **Strengthened verify probe**: now also `curl http://127.0.0.1/vm/<tid>/` and rejects 5xx / connection-refused
-- **ALB repoint failures now raise** — no more silent swallowing
-- **NEW cross-ALB reachability gate**: hits `http://<ALB_DNS>/vm/<tid>/` for up to 30s; only flips DDB after a non-5xx response
-- **NEW status `failover_failed_partial`**: VM up on target but ALB/cross-ALB failed → operator must manually fix the ALB rule
-
-```bash
-git pull && ./setup.sh <region> <profile>
-```
-
-After redeploy, the new `PUBLIC_BASE_URL` env var on the health_check Lambda activates the cross-ALB gate. Watch CloudWatch for `failover failed` log lines — they now distinguish "VM never came up" from "VM came up but ALB never updated" instead of silently emitting fake successes.
-
-**16 new unit tests in `tests/test_failover_genuine.py`** explicitly cover the three root causes (6 false-positive guards + 4 happy-path + 6 cross-ALB probe). **534 passed / 0 failed** locally.
-
-To find tenants potentially affected by the old bug:
-```bash
-aws dynamodb scan --table-name openclaw-tenants \
-  --filter-expression 'attribute_exists(failover_at) AND #s = :running' \
-  --expression-attribute-names '{"#s":"status"}' \
-  --expression-attribute-values '{":running":{"S":"running"}}' --profile $PROFILE
-# Then manually probe each dashboard URL — if any 502, that tenant was a fake-failover.
-```
-
-### v1.4.0 → v1.4.1 (Console UI for skills + groups CRUD)
-
-v1.4.1 closes [#63](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/63): the v1.4.0 (#62) work shipped the data model + API for per-tenant skill scoping, but operators still had to `aws s3 cp` from a terminal to actually edit / upload skills, and `curl` to manage groups. v1.4.1 gives the Application tab a real management surface — Edit / Upload / Delete buttons backed by `GET/PUT/DELETE /skills/{name}`, plus a Skill Groups card wired to the v1.4.0 endpoints.
-
-```bash
-git pull && ./setup.sh <region> <profile>
-```
-
-No data migration. Existing `s3://${ASSETS_BUCKET}/skills/<name>/SKILL.md` files are visible in the new editor immediately. Console picks up the UI on the next CloudFront cache flush. RBAC: `viewer` sees read-only list + preview; `operator+` sees Edit / Delete / + New / Group management buttons.
-
-16 new unit tests in `tests/test_skill_crud.py` cover read / update / delete + content validation (must contain `# Title`, max 256 KiB, valid name regex) + RBAC routing. **493 passed / 0 failed locally** (1.4.0 baseline 477 + 16 new).
-
-### v1.3.4 → v1.4.0 (per-tenant skill scoping — opt-in security feature)
-
-v1.4.0 closes [#62](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/62): pre-1.4.0 every tenant VM got `cp -r` of every skill in `s3://${ASSETS_BUCKET}/skills/` — there was no way to keep an SRE team's incident-response skill out of every other tenant's filesystem. v1.4.0 adds tenant-level + group-level skill scoping; tenants without scoping continue to receive everything, so the upgrade is **fully backward compatible**.
-
-```bash
-git pull && ./setup.sh <region> <profile>
-```
-
-Adds a new `openclaw-groups` DDB table + 4 new API endpoints (`GET/POST /groups`, `POST /groups/{name}/skills`, `DELETE /groups/{name}/skills/{skill}`). Tenant `POST /tenants` body now accepts `skills: [...]` and/or `group: "..."` fields. `GET /tenants/{id}` returns `effective_skills` (resolved union, or `"*"` for broadcast). See [Shared Skills](#-advanced-topics) in Advanced Topics for usage examples.
-
-29 new unit tests in `tests/test_skill_scoping.py` cover all six semantic cases from the issue: empty / single / group-only / tenant-only / both / unknown-group.
-
-### v1.3.3 → v1.3.4 (security hardening — recommended for any production multi-tenant deployment)
-
-v1.3.4 fixes [#61](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/61): operator console (`/console/*`) and per-tenant dashboards (`/vm/*`) used to share one CloudFront distribution and one domain, meaning the Cognito session cookie was sent to tenant DOM. v1.3.4 adds a **dual-domain mode** that creates two independent CloudFront distributions with two ACM certs — the Cognito session cookie is physically scoped to `console_domain` and the browser will not send it to `app_domain`.
-
-**Backward compatible**: existing v1.3.3 deployments without the new fields continue to work unchanged in legacy single-domain mode. **No forced migration**, but production multi-tenant deployments are strongly recommended to switch.
-
-```bash
-# Prepare two ACM certs in us-east-1 for console_domain and app_domain.
-git pull && ./setup.sh <region> <profile> \
-  --console-domain console.example.com --console-cert <acm-arn> \
-  --app-domain     app.example.com     --app-cert     <acm-arn>
-```
-
-After redeploy:
-
-- Setup prints **two distinct URLs** — operator console (Cognito-protected) and per-tenant dashboard
-- `OC_CONSOLE_BASE` and `OC_DASHBOARD_BASE` injected into `console/config.js` separately
-- `DualDomainMode: true` in CloudFormation outputs
-- See [Multi-Domain Setup](#-advanced-topics) in Advanced Topics for full security rationale
-
-### v1.3.2 → v1.3.3 (host capacity counter consistency)
-
-v1.3.3 fixes [#59](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/59) and [#60](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/60): the `/migrate` API didn't update host capacity counters (source `used_vcpu` not decremented, target not incremented) and didn't preflight target capacity. v1.3.3 adds both, plus extends AZ failover to update the target's `used_vcpu` / `used_mem_mb` (was only `vm_count`).
-
-```bash
-git pull && ./setup.sh <region> <profile>
-```
-
-No data migration needed — the fix only affects new migrations after deploy. 4 new regression tests in `tests/test_migration.py`.
-
-### v1.3.1 → **v1.3.2** (recommended for any multi-tenant deployment)
-
-v1.3.2 fixes everything that surfaces under real load: concurrent Lambda invocations, multi-tenant batch failover, transient kernel races, host-agent ⇄ Lambda race conditions where SSM exit code disagrees with VM truth.
-
-```bash
-git pull && ./setup.sh <region> <profile>     # adds reserved_concurrent_executions=1
-```
-
-After redeploy, re-roll `launch-vm.sh` on existing hosts:
+### Roll fixes into existing hosts/tenants
 
 ```bash
 source .env.deploy
+# rootfs — pushed in place to live hosts; existing tenants pick it up on next `reset`
+curl -s -X POST "${API_URL}hosts/refresh-rootfs" -H "x-api-key: ${API_KEY}" | jq .
+# launch-vm.sh and other host-side scripts — via SSM
 aws s3 cp deploy/userdata/launch-vm.sh s3://${ASSETS_BUCKET}/deployment/scripts/launch-vm.sh
 aws ssm send-command --document-name AWS-RunShellScript \
     --targets Key=tag:aws:autoscaling:groupName,Values=openclaw-hosts-asg \
-    --parameters 'commands=[
-      "aws s3 cp s3://'${ASSETS_BUCKET}'/deployment/scripts/launch-vm.sh /home/ubuntu/launch-vm.sh",
-      "chmod +x /home/ubuntu/launch-vm.sh"
-    ]'
+    --parameters 'commands=["aws s3 cp s3://'${ASSETS_BUCKET}'/deployment/scripts/launch-vm.sh /home/ubuntu/launch-vm.sh","chmod +x /home/ubuntu/launch-vm.sh"]'
 ```
 
-**New audit log entries to monitor:**
+`init-host.sh` changes require replacing the host (UserData runs once). One at a time, zero-downtime: drain tenants off → terminate → ASG relaunches from the new Launch Template → wait `InService` → next.
 
-- `AZ_FAILOVER_RECOVERED_BY_VERIFY` — informational (verify probe rescued a launch)
-- `AZ_FAILOVER_SKIPPED_CONCURRENT` — informational (concurrent Lambda backed off)
-- `AZ_FAILOVER_TENANT_FAILED` — actionable (verify probe confirmed real failure)
-- `AZ_FAILOVER_NO_BACKUP` — actionable (tenant has no backup, refuse-to-fail-over)
+### Breaking changes
 
-**Summary buckets are now disjoint**: `tenants_failed_over`, `tenants_failed`, `tenants_blocked` are independent.
+Everything else is covered by `git pull && ./setup.sh`.
 
-<details>
-<summary><b>Older upgrade paths (v1.3.0 → v1.3.1, v1.2.9 → v1.3.0, v1.2.7 → v1.2.9)</b></summary>
+| Release | Change | Action |
+|---|---|---|
+| **v1.5.0** | Cognito id_token RS256 verification; microVM SSH → pubkey-only (shared password removed) | Deploy with Docker; rebuild rootfs + roll hosts for SSH (see below) |
+| **v1.3.4** | Dual-domain mode scopes the Cognito cookie to the console domain ([#61](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/61)) — opt-in | If adopting: two us-east-1 ACM certs + `--console-domain/--console-cert/--app-domain/--app-cert` |
+| **v1.3.0** | ASG default → 2 hosts / 2 AZs (AZ failover needs a target) | None, or set `asg.min_capacity: 1` / `multi_az.enabled: false` for single-AZ |
 
-For older upgrades, please refer to **[CHANGELOG.md](CHANGELOG.md)** which contains the per-version operator notes.
+**v1.5.0 details.** RBAC role-gating is opt-in (`console_auth.rbac_enabled: false` by default — `x-api-key` reads and writes unchanged, no Bearer needed). With `rbac_enabled: true`, writes require a valid Cognito id_token (`Authorization: Bearer …`); forged / `alg:none` / expired tokens fall back to `DEFAULT_NO_JWT_ROLE` (default `viewer`). The SSH change is data-plane — existing VMs keep the old password until their host is rolled:
 
-Quick references:
-
-- **v1.3.0 → v1.3.1**: 5 path-A integration bugs fixed. Re-roll `launch-vm.sh`. `__az_failover_state__` synthetic record now used for cooldown persistence.
-- **v1.2.9 → v1.3.0**: ASG `min_capacity` 1 → 2 (multi-AZ default). New IAM permissions for `health_check` Lambda.
-- **v1.2.7 → v1.2.9**: Multiple console + observability fixes. Existing hosts need re-rolling for the new `host-agent.py` (real CPU% / Memory metrics).
-
-</details>
+```bash
+source .env.deploy && ./scripts/build-rootfs-on-ec2.sh <rootfs_version> <arch>   # rootfs content tag (e.g. v1.1), not the product version
+```
 
 ---
 

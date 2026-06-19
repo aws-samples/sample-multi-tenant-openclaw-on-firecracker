@@ -43,6 +43,19 @@
   window.location.href = url;
 })();
 </script>
+<!-- Alpine component, split by domain (no build step). Each app.<domain>.js defines a window.ocXxx object; 
+     All must load before the deferred Alpine below, which calls app() at init. -->
+<script src="js/app.core.js"></script>
+<script src="js/app.tenants.js"></script>
+<script src="js/app.hosts.js"></script>
+<script src="js/app.migrations.js"></script>
+<script src="js/app.backups.js"></script>
+<script src="js/app.templates.js"></script>
+<script src="js/app.skills.js"></script>
+<script src="js/app.groups.js"></script>
+<script src="js/app.monitoring.js"></script>
+<script src="js/app.format.js"></script>
+<script src="js/app.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.9/dist/cdn.min.js" integrity="sha384-9Ax3MmS9AClxJyd5/zafcXXjxmwFhZCdsT6HJoJjarvCaAkJlk5QDzjLJm+Wdx5F" crossorigin="anonymous"></script>
 </head>
 <body x-data="app()" x-init="init()">
@@ -83,7 +96,7 @@
 <!-- Nav Tabs -->
 <div class="nav-tabs">
   <button class="nav-tab" :class="page==='tenants' && 'active'" @click="page='tenants'">Tenants</button>
-  <button class="nav-tab" :class="page==='app' && 'active'" @click="page='app'; loadAgentCoreTools()">Application</button>
+  <button class="nav-tab" :class="page==='app' && 'active'" @click="page='app'; loadAgentCoreTools()">Agent Config</button>
   <button class="nav-tab" :class="page==='monitoring' && 'active'" @click="page='monitoring'; loadSystemInfo()">Monitoring</button>
   <button class="nav-tab" :class="page==='backups' && 'active'" @click="page='backups'; loadBackups()">Backups</button>
   <button class="nav-tab" :class="page==='settings' && 'active'" @click="page='settings'; loadSystemInfo()">Settings</button>
@@ -167,13 +180,12 @@
         </div>
       </template>
 
-      <!-- Skills mini-panel -->
-      <div class="section-card mini-panel">
-        <span style="font-size:13px;color:var(--cyan)"><svg class="icon s14" style="vertical-align:-2px"><use href="#i-brain"/></svg> Shared Skills</span>
-        <span style="font-size:11px;color:var(--gray)" x-text="'('+skills.length+')'"></span>
-        <template x-for="s in skills" :key="s.id">
-          <span style="display:inline-block;margin:4px 4px 0 0;padding:2px 8px;border:1px solid var(--border);border-radius:10px;font-size:11px;color:var(--text)" x-text="s.name" :title="s.description"></span>
-        </template>
+      <!-- Skills mini-panel — counts only; per-tenant scoping is via Groups,
+           so don't flatten every skill here (it reads as "all tenants get all"). -->
+      <div class="section-card mini-panel" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <span style="font-size:13px;color:var(--cyan)"><svg class="icon s14" style="vertical-align:-2px"><use href="#i-brain"/></svg> <span x-text="skills.length"></span> shared skill(s)</span>
+        <span style="font-size:12px;color:var(--gray)">· scope per tenant with Skill Groups</span>
+        <a @click.prevent="page='app'" href="#" style="margin-left:auto;font-size:12px;color:var(--cyan)">Manage →</a>
       </div>
 
       <div class="panel-header">
@@ -205,19 +217,27 @@
         <table>
           <thead>
             <tr>
-              <th>ID</th><th>Name</th><th>Status</th><th>Tags</th><th>vCPU</th><th>Memory</th><th>Disk</th><th>Guest IP</th>
+              <th>ID</th><th>Name</th><th>Status</th><th>Group</th><th>Tags</th><th>vCPU</th><th>Memory</th><th>Disk</th><th>Guest IP</th>
               <th>Port</th><th>Rootfs</th><th>VM Health</th><th>Gateway</th><th>Actions</th>
             </tr>
           </thead>
           <tbody>
             <template x-if="filteredTenants.length === 0 && !loadingTenants">
-              <tr><td colspan="13" class="empty">No tenants</td></tr>
+              <tr><td colspan="14" class="empty">No tenants</td></tr>
             </template>
             <template x-for="t in filteredTenants" :key="t.id">
               <tr>
                 <td x-text="t.id"></td>
                 <td x-text="t.name || '-'"></td>
                 <td><span class="badge" :class="'badge-'+t.status" x-text="t.status"></span></td>
+                <td>
+                  <template x-if="t.group">
+                    <span class="tag-badge" x-text="t.group"></span>
+                  </template>
+                  <template x-if="!t.group">
+                    <span style="color:#445;font-size:11px" title="Broadcast — all skills">—</span>
+                  </template>
+                </td>
                 <td>
                   <template x-for="(v, k) in (t.tags || {})" :key="k">
                     <span class="tag-badge" x-text="k + ':' + v"></span>
@@ -287,7 +307,7 @@
 
 <!-- Page: App Config -->
 <div x-show="page==='app'" class="page-content">
-  <h2>⚙ Claw Configuration</h2>
+  <h2>⚙ Agent Configuration</h2>
 
   <!-- Config Templates -->
   <div class="section-card">
@@ -492,7 +512,7 @@
         </div>
       </div>
       <div>
-        <div style="font-size:11px;color:var(--gray)">Grafana (AMG)</div>
+        <div style="font-size:11px;color:var(--gray)">Grafana (AMG) Workspace</div>
         <div style="font-size:13px">
           <template x-if="systemInfo?.metrics?.grafana_url">
             <a :href="systemInfo.metrics.grafana_url" target="_blank" style="color:var(--cyan)">Open Grafana →</a>
@@ -514,6 +534,42 @@
       💡 To enable: set <code>metrics.enabled: true</code> in <code>config.yml</code> and redeploy.
       The stack will provision Amazon Managed Prometheus + Grafana, and ADOT collectors on each
       host start scraping in ~3 minutes after rollout.
+    </div>
+  </div>
+
+  <!-- Grafana → AMP data source config -->
+  <div class="section-card" x-show="systemInfo?.metrics?.amp_remote_write_url">
+    <h3>Grafana Data Source</h3>
+    <p style="color:var(--gray);font-size:13px">
+      In Grafana → <b>Connections → Data sources → Add data source → Prometheus</b>, fill in the values below.
+      The Grafana workspace's IAM role already has read access to AMP, so no static keys are needed.
+    </p>
+    <table style="margin-top:8px">
+      <tbody>
+        <tr>
+          <td style="white-space:nowrap"><code>Prometheus server URL</code></td>
+          <td style="font-family:monospace;word-break:break-all;color:var(--text)" x-text="ampQueryUrl()"></td>
+        </tr>
+        <tr>
+          <td><code>SigV4 auth</code></td>
+          <td><span class="text-green">On</span></td>
+        </tr>
+        <tr>
+          <td style="white-space:nowrap"><code>Authentication Provider</code></td>
+          <td><b>AWS SDK Default</b> <span style="color:var(--gray)">— "Workspace IAM Role" or "Access &amp; secret key" return 403</span></td>
+        </tr>
+        <tr>
+          <td><code>Default Region</code></td>
+          <td><span style="font-family:monospace;color:var(--text)" x-text="systemInfo?.region || '-'"></span></td>
+        </tr>
+      </tbody>
+    </table>
+    <div style="margin-top:10px;padding:8px 12px;background:#1a2332;border-radius:6px;font-size:12px;color:var(--gray)">
+      ⚠️ Use the <b>server URL</b> above (workspace root) — not the <code>remote_write</code> URL. Grafana appends <code>/api/v1/query</code> itself.
+    </div>
+    <!-- raw endpoint, for reference -->
+    <div style="margin-top:12px;font-size:12px;color:var(--gray);font-family:monospace;word-break:break-all">
+      <div><span style="color:var(--cyan-dim)">ADOT remote_write:</span> <span x-text="systemInfo?.metrics?.amp_remote_write_url || '-'"></span></div>
     </div>
   </div>
 
@@ -558,15 +614,6 @@
         <div style="font-size:11px;color:var(--cyan-dim);margin-bottom:2px">Tenants over 90% disk usage</div>
         <pre style="background:#0a0e17;border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:11px;color:var(--text);overflow-x:auto;margin:0">openclaw_vm_disk_used_pct &gt; 90</pre>
       </div>
-    </div>
-  </div>
-
-  <!-- AMP / Grafana wiring -->
-  <div class="section-card" x-show="systemInfo?.metrics?.amp_remote_write_url">
-    <h3>Endpoints</h3>
-    <div style="font-size:12px;color:var(--gray);font-family:monospace;word-break:break-all">
-      <div><span style="color:var(--cyan-dim)">AMP remote_write:</span> <span x-text="systemInfo?.metrics?.amp_remote_write_url || '-'"></span></div>
-      <div style="margin-top:4px"><span style="color:var(--cyan-dim)">Grafana:</span> <span x-text="systemInfo?.metrics?.grafana_url || '-'"></span></div>
     </div>
   </div>
 </div>
@@ -672,24 +719,16 @@
     </div>
   </div>
 
-  <!-- AgentCore -->
-  <div class="section-card" x-show="agentcoreStatus">
-    <h3>AgentCore</h3>
-    <div style="font-size:13px">
-      <span>Status: </span><span :class="agentcoreStatus.enabled ? 'text-green' : 'text-gray'" x-text="agentcoreStatus.enabled ? 'Enabled' : 'Disabled'"></span>
-      <template x-if="agentcoreStatus.gateway_url">
-        <div style="margin-top:4px;color:var(--gray)">Gateway: <span x-text="agentcoreStatus.gateway_url" style="font-size:11px"></span></div>
-      </template>
-    </div>
-  </div>
-
-  <!-- Infrastructure feature flags (issue: surface multi_az / metrics / waf / quotas / RBAC) -->
+  <!-- Infrastructure feature flags (issue: surface multi_az / metrics / waf / quotas / RBAC / agentcore) -->
   <div class="section-card" x-show="systemInfo">
     <h3><svg class="icon s14" style="vertical-align:-2px"><use href="#i-shield"/></svg> Infrastructure</h3>
     <p style="color:var(--gray);font-size:13px">Optional features and their current status. Toggle in <code>config.yml</code> and re-run <code>./setup.sh</code>.</p>
-    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-top:8px">
+    <!-- Fixed 4-col grid so Login (col4/row1) sits directly above RBAC
+         (col4/row2) — a related pair, top-over-bottom. Falls back to 2 cols
+         on narrow screens (the explicit col/row only apply at >=900px). -->
+    <div class="infra-grid">
       <!-- Multi-AZ -->
-      <div>
+      <div style="grid-column:3;grid-row:1">
         <div style="font-size:11px;color:var(--gray)">Multi-AZ HA</div>
         <div style="font-size:13px">
           <span :class="systemInfo?.multi_az?.enabled ? 'text-green' : 'text-gray'"
@@ -699,7 +738,7 @@
         </div>
       </div>
       <!-- Metrics / AMP -->
-      <div>
+      <div style="grid-column:2;grid-row:1">
         <div style="font-size:11px;color:var(--gray)">Prometheus + Grafana</div>
         <div style="font-size:13px">
           <span :class="systemInfo?.metrics?.enabled ? 'text-green' : 'text-gray'"
@@ -707,23 +746,32 @@
         </div>
       </div>
       <!-- WAF -->
-      <div>
+      <div style="grid-column:4;grid-row:2">
         <div style="font-size:11px;color:var(--gray)">AWS WAF</div>
         <div style="font-size:13px">
           <span :class="systemInfo?.waf?.enabled ? 'text-green' : 'text-gray'"
                 x-text="systemInfo?.waf?.enabled ? '● Enabled' : '○ Disabled'"></span>
         </div>
       </div>
-      <!-- Cognito / RBAC -->
-      <div>
-        <div style="font-size:11px;color:var(--gray)">Cognito + RBAC</div>
+      <!-- Console Login + RBAC — two independent switches (1.5.4). Kept as
+           separate grid cells (like every other flag) but pinned to the same
+           column, consecutive rows, so the related pair reads top-over-bottom. -->
+      <div style="grid-column:1;grid-row:1">
+        <div style="font-size:11px;color:var(--gray)">Console Login (Cognito)</div>
         <div style="font-size:13px">
           <span :class="systemInfo?.cognito?.enabled ? 'text-green' : 'text-gray'"
-                x-text="systemInfo?.cognito?.enabled ? '● Enabled (admin/operator/viewer)' : '○ API key only'"></span>
+                x-text="systemInfo?.cognito?.enabled ? '● Enabled' : '○ API key only'"></span>
+        </div>
+      </div>
+      <div style="grid-column:1;grid-row:2">
+        <div style="font-size:11px;color:var(--gray)">RBAC (role-gating)</div>
+        <div style="font-size:13px">
+          <span :class="systemInfo?.cognito?.rbac_enabled ? 'text-green' : 'text-gray'"
+                x-text="systemInfo?.cognito?.rbac_enabled ? '● Enabled' : '○ Disabled'"></span>
         </div>
       </div>
       <!-- Notifications -->
-      <div>
+      <div style="grid-column:2;grid-row:2">
         <div style="font-size:11px;color:var(--gray)">SNS Lifecycle Events</div>
         <div style="font-size:13px">
           <span :class="systemInfo?.notifications?.enabled ? 'text-green' : 'text-gray'"
@@ -731,7 +779,7 @@
         </div>
       </div>
       <!-- Quotas -->
-      <div>
+      <div style="grid-column:3;grid-row:2">
         <div style="font-size:11px;color:var(--gray)">Per-tenant Quotas</div>
         <div style="font-size:13px">
           <span :class="systemInfo?.quotas?.enabled ? 'text-green' : 'text-gray'"
@@ -739,6 +787,17 @@
         </div>
         <div x-show="systemInfo?.quotas?.enabled" style="font-size:11px;color:var(--gray);margin-top:2px">
           <span x-text="'vCPU: ' + (systemInfo?.quotas?.max_vcpu_per_tenant || 0) + ', Mem: ' + (systemInfo?.quotas?.max_mem_mb_per_tenant || 0) + 'MB, Disk: ' + (systemInfo?.quotas?.max_data_disk_mb || 0) + 'MB'"></span>
+        </div>
+      </div>
+      <!-- AgentCore -->
+      <div style="grid-column:4;grid-row:1">
+        <div style="font-size:11px;color:var(--gray)">AgentCore</div>
+        <div style="font-size:13px">
+          <span :class="agentcoreStatus?.enabled ? 'text-green' : 'text-gray'"
+                x-text="agentcoreStatus?.enabled ? '● Enabled' : '○ Disabled'"></span>
+        </div>
+        <div x-show="agentcoreStatus?.gateway_url" style="font-size:11px;color:var(--gray);margin-top:2px;word-break:break-all">
+          <span x-text="'Gateway: ' + (agentcoreStatus?.gateway_url || '')"></span>
         </div>
       </div>
     </div>
@@ -795,8 +854,8 @@
 <!-- Create / Restore Tenant Modal (global — not nested in any tab so it's visible from Tenants and Backups) -->
 <!-- 1.4.1 (#63) — Skill upload modal -->
 <template x-if="showSkillUpload">
-  <div class="modal-overlay" @click.self="showSkillUpload=false">
-    <div class="modal" style="max-width:720px">
+  <div class="overlay" @click.self="showSkillUpload=false">
+    <div class="modal" style="width:680px">
       <h3>Upload New Skill</h3>
       <div class="form-row">
         <label>Name</label>
@@ -822,8 +881,8 @@
 
 <!-- 1.4.1 (#63) — Group create modal -->
 <template x-if="showGroupModal">
-  <div class="modal-overlay" @click.self="showGroupModal=false">
-    <div class="modal" style="max-width:560px">
+  <div class="overlay" @click.self="showGroupModal=false">
+    <div class="modal">
       <h3>Create Skill Group</h3>
       <div class="form-row">
         <label>Name</label>
@@ -890,6 +949,13 @@
           <option :value="t.name" x-text="t.name"></option>
         </template>
       </select>
+      <label>Skill Group <span class="opt">optional — scopes which skills this tenant gets</span></label>
+      <select x-model="form.group" class="settings-input">
+        <option value="">All skills (broadcast — no scoping)</option>
+        <template x-for="g in groups" :key="g.name">
+          <option :value="g.name" x-text="g.name + ' — ' + (g.skills||[]).length + ' skill(s)'"></option>
+        </template>
+      </select>
       <label>Target host <span class="opt">optional — admin/operator only</span></label>
       <select x-model="form.preferred_host_id" class="settings-input" style="margin-bottom:14px">
         <option value="">Auto (scheduler picks first host with capacity)</option>
@@ -949,585 +1015,6 @@
   </div>
 </template>
 
-<script>
-function app() {
-  return {
-    apiUrl: '', apiKey: '', connected: false, toast: '',
-    page: 'tenants',
-    showApiKey: false,
-    saving: false,
-    hosts: [], tenants: [], selectedHost: null, rootfsVersion: '',
-    loadingHosts: false, loadingTenants: false,
-    showModal: false,
-    skills: [], templates: [],
-    editTpl: null,
-    // 1.4.1 (#63) — Console skills CRUD state
-    expandedSkill: null,         // skill name whose preview/edit panel is open
-    skillEditMode: false,        // true = textarea editor visible, false = preview only
-    skillContent: '',            // current SKILL.md content in the editor
-    skillSaving: false,          // disables save button during PUT
-    showSkillUpload: false,      // upload modal visibility
-    skillUploadForm: { name: '', content: '# New Skill\n\nDescribe what this skill does.\n' },
-    // 1.4.0 (#62) / 1.4.1 (#63) — Groups CRUD state
-    groups: [],
-    showGroupModal: false,
-    groupForm: { name: '', description: '', skills_text: '' },
-    expandedGroup: null,         // group name whose skills picker is open
-    addSkillToGroupName: '',     // skill name being typed into the picker
-    agentcoreStatus: { enabled: false }, agentcoreRegion: 'ap-northeast-1',
-    form: { name: '', vcpu: null, memory_mb: null, config_template: '', preferred_host_id: '', tags_text: '' },
-    backups: [], backupFilter: 'all', loadingBackups: false,
-    expandedGroups: new Set(),   // tenant_ids whose history rows are expanded
-    restoreSource: null,   // set when modal opened from Backups tab; null = normal create
-    statusFilter: 'all',   // filter for tenants list
-    tagFilter: '',         // filter expression: "k1:v1,k2:v2" — AND across pairs
-
-    // v1.2.8 — surfaces for features that already had an API but no UI.
-    agentcoreTools: [],   // populated when Application tab is opened (and AgentCore enabled)
-    systemInfo: null,     // populated when Monitoring/Settings tab is opened
-    migrateSource: null,  // tenant being migrated; modal opens when truthy
-    migrateTarget: '',    // selected target host_id
-
-    init() {
-      this.apiUrl = localStorage.getItem('oc_api_url') || window.OC_DEFAULT_API_URL || '';
-      this.apiKey = localStorage.getItem('oc_api_key') || window.OC_DEFAULT_API_KEY || '';
-      if (this.apiUrl && this.apiKey) this.refresh();
-    },
-    saveSettings() {
-      localStorage.setItem('oc_api_url', this.apiUrl);
-      localStorage.setItem('oc_api_key', this.apiKey);
-    },
-    async api(method, path, body) {
-      const url = this.apiUrl.replace(/\/+$/, '') + '/' + path.replace(/^\/+/, '');
-      const headers = { 'x-api-key': this.apiKey, 'Content-Type': 'application/json' };
-      // 1.5.0: the API Lambda verifies a Cognito id_token's signature and reads cognito:groups for RBAC. 
-      // Without this header every write is downgraded to viewer and 403s.
-      const token = localStorage.getItem('oc_id_token');
-      if (token) headers['Authorization'] = 'Bearer ' + token;
-      const opts = { method, headers };
-      if (body) opts.body = JSON.stringify(body);
-      const r = await fetch(url, opts);
-      this.connected = r.ok;
-      return r.json();
-    },
-    async refresh() {
-      await Promise.all([this.loadHosts(), this.loadTenants(), this.loadTemplates(), this.loadSystemInfo()]);
-    },
-    async loadHosts() {
-      if (!this.apiUrl || !this.apiKey) return;
-      this.loadingHosts = true;
-      try { this.hosts = await this.api('GET', 'hosts'); this.connected = true; }
-      catch { this.connected = false; }
-      this.loadingHosts = false;
-      try { this.rootfsVersion = (await this.api('GET', 'hosts/rootfs-version')).version; } catch {}
-      try { this.agentcoreStatus = await this.api('GET', 'agentcore/status'); } catch {}
-      // Load skills + groups (v1.4.0/1.4.1)
-      this.loadSkills();
-      this.loadGroups();
-    },
-    async loadTenants() {
-      if (!this.apiUrl || !this.apiKey) return;
-      this.loadingTenants = true;
-      try { this.tenants = await this.api('GET', 'tenants'); this.connected = true; }
-      catch { this.connected = false; }
-      this.loadingTenants = false;
-    },
-    // Mirror of API _NAME_RE in deploy/lambda/api/handler.py — keep in sync.
-    get nameError() {
-      const n = (this.form.name || '').trim();
-      if (!n) return '';
-      if (n.length > 32) return 'Name exceeds 32 characters';
-      if (!/^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$/.test(n)) {
-        return 'Name must be lowercase letters, digits, or hyphens (no leading/trailing hyphen)';
-      }
-      return '';
-    },
-    async createTenant() {
-      if (!this.form.name || this.nameError) return;
-      const body = { name: this.form.name };
-      if (this.form.vcpu) body.vcpu = this.form.vcpu;
-      if (this.form.memory_mb) body.mem_mb = this.form.memory_mb;
-      if (this.form.config_template) body.config_template = this.form.config_template;
-      if (this.form.preferred_host_id) body.preferred_host_id = this.form.preferred_host_id;
-      // Parse tags from textarea — supports "key:value" per line, also comma-separated.
-      const tags = this.parseTagsInput(this.form.tags_text);
-      if (Object.keys(tags).length > 0) body.tags = tags;
-      if (this.restoreSource) {
-        body.restore_from = {
-          tenant_id: this.restoreSource.tenant_id,
-          timestamp: this.restoreSource.timestamp,
-        };
-      }
-      const r = await this.api('POST', 'tenants', body);
-      if (r && r.error) {
-        this.toast = '✗ ' + r.error;
-        setTimeout(() => this.toast = '', 4000);
-        return;
-      }
-      const wasRestore = !!this.restoreSource;
-      this.closeCreateModal();
-      if (wasRestore) {
-        this.page = 'tenants';    // jump to Tenants tab to watch the new VM come up
-      }
-      this.loadTenants();
-    },
-    closeCreateModal() {
-      this.showModal = false;
-      this.restoreSource = null;
-      this.form = { name: '', vcpu: null, memory_mb: null, config_template: '', preferred_host_id: '', tags_text: '' };
-    },
-    parseTagsInput(text) {
-      // Accepts "key:value" pairs separated by newline or comma. Empty → {}.
-      const tags = {};
-      if (!text) return tags;
-      const parts = text.split(/[\n,]/).map(s => s.trim()).filter(Boolean);
-      for (const p of parts) {
-        const idx = p.indexOf(':');
-        if (idx <= 0) continue;
-        const k = p.slice(0, idx).trim();
-        const v = p.slice(idx + 1).trim();
-        if (k && v) tags[k] = v;
-      }
-      return tags;
-    },
-    async loadBackups() {
-      if (!this.apiUrl || !this.apiKey) return;
-      this.loadingBackups = true;
-      try { this.backups = await this.api('GET', 'backups'); this.connected = true; }
-      catch { this.connected = false; this.backups = []; }
-      this.loadingBackups = false;
-    },
-    openRestore(backup) {
-      this.restoreSource = backup;
-      this.form = {
-        name: (backup.tenant_name || backup.tenant_id) + '-restored',
-        vcpu: null, memory_mb: null, config_template: '',
-      };
-      this.showModal = true;
-    },
-    formatTs(ts) {
-      if (!ts) return '-';
-      // API returns ISO 8601 like "2026-04-27T19:00:39Z"
-      const d = new Date(ts);
-      return isNaN(d) ? ts : d.toLocaleString();
-    },
-    formatBytes(n) {
-      if (!n) return '-';
-      const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-      let i = 0;
-      while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
-      return n.toFixed(i ? 1 : 0) + ' ' + units[i];
-    },
-    get filteredBackups() {
-      if (this.backupFilter === 'orphan') return this.backups.filter(b => !b.tenant_exists);
-      return this.backups;
-    },
-    get backupGroups() {
-      // Group by tenant_id, sort groups so most recently backed-up tenant is at top.
-      const groups = new Map();
-      for (const b of this.filteredBackups) {
-        if (!groups.has(b.tenant_id)) {
-          groups.set(b.tenant_id, {
-            tenant_id: b.tenant_id,
-            tenant_name: b.tenant_name,
-            tenant_exists: b.tenant_exists,
-            backups: [],
-          });
-        }
-        groups.get(b.tenant_id).backups.push(b);
-      }
-      return [...groups.values()].sort((a, b) =>
-        a.backups[0].last_modified.localeCompare(b.backups[0].last_modified)
-      );
-    },
-    toggleGroup(tenantId) {
-      // Reassign to a new Set so Alpine's reactivity picks up the change.
-      const s = new Set(this.expandedGroups);
-      if (s.has(tenantId)) s.delete(tenantId); else s.add(tenantId);
-      this.expandedGroups = s;
-    },
-    async loadTemplates() {
-      try { const r = await this.api('GET', 'templates'); this.templates = r.templates || []; } catch {}
-    },
-    async saveTemplate() {
-      if (!this.editTpl?.name) return;
-      try {
-        const content = JSON.parse(this.editTpl.content);
-        await this.api('PUT', 'templates/' + this.editTpl.name, content);
-        this.editTpl = null; this.loadTemplates();
-      } catch (e) { alert('Invalid JSON: ' + e.message); }
-    },
-    async deleteTemplate(name) {
-      if (!confirm('Delete template "' + name + '"?')) return;
-      await this.api('DELETE', 'templates/' + name);
-      this.loadTemplates();
-    },
-    async deleteTenant(id) {
-      if (!confirm('Delete tenant ' + id + '?')) return;
-      await this.api('DELETE', 'tenants/' + id);
-      this.loadTenants();
-    },
-    async tenantAction(id, action) {
-      this.toast = action + '…';
-      await this.api('POST', 'tenants/' + id + '/' + action);
-      this.toast = '✓ ' + action;
-      setTimeout(() => this.toast = '', 2000);
-      this.loadTenants();
-    },
-    // v1.2.8 — host AZ lookup for the new "AZ" column in the tenants table.
-    hostAz(host_id) {
-      if (!host_id) return '';
-      const h = this.hosts.find(h => h.instance_id === host_id);
-      return h ? (h.az || '') : '';
-    },
-    // v1.2.8 — Migrate flow. API: POST /tenants/{id}/migrate {target_host_id}.
-    openMigrate(t) {
-      this.migrateSource = t;
-      this.migrateTarget = '';
-    },
-    availableMigrationTargets() {
-      // Active hosts that aren't the source's current host.
-      if (!this.migrateSource) return [];
-      return this.hosts.filter(h =>
-        h.status === 'active' && h.instance_id !== this.migrateSource.host_id
-      );
-    },
-    async migrateTenant() {
-      if (!this.migrateSource || !this.migrateTarget) return;
-      const id = this.migrateSource.id;
-      const r = await this.api('POST', 'tenants/' + id + '/migrate',
-        { target_host_id: this.migrateTarget });
-      if (r && r.error) {
-        this.toast = '✗ ' + r.error;
-        setTimeout(() => this.toast = '', 4000);
-        return;
-      }
-      this.toast = '✓ migrating ' + id;
-      setTimeout(() => this.toast = '', 3000);
-      this.migrateSource = null;
-      this.migrateTarget = '';
-      this.loadTenants();
-    },
-    // v1.2.8 — Application tab: list MCP tools registered on AgentCore Gateway.
-    async loadAgentCoreTools() {
-      if (!this.apiUrl || !this.apiKey) return;
-      try {
-        const r = await this.api('GET', 'agentcore/tools');
-        this.agentcoreTools = (r && r.tools) || [];
-      } catch {
-        this.agentcoreTools = [];
-      }
-    },
-    // v1.2.8/9 — Monitoring + Settings tabs: feature flags + grafana url
-    // + a fresh hosts snapshot so the Fleet-by-AZ table has up-to-date data.
-    async loadSystemInfo() {
-      if (!this.apiUrl || !this.apiKey) return;
-      try {
-        this.systemInfo = await this.api('GET', 'system/info');
-      } catch {
-        this.systemInfo = null;
-      }
-      // Refresh hosts so groupedHosts / fleetByAz reflect any new hosts that
-      // came up since the user last opened the Tenants tab.
-      this.loadHosts();
-    },
-    // v1.2.8 — link to the S3 console at this skill's prefix so operators
-    // can edit/upload the SKILL.md without leaving the browser.
-    skillS3Url(skill) {
-      // Use the deployed bucket name + region from the .env.deploy-injected globals.
-      // Falls back to the AWS console list page when we can't compute the deep link.
-      const region = (this.systemInfo?.region) || (window.OC_REGION || 'us-east-1');
-      const bucket = (this.systemInfo?.assets_bucket) || window.OC_ASSETS_BUCKET || '';
-      if (bucket && skill?.id) {
-        return `https://${region}.console.aws.amazon.com/s3/buckets/${bucket}?prefix=skills/${skill.id}/&region=${region}`;
-      }
-      return 'https://s3.console.aws.amazon.com/s3/home';
-    },
-
-    // ===== 1.4.1 (#63) — Skill CRUD =====
-    async loadSkills() {
-      try {
-        const sk = await this.api('GET', 'skills');
-        this.skills = sk.skills || [];
-      } catch {}
-    },
-    renderMd(text) {
-      // Use Marked if loaded, otherwise just escape and show as <pre>
-      if (window.marked) return window.marked.parse(text || '');
-      const esc = (text || '').replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
-      return `<pre style="white-space:pre-wrap">${esc}</pre>`;
-    },
-    async toggleSkill(name) {
-      if (this.expandedSkill === name) {
-        this.expandedSkill = null;
-        this.skillEditMode = false;
-        this.skillContent = '';
-        return;
-      }
-      this.expandedSkill = name;
-      this.skillEditMode = false;
-      try {
-        const r = await this.api('GET', 'skills/' + encodeURIComponent(name));
-        this.skillContent = r.content || '';
-      } catch (e) {
-        this.toast = '✗ Load failed: ' + (e.message || e);
-        setTimeout(() => this.toast = '', 4000);
-        this.expandedSkill = null;
-      }
-    },
-    async saveSkill(name) {
-      if (this.skillSaving) return;
-      // Quick client-side sanity — server enforces this too but fail fast in UI.
-      const hasH1 = this.skillContent.split('\n').some(ln => /^\s*#\s+\S/.test(ln));
-      if (!hasH1) {
-        this.toast = '✗ SKILL.md must have a top-level "# Title" line';
-        setTimeout(() => this.toast = '', 4000);
-        return;
-      }
-      this.skillSaving = true;
-      try {
-        const r = await this.api('PUT', 'skills/' + encodeURIComponent(name), { content: this.skillContent });
-        if (r.error) throw new Error(r.error);
-        this.toast = '✓ Saved ' + name;
-        this.skillEditMode = false;
-        await this.loadSkills();
-      } catch (e) {
-        this.toast = '✗ Save failed: ' + (e.message || e);
-      }
-      this.skillSaving = false;
-      setTimeout(() => this.toast = '', 3000);
-    },
-    async deleteSkill(name) {
-      if (!confirm(`Delete skill "${name}"?\n\nThis removes the entire s3://${this.systemInfo?.assets_bucket || '<bucket>'}/skills/${name}/ prefix and is not reversible.`)) return;
-      try {
-        const r = await this.api('DELETE', 'skills/' + encodeURIComponent(name));
-        if (r.error) throw new Error(r.error);
-        this.toast = '✓ Deleted ' + name;
-        if (this.expandedSkill === name) this.expandedSkill = null;
-        await this.loadSkills();
-      } catch (e) {
-        this.toast = '✗ Delete failed: ' + (e.message || e);
-      }
-      setTimeout(() => this.toast = '', 3000);
-    },
-    async uploadSkill() {
-      const name = (this.skillUploadForm.name || '').trim();
-      if (!/^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$/.test(name)) {
-        this.toast = '✗ Invalid skill name (lowercase letters, digits, hyphens; 1-64 chars)';
-        setTimeout(() => this.toast = '', 4000);
-        return;
-      }
-      try {
-        const r = await this.api('PUT', 'skills/' + encodeURIComponent(name), { content: this.skillUploadForm.content });
-        if (r.error) throw new Error(r.error);
-        this.toast = '✓ Uploaded ' + name;
-        this.showSkillUpload = false;
-        this.skillUploadForm = { name: '', content: '# New Skill\n\nDescribe what this skill does.\n' };
-        await this.loadSkills();
-      } catch (e) {
-        this.toast = '✗ Upload failed: ' + (e.message || e);
-      }
-      setTimeout(() => this.toast = '', 3000);
-    },
-
-    // ===== 1.4.1 (#63) — Groups CRUD (uses v1.4.0 endpoints) =====
-    async loadGroups() {
-      try {
-        const r = await this.api('GET', 'groups');
-        this.groups = r.groups || [];
-      } catch {}
-    },
-    async createGroup() {
-      const name = (this.groupForm.name || '').trim();
-      if (!/^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$/.test(name)) {
-        this.toast = '✗ Invalid group name (same rules as tenant name)';
-        setTimeout(() => this.toast = '', 4000);
-        return;
-      }
-      const skills = (this.groupForm.skills_text || '')
-        .split(',').map(s => s.trim()).filter(Boolean);
-      try {
-        const r = await this.api('POST', 'groups', {
-          name, description: this.groupForm.description || '', skills,
-        });
-        if (r.error) throw new Error(r.error);
-        this.toast = '✓ Created group ' + name;
-        this.showGroupModal = false;
-        this.groupForm = { name: '', description: '', skills_text: '' };
-        await this.loadGroups();
-      } catch (e) {
-        this.toast = '✗ Create failed: ' + (e.message || e);
-      }
-      setTimeout(() => this.toast = '', 3000);
-    },
-    async addSkillToGroup(groupName) {
-      const sk = (this.addSkillToGroupName || '').trim();
-      if (!sk) return;
-      try {
-        const r = await this.api('POST', `groups/${encodeURIComponent(groupName)}/skills`, { skill: sk });
-        if (r.error) throw new Error(r.error);
-        this.addSkillToGroupName = '';
-        await this.loadGroups();
-      } catch (e) {
-        this.toast = '✗ Add failed: ' + (e.message || e);
-        setTimeout(() => this.toast = '', 3000);
-      }
-    },
-    async removeSkillFromGroup(groupName, skill) {
-      if (!confirm(`Remove "${skill}" from group "${groupName}"?`)) return;
-      try {
-        await this.api('DELETE', `groups/${encodeURIComponent(groupName)}/skills/${encodeURIComponent(skill)}`);
-        await this.loadGroups();
-      } catch (e) {
-        this.toast = '✗ Remove failed: ' + (e.message || e);
-        setTimeout(() => this.toast = '', 3000);
-      }
-    },
-    async refreshRootfs() {
-      if (!confirm('Pull latest rootfs to all hosts?')) return;
-      this.toast = 'refresh-rootfs…';
-      await this.api('POST', 'hosts/refresh-rootfs');
-      this.toast = '✓ refresh-rootfs sent';
-      setTimeout(() => this.toast = '', 3000);
-    },
-    copyCmd(cmd) {
-      navigator.clipboard.writeText(cmd);
-      this.toast = '✓ Copied: ' + cmd;
-      setTimeout(() => this.toast = '', 2000);
-    },
-    cpuPct(h) {
-      const ratio = h.cpu_overcommit_ratio || 1;
-      const allocatable = h.total_vcpu * ratio;
-      return allocatable ? Math.min(100, Math.round(h.used_vcpu / allocatable * 100)) : 0;
-    },
-    cpuBarClass(h) {
-      return h.used_vcpu > h.total_vcpu ? 'bar-cpu-over' : 'bar-cpu';
-    },
-    memPct(h) {
-      const ratio = h.mem_overcommit_ratio || 1;
-      const allocatable = h.total_mem_mb * ratio;
-      return allocatable ? Math.min(100, Math.round(h.used_mem_mb / allocatable * 100)) : 0;
-    },
-    memBarClass(h) {
-      return h.used_mem_mb > h.total_mem_mb ? 'bar-mem-over' : 'bar-mem';
-    },
-    healthClass(v, status) {
-      // Only running tenants have meaningful live health; others show grey.
-      if (status && status !== 'running') return 'health-unknown';
-      return v === 'up' ? 'health-up' : v === 'down' ? 'health-down' : 'health-unknown';
-    },
-    // 1.2.9 — host-agent now samples cpu_pct from /proc/<fc_pid>/stat
-    // and memory_used_mb from VmRSS (the previous balloon-stats path was
-    // unreliable: available_memory often returned 0). All three metrics
-    // are now meaningful — DDB returns Number attributes as strings so
-    // we coerce here.
-    _n(v) { return Number(v) || 0; },
-    metricLevel(pct) {
-      return pct >= 90 ? 'metric-crit' : pct >= 70 ? 'metric-warn' : 'metric-ok';
-    },
-    diskText(t) {
-      const m = t.metrics;
-      if (!m) return '';
-      const fmt = mb => mb >= 1024 ? (mb/1024).toFixed(1)+'G' : mb+'M';
-      const used = this._n(m.disk_used_mb);
-      const total = this._n(m.disk_total_mb);
-      const pct = this._n(m.disk_used_pct);
-      return `${fmt(used)}/${fmt(total)} (${pct}%)`;
-    },
-    cpuText(t) {
-      // "12% / 2 vCPU" — pct is of the allocated vcpu count; show the
-      // raw vcpu allocation for context so 50% on 1 vcpu vs 2 vcpu reads right.
-      const pct = this._n(t.metrics?.cpu_pct);
-      return `${pct}% / ${t.vcpu} vCPU`;
-    },
-    memText(t) {
-      // "1.2G/4G (30%)" — used is from VmRSS; total is the configured mem_mb.
-      const used = this._n(t.metrics?.memory_used_mb);
-      const total = this._n(t.mem_mb);
-      const pct = total > 0 ? Math.min(100, Math.round((used / total) * 100)) : 0;
-      const fmt = mb => mb >= 1024 ? (mb / 1024).toFixed(1) + 'G' : mb + 'M';
-      return `${fmt(used)}/${fmt(total)} (${pct}%)`;
-    },
-    memPctOfTenant(t) {
-      const used = this._n(t.metrics?.memory_used_mb);
-      const total = this._n(t.mem_mb);
-      return total > 0 ? Math.min(100, Math.round((used / total) * 100)) : 0;
-    },
-    role() {
-      // RBAC (issue #14): inspect the JWT id_token, return the most-privileged
-      // group name. No JWT (e.g. when console_auth.enabled: false) → admin.
-      var token = localStorage.getItem('oc_id_token');
-      if (!token) return 'admin';
-      try {
-        var p = JSON.parse(atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
-        var groups = p['cognito:groups'] || [];
-        if (typeof groups === 'string') groups = [groups];
-        var rank = { viewer: 0, operator: 1, admin: 2 };
-        var best = null, bestRank = -1;
-        groups.forEach(function(g) {
-          if (rank[g] !== undefined && rank[g] > bestRank) { best = g; bestRank = rank[g]; }
-        });
-        return best || 'viewer';
-      } catch (e) { return 'viewer'; }
-    },
-    canWrite() { return this.role() !== 'viewer'; },
-    get filteredTenants() {
-      let list = this.tenants;
-      if (this.selectedHost) list = list.filter(t => t.host_id === this.selectedHost);
-      if (this.statusFilter !== 'all') list = list.filter(t => t.status === this.statusFilter);
-      const tagPairs = this.parseTagsInput(this.tagFilter);
-      const required = Object.entries(tagPairs);
-      if (required.length) {
-        list = list.filter(t => {
-          const tags = t.tags || {};
-          return required.every(([k, v]) => tags[k] === v);
-        });
-      }
-      return list;
-    },
-    get tenantStatuses() {
-      return [...new Set(this.tenants.map(t => t.status).filter(Boolean))].sort();
-    },
-    // 1.2.9 — group hosts by AZ when multi_az is enabled, otherwise return
-    // a single un-titled group so the existing flat layout still works.
-    // Sorted alphabetically by AZ for stable rendering.
-    get groupedHosts() {
-      const multiAz = !!(this.systemInfo?.multi_az?.enabled);
-      if (!multiAz) return [{ az: null, hosts: this.hosts }];
-      const groups = new Map();
-      for (const h of this.hosts) {
-        const az = h.az || '(no az)';
-        if (!groups.has(az)) groups.set(az, []);
-        groups.get(az).push(h);
-      }
-      return [...groups.keys()].sort().map(az => ({ az, hosts: groups.get(az) }));
-    },
-    // 1.2.9 — Fleet by AZ summary for Settings: counts/aggregates per AZ.
-    get fleetByAz() {
-      const groups = new Map();
-      for (const h of this.hosts) {
-        const az = h.az || '(no az)';
-        if (!groups.has(az)) {
-          groups.set(az, { az, hosts: 0, vms: 0, vcpu_used: 0, vcpu_total: 0 });
-        }
-        const g = groups.get(az);
-        g.hosts++;
-        g.vms += this._n(h.vm_count);
-        g.vcpu_used += this._n(h.used_vcpu);
-        g.vcpu_total += this._n(h.total_vcpu);
-      }
-      return [...groups.values()].sort((a, b) => a.az.localeCompare(b.az));
-    },
-    // 1.2.9 — for the create-tenant modal's preferred-host picker. Lists
-    // active hosts with their az + remaining capacity. Sorted by az.
-    availableHostsForCreate() {
-      return this.hosts
-        .filter(h => h.status === 'active' || h.status === 'idle')
-        .sort((a, b) => (a.az || '').localeCompare(b.az || ''));
-    },
-  };
-}
-</script>
 <div class="toast" x-show="toast" x-transition x-text="toast"></div>
 <footer class="footer" x-data>
   <span>Version</span> <span x-text="'v' + (window.OC_VERSION || 'dev')"></span>

@@ -132,9 +132,24 @@ tr:hover td { background: #0ff1; }
 
 /* Modal */
 .overlay { position: fixed; inset: 0; background: #000a; display: flex; align-items: center; justify-content: center; z-index: 50; }
+/* Infrastructure feature-flag grid: fixed 4 columns with explicit item
+   placement (so Login sits directly above RBAC). Collapses to 2 columns on
+   narrow viewports, where explicit grid-column/grid-row are ignored and items
+   flow in DOM order. align-items:start keeps cells top-aligned. */
+.infra-grid {
+  display: grid; gap: 14px; margin-top: 8px; align-items: start;
+  grid-template-columns: repeat(4, 1fr);
+}
+@media (max-width: 900px) {
+  .infra-grid { grid-template-columns: repeat(2, 1fr); }
+  .infra-grid > div { grid-column: auto !important; grid-row: auto !important; }
+}
+
 .modal {
   background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
-  padding: 24px; width: 380px; position: relative;
+  /* Default fits most forms; modals needing a wider editor (e.g. JSON/SKILL.md)
+     override with an inline width. max-width keeps it on-screen when narrow. */
+  padding: 24px; width: 560px; max-width: 92vw; position: relative;
 }
 .modal h2 { font-size: 18px; color: #fff; margin-bottom: 20px; }
 .modal label { display: block; font-size: 12px; margin-bottom: 4px; color: #8899aa; }

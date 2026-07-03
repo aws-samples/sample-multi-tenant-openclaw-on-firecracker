@@ -1,0 +1,30 @@
+#!/bin/bash
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+# 启动 OpenClaw Management Console
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PORT="${1:-8080}"
+
+# 从 .env.deploy 生成 config.js
+ENV_FILE="$SCRIPT_DIR/.env.deploy"
+CONFIG_JS="$SCRIPT_DIR/console/config.js"
+if [ -f "$ENV_FILE" ]; then
+  source "$ENV_FILE"
+  VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('$SCRIPT_DIR/pyproject.toml','rb'))['project']['version'])" 2>/dev/null || echo "dev")
+  cat > "$CONFIG_JS" << EOF
+window.OC_DEFAULT_API_URL = "${API_URL:-}";
+window.OC_DEFAULT_API_KEY = "${API_KEY:-}";
+window.OC_DASHBOARD_BASE = "${DASHBOARD_URL:-}";
+window.OC_VERSION = "${VERSION}";
+EOF
+  echo "✓ 已从 .env.deploy 加载配置"
+else
+  echo '// no .env.deploy found' > "$CONFIG_JS"
+  echo "⚠ 未找到 .env.deploy，需手动输入 API URL 和 Key"
+fi
+
+echo "→ OpenClaw Console: http://localhost:${PORT}"
+cd "$SCRIPT_DIR/console"
+python3 -m http.server "$PORT"

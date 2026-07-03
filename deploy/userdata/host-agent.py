@@ -1,0 +1,1122 @@
+#!/usr/bin/env python3
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+"""OpenClaw Host Agent — probes local VMs and writes health status to DynamoDB.
+Replaces per-tenant SSM health checks. Runs as systemd service on each host.
+"""
+
+import json
+import os
+import subprocess
+import threading
+import time
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+import boto3
+from botocore.config import Config as BotoConfig
+
+POLL_INTERVAL = int(os.environ.get("OC_AGENT_POLL_INTERVAL", "15"))
+PORT = int(os.environ.get("OC_AGENT_PORT", "8899"))
+# Health/control AND Prometheus /metrics are served by the SAME HTTPServer
+# on PORT (8899). The earlier OC_AGENT_PROM_PORT=9090 split-port design was
+# never wired into main(), causing the ADOT collector to fail every scrape
+# (issue #4 regression, fixed in 1.2.5).
+VM_DIR = "/data/firecracker-vms"
+GATEWAY_PORT = 18789
+TENANTS_TABLE = os.environ.get("TENANTS_TABLE", "")
+# Since 1.3.0: host-agent also writes a heartbeat to the hosts table so the
+# health_check Lambda can do AZ-level failover (it needs to know which hosts
+# are still alive at the host level, not just whether their tenants reported).
+HOSTS_TABLE = os.environ.get("HOSTS_TABLE", "")
+INSTANCE_ID = os.environ.get("INSTANCE_ID", "")
+
+
+# ═══════════════════════════════════════════
+# Prometheus exporter (issue #4)
+# ═══════════════════════════════════════════
+#
+# Exposes a /metrics endpoint in Prom text-exposition format on the same
+# HTTPServer (and therefore the same PORT, 8899) as /health, to avoid a
+# second listener. An ADOT collector running as a sibling systemd service
+# scrapes 127.0.0.1:8899/metrics and remote-writes to AMP.
+#
+# Why text-format and not the prometheus_client library?
+# - We already have BaseHTTPRequestHandler. Adding prometheus_client just for
+#   text rendering pulls in a dependency tree we don't otherwise need.
+# - The exposition format is stable and trivially correct to emit by hand.
+# - Pure function (input dict → string) is testable without a live server.
+
+_PROM_GAUGES = (
+    (
+        "openclaw_vm_memory_used_mb",
+        "Per-VM memory in active use (MB)",
+        "memory_used_mb",
+    ),
+    (
+        "openclaw_vm_memory_balloon_mib",
+        "Balloon size held by the host (MiB)",
+        "memory_balloon_mib",
+    ),
+    ("openclaw_vm_disk_used_mb", "Per-VM data disk used (MB)", "disk_used_mb"),
+    ("openclaw_vm_disk_total_mb", "Per-VM data disk capacity (MB)", "disk_total_mb"),
+    ("openclaw_vm_disk_used_pct", "Per-VM data disk used (percent)", "disk_used_pct"),
+    ("openclaw_vm_cpu_pct", "Per-VM CPU usage (percent of allocated vcpus)", "cpu_pct"),
+)
+
+
+def _render_metrics_text(snapshots):
+    """Render the in-memory snapshots dict as Prometheus exposition text.
+
+    Pure function — no I/O — so it is easy to assert against in unit tests.
+    Always emits HELP/TYPE headers (even with zero samples) so that scrapers
+    that validate metadata don't choke on a quiet host.
+    """
+    out = []
+    for metric_name, help_text, key in _PROM_GAUGES:
+        out.append(f"# HELP {metric_name} {help_text}")
+        out.append(f"# TYPE {metric_name} gauge")
+        for tid, info in snapshots.items():
+            metrics = info.get("metrics") if isinstance(info, dict) else None
+            if not metrics:
+                continue
+            value = metrics.get(key, 0)
+            out.append(f'{metric_name}{{tenant="{tid}"}} {int(value)}')
+    # vm_health as 0/1 — useful for alerting even when metrics are missing.
+    out.append("# HELP openclaw_vm_health 1 if the VM responded to ping, else 0")
+    out.append("# TYPE openclaw_vm_health gauge")
+    for tid, info in snapshots.items():
+        if not isinstance(info, dict):
+            continue
+        v = 1 if info.get("vm_health") == "up" else 0
+        out.append(f'openclaw_vm_health{{tenant="{tid}"}} {v}')
+    return "\n".join(out) + "\n"
+
+
+# Balloon config (from /etc/platform.env)
+BALLOON_ENABLED = os.environ.get("BALLOON_ENABLED", "false") == "true"
+BALLOON_MAX_INFLATE_RATIO = float(os.environ.get("BALLOON_MAX_INFLATE_RATIO", "0.4"))
+BALLOON_MIN_GUEST_AVAILABLE_MB = int(
+    os.environ.get("BALLOON_MIN_GUEST_AVAILABLE_MB", "512")
+)
+
+# DynamoDB client (region auto-detected from instance metadata)
+_ddb = None
+_status = {}
+_lock = threading.Lock()
+
+
+def _get_ddb():
+    global _ddb
+    if _ddb is None:
+        # Get region from IMDS (IMDSv2 with session token)
+        # EC2 IMDS only supports http:// on link-local 169.254.169.254
+        try:
+            import urllib.request
+
+            tok = (
+                urllib.request.urlopen(
+                    urllib.request.Request(  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected
+                        "http://169.254.169.254/latest/api/token",  # nosemgrep: python.lang.security.audit.insecure-transport.urllib.insecure-urllib-request
+                        headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"},
+                        method="PUT",
+                    ),
+                    timeout=2,
+                )
+                .read()
+                .decode()
+            )
+            region = (
+                urllib.request.urlopen(
+                    urllib.request.Request(  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected
+                        "http://169.254.169.254/latest/meta-data/placement/region",  # nosemgrep: python.lang.security.audit.insecure-transport.urllib.insecure-urllib-request
+                        headers={"X-aws-ec2-metadata-token": tok},
+                    ),
+                    timeout=2,
+                )
+                .read()
+                .decode()
+            )
+        except Exception:
+            region = "ap-northeast-1"
+        _ddb = boto3.resource(
+            "dynamodb",
+            region_name=region,
+            config=BotoConfig(retries={"max_attempts": 2}),
+        )
+    return _ddb
+
+
+_recovering = set()  # Track VMs being recovered to avoid duplicate launches
+
+# Dead-zone guard: FC alive but guest unreachable (e.g. TAP DOWN after a partial
+# launch) is invisible to _recover_vm, which only fires when FC is absent. After
+# this many consecutive unreachable polls, force a stop+relaunch.
+_net_dead_polls = {}  # tenant_id -> consecutive polls: fc alive, guest unreachable
+_NET_DEAD_THRESHOLD = 3
+
+
+def _register_net_poll(tenant_id, guest_reachable):
+    """Track consecutive 'FC alive but guest unreachable' polls. Returns True
+    when the count crosses _NET_DEAD_THRESHOLD (caller should force-relaunch).
+    A reachable poll resets the counter. Pure/testable — no I/O."""
+    if guest_reachable:
+        _net_dead_polls.pop(tenant_id, None)
+        return False
+    n = _net_dead_polls.get(tenant_id, 0) + 1
+    _net_dead_polls[tenant_id] = n
+    if n >= _NET_DEAD_THRESHOLD:
+        _net_dead_polls.pop(tenant_id, None)
+        return True
+    return False
+
+
+def _recover_vm(tenant_id, cfg):
+    """Launch VM that has vm.json but no running Firecracker process."""
+    if tenant_id in _recovering:
+        return
+    _recovering.add(tenant_id)
+    vm_num = cfg.get("vm_num", 1)
+    vcpu = cfg.get("vcpu", 2)
+    mem_mb = cfg.get("mem_mb", 4096)
+    print(f"recovering {tenant_id} (vm{vm_num} {vcpu}vCPU/{mem_mb}MB)")
+    try:
+        subprocess.Popen(
+            [
+                "bash",
+                "/home/ubuntu/launch-vm.sh",
+                str(tenant_id),
+                str(vm_num),
+                str(vcpu),
+                str(mem_mb),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        print(f"recover {tenant_id} failed: {e}")
+        _recovering.discard(tenant_id)
+
+
+def _force_relaunch_vm(tenant_id, cfg):
+    """stop-vm + launch-vm to rebuild a VM whose FC is alive but guest network
+    is dead. Unlike _recover_vm, handles the FC-alive case."""
+    if tenant_id in _recovering:
+        return
+    _recovering.add(tenant_id)
+    vm_num = cfg.get("vm_num", 1)
+    vcpu = cfg.get("vcpu", 2)
+    mem_mb = cfg.get("mem_mb", 4096)
+    print(
+        f"force-relaunch {tenant_id} (vm{vm_num}): FC alive but guest unreachable "
+        f"for {_NET_DEAD_THRESHOLD} polls — rebuilding network"
+    )
+    try:
+        subprocess.run(
+            ["bash", "/home/ubuntu/stop-vm.sh", str(tenant_id), str(vm_num)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
+        subprocess.Popen(
+            [
+                "bash",
+                "/home/ubuntu/launch-vm.sh",
+                str(tenant_id),
+                str(vm_num),
+                str(vcpu),
+                str(mem_mb),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        print(f"force-relaunch {tenant_id} failed: {e}")
+        _recovering.discard(tenant_id)
+
+
+def _probe_all():
+    """Probe all local VMs."""
+    results = {}
+    try:
+        entries = os.listdir(VM_DIR)
+    except FileNotFoundError:
+        return results
+
+    for tenant_id in entries:
+        vm_path = os.path.join(VM_DIR, tenant_id)
+        cfg_file = os.path.join(vm_path, "vm.json")
+        if not os.path.isfile(cfg_file):
+            continue
+
+        try:
+            with open(cfg_file, encoding="utf-8") as f:
+                cfg = json.load(f)
+            guest_ip = cfg.get("guest_ip", "")
+        except Exception:
+            continue
+        if not guest_ip:
+            continue
+
+        # Skip intentionally stopped VMs
+        stopped_marker = os.path.join(vm_path, ".stopped")
+        if os.path.exists(stopped_marker):
+            continue
+
+        # Auto-recover: vm.json exists but Firecracker not running.
+        # Capture pid here too so the metrics composer can read /proc/<pid>
+        # without re-running pgrep on every gauge.
+        sock_file = os.path.join(vm_path, "fc.sock")
+        pgrep = subprocess.run(
+            ["pgrep", "-f", f"api-sock {sock_file}"], capture_output=True, text=True
+        )
+        fc_pid = None
+        if pgrep.returncode == 0:
+            pids = pgrep.stdout.strip().split()
+            if pids:
+                try:
+                    fc_pid = int(pids[0])
+                except (ValueError, IndexError):
+                    pass
+        fc_running = fc_pid is not None
+
+        if not fc_running:
+            _recover_vm(tenant_id, cfg)
+            results[tenant_id] = {
+                "vm_health": "recovering",
+                "app_health": "down",
+                "guest_ip": guest_ip,
+            }
+            continue
+
+        _recovering.discard(tenant_id)
+
+        vm_health = "down"
+        app_health = "down"
+
+        try:
+            r = subprocess.run(
+                ["ping", "-c", "1", "-W", "2", guest_ip], capture_output=True, timeout=5
+            )
+            if r.returncode == 0:
+                vm_health = "up"
+        except Exception:
+            pass
+
+        if vm_health == "up":
+            _register_net_poll(tenant_id, guest_reachable=True)
+            try:
+                r = subprocess.run(
+                    [
+                        "curl",
+                        "-sf",
+                        "-o",
+                        "/dev/null",
+                        "--connect-timeout",
+                        "3",
+                        f"http://{guest_ip}:{GATEWAY_PORT}/",
+                    ],
+                    capture_output=True,
+                    timeout=8,
+                )
+                if r.returncode == 0:
+                    app_health = "up"
+            except Exception:
+                pass
+        elif _register_net_poll(tenant_id, guest_reachable=False):
+            # FC alive but guest unreachable past the threshold — rebuild network.
+            _force_relaunch_vm(tenant_id, cfg)
+            results[tenant_id] = {
+                "vm_health": "recovering",
+                "app_health": "down",
+                "guest_ip": guest_ip,
+            }
+            continue
+
+        results[tenant_id] = {
+            "vm_health": vm_health,
+            "app_health": app_health,
+            "guest_ip": guest_ip,
+            "fc_pid": fc_pid,
+        }
+
+    return results
+
+
+def _read_gateway_token(guest_ip):
+    """SSH into VM and read gateway token from openclaw.json."""
+    try:
+        # 1.5.0 security: key-based SSH. The private key is per-host
+        # (/etc/openclaw/host_vm_key, generated at boot by init-host.sh) and
+        # never leaves this host; the matching public key was injected into
+        # the VM's data disk at launch. No shared password, no secret over SSM.
+        r = subprocess.run(
+            [
+                "ssh",
+                "-i",
+                "/etc/openclaw/host_vm_key",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "IdentitiesOnly=yes",
+                f"agent@{guest_ip}",
+                "jq -r .gateway.auth.token .openclaw/openclaw.json",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        token = r.stdout.strip()
+        return token if token and token != "null" else ""
+    except Exception as e:
+        print(f"read token from {guest_ip}: {e}")
+        return ""
+
+
+def _read_channel_secret(guest_ip):
+    """SSH into VM and read the claw-channel HMAC secret from openclaw.json.
+
+    Same per-host key-based SSH path as _read_gateway_token (no shared password,
+    no secret over SSM). The secret is generated per-VM by launch-vm.sh and lives
+    only on the data disk; mirroring it into the tenant's DDB record lets the
+    (non-VPC) signing Lambda read it to sign C-end messages — it never reaches
+    the browser. Returns "" if absent (older image / not yet provisioned)."""
+    try:
+        r = subprocess.run(
+            [
+                "ssh",
+                "-i",
+                "/etc/openclaw/host_vm_key",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "IdentitiesOnly=yes",
+                f"agent@{guest_ip}",
+                'jq -r \'.channels["claw-channel"].secret // ""\' .openclaw/openclaw.json',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        s = r.stdout.strip()
+        return s if s and s != "null" else ""
+    except Exception as e:
+        print(f"read channel secret from {guest_ip}: {e}")
+        return ""
+
+
+def _write_host_heartbeat():
+    """Update this host's ``last_seen`` and ``last_health_check`` timestamps in
+    the hosts table. Called every poll so the health_check Lambda can detect
+    AZ-level outages by checking host-level freshness (not just tenant-level
+    health, which goes stale only when a tenant exists). Best-effort; never
+    raises.
+    """
+    if not HOSTS_TABLE or not INSTANCE_ID:
+        return
+    try:
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        table = _get_ddb().Table(HOSTS_TABLE)
+        table.update_item(
+            Key={"instance_id": INSTANCE_ID},
+            UpdateExpression="SET last_seen = :t, last_health_check = :t",
+            ExpressionAttributeValues={":t": ts},
+        )
+    except Exception as e:
+        # Heartbeat failures must never crash the poll loop.
+        print(f"host heartbeat failed (non-fatal): {e}")
+
+
+def _write_ddb(results):
+    """Update tenant health in DynamoDB. Promote creating → running when VM is up."""
+    if not TENANTS_TABLE or not results:
+        return
+    table = _get_ddb().Table(TENANTS_TABLE)
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    for tid, info in results.items():
+        # Compute per-VM metrics for healthy VMs (issue #3).
+        # Skipped for down/recovering VMs to keep their last-known metrics
+        # rather than overwriting with zeros (which would mask the failure).
+        metrics = None
+        if info["vm_health"] == "up":
+            sock_file = os.path.join(VM_DIR, tid, "fc.sock")
+            data_file = os.path.join(VM_DIR, tid, "data.ext4")
+            cfg_file = os.path.join(VM_DIR, tid, "vm.json")
+            vm_mem_mb = 4096
+            vm_vcpu = 1
+            try:
+                with open(cfg_file, encoding="utf-8") as f:
+                    cfg = json.load(f)
+                    vm_mem_mb = cfg.get("mem_mb", 4096)
+                    vm_vcpu = cfg.get("vcpu", 1) or 1
+            except Exception:
+                pass
+            fc_pid = info.get("fc_pid")
+            try:
+                metrics = _compose_metrics(
+                    tid, vm_mem_mb, sock_file, data_file, fc_pid=fc_pid, vcpu=vm_vcpu
+                )
+            except Exception as e:
+                print(f"compose_metrics {tid}: {e}")
+            # Mirror computed metrics back into the in-memory snapshot so
+            # the Prometheus exporter (/metrics endpoint scraped by ADOT
+            # → AMP) sees the actual per-VM gauges. Without this only
+            # vm_health was being exposed, leaving openclaw_vm_memory_used_mb
+            # / disk_used_mb / disk_used_pct etc. empty in AMP. (Companion
+            # fix to the 8899/9090 port-mismatch — both shipped 1.2.5.)
+            if metrics is not None:
+                info["metrics"] = metrics
+
+        try:
+            if info["vm_health"] == "up":
+                # Promote creating → running + read gateway token
+                token = _read_gateway_token(info["guest_ip"])
+                if not token:
+                    continue  # Wait for SSH/gateway to be ready
+                # claw-channel: mirror the per-VM HMAC secret into DDB at the
+                # same promotion moment as gateway_token, so the signing Lambda
+                # (not in a VPC, can't reach the VM) can read it to sign C-end
+                # messages. Empty on older images — channel just won't be usable.
+                channel_secret = _read_channel_secret(info["guest_ip"])
+                # NOTE: `metrics` is a DynamoDB reserved keyword, so it must be
+                # referenced via an ExpressionAttributeNames placeholder (#m).
+                # Same for `status` (#s, already aliased). Without #m the
+                # update_item call returns ValidationException and the tenant
+                # never gets promoted to running.
+                update_expr = (
+                    "SET #s = :r, vm_health = :vh, app_health = :ah, "
+                    "health_failures = :z, last_health_check = :t, "
+                    "updated_at = :t, gateway_token = :tk, "
+                    "channel_secret = :cs, #m = :m"
+                )
+                # NOTE (loop 2026-07-01): we tried widening this to
+                # `#s IN (creating, stopped)` to self-heal a "stopped-but-alive"
+                # contradiction, but it RACES fleet-power stop: fleet_power
+                # reconciles DDB→stopped immediately (async SSM not yet run), then
+                # this poll sees the VM still up (SSM hasn't stopped it) + DDB
+                # stopped and pulls it back to running — so after stop-vm finally
+                # writes .stopped, the VM is stopped but DDB stays running forever.
+                # That regression hits EVERY normal fleet-power stop, far worse
+                # than the rare stopped-but-alive edge (only when stop's SSM fails
+                # on a host). So promotion stays creating→running ONLY. The
+                # stopped-but-alive edge is a known limitation to fix later with a
+                # mechanism that doesn't collide with the stop path (e.g. a
+                # grace-timed sweep keyed on the missing .stopped marker).
+                update_vals = {
+                    ":r": "running",
+                    ":c": "creating",
+                    ":vh": info["vm_health"],
+                    ":ah": info["app_health"],
+                    ":z": 0,
+                    ":t": now,
+                    ":tk": token,
+                    ":cs": channel_secret,
+                    ":m": metrics or {},
+                }
+                table.update_item(
+                    Key={"id": tid},
+                    UpdateExpression=update_expr,
+                    ConditionExpression="#s = :c",
+                    ExpressionAttributeNames={"#s": "status", "#m": "metrics"},
+                    ExpressionAttributeValues=update_vals,
+                )
+                print(
+                    f"promoted {tid} creating → running (token={'yes' if token else 'no'})"
+                )
+            else:
+                # attribute_exists(id) guards against upserting an orphan: if the
+                # tenant's main record was already deleted (control-plane DELETE)
+                # but its FC process is still alive on this host, a bare
+                # update_item would resurrect a ghost row carrying only health
+                # fields (no status/host/capacity). Loop 2026-07-02 found 1254
+                # such orphans (id, app_health, vm_health, metrics only). The
+                # condition fails silently (caught below) once the tenant is gone.
+                table.update_item(
+                    Key={"id": tid},
+                    UpdateExpression="SET vm_health = :vh, app_health = :ah, last_health_check = :t",
+                    ConditionExpression="attribute_exists(id)",
+                    ExpressionAttributeValues={
+                        ":vh": info["vm_health"],
+                        ":ah": info["app_health"],
+                        ":t": now,
+                    },
+                )
+        except table.meta.client.exceptions.ConditionalCheckFailedException:
+            # promote's `#s = :c` failed. Two causes: (a) tenant is already
+            # running (normal — refresh health/metrics below), or (b) the tenant
+            # record no longer exists (deleted while its FC lingered). Both
+            # refresh paths carry attribute_exists(id) so case (b) fails cleanly
+            # instead of upserting a health-only orphan row (loop 2026-07-02).
+            try:
+                if metrics is not None:
+                    # `metrics` is a DDB reserved keyword — alias via #m.
+                    table.update_item(
+                        Key={"id": tid},
+                        UpdateExpression=(
+                            "SET vm_health = :vh, app_health = :ah, "
+                            "last_health_check = :t, #m = :m"
+                        ),
+                        ConditionExpression="attribute_exists(id)",
+                        ExpressionAttributeNames={"#m": "metrics"},
+                        ExpressionAttributeValues={
+                            ":vh": info["vm_health"],
+                            ":ah": info["app_health"],
+                            ":t": now,
+                            ":m": metrics,
+                        },
+                    )
+                else:
+                    table.update_item(
+                        Key={"id": tid},
+                        UpdateExpression="SET vm_health = :vh, app_health = :ah, last_health_check = :t",
+                        ConditionExpression="attribute_exists(id)",
+                        ExpressionAttributeValues={
+                            ":vh": info["vm_health"],
+                            ":ah": info["app_health"],
+                            ":t": now,
+                        },
+                    )
+            except Exception as e:
+                print(f"ddb update {tid}: {e}")
+        except Exception as e:
+            print(f"ddb update {tid}: {e}")
+
+
+# ═══════════════════════════════════════════
+# Per-VM resource metrics (issue #3)
+# ═══════════════════════════════════════════
+#
+# Sources:
+#   memory_used_mb / memory_balloon_mib  : Firecracker /balloon/statistics
+#   disk_used_mb / disk_total_mb / pct   : dumpe2fs -h on data.ext4 (host-side)
+#   cpu_pct                               : reserved (0 in this PR)
+#
+# Tenants without a probe failure get a `metrics` field on their DDB record.
+
+
+def _parse_dumpe2fs_blocks(output):
+    """Extract (used_mb, total_mb) from dumpe2fs -h output.
+
+    dumpe2fs prints many irrelevant lines (features, UUIDs, etc.); we only
+    need three keys. Returns (0, 0) on malformed input rather than raising
+    so the polling loop never crashes from a transient FS-tool failure.
+    """
+    import re
+
+    block_count = block_size = free_blocks = None
+    for line in output.splitlines():
+        m = re.match(r"^Block count:\s+(\d+)", line)
+        if m:
+            block_count = int(m.group(1))
+            continue
+        m = re.match(r"^Block size:\s+(\d+)", line)
+        if m:
+            block_size = int(m.group(1))
+            continue
+        m = re.match(r"^Free blocks:\s+(\d+)", line)
+        if m:
+            free_blocks = int(m.group(1))
+    if block_count is None or block_size is None or free_blocks is None:
+        return 0, 0
+    total_bytes = block_count * block_size
+    used_bytes = (block_count - free_blocks) * block_size
+    return used_bytes // (1024 * 1024), total_bytes // (1024 * 1024)
+
+
+def _get_disk_usage(data_file):
+    """Run `dumpe2fs -h` on data.ext4 and return (used_mb, total_mb, pct).
+
+    Host-side: avoids SSH into the guest. Safe even when the file does not
+    exist (newly-creating VM) — returns zeros instead of raising.
+    """
+    if not data_file or not os.path.exists(data_file):
+        return 0, 0, 0
+    try:
+        r = subprocess.run(
+            ["dumpe2fs", "-h", data_file], capture_output=True, text=True, timeout=5
+        )
+        if r.returncode != 0:
+            return 0, 0, 0
+        used_mb, total_mb = _parse_dumpe2fs_blocks(r.stdout)
+        pct = int(used_mb * 100 / total_mb) if total_mb else 0
+        return used_mb, total_mb, pct
+    except Exception:
+        return 0, 0, 0
+
+
+def _get_memory_usage(stats, vm_mem_mb):
+    """Compute (used_mb, balloon_mib) from balloon /statistics response.
+
+    `available_memory` reflects what the guest kernel could hand out, so
+    `vm_mem_mb - available_mb` is a good proxy for "memory in active use".
+    Pure function — no I/O — so it can be tested without a running VM.
+    """
+    if not stats:
+        return 0, 0
+    available_bytes = stats.get("stats", {}).get("available_memory", 0)
+    available_mb = available_bytes // (1024 * 1024)
+    used_mb = max(0, vm_mem_mb - available_mb)
+    balloon_mib = stats.get("actual_mib", 0)
+    return used_mb, balloon_mib
+
+
+# ───────────────────────────────────────────────
+# Real CPU / memory sampling from /proc/<pid>/* (issue: meeting note
+# 2026-05-22 — "可观测性里你那个内存是读不到的，CPU 也读不到").
+#
+# Background: balloon /statistics often returns available_memory=0 on
+# kernels without VIRTIO_BALLOON_F_STATS_VQ enabled, so the previous
+# proxy `vm_mem_mb - available_mb` evaluated to vm_mem_mb (= 100% RSS,
+# obviously wrong). And cpu_pct was a hard-coded 0 stub. Both surfaced
+# as "—" placeholders in the console.
+#
+# Fix: read straight from /proc/<fc_pid>/* on the host. Firecracker is a
+# normal Linux process, so its CPU time and RSS are first-class kernel
+# stats — no balloon protocol negotiation, no in-guest agent.
+#
+# Memory: VmRSS reflects host-resident memory of the Firecracker process,
+# which is approximately guest_used + Firecracker overhead (~30–60 MB).
+# That's good enough to render a usage bar; we don't subtract overhead so
+# the number is the number you'd see in `top` for the firecracker pid.
+#
+# CPU: utime+stime are cumulative jiffies. We diff against the previous
+# sample for the same tenant and divide by the sampling interval to get
+# the percentage of one CPU. Then we divide by vcpu_count to express it
+# as percent-of-allocated-vcpus (which is what operators want to see —
+# 100% means "all configured vCPUs are pegged").
+# ───────────────────────────────────────────────
+
+
+# Per-tenant rolling window for CPU sampling. {tid → (jiffies, monotonic_ts)}
+# Module-global is fine: the polling thread is the only writer and a
+# missing entry just means "first sample, return 0".
+_CPU_SAMPLES = {}
+
+try:
+    _CLK_TCK = os.sysconf("SC_CLK_TCK")
+except (ValueError, OSError):
+    _CLK_TCK = 100  # Linux default; kept for portability + test isolation.
+
+
+def _read_proc_stat_cpu_jiffies(pid):
+    """Sum of utime + stime from /proc/<pid>/stat, in jiffies. None on failure.
+
+    Pure function (input pid → integer jiffies) so the unit test can drive
+    it through a tmpfs fixture without monkey-patching subprocess. The
+    /proc/PID/stat format is documented in proc(5); fields 14 + 15 (1-indexed)
+    are utime and stime. Note that the comm field (#2) can contain spaces +
+    parentheses, so we split on the *trailing* `)` rather than naïve split.
+    """
+    if not pid:
+        return None
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+            line = f.read()
+    except (FileNotFoundError, PermissionError):
+        return None
+    rparen = line.rfind(")")
+    if rparen < 0:
+        return None
+    fields = line[rparen + 1 :].split()
+    # After the trailing `)` we lose fields 1 + 2; field 14 (utime) becomes
+    # index 11, field 15 (stime) becomes index 12.
+    try:
+        return int(fields[11]) + int(fields[12])
+    except (IndexError, ValueError):
+        return None
+
+
+def _read_proc_status_rss_kb(pid):
+    """VmRSS in KB from /proc/<pid>/status. None if unavailable.
+
+    Pure function, easy to fixture in tests.
+    """
+    if not pid:
+        return None
+    try:
+        with open(f"/proc/{pid}/status", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1])
+    except (FileNotFoundError, PermissionError, ValueError):
+        return None
+    return None
+
+
+def _compute_cpu_pct(
+    prev_jiffies, prev_ts, cur_jiffies, cur_ts, vcpu, clk_tck=_CLK_TCK
+):
+    """Compute CPU% (of allocated vcpus) from two /proc/stat samples.
+
+    Pure function. Returns 0 on the first sample (no prior baseline) and
+    on bogus inputs (negative delta means pid was reused, vcpu==0 means
+    the caller forgot to populate it). Caps at 100 — overshoot can happen
+    if the guest briefly outruns its quota and the host accounting catches
+    up unevenly.
+    """
+    if prev_jiffies is None or cur_jiffies is None:
+        return 0
+    if prev_ts is None or cur_ts is None or cur_ts <= prev_ts:
+        return 0
+    if cur_jiffies < prev_jiffies:
+        return 0  # pid reused or counter wrapped — discard
+    if not vcpu or vcpu <= 0 or clk_tck <= 0:
+        return 0
+    elapsed_s = cur_ts - prev_ts
+    cpu_seconds = (cur_jiffies - prev_jiffies) / clk_tck
+    pct = int((cpu_seconds / elapsed_s / vcpu) * 100)
+    return max(0, min(100, pct))
+
+
+def _sample_cpu_pct(tenant_id, fc_pid, vcpu):
+    """Read current jiffies, compare to last sample, return CPU%.
+
+    Side effect: updates _CPU_SAMPLES so the next call has a baseline.
+    Returns 0 on the first sample for a tenant.
+    """
+    now = time.monotonic()
+    cur_jiffies = _read_proc_stat_cpu_jiffies(fc_pid)
+    prev = _CPU_SAMPLES.get(tenant_id)
+    pct = 0
+    if prev is not None and cur_jiffies is not None:
+        prev_jiffies, prev_ts = prev
+        pct = _compute_cpu_pct(prev_jiffies, prev_ts, cur_jiffies, now, vcpu)
+    if cur_jiffies is not None:
+        _CPU_SAMPLES[tenant_id] = (cur_jiffies, now)
+    return pct
+
+
+def _compose_metrics(tenant_id, vm_mem_mb, sock_file, data_file, fc_pid=None, vcpu=1):
+    """Build the per-VM metrics dict written to DDB.
+
+    1.2.9 fix: cpu_pct now comes from /proc/<fc_pid>/stat sampling rather
+    than the previous hard-coded 0; memory_used_mb now prefers VmRSS over
+    the unreliable balloon stats path. The balloon-stats path is kept as a
+    fallback so hosts on older kernels still report something sensible.
+    """
+    # CPU — real %, sampled across two polls.
+    cpu_pct = _sample_cpu_pct(tenant_id, fc_pid, vcpu)
+
+    # Memory — VmRSS first (always readable on Linux), balloon as fallback.
+    mem_used = 0
+    rss_kb = _read_proc_status_rss_kb(fc_pid) if fc_pid else None
+    if rss_kb:
+        mem_used = rss_kb // 1024  # KB → MB
+
+    # Balloon stats are still useful for `memory_balloon_mib` (how much the
+    # host has reclaimed) regardless of whether available_memory is reliable.
+    stats = _get_balloon_stats(sock_file) if sock_file else None
+    balloon_used_mb, balloon_mib = _get_memory_usage(stats, vm_mem_mb)
+    if not mem_used:
+        mem_used = balloon_used_mb  # last-ditch fallback
+
+    disk_used, disk_total, disk_pct = _get_disk_usage(data_file)
+    return {
+        "memory_used_mb": int(mem_used),
+        "memory_balloon_mib": int(balloon_mib),
+        "disk_used_mb": int(disk_used),
+        "disk_total_mb": int(disk_total),
+        "disk_used_pct": int(disk_pct),
+        "cpu_pct": int(cpu_pct),
+    }
+
+
+def _get_balloon_stats(sock_file):
+    """Get balloon statistics from a VM via Firecracker API."""
+    try:
+        r = subprocess.run(
+            [
+                "curl",
+                "-sf",
+                "--unix-socket",
+                sock_file,
+                "http://localhost/balloon/statistics",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return json.loads(r.stdout)
+    except Exception:
+        pass
+    return None
+
+
+def _set_balloon_target(sock_file, amount_mib):
+    """Set balloon target size (inflate/deflate)."""
+    try:
+        subprocess.run(
+            [
+                "curl",
+                "-sf",
+                "--unix-socket",
+                sock_file,
+                "-X",
+                "PATCH",
+                "http://localhost/balloon",
+                "-H",
+                "Content-Type: application/json",
+                "-d",
+                json.dumps({"amount_mib": amount_mib}),
+            ],
+            capture_output=True,
+            timeout=5,
+        )
+    except Exception as e:
+        print(f"balloon set failed: {e}")
+
+
+def _get_host_mem_info():
+    """Read host /proc/meminfo, return (total_mb, available_mb)."""
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            info = {}
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    info[parts[0].rstrip(":")] = int(parts[1])  # kB
+            total = info.get("MemTotal", 0) // 1024
+            available = info.get("MemAvailable", 0) // 1024
+            return total, available
+    except Exception:
+        return 0, 0
+
+
+def _adjust_balloons(probe_results):
+    """Dynamically adjust balloon sizes based on host memory pressure.
+
+    Strategy:
+    - If host available memory < 20% of total → inflate balloons on VMs with spare memory
+    - If host available memory > 40% of total → deflate balloons to give memory back
+    - Never inflate beyond max_inflate_ratio of VM's declared memory
+    - Never reduce guest available below min_guest_available_mb
+    """
+    if not BALLOON_ENABLED:
+        return
+
+    host_total, host_available = _get_host_mem_info()
+    if host_total == 0:
+        return
+
+    host_pressure = host_available / host_total  # 0.0 = no memory, 1.0 = all free
+
+    for tid, info in probe_results.items():
+        if info.get("vm_health") != "up":
+            continue
+        sock_file = os.path.join(VM_DIR, tid, "fc.sock")
+        if not os.path.exists(sock_file):
+            continue
+
+        # Read VM config for declared memory
+        cfg_file = os.path.join(VM_DIR, tid, "vm.json")
+        try:
+            with open(cfg_file, encoding="utf-8") as f:
+                cfg = json.load(f)
+            vm_mem_mb = cfg.get("mem_mb", 4096)
+        except Exception:
+            continue
+
+        stats = _get_balloon_stats(sock_file)
+        if not stats:
+            continue
+
+        current_balloon_mib = stats.get("actual_mib", 0)
+        max_balloon = int(vm_mem_mb * BALLOON_MAX_INFLATE_RATIO)
+
+        # Guest available memory (from balloon stats)
+        guest_available_mb = stats.get("stats", {}).get("available_memory", 0) // (
+            1024 * 1024
+        )
+        guest_free_mb = stats.get("stats", {}).get("free_memory", 0) // (1024 * 1024)
+
+        if host_pressure < 0.20:
+            # Host under pressure — try to reclaim from this VM
+            reclaimable = guest_available_mb - BALLOON_MIN_GUEST_AVAILABLE_MB
+            if reclaimable > 0:
+                target = min(current_balloon_mib + reclaimable, max_balloon)
+                if target > current_balloon_mib:
+                    _set_balloon_target(sock_file, target)
+                    print(
+                        f"balloon inflate {tid}: {current_balloon_mib}→{target}MB "
+                        f"(host_avail={host_available}MB guest_avail={guest_available_mb}MB)"
+                    )
+
+        elif host_pressure > 0.40:
+            # Host has plenty of memory — give back to VMs
+            if current_balloon_mib > 0:
+                _set_balloon_target(sock_file, 0)
+                print(
+                    f"balloon deflate {tid}: {current_balloon_mib}→0MB (host_avail={host_available}MB)"
+                )
+
+
+# Orphan-firecracker overwatcher (Firecracker prod-host-setup.md:69-83 recommends
+# a host process that reaps unresponsive/leaked firecrackers). Our normal recovery
+# only iterates vm.json dirs, so a firecracker whose vm.json was already removed
+# (tenant deleted, but DELETE raced the kill / SIGKILL chaser missed) becomes an
+# ORPHAN that no probe ever revisits — it silently holds ~600MB-1GB RSS forever.
+# This sweep finds firecrackers whose socket dir has no vm.json and SIGKILLs them.
+_ORPHAN_GRACE_SEC = int(os.environ.get("OC_ORPHAN_GRACE_SEC", "120"))
+
+
+def _reap_orphan_firecrackers():
+    """SIGKILL firecracker processes whose VM dir has no vm.json (leaked/orphaned).
+
+    Guards against false positives: only reaps a firecracker that has been running
+    longer than _ORPHAN_GRACE_SEC, so a VM mid-launch (firecracker started before
+    launch-vm.sh writes vm.json) is never killed."""
+    try:
+        pg = subprocess.run(
+            ["pgrep", "-af", "api-sock"], capture_output=True, text=True, timeout=10
+        )
+    except Exception:
+        return
+    if pg.returncode != 0:
+        return
+    reaped = 0
+    for line in pg.stdout.strip().splitlines():
+        parts = line.split(None, 1)
+        if len(parts) < 2 or "firecracker" not in parts[1]:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        # Extract the --api-sock path → its dir is the VM dir.
+        sock = None
+        for tok in parts[1].split():
+            if tok.endswith("fc.sock") or "/fc.sock" in tok:
+                sock = tok
+                break
+        if not sock:
+            # fall back: --api-sock <path>
+            toks = parts[1].split()
+            if "--api-sock" in toks:
+                i = toks.index("--api-sock")
+                if i + 1 < len(toks):
+                    sock = toks[i + 1]
+        if not sock:
+            continue
+        vmdir = os.path.dirname(sock)
+        # has a live vm.json → legitimate, skip
+        if os.path.isfile(os.path.join(vmdir, "vm.json")):
+            continue
+        # grace: skip young processes (mid-launch, vm.json not written yet)
+        try:
+            et = subprocess.run(
+                ["ps", "-o", "etimes=", "-p", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            age = int(et.stdout.strip() or "0")
+        except Exception:
+            age = 0
+        if age < _ORPHAN_GRACE_SEC:
+            continue
+        print(
+            f"overwatcher: reaping orphan firecracker pid={pid} dir={vmdir} age={age}s"
+        )
+        try:
+            # Kill by EXACT socket path (zero false-positive: matches only this
+            # firecracker), NOT by a guessed vm_num. We deliberately do NOT call
+            # stop-vm.sh here because it deletes tap-vm<NUM> from a vm_num we can't
+            # reliably recover for an orphan (vm.json is gone) — a wrong guess would
+            # touch the wrong tap. Process reclaim (the 600MB-1GB RSS) is the goal;
+            # a leaked tap is harmless and swept separately below best-effort.
+            subprocess.run(
+                ["pkill", "-KILL", "-f", f"api-sock {sock}"],
+                capture_output=True,
+                timeout=10,
+            )
+            subprocess.run(["kill", "-9", str(pid)], capture_output=True, timeout=5)
+            # best-effort tap cleanup: derive tap from the dead fc's own netns/cmdline
+            # is unreliable for an orphan, so leave the tap for the periodic tap GC.
+            try:
+                os.remove(os.path.join(vmdir, "fc.sock"))
+            except OSError:
+                pass
+            # PRD 2.1 根治"僵尸 per-tenant nginx 路由累积":孤儿的 nginx conf 没走
+            # stop-vm 清理通道,这里按 tenant_id 精确删它那一条 + reload。tenant_id =
+            # vmdir basename(确定值,非猜测),只删自己这条,不碰别人。
+            orphan_tid = os.path.basename(vmdir)
+            nginx_conf = f"/etc/nginx/conf.d/tenants/{orphan_tid}.conf"
+            if os.path.isfile(nginx_conf):
+                try:
+                    os.remove(nginx_conf)
+                    subprocess.run(
+                        ["nginx", "-s", "reload"], capture_output=True, timeout=10
+                    )
+                    print(f"overwatcher: removed orphan nginx route {orphan_tid}")
+                except Exception:
+                    pass
+            reaped += 1
+        except Exception as e:
+            print(f"overwatcher: reap pid={pid} failed: {e}")
+    if reaped:
+        print(f"overwatcher: reaped {reaped} orphan firecracker(s)")
+
+
+def _poll_loop():
+    while True:
+        try:
+            # 1.3.0: heartbeat at the start so failures in tenant probing
+            # don't suppress the host-level liveness signal.
+            _write_host_heartbeat()
+            _reap_orphan_firecrackers()
+            results = _probe_all()
+            ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            with _lock:
+                _status.clear()
+                for tid, info in results.items():
+                    info["updated_at"] = ts
+                    _status[tid] = info
+            _write_ddb(results)
+            _adjust_balloons(results)
+        except Exception as e:
+            print(f"poll error: {e}")
+        time.sleep(POLL_INTERVAL)
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/metrics":
+            # Prometheus text exposition (issue #4). Scraped by sibling
+            # ADOT collector that remote-writes to AMP.
+            with _lock:
+                data = dict(_status)
+            body = _render_metrics_text(data).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path in ("/health", "/"):
+            with _lock:
+                data = dict(_status)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(data).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass
+
+
+def main():
+    print(
+        f"openclaw-agent starting on :{PORT}, poll every {POLL_INTERVAL}s, table={TENANTS_TABLE}"
+    )
+    t = threading.Thread(target=_poll_loop, daemon=True)
+    t.start()
+    HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+
+
+if __name__ == "__main__":
+    main()

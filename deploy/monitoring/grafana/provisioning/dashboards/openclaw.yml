@@ -1,0 +1,16 @@
+# Grafana dashboard 自动 provisioning — 从 /var/lib/grafana/dashboards 加载
+# 仓库里的 dashboard JSON(随代码迭代,不靠 UI 手建)。
+apiVersion: 1
+
+providers:
+  - name: openclaw-dashboards
+    orgId: 1
+    folder: OpenClaw
+    type: file
+    disableDeletion: false
+    editable: true # 允许 UI 上临时调,但真相源是仓库 JSON
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

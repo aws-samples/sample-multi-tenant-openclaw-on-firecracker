@@ -1,0 +1,2501 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Finance Agent · 智能理财助手</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230b0e11'/%3E%3Cg fill='none' stroke='%23f7a600' stroke-width='2.5'%3E%3Crect x='6' y='6' width='8' height='8' rx='1.5'/%3E%3Crect x='18' y='6' width='8' height='8' rx='1.5'/%3E%3Crect x='6' y='18' width='8' height='8' rx='1.5'/%3E%3Crect x='18' y='18' width='8' height='8' rx='1.5'/%3E%3C/g%3E%3C/svg%3E"
+    />
+    <style>
+      :root {
+        /* 深色主题:黑 + 橙黄 accent */
+        --bg: #0b0e11;
+        --bg2: #12161c;
+        --panel: #161b22;
+        --panel2: #1c232c;
+        --line: #222b36;
+        --line2: #2c3744;
+        --txt: #eaecef;
+        --dim: #a7b1bd;
+        --faint: #707a86;
+        --brand: #f7a600;
+        --brand2: #ffb800;
+        --brand-dim: #8a6410;
+        --green: #20b26c;
+        --red: #f6465d;
+        --blue: #3aa6ff;
+        --mono: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+        --sans:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Microsoft YaHei", sans-serif;
+      }
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        height: 100%;
+      }
+      body {
+        background: var(--bg);
+        color: var(--txt);
+        font-family: var(--sans);
+        overflow: hidden;
+        -webkit-font-smoothing: antialiased;
+      }
+      .app {
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+      }
+      /* 全站导航条(站头):AI Pro 无关项灰化,仅装饰 */
+      .topnav {
+        height: 48px;
+        flex-shrink: 0;
+        background: var(--bg);
+        border-bottom: 1px solid var(--line);
+        display: flex;
+        align-items: center;
+        gap: 22px;
+        padding: 0 20px;
+      }
+      .topnav .wm {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        font-weight: 800;
+        font-size: 16px;
+        letter-spacing: 0.2px;
+        flex-shrink: 0;
+      }
+      .topnav .wm .d {
+        width: 22px;
+        height: 22px;
+        border-radius: 6px;
+        background: linear-gradient(135deg, var(--brand), var(--brand2));
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: #0b0e11;
+        font-weight: 900;
+        font-size: 14px;
+      }
+      .topnav .links {
+        display: flex;
+        align-items: center;
+        gap: 20px;
+        flex: 1;
+        min-width: 0;
+      }
+      /* 非 AI 项灰掉:不可点、低对比,只做"全站头"的形 */
+      .topnav .links a {
+        color: var(--faint);
+        font-size: 13.5px;
+        font-weight: 500;
+        text-decoration: none;
+        cursor: default;
+        white-space: nowrap;
+      }
+      .topnav .links a.on {
+        color: var(--brand);
+        font-weight: 700;
+        cursor: default;
+      }
+      .topnav .search {
+        margin-left: auto;
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 6px 11px;
+        color: var(--faint);
+        font-size: 12.5px;
+        width: 180px;
+        flex-shrink: 0;
+      }
+      .topnav .ic {
+        color: var(--faint);
+        font-size: 15px;
+        cursor: default;
+      }
+      .appbody {
+        flex: 1;
+        min-height: 0;
+        display: grid;
+        grid-template-columns: 264px 1fr;
+      }
+
+      /* ============ 左侧栏 ============ */
+      .side {
+        background: var(--bg2);
+        border-right: 1px solid var(--line);
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 18px 18px 14px;
+      }
+      .logo {
+        width: 30px;
+        height: 30px;
+        border-radius: 8px;
+        background: linear-gradient(135deg, var(--brand), var(--brand2));
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: 900;
+        color: #0b0e11;
+        font-size: 18px;
+        flex-shrink: 0;
+      }
+      .brand .nm {
+        font-size: 17px;
+        font-weight: 800;
+        letter-spacing: 0.3px;
+      }
+      .brand .nm .pro {
+        color: var(--brand);
+        font-weight: 700;
+        font-size: 12px;
+        border: 1px solid var(--brand-dim);
+        border-radius: 5px;
+        padding: 1px 6px;
+        margin-left: 6px;
+        vertical-align: middle;
+      }
+      .newbtn {
+        margin: 6px 14px 14px;
+        padding: 11px;
+        border: 1px solid var(--line2);
+        border-radius: 10px;
+        background: var(--panel);
+        color: var(--txt);
+        font-size: 14px;
+        font-weight: 600;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        justify-content: center;
+        transition: 0.15s;
+      }
+      .newbtn:hover {
+        border-color: var(--brand);
+        color: var(--brand);
+      }
+      .navrow {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 9px 18px;
+        color: var(--dim);
+        font-size: 14px;
+        cursor: pointer;
+        transition: 0.12s;
+      }
+      .navrow:hover {
+        background: var(--panel);
+        color: var(--txt);
+      }
+      .navrow .i {
+        width: 18px;
+        text-align: center;
+        opacity: 0.8;
+      }
+
+      .seclbl {
+        padding: 14px 18px 6px;
+        font-size: 11px;
+        color: var(--faint);
+        letter-spacing: 1.2px;
+        text-transform: uppercase;
+        font-weight: 700;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+      .seclbl .rf {
+        cursor: pointer;
+        color: var(--faint);
+        font-size: 13px;
+        letter-spacing: 0;
+      }
+      .seclbl .rf:hover {
+        color: var(--brand);
+      }
+      .nodes {
+        flex: 1;
+        overflow-y: auto;
+        padding: 0 10px;
+        min-height: 0;
+      }
+      .node {
+        padding: 10px 12px;
+        border-radius: 9px;
+        cursor: pointer;
+        margin-bottom: 3px;
+        transition: 0.12s;
+        border: 1px solid transparent;
+      }
+      .node:hover {
+        background: var(--panel);
+      }
+      .node.on {
+        background: var(--panel2);
+        border-color: var(--line2);
+      }
+      .node .nt {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 14px;
+        font-weight: 600;
+      }
+      .node .dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--green);
+        flex-shrink: 0;
+        box-shadow: 0 0 6px var(--green);
+      }
+      .node .dot.off {
+        background: var(--faint);
+        box-shadow: none;
+      }
+      .node .meta {
+        font-size: 11px;
+        color: var(--faint);
+        margin-top: 3px;
+        font-family: var(--mono);
+        padding-left: 15px;
+      }
+      .nodes .empty {
+        color: var(--faint);
+        font-size: 12px;
+        padding: 14px 12px;
+        line-height: 1.6;
+      }
+      .side .foot {
+        padding: 12px 18px;
+        border-top: 1px solid var(--line);
+        font-size: 11px;
+        color: var(--faint);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+      .side .foot .u {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-width: 0;
+      }
+      .side .foot .u .em {
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 130px;
+      }
+      .side .foot .ua {
+        width: 22px;
+        height: 22px;
+        border-radius: 50%;
+        background: var(--brand);
+        color: #0b0e11;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: 800;
+        font-size: 11px;
+        flex-shrink: 0;
+      }
+      .side .foot .logout {
+        cursor: pointer;
+        color: var(--faint);
+        font-size: 11px;
+        border: 1px solid var(--line2);
+        border-radius: 6px;
+        padding: 3px 8px;
+        transition: 0.12s;
+        flex-shrink: 0;
+      }
+      .side .foot .logout:hover {
+        border-color: var(--red);
+        color: var(--red);
+      }
+
+      /* ============ 主聊天区 ============ */
+      .main {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+        min-height: 0;
+        position: relative;
+      }
+      .topbar {
+        height: 56px;
+        border-bottom: 1px solid var(--line);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0 24px;
+        flex-shrink: 0;
+      }
+      .topbar .ti {
+        display: flex;
+        align-items: center;
+        gap: 11px;
+      }
+      .topbar .ti .av {
+        width: 30px;
+        height: 30px;
+        border-radius: 8px;
+        background: linear-gradient(135deg, var(--brand), var(--brand2));
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 16px;
+      }
+      .topbar .ti .nm {
+        font-size: 15px;
+        font-weight: 700;
+      }
+      .topbar .ti .st {
+        font-size: 12px;
+        color: var(--green);
+        display: flex;
+        align-items: center;
+        gap: 5px;
+      }
+      .topbar .ti .st .d {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: var(--green);
+        box-shadow: 0 0 6px var(--green);
+      }
+      .topbar .tr {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-size: 12px;
+        color: var(--faint);
+        font-family: var(--mono);
+      }
+      .modelchip {
+        border: 1px solid var(--line2);
+        border-radius: 7px;
+        padding: 5px 11px;
+        font-size: 12px;
+        color: var(--dim);
+        background: var(--panel);
+      }
+
+      .chat {
+        flex: 1;
+        overflow-y: auto;
+        padding: 28px 0;
+        min-height: 0;
+      }
+      .cwrap {
+        max-width: 760px;
+        margin: 0 auto;
+        padding: 0 24px;
+      }
+      .guard-block {
+        border: 1px solid rgba(246, 70, 93, 0.35);
+        background: rgba(246, 70, 93, 0.07);
+        border-radius: 10px;
+        padding: 12px 14px;
+        line-height: 1.55;
+        color: #e8b4bc;
+      }
+      .msg {
+        display: flex;
+        gap: 13px;
+        margin-bottom: 24px;
+        animation: rise 0.3s ease;
+      }
+      @keyframes rise {
+        from {
+          opacity: 0;
+          transform: translateY(6px);
+        }
+        to {
+          opacity: 1;
+          transform: none;
+        }
+      }
+      .msg .ava {
+        width: 32px;
+        height: 32px;
+        border-radius: 9px;
+        flex-shrink: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 16px;
+      }
+      .msg.ai .ava {
+        background: linear-gradient(135deg, var(--brand), var(--brand2));
+      }
+      .msg.me .ava {
+        background: var(--panel2);
+        border: 1px solid var(--line2);
+      }
+      .msg .bd {
+        flex: 1;
+        min-width: 0;
+      }
+      .msg .who {
+        font-size: 13px;
+        font-weight: 700;
+        margin-bottom: 5px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .msg .who .t {
+        font-size: 11px;
+        color: var(--faint);
+        font-weight: 400;
+        font-family: var(--mono);
+      }
+      .msg .ct {
+        font-size: 15px;
+        line-height: 1.7;
+        color: #dfe4ea;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .msg.me .who {
+        color: var(--brand);
+      }
+      .msg .ct code {
+        font-family: var(--mono);
+        font-size: 13px;
+        background: var(--panel2);
+        padding: 1px 5px;
+        border-radius: 4px;
+        color: var(--brand2);
+      }
+
+      /* 图片消息(agent 出图 / 用户发图) */
+      .media-slot {
+        margin-top: 8px;
+      }
+      .media-slot img {
+        max-width: 320px;
+        max-height: 320px;
+        border-radius: 10px;
+        border: 1px solid var(--line, #2b2f36);
+        display: block;
+        background: var(--panel2, #1a1d22);
+      }
+      .media-loading,
+      .media-err {
+        font-size: 13px;
+        color: #8b929c;
+        padding: 10px 12px;
+        border: 1px dashed var(--line, #2b2f36);
+        border-radius: 10px;
+        display: inline-block;
+        background: var(--panel2, #1a1d22);
+      }
+      .media-err {
+        color: var(--red, #e0566a);
+        border-color: var(--red, #e0566a);
+      }
+
+      /* 欢迎屏 */
+      .welcome {
+        max-width: 680px;
+        margin: 8vh auto 0;
+        text-align: center;
+        padding: 0 24px;
+        animation: rise 0.4s ease;
+      }
+      .welcome .big {
+        font-size: 30px;
+        font-weight: 800;
+        margin-bottom: 10px;
+      }
+      .welcome .big .g {
+        background: linear-gradient(95deg, var(--brand), var(--brand2));
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+      .welcome .sb {
+        color: var(--dim);
+        font-size: 15px;
+        line-height: 1.6;
+        margin-bottom: 28px;
+      }
+      .cards {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px;
+        text-align: left;
+      }
+      .qcard {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 15px 17px;
+        cursor: pointer;
+        transition: 0.15s;
+      }
+      .qcard:hover {
+        border-color: var(--brand);
+        transform: translateY(-2px);
+      }
+      /* Next-Actions 引导按钮(每条回复后) */
+      .na-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+        margin-top: 12px;
+        padding-top: 10px;
+        border-top: 1px solid var(--line);
+      }
+      .na-lbl {
+        font-size: 12px;
+        color: var(--brand-dim);
+        margin-right: 2px;
+      }
+      .na-chip {
+        background: rgba(247, 166, 0, 0.08);
+        border: 1px solid rgba(247, 166, 0, 0.3);
+        color: var(--brand2);
+        border-radius: 14px;
+        padding: 5px 12px;
+        font-size: 12.5px;
+        cursor: pointer;
+        transition: 0.15s;
+        white-space: nowrap;
+      }
+      .na-chip:hover {
+        background: var(--brand);
+        color: #1a1300;
+        border-color: var(--brand);
+      }
+      .qcard .qt {
+        font-size: 14px;
+        font-weight: 600;
+        margin-bottom: 4px;
+      }
+      .qcard .qd {
+        font-size: 12px;
+        color: var(--faint);
+      }
+
+      /* 输入区 */
+      .composer {
+        flex-shrink: 0;
+        padding: 14px 0 22px;
+        background: linear-gradient(to top, var(--bg) 60%, transparent);
+      }
+      .cbox {
+        max-width: 760px;
+        margin: 0 auto;
+        padding: 0 24px;
+      }
+      .inwrap {
+        background: var(--panel);
+        border: 1px solid var(--line2);
+        border-radius: 15px;
+        padding: 13px 15px;
+        transition: 0.15s;
+        display: flex;
+        flex-direction: column;
+        gap: 9px;
+      }
+      .inwrap:focus-within {
+        border-color: var(--brand);
+        box-shadow: 0 0 0 3px rgba(247, 166, 0, 0.1);
+      }
+      .inwrap textarea {
+        width: 100%;
+        background: transparent;
+        border: none;
+        outline: none;
+        color: var(--txt);
+        font-size: 15px;
+        font-family: var(--sans);
+        resize: none;
+        line-height: 1.5;
+        max-height: 160px;
+      }
+      .inwrap textarea::placeholder {
+        color: var(--faint);
+      }
+      .inrow {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+      .inrow .lf {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 12px;
+        color: var(--faint);
+      }
+      .tool {
+        width: 30px;
+        height: 30px;
+        border-radius: 8px;
+        border: 1px solid var(--line2);
+        background: transparent;
+        color: var(--dim);
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: 0.12s;
+      }
+      .tool:hover {
+        border-color: var(--brand);
+        color: var(--brand);
+      }
+      .send {
+        width: 34px;
+        height: 34px;
+        border-radius: 9px;
+        border: none;
+        background: var(--brand);
+        color: #0b0e11;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 16px;
+        font-weight: 800;
+        transition: 0.15s;
+      }
+      .send:hover {
+        background: var(--brand2);
+      }
+      .send:disabled {
+        background: var(--line2);
+        color: var(--faint);
+        cursor: not-allowed;
+      }
+      .disclaimer {
+        text-align: center;
+        font-size: 11px;
+        color: var(--faint);
+        margin-top: 9px;
+      }
+
+      /* typing */
+      .typing {
+        display: inline-flex;
+        gap: 4px;
+        align-items: center;
+      }
+      .typing span {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: var(--brand);
+        animation: blink 1.2s infinite;
+      }
+      .typing span:nth-child(2) {
+        animation-delay: 0.2s;
+      }
+      .typing span:nth-child(3) {
+        animation-delay: 0.4s;
+      }
+      @keyframes blink {
+        0%,
+        60%,
+        100% {
+          opacity: 0.25;
+        }
+        30% {
+          opacity: 1;
+        }
+      }
+
+      /* 思考过程面板(agent 处理期间的步骤提示) */
+      .think {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        color: var(--brand2);
+        font-size: 13px;
+      }
+      .think-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--brand);
+        box-shadow: 0 0 8px var(--brand);
+        animation: pulse 1s infinite;
+      }
+      .think-tx {
+        opacity: 0.85;
+      }
+      @keyframes pulse {
+        0%,
+        100% {
+          transform: scale(0.7);
+          opacity: 0.5;
+        }
+        50% {
+          transform: scale(1.1);
+          opacity: 1;
+        }
+      }
+
+      /* 信息卡片(agent 回复的可视化) */
+      .quote-card {
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 14px 16px;
+        margin: 4px 0 12px;
+        background: linear-gradient(
+          145deg,
+          rgba(247, 166, 0, 0.06),
+          rgba(255, 255, 255, 0.01)
+        );
+      }
+      .qc-head {
+        display: flex;
+        align-items: baseline;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+      .qc-sym {
+        font-weight: 700;
+        font-size: 15px;
+        color: #e8eef6;
+      }
+      .qc-price {
+        font-size: 22px;
+        font-weight: 700;
+        color: var(--brand2);
+        font-variant-numeric: tabular-nums;
+      }
+      .qc-chg {
+        font-size: 14px;
+        font-weight: 600;
+      }
+      .qc-grid {
+        display: flex;
+        gap: 22px;
+        margin-top: 10px;
+        flex-wrap: wrap;
+      }
+      .qc-k {
+        font-size: 11px;
+        color: var(--dim, #7a8aa0);
+      }
+      .qc-v {
+        font-size: 13px;
+        color: #cdd7e3;
+        font-variant-numeric: tabular-nums;
+        margin-top: 2px;
+      }
+
+      /* 连接状态条 */
+      .connbar {
+        position: absolute;
+        top: 56px;
+        left: 0;
+        right: 0;
+        background: rgba(58, 166, 255, 0.12);
+        border-bottom: 1px solid rgba(58, 166, 255, 0.3);
+        color: var(--blue);
+        font-size: 12px;
+        padding: 7px 24px;
+        text-align: center;
+        font-family: var(--mono);
+        display: none;
+      }
+      .connbar.show {
+        display: block;
+      }
+      .connbar.demo {
+        background: rgba(247, 166, 0, 0.1);
+        border-color: rgba(247, 166, 0, 0.3);
+        color: var(--brand2);
+      }
+      .connbar.err {
+        background: rgba(246, 70, 93, 0.1);
+        border-color: rgba(246, 70, 93, 0.3);
+        color: var(--red);
+      }
+
+      /* 加载遮罩(鉴权检查期间) */
+      .boot {
+        position: fixed;
+        inset: 0;
+        background: var(--bg);
+        z-index: 100;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 16px;
+      }
+      .boot .lg {
+        width: 56px;
+        height: 56px;
+        border-radius: 14px;
+        background: linear-gradient(135deg, var(--brand), var(--brand2));
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: 900;
+        color: #0b0e11;
+        font-size: 32px;
+      }
+      .boot .tx {
+        color: var(--dim);
+        font-size: 14px;
+      }
+
+      ::-webkit-scrollbar {
+        width: 9px;
+      }
+      ::-webkit-scrollbar-thumb {
+        background: var(--line2);
+        border-radius: 5px;
+      }
+      ::-webkit-scrollbar-track {
+        background: transparent;
+      }
+    </style>
+
+    <!-- ============ Cognito OAuth2 authorization-code + PKCE 鉴权门 ============
+         未登录 -> 跳 Hosted UI(code+PKCE);回调用 code 换 id/refresh token;
+         id_token 临过期用 refresh_token 静默换新(7天免登录),不踢回登录页。
+         治根因:旧 implicit flow 只拿 id_token(1h过期)、无 refresh,过期就掉线。 -->
+    <script>
+      // 账号相关值不再硬编码旧账号(judge迁移门):部署时 setup.sh/上传脚本 sed 注入
+      // 新账号真值(__OC_*__ 占位),git 源码不写死 → 迁账号零改前端、随部署继承。
+      // 占位未替换(本地直开)时检测=空,绝不把字面占位当真值。
+      var _ph = function (v) {
+        return v.indexOf("__OC_") === 0 ? "" : v;
+      };
+      window.OC_COGNITO_DOMAIN = _ph("__OC_COGNITO_DOMAIN__");
+      window.OC_COGNITO_CLIENT_ID = _ph("__OC_COGNITO_CLIENT_ID__");
+      // redirect 按当前页路径自适应:chat 页回 /chat/index.html、console 回 /console,
+      // 一套注入值两页通用,解 judge 指出的「一份 config 给不了两个 redirect」冲突。
+      window.OC_COGNITO_REDIRECT_URI =
+        window.location.origin + window.location.pathname;
+      // 控制面 API(跨域,CORS 已对全网放行)。用于动态拉当前用户的节点列表。
+      window.OC_API_URL = _ph("__OC_API_URL__");
+      // API Gateway 限流 key(usage-plan key,非授权凭据)。部署时 sed 注入真值
+      // (__OC_API_KEY__ 占位),git 不写死。空值回退 localStorage.oc_api_key。授权靠 Cognito+owner。
+      window.OC_API_KEY = _ph("__OC_API_KEY__");
+      // SECURITY (per-tenant isolation, no shared fallback): there is NO default
+      // tenant. A user may ONLY chat with a node that `GET /tenants` returns for
+      // them — that list is owner-scoped server-side (handler.py owner filter +
+      // hub authorizeSubForTenant). If a logged-in user has no running node of
+      // their own, the UI shows an explicit "no node" state and routes NOWHERE;
+      // it must never fall back to a shared/hardcoded tenant (that would route
+      // unrelated users into the same node — a cross-tenant breach). Do NOT
+      // reintroduce a window.OC_DEFAULT_TENANT or any hardcoded tenant id here.
+      window.OC_DEFAULT_TENANT = "";
+
+      // PKCE helpers (code_verifier / S256 challenge).
+      function _b64url(buf) {
+        return btoa(String.fromCharCode.apply(null, new Uint8Array(buf)))
+          .replace(/\+/g, "-")
+          .replace(/\//g, "_")
+          .replace(/=+$/, "");
+      }
+      function _randVerifier() {
+        var a = new Uint8Array(32);
+        crypto.getRandomValues(a);
+        return _b64url(a.buffer);
+      }
+      async function _challenge(verifier) {
+        var d = await crypto.subtle.digest(
+          "SHA-256",
+          new TextEncoder().encode(verifier),
+        );
+        return _b64url(d);
+      }
+      // POST to Cognito /oauth2/token. grant: "authorization_code" | "refresh_token".
+      async function _tokenExchange(domain, clientId, redirectUri, body) {
+        var r = await fetch("https://" + domain + "/oauth2/token", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams(body).toString(),
+        });
+        if (!r.ok) throw new Error("token endpoint HTTP " + r.status);
+        return await r.json();
+      }
+      function _storeTokens(t) {
+        if (t.id_token) localStorage.setItem("oc_id_token", t.id_token);
+        if (t.refresh_token)
+          localStorage.setItem("oc_refresh_token", t.refresh_token);
+        // id/access tokens are short-lived (≤24h); record absolute expiry so
+        // we can refresh proactively before the hub /token call would 401.
+        localStorage.setItem(
+          "oc_token_exp",
+          Date.now() + parseInt(t.expires_in || "3600", 10) * 1000,
+        );
+      }
+      // Silent refresh: swap a valid refresh_token for a fresh id_token. Returns
+      // the new id_token or null (caller falls back to interactive login).
+      async function refreshIdToken() {
+        var rt = localStorage.getItem("oc_refresh_token");
+        if (!rt) return null;
+        try {
+          var t = await _tokenExchange(
+            window.OC_COGNITO_DOMAIN,
+            window.OC_COGNITO_CLIENT_ID,
+            window.OC_COGNITO_REDIRECT_URI,
+            {
+              grant_type: "refresh_token",
+              client_id: window.OC_COGNITO_CLIENT_ID,
+              refresh_token: rt,
+            },
+          );
+          // refresh-token responses omit refresh_token unless rotation is on;
+          // _storeTokens keeps the existing one when absent.
+          _storeTokens(t);
+          return t.id_token || localStorage.getItem("oc_id_token");
+        } catch (e) {
+          return null;
+        }
+      }
+      window.refreshIdToken = refreshIdToken;
+
+      // authGate is async because the code→token exchange awaits a network call.
+      // The boot overlay stays until it resolves; index code runs after.
+      window.__authReady = (async function authGate() {
+        var host = window.location.hostname;
+        var isLocal =
+          window.location.protocol === "file:" ||
+          host === "localhost" ||
+          host === "127.0.0.1";
+        if (isLocal) {
+          window.OC_LOCAL = true;
+          return;
+        }
+
+        var domain = window.OC_COGNITO_DOMAIN;
+        var clientId = window.OC_COGNITO_CLIENT_ID;
+        var redirectUri = window.OC_COGNITO_REDIRECT_URI;
+
+        function gotoLogin() {
+          // generate + persist PKCE verifier, redirect to Hosted UI with S256.
+          var verifier = _randVerifier();
+          sessionStorage.setItem("oc_pkce_verifier", verifier);
+          _challenge(verifier).then(function (chal) {
+            var url =
+              "https://" +
+              domain +
+              "/oauth2/authorize?client_id=" +
+              clientId +
+              "&response_type=code&scope=openid+email&redirect_uri=" +
+              encodeURIComponent(redirectUri) +
+              "&code_challenge_method=S256&code_challenge=" +
+              chal;
+            window.location.href = url;
+          });
+        }
+
+        // 防御 1:已有未过期 id_token → 先清掉 URL 残留的 ?code= 再放行。
+        // authorization code 一次性,带着旧 code reload 会二次换取失败 → 死循环;
+        // 有有效 token 时根本不该再碰 code。这条最先判,斩断循环。
+        var token0 = localStorage.getItem("oc_id_token");
+        var exp0 = parseInt(localStorage.getItem("oc_token_exp") || "0", 10);
+        if (token0 && exp0 > Date.now()) {
+          if (window.location.search) history.replaceState({}, "", redirectUri);
+          return;
+        }
+
+        // 回调:?code= → 用 PKCE verifier 换 id/refresh token
+        var qs = new URLSearchParams(window.location.search);
+        var code = qs.get("code");
+        if (code) {
+          // 防御 2:换取前先把 ?code= 从地址栏抹掉,任何后续 reload 都不会
+          // 拿同一个(已消费的)code 再换一次。
+          history.replaceState({}, "", redirectUri);
+          var verifier = sessionStorage.getItem("oc_pkce_verifier");
+          if (verifier) {
+            try {
+              var t = await _tokenExchange(domain, clientId, redirectUri, {
+                grant_type: "authorization_code",
+                client_id: clientId,
+                code: code,
+                redirect_uri: redirectUri,
+                code_verifier: verifier,
+              });
+              _storeTokens(t);
+              sessionStorage.removeItem("oc_pkce_verifier");
+              return;
+            } catch (e) {
+              sessionStorage.removeItem("oc_pkce_verifier");
+              // 防御 3:换取失败不立刻再跳登录(否则 Cognito 有 session 会
+              // 秒发新 code 形成高速循环)。用 sessionStorage 计数,>=2 次
+              // 连续失败就停在错误态让用户手动重试,不无限刷新。
+              var fails =
+                parseInt(sessionStorage.getItem("oc_auth_fails") || "0", 10) +
+                1;
+              sessionStorage.setItem("oc_auth_fails", String(fails));
+              if (fails < 2) {
+                gotoLogin();
+              } else {
+                sessionStorage.removeItem("oc_auth_fails");
+                window.__authError = "登录换取失败,请刷新页面重试";
+              }
+              return;
+            }
+          }
+        }
+        // 走到这说明无有效 token、也没有可换的 code → 清零失败计数
+        sessionStorage.removeItem("oc_auth_fails");
+
+        // 有未过期 id_token → 放行(冗余兜底,正常已被防御1拦下)
+        var token = localStorage.getItem("oc_id_token");
+        var exp = parseInt(localStorage.getItem("oc_token_exp") || "0", 10);
+        if (token && exp > Date.now()) return;
+
+        // id_token 过期但有 refresh_token → 静默换新(7天内不踢登录)
+        if (localStorage.getItem("oc_refresh_token")) {
+          var fresh = await refreshIdToken();
+          if (fresh) return;
+        }
+
+        // 无 token 且无法刷新 → 跳 Hosted UI
+        localStorage.removeItem("oc_id_token");
+        gotoLogin();
+      })();
+    </script>
+  </head>
+  <body>
+    <!-- 鉴权/初始化遮罩,JS 起来后移除 -->
+    <div class="boot" id="boot">
+      <div class="lg">B</div>
+      <div class="tx">正在验证身份并连接你的智能体节点…</div>
+    </div>
+
+    <div class="app" style="display: none" id="appRoot">
+      <div class="appbody">
+        <!-- 左侧栏 -->
+        <aside class="side">
+          <div class="brand">
+            <div class="logo">📊</div>
+            <div class="nm">Finance<span class="pro">Agent</span></div>
+          </div>
+          <button class="newbtn" onclick="newSession()">＋ 新建对话</button>
+          <div class="navrow"><span class="i">🌤️</span> 天气速览</div>
+          <div class="navrow" onclick="loadHistory()" style="cursor: pointer">
+            <span class="i">◷</span> 历史记录
+          </div>
+          <div class="navrow"><span class="i">⚙</span> 设置</div>
+
+          <div class="seclbl">
+            我的智能体节点
+            <span class="rf" title="刷新节点" onclick="loadNodes()">↻</span>
+          </div>
+          <div class="nodes" id="nodeList">
+            <div class="empty">加载节点中…</div>
+          </div>
+
+          <div class="foot">
+            <div class="u">
+              <div class="ua" id="userInitial">·</div>
+              <span class="em" id="userEmail">未登录</span>
+            </div>
+            <span class="logout" id="logoutBtn" onclick="logout()">退出</span>
+          </div>
+        </aside>
+
+        <!-- 主聊天区 -->
+        <main class="main">
+          <div class="topbar">
+            <div class="ti">
+              <div class="av">📊</div>
+              <div>
+                <div class="nm" id="hdrName">Finance Agent</div>
+                <div class="st">
+                  <span class="d"></span><span id="hdrNode">— · 连接中</span>
+                </div>
+              </div>
+            </div>
+            <div class="tr">
+              <span class="modelchip" id="modelChip">Claude Sonnet 4.6</span>
+            </div>
+          </div>
+
+          <div class="connbar" id="connBar"></div>
+
+          <div class="chat" id="chat">
+            <div class="welcome" id="welcome">
+              <div class="big">
+                你好,我是 <span class="g">Finance Agent</span> 📊
+              </div>
+              <div class="sb">
+                运行在你专属的隔离微虚拟机里 · 身份与技能不可篡改 ·
+                数据不出你的沙箱<br />问我天气、聊聊问题,或核验我的身份与技能。
+              </div>
+              <div class="cards">
+                <div
+                  class="qcard"
+                  onclick="
+                    quickAsk('东京今天天气怎么样?')
+                  "
+                >
+                  <div class="qt">🌤️ 天气速览</div>
+                  <div class="qd">当前天气 + 短期预报</div>
+                </div>
+                <div
+                  class="qcard"
+                  onclick="
+                    quickAsk('帮我把这段长文总结成三点。')
+                  "
+                >
+                  <div class="qt">📝 资料总结</div>
+                  <div class="qd">长文压缩成要点</div>
+                </div>
+                <div
+                  class="qcard"
+                  onclick="
+                    quickAsk(
+                      '你是谁?谁运营你?运行在什么隔离环境?身份文件能改吗?',
+                    )
+                  "
+                >
+                  <div class="qt">🪪 身份核验</div>
+                  <div class="qd">确认我连的是哪个助手</div>
+                </div>
+                <div
+                  class="qcard"
+                  onclick="
+                    quickAsk('列出你能用的技能,并说明哪些是只读不可篡改的。')
+                  "
+                >
+                  <div class="qt">🛡️ 技能与安全</div>
+                  <div class="qd">能力边界 + 不可篡改性</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="composer">
+            <div class="cbox">
+              <div class="inwrap">
+                <textarea
+                  id="input"
+                  rows="1"
+                  placeholder="给 Finance Agent 发消息(Enter 发送,Shift+Enter 换行)"
+                  oninput="autoGrow(this)"
+                  onkeydown="onKey(event)"
+                ></textarea>
+                <div class="inrow">
+                  <div class="lf">
+                    <input
+                      type="file"
+                      id="fileInput"
+                      accept="image/png,image/jpeg,image/gif,image/webp"
+                      style="display: none"
+                      onchange="onPickImage(event)"
+                    />
+                    <button
+                      class="tool"
+                      title="发送图片"
+                      onclick="document.getElementById('fileInput').click()"
+                    >
+                      ＋
+                    </button>
+                    <button class="tool" title="语音">🎙</button>
+                    <span style="margin-left: 4px">标准模式</span>
+                  </div>
+                  <button class="send" id="sendBtn" onclick="send()">↑</button>
+                </div>
+              </div>
+              <div class="disclaimer">
+                Finance Agent
+                可能会出错,仅供参考、非投资建议。每条对话经 Bedrock
+                Guardrail 过滤。
+              </div>
+            </div>
+          </div>
+        </main>
+      </div>
+    </div>
+
+    <script>
+      // ============ 运行环境探测 ============
+      // 生产(https,CloudFront):走 claw-channel 签名两跳(见下方 callGateway):
+      //   先 POST {API}/chat/sign 拿签名,再同源 POST /chat/{tenant}/inbound 经
+      //   CloudFront → ALB → nginx → 签名 webhook。gateway_token 不再进浏览器。
+      // 现场 demo(file:// / localhost):走本地代理 127.0.0.1:8799/chat(token 在代理进程内存)。
+      const IS_LOCAL = !!window.OC_LOCAL;
+      const PROXY = "http://127.0.0.1:8799"; // 本地代理(SSH 隧道到 metal)— 仅 demo 兜底
+      const ORIGIN = window.location.origin; // 同源 CloudFront,反代 /vm/*
+
+      // 静态降级节点(API 拉不到时显示,保证界面不空;对话仍可尝试经反代连通)
+      const STATIC_NODES = [
+        {
+          id: "ro-test-01",
+          tenant: "ro-test-01",
+          label: "ro-test-01",
+          host: "metal · vm47",
+          online: true,
+        },
+      ];
+
+      let NODES = [];
+      let active = null;
+      let history = [];
+
+      // ============ 节点列表:从控制面 API 动态拉 ============
+      // GET /tenants 带 Cognito id_token(Bearer)+ x-api-key。
+      // RBAC owner 过滤后只返回当前用户自己的节点。拉不到就降级静态。
+      function idToken() {
+        return localStorage.getItem("oc_id_token") || "";
+      }
+      // 当前登录用户的 Cognito sub(解 id_token)。用于在节点列表里优先选中
+      // **自己 owner 的**节点——admin 角色会从 GET /tenants 拿到全部节点,若盲选
+      // NODES[0] 可能选中别人的节点→发消息时 hub authorizeSubForTenant 判 sub≠owner
+      // 返回 "not authorized for this tenant"。自助节点 id 形如 u-{sub前8}-xxxx。
+      function mySub() {
+        const t = idToken();
+        if (t.split(".").length !== 3) return "";
+        try {
+          const p = JSON.parse(
+            atob(t.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")),
+          );
+          return p.sub || "";
+        } catch (e) {
+          return "";
+        }
+      }
+      // 从节点列表挑「属于当前用户」的优先项:id 以 u-{sub前8} 开头(自助命名约定)。
+      function pickOwnNode(nodes) {
+        const sub = mySub();
+        if (sub) {
+          const pfx = "u-" + sub.slice(0, 8).toLowerCase();
+          const own = nodes.find((n) =>
+            (n.id || "").toLowerCase().startsWith(pfx),
+          );
+          if (own) return own;
+        }
+        return nodes[0];
+      }
+      function apiKey() {
+        // 共享网关限流 key(非用户私密,API Gateway usage-plan key,非授权凭据)。
+        // 优先用部署时注入的 window.OC_API_KEY(setup.sh 上传 chat 页时 sed 注入,
+        // 不写死进 git 源码——红线);否则回退控制台共用的 localStorage.oc_api_key。
+        // 授权仍由 Cognito id_token + 后端 owner scoping 决定;这个 key 只为过
+        // API Gateway 的限流门,自助用户不必手动输 key 也能列出+连自己的节点。
+        return window.OC_API_KEY || localStorage.getItem("oc_api_key") || "";
+      }
+
+      async function loadNodes(opts) {
+        opts = opts || {};
+        const el = document.getElementById("nodeList");
+        if (IS_LOCAL) {
+          NODES = STATIC_NODES.slice();
+          if (!active) active = NODES[0];
+          renderNodes();
+          return;
+        }
+        try {
+          const url = window.OC_API_URL.replace(/\/+$/, "") + "/tenants";
+          // Cognito id_token 是授权凭据:GET /tenants 带它(非 admin)后端按
+          // owner_id 只返回调用者名下的节点(handler.py issue #80 owner scoping),
+          // 所以自助开通的用户**不需要** gateway key 就能列出+连自己的节点。
+          // x-api-key 只是 API Gateway 的限流 key(可选);页面注入了就带上,
+          // 没有也照常发(跟 provisionMyNode 一致)——缺它不该阻止用户看到自己的节点。
+          const headers = { Authorization: "Bearer " + idToken() };
+          const k = apiKey();
+          if (k) headers["x-api-key"] = k;
+          const r = await fetch(url, { headers });
+          if (r.status === 401) throw new Error("NEED_LOGIN");
+          if (r.status === 403 && !k) throw new Error("NO_API_KEY");
+          if (r.status === 403) throw new Error("BAD_API_KEY");
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          const items = await r.json();
+          if (!Array.isArray(items)) throw new Error("bad shape");
+          // chat 是 C 端对话:只展示**当前用户自己 owner 的** running 节点。
+          // 非 admin 后端已 owner-scope;但 admin 角色(运营兼用同账号)会拿到全部
+          // 节点,若不在前端再过滤一次,会列出别人的节点→选中后发消息撞 hub
+          // authorizeSubForTenant 的 'not authorized for this tenant'(sub≠owner)。
+          // 有 sub 就按 owner_id===sub 过滤;拿不到 sub(降级)才不过滤。
+          const _sub = mySub();
+          const mapped = items
+            .filter((t) => (t.status || "") === "running")
+            .filter((t) => !_sub || !t.owner_id || t.owner_id === _sub)
+            .map((t) => ({
+              id: t.id,
+              tenant: t.id,
+              label: t.name || t.id,
+              host: (t.host_id || "—") + (t.guest_ip ? " · " + t.guest_ip : ""),
+              online: (t.app_health || "") === "up" || t.status === "running",
+              // #15: 不再在浏览器侧持有 gateway_token(已由 #100 从 API 响应剥离,
+              // 且 chat 走 hub 短时 token,gateway_token 永不进浏览器)。删死字段。
+            }));
+          if (mapped.length === 0) throw new Error("no running tenants");
+          NODES = mapped;
+          // 优先选当前用户自己 owner 的节点(admin 会看到全部节点,盲选 NODES[0]
+          // 可能选中别人的→hub 返回 not authorized for this tenant)。
+          if (!active || !NODES.find((n) => n.id === active.id))
+            active = pickOwnNode(NODES);
+          renderNodes();
+          selectNode(active.id, true);
+        } catch (e) {
+          const msg = String(e.message || e);
+          // 缺/错网关 key — 提示用户输入一次(存 localStorage,不进源码)。
+          // 不自动弹窗骚扰;在节点区放一个「连接」入口,点了才提示。
+          if (
+            (msg === "NO_API_KEY" || msg === "BAD_API_KEY") &&
+            !opts.noPrompt
+          ) {
+            // The gateway key is ONLY for the optional "list my nodes" sidebar;
+            // chat itself runs over Cognito + the hub WS and needs no key. So a
+            // missing key is not an error — render the quiet sidebar prompt but
+            // do NOT raise the alarming red connection banner (it falsely reads
+            // as "chat is broken"). Only a genuinely bad key warrants the banner.
+            renderNeedKey(msg === "BAD_API_KEY");
+            if (msg === "BAD_API_KEY") {
+              showConn(
+                "网关连接 key 无效(仅影响左侧节点列表,不影响对话)。",
+                true,
+              );
+            }
+            return;
+          }
+          // 其它失败:仅本地开发可降级到静态节点(走本地代理,不涉真实租户隔离)。
+          // 生产环境绝不降级到共享静态节点——那等于把拉不到自己节点的用户路由到
+          // 一个公共节点(跨租户泄漏)。生产失败时清空节点列表 + 明确提示,路由到任何
+          // 节点都不发生。
+          if (IS_LOCAL) {
+            NODES = STATIC_NODES.slice();
+            if (!active) active = NODES[0];
+            renderNodes();
+            showConn(
+              "本地节点列表降级为静态(API 未返回:" + msg.slice(0, 60) + ")。",
+              true,
+            );
+          } else {
+            NODES = [];
+            active = null;
+            renderNodes();
+            showConn(
+              "无法加载你的节点列表(" +
+                msg.slice(0, 60) +
+                ")。请刷新或联系管理员开通节点。",
+              true,
+            );
+          }
+        }
+      }
+
+      // 缺网关 key 时的引导(点击才输入,key 只进 localStorage)
+      function renderNeedKey(wasBad) {
+        const el = document.getElementById("nodeList");
+        el.innerHTML = `
+      <div class="empty">
+        ${wasBad ? "网关连接 key 无效。" : "尚未配置网关连接 key。"}<br>
+        配置后即可列出你名下的运行中节点。<br><br>
+        <span class="rf" style="border:1px solid var(--line2);border-radius:7px;padding:6px 12px;color:var(--brand)"
+              onclick="promptKey()">输入网关连接 key</span>
+      </div>`;
+      }
+      function promptKey() {
+        const k = window.prompt(
+          "输入网关连接 key(由管理员提供;仅存本浏览器 localStorage,不写入页面源码):",
+        );
+        if (k && k.trim()) {
+          localStorage.setItem("oc_api_key", k.trim());
+          showConn("已保存连接 key,正在拉取节点…", false);
+          loadNodes();
+        }
+      }
+
+      function renderNodes() {
+        const el = document.getElementById("nodeList");
+        if (!NODES.length) {
+          // 自助开通:名下无节点时,让用户一键为自己开通(POST /tenants/self),
+          // 不再只提示"联系管理员"。按钮在开通中禁用并显示进度。
+          el.innerHTML = `
+        <div class="empty">
+          你名下还没有 AI 节点。<br><br>
+          <span id="provisionBtn" class="rf"
+                style="border:1px solid var(--line2);border-radius:7px;padding:8px 14px;color:var(--brand);cursor:pointer"
+                onclick="provisionMyNode()">＋ 开通我的 AI 节点</span>
+          <div id="provisionMsg" style="margin-top:10px;color:var(--muted);font-size:12px"></div>
+        </div>`;
+          return;
+        }
+        el.innerHTML = NODES.map(
+          (n) => `
+      <div class="node ${active && n.id === active.id ? "on" : ""}" onclick="selectNode('${n.id}')">
+        <div class="nt"><span class="dot ${n.online ? "" : "off"}"></span>${escapeHtml(n.label)}</div>
+        <div class="meta">${escapeHtml(n.host)} · ${n.online ? "running" : "stopped"}</div>
+      </div>`,
+        ).join("");
+      }
+
+      // 自助开通自己的 openclaw 节点:POST /tenants/self(owner 由后端绑登录态,
+      // 后端有 per-user 上限防滥用)→ 轮询到 running → 自动选中进对话。
+      let _provisioning = false;
+      async function provisionMyNode() {
+        if (_provisioning) return;
+        _provisioning = true;
+        const btn = document.getElementById("provisionBtn");
+        const msg = document.getElementById("provisionMsg");
+        const setMsg = (t) => {
+          if (msg) msg.textContent = t;
+        };
+        if (btn) {
+          btn.style.opacity = "0.5";
+          btn.style.pointerEvents = "none";
+        }
+        try {
+          const base = window.OC_API_URL.replace(/\/+$/, "");
+          const headers = {
+            Authorization: "Bearer " + idToken(),
+            "Content-Type": "application/json",
+          };
+          const k = apiKey();
+          if (k) headers["x-api-key"] = k;
+          setMsg("正在为你开通 AI 节点…");
+          const r = await fetch(base + "/tenants/self", {
+            method: "POST",
+            headers,
+            body: JSON.stringify({}),
+          });
+          if (r.status === 401) throw new Error("请先登录再开通");
+          if (r.status === 409) {
+            const j = await r.json().catch(() => ({}));
+            throw new Error(j.error || "已达节点上限");
+          }
+          if (!r.ok) throw new Error("开通失败 HTTP " + r.status);
+          const created = await r.json();
+          const newId = created.id;
+          setMsg("节点创建中(creating→running),约需 30 秒…");
+          // 轮询 GET /tenants 直到这个新节点 running(最多 ~90s)
+          for (let i = 0; i < 30; i++) {
+            await new Promise((s) => setTimeout(s, 3000));
+            await loadNodes({ noPrompt: true });
+            const found = NODES.find((n) => n.id === newId);
+            if (found) {
+              setMsg("节点已就绪,正在进入对话…");
+              selectNode(newId);
+              _provisioning = false;
+              return;
+            }
+          }
+          setMsg("节点已创建,仍在启动中。稍后点刷新(↻)即可看到。");
+        } catch (e) {
+          setMsg("开通失败:" + (e && e.message ? e.message : e));
+          if (btn) {
+            btn.style.opacity = "1";
+            btn.style.pointerEvents = "auto";
+          }
+        } finally {
+          _provisioning = false;
+        }
+      }
+
+      function selectNode(id, silent) {
+        active = NODES.find((n) => n.id === id) || active;
+        if (!active) return;
+        document.getElementById("hdrNode").textContent =
+          active.label + (active.online ? " · 在线" : " · 离线");
+        renderNodes();
+        if (!silent) resetChat();
+        if (active.online) {
+          showConn(
+            IS_LOCAL
+              ? "已连接 OpenClaw gateway · Claude Sonnet 4.6 · 经本地代理"
+              : "已连接 OpenClaw gateway · Claude Sonnet 4.6 · 经 CloudFront 反代(同源)",
+            false,
+          );
+        } else {
+          showConn(`${active.label} 当前离线 — 选一个 running 节点对话`, true);
+        }
+      }
+
+      // 多会话 threadId: one threadId per conversation. "新建对话"
+      // mints a fresh one so the agent gets an isolated context (channel embeds it
+      // as sub:t:threadId in the session key). Persisted so a page refresh keeps
+      // the same conversation. crypto.randomUUID with a fallback.
+      function newThreadId() {
+        try {
+          if (crypto && crypto.randomUUID) return crypto.randomUUID();
+        } catch (_) {}
+        return (
+          "t-" +
+          Date.now().toString(36) +
+          "-" +
+          Math.random().toString(36).slice(2, 8)
+        );
+      }
+      // #41: a thread persisted in sessionStorage means this is a refresh/reopen
+      // of an existing conversation → auto-load its history on boot. A brand-new
+      // thread (fresh login) has nothing to load.
+      const _threadPreexisted = !!sessionStorage.getItem("oc_active_thread");
+      let _activeThreadId =
+        sessionStorage.getItem("oc_active_thread") || newThreadId();
+      sessionStorage.setItem("oc_active_thread", _activeThreadId);
+      function resetChat() {
+        history = [];
+        document.getElementById("chat").innerHTML =
+          document.getElementById("welcome").outerHTML;
+      }
+      function newSession() {
+        // #13 先丢弃当前 thread 在途的请求(reject + 清门控),再切新 thread。
+        // 否则旧 thread 的 reply_delta 会写到马上被 resetChat 移除的气泡,且发送
+        // 门控卡在 true 让新会话发不出消息,直到旧请求 90s 超时。
+        _abortInflight("已切换到新对话");
+        // start a fresh isolated conversation thread
+        _activeThreadId = newThreadId();
+        sessionStorage.setItem("oc_active_thread", _activeThreadId);
+        resetChat();
+      }
+
+      // 会话历史回看 (PRD #40-43): ask the channel (via the hub WS) for the past
+      // turns of the ACTIVE thread, then render them into the chat. The hub stamps
+      // the server-verified sub so only this user's own thread is ever returned
+      // (IDOR guard lives server-side). Used by the "历史记录" button and on
+      // reconnect/refresh so the conversation survives a reload (#41).
+      function resolveActiveNode() {
+        // Only a node the user actually owns (set via selectNode from the
+        // owner-scoped GET /tenants list) is ever active. No synthesis from a
+        // default/hardcoded tenant — no node of your own means route nowhere.
+        return active || null;
+      }
+      async function fetchHistory(limit) {
+        const node = resolveActiveNode();
+        if (!node) throw new Error("没有选中的节点");
+        const ws = await ensureHub(node);
+        const requestId = newReqId();
+        return await new Promise((resolve) => {
+          _histPending.set(requestId, { resolve });
+          // 12s 超时:解掉 pending 给空结果,避免 UI 永久 loading
+          const to = setTimeout(() => {
+            if (_histPending.has(requestId)) {
+              _histPending.delete(requestId);
+              resolve({ messages: [], error: "timeout" });
+            }
+          }, 12000);
+          const orig = _histPending.get(requestId).resolve;
+          _histPending.set(requestId, {
+            resolve: (v) => {
+              clearTimeout(to);
+              orig(v);
+            },
+          });
+          ws.send(
+            JSON.stringify({
+              type: "history_request",
+              requestId,
+              threadId: _activeThreadId,
+              limit: limit || 50,
+            }),
+          );
+        });
+      }
+      function renderHistory(messages) {
+        resetChat();
+        if (!messages || !messages.length) {
+          showConn("本对话暂无历史记录", true);
+          return;
+        }
+        const w = document.getElementById("welcome");
+        if (w) w.remove();
+        for (const m of messages) {
+          if (!m || typeof m.text !== "string" || !m.text.trim()) continue;
+          if (m.role === "assistant") {
+            const ct = addMsg("ai", "");
+            ct.innerHTML = renderMd(m.text);
+          } else {
+            addMsg("me", m.text);
+          }
+        }
+      }
+      async function loadHistory() {
+        if (_histLoading) return;
+        _histLoading = true;
+        try {
+          const { messages, error } = await fetchHistory(50);
+          if (error && !messages.length) {
+            showConn(
+              error === "timeout" ? "历史加载超时,可重试" : "暂无历史记录",
+              true,
+            );
+            return;
+          }
+          renderHistory(messages);
+        } catch (e) {
+          showConn("历史加载失败: " + (e && e.message), true);
+        } finally {
+          _histLoading = false;
+        }
+      }
+      function quickAsk(t) {
+        document.getElementById("input").value = t;
+        send();
+      }
+
+      // 思考过程面板:按用户问题推断 agent 正在做的步骤,在回复气泡里轮换显示。
+      // 返回 interval id,调用方在回复到达/出错时 clearInterval。纯前端 UX,文案是
+      // 中性的"正在做某类事"。
+      function thinkingSteps(q) {
+        const r = (q || "").toLowerCase();
+        const has = (...ws) => ws.some((w) => r.includes(w));
+        if (has("天气", "weather", "气温", "下雨", "预报"))
+          return [
+            "接收请求",
+            "查询公共天气数据",
+            "解析当前天气与预报",
+            "组织回复",
+          ];
+        if (has("总结", "摘要", "summarize", "概括", "要点"))
+          return [
+            "接收请求",
+            "通读来源内容",
+            "提炼关键要点",
+            "组织结论",
+          ];
+        if (has("身份", "你是谁", "skill", "技能", "能做"))
+          return [
+            "接收请求",
+            "读取身份与能力清单",
+            "确认沙箱与不可篡改约束",
+            "组织回复",
+          ];
+        return ["接收请求", "理解意图", "检索相关数据", "组织回复"];
+      }
+      function startThinking(ctEl, q) {
+        const steps = thinkingSteps(q);
+        let i = 0;
+        const render = () => {
+          const cur = steps[Math.min(i, steps.length - 1)];
+          ctEl.innerHTML =
+            '<div class="think"><span class="think-dot"></span>' +
+            '<span class="think-tx">' +
+            cur +
+            "…</span></div>";
+        };
+        render();
+        return setInterval(() => {
+          i++;
+          if (i < steps.length) render();
+        }, 1400);
+      }
+
+      // Next-Actions: 每条回复后给 2-3 个相关「下一步」建议。按回复内容关键词派生,
+      // 点击回填并发送。纯前端,不依赖后端协议。
+      function suggestNextActions(reply) {
+        const r = (reply || "").toLowerCase();
+        const has = (...ws) => ws.some((w) => r.includes(w));
+        const out = [];
+        if (has("天气", "weather", "气温", "下雨", "预报")) {
+          out.push(["🌤️ 明天预报", "那这个城市明天的天气预报呢?"]);
+          out.push(["🧳 出行建议", "根据天气给我一点出行/穿衣建议。"]);
+        }
+        if (has("总结", "摘要", "要点", "概括")) {
+          out.push(["📝 再精简", "把它再压缩成一句话。"]);
+        }
+        if (has("身份", "skill", "技能", "finance agent", "📊")) {
+          out.push(["🛡️ 能力边界", "你哪些技能是只读不可篡改的?"]);
+        }
+        // 默认兜底:总给一组通用下一步
+        if (out.length === 0) {
+          out.push(["🌤️ 查天气", "东京今天天气怎么样?"]);
+          out.push(["📝 帮我总结", "帮我把一段长文总结成三点。"]);
+        }
+        return out.slice(0, 3);
+      }
+
+      function renderNextActions(reply) {
+        const acts = suggestNextActions(reply);
+        if (!acts.length) return "";
+        const chips = acts
+          .map(
+            (a) =>
+              `<button class="na-chip" onclick="quickAsk(${JSON.stringify(a[1]).replace(/"/g, "&quot;")})">${a[0]}</button>`,
+          )
+          .join("");
+        return `<div class="na-row"><span class="na-lbl">下一步</span>${chips}</div>`;
+      }
+
+      function autoGrow(t) {
+        t.style.height = "auto";
+        t.style.height = Math.min(t.scrollHeight, 160) + "px";
+      }
+      function onKey(e) {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          send();
+        }
+      }
+
+      function escapeHtml(s) {
+        return (s || "")
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;");
+      }
+
+      function addMsg(role, text) {
+        const w = document.getElementById("welcome");
+        if (w) w.remove();
+        const chat = document.getElementById("chat");
+        const t = new Date().toLocaleTimeString("zh-CN", {
+          hour: "2-digit",
+          minute: "2-digit",
+        });
+        const isAI = role === "ai";
+        const div = document.createElement("div");
+        div.className = "msg " + (isAI ? "ai" : "me");
+        div.innerHTML = `
+      <div class="ava">${isAI ? "📊" : userInitialChar()}</div>
+      <div class="bd">
+        <div class="who">${isAI ? "Finance Agent" : "你"}<span class="t">${t}</span></div>
+        <div class="ct">${isAI ? "" : escapeHtml(text)}</div>
+      </div>`;
+        if (!chat.querySelector(".cwrap")) {
+          chat.innerHTML = '<div class="cwrap" id="cwrap"></div>';
+        }
+        document.getElementById("cwrap").appendChild(div);
+        chat.scrollTop = chat.scrollHeight;
+        return div.querySelector(".ct");
+      }
+
+      function userInitialChar() {
+        const em = localStorage.getItem("oc_user_email") || "A";
+        return (em[0] || "A").toUpperCase();
+      }
+
+      // 极简 Markdown 渲染(先 HTML 转义防注入,再处理 **粗体** / `代码` / 链接 / 换行)
+      function renderMd(s) {
+        const esc = escapeHtml(s);
+        const base = esc
+          .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+          .replace(/`([^`]+)`/g, "<code>$1</code>")
+          .replace(
+            /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+            '<a href="$2" target="_blank" rel="noopener" style="color:var(--brand2)">$1</a>',
+          )
+          .replace(/\n/g, "<br>");
+        return base;
+      }
+
+      function showConn(msg, demo) {
+        const b = document.getElementById("connBar");
+        b.textContent = msg;
+        b.className = "connbar show" + (demo ? " demo" : "");
+      }
+
+      // 用户从 ＋ 选了一张图:经中枢预签名 URL 上传到 S3,在自己的气泡里显示,
+      // 并把 fileKey 随下一条消息发给 agent(与主流 AI 助手发图交互一致)。
+      // 上传走中枢(持唯一 S3 凭据),浏览器只拿到短时预签名 PUT URL。
+      async function onPickImage(ev) {
+        const file = ev.target.files && ev.target.files[0];
+        ev.target.value = ""; // 允许重复选同一文件
+        if (!file) return;
+        const MAX = 20 * 1024 * 1024;
+        const okMime = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+        if (!okMime.includes(file.type)) {
+          showConn("不支持的图片格式", true);
+          return;
+        }
+        if (file.size > MAX) {
+          showConn("图片超过 20MB 上限", true);
+          return;
+        }
+        if (!active) {
+          // No node of your own → don't route anywhere (no shared fallback).
+          showConn(
+            "你名下没有可用的 AI 节点,无法发图。请联系管理员开通节点。",
+            true,
+          );
+          return;
+        }
+        const slot = addMsg("me", "");
+        slot.innerHTML = '<div class="media-loading">上传中…</div>';
+        try {
+          await ensureHub(active); // 确保有 _hubToken
+          // 1. 取预签名 PUT URL
+          const up = await fetch(hubBase() + "/files/upload-url", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: "Bearer " + _hubToken,
+            },
+            body: JSON.stringify({ mimeType: file.type, size: file.size }),
+          });
+          if (!up.ok) throw new Error("upload-url " + up.status);
+          const uj = await up.json();
+          const fileKey = uj?.data?.fileKey;
+          const putUrl = uj?.data?.url;
+          if (!fileKey || !putUrl) throw new Error("预签名缺失");
+          // 2. PUT 到 S3
+          const put = await fetch(putUrl, {
+            method: "PUT",
+            headers: { "Content-Type": file.type },
+            body: file,
+          });
+          if (!put.ok) throw new Error("S3 PUT " + put.status);
+          // 3. 本地预览(直接用 objectURL,不必再下载)
+          const localUrl = URL.createObjectURL(file);
+          slot.innerHTML = `<img src="${localUrl}" alt="my image" />`;
+          const chat = document.getElementById("chat");
+          if (chat) chat.scrollTop = chat.scrollHeight;
+          // 4. 发一条带 fileKey 的消息给 agent。注:agent 端「看图」(多模态视觉
+          //    输入)需 OpenClaw core 的图片输入通道,属下一步;当前先打通上传+
+          //    在会话里携带图片引用,文本侧 agent 可感知用户发了图。
+          const ws = await ensureHub(active);
+          ws.send(
+            JSON.stringify({
+              text: "[用户发送了一张图片]",
+              threadId: _activeThreadId,
+              attachments: [
+                {
+                  fileKey,
+                  mimeType: file.type,
+                  type: "image",
+                  name: file.name,
+                },
+              ],
+            }),
+          );
+          history.push({ role: "user", content: "[图片]" });
+        } catch (e) {
+          slot.innerHTML = `<div class="media-err">图片上传失败:${escapeHtml(String(e).slice(0, 80))}</div>`;
+        }
+      }
+
+      async function send() {
+        // Per-tenant isolation: you can only chat with a node you own. `active`
+        // is set exclusively from the owner-scoped GET /tenants list (via
+        // selectNode); the hub token then binds to that verified sub + tenant_id.
+        // No node of your own → refuse and route NOWHERE (never a shared default).
+        if (!active) {
+          showConn(
+            "你名下没有可用的 AI 节点。请联系管理员为你的账号开通节点后再对话。",
+            true,
+          );
+          return;
+        }
+        const inp = document.getElementById("input");
+        const text = inp.value.trim();
+        if (!text) return;
+        // #2 发送中门控:上一条还在途就忽略这次(不清输入、留着让用户等或改),
+        // 给一条轻提示。避免连点/连发并发打爆 hub、避免气泡观感卡死。
+        if (_isSending) {
+          showConn("上一条还在回复中,请稍候…", false);
+          return;
+        }
+        // #2 置位门控后,从这里到 finally 的所有代码(含 addMsg 等同步 DOM 操作)
+        // 都在 try 内——任何一步抛错(如 DOM 未就绪)finally 都会复位 _isSending,
+        // 绝不因 try 外抛错把用户永久锁死(review Warning 修正:enter/exit 对称绑定同一 try)。
+        _isSending = true;
+        _setSendingUI(true);
+        let _thinkTimer = null;
+        let ctEl = null;
+        try {
+          inp.value = "";
+          autoGrow(inp);
+          addMsg("me", text);
+          history.push({ role: "user", content: text });
+          ctEl = addMsg("ai", "");
+          ctEl.innerHTML =
+            '<span class="typing"><span></span><span></span><span></span></span>';
+          // 思考过程面板(对齐主流 AI 助手 StatusParts):agent 处理期间,根据用户
+          // 问题推断它在做什么,轮换显示步骤。首个 reply_delta 到达(callGateway 内 onDelta
+          // 改 innerHTML)会自然覆盖掉它。纯前端,不依赖后端真实 step 事件。
+          _thinkTimer = startThinking(ctEl, text);
+          // 并发修复: this bubble is bound to its request via clientMessageId inside
+          // callGateway (reply_delta/reply route to it by id). Multiple sends in
+          // flight each keep their own bubble — no global, no cross-wiring.
+          const res = await callGateway(active, text, ctEl);
+          clearInterval(_thinkTimer);
+          // callGateway 现在返回 {text, files}。兼容旧的纯字符串返回。
+          const reply = typeof res === "string" ? res : res?.text || "";
+          const files = typeof res === "string" ? [] : res?.files || [];
+          // 护栏拦截识别:当回复是 LLM/Guardrail 错误占位(如 Bedrock Guardrail
+          // 返回 400 Violated guardrail policy → 网关给出 "Something went wrong"
+          // 占位)时,不当普通回复渲染,改成像主流 AI 助手那样的明确安全提示。
+          // 例外:回复带图片(agent 出图)时即使文本为空也不算拦截。
+          if (files.length === 0 && isGuardrailBlocked(reply)) {
+            ctEl.innerHTML =
+              '<div class="guard-block">🔒 这个请求触发了安全护栏,已被拦截。<br>' +
+              '<span style="opacity:.7;font-size:.92em">涉及越权、数据外泄或越狱探测的请求会在平台层被阻断。换个问题试试,或问问天气、让我帮你总结资料。</span></div>';
+            history.push({ role: "assistant", content: "[安全护栏拦截]" });
+          } else if (files.length === 0 && isTransientError(reply)) {
+            // 通用/瞬时错误(Something went wrong / TPS 限流)→ 中性"出错可重试",
+            // 不误报护栏。实测后端同问题 localhost 答对,经 CloudFront 偶发此占位。
+            ctEl.innerHTML =
+              '<span style="opacity:.75">⚠️ 处理出错了,请再发一次试试。</span>';
+            history.push({ role: "assistant", content: "[处理出错]" });
+          } else if (files.length === 0 && !reply) {
+            // 空回复(超时/agent 偶发/reply_error)→ 中性提示可重试,别误报护栏。
+            ctEl.innerHTML =
+              '<span style="opacity:.7">没收到回复,请再发一次。</span>';
+            history.push({ role: "assistant", content: "[空回复]" });
+          } else {
+            ctEl.innerHTML =
+              (reply ? renderMd(reply) : "") +
+              renderFiles(files) +
+              (reply ? renderNextActions(reply) : "");
+            // 异步把 fileKey 换成预签名 URL 填进 <img>(agent 出图)。
+            hydrateFiles(ctEl, files);
+            history.push({
+              role: "assistant",
+              content: reply + (files.length ? ` [图片×${files.length}]` : ""),
+            });
+          }
+        } catch (err) {
+          clearInterval(_thinkTimer);
+          // #13 主动丢弃(切换会话/断连时 _abortInflight reject)不是"连接失败":
+          // 带 aborted 哨兵的 reject 静默跳过,不弹红色错误条(cancel ≠ error)。
+          // finally 仍会复位门控(此时 _abortInflight 已复位,无害幂等)。
+          if (err && err.aborted) return;
+          const m = String(err);
+          // ctEl 可能在创建前就抛错(DOM 未就绪)→ 判空,避免 catch 内二次抛错。
+          if (ctEl && isGuardrailBlocked(m)) {
+            ctEl.innerHTML =
+              '<div class="guard-block">🔒 这个请求触发了安全护栏,已被拦截。</div>';
+          } else if (ctEl) {
+            ctEl.innerHTML = `<span style="color:var(--red)">[连接失败] </span>${escapeHtml(m.slice(0, 200))}`;
+            showConn("连接失败:" + m.slice(0, 80), true);
+          } else {
+            showConn("发送失败:" + m.slice(0, 80), true);
+          }
+        } finally {
+          // #2 无论成功/失败/超时,都解锁发送门控并恢复按钮,绝不把用户永久锁死。
+          _isSending = false;
+          _setSendingUI(false);
+        }
+      }
+
+      // #2 发送中的 UI 态:禁用发送按钮 + 降透明度,给"在途"的可见反馈。
+      // callGateway 已有超时(见其内 timeout),finally 保证这里一定会解锁。
+      function _setSendingUI(sending) {
+        const btn = document.getElementById("sendBtn");
+        if (!btn) return;
+        btn.disabled = !!sending;
+        btn.style.opacity = sending ? "0.5" : "";
+        btn.style.cursor = sending ? "not-allowed" : "";
+      }
+
+      // 通用/瞬时错误占位(OpenClaw "Something went wrong"、TPS 限流等)——
+      // 这不是安全护栏拦截!实测:同一查询 localhost 直连答对,浏览器经
+      // CloudFront 偶发拿到此占位(疑 Bedrock Guardrail ApplyGuardrail TPS 限流
+      // / session 偶发)。早期把它归进 isGuardrailBlocked,导致正常的问题
+      // 被误显示成"触发安全护栏",吓人且误导。拆出来按"出错可重试"中性处理。
+      function isTransientError(s) {
+        if (!s) return false;
+        const t = String(s).toLowerCase();
+        return (
+          t.includes("something went wrong") ||
+          t.includes("/new to start") ||
+          t.includes("too many requests") ||
+          t.includes("try again")
+        );
+      }
+      // 识别真正的安全护栏/内容过滤拦截信号(Bedrock Guardrail policy 命中)。
+      function isGuardrailBlocked(s) {
+        // 空回复 ≠ 护栏(交给调用方中性处理);通用错误也不算护栏(见上)。
+        if (!s) return false;
+        const t = String(s).toLowerCase();
+        return (
+          t.includes("violated guardrail") ||
+          t.includes("guardrail policy") ||
+          t.includes("blocked by") ||
+          t.includes("content filter")
+        );
+      }
+
+      // ============ 对接 claw-hub(WS 中枢)============
+      // 生产:不直连裸端点、也不自建 HTTP webhook。前端 wss 连 claw-hub 中枢:
+      //   ① POST {HUB}/token(Cognito Bearer + {tenant_id})→ 中枢验 JWT,签一个
+      //      绑定 sub+tenant 的短时 token(gateway_token / appSecret 永不进浏览器)。
+      //   ② wss 连 {HUB_WS}?token=<token> 长连。发 {text};收 {type:"reply",text}。
+      //   中枢把消息按 verified sub 盖戳后转给该租户 VM 内的 claw-channel,
+      //   channel 经 OpenClaw 原生会话(dmScope per-channel-peer)隔离回流。
+      // demo:POST 本地代理 /chat(无 token,代理内存持 token)。
+      let _hubWS = null,
+        _hubReady = false;
+      // 并发修复 (CRITICAL): replies are correlated by clientMessageId, NOT by a
+      // FIFO queue + single streaming bubble (which broke under concurrent sends:
+      // earlier messages' bubbles spun forever and replies could be mismatched).
+      // _hubPending maps each in-flight request's clientMessageId → its callbacks
+      // AND its bubble element, so reply / reply_delta / reply_error route to the
+      // exact bubble regardless of order. Generated per send.
+      let _hubPending = new Map(); // clientMessageId -> {resolve, reject, ctEl}
+      // #2 发送中门控:一条消息在途(等 reply)时,不受理新的 send(),避免用户连点
+      // /连发把 hub 打爆、也避免"上一条还转圈就又发"导致的观感卡死。correlationId
+      // 路由(_hubPending)已保证多气泡不串,门控进一步防无节制并发。
+      let _isSending = false;
+      // #13 切换/新建会话时丢弃在途请求:reject 所有 _hubPending(让转圈气泡收敛成
+      // 错误而非永久挂),清空 Map,并复位发送门控(#2)。否则:① 旧 thread 的 reply_delta
+      // 会写到已被 resetChat 移除的气泡(脏写);② _isSending 卡在 true,新会话要等旧
+      // 请求 90s 超时才能发。与 ws.onclose 的清理同源(DRY)。
+      // silent=true(默认,用于 newSession 主动切换):reject 带 aborted 哨兵,send()
+      // 的 catch 静默跳过,不弹"连接失败"红条(cancel ≠ error)。silent=false(用于
+      // onclose 断连):不带哨兵,让 send() catch 正常给用户断连提示。两种都复位门控。
+      function _abortInflight(reason, silent = true) {
+        for (const ent of _hubPending.values()) {
+          try {
+            const err = new Error(reason || "会话已切换");
+            if (silent) err.aborted = true;
+            ent.reject(err);
+          } catch (_) {}
+        }
+        _hubPending.clear();
+        _isSending = false;
+        if (typeof _setSendingUI === "function") _setSendingUI(false);
+      }
+      // 会话历史回看 (PRD #40-43): in-flight history requests keyed by requestId,
+      // resolved when the matching history_reply frame arrives.
+      let _histPending = new Map(); // requestId -> {resolve}
+      let _histLoading = false;
+      function newReqId() {
+        try {
+          if (crypto && crypto.randomUUID) return "h-" + crypto.randomUUID();
+        } catch (_) {}
+        return (
+          "h-" +
+          Date.now().toString(36) +
+          "-" +
+          Math.random().toString(36).slice(2, 8)
+        );
+      }
+      function newClientMsgId() {
+        try {
+          if (crypto && crypto.randomUUID) return "m-" + crypto.randomUUID();
+        } catch (_) {}
+        return (
+          "m-" +
+          Date.now().toString(36) +
+          "-" +
+          Math.random().toString(36).slice(2, 8)
+        );
+      }
+      function hubBase() {
+        // 默认同源经 CloudFront /hub/ 反代到 ALB→host hub;可被 window.OC_HUB_URL 覆盖。
+        return (window.OC_HUB_URL || ORIGIN + "/hub").replace(/\/+$/, "");
+      }
+      function hubWsUrl(token) {
+        const b = window.OC_HUB_WS || ORIGIN.replace(/^http/, "ws") + "/hub/ws";
+        return b.replace(/\/+$/, "") + "?token=" + encodeURIComponent(token);
+      }
+      let _hubToken = ""; // last frontend hub token, reused for /files/download-url
+
+      // Render placeholder slots for agent-generated images (FILE parts). Each
+      // slot is filled asynchronously by hydrateFiles once its presigned download
+      // URL resolves. We never put a raw URL in the WS frame — only the fileKey.
+      function renderFiles(files) {
+        if (!files || !files.length) return "";
+        return files
+          .map((f, i) => {
+            const key = String(f.fileKey || "");
+            const safeKey = key.replace(/[^a-zA-Z0-9/_.-]/g, "");
+            if ((f.type || "image") === "image") {
+              return `<div class="media-slot" data-key="${escapeHtml(safeKey)}" data-i="${i}"><div class="media-loading">🖼 正在加载图片…</div></div>`;
+            }
+            return `<div class="media-slot file" data-key="${escapeHtml(safeKey)}" data-i="${i}">📎 ${escapeHtml(f.name || "附件")}</div>`;
+          })
+          .join("");
+      }
+
+      // Resolve each fileKey to a presigned URL via the hub and fill the slot.
+      // The hub re-checks tenant ownership (IDOR guard) before signing.
+      async function hydrateFiles(rootEl, files) {
+        if (!files || !files.length || !rootEl) return;
+        const slots = rootEl.querySelectorAll(".media-slot");
+        for (const slot of slots) {
+          const key = slot.getAttribute("data-key");
+          if (!key) continue;
+          try {
+            const r = await fetch(
+              hubBase() +
+                "/files/download-url?fileKey=" +
+                encodeURIComponent(key),
+              { headers: { Authorization: "Bearer " + _hubToken } },
+            );
+            if (!r.ok) {
+              slot.innerHTML = `<div class="media-err">图片加载失败 (${r.status})</div>`;
+              continue;
+            }
+            const j = await r.json();
+            const url = j?.data?.url;
+            if (!url) {
+              slot.innerHTML = '<div class="media-err">图片暂不可用</div>';
+              continue;
+            }
+            if (slot.classList.contains("file")) {
+              slot.innerHTML = `<a href="${url}" target="_blank" rel="noopener" style="color:var(--brand2)">📎 下载附件</a>`;
+            } else {
+              slot.innerHTML = `<img src="${url}" alt="agent image" loading="lazy" />`;
+            }
+            const chat = document.getElementById("chat");
+            if (chat) chat.scrollTop = chat.scrollHeight;
+          } catch (e) {
+            slot.innerHTML = '<div class="media-err">图片加载出错</div>';
+          }
+        }
+      }
+      // 中枢前端 token TTL 300s;WS 连接超过这个时长后中枢侧 token 已过期,
+      // 强制重连换新 token(否则发消息会被中枢拒)。
+      const HUB_TOKEN_TTL_MS = 270000; // 270s,留 30s 余量
+      let _hubConnAt = 0;
+      // 生产级韧性:中枢连接(token fetch + WS 握手)对瞬态故障自动重试,
+      // 而不是一次失败就把 "Failed to fetch"/"中枢连接超时" 抛给用户。瞬态来源:
+      // CloudFront 边缘抖动、WS 重连窗口、token TTL 边界、网络毛刺。退避重试 3 次
+      // 内基本吃掉这些;真挂(后端 down/鉴权过期)才在末次冒泡真实错误。
+      async function ensureHub(node) {
+        let lastErr;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            return await _ensureHubOnce(node);
+          } catch (e) {
+            lastErr = e;
+            // 鉴权过期类错误不该重试(由 _ensureHubOnce 内部走 refresh/跳登录)
+            const msg = String(e && e.message);
+            if (msg.includes("登录已过期")) throw e;
+            // 关掉可能半死的连接,退避后重建:200ms, 600ms
+            if (_hubWS) {
+              try {
+                _hubWS.close();
+              } catch (_) {}
+              _hubWS = null;
+              _hubReady = false;
+            }
+            if (attempt < 2)
+              await new Promise((r) =>
+                setTimeout(r, 200 * Math.pow(3, attempt)),
+              );
+          }
+        }
+        throw lastErr;
+      }
+      async function _ensureHubOnce(node) {
+        const fresh =
+          _hubWS &&
+          _hubReady &&
+          _hubWS.readyState === 1 &&
+          Date.now() - _hubConnAt < HUB_TOKEN_TTL_MS;
+        if (fresh) return _hubWS;
+        // token 老了或连接断了:关旧的,重取 token 重连
+        if (_hubWS) {
+          try {
+            _hubWS.close();
+          } catch (_) {}
+          _hubWS = null;
+          _hubReady = false;
+        }
+        // 取前端 token(中枢验 Cognito JWT)。401 时先用 refresh_token 静默
+        // 换新 id_token 重试一次,换不动才踢登录——治"用一阵 token 过期就掉线"。
+        async function postToken() {
+          return fetch(hubBase() + "/token", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: "Bearer " + idToken(),
+            },
+            body: JSON.stringify({ tenant_id: node.tenant }),
+          });
+        }
+        let r = await postToken();
+        if (r.status === 401 && window.refreshIdToken) {
+          // id_token 过期/无效 → 静默刷新后重试一次
+          const fresh = await window.refreshIdToken();
+          if (fresh) {
+            showConn("会话已刷新,重连中…", false);
+            r = await postToken();
+          }
+        }
+        if (!r.ok) {
+          // refresh 也救不回(refresh_token 也过期,>7天)→ 才踢回登录。
+          if (r.status === 401) {
+            localStorage.removeItem("oc_id_token");
+            localStorage.removeItem("oc_token_exp");
+            localStorage.removeItem("oc_refresh_token");
+            showConn("登录已过期,正在重新登录…", false);
+            setTimeout(() => location.reload(), 800);
+            throw new Error("登录已过期,正在重新登录");
+          }
+          let detail = "中枢鉴权失败 HTTP " + r.status;
+          try {
+            detail = (await r.json()).error || detail;
+          } catch (_) {}
+          throw new Error(detail);
+        }
+        _hubConnAt = Date.now();
+        const { token } = await r.json();
+        _hubToken = token; // kept for /files/download-url (agent 出图)
+        return await new Promise((resolve, reject) => {
+          const ws = new WebSocket(hubWsUrl(token));
+          let settled = false;
+          ws.onopen = () => {};
+          ws.onmessage = (ev) => {
+            let m;
+            try {
+              m = JSON.parse(ev.data);
+            } catch (_) {
+              return;
+            }
+            if (m.type === "ready") {
+              _hubWS = ws;
+              _hubReady = true;
+              settled = true;
+              resolve(ws);
+              return;
+            }
+            // 并发修复: all reply frames carry clientMessageId. Route to the exact
+            // pending request (and its bubble) — never FIFO, never a global bubble.
+            const cmid = m.clientMessageId;
+            if (m.type === "reply_delta") {
+              // 流式输出: cumulative in-progress text — REPLACE this request's
+              // bubble live (no append). Authoritative final arrives as reply.
+              const ent = cmid && _hubPending.get(cmid);
+              if (ent && ent.ctEl && typeof m.text === "string") {
+                ent.ctEl.innerHTML = renderMd(m.text);
+                const chat = document.getElementById("chat");
+                if (chat) chat.scrollTop = chat.scrollHeight;
+              }
+              return;
+            }
+            if (m.type === "reply" || m.type === "reply_error") {
+              const ent = cmid && _hubPending.get(cmid);
+              if (ent) {
+                _hubPending.delete(cmid);
+                ent.resolve({
+                  text: m.text || "",
+                  files: m.files || [],
+                  isError: m.type === "reply_error",
+                });
+              }
+              return;
+            }
+            // 会话历史回看 (PRD #40-43): the channel returned the past turns of the
+            // active thread. Resolve the pending history request (by requestId) so
+            // requestHistory() can render them; ignore replies for other threads.
+            if (m.type === "history_reply") {
+              const hent = m.requestId && _histPending.get(m.requestId);
+              if (hent) {
+                _histPending.delete(m.requestId);
+                hent.resolve({
+                  messages: Array.isArray(m.messages) ? m.messages : [],
+                  error: m.error || "",
+                });
+              }
+              return;
+            }
+            if (m.type === "error") {
+              // hub-level error without a clientMessageId (e.g. empty/offline):
+              // fail the oldest pending request so a bubble doesn't hang.
+              if (cmid && _hubPending.has(cmid)) {
+                const ent = _hubPending.get(cmid);
+                _hubPending.delete(cmid);
+                ent.reject(new Error(m.error || "hub error"));
+              } else {
+                const first = _hubPending.keys().next().value;
+                if (first) {
+                  const ent = _hubPending.get(first);
+                  _hubPending.delete(first);
+                  ent.reject(new Error(m.error || "hub error"));
+                } else if (!settled) {
+                  settled = true;
+                  reject(new Error(m.error || "hub error"));
+                }
+              }
+            }
+          };
+          ws.onclose = () => {
+            _hubReady = false;
+            if (_hubWS === ws) _hubWS = null;
+            // 并发修复: reject all in-flight requests so every spinning bubble
+            // resolves to an error instead of hanging. #13:复用 _abortInflight,
+            // 同时复位发送门控(否则断连后 _isSending 卡 true,重连也发不出)。
+            // silent=false:断连是真失败,让 send() catch 正常给用户提示(区别于主动切换)。
+            _abortInflight("中枢连接断开", false);
+            if (!settled) {
+              settled = true;
+              reject(new Error("中枢连接关闭"));
+            }
+          };
+          ws.onerror = () => {
+            if (!settled) {
+              settled = true;
+              reject(new Error("中枢连接错误"));
+            }
+          };
+          setTimeout(() => {
+            if (!settled) {
+              settled = true;
+              reject(new Error("中枢连接超时"));
+            }
+          }, 12000);
+        });
+      }
+      async function callGateway(node, text, ctEl) {
+        if (IS_LOCAL) {
+          const r = await fetch(`${PROXY}/chat`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              node: node.id,
+              message: text,
+              history: history.slice(-12),
+            }),
+          });
+          if (!r.ok) {
+            let detail = "HTTP " + r.status;
+            try {
+              const e = await r.json();
+              detail = e.error || detail;
+            } catch (_) {}
+            throw new Error(detail);
+          }
+          const d = await r.json();
+          if (d.error) throw new Error(d.error);
+          return { text: d.reply || d.content || JSON.stringify(d), files: [] };
+        }
+
+        // 生产:wss 连中枢,发文本,等回复帧({text, files})
+        // 并发修复: stamp a unique clientMessageId, register it (with the bubble)
+        // in the _hubPending Map, and send it. Replies route back by this id, so
+        // concurrent sends never cross-wire or hang.
+        let ws = await ensureHub(node);
+        // 韧性:ensureHub 可能返回一个刚校验过、但在这一行之前的微小窗口里被
+        // 对端关掉的连接(readyState!==1)。发送前再确认一次,不 OPEN 就重建一次,
+        // 避免对死连接 send() 抛 "Failed to fetch"/InvalidStateError 给用户。
+        if (!ws || ws.readyState !== 1) {
+          _hubWS = null;
+          _hubReady = false;
+          ws = await ensureHub(node);
+        }
+        const cmid = newClientMsgId();
+        return await new Promise((resolve, reject) => {
+          _hubPending.set(cmid, { resolve, reject, ctEl });
+          try {
+            ws.send(
+              JSON.stringify({
+                text,
+                threadId: _activeThreadId,
+                clientMessageId: cmid,
+              }),
+            );
+          } catch (e) {
+            _hubPending.delete(cmid);
+            reject(new Error("发送失败:" + String(e)));
+            return;
+          }
+          setTimeout(() => {
+            if (_hubPending.has(cmid)) {
+              _hubPending.delete(cmid);
+              reject(new Error("回复超时"));
+            }
+          }, 90000);
+        });
+      }
+
+      // ============ 启动 ============
+      (async function boot() {
+        // 等鉴权门(code→token 换取是 async)完成再初始化,避免在 token 存好
+        // 之前就 loadNodes()/连 hub 拿不到 token,也避免与 authGate 竞争重载。
+        try {
+          await window.__authReady;
+        } catch (_) {}
+        // 鉴权彻底失败(连续换取失败)→ 显示错误而不是空转刷新。
+        if (window.__authError) {
+          const bx = document.getElementById("boot");
+          if (bx) bx.querySelector(".tx").textContent = window.__authError;
+          return;
+        }
+        // 解析登录用户(从 id_token 的 payload 取 email/sub,仅展示用)
+        let email = "";
+        try {
+          const tok = idToken();
+          if (tok) {
+            const payload = JSON.parse(
+              atob(tok.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")),
+            );
+            email =
+              payload.email || payload["cognito:username"] || payload.sub || "";
+          }
+        } catch (_) {}
+        if (IS_LOCAL && !email) email = "本地 demo";
+        if (email) {
+          localStorage.setItem("oc_user_email", email);
+          document.getElementById("userEmail").textContent = email;
+          document.getElementById("userInitial").textContent = (
+            email[0] || "A"
+          ).toUpperCase();
+        }
+        if (IS_LOCAL) {
+          document.getElementById("logoutBtn").style.display = "none";
+        }
+
+        // 显示 app,移除 boot 遮罩
+        document.getElementById("boot").style.display = "none";
+        document.getElementById("appRoot").style.display = "grid";
+
+        // 拉节点
+        loadNodes();
+
+        // #41 会话历史回看: 刷新/重开页面且 thread 已存在 → 后台自动拉回本对话历史,
+        // 让对话跨刷新存活。失败静默(loadHistory 内部已处理提示),不阻塞首屏。
+        if (_threadPreexisted && !IS_LOCAL) {
+          loadHistory().catch(() => {});
+        }
+
+        // demo 模式探测本地代理
+        if (IS_LOCAL) {
+          fetch(`${PROXY}/health`)
+            .then((r) => r.json())
+            .then((d) => {
+              if (d && d.ok)
+                showConn(
+                  "已连接 OpenClaw gateway · 经本地代理(token 不出代理)",
+                  false,
+                );
+            })
+            .catch(() =>
+              showConn("本地代理未连接 — 启动 SSH 隧道 + 代理后刷新", true),
+            );
+        }
+      })();
+
+      function logout() {
+        localStorage.removeItem("oc_id_token");
+        localStorage.removeItem("oc_token_exp");
+        localStorage.removeItem("oc_user_email");
+        // 回 Hosted UI logout,再跳回登录
+        const domain = window.OC_COGNITO_DOMAIN;
+        const clientId = window.OC_COGNITO_CLIENT_ID;
+        const logoutUri = window.OC_COGNITO_REDIRECT_URI;
+        window.location.href =
+          "https://" +
+          domain +
+          "/logout?client_id=" +
+          clientId +
+          "&logout_uri=" +
+          encodeURIComponent(logoutUri);
+      }
+    </script>
+  </body>
+</html>

@@ -1,0 +1,171 @@
+{
+  "generatedAt": "2026-06-27T19:12:31.643Z",
+  "hub": "ws://127.0.0.1:8799",
+  "summary": {
+    "cases": 20,
+    "pass": 20,
+    "assertions": 101
+  },
+  "results": [
+    {
+      "id": "WS-01",
+      "title": "owner frontend 连接 → ready 帧 + tenant 正确",
+      "status": "pass",
+      "checks": 5,
+      "passed": 5,
+      "ms": 10
+    },
+    {
+      "id": "WS-02",
+      "title": "channel 连接 → registered 帧",
+      "status": "pass",
+      "checks": 5,
+      "passed": 5,
+      "ms": 2
+    },
+    {
+      "id": "WS-03",
+      "title": "无 token → 拒绝(error 帧 + close 1008)",
+      "status": "pass",
+      "checks": 5,
+      "passed": 5,
+      "ms": 2
+    },
+    {
+      "id": "WS-04",
+      "title": "坏签名 token → 401 拒绝",
+      "status": "pass",
+      "checks": 5,
+      "passed": 5,
+      "ms": 1
+    },
+    {
+      "id": "WS-05",
+      "title": "过期 token → 拒绝",
+      "status": "pass",
+      "checks": 5,
+      "passed": 5,
+      "ms": 1
+    },
+    {
+      "id": "WS-06",
+      "title": "owner 发文字 → channel 收 USER 帧 → reply 回 owner",
+      "status": "pass",
+      "checks": 5,
+      "passed": 5,
+      "ms": 3
+    },
+    {
+      "id": "WS-07",
+      "title": "流式 reply_delta → 累积 → 最终 reply 定稿",
+      "status": "pass",
+      "checks": 5,
+      "passed": 5,
+      "ms": 3
+    },
+    {
+      "id": "WS-08",
+      "title": "多 thread 隔离:同 sub 两个 threadId 派生不同 session",
+      "status": "pass",
+      "checks": 5,
+      "passed": 5,
+      "ms": 3
+    },
+    {
+      "id": "WS-09",
+      "title": "空 threadId → 回退单 thread(向后兼容)",
+      "status": "pass",
+      "checks": 5,
+      "passed": 5,
+      "ms": 2
+    },
+    {
+      "id": "WS-10",
+      "title": "恶意 threadId(注入字符)→ 被正则清洗回退",
+      "status": "pass",
+      "checks": 5,
+      "passed": 5,
+      "ms": 1
+    },
+    {
+      "id": "WS-11",
+      "title": "超长 threadId(>80) → 被拒回退",
+      "status": "pass",
+      "checks": 5,
+      "passed": 5,
+      "ms": 2
+    },
+    {
+      "id": "WS-12",
+      "title": "空消息(无文无图)→ error 帧拒绝",
+      "status": "pass",
+      "checks": 5,
+      "passed": 5,
+      "ms": 3
+    },
+    {
+      "id": "WS-13",
+      "title": "坏 JSON 帧 → error 帧,连接不崩",
+      "status": "pass",
+      "checks": 5,
+      "passed": 5,
+      "ms": 1
+    },
+    {
+      "id": "WS-14",
+      "title": "agent 离线(无 channel 注册)→ error agent offline",
+      "status": "pass",
+      "checks": 5,
+      "passed": 5,
+      "ms": 1
+    },
+    {
+      "id": "WS-15",
+      "title": "跨租户隔离:tenantB 的 channel 收不到 tenantA 的消息",
+      "status": "pass",
+      "checks": 5,
+      "passed": 5,
+      "ms": 1203
+    },
+    {
+      "id": "WS-16",
+      "title": "reply 只回源 sub 的 tab,不广播给其他 sub",
+      "status": "pass",
+      "checks": 5,
+      "passed": 5,
+      "ms": 1008
+    },
+    {
+      "id": "WS-17",
+      "title": "同 sub 多 tab:reply 扇出到该 sub 的所有 tab",
+      "status": "pass",
+      "checks": 5,
+      "passed": 5,
+      "ms": 6
+    },
+    {
+      "id": "WS-18",
+      "title": "看图 fileKey 跨租户走私 → 被 tenant 段守卫丢弃",
+      "status": "pass",
+      "checks": 6,
+      "passed": 6,
+      "ms": 3
+    },
+    {
+      "id": "WS-19",
+      "title": ">4 张图 → 截到 4 张(滥用上限)",
+      "status": "pass",
+      "checks": 5,
+      "passed": 5,
+      "ms": 2
+    },
+    {
+      "id": "WS-20",
+      "title": "重连:断开后用同 token 重连仍可收发",
+      "status": "pass",
+      "checks": 5,
+      "passed": 5,
+      "ms": 404
+    }
+  ]
+}

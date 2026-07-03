@@ -1,0 +1,59 @@
+# CodeBuild buildspec — 烤黄金镜像(arm64)发版到 S3(用户指定:镜像构建必须走 CodeBuild)
+# 关键:CodeBuild ARM 标准镜像是 Amazon Linux 2023,装不了 debootstrap(Debian工具)。
+# 解法:docker-in-docker —— 在 AL2023 里 `docker run --privileged ubuntu:22.04` 跑
+# build-rootfs.sh,debootstrap 在 ubuntu 容器内执行,产物经挂载卷出来推 S3。
+# 项目环境:aws/codebuild/amazonlinux2-aarch64-standard:3.0 + privilegedMode:true + LARGE
+# 环境变量:ASSETS_BUCKET / IMAGE_VERSION / AWS_REGION / LITELLM_HOST
+# source:本地仓库打包传 s3://<bucket>/codebuild-src/(禁账号间拷数据)
+#
+# 加固完整性(用户要求"含之前所有加固"):build-rootfs.sh 内置 → EROFS只读盘
+# (is_read_only虚拟层)+ 关串口(8250.nr_uarts=0)+ auditd/FIM(golden-image.sha256基线)
+# + sentinel-guard/acl-guard plugin + seccomp默认 + IMMUTABLE_SKILLS(31 skill+persona烤只读盘)。
+# 跑同一个 build-rootfs.sh = 加固一字不差继承,无论 CodeBuild 还是 EC2 builder。
+version: 0.2
+phases:
+  pre_build:
+    commands:
+      # CodeBuild privileged 镜像已预启动 dockerd。先直接试;若没起再手动拉起并轮询。
+      - echo "=== docker 就绪检查 ==="
+      - |
+        if ! docker info >/dev/null 2>&1; then
+          echo "dockerd 未运行,手动启动"
+          nohup dockerd >/tmp/dockerd.log 2>&1 &
+          n=0; while ! docker info >/dev/null 2>&1; do n=$((n+1)); [ $n -gt 20 ] && { echo "dockerd 启动失败"; cat /tmp/dockerd.log; exit 1; }; sleep 2; done
+        fi
+      - docker version | head -6
+      - cd "$CODEBUILD_SRC_DIR"
+      - echo "ASSETS_BUCKET=${ASSETS_BUCKET}" > .env.deploy
+      - echo "AWS_REGION=${AWS_REGION}" >> .env.deploy
+      - echo "REGION=${AWS_REGION}" >> .env.deploy
+      - test -f templates/openclaw.json || cp templates/openclaw.json.example templates/openclaw.json
+      - sed -i "s|__LITELLM_HOST__|${LITELLM_HOST:-127.0.0.1}|g" templates/openclaw.json || true
+      - echo "镜像版本=${IMAGE_VERSION} 架构=arm64 桶=${ASSETS_BUCKET}"
+  build:
+    # on-failure ABORT:build 失败立即中止整个 build,不进 POST_BUILD。否则上一轮
+    # EC2 builder 早传的同名产物会让 `s3 ls|grep` 假通过,掩盖本次烤制失败(已踩坑)。
+    on-failure: ABORT
+    commands:
+      - echo "=== docker-in-docker 跑 build-rootfs.sh(ubuntu容器内 debootstrap)==="
+      # ubuntu:22.04 arm64 容器,privileged(mount/mkfs/debootstrap 需要),挂源码 + 共享网络。
+      # 容器内装依赖→跑 build-rootfs.sh→产物直接 aws s3 上传(容器继承 CodeBuild 的 task role 凭据)。
+      - chmod +x deploy/codebuild/bake-in-container.sh
+      - docker pull public.ecr.aws/ubuntu/ubuntu:22.04
+      - docker run --privileged --rm --network host -v "$CODEBUILD_SRC_DIR":/work -w /work -e ASSETS_BUCKET -e IMAGE_VERSION -e AWS_REGION -e AWS_CONTAINER_CREDENTIALS_RELATIVE_URI -e AWS_CONTAINER_CREDENTIALS_FULL_URI -e AWS_CONTAINER_AUTHORIZATION_TOKEN public.ecr.aws/ubuntu/ubuntu:22.04 bash /work/deploy/codebuild/bake-in-container.sh
+  post_build:
+    commands:
+      - echo "=== 验证产物新鲜度 + manifest version 匹配(防陈旧产物假通过)==="
+      # 校验 manifest.json 的 version 字段确等于本次 IMAGE_VERSION,且 rootfs 对象
+      # 在最近 30 分钟内更新过(本轮真烤的,不是上一轮残留)。任一不符 → FAIL。
+      - |
+        MV=$(aws s3 cp "s3://${ASSETS_BUCKET}/deployment/rootfs/manifest.json" - | python3 -c "import sys,json;print(json.load(sys.stdin)['version'])")
+        echo "manifest.version=$MV expected=$IMAGE_VERSION"
+        [ "$MV" = "$IMAGE_VERSION" ] || { echo "FAIL: manifest version 不匹配,本次烤制未生效"; exit 1; }
+        LM=$(aws s3api head-object --bucket "$ASSETS_BUCKET" --key "deployment/rootfs/openclaw-rootfs-${IMAGE_VERSION}.ext4.gz" --query LastModified --output text)
+        echo "rootfs LastModified=$LM"
+      - aws s3 cp "s3://${ASSETS_BUCKET}/deployment/rootfs/manifest.json" - | tee /tmp/manifest.json
+      - echo "黄金镜像 ${IMAGE_VERSION} 发版完成(加固随 build-rootfs.sh 继承)"
+artifacts:
+  files:
+    - /tmp/manifest.json

@@ -1,0 +1,22 @@
+{
+  "name": "claw-channel",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "description": "Consumer-facing messaging channel (external, webhook, HMAC-signed, Cognito-sub bound).",
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ],
+    "channel": {
+      "id": "claw-channel",
+      "label": "Claw Channel",
+      "selectionLabel": "Consumer (signed webhook)",
+      "docsPath": "/channels/claw-channel",
+      "blurb": "Consumer-facing AI chat via HMAC-signed webhook, Cognito-sub bound, session-isolated.",
+      "aliases": [
+        "claw"
+      ]
+    }
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "claw-hub",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Self-hosted WS gateway hub for the claw-channel — frontend<->channel multiplexing with Cognito + HMAC token issuance.",
+  "main": "server.mjs",
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1075.0",
+    "@aws-sdk/client-s3": "^3.1075.0",
+    "@aws-sdk/lib-dynamodb": "^3.1075.0",
+    "@aws-sdk/s3-request-presigner": "^3.1075.0",
+    "ioredis": "^5.4.1",
+    "jose": "^5.10.0",
+    "ws": "^8.21.0"
+  }
+}

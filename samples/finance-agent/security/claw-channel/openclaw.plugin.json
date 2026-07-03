@@ -1,0 +1,14 @@
+{
+  "id": "claw-channel",
+  "name": "Claw Channel",
+  "description": "Consumer-facing messaging channel. External plugin, self-hosted webhook (HMAC-SHA256 signed, Cognito-sub bound). Replaces the bare /v1/chat/completions HTTP endpoint with a signed, session-isolated inbound surface. Token never reaches the browser; userId is the server-verified Cognito sub.",
+  "channels": ["claw-channel"],
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

@@ -129,7 +129,7 @@ host 自举的几个要点：
 
 > **Note**
 >
-> `launch-vm.sh` 的脚本默认 vCPU 2 / 内存 4096 MB 与 `config.yml` 的 microVM 默认值（1 vCPU / 2048 MB）不一致，实际以调用方（API Lambda）传入的参数为准；容量规划按每 microVM 2 GB 计。
+> `launch-vm.sh` 的脚本默认 vCPU 2 / 内存 4096 MB 与 `config.yml` 的 microVM 默认值（`default_vcpu: 2` / `default_mem_mb: 4096`）一致；实际以调用方（API Lambda）传入的参数为准。容量推算以每 microVM 2 GB 内存基线计（r8g.metal-24xl 约 760 GB ÷ 2 GB ≈ 380/台，为推算口径;单台实测健康密度见容量章节 187 节点）。
 
 该解决方案的所有注入都在 Firecracker `InstanceStart` 之前完成，这是「零运行时操作」的实现位置。启动流程为：
 
@@ -224,7 +224,7 @@ backup 的 `backup_cron` 是扫描节拍而非统一备份时间：每次触发�
 
 ### ASG 弹性伸缩与机型
 
-宿主机扩缩容交由 Amazon EC2 Auto Scaling 托管。该解决方案用 Auto Scaling Group 与启动模板管理整队宿主机的拉起与滚动重建。host 由 ASG 拉起、自举注册，空闲超时由 scaler 经两轮确认后受控回收，整池容量按 `config.yml` 调整，当前 min 1 / max 3 台。
+宿主机扩缩容交由 Amazon EC2 Auto Scaling 托管。该解决方案用 Auto Scaling Group 与启动模板管理整队宿主机的拉起与滚动重建。host 由 ASG 拉起、自举注册，空闲超时由 scaler 经两轮确认后受控回收，整池容量按 `config.yml` 调整，默认值 `min_capacity: 2` / `max_capacity: 8` 台。
 
 生产机型使用 metal 系列（Graviton4 ARM64，原生 KVM 运行 Firecracker，而非 x86 嵌套虚拟化）。`config.yml` 以 `arch: arm64` 与 `instance_type` 配置机型，容量推导由部署代码按 size token 查表并结合内存比计算。metal 机型走原生 KVM、不开启嵌套虚拟化；生产底座固定为 metal 原生 KVM。
 
@@ -234,7 +234,7 @@ backup 的 `backup_cron` 是扫描节拍而非统一备份时间：每次触发�
 
 容量按 `config.yml` 调整：
 
-- 每个租户 microVM 默认 1 vCPU / 2048 MB（2 GB），由 `vm.default_vcpu` 与 `vm.default_mem_mb` 控制。
+- 每个租户 microVM 默认 2 vCPU / 4096 MB，由 `vm.default_vcpu` 与 `vm.default_mem_mb` 控制；容量推算仍以每 microVM 2 GB 内存基线取值。
 - 超卖比由 `cpu_overcommit_ratio` 与 `mem_overcommit_ratio` 控制。可分配容量按 `allocatable_vcpu = total_vcpu × CPU_OVERCOMMIT_RATIO` 计，API 侧据 host 剩余容量调度。
 - 每台 host 配 600 GB gp3 加密 EBS 数据盘（`/dev/sdf` 挂 `/data`），承载所有 microVM 的稀疏盘与 rootfs overlay。单 microVM 稀疏盘实占约 187 MB 至 1.3 GB。
 - microVM 寻址上限到 vm_num 480（每 microVM 一个 /30 点对点链路）。

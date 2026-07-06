@@ -139,7 +139,7 @@ With `client_token`, the id is determined by `(owner, client_token)`, and replay
 
 **`GET {BASE}/tenants`** — the tenant list (RBAC viewer+; a non-admin only sees the tenants they own).
 
-- No parameters: a bare array (full set). Each entry contains `id/name/status/owner_id/host_port/guest_ip/vm_health/app_health/metrics`.
+- No parameters: a bare array (full set). Each entry is the tenant's DDB record projected with server-side credential fields removed, containing `id/name/status/owner_id/host_port/guest_ip/vm_health/app_health` and similar (`vm_health`/`app_health` are written by the health_check Lambda and may not yet appear on a freshly created tenant before its first health check).
 - Pagination: `GET {BASE}/tenants?limit=5` → `{"tenants":[…],"next_token":"<opaque>","count":<count on this page>}`.
 - Boundaries (verified on a live machine): `?limit=-1` → `400 {"code":"VALIDATION","error":"limit must be a positive integer (>= 1)"}`; `?next_token=garbage` → `400 {"code":"VALIDATION","error":"next_token is invalid or expired"}`.
 - Optional `?tag=key:value` to filter by tag (can be repeated, AND semantics).
@@ -166,7 +166,7 @@ For an already-deleted tenant there is a state guard against revival. An unknown
 **`GET {BASE}/tenants/{id}/{action}`** — tenant-scoped read-only (RBAC viewer+ + owner gating). Supported `action` values:
 
 - `backups` — the backup list for this tenant.
-- `data` — a tenant data snapshot (**metadata only, zero credentials**: `status/host_id/vcpu/mem_mb/rootfs_version/effective_skills/has_billing_vkey/backup_count/tags`), so operations can see the tenant's state clearly without entering the guest.
+- `data` — a tenant data snapshot (**metadata only, zero credentials**: `id/status/host_id/guest_ip/vm_num/vcpu/mem_mb/data_disk_mb/rootfs_version/effective_skills/group/schedule/ttl_hours/expires_at/owner_id/tenant_user_id/has_billing_vkey/backup_count/created_at/updated_at/tags`; `has_billing_vkey` reports only whether a billing key exists, never its value), so operations can see the tenant's state clearly without entering the guest.
 - `access` — the explicit authorization ledger `{owner_id, authorized_users:{sub:{role,granted_at,expire_at}}}`.
 
 **`DELETE {BASE}/tenants/{id}`** — deregister (~12.2s, RBAC operator+ + owner gating).

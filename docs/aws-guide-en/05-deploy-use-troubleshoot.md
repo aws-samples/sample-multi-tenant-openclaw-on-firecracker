@@ -135,7 +135,7 @@ Key points of host bootstrap:
 
 > **Note**
 >
-> The script's default vCPU 2 / memory 4096 MB in `launch-vm.sh` do not match the microVM defaults in `config.yml` (1 vCPU / 2048 MB); the arguments passed in by the caller (the API Lambda) prevail in practice, and capacity planning is based on 2 GB per microVM.
+> The script's default vCPU 2 / memory 4096 MB in `launch-vm.sh` match the microVM defaults in `config.yml` (`default_vcpu: 2` / `default_mem_mb: 4096`); the arguments passed in by the caller (the API Lambda) prevail in practice. Capacity is estimated at a 2 GB-per-microVM memory baseline (r8g.metal-24xl ≈ 760 GB ÷ 2 GB ≈ 380/host, an estimate; the per-host measured healthy density of 187 nodes is in the capacity section).
 
 All injection in this solution completes before the Firecracker `InstanceStart`; this is where "zero runtime operations" is implemented. The launch flow is:
 
@@ -230,7 +230,7 @@ This section describes the solution's ASG elastic scaling, instance-type selecti
 
 ### ASG elastic scaling and instance types
 
-Host scaling is managed by Amazon EC2 Auto Scaling. The solution uses an Auto Scaling Group and a launch template to manage the launch and rolling rebuild of the entire host fleet. Hosts are launched by the ASG and bootstrap-register; idle timeout is reclaimed by the scaler under control after two rounds of confirmation; the whole pool's capacity is adjusted through `config.yml`, currently min 1 / max 3 hosts.
+Host scaling is managed by Amazon EC2 Auto Scaling. The solution uses an Auto Scaling Group and a launch template to manage the launch and rolling rebuild of the entire host fleet. Hosts are launched by the ASG and bootstrap-register; idle timeout is reclaimed by the scaler under control after two rounds of confirmation; the whole pool's capacity is adjusted through `config.yml`, with defaults `min_capacity: 2` / `max_capacity: 8` hosts.
 
 Production instance types use the metal series (Graviton4 ARM64, running Firecracker on native KVM, not x86 nested virtualization). `config.yml` configures the instance type through `arch: arm64` and `instance_type`, and capacity derivation is computed by the deployment code by looking up the size token in a table combined with the memory ratio. The metal instance type uses native KVM and does not enable nested virtualization; the production foundation is fixed at metal native KVM.
 
@@ -240,7 +240,7 @@ If config's `host.instance_types` provides multiple equal-capacity instance type
 
 Capacity is adjusted through `config.yml`:
 
-- Each tenant microVM defaults to 1 vCPU / 2048 MB (2 GB), controlled by `vm.default_vcpu` and `vm.default_mem_mb`.
+- Each tenant microVM defaults to 2 vCPU / 4096 MB, controlled by `vm.default_vcpu` and `vm.default_mem_mb`; capacity is still estimated at a 2 GB-per-microVM memory baseline.
 - The overcommit ratio is controlled by `cpu_overcommit_ratio` and `mem_overcommit_ratio`. Allocatable capacity is computed as `allocatable_vcpu = total_vcpu × CPU_OVERCOMMIT_RATIO`, and the API side schedules based on each host's remaining capacity.
 - Each host is configured with a 600 GB gp3 encrypted EBS data disk (`/dev/sdf` mounted at `/data`), carrying the sparse disks and rootfs overlays of all microVMs. A single microVM's sparse disk actually occupies about 187 MB to 1.3 GB.
 - microVM addressing tops out at vm_num 480 (one /30 point-to-point link per microVM).

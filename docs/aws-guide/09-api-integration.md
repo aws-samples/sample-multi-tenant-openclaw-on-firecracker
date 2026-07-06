@@ -139,7 +139,7 @@ curl -s -X POST -H "x-api-key: $KEY" -H "content-type: application/json" \
 
 **`GET {BASE}/tenants`** — 租户列表(RBAC viewer+;非 admin 只见自己 owner 的)。
 
-- 无参:裸数组(全量)。每条含 `id/name/status/owner_id/host_port/guest_ip/vm_health/app_health/metrics`。
+- 无参:裸数组(全量)。每条为该租户 DDB 记录去除服务端凭据字段后的投影,含 `id/name/status/owner_id/host_port/guest_ip/vm_health/app_health` 等字段(`vm_health`/`app_health` 由 health_check Lambda 写入,新建租户在首次健康检查前可能尚未出现)。
 - 分页:`GET {BASE}/tenants?limit=5` → `{"tenants":[…],"next_token":"<opaque>","count":<本页条数>}`。
 - 边界(真机验证):`?limit=-1` → `400 {"code":"VALIDATION","error":"limit must be a positive integer (>= 1)"}`;`?next_token=garbage` → `400 {"code":"VALIDATION","error":"next_token is invalid or expired"}`。
 - 可选 `?tag=key:value` 按标签过滤(可多个,AND 语义)。
@@ -166,7 +166,7 @@ curl -s -X POST -H "x-api-key: $KEY" -H "content-type: application/json" \
 **`GET {BASE}/tenants/{id}/{action}`** — 租户维度只读(RBAC viewer+ + owner 门控)。支持的 `action`:
 
 - `backups` — 该租户的备份清单。
-- `data` — 租户数据快照(**仅元数据、零凭据**:`status/host_id/vcpu/mem_mb/rootfs_version/effective_skills/has_billing_vkey/backup_count/tags`),让运维不进 guest 就看清租户态。
+- `data` — 租户数据快照(**仅元数据、零凭据**:`id/status/host_id/guest_ip/vm_num/vcpu/mem_mb/data_disk_mb/rootfs_version/effective_skills/group/schedule/ttl_hours/expires_at/owner_id/tenant_user_id/has_billing_vkey/backup_count/created_at/updated_at/tags`;`has_billing_vkey` 仅报计费密钥是否存在、绝不返回值),让运维不进 guest 就看清租户态。
 - `access` — 显式授权账本 `{owner_id, authorized_users:{sub:{role,granted_at,expire_at}}}`。
 
 **`DELETE {BASE}/tenants/{id}`** — 注销(~12.2s,RBAC operator+ + owner 门控)。

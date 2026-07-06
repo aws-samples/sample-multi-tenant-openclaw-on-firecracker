@@ -6,7 +6,7 @@
 
 本节介绍控制面的组件构成与职责边界。该组件由 AWS Lambda、Amazon DynamoDB 与 Amazon API Gateway 构成，通过 AWS Cloud Development Kit (AWS CDK) 部署，负责租户的注册、启停、备份、迁移与注销，自身不参与实时聊天链路。
 
-控制面对外暴露一组 REST API，全部经 Amazon API Gateway 接入并要求 `x-api-key`，后端由一个 AWS Lambda 函数承载租户注册、生命周期操作、备份、host/skill/group 管理与审计日志等端点。控制面状态持久化在 Amazon DynamoDB，按职责分为三张主表：
+控制面对外暴露一组 REST API，全部经 Amazon API Gateway 接入并要求 `x-api-key`，后端由一个 AWS Lambda 函数承载租户注册、生命周期操作、备份、host/skill/group 管理与审计日志等端点。控制面状态持久化在 Amazon DynamoDB，其中三张核心状态表按职责划分如下（另有 audit 审计表及 batch-jobs、tenant-idp-map 等运维/联邦辅助表）：
 
 - **tenants 表**：以 `id` 为主键的 schemaless 表，按需写入 `owner_id`、`tenant_user_id`、`authorized_users`、`litellm_vkey`、`channel_secret` 等字段，承载租户元数据与授权记录。该表不存在表级完整 schema 可对照。
 - **hosts 表**：记录 host 节点状态、规格与容量计数（考虑 overcommit 比率，可用容量 =（total × ratio）− used）。

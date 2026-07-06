@@ -3,6 +3,7 @@
 
 import json
 import platform as _platform
+import re
 import yaml
 import aws_cdk as cdk
 from aws_cdk import (
@@ -30,6 +31,7 @@ from aws_cdk import (
     aws_route53resolver as route53resolver,
     aws_sqs as sqs,
     aws_lambda_event_sources as lambda_event_sources,
+    aws_bedrock as bedrock,
     aws_bedrock_agentcore_alpha as agentcore,
     aws_bedrockagentcore as agentcore_l1,
     aws_codebuild as codebuild,
@@ -223,6 +225,23 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 enable_key_rotation=True,
                 removal_policy=self._stateful_removal,
             )
+        # #32 — WORM archive path config. When `audit.worm_archive_enabled=true`:
+        # ① 开 DDB Stream(NEW_IMAGE)让归档 Lambda 消费;② 建独立 audit-archive
+        # WORM 桶(Object Lock COMPLIANCE + Versioned + RETAIN,连 root 都改不动/删
+        # 不掉,retention = `worm_retention_years` 年,默认 7);③ 加
+        # `gsi_audit_owner` 按 actor_owner_id 反查,让 GET /audit-log?owner=... 走
+        # GSI 而不是全表扫描。dev/rebuildable region 走 DESTROY+auto-delete 降级
+        # (照 backup 桶写法),生产区自动切 WORM。
+        #
+        # ⚠ 硬约束(与 audit_cmk 相同):首次开只能在 FRESH account——存量
+        # RETAIN 审计表加 Stream / GSI 会强制 replace 丢历史。开关闭默认所以现有
+        # 部署完全向后兼容(byte-identical synth)。
+        audit_archive_enabled = bool(audit_cfg.get("worm_archive_enabled", False))
+        audit_worm_retention_years = int(audit_cfg.get("worm_retention_years", 7))
+        if audit_worm_retention_years <= 0:
+            raise ValueError(
+                f"audit.worm_retention_years must be positive, got {audit_worm_retention_years}"
+            )
         # Aws.STACK_ID format: arn:aws:cloudformation:<region>:<acct>:stack/<name>/<uuid>
         # Take the first 5 hex chars of the UUID's leading segment as the suffix.
         stack_uuid = Fn.select(2, Fn.split("/", cdk.Aws.STACK_ID))
@@ -248,7 +267,29 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 else None
             ),
             encryption_key=audit_cmk,
+            # #32 — Stream enables the WORM archive path. Off → None (unchanged).
+            stream=(
+                dynamodb.StreamViewType.NEW_IMAGE if audit_archive_enabled else None
+            ),
         )
+        # #32 — GSI on actor_owner_id lets /audit-log?owner=... query one tenant's
+        # trail without a full-partition scan. Shares the column _audit_write already
+        # stamps (owner_id from the caller identity), so no data-model migration.
+        # DDB caveats:一次 update 只能加/删 1 个 GSI(见 tenants_table gate 上的
+        # 792 撞过的坑),所以放在 worm_archive_enabled gate 下,配合 cmk_encryption
+        # 同一 FRESH-deploy 约束——不 mix 已有 audit_table 上多 GSI 追加。
+        if audit_archive_enabled:
+            audit_table.add_global_secondary_index(
+                index_name="gsi_audit_owner",
+                partition_key=dynamodb.Attribute(
+                    name="actor_owner_id",
+                    type=dynamodb.AttributeType.STRING,
+                ),
+                sort_key=dynamodb.Attribute(
+                    name="ts", type=dynamodb.AttributeType.STRING
+                ),
+                projection_type=dynamodb.ProjectionType.ALL,
+            )
 
         # PRD #54 — async batch jobs. A large bulk lifecycle op (>100 nodes, or
         # ?async) is recorded here, then a self-invoked worker processes it in
@@ -301,7 +342,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
         # ========== Tenant-Backup CMK + WORM backup bucket (insider-threat hardening) ==========
         # 威胁模型:租户 data.ext4 备份是真实资产数据。光放 assets 桶(默认 SSE-S3,
         # AWS 托管密钥)防不住「拥有该桶权限的 S3 管理员」——他能 GetObject 读明文、
-        # PutObject 覆盖、DeleteObject 删除。生产级隔离要堵的就是这个内部威胁面。两层独立机制:
+        # PutObject 覆盖、DeleteObject 删除。生产级要堵的就是这个内部威胁面。两层独立机制:
         #
         # 1) 防篡改/防删 — S3 Object Lock COMPLIANCE 模式 + Versioning。AWS 官方:
         #    COMPLIANCE 模式下在保留期内**连 root 账户都不能删除/覆盖对象版本、不能缩短
@@ -406,23 +447,155 @@ class OpenClawOrchestratorStack(cdk.Stack):
             ),
         )
 
+        # ========== #32 Audit-archive WORM bucket (independent from backup bucket) ==========
+        # 为什么单独一个桶(而不是复用 backup 桶):backup 桶装租户 data.ext4(体量大、
+        # retention 走 CFG["s3"]["backup_retention_days"] 数十天量级 lifecycle),审计
+        # 归档是控制面 CRUD 事件(体量小、retention 数年 SEC-17a-4 级)。权限面/生命
+        # 周期/密钥分离 → 一个 S3 管理员事故不牵动另一个。
+        #
+        # 双层保护:
+        # 1) 防篡改/防删 — S3 Object Lock COMPLIANCE + Versioning + RETAIN(prod)。
+        #    COMPLIANCE 保留期内 root 都改不动/删不掉,连缩短 retention 都不行。
+        # 2) 防看明文 — 独立 audit-archive CMK(SSE-KMS)。key policy 只授归档
+        #    Lambda 的 role 用密钥;S3 管理员即便 GetObject 也拿到密文,解不开。
+        audit_archive_bucket = None
+        audit_archive_cmk = None
+        if audit_archive_enabled:
+            audit_archive_cmk = kms.Key(
+                self,
+                "AuditArchiveCMK",
+                alias="alias/openclaw-audit-archive",
+                description="Encrypts the WORM-archived audit trail; decrypt scoped to archive Lambda only",
+                enable_key_rotation=True,
+                removal_policy=self._stateful_removal,
+            )
+            _audit_archive_kwargs = dict(
+                bucket_name=f"openclaw-audit-archive-{self.account}{self._gsuffix}",
+                block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+                enforce_ssl=True,
+                encryption=s3.BucketEncryption.KMS,
+                encryption_key=audit_archive_cmk,
+                bucket_key_enabled=True,
+            )
+            if _is_prod_region:
+                _audit_archive_kwargs.update(
+                    removal_policy=RemovalPolicy.RETAIN,
+                    versioned=True,  # Object Lock 要求
+                    object_lock_enabled=True,
+                    object_lock_default_retention=s3.ObjectLockRetention.compliance(
+                        Duration.days(365 * audit_worm_retention_years)
+                    ),
+                )
+            else:
+                _audit_archive_kwargs.update(
+                    removal_policy=RemovalPolicy.DESTROY,
+                    auto_delete_objects=True,
+                )
+            audit_archive_bucket = s3.Bucket(
+                self, "AuditArchive", **_audit_archive_kwargs
+            )
+
         # NOTE: media-upload CORS for this bucket is configured later, after the
         # CloudFront distribution is created (search "AssetsCors"), because the
         # allowed-origin must be scoped to the real CloudFront domain.
 
         # ========== Lambda Shared Policy ==========
-        ssm_policy = iam.PolicyStatement(
-            actions=["ssm:SendCommand", "ssm:GetCommandInvocation"],
+        #
+        # Issue #62(档 B,人工评审):IAM 收窄。原来 SendCommand /
+        # TerminateInstances / Describe* 全通配 resources=["*"],跟审计
+        # baseline 冲突(WI-E/M-7)。收窄按爆炸半径切三块:
+        #
+        #   1. ssm:SendCommand(可写路径)拆两条 statement:
+        #        · document ARN(AWS-RunShellScript)— 不能带 aws:ResourceTag
+        #          条件,document 资源身上不打这两个 tag,条件求值失败会全链路
+        #          AccessDenied 卡死 create/terminate;
+        #        · instance ARN — 带 aws:ResourceTag/Project=openclaw +
+        #          aws:ResourceTag/Role=metal-host 条件,只允许对 ASG 打出的
+        #          host 发命令。tag key/value 与 LaunchTemplate 里 TagSpecifications
+        #          (stack.py:_host_tags)字面一致,拼错 → AccessDenied。
+        #
+        #   2. ec2:TerminateInstances(不可逆)单独一条,resources=instance ARN,
+        #      带同款 aws:ResourceTag 条件——只能杀自己起的 metal host,不能
+        #      误伤同账号别的 EC2。
+        #
+        #   3. 只读 List/Describe(ssm:GetCommandInvocation /
+        #      ec2:DescribeInstances / ec2:DescribeInstanceTypes)—— 这三个 API
+        #      多不支持资源级 IAM(SDK 校验时会拒绝带 ARN 的 resources),保留
+        #      resources=["*"] 单列一条只读 statement,爆炸半径低。
+        #
+        # 防错:test_stack.py 里 synth 断言 tag key/value 与
+        # LaunchTemplate TagSpecifications 一致(见 TestIamNarrowing),防两处
+        # 漂移(改一处忘改另一处 → AccessDenied)。
+        _host_tag_conditions = {
+            "StringEquals": {
+                "aws:ResourceTag/Project": "openclaw",
+                "aws:ResourceTag/Role": "metal-host",
+            }
+        }
+        _ssm_document_arn = f"arn:aws:ssm:{self.region}::document/AWS-RunShellScript"
+        _ec2_instance_arn_wildcard = (
+            f"arn:aws:ec2:{self.region}:{self.account}:instance/*"
+        )
+        # SSM SendCommand(可写)— 两条:document(无 tag 条件) + instance(tag 条件)
+        ssm_send_document_policy = iam.PolicyStatement(
+            actions=["ssm:SendCommand"],
+            resources=[_ssm_document_arn],
+        )
+        ssm_send_instance_policy = iam.PolicyStatement(
+            actions=["ssm:SendCommand"],
+            resources=[_ec2_instance_arn_wildcard],
+            conditions=_host_tag_conditions,
+        )
+        # SSM GetCommandInvocation(只读)— 不支持资源级 IAM,保留 *
+        ssm_readonly_policy = iam.PolicyStatement(
+            actions=["ssm:GetCommandInvocation"],
             resources=["*"],
         )
-        ec2_policy = iam.PolicyStatement(
+        # 组合出兼容旧接口的 ssm_policy(变成 3 条 statement 的元组用法不方便,
+        # 直接改成"多 statement 数组",调用点循环 add_to_role_policy 一次挂全部)
+        ssm_policy_statements = [
+            ssm_send_document_policy,
+            ssm_send_instance_policy,
+            ssm_readonly_policy,
+        ]
+        # EC2 TerminateInstances(不可逆)— 单独一条,带 tag 条件
+        ec2_terminate_policy = iam.PolicyStatement(
+            actions=["ec2:TerminateInstances"],
+            resources=[_ec2_instance_arn_wildcard],
+            conditions=_host_tag_conditions,
+        )
+        # EC2 Describe*(只读)— 不支持资源级 IAM,保留 *
+        ec2_describe_policy = iam.PolicyStatement(
             actions=[
                 "ec2:DescribeInstances",
                 "ec2:DescribeInstanceTypes",
-                "ec2:TerminateInstances",
             ],
             resources=["*"],
         )
+        ec2_policy_statements = [
+            ec2_terminate_policy,
+            ec2_describe_policy,
+        ]
+
+        def _attach_ssm_policies(fn):
+            """帮助函数:把 SSM 收窄后的多条 statement 挂到 Lambda role。
+
+            SSM SendCommand 被拆成 document+instance 两条(带/不带 tag 条件),
+            外加只读 GetCommandInvocation 一条;共 3 条 statement。健康检查/
+            scaler/backup 只需要 SSM(不 terminate 实例),用这个 helper。
+            """
+            for _st in ssm_policy_statements:
+                fn.add_to_role_policy(_st)
+
+        def _attach_shared_policies(fn):
+            """帮助函数:把 ssm/ec2 收窄后的多条 statement 一次挂到 Lambda role。
+
+            替代旧的 fn.add_to_role_policy(ssm_policy)/fn.add_to_role_policy(ec2_policy)
+            单条形式;api_fn 和 lifecycle_consumer 需要完整 SSM + EC2(含 Terminate)。
+            """
+            _attach_ssm_policies(fn)
+            for _st in ec2_policy_statements:
+                fn.add_to_role_policy(_st)
 
         # ========== SNS Lifecycle Notifications (issue #13, optional) ==========
         notif_cfg = CFG.get("notifications", {}) or {}
@@ -449,6 +622,15 @@ class OpenClawOrchestratorStack(cdk.Stack):
             )
         else:
             _external_authz_secret_ref = ""
+
+        # ========== SQS Dispatch(标准队列+装箱)双开关守卫(fail-loud) ==========
+        # SPEC/specs/sqs-dispatch/interfaces.md L30:dispatch.enabled=true 时
+        # create/start 一律走 dispatch 标准队列;两者同 true → synth 直接 raise,
+        # 防止同一 create 消息同时落 dispatch(std) 和 lifecycle(fifo) 队列被
+        # 消费两次起两个 VM。守卫抽在 deploy/lib/dispatch_infra.py 里可独测。
+        from lib.dispatch_infra import validate_no_double_enqueue
+
+        validate_no_double_enqueue(CFG)
 
         # ========== API Lambda ==========
         # 控制面重构阶段1 — lifecycle SQS 队列 + DLQ(削峰)。config-gated:
@@ -716,8 +898,9 @@ class OpenClawOrchestratorStack(cdk.Stack):
             # 这些,导致 consumer 消费 create 消息时 AccessDenied(ssm:SendCommand /
             # elasticloadbalancing:CreateTargetGroup),租户永远卡 creating、消息进 DLQ。
             # 注释一直写"consumer 同 api 权限"但代码没落实,现补齐。
-            lifecycle_consumer.add_to_role_policy(ssm_policy)
-            lifecycle_consumer.add_to_role_policy(ec2_policy)
+            # 注:#62 IAM 收窄后 ssm_policy/ec2_policy 拆成多条 statement,
+            # 用 _attach_shared_policies 一次挂上,不再 add_to_role_policy 单条。
+            _attach_shared_policies(lifecycle_consumer)
             lifecycle_consumer.add_to_role_policy(
                 iam.PolicyStatement(
                     actions=[
@@ -767,7 +950,10 @@ class OpenClawOrchestratorStack(cdk.Stack):
         # Issue #13 — allow publishing tenant lifecycle events
         if notifications_topic is not None:
             notifications_topic.grant_publish(api_fn)
-        api_fn.add_to_role_policy(ssm_policy)
+        # #62 IAM 收窄:ssm_policy + ec2_policy 各拆成多条 statement,
+        # 用 _attach_shared_policies 一次挂上。原 ssm_policy/ec2_policy 两次
+        # add_to_role_policy 合并到这里(下方 ec2_policy 那行已删)。
+        _attach_shared_policies(api_fn)
         # Phase 2 — emit the TenantCreateLatencySeconds SLA metric. PutMetricData
         # can't be resource-scoped (no ARNs), so it's namespace-conditioned to
         # OpenClaw/ControlPlane to keep it least-privilege.
@@ -805,7 +991,9 @@ class OpenClawOrchestratorStack(cdk.Stack):
                     ],
                 )
             )
-        api_fn.add_to_role_policy(ec2_policy)
+        # #62 IAM 收窄:ec2_policy 已经由 _attach_shared_policies(api_fn) 挂上,
+        # 这里删掉旧的单条 add(ssm_policy + ec2_policy 两次调用合并成一次
+        # _attach_shared_policies)。
         api_fn.add_to_role_policy(
             iam.PolicyStatement(
                 actions=[
@@ -855,6 +1043,85 @@ class OpenClawOrchestratorStack(cdk.Stack):
             ],
         )
         plan.add_api_key(api_key)
+
+        # ========== #108 per-platform scoped API keys (config-gated, default off) ==========
+        # Closes the god-key IDOR: one openclaw-admin-key today grants full-fleet
+        # access, so handing it to any third-party platform leaks every platform's
+        # tenants. When `api.platform_keys` is configured, each listed platform
+        # gets its OWN APIGW key + usage plan, and a REQUEST authorizer resolves
+        # which platform the presented key belongs to (via PlatformKeyMap: sha256
+        # of the key → platform_id) and injects requestContext.authorizer.platform_id.
+        # The handler then scopes list/get/action/create/delete to that namespace
+        # (stage 1). DEFAULT OFF: with no platform_keys config the block is skipped
+        # entirely → byte-identical single-key deploy (backward compatible).
+        #
+        # The legacy openclaw-admin-key stays as the operator super-key (not in the
+        # map → no platform_id injected → full-fleet, internal ops only). Removing
+        # it is an irreversible credential change left to a human decision (#0-C).
+        _platform_keys = _api_cfg.get("platform_keys") or []
+        _platform_authorizer = None
+        if _platform_keys:
+            # PlatformKeyMap: PK=key_hash (sha256 hex of the API key value — NEVER
+            # the plaintext key), field platform_id. The authorizer reads it; an
+            # operator seeds it out-of-band (create key → put {sha256(value),
+            # platform_id}). RETAIN so a stack replace never drops the mapping and
+            # silently downgrades every scoped key to unscoped (a security regression).
+            platform_key_table = dynamodb.Table(
+                self,
+                "PlatformKeyMap",
+                partition_key=dynamodb.Attribute(
+                    name="key_hash", type=dynamodb.AttributeType.STRING
+                ),
+                billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+                removal_policy=RemovalPolicy.RETAIN,
+                point_in_time_recovery_specification=_pitr_spec,
+            )
+            authorizer_fn = _lambda.Function(
+                self,
+                "PlatformAuthorizer",
+                function_name="openclaw-platform-authorizer",
+                runtime=_lambda.Runtime.PYTHON_3_12,
+                architecture=_lambda.Architecture.ARM_64,
+                handler="handler.lambda_handler",
+                code=_lambda.Code.from_asset("deploy/lambda/platform_authorizer"),
+                timeout=Duration.seconds(10),
+                memory_size=128,
+                environment={"PLATFORM_KEY_TABLE": platform_key_table.table_name},
+            )
+            platform_key_table.grant_read_data(authorizer_fn)
+            # REQUEST authorizer keyed on the x-api-key header. identity_source makes
+            # API GW cache per distinct key value (results_cache) — same key → one
+            # authorizer invoke per TTL, not per request.
+            _platform_authorizer = apigw.RequestAuthorizer(
+                self,
+                "PlatformKeyAuthorizer",
+                handler=authorizer_fn,
+                identity_sources=[apigw.IdentitySource.header("x-api-key")],
+                results_cache_ttl=Duration.minutes(5),
+            )
+            # One key + one usage plan per configured platform. Each plan carries
+            # its own throttle (per-platform rate limiting, DoD) so one platform
+            # can't exhaust another's budget.
+            for _pk in _platform_keys:
+                _pid = str(_pk.get("id", "")).strip()
+                if not _pid:
+                    continue
+                _pkey = api.add_api_key(
+                    f"PlatformKey{_pid}",
+                    api_key_name=f"openclaw-platform-{_pid}",
+                )
+                _pplan = api.add_usage_plan(
+                    f"PlatformPlan{_pid}",
+                    name=f"openclaw-plan-{_pid}",
+                    throttle=apigw.ThrottleSettings(
+                        rate_limit=int(_pk.get("throttle_rate_limit", 100)),
+                        burst_limit=int(_pk.get("throttle_burst_limit", 200)),
+                    ),
+                    api_stages=[
+                        apigw.UsagePlanPerApiStage(api=api, stage=api.deployment_stage)
+                    ],
+                )
+                _pplan.add_api_key(_pkey)
 
         # ========== WAF (issue #7, optional) ==========
         waf_cfg = CFG.get("waf", {}) or {}
@@ -956,6 +1223,17 @@ class OpenClawOrchestratorStack(cdk.Stack):
             )
 
         key_required = {"api_key_required": True}
+        # #108 — when per-platform keys are configured, attach the REQUEST
+        # authorizer to every keyed method so requestContext.authorizer.platform_id
+        # reaches the handler. Off by default → key_required stays exactly as before
+        # (backward-compatible single-key deploy). CORS preflight (OPTIONS) is added
+        # by default_cors_preflight_options WITHOUT this dict, so it stays unauthorized.
+        if _platform_authorizer is not None:
+            key_required = {
+                "api_key_required": True,
+                "authorizer": _platform_authorizer,
+                "authorization_type": apigw.AuthorizationType.CUSTOM,
+            }
 
         # ── Lambda permission policy size fix (deploy-blocking) ──
         # Each `LambdaIntegration(api_fn)` makes CDK attach a *separate*
@@ -1169,7 +1447,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 resources=["*"],
             )
         )
-        health_fn.add_to_role_policy(ssm_policy)
+        _attach_ssm_policies(health_fn)  # #62 IAM 收窄:拆 SSM 多 statement
 
         events.Rule(
             self,
@@ -1284,7 +1562,9 @@ class OpenClawOrchestratorStack(cdk.Stack):
         hosts_table.grant_read_write_data(scaler_fn)
         # Issue #15 — TTL processing reads tenants and updates status (stop/delete)
         tenants_table.grant_read_write_data(scaler_fn)
-        scaler_fn.add_to_role_policy(ssm_policy)  # SSM stop-vm.sh on TTL expiry
+        # #62 IAM 收窄:SSM 拆多 statement;stop-vm.sh 走 SSM SendCommand,
+        # instance ARN 带 Project=openclaw/Role=metal-host 条件。
+        _attach_ssm_policies(scaler_fn)
         # task #21 — read rootfs manifest (current golden version) for refresh
         assets_bucket.grant_read(scaler_fn)
         scaler_fn.add_to_role_policy(
@@ -1333,7 +1613,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
         assets_bucket.grant_read_write(backup_fn)
         backup_bucket.grant_read_write(backup_fn)  # 备份写入 + 恢复读取
         backup_cmk.grant_encrypt_decrypt(backup_fn)  # CMK 解密权限只授备份执行者
-        backup_fn.add_to_role_policy(ssm_policy)
+        _attach_ssm_policies(backup_fn)  # #62 IAM 收窄:拆 SSM 多 statement
         backup_fn.grant_invoke(api_fn)  # API Lambda async invokes Backup Lambda
 
         # PRD 2.6: backup_cron 现在是"扫描节拍"而非"统一备份时间"——每次触发只备到期
@@ -1345,6 +1625,52 @@ class OpenClawOrchestratorStack(cdk.Stack):
             schedule=events.Schedule.expression(CFG["s3"]["backup_cron"]),
             targets=[targets.LambdaFunction(backup_fn)],
         )
+
+        # ========== #32 Audit archive Lambda (DDB Stream → WORM bucket) ==========
+        # 触发: audit_table DDB Stream (NEW_IMAGE)。每条审计条目 put 后 Lambda 消费
+        # 事件,把 NEW_IMAGE 反 marshal 成 JSON,PutObject 到 audit_archive_bucket
+        # 分区路径 `<prefix>/<owner_id>/<yyyy>/<mm>/<dd>/<id>.json`。retention 靠
+        # Object Lock,不设 lifecycle expiration(WORM 满周期后 lifecycle 可后加)。
+        # 幂等:key 里带 audit_row_id(uuid4)→ PutObject 覆盖同 key 得到同版本内容,
+        # 加上 bucket 版本化,重放不会导致 lost-update。
+        if audit_archive_enabled:
+            audit_archive_fn = _lambda.Function(
+                self,
+                "AuditArchiveFn",
+                function_name="openclaw-audit-archive",
+                runtime=_lambda.Runtime.PYTHON_3_12,
+                handler="handler.lambda_handler",
+                code=_lambda.Code.from_asset("deploy/lambda/audit_archive"),
+                timeout=Duration.seconds(60),
+                memory_size=256,
+                environment={
+                    "AUDIT_ARCHIVE_BUCKET": audit_archive_bucket.bucket_name,
+                    "AUDIT_ARCHIVE_PREFIX": audit_cfg.get(
+                        "archive_prefix", "audit-archive"
+                    ),
+                    "AUDIT_ARCHIVE_CMK_KEY_ID": audit_archive_cmk.key_id,
+                },
+                # dead-letter: 消费失败进 DLQ 让工程可见,不静默吞
+                dead_letter_queue_enabled=True,
+            )
+            audit_archive_bucket.grant_write(audit_archive_fn)
+            audit_archive_cmk.grant_encrypt(audit_archive_fn)
+            audit_archive_fn.add_event_source(
+                lambda_event_sources.DynamoEventSource(
+                    audit_table,
+                    starting_position=_lambda.StartingPosition.TRIM_HORIZON,
+                    batch_size=100,
+                    bisect_batch_on_error=True,
+                    retry_attempts=3,
+                    # 只关心新增(NEW_IMAGE);删除/修改事件跳过——TTL 到期删是保留策略
+                    # 一部分,不需要归档;INSERT 是唯一有效通道。
+                    filters=[
+                        _lambda.FilterCriteria.filter(
+                            {"eventName": _lambda.FilterRule.is_equal("INSERT")}
+                        )
+                    ],
+                )
+            )
 
         # ╓─── [包B 隔离安全] owner=B ── host角色/监控(host_role,被ASG/AMP/AgentCore引用)─╖
         # ========== Host EC2 Role (SSM + S3 backup + self-register) ==========
@@ -1393,6 +1719,30 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 resources=["*"],
             )
         )
+
+        # ========== SQS Dispatch (标准队列 + 装箱消费 + 聚合 SSM/pull 二期) ==========
+        # config-gated by dispatch.enabled(default false → 零新资源)。所有一期/二期
+        # 基础设施(队列/DLQ/ESM/assignments 表/andon param/Poller Rule/DLQ alarm)
+        # 集中在 DispatchInfra Construct 里,stack.py 只保留最小侵入的实例化 + env 注入。
+        # 双开关守卫在 API Lambda 段前已经走过 validate_no_double_enqueue。
+        _dispatch_cfg = CFG.get("dispatch", {}) or {}
+        if _dispatch_cfg.get("enabled", False):
+            from lib.dispatch_infra import DispatchInfra
+
+            dispatch_infra = DispatchInfra(
+                self,
+                "Dispatch",
+                cfg=_dispatch_cfg,
+                api_fn=api_fn,
+                host_role=host_role,
+            )
+            # 契约 env(interfaces.md L6-17)注入 api_fn。lifecycle_consumer 复用同一
+            # handler 代码,create_via_queue 迁移期两者共存,一并给到 consumer,避免
+            # "同 handler 两个 Lambda 走出不一致行为"。
+            for _k, _v in dispatch_infra.env_vars().items():
+                api_fn.add_environment(_k, _v)
+                if getattr(self, "_lifecycle_consumer", None) is not None:
+                    self._lifecycle_consumer.add_environment(_k, _v)
 
         # ========== Amazon Managed Prometheus + Grafana (issue #4) ==========
         # Host-agent exposes /metrics on :8899 (same listener as /health);
@@ -1484,6 +1834,35 @@ class OpenClawOrchestratorStack(cdk.Stack):
         # let an account that already runs GuardDuty just point Wazuh at it.
         sec_cfg = CFG.get("security", {}) or {}
         if sec_cfg.get("guardduty_enabled", False):
+            # Optional: RUNTIME_MONITORING feature. Off by default because the
+            # naive path (features=[{RUNTIME_MONITORING, ENABLED}]) also flips
+            # EC2_AGENT_MANAGEMENT to ENABLED at the account level, and that
+            # associates SSM to auto-install the GuardDuty agent on EVERY EC2
+            # in the account (evidence: engineering/00-knowledge-base/evidence/
+            # metal-experiments/8layer-evidence.md:163-181 — AWS "how runtime
+            # monitoring works ec2" doc). That is not safe for a shared account
+            # hosting other teams' hosts.
+            # Safe stance when the flag is true:
+            #   RUNTIME_MONITORING=ENABLED but EC2_AGENT_MANAGEMENT=DISABLED,
+            # so the runtime feature is provisioned in the detector but agents
+            # are only installed on EC2s explicitly tagged
+            # GuardDutyManaged=true (inclusion-tag path). Anything else the
+            # account already runs (Wazuh/auditd in-guest, existing agents)
+            # keeps working.
+            gd_features = None
+            if sec_cfg.get("guardduty_runtime_monitoring", False):
+                gd_features = [
+                    guardduty.CfnDetector.CFNFeatureConfigurationProperty(
+                        name="RUNTIME_MONITORING",
+                        status="ENABLED",
+                        additional_configuration=[
+                            guardduty.CfnDetector.CFNFeatureAdditionalConfigurationProperty(
+                                name="EC2_AGENT_MANAGEMENT",
+                                status="DISABLED",
+                            ),
+                        ],
+                    ),
+                ]
             gd_detector = guardduty.CfnDetector(
                 self,
                 "GuardDutyDetector",
@@ -1496,6 +1875,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
                         enable=True
                     ),
                 ),
+                features=gd_features,
             )
             # Route GuardDuty findings to the notifications SNS topic so the
             # Wazuh platform (or any subscriber) ingests them alongside HIDS
@@ -1511,6 +1891,101 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 )
                 gd_rule.add_target(targets.SnsTopic(notifications_topic))
             cdk.CfnOutput(self, "GuardDutyDetectorId", value=gd_detector.ref)
+
+        # ========== Inspector2 host/ECR vulnerability scanning (issue #27) ==========
+        # Amazon Inspector v2 is an account-level toggle (no L2 CDK construct
+        # today — aws_inspectorv2 only exposes L1s for filters/CIS scans, not
+        # for enabling the service itself). Path: config-gated AwsCustomResource
+        # calling inspector2:Enable on-create and inspector2:Disable on-delete,
+        # so the flag flip both enables the service AND tears it down cleanly
+        # on stack destroy.
+        # Default false: Enable is an account-level side effect (bills per
+        # ec2/ecr resource scanned) — safer to leave the account operator in
+        # control and let them either flip this flag or run the enable command
+        # out of band.
+        if sec_cfg.get("inspector_enabled", False):
+            insp_resource_types = sec_cfg.get(
+                "inspector_resource_types", ["EC2", "ECR"]
+            )
+            insp_enable = cr.AwsCustomResource(
+                self,
+                "Inspector2Enable",
+                on_create=cr.AwsSdkCall(
+                    service="Inspector2",
+                    action="enable",
+                    parameters={
+                        "resourceTypes": insp_resource_types,
+                    },
+                    physical_resource_id=cr.PhysicalResourceId.of(
+                        f"inspector2-{self.region}"
+                    ),
+                ),
+                on_update=cr.AwsSdkCall(
+                    service="Inspector2",
+                    action="enable",
+                    parameters={
+                        "resourceTypes": insp_resource_types,
+                    },
+                    physical_resource_id=cr.PhysicalResourceId.of(
+                        f"inspector2-{self.region}"
+                    ),
+                ),
+                on_delete=cr.AwsSdkCall(
+                    service="Inspector2",
+                    action="disable",
+                    parameters={
+                        "resourceTypes": insp_resource_types,
+                    },
+                ),
+                install_latest_aws_sdk=True,
+                policy=cr.AwsCustomResourcePolicy.from_statements(
+                    [
+                        iam.PolicyStatement(
+                            actions=[
+                                "inspector2:Enable",
+                                "inspector2:Disable",
+                                "inspector2:BatchGetAccountStatus",
+                            ],
+                            resources=["*"],
+                        ),
+                        # inspector2:Enable creates the service-linked role on
+                        # first call; grant iam:CreateServiceLinkedRole scoped
+                        # to inspector2 SLR so the custom resource can bootstrap
+                        # the account without needing pre-existing SLR.
+                        iam.PolicyStatement(
+                            actions=["iam:CreateServiceLinkedRole"],
+                            resources=[
+                                f"arn:aws:iam::{self.account}:role/aws-service-role/inspector2.amazonaws.com/AWSServiceRoleForAmazonInspector2"
+                            ],
+                            conditions={
+                                "StringLike": {
+                                    "iam:AWSServiceName": "inspector2.amazonaws.com"
+                                }
+                            },
+                        ),
+                    ]
+                ),
+            )
+            # Route Inspector2 findings to the same SNS topic as GuardDuty so
+            # the aggregated monitoring platform (Wazuh) picks them up.
+            if notifications_topic is not None:
+                insp_rule = events.Rule(
+                    self,
+                    "Inspector2ToSns",
+                    event_pattern=events.EventPattern(
+                        source=["aws.inspector2"],
+                        detail_type=["Inspector2 Finding"],
+                    ),
+                )
+                insp_rule.add_target(targets.SnsTopic(notifications_topic))
+                # EventBridge rule depends on inspector2 being enabled first,
+                # otherwise the source has no events to match.
+                insp_rule.node.add_dependency(insp_enable)
+            cdk.CfnOutput(
+                self,
+                "Inspector2Enabled",
+                value=",".join(insp_resource_types),
+            )
 
         instance_profile = iam.CfnInstanceProfile(
             self,
@@ -1708,6 +2183,54 @@ class OpenClawOrchestratorStack(cdk.Stack):
 
         vpc = ec2.Vpc.from_lookup(self, "Vpc", is_default=True)
 
+        # ========== Bedrock Guardrail (#80 部署时序 — 栈内资源,SSM 输出) ==========
+        # 长期做法:把带外 apply-hardening.sh 建的 Guardrail 挪进 CDK 栈内,拿到 id 后
+        # 写 SSM /openclaw/bedrock-guardrail-id,LiteLLM userdata 从 SSM 读(不硬编码
+        # od6s8sm533fs 那种账号特定 id)。策略定义单一真相源仍是
+        # deploy/runtime-config-export/bedrock-guardrail.json —— apply-hardening.sh
+        # 和这里的 CfnGuardrail 都从这个 JSON 转换,保证两条路径策略一致。
+        #
+        # 迁移路径(默认 false 保存量兼容):
+        #  ① 存量账号已经带外建过 Guardrail(id 已在 SSM 或硬编码) → 留 false,现状不变。
+        #  ② 新账号 / 想统一走 IaC → config.yml 里设 security.guardrail_managed_by_stack: true,
+        #    栈内建 Guardrail、写 SSM,LiteLLM userdata 从 SSM 读。同账号已有同名 Guardrail
+        #    时 CFN 会冲突(create-guardrail 名字不唯一是异常),运营需先把带外那个改名或删了
+        #    再切开关。切开关的运维笔记落 RUNBOOK.md,别静默切。
+        _guardrail_ssm_param_name = "/openclaw/bedrock-guardrail-id"
+        _guardrail_managed = sec_cfg.get("guardrail_managed_by_stack", False)
+        if _guardrail_managed:
+            from lib.guardrail_props import build_guardrail_kwargs, summary
+
+            _gr_json = str(
+                Path(__file__).resolve().parent
+                / "runtime-config-export"
+                / "bedrock-guardrail.json"
+            )
+            _gr_kwargs = build_guardrail_kwargs(_gr_json)
+            _gr_stats = summary(_gr_kwargs)
+            print(
+                f"[#80 guardrail] CfnGuardrail from {_gr_json}: "
+                f"topics={_gr_stats['topics']} content_filters={_gr_stats['content_filters']} "
+                f"words={_gr_stats['words']} pii={_gr_stats['pii_entities']} "
+                f"regexes={_gr_stats['regexes']} grounding={_gr_stats['grounding_filters']}"
+            )
+            _guardrail = bedrock.CfnGuardrail(self, "OpenClawGuardrail", **_gr_kwargs)
+            # id → SSM。LiteLLM userdata / apply-hardening 都可以从这里读,不再硬编码。
+            ssm.StringParameter(
+                self,
+                "BedrockGuardrailIdParam",
+                parameter_name=_guardrail_ssm_param_name,
+                string_value=_guardrail.attr_guardrail_id,
+                description="Bedrock Guardrail id created by stack (#80). "
+                "LiteLLM userdata reads this at boot instead of hardcoded id.",
+            )
+            cdk.CfnOutput(
+                self,
+                "BedrockGuardrailId",
+                value=_guardrail.attr_guardrail_id,
+                description="Bedrock Guardrail id (#80 CfnGuardrail managed by stack).",
+            )
+
         # ========== AI Gateway (LiteLLM) toggle ==========
         # guest microVMs hold ZERO credentials; LLM calls go through an OpenAI-
         # compatible gateway (LiteLLM) → Bedrock. Two modes:
@@ -1783,6 +2306,17 @@ class OpenClawOrchestratorStack(cdk.Stack):
                     ],
                 )
             )
+            # #80 — LiteLLM userdata 从 SSM 读 guardrail id(去硬编码 od6s8sm533fs)。
+            # 栈内建 Guardrail 时(security.guardrail_managed_by_stack=true)param 由本栈写;
+            # 未开开关时 param 可能不存在,userdata 会走硬编码兜底(保存量兼容)+ 日志留痕。
+            litellm_role.add_to_policy(
+                iam.PolicyStatement(
+                    actions=["ssm:GetParameter"],
+                    resources=[
+                        f"arn:aws:ssm:{self.region}:{self.account}:parameter{_guardrail_ssm_param_name}"
+                    ],
+                )
+            )
             _lite_ud = ec2.UserData.for_linux()
             _lite_ud.add_commands(
                 "set -x",
@@ -1816,8 +2350,16 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 # config.runtime.yaml 必须先于 compose up 生成,否则 compose 把不存在的挂载源
                 # 当目录建 → 容器内 /etc/litellm/config.yaml 成空目录 → IsADirectoryError 崩溃重启(已踩坑)。
                 # litellm-config.yaml 在 S3 deployment/litellm/(setup.sh 已补传),就地 sed 注入 guardrail+master_key 引用。
-                f': "${{GUARDRAIL_ID:=__GUARDRAIL_ID__}}"',
-                'sed "s|__GUARDRAIL_ID__|${GUARDRAIL_ID}|g" litellm-config.yaml > config.runtime.yaml 2>/dev/null || cp litellm-config.yaml config.runtime.yaml',
+                # #80 — guardrail id 从 SSM 读(栈内建 CfnGuardrail 后写入),读不到走硬编码兜底(存量账号)。
+                # 一直用 od6s8sm533fs 硬编码在跨账号切换时炸(id 是账号特定的),这里从 SSM 拉才对。
+                f'GR_ID=$(aws ssm get-parameter --name {_guardrail_ssm_param_name} --region {self.region} --query "Parameter.Value" --output text 2>/dev/null || echo "")',
+                'if [ -z "$GR_ID" ]; then echo "[litellm-userdata][WARN] SSM has no guardrail id, falling back to legacy hardcode"; GR_ID="od6s8sm533fs"; fi',
+                'echo "[litellm-userdata] guardrail id: $GR_ID"',
+                'sed "s|__GUARDRAIL_ID__|${GR_ID}|g" litellm-config.yaml > config.runtime.yaml',
+                # fail-loud:sed 没替换掉占位符就 crash 不启网关(guardrail 是安全强依赖,
+                # 没占位符替换的 config 里 guardrailIdentifier 会是字面 "__GUARDRAIL_ID__"
+                # → LiteLLM 每次 request ApplyGuardrail 401 → 每条对话被拒。fail-loud 好过静默)。
+                'if grep -q "__GUARDRAIL_ID__" config.runtime.yaml; then echo "[litellm-userdata][ERR] guardrail placeholder not replaced" >&2; exit 1; fi',
                 "sed -i 's|^\\(\\s*master_key:\\).*|\\1 os.environ/LITELLM_MASTER_KEY|' config.runtime.yaml || true",
                 "docker compose -f docker-compose.litellm.yml up -d 2>&1 | tail -5",
                 # IMDSv2: AL2023 强制 token,旧 IMDSv1 curl 取 IP 返回空→SSM 写成 http://:4000/v1(已踩坑)。先 PUT 拿 token。
@@ -2155,6 +2697,55 @@ class OpenClawOrchestratorStack(cdk.Stack):
             hub_ws_val = ""
         init_sh = init_sh.replace("{{CLAW_HUB_URL}}", hub_url_val)
         init_sh = init_sh.replace("{{CLAW_HUB_WS}}", hub_ws_val)
+        # #39 microVM 出网默认拒绝白名单(L4 tap 级 iptables egress allowlist)。
+        # 五个值写进 /etc/platform.env,init-host.sh 起 host dnsmasq + ipset 基建、
+        # launch-vm.sh source 后据此决定放行/DROP。默认 enabled=false → launch-vm 保持
+        # 末尾 FORWARD ACCEPT(现状零变化);true → 切默认拒绝(静态 CIDR + FQDN ipset 放行 +
+        # 末尾 DROP)。VPC CIDR 直接用 CDK 解析出的 vpc.vpc_cidr_block(不依赖 host IMDS),
+        # 覆盖 hub 私网 tap IP / 堡垒机 LiteLLM / EKS ALB / VPC Endpoint 私网。
+        # 改这里→重建 host 即继承,绝不热改运行中 VM。
+        #
+        # 运营输入格式白名单校验(synth 期 fail-loud):domains/cidrs 会渲染进 platform.env
+        # 和 dnsmasq/iptables 规则,虽是可信 config.yml 输入,但含换行/分号/空格会多写一行
+        # 变量或多注入一条指令。这里正则夹紧,不合法直接炸 synth,不把脏值烤进部署代码。
+        _egress_domains = (sec_cfg.get("egress_allowlist_domains") or "").strip()
+        _egress_cidrs = (sec_cfg.get("egress_allowlist_cidrs") or "").strip()
+        _egress_dns_upstream = (sec_cfg.get("egress_dns_upstream") or "8.8.8.8").strip()
+        _dom_re = re.compile(
+            r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$", re.I
+        )
+        _cidr_re = re.compile(r"^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$")
+        _ipv4_re = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+        for _d in [x.strip() for x in _egress_domains.split(",") if x.strip()]:
+            if not _dom_re.match(_d):
+                raise ValueError(
+                    f"security.egress_allowlist_domains 含非法域名 {_d!r}:只允许逗号分隔的 FQDN"
+                    "(字母数字/连字符/点),不得含空格/分号/斜杠/换行(#39 防注入)"
+                )
+        for _c in [x.strip() for x in _egress_cidrs.split(",") if x.strip()]:
+            if not _cidr_re.match(_c):
+                raise ValueError(
+                    f"security.egress_allowlist_cidrs 含非法 CIDR {_c!r}:只允许逗号分隔的 IPv4 CIDR"
+                    "(如 10.0.0.0/16)(#39 防注入)"
+                )
+        if not (
+            _ipv4_re.match(_egress_dns_upstream) or _dom_re.match(_egress_dns_upstream)
+        ):
+            raise ValueError(
+                f"security.egress_dns_upstream 非法 {_egress_dns_upstream!r}:只允许 IPv4 或 FQDN(#39)"
+            )
+        init_sh = init_sh.replace(
+            "{{EGRESS_ALLOWLIST_ENABLED}}",
+            str(sec_cfg.get("egress_allowlist_enabled", False)).lower(),
+        )
+        init_sh = init_sh.replace(
+            "{{EGRESS_INCLUDE_VPC_CIDR}}",
+            str(sec_cfg.get("egress_allowlist_include_vpc_cidr", True)).lower(),
+        )
+        init_sh = init_sh.replace("{{EGRESS_VPC_CIDR}}", vpc.vpc_cidr_block)
+        init_sh = init_sh.replace("{{EGRESS_ALLOWLIST_CIDRS}}", _egress_cidrs)
+        init_sh = init_sh.replace("{{EGRESS_ALLOWLIST_DOMAINS}}", _egress_domains)
+        init_sh = init_sh.replace("{{EGRESS_DNS_UPSTREAM}}", _egress_dns_upstream)
         # backup-data.sh is pulled from S3 at runtime (uses the $ASSETS_BUCKET shell
         # var init-host.sh resolves from the AssetsBucket stack output).
         init_sh = init_sh.replace(
@@ -2181,7 +2772,8 @@ class OpenClawOrchestratorStack(cdk.Stack):
         # base64(gzip(...)) blob inside a tiny ASCII bootstrap that decodes, gunzips
         # and execs it. base64 is ASCII-safe for the template; gzip keeps it small
         # (~9KB gzipped → ~12.5KB base64, comfortably under 16KB).
-        import gzip as _gzip, base64 as _b64
+        import base64 as _b64
+        import gzip as _gzip
 
         _blob = _b64.b64encode(_gzip.compress(init_sh.encode("utf-8"), 9)).decode(
             "ascii"
@@ -2329,12 +2921,17 @@ class OpenClawOrchestratorStack(cdk.Stack):
         # and HttpPutResponseHopLimit=1 stops a process one network hop away
         # from obtaining a token. host-agent.py / the AWS SDK use the IMDSv2
         # flow, so this is transparent to legitimate callers.
+        # #34 — HttpProtocolIpv6=disabled 关掉 host 侧 IMDS 的 IPv6 端点
+        # (fd00:ec2::254),与 launch-vm.sh 的 per-tap disable_ipv6=1 一起把 IPv6
+        # IMDS 一刀切断,不留 SSRF via IPv6 的通路。IMDSv6 是 opt-in,disable 是
+        # AWS 明确记录的支持值(EC2 metadata options),默认关只是加固纪律。
         cfn_lt.add_property_override(
             "LaunchTemplateData.MetadataOptions",
             {
                 "HttpTokens": "required",
                 "HttpPutResponseHopLimit": 1,
                 "HttpEndpoint": "enabled",
+                "HttpProtocolIpv6": "disabled",
             },
         )
 
@@ -2358,10 +2955,12 @@ class OpenClawOrchestratorStack(cdk.Stack):
             # CreateLaunchTemplateVersion merges onto SourceVersion=$Latest so
             # this would normally be inherited, but we restate it so the
             # security posture is explicit and cannot silently regress.
+            # #34 — HttpProtocolIpv6=disabled 与上面 override 保持一致。
             "MetadataOptions": {
                 "HttpTokens": "required",
                 "HttpPutResponseHopLimit": 1,
                 "HttpEndpoint": "enabled",
+                "HttpProtocolIpv6": "disabled",
             },
         }
         if not _is_metal:
@@ -2700,6 +3299,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
         # 若未列,部署时传 -c cf_origin_facing_prefix_list=<pl-id>(否则降级 VPC-only)。
         _CF_PL_BY_REGION = {
             "ap-southeast-1": "pl-31a34658",
+            "us-east-1": "pl-3b927c52",
         }
         _cf_pl = self.node.try_get_context(
             "cf_origin_facing_prefix_list"
@@ -2855,6 +3455,25 @@ function handler(event) {
         # nosniff headers; add them at the edge so every cached response carries
         # them without touching each HTML file. Applied to the console/static
         # behaviors below.
+        # #63 — CSP for XSS-in-depth. 前端 chat/console 内联 <script> 已全部
+        # 搬到 js/*.js(console/chat/js/auth.js/chat.js 与 console/js/auth.js),
+        # setup.sh 注入的账号占位符走 <script type=application/json>(不受 CSP
+        # 执行策略约束)。不采用 'unsafe-inline'(对主威胁 renderMd/innerHTML
+        # 注入防护为零),静态托管无服务端也不做 nonce(静态 nonce=常量=没用)。
+        # 'unsafe-eval' 保留给 Alpine.js v3(x-data/@click 用 new Function 求值,
+        # 拿掉整个 console 挂);marked/alpine CDN 白名单显式列。connect-src
+        # 覆盖同源 /hub /chat/sign /tenants + Cognito /oauth2/token 跨域 fetch
+        # (Cognito domain 由部署时决定,不硬编码进 CSP,故收敛成 https:/wss:)。
+        _csp = (CFG.get("cloudfront", {}) or {}).get("csp") or (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-eval' https://cdn.jsdelivr.net; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: blob:; "
+            "connect-src 'self' https: wss:; "
+            "frame-ancestors 'none'; "
+            "base-uri 'self'; "
+            "object-src 'none'"
+        )
         sec_headers_policy = cloudfront.ResponseHeadersPolicy(
             self,
             "SecHeadersPolicy",
@@ -2875,6 +3494,10 @@ function handler(event) {
                 ),
                 referrer_policy=cloudfront.ResponseHeadersReferrerPolicy(
                     referrer_policy=cloudfront.HeadersReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN,
+                    override=True,
+                ),
+                content_security_policy=cloudfront.ResponseHeadersContentSecurityPolicy(
+                    content_security_policy=_csp,
                     override=True,
                 ),
             ),
@@ -3214,6 +3837,70 @@ function handler(event) {
                         attribute_mapping=_idp_attribute_mapping(),
                     )
                     _supported_idps.append(idp_provider_name)
+                    # #144 — this branch never wired Pre-Token-Generation, so
+                    # federated users' tokens carried custom:platform_id=None
+                    # forever (platform reporting/filter dead on this deploy
+                    # shape; NOT an authz face — auth.py:289 never uses
+                    # platform_id for decisions). from_user_pool_id returns an
+                    # interface proxy with no add_trigger and CFN has no
+                    # standalone LambdaConfig resource, so a provider-backed
+                    # custom resource calls UpdateUserPool. That API resets
+                    # every omitted field to defaults (API ref), hence the
+                    # handler describes → merges → overlays the trigger, and
+                    # fails the deploy loud when custom:tenant_user_id is
+                    # missing from the imported pool's (immutable) schema.
+                    _ptg_fn = _lambda.Function(
+                        self,
+                        "PreTokenGen",
+                        function_name="openclaw-pretokengen",
+                        runtime=_lambda.Runtime.PYTHON_3_12,
+                        architecture=_lambda.Architecture.ARM_64,
+                        handler="handler.handler",
+                        code=_lambda.Code.from_asset("deploy/lambda/pretokengen"),
+                        timeout=Duration.seconds(5),
+                        memory_size=128,
+                    )
+                    _ptg_fn.add_permission(
+                        "CognitoInvoke",
+                        principal=iam.ServicePrincipal("cognito-idp.amazonaws.com"),
+                        source_arn=user_pool.user_pool_arn,
+                    )
+                    _ptg_attach_fn = _lambda.Function(
+                        self,
+                        "PtgAttach",
+                        function_name="openclaw-ptg-attach",
+                        runtime=_lambda.Runtime.PYTHON_3_12,
+                        architecture=_lambda.Architecture.ARM_64,
+                        handler="handler.handler",
+                        code=_lambda.Code.from_asset("deploy/lambda/ptg_attach"),
+                        timeout=Duration.seconds(30),
+                        memory_size=128,
+                    )
+                    _ptg_attach_fn.add_to_role_policy(
+                        iam.PolicyStatement(
+                            actions=[
+                                "cognito-idp:DescribeUserPool",
+                                "cognito-idp:UpdateUserPool",
+                            ],
+                            resources=[user_pool.user_pool_arn],
+                        )
+                    )
+                    _ptg_provider = cr.Provider(
+                        self,
+                        "PtgAttachProvider",
+                        on_event_handler=_ptg_attach_fn,
+                    )
+                    _ptg_attach = cdk.CustomResource(
+                        self,
+                        "PtgAttachTrigger",
+                        service_token=_ptg_provider.service_token,
+                        properties={
+                            "UserPoolId": existing_pool_id,
+                            "LambdaArn": _ptg_fn.function_arn,
+                            "RequiredCustomAttr": idp_custom_attr,
+                        },
+                    )
+                    _ptg_attach.node.add_dependency(_ptg_fn)
                 cfn_client = cognito.CfnUserPoolClient(
                     self,
                     "ConsoleClient",

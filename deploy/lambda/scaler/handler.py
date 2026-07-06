@@ -19,7 +19,11 @@ ASG_NAME = os.environ["ASG_NAME"]
 IDLE_TIMEOUT = int(os.environ["IDLE_TIMEOUT_MINUTES"])
 
 # Issue #15 — terminal statuses where TTL processing is a no-op
-_TTL_TERMINAL = {"stopped", "deleted", "failed"}
+# #107 — "deleting" is the transient gate set by delete_tenant's CAS while a
+# delete is in flight. TTL处置对它必须是 no-op:租户正在被显式删除,若 TTL 循环
+# 再对它下发 stop/delete,会把 "deleting" 逆转成活跃态(重开账本扣穿窗口)或抢在
+# delete 主流程完成副作用前误标终态(致 _abort_restore_status 回滚失败 + slot 泄漏)。
+_TTL_TERMINAL = {"stopped", "deleted", "failed", "deleting"}
 
 # ── Seamless image refresh (task #21) ───────────────────────────────────
 # Force-rotate every tenant onto the current golden image every N hours so
@@ -317,13 +321,20 @@ def _reconcile_schedules():
             vm_num = int(it.get("vm_num", 1))
             vcpu = int(it.get("vcpu", 2))
             mem_mb = int(it.get("mem_mb", 4096))
+            # #41 — 穿透 chat_endpoint_enabled 到 launch-vm 幂等段(第 10 位)。
+            # 老版本只填 4 位,CHAT_EP_ENABLED 恒空 → scheduler 唤醒后开关不生效。
+            # 位 5-9/11 空占位(launch-vm 自 special-case ""),数据盘保留一次性字段。
+            cee = bool(it.get("chat_endpoint_enabled", False))
+            chat_ep_arg = "1" if cee else "0"
+            launch_cmd = (
+                f"/home/ubuntu/launch-vm.sh {tid} {vm_num} {vcpu} {mem_mb} "
+                f'"" "" "" "" "" {chat_ep_arg} ""'
+            )
             ssm.send_command(
                 InstanceIds=[host_id],
                 DocumentName="AWS-RunShellScript",
                 Parameters={
-                    "commands": [
-                        f"/home/ubuntu/launch-vm.sh {tid} {vm_num} {vcpu} {mem_mb}",
-                    ]
+                    "commands": [launch_cmd],
                 },
             )
             tenants_table.update_item(
@@ -374,7 +385,16 @@ def _reconcile_schedules():
 # stampede the fleet.
 # ═══════════════════════════════════════════════════════════════════
 
-_REFRESH_SKIP_STATUS = {"stopped", "deleted", "failed", "creating", "migrating"}
+# #107 — "deleting" 同终态语义:不给正在删除的租户滚镜像(否则对正被 rm 的 VM
+# 发 rebuild/refresh SSM,与 delete 抢 SSM)。
+_REFRESH_SKIP_STATUS = {
+    "stopped",
+    "deleted",
+    "failed",
+    "creating",
+    "migrating",
+    "deleting",
+}
 
 
 def _current_golden_version():

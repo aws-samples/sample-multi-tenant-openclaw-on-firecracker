@@ -81,6 +81,17 @@ INJECTED_COGNITO_B64="${11:-}"
 [ "${INJECTED_COGNITO_B64}" = '""' ] && INJECTED_COGNITO_B64=""
 VM_DIR="/data/firecracker-vms/${TENANT_ID}"
 [ -f /etc/platform.env ] && source /etc/platform.env
+# #41 — harden-config.sh 提供 POSIX sh 幂等 openclaw.json 收敛函数
+# (oc_harden_config + oc_normalize_litellm_baseurl)。launch-vm.sh 每次启动都调
+# oc_harden_config,不管 fresh/wake,收敛部署相关值(CloudFront origin/LiteLLM
+# baseUrl/chatCompletions 三态/apiKey 显式非空)。缺文件 = 部署漂移 → fail-loud。
+if [ -r /home/ubuntu/lib/harden-config.sh ]; then
+  # shellcheck disable=SC1091
+  . /home/ubuntu/lib/harden-config.sh
+else
+  echo "[oc:launch] FATAL: /home/ubuntu/lib/harden-config.sh missing (init-host.sh should have downloaded it)" >&2
+  exit 1
+fi
 mkdir -p ${VM_DIR}
 rm -f ${VM_DIR}/.stopped
 SOCK="${VM_DIR}/fc.sock"
@@ -214,36 +225,27 @@ fi
 # Configure openclaw.json
 OC_JSON="${MOUNT_TMP}/.openclaw/openclaw.json"
 if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
+  # ─────────────────────────────────────────────────────────────────────
+  # ONE-TIME 生成(NEW_DATA 才跑):config template 首次下载、gateway token 首铸、
+  # channel_secret 首次落盘、Cognito 注入、per-tenant vkey 首次注入。这些是"一次
+  # 性生成"的东西——重跑会破坏 DDB 握手(hub 校验 channel_secret 用的是首次那个),
+  # 或用 shared vkey 覆盖已铸的 per-tenant vkey坏计费拆分。
+  # ─────────────────────────────────────────────────────────────────────
   if [ "$NEW_DATA" = "true" ]; then
-    # Download custom template from S3 (if specified)
+    # Download custom template from S3 (if specified). 幂等段跑之前先下,让
+    # oc_harden_config 收敛新拉下来的模板;唤醒不重下(会冲掉用户配置)。
     if [ -n "${CONFIG_TEMPLATE}" ] && [ -n "${ASSETS_BUCKET:-}" ]; then
       aws s3 cp "s3://${ASSETS_BUCKET}/templates/openclaw/${CONFIG_TEMPLATE}/openclaw.json" "${OC_JSON}" --region "${OC_REGION:-ap-northeast-1}" --quiet
       log "config template '${CONFIG_TEMPLATE}' applied"
     fi
-    # Inject platform config. Two SEPARATE, ORTHOGONAL auth layers:
+    # Two SEPARATE, ORTHOGONAL auth layers:
     #   (a) gateway.auth.token  — protects the control plane / control UI.
     #   (b) channels.claw-channel.secret — HMAC secret for the signed C-end
     #       webhook (the mini-app's backend signs with the same secret using the
     #       Cognito-verified `sub`). This is the user-message path; it does NOT
     #       touch gateway.auth.token.
-    #
-    # We DO NOT open the bare OpenAI chatCompletions HTTP endpoint anymore, and we
-    # DO NOT weaken control-UI auth. The previous bb-branch patch
-    # (allowedOrigins=["*"] + dangerouslyDisableDeviceAuth + chatCompletions.enabled)
-    # was a wide-open, device-auth-off, token-in-browser surface. We avoid that
-    # entirely: gateway.http={}, all messages flow over the claw-channel.
-    # allowedOrigins is scoped to the CloudFront origin instead of "*".
-    # chatCompletions stays at its OpenClaw default (off).
     NEW_TOKEN=$(openssl rand -hex 24)
-    # claw-channel (outbound WS to the hub):
-    #   appSecret  — per-VM hex secret. The channel signs HMAC("{appId}:{ts}",
-    #                appSecret) to fetch a hub token. host-agent mirrors this same
-    #                secret into the tenant's DDB record (channel_secret), so the
-    #                self-hosted claw-hub can verify the channel's registration.
-    #   appId      — the tenant id (single-account model: appId == tenant).
-    #   hubUrl/wsUrl — where the channel dials OUT to register (the hub). The
-    #                  browser only ever talks to the hub; the appSecret/gateway
-    #                  token never reach the browser.
+    # claw-channel (outbound WS to the hub) — see docstrings below.
     # Prefer the control-plane-minted secret (already in DDB before boot → hub
     # verifies the channel's FIRST registration, no race). Only self-generate if
     # the caller didn't pass one (legacy path; host-agent read-back still mirrors
@@ -255,7 +257,6 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
       CHANNEL_SECRET=$(openssl rand -hex 32)
       log "channel_secret self-generated (legacy; relies on host-agent DDB mirror)"
     fi
-    CF_ORIGIN="${CLOUDFRONT_ORIGIN:-https://d14etqjt4kt9t4.cloudfront.net}"
     HUB_URL="${CLAW_HUB_URL:-http://${HOST_TAP_IP:-172.16.0.1}:8790}"
     HUB_WS="${CLAW_HUB_WS:-ws://${HOST_TAP_IP:-172.16.0.1}:8790}"
     # WI-002 — decode the per-tenant Cognito machine-user creds (if provisioned).
@@ -279,19 +280,6 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
         log "WARN: Cognito creds base64/JSON decode failed — falling back to HMAC channel_secret"
       fi
     fi
-    # per-tenant chatCompletions: default off → del the endpoint (secure default).
-    # Only when this tenant's flag is on do we set enabled:true instead of deleting.
-    # The jq fragment is chosen at runtime so the default path is byte-identical to
-    # the old unconditional del() (no behavior change for the 99% default-off case).
-    case "${CHAT_EP_ENABLED}" in
-      1|true|TRUE|yes|on)
-        _CHAT_EP_JQ='.gateway.http.endpoints.chatCompletions.enabled = true'
-        log "chatCompletions endpoint ENABLED for this tenant (per-tenant flag on; mitigations: gateway_token + reverse proxy + Guardrail + vkey limit)"
-        ;;
-      *)
-        _CHAT_EP_JQ='del(.gateway.http.endpoints.chatCompletions)'
-        ;;
-    esac
     # Cognito fields are added only when all four are present; otherwise the
     # object keeps just the HMAC fields (legacy path). The in-VM channel's
     # hasCognitoCreds() then picks Cognito vs HMAC. HMAC fields stay either way
@@ -301,63 +289,89 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
     else
       _COGNITO_JQ=''
     fi
-    jq --arg t "$NEW_TOKEN" --arg s "$CHANNEL_SECRET" --arg origin "$CF_ORIGIN" \
+    jq --arg t "$NEW_TOKEN" --arg s "$CHANNEL_SECRET" \
        --arg appid "$TENANT_ID" --arg huburl "$HUB_URL" --arg hubws "$HUB_WS" \
        --arg cogregion "$COG_REGION" --arg cogclient "$COG_CLIENT_ID" \
        --arg coguser "$COG_USERNAME" --arg cogpass "$COG_PASSWORD" "
       .gateway.auth.token = \$t |
-      .gateway.controlUi.allowedOrigins = [\$origin] |
-      del(.gateway.controlUi.dangerouslyDisableDeviceAuth) |
-      ${_CHAT_EP_JQ} |
       .channels = ((.channels // {}) + { \"claw-channel\": (((.channels // {})[\"claw-channel\"] // {}) + {
         \"enabled\": true, \"secret\": \$s, \"appId\": \$appid,
         \"appSecret\": \$s, \"hubUrl\": \$huburl, \"wsUrl\": \$hubws
       }) })
       ${_COGNITO_JQ}
     " "${OC_JSON}" > "${OC_JSON}.tmp" && mv "${OC_JSON}.tmp" "${OC_JSON}"
-    # The mini-app reaches the agent via the claw-hub WS (browser -> hub ->
-    # outbound channel), NOT any bare gateway endpoint. The HMAC secret lives only
-    # here on the per-VM data disk + mirrored to DDB for the hub — never baked
-    # into the read-only golden image, never sent to the browser.
-    log "gateway token + channel hub config generated"
-    # task #15 — per-tenant LiteLLM billing key. If the API minted a vkey for
-    # this tenant, override the shared apiKey baked in the image so this VM's
-    # spend/budget/rate-limit bills to its OWN key (per-tenant↔sub split).
-    # vkey lives ONLY on the per-VM data disk (like channel_secret), never in
-    # the read-only golden image. Empty → keep the shared key (backward compat).
-    # apiKey 注入:优先 per-tenant vkey(计费拆分);无专属 vkey 则用 shared vkey
-    # (LITELLM_SHARED_VKEY,init-host 从 SSM 拉)。镜像里 apiKey 是 __INJECT_AT_DEPLOY__
-    # 占位,必须运行时替换成真 key,否则 agent 拿占位符当 key 调 LiteLLM → 401 →
-    # "Something went wrong"(实测 demo 租户踩到)。两者都空才保留占位(会失败,WARN)。
-    _LK="${LITELLM_VKEY:-${LITELLM_SHARED_VKEY:-}}"
-    if [ -n "${_LK}" ]; then
-      jq --arg vk "$_LK" '
-        .models.providers.litellm.apiKey = $vk
-      ' "${OC_JSON}" > "${OC_JSON}.tmp" && mv "${OC_JSON}.tmp" "${OC_JSON}"
-      if [ -n "${LITELLM_VKEY}" ]; then log "per-tenant LiteLLM vkey injected (billing split)"; else log "shared LiteLLM vkey injected (no per-tenant vkey)"; fi
+    log "gateway token + channel hub config generated (one-time)"
+  fi
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 幂等收敛(#41)—— 每次启动都跑(fresh + wake),把部署相关值收敛到当前:
+  #   • dangerouslyDisableDeviceAuth 无条件 del(secure default)
+  #   • allowedOrigins → 当前 CloudFront origin(SSM 拉最新)
+  #   • baseUrl → 当前 LiteLLM host(堡垒机重建 IP 会变)
+  #   • chatCompletions 三态(1/0/空)
+  #   • apiKey 仅在显式非空时改写(唤醒空参绝不覆盖数据盘上的 per-tenant vkey)
+  # 老版本把这块塞在 NEW_DATA-only 分支里,唤醒路径完全跳过 → 唤醒即漂移。
+  # 详细语义见 lib/harden-config.sh 的 oc_harden_config 注释。
+  # ─────────────────────────────────────────────────────────────────────
+  CF_ORIGIN="${CLOUDFRONT_ORIGIN:-}"
+  LITELLM_BASEURL="$(oc_normalize_litellm_baseurl "${LITELLM_HOST:-}")"
+
+  # apiKey:优先 per-tenant LITELLM_VKEY 参数(SSM 传入,per-tenant 计费拆分);
+  # 参数为空时才 fall back 到 platform.env 的 LITELLM_SHARED_VKEY(shared)。
+  # 关键 fail-safe:LITELLM_VKEY 参数空 + LITELLM_SHARED_VKEY 也空 → _APIKEY 空 →
+  # oc_harden_config 不写 apiKey(不会拿 shared 覆盖数据盘上的 per-tenant vkey)。
+  # 老版本这一位失败会保留 __INJECT_AT_DEPLOY__ 占位 → agent 拿占位当 key → 401,
+  # 现在只在有真 key 时改写,数据盘上首铸的 per-tenant vkey 会被幂等段保留。
+  _APIKEY="${LITELLM_VKEY:-${LITELLM_SHARED_VKEY:-}}"
+
+  # #80 · host 侧自愈:init-host 只在首启从 SSM 读一次 vkey,读空就永远空
+  # (setup.sh 铸 vkey 晚于 host 首启就撞这个)。这里加单次「vkey 为空→补读 SSM」的
+  # 自愈,把「铸 vkey 晚于 host 首启」的时序窗口封了。有值直接用,零延迟。
+  # 关键:只补 shared vkey(未提供 per-tenant LITELLM_VKEY 时才走到这里);
+  # 补到 _APIKEY 后传给 oc_harden_config,由 helper 幂等段真正落进 openclaw.json。
+  if [ -z "${_APIKEY}" ]; then
+    log "vkey empty in /etc/platform.env — 从 SSM /openclaw/litellm-shared-vkey 补读一次"
+    _SSM_LK="$(aws ssm get-parameter --name /openclaw/litellm-shared-vkey --with-decryption \
+                 --region "${REGION}" --query 'Parameter.Value' --output text 2>/dev/null || true)"
+    if [ -n "${_SSM_LK}" ] && [ "${_SSM_LK}" != "None" ]; then
+      _APIKEY="${_SSM_LK}"
+      # 回写 /etc/platform.env 让下一台 VM 首发不用再补读:替换现有行或追加。
+      if grep -q '^LITELLM_SHARED_VKEY=' /etc/platform.env 2>/dev/null; then
+        sed -i "s|^LITELLM_SHARED_VKEY=.*|LITELLM_SHARED_VKEY=${_APIKEY}|" /etc/platform.env
+      else
+        echo "LITELLM_SHARED_VKEY=${_APIKEY}" >> /etc/platform.env
+      fi
+      chmod 600 /etc/platform.env || true
+      # 同进程后续读到这个变量(下一台 microVM 起 launch-vm 会重 source)
+      export LITELLM_SHARED_VKEY="${_APIKEY}"
+      log "vkey 从 SSM 补读成功并回写 /etc/platform.env"
     else
-      log "WARN: 无 LITELLM_VKEY 也无 LITELLM_SHARED_VKEY — apiKey 保留占位符,LLM 调用会 401。设 SSM /openclaw/litellm-shared-vkey。"
+      log "SSM /openclaw/litellm-shared-vkey 仍为空(setup.sh 铸 vkey 未完成?)"
     fi
-    # LiteLLM baseUrl:镜像烤死的 __LITELLM_HOST__ 默认 127.0.0.1 是错的(microVM 本地无
-    # LiteLLM);运行时用 platform.env 的 LITELLM_HOST(init-host 从 SSM /openclaw/litellm-host
-    # 拉=堡垒机内网 IP)改写,microVM 经 metal host 网络访问堡垒机:4000(同 VPC 实测可达)。
-    # LiteLLM 地址部署环境相关,必须运行时注入不能烤死(跨账号/重建堡垒机 IP 会变)。
-    if [ -n "${LITELLM_HOST}" ]; then
-      # LITELLM_HOST 可能是纯 IP/host(旧契约)或完整 URL http://IP:4000/v1(SSM
-      # /openclaw/litellm-host 现存完整 URL,stack.py user-data + setup.sh 都这么写)。
-      # 规范化:已含 http:// 直接用;纯 host 才拼 http://host:4000/v1。否则双重拼接成
-      # http://http://IP:4000/v1:4000/v1 → openclaw 调 LiteLLM 必失败(重建实撞根因)。
-      case "${LITELLM_HOST}" in
-        http://*|https://*) LITELLM_BASEURL="${LITELLM_HOST}" ;;
-        *) LITELLM_BASEURL="http://${LITELLM_HOST}:4000/v1" ;;
-      esac
-      jq --arg h "${LITELLM_BASEURL}" '
-        .models.providers.litellm.baseUrl = $h
-      ' "${OC_JSON}" > "${OC_JSON}.tmp" && mv "${OC_JSON}.tmp" "${OC_JSON}"
-      log "LiteLLM baseUrl set to ${LITELLM_BASEURL} (runtime inject, normalized)"
-    else
-      log "WARN: LITELLM_HOST empty — openclaw.json baseUrl keeps baked value (likely 127.0.0.1, LLM calls will fail). Set SSM /openclaw/litellm-host."
+  fi
+
+  # 两者都空且 SSM 补读也空 → helper 幂等段跳过 apiKey 写入(保留数据盘上的老 key)。
+  # 首启且数据盘上 apiKey 还是烤死的 __INJECT_AT_DEPLOY__ 占位时,agent 拿占位当 key 调
+  # LiteLLM → 401 → "Something went wrong"。打红字 WARN 让运维一眼看见根因。
+  if [ -z "${_APIKEY}" ]; then
+    log "WARN: 无 LITELLM_VKEY 也无 LITELLM_SHARED_VKEY(SSM 也空)— apiKey 保留占位符,LLM 调用会 401。设 SSM /openclaw/litellm-shared-vkey(setup.sh 或手工 aws ssm put-parameter)。"
+  fi
+
+  if oc_harden_config "${OC_JSON}" "${CF_ORIGIN}" "${LITELLM_BASEURL}" "${_APIKEY}" "${CHAT_EP_ENABLED}"; then
+    # 日志一行看清幂等段执行了什么(帮排查唤醒漂移)
+    _log_origin="${CF_ORIGIN:-<unset,skipped>}"
+    _log_url="${LITELLM_BASEURL:-<unset,skipped>}"
+    _log_chat="${CHAT_EP_ENABLED:-<unset,no-op>}"
+    _log_key=""
+    if [ -n "${LITELLM_VKEY}" ]; then _log_key="per-tenant"
+    elif [ -n "${LITELLM_SHARED_VKEY:-}" ]; then _log_key="shared"
+    else _log_key="<unset,preserving-disk>"
     fi
+    log "harden-config: origin=${_log_origin} baseUrl=${_log_url} chat=${_log_chat} apiKey=${_log_key}"
+  else
+    # fail-loud:静默吞过一次就是事故。exit 让 trap 上报。
+    log "FATAL: harden-config failed on ${OC_JSON}"
+    exit 1
   fi
   sudo chown 1000:1000 "${OC_JSON}"
   # AgentCore Gateway MCP injection (if configured).
@@ -420,6 +434,13 @@ _tuntap_add_with_retry() {
 _tuntap_add_with_retry
 sudo ip addr add ${HOST_TAP_IP}/30 dev ${TAP}
 sudo ip link set dev ${TAP} up
+# ── SECURITY (#34: IMDSv6 拦截,per-tap disable_ipv6=1)──
+# 老版本注释声称 IPv6 IMDS(fd00:ec2::254)"defensively covered",但仅有下面的
+# IPv4 iptables DROP,ip6tables 全仓零命中,注释名实不符。真堵法:tap 上关掉
+# IPv6 协议栈,fd00:ec2::254 与 fe80 一并消失,不依赖 ip6tables 存在。
+# 幂等 + 无 ip6tables 依赖 + 单条命令收敛,与 launch-vm 其它 sysctl 风格一致。
+# 深度防御另一半在 init-host.sh step1b(host 全局 net.ipv6.conf.all.forwarding=0)。
+sudo sysctl -q -w net.ipv6.conf.${TAP}.disable_ipv6=1 2>/dev/null || true
 HOST_IFACE=$(ip route show default | awk '{print $5}' | head -1)
 sudo sysctl -q -w net.ipv4.ip_forward=1
 # ── SECURITY (multi-tenant isolation): block guest → instance metadata ──
@@ -429,7 +450,9 @@ sudo sysctl -q -w net.ipv4.ip_forward=1
 # and the tenants/hosts tables — i.e. every other tenant's data). Drop all
 # guest-originated traffic to the link-local IMDS range BEFORE the ACCEPT
 # rules. -I inserts at the top so it always precedes the FORWARD ACCEPT.
-# Also covers IMDSv6 (fd00:ec2::254) defensively.
+# IPv6 IMDS (fd00:ec2::254) is blocked by disabling IPv6 on the tap above,
+# and host-side net.ipv6.conf.all.forwarding=0 (init-host.sh step1b) — no
+# need for ip6tables since the guest has no IPv6 stack on its tap link.
 sudo iptables -C FORWARD -i ${TAP} -d 169.254.169.254 -j DROP 2>/dev/null || \
   sudo iptables -I FORWARD 1 -i ${TAP} -d 169.254.169.254 -j DROP
 sudo iptables -C FORWARD -i ${TAP} -d 169.254.169.253 -j DROP 2>/dev/null || \
@@ -471,8 +494,62 @@ sudo iptables -t nat -C POSTROUTING -o ${HOST_IFACE} -j MASQUERADE 2>/dev/null |
   sudo iptables -t nat -A POSTROUTING -o ${HOST_IFACE} -j MASQUERADE
 sudo iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
   sudo iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-sudo iptables -C FORWARD -i ${TAP} -o ${HOST_IFACE} -j ACCEPT 2>/dev/null || \
-  sudo iptables -A FORWARD -i ${TAP} -o ${HOST_IFACE} -j ACCEPT
+# ── SECURITY (#39: 出网默认拒绝白名单)──
+# EGRESS_ALLOWLIST_ENABLED 从 /etc/platform.env(:54 source)取,由 config
+# security.egress_allowlist_enabled 经 stack.py 渲染而来。默认 false → 保持历史
+# 行为:无条件放行 guest→公网口(现状零变化)。true → 切默认拒绝:只放行 ①VPC CIDR +
+# 自定义 CIDR(静态,覆盖 hub/LiteLLM/EKS ALB/VPC Endpoint 私网)②host dnsmasq 解析
+# 内置 cognito-idp/s3 + 运营域名灌进 ipset oc_egress_allow 的真实 IP ③guest 的 :53
+# 被透明 DNAT 到 host dnsmasq(硬编码 8.8.8.8 无需改),其余一律末尾 DROP 兜底。
+# 上述 IMDS/租户超网/管理端口 DROP 都在链首(-I),先命中,白名单不误放。
+if [ "${EGRESS_ALLOWLIST_ENABLED:-false}" = "true" ]; then
+  # (1) 透明 DNS 劫持:guest 发往任意 DNS(含硬编码 8.8.8.8)的 :53 都 DNAT 到 host
+  #     dnsmasq(HOST_TAP_IP:53)。UDP+TCP 都要(大响应/AXFR 走 TCP)。nat/PREROUTING
+  #     的 DNAT 合法(-j DROP 才被 nft 禁);零 guest 改造破掉硬编码解析器。
+  for _proto in udp tcp; do
+    sudo iptables -t nat -C PREROUTING -i ${TAP} -p ${_proto} --dport 53 -j DNAT --to-destination ${HOST_TAP_IP}:53 2>/dev/null || \
+      sudo iptables -t nat -I PREROUTING 1 -i ${TAP} -p ${_proto} --dport 53 -j DNAT --to-destination ${HOST_TAP_IP}:53
+    # 显式放行 guest→host dnsmasq(INPUT)。当前 INPUT 默认 ACCEPT,显式写更 future-proof。
+    sudo iptables -C INPUT -i ${TAP} -p ${_proto} -d ${HOST_TAP_IP} --dport 53 -j ACCEPT 2>/dev/null || \
+      sudo iptables -I INPUT 1 -i ${TAP} -p ${_proto} -d ${HOST_TAP_IP} --dport 53 -j ACCEPT
+  done
+  # (2) 静态 CIDR 白名单:VPC CIDR(覆盖 hub/LiteLLM/EKS ALB/VPC Endpoint 私网)+ 运营 CIDR。
+  _EGRESS_CIDRS=""
+  [ "${EGRESS_INCLUDE_VPC_CIDR:-true}" = "true" ] && [ -n "${EGRESS_VPC_CIDR:-}" ] && _EGRESS_CIDRS="${EGRESS_VPC_CIDR}"
+  _EGRESS_CIDRS="${_EGRESS_CIDRS} $(echo "${EGRESS_ALLOWLIST_CIDRS:-}" | tr ',' ' ')"
+  # 白名单 ACCEPT 与末尾 DROP 都**不限出口网卡 -o**(按目的地放行/拒绝,不绑死主网卡)。
+  # 为什么:末尾兜底若限 `-o ${HOST_IFACE}`,host 上出现第二条出网路径(第二 ENI/docker0/
+  # VPN/策略路由)时,guest→该路径的流量既不命中链首 IMDS/超网 DROP、也不命中限主网卡的
+  # 兜底 DROP、又无 ACCEPT → 落到 FORWARD 默认策略(常为 ACCEPT)fail-open 泄漏。去掉 -o 让
+  # 兜底成为真正的 catch-all(guest→host 自身服务走 INPUT 链,不受 FORWARD 影响,不误伤
+  # host-agent 反向 SSH)。ACCEPT 同去 -o,与 DROP 对称:白名单目标经任何路径都放行。
+  for _cidr in ${_EGRESS_CIDRS}; do
+    [ -z "${_cidr}" ] && continue
+    sudo iptables -C FORWARD -i ${TAP} -d ${_cidr} -j ACCEPT 2>/dev/null || \
+      sudo iptables -A FORWARD -i ${TAP} -d ${_cidr} -j ACCEPT
+  done
+  # (3) FQDN 白名单:dnsmasq 解析 cognito/s3/运营域名灌进共享 ipset 的真实 IP。ipset
+  #     缺失(dnsmasq/ipset 没装成)时 -m set 规则加不上 → 跳过,退回只放静态 CIDR + DNS
+  #     (fail-safe 不阻断 VM 启动;代价是 cognito/s3 出网被 DROP,真机验证前默认关兜住)。
+  if sudo ipset list oc_egress_allow >/dev/null 2>&1; then
+    sudo iptables -C FORWARD -i ${TAP} -m set --match-set oc_egress_allow dst -j ACCEPT 2>/dev/null || \
+      sudo iptables -A FORWARD -i ${TAP} -m set --match-set oc_egress_allow dst -j ACCEPT
+  else
+    # ipset 缺失 = host 的 setup-egress-allowlist.sh 没跑成(S3 没下到/dnsmasq 没装),但本 VM
+    # 的 gate 仍开 → cognito/s3 等 FQDN 目标会被下面的兜底 DROP 拦掉(fail-closed,不泄漏,但该
+    # 租户 DNS/公网 AWS 端点不可用)。这是 host 基建与 VM 规则两半独立失败的可用性悬崖:告警落痕,
+    # 便于 380 台里个别 host 脚本没下成时定位;运营应据此把该 host 视作 degraded 排查 dnsmasq。
+    log "WARN: ipset oc_egress_allow MISSING — host setup-egress-allowlist.sh likely not run (dnsmasq down). FQDN allowlist skipped; cognito/s3 egress WILL be DROPPED for this VM. Treat host as degraded."
+  fi
+  # (4) 链尾兜底 catch-all DROP:默认拒绝该 guest 转发到任何目的地的其余一切(不限出口网卡,
+  #     直连 IP 绕 DNS 白名单、以及经第二网卡/网桥的出网都被这条兜住)。
+  sudo iptables -C FORWARD -i ${TAP} -j DROP 2>/dev/null || \
+    sudo iptables -A FORWARD -i ${TAP} -j DROP
+else
+  # 默认(gate 关):现状零变化 —— 无条件放行 guest→公网口。
+  sudo iptables -C FORWARD -i ${TAP} -o ${HOST_IFACE} -j ACCEPT 2>/dev/null || \
+    sudo iptables -A FORWARD -i ${TAP} -o ${HOST_IFACE} -j ACCEPT
+fi
 
 # Start Firecracker
 log "starting firecracker..."

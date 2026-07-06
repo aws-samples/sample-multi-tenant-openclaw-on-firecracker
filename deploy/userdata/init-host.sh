@@ -77,7 +77,13 @@ swapoff -a 2>/dev/null || true
 if [ -w /sys/devices/system/cpu/smt/control ]; then
   echo off > /sys/devices/system/cpu/smt/control 2>/dev/null || true
 fi
-log "step1b done: ksm=$(cat /sys/kernel/mm/ksm/run 2>/dev/null||echo n/a) swaps=$(grep -c partition /proc/swaps 2>/dev/null||echo 0) smt=$(cat /sys/devices/system/cpu/smt/control 2>/dev/null||echo n/a)"
+# IPv6 forwarding:内核默认 0,显式关一遍防 AMI 漂移(与上面显式关 SMT 同理)。
+# 铁律 #6:默认满足 ≠ 部署代码保证。租户 tap 走 per-tap disable_ipv6=1(launch-vm.sh
+# 里做),host 侧 all.forwarding=0 是纵深防御:即便某台 tap 漏配了 disable_ipv6,
+# host 不转发也守住 IPv6 IMDS fd00:ec2::254。
+sysctl -q -w net.ipv6.conf.all.forwarding=0 2>/dev/null || true
+_ipv6fwd=$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || echo n/a)
+log "step1b done: ksm=$(cat /sys/kernel/mm/ksm/run 2>/dev/null||echo n/a) swaps=$(grep -c partition /proc/swaps 2>/dev/null||echo 0) smt=$(cat /sys/devices/system/cpu/smt/control 2>/dev/null||echo n/a) ipv6fwd=${_ipv6fwd}"
 
 # Step 2: Install tools + Firecracker
 log "step2: installing tools + firecracker"
@@ -113,12 +119,17 @@ log "firecracker ${FC_VER} installed"
 # Resolve table names from stack outputs
 HOSTS_TABLE=$(_stack_output HostsTable)
 TENANTS_TABLE=$(_stack_output TenantsTable)
+# SQS dispatch 二期 pull 模式:host-agent 从 openclaw-assignments 拉每台 host 的
+# desired 状态。栈没启用 dispatch(config.yml dispatch.enabled=false)时 output 不存在,
+# _stack_output 会打印 "None" → 我们清空,让 host-agent 不启 dispatch 线程(零变化)。
+ASSIGNMENTS_TABLE=$(_stack_output AssignmentsTable)
 # Fallback to known constants if stack outputs aren't ready yet (chicken-
 # and-egg: outputs only become visible AFTER the stack reaches
 # CREATE_COMPLETE, but the host is launched mid-CREATE by the ASG).
 # Both tables are stack-defined with these exact names in deploy/stack.py.
 [ -z "$HOSTS_TABLE" ] || [ "$HOSTS_TABLE" = "None" ] && HOSTS_TABLE="openclaw-hosts"
 [ -z "$TENANTS_TABLE" ] || [ "$TENANTS_TABLE" = "None" ] && TENANTS_TABLE="openclaw-tenants"
+[ -z "$ASSIGNMENTS_TABLE" ] || [ "$ASSIGNMENTS_TABLE" = "None" ] && ASSIGNMENTS_TABLE=""
 log "tables: hosts=${HOSTS_TABLE} tenants=${TENANTS_TABLE}"
 
 # Resolve bucket names + backup CMK at runtime from stack outputs instead of
@@ -145,6 +156,7 @@ BACKUP_BUCKET=${BACKUP_BUCKET}
 BACKUP_CMK_KEY_ID=${BACKUP_CMK_KEY_ID}
 TENANTS_TABLE=${TENANTS_TABLE}
 HOSTS_TABLE=${HOSTS_TABLE}
+ASSIGNMENTS_TABLE=${ASSIGNMENTS_TABLE}
 INSTANCE_ID=${INSTANCE_ID}
 SUBNET_PREFIX={{SUBNET_PREFIX}}
 ROOTFS_OVERLAY_MB={{ROOTFS_OVERLAY_MB}}
@@ -156,6 +168,12 @@ BALLOON_MAX_INFLATE_RATIO={{BALLOON_MAX_INFLATE_RATIO}}
 BALLOON_MIN_GUEST_AVAILABLE_MB={{BALLOON_MIN_GUEST_AVAILABLE_MB}}
 CLAW_HUB_URL={{CLAW_HUB_URL}}
 CLAW_HUB_WS={{CLAW_HUB_WS}}
+EGRESS_ALLOWLIST_ENABLED={{EGRESS_ALLOWLIST_ENABLED}}
+EGRESS_INCLUDE_VPC_CIDR={{EGRESS_INCLUDE_VPC_CIDR}}
+EGRESS_VPC_CIDR={{EGRESS_VPC_CIDR}}
+EGRESS_ALLOWLIST_CIDRS={{EGRESS_ALLOWLIST_CIDRS}}
+EGRESS_ALLOWLIST_DOMAINS={{EGRESS_ALLOWLIST_DOMAINS}}
+EGRESS_DNS_UPSTREAM={{EGRESS_DNS_UPSTREAM}}
 ENVEOF
 
 # CLOUDFRONT_ORIGIN:CloudFront 分发域在 CDK 里晚于 LaunchTemplate 创建(循环依赖),
@@ -208,6 +226,21 @@ rm -f /etc/nginx/sites-enabled/default
 systemctl enable nginx
 systemctl restart nginx
 log "nginx proxy configured"
+
+# ── #39 microVM 出网默认拒绝白名单 — host 侧基建(dnsmasq + ipset)──
+# 逻辑在独立脚本 setup-egress-allowlist.sh(S3 分发,不内联进 init-host 以免撑爆 user-data
+# 16KB 硬限;memory: uswest2-deploy-deadlock)。它读 /etc/platform.env 的 EGRESS_* + REGION,
+# config security.egress_allowlist_enabled 默认 false 时脚本自身直接跳过(host 零变化)。
+# 逐个 tap 的 DNAT/ACCEPT/DROP 规则在 launch-vm.sh 里做(每 VM 一份,-i $TAP 隔离)。
+mkdir -p /home/ubuntu
+aws s3 cp s3://${ASSETS_BUCKET}/deployment/scripts/setup-egress-allowlist.sh /home/ubuntu/setup-egress-allowlist.sh --region ${REGION} --no-progress 2>/dev/null \
+  || _s3_get s3://${ASSETS_BUCKET}/deployment/scripts/setup-egress-allowlist.sh /home/ubuntu/setup-egress-allowlist.sh || true
+if [ -f /home/ubuntu/setup-egress-allowlist.sh ]; then
+  chmod +x /home/ubuntu/setup-egress-allowlist.sh
+  bash /home/ubuntu/setup-egress-allowlist.sh || log "WARN: setup-egress-allowlist.sh returned non-zero (egress allowlist degraded)"
+else
+  log "WARN: setup-egress-allowlist.sh not downloaded — egress allowlist skipped (host-agent still starts)"
+fi
 
 # Host agent — probes all local VMs, writes health to DynamoDB
 {{HOST_AGENT_SCRIPT}}
@@ -306,7 +339,7 @@ aws s3 cp s3://${ASSETS_BUCKET}/{{ROOTFS_PREFIX}}/${DATA_KEY} ${ASSETS}/data.gz 
 pigz -dc ${ASSETS}/rootfs.gz > ${ASSETS}/openclaw-rootfs.ext4 && rm -f ${ASSETS}/rootfs.gz
 pigz -dc ${ASSETS}/data.gz > ${ASSETS}/openclaw-data-template.ext4 && rm -f ${ASSETS}/data.gz
 fallocate --dig-holes ${ASSETS}/openclaw-data-template.ext4
-# 只读权威盘(immutable):烤死 Finance Agent 身份 + 2 skill + 护栏,launch-vm 挂为 /dev/vdd
+# 只读权威盘(immutable):烤死 ClawPool Agent 身份 + 15skill + 护栏,launch-vm 挂为 /dev/vdd
 # is_read_only:true(见 launch-vm:432)。漏下它 → 租户起来但无身份/skill(launch-vm WARN
 # "immutable absent — launching WITHOUT immutable authority disk")。manifest 有 immutable
 # 字段就必须下,这是黄金镜像"启动即成品"的核心盘,不是可选。
@@ -334,6 +367,13 @@ log "step4: deploying scripts"
 aws s3 cp s3://${ASSETS_BUCKET}/deployment/scripts/launch-vm.sh /home/ubuntu/launch-vm.sh --region ${REGION} --no-progress 2>/dev/null || \
   _s3_get s3://${ASSETS_BUCKET}/deployment/scripts/launch-vm.sh /home/ubuntu/launch-vm.sh
 chmod +x /home/ubuntu/launch-vm.sh && chown ubuntu:ubuntu /home/ubuntu/launch-vm.sh
+# harden-config.sh(#41)— launch-vm.sh source 的 POSIX sh 幂等收敛库。必须在
+# launch-vm.sh 首次被调用前落地,否则 launch-vm 顶部 . lib/harden-config.sh 失败
+# → 每次启动 exit 1 → 一台 host 起不来任何租户。走同一 _s3_get 重试骨架。
+mkdir -p /home/ubuntu/lib
+aws s3 cp s3://${ASSETS_BUCKET}/deployment/scripts/lib/harden-config.sh /home/ubuntu/lib/harden-config.sh --region ${REGION} --no-progress 2>/dev/null || \
+  _s3_get s3://${ASSETS_BUCKET}/deployment/scripts/lib/harden-config.sh /home/ubuntu/lib/harden-config.sh
+chmod +x /home/ubuntu/lib/harden-config.sh && chown -R ubuntu:ubuntu /home/ubuntu/lib
 aws s3 cp s3://${ASSETS_BUCKET}/deployment/scripts/stop-vm.sh /home/ubuntu/stop-vm.sh --region ${REGION} --no-progress 2>/dev/null || \
   _s3_get s3://${ASSETS_BUCKET}/deployment/scripts/stop-vm.sh /home/ubuntu/stop-vm.sh
 chmod +x /home/ubuntu/stop-vm.sh && chown ubuntu:ubuntu /home/ubuntu/stop-vm.sh
@@ -342,7 +382,9 @@ chmod +x /home/ubuntu/stop-vm.sh && chown ubuntu:ubuntu /home/ubuntu/stop-vm.sh
 # start-all-vms / stop-all-vms — host-local fan-out for the 1-minute fleet
 # power goal: control plane sends ONE SSM per host, host starts/stops all its
 # VMs in bounded parallel (SSM concurrency = host count, not VM count).
-for _s in clone-data migrate-vm resize-disk start-all-vms stop-all-vms; do
+# launch-all-vms.sh (SQS dispatch push手脚) piggy-backs on the same fan-out
+# semaphore as start-all-vms.sh; single SSM/host aggregate command.
+for _s in clone-data migrate-vm resize-disk start-all-vms stop-all-vms launch-all-vms; do
   aws s3 cp s3://${ASSETS_BUCKET}/deployment/scripts/${_s}.sh /home/ubuntu/${_s}.sh --region ${REGION} --no-progress 2>/dev/null \
     || _s3_get s3://${ASSETS_BUCKET}/deployment/scripts/${_s}.sh /home/ubuntu/${_s}.sh || true
   chmod +x /home/ubuntu/${_s}.sh && chown ubuntu:ubuntu /home/ubuntu/${_s}.sh

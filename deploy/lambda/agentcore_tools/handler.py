@@ -4,7 +4,6 @@
 """AgentCore Gateway tool: hello-world + system info.
 Registered as MCP tool via Gateway, available to all OpenClaw agents."""
 
-import json
 import os
 import platform
 from datetime import datetime, timezone

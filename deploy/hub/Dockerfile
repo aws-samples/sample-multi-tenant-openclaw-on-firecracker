@@ -19,6 +19,8 @@ ENV NODE_ENV=production
 # run as the built-in unprivileged 'node' user (uid 1000), never root
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json server.mjs cluster-routing.mjs ./
+# #136 拆分:业务逻辑模块(目录级 COPY,新增 lib 文件免改本行)
+COPY lib ./lib
 USER node
 EXPOSE 8790
 # SIGTERM is handled in server.mjs for graceful drain on Pod rolling.

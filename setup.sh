@@ -171,6 +171,18 @@ aws s3 cp "$SCRIPT_DIR/deploy/userdata/backup-data.sh" "s3://${BUCKET}/deploymen
   --profile "$PROFILE" --region "$REGION" --quiet
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/launch-vm.sh" "s3://${BUCKET}/deployment/scripts/launch-vm.sh" \
   --profile "$PROFILE" --region "$REGION" --quiet
+# setup-egress-allowlist.sh(#39)— host 侧 dnsmasq + ipset 出网白名单基建。独立成脚本
+# 而非内联 init-host.sh(避免撑爆 user-data 16KB 硬限);init-host.sh 拉到 /home/ubuntu/
+# 后执行,config security.egress_allowlist_enabled 默认 false 时脚本自身跳过。缺它 →
+# init-host WARN 跳过(host-agent 仍起),egress 退回现状放行(非致命)。
+aws s3 cp "$SCRIPT_DIR/deploy/userdata/setup-egress-allowlist.sh" "s3://${BUCKET}/deployment/scripts/setup-egress-allowlist.sh" \
+  --profile "$PROFILE" --region "$REGION" --quiet
+# harden-config.sh(#41)— launch-vm.sh source 的 POSIX sh 幂等 openclaw.json
+# 收敛库(每次启动跑,不管 fresh/wake)。同 host-agent.py / launch-vm.sh 的下发
+# 契约:setup.sh 上传到 S3,init-host.sh 拉到 /home/ubuntu/lib/。缺它 →
+# launch-vm.sh 顶部 `. lib/harden-config.sh` 失败 → 每次启动 exit 1,一台起不来。
+aws s3 cp "$SCRIPT_DIR/deploy/userdata/lib/harden-config.sh" "s3://${BUCKET}/deployment/scripts/lib/harden-config.sh" \
+  --profile "$PROFILE" --region "$REGION" --quiet
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/stop-vm.sh" "s3://${BUCKET}/deployment/scripts/stop-vm.sh" \
   --profile "$PROFILE" --region "$REGION" --quiet
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/clone-data.sh" "s3://${BUCKET}/deployment/scripts/clone-data.sh" \
@@ -191,6 +203,11 @@ aws s3 cp "$SCRIPT_DIR/deploy/userdata/start-all-vms.sh" "s3://${BUCKET}/deploym
   --profile "$PROFILE" --region "$REGION" --quiet
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/stop-all-vms.sh" "s3://${BUCKET}/deployment/scripts/stop-all-vms.sh" \
   --profile "$PROFILE" --region "$REGION" --quiet
+# launch-all-vms.sh — SQS dispatch push 手脚:装箱消费的聚合 SSM 命令调它,
+# 从 ParamStore /openclaw/dispatch/manifests/<cmd>/<host>/part-N 拉 JSON-lines
+# manifest,本地信号量 fan-out launch-vm.sh。同 start-all-vms 的上传契约。
+aws s3 cp "$SCRIPT_DIR/deploy/userdata/launch-all-vms.sh" "s3://${BUCKET}/deployment/scripts/launch-all-vms.sh" \
+  --profile "$PROFILE" --region "$REGION" --quiet
 
 # claw-hub(WebSocket 中枢)安装脚本 + 源码。metal 单进程模式(CLAW_HUB_URL 为空)下,
 # init-host.sh 启动时拉 install-hub.sh,后者再拉 deployment/hub/ 下的 server.mjs 等起 hub。
@@ -204,6 +221,9 @@ aws s3 cp "$SCRIPT_DIR/deploy/hub/cluster-routing.mjs" "s3://${BUCKET}/deploymen
   --profile "$PROFILE" --region "$REGION" --quiet
 aws s3 cp "$SCRIPT_DIR/deploy/hub/package.json" "s3://${BUCKET}/deployment/hub/package.json" \
   --profile "$PROFILE" --region "$REGION" --quiet
+# #136 拆分:server.mjs 的业务逻辑在 lib/*.mjs,整目录上传(目录级同步,免逐文件枚举再漏)
+aws s3 cp "$SCRIPT_DIR/deploy/hub/lib/" "s3://${BUCKET}/deployment/hub/lib/" \
+  --recursive --profile "$PROFILE" --region "$REGION" --quiet
 
 # LiteLLM 网关资产(ai_gateway.url 留空时,CDK 起的 LiteLLM EC2 userdata 从这拉
 # docker-compose + config 跑起网关)。总是上传(幂等),开关在 CDK 侧。
@@ -222,6 +242,28 @@ aws s3 cp "$SCRIPT_DIR/deploy/monitoring/docker-compose.wazuh.yml" "s3://${BUCKE
   --profile "$PROFILE" --region "$REGION" --quiet
 aws s3 cp "$SCRIPT_DIR/deploy/monitoring/wazuh-rules/openclaw_local_rules.xml" "s3://${BUCKET}/deployment/monitoring/wazuh-rules/openclaw_local_rules.xml" \
   --profile "$PROFILE" --region "$REGION" --quiet
+
+# #80 — 部署时序保证:LiteLLM shared vkey 铸到 SSM /openclaw/litellm-shared-vkey。
+# 编排层(post-deploy,非 CFN CR)——CR 塞进去会让部署耦合 LiteLLM 健康态、timeout
+# 回滚更脆。这里等 LiteLLM /health/liveliness healthy 后 POST /key/generate → put SSM。
+# 幂等:SSM 已有值就跳过(轮换用 SKIP_MINT_SHARED_VKEY=1 手动 aws ssm put + LiteLLM /key/delete 老 key)。
+# 存量部署接过来时首次运行会自动铸,不需要人工先跑 curl。
+if [ "${SKIP_MINT_SHARED_VKEY:-0}" = "1" ]; then
+  echo "→ 跳过 shared vkey 铸造(SKIP_MINT_SHARED_VKEY=1)"
+else
+  echo "→ 铸/校验 LiteLLM shared vkey → SSM /openclaw/litellm-shared-vkey ..."
+  # 失败不阻塞剩余 setup(#80 host 侧 launch-vm 有自愈重读兜底);但会打红字 + 退出码留在
+  # $VKEY_MINT_RC 供调用者判断。生产 setup 若要严格失败就在此 exit $VKEY_MINT_RC。
+  set +e
+  REGION="$REGION" PROFILE="$PROFILE" \
+    bash "$SCRIPT_DIR/deploy/lib/mint-shared-vkey.sh"
+  VKEY_MINT_RC=$?
+  set -e
+  if [ "$VKEY_MINT_RC" -ne 0 ]; then
+    echo "⚠  shared vkey 铸造失败(rc=$VKEY_MINT_RC)。host launch-vm 侧有自愈重读兜底," >&2
+    echo "  但对话可能持续 401 直到手工修复。请查 mint-shared-vkey 日志、修好后重跑 setup.sh。" >&2
+  fi
+fi
 
 # 导出 stack outputs
 echo "→ 导出部署信息..."
@@ -303,7 +345,15 @@ sed -e "s|__OC_COGNITO_DOMAIN__|${COGNITO_DOMAIN:-}|g" \
 aws s3 cp "$CHAT_TMP" "s3://${ASSETS_BUCKET}/chat/index.html" \
   --profile "$PROFILE" --region "$REGION" --quiet --content-type text/html
 rm -f "$CHAT_TMP"
-echo "✓ Chat uploaded to s3://${ASSETS_BUCKET}/chat/index.html (account values injected)"
+
+# #63 CSP:chat 页内联 <script> 已搬到 console/chat/js/{auth,chat}.js,
+# 需一起上传到桶根 chat/js/。占位符只在 index.html,js/ 无需 sed。
+if [ -d "$SCRIPT_DIR/console/chat/js" ]; then
+  aws s3 sync "$SCRIPT_DIR/console/chat/js/" "s3://${ASSETS_BUCKET}/chat/js/" \
+    --profile "$PROFILE" --region "$REGION" --quiet --delete \
+    --content-type application/javascript
+fi
+echo "✓ Chat uploaded to s3://${ASSETS_BUCKET}/chat/ (account values injected, CSP-safe external scripts)"
 
 # 写 CloudFront 域到 SSM,供 init-host.sh 运行时拉(解 CloudFront 晚于 LaunchTemplate 的
 # CDK 循环依赖)。租户 gateway allowedOrigins 用它,不硬编码旧账号域。

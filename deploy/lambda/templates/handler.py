@@ -14,7 +14,6 @@ PREFIX = "templates/openclaw/"
 
 def lambda_handler(event, context):
     method = event.get("httpMethod", "")
-    path = event.get("path", "")
     path_params = event.get("pathParameters") or {}
     name = path_params.get("name", "")
 
@@ -41,9 +40,15 @@ def list_templates():
                 continue
             # Check if openclaw.json exists
             try:
-                meta = s3.head_object(Bucket=BUCKET, Key=f"{PREFIX}{name}/openclaw.json")
+                meta = s3.head_object(
+                    Bucket=BUCKET, Key=f"{PREFIX}{name}/openclaw.json"
+                )
                 size = meta.get("ContentLength", 0)
-                modified = meta.get("LastModified", "").isoformat() if meta.get("LastModified") else ""
+                modified = (
+                    meta.get("LastModified", "").isoformat()
+                    if meta.get("LastModified")
+                    else ""
+                )
             except Exception:
                 size = 0
                 modified = ""
@@ -98,6 +103,9 @@ def delete_template(name):
 def _resp(code, body):
     return {
         "statusCode": code,
-        "headers": {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*"},
+        "headers": {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+        },
         "body": json.dumps(body),
     }

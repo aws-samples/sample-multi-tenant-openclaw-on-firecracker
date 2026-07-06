@@ -70,6 +70,10 @@ for f in server.mjs cluster-routing.mjs package.json; do
   "${AWS_BIN}" s3 cp "s3://${ASSETS_BUCKET}/deployment/hub/${f}" "${HUB_DIR}/${f}" \
     --region "${REGION}" --no-progress
 done
+# #136 拆分:server.mjs 是 composition root,业务逻辑在 lib/*.mjs,整目录拉取。
+# 缺 lib/ 时 node 起不来(ERR_MODULE_NOT_FOUND),脚本 set -euo 下拉取失败即 fail-loud。
+"${AWS_BIN}" s3 cp "s3://${ASSETS_BUCKET}/deployment/hub/lib/" "${HUB_DIR}/lib/" \
+  --recursive --region "${REGION}" --no-progress
 log "hub source synced to ${HUB_DIR}"
 
 # ── Step 3: prod deps (no Redis needed in single-process; ioredis is optional

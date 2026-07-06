@@ -16,7 +16,7 @@ host:
   # arm64 不能混)。留空=只用上面的单一 instance_type。
   # instance_types: ["r8g.metal-48xl", "r8g.metal-24xl"]
   root_volume_gb: 20
-  data_volume_gb: 600              # 380 VM/台的磁盘硬前提:单 VM 稀疏盘实占 187M–1.3G,200G 只够约 60 个;600G 留余量承 380(795 实测,2026-06-30)。改大后 host 重建即带大盘,不再依赖运行态扩盘
+  data_volume_gb: 900              # 380 VM/台的磁盘硬前提。真机对账(#37,2026-07-04 us-east-1 压 377 VM):/data 实占随负载走——轻载 377 VM 仅占 28G(sparse 单 VM ~84–187M),重载单 VM 实占可达 1.3G,380×1.3G≈494G。600G 够 380 稀疏稳态但重载几乎无冗余;提到 900G 给重载 + 未来密度(#51)余量,仍远低于 380×8G(vm.data_disk_mb 声明上限,靠 sparse 不全占)。改大后 host 重建即带大盘,不依赖运行态扩盘。
   keep_data_volume:  true          # 实例删除后是否保留EBS卷
   reserved_vcpu: 1
   reserved_mem_mb: 2048
@@ -110,8 +110,42 @@ scaler:
   # ⚠ DynamoDB 限制「一次 update 只能加 1 个 GSI」:首次部署若 gsi_owner 尚未 ACTIVE,
   # 本开关须保持 false 让 gsi_owner 先建好,待其 ACTIVE 后再设 true 单独触发一次
   # cdk deploy 加 gsi_tenant_user(分两步,见 stack.py:116-123)。
-  # 键名必须是 add_gsi_tenant_user(旧名已废,stack 不读)。
+  # 键名必须是 add_gsi_tenant_user(去品牌化前旧名 add_gsi_platform_user 已废,stack 不读)。
   add_gsi_tenant_user: false
+
+# ========== SQS Dispatch(标准队列 + 装箱消费,治大规模建租户 SSM 打爆) ==========
+# 与上面 scaler.lifecycle_queue_enabled(FIFO,治同租户下 lifecycle 有序)是并行两条
+# 通道:lifecycle FIFO 继续管 stop/delete(需 per-tenant 严格有序),dispatch 标准队列
+# 只管 create/start 的高并发装箱聚合。一期 push=聚合 SSM(单 host 一条命令带 batch
+# manifest),二期 pull=写 assignments 表让 host-agent 自取。设计契约:
+# SPEC/specs/sqs-dispatch/interfaces.md。ADR:
+# engineering/00-knowledge-base/decisions/ADR-controlplane-sqs-batch-dispatch.md。
+#
+# 开关矩阵(interfaces.md L30):
+#   dispatch.enabled=false → 什么都不建,现状不变(向后兼容)。
+#   dispatch.enabled=true  → create/start 一律走 dispatch,scaler.create_via_queue 被忽略。
+#   两者同 true             → stack.py synth 直接 raise ValueError(fail-loud,防双入队)。
+# 迁移三步:
+#   ① dispatch.enabled=false + create_via_queue=true 现状。
+#   ② 排干 lifecycle 队列在途 create。
+#   ③ 一次 deploy 里同时翻:dispatch.enabled=true + create_via_queue=false。
+#
+# 突发算术(打开前必算):esm_max_concurrency × 每批分片数 = 瞬时 PutParameter TPS。
+# 大于 3 TPS 必须先给 Parameter Store 开 higher throughput,否则被 ParamStore 侧限流。
+#
+# andon 急停(不走本 config,走运行时 SSM param):
+#   aws ssm put-parameter --overwrite --name /openclaw/dispatch/config --value 'andon=stop'
+# 消费端每次 SendCommand/BatchWriteItem 前 GetParameter 单读(读失败 fail-closed)。
+dispatch:
+  enabled: false      # 默认关,零新资源
+  # push=聚合 SSM+ParamStore 分片(回退,受 ~3 TPS PutParameter + 24KB 参数区限);
+  # ddb=写 assignments 表 + 一条 --from-ddb SSM 叫醒 host 自查表(一期默认载体,#73,
+  #     PutParameter 退出热路径);pull=host-agent 5s 轮询自取(二期,无 SSM 叫醒)。
+  mode: push          # 一期部署显式设 ddb;默认 push 保持存量部署零变化
+  esm_max_concurrency: 10   # SQS Lambda ESM ScalingConfig MaximumConcurrency(硬 range 2..1000)
+  batching_window_seconds: 2   # 攒批降 Lambda 冷启开销;0..300
+  max_batch_size: 500   # 单次 invoke 里的最大装箱租户数;1..10000(推导 executionTimeout 也受制于此)
+  dlq_max_receive_count: 3   # DLQ maxReceiveCount;一进 DLQ 就告警(alarm openclaw-dispatch-dlq-not-empty)
 
 # ========== 健康检查 ==========
 health_check:
@@ -132,6 +166,17 @@ health_check:
 api:
   throttle_rate_limit: 500          # 稳态 req/s(account 级 steady-state)
   throttle_burst_limit: 1000        # 瞬时 burst 上限(令牌桶容量)
+  # #108 第三方对接 per-platform scoped API key(默认关 = 单 key 部署字节不变)。
+  # 配了下面这段,每个平台拿一把独立 key + 独立 usage plan(per-platform 限流),
+  # REQUEST authorizer 解析 key→platform 注入 requestContext.authorizer.platform_id,
+  # 控制面按平台命名空间隔离(平台 A 的 key 碰不到平台 B 的租户,跨平台 403)。
+  # 部署后须手动 seed PlatformKeyMap:create key → put {key_hash=sha256(key值), platform_id}。
+  # 老 openclaw-admin-key 保留作运维超管(不在映射→无作用域→全量,仅内部运维)。
+  # platform_keys:
+  #   - id: acme                    # 平台标识(= 租户 platform_id 命名空间)
+  #     throttle_rate_limit: 100    # 该平台稳态 req/s(缺省 100)
+  #     throttle_burst_limit: 200   # 该平台 burst(缺省 200)
+  #   - id: globex
 
 # ========== AWS WAF (可选, 关联到 API Gateway) ==========
 waf:
@@ -196,6 +241,18 @@ audit:
   # replace 丢审计历史。开了会新建 alias/openclaw-audit-log CMK(自动轮换),Lambda
   # 的 grant_read_write_data 自动获得 kms 解密权限。
   cmk_encryption: false
+  # #32 WORM 归档:审计表 DDB 只留 90 天热窗(retention_days),冷数据归档到独立的
+  # audit-archive S3 桶(Object Lock COMPLIANCE + Versioning + 独立 CMK)保留数年。
+  # 归档链路:DDB Stream(NEW_IMAGE)→ 归档 Lambda → S3 按 owner/date/id.json 分区。
+  # 同时给 audit 表加 gsi_audit_owner(actor_owner_id, ts)让按租户查审计走 GSI 不再
+  # 全分区扫。
+  # ⚠ 与 cmk_encryption 相同硬约束:只能在全新 account 首次部署时开(存量 audit 表
+  # 加 Stream + GSI 会强制 replace 丢历史)。dev region 走 DESTROY 降级不锁 WORM。
+  worm_archive_enabled: false
+  # WORM 桶 Object Lock retention(prod region);默认 7 年对齐 SEC 17a-4 常见口径
+  worm_retention_years: 7
+  # S3 分区前缀
+  archive_prefix: "audit-archive"
 
 # Go-live A1: 租户↔用户映射的写权威外置给外部后端(external backend)。enabled=true 时:① create_tenant
 # 不再隐式让创建者(Cognito sub)拥有租户;② 外部后端经 HMAC 签名的 POST /external/authz
@@ -205,12 +262,12 @@ external_authz:
   secret_name: ""                  # Secrets Manager 里的 HMAC 共享密钥名(外部后端签名用);走 CFN 动态引用,明文不进模板
   # user_pool_id: ""              # 复用已有 User Pool（留空自动创建）
 
-# ========== 外部 IdP 联合 (可选, OIDC) ==========
-# 让外部平台的用户用既有账号经 OIDC 联合登录到同一个 Cognito User Pool (task #13/#14)。
+# ========== 外部平台 IdP 联合 (可选, OIDC) ==========
+# 让外部平台用户用既有账号经 OIDC 联合登录到同一个 Cognito User Pool (task #13/#14)。
 # 依赖 console_auth.enabled=true (provider 挂在 console 的 User Pool 上)。
 # enabled=false (默认) 时不加任何 provider, User Pool 保持 COGNITO-only, 完全向后兼容。
 #
-# 注意: 这里只提供"接入点 + 契约", 外部 IdP 的真实 OIDC 端点 (issuer/client) 由 IdP 侧提供,
+# 注意: 这里只提供"接入点 + 契约", 外部平台真实 OIDC 端点 (issuer/client) 由外部平台侧提供,
 # 我方不硬编造。client_secret 走 Secrets Manager 动态引用, 明文绝不进 CloudFormation 模板。
 #
 # 联合对 hub 透明: hub 仍只验 Cognito 签发的 id_token (零凭据 guest 约束不变)。
@@ -219,12 +276,12 @@ external_authz:
 exchange_idp:
   enabled: false                   # 开关; false 时下面字段全部忽略
   # provider_name: "ExchangeIdP"      # Cognito 里该 provider 的名字 (hosted-UI 按钮 + supported 列表)
-  # issuer_url: ""                 # 【IdP 侧提供】OIDC issuer URL, 留空=不启用 (CDK 自动发现 .well-known)
-  # client_id: ""                  # 【IdP 侧提供】OIDC client id
+  # issuer_url: ""                 # 【外部平台侧提供】OIDC issuer URL, 留空=不启用 (CDK 自动发现 .well-known)
+  # client_id: ""                  # 【外部平台侧提供】OIDC client id
   # client_secret_secret: ""       # client secret 所在的 Secrets Manager 密钥名/ARN (不写明文!)
   # client_secret_json_key: ""     # 若密钥是 JSON, 取哪个 key; 纯字符串密钥留空
-  # scopes: ["openid", "profile", "email"]   # 向外部 IdP 请求的 OAuth2 scopes
-  # stable_id_claim: "sub"         # 外部平台稳定用户 id 所在的 OIDC claim, 映到 custom:tenant_user_id
+  # scopes: ["openid", "profile", "email"]   # 向外部平台 IdP 请求的 OAuth2 scopes
+  # stable_id_claim: "sub"         # 外部平台端稳定用户 id 所在的 OIDC claim, 映到 custom:tenant_user_id
   # attribute_request_method: "GET"  # GET | POST, IdP userInfo 端点的请求方法
   # map_email: true                # 是否把 email claim 也映到 Cognito email 属性
 
@@ -272,9 +329,36 @@ metrics:
 # ② GuardDuty 云层威胁检测 ③ openclaw 运行时 metrics(host-agent → AMP)。
 security:
   guardduty_enabled: false   # true=CDK 启 GuardDuty detector + 把 Finding 经 EventBridge 路由到 SNS(供 Wazuh/订阅者消费)。账号已有 detector 时保持 false。
+  guardduty_runtime_monitoring: false   # true=在 detector 上启 RUNTIME_MONITORING feature,同时把 EC2_AGENT_MANAGEMENT 显式设为 DISABLED —— 开 automated agent management 会给账号内所有 EC2 装 GuardDuty agent(SSM association),会波及本栈之外的 host。安全开启法:只给需要监控的实例打 inclusion tag GuardDutyManaged=true(或反向给不想装的 host 打 exclusion tag GuardDutyManaged=false)。account 层威胁检测(GD 自身的 9 feature)不受此开关影响,一手证据 engineering/00-knowledge-base/evidence/metal-experiments/8layer-evidence.md:163-181。前置:guardduty_enabled: true。默认 false。
+  inspector_enabled: false   # true=在本 region 启用 Amazon Inspector v2(经 AwsCustomResource 调 inspector2:Enable),对 EC2/ECR 做 CVE 与配置扫描,Finding 经 EventBridge 路由到 SNS。默认 false:Enable 是账号级动作(按扫描资源计费),建议由账号运营方显式打开。stack destroy 时会 Disable。
+  inspector_resource_types: ["EC2", "ECR"]   # inspector_enabled=true 时扫描的资源类型。可选 EC2/ECR/LAMBDA/LAMBDA_CODE/CODE_REPOSITORY。默认覆盖 host CVE(EC2) + 镜像 CVE(ECR)。
   wazuh_enabled: false       # true=CDK 起一台专用监控 EC2(m7i.xlarge/AL2023),userdata 自动装 docker+compose 跑 Wazuh manager/indexer/dashboard,从 assets bucket 拉 deployment/monitoring/*。SG 仅 VPC CIDR 入站(1514/1515/55000/443,绝不 0.0.0.0)。默认 false。
   # Wazuh manager 部署见 deploy/monitoring/WAZUH-RUNBOOK.md(docker-compose 起 manager+indexer+dashboard,in-guest agent forward)。
-  dns_firewall_enabled: false  # true=CDK 建 Route53 Resolver DNS Firewall(domain list openclaw-egress-blocklist + rule group openclaw-egress-fw + BLOCK 规则 NXDOMAIN + 关联 VPC),在 DNS 解析层拦 C2/外泄域名(L4 出网防线)。默认 false。真实 C2 域名清单不入仓库(domain list 只放 demo 占位),运营用 route53resolver import-firewall-domains 从受控威胁情报源另灌。此前由 apply-hardening.sh 旁路建,现纳入 stack.py 随重建对账。
+  dns_firewall_enabled: false  # true=CDK 建 Route53 Resolver DNS Firewall(domain list openclaw-egress-blocklist + rule group openclaw-egress-fw + BLOCK 规则 NXDOMAIN + 关联 VPC),在 DNS 解析层拦 C2/外泄域名(L4 出网防线)。默认 false。真实 C2 域名清单不入仓库(domain list 只放 demo 占位),运营用 route53resolver import-firewall-domains 从受控威胁情报源另灌。此前由 apply-hardening.sh 旁路建,现纳入 stack.py 随重建对账。注意:DNS FW 只拦经 VPC Route53 Resolver 的查询;microVM guest DNS 硬编码公网 8.8.8.8 不经 VPC Resolver,故 DNS FW 对 microVM 出网无效(定位=带外 C2 黑名单)。收 microVM 出网走下面的 egress_allowlist(#39,tap 级 iptables 白名单)。
+  guardrail_managed_by_stack: false  # true=CDK 用 aws_bedrock.CfnGuardrail 从 deploy/runtime-config-export/bedrock-guardrail.json 建 Bedrock Guardrail,id 写 SSM /openclaw/bedrock-guardrail-id(LiteLLM userdata/apply-hardening.sh 都从 SSM 读、不硬编码)。默认 false 保存量兼容——存量账号已有 apply-hardening.sh 建过的 Guardrail(795=od6s8sm533fs)保持 false,LiteLLM 继续走硬编码兜底 id。切 true 前必须先把带外那个 Guardrail 改名或删了,否则 CFN 建同名 Guardrail 冲突。#80。
+
+  # ── #39 microVM 出网默认拒绝白名单(L4 tap 级 iptables egress allowlist)──
+  # false(默认)= 现状:launch-vm.sh 末尾 FORWARD ACCEPT 放行 guest→全部公网出网(零变化)。
+  # true = 把末尾 ACCEPT 换成「静态 CIDR 放行 + FQDN 白名单放行 + 末尾 DROP」默认拒绝。机制:
+  #   ① 静态 CIDR:自动放行 VPC CIDR(覆盖 host 本地 hub tap IP + 堡垒机 LiteLLM 私网 + EKS ALB
+  #      私网),+ 下面 egress_allowlist_cidrs 的自定义 CIDR。
+  #   ② FQDN 白名单:host 起 dnsmasq,用 nat/PREROUTING DNAT 把 guest 的 :53 透明劫持到 host
+  #      dnsmasq(guest DNS 硬编码 8.8.8.8 无需改,零 guest 改造/不重烤镜像);dnsmasq 对内置
+  #      cognito-idp.{region}/s3.{region} + 下面 egress_allowlist_domains 边解析边灌 ipset
+  #      oc_egress_allow,FORWARD 用 -m set --match-set 放行解析出的真实 IP。cognito-idp 在
+  #      ip-ranges.json 无独立 service key(只落 AMAZON 大段),故走 FQDN 白名单精确放行,不放整段。
+  #   ③ 末尾对 tap→公网口补 DROP 兜底(默认拒绝);直连 IP 绕过 DNS 白名单的也被这条 DROP 兜住。
+  # 为什么默认关:开启会切默认拒绝,漏放一个必需目标(cognito/LLM/hub/S3 图片链路)microVM 即
+  #   不可用,误伤面大,须先在真机满载 380 逐条验证放行/拦截都对再灰度开启(改部署代码→重建,非热改)。
+  # 精确到 bucket 级 / 复活 R53 DNS FW / VPC Endpoint 收敛需改 guest DNS + 重烤镜像,留独立 ADR。
+  egress_allowlist_enabled: false
+  egress_allowlist_include_vpc_cidr: true   # gate 开时是否自动放行整个 VPC CIDR(覆盖 LiteLLM/EKS hub/VPC endpoint 私网)。默认 true。
+  # 额外放行的自定义 CIDR(逗号分隔,如堡垒机所在的对等 VPC / 独立 LiteLLM 子网)。VPC CIDR 已自动放行。
+  egress_allowlist_cidrs: ""
+  # 额外放行的 FQDN(逗号分隔,叠在内置 cognito-idp/s3 默认域名之上;如 finance-agent 的行情数据 API 域名)。
+  egress_allowlist_domains: ""
+  # host dnsmasq 的上游解析器。默认沿用 guest 原硬编码 8.8.8.8 便于对齐;可改 VPC Resolver 169.254.169.253。
+  egress_dns_upstream: "8.8.8.8"
 
 # ========== claw-hub 端点(microVM channel dial-out 目标)==========
 # 每个 microVM 的 claw-channel 拨出到 hub 注册(jarvis 同款 outbound WS)。

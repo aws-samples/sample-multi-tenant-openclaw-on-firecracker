@@ -8,6 +8,7 @@ Replaces per-tenant SSM health checks. Runs as systemd service on each host.
 
 import json
 import os
+import random
 import subprocess
 import threading
 import time
@@ -930,7 +931,6 @@ def _adjust_balloons(probe_results):
         guest_available_mb = stats.get("stats", {}).get("available_memory", 0) // (
             1024 * 1024
         )
-        guest_free_mb = stats.get("stats", {}).get("free_memory", 0) // (1024 * 1024)
 
         if host_pressure < 0.20:
             # Host under pressure — try to reclaim from this VM
@@ -1060,6 +1060,556 @@ def _reap_orphan_firecrackers():
         print(f"overwatcher: reaped {reaped} orphan firecracker(s)")
 
 
+# ═══════════════════════════════════════════
+# SQS dispatch — pull-mode reconciler (二期)
+# ═══════════════════════════════════════════
+#
+# When ASSIGNMENTS_TABLE is set, we run a second thread that pulls "desired
+# state" rows from the openclaw-assignments DDB table and locally fans out
+# launch-vm.sh. The consumer Lambda only writes rows (no SSM), so:
+#   - dispatch scales with DDB Query throughput (host count × 5s poll), not
+#     SSM SendCommand rate (which cratered at ~40 concurrent per-instance);
+#   - a host that missed one poll auto-catches up on the next tick — the
+#     table IS the desired state (no fire-and-forget SendCommand to replay).
+#
+# The planning step (_plan_dispatch) is a pure function that takes the DDB
+# rows and the on-disk VM inventory and returns a list of (assignment,
+# action) tuples: launch | skip_done | over_budget. Tests exercise this
+# without any AWS.
+
+ASSIGNMENTS_TABLE = os.environ.get("ASSIGNMENTS_TABLE", "")
+DISPATCH_POLL = int(os.environ.get("OC_AGENT_DISPATCH_POLL", "5"))
+DISPATCH_PARALLEL = int(os.environ.get("OC_AGENT_DISPATCH_PARALLEL", "96"))
+DISPATCH_RETRY_BUDGET = int(os.environ.get("DISPATCH_RETRY_BUDGET", "3"))
+
+# ── P0.1 backoff + jitter (kubelet pod_workers.go:completeWork:1524-1548) ──
+# Every failure used to burn one of DISPATCH_RETRY_BUDGET immediately; three
+# strikes and the tenant went to requires_intervention. That's cruel to
+# transient SSM/DDB throttles and it makes 380 hosts hammer the same second
+# after a failure (惊群). Kubelet's answer: classify the error, back off
+# for a category-specific delay, and jitter every enqueue by up to 50%.
+# We keep the budget as a hard cap for terminal (non-transient) failures,
+# but transient errors no longer count against it. Values mirror kubelet:
+#   pod_workers.go:325  workerBackOffPeriodDefault  = 10s
+#   pod_workers.go:327  workerResyncIntervalJitterFactor = 0.5
+#   pod_workers.go:333  backOffOnTransientErrorPeriod = 1s
+DISPATCH_BACKOFF_BASE_SEC = float(os.environ.get("OC_AGENT_DISPATCH_BACKOFF", "10"))
+DISPATCH_BACKOFF_MAX_SEC = float(os.environ.get("OC_AGENT_DISPATCH_BACKOFF_MAX", "60"))
+DISPATCH_BACKOFF_TRANSIENT_SEC = float(
+    os.environ.get("OC_AGENT_DISPATCH_TRANSIENT", "1")
+)
+DISPATCH_JITTER_FACTOR = 0.5
+# Housekeeping runs on its own slower cadence (kubelet housekeepingPeriod=2s;
+# we go slower because DDB Query is more expensive — 60s is one 5s-poll batch
+# worth of tenants scanned per minute per host).
+DISPATCH_HOUSEKEEPING_SEC = int(os.environ.get("OC_AGENT_HOUSEKEEPING", "60"))
+
+_dispatch_inflight = set()  # tenant_ids currently in a launch subprocess
+_dispatch_inflight_lock = threading.Lock()
+
+# ── P0.3 workQueue: map[tenant_id]→due_time_epoch_seconds ──
+# Modelled on util/queue/work_queue.go:36-68 — a plain dict is fine at our
+# scale (≤380 rows/host). Enqueue overwrites due_time (dedup on tenant_id);
+# _dispatch_get_due() pops all entries whose due_time ≤ now. On each tick we
+# still do a bounded DDB Query as the desired-state truth, but a tenant that
+# just failed with backoff won't run again until its due_time — the queue is
+# the "not yet due" filter over the DDB row set.
+_dispatch_queue = {}  # tenant_id -> due_time (epoch seconds)
+_dispatch_queue_lock = threading.Lock()
+
+
+def _jitter(base_sec, factor=DISPATCH_JITTER_FACTOR):
+    """Add up to `factor * base_sec` uniform random skew to a delay. Kubelet
+    calls wait.Jitter(t, 0.5); the point is to spread N hosts that hit the
+    same failure at t0 across [t0+t, t0+1.5t] so their retries don't stampede.
+    Pure function — testable by seeding random.
+    """
+    if base_sec <= 0:
+        return 0.0
+    return base_sec + random.uniform(0.0, factor * base_sec)
+
+
+def _backoff_for_reason(reason):
+    """Kubelet-style error classification. Return the delay (seconds) before
+    the next attempt. Transient categories get a tight retry (1s + jitter);
+    generic failures get the 10s base capped at 60s (like kubelet's clamp to
+    resyncInterval in pod_workers.go:1544). Callers add jitter.
+    """
+    r = (reason or "").lower()
+    # DDB / SSM throttles, SQS TooManyRequests, transport hiccups — kubelet
+    # groups these under backOffOnTransientErrorPeriod. Match real AWS error
+    # names (ProvisionedThroughputExceededException, RequestLimitExceeded,
+    # ThrottlingException) as well as the generic strings.
+    transient_markers = (
+        "throttl",
+        "timeout",
+        "unavailab",
+        "networknotready",
+        "connection reset",
+        "too many requests",
+        "provisionedthroughput",
+        "requestlimitexceeded",
+        "servicetooheavy",
+    )
+    if any(m in r for m in transient_markers):
+        return DISPATCH_BACKOFF_TRANSIENT_SEC
+    # launch-vm.sh non-zero (rc=1, disk full, image missing, guest kernel
+    # panic) is a real failure; use the longer backoff and let the budget cap
+    # take terminal decisions on repeated real failures.
+    return min(DISPATCH_BACKOFF_BASE_SEC, DISPATCH_BACKOFF_MAX_SEC)
+
+
+def _dispatch_enqueue(tenant_id, delay_sec):
+    """Set due_time = now + delay + jitter, replacing any prior entry for the
+    same tenant. Kubelet work_queue.go:64-68 does the exact same map assign
+    (dedup semantics — a second Enqueue for the same key wins).
+    """
+    due = time.time() + _jitter(delay_sec)
+    with _dispatch_queue_lock:
+        _dispatch_queue[tenant_id] = due
+
+
+def _dispatch_pop_due(now=None):
+    """Pop all tenants whose due_time ≤ now (work_queue.go:GetWork:50).
+    Returns a set of tenant_ids the caller may include in this tick.
+    Non-due entries stay in the queue and are skipped by _dispatch_tick.
+    """
+    if now is None:
+        now = time.time()
+    due = set()
+    with _dispatch_queue_lock:
+        for tid, when in list(_dispatch_queue.items()):
+            if when <= now:
+                due.add(tid)
+                del _dispatch_queue[tid]
+    return due
+
+
+def _dispatch_peek_pending(now=None):
+    """Return the set of tenant_ids that are currently queued but NOT yet due.
+    Used by _dispatch_tick to short-circuit tenants that failed recently and
+    are still cooling off — DDB row still says pending, but our local queue
+    says 'don't touch until due_time'.
+    """
+    if now is None:
+        now = time.time()
+    with _dispatch_queue_lock:
+        return {tid for tid, when in _dispatch_queue.items() if when > now}
+
+
+def _dispatch_queue_size():
+    with _dispatch_queue_lock:
+        return len(_dispatch_queue)
+
+
+def _plan_dispatch(assignments, local_vms, retry_budget=DISPATCH_RETRY_BUDGET):
+    """Given a list of assignment DDB rows and the local vm inventory, decide
+    the action for each row. Pure function — no I/O, no side effects — so it
+    is trivial to test with plain dicts.
+
+    Args:
+      assignments: [{"tenant_id","vm_num","vcpu","mem_mb","chat_ep","status",
+                     "dispatch_retries" (optional)}] — status is expected to
+                     be "pending" (caller filters), but we defend against a
+                     stale row that already flipped to "done".
+      local_vms:   set of tenant_ids that already have /data/firecracker-vms/
+                   <tenant>/vm.json on this host.
+      retry_budget: hard cap; retries ≥ budget → over_budget (agent flips
+                   tenant to requires_intervention per the contract).
+
+    Returns: [{"tenant_id","action","assignment"}]
+      action ∈ {"launch","skip_done","over_budget","skip_inflight"}
+    """
+    plan = []
+    for a in assignments:
+        tid = a.get("tenant_id")
+        if not tid:
+            continue
+        if a.get("status") != "pending":
+            continue
+        # Idempotent guard: another agent thread (or a prior poll cycle) may
+        # have already launched. `vm.json exists` = we own that tenant; flip
+        # to done without relaunching.
+        if tid in local_vms:
+            plan.append({"tenant_id": tid, "action": "skip_done", "assignment": a})
+            continue
+        with _dispatch_inflight_lock:
+            if tid in _dispatch_inflight:
+                # Prior tick's subprocess still running — do not double-launch.
+                plan.append(
+                    {"tenant_id": tid, "action": "skip_inflight", "assignment": a}
+                )
+                continue
+        retries = int(a.get("dispatch_retries", 0) or 0)
+        if retries >= retry_budget:
+            plan.append({"tenant_id": tid, "action": "over_budget", "assignment": a})
+            continue
+        plan.append({"tenant_id": tid, "action": "launch", "assignment": a})
+    return plan
+
+
+def _local_vm_inventory():
+    """Snapshot tenant_ids that already have vm.json on disk."""
+    try:
+        return {
+            tid
+            for tid in os.listdir(VM_DIR)
+            if os.path.isfile(os.path.join(VM_DIR, tid, "vm.json"))
+        }
+    except FileNotFoundError:
+        return set()
+
+
+def _mark_assignment_done(table, instance_id, tenant_id):
+    """Condition write: assignment status=pending → done. Loser (already done
+    /failed) is fine; we ack silently."""
+    try:
+        table.update_item(
+            Key={"instance_id": instance_id, "tenant_id": tenant_id},
+            UpdateExpression="SET #s = :d, done_ts = :t",
+            ConditionExpression="attribute_not_exists(#s) OR #s = :p",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":d": "done",
+                ":p": "pending",
+                ":t": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            },
+        )
+    except Exception as e:
+        # Conditional-check failures are expected (another agent won the race).
+        if "ConditionalCheckFailedException" not in str(e):
+            print(f"assignment done write {tenant_id} failed: {e}")
+
+
+def _mark_assignment_failed(table, instance_id, tenant_id, reason=""):
+    try:
+        table.update_item(
+            Key={"instance_id": instance_id, "tenant_id": tenant_id},
+            UpdateExpression="SET #s = :f, failed_ts = :t, fail_reason = :r",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":f": "failed",
+                ":t": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                ":r": (reason or "")[:200],
+            },
+        )
+    except Exception as e:
+        print(f"assignment fail write {tenant_id} failed: {e}")
+
+
+def _promote_tenant_running(tenant_id):
+    """tenants status=creating → running (condition write). Loser (already
+    running / stopped / deleting) is silently accepted — we never overwrite
+    a downstream state (D-#0-C fail-loud on assumption)."""
+    if not TENANTS_TABLE:
+        return
+    try:
+        table = _get_ddb().Table(TENANTS_TABLE)
+        table.update_item(
+            Key={"id": tenant_id},
+            UpdateExpression="SET #s = :r, running_ts = :t",
+            ConditionExpression="#s = :c",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":r": "running",
+                ":c": "creating",
+                ":t": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            },
+        )
+    except Exception as e:
+        if "ConditionalCheckFailedException" not in str(e):
+            print(f"promote {tenant_id} to running failed: {e}")
+
+
+def _bump_dispatch_retries(tenant_id):
+    """Atomic tenants.dispatch_retries += 1. Poller cap check is separate."""
+    if not TENANTS_TABLE:
+        return
+    try:
+        table = _get_ddb().Table(TENANTS_TABLE)
+        table.update_item(
+            Key={"id": tenant_id},
+            UpdateExpression="ADD dispatch_retries :one",
+            ExpressionAttributeValues={":one": 1},
+        )
+    except Exception as e:
+        print(f"bump retries {tenant_id} failed: {e}")
+
+
+def _flag_requires_intervention(tenant_id):
+    """Budget exhausted: tenants.status=requires_intervention (no reset). Only
+    from creating/failed to avoid clobbering a subsequent recovery."""
+    if not TENANTS_TABLE:
+        return
+    try:
+        table = _get_ddb().Table(TENANTS_TABLE)
+        table.update_item(
+            Key={"id": tenant_id},
+            UpdateExpression="SET #s = :r, requires_intervention_ts = :t",
+            ConditionExpression="#s IN (:c, :f)",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":r": "requires_intervention",
+                ":c": "creating",
+                ":f": "failed",
+                ":t": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            },
+        )
+    except Exception as e:
+        if "ConditionalCheckFailedException" not in str(e):
+            print(f"requires_intervention {tenant_id} failed: {e}")
+
+
+def _execute_launch(assignment):
+    """Fire launch-vm.sh in a subprocess and wait — the DISPATCH_PARALLEL
+    semaphore is the caller's job (a ThreadPoolExecutor)."""
+    tid = assignment["tenant_id"]
+    vm_num = str(assignment.get("vm_num", 1))
+    vcpu = str(assignment.get("vcpu", 2))
+    mem_mb = str(assignment.get("mem_mb", 2048))
+    chat_ep = str(assignment.get("chat_ep", 0))
+    with _dispatch_inflight_lock:
+        _dispatch_inflight.add(tid)
+    try:
+        # Same 10-position invocation as launch-all-vms.sh — positions 5-9
+        # left blank so launch-vm.sh reads secrets from DDB itself (single
+        # code path with _recover_vm and the SSM push driver).
+        rc = subprocess.call(
+            [
+                "bash",
+                "/home/ubuntu/launch-vm.sh",
+                tid,
+                vm_num,
+                vcpu,
+                mem_mb,
+                "",
+                "",
+                "",
+                "",
+                "",
+                chat_ep,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return rc == 0
+    except Exception as e:
+        print(f"dispatch launch {tid} failed: {e}")
+        return False
+    finally:
+        with _dispatch_inflight_lock:
+            _dispatch_inflight.discard(tid)
+
+
+def _query_pending_assignments(table, instance_id):
+    """DDB Query keyed on this host. Uses status filter (pending) — bounded by
+    the per-host row count (≤380 concurrent creations), so no pagination
+    logic needed at this scale. If we ever grow >1000 rows, add an LSI on
+    status and switch to KeyConditionExpression."""
+    rows = []
+    try:
+        resp = table.query(
+            KeyConditionExpression="instance_id = :i",
+            FilterExpression="#s = :p",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":i": instance_id, ":p": "pending"},
+        )
+        rows = resp.get("Items", [])
+    except Exception as e:
+        print(f"query assignments failed (non-fatal): {e}")
+    return rows
+
+
+def _dispatch_tick(table):
+    """One reconciliation pass. Isolated so tests can drive it without a
+    running thread.
+
+    P0.3 workQueue integration: after planning, drop any launch step whose
+    tenant is queued but not yet due (still cooling off after a prior
+    failure). The DDB row is still 'pending' — we honor the local backoff
+    clock instead of re-hitting launch-vm.sh at every 5s poll.
+    """
+    if not INSTANCE_ID:
+        return
+    assignments = _query_pending_assignments(table, INSTANCE_ID)
+    if not assignments:
+        return
+    local = _local_vm_inventory()
+    plan = _plan_dispatch(assignments, local)
+    # P0.3: cooling-off filter — tenants in queue with due_time>now stay quiet
+    # this tick. Their DDB row is still 'pending' so the next tick after
+    # due_time will re-plan them naturally (dict pop drains automatically via
+    # _dispatch_pop_due below).
+    not_yet_due = _dispatch_peek_pending()
+    # First, handle no-op rows without holding a thread slot.
+    launches = []
+    for step in plan:
+        tid = step["tenant_id"]
+        if step["action"] == "skip_done":
+            _mark_assignment_done(table, INSTANCE_ID, tid)
+            _promote_tenant_running(tid)
+        elif step["action"] == "over_budget":
+            _mark_assignment_failed(
+                table, INSTANCE_ID, tid, reason="retry budget exhausted"
+            )
+            _flag_requires_intervention(tid)
+        elif step["action"] == "skip_inflight":
+            # Prior tick is still running; next tick will re-plan.
+            continue
+        else:
+            if tid in not_yet_due:
+                # Cooling off from a prior failure — skip this tick.
+                continue
+            launches.append(step["assignment"])
+    # Drain due entries: they've served their purpose (the DDB row will
+    # decide whether to launch this tick), so pop them out of the queue.
+    _dispatch_pop_due()
+    if not launches:
+        return
+    # Bounded parallelism — the semaphore keeps the host at DISPATCH_PARALLEL
+    # in-flight launch-vm.sh subprocesses (matches launch-all-vms.sh's
+    # `wait -n` gate). ThreadPoolExecutor here waits for the whole batch, so
+    # a single tick never runs past DISPATCH_POLL if launches are fast.
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=DISPATCH_PARALLEL) as pool:
+        futures = {pool.submit(_execute_launch, a): a for a in launches}
+        for fut, a in futures.items():
+            tid = a["tenant_id"]
+            ok = False
+            err_reason = "launch-vm.sh non-zero"
+            try:
+                ok = fut.result()
+            except Exception as e:
+                # Preserve the raised reason for _backoff_for_reason to
+                # classify (throttled / timeout ⇒ transient).
+                err_reason = str(e) or err_reason
+                print(f"dispatch future {tid} raised: {err_reason}")
+                ok = False
+            if ok:
+                _mark_assignment_done(table, INSTANCE_ID, tid)
+                _promote_tenant_running(tid)
+            else:
+                # P0.1: classify the failure. Transient (throttle/timeout) →
+                # short jittered retry, do NOT burn retry budget. Real
+                # failure (launch-vm rc≠0) → 10s backoff + bump retries; the
+                # budget cap still catches genuinely stuck tenants.
+                delay = _backoff_for_reason(err_reason)
+                is_transient = delay <= DISPATCH_BACKOFF_TRANSIENT_SEC
+                _mark_assignment_failed(table, INSTANCE_ID, tid, reason=err_reason)
+                _dispatch_enqueue(tid, delay)
+                if not is_transient:
+                    _bump_dispatch_retries(tid)
+
+
+def _dispatch_loop():
+    """Poll thread. Only started when ASSIGNMENTS_TABLE is set (systemd env)."""
+    while True:
+        try:
+            table = _get_ddb().Table(ASSIGNMENTS_TABLE)
+            _dispatch_tick(table)
+        except Exception as e:
+            # Never crash — main _poll_loop keeps the host alive.
+            print(f"dispatch loop error (non-fatal): {e}")
+        time.sleep(DISPATCH_POLL)
+
+
+# ═══════════════════════════════════════════
+# P0.2 Housekeeping — bidirectional reconciliation (kubelet §5)
+# ═══════════════════════════════════════════
+#
+# The 5s dispatch tick only handles the forward direction (DDB says pending →
+# maybe launch). It cannot detect two silent-drift classes:
+#
+#   Class A (desired without local):  DDB row exists as pending, we somehow
+#       have no vm.json on disk AND no queue entry AND no inflight subprocess.
+#       Cause: agent process crashed mid-launch, or launch-vm.sh succeeded but
+#       vm.json write got wiped by a reboot. Fix: enqueue for immediate re-pull.
+#
+#   Class B (local without desired):  vm.json exists on disk but DDB has no
+#       matching assignment (or the row is 'done'/'failed', not 'pending').
+#       Cause: control-plane deleted the tenant while VM still runs; or a
+#       manual test-launched tenant. Fix: report/log; deletion is _reap_
+#       orphan_firecrackers's job (it uses its own missing-vm.json signal),
+#       so housekeeping stays report-only for Class B — no destructive
+#       action from the housekeeper (safety > completeness).
+#
+# Ordering rule (kubelet_pods.go:1219-1233): snapshot ACTUAL state BEFORE
+# reading desired state. If we read desired first, a tenant that just landed
+# on disk between reads would appear as Class A and get double-launched.
+#
+# Cadence: DISPATCH_HOUSEKEEPING_SEC (60s) — much slower than the 5s dispatch
+# tick because DDB Query cost + orphan-detection is cheap-per-tick but pointless
+# to run every poll interval.
+
+
+def _housekeeping_reconcile(table):
+    """One housekeeping pass. Pure orchestration — I/O is delegated to
+    _local_vm_inventory / _query_pending_assignments / _dispatch_enqueue so
+    tests can drive this without a table.
+
+    Returns a dict summary {re_enqueued, orphaned, desired, local} for logging
+    and for tests to assert on.
+    """
+    if not INSTANCE_ID:
+        return {"re_enqueued": 0, "orphaned": 0, "desired": 0, "local": 0}
+    # Snapshot ACTUAL first — kubelet_pods.go:1219-1233 ordering rule.
+    local = _local_vm_inventory()
+    # Snapshot inflight second (subset of the truth about "we own this tid").
+    with _dispatch_inflight_lock:
+        inflight = set(_dispatch_inflight)
+    # Now read desired.
+    rows = _query_pending_assignments(table, INSTANCE_ID)
+    desired = {r.get("tenant_id"): r for r in rows if r.get("tenant_id")}
+    # Also filter out tenants already backing off (queued, not-yet-due) —
+    # they are being handled, not silently drifting.
+    with _dispatch_queue_lock:
+        queued = set(_dispatch_queue.keys())
+    # Class A: DDB says pending, we have no local trace at all.
+    re_enqueued = 0
+    for tid in desired.keys():
+        if tid in local:
+            continue
+        if tid in inflight:
+            continue
+        if tid in queued:
+            continue
+        # We should be launching this tenant but haven't — enqueue with a
+        # small jittered delay so 380 hosts that all detected the same
+        # crash-recovery drift don't fire at once. Use transient backoff
+        # (1s + up to 0.5s jitter) — this is not a failure retry, it's a
+        # forward re-drive of desired state.
+        _dispatch_enqueue(tid, DISPATCH_BACKOFF_TRANSIENT_SEC)
+        re_enqueued += 1
+    # Class B: vm.json on disk with no matching pending assignment. We only
+    # report; deletion belongs to _reap_orphan_firecrackers (which checks a
+    # different signal — missing vm.json, not missing DDB row).
+    orphaned = sum(1 for tid in local if tid not in desired)
+    if re_enqueued or orphaned:
+        print(
+            f"housekeeping: desired={len(desired)} local={len(local)} "
+            f"re_enqueued={re_enqueued} orphaned_report={orphaned}"
+        )
+    return {
+        "re_enqueued": re_enqueued,
+        "orphaned": orphaned,
+        "desired": len(desired),
+        "local": len(local),
+    }
+
+
+def _housekeeping_loop():
+    """Independent tick from the 5s dispatch loop. Only started when
+    ASSIGNMENTS_TABLE is set."""
+    while True:
+        try:
+            table = _get_ddb().Table(ASSIGNMENTS_TABLE)
+            _housekeeping_reconcile(table)
+        except Exception as e:
+            print(f"housekeeping loop error (non-fatal): {e}")
+        time.sleep(DISPATCH_HOUSEKEEPING_SEC)
+
+
 def _poll_loop():
     while True:
         try:
@@ -1115,6 +1665,23 @@ def main():
     )
     t = threading.Thread(target=_poll_loop, daemon=True)
     t.start()
+    # Pull-mode dispatch reconciler (二期 SPEC/specs/sqs-dispatch/interfaces.md).
+    # Only starts when ASSIGNMENTS_TABLE is injected via systemd (dispatch.enabled
+    # && dispatch.mode=pull in config.yml). One extra daemon thread; no impact
+    # on the health/heartbeat loop above.
+    if ASSIGNMENTS_TABLE:
+        print(
+            f"openclaw-agent dispatch pull mode: assignments={ASSIGNMENTS_TABLE} "
+            f"poll={DISPATCH_POLL}s parallel={DISPATCH_PARALLEL} "
+            f"housekeeping={DISPATCH_HOUSEKEEPING_SEC}s"
+        )
+        d = threading.Thread(target=_dispatch_loop, daemon=True)
+        d.start()
+        # P0.2: housekeeping runs independently — slower cadence, catches
+        # silent-drift classes the 5s dispatch tick can't see (crash-recovery
+        # after mid-launch abort, vm.json wipe by reboot, etc.).
+        hk = threading.Thread(target=_housekeeping_loop, daemon=True)
+        hk.start()
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 

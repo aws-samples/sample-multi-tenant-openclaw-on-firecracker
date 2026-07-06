@@ -27,7 +27,7 @@ shell so it can be unit-tested without DDB/SSM/SNS access.
 import os
 import json
 import boto3
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 ddb = boto3.resource("dynamodb")
 ssm = boto3.client("ssm")
@@ -958,14 +958,22 @@ def _failover_tenant_to_host(tenant, target_host, source_az, now):
             return False
 
         # 3) Launch on target host via SSM with POSITIONAL args.
-        #    launch-vm.sh signature:
+        #    launch-vm.sh signature (11 位):
         #      launch-vm.sh <tenant_id> <vm_num> <vcpu> <mem_mb>
         #                   <config_template> <restore_backup_key>
+        #                   <scoped_skills> <litellm_vkey> <channel_secret>
+        #                   <chat_endpoint_enabled> <cognito_b64>
         #    config_template can be empty string ""; restore_backup_key
         #    is an S3 key (no s3:// prefix), e.g. backups/<tid>/<ts>.gz.
+        # #41 — failover 是 wake 场景(从 backup 恢复到 target host),必须穿透
+        # chat_endpoint_enabled 到 launch-vm 幂等段(第 10 位);位 7/8/9/11 空占位
+        # (数据盘从 backup 恢复,首铸字段随备份带回来,不重铸)。老版本只填 6 位。
+        cee = bool(tenant.get("chat_endpoint_enabled", False))
+        chat_ep_arg = "1" if cee else "0"
         launch_cmd = (
             f"/home/ubuntu/launch-vm.sh {tenant_id} {target_vm_num} "
-            f'{vcpu} {mem_mb} "{config_template}" "{backup_key}"'
+            f'{vcpu} {mem_mb} "{config_template}" "{backup_key}" '
+            f'"" "" "" {chat_ep_arg} ""'
         )
         ssm_resp = ssm.send_command(
             InstanceIds=[target_host_id],

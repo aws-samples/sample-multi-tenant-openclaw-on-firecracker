@@ -13,7 +13,7 @@
 # __MANAGER_PRIVATE_IP__ is substituted by setup-wazuh-two-ec2.sh at launch time
 # from the running manager instance. It is a placeholder in the repo on purpose.
 #
-# Verified on <AWS_ACCOUNT_ID> / ap-southeast-1, 2026-06-30: agent registered as
+# Verified on a demo account / region, 2026-06-30: agent registered as
 # ID 001 Agent-one Active; whodata engine started; touch/echo/rm /etc/fim_test
 # produced rule 554/550/553 alerts on the manager within the same second, with
 # who=root attached.

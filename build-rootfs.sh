@@ -12,10 +12,17 @@
 # and runs the same script remotely.
 set -euo pipefail
 
-# Show line number + exit code on any failure so users know exactly where things broke
-trap 'rc=$?; echo "❌ build-rootfs.sh failed at line $LINENO (exit $rc)" >&2; echo "💡 To capture full log next run: ./build-rootfs.sh ${1:-v1.0} 2>&1 | tee build.log" >&2' ERR
+# Show line number + exit code on any failure so users know exactly where things broke.
+# 顺手 lazy-umount ROOTFS_DIR(评审 LOW #4):失败路径下如果 chroot 挂载/主 rootfs 还挂着,
+# 用户手动清理容易忘。lazy(-l)在正常路径已 umount 时也无副作用(路径不存在直接返 0)。
+trap 'rc=$?; echo "❌ build-rootfs.sh failed at line $LINENO (exit $rc)" >&2; echo "💡 To capture full log next run: ./build-rootfs.sh ${1:-v1.0} 2>&1 | tee build.log" >&2; [ -n "${ROOTFS_DIR:-}" ] && sudo umount -l "${ROOTFS_DIR}" 2>/dev/null || true' ERR
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# #35 image hygiene lib — strip/assert 逻辑抽出成可独立执行 + 可 subprocess-test
+# 的 shell 库,让 immutable/data 两条路径共用同一份 find 谓词,消除漂移。
+# shellcheck disable=SC1091
+. "${SCRIPT_DIR}/scripts/lib/image-hygiene.sh"
 
 # OS guard. The chroot+debootstrap path is Linux-only — no point in waiting
 # for the "command not found" deep into the script when we know up front
@@ -352,7 +359,7 @@ chmod +x /usr/local/sbin/openclaw-mount-immutable.sh
 systemctl enable openclaw-immutable.service
 
 # === FIM: host-invisible file-integrity monitor (our Wazuh-style analogue) ===
-# A hardened production sandbox typically runs Wazuh syscheck (FIM) + logcollector +
+# A production-grade hardened sandbox runs Wazuh syscheck (FIM) + logcollector +
 # active-response in a separate namespace the agent CANNOT see or modify:
 # `/var/ossec` simply does not exist in the agent's mount namespace, so even a
 # fully compromised agent cannot tamper with the monitor that watches it.
@@ -395,7 +402,7 @@ fi
 
 drift=0
 # Baseline lines look like: "<sha256>  workspace/SOUL.md" or
-# "<sha256>  skills/skill-vetter/SKILL.md" (paths relative to the disk root).
+# "<sha256>  skills/ops-guardrails/SKILL.md" (paths relative to the disk root).
 while read -r want rel; do
   [ -n "${rel:-}" ] || continue
   case "$rel" in
@@ -629,7 +636,7 @@ def main():
                 cmd, parts = decode_hex_args(line)
                 for rx, desc in REV_SHELL_SIGS:
                     if rx.search(cmd):
-                        emit({"ts": now(), "product": "Finance Agent Runtime Monitor",
+                        emit({"ts": now(), "product": "ClawPool Agent Runtime Monitor",
                               "rule_id": 100210, "rule": "ReverseShell", "level": 12,
                               "severity": "P1", "signature": desc, "command": cmd[:400],
                               "detector": "auditd execve (in-guest, agent-invisible)"})
@@ -638,7 +645,7 @@ def main():
                 m = re.search(r'key="?(claw_fim_[a-z]+)"?', line)
                 if m:
                     g = lambda p: (re.search(p, line).group(1) if re.search(p, line) else "?")
-                    emit({"ts": now(), "product": "Finance Agent Runtime Monitor",
+                    emit({"ts": now(), "product": "ClawPool Agent Runtime Monitor",
                           "rule_id": 100110, "rule": "SensitiveFileModified", "level": 10,
                           "severity": "P1", "fim_key": m.group(1),
                           "who_auid": g(r'\bauid=(\S+)'), "who_uid": g(r'\buid=(\S+)'),
@@ -703,8 +710,8 @@ if [ -d /tmp/image-sample ]; then
   if [ -d /tmp/image-sample/skills ]; then
     cp -a /tmp/image-sample/skills/. /home/agent/.openclaw/skills/
   fi
-  # Security plugins: code-enforced before_tool_call enforcement (moves the
-  # disclosure guardrails from prompt self-discipline to a hard runtime veto). Two
+  # Security plugins: code-enforced before_tool_call enforcement (moves
+  # ops-guardrails from prompt self-discipline to a hard runtime veto). Two
   # complementary, independently-vetoing plugins are baked + enabled so every
   # VM enforces them:
   #   acl-guard      — tight secret/IMDS exfil deny-list (priority 1000, first).
@@ -780,23 +787,25 @@ Environment=OPENCLAW_SYSTEMD_UNIT=openclaw-gateway.service
 Environment=OPENCLAW_SERVICE_MARKER=openclaw
 Environment=OPENCLAW_SERVICE_KIND=gateway
 
-# ── HARDENING (privilege drop) — defence-in-depth capability/seccomp lockdown ──
-# A hardened agent sandbox runs the workload with ZERO Linux capabilities (root
-# inside, but no caps) plus a seccomp filter. Our gateway already runs as the
-# unprivileged `agent` user (uid 1000, a systemd *user* service — never root),
-# so we layer defence-in-depth on top:
+# ── HARDENING (privilege drop) — a production-grade privilege-drop (CapBnd=0) ──
+# A hardened production sandbox runs the agent with CapBnd=0000…0000
+# (root inside, but ZERO Linux capabilities) plus a seccomp filter. Our gateway
+# already runs as the unprivileged `agent` user (uid 1000, a systemd *user*
+# service — never root), so we layer defence-in-depth on top:
 #   NoNewPrivileges        — no setuid/setgid escalation; even a compromised
 #                            gateway cannot regain privileges via exec (mirrors
-#                            a zero-capability bounding set's "cannot re-acquire").
-#   CapabilityBoundingSet= — empty bounding set: no capability obtainable.
+#                            CapBnd=0's "cannot re-acquire any cap").
+#   CapabilityBoundingSet= — empty bounding set: no capability obtainable
+#                            (the systemd analogue of the hardened CapBnd=0).
 #   RestrictSUIDSGID       — block creating SUID/SGID files.
 #   ProtectKernelTunables / ProtectKernelModules / ProtectControlGroups —
 #                            read-only /proc/sys, /sys; no module load; no cgroup
 #                            edits from inside the gateway.
 #   RestrictNamespaces / LockPersonality / MemoryDenyWriteExecute(off — Node JIT
 #                            needs W^X relaxed) — narrow the kernel attack surface.
-#   SystemCallFilter=@system-service — seccomp allowlist scoped to the
-#                            syscalls a Node service legitimately needs.
+#   SystemCallFilter=@system-service — seccomp allowlist (a hardened sandbox has 1 active
+#                            BPF filter; this is our equivalent, scoped to the
+#                            syscalls a Node service legitimately needs).
 NoNewPrivileges=true
 CapabilityBoundingSet=
 AmbientCapabilities=
@@ -810,8 +819,8 @@ RestrictRealtime=true
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 
-# ── HARDENING (cgroup resource limits) — cgroup v2 per-slice sub-limits ──
-# A hardened sandbox pins each workload to a memory.max + cpu.max at the cgroup
+# ── HARDENING (cgroup resource limits) — a production-grade cgroup v2 adaptation ──
+# A hardened sandbox pins each to memory.max=4GB + cpu.max=2.5cores at the cgroup
 # layer. Our microVM is already capped by Firecracker (≈2GB/1vCPU on the dense
 # default), so this is a *sub-limit* INSIDE the guest: it bounds the gateway +
 # all its tool-exec children so a runaway/forked workload OOMs its own slice
@@ -838,7 +847,7 @@ ln -sf ../openclaw-gateway.service /home/agent/.config/systemd/user/default.targ
 # Without delegation, a systemd *user* service silently ignores resource limits
 # (the controllers aren't available in the user slice). Ubuntu Noble is cgroup
 # v2 unified, so memory+cpu+pids are delegatable. This is the plumbing that turns
-# the cgroup sub-limit from decoration into enforcement.
+# the hardened cgroup sub-limit from decoration into enforcement.
 mkdir -p /etc/systemd/system/user@.service.d
 cat > /etc/systemd/system/user@.service.d/10-openclaw-delegate.conf << 'DELEG'
 [Service]
@@ -880,7 +889,19 @@ truncate -s ${DATA_DISK_MB}M ${DATA_IMG}
 mkfs.ext4 -q ${DATA_IMG}
 sudo mkdir -p ${DATA_DIR}
 sudo mount ${DATA_IMG} ${DATA_DIR}
+# #35 image hygiene: strip python build caches from the agent home BEFORE it is
+# copied into the data template (scaffold/__pycache__ etc. would otherwise ride
+# into every tenant's writable data disk). Strip source then copy clean.
+sudo bash -c "$(declare -f image_hygiene_strip _image_hygiene_cache_dir_predicate _image_hygiene_pyc_predicate); image_hygiene_strip '${ROOTFS_DIR}/home/agent'"
 sudo cp -a ${ROOTFS_DIR}/home/agent/. ${DATA_DIR}/
+# #35 fail-loud (评审 MEDIUM #1):对称于 immutable 侧,在挂载中的 data 盘上跑
+# 同一份 find 断言。命中即打印 + umount + exit 1,别让污染的数据盘静默滚下去。
+if ! sudo bash -c "$(declare -f image_hygiene_assert image_hygiene_find_hits _image_hygiene_cache_dir_predicate _image_hygiene_pyc_predicate); image_hygiene_assert '${DATA_DIR}' '<data>'"; then
+  sudo umount ${DATA_DIR} 2>/dev/null || true
+  sudo rmdir ${DATA_DIR} 2>/dev/null || true
+  exit 1
+fi
+echo "  → #35 hygiene OK: data disk carries no python build cache"
 sudo chown -R 1000:1000 ${DATA_DIR}
 sudo umount ${DATA_DIR}
 sudo rmdir ${DATA_DIR}
@@ -906,10 +927,11 @@ rm -f ${IMMUTABLE_IMG}
 # platform-injected + guardrail-masked) and is a protected identity file, so it
 # must be tamper-proof too.
 IMMUTABLE_WORKSPACE_FILES="SOUL.md AGENTS.md IDENTITY.md HEARTBEAT.md COMMUNICATION_STYLE.md TOOLS.md USER.md"
-# Ops / safety skills that must never be editable from inside the VM. This sample
-# ships a minimal set: skill-vetter (security review before enabling any new skill)
-# and weather (read-only public data). Both are baked read-only + FIM-monitored so
-# a tenant cannot rewrite them at runtime.
+# Ops / safety skills that must never be editable from inside the VM. The sample
+# ships two: skill-vetter (security review before enabling any new/third-party
+# skill) and weather (read-only public data). An attacker editing a safety-relevant
+# skill to fabricate a "safe" verdict is a risk, so they are baked read-only +
+# FIM-monitored on the immutable disk alongside the identity files.
 IMMUTABLE_SKILLS="skill-vetter weather"
 
 # Stage the immutable set from the just-built golden /home/agent tree.
@@ -933,9 +955,18 @@ for s in ${IMMUTABLE_SKILLS}; do
   fi
 done
 
-# sha256 baseline (P3-9): hash every file in the immutable set so the golden image
-# can be verified against a known baseline at runtime. Path is relative to the disk
-# root (e.g. workspace/SOUL.md, skills/skill-vetter/SKILL.md). Written INTO the
+# #35 image hygiene: strip Python build caches BEFORE hashing/sizing/baking.
+# scaffold/__pycache__, .ruff_cache, .pytest_cache and *.pyc are build-time
+# debris that would otherwise (a) get sha256-hashed into golden-image.sha256 and
+# baked into the READ-ONLY authority disk (bloat + non-reproducible bytes that
+# vary by interpreter version), and (b) leak build-host state into every tenant
+# microVM. The existing find-cleanup only covered ._* / node_modules / test-harness.
+echo "  → #35 stripping python build caches from immutable stage"
+sudo bash -c "$(declare -f image_hygiene_strip _image_hygiene_cache_dir_predicate _image_hygiene_pyc_predicate); image_hygiene_strip '${IMMUTABLE_STAGE}'"
+
+# sha256 baseline (P3-9): hash every file in the immutable set so the healthcheck
+# skill can verify the golden image at runtime. Path is relative to the disk root
+# (e.g. workspace/SOUL.md, skills/ops-guardrails/SKILL.md). Written INTO the
 # read-only disk itself so it can't be tampered with either.
 echo "  → generating golden-image.sha256 baseline"
 ( cd ${IMMUTABLE_STAGE} && sudo find workspace skills -type f ! -name 'golden-image.sha256' -print0 \
@@ -953,6 +984,18 @@ mkfs.ext4 -q ${IMMUTABLE_IMG}
 sudo mkdir -p ${IMMUTABLE_DIR}
 sudo mount ${IMMUTABLE_IMG} ${IMMUTABLE_DIR}
 sudo cp -a ${IMMUTABLE_STAGE}/. ${IMMUTABLE_DIR}/
+# #35 image-hygiene assertion (fail-loud, DoD core): after the content lands on
+# the real immutable disk, assert NO python build cache made it through. If any
+# survives the strip above (e.g. a future skill dir sneaks one in), abort the
+# build rather than silently ship a polluted read-only golden image. Runs while
+# still mounted so it inspects the exact bytes that become the disk image.
+# 谓词与 immutable strip / data strip 共用同一份库函数,避免漂移(评审 LOW #3)。
+if ! sudo bash -c "$(declare -f image_hygiene_assert image_hygiene_find_hits _image_hygiene_cache_dir_predicate _image_hygiene_pyc_predicate); image_hygiene_assert '${IMMUTABLE_DIR}' '<immutable>'"; then
+  sudo umount ${IMMUTABLE_DIR} 2>/dev/null || true
+  sudo rmdir ${IMMUTABLE_DIR} 2>/dev/null || true
+  exit 1
+fi
+echo "  → #35 hygiene OK: immutable disk carries no python build cache"
 # Own by agent uid:gid (1000) so the read-only bind-mount presents agent-owned files.
 sudo chown -R 1000:1000 ${IMMUTABLE_DIR}
 sudo umount ${IMMUTABLE_DIR}

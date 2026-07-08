@@ -58,7 +58,7 @@ def _lambda_referenced_scripts():
     """
     found = set()
     for handler in LAMBDA_DIR.rglob("handler.py"):
-        text = handler.read_text()
+        text = handler.read_text(encoding="utf-8")
         for m in _HOST_SCRIPT_RE.finditer(text):
             found.add(m.group(1))
     return found
@@ -72,8 +72,8 @@ def _rendered_init_host_text():
     expand it from stack.py's own replacement string so the test tracks the
     real rendering logic rather than hard-coding backup-data.sh.
     """
-    init_text = INIT_HOST_SH.read_text()
-    stack_text = STACK_PY.read_text()
+    init_text = INIT_HOST_SH.read_text(encoding="utf-8")
+    stack_text = STACK_PY.read_text(encoding="utf-8")
     # Pull the literal that stack.py substitutes for {{BACKUP_DATA_SCRIPT}}.
     # It is a multi-line .replace("{{BACKUP_DATA_SCRIPT}}", "....") — grab any
     # /home/ubuntu/*.sh download lines that appear near that replacement.
@@ -121,7 +121,7 @@ def test_script_uploaded_by_setup(script):
     This is the assertion that would have failed on migrate-vm.sh (issue #64)
     and resize-disk.sh the moment either API was wired up.
     """
-    setup_text = SETUP_SH.read_text()
+    setup_text = SETUP_SH.read_text(encoding="utf-8")
     needle = f"deployment/scripts/{script}"
     assert needle in setup_text, (
         f"{script} is invoked by a Lambda but setup.sh never uploads it to "

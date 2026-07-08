@@ -45,6 +45,9 @@ SCOPED_SKILLS="${7:-}"
 [ "${SCOPED_SKILLS}" = '""' ] && SCOPED_SKILLS=""
 VM_DIR="/data/firecracker-vms/${TENANT_ID}"
 [ -f /etc/platform.env ] && source /etc/platform.env
+APP_PORT="${VM_APP_PORT:-3456}"
+FIRECRACKER_ASSETS="${FIRECRACKER_ASSETS:-/data/firecracker-assets}"
+LOCAL_TEMPLATES_DIR="${LOCAL_TEMPLATES_DIR:-/data/swarmclaw-firecracker/templates}"
 mkdir -p ${VM_DIR}
 rm -f ${VM_DIR}/.stopped
 SOCK="${VM_DIR}/fc.sock"
@@ -69,8 +72,8 @@ rm -f ${SOCK}; sleep 0.5
 # Prepare disks
 log "preparing disks..."
 T0=$SECONDS
-ROOTFS="/data/firecracker-assets/openclaw-rootfs.ext4"
-DATA_TPL="/data/firecracker-assets/openclaw-data-template.ext4"
+ROOTFS="${FIRECRACKER_ASSETS}/swarmclaw-rootfs.ext4"
+DATA_TPL="${FIRECRACKER_ASSETS}/swarmclaw-data-template.ext4"
 DATA_SIZE=$(stat -c%s ${DATA_TPL})
 
 # Overlay: sparse file for rootfs copy-on-write (shared read-only rootfs + per-VM writable layer)
@@ -154,49 +157,48 @@ if [ -d "${SHARED_SKILLS}" ] && [ "$(ls -A ${SHARED_SKILLS} 2>/dev/null)" ]; the
   sudo chown -R 1000:1000 ${MOUNT_TMP}/.openclaw/skills
   log "skills injected"
 fi
-# Configure openclaw.json
-OC_JSON="${MOUNT_TMP}/.openclaw/openclaw.json"
-if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
-  if [ "$NEW_DATA" = "true" ]; then
-    # Download custom template from S3 (if specified)
-    if [ -n "${CONFIG_TEMPLATE}" ] && [ -n "${ASSETS_BUCKET:-}" ]; then
-      aws s3 cp "s3://${ASSETS_BUCKET}/templates/openclaw/${CONFIG_TEMPLATE}/openclaw.json" "${OC_JSON}" --region "${OC_REGION:-ap-northeast-1}" --quiet
-      log "config template '${CONFIG_TEMPLATE}' applied"
+# Configure SwarmClaw environment. The service reads this file on every boot,
+# and the data disk persists it through backup, clone, restore, and migration.
+SC_HOME="${MOUNT_TMP}/.swarmclaw"
+SC_ENV="${SC_HOME}/.env.local"
+mkdir -p "${SC_HOME}/data" "${SC_HOME}/workspace"
+if [ "$NEW_DATA" = "true" ]; then
+  ACCESS_KEY=$(openssl rand -hex 24)
+  CREDENTIAL_SECRET=$(openssl rand -hex 32)
+  : > "${SC_ENV}"
+  if [ -n "${CONFIG_TEMPLATE}" ] && [ -n "${ASSETS_BUCKET:-}" ]; then
+    if aws s3 cp "s3://${ASSETS_BUCKET}/templates/swarmclaw/${CONFIG_TEMPLATE}/.env.local" "${SC_ENV}.template" --region "${OC_REGION:-ap-northeast-1}" --quiet; then
+      cat "${SC_ENV}.template" >> "${SC_ENV}"
+      rm -f "${SC_ENV}.template"
+      log "SwarmClaw env template '${CONFIG_TEMPLATE}' applied"
+    else
+      rm -f "${SC_ENV}.template"
+      log "SwarmClaw env template '${CONFIG_TEMPLATE}' not found; continuing with defaults"
     fi
-    # Inject platform config: unique token + allowedOrigins + disableDeviceAuth
-    NEW_TOKEN=$(openssl rand -hex 24)
-    jq --arg t "$NEW_TOKEN" '
-      .gateway.auth.token = $t |
-      .gateway.controlUi.allowedOrigins = ["*"] |
-      .gateway.controlUi.dangerouslyDisableDeviceAuth = true
-    ' "${OC_JSON}" > "${OC_JSON}.tmp" && mv "${OC_JSON}.tmp" "${OC_JSON}"
-    log "gateway token generated"
+  elif [ -n "${CONFIG_TEMPLATE}" ] && [ -f "${LOCAL_TEMPLATES_DIR}/${CONFIG_TEMPLATE}/.env.local" ]; then
+    cat "${LOCAL_TEMPLATES_DIR}/${CONFIG_TEMPLATE}/.env.local" >> "${SC_ENV}"
+    log "local SwarmClaw env template '${CONFIG_TEMPLATE}' applied"
   fi
-  sudo chown 1000:1000 "${OC_JSON}"
-  # AgentCore Gateway MCP injection (if configured).
-  #
-  # OpenClaw 2026.5+ moved MCP servers from a top-level `mcpServers` key to
-  # `mcp.servers.<name>` (verified against `openclaw mcp set` output;
-  # `openclaw mcp list` reads from this same path). The old top-level
-  # location and a brief intermediate `tools.mcpServers` location both
-  # fail config validation now. We write through `.mcp.servers` to match
-  # what the CLI itself uses.
-  if [ -f /data/agentcore.env ]; then
-    source /data/agentcore.env
-    if [ -n "${AGENTCORE_GATEWAY_URL:-}" ]; then
-      jq --arg url "$AGENTCORE_GATEWAY_URL" '
-        (.mcp // {}) as $mcp |
-        .mcp = ($mcp + {
-          "servers": ((($mcp.servers // {})) + {
-            "agentcore-gateway": {"url": $url, "transport": "streamable-http"}
-          })
-        })
-      ' "${OC_JSON}" > "${OC_JSON}.tmp" && mv "${OC_JSON}.tmp" "${OC_JSON}"
-      sudo chown 1000:1000 "${OC_JSON}"
-      log "AgentCore Gateway MCP injected at .mcp.servers: ${AGENTCORE_GATEWAY_URL}"
-    fi
-  fi
+  cat >> "${SC_ENV}" << SCEOF
+SWARMCLAW_HOME=/home/agent/.swarmclaw
+DATA_DIR=/home/agent/.swarmclaw/data
+PORT=${APP_PORT}
+HOSTNAME=0.0.0.0
+SWARMCLAW_ACCESS_KEY=${ACCESS_KEY}
+SWARMCLAW_API_KEY=${ACCESS_KEY}
+CREDENTIAL_SECRET=${CREDENTIAL_SECRET}
+SCEOF
+  chmod 600 "${SC_ENV}"
+  printf '%s' "${ACCESS_KEY}" > "${VM_DIR}/access-key"
+  chmod 600 "${VM_DIR}/access-key"
+  log "SwarmClaw tenant environment generated"
 fi
+if [ -f /data/agentcore.env ]; then
+  mkdir -p "${SC_HOME}/gateways"
+  cp /data/agentcore.env "${SC_HOME}/gateways/agentcore.env"
+  log "AgentCore environment copied for SwarmClaw"
+fi
+sudo chown -R 1000:1000 "${SC_HOME}"
 # 1.5.0 security: inject THIS host's public key so host-agent can SSH into
 # the guest with key auth (no shared password). The key is per-host
 # (init-host.sh generates it), so each VM trusts only its own host. uid/gid
@@ -268,7 +270,7 @@ sleep 1
 # Configure VM
 curl -s --unix-socket ${SOCK} -X PUT http://localhost/boot-source \
   -H 'Content-Type: application/json' \
-  -d '{"kernel_image_path":"/home/ubuntu/firecracker-assets/vmlinux","boot_args":"console=ttyS0 reboot=k panic=1 pci=off init=/sbin/overlay-init overlay_root=vdb ip='${GUEST_IP}'::'${HOST_TAP_IP}':255.255.255.0::eth0:off"}'
+  -d '{"kernel_image_path":"'${FIRECRACKER_ASSETS}'/vmlinux","boot_args":"console=ttyS0 reboot=k panic=1 pci=off init=/sbin/overlay-init overlay_root=vdb ip='${GUEST_IP}'::'${HOST_TAP_IP}':255.255.255.0::eth0:off"}'
 
 curl -s --unix-socket ${SOCK} -X PUT http://localhost/drives/rootfs \
   -H 'Content-Type: application/json' \
@@ -318,7 +320,7 @@ ssh-keygen -R ${GUEST_IP} 2>/dev/null || true
 # Nginx reverse proxy for this tenant's dashboard
 sudo tee /etc/nginx/conf.d/tenants/${TENANT_ID}.conf > /dev/null <<EOF
 location ~ ^/vm/${TENANT_ID}(/.*)?$ {
-    proxy_pass http://${GUEST_IP}:18789\$1;
+    proxy_pass http://${GUEST_IP}:${APP_PORT}\$1;
     proxy_http_version 1.1;
     proxy_set_header Upgrade \$http_upgrade;
     proxy_set_header Connection \$connection_upgrade;

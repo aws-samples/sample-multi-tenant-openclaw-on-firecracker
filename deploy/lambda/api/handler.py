@@ -36,6 +36,7 @@ VM_DEFAULT_VCPU = int(os.environ.get("VM_DEFAULT_VCPU", 2))
 VM_DEFAULT_MEM = int(os.environ.get("VM_DEFAULT_MEM", 4096))
 VM_DATA_DISK_MB = int(os.environ.get("VM_DATA_DISK_MB", 2048))
 VM_PORT_BASE = int(os.environ.get("VM_PORT_BASE", 18789))
+VM_APP_PORT = int(os.environ.get("VM_APP_PORT", os.environ.get("APP_PORT", 3456)))
 VM_SUBNET_PREFIX = os.environ.get("VM_SUBNET_PREFIX", "172.16")
 ASG_NAME = os.environ.get("ASG_NAME", "openclaw-hosts-asg")
 ALB_LISTENER_ARN = os.environ.get("ALB_LISTENER_ARN", "")
@@ -861,7 +862,7 @@ def delete_tenant(tenant_id, query_params):
     if host_id:
         # Remove DNAT rule (best effort)
         _ssm_run(host_id,
-            f"sudo iptables -t nat -D PREROUTING -i $(ip route show default | awk '{{print $5}}' | head -1) -p tcp --dport {item.get('host_port',0)} -j DNAT --to-destination {item.get('guest_ip','')}:{VM_PORT_BASE} 2>/dev/null || true"
+            f"sudo iptables -t nat -D PREROUTING -i $(ip route show default | awk '{{print $5}}' | head -1) -p tcp --dport {item.get('host_port',0)} -j DNAT --to-destination {item.get('guest_ip','')}:{VM_APP_PORT} 2>/dev/null || true"
         )
 
         if not keep_data:
@@ -1065,7 +1066,7 @@ def tenant_action(tenant_id, action, body=None):
         # Re-add DNAT after restart
         dnat_cmd = (
             f"sudo iptables -t nat -A PREROUTING -i $(ip route show default | awk '{{print $5}}' | head -1) "
-            f"-p tcp --dport {host_port} -j DNAT --to-destination {guest_ip}:{VM_PORT_BASE}"
+            f"-p tcp --dport {host_port} -j DNAT --to-destination {guest_ip}:{VM_APP_PORT}"
         ) if guest_ip and host_port else ""
         full_cmd = f"{stop_cmd} && sleep 2 && {launch_cmd}"
         if dnat_cmd:
@@ -1080,7 +1081,7 @@ def tenant_action(tenant_id, action, body=None):
         # Remove DNAT rule
         dnat_del = (
             f"sudo iptables -t nat -D PREROUTING -i $(ip route show default | awk '{{print $5}}' | head -1) "
-            f"-p tcp --dport {host_port} -j DNAT --to-destination {guest_ip}:{VM_PORT_BASE} 2>/dev/null || true"
+            f"-p tcp --dport {host_port} -j DNAT --to-destination {guest_ip}:{VM_APP_PORT} 2>/dev/null || true"
         ) if guest_ip and host_port else ""
         full_cmd = stop_cmd
         if dnat_del:
@@ -1094,7 +1095,7 @@ def tenant_action(tenant_id, action, body=None):
         launch_cmd = f"/home/ubuntu/launch-vm.sh {tenant_id} {vm_num} {item['vcpu']} {item['mem_mb']}"
         dnat_cmd = (
             f"sudo iptables -t nat -A PREROUTING -i $(ip route show default | awk '{{print $5}}' | head -1) "
-            f"-p tcp --dport {host_port} -j DNAT --to-destination {guest_ip}:{VM_PORT_BASE}"
+            f"-p tcp --dport {host_port} -j DNAT --to-destination {guest_ip}:{VM_APP_PORT}"
         ) if guest_ip and host_port else ""
         full_cmd = launch_cmd
         if dnat_cmd:
@@ -1111,7 +1112,7 @@ def tenant_action(tenant_id, action, body=None):
         launch_cmd = f"/home/ubuntu/launch-vm.sh {tenant_id} {vm_num} {item['vcpu']} {item['mem_mb']}"
         dnat_cmd = (
             f"sudo iptables -t nat -A PREROUTING -i $(ip route show default | awk '{{print $5}}' | head -1) "
-            f"-p tcp --dport {host_port} -j DNAT --to-destination {guest_ip}:{VM_PORT_BASE}"
+            f"-p tcp --dport {host_port} -j DNAT --to-destination {guest_ip}:{VM_APP_PORT}"
         ) if guest_ip and host_port else ""
         full_cmd = f"{stop_cmd} && {reset_cmd} && sleep 2 && {launch_cmd}"
         if dnat_cmd:
@@ -1575,15 +1576,15 @@ DATA_GZ={manifest['data_template']}
 aws s3 cp "s3://$BUCKET/$PREFIX/manifest.json" "$ASSETS/manifest.json" --region "$REGION"
 aws s3 cp "s3://$BUCKET/$PREFIX/$ROOTFS_GZ" "$ASSETS/rootfs.gz" --region "$REGION"
 aws s3 cp "s3://$BUCKET/$PREFIX/$DATA_GZ" "$ASSETS/data.gz" --region "$REGION"
-pigz -dc "$ASSETS/rootfs.gz" > "$ASSETS/openclaw-rootfs.ext4.tmp"
-[ -s "$ASSETS/openclaw-rootfs.ext4.tmp" ]
-mv "$ASSETS/openclaw-rootfs.ext4.tmp" "$ASSETS/openclaw-rootfs.ext4"
+pigz -dc "$ASSETS/rootfs.gz" > "$ASSETS/swarmclaw-rootfs.ext4.tmp"
+[ -s "$ASSETS/swarmclaw-rootfs.ext4.tmp" ]
+mv "$ASSETS/swarmclaw-rootfs.ext4.tmp" "$ASSETS/swarmclaw-rootfs.ext4"
 rm -f "$ASSETS/rootfs.gz"
-pigz -dc "$ASSETS/data.gz" > "$ASSETS/openclaw-data-template.ext4.tmp"
-[ -s "$ASSETS/openclaw-data-template.ext4.tmp" ]
-mv "$ASSETS/openclaw-data-template.ext4.tmp" "$ASSETS/openclaw-data-template.ext4"
+pigz -dc "$ASSETS/data.gz" > "$ASSETS/swarmclaw-data-template.ext4.tmp"
+[ -s "$ASSETS/swarmclaw-data-template.ext4.tmp" ]
+mv "$ASSETS/swarmclaw-data-template.ext4.tmp" "$ASSETS/swarmclaw-data-template.ext4"
 rm -f "$ASSETS/data.gz"
-fallocate --dig-holes "$ASSETS/openclaw-data-template.ext4"
+fallocate --dig-holes "$ASSETS/swarmclaw-data-template.ext4"
 """.strip()
     try:
         ssm.send_command(
@@ -1870,7 +1871,7 @@ def _launch_vm(instance_id, tenant_id, vm_num, vcpu, mem_mb, guest_ip, host_port
     skills_arg = ",".join(scoped_skills) if scoped_skills else '""'
     cmd = (f"/home/ubuntu/launch-vm.sh {tenant_id} {vm_num} {vcpu} {mem_mb} {tpl_arg} {restore_arg} {skills_arg} && "
            f"sudo iptables -t nat -A PREROUTING -i $(ip route show default | awk '{{print $5}}' | head -1) "
-           f"-p tcp --dport {host_port} -j DNAT --to-destination {guest_ip}:{VM_PORT_BASE}")
+           f"-p tcp --dport {host_port} -j DNAT --to-destination {guest_ip}:{VM_APP_PORT}")
     _ssm_send(instance_id, cmd, timeout=300)
 
 

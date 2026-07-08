@@ -2,7 +2,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-"""OpenClaw Host Agent — probes local VMs and writes health status to DynamoDB.
+"""Host Agent — probes local VMs and writes health status to DynamoDB.
 Replaces per-tenant SSM health checks. Runs as systemd service on each host.
 """
 
@@ -23,7 +23,7 @@ PORT = int(os.environ.get("OC_AGENT_PORT", "8899"))
 # never wired into main(), causing the ADOT collector to fail every scrape
 # (issue #4 regression, fixed in 1.2.5).
 VM_DIR = "/data/firecracker-vms"
-GATEWAY_PORT = 18789
+APP_PORT = int(os.environ.get("VM_APP_PORT", os.environ.get("GATEWAY_PORT", "3456")))
 TENANTS_TABLE = os.environ.get("TENANTS_TABLE", "")
 # Since 1.3.0: host-agent also writes a heartbeat to the hosts table so the
 # health_check Lambda can do AZ-level failover (it needs to know which hosts
@@ -254,7 +254,7 @@ def _probe_all():
             try:
                 r = subprocess.run(
                     ["curl", "-sf", "-o", "/dev/null", "--connect-timeout", "3",
-                     f"http://{guest_ip}:{GATEWAY_PORT}/"],
+                     f"http://{guest_ip}:{APP_PORT}/"],
                     capture_output=True, timeout=8)
                 if r.returncode == 0:
                     app_health = "up"
@@ -274,7 +274,7 @@ def _probe_all():
 
 
 def _read_gateway_token(guest_ip):
-    """SSH into VM and read gateway token from openclaw.json."""
+    """SSH into VM and read the SwarmClaw access key."""
     try:
         # 1.5.0 security: key-based SSH. The private key is per-host
         # (/etc/openclaw/host_vm_key, generated at boot by init-host.sh) and
@@ -284,7 +284,9 @@ def _read_gateway_token(guest_ip):
             ["ssh", "-i", "/etc/openclaw/host_vm_key",
              "-o", "StrictHostKeyChecking=no",
              "-o", "IdentitiesOnly=yes",
-             f"agent@{guest_ip}", "jq -r .gateway.auth.token .openclaw/openclaw.json"],
+             f"agent@{guest_ip}",
+             "grep -E '^(SWARMCLAW_ACCESS_KEY|SWARMCLAW_API_KEY)=' "
+             ".swarmclaw/.env.local | head -1 | cut -d= -f2-"],
             capture_output=True, text=True, timeout=10,
         )
         token = r.stdout.strip()
@@ -357,7 +359,7 @@ def _write_ddb(results):
 
         try:
             if info["vm_health"] == "up":
-                # Promote creating → running + read gateway token
+                # Promote creating → running + read SwarmClaw access key.
                 token = _read_gateway_token(info["guest_ip"])
                 if not token:
                     continue  # Wait for SSH/gateway to be ready
@@ -530,7 +532,7 @@ _CPU_SAMPLES = {}
 
 try:
     _CLK_TCK = os.sysconf("SC_CLK_TCK")
-except (ValueError, OSError):
+except (AttributeError, ValueError, OSError):
     _CLK_TCK = 100  # Linux default; kept for portability + test isolation.
 
 

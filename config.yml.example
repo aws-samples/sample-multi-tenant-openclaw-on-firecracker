@@ -35,7 +35,8 @@ vm:
   default_mem_mb: 4096
   rootfs_overlay_mb: 8192          # 每个 VM 可写层上限 (sparse, 不预占空间)
   data_disk_mb: 8192               # 每个 VM 数据盘 /home/agent 上限 (sparse)
-  gateway_port_base: 18789
+  gateway_port_base: 18789         # host-side per-tenant port allocation
+  app_port: 3456                   # in-guest SwarmClaw web server port
   subnet_prefix: "172.16"
 
 # ========== S3 ==========
@@ -68,7 +69,7 @@ scaler:
 health_check:
   interval_minutes: 5
   max_failures: 3
-  app_port: 18789
+  app_port: 3456
   # AZ-level failover (since 1.3.0). 当某个 AZ 内所有 host 在 unhealthy_threshold_minutes
   # 时间内一直 stale, 自动把该 AZ 的 running tenants 迁移到其他健康 AZ. 需要 multi_az.enabled=true.
   az_failover:

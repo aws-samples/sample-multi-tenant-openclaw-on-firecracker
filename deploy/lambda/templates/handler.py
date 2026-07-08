@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-"""Templates Lambda — manage OpenClaw config templates in S3."""
+"""Templates Lambda — manage SwarmClaw environment templates in S3."""
 
 import os
 import json
@@ -9,7 +9,8 @@ import boto3
 
 s3 = boto3.client("s3")
 BUCKET = os.environ.get("ASSETS_BUCKET", "")
-PREFIX = "templates/openclaw/"
+PREFIX = "templates/swarmclaw/"
+TEMPLATE_FILE = ".env.local"
 
 
 def lambda_handler(event, context):
@@ -39,9 +40,9 @@ def list_templates():
             name = cp["Prefix"].replace(PREFIX, "").rstrip("/")
             if not name:
                 continue
-            # Check if openclaw.json exists
+            # Check if template env exists
             try:
-                meta = s3.head_object(Bucket=BUCKET, Key=f"{PREFIX}{name}/openclaw.json")
+                meta = s3.head_object(Bucket=BUCKET, Key=f"{PREFIX}{name}/{TEMPLATE_FILE}")
                 size = meta.get("ContentLength", 0)
                 modified = meta.get("LastModified", "").isoformat() if meta.get("LastModified") else ""
             except Exception:
@@ -56,7 +57,7 @@ def list_templates():
 def get_template(name):
     """Get template content."""
     try:
-        obj = s3.get_object(Bucket=BUCKET, Key=f"{PREFIX}{name}/openclaw.json")
+        obj = s3.get_object(Bucket=BUCKET, Key=f"{PREFIX}{name}/{TEMPLATE_FILE}")
         content = obj["Body"].read().decode("utf-8")
         return _resp(200, {"name": name, "content": json.loads(content)})
     except s3.exceptions.NoSuchKey:
@@ -73,7 +74,7 @@ def put_template(name, body):
         content = json.loads(body) if isinstance(body, str) else body
         s3.put_object(
             Bucket=BUCKET,
-            Key=f"{PREFIX}{name}/openclaw.json",
+            Key=f"{PREFIX}{name}/{TEMPLATE_FILE}",
             Body=json.dumps(content, indent=2),
             ContentType="application/json",
         )
@@ -89,7 +90,7 @@ def delete_template(name):
     if name == "default":
         return _resp(403, {"error": "cannot delete default template"})
     try:
-        s3.delete_object(Bucket=BUCKET, Key=f"{PREFIX}{name}/openclaw.json")
+        s3.delete_object(Bucket=BUCKET, Key=f"{PREFIX}{name}/{TEMPLATE_FILE}")
         return _resp(200, {"name": name, "status": "deleted"})
     except Exception as e:
         return _resp(500, {"error": str(e)})

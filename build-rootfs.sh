@@ -2,9 +2,10 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-# Build the OpenClaw rootfs + data template and upload to S3.
+# Build the SwarmClaw rootfs + data template.
 # Usage: ./build-rootfs.sh [version]
 #        ./build-rootfs.sh v1.6
+#        HETZNER_LOCAL=1 ./build-rootfs.sh v1.6
 #
 # Linux-only: relies on debootstrap (Linux package), KVM-friendly chroot,
 # pigz, e2fsprogs. macOS users hit the OS guard below and are pointed at
@@ -50,33 +51,37 @@ case "$(uname -s)" in
 esac
 
 ENV_FILE="$SCRIPT_DIR/.env.deploy"
-if [ -f "$ENV_FILE" ]; then
+HETZNER_LOCAL="${HETZNER_LOCAL:-0}"
+if [ "$HETZNER_LOCAL" = "1" ]; then
+  REGION="${REGION:-local}"
+  PROFILE="${PROFILE:-}"
+  ASSETS_BUCKET="${ASSETS_BUCKET:-}"
+elif [ -f "$ENV_FILE" ]; then
   source "$ENV_FILE"
 else
-  echo "❌ .env.deploy not found — run ./setup.sh first."
-  exit 1
-fi
-
-OC_TEMPLATE="$SCRIPT_DIR/templates/openclaw.json"
-if [ ! -f "$OC_TEMPLATE" ]; then
-  echo "❌ 未找到 templates/openclaw.json，请从 openclaw.json.example 复制并配置"
+  echo "❌ .env.deploy not found — run ./setup.sh first, or use HETZNER_LOCAL=1 for local output."
   exit 1
 fi
 
 VERSION="${1:-v1.0}"
-BUCKET="${ASSETS_BUCKET}"
-ROOTFS_IMG="/tmp/openclaw-rootfs-${VERSION}.ext4"
-DATA_IMG="/tmp/openclaw-data-template-${VERSION}.ext4"
-ROOTFS_DIR="/tmp/openclaw-rootfs-build"
+BUCKET="${ASSETS_BUCKET:-}"
+ROOTFS_IMG="/tmp/swarmclaw-rootfs-${VERSION}.ext4"
+DATA_IMG="/tmp/swarmclaw-data-template-${VERSION}.ext4"
+ROOTFS_DIR="/tmp/swarmclaw-rootfs-build"
 
 # 依赖检查
 MISSING=()
-for cmd in debootstrap aws mkfs.ext4 curl pigz e2fsck resize2fs; do
+REQUIRED_CMDS=(debootstrap mkfs.ext4 curl pigz e2fsck resize2fs)
+if [ "$HETZNER_LOCAL" != "1" ]; then
+  REQUIRED_CMDS+=(aws)
+fi
+for cmd in "${REQUIRED_CMDS[@]}"; do
   command -v $cmd &>/dev/null || MISSING+=($cmd)
 done
 if [ ${#MISSING[@]} -gt 0 ]; then
   echo "❌ 缺少依赖: ${MISSING[*]}"
-  echo "   sudo apt-get install -y debootstrap e2fsprogs awscli curl pigz"
+  echo "   sudo apt-get install -y debootstrap e2fsprogs curl pigz"
+  [ "$HETZNER_LOCAL" = "1" ] || echo "   AWS mode also needs awscli."
   exit 1
 fi
 
@@ -148,9 +153,6 @@ sudo mount --bind /proc ${ROOTFS_DIR}/proc
 sudo mount --bind /sys ${ROOTFS_DIR}/sys
 sudo mount --bind /dev ${ROOTFS_DIR}/dev
 
-# Copy openclaw config template into chroot
-sudo cp "$OC_TEMPLATE" ${ROOTFS_DIR}/tmp/openclaw.json
-
 sudo chroot ${ROOTFS_DIR} /bin/bash << 'CHROOT'
 set -e
 trap 'rc=$?; echo "❌ chroot script failed at line $LINENO (exit $rc)" >&2; if [ "$rc" = "137" ] || [ "$rc" = "9" ]; then echo "   killed by SIGKILL — almost certainly OOM. Increase RAM or add swap." >&2; fi' ERR
@@ -203,7 +205,7 @@ echo "openclaw-vm" > /etc/hostname
 echo "127.0.0.1 localhost openclaw-vm" > /etc/hosts
 passwd -l root   # lock root password — pubkey-only, no console/password login
 
-# Create agent user for openclaw
+# Create agent user for SwarmClaw
 useradd -m -s /bin/bash agent
 passwd -l agent  # lock agent password — SSH is pubkey-only (key injected at launch)
 # pre-create the agent .ssh dir so launch-vm.sh can drop authorized_keys into
@@ -250,51 +252,42 @@ systemctl enable openclaw-data.service
 
 echo "node=$(node --version) npm=$(npm --version)"
 
-echo "[7/8] OpenClaw CLI (npm install -g openclaw — peak ~1GB RAM)"
-npm install -g openclaw
+echo "[7/8] SwarmClaw runtime (npm install -g @swarmclawai/swarmclaw — peak ~1GB RAM)"
+npm install -g @swarmclawai/swarmclaw
 chown -R agent:agent /usr/lib/node_modules
 
-echo "[8/8] OpenClaw onboard (bootstrap files)"
-# Config will be overwritten by template — onboard params are placeholders
-HOME=/home/agent su -s /bin/bash agent -c "openclaw onboard --non-interactive \
-  --accept-risk --mode local --auth-choice custom-api-key \
-  --custom-base-url 'http://placeholder' --custom-model-id 'placeholder' \
-  --custom-api-key 'placeholder' --gateway-bind lan --gateway-auth token --skip-health"
-# Overwrite config with our template (onboard config replaced, bootstrap files kept)
-cp /tmp/openclaw.json /home/agent/.openclaw/openclaw.json
-chown agent:agent /home/agent/.openclaw/openclaw.json
-rm -f /tmp/openclaw.json
-
-# --- Gateway service file (built into /home/agent, will be in data template) ---
-NODE_BIN=$(which node)
-OC_DIST=$(npm root -g)/openclaw/dist/index.js
-
+echo "[8/8] SwarmClaw service bootstrap"
 mkdir -p /home/agent/.config/systemd/user/default.target.wants
-cat > /home/agent/.config/systemd/user/openclaw-gateway.service << GWSVC
+mkdir -p /home/agent/.swarmclaw/data /home/agent/.swarmclaw/workspace
+cat > /home/agent/.swarmclaw/.env.local << 'SCENV'
+SWARMCLAW_HOME=/home/agent/.swarmclaw
+DATA_DIR=/home/agent/.swarmclaw/data
+PORT=3456
+HOSTNAME=0.0.0.0
+SCENV
+cat > /home/agent/.config/systemd/user/swarmclaw.service << SCSVC
 [Unit]
-Description=OpenClaw Gateway
+Description=SwarmClaw tenant runtime
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=${NODE_BIN} ${OC_DIST} gateway --port 18789
+WorkingDirectory=/home/agent
+EnvironmentFile=-/home/agent/.swarmclaw/.env.local
+ExecStart=/usr/bin/env swarmclaw server --port \${PORT} --host 0.0.0.0
 Restart=always
 RestartSec=5
 KillMode=process
 Environment=HOME=/home/agent
 Environment=TMPDIR=/tmp
-Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-Environment=OPENCLAW_GATEWAY_PORT=18789
-Environment=OPENCLAW_SYSTEMD_UNIT=openclaw-gateway.service
-Environment=OPENCLAW_SERVICE_MARKER=openclaw
-Environment=OPENCLAW_SERVICE_KIND=gateway
+Environment=PATH=/home/agent/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 [Install]
 WantedBy=default.target
-GWSVC
-ln -sf ../openclaw-gateway.service /home/agent/.config/systemd/user/default.target.wants/openclaw-gateway.service
+SCSVC
+ln -sf ../swarmclaw.service /home/agent/.config/systemd/user/default.target.wants/swarmclaw.service
 # --- Shared Skills directory ---
-mkdir -p /home/agent/.openclaw/skills
+mkdir -p /home/agent/.openclaw/skills /home/agent/.swarmclaw/skills
 # Skills will be synced from host's /data/shared-skills/ at VM launch time
 # This directory is on the data disk, so it persists across rootfs resets
 
@@ -303,9 +296,9 @@ chown -R agent:agent /home/agent
 # --- Cleanup ---
 apt-get clean
 rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/* /root/.npm /tmp/*
-rm -rf /opt/openclaw-mission-control/.next/cache /opt/openclaw-mission-control/node_modules/.cache
+rm -rf /home/agent/.swarmclaw/builds/*/.next/cache /home/agent/.swarmclaw/builds/*/node_modules/.cache
 
-echo "openclaw=$(openclaw --version 2>&1 || echo 'installed')"
+echo "swarmclaw=$(swarmclaw version 2>&1 || echo 'installed')"
 
 # OverlayFS init script (enables shared read-only rootfs across VMs)
 mkdir -p /overlay /mnt
@@ -343,32 +336,55 @@ echo "=== Compressing images ==="
 pigz -f ${ROOTFS_IMG}
 pigz -f ${DATA_IMG}
 
-echo "=== Uploading to S3 ==="
-PROFILE_FLAG="${PROFILE:+--profile ${PROFILE}}"
-ROOTFS_KEY="openclaw-rootfs-${VERSION}.ext4.gz"
-DATA_KEY="openclaw-data-template-${VERSION}.ext4.gz"
-aws s3 cp ${ROOTFS_IMG}.gz s3://${BUCKET}/deployment/rootfs/${ROOTFS_KEY} ${PROFILE_FLAG}
-aws s3 cp ${DATA_IMG}.gz s3://${BUCKET}/deployment/rootfs/${DATA_KEY} ${PROFILE_FLAG}
-
-# Upload manifest (version pointer)
-cat <<EOF | aws s3 cp - s3://${BUCKET}/deployment/rootfs/manifest.json ${PROFILE_FLAG} --content-type application/json
+ROOTFS_KEY="swarmclaw-rootfs-${VERSION}.ext4.gz"
+DATA_KEY="swarmclaw-data-template-${VERSION}.ext4.gz"
+MANIFEST_JSON=$(cat <<EOF
 {"version":"${VERSION}","rootfs":"${ROOTFS_KEY}","data_template":"${DATA_KEY}"}
 EOF
+)
 
 ROOTFS_SIZE=$(ls -lh ${ROOTFS_IMG}.gz | awk '{print $5}')
 DATA_SIZE=$(ls -lh ${DATA_IMG}.gz | awk '{print $5}')
-rm -f ${ROOTFS_IMG}.gz ${DATA_IMG}.gz
 
-echo ""
-echo "✓ rootfs ${VERSION} uploaded (${ROOTFS_SIZE})"
-echo "  s3://${BUCKET}/deployment/rootfs/${ROOTFS_KEY}"
-echo "✓ data template ${VERSION} uploaded (${DATA_SIZE})"
-echo "  s3://${BUCKET}/deployment/rootfs/${DATA_KEY}"
-echo "✓ manifest.json → ${VERSION}"
-
-# Refresh on active hosts
-if [ -n "${API_URL:-}" ] && [ -n "${API_KEY:-}" ]; then
+if [ "$HETZNER_LOCAL" = "1" ]; then
+  OUT_DIR="${LOCAL_OUTPUT_DIR:-/data/swarmclaw-firecracker/rootfs}"
+  INSTALL_DIR="${LOCAL_INSTALL_DIR:-/data/firecracker-assets}"
+  echo "=== Writing local Hetzner rootfs artifacts ==="
+  sudo mkdir -p "${OUT_DIR}" "${INSTALL_DIR}"
+  sudo cp ${ROOTFS_IMG}.gz "${OUT_DIR}/${ROOTFS_KEY}"
+  sudo cp ${DATA_IMG}.gz "${OUT_DIR}/${DATA_KEY}"
+  printf '%s\n' "${MANIFEST_JSON}" | sudo tee "${OUT_DIR}/manifest.json" >/dev/null
+  sudo sh -c "pigz -dc '${OUT_DIR}/${ROOTFS_KEY}' > '${INSTALL_DIR}/swarmclaw-rootfs.ext4'"
+  sudo sh -c "pigz -dc '${OUT_DIR}/${DATA_KEY}' > '${INSTALL_DIR}/swarmclaw-data-template.ext4'"
+  sudo fallocate --dig-holes "${INSTALL_DIR}/swarmclaw-data-template.ext4" || true
+  sudo chown -R root:root "${OUT_DIR}" "${INSTALL_DIR}"
+  rm -f ${ROOTFS_IMG}.gz ${DATA_IMG}.gz
   echo ""
-  echo "→ Refreshing assets on active hosts..."
-  curl -s -X POST "${API_URL}hosts/refresh-rootfs" -H "x-api-key: ${API_KEY}" | python3 -m json.tool
+  echo "✓ rootfs ${VERSION} written (${ROOTFS_SIZE})"
+  echo "  ${OUT_DIR}/${ROOTFS_KEY}"
+  echo "✓ data template ${VERSION} written (${DATA_SIZE})"
+  echo "  ${OUT_DIR}/${DATA_KEY}"
+  echo "✓ installed active images into ${INSTALL_DIR}"
+elif [ -n "${BUCKET}" ]; then
+  echo "=== Uploading to S3 ==="
+  PROFILE_FLAG="${PROFILE:+--profile ${PROFILE}}"
+  aws s3 cp ${ROOTFS_IMG}.gz s3://${BUCKET}/deployment/rootfs/${ROOTFS_KEY} ${PROFILE_FLAG}
+  aws s3 cp ${DATA_IMG}.gz s3://${BUCKET}/deployment/rootfs/${DATA_KEY} ${PROFILE_FLAG}
+  printf '%s\n' "${MANIFEST_JSON}" | aws s3 cp - s3://${BUCKET}/deployment/rootfs/manifest.json ${PROFILE_FLAG} --content-type application/json
+  rm -f ${ROOTFS_IMG}.gz ${DATA_IMG}.gz
+  echo ""
+  echo "✓ rootfs ${VERSION} uploaded (${ROOTFS_SIZE})"
+  echo "  s3://${BUCKET}/deployment/rootfs/${ROOTFS_KEY}"
+  echo "✓ data template ${VERSION} uploaded (${DATA_SIZE})"
+  echo "  s3://${BUCKET}/deployment/rootfs/${DATA_KEY}"
+  echo "✓ manifest.json → ${VERSION}"
+  # Refresh on active hosts
+  if [ -n "${API_URL:-}" ] && [ -n "${API_KEY:-}" ]; then
+    echo ""
+    echo "→ Refreshing assets on active hosts..."
+    curl -s -X POST "${API_URL}hosts/refresh-rootfs" -H "x-api-key: ${API_KEY}" | python3 -m json.tool
+  fi
+else
+  echo "❌ ASSETS_BUCKET is empty; cannot upload AWS rootfs artifacts."
+  exit 1
 fi

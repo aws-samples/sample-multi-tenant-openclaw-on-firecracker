@@ -218,6 +218,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 "VM_DEFAULT_MEM": str(CFG["vm"]["default_mem_mb"]),
                 "VM_DATA_DISK_MB": str(CFG["vm"]["data_disk_mb"]),
                 "VM_PORT_BASE": str(CFG["vm"]["gateway_port_base"]),
+                "VM_APP_PORT": str(CFG["vm"].get("app_port", CFG.get("health_check", {}).get("app_port", 3456))),
                 "VM_SUBNET_PREFIX": CFG["vm"]["subnet_prefix"],
                 "ASG_NAME": "openclaw-hosts-asg",
                 "BACKUP_PREFIX": CFG["s3"]["backup_prefix"],
@@ -738,6 +739,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
         init_sh = init_sh.replace("{{AVAIL_MEM}}", str(_avail_mem))
         init_sh = init_sh.replace("{{SUBNET_PREFIX}}", CFG["vm"]["subnet_prefix"])
         init_sh = init_sh.replace("{{ROOTFS_OVERLAY_MB}}", str(CFG["vm"].get("rootfs_overlay_mb", 8192)))
+        init_sh = init_sh.replace("{{VM_APP_PORT}}", str(CFG["vm"].get("app_port", CFG.get("health_check", {}).get("app_port", 3456))))
         init_sh = init_sh.replace("{{AGENTCORE_GATEWAY_URL}}", gateway_url if gateway_url else "none")
         init_sh = init_sh.replace("{{AMP_REMOTE_WRITE_URL}}", amp_remote_write_url)
         # Balloon config

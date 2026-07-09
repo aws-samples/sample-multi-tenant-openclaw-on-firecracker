@@ -1,120 +1,94 @@
-# SwarmClaw Firecracker Pool for Hetzner
+# XoomAI SwarmClaw Tenant Host for Hetzner
 
-Run isolated, multi-tenant SwarmClaw instances on a single Ubuntu host using Firecracker microVMs.
+Run multi-tenant SwarmClaw instances on an Ubuntu Hetzner host without managed cloud services.
 
-This fork is aimed at Hetzner dedicated/root/bare-metal servers. It does not depend on a managed cloud control plane: tenant state, rootfs assets, backups, lifecycle operations, and routing all live on the host.
+This fork is for a XoomAI Enterprise OS deployment where one tenant can run many agents across multiple harnesses, departments, MCP servers, and external connections. The target runtime is a local Ubuntu control plane with tenant-scoped workspaces, nginx routing, local state, and direct lifecycle automation.
 
 ## What This Is
 
-- One tenant maps to one Firecracker microVM.
-- Each tenant runs its own SwarmClaw server.
-- One tenant can host many SwarmClaw agents across many providers and harnesses.
-- Tenant disks live under `/data/firecracker-vms`.
-- Tenant dashboards are exposed through host nginx at `/vm/<tenant-id>/`.
+- One tenant maps to one isolated tenant workspace.
+- Each tenant can run its own SwarmClaw instance.
+- One tenant can host many agents across many harnesses.
+- Tenant state lives on the host under `/data/xoomai-swarmclaw`.
+- Tenant apps are exposed through nginx tenant routes.
 - The local control plane is a Python systemd service with JSON state.
 
-## Host Requirement
-
-Firecracker requires KVM. Your host must expose:
-
-```bash
-test -e /dev/kvm && echo ok
-```
-
-Hetzner Cloud VPS instances do not expose nested virtualization. Use a Hetzner dedicated/root/bare-metal server, or another Ubuntu host with `/dev/kvm`.
-
-## Architecture
+## Target Architecture
 
 ```text
-Operator
+Operator / XoomAI Enterprise OS
   |
-  |  x-api-key
+  |  local API key
   v
-Local API :8080
+Local Control API :8080
   |
-  | direct subprocess calls
+  | direct lifecycle automation
   v
-Firecracker host scripts
+Tenant runtime manager
   |
-  +-- /data/firecracker-vms/<tenant-id>/
-  |     +-- data.ext4
-  |     +-- overlay.ext4
-  |     +-- access-key
-  |
-  +-- tap-vmN -> tenant guest 172.16.N.2
+  +-- /data/xoomai-swarmclaw/tenants/<tenant-id>/
+  |     +-- workspace
+  |     +-- env
+  |     +-- state
   |
   v
-Tenant microVM
-  |
-  v
-SwarmClaw :3456
+SwarmClaw tenant runtime :3456
 
-nginx :80
+nginx :80/:443
   |
-  +-- /vm/<tenant-id>/ -> http://172.16.N.2:3456/
+  +-- tenant route -> SwarmClaw tenant runtime
 ```
 
-## What Replaces The Managed Cloud Pieces
+## Host Requirements
 
-| Previous role | This fork |
-|---|---|
-| Remote API functions | `swarmclaw-firecracker-api.service` |
-| Managed database | `/data/swarmclaw-firecracker/state/tenants.json` |
-| Object storage for assets | `/data/swarmclaw-firecracker/rootfs` and `/data/firecracker-assets` |
-| Object storage for backups | `/data/swarmclaw-firecracker/backups` |
-| Remote command runner | Direct local subprocess calls |
-| Load balancer / CDN | Host nginx |
-| Managed auth | Local API key at `/etc/swarmclaw-firecracker/api-key` |
+- Ubuntu 22.04 or 24.04
+- Root or sudo access
+- nginx
+- Python 3.11+
+- Node.js 20+
+- A process/container runtime for tenant workloads
+- Firewall rules that expose only the intended public ports
 
 ## Quick Start
 
 On the Ubuntu host:
 
 ```bash
-git clone https://github.com/XoomCloud/multi-tenant-openclaw-on-firecracker.git
-cd multi-tenant-openclaw-on-firecracker
+git clone <your-fork-url>
+cd <repo-dir>
 git checkout swarmclaw-hetzner-backend
 ```
 
-Install the local control plane and build the SwarmClaw rootfs:
+Install the local control plane:
 
 ```bash
-sudo scripts/hetzner/install.sh \
-  --kernel-path /path/to/firecracker-compatible-vmlinux \
-  --build-rootfs \
-  --version v1.0
+sudo scripts/hetzner/install.sh
 ```
 
-If you already placed a compatible kernel at `/data/firecracker-assets/vmlinux`, you can use:
+The installer should provision:
 
-```bash
-sudo scripts/hetzner/install.sh --skip-kernel --build-rootfs --version v1.0
-```
-
-The installer intentionally does not download a kernel from a cloud-provider bucket. Provide a local kernel with `--kernel-path`, a non-provider URL with `--kernel-url`, or pre-place `/data/firecracker-assets/vmlinux`.
+- `/opt/xoomai-swarmclaw` for control-plane code
+- `/etc/xoomai-swarmclaw/api-key` for local API auth
+- `/data/xoomai-swarmclaw` for tenant state, templates, and backups
+- `xoomai-swarmclaw-api.service` for the local API
+- nginx tenant routing
 
 ## Create A Tenant
 
 ```bash
-API_KEY="$(sudo cat /etc/swarmclaw-firecracker/api-key)"
+API_KEY="$(sudo cat /etc/xoomai-swarmclaw/api-key)"
 
 curl -s -X POST http://127.0.0.1:8080/tenants \
   -H "x-api-key: ${API_KEY}" \
   -H "content-type: application/json" \
-  -d '{"name":"demo","vcpu":2,"mem_mb":4096}' | jq .
+  -d '{"name":"demo","cpu":2,"memory_mb":4096}' | jq .
 ```
 
-The response includes:
+The response should include:
 
 - `id`: tenant id
 - `dashboard_url`: nginx route for the tenant
-- `access_key`: generated SwarmClaw API/access key for that tenant
-
-Open:
-
-```text
-http://<host>/vm/<tenant-id>/
-```
+- `access_key`: generated SwarmClaw access key for that tenant
 
 ## Tenant Operations
 
@@ -154,26 +128,10 @@ curl -s -X POST http://127.0.0.1:8080/tenants/<id>/clone \
   -d '{"name":"demo-clone"}' | jq .
 ```
 
-Resize the tenant data disk:
-
-```bash
-curl -s -X POST http://127.0.0.1:8080/tenants/<id>/resize-disk \
-  -H "x-api-key: ${API_KEY}" \
-  -H "content-type: application/json" \
-  -d '{"data_disk_mb":16384}' | jq .
-```
-
 Delete a tenant:
 
 ```bash
 curl -s -X DELETE http://127.0.0.1:8080/tenants/<id> \
-  -H "x-api-key: ${API_KEY}" | jq .
-```
-
-Preserve the tenant disk directory:
-
-```bash
-curl -s -X DELETE "http://127.0.0.1:8080/tenants/<id>?keep_data=true" \
   -H "x-api-key: ${API_KEY}" | jq .
 ```
 
@@ -182,14 +140,14 @@ curl -s -X DELETE "http://127.0.0.1:8080/tenants/<id>?keep_data=true" \
 Tenant `config_template` names map to local environment templates:
 
 ```text
-/data/swarmclaw-firecracker/templates/<template-name>/.env.local
+/data/xoomai-swarmclaw/templates/<template-name>/.env.local
 ```
 
 Example:
 
 ```bash
-sudo mkdir -p /data/swarmclaw-firecracker/templates/openrouter
-sudo tee /data/swarmclaw-firecracker/templates/openrouter/.env.local >/dev/null <<'EOF'
+sudo mkdir -p /data/xoomai-swarmclaw/templates/openrouter
+sudo tee /data/xoomai-swarmclaw/templates/openrouter/.env.local >/dev/null <<'EOF'
 OPENROUTER_API_KEY=replace-me
 EOF
 ```
@@ -200,7 +158,7 @@ Create a tenant with that template:
 curl -s -X POST http://127.0.0.1:8080/tenants \
   -H "x-api-key: ${API_KEY}" \
   -H "content-type: application/json" \
-  -d '{"name":"research","config_template":"openrouter","vcpu":2,"mem_mb":4096}' | jq .
+  -d '{"name":"research","config_template":"openrouter","cpu":2,"memory_mb":4096}' | jq .
 ```
 
 Generated tenant values are appended after the template:
@@ -217,47 +175,33 @@ Generated tenant values are appended after the template:
 
 | Path | Purpose |
 |---|---|
-| `/etc/swarmclaw-firecracker/api-key` | Local API key |
-| `/etc/swarmclaw-firecracker/env` | systemd environment for the local API |
-| `/data/firecracker-assets` | Active kernel/rootfs/data template |
-| `/data/firecracker-vms` | Tenant VM disks and metadata |
-| `/data/swarmclaw-firecracker/state/tenants.json` | Local tenant database |
-| `/data/swarmclaw-firecracker/backups` | Local compressed tenant backups |
-| `/data/swarmclaw-firecracker/templates` | SwarmClaw env templates |
-| `/opt/swarmclaw-firecracker` | Local API and host scripts |
+| `/etc/xoomai-swarmclaw/api-key` | Local API key |
+| `/etc/xoomai-swarmclaw/env` | systemd environment for the local API |
+| `/data/xoomai-swarmclaw/state/tenants.json` | Local tenant database |
+| `/data/xoomai-swarmclaw/backups` | Local tenant backups |
+| `/data/xoomai-swarmclaw/templates` | SwarmClaw env templates |
+| `/opt/xoomai-swarmclaw` | Local API and host scripts |
 
 ## Services
 
 ```bash
-sudo systemctl status swarmclaw-firecracker-api
-sudo journalctl -u swarmclaw-firecracker-api -f
-sudo systemctl restart swarmclaw-firecracker-api
+sudo systemctl status xoomai-swarmclaw-api
+sudo journalctl -u xoomai-swarmclaw-api -f
+sudo systemctl restart xoomai-swarmclaw-api
 sudo systemctl restart nginx
-```
-
-## Build Rootfs Later
-
-```bash
-sudo HETZNER_LOCAL=1 \
-  LOCAL_OUTPUT_DIR=/data/swarmclaw-firecracker/rootfs \
-  LOCAL_INSTALL_DIR=/data/firecracker-assets \
-  ./build-rootfs.sh v1.0
-
-sudo systemctl restart swarmclaw-firecracker-api
 ```
 
 ## Security Notes
 
 - Put the local API behind a firewall or private network.
-- Rotate `/etc/swarmclaw-firecracker/api-key` if it leaks.
+- Rotate `/etc/xoomai-swarmclaw/api-key` if it leaks.
 - Do not expose tenant dashboards publicly unless you understand the SwarmClaw access model.
-- Backups are local files. Copy `/data/swarmclaw-firecracker/backups` off-host if you need disaster recovery.
+- Backups are local files. Copy `/data/xoomai-swarmclaw/backups` off-host if you need disaster recovery.
 - This is a single-host backend. There is no multi-host failover or autoscaling in this fork.
 
 ## More Docs
 
 - [Hetzner Ubuntu install guide](docs/HETZNER-UBUNTU.md)
-- [SwarmClaw Firecracker runtime notes](docs/SWARMCLAW-FIRECRACKER.md)
 
 ## License
 

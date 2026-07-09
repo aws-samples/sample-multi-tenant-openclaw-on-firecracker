@@ -1,0 +1,49 @@
+<!--
+  OpenClaw on Firecracker — Wazuh 自定义规则(10h-goal #20).
+  把 microVM in-guest 的 auditd + openclaw-fim.sh 告警映射成 Wazuh rule.id + 等级,
+  与镜像里实测命中的规则号对齐(reverse-shell 100210 / 敏感身份文件改 100110)。
+  挂载进 manager: ./wazuh-rules → /var/ossec/etc/rules/local_rules.d (compose 已配)。
+  等级约定: 12+ = 高危需即时告警(对接 SNS/PagerDuty)。
+-->
+<group name="openclaw,firecracker,">
+
+  <!-- in-guest FIM: 受保护身份文件(SOUL/AGENTS/TOOLS/openclaw.json 等)被改 -->
+  <rule id="100110" level="12">
+    <decoded_as>auditd</decoded_as>
+    <field name="audit.key">claw_fim_identity</field>
+    <description>OpenClaw: 受保护身份/配置文件被修改(只读黄金镜像盘应拒写,触发=异常)</description>
+    <group>gdpr_IV_35.7.d,pci_dss_11.5,hipaa_164.312.c.1,</group>
+  </rule>
+
+  <!-- in-guest FIM: skill 目录被改(skill 应只读) -->
+  <rule id="100111" level="10">
+    <decoded_as>auditd</decoded_as>
+    <field name="audit.key">claw_fim_skills</field>
+    <description>OpenClaw: skill 文件被修改(skill 应只读,运行时改写=异常)</description>
+  </rule>
+
+  <!-- in-guest auditd: reverse-shell / 可疑外连进程行为 -->
+  <rule id="100210" level="13">
+    <decoded_as>auditd</decoded_as>
+    <field name="audit.key">claw_reverse_shell</field>
+    <description>OpenClaw: 检测到 reverse-shell 特征进程行为(guest 内异常外连)</description>
+    <group>attack.t1059,attack.t1571,</group>
+  </rule>
+
+  <!-- in-guest auditd: 越权/提权尝试(sudo 到 root 之外的异常 setuid) -->
+  <rule id="100220" level="12">
+    <decoded_as>auditd</decoded_as>
+    <field name="audit.key">claw_privesc</field>
+    <description>OpenClaw: guest 内提权/异常 setuid 尝试</description>
+    <group>attack.t1548,</group>
+  </rule>
+
+  <!-- AWS GuardDuty Finding(经 SNS→SQS→integration 灌入)统一抬等级 -->
+  <rule id="100300" level="12">
+    <decoded_as>json</decoded_as>
+    <field name="aws.source">guardduty</field>
+    <description>AWS GuardDuty: 云层威胁检测 finding(VPC/DNS/EC2)</description>
+    <group>amazon,guardduty,</group>
+  </rule>
+
+</group>

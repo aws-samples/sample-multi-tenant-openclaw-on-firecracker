@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<!-- Swagger UI for docs/aws-guide/openapi.yaml — CONTROL-PLANE API Gateway (issue #133/#154).
+     可运行版:顶部授权面板设 API base URL(apiId+region)+ x-api-key + 可选 Cognito Bearer,
+     自动注入到每个 Try it out 请求。控制面接口需真实 API_URL + x-api-key 才能返回真实结果。
+     Serve locally:  python3 -m http.server 8899  →  http://localhost:8899/swagger.html
+     Pinned swagger-ui-dist 5.17.14 with SRI; no build step. -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OpenClaw on Firecracker — 控制面 API(可运行)</title>
+  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5.17.14/swagger-ui.css"
+        integrity="sha384-wxLW6kwyHktdDGr6Pv1zgm/VGJh99lfUbzSn6HNHBENZlCN7W602k9VkGdxuFvPn"
+        crossorigin="anonymous" />
+  <style>
+    html, body { margin: 0; padding: 0; background: #0d1117; }
+    .topbar { display: none; }
+    .swagger-ui .info { margin: 24px 0; }
+    #banner {
+      background: linear-gradient(135deg, #101728, #1a2440);
+      color: #e6edf3; padding: 18px 28px;
+      font: 600 18px/1.5 -apple-system, "PingFang SC", sans-serif;
+      border-bottom: 1px solid #263050;
+    }
+    #banner small { display: block; font-weight: 400; font-size: 13px; color: #8b98b8; margin-top: 3px; }
+    /* 授权面板 */
+    #authpanel {
+      background: #0f1522; border-bottom: 1px solid #263050; padding: 14px 28px;
+      font: 400 13.5px/1.5 -apple-system, "PingFang SC", sans-serif; color: #c7d2e8;
+    }
+    #authpanel h3 { margin: 0 0 8px; font-size: 14px; color: #e6edf3; font-weight: 700; }
+    #authpanel .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+    #authpanel label { font-size: 12px; color: #8b98b8; min-width: 92px; }
+    #authpanel input {
+      background: #0a0e17; color: #e8edf6; border: 1px solid #263050; border-radius: 7px;
+      padding: 8px 11px; font-size: 13px; font-family: ui-monospace, monospace; min-width: 260px; flex: 1;
+    }
+    #authpanel input:focus { outline: none; border-color: #38d5e0; }
+    #authpanel button {
+      background: linear-gradient(90deg, #ff6a2b, #ff8d3a); color: #1a0d05; font-weight: 700;
+      border: none; border-radius: 7px; padding: 8px 18px; cursor: pointer; font-family: inherit; font-size: 13px;
+    }
+    #authpanel button.ghost { background: none; color: #8b98b8; border: 1px solid #263050; }
+    #auth-state { font-size: 12.5px; margin-top: 6px; }
+    #auth-state.ok { color: #3ecf8e; } #auth-state.err { color: #ff5470; }
+    #auth-state code { background: #0a0e17; padding: 1px 6px; border-radius: 5px; color: #38d5e0; font-size: 11.5px; }
+    .hint { color: #8b98b8; font-size: 12px; margin: 2px 0 0; }
+  </style>
+</head>
+<body>
+  <div id="banner">
+    OpenClaw on Firecracker · 控制面 API Gateway 参考(可运行)
+    <small>这是 ClawPool 控制面 API(<code style="color:#38d5e0">execute-api.../v1</code>),外部平台/openclaw-register 对接的真接口。
+      设好下面的 API 地址 + x-api-key 后,下方接口的 Try it out 会真打你的部署环境。数据面 /hub/* 由 hub 服务提供(见 spec 内标注)。</small>
+  </div>
+
+  <div id="authpanel">
+    <h3>① 设置 API 地址 + 凭据(Try it out 会自动带上)</h3>
+    <div class="row">
+      <label>API Base URL</label>
+      <input id="ap-base" type="text" placeholder="https://&lt;apiId&gt;.execute-api.ap-southeast-1.amazonaws.com/v1" />
+    </div>
+    <div class="row">
+      <label>x-api-key</label>
+      <input id="ap-key" type="password" placeholder="控制面 usage-plan key(每个控制面调用必带)" autocomplete="off" />
+    </div>
+    <div class="row">
+      <label>Cognito Bearer</label>
+      <input id="ap-jwt" type="password" placeholder="可选:Cognito id_token(带 owner 归属/RBAC 的接口需要)" autocomplete="off" />
+      <button id="ap-apply">应用</button>
+      <button id="ap-clear" class="ghost">清除</button>
+    </div>
+    <div id="auth-state">未设置 — 控制面接口需 API 地址 + x-api-key 才能真跑(否则 403/连不上)。</div>
+    <p class="hint">凭据只存在本页内存(sessionStorage),注入到本页发出的请求;不上传别处。API 地址取自 CloudFormation 输出 ApiUrl;key 取自 <code>aws apigateway get-api-key --include-value</code>。</p>
+  </div>
+
+  <div id="swagger-ui"></div>
+  <script src="https://unpkg.com/swagger-ui-dist@5.17.14/swagger-ui-bundle.js"
+          integrity="sha384-wmyclcVGX/WhUkdkATwhaK1X1JtiNrr2EoYJ+diV3vj4v6OC5yCeSu+yW13SYJep"
+          crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/swagger-ui-dist@5.17.14/swagger-ui-standalone-preset.js"
+          integrity="sha384-2YH8WDRaj7V2OqU/trsmzSagmk/E2SutiCsGkdgoQwC9pNUJV1u/141DHB6jgs8t"
+          crossorigin="anonymous"></script>
+  <script>
+    var BASE = sessionStorage.getItem("cp_base") || "";
+    var KEY  = sessionStorage.getItem("cp_key")  || "";
+    var JWT  = sessionStorage.getItem("cp_jwt")  || "";
+
+    window.onload = function () {
+      window.ui = SwaggerUIBundle({
+        url: "openapi.yaml",
+        dom_id: "#swagger-ui",
+        deepLinking: true,
+        docExpansion: "list",
+        defaultModelsExpandDepth: 0,
+        presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],
+        layout: "BaseLayout",
+        tryItOutEnabled: true,
+        validatorUrl: null,
+        // 把凭据 + base URL 注入每个 Try it out 请求。
+        requestInterceptor: function (req) {
+          // 覆写 base URL:把 spec server 模板换成用户填的真实地址
+          if (BASE) {
+            try {
+              var u = new URL(req.url);
+              var path = u.pathname + u.search;
+              // spec 的 server 带 /v1,用户填的 BASE 也带 /v1 → 去掉 req 里重复的前缀段
+              var b = BASE.replace(/\/+$/, "");
+              // req.url 形如 https://your-api-id.execute-api.../v1/tenants → 取 /v1 之后
+              var m = req.url.match(/\/v1(\/.*)?$/);
+              req.url = m ? (b + (m[1] || "")) : (b + path);
+            } catch (e) { /* 保底不改 */ }
+          }
+          if (KEY && !req.headers["x-api-key"]) req.headers["x-api-key"] = KEY;
+          if (JWT && !req.headers["Authorization"] && !req.headers["authorization"])
+            req.headers["Authorization"] = "Bearer " + JWT;
+          return req;
+        },
+      });
+      restore();
+    };
+
+    function $(id) { return document.getElementById(id); }
+    function state() { return $("auth-state"); }
+    function restore() {
+      if (BASE) $("ap-base").value = BASE;
+      if (KEY) $("ap-key").value = KEY;
+      if (JWT) $("ap-jwt").value = JWT;
+      if (BASE || KEY) applyState();
+    }
+    function applyState() {
+      var s = state(); s.className = "ok";
+      s.innerHTML = "已应用 · Base=<code>" + (BASE || "(spec 默认)") + "</code>" +
+        (KEY ? " · x-api-key ✓" : " · <span style='color:#ff5470'>无 x-api-key(控制面会 403)</span>") +
+        (JWT ? " · Bearer ✓" : "");
+    }
+    $("ap-apply").onclick = function () {
+      BASE = $("ap-base").value.trim();
+      KEY = $("ap-key").value.trim();
+      JWT = $("ap-jwt").value.trim();
+      sessionStorage.setItem("cp_base", BASE);
+      sessionStorage.setItem("cp_key", KEY);
+      sessionStorage.setItem("cp_jwt", JWT);
+      applyState();
+    };
+    $("ap-clear").onclick = function () {
+      BASE = KEY = JWT = "";
+      sessionStorage.removeItem("cp_base");
+      sessionStorage.removeItem("cp_key");
+      sessionStorage.removeItem("cp_jwt");
+      $("ap-base").value = $("ap-key").value = $("ap-jwt").value = "";
+      state().className = ""; state().textContent = "已清除。";
+    };
+  </script>
+</body>
+</html>

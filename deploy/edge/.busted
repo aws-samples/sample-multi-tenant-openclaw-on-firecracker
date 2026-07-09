@@ -1,0 +1,17 @@
+-- deploy/edge/.busted — busted test runner config for the edge module.
+-- Run from deploy/edge/ with `busted` (no args) to pick this up.
+return {
+    _all = {
+        -- Add deploy/edge/ to lua path so `require "edge.lib.xxx"` and
+        -- `require "spec_helper"` resolve when specs run from repo root
+        -- or from deploy/edge/.
+        lpath = "?.lua;lib/?.lua;test/?.lua;../?.lua;../../?.lua",
+        pattern = "_spec",
+    },
+    default = {
+        ROOT = { "test/" },
+        output = "gtest",
+        verbose = true,
+        recursive = true,
+    },
+}

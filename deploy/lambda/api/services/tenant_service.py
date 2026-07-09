@@ -1,0 +1,2380 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+"""services/tenant_service — 租户 CRUD + 生命周期动作 + resize/access/backup 解析。
+
+handler-split #132 阶段2 —— 从 handler.py 逐字机械搬迁这 8 个函数,函数体零逻辑改动:
+  _validate_purchase · _redact_tenant · create_tenant · tenant_access_grant ·
+  delete_tenant · tenant_action · _resolve_backup · tenant_resize
+唯一的字面改动是把测试会重绑的 clients 符号、以及测试 patch 在核心模块上的依赖函数
+改成属性访问(`clients.X` / `scheduling.X` / …),见下方死结说明。
+
+依赖方向(import-layers 合法):services → core(clients/utils/auth/scheduling/vkey/
+ssm_dispatch/legacy_alb/skills/audit)+ services.lifecycle_dispatch(横向 services 允许)。
+不反向 import handler / routes / consumers / router。
+
+**属性访问解死结(scheduling/audit/lifecycle 域已验证的跨模块串染)**:
+测试用 `spec_from_file_location` 反复 exec handler,再对 handler 模块(`api`)重绑符号
+注入 fixture:① clients 值符号(`api.tenants_table = mock`、
+`patch.object(api, "LIFECYCLE_QUEUE_URL", ...)`、`api.CPU_OVERCOMMIT_RATIO = 1.0`)——
+若本模块 `from core.clients import tenants_table` 做值绑定,会持有原始对象、看不到
+测试重绑 → 测试红。故本模块所有 clients 符号一律走 `import core.clients as clients` +
+函数体内 `clients.tenants_table`,测试 patch `clients.X`(规范源)即全局生效。
+② 依赖函数(`_find_host`/`_launch_vm`/`_ssm_run`/`_get_caller_identity`/…):这 8 个
+函数原本在 handler 名字空间读裸名,测试 `patch.object(api, "_find_host", ...)` 才生效;
+搬到本模块后调用点在这里,若 `from core.scheduling import _find_host` 做值绑定,patch
+`api._find_host`(handler facade 的别名)看不到。故依赖函数也走模块属性访问
+`scheduling._find_host(...)`,测试改 patch 对应核心模块(`api._scheduling` 等,与 handler
+facade 指向同一模块对象)即可全局生效。
+"""
+
+import json
+import os
+import re
+import time
+import secrets
+
+import boto3
+from botocore.exceptions import ClientError
+
+import core.clients as clients
+import core.utils as utils
+import core.auth as auth
+import core.scheduling as scheduling
+import core.vkey as vkey
+import core.ssm_dispatch as ssm_dispatch
+
+# #187 转型:core.legacy_alb 全模块下线(数据面两级路由不再用 per-tenant ALB rule/TG)。
+import core.skills as skills
+import core.audit as audit
+import services.lifecycle_dispatch as lifecycle_dispatch
+
+# ── tenant 域私有常量(逐字搬自 handler.py 顶部;仅本域使用)──────────────────
+# issue #59 (WI-E/M-1) — config_template is caller-controlled and flows into an
+# SSM root shell command; its ONLY legitimate use is as an S3 path slug
+# (launch-vm.sh: s3://$ASSETS_BUCKET/templates/openclaw/${CONFIG_TEMPLATE}/openclaw.json),
+# so it must be a plain DNS-label. Reject anything with shell metacharacters,
+# whitespace, or path separators at the edge (defense in depth still quotes it
+# in _launch_vm). Empty == "no custom template" and is validated separately.
+_CONFIG_TEMPLATE_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$")
+
+# #93 idempotency key / #95 adversarial C-003/C-005/C-006 — client_token is a
+# caller-supplied idempotency key that flows into an SSM command and log lines.
+# Restrict to 4-128 printable ASCII (codepoints 33-126): no spaces, no control
+# chars (\n \t \x00), no non-ASCII. .isascii() alone lets control chars through.
+_CLIENT_TOKEN_RE = re.compile(r"^[\x21-\x7e]{4,128}$")
+
+# ── #106 下单/购买语义(商业闭环)──────────────────────────────────────────
+# 业务场景:用户在外部平台页面「下单购买一个 claw」。租户记录带三个购买维度字段
+# (全部 ADDITIVE + optional,不带 = 与 #106 前字节一致的行为,严格向后兼容):
+#   • order_id      外部平台订单号(计费/对账锚,#66/#68 spend 端点按它归集)。
+#   • plan_tier     套餐档(free/standard/pro/enterprise 之一,受控枚举防脏数据)。
+#   • purchase_status  两段式状态机:pending(下单意向已记,VM 未开通)→ provisioned
+#                   (已开通,业务可用)。对齐 AWS SaaS Factory 的下单→provisioning
+#                   状态机。注意这与 tenant.status(creating/running/stopped 生命周期)
+#                   正交:status 是「VM 活着没」,purchase_status 是「这笔生意到哪步」。
+# order_id 走 client_token 同款可打印 ASCII 校验(当前只落 DDB + 可能进 CloudWatch 日志行,
+# 若未来进 SSM 命令拼接则此校验已就位;纵深防御,防注入/日志投毒);plan_tier 受控枚举;
+# purchase_status 由服务端状态机管,不接受 create 直接塞任意值(只允许省略→默认 pending,或显式 pending)。
+# \Z 而非 $:Python 的 $ 在 re.match 下也匹配「末尾换行符之前」,`"ord\n"` 会被 $ 放行
+# (尾换行绕过校验,进日志/命令行做投毒)。\Z 只匹配字符串绝对末尾,堵掉这个注入面。
+_ORDER_ID_RE = re.compile(r"^[\x21-\x7e]{1,128}\Z")
+_PLAN_TIERS = ("free", "standard", "pro", "enterprise")
+_PURCHASE_PENDING = "pending"
+_PURCHASE_PROVISIONED = "provisioned"
+
+_TENANT_SECRET_FIELDS = (
+    "channel_secret",
+    "litellm_vkey",
+    "cognito_channel_password",  # WI-002 — machine-user password, never to browser
+    "gateway_token",  # #100 — per-tenant bearer protecting the gateway control UI;
+    # GET /tenants was leaking it in plaintext, letting one x-api-key harvest EVERY
+    # tenant's gateway_token (credential batch-exposure). Server-side only (see :1092).
+    "injected_credentials",  # #118/#116 — platform-injected credential ciphertext
+    # blobs; ciphertext (not plaintext), but still never echoed to any GET caller.
+)
+
+
+def _validate_purchase(body):
+    """校验 create body 里的购买字段,返回 (purchase_fields_dict, err_str)。
+
+    三个字段全 optional。任一存在即进入「下单」语义:purchase_status 记为 pending
+    (除非显式传 pending,不接受 create 直接塞 provisioned——开通只能走 provision
+    动作的服务端状态机,防止调用方一步到位跳过开通闸)。都不传则返回空 dict,
+    调用方一个购买字段都不写,行为与 #106 前完全一致。
+    """
+    fields = {}
+    order_id = body.get("order_id")
+    if order_id is not None:
+        if not isinstance(order_id, str) or not _ORDER_ID_RE.match(order_id):
+            return (
+                None,
+                "order_id must be 1-128 printable ASCII chars (no spaces/control chars)",
+            )
+        fields["order_id"] = order_id
+    plan_tier = body.get("plan_tier")
+    if plan_tier is not None:
+        if not isinstance(plan_tier, str) or plan_tier not in _PLAN_TIERS:
+            return None, f"plan_tier must be one of {list(_PLAN_TIERS)}"
+        fields["plan_tier"] = plan_tier
+    ps = body.get("purchase_status")
+    if ps is not None:
+        # create 只接受省略或显式 pending;provisioned/其它值一律拒(开通走 provision 动作)。
+        if ps != _PURCHASE_PENDING:
+            return None, (
+                f"purchase_status on create must be omitted or '{_PURCHASE_PENDING}' "
+                f"(use POST /tenants/{{id}}/provision to move pending→provisioned)"
+            )
+    # 任一购买字段存在 → 这是一笔下单,记 purchase_status=pending。
+    if fields or ps is not None:
+        fields["purchase_status"] = _PURCHASE_PENDING
+    return fields, None
+
+
+def _redact_tenant(item):
+    """Return a shallow copy of a tenant record with secret fields removed.
+    Defensive: callers pass DDB items straight to _resp, so this is the single
+    choke point that keeps credentials server-side."""
+    if not isinstance(item, dict):
+        return item
+    return {k: v for k, v in item.items() if k not in _TENANT_SECRET_FIELDS}
+
+
+# ── #187 P1 — pre-mint gateway token + reveal ──────
+# 建租户时预铸 32 字节随机 token,KMS 信封绑 tenant_id 加密,密文与 expires_at=now+900
+# 一起落 openclaw-tenant-secrets 表。SSM 命令把密文按位置 12 传给 launch-vm.sh;host
+# 用同一 tenant_id ctx 解密后写入 openclaw.json 的 `.gateway.auth.token`。
+#
+# **API 侧不解密**(2026-07-08 两次纠正):控制平面调用方
+# 建租户后本就在 loop 里轮询状态,一旦查到 running 就绪、就在 GET /tenants/{id} 的
+# 响应里带回 gateway_token **密文原样**(base64 信封密文);GET /tenants/{id}/token
+# 保留作等价别名,同样只返密文。**调用方自己拿 KMS Decrypt**(它有 kms:Decrypt +
+# 知道 EncryptionContext={"tenant_id":<id>})。好处:token 全程不以明文过线、不进
+# CloudTrail、不进 Lambda 日志。API Lambda 不需要 kms:Decrypt 权限。
+#
+# 不进 tenants 表(独立表隔离)——避免 _redact_tenant 需要新增字段;独立 TTL 让密文
+# 不能"永远拿"(过窗 410,客户自持)。
+import core.kms_envelope as kms_envelope  # noqa: E402  (关键路径依赖显式在这里 import,不与顶层 import 混)
+
+_GATEWAY_TOKEN_TTL_SEC = 900  # 15min 窗口:创建后到"客户拉走存本地"应该只算秒级
+_GATEWAY_TOKEN_BYTES = 32  # 32 字节 → 43 char base64url(比 hex 短、URL 安全)
+
+# #10 WSS 直连丝滑授权 —— 设备身份三件套(Ed25519)。控制面创建租户时铸一对
+# ed25519 keypair:公钥 + deviceId(=SHA256(公钥 raw 32B) hex,与 OpenClaw
+# device-identity.ts:143 deriveDeviceIdFromPublicKey 一致)冷注入镜像的
+# devices/paired.json(gateway 侧"已批准名单",免界面 approve);私钥 PEM 走
+# KMS 信封加密(EncryptionContext=owner_id,同 gateway_token 机制)存 tenant_secrets,
+# 由控制面 GET /tenants/{id} 折进就绪响应返回,调用方本地解密后签 WSS 握手帧。
+# scope 预授权到读写两档(default-deny,不给 operator.admin 全权)。
+_DEVICE_SCOPES_DEFAULT = ["operator.read", "operator.write"]
+
+
+def mint_gateway_token(tenant_id):
+    """Mint a per-tenant gateway token, envelope-encrypt with tenant_id EC, and
+    persist the ciphertext to the tenant_secrets table with a 15-min TTL. Returns
+    the base64 ciphertext (str) so the caller can pass it to _launch_vm (which
+    hands it to launch-vm.sh position 12; the host decrypts with the same EC).
+
+    Fail-loud on every branch — no half-minted state:
+      • CLAWPOOL_CMK_ARN unset → the feature is off (upstream forgot to enable
+        security.clawpool_cmk_enabled). RuntimeError, don't silently no-op.
+      • TENANT_SECRETS_TABLE unset → stack out-of-date (feature deployed
+        without the table). RuntimeError.
+      • KMS GenerateRandom / encrypt / DDB put_item raise → propagate; the
+        caller (create_tenant) rolls back the tenant put like the vkey/launch
+        failure paths do.
+    """
+    if not tenant_id:
+        raise ValueError("tenant_id is required")
+    if not clients.CLAWPOOL_CMK_ARN:
+        raise RuntimeError(
+            "gateway token mint requires CLAWPOOL_CMK_ARN "
+            "(security.clawpool_cmk_enabled=true in config)"
+        )
+    if clients.tenant_secrets_table is None:
+        raise RuntimeError(
+            "gateway token mint requires TENANT_SECRETS_TABLE "
+            "(openclaw-tenant-secrets DDB table not deployed)"
+        )
+    # KMS GenerateRandom is a FIPS-validated CSPRNG on the KMS HSM — stronger than
+    # secrets.token_bytes for a token that grants control-plane authority. Its
+    # cost is one KMS call per create, negligible next to the encrypt/put below.
+    rnd = clients.kms.generate_random(NumberOfBytes=_GATEWAY_TOKEN_BYTES)["Plaintext"]
+    # base64url without padding → URL-safe + shorter than hex; the host writes it
+    # as-is into openclaw.json .gateway.auth.token (opaque bearer token to gateway).
+    import base64 as _b64
+
+    token_plaintext = _b64.urlsafe_b64encode(rnd).rstrip(b"=").decode()
+    ciphertext = kms_envelope.encrypt_with_tenant(
+        token_plaintext, tenant_id, clients.CLAWPOOL_CMK_ARN
+    )
+    expires_at = int(time.time()) + _GATEWAY_TOKEN_TTL_SEC
+    # #10 fix(对称):用 update_item SET merge,不用 put_item。gateway token 与 device
+    # 身份共用同一 tenant_secrets 行(主键 tenant_id),无论谁先写,put_item 整条替换都会
+    # 抹掉对方的字段。两侧都改 update_item 才真共存(reviewer 抓 device 侧覆盖 gateway,
+    # 反序测试又暴露 gateway 侧同样会覆盖 device)。`expires_at` 是表 TTL 属性。
+    clients.tenant_secrets_table.update_item(
+        Key={"tenant_id": tenant_id},
+        UpdateExpression=(
+            "SET gateway_token_ct = :ct, expires_at = :ea, created_at = :ca"
+        ),
+        ExpressionAttributeValues={
+            ":ct": ciphertext,
+            ":ea": expires_at,
+            ":ca": utils._now(),
+        },
+    )
+    return ciphertext
+
+
+def _derive_device_id(public_raw: bytes) -> str:
+    """deviceId = SHA256(公钥 raw 32B) hex —— 与 OpenClaw device-identity.ts:148
+    deriveDeviceIdFromPublicKey 一致(gateway 握手时反推校验 id==derive(publicKey))。"""
+    import hashlib
+
+    return hashlib.sha256(public_raw).hexdigest()
+
+
+def mint_device_identity(tenant_id, owner_id, scopes=None):
+    """#10 — 铸一对 ed25519 设备身份,私钥 KMS 信封加密(EncryptionContext=owner_id,
+    同 injected_credentials/vkey 机制)存 tenant_secrets,返回冷注入 + 返回给调用方所需的
+    四元组。fail-loud 与 mint_gateway_token 一致(半铸态即回滚)。
+
+    返回 dict:
+      device_id      — SHA256(公钥) hex,注入 paired.json + 明文返回调用方
+      public_key     — 公钥 raw 32B 的 base64url,注入 paired.json + 明文返回
+      private_key_ct — 私钥 PKCS8 PEM 的 KMS 密文(base64),存 DDB + 返回调用方(本地解密签名)
+      scopes         — 预授权 scope(default-deny 读写两档)
+
+    owner_id 必须存在(EncryptionContext 绑定);api-key 建租户但 owner_id 未定(停在
+    sentinel)时不铸(返回 None)——设备身份属某个 end user,无 owner 无从绑。
+    """
+    if not owner_id or owner_id == clients.API_KEY_OWNER:
+        return None
+    if not clients.CLAWPOOL_CMK_ARN:
+        raise RuntimeError(
+            "device identity mint requires CLAWPOOL_CMK_ARN "
+            "(security.clawpool_cmk_enabled=true in config)"
+        )
+    if clients.tenant_secrets_table is None:
+        raise RuntimeError(
+            "device identity mint requires TENANT_SECRETS_TABLE "
+            "(openclaw-tenant-secrets DDB table not deployed)"
+        )
+    import base64 as _b64
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+
+    priv = ed25519.Ed25519PrivateKey.generate()
+    pub_raw = priv.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    priv_pem = priv.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+    device_id = _derive_device_id(pub_raw)
+    public_key_b64u = _b64.urlsafe_b64encode(pub_raw).rstrip(b"=").decode()
+    scopes = list(scopes) if scopes else list(_DEVICE_SCOPES_DEFAULT)
+    private_key_ct = kms_envelope.encrypt(priv_pem, owner_id, clients.CLAWPOOL_CMK_ARN)
+    expires_at = int(time.time()) + _GATEWAY_TOKEN_TTL_SEC
+    # #10 fix(reviewer CONFIRMED): 用 update_item SET merge,不用 put_item。
+    # gateway token 和 device 身份共用同一 tenant_secrets 行(主键 tenant_id),
+    # put_item 是整条替换 → 会把先写的 gateway_token_ct/expires_at 抹掉(reveal 410、
+    # TTL 属性 expires_at 丢失致私钥密文永不清扫)。update_item 只加/改 device_* 字段,
+    # gateway token 字段原样保留。字段名故意分开(expires_at vs device_expires_at)就是为共存。
+    clients.tenant_secrets_table.update_item(
+        Key={"tenant_id": tenant_id},
+        UpdateExpression=(
+            "SET device_id = :did, device_public_key = :pk, "
+            "device_private_key_ct = :ct, device_scopes = :sc, "
+            "device_expires_at = :de, device_created_at = :dc"
+        ),
+        ExpressionAttributeValues={
+            ":did": device_id,
+            ":pk": public_key_b64u,
+            ":ct": private_key_ct,
+            ":sc": scopes,
+            ":de": expires_at,
+            ":dc": utils._now(),
+        },
+    )
+    return {
+        "device_id": device_id,
+        "public_key": public_key_b64u,
+        "private_key_ct": private_key_ct,
+        "scopes": scopes,
+    }
+
+
+def build_paired_json_b64(device):
+    """#188 — 把 mint_device_identity 的返回 dict 组装成 launch-vm 冷注入用的
+    paired.json base64。paired.json 是 gateway 侧"已批准设备名单",首连命中即免人工
+    approve(INJECTION-SPEC-2026.2.26.md,真机验证)。
+
+    2026.2.26(协议 v3)配对门只看 `roles` 含请求角色 + publicKey 匹配,`tokens`
+    可留空对象——比 6.11 简单(6.11 要 tokens[role] 预铸活跃 token)。故这里只放
+    deviceId/publicKey(raw base64url,非 PEM)/role/roles/scopes/tokens:{}/时间戳。
+
+    device 为 None(owner 未知 / CMK 关 → mint 返 None)→ 返回 "",launch-vm 侧
+    读空跳过写盘(feature-off 字节兼容)。返回单 device 的 paired.json 全量对象的
+    base64(launch-vm base64 -d 后直接当 paired.json 内容)。
+    """
+    if not device or not device.get("device_id") or not device.get("public_key"):
+        return ""
+    import base64 as _b64
+
+    device_id = device["device_id"]
+    scopes = list(device.get("scopes") or _DEVICE_SCOPES_DEFAULT)
+    now_ms = int(time.time() * 1000)
+    # role 固定 operator(2.26 配对门只校 roles 含请求角色;scopes 已 default-deny
+    # 收窄到读写两档,不给 operator.admin 全权)。
+    paired = {
+        device_id: {
+            "deviceId": device_id,
+            "publicKey": device["public_key"],
+            "role": "operator",
+            "roles": ["operator"],
+            "scopes": scopes,
+            "tokens": {},
+            "createdAtMs": now_ms,
+            "approvedAtMs": now_ms,
+        }
+    }
+    return _b64.b64encode(json.dumps(paired).encode()).decode()
+
+
+def read_gateway_token_ct(tenant_id):
+    """Helper for GET /tenants/{id} (handler.get_tenant): if a valid ciphertext
+    row exists inside the TTL window, return the base64 ciphertext string; else
+    return None. Silent (no error responses) — the caller decides how to shape
+    the response and whether to include the field.
+
+    Returns None on: feature-off / no row / expired. Never raises.
+    """
+    if clients.tenant_secrets_table is None:
+        return None
+    try:
+        row = clients.tenant_secrets_table.get_item(
+            Key={"tenant_id": tenant_id}, ConsistentRead=True
+        ).get("Item")
+    except Exception:
+        # Fold-into-poll must not break the tenant read; on a transient error
+        # the field is simply omitted and the caller re-polls GET /tenants/{id}.
+        return None
+    if not row:
+        return None
+    if int(row.get("expires_at", 0)) <= int(time.time()):
+        return None
+    return row["gateway_token_ct"]
+
+
+def read_device_identity(tenant_id):
+    """#10 — Helper for GET /tenants/{id}: 返回 WSS 设备三件套(供调用方本地签握手),
+    TTL 窗口内有 device 行才返回,否则 None。Silent(不抛)——与 read_gateway_token_ct
+    同款 fold-into-poll 语义。
+
+    返回 dict {device_id, public_key(明文), private_key(KMS 密文), scopes} 或 None。
+    device_expires_at 独立于 gateway token 的 expires_at(同表不同字段)。
+    """
+    if clients.tenant_secrets_table is None:
+        return None
+    try:
+        row = clients.tenant_secrets_table.get_item(
+            Key={"tenant_id": tenant_id}, ConsistentRead=True
+        ).get("Item")
+    except Exception:
+        return None
+    if not row or not row.get("device_id"):
+        return None
+    if int(row.get("device_expires_at", 0)) <= int(time.time()):
+        return None
+    return {
+        "device_id": row["device_id"],
+        "public_key": row["device_public_key"],
+        "private_key": row["device_private_key_ct"],
+        "scopes": row.get("device_scopes", []),
+    }
+
+
+def _cleanup_gateway_token_secret(tenant_id):
+    """Best-effort remove the secrets-table row on delete_tenant. Failures don't
+    block the delete: TTL sweeps the row within minutes anyway; this just closes
+    the window immediately when the caller says the tenant is gone."""
+    if clients.tenant_secrets_table is None:
+        return
+    try:
+        clients.tenant_secrets_table.delete_item(Key={"tenant_id": tenant_id})
+    except Exception as e:  # noqa: BLE001 — best-effort cleanup, TTL is the guarantee
+        print(f"[#187] tenant_secrets delete_item best-effort failed: {e}")
+
+
+def _attribution_override(body, event):
+    """#143 — resolve the create-on-behalf attribution override from the body.
+
+    The api-key path is an external platform's backend (trusted automation, no
+    per-user Bearer), so it may state WHICH end user the tenant belongs to:
+      • body.owner_id — the end user's Cognito sub (UUID; every owner check and
+        the chat UI compare owner_id == sub, so any other shape could never
+        match a real caller). Without it the record parks at the API_KEY_OWNER
+        sentinel and the end user can never see their node (evidence
+        Q2-OWNER-E2E-2026-07-06).
+      • body.tenant_user_id — the platform's OWN stable user id (NOT a Cognito
+        sub — attributes end users that never touch our Cognito, #13/#14).
+
+    Security contract:
+      • Bearer callers NEVER get the override: owner derives from the verified
+        token, otherwise user A could create/claim a node in B's name. Reject
+        loud (403), don't silently strip — a misconfigured client must notice.
+        create_tenant_self additionally strips these fields (defense in depth).
+      • Under EXTERNAL_AUTHZ authority is the signed /external/authz endpoint,
+        not the creator — owner_id override is refused loud (403) instead of
+        being silently parked at the sentinel.
+      • Values are validated at the edge (anti injection / log poisoning).
+      • The SQS replay path re-runs this with _consumer_ident (api_key_only
+        carried) and the body snapshot carries the override → same result.
+
+    Returns (owner_id | None, tenant_user_id | None, error_resp | None).
+    """
+    body_owner_id = body.get("owner_id")
+    body_tenant_user_id = body.get("tenant_user_id")
+    if body_owner_id is None and body_tenant_user_id is None:
+        return None, None, None
+    if not auth._get_caller_identity(event or {}).get("api_key_only"):
+        return (
+            None,
+            None,
+            utils._err(
+                403,
+                "FORBIDDEN",
+                "owner_id/tenant_user_id in body is allowed only for the "
+                "api-key (create-on-behalf) path",
+            ),
+        )
+    if body_owner_id is not None:
+        if clients.EXTERNAL_AUTHZ:
+            return (
+                None,
+                None,
+                utils._err(
+                    403,
+                    "FORBIDDEN",
+                    "tenant authority is external: owner_id cannot be set at "
+                    "create — grant access via POST /external/authz",
+                ),
+            )
+        if not isinstance(body_owner_id, str) or not utils._COGNITO_SUB_RE.match(
+            body_owner_id
+        ):
+            return (
+                None,
+                None,
+                utils._err(400, "VALIDATION", "owner_id must be a Cognito sub (UUID)"),
+            )
+    if body_tenant_user_id is not None:
+        if not isinstance(
+            body_tenant_user_id, str
+        ) or not utils._TENANT_USER_ID_RE.match(body_tenant_user_id):
+            return (
+                None,
+                None,
+                utils._err(
+                    400,
+                    "VALIDATION",
+                    "tenant_user_id must be 1-128 printable ASCII chars "
+                    "(no spaces/control chars)",
+                ),
+            )
+    return body_owner_id, body_tenant_user_id, None
+
+
+def create_tenant(body=None, event=None):
+    if body is None:
+        return utils._resp(400, {"error": "missing body"})
+    # 坏 JSON → 400 不 500;合法但非对象(list/数字)→ 400(否则下面 body.get / 各处
+    # 取值抛 AttributeError → 顶层 catch 500 泄内部错)。边界输入严校验。
+    try:
+        body = json.loads(body) if isinstance(body, str) else body
+    except (ValueError, TypeError):
+        return utils._resp(400, {"error": "invalid json"})
+    if not isinstance(body, dict):
+        return utils._resp(400, {"error": "body must be a JSON object"})
+
+    # issue #80 — stamp the creator's identity so future per-tenant routes can
+    # enforce owner==caller. Cognito `sub` for logged-in users, API_KEY_OWNER
+    # for the API-key path. None only if a Bearer token was present but failed
+    # verification — RBAC would already have rejected such a write.
+    owner_id = auth._get_caller_identity(event or {})["owner_id"]
+    # task #13/#14 — capture the external stable id for OIDC-federated callers so
+    # the tenant is attributable to the external user (identity chain). None for
+    # native Cognito / API-key callers, in which case the field is not stored.
+    tenant_user_id = auth._get_caller_identity(event or {}).get("tenant_user_id")
+    # #143 — create-on-behalf attribution override (路 A), api-key callers only.
+    # See _attribution_override for the security contract. Loud errors (403/400)
+    # propagate; a returned value replaces the identity-derived default.
+    _ovr_owner, _ovr_tuid, _ovr_err = _attribution_override(body, event)
+    if _ovr_err is not None:
+        return _ovr_err
+    if _ovr_owner is not None:
+        owner_id = _ovr_owner
+    if _ovr_tuid is not None:
+        tenant_user_id = _ovr_tuid
+    # #106 — external-platform attribution. Precedence:
+    #   1. body.platform_id — explicit, used by the "交易平台后端代开" path where the
+    #      platform's server (API-key auth, no per-user Cognito token) creates a
+    #      tenant on behalf of one of its users and states which platform it is.
+    #   2. custom:platform_id claim — for the federated-user path (pretokengen
+    #      injected it, resolved once in _get_caller_identity — no extra verify).
+    # Body override is validated (caller-controlled input → _PLATFORM_ID_RE); the
+    # claim value is already Cognito-controlled. Stored only when present, so
+    # native / non-platform tenants keep byte-identical records to before #106.
+    platform_id = auth._get_caller_identity(event or {}).get("platform_id")
+    body_platform_id = body.get("platform_id")
+    if body_platform_id is not None:
+        if not isinstance(body_platform_id, str) or not utils._PLATFORM_ID_RE.match(
+            body_platform_id
+        ):
+            return utils._err(
+                400,
+                "VALIDATION",
+                "platform_id must be 1-128 chars [a-zA-Z0-9._-]",
+            )
+        platform_id = body_platform_id
+    # #108 — a platform-scoped API key can ONLY create tenants inside its own
+    # platform namespace. The authorizer-injected scope wins over both body and
+    # claim: if the body tried to name a DIFFERENT platform, that's a
+    # cross-platform create attempt → 403 (not a silent re-pin). If body/claim
+    # agree or are absent, we pin platform_id to the scope so the record always
+    # lands in the caller's namespace (and is later visible via ?platform_id).
+    _scope = auth._get_caller_identity(event or {}).get("platform_scope")
+    if _scope is not None:
+        if platform_id is not None and platform_id != _scope:
+            return utils._err(
+                403,
+                "FORBIDDEN",
+                "platform-scoped key cannot create a tenant for another platform",
+            )
+        platform_id = _scope
+    # #106 — purchase/order semantics (all additive/optional; see _validate_purchase).
+    purchase_fields, purchase_err = _validate_purchase(body)
+    if purchase_err:
+        return utils._err(400, "VALIDATION", purchase_err)
+    # Go-live A1: when authority is external, do NOT derive ownership from whoever
+    # created the tenant — access is granted exclusively by the external backend
+    # via the signed /external/authz endpoint (written to authorized_users). We
+    # park owner_id at the API_KEY_OWNER sentinel so no Cognito sub implicitly owns
+    # it; with SHARED_TENANT_ACCESS off on the hub, that means "nobody until the
+    # external backend grants".
+    if clients.EXTERNAL_AUTHZ:
+        owner_id = clients.API_KEY_OWNER
+
+    name = body.get("name", "")
+    name_err = utils._validate_name(name)
+    if name_err:
+        return utils._resp(400, {"error": name_err})
+
+    # #95 对抗测试暴露(ADV-J-003/J-004):裸 int() 对非数字抛 ValueError→500 泄内部报错
+    # (违反 E2),负数/0 绕过配额击穿容量账本(违反 I1)。改为类型+正整数校验,返 400 code。
+    def _pos_int(field, default):
+        try:
+            v = int(body.get(field, default))
+        except (ValueError, TypeError):
+            return None, f"{field} must be a positive integer"
+        if v <= 0:
+            return None, f"{field} must be a positive integer (got {v})"
+        return v, None
+
+    vcpu, _e = _pos_int("vcpu", clients.VM_DEFAULT_VCPU)
+    if _e:
+        return utils._err(400, "VALIDATION", _e)
+    mem_mb, _e = _pos_int("mem_mb", clients.VM_DEFAULT_MEM)
+    if _e:
+        return utils._err(400, "VALIDATION", _e)
+    data_disk_mb, _e = _pos_int("data_disk_mb", clients.VM_DATA_DISK_MB)
+    if _e:
+        return utils._err(400, "VALIDATION", _e)
+
+    # Issue #9 — quota check (no-op when env vars unset).
+    quota_err = scheduling._check_quota(vcpu, mem_mb, data_disk_mb)
+    if quota_err:
+        return utils._resp(400, {"error": quota_err})
+
+    config_template = body.get("config_template", "")
+    # issue #59 (WI-E/M-1) — reject injection at the edge. Unvalidated,
+    # config_template reaches an SSM root shell on a shared host, the strongest
+    # cross-tenant escape in the security review. Empty is the common "no custom
+    # template" case; any non-empty value must be a bare DNS-label S3 slug.
+    if config_template and not _CONFIG_TEMPLATE_RE.match(config_template):
+        return utils._resp(
+            400,
+            {
+                "error": "config_template must match ^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$"
+            },
+        )
+    restore_from = body.get("restore_from")
+    clone_from = body.get("clone_from")
+
+    # #93 — control-plane standardization. All ADDITIVE + optional: a caller that
+    # omits every one of these gets byte-identical behavior to before #93
+    # (api-design-review A1/A2). image_id: which golden rootfs version this tenant
+    # was created against — records it for later rolling-upgrade tracking; phase-1
+    # default "v2". security: per-tenant encryption/cert config (see
+    # _validate_security). client_token: optional idempotency key (C1/C3) — NOT
+    # required, so SDK auto-generation isn't disturbed.
+    image_id = (body.get("image_id") or "v2").strip()
+    if not _CONFIG_TEMPLATE_RE.match(image_id):
+        return utils._err(
+            400,
+            "VALIDATION",
+            "image_id must match ^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$",
+        )
+    security, sec_err = utils._validate_security(body.get("security"))
+    if sec_err:
+        return utils._err(400, "VALIDATION", sec_err)
+    # #118/#116 — optional platform-injected credentials (in-transit KMS ciphertext).
+    # The API only validates + relays the ciphertext; the host decrypts at VM launch
+    # (guest zero-credential baseline). Absent → unchanged behavior.
+    injected_credentials, ic_err = utils._validate_injected_credentials(
+        body.get("injected_credentials"), clients.CLAWPOOL_CMK_ARN
+    )
+    if ic_err:
+        return utils._err(400, "VALIDATION", ic_err)
+    # #118 — the injected ciphertext is bound to owner_id in its KMS EncryptionContext
+    # (the upstream registration center encrypts the userkey under the platform user's
+    # owner_id, before any tenant exists). So a tenant that carries injected_credentials
+    # MUST have a concrete owner_id — that's the value the host decrypts against. Reject
+    # loudly at create instead of letting the host fail-closed at launch (better UX +
+    # clear cause). owner_id here is the platform-supplied value (create-on-behalf).
+    # NOTE: under EXTERNAL_AUTHZ, owner_id was parked at the API_KEY_OWNER sentinel above
+    # (authority externalized) — injection needs the real owner_id as its EC, so it is
+    # incompatible with EXTERNAL_AUTHZ for now (a dedicated cred_owner_id field would
+    # decouple them; deferred until that mode is actually used).
+    if injected_credentials:
+        if not owner_id or owner_id == clients.API_KEY_OWNER:
+            return utils._err(
+                400,
+                "VALIDATION",
+                "injected_credentials requires an owner_id (the KMS EncryptionContext "
+                "binding); pass body.owner_id (create-on-behalf). Not supported under "
+                "EXTERNAL_AUTHZ (owner_id is externalized).",
+            )
+    client_token = (body.get("client_token") or "").strip()
+    # #95 adversarial C-006: .isascii() passes control chars (\n \t \x00), and
+    # .strip() only trims the edges, so an embedded control char used to slip
+    # through and land in the SSM command / log line (injection / log-poisoning).
+    # An idempotency key is a printable token — require ASCII 33-126 (no control
+    # chars, no spaces). Length 4-128 (C-003 short / C-005 over-128 rejected too).
+    if client_token and not _CLIENT_TOKEN_RE.match(client_token):
+        return utils._err(
+            400,
+            "VALIDATION",
+            "client_token must be 4-128 printable ASCII chars (no spaces/control chars)",
+        )
+
+    # 1.4.0 (#62) — per-tenant skill list and optional group membership.
+    # Validate up-front so we don't half-create a tenant with a malformed scope.
+    skills_in = body.get("skills")
+    if skills_in is not None:
+        if not isinstance(skills_in, list) or not all(
+            isinstance(s, str) for s in skills_in
+        ):
+            return utils._resp(400, {"error": "skills must be a list of strings"})
+        skills_in = sorted(set(s.strip() for s in skills_in if s and s.strip()))
+    # per-tenant chatCompletions switch (default off = secure default). Only
+    # tenants explicitly created with chat_endpoint_enabled=true get the
+    # OpenAI-compatible HTTP endpoint; launch-vm.sh injects enabled:true for them
+    # and deletes the endpoint for everyone else.
+    # #95 adversarial C-017: bool("false") / bool("0") are both True, so a JSON
+    # string used to silently OPEN this deviceAuth-bypassing endpoint. This is a
+    # secure-default switch — accept only a real JSON boolean; anything else
+    # (string, number, null) fails loud rather than defaulting to "on".
+    cee_raw = body.get("chat_endpoint_enabled", False)
+    if not isinstance(cee_raw, bool):
+        return utils._err(
+            400,
+            "VALIDATION",
+            "chat_endpoint_enabled must be a JSON boolean (true/false)",
+        )
+    chat_endpoint_enabled = cee_raw
+
+    group_in = (body.get("group") or "").strip()
+    if group_in and not utils._NAME_RE.match(group_in):
+        return utils._resp(
+            400, {"error": "group must match ^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$"}
+        )
+    if group_in and clients.groups_table is not None:
+        # Soft-validate: warn at create time if the group doesn't exist yet,
+        # rather than silently allowing a typo to drop tenant from any scope.
+        try:
+            grp_chk = clients.groups_table.get_item(Key={"name": group_in}).get("Item")
+            if not grp_chk:
+                return utils._resp(
+                    404,
+                    {
+                        "error": f"group '{group_in}' not found — create it first via POST /groups"
+                    },
+                )
+        except Exception:
+            pass
+
+    # Issue #12 — clone_from is mutually exclusive with restore_from
+    if clone_from and restore_from:
+        return utils._resp(
+            400, {"error": "clone_from and restore_from are mutually exclusive"}
+        )
+
+    # Resolve clone source: must exist + be running. Forces same-host scheduling.
+    clone_src = None
+    if clone_from:
+        clone_src = clients.tenants_table.get_item(
+            Key={"id": clone_from}, ConsistentRead=True
+        ).get("Item")
+        if not clone_src:
+            return utils._resp(404, {"error": f"clone source not found: {clone_from}"})
+        # issue #80 — can't clone a tenant you don't own (IDOR).
+        denied = auth._assert_owner_or_admin(clone_src, event or {})
+        if denied is not None:
+            return denied
+        if clone_src.get("status") != "running":
+            return utils._resp(
+                400,
+                {
+                    "error": f"clone source must be running (current: {clone_src.get('status')})"
+                },
+            )
+
+    # Issue #10 — validate tags up-front (fail fast before any side effects)
+    tags_err = utils._validate_tags(body.get("tags"))
+    if tags_err:
+        return utils._resp(400, {"error": tags_err})
+    tags = body.get("tags") or {}
+
+    # Issue #15 — optional TTL fields
+    ttl_fields, ttl_err = utils._parse_ttl(body.get("ttl_hours"), body.get("on_expiry"))
+    if ttl_err:
+        return utils._resp(400, {"error": ttl_err})
+
+    # Issue #11 — optional `schedule` field; validated then persisted.
+    sched, sched_err = utils._parse_schedule(body.get("schedule"))
+    if sched_err:
+        return utils._resp(400, {"error": sched_err})
+
+    restore_backup_key = ""
+    if restore_from:
+        src_id = restore_from.get("tenant_id")
+        if not src_id:
+            return utils._resp(400, {"error": "restore_from.tenant_id required"})
+        ts = restore_from.get("timestamp")
+        restore_backup_key = _resolve_backup(src_id, ts)
+        if not restore_backup_key:
+            if ts:
+                return utils._resp(404, {"error": f"backup not found: {src_id}/{ts}"})
+            return utils._resp(
+                404, {"error": f"no backups found for tenant_id={src_id}"}
+            )
+
+    # On a consumer replay the id was already assigned at enqueue time; reuse it
+    # so the consumer materializes exactly the id the caller was handed in its 202
+    # (no second _gen_id → no orphaned/duplicate tenant). Fresh sync path mints a
+    # new id as before.
+    tenant_id = body.get("_assigned_tenant_id") or utils._gen_id(
+        name, client_token, owner_id
+    )
+    now = utils._now()
+
+    # ── [hackathon] Dispatch (SQS 标准队列 + 装箱消费,SPEC/sqs-dispatch) ──
+    # DISPATCH_QUEUE_URL 非空 且 非 consumer 回放 → 走装箱路径,优先于旧
+    # CREATE_VIA_QUEUE FIFO(SPEC 开关优先级矩阵)。tenants 条件写占位保证幂等:
+    # 相同 tenant_id 二次投递 conditional check fail → 返 409(而非重复开 VM)。
+    if clients.DISPATCH_QUEUE_URL and not (event or {}).get("_consumer_ident"):
+        # 占位字段集对照同步路径 item(本函数下方 ~L721)保持同宽——#139/#140 真机
+        # 抓出窄字段集的两类后果:丢 tags → batch by filter 0 命中;缺
+        # channel_secret → hub 握手竞态回归(同步路径特意 mint-up-front)。
+        # host_id/vm_num/guest_ip 此刻还不存在(消费端装箱才定),由
+        # dispatch_service 装箱 CAS 成功后回写(_backfill_placement)。
+        try:
+            item = {
+                "id": tenant_id,
+                "status": "creating",
+                "desired_status": "running",
+                "dispatch_retries": 0,
+                "created_at": now,
+                "updated_at": now,
+                "creation_started_at": now,
+                "name": name,
+                "vcpu": int(vcpu),
+                "mem_mb": int(mem_mb),
+                "owner_id": owner_id,
+                "health_failures": 0,
+                "config_template": config_template,
+                "restore_backup_key": restore_backup_key,
+                "tags": tags,
+                "image_id": image_id,
+                "channel_secret": secrets.token_hex(32),
+            }
+            if owner_id:
+                item["uuid"] = owner_id  # #93 同步路径同款 principal 记录
+            if security:
+                item["security"] = security
+            if (
+                injected_credentials
+            ):  # #118/#116 — 与同步路径同宽,dispatch 消费重建时 host 自取解密
+                item["injected_credentials"] = injected_credentials
+            if tenant_user_id:  # #143 — 占位与同步路径同宽(丢字段=Q2 真机现形)
+                item["tenant_user_id"] = tenant_user_id
+            if platform_id:
+                item["platform_id"] = platform_id
+            clients.tenants_table.put_item(
+                Item=item,
+                ConditionExpression="attribute_not_exists(id)",
+            )
+        except ClientError as e:
+            if (
+                e.response.get("Error", {}).get("Code")
+                == "ConditionalCheckFailedException"
+            ):
+                return utils._resp(
+                    409, {"error": "tenant already exists", "id": tenant_id}
+                )
+            raise
+
+        # #188 — dispatch push 路径的 device/gateway_token 冷注入根因修复。
+        # 同步路径在 _launch_vm 前铸 device+token 并冷注入(:1228/:1254);dispatch
+        # 路径此前只 put 占位 + send_message,把铸造留给了从不发生的同步分支 → 队列
+        # 消息不带密文 → launch-vm 第 12/13 位参空 → wss 免 approve 在生产配置
+        # (dispatch.enabled=true mode=push)100% 失效。这里在 send_message 之前补铸,
+        # 把密文塞进 msg.params 一路穿透到 host 冷注入(dispatch_service manifest g/d 字段)。
+        # fail-open:铸造失败不阻塞已 accepted 的异步 create(占位已落、202 已定),
+        # launch-vm 回退到 in-VM openssl gateway token(pre-#187 行为),租户照常起来,
+        # 只是这一台不具备 reveal/免 approve 能力——比 500 掉一个已接受的异步请求更好。
+        gateway_token_ct = None
+        if clients.CLAWPOOL_CMK_ARN and clients.tenant_secrets_table is not None:
+            try:
+                gateway_token_ct = mint_gateway_token(tenant_id)
+            except Exception as e:  # noqa: BLE001 — fail-open,不阻塞异步 create
+                print(
+                    f"[#188] dispatch mint_gateway_token failed (non-fatal): "
+                    f"{type(e).__name__}: {e}"
+                )
+                _cleanup_gateway_token_secret(tenant_id)  # 清半写残留
+                gateway_token_ct = None
+        device_paired_b64 = ""
+        if (
+            owner_id
+            and clients.CLAWPOOL_CMK_ARN
+            and clients.tenant_secrets_table is not None
+        ):
+            try:
+                # owner==API_KEY_OWNER / 空 → mint_device_identity 返 None → paired 空。
+                _device = mint_device_identity(tenant_id, owner_id)
+                device_paired_b64 = build_paired_json_b64(_device)
+            except Exception as e:  # noqa: BLE001 — 可选增强,失败不回滚
+                print(
+                    f"[#188] dispatch mint_device_identity failed (non-fatal): "
+                    f"{type(e).__name__}: {e}"
+                )
+                device_paired_b64 = ""
+
+        _sqs_dispatch = getattr(clients, "sqs", None) or boto3.client("sqs")
+        msg = {
+            "v": 1,
+            "action": "create",
+            "tenant_id": tenant_id,
+            "request_token": (body.get("client_token") or "") or f"req-{tenant_id}",
+            "params": {
+                "vcpu": int(vcpu),
+                "mem_mb": int(mem_mb),
+                "owner_id": owner_id,
+                # #160 — 用已校验的 chat_endpoint_enabled 变量(:608 从对外字段名
+                # chat_endpoint_enabled 校验而来),不是从 body 再取错 key chat_ep
+                # (客户端从不传 chat_ep,那样恒 False → dispatch 路径静默丢开关)。
+                # consumer(dispatch_service:399/557)读 params["chat_ep"],故此处 key
+                # 仍叫 chat_ep(队列内部字段名),只修取值来源。
+                "chat_ep": chat_endpoint_enabled,
+                "image": config_template or "default",
+                # #188 — 预铸密文/配对元数据透传给 consumer → manifest/assignments →
+                # host 冷注入。空值(feature-off / owner 未知)不影响下游:manifest
+                # encode 只在非空时写 g/d,launch-vm fail-open 跳过。
+                "gateway_token_ct": gateway_token_ct,
+                "device_paired_b64": device_paired_b64,
+            },
+        }
+        try:
+            _sqs_dispatch.send_message(
+                QueueUrl=clients.DISPATCH_QUEUE_URL, MessageBody=json.dumps(msg)
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[dispatch] send_message failed: {e}")
+            # 失败:回滚占位(best-effort),返 5xx 让客户端重试
+            try:
+                clients.tenants_table.delete_item(Key={"id": tenant_id})
+            except Exception:  # noqa: BLE001
+                pass
+            return utils._resp(503, {"error": "dispatch enqueue failed; retry"})
+        return utils._resp(
+            202,
+            {
+                "id": tenant_id,
+                "status": "queued",
+                "message": "create accepted; dispatching",
+            },
+        )
+
+    # ── Phase 2: shed-load a 380-create burst onto the FIFO queue ──
+    # All CHEAP validation above ran synchronously (so the caller still gets an
+    # immediate 400 on a bad request). Now, if create-via-queue is enabled and
+    # this is NOT a consumer replay, enqueue the create and return 202 — the
+    # consumer drains the queue at its reserved-concurrency rate, so a burst of
+    # 380 POST /tenants no longer fans out 380 synchronous SSM calls and trips the
+    # SSM single-instance concurrency wall (795: 40 concurrent → 11 TimedOut).
+    # Parallelism is preserved: MessageGroupId = tenant_id means every create is
+    # its own FIFO group and they consume concurrently (only same-tenant ops
+    # serialize). We stamp the already-generated tenant_id into the queued body so
+    # the consumer creates exactly THIS id (no second _gen_id → no ghost tenant)
+    # and the caller can poll GET /tenants/{id} immediately. enqueued_at lets the
+    # consumer emit a queue-wait latency metric (the 1-minute SLA guard).
+    if (
+        clients.CREATE_VIA_QUEUE
+        and clients.LIFECYCLE_QUEUE_URL
+        and not (event or {}).get("_consumer_ident")
+    ):
+        queued_body = dict(body)
+        queued_body["_assigned_tenant_id"] = tenant_id
+        queued_body["_enqueued_at"] = now
+        # #108 — stamp the pinned platform_id into the queued snapshot so the
+        # tenant lands in the caller's namespace even if scope resolution on
+        # replay ever changed. (enqueue_lifecycle also carries platform_scope in
+        # _ident, which re-pins on replay; this makes the body self-consistent.)
+        if platform_id:
+            queued_body["platform_id"] = platform_id
+        if lifecycle_dispatch.enqueue_lifecycle(
+            "create", tenant_id, event, extra=queued_body
+        ):
+            return utils._resp(
+                202,
+                {
+                    "id": tenant_id,
+                    "status": "queued",
+                    "message": "create accepted; provisioning asynchronously",
+                },
+            )
+
+    # task #15 — mint this tenant's own LiteLLM vkey (spend/budget split per
+    # tenant↔sub). None if billing unconfigured → falls back to the image's
+    # shared key (backward compatible). Stored on the record; launch-vm.sh
+    # injects it into the per-VM openclaw.json.
+    tenant_vkey = vkey._mint_tenant_vkey(tenant_id, owner_id)
+
+    # channel_secret — the per-tenant HMAC secret the in-VM claw-channel signs
+    # its hub registration with (the hub verifies against this same value, read
+    # from this DDB record). We MINT IT HERE (control plane, before the VM
+    # exists) and pass it to launch-vm.sh, instead of letting launch-vm.sh
+    # `openssl rand` its own and relying on host-agent to SSH-read-back + mirror
+    # it into DDB afterwards. That read-back path had a startup RACE: the VM's
+    # channel dialed the hub within seconds of boot (token-fail / 401) while DDB
+    # still had no channel_secret (host-agent's 15s poll hadn't mirrored it yet);
+    # the channel exhausted its retry budget (~30s) and gave up permanently →
+    # "agent offline" forever. Minting up-front makes DDB authoritative and
+    # populated BEFORE the VM boots, so the hub verifies the very first attempt.
+    # 64 hex chars == openssl rand -hex 32 (the format launch-vm.sh used).
+    channel_secret = secrets.token_hex(32)
+
+    # #187 P5 — Cognito 渠道机器用户(WI-002)随 channel/hub 一起下线;数据面走
+    # 两级路由到 microVM:18789 gateway,鉴权改走 gateway 原生 token。
+
+    # Find host with capacity. The scheduler is normally automatic, but
+    # operators occasionally need to pin a tenant to a specific host (e.g.
+    # to drain a host before terminating it, or to keep two related VMs on
+    # the same hardware). Three modes, in priority order:
+    #   1. clone_from → must land on the source's host (local `cp` only)
+    #   2. preferred_host_id (admin/operator) → land there or fail
+    #   3. default → first host with capacity
+    preferred_host_id = (body.get("preferred_host_id") or "").strip()
+    if clone_src:
+        host = scheduling._get_specific_host_with_capacity(
+            clone_src["host_id"], vcpu, mem_mb
+        )
+        if not host:
+            return utils._resp(
+                400,
+                {
+                    "error": f"clone source's host {clone_src['host_id']} lacks "
+                    f"capacity for clone (vcpu={vcpu}, mem_mb={mem_mb})"
+                },
+            )
+    elif preferred_host_id:
+        host = scheduling._get_specific_host_with_capacity(
+            preferred_host_id, vcpu, mem_mb
+        )
+        if not host:
+            # Distinguish "host doesn't exist" from "host full" so the
+            # console can render the right message.
+            existing = clients.hosts_table.get_item(
+                Key={"instance_id": preferred_host_id}, ConsistentRead=True
+            ).get("Item")
+            if not existing or existing.get("status") in ("deleted", "draining"):
+                return utils._resp(
+                    404,
+                    {
+                        "error": f"preferred_host_id {preferred_host_id} not found or draining"
+                    },
+                )
+            return utils._resp(
+                400,
+                {
+                    "error": f"preferred_host_id {preferred_host_id} lacks capacity "
+                    f"(vcpu={vcpu}, mem_mb={mem_mb})"
+                },
+            )
+    else:
+        host = scheduling._find_host(vcpu, mem_mb)
+    if not host:
+        # No capacity — save as pending and scale out.
+        # Persist config_template and restore_backup_key so process_pending() can apply them.
+        item = {
+            "id": tenant_id,
+            "name": name,
+            "vcpu": vcpu,
+            "mem_mb": mem_mb,
+            "status": "pending",
+            "health_failures": 0,
+            "config_template": config_template,
+            "restore_backup_key": restore_backup_key,
+            "tags": tags,
+            "created_at": now,
+            "updated_at": now,
+        }
+        if owner_id:  # issue #80 — record ownership for IDOR enforcement
+            item["owner_id"] = owner_id
+            item["uuid"] = owner_id  # #93 — stable Cognito-sub principal (= owner_id);
+            # NOT the primary key (id stays name-xxxx so one user can own many tenants)
+        item["image_id"] = image_id  # #93 — golden rootfs version at creation
+        if security:  # #93 — per-tenant encryption/security config (optional)
+            item["security"] = security
+        if injected_credentials:  # #118/#116 — platform-injected credential ciphertext
+            item["injected_credentials"] = injected_credentials
+        if tenant_user_id:  # task #13/#14 — external user attribution
+            item["tenant_user_id"] = tenant_user_id
+        if platform_id:  # #106 — external-platform attribution (筛租户用)
+            item["platform_id"] = platform_id
+        item.update(purchase_fields)  # #106 — order_id/plan_tier/purchase_status
+        if tenant_vkey:  # task #15 — per-tenant LiteLLM billing key
+            item["litellm_vkey"] = tenant_vkey
+        if skills_in is not None:
+            item["skills"] = skills_in
+        if group_in:
+            item["group"] = group_in
+        if chat_endpoint_enabled:  # per-tenant chatCompletions switch (default off)
+            item["chat_endpoint_enabled"] = True
+        item.update(ttl_fields)
+        if sched:
+            item["schedule"] = sched
+        # #93 / api-design-review C2/J2 — conditional put prevents a same-id replay
+        # (retry, double-submit, duplicate queue consume) from overwriting an
+        # existing tenant. Same id already present → 409 ConflictException (C4),
+        # not a silent clobber. This is the durable idempotency layer; SQS FIFO
+        # dedup (C6) only sheds load, it doesn't guarantee exactly-once.
+        try:
+            clients.tenants_table.put_item(
+                Item=item, ConditionExpression="attribute_not_exists(id)"
+            )
+        except (
+            clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException
+        ):
+            return utils._err(
+                409,
+                "CONFLICT",
+                f"tenant '{tenant_id}' already exists",
+                extra={"id": tenant_id},
+            )
+        scheduling._scale_out()
+        audit._publish_event(
+            "tenant.created",
+            tenant_id,
+            {
+                "name": name,
+                "vcpu": vcpu,
+                "mem_mb": mem_mb,
+                "status": "pending",
+            },
+        )
+        return utils._resp(
+            201,
+            {
+                "id": tenant_id,
+                "status": "pending",
+                "message": "scaling out, VM will be created when host is ready",
+            },
+        )
+
+    # Allocate vm_num + reserve capacity ATOMICALLY (GITHUB-scheduler-bugs P0).
+    #
+    # The old code read host["next_vm_num"], computed guest_ip/host_port from it,
+    # then did an unconditional `SET next_vm_num = :next` (absolute assignment).
+    # Under concurrent create_tenant calls, _find_host deterministically returns
+    # the same least-loaded host, every caller reads the SAME next_vm_num, and
+    # they all land on the same vm_num / guest_ip / host_port — the real root of
+    # the observed PriorityInUse / "all packed on one host" failures, plus the
+    # absolute assignment silently dropped concurrent increments (capacity ledger
+    # drift). Fix: a compare-and-swap that atomically (a) confirms next_vm_num is
+    # unchanged since we read it, (b) re-checks capacity at write time so we never
+    # oversell, and (c) increments next_vm_num / used_* in one conditional update.
+    # On contention (ConditionalCheckFailedException) we re-pick a host and retry.
+    def _reserve_slot(h):
+        """Atomically claim a vm_num + capacity on host h. Returns the claimed
+        vm_num, or None if h no longer has capacity / lost the CAS race."""
+        expected = int(h.get("next_vm_num", 1))
+        cap_v = int(int(h["total_vcpu"]) * clients.CPU_OVERCOMMIT_RATIO) - vcpu
+        cap_m = int(int(h["total_mem_mb"]) * clients.MEM_OVERCOMMIT_RATIO) - mem_mb
+        try:
+            r = clients.hosts_table.update_item(
+                Key={"instance_id": h["instance_id"]},
+                UpdateExpression=(
+                    "SET used_vcpu = used_vcpu + :v, used_mem_mb = used_mem_mb + :m, "
+                    "vm_count = vm_count + :one, next_vm_num = next_vm_num + :one, "
+                    "#s = :a REMOVE idle_since"
+                ),
+                ConditionExpression=(
+                    "next_vm_num = :expected AND used_vcpu <= :cap_v "
+                    "AND used_mem_mb <= :cap_m"
+                ),
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={
+                    ":v": vcpu,
+                    ":m": mem_mb,
+                    ":one": 1,
+                    ":a": "active",
+                    ":expected": expected,
+                    ":cap_v": cap_v,
+                    ":cap_m": cap_m,
+                },
+                ReturnValues="UPDATED_NEW",
+            )
+            # next_vm_num was incremented; the slot we claimed is the pre-increment value.
+            return int(r["Attributes"]["next_vm_num"]) - 1
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                return None
+            raise
+
+    vm_num = None
+    for attempt in range(8):
+        claimed = _reserve_slot(host)
+        if claimed is not None:
+            vm_num = claimed
+            break
+        # Lost the CAS race or host filled up — clones must stay on their source
+        # host, so they can't re-pick and just fail; others re-pick a host.
+        if clone_src or preferred_host_id:
+            return utils._resp(
+                409,
+                {"error": "host slot contended or filled during allocation; retry"},
+            )
+        time.sleep(0.05 * (attempt + 1))
+        host = scheduling._find_host(vcpu, mem_mb)
+        if not host:
+            return utils._resp(503, {"error": "no host capacity (contended out)"})
+    if vm_num is None:
+        return utils._resp(
+            503, {"error": "slot allocation contended out after retries"}
+        )
+
+    guest_ip = auth._guest_ip(vm_num)
+    host_port = clients.VM_PORT_BASE + vm_num - 1
+
+    item = {
+        "id": tenant_id,
+        "name": name,
+        "host_id": host["instance_id"],
+        "vm_num": vm_num,
+        "guest_ip": guest_ip,
+        "host_port": host_port,
+        "vcpu": vcpu,
+        "mem_mb": mem_mb,
+        "status": "creating",
+        "health_failures": 0,
+        "rootfs_version": host.get("rootfs_version", ""),
+        "config_template": config_template,
+        "restore_backup_key": restore_backup_key,
+        "tags": tags,
+        "creation_started_at": now,
+        "created_at": now,
+        "updated_at": now,
+        # Authoritative HMAC secret for the hub↔channel handshake, present in DDB
+        # BEFORE the VM boots (kills the host-agent read-back race; see above).
+        "channel_secret": channel_secret,
+    }
+    if owner_id:  # issue #80 — record ownership for IDOR enforcement
+        item["owner_id"] = owner_id
+        item["uuid"] = owner_id  # #93 — stable Cognito-sub principal (= owner_id);
+        # NOT the primary key (id stays name-xxxx so one user can own many tenants)
+    item["image_id"] = image_id  # #93 — golden rootfs version at creation
+    if security:  # #93 — per-tenant encryption/security config (optional)
+        item["security"] = security
+    if injected_credentials:  # #118/#116 — platform-injected credential ciphertext
+        item["injected_credentials"] = injected_credentials
+    if tenant_user_id:  # task #13/#14 — external user attribution
+        item["tenant_user_id"] = tenant_user_id
+    if platform_id:  # #106 — external-platform attribution (筛租户用)
+        item["platform_id"] = platform_id
+    item.update(purchase_fields)  # #106 — order_id/plan_tier/purchase_status
+    if tenant_vkey:  # task #15 — per-tenant LiteLLM billing key
+        item["litellm_vkey"] = tenant_vkey
+    if skills_in is not None:
+        item["skills"] = skills_in
+    if group_in:
+        item["group"] = group_in
+    if chat_endpoint_enabled:  # per-tenant chatCompletions switch (default off)
+        item["chat_endpoint_enabled"] = True
+    if clone_from:
+        item["clone_from"] = clone_from
+    # Persist optional TTL fields on the running path too (#48 follow-up).
+    item.update(ttl_fields)
+    if sched:
+        item["schedule"] = sched
+    # Capacity + vm_num already reserved atomically above; just record the tenant.
+    # If this put fails we roll the reservation back so the ledger stays honest.
+    # #93 / api-design-review C2/J2 — conditional put: a same-id replay (retry,
+    # double-submit, duplicate queue consume) must not overwrite an existing
+    # tenant. On conflict we release the slot THIS attempt just reserved (the
+    # original tenant keeps its own) and return 409 — avoids both a silent clobber
+    # and a capacity leak. Any other failure rolls back + re-raises as before.
+    try:
+        clients.tenants_table.put_item(
+            Item=item, ConditionExpression="attribute_not_exists(id)"
+        )
+    except clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException:
+        scheduling._release_slot(host["instance_id"], vcpu, mem_mb)
+        return utils._err(
+            409,
+            "CONFLICT",
+            f"tenant '{tenant_id}' already exists",
+            extra={"id": tenant_id},
+        )
+    except Exception:
+        scheduling._release_slot(host["instance_id"], vcpu, mem_mb)
+        raise
+
+    # #187 P1 — pre-mint gateway token when feature is on (CMK + secrets table
+    # both deployed). Enables control-plane reveal (GET /tenants/{id}/token) and
+    # SSM-position-12 injection to launch-vm.sh (host decrypts + writes
+    # openclaw.json .gateway.auth.token). Feature OFF → gateway_token_ct stays
+    # None and launch-vm keeps `openssl rand`-ing its own gateway token in-VM
+    # (existing pre-#187 behavior, byte-identical). Placed AFTER the successful
+    # tenant put (never mint for a 409-conflict path), BEFORE _launch_vm (so the
+    # ciphertext can be threaded to launch-vm position 12). Failure to mint after
+    # the feature was enabled follows the launch-vm rollback path: mark tenant
+    # deleted + release the slot + best-effort clean up the secrets row (may not
+    # exist), then 502 so caller retries.
+    gateway_token_ct = None
+    if clients.CLAWPOOL_CMK_ARN and clients.tenant_secrets_table is not None:
+        try:
+            gateway_token_ct = mint_gateway_token(tenant_id)
+        except Exception as e:  # noqa: BLE001 — rollback path, then propagate as 502
+            print(f"[#187] mint_gateway_token failed: {type(e).__name__}: {e}")
+            _cleanup_gateway_token_secret(tenant_id)  # in case partial write landed
+            scheduling._release_slot(host["instance_id"], vcpu, mem_mb)
+            clients.tenants_table.update_item(
+                Key={"id": tenant_id},
+                UpdateExpression="SET #s = :s, updated_at = :t",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={":s": "deleted", ":t": utils._now()},
+            )
+            return utils._resp(
+                502,
+                {
+                    "error": "gateway token mint failed; tenant rolled back, retry",
+                    "id": tenant_id,
+                },
+            )
+
+    # #10 — WSS 设备身份三件套(可选增强,不阻塞租户创建)。owner_id 已知(非 sentinel)
+    # 且 CMK 开时铸:公钥 + deviceId 供 launch-vm 冷注入 paired.json,私钥密文存 DDB
+    # 供 GET fold-in。铸失败不回滚租户(gateway token 已够本期用,device 是丝滑授权
+    # 增强)——best-effort 告警,租户照常创建。
+    device_paired_b64 = ""
+    if (
+        owner_id
+        and clients.CLAWPOOL_CMK_ARN
+        and clients.tenant_secrets_table is not None
+    ):
+        try:
+            # 铸设备三件套写进 tenant_secrets 供 GET fold-in;返回的公钥+deviceId 再
+            # 组装成 paired.json base64 传给 launch-vm 冷注入(#188 免人工 approve)。
+            _device = mint_device_identity(tenant_id, owner_id)
+            device_paired_b64 = build_paired_json_b64(_device)
+        except Exception as e:  # noqa: BLE001 — 可选增强,失败不回滚租户
+            print(
+                f"[#10] mint_device_identity failed (non-fatal): {type(e).__name__}: {e}"
+            )
+            device_paired_b64 = ""  # mint 失败 → 空参,launch-vm fail-open 跳过冷注入
+
+    # Issue #12 — for clones, snapshot source disks before launching the new VM.
+    # clone-data.sh: pause src → cp --sparse data.ext4 + overlay.ext4 → resume src.
+    if clone_src:
+        src_vm_num = int(clone_src.get("vm_num", 1))
+        clone_cmd = (
+            f"/home/ubuntu/clone-data.sh {clone_from} {src_vm_num} {tenant_id} {vm_num}"
+        )
+        if not ssm_dispatch._ssm_run(host["instance_id"], clone_cmd, timeout=180):
+            # Roll back: undo the host counter increment + delete tenant row
+            clients.hosts_table.update_item(
+                Key={"instance_id": host["instance_id"]},
+                UpdateExpression="SET used_vcpu = used_vcpu - :v, used_mem_mb = used_mem_mb - :m, vm_count = vm_count - :one",
+                ExpressionAttributeValues={":v": vcpu, ":m": mem_mb, ":one": 1},
+            )
+            clients.tenants_table.update_item(
+                Key={"id": tenant_id},
+                UpdateExpression="SET #s = :s, updated_at = :t",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={":s": "deleted", ":t": utils._now()},
+            )
+            # #187 — same reasoning as the launch-vm rollback: a token never
+            # injected must not remain revealable for its 15-min window.
+            _cleanup_gateway_token_secret(tenant_id)
+            return utils._resp(
+                502, {"error": "clone-data.sh failed; tenant rolled back"}
+            )
+
+    launch_cmd_id = ssm_dispatch._launch_vm(
+        host["instance_id"],
+        tenant_id,
+        vm_num,
+        vcpu,
+        mem_mb,
+        guest_ip,
+        host_port,
+        config_template,
+        restore_backup_key,
+        scoped_skills=skills._resolve_effective_skills(item),
+        litellm_vkey=tenant_vkey or "",  # task #15 per-tenant billing key
+        channel_secret=channel_secret,  # mint-up-front (kills hub handshake race)
+        chat_endpoint_enabled=chat_endpoint_enabled,  # per-tenant chatCompletions
+        gateway_token_ct=gateway_token_ct,  # #187 P1 — pre-minted gateway token ciphertext
+        device_paired_b64=device_paired_b64,  # #188 — paired.json 冷注入(免 approve)
+    )
+    # loop 2026-07-01 bugfix: launch-vm's SSM SendCommand can be throttled when
+    # many creates fan out concurrently (create_via_queue consumer × 10). It was
+    # fire-and-forget, so a throttled launch left the tenant stuck in `creating`
+    # forever with a leaked capacity slot (host账本 used_vcpu > 实际 fc). Now: if
+    # submission failed, roll the reservation + tenant back and return 502 so the
+    # caller retries — and the SQS consumer re-queues the create with backoff
+    # (see _consume_lifecycle_sqs: code>=500 → batchItemFailures → SQS redrive).
+    if launch_cmd_id is None:
+        scheduling._release_slot(host["instance_id"], vcpu, mem_mb)
+        clients.tenants_table.update_item(
+            Key={"id": tenant_id},
+            UpdateExpression="SET #s = :s, updated_at = :t",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":s": "deleted", ":t": utils._now()},
+        )
+        # #187 — a token that never made it into the VM is a token that will
+        # never be redeemed; release the secrets row so its 15-min reveal window
+        # isn't handed to a caller whose tenant is being rolled back.
+        _cleanup_gateway_token_secret(tenant_id)
+        return utils._resp(
+            502,
+            {
+                "error": "launch-vm SSM dispatch failed (throttled?); "
+                "tenant rolled back, retry",
+                "id": tenant_id,
+            },
+        )
+
+    # #187 转型:per-tenant ALB rule/TG 已下线,数据面走 ALB LOR → OpenResty edge
+    # → Redis 查表 → host DNAT → microVM:18789。
+
+    audit._publish_event(
+        "tenant.created",
+        tenant_id,
+        {
+            "name": name,
+            "vcpu": vcpu,
+            "mem_mb": mem_mb,
+            "host_id": host["instance_id"],
+            "guest_ip": guest_ip,
+        },
+    )
+
+    return utils._resp(
+        201,
+        {
+            "id": tenant_id,
+            "host_id": host["instance_id"],
+            "guest_ip": guest_ip,
+            "host_port": host_port,
+            "status": "creating",
+        },
+    )
+
+
+def delete_tenant(tenant_id, query_params, event=None):
+    item = clients.tenants_table.get_item(
+        Key={"id": tenant_id}, ConsistentRead=True
+    ).get("Item")
+    if not item:
+        return utils._resp(404, {"error": "tenant not found"})
+    # issue #80 — IDOR: only the owner (or admin / api-key) may delete.
+    denied = auth._assert_owner_or_admin(item, event or {})
+    if denied is not None:
+        return denied
+    if item.get("status") == "deleted":
+        return utils._resp(200, {"id": tenant_id, "status": "deleted"})
+
+    # #107 — 并发双删扣穿 host 账本修复(与 create 的原子 CAS 对称)。
+    # delete 的 host 计数回退(used_vcpu/vm_count -= …,下方 line ~2210)无
+    # ConditionExpression,两个并发 DELETE 同一 tenant 会各扣一次 → 账本被扣穿变负,
+    # 调度容量判断失真。这里用一次 CAS 把 status pending/running/… → "deleting" 当
+    # 并发闸:ConditionExpression 保证**只有一个调用赢得这次翻转**,赢家继续执行
+    # 全部副作用(SSM stop / rm / ALB / 计数回退)且账本只被扣一次;输家(CCF)立即
+    # 幂等返回 200,不碰计数。用中间态 "deleting" 而非直接 "deleted",是为了:① 副作用
+    # 期间 status 已非 running,list/调度不再把它算作活跃;② 万一副作用中途失败,记录
+    # 停在 "deleting" 可被巡检发现重试,而不是过早标 "deleted" 把半清理的租户藏起来。
+    prev_status = item.get("status")
+    try:
+        clients.tenants_table.update_item(
+            Key={"id": tenant_id},
+            UpdateExpression="SET #s = :deleting, updated_at = :t",
+            ConditionExpression="#s <> :deleted AND #s <> :deleting",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":deleting": "deleting",
+                ":deleted": "deleted",
+                ":t": utils._now(),
+            },
+        )
+    except clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException:
+        # 另一个并发 DELETE 已抢到闸(status 已是 deleting/deleted)。终态一致 →
+        # 幂等 200,绝不重复扣账本(这正是 #107 要修的扣穿点)。
+        return utils._resp(200, {"id": tenant_id, "status": "deleting"})
+
+    keep_data = query_params.get("keep_data", "true").lower() == "true"
+    host_id = item.get("host_id")
+    # Go-live B2: snapshot-before-destroy. Deleting with keep_data=false does an
+    # irreversible `rm -rf` of the tenant's data disk. Per the project rule
+    # "不可逆操作前先保护", we first take a SYNCHRONOUS backup to S3 so the data
+    # is recoverable, and fail closed (abort the delete) if the backup fails —
+    # unless the caller explicitly opts out with ?skip_backup=true (e.g. the
+    # tenant truly has no data worth keeping). keep_data=true deletes (soft) keep
+    # the disk on the host anyway, so no pre-backup is needed there.
+    skip_backup = query_params.get("skip_backup", "false").lower() == "true"
+
+    # #107 — if we abort AFTER winning the CAS gate (status already "deleting")
+    # but BEFORE doing any destructive side effect (backup failed → we bail to
+    # protect data, 铁律 #4), roll status back to its pre-delete value so the
+    # tenant isn't stranded in "deleting" (invisible to list, un-actionable). No
+    # capacity counter was touched yet at this point, so status is all we restore.
+    def _abort_restore_status():
+        try:
+            clients.tenants_table.update_item(
+                Key={"id": tenant_id},
+                UpdateExpression="SET #s = :prev, updated_at = :t",
+                ConditionExpression="#s = :deleting",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={
+                    ":prev": prev_status,
+                    ":deleting": "deleting",
+                    ":t": utils._now(),
+                },
+            )
+        except Exception:
+            # Best-effort restore; if another op already moved it, leave as-is.
+            pass
+
+    if host_id and not keep_data and not skip_backup:
+        try:
+            lambda_client = boto3.client("lambda")
+            resp = lambda_client.invoke(
+                FunctionName=os.environ.get("BACKUP_FUNCTION", "openclaw-backup"),
+                InvocationType="RequestResponse",  # SYNC: data safe in S3 before rm
+                # pre_delete=True:让 backup 绕过"只备 running"守卫——delete CAS 已把
+                # status 翻成 "deleting"(先于本调用),不带这个信号 backup 会 no-op 拒掉,
+                # 删前备份形同虚设、盘照删(CRITICAL 数据丢失,本修复的根因)。
+                Payload=json.dumps({"tenant_id": tenant_id, "pre_delete": True}).encode(
+                    "utf-8"
+                ),
+            )
+            # 必须解析备份 Lambda 的**业务结果**(Payload.success),不能只看 invoke 层
+            # StatusCode——backup 对失败场景是正常 return {"success":False}(非抛异常),
+            # RequestResponse 的 StatusCode 仍 200 且无 FunctionError,只看它会误判成功、
+            # 越过 fail-closed 继续 rm -rf 而 S3 无备份(CRITICAL 数据丢失,本修复的根因)。
+            invoke_ok = (
+                resp.get("StatusCode", 500) == 200 and "FunctionError" not in resp
+            )
+            payload_ok = False
+            payload_err = "unparseable backup response"
+            if invoke_ok:
+                try:
+                    raw = resp["Payload"].read()
+                    result = json.loads(raw) if raw else {}
+                    payload_ok = result.get("success") is True
+                    if not payload_ok:
+                        payload_err = result.get("error") or "backup reported failure"
+                except Exception as pe:  # noqa: BLE001 — 解析失败即 fail-closed
+                    payload_err = f"backup response parse error: {pe}"
+            else:
+                payload_err = "backup invoke failed (StatusCode/FunctionError)"
+            if not payload_ok:
+                _abort_restore_status()
+                return utils._resp(
+                    502,
+                    {
+                        "error": "pre-delete backup failed; aborting destroy to avoid "
+                        "irreversible data loss. Retry, or pass ?skip_backup=true to "
+                        "delete without a backup.",
+                        "backup_error": payload_err,
+                    },
+                )
+        except Exception as e:
+            _abort_restore_status()
+            return utils._resp(
+                502,
+                {
+                    "error": f"pre-delete backup error ({e}); aborting destroy. Retry, "
+                    "or ?skip_backup=true to force.",
+                },
+            )
+
+    if host_id:
+        # Stop VM via SSM
+        vm_num = int(item.get("vm_num", 1))
+        ssm_dispatch._ssm_run(host_id, f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num}")
+        # Remove vm.json so host-agent won't try to recover
+        ssm_dispatch._ssm_run(
+            host_id, f"rm -f /data/firecracker-vms/{tenant_id}/vm.json"
+        )
+
+    # #187 转型:legacy_alb rule 已删,数据面走两级路由,无需再摘 per-tenant ALB rule。
+
+    if host_id:
+        # 销毁租户 → 回收数据面路由(2026-07-08:delete 可移除路由,stop 保留)。
+        # DNAT 规则删除的 argv 必须与 host-agent route_ops.dnat_rule_args 加规则时
+        # 完全一致(无 `-i <iface>` 前缀)——旧代码带 `-i` 前缀,与 route_ops 无 `-i`
+        # 的规则不匹配,`iptables -D` 删不掉,DNAT 规则永久泄漏在 PREROUTING 链里,
+        # 累计租户越多链越长(线性匹配退化的真正元凶)。修成对齐 argv 后 delete
+        # 真回收端口段槽位,单 host 规则数回落到活跃租户量级。
+        _hp = item.get("host_port", 0)
+        _gip = item.get("guest_ip", "")
+        if _hp and _gip:
+            ssm_dispatch._ssm_run(
+                host_id,
+                f"sudo iptables --wait 3 -t nat -D PREROUTING -p tcp --dport {_hp} "
+                f"-j DNAT --to-destination {_gip}:{clients.VM_PORT_BASE} "
+                f"2>/dev/null || true",
+            )
+
+        if not keep_data:
+            ssm_dispatch._ssm_run(host_id, f"rm -rf /data/firecracker-vms/{tenant_id}")
+
+        # Update host counters.
+        # #107 defense-in-depth: guard the decrement with `>= :v` so it can NEVER
+        # drive the ledger negative even if the status CAS gate is somehow bypassed
+        # (e.g. a concurrent lifecycle action reversed "deleting" back to active and
+        # a second DELETE won the gate again). The gate makes the double-decrement
+        # rare; this guard makes an over-decrement structurally impossible. On a
+        # guard violation we fail LOUD (log the anomaly) instead of silently
+        # subtracting into negative — the tenant is still marked deleted (its VM is
+        # gone), we just refuse to corrupt the capacity ledger.
+        host_resp = None
+        try:
+            host_resp = clients.hosts_table.update_item(
+                Key={"instance_id": host_id},
+                UpdateExpression="SET used_vcpu = used_vcpu - :v, used_mem_mb = used_mem_mb - :m, vm_count = vm_count - :one",
+                ConditionExpression="used_vcpu >= :v AND used_mem_mb >= :m AND vm_count >= :one",
+                ExpressionAttributeValues={
+                    ":v": item["vcpu"],
+                    ":m": item["mem_mb"],
+                    ":one": 1,
+                },
+                ReturnValues="ALL_NEW",
+            )
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                # Ledger would go negative → a prior decrement already ran for this
+                # tenant (double-delete slipped the gate). Skip the subtract; do NOT
+                # corrupt the ledger. Loud so it's caught, not swallowed.
+                print(
+                    f"delete_tenant #107: refused ledger under-run on host {host_id} "
+                    f"for tenant {tenant_id} (vcpu={item['vcpu']}, mem={item['mem_mb']}) "
+                    f"— counters already reclaimed by a prior delete; skipping."
+                )
+            else:
+                raise
+        # Record idle_since when host becomes empty (defensive — mocks may
+        # omit Attributes; treat as still-busy and skip).
+        attrs = host_resp.get("Attributes") if isinstance(host_resp, dict) else None
+        if attrs and int(attrs.get("vm_count", 0)) == 0:
+            clients.hosts_table.update_item(
+                Key={"instance_id": host_id},
+                UpdateExpression="SET idle_since = :t",
+                ExpressionAttributeValues={":t": utils._now()},
+            )
+
+    # Go-live C: reclaim the per-tenant LiteLLM vkey so it doesn't linger in
+    # LiteLLM after the tenant is gone (credential + budget leak over churn).
+    # Best-effort — delete proceeds regardless; we record whether it was revoked.
+    vkey_revoked = vkey._revoke_tenant_vkey(item.get("litellm_vkey"))
+
+    # #187 P5 — Cognito 渠道机器用户 helper 已删;老记录里若还残留
+    # cognito_channel_password 字段,由下面的 UpdateExpression 幂等 REMOVE 清除。
+
+    # #107 — collapse deleting → deleted (the winner's final step). We already
+    # hold the concurrency gate (status is "deleting", set by our CAS above), so
+    # this is an unconditional finalize; no second race is possible.
+    # #166 — only drop litellm_vkey once revoke is confirmed. If the tenant had a
+    # per-tenant vkey but revoke failed (e.g. LiteLLM transient outage), keep the
+    # field and flag it so a reconciler can retry — dropping it here would orphan
+    # a live key in LiteLLM (credential + budget leak with no way to find it).
+    if item.get("litellm_vkey") and not vkey_revoked:
+        update_expr = (
+            "SET #s = :s, updated_at = :t, vkey_revoke_failed = :vf "
+            "REMOVE cognito_channel_password"
+        )
+        expr_vals = {":s": "deleted", ":t": utils._now(), ":vf": True}
+    else:
+        update_expr = (
+            "SET #s = :s, updated_at = :t REMOVE litellm_vkey, cognito_channel_password"
+        )
+        expr_vals = {":s": "deleted", ":t": utils._now()}
+    clients.tenants_table.update_item(
+        Key={"id": tenant_id},
+        UpdateExpression=update_expr,
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues=expr_vals,
+    )
+    # #187 P1 — best-effort remove the gateway-token ciphertext row (feature-gated
+    # inside _cleanup; no-op when TENANT_SECRETS_TABLE is unset). Closes the
+    # reveal window immediately on delete instead of waiting for the DDB TTL sweep.
+    _cleanup_gateway_token_secret(tenant_id)
+    audit._publish_event(
+        "tenant.deleted",
+        tenant_id,
+        {
+            "keep_data": keep_data,
+            "vkey_revoked": vkey_revoked,
+        },
+    )
+    return utils._resp(200, {"id": tenant_id, "status": "deleted"})
+
+
+def _reserve_migration_slot(target, vcpu, mem_mb, attempts=8):
+    """#50/#172 — atomically claim a vm_num + capacity on a migration TARGET host.
+
+    与 create 路径 _reserve_slot 同款 CAS,为 migrate 路径抽出。修复前 migrate 用
+    `target_vm_num = int(target.get("next_vm_num"))` 裸 get + 无条件写租户记录,不抢占
+    target 的 slot、不递增 next_vm_num:两个并发迁移到同一 target host 读到同一
+    next_vm_num → 分到同一 vm_num → guest_ip/host_port 重叠 → 跨租户网络/端口串(危害轴①)。
+    此 CAS(a)确认 next_vm_num 自读取未变(b)写时复检容量不超卖(c)一次条件写自增
+    next_vm_num/used_*。CCF(竞争)则重读 target 重试。返回认领的(自增前)vm_num,或
+    None(target 无容量/持续输 CAS/已 draining/deleted)。
+
+    容量记账发生在这里(认领即递增 target used_*),所以 health_check sweep 的
+    restore-success 路径**只能减 SOURCE 计数**,绝不能再递增 target 或绝对赋值
+    next_vm_num(否则重复计账 + 覆盖并发 create 的递增,#172 defect B)。
+    """
+    instance_id = target["instance_id"]
+    h = target
+    for attempt in range(attempts):
+        expected = int(h.get("next_vm_num", 1))
+        cap_v = int(int(h["total_vcpu"]) * clients.CPU_OVERCOMMIT_RATIO) - vcpu
+        cap_m = int(int(h["total_mem_mb"]) * clients.MEM_OVERCOMMIT_RATIO) - mem_mb
+        try:
+            r = clients.hosts_table.update_item(
+                Key={"instance_id": instance_id},
+                UpdateExpression=(
+                    "SET used_vcpu = used_vcpu + :v, used_mem_mb = used_mem_mb + :m, "
+                    "vm_count = vm_count + :one, next_vm_num = next_vm_num + :one"
+                ),
+                ConditionExpression=(
+                    "next_vm_num = :expected AND used_vcpu <= :cap_v "
+                    "AND used_mem_mb <= :cap_m"
+                ),
+                ExpressionAttributeValues={
+                    ":v": vcpu,
+                    ":m": mem_mb,
+                    ":one": 1,
+                    ":expected": expected,
+                    ":cap_v": cap_v,
+                    ":cap_m": cap_m,
+                },
+                ReturnValues="UPDATED_NEW",
+            )
+            return int(r["Attributes"]["next_vm_num"]) - 1
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                raise
+            # 输了 CAS 或容量变了 — 重读 target 重试(退避)。
+            time.sleep(0.05 * (attempt + 1))
+            fresh = clients.hosts_table.get_item(
+                Key={"instance_id": instance_id}, ConsistentRead=True
+            ).get("Item")
+            if not fresh or fresh.get("status") in ("draining", "deleted"):
+                return None
+            h = fresh
+    return None
+
+
+def tenant_action(tenant_id, action, body=None, event=None):
+    item = clients.tenants_table.get_item(
+        Key={"id": tenant_id}, ConsistentRead=True
+    ).get("Item")
+    if not item:
+        return utils._resp(404, {"error": "tenant not found"})
+    # issue #80 — IDOR: gate every action (start/stop/restart/migrate/resize/
+    # backup/…) on ownership. Checked once here so all branches are covered.
+    denied = auth._assert_owner_or_admin(item, event or {})
+    if denied is not None:
+        return denied
+
+    # 控制面重构阶段1 — 产端入队:纯 lifecycle 动作(start/stop/restart/pause/resume)
+    # 只是经 SSM 下发、无特殊同步返回值,队列开启时入 SQS 由 consumer 受控并发消费
+    # (削峰 + 限流阀,治 1000/s 雪崩),立即返 202。resize/backup/migrate/access 等
+    # 有同步返回语义的不入队,保持原同步路径。开关关 → 全走同步(向后兼容)。
+    # 防重入:consumer 重放时 event 带 _consumer_ident,不再二次入队。
+    _async_actions = {"start", "stop", "restart", "pause", "resume", "reset", "rebuild"}
+    if (
+        action in _async_actions
+        and clients.LIFECYCLE_QUEUE_URL
+        and not (event or {}).get("_consumer_ident")
+    ):
+        if lifecycle_dispatch.enqueue_lifecycle(action, tenant_id, event):
+            return utils._resp(
+                202,
+                {"id": tenant_id, "action": action, "status": "queued"},
+            )
+
+    # ── Issue #16: live VM resize (hot-add vCPU) ──
+    if action == "resize":
+        return tenant_resize(tenant_id, body)
+
+    # ── Issue #22: resize-disk (offline grow of data.ext4) ──
+    if action == "resize-disk":
+        try:
+            payload = json.loads(body) if isinstance(body, str) else (body or {})
+        except Exception:
+            payload = {}
+        new_size = payload.get("new_size_mb")
+        if not isinstance(new_size, int):
+            return utils._resp(400, {"error": "missing or invalid new_size_mb"})
+        current = int(item.get("data_disk_mb", clients.VM_DATA_DISK_MB))
+        if new_size <= current:
+            return utils._resp(
+                400,
+                {
+                    "error": f"new_size_mb must be larger (current {current}MB); shrink not supported"
+                },
+            )
+        if new_size > 1024 * 1024:
+            return utils._resp(400, {"error": "new_size_mb exceeds 1 TiB ceiling"})
+        host_id = item.get("host_id")
+        vm_num = int(item.get("vm_num", 1))
+        if not host_id:
+            return utils._resp(400, {"error": "tenant has no host (still pending?)"})
+        # Issue #64-class fix: resize-disk.sh was never deployed (same defect
+        # as migrate-vm.sh) AND this path was fire-and-forget — it flipped
+        # data_disk_mb in DDB before the host had even run the script, so DDB
+        # claimed the new size whether or not the ext4 grow actually happened.
+        # Now: run synchronously, and only persist the new size on Success.
+        if not ssm_dispatch._ssm_run(
+            host_id,
+            f"/home/ubuntu/resize-disk.sh {tenant_id} {vm_num} {new_size}",
+            timeout=120,
+        ):
+            return utils._resp(
+                502,
+                {
+                    "error": "resize-disk.sh failed on host; size unchanged",
+                    "id": tenant_id,
+                    "data_disk_mb": current,
+                },
+            )
+        clients.tenants_table.update_item(
+            Key={"id": tenant_id},
+            UpdateExpression="SET data_disk_mb = :s, updated_at = :t",
+            ExpressionAttributeValues={":s": new_size, ":t": utils._now()},
+        )
+        return utils._resp(
+            200,
+            {
+                "id": tenant_id,
+                "status": "running",
+                "old_size_mb": current,
+                "new_size_mb": new_size,
+            },
+        )
+
+    if action == "migrate":
+        # Live migration via Firecracker snapshot/restore (issue #20).
+        # Body shape: {"target_host_id": "i-...."}
+        # Firecracker can't snapshot a VM with an active balloon device, live migrate is unavailable while balloon is on (issue #72).
+        # Reject up front instead of failing ~minutes later in the snapshot step.
+        if clients.BALLOON_ENABLED:
+            return utils._resp(
+                409,
+                {
+                    "error": "Live migration isn't available while memory overcommit (balloon) is on. To move this tenant, back it up, recreate it on the target host, then restore the backup — no data is lost.",
+                    "reason": "balloon_enabled",
+                },
+            )
+        try:
+            payload = json.loads(body) if isinstance(body, str) else (body or {})
+        except Exception:
+            payload = {}
+        target_host_id = payload.get("target_host_id")
+        if not target_host_id:
+            return utils._resp(400, {"error": "missing target_host_id"})
+        source_host_id = item.get("host_id")
+        if target_host_id == source_host_id:
+            return utils._resp(
+                400, {"error": "target_host_id must be different from source"}
+            )
+        target = clients.hosts_table.get_item(
+            Key={"instance_id": target_host_id}, ConsistentRead=True
+        ).get("Item")
+        if not target:
+            return utils._resp(
+                404, {"error": f"target host {target_host_id} not found"}
+            )
+        if target.get("status") in ("draining", "deleted"):
+            return utils._resp(
+                409, {"error": f"target host {target_host_id} is {target['status']}"}
+            )
+
+        # Capacity check — same allocatable formula as _find_host().
+        vcpu = int(item.get("vcpu", 0))
+        mem_mb = int(item.get("mem_mb", 0))
+        allocatable_vcpu = int(int(target["total_vcpu"]) * clients.CPU_OVERCOMMIT_RATIO)
+        free_vcpu = allocatable_vcpu - int(target.get("used_vcpu", 0))
+        allocatable_mem = int(
+            int(target["total_mem_mb"]) * clients.MEM_OVERCOMMIT_RATIO
+        )
+        free_mem = allocatable_mem - int(target.get("used_mem_mb", 0))
+        if free_vcpu < vcpu or free_mem < mem_mb:
+            return utils._resp(
+                409,
+                {
+                    "error": (
+                        f"target host has insufficient capacity "
+                        f"(free vcpu={free_vcpu}, free mem={free_mem}MB; "
+                        f"need vcpu={vcpu}, mem={mem_mb}MB)"
+                    )
+                },
+            )
+
+        vm_num = int(item.get("vm_num", 1))
+        bucket = os.environ.get("ASSETS_BUCKET", "")
+        snap_prefix = f"migrations/{tenant_id}"
+        # #172 — CAS 原子占 target host 的 vm_num + 容量(替代裸 get,防两个并发迁移到
+        # 同一 target 抢同一 vm_num → guest_ip/host_port 串)。占不到(target 无容量/持续
+        # 输 CAS)→ fail migrate,不落 migrating 态(否则租户卡 migrating 且没抢到 slot)。
+        target_vm_num = _reserve_migration_slot(target, vcpu, mem_mb)
+        if target_vm_num is None:
+            return utils._resp(
+                503,
+                {
+                    "error": "migration target has no capacity (lost CAS / full); "
+                    "retry later or pick another target",
+                },
+            )
+        now = utils._now()
+
+        # ── Issue #64 — ASYNC, fail-safe migration ──
+        # A correct migration runs snapshot(source)+restore(target), which now
+        # ship multi-GB disk images and take *minutes*. API Gateway caps a
+        # synchronous integration at 29s, so we cannot block here (an earlier
+        # synchronous version returned "Endpoint request timed out" and could
+        # leave the tenant stuck in `migrating`). Instead:
+        #   1. Do all the cheap validation synchronously (done above).
+        #   2. Fire-and-forget the snapshot via _ssm_send (returns a CommandId).
+        #   3. Record migrating + the async context in DDB and return 202.
+        # The health_check Lambda's 5-min sweep (_advance_migration) polls the
+        # SSM CommandId, triggers restore when snapshot succeeds, verifies the
+        # dashboard through the public path, and only then flips host_id /
+        # counters / routing → running. Any failure (or a 15-min watchdog)
+        # rolls status back to running with host_id untouched, so the tenant
+        # is never left pointing at a host with no VM. The source of truth is
+        # only mutated after the whole move is proven — same fail-safe contract
+        # as before, just driven out-of-band instead of in the request path.
+
+        snap_cmd = ssm_dispatch._ssm_send(
+            source_host_id,
+            f"/home/ubuntu/migrate-vm.sh snapshot {tenant_id} {vm_num} "
+            f"s3://{bucket}/{snap_prefix}",
+            timeout=600,  # snapshot + multi-GB disk upload to S3
+        )
+        if not snap_cmd:
+            # #172 — SSM submit 失败,啥都没起。但上面已 CAS 占了 target 的 slot,且这里
+            # 在写 status=migrating **之前**就 bail,sweep 只扫 migrating 租户 → 永远看不到
+            # 它、_rollback_migration 不会触发 → target host 的 used_vcpu/used_mem_mb/vm_count
+            # 永久泄漏(2026-07-01 SSM ThrottlingException 在 380 突发下的失败模式)。必须
+            # 在 502 前释放预留,镜像 create 路径的 _release_slot-on-failure(本文件 :901/960)。
+            scheduling._release_slot(target_host_id, vcpu, mem_mb)
+            return utils._resp(
+                502,
+                {
+                    "error": "failed to start migration (SSM submit)",
+                    "id": tenant_id,
+                    "source_host_id": source_host_id,
+                    "target_host_id": target_host_id,
+                },
+            )
+
+        # Mark migrating + stash everything the sweep needs to finish the move.
+        # No host_id / counter / routing change happens here — only after the
+        # sweep proves snapshot+restore+dashboard all succeeded.
+        clients.tenants_table.update_item(
+            Key={"id": tenant_id},
+            UpdateExpression=(
+                "SET #s = :s, migration_target = :tgt, "
+                "migration_target_vm_num = :tvn, migration_source = :src, "
+                "migration_snap_cmd = :scmd, migration_phase = :ph, "
+                "migration_started_at = :st, migration_snapshot_uri = :uri, "
+                "updated_at = :t"
+            ),
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":s": "migrating",
+                ":tgt": target_host_id,
+                ":tvn": target_vm_num,
+                ":src": source_host_id,
+                ":scmd": snap_cmd,
+                ":ph": "snapshot",
+                ":st": now,
+                ":uri": f"s3://{bucket}/{snap_prefix}",
+                ":t": now,
+            },
+        )
+
+        # 202 Accepted: the move is in flight. Clients poll GET /tenants/{id}
+        # until status is `running` (success) or back to its prior value with
+        # migration_failed set (failure).
+        return utils._resp(
+            202,
+            {
+                "id": tenant_id,
+                "status": "migrating",
+                "source_host_id": source_host_id,
+                "target_host_id": target_host_id,
+                "snapshot_uri": f"s3://{bucket}/{snap_prefix}",
+                "poll": f"/tenants/{tenant_id}",
+            },
+        )
+
+    if action == "restart":
+        vm_num = int(item.get("vm_num", 1))
+        guest_ip = item.get("guest_ip", "")
+        host_port = item.get("host_port", "")
+        stop_cmd = f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num}"
+        # #41 — 通过 helper 生成带全部 11 位参数的命令,穿透 chat_endpoint_enabled
+        # 到 launch-vm 幂等段;老版本只填 4 位、CHAT_EP_ENABLED 恒空致唤醒漂移。
+        launch_cmd = ssm_dispatch._launch_vm_wake_cmd(tenant_id, item)
+        # Re-add DNAT after restart
+        dnat_cmd = (
+            (
+                f"sudo iptables --wait 3 -t nat -A PREROUTING "
+                f"-p tcp --dport {host_port} -j DNAT --to-destination {guest_ip}:{clients.VM_PORT_BASE}"
+            )
+            if guest_ip and host_port
+            else ""
+        )
+        full_cmd = f"{stop_cmd} && sleep 2 && {launch_cmd}"
+        if dnat_cmd:
+            full_cmd += f" && {dnat_cmd}"
+        ssm_dispatch._ssm_run(item["host_id"], full_cmd, timeout=300)
+        new_status = "running"
+    elif action == "stop":
+        vm_num = int(item.get("vm_num", 1))
+        guest_ip = item.get("guest_ip", "")
+        host_port = item.get("host_port", "")
+        stop_cmd = f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num}"
+        # Remove DNAT rule
+        dnat_del = (
+            (
+                f"sudo iptables --wait 3 -t nat -D PREROUTING "
+                f"-p tcp --dport {host_port} -j DNAT --to-destination {guest_ip}:{clients.VM_PORT_BASE} 2>/dev/null || true"
+            )
+            if guest_ip and host_port
+            else ""
+        )
+        full_cmd = stop_cmd
+        if dnat_del:
+            full_cmd += f" && {dnat_del}"
+        ssm_dispatch._ssm_run(item["host_id"], full_cmd)
+        new_status = "stopped"
+    elif action == "start":
+        vm_num = int(item.get("vm_num", 1))
+        guest_ip = item.get("guest_ip", "")
+        host_port = item.get("host_port", "")
+        # #41 — 通过 helper 生成带全部 11 位参数的命令,穿透 chat_endpoint_enabled
+        # 到 launch-vm 幂等段;老版本只填 4 位、CHAT_EP_ENABLED 恒空致唤醒漂移。
+        launch_cmd = ssm_dispatch._launch_vm_wake_cmd(tenant_id, item)
+        dnat_cmd = (
+            (
+                f"sudo iptables --wait 3 -t nat -A PREROUTING "
+                f"-p tcp --dport {host_port} -j DNAT --to-destination {guest_ip}:{clients.VM_PORT_BASE}"
+            )
+            if guest_ip and host_port
+            else ""
+        )
+        full_cmd = launch_cmd
+        if dnat_cmd:
+            full_cmd += f" && {dnat_cmd}"
+        ssm_dispatch._ssm_run(item["host_id"], full_cmd, timeout=300)
+        new_status = "running"
+    elif action == "reset":
+        vm_num = int(item.get("vm_num", 1))
+        guest_ip = item.get("guest_ip", "")
+        host_port = item.get("host_port", "")
+        # Stop, delete overlay (force fresh layer), then launch
+        stop_cmd = f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num}"
+        reset_cmd = f"rm -f /data/firecracker-vms/{tenant_id}/overlay.ext4"
+        # #41 — 通过 helper 生成带全部 11 位参数的命令,穿透 chat_endpoint_enabled
+        # 到 launch-vm 幂等段;老版本只填 4 位、CHAT_EP_ENABLED 恒空致唤醒漂移。
+        launch_cmd = ssm_dispatch._launch_vm_wake_cmd(tenant_id, item)
+        dnat_cmd = (
+            (
+                f"sudo iptables --wait 3 -t nat -A PREROUTING "
+                f"-p tcp --dport {host_port} -j DNAT --to-destination {guest_ip}:{clients.VM_PORT_BASE}"
+            )
+            if guest_ip and host_port
+            else ""
+        )
+        full_cmd = f"{stop_cmd} && {reset_cmd} && sleep 2 && {launch_cmd}"
+        if dnat_cmd:
+            full_cmd += f" && {dnat_cmd}"
+        ssm_dispatch._ssm_run(item["host_id"], full_cmd, timeout=300)
+        new_status = "running"
+    elif action == "rebuild":
+        # Phase 4 — in-place UPGRADE this tenant's VM to the host's CURRENT rootfs
+        # (the version refresh_rootfs just staged in /data/firecracker-assets).
+        # The host's golden image is read-only and the per-VM overlay is the only
+        # writable rootfs layer, so dropping the overlay + relaunching boots the VM
+        # on the NEW rootfs. The user's data.ext4 (the data disk, separate from the
+        # overlay) is PRESERVED — identity/skills/config/channel_secret/vkey live
+        # there and survive. This is how a rolling upgrade lands: refresh_rootfs to
+        # stage the new image on hosts → rebuild each tenant to adopt it. Same
+        # mechanism as reset, but the intent is "upgrade", and we record the new
+        # rootfs_version on the tenant so GET /tenants shows the post-upgrade drift.
+        vm_num = int(item.get("vm_num", 1))
+        guest_ip = item.get("guest_ip", "")
+        host_port = item.get("host_port", "")
+        stop_cmd = f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num}"
+        # Drop the overlay so the refreshed read-only rootfs layer takes effect;
+        # data.ext4 (user data) is untouched.
+        drop_overlay = f"rm -f /data/firecracker-vms/{tenant_id}/overlay.ext4"
+        # #41 — 通过 helper 生成带全部 11 位参数的命令,穿透 chat_endpoint_enabled
+        # 到 launch-vm 幂等段;老版本只填 4 位、CHAT_EP_ENABLED 恒空致唤醒漂移。
+        launch_cmd = ssm_dispatch._launch_vm_wake_cmd(tenant_id, item)
+        dnat_cmd = (
+            (
+                f"sudo iptables --wait 3 -t nat -A PREROUTING "
+                f"-p tcp --dport {host_port} -j DNAT --to-destination {guest_ip}:{clients.VM_PORT_BASE}"
+            )
+            if guest_ip and host_port
+            else ""
+        )
+        full_cmd = f"{stop_cmd} && {drop_overlay} && sleep 2 && {launch_cmd}"
+        if dnat_cmd:
+            full_cmd += f" && {dnat_cmd}"
+        ssm_dispatch._ssm_run(item["host_id"], full_cmd, timeout=300)
+        new_status = "running"
+    elif action == "pause":
+        vm_dir = f"/data/firecracker-vms/{tenant_id}"
+        ssm_dispatch._ssm_run(
+            item["host_id"],
+            f"curl -s --unix-socket {vm_dir}/fc.sock -X PATCH http://localhost/vm "
+            f'-H "Content-Type: application/json" -d \'{{"state":"Paused"}}\'',
+        )
+        new_status = "paused"
+    elif action == "resume":
+        vm_dir = f"/data/firecracker-vms/{tenant_id}"
+        ssm_dispatch._ssm_run(
+            item["host_id"],
+            f"curl -s --unix-socket {vm_dir}/fc.sock -X PATCH http://localhost/vm "
+            f'-H "Content-Type: application/json" -d \'{{"state":"Resumed"}}\'',
+        )
+        new_status = "running"
+    elif action == "backup":
+        # Async invoke Backup Lambda with single tenant
+        lambda_client = boto3.client("lambda")
+        lambda_client.invoke(
+            FunctionName=os.environ.get("BACKUP_FUNCTION", "openclaw-backup"),
+            InvocationType="Event",  # async, returns immediately
+            Payload=json.dumps({"tenant_id": tenant_id}).encode(),
+        )
+        audit._publish_event("tenant.backup_started", tenant_id, {})
+        return utils._resp(
+            202, {"id": tenant_id, "action": "backup", "status": "started"}
+        )
+    elif action == "access":
+        # Explicit tenant authorization (P0): owner/admin grants or revokes
+        # another Cognito sub access to this tenant. Gated by _assert_owner_or_admin
+        # above (only owner/admin can manage grants — least privilege). The grant
+        # list lives in the tenant record's `authorized_users` map and the hub
+        # consults it for /token + /files + WS. Audited via _audit_write (caller).
+        return tenant_access_grant(tenant_id, item, body)
+    elif action == "provision":
+        # #106 — 两段式下单/开通状态机的第二段:pending → provisioned。
+        # 这是「业务开通」(把一笔已下单的租户标记为业务可用),与 VM 生命周期
+        # status(creating/running)正交,所以走独立字段 purchase_status、独立
+        # 分支直接返回(不落到底部那套改 status 的通用更新)。
+        # 幂等 + 防错序:CAS 条件更新 purchase_status = pending 才翻 provisioned。
+        #   • 记录本来就没有购买语义(从没下过单)→ 400,不允许凭空开通。
+        #   • 已经是 provisioned → 200 幂等返回(重复 provision 不报错、不副作用)。
+        #   • 处于 pending → 原子翻成 provisioned(ConditionExpression 防并发双开)。
+        cur = item.get("purchase_status")
+        if cur is None:
+            return utils._err(
+                400,
+                "VALIDATION",
+                "tenant has no purchase to provision (create it with an order first)",
+                extra={"id": tenant_id},
+            )
+        if cur == _PURCHASE_PROVISIONED:
+            return utils._resp(
+                200,
+                {
+                    "id": tenant_id,
+                    "purchase_status": _PURCHASE_PROVISIONED,
+                    "message": "already provisioned",
+                },
+            )
+        try:
+            clients.tenants_table.update_item(
+                Key={"id": tenant_id},
+                UpdateExpression="SET purchase_status = :prov, provisioned_at = :t, updated_at = :t",
+                ConditionExpression="purchase_status = :pend",
+                ExpressionAttributeValues={
+                    ":prov": _PURCHASE_PROVISIONED,
+                    ":pend": _PURCHASE_PENDING,
+                    ":t": utils._now(),
+                },
+            )
+        except (
+            clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException
+        ):
+            # Lost the CAS race (a concurrent provision already flipped it) — the
+            # end state is provisioned either way, so report success idempotently.
+            return utils._resp(
+                200,
+                {
+                    "id": tenant_id,
+                    "purchase_status": _PURCHASE_PROVISIONED,
+                    "message": "already provisioned",
+                },
+            )
+        audit._publish_event("tenant.provisioned", tenant_id, {})
+        return utils._resp(
+            200,
+            {
+                "id": tenant_id,
+                "purchase_status": _PURCHASE_PROVISIONED,
+                "provisioned": True,
+            },
+        )
+    else:
+        return utils._resp(400, {"error": f"unknown action: {action}"})
+
+    update_expr = "SET #s = :s, updated_at = :t"
+    expr_values = {":s": new_status, ":t": utils._now()}
+    if action in ("reset", "rebuild"):
+        # Record the host's current rootfs_version on the tenant: after a rebuild
+        # the VM runs whatever version the host has staged, so GET /tenants must
+        # reflect that (drift visibility — who's been upgraded, who's stale).
+        host = clients.hosts_table.get_item(
+            Key={"instance_id": item["host_id"]}, ConsistentRead=True
+        ).get("Item", {})
+        update_expr += ", rootfs_version = :rv"
+        expr_values[":rv"] = host.get("rootfs_version", "")
+
+    clients.tenants_table.update_item(
+        Key={"id": tenant_id},
+        UpdateExpression=update_expr,
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues=expr_values,
+    )
+    # Issue #13 — publish lifecycle event for the action.
+    # Map action verbs to lifecycle event names so consumers can filter.
+    _action_to_event = {
+        "stop": "tenant.stopped",
+        "start": "tenant.started",
+        "restart": "tenant.restarted",
+        "pause": "tenant.paused",
+        "resume": "tenant.resumed",
+        "reset": "tenant.reset",
+        "rebuild": "tenant.rebuilt",
+    }
+    event_name = _action_to_event.get(action, f"tenant.{new_status}")
+    audit._publish_event(
+        event_name, tenant_id, {"action": action, "status": new_status}
+    )
+    return utils._resp(200, {"id": tenant_id, "status": new_status})
+
+
+def tenant_access_grant(tenant_id, item, body):
+    """Grant or revoke a Cognito sub's access to a tenant (explicit authz, P0).
+
+    Body: { "principal": "<cognito-sub>", "op": "grant"|"revoke",
+            "role": "member"|"viewer"|... (grant only), "expire_at": <epoch?> }
+    The owner is implicit (owner_id) and cannot be revoked here. Writes the
+    tenant record's `authorized_users` map: { sub: {role, granted_at, expire_at?} }.
+    Caller already passed _assert_owner_or_admin, so only owner/admin reach here.
+    """
+    try:
+        payload = json.loads(body) if isinstance(body, str) else (body or {})
+    except Exception:
+        payload = {}
+    principal = str(payload.get("principal", "")).strip()
+    op = str(payload.get("op", "grant")).strip().lower()
+    if not principal:
+        return utils._resp(400, {"error": "missing principal (cognito sub)"})
+    if op not in ("grant", "revoke"):
+        return utils._resp(400, {"error": "op must be grant or revoke"})
+    owner = item.get("owner_id")
+    if principal == owner:
+        return utils._resp(
+            400, {"error": "owner access is implicit and cannot be modified"}
+        )
+    current = item.get("authorized_users")
+    if not isinstance(current, dict):
+        current = {}
+    if op == "revoke":
+        current.pop(principal, None)
+    else:
+        role = str(payload.get("role", "member")).strip() or "member"
+        grant = {"role": role, "granted_at": utils._now()}
+        exp = payload.get("expire_at")
+        if isinstance(exp, (int, float)) and exp > 0:
+            grant["expire_at"] = int(exp)
+        current[principal] = grant
+    clients.tenants_table.update_item(
+        Key={"id": tenant_id},
+        UpdateExpression="SET authorized_users = :a, updated_at = :t",
+        ExpressionAttributeValues={":a": current, ":t": utils._now()},
+    )
+    audit._publish_event(
+        "tenant.access_changed", tenant_id, {"principal": principal, "op": op}
+    )
+    return utils._resp(200, {"id": tenant_id, "authorized_users": current})
+
+
+def _resolve_backup(src_tenant_id, timestamp=None):
+    """Return the S3 key of a backup, or empty string if not found.
+    If timestamp is given, look up that exact backup. Otherwise return the most recent.
+    """
+    bucket = os.environ.get("ASSETS_BUCKET", "")
+    prefix = os.environ.get("BACKUP_PREFIX", "backups")
+    resp = clients.s3.list_objects_v2(
+        Bucket=bucket, Prefix=f"{prefix}/{src_tenant_id}/"
+    )
+    objs = resp.get("Contents", [])
+    if not objs:
+        return ""
+    if timestamp:
+        key = f"{prefix}/{src_tenant_id}/{timestamp}.gz"
+        return key if any(o["Key"] == key for o in objs) else ""
+    # Latest = highest LastModified
+    return max(objs, key=lambda o: o["LastModified"])["Key"]
+
+
+def tenant_resize(tenant_id, body):
+    """POST /tenants/{id}/resize — hot-add vCPU on a running tenant."""
+    if body is None:
+        return utils._resp(400, {"error": "missing body"})
+    try:
+        body = json.loads(body) if isinstance(body, str) else body
+    except (ValueError, TypeError):
+        return utils._resp(400, {"error": "invalid json"})
+    if not isinstance(body, dict):
+        return utils._resp(400, {"error": "body must be a JSON object"})
+    new_vcpu = body.get("vcpu")
+    new_mem = body.get("mem_mb")
+    if new_vcpu is None and new_mem is None:
+        return utils._resp(
+            400, {"error": "specify vcpu (memory live-resize not supported)"}
+        )
+    if new_mem is not None:
+        return utils._resp(
+            400,
+            {
+                "error": "memory live-resize is not supported; "
+                "stop the tenant, recreate with new mem_mb, then start"
+            },
+        )
+    try:
+        new_vcpu = int(new_vcpu)
+    except (TypeError, ValueError):
+        return utils._resp(400, {"error": "vcpu must be an integer"})
+    item = clients.tenants_table.get_item(
+        Key={"id": tenant_id}, ConsistentRead=True
+    ).get("Item")
+    if not item:
+        return utils._resp(404, {"error": "tenant not found"})
+    if item.get("status") != "running":
+        return utils._resp(
+            400, {"error": f"tenant must be running (current: {item.get('status')})"}
+        )
+    current_vcpu = int(item.get("vcpu", 0))
+    if new_vcpu <= current_vcpu:
+        return utils._resp(
+            400,
+            {
+                "error": f"vcpu must be greater than current ({current_vcpu}); "
+                "Firecracker cannot shrink — restart to decrease"
+            },
+        )
+    quota_err = scheduling._check_quota(
+        new_vcpu, int(item.get("mem_mb", 0)), int(item.get("data_disk_mb", 0))
+    )
+    if quota_err:
+        return utils._resp(400, {"error": quota_err})
+    host_id = item.get("host_id", "")
+    if not host_id:
+        return utils._resp(400, {"error": "tenant has no host assigned"})
+    host = clients.hosts_table.get_item(
+        Key={"instance_id": host_id}, ConsistentRead=True
+    ).get("Item")
+    if not host:
+        return utils._resp(400, {"error": f"host {host_id} not found"})
+    delta = new_vcpu - current_vcpu
+    allocatable = int(int(host["total_vcpu"]) * clients.CPU_OVERCOMMIT_RATIO)
+    free = allocatable - int(host["used_vcpu"])
+    if delta > free:
+        return utils._resp(
+            400,
+            {
+                "error": f"insufficient host capacity: need {delta} more vCPU, "
+                f"host has {free} free (allocatable={allocatable}, used={host['used_vcpu']})"
+            },
+        )
+    vm_dir = f"/data/firecracker-vms/{tenant_id}"
+    cmd = (
+        f"curl -sf --unix-socket {vm_dir}/fc.sock -X PATCH http://localhost/machine-config "
+        f'-H "Content-Type: application/json" '
+        f'-d \'{{"vcpu_count":{new_vcpu},"mem_size_mib":{int(item["mem_mb"])}}}\''
+    )
+    if not ssm_dispatch._ssm_run(host_id, cmd, timeout=30):
+        return utils._resp(
+            502, {"error": "Firecracker machine-config PATCH failed; tenant unchanged"}
+        )
+    now = utils._now()
+    clients.tenants_table.update_item(
+        Key={"id": tenant_id},
+        UpdateExpression="SET vcpu = :v, updated_at = :t",
+        ExpressionAttributeValues={":v": new_vcpu, ":t": now},
+    )
+    clients.hosts_table.update_item(
+        Key={"instance_id": host_id},
+        UpdateExpression="SET used_vcpu = used_vcpu + :v",
+        ExpressionAttributeValues={":v": delta},
+    )
+    return utils._resp(
+        200,
+        {
+            "id": tenant_id,
+            "vcpu": new_vcpu,
+            "mem_mb": int(item["mem_mb"]),
+            "delta": delta,
+        },
+    )

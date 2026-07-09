@@ -1,0 +1,84 @@
+# 自建 Prometheus + Grafana 运行时监控栈(EC2 自托管,替代 AMP/AMG)。
+#
+# 为什么自托管而非 AWS Managed Prometheus(AMP)+ Managed Grafana(AMG):
+#   AMG 强制走 IAM Identity Center(SSO)登录,本环境没配 SSO。本栈用
+#   Grafana 自带的 admin 账号(密码走环境变量),起一台监控 EC2 即可用。
+#
+# 抓取源: 每台 metal host 的 host-agent 在 :8899/metrics 暴露 Prom text
+#   (见 deploy/userdata/host-agent.py:_render_metrics_text,7 个 gauge)。
+#   host-agent 在私网(metal host 内网 IP),所以这台监控 EC2 必须与
+#   metal host 同 VPC、SG 允许它出站到 host 的 8899。target 发现见 prometheus.yml。
+#
+# 起在一台专用监控 EC2(非 metal host,隔离爆炸半径)上:
+#   docker compose --env-file .env -f docker-compose.prom-grafana.yml up -d
+# 凭据(Grafana admin 密码)走 .env(不提交);见 MONITORING-RUNBOOK.md §3。
+#
+# 安全边界(硬红线): Prometheus 9090 / Grafana 3000 入站只对 VPC CIDR 或
+#   堡垒机 SG / 办公 IP 开,绝不 0.0.0.0/0(见 runbook §2 + setup 脚本)。
+version: "3.8"
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    hostname: prometheus
+    restart: always
+    user: "65534:65534" # nobody — 容器内非 root 写 TSDB 卷
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d" # 留 15 天,按盘大小调
+      - "--web.enable-lifecycle" # 允许 POST /-/reload 热加载抓取配置
+      - "--web.listen-address=0.0.0.0:9090" # 容器内监听;对外暴露面由 SG/端口映射控制
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./targets:/etc/prometheus/targets:ro # file_sd 占位目录(ec2_sd 用不到也无害)
+      - prometheus_data:/prometheus
+    ports:
+      # 仅当 SG 已锁 VPC CIDR/堡垒机时才暴露。生产建议只 bind 127.0.0.1
+      # 走 SSH 隧道看,或前置 ALB+ACM。绝不靠 0.0.0.0/0 SG。
+      - "9090:9090"
+    networks: [monitoring]
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    hostname: grafana
+    restart: always
+    environment:
+      # admin 密码不硬编码,从 .env 注入(见 runbook §3)。
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
+      - GF_USERS_ALLOW_SIGN_UP=false # 关注册,只管理员建账号
+      - GF_AUTH_ANONYMOUS_ENABLED=false # 关匿名访问
+      - GF_SERVER_ROOT_URL=${GRAFANA_ROOT_URL:-http://localhost:3000}
+    volumes:
+      # datasource + dashboard 自动 provisioning(随仓库迭代,无需手点 UI)。
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      # 同 Prometheus: 仅在 SG 锁定后暴露,绝不 0.0.0.0/0。
+      - "3000:3000"
+    depends_on: [prometheus]
+    networks: [monitoring]
+
+  # node_exporter — 采本台监控 EC2 自身的 CPU/内存/盘(自监控)。
+  # metal host 的指标走 host-agent:8899,不靠这个;这个只看监控机自身健康。
+  node_exporter:
+    image: prom/node-exporter:v1.8.1
+    hostname: node-exporter
+    restart: always
+    command:
+      - "--path.rootfs=/host"
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+    # 不映射端口到宿主公网;Prometheus 经 monitoring 网络内部抓 node-exporter:9100。
+    networks: [monitoring]
+
+volumes:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  monitoring:
+    driver: bridge

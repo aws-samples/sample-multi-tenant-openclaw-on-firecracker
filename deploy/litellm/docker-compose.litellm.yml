@@ -1,0 +1,107 @@
+# LiteLLM LLM 网关 + Postgres（per-tenant vkey / spend 持久化）。
+#
+# 角色：数据面 chat 推理的前提。guest microVM 里的 OpenClaw 走
+#   http://<host>:4000/v1 → LiteLLM → Bedrock（ap-southeast-1）。
+#   见 templates/openclaw.json 的 .models.providers.litellm.baseUrl = http://__LITELLM_HOST__:4000/v1。
+#
+# 跑在哪：当前阶段跑在堡垒机（admin instance role + docker）。LiteLLM 用
+#   宿主的 instance role 调 Bedrock（不放静态 AWS key，只给 AWS_REGION）。
+#
+# 起法（在堡垒机 ~/openclaw/deploy/litellm/）：
+#   ./litellm-up.sh        # 注入 guardrail ID + 生成 master_key 写 .env(600) + compose up
+#   ./litellm-down.sh      # compose down（保留 pg 卷，spend 不丢）
+# 详见同目录 LITELLM-RUNBOOK.md。
+#
+# 安全边界（硬红线，见 runbook §安全）：
+#   - LiteLLM 4000 端口映射到宿主，但 SG 入站只对 VPC CIDR(172.31.0.0/16) 开，
+#     绝不 0.0.0.0/0。guest microVM 经 metal host 用私网 IP 访问。
+#   - Postgres 不映射宿主端口，只在 compose 内网（litellm-net）暴露给 LiteLLM。
+#   - master_key / pg 密码走 .env(600,不提交)；config 里 __GUARDRAIL_ID__ 起容器前 sed 注入。
+
+services:
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    hostname: litellm
+    restart: always
+    # 容器内 LiteLLM 监听 0.0.0.0:4000；对外暴露面由宿主端口映射 + SG 控制。
+    command:
+      [
+        "--config",
+        "/etc/litellm/config.yaml",
+        "--port",
+        "4000",
+        "--num_workers",
+        "4",
+      ]
+    environment:
+      # master_key：管理 API（/key/generate 等）的根凭据。从 .env 注入，绝不硬编码。
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY 必须在 .env 设置（litellm-up.sh 自动生成）}
+      # spend/vkey 持久化到 compose 内网 postgres。
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-litellm}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 必须在 .env 设置}@litellm-db:5432/${POSTGRES_DB:-litellm}
+      # Bedrock 走宿主 instance role：只给 region，不放 AWS key（无硬编码密钥）。
+      - AWS_REGION=${AWS_REGION:-ap-southeast-1}
+      - AWS_REGION_NAME=${AWS_REGION:-ap-southeast-1}
+      # store_model_in_db 关：模型清单以 config.yaml 为准（随仓库迭代，不靠 DB 漂移）。
+      - STORE_MODEL_IN_DB=False
+    volumes:
+      # 起容器前由 litellm-up.sh 把 __GUARDRAIL_ID__ sed 成真实 ID，产出 config.runtime.yaml（不提交）。
+      - ./config.runtime.yaml:/etc/litellm/config.yaml:ro
+    ports:
+      # 4000 映射到宿主全网卡(0.0.0.0)，使 VPC 内 metal host 可达；
+      # 真正的暴露控制在 SG（只放 172.31.0.0/16），见 runbook。绝不靠 0.0.0.0/0 SG。
+      - "4000:4000"
+    # depends_on 用 required=false, 让 HA 模式(litellm-db 不启动, DATABASE_URL
+    # 指向外部 RDS Multi-AZ)不因缺 litellm-db 服务而报错; 单机模式(默认)
+    # 会连 litellm-db profile 一起起, healthcheck 通过后 litellm 启动。
+    depends_on:
+      litellm-db:
+        condition: service_healthy
+        required: false
+    healthcheck:
+      # LiteLLM 自带存活探针；用 python（镜像自带）避免依赖 curl。
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://localhost:4000/health/liveliness',timeout=4).status==200 else sys.exit(1)",
+        ]
+      interval: 15s
+      timeout: 6s
+      retries: 10
+      start_period: 40s
+    networks: [litellm-net]
+
+  litellm-db:
+    image: postgres:16-alpine
+    hostname: litellm-db
+    restart: always
+    # HA 模式(#187 P6)不启动本服务, 由 CDK 建 RDS PostgreSQL Multi-AZ 提供共享
+    # PG(两台 LiteLLM 实例连同一份 vkey/spend 表, 避免分裂)。docker compose
+    # --profile embedded-db up 才起本服务(单机模式默认行为, 见 litellm-up.sh)。
+    profiles: ["embedded-db"]
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-litellm}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 必须在 .env 设置}
+      - POSTGRES_DB=${POSTGRES_DB:-litellm}
+    volumes:
+      - litellm_pgdata:/var/lib/postgresql/data
+    # 不映射宿主端口：postgres 只在 compose 内网对 litellm 可见，外部不可达。
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-litellm} -d ${POSTGRES_DB:-litellm}",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks: [litellm-net]
+
+volumes:
+  litellm_pgdata:
+
+networks:
+  litellm-net:
+    driver: bridge

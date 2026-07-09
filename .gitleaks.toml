@@ -1,0 +1,39 @@
+# .gitleaks.toml — credential-scan config for this sample.
+# Inherits gitleaks' default rule set (AWS/GitHub/Slack/private keys, etc.) and
+# adds an allowlist for obvious test fixtures and desensitized placeholders.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test fixtures and desensitized placeholders — not real credentials"
+paths = [
+  '''.*\.example$''',
+  '''.*\.md$''',
+  '''.*\.svg$''',
+  '''.*\.lock$''',
+  '''uv\.lock''',
+  # unit/integration test fixtures carry synthetic keys as test input
+  '''tests/.*''',
+  '''.*/test/.*\.(test\.)?mjs$''',
+  '''samples/.*/test/.*''',
+  '''samples/.*/tests/.*''',
+]
+regexes = [
+  '''REDACTED''',
+  '''<[a-zA-Z_]+>''',
+  '''(?i)example|placeholder|dummy|invalid|your[_-]|xxxxxxxx''',
+  # AWS docs conventional placeholder account
+  '''123456789012''',
+  '''000000000000''',
+  # repeating-hex synthetic test key
+  '''(?i)^(00112233445566778899aabbccddeeff)$''',
+]
+stopwords = [
+  "example",
+  "placeholder",
+  "redacted",
+  "dummy",
+  "sample",
+  "invalid",
+]

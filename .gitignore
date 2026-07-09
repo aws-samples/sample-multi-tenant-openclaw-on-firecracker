@@ -1,0 +1,134 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment & Secrets
+.venv/
+.env
+.env.*
+!.env.example
+# LiteLLM 起容器前注入 guardrail ID 的运行态产物(含账号特定 ID),不进仓库
+config.runtime.yaml
+# EKS 部署时填真值的运行态产物(含账号ID/资源ID/HMAC),只留占位符模板进仓库
+*.filled.yaml
+deploy/eks/*.filled.yaml
+.dev
+local-dev
+config.yml
+openclaw.json
+
+# ── Per-sample private config & credentials (config/) ──
+# Each sample image's config/ holds deployment-specific config and
+# secrets (real openclaw.json, exchange keys). The .example placeholders ARE tracked;
+# real values must not be. DEV NOTE: kept tracked for now so prompt-injection /
+# guardrail interception can be tested against realistic config. Before open-source
+# publish, uncomment the next line to ignore real values (keep *.example):
+# samples/*/config/*
+# !samples/*/config/*.example
+# !samples/*/config/README.md
+
+# 本地开发交接文档,含真实凭据,禁止 commit/push
+# (develop-dev 已清空并整合进 engineering:正式内容进四件套知识库,
+#  IDEA 笔记进 (internal design docs),目录删除)
+DEPLOYMENT-INFO.md
+HANDOFF-压测交接.md
+
+# Logs
+logs/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+# ruff lint cache — gets cp'd into the read-only golden image by build-rootfs.sh
+# if left under samples/finance-agent/skills/; keep it out of git and out of the baked image.
+.ruff_cache/
+dist/
+build/
+*.egg-info
+*.egg
+
+# CDK
+cdk.out/
+cdk.context.json
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Node (if console has dependencies)
+node_modules/
+# loadtest symlinks node_modules -> deploy/hub/node_modules (not a real dir, escapes the rule above)
+tests/loadtest/node_modules
+# loadtest run outputs (per-run JSON evidence, not source)
+tests/loadtest/artifacts/
+
+# Generated files
+console/config.js
+
+# Config backups
+config.yml.bak
+*.bak
+*.bak.*
+
+# Agent / IDE state (per-developer)
+.omc/
+.playwright-mcp/
+
+# === Promotional / Marketing artifacts (NEVER push to public repo) ===
+# Public WeChat / blog articles, both source and exported formats.
+article*.md
+blog*.md
+*.docx
+*.pdf
+
+# Date-prefixed marketing drafts (公众号 文章草稿)
+2026-*.md
+2025-*.md
+
+# === Slide decks, PPT working dirs, source SVGs (NEVER push) ===
+# Generated PowerPoint decks + the entire build pipeline (build_p*.py,
+# h.py helpers, raw SVG → PNG sources). These are author-specific
+# marketing collateral, not part of the project's public deliverable.
+ppt/
+*.pptx
+*.key
+
+# Working SVG / PNG sources for marketing visuals (the published
+# screenshots in docs/ are explicitly tracked; everything else under
+# top-level svg/ is local-only).
+svg/
+
+# Local screenshot working directories
+docs/v132-screenshots/
+docs/screenshots-tmp/
+
+# Claude Code 配置:共享规范(skill / settings.json / commands / hooks)进版本库,
+# 让团队每个人 clone 下来都拿到同一套 issue 驱动流程与门禁(用户要求「.claude 也要追踪,大家都看到」)。
+# 只排除机器本地运行态:锁文件、会话缓存、worktrees、评测运行产物。
+.claude/*.lock
+.claude/scheduled_tasks.json
+.claude/scheduled_tasks.lock
+.claude/.current-issue
+.claude/worktrees/
+.claude/evals/
+.claude/**/__pycache__/
+
+# Personal/operator-specific local instructions (account IDs, bastion IPs,
+# internal tooling, memory references) — machine-local, never committed.
+CLAUDE.local.md
+
+# .localbin 已挪进 (internal design docs)(含 token 的 .network-response
+# 已剔除隔离到 trashllm)。抓包响应类文件仍禁止入库(可能含 live token):
+*.network-response
+.remote-drift/
+*.bak-*
+.bak-*/
+
+# 内部发布检查脚本 — 绝不进发布物
+scripts/release-gate.sh
+release-gate.sh
+.release-gate*

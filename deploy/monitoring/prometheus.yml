@@ -1,0 +1,72 @@
+# Prometheus 抓取配置 — 抓各 metal host 的 host-agent :8899/metrics。
+#
+# host-agent 暴露在每台 metal host 的私网 IP:8899(见 host-agent.py,
+# 与 /health 同端口)。这台 Prometheus EC2 必须与 metal host 同 VPC,
+# 且自身 SG 出站允许到 host 的 8899(host 入站 SG 反过来放行本机)。
+#
+# target 发现两条路(下面用 ec2_sd,file_sd 作离线/无 IAM 兜底):
+#   ① ec2_sd_configs: 按 EC2 tag 自动发现 openclaw metal host(推荐,
+#      host 起停自动增删 target)。需要本 EC2 的 instance role 有
+#      ec2:DescribeInstances 只读权限。
+#   ② file_sd_configs: 读 ./targets/metal-hosts.yml 手填 host IP
+#      (无 IAM / 临时验证用)。两者可并存。
+
+global:
+  scrape_interval: 30s # host-agent 轮询周期较慢,30s 足够,别太密
+  scrape_timeout: 10s
+  external_labels:
+    monitor: openclaw-firecracker
+
+scrape_configs:
+  # ---- 各 metal host 的 host-agent(EC2 service discovery) ----
+  - job_name: openclaw-host-agent-ec2
+    metrics_path: /metrics
+    scheme: http # host-agent 是明文 http(私网内,无 TLS);别走 https
+    ec2_sd_configs:
+      # region 改成实际部署 region(新加坡 demo: ap-southeast-1)。
+      - region: ap-southeast-1
+        port: 8899
+        # 只发现带 openclaw host 标识 tag 的实例。tag key/value 按
+        # 实际 launch template 打的标签改(见 deploy/stack.py ASG tags)。
+        filters:
+          - name: "tag:Project"
+            values: ["openclaw"]
+          - name: "tag:Role"
+            values: ["metal-host"]
+          - name: "instance-state-name"
+            values: ["running"]
+    relabel_configs:
+      # 用私网 IP:8899 作抓取地址(同 VPC 才通)。
+      - source_labels: [__meta_ec2_private_ip]
+        regex: "(.*)"
+        replacement: "${1}:8899"
+        target_label: __address__
+      # 把 instance id 落成 label,dashboard 按它分组(= 区分各 host)。
+      - source_labels: [__meta_ec2_instance_id]
+        target_label: instance
+      - source_labels: [__meta_ec2_availability_zone]
+        target_label: az
+      - source_labels: [__meta_ec2_tag_Name]
+        target_label: host_name
+
+  # ---- file_sd 兜底(无 IAM / 临时验证;手填 host 私网 IP) ----
+  # 编辑 ./targets/metal-hosts.yml 加 host,Prometheus 自动热加载,无需重启。
+  - job_name: openclaw-host-agent-file
+    metrics_path: /metrics
+    scheme: http
+    file_sd_configs:
+      - files:
+          - /etc/prometheus/targets/metal-hosts.yml
+        refresh_interval: 1m
+
+  # ---- 监控机自身(node_exporter,自监控) ----
+  - job_name: monitoring-host-self
+    static_configs:
+      - targets: ["node_exporter:9100"]
+        labels:
+          instance: monitoring-ec2
+
+  # ---- Prometheus 自身 ----
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

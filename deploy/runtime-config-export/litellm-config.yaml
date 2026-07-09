@@ -1,0 +1,50 @@
+general_settings:
+  master_key: [REDACTED]
+litellm_settings:
+  drop_params: true
+  num_retries: 3
+  request_timeout: 600
+  telemetry: false
+  fallbacks:
+    - claude-sonnet-4-6:
+        - claude-sonnet-4-6-global
+    - claude-opus-4-5:
+        - claude-sonnet-4-6
+    - claude-haiku-4-5:
+        - claude-sonnet-4-6
+model_list:
+  # 新加坡 ap-southeast-1 active 模型(已实测可 invoke)
+  - litellm_params:
+      aws_region_name: ap-southeast-1
+      model: bedrock/global.anthropic.claude-sonnet-4-6
+    model_name: claude-sonnet-4-6
+  - litellm_params:
+      aws_region_name: ap-southeast-1
+      model: bedrock/global.anthropic.claude-sonnet-4-6
+    model_name: claude-sonnet-4-6-global
+  - litellm_params:
+      aws_region_name: ap-southeast-1
+      model: bedrock/global.anthropic.claude-opus-4-5-20251101-v1:0
+    model_name: claude-opus-4-5
+  - litellm_params:
+      aws_region_name: ap-southeast-1
+      model: bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0
+    model_name: claude-haiku-4-5
+  - litellm_params:
+      aws_region_name: ap-southeast-1
+      model: bedrock/apac.anthropic.claude-3-5-sonnet-20241022-v2:0
+    model_name: claude-3-5-sonnet
+guardrails:
+  - guardrail_name: "claw-bedrock-guardrail"
+    litellm_params:
+      guardrail: bedrock
+      mode: "during_call"
+      # 部署时注入目标账号的 Bedrock Guardrail ID(apply-hardening.sh 创建后打印)。
+      # 旧账号146=y6w95v95aela;新账号795=od6s8sm533fs(2026-06-30 apply-hardening 真建)。
+      # 不硬编码账号特定 ID,LiteLLM 起容器时 sed 注入(随仓库迭代,跨账号可复用)。
+      guardrailIdentifier: __GUARDRAIL_ID__
+      guardrailVersion: "DRAFT"
+      aws_region_name: ap-southeast-1
+      default_on: true
+      experimental_use_latest_role_message_only: true
+      skip_system_message_in_guardrail: true

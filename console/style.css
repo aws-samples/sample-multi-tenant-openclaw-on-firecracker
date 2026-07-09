@@ -1,0 +1,790 @@
+@import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap");
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+:root {
+  /* AWS Console style (10h-goal #18): AWS Management Console dark palette —
+     slate-navy surfaces, "squid ink" top band (#232f3e), AWS orange accent
+     (#ff9900) + console blue links (#539fe5). Variable names (--cyan etc.) are
+     kept since the whole console references them; recoloring here reskins every
+     rule at once (same approach the prior exchange-style retheme used). */
+  --bg: #0f1b2d; /* AWS console content backdrop (dark) */
+  --panel: #16263d; /* card/panel surface */
+  --border: #2a3f5a; /* low-contrast slate divider (AWS look) */
+  --cyan: #ff9900; /* AWS orange — primary accent */
+  --cyan-dim: #ff9900cc;
+  --red: #d13212; /* AWS error red */
+  --green: #1d8102; /* AWS success green */
+  --gray: #8d99a8; /* AWS secondary text */
+  --text: #eaeded; /* AWS console primary text on dark */
+  --brand: #ff9900;
+  --brand2: #ec7211; /* AWS button orange (darker) */
+  --aws-squidink: #232f3e; /* AWS top navigation band */
+  --aws-link: #539fe5; /* AWS console link blue */
+}
+
+/* AWS Console top navigation band — slate "squid ink" header strip, applied to
+   the existing header/topbar without changing markup (inert if absent). */
+.topbar,
+.app-header,
+header.main-header,
+.console-header {
+  background: var(--aws-squidink) !important;
+  border-bottom: 1px solid #000 !important;
+}
+.nav-tab.active {
+  font-weight: 600;
+}
+a:not(.btn):not(.nav-tab) {
+  color: var(--aws-link);
+}
+body {
+  font-family: "JetBrains Mono", monospace;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+}
+input {
+  font-family: inherit;
+}
+/* 全局表单元素 dark 主题——之前只有 .modal/.settings 等特定类有样式,裸 input/
+   select(Pool Ops / Load Test)落到浏览器默认白底,在 dark console 里很丑。统一给
+   所有 input/select/textarea 套 console 主题(各 tab 的特定类仍可覆盖)。 */
+input,
+select,
+textarea {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: #e8eef6;
+  padding: 7px 10px;
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+  transition: border-color 0.15s;
+}
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: var(--cyan);
+}
+input::placeholder,
+textarea::placeholder {
+  color: #5a7088;
+}
+select option {
+  background: var(--panel);
+  color: #e8eef6;
+}
+
+/* Header */
+.header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 20px 28px;
+  flex-wrap: wrap;
+}
+.header h1 {
+  font-size: 22px;
+  color: #fff;
+  margin-right: auto;
+}
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.status-dot.ok {
+  background: var(--green);
+  box-shadow: 0 0 8px var(--green);
+}
+.status-dot.err {
+  background: var(--red);
+  box-shadow: 0 0 8px var(--red);
+}
+.status-label {
+  font-size: 13px;
+  margin-right: 12px;
+}
+/* global input base */
+
+/* Layout */
+/* tenants two-column layout is inline on page-content */
+.flex-layout {
+  display: flex;
+  gap: 20px;
+  align-items: flex-start;
+}
+.hosts-panel {
+  width: 330px;
+  flex-shrink: 0;
+}
+.tenants-panel {
+  flex: 1;
+  min-width: 0;
+}
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+.panel-title {
+  font-size: 18px;
+  color: #fff;
+}
+
+/* Nav Tabs */
+.nav-tabs {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--border);
+  padding: 0 16px;
+  background: var(--bg);
+}
+.nav-tab {
+  padding: 8px 16px;
+  border: none;
+  background: none;
+  color: var(--gray);
+  cursor: pointer;
+  font-size: 13px;
+  border-bottom: 2px solid transparent;
+}
+.nav-tab:hover {
+  color: var(--text);
+}
+.nav-tab.active {
+  color: var(--cyan);
+  border-bottom-color: var(--cyan);
+}
+
+/* Page content */
+.page-content {
+  padding: 16px 28px;
+}
+.page-content h2 {
+  font-size: 18px;
+  margin-bottom: 16px;
+  color: var(--text);
+}
+.section-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 16px;
+  background: var(--panel);
+  max-width: 1080px;
+}
+.section-card h3 {
+  font-size: 14px;
+  color: var(--cyan);
+  margin-bottom: 8px;
+}
+/* Compact variant: same visual container as section-card but slimmer padding for inline status/skills strips */
+.mini-panel {
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  max-width: none;
+}
+.config-item {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+.config-item:last-child {
+  border-bottom: none;
+}
+.config-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  min-width: 160px;
+}
+.config-desc {
+  font-size: 12px;
+  color: var(--gray);
+}
+.text-green {
+  color: #4ade80;
+}
+.text-gray {
+  color: var(--gray);
+}
+
+/* Buttons */
+.btn {
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  border-radius: 6px;
+  padding: 7px 16px;
+  transition: 0.2s;
+  /* 默认外观:之前 .btn 基类无 bg/border/color,只写 class="btn"(Pool Ops/Load
+     Test)落到浏览器默认白底方块。给个橙色实心默认态,修饰类(-outline/-cyan)仍覆盖。 */
+  background: var(--cyan);
+  border: 1px solid var(--cyan);
+  color: #1a1300;
+  font-weight: 600;
+}
+.btn:hover {
+  box-shadow: 0 0 14px #ff990055;
+}
+.btn-cyan {
+  background: transparent;
+  border: 1px solid var(--cyan);
+  color: var(--cyan);
+}
+.btn-cyan:hover {
+  background: #f7a60022;
+  box-shadow: 0 0 12px #f7a60044;
+}
+.btn-create {
+  background: var(--cyan);
+  color: var(--bg);
+  border: none;
+  font-weight: 700;
+}
+.btn-create:hover {
+  box-shadow: 0 0 16px #f7a60066;
+}
+.btn-outline {
+  background: transparent;
+  border: 1px solid var(--cyan-dim);
+  color: var(--cyan-dim);
+}
+.btn-outline:hover {
+  border-color: var(--cyan);
+  color: var(--cyan);
+  box-shadow: 0 0 8px #f7a60033;
+}
+.btn-icon {
+  background: none;
+  border: none;
+  color: var(--cyan-dim);
+  cursor: pointer;
+  font-size: 32px;
+  padding: 4px;
+}
+.btn-icon:hover {
+  color: var(--cyan);
+}
+.btn-sm {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+.btn-act {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--cyan-dim);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 3px 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  line-height: 1;
+  transition: all 0.12s;
+}
+.btn-act:hover {
+  color: var(--cyan);
+  border-color: var(--cyan);
+  background: rgba(0, 200, 255, 0.08);
+}
+.btn-del {
+  background: rgba(255, 68, 68, 0.06);
+  border: 1px solid rgba(255, 68, 68, 0.25);
+  border-radius: 6px;
+  color: #f88;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 3px 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  line-height: 1;
+  transition: all 0.12s;
+}
+.btn-del:hover {
+  color: #fff;
+  background: var(--red);
+  border-color: var(--red);
+}
+/* 行内操作按钮的文字 label(图标+字) */
+.act-lbl {
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.toast {
+  position: fixed;
+  bottom: 40px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--cyan);
+  color: #000;
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  z-index: 999;
+}
+
+/* Host cards */
+.host-card {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px 14px;
+  margin-bottom: 10px;
+  background: linear-gradient(135deg, #0d1321, #111b2e);
+  cursor: pointer;
+  transition:
+    border-color 0.2s,
+    box-shadow 0.2s;
+}
+.host-card:hover {
+  border-color: var(--cyan-dim);
+}
+.host-card.selected {
+  border-color: var(--cyan);
+  box-shadow: 0 0 12px #f7a60033;
+}
+.host-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.host-id {
+  font-size: 12px;
+  color: #fff;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.badge {
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-weight: 600;
+}
+.badge-active,
+.badge-running {
+  border: 1px solid var(--green);
+  color: var(--green);
+}
+.badge-inactive {
+  border: 1px solid var(--gray);
+  color: var(--gray);
+}
+.badge-stopped {
+  border: 1px solid var(--red, #f44);
+  color: var(--red, #f44);
+}
+.badge-paused {
+  border: 1px solid var(--yellow, #fa0);
+  color: var(--yellow, #fa0);
+}
+.badge-draining {
+  border: 1px solid var(--gray);
+  color: var(--gray);
+}
+.badge-count {
+  font-size: 9px;
+  padding: 1px 6px;
+  border: 1px solid var(--cyan-dim);
+  color: var(--cyan-dim);
+  font-weight: 400;
+}
+.backup-toggle {
+  color: var(--cyan-dim);
+  transition: transform 0.15s;
+  font-size: 14px;
+}
+.backup-toggle:hover {
+  color: var(--cyan);
+}
+.backup-toggle.expanded {
+  transform: rotate(90deg);
+}
+.backup-child-row td {
+  background: rgba(0, 255, 255, 0.02);
+  border-bottom-color: #1a2332;
+  font-size: 11px;
+  color: var(--cyan-dim);
+}
+.backup-child-row:last-child td {
+  border-bottom: 1px solid var(--border);
+}
+.act-group {
+  display: flex;
+  gap: 5px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.host-row {
+  display: flex;
+  align-items: center;
+  font-size: 11px;
+  margin-bottom: 4px;
+  gap: 8px;
+}
+.host-label {
+  width: 62px;
+  color: #6b7a8d;
+  white-space: nowrap;
+}
+.bar-bg {
+  flex: 1;
+  height: 6px;
+  background: #1a2332;
+  border-radius: 3px;
+  overflow: hidden;
+  position: relative;
+}
+.bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.3s;
+}
+.bar-cpu {
+  background: linear-gradient(90deg, #f7a600, #ffb800);
+}
+.bar-cpu-over {
+  background: linear-gradient(90deg, #f7a600, #ff7a00);
+}
+.bar-mem {
+  background: linear-gradient(90deg, #f7a600, #ff7a00);
+}
+.bar-mem-over {
+  background: linear-gradient(90deg, #f7a600, #ffb800);
+}
+.bar-physical-mark {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  width: 2px;
+  background: rgba(255, 255, 255, 0.5);
+  pointer-events: none;
+}
+.overcommit-badge {
+  font-size: 10px;
+  color: #f90;
+}
+.icon {
+  display: inline-block;
+  vertical-align: middle;
+  fill: none;
+  stroke: currentColor;
+}
+.s12 {
+  width: 12px;
+  height: 12px;
+}
+.s13 {
+  width: 13px;
+  height: 13px;
+}
+.s14 {
+  width: 14px;
+  height: 14px;
+}
+.s16 {
+  width: 16px;
+  height: 16px;
+}
+.host-val {
+  width: 60px;
+  text-align: right;
+  font-size: 11px;
+}
+
+/* Tenants table */
+.table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+th {
+  text-align: left;
+  padding: 8px 10px;
+  color: var(--cyan);
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+  white-space: nowrap;
+}
+td {
+  padding: 8px 10px;
+  border-bottom: 1px solid #1a2332;
+  white-space: nowrap;
+}
+tr:hover td {
+  background: #f7a60022;
+}
+.health-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+/* Disk column — bar on top, exact "used/total (pct%)" text below */
+.disk-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 100px;
+}
+.disk-track {
+  height: 5px;
+  background: #1a2332;
+  border-radius: 2px;
+  overflow: hidden;
+}
+.disk-fill {
+  height: 100%;
+  transition: width 0.3s;
+}
+.disk-text {
+  font-size: 11px;
+  color: var(--cyan-dim);
+  white-space: nowrap;
+}
+.metric-ok {
+  background: var(--cyan-dim);
+}
+.metric-warn {
+  background: #fb3;
+  box-shadow: 0 0 4px #fb38;
+}
+.metric-crit {
+  background: var(--red);
+  box-shadow: 0 0 4px #f448;
+}
+.health-up {
+  background: var(--green);
+  box-shadow: 0 0 6px var(--green);
+}
+.health-down {
+  background: var(--red);
+  box-shadow: 0 0 6px var(--red);
+}
+.health-unknown {
+  background: var(--gray);
+}
+
+/* Tag badges (issue #10) */
+.tag-badge {
+  display: inline-block;
+  margin: 1px 3px 1px 0;
+  padding: 1px 6px;
+  border: 1px solid var(--cyan-dim);
+  border-radius: 8px;
+  font-size: 10px;
+  color: var(--cyan-dim);
+  background: rgba(0, 255, 255, 0.04);
+  white-space: nowrap;
+}
+
+/* Modal */
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: #000a;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+}
+/* Infrastructure feature-flag grid: fixed 4 columns with explicit item
+   placement (so Login sits directly above RBAC). Collapses to 2 columns on
+   narrow viewports, where explicit grid-column/grid-row are ignored and items
+   flow in DOM order. align-items:start keeps cells top-aligned. */
+.infra-grid {
+  display: grid;
+  gap: 14px;
+  margin-top: 8px;
+  align-items: start;
+  grid-template-columns: repeat(4, 1fr);
+}
+@media (max-width: 900px) {
+  .infra-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .infra-grid > div {
+    grid-column: auto !important;
+    grid-row: auto !important;
+  }
+}
+
+.modal {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  /* Default fits most forms; modals needing a wider editor (e.g. JSON/SKILL.md)
+     override with an inline width. max-width keeps it on-screen when narrow. */
+  padding: 24px;
+  width: 560px;
+  max-width: 92vw;
+  position: relative;
+}
+.modal h2 {
+  font-size: 18px;
+  color: #fff;
+  margin-bottom: 20px;
+}
+.modal label {
+  display: block;
+  font-size: 12px;
+  margin-bottom: 4px;
+  color: #8899aa;
+}
+.modal label .req {
+  color: var(--red);
+}
+.modal label .opt {
+  color: #556;
+  font-style: italic;
+}
+.modal input {
+  width: 100%;
+  background: #0a0e17;
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 8px 12px;
+  border-radius: 4px;
+  font-size: 13px;
+  margin-bottom: 14px;
+}
+.modal input:focus {
+  outline: none;
+  border-color: var(--cyan);
+  box-shadow: 0 0 8px #f7a60033;
+}
+.modal input.invalid {
+  border-color: var(--red);
+  box-shadow: 0 0 8px #f442;
+}
+.modal .hint {
+  font-size: 11px;
+  color: #667;
+  margin: -10px 0 14px 2px;
+}
+.modal .hint.err {
+  color: var(--red);
+}
+.modal-actions {
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+  margin-top: 6px;
+}
+.modal .close-btn {
+  position: absolute;
+  top: 12px;
+  right: 14px;
+  background: none;
+  border: none;
+  color: var(--cyan);
+  font-size: 20px;
+  cursor: pointer;
+}
+
+.empty {
+  text-align: center;
+  padding: 40px;
+  color: #445;
+}
+.spin {
+  animation: spin 1s linear infinite;
+  display: inline-block;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.footer {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+  text-align: center;
+  padding: 12px;
+  color: #555;
+  font-size: 12px;
+  letter-spacing: 1px;
+}
+
+/* Settings inputs */
+.settings-input {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 8px 12px;
+  border-radius: 4px;
+  font-size: 13px;
+  width: 100%;
+}
+.settings-input::placeholder {
+  color: #4a5568;
+}
+.settings-input:focus {
+  outline: none;
+  border-color: var(--cyan);
+  box-shadow: 0 0 8px #f7a60033;
+}
+.btn-toggle-pw {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 2px;
+  color: var(--text);
+}
+.btn-toggle-pw:hover {
+  color: var(--cyan);
+}
+
+/* Scrollbars — match the dark/cyan theme */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #f7a60055 var(--panel);
+}
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: var(--panel);
+}
+::-webkit-scrollbar-thumb {
+  background: #f7a60055;
+  border: 2px solid var(--panel);
+  border-radius: 5px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--cyan-dim);
+}
+::-webkit-scrollbar-corner {
+  background: var(--panel);
+}

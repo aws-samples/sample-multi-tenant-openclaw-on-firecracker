@@ -1,0 +1,97 @@
+{
+  "agents": {
+    "defaults": {
+      "workspace": "/home/agent/.openclaw/workspace",
+      "model": {
+        "primary": "PROVIDER_NAME/MODEL_ID"
+      },
+      "heartbeat": {
+        "every": "30m",
+        "isolatedSession": true,
+        "lightContext": true,
+        "target": "last"
+      },
+      "contextPruning": {
+        "mode": "cache-ttl",
+        "ttl": "3m",
+        "keepLastAssistants": 3,
+        "softTrimRatio": 0.3,
+        "hardClearRatio": 0.5,
+        "minPrunableToolChars": 5000,
+        "softTrim": {
+          "maxChars": 2000,
+          "headChars": 600,
+          "tailChars": 600
+        },
+        "hardClear": {
+          "enabled": true,
+          "placeholder": "[Old tool result content cleared to save tokens]"
+        }
+      },
+      "compaction": {
+        "mode": "safeguard",
+        "reserveTokens": 100000,
+        "keepRecentTokens": 100000,
+        "reserveTokensFloor": 100000,
+        "maxHistoryShare": 0.4,
+        "midTurnPrecheck": {
+          "enabled": true
+        },
+        "maxActiveTranscriptBytes": "20mb",
+        "memoryFlush": {
+          "enabled": true,
+          "softThresholdTokens": 6000
+        }
+      },
+      "maxConcurrent": 4,
+      "subagents": {
+        "maxConcurrent": 8
+      }
+    }
+  },
+  "gateway": {
+    "mode": "local",
+    "auth": {
+      "mode": "token"
+    },
+    "port": 18789,
+    "bind": "lan"
+  },
+  "session": {
+    "dmScope": "per-peer"
+  },
+  "tools": {
+    "profile": "coding",
+    "loopDetection": {
+      "enabled": true,
+      "historySize": 30,
+      "warningThreshold": 5,
+      "criticalThreshold": 10,
+      "globalCircuitBreakerThreshold": 15,
+      "detectors": {
+        "genericRepeat": true,
+        "knownPollNoProgress": true,
+        "pingPong": true
+      }
+    }
+  },
+  "models": {
+    "providers": {
+      "PROVIDER_NAME": {
+        "baseUrl": "https://your-api-endpoint/v1",
+        "api": "openai-completions",
+        "apiKey": "<YOUR_API_KEY>",
+        "models": [
+          {
+            "id": "MODEL_ID",
+            "name": "Model Display Name",
+            "contextWindow": 131072,
+            "maxTokens": 4096,
+            "_comment_input": "看图多模态(用户发图给 agent)必须含 image,否则 core 跳过原生 vision 注入、看图失效。已在 v11 镜像实测生效;此模板示例同步,防重建真模板时漏掉。仅对真支持 vision 的模型(如 Claude via litellm)配 image。",
+            "input": ["text", "image"]
+          }
+        ]
+      }
+    }
+  }
+}

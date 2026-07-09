@@ -191,7 +191,7 @@ function TopologyMap() {
       <div className="topology-header">
         <div>
           <h2>Tenant Fabric</h2>
-          <p>Firecracker isolation with SwarmClaw orchestration lanes.</p>
+          <p>Tenant-isolated SwarmClaw orchestration lanes on Ubuntu.</p>
         </div>
         <StatusPill value="running" />
       </div>
@@ -293,7 +293,7 @@ function App() {
         </header>
 
         <section className="metrics-grid">
-          <Metric icon={Layers3} label="Tenants" value="3" hint="all isolated microVMs" />
+          <Metric icon={Layers3} label="Tenants" value="3" hint="isolated workspaces" />
           <Metric icon={Bot} label="Agents" value={allAgents.length} hint={`${activeAgents} actively executing`} />
           <Metric icon={Workflow} label="Workflows" value="5" hint="3 running · 1 review" />
           <Metric icon={Cable} label="MCP / Connections" value="6" hint="all scoped by tenant" />
@@ -427,10 +427,10 @@ function App() {
             </div>
             <div className="infra-grid">
               <div><TerminalSquare size={18} /><strong>Ubuntu host</strong><span>hetzner-rx220-01</span></div>
-              <div><LockKeyhole size={18} /><strong>Isolation</strong><span>Firecracker KVM</span></div>
+              <div><LockKeyhole size={18} /><strong>Isolation</strong><span>tenant-scoped runtime</span></div>
               <div><Database size={18} /><strong>State</strong><span>local JSON + ext4 disks</span></div>
               <div><GitBranch size={18} /><strong>Release</strong><span>swarmclaw-hetzner-backend</span></div>
-              <div><Zap size={18} /><strong>Routing</strong><span>nginx /vm/&lt;tenant&gt;</span></div>
+              <div><Zap size={18} /><strong>Routing</strong><span>nginx tenant routes</span></div>
               <div><Play size={18} /><strong>Automation</strong><span>direct lifecycle scripts</span></div>
             </div>
           </section>

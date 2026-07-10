@@ -60,26 +60,26 @@ def build_lambdas(self, ctx):
     """Build lambdas resources (mechanical transplant from stack.py, issue #87)."""
     # --- Unpack from ctx ---
     CFG = ctx.CFG
-    _pitr_spec = getattr(ctx, '_pitr_spec', None)
-    assets_bucket = getattr(ctx, 'assets_bucket', None)
-    audit_archive_bucket = getattr(ctx, 'audit_archive_bucket', None)
-    audit_archive_cmk = getattr(ctx, 'audit_archive_cmk', None)
-    audit_archive_enabled = getattr(ctx, 'audit_archive_enabled', None)
-    audit_cfg = getattr(ctx, 'audit_cfg', None)
-    audit_retention_days = getattr(ctx, 'audit_retention_days', None)
-    audit_table = getattr(ctx, 'audit_table', None)
-    backup_bucket = getattr(ctx, 'backup_bucket', None)
-    backup_cmk = getattr(ctx, 'backup_cmk', None)
-    batch_jobs_table = getattr(ctx, 'batch_jobs_table', None)
-    clawpool_cmk = getattr(ctx, 'clawpool_cmk', None)
-    clawpool_rsa_cmk = getattr(ctx, 'clawpool_rsa_cmk', None)
-    groups_table = getattr(ctx, 'groups_table', None)
-    hosts_table = getattr(ctx, 'hosts_table', None)
-    param_registry_table = getattr(ctx, 'param_registry_table', None)
-    recipient_keys_table = getattr(ctx, 'recipient_keys_table', None)
-    tenant_idp_table = getattr(ctx, 'tenant_idp_table', None)
-    tenant_secrets_table = getattr(ctx, 'tenant_secrets_table', None)
-    tenants_table = getattr(ctx, 'tenants_table', None)
+    _pitr_spec = getattr(ctx, "_pitr_spec", None)
+    assets_bucket = getattr(ctx, "assets_bucket", None)
+    audit_archive_bucket = getattr(ctx, "audit_archive_bucket", None)
+    audit_archive_cmk = getattr(ctx, "audit_archive_cmk", None)
+    audit_archive_enabled = getattr(ctx, "audit_archive_enabled", None)
+    audit_cfg = getattr(ctx, "audit_cfg", None)
+    audit_retention_days = getattr(ctx, "audit_retention_days", None)
+    audit_table = getattr(ctx, "audit_table", None)
+    backup_bucket = getattr(ctx, "backup_bucket", None)
+    backup_cmk = getattr(ctx, "backup_cmk", None)
+    batch_jobs_table = getattr(ctx, "batch_jobs_table", None)
+    clawpool_cmk = getattr(ctx, "clawpool_cmk", None)
+    clawpool_rsa_cmk = getattr(ctx, "clawpool_rsa_cmk", None)
+    groups_table = getattr(ctx, "groups_table", None)
+    hosts_table = getattr(ctx, "hosts_table", None)
+    param_registry_table = getattr(ctx, "param_registry_table", None)
+    recipient_keys_table = getattr(ctx, "recipient_keys_table", None)
+    tenant_idp_table = getattr(ctx, "tenant_idp_table", None)
+    tenant_secrets_table = getattr(ctx, "tenant_secrets_table", None)
+    tenants_table = getattr(ctx, "tenants_table", None)
 
     # ========== Lambda Shared Policy ==========
     #
@@ -115,9 +115,7 @@ def build_lambdas(self, ctx):
         }
     }
     _ssm_document_arn = f"arn:aws:ssm:{self.region}::document/AWS-RunShellScript"
-    _ec2_instance_arn_wildcard = (
-        f"arn:aws:ec2:{self.region}:{self.account}:instance/*"
-    )
+    _ec2_instance_arn_wildcard = f"arn:aws:ec2:{self.region}:{self.account}:instance/*"
     # SSM SendCommand(可写)— 两条:document(无 tag 条件) + instance(tag 条件)
     ssm_send_document_policy = iam.PolicyStatement(
         actions=["ssm:SendCommand"],
@@ -291,26 +289,18 @@ def build_lambdas(self, ctx):
         "LITELLM_MASTER_KEY_SECRET": CFG.get("billing", {}).get(
             "master_key_secret", ""
         ),
-        "TENANT_DEFAULT_BUDGET": str(
-            CFG.get("billing", {}).get("default_budget", 0)
-        ),
+        "TENANT_DEFAULT_BUDGET": str(CFG.get("billing", {}).get("default_budget", 0)),
         "TENANT_DEFAULT_RPM": str(CFG.get("billing", {}).get("default_rpm", 0)),
         "QUOTAS_ENABLED": str(CFG.get("quotas", {}).get("enabled", False)).lower(),
         "QUOTAS_MAX_VCPU": str(CFG.get("quotas", {}).get("max_vcpu_per_tenant", 0)),
-        "QUOTAS_MAX_MEM_MB": str(
-            CFG.get("quotas", {}).get("max_mem_mb_per_tenant", 0)
-        ),
+        "QUOTAS_MAX_MEM_MB": str(CFG.get("quotas", {}).get("max_mem_mb_per_tenant", 0)),
         "QUOTAS_MAX_DATA_DISK_MB": str(
             CFG.get("quotas", {}).get("max_data_disk_mb", 0)
         ),
-        "MULTI_AZ_ENABLED": str(
-            CFG.get("multi_az", {}).get("enabled", False)
-        ).lower(),
+        "MULTI_AZ_ENABLED": str(CFG.get("multi_az", {}).get("enabled", False)).lower(),
         "MULTI_AZ_COUNT": str(CFG.get("multi_az", {}).get("az_count", 1)),
         "WAF_ENABLED": str(CFG.get("waf", {}).get("enabled", False)).lower(),
-        "BALLOON_ENABLED": str(
-            CFG.get("balloon", {}).get("enabled", False)
-        ).lower(),
+        "BALLOON_ENABLED": str(CFG.get("balloon", {}).get("enabled", False)).lower(),
         "CONSOLE_AUTH_ENABLED": str(
             (CFG.get("console_auth", {}) or {}).get("enabled", False)
         ).lower(),
@@ -397,29 +387,49 @@ def build_lambdas(self, ctx):
     batch_jobs_table.grant_read_write_data(api_fn)
     # #97 档A — /tenantmatch only reads the IdP map (least privilege: read-only).
     tenant_idp_table.grant_read_data(api_fn)
-    # #187 P1 — control-plane mints the per-tenant gateway token ciphertext
-    # (SPEC/11-ENGINE-TRANSFORM · INTERFACE-CONTRACT §5). Lambda needs:
-    #   • r/w on the secrets table (put on mint, get on reveal, delete on
-    #     cleanup);
+    # #187 P1 / #149 出站 — control-plane mints the per-tenant gateway token +
+    # device identity ciphertext (SPEC/11-ENGINE-TRANSFORM · INTERFACE-CONTRACT §5).
+    # Lambda needs:
+    #   • r/w on the secrets table (put on mint, get on reveal, delete on cleanup);
     #   • kms:GenerateRandom (32B CSPRNG for the token, API-level not per-key);
-    #   • kms:Encrypt on the ClawPool CMK (envelope encrypt with tenant_id ctx).
-    # It **does NOT get kms:Decrypt** on the CMK — API side never decrypts:
-    # reveal_token / get_tenant fold the ciphertext into responses verbatim,
-    # the caller (control-plane backend) has kms:Decrypt and unwraps locally.
-    # This keeps token plaintext off the wire / out of CloudTrail / out of
-    # Lambda logs. Host role separately has kms:Decrypt for the SSM position-12
-    # injection path (unchanged, added with #118).
+    #   • kms:Encrypt on the ClawPool CMK (envelope encrypt with tenant_id ctx);
+    #   • kms:Decrypt on the ClawPool CMK — GET /tenants/{id}/credentials decrypts
+    #     the stored ciphertext then re-OAEP-encrypts under the platform recipient
+    #     RSA public key (bootstrap keypair: public in DDB, private in Secrets
+    #     Manager, handed to the caller offline by ops). Plaintext exists only
+    #     inside the handler for the re-wrap, never logged / never returned raw.
+    #   • create/read the bootstrap recipient private-key secret (first-call
+    #     keypair generation in ensure_bootstrap_key).
+    # Host role separately has kms:Decrypt for the SSM position-12 injection path
+    # (unchanged, added with #118). The consumer Lambda below runs create only
+    # (never GET /credentials), so it keeps encrypt-only.
     tenant_secrets_table.grant_read_write_data(api_fn)
     param_registry_table.grant_read_write_data(api_fn)
     recipient_keys_table.grant_read_write_data(api_fn)
     if clawpool_cmk is not None:
-        clawpool_cmk.grant_encrypt(api_fn)
+        clawpool_cmk.grant_encrypt_decrypt(api_fn)
         api_fn.add_to_role_policy(
             iam.PolicyStatement(
                 actions=["kms:GenerateRandom"],
                 resources=["*"],
             )
         )
+    # #149 出站 bootstrap — ensure_bootstrap_key 首调生成 recipient keypair,私钥
+    # 存 Secrets Manager 固定名字(运维 get-secret-value 线下交调用方)。删除权
+    # (purge_bootstrap_private_key)故意不给:强删是运维手动动作,不留给 API 面。
+    api_fn.add_to_role_policy(
+        iam.PolicyStatement(
+            actions=[
+                "secretsmanager:CreateSecret",
+                "secretsmanager:PutSecretValue",
+                "secretsmanager:GetSecretValue",
+            ],
+            resources=[
+                f"arn:aws:secretsmanager:{self.region}:{self.account}:"
+                "secret:openclaw/recipient-bootstrap-private-key*"
+            ],
+        )
+    )
     # self-invoke(batch worker)权限:**不用** api_fn.grant_invoke(api_fn)。
     # 查证 CDK issue #11020:grantInvoke 给自身会把 api_fn ARN 注入自己的
     # ServiceRole DefaultPolicy,而 DefaultPolicy↔Lambda 是 CDK 经典 circular
@@ -448,9 +458,7 @@ def build_lambdas(self, ctx):
         api_fn.add_environment("LIFECYCLE_QUEUE_URL", lifecycle_queue.queue_url)
         # Phase 2 — route POST /tenants through the FIFO queue too (config-gated,
         # default off). Only meaningful when the queue exists, so it's set here.
-        _create_via_queue = bool(
-            CFG.get("scaler", {}).get("create_via_queue", False)
-        )
+        _create_via_queue = bool(CFG.get("scaler", {}).get("create_via_queue", False))
         api_fn.add_environment("CREATE_VIA_QUEUE", str(_create_via_queue).lower())
         _api_env["CREATE_VIA_QUEUE"] = str(_create_via_queue).lower()
         # 给 api_fn 发队列权限用**独立 iam.Policy 资源**(非 grant_send_messages、
@@ -484,9 +492,7 @@ def build_lambdas(self, ctx):
             code=_lambda.Code.from_asset(
                 "deploy/lambda/api",
                 bundling=BundlingOptions(
-                    image=cdk.DockerImage.from_registry(
-                        _sam_build_image_for_host()
-                    ),
+                    image=cdk.DockerImage.from_registry(_sam_build_image_for_host()),
                     # VirtioFS bind-mount 拒写(见 api_fn 处注释),用 VOLUME_COPY。
                     bundling_file_access=BundlingFileAccess.VOLUME_COPY,
                     command=[
@@ -513,9 +519,7 @@ def build_lambdas(self, ctx):
         # so it must see CLAWPOOL_CMK_ARN too or the queued-create path would
         # reject valid injections. Gated identically (only when feature on).
         if clawpool_cmk is not None:
-            lifecycle_consumer.add_environment(
-                "CLAWPOOL_CMK_ARN", clawpool_cmk.key_arn
-            )
+            lifecycle_consumer.add_environment("CLAWPOOL_CMK_ARN", clawpool_cmk.key_arn)
         # consumer 同 api 权限(同代码路径,要读写表/调 SSM/发事件)
         tenants_table.grant_read_write_data(lifecycle_consumer)
         hosts_table.grant_read_write_data(lifecycle_consumer)
@@ -544,9 +548,7 @@ def build_lambdas(self, ctx):
                 actions=["cloudwatch:PutMetricData"],
                 resources=["*"],
                 conditions={
-                    "StringEquals": {
-                        "cloudwatch:namespace": "OpenClaw/ControlPlane"
-                    }
+                    "StringEquals": {"cloudwatch:namespace": "OpenClaw/ControlPlane"}
                 },
             )
         )
@@ -618,9 +620,7 @@ def build_lambdas(self, ctx):
     cw_metrics_policy = iam.PolicyStatement(
         actions=["cloudwatch:PutMetricData"],
         resources=["*"],
-        conditions={
-            "StringEquals": {"cloudwatch:namespace": "OpenClaw/ControlPlane"}
-        },
+        conditions={"StringEquals": {"cloudwatch:namespace": "OpenClaw/ControlPlane"}},
     )
     api_fn.add_to_role_policy(cw_metrics_policy)
     # task #15 — read the LiteLLM master key secret to mint per-tenant
@@ -696,9 +696,7 @@ def build_lambdas(self, ctx):
             rate_limit=int(_api_cfg.get("throttle_rate_limit", 500)),
             burst_limit=int(_api_cfg.get("throttle_burst_limit", 1000)),
         ),
-        api_stages=[
-            apigw.UsagePlanPerApiStage(api=api, stage=api.deployment_stage)
-        ],
+        api_stages=[apigw.UsagePlanPerApiStage(api=api, stage=api.deployment_stage)],
     )
     plan.add_api_key(api_key)
 
@@ -795,9 +793,7 @@ def build_lambdas(self, ctx):
             "AWSManagedRulesAmazonIpReputationList",
         ]
         managed_rule_names = list(
-            dict.fromkeys(
-                list(waf_cfg.get("managed_rules", []) or []) + _waf_baseline
-            )
+            dict.fromkeys(list(waf_cfg.get("managed_rules", []) or []) + _waf_baseline)
         )
 
         rules = []
@@ -1287,9 +1283,7 @@ def build_lambdas(self, ctx):
             "BACKUP_PREFIX": CFG["s3"]["backup_prefix"],
             # PRD 2.6 错峰+限并发:每租户距上次备份超 INTERVAL_HOURS 才备(错峰),
             # 单次触发最多 BATCH_LIMIT 个(削并发)。配合高频 schedule 滚动覆盖全量。
-            "BACKUP_INTERVAL_HOURS": str(
-                CFG["s3"].get("backup_interval_hours", 24)
-            ),
+            "BACKUP_INTERVAL_HOURS": str(CFG["s3"].get("backup_interval_hours", 24)),
             "BACKUP_BATCH_LIMIT": str(CFG["s3"].get("backup_batch_limit", 20)),
         },
     )
@@ -1359,11 +1353,11 @@ def build_lambdas(self, ctx):
     # ╓─── [包B 隔离安全] owner=B ── host角色/监控(host_role,被ASG/AMP/AgentCore引用)─╖
 
     # --- Pack onto ctx ---
-    ctx._api_cfg = locals().get('_api_cfg')
-    ctx._platform_authorizer = locals().get('_platform_authorizer')
-    ctx.api = locals().get('api')
-    ctx.api_fn = locals().get('api_fn')
-    ctx.api_key = locals().get('api_key')
-    ctx.health_fn = locals().get('health_fn')
-    ctx.notifications_topic = locals().get('notifications_topic')
-    ctx.notifications_topic_arn = locals().get('notifications_topic_arn')
+    ctx._api_cfg = locals().get("_api_cfg")
+    ctx._platform_authorizer = locals().get("_platform_authorizer")
+    ctx.api = locals().get("api")
+    ctx.api_fn = locals().get("api_fn")
+    ctx.api_key = locals().get("api_key")
+    ctx.health_fn = locals().get("health_fn")
+    ctx.notifications_topic = locals().get("notifications_topic")
+    ctx.notifications_topic_arn = locals().get("notifications_topic_arn")

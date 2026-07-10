@@ -76,6 +76,58 @@ def get_current_key():
     return item or None
 
 
+#: bootstrap 私钥在 Secrets Manager 的固定名字。平台首启自动生成 keypair 后私钥存这里,
+#: 运维 get-secret-value 取出线下交给调用方;交接完可走 purge_bootstrap_private_key 强删。
+BOOTSTRAP_SECRET_NAME = os.environ.get(
+    "RECIPIENT_BOOTSTRAP_SECRET", "openclaw/recipient-bootstrap-private-key"
+)
+
+
+def ensure_bootstrap_key():
+    """无任何 recipient key 时平台自动生成一对 RSA-4096:私钥先落 Secrets Manager,
+    公钥再登记 DDB(source=bootstrap)。已有 current key 则原样返回,幂等。
+
+    顺序契约:私钥必须先存好再推进公钥指针——反过来会有"公钥已生效、私钥没人拿到"
+    的窗口,那段时间封出的凭据谁都解不开。并发双起时 register_key 的版本行条件写让
+    后到者失败;后到者重读 current(先到者已写好)即可,两边私钥/公钥各自成对不串。
+    """
+    current = get_current_key()
+    if current:
+        return current
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=4096)
+    private_pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+    public_pem = (
+        key.public_key()
+        .public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        .decode()
+    )
+    sm = _get_secrets_client()
+    try:
+        sm.create_secret(Name=BOOTSTRAP_SECRET_NAME, SecretString=private_pem)
+    except sm.exceptions.ResourceExistsException:
+        # 上次半程失败的残留(私钥存了、公钥没登记成)——覆盖成本次的私钥,
+        # 保证 Secrets Manager 里的私钥与即将登记的公钥永远是同一对。
+        sm.put_secret_value(SecretId=BOOTSTRAP_SECRET_NAME, SecretString=private_pem)
+    try:
+        return register_key(public_pem, source="bootstrap")
+    except Exception:
+        # 并发撞版本行条件写:后到者读先到者的结果;仍读不到才是真失败,fail-loud。
+        current = get_current_key()
+        if current:
+            return current
+        raise
+
+
 def register_key(public_key_pem, source="caller"):
     """校验 RSA-4096 → 追加新版本行 → 推进 current 指针。返回新版本元数据。"""
     _validate_rsa4096(public_key_pem)

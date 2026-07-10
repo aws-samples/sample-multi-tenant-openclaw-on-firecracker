@@ -2518,15 +2518,28 @@ def tenant_resize(tenant_id, body):
     )
 
 
-def get_tenant_credentials(tenant_id, event=None):
-    """Task 4.3 — GET /tenants/{id}/credentials 服务逻辑。
-
-    有 enabled Recipient_Public_Key → grouped claw_credentials(enc/gateway/device);
-    无 → legacy flat(kms_encrypted/kms_key_arn/items)。非 running → 404。
-    凭据是全响应里最敏感的资源,owner==caller/admin 门与 get_tenant 同款(#80 IDOR)。
-    """
-    from services.recipient_key_service import get_current_key
+def _rewrap_for_recipient(kms_plaintext, pem, field, key_id):
+    """KMS 明文(bytes|str)→ recipient 公钥 OAEP 加密的 enc:v1: 信封。纯本地 RSA。"""
     from core.envelope import encrypt_outbound
+
+    plain = (
+        kms_plaintext.decode() if isinstance(kms_plaintext, bytes) else kms_plaintext
+    )
+    return encrypt_outbound(plain, pem, field, key_id)
+
+
+def get_tenant_credentials(tenant_id, event=None):
+    """GET /tenants/{id}/credentials — 出站凭据交付(asymmetric-v1,无 legacy 回落)。
+
+    recipient key 由平台首调自动生成(ensure_bootstrap_key:公钥 DDB / 私钥
+    Secrets Manager,运维线下交给调用方),调用方无需注册。流程:KMS 解密存储密文 →
+    recipient 公钥重新 OAEP 加密 → 返回;调用方本地私钥解密。解密/重加密任一步失败
+    返 502 fail-loud,绝不回落成调用方解不开的 KMS 密文(旧 legacy flat 形态已删,
+    它只在平台自己持有 kms:Decrypt 的 bootstrap 调试场景有意义)。
+    非 running → 404;owner==caller/admin 门与 get_tenant 同款(#80 IDOR)。
+    """
+    from services.recipient_key_service import ensure_bootstrap_key
+    from core import kms_envelope
 
     item = clients.tenants_table.get_item(Key={"id": tenant_id}).get("Item")
     if not item:
@@ -2541,80 +2554,70 @@ def get_tenant_credentials(tenant_id, event=None):
             f"tenant {tenant_id} is not running (status={item.get('status')})",
         )
 
-    # 读 gateway token + device identity
+    # 读 gateway token + device identity(TTL 窗口外/未铸 → None,响应字段留空)
     gw_ct = read_gateway_token_ct(tenant_id)
     device = read_device_identity(tenant_id)
 
-    recipient_key = get_current_key()
-    if recipient_key and recipient_key.get("enabled", False):
-        # Grouped 形态: sensitive 字段经 recipient 公钥加密
-        pem = recipient_key["public_key_pem"]
-        key_id = recipient_key["key_id"]
-        key_version = recipient_key["version"]
+    try:
+        recipient_key = ensure_bootstrap_key()
+    except Exception as e:  # noqa: BLE001 — 首启生成失败必须可见,不降级
+        return utils._err(
+            502,
+            "RECIPIENT_KEY_UNAVAILABLE",
+            f"recipient key bootstrap failed: {type(e).__name__}",
+        )
+    if not recipient_key.get("enabled", False):
+        # key 被显式 disable(轮换中):fail-closed,让运维登记新 key,绝不回落 KMS 密文
+        return utils._err(
+            409,
+            "RECIPIENT_KEY_DISABLED",
+            "current recipient key is disabled; register a new key "
+            "(POST /recipient-key) before fetching credentials",
+        )
+    pem = recipient_key["public_key_pem"]
+    key_id = recipient_key["key_id"]
 
-        # gateway token: 需要先解密 KMS 密文再用 recipient key 重新加密
-        gw_enc = None
+    gw_enc = ""
+    dev_privkey_enc = ""
+    try:
         if gw_ct:
-            try:
-                from core import kms_envelope
-
-                gw_plain = kms_envelope.decrypt_with_tenant(gw_ct, tenant_id)
-                gw_plain_str = (
-                    gw_plain.decode() if isinstance(gw_plain, bytes) else gw_plain
-                )
-                gw_enc = encrypt_outbound(gw_plain_str, pem, "gateway.token", key_id)
-            except Exception:
-                gw_enc = None  # fallback: 解密失败不阻塞,返 legacy
-
-        # device private key: 需要先解密再重新加密
-        # (read_device_identity 返回的键名是 private_key,值是 KMS 密文——见其 docstring)
-        dev_privkey_enc = None
+            gw_enc = _rewrap_for_recipient(
+                kms_envelope.decrypt_with_tenant(gw_ct, tenant_id),
+                pem,
+                "gateway.token",
+                key_id,
+            )
         if device and device.get("private_key"):
-            try:
-                from core import kms_envelope
+            dev_privkey_enc = _rewrap_for_recipient(
+                kms_envelope.decrypt(device["private_key"], item.get("owner_id", "")),
+                pem,
+                "device.private_key",
+                key_id,
+            )
+    except Exception as e:  # noqa: BLE001 — fail-loud,绝不静默回落 legacy
+        return utils._err(
+            502,
+            "CREDENTIAL_REWRAP_FAILED",
+            f"credential re-wrap failed: {type(e).__name__}",
+        )
 
-                owner_id = item.get("owner_id", "")
-                pk_plain = kms_envelope.decrypt(device["private_key"], owner_id)
-                pk_plain_str = (
-                    pk_plain.decode() if isinstance(pk_plain, bytes) else pk_plain
-                )
-                dev_privkey_enc = encrypt_outbound(
-                    pk_plain_str, pem, "device.private_key", key_id
-                )
-            except Exception:
-                dev_privkey_enc = None
-
-        if gw_enc is None and dev_privkey_enc is None:
-            # 解密全失败,fallback to legacy
-            pass
-        else:
-            creds = {
-                "claw_credentials": {
-                    "enc": {
-                        "scheme": "asymmetric-v1",
-                        "recipient_key_id": key_id,
-                        "algorithm": "RSA_4096_OAEP_SHA256",
-                        "key_version": key_version,
-                    },
-                    "gateway": {"token": gw_enc or ""},
-                    "device": {
-                        "id": device["device_id"] if device else "",
-                        "public_key": device["public_key"] if device else "",
-                        "private_key": dev_privkey_enc or "",
-                        "scopes": device.get("scopes", list(_DEVICE_SCOPES_DEFAULT))
-                        if device
-                        else list(_DEVICE_SCOPES_DEFAULT),
-                    },
-                }
-            }
-            return utils._resp(200, creds)
-
-    # Legacy flat 形态(无 recipient key)
-    legacy = {}
-    if gw_ct and clients.CLAWPOOL_CMK_ARN:
-        legacy = {
-            "kms_encrypted": True,
-            "kms_key_arn": clients.CLAWPOOL_CMK_ARN,
-            "items": {"gateway_token": gw_ct},
+    creds = {
+        "claw_credentials": {
+            "enc": {
+                "scheme": "asymmetric-v1",
+                "recipient_key_id": key_id,
+                "algorithm": "RSA_4096_OAEP_SHA256",
+                "key_version": recipient_key["version"],
+            },
+            "gateway": {"token": gw_enc},
+            "device": {
+                "id": device["device_id"] if device else "",
+                "public_key": device["public_key"] if device else "",
+                "private_key": dev_privkey_enc,
+                "scopes": device.get("scopes", list(_DEVICE_SCOPES_DEFAULT))
+                if device
+                else list(_DEVICE_SCOPES_DEFAULT),
+            },
         }
-    return utils._resp(200, legacy)
+    }
+    return utils._resp(200, creds)

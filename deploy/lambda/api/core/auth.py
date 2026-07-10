@@ -240,6 +240,9 @@ _VIEWER_OK = {
     ("GET", "/tenants"),
     ("GET", "/tenants/{id}"),
     ("GET", "/tenants/{id}/{action}"),
+    # Task 7.3 — credentials 子资源与 GET /tenants/{id} 同级(那里今天就折 token/device):
+    # viewer 过 RBAC 门,owner==caller/admin 检查在 get_tenant_credentials 内(#80 IDOR 模式)。
+    ("GET", "/tenants/{id}/credentials"),
     # self-service node provisioning is viewer-level at the RBAC gate; the
     # create_tenant_self handler then enforces self-only + per-user cap.
     ("POST", "/tenants/self"),
@@ -498,7 +501,20 @@ def _assert_owner_or_admin(item, event):
 # login to learn which upstream IdP to federate to, so it can't require a JWT. It
 # leaks no tenant data (only platform_id→idp_provider_name), and the API-key gate
 # at API Gateway still fronts it.
-_RBAC_SKIP = {("POST", "/external/authz"), ("GET", "/tenantmatch")}
+# tenant-credential-contract: registry/recipient-key 管理接口的真正 admin 门在
+# handler 内(_get_caller_identity().is_admin:api-key=admin 全权、operator/viewer
+# Bearer 被拒)。前置 RBAC 门按 role 判会把 api-key(role=viewer 但 is_admin=True)误拦,
+# 故这些端点 skip 前置门,让 handler 内的 is_admin 判定当唯一门。
+_RBAC_SKIP = {
+    ("POST", "/external/authz"),
+    ("GET", "/tenantmatch"),
+    ("GET", "/registry/{config_template}"),
+    ("POST", "/registry/{config_template}"),
+    ("POST", "/registry/{config_template}/rollback"),
+    ("GET", "/recipient-key"),
+    ("POST", "/recipient-key"),
+    ("POST", "/recipient-key/disable"),
+}
 
 
 def _rbac_check(event, method, resource):

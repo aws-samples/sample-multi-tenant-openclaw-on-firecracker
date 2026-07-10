@@ -1,10 +1,8 @@
 # Developer Guide
 
-> **2026-07-08 data-plane redesign notice**: the real-time chat integration part of this chapter — `claw-hub` / `claw-channel` outbound dial, the three Cognito identities, `/hub/token` `/hub/ws`, HMAC `channel_secret` — has been **fully superseded** by [Chapter 13 · Data-plane two-tier routing](13-data-plane-redesign.md) (customer OIDC does not support headless/browserless login, so Cognito and the outbound-dial hub were dropped in favor of OpenClaw-native gateway auth). The control plane REST API part of this chapter remains valid. For the current real-time chat integration, Chapter 13 is authoritative.
-
 This section is for developers who need to interact with the solution programmatically, covering the authentication model, the control plane REST API, real-time chat integration, and the authorization model.
 
-The solution exposes two integration surfaces: the control plane REST API (management operations such as tenant registration, lifecycle, backup, and deregistration) and the real-time chat path, which is now a two-tier edge route to the OpenClaw-native gateway inside the tenant microVM (see [Chapter 13](13-data-plane-redesign.md)). The control plane REST API's trust root is Amazon Cognito.
+The solution exposes two integration surfaces: the control plane REST API (management operations such as tenant registration, lifecycle, backup, and deregistration) and the real-time chat path (a bidirectional WebSocket channel: browser ↔ chat hub `claw-hub` ↔ `claw-channel` inside the tenant microVM). The two integration surfaces share the same trust root, Amazon Cognito, but fall on two mutually orthogonal verification planes.
 
 > **Note**
 >

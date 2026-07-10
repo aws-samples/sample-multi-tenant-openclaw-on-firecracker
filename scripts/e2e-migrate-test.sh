@@ -4,7 +4,8 @@
 #
 # e2e-migrate-test.sh — REAL end-to-end live-migration test (issue #64 AC #6).
 #
-# This drives the actual data plane against a live deployment:
+# Unlike tests/test_migration.py (which mocks SSM), this drives the actual
+# data plane against a live deployment:
 #   1. Ensures migrate-vm.sh / resize-disk.sh are present on every active host
 #      (uploads to S3 + SSM-copies to /home/ubuntu on each host).
 #   2. Picks a running tenant and migrates it to a different active host.

@@ -822,11 +822,12 @@ if [ -d /tmp/image-sample ]; then
     # Register the two guard plugins in config: load paths + enabled entries.
     # jq merge keeps whatever the template already had under .plugins.
     #   acl-guard / sentinel-guard — before_tool_call hooks (priority 1000 / 200)
-    # claw-channel was retired in the data-plane refactor: the WSS-hub reverse
-    # channel is replaced by two-tier routing (OpenResty edge → host DNAT → in-VM native
+    # claw-channel was retired in the 11-ENGINE-TRANSFORM data-plane refactor
+    # (SPEC/11-ENGINE-TRANSFORM/02-DEV-PLAN.md §A): the WSS-hub reverse channel
+    # is replaced by two-tier routing (OpenResty edge → host DNAT → in-VM native
     # gateway on :18789). The gateway now serves chat via the OpenAI-compatible
     # /v1/chat/completions and /v1/responses HTTP endpoints directly; the plugin
-    # is archived under (archived) for history.
+    # is archived (no longer used) for history.
     if command -v jq >/dev/null 2>&1; then
       jq '
         (.plugins // {}) as $p |
@@ -909,16 +910,24 @@ SystemCallErrorNumber=EPERM
 # default), so this is a *sub-limit* INSIDE the guest: it bounds the gateway +
 # all its tool-exec children so a runaway/forked workload OOMs its own slice
 # instead of taking down the whole VM (PID 1, sshd, the FIM monitor). Values are
-# scaled to the 2GB/1vCPU node and leave headroom for the OS and sshd.
+# scaled to the 4GB/2vCPU default node and leave headroom for the OS and sshd.
 #   MemoryHigh — soft throttle (reclaim pressure) before the hard cap.
 #   MemoryMax  — hard ceiling for the gateway slice (OOM-kills inside the slice).
-#   CPUQuota   — ≈0.9 core sustained (our analogue of cpu.max=2.5 on a
-#                bigger box; here the VM only has ~1 vCPU so we cap just under).
+#     2026-07-09: bumped 1536M→3072M. The old 1536M was written for a 2GB/1vCPU
+#     node; on 2026.2.26 the gateway's V8 heap alone crosses 1.5G at startup and
+#     the slice OOM-killed it in a restart loop (status=6/ABRT, 70+ restarts),
+#     so :18789 never stayed up (400 load test: VM Health green / Gateway red on
+#     every tenant). 3072M ≈ 75% of the 4G VM, leaving ~1G for OS/sshd/FIM.
+#     NOTE: still coupled to the default VM size baked here; a smaller-mem tenant
+#     would want a launch-vm drop-in that scales this to the VM's actual mem
+#     (deferred; see evidence/CRITICAL-226-gateway-oom-plugin-incompat).
+#   CPUQuota   — ≈1.8 core sustained (was 90%/~0.9 core for the 1vCPU node; the
+#                default is now 2 vCPU, so cap just under 2 cores).
 #   TasksMax   — fork-bomb guard.
-MemoryHigh=1280M
-MemoryMax=1536M
+MemoryHigh=2560M
+MemoryMax=3072M
 MemorySwapMax=0
-CPUQuota=90%
+CPUQuota=180%
 TasksMax=512
 
 [Install]

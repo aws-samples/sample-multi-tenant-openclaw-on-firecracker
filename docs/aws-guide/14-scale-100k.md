@@ -8,14 +8,14 @@
 
 ## 14.1 测试阶段:满负载 380/台 + 反向用例
 
-**硬要求**:真机测试必须打**满负载 380/台**,且用例集合**必含反向场景**,不允许只跑 happy path。
+**Abel 硬要求**(memory `fullload-380-test-mandate-2026-07-04`):真机测试必须打**满负载 380/台**,且用例集合**必含反向场景**,不允许只跑 happy path。
 
 ### 满负载压测
 
 - **单机上限**:`r8g.metal-24xl` 每台 380 microVM(2 GB/VM × 380 = 760 GB,匹配 768 GB 内存)。
 - **不允许绕开的四类测试**(缺一挂 backlog,不许 close issue):
   1. **稳态**:380 microVM 全 running,SSE 保持 30 min 无掉线。
-  2. **突发建租户**:一批 300 create/s 打进 SQS dispatch,验证削峰到 host 单实例 SSM 并发 ≤ 阈值(实测约 40 并发即撞 SSM TimedOut)。
+  2. **突发建租户**:一批 300 create/s 打进 SQS dispatch,验证削峰到 host 单实例 SSM 并发 ≤ 阈值(795 实测 40 并发就撞 TimedOut,`memory: loadtest-380-ssm-concurrency-bottleneck`)。
   3. **单 AZ 挂**:kill 一个 AZ 的 edge + host 混合负载,余两 AZ 承接;验证 `az_failover` 迁租户能力(`config.yml:health_check.az_failover`)。
   4. **conntrack 表满**:边缘 + host 同时打到 `nf_conntrack_max=1048576` 附近,验证不丢包。edge 侧 `install-edge.sh:131`,host 侧 `init-host.sh:85-99`。
 
@@ -31,19 +31,19 @@
 
 ### 证据留痕
 
-所有测试结果必须归档留痕——没留痕 = 没测过(测试纪律)。
+所有测试结果必须留痕归档——没留痕 = 没测过(项目测试纪律)。
 
 ---
 
 ## 14.2 上线阶段:灰度滚动 + 分步部署
 
-**核心纪律**:不要 `min_capacity=1` 让 host 在镜像就绪前起。**正解顺序:先 min=0 → 烤镜像 → 再 scale 到目标容量**。
+**核心纪律**(memory `goal-restructure-and-deploy-uswest2-2026-06-30`):不要 `min_capacity=1` 让 host 在镜像就绪前起。**正解顺序:先 min=0 → 烤镜像 → 再 scale 到目标容量**。
 
 ### 冷启部署顺序(fresh region)
 
 1. **VPC + 网络先起**:`./setup.sh <region> <profile>` 走 `deploy/stack.py:_build_vpc(mode=self_managed)`(自建 /20 + 3 AZ + 3 NAT GW)。这一步栈成功但 host_asg **min=0**、edge_asg **min=0**。
 2. **烤镜像**:`build-rootfs.sh --arch arm64` 或 stack 内 CodeBuild 自动烤(`image.build_in_stack=true`)。等 S3 里有对应 rootfs.
-3. **拉 host 到最小容量**:改 `config.yml:asg.min_capacity=2` 再 `setup.sh` 一次。host 拉起时 rootfs 已在 S3,不会 Heartbeat Timeout 反复替换。
+3. **拉 host 到最小容量**:改 `config.yml:asg.min_capacity=2` 再 `setup.sh` 一次。host 拉起时 rootfs 已在 S3,不会 Heartbeat Timeout 反复替换(踩过:`memory: uswest2-deploy-deadlock-and-fixes`)。
 4. **拉 edge 到 min=3**:`config.yml:edge.enabled=true` + `edge.min_capacity=3`,`setup.sh`。edge userdata 会轮询 `/healthz` 到 200 才 CONTINUE(`install-edge.sh:170-183` warmup gate),ASG lifecycle 只在真能路由时才放行。
 
 ### 滚动升级(改镜像 / 改 stack.py)
@@ -62,12 +62,12 @@
 
 ### 灰度切数据面(旧 hub-WS → 新两级路由)
 
-**并行灰度期已落地**(P2b-iac),两条路径共存:
+**并行灰度期已合入 bb**(P2 · MR !168 P2b-iac),两条路径共存:
 
 - ALB `/hub/*` rule priority=10 仍指向老 hub target group(host:80 nginx)——**下线中,P4 后可移除**。
 - ALB `/vm/*` + `/ws/*` rule priority=20 指向新 EdgeTG(`stack.py:3846-3851`)。
 
-灰度切流:CloudFront 端把 `/hub/*` behavior 逐步迁到 `/ws/*`,前端 SDK 升级到走 `wss /gw/ws`(平台后端做 SSE relay,见 `docs/aws-guide/13-data-plane-redesign.md § 13.1`)。旧 hub 完全下线需 P4-② 前端全量切完 + `docs/backend/openapi.yaml` 3.0.0 集成完成。
+灰度切流:CloudFront 端把 `/hub/*` behavior 逐步迁到 `/ws/*`,前端 SDK 升级到走 `wss /gw/ws`(平台后端做 SSE relay,见 `docs/aws-guide/13-data-plane-redesign.md § 13.1`)。旧 hub 完全下线需 P4-② 前端全量切完 + `docs/backend/openapi.yaml` 3.0.0 集成完成(MR !172 已合)。
 
 ---
 
@@ -118,15 +118,15 @@
 
 生产上线后必须建立"演练"节奏,不等真事故来。规格:
 
-| 场景 | 频率 | 命令 / 步骤 |
-|---|---|---|
+| 场景                      | 频率     | 命令 / 步骤                                                                                                                   |
+| ------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------- |
 | ElastiCache 手动 failover | **季度** | `aws elasticache test-failover --replication-group-id openclaw-routes --node-group-id 0001` · 观察 fail-static 触发时长 < 60s |
-| Edge 单 AZ kill | **季度** | terminate 一个 AZ 的 edge 实例 · 观察 ASG 补新 + ELB 分流时长 |
-| Host AZ failover | **半年** | 触发 `az_failover`(手工 disable 一个 AZ 的 host status)· 验证租户迁移路径 |
-| CloudFront 长静默门 | **季度** | 打一个 200s 静默 WS · 观察是否被 CloudFront 180s 断 · 验证客户端心跳 SDK 落地情况 |
-| Guardrail 拦截采样 | **月度** | OWASP top 10 case 抽样跑 · 拦 14/14 是 baseline · 有掉的立刻查 |
+| Edge 单 AZ kill           | **季度** | terminate 一个 AZ 的 edge 实例 · 观察 ASG 补新 + ELB 分流时长                                                                 |
+| Host AZ failover          | **半年** | 触发 `az_failover`(手工 disable 一个 AZ 的 host status)· 验证租户迁移路径                                                     |
+| CloudFront 长静默门       | **季度** | 打一个 200s 静默 WS · 观察是否被 CloudFront 180s 断 · 验证客户端心跳 SDK 落地情况                                             |
+| Guardrail 拦截采样        | **月度** | OWASP top 10 case 抽样跑 · 拦 14/14 是 baseline · 有掉的立刻查                                                                |
 
-演练结果归档留痕。
+演练结果留痕归档。
 
 ---
 
@@ -135,3 +135,4 @@
 - **架构原理**:见 [第 13 章 · 数据面两级路由](13-data-plane-redesign.md)。
 - **组件运维手册**(告警阈值 / 扩缩容触发 / 故障排查):见 [第 11 章 · 组件运维手册](11-ops-maintenance.md)。
 - **私有 API 加固**:见 [第 12 章 · Private API Gateway](12-private-api-hardening.md)。
+- **HA 审计**(15 组件逐条 · 已修 vs 仍单点):见项目 HA 审计文档。

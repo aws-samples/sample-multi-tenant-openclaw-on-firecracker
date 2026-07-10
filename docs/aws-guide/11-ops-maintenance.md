@@ -1,7 +1,7 @@
 # 11 · 组件运维手册
 
 > 本章按组件列日常维护、监控指标、告警阈值、扩缩容与故障排查。**十万级规模化的运维底线在这一章**,给运营和 SRE 团队用。
-> 冲突裁决:AWS 官方文档 > 本手册 > 记忆。
+> 冲突裁决:AWS 官方文档 > 本手册 > 记忆。改变化以 CHANGELOG 为准。
 
 ---
 
@@ -337,5 +337,5 @@
 2. 拉一份最新 stack.py + config.yml,对照本手册第 11.1-11.10 逐项对齐实际部署。
 3. Grafana 打开看有没有 dashboard;没有跑一遍 provisioning。
 4. 一次手动 failover 演练(ElastiCache + host AZ)。
-5. 查阅最近 30 天的变更记录。
-6. 复核生产安全铁律(删资源前必快照;拿不准即假设为生产)。
+5. 打开 CHANGELOG.md 看最近 30 天改动。
+6. 读 `.claude/rules/amazon-production-safety-do-not-delete.md` 铁律(删资源前必快照;假设生产)。

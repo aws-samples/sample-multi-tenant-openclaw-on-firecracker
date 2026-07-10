@@ -6,8 +6,8 @@ This solution runs Firecracker microVMs on native KVM on Amazon EC2 bare metal i
 
 - Provisions a dedicated-kernel Firecracker microVM for each tenant, isolating memory, CPU, and kernel between tenants at the virtual machine level.
 - Cold-injects identity, skills, and configuration into a read-only golden image before the virtual machine starts, so that each virtual machine is a finished product at boot; after boot, the control plane injects no business data into it.
-- Routes real-time chat requests from browsers or frontends to the OpenClaw-native gateway inside the corresponding tenant's virtual machine through a two-tier edge route: Amazon CloudFront and an Application Load Balancer (least-outstanding-requests) front an OpenResty edge Auto Scaling group that looks up the tenant's route in a Redis route table, then host iptables PREROUTING DNAT (ports 10000-10400) forwards to the microVM's `:18789` gateway.
-- Uses Amazon Cognito as the single root of trust for control-plane identity, uniformly verifying all access to the control plane and downgrading to least privilege whenever verification fails; the data plane authenticates instead with a per-tenant `gateway_token`.
+- Routes real-time chat requests from browsers or frontends to the OpenClaw agent inside the corresponding tenant's virtual machine through a self-hosted WebSocket hub (claw-hub).
+- Uses Amazon Cognito as the single root of trust for identity, uniformly verifying all access to the control plane and data plane, and downgrading to least privilege whenever verification fails.
 - Layers on five levels of defense in depth: the content layer, the tool execution layer, the identity layer, the network layer, and the credential and read-only monitoring layer. Each level is implemented in deployment code or in a device, and does not rely on model self-discipline.
 
 This implementation guide describes the reference architecture and components, deployment planning considerations, and configuration steps for deploying the OpenClaw on Firecracker multi-tenant AI agent platform solution to the Amazon Web Services (AWS) Cloud. It is intended for platform engineers, security reviewers, operations engineers, and application developers who have architectural experience with the AWS Cloud.
@@ -46,15 +46,15 @@ This solution layers on five levels of protection: the content layer (Amazon Bed
 
 **Unified root of trust for identity**
 
-This solution uses Amazon Cognito as the single root of trust for control-plane identity; the control plane accepts only tokens issued and verified by Cognito. External identity providers federate into the same Cognito user pool through OpenID Connect (OIDC). The data plane does not use Cognito; it authenticates each tenant with a per-tenant `gateway_token`.
+This solution uses Amazon Cognito as the single root of trust for identity; both the control plane and the data plane accept only tokens issued and verified by Cognito. External identity providers federate into the same Cognito user pool through OpenID Connect (OIDC), transparently to the data plane.
 
 **Serverless control plane**
 
 The registration, lifecycle, health check, backup, and scaling logic of this solution is carried by AWS Lambda, Amazon DynamoDB, and Amazon API Gateway, billed by usage and requiring no dedicated operational servers.
 
-**Real-time chat routing (two-tier edge route)**
+**Real-time chat hub**
 
-This solution carries real-time chat between browsers and agents through a two-tier edge route. Amazon CloudFront and an Application Load Balancer (least-outstanding-requests) front an OpenResty edge Auto Scaling group, which looks up the tenant's route in a Redis route table (L1 lrucache 5s, L2 shared_dict 60s, L3 Amazon ElastiCache). Host iptables PREROUTING DNAT (ports 10000-10400) then forwards to the OpenClaw-native gateway on the virtual machine's `:18789`, which authenticates the request with the tenant's `gateway_token` (`Authorization: Bearer`).
+This solution carries real-time chat between browsers and agents through a self-hosted WebSocket hub (claw-hub). The channel client inside the virtual machine dials out to the hub on its own initiative and opens no inbound ports on the virtual machine.
 
 **Replaceable business sample**
 
@@ -128,7 +128,7 @@ The management plane composed of AWS Lambda, Amazon DynamoDB, and Amazon API Gat
 
 **Data plane**
 
-The real-time chat path composed of a two-tier edge route (Amazon CloudFront → Application Load Balancer → OpenResty edge Auto Scaling group with a Redis route table → host iptables PREROUTING DNAT), which routes browser requests to the OpenClaw-native gateway inside the corresponding tenant's virtual machine, authenticated by a per-tenant `gateway_token`.
+The real-time chat path composed of the self-hosted WebSocket hub claw-hub, which routes browser requests to the agent inside the corresponding tenant's virtual machine.
 
 **Five levels of defense in depth**
 

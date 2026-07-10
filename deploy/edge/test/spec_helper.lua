@@ -108,7 +108,7 @@ end
 
 -- --- Fake resty.lock stub --------------------------------------------------
 -- Non-blocking: lock always succeeds instantly. Enough for correctness
--- tests; stampede timing is covered separately at L4.
+-- tests; stampede timing is covered separately at L4 (03-TEST-PLAN §5).
 local function new_fake_lock_module()
     local mod = {}
     function mod:new(_name, _opts)

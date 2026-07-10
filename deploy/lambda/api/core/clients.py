@@ -36,6 +36,11 @@ kms = boto3.client("kms")
 # rejects any injected_credentials since it can't be encrypted against a key).
 CLAWPOOL_CMK_ARN = os.environ.get("CLAWPOOL_CMK_ARN", "")
 
+# #149 asymmetric-v1 — RSA-4096 CMK ARN. The API serves its PUBLIC key (kms:GetPublicKey)
+# so callers locally OAEP-encrypt env creds; the API never decrypts (host does). Empty
+# when security.clawpool_cmk_enabled=false → GET /clawpool-rsa-public-key returns 404.
+CLAWPOOL_RSA_CMK_ARN = os.environ.get("CLAWPOOL_RSA_CMK_ARN", "")
+
 # #187 P1 — 短寿命密文表(pk=tenant_id,TTL=expires_at=now+900),存 gateway token
 # 密文(tenant_id EncryptionContext)。控制面 mint、reveal 从这里读;host 侧不读该表
 # (host 走 SSM 位置 12 参数拿密文,和 #118 host 直读 injected_credentials from
@@ -78,7 +83,7 @@ batch_jobs_table = (
     else None
 )
 
-# #97 档A — optional external-platform → Cognito-IdP map. Absent →
+# #97 档A — optional external-platform → Cognito-IdP map (SPEC/02 §2.7). Absent →
 # federation not configured; /tenantmatch returns 404 (front-end falls back to
 # passing identity_provider explicitly). Partition key: platform_id (S).
 tenant_idp_table = (

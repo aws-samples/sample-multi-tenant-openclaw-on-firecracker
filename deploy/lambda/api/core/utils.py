@@ -46,6 +46,29 @@ def _gen_id(name, client_token="", owner_id=""):
 _ENCRYPTION_TYPES = ("none", "platform_managed", "tenant_cmk")
 _ARN_RE = re.compile(r"^arn:aws[a-z\-]*:[a-z0-9\-]+:[a-z0-9\-]*:\d{0,12}:.+")
 
+# Task 6.1 — security 对象的合法字段白名单 + 误放拒绝集(R10.1–R10.5)
+_SECURITY_ALLOWED_FIELDS = frozenset(
+    {"storage_encrypted", "encryption_type", "kms_key_arn", "cert_arn", "secret_ref"}
+)
+_SECURITY_MISPLACED_FIELDS = frozenset(
+    {
+        "api_key",
+        "api_secret_key",
+        "subaccount_api_key",
+        "subaccount_api_secret_key",
+        "llm_key",
+        "injected_parameters",
+        "injected_credentials",
+        "scheme",
+        "recipient_public_key",
+        "public_key_pem",
+        "public_key",
+        "private_key",
+        "gateway_token",
+        "device",
+    }
+)
+
 
 def _validate_security(sec):
     """Validate + normalize the optional `security` map. Returns (clean_map, err).
@@ -57,6 +80,13 @@ def _validate_security(sec):
         return {}, None
     if not isinstance(sec, dict):
         return None, "security must be an object"
+    # R10.5 — 凭据注入/公钥字段误放进 security 对象时立即拒绝并指名
+    misplaced = set(sec.keys()) & _SECURITY_MISPLACED_FIELDS
+    if misplaced:
+        return (
+            None,
+            f"security contains misplaced credential/key field(s): {sorted(misplaced)}",
+        )
     enc = bool(sec.get("storage_encrypted", False))
     etype = sec.get("encryption_type", "none" if not enc else "platform_managed")
     if etype not in _ENCRYPTION_TYPES:
@@ -205,6 +235,58 @@ def _validate_injected_credentials(raw, configured_cmk_arn=""):
             )
         clean_items.append({"name": name, "ciphertext": ct})
     return {"kms_encrypted": True, "kms_key_arn": key_arn, "items": clean_items}, None
+
+
+def _normalize_injected_parameters(body):
+    """入站归一化(tenant-credential-contract Task 3.1)。create_tenant 最前面调用。
+
+    把两个入口统一成新形态 `injected_parameters`
+    {scheme: "asymmetric-v1"|"kms-cmk"|缺省, items: {<logical_field>: <value>}}:
+      • body 带 `injected_parameters` → 直接用它(新形态优先)。
+      • 否则看旧别名 `injected_credentials`:
+        - 旧 list 形态 {kms_encrypted, kms_key_arn, items:[{name, ciphertext}]}
+          → 翻译为 {scheme: "kms-cmk", items: {name: ciphertext, ...}}。
+        - 已是新 dict 形态(items 为 dict)→ 原样当 injected_parameters。
+      • 两者都缺 → None。
+    本函数只做形态翻译不做校验:结构非法的值原样透传,由
+    _validate_injected_parameters_v2 fail-closed 拒绝(那里有具体错误文案)。"""
+    params = body.get("injected_parameters")
+    if params is not None:
+        return params
+    # #149 目标态别名:env_injected_credentials {scheme, items:{<field>:<enc:v1: 值>}}
+    # 已是新形态,直接当 injected_parameters;若同时带 claw_injected_credentials.llm_key
+    # 则并入 items(llm_key 是 registry 的 config-class field,空值走 empty_fallback)。
+    env_inj = body.get("env_injected_credentials")
+    if env_inj is not None:
+        if isinstance(env_inj, dict) and isinstance(env_inj.get("items"), dict):
+            merged = dict(env_inj)  # 浅拷贝,不改调用方对象
+            merged_items = dict(env_inj["items"])
+            claw_inj = body.get("claw_injected_credentials")
+            if isinstance(claw_inj, dict) and "llm_key" in claw_inj:
+                # llm_key 非空才注入;空串=用平台 shared vkey(registry empty_fallback)
+                if claw_inj.get("llm_key"):
+                    merged_items["llm_key"] = claw_inj["llm_key"]
+            merged["items"] = merged_items
+            return merged
+        return env_inj  # 结构非法:透传给 v2 fail-closed 拒绝
+    legacy = body.get("injected_credentials")
+    if legacy is None:
+        return None
+    if isinstance(legacy, dict) and isinstance(legacy.get("items"), list):
+        items = {}
+        for it in legacy["items"]:
+            if not isinstance(it, dict) or not isinstance(it.get("name"), str):
+                return legacy  # 旧形态条目结构非法:透传,交给 v2 以类型错拒绝
+            if it["name"] in items:
+                return legacy  # 重名会在 dict 化时静默覆盖丢数据:透传给 v2 拒绝
+            items[it["name"]] = it.get("ciphertext")
+        return {"scheme": "kms-cmk", "items": items}
+    return legacy  # 新 dict 形态(或其它非法值,透传给 v2 拒绝)
+
+
+#: _validate_injected_parameters_v2 已移到 core/envelope.py(它依赖 envelope 的
+#: scheme/信封解析,而本模块是 core-leaf 叶子禁 import 仓内;envelope 是 core 层可
+#: 向下 import 本模块常量)。tenant_service 改调 envelope 版。见 import-layers 门。
 
 
 def _now():
@@ -464,20 +546,33 @@ def _parse_next_token(token):
     return key, None
 
 
-def _resp(code, body):
+def _resp(code, body, headers=None):
+    h = {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "Content-Type,x-api-key,Authorization",
+    }
+    if headers:
+        h.update(headers)
     return {
         "statusCode": code,
-        "headers": {
-            "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Headers": "Content-Type,x-api-key,Authorization",
-        },
+        "headers": h,
         "body": json.dumps(body, default=str),
     }
 
 
-def _err(code, error_code, message, extra=None):
+# Task 7.1 — 标准错误码与 HTTP 状态映射(R13.7/R13.9)
+ERROR_CODE_TO_STATUS = {
+    "VALIDATION": 400,
+    "ACCESS_DENIED": 403,
+    "NOT_FOUND": 404,
+    "CONFLICT": 409,
+    "THROTTLING": 429,
+}
+
+
+def _err(code, error_code, message, extra=None, headers=None):
     body = {"error": message, "code": error_code}
     if extra:
         body.update(extra)
-    return _resp(code, body)
+    return _resp(code, body, headers=headers)

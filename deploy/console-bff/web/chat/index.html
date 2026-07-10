@@ -1,0 +1,1045 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ClawPool Agent · 智能交易助手</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230b0e11'/%3E%3Cg fill='none' stroke='%23f7a600' stroke-width='2.5'%3E%3Crect x='6' y='6' width='8' height='8' rx='1.5'/%3E%3Crect x='18' y='6' width='8' height='8' rx='1.5'/%3E%3Crect x='6' y='18' width='8' height='8' rx='1.5'/%3E%3Crect x='18' y='18' width='8' height='8' rx='1.5'/%3E%3C/g%3E%3C/svg%3E"
+    />
+    <style>
+      :root {
+        /* 交易所风格主题:黑 + 橙黄 accent */
+        --bg: #0b0e11;
+        --bg2: #12161c;
+        --panel: #161b22;
+        --panel2: #1c232c;
+        --line: #222b36;
+        --line2: #2c3744;
+        --txt: #eaecef;
+        --dim: #a7b1bd;
+        --faint: #707a86;
+        --brand: #f7a600;
+        --brand2: #ffb800;
+        --brand-dim: #8a6410;
+        --green: #20b26c;
+        --red: #f6465d;
+        --blue: #3aa6ff;
+        --mono: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+        --sans:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Microsoft YaHei", sans-serif;
+      }
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        height: 100%;
+      }
+      body {
+        background: var(--bg);
+        color: var(--txt);
+        font-family: var(--sans);
+        overflow: hidden;
+        -webkit-font-smoothing: antialiased;
+      }
+      .app {
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+      }
+      /* 全站导航条(仿交易所站头):AI Pro 无关项灰化,仅装饰 */
+      .topnav {
+        height: 48px;
+        flex-shrink: 0;
+        background: var(--bg);
+        border-bottom: 1px solid var(--line);
+        display: flex;
+        align-items: center;
+        gap: 22px;
+        padding: 0 20px;
+      }
+      .topnav .wm {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        font-weight: 800;
+        font-size: 16px;
+        letter-spacing: 0.2px;
+        flex-shrink: 0;
+      }
+      .topnav .wm .d {
+        width: 22px;
+        height: 22px;
+        border-radius: 6px;
+        background: linear-gradient(135deg, var(--brand), var(--brand2));
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: #0b0e11;
+        font-weight: 900;
+        font-size: 14px;
+      }
+      .topnav .links {
+        display: flex;
+        align-items: center;
+        gap: 20px;
+        flex: 1;
+        min-width: 0;
+      }
+      /* 非 AI 项灰掉:不可点、低对比,只做"全站头"的形 */
+      .topnav .links a {
+        color: var(--faint);
+        font-size: 13.5px;
+        font-weight: 500;
+        text-decoration: none;
+        cursor: default;
+        white-space: nowrap;
+      }
+      .topnav .links a.on {
+        color: var(--brand);
+        font-weight: 700;
+        cursor: default;
+      }
+      .topnav .search {
+        margin-left: auto;
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 6px 11px;
+        color: var(--faint);
+        font-size: 12.5px;
+        width: 180px;
+        flex-shrink: 0;
+      }
+      .topnav .ic {
+        color: var(--faint);
+        font-size: 15px;
+        cursor: default;
+      }
+      .appbody {
+        flex: 1;
+        min-height: 0;
+        display: grid;
+        grid-template-columns: 264px 1fr;
+      }
+
+      /* ============ 左侧栏 ============ */
+      .side {
+        background: var(--bg2);
+        border-right: 1px solid var(--line);
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 18px 18px 14px;
+      }
+      .logo {
+        width: 30px;
+        height: 30px;
+        border-radius: 8px;
+        background: linear-gradient(135deg, var(--brand), var(--brand2));
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: 900;
+        color: #0b0e11;
+        font-size: 18px;
+        flex-shrink: 0;
+      }
+      .brand .nm {
+        font-size: 17px;
+        font-weight: 800;
+        letter-spacing: 0.3px;
+      }
+      .brand .nm .pro {
+        color: var(--brand);
+        font-weight: 700;
+        font-size: 12px;
+        border: 1px solid var(--brand-dim);
+        border-radius: 5px;
+        padding: 1px 6px;
+        margin-left: 6px;
+        vertical-align: middle;
+      }
+      .newbtn {
+        margin: 6px 14px 14px;
+        padding: 11px;
+        border: 1px solid var(--line2);
+        border-radius: 10px;
+        background: var(--panel);
+        color: var(--txt);
+        font-size: 14px;
+        font-weight: 600;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        justify-content: center;
+        transition: 0.15s;
+      }
+      .newbtn:hover {
+        border-color: var(--brand);
+        color: var(--brand);
+      }
+      .navrow {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 9px 18px;
+        color: var(--dim);
+        font-size: 14px;
+        cursor: pointer;
+        transition: 0.12s;
+      }
+      .navrow:hover {
+        background: var(--panel);
+        color: var(--txt);
+      }
+      .navrow .i {
+        width: 18px;
+        text-align: center;
+        opacity: 0.8;
+      }
+
+      .seclbl {
+        padding: 14px 18px 6px;
+        font-size: 11px;
+        color: var(--faint);
+        letter-spacing: 1.2px;
+        text-transform: uppercase;
+        font-weight: 700;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+      .seclbl .rf {
+        cursor: pointer;
+        color: var(--faint);
+        font-size: 13px;
+        letter-spacing: 0;
+      }
+      .seclbl .rf:hover {
+        color: var(--brand);
+      }
+      .nodes {
+        flex: 1;
+        overflow-y: auto;
+        padding: 0 10px;
+        min-height: 0;
+      }
+      .node {
+        padding: 10px 12px;
+        border-radius: 9px;
+        cursor: pointer;
+        margin-bottom: 3px;
+        transition: 0.12s;
+        border: 1px solid transparent;
+      }
+      .node:hover {
+        background: var(--panel);
+      }
+      .node.on {
+        background: var(--panel2);
+        border-color: var(--line2);
+      }
+      .node .nt {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 14px;
+        font-weight: 600;
+      }
+      .node .dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--green);
+        flex-shrink: 0;
+        box-shadow: 0 0 6px var(--green);
+      }
+      .node .dot.off {
+        background: var(--faint);
+        box-shadow: none;
+      }
+      .node .meta {
+        font-size: 11px;
+        color: var(--faint);
+        margin-top: 3px;
+        font-family: var(--mono);
+        padding-left: 15px;
+      }
+      .nodes .empty {
+        color: var(--faint);
+        font-size: 12px;
+        padding: 14px 12px;
+        line-height: 1.6;
+      }
+      .side .foot {
+        padding: 12px 18px;
+        border-top: 1px solid var(--line);
+        font-size: 11px;
+        color: var(--faint);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+      .side .foot .u {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-width: 0;
+      }
+      .side .foot .u .em {
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 130px;
+      }
+      .side .foot .ua {
+        width: 22px;
+        height: 22px;
+        border-radius: 50%;
+        background: var(--brand);
+        color: #0b0e11;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: 800;
+        font-size: 11px;
+        flex-shrink: 0;
+      }
+      .side .foot .logout {
+        cursor: pointer;
+        color: var(--faint);
+        font-size: 11px;
+        border: 1px solid var(--line2);
+        border-radius: 6px;
+        padding: 3px 8px;
+        transition: 0.12s;
+        flex-shrink: 0;
+      }
+      .side .foot .logout:hover {
+        border-color: var(--red);
+        color: var(--red);
+      }
+
+      /* ============ 主聊天区 ============ */
+      .main {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+        min-height: 0;
+        position: relative;
+      }
+      .topbar {
+        height: 56px;
+        border-bottom: 1px solid var(--line);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0 24px;
+        flex-shrink: 0;
+      }
+      .topbar .ti {
+        display: flex;
+        align-items: center;
+        gap: 11px;
+      }
+      .topbar .ti .av {
+        width: 30px;
+        height: 30px;
+        border-radius: 8px;
+        background: linear-gradient(135deg, var(--brand), var(--brand2));
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 16px;
+      }
+      .topbar .ti .nm {
+        font-size: 15px;
+        font-weight: 700;
+      }
+      .topbar .ti .st {
+        font-size: 12px;
+        color: var(--green);
+        display: flex;
+        align-items: center;
+        gap: 5px;
+      }
+      .topbar .ti .st .d {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: var(--green);
+        box-shadow: 0 0 6px var(--green);
+      }
+      .topbar .tr {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-size: 12px;
+        color: var(--faint);
+        font-family: var(--mono);
+      }
+      .modelchip {
+        border: 1px solid var(--line2);
+        border-radius: 7px;
+        padding: 5px 11px;
+        font-size: 12px;
+        color: var(--dim);
+        background: var(--panel);
+      }
+
+      .chat {
+        flex: 1;
+        overflow-y: auto;
+        padding: 28px 0;
+        min-height: 0;
+      }
+      .cwrap {
+        max-width: 760px;
+        margin: 0 auto;
+        padding: 0 24px;
+      }
+      .guard-block {
+        border: 1px solid rgba(246, 70, 93, 0.35);
+        background: rgba(246, 70, 93, 0.07);
+        border-radius: 10px;
+        padding: 12px 14px;
+        line-height: 1.55;
+        color: #e8b4bc;
+      }
+      .msg {
+        display: flex;
+        gap: 13px;
+        margin-bottom: 24px;
+        animation: rise 0.3s ease;
+      }
+      @keyframes rise {
+        from {
+          opacity: 0;
+          transform: translateY(6px);
+        }
+        to {
+          opacity: 1;
+          transform: none;
+        }
+      }
+      .msg .ava {
+        width: 32px;
+        height: 32px;
+        border-radius: 9px;
+        flex-shrink: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 16px;
+      }
+      .msg.ai .ava {
+        background: linear-gradient(135deg, var(--brand), var(--brand2));
+      }
+      .msg.me .ava {
+        background: var(--panel2);
+        border: 1px solid var(--line2);
+      }
+      .msg .bd {
+        flex: 1;
+        min-width: 0;
+      }
+      .msg .who {
+        font-size: 13px;
+        font-weight: 700;
+        margin-bottom: 5px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .msg .who .t {
+        font-size: 11px;
+        color: var(--faint);
+        font-weight: 400;
+        font-family: var(--mono);
+      }
+      .msg .ct {
+        font-size: 15px;
+        line-height: 1.7;
+        color: #dfe4ea;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .msg.me .who {
+        color: var(--brand);
+      }
+      .msg .ct code {
+        font-family: var(--mono);
+        font-size: 13px;
+        background: var(--panel2);
+        padding: 1px 5px;
+        border-radius: 4px;
+        color: var(--brand2);
+      }
+
+      /* 图片消息(agent 出图 / 用户发图) */
+      .media-slot {
+        margin-top: 8px;
+      }
+      .media-slot img {
+        max-width: 320px;
+        max-height: 320px;
+        border-radius: 10px;
+        border: 1px solid var(--line, #2b2f36);
+        display: block;
+        background: var(--panel2, #1a1d22);
+      }
+      .media-loading,
+      .media-err {
+        font-size: 13px;
+        color: #8b929c;
+        padding: 10px 12px;
+        border: 1px dashed var(--line, #2b2f36);
+        border-radius: 10px;
+        display: inline-block;
+        background: var(--panel2, #1a1d22);
+      }
+      .media-err {
+        color: var(--red, #e0566a);
+        border-color: var(--red, #e0566a);
+      }
+
+      /* 欢迎屏 */
+      .welcome {
+        max-width: 680px;
+        margin: 8vh auto 0;
+        text-align: center;
+        padding: 0 24px;
+        animation: rise 0.4s ease;
+      }
+      .welcome .big {
+        font-size: 30px;
+        font-weight: 800;
+        margin-bottom: 10px;
+      }
+      .welcome .big .g {
+        background: linear-gradient(95deg, var(--brand), var(--brand2));
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+      .welcome .sb {
+        color: var(--dim);
+        font-size: 15px;
+        line-height: 1.6;
+        margin-bottom: 28px;
+      }
+      .cards {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px;
+        text-align: left;
+      }
+      .qcard {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 15px 17px;
+        cursor: pointer;
+        transition: 0.15s;
+      }
+      .qcard:hover {
+        border-color: var(--brand);
+        transform: translateY(-2px);
+      }
+      /* Next-Actions 引导按钮(每条回复后) */
+      .na-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+        margin-top: 12px;
+        padding-top: 10px;
+        border-top: 1px solid var(--line);
+      }
+      .na-lbl {
+        font-size: 12px;
+        color: var(--brand-dim);
+        margin-right: 2px;
+      }
+      .na-chip {
+        background: rgba(247, 166, 0, 0.08);
+        border: 1px solid rgba(247, 166, 0, 0.3);
+        color: var(--brand2);
+        border-radius: 14px;
+        padding: 5px 12px;
+        font-size: 12.5px;
+        cursor: pointer;
+        transition: 0.15s;
+        white-space: nowrap;
+      }
+      .na-chip:hover {
+        background: var(--brand);
+        color: #1a1300;
+        border-color: var(--brand);
+      }
+      .qcard .qt {
+        font-size: 14px;
+        font-weight: 600;
+        margin-bottom: 4px;
+      }
+      .qcard .qd {
+        font-size: 12px;
+        color: var(--faint);
+      }
+
+      /* 输入区 */
+      .composer {
+        flex-shrink: 0;
+        padding: 14px 0 22px;
+        background: linear-gradient(to top, var(--bg) 60%, transparent);
+      }
+      .cbox {
+        max-width: 760px;
+        margin: 0 auto;
+        padding: 0 24px;
+      }
+      .inwrap {
+        background: var(--panel);
+        border: 1px solid var(--line2);
+        border-radius: 15px;
+        padding: 13px 15px;
+        transition: 0.15s;
+        display: flex;
+        flex-direction: column;
+        gap: 9px;
+      }
+      .inwrap:focus-within {
+        border-color: var(--brand);
+        box-shadow: 0 0 0 3px rgba(247, 166, 0, 0.1);
+      }
+      .inwrap textarea {
+        width: 100%;
+        background: transparent;
+        border: none;
+        outline: none;
+        color: var(--txt);
+        font-size: 15px;
+        font-family: var(--sans);
+        resize: none;
+        line-height: 1.5;
+        max-height: 160px;
+      }
+      .inwrap textarea::placeholder {
+        color: var(--faint);
+      }
+      .inrow {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+      .inrow .lf {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 12px;
+        color: var(--faint);
+      }
+      .tool {
+        width: 30px;
+        height: 30px;
+        border-radius: 8px;
+        border: 1px solid var(--line2);
+        background: transparent;
+        color: var(--dim);
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: 0.12s;
+      }
+      .tool:hover {
+        border-color: var(--brand);
+        color: var(--brand);
+      }
+      .send {
+        width: 34px;
+        height: 34px;
+        border-radius: 9px;
+        border: none;
+        background: var(--brand);
+        color: #0b0e11;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 16px;
+        font-weight: 800;
+        transition: 0.15s;
+      }
+      .send:hover {
+        background: var(--brand2);
+      }
+      .send:disabled {
+        background: var(--line2);
+        color: var(--faint);
+        cursor: not-allowed;
+      }
+      .disclaimer {
+        text-align: center;
+        font-size: 11px;
+        color: var(--faint);
+        margin-top: 9px;
+      }
+
+      /* typing */
+      .typing {
+        display: inline-flex;
+        gap: 4px;
+        align-items: center;
+      }
+      .typing span {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: var(--brand);
+        animation: blink 1.2s infinite;
+      }
+      .typing span:nth-child(2) {
+        animation-delay: 0.2s;
+      }
+      .typing span:nth-child(3) {
+        animation-delay: 0.4s;
+      }
+      @keyframes blink {
+        0%,
+        60%,
+        100% {
+          opacity: 0.25;
+        }
+        30% {
+          opacity: 1;
+        }
+      }
+
+      /* 思考过程面板(agent 处理期间的步骤提示) */
+      .think {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        color: var(--brand2);
+        font-size: 13px;
+      }
+      .think-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--brand);
+        box-shadow: 0 0 8px var(--brand);
+        animation: pulse 1s infinite;
+      }
+      .think-tx {
+        opacity: 0.85;
+      }
+      @keyframes pulse {
+        0%,
+        100% {
+          transform: scale(0.7);
+          opacity: 0.5;
+        }
+        50% {
+          transform: scale(1.1);
+          opacity: 1;
+        }
+      }
+
+      /* 行情卡片(agent 行情回复的可视化,对齐主流交易所行情 widget) */
+      .quote-card {
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 14px 16px;
+        margin: 4px 0 12px;
+        background: linear-gradient(
+          145deg,
+          rgba(247, 166, 0, 0.06),
+          rgba(255, 255, 255, 0.01)
+        );
+      }
+      .qc-head {
+        display: flex;
+        align-items: baseline;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+      .qc-sym {
+        font-weight: 700;
+        font-size: 15px;
+        color: #e8eef6;
+      }
+      .qc-price {
+        font-size: 22px;
+        font-weight: 700;
+        color: var(--brand2);
+        font-variant-numeric: tabular-nums;
+      }
+      .qc-chg {
+        font-size: 14px;
+        font-weight: 600;
+      }
+      .qc-grid {
+        display: flex;
+        gap: 22px;
+        margin-top: 10px;
+        flex-wrap: wrap;
+      }
+      .qc-k {
+        font-size: 11px;
+        color: var(--dim, #7a8aa0);
+      }
+      .qc-v {
+        font-size: 13px;
+        color: #cdd7e3;
+        font-variant-numeric: tabular-nums;
+        margin-top: 2px;
+      }
+
+      /* 连接状态条 */
+      .connbar {
+        position: absolute;
+        top: 56px;
+        left: 0;
+        right: 0;
+        background: rgba(58, 166, 255, 0.12);
+        border-bottom: 1px solid rgba(58, 166, 255, 0.3);
+        color: var(--blue);
+        font-size: 12px;
+        padding: 7px 24px;
+        text-align: center;
+        font-family: var(--mono);
+        display: none;
+      }
+      .connbar.show {
+        display: block;
+      }
+      .connbar.demo {
+        background: rgba(247, 166, 0, 0.1);
+        border-color: rgba(247, 166, 0, 0.3);
+        color: var(--brand2);
+      }
+      .connbar.err {
+        background: rgba(246, 70, 93, 0.1);
+        border-color: rgba(246, 70, 93, 0.3);
+        color: var(--red);
+      }
+
+      /* 加载遮罩(鉴权检查期间) */
+      .boot {
+        position: fixed;
+        inset: 0;
+        background: var(--bg);
+        z-index: 100;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 16px;
+      }
+      .boot .lg {
+        width: 56px;
+        height: 56px;
+        border-radius: 14px;
+        background: linear-gradient(135deg, var(--brand), var(--brand2));
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: 900;
+        color: #0b0e11;
+        font-size: 32px;
+      }
+      .boot .tx {
+        color: var(--dim);
+        font-size: 14px;
+      }
+
+      ::-webkit-scrollbar {
+        width: 9px;
+      }
+      ::-webkit-scrollbar-thumb {
+        background: var(--line2);
+        border-radius: 5px;
+      }
+      ::-webkit-scrollbar-track {
+        background: transparent;
+      }
+    </style>
+
+    <!-- #63 CSP 外链化 — 内联 <script> 已搬到 js/auth.js 与 js/chat.js。
+         setup.sh 把 __OC_*__ 占位 sed 到下面这个 <script type=application/json>
+         (不是可执行脚本,不受 CSP script-src 约束),外链脚本读之。 -->
+    <script type="application/json" id="oc-config">
+      {
+        "cognito_domain": "__OC_COGNITO_DOMAIN__",
+        "cognito_client_id": "__OC_COGNITO_CLIENT_ID__",
+        "api_url": "__OC_API_URL__",
+        "api_key": "__OC_API_KEY__"
+      }
+    </script>
+    <script src="js/auth.js"></script>
+  </head>
+  <body>
+    <!-- 鉴权/初始化遮罩,JS 起来后移除 -->
+    <div class="boot" id="boot">
+      <div class="lg">B</div>
+      <div class="tx">正在验证身份并连接你的智能体节点…</div>
+    </div>
+
+    <div class="app" style="display: none" id="appRoot">
+      <div class="appbody">
+        <!-- 左侧栏 -->
+        <aside class="side">
+          <div class="brand">
+            <div class="logo">🐋</div>
+            <div class="nm">ClawPool<span class="pro">Agent</span></div>
+          </div>
+          <button class="newbtn" data-action="new-session">＋ 新建对话</button>
+          <div class="navrow"><span class="i">⇆</span> 转账资金</div>
+          <div class="navrow" data-action="load-history" style="cursor: pointer">
+            <span class="i">◷</span> 历史记录
+          </div>
+          <div class="navrow"><span class="i">⚙</span> 设置</div>
+
+          <div class="seclbl">
+            我的智能体节点
+            <span class="rf" title="刷新节点" data-action="load-nodes" style="cursor: pointer">↻</span>
+          </div>
+          <div class="nodes" id="nodeList">
+            <div class="empty">加载节点中…</div>
+          </div>
+
+          <div class="foot">
+            <div class="u">
+              <div class="ua" id="userInitial">·</div>
+              <span class="em" id="userEmail">未登录</span>
+            </div>
+            <span class="logout" id="logoutBtn" data-action="logout">退出</span>
+          </div>
+        </aside>
+
+        <!-- 主聊天区 -->
+        <main class="main">
+          <div class="topbar">
+            <div class="ti">
+              <div class="av">🐋</div>
+              <div>
+                <div class="nm" id="hdrName">ClawPool Agent</div>
+                <div class="st">
+                  <span class="d"></span><span id="hdrNode">— · 连接中</span>
+                </div>
+              </div>
+            </div>
+            <div class="tr">
+              <span class="modelchip" id="modelChip">Claude Sonnet 4.6</span>
+            </div>
+          </div>
+
+          <div class="connbar" id="connBar"></div>
+
+          <div class="chat" id="chat">
+            <div class="welcome" id="welcome">
+              <div class="big">
+                你好,我是 <span class="g">ClawPool Agent</span> 🐋
+              </div>
+              <div class="sb">
+                运行在你专属的隔离微虚拟机里 · 身份与技能不可篡改 ·
+                数据不出你的沙箱<br />问我行情、查代币审计、跑策略回测,或聊聊市场。
+              </div>
+              <div class="cards">
+                <div
+                  class="qcard"
+                  data-action="quick-ask"
+                  data-quick="BTC 现在什么价位?简短说下短期多空关键位。"
+                >
+                  <div class="qt">📈 BTC 行情速览</div>
+                  <div class="qd">价位 + 短期多空关键位</div>
+                </div>
+                <div
+                  class="qcard"
+                  data-action="quick-ask"
+                  data-quick="帮我查一下某个代币的合约审计风险点该看哪些。"
+                >
+                  <div class="qt">🔍 代币审计</div>
+                  <div class="qd">合约风险点速查</div>
+                </div>
+                <div
+                  class="qcard"
+                  data-action="quick-ask"
+                  data-quick="你是谁?谁运营你?运行在什么隔离环境?身份文件能改吗?"
+                >
+                  <div class="qt">🪪 身份核验</div>
+                  <div class="qd">确认我连的是哪个助手</div>
+                </div>
+                <div
+                  class="qcard"
+                  data-action="quick-ask"
+                  data-quick="列出你能用的技能,并说明哪些是只读不可篡改的。"
+                >
+                  <div class="qt">🛡️ 技能与安全</div>
+                  <div class="qd">能力边界 + 不可篡改性</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="composer">
+            <div class="cbox">
+              <div class="inwrap">
+                <textarea
+                  id="input"
+                  rows="1"
+                  placeholder="给 ClawPool Agent 发消息(Enter 发送,Shift+Enter 换行)"
+                ></textarea>
+                <div class="inrow">
+                  <div class="lf">
+                    <input
+                      type="file"
+                      id="fileInput"
+                      accept="image/png,image/jpeg,image/gif,image/webp"
+                      style="display: none"
+                    />
+                    <button
+                      class="tool"
+                      title="发送图片"
+                      data-action="pick-image"
+                    >
+                      ＋
+                    </button>
+                    <button class="tool" title="语音">🎙</button>
+                    <span style="margin-left: 4px">标准模式</span>
+                  </div>
+                  <button class="send" id="sendBtn" data-action="send">↑</button>
+                </div>
+              </div>
+              <div class="disclaimer">
+                ClawPool Agent
+                可能会出错,涉及资金的操作请务必二次确认。每条对话经 Bedrock
+                Guardrail 过滤。
+              </div>
+            </div>
+          </div>
+        </main>
+      </div>
+    </div>
+
+    <script src="js/chat.js"></script>
+  </body>
+</html>

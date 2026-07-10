@@ -8,14 +8,14 @@
 
 ## 14.1 Test phase · full-load 380 per host + adversarial cases
 
-**Hard requirement**: real-host tests must drive **380 microVMs per host at full load** and include **adversarial cases**, not just happy path.
+**Hard requirement** (memory `fullload-380-test-mandate-2026-07-04`): real-host tests must drive **380 microVMs per host at full load** and include **adversarial cases**, not just happy path.
 
 ### Full-load pressure
 
 - **Per-host ceiling**: `r8g.metal-24xl` supports 380 microVMs (2 GB/VM × 380 = 760 GB, matches the 768 GB memory).
 - **Four tests that block issue-close** (missing any goes to backlog, not "done"):
   1. **Steady state** — 380 microVMs running, SSE holds 30 min without dropouts.
-  2. **Bursty create** — 300 create/s into SQS dispatch; verify the SSM per-instance concurrency stays under the ceiling (measured: ~40 concurrent create hits `TimedOut`).
+  2. **Bursty create** — 300 create/s into SQS dispatch; verify the SSM per-instance concurrency stays under the ceiling (795 measured: 40 concurrent create hit `TimedOut`, `memory: loadtest-380-ssm-concurrency-bottleneck`).
   3. **Single-AZ down** — kill one AZ of edge + host mixed load; verify the other two AZs absorb traffic and `az_failover` migrates tenants (`config.yml:health_check.az_failover`).
   4. **conntrack near cap** — drive edge + host to `nf_conntrack_max=1048576` neighborhood; verify no packet loss. Edge: `install-edge.sh:131`. Host: `init-host.sh:85-99`.
 
@@ -31,19 +31,19 @@ Iron law #11 mandates test intensity scales with blast radius on isolation / del
 
 ### Evidence
 
-All test results must be archived — no traces = not tested (test discipline).
+All test results must be archived — no traces = not tested (project test discipline).
 
 ---
 
 ## 14.2 Rollout phase · canary rolling + staged bring-up
 
-**Core discipline**: do not `min_capacity=1` and start hosts before the golden image is ready. **Correct order: min=0 → bake image → then scale up.**
+**Core discipline** (memory `goal-restructure-and-deploy-uswest2-2026-06-30`): do not `min_capacity=1` and start hosts before the golden image is ready. **Correct order: min=0 → bake image → then scale up.**
 
 ### Cold-start order (fresh region)
 
 1. **VPC and networking first** — `./setup.sh <region> <profile>` runs `deploy/stack.py:_build_vpc(mode=self_managed)` (self-managed /20 + 3 AZ + 3 NAT GW). At this point `host_asg` **min=0**, `edge_asg` **min=0**.
 2. **Bake the image** — `build-rootfs.sh --arch arm64`, or in-stack CodeBuild (`image.build_in_stack=true`). Wait for the rootfs in S3.
-3. **Scale hosts to minimum** — set `config.yml:asg.min_capacity=2`, re-run `setup.sh`. The rootfs is already in S3, so hosts won't Heartbeat-Timeout-replace.
+3. **Scale hosts to minimum** — set `config.yml:asg.min_capacity=2`, re-run `setup.sh`. The rootfs is already in S3, so hosts won't Heartbeat-Timeout-replace (burned on this: `memory: uswest2-deploy-deadlock-and-fixes`).
 4. **Scale edge to min=3** — set `config.yml:edge.enabled=true` + `edge.min_capacity=3`, re-run `setup.sh`. Edge userdata polls `/healthz` to 200 before CONTINUE (`install-edge.sh:170-183` warmup gate); the ASG lifecycle hook only lets the instance take traffic once it truly routes.
 
 ### Rolling upgrade (image change / stack.py change)
@@ -62,12 +62,12 @@ All test results must be archived — no traces = not tested (test discipline).
 
 ### Cutting over the data plane (hub-WS → two-tier route)
 
-**Parallel canary landed** (P2b-iac): both paths coexist for now.
+**Parallel canary landed in bb** (P2 · MR !168 P2b-iac): both paths coexist for now.
 
 - ALB rule priority 10 keeps `/hub/*` → legacy hub target group (host:80 nginx) — **decommissioning; removable after P4**.
 - ALB rule priority 20 points `/vm/*` + `/ws/*` → EdgeTG (`stack.py:3846-3851`).
 
-Cut over by migrating CloudFront `/hub/*` behavior toward `/ws/*` and upgrading the client SDK to `wss /gw/ws` (platform BE does SSE relay, `docs/aws-guide-en/13-data-plane-redesign.md § 13.1`). Legacy hub can be fully removed after P4-② finishes the frontend cutover and `docs/backend/openapi.yaml` 3.0.0 is integrated.
+Cut over by migrating CloudFront `/hub/*` behavior toward `/ws/*` and upgrading the client SDK to `wss /gw/ws` (platform BE does SSE relay, `docs/aws-guide-en/13-data-plane-redesign.md § 13.1`). Legacy hub can be fully removed after P4-② finishes the frontend cutover and `docs/backend/openapi.yaml` 3.0.0 is integrated (MR !172 landed).
 
 ---
 
@@ -118,13 +118,13 @@ Production = 100k microVMs steady state. Break any of these six lines and you ha
 
 Once in production, establish drills — don't wait for real incidents. Recommended cadence:
 
-| Scenario | Frequency | Command / Steps |
-|---|---|---|
-| ElastiCache manual failover | **Quarterly** | `aws elasticache test-failover --replication-group-id openclaw-routes --node-group-id 0001` — observe fail-static trigger duration < 60 s |
-| Edge single-AZ kill | **Quarterly** | Terminate one AZ's edge instance — observe ASG replacement + ELB rebalance time |
-| Host AZ failover | **Semi-annual** | Trigger `az_failover` (manually disable host status in one AZ) — verify tenant migration path |
-| CloudFront long-idle cap | **Quarterly** | Hold an idle WS 200 s — observe whether CloudFront cuts at 180 s — verify client-heartbeat SDK deployment |
-| Guardrail intercept sampling | **Monthly** | Sample OWASP top-10 through the guardrail — 14/14 blocked is baseline — any regression escalates |
+| Scenario                     | Frequency       | Command / Steps                                                                                                                           |
+| ---------------------------- | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| ElastiCache manual failover  | **Quarterly**   | `aws elasticache test-failover --replication-group-id openclaw-routes --node-group-id 0001` — observe fail-static trigger duration < 60 s |
+| Edge single-AZ kill          | **Quarterly**   | Terminate one AZ's edge instance — observe ASG replacement + ELB rebalance time                                                           |
+| Host AZ failover             | **Semi-annual** | Trigger `az_failover` (manually disable host status in one AZ) — verify tenant migration path                                             |
+| CloudFront long-idle cap     | **Quarterly**   | Hold an idle WS 200 s — observe whether CloudFront cuts at 180 s — verify client-heartbeat SDK deployment                                 |
+| Guardrail intercept sampling | **Monthly**     | Sample OWASP top-10 through the guardrail — 14/14 blocked is baseline — any regression escalates                                          |
 
 All drill results are archived.
 
@@ -135,3 +135,4 @@ All drill results are archived.
 - Architecture: [Chapter 13 · Data-plane two-tier routing](13-data-plane-redesign.md).
 - Component ops (alert thresholds, scaling triggers, troubleshooting): [Chapter 11 · Component Ops Manual](11-ops-maintenance.md).
 - Private API hardening: [Chapter 12 · Private API Gateway](12-private-api-hardening.md).
+- HA audit (15 components, fixed vs still-single): see the project HA audit doc.

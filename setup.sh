@@ -430,7 +430,7 @@ aws s3 cp "$SCRIPT_DIR/deploy/userdata/launch-all-vms.sh" "s3://${BUCKET}/deploy
   --profile "$PROFILE" --region "$REGION" --quiet
 
 # #187 转型:claw-hub(WebSocket 中枢)数据面已下线。install-hub.sh + deploy/hub/
-# 全部归档到 (archived)。数据面改两级路由
+# 已归档(不再使用)。数据面改两级路由
 # 直连 microVM 原生 gateway(ALB LOR → OpenResty edge → Redis → host DNAT →
 # microVM:18789),setup.sh 不再上传 hub 资产;init-host.sh 里 install-hub.sh
 # 引用也应一并删(独立 issue,同 stack.py CloudFront /hub behavior + HubTG 收尾)。

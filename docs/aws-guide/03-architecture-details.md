@@ -1,8 +1,8 @@
 # 架构详情
 
-> **2026-07-08 数据面转型说明**:本章「数据面(实时聊天中枢 claw-hub)」及其身份链、hub-WS、claw-channel、Cognito 三处身份、HMAC channel_secret 等旧模型已被 [第 13 章 · 数据面两级路由](13-data-plane-redesign.md) **完全代替**(客户 OIDC 不支持无浏览器登录,故弃用 Cognito 与出站拨号中枢,改用 OpenClaw 原生 gateway 认证)。本章其余部分(控制面、租户 microVM、五层安全模型)保持有效。
+> **2026-07-08 数据面转型说明**:本章「数据面(实时聊天中枢 claw-hub)」及其身份链、hub-WS、claw-channel、Cognito 三处身份、HMAC channel_secret 等旧模型已被 [第 13 章 · 数据面两级路由](13-data-plane-redesign.md) **完全代替**。转型缘由与影响面见项目决策记录。本章其余部分(控制面、租户 microVM、五层安全模型)保持有效。
 
-本节介绍构成此解决方案的组件和 AWS 服务，以及这些组件如何协同工作的架构详情。该解决方案由三大组件构成：负责注册、生命周期、备份与注销的控制面（生命周期管理平面）；按租户把实时聊天路由到各 microVM 内 OpenClaw 原生 gateway 的数据面（两级边缘路由：OpenResty 边缘 ASG + 宿主 iptables DNAT）；以及为每个租户运行带身份、技能与护栏的 OpenClaw AI agent 的租户 microVM（基于 Firecracker 的独立内核运行时）。三者职责正交：控制面只做生命周期管理、运行后不向 microVM 注入业务数据；数据面只做按租户的消息路由；租户 microVM 是启动即成品的隔离运行时。安全模型在这三个组件之上以五层纵深防御叠加，详见本节的「纵深防御：五层安全模型」。
+本节介绍构成此解决方案的组件和 AWS 服务，以及这些组件如何协同工作的架构详情。该解决方案由三大组件构成：负责注册、生命周期、备份与注销的控制面（生命周期管理平面）；按租户路由实时聊天请求的数据面（实时聊天中枢 claw-hub）；以及为每个租户运行带身份、技能与护栏的 OpenClaw AI agent 的租户 microVM（基于 Firecracker 的独立内核运行时）。三者职责正交：控制面只做生命周期管理、运行后不向 microVM 注入业务数据；数据面只做按租户的消息路由；租户 microVM 是启动即成品的隔离运行时。安全模型在这三个组件之上以五层纵深防御叠加，详见本节的「纵深防御：五层安全模型」。
 
 ## 控制面（生命周期管理平面）
 
@@ -30,13 +30,34 @@
 >
 > Amazon DynamoDB 审计表的客户主密钥（CMK）加密目前属于规划（未实现）。现存表为 `RETAIN`，在线切换加密会强制 replace 并丢失审计数据，因此仅规划在全新账户首次部署时启用。
 
-## 数据面（两级边缘路由）
+## 数据面（实时聊天中枢 claw-hub）
 
-本节概述数据面的当前模型。数据面按租户把实时聊天路由到各 microVM 内的 OpenClaw 原生 gateway，链路为：浏览器 → 平台后端 → Amazon CloudFront → Application Load Balancer（最少未完成请求）→ OpenResty 边缘 ASG（查 Redis 路由表得到该租户自己的 `host:port`）→ host iptables PREROUTING DNAT（端口 10000-10400）→ microVM `:18789` 上的 OpenClaw 原生 gateway。gateway 的唯一鉴权是每租户 `Authorization: Bearer <gateway_token>`，controlUi 关闭。
+本节介绍数据面的连接模型与验签平面。该组件是一个自建的 WebSocket 中枢（claw-hub），按租户把浏览器或前端的聊天请求路由到对应 microVM 内的 OpenClaw agent，并对跨租户访问做应用层显式授权。
 
-Redis 路由表在 OpenResty 边缘做三级缓存查询以降低延迟:L1 lrucache 5s、L2 shared_dict 60s、L3 ElastiCache。唯一凭据是每租户 KMS 信封加密的 `gateway_token`（EncryptionContext={tenant_id}),密文存 Amazon DynamoDB、15 分钟 TTL,由 launch-vm.sh 在启动前冷注入,API Lambda 无 `kms:Decrypt` 权限。
+数据面采用 outbound-WS 中枢模型：microVM 内的 `claw-channel` 主动向 claw-hub 拨出连接、不开任何入站端口。浏览器与 agent 之间的实时投递全部经 claw-hub 的 WebSocket 转发，链路为「浏览器 ↔ claw-hub ↔ microVM 内 claw-channel ↔ agent」。公网唯一入口经 Amazon CloudFront → Application Load Balancer，CloudFront 的 `/hub/*` 行为转发所有请求头（含 `Upgrade` 与 `Sec-WebSocket-*`）、禁用缓存、允许全部方法，并将 origin 读超时设为 60s 以承载 WebSocket 长连接。
 
-本节先前的 claw-hub / claw-channel 出站拨号旧模型已被完全代替,权威说明见 [第 13 章 · 数据面两级路由](13-data-plane-redesign.md)（含 token 铸造、边缘路由、宿主 DNAT、超时链）。
+数据面区分三种 token，对应两个独立的验签平面，三种 token 的信任最终都回溯到 Amazon Cognito：
+
+- **控制面 Cognito id_token**：调用控制面 REST API 时在 `Authorization: Bearer` 中携带，经 Amazon Cognito 的 JWKS 公钥做 RS256 验签，校验 issuer，验签失败一律降级到最小权限（viewer）。
+- **聊天前端 token**：浏览器连接 claw-hub 的 WebSocket 所需。客户端经 `POST /token`（带 Cognito id_token Bearer 与 `tenant_id`）发起，claw-hub 先用 Amazon Cognito 的 JWKS 做 RS256 验签，再做一次显式租户授权检查（该用户是否为租户 owner 或被授权人），通过后才签发。该 token 是 claw-hub 自签的 HMAC token，TTL 300s，携带 `role`（固定 `frontend`）、`sub`（服务端验过的用户身份）、`tenant`、`access`、`exp` 五个 claim。
+- **聊天通道 token**：microVM 内的 claw-channel 向 claw-hub 注册出站连接所需。channel 经 `POST /channel-token`（带 `tenant_id`、`appId`、`timestamp`、`signature`，其中签名为 `HMAC-SHA256("{appId}:{timestamp}", appSecret)`，时间窗 ±300s、常量时间比对）发起。通道 token 只带 `role`（`channel`）、`tenant`、`exp` 三个 claim，不含 `sub`，因为它代表一个租户而非某个用户。
+
+两个验签平面正交：控制面平面用 Cognito id_token 的 Bearer + RBAC；聊天平面内部又分前端 token 与通道 token，各自独立验签，但前端 token 的发行同样以 Cognito id_token 验签为前提。Amazon Cognito 是整套平台身份验证的唯一信任根，控制面与数据面都只认 Cognito 签发并验签通过的 token；外部账号经 OpenID Connect（OIDC）联合也是联合进同一个 Cognito User Pool 后由 Cognito 重新签发 id_token，对 claw-hub 透明、不引入 guest 侧新凭据。
+
+出图与看图（media）链路通过 Amazon S3 presigned URL 完成，claw-hub 是唯一持有 S3 实例角色的组件，把 S3 访问的爆炸半径收敛在一处：
+
+- **看图（inbound）**：用户上传时，前端经 claw-hub presign PUT 到 Amazon S3，发携带 fileKey 的 FILE 帧，claw-channel 取 presigned GET、本地校验 MIME 与大小后传给多模态核心。
+- **出图（outbound）**：agent 引用本地文件时，claw-channel 校验 MIME 与大小并经 claw-hub presign 上传 Amazon S3，前端再取 presigned URL。
+
+文件端点对租户归属做校验：取下载链接时校验路径中的租户段必须与 token 中的租户一致，跨租户连对象是否存在都不泄露。Amazon S3 媒体桶的跨域（CORS）只放行单一 CloudFront 域。
+
+> **Important**
+>
+> `POST /chat/sign` 端点与 `x-claw-*`（signature/random/timestamp）三个头是早期「签名→经 nginx→VM inbound」设计的历史残留：claw-channel 是 outbound-WS 模型、不开入站端口，代码中无任何对应的 inbound 签名校验方。接入方不应将其当作活契约，C 端聊天投递实际全部经 claw-hub 的 WebSocket 链路完成。
+
+> **Note**
+>
+> claw-hub 当前生产实跑单进程 metal 形态（systemd 拉起），跨 Pod 的 Redis 路由（cluster-routing）代码完整且 degrade-safe，但 Amazon Elastic Kubernetes Service (Amazon EKS) 多副本灰度尚未切换到生产（目标态）。接入契约（`/hub/token`、`/hub/ws`、帧结构）在单进程与多副本下一致。
 
 ## 租户 microVM（OpenClaw agent 运行时）
 
@@ -55,7 +76,7 @@ Firecracker microVM 挂载四块盘，按 Firecracker PUT 顺序分配 `/dev/vd<
 
 ### 身份冷注入
 
-身份、技能与配置遵循「启动前冷注入」：身份文件与运维 skill 烤进只读的 immutable 盘；租户专属配置（每租户 `gateway_token`、per-tenant 计费 vkey）在启动前注入到 data 盘的 `openclaw.json`。VM 启动即为成品，控制面对运行中的 VM 不做行为或数据注入。修改租户身份需要重新构建镜像并重建，而非调用运行时 API。每租户 `gateway_token` 采用 KMS 信封加密模型：以 KMS GenerateRandom（32 字节）铸造 → 信封加密（EncryptionContext={tenant_id}）→ 密文写入 Amazon DynamoDB 记录，并在启动 VM 时由部署脚本冷注入到 data 盘 `openclaw.json` 的 `.gateway.auth.token`，使 microVM 内的 gateway 校验每租户 Bearer token；该 token 从不烤进只读黄金镜像、从不下发给浏览器。
+身份、技能与配置遵循「启动前冷注入」：身份文件与运维 skill 烤进只读的 immutable 盘；租户专属配置（channel secret、per-tenant 计费 vkey）在启动前注入到 data 盘的 `openclaw.json`。VM 启动即为成品，控制面对运行中的 VM 不做行为或数据注入。修改租户身份需要重新构建镜像并重建，而非调用运行时 API。HMAC channel secret 采用控制面预生成模型：注册租户时由控制面以 32 字节随机值铸出、写入 DynamoDB 记录，并在启动 VM 时由部署脚本注入到 data 盘，使 claw-hub 对 channel 的首次注册即可验签通过；该 secret 从不烤进只读黄金镜像、从不下发给浏览器。
 
 ### 网络寻址模型
 
@@ -80,7 +101,7 @@ Firecracker microVM 挂载四块盘，按 Firecracker PUT 顺序分配 `/dev/vd<
 
 ### L3 身份层（Amazon Cognito + RBAC + owner 门控）
 
-本层以 Amazon Cognito 为唯一信任根做身份验证与授权。控制面 API 用 RS256 + JWKS 公钥验签 Cognito 签发的 token，验签失败一律降级到最小权限（viewer），绝不默认 admin；`cognito:groups` 声明映射 viewer/operator/admin 三级角色，forged、expired、`alg:none`、错误 issuer 的 token 一律降级到只读。基于角色的访问控制（RBAC）门控自身是独立开关 `RBAC_ENABLED`，默认 `true`（默认强制 per-route 角色检查 + owner 检查）。数据面上跨租户被结构性挡住,因为每租户 `gateway_token` 只绑一个租户（KMS EncryptionContext={tenant_id}）,边缘严格按该租户自己的 `host:port`（取自 Redis 路由表）转发,租户 A 的 token 无法解析或到达租户 B 的 microVM。
+本层以 Amazon Cognito 为唯一信任根做身份验证与授权。控制面 API 用 RS256 + JWKS 公钥验签 Cognito 签发的 token，验签失败一律降级到最小权限（viewer），绝不默认 admin；`cognito:groups` 声明映射 viewer/operator/admin 三级角色，forged、expired、`alg:none`、错误 issuer 的 token 一律降级到只读。基于角色的访问控制（RBAC）门控自身是独立开关 `RBAC_ENABLED`，默认 `true`（默认强制 per-route 角色检查 + owner 检查）。数据面 claw-hub 把「token 绑一个租户 + channel 注册一个租户 + 撮合不跨桥」写成可指认的授权点：`authorizeSubForTenant` 据 `owner_id` 与 `authorized_users` 判定，DDB 出错则拒绝（fail-closed），别人的私有节点拒绝（`not-authorized`）。聊天链路上跨租户被结构性挡住：前端 token 只带一个租户、channel 只注册一个租户，hub 路由时要求两者一致，否则路由到空 channel。
 
 > **Note**
 >
@@ -90,7 +111,7 @@ Firecracker microVM 挂载四块盘，按 Firecracker PUT 顺序分配 `/dev/vd<
 
 本层在 host 上以 iptables 强制跨租户与跨边界的网络隔离（Firecracker 自身不过滤流量，出网过滤全靠 host iptables）。所有安全 DROP 都插到链顶，确保排在追加的 ACCEPT/MASQUERADE 之前。三类 DROP 为：① IMDS 隔离，在 FORWARD 链 DROP guest 到 `169.254.169.254` 与 `169.254.169.253` 的流量，防租户经 MASQUERADE 到达 host 的实例元数据服务盗取 host EC2 instance-profile 凭据；② 东西向 L2 隔离，FORWARD 链 DROP guest 到整个租户超网 `SUBNET_PREFIX/16` 的流量，防包被路由进另一个租户的 /30；③ 管理面隔离，INPUT 链 DROP guest 到 host 的 8899/9090/22 端口。
 
-出网方向支持默认拒绝白名单（config-gated `security.egress_allowlist_enabled`，默认 false，开启前 guest 出网无限制、行为不变）。开启后把 FORWARD 链末尾的无条件 ACCEPT 换成：放行 VPC CIDR 与运营自定义 CIDR（覆盖 OpenResty 边缘 ASG、LiteLLM、VPC Endpoint 等私网目标）、放行 host dnsmasq 按域名白名单解析出的真实 IP（内置 `cognito-idp.{region}.amazonaws.com`、`s3.{region}.amazonaws.com`，运营可加外部平台行情等域名），末尾对该租户到公网口补 DROP 兜底。域名白名单靠 host dnsmasq 实现：`nat/PREROUTING` 把 guest 的 :53 透明 DNAT 到 host dnsmasq，dnsmasq 边解析边把命中域名的 IP 灌进 ipset，FORWARD 用 `-m set --match-set` 放行——因此不改 guest 镜像（guest DNS 保持不变）即可收口。放行 `cognito-idp` 走域名白名单而非 IP 段，因为 AWS `ip-ranges.json` 未发布 Cognito 独立的地址段（只落在 AMAZON 大聚合段）。
+出网方向支持默认拒绝白名单（config-gated `security.egress_allowlist_enabled`，默认 false，开启前 guest 出网无限制、行为不变）。开启后把 FORWARD 链末尾的无条件 ACCEPT 换成：放行 VPC CIDR 与运营自定义 CIDR（覆盖 hub、LiteLLM、EKS ALB、VPC Endpoint 等私网目标）、放行 host dnsmasq 按域名白名单解析出的真实 IP（内置 `cognito-idp.{region}.amazonaws.com`、`s3.{region}.amazonaws.com`，运营可加交易所行情等域名），末尾对该租户到公网口补 DROP 兜底。域名白名单靠 host dnsmasq 实现：`nat/PREROUTING` 把 guest 的 :53 透明 DNAT 到 host dnsmasq，dnsmasq 边解析边把命中域名的 IP 灌进 ipset，FORWARD 用 `-m set --match-set` 放行——因此不改 guest 镜像（guest DNS 保持不变）即可收口。放行 `cognito-idp` 走域名白名单而非 IP 段，因为 AWS `ip-ranges.json` 未发布 Cognito 独立的地址段（只落在 AMAZON 大聚合段）。
 
 需要说明：Amazon Route 53 Resolver DNS Firewall（config-gated `security.dns_firewall_enabled`，默认 false）作用于经 VPC Route 53 Resolver 的 DNS 查询；而 microVM 的 guest DNS 不经 VPC Resolver，因此 DNS Firewall 定位为带外/VPC 层的 C2 与数据外泄域名黑名单，与上述 tap 级出网白名单正交，不互相替代。收 microVM 出网以出网白名单为准。
 
@@ -102,7 +123,7 @@ Firecracker microVM 挂载四块盘，按 Firecracker PUT 顺序分配 `/dev/vd<
 
 ### L5 凭据·只读·监控层
 
-本层覆盖凭据最小化、镜像不可变与运行时监控。guest 内不放任何长期 AWS 凭据（zero-credential 黄金镜像）；媒体/图片的 Amazon S3 访问不在当前样本 chat demo 范围;per-tenant 计费 vkey 的 master key 只放 AWS Secrets Manager，Lambda 冷启动按需读一次缓存，从不进 env 明文、从不下到 host 或 guest，且 Lambda 角色的 `secretsmanager:GetSecretValue` 权限 scoped 到单一 secret 前缀。host 侧强制 IMDSv2（`HttpTokens=required` + `HttpPutResponseHopLimit=1`）。镜像不可变由四块盘的只读语义保证（详见本节「租户 microVM」）。host 启动时显式关闭三个跨租户侧信道与数据残留面：KSM（内核同页合并）、SMT（超线程）、swap，加固随重建继承、可审计、幂等。运行时监控含 in-guest 的 auditd（开销约 11.7MB，实测）与 Wazuh 文件完整性监控（FIM，约 42MB，实测）——guest 内运行时威胁监控由 Wazuh/auditd 承载，不依赖 Amazon GuardDuty Runtime agent（后者未在本栈启用）。AWS 平台侧另叠加 Amazon GuardDuty 账号级威胁检测（VPC/DNS/EC2/S3 等云层 findings，config-gated，`RUNTIME_MONITORING` 默认关闭）、Amazon S3 全桶级公网封锁 + 强制 HTTPS、VPC Flow Logs（config-gated，默认 true，投递到 Amazon CloudWatch 供网络取证）等基线控制。
+本层覆盖凭据最小化、镜像不可变与运行时监控。guest 内不放任何长期 AWS 凭据（zero-credential 黄金镜像），需要读写 Amazon S3 时由 claw-hub 代签 presigned URL；per-tenant 计费 vkey 的 master key 只放 AWS Secrets Manager，Lambda 冷启动按需读一次缓存，从不进 env 明文、从不下到 host 或 guest，且 Lambda 角色的 `secretsmanager:GetSecretValue` 权限 scoped 到单一 secret 前缀。host 侧强制 IMDSv2（`HttpTokens=required` + `HttpPutResponseHopLimit=1`）。镜像不可变由四块盘的只读语义保证（详见本节「租户 microVM」）。host 启动时显式关闭三个跨租户侧信道与数据残留面：KSM（内核同页合并）、SMT（超线程）、swap，加固随重建继承、可审计、幂等。运行时监控含 in-guest 的 auditd（开销约 11.7MB，实测）与 Wazuh 文件完整性监控（FIM，约 42MB，实测）——guest 内运行时威胁监控由 Wazuh/auditd 承载，不依赖 Amazon GuardDuty Runtime agent（后者未在本栈启用）。AWS 平台侧另叠加 Amazon GuardDuty 账号级威胁检测（VPC/DNS/EC2/S3 等云层 findings，config-gated，`RUNTIME_MONITORING` 默认关闭）、Amazon S3 全桶级公网封锁 + 强制 HTTPS、VPC Flow Logs（config-gated，默认 true，投递到 Amazon CloudWatch 供网络取证）等基线控制。
 
 审计层按「谁记录、可不可篡改、保多久」分开落地。租户业务数据的备份桶启用 Amazon S3 Object Lock（COMPLIANCE 模式）实现 WORM，保留期内 root 账户也不能覆盖/删除对象版本、不能缩短保留期，此项已随本栈交付（`deploy/stack.py:301-360`）。控制面的 API 变更审计写入 Amazon DynamoDB 审计表（`GET /audit-log`），best-effort 追加、TTL 90 天到期即失，属可变审计流水而非 WORM，不适合作为不可篡改的合规证据。真正对齐 SEC 17a-4 / CFTC / FINRA 的不可篡改审计 trail（含 Object Lock 化的 AWS CloudTrail + 跨多区完整性校验）目前属于规划（未实现，见 issue #32）；当前 AWS CloudTrail 复用账号级 trail，仅启用日志文件完整性校验（log-file validation），不带 Object Lock，不应作为已交付能力对外表达。
 
@@ -116,9 +137,9 @@ Firecracker microVM 挂载四块盘，按 Firecracker PUT 顺序分配 `/dev/vd<
 | AWS Lambda                                     | 核心。承载控制面的租户注册、生命周期、备份、host/skill/group 管理与审计端点，以及异步备份函数。                                                          |
 | Amazon DynamoDB                                | 核心。以 tenants、hosts、groups 三张主表加 audit 表持久化租户元数据、节点状态、调度记录与授权字段，四张 `RETAIN` 表开启时间点恢复。                      |
 | Amazon Simple Storage Service (Amazon S3)      | 核心。存放租户数据盘、skill、备份与镜像分片；备份桶启用对象锁定（COMPLIANCE）实现 WORM，全桶级公网封锁 + 强制 HTTPS。                                    |
-| Amazon CloudFront                              | 核心。作为公网唯一入口（CloudFront → ALB → OpenResty 边缘 ASG），反代聊天 UI 并把请求转发到边缘路由层。                                                  |
-| Application Load Balancer                      | 核心。位于 CloudFront 之后，以最少未完成请求把聊天流量分发到 OpenResty 边缘 ASG。                                                                        |
-| Amazon Cognito                                 | 核心。**控制面/控制台**身份验证的信任根，提供用户目录、OAuth 2.0 授权与 id_token 签发，供 JWKS 公钥验签；支持外部 OIDC 联合进同一 User Pool。数据面不再使用 Cognito——改用每租户 `gateway_token` 鉴权。 |
+| Amazon CloudFront                              | 核心。作为公网唯一入口（CloudFront → ALB），反代聊天 UI 与 claw-hub，`/hub/*` 行为转发 WebSocket 升级头并禁用缓存。                                      |
+| Application Load Balancer                      | 核心。位于 CloudFront 之后，将聊天与控制面流量分发到 claw-hub 与后端。                                                                                   |
+| Amazon Cognito                                 | 核心。整套平台身份验证的唯一信任根，提供用户目录、OAuth 2.0 授权与 id_token 签发，供控制面与数据面用 JWKS 公钥验签；支持外部 OIDC 联合进同一 User Pool。 |
 | Amazon Elastic Compute Cloud (Amazon EC2)      | 核心。以 metal 系列实例运行 Firecracker microVM host，由 Auto Scaling Group 管理弹性伸缩；强制 IMDSv2 + hop-limit=1。                                    |
 | Amazon Bedrock                                 | 核心。通过 Amazon Bedrock Guardrails 在内容层（L1）对进出大语言模型的内容做越狱拦截、有害内容过滤与敏感信息脱敏。                                        |
 | Amazon CloudWatch                              | 支持。接收 VPC Flow Logs 与日志组，供网络取证与隔离 DROP 规则的生效验证。                                                                                |
@@ -130,7 +151,7 @@ Firecracker microVM 挂载四块盘，按 Firecracker PUT 顺序分配 `/dev/vd<
 | Amazon EventBridge                             | 支持。驱动后台 `process_pending` 等异步处理，触发待处理租户的容量调度。                                                                                  |
 | Amazon Simple Queue Service (Amazon SQS)       | 支持。config-gated，为生命周期动作削峰，启用时 start/stop/restart 等操作入队返回 202 queued。                                                            |
 | Amazon GuardDuty                               | 支持。在 AWS 平台侧提供威胁检测，纳入 L5 监控层基线（config-gated）。                                                                                    |
-| Amazon Elastic Kubernetes Service (Amazon EKS) | 支持。当前架构不使用 EKS；边缘路由由 OpenResty 边缘 ASG 承载。                                                                                           |
+| Amazon Elastic Kubernetes Service (Amazon EKS) | 支持。claw-hub 多副本部署形态（目标态），跨 Pod 路由代码完整、灰度尚未切换到生产。                                                                       |
 
 > **Note**
 >

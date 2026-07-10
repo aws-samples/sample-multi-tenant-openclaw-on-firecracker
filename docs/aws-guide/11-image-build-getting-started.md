@@ -52,7 +52,7 @@ aws s3 mb s3://my-openclaw-images --region us-east-1
 2. 在这个根文件系统里（chroot 进去）装 Node.js 22。
 3. **`npm install -g openclaw@<版本>`** —— 这就是把 OpenClaw 本体装进镜像的那一步（脚本里版本钉在 `2026.5.6`，见 `build-rootfs.sh` 的 `OPENCLAW_PIN` 变量，在 `[7/8]` 那步附近，要换版本改这里）。
 4. `openclaw onboard` 生成初始配置。
-5. **把样本的身份和技能烤进去**：`samples/<name>/persona/*` 复制进 `/home/agent/.openclaw/workspace/`，`samples/<name>/skills/*` 复制进 `/home/agent/.openclaw/skills/`，安全护栏插件（`sentinel-guard`/`acl-guard`）一并启用。
+5. **把样本的身份和技能烤进去**：`samples/<name>/persona/*` 复制进 `/home/agent/.openclaw/workspace/`，`samples/<name>/skills/*` 复制进 `/home/agent/.openclaw/skills/`，安全护栏插件（`sentinel-guard`/`acl-guard`/`claw-channel`）一并启用。
 6. 做安全加固：根盘和身份盘设为只读、关掉 guest 串口、装审计与文件完整性基线、烤进默认 seccomp 过滤器。
 7. 把做好的根文件系统封成磁盘镜像、压缩、传到 S3，并写一份 `manifest.json` 版本指针。
 

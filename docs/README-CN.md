@@ -21,6 +21,7 @@
   <a href="https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues">
     <img src="https://img.shields.io/github/issues/aws-samples/sample-multi-tenant-openclaw-on-firecracker?color=brightgreen" alt="Open issues"/>
   </a>
+  <img src="https://img.shields.io/badge/tests-660%2B%20passing-brightgreen" alt="Tests passing"/>
 </p>
 
 <p align="center">
@@ -106,7 +107,7 @@ L1 Prompt（LiteLLM pre/post + Bedrock Guardrail 双向）、L2 工具（`before
 
 ### 交付级架构总览
 
-下图给出交付级架构总览：左侧数据面（终端用户经 CloudFront → ALB → OpenResty 边缘查 Redis 路由表 → host iptables DNAT → microVM 原生 gateway，唯一凭据是每租户 KMS 信封加密的 `gateway_token`），中部控制面（全托管无服务器，编排租户全生命周期），右侧 L1–L5 纵深防御边界。
+下图给出交付级架构总览：左侧数据面（终端用户经 CloudFront → ALB → WebSocket 中枢 → VM 内 channel 出站连接），中部控制面（全托管无服务器，编排租户全生命周期），右侧 L1–L5 纵深防御边界。
 
 <p align="center">
   <img src="arch-overview-cn.png" alt="ClawPool 交付级架构总览 — 数据面、控制面、L1–L5 纵深防御" width="96%"/>
@@ -117,19 +118,16 @@ L1 Prompt（LiteLLM pre/post + Bedrock Guardrail 双向）、L2 工具（`before
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│  数据面（C 端聊天，两级路由 + 原生 gateway）                          │
+│  数据面（C 端聊天，hub-WS）                                            │
 │                                                                       │
-│  浏览器 ──wss──► 平台后端 ──HTTP+SSE, Bearer gateway_token──┐         │
-│                                                             ▼         │
-│    CloudFront ──► ALB (最少未完成请求) ──► OpenResty 边缘 ASG (3 AZ)  │
-│                                            │                          │
-│                    Redis GET route:{tenant_id}                        │
-│                    (L1 lrucache 5s / L2 shared_dict 60s / L3 ElastiCache)│
-│                                            ▼                          │
-│                    host iptables PREROUTING DNAT (端口 10000–10400)   │
-│                                            ▼                          │
-│                    microVM :18789  OpenClaw 原生 gateway              │
-│                    （仅 token 鉴权，controlUi 关闭）                  │
+│  浏览器  ──POST /hub/token (Bearer Cognito id_token)──┐               │
+│    │                                                  ▼               │
+│    └── wss  CloudFront /hub/* ──► ALB ──► nginx ──► claw-hub :8790    │
+│                                                        │  (WS 中枢)   │
+│                                       VM 内 claw-channel ◄┘            │
+│                                       （主动出站 dial-out，           │
+│                                        不在 VM 开任何入站端口）        │
+│                                            └─► 进程内调 agent          │
 └─────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -153,7 +151,7 @@ ASG:         自动扩缩 host
 EventBridge: 健康检查 + 闲置回收 + 错峰备份
 ```
 
-> **说明**：C 端聊天直连 microVM 的 OpenClaw 原生 gateway（`:18789`，仅接受 `Authorization: Bearer <gateway_token>`，`controlUi.enabled=false`）。`gateway_token` 用 KMS `GenerateRandom` 铸造、以 `EncryptionContext={tenant_id}` 信封加密、只以密文存进带 15 分钟 TTL 的 DDB 表，并在 `launch-vm.sh` 冷注入，明文不经 SSM/CloudTrail/Lambda 日志。API Lambda **无 `kms:Decrypt` 权限**，只有调用方（平台后端）在自己进程内解密。
+> **说明**：OpenClaw gateway 的 `chatCompletions` 端点已被 `launch-vm.sh` 显式删除（`del(.gateway.http.endpoints.chatCompletions)`），**不参与 C 端聊天**。gateway control UI（`/vm/{tenant}/`:18789）是与聊天正交的管理员旁路，不在主数据路径上。C 端真实聊天链路只走上面的 hub-WS。
 
 </details>
 
@@ -169,7 +167,7 @@ VMn: tap-vmN   ...                                            (/30)
 ```
 
 - **出网**：iptables MASQUERADE + NAT 白名单 → 互联网
-- **数据面入站**：浏览器 → 平台后端 → CloudFront → ALB → OpenResty 边缘（查 Redis 路由表）→ host iptables DNAT（端口 10000–10400）→ microVM `:18789` 原生 gateway
+- **数据面入站**：浏览器 → CloudFront `/hub/*` → ALB → claw-hub:8790 → VM 出站 channel（VM 不开入站口）
 - **跨 VM**：整个 /16 超网 `FORWARD DROP`，子网间无路由
 
 ### 项目结构
@@ -178,7 +176,7 @@ VMn: tap-vmN   ...                                            (/30)
 sample-multi-tenant-openclaw-on-firecracker/
 ├── deploy/                    # CDK 项目（池子核心，agent 无关）
 │   ├── stack.py               # 基础设施定义
-│   ├── edge/                  # OpenResty 边缘（route.lua 查 Redis 路由表 + nginx.conf）
+│   ├── hub/                   # claw-hub WS 中枢源码（部署到 host，不烤进 microVM）
 │   ├── lambda/
 │   │   ├── api/handler.py             # 租户 CRUD + host 管理
 │   │   ├── templates/handler.py       # 配置模板 CRUD
@@ -188,12 +186,13 @@ sample-multi-tenant-openclaw-on-firecracker/
 │   │   └── scaler/handler.py          # 闲置 host 回收
 │   └── userdata/
 │       ├── init-host.sh       # host 初始化
-│       ├── route_ops.py       # host 侧路由：iptables DNAT + Redis 双写
+│       ├── install-hub.sh     # 装 claw-hub + nginx /hub 反代
 │       ├── host-agent.py      # VM 健康轮询 + DDB 写入 + balloon
 │       ├── launch-vm.sh       # microVM 启动（身份/skill 冷注入）
 │       └── stop-vm.sh         # microVM 停止
 ├── console/                   # Web 管理控制台（含 chat/index.html C 端聊天页）
 ├── samples/                   # 可替换样本镜像（用户品牌）
+├── tests/                     # 660+ 测试（unit / integration / e2e）
 ├── scripts/
 │   ├── build-rootfs-on-ec2.sh # 云端构建（无需本地 Linux）
 │   └── destroy.sh             # 销毁栈
@@ -324,7 +323,7 @@ sample-multi-tenant-openclaw-on-firecracker/
 | 层                 | 实现                                                                                                                                                                                                                                 |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | **静态加密**       | EBS 卷（rootfs + data）默认 KMS 加密。                                                                                                                                                                                               |
-| **传输加密**       | C 端聊天链路 CloudFront → ALB → OpenResty 边缘 → microVM gateway 全程 TLS；控制面 API Gateway HTTPS。                                                                                                                                                        |
+| **传输加密**       | C 端聊天链路 CloudFront → ALB → claw-hub 全程 TLS；控制面 API Gateway HTTPS。                                                                                                                                                        |
 | **API 鉴权**       | API Gateway 带 `x-api-key` + 可选 AWS WAF（rate limit / geo block / OWASP）。                                                                                                                                                        |
 | **Console 鉴权**   | Cognito **authorization-code + PKCE** flow + 可选 MFA。                                                                                                                                                                              |
 | **RBAC**           | Cognito Groups `admin` / `operator` / `viewer`，由 `console_auth.rbac_enabled` 控制（默认 `true`，安全默认）。id_token 经 JWKS 校验 RS256 签名，伪造 / `alg:none` / 过期 token 降级为 `viewer`，无 token 兜底 `viewer`、写操作 403。 |

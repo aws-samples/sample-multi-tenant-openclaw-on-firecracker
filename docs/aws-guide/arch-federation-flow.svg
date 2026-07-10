@@ -5,9 +5,8 @@
     <marker id="arrData" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L7,3 L0,6 Z" fill="#ec7211"/></marker>
   </defs>
 
-  <text x="40" y="42" font-size="27" font-weight="700" fill="#16233a">外部 SaaS 平台对接 · 端到端认证授权与数据面对话时序(旧模型)</text>
+  <text x="40" y="42" font-size="27" font-weight="700" fill="#16233a">外部 SaaS 平台对接 · 端到端认证授权与数据面对话时序</text>
   <text x="40" y="70" font-size="15" fill="#5a6b85">档 A 联邦方案 · 二手电商平台(客户自有 IdP)代开租户 · 自由用户各自独立 openclaw · 全程 Cognito 信任根 · 禁自助注册</text>
-  <text x="40" y="94" font-size="13" font-weight="700" fill="#b3261e">⚠ 已被代替:图中 Cognito 联邦 + hub token + channel 数据面为旧模型,当前数据面走 gateway 两级路由,见 13-data-plane-redesign.md</text>
 
   <rect x="30" y="120" width="1700" height="300" fill="#ece1fb" opacity="0.30"/>
   <rect x="30" y="420" width="1700" height="336" fill="#fde9d6" opacity="0.30"/>
@@ -124,7 +123,7 @@
   </g>
 
   <g font-size="11" fill="#6b7a92">
-    <text x="44" y="1502">链路:hub 端点 / token 签发 / wss 帧,含 JWKS 验签、token 铸造与消息撮合;控制面 POST /tenants(代开路径)</text>
+    <text x="44" y="1502">来源(一手 file:line):hub 端点/token/wss 帧 SPEC/03-HUB-SPEC.md §1-5 + server.mjs:249-267(JWKS 验签)/402-472(token)/623-772(撮合);控制面 POST /tenants(代开路径)</text>
     <text x="44" y="1520">+ owner 门控 handler.py + Pre-Token-Gen/TenantTable/多 IdP 联邦照抄 aws-samples/amazon-cognito-example-for-multi-tenant(已 clone opensource/);AI pro 前端复用现有 console/chat(Hosted UI+PKCE 联邦就绪)。</text>
     <text x="44" y="1538" fill="#c15c14">关键:禁用户自助注册(/tenants/self 存在但本流程不用),租户由交易平台后端代开;AI pro chat UI 生产中嵌客户电商域、非独立域名。custom claim/联邦/Pre-Token-Gen 属档 A 待实现,当前单 Cognito Pool 直连未接外部 IdP。</text>
   </g>

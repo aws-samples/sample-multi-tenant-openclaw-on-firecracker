@@ -1,7 +1,5 @@
 # External Platform Integration Guide (from the customer's perspective)
 
-> **2026-07-08 data-plane redesign notice**: the real-time chat integration flow in this chapter — the federated-token exchange to `{HUB}/hub/token` and the `wss {HUB}/hub/ws` connection — has been **fully superseded** by [Chapter 13 · Data-plane two-tier routing](13-data-plane-redesign.md) (customer OIDC does not support headless/browserless login, so Cognito and the outbound-dial hub were dropped in favor of OpenClaw-native gateway auth). The tenant creation / management (control plane REST API) parts of this chapter remain valid. For the current real-time chat integration, Chapter 13 is authoritative.
-
 This section is for **customers who want to integrate ClawPool into their own platform** (a trading platform, a secondhand marketplace, any SaaS). By the end you will be able to give every one of your platform's free users a dedicated AI assistant (an independent openclaw), entirely through your own account system, with the user never touching any underlying console.
 
 > Positioning distinction: the previous section, the _Control Plane API Integration_, is a **per-endpoint reference**; this section is an **integration approach and steps** — how your platform should connect, how to thread authentication, and how users use it. The term "the platform / ClawPool" refers to the integratee (which provides the openclaw pool), and "your platform" refers to the integrator (the customer's own platform).
@@ -54,7 +52,7 @@ Use `<platform_id>:<user id>` for `client_token` to guarantee idempotent repeat 
 > **Important** For "manage a fleet by user" (Step 5) and "the user sees their own nodes in the chat UI" to work, the attribution fields must land at create time: on the api-key-only path **pass `owner_id` + `tenant_user_id` explicitly in the body** (as above); on the forward-the-id_token path ownership is derived automatically from the token. Give neither and the tenant lands under the system sentinel — the user's `GET /tenants` will not list it and `GET /users/{tenant_user_id}/tenants` will not find it. The reference implementation `console/marketplace-demo/broker/handler.py` shows the overall flow skeleton; treat this section's convention as authoritative.
 
 **Step 4 · Enter the AI assistant**
-The user clicks "enter the AI assistant" → jumps to the chat UI under your domain → the chat UI, via your platform back end, obtains the tenant's `gateway_token` (your back end decrypts the KMS ciphertext returned by `revealToken`) → chats over the two-tier edge route to the microVM-native gateway. The current integration is detailed in [Chapter 13 · Data-plane two-tier routing](13-data-plane-redesign.md).
+The user clicks "enter the AI assistant" → jumps to the chat UI under your domain → the chat UI uses the federated `id_token` to call `POST {HUB}/hub/token` (with `tenant_id`) to exchange for a real-time token → opens `wss {HUB}/hub/ws?token=` → chats. See the _Control Plane API Integration_ §4-5 for details.
 
 **Step 5 · Manage by user**
 

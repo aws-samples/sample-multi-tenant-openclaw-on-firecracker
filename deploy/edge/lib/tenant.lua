@@ -5,7 +5,7 @@
 --   1. Path: /ws/{tenant_id}/... (production entry, ALB forwards raw URI).
 --   2. Header: X-Tenant-Id (fallback for /v1/* alt entry, less common).
 --
--- Adversarial inputs we defend against:
+-- Adversarial inputs we defend against (matches 03-TEST-PLAN):
 --   - URL-encoded bytes (%2F etc) — we DO NOT decode; ids are opaque tokens
 --     and any decode-then-match would open up path-traversal ambiguity.
 --   - Overlong ids (DoS / memory) — cap at MAX_LEN.

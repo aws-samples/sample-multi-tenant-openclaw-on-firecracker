@@ -14,8 +14,8 @@
 #   - IMDS reachable so we can read the host's own local-ipv4 for
 #     $edge_self_ip (drives local vs remote branch in balancer_pick).
 #
-# Everything below the "install" section is kernel/network tuning for the
-# "压测前环境核对" (pre-load-test environment check). If any check fails we exit
+# Everything below the "install" section is kernel/network tuning called
+# out in 03-TEST-PLAN §8 "压测前环境核对". If any check fails we exit
 # non-zero so ASG lifecycle hooks catch it — no silent success.
 
 set -euo pipefail
@@ -113,7 +113,7 @@ export EDGE_SELF_IP="$SELF_IP"
 envsubst '$ENGINE_REDIS_HOST $ENGINE_REDIS_PORT $EDGE_SELF_IP' \
     < "$SRC_DIR/nginx.conf" > "$CONF_DIR/nginx.conf"
 
-# ── 5. Kernel / socket tuning ────────────────────────────────────────────
+# ── 5. Kernel / socket tuning (03-TEST-PLAN §8) ──────────────────────────
 cat > /etc/sysctl.d/99-openclaw-edge.conf <<'SYSCTL'
 # --- OpenClaw Pool edge tuning ---------------------------------
 # Ephemeral port pool: needs to be wide open for upstream fan-out
@@ -170,7 +170,7 @@ systemctl daemon-reload
 systemctl enable claw-edge.service
 systemctl restart claw-edge.service
 
-# ── 7. Warmup wait on /healthz ───────────────────
+# ── 7. Warmup wait on /healthz (INTERFACE-CONTRACT §6) ───────────────────
 # nginx accepts on :8080 in ~200ms but route.lua's warmup gate returns 503
 # until the async Redis PING succeeds (up to 30s + a bit of slack). We
 # poll /healthz here so the userdata script only returns success once the

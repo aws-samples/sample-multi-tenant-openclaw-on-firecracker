@@ -1,21 +1,19 @@
 # 部署解决方案
 
-> **2026-07-08 数据面转型说明**:本章涉及实时聊天的验证与排查步骤中引用的 `claw-hub` / `claw-channel` 出站拨号中枢、`/hub/token` `/hub/ws`、HMAC channel_secret 等旧运行态已被 [第 13 章 · 数据面两级路由](13-data-plane-redesign.md) 代替。当前实时聊天走 gateway 两级路由,验证与排查步骤以第 13 章及第 11 章运维手册为准;本章保留的 hub 步骤仅作历史参考。控制面部署与租户生命周期部分仍然有效。
-
 在部署此解决方案之前，请查看本指南中的架构和规划部署注意事项。该解决方案在 AWS 上为每个租户提供一台独立内核的 Firecracker microVM，运行带身份、技能与护栏的 OpenClaw AI agent；控制面（AWS Lambda、Amazon DynamoDB 与 Amazon API Gateway）负责注册、生命周期、备份与注销，运行后不向租户 microVM 注入业务数据。本节介绍该解决方案的部署流程与所需步骤。
 
 ## 部署流程概述
 
 本节介绍该解决方案的部署入口、配置文件与推荐执行顺序。
 
-该解决方案的部署代码由四部分组成：基于 AWS Cloud Development Kit (AWS CDK) 的基础设施定义（`deploy/app.py` 与 `deploy/stack.py`）、host 与 microVM 生命周期脚本（`deploy/userdata/*.sh`）、黄金镜像构建脚本（`build-rootfs.sh`），以及数据面 OpenResty 边缘路由（`deploy/edge/`）加宿主路由脚本（`deploy/userdata/route_ops.py`：iptables DNAT 加 Redis 路由表双写）。
+该解决方案的部署代码由四部分组成：基于 AWS Cloud Development Kit (AWS CDK) 的基础设施定义（`deploy/app.py` 与 `deploy/stack.py`）、host 与 microVM 生命周期脚本（`deploy/userdata/*.sh`）、黄金镜像构建脚本（`build-rootfs.sh`），以及数据面 WebSocket 中枢 claw-hub（`deploy/hub/`）。
 
 AWS CDK 入口 `deploy/app.py` 读取 context 中的 `region`（默认 `us-east-1`），实例化 `OpenClawOrchestratorStack`，账号取自环境变量 `CDK_DEFAULT_ACCOUNT`。中心配置文件 `config.yml` 集中定义 host 规格、microVM 默认值、Auto Scaling Group (ASG)、Balloon 内存回收、健康检查、Multi-AZ 与 Amazon Cognito 认证。部署命令封装在 `setup.sh` 中。
 
 推荐的部署顺序为：
 
 1. 核对 `config.yml`，重点确认区域（`region`）、实例类型（`instance_type`）与 ASG 容量。
-2. 运行 `setup.sh`，完成 AWS CDK 部署并将 host 脚本与 `deploy/edge/` 资产上传到 Amazon Simple Storage Service (Amazon S3) assets 桶。
+2. 运行 `setup.sh`，完成 AWS CDK 部署并将 host 脚本与 `deploy/hub/` 资产上传到 Amazon Simple Storage Service (Amazon S3) assets 桶。
 3. ASG 拉起第一台 host，host 执行 `init-host.sh` 完成自举并向宿主表注册。
 4. 通过控制面 API 注册第一个租户，验证端到端链路连通。
 
@@ -269,7 +267,7 @@ cdk deploy -c region="<region>" --profile "<profile>" --require-approval never
 
 向控制面 API 发送 `POST /tenants` 请求注册一个租户。控制面 API 由 Amazon API Gateway（名为 `openclaw-orchestrator`，stage `v1`）承载，转发到运行在 ARM_64、256 MB、120 秒超时的 AWS Lambda 函数。注册成功后，控制面在 DynamoDB 写入租户记录，调度到某台 host，由该 host 的 `launch-vm.sh` 在 Firecracker `InstanceStart` 之前完成全部冷注入并启动 microVM。
 
-> **验证**：确认 `POST /tenants` 返回（实测约 1.7 秒），租户状态在约 4.0 秒内由 `creating` 经 `running` 变为 `vm_health` up（实测）。随后走实时聊天链路发一条消息确认 agent 回复（端到端首回复实测约 27 秒）：以 Amazon Cognito 登录取 id_token →`POST {CloudFront}/hub/token` 带 `Authorization: Bearer {id_token}` 与 `{"tenant_id":"<id>"}` 换前端 token →`wss {CloudFront}/hub/ws?token=<前端token>` 上发 `{"text":"..."}` →收 `{"type":"reply"}`。聊天消息走 claw-hub WebSocket 中枢与虚拟机内 claw-channel 出站连接，不经任何 gateway HTTP 端点，详见『开发人员指南 — 实时聊天接入』。（旧 hub 验证步骤,仅作历史参考。实时聊天当前走 gateway 两级路由,端到端验证步骤以 [第 13 章 · 数据面两级路由](13-data-plane-redesign.md) 与第 11 章运维手册为准。）
+> **验证**：确认 `POST /tenants` 返回（实测约 1.7 秒），租户状态在约 4.0 秒内由 `creating` 经 `running` 变为 `vm_health` up（实测）。随后走实时聊天链路发一条消息确认 agent 回复（端到端首回复实测约 27 秒）：以 Amazon Cognito 登录取 id_token →`POST {CloudFront}/hub/token` 带 `Authorization: Bearer {id_token}` 与 `{"tenant_id":"<id>"}` 换前端 token →`wss {CloudFront}/hub/ws?token=<前端token>` 上发 `{"text":"..."}` →收 `{"type":"reply"}`。聊天消息走 claw-hub WebSocket 中枢与虚拟机内 claw-channel 出站连接，不经任何 gateway HTTP 端点，详见『开发人员指南 — 实时聊天接入』。
 
 ## CDK 部署的核心资源
 
@@ -344,7 +342,7 @@ host 自举的几个要点：
 该解决方案的所有注入都在 Firecracker `InstanceStart` 之前完成，这是「零运行时操作」的实现位置。启动流程为：
 
 1. 挂载 data.ext4，注入 shared skills，生成 gateway token，注入 SSH 公钥。
-2. 通过 jq 修改 `openclaw.json`：写入随机 `NEW_TOKEN` 作为 `gateway.auth.token`、写入 claw-channel HMAC secret、设 `claw-channel.enabled=true` 并将 hubUrl/wsUrl 指向宿主 IP 的 8790 端口；同一 jq 块删除 chatCompletions 与 dangerouslyDisableDeviceAuth、将 allowedOrigins 收窄到单个 CloudFront origin；若 API 铸出了 per-tenant vkey，再写入 `.models.providers.litellm.apiKey`。（本示例中 claw-channel HMAC secret / `claw-channel.enabled=true` / hubUrl 属旧 channel 出站拨号模型,已被代替;当前 gateway 两级路由模型见 [第 13 章 · 数据面两级路由](13-data-plane-redesign.md)。）
+2. 通过 jq 修改 `openclaw.json`：写入随机 `NEW_TOKEN` 作为 `gateway.auth.token`、写入 claw-channel HMAC secret、设 `claw-channel.enabled=true` 并将 hubUrl/wsUrl 指向宿主 IP 的 8790 端口；同一 jq 块删除 chatCompletions 与 dangerouslyDisableDeviceAuth、将 allowedOrigins 收窄到单个 CloudFront origin；若 API 铸出了 per-tenant vkey，再写入 `.models.providers.litellm.apiKey`。
 3. 挂载 `/dev/vdd` immutable 只读盘，启动 Firecracker。
 
 `InstanceStart` 之后，脚本关闭严格模式，仅执行 nginx reload 与 ssh-keygen 清理，不再向运行中的 microVM 推送数据。
@@ -490,7 +488,7 @@ backup 的 `backup_cron` 是扫描节拍而非统一备份时间：每次触发�
 
 处置：host-agent 提供两级自恢复，多数情况无需人工介入。`vm.json` 存在但进程消失时，`_recover_vm` 重新启动；Firecracker 存活但 guest 网络连续不可达到阈值时，`_force_relaunch_vm` 走 stop 加 launch 重建。若整台 host 上所有租户同时 stale，多半是 host-agent 本身宕机，health_check Lambda 经 Systems Manager 下发 `systemctl restart host-agent` 拉起，设有 600 秒冷却（`RESTART_COOLDOWN_SECONDS=600`）。冷却期内不要手动反复重启，按 `agent_restart_at` 等待过冷却。
 
-聊天专项排查（健康正常但用户聊天连不上）：实时聊天当前走 gateway 两级路由,排查步骤以 [第 13 章 · 数据面两级路由](13-data-plane-redesign.md) 与第 11 章运维手册为准。以下 claw-hub / claw-channel 出站拨号中枢排查步骤属旧模型,仅作历史参考。聊天链路与虚拟机内的 gateway control UI 是两条正交路径，聊天走 claw-hub WebSocket 中枢加虚拟机内 claw-channel 出站连接，与 control UI 无关。按此顺序排查——① claw-hub 服务（`claw-hub.service`）是否健康、`/hub/healthz` 是否返回正常、宿主 nginx `/hub/` 反向代理是否生效；② 虚拟机内 claw-channel 的出站连接日志（`claw-channel.log`），看是否出现 `token-fail`、`ws-unexpected-response`、`ws-close` 等决策；③ Amazon DynamoDB 租户记录中 `channel_secret` 是否已镜像就绪（hub 据此验签虚拟机的通道注册）。
+聊天专项排查（健康正常但用户聊天连不上）：聊天链路与虚拟机内的 gateway control UI 是两条正交路径，聊天走 claw-hub WebSocket 中枢加虚拟机内 claw-channel 出站连接，与 control UI 无关。按此顺序排查——① claw-hub 服务（`claw-hub.service`）是否健康、`/hub/healthz` 是否返回正常、宿主 nginx `/hub/` 反向代理是否生效；② 虚拟机内 claw-channel 的出站连接日志（`claw-channel.log`），看是否出现 `token-fail`、`ws-unexpected-response`、`ws-close` 等决策；③ Amazon DynamoDB 租户记录中 `channel_secret` 是否已镜像就绪（hub 据此验签虚拟机的通道注册）。
 
 ### 症状 B：启动 microVM 报错、microVM 起不来
 

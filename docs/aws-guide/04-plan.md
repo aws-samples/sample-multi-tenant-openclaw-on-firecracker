@@ -8,7 +8,7 @@
 
 > **Important**
 >
-> 此估算为成本推算，未包含大模型推理、第三方外部平台 API、数据传输等费用，也未包含可选监控平台（自建 Amazon EC2 上的 Prometheus、Grafana、Wazuh）与可选托管安全服务（Amazon GuardDuty、Amazon OpenSearch Service）的费用。请以 AWS Pricing Calculator 结合目标区域与实际用量为准。建议为该解决方案创建预算，并通过 AWS Cost Explorer 跟踪实际支出。
+> 此估算为成本推算，未包含大模型推理、第三方交易所 API、数据传输等费用，也未包含可选监控平台（自建 Amazon EC2 上的 Prometheus、Grafana、Wazuh）与可选托管安全服务（Amazon GuardDuty、Amazon OpenSearch Service）的费用。请以 AWS Pricing Calculator 结合目标区域与实际用量为准。建议为该解决方案创建预算，并通过 AWS Cost Explorer 跟踪实际支出。
 
 该解决方案的主要成本构成如下。
 

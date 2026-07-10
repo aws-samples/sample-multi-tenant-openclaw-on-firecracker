@@ -54,7 +54,8 @@ from botocore.exceptions import ClientError  # process_pending CAS 认领(#9 跨
 # #187 转型:C 端聊天不再走 claw-channel + hub 中枢签名路径。
 # 前端直接 POST /ws/{tenant_id}/v1/chat/completions,SSE 流式,鉴权用租户 gateway
 # token(GET /tenants/{id}/token 拿密文,调用方自解)。旧 chat_sign 路由 + claw-
-# channel HMAC + hub relay 全部下线。
+# channel HMAC + hub relay 全部下线。参见 SPEC/11-ENGINE-TRANSFORM/02-DEV-PLAN.md G/D
+# 与 04-API-SPEC.md 一、二节。
 
 
 def lambda_handler(event, context):
@@ -191,6 +192,23 @@ def lambda_handler(event, context):
             path_params["name"], event.get("body")
         ),
         ("DELETE", "/skills/{name}"): lambda: delete_skill(path_params["name"]),
+        # Task 7.3 — tenant-credential-contract 新路由
+        ("GET", "/tenants/{id}/credentials"): lambda: _get_tenant_credentials(
+            path_params["id"], event
+        ),
+        ("GET", "/registry/{config_template}"): lambda: _get_registry(
+            path_params["config_template"], event
+        ),
+        ("POST", "/registry/{config_template}"): lambda: _publish_registry(
+            path_params["config_template"], event
+        ),
+        ("POST", "/registry/{config_template}/rollback"): lambda: _rollback_registry(
+            path_params["config_template"], event
+        ),
+        ("GET", "/recipient-key"): lambda: _get_recipient_key(event),
+        ("POST", "/recipient-key"): lambda: _register_recipient_key(event),
+        ("POST", "/recipient-key/disable"): lambda: _disable_recipient_key(event),
+        ("GET", "/clawpool-rsa-public-key"): lambda: _get_clawpool_rsa_public_key(),
     }
 
     handler = routes.get((method, resource))
@@ -346,8 +364,8 @@ def get_tenant(tenant_id, event=None):
     # Strip server-side secrets before returning (see _redact_tenant).
     body = _redact_tenant(item)
     # #187 P1 — fold the KMS **ciphertext** of the pre-minted gateway token into
-    # the status-poll response once the tenant is `running`
-    # (2026-07-08 二次纠正). Poll semantics: control-plane callers loop
+    # the status-poll response once the tenant is `running` (INTERFACE-CONTRACT
+    # §5, Abel 2026-07-08 二次纠正). Poll semantics: control-plane callers loop
     # GET /tenants/{id}; on `creating` they keep polling; on `running` they read
     # `gateway_token` (base64 ciphertext) out of this same response and decrypt
     # it locally with EncryptionContext={"tenant_id":<id>}. API Lambda does NOT
@@ -595,7 +613,7 @@ def tenant_match(query_params=None):
     Pre-login lookup: the browser calls this BEFORE any Cognito login to learn which
     upstream IdP (Cognito provider name) to federate to for a given external platform,
     then does federatedSignIn(customProvider=<idp_provider_name>). Read-only, leaks no
-    tenant data — only the platform→IdP routing. Mirrors aws-samples/
+    tenant data — only the platform→IdP routing (SPEC/02 §2.7). Mirrors aws-samples/
     amazon-cognito-example-for-multi-tenant TenantAPI.ts:13-22 (there keyed by email
     domain; here by explicit platform_id).
 
@@ -1710,3 +1728,153 @@ remove_skill_from_group = _skills_groups.remove_skill_from_group
 read_skill = _skills_groups.read_skill
 update_skill = _skills_groups.update_skill
 delete_skill = _skills_groups.delete_skill
+
+
+# ── Task 7.3: tenant-credential-contract 路由 handler ──────────────────────────
+
+
+def _get_tenant_credentials(tenant_id, event):
+    """GET /tenants/{id}/credentials — 出站凭据子资源(R7.1);event 透传做 #80 owner 门"""
+    from services.tenant_service import get_tenant_credentials
+
+    return get_tenant_credentials(tenant_id, event)
+
+
+def _get_registry(config_template, event):
+    """GET /registry/{config_template} — 读当前 registry 快照(admin-only)"""
+    # admin gate — identity-based like fleet_power (works for api-key admin path;
+    # requestContext.authorizer.role is never populated in this stack, no custom authorizer)
+    if not _get_caller_identity(event or {}).get("is_admin"):
+        return _err(403, "ACCESS_DENIED", "registry management requires admin role")
+    from services.registry_service import load_current_snapshot
+
+    try:
+        version, entries = load_current_snapshot(config_template)
+    except LookupError as e:
+        return _err(404, "NOT_FOUND", str(e))
+    return _resp(
+        200,
+        {"config_template": config_template, "version": version, "entries": entries},
+    )
+
+
+def _publish_registry(config_template, event):
+    """POST /registry/{config_template} — 发布新快照(admin-only)"""
+    # admin gate — identity-based like fleet_power (works for api-key admin path;
+    # requestContext.authorizer.role is never populated in this stack, no custom authorizer)
+    if not _get_caller_identity(event or {}).get("is_admin"):
+        return _err(403, "ACCESS_DENIED", "registry publish requires admin role")
+    import json as _json
+
+    body = event.get("body")
+    if isinstance(body, str):
+        body = _json.loads(body)
+    if not body or not isinstance(body.get("entries"), dict):
+        return _err(400, "VALIDATION", "body.entries must be an object")
+    from services.registry_service import publish_snapshot
+
+    new_version = publish_snapshot(config_template, body["entries"])
+    return _resp(200, {"config_template": config_template, "version": new_version})
+
+
+def _rollback_registry(config_template, event):
+    """POST /registry/{config_template}/rollback — 回滚到指定版本(admin-only)"""
+    # admin gate — identity-based like fleet_power (works for api-key admin path;
+    # requestContext.authorizer.role is never populated in this stack, no custom authorizer)
+    if not _get_caller_identity(event or {}).get("is_admin"):
+        return _err(403, "ACCESS_DENIED", "registry rollback requires admin role")
+    import json as _json
+
+    body = event.get("body")
+    if isinstance(body, str):
+        body = _json.loads(body)
+    version = (body or {}).get("version")
+    if not isinstance(version, int):
+        return _err(400, "VALIDATION", "body.version must be an integer")
+    from services.registry_service import rollback
+
+    try:
+        rollback(config_template, version)
+    except Exception as e:
+        return _err(400, "VALIDATION", f"rollback failed: {e}")
+    return _resp(200, {"config_template": config_template, "rolled_back_to": version})
+
+
+def _get_clawpool_rsa_public_key():
+    """GET /clawpool-rsa-public-key — #149 asymmetric-v1 入站用。
+
+    返回 ClawPool RSA CMK 的公钥(PEM),供外部调用方本地 OAEP-SHA256 加密 env 凭据,
+    再以 enc:v1: 信封发 POST /tenants(env_injected_credentials)。私钥不出 KMS,只有
+    host 在 VM launch 时 kms:Decrypt。此端点只读公钥(kms:GetPublicKey),不涉私钥。
+    """
+    import base64
+    from core import clients
+
+    arn = clients.CLAWPOOL_RSA_CMK_ARN
+    if not arn:
+        return _err(404, "NOT_FOUND",
+                    "asymmetric-v1 not enabled (no RSA CMK; security.clawpool_cmk_enabled off)")
+    try:
+        resp = clients.kms.get_public_key(KeyId=arn)
+    except Exception as e:  # noqa: BLE001
+        return _err(502, "UPSTREAM", f"kms:GetPublicKey failed: {e}")
+    der_b64 = base64.b64encode(resp["PublicKey"]).decode()
+    pem = "-----BEGIN PUBLIC KEY-----\n" + \
+        "\n".join(der_b64[i:i + 64] for i in range(0, len(der_b64), 64)) + \
+        "\n-----END PUBLIC KEY-----\n"
+    return _resp(200, {
+        "key_id": arn,
+        "key_spec": resp.get("KeySpec", "RSA_4096"),
+        "algorithm": "RSAES_OAEP_SHA_256",
+        "public_key_pem": pem,
+        "envelope_hint": "enc:v1:1:RSA_4096_OAEP_SHA_256:<key_id>:0:<base64(ciphertext)>",
+    })
+
+
+def _get_recipient_key(event):
+    """GET /recipient-key — 读当前 enabled 公钥元数据"""
+    from services.recipient_key_service import get_current_key
+
+    key = get_current_key()
+    if not key:
+        return _resp(200, {"recipient_key": None})
+    return _resp(200, {"recipient_key": key})
+
+
+def _register_recipient_key(event):
+    """POST /recipient-key — 登记/替换平台级 recipient 公钥(admin-only)"""
+    # admin gate — identity-based like fleet_power (works for api-key admin path;
+    # requestContext.authorizer.role is never populated in this stack, no custom authorizer)
+    if not _get_caller_identity(event or {}).get("is_admin"):
+        return _err(
+            403, "ACCESS_DENIED", "recipient key registration requires admin role"
+        )
+    import json as _json
+
+    body = event.get("body")
+    if isinstance(body, str):
+        body = _json.loads(body)
+    pem = (body or {}).get("public_key_pem", "")
+    if not pem:
+        return _err(400, "VALIDATION", "body.public_key_pem is required")
+    source = (body or {}).get("source", "caller")
+    from services.recipient_key_service import register_key
+
+    try:
+        meta = register_key(pem, source=source)
+    except ValueError as e:
+        return _err(400, "VALIDATION", str(e))
+    return _resp(200, meta)
+
+
+def _disable_recipient_key(event):
+    """POST /recipient-key/disable — 禁用当前 recipient key(admin-only)"""
+    # admin gate — identity-based like fleet_power (works for api-key admin path;
+    # requestContext.authorizer.role is never populated in this stack, no custom authorizer)
+    if not _get_caller_identity(event or {}).get("is_admin"):
+        return _err(403, "ACCESS_DENIED", "recipient key disable requires admin role")
+    from services.recipient_key_service import disable_current
+
+    result = disable_current()
+    return _resp(200, {"disabled": True, "key": result})
+

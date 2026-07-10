@@ -57,8 +57,8 @@ INJECTED_CHANNEL_SECRET="${9:-}"
 # chat_endpoint_enabled (10th arg) — per-tenant switch for the OpenAI-compatible
 # gateway.http.endpoints.chatCompletions endpoint. DEFAULT OFF (empty / "0" /
 # "false"): we keep deleting the endpoint (OpenClaw's secure default + this
-# fork's policy — see the del() below; chatCompletions is never enabled
-# globally). Only when the API Lambda passes "1"/"true" (the tenant record's
+# fork's policy — see the del() below; chatCompletions must not be globally
+# enabled by default). Only when the API Lambda passes "1"/"true" (the tenant record's
 # chat_endpoint_enabled flag) do we inject enabled:true for THAT tenant. Mitigations
 # stay regardless: per-tenant gateway.auth.token + CloudFront/nginx reverse proxy +
 # Bedrock Guardrail + LiteLLM vkey limit. Empty (legacy SSM commands) → off.
@@ -67,13 +67,13 @@ CHAT_EP_ENABLED="${10:-}"
 # Cognito 渠道机器用户 base64)。channel/hub 数据面已下线,数据面走两级路由直连
 # microVM:18789 gateway。参数位保留以维持 12 位对齐,取值不再使用。
 INJECTED_COGNITO_B64="${11:-}"
-# #187 P1: 12th positional arg — base64 KMS
+# #187 P1 (SPEC/11-ENGINE-TRANSFORM D+B): 12th positional arg — base64 KMS
 # ciphertext of the pre-minted gateway token (tenant_id EncryptionContext, ClawPool
 # CMK). Empty (legacy SSM commands / feature off) → keep the openssl-generated
 # in-VM token. Non-empty → we `aws kms decrypt` here on the host (has kms:Decrypt
 # on the ClawPool CMK), inject the plaintext as `.gateway.auth.token`, replacing
 # the openssl one. This closes the "control plane can't reveal the gateway token"
-# gap that hub → gateway direct-connect needs. Reveal window
+# gap that hub → gateway direct-connect (11-ENGINE-TRANSFORM) needs. Reveal window
 # is enforced control-side (openclaw-tenant-secrets TTL 15min); this side is just
 # the injection step.
 INJECTED_GATEWAY_TOKEN_CT="${12:-}"
@@ -239,6 +239,117 @@ if [ -d "${SHARED_SKILLS}" ] && [ "$(ls -A ${SHARED_SKILLS} 2>/dev/null)" ]; the
   sudo chown -R 1000:1000 ${MOUNT_TMP}/.openclaw/skills
   log "skills injected"
 fi
+# ─────────────────────────────────────────────────────────────────────────
+# #118/#116 + #149 — platform-injected credentials: read tenant record + decrypt.
+#
+# MOVED here (before the openclaw.json config block) from its old post-umount
+# position so that: (a) config-class injection (oc_inject_config_from_plan) can
+# see _FP_PURE while the data disk is STILL MOUNTED, and (b) env-class plaintext
+# is prepared into _CREDS_ENV; the read-only creds disk is BUILT later (after
+# umount) from that file — see the "build creds disk" block below.
+#
+# The control plane stores each credential as ciphertext on the tenant record
+# (never plaintext, never on the SSM command line). The host — the ONLY place
+# with kms:Decrypt on the ClawPool CMK(s) — decrypts each value:
+#   • kms-cmk (legacy/default): symmetric CMK + owner_id EncryptionContext
+#     (cross-tenant containment: a ciphertext minted for another tenant fails).
+#   • asymmetric-v1 (#149): RSA-4096 OAEP-SHA256 via the RSA CMK; KMS asymmetric
+#     Decrypt does NOT accept EncryptionContext (verified ValidationException),
+#     so tenant binding is the per-tenant frozen plan + envelope key_id (scheme-B).
+# env-class → dotenv on a per-VM ext4 attached READ-ONLY as /dev/vde; config-class
+# → jq dot-path overwrite in openclaw.json (plaintext never lands on the data disk).
+# No creds disk / no plan → unchanged behavior for tenants without injected creds.
+CREDS_VOL="${VM_DIR}/creds.ext4"
+rm -f "${CREDS_VOL}"
+_CREDS_ENV=""   # set below iff env-class creds were decrypted; drives disk build
+# Read the tenant record. --consistent-read closes the create→launch race (the
+# default eventually-consistent read could miss injected_credentials/frozen plan
+# just written by create_tenant). Separate the AWS CALL from the jq PARSE so we
+# can tell three cases apart instead of collapsing them to "empty" (old fail-OPEN
+# bug):
+#   • call errors (throttle / IAM / network) → fail-CLOSED: abort launch, the
+#     scheduler retries. Never boot a credential-provisioned VM without its creds.
+#   • call ok, no injected field → clean no-op (the 99% common case).
+#   • call ok, field present → decrypt below.
+# if-condition form: set -e is disabled for the command, so a non-zero aws exit
+# reaches our explicit fail-closed branch instead of aborting at the assignment.
+if _IC_RAW="$(aws dynamodb get-item \
+  --table-name "${TENANTS_TABLE:-openclaw-tenants}" \
+  --key "{\"id\":{\"S\":\"${TENANT_ID}\"}}" \
+  --projection-expression 'injected_credentials, owner_id, frozen_injection_plan, scheme, registry_version' \
+  --consistent-read \
+  --region "${OC_REGION:-ap-northeast-1}" \
+  --output json 2>/dev/null)"; then
+  :
+else
+  log "FATAL: DDB get-item for injected_credentials failed (throttle/IAM/network) — aborting launch fail-closed (scheduler will retry)"
+  exit 1
+fi
+_IC_JSON="$(printf '%s' "${_IC_RAW}" | jq -c '.Item.injected_credentials.M // empty' 2>/dev/null || true)"
+# #149 Task 8.1: frozen_injection_plan 新契约(优先于旧 injected_credentials)
+_FP_JSON="$(printf '%s' "${_IC_RAW}" | jq -c '.Item.frozen_injection_plan.M // empty' 2>/dev/null || true)"
+_FP_SCHEME="$(printf '%s' "${_IC_RAW}" | jq -r '.Item.scheme.S // "kms-cmk"' 2>/dev/null || true)"
+if [ -n "${_FP_JSON}" ] && [ "${_FP_JSON}" != "null" ]; then
+  # 新契约: env-class → cred-inject(下面建盘), config-class → harden-config(配置块内)
+  _CRED_OWNER="$(printf '%s' "${_IC_RAW}" | jq -r '.Item.owner_id.S // empty' 2>/dev/null || true)"
+  if [ -z "${_CRED_OWNER}" ]; then
+    log "FATAL: frozen_injection_plan present but no owner_id — aborting fail-closed"
+    exit 1
+  fi
+  log "frozen_injection_plan present (scheme=${_FP_SCHEME}) — injecting via new contract"
+  if [ -r /home/ubuntu/lib/cred-inject.sh ]; then
+    # shellcheck disable=SC1091
+    . /home/ubuntu/lib/cred-inject.sh
+  else
+    log "FATAL: /home/ubuntu/lib/cred-inject.sh missing"; exit 1
+  fi
+  # 转换 DDB M 格式为纯 JSON(去掉 DDB 类型标注);供 env 解密与 config 注入共用。
+  _FP_PURE="$(printf '%s' "${_IC_RAW}" | jq -c '[.Item.frozen_injection_plan.M | to_entries[] | {(.key): {param_class: .value.M.param_class.S, injection_target: .value.M.injection_target.S, sensitive: (.value.M.sensitive.BOOL // false), mode: .value.M.mode.S, value_ref: (.value.M.value_ref.S // ""), empty_fallback: (.value.M.empty_fallback.S // "")}}] | add // {}' 2>/dev/null || true)"
+  export _FP_PURE _FP_SCHEME _CRED_OWNER
+  # env-class 解密进临时 dotenv(建盘在 umount 之后)。config-class 由
+  # oc_inject_config_from_plan 在配置块内处理(此时数据盘仍挂载)。
+  _CREDS_ENV_TMP="$(mktemp /tmp/creds-${TENANT_ID}.XXXXXX.env)"
+  chmod 600 "${_CREDS_ENV_TMP}"
+  if ! _FP_COUNT="$(oc_decrypt_frozen_plan "${_FP_PURE}" "${_CRED_OWNER}" "${_FP_SCHEME}" "${OC_REGION:-ap-northeast-1}" "${_CREDS_ENV_TMP}" "${CLAWPOOL_RSA_CMK_ARN:-}")"; then
+    log "FATAL: frozen plan env-class decrypt failed — aborting"
+    shred -u "${_CREDS_ENV_TMP}" 2>/dev/null || rm -f "${_CREDS_ENV_TMP}"
+    exit 1
+  fi
+  # 仅当真有 env-class 条目写出时才建盘(纯 config-class 计划不需要 creds 盘)。
+  if [ -s "${_CREDS_ENV_TMP}" ]; then
+    _CREDS_ENV="${_CREDS_ENV_TMP}"
+  else
+    rm -f "${_CREDS_ENV_TMP}"
+  fi
+elif [ -n "${_IC_JSON}" ] && [ "${_IC_JSON}" != "null" ]; then
+  # owner_id is the EncryptionContext the upstream encrypted the userkey under.
+  _CRED_OWNER="$(printf '%s' "${_IC_RAW}" | jq -r '.Item.owner_id.S // empty' 2>/dev/null || true)"
+  if [ -z "${_CRED_OWNER}" ]; then
+    log "FATAL: injected_credentials present but tenant record has no owner_id (EC binding missing) — aborting launch fail-closed"
+    exit 1
+  fi
+  log "injected_credentials present — decrypting via host KMS role (EC owner_id=${_CRED_OWNER})"
+  # decrypt logic lives in lib/cred-inject.sh (unit-tested with a stubbed aws).
+  if [ -r /home/ubuntu/lib/cred-inject.sh ]; then
+    # shellcheck disable=SC1091
+    . /home/ubuntu/lib/cred-inject.sh
+  else
+    log "FATAL: /home/ubuntu/lib/cred-inject.sh missing (init-host.sh should have downloaded it)"
+    exit 1
+  fi
+  _CREDS_ENV_TMP="$(mktemp /tmp/creds-${TENANT_ID}.XXXXXX.env)"
+  chmod 600 "${_CREDS_ENV_TMP}"
+  # fail-closed: any decrypt failure (EC mismatch / tampered / no perm / malformed)
+  # returns non-zero → we abort the launch, never boot with half/empty creds.
+  if ! _IC_COUNT="$(oc_decrypt_injected_creds "${_IC_JSON}" "${_CRED_OWNER}" "${OC_REGION:-ap-northeast-1}" "${_CREDS_ENV_TMP}")"; then
+    log "FATAL: injected credential decrypt failed (see [oc:cred] above) — aborting launch"
+    shred -u "${_CREDS_ENV_TMP}" 2>/dev/null || rm -f "${_CREDS_ENV_TMP}"
+    exit 1
+  fi
+  _CREDS_ENV="${_CREDS_ENV_TMP}"
+  log "decrypted ${_IC_COUNT} credential(s) — creds disk built after umount"
+fi
+
 # Configure openclaw.json
 OC_JSON="${MOUNT_TMP}/.openclaw/openclaw.json"
 if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
@@ -266,7 +377,7 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
     # tenant_id EncryptionContext), decrypt it here on the host and use THAT as
     # NEW_TOKEN, overriding the openssl rand above. Rationale:
     #   • Control plane needs `GET /tenants/{id}/token` reveal for direct-gateway
-    #     data plane: only pre-minted tokens can be revealed.
+    #     data plane (11-ENGINE-TRANSFORM): only pre-minted tokens can be revealed.
     #   • openssl rand stays as the FEATURE-OFF fallback (byte-identical old path
     #     for un-migrated deployments; no CMK → no ciphertext → no override).
     # Fail-closed: ciphertext present but decrypt fails (EC mismatch, no perm,
@@ -396,6 +507,13 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
   fi
 
   if oc_harden_config "${OC_JSON}" "${CF_ORIGIN}" "${LITELLM_BASEURL}" "${_APIKEY}" "${CHAT_EP_ENABLED}"; then
+    # Task 8.3: frozen plan config-class dot-path 覆盖(新契约)
+    if [ -n "${_FP_PURE:-}" ]; then
+      if ! oc_inject_config_from_plan "${OC_JSON}" "${_FP_PURE}" "${_FP_SCHEME}" "${_CRED_OWNER}" "${OC_REGION:-ap-northeast-1}" "${LITELLM_SHARED_VKEY:-}" "${CLAWPOOL_RSA_CMK_ARN:-}"; then
+        log "FATAL: config-class injection from frozen plan failed — aborting"
+        exit 1
+      fi
+    fi
     # 日志一行看清幂等段执行了什么(帮排查唤醒漂移)
     _log_origin="${CF_ORIGIN:-<unset,skipped>}"
     _log_url="${LITELLM_BASEURL:-<unset,skipped>}"
@@ -452,77 +570,18 @@ sudo umount ${MOUNT_TMP}
 rmdir ${MOUNT_TMP} 2>/dev/null || true
 
 # ─────────────────────────────────────────────────────────────────────────
-# #118/#116 — platform-injected credentials: KMS-decrypt → per-VM READ-ONLY disk.
-#
-# The control plane stores each credential as CMK ciphertext on the tenant record
-# (never plaintext, never on the SSM command line). Here the host — the ONLY place
-# with kms:Decrypt on the ClawPool CMK — decrypts each value with the tenant_id
-# EncryptionContext (a ciphertext minted for another tenant fails to decrypt:
-# cross-tenant containment), writes a dotenv to a per-VM ext4, and attaches it
-# READ-ONLY as /dev/vde (marked with .clawcreds-marker). The guest identifies it
-# by that marker (no udev in the image), mounts it read-only and binds it over
-# ~/.openclaw/.env (build-rootfs openclaw-creds.service); OpenClaw's native dotenv
-# loader + ${ENV} interpolation then feed the values into config — plaintext never
-# lands in openclaw.json. No creds disk attached when the tenant has no
-# injected_credentials, so existing tenants are unaffected.
-CREDS_VOL="${VM_DIR}/creds.ext4"
-rm -f "${CREDS_VOL}"
-# Read the tenant record. --consistent-read closes the create→launch race (the
-# default eventually-consistent read could miss injected_credentials just written
-# by create_tenant). Separate the AWS CALL from the jq PARSE so we can tell three
-# cases apart instead of collapsing them to "empty" (the old fail-OPEN bug):
-#   • call errors (throttle / IAM / network) → fail-CLOSED: abort launch, the
-#     scheduler retries (same posture as the SSM-throttle rollback). Never boot a
-#     credential-provisioned VM without confirming its creds.
-#   • call ok, no injected_credentials field → clean no-op (the 99% common case).
-#   • call ok, field present → decrypt below.
-# if-condition form: set -e is disabled for the command, so a non-zero aws exit
-# reaches our explicit fail-closed branch instead of aborting at the assignment.
-# owner_id is read alongside injected_credentials because it's the EncryptionContext
-# binding (EC=owner_id=<平台用户id>). #owner is not a DDB reserved word, so a bare
-# projection is fine.
-if _IC_RAW="$(aws dynamodb get-item \
-  --table-name "${TENANTS_TABLE:-openclaw-tenants}" \
-  --key "{\"id\":{\"S\":\"${TENANT_ID}\"}}" \
-  --projection-expression 'injected_credentials, owner_id' \
-  --consistent-read \
-  --region "${OC_REGION:-ap-northeast-1}" \
-  --output json 2>/dev/null)"; then
-  :
-else
-  log "FATAL: DDB get-item for injected_credentials failed (throttle/IAM/network) — aborting launch fail-closed (scheduler will retry)"
-  exit 1
-fi
-_IC_JSON="$(printf '%s' "${_IC_RAW}" | jq -c '.Item.injected_credentials.M // empty' 2>/dev/null || true)"
-if [ -n "${_IC_JSON}" ] && [ "${_IC_JSON}" != "null" ]; then
-  # owner_id is the EncryptionContext the upstream encrypted the userkey under.
-  _CRED_OWNER="$(printf '%s' "${_IC_RAW}" | jq -r '.Item.owner_id.S // empty' 2>/dev/null || true)"
-  if [ -z "${_CRED_OWNER}" ]; then
-    log "FATAL: injected_credentials present but tenant record has no owner_id (EC binding missing) — aborting launch fail-closed"
-    exit 1
-  fi
-  log "injected_credentials present — decrypting via host KMS role (EC owner_id=${_CRED_OWNER})"
-  # decrypt logic lives in lib/cred-inject.sh (unit-tested with a stubbed aws).
-  if [ -r /home/ubuntu/lib/cred-inject.sh ]; then
-    # shellcheck disable=SC1091
-    . /home/ubuntu/lib/cred-inject.sh
-  else
-    log "FATAL: /home/ubuntu/lib/cred-inject.sh missing (init-host.sh should have downloaded it)"
-    exit 1
-  fi
-  _CREDS_ENV="$(mktemp /tmp/creds-${TENANT_ID}.XXXXXX.env)"
-  chmod 600 "${_CREDS_ENV}"
-  # fail-closed: any decrypt failure (EC mismatch / tampered / no perm / malformed)
-  # returns non-zero → we abort the launch, never boot with half/empty creds.
-  if ! _IC_COUNT="$(oc_decrypt_injected_creds "${_IC_JSON}" "${_CRED_OWNER}" "${OC_REGION:-ap-northeast-1}" "${_CREDS_ENV}")"; then
-    log "FATAL: injected credential decrypt failed (see [oc:cred] above) — aborting launch"
-    shred -u "${_CREDS_ENV}" 2>/dev/null || rm -f "${_CREDS_ENV}"
-    exit 1
-  fi
-  # Build a small per-VM ext4 holding just the .env, attach read-only as /dev/vde.
-  # The guest identifies it by a marker file (below), not by label — the image has
-  # no udev/blkid so by-label never populates. The label is cosmetic (aids host-side
-  # lsblk debugging).
+# #118/#116 + #149 — build the per-VM READ-ONLY credentials disk from the dotenv
+# decrypted above (env-class only). Unified for both the new frozen-plan contract
+# and the legacy injected_credentials path: whichever set _CREDS_ENV (a non-empty
+# temp dotenv) gets a creds.ext4. Empty _CREDS_ENV (no env creds / no injection)
+# → no disk, so tenants without injected creds stay byte-identical (guest
+# openclaw-creds.service no-ops on ConditionPathExists=/dev/vde). Attached
+# READ-ONLY as /dev/vde (marker file .clawcreds-marker); the guest binds it over
+# ~/.openclaw/.env — plaintext never touched the data disk or openclaw.json.
+if [ -n "${_CREDS_ENV:-}" ] && [ -s "${_CREDS_ENV}" ]; then
+  # Build a small per-VM ext4 holding just the .env. The guest identifies it by a
+  # marker file (below), not by label — the image has no udev/blkid so by-label
+  # never populates. The label is cosmetic (aids host-side lsblk debugging).
   truncate -s 16M "${CREDS_VOL}"
   mkfs.ext4 -q -L clawcreds "${CREDS_VOL}"
   _CREDS_MNT="/tmp/creds-mount-${TENANT_ID}"
@@ -531,16 +590,12 @@ if [ -n "${_IC_JSON}" ] && [ "${_IC_JSON}" != "null" ]; then
   sudo cp "${_CREDS_ENV}" "${_CREDS_MNT}/.env"
   sudo chmod 600 "${_CREDS_MNT}/.env"
   sudo chown 1000:1000 "${_CREDS_MNT}/.env"
-  # Marker file so the guest can POSITIVELY identify this disk by content when it
-  # scans raw devices (no udev/blkid in the guest image → can't rely on by-label;
-  # device letter can shift if the immutable disk is absent). Distinguishes the
-  # creds disk from the immutable skills disk (which has workspace/skills, no marker).
   echo "clawcreds" | sudo tee "${_CREDS_MNT}/.clawcreds-marker" >/dev/null
   sudo umount "${_CREDS_MNT}"
   rmdir "${_CREDS_MNT}" 2>/dev/null || true
   # host-side plaintext lived only in this tmp file; shred it now.
   shred -u "${_CREDS_ENV}" 2>/dev/null || rm -f "${_CREDS_ENV}"
-  log "injected ${_IC_COUNT} credential(s) onto read-only creds disk"
+  log "injected credential(s) onto read-only creds disk (${CREDS_VOL})"
 else
   CREDS_VOL=""
 fi

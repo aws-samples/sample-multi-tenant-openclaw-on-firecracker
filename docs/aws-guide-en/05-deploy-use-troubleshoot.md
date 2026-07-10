@@ -1,21 +1,19 @@
 # Deploy the Solution
 
-> **2026-07-08 data-plane redesign notice**: any real-time chat runtime steps in this chapter that reference the old hub/channel model — `claw-hub`, `claw-channel`, `/hub/token`, `/hub/ws`, HMAC `channel_secret` — have been superseded by [Chapter 13 · Data-plane two-tier routing](13-data-plane-redesign.md). Real-time chat now runs over the gateway two-tier route; use Chapter 13 and the Chapter 11 ops manual for current verification and troubleshooting. Control plane deployment and lifecycle steps in this chapter remain valid.
-
 Before you deploy this solution, review the architecture and the planning considerations in this guide. This solution provisions one dedicated-kernel Firecracker microVM per tenant on AWS, running an OpenClaw AI agent equipped with an identity, skills, and guardrails. The control plane (AWS Lambda, Amazon DynamoDB, and Amazon API Gateway) handles registration, lifecycle, backup, and deregistration, and injects no business data into tenant microVMs after they are running. This section describes the deployment process and the required steps.
 
 ## Deployment process overview
 
 This section describes the deployment entry points, configuration files, and recommended order of execution for the solution.
 
-The deployment code for this solution comprises four parts: an infrastructure definition built on the AWS Cloud Development Kit (AWS CDK) (`deploy/app.py` and `deploy/stack.py`), the host and microVM lifecycle scripts (`deploy/userdata/*.sh`), the golden image build script (`build-rootfs.sh`), and the data-plane OpenResty edge routing (`deploy/edge/`) plus the host-side routing script (`deploy/userdata/route_ops.py`: iptables DNAT + Redis route-table dual-write).
+The deployment code for this solution comprises four parts: an infrastructure definition built on the AWS Cloud Development Kit (AWS CDK) (`deploy/app.py` and `deploy/stack.py`), the host and microVM lifecycle scripts (`deploy/userdata/*.sh`), the golden image build script (`build-rootfs.sh`), and the data-plane WebSocket hub claw-hub (`deploy/hub/`).
 
 The AWS CDK entry point `deploy/app.py` reads `region` from context (defaults to `us-east-1`), instantiates `OpenClawOrchestratorStack`, and takes the account from the `CDK_DEFAULT_ACCOUNT` environment variable. The central configuration file `config.yml` defines, in one place, the host specification, microVM defaults, the Auto Scaling Group (ASG), Balloon memory reclamation, health checks, Multi-AZ, and Amazon Cognito authentication. The deployment commands are wrapped in `setup.sh`.
 
 The recommended deployment order is:
 
 1. Review `config.yml`, paying particular attention to the region (`region`), instance type (`instance_type`), and ASG capacity.
-2. Run `setup.sh` to complete the AWS CDK deployment and upload the host scripts and the `deploy/edge/` assets to the Amazon Simple Storage Service (Amazon S3) assets bucket.
+2. Run `setup.sh` to complete the AWS CDK deployment and upload the host scripts and the `deploy/hub/` assets to the Amazon Simple Storage Service (Amazon S3) assets bucket.
 3. The ASG launches the first host, which runs `init-host.sh` to bootstrap itself and register with the hosts table.
 4. Register the first tenant through the control plane API and verify end-to-end connectivity.
 
@@ -67,7 +65,7 @@ Send a `POST /tenants` request to the control plane API to register a tenant. Th
 
 > **Note**
 >
-> Confirm that `POST /tenants` returns (measured at about 1.7 seconds), and that the tenant status changes from `creating` through `running` to `vm_health` up within about 4.0 seconds (measured). Then send a message over the real-time chat path to confirm the agent replies (end-to-end first reply measured at about 27 seconds): sign in with Amazon Cognito to obtain the id_token → `POST {CloudFront}/hub/token` with `Authorization: Bearer {id_token}` and `{"tenant_id":"<id>"}` to exchange for a frontend token → `wss {CloudFront}/hub/ws?token=<frontend token>` to send `{"text":"..."}` → receive `{"type":"reply"}`. Chat messages travel over the claw-hub WebSocket hub and the claw-channel outbound connection inside the VM, and do not pass through any gateway HTTP endpoint. See "Developer Guide — Real-time chat integration". **Legacy — the hub/channel chat path shown here has been superseded**: real-time chat now runs over the gateway two-tier route; use [Chapter 13](13-data-plane-redesign.md) / the Chapter 11 ops manual for current verification steps.
+> Confirm that `POST /tenants` returns (measured at about 1.7 seconds), and that the tenant status changes from `creating` through `running` to `vm_health` up within about 4.0 seconds (measured). Then send a message over the real-time chat path to confirm the agent replies (end-to-end first reply measured at about 27 seconds): sign in with Amazon Cognito to obtain the id_token → `POST {CloudFront}/hub/token` with `Authorization: Bearer {id_token}` and `{"tenant_id":"<id>"}` to exchange for a frontend token → `wss {CloudFront}/hub/ws?token=<frontend token>` to send `{"text":"..."}` → receive `{"type":"reply"}`. Chat messages travel over the claw-hub WebSocket hub and the claw-channel outbound connection inside the VM, and do not pass through any gateway HTTP endpoint. See "Developer Guide — Real-time chat integration".
 
 ## Core resources created by the CDK deployment
 
@@ -142,7 +140,7 @@ Key points of host bootstrap:
 All injection in this solution completes before the Firecracker `InstanceStart`; this is where "zero runtime operations" is implemented. The launch flow is:
 
 1. Mount data.ext4, inject shared skills, generate the gateway token, and inject the SSH public key.
-2. Modify `openclaw.json` through jq: write a random `NEW_TOKEN` as `gateway.auth.token`, write the claw-channel HMAC secret, set `claw-channel.enabled=true`, and point hubUrl/wsUrl at port 8790 of the host IP; in the same jq block, delete chatCompletions and dangerouslyDisableDeviceAuth and narrow allowedOrigins to a single CloudFront origin; if the API minted a per-tenant vkey, additionally write `.models.providers.litellm.apiKey`. **Legacy — the claw-channel HMAC secret / `claw-channel.enabled=true` / hubUrl parts of this example belong to the old channel model**; the current gateway model is in [Chapter 13](13-data-plane-redesign.md).
+2. Modify `openclaw.json` through jq: write a random `NEW_TOKEN` as `gateway.auth.token`, write the claw-channel HMAC secret, set `claw-channel.enabled=true`, and point hubUrl/wsUrl at port 8790 of the host IP; in the same jq block, delete chatCompletions and dangerouslyDisableDeviceAuth and narrow allowedOrigins to a single CloudFront origin; if the API minted a per-tenant vkey, additionally write `.models.providers.litellm.apiKey`.
 3. Mount the `/dev/vdd` immutable read-only disk and start Firecracker.
 
 After `InstanceStart`, the script disables strict mode, performs only an nginx reload and ssh-keygen cleanup, and no longer pushes data to the running microVM.
@@ -288,7 +286,7 @@ Locate: SSH to the host, check whether the Firecracker process exists, and view 
 
 Remedy: the host-agent provides two levels of self-recovery, and in most cases no manual intervention is needed. When `vm.json` exists but the process has disappeared, `_recover_vm` restarts it; when Firecracker is alive but the guest network is continuously unreachable up to the threshold, `_force_relaunch_vm` rebuilds through stop plus launch. If all tenants on an entire host go stale at once, the host-agent itself is most likely down, and the health_check Lambda issues `systemctl restart host-agent` through Systems Manager to bring it up, with a 600-second cooldown (`RESTART_COOLDOWN_SECONDS=600`). Do not manually restart repeatedly during the cooldown; wait out the cooldown per `agent_restart_at`.
 
-Chat-specific troubleshooting (health is normal but the user's chat cannot connect): **real-time chat now runs over the gateway two-tier route; use [Chapter 13](13-data-plane-redesign.md) / the Chapter 11 ops manual for current verification and troubleshooting steps.** The steps below are retained as historical reference for the superseded hub/channel model. The chat path and the in-VM gateway control UI are two orthogonal paths; chat travels over the claw-hub WebSocket hub plus the in-VM claw-channel outbound connection, unrelated to the control UI. Troubleshoot in this order — (1) whether the claw-hub service (`claw-hub.service`) is healthy, whether `/hub/healthz` returns normally, and whether the host nginx `/hub/` reverse proxy is in effect; (2) the in-VM claw-channel outbound connection log (`claw-channel.log`), looking for decisions such as `token-fail`, `ws-unexpected-response`, and `ws-close`; (3) whether `channel_secret` in the Amazon DynamoDB tenant record is mirrored and ready (the hub verifies the VM's channel registration signature against it).
+Chat-specific troubleshooting (health is normal but the user's chat cannot connect): the chat path and the in-VM gateway control UI are two orthogonal paths; chat travels over the claw-hub WebSocket hub plus the in-VM claw-channel outbound connection, unrelated to the control UI. Troubleshoot in this order — (1) whether the claw-hub service (`claw-hub.service`) is healthy, whether `/hub/healthz` returns normally, and whether the host nginx `/hub/` reverse proxy is in effect; (2) the in-VM claw-channel outbound connection log (`claw-channel.log`), looking for decisions such as `token-fail`, `ws-unexpected-response`, and `ws-close`; (3) whether `channel_secret` in the Amazon DynamoDB tenant record is mirrored and ready (the hub verifies the VM's channel registration signature against it).
 
 ### Symptom B: microVM launch errors, the microVM does not come up
 

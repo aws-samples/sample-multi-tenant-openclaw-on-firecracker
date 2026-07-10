@@ -1,7 +1,5 @@
 # 外部平台集成指南(客户视角)
 
-> **2026-07-08 数据面转型说明**:本章描述的实时聊天接入序列(`{HUB}/hub/token` 换令牌、`wss {HUB}/hub/ws` 建连的 hub 出站拨号模型)已被 [第 13 章 · 数据面两级路由](13-data-plane-redesign.md) 代替(客户 OIDC 不支持无浏览器登录,故弃用 Cognito 与出站拨号中枢,改用 OpenClaw 原生 gateway 认证)。当前实时聊天接入以第 13 章为准;控制面 API 集成部分仍然有效。
-
 本节面向**要把 ClawPool 集成进自有平台的客户**(如交易平台、二手电商、任意 SaaS)。读完你能让平台的每个自由用户拥有一个专属的 AI 助手(独立 openclaw),全程用你自己的账号体系,用户不接触任何底层控制台。
 
 > 定位区分:上一节《控制面 API 对接文档》是**逐接口参考**;本节是**集成方案与步骤**——你的平台该怎么接、认证怎么串、用户怎么用。术语「本平台/ClawPool」指被集成方(提供 openclaw pool),「你的平台」指集成方(客户自有平台)。
@@ -54,7 +52,7 @@ AI 助手前端(chat UI)嵌在你的域名下,用户从你的登录态无缝进�
 > **Important** 要让「按用户管理 fleet」(Step 5)与「用户在 chat UI 看到自己的节点」生效,创建时必须让归属字段落库:纯 api-key 代开就**在 body 里显式传 `owner_id` + `tenant_user_id`**(上例);转发用户 id_token 则归属自动取自 token。两者都不给,租户会落在系统名下——用户 `GET /tenants` 列不出它、`GET /users/{tenant_user_id}/tenants` 也查不到。参考实现 `console/marketplace-demo/broker/handler.py` 展示了整体流程骨架,以本节口径为准。
 
 **Step 4 · 进入 AI 助手**
-用户点「进入 AI 助手」→ 跳你域名下的 chat UI → chat UI 经你的平台后端拿到该租户的 `gateway_token`(平台后端用 KMS 解 revealToken 返回的密文)→ 经两级边缘路由到 microVM 原生 gateway 发起实时对话。当前接入方式(浏览器 → 平台后端 → CloudFront → ALB → OpenResty 边缘 → 宿主 iptables DNAT → microVM 原生 gateway)详见 [第 13 章 · 数据面两级路由](13-data-plane-redesign.md)。
+用户点「进入 AI 助手」→ 跳你域名下的 chat UI → chat UI 用联邦 `id_token` 调 `POST {HUB}/hub/token`(带 `tenant_id`)换实时令牌 → 建 `wss {HUB}/hub/ws?token=` → 对话。详见《控制面 API 对接文档》§4-5。
 
 **Step 5 · 按用户管理**
 

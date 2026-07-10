@@ -4,13 +4,13 @@
 
 ## 架构图
 
-使用默认参数部署此解决方案将在您的 AWS 账户中部署以下组件。下图给出交付级架构总览：左侧数据面（终端用户经 Amazon CloudFront → Application Load Balancer → OpenResty 边缘 ASG 查 Redis 路由表 → 宿主 iptables DNAT → 虚拟机内 :18789 的 OpenClaw 原生 gateway），中部控制面（全托管无服务器，编排租户全生命周期），右侧从 L1 到 L5 的纵深防御边界。
+使用默认参数部署此解决方案将在您的 AWS 账户中部署以下组件。下图给出交付级架构总览：左侧数据面（终端用户经 Amazon CloudFront → Application Load Balancer → WebSocket 中枢 → 虚拟机内 channel 出站连接），中部控制面（全托管无服务器，编排租户全生命周期），右侧从 L1 到 L5 的纵深防御边界。
 
 ![交付级架构总览](arch-delivery-overview.svg)
 
 > **Note**
 >
-> 该解决方案的 AWS 资源基于 AWS Cloud Development Kit (AWS CDK) 构造创建。AWS CDK 在部署时合成 AWS CloudFormation 模板并管理资源的生命周期。数据面的边缘路由由 OpenResty 边缘 ASG 承载，横向按负载弹性伸缩。渲染图可能仍画着旧的 WebSocket 中枢拓扑，以下文文字流描述的 gateway 链路为准。
+> 该解决方案的 AWS 资源基于 AWS Cloud Development Kit (AWS CDK) 构造创建。AWS CDK 在部署时合成 AWS CloudFormation 模板并管理资源的生命周期。图中 Amazon EKS WebSocket 集群为多副本目标态（当前生产实跑单进程中枢，灰度尚未切换，详见架构详情）。
 
 使用 AWS CloudFormation 模板部署的解决方案组件，其高级流程如下。
 
@@ -20,15 +20,15 @@
 
 3. 宿主（Amazon EC2 裸金属实例）由 Amazon EC2 Auto Scaling 组管理。新宿主启动后自举，下载只读黄金镜像、注册到宿主表，并在 KVM 之上为每个租户启动一台 Firecracker microVM。
 
-4. 启动每台 microVM 前，宿主脚本将身份、技能、租户专属配置（gateway_token、计费虚拟密钥）冷注入到磁盘。gateway_token 为每租户 KMS 信封加密（EncryptionContext={tenant_id}），密文存 DDB 并设 15 分钟 TTL，由 launch-vm.sh 冷注入。microVM 挂载只读黄金镜像盘，启动即为成品。该步骤全部在 Firecracker `InstanceStart` 之前完成，对应"零运行时操作"。
+4. 启动每台 microVM 前，宿主脚本将身份、技能、租户专属配置（通道密钥、计费虚拟密钥）冷注入到磁盘。microVM 挂载只读黄金镜像盘，启动即为成品。该步骤全部在 Firecracker `InstanceStart` 之前完成，对应"零运行时操作"。
 
-5. 终端用户经浏览器与平台后端发起实时聊天请求，请求经 Amazon CloudFront 进入。CloudFront 作为公网唯一入口，回源到 Application Load Balancer（按最少未完成请求分发），再转发到 OpenResty 边缘 ASG。
+5. 终端用户通过浏览器或前端经 Amazon CloudFront 访问聊天界面。CloudFront 作为公网唯一入口，回源到 Application Load Balancer，再转发到自建 WebSocket 中枢 claw-hub。
 
-6. OpenResty 边缘 ASG 查 Redis 路由表定位目标租户所在的宿主与端口：先查进程内 L1 lrucache（5s），未命中再查 L2 shared_dict（60s），仍未命中回源 L3 ElastiCache。
+6. 终端用户登录走 Amazon Cognito 的 OAuth 2.0 授权码流（含 PKCE），可选通过 OpenID Connect 联合外部身份提供方。claw-hub 以 Cognito 签发的令牌为前置依赖，验签通过后再做显式租户授权检查，签发短期 hub 令牌。
 
-7. 边缘将请求转发到目标宿主，宿主 iptables PREROUTING DNAT（端口 10000-10400）把请求转发到对应虚拟机内 :18789 的 OpenClaw 原生 gateway。gateway 的唯一鉴权是每租户 `Authorization: Bearer <gateway_token>`，controlUi 关闭；虚拟机不再主动向任何中枢拨出连接。
+7. 虚拟机内的通道客户端（claw-channel）主动向 claw-hub 拨出 WebSocket 连接，不在虚拟机上开放任何入站端口。claw-hub 将前端请求与虚拟机出站连接按租户配对，把聊天消息路由到对应租户的 agent。
 
-8. 出图与看图等媒体处理不在当前样本 chat demo 的范围内；实时聊天链路仅承载文本消息，不再经由任何中枢申请 Amazon S3 预签名 URL。
+8. 出图与看图走 Amazon S3 预签名 URL：claw-hub 是唯一持有 S3 访问权限的组件，虚拟机经 claw-hub 申请预签名 URL 上传或下载媒体文件，将 S3 访问的爆炸半径收敛在一处。
 
 9. 控制面与数据面的关键事件经 Amazon CloudWatch 记录指标与日志；宿主探针暴露 Prometheus 指标供监控平台采集；安全相关事件可经 Amazon GuardDuty 与 Amazon EventBridge 汇入统一告警通道（默认关闭，按需启用）。
 
@@ -51,7 +51,7 @@
 
 本节介绍该解决方案如何运用安全性支柱的原则和最佳实践。
 
-- 该解决方案以 Amazon Cognito 作为控制面与控制台的身份信任根，控制面只接受 Cognito 验签通过的令牌，验签失败一律降级到最小权限（只读）；数据面不使用 Cognito，改以每租户 gateway_token 由 OpenClaw 原生 gateway 校验。
+- 该解决方案以 Amazon Cognito 作为唯一身份信任根，控制面与数据面均只接受 Cognito 验签通过的令牌，验签失败一律降级到最小权限（只读）。
 - 该解决方案默认启用基于角色的访问控制（RBAC），强制按路由的角色检查与资源属主检查。
 - 该解决方案为每个租户预配独立内核的 Firecracker microVM，并在宿主 iptables 上丢弃跨租户东西向流量、丢弃虚拟机访问实例元数据服务（IMDS）与宿主管理端口的流量。
 - 该解决方案的 agent 工具执行层在工具真正执行前否决凭据外泄、敏感文件读取等危险动作，内容层经 Amazon Bedrock Guardrails 拦截越狱与有害内容。

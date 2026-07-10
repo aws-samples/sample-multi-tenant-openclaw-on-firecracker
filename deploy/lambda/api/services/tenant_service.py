@@ -47,6 +47,15 @@ import core.ssm_dispatch as ssm_dispatch
 import core.skills as skills
 import core.audit as audit
 import services.lifecycle_dispatch as lifecycle_dispatch
+import services.registry_service as registry_service
+
+# tenant-credential-contract — envelope 是 stdlib-only 叶子,纯函数值绑定安全
+# (测试不 patch 它,不受本文件头部「属性访问解死结」约束)。
+from core.envelope import (
+    _validate_injected_parameters_v2,
+    looks_encrypted,
+    resolve_scheme,
+)
 
 # ── tenant 域私有常量(逐字搬自 handler.py 顶部;仅本域使用)──────────────────
 # issue #59 (WI-E/M-1) — config_template is caller-controlled and flows into an
@@ -56,6 +65,9 @@ import services.lifecycle_dispatch as lifecycle_dispatch
 # whitespace, or path separators at the edge (defense in depth still quotes it
 # in _launch_vm). Empty == "no custom template" and is validated separately.
 _CONFIG_TEMPLATE_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$")
+# tenant-credential-contract Task 3.5 — registry 按 config_template 分区,注入路径
+# 复用同一 DNS-label 约束(别名而非新 regex:同一约束一个来源,防两处漂移)。
+_DNS_LABEL_RE = _CONFIG_TEMPLATE_RE
 
 # #93 idempotency key / #95 adversarial C-003/C-005/C-006 — client_token is a
 # caller-supplied idempotency key that flows into an SSM command and log lines.
@@ -91,6 +103,8 @@ _TENANT_SECRET_FIELDS = (
     # tenant's gateway_token (credential batch-exposure). Server-side only (see :1092).
     "injected_credentials",  # #118/#116 — platform-injected credential ciphertext
     # blobs; ciphertext (not plaintext), but still never echoed to any GET caller.
+    "frozen_injection_plan",  # tenant-credential-contract Task 4.1 — frozen plan
+    # entries carry value_ref (ciphertext or plaintext values); never echoed.
 )
 
 
@@ -139,23 +153,30 @@ def _redact_tenant(item):
     return {k: v for k, v in item.items() if k not in _TENANT_SECRET_FIELDS}
 
 
-# ── #187 P1 — pre-mint gateway token + reveal ──────
+# ── #187 P1 — pre-mint gateway token + reveal (11-ENGINE-TRANSFORM D 段)──────
 # 建租户时预铸 32 字节随机 token,KMS 信封绑 tenant_id 加密,密文与 expires_at=now+900
 # 一起落 openclaw-tenant-secrets 表。SSM 命令把密文按位置 12 传给 launch-vm.sh;host
 # 用同一 tenant_id ctx 解密后写入 openclaw.json 的 `.gateway.auth.token`。
 #
-# **API 侧不解密**(2026-07-08 两次纠正):控制平面调用方
+# **API 侧不解密**(Abel 2026-07-08 两次纠正 · INTERFACE-CONTRACT §5):控制平面调用方
 # 建租户后本就在 loop 里轮询状态,一旦查到 running 就绪、就在 GET /tenants/{id} 的
 # 响应里带回 gateway_token **密文原样**(base64 信封密文);GET /tenants/{id}/token
 # 保留作等价别名,同样只返密文。**调用方自己拿 KMS Decrypt**(它有 kms:Decrypt +
 # 知道 EncryptionContext={"tenant_id":<id>})。好处:token 全程不以明文过线、不进
 # CloudTrail、不进 Lambda 日志。API Lambda 不需要 kms:Decrypt 权限。
 #
-# 不进 tenants 表(独立表隔离)——避免 _redact_tenant 需要新增字段;独立 TTL 让密文
-# 不能"永远拿"(过窗 410,客户自持)。
+# 不进 tenants 表(独立表隔离)——避免 _redact_tenant 需要新增字段。
 import core.kms_envelope as kms_envelope  # noqa: E402  (关键路径依赖显式在这里 import,不与顶层 import 混)
 
-_GATEWAY_TOKEN_TTL_SEC = 900  # 15min 窗口:创建后到"客户拉走存本地"应该只算秒级
+# 密文 TTL = 租户生命周期级(30 天),不是短 reveal 窗口。设计是 GET /tenants/{id}
+# 一站返全(status/token/device/vkey),调用方(如 JDWS 平台网关)按需反复取,不是
+# "创建后秒级拉走存本地"的一次性 reveal。旧 900s(15min)窗口会让 DynamoDB TTL 把
+# gateway_token_ct/device_* 密文自动删掉 → 运行中的长期服务十几分钟后 GET 拿不回
+# token(报 missing/500),而 microVM 里冷注入的 token 明文一直有效、gateway 一直认
+# ——控制面副本被过早 TTL 清扫是 bug。密文本身 KMS 加密(EncryptionContext 锁死)+ 表
+# 在私网,15min 二次锁属过度设计。改 30 天让密文活到租户生命周期,JDWS 侧另有进程内
+# 缓存(gw-ws.mjs _credsCache)握手成功即代持,双保险。
+_GATEWAY_TOKEN_TTL_SEC = 30 * 24 * 3600  # 30 天:租户生命周期级,非短 reveal 窗口
 _GATEWAY_TOKEN_BYTES = 32  # 32 字节 → 43 char base64url(比 hex 短、URL 安全)
 
 # #10 WSS 直连丝滑授权 —— 设备身份三件套(Ed25519)。控制面创建租户时铸一对
@@ -164,8 +185,9 @@ _GATEWAY_TOKEN_BYTES = 32  # 32 字节 → 43 char base64url(比 hex 短、URL �
 # devices/paired.json(gateway 侧"已批准名单",免界面 approve);私钥 PEM 走
 # KMS 信封加密(EncryptionContext=owner_id,同 gateway_token 机制)存 tenant_secrets,
 # 由控制面 GET /tenants/{id} 折进就绪响应返回,调用方本地解密后签 WSS 握手帧。
-# scope 预授权到读写两档(default-deny,不给 operator.admin 全权)。
-_DEVICE_SCOPES_DEFAULT = ["operator.read", "operator.write"]
+# scope 预授权: 无人值守部署需 admin 全权(approve/pairing/管理均需),
+# 与 openclaw CLI 连接时写死的 scopes 对齐(gateway/call.ts:272)。
+_DEVICE_SCOPES_DEFAULT = ["operator.admin", "operator.approvals", "operator.pairing"]
 
 
 def mint_gateway_token(tenant_id):
@@ -328,8 +350,8 @@ def build_paired_json_b64(device):
     device_id = device["device_id"]
     scopes = list(device.get("scopes") or _DEVICE_SCOPES_DEFAULT)
     now_ms = int(time.time() * 1000)
-    # role 固定 operator(2.26 配对门只校 roles 含请求角色;scopes 已 default-deny
-    # 收窄到读写两档,不给 operator.admin 全权)。
+    # role 固定 operator(2.26 配对门只校 roles 含请求角色;scopes 给 admin 全权,
+    # 无人值守部署需 approve/pairing/管理,与 CLI call.ts:272 对齐)。
     paired = {
         device_id: {
             "deviceId": device_id,
@@ -489,6 +511,35 @@ def _attribution_override(body, event):
     return body_owner_id, body_tenant_user_id, None
 
 
+def _resolve_injection_plan(
+    validated_items, scheme, registry_entries, registry_version
+):
+    """把校验过的 injected items 冻结成 per-field 注入计划(Task 2.4)。
+
+    validated_items 已过 _validate_injected_parameters_v2(每个 field 必在 registry 里),
+    这里只做决策快照:复制 registry 的注入坐标 + 按 enc:v1: 前缀定 mode,值原样存
+    value_ref(本层绝不解密——guest 零凭据基线)。plan 随租户落 DDB 后,registry 再
+    发布新快照也不影响已建租户(冻结语义);scheme 由调用方传入已归一化值,当前
+    plan 消费方(launch 冷注入)从 enc:v1: 信封自描述头取解密参数,故不落 entry。
+    返回 (frozen_injection_plan_dict, registry_version)。
+    """
+    del scheme  # 契约签名保留;见 docstring
+    plan = {}
+    for field, value in validated_items.items():
+        entry = registry_entries[field]
+        plan_entry = {
+            "param_class": entry.get("param_class"),
+            "injection_target": entry.get("injection_target"),
+            "sensitive": bool(entry.get("sensitive")),
+            "mode": "encrypted" if looks_encrypted(value) else "plaintext",
+            "value_ref": value,
+        }
+        if entry.get("empty_fallback"):
+            plan_entry["empty_fallback"] = entry["empty_fallback"]
+        plan[field] = plan_entry
+    return plan, registry_version
+
+
 def create_tenant(body=None, event=None):
     if body is None:
         return utils._resp(400, {"error": "missing body"})
@@ -632,33 +683,94 @@ def create_tenant(body=None, event=None):
     security, sec_err = utils._validate_security(body.get("security"))
     if sec_err:
         return utils._err(400, "VALIDATION", sec_err)
-    # #118/#116 — optional platform-injected credentials (in-transit KMS ciphertext).
-    # The API only validates + relays the ciphertext; the host decrypts at VM launch
-    # (guest zero-credential baseline). Absent → unchanged behavior.
-    injected_credentials, ic_err = utils._validate_injected_credentials(
-        body.get("injected_credentials"), clients.CLAWPOOL_CMK_ARN
+    # tenant-credential-contract Task 3.5 — normalize FIRST, then route:
+    # body 带新字段 `injected_parameters` → registry 驱动的 v2 校验 + frozen plan;
+    # 只带旧 `injected_credentials`(或都不带)→ 原有 #118 路径逐字不变(兼容:旧
+    # 调用方不需要 registry 表存在)。归一化只做形态翻译,校验各归各路 fail-closed。
+    frozen_injection_plan = None
+    registry_version = None
+    injected_credentials = None
+    _frozen_scheme = (
+        None  # #149 — resolved scheme (kms-cmk/asymmetric-v1) 落库供 host 分派
     )
-    if ic_err:
-        return utils._err(400, "VALIDATION", ic_err)
-    # #118 — the injected ciphertext is bound to owner_id in its KMS EncryptionContext
-    # (the upstream registration center encrypts the userkey under the platform user's
-    # owner_id, before any tenant exists). So a tenant that carries injected_credentials
-    # MUST have a concrete owner_id — that's the value the host decrypts against. Reject
-    # loudly at create instead of letting the host fail-closed at launch (better UX +
-    # clear cause). owner_id here is the platform-supplied value (create-on-behalf).
-    # NOTE: under EXTERNAL_AUTHZ, owner_id was parked at the API_KEY_OWNER sentinel above
-    # (authority externalized) — injection needs the real owner_id as its EC, so it is
-    # incompatible with EXTERNAL_AUTHZ for now (a dedicated cred_owner_id field would
-    # decouple them; deferred until that mode is actually used).
-    if injected_credentials:
+    _injected_params = utils._normalize_injected_parameters(body)
+    # #149 — v2(registry+frozen plan)路径:新 injected_parameters 或目标态别名
+    # env_injected_credentials 触发;旧 injected_credentials 仍走下面的 legacy 分支。
+    if (
+        body.get("injected_parameters") is not None
+        or body.get("env_injected_credentials") is not None
+    ):
+        # registry 按 config_template 分区;空 = shipped default 模板(与 dispatch
+        # 的 `config_template or "default"` 同一约定)。DNS-label 校验挡 registry
+        # 分区键注入(config_template 本身已在上面过了同一 regex,这里守 "default"
+        # 兜底值与显式空串的组合边界)。
+        _reg_template = config_template or "default"
+        if not _DNS_LABEL_RE.match(_reg_template):
+            return utils._err(
+                400,
+                "VALIDATION",
+                "config_template must match ^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$",
+            )
+        try:
+            registry_version, _reg_entries = registry_service.load_current_snapshot(
+                _reg_template
+            )
+        except LookupError as e:
+            # 无 registry 快照 = 该模板不支持参数注入;fail-closed 400 而非 500。
+            return utils._err(400, "VALIDATION", str(e))
+        _validated_items, ip_err = _validate_injected_parameters_v2(
+            _injected_params, clients.CLAWPOOL_CMK_ARN, _reg_entries
+        )
+        if ip_err:
+            return utils._err(400, "VALIDATION", ip_err)
+        # R12.1 — 注入值绑定 owner_id(解密 AAD/EncryptionContext);与旧路径同一
+        # 拒绝语义(EXTERNAL_AUTHZ 下 owner_id 被停在哨兵值,同样不支持)。
         if not owner_id or owner_id == clients.API_KEY_OWNER:
             return utils._err(
                 400,
                 "VALIDATION",
-                "injected_credentials requires an owner_id (the KMS EncryptionContext "
-                "binding); pass body.owner_id (create-on-behalf). Not supported under "
-                "EXTERNAL_AUTHZ (owner_id is externalized).",
+                "injected_parameters requires an owner_id (the decryption-context "
+                "binding); pass body.owner_id (create-on-behalf). Not supported "
+                "under EXTERNAL_AUTHZ (owner_id is externalized).",
             )
+        _frozen_scheme = resolve_scheme(_injected_params.get("scheme"))
+        frozen_injection_plan, registry_version = _resolve_injection_plan(
+            _validated_items,
+            _frozen_scheme,
+            _reg_entries,
+            registry_version,
+        )
+    else:
+        # #118/#116 — optional platform-injected credentials (in-transit KMS
+        # ciphertext). The API only validates + relays the ciphertext; the host
+        # decrypts at VM launch (guest zero-credential baseline). Absent →
+        # unchanged behavior.
+        injected_credentials, ic_err = utils._validate_injected_credentials(
+            body.get("injected_credentials"), clients.CLAWPOOL_CMK_ARN
+        )
+        if ic_err:
+            return utils._err(400, "VALIDATION", ic_err)
+        # #118 — the injected ciphertext is bound to owner_id in its KMS
+        # EncryptionContext (the upstream registration center encrypts the userkey
+        # under the platform user's owner_id, before any tenant exists). So a
+        # tenant that carries injected_credentials MUST have a concrete owner_id —
+        # that's the value the host decrypts against. Reject loudly at create
+        # instead of letting the host fail-closed at launch (better UX + clear
+        # cause). owner_id here is the platform-supplied value (create-on-behalf).
+        # NOTE: under EXTERNAL_AUTHZ, owner_id was parked at the API_KEY_OWNER
+        # sentinel above (authority externalized) — injection needs the real
+        # owner_id as its EC, so it is incompatible with EXTERNAL_AUTHZ for now
+        # (a dedicated cred_owner_id field would decouple them; deferred until
+        # that mode is actually used).
+        if injected_credentials:
+            if not owner_id or owner_id == clients.API_KEY_OWNER:
+                return utils._err(
+                    400,
+                    "VALIDATION",
+                    "injected_credentials requires an owner_id (the KMS EncryptionContext "
+                    "binding); pass body.owner_id (create-on-behalf). Not supported under "
+                    "EXTERNAL_AUTHZ (owner_id is externalized).",
+                )
     client_token = (body.get("client_token") or "").strip()
     # #95 adversarial C-006: .isascii() passes control chars (\n \t \x00), and
     # .strip() only trims the edges, so an embedded control char used to slip
@@ -684,7 +796,7 @@ def create_tenant(body=None, event=None):
     # per-tenant chatCompletions switch (default off = secure default). Only
     # tenants explicitly created with chat_endpoint_enabled=true get the
     # OpenAI-compatible HTTP endpoint; launch-vm.sh injects enabled:true for them
-    # and deletes the endpoint for everyone else.
+    # and deletes the endpoint for everyone else. See project security decision.
     # #95 adversarial C-017: bool("false") / bool("0") are both True, so a JSON
     # string used to silently OPEN this deviceAuth-bypassing endpoint. This is a
     # secure-default switch — accept only a real JSON boolean; anything else
@@ -821,6 +933,13 @@ def create_tenant(body=None, event=None):
                 injected_credentials
             ):  # #118/#116 — 与同步路径同宽,dispatch 消费重建时 host 自取解密
                 item["injected_credentials"] = injected_credentials
+            if frozen_injection_plan:  # tenant-credential-contract Task 3.5
+                item["frozen_injection_plan"] = frozen_injection_plan
+                item["registry_version"] = registry_version
+                if (
+                    _frozen_scheme
+                ):  # #149 — host launch-vm.sh:506 读 .Item.scheme 分派解密
+                    item["scheme"] = _frozen_scheme
             if tenant_user_id:  # #143 — 占位与同步路径同宽(丢字段=Q2 真机现形)
                 item["tenant_user_id"] = tenant_user_id
             if platform_id:
@@ -1054,6 +1173,11 @@ def create_tenant(body=None, event=None):
             item["security"] = security
         if injected_credentials:  # #118/#116 — platform-injected credential ciphertext
             item["injected_credentials"] = injected_credentials
+        if frozen_injection_plan:  # tenant-credential-contract Task 3.5
+            item["frozen_injection_plan"] = frozen_injection_plan
+            item["registry_version"] = registry_version
+            if _frozen_scheme:  # #149 — host launch-vm.sh:506 读 .Item.scheme 分派解密
+                item["scheme"] = _frozen_scheme
         if tenant_user_id:  # task #13/#14 — external user attribution
             item["tenant_user_id"] = tenant_user_id
         if platform_id:  # #106 — external-platform attribution (筛租户用)
@@ -1214,6 +1338,11 @@ def create_tenant(body=None, event=None):
         item["security"] = security
     if injected_credentials:  # #118/#116 — platform-injected credential ciphertext
         item["injected_credentials"] = injected_credentials
+    if frozen_injection_plan:  # tenant-credential-contract Task 3.5
+        item["frozen_injection_plan"] = frozen_injection_plan
+        item["registry_version"] = registry_version
+        if _frozen_scheme:  # #149 — host launch-vm.sh:506 读 .Item.scheme 分派解密
+            item["scheme"] = _frozen_scheme
     if tenant_user_id:  # task #13/#14 — external user attribution
         item["tenant_user_id"] = tenant_user_id
     if platform_id:  # #106 — external-platform attribution (筛租户用)
@@ -1351,7 +1480,7 @@ def create_tenant(body=None, event=None):
         litellm_vkey=tenant_vkey or "",  # task #15 per-tenant billing key
         channel_secret=channel_secret,  # mint-up-front (kills hub handshake race)
         chat_endpoint_enabled=chat_endpoint_enabled,  # per-tenant chatCompletions
-        gateway_token_ct=gateway_token_ct,  # #187 P1 — pre-minted gateway token ciphertext
+        gateway_token_ct=gateway_token_ct,  # #187 P1 — SPEC/11-ENGINE-TRANSFORM D
         device_paired_b64=device_paired_b64,  # #188 — paired.json 冷注入(免 approve)
     )
     # loop 2026-07-01 bugfix: launch-vm's SSM SendCommand can be throttled when
@@ -1548,7 +1677,7 @@ def delete_tenant(tenant_id, query_params, event=None):
     # #187 转型:legacy_alb rule 已删,数据面走两级路由,无需再摘 per-tenant ALB rule。
 
     if host_id:
-        # 销毁租户 → 回收数据面路由(2026-07-08:delete 可移除路由,stop 保留)。
+        # 销毁租户 → 回收数据面路由(Abel 2026-07-08:delete 可移除路由,stop 保留)。
         # DNAT 规则删除的 argv 必须与 host-agent route_ops.dnat_rule_args 加规则时
         # 完全一致(无 `-i <iface>` 前缀)——旧代码带 `-i` 前缀,与 route_ops 无 `-i`
         # 的规则不匹配,`iptables -D` 删不掉,DNAT 规则永久泄漏在 PREROUTING 链里,
@@ -1563,6 +1692,15 @@ def delete_tenant(tenant_id, query_params, event=None):
                 f"-j DNAT --to-destination {_gip}:{clients.VM_PORT_BASE} "
                 f"2>/dev/null || true",
             )
+        # #134 修:delete 显式清 Redis route:{tenant} 键(contract §8 要求,原实现漏了 →
+        # edge 仍缓存指向已删 VM 的 host:port,DNAT 已摘 → 502)。控制面无 Redis 客户端,
+        # 经 SSM 调 host 上 route_ops.py CLI(host 在 VPC 内、有 ENGINE_REDIS_ENDPOINT)。
+        # best-effort:host-agent 的 orphan-reap 也会补删(双保险)。
+        ssm_dispatch._ssm_run(
+            host_id,
+            f"set -a; . /etc/environment 2>/dev/null; . /etc/platform.env 2>/dev/null; set +a; "
+            f"python3 /opt/openclaw/route_ops.py del-route {tenant_id} 2>/dev/null || true",
+        )
 
         if not keep_data:
             ssm_dispatch._ssm_run(host_id, f"rm -rf /data/firecracker-vms/{tenant_id}")
@@ -2378,3 +2516,105 @@ def tenant_resize(tenant_id, body):
             "delta": delta,
         },
     )
+
+
+def get_tenant_credentials(tenant_id, event=None):
+    """Task 4.3 — GET /tenants/{id}/credentials 服务逻辑。
+
+    有 enabled Recipient_Public_Key → grouped claw_credentials(enc/gateway/device);
+    无 → legacy flat(kms_encrypted/kms_key_arn/items)。非 running → 404。
+    凭据是全响应里最敏感的资源,owner==caller/admin 门与 get_tenant 同款(#80 IDOR)。
+    """
+    from services.recipient_key_service import get_current_key
+    from core.envelope import encrypt_outbound
+
+    item = clients.tenants_table.get_item(Key={"id": tenant_id}).get("Item")
+    if not item:
+        return utils._err(404, "NOT_FOUND", f"tenant {tenant_id} not found")
+    denied = auth._assert_owner_or_admin(item, event or {})
+    if denied is not None:
+        return denied
+    if item.get("status") != "running":
+        return utils._err(
+            404,
+            "NOT_FOUND",
+            f"tenant {tenant_id} is not running (status={item.get('status')})",
+        )
+
+    # 读 gateway token + device identity
+    gw_ct = read_gateway_token_ct(tenant_id)
+    device = read_device_identity(tenant_id)
+
+    recipient_key = get_current_key()
+    if recipient_key and recipient_key.get("enabled", False):
+        # Grouped 形态: sensitive 字段经 recipient 公钥加密
+        pem = recipient_key["public_key_pem"]
+        key_id = recipient_key["key_id"]
+        key_version = recipient_key["version"]
+
+        # gateway token: 需要先解密 KMS 密文再用 recipient key 重新加密
+        gw_enc = None
+        if gw_ct:
+            try:
+                from core import kms_envelope
+
+                gw_plain = kms_envelope.decrypt_with_tenant(gw_ct, tenant_id)
+                gw_plain_str = (
+                    gw_plain.decode() if isinstance(gw_plain, bytes) else gw_plain
+                )
+                gw_enc = encrypt_outbound(gw_plain_str, pem, "gateway.token", key_id)
+            except Exception:
+                gw_enc = None  # fallback: 解密失败不阻塞,返 legacy
+
+        # device private key: 需要先解密再重新加密
+        # (read_device_identity 返回的键名是 private_key,值是 KMS 密文——见其 docstring)
+        dev_privkey_enc = None
+        if device and device.get("private_key"):
+            try:
+                from core import kms_envelope
+
+                owner_id = item.get("owner_id", "")
+                pk_plain = kms_envelope.decrypt(device["private_key"], owner_id)
+                pk_plain_str = (
+                    pk_plain.decode() if isinstance(pk_plain, bytes) else pk_plain
+                )
+                dev_privkey_enc = encrypt_outbound(
+                    pk_plain_str, pem, "device.private_key", key_id
+                )
+            except Exception:
+                dev_privkey_enc = None
+
+        if gw_enc is None and dev_privkey_enc is None:
+            # 解密全失败,fallback to legacy
+            pass
+        else:
+            creds = {
+                "claw_credentials": {
+                    "enc": {
+                        "scheme": "asymmetric-v1",
+                        "recipient_key_id": key_id,
+                        "algorithm": "RSA_4096_OAEP_SHA256",
+                        "key_version": key_version,
+                    },
+                    "gateway": {"token": gw_enc or ""},
+                    "device": {
+                        "id": device["device_id"] if device else "",
+                        "public_key": device["public_key"] if device else "",
+                        "private_key": dev_privkey_enc or "",
+                        "scopes": device.get("scopes", list(_DEVICE_SCOPES_DEFAULT))
+                        if device
+                        else list(_DEVICE_SCOPES_DEFAULT),
+                    },
+                }
+            }
+            return utils._resp(200, creds)
+
+    # Legacy flat 形态(无 recipient key)
+    legacy = {}
+    if gw_ct and clients.CLAWPOOL_CMK_ARN:
+        legacy = {
+            "kms_encrypted": True,
+            "kms_key_arn": clients.CLAWPOOL_CMK_ARN,
+            "items": {"gateway_token": gw_ct},
+        }
+    return utils._resp(200, legacy)

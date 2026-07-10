@@ -1,10 +1,8 @@
 # 控制面 API 对接文档
 
-> **2026-07-08 数据面转型说明**:本文数据面 hub 令牌兑换(`{HUB}/hub/token`、`/channel-token`、`/hub/ws`)与 Cognito 数据面身份已被 [第 13 章 · 数据面两级路由](13-data-plane-redesign.md) 代替。当前数据面走 gateway 两级路由(浏览器 → 平台后端 → CloudFront → ALB → OpenResty 边缘 ASG → 宿主 iptables DNAT → microVM 原生 gateway),实时聊天接入以第 13 章为准。控制面 REST API(`{BASE}` 系列端点)仍然有效。
-
 本节面向要把本平台集成进自有系统的对接方(客户后端 / 运营控制台 / 自动化脚本)。每个接口示例均经真实调用验证(直接对部署环境 curl,响应为真机返回、凭据已脱敏)。照本节从「创建租户 → 查到运行中 → 实时通道发消息 → 收到回复」可顺序跑通全链路。
 
-> 本文所有 `{BASE}` 指控制面 API 网关地址(形如 `https://<api-id>.execute-api.<region>.amazonaws.com/v1`,部署后由 `console/config.js` 的 `OC_DEFAULT_API_URL` 给出)。`{HUB}` 指数据面 hub 的对外地址(经 CloudFront `/hub/*` 反代)(旧数据面链路,见 [第 13 章](13-data-plane-redesign.md) 转型说明)。真实账号 ID / 域名 / 凭据请以你自己的部署为准,本文用占位符。
+> 本文所有 `{BASE}` 指控制面 API 网关地址(形如 `https://<api-id>.execute-api.<region>.amazonaws.com/v1`,部署后由 `console/config.js` 的 `OC_DEFAULT_API_URL` 给出)。`{HUB}` 指数据面 hub 的对外地址(经 CloudFront `/hub/*` 反代)。真实账号 ID / 域名 / 凭据请以你自己的部署为准,本文用占位符。
 
 > **字段级契约** 本文是人读的端点参考;逐字段(类型 / 必填 / 默认 / 枚举 / 正则 / 敏感)机器可校验的真相源是同目录 `openapi.yaml`(OpenAPI 3.1,37 路径),可用 `swagger.html` 本地浏览(`cd docs/aws-guide && python3 -m http.server`,浏览器开 `swagger.html`)。下文各端点标注的 `openapi.yaml <operationId>` 即对应条目。
 
@@ -438,4 +436,4 @@ curl -s -H "x-api-key: $KEY" "$BASE/tenants/quickstart-xxxx"
 | `{HUB}/hub/ws`                                         | WSS            | 前端短 token                 | 实时对话                                                                                         |
 | `{HUB}/files/upload-url` `/download-url`               | POST/GET       | hub token                    | 文件预签(租户段守卫)                                                                             |
 
-> 验证来源:控制面路由与 RBAC 分级来自 `deploy/lambda/api/handler.py` 路由表(`routes` 字典)+ `_VIEWER_OK`/`_RBAC_SKIP`/`_rbac_check` 定义;端点行为经真机 curl 部署环境验证;hub/wss 参数来自旧数据面 hub 源(已随转型下线,当前数据面见第 13 章)。分页页大小语义、AgentCore 工具清单以实际部署配置为准。
+> 验证来源:控制面路由与 RBAC 分级来自 `deploy/lambda/api/handler.py` 路由表(`routes` 字典)+ `_VIEWER_OK`/`_RBAC_SKIP`/`_rbac_check` 定义;端点行为经真机 curl 部署环境验证;hub/wss 参数来自 `SPEC/03-HUB-SPEC.md` + `deploy/hub/server.mjs`。分页页大小语义、AgentCore 工具清单以实际部署配置为准。

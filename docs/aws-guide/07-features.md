@@ -4,13 +4,13 @@
 
 ## 平台核心与业务样本的分层
 
-该解决方案的平台核心与具体业务解耦。控制面（AWS Lambda 与 Amazon DynamoDB）、数据面两级边缘路由（OpenResty 边缘 ASG + 宿主 iptables DNAT，路由到各 microVM 内 OpenClaw 原生 gateway）、宿主生命周期脚本本身不包含任何业务内容，只负责预配并管理大规模隔离的 AI agent microVM。每台虚拟机运行什么 agent，由一个可替换的样本决定：构建脚本通过 `SAMPLE` 环境变量选择样本，默认 `finance-agent`，更换样本目录即更换整套 agent 能力，平台核心不变。
+该解决方案的平台核心与具体业务解耦。控制面（AWS Lambda 与 Amazon DynamoDB）、数据面 WebSocket 中枢（claw-hub）、宿主生命周期脚本本身不包含任何业务内容，只负责预配并管理大规模隔离的 AI agent microVM。每台虚拟机运行什么 agent，由一个可替换的样本决定：构建脚本通过 `SAMPLE` 环境变量选择样本，默认 `finance-agent`，更换样本目录即更换整套 agent 能力，平台核心不变。
 
 随仓库发布的 `finance-agent` 样本是一个**最小骨架**：它演示样本该怎么组织（身份人设 `persona/`、能力技能 `skills/`、标配护栏 `security/`、部署配置 `config/`），但只带一个 `weather` 演示技能,把「业务能力」这一层留给部署方按自己的场景填充。这样开源发布物里不预置任何特定行业的业务技能,平台核心与安全层则完整可用。
 
 **标配安全层（每个样本都带,平台保证）**
 
-每个样本镜像都自带两类护栏(在 `security/` 下),不随业务技能增减:`sentinel-guard`(工具执行层 ACL,default-deny 拦读凭据/IMDS/敏感路径)、`acl-guard`(命令白名单)。叠加只读黄金镜像(EROFS)、auditd 与文件完整性监控。这层是 L2 工具护栏与 L5 只读/监控的落地,详见架构安全章。
+每个样本镜像都自带两类护栏(在 `security/` 下),不随业务技能增减:claw-channel 出站通信、`sentinel-guard`(工具执行层 ACL,default-deny 拦读凭据/IMDS/敏感路径)、`acl-guard`(命令白名单)。叠加只读黄金镜像(EROFS)、auditd 与文件完整性监控。这层是 L2 工具护栏与 L5 只读/监控的落地,详见架构安全章。
 
 **演示技能与供应链治理**
 
@@ -41,7 +41,7 @@
 | 宿主管理           | 注册、列出、下线宿主；刷新黄金镜像；查询镜像版本                         | `POST /hosts`、`POST /hosts/refresh-rootfs`         |
 | 技能分发           | 技能分组增删、技能定义读写删、按租户或分组的技能范围控制                 | `GET/POST /groups`、`GET/PUT/DELETE /skills/{name}` |
 | 系统与审计         | 特性快照、AgentCore 状态与工具、审计日志（默认保留 90 天）               | `GET /system/info`、`GET /audit-log`                |
-| 实时聊天           | 经两级边缘路由到 microVM 原生 gateway（Bearer `gateway_token` 鉴权）     | `POST /ws/{tenant_id}/v1/chat/completions`（SSE）   |
+| 实时聊天           | 消息签名（HMAC）、出图看图预签名 URL                                     | hub `/token`、`/ws`、`/files/*`                     |
 
 > **Note**
 >

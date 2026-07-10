@@ -7,7 +7,7 @@
 # 抽出来是为了两件事:
 #   ① build-rootfs.sh 的 immutable/data 两条路径复用同一份 strip+assert 逻辑,
 #      避免谓词漂移(此前 immutable 断言的 *.pyc 缺 -type f,与 strip 侧不一致)。
-#   ② 可以直接 subprocess 跑真 bash,验证
+#   ② 让 tests/test_image_hygiene.py 可以直接 subprocess 跑真 bash,验证
 #      "谓词、返回码、fail-loud 行为"的实际字节层,而不是 Python 复刻近似断言。
 #
 # 三个函数,POSIX-friendly(bash source 用):

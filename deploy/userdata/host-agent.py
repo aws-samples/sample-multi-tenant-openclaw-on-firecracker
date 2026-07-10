@@ -21,7 +21,7 @@ from botocore.config import Config as BotoConfig
 # P2b (2026-07-08): route_ops lives in the same userdata directory. Add it to
 # sys.path so the tenant-route helpers (port bitmap / DNAT / Redis writer /
 # drift reconcile) resolve when host-agent runs as a systemd ExecStart from
-# /opt/openclaw/.
+# /opt/openclaw/. See project interface spec §1/§3/§4/§6/§8.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import route_ops  # noqa: E402
 
@@ -479,7 +479,10 @@ def _probe_all():
                         "/dev/null",
                         "--connect-timeout",
                         "3",
-                        f"http://{guest_ip}:{GATEWAY_PORT}/",
+                        # gateway 对 / 返回 404(无内容是预期),curl -f 把 404 当失败
+                        # → app_health 误判 down(健康 gateway 亮红灯)。探 /healthz(gateway
+                        # 起来即 200),-f 才反映真实存活。实测:/ =404、/healthz =200。
+                        f"http://{guest_ip}:{GATEWAY_PORT}/healthz",
                     ],
                     capture_output=True,
                     timeout=8,
@@ -1172,6 +1175,14 @@ def _reap_orphan_firecrackers():
                     print(f"overwatcher: removed orphan nginx route {orphan_tid}")
                 except Exception:
                     pass
+            # #134 修:孤儿(含 delete 后残留)也要清 Redis route: 键——否则 edge 仍
+            # 缓存指向已删 VM 的 host:port(DNAT 已被控制面摘,连接 refused/502)。
+            # _release_route 无条件 del_route(tenant),port=None 时跳过 DNAT(delete 已摘)。
+            try:
+                _release_route(orphan_tid, None, "")
+                print(f"overwatcher: released redis route {orphan_tid}")
+            except Exception as e:
+                print(f"overwatcher: release route {orphan_tid} failed: {e}")
             reaped += 1
         except Exception as e:
             print(f"overwatcher: reap pid={pid} failed: {e}")

@@ -4,12 +4,12 @@
 
 """Host-side routing operations for the P2 two-tier data plane.
 
-Routing contract shared with the edge:
-    - Redis key schema (`route:{tenant_id}` -> JSON host/port/guest_ip/updated_at)
-    - Port bitmap 10000-10400 + iptables DNAT (atomic three-step)
-    - DDB descriptor fields (host_private_ip, host_port, guest_ip)
-    - HA self-recovery (Redis write fails degrade, DDB is authority)
-    - Redis failover (primary endpoint, DNS TTL re-resolve, no infinite pool)
+Contract: see project interface spec.
+    §1 Redis key schema (`route:{tenant_id}` -> JSON host/port/guest_ip/updated_at)
+    §3 Port bitmap 10000-10400 + iptables DNAT (atomic three-step)
+    §4 DDB descriptor fields (host_private_ip, host_port, guest_ip)
+    §6 HA self-recovery (Redis write fails degrade, DDB is authority)
+    §8 Redis failover (primary endpoint, DNS TTL re-resolve, no infinite pool)
 
 Kept as a thin module: pure functions where possible, one class per stateful
 concern, small enough to reason about. host-agent.py wires it in at promotion.
@@ -18,6 +18,7 @@ concern, small enough to reason about. host-agent.py wires it in at promotion.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import threading
@@ -442,3 +443,28 @@ def reconcile_drift(
         "missing_dnat": missing_dnat,
         "ghost_descriptor": ghost_descriptor,
     }
+
+
+# ─── CLI(#134 修:让控制面 delete 经 SSM 精确清 Redis route: 键)───
+# 控制面 Lambda 不在 VPC 内、无 Redis 客户端,delete 只摘了 host DNAT 却漏了 Redis
+# route: 键(contract §8:delete MUST 显式 DEL,原实现漏了 → edge 缓存指向已删 VM)。
+# host 在 VPC 内、有 ENGINE_REDIS_ENDPOINT,delete 时由控制面发一条 SSM 调本 CLI 补删。
+# 只按 tenant_id 删自己那一条(不碰 DNAT/port,无端口 shadow 风险)。
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) >= 3 and sys.argv[1] == "del-route":
+        _tid = sys.argv[2]
+        _ep = os.environ.get("ENGINE_REDIS_ENDPOINT", "")
+        if not _ep:
+            print("del-route: no ENGINE_REDIS_ENDPOINT — skip (Redis 未接线)")
+            sys.exit(0)
+        _w = RedisRouteWriter(
+            primary_endpoint=_ep,
+            port=int(os.environ.get("ENGINE_REDIS_PORT", "6379")),
+        )
+        ok = _w.del_route(_tid)
+        print(f"del-route {_tid}: {'ok' if ok else 'degraded(fail-open)'}")
+        sys.exit(0)
+    print("usage: route_ops.py del-route <tenant_id>")
+    sys.exit(2)

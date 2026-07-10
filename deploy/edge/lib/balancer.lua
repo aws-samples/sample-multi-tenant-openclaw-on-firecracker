@@ -1,7 +1,7 @@
 -- deploy/edge/lib/balancer.lua
 --
 -- balancer_pick — pick the upstream peer for the current request.
--- Two branches per the routing contract:
+-- Two branches per INTERFACE-CONTRACT §2:
 --   local  descriptor.host == self_ip  → connect guest_ip:18789 directly
 --   remote                             → connect host:port (peer's DNAT)
 --

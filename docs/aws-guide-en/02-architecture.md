@@ -4,7 +4,7 @@ This section describes the reference architecture of this solution, the high-lev
 
 ## Architecture diagram
 
-Deploying this solution with the default parameters builds the following components in your AWS account. The delivery-level architecture comprises three areas: the data plane (end users flow through Amazon CloudFront → Application Load Balancer → OpenResty edge Auto Scaling group with a Redis route table → host iptables PREROUTING DNAT → the OpenClaw-native gateway inside the virtual machine), the control plane (fully managed and serverless, orchestrating the full tenant lifecycle), and the L1-through-L5 defense-in-depth boundaries. The numbered flow below and the component descriptions in Architecture details cover each of these areas.
+Deploying this solution with the default parameters builds the following components in your AWS account. The delivery-level architecture comprises three areas: the data plane (end users flow through Amazon CloudFront → Application Load Balancer → WebSocket hub → outbound channel connection inside the virtual machine), the control plane (fully managed and serverless, orchestrating the full tenant lifecycle), and the L1-through-L5 defense-in-depth boundaries. The numbered flow below and the component descriptions in Architecture details cover each of these areas.
 
 > **Note**
 >
@@ -12,7 +12,7 @@ Deploying this solution with the default parameters builds the following compone
 
 > **Note**
 >
-> The AWS resources of this solution are created based on AWS Cloud Development Kit (AWS CDK) constructs. At deployment time, the AWS CDK synthesizes an AWS CloudFormation template and manages the lifecycle of the resources. The rendered diagram may still show the legacy WebSocket hub; that component has been removed. The authoritative data-plane flow is the two-tier edge route described in the text below: an OpenResty edge Auto Scaling group behind the Application Load Balancer resolves each tenant's route from a Redis route table and forwards to the tenant's virtual machine through host iptables DNAT.
+> The AWS resources of this solution are created based on AWS Cloud Development Kit (AWS CDK) constructs. At deployment time, the AWS CDK synthesizes an AWS CloudFormation template and manages the lifecycle of the resources. The Amazon EKS WebSocket cluster shown in the diagram is a multi-replica target state (production currently runs a single-process hub, and the phased rollout has not yet switched over; see Architecture details).
 
 The components of the solution deployed by the AWS CloudFormation template follow this high-level flow.
 
@@ -22,15 +22,15 @@ The components of the solution deployed by the AWS CloudFormation template follo
 
 3. The hosts (Amazon EC2 bare metal instances) are managed by an Amazon EC2 Auto Scaling group. After a new host starts, it bootstraps itself, downloads the read-only golden image, registers into the host table, and starts a Firecracker microVM for each tenant on top of KVM.
 
-4. Before each microVM starts, the host script cold-injects identity, skills, and tenant-specific configuration (gateway_token, billing virtual key) to disk. The microVM mounts the read-only golden image disk and is a finished product at boot. This step is entirely completed before the Firecracker `InstanceStart`, corresponding to "zero runtime operations."
+4. Before each microVM starts, the host script cold-injects identity, skills, and tenant-specific configuration (channel key, billing virtual key) to disk. The microVM mounts the read-only golden image disk and is a finished product at boot. This step is entirely completed before the Firecracker `InstanceStart`, corresponding to "zero runtime operations."
 
-5. End users access the chat interface through a browser or frontend, which reaches the platform back end and then Amazon CloudFront. CloudFront serves as the single public entry point, originating to the Application Load Balancer (least-outstanding-requests), which forwards to the OpenResty edge Auto Scaling group.
+5. End users access the chat interface through a browser or frontend by way of Amazon CloudFront. CloudFront serves as the single public entry point, originating to the Application Load Balancer, which then forwards to the self-hosted WebSocket hub claw-hub.
 
-6. The OpenResty edge Auto Scaling group looks up the tenant's route in a Redis route table, backed by three cache tiers: an L1 lrucache (5s), an L2 shared_dict (60s), and L3 Amazon ElastiCache. The resolved route identifies the host and port that front the tenant's virtual machine.
+6. End user sign-in uses the Amazon Cognito OAuth 2.0 authorization code flow (with PKCE), and can optionally federate external identity providers through OpenID Connect. claw-hub takes the Cognito-issued token as a prerequisite, and after verification performs an explicit tenant authorization check before issuing a short-lived hub token.
 
-7. Host iptables PREROUTING DNAT (ports 10000-10400) forwards the request to the OpenClaw-native gateway on the virtual machine's `:18789`. The gateway authenticates the request solely with the tenant's `gateway_token` (`Authorization: Bearer`); the gateway's controlUi is disabled. The sole data-plane credential is a per-tenant, AWS KMS envelope-encrypted `gateway_token` (`EncryptionContext={tenant_id}`), whose ciphertext is stored in Amazon DynamoDB with a 15-minute TTL and cold-injected by `launch-vm.sh`; the control-plane API Lambda holds no `kms:Decrypt` permission.
+7. The channel client inside the virtual machine (claw-channel) dials out a WebSocket connection to claw-hub on its own initiative and opens no inbound ports on the virtual machine. claw-hub pairs the frontend request with the virtual machine's outbound connection by tenant, routing chat messages to the corresponding tenant's agent.
 
-8. Media and image handling (for example, upload and download via Amazon Simple Storage Service presigned URLs) is out of scope of the current sample chat demo, which exchanges text messages only.
+8. Image generation and image viewing use Amazon Simple Storage Service (Amazon S3) presigned URLs: claw-hub is the only component that holds S3 access permissions. The virtual machine requests presigned URLs through claw-hub to upload or download media files, converging the blast radius of S3 access to a single place.
 
 9. Key events of the control plane and data plane are recorded as metrics and logs through Amazon CloudWatch; host probes expose Prometheus metrics for the monitoring platform to collect; security-related events can be aggregated into a unified alerting channel through Amazon GuardDuty and Amazon EventBridge (disabled by default, enabled on demand).
 
@@ -53,7 +53,7 @@ This section describes how this solution applies the principles and best practic
 
 This section describes how this solution applies the principles and best practices of the Security pillar.
 
-- This solution uses Amazon Cognito as the single root of trust for control-plane identity; the control plane accepts only tokens verified by Cognito, and downgrades to least privilege (read-only) whenever verification fails. The data plane does not use Cognito; it authenticates each tenant with a per-tenant `gateway_token`.
+- This solution uses Amazon Cognito as the single root of trust for identity; both the control plane and the data plane accept only tokens verified by Cognito, and downgrade to least privilege (read-only) whenever verification fails.
 - This solution enables role-based access control (RBAC) by default, enforcing per-route role checks and resource ownership checks.
 - This solution provisions a dedicated-kernel Firecracker microVM for each tenant, and drops cross-tenant east-west traffic at host iptables, as well as traffic from the virtual machine to the Instance Metadata Service (IMDS) and to host management ports.
 - The agent tool execution layer of this solution vetoes dangerous actions such as credential exfiltration and sensitive file reads before the tool actually executes, and the content layer intercepts jailbreaks and harmful content through Amazon Bedrock Guardrails.

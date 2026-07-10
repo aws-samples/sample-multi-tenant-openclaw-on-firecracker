@@ -4,10 +4,10 @@
 -- that nginx.conf wires into rewrite / access / balancer / init_worker.
 -- Each phase is a thin dispatcher — logic lives in edge.lib.*.
 --
--- Shares a data contract with host-agent + the IaC layer.
+-- Data contract with host-agent + iac-dev: see project interface spec.
 --
 -- Do not add business logic here. Keep this file the "entry only, routes to
--- domain" boundary.
+-- domain" boundary per .claude/rules/code-craft-discipline.md.
 
 local tenant_mod   = require "edge.lib.tenant"
 local backend_mod  = require "edge.lib.backend"
@@ -18,7 +18,7 @@ local _M = { _VERSION = "0.02" }
 
 -- Warmup gate: /healthz reads this and returns 503 until the async probe
 -- below succeeds. Prevents ASG rotating traffic into a cold instance
--- whose Redis connection has not yet been proven.
+-- whose Redis connection has not yet been proven (INTERFACE-CONTRACT §6).
 local function mark_ready()
     local flag = ngx.shared.edge_ready
     if flag then flag:set("ready", 1) end

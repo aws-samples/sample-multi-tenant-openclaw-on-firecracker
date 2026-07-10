@@ -1,10 +1,8 @@
 # 开发人员指南
 
-> **2026-07-08 数据面转型说明**:本章的实时聊天接入部分——`claw-hub` / `claw-channel` 出站拨号、Cognito 三处身份、`/hub/token` `/hub/ws`、HMAC channel_secret——已被 [第 13 章 · 数据面两级路由](13-data-plane-redesign.md) **完全代替**(客户 OIDC 不支持无浏览器登录,故弃用 Cognito 与出站拨号中枢,改用 OpenClaw 原生 gateway 认证)。控制面 REST API 部分仍然有效。实时聊天的当前接入方式以第 13 章为准。
-
 本节面向需要以编程方式与该解决方案交互的开发人员，覆盖认证模型、控制面 REST API、实时聊天接入与授权模型。
 
-该解决方案对外提供两个接入面：控制面 REST API（租户注册、生命周期、备份、注销等管理操作）和实时聊天链路。实时聊天链路当前采用两级边缘路由到 microVM 内 OpenClaw 原生 gateway（详见 [第 13 章 · 数据面两级路由](13-data-plane-redesign.md)）；控制面 REST API 的信任根是 Amazon Cognito。下文「实时聊天接入」及令牌流程小节描述的 `claw-hub` / `claw-channel` 出站拨号中枢模型已被第 13 章代替，仅作历史参考保留。
+该解决方案对外提供两个接入面：控制面 REST API（租户注册、生命周期、备份、注销等管理操作）和实时聊天链路（浏览器 ↔ 聊天中枢 `claw-hub` ↔ 租户 microVM 内 `claw-channel` 的 WebSocket 双向通道）。两个接入面共享同一信任根 Amazon Cognito，但落在两个相互正交的验签平面上。
 
 > **Note**
 >
@@ -25,7 +23,7 @@
 在信任根之上有两个正交的认证平面：
 
 - **控制面平面（REST API）**：使用 Amazon Cognito id_token 的 Bearer 凭证加 RBAC。
-- **聊天平面（`claw-hub`）**：内部分为聊天前端 token 与聊天通道 token 两种，各自独立验签；前端 token 的发行同样以 Cognito id_token 验签为前提。（旧数据面 hub 模型,已被 [第 13 章](13-data-plane-redesign.md) 代替,以下描述仅作历史参考。）
+- **聊天平面（`claw-hub`）**：内部分为聊天前端 token 与聊天通道 token 两种，各自独立验签；前端 token 的发行同样以 Cognito id_token 验签为前提。
 
 > **Note**
 >

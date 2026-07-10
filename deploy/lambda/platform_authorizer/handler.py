@@ -4,7 +4,7 @@
 """#108 — REQUEST Lambda authorizer: 把「这把 API key 属于哪个平台」解析成
 requestContext.authorizer.platform_id,注入给控制面 handler 做命名空间隔离。
 
-为什么需要它(承重约束,见 (internal design docs)):API Gateway Lambda proxy
+为什么需要它(承重约束,见项目设计记录):API Gateway Lambda proxy
 集成下,只有配了 authorizer 时 requestContext.authorizer.* 才会传给后端;纯
 usage-plan API key(仅 api_key_required)拿不到「keyId→平台」的可信映射。所以平台
 身份必须由这个 REQUEST authorizer 解析并注入,handler 只信注入值(不读 x-api-key

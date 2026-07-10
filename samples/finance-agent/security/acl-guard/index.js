@@ -12,7 +12,6 @@
 // line 121: "before_tool_call — rewrite tool params, block execution, or require
 // approval"): handler gets { toolName, params, ctx }, returns
 // { block: true, blockReason } to veto.
-import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
@@ -111,7 +110,7 @@ function logDeny(entry) {
   }
 }
 
-export default definePluginEntry({
+export default {
   id: "acl-guard",
   name: "ACL Guard",
   description:
@@ -153,4 +152,4 @@ export default definePluginEntry({
       { priority: 1000 }, // run before any other tool hook
     );
   },
-});
+};

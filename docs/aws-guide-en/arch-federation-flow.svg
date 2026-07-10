@@ -5,9 +5,8 @@
     <marker id="arrData" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L7,3 L0,6 Z" fill="#ec7211"/></marker>
   </defs>
 
-  <text x="40" y="42" font-size="27" font-weight="700" fill="#16233a">External SaaS Platform Integration &#183; End-to-End Auth &amp; Data-Plane Chat Sequence (legacy model)</text>
+  <text x="40" y="42" font-size="27" font-weight="700" fill="#16233a">External SaaS Platform Integration &#183; End-to-End Auth &amp; Data-Plane Chat Sequence</text>
   <text x="40" y="70" font-size="15" fill="#5a6b85">Tier-A federation &#183; backend brokered tenant provisioning &#183; per-user isolated openclaw &#183; Cognito as single trust root &#183; self-registration disabled</text>
-  <text x="40" y="94" font-size="13" font-weight="700" fill="#b3261e">&#9888; Superseded: the Cognito federation + hub token + channel data plane shown here is the old model; the current data plane uses the gateway two-tier route &#8212; see 13-data-plane-redesign.md</text>
 
   <rect x="30" y="120" width="1700" height="300" fill="#ece1fb" opacity="0.30"/>
   <rect x="30" y="420" width="1700" height="336" fill="#fde9d6" opacity="0.30"/>
@@ -124,7 +123,7 @@
   </g>
 
   <g font-size="11" fill="#6b7a92">
-    <text x="44" y="1502">Flow: hub endpoints / token issuance / wss frames, incl. JWKS verify, token minting, and message matching; control plane POST /tenants (broker path)</text>
+    <text x="44" y="1502">Source (first-hand file:line): hub endpoints/token/wss frames SPEC/03-HUB-SPEC.md &#167;1-5 + server.mjs:249-267 (JWKS verify)/402-472 (token)/623-772 (matching); control plane POST /tenants (broker path)</text>
     <text x="44" y="1520">+ owner gating handler.py + Pre-Token-Gen/TenantTable/multi-IdP federation modeled on aws-samples/amazon-cognito-example-for-multi-tenant (cloned to opensource/); chat frontend reuses existing console/chat (Hosted UI + PKCE federation ready).</text>
     <text x="44" y="1538" fill="#c15c14">Note: user self-registration disabled (/tenants/self exists but unused in this flow), tenants brokered by platform backend; chat UI embedded in customer domain in production, not a standalone domain. custom claim/federation/Pre-Token-Gen are Tier-A pending items; currently single Cognito Pool direct, no external IdP wired.</text>
   </g>

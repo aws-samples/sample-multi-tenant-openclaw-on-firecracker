@@ -6,8 +6,8 @@ OpenClaw on Firecracker 多租户 AI Agent 平台可帮助您在 AWS 上为成�
 
 - 为每个租户预配一台独立内核的 Firecracker microVM，在虚拟机级别隔离租户之间的内存、CPU 与内核。
 - 将身份、技能、配置在虚拟机启动前冷注入到只读黄金镜像，虚拟机启动即为成品，运行后控制面不向其注入任何业务数据。
-- 通过两级边缘路由（OpenResty 边缘 ASG 查 Redis 路由表 → 宿主 iptables DNAT）将浏览器或前端的实时聊天请求按租户路由到对应虚拟机内的 OpenClaw 原生 gateway。
-- 以 Amazon Cognito 作为控制面与控制台的身份信任根，对控制面的所有访问统一验签，验签失败一律降级到最小权限；数据面则以每租户 gateway_token 作为唯一凭据。
+- 通过自建 WebSocket 中枢（claw-hub）将浏览器或前端的实时聊天请求按租户路由到对应虚拟机内的 OpenClaw agent。
+- 以 Amazon Cognito 作为唯一身份信任根，对控制面与数据面的所有访问统一验签，验签失败一律降级到最小权限。
 - 叠加五层纵深防护：内容层、工具执行层、身份层、网络层、凭据与只读监控层，每一层都落实到部署代码或设备，不依赖模型自律。
 
 本实施指南概述了 OpenClaw on Firecracker 多租户 AI Agent 平台解决方案的参考架构与组件、部署规划注意事项，以及将该解决方案部署到 Amazon Web Services (AWS) 云的配置步骤。它面向在 AWS 云中具有架构实践经验的平台工程师、安全评审人员、运维工程师与应用开发人员。
@@ -46,15 +46,15 @@ OpenClaw on Firecracker 多租户 AI Agent 平台可帮助您在 AWS 上为成�
 
 **统一身份信任根**
 
-该解决方案以 Amazon Cognito 作为控制面与控制台的身份信任根，控制面只接受 Cognito 签发并验签通过的令牌，外部身份提供方可通过 OpenID Connect (OIDC) 联合进同一个 Cognito 用户池。数据面不使用 Cognito，改以每租户 gateway_token 作为唯一凭据，由 OpenClaw 原生 gateway 校验。
+该解决方案以 Amazon Cognito 作为唯一身份信任根，控制面与数据面均只接受 Cognito 签发并验签通过的令牌。外部身份提供方通过 OpenID Connect (OIDC) 联合进同一个 Cognito 用户池，对数据面透明。
 
 **无服务器控制面**
 
 该解决方案的注册、生命周期、健康检查、备份、扩缩容逻辑由 AWS Lambda、Amazon DynamoDB 与 Amazon API Gateway 承载，按用量付费，无需运维专用服务器。
 
-**实时聊天路由（两级边缘路由）**
+**实时聊天中枢**
 
-该解决方案通过两级边缘路由承载浏览器与 agent 之间的实时聊天：OpenResty 边缘 ASG 查 Redis 路由表（L1 lrucache 5s / L2 shared_dict 60s / L3 ElastiCache）确定目标租户，宿主 iptables PREROUTING DNAT 将请求转发到对应虚拟机内 :18789 的 OpenClaw 原生 gateway，由每租户 gateway_token 完成鉴权。
+该解决方案通过自建 WebSocket 中枢（claw-hub）承载浏览器与 agent 之间的实时聊天。虚拟机内的通道客户端主动向中枢拨出连接，不在虚拟机上开放任何入站端口。
 
 **可替换的业务样本**
 
@@ -92,7 +92,7 @@ OpenClaw on Firecracker 多租户 AI Agent 平台可帮助您在 AWS 上为成�
 
 **对隔离强度有合规要求的多租户场景**
 
-在金融、企业级 SaaS 等对租户隔离与数据残留有强要求的行业，用虚拟机级隔离满足"单租户越权不外溢"的合规预期。
+在金融、交易所等对租户隔离与数据残留有强要求的行业，用虚拟机级隔离满足"单租户越权不外溢"的合规预期。
 
 **面向终端用户的 AI 助手自助开通**
 
@@ -128,7 +128,7 @@ OpenClaw on Firecracker 多租户 AI Agent 平台可帮助您在 AWS 上为成�
 
 **数据面（Data plane）**
 
-由 OpenResty 边缘 ASG 与宿主 iptables DNAT 构成的两级边缘路由链路：边缘查 Redis 路由表定位目标租户，宿主 DNAT 将浏览器请求转发到对应虚拟机内 :18789 的 OpenClaw 原生 gateway，由每租户 gateway_token 鉴权。
+由自建 WebSocket 中枢 claw-hub 构成的实时聊天链路，将浏览器请求按租户路由到对应虚拟机内的 agent。
 
 **纵深防护五层（Defense in depth）**
 

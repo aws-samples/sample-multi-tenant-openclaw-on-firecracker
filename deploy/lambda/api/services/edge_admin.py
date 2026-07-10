@@ -8,8 +8,10 @@
 - ``list_edge_instances()`` — ``GET /admin/edge/instances``:列 EdgeASG(P2b-iac
   合入,`auto_scaling_group_name="openclaw-edge-asg"`)实例 + ALB target health。
 - ``list_edge_metrics()`` — ``GET /admin/edge/metrics``:P4-③ 阶段返聚合骨架 +
-  ``metrics_source="stub"``;真 Prometheus 指标待观测栈接线后从 CloudWatch/AMP
-  取。**不造假数据。**
+  ``metrics_source="stub"``;真 Prometheus 指标待 P6 观测栈接线后从 CloudWatch/AMP
+  取(见 progress/p4-edge-console.md §八风险 1)。**不造假数据。**
+
+契约:04-API-SPEC §六;拆解:progress/p4-edge-console.md。
 """
 
 from __future__ import annotations
@@ -151,7 +153,7 @@ def list_edge_metrics():
     真 Prometheus 指标从 edge OpenResty ``/metrics`` 端点(deploy/edge/nginx.conf
     :164)采集,现阶段该端点只吐 ``edge_up 1`` 占位。P6 观测阶段接线 CloudWatch
     GetMetricData 或 AMP scrape 后本函数改从那读真值;api Lambda 现在不在 VPC 内,
-    直接拉 edge 私网 IP 走不通。
+    直接拉 edge 私网 IP 走不通(见 progress/p4-edge-console.md §八风险 1)。
     """
     # 先复用 list_edge_instances 的数据面(ASG + IP 列表),失败直接透传。
     inner = list_edge_instances()

@@ -82,7 +82,8 @@ fi
 # 里做),host 侧 all.forwarding=0 是纵深防御:即便某台 tap 漏配了 disable_ipv6,
 # host 不转发也守住 IPv6 IMDS fd00:ec2::254。
 sysctl -q -w net.ipv6.conf.all.forwarding=0 2>/dev/null || true
-# nf_conntrack table sizing for NFR-3: a single r8g.metal-24xl runs up to 400 microVMs, each
+# nf_conntrack table sizing for NFR-3 (INTERFACE-CONTRACT §6/§7 / 11-ENGINE-TRANSFORM
+# 01-REQUIREMENTS NFR-3): a single r8g.metal-24xl runs up to 400 microVMs, each
 # with 2-3 outbound WS + per-tap DNAT rules. Kernel default nf_conntrack_max is
 # 262144 on Ubuntu 22.04 aarch64 which the host can blow past under peak fan-in
 # well before all 400 tenants are active. Load the module first (host may not
@@ -205,6 +206,14 @@ LITELLM_HOST=$(aws ssm get-parameter --name /openclaw/litellm-host --region ${RE
   --query "Parameter.Value" --output text 2>/dev/null || echo "")
 echo "LITELLM_HOST=${LITELLM_HOST}" >> /etc/platform.env
 log "LITELLM_HOST from SSM: ${LITELLM_HOST:-<empty, set /openclaw/litellm-host=bastion internal IP>}"
+
+# CLAWPOOL_RSA_CMK_ARN:#149 asymmetric-v1 注入用。cred-inject.sh 对 scheme=asymmetric-v1
+# 的 env 凭据调 `aws kms decrypt --key-id ${CLAWPOOL_RSA_CMK_ARN} --encryption-algorithm
+# RSAES_OAEP_SHA_256`(信封里的 key_id 是逻辑名,解密需真实 ARN)。栈建 RSA CMK 时写此 SSM。
+CLAWPOOL_RSA_CMK_ARN=$(aws ssm get-parameter --name /openclaw/clawpool-rsa-cmk-arn --region ${REGION} \
+  --query "Parameter.Value" --output text 2>/dev/null || echo "")
+echo "CLAWPOOL_RSA_CMK_ARN=${CLAWPOOL_RSA_CMK_ARN}" >> /etc/platform.env
+log "CLAWPOOL_RSA_CMK_ARN from SSM: ${CLAWPOOL_RSA_CMK_ARN:+<set>}${CLAWPOOL_RSA_CMK_ARN:-<empty>}"
 
 # LITELLM_SHARED_VKEY:无专属 vkey 的租户共用的 LiteLLM virtual key(有预算上限)。镜像里
 # openclaw.json 的 apiKey 是 __INJECT_AT_DEPLOY__ 占位(CodeBuild 烤时不知道真实 key,不该
@@ -432,8 +441,7 @@ done
 
 # #187 转型:step4a2 claw-hub 本地安装已下线。数据面改两级路由直连 microVM
 # 原生 gateway(ALB LOR → OpenResty edge → Redis 查表 → host iptables DNAT →
-# microVM:18789)。install-hub.sh + deploy/hub/ 源已归档到
-# (archived)。#187 P5:CLAW_HUB_URL/CLAW_HUB_WS
+# microVM:18789)。install-hub.sh + deploy/hub/ 源已归档。#187 P5:CLAW_HUB_URL/CLAW_HUB_WS
 # env 与 stack.py 模板替换、CloudFront /hub/* behavior、HubTargetGroup 已一并删除。
 
 # Step 4b: AgentCore config (if enabled)

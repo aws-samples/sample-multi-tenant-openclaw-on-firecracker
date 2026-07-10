@@ -4,13 +4,13 @@ This section describes the capabilities that the agent of this solution can prov
 
 ## Layering of platform core and business sample
 
-The platform core of this solution is decoupled from any specific business. The control plane (AWS Lambda and Amazon DynamoDB), the data plane two-tier edge route (OpenResty edge ASG + host iptables DNAT, routing to the OpenClaw-native gateway inside each microVM), and the host lifecycle scripts themselves contain no business content; they are solely responsible for provisioning and managing isolated AI agent microVMs at large scale. The agent that runs in each virtual machine is determined by a replaceable sample: the build script selects the sample through the `SAMPLE` environment variable, defaulting to `finance-agent`. Replacing the sample directory replaces the entire set of agent capabilities without changing the platform core.
+The platform core of this solution is decoupled from any specific business. The control plane (AWS Lambda and Amazon DynamoDB), the data plane WebSocket hub (claw-hub), and the host lifecycle scripts themselves contain no business content; they are solely responsible for provisioning and managing isolated AI agent microVMs at large scale. The agent that runs in each virtual machine is determined by a replaceable sample: the build script selects the sample through the `SAMPLE` environment variable, defaulting to `finance-agent`. Replacing the sample directory replaces the entire set of agent capabilities without changing the platform core.
 
 The `finance-agent` sample published with the repository is a **minimal skeleton**: it demonstrates how a sample should be organized (identity persona `persona/`, capability skills `skills/`, standard guardrails `security/`, deployment configuration `config/`), but ships only one `weather` demonstration skill, leaving the "business capability" layer for the deployer to populate according to their own scenario. In this way, the open-source release preloads no business skills for any specific industry, while the platform core and security layer are fully usable.
 
 **Standard security layer (shipped with every sample, guaranteed by the platform)**
 
-Every sample image ships with two categories of guardrails (under `security/`) that do not vary with business skills: `sentinel-guard` (tool execution layer ACL, default-deny that intercepts reads of credentials / IMDS / sensitive paths) and `acl-guard` (command allowlist). These are layered on top of the read-only golden image (EROFS), auditd, and file integrity monitoring. This layer is the on-the-ground implementation of the L2 tool guardrails and the L5 read-only / monitoring layer; see the Architecture and security chapter for details.
+Every sample image ships with two categories of guardrails (under `security/`) that do not vary with business skills: claw-channel outbound communication, `sentinel-guard` (tool execution layer ACL, default-deny that intercepts reads of credentials / IMDS / sensitive paths), and `acl-guard` (command allowlist). These are layered on top of the read-only golden image (EROFS), auditd, and file integrity monitoring. This layer is the on-the-ground implementation of the L2 tool guardrails and the L5 read-only / monitoring layer; see the Architecture and security chapter for details.
 
 **Demonstration skill and supply chain governance**
 
@@ -41,7 +41,7 @@ Beyond the capabilities of the agent inside the virtual machine, the control pla
 | Host management                  | Register, list, decommission hosts; refresh golden image; query image version                                                | `POST /hosts`, `POST /hosts/refresh-rootfs`         |
 | Skill distribution               | Add/delete skill groups, read/write/delete skill definitions, control skill scope by tenant or group                         | `GET/POST /groups`, `GET/PUT/DELETE /skills/{name}` |
 | System and audit                 | Feature snapshot, AgentCore status and tools, audit log (retained 90 days by default)                                        | `GET /system/info`, `GET /audit-log`                |
-| Real-time chat                   | Two-tier edge route to the microVM-native gateway (Bearer `gateway_token` auth)                                              | `POST /ws/{tenant_id}/v1/chat/completions` (SSE)    |
+| Real-time chat                   | Message signing (HMAC), image generation and viewing presigned URLs                                                          | hub `/token`, `/ws`, `/files/*`                     |
 
 > **Note**
 >

@@ -1267,9 +1267,9 @@ function blockResult(guard, hit, tool, field, sample, ctx) {
   };
 }
 
-import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
-
-export default definePluginEntry({
+// openclaw's plugin loader expects the default export to be the plugin object
+// { id, register(api){...} } directly (no wrapper import).
+export default {
   id: "sentinel-guard",
   name: "Sentinel Guard",
   description:
@@ -1524,4 +1524,4 @@ export default definePluginEntry({
       return undefined;
     });
   },
-});
+};

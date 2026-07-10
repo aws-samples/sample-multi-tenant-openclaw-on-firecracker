@@ -1,7 +1,7 @@
 -- deploy/edge/lib/redis_client.lua
 --
 -- Thin, single-purpose wrapper around lua-resty-redis. The only op we need
--- is GET on the "route:{tenant_id}" key. Kept
+-- is GET on the "route:{tenant_id}" key (INTERFACE-CONTRACT §1). Kept
 -- separate so unit tests can inject a stub for the "redis" table without
 -- touching lookup_backend.
 --

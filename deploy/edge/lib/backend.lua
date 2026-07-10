@@ -1,6 +1,6 @@
 -- deploy/edge/lib/backend.lua
 --
--- Three-tier route cache + fail-static.
+-- Three-tier route cache + fail-static (INTERFACE-CONTRACT §2).
 --
 -- Layers (top-down):
 --   L1  worker-local lrucache (resty.lrucache)   — nanosecond hits
@@ -24,8 +24,8 @@
 --     covering an ElastiCache primary→replica automatic failover. AWS
 --     ElastiCache Multi-AZ failover window is typically 10-30s; we hold
 --     stale route entries in L2 for 60s so route.lua can keep serving
---     traffic through the switchover instead of 503-ing. The routing
---     contract fixes this as the quantified lower bound: "L2 TTL ≥
+--     traffic through the switchover instead of 503-ing. INTERFACE-
+--     CONTRACT §8 fixes this as the quantified lower bound: "L2 TTL ≥
 --     预期最长 failover 窗口(建议 ≥30-60s)". After 60s host-agent will
 --     have re-written fresh values anyway.
 --     Freshness comes from L1 (5s) invalidating first; L2 only feeds
@@ -53,8 +53,8 @@ _M.SOURCE_STATIC = "static"-- fail-static (Redis error, L2 stale)
 -- up within seconds even for tenants that stay hot in cache.
 local POS_TTL_SEC     = 5
 -- L2 (shared_dict) stale TTL — long enough to cover an ElastiCache
--- Multi-AZ failover window while Redis is unreachable. See the routing
--- contract and the header comment above.
+-- Multi-AZ failover window while Redis is unreachable. See §8 of
+-- INTERFACE-CONTRACT and the header comment above.
 local L2_TTL_SEC      = 60
 local NEG_TTL_SEC     = 2
 -- Small ±0.5s jitter on positive TTL avoids herd expiry across workers.
@@ -72,8 +72,8 @@ local L1_CACHE  -- set by init_worker
 local NEG_SENTINEL = { __neg__ = true }
 
 --[[
-    parse_value: decode the JSON string written by host-agent (see the
-    routing contract). Returns descriptor table, or nil on bad JSON.
+    parse_value: decode the JSON string written by host-agent (see
+    INTERFACE-CONTRACT §1). Returns descriptor table, or nil on bad JSON.
     Rejects entries missing any required field so the caller can 404
     instead of routing to a black hole.
 --]]

@@ -1,6 +1,6 @@
 # 13 · 数据面两级路由(2026-07-08 转型后)
 
-> 本章描述 2026-07-08 数据面去中枢化改造后的实时聊天链路。**代替** [03-架构详情](03-architecture-details.md) 里"实时聊天中枢 claw-hub"一节的旧模型(hub-WS + claw-channel 出站拨号 + Cognito 三处身份 + HMAC channel_secret 等)。改造缘由:客户 OIDC 不支持无浏览器登录,故弃用 Cognito 与出站拨号中枢,改用 OpenClaw 原生 gateway 认证。运维手册(监控、告警、故障排查)见 [第 11 章 · 组件运维手册](11-ops-maintenance.md),本章不重复。
+> 本章描述 2026-07-08 数据面去中枢化改造后的实时聊天链路。**代替** [03-架构详情](03-architecture-details.md) 里"实时聊天中枢 claw-hub"一节的旧模型(hub-WS + claw-channel 出站拨号 + Cognito 三处身份 + HMAC channel_secret 等)。改造缘由与影响面见项目决策记录;权威接口契约见项目接口契约文档。运维手册(监控、告警、故障排查)见 [第 11 章 · 组件运维手册](11-ops-maintenance.md),本章不重复。
 
 ## 13.1 端到端数据面链路
 
@@ -33,7 +33,7 @@
 OpenClaw gateway 端 `gateway.auth.mode=token` + `gateway.controlUi.enabled=false`(templates/openclaw.json:10-17);唯一鉴权 = per-租户 `Authorization: Bearer <gateway_token>`。token 生命周期:
 
 1. **铸造(mint)**:控制面 `POST /tenants` 时,`deploy/lambda/api/services/tenant_service.py:162-214 mint_gateway_token` 走 KMS GenerateRandom 32B → base64url 编码 → `kms_envelope.encrypt_with_tenant(plaintext, tenant_id, ClawPoolCMK)` 信封加密,EncryptionContext={"tenant_id":<id>} → 存 `openclaw-tenant-secrets` DDB 表(schema 见 stack.py),`expires_at=now+900`。
-2. **注入 microVM**:密文以 launch-vm 位置 12 参数传入 `deploy/userdata/launch-vm.sh`,host 侧 kms:Decrypt(EC={tenant_id})取明文,写入只读盘上 `openclaw.json .gateway.auth.token`。**明文永不落在 host 磁盘,永不进 SSM 命令,永不入 CloudTrail**。
+2. **注入 microVM**:密文以 launch-vm 位置 12 参数传入 `deploy/userdata/launch-vm.sh`(#187 P1),host 侧 kms:Decrypt(EC={tenant_id})取明文,写入只读盘上 `openclaw.json .gateway.auth.token`。**明文永不落在 host 磁盘,永不进 SSM 命令,永不入 CloudTrail**。
 3. **调用方拿密文**:平台后端调 `GET /tenants/{id}`,response.status=`running` 时响应体自动带 `gateway_token` 字段(base64 KMS 信封密文;`handler.py:346-357` 引用 `tenant_service.read_gateway_token_ct`)。这是取 token 的唯一途径(专用 `GET /tenants/{id}/token` 端点已删除)。API Lambda 不 decrypt、也无 kms:Decrypt 权限;调用方拿到密文后本地 Decrypt(EncryptionContext={"tenant_id":<id>})取明文。
 4. **窗口**:密文表 DDB TTL 900s(15min);过期后 `gateway_token` 字段从 GET 响应消失,需重铸(SPEC §7.1 开放问题)。
 
@@ -51,7 +51,7 @@ OpenClaw gateway 端 `gateway.auth.mode=token` + `gateway.controlUi.enabled=fals
 | L2  | `lua_shared_dict route_cache 128m`        | 60s     | 跨 worker 共享 + fail-static 兜 ElastiCache failover 窗口 |
 | L3  | ElastiCache Redis `GET route:{tenant_id}` | —       | 权威源(host-agent 双写)                                   |
 
-L3 miss 时 `resty.lock` 单飞回源(防 stampede);Redis 不可达时 L2 保底服务旧值(fail-static)。**L2 TTL 60s 是量化下限**——必须 "≥ 预期最长 failover 窗口(建议 ≥30-60s)",ElastiCache Multi-AZ automatic failover 通常 15-30s。
+L3 miss 时 `resty.lock` 单飞回源(防 stampede);Redis 不可达时 L2 保底服务旧值(fail-static)。**L2 TTL 60s 是量化下限**——INTERFACE-CONTRACT §8 明确 "≥ 预期最长 failover 窗口(建议 ≥30-60s)",ElastiCache Multi-AZ automatic failover 通常 15-30s。
 
 **DNS 与连接层**:nginx.conf 有 `resolver 169.254.169.253 valid=30s ipv6=off`;`lua-resty-redis` `set_keepalive(60000ms, 100)`(池化短生命)。禁止硬编码 Redis 节点 IP;必须用 primary endpoint DNS(AWS 侧 failover 时更新 CNAME)。
 
@@ -59,7 +59,7 @@ L3 miss 时 `resty.lock` 单飞回源(防 stampede);Redis 不可达时 L2 保底
 
 `deploy/userdata/host-agent.py`(host-agent worker 串行):
 
-- **端口段**:10000-10400(401 个槽,匹配单机 ≤400 microVM)。
+- **端口段**:10000-10400(401 个槽,匹配单机 ≤400 microVM;`INTERFACE-CONTRACT §3`)。
 - **分配**:本机位图 + `iptables -C` 冲突检测三步原子(mutex 串行,防并发撞端口)。
 - **DNAT 建**:`iptables -t nat -A PREROUTING -p tcp --dport <host_port> -j DNAT --to-destination <guest_ip>:18789`。
 - **descriptor 双写**:VM 探活 + gateway token 验证通过后,`先写 DDB 后写 Redis`;delete/migrate 时 `DEL route:{tenant_id}` + 对称撤 DNAT + 释放位图槽。
@@ -103,4 +103,4 @@ L3 miss 时 `resty.lock` 单飞回源(防 stampede);Redis 不可达时 L2 保底
 | 路由权威源      | hub 内存 + owner 校验                                                                         | ElastiCache Redis `route:{tenant_id}` 三级缓存                                                    |
 | 出图/看图链路   | claw-hub presign S3                                                                           | 待重设计(留 SPEC §7.2 开放问题;当前样本 chat demo 不含图)                                         |
 
-**已落地的组件**(2026-07-08):P1 控制面预铸 token · P2-edge 三件套(nginx.conf/route.lua/install-edge.sh) · P2b-host(host-agent 端口位图 + DNAT) · P2b-iac(stack.py EdgeASG + ElastiCache + ALB) · P3 镜像 v5(去 channel) · P4-①② demo/前端切换。P4-③(edge admin console)与 P5-P7 在后续阶段落地。
+**已合入 bb 的 phase MR**(2026-07-08):P1 控制面预铸 token(MR !… 见 `progress/p1-controlplane.md`) · P2-edge 三件套(nginx.conf/route.lua/install-edge.sh) · P2b-host(host-agent 端口位图 + DNAT) · P2b-iac(stack.py EdgeASG + ElastiCache + ALB) · P3 镜像 v5(去 channel) · P4-①② demo/前端切换。P4-③(edge admin console)与 P5-P7 在后续 phase 落地。

@@ -17,7 +17,7 @@
 # template 下载 / vkey 首铸)仍留在 NEW_DATA-only,不在这里。
 #
 # POSIX sh 限制:不用 [[、数组、<<<;所有函数在 dash/busybox/bash 下皆可跑。
-# 这份文件的函数可被 source 后直接调用、用真 jq 验证。
+# 测试(tests/test_harden_config.py)source 这份文件、直接调函数、拿真 jq 验证。
 
 # oc_harden_config <oc_json> <cf_origin_or_empty> <litellm_baseurl_or_empty>
 #                  <litellm_vkey_or_empty> <chat_ep_enabled: 1|0|"">
@@ -56,6 +56,7 @@ oc_harden_config() {
   # 起手 `.` 是 identity(拿到原 JSON 不变),后面每个 `|` 是纯变换。
   __hc_prog='.'
   __hc_prog="${__hc_prog} | del(.gateway.controlUi.dangerouslyDisableDeviceAuth)"
+  # 11-ENGINE-TRANSFORM(SPEC/11-ENGINE-TRANSFORM/02-DEV-PLAN.md §A):
   # 数据面转两级路由后 controlUi 必须关。无条件设 false,防有人在数据盘塞回 true,
   # 与 dangerouslyDisableDeviceAuth 同段(每次唤醒都收敛,不假设 NEW_DATA 时清过就够)。
   __hc_prog="${__hc_prog} | .gateway.controlUi.enabled = false"
@@ -115,4 +116,125 @@ oc_normalize_litellm_baseurl() {
     http://*|https://*) printf '%s' "${__hc_h}" ;;
     *) printf 'http://%s:4000/v1' "${__hc_h}" ;;
   esac
+}
+
+# ── Task 8.3: Frozen_Injection_Plan config-class 注入 ─────────────────────────
+# oc_inject_config_from_plan <oc_json> <plan_json> <scheme> <owner_id> <region>
+#                            <litellm_shared_vkey> [rsa_key_id]
+#   处理 param_class=config 的条目:按 injection_target(dot-path)幂等覆盖 openclaw.json
+#   empty_fallback: 值为空/缺失时使用 fallback
+#   唤醒路径(plan_json 为空): 不覆盖(保留数据盘既有值)
+#   scheme:kms-cmk(对称 CMK + owner_id EC)| asymmetric-v1(RSA-4096 OAEP,无 EC,方案B)
+#   fail-closed: 完成后检查无 __INJECT_AT_DEPLOY__ / __LITELLM_HOST__ 残留
+oc_inject_config_from_plan() {
+  __ic_oc="$1"
+  __ic_plan="$2"
+  __ic_scheme="$3"
+  __ic_owner="$4"
+  __ic_region="$5"
+  __ic_shared_vkey="$6"
+  __ic_rsa_key_id="${7:-}"   # #149 asymmetric-v1: RSA CMK ARN (from CLAWPOOL_RSA_CMK_ARN)
+
+  [ -z "${__ic_plan}" ] && return 0  # 无 plan(唤醒/旧契约) = 不动
+  [ -f "${__ic_oc}" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 3
+
+  # 提取 config-class,逐行输出 compact-JSON(一条目一行)。不用 @tsv:tab 是
+  # 空白符,IFS=tab 的 read 会折叠连续 tab,value_ref 为空(llm_key 留空走
+  # shared-vkey 的主用例)时中间空字段被吞、字段整体错位。改在循环内用 jq 逐字段
+  # 取值,既保空字段又不受 plaintext 值含分隔符影响(单一解码路径)。
+  __ic_rows="$(printf '%s' "${__ic_plan}" \
+    | jq -c 'to_entries[] | select(.value.param_class == "config") | {t: .value.injection_target, m: .value.mode, v: (.value.value_ref // ""), f: (.value.empty_fallback // "")}' 2>/dev/null || true)"
+  [ -z "${__ic_rows}" ] && return 0
+
+  while IFS= read -r __ic_row; do
+    [ -z "${__ic_row}" ] && continue
+    __ic_target="$(printf '%s' "${__ic_row}" | jq -r '.t')"
+    __ic_mode="$(printf '%s' "${__ic_row}" | jq -r '.m')"
+    __ic_val="$(printf '%s' "${__ic_row}" | jq -r '.v')"
+    __ic_fallback="$(printf '%s' "${__ic_row}" | jq -r '.f')"
+    [ -z "${__ic_target}" ] && continue
+
+    # 解密/取值
+    if [ "${__ic_mode}" = "encrypted" ] && [ -n "${__ic_val}" ]; then
+      if [ "${__ic_scheme}" = "kms-cmk" ]; then
+        __ic_plain="$(printf '%s' "${__ic_val}" | base64 -d 2>/dev/null \
+          | aws kms decrypt \
+              --ciphertext-blob fileb:///dev/stdin \
+              --encryption-context "owner_id=${__ic_owner}" \
+              --region "${__ic_region}" \
+              --query Plaintext --output text 2>/dev/null \
+          | base64 -d 2>/dev/null || true)"
+        if [ -z "${__ic_plain}" ]; then
+          echo "[oc:harden] FATAL: decrypt failed for config ${__ic_target}" >&2
+          return 1
+        fi
+      elif [ "${__ic_scheme}" = "asymmetric-v1" ]; then
+        # #149 方案B — RSA-4096 OAEP-SHA256 via KMS asymmetric CMK(与 cred-inject 同源)。
+        # 无 EncryptionContext(KMS 非对称 Decrypt 不支持,verified ValidationException);
+        # 租户绑定 = frozen plan(field↔target)+ 信封 key_id。value_ref 是完整 enc:v1:
+        # 信封,取末段(base64 密文体)KMS-decrypt。
+        if [ -z "${__ic_rsa_key_id}" ]; then
+          echo "[oc:harden] FATAL: asymmetric-v1 config needs CLAWPOOL_RSA_CMK_ARN (empty)" >&2
+          return 1
+        fi
+        __ic_body="${__ic_val##*:}"   # enc:v1:...:<b64> → 最后一段 = 密文 base64
+        __ic_plain="$(printf '%s' "${__ic_body}" | base64 -d 2>/dev/null \
+          | aws kms decrypt \
+              --ciphertext-blob fileb:///dev/stdin \
+              --key-id "${__ic_rsa_key_id}" \
+              --encryption-algorithm RSAES_OAEP_SHA_256 \
+              --region "${__ic_region}" \
+              --query Plaintext --output text 2>/dev/null \
+          | base64 -d 2>/dev/null || true)"
+        if [ -z "${__ic_plain}" ]; then
+          echo "[oc:harden] FATAL: asymmetric-v1 decrypt failed for config ${__ic_target}" >&2
+          return 1
+        fi
+      else
+        echo "[oc:harden] FATAL: config decrypt: unknown scheme '${__ic_scheme}'" >&2
+        return 1
+      fi
+      # 控制字符拒绝(同 cred-inject:防 \r 破坏 jq --arg 写入)
+      if [ "$(printf '%s' "${__ic_plain}" | LC_ALL=C tr -dc '[:cntrl:]' | wc -c | tr -d ' ')" != "0" ]; then
+        echo "[oc:harden] FATAL: config ${__ic_target} value contains control chars (rejected)" >&2
+        return 1
+      fi
+    elif [ "${__ic_mode}" = "plaintext" ] && [ -n "${__ic_val}" ]; then
+      __ic_plain="${__ic_val}"
+    else
+      # 空值: 用 empty_fallback
+      if [ -n "${__ic_fallback}" ]; then
+        # LITELLM_SHARED_VKEY 是特殊 fallback 名,值从参数传入
+        case "${__ic_fallback}" in
+          LITELLM_SHARED_VKEY) __ic_plain="${__ic_shared_vkey}" ;;
+          *) __ic_plain="${__ic_fallback}" ;;
+        esac
+      else
+        continue  # 非 required 且无 fallback,跳过不覆盖
+      fi
+    fi
+
+    # jq 幂等写入 dot-path
+    __ic_tmp="${__ic_oc}.inject.$$"
+    if ! jq --arg val "${__ic_plain}" ".${__ic_target} = \$val" "${__ic_oc}" > "${__ic_tmp}" 2>/dev/null; then
+      echo "[oc:harden] FATAL: jq failed setting .${__ic_target}" >&2
+      rm -f "${__ic_tmp}"
+      return 1
+    fi
+    if [ ! -s "${__ic_tmp}" ]; then
+      rm -f "${__ic_tmp}"
+      return 1
+    fi
+    mv "${__ic_tmp}" "${__ic_oc}"
+  done <<IC_EOF
+${__ic_rows}
+IC_EOF
+
+  # fail-closed: 残留占位符检查
+  if grep -q '__INJECT_AT_DEPLOY__\|__LITELLM_HOST__' "${__ic_oc}" 2>/dev/null; then
+    echo "[oc:harden] FATAL: placeholder residual in ${__ic_oc} after injection — aborting" >&2
+    return 1
+  fi
+  return 0
 }

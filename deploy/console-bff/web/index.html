@@ -1,0 +1,3056 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ClawPool Agent · Pool Management Console</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230b0e11'/%3E%3Cg fill='none' stroke='%23f7a600' stroke-width='2.5'%3E%3Crect x='6' y='6' width='8' height='8' rx='1.5'/%3E%3Crect x='18' y='6' width='8' height='8' rx='1.5'/%3E%3Crect x='6' y='18' width='8' height='8' rx='1.5'/%3E%3Crect x='18' y='18' width='8' height='8' rx='1.5'/%3E%3C/g%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="style.css" />
+    <script src="config.js"></script>
+    <!-- 1.4.1 (#63) — Marked for SKILL.md preview rendering. Tiny (~30KB), no
+     bundler needed, fits the existing Alpine.js / no-build approach. -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <!-- #63 CSP 外链化:Cognito implicit flow 搬到 js/auth.js,配合
+         CloudFront ResponseHeadersPolicy 的 script-src 'self'。逻辑不变。 -->
+    <script src="js/auth.js"></script>
+    <!-- Alpine component, split by domain (no build step). Each app.<domain>.js defines a window.ocXxx object;
+     All must load before the deferred Alpine below, which calls app() at init. -->
+    <script src="js/app.core.js"></script>
+    <script src="js/app.tenants.js"></script>
+    <script src="js/app.hosts.js"></script>
+    <script src="js/app.migrations.js"></script>
+    <script src="js/app.backups.js"></script>
+    <script src="js/app.templates.js"></script>
+    <script src="js/app.skills.js"></script>
+    <script src="js/app.groups.js"></script>
+    <script src="js/app.monitoring.js"></script>
+    <script src="js/app.format.js"></script>
+    <script src="js/app.loadtest.js"></script>
+    <script src="js/app.poolops.js"></script>
+    <script src="js/app.edge.js"></script>
+    <script src="js/app.js"></script>
+    <script
+      defer
+      src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.9/dist/cdn.min.js"
+      integrity="sha384-9Ax3MmS9AClxJyd5/zafcXXjxmwFhZCdsT6HJoJjarvCaAkJlk5QDzjLJm+Wdx5F"
+      crossorigin="anonymous"
+    ></script>
+  </head>
+  <body x-data="app()" x-init="init()">
+    <svg xmlns="http://www.w3.org/2000/svg" style="display: none">
+      <symbol
+        id="i-refresh"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <polyline points="23 4 23 10 17 10" />
+        <polyline points="1 20 1 14 7 14" />
+        <path
+          d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"
+        />
+      </symbol>
+      <symbol
+        id="i-download"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+        <polyline points="7 10 12 15 17 10" />
+        <line x1="12" y1="15" x2="12" y2="3" />
+      </symbol>
+      <symbol
+        id="i-brain"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <path
+          d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"
+        />
+        <path
+          d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"
+        />
+        <path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4" />
+        <path d="M17.599 6.5a3 3 0 0 0 .399-1.375" />
+        <path d="M6.003 5.125A3 3 0 0 0 6.401 6.5" />
+        <path d="M3.477 10.896a4 4 0 0 1 .585-.396" />
+        <path d="M19.938 10.5a4 4 0 0 1 .585.396" />
+        <path d="M6 18a4 4 0 0 1-1.967-.516" />
+        <path d="M19.967 17.484A4 4 0 0 1 18 18" />
+      </symbol>
+      <symbol
+        id="i-terminal"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <polyline points="4 17 10 11 4 5" />
+        <line x1="12" y1="19" x2="20" y2="19" />
+      </symbol>
+      <symbol
+        id="i-dashboard"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <rect x="3" y="3" width="7" height="9" rx="1" />
+        <rect x="14" y="3" width="7" height="5" rx="1" />
+        <rect x="14" y="12" width="7" height="9" rx="1" />
+        <rect x="3" y="16" width="7" height="5" rx="1" />
+      </symbol>
+      <symbol
+        id="i-key"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <circle cx="8" cy="15" r="4" />
+        <line x1="10.85" y1="12.15" x2="19" y2="4" />
+        <line x1="18" y1="5" x2="20" y2="7" />
+        <line x1="15" y1="8" x2="17" y2="10" />
+      </symbol>
+      <symbol
+        id="i-globe"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <circle cx="12" cy="12" r="10" />
+        <path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20" />
+        <path d="M2 12h20" />
+      </symbol>
+      <symbol
+        id="i-pause"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <rect x="6" y="4" width="4" height="16" />
+        <rect x="14" y="4" width="4" height="16" />
+      </symbol>
+      <symbol
+        id="i-power"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <path d="M18.36 6.64a9 9 0 1 1-12.73 0" />
+        <line x1="12" y1="2" x2="12" y2="12" />
+      </symbol>
+      <symbol
+        id="i-play"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <polygon points="5 3 19 12 5 21 5 3" />
+      </symbol>
+      <symbol
+        id="i-rotate-ccw"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <polyline points="1 4 1 10 7 10" />
+        <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" />
+      </symbol>
+      <symbol
+        id="i-trash"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <polyline points="3 6 5 6 21 6" />
+        <path
+          d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"
+        />
+        <line x1="10" y1="11" x2="10" y2="17" />
+        <line x1="14" y1="11" x2="14" y2="17" />
+      </symbol>
+      <symbol
+        id="i-delete"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <line x1="18" y1="6" x2="6" y2="18" />
+        <line x1="6" y1="6" x2="18" y2="18" />
+      </symbol>
+      <symbol
+        id="i-zap"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+      </symbol>
+      <symbol
+        id="i-link"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+        <path
+          d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"
+        />
+      </symbol>
+      <symbol
+        id="i-eye"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+        <circle cx="12" cy="12" r="3" />
+      </symbol>
+      <symbol
+        id="i-eye-off"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <path
+          d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"
+        />
+        <line x1="1" y1="1" x2="23" y2="23" />
+      </symbol>
+      <symbol
+        id="i-edit"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+        <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
+      </symbol>
+      <symbol
+        id="i-restore"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <polyline points="21 8 21 21 3 21 3 8" />
+        <rect x="1" y="3" width="22" height="5" />
+        <line x1="10" y1="12" x2="14" y2="12" />
+        <polyline points="16 16 12 20 8 16" />
+      </symbol>
+      <symbol
+        id="i-chevron-right"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <polyline points="9 18 15 12 9 6" />
+      </symbol>
+      <symbol
+        id="i-activity"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+      </symbol>
+      <symbol
+        id="i-move"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <polyline points="5 9 2 12 5 15" />
+        <polyline points="9 5 12 2 15 5" />
+        <polyline points="15 19 12 22 9 19" />
+        <polyline points="19 9 22 12 19 15" />
+        <line x1="2" y1="12" x2="22" y2="12" />
+        <line x1="12" y1="2" x2="12" y2="22" />
+      </symbol>
+      <symbol
+        id="i-tool"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <path
+          d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"
+        />
+      </symbol>
+      <symbol
+        id="i-bar-chart"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <line x1="12" y1="20" x2="12" y2="10" />
+        <line x1="18" y1="20" x2="18" y2="4" />
+        <line x1="6" y1="20" x2="6" y2="16" />
+      </symbol>
+      <symbol
+        id="i-shield"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+      </symbol>
+    </svg>
+
+    <!-- Header -->
+    <div class="header">
+      <h1>
+        <span
+          style="
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 26px;
+            height: 26px;
+            border-radius: 6px;
+            background: linear-gradient(135deg, #f7a600, #ffb800);
+            color: #0b0e11;
+            font-weight: 900;
+            margin-right: 10px;
+            vertical-align: middle;
+          "
+          >B</span
+        >ClawPool Agent · Pool Management Console
+      </h1>
+      <span class="status-dot" :class="connected ? 'ok' : 'err'"></span>
+      <span
+        class="status-label"
+        x-text="connected ? 'Connected' : 'Disconnected'"
+      ></span>
+    </div>
+
+    <!-- Nav Tabs -->
+    <div class="nav-tabs">
+      <button
+        class="nav-tab"
+        :class="page==='tenants' && 'active'"
+        @click="page='tenants'"
+      >
+        Tenants
+      </button>
+      <button
+        class="nav-tab"
+        :class="page==='app' && 'active'"
+        @click="page='app'; loadAgentCoreTools()"
+      >
+        Agent Config
+      </button>
+      <button
+        class="nav-tab"
+        :class="page==='monitoring' && 'active'"
+        @click="page='monitoring'; loadSystemInfo()"
+      >
+        Monitoring
+      </button>
+      <button
+        class="nav-tab"
+        :class="page==='backups' && 'active'"
+        @click="page='backups'; loadBackups()"
+      >
+        Backups
+      </button>
+      <button
+        class="nav-tab"
+        :class="page==='poolops' && 'active'"
+        @click="page='poolops'; poReconcileView()"
+      >
+        Pool Ops
+      </button>
+      <button
+        class="nav-tab"
+        :class="page==='loadtest' && 'active'"
+        @click="page='loadtest'"
+      >
+        Load Test
+      </button>
+      <button
+        class="nav-tab"
+        :class="page==='edge' && 'active'"
+        @click="page='edge'; refreshEdge()"
+      >
+        Edge
+      </button>
+      <button
+        class="nav-tab"
+        :class="page==='settings' && 'active'"
+        @click="page='settings'; loadSystemInfo()"
+      >
+        Settings
+      </button>
+    </div>
+
+    <!-- Page: Tenants (main) -->
+    <div x-show="page==='tenants'" class="page-content">
+      <h2>🖥 Tenants Management</h2>
+      <div class="flex-layout">
+        <!-- Hosts -->
+        <div class="hosts-panel">
+          <div class="panel-header">
+            <span class="panel-title">Hosts (Group)</span>
+          </div>
+          <div
+            style="
+              display: flex;
+              align-items: center;
+              gap: 8px;
+              padding: 0 4px 6px;
+              font-size: 12px;
+            "
+          >
+            <span
+              style="color: var(--gray)"
+              x-text="'Latest rootfs: '+(rootfsVersion||'…')"
+            ></span>
+            <button
+              class="btn-act"
+              title="Pull latest rootfs to all hosts"
+              @click="refreshRootfs()"
+            >
+              <svg class="icon s13"><use href="#i-download" /></svg>
+            </button>
+          </div>
+          <template x-if="hosts.length === 0 && !loadingHosts">
+            <div class="empty">No hosts</div>
+          </template>
+          <!-- 1.2.9 — hosts grouped by AZ when multi-AZ is enabled, flat list otherwise. -->
+          <template x-for="grp in groupedHosts" :key="grp.az || 'all'">
+            <div>
+              <template x-if="grp.az !== null">
+                <div
+                  style="
+                    display: flex;
+                    align-items: center;
+                    gap: 6px;
+                    margin: 8px 0 4px;
+                    font-size: 11px;
+                    color: var(--cyan-dim);
+                    font-family: monospace;
+                  "
+                >
+                  <svg class="icon s12"><use href="#i-globe" /></svg>
+                  <span x-text="grp.az"></span>
+                  <span
+                    style="color: var(--gray)"
+                    x-text="' · '+grp.hosts.length+' host(s) · '+grp.hosts.reduce((s,h)=>s+(h.vm_count||0),0)+' VM(s)'"
+                  ></span>
+                </div>
+              </template>
+              <template x-for="h in grp.hosts" :key="h.instance_id">
+                <div
+                  class="host-card"
+                  :class="selectedHost === h.instance_id && 'selected'"
+                  @click="selectedHost = selectedHost === h.instance_id ? null : h.instance_id"
+                >
+                  <div class="host-top">
+                    <span class="host-id" x-text="h.instance_id"></span>
+                    <span
+                      x-show="h.az"
+                      style="
+                        font-size: 10px;
+                        color: var(--gray);
+                        font-family: monospace;
+                      "
+                      x-text="h.az"
+                    ></span>
+                    <span
+                      class="badge"
+                      :class="h.status==='active' ? 'badge-active' : 'badge-inactive'"
+                      x-text="h.status"
+                    ></span>
+                  </div>
+                  <div class="host-row">
+                    <span class="host-label"
+                      >CPU<span
+                        class="overcommit-badge"
+                        x-show="(h.cpu_overcommit_ratio||1) > 1"
+                        x-text="' (×'+(h.cpu_overcommit_ratio||1)+')'"
+                      ></span
+                    ></span>
+                    <div class="bar-bg" style="position: relative">
+                      <div
+                        class="bar-fill"
+                        :class="cpuBarClass(h)"
+                        :style="'width:'+cpuPct(h)+'%'"
+                      ></div>
+                      <template x-if="(h.cpu_overcommit_ratio||1) > 1">
+                        <div
+                          class="bar-physical-mark"
+                          :style="'left:'+(100/(h.cpu_overcommit_ratio||1))+'%'"
+                        ></div>
+                      </template>
+                    </div>
+                    <span
+                      class="host-val"
+                      x-text="(h.total_vcpu == null) ? '—' : (h.used_vcpu||0)+'/'+h.total_vcpu"
+                    ></span>
+                  </div>
+                  <div class="host-row">
+                    <span class="host-label"
+                      >Mem<span
+                        class="overcommit-badge"
+                        x-show="(h.mem_overcommit_ratio||1) > 1"
+                        x-text="' (×'+(h.mem_overcommit_ratio||1)+')'"
+                      ></span
+                    ></span>
+                    <div class="bar-bg" style="position: relative">
+                      <div
+                        class="bar-fill"
+                        :class="memBarClass(h)"
+                        :style="'width:'+memPct(h)+'%'"
+                      ></div>
+                      <template x-if="(h.mem_overcommit_ratio||1) > 1">
+                        <div
+                          class="bar-physical-mark"
+                          :style="'left:'+(100/(h.mem_overcommit_ratio||1))+'%'"
+                        ></div>
+                      </template>
+                    </div>
+                    <span
+                      class="host-val"
+                      x-text="(h.total_mem_mb == null) ? '—' : ((h.used_mem_mb||0)/1024).toFixed(1)+'/'+(h.total_mem_mb/1024).toFixed(1)"
+                    ></span>
+                  </div>
+                  <div class="host-row">
+                    <span class="host-label">VM(s)</span>
+                    <span style="color: #fff" x-text="h.vm_count"></span>
+                    <span
+                      style="
+                        margin-left: auto;
+                        font-size: 11px;
+                        color: var(--gray);
+                      "
+                      x-text="h.rootfs_version||''"
+                    ></span>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </template>
+        </div>
+
+        <!-- Tenants -->
+        <div class="tenants-panel">
+          <!-- AgentCore status mini-panel -->
+          <template x-if="agentcoreStatus.enabled">
+            <div class="section-card mini-panel" style="border-color: #0f83">
+              <span style="font-size: 13px; color: var(--green)"
+                >⚡ AgentCore</span
+              >
+              <span style="font-size: 11px; color: var(--gray)">enabled</span>
+              <a
+                :href="'https://'+agentcoreRegion+'.console.aws.amazon.com/cloudwatch/home?region='+agentcoreRegion+'#dashboards'"
+                target="_blank"
+                style="font-size: 11px; color: var(--cyan); margin-left: 8px"
+                >📊 CloudWatch</a
+              >
+            </div>
+          </template>
+
+          <!-- Skills mini-panel — counts only; per-tenant scoping is via Groups,
+           so don't flatten every skill here (it reads as "all tenants get all"). -->
+          <div
+            class="section-card mini-panel"
+            style="
+              display: flex;
+              align-items: center;
+              gap: 8px;
+              flex-wrap: wrap;
+            "
+          >
+            <span style="font-size: 13px; color: var(--cyan)"
+              ><svg class="icon s14" style="vertical-align: -2px">
+                <use href="#i-brain" />
+              </svg>
+              <span x-text="skills.length"></span> shared skill(s)</span
+            >
+            <span style="font-size: 12px; color: var(--gray)"
+              >· scope per tenant with Skill Groups</span
+            >
+            <a
+              @click.prevent="page='app'"
+              href="#"
+              style="margin-left: auto; font-size: 12px; color: var(--cyan)"
+              >Manage →</a
+            >
+          </div>
+
+          <div class="panel-header">
+            <span class="panel-title"
+              >Tenants
+              <template x-if="selectedHost"
+                ><span style="font-size: 12px; color: var(--cyan-dim)"
+                  >— <span x-text="selectedHost"></span>
+                  <button
+                    class="btn-icon"
+                    @click="selectedHost=null"
+                    style="font-size: 12px"
+                  >
+                    <svg class="icon s12">
+                      <use href="#i-delete" />
+                    </svg></button></span></template
+            ></span>
+            <div style="display: flex; gap: 8px; align-items: center">
+              <button
+                class="btn btn-outline btn-sm"
+                @click="refresh()"
+                :disabled="loadingHosts||loadingTenants"
+              >
+                Refresh
+                <span :class="(loadingHosts||loadingTenants) && 'spin'"
+                  ><svg class="icon s13"><use href="#i-refresh" /></svg
+                ></span>
+              </button>
+              <button
+                class="btn btn-cyan btn-sm"
+                @click="restoreSource=null; showModal=true"
+              >
+                + New
+              </button>
+            </div>
+          </div>
+          <div class="panel-header">
+            <div
+              style="
+                display: flex;
+                align-items: center;
+                gap: 12px;
+                flex-wrap: wrap;
+              "
+            >
+              <label style="font-size: 12px; color: var(--gray)">Status</label>
+              <select
+                class="settings-input"
+                x-model="statusFilter"
+                style="width: 140px; padding: 4px 8px; font-size: 12px"
+              >
+                <option value="all">All</option>
+                <template x-for="s in tenantStatuses" :key="s">
+                  <option :value="s" x-text="s"></option>
+                </template>
+              </select>
+              <label style="font-size: 12px; color: var(--gray)">Tag</label>
+              <input
+                type="text"
+                x-model="tagFilter"
+                placeholder="key:value (e.g. team:ml)"
+                class="settings-input"
+                style="width: 200px; padding: 4px 8px; font-size: 12px"
+                title="Filter by tag — comma separated for AND (e.g. team:ml,env:dev)"
+              />
+              <span
+                style="font-size: 12px; color: var(--gray)"
+                x-text="filteredTenants.length + ' tenant(s)'"
+              ></span>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Name</th>
+                  <th>Status</th>
+                  <th>Group</th>
+                  <th>Tags</th>
+                  <th>vCPU</th>
+                  <th>Memory</th>
+                  <th>Disk</th>
+                  <th>Guest IP</th>
+                  <th>Port</th>
+                  <th>Rootfs</th>
+                  <th>VM Health</th>
+                  <th>Gateway</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                <template
+                  x-if="filteredTenants.length === 0 && !loadingTenants"
+                >
+                  <tr>
+                    <td colspan="14" class="empty">No tenants</td>
+                  </tr>
+                </template>
+                <template x-for="t in filteredTenants" :key="t.id">
+                  <tr>
+                    <td x-text="t.id"></td>
+                    <td x-text="t.name || '-'"></td>
+                    <td>
+                      <span
+                        class="badge"
+                        :class="'badge-'+t.status"
+                        x-text="t.status"
+                      ></span>
+                    </td>
+                    <td>
+                      <template x-if="t.group">
+                        <span class="tag-badge" x-text="t.group"></span>
+                      </template>
+                      <template x-if="!t.group">
+                        <span
+                          style="color: #445; font-size: 11px"
+                          title="Broadcast — all skills"
+                          >—</span
+                        >
+                      </template>
+                    </td>
+                    <td>
+                      <template x-for="(v, k) in (t.tags || {})" :key="k">
+                        <span class="tag-badge" x-text="k + ':' + v"></span>
+                      </template>
+                    </td>
+                    <td>
+                      <div
+                        class="disk-cell"
+                        x-show="t.status==='running' && t.metrics"
+                      >
+                        <div class="disk-track">
+                          <div
+                            class="disk-fill"
+                            :class="metricLevel(_n(t.metrics?.cpu_pct))"
+                            :style="'width:'+_n(t.metrics?.cpu_pct)+'%'"
+                          ></div>
+                        </div>
+                        <span class="disk-text" x-text="cpuText(t)"></span>
+                      </div>
+                      <span
+                        x-show="t.status!=='running' || !t.metrics"
+                        style="color: #445; font-size: 11px"
+                        x-text="t.vcpu"
+                      ></span>
+                    </td>
+                    <td>
+                      <div
+                        class="disk-cell"
+                        x-show="t.status==='running' && t.metrics"
+                      >
+                        <div class="disk-track">
+                          <div
+                            class="disk-fill"
+                            :class="metricLevel(memPctOfTenant(t))"
+                            :style="'width:'+memPctOfTenant(t)+'%'"
+                          ></div>
+                        </div>
+                        <span class="disk-text" x-text="memText(t)"></span>
+                      </div>
+                      <span
+                        x-show="t.status!=='running' || !t.metrics"
+                        style="color: #445; font-size: 11px"
+                        x-text="t.mem_mb"
+                      ></span>
+                    </td>
+                    <td>
+                      <div
+                        class="disk-cell"
+                        x-show="t.status==='running' && t.metrics"
+                      >
+                        <div class="disk-track">
+                          <div
+                            class="disk-fill"
+                            :class="metricLevel(_n(t.metrics?.disk_used_pct))"
+                            :style="'width:'+_n(t.metrics?.disk_used_pct)+'%'"
+                          ></div>
+                        </div>
+                        <span class="disk-text" x-text="diskText(t)"></span>
+                      </div>
+                      <span
+                        x-show="t.status!=='running' || !t.metrics"
+                        style="color: #445; font-size: 11px"
+                        >—</span
+                      >
+                    </td>
+                    <td x-text="t.guest_ip || '-'"></td>
+                    <td x-text="t.host_port || '-'"></td>
+                    <td
+                      style="font-size: 11px; color: var(--gray)"
+                      x-text="t.rootfs_version||'-'"
+                    ></td>
+                    <td>
+                      <span
+                        class="health-dot"
+                        :class="healthClass(t.vm_health, t.status)"
+                      ></span>
+                    </td>
+                    <td>
+                      <span
+                        class="health-dot"
+                        :class="healthClass(t.app_health, t.status)"
+                      ></span>
+                    </td>
+                    <td>
+                      <div class="act-group">
+                        <button
+                          class="btn-act"
+                          title="复制 SSH 连接命令 (oc-connect.sh)"
+                          @click="copyCmd('./scripts/oc-connect.sh '+t.id)"
+                        >
+                          <svg class="icon s13"><use href="#i-terminal" /></svg
+                          ><span class="act-lbl">SSH</span>
+                        </button>
+                        <!-- #187 转型:controlUi.enabled=false(P3 已烤),
+                             gateway Control UI 死代码 + oc-dashboard.sh 复制按钮
+                             同时下线;租户操作走本控制台其余入口。 -->
+                        <template x-if="t.status==='running'">
+                          <button
+                            class="btn-act"
+                            title="展示 gateway token 密文(调用方自解;§INTERFACE-CONTRACT §5)"
+                            @click="revealToken(t.id)"
+                          >
+                            <svg class="icon s13"><use href="#i-key" /></svg
+                            ><span class="act-lbl">Token</span>
+                          </button>
+                        </template>
+                        <template x-if="t.status==='running'">
+                          <span>
+                            <!-- #187 Abel: pause/resume 本期未开(SPEC 标 Disabled),
+                                 按钮灰化 + tooltip 明说,防误点。 -->
+                            <button
+                              class="btn-act"
+                              disabled
+                              style="opacity:0.45;cursor:not-allowed"
+                              title="本期未开(SPEC Disabled;暂停/恢复能力待独立 issue)"
+                            >
+                              <svg class="icon s13"><use href="#i-pause" /></svg
+                              ><span class="act-lbl">暂停</span>
+                            </button>
+                            <button
+                              class="btn-act"
+                              title="停止 (释放资源)"
+                              @click="tenantAction(t.id,'stop')"
+                            >
+                              <svg class="icon s13"><use href="#i-power" /></svg
+                              ><span class="act-lbl">停止</span>
+                            </button>
+                            <button
+                              class="btn-act"
+                              title="重启"
+                              @click="tenantAction(t.id,'restart')"
+                            >
+                              <svg class="icon s13"><use href="#i-zap" /></svg
+                              ><span class="act-lbl">重启</span>
+                            </button>
+                            <button
+                              class="btn-act"
+                              title="迁移到其他 host"
+                              @click="openMigrate(t)"
+                            >
+                              <svg class="icon s13"><use href="#i-move" /></svg
+                              ><span class="act-lbl">迁移</span>
+                            </button>
+                          </span>
+                        </template>
+                        <template x-if="t.status==='stopped'">
+                          <span>
+                            <button
+                              class="btn-act"
+                              title="启动"
+                              @click="tenantAction(t.id,'start')"
+                            >
+                              <svg class="icon s13"><use href="#i-play" /></svg
+                              ><span class="act-lbl">启动</span>
+                            </button>
+                            <button
+                              class="btn-act"
+                              title="重置 rootfs (清可写层,换新镜像)"
+                              @click="tenantAction(t.id,'reset')"
+                            >
+                              <svg class="icon s13">
+                                <use href="#i-rotate-ccw" /></svg
+                              ><span class="act-lbl">重置</span>
+                            </button>
+                          </span>
+                        </template>
+                        <template x-if="t.status==='paused'">
+                          <!-- #187 Abel: paused 态本期理论上不会出现(pause 已 Disabled);
+                               留占位并灰按钮,兜底防未来出现 -->
+                          <button
+                            class="btn-act"
+                            disabled
+                            style="opacity:0.45;cursor:not-allowed"
+                            title="本期未开(SPEC Disabled)"
+                          >
+                            <svg class="icon s13"><use href="#i-play" /></svg
+                            ><span class="act-lbl">恢复</span>
+                          </button>
+                        </template>
+                        <button
+                          class="btn-del"
+                          title="删除节点 (不可逆,先备份)"
+                          @click="deleteTenant(t.id)"
+                        >
+                          <svg class="icon s13"><use href="#i-trash" /></svg
+                          ><span class="act-lbl">删除</span>
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      <!-- /flex-layout -->
+    </div>
+    <!-- /page:tenants -->
+
+    <!-- Page: App Config -->
+    <div x-show="page==='app'" class="page-content">
+      <h2>⚙ Agent Configuration</h2>
+
+      <!-- Config Templates -->
+      <div class="section-card">
+        <div
+          style="
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+          "
+        >
+          <h3>Config Templates</h3>
+          <button
+            class="btn btn-cyan btn-sm"
+            @click="editTpl={name:'',content:'{\n  \n}',isNew:true}"
+          >
+            + New
+          </button>
+        </div>
+        <p style="color: var(--gray); font-size: 13px">
+          OpenClaw configuration templates for different LLM providers and
+          models.
+        </p>
+        <div style="margin-top: 8px">
+          <template x-for="t in templates" :key="t.name">
+            <div class="config-item" style="justify-content: space-between">
+              <span>
+                <span class="config-name" x-text="t.name"></span>
+                <span
+                  class="config-desc"
+                  x-text="t.modified ? new Date(t.modified).toLocaleDateString() : ''"
+                ></span>
+              </span>
+              <span style="display: flex; gap: 6px">
+                <button
+                  class="btn-icon"
+                  title="Edit"
+                  @click="(async()=>{const r=await $data.api('GET','templates/'+t.name);editTpl={name:t.name,content:JSON.stringify(r.content,null,2),isNew:false}})()"
+                >
+                  <svg class="icon s14"><use href="#i-edit" /></svg>
+                </button>
+                <button
+                  class="btn-icon"
+                  title="Delete"
+                  @click="deleteTemplate(t.name)"
+                >
+                  <svg class="icon s14"><use href="#i-delete" /></svg>
+                </button>
+              </span>
+            </div>
+          </template>
+          <div
+            x-show="templates.length===0"
+            style="color: var(--gray); font-size: 12px"
+          >
+            No custom templates. Tenants use the built-in default config.
+          </div>
+        </div>
+      </div>
+
+      <!-- Template Editor Modal -->
+      <template x-if="editTpl">
+        <div class="overlay" @click.self="editTpl=null">
+          <div class="modal" style="width: 680px">
+            <button class="close-btn" @click="editTpl=null">
+              <svg class="icon s16"><use href="#i-delete" /></svg>
+            </button>
+            <h2
+              x-text="editTpl.isNew ? 'New Template' : 'Edit: ' + editTpl.name"
+            ></h2>
+            <template x-if="editTpl.isNew">
+              <div>
+                <label>Name <span class="req">*</span></label>
+                <input
+                  type="text"
+                  x-model="editTpl.name"
+                  placeholder="e.g. bedrock-claude"
+                />
+              </div>
+            </template>
+            <label>openclaw.json</label>
+            <textarea
+              x-model="editTpl.content"
+              style="
+                width: 100%;
+                height: 320px;
+                font-family: monospace;
+                font-size: 12px;
+                background: var(--bg);
+                color: var(--text);
+                border: 1px solid var(--border);
+                border-radius: 6px;
+                padding: 10px;
+                resize: vertical;
+              "
+            ></textarea>
+            <div class="modal-actions">
+              <button class="btn btn-cyan" @click="editTpl=null">Cancel</button>
+              <button
+                class="btn btn-create"
+                @click="saveTemplate()"
+                :disabled="!editTpl.name"
+              >
+                Save
+              </button>
+            </div>
+          </div>
+        </div>
+      </template>
+
+      <!-- AgentCore MCP Tools (issue: surface what tools VMs gain when AgentCore is on) -->
+      <div class="section-card" x-show="agentcoreStatus.enabled">
+        <div
+          style="
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+          "
+        >
+          <h3>
+            <svg class="icon s14" style="vertical-align: -2px">
+              <use href="#i-tool" />
+            </svg>
+            MCP Tools (via AgentCore Gateway)
+          </h3>
+          <span
+            class="badge badge-active"
+            x-text="(agentcoreTools.length || 0) + ' tools'"
+          ></span>
+        </div>
+        <p style="color: var(--gray); font-size: 13px">
+          All tenant VMs auto-connect to the AgentCore Gateway and gain these
+          MCP tools. Tool definitions live in
+          <code>deploy/lambda/agentcore_tools/</code> +
+          <code>deploy/stack.py</code>.
+        </p>
+        <div style="margin-top: 8px">
+          <template x-for="tool in agentcoreTools" :key="tool.name">
+            <div
+              class="config-item"
+              style="flex-direction: column; align-items: flex-start; gap: 4px"
+            >
+              <span style="display: flex; align-items: baseline; gap: 8px">
+                <span class="config-name" x-text="tool.name"></span>
+                <span
+                  style="
+                    font-size: 11px;
+                    color: var(--cyan-dim);
+                    font-family: monospace;
+                  "
+                >
+                  <template
+                    x-for="(prop, key) in (tool.input_schema?.properties || {})"
+                    :key="key"
+                  >
+                    <span x-text="key + ', '"></span>
+                  </template>
+                  <span
+                    x-show="!Object.keys(tool.input_schema?.properties || {}).length"
+                    >no params</span
+                  >
+                </span>
+              </span>
+              <span
+                class="config-desc"
+                style="margin-left: 0"
+                x-text="tool.description"
+              ></span>
+            </div>
+          </template>
+          <div
+            x-show="agentcoreTools.length === 0"
+            style="color: var(--gray); font-size: 12px"
+          >
+            AgentCore not enabled, or no tools registered yet. Set
+            <code>agentcore.enabled: true</code> in <code>config.yml</code> and
+            redeploy.
+          </div>
+        </div>
+      </div>
+
+      <!-- Groups (1.4.0 #62 / 1.4.1 #63) -->
+      <div class="section-card">
+        <h3 style="display: flex; align-items: center; gap: 8px">
+          <svg class="icon s14" style="vertical-align: -2px">
+            <use href="#i-brain" />
+          </svg>
+          Skill Groups
+          <span
+            style="font-size: 11px; color: var(--gray)"
+            x-text="'(' + groups.length + ')'"
+          ></span>
+          <button
+            x-show="canWrite()"
+            class="btn btn-cyan btn-sm"
+            style="margin-left: auto"
+            @click="showGroupModal=true"
+          >
+            + New Group
+          </button>
+        </h3>
+        <p style="color: var(--gray); font-size: 13px">
+          Groups bundle skills together so a tenant can subscribe via
+          <code>group: "team-sre"</code>
+          instead of listing every skill. A tenant's effective skill set =
+          <code>tenant.skills ∪ group.skills</code>. Tenants without scoping
+          fields get every skill (legacy broadcast).
+        </p>
+        <div style="margin-top: 8px">
+          <template x-for="g in groups" :key="g.name">
+            <div
+              class="config-item"
+              style="
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 6px;
+                padding: 10px 12px;
+              "
+            >
+              <span
+                style="
+                  display: flex;
+                  align-items: baseline;
+                  gap: 8px;
+                  width: 100%;
+                "
+              >
+                <span class="config-name" x-text="g.name"></span>
+                <span
+                  class="config-desc"
+                  style="margin-left: 0; flex: 1"
+                  x-text="g.description || 'No description'"
+                ></span>
+                <span
+                  style="font-size: 11px; color: var(--gray)"
+                  x-text="(g.skills||[]).length + ' skills'"
+                ></span>
+                <button
+                  x-show="canWrite()"
+                  class="btn-act"
+                  style="font-size: 11px; color: var(--cyan)"
+                  @click="expandedGroup = (expandedGroup===g.name ? null : g.name); addSkillToGroupName=''"
+                  x-text="expandedGroup===g.name?'▾ Hide':'▸ Edit'"
+                ></button>
+              </span>
+              <!-- Inline group editor -->
+              <div
+                x-show="expandedGroup===g.name"
+                style="
+                  width: 100%;
+                  margin-top: 6px;
+                  border-top: 1px dashed var(--border);
+                  padding-top: 8px;
+                "
+              >
+                <div
+                  style="
+                    display: flex;
+                    flex-wrap: wrap;
+                    gap: 4px;
+                    margin-bottom: 8px;
+                  "
+                >
+                  <template x-for="sk in (g.skills||[])" :key="sk">
+                    <span
+                      style="
+                        display: inline-flex;
+                        align-items: center;
+                        gap: 4px;
+                        padding: 3px 8px;
+                        border: 1px solid var(--border);
+                        border-radius: 10px;
+                        font-size: 12px;
+                        background: var(--bg-mid);
+                      "
+                    >
+                      <span x-text="sk"></span>
+                      <button
+                        x-show="canWrite()"
+                        class="btn-act"
+                        style="
+                          color: var(--red);
+                          padding: 0 0 0 4px;
+                          font-size: 14px;
+                          line-height: 1;
+                        "
+                        title="Remove from group"
+                        @click="removeSkillFromGroup(g.name, sk)"
+                      >
+                        ×
+                      </button>
+                    </span>
+                  </template>
+                  <span
+                    x-show="!(g.skills||[]).length"
+                    style="
+                      color: var(--gray);
+                      font-size: 12px;
+                      font-style: italic;
+                    "
+                    >empty group</span
+                  >
+                </div>
+                <div
+                  x-show="canWrite()"
+                  style="display: flex; gap: 6px; align-items: center"
+                >
+                  <select
+                    x-model="addSkillToGroupName"
+                    style="
+                      flex: 1;
+                      padding: 6px 8px;
+                      background: var(--bg-mid);
+                      border: 1px solid var(--border);
+                      border-radius: 4px;
+                      color: var(--text);
+                      font-size: 12px;
+                    "
+                  >
+                    <option value="">— pick a skill to add —</option>
+                    <template
+                      x-for="s in skills.filter(x => !(g.skills||[]).includes(x.name))"
+                      :key="s.id"
+                    >
+                      <option :value="s.name" x-text="s.name"></option>
+                    </template>
+                  </select>
+                  <button
+                    class="btn btn-cyan btn-sm"
+                    :disabled="!addSkillToGroupName"
+                    @click="addSkillToGroup(g.name)"
+                  >
+                    Add
+                  </button>
+                </div>
+              </div>
+            </div>
+          </template>
+          <div
+            x-show="groups.length===0"
+            style="color: var(--gray); font-size: 12px"
+          >
+            No groups defined. Click <b>+ New Group</b> to bundle skills for a
+            team.
+          </div>
+        </div>
+      </div>
+
+      <!-- Skills (1.4.1 #63 — full CRUD) -->
+      <div class="section-card">
+        <h3 style="display: flex; align-items: center; gap: 8px">
+          <svg class="icon s14" style="vertical-align: -2px">
+            <use href="#i-brain" />
+          </svg>
+          Shared Skills
+          <span
+            style="font-size: 11px; color: var(--gray)"
+            x-text="'(' + skills.length + ')'"
+          ></span>
+          <button
+            x-show="canWrite()"
+            class="btn btn-cyan btn-sm"
+            style="margin-left: auto"
+            @click="showSkillUpload=true"
+          >
+            + New Skill
+          </button>
+        </h3>
+        <p style="color: var(--gray); font-size: 13px">
+          Skills are shared across all tenants. They're plain markdown files in
+          <code>s3://${ASSETS_BUCKET}/skills/&lt;name&gt;/SKILL.md</code> and
+          are synced to every host every 5 minutes via cron, then injected into
+          VMs at launch.
+          <span x-show="canWrite()"
+            >Click a row to view / edit. Use Groups (above) to scope skills to
+            specific tenants.</span
+          >
+        </p>
+        <div style="margin-top: 8px">
+          <template x-for="s in skills" :key="s.id">
+            <div
+              class="config-item"
+              style="
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 6px;
+                padding: 10px 12px;
+              "
+            >
+              <span
+                style="
+                  display: flex;
+                  align-items: baseline;
+                  gap: 8px;
+                  width: 100%;
+                "
+              >
+                <span
+                  class="config-name"
+                  x-text="s.name"
+                  style="cursor: pointer"
+                  @click="toggleSkill(s.name)"
+                ></span>
+                <span
+                  class="config-desc"
+                  style="margin-left: 0; flex: 1"
+                  x-text="s.description || 'No description'"
+                ></span>
+                <button
+                  class="btn-act"
+                  style="font-size: 11px; color: var(--cyan)"
+                  @click="toggleSkill(s.name)"
+                  x-text="expandedSkill===s.name?'▾ Hide':'▸ View'"
+                ></button>
+                <a
+                  class="btn-act"
+                  style="font-size: 11px; color: var(--cyan)"
+                  :href="skillS3Url(s)"
+                  target="_blank"
+                  rel="noopener"
+                  title="Open S3 console at this skill's prefix"
+                >
+                  <svg class="icon s12" style="vertical-align: -1px">
+                    <use href="#i-link" />
+                  </svg>
+                  S3
+                </a>
+                <button
+                  x-show="canWrite()"
+                  class="btn-act"
+                  style="font-size: 11px; color: var(--red)"
+                  @click="deleteSkill(s.name)"
+                >
+                  Delete
+                </button>
+              </span>
+              <!-- Inline preview / editor -->
+              <div
+                x-show="expandedSkill===s.name"
+                style="
+                  width: 100%;
+                  margin-top: 6px;
+                  border-top: 1px dashed var(--border);
+                  padding-top: 8px;
+                "
+              >
+                <div style="display: flex; gap: 6px; margin-bottom: 6px">
+                  <button
+                    class="btn btn-outline btn-sm"
+                    @click="skillEditMode=false"
+                    :class="!skillEditMode && 'btn-cyan'"
+                  >
+                    Preview
+                  </button>
+                  <button
+                    x-show="canWrite()"
+                    class="btn btn-outline btn-sm"
+                    @click="skillEditMode=true"
+                    :class="skillEditMode && 'btn-cyan'"
+                  >
+                    Edit
+                  </button>
+                  <button
+                    x-show="canWrite() && skillEditMode"
+                    class="btn btn-cyan btn-sm"
+                    style="margin-left: auto"
+                    @click="saveSkill(s.name)"
+                    :disabled="skillSaving"
+                    x-text="skillSaving?'Saving...':'Save'"
+                  ></button>
+                </div>
+                <div
+                  x-show="!skillEditMode"
+                  class="skill-md-preview"
+                  style="
+                    padding: 8px 12px;
+                    background: var(--bg-mid);
+                    border-radius: 6px;
+                    max-height: 400px;
+                    overflow: auto;
+                    font-size: 13px;
+                  "
+                  x-html="renderMd(skillContent)"
+                ></div>
+                <textarea
+                  x-show="skillEditMode"
+                  x-model="skillContent"
+                  style="
+                    width: 100%;
+                    height: 340px;
+                    font-family: monospace;
+                    font-size: 12px;
+                    padding: 8px;
+                    background: var(--bg-mid);
+                    border: 1px solid var(--border);
+                    border-radius: 6px;
+                    color: var(--text);
+                    resize: vertical;
+                  "
+                  spellcheck="false"
+                ></textarea>
+              </div>
+            </div>
+          </template>
+          <div
+            x-show="skills.length===0"
+            style="color: var(--gray); font-size: 12px"
+          >
+            No skills configured. Click <b>+ New Skill</b> above (or upload to
+            <code>s3://${ASSETS_BUCKET}/skills/&lt;name&gt;/</code> directly).
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Page: Monitoring -->
+    <div x-show="page==='monitoring'" class="page-content">
+      <h2>
+        <svg class="icon s14" style="vertical-align: -2px">
+          <use href="#i-bar-chart" />
+        </svg>
+        Observability
+      </h2>
+
+      <!-- Live status -->
+      <div class="section-card">
+        <h3>Status</h3>
+        <div
+          style="
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 12px;
+            margin-top: 8px;
+          "
+        >
+          <div>
+            <div style="font-size: 11px; color: var(--gray)">
+              Prometheus (AMP)
+            </div>
+            <div style="font-size: 13px">
+              <span
+                :class="systemInfo?.metrics?.enabled ? 'text-green' : 'text-gray'"
+                x-text="systemInfo?.metrics?.enabled ? '● Enabled' : '○ Disabled'"
+              ></span>
+            </div>
+          </div>
+          <div>
+            <div style="font-size: 11px; color: var(--gray)">
+              Grafana (AMG) Workspace
+            </div>
+            <div style="font-size: 13px">
+              <template x-if="systemInfo?.metrics?.grafana_url">
+                <a
+                  :href="systemInfo.metrics.grafana_url"
+                  target="_blank"
+                  style="color: var(--cyan)"
+                  >Open Grafana →</a
+                >
+              </template>
+              <template x-if="!systemInfo?.metrics?.grafana_url">
+                <span class="text-gray">Not provisioned</span>
+              </template>
+            </div>
+          </div>
+          <div>
+            <div style="font-size: 11px; color: var(--gray)">
+              SNS Notifications
+            </div>
+            <div style="font-size: 13px">
+              <span
+                :class="systemInfo?.notifications?.enabled ? 'text-green' : 'text-gray'"
+                x-text="systemInfo?.notifications?.enabled ? '● Enabled' : '○ Disabled'"
+              ></span>
+            </div>
+          </div>
+        </div>
+        <div
+          x-show="!systemInfo?.metrics?.enabled"
+          style="
+            margin-top: 12px;
+            padding: 8px 12px;
+            background: #1a2332;
+            border-radius: 6px;
+            font-size: 12px;
+            color: var(--gray);
+          "
+        >
+          💡 To enable: set <code>metrics.enabled: true</code> in
+          <code>config.yml</code> and redeploy. The stack will provision Amazon
+          Managed Prometheus + Grafana, and ADOT collectors on each host start
+          scraping in ~3 minutes after rollout.
+        </div>
+      </div>
+
+      <!-- Grafana → AMP data source config -->
+      <div
+        class="section-card"
+        x-show="systemInfo?.metrics?.amp_remote_write_url"
+      >
+        <h3>Grafana Data Source</h3>
+        <p style="color: var(--gray); font-size: 13px">
+          In Grafana →
+          <b>Connections → Data sources → Add data source → Prometheus</b>, fill
+          in the values below. The Grafana workspace's IAM role already has read
+          access to AMP, so no static keys are needed.
+        </p>
+        <table style="margin-top: 8px">
+          <tbody>
+            <tr>
+              <td style="white-space: nowrap">
+                <code>Prometheus server URL</code>
+              </td>
+              <td
+                style="
+                  font-family: monospace;
+                  word-break: break-all;
+                  color: var(--text);
+                "
+                x-text="ampQueryUrl()"
+              ></td>
+            </tr>
+            <tr>
+              <td><code>SigV4 auth</code></td>
+              <td><span class="text-green">On</span></td>
+            </tr>
+            <tr>
+              <td style="white-space: nowrap">
+                <code>Authentication Provider</code>
+              </td>
+              <td>
+                <b>AWS SDK Default</b>
+                <span style="color: var(--gray)"
+                  >— "Workspace IAM Role" or "Access &amp; secret key" return
+                  403</span
+                >
+              </td>
+            </tr>
+            <tr>
+              <td><code>Default Region</code></td>
+              <td>
+                <span
+                  style="font-family: monospace; color: var(--text)"
+                  x-text="systemInfo?.region || '-'"
+                ></span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div
+          style="
+            margin-top: 10px;
+            padding: 8px 12px;
+            background: #1a2332;
+            border-radius: 6px;
+            font-size: 12px;
+            color: var(--gray);
+          "
+        >
+          ⚠️ Use the <b>server URL</b> above (workspace root) — not the
+          <code>remote_write</code> URL. Grafana appends
+          <code>/api/v1/query</code> itself.
+        </div>
+        <!-- raw endpoint, for reference -->
+        <div
+          style="
+            margin-top: 12px;
+            font-size: 12px;
+            color: var(--gray);
+            font-family: monospace;
+            word-break: break-all;
+          "
+        >
+          <div>
+            <span style="color: var(--cyan-dim)">ADOT remote_write:</span>
+            <span
+              x-text="systemInfo?.metrics?.amp_remote_write_url || '-'"
+            ></span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Per-VM metrics list -->
+      <div class="section-card">
+        <h3>Per-VM Metrics</h3>
+        <p style="color: var(--gray); font-size: 13px">
+          Each host's <code>host-agent</code> exposes these gauges on
+          <code>:8899/metrics</code>. ADOT scrapes every 30s and remote-writes
+          to AMP via SigV4 (no static credentials).
+        </p>
+        <table style="margin-top: 8px">
+          <thead>
+            <tr>
+              <th>Metric</th>
+              <th>Type</th>
+              <th>Labels</th>
+              <th>Description</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>openclaw_vm_health</code></td>
+              <td>gauge (0/1)</td>
+              <td>tenant</td>
+              <td>1 if VM responded to ping, else 0</td>
+            </tr>
+            <tr>
+              <td><code>openclaw_vm_cpu_pct</code></td>
+              <td>gauge</td>
+              <td>tenant</td>
+              <td>Per-VM CPU usage (percent of allocated vcpus)</td>
+            </tr>
+            <tr>
+              <td><code>openclaw_vm_memory_used_mb</code></td>
+              <td>gauge</td>
+              <td>tenant</td>
+              <td>Per-VM memory in active use (MB, from VmRSS)</td>
+            </tr>
+            <tr>
+              <td><code>openclaw_vm_memory_balloon_mib</code></td>
+              <td>gauge</td>
+              <td>tenant</td>
+              <td>Balloon size held by the host (MiB)</td>
+            </tr>
+            <tr>
+              <td><code>openclaw_vm_disk_used_mb</code></td>
+              <td>gauge</td>
+              <td>tenant</td>
+              <td>Per-VM data disk used (MB)</td>
+            </tr>
+            <tr>
+              <td><code>openclaw_vm_disk_total_mb</code></td>
+              <td>gauge</td>
+              <td>tenant</td>
+              <td>Per-VM data disk capacity (MB)</td>
+            </tr>
+            <tr>
+              <td><code>openclaw_vm_disk_used_pct</code></td>
+              <td>gauge</td>
+              <td>tenant</td>
+              <td>Per-VM data disk used (percent)</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- PromQL examples -->
+      <div class="section-card">
+        <h3>Sample PromQL</h3>
+        <p style="color: var(--gray); font-size: 13px">
+          Copy into Grafana → Explore → AMP datasource.
+        </p>
+        <div
+          style="
+            margin-top: 8px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+          "
+        >
+          <div>
+            <div
+              style="
+                font-size: 11px;
+                color: var(--cyan-dim);
+                margin-bottom: 2px;
+              "
+            >
+              Memory used by all running VMs of a tenant
+            </div>
+            <pre
+              style="
+                background: #0a0e17;
+                border: 1px solid var(--border);
+                border-radius: 6px;
+                padding: 8px 10px;
+                font-size: 11px;
+                color: var(--text);
+                overflow-x: auto;
+                margin: 0;
+              "
+            >
+sum by (tenant) (openclaw_vm_memory_used_mb)</pre
+            >
+          </div>
+          <div>
+            <div
+              style="
+                font-size: 11px;
+                color: var(--cyan-dim);
+                margin-bottom: 2px;
+              "
+            >
+              Hosts with at least one unhealthy VM in the last minute
+            </div>
+            <pre
+              style="
+                background: #0a0e17;
+                border: 1px solid var(--border);
+                border-radius: 6px;
+                padding: 8px 10px;
+                font-size: 11px;
+                color: var(--text);
+                overflow-x: auto;
+                margin: 0;
+              "
+            >
+min_over_time(openclaw_vm_health[1m]) == 0</pre
+            >
+          </div>
+          <div>
+            <div
+              style="
+                font-size: 11px;
+                color: var(--cyan-dim);
+                margin-bottom: 2px;
+              "
+            >
+              Tenants over 90% disk usage
+            </div>
+            <pre
+              style="
+                background: #0a0e17;
+                border: 1px solid var(--border);
+                border-radius: 6px;
+                padding: 8px 10px;
+                font-size: 11px;
+                color: var(--text);
+                overflow-x: auto;
+                margin: 0;
+              "
+            >
+openclaw_vm_disk_used_pct &gt; 90</pre
+            >
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Page: Backups -->
+    <div x-show="page==='backups'" class="page-content">
+      <h2>💾 Backups</h2>
+      <div class="panel-header">
+        <div style="display: flex; align-items: center; gap: 12px">
+          <label style="font-size: 12px; color: var(--gray)">Filter</label>
+          <select
+            class="settings-input"
+            x-model="backupFilter"
+            style="width: 160px"
+          >
+            <option value="all">All</option>
+            <option value="orphan">Orphan only</option>
+          </select>
+          <span
+            style="font-size: 12px; color: var(--gray)"
+            x-text="backupGroups.length + ' tenant(s), ' + filteredBackups.length + ' backup(s)'"
+          ></span>
+        </div>
+        <button
+          class="btn btn-outline btn-sm"
+          @click="loadBackups()"
+          :disabled="loadingBackups"
+        >
+          Refresh
+          <span :class="loadingBackups && 'spin'"
+            ><svg class="icon s13"><use href="#i-refresh" /></svg
+          ></span>
+        </button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Tenant</th>
+              <th>Source Status</th>
+              <th>Backup Time</th>
+              <th>Size</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <template x-if="backupGroups.length === 0 && !loadingBackups">
+              <tr>
+                <td
+                  colspan="5"
+                  class="empty"
+                  x-text="backupFilter==='orphan' ? 'No orphan backups' : 'No backups'"
+                ></td>
+              </tr>
+            </template>
+            <template x-for="g in backupGroups" :key="g.tenant_id">
+              <template
+                x-for="(b, i) in (expandedGroups.has(g.tenant_id) ? g.backups : [g.backups[0]])"
+                :key="b.timestamp"
+              >
+                <tr :class="i > 0 && 'backup-child-row'">
+                  <td>
+                    <template x-if="i === 0">
+                      <span
+                        style="
+                          display: inline-flex;
+                          align-items: center;
+                          gap: 6px;
+                        "
+                      >
+                        <template x-if="g.backups.length > 1">
+                          <button
+                            class="btn-icon backup-toggle"
+                            :class="expandedGroups.has(g.tenant_id) && 'expanded'"
+                            @click="toggleGroup(g.tenant_id)"
+                            :title="expandedGroups.has(g.tenant_id) ? 'Collapse' : 'Expand history'"
+                          >
+                            <svg class="icon s12">
+                              <use href="#i-chevron-right" />
+                            </svg>
+                          </button>
+                        </template>
+                        <template x-if="g.backups.length === 1">
+                          <span
+                            style="display: inline-block; width: 12px"
+                          ></span>
+                        </template>
+                        <span x-text="g.tenant_name || g.tenant_id"></span>
+                        <template x-if="g.tenant_name">
+                          <span
+                            style="color: var(--gray); font-size: 11px"
+                            x-text="g.tenant_id"
+                          ></span>
+                        </template>
+                        <template x-if="g.backups.length > 1">
+                          <span
+                            class="badge badge-count"
+                            x-text="'+' + (g.backups.length - 1) + ' more'"
+                          ></span>
+                        </template>
+                      </span>
+                    </template>
+                    <template x-if="i > 0">
+                      <span
+                        style="
+                          color: var(--gray);
+                          font-size: 11px;
+                          padding-left: 30px;
+                        "
+                        >↳ previous backup</span
+                      >
+                    </template>
+                  </td>
+                  <td>
+                    <template x-if="i === 0">
+                      <span
+                        class="badge"
+                        :class="b.tenant_exists ? 'badge-active' : 'badge-inactive'"
+                        x-text="b.tenant_exists ? 'active' : 'orphan'"
+                      ></span>
+                    </template>
+                  </td>
+                  <td x-text="formatTs(b.timestamp)"></td>
+                  <td x-text="formatBytes(b.size_bytes)"></td>
+                  <td>
+                    <button
+                      class="btn-act"
+                      :title="i === 0 ? 'Restore latest — create a new tenant from this backup' : 'Restore this version'"
+                      @click="openRestore(b)"
+                    >
+                      <svg class="icon s13"><use href="#i-restore" /></svg>
+                    </button>
+                  </td>
+                </tr>
+              </template>
+            </template>
+          </tbody>
+        </table>
+      </div>
+      <p style="color: var(--gray); font-size: 12px; margin-top: 12px">
+        Backups are retained for 7 days (S3 lifecycle). Orphan backups are from
+        tenants that have been deleted — restoring creates a new tenant with the
+        backup's data volume.
+      </p>
+    </div>
+
+    <!-- Page: Load Test (控制面端到端压测,看 p50/p99) -->
+    <!-- ============ Pool Ops: fleet-wide scheduling in one place ============ -->
+    <div x-show="page==='poolops'" class="page-content">
+      <h2>🛠 Pool Ops — 集群调度中枢</h2>
+      <p style="color: var(--dim); margin-bottom: 18px">
+        对整个 openclaw pool 的批量调度行为集中在此,全部走真实控制面端点(无
+        mock): 批量生命周期(<code>POST /batch/tenants</code
+        >)、滚动重建镜像(<code>POST /hosts/refresh-rootfs</code
+        >)、容量账对账。需 operator/admin 角色。
+      </p>
+
+      <!-- 批量生命周期 -->
+      <div
+        class="card"
+        style="
+          border: 1px solid var(--border);
+          border-radius: 10px;
+          padding: 18px;
+          margin-bottom: 18px;
+        "
+      >
+        <h3 style="margin: 0 0 12px; color: var(--accent)">批量生命周期</h3>
+        <div
+          style="
+            display: flex;
+            gap: 12px;
+            align-items: flex-end;
+            flex-wrap: wrap;
+          "
+        >
+          <label
+            >动作<br /><select x-model="poAction" style="min-width: 130px">
+              <option value="stop">停止 stop</option>
+              <option value="start">启动 start</option>
+              <option value="backup">备份 backup</option>
+              <option value="delete">删除 delete</option>
+            </select></label
+          >
+          <label
+            >过滤 tag(可选,空=全部)<br /><input
+              type="text"
+              x-model="poFilterTag"
+              placeholder="team:ml"
+              style="width: 200px"
+          /></label>
+          <button
+            class="btn"
+            :disabled="poBusy"
+            @click="poRunBatch()"
+            x-text="poBusy ? '执行中…' : '执行批量动作'"
+          ></button>
+          <button
+            class="btn"
+            style="background: transparent; border: 1px solid var(--border)"
+            x-show="poResult && poResult.job_id"
+            @click="poPollJob()"
+          >
+            轮询 job
+          </button>
+        </div>
+        <p
+          x-show="poStatus"
+          x-text="poStatus"
+          style="margin-top: 12px; color: var(--dim); font-family: monospace"
+        ></p>
+      </div>
+
+      <!-- 滚动重建镜像 + 容量对账 -->
+      <div style="display: flex; gap: 18px; flex-wrap: wrap">
+        <div
+          class="card"
+          style="
+            flex: 1;
+            min-width: 320px;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 18px;
+          "
+        >
+          <h3 style="margin: 0 0 12px; color: var(--accent)">镜像滚动重建</h3>
+          <p style="color: var(--dim); margin: 0 0 12px; font-size: 13px">
+            拉取最新黄金镜像(rootfs+data template)到所有
+            host,新建/重建节点继承最新镜像。
+          </p>
+          <button
+            class="btn"
+            :disabled="poHostsBusy"
+            @click="poRefreshRootfs()"
+            x-text="poHostsBusy ? '下发中…' : '拉取最新镜像到所有 host'"
+          ></button>
+        </div>
+        <div
+          class="card"
+          style="
+            flex: 1;
+            min-width: 320px;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 18px;
+          "
+        >
+          <h3 style="margin: 0 0 12px; color: var(--accent)">容量账对账</h3>
+          <p style="color: var(--dim); margin: 0 0 12px; font-size: 13px">
+            账面 vm_count vs 真实 running/creating。卡 creating 超 15min
+            的僵尸由 health_check reaper 自动回收容量。
+          </p>
+          <button class="btn" @click="poReconcileView()">刷新对账视图</button>
+        </div>
+      </div>
+      <p
+        x-show="poHostsStatus"
+        x-text="poHostsStatus"
+        style="margin-top: 14px; color: var(--dim); font-family: monospace"
+      ></p>
+    </div>
+
+    <div x-show="page==='loadtest'" class="page-content">
+      <h2>🔥 Load Test — 控制面端到端压测</h2>
+      <p style="color: var(--dim); margin-bottom: 16px">
+        并发触发 N 个 <code>POST /tenants</code>,真实测控制面注册 API 的 p50/p99
+        和 creating→running 可用时延。用于验证「N 个同时启动多久能用」+ 暴露
+        host 容量/超卖/调度争用瓶颈。压测节点名前缀
+        <code>lt-</code>,跑完一键清理。
+      </p>
+      <div
+        class="lt-controls"
+        style="
+          display: flex;
+          gap: 12px;
+          align-items: flex-end;
+          flex-wrap: wrap;
+          margin-bottom: 18px;
+        "
+      >
+        <label
+          >并发数 N<br /><input
+            type="number"
+            x-model.number="ltN"
+            min="1"
+            max="500"
+            style="width: 90px"
+        /></label>
+        <label
+          >vCPU<br /><input
+            type="number"
+            x-model.number="ltVcpu"
+            min="1"
+            max="4"
+            style="width: 70px"
+        /></label>
+        <label
+          >内存MB<br /><input
+            type="number"
+            x-model.number="ltMem"
+            min="512"
+            step="512"
+            style="width: 90px"
+        /></label>
+        <button
+          class="btn-primary"
+          @click="runLoadTest()"
+          :disabled="ltRunning"
+        >
+          <span x-show="!ltRunning">▶ 开始压测</span
+          ><span x-show="ltRunning">压测中…</span>
+        </button>
+        <button
+          class="btn-secondary"
+          @click="cleanupLoadTest()"
+          :disabled="ltRunning"
+        >
+          🧹 清理 lt- 节点
+        </button>
+      </div>
+      <div
+        x-show="ltStatus"
+        class="lt-status"
+        x-text="ltStatus"
+        style="margin-bottom: 12px; color: var(--brand)"
+      ></div>
+      <div
+        x-show="ltResult.done"
+        class="lt-result"
+        style="
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+          gap: 12px;
+        "
+      >
+        <div class="metric-card">
+          <div class="metric-label">POST 成功/总数</div>
+          <div
+            class="metric-value"
+            x-text="ltResult.ok + '/' + ltResult.total"
+          ></div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">POST p50</div>
+          <div class="metric-value" x-text="ltResult.p50 + 's'"></div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">POST p99</div>
+          <div class="metric-value" x-text="ltResult.p99 + 's'"></div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">POST max</div>
+          <div class="metric-value" x-text="ltResult.max + 's'"></div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">全部 running 耗时</div>
+          <div class="metric-value" x-text="ltResult.runningSec + 's'"></div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">running / 成功</div>
+          <div
+            class="metric-value"
+            x-text="ltResult.running + '/' + ltResult.ok"
+          ></div>
+        </div>
+        <div class="metric-card" x-show="ltResult.fail">
+          <div class="metric-label" style="color: var(--red)">失败</div>
+          <div
+            class="metric-value"
+            style="color: var(--red)"
+            x-text="ltResult.fail"
+          ></div>
+        </div>
+      </div>
+      <pre
+        x-show="ltLog"
+        x-text="ltLog"
+        style="
+          margin-top: 14px;
+          background: var(--panel2);
+          padding: 12px;
+          border-radius: 8px;
+          max-height: 240px;
+          overflow: auto;
+          font-size: 12px;
+        "
+      ></pre>
+    </div>
+
+    <!-- Page: Edge — P4-③ (#187) OpenResty ASG + /metrics view -->
+    <div x-show="page==='edge'" class="page-content">
+      <h2>🌐 Edge (OpenResty ASG)</h2>
+      <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 12px;">
+        <button @click="refreshEdge()" class="btn-secondary" :disabled="edgeLoading">
+          <span x-show="!edgeLoading">Refresh</span>
+          <span x-show="edgeLoading">Loading…</span>
+        </button>
+        <span x-show="edgeInstances && edgeInstances.generated_at" style="font-size: 12px; color: var(--muted);">
+          fetched: <span x-text="edgeInstances && edgeInstances.generated_at"></span>
+        </span>
+      </div>
+
+      <template x-if="edgeError">
+        <div class="empty-state" style="color: #e74c3c;">
+          <strong>Error:</strong> <span x-text="edgeError"></span>
+          <p style="font-size: 12px; margin-top: 8px;">
+            If message includes <code>EDGE_STACK_NOT_DEPLOYED</code>, run <code>cdk deploy</code> with
+            <code>edge.enabled=true</code> (see SPEC/11-ENGINE-TRANSFORM/02-DEV-PLAN P2b-iac).
+          </p>
+        </div>
+      </template>
+
+      <section class="section-card" style="margin-bottom: 18px;">
+        <h3>ASG</h3>
+        <template x-if="edgeInstances">
+          <div style="font-size: 13px;">
+            <div>Name: <code x-text="edgeInstances.asg_name"></code></div>
+            <div>
+              min / desired / max:
+              <strong x-text="edgeInstances.asg.min_size"></strong> /
+              <strong x-text="edgeInstances.asg.desired_capacity"></strong> /
+              <strong x-text="edgeInstances.asg.max_size"></strong>
+            </div>
+          </div>
+        </template>
+        <template x-if="!edgeInstances && !edgeError">
+          <div class="empty-state">Click Refresh to load.</div>
+        </template>
+      </section>
+
+      <section class="section-card" style="margin-bottom: 18px;">
+        <h3>Instances</h3>
+        <template x-if="edgeInstances && edgeInstances.instances.length === 0">
+          <div class="empty-state">
+            EdgeASG has no instances (P2b-iac not deployed, or desired_capacity=0).
+          </div>
+        </template>
+        <template x-if="edgeInstances && edgeInstances.instances.length > 0">
+          <table style="width: 100%; font-size: 13px;">
+            <thead>
+              <tr>
+                <th>Instance</th>
+                <th>AZ</th>
+                <th>Lifecycle</th>
+                <th>ASG Health</th>
+                <th>ALB Target</th>
+                <th>Private IP</th>
+                <th>Launched</th>
+              </tr>
+            </thead>
+            <tbody>
+              <template x-for="i in edgeInstances.instances" :key="i.instance_id">
+                <tr>
+                  <td><code x-text="i.instance_id"></code></td>
+                  <td x-text="i.availability_zone"></td>
+                  <td x-text="i.lifecycle_state"></td>
+                  <td x-text="i.health_status"></td>
+                  <td x-text="i.target_health === null ? '—' : i.target_health"></td>
+                  <td><code x-text="i.private_ip"></code></td>
+                  <td x-text="i.launched_at"></td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </template>
+        <template x-if="edgeInstances && edgeInstances.notes && edgeInstances.notes.length > 0">
+          <ul style="font-size: 12px; color: var(--muted); margin-top: 10px;">
+            <template x-for="n in edgeInstances.notes" :key="n">
+              <li x-text="n"></li>
+            </template>
+          </ul>
+        </template>
+      </section>
+
+      <section class="section-card">
+        <h3>/metrics</h3>
+        <template x-if="edgeMetrics && edgeMetrics.metrics_source === 'stub'">
+          <p style="font-size: 12px; color: var(--muted);">
+            Metrics not yet wired (P6 observability stack pending). Edge <code>/metrics</code>
+            endpoint currently emits <code>edge_up 1</code> only. Real counters (L1/L2/L3, cache
+            hit rate, fail-static, upstream latency) will appear after P6 lands.
+          </p>
+        </template>
+        <template x-if="edgeMetrics && edgeMetrics.instances.length > 0">
+          <ul style="font-size: 12px;">
+            <template x-for="m in edgeMetrics.instances" :key="m.instance_id">
+              <li>
+                <code x-text="m.instance_id"></code> —
+                <code x-text="m.private_ip"></code> —
+                reachable: <span x-text="m.reachable === null ? 'unknown (P6)' : m.reachable"></span>
+              </li>
+            </template>
+          </ul>
+        </template>
+        <template x-if="edgeMetrics && edgeMetrics.notes && edgeMetrics.notes.length > 0">
+          <ul style="font-size: 11px; color: var(--muted); margin-top: 10px;">
+            <template x-for="n in edgeMetrics.notes" :key="n">
+              <li x-text="n"></li>
+            </template>
+          </ul>
+        </template>
+      </section>
+    </div>
+
+    <!-- Page: Settings -->
+    <div x-show="page==='settings'" class="page-content">
+      <h2>🔧 Settings</h2>
+
+      <!-- API Connection -->
+      <div class="section-card">
+        <h3>API Connection</h3>
+        <div
+          style="
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            max-width: 680px;
+          "
+        >
+          <label style="font-size: 12px; color: var(--gray)">API URL</label>
+          <input
+            class="settings-input"
+            type="text"
+            x-model="apiUrl"
+            placeholder="https://api.example.com/v1/"
+          />
+          <label style="font-size: 12px; color: var(--gray)">API Key</label>
+          <div style="position: relative">
+            <input
+              class="settings-input"
+              :type="showApiKey ? 'text' : 'password'"
+              x-model="apiKey"
+              placeholder="API Key"
+              style="width: 100%; padding-right: 36px"
+            />
+            <button
+              class="btn-toggle-pw"
+              @click="showApiKey = !showApiKey"
+              title="Toggle visibility"
+            >
+              <svg class="icon s14">
+                <use :href="showApiKey ? '#i-eye-off' : '#i-eye'" />
+              </svg>
+            </button>
+          </div>
+          <button
+            class="btn btn-cyan"
+            style="align-self: flex-start; margin-top: 4px"
+            @click="saving=true; saveSettings(); refresh().then(()=>{saving=false; toast='Settings saved ✓'; setTimeout(()=>toast='',2000)})"
+            :disabled="saving"
+          >
+            <span x-text="saving ? 'Connecting...' : 'Save & Connect'"></span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Infrastructure feature flags (issue: surface multi_az / metrics / waf / quotas / RBAC / agentcore) -->
+      <div class="section-card" x-show="systemInfo">
+        <h3>
+          <svg class="icon s14" style="vertical-align: -2px">
+            <use href="#i-shield" />
+          </svg>
+          Infrastructure
+        </h3>
+        <p style="color: var(--gray); font-size: 13px">
+          Optional features and their current status. Toggle in
+          <code>config.yml</code> and re-run <code>./setup.sh</code>.
+        </p>
+        <!-- Fixed 4-col grid so Login (col4/row1) sits directly above RBAC
+         (col4/row2) — a related pair, top-over-bottom. Falls back to 2 cols
+         on narrow screens (the explicit col/row only apply at >=900px). -->
+        <div class="infra-grid">
+          <!-- Multi-AZ -->
+          <div style="grid-column: 3; grid-row: 1">
+            <div style="font-size: 11px; color: var(--gray)">Multi-AZ HA</div>
+            <div style="font-size: 13px">
+              <span
+                :class="systemInfo?.multi_az?.enabled ? 'text-green' : 'text-gray'"
+                x-text="systemInfo?.multi_az?.enabled
+                          ? '● ' + (systemInfo.multi_az.az_count || 1) + ' AZ'
+                          : '○ Single AZ (default)'"
+              ></span>
+            </div>
+          </div>
+          <!-- Metrics / AMP -->
+          <div style="grid-column: 2; grid-row: 1">
+            <div style="font-size: 11px; color: var(--gray)">
+              Prometheus + Grafana
+            </div>
+            <div style="font-size: 13px">
+              <span
+                :class="systemInfo?.metrics?.enabled ? 'text-green' : 'text-gray'"
+                x-text="systemInfo?.metrics?.enabled ? '● Provisioned' : '○ Disabled'"
+              ></span>
+            </div>
+          </div>
+          <!-- WAF -->
+          <div style="grid-column: 4; grid-row: 2">
+            <div style="font-size: 11px; color: var(--gray)">AWS WAF</div>
+            <div style="font-size: 13px">
+              <span
+                :class="systemInfo?.waf?.enabled ? 'text-green' : 'text-gray'"
+                x-text="systemInfo?.waf?.enabled ? '● Enabled' : '○ Disabled'"
+              ></span>
+            </div>
+          </div>
+          <!-- Console Login + RBAC — two independent switches (1.5.4). Kept as
+           separate grid cells (like every other flag) but pinned to the same
+           column, consecutive rows, so the related pair reads top-over-bottom. -->
+          <div style="grid-column: 1; grid-row: 1">
+            <div style="font-size: 11px; color: var(--gray)">
+              Console Login (Cognito)
+            </div>
+            <div style="font-size: 13px">
+              <span
+                :class="systemInfo?.cognito?.enabled ? 'text-green' : 'text-gray'"
+                x-text="systemInfo?.cognito?.enabled ? '● Enabled' : '○ API key only'"
+              ></span>
+            </div>
+          </div>
+          <div style="grid-column: 1; grid-row: 2">
+            <div style="font-size: 11px; color: var(--gray)">
+              RBAC (role-gating)
+            </div>
+            <div style="font-size: 13px">
+              <span
+                :class="systemInfo?.cognito?.rbac_enabled ? 'text-green' : 'text-gray'"
+                x-text="systemInfo?.cognito?.rbac_enabled ? '● Enabled' : '○ Disabled'"
+              ></span>
+            </div>
+          </div>
+          <!-- Notifications -->
+          <div style="grid-column: 2; grid-row: 2">
+            <div style="font-size: 11px; color: var(--gray)">
+              SNS Lifecycle Events
+            </div>
+            <div style="font-size: 13px">
+              <span
+                :class="systemInfo?.notifications?.enabled ? 'text-green' : 'text-gray'"
+                x-text="systemInfo?.notifications?.enabled ? '● Publishing' : '○ Disabled'"
+              ></span>
+            </div>
+          </div>
+          <!-- Quotas -->
+          <div style="grid-column: 3; grid-row: 2">
+            <div style="font-size: 11px; color: var(--gray)">
+              Per-tenant Quotas
+            </div>
+            <div style="font-size: 13px">
+              <span
+                :class="systemInfo?.quotas?.enabled ? 'text-green' : 'text-gray'"
+                x-text="systemInfo?.quotas?.enabled ? '● Enforced' : '○ Unlimited'"
+              ></span>
+            </div>
+            <div
+              x-show="systemInfo?.quotas?.enabled"
+              style="font-size: 11px; color: var(--gray); margin-top: 2px"
+            >
+              <span
+                x-text="'vCPU: ' + (systemInfo?.quotas?.max_vcpu_per_tenant || 0) + ', Mem: ' + (systemInfo?.quotas?.max_mem_mb_per_tenant || 0) + 'MB, Disk: ' + (systemInfo?.quotas?.max_data_disk_mb || 0) + 'MB'"
+              ></span>
+            </div>
+          </div>
+          <!-- AgentCore -->
+          <div style="grid-column: 4; grid-row: 1">
+            <div style="font-size: 11px; color: var(--gray)">AgentCore</div>
+            <div style="font-size: 13px">
+              <span
+                :class="agentcoreStatus?.enabled ? 'text-green' : 'text-gray'"
+                x-text="agentcoreStatus?.enabled ? '● Enabled' : '○ Disabled'"
+              ></span>
+            </div>
+            <div
+              x-show="agentcoreStatus?.gateway_url"
+              style="
+                font-size: 11px;
+                color: var(--gray);
+                margin-top: 2px;
+                word-break: break-all;
+              "
+            >
+              <span
+                x-text="'Gateway: ' + (agentcoreStatus?.gateway_url || '')"
+              ></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Host overcommit -->
+      <div class="section-card" x-show="systemInfo?.host_config">
+        <h3>Host Overcommit Ratios</h3>
+        <p style="color: var(--gray); font-size: 13px">
+          Allocatable resources = physical × ratio. Tune in
+          <code>config.yml</code> under <code>host:</code>.
+        </p>
+        <div
+          style="
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 14px;
+            margin-top: 8px;
+            font-size: 13px;
+          "
+        >
+          <div>
+            <span style="color: var(--gray)">CPU overcommit:</span>
+            <span
+              x-text="'×' + (systemInfo?.host_config?.cpu_overcommit_ratio || 1)"
+            ></span>
+          </div>
+          <div>
+            <span style="color: var(--gray)">Memory overcommit:</span>
+            <span
+              x-text="'×' + (systemInfo?.host_config?.mem_overcommit_ratio || 1)"
+            ></span>
+          </div>
+          <div>
+            <span style="color: var(--gray)">Default per tenant:</span>
+            <span
+              x-text="(systemInfo?.host_config?.vm_default_vcpu || '?') + ' vCPU, ' + (systemInfo?.host_config?.vm_default_mem_mb || '?') + ' MB'"
+            ></span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 1.2.9 — Fleet distribution across AZs (visible regardless of multi_az
+       so single-AZ deployments also see "all in 1a"). -->
+      <div class="section-card" x-show="hosts.length > 0">
+        <h3>
+          <svg class="icon s14" style="vertical-align: -2px">
+            <use href="#i-globe" />
+          </svg>
+          Fleet by AZ
+        </h3>
+        <p style="color: var(--gray); font-size: 13px">
+          Live distribution of registered hosts and their tenants across
+          Availability Zones. Set <code>multi_az.enabled: true</code> in
+          <code>config.yml</code> to spread the ASG.
+        </p>
+        <table style="margin-top: 8px; font-size: 12px">
+          <thead>
+            <tr>
+              <th>Availability Zone</th>
+              <th>Hosts</th>
+              <th>VMs</th>
+              <th>vCPU used / total</th>
+            </tr>
+          </thead>
+          <tbody>
+            <template x-for="g in fleetByAz" :key="g.az">
+              <tr>
+                <td x-text="g.az"></td>
+                <td x-text="g.hosts"></td>
+                <td x-text="g.vms"></td>
+                <td x-text="g.vcpu_used + ' / ' + g.vcpu_total"></td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- System Info -->
+      <div class="section-card">
+        <h3>System</h3>
+        <div style="font-size: 13px; color: var(--gray)">
+          <div>
+            Console URL: <span x-text="window.location.origin"></span>
+          </div>
+          <div>
+            GitHub:
+            <a
+              href="https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker"
+              target="_blank"
+              style="color: var(--cyan)"
+              >aws-samples/sample-multi-tenant-openclaw-on-firecracker</a
+            >
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Create / Restore Tenant Modal (global — not nested in any tab so it's visible from Tenants and Backups) -->
+    <!-- 1.4.1 (#63) — Skill upload modal -->
+    <template x-if="showSkillUpload">
+      <div class="overlay" @click.self="showSkillUpload=false">
+        <div class="modal" style="width: 680px">
+          <h3>Upload New Skill</h3>
+          <div class="form-row">
+            <label>Name</label>
+            <input
+              type="text"
+              x-model="skillUploadForm.name"
+              placeholder="lowercase-with-hyphens"
+              pattern="^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$"
+              style="width: 100%"
+            />
+          </div>
+          <div class="form-row">
+            <label>SKILL.md content</label>
+            <textarea
+              x-model="skillUploadForm.content"
+              style="
+                width: 100%;
+                height: 300px;
+                font-family: monospace;
+                font-size: 12px;
+                padding: 8px;
+                background: var(--bg-mid);
+                border: 1px solid var(--border);
+                border-radius: 4px;
+                color: var(--text);
+                resize: vertical;
+              "
+              spellcheck="false"
+            ></textarea>
+            <small style="color: var(--gray); font-size: 11px"
+              >Must contain at least one top-level <code># Title</code> line.
+              Max 256 KiB.</small
+            >
+          </div>
+          <div
+            style="
+              display: flex;
+              gap: 8px;
+              justify-content: flex-end;
+              margin-top: 12px;
+            "
+          >
+            <button
+              class="btn btn-outline btn-sm"
+              @click="showSkillUpload=false"
+            >
+              Cancel
+            </button>
+            <button class="btn btn-cyan btn-sm" @click="uploadSkill()">
+              Upload
+            </button>
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <!-- 1.4.1 (#63) — Group create modal -->
+    <template x-if="showGroupModal">
+      <div class="overlay" @click.self="showGroupModal=false">
+        <div class="modal">
+          <h3>Create Skill Group</h3>
+          <div class="form-row">
+            <label>Name</label>
+            <input
+              type="text"
+              x-model="groupForm.name"
+              placeholder="team-sre"
+              pattern="^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$"
+              style="width: 100%"
+            />
+          </div>
+          <div class="form-row">
+            <label>Description (optional)</label>
+            <input
+              type="text"
+              x-model="groupForm.description"
+              placeholder="SRE team standard tools"
+              style="width: 100%"
+            />
+          </div>
+          <div class="form-row">
+            <label>Initial skills (comma-separated, optional)</label>
+            <input
+              type="text"
+              x-model="groupForm.skills_text"
+              placeholder="k8s-debug, incident-response"
+              style="width: 100%"
+            />
+            <small style="color: var(--gray); font-size: 11px"
+              >You can add/remove skills later via the group's edit
+              panel.</small
+            >
+          </div>
+          <div
+            style="
+              display: flex;
+              gap: 8px;
+              justify-content: flex-end;
+              margin-top: 12px;
+            "
+          >
+            <button
+              class="btn btn-outline btn-sm"
+              @click="showGroupModal=false"
+            >
+              Cancel
+            </button>
+            <button class="btn btn-cyan btn-sm" @click="createGroup()">
+              Create
+            </button>
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <template x-if="showModal">
+      <div class="overlay" @click.self="closeCreateModal()">
+        <div class="modal">
+          <button class="close-btn" @click="closeCreateModal()">
+            <svg class="icon s16"><use href="#i-delete" /></svg>
+          </button>
+          <h2 x-text="restoreSource ? 'Create from Backup' : 'New Tenant'"></h2>
+          <template x-if="restoreSource">
+            <div
+              style="
+                margin: -4px 0 12px;
+                padding: 8px 10px;
+                border: 1px solid var(--border);
+                border-radius: 6px;
+                background: var(--bg);
+                font-size: 12px;
+              "
+            >
+              <div style="color: var(--gray)">Source backup</div>
+              <div style="color: var(--text); margin-top: 2px">
+                <span
+                  x-text="restoreSource.tenant_name || restoreSource.tenant_id"
+                ></span>
+                <span style="color: var(--gray)"> · </span>
+                <span x-text="formatTs(restoreSource.timestamp)"></span>
+                <span style="color: var(--gray)"> · </span>
+                <span x-text="formatBytes(restoreSource.size_bytes)"></span>
+                <template x-if="!restoreSource.tenant_exists">
+                  <span
+                    class="badge badge-inactive"
+                    style="margin-left: 8px; font-size: 10px"
+                    >orphan</span
+                  >
+                </template>
+              </div>
+            </div>
+          </template>
+          <label>Name <span class="req">*</span></label>
+          <input
+            type="text"
+            x-model="form.name"
+            placeholder="e.g. my-tenant"
+            maxlength="32"
+            @keydown.enter="!nameError && createTenant()"
+            :class="{'invalid': form.name && nameError}"
+          />
+          <div
+            class="hint"
+            :class="{'err': form.name && nameError}"
+            x-text="form.name && nameError ? nameError : '1–32 chars: lowercase letters, digits, hyphens (no leading/trailing hyphen)'"
+          ></div>
+          <label>vCPU <span class="opt">optional</span></label>
+          <input type="number" x-model.number="form.vcpu" placeholder="2" />
+          <label>Memory (MB) <span class="opt">optional</span></label>
+          <input
+            type="number"
+            x-model.number="form.memory_mb"
+            placeholder="4096"
+          />
+          <label>Config Template <span class="opt">optional</span></label>
+          <select x-model="form.config_template" class="settings-input">
+            <option value="">Default (built-in)</option>
+            <template x-for="t in templates" :key="t.name">
+              <option :value="t.name" x-text="t.name"></option>
+            </template>
+          </select>
+          <label
+            >Skill Group
+            <span class="opt"
+              >optional — scopes which skills this tenant gets</span
+            ></label
+          >
+          <select x-model="form.group" class="settings-input">
+            <option value="">All skills (broadcast — no scoping)</option>
+            <template x-for="g in groups" :key="g.name">
+              <option
+                :value="g.name"
+                x-text="g.name + ' — ' + (g.skills||[]).length + ' skill(s)'"
+              ></option>
+            </template>
+          </select>
+          <label
+            >Target host
+            <span class="opt">optional — admin/operator only</span></label
+          >
+          <select
+            x-model="form.preferred_host_id"
+            class="settings-input"
+            style="margin-bottom: 14px"
+          >
+            <option value="">
+              Auto (scheduler picks first host with capacity)
+            </option>
+            <template
+              x-for="h in availableHostsForCreate()"
+              :key="h.instance_id"
+            >
+              <option
+                :value="h.instance_id"
+                x-text="h.instance_id + (h.az ? ' (' + h.az + ')' : '') + ' — ' + (h.total_vcpu - h.used_vcpu) + ' free vCPU, ' + h.vm_count + ' VM(s)'"
+              ></option>
+            </template>
+          </select>
+          <label
+            >Tags
+            <span class="opt">optional — one per line, key:value</span></label
+          >
+          <textarea
+            x-model="form.tags_text"
+            placeholder="team:ml&#10;env:dev"
+            style="
+              width: 100%;
+              background: #0a0e17;
+              border: 1px solid var(--border);
+              color: var(--text);
+              padding: 8px 12px;
+              border-radius: 4px;
+              font-size: 12px;
+              font-family: monospace;
+              height: 60px;
+              margin-bottom: 14px;
+              resize: vertical;
+            "
+          ></textarea>
+          <div class="modal-actions">
+            <button class="btn btn-cyan" @click="closeCreateModal()">
+              Cancel
+            </button>
+            <button
+              class="btn btn-create"
+              @click="createTenant()"
+              :disabled="!form.name || !!nameError"
+              x-text="restoreSource ? 'Create from Backup' : 'Create'"
+            ></button>
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <!-- #187 Reveal Token / Descriptor Modal(Abel 2026-07-08:控制面功能全上 console)
+         GET /tenants/{id}/token → 显示 KMS 密文(base64 信封);API 侧不 decrypt,
+         调用方拿 EncryptionContext={tenant_id: <id>} 自解得明文(§INTERFACE-CONTRACT §5)。
+         附 descriptor:host_private_ip / host_port / guest_ip / status。 -->
+    <template x-if="revealState.open">
+      <div class="overlay" @click.self="closeReveal()">
+        <div class="modal" style="max-width: 700px">
+          <button class="close-btn" @click="closeReveal()">
+            <svg class="icon s16"><use href="#i-delete" /></svg>
+          </button>
+          <h2>Gateway Token &amp; Descriptor</h2>
+          <div
+            style="
+              margin: -4px 0 12px;
+              padding: 8px 10px;
+              border: 1px solid var(--border);
+              border-radius: 6px;
+              background: var(--bg);
+              font-size: 12px;
+            "
+          >
+            <div style="color: var(--gray)">Tenant</div>
+            <div
+              style="color: var(--text); margin-top: 2px; font-family: monospace"
+              x-text="revealState.tenantId"
+            ></div>
+          </div>
+          <template x-if="revealState.loading">
+            <p style="color: var(--gray); font-size: 13px">加载中…</p>
+          </template>
+          <template x-if="revealState.error">
+            <p style="color: var(--red); font-size: 13px" x-text="revealState.error"></p>
+          </template>
+          <template x-if="revealState.descriptor && !revealState.loading">
+            <div>
+              <h4 style="margin: 12px 0 6px; font-size: 13px">Descriptor</h4>
+              <table
+                style="
+                  font-size: 12px;
+                  width: 100%;
+                  border-collapse: collapse;
+                  margin-bottom: 12px;
+                "
+              >
+                <tbody>
+                  <tr>
+                    <td style="color: var(--gray); padding: 2px 8px 2px 0; width: 140px">
+                      host_private_ip
+                    </td>
+                    <td
+                      style="font-family: monospace"
+                      x-text="revealState.descriptor.host_private_ip || '—'"
+                    ></td>
+                  </tr>
+                  <tr>
+                    <td style="color: var(--gray); padding: 2px 8px 2px 0">host_port</td>
+                    <td
+                      style="font-family: monospace"
+                      x-text="revealState.descriptor.host_port || '—'"
+                    ></td>
+                  </tr>
+                  <tr>
+                    <td style="color: var(--gray); padding: 2px 8px 2px 0">guest_ip</td>
+                    <td
+                      style="font-family: monospace"
+                      x-text="revealState.descriptor.guest_ip || '—'"
+                    ></td>
+                  </tr>
+                  <tr>
+                    <td style="color: var(--gray); padding: 2px 8px 2px 0">status</td>
+                    <td
+                      style="font-family: monospace"
+                      x-text="revealState.descriptor.status || '—'"
+                    ></td>
+                  </tr>
+                </tbody>
+              </table>
+              <h4 style="margin: 12px 0 6px; font-size: 13px">
+                Gateway Token(KMS 信封密文)
+              </h4>
+              <p style="color: var(--gray); font-size: 12px; line-height: 1.5">
+                下方是 base64 信封密文,API Lambda 从
+                <code>openclaw-tenant-secrets</code> DDB 表原样吐出、
+                <b>不 decrypt</b>。调用方拿到后用
+                <code>kms:Decrypt</code> +
+                EncryptionContext=<code x-text="JSON.stringify(revealState.descriptor.encryption_context)"></code>
+                自解得明文,再作 Bearer 打
+                <code>/ws/{tenant_id}/v1/chat/completions</code>。TTL 900s,
+                过窗口需重铸(不从 VM 回读)。
+              </p>
+              <textarea
+                readonly
+                x-model="revealState.ciphertext"
+                style="
+                  width: 100%;
+                  height: 120px;
+                  font-family: monospace;
+                  font-size: 11px;
+                  padding: 8px;
+                  border: 1px solid var(--border);
+                  border-radius: 4px;
+                  resize: vertical;
+                "
+              ></textarea>
+              <div style="text-align: right; margin-top: 8px">
+                <button
+                  class="btn btn-cyan"
+                  @click="copyText(revealState.ciphertext)"
+                >
+                  复制密文
+                </button>
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+    </template>
+
+    <!-- Migrate Tenant Modal (issue: API has /tenants/{id}/migrate but no UI surfaced it) -->
+    <template x-if="migrateSource">
+      <div class="overlay" @click.self="migrateSource=null">
+        <div class="modal">
+          <button class="close-btn" @click="migrateSource=null">
+            <svg class="icon s16"><use href="#i-delete" /></svg>
+          </button>
+          <h2>Migrate Tenant</h2>
+          <div
+            style="
+              margin: -4px 0 12px;
+              padding: 8px 10px;
+              border: 1px solid var(--border);
+              border-radius: 6px;
+              background: var(--bg);
+              font-size: 12px;
+            "
+          >
+            <div style="color: var(--gray)">Tenant</div>
+            <div style="color: var(--text); margin-top: 2px">
+              <span x-text="migrateSource.name || migrateSource.id"></span>
+              <span style="color: var(--gray)"> · current host </span>
+              <span x-text="migrateSource.host_id"></span>
+              <span
+                style="color: var(--gray)"
+                x-show="hostAz(migrateSource.host_id)"
+                x-text="' · ' + hostAz(migrateSource.host_id)"
+              ></span>
+            </div>
+          </div>
+          <p style="font-size: 12px; color: var(--gray); margin-bottom: 8px">
+            Live migration via Firecracker snapshot/restore. The VM is paused on
+            the source, snapshotted to S3, restored on the target host, then
+            resumed. Pause window is on the order of seconds, not
+            user-perceptible for most agents.
+          </p>
+          <label>Target host <span class="req">*</span></label>
+          <select
+            class="settings-input"
+            x-model="migrateTarget"
+            style="margin-bottom: 14px"
+          >
+            <option value="">Choose a host…</option>
+            <template
+              x-for="h in availableMigrationTargets()"
+              :key="h.instance_id"
+            >
+              <option
+                :value="h.instance_id"
+                x-text="h.instance_id + (h.az ? ' (' + h.az + ')' : '') + ' — ' + h.used_vcpu + '/' + h.total_vcpu + ' vCPU, ' + h.vm_count + ' VM(s)'"
+              ></option>
+            </template>
+          </select>
+          <div
+            x-show="availableMigrationTargets().length === 0"
+            class="hint err"
+          >
+            No other active hosts available. Scale ASG out first or wait for
+            capacity.
+          </div>
+          <div class="modal-actions">
+            <button class="btn btn-cyan" @click="migrateSource=null">
+              Cancel
+            </button>
+            <button
+              class="btn btn-create"
+              @click="migrateTenant()"
+              :disabled="!migrateTarget"
+            >
+              Migrate
+            </button>
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <div class="toast" x-show="toast" x-transition x-text="toast"></div>
+    <footer class="footer" x-data>
+      <span>Version</span>
+      <span x-text="'v' + (window.OC_VERSION || 'dev')"></span>
+    </footer>
+  </body>
+</html>

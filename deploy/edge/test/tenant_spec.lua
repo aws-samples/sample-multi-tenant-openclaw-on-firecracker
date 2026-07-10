@@ -1,6 +1,6 @@
 -- deploy/edge/test/tenant_spec.lua
 --
--- extract_tenant_id — adversarial coverage matrix.
+-- extract_tenant_id — adversarial coverage matrix per 03-TEST-PLAN.
 
 local helper = require "spec_helper"
 local tenant = require "edge.lib.tenant"
@@ -17,9 +17,9 @@ describe("tenant.extract_tenant_id", function()
     end)
 
     it("extracts self-service prefix id (u-slug)", function()
-        local tid, err = tenant.extract_tenant_id("/ws/u-demo/v1/responses", nil)
+        local tid, err = tenant.extract_tenant_id("/ws/u-abel-demo/v1/responses", nil)
         assert.is_nil(err)
-        assert.are.equal("u-demo", tid)
+        assert.are.equal("u-abel-demo", tid)
     end)
 
     it("extracts id with no trailing slash", function()

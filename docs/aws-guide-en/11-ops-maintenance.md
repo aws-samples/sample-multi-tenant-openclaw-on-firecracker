@@ -448,6 +448,6 @@ Run these before taking over operations:
    against the actual deployment.
 3. Load Grafana; if there are no dashboards, run the provisioning script.
 4. Execute one manual failover drill (ElastiCache + host AZ).
-5. Review the last 30 days of release notes.
-6. Review the production-safety rules (never delete resources without a
-   snapshot; treat unknowns as production).
+5. Read the last 30 days of `CHANGELOG.md`.
+6. Read `.claude/rules/amazon-production-safety-do-not-delete.md` (never
+   delete resources without a snapshot; treat unknowns as production).

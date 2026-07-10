@@ -79,7 +79,7 @@ multi_az:
   enabled: true
   az_count: 2
 
-# ========== 网络(P2b · #187,FR-10)==========
+# ========== 网络(P2b · #187,INTERFACE-CONTRACT §6/FR-10)==========
 # 默认 `default_vpc` 保存量兼容(host 裸公网,不推荐;仅早期 demo/dev)。
 # 生产走 `self_managed`:自建 /20 VPC + 3 公有子网(ALB/NAT GW)+ 3 NAT GW +
 # 3 私有子网(host/edge/Redis 全在私有)。客户已有 VPC 就走 `imported`,
@@ -165,9 +165,7 @@ scaler:
 # 与上面 scaler.lifecycle_queue_enabled(FIFO,治同租户下 lifecycle 有序)是并行两条
 # 通道:lifecycle FIFO 继续管 stop/delete(需 per-tenant 严格有序),dispatch 标准队列
 # 只管 create/start 的高并发装箱聚合。一期 push=聚合 SSM(单 host 一条命令带 batch
-# manifest),二期 pull=写 assignments 表让 host-agent 自取。设计契约:
-# SPEC/specs/sqs-dispatch/interfaces.md。ADR:
-# (internal design docs)。
+# manifest),二期 pull=写 assignments 表让 host-agent 自取。
 #
 # 开关矩阵(interfaces.md L30):
 #   dispatch.enabled=false → 什么都不建,现状不变(向后兼容)。
@@ -278,9 +276,17 @@ console_auth:
   # 操作必须带 Cognito id_token。放宽到 operator/admin = 任何持 API key 者无需登录即可
   # 写/改,等于削掉一层门控,仅在受信内网自动化等明确场景才放宽,生产保持 viewer。
   default_no_jwt_role: viewer
+  # Task 9.2 (#149) — Console BFF(前端零 key)。console_auth.enabled=true 即部署
+  # openclaw-console-bff Lambda + Lambda 目标组;再配下面的【区域内】ACM 证书 ARN
+  # 才在 DashboardALB 上开 443 listener + authenticate-cognito 登录门
+  # (/console/* 与 /capi/* 先过 Cognito Hosted UI 登录再转发 BFF)。不配证书则
+  # BFF 就位但不接流量(ALB 的 authenticate-cognito 只能挂 HTTPS listener)。
+  # 真 admin key 不进 IaC 模板:部署后由 setup.sh 写入 Lambda env CTRL_API_KEY。
+  bff_certificate_arn: ""
+  bff_domain: ""                   # BFF 对外域名(Cognito OAuth 回调);留空用 ALB DNS
   # WI-002 — channel 段 Cognito 鉴权(#187 P5 已随 channel/hub 数据面下线归档,
   # 保留字段防呆:openclaw-tenant-secrets 老残留字段清理 UpdateExpression 仍幂等
-  # REMOVE)。历史 ADR 见 (archived)。
+  # REMOVE)。
   channel_cognito_auth: false
 
 # 控制面 DynamoDB 表的时间点恢复(PITR)。覆盖 tenants/hosts/groups/audit 四张 RETAIN 表
@@ -318,26 +324,26 @@ external_authz:
   secret_name: ""                  # Secrets Manager 里的 HMAC 共享密钥名(外部后端签名用);走 CFN 动态引用,明文不进模板
   # user_pool_id: ""              # 复用已有 User Pool（留空自动创建）
 
-# ========== 外部平台 IdP 联合 (可选, OIDC) ==========
-# 让外部平台用户用既有账号经 OIDC 联合登录到同一个 Cognito User Pool。
+# ========== 交易所 IdP 联合 (可选, OIDC) ==========
+# 让交易所用户用既有账号经 OIDC 联合登录到同一个 Cognito User Pool (task #13/#14)。
 # 依赖 console_auth.enabled=true (provider 挂在 console 的 User Pool 上)。
 # enabled=false (默认) 时不加任何 provider, User Pool 保持 COGNITO-only, 完全向后兼容。
 #
-# 注意: 这里只提供"接入点 + 契约", 外部平台真实 OIDC 端点 (issuer/client) 由外部平台侧提供,
+# 注意: 这里只提供"接入点 + 契约", 交易所真实 OIDC 端点 (issuer/client) 由交易所侧提供,
 # 我方不硬编造。client_secret 走 Secrets Manager 动态引用, 明文绝不进 CloudFormation 模板。
 #
 # 联合对 hub 透明: hub 仍只验 Cognito 签发的 id_token (零凭据 guest 约束不变)。
-# attribute mapping 把外部平台稳定 id (默认 OIDC `sub` claim) 映到 Cognito 自定义属性
+# attribute mapping 把交易所稳定 id (默认 OIDC `sub` claim) 映到 Cognito 自定义属性
 # custom:tenant_user_id; Cognito 自身生成的 sub 作为租户 owner_id。
 exchange_idp:
   enabled: false                   # 开关; false 时下面字段全部忽略
   # provider_name: "ExchangeIdP"      # Cognito 里该 provider 的名字 (hosted-UI 按钮 + supported 列表)
-  # issuer_url: ""                 # 【外部平台侧提供】OIDC issuer URL, 留空=不启用 (CDK 自动发现 .well-known)
-  # client_id: ""                  # 【外部平台侧提供】OIDC client id
+  # issuer_url: ""                 # 【交易所侧提供】OIDC issuer URL, 留空=不启用 (CDK 自动发现 .well-known)
+  # client_id: ""                  # 【交易所侧提供】OIDC client id
   # client_secret_secret: ""       # client secret 所在的 Secrets Manager 密钥名/ARN (不写明文!)
   # client_secret_json_key: ""     # 若密钥是 JSON, 取哪个 key; 纯字符串密钥留空
-  # scopes: ["openid", "profile", "email"]   # 向外部平台 IdP 请求的 OAuth2 scopes
-  # stable_id_claim: "sub"         # 外部平台端稳定用户 id 所在的 OIDC claim, 映到 custom:tenant_user_id
+  # scopes: ["openid", "profile", "email"]   # 向交易所 IdP 请求的 OAuth2 scopes
+  # stable_id_claim: "sub"         # 交易所端稳定用户 id 所在的 OIDC claim, 映到 custom:tenant_user_id
   # attribute_request_method: "GET"  # GET | POST, IdP userInfo 端点的请求方法
   # map_email: true                # 是否把 email claim 也映到 Cognito email 属性
 
@@ -393,7 +399,7 @@ security:
   #   测试期可先用一把手工指定的 CMK 加密验证链路,部署后切成本栈输出的 ARN。
   clawpool_cmk_enabled: false
   guardduty_enabled: false   # true=CDK 启 GuardDuty detector + 把 Finding 经 EventBridge 路由到 SNS(供 Wazuh/订阅者消费)。账号已有 detector 时保持 false。
-  guardduty_runtime_monitoring: false   # true=在 detector 上启 RUNTIME_MONITORING feature,同时把 EC2_AGENT_MANAGEMENT 显式设为 DISABLED —— 开 automated agent management 会给账号内所有 EC2 装 GuardDuty agent(SSM association),会波及本栈之外的 host。安全开启法:只给需要监控的实例打 inclusion tag GuardDutyManaged=true(或反向给不想装的 host 打 exclusion tag GuardDutyManaged=false)。account 层威胁检测(GD 自身的 9 feature)不受此开关影响,一手证据 (internal design docs):163-181。前置:guardduty_enabled: true。默认 false。
+  guardduty_runtime_monitoring: false   # true=在 detector 上启 RUNTIME_MONITORING feature,同时把 EC2_AGENT_MANAGEMENT 显式设为 DISABLED —— 开 automated agent management 会给账号内所有 EC2 装 GuardDuty agent(SSM association),会波及本栈之外的 host。安全开启法:只给需要监控的实例打 inclusion tag GuardDutyManaged=true(或反向给不想装的 host 打 exclusion tag GuardDutyManaged=false)。account 层威胁检测(GD 自身的 9 feature)不受此开关影响。前置:guardduty_enabled: true。默认 false。
   inspector_enabled: false   # true=在本 region 启用 Amazon Inspector v2(经 AwsCustomResource 调 inspector2:Enable),对 EC2/ECR 做 CVE 与配置扫描,Finding 经 EventBridge 路由到 SNS。默认 false:Enable 是账号级动作(按扫描资源计费),建议由账号运营方显式打开。stack destroy 时会 Disable。
   inspector_resource_types: ["EC2", "ECR"]   # inspector_enabled=true 时扫描的资源类型。可选 EC2/ECR/LAMBDA/LAMBDA_CODE/CODE_REPOSITORY。默认覆盖 host CVE(EC2) + 镜像 CVE(ECR)。
   wazuh_enabled: false       # true=CDK 起一台专用监控 EC2(m7i.xlarge/AL2023),userdata 自动装 docker+compose 跑 Wazuh manager/indexer/dashboard,从 assets bucket 拉 deployment/monitoring/*。SG 仅 VPC CIDR 入站(1514/1515/55000/443,绝不 0.0.0.0)。默认 false。
@@ -419,16 +425,26 @@ security:
   egress_allowlist_include_vpc_cidr: true   # gate 开时是否自动放行整个 VPC CIDR(覆盖 LiteLLM/EKS hub/VPC endpoint 私网)。默认 true。
   # 额外放行的自定义 CIDR(逗号分隔,如堡垒机所在的对等 VPC / 独立 LiteLLM 子网)。VPC CIDR 已自动放行。
   egress_allowlist_cidrs: ""
-  # 额外放行的 FQDN(逗号分隔,叠在内置 cognito-idp/s3 默认域名之上;如 finance-agent 的外部行情 API 域名)。
+  # 额外放行的 FQDN(逗号分隔,叠在内置 cognito-idp/s3 默认域名之上;如 finance-agent 的交易所行情 API 域名)。
   egress_allowlist_domains: ""
   # host dnsmasq 的上游解析器。默认沿用 guest 原硬编码 8.8.8.8 便于对齐;可改 VPC Resolver 169.254.169.253。
   egress_dns_upstream: "8.8.8.8"
 
+# ========== claw-hub 端点(microVM channel dial-out 目标)==========
+# 每个 microVM 的 claw-channel 拨出到 hub 注册(jarvis 同款 outbound WS)。
+# 默认走 host 本地 tap IP 上的 hub(单 host 自包含,向后兼容)。配 alb_dns 后,
+# launch-vm.sh 注入的 HUB_URL/HUB_WS 改指 EKS hub ALB —— 节点重建即继承,
+# 这是"切 EKS 生产流量"的长期做法(改部署代码→重建,非热改运行中 VM)。
+# 留空=metal 本地 hub(默认)。这是 ②EKS 灰度切生产流量的唯一开关。
+hub:
+  alb_dns: ""                      # 例: k8s-clawhub-clawhub-xxxx.ap-southeast-1.elb.amazonaws.com (EKS hub Ingress ALB DNS)。留空=metal 本地 hub。
+  alb_scheme: "ws"                 # ws | wss。EKS ALB 加 ACM 证书后改 wss(配 deploy/eks/claw-hub.yaml 的 TLS annotation)。
+  alb_port: 80                     # ALB 监听端口。HTTPS(wss)时改 443。
 
 # ========== AI Gateway(LiteLLM)开关 ==========
 # guest microVM 零凭据,LLM 调用经一个 OpenAI 兼容网关(LiteLLM)→ Bedrock。
 ai_gateway:
-  # 已有网关就填它的 base URL(如 http://<litellm-gateway-ip>:4000/v1),CDK 直接写进 SSM
+  # 已有网关就填它的 base URL(如 http://172.31.11.76:4000/v1),CDK 直接写进 SSM
   # /openclaw/litellm-host 给 host 用。留空 = CDK 自动起一台 LiteLLM EC2(最小权限
   # bedrock instance role,无静态 key),起来后把私网 IP 写 SSM。新 region 一键部署
   # 默认留空即可;生产 ap-southeast-1 可填已有堡垒机网关复用。

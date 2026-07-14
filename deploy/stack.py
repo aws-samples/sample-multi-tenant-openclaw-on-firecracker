@@ -723,7 +723,25 @@ class OpenClawOrchestratorStack(cdk.Stack):
             gateway_url = ac_gateway.gateway_url
             ac_gateway.grant_invoke(host_role)
 
-        vpc = ec2.Vpc.from_lookup(self, "Vpc", is_default=True)
+        # import an existing (enterprise-managed) VPC when network.vpc_id is set;
+        # otherwise fall back to the account default VPC (zero-config path).
+        _net_cfg = CFG.get("network", {}) or {}
+        _vpc_id = (_net_cfg.get("vpc_id") or "").strip()
+        if _vpc_id:
+            vpc = ec2.Vpc.from_lookup(self, "Vpc", vpc_id=_vpc_id)
+        else:
+            vpc = ec2.Vpc.from_lookup(self, "Vpc", is_default=True)
+
+        # restrict to explicit subnets via SubnetFilter.by_ids (lazy, resolves
+        # after context lookup); else fall back to public/private.
+        _subnet_ids = list(_net_cfg.get("subnet_ids") or [])
+
+        def _subnet_selection():
+            if _subnet_ids:
+                return ec2.SubnetSelection(subnet_filters=[ec2.SubnetFilter.by_ids(_subnet_ids)])
+            if vpc.public_subnets:
+                return ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC)
+            return ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS)
 
         # ========== Multi-AZ HA (issue #8) ==========
         # `_az_count` controls how many AZs the ASG and ALB span. Default is
@@ -915,9 +933,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
         asg = autoscaling.AutoScalingGroup(self, "HostASG",
             auto_scaling_group_name="openclaw-hosts-asg",
             vpc=vpc,
-            vpc_subnets=ec2.SubnetSelection(
-                subnets=vpc.public_subnets[:_az_count] or vpc.private_subnets[:_az_count]
-            ),
+            vpc_subnets=_subnet_selection(),
             launch_template=launch_template,
             min_capacity=CFG["asg"]["min_capacity"],
             max_capacity=CFG["asg"]["max_capacity"],
@@ -1063,13 +1079,14 @@ class OpenClawOrchestratorStack(cdk.Stack):
         # The multi_az.az_count knob controls ASG fan-out; ALB independently
         # always claims max(2, az_count) subnets so single-AZ ASG mode still
         # produces a valid load balancer.
-        _alb_az_count = max(2, _az_count)
-        _alb_subnets = (vpc.public_subnets[:_alb_az_count]
-                        or vpc.private_subnets[:_alb_az_count])
+        # ALB needs subnets in ≥2 AZs (AWS API constraint). When network.subnet_ids
+        # is given the operator must ensure they span ≥2 AZs — AWS rejects the ALB
+        # at deploy otherwise. With no explicit list, the VPC's public/private
+        # subnets already span the account's AZs.
         alb = elbv2.ApplicationLoadBalancer(self, "DashboardALB",
             load_balancer_name="openclaw-dashboard",
             vpc=vpc,
-            vpc_subnets=ec2.SubnetSelection(subnets=_alb_subnets),
+            vpc_subnets=_subnet_selection(),
             internet_facing=True,
         )
         listener = alb.add_listener("HTTP", port=80,
@@ -1122,11 +1139,25 @@ class OpenClawOrchestratorStack(cdk.Stack):
         # only — tenant dashboards on app_domain physically cannot read it.
         # If unset (or only legacy custom_domain set) → LEGACY single-distribution
         # mode, kept for backward-compat with v1.3.3 and earlier deployments.
-        s3_origin = origins.S3BucketOrigin.with_origin_access_control(assets_bucket)
-        # CloudFront Function: rewrite /console/ → /console/index.html, / → /console/index.html
-        url_rewrite_fn = cloudfront.Function(self, "UrlRewrite",
-            function_name="openclaw-url-rewrite",
-            code=cloudfront.FunctionCode.from_inline("""
+        cf_cfg = CFG.get("cloudfront", {}) or {}
+        # ----- DUAL mode candidates -----
+        console_domain = (cf_cfg.get("console_domain") or "").strip()
+        console_cert_arn = (cf_cfg.get("console_cert_arn") or "").strip()
+        app_domain = (cf_cfg.get("app_domain") or "").strip()
+        app_cert_arn = (cf_cfg.get("app_cert_arn") or "").strip()
+        dual_mode = bool(console_domain and console_cert_arn and app_domain and app_cert_arn)
+        # ----- LEGACY single-domain fallback -----
+        custom_domain = (cf_cfg.get("custom_domain") or "").strip()
+        acm_cert_arn = (cf_cfg.get("acm_cert_arn") or "").strip()
+        # #79: bring-your-own CDN — skip CloudFront entirely.
+        cf_enabled = cf_cfg.get("enabled", True)
+
+        # S3 origin + url-rewrite Function only exist to back a distribution.
+        if cf_enabled:
+            s3_origin = origins.S3BucketOrigin.with_origin_access_control(assets_bucket)
+            url_rewrite_fn = cloudfront.Function(self, "UrlRewrite",
+                function_name="openclaw-url-rewrite",
+                code=cloudfront.FunctionCode.from_inline("""
 function handler(event) {
   var uri = event.request.uri;
   if (uri === '/') {
@@ -1138,20 +1169,26 @@ function handler(event) {
   }
   return event.request;
 }"""),
-        )
+            )
 
-        cf_cfg = CFG.get("cloudfront", {}) or {}
-        # ----- DUAL mode candidates -----
-        console_domain = (cf_cfg.get("console_domain") or "").strip()
-        console_cert_arn = (cf_cfg.get("console_cert_arn") or "").strip()
-        app_domain = (cf_cfg.get("app_domain") or "").strip()
-        app_cert_arn = (cf_cfg.get("app_cert_arn") or "").strip()
-        dual_mode = bool(console_domain and console_cert_arn and app_domain and app_cert_arn)
-        # ----- LEGACY single-domain fallback -----
-        custom_domain = (cf_cfg.get("custom_domain") or "").strip()
-        acm_cert_arn = (cf_cfg.get("acm_cert_arn") or "").strip()
-
-        if dual_mode:
+        if not cf_enabled:
+            # No CloudFront: expose ALB DNS (dashboards) + S3 REST endpoint
+            # (console) for a customer-owned CDN. Bucket stays private — the CDN
+            # origin-accesses it; we don't open it publicly.
+            # Domain/cert are CloudFront-only; warn + ignore if set here.
+            if any([console_domain, console_cert_arn, app_domain, app_cert_arn,
+                    custom_domain, acm_cert_arn]):
+                print("⚠️  config.yml: cloudfront.enabled=false — the console_domain / "
+                      "app_domain / custom_domain / *_cert_arn values are ignored "
+                      "(they only apply to a CloudFront distribution). Point your own "
+                      "CDN at the ALB DNS + S3 endpoint outputs instead.")
+            dual_mode = False
+            console_host = assets_bucket.bucket_regional_domain_name
+            dashboard_host = alb.load_balancer_dns_name
+            console_cf_id = ""
+            app_cf_id = ""
+            cf_distribution = None
+        elif dual_mode:
             # ===== DUAL mode: two distributions, two certs, two aliases =====
             # Distribution A: console — S3 origin only, /console/* + redirect / → /console/
             console_cf = cloudfront.Distribution(self, "ConsoleCF",
@@ -1257,9 +1294,10 @@ function handler(event) {
             callback_urls = [f"https://{console_host}/console/index.html"]
             # In legacy single-mode, also add the *.cloudfront.net default
             # so direct CF URL access still works during DNS migration.
-            if not dual_mode and not custom_domain:
-                pass  # console_host is already cf default domain
-            elif not dual_mode and custom_domain:
+            # Legacy single-mode with a custom domain: also allow the raw
+            # *.cloudfront.net default so direct CF access works during DNS
+            # migration. Skipped when there's no distribution (#79 no-CloudFront).
+            if not dual_mode and custom_domain and cf_distribution is not None:
                 callback_urls.append(
                     f"https://{cf_distribution.distribution_domain_name}/console/index.html")
 
@@ -1365,8 +1403,10 @@ function handler(event) {
             "ConsoleUrl": f"https://{console_host}",
             "DashboardUrl": f"https://{dashboard_host}",
             "DualDomainMode": "true" if dual_mode else "false",
-            "CloudfrontDistributionId": console_cf_id,
-            "AppCloudfrontDistributionId": app_cf_id,
+            # #79: omit CF distribution outputs when no CloudFront exists —
+            # CfnOutput rejects empty values, and there's nothing to invalidate.
+            **({"CloudfrontDistributionId": console_cf_id} if console_cf_id else {}),
+            **({"AppCloudfrontDistributionId": app_cf_id} if app_cf_id else {}),
             **({"NotificationsTopicArn": notifications_topic_arn} if notifications_topic_arn else {}),
             **cognito_outputs,
         }.items():

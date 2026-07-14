@@ -76,6 +76,40 @@ health_check:
     unhealthy_threshold_minutes: 10  # AZ 多久 (>=) 全停才触发, 防止短暂网络抖动误判
     cooldown_minutes: 30             # 同一 AZ 触发一次后, 多久才能再次触发
 
+# ========== Console 认证 (可选) ==========
+console_auth:
+  enabled: false                   # 开启后 Console 需要 Cognito 登录
+  self_sign_up: false              # 允许用户自注册
+  rbac_enabled: false              # 角色鉴权(viewer/operator/admin)开关, 独立于登录; true=按角色限制写操作
+  # user_pool_id: ""              # 复用已有 User Pool（留空自动创建）
+
+# ========== 网络 (可选) ==========
+# 默认留空 = 使用账号默认 VPC (零配置)。企业受管网络填入已有 VPC/子网导入。
+network:
+  vpc_id: ""                       # 空=默认 VPC; 非空=导入该已有 VPC
+  subnet_ids: []                   # 空=用 VPC 的 public(退 private)子网; 非空=仅用这些 (ALB 需≥2个跨 AZ)
+
+# ========== CloudFront 自定义域名 (可选) ==========
+# 推荐使用双域名模式分离 console 和 tenant dashboard，物理隔离 Cognito session 与租户应用代码（防 XSS / cookie 跨域风险）。
+#
+#   双域名模式（推荐生产用）：
+#     ./setup.sh <region> <profile> \
+#       --console-domain console.example.com --console-cert <acm-arn> \
+#       --app-domain     app.example.com     --app-cert     <acm-arn>
+#
+#   单域名模式（legacy / dev-only）：
+#     ./setup.sh <region> <profile> --domain <domain> --cert <acm-arn>
+cloudfront:
+  enabled: true                    # false=不建 CloudFront, 输出 ALB DNS + S3 endpoint 供自有 CDN 回源
+  # ----- 双域名模式（推荐） -----
+  console_domain: ""               # 例: console.sample.com（操作员控制台）
+  console_cert_arn: ""             # us-east-1 ACM cert ARN
+  app_domain: ""                   # 例: claw.sample.com（per-tenant dashboard）
+  app_cert_arn: ""                 # us-east-1 ACM cert ARN
+  # ----- 单域名模式（legacy 兼容） -----
+  custom_domain: ""                # 例: claw.sample.com 留空则使用默认 *.cloudfront.net
+  acm_cert_arn: ""                 # us-east-1 ACM 证书 ARN (CloudFront 必须 us-east-1)
+
 # ========== AWS WAF (可选, 关联到 API Gateway) ==========
 waf:
   enabled: false                   # 启用后保护 API Gateway 免受常见攻击
@@ -97,34 +131,6 @@ agentcore:
   #   enabled: true
   # browser:
   #   enabled: true
-
-# ========== Console 认证 (可选) ==========
-console_auth:
-  enabled: false                   # 开启后 Console 需要 Cognito 登录
-  self_sign_up: false              # 允许用户自注册
-  rbac_enabled: false              # 角色鉴权(viewer/operator/admin)开关, 独立于登录; true=按角色限制写操作
-  # user_pool_id: ""              # 复用已有 User Pool（留空自动创建）
-
-# ========== CloudFront 自定义域名 (可选) ==========
-# 1.3.4+ 推荐使用双域名模式分离 console 和 tenant dashboard，物理隔离 Cognito
-# session 与租户应用代码（防 XSS / cookie 跨域风险）。
-#
-#   双域名模式（推荐生产用）：
-#     ./setup.sh <region> <profile> \
-#       --console-domain console.example.com --console-cert <acm-arn> \
-#       --app-domain     app.example.com     --app-cert     <acm-arn>
-#
-#   单域名模式（legacy / dev-only）：
-#     ./setup.sh <region> <profile> --domain <domain> --cert <acm-arn>
-cloudfront:
-  # ----- 双域名模式（v1.3.4+ 推荐） -----
-  console_domain: ""               # 例: console.aws.xin（操作员控制台）
-  console_cert_arn: ""             # us-east-1 ACM cert ARN
-  app_domain: ""                   # 例: app.aws.xin（per-tenant dashboard）
-  app_cert_arn: ""                 # us-east-1 ACM cert ARN
-  # ----- 单域名模式（legacy 兼容） -----
-  custom_domain: ""                # 例: claw.aws.xin，留空则使用默认 *.cloudfront.net
-  acm_cert_arn: ""                 # us-east-1 ACM 证书 ARN (CloudFront 必须 us-east-1)
 
 # ========== Lifecycle Notifications (可选, SNS) ==========
 # 启用后, API Lambda 在 tenant 创建/删除/启停等事件时 publish 到 SNS topic

@@ -24,7 +24,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-INDEX_HTML = (ROOT / "console" / "index.html").read_text()
+# the console was split into console/js/app.*.js modules (1.5.5), so the
+# literals these contracts assert now live across index.html + the JS modules.
+# Concatenate all console source so the assertions find them wherever they moved.
+_console_dir = ROOT / "console"
+INDEX_HTML = "\n".join(
+    p.read_text() for p in [_console_dir / "index.html", *sorted(_console_dir.glob("js/app.*.js"))]
+)
 
 
 # ─────────────────────────────────────────────

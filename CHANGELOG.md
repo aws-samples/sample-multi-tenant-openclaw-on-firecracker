@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.5.7]
+
+Enterprise landing (#79): deploy into an existing VPC and optionally skip CloudFront for your own CDN. Both opt-in, default off — zero-config path unchanged.
+
+### Added
+
+- **Bring-your-own VPC/subnets.** `network.vpc_id` imports an existing VPC instead of the account default; `network.subnet_ids` pins the ASG and ALB to a chosen subset.
+- **Optional CloudFront.** `cloudfront.enabled: false` skips the distribution, exposing the ALB DNS and S3 endpoint for a customer-owned CDN. The assets bucket stays private. Any `*_domain`/`*_cert_arn` set alongside it are CloudFront-only and warned-and-ignored.
+
+### Fixed
+
+- **Console contract tests read the split JS modules.** After the 1.5.5 `console/js/app.*.js` split they only scanned `index.html` and failed; now they scan all modules (#80, partial).
+
 ## [1.5.6]
 
 Deploy-time robustness: a preflight gate, a config guard against a silent OOM combo, and a smoother first-run path. Verified end-to-end against a live stack.
@@ -10,8 +23,8 @@ Deploy-time robustness: a preflight gate, a config guard against a silent OOM co
 
 ### Changed
 
-- **`setup.sh` fails fast via a new `scripts/preflight.sh`.** Checks required tools (aws, cdk, python3, docker), a reachable Docker daemon, resolvable AWS creds, CDK bootstrap in the target region, and a `.venv` that actually imports `aws_cdk` — each with a clear fix message — instead of dying deep in `cdk deploy`.
-- **`config.js` no longer bakes the `OC_DEFAULT_API_KEY` in `config.js`, the operator enters it once in Settings and it persists to localStorage.
+- **`setup.sh` runs a preflight (`scripts/preflight.sh`)** checking tools, Docker, AWS creds, CDK bootstrap, and a `.venv` with `aws_cdk` — failing early with a clear message instead of deep in `cdk deploy`.
+- **`config.js`** no longer bakes in OC_DEFAULT_API_KEY — the operator enters it once in Settings, and it persists to localStorage.
 
 ## [1.5.5]
 

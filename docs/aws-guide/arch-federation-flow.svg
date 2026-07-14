@@ -1,0 +1,130 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1760 1620" font-family="'PingFang SC','Microsoft YaHei','Helvetica Neue',Arial,sans-serif">
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L7,3 L0,6 Z" fill="#2b3a55"/></marker>
+    <marker id="arrRet" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L7,3 L0,6 Z" fill="#3f9d52"/></marker>
+    <marker id="arrData" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0 L7,3 L0,6 Z" fill="#ec7211"/></marker>
+  </defs>
+
+  <text x="40" y="42" font-size="27" font-weight="700" fill="#16233a">外部 SaaS 平台对接 · 端到端认证授权与数据面对话时序</text>
+  <text x="40" y="70" font-size="15" fill="#5a6b85">档 A 联邦方案 · 二手电商平台(客户自有 IdP)代开租户 · 自由用户各自独立 openclaw · 全程 Cognito 信任根 · 禁自助注册</text>
+
+  <rect x="30" y="120" width="1700" height="300" fill="#ece1fb" opacity="0.30"/>
+  <rect x="30" y="420" width="1700" height="336" fill="#fde9d6" opacity="0.30"/>
+  <rect x="30" y="756" width="1700" height="250" fill="#dbeccf" opacity="0.30"/>
+  <rect x="30" y="1006" width="1700" height="470" fill="#d7e6f5" opacity="0.30"/>
+  <text x="44" y="142" font-size="14" font-weight="700" fill="#7a4fd0">① 身份联邦(用户登录二手电商 → 外部 IdP 联邦进 Cognito,信任根收敛)</text>
+  <text x="44" y="442" font-size="14" font-weight="700" fill="#c15c14">② 租户开通(用户在电商购买 → 交易平台后端代开独立 microVM · 非用户自助)</text>
+  <text x="44" y="778" font-size="14" font-weight="700" fill="#2f7d40">③ 数据面接入(用户进 AI pro 前端 → 换 hub token → 建 wss)</text>
+  <text x="44" y="1028" font-size="14" font-weight="700" fill="#2b5a8c">④ 实时对话(AI pro 前端 ⇄ hub ⇄ microVM/openclaw,三段闸隔离)</text>
+
+  <g font-size="13" font-weight="700" text-anchor="middle">
+    <g><rect x="46" y="86" width="128" height="46" rx="6" fill="#3f9d52"/><text x="110" y="105" fill="#fff">平台自由用户</text><text x="110" y="122" fill="#eafbe8" font-size="10.5" font-weight="400">浏览器</text></g>
+    <g><rect x="256" y="86" width="128" height="46" rx="6" fill="#5a6b85"/><text x="320" y="105" fill="#fff">二手电商前端</text><text x="320" y="122" fill="#e8edf5" font-size="10.5" font-weight="400">客户自有 SPA</text></g>
+    <g><rect x="476" y="86" width="128" height="46" rx="6" fill="#9b6dff"/><text x="540" y="105" fill="#fff">二手电商 IdP</text><text x="540" y="122" fill="#efe8ff" font-size="10.5" font-weight="400">外部 OIDC</text></g>
+    <g><rect x="696" y="86" width="128" height="46" rx="6" fill="#5a6b85"/><text x="760" y="105" fill="#fff">交易平台后端</text><text x="760" y="122" fill="#e8edf5" font-size="10.5" font-weight="400">客户后端</text></g>
+    <g><rect x="916" y="86" width="128" height="46" rx="6" fill="#ec7211"/><text x="980" y="105" fill="#fff">控制面 API</text><text x="980" y="122" fill="#fde7d6" font-size="10.5" font-weight="400">API GW→Lambda</text></g>
+    <g><rect x="1126" y="86" width="128" height="46" rx="6" fill="#9b6dff"/><text x="1190" y="105" fill="#fff">Cognito</text><text x="1190" y="122" fill="#efe8ff" font-size="10.5" font-weight="400">单 User Pool</text></g>
+    <g><rect x="1336" y="86" width="128" height="46" rx="6" fill="#2f7d40"/><text x="1400" y="105" fill="#fff">AI pro 前端</text><text x="1400" y="122" fill="#dff0e2" font-size="10.5" font-weight="400">chat UI(嵌电商域)</text></g>
+    <g><rect x="1496" y="86" width="128" height="46" rx="6" fill="#3f9d52"/><text x="1560" y="105" fill="#fff">hub(WS 中枢)</text><text x="1560" y="122" fill="#eafbe8" font-size="10.5" font-weight="400">server.mjs :8790</text></g>
+    <g><rect x="1636" y="86" width="100" height="46" rx="6" fill="#1e2738"/><text x="1686" y="105" fill="#fff">microVM</text><text x="1686" y="122" fill="#c9d2e3" font-size="10.5" font-weight="400">openclaw</text></g>
+  </g>
+  <g stroke="#c2cbd9" stroke-width="1.4" stroke-dasharray="4 4">
+    <line x1="110" y1="132" x2="110" y2="1478"/><line x1="320" y1="132" x2="320" y2="1478"/><line x1="540" y1="132" x2="540" y2="1478"/>
+    <line x1="760" y1="132" x2="760" y2="1478"/><line x1="980" y1="132" x2="980" y2="1478"/><line x1="1190" y1="132" x2="1190" y2="1478"/>
+    <line x1="1400" y1="132" x2="1400" y2="1478"/><line x1="1560" y1="132" x2="1560" y2="1478"/><line x1="1686" y1="132" x2="1686" y2="1478"/>
+  </g>
+
+  <g font-size="12.5" fill="#2b3a55" text-anchor="middle">
+    <line x1="110" y1="170" x2="316" y2="170" stroke="#2b3a55" stroke-width="1.6" marker-end="url(#arr)"/>
+    <text x="213" y="163">1. 访问二手电商平台</text>
+    <line x1="320" y1="200" x2="536" y2="200" stroke="#2b3a55" stroke-width="1.6" marker-end="url(#arr)"/>
+    <text x="428" y="193">2. 发起登录(authorization_code + PKCE)</text>
+    <line x1="536" y1="230" x2="114" y2="230" stroke="#2b3a55" stroke-width="1.6" marker-end="url(#arr)"/>
+    <text x="325" y="223">3. 用户在自己平台登录(电商自有账号密码)</text>
+    <line x1="114" y1="260" x2="536" y2="260" stroke="#2b3a55" stroke-width="1.6" marker-end="url(#arr)"/>
+    <text x="325" y="253">4. 提交凭据 → 电商 IdP 签发 authz code</text>
+    <line x1="540" y1="290" x2="1186" y2="290" stroke="#3f9d52" stroke-width="1.6" marker-end="url(#arrRet)"/>
+    <text x="863" y="283" fill="#2f7d40">5. 联邦回调 Cognito /oauth2/idpresponse(customProvider=电商idp)</text>
+    <rect x="1115" y="304" width="150" height="24" rx="4" fill="#9b6dff"/>
+    <text x="1190" y="320" fill="#fff" font-size="11">6. Pre-Token-Gen 注入 claim</text>
+    <line x1="1186" y1="360" x2="324" y2="360" stroke="#3f9d52" stroke-width="1.6" marker-end="url(#arrRet)"/>
+    <text x="755" y="353" fill="#2f7d40">7. 本平台 id_token{sub, custom:tenant_user_id, custom:platform_id, exp} 回电商前端</text>
+    <text x="325" y="392" font-size="11" fill="#5a6b85">(用户此时已是登录态,持本平台可信 id_token)</text>
+
+    <line x1="320" y1="470" x2="756" y2="470" stroke="#2b3a55" stroke-width="1.6" marker-end="url(#arr)"/>
+    <text x="538" y="463">8. 在电商内申请购买/开通 AI pro(带 id_token)</text>
+    <line x1="760" y1="500" x2="976" y2="500" stroke="#2b3a55" stroke-width="1.6" marker-end="url(#arr)"/>
+    <text x="868" y="493">9. POST /tenants(交易平台后端代开)</text>
+    <text x="868" y="514" font-size="11" fill="#5a6b85">x-api-key + 转发用户 Bearer id_token(tenant_user_id 从 claim 读,非 body) · 非用户自助</text>
+    <rect x="905" y="528" width="150" height="38" rx="4" fill="#ec7211"/>
+    <text x="980" y="544" fill="#fff" font-size="11">10. 验签 + owner 归属</text>
+    <text x="980" y="559" fill="#fde7d6" font-size="10">按 tenant_user_id 建独立节点</text>
+    <line x1="1055" y1="586" x2="1186" y2="586" stroke="#2b3a55" stroke-width="1.6" marker-end="url(#arr)"/>
+    <text x="1120" y="579" font-size="11">11. 建 channel</text>
+    <text x="1120" y="593" font-size="10" fill="#5a6b85">machine-user</text>
+    <line x1="1055" y1="621" x2="1682" y2="621" stroke="#ec7211" stroke-width="1.6" marker-end="url(#arrData)"/>
+    <text x="1360" y="614" fill="#c15c14">12. SSM launch-vm:冷注入身份/skill/channel 密码到只读盘 → 起 microVM</text>
+    <line x1="1682" y1="651" x2="1057" y2="651" stroke="#3f9d52" stroke-width="1.6" marker-end="url(#arrRet)"/>
+    <text x="1360" y="644" fill="#2f7d40">13. vm_health up(host-agent 上报,~4.0s)</text>
+    <line x1="976" y1="681" x2="764" y2="681" stroke="#3f9d52" stroke-width="1.6" marker-end="url(#arrRet)"/>
+    <text x="870" y="674" fill="#2f7d40">14. 202 {id, status:queued}</text>
+    <line x1="976" y1="711" x2="764" y2="711" stroke="#3f9d52" stroke-width="1.4" stroke-dasharray="5 3" marker-end="url(#arrRet)"/>
+    <text x="870" y="704" fill="#2f7d40" font-size="11">15. 交易平台后端轮询 GET /tenants/{id} 到 running</text>
+    <line x1="1682" y1="738" x2="1564" y2="738" stroke="#3f9d52" stroke-width="1.6" marker-end="url(#arrRet)"/>
+    <text x="1623" y="731" fill="#2f7d40" font-size="10.5">16. channel dial OUT</text>
+
+    <line x1="110" y1="808" x2="1396" y2="808" stroke="#2b3a55" stroke-width="1.6" marker-end="url(#arr)"/>
+    <text x="753" y="801">17. 用户进 AI pro 前端(电商内跳转 landing,已登录态带本平台 id_token,无缝)</text>
+    <line x1="1400" y1="838" x2="1556" y2="838" stroke="#2b3a55" stroke-width="1.6" marker-end="url(#arr)"/>
+    <text x="1478" y="831" font-size="11">18. POST /hub/token</text>
+    <text x="1478" y="845" font-size="10" fill="#5a6b85">Bearer id_token + {tenant_id}</text>
+    <rect x="1485" y="858" width="150" height="38" rx="4" fill="#3f9d52"/>
+    <text x="1560" y="874" fill="#fff" font-size="11">19. JWKS 验签 +</text>
+    <text x="1560" y="889" fill="#eafbe8" font-size="10">authorizeSubForTenant</text>
+    <line x1="1556" y1="924" x2="1404" y2="924" stroke="#3f9d52" stroke-width="1.6" marker-end="url(#arrRet)"/>
+    <text x="1480" y="917" fill="#2f7d40" font-size="10.5">20. 前端短 token</text>
+    <line x1="1400" y1="960" x2="1556" y2="960" stroke="#2b3a55" stroke-width="2" marker-end="url(#arr)"/>
+    <text x="1478" y="953" font-size="11">21. 建 wss /hub/ws?token=</text>
+    <rect x="1485" y="974" width="150" height="24" rx="4" fill="#3f9d52"/>
+    <text x="1560" y="990" fill="#fff" font-size="10.5">22. verifyHubToken 盖 _tenant</text>
+
+    <line x1="110" y1="1058" x2="1396" y2="1058" stroke="#2b3a55" stroke-width="1.6" marker-end="url(#arr)"/>
+    <text x="753" y="1051">23. 输入对话内容</text>
+    <line x1="1400" y1="1088" x2="1556" y2="1088" stroke="#2b3a55" stroke-width="1.6" marker-end="url(#arr)"/>
+    <text x="1478" y="1081" font-size="10.5">24. wss 帧 msg_create</text>
+    <text x="1478" y="1095" font-size="9.5" fill="#5a6b85">parts[TEXT]+threadId+clientMessageId</text>
+    <rect x="1485" y="1108" width="150" height="38" rx="4" fill="#3f9d52"/>
+    <text x="1560" y="1124" fill="#fff" font-size="11">25. senderId=验过的 sub</text>
+    <text x="1560" y="1139" fill="#eafbe8" font-size="10">deliverToChannel(tenant)</text>
+    <line x1="1564" y1="1172" x2="1682" y2="1172" stroke="#ec7211" stroke-width="1.6" marker-end="url(#arrData)"/>
+    <text x="1623" y="1165" fill="#c15c14" font-size="10.5">26. 投 channel</text>
+    <path d="M1686,1200 h40 v30 h-40" fill="none" stroke="#ec7211" stroke-width="1.5" marker-end="url(#arrData)"/>
+    <text x="1660" y="1220" fill="#c15c14" font-size="10.5" text-anchor="end">27. openclaw→LiteLLM→Bedrock</text>
+    <line x1="1682" y1="1258" x2="1564" y2="1258" stroke="#3f9d52" stroke-width="1.6" marker-end="url(#arrRet)"/>
+    <text x="1623" y="1251" fill="#2f7d40" font-size="10.5">28. reply_delta</text>
+    <line x1="1556" y1="1288" x2="1404" y2="1288" stroke="#3f9d52" stroke-width="1.6" marker-end="url(#arrRet)"/>
+    <text x="1480" y="1281" fill="#2f7d40" font-size="10.5">29. 流式回复</text>
+    <line x1="1396" y1="1318" x2="114" y2="1318" stroke="#3f9d52" stroke-width="1.6" marker-end="url(#arrRet)"/>
+    <text x="753" y="1311" fill="#2f7d40">30. 增量渲染对话气泡(仅投 fws._tenant===tenant 的该 sub 的 tab · 替换同 clientMessageId)</text>
+  </g>
+
+  <rect x="740" y="1348" width="760" height="60" rx="6" fill="#fdeaea" stroke="#d9534f" stroke-width="1.3"/>
+  <text x="752" y="1368" font-size="12.5" font-weight="700" fill="#c0392b">跨租户隔离三段闸(结构性,不信客户端自报)</text>
+  <text x="752" y="1386" font-size="11.5" fill="#8a2f28">① 前端短 token 绑单一 tenant(hub 签发时盖入) ② channel 用 Cognito access_token 的 username claim 证明租户身份(不可伪造)</text>
+  <text x="752" y="1402" font-size="11.5" fill="#8a2f28">③ 撮合仅在 fws._tenant===frame._tenant 时发生 · senderId 用服务端验过的 sub · 授权查 owner_id/authorized_users(server 端,绝不信 JWT 自称)</text>
+
+  <g font-size="12" fill="#2b3a55">
+    <text x="44" y="1450" font-weight="700">图例:</text>
+    <line x1="96" y1="1446" x2="136" y2="1446" stroke="#2b3a55" stroke-width="1.6" marker-end="url(#arr)"/><text x="142" y="1450">请求/前向</text>
+    <line x1="222" y1="1446" x2="262" y2="1446" stroke="#3f9d52" stroke-width="1.6" marker-end="url(#arrRet)"/><text x="268" y="1450">响应/回程</text>
+    <line x1="352" y1="1446" x2="392" y2="1446" stroke="#ec7211" stroke-width="1.6" marker-end="url(#arrData)"/><text x="398" y="1450">部署/数据面投递</text>
+    <rect x="524" y="1439" width="14" height="14" fill="#9b6dff"/><text x="544" y="1450">内部处理(验签/注入)</text>
+    <line x1="676" y1="1446" x2="716" y2="1446" stroke="#3f9d52" stroke-width="1.4" stroke-dasharray="5 3"/><text x="722" y="1450">轮询</text>
+  </g>
+
+  <g font-size="11" fill="#6b7a92">
+    <text x="44" y="1502">来源(一手 file:line):hub 端点/token/wss 帧 the internal design spec;控制面 POST /tenants(代开路径)</text>
+    <text x="44" y="1520">+ owner 门控 handler.py + Pre-Token-Gen/TenantTable/多 IdP 联邦照抄 aws-samples/amazon-cognito-example-for-multi-tenant(已 clone opensource/);AI pro 前端复用现有 console/chat(Hosted UI+PKCE 联邦就绪)。</text>
+    <text x="44" y="1538" fill="#c15c14">关键:禁用户自助注册(/tenants/self 存在但本流程不用),租户由交易平台后端代开;AI pro chat UI 生产中嵌客户电商域、非独立域名。custom claim/联邦/Pre-Token-Gen 属档 A 待实现,当前单 Cognito Pool 直连未接外部 IdP。</text>
+  </g>
+</svg>

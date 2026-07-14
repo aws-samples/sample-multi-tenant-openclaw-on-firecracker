@@ -1,0 +1,138 @@
+{
+  "agents": {
+    "defaults": {
+      "workspace": "/home/agent/.openclaw/workspace",
+      "model": {
+        "primary": "litellm/claude-sonnet-4-6"
+      },
+      "heartbeat": {
+        "every": "30m",
+        "target": "last"
+      },
+      "contextPruning": {
+        "mode": "cache-ttl",
+        "ttl": "3m",
+        "keepLastAssistants": 3,
+        "softTrimRatio": 0.3,
+        "hardClearRatio": 0.5,
+        "minPrunableToolChars": 5000,
+        "softTrim": {
+          "maxChars": 2000,
+          "headChars": 600,
+          "tailChars": 600
+        },
+        "hardClear": {
+          "enabled": true,
+          "placeholder": "[Old tool result content cleared to save tokens]"
+        }
+      },
+      "compaction": {
+        "mode": "safeguard",
+        "reserveTokens": 100000,
+        "keepRecentTokens": 100000,
+        "reserveTokensFloor": 100000,
+        "maxHistoryShare": 0.4,
+        "memoryFlush": {
+          "enabled": true,
+          "softThresholdTokens": 6000
+        }
+      },
+      "maxConcurrent": 4,
+      "subagents": {
+        "maxConcurrent": 8
+      }
+    }
+  },
+  "gateway": {
+    "mode": "local",
+    "auth": {
+      "mode": "token"
+    },
+    "port": 18789,
+    "bind": "lan",
+    "controlUi": {
+      "enabled": false
+    },
+    "http": {
+      "endpoints": {
+        "chatCompletions": {
+          "enabled": true
+        },
+        "responses": {
+          "enabled": true
+        }
+      }
+    }
+  },
+  "session": {
+    "dmScope": "per-peer"
+  },
+  "tools": {
+    "profile": "coding",
+    "loopDetection": {
+      "enabled": true,
+      "historySize": 30,
+      "warningThreshold": 5,
+      "criticalThreshold": 10,
+      "globalCircuitBreakerThreshold": 15,
+      "detectors": {
+        "genericRepeat": true,
+        "knownPollNoProgress": true,
+        "pingPong": true
+      }
+    }
+  },
+  "mcpServers": {
+    "git": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-git",
+        "--repository",
+        "/home/agent/.openclaw/workspace"
+      ],
+      "env": {}
+    },
+    "postgres": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-postgres"
+      ],
+      "env": {
+        "DATABASE_URL": "${DATABASE_URL}"
+      }
+    }
+  },
+  "models": {
+    "providers": {
+      "litellm": {
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "claude-sonnet-4-6",
+            "name": "Claude Sonnet 4.6 (via LiteLLM→Bedrock)",
+            "reasoning": true,
+            "contextWindow": 200000,
+            "maxTokens": 64000,
+            "input": [
+              "text",
+              "image"
+            ]
+          },
+          {
+            "id": "claude-haiku-4-5",
+            "name": "Claude Haiku 4.5 (via LiteLLM→Bedrock)",
+            "reasoning": false,
+            "contextWindow": 200000,
+            "maxTokens": 32000,
+            "input": [
+              "text",
+              "image"
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

@@ -34,6 +34,25 @@ from pathlib import Path
 CFG = yaml.safe_load((Path(__file__).parent.parent / "config.yml").read_text())
 
 
+def _normalize_config(cfg):
+    """Clamp config combinations that would silently misbehave at runtime."""
+    # mem_overcommit_ratio drives the scheduler's per-host allocatable memory
+    # independently of balloon. With balloon off there's no reclaim path
+    # (host-agent._adjust_balloons early-returns), so overcommit > 1.0 would
+    # oversubscribe host memory with nothing to claw it back → OOM. Force it to
+    # 1.0 so memory overcommit is a no-op unless balloon is actually enabled.
+    mem_ratio = float(cfg.get("host", {}).get("mem_overcommit_ratio", 1.0))
+    balloon_on = bool(cfg.get("balloon", {}).get("enabled", False))
+    if mem_ratio > 1.0 and not balloon_on:
+        print(f"⚠️  config.yml: host.mem_overcommit_ratio={mem_ratio} ignored — "
+              "memory overcommit requires balloon.enabled=true (its only reclaim path). "
+              "Deploying with effective ratio 1.0; set balloon.enabled=true to use overcommit.")
+        cfg.setdefault("host", {})["mem_overcommit_ratio"] = 1.0
+
+
+_normalize_config(CFG)
+
+
 def _sam_build_image_for_host():
     """SAM build image tag for the deploy host's arch (avoids QEMU). pip still
     cross-downloads the aarch64 wheel to match the ARM_64 Lambda."""

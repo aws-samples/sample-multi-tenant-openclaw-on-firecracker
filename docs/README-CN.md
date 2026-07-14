@@ -124,14 +124,16 @@ cd sample-multi-tenant-openclaw-on-firecracker
 cp config.yml.example config.yml                                  # 按需调整
 cp templates/openclaw.json.example templates/openclaw.json        # 填入 LLM API key
 
-# 2️⃣ 一键 CDK 部署 (~5 分钟) — 自动创建 VPC、ASG、ALB、Lambda、DynamoDB、
-#                                AMP、Grafana、Cognito、AgentCore、KMS、WAF
+# 2️⃣ 安装 Python 依赖到 .venv（CDK app.py 从这里 import aws-cdk-lib）
+uv sync
+
+# 3️⃣ 一键 CDK 部署 (~5 分钟) — 自动创建 VPC、ASG、ALB、Lambda、DynamoDB、AMP、Grafana、Cognito、AgentCore、KMS、WAF
 ./setup.sh ap-northeast-1 your-aws-profile
 
-# 3️⃣ 构建 rootfs (~10 分钟，一次性，云端 build — 无需本地 Linux)
+# 4️⃣ 构建 rootfs (~10 分钟，一次性，云端 build — 无需本地 Linux)
 ./scripts/build-rootfs-on-ec2.sh v1.0
 
-# 4️⃣ 创建第一个租户
+# 5️⃣ 创建第一个租户
 source .env.deploy
 curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" \
   -d '{"name":"my-first-agent","vcpu":2,"mem_mb":4096}' | jq .

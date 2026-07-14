@@ -1,6 +1,19 @@
 # Changelog
 
-## [1.5.5] — 2026-06-19
+## [1.5.6]
+
+Deploy-time robustness: a preflight gate, a config guard against a silent OOM combo, and a smoother first-run path. Verified end-to-end against a live stack.
+
+### Fixed
+
+- **Memory overcommit without balloon silently risked host OOM.** `mem_overcommit_ratio` feeds the scheduler's per-host allocatable memory independently of balloon, but with balloon off there's no reclaim path (`host-agent._adjust_balloons` early-returns) — so `ratio > 1.0` oversubscribed host memory with nothing to claw it back. `deploy/stack.py` now clamps the effective ratio to 1.0 (with a warning) when balloon is disabled, so the setting is a safe no-op unless balloon is actually on. Verified on a live stack: config `1.5` + balloon off → Lambda `MEM_OVERCOMMIT_RATIO=1.0`.
+
+### Changed
+
+- **`setup.sh` fails fast via a new `scripts/preflight.sh`.** Checks required tools (aws, cdk, python3, docker), a reachable Docker daemon, resolvable AWS creds, CDK bootstrap in the target region, and a `.venv` that actually imports `aws_cdk` — each with a clear fix message — instead of dying deep in `cdk deploy`.
+- **`config.js` no longer bakes the `OC_DEFAULT_API_KEY` in `config.js`, the operator enters it once in Settings and it persists to localStorage.
+
+## [1.5.5]
 
 Closes the skill-group → tenant chain in the console (the backend already supported it; the create form just never sent a group), plus console refactor and UI fixes.
 

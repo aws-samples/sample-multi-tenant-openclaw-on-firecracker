@@ -6,7 +6,35 @@
 import os
 import json
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+
+@pytest.fixture(autouse=True)
+def _fast_clock(request):
+    """Make sleep-based polling loops finish instantly in unit tests.
+
+    SSM sync-wait paths (e.g. _wait_ssm_done) sleep between polls until a
+    real-wall-clock deadline. We make sleep() a no-op that instead advances a
+    virtual offset added to time.time(), so a loop that sleeps reaches its
+    deadline immediately, while code that never sleeps (JWT exp/iat checks,
+    JWKS cache TTL) still sees the real clock. E2E tests keep the real clock.
+    """
+    if request.node.get_closest_marker("e2e"):
+        yield
+        return
+
+    import time as _time
+    real_time = _time.time
+    state = {"offset": 0.0}
+
+    def fake_sleep(secs=0, *_args, **_kwargs):
+        state["offset"] += float(secs or 0)
+
+    def fake_time():
+        return real_time() + state["offset"]
+
+    with patch("time.sleep", fake_sleep), patch("time.time", fake_time):
+        yield
 
 # Default env vars for unit tests (overridden by E2E via .env.deploy)
 _DEFAULTS = {

@@ -4,11 +4,11 @@
 
 # 部署 CDK stack 并导出环境信息到 .env.deploy
 #
-# Usage:
+# Usage (profile optional — defaults to the AWS CLI 'default' profile):
 #   Single-domain (legacy):
-#     ./setup.sh <region> <profile> [--domain <domain>] [--cert <acm-arn>]
+#     ./setup.sh <region> [profile] [--domain <domain>] [--cert <acm-arn>]
 #   Dual-domain (1.3.4+ recommended for production):
-#     ./setup.sh <region> <profile> \
+#     ./setup.sh <region> [profile] \
 #       --console-domain console.example.com --console-cert <acm-arn> \
 #       --app-domain     app.example.com     --app-cert     <acm-arn>
 #
@@ -23,12 +23,24 @@
 # 物理上隔离 console 凭证和 tenant 应用，是多租户场景的安全最佳实践。
 set -euo pipefail
 
-REGION="${1:?Usage: ./setup.sh <region> <profile> [--domain | --console-domain & --app-domain]}"
-PROFILE="${2:?Usage: ./setup.sh <region> <profile> [--domain | --console-domain & --app-domain]}"
-shift 2
+REGION="${1:?Usage: ./setup.sh <region> [profile] [--domain | --console-domain & --app-domain]}"
+shift
+# profile optional — mirrors AWS CLI, which falls back to the 'default' profile.
+# Treat $1 as profile only if present and not a flag (so `setup.sh <region> --domain …` works).
+if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then
+  PROFILE="$1"; shift
+else
+  PROFILE="default"
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
+
+# Fail fast on missing tools / creds / bootstrap before touching anything.
+# app.py defaults region to us-east-1 when -c region is absent; guard against a
+# blank REGION silently deploying to the wrong place.
+[ -n "$REGION" ] || { echo "❌ REGION is empty" >&2; exit 1; }
+REGION="$REGION" PROFILE="$PROFILE" bash "$SCRIPT_DIR/scripts/preflight.sh" "$REGION" "$PROFILE"
 
 # Parse domain flags. Both legacy single-domain and new dual-domain are supported.
 DOMAIN_FLAG=""; CERT_FLAG=""
@@ -57,6 +69,9 @@ if $DOMAIN_SET || $CERT_SET || $CONSOLE_DOMAIN_SET || $CONSOLE_CERT_SET || $APP_
 fi
 
 if $ANY_DOMAIN_FLAG; then
+  # Regex-rewriting a hand-edited config.yml is fragile — back it up first so a
+  # bad substitution is recoverable.
+  cp config.yml "config.yml.bak.$(date +%s)" 2>/dev/null || true
   DOMAIN="$DOMAIN_FLAG" CERT="$CERT_FLAG" \
   CONSOLE_DOMAIN="$CONSOLE_DOMAIN_FLAG" CONSOLE_CERT="$CONSOLE_CERT_FLAG" \
   APP_DOMAIN="$APP_DOMAIN_FLAG"         APP_CERT="$APP_CERT_FLAG" \
@@ -158,13 +173,17 @@ PATH=".venv/bin:$PATH" cdk deploy -c region="$REGION" --profile "$PROFILE" --req
 BUCKET=$(aws cloudformation describe-stacks --stack-name OpenClawOrchestrator \
   --query 'Stacks[0].Outputs[?OutputKey==`AssetsBucket`].OutputValue' --output text \
   --profile "$PROFILE" --region "$REGION")
+# Guard: if deploy succeeded but the output lookup returned nothing, every
+# s3 cp below would target s3:///deployment/... and fail confusingly. Stop here.
+[ -n "$BUCKET" ] && [ "$BUCKET" != "None" ] || { echo "❌ could not resolve AssetsBucket output — aborting upload" >&2; exit 1; }
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/host-agent.py" "s3://${BUCKET}/deployment/scripts/host-agent.py" \
   --profile "$PROFILE" --region "$REGION" --quiet
 
-# Re-deploy is a no-op if nothing changed but it forces ASG hosts to retry
-# pulling scripts now that S3 has them — guards against the race where the
-# host's user-data ran before scripts were uploaded.
-echo "✓ Scripts uploaded; existing hosts will pick them up via init-host.sh retry loop"
+# Newly-launched hosts pull these on boot via init-host.sh's S3 retry loop, so
+# uploading now closes the race where a host booted before scripts existed.
+# NOTE: already-running hosts do NOT auto-refresh — they keep the scripts they
+# booted with. Re-roll them (or use the API refresh paths) to pick up changes.
+echo "✓ Scripts uploaded to S3 (new hosts pull on boot; running hosts need a re-roll)"
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/adot-config.yaml" "s3://${BUCKET}/deployment/scripts/adot-config.yaml" \
   --profile "$PROFILE" --region "$REGION" --quiet
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/backup-data.sh" "s3://${BUCKET}/deployment/scripts/backup-data.sh" \
@@ -228,9 +247,13 @@ VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('$SCRIPT_DIR/pypro
 # In legacy single-mode, both equal DASHBOARD_URL — backward-compat preserved.
 CONSOLE_BASE="${CONSOLE_URL:-${DASHBOARD_URL:-}}"
 DASHBOARD_BASE="${DASHBOARD_URL:-}"
+# SECURITY: config.js is served publicly via CloudFront, so the API key must
+# NOT be baked in — anyone opening the console page could read it. The operator
+# enters the key once in Settings; app.core.js persists it to localStorage.
+# API_URL is not a secret and stays as a convenience default.
 cat > "$SCRIPT_DIR/console/config.js" << CFGEOF
 window.OC_DEFAULT_API_URL = "${API_URL:-}";
-window.OC_DEFAULT_API_KEY = "${API_KEY:-}";
+window.OC_DEFAULT_API_KEY = "";
 window.OC_CONSOLE_BASE = "${CONSOLE_BASE}";
 window.OC_DASHBOARD_BASE = "${DASHBOARD_BASE}";
 window.OC_DUAL_DOMAIN_MODE = "${DUAL_DOMAIN_MODE:-false}";
@@ -241,6 +264,9 @@ window.OC_COGNITO_DOMAIN = "${COGNITO_DOMAIN:-}";
 window.OC_COGNITO_CLIENT_ID = "${COGNITO_CLIENT_ID:-}";
 window.OC_COGNITO_REDIRECT_URI = "${CONSOLE_BASE}/console/index.html";
 CFGEOF
+# --delete prunes stale console assets. Scoped to the console/ prefix on both
+# sides, so it only ever touches s3://.../console/* — never other assets in the
+# shared bucket (rootfs/, templates/, skills/, backups/).
 aws s3 sync "$SCRIPT_DIR/console/" "s3://${ASSETS_BUCKET}/console/" \
   --profile "$PROFILE" --region "$REGION" --quiet --delete
 echo "✓ Console uploaded to s3://${ASSETS_BUCKET}/console/"

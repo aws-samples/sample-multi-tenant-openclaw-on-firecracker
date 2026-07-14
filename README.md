@@ -124,14 +124,16 @@ cd sample-multi-tenant-openclaw-on-firecracker
 cp config.yml.example config.yml                                  # tweak as needed
 cp templates/openclaw.json.example templates/openclaw.json        # set your LLM API key
 
-# 2️⃣ One-click CDK deploy (~5 min) — provisions VPC, ASG, ALB, Lambda, DynamoDB,
-#                                    AMP, Grafana, Cognito, AgentCore, KMS, WAF
+# 2️⃣ Install Python deps into .venv (CDK app.py imports aws-cdk-lib from here)
+uv sync
+
+# 3️⃣ One-click CDK deploy (~5 min) — provisions VPC, ASG, ALB, Lambda, DynamoDB, AMP, Grafana, Cognito, AgentCore, KMS, WAF
 ./setup.sh ap-northeast-1 your-aws-profile
 
-# 3️⃣ Build the rootfs (~10 min, one-time, cloud-native — no local Linux required)
+# 4️⃣ Build the rootfs (~10 min, one-time, cloud-native — no local Linux required)
 ./scripts/build-rootfs-on-ec2.sh v1.0
 
-# 4️⃣ Create your first tenant
+# 5️⃣ Create your first tenant
 source .env.deploy
 curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" \
   -d '{"name":"my-first-agent","vcpu":2,"mem_mb":4096}' | jq .

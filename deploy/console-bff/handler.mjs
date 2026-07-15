@@ -10,6 +10,7 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join, normalize, extname } from "node:path";
 import { route as routeTraces } from "./traces.mjs";
+import { route as routeLogs } from "./logs.mjs";
 
 // @aws-sdk/client-ssm 由 Lambda Node 20 runtime 内建(未装进部署包)。
 // 本地开发/单测机器上可能没有 → 走 lazy import,允许 handler.mjs 无依赖载入。
@@ -29,9 +30,9 @@ const OBS_ASSETS_BUCKET = process.env.OBS_ASSETS_BUCKET || "";
 const OBS_S3_PREFIX = "deployment/observability/";
 const OBS_ALLOWED_KEYS = new Set([
   "adot/adot-config.yaml",
-  "fluent-bit/fluent-bit.conf",
-  "fluent-bit/parsers.conf",
-  "fluent-bit/extract_trace_root.lua",
+  "fluent-bit/edge/fluent-bit.conf",
+  "fluent-bit/edge/parsers.conf",
+  "fluent-bit/edge/extract_trace_root.lua",
 ]);
 // ponytail: 惰性加载 @aws-sdk/client-s3 —— Lambda Node 20 runtime 内置该 SDK,
 // 本地跑单测不需装它(测试用 setObsFetcher 注入 stub)。
@@ -70,9 +71,34 @@ const MIME = {
 
 // 动态 config.js:同源相对路径 /capi,零 key。前端 app.core.js 读 OC_DEFAULT_API_URL
 // 作为 apiUrl、OC_DEFAULT_API_KEY 作为 x-api-key 头 —— 这里把 key 置空,url 指向 BFF。
-function dynamicConfigJs() {
+// #217 — ALB 的 x-amzn-oidc-data(走 OIDC userInfo)【不含】cognito:groups(实测 keys 只有
+// sub/email/username/exp/iss)。故用 token 里的 username 调 Cognito AdminListGroupsForUser
+// 查真实组 → 角色。USER_POOL_ID 由 CDK 注入 env;查失败/无 pool → 安全默认 viewer。
+async function roleForUser(username) {
+  const poolId = process.env.USER_POOL_ID || "";
+  if (!poolId || !username || username === "unknown") return "viewer";
+  try {
+    const { CognitoIdentityProviderClient, AdminListGroupsForUserCommand } =
+      await import("@aws-sdk/client-cognito-identity-provider");
+    const c = new CognitoIdentityProviderClient({});
+    const r = await c.send(new AdminListGroupsForUserCommand({
+      UserPoolId: poolId, Username: username,
+    }));
+    return roleFromGroups((r.Groups || []).map((g) => g.GroupName));
+  } catch (e) {
+    console.log("[oidc] roleForUser failed for " + username + ": " + e);
+    return "viewer";
+  }
+}
+
+async function dynamicConfigJs(headers) {
+  // #217 — 真实角色:ALB token 不带 groups,用其中的 username 查 Cognito 组(见 roleForUser)。
+  // 经 window.OC_ROLE 暴露给前端,让 canWrite() 在 BFF 架构下拿到真角色。
+  const ident = parseOidcIdentity(headers);
+  const role = await roleForUser(ident.username);
   return [
     `window.OC_DEFAULT_API_URL = "${API_PREFIX}/";`,
+    `window.OC_ROLE = "${role}";`,
     // 前端不再持真 key。给一个非敏感占位哨兵 —— console 现有逻辑用 `if (apiUrl && apiKey)`
     // 守卫是否发请求(app.core.js/app.tenants.js),空串会让它永不发请求。占位值满足守卫,
     // 且它到 BFF 后被丢弃(BFF 只用自己 env 里的真 key 注入),泄露了也毫无价值。
@@ -103,13 +129,14 @@ function textResp(status, body, contentType) {
 }
 
 // ── 静态文件 serve(白名单后缀 + 路径归一化防穿越)──────────────────────────
-async function serveStatic(urlPath) {
+async function serveStatic(urlPath, headers) {
   let rel = urlPath;
   if (rel === "/" || rel === "" || rel === "/index.html") {
     rel = "/index.html";
   }
   if (rel === "/config.js") {
-    return textResp(200, dynamicConfigJs(), MIME[".js"]);
+    // #217 — config.js 带 window.OC_ROLE(用 token username 查 Cognito 组得真实角色)
+    return textResp(200, await dynamicConfigJs(headers), MIME[".js"]);
   }
   const ext = extname(rel);
   if (!MIME[ext]) return textResp(404, "not found");
@@ -131,9 +158,23 @@ async function serveStatic(urlPath) {
 }
 
 // ── 控制面代理:注入 admin key,原样透传 method/body/query ────────────────────
+// ALB 传进来的 query 值是 URL 编码态且不解码(与 API GW 不同);若直接喂
+// URLSearchParams,它会把已存在的 %-转义再编一次(%3A→%253A),双重编码 →
+// 控制面收到 %3A → ISO8601 正则失败 400(snapshot_time 带冒号最先暴露)。
+// 先 decode 一次再重编码,保证恰好单层编码;对未编码值 decode 为 no-op。
+export function buildForwardQuery(qs) {
+  const params = new URLSearchParams();
+  for (const [k, v] of Object.entries(qs || {})) {
+    let val = v;
+    try { val = decodeURIComponent(v); } catch { /* 非法 %-序列:原样透传 */ }
+    params.append(k, val);
+  }
+  return params.toString();
+}
+
 async function proxyControlPlane(event, subPath) {
   const qs = event.queryStringParameters || {};
-  const query = new URLSearchParams(qs).toString();
+  const query = buildForwardQuery(qs);
   const url = `${CTRL_BASE.replace(/\/+$/, "")}/${subPath.replace(/^\/+/, "")}${query ? "?" + query : ""}`;
   const method = event.httpMethod || "GET";
 
@@ -246,14 +287,35 @@ export function maskParams(params) {
   return out;
 }
 
+// #217 — 从 ALB 注入的 x-amzn-oidc-data(Cognito 登录后的已验证身份)解出 sub/email +
+// 角色。角色 = cognito:groups 里最高权限(admin>operator>viewer),没组 → viewer。
+// 前端拿不到这个 header(它在 ALB→BFF 之间),故 BFF 解出来经动态 config.js 暴露给前端,
+// 让 console 按真实角色隐藏写操作入口(canWrite 门控在 BFF 架构下才能生效)。
+function roleFromGroups(groups) {
+  let g = groups || [];
+  if (typeof g === "string") g = [g];
+  const rank = { viewer: 0, operator: 1, admin: 2 };
+  let best = "viewer", bestRank = -1;
+  for (const x of g) {
+    if (rank[x] !== undefined && rank[x] > bestRank) { best = x; bestRank = rank[x]; }
+  }
+  return best;
+}
+
 function parseOidcIdentity(headers) {
   const data = headers?.["x-amzn-oidc-data"] || "";
-  if (!data) return { sub: "unknown", email: "unknown" };
+  if (!data) return { sub: "unknown", email: "unknown", role: "viewer" };
   try {
     const payload = JSON.parse(Buffer.from(data.split(".")[1], "base64").toString());
-    return { sub: payload.sub || "unknown", email: payload.email || "unknown" };
+    // ALB 的 x-amzn-oidc-data 走 OIDC userInfo,不含 cognito:groups(实测),故这里只取
+    // sub/email/username;角色由 roleForUser(username) 另查 Cognito 组(见 dynamicConfigJs)。
+    return {
+      sub: payload.sub || "unknown",
+      email: payload.email || "unknown",
+      username: payload.username || payload.sub || "unknown",
+    };
   } catch {
-    return { sub: "parse-error", email: "parse-error" };
+    return { sub: "parse-error", email: "parse-error", username: "unknown" };
   }
 }
 
@@ -308,6 +370,20 @@ async function loadXray() {
 }
 export function __setXray(fake) {
   _xray = fake;
+}
+
+// #266 — Lazy loaders for the per-tenant log viewer adapters (CloudWatch Logs
+// Insights + AOS). Same pattern as X-Ray: SDK loads only when the route is hit,
+// tests inject fakes via __setLogDeps() so nothing pulls the SDK.
+let _logDeps = null;
+async function loadLogDeps() {
+  if (_logDeps) return _logDeps;
+  const [cw, ao] = await Promise.all([import("./cwlogs-client.mjs"), import("./aos-client.mjs")]);
+  _logDeps = { cwlogs: cw.cwlogs, aos: ao.aos };
+  return _logDeps;
+}
+export function __setLogDeps(fake) {
+  _logDeps = fake;
 }
 
 // ── R15.2 SSM 默认值 console 可查改 ─────────────────────────────────────────
@@ -401,9 +477,10 @@ async function putSystemDefault(key, value) {
     Value: value,
     Type: meta.secure ? "SecureString" : "String",
     Overwrite: true,
-    // secure 参数用 alias/clawpool-general(host role 有 kms:Decrypt);未配 CMK 时
-    // 走默认 aws/ssm。这里显式指定与 mint-shared-vkey.sh 契约同款。
-    ...(meta.secure ? { KeyId: "alias/clawpool-general" } : {}),
+    // #264 — 不显式指定 KeyId:SecureString 走 SSM 默认 aws/ssm 托管 key(与
+    // litellm-shared-vkey 现有加密方式一致,真机实测)。原来硬编码 alias/clawpool-general
+    // 是不存在的 alias(真机 NotFoundException)→ 写 secure 默认值必 KMS 失败。BFF role
+    // 的 kms 权限用 ViaService 限定 ssm,与此一致。
   });
   await client.send(cmd);
 }
@@ -496,11 +573,19 @@ export async function handler(event) {
         emitAudit(event, identity, resp, startMs);
         return resp;
       }
+      // #266: /capi/logs served locally — per-tenant Lambda(CloudWatch)+ vm/host
+      // (AOS)log viewer. Adapters load lazily; tests inject via __setLogDeps().
+      if (subPath === "/logs") {
+        const deps = await loadLogDeps();
+        const resp = (await routeLogs(subPath, event, deps)) || textResp(404, "not found");
+        emitAudit(event, identity, resp, startMs);
+        return resp;
+      }
       const resp = await proxyControlPlane(event, subPath);
       emitAudit(event, identity, resp, startMs);
       return resp;
     }
-    return await serveStatic(path);
+    return await serveStatic(path, event.headers);
   } catch (e) {
     // fail-loud:不静默吞,回 502 带简短原因(不泄 key)。
     const resp = textResp(502, `bff error: ${String(e?.message || e).slice(0, 200)}`);

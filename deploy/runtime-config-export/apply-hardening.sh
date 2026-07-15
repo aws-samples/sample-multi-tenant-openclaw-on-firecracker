@@ -78,20 +78,20 @@ if [ "$EXIST_ID" != "None" ] && [ -n "$EXIST_ID" ]; then
   echo "  已存在 guardrail $GR_NAME ($EXIST_ID) — 跳过创建(幂等);如要更新用 update-guardrail"
   GID="$EXIST_ID"
 else
-  # 名称中性化:存量账号可能有旧名的 guardrail(早前用非中性 name 建的)。
-  # 若存在,原地 update-guardrail 改名到中性名(id 不变
+  # 去品牌收敛(issue #24):存量账号可能有旧品牌名的 guardrail(去品牌前建的,如
+  # 旧品牌-ai-chat-exchange-grade)。若存在,原地 update-guardrail 改名到中性名(id 不变
   # → LiteLLM/镜像的 guardrailIdentifier 引用不断),而不是另建一个 claw-* 留孤儿。
   # 用同一份 $GR_INPUT(name 已是中性名 + 完整 policy)做 update,replace 语义下 policy 零削减。
-  # 探测规则:名字含 "-ai-chat-exchange-grade" 后缀但 name 不等于目标中性名 = 旧名残留。
+  # 探测规则:名字含 "-ai-chat-exchange-grade" 后缀但 name 不等于目标中性名 = 旧品牌残留。
   LEGACY_ID=$($AWS bedrock list-guardrails \
     --query "guardrails[?contains(name,'-ai-chat-exchange-grade') && name!='$GR_NAME'].id|[0]" \
     --output text 2>/dev/null || echo "None")
   if [ "$LEGACY_ID" != "None" ] && [ -n "$LEGACY_ID" ]; then
     LEGACY_NAME=$($AWS bedrock get-guardrail --guardrail-identifier "$LEGACY_ID" --guardrail-version DRAFT --query name --output text 2>/dev/null || echo "?")
-    echo "  发现旧名 guardrail $LEGACY_NAME ($LEGACY_ID) — 原地改名到 $GR_NAME(id 不变,LiteLLM 引用不断)"
+    echo "  发现旧品牌 guardrail $LEGACY_NAME ($LEGACY_ID) — 原地改名到 $GR_NAME(id 不变,LiteLLM 引用不断)"
     $AWS bedrock update-guardrail --guardrail-identifier "$LEGACY_ID" --cli-input-json "file://$GR_INPUT" >/dev/null
     GID="$LEGACY_ID"
-    echo "  ✓ 改名完成 id=$GID(policy 用仓库完整入参,replace 零削减)"
+    echo "  ✓ 去品牌改名完成 id=$GID(policy 用仓库完整入参,replace 零削减)"
   else
     GID=$($AWS bedrock create-guardrail --cli-input-json "file://$GR_INPUT" --query "guardrailId" --output text)
     echo "  ✓ 创建 guardrail id=$GID"

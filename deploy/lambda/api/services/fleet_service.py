@@ -301,6 +301,11 @@ def _execute_batch(action, target_ids, event):
                 failed.append({"id": tid, "error": "tenant not found"})
                 continue
             if action == "delete":
+                # #263 — 批删削峰不在这里做:delete_tenant 入口已有入队短路(队列开+
+                # 非 consumer 重放 → 入队返 202)。同步批删与 async worker(run_batch_job
+                # 传 _caller_identity_memo,非 _consumer_ident)都命中它,逐 tid 秒入队,
+                # consumer 受控并发消费。202<400 计入 succeeded,{succeeded,failed} 结构不变。
+                # 空 query 保持批删现状语义(软删保盘);真删盘走单删 ?keep_data=false。
                 result = tenant_service.delete_tenant(tid, {}, event)
             else:
                 result = tenant_service.tenant_action(tid, action, None, event)

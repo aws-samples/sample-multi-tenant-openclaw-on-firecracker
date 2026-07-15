@@ -28,7 +28,7 @@ def _read_pyproject_version():
 
 
 def _build_vpc(scope, net_cfg):
-    """P2b · #187 FR-10 · the data-plane contract §6:三档 VPC。
+    """P2b · #187 FR-10 · the data-plane contract:三档 VPC。
 
     - default_vpc: 存量 from_lookup 默认 VPC(host 裸公网,不推荐)。
     - self_managed: 自建 /20,PUBLIC×3(/24)+ PRIVATE_ISOLATED×3(Database /26,

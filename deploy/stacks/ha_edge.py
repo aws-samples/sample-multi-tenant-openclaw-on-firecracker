@@ -1,7 +1,6 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-import ipaddress
 import re
 from aws_cdk import (
     aws_lambda as _lambda,
@@ -18,7 +17,6 @@ from aws_cdk import (
     aws_bedrockagentcore as agentcore_l1,
     aws_ssm as ssm,
     aws_elasticache as elasticache,
-    aws_wafv2 as wafv2,
     custom_resources as cr,
     Duration,
     Fn,
@@ -42,14 +40,6 @@ def build_ha_edge(self, ctx):
     image_ready = getattr(ctx, "image_ready", None)
     sec_cfg = getattr(ctx, "sec_cfg", None)
     vpc = getattr(ctx, "vpc", None)
-
-    # ── Observability: X-Ray tracing (same gate as lambdas.py) ──
-    _obs_cfg = CFG.get("observability", {}) or {}
-    _tracing_mode = (
-        _lambda.Tracing.ACTIVE
-        if _obs_cfg.get("tracing_enabled", True)
-        else _lambda.Tracing.PASS_THROUGH
-    )
 
     # ========== Multi-AZ HA (issue #8) ==========
     # `_az_count` controls how many AZs the ASG and ALB span. Default is
@@ -149,16 +139,29 @@ def build_ha_edge(self, ctx):
     _edge_port_high = int((CFG.get("edge", {}) or {}).get("dnat_port_high", 15000))
     init_sh = init_sh.replace("{{DNAT_PORT_LOW}}", str(_edge_port_low))
     init_sh = init_sh.replace("{{DNAT_PORT_HIGH}}", str(_edge_port_high))
-    # R5.3 port quarantine cooldown (seconds). release 后端口冷却期内不被复用,
-    # 防 R6 迁移完成后源端口立即被目标新租户复用把在途流量窜走。
-    _quarantine_secs = int(
-        (CFG.get("edge", {}) or {}).get("port_quarantine_seconds", 20)
+    # #266 端口 quarantine 冷却期(config.yml → edge.port_quarantine_seconds →
+    # /etc/platform.env,route_ops.py:48 读)。#222 加了 init-host.sh 的占位符
+    # 却漏了这条渲染 → 真机 host-agent 起来 import route_ops 时
+    # int("{{PORT_QUARANTINE_SECONDS}}") 抛 ValueError,host-agent 崩溃重启循环、
+    # 整台 host 不可调度(2026-07-15 美东1 真机复现)。默认 20 与 route_ops.py
+    # 的 os.environ.get 兜底同源;0 = 关。
+    init_sh = init_sh.replace(
+        "{{PORT_QUARANTINE_SECONDS}}",
+        str((CFG.get("edge", {}) or {}).get("port_quarantine_seconds", 20)),
     )
-    init_sh = init_sh.replace("{{PORT_QUARANTINE_SECONDS}}", str(_quarantine_secs))
     init_sh = init_sh.replace(
         "{{AGENTCORE_GATEWAY_URL}}", gateway_url if gateway_url else "none"
     )
     init_sh = init_sh.replace("{{AMP_REMOTE_WRITE_URL}}", amp_remote_write_url)
+    # #245 host Fluent Bit: logging gate + the two host-side stream names.
+    # Hardcode the names (same pattern as edge's claw-logs{gsuffix} in the edge
+    # userdata below) — build_observability runs after build_ha_edge, so
+    # ctx.log_firehose_stream_name_* isn't set yet at template time. Names are
+    # deterministic from _gsuffix and must match observability.py.
+    _logging_enabled = bool((CFG.get("logging") or {}).get("enabled", False))
+    init_sh = init_sh.replace("{{LOGGING_ENABLED}}", str(_logging_enabled).lower())
+    init_sh = init_sh.replace("{{FB_STREAM_HOST}}", f"claw-logs-host{self._gsuffix}")
+    init_sh = init_sh.replace("{{FB_STREAM_VM}}", f"claw-logs-vm{self._gsuffix}")
     # Balloon config
     balloon_cfg = CFG.get("balloon", {})
     init_sh = init_sh.replace(
@@ -379,7 +382,7 @@ def build_ha_edge(self, ctx):
     # be ignored on metal. We gate the nested-virt CustomResource on this.
     _is_metal = ".metal" in _instance_type_str
 
-    # 开发期 SSH(the project rule:开发用 SSH 不用 SSM)。config host.ssh_key_name
+    # 开发期 SSH(the ops guide 铁律:开发用 SSH 不用 SSM)。config host.ssh_key_name
     # 配了就给 metal 绑 keypair,让堡垒机能 SSH 进去调试/起节点。生产留空=无 key。
     _host_key_name = (CFG.get("host", {}) or {}).get("ssh_key_name") or None
     # 私有子网模式下 host 不要公网 IP(默认 VPC 公有子网需要公 IP 出网,
@@ -693,7 +696,6 @@ def build_ha_edge(self, ctx):
                 code=_lambda.Code.from_asset("deploy/lambda/agentcore_tools"),
                 timeout=Duration.seconds(30),
                 memory_size=2048,
-                tracing=_tracing_mode,
             )
             ac_gateway.add_lambda_target(
                 "tools",
@@ -818,14 +820,14 @@ def build_ha_edge(self, ctx):
         vpc=vpc,
         vpc_subnets=ec2.SubnetSelection(subnets=_alb_subnets),
         internet_facing=True,
-        # P2b · the data-plane contract §6:数据面是 SSE 流式 + WS 长连,ALB 默认
+        # P2b · the data-plane contract:数据面是 SSE 流式 + WS 长连,ALB 默认
         # idle_timeout=60s 会掐断 >1min 无字节的连接。设 3600s(ALB 硬上限 4000s
         # 内),与 OpenResty proxy_read/send_timeout 3600s 对齐。CloudFront origin
         # 由硬上限 180s 兜(§6 更新:CF 180s → ALB 3600s → OpenResty 3600s,WS
         # 长静默 >180s 靠客户端 30s ping 兜)。
         idle_timeout=Duration.seconds(3600),
     )
-    # 安全红线(project security rule):公网走 CloudFront→ALB,ALB 入站【只】允许
+    # 安全红线(the ops guide):公网走 CloudFront→ALB,ALB 入站【只】允许
     # CloudFront origin-facing managed prefix list,绝不对 0.0.0.0/0 开放。
     # add_listener 默认 open=True 会给 ALB SG 加 0.0.0.0/0:80 —— 必须 open=False,
     # 再显式只放行 CloudFront prefix list。prefix list id 各区不同,从 context 读
@@ -892,229 +894,6 @@ def build_ha_edge(self, ctx):
         "VPC to host-agent :8899 (Prometheus /metrics scrape + /health)",
     )
 
-    # ╓─── [#212 R3 CloudFront 可配置]  ALB SG 追加放行客户自有边缘 CIDR ─╖
-    # cloudfront.enabled=false 时,客户接自有边缘(自建 CDN/WAF/GLB 出口)。
-    # 公网 ALB SG 保留 CF prefix list 兜底(现有逻辑已挂),此处追加放行客户
-    # 手填的 alb_ingress_cidrs(逗号分隔的自有边缘出口段);0.0.0.0/0 fail-loud。
-    # 不填 = 安全但流量不通(设计选择,见 spec design.md 5:false 不做硬拒 synth)。
-    _cf_cfg_for_ingress = CFG.get("cloudfront", {}) or {}
-    _extra_cidrs_raw = str(
-        _cf_cfg_for_ingress.get("alb_ingress_cidrs", "") or ""
-    ).strip()
-    if _extra_cidrs_raw:
-        for _cidr in [c.strip() for c in _extra_cidrs_raw.split(",") if c.strip()]:
-            # #212 R3 红线:SG 任何组合下不得对全网开放。用 ipaddress 解析而非字面
-            # 匹配 "0.0.0.0/0" —— 否则拆分段(0.0.0.0/1 + 128.0.0.0/1、::/1 等)可
-            # 绕过字符串检查等效全网开放。拒:非法 CIDR、含默认路由网络、prefixlen
-            # 过小(IPv4<8 / IPv6<16)覆盖面过大的段。
-            try:
-                _net = ipaddress.ip_network(_cidr, strict=False)
-            except ValueError as _e:
-                raise ValueError(
-                    f"cloudfront.alb_ingress_cidrs 含非法 CIDR {_cidr!r}:{_e}"
-                )
-            _min_prefix = 8 if _net.version == 4 else 16
-            if _net.prefixlen < _min_prefix or int(_net.network_address) == 0:
-                raise ValueError(
-                    f"cloudfront.alb_ingress_cidrs 段 {_cidr} 覆盖面过大/含全网默认路由"
-                    "(#212 R3 红线,SG 任何组合下不得对全网开放;要放公网走 "
-                    "CloudFront/客户自有 CDN)"
-                )
-            listener.connections.allow_default_port_from(
-                ec2.Peer.ipv4(_cidr),
-                f"#212 R3 alb_ingress_cidrs: customer edge egress {_cidr}",
-            )
-
-    # ╓─── [#212 R2 ALB 拆分] 内网 ALB(控制台流量)+ 可选 NLB PrivateLink ─╖
-    # 默认 alb_split.enabled=false → 现状:BFF/console 挂公网 DashboardALB(auth.py 逻辑不变)。
-    # 开 true → 新建 internal ALB,BFF 目标组挂它;auth.py 见 R2 分支据 _alb_split_enabled 挂 TG。
-    # R3 需要 self_managed 或 imported 网络(要求私有子网 ≥2 跨 AZ);default_vpc 拒。
-    _split_cfg = CFG.get("alb_split", {}) or {}
-    _alb_split_enabled = bool(_split_cfg.get("enabled", False))
-    console_alb = None
-    console_alb_listener = None
-    if _alb_split_enabled:
-        _net_mode = (CFG.get("network", {}) or {}).get("mode", "default_vpc")
-        if _net_mode not in ("self_managed", "imported"):
-            raise ValueError(
-                "alb_split.enabled=true requires network.mode=self_managed|imported "
-                "(internal ALB 需 ≥2 私有子网跨 AZ;default_vpc 无匹配私有子网)"
-            )
-        _console_alb_subnets = (
-            vpc.select_subnets(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS).subnets
-            or vpc.private_subnets
-        )
-        if len(_console_alb_subnets) < 2:
-            raise ValueError(
-                "alb_split.enabled=true 需要 ≥2 私有子网跨 AZ,当前=%d"
-                % len(_console_alb_subnets)
-            )
-        console_alb = elbv2.ApplicationLoadBalancer(
-            self,
-            "ConsoleALB",
-            load_balancer_name="openclaw-console",
-            vpc=vpc,
-            vpc_subnets=ec2.SubnetSelection(subnets=_console_alb_subnets[:3]),
-            internet_facing=False,  # 内网 ALB,scheme=internal
-            idle_timeout=Duration.seconds(60),
-        )
-        # 内网 ALB SG 入站 :443 只放本 VPC(NLB target 走同 VPC,PrivateLink 由 NLB 承载)。
-        console_alb.connections.security_groups[0].add_ingress_rule(
-            ec2.Peer.ipv4(vpc.vpc_cidr_block),
-            ec2.Port.tcp(443),
-            "internal ALB :443 from VPC only (PrivateLink 经 NLB→internal ALB)",
-        )
-        # 默认 :443 fixed 404 listener,auth.py 见 _alb_split_enabled 挂 authenticate-cognito rule。
-        # 证书由 config alb_split.console_alb_certificate_arn 提供;未配则 :443 起不来。
-        _console_cert = str(
-            _split_cfg.get("console_alb_certificate_arn", "") or ""
-        ).strip()
-        if _console_cert:
-            console_alb_listener = console_alb.add_listener(
-                "ConsoleHTTPS",
-                port=443,
-                open=False,
-                certificates=[elbv2.ListenerCertificate.from_arn(_console_cert)],
-                default_action=elbv2.ListenerAction.fixed_response(
-                    404, content_type="text/plain", message_body="not found"
-                ),
-            )
-        else:
-            print(
-                "[#212 R2] WARNING: alb_split.enabled=true but "
-                "alb_split.console_alb_certificate_arn empty — ConsoleALB has no "
-                ":443 listener; BFF 挂它后暂不可达(补证书 ARN 后 redeploy 即通)。"
-            )
-
-    # ╓─── [#212 R3 NLB 集团打通] internal NLB → internal ALB + PrivateLink EPS ─╖
-    _nlb_cfg = CFG.get("nlb", {}) or {}
-    _nlb_enabled = bool(_nlb_cfg.get("enabled", False))
-    if _nlb_enabled:
-        if not _alb_split_enabled:
-            raise ValueError(
-                "nlb.enabled=true requires alb_split.enabled=true "
-                "(NLB target 是内网 ALB,拆分未启则无内网 ALB 可挂)"
-            )
-        _nlb_subnets = (
-            vpc.select_subnets(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS).subnets
-            or vpc.private_subnets
-        )
-        # NLB TargetType=alb 要求 aws-cdk-lib.aws_elasticloadbalancingv2 支持;先用 L1(CfnLoadBalancer)
-        # + 底层 TargetGroup 挂 internal ALB。CDK L2 NetworkLoadBalancer TargetType=alb 有版本约束。
-        _console_nlb = elbv2.NetworkLoadBalancer(
-            self,
-            "ConsoleNLB",
-            load_balancer_name="openclaw-console-nlb",
-            vpc=vpc,
-            vpc_subnets=ec2.SubnetSelection(subnets=_nlb_subnets[:3]),
-            internet_facing=False,
-        )
-        _nlb_listener = _console_nlb.add_listener("Tls443", port=443)
-        # TargetType=alb:NLB 反代 internal ALB(七层能力完整落到 ALB 层,如 authenticate-cognito)。
-        _alb_target_tg = elbv2.NetworkTargetGroup(
-            self,
-            "ConsoleNLBToALBTG",
-            vpc=vpc,
-            port=443,
-            protocol=elbv2.Protocol.TCP,
-            target_type=elbv2.TargetType.ALB,
-        )
-        _nlb_listener.add_target_groups("Default", _alb_target_tg)
-        # 挂 target = internal ALB ARN
-        from aws_cdk import aws_elasticloadbalancingv2_targets as elbv2_targets
-
-        _alb_target_tg.add_target(elbv2_targets.AlbTarget(console_alb, 443))
-        # VPC Endpoint Service(acceptance_required=true):集团侧建 endpoint 后由运营 approve。
-        _ep_svc = ec2.CfnVPCEndpointService(
-            self,
-            "ConsoleEndpointService",
-            network_load_balancer_arns=[_console_nlb.load_balancer_arn],
-            acceptance_required=True,
-        )
-        # 允许发起 PrivateLink 连接的 principal(若未配,只本账号可 create-vpc-endpoint)。
-        _allowed = list(_nlb_cfg.get("allowed_principals") or [])
-        if _allowed:
-            ec2.CfnVPCEndpointServicePermissions(
-                self,
-                "ConsoleEndpointServicePerms",
-                service_id=_ep_svc.ref,
-                allowed_principals=_allowed,
-            )
-        import aws_cdk as cdk  # local import to avoid double-import at top
-
-        cdk.CfnOutput(
-            self,
-            "ConsoleEndpointServiceName",
-            value=Fn.join(".", ["com.amazonaws.vpce", self.region, _ep_svc.ref]),
-            description="VPC Endpoint Service name (集团侧建 endpoint 用)",
-        )
-
-    # ╓─── [#212 R4 ALB WebACL] REGIONAL 作用域,四托管规则(无 rate/无 IP 信誉)─╖
-    _waf_alb_cfg = CFG.get("waf", {}) or {}
-    if bool(_waf_alb_cfg.get("alb_enabled", False)):
-        if not _alb_split_enabled:
-            # WAF 挂只有拆分后的内网 ALB 才有意义(数据面公网 ALB WSS upgrade 用例
-            # spec R4.3 要求不误拦,当前 CommonRuleSet 对 upgrade 无冲突,故也挂上)。
-            print(
-                "[#212 R4] WARNING: waf.alb_enabled=true but alb_split.enabled=false "
-                "— WebACL 只挂公网 DashboardALB(内网 ALB 未启)"
-            )
-        # 四条托管规则,顺序 = 优先级(0..3)。规则名对齐 D5 终局口径。
-        _alb_managed_rules = [
-            "AWSManagedRulesCommonRuleSet",
-            "AWSManagedRulesKnownBadInputsRuleSet",
-            "AWSManagedRulesSQLiRuleSet",
-            "AWSManagedRulesLinuxRuleSet",  # UnixRuleSet 是别名,官方规则名 LinuxRuleSet
-        ]
-        _alb_rules = []
-        for _i, _rn in enumerate(_alb_managed_rules):
-            _alb_rules.append(
-                wafv2.CfnWebACL.RuleProperty(
-                    name=_rn,
-                    priority=_i,
-                    override_action=wafv2.CfnWebACL.OverrideActionProperty(none={}),
-                    statement=wafv2.CfnWebACL.StatementProperty(
-                        managed_rule_group_statement=wafv2.CfnWebACL.ManagedRuleGroupStatementProperty(
-                            vendor_name="AWS",
-                            name=_rn,
-                        ),
-                    ),
-                    visibility_config=wafv2.CfnWebACL.VisibilityConfigProperty(
-                        cloud_watch_metrics_enabled=True,
-                        sampled_requests_enabled=True,
-                        metric_name=_rn,
-                    ),
-                )
-            )
-        _alb_web_acl = wafv2.CfnWebACL(
-            self,
-            "AlbWebACL",
-            name=f"openclaw-alb-acl{self._gsuffix}",
-            scope="REGIONAL",  # ALB 是 REGIONAL(CloudFront 才 CLOUDFRONT scope 且 us-east-1)
-            default_action=wafv2.CfnWebACL.DefaultActionProperty(allow={}),
-            visibility_config=wafv2.CfnWebACL.VisibilityConfigProperty(
-                cloud_watch_metrics_enabled=True,
-                sampled_requests_enabled=True,
-                metric_name="OpenClawAlbACL",
-            ),
-            rules=_alb_rules,
-        )
-        # 公网 ALB 关联
-        wafv2.CfnWebACLAssociation(
-            self,
-            "AlbWebACLAssociation",
-            resource_arn=alb.load_balancer_arn,
-            web_acl_arn=_alb_web_acl.attr_arn,
-        )
-        # 内网 ALB(若拆分)也关联同一 WebACL(spec R4.1)
-        if console_alb is not None:
-            wafv2.CfnWebACLAssociation(
-                self,
-                "ConsoleAlbWebACLAssociation",
-                resource_arn=console_alb.load_balancer_arn,
-                web_acl_arn=_alb_web_acl.attr_arn,
-            )
-
     # Pass ALB info to API Lambda for path-based routing
     api_fn.add_environment("ALB_LISTENER_ARN", listener.listener_arn)
     api_fn.add_environment("VPC_ID", vpc.vpc_id)
@@ -1172,49 +951,24 @@ def build_ha_edge(self, ctx):
             ec2.Port.tcp(6379),
             "host-agent writes route:{tenant_id}",
         )
-        # #196 — Redis 优先落独立 DB 子网(PRIVATE_ISOLATED,数据库层与 app 层
-        # 物理隔离、无 NAT 出网面)。self_managed 现建 Db 层;imported 传了
-        # database_subnet_ids 也走这里。没有隔离子网(default_vpc / imported 未传 db /
-        # 存量栈)则回落 PRIVATE_WITH_EGRESS → private_subnets,行为与升级前一致。
-        _redis_on_db_subnet = True
         _redis_subnets = vpc.select_subnets(
-            subnet_type=ec2.SubnetType.PRIVATE_ISOLATED
+            subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
         ).subnet_ids
-        if not _redis_subnets:
-            _redis_on_db_subnet = False
-            _redis_subnets = vpc.select_subnets(
-                subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
-            ).subnet_ids
         if not _redis_subnets:
             # default_vpc / imported 场景可能没有 PRIVATE_WITH_EGRESS,回落
             # private_subnets(imported 明确传的私有子网 id)。全空 fail-loud。
             _redis_subnets = [s.subnet_id for s in vpc.private_subnets]
         if len(_redis_subnets) < 2:
             raise ValueError(
-                "redis.enabled=true 需要 ≥2 子网跨 AZ,当前可用 Redis 子网数="
+                "redis.enabled=true 需要 ≥2 私有子网跨 AZ,当前 VPC 私有子网数="
                 f"{len(_redis_subnets)}(网络模式改 self_managed 或 imported 传齐)"
             )
-        # #196 存量升级(fix):SubnetGroup 名里编入落点(-db / 私有=无后缀)。
-        # 存量环境从私有子网升到隔离 Db 子网时,SubnetGroup 只改 subnet_ids 会让
-        # CFN 走 ModifyCacheSubnetGroup 就地改——但 ElastiCache 对**在用**的
-        # SubnetGroup 报 "subnet IDs ... in use"(400)→ 整栈 UPDATE_ROLLBACK
-        # (存量 Redis 无法就地迁子网,真机实撞)。把落点编进名字后,升级=换名=
-        # CFN 先建新 SubnetGroup(Db)、再因名变 REPLACE ReplicationGroup(删旧
-        # Redis@私有子网、建新 Redis@Db 子网),这是 AWS 迁 ElastiCache 子网的
-        # 原生路径。代价:路由表 Redis 重建期短暂空(edge L2 stale 兜 60s +
-        # host-agent 下一 promote 重灌;存量 running 租户需一次 route reseed)。
-        # 新部署无影响(本就直接建在 Db 子网,名字带 -db 一步到位)。
-        _redis_sng_name = f"openclaw-redis-subnets{'-db' if _redis_on_db_subnet else ''}{self._gsuffix}"
         _redis_subnet_group = elasticache.CfnSubnetGroup(
             self,
             "RedisSubnetGroup",
-            description=(
-                "OpenClaw route-table Redis (isolated Db subnets)"
-                if _redis_on_db_subnet
-                else "OpenClaw route-table Redis (private subnets)"
-            ),
+            description="OpenClaw route-table Redis (private subnets)",
             subnet_ids=_redis_subnets,
-            cache_subnet_group_name=_redis_sng_name,
+            cache_subnet_group_name=f"openclaw-redis-subnets{self._gsuffix}",
         )
         _replicas = int(_redis_cfg.get("num_replicas", 2))
         _redis_rg = elasticache.CfnReplicationGroup(
@@ -1310,7 +1064,7 @@ def build_ha_edge(self, ctx):
             "ALB to OpenResty edge :8080 (only)",
         )
         # edge SG → host SG DNAT 端口段(host 数据面入站的唯一来源)。
-        # 安全红线(internal security review):host 的数据面流量只能来自 OpenResty
+        # 安全红线():host 的数据面流量只能来自 OpenResty
         # edge 集群,别处一律拒。端口段上下界从 config edge.dnat_port_{low,high} 读
         # (默认 [10000,15000] = 5001 槽);此处复用上方算好的 _edge_port_{low,high},
         # 与注入 host 位图的 DNAT_PORT_{LOW,HIGH} 同源(Property 2,防两边裂开)。
@@ -1318,9 +1072,9 @@ def build_ha_edge(self, ctx):
         sg.add_ingress_rule(
             ec2.Peer.security_group_id(_edge_sg.security_group_id),
             ec2.Port.tcp_range(_edge_port_low, _edge_port_high),
-            "edge to host DNAT port range (the data-plane contract S3)",
+            "edge to host DNAT port range (the data-plane contract)",
         )
-        # 安全红线(internal security review):禁止 host↔host 互访,堵跨租户/跨 host
+        # 安全红线():禁止 host↔host 互访,堵跨租户/跨 host
         # 横向移动。旧 HostToHostDnatIngress(host SG 自引用放行 DNAT 端口段)
         # 是"edge 曾装在 host 上"旧布局的遗留;现在 OpenResty 是独立 ASG,
         # 数据面链路是 edge→host DNAT→microVM,host 之间无需互通该端口段。
@@ -1365,11 +1119,7 @@ def build_ha_edge(self, ctx):
             f"[ -f /opt/openclaw-edge/install-edge.sh ] && [ -f /opt/openclaw-edge/nginx.conf ] && break; "
             f'echo "waiting for edge assets in S3 ($i)"; sleep 10; done',
             '[ -f /opt/openclaw-edge/install-edge.sh ] || { echo "[edge-userdata] FATAL: edge assets missing after 600s" >&2; exit 1; }',
-            # #229: 透传 ASSETS_BUCKET + AWS_REGION 让 install-edge.sh 从 S3
-            # deployment/observability/fluent-bit/ 拉最新配置(S3 asset 化,
-            # 可下发新版无需重烤 edge AMI);缺环境或拉失败回退 asset bundle。
             f'ENGINE_REDIS_ENDPOINT="{redis_endpoint}" EDGE_LISTEN_PORT=8080 '
-            f'ASSETS_BUCKET="{assets_bucket.bucket_name}" AWS_REGION="{self.region}" '
             "bash /opt/openclaw-edge/install-edge.sh",
         )
         _edge_lt = ec2.LaunchTemplate(
@@ -1511,36 +1261,19 @@ function handler(event) {
     )
 
     cf_cfg = CFG.get("cloudfront", {}) or {}
-    # #212 R3:cloudfront.enabled 总开关。false = 不建 Distribution,SG 保 CF prefix list
-    # 兜底 + 客户 alb_ingress_cidrs 追加自有边缘。默认 true = 现状。
-    _cf_enabled = bool(cf_cfg.get("enabled", True))
     # ----- DUAL mode candidates -----
     console_domain = (cf_cfg.get("console_domain") or "").strip()
     console_cert_arn = (cf_cfg.get("console_cert_arn") or "").strip()
     app_domain = (cf_cfg.get("app_domain") or "").strip()
     app_cert_arn = (cf_cfg.get("app_cert_arn") or "").strip()
     dual_mode = bool(
-        _cf_enabled
-        and console_domain
-        and console_cert_arn
-        and app_domain
-        and app_cert_arn
+        console_domain and console_cert_arn and app_domain and app_cert_arn
     )
     # ----- LEGACY single-domain fallback -----
     custom_domain = (cf_cfg.get("custom_domain") or "").strip()
     acm_cert_arn = (cf_cfg.get("acm_cert_arn") or "").strip()
 
-    # cf_enabled=false:整段 gate 掉,以 ALB DNS 作 console_host / dashboard_host。
-    # 责任移交客户边缘:TLS 终结、DDoS、边缘 WAF 归客户(见部署文档 R3.4)。
-    cf_distribution = None
-    if not _cf_enabled:
-        # Distribution 全不建;host 变量兜底为 ALB DNS(供 CORS/Cognito 回调等下游用)。
-        # 客户自建域时经自有 CDN 反代 ALB DNS,或直接把 CDN 出口 CIDR 放入 alb_ingress_cidrs。
-        console_host = alb.load_balancer_dns_name
-        dashboard_host = alb.load_balancer_dns_name
-        console_cf_id = ""
-        app_cf_id = ""
-    elif dual_mode:
+    if dual_mode:
         # ===== DUAL mode: two distributions, two certs, two aliases =====
         # Distribution A: console — S3 origin only, /console/* + redirect / → /console/
         console_cf = cloudfront.Distribution(
@@ -1729,11 +1462,6 @@ function handler(event) {
 
     # --- Pack onto ctx ---
     ctx.alb = locals().get("alb")
-    # #212 R2/R3: 内网 ALB + CF gate
-    ctx.console_alb = locals().get("console_alb")
-    ctx.console_alb_listener = locals().get("console_alb_listener")
-    ctx._alb_split_enabled = locals().get("_alb_split_enabled", False)
-    ctx._cf_enabled = locals().get("_cf_enabled", True)
     ctx.app_cf_id = locals().get("app_cf_id")
     ctx.asg = locals().get("asg")
     ctx.cf_distribution = locals().get("cf_distribution")

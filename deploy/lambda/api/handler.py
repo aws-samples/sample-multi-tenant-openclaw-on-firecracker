@@ -56,8 +56,8 @@ from core.logging import logger, inject_trace_root, reset_invocation_keys
 # #187 转型:C 端聊天不再走 claw-channel + hub 中枢签名路径。
 # 前端直接 POST /ws/{tenant_id}/v1/chat/completions,SSE 流式,鉴权用租户 gateway
 # token(GET /tenants/{id}/token 拿密文,调用方自解)。旧 chat_sign 路由 + claw-
-# channel HMAC + hub relay 全部下线。参见 the dev plan G/D
-# 与 the API spec.md 一、二节。
+# channel HMAC + hub relay 全部下线。参见 the data-plane design doc G/D
+# 与 the API spec 一、二节。
 
 
 def lambda_handler(event, context):
@@ -87,6 +87,18 @@ def lambda_handler(event, context):
     # Not an HTTP request (no httpMethod) — handle before route dispatch.
     if event.get("_batch_job"):
         return run_batch_job(event["_batch_job"])
+
+    # #217 fix(504) — async pull-image worker: self-invoked with
+    # {"_pull_image_async": {instance_id, snapshot_time, prev_status}}. pull_image
+    # 已 CAS 置 upgrading + 回 202;这里在无客户端等待的 fire-and-forget 调用里跑
+    # 装 live + 金丝雀验证的数分钟长链(超 APIGW 29s,故必须异步)。
+    _pia = event.get("_pull_image_async")
+    if _pia:
+        return _run_pull_pipeline(
+            _pia["instance_id"],
+            _pia["snapshot_time"],
+            _pia.get("prev_status"),
+        )
 
     # 控制面重构阶段1 — SQS lifecycle consumer。lifecycle 写操作(create/start/
     # stop/delete)入 SQS,本 Lambda 作为 consumer 被 SQS 触发(event.Records,
@@ -174,6 +186,12 @@ def lambda_handler(event, context):
         ("GET", "/hosts"): list_hosts,
         ("POST", "/hosts"): lambda: register_host(event.get("body")),
         ("POST", "/hosts/refresh-rootfs"): refresh_rootfs,
+        # #217 V2 — 照 DDB 快照按精确 VersionId 拉 host 相关文件(镜像+脚本),校验 etag
+        # 后装到 live 原位置(launch-vm/service 直接读)。?snapshot_time=<ISO>,只作用一台
+        # host。Admin op。旧 ?version=/version-verdict 已废弃(统一快照模型)。
+        ("POST", "/hosts/{instance_id}/pull-image"): lambda: pull_image(
+            path_params["instance_id"], event.get("queryStringParameters") or {}
+        ),
         # Fleet power: start/stop EVERY VM across all hosts via host-local fan-out
         # (1-minute fleet power goal). Admin-only (gated inside fleet_power).
         ("POST", "/hosts/fleet-power"): lambda: fleet_power(event.get("body"), event),
@@ -184,6 +202,9 @@ def lambda_handler(event, context):
         ("GET", "/images"): lambda: list_images(
             event.get("queryStringParameters") or {}
         ),
+        # #217 V2 — list version snapshots (time+label+count) so the console can
+        # let an operator pick which snapshot_time to pull onto a host.
+        ("GET", "/snapshots"): lambda: list_snapshots(),
         ("GET", "/agentcore/status"): agentcore_status,
         ("GET", "/agentcore/tools"): agentcore_tools,
         ("GET", "/system/info"): system_info,
@@ -391,7 +412,7 @@ def get_tenant(tenant_id, event=None):
     body = _redact_tenant(item)
     # #187 P1 — fold the KMS **ciphertext** of the pre-minted gateway token into
     # the status-poll response once the tenant is `running` (the data-plane contract
-    # §5, per the data-plane contract review). Poll semantics: control-plane callers loop
+    # §5, 二次纠正). Poll semantics: control-plane callers loop
     # GET /tenants/{id}; on `creating` they keep polling; on `running` they read
     # `gateway_token` (base64 ciphertext) out of this same response and decrypt
     # it locally with EncryptionContext={"tenant_id":<id>}. API Lambda does NOT
@@ -639,7 +660,7 @@ def tenant_match(query_params=None):
     Pre-login lookup: the browser calls this BEFORE any Cognito login to learn which
     upstream IdP (Cognito provider name) to federate to for a given external platform,
     then does federatedSignIn(customProvider=<idp_provider_name>). Read-only, leaks no
-    tenant data — only the platform→IdP routing (internal design spec §2.7). Mirrors aws-samples/
+    tenant data — only the platform→IdP routing (the design docs §2.7). Mirrors aws-samples/
     amazon-cognito-example-for-multi-tenant TenantAPI.ts:13-22 (there keyed by email
     domain; here by explicit platform_id).
 
@@ -1483,7 +1504,16 @@ def _consume_lifecycle_sqs(records):
                 except Exception:  # noqa: BLE001
                     pass
             elif action == "delete":
-                result = delete_tenant(tid, {}, ev)
+                # #263 — 透传 keep_data/skip_backup:producer 入队时把原始 query 值放进
+                # extra,这里重建成 query_params。恒传空 {} 会让 keep_data 默认 "true"
+                # (tenant_service 默认软删),该删的盘悄悄没删(no-data-loss 反向)。
+                # None(调用方没传该 query)不放进 dict,让 delete_tenant 的默认值生效。
+                _q = {
+                    k: str(extra[k])
+                    for k in ("keep_data", "skip_backup")
+                    if extra.get(k) is not None
+                }
+                result = delete_tenant(tid, _q, ev)
             else:
                 result = tenant_action(tid, action, extra or None, ev)
             code = result.get("statusCode", 500) if isinstance(result, dict) else 200
@@ -1709,10 +1739,13 @@ register_host = _host_service.register_host
 deregister_host = _host_service.deregister_host
 cleanup_terminated_host = _host_service.cleanup_terminated_host
 rootfs_version = _host_service.rootfs_version
+_run_pull_pipeline = _host_service._run_pull_pipeline  # #217 fix(504) async pull worker
 rootfs_drift = _host_service.rootfs_drift
 _get_manifest = _host_service._get_manifest
 list_images = _host_service.list_images
+list_snapshots = _host_service.list_snapshots  # #217 V2 — 列快照供 console 选
 refresh_rootfs = _host_service.refresh_rootfs
+pull_image = _host_service.pull_image  # #217 V2 — snapshot pull → install live
 
 # T1.8 — services/console_info:控制台只读端点(备份清单 + AgentCore 工具清单,4 函数)。
 from services import console_info as _console_info  # noqa: E402

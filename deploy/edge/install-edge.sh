@@ -15,7 +15,7 @@
 #     $edge_self_ip (drives local vs remote branch in balancer_pick).
 #
 # Everything below the "install" section is kernel/network tuning called
-# out in the test plan §8 "压测前环境核对". If any check fails we exit
+# out in the test plan "压测前环境核对". If any check fails we exit
 # non-zero so ASG lifecycle hooks catch it — no silent success.
 
 set -euo pipefail
@@ -113,7 +113,7 @@ export EDGE_SELF_IP="$SELF_IP"
 envsubst '$ENGINE_REDIS_HOST $ENGINE_REDIS_PORT $EDGE_SELF_IP' \
     < "$SRC_DIR/nginx.conf" > "$CONF_DIR/nginx.conf"
 
-# ── 5. Kernel / socket tuning (the test plan §8) ──────────────────────────
+# ── 5. Kernel / socket tuning (the test plan) ──────────────────────────
 cat > /etc/sysctl.d/99-openclaw-edge.conf <<'SYSCTL'
 # --- OpenClaw Pool edge tuning ---------------------------------
 # Ephemeral port pool: needs to be wide open for upstream fan-out
@@ -187,77 +187,25 @@ systemctl restart systemd-journald || log "WARN: journald restart failed"
 log "journald drop-in applied (RateLimitBurst=50000, SystemMaxUse=2G)"
 
 # ── 8. Fluent Bit (log shipper: journald → Firehose) ────────────────────
-# Config-gated: skip when LOGGING_ENABLED=false (CDK passes this from config).
-LOGGING_ENABLED="${LOGGING_ENABLED:-true}"
-if [[ "$LOGGING_ENABLED" == "true" ]]; then
-    # 8a. Install Fluent Bit from official repo (pin major version 3.x).
-    if ! command -v fluent-bit >/dev/null 2>&1; then
-        if grep -qi ubuntu /etc/os-release 2>/dev/null; then
-            curl -fsSL https://packages.fluentbit.io/fluentbit.key \
-                | gpg --dearmor -o /usr/share/keyrings/fluentbit.gpg
-            codename="$(lsb_release -sc)"
-            echo "deb [arch=$ARCH_DEB signed-by=/usr/share/keyrings/fluentbit.gpg] https://packages.fluentbit.io/ubuntu/$codename $codename main" \
-                > /etc/apt/sources.list.d/fluent-bit.list
-            apt-get update -qq
-            apt-get install -y -qq fluent-bit
-        elif grep -qi 'amazon linux' /etc/os-release 2>/dev/null; then
-            cat > /etc/yum.repos.d/fluent-bit.repo <<'FBREPO'
-[fluent-bit]
-name=Fluent Bit
-baseurl=https://packages.fluentbit.io/amazonlinux/2023/$basearch/
-gpgcheck=1
-enabled=1
-gpgkey=https://packages.fluentbit.io/fluentbit.key
-FBREPO
-            dnf install -y -q fluent-bit
-        else
-            log "WARN: cannot install fluent-bit on this distro; skipping"
-        fi
-    fi
+# Shared installer (deploy/edge/fluent-bit/install-fluent-bit.sh) does the
+# install + S3 config pull + placeholder render + start for both edge and
+# host roles. Edge maps its region/stream into the FB_* vars the config
+# expects. Config-gated inside the shared script (LOGGING_ENABLED=false → no-op).
+# Resolve defaults into locals first — same-line prefix assignments can't see
+# each other's expansions (shellcheck SC2097/SC2098).
+FB_AWS_REGION="${AWS_REGION:-ap-southeast-1}"
+FB_LOGGING_ENABLED="${LOGGING_ENABLED:-true}"
+FB_ASSETS_BUCKET="${ASSETS_BUCKET:-}"
+FB_REGION="$FB_AWS_REGION" \
+FB_STREAM="${FIREHOSE_DELIVERY_STREAM:-}" \
+FB_ROLE=edge \
+LOGGING_ENABLED="$FB_LOGGING_ENABLED" \
+ASSETS_BUCKET="$FB_ASSETS_BUCKET" \
+AWS_REGION="$FB_AWS_REGION" \
+FB_LOCAL_DIR="$SRC_DIR/fluent-bit/edge" \
+    bash "$SRC_DIR/fluent-bit/install-fluent-bit.sh"
 
-    # 8b. Deploy Fluent Bit config files.
-    # #229: 优先从 s3://<assets>/deployment/observability/fluent-bit/ 拉最新版
-    # (S3 asset 化,可下发新版无需重烤 edge AMI);拉失败回退 $SRC_DIR 里
-    # asset bundle 版兜底(setup.sh 仍会同步 deploy/edge/ 全套过去),不静默
-    # 起空配置。铁律#3:edge 重建 / systemctl restart 时才吃新配置,不开热注入。
-    FB_CONF_DIR=/etc/fluent-bit
-    mkdir -p "$FB_CONF_DIR"
-    mkdir -p /var/lib/fluent-bit/storage
-    FB_AWS_REGION_PULL="${AWS_REGION:-ap-southeast-1}"
-    _fb_pull() {
-        local name="$1"
-        if [[ -n "${ASSETS_BUCKET:-}" ]] && \
-           aws s3 cp "s3://${ASSETS_BUCKET}/deployment/observability/fluent-bit/${name}" \
-             "$FB_CONF_DIR/${name}" \
-             --region "$FB_AWS_REGION_PULL" --no-progress 2>/dev/null; then
-            return 0
-        fi
-        log "WARN(#229): ${name} 未从 S3 拉到,回退 $SRC_DIR/fluent-bit 兜底"
-        install -m 0644 "$SRC_DIR/fluent-bit/${name}" "$FB_CONF_DIR/${name}"
-    }
-    _fb_pull fluent-bit.conf
-    _fb_pull parsers.conf
-    _fb_pull extract_trace_root.lua
-
-    # 8c. Template environment variables into Fluent Bit config.
-    # AWS_REGION and FIREHOSE_DELIVERY_STREAM are passed by CDK/userdata.
-    FB_AWS_REGION="${AWS_REGION:-ap-southeast-1}"
-    FB_STREAM="${FIREHOSE_DELIVERY_STREAM:-}"
-    if [[ -z "$FB_STREAM" ]]; then
-        log "WARN: FIREHOSE_DELIVERY_STREAM not set; Fluent Bit output will fail until configured"
-    fi
-    sed -i "s|\${AWS_REGION}|${FB_AWS_REGION}|g" "$FB_CONF_DIR/fluent-bit.conf"
-    sed -i "s|\${FIREHOSE_DELIVERY_STREAM}|${FB_STREAM}|g" "$FB_CONF_DIR/fluent-bit.conf"
-
-    # 8d. Enable and start.
-    systemctl enable fluent-bit
-    systemctl restart fluent-bit
-    log "fluent-bit installed and started (stream=${FB_STREAM:-UNSET})"
-else
-    log "LOGGING_ENABLED=false; skipping Fluent Bit install"
-fi
-
-# ── 9. Warmup wait on /healthz (the data-plane contract §6) ───────────────────
+# ── 9. Warmup wait on /healthz (the data-plane contract) ───────────────────
 # nginx accepts on :8080 in ~200ms but route.lua's warmup gate returns 503
 # until the async Redis PING succeeds (up to 30s + a bit of slack). We
 # poll /healthz here so the userdata script only returns success once the

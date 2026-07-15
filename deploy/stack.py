@@ -40,19 +40,27 @@ class OpenClawOrchestratorStack(cdk.Stack):
             "" if _deploy_region == "ap-southeast-1" else f"-{_deploy_region}"
         )
 
-        # Removal policy by region: ap-southeast-1 is the production deployment so
-        # RETAIN everything (data safety). Any other region is a rebuildable dev/test
-        # environment → DESTROY + auto-delete, so a torn-down stack leaves NO retained
-        # buckets/tables. That is what lets "delete the stack and redeploy" converge:
-        # RETAIN residue otherwise collides on the next create / races S3 name release.
-        _is_prod_region = _deploy_region == "ap-southeast-1"
+        # Removal policy: when True, stateful resources (DDB tables, backup/audit
+        # buckets) are RETAIN + WORM Object Lock for data safety; when False they
+        # are DESTROY + auto-delete so "delete the stack and redeploy" converges
+        # cleanly (RETAIN residue otherwise collides on the next create / races the
+        # S3 name release). Driven by config `deploy.protect_stateful_resources`;
+        # when unset it falls back to the legacy default (ap-southeast-1 = prod =
+        # protected) so existing deployers are unaffected. A rebuildable test region
+        # (incl. a test ap-southeast-1) sets it false to allow teardown+rebuild.
+        _protect = (CFG.get("deploy") or {}).get("protect_stateful_resources")
+        _is_prod_region = (
+            bool(_protect)
+            if _protect is not None
+            else _deploy_region == "ap-southeast-1"
+        )
         self._stateful_removal = (
             RemovalPolicy.RETAIN if _is_prod_region else RemovalPolicy.DESTROY
         )
         self._auto_delete = not _is_prod_region
 
         # ╔══════════════════════════════════════════════════════════════════╗
-        # ║ 三包归属导航(配合 the internal ownership map)         ║
+        # ║ 三包归属导航(配合 engineering/03-collaboration/OWNERS.md)         ║
         # ║ 本 __init__ 顺序构建,资源用局部变量交叉引用,暂不物理拆分(拆 con-  ║
         # ║ struct 会改 logical ID → 删库风险,见 work-items/WI-001)。改动时    ║
         # ║ 按下方 [包X] 标记认领自己的段,别动别的包的段;跨段枢纽变量(api_fn/ ║

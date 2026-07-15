@@ -208,7 +208,7 @@ def build_storage(self, ctx):
         time_to_live_attribute="expires_ttl",
         removal_policy=RemovalPolicy.DESTROY,
     )
-    # #97 档A — external-platform → Cognito upstream-IdP routing map (the internal design spec §2.7).
+    # #97 档A — external-platform → Cognito upstream-IdP routing map (the design docs §2.7).
     # partition_key platform_id; rows {idp_provider_name, issuer_url, created_at}.
     # GET /tenantmatch reads it pre-login to route to the right federated IdP.
     # Rebuildable routing config (no tenant data) → DESTROY removal is fine.
@@ -222,7 +222,7 @@ def build_storage(self, ctx):
         billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
         removal_policy=RemovalPolicy.DESTROY,
     )
-    # #187 P1 — short-lived per-tenant secret ciphertext store (the design spec
+    # #187 P1 — short-lived per-tenant secret ciphertext store (the data-plane design
     # F). Holds the KMS-envelope-encrypted gateway token (tenant_id EncryptionContext)
     # with a 15-min TTL (`expires_at` = now+900 seconds). Rows are ROTATED (not deleted)
     # on each tenant create; DDB TTL sweeps expired rows within minutes; delete_tenant
@@ -282,12 +282,36 @@ def build_storage(self, ctx):
         auto_delete_objects=self._auto_delete,
         block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
         enforce_ssl=True,
+        # #217 V2 版本模型(ADR 第9节):开 versioning,每次覆盖 deployment/rootfs、
+        # deployment/scripts 下的文件都留不可变 VersionId,让 version-snapshots 表能按
+        # 精确 VersionId 重建任意历史时刻的完整文件集(镜像+脚本一致)。开 versioning 后
+        # 旧对象版本不随覆盖丢失——是 stateful 属性变更(RemovalPolicy 域),MR 需 @the maintainer。
+        versioned=True,
+    )
+
+    # #217 V2 版本模型(ADR 第9节)· 文件版本快照表。一条 = 某个时刻整个 deployment/
+    # 所有文件的完整清单;value(JSON 属性 files)= [{path, s3_version_id, etag}, ...]
+    # 覆盖 rootfs 镜像 + scripts 脚本 + edge/litellm/monitoring。pull-image?snapshot_time
+    # =<ISO> 照此按精确 VersionId 逐文件拉,达成「镜像与脚本整版一致 + 精确回滚」。
+    # 主键 snapshot_time = ISO8601 时间字符串(owner 2026-07-14:human 可读 + 字典序=
+    # 时间序;如 "2026-07-14T08:15:30Z")。从 Number 换 String 走了 orphan→手工删→重建
+    # 三步(DDB 主键不可原地改 + RETAIN)。
+    version_snapshots_table = dynamodb.Table(
+        self,
+        "VersionSnapshots",
+        table_name="openclaw-version-snapshots",
+        partition_key=dynamodb.Attribute(
+            name="snapshot_time", type=dynamodb.AttributeType.STRING
+        ),
+        billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+        removal_policy=self._stateful_removal,
+        point_in_time_recovery_specification=_pitr_spec,
     )
 
     # ========== Tenant-Backup CMK + WORM backup bucket (insider-threat hardening) ==========
     # 威胁模型:租户 data.ext4 备份是真实资产数据。光放 assets 桶(默认 SSE-S3,
     # AWS 托管密钥)防不住「拥有该桶权限的 S3 管理员」——他能 GetObject 读明文、
-    # PutObject 覆盖、DeleteObject 删除。生产级要堵的就是这个内部威胁面。两层独立机制:
+    # PutObject 覆盖、DeleteObject 删除。平台级要堵的就是这个内部威胁面。两层独立机制:
     #
     # 1) 防篡改/防删 — S3 Object Lock COMPLIANCE 模式 + Versioning。AWS 官方:
     #    COMPLIANCE 模式下在保留期内**连 root 账户都不能删除/覆盖对象版本、不能缩短
@@ -516,3 +540,4 @@ def build_storage(self, ctx):
     ctx.tenant_idp_table = locals().get("tenant_idp_table")
     ctx.tenant_secrets_table = locals().get("tenant_secrets_table")
     ctx.tenants_table = locals().get("tenants_table")
+    ctx.version_snapshots_table = locals().get("version_snapshots_table")  # #217 V2

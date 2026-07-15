@@ -1,6 +1,6 @@
 -- deploy/edge/test/balancer_spec.lua
 --
--- balancer.pick_peer — local vs remote branches per the data-plane contract §2.
+-- balancer.pick_peer — local vs remote branches per the data-plane contract.
 -- We test the pure `pick_peer` function; `balancer_pick` is a thin wrapper
 -- around ngx.balancer that we exercise via the fake in spec_helper.
 

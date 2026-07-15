@@ -82,8 +82,8 @@ fi
 # 里做),host 侧 all.forwarding=0 是纵深防御:即便某台 tap 漏配了 disable_ipv6,
 # host 不转发也守住 IPv6 IMDS fd00:ec2::254。
 sysctl -q -w net.ipv6.conf.all.forwarding=0 2>/dev/null || true
-# nf_conntrack table sizing for NFR-3 (the data-plane contract §6/§7 / the data-plane refactor
-# the capacity requirement): a single r8g.metal-24xl runs up to 400 microVMs, each
+# nf_conntrack table sizing for NFR-3 (the data-plane contract / the data-plane design
+# the requirements doc): a single r8g.metal-24xl runs up to 400 microVMs, each
 # with 2-3 outbound WS + per-tap DNAT rules. Kernel default nf_conntrack_max is
 # 262144 on Ubuntu 22.04 aarch64 which the host can blow past under peak fan-in
 # well before all 400 tenants are active. Load the module first (host may not
@@ -337,6 +337,44 @@ chown ubuntu:ubuntu /data /data/firecracker-assets
 rm -rf /home/ubuntu/firecracker-assets
 ln -sfn /data/firecracker-assets /home/ubuntu/firecracker-assets
 
+# Step 3a2: Fluent Bit host log shipper (#245). Runs after /data is mounted
+# so the vm pipeline can tail /data/firecracker-vms/*/fc.log. Shared installer
+# + host config pull from S3, same mechanism as edge. Config-gated: the shared
+# script no-ops when LOGGING_ENABLED=false. Host has no baked fallback (no
+# FB_LOCAL_DIR) — S3 miss is fail-loud inside the installer, matching #229.
+LOGGING_ENABLED="{{LOGGING_ENABLED}}"
+if [ "${LOGGING_ENABLED}" = "true" ]; then
+  log "step3a2: installing host Fluent Bit (journald + fc.log → Firehose)"
+  mkdir -p /opt/openclaw/fluent-bit
+  aws s3 cp s3://${ASSETS_BUCKET}/deployment/observability/fluent-bit/install-fluent-bit.sh \
+    /opt/openclaw/fluent-bit/install-fluent-bit.sh --region ${REGION} --no-progress \
+    || { log "ERROR(#245): install-fluent-bit.sh 未拉到 (S3 miss)"; exit 1; }
+  chmod +x /opt/openclaw/fluent-bit/install-fluent-bit.sh
+  FB_ROLE=host \
+  FB_REGION="${REGION}" \
+  FB_STREAM_HOST="{{FB_STREAM_HOST}}" \
+  FB_STREAM_VM="{{FB_STREAM_VM}}" \
+  LOGGING_ENABLED="true" \
+  ASSETS_BUCKET="${ASSETS_BUCKET}" \
+  AWS_REGION="${REGION}" \
+    bash /opt/openclaw/fluent-bit/install-fluent-bit.sh
+  # fc.log local rotation: keep 3 days on-host; AOS holds the searchable copy.
+  cat > /etc/logrotate.d/openclaw-fcvm <<'LOGROTATE'
+/data/firecracker-vms/*/fc.log {
+    daily
+    rotate 3
+    missingok
+    notifempty
+    copytruncate
+    compress
+    delaycompress
+}
+LOGROTATE
+  log "host Fluent Bit + fc.log logrotate(3d) configured"
+else
+  log "LOGGING_ENABLED=false; skipping host Fluent Bit"
+fi
+
 # Tag data volume
 DATA_VOL_ID=$(aws ec2 describe-volumes --filters Name=attachment.instance-id,Values=${INSTANCE_ID} Name=attachment.device,Values=/dev/sdf --query 'Volumes[0].VolumeId' --output text --region ${REGION})
 aws ec2 create-tags --resources ${DATA_VOL_ID} --tags Key=Name,Value=openclaw-data-${INSTANCE_ID} Key=openclaw:role,Value=host-data --region ${REGION}
@@ -420,9 +458,9 @@ chmod +x /home/ubuntu/stop-vm.sh && chown ubuntu:ubuntu /home/ubuntu/stop-vm.sh
 # start-all-vms / stop-all-vms — host-local fan-out for the 1-minute fleet
 # power goal: control plane sends ONE SSM per host, host starts/stops all its
 # VMs in bounded parallel (SSM concurrency = host count, not VM count).
-# launch-all-vms.sh (SQS dispatch push手脚) piggy-backs on the same fan-out
-# semaphore as start-all-vms.sh; single SSM/host aggregate command.
-for _s in clone-data migrate-vm resize-disk start-all-vms stop-all-vms launch-all-vms; do
+# #256 — launch-all-vms.sh 已内联进 launch-vm.sh 的 fan_out_main(唯一起 VM 脚本,已在
+# 上方单独下载),聚合 SSM 命令调 `launch-vm.sh --manifest|--from-ddb ...`,此处不再拉它。
+for _s in clone-data migrate-vm resize-disk start-all-vms stop-all-vms; do
   aws s3 cp s3://${ASSETS_BUCKET}/deployment/scripts/${_s}.sh /home/ubuntu/${_s}.sh --region ${REGION} --no-progress 2>/dev/null \
     || _s3_get s3://${ASSETS_BUCKET}/deployment/scripts/${_s}.sh /home/ubuntu/${_s}.sh || true
   chmod +x /home/ubuntu/${_s}.sh && chown ubuntu:ubuntu /home/ubuntu/${_s}.sh
@@ -432,7 +470,7 @@ done
 # #187 转型:step4a2 claw-hub 本地安装已下线。数据面改两级路由直连 microVM
 # 原生 gateway(ALB LOR → OpenResty edge → Redis 查表 → host iptables DNAT →
 # microVM:18789)。install-hub.sh + deploy/hub/ 源已归档到
-# an internal archive。#187 P5:CLAW_HUB_URL/CLAW_HUB_WS
+# engineering/04-archive/p4-cutover-deprecated/。#187 P5:CLAW_HUB_URL/CLAW_HUB_WS
 # env 与 stack.py 模板替换、CloudFront /hub/* behavior、HubTargetGroup 已一并删除。
 
 # Step 4b: AgentCore config (if enabled)
@@ -473,7 +511,7 @@ AVAIL_MEM=$(( _HOST_MEM_MB - _RES_MEM ))
 log "step5: registering to DynamoDB (az=${AZ}, capacity ${AVAIL_VCPU}vcpu/${AVAIL_MEM}MB from ${_HOST_VCPU}vcpu/${_HOST_MEM_MB}MB host)"
 _registered=0
 for _r in $(seq 1 10); do
-  aws dynamodb put-item --table-name ${HOSTS_TABLE} --region ${REGION} --item '{"instance_id":{"S":"'${INSTANCE_ID}'"},"private_ip":{"S":"'${PRIVATE_IP}'"},"az":{"S":"'${AZ}'"},"total_vcpu":{"N":"'${AVAIL_VCPU}'"},"total_mem_mb":{"N":"'${AVAIL_MEM}'"},"used_vcpu":{"N":"0"},"used_mem_mb":{"N":"0"},"vm_count":{"N":"0"},"next_vm_num":{"N":"1"},"status":{"S":"active"},"rootfs_version":{"S":"'${ROOTFS_VER}'"}}' && { _registered=1; break; }
+  aws dynamodb put-item --table-name ${HOSTS_TABLE} --region ${REGION} --item '{"instance_id":{"S":"'${INSTANCE_ID}'"},"private_ip":{"S":"'${PRIVATE_IP}'"},"az":{"S":"'${AZ}'"},"total_vcpu":{"N":"'${AVAIL_VCPU}'"},"total_mem_mb":{"N":"'${AVAIL_MEM}'"},"used_vcpu":{"N":"0"},"used_mem_mb":{"N":"0"},"vm_count":{"N":"0"},"next_vm_num":{"N":"1"},"status":{"S":"active"},"rootfs_version":{"S":"'${ROOTFS_VER}'"},"snapshot_time":{"S":"'${ROOTFS_VER}'"}}' && { _registered=1; break; }
   log "register attempt $_r failed, retrying in 15s..."
   sleep 15
 done

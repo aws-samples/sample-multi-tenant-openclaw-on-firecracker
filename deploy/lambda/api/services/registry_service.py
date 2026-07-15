@@ -26,17 +26,14 @@ DEFAULT_TEMPLATE = "default"
 
 # shipped default 模板的预置 Registry_Entries(publish_snapshot 的种子输入)
 #
-# R14.2 llm_key 注入契约(文档化;#233 去掉强制 base64 后更新):
-#   llm_key 与外部平台凭据走同一条 injected_parameters 通道、同一套 envelope 校验
-#   (envelope._validate_injected_parameters_v2)。**接受两种形态**:
-#     ① `enc:v1:` 信封 → owner_id 绑定加密路径(与外部平台凭据同等 owner 隔离,首选;
-#        需 owner 隔离的敏感值必须走这条)
-#     ② 明文透传(≤8192、无控制字符)→ 原值直接注入、**无 owner 绑定**;含原始
-#        `sk-...` key、per-tenant mint 的 litellm vkey、客户自持 key。仅可承载自隔离的
-#        opaque 值,SHALL NOT 放需 owner 隔离的敏感值(那些走 ①)。
-#   #233 前旧契约强求非信封值必须 base64,是纯障碍:base64 不是加密(DDB 明文存、
-#   一眼可解),host 侧 plaintext 分支又不做 base64 -d,反把编码后的 key 注坏致
-#   litellm 401(新加坡 kpweqnkwm9 2026-07-11、客户联调 2026-07-13 都撞这个)。已去除。
+# R14.2 llm_key 注入契约(文档化,防再踩新加坡 kpweqnkwm9 2026-07-11 的 400):
+#   llm_key 与平台凭据走同一条 injected_parameters 通道、同一套 envelope 校验
+#   (envelope._validate_injected_parameters_v2)。**接受两种形态,拒第三种**:
+#     ① `enc:v1:` 信封 → owner_id 绑定加密路径(与平台凭据同等 owner 隔离,首选)
+#     ② 裸 base64(≤8192)→ 原值透传、**无 owner 绑定**;仅可承载自隔离的 opaque
+#        值(如 per-tenant mint 的 litellm vkey),SHALL NOT 放需 owner 隔离的敏感值
+#     ③ 原始 `sk-...` key(既非 enc:v1: 也非合法 base64)→ 400 must be base64(真机
+#        撞的就是这个:上游直接塞原始 key。上游要么 base64 编码,要么走 enc:v1:)
 #   空值走下方 empty_fallback=LITELLM_SHARED_VKEY(平台 shared vkey,仅上游未传时兜底,
 #   优先级低于上游传入;见 launch-vm.sh:474 _APIKEY per-tenant > shared)。
 SHIPPED_DEFAULT_ENTRIES = {
@@ -46,22 +43,6 @@ SHIPPED_DEFAULT_ENTRIES = {
         "sensitive": True,
         "required": False,
         "empty_fallback": "LITELLM_SHARED_VKEY",
-    },
-    # 客户自带 AI 网关解耦:让调用方 per-tenant 传自己的 litellm/OpenAI-兼容 baseUrl
-    #   (尤其自建 http 模式网关)。此前 baseUrl 只走全平台共享的 LITELLM_HOST(SSM
-    #   /openclaw/litellm-host),所有租户强制指向同一个平台 litellm,客户接不进自己的。
-    # 走 llm_key 同一条 injected_parameters/config-class 通道,注入到 openclaw.json 的
-    #   models.providers.litellm.baseUrl(host oc_inject_config_from_plan 幂等写)。
-    # sensitive=false:baseUrl 是端点地址不是密钥,明文注入(校验层对非敏感 config 值
-    #   放行明文,不强求 base64/enc:v1: — 否则 http://host:4000/v1 会被 base64 门拒)。
-    # 空值 → empty_fallback=LITELLM_HOST_DEFAULT:host 回退平台全局 LITELLM_HOST
-    #   (兼容不自带网关的租户,行为与现状一致)。
-    "llm_base_url": {
-        "param_class": "config",
-        "injection_target": "models.providers.litellm.baseUrl",
-        "sensitive": False,
-        "required": False,
-        "empty_fallback": "LITELLM_HOST_DEFAULT",
     },
     "api_key": {
         "param_class": "env",
@@ -135,64 +116,16 @@ def ensure_default_seeded():
         raise
 
 
-def _named_template_exists_in_s3(config_template):
-    """#223 客户联调闭环:console 存自定义模板走 templates Lambda 只写 S3
-    (templates/openclaw/<name>/openclaw.json),不建 registry 指针。判断该模板
-    在 S3 是否真存在,存在才 lazy-seed 指针(见 ensure_named_seeded)。
-    fail-safe:桶名缺失或 S3 报错 → False(退回 fail-loud,不误 seed)。
-    """
-    bucket = os.environ.get("ASSETS_BUCKET", "")
-    if not bucket:
-        return False
-    key = f"templates/openclaw/{config_template}/openclaw.json"
-    try:
-        clients.s3.head_object(Bucket=bucket, Key=key)
-        return True
-    except Exception:  # noqa: BLE001 — 404/403/网络皆视作"不可用",退回 fail-loud
-        return False
-
-
-def ensure_named_seeded(config_template):
-    """#223:具名模板在 S3 存在但 registry 无指针时,用标准默认注入契约补种一次。
-
-    根因:console Agent Config 存模板(templates Lambda put_template)只写 S3,
-    不联动 registry publish;建租户校验 registry current 指针 → 客户存完模板建租户
-    仍撞 no current pointer 400,console 全套操作闭不了环。这里在"S3 有该模板 + 无
-    指针"时补种,让"console 存模板"="可用模板"。entries 复用 SHIPPED_DEFAULT_ENTRIES
-    (凭据注入路径通用);要非标 entries 仍可 admin POST /registry/{tpl} 覆盖。
-    幂等 + 并发撞车吞 TransactionCanceledException,与 ensure_default_seeded 同。
-    """
-    items = _query_all(config_template)
-    if any(i["sk"] == "current" for i in items):
-        return
-    if not _named_template_exists_in_s3(config_template):
-        return  # S3 无此模板 → 不 seed,交回 fail-loud 挡 typo
-    txn_cancelled = getattr(
-        clients.ddb.meta.client.exceptions,
-        "TransactionCanceledException",
-        None,
-    )
-    try:
-        publish_snapshot(config_template, SHIPPED_DEFAULT_ENTRIES)
-    except Exception as e:  # noqa: BLE001 — 仅吞并发补种撞车,余皆 re-raise
-        if txn_cancelled is not None and isinstance(e, txn_cancelled):
-            return
-        raise
-
-
 def load_current_snapshot(config_template):
     """单次 Query 拿全部行,按 current 指针选中快照。返回 (version, entries)。
 
-    无指针时:DEFAULT_TEMPLATE 补种 shipped 默认(随部署自愈);具名模板若 S3 存在
-    则 lazy-seed(#223,console 存模板即可用),S3 也没有才 fail-loud(挡错名/typo)。
+    config_template == DEFAULT_TEMPLATE 且无指针 → 补种一次再读(shipped 模板随部署
+    自愈);其它模板名无指针仍 fail-loud(挡错名/typo,不静默用空模板起租户)。
     """
     items = _query_all(config_template)
     current = next((i for i in items if i["sk"] == "current"), None)
-    if current is None:
-        if config_template == DEFAULT_TEMPLATE:
-            ensure_default_seeded()
-        else:
-            ensure_named_seeded(config_template)
+    if current is None and config_template == DEFAULT_TEMPLATE:
+        ensure_default_seeded()
         items = _query_all(config_template)
         current = next((i for i in items if i["sk"] == "current"), None)
     if current is None:

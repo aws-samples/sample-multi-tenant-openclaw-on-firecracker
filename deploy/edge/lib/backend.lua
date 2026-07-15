@@ -1,6 +1,6 @@
 -- deploy/edge/lib/backend.lua
 --
--- Three-tier route cache + fail-static (the data-plane contract §2).
+-- Three-tier route cache + fail-static (the data-plane contract).
 --
 -- Layers (top-down):
 --   L1  worker-local lrucache (resty.lrucache)   — nanosecond hits
@@ -73,7 +73,7 @@ local NEG_SENTINEL = { __neg__ = true }
 
 --[[
     parse_value: decode the JSON string written by host-agent (see
-    the data-plane contract §1). Returns descriptor table, or nil on bad JSON.
+    the data-plane contract). Returns descriptor table, or nil on bad JSON.
     Rejects entries missing any required field so the caller can 404
     instead of routing to a black hole.
 --]]

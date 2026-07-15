@@ -837,12 +837,12 @@ if [ -d /tmp/image-sample ]; then
     # Register the two guard plugins in config: load paths + enabled entries.
     # jq merge keeps whatever the template already had under .plugins.
     #   acl-guard / sentinel-guard — before_tool_call hooks (priority 1000 / 200)
-    # claw-channel was retired in the the data-plane refactor data-plane refactor
-    # (the design spec the dev plan §A): the WSS-hub reverse channel
+    # claw-channel was retired in the the data-plane design data-plane refactor
+    # (the data-plane design doc §A): the WSS-hub reverse channel
     # is replaced by two-tier routing (OpenResty edge → host DNAT → in-VM native
     # gateway on :18789). The gateway now serves chat via the OpenAI-compatible
     # /v1/chat/completions and /v1/responses HTTP endpoints directly; the plugin
-    # is archived under an internal archive for history.
+    # is archived under engineering/04-archive/claw-channel-plugin/ for history.
     if command -v jq >/dev/null 2>&1; then
       jq '
         (.plugins // {}) as $p |
@@ -1035,13 +1035,15 @@ rm -f ${IMMUTABLE_IMG}
 # platform-injected + guardrail-masked) and is a protected identity file, so it
 # must be tamper-proof too.
 IMMUTABLE_WORKSPACE_FILES="SOUL.md AGENTS.md IDENTITY.md HEARTBEAT.md COMMUNICATION_STYLE.md TOOLS.md USER.md"
-# Ops / safety skills that must never be editable from inside the VM. An attacker
-# editing a vetting skill to fabricate a "safe" verdict is a risk, so these are
-# baked read-only + FIM-monitored. This AWS sample ships a minimal neutral set
-# (skill-vetter + weather); brand-specific skills are added when you bake your own
-# golden image (see docs). The cp loop below tolerates a missing dir (`[ -d ]`
-# guard) so trimming the set never breaks the build.
-IMMUTABLE_SKILLS="skill-vetter weather"
+# Ops / safety skills that must never be editable from inside the VM. Includes
+# the general-capability skills: intent-router (always-on routing), session-logs
+# (tenant-scoped read), summarize, and market-data (read-only reference data).
+# An attacker editing an analysis/ranking skill to fabricate a "safe" verdict or
+# a fake board is a risk, so these are baked read-only + FIM-monitored like the
+# other safety-relevant skills. The list must stay consistent with MANIFEST's
+# neutral skill set; the cp loop (:1035) tolerates a missing dir ([ -d ] guard,
+# skip + warn) so an absent skill never crashes the build.
+IMMUTABLE_SKILLS="ops-guardrails skill-vetter healthcheck browser-automation skill-creator taskflow weather intent-router session-logs summarize market-data"
 
 # Stage the immutable set from the just-built golden /home/agent tree.
 IMMUTABLE_STAGE="/tmp/openclaw-immutable-stage"

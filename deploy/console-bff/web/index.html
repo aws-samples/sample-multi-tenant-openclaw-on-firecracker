@@ -31,6 +31,8 @@
     <script src="js/app.edge.js"></script>
     <script src="js/app.audit.js"></script>
     <script src="js/app.traces.js"></script>
+    <script src="js/app.logs.js"></script>
+    <script src="js/app.rsa.js"></script>
     <script src="js/app.js"></script>
     <script
       defer
@@ -391,7 +393,7 @@
             margin-right: 10px;
             vertical-align: middle;
           "
-          >🦞</span
+          >B</span
         >ClawPool Agent · Pool Management Console
       </h1>
       <span class="status-dot" :class="connected ? 'ok' : 'err'"></span>
@@ -447,10 +449,24 @@
       </button>
       <button
         class="nav-tab"
+        :class="page==='logs' && 'active'"
+        @click="page='logs'"
+      >
+        Logs
+      </button>
+      <button
+        class="nav-tab"
         :class="page==='audit' && 'active'"
         @click="page='audit'; loadAudit(); loadImages()"
       >
         Audit &amp; Ops
+      </button>
+      <button
+        class="nav-tab"
+        :class="page==='rsa' && 'active'"
+        @click="page='rsa'; loadRecipientKey()"
+      >
+        RSA Credentials
       </button>
       <button
         class="nav-tab"
@@ -470,26 +486,71 @@
           <div class="panel-header">
             <span class="panel-title">Hosts (Group)</span>
           </div>
-          <div
-            style="
-              display: flex;
-              align-items: center;
-              gap: 8px;
-              padding: 0 4px 6px;
-              font-size: 12px;
-            "
-          >
-            <span
-              style="color: var(--gray)"
-              x-text="'Latest rootfs: '+(rootfsVersion||'…')"
-            ></span>
-            <button
-              class="btn-act"
-              title="Pull latest rootfs to all hosts"
-              @click="refreshRootfs()"
+          <!-- #217 V2 — 版本区:纵向两行,避免横向挤成一行折行(旧布局标题+下拉+按钮挤丑)。
+               行1:只读 "Latest snapshot"(fleet 最新快照,完整不折行);
+               行2:版本选择控件条(下拉 + Pull all),仅 operator+(canWrite)显示,viewer 不渲染。 -->
+          <div style="padding: 0 4px 8px">
+            <!-- 行1:只读最新快照 -->
+            <div
+              style="
+                font-size: 12px;
+                color: var(--gray);
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                margin-bottom: 6px;
+              "
+              :title="'Fleet 最新快照(各 host 当前版本见卡片 snapshot 行):'+(latestSnapshot||'—')"
             >
-              <svg class="icon s13"><use href="#i-download" /></svg>
-            </button>
+              Latest snapshot:
+              <span
+                style="color: var(--text)"
+                x-text="latestSnapshot||'—'"
+              ></span>
+            </div>
+            <!-- 行2:版本选择 + Pull all(operator+ 才显示) -->
+            <template x-if="canWrite()">
+              <div style="display: flex; align-items: center; gap: 6px">
+                <select
+                  x-model="selectedSnapshot"
+                  style="
+                    flex: 1;
+                    min-width: 0;
+                    font-size: 11px;
+                    background: var(--bg);
+                    color: var(--text);
+                    border: 1px solid var(--border);
+                    border-radius: 4px;
+                    padding: 3px 6px;
+                  "
+                  title="Pick a snapshot version to pull to all hosts"
+                >
+                  <option value="">Snapshot version…</option>
+                  <template x-for="s in snapshots" :key="s.snapshot_time">
+                    <option
+                      :value="s.snapshot_time"
+                      x-text="s.snapshot_time + (s.label ? ' ('+s.label+')' : '')"
+                    ></option>
+                  </template>
+                </select>
+                <button
+                  class="btn-act"
+                  style="
+                    display: inline-flex;
+                    align-items: center;
+                    gap: 4px;
+                    font-size: 11px;
+                    white-space: nowrap;
+                    flex-shrink: 0;
+                  "
+                  title="Pull the selected snapshot to all hosts (fleet-wide pull-image)"
+                  @click="pullSnapshotToAll()"
+                >
+                  <svg class="icon s13"><use href="#i-download" /></svg>
+                  <span>Pull all</span>
+                </button>
+              </div>
+            </template>
           </div>
           <template x-if="hosts.length === 0 && !loadingHosts">
             <div class="empty">No hosts</div>
@@ -604,6 +665,71 @@
                       x-text="h.rootfs_version||''"
                     ></span>
                   </div>
+                  <!-- #217 — 当前 host 装的快照版本(pull-image 成功后写 hosts.snapshot_time);
+                       显示 snapshot_time(rootfs版),rootfs 版从 snapshots 列表按 time 反查 label。
+                       没做过 snapshot pull 的 host 无此字段,整行隐藏。 -->
+                  <div class="host-row" x-show="h.snapshot_time">
+                    <span class="host-label">snapshot</span>
+                    <span
+                      style="font-size: 11px; color: var(--gray)"
+                      x-text="snapshotLabel(h.snapshot_time)"
+                      :title="'Current live snapshot (installed by pull-image): '+(h.snapshot_time||'')"
+                    ></span>
+                  </div>
+                  <!-- #217 — 每台 host 各自选快照版本 + Pull(独占一行,不挤顶部;inline
+                       下拉非弹窗)。默认最新快照(hostSnapFor),各台独立;canWrite() 门控,
+                       viewer 不渲染。@click.stop 防触发卡片选中。 -->
+                  <template x-if="canWrite()">
+                    <div
+                      class="host-row"
+                      style="gap: 6px; margin-top: 6px"
+                      @click.stop
+                    >
+                      <span class="host-label">pull</span>
+                      <select
+                        :value="hostSnapFor(h.instance_id)"
+                        @change="hostSnapChoice[h.instance_id] = $event.target.value"
+                        :disabled="h.status === 'upgrading'"
+                        style="
+                          flex: 1;
+                          min-width: 0;
+                          font-size: 11px;
+                          background: var(--bg);
+                          color: var(--text);
+                          border: 1px solid var(--border);
+                          border-radius: 4px;
+                          padding: 3px 6px;
+                        "
+                        title="Pick a snapshot version to pull to this host"
+                      >
+                        <template x-for="s in snapshots" :key="s.snapshot_time">
+                          <option
+                            :value="s.snapshot_time"
+                            x-text="s.snapshot_time + (s.label ? ' ('+s.label+')' : '')"
+                          ></option>
+                        </template>
+                      </select>
+                      <button
+                        class="btn-act"
+                        style="
+                          display: inline-flex;
+                          align-items: center;
+                          gap: 4px;
+                          font-size: 11px;
+                          white-space: nowrap;
+                          flex-shrink: 0;
+                        "
+                        :disabled="h.status === 'upgrading'"
+                        :title="h.status === 'upgrading' ? 'host is upgrading (pull in progress)' : ('Pull '+hostSnapFor(h.instance_id)+' to this host (pull-image)')"
+                        @click.stop="pullSnapshotToHost(h.instance_id)"
+                      >
+                        <svg class="icon s13"><use href="#i-download" /></svg>
+                        <span
+                          x-text="h.status === 'upgrading' ? 'Upgrading…' : 'Pull'"
+                        ></span>
+                      </button>
+                    </div>
+                  </template>
                 </div>
               </template>
             </div>
@@ -875,7 +1001,7 @@
                         <template x-if="t.status==='running'">
                           <button
                             class="btn-act"
-                            title="展示 gateway token 密文(调用方自解;data-plane contract 5)"
+                            title="展示 gateway token 密文(调用方自解;§the data-plane contract)"
                             @click="revealToken(t.id)"
                           >
                             <svg class="icon s13"><use href="#i-key" /></svg
@@ -1058,7 +1184,22 @@
                 />
               </div>
             </template>
-            <label>openclaw.json</label>
+            <div
+              style="
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+              "
+            >
+              <label>openclaw.json</label>
+              <button
+                class="btn btn-cyan btn-sm"
+                @click="useBaseline()"
+                title="把内置默认 openclaw.json 全量基线填入编辑框，在它之上加 MCP / 改模型"
+              >
+                以默认基线填充
+              </button>
+            </div>
             <textarea
               x-model="editTpl.content"
               style="
@@ -2031,7 +2172,7 @@ openclaw_vm_disk_used_pct &gt; 90</pre
           <p style="font-size: 12px; margin-top: 8px">
             If message includes <code>EDGE_STACK_NOT_DEPLOYED</code>, run
             <code>cdk deploy</code> with <code>edge.enabled=true</code> (see
-            the dev plan).
+            the data-plane design/the design doc).
           </p>
         </div>
       </template>
@@ -2243,13 +2384,13 @@ openclaw_vm_disk_used_pct &gt; 90</pre
                   </td>
                   <td>
                     <button class="btn" @click="openTrace(row.Id)">Open</button>
-                    <a
+                    <button
                       class="btn"
-                      :href="logDeepLink(row.Id)"
-                      target="_blank"
-                      title="Search logs by trace_root (via #219)"
-                      >Logs</a
+                      @click="openLogsForTrace(row)"
+                      title="按该租户查 VM/host/Lambda 日志 (#266)"
                     >
+                      Logs
+                    </button>
                   </td>
                 </tr>
               </template>
@@ -2432,6 +2573,118 @@ openclaw_vm_disk_used_pct &gt; 90</pre
       </div>
     </div>
 
+    <!-- Page: Logs (#266 — 按租户查 VM firecracker 启动 / host / Lambda 日志) -->
+    <div x-show="page==='logs'" class="page-content">
+      <h2>📜 Logs</h2>
+      <div class="section-card">
+        <p style="color: #888; margin-top: 0; font-size: 13px">
+          租户从创建到启动不健康时的日志抓手。<b>VM</b> = firecracker 每租户
+          启动日志(AOS claw-logs-vm,按 tenant_id 精确匹配);<b>Host</b> = launch
+          诊断(AOS claw-logs-host,自由文本匹配);<b>Lambda</b> =
+          控制面链路(CloudWatch Logs Insights,按 tenant_id 过滤)。
+        </p>
+        <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: end">
+          <label>
+            Tenant (name 或 id)
+            <input
+              type="text"
+              x-model="logFilter.tenant"
+              list="oc-tenant-list"
+              placeholder="acme 或 acme-1a2b"
+              style="width: 220px"
+            />
+            <datalist id="oc-tenant-list">
+              <template x-for="t in tenants" :key="t.id || t.tenant_id">
+                <option
+                  :value="t.name"
+                  x-text="(t.name || '') + ' — ' + (t.id || t.tenant_id)"
+                ></option>
+              </template>
+            </datalist>
+          </label>
+          <label>
+            Source
+            <select x-model="logFilter.source" style="width: 130px">
+              <option value="vm">VM (firecracker)</option>
+              <option value="host">Host (launch)</option>
+              <option value="lambda">Lambda (控制面)</option>
+            </select>
+          </label>
+          <label>
+            Window (minutes)
+            <input
+              type="number"
+              min="1"
+              max="1440"
+              x-model.number="logFilter.minutes"
+              style="width: 90px"
+            />
+          </label>
+          <button class="btn" @click="loadLogs()" :disabled="logsLoading">
+            Search
+          </button>
+        </div>
+        <div
+          x-show="logsError === 'timeout'"
+          style="color: #c78500; margin-top: 8px"
+        >
+          日志查询超时,缩小时间窗后重试。
+        </div>
+        <div
+          x-show="logsError === 'unavailable'"
+          style="color: #c53030; margin-top: 8px"
+        >
+          日志源不可用(AOS/CloudWatch 或该租户 tenant_id 无法解析)。
+        </div>
+        <div
+          x-show="logApproximate"
+          style="color: #c78500; margin-top: 8px; font-size: 12px"
+        >
+          Host 日志无结构化 tenant 字段,以下为按 tenant_id 全文匹配的近似结果。
+        </div>
+      </div>
+
+      <div class="section-card">
+        <h3>Log lines (<span x-text="logRows.length"></span>)</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th style="width: 180px">Time</th>
+                <th style="width: 70px">Level</th>
+                <th>Message</th>
+              </tr>
+            </thead>
+            <tbody>
+              <template x-for="(row, i) in logRows" :key="i">
+                <tr>
+                  <td
+                    x-text="row.ts"
+                    style="white-space: nowrap; font-size: 12px"
+                  ></td>
+                  <td x-text="row.level || '-'"></td>
+                  <td
+                    style="
+                      font-family: monospace;
+                      font-size: 12px;
+                      white-space: pre-wrap;
+                      word-break: break-word;
+                    "
+                    x-text="row.message"
+                  ></td>
+                </tr>
+              </template>
+              <tr x-show="logRows.length === 0 && !logsLoading">
+                <td colspan="3" style="text-align: center; color: #888">
+                  该窗口内无日志。选一个租户 + source 后 Search。
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <span x-show="logsLoading" style="margin-left: 8px">Loading…</span>
+      </div>
+    </div>
 
     <div x-show="page==='audit'" class="page-content">
       <h2>🧾 Audit &amp; Ops</h2>
@@ -2616,6 +2869,329 @@ openclaw_vm_disk_used_pct &gt; 90</pre
         </template>
       </div>
     </div>
+
+    <!-- Page: RSA Credentials (asymmetric-v1 出站/入站凭据) -->
+    <div x-show="page==='rsa'" class="page-content" data-rsa-v2>
+      <h2>🔐 RSA Credentials</h2>
+      <p class="rsa-lede">
+        非对称出站凭据(<code>asymmetric-v1</code>):调用方本地持 RSA-4096
+        私钥,注册公钥到平台;<code>GET credentials</code> 拿回
+        <code>enc:v1:</code> 信封,浏览器用本地私钥 OAEP-SHA256
+        解密。私钥永不上传、永不进 curl 导出,调用方无需 KMS。
+      </p>
+
+      <div class="rsa-flow">
+        <!-- 步骤 1 · 本地 keypair -->
+        <section class="section-card rsa-step">
+          <div class="rsa-step-head">
+            <span class="rsa-step-num">1</span>
+            <h3>本地 RSA-4096 Keypair</h3>
+            <span
+              class="badge"
+              :class="rsaPrivPem ? 'badge-running' : 'badge-stopped'"
+              x-text="rsaPrivPem ? '已生成' : '未生成'"
+            ></span>
+          </div>
+          <p class="rsa-hint">
+            私钥只存在本浏览器
+            <code>localStorage</code>,从不上传、从不进导出命令。
+          </p>
+          <div class="rsa-actions">
+            <button
+              class="btn btn-create"
+              @click="generateRsaKeypair()"
+              :disabled="rsaBusy"
+            >
+              <svg class="icon s14"><use href="#i-key" /></svg>
+              <span
+                x-text="rsaPrivPem ? '重新生成 keypair' : '生成 keypair'"
+              ></span>
+            </button>
+          </div>
+          <template x-if="rsaPubPem">
+            <div class="rsa-field">
+              <label>公钥 PEM · 可公开,用于注册</label>
+              <textarea class="rsa-code" readonly x-text="rsaPubPem"></textarea>
+            </div>
+          </template>
+        </section>
+
+        <!-- 步骤 2 · 平台 recipient key -->
+        <section class="section-card rsa-step">
+          <div class="rsa-step-head">
+            <span class="rsa-step-num">2</span>
+            <h3>平台 Recipient Key</h3>
+            <template x-if="rsaRecipientKey">
+              <span
+                class="badge"
+                :class="rsaRecipientKey.enabled ? 'badge-running' : 'badge-stopped'"
+                x-text="rsaRecipientKey.enabled ? 'enabled' : 'disabled'"
+              ></span>
+            </template>
+          </div>
+          <template x-if="rsaRecipientKey">
+            <div class="rsa-kv">
+              <div>
+                <span>key_id</span><code x-text="rsaRecipientKey.key_id"></code>
+              </div>
+              <div>
+                <span>version</span
+                ><code x-text="rsaRecipientKey.version"></code>
+              </div>
+              <div>
+                <span>algorithm</span
+                ><code
+                  x-text="rsaRecipientKey.algorithm || 'RSA_4096_OAEP_SHA256'"
+                ></code>
+              </div>
+            </div>
+          </template>
+          <template x-if="!rsaRecipientKey">
+            <p class="rsa-hint">
+              平台当前无 recipient key —— 注册本地公钥,或平台首调 GET
+              credentials 时自动 bootstrap。
+            </p>
+          </template>
+          <div class="rsa-actions">
+            <button
+              class="btn btn-create"
+              @click="registerRsaPubkey()"
+              :disabled="rsaBusy || !rsaPubPem"
+            >
+              注册本地公钥
+            </button>
+            <button
+              class="btn btn-outline"
+              @click="loadRecipientKey()"
+              :disabled="rsaBusy"
+            >
+              <svg class="icon s14"><use href="#i-refresh" /></svg> 刷新
+            </button>
+            <button
+              class="btn btn-del"
+              @click="disableRsaKey()"
+              :disabled="rsaBusy"
+            >
+              <svg class="icon s14"><use href="#i-power" /></svg> 禁用(轮换)
+            </button>
+          </div>
+        </section>
+
+        <!-- 步骤 3 · 拉取 + 本地解密 -->
+        <section class="section-card rsa-step">
+          <div class="rsa-step-head">
+            <span class="rsa-step-num">3</span>
+            <h3>拉取并解密租户凭据</h3>
+          </div>
+          <div class="rsa-actions">
+            <select
+              class="settings-input rsa-select"
+              x-model="rsaSelectedTenant"
+            >
+              <option value="">选择租户…</option>
+              <template x-for="t in tenants" :key="t.id">
+                <option :value="t.id" x-text="t.name + ' · ' + t.id"></option>
+              </template>
+            </select>
+            <button
+              class="btn btn-create"
+              @click="fetchAndDecryptCreds(rsaSelectedTenant)"
+              :disabled="rsaBusy || !rsaSelectedTenant"
+            >
+              <svg class="icon s14"><use href="#i-shield" /></svg> 拉取 +
+              本地解密
+            </button>
+          </div>
+          <template x-if="rsaCreds">
+            <div class="rsa-result">
+              <div class="rsa-kv">
+                <div>
+                  <span>scheme</span><code x-text="rsaCreds.enc.scheme"></code>
+                </div>
+                <div>
+                  <span>key_id</span
+                  ><code x-text="rsaCreds.enc.recipient_key_id"></code>
+                </div>
+                <div>
+                  <span>device.id</span><code x-text="rsaCreds.deviceId"></code>
+                </div>
+              </div>
+              <div class="rsa-field">
+                <label>gateway.token · 已解密</label>
+                <textarea
+                  class="rsa-code"
+                  style="height: 46px"
+                  readonly
+                  x-text="rsaCreds.gatewayToken"
+                ></textarea>
+              </div>
+              <div class="rsa-field">
+                <label>device.private_key · 已解密 (PKCS8 PEM)</label>
+                <textarea
+                  class="rsa-code"
+                  readonly
+                  x-text="rsaCreds.devicePrivPem"
+                ></textarea>
+              </div>
+              <div class="rsa-hint">
+                scopes: <span x-text="(rsaCreds.scopes||[]).join(', ')"></span>
+              </div>
+              <div class="rsa-actions">
+                <button class="btn btn-outline" @click="clearRsaCreds()">
+                  清除(明文不留)
+                </button>
+              </div>
+            </div>
+          </template>
+        </section>
+      </div>
+
+      <!-- 入站 flow(inbound):平台公钥本地加密业务凭据 → 建租户注入 -->
+      <h2 style="margin-top: 28px">📥 入站凭据注入(inbound · 反方向)</h2>
+      <p class="rsa-lede">
+        调用方拿【平台】RSA 公钥,浏览器本地 OAEP-SHA256 加密业务凭据(平台 API
+        key 等),<code>POST /tenants</code> 带
+        <code>env_injected_credentials</code>,host 在 VM launch 时
+        <code>kms:Decrypt</code> 注入。调用方零 AWS 依赖、不碰
+        KMS,明文凭据不上传、不进 curl 导出。
+      </p>
+      <div class="rsa-flow">
+        <section class="section-card rsa-step">
+          <div class="rsa-step-head">
+            <span class="rsa-step-num">A</span>
+            <h3>取平台公钥</h3>
+            <template x-if="inboundPubKey">
+              <span
+                class="badge badge-running"
+                x-text="'key_id ' + (inboundPubKey.key_id||'')"
+              ></span>
+            </template>
+          </div>
+          <p class="rsa-hint">
+            平台 RSA-4096 CMK 公钥(私钥永在 KMS)。<code
+              >GET /clawpool-rsa-public-key</code
+            >;未开 asymmetric-v1 时返回 404。
+          </p>
+          <div class="rsa-actions">
+            <button
+              class="btn btn-create"
+              @click="loadInboundPubKey()"
+              :disabled="rsaBusy"
+            >
+              <svg class="icon s14"><use href="#i-download" /></svg> 取平台公钥
+            </button>
+          </div>
+        </section>
+
+        <section class="section-card rsa-step">
+          <div class="rsa-step-head">
+            <span class="rsa-step-num">B</span>
+            <h3>本地加密业务凭据</h3>
+          </div>
+          <p class="rsa-hint">
+            field 名须匹配 registry(小写);单值明文 ≤ 446B(RSA-OAEP
+            上限)。明文只在本浏览器加密,不上传。
+          </p>
+          <div class="rsa-actions">
+            <input
+              class="settings-input"
+              style="width: 220px"
+              x-model="inboundNewField"
+              placeholder="field(如 api_key)"
+            />
+            <input
+              class="settings-input"
+              style="width: 260px"
+              x-model="inboundNewValue"
+              placeholder="明文 value"
+            />
+            <button class="btn btn-outline" @click="addInboundItem()">
+              + 添加
+            </button>
+          </div>
+          <template x-if="inboundItems.length">
+            <div style="margin-top: 10px">
+              <template x-for="(it, i) in inboundItems" :key="i">
+                <div class="config-item" style="justify-content: space-between">
+                  <span
+                    ><code x-text="it.field"></code> =
+                    <span class="rsa-hint" style="margin: 0"
+                      >••••••(明文本地保留)</span
+                    ></span
+                  >
+                  <button class="btn btn-del" @click="removeInboundItem(i)">
+                    移除
+                  </button>
+                </div>
+              </template>
+            </div>
+          </template>
+          <div class="rsa-actions" style="margin-top: 12px">
+            <button
+              class="btn btn-create"
+              @click="encryptInbound()"
+              :disabled="rsaBusy || !inboundPubKey || !inboundItems.length"
+            >
+              <svg class="icon s14"><use href="#i-key" /></svg> 本地加密
+            </button>
+            <button class="btn btn-outline" @click="clearInbound()">
+              清空
+            </button>
+          </div>
+          <template x-if="inboundEncrypted">
+            <div class="rsa-field">
+              <label
+                >env_injected_credentials · 已加密(enc:v1: 密文,无明文)</label
+              >
+              <textarea
+                class="rsa-code"
+                style="height: 120px"
+                readonly
+                x-text="JSON.stringify(inboundEncrypted, null, 2)"
+              ></textarea>
+            </div>
+          </template>
+        </section>
+
+        <section class="section-card rsa-step">
+          <div class="rsa-step-head">
+            <span class="rsa-step-num">C</span>
+            <h3>建租户并注入</h3>
+          </div>
+          <p class="rsa-hint">
+            <strong>影响面</strong>:创建一个新 microVM 租户,host launch
+            时注入上面已加密的凭据到 env。owner_id 换成真 Cognito sub。
+          </p>
+          <div class="rsa-actions">
+            <button
+              class="btn btn-outline rsa-curl"
+              @click="exportInboundCurl()"
+              :disabled="!inboundEncrypted"
+            >
+              <svg class="icon s14"><use href="#i-terminal" /></svg> 生成建租户
+              curl
+            </button>
+          </div>
+          <template x-if="inboundCurl">
+            <div class="rsa-field">
+              <label
+                >建租户 curl · 只含 enc:v1: 密文,api-key/owner_id 换真值</label
+              >
+              <textarea
+                class="rsa-code"
+                style="height: 120px"
+                readonly
+                x-text="inboundCurl"
+              ></textarea>
+            </div>
+          </template>
+        </section>
+      </div>
+
+      <div class="rsa-toast" x-show="rsaMsg" x-transition x-text="rsaMsg"></div>
+    </div>
+
+    <!-- Page: Admin / Audit(补齐只读 API surface:审计/镜像/升级漂移/用户查询)-->
 
     <!-- Page: Settings -->
     <div x-show="page==='settings'" class="page-content">
@@ -3215,9 +3791,9 @@ openclaw_vm_disk_used_pct &gt; 90</pre
       </div>
     </template>
 
-    <!-- #187 Reveal Token / Descriptor Modal(per internal review:控制面功能全上 console)
+    <!-- #187 Reveal Token / Descriptor Modal(design decision)
          GET /tenants/{id}/token → 显示 KMS 密文(base64 信封);API 侧不 decrypt,
-         调用方拿 EncryptionContext={tenant_id: <id>} 自解得明文(data-plane contract 5)。
+         调用方拿 EncryptionContext={tenant_id: <id>} 自解得明文(§the data-plane contract)。
          附 descriptor:host_private_ip / host_port / guest_ip / status。 -->
     <template x-if="revealState.open">
       <div class="overlay" @click.self="closeReveal()">

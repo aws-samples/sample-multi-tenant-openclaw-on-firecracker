@@ -29,7 +29,8 @@ window.ocTraces = {
         start: String(now - Math.max(1, this.traceFilter.minutes) * 60),
         end: String(now),
       });
-      if (this.traceFilter.tenant) params.set("tenant", this.traceFilter.tenant);
+      if (this.traceFilter.tenant)
+        params.set("tenant", this.traceFilter.tenant);
       if (this.traceFilter.errorOnly) params.set("error", "1");
       if (nextToken) params.set("next", nextToken);
       const r = await this._traceFetch("traces?" + params.toString());
@@ -58,9 +59,13 @@ window.ocTraces = {
     this.traceDetailLoading = true;
     this.traceSelected = null;
     try {
-      const r = await this._traceFetch("traces/detail?ids=" + encodeURIComponent(id));
+      const r = await this._traceFetch(
+        "traces/detail?ids=" + encodeURIComponent(id),
+      );
       if (!r.ok) {
-        this.traceSelected = { error: r.status === 429 ? "throttled" : "unavailable" };
+        this.traceSelected = {
+          error: r.status === 429 ? "throttled" : "unavailable",
+        };
         return;
       }
       const body = await r.json();
@@ -125,7 +130,9 @@ window.ocTraces = {
       });
       const r = await this._traceFetch("traces/map?" + params.toString());
       if (!r.ok) {
-        this.serviceMap = { error: r.status === 429 ? "throttled" : "unavailable" };
+        this.serviceMap = {
+          error: r.status === 429 ? "throttled" : "unavailable",
+        };
         return;
       }
       this.serviceMap = await r.json();
@@ -136,14 +143,18 @@ window.ocTraces = {
     }
   },
 
-  // ── Log deep link (R6.6) ──────────────────────────────────────────────────
-  // Placeholder — AOS Discover URL structure is delivered by #219/#207. Until
-  // then this points at the ClawPool internal wiki entry that documents the
-  // trace_root search recipe. Swapping to the real URL is a one-line change.
-  logDeepLink(traceRoot) {
-    if (!traceRoot) return "#";
-    // #219/#207 will replace this with the AOS Discover URL.
-    return "/console/logs?trace_root=" + encodeURIComponent(traceRoot) + "#todo-219";
+  // ── Jump to per-tenant Logs viewer (#266, replaces the #219 placeholder) ────
+  // From a trace row, open the Logs tab prefilled with that trace's tenant and
+  // default to VM (firecracker) logs — the usual next question after a failed
+  // create trace is "why did the VM not come up".
+  openLogsForTrace(row) {
+    const tenant =
+      (row &&
+        (row.tenant_id || (row.Annotations && row.Annotations.tenant_id))) ||
+      "";
+    if (tenant && this.logFilter) this.logFilter.tenant = String(tenant);
+    this.page = "logs";
+    if (tenant) this.loadLogs();
   },
 
   // ── HTTP helper (shares apiKey with ocCore) ───────────────────────────────

@@ -6,11 +6,9 @@ from aws_cdk import (
     aws_dynamodb as dynamodb,
     aws_lambda as _lambda,
     aws_apigateway as apigw,
-    aws_cloudwatch as cloudwatch,
     aws_events as events,
     aws_events_targets as targets,
     aws_iam as iam,
-    aws_logs as logs,
     aws_sns as sns,
     aws_wafv2 as wafv2,
     aws_sqs as sqs,
@@ -47,6 +45,7 @@ def build_lambdas(self, ctx):
     param_registry_table = getattr(ctx, "param_registry_table", None)
     recipient_keys_table = getattr(ctx, "recipient_keys_table", None)
     tenant_idp_table = getattr(ctx, "tenant_idp_table", None)
+    version_snapshots_table = getattr(ctx, "version_snapshots_table", None)  # #217 V2
     tenant_secrets_table = getattr(ctx, "tenant_secrets_table", None)
     tenants_table = getattr(ctx, "tenants_table", None)
 
@@ -225,42 +224,6 @@ def build_lambdas(self, ctx):
                 max_receive_count=5, queue=lifecycle_dlq
             ),
         )
-        # prod-config MR1(#212):lifecycle 队列的 DLQ 也要告警(此前只有 dispatch
-        # DLQ 有,见 dispatch_infra.py:359)。lifecycle 消费端连续 5 次失败(SSM 打不动
-        # host / launch-vm 崩)会把该 create/stop/start/delete 死信进 DLQ——一进就得人
-        # 介入(租户永久卡态),不该只靠 dispatch DLQ 告警旁证。阈值 0 = 任何一条即告警。
-        cloudwatch.Alarm(
-            self,
-            "LifecycleDlqAlarm",
-            alarm_name="openclaw-lifecycle-dlq-not-empty",
-            metric=lifecycle_dlq.metric_approximate_number_of_messages_visible(
-                period=Duration.minutes(1),
-                statistic="Maximum",
-            ),
-            threshold=0,
-            evaluation_periods=1,
-            comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
-            treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
-            alarm_description=(
-                "openclaw-lifecycle-dlq has a message — a tenant lifecycle op "
-                "(create/stop/start/delete) gave up after retries. Investigate: "
-                "SSM RunCommand history, host-agent logs, tenant stuck state."
-            ),
-        )
-
-    # ── Observability: X-Ray tracing + log retention (design.md §1) ──
-    _obs_cfg = CFG.get("observability", {}) or {}
-    _tracing_enabled = _obs_cfg.get("tracing_enabled", True)
-    _tracing_mode = (
-        _lambda.Tracing.ACTIVE if _tracing_enabled else _lambda.Tracing.PASS_THROUGH
-    )
-    _log_retention_days = int(_obs_cfg.get("log_retention_days", 30))
-    _log_retention = {
-        7: logs.RetentionDays.ONE_WEEK,
-        30: logs.RetentionDays.ONE_MONTH,
-        90: logs.RetentionDays.THREE_MONTHS,
-        365: logs.RetentionDays.ONE_YEAR,
-    }.get(_log_retention_days, logs.RetentionDays.ONE_MONTH)
 
     # 控制面重构阶段1 — api_fn 的环境变量抽成共享 dict,lifecycle consumer 复用
     # (同一份 handler 需同配置:表名/区域/SSM/overcommit 等)。Cognito pool id 等
@@ -276,12 +239,8 @@ def build_lambdas(self, ctx):
         "TENANT_SECRETS_TABLE": tenant_secrets_table.table_name,  # #187 P1 gateway token
         "PARAM_REGISTRY_TABLE": param_registry_table.table_name,
         "RECIPIENT_KEYS_TABLE": recipient_keys_table.table_name,
+        "VERSION_SNAPSHOTS_TABLE": version_snapshots_table.table_name,  # #217 V2
         "ASSETS_BUCKET": assets_bucket.bucket_name,
-        # #199 fix — api_fn/consumer 的 _resolve_backup 需从 WORM+CMK 备份桶(非
-        # assets 桶)list/resolve 备份;此前只注了 ASSETS_BUCKET → restore 永远
-        # "backup not found"(备份数据在 backup 桶里但 resolve 拉错桶)。空串时
-        # _resolve_backup 回退 ASSETS_BUCKET(兼容未建 backup_bucket 的旧部署)。
-        "BACKUP_BUCKET": backup_bucket.bucket_name if backup_bucket else "",
         "NOTIFICATIONS_TOPIC_ARN": notifications_topic_arn,
         "ROOTFS_PREFIX": CFG["s3"]["rootfs_prefix"],
         "HOST_RESERVED_VCPU": str(CFG["host"]["reserved_vcpu"]),
@@ -358,10 +317,13 @@ def build_lambdas(self, ctx):
                 ],
             ),
         ),
-        timeout=Duration.seconds(120),
+        # #217 §10.3 — 900s(Lambda 硬上限 15min)让 pull-image 金丝雀同步链跑完:
+        # 装 live(SSM 等)→ 起金丝雀 → poll 到 running → 晋级/回滚,需数分钟。APIGW
+        # 集成 29s 会早早回 504,但 Lambda 后台跑完整链(浏览器靠 console 轮询看
+        # upgrading→金丝雀→active)。timeout 是上限,普通请求仍秒回,不影响别的路由;
+        # pull 期间占一个实例数分钟,并发别的请求靠 Lambda 自动扩实例。
+        timeout=Duration.seconds(900),
         memory_size=2048,
-        tracing=_tracing_mode,
-        log_retention=_log_retention,
         environment=dict(_api_env),
     )
     # ── Lambda Version + Alias "live" (#149) ──────────────────────────────
@@ -379,6 +341,7 @@ def build_lambdas(self, ctx):
     tenants_table.grant_read_write_data(api_fn)
     hosts_table.grant_read_write_data(api_fn)
     groups_table.grant_read_write_data(api_fn)
+    version_snapshots_table.grant_read_data(api_fn)  # #217 V2 — pull-image 只读快照
     # #152/#118 — the ClawPool credential-injection CMK ARN. Added ONLY when the
     # feature is on so synth stays byte-identical when off (no key on the env).
     # The API uses it as the real gate: it rejects injected_credentials whose
@@ -400,7 +363,7 @@ def build_lambdas(self, ctx):
     # #97 档A — /tenantmatch only reads the IdP map (least privilege: read-only).
     tenant_idp_table.grant_read_data(api_fn)
     # #187 P1 / #149 出站 — control-plane mints the per-tenant gateway token +
-    # device identity ciphertext (the design spec · the data-plane contract §5).
+    # device identity ciphertext (the data-plane design · the data-plane contract).
     # Lambda needs:
     #   • r/w on the secrets table (put on mint, get on reveal, delete on cleanup);
     #   • kms:GenerateRandom (32B CSPRNG for the token, API-level not per-key);
@@ -418,6 +381,16 @@ def build_lambdas(self, ctx):
     tenant_secrets_table.grant_read_write_data(api_fn)
     param_registry_table.grant_read_write_data(api_fn)
     recipient_keys_table.grant_read_write_data(api_fn)
+    # #264 — GET /admin/edge/instances(edge_admin.py:48 查 edge TG 健康)需要它;
+    # 原来 role 有一堆 #187 前遗留的 elbv2 写权却独缺这个读权,target_health 静默返 null
+    # (edge_admin.py 注释自标 "P5 后追加 elbv2:DescribeTarget* IAM")。Describe 类不支持
+    # 资源级 → Resource=*。
+    api_fn.add_to_role_policy(
+        iam.PolicyStatement(
+            actions=["elasticloadbalancing:DescribeTargetHealth"],
+            resources=["*"],
+        )
+    )
     if clawpool_cmk is not None:
         clawpool_cmk.grant_encrypt_decrypt(api_fn)
         api_fn.add_to_role_policy(
@@ -462,9 +435,6 @@ def build_lambdas(self, ctx):
         ],
     )
     assets_bucket.grant_read(api_fn)
-    # #199 fix — _resolve_backup 从 backup 桶 list/resolve 备份(restore/迁移入口)。
-    if backup_bucket:
-        backup_bucket.grant_read(api_fn)
 
     # 控制面重构阶段1 — 把队列 URL 注入 api Lambda(产端:create/start/stop/delete
     # 入队)+ 建 consumer Lambda(同 handler 代码,SQS 事件触发,reserved
@@ -481,26 +451,17 @@ def build_lambdas(self, ctx):
         # 对 queue 的依赖,而 API GW ApiDeployment 间接依赖 api role/Lambda,queue
         # 又被 consumer grant 一堆表 → circular dependency(2026-06-29 实撞)。
         # 独立 Policy 把 queue 依赖隔离在自己资源上,不污染 DefaultPolicy → 断环。
-        # R10.2 — /system/queues 只读 lifecycle 队列+DLQ 深度用 GetQueueAttributes;
-        # DLQ URL 注入 env(独立 Policy 隔离依赖,同断环理由)。
-        if lifecycle_dlq is not None:
-            api_fn.add_environment("LIFECYCLE_DLQ_URL", lifecycle_dlq.queue_url)
-        _lifecycle_read_arns = [lifecycle_queue.queue_arn] + (
-            [lifecycle_dlq.queue_arn] if lifecycle_dlq is not None else []
-        )
         iam.Policy(
             self,
             "ApiLifecycleEnqueuePolicy",
             roles=[api_fn.role],
             statements=[
                 iam.PolicyStatement(
-                    actions=["sqs:SendMessage"],
+                    # #264 — GetQueueAttributes: GET /system/queues(handler.py:757 读队列深度)
+                    # 需要它;原来只有 SendMessage → 面板 depth 静默返 null(fail-soft 吞了 AccessDenied)。
+                    actions=["sqs:SendMessage", "sqs:GetQueueAttributes"],
                     resources=[lifecycle_queue.queue_arn],
-                ),
-                iam.PolicyStatement(
-                    actions=["sqs:GetQueueAttributes"],
-                    resources=_lifecycle_read_arns,
-                ),
+                )
             ],
         )
         _consumer_reserved = int(
@@ -535,8 +496,6 @@ def build_lambdas(self, ctx):
             ),
             timeout=Duration.seconds(180),
             memory_size=2048,
-            tracing=_tracing_mode,
-            log_retention=_log_retention,
             # 限流阀:consumer 并发上限 = SSM/host 可承受速率(削峰核心)
             reserved_concurrent_executions=_consumer_reserved,
             # 同 api 配置(共享 _api_env);consumer 不入队故不给 LIFECYCLE_QUEUE_URL。
@@ -556,9 +515,16 @@ def build_lambdas(self, ctx):
         batch_jobs_table.grant_read_write_data(lifecycle_consumer)
         # #187 P1 — consumer replays create_tenant which now mints gateway token.
         # Same grants as api_fn (secrets table r/w + CMK encrypt + GenerateRandom).
-        # **No kms:Decrypt** — API side never decrypts (the data-plane contract §5,
+        # **No kms:Decrypt** — API side never decrypts (the data-plane contract,
         # ciphertext is folded into GET responses verbatim; caller decrypts).
         tenant_secrets_table.grant_read_write_data(lifecycle_consumer)
+        # #264 — consumer replay 走 config_template / injected_parameters /
+        # env_injected_credentials 分支时(tenant_service.py:751/806)调
+        # registry_service.load_current_snapshot → param-registry 表 Query,补种
+        # 时还 PutItem/transact_write。api_fn 有此 grant(:382)但 consumer 漏,
+        # 带模板/凭据注入的租户 replay 时 AccessDenied → 穿窄 except → 重试进
+        # DLQ → 永久卡 creating/queued(默认可达:lifecycle_queue+create_via_queue 均默认开)。
+        param_registry_table.grant_read_write_data(lifecycle_consumer)
         if clawpool_cmk is not None:
             clawpool_cmk.grant_encrypt(lifecycle_consumer)
             lifecycle_consumer.add_to_role_policy(
@@ -569,9 +535,6 @@ def build_lambdas(self, ctx):
             )
         assets_bucket.grant_read(lifecycle_consumer)
         assets_bucket.grant_put(lifecycle_consumer)
-        # #199 fix — consumer 也走 _resolve_backup(dispatch/queue 建租户带 restore_from)。
-        if backup_bucket:
-            backup_bucket.grant_read(lifecycle_consumer)
         lifecycle_queue.grant_consume_messages(lifecycle_consumer)
         # consumer emits the create-latency SLA metric on the create path.
         lifecycle_consumer.add_to_role_policy(
@@ -621,17 +584,49 @@ def build_lambdas(self, ctx):
             )
         )
         assets_bucket.grant_delete(lifecycle_consumer)
+        # #264 — consumer replay create/delete 时 audit._publish_event 发 SNS
+        # (core/audit.py:42,tenant_service.py:1705/1997/2581)。api_fn(:599)有
+        # grant_publish 但 consumer 漏 → notifications.enabled=true 时 queued 租户
+        # 的生命周期通知被 audit.py:51 静默吞("SNS publish failed"),订阅方看到
+        # "部分租户有通知部分没"。与 api_fn 同门控(仅 notifications_topic 建了才授)。
+        if notifications_topic is not None:
+            notifications_topic.grant_publish(lifecycle_consumer)
         # consumer 跟 api_fn 共享 _api_env;Cognito pool/client id 等后置
         # add_environment 的 key,在 Cognito 段对 api_fn 和本 consumer 都加
         # (见下方 _lifecycle_consumer 引用)。存引用供 Cognito 段使用。
         self._lifecycle_consumer = lifecycle_consumer
-        lifecycle_consumer.add_event_source(
-            lambda_event_sources.SqsEventSource(
-                lifecycle_queue,
-                batch_size=10,
-                report_batch_item_failures=True,
+        # #263 — ESM ScalingConfig.MaximumConcurrency 限流阀:治批删削峰的核心。
+        # 不加就是"consumer 按活跃 MessageGroup 数任意并发"(30 个不同租户 delete →
+        # 最高 30 并发砸向少数 host),撞 SSM 单 host CommandWorkersLimit=5、饿死
+        # launch-vm/start/stop。aws-cdk-lib 2.x 的 SqsEventSource 不直接暴露
+        # ScalingConfig kwarg(见 dispatch_infra.py:253),用 add_event_source_mapping
+        # + add_property_override 落 CFN 属性(与 dispatch ESM 同款,验证过的做法)。
+        _lc_max_conc = int(CFG.get("scaler", {}).get("lifecycle_max_concurrency", 10))
+        # AWS 硬下限 2,上限 1000;且 reserved ≥ max_concurrency(否则部署行为异常)。
+        # fail-loud 比 synth 过、CFN 报错或线上限流失效更好定位。
+        if not (2 <= _lc_max_conc <= 1000):
+            raise ValueError(
+                f"scaler.lifecycle_max_concurrency={_lc_max_conc} out of range 2..1000 "
+                "(SQS Lambda ESM ScalingConfig hard limits)."
             )
+        if _lc_max_conc > _consumer_reserved:
+            raise ValueError(
+                f"scaler.lifecycle_max_concurrency={_lc_max_conc} exceeds "
+                f"lifecycle_consumer_concurrency={_consumer_reserved}; reserved must be "
+                ">= max_concurrency (AWS hard constraint) or the ESM can't scale to it."
+            )
+        _lc_esm = lifecycle_consumer.add_event_source_mapping(
+            "LifecycleQueueEsm",
+            event_source_arn=lifecycle_queue.queue_arn,
+            batch_size=10,
+            report_batch_item_failures=True,
+            enabled=True,
         )
+        _lc_cfn_esm = _lc_esm.node.default_child
+        if _lc_cfn_esm is not None:
+            _lc_cfn_esm.add_property_override(
+                "ScalingConfig", {"MaximumConcurrency": _lc_max_conc}
+            )
         cdk.CfnOutput(self, "LifecycleQueueUrl", value=lifecycle_queue.queue_url)
     # 1.4.1 (#63) — Console skills CRUD: api Lambda writes SKILL.md
     # via PUT /skills/{name} and removes the skills/{name}/ prefix
@@ -696,79 +691,11 @@ def build_lambdas(self, ctx):
     )
 
     # ========== API Gateway ==========
-    # #212 R1:EDGE resource policy — mode=private 或 edge_resource_policy_deny_public=true 时
-    # 挂条 policy 让 EDGE 只对指定 VPCE 放行(其余 IP 拒),避免 mode=private 时 EDGE 还
-    # 公网可达。默认 mode=edge → policy=None → 现状不变。
-    _edge_api_cfg = CFG.get("api", {}) or {}
-    _edge_mode_raw = str(_edge_api_cfg.get("mode", "")).strip().lower()
-    _edge_legacy = _edge_api_cfg.get("private_api_enabled", None)
-    if _edge_mode_raw:
-        _edge_api_mode = _edge_mode_raw
-    else:
-        _edge_api_mode = "both" if bool(_edge_legacy) else "edge"
-    _edge_deny_pub = _edge_api_mode == "private" or bool(
-        _edge_api_cfg.get("edge_resource_policy_deny_public", False)
-    )
-    _edge_policy = None
-    if _edge_deny_pub:
-        # 通用 deny-any-non-vpce policy;private 模式下 EDGE 事实上应被 network_vpc 建的
-        # execute-api VPCE 兜住(SourceVpce 条件用 aws:SourceVpce 通配未匹配即拒)。
-        # 因 network_vpc 段在 lambdas 后跑,此处用 aws:SourceIp !aws:VpcSourceIp 二段式
-        # 拒(拒所有源 IP 除非来自 VPC 内)。fail-safe:即便 EDGE 有公网 DNS,resource policy
-        # 会挡下所有非 VPC 源。同时不影响后续 method AWS_IAM/api-key 门控。
-        _edge_policy = iam.PolicyDocument(
-            statements=[
-                iam.PolicyStatement(
-                    effect=iam.Effect.DENY,
-                    principals=[iam.AnyPrincipal()],
-                    actions=["execute-api:Invoke"],
-                    resources=["execute-api:/*"],
-                    conditions={
-                        "NotIpAddress": {
-                            # 私有 IP 段(RFC1918 + link-local + carrier-grade NAT)
-                            "aws:SourceIp": [
-                                "10.0.0.0/8",
-                                "172.16.0.0/12",
-                                "192.168.0.0/16",
-                            ]
-                        }
-                    },
-                ),
-                iam.PolicyStatement(
-                    effect=iam.Effect.ALLOW,
-                    principals=[iam.AnyPrincipal()],
-                    actions=["execute-api:Invoke"],
-                    resources=["execute-api:/*"],
-                ),
-            ]
-        )
     api = apigw.RestApi(
         self,
         "Api",
         rest_api_name="openclaw-orchestrator",
-        policy=_edge_policy,
-        deploy_options=apigw.StageOptions(
-            stage_name="v1",
-            tracing_enabled=_tracing_enabled,
-            access_log_destination=apigw.LogGroupLogDestination(
-                logs.LogGroup(
-                    self,
-                    "ApiAccessLog",
-                    log_group_name="/aws/apigateway/openclaw-orchestrator",
-                    retention=logs.RetentionDays.ONE_MONTH,
-                )
-            ),
-            access_log_format=apigw.AccessLogFormat.custom(
-                '{"requestId":"$context.requestId",'
-                '"traceId":"$context.xrayTraceId",'
-                '"ip":"$context.identity.sourceIp",'
-                '"method":"$context.httpMethod",'
-                '"path":"$context.resourcePath",'
-                '"status":"$context.status",'
-                '"latency":"$context.responseLatency",'
-                '"integrationLatency":"$context.integrationLatency"}'
-            ),
-        ),
+        deploy_options=apigw.StageOptions(stage_name="v1"),
         default_cors_preflight_options=apigw.CorsOptions(
             allow_origins=apigw.Cors.ALL_ORIGINS,
             allow_methods=apigw.Cors.ALL_METHODS,
@@ -841,8 +768,6 @@ def build_lambdas(self, ctx):
             code=_lambda.Code.from_asset("deploy/lambda/platform_authorizer"),
             timeout=Duration.seconds(10),
             memory_size=2048,
-            tracing=_tracing_mode,
-            log_retention=_log_retention,
             environment={"PLATFORM_KEY_TABLE": platform_key_table.table_name},
         )
         platform_key_table.grant_read_data(authorizer_fn)
@@ -1082,6 +1007,11 @@ def build_lambdas(self, ctx):
 
     host_resource = hosts_resource.add_resource("{instance_id}")
     host_resource.add_method("DELETE", _li(), **key_required)
+    # #217 V2 — POST /hosts/{instance_id}/pull-image?snapshot_time=<ISO>: 照 DDB
+    # 快照按精确 VersionId 拉 host 相关文件(镜像+脚本),校验 etag 后装到 live 原位置
+    # (launch-vm/service 直接读)。只作用一台 host。Admin op (x-api-key)。
+    pull_image_resource = host_resource.add_resource("pull-image")
+    pull_image_resource.add_method("POST", _li(), **key_required)
 
     backups_resource = api.root.add_resource("backups")
     backups_resource.add_method("GET", _li(), **key_required)
@@ -1090,6 +1020,10 @@ def build_lambdas(self, ctx):
     # (per-tenant data snapshot reuses GET /tenants/{id}/{action} action=data)
     images_resource = api.root.add_resource("images")
     images_resource.add_method("GET", _li(), **key_required)
+
+    # #217 V2 — GET /snapshots: 列版本快照(time+label+count),console 选 snapshot_time 拉。
+    snapshots_resource = api.root.add_resource("snapshots")
+    snapshots_resource.add_method("GET", _li(), **key_required)
 
     # 1.4.0 (#62) — Groups CRUD endpoints
     groups_resource = api.root.add_resource("groups")
@@ -1182,8 +1116,6 @@ def build_lambdas(self, ctx):
             180
         ),  # 1.3.1: room for synchronous SSM wait during failover
         memory_size=2048,
-        tracing=_tracing_mode,
-        log_retention=_log_retention,
         # 1.3.2: prevent concurrent invocations from racing on the same
         # tenant migration. EventBridge fires every 5 min, but failover
         # can take 60-90s of synchronous SSM waits — if a long-running
@@ -1251,8 +1183,6 @@ def build_lambdas(self, ctx):
         code=_lambda.Code.from_asset("deploy/lambda/skills"),
         timeout=Duration.seconds(30),
         memory_size=2048,
-        tracing=_tracing_mode,
-        log_retention=_log_retention,
         environment={
             "ASSETS_BUCKET": assets_bucket.bucket_name,
             # 1.4.0 (#62) — needed for ?tenant=... per-tenant scope filtering
@@ -1284,8 +1214,6 @@ def build_lambdas(self, ctx):
         code=_lambda.Code.from_asset("deploy/lambda/templates"),
         timeout=Duration.seconds(30),
         memory_size=2048,
-        tracing=_tracing_mode,
-        log_retention=_log_retention,
         environment={"ASSETS_BUCKET": assets_bucket.bucket_name},
     )
     assets_bucket.grant_read_write(templates_fn)
@@ -1314,18 +1242,11 @@ def build_lambdas(self, ctx):
         code=_lambda.Code.from_asset("deploy/lambda/scaler"),
         timeout=Duration.seconds(60),
         memory_size=2048,
-        tracing=_tracing_mode,
-        log_retention=_log_retention,
         environment={
             "HOSTS_TABLE": hosts_table.table_name,
             "TENANTS_TABLE": tenants_table.table_name,
             "ASG_NAME": "openclaw-hosts-asg",
             "IDLE_TIMEOUT_MINUTES": str(CFG["scaler"]["idle_timeout_minutes"]),
-            # R8 — 空闲缩容总开关,默认 false(不自动 terminate host,防缩到 0 撞
-            # pending 租户;OFF 时仍做 idle 标记)。客户按需在 config 开。
-            "IDLE_RECLAIM_ENABLED": str(
-                CFG.get("scaler", {}).get("idle_reclaim_enabled", False)
-            ).lower(),
             # task #21 — seamless rolling image refresh (gated OFF until verified)
             "IMAGE_REFRESH_ENABLED": str(
                 CFG.get("scaler", {}).get("image_refresh_enabled", False)
@@ -1365,11 +1286,12 @@ def build_lambdas(self, ctx):
         iam.PolicyStatement(
             actions=[
                 "autoscaling:DescribeAutoScalingGroups",
-                # R8 — terminate 前查实例 lifecycle,防已终止中的实例被重复 terminate
-                # 多扣一次 desired(references.md#R8-Ref-2)。只读,Describe* 不能带
-                # resource ARN 条件(AWS 侧 Describe 动作不支持 resource-level),故 *。
-                "autoscaling:DescribeAutoScalingInstances",
                 "autoscaling:TerminateInstanceInAutoScalingGroup",
+                # #264 — 两个躲在默认关开关后的缺失,一开就 AccessDenied:
+                # SetDesiredCapacity: _ensure_reserve_capacity(handler.py:192,RESERVE_ENABLED=true 预留扩容)
+                # DescribeAutoScalingInstances: _lifecycle_terminating(handler.py:330,IDLE_RECLAIM_ENABLED=true 防双扣 desired)
+                "autoscaling:SetDesiredCapacity",
+                "autoscaling:DescribeAutoScalingInstances",
             ],
             resources=["*"],
         )
@@ -1393,8 +1315,6 @@ def build_lambdas(self, ctx):
         code=_lambda.Code.from_asset("deploy/lambda/backup"),
         timeout=Duration.seconds(900),
         memory_size=2048,
-        tracing=_tracing_mode,
-        log_retention=_log_retention,
         environment={
             "TENANTS_TABLE": tenants_table.table_name,
             "ASSETS_BUCKET": assets_bucket.bucket_name,
@@ -1441,8 +1361,6 @@ def build_lambdas(self, ctx):
             code=_lambda.Code.from_asset("deploy/lambda/audit_archive"),
             timeout=Duration.seconds(60),
             memory_size=2048,
-            tracing=_tracing_mode,
-            log_retention=_log_retention,
             environment={
                 "AUDIT_ARCHIVE_BUCKET": audit_archive_bucket.bucket_name,
                 "AUDIT_ARCHIVE_PREFIX": audit_cfg.get(
@@ -1483,14 +1401,3 @@ def build_lambdas(self, ctx):
     ctx.health_fn = locals().get("health_fn")
     ctx.notifications_topic = locals().get("notifications_topic")
     ctx.notifications_topic_arn = locals().get("notifications_topic_arn")
-    # #220 (R9 business alarms): expose the rest of the Lambdas + the lifecycle
-    # queue so build_alarms can create per-function Errors/Throttles alarms and
-    # SQS age-of-oldest-message alarm without touching this module.
-    ctx.audit_archive_fn = locals().get("audit_archive_fn")
-    ctx.authorizer_fn = locals().get("authorizer_fn")
-    ctx.backup_fn = locals().get("backup_fn")
-    ctx.lifecycle_consumer = locals().get("lifecycle_consumer")
-    ctx.lifecycle_queue = locals().get("lifecycle_queue")
-    ctx.scaler_fn = locals().get("scaler_fn")
-    ctx.skills_fn = locals().get("skills_fn")
-    ctx.templates_fn = locals().get("templates_fn")

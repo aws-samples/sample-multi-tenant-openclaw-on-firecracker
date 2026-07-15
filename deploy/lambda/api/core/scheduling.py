@@ -114,15 +114,29 @@ def _find_host(vcpu_needed, mem_needed):
     return best
 
 
-def _get_specific_host_with_capacity(instance_id, vcpu_needed, mem_needed):
+def _get_specific_host_with_capacity(
+    instance_id, vcpu_needed, mem_needed, allow_upgrading=False
+):
     """Issue #12 — locate a specific host (used for same-host clone) and
-    confirm it has capacity. Returns the host item or None."""
+    confirm it has capacity. Returns the host item or None.
+
+    #217 §10.6 — allow_upgrading widens the status gate to include `upgrading`
+    for the ONE pinned host, so pull_image's canary tenant can land on the host
+    it is validating. Only pull_image sets this (via create_tenant(_canary_host=)),
+    and only for that exact instance_id — every other caller keeps the strict
+    active/idle gate. Capacity CAS is unchanged (canary still occupies real slots).
+    """
     # Phase 6: strong read so the capacity gate for a pinned/clone host sees the
     # freshest used_* a concurrent create may have just reserved.
+    statuses = {":a": "active", ":i": "idle"}
+    status_filter = "#s IN (:a, :i)"
+    if allow_upgrading:
+        statuses[":u"] = "upgrading"
+        status_filter = "#s IN (:a, :i, :u)"
     hosts = clients.hosts_table.scan(
-        FilterExpression="#s IN (:a, :i)",
+        FilterExpression=status_filter,
         ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":a": "active", ":i": "idle"},
+        ExpressionAttributeValues=statuses,
         ConsistentRead=True,
     ).get("Items", [])
     for h in hosts:

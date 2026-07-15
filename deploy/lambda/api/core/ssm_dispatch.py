@@ -112,7 +112,7 @@ def _launch_vm(
     # host-agent read-back race). Non-empty (normal path) → DDB & guest share it.
     csecret_arg = _q(channel_secret)
     # 10th positional arg — per-tenant chatCompletions switch. Default off ("0")
-    # keeps launch-vm.sh deleting the endpoint (secure default; see project docs
+    # keeps launch-vm.sh deleting the endpoint (secure default; see the ops guide
     # "chatCompletions 为什么不能全局默认开"). Only tenants with
     # chat_endpoint_enabled=true in DDB get "1" → enabled:true injected.
     chat_ep_arg = "1" if chat_endpoint_enabled else "0"

@@ -72,8 +72,12 @@ for vm_path in "${VM_DIR}"/*/; do
   fi
   _wait_for_slot
   # launch-vm.sh clears .stopped (line 76) and reuses the existing data disk.
-  bash /home/ubuntu/launch-vm.sh "${tenant_id}" "${vm_num}" "${vcpu}" "${mem_mb}" \
-    >/dev/null 2>&1 &
+  # #266 — wrap in systemd-cat so launch diagnostics land in journald (tag
+  # claw-launch) → Fluent Bit host.platform → AOS claw-logs-host, instead of
+  # being swallowed by /dev/null. Console Logs viewer needs these when a VM
+  # fails to come up on a fleet-wide start. Same pattern as host-agent.py:345.
+  systemd-cat -t claw-launch \
+    bash /home/ubuntu/launch-vm.sh "${tenant_id}" "${vm_num}" "${vcpu}" "${mem_mb}" &
   started=$((started + 1))
 done
 

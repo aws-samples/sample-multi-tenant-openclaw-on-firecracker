@@ -21,8 +21,8 @@ from botocore.config import Config as BotoConfig
 # P2b (2026-07-08): route_ops lives in the same userdata directory. Add it to
 # sys.path so the tenant-route helpers (port bitmap / DNAT / Redis writer /
 # drift reconcile) resolve when host-agent runs as a systemd ExecStart from
-# /opt/openclaw/. See internal design docs
-# the data-plane contract §1/§3/§4/§6/§8.
+# /opt/openclaw/. See the data-plane design docs
+# the data-plane interface contract §1/§3/§4/§6/§8.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import route_ops  # noqa: E402
 
@@ -627,8 +627,7 @@ def _refresh_health(table, tid, info, now, metrics):
         cleanly (caught by the caller).
     """
     expr = (
-        "SET vm_health = :vh, app_health = :ah, last_health_check = :t, "
-        "guest_ip = :gi"
+        "SET vm_health = :vh, app_health = :ah, last_health_check = :t, guest_ip = :gi"
     )
     vals = {
         ":vh": info["vm_health"],
@@ -1633,6 +1632,13 @@ def _execute_launch(assignment):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        # #267 — rc 75 = launch-vm.sh per-tenant flock 抢锁失败(#256):另一进程
+        # (push fan-out / ssm wake / _recover_vm)正在起同租户,是良性 skip,不是失败。
+        # 返 "skip" 让调用点保持 assignment pending(不标 failed、不消耗 retry 预算),
+        # 下一 tick 自然收敛或 winner 已起好后 vm.json 存在被跳过。systemd-cat 透传
+        # 退出码(systemd 255 真机实测:exit 75→rc 75),故这里能拿到真实 75。
+        if rc == 75:
+            return "skip"
         return rc == 0
     except Exception as e:
         print(f"dispatch launch {tid} failed: {e}")
@@ -1727,6 +1733,12 @@ def _dispatch_tick(table):
                 err_reason = str(e) or err_reason
                 print(f"dispatch future {tid} raised: {err_reason}")
                 ok = False
+            # #267 — flock skip 必须在 `if ok:` 之前判:"skip" 是 truthy 字符串,
+            # 落 `if ok:` 会被当成功 _mark_assignment_done → 该租户其实没起(winner
+            # 可能也失败),孤儿。skip = 良性(另一进程在起同租户),保持 pending 不动,
+            # 不标 done/failed、不消耗 retry 预算、不重入队,下一 tick 由 DDB 行决定。
+            if ok == "skip":
+                continue
             if ok:
                 _mark_assignment_done(table, INSTANCE_ID, tid)
                 _promote_tenant_running(tid)

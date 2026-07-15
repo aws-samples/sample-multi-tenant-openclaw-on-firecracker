@@ -56,6 +56,14 @@ tenants_table = ddb.Table(os.environ["TENANTS_TABLE"])
 
 hosts_table = ddb.Table(os.environ["HOSTS_TABLE"])
 
+# #217 V2 — 文件版本快照表(pull-image?snapshot_time 按此逐文件按精确 VersionId 拉)。
+# env-gated:未部署 V2 的环境无此 env → None,pull-image 的 snapshot 分支 fail-loud。
+version_snapshots_table = (
+    ddb.Table(os.environ["VERSION_SNAPSHOTS_TABLE"])
+    if os.environ.get("VERSION_SNAPSHOTS_TABLE")
+    else None
+)
+
 # PRD #50-58 — control-plane scale-out GSIs on the tenants table (defined in
 # deploy/stack.py). gsi_owner partitions by owner_id (Cognito sub) for "my
 # nodes"; gsi_tenant_user partitions by tenant_user_id for the external backend's
@@ -83,7 +91,7 @@ batch_jobs_table = (
     else None
 )
 
-# #97 档A — optional external-platform → Cognito-IdP map (internal design spec §2.7). Absent →
+# #97 档A — optional external-platform → Cognito-IdP map (the design docs §2.7). Absent →
 # federation not configured; /tenantmatch returns 404 (front-end falls back to
 # passing identity_provider explicitly). Partition key: platform_id (S).
 tenant_idp_table = (

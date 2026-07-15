@@ -13,6 +13,7 @@ files["fluent-bit/"] = {
     -- so it MUST be a global function (not local) — and its signature is fixed
     -- by Fluent Bit's calling convention (tag, timestamp, record), some args
     -- go unused. Silence those two narrowly for the fluent-bit filter dir only.
-    globals = { "extract_trace_root" },  -- 111: global entrypoint called by name
+    -- extract_trace_root: edge/ filter; extract_tenant_id: host/ vm-log filter (#245).
+    globals = { "extract_trace_root", "extract_tenant_id" },  -- 111: global entrypoint
     ignore = { "212" },  -- unused argument (tag/timestamp per FB filter contract)
 }

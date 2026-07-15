@@ -10,7 +10,7 @@ Design intent:
 - 幂等:S3 key 里带审计条目的 uuid4 id,同事件重放写同 key,配合 bucket versioning
   不会造成 lost update(WORM 桶版本化 + 新版本创建也在 Object Lock 保护下)。
 - fail-loud:反序列化/写桶失败抛异常让 Lambda 服务重试→重试耗尽后进 DLQ,不静默吞
-  (fail-loud: never silently swallow exceptions)。
+  (对齐铁律 #11 与 the ops guide "别静默吞异常")。
 - unmarshal 不引外部依赖(zero deps):DDB Stream 的 NEW_IMAGE 是 attr:{type:val}
   形式,手写一个 stdlib-only 反序列化器,防止将来 lambda-layer 漂移。
 """

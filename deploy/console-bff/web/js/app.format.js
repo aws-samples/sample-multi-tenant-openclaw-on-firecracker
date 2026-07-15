@@ -56,6 +56,10 @@ window.ocFormat = {
     return total > 0 ? Math.min(100, Math.round((used / total) * 100)) : 0;
   },
   role() {
+    // #217 — BFF 架构:真实角色由 BFF 从 ALB x-amzn-oidc-data 解出,经 config.js 注入
+    // window.OC_ROLE(前端拿不到那个 header)。优先读它——BFF 登录门下 localStorage 无
+    // oc_id_token,下面老 JWT 分支会误判成 admin,导致 viewer 也看到写操作入口。
+    if (window.OC_ROLE) return window.OC_ROLE;
     // RBAC (issue #14): inspect the JWT id_token, return the most-privileged
     // group name. No JWT (e.g. when console_auth.enabled: false) → admin.
     var token = localStorage.getItem('oc_id_token');

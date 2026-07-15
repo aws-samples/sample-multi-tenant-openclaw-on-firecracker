@@ -3,6 +3,310 @@
 # SPDX-License-Identifier: MIT-0
 
 set -euo pipefail
+# #256 — launch-vm.sh 是唯一起 VM 脚本。fan_out_main 内联了原 launch-all-vms.sh 的批量
+# fan-out 逻辑(SQS dispatch:一条 SSM 命令叫醒本 host → 读 manifest/DDB assignment →
+# 逐行 re-invoke `bash "$0" <单租户 13 位参数>` 起 VM)。函数后的 dispatcher case 据 $1
+# 是否为 --manifest(paramstore)/--from-ddb(DDB)决定走向:批量 → fan_out_main;否则
+# (单租户位置参)→ 落下面的单 VM 主体。每个 re-invoke 的子进程都是独立的单 VM 主体
+# (进程隔离:一个租户 exit 不拆整批;各自抢自己租户的 flock,kubelet per-pod worker 同款)。
+#
+# 顶层是 `set -euo pipefail`(有 -e),原 launch-all 是 `set -uo pipefail`(无 -e):它靠
+# `wait` 后子进程失败不中断、继续聚合 v2 JSON 给 Poller 清算。故 fan_out_main 第一行
+# `set +e` 关掉 -e 恢复此行为(-u / -o pipefail 由顶层保留)。log 走 stderr([oc:launch-all]
+# tag),stdout 只留给 v2 JSON(Poller 解析),绝不混。
+fan_out_main() {
+  set +e
+
+  # dispatcher 透传全部参数;$1 是 --manifest(paramstore 回退)或 --from-ddb(DDB 载体)。
+  local mode="$1"; shift
+  FROM_DDB=0
+  [ "${mode}" = "--from-ddb" ] && FROM_DDB=1
+
+  COMMAND_ID="${1:?Usage: launch-vm.sh --manifest|--from-ddb <command_id> <count> <max_parallel>}"
+  PART_COUNT="${2:?Usage: launch-vm.sh --manifest|--from-ddb <command_id> <count> <max_parallel>}"
+  MAX_PARALLEL="${3:-96}"
+
+  # FAN_VM_DIR 必须 local:与单 VM 主体的全局 VM_DIR=/data/firecracker-vms/<tid> 同名,
+  # local 化杜绝 fan-out 段污染主体的 VM_DIR(dynamic scoping 让 _launch_one 也读得到)。
+  local FAN_VM_DIR="/data/firecracker-vms"
+  PARAM_PREFIX="${DISPATCH_PARAM_PREFIX:-/openclaw/dispatch}"
+  # In ddb mode $4 is the assignments table name; in paramstore mode $4 (if given)
+  # is the param prefix — keep the old positional contract intact.
+  ASSIGN_TABLE="${4:-${ASSIGNMENTS_TABLE:-openclaw-assignments}}"
+  if [ "${FROM_DDB}" -eq 0 ] && [ -n "${4:-}" ]; then
+    PARAM_PREFIX="$4"
+  fi
+
+  _fo_log() { echo "[oc:launch-all] $(date +%H:%M:%S) $*" >&2; }
+  _fo_die() { _fo_log "FATAL: $*"; rm -rf "${RESULT_DIR:-}" 2>/dev/null || true; exit 1; }
+
+  # ── REGION + INSTANCE_ID from /etc/platform.env (init-host.sh wrote it) ──
+  # init-host.sh writes INSTANCE_ID + OC_REGION at first boot; source not re-hit IMDS.
+  [ -f /etc/platform.env ] && . /etc/platform.env
+  REGION="${OC_REGION:-${AWS_REGION:-}}"
+  [ -n "${REGION}" ] || _fo_die "OC_REGION empty in /etc/platform.env — init-host.sh didn't run?"
+  [ -n "${INSTANCE_ID:-}" ] || _fo_die "INSTANCE_ID empty in /etc/platform.env — init-host.sh didn't run?"
+
+  _fo_log "start command_id=${COMMAND_ID} parts=${PART_COUNT} parallel=${MAX_PARALLEL} host=${INSTANCE_ID}"
+
+  # ── Fetch one manifest part with exponential backoff (jitter via $RANDOM) ──
+  # ParamStore is eventually consistent across regions but strong within one
+  # region; the retry loop guards against ParameterNotFound during the tiny
+  # window where SSM SendCommand outraces the last PutParameter. We DO NOT
+  # silently return empty on total failure — that would launch 0 VMs and
+  # report success (fail-loud rule).
+  _get_part() {
+    local n="$1" name attempt=0 out rc
+    name="${PARAM_PREFIX}/manifests/${COMMAND_ID}/${INSTANCE_ID}/part-${n}"
+    while [ "${attempt}" -lt 3 ]; do
+      out=$(aws ssm get-parameter --region "${REGION}" --name "${name}" \
+        --with-decryption --query 'Parameter.Value' --output text 2>/dev/null)
+      rc=$?
+      if [ "${rc}" -eq 0 ] && [ -n "${out}" ] && [ "${out}" != "None" ]; then
+        printf '%s' "${out}"
+        return 0
+      fi
+      attempt=$((attempt + 1))
+      sleep "$(awk "BEGIN{print (2^${attempt}) + (${RANDOM}%1000)/1000}")"
+    done
+    return 1
+  }
+
+  # ── DDB source: Query this host's pending assignments → same JSON-lines ──
+  # Filter to status=pending + action=create (idempotent redelivery: done rows are
+  # skipped at the source, vm.json check still guards the race). command_id is NOT
+  # part of the key — a host drains ALL its pending rows, which self-heals any
+  # earlier batch whose wake-up SSM command was lost (at-least-once safety net).
+  _get_ddb_lines() {
+    aws dynamodb query --region "${REGION}" \
+      --table-name "${ASSIGN_TABLE}" \
+      --key-condition-expression "instance_id = :i" \
+      --filter-expression "#s = :p AND #a = :c" \
+      --expression-attribute-names '{"#s":"status","#a":"action"}' \
+      --expression-attribute-values \
+        "{\":i\":{\"S\":\"${INSTANCE_ID}\"},\":p\":{\"S\":\"pending\"},\":c\":{\"S\":\"create\"}}" \
+      --output json 2>/dev/null \
+    | jq -c '.Items[] | {t:.tenant_id.S, n:(.vm_num.N|tonumber),
+                          c:(.vcpu.N|tonumber), m:(.mem_mb.N|tonumber),
+                          e:(if .chat_ep.BOOL then 1 else 0 end)}
+                         + (if .gateway_token_ct.S then {g:.gateway_token_ct.S} else {} end)
+                         + (if .device_paired_b64.S then {d:.device_paired_b64.S} else {} end)
+                         + (if .restore_backup_key.S then {r:.restore_backup_key.S} else {} end)'
+  }
+
+  # ── Mark one assignment done|failed (conditional; Poller/agent reconcile) ──
+  # ConditionExpression status=pending: two executors racing the same row (SSM
+  # wake-up + a future agent poll both saw it) — only the first transition wins,
+  # the loser's write is rejected instead of silently overwriting (same discipline
+  # as tenants creating→running). Adds <st>_ts stamp + fail_reason for postmortem
+  # without SSHing the host. best-effort (|| true): a mark failure never fails the
+  # launch (the VM is already up; Poller reconciles from stdout v2 report anyway).
+  _mark_assignment() {
+    local tid="$1" st="$2" reason="${3:-}"
+    local expr="SET #s = :v, ${st}_ts = :ts"
+    local now_iso vals
+    now_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    vals="{\":v\":{\"S\":\"${st}\"},\":ts\":{\"S\":\"${now_iso}\"},\":pend\":{\"S\":\"pending\"}"
+    if [ -n "${reason}" ]; then
+      expr="${expr}, fail_reason = :r"
+      vals="${vals},\":r\":{\"S\":\"${reason:0:1024}\"}"
+    fi
+    vals="${vals}}"
+    aws dynamodb update-item --region "${REGION}" \
+      --table-name "${ASSIGN_TABLE}" \
+      --key "{\"instance_id\":{\"S\":\"${INSTANCE_ID}\"},\"tenant_id\":{\"S\":\"${tid}\"}}" \
+      --update-expression "${expr}" \
+      --condition-expression "#s = :pend" \
+      --expression-attribute-names '{"#s":"status"}' \
+      --expression-attribute-values "${vals}" \
+      >/dev/null 2>&1 || true
+  }
+
+  # ── Launch a single VM (called in background as a semaphore job) ───────
+  _launch_one() {
+    local tid="$1" vm_num="$2" vcpu="$3" mem_mb="$4" chat_ep="$5"
+    local gw_token_ct="${6:-}" device_paired="${7:-}" restore_key="${8:-}"
+    local vm_path="${FAN_VM_DIR}/${tid}"
+    # Idempotent check: if vm.json already exists we treat this as an at-least-once
+    # duplicate delivery. host-agent's poll loop will still recover it if FC died.
+    if [ -f "${vm_path}/vm.json" ]; then
+      return 42  # sentinel: skipped
+    fi
+    # 13 positional args mirror the launch-vm.sh signature: config_template=$5,
+    # restore_backup_key=$6 (#199 — 缺则 launch 建空白盘=数据丢失,故必须透传),
+    # chat_ep=$10, position 11 (cognito, retired #187 P5) empty,
+    # gateway_token_ct=$12 (#187 P1), device_paired_b64=$13 (#188 wss 免 approve).
+    # config_template($5) 走 DDB tenants 记录(host-agent/launch-vm 自取),此处
+    # 空;restore_key($6) 从 assignment/manifest 透传。Empty 7-9 keep defaults.
+    # Secrets like vkey/channel_secret are still pulled from DDB by launch-vm.
+    # #256 — re-invoke 本脚本自己(bash "$0"):单租户位置参不含 --manifest/--from-ddb,
+    # 故落 dispatcher 后的单 VM 主体,不会递归回 fan_out_main。
+    # #266 — systemd-cat 包裹让每租户 launch 诊断进 journald(tag claw-launch)→
+    # Fluent Bit host.platform → AOS claw-logs-host,不再被 /dev/null 吞掉。fan-out
+    # 批量创建卡住时,console Logs viewer 才查得到某租户为何没起来。
+    systemd-cat -t claw-launch \
+      bash "$0" "${tid}" "${vm_num}" "${vcpu}" "${mem_mb}" \
+      "" "${restore_key}" "" "" "" "${chat_ep}" "" "${gw_token_ct}" "${device_paired}"
+    return $?
+  }
+
+  # ── Bounded-parallel fan-out (same job-count semaphore as start-all-vms.sh) ──
+  _wait_for_slot() {
+    while [ "$(jobs -rp | wc -l)" -ge "${MAX_PARALLEL}" ]; do
+      wait -n 2>/dev/null || sleep 0.2
+    done
+  }
+
+  # Aggregate results via a tempfile per child (bash can't return values across
+  # background jobs, and a single log file would race). Each _launch_one writes
+  # one word: "launched" | "skipped" | "failed" | "inprogress" into a result file.
+  RESULT_DIR="$(mktemp -d /tmp/oc-launch-all.XXXXXX)"
+
+  _dispatch_line() {
+    # Parse ONE JSON-line: {"t":"t-xxx","n":42,"c":2,"m":2048,"e":0[,"g":"<ct>","d":"<b64>"]}
+    # We use jq (present on host, same as start-all-vms.sh:59-61) — a stdlib
+    # sed regex here would break on any future field addition.
+    # g = gateway_token_ct (base64 KMS 密文, #187 P1); d = device_paired_b64
+    # (base64 paired.json, #188). 缺省空串 → launch-vm fail-open。
+    local line="$1" rfile="$2"
+    local tid vm_num vcpu mem_mb chat_ep gw_token_ct device_paired restore_key
+    tid=$(jq -r '.t // empty' <<<"${line}" 2>/dev/null)
+    vm_num=$(jq -r '.n // empty' <<<"${line}" 2>/dev/null)
+    vcpu=$(jq -r '.c // 2' <<<"${line}" 2>/dev/null)
+    mem_mb=$(jq -r '.m // 2048' <<<"${line}" 2>/dev/null)
+    chat_ep=$(jq -r '.e // 0' <<<"${line}" 2>/dev/null)
+    gw_token_ct=$(jq -r '.g // empty' <<<"${line}" 2>/dev/null)
+    device_paired=$(jq -r '.d // empty' <<<"${line}" 2>/dev/null)
+    # #199 — restore 意图(r=S3 backup key);空 → 普通建盘,非空 → launch 恢复该备份
+    restore_key=$(jq -r '.r // empty' <<<"${line}" 2>/dev/null)
+    if [ -z "${tid}" ] || [ -z "${vm_num}" ]; then
+      echo "failed" > "${rfile}"
+      _fo_log "parse-error line=${line}"
+      return
+    fi
+    _launch_one "${tid}" "${vm_num}" "${vcpu}" "${mem_mb}" "${chat_ep}" \
+      "${gw_token_ct}" "${device_paired}" "${restore_key}"
+    rc=$?
+    printf '%s' "${tid}" > "${rfile}.tid"  # v2 per-tenant report (see stdout JSON)
+    if [ "${rc}" -eq 0 ]; then
+      echo "launched" > "${rfile}"
+      [ "${FROM_DDB}" -eq 1 ] && _mark_assignment "${tid}" "done"
+    elif [ "${rc}" -eq 42 ]; then
+      echo "skipped" > "${rfile}"
+      [ "${FROM_DDB}" -eq 1 ] && _mark_assignment "${tid}" "done"
+    elif [ "${rc}" -eq 75 ]; then
+      # #256 — launch-vm.sh 抢 per-tenant flock 失败(另一进程正在起同租户)的 skip 哨兵。
+      # 关键:绝不 _mark_assignment done。持锁 winner 可能死在写 vm.json 之前(如 #199
+      # DDB get-item fail-closed exit 1),若这里把 assignment 标 done,它就从 pending 过滤
+      # 掉永不重投 + 无 vm.json 让 host-agent 本地恢复也没锚点 = 永久孤儿(no-data-loss)。
+      # 写 inprogress → 不进 v2 JSON 的 launched/skipped/failed 三清单(_result_list 只精确
+      # 匹配那三个)→ Poller 看不到 → assignment 保持 pending → 下一轮 dispatch 重新 pick。
+      echo "inprogress" > "${rfile}"
+      _fo_log "launch skip(flock held) tenant=${tid} rc=75 — 保持 pending 待重投"
+    else
+      echo "failed" > "${rfile}"
+      [ "${FROM_DDB}" -eq 1 ] && _mark_assignment "${tid}" "failed" "launch-vm rc=${rc}"
+      _fo_log "launch fail tenant=${tid} rc=${rc}"
+    fi
+  }
+
+  job_seq=0
+  if [ "${FROM_DDB}" -eq 1 ]; then
+    # ddb 载体:Query 本 host 全部 pending 行(数据在表,SSM 只叫醒)。零行可能是
+    # DDB 最终一致读窗口(BatchWrite 落 leader、replica 未追上,同区 lag 通常
+    # <100ms 但叫醒命令跑得更快),退避重试 2 次再 die;fail-loud 不静默 launch 0 个。
+    attempt=0
+    body=""
+    while [ "${attempt}" -lt 3 ]; do
+      body=$(_get_ddb_lines)
+      [ -n "${body}" ] && break
+      attempt=$((attempt + 1))
+      sleep "$(awk "BEGIN{print ${attempt} + (${RANDOM}%1000)/1000}")"
+    done
+    [ -n "${body}" ] || _fo_die "ddb source: zero pending assignments for ${INSTANCE_ID} after 3 tries (expected ~${PART_COUNT})"
+    while IFS= read -r line; do
+      [ -z "${line}" ] && continue
+      _wait_for_slot
+      rfile="${RESULT_DIR}/r-${job_seq}"
+      _dispatch_line "${line}" "${rfile}" &
+      job_seq=$((job_seq + 1))
+    done <<<"${body}"
+  else
+    part_idx=0
+    while [ "${part_idx}" -lt "${PART_COUNT}" ]; do
+      body=$(_get_part "${part_idx}") || _fo_die "part ${part_idx} unreadable after 3 retries"
+      while IFS= read -r line; do
+        [ -z "${line}" ] && continue
+        _wait_for_slot
+        rfile="${RESULT_DIR}/r-${job_seq}"
+        _dispatch_line "${line}" "${rfile}" &
+        job_seq=$((job_seq + 1))
+      done <<<"${body}"
+      part_idx=$((part_idx + 1))
+    done
+  fi
+
+  # Wait for the whole fan-out so the SSM exit status reflects reality.
+  wait
+
+  launched=0
+  skipped=0
+  failed=0
+  if [ -d "${RESULT_DIR}" ]; then
+    for f in "${RESULT_DIR}"/r-*; do
+      case "${f}" in *.tid) continue ;; esac  # 别把 .tid 附属文件数成 failed(真机第 6 bug)
+      [ -f "${f}" ] || continue
+      v=$(cat "${f}" 2>/dev/null || echo "failed")
+      case "${v}" in
+        launched)   launched=$((launched + 1)) ;;
+        skipped)    skipped=$((skipped + 1)) ;;
+        inprogress) ;;  # #256 flock skip:不计 launched/skipped/failed,不进 v2 清单,不触发批回滚(保持 pending 待重投)
+        *)          failed=$((failed + 1)) ;;
+      esac
+    done
+  fi
+
+  # Single-line JSON on stdout — Poller GetCommandInvocation parses this.
+  # v2: per-tenant result lists so the Poller can mark tenants running WITHOUT
+  # relying on tenants.dispatch_claim — the claim is deliberately volatile
+  # (released on retry paths to break the claim deadlock), so a visibility
+  # retry racing a still-running SSM command used to orphan the whole batch in
+  # `creating` forever (e2ev2-probe, 2026-07-05). The executor reporting WHO it
+  # launched is the only association that can't be cleared underneath us.
+  # Budget: 380 ids × ~20B ≈ 8KB < GetCommandInvocation's 24,000-char stdout cap.
+  # (_fo_log writes to stderr so it doesn't pollute the JSON contract.)
+  _result_list() {  # $1 = launched|skipped|failed → JSON array of tenant ids
+    local want="$1" out="" f v tid
+    for f in "${RESULT_DIR}"/r-*; do
+      case "${f}" in *.tid) continue ;; esac  # .tid 是附属文件,不是结果
+      [ -f "${f}" ] || continue
+      v=$(cat "${f}" 2>/dev/null || echo "failed")
+      tid=$(cat "${f}.tid" 2>/dev/null || echo "")
+      [ "${v}" = "${want}" ] && [ -n "${tid}" ] && out="${out}\"${tid}\","
+    done
+    printf '[%s]' "${out%,}"
+  }
+  printf '{"v":2,"launched":%d,"skipped":%d,"failed":%d,"host":"%s","command_id":"%s","tenants":{"launched":%s,"skipped":%s,"failed":%s}}\n' \
+    "${launched}" "${skipped}" "${failed}" "${INSTANCE_ID}" "${COMMAND_ID}" \
+    "$(_result_list launched)" "$(_result_list skipped)" "$(_result_list failed)"
+
+  _fo_log "DONE launched=${launched} skipped=${skipped} failed=${failed}"
+  # 函数末尾显式清理 RESULT_DIR(不用 EXIT trap:避免与单 VM 主体 line ~ 的 trap ... EXIT 冲突;
+  # _fo_die 里也已各自清理)。
+  rm -rf "${RESULT_DIR}" 2>/dev/null || true
+  # Exit non-zero if any launch failed so the Poller can classify the batch as
+  # partial/failed and roll back CAS + dispatch_retries+=1 per the contract.
+  if [ "${failed}" -gt 0 ]; then
+    return 1
+  fi
+  return 0
+}
+case "${1:-}" in
+  --manifest|--from-ddb)
+    fan_out_main "$@"
+    exit $?
+    ;;
+esac
 # 1.3.2: trap any non-zero exit so we know which line failed even when
 # stdout gets truncated by SSM's 8KB output limit. NOTE: do NOT pkill
 # firecracker — once InstanceStart succeeds, the VM is genuinely up and
@@ -50,6 +354,21 @@ _oc_cleanup_on_err() {
 trap _oc_cleanup_on_err ERR EXIT
 TENANT_ID="${1:?Usage: launch-vm.sh <tenant_id> <vm_num> [vcpu] [mem_mb] [config_template] [restore_backup_key] [scoped_skills]}"
 VM_NUM="${2:?Usage: launch-vm.sh <tenant_id> <vm_num> [vcpu] [mem_mb] [config_template] [restore_backup_key] [scoped_skills]}"
+# #256 — per-tenant 跨进程互斥(kubelet per-pod worker 的跨进程等价物)。
+# launch-vm.sh 有多类并发调用者:fan-out(bash 子进程)/host-agent recover(Popen)/
+# ssm wake/scaler/health failover(独立 SSM 进程)。Python 的 _recovering/_dispatch_inflight
+# 是进程内 set,跨不过 bash 和 SSM 那几类进程。flock 是 inode advisory 锁,跨语言/跨进程
+# 有效,内核在持锁 fd 关闭时自动释放(正常退出/SIGKILL/OOM/断电都释放),锁永不泄漏
+# (残留是 0 字节锁文件,/run/lock tmpfs 重启清,无死锁)。
+# 必须在 SOCK/TAP(下面)定义之前:此时 TAP/SOCK/MOUNT_TMP 全未定义,抢锁失败的 loser
+# 退出即使跑 EXIT trap 也是 no-op,绝不会 ip link del 掉 winner 正在用的同名 tap-vm${VM_NUM}。
+# 抢不到锁 → exit 75(skip 专用哨兵,绝不 0/42):launch-all 映射成 inprogress、保持
+# assignment pending、不计 launched、不 _mark_assignment done(否则持锁 winner 若死在写
+# vm.json 之前,assignment 被标 done + 无 vm.json = 永久孤儿,踩 no-data-loss)。
+# 先 trap - ERR EXIT 再退,避免良性 skip 触发 _oc_cleanup_on_err 刷一条误导性 FAIL 日志。
+mkdir -p /run/lock 2>/dev/null || true
+exec 9>"/run/lock/oc-launch-${TENANT_ID}.lock"
+flock -n 9 || { trap - ERR EXIT; echo "[oc:launch] ${TENANT_ID} launch already in progress (flock held) — skip" >&2; exit 75; }
 VCPU="${3:-2}"
 MEM_MB="${4:-4096}"
 CONFIG_TEMPLATE="${5:-}"
@@ -76,7 +395,7 @@ INJECTED_CHANNEL_SECRET="${9:-}"
 # chat_endpoint_enabled (10th arg) — per-tenant switch for the OpenAI-compatible
 # gateway.http.endpoints.chatCompletions endpoint. DEFAULT OFF (empty / "0" /
 # "false"): we keep deleting the endpoint (OpenClaw's secure default + this
-# fork's policy — see the del() below and project docs on why chatCompletions cannot be
+# fork's policy — see the del() below and the ops guide "chatCompletions 为什么不能
 # 全局默认开"). Only when the API Lambda passes "1"/"true" (the tenant record's
 # chat_endpoint_enabled flag) do we inject enabled:true for THAT tenant. Mitigations
 # stay regardless: per-tenant gateway.auth.token + CloudFront/nginx reverse proxy +
@@ -86,13 +405,13 @@ CHAT_EP_ENABLED="${10:-}"
 # Cognito 渠道机器用户 base64)。channel/hub 数据面已下线,数据面走两级路由直连
 # microVM:18789 gateway。参数位保留以维持 12 位对齐,取值不再使用。
 INJECTED_COGNITO_B64="${11:-}"
-# #187 P1 (SPEC/the data-plane refactor D+B): 12th positional arg — base64 KMS
+# #187 P1 (the data-plane design D+B): 12th positional arg — base64 KMS
 # ciphertext of the pre-minted gateway token (tenant_id EncryptionContext, ClawPool
 # CMK). Empty (legacy SSM commands / feature off) → keep the openssl-generated
 # in-VM token. Non-empty → we `aws kms decrypt` here on the host (has kms:Decrypt
 # on the ClawPool CMK), inject the plaintext as `.gateway.auth.token`, replacing
 # the openssl one. This closes the "control plane can't reveal the gateway token"
-# gap that hub → gateway direct-connect (the data-plane refactor) needs. Reveal window
+# gap that hub → gateway direct-connect (the data-plane design) needs. Reveal window
 # is enforced control-side (openclaw-tenant-secrets TTL 15min); this side is just
 # the injection step.
 INJECTED_GATEWAY_TOKEN_CT="${12:-}"
@@ -323,6 +642,13 @@ log "disks ready ($((SECONDS-T0))s)"
 SHARED_SKILLS="/data/shared-skills"
 MOUNT_TMP="/tmp/data-mount-${TENANT_ID}"
 mkdir -p ${MOUNT_TMP}
+# #256 — 入口幂等预清理:上次 attempt 被强杀(SIGKILL/OOM/host 重启)在 trap 兜底跑之前
+# 就死了会泄漏这个挂载点,下次进来直接撞 "already mounted" 卡死。这里 mount 前先卸残留。
+# 用 plain umount(不用 -l 惰性):此刻已持有 per-tenant flock(见上,是本租户唯一 owner),
+# 残留必来自被 SIGKILL 的死进程(无活写者),plain umount 必成功;若 busy(有意外活写者)
+# = 违反不变量,让 set -e fail-loud 中止 + 调度重试,绝不 lazy-detach-then-remount
+# (那会让活写者继续写旧挂载 + remount 双挂同一 backing file → ext4 损坏,踩 no-data-loss)。
+mountpoint -q "${MOUNT_TMP}" && sudo umount "${MOUNT_TMP}"
 sudo mount ${DATA_VOL} ${MOUNT_TMP}
 # Skills (1.4.0 #62: optional per-tenant scope via $SCOPED_SKILLS comma-list)
 if [ -d "${SHARED_SKILLS}" ] && [ "$(ls -A ${SHARED_SKILLS} 2>/dev/null)" ]; then
@@ -484,7 +810,7 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
     # tenant_id EncryptionContext), decrypt it here on the host and use THAT as
     # NEW_TOKEN, overriding the openssl rand above. Rationale:
     #   • Control plane needs `GET /tenants/{id}/token` reveal for direct-gateway
-    #     data plane (the data-plane refactor): only pre-minted tokens can be revealed.
+    #     data plane (the data-plane design): only pre-minted tokens can be revealed.
     #   • openssl rand stays as the FEATURE-OFF fallback (byte-identical old path
     #     for un-migrated deployments; no CMK → no ciphertext → no override).
     # Fail-closed: ciphertext present but decrypt fails (EC mismatch, no perm,
@@ -693,6 +1019,9 @@ if [ -n "${_CREDS_ENV:-}" ] && [ -s "${_CREDS_ENV}" ]; then
   mkfs.ext4 -q -L clawcreds "${CREDS_VOL}"
   _CREDS_MNT="/tmp/creds-mount-${TENANT_ID}"
   mkdir -p "${_CREDS_MNT}"
+  # #256 — 同 data 盘:入口幂等预清理上次强杀泄漏的挂载点。持锁后残留必是死进程,
+  # plain umount(不用 -l)必成;busy 则 fail-loud 中止,绝不 lazy-detach 致双挂损坏。
+  mountpoint -q "${_CREDS_MNT}" && sudo umount "${_CREDS_MNT}"
   sudo mount "${CREDS_VOL}" "${_CREDS_MNT}"
   sudo cp "${_CREDS_ENV}" "${_CREDS_MNT}/.env"
   sudo chmod 600 "${_CREDS_MNT}/.env"

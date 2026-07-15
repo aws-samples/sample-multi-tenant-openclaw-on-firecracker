@@ -4,6 +4,7 @@ handler-split #132 T1.8 —— 从 handler.py 逐字搬迁,行为零改动。
 依赖方向:services → core(clients/utils),不反向 import handler。
 这些是零鉴权的纯读聚合端点(鉴权在 lambda_handler 的 RBAC 前置闸完成)。
 """
+
 import os
 
 from core.clients import s3, tenants_table
@@ -11,7 +12,10 @@ from core.utils import _resp
 
 
 def list_backups(tenant_id):
-    bucket = os.environ.get("ASSETS_BUCKET", "")
+    # backup 写在专用桶 BACKUP_BUCKET(-v3 后缀,WORM+CMK);回落 ASSETS_BUCKET 仅为兼容
+    # 旧单桶部署。读错桶会列空(真机踩过:backup 在 S3 但 API 列不出)。与 tenant_service
+    # ._resolve_backup 同源——restore 侧已修此桶,listing 侧此前遗漏。
+    bucket = os.environ.get("BACKUP_BUCKET") or os.environ.get("ASSETS_BUCKET", "")
     prefix = os.environ.get("BACKUP_PREFIX", "backups")
     resp = s3.list_objects_v2(Bucket=bucket, Prefix=f"{prefix}/{tenant_id}/")
     backups = []
@@ -29,7 +33,8 @@ def list_backups(tenant_id):
 
 def list_all_backups():
     """List all backups across all tenants, left-joined with tenants table to mark orphans."""
-    bucket = os.environ.get("ASSETS_BUCKET", "")
+    # 同 list_backups:backup 在专用桶 BACKUP_BUCKET,回落 ASSETS_BUCKET 兼容旧部署。
+    bucket = os.environ.get("BACKUP_BUCKET") or os.environ.get("ASSETS_BUCKET", "")
     prefix = os.environ.get("BACKUP_PREFIX", "backups")
 
     # Build tenant_id → (name, exists) map from DDB (include soft-deleted for name resolution)

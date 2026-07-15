@@ -39,5 +39,7 @@ function app() {
     window.ocEdge,
     window.ocAudit,
     window.ocTraces,
+    window.ocLogs,
+    window.ocRsa,
   );
 }

@@ -479,7 +479,7 @@ def _send_ssm_manifest(
             TimeoutSeconds=120,  # invocation delivery
             Parameters={
                 "commands": [
-                    f"bash /home/ubuntu/launch-all-vms.sh {command_id} {part_count} {parallel} "
+                    f"bash /home/ubuntu/launch-vm.sh --manifest {command_id} {part_count} {parallel} "
                     f"{clients.DISPATCH_PARAM_PREFIX}"
                 ],
                 "executionTimeout": [str(exec_timeout)],
@@ -511,7 +511,7 @@ def _send_ssm_from_ddb(
             TimeoutSeconds=120,
             Parameters={
                 "commands": [
-                    f"bash /home/ubuntu/launch-all-vms.sh --from-ddb {command_id} "
+                    f"bash /home/ubuntu/launch-vm.sh --from-ddb {command_id} "
                     f"{batch_size} {parallel} {clients.assignments_table.table_name}"
                 ],
                 "executionTimeout": [str(exec_timeout)],
@@ -772,10 +772,23 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     _release_claims([msg_to_tid[m] for m in dedup if m in msg_to_tid], command_id)
     # #141 — batch-level fail-loud summary: 一眼看清本次 invoke 收敛多少/回退多少,
     # 不用 grep per-tenant 行。dedup 非空 = 有租户回队列重投(超预算才最终进 DLQ)。
+    # #256 — 全链路可观测:打出本批 won 的**全部** tenant_id(不截断、不丢),让"按任意租户
+    # grep 一键追全链路"成立(原来只记 command_id,tid→command_id 关联断在 dispatch 段,追踪
+    # 要中转 SSM/assignments)。**分批写入**:每 50 个 tid 一条日志行(带 [i/n] 序号),既不丢
+    # 任何 tid,又不把 380/批挤成一条巨长难读/易被下游截断的行。summary 行先出总数。
+    _won_tids = [w["tenant_id"] for w in winners]
     print(
         f"[dispatch] batch done cmd={command_id}: "
         f"won={len(winners)} requeued={len(dedup)}"
     )
+    _CHUNK = 50
+    _total_chunks = (len(_won_tids) + _CHUNK - 1) // _CHUNK
+    for _i in range(0, len(_won_tids), _CHUNK):
+        _part = _i // _CHUNK + 1
+        _chunk = ",".join(_won_tids[_i : _i + _CHUNK])
+        print(
+            f"[dispatch] tenants cmd={command_id} [{_part}/{_total_chunks}]=[{_chunk}]"
+        )
     return {"batchItemFailures": [{"itemIdentifier": m} for m in dedup]}
 
 

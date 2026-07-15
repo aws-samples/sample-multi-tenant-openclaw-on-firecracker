@@ -5,14 +5,16 @@ import aws_cdk as cdk
 from aws_cdk import (
     aws_lambda as _lambda,
     aws_iam as iam,
+    aws_ec2 as ec2,
     aws_elasticloadbalancingv2 as elbv2,
     aws_elasticloadbalancingv2_actions as elbv2_actions,
     aws_elasticloadbalancingv2_targets as elbv2_targets,
     aws_cognito as cognito,
-    aws_logs as logs,
     custom_resources as cr,
     Duration,
 )
+
+from stacks._bff_cidr import collect_bff_ingress_cidrs
 
 
 def build_auth(self, ctx):
@@ -29,29 +31,6 @@ def build_auth(self, ctx):
     listener = getattr(ctx, "listener", None)
     m = getattr(ctx, "m", None)
     vpc = getattr(ctx, "vpc", None)
-    # #212 R2 ALB 拆分:BFF authenticate-cognito rule 挂内网 ALB(拆分开)或
-    # 公网 DashboardALB(拆分关,现状)。console_alb_listener 由 ha_edge 建 :443 HTTPS 时提供。
-    console_alb = getattr(ctx, "console_alb", None)
-    console_alb_listener = getattr(ctx, "console_alb_listener", None)
-    _alb_split_enabled = bool(getattr(ctx, "_alb_split_enabled", False))
-    # R15.2:BFF 读 SecureString shared-vkey 需 kms:Decrypt clawpool CMK
-    # (仅 security.clawpool_cmk_enabled=true 时存在,同 lambdas.py/litellm.py pattern)。
-    clawpool_cmk = getattr(ctx, "clawpool_cmk", None)
-
-    # ── Observability: X-Ray tracing + log retention (same gate as lambdas.py) ──
-    _obs_cfg = CFG.get("observability", {}) or {}
-    _tracing_mode = (
-        _lambda.Tracing.ACTIVE
-        if _obs_cfg.get("tracing_enabled", True)
-        else _lambda.Tracing.PASS_THROUGH
-    )
-    _log_retention_days = int(_obs_cfg.get("log_retention_days", 30))
-    _log_retention = {
-        7: logs.RetentionDays.ONE_WEEK,
-        30: logs.RetentionDays.ONE_MONTH,
-        90: logs.RetentionDays.THREE_MONTHS,
-        365: logs.RetentionDays.ONE_YEAR,
-    }.get(_log_retention_days, logs.RetentionDays.ONE_MONTH)
 
     # ========== Console Auth (Cognito) ==========
     auth_cfg = CFG.get("console_auth", {})
@@ -204,13 +183,6 @@ def build_auth(self, ctx):
                     code=_lambda.Code.from_asset("deploy/lambda/pretokengen"),
                     timeout=Duration.seconds(5),
                     memory_size=2048,
-                    tracing=_tracing_mode,
-                    log_group=logs.LogGroup(
-                        self,
-                        "PreTokenGenLogGroup",
-                        log_group_name="/aws/lambda/openclaw-pretokengen",
-                        retention=_log_retention,
-                    ),
                 )
                 _ptg_fn.add_permission(
                     "CognitoInvoke",
@@ -227,13 +199,6 @@ def build_auth(self, ctx):
                     code=_lambda.Code.from_asset("deploy/lambda/ptg_attach"),
                     timeout=Duration.seconds(30),
                     memory_size=2048,
-                    tracing=_tracing_mode,
-                    log_group=logs.LogGroup(
-                        self,
-                        "PtgAttachLogGroup",
-                        log_group_name="/aws/lambda/openclaw-ptg-attach",
-                        retention=_log_retention,
-                    ),
                 )
                 _ptg_attach_fn.add_to_role_policy(
                     iam.PolicyStatement(
@@ -327,13 +292,6 @@ def build_auth(self, ctx):
                     code=_lambda.Code.from_asset("deploy/lambda/pretokengen"),
                     timeout=Duration.seconds(5),
                     memory_size=2048,
-                    tracing=_tracing_mode,
-                    log_group=logs.LogGroup(
-                        self,
-                        "PreTokenGenLogGroup",
-                        log_group_name="/aws/lambda/openclaw-pretokengen",
-                        retention=_log_retention,
-                    ),
                 )
             user_pool = cognito.UserPool(
                 self,
@@ -455,28 +413,76 @@ def build_auth(self, ctx):
             )
 
         # ── Task 9.2 (#149): Console BFF — 前端零 key ──────────────────
-        # PoC 已真机验证(an internal PoC):BFF Lambda
+        # PoC 已真机验证(engineering/security/clawconsole-bff-poc):BFF Lambda
         # 托管 console 静态文件 + /capi/* 后端代持 admin key(浏览器全程零真 key),
         # 登录门在 ALB authenticate-cognito(未登录 302 Cognito Hosted UI)。
-        # #229: BFF 增加 /capi/obs-config 只读端点回显 ADOT + Fluent Bit 当前
-        # S3 配置版本;IAM 只授 s3:GetObject on deployment/observability/*(无写)。
-        _assets_bucket = getattr(ctx, "assets_bucket", None)
-        # #212 R1.5:api.mode=private/both 时 BFF 需进 VPC 私有子网(fetch VPCE DNS)。
-        # 默认 mode=edge → 不进 VPC(现状,零冷启惩罚)。BFF ENI 首建 Hyperplane 分钟级,
-        # 复用后可控;控制台低频流量可接受(spec design.md 2)。
-        from aws_cdk import aws_ec2 as _ec2
-
-        _api_mode_for_bff = str(getattr(ctx, "_api_mode", "edge") or "edge").lower()
-        _bff_in_vpc = _api_mode_for_bff in ("private", "both")
-        _bff_kwargs = {}
-        if _bff_in_vpc:
-            _bff_kwargs["vpc"] = vpc
-            _bff_kwargs["vpc_subnets"] = _ec2.SubnetSelection(
-                subnet_type=_ec2.SubnetType.PRIVATE_WITH_EGRESS
+        # #217 — CTRL_API_KEY 部署时自动注入,根治"全量 deploy 后成占位符 → /capi 全 403"。
+        # APIGW 随机生成的 admin key 明文 value 在 CFN 里 GetAtt 取不到(只有 id),故用
+        # AwsCustomResource 部署时调 getApiKey(includeValue) 捞真值,再喂进 BFF env。
+        # 全程在 cdk deploy 内闭环,不靠 setup.sh、不靠人手,裸 cdk deploy 也覆盖、幂等
+        # (#250 的 setup.sh 部署后注入是带外兜底,与此互补;此处让 CDK 自身也自洽)。
+        # data_hidden("value"):真 key 不落 custom-resource 的 CloudWatch 日志。
+        # IAM 限这一把 key 的 ARN(apigateway:GET,最小权限)。
+        _admin_key = getattr(ctx, "api_key", None)
+        _ctrl_key_value = "PLACEHOLDER_INJECT_AT_DEPLOY"
+        if _admin_key is not None:
+            _key_arn = (
+                f"arn:{self.partition}:apigateway:{self.region}::"
+                f"/apikeys/{_admin_key.key_id}"
             )
-        _ctrl_api_base = (
-            f"https://{api.rest_api_id}.execute-api.{self.region}.amazonaws.com/v1"
+            _get_key = cr.AwsSdkCall(
+                service="APIGateway",
+                action="getApiKey",
+                parameters={"apiKey": _admin_key.key_id, "includeValue": True},
+                physical_resource_id=cr.PhysicalResourceId.of(
+                    f"ctrl-api-key-value-{_admin_key.key_id}"
+                ),
+                output_paths=["value"],
+                # 真 key 不落 custom-resource 的 CloudWatch 日志(隐藏响应数据)。
+                logging=cr.Logging.with_data_hidden(),
+            )
+            _ctrl_key_cr = cr.AwsCustomResource(
+                self,
+                "CtrlApiKeyValue",
+                on_create=_get_key,
+                on_update=_get_key,
+                install_latest_aws_sdk=False,
+                policy=cr.AwsCustomResourcePolicy.from_statements(
+                    [
+                        iam.PolicyStatement(
+                            actions=["apigateway:GET"], resources=[_key_arn]
+                        )
+                    ]
+                ),
+            )
+            _ctrl_key_cr.node.add_dependency(_admin_key)
+            _ctrl_key_value = _ctrl_key_cr.get_response_field("value")
+        # #266 — 当 logging.enabled 时 BFF 进 VPC,才够得着 VPC-only 的 AOS 域查
+        # vm/host 日志(observability.py 回填 AOS_ENDPOINT/AOS_SECRET_ARN + SG 入站)。
+        # VPC 内经现有 3 NAT 出公网,control-plane API / Cognito / SSM / CloudWatch
+        # 调用不断。private_dns 的 execute-api VPCE 只在 api.mode=private/both 建
+        # (network_vpc.py:83),edge 模式(默认)不劫持 DNS,/capi 公网代理照走。
+        _bff_in_vpc = (
+            bool((CFG.get("logging", {}) or {}).get("enabled", False))
+            and vpc is not None
         )
+        _bff_vpc_kwargs = {}
+        _bff_sg = None
+        if _bff_in_vpc:
+            _bff_sg = ec2.SecurityGroup(
+                self,
+                "ConsoleBffSg",
+                vpc=vpc,
+                description="console BFF Lambda ENIs - egress only (NAT + AOS 443)",
+                allow_all_outbound=True,
+            )
+            _bff_vpc_kwargs = {
+                "vpc": vpc,
+                "vpc_subnets": ec2.SubnetSelection(
+                    subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
+                ),
+                "security_groups": [_bff_sg],
+            }
         console_bff_fn = _lambda.Function(
             self,
             "ConsoleBFF",
@@ -487,100 +493,98 @@ def build_auth(self, ctx):
             code=_lambda.Code.from_asset("deploy/console-bff"),
             timeout=Duration.seconds(30),
             memory_size=2048,
-            tracing=_tracing_mode,
-            log_group=logs.LogGroup(
-                self,
-                "ConsoleBffLogGroup",
-                log_group_name="/aws/lambda/openclaw-console-bff",
-                retention=_log_retention,
-            ),
+            **_bff_vpc_kwargs,
             environment={
-                # mode=private 下客户走 VPCE DNS(<api-id>-<vpce-id>.execute-api...);
-                # 但 vpce_id 是 network_vpc token 无法字符串拼接进 env,由 setup.sh 部署后
-                # 用 aws lambda update-function-configuration 注入实际 VPCE DNS 覆盖此值。
-                # 默认 mode=edge 时此值即公网 execute-api,BFF 出 NAT 通过公网访问。
-                "CTRL_API_BASE": _ctrl_api_base,
-                # 真 key 不进 IaC/模板:部署后由 setup.sh 注入(同 config.js 旧路径)。
-                "CTRL_API_KEY": "PLACEHOLDER_INJECT_AT_DEPLOY",
-                # #229: 观测配置只读桶(handler.mjs handleObsConfig 拉这个)。
-                "OBS_ASSETS_BUCKET": _assets_bucket.bucket_name
-                if _assets_bucket
-                else "",
-                "API_MODE": _api_mode_for_bff,
+                "CTRL_API_BASE": f"https://{api.rest_api_id}.execute-api.{self.region}.amazonaws.com/v1",
+                # #217 — 部署时由 CtrlApiKeyValue custom resource 捞真值注入(见上)。
+                # api_key 不可用时(理论上不会)回落占位符,行为同旧。
+                "CTRL_API_KEY": _ctrl_key_value,
+                # #217 — BFF 用 token username 查 Cognito 组得真实角色(ALB x-amzn-oidc-data
+                # 不含 cognito:groups)。注入 pool id 供 AdminListGroupsForUser。空 → roleForUser
+                # 回落 viewer(canWrite 全 false → 写操作入口全隐藏)。rebase 曾丢过此行(#209
+                # docs 提交把 auth.py 回退掉),导致 console 全员降级 viewer、Pull 按钮消失。
+                "USER_POOL_ID": cognito_outputs.get("CognitoUserPoolId", ""),
             },
-            **_bff_kwargs,
         )
-        # #221 — trace viewer read-only X-Ray query APIs. Spec R6.3 / F7:
-        # exactly four read actions; X-Ray read APIs are not resource-scopable,
-        # so Resource = "*" is the tightest possible policy. No write action
-        # is granted — the console viewer is read-only.
+        # #217 — BFF 查用户组以判角色(canWrite 门控):ALB OIDC token 不带 groups,
+        # 用 username 调 AdminListGroupsForUser。只读该动作,资源限本 user pool。
+        console_bff_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["cognito-idp:AdminListGroupsForUser"],
+                resources=[user_pool.user_pool_arn],
+            )
+        )
+        # #264 — BFF 系统默认值面板(GET/POST /capi/system/defaults, handler.mjs:425/460)
+        # 读写这 4 个 /openclaw/ SSM 参数;role 原来只有 cognito 一条 → 生产全 AccessDenied
+        # (真机实测 /capi/system/defaults + /capi/traces 全挂,热补后 200)。资源限 /openclaw/
+        # 前缀非整账户通配。
+        console_bff_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["ssm:GetParameter", "ssm:GetParameters", "ssm:PutParameter"],
+                resources=[
+                    f"arn:{self.partition}:ssm:{self.region}:{self.account}:parameter/openclaw/*"
+                ],
+            )
+        )
+        # SecureString(litellm-shared-vkey)用 aws/ssm 托管 key,WithDecryption 需 kms:Decrypt。
+        # 用 ViaService condition 限定只经 SSM 服务解密(最小权限,不必知道托管 key 的 key id)。
+        console_bff_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey"],
+                resources=["*"],
+                conditions={
+                    "StringEquals": {
+                        "kms:ViaService": f"ssm.{self.region}.amazonaws.com"
+                    }
+                },
+            )
+        )
+        # trace viewer(GET /capi/traces{,/detail,/map}, traces.mjs)。X-Ray 读 API 不支持
+        # 资源级,Resource=* 是最小权限例外。
         console_bff_fn.add_to_role_policy(
             iam.PolicyStatement(
                 actions=[
                     "xray:GetTraceSummaries",
                     "xray:BatchGetTraces",
                     "xray:GetServiceGraph",
-                    "xray:GetTraceGraph",
                 ],
                 resources=["*"],
             )
         )
-        # #229: 只读授权 —— s3:GetObject 限 deployment/observability/* 前缀。
-        # 不给 s3:PutObject/DeleteObject(写下发端点未实现,安全红线留人工)。
-        if _assets_bucket is not None:
-            console_bff_fn.add_to_role_policy(
-                iam.PolicyStatement(
-                    actions=["s3:GetObject"],
-                    resources=[
-                        f"{_assets_bucket.bucket_arn}/deployment/observability/*"
-                    ],
-                )
-            )
-        # construct id 带 "V2":BFF 早期部署把这个 TG 挂在独立的 ConsoleBffALB 上,
-        # 后来改挂共享的 DashboardALB。一个 target group 只能属于一个 ALB,CFN 在单次
-        # 部署里没法把同一个物理 TG 从旧 ALB 迁到新 ALB(会报 ServiceLimitExceeded:
-        # "target group cannot be associated with more than one load balancer")。
-        # 换 construct id → CFN 建全新 TG 挂 DashboardALB、旧 TG 随旧 ALB 一起删,
-        # 迁移一次过、且此后幂等。
-        # R15.2:BFF 直读 SSM 默认值(litellm-host/shared-vkey/config-template/
-        # rootfs-manifest-version)供 console 一屏可查+可下发。IAM 限四个具名参数,
-        # 不给通配。SecureString(shared-vkey)读要 host role 能 Decrypt 的 CMK →
-        # BFF 也要 kms:Decrypt 该 CMK(仅 clawpool_cmk_enabled 开时存在)。
-        _ssm_defaults = [
-            f"arn:aws:ssm:{self.region}:{self.account}:parameter/openclaw/litellm-host",
-            f"arn:aws:ssm:{self.region}:{self.account}:parameter/openclaw/litellm-shared-vkey",
-            f"arn:aws:ssm:{self.region}:{self.account}:parameter/openclaw/config-template",
-            f"arn:aws:ssm:{self.region}:{self.account}:parameter/openclaw/rootfs-manifest-version",
-        ]
+        # #266 — per-tenant Lambda log viewer(GET /capi/logs?source=lambda, logs.mjs)
+        # 走 CloudWatch Logs Insights,按 tenant_id 过滤 /aws/lambda/openclaw-* 日志组。
+        # StartQuery/GetQueryResults 是账户级异步查询 API(不支持资源级授权);
+        # DescribeLogGroups 按前缀解析日志组名。Resource=* 是这类 API 的最小权限例外。
         console_bff_fn.add_to_role_policy(
             iam.PolicyStatement(
-                actions=["ssm:GetParameters", "ssm:PutParameter"],
-                resources=_ssm_defaults,
+                actions=[
+                    "logs:StartQuery",
+                    "logs:GetQueryResults",
+                    "logs:StopQuery",
+                    "logs:DescribeLogGroups",
+                ],
+                resources=["*"],
             )
         )
-        if clawpool_cmk is not None:
-            clawpool_cmk.grant_encrypt_decrypt(console_bff_fn.grant_principal)
-
+        # #266 — 把 BFF fn / SG / in-vpc 标记挂 ctx,build_observability 回填 AOS
+        # (vm/host 日志)端点 + secret 读权限 + AOS SG 入站(auth 先于 observability
+        # 运行,AOS 域此刻还没建,故 AOS 相关接线延到那边做)。
+        ctx.console_bff_fn = console_bff_fn
+        ctx.console_bff_sg = _bff_sg
+        ctx.console_bff_in_vpc = _bff_in_vpc
         console_bff_tg = elbv2.ApplicationTargetGroup(
             self,
-            "ConsoleBffTGV2",
+            "ConsoleBffTG",
             target_type=elbv2.TargetType.LAMBDA,
             targets=[elbv2_targets.LambdaTarget(console_bff_fn)],
         )
         # authenticate-cognito 只能挂 HTTPS listener,且要求带 secret 的 app
         # client(现有 ConsoleClient 是 generate_secret=False,不能复用)。
-        # #212 R2:拆分开(alb_split.enabled=true) → 挂内网 ALB(ha_edge 已建 :443 listener);
-        # 拆分关 → 挂公网 DashboardALB(现状,由 auth_cfg.bff_certificate_arn 起 :443)。
+        # DashboardALB 目前只有 :80(TLS 在 CloudFront 终结),所以 HTTPS
+        # listener + 认证规则由 config 提供的【区域内】ACM 证书门控。
         _bff_cert_arn = auth_cfg.get("bff_certificate_arn", "")
-        # 决定挂哪个 ALB / listener。拆分时优先内网 ALB(已由 ha_edge 建好 :443 with cert)。
-        _use_split = (
-            _alb_split_enabled
-            and console_alb is not None
-            and console_alb_listener is not None
-        )
-        _target_alb = console_alb if _use_split else alb
-        if _use_split or _bff_cert_arn:
-            _bff_host = auth_cfg.get("bff_domain") or _target_alb.load_balancer_dns_name
+        if _bff_cert_arn:
+            _bff_host = auth_cfg.get("bff_domain") or alb.load_balancer_dns_name
             _bff_client = user_pool.add_client(
                 "ConsoleBffClient",
                 generate_secret=True,  # ALB authenticate-cognito 硬要求
@@ -590,19 +594,15 @@ def build_auth(self, ctx):
                     callback_urls=[f"https://{_bff_host}/oauth2/idpresponse"],
                 ),
             )
-            if _use_split:
-                # 内网 ALB 的 :443 listener 由 ha_edge 建好(alb_split.console_alb_certificate_arn 提供的证书)。
-                _bff_https = console_alb_listener
-            else:
-                _bff_https = alb.add_listener(
-                    "BffHTTPS",
-                    port=443,
-                    open=False,  # 同 :80 红线:绝不自动开 0.0.0.0/0
-                    certificates=[elbv2.ListenerCertificate.from_arn(_bff_cert_arn)],
-                    default_action=elbv2.ListenerAction.fixed_response(
-                        404, content_type="text/plain", message_body="not found"
-                    ),
-                )
+            _bff_https = alb.add_listener(
+                "BffHTTPS",
+                port=443,
+                open=False,  # 同 :80 红线:绝不自动开 0.0.0.0/0
+                certificates=[elbv2.ListenerCertificate.from_arn(_bff_cert_arn)],
+                default_action=elbv2.ListenerAction.fixed_response(
+                    404, content_type="text/plain", message_body="not found"
+                ),
+            )
             _bff_https.add_action(
                 "ConsoleBffAuth",
                 priority=10,
@@ -617,20 +617,20 @@ def build_auth(self, ctx):
                         "ConsoleBffDomainRef",
                         cognito_outputs["CognitoDomain"].split(".")[0],
                     ),
-                    session_timeout=Duration.seconds(1800),
                     next=elbv2.ListenerAction.forward([console_bff_tg]),
                 ),
             )
-            # Logout + 审计需要 Cognito 坐标(#212 MR2)
-            console_bff_fn.add_environment(
-                "COGNITO_DOMAIN", cognito_outputs["CognitoDomain"]
-            )
-            console_bff_fn.add_environment(
-                "COGNITO_CLIENT_ID", _bff_client.user_pool_client_id
-            )
-            console_bff_fn.add_environment(
-                "BFF_LOGOUT_URI", f"https://{_bff_host}/console/"
-            )
+            # #255 — 建了 443 门必须给 ALB SG 补 443 入站白名单,否则门建了墙上没开
+            # 洞、443 全超时(真机实测:手工建 443 listener 后仍需手动加 SG 才通)。
+            # 白名单从 config console_auth.bff_ingress_cidrs 读(逗号分隔 CIDR),默认空
+            # = 不开 443 入站(fail-safe)。绝不放 0.0.0.0/0(AWS 暴露红线);运营员
+            # 填自家办公/VPN CIDR。校验(含 0.0.0.0/0 fail-loud)抽到 _bff_cidr(纯 stdlib,
+            # 可脱离 CDK synth 单测,守暴露红线不变量)。
+            for _c in collect_bff_ingress_cidrs(auth_cfg.get("bff_ingress_cidrs")):
+                _bff_https.connections.allow_default_port_from(
+                    ec2.Peer.ipv4(_c),
+                    "console BFF 443 ingress allowlist (no 0.0.0.0/0, #255)",
+                )
         # TODO(#149): 未配 bff_certificate_arn 时无 HTTPS listener,BFF Lambda
         # + TG 已就位但不接流量;补一张区域内 ACM 证书(config console_auth.
         # bff_certificate_arn)即接通。别把认证规则挂 :80(明文回传 session
@@ -646,8 +646,3 @@ def build_auth(self, ctx):
 
     # --- Pack onto ctx ---
     ctx.cognito_outputs = locals().get("cognito_outputs")
-    # #220 (R9): expose runtime Lambdas so build_alarms can wire per-function
-    # Errors/Throttles alarms. _ptg_attach_fn is a one-shot custom resource on
-    # deploy — skipped intentionally.
-    ctx.console_bff_fn = locals().get("console_bff_fn")
-    ctx.pretokengen_fn = locals().get("_ptg_fn")

@@ -300,6 +300,23 @@ select option {
   border-color: var(--cyan);
   background: rgba(0, 200, 255, 0.08);
 }
+/* #249 — disabled(如 host upgrading 时的 Pull):变灰 + 禁点 + 压掉 hover,
+   否则 disabled 属性生效但视觉仍像可点(踩过:upgrading 时按钮看起来还能按)。 */
+.btn-act:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  color: var(--gray);
+}
+.btn-act:disabled:hover {
+  color: var(--gray);
+  border-color: var(--border);
+  background: rgba(255, 255, 255, 0.03);
+}
+/* #249 — host upgrading 时版本下拉也 disable,变灰 + 禁点(与 Pull 按钮一致)。 */
+select:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
 .btn-del {
   background: rgba(255, 68, 68, 0.06);
   border: 1px solid rgba(255, 68, 68, 0.25);

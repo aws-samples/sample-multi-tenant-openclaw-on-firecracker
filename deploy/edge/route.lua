@@ -5,7 +5,7 @@
 -- Each phase is a thin dispatcher — logic lives in edge.lib.*.
 --
 -- Data contract with host-agent + iac-dev:
---   the data-plane contract
+--   the data-plane interface contract
 --
 -- Do not add business logic here. Keep this file the "entry only, routes to
 -- domain" boundary per .claude/rules/code-craft-discipline.md.
@@ -19,7 +19,7 @@ local _M = { _VERSION = "0.02" }
 
 -- Warmup gate: /healthz reads this and returns 503 until the async probe
 -- below succeeds. Prevents ASG rotating traffic into a cold instance
--- whose Redis connection has not yet been proven (the data-plane contract §6).
+-- whose Redis connection has not yet been proven (the data-plane contract).
 local function mark_ready()
     local flag = ngx.shared.edge_ready
     if flag then flag:set("ready", 1) end

@@ -398,10 +398,17 @@ _obs_upload() {
     --profile "$PROFILE" --region "$REGION" --quiet \
     --metadata "sha256=${sha},uploaded-at=${_OBS_TS},git-commit=${_OBS_COMMIT}"
 }
-_obs_upload "$SCRIPT_DIR/deploy/userdata/adot-config.yaml"           "deployment/observability/adot/adot-config.yaml"
-_obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/fluent-bit.conf"     "deployment/observability/fluent-bit/fluent-bit.conf"
-_obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/parsers.conf"        "deployment/observability/fluent-bit/parsers.conf"
-_obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/extract_trace_root.lua" "deployment/observability/fluent-bit/extract_trace_root.lua"
+_obs_upload "$SCRIPT_DIR/deploy/userdata/adot-config.yaml"                  "deployment/observability/adot/adot-config.yaml"
+# Shared installer (edge + host pull this same script).
+_obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/install-fluent-bit.sh"      "deployment/observability/fluent-bit/install-fluent-bit.sh"
+# edge role config.
+_obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/edge/fluent-bit.conf"        "deployment/observability/fluent-bit/edge/fluent-bit.conf"
+_obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/edge/parsers.conf"           "deployment/observability/fluent-bit/edge/parsers.conf"
+_obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/edge/extract_trace_root.lua" "deployment/observability/fluent-bit/edge/extract_trace_root.lua"
+# host role config (#245).
+_obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/host/fluent-bit.conf"        "deployment/observability/fluent-bit/host/fluent-bit.conf"
+_obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/host/parsers.conf"           "deployment/observability/fluent-bit/host/parsers.conf"
+_obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/host/extract_tenant_id.lua"  "deployment/observability/fluent-bit/host/extract_tenant_id.lua"
 echo "✓ Observability configs uploaded to s3://${BUCKET}/deployment/observability/ (commit=${_OBS_COMMIT})"
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/backup-data.sh" "s3://${BUCKET}/deployment/scripts/backup-data.sh" \
   --profile "$PROFILE" --region "$REGION" --quiet
@@ -444,14 +451,12 @@ aws s3 cp "$SCRIPT_DIR/deploy/userdata/start-all-vms.sh" "s3://${BUCKET}/deploym
   --profile "$PROFILE" --region "$REGION" --quiet
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/stop-all-vms.sh" "s3://${BUCKET}/deployment/scripts/stop-all-vms.sh" \
   --profile "$PROFILE" --region "$REGION" --quiet
-# launch-all-vms.sh — SQS dispatch push 手脚:装箱消费的聚合 SSM 命令调它,
-# 从 ParamStore /openclaw/dispatch/manifests/<cmd>/<host>/part-N 拉 JSON-lines
-# manifest,本地信号量 fan-out launch-vm.sh。同 start-all-vms 的上传契约。
-aws s3 cp "$SCRIPT_DIR/deploy/userdata/launch-all-vms.sh" "s3://${BUCKET}/deployment/scripts/launch-all-vms.sh" \
-  --profile "$PROFILE" --region "$REGION" --quiet
+# #256 — launch-all-vms.sh 已内联进 launch-vm.sh 的 fan_out_main(唯一起 VM 脚本)。
+# 聚合 SSM 命令现调 `launch-vm.sh --manifest|--from-ddb ...`(见 dispatch_service.py),
+# 不再单独上传 launch-all-vms.sh。launch-vm.sh 的上传在上方(第 415 行)。
 
 # #187 转型:claw-hub(WebSocket 中枢)数据面已下线。install-hub.sh + deploy/hub/
-# 全部归档到 an internal archive。数据面改两级路由
+# 全部归档到 engineering/04-archive/p4-cutover-deprecated/。数据面改两级路由
 # 直连 microVM 原生 gateway(ALB LOR → OpenResty edge → Redis → host DNAT →
 # microVM:18789),setup.sh 不再上传 hub 资产;init-host.sh 里 install-hub.sh
 # 引用也应一并删(独立 issue,同 stack.py CloudFront /hub behavior + HubTG 收尾)。
@@ -573,6 +578,30 @@ if [ -d "$SCRIPT_DIR/console/chat/js" ]; then
     --content-type application/javascript
 fi
 echo "✓ Chat uploaded to s3://${ASSETS_BUCKET}/chat/ (account values injected, CSP-safe external scripts)"
+
+# Console BFF(#149):把真 admin key 注入 openclaw-console-bff Lambda env(CTRL_API_KEY)。
+# 真 key 不进 IaC 模板(CDK auth.py 里是 PLACEHOLDER_INJECT_AT_DEPLOY),部署后由此注入,浏览器全程零 key。
+# 仅当配了 console_auth.bff_certificate_arn 部署出该 Lambda 时才注;没部署则 describe 失败静默跳过。
+if [ -n "${API_KEY:-}" ] && \
+   aws lambda get-function --function-name openclaw-console-bff \
+     --profile "$PROFILE" --region "$REGION" >/dev/null 2>&1; then
+  # update-function-configuration 的 --environment 是整体替换,故先完整读回现有 env、只覆写
+  # CTRL_API_KEY,用 jq 合并回去(不丢 CDK 注入的 CTRL_API_BASE 及其它 env)。
+  CUR_ENV_JSON="$(aws lambda get-function-configuration --function-name openclaw-console-bff \
+    --profile "$PROFILE" --region "$REGION" \
+    --query 'Environment.Variables' --output json 2>/dev/null)"
+  if [ -z "$CUR_ENV_JSON" ] || [ "$CUR_ENV_JSON" = "null" ]; then
+    echo "⚠ Console BFF: 读现有 env 失败,跳过 key 注入(避免整体替换丢 CTRL_API_BASE)"
+  else
+    # --environment 直接用 JSON 格式(比 shorthand Variables={} 稳:value 含特殊字符不崩)。
+    ENV_ARG="$(printf '%s' "$CUR_ENV_JSON" | jq -c --arg k "$API_KEY" '{Variables: (. + {CTRL_API_KEY:$k})}')"
+    aws lambda update-function-configuration --function-name openclaw-console-bff \
+      --environment "$ENV_ARG" \
+      --profile "$PROFILE" --region "$REGION" >/dev/null 2>&1 \
+      && echo "✓ Console BFF: admin key injected into openclaw-console-bff env (browser stays key-less)" \
+      || echo "⚠ Console BFF: key injection failed (check openclaw-console-bff exists / IAM lambda:UpdateFunctionConfiguration)"
+  fi
+fi
 
 # 写 CloudFront 域到 SSM,供 init-host.sh 运行时拉(解 CloudFront 晚于 LaunchTemplate 的
 # CDK 循环依赖)。租户 gateway allowedOrigins 用它,不硬编码旧账号域。

@@ -20,7 +20,45 @@ const {
   setObsFetcher,
   maskSecretValue,
   validateSystemDefault,
+  buildForwardQuery,
 } = await import("./handler.mjs");
+
+// ── buildForwardQuery tests (#217:ALB 编码态 query 双重编码 → 400 修复)─────────
+describe("buildForwardQuery", () => {
+  it("decodes ALB-encoded values once so the control plane gets single-encoding", () => {
+    // ALB 给 BFF 的是编码态(%3A);转发出去必须仍是单层编码 %3A,不能变 %253A。
+    const q = buildForwardQuery({ snapshot_time: "2026-07-14T09%3A37%3A50Z" });
+    assert.equal(q, "snapshot_time=2026-07-14T09%3A37%3A50Z");
+    // 且解码后正是合法 ISO8601(证明控制面正则会通过)。
+    assert.equal(
+      decodeURIComponent(new URLSearchParams(q).get("snapshot_time")),
+      "2026-07-14T09:37:50Z",
+    );
+  });
+
+  it("is a no-op shape for already-decoded values (still single-encodes)", () => {
+    const q = buildForwardQuery({ snapshot_time: "2026-07-14T09:37:50Z" });
+    assert.equal(new URLSearchParams(q).get("snapshot_time"), "2026-07-14T09:37:50Z");
+  });
+
+  it("handles empty / missing query", () => {
+    assert.equal(buildForwardQuery({}), "");
+    assert.equal(buildForwardQuery(null), "");
+    assert.equal(buildForwardQuery(undefined), "");
+  });
+
+  it("passes through a malformed %-sequence without throwing", () => {
+    const q = buildForwardQuery({ x: "100%done" });
+    assert.equal(new URLSearchParams(q).get("x"), "100%done");
+  });
+
+  it("preserves multiple params", () => {
+    const q = buildForwardQuery({ a: "1", b: "x%3Ay" });
+    const p = new URLSearchParams(q);
+    assert.equal(p.get("a"), "1");
+    assert.equal(p.get("b"), "x:y");
+  });
+});
 
 // ── maskParams tests ─────────────────────────────────────────────────────────
 
@@ -156,9 +194,9 @@ describe("/capi/obs-config", () => {
       const keys = body.items.map((i) => i.key).sort();
       assert.deepEqual(keys, [
         "adot/adot-config.yaml",
-        "fluent-bit/extract_trace_root.lua",
-        "fluent-bit/fluent-bit.conf",
-        "fluent-bit/parsers.conf",
+        "fluent-bit/edge/extract_trace_root.lua",
+        "fluent-bit/edge/fluent-bit.conf",
+        "fluent-bit/edge/parsers.conf",
       ]);
       assert.equal(body.items[0].sha256, "deadbeef");
       assert.equal(body.items[0].git_commit, "abc1234");

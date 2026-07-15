@@ -257,6 +257,8 @@ _VIEWER_OK = {
     ("GET", "/hosts/rootfs-version"),
     ("GET", "/hosts/rootfs-drift"),
     ("GET", "/images"),
+    # #217 V2 — 列版本快照(time+label+count),只读,供 console 选 snapshot 拉。同 /images 级。
+    ("GET", "/snapshots"),
     ("GET", "/agentcore/status"),
     ("GET", "/agentcore/tools"),
     ("GET", "/system/info"),

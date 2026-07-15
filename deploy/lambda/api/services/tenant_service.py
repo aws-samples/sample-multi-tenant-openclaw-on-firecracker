@@ -155,12 +155,12 @@ def _redact_tenant(item):
     return {k: v for k, v in item.items() if k not in _TENANT_SECRET_FIELDS}
 
 
-# ── #187 P1 — pre-mint gateway token + reveal (the data-plane refactor D 段)──────
+# ── #187 P1 — pre-mint gateway token + reveal (the data-plane design D 段)──────
 # 建租户时预铸 32 字节随机 token,KMS 信封绑 tenant_id 加密,密文与 expires_at=now+900
 # 一起落 openclaw-tenant-secrets 表。SSM 命令把密文按位置 12 传给 launch-vm.sh;host
 # 用同一 tenant_id ctx 解密后写入 openclaw.json 的 `.gateway.auth.token`。
 #
-# **API 侧不解密**(per data-plane contract review):控制平面调用方
+# **API 侧不解密**(design decision):控制平面调用方
 # 建租户后本就在 loop 里轮询状态,一旦查到 running 就绪、就在 GET /tenants/{id} 的
 # 响应里带回 gateway_token **密文原样**(base64 信封密文);GET /tenants/{id}/token
 # 保留作等价别名,同样只返密文。**调用方自己拿 KMS Decrypt**(它有 kms:Decrypt +
@@ -600,11 +600,20 @@ def _phys_tap_occupied(host_id, phys_num, exclude_id=None):
                     break
         return False
     except Exception as e:  # noqa: BLE001 — fail-closed,不能因 scan 抖动放行撞号
-        print(f"_phys_tap_occupied({host_id},{phys_num}) scan failed → fail-closed: {e}")
+        print(
+            f"_phys_tap_occupied({host_id},{phys_num}) scan failed → fail-closed: {e}"
+        )
         return True
 
 
-def create_tenant(body=None, event=None):
+def create_tenant(body=None, event=None, _canary_host=None):
+    # #217 §10.6 — _canary_host is an INTERNAL param, never a body/HTTP field.
+    # The route lambda calls create_tenant(body, event) with exactly two args
+    # (handler.py) and create_tenant_self delegates with two args, so external
+    # callers can never set it. Only pull_image passes _canary_host=<this host>
+    # to let its canary tenant land on the host being upgraded (status=upgrading).
+    # It ONLY relaxes the status gate for that one pinned host — capacity CAS,
+    # vm_num uniqueness, and every other guard are unchanged.
     if body is None:
         return utils._resp(400, {"error": "missing body"})
     # 坏 JSON → 400 不 500;合法但非对象(list/数字)→ 400(否则下面 body.get / 各处
@@ -879,7 +888,7 @@ def create_tenant(body=None, event=None):
     # per-tenant chatCompletions switch (default off = secure default). Only
     # tenants explicitly created with chat_endpoint_enabled=true get the
     # OpenAI-compatible HTTP endpoint; launch-vm.sh injects enabled:true for them
-    # and deletes the endpoint for everyone else. See project docs for the security default.
+    # and deletes the endpoint for everyone else. See the ops guide security decision.
     # #95 adversarial C-017: bool("false") / bool("0") are both True, so a JSON
     # string used to silently OPEN this deviceAuth-bypassing endpoint. This is a
     # secure-default switch — accept only a real JSON boolean; anything else
@@ -997,11 +1006,23 @@ def create_tenant(body=None, event=None):
             inflight_dedup.release_inflight_lock(owner_id, tenant_user_id)
             return _name_err[0]
 
+    # #217 — pinned 放置(金丝雀 / preferred_host_id / clone 同 host)不走 dispatch 队列。
+    # dispatch → binpack 是"不指定 host 的批量创建"优化:binpack 无 pinned 概念、且
+    # dispatch msg 不带 preferred_host_id / _canary_host → 走它会把指定 host 丢掉,
+    # 金丝雀落不到正 upgrading 的那台(unplaced)。pinned 走下方同步路径,那里的
+    # _get_specific_host_with_capacity(allow_upgrading=<金丝雀>) 才认指定 host + upgrading 豁免。
+    _pinned_placement = bool(
+        _canary_host or (body.get("preferred_host_id") or "").strip() or clone_from
+    )
     # ── [hackathon] Dispatch (SQS 标准队列 + 装箱消费,SPEC/sqs-dispatch) ──
-    # DISPATCH_QUEUE_URL 非空 且 非 consumer 回放 → 走装箱路径,优先于旧
+    # DISPATCH_QUEUE_URL 非空 且 非 consumer 回放 且 非 pinned → 走装箱路径,优先于旧
     # CREATE_VIA_QUEUE FIFO(SPEC 开关优先级矩阵)。tenants 条件写占位保证幂等:
     # 相同 tenant_id 二次投递 conditional check fail → 返 409(而非重复开 VM)。
-    if clients.DISPATCH_QUEUE_URL and not (event or {}).get("_consumer_ident"):
+    if (
+        clients.DISPATCH_QUEUE_URL
+        and not (event or {}).get("_consumer_ident")
+        and not _pinned_placement
+    ):
         # 占位字段集对照同步路径 item(本函数下方 ~L721)保持同宽——#139/#140 真机
         # 抓出窄字段集的两类后果:丢 tags → batch by filter 0 命中;缺
         # channel_secret → hub 握手竞态回归(同步路径特意 mint-up-front)。
@@ -1242,8 +1263,10 @@ def create_tenant(body=None, event=None):
                 },
             )
     elif preferred_host_id:
+        # #217 §10.6 — a canary for THIS host may land on it while it's upgrading.
+        _allow_upg = bool(_canary_host) and _canary_host == preferred_host_id
         host = scheduling._get_specific_host_with_capacity(
-            preferred_host_id, vcpu, mem_mb
+            preferred_host_id, vcpu, mem_mb, allow_upgrading=_allow_upg
         )
         if not host:
             # Distinguish "host doesn't exist" from "host full" so the
@@ -1376,30 +1399,57 @@ def create_tenant(body=None, event=None):
         expected = int(h.get("next_vm_num", 1))
         cap_v = int(int(h["total_vcpu"]) * clients.CPU_OVERCOMMIT_RATIO) - vcpu
         cap_m = int(int(h["total_mem_mb"]) * clients.MEM_OVERCOMMIT_RATIO) - mem_mb
+        # #217 — 普通租户落到 host → 顺手把 host 标 active(有租户即活跃)。但【金丝雀】落到
+        # 正 pull-image(status=upgrading)的 host 时【绝不能】把 host 拍成 active:那会在
+        # 回滚/晋级前就谎报 active,而 live 可能还是待验证/poison 版本(真机实测:UI 见 canary
+        # creating 即转 active + upgrading_at 残留)。故金丝雀预留槽只加计数、REMOVE idle_since,
+        # 【不写 #s】——host 保持 upgrading,status 完全交给 pull 编排(晋级/回滚)决定。
+        _is_canary = bool(_canary_host) and h["instance_id"] == _canary_host
+        if _is_canary:
+            _set_expr = (
+                "SET used_vcpu = used_vcpu + :v, used_mem_mb = used_mem_mb + :m, "
+                "vm_count = vm_count + :one, next_vm_num = next_vm_num + :one "
+                "REMOVE idle_since"
+            )
+            _names = None
+            _vals = {
+                ":v": vcpu,
+                ":m": mem_mb,
+                ":one": 1,
+                ":expected": expected,
+                ":cap_v": cap_v,
+                ":cap_m": cap_m,
+            }
+        else:
+            _set_expr = (
+                "SET used_vcpu = used_vcpu + :v, used_mem_mb = used_mem_mb + :m, "
+                "vm_count = vm_count + :one, next_vm_num = next_vm_num + :one, "
+                "#s = :a REMOVE idle_since"
+            )
+            _names = {"#s": "status"}
+            _vals = {
+                ":v": vcpu,
+                ":m": mem_mb,
+                ":one": 1,
+                ":a": "active",
+                ":expected": expected,
+                ":cap_v": cap_v,
+                ":cap_m": cap_m,
+            }
         try:
-            r = clients.hosts_table.update_item(
+            _kwargs = dict(
                 Key={"instance_id": h["instance_id"]},
-                UpdateExpression=(
-                    "SET used_vcpu = used_vcpu + :v, used_mem_mb = used_mem_mb + :m, "
-                    "vm_count = vm_count + :one, next_vm_num = next_vm_num + :one, "
-                    "#s = :a REMOVE idle_since"
-                ),
+                UpdateExpression=_set_expr,
                 ConditionExpression=(
                     "next_vm_num = :expected AND used_vcpu <= :cap_v "
                     "AND used_mem_mb <= :cap_m"
                 ),
-                ExpressionAttributeNames={"#s": "status"},
-                ExpressionAttributeValues={
-                    ":v": vcpu,
-                    ":m": mem_mb,
-                    ":one": 1,
-                    ":a": "active",
-                    ":expected": expected,
-                    ":cap_v": cap_v,
-                    ":cap_m": cap_m,
-                },
+                ExpressionAttributeValues=_vals,
                 ReturnValues="UPDATED_NEW",
             )
+            if _names:
+                _kwargs["ExpressionAttributeNames"] = _names
+            r = clients.hosts_table.update_item(**_kwargs)
             # next_vm_num was incremented; the slot we claimed is the pre-increment value.
             return int(r["Attributes"]["next_vm_num"]) - 1
         except ClientError as e:
@@ -1459,7 +1509,8 @@ def create_tenant(body=None, event=None):
         scheduling._release_slot(host["instance_id"], vcpu, mem_mb)
         inflight_dedup.release_inflight_lock(owner_id, tenant_user_id)
         return utils._resp(
-            503, {"error": "unable to find a free physical vm slot on host; retry"},
+            503,
+            {"error": "unable to find a free physical vm slot on host; retry"},
         )
 
     guest_ip = auth._guest_ip(vm_num)
@@ -1646,7 +1697,7 @@ def create_tenant(body=None, event=None):
         litellm_vkey=tenant_vkey or "",  # task #15 per-tenant billing key
         channel_secret=channel_secret,  # mint-up-front (kills hub handshake race)
         chat_endpoint_enabled=chat_endpoint_enabled,  # per-tenant chatCompletions
-        gateway_token_ct=gateway_token_ct,  # #187 P1 — SPEC/the data-plane refactor D
+        gateway_token_ct=gateway_token_ct,  # #187 P1 — the data-plane design D
         device_paired_b64=device_paired_b64,  # #188 — paired.json 冷注入(免 approve)
     )
     # loop 2026-07-01 bugfix: launch-vm's SSM SendCommand can be throttled when
@@ -1723,6 +1774,23 @@ def delete_tenant(tenant_id, query_params, event=None):
     if item.get("status") == "deleted":
         return utils._resp(200, {"id": tenant_id, "status": "deleted"})
 
+    # #263 — delete 削峰:队列开启且非 consumer 重放时,入队即返 202,由 consumer
+    # 受控并发消费(避免短时间批删把单 host SSM CommandWorkersLimit=5 打爆,饿死
+    # launch-vm/start/stop;单删同步 backup+4~5 条阻塞 SSM ~15~35s 还会撞 API GW 29s)。
+    # keep_data/skip_backup 放进 extra 让 consumer 透传(否则恒软删,盘悄悄没删)。
+    # 与 tenant_action 的入队守卫同款:队列没配 → enqueue 返 False,回退下方同步路径
+    # (向后兼容);_consumer_ident 存在说明本次已是 consumer 重放,不再二次入队(防
+    # 无限入队)。字段 {id,status} 与同步路径一致,status 值 "queued" 与 tenant_action 对齐。
+    if clients.LIFECYCLE_QUEUE_URL and not (event or {}).get("_consumer_ident"):
+        _extra = {
+            "keep_data": query_params.get("keep_data"),
+            "skip_backup": query_params.get("skip_backup"),
+        }
+        if lifecycle_dispatch.enqueue_lifecycle(
+            "delete", tenant_id, event, extra=_extra
+        ):
+            return utils._resp(202, {"id": tenant_id, "status": "queued"})
+
     # #107 — 并发双删扣穿 host 账本修复(与 create 的原子 CAS 对称)。
     # delete 的 host 计数回退(used_vcpu/vm_count -= …,下方 line ~2210)无
     # ConditionExpression,两个并发 DELETE 同一 tenant 会各扣一次 → 账本被扣穿变负,
@@ -1746,9 +1814,29 @@ def delete_tenant(tenant_id, query_params, event=None):
             },
         )
     except clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException:
-        # 另一个并发 DELETE 已抢到闸(status 已是 deleting/deleted)。终态一致 →
-        # 幂等 200,绝不重复扣账本(这正是 #107 要修的扣穿点)。
-        return utils._resp(200, {"id": tenant_id, "status": "deleting"})
+        # CAS 撞 deleting/deleted。区分两种:
+        # ① status 已 deleted → 真幂等,删完了,返 200。
+        # ② status 还是 deleting → 删除未完成(上次副作用失败留下,#268)。若这是 consumer
+        #    队列重投(_consumer_ident,FIFO MessageGroupId=tenant_id 保证同租户串行消费,
+        #    不存在并发双删),应**继续重试剩余副作用**(stop-vm/rm 幂等),而不是返 200 把
+        #    半清理的租户永久卡 deleting(旧行为 → #268 盘泄漏 + 孤儿永不收敛)。同步并发
+        #    请求(无 _consumer_ident)仍返 200 防 #107 双删扣穿——那条路没有重投机制。
+        cur = (
+            clients.tenants_table.get_item(
+                Key={"id": tenant_id}, ConsistentRead=True
+            ).get("Item")
+            or {}
+        )
+        if cur.get("status") == "deleted":
+            return utils._resp(200, {"id": tenant_id, "status": "deleted"})
+        is_consumer_replay = bool((event or {}).get("_consumer_ident"))
+        if not is_consumer_replay:
+            # 同步路径并发双删的输家:幂等 200,不碰副作用/账本(#107)。
+            return utils._resp(200, {"id": tenant_id, "status": "deleting"})
+        # consumer 重投卡在 deleting 的删除:status 已是 deleting,不再翻转,直接往下
+        # 重试副作用(stop-vm/rm 幂等)。#107 账本回退由下方 `used_vcpu >= :v` guard
+        # 防重复扣穿(第一次已扣过则 CCF → skip),不会二次扣账本。
+        prev_status = cur.get("status", prev_status)
 
     keep_data = query_params.get("keep_data", "true").lower() == "true"
     host_id = item.get("host_id")
@@ -1838,18 +1926,52 @@ def delete_tenant(tenant_id, query_params, event=None):
             )
 
     if host_id:
-        # Stop VM via SSM
+        # Stop VM via SSM.
+        # #268 — stop-vm 是关键副作用,不是 best-effort:失败=VM 孤儿(fc 进程还活着
+        # 占内存/vCPU)+ 若继续标 deleted 则账本回退但 VM 没停(容量统计失真)。真机实测
+        # (新加坡 795,#263 削峰测试):create 的 launch-vm 挤爆单 host SSM
+        # CommandWorkersLimit=5,delete 的 stop-vm 排队 >30s → _ssm_run 返 False,旧代码
+        # 忽略返回值照常标 deleted → 236 残留目录 + 27 孤儿 fc。这里 fail-loud:stop-vm
+        # 失败则回滚 status 到删除前(复用 _abort_restore_status,CAS 保证只回滚自己翻的
+        # deleting)+ 返 502。delete 走队列(#263)时 consumer 收 5xx 会重投,重投时租户又
+        # 是 running→CAS 重新翻 deleting→重试 stop(幂等:已停的 VM 再停无害)。best-effort
+        # 的 iptables/route(下方)失败仍容忍,有 host-agent orphan-reap 兜底。
         vm_num = int(item.get("vm_num", 1))
-        ssm_dispatch._ssm_run(host_id, f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num}")
-        # Remove vm.json so host-agent won't try to recover
-        ssm_dispatch._ssm_run(
+        if not ssm_dispatch._ssm_run(
+            host_id, f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num}"
+        ):
+            _abort_restore_status()
+            return utils._resp(
+                502,
+                {
+                    "error": "stop-vm failed (SSM timeout/error); aborting delete to "
+                    "avoid a stranded VM + disk leak. Retry — delete via the lifecycle "
+                    "queue re-drives automatically.",
+                    "id": tenant_id,
+                },
+            )
+        # Remove vm.json so host-agent won't try to recover. Only after stop
+        # succeeded — else we'd delete the recovery marker while the VM is still
+        # running (worse: host-agent won't recover, VM stays orphaned untracked).
+        # #268 — vm.json rm 失败也 fail-loud:留着它 host-agent 会 recover 已"删"的租户
+        # (幽灵复活),同样回滚重投。
+        if not ssm_dispatch._ssm_run(
             host_id, f"rm -f /data/firecracker-vms/{tenant_id}/vm.json"
-        )
+        ):
+            _abort_restore_status()
+            return utils._resp(
+                502,
+                {
+                    "error": "rm vm.json failed (SSM timeout/error); aborting delete so "
+                    "host-agent won't recover a half-deleted tenant. Retry.",
+                    "id": tenant_id,
+                },
+            )
 
     # #187 转型:legacy_alb rule 已删,数据面走两级路由,无需再摘 per-tenant ALB rule。
 
     if host_id:
-        # 销毁租户 → 回收数据面路由(contract: delete removes route, stop keeps it)。
+        # 销毁租户 → 回收数据面路由(design decision)。
         # DNAT 规则删除的 argv 必须与 host-agent route_ops.dnat_rule_args 加规则时
         # 完全一致(无 `-i <iface>` 前缀)——旧代码带 `-i` 前缀,与 route_ops 无 `-i`
         # 的规则不匹配,`iptables -D` 删不掉,DNAT 规则永久泄漏在 PREROUTING 链里,
@@ -1875,7 +1997,28 @@ def delete_tenant(tenant_id, query_params, event=None):
         )
 
         if not keep_data:
-            ssm_dispatch._ssm_run(host_id, f"rm -rf /data/firecracker-vms/{tenant_id}")
+            # #268 — rm -rf 数据盘是关键(no-data-loss:盘泄漏累积撑爆 host 容量)。
+            # 到这一步 VM 已停(stop-vm 成功),盘没删则留 deleting 中间态 + 502 fail-loud,
+            # 不推进到 deleted(避免"标 deleted 但盘还在"的静默泄漏)。delete 走队列时
+            # consumer 收 502 重投,重投时 CAS 撞 deleting → 上方 CCF 分支放行 consumer 重投
+            # 继续重试(VM 已停,补删盘幂等);账本回退在本步之后(:2020),此刻未扣,重投
+            # 成功那次才扣一次(guard 防负)。
+            if not ssm_dispatch._ssm_run(
+                host_id, f"rm -rf /data/firecracker-vms/{tenant_id}"
+            ):
+                print(
+                    f"delete_tenant #268: rm -rf data disk FAILED for {tenant_id} on "
+                    f"host {host_id} (SSM timeout/error) — VM stopped but disk leaked; "
+                    f"keeping status=deleting for retry, NOT marking deleted."
+                )
+                return utils._resp(
+                    502,
+                    {
+                        "error": "data disk rm failed (SSM timeout/error); VM is stopped "
+                        "but disk not reclaimed. Kept status=deleting for re-drive.",
+                        "id": tenant_id,
+                    },
+                )
 
         # Update host counters.
         # #107 defense-in-depth: guard the decrement with `>= :v` so it can NEVER

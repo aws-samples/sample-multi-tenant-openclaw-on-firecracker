@@ -3,8 +3,8 @@
 -- Small non-ngx-specific helpers. Kept dependency-free so unit tests can
 -- require this module without booting the OpenResty runtime.
 --
--- Contract owners: the design spec: 
--- the data-plane contract §1 (Redis key schema) — the JSON decoder here is
+-- Contract owners: the data-plane design docs
+-- the data-plane interface contract §1 (Redis key schema) — the JSON decoder here is
 -- the only place that must agree with host-agent's writer.
 
 local _M = { _VERSION = "0.01" }

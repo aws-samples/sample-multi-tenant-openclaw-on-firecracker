@@ -8,6 +8,8 @@ window.ocCore = {
   page: "tenants",
   showApiKey: false,
   saving: false,
+  pollMs: 5000, // live-status poll cadence; a host's active→upgrading→active shows without a manual refresh
+  _pollTimer: null,
 
   init() {
     this.apiUrl =
@@ -24,6 +26,8 @@ window.ocCore = {
       "poolops",
       "loadtest",
       "edge",
+      "traces",
+      "logs",
       "settings",
     ];
     const saved = localStorage.getItem("oc_page");
@@ -35,7 +39,23 @@ window.ocCore = {
       // straight onto one of them, fire its loader so the page isn't empty.
       if (this.page === "app") this.loadAgentCoreTools();
       if (this.page === "backups") this.loadBackups();
+      this.startPolling();
     }
+  },
+  // #217 — quietly re-poll host+tenant status so a host's active→upgrading→active
+  // cycle (e.g. after a snapshot Pull) shows up without hitting refresh. Pauses
+  // when the tab is backgrounded so we don't burn API calls no one is watching.
+  startPolling() {
+    if (this._pollTimer) return;
+    const tick = () => {
+      if (document.hidden) return; // backgrounded → skip this beat, keep the timer
+      this.pollHosts();
+      this.pollTenants();
+    };
+    this._pollTimer = setInterval(tick, this.pollMs);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) tick(); // catch up immediately when the tab returns
+    });
   },
   saveSettings() {
     localStorage.setItem("oc_api_url", this.apiUrl);
@@ -73,6 +93,38 @@ window.ocCore = {
     }
     this.connected = r.ok;
     return r.json();
+  },
+  // #269 — 写操作 fail-loud 版:和 api() 同样构造(url/header/token/401 刷新),但
+  // 返回 {ok, status, body} 而非吞掉 status。api() 为读路径保留(不改其行为,避免
+  // 波及全站调用方);写操作(saveTemplate/deleteTemplate)用这个才能把 WAF 403 /
+  // 后端 5xx 报给用户,不静默关弹窗骗"成功"。body 解析失败(非 JSON)时 body=null。
+  async apiStatus(method, path, body) {
+    const url =
+      this.apiUrl.replace(/\/+$/, "") + "/" + path.replace(/^\/+/, "");
+    const headers = {
+      "x-api-key": this.apiKey,
+      "Content-Type": "application/json",
+    };
+    const token = localStorage.getItem("oc_id_token");
+    if (token) headers["Authorization"] = "Bearer " + token;
+    const opts = { method, headers };
+    if (body !== undefined) opts.body = JSON.stringify(body);
+    let r = await fetch(url, opts);
+    if (r.status === 401 && window.refreshIdToken) {
+      const newToken = await window.refreshIdToken();
+      if (newToken) {
+        opts.headers["Authorization"] = "Bearer " + newToken;
+        r = await fetch(url, opts);
+      }
+    }
+    this.connected = r.ok;
+    let parsed = null;
+    try {
+      parsed = await r.json();
+    } catch {
+      /* 非 JSON 响应(如 WAF 的 HTML/空 body):body 留 null */
+    }
+    return { ok: r.ok, status: r.status, body: parsed };
   },
   async refresh() {
     await Promise.all([

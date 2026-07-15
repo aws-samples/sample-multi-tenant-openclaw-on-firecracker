@@ -105,6 +105,13 @@ def lambda_handler(event, context):
         status = h.get("status")
         vm_count = int(h.get("vm_count", 0))
 
+        # #217 — 正在 pull-image 灰度升级的 host 由 pull 编排独占其 status(upgrading→
+        # active/回滚),scaler 一律不碰:不标 idle、不复位 active、不 terminate。金丝雀
+        # 租户会让 vm_count>0,若不在此跳过,下面的 idle→active 复位会拍脏正在验证的 host。
+        if status == "upgrading":
+            print(f"{instance_id}: upgrading (pull-image in progress) — scaler skips")
+            continue
+
         if vm_count > 0:
             # Has VMs — ensure active (recover from idle if tenant was assigned)
             if status == "idle":
@@ -270,12 +277,25 @@ def _update_tenant_status(tenant_id, status):
 
 
 def _set_status(instance_id, status):
-    hosts_table.update_item(
-        Key={"instance_id": instance_id},
-        UpdateExpression="SET #s = :s",
-        ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":s": status},
-    )
+    # #217 race fix — scaler 的 scan 是最终一致读,可能读到过期的 status(如 host 已被
+    # pull-image 置 upgrading,但 scan 快照还是 idle)→ 盲写会把正在灰度升级的 host 拍回
+    # active/idle,leave upgrading_at 残留 + 打断金丝雀验证(真机实测:active + 仍 poison
+    # 的 live 窗口)。加 ConditionExpression 只在 host 仍是 active/idle 时才写:host 已进
+    # upgrading → CCF,跳过不动(pull 编排独占该 host 的 status,scaler 不碰)。
+    try:
+        hosts_table.update_item(
+            Key={"instance_id": instance_id},
+            UpdateExpression="SET #s = :s",
+            ConditionExpression="#s IN (:a, :i)",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":s": status, ":a": "active", ":i": "idle",
+            },
+        )
+    except hosts_table.meta.client.exceptions.ConditionalCheckFailedException:
+        # host 不在 active/idle(多半正 upgrading / 已 terminating)→ scaler 不该改它的
+        # status。静默跳过(下一 tick host 回 active/idle 后再正常参与 idle 回收)。
+        print(f"{instance_id}: skip status→{status} (host not active/idle, likely upgrading)")
 
 
 def _set_idle_since(instance_id, ts):

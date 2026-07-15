@@ -39,7 +39,7 @@
 #     shared key 兜底覆盖数据盘上的 per-tenant vkey——那会坏计费拆分)
 #
 # fail-loud:jq exit 非零、或输出空,一律不 clobber 原 openclaw.json,return 1。
-# silently swallowing an exception once caused an incident (fail-loud is mandatory)。
+# 静默吞过一次异常就是事故(踩过——see the ops guide)。
 oc_harden_config() {
   __hc_oc="$1"
   __hc_origin="$2"
@@ -56,7 +56,7 @@ oc_harden_config() {
   # 起手 `.` 是 identity(拿到原 JSON 不变),后面每个 `|` 是纯变换。
   __hc_prog='.'
   __hc_prog="${__hc_prog} | del(.gateway.controlUi.dangerouslyDisableDeviceAuth)"
-  # the data-plane refactor(the dev plan §A):
+  # the data-plane design(the data-plane design doc §A):
   # 数据面转两级路由后 controlUi 必须关。无条件设 false,防有人在数据盘塞回 true,
   # 与 dangerouslyDisableDeviceAuth 同段(每次唤醒都收敛,不假设 NEW_DATA 时清过就够)。
   __hc_prog="${__hc_prog} | .gateway.controlUi.enabled = false"

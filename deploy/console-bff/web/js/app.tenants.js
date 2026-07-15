@@ -7,7 +7,7 @@ window.ocTenants = {
   statusFilter: 'all',   // filter for tenants list
   tagFilter: '',         // filter expression: "k1:v1,k2:v2" — AND across pairs
   // #187 转型:reveal token + descriptor modal 状态。
-  // reveal 显示的是 KMS 密文(base64 信封,data-plane contract 5),调用方
+  // reveal 显示的是 KMS 密文(base64 信封,§the data-plane contract),调用方
   // 拿 tenant_id 作 EncryptionContext 自解得明文;API 侧不 decrypt。
   revealState: { open: false, tenantId: '', ciphertext: '', error: '', descriptor: null, loading: false },
 
@@ -17,6 +17,13 @@ window.ocTenants = {
     try { this.tenants = await this.api('GET', 'tenants'); this.connected = true; }
     catch { this.connected = false; }
     this.loadingTenants = false;
+  },
+  // #217 — quiet poll variant: refresh tenants WITHOUT the loading flag so the
+  // 5s background poll doesn't flash the spinner or empty-state on every beat.
+  async pollTenants() {
+    if (!this.apiUrl || !this.apiKey) return;
+    try { this.tenants = await this.api('GET', 'tenants'); this.connected = true; }
+    catch { this.connected = false; }
   },
   // Mirror of API _NAME_RE in deploy/lambda/api/handler.py — keep in sync.
   get nameError() {

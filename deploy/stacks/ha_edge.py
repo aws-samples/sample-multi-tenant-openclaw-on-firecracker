@@ -37,7 +37,6 @@ def build_ha_edge(self, ctx):
     gateway_url = getattr(ctx, "gateway_url", None)
     health_fn = getattr(ctx, "health_fn", None)
     host_role = getattr(ctx, "host_role", None)
-    image_ready = getattr(ctx, "image_ready", None)
     sec_cfg = getattr(ctx, "sec_cfg", None)
     vpc = getattr(ctx, "vpc", None)
 
@@ -601,12 +600,11 @@ def build_ha_edge(self, ctx):
         max_capacity=CFG["asg"]["max_capacity"],
     )
     asg.node.add_dependency(set_default)
-    # Block ASG (and the first host) until the golden image is baked + in S3,
-    # so init-host can pull the rootfs on first boot instead of timing out the
-    # lifecycle hook. This is what lets min_capacity stay >=1 on a fresh region
-    # without the manual two-phase (min0 → bake → scale1) dance.
-    if image_ready is not None:
-        asg.node.add_dependency(image_ready)
+    # Golden-image bake is a separate, non-blocking stack (OpenClawImageStack)
+    # now, so the ASG no longer depends on image readiness. On a fresh region the
+    # first host may boot before the image is in S3 and churn a few minutes via
+    # the lifecycle-hook timeout until the bake lands the rootfs — not a deploy
+    # failure. Steady-state redeploys are unaffected (image already present).
     cfn_asg = asg.node.default_child
     _pinned_ver = nested_virt.get_response_field("LaunchTemplateVersion.VersionNumber")
     if len(_instance_pool) >= 2:
@@ -1001,13 +999,23 @@ def build_ha_edge(self, ctx):
                 "redis.enabled=true 需要 ≥2 私有子网跨 AZ,当前 VPC 私有子网数="
                 f"{len(_redis_subnets)}(网络模式改 self_managed 或 imported 传齐)"
             )
-        _redis_subnet_group = elasticache.CfnSubnetGroup(
-            self,
-            "RedisSubnetGroup",
-            description="OpenClaw route-table Redis (private subnets)",
-            subnet_ids=_redis_subnets,
-            cache_subnet_group_name=f"openclaw-redis-subnets{self._gsuffix}",
-        )
+        # #281 复用现网:配了 existing_subnet_group_arn 就复用客户已有子网组
+        # (不建新的、不改现有);否则按 subnet_ids 建新子网组。ARN 末段即 group name。
+        # ⚠️ 复用者自保:该子网组须已覆盖 ≥2 AZ(automatic_failover+multi_az 要求),
+        # 否则 CreateReplicationGroup 400(复用时绕过上面的 <2 fail-loud 校验)。
+        _existing_sg_arn = str(_redis_cfg.get("existing_subnet_group_arn", "")).strip()
+        if _existing_sg_arn:
+            _redis_subnet_group = None
+            _redis_subnet_group_name = _existing_sg_arn.split(":")[-1]
+        else:
+            _redis_subnet_group = elasticache.CfnSubnetGroup(
+                self,
+                "RedisSubnetGroup",
+                description="OpenClaw route-table Redis (private subnets)",
+                subnet_ids=_redis_subnets,
+                cache_subnet_group_name=f"openclaw-redis-subnets{self._gsuffix}",
+            )
+            _redis_subnet_group_name = _redis_subnet_group.ref
         _replicas = int(_redis_cfg.get("num_replicas", 2))
         # #271 引擎可选 redis|valkey。Valkey 是 Redis OSS 的 BSD fork,ElastiCache
         # 支持 engine="valkey";协议/端口 6379 与 Redis 客户端(host-agent redis-py +
@@ -1035,28 +1043,40 @@ def build_ha_edge(self, ctx):
         # 不用 default parameter group(便于后续调 maxmemory-policy 等)。
         _redis_major = _redis_engine_version.split(".")[0]
         _redis_pg_family = f"{_redis_engine}{_redis_major}"
-        _redis_param_group = elasticache.CfnParameterGroup(
-            self,
-            "RouteRedisParamGroup",
-            cache_parameter_group_family=_redis_pg_family,
-            description=(
-                f"OpenClaw route table {_redis_engine} {_redis_engine_version} "
-                "(explicit param group, #271)"
-            ),
-        )
+        # #281 复用现网:配了 existing_parameter_group_arn 就复用客户已有参数组
+        # (不建新的、不改现有参数);否则按 family 新建。ARN 末段即 group name。
+        # ⚠️ 复用者自保:该参数组 family 须匹配 engine+major(valkey7 / redis7),
+        # 否则 CreateReplicationGroup 400(拿 redis7 参数组配 valkey 引擎会被拒)。
+        _existing_pg_arn = str(
+            _redis_cfg.get("existing_parameter_group_arn", "")
+        ).strip()
+        if _existing_pg_arn:
+            _redis_param_group = None
+            _redis_param_group_name = _existing_pg_arn.split(":")[-1]
+        else:
+            _redis_param_group = elasticache.CfnParameterGroup(
+                self,
+                "RouteRedisParamGroup",
+                cache_parameter_group_family=_redis_pg_family,
+                description=(
+                    f"OpenClaw route table {_redis_engine} {_redis_engine_version} "
+                    "(explicit param group, #271)"
+                ),
+            )
+            _redis_param_group_name = _redis_param_group.ref
         _redis_rg = elasticache.CfnReplicationGroup(
             self,
             "RouteRedis",
             replication_group_description="OpenClaw tenant to host route table",
             engine=_redis_engine,
             engine_version=_redis_engine_version,
-            cache_parameter_group_name=_redis_param_group.ref,
+            cache_parameter_group_name=_redis_param_group_name,
             cache_node_type=str(_redis_cfg.get("node_type", "cache.r7g.large")),
             num_cache_clusters=1 + _replicas,
             automatic_failover_enabled=True,
             multi_az_enabled=True,
             # cluster mode disabled(单 shard 主从),用 primary endpoint。
-            cache_subnet_group_name=_redis_subnet_group.ref,
+            cache_subnet_group_name=_redis_subnet_group_name,
             security_group_ids=[_redis_sg.security_group_id],
             port=6379,
             # 显式关 transit 加密(设计决策):SG 隔离即够(私网内 6379 只对 host/edge
@@ -1064,8 +1084,11 @@ def build_ha_edge(self, ctx):
             # lua-resty-redis 都要额外配。显式 False 优于隐式(防未来引擎默认变化)。
             transit_encryption_enabled=False,
         )
-        _redis_rg.add_dependency(_redis_subnet_group)
-        _redis_rg.add_dependency(_redis_param_group)
+        # #281 只在自建时加依赖;复用现网(existing_*_arn)时不 depend on 外部资源。
+        if _redis_subnet_group is not None:
+            _redis_rg.add_dependency(_redis_subnet_group)
+        if _redis_param_group is not None:
+            _redis_rg.add_dependency(_redis_param_group)
         redis_endpoint = (
             f"{_redis_rg.attr_primary_end_point_address}:"
             f"{_redis_rg.attr_primary_end_point_port}"

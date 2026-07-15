@@ -3,7 +3,6 @@
 
 import aws_cdk as cdk
 from aws_cdk import (
-    aws_lambda as _lambda,
     aws_events as events,
     aws_events_targets as targets,
     aws_iam as iam,
@@ -11,12 +10,9 @@ from aws_cdk import (
     aws_grafana as grafana,
     aws_guardduty as guardduty,
     aws_bedrock_agentcore_alpha as agentcore,
-    aws_codebuild as codebuild,
-    aws_s3_assets as s3_assets,
     custom_resources as cr,
     Duration,
 )
-from pathlib import Path
 
 
 def build_compute(self, ctx):
@@ -222,9 +218,9 @@ def build_compute(self, ctx):
         # naive path (features=[{RUNTIME_MONITORING, ENABLED}]) also flips
         # EC2_AGENT_MANAGEMENT to ENABLED at the account level, and that
         # associates SSM to auto-install the GuardDuty agent on EVERY EC2
-        # in the account (evidence: the verification evidence
-        # metal-experiments/8layer-evidence.md:163-181 — AWS "how runtime
-        # monitoring works ec2" doc). That is not safe for a shared account
+        # in the account (per AWS "how GuardDuty runtime monitoring works on
+        # EC2" — automated agent management associates SSM fleet-wide). That is
+        # not safe for a shared account
         # hosting other teams' hosts.
         # Safe stance when the flag is true:
         #   RUNTIME_MONITORING=ENABLED but EC2_AGENT_MANAGEMENT=DISABLED,
@@ -376,174 +372,13 @@ def build_compute(self, ctx):
         instance_profile_name=f"openclaw-host-profile{self._gsuffix}",
     )
 
-    # ╓─── [包C 控制面+工程化] owner=C ── 栈内烤镜像(image_ready 被 ASG 依赖)──╖
-    # ========== In-stack golden-image bake (CodeBuild) ==========
-    # Solves the chicken-and-egg deadlock: with min_capacity>=1 the ASG would
-    # launch a host before any golden image exists in S3, init-host can't pull
-    # the rootfs, the lifecycle hook times out, and the ASG churns metal forever.
-    # Here a CodeBuild project bakes the image DURING `cdk deploy` (reusing the
-    # battle-tested deploy/codebuild/buildspec-golden-image.yml: docker-in-docker
-    # debootstrap, same build-rootfs.sh, same hardening), and the ASG is made to
-    # depend on a custom resource that BLOCKS until the build succeeds. So by the
-    # time the first host boots, the image is already in the bucket.
-    # Toggle with image.build_in_stack: false to skip (reuse existing image or
-    # bake out-of-band via scripts/build-rootfs-on-ec2.sh).
-    _img_cfg = CFG.get("image", {}) or {}
-    image_version = str(_img_cfg.get("version", "v1.0"))
-    image_ready = None  # node the ASG depends on; set when build_in_stack
-    if _img_cfg.get("build_in_stack", True):
-        # Repo source as an S3 asset (CDK zips + uploads). Exclude heavy/local-only
-        # dirs so the upload stays small and never carries secrets.
-        repo_asset = s3_assets.Asset(
-            self,
-            "GoldenImageSource",
-            path=str(Path(__file__).parent.parent.parent),
-            exclude=[
-                ".git",
-                ".venv",
-                "cdk.out",
-                "node_modules",
-                "**/node_modules",
-                "*.bak",
-                "*.bak-*",
-                ".localbin",
-                ".remote-drift",
-                "engineering",
-                "docs/**",
-                "presentations/**",
-                "*.pyc",
-                "**/__pycache__",
-                ".ruff_cache",
-            ],
-        )
-
-        # CodeBuild service role: read the source asset, read/write the assets
-        # bucket (push baked image), and the EC2/describe bits build-rootfs needs.
-        cb_role = iam.Role(
-            self,
-            "GoldenImageBuildRole",
-            assumed_by=iam.ServicePrincipal("codebuild.amazonaws.com"),
-        )
-        assets_bucket.grant_read_write(cb_role)
-        repo_asset.grant_read(cb_role)
-        cb_role.add_to_policy(
-            iam.PolicyStatement(
-                actions=[
-                    "logs:CreateLogGroup",
-                    "logs:CreateLogStream",
-                    "logs:PutLogEvents",
-                ],
-                resources=["*"],
-            )
-        )
-
-        golden_project = codebuild.Project(
-            self,
-            "GoldenImageBuilder",
-            project_name=f"openclaw-golden-image-builder{self._gsuffix}",
-            role=cb_role,
-            source=codebuild.Source.s3(
-                bucket=repo_asset.bucket,
-                path=repo_asset.s3_object_key,
-            ),
-            environment=codebuild.BuildEnvironment(
-                build_image=codebuild.LinuxArmBuildImage.AMAZON_LINUX_2_STANDARD_3_0,
-                compute_type=codebuild.ComputeType.LARGE,
-                privileged=True,  # docker-in-docker for debootstrap
-            ),
-            environment_variables={
-                "ASSETS_BUCKET": codebuild.BuildEnvironmentVariable(
-                    value=assets_bucket.bucket_name
-                ),
-                "IMAGE_VERSION": codebuild.BuildEnvironmentVariable(
-                    value=image_version
-                ),
-                "AWS_REGION": codebuild.BuildEnvironmentVariable(value=self.region),
-            },
-            build_spec=codebuild.BuildSpec.from_source_filename(
-                "deploy/codebuild/buildspec-golden-image.yml"
-            ),
-            timeout=Duration.minutes(40),
-        )
-
-        # Custom-resource provider that starts the build and BLOCKS (isComplete
-        # waiter) until it succeeds. A single onEvent Lambda can't wait ~10min for
-        # the build (Lambda/CR timeout), so we use the async isComplete pattern:
-        # onEvent fires start-build, isComplete polls batch-get-builds until the
-        # build leaves IN_PROGRESS, failing the deploy if it didn't SUCCEED.
-        cb_start_fn = _lambda.Function(
-            self,
-            "GoldenBuildStart",
-            runtime=_lambda.Runtime.PYTHON_3_12,
-            handler="index.on_event",
-            timeout=Duration.minutes(2),
-            code=_lambda.Code.from_inline(
-                "import boto3, json\n"
-                "cb = boto3.client('codebuild')\n"
-                "def on_event(event, ctx):\n"
-                "    rt = event['RequestType']\n"
-                "    if rt == 'Delete':\n"
-                "        return {'PhysicalResourceId': event.get('PhysicalResourceId','golden-build')}\n"
-                "    proj = event['ResourceProperties']['ProjectName']\n"
-                "    # rerun whenever IMAGE_VERSION changes (Update) or on Create\n"
-                "    b = cb.start_build(projectName=proj)['build']\n"
-                "    return {'PhysicalResourceId': b['id'], 'Data': {'BuildId': b['id']}}\n"
-            ),
-        )
-        cb_done_fn = _lambda.Function(
-            self,
-            "GoldenBuildPoll",
-            runtime=_lambda.Runtime.PYTHON_3_12,
-            handler="index.is_complete",
-            timeout=Duration.minutes(2),
-            code=_lambda.Code.from_inline(
-                "import boto3\n"
-                "cb = boto3.client('codebuild')\n"
-                "def is_complete(event, ctx):\n"
-                "    rt = event['RequestType']\n"
-                "    if rt == 'Delete':\n"
-                "        return {'IsComplete': True}\n"
-                "    bid = event['PhysicalResourceId']\n"
-                "    b = cb.batch_get_builds(ids=[bid])['builds'][0]\n"
-                "    status = b['buildStatus']\n"
-                "    if status == 'IN_PROGRESS':\n"
-                "        return {'IsComplete': False}\n"
-                "    if status == 'SUCCEEDED':\n"
-                "        return {'IsComplete': True}\n"
-                "    raise Exception(f'golden image build {bid} ended {status}')\n"
-            ),
-        )
-        cb_start_fn.add_to_role_policy(
-            iam.PolicyStatement(
-                actions=["codebuild:StartBuild"],
-                resources=[golden_project.project_arn],
-            )
-        )
-        cb_done_fn.add_to_role_policy(
-            iam.PolicyStatement(
-                actions=["codebuild:BatchGetBuilds"],
-                resources=[golden_project.project_arn],
-            )
-        )
-        golden_provider = cr.Provider(
-            self,
-            "GoldenBuildProvider",
-            on_event_handler=cb_start_fn,
-            is_complete_handler=cb_done_fn,
-            query_interval=Duration.seconds(30),
-            total_timeout=Duration.minutes(40),
-        )
-        image_ready = cdk.CustomResource(
-            self,
-            "GoldenImageReady",
-            service_token=golden_provider.service_token,
-            properties={
-                "ProjectName": golden_project.project_name,
-                # change forces re-bake when the image version changes
-                "ImageVersion": image_version,
-            },
-        )
-        image_ready.node.add_dependency(golden_project)
+    # Golden-image bake moved to its own stack (deploy/stacks/image.py →
+    # OpenClawImageStack). It ran a CodeBuild project behind a BLOCKING custom
+    # resource here, so a build failure rolled back the whole orchestrator
+    # stack. Split out + made non-blocking: a bad build now only touches the
+    # image stack. The ASG below no longer depends on image readiness (ctx has
+    # no image_ready), so a fresh region may churn a host a few minutes until
+    # the bake lands the rootfs — not a deploy failure.
 
     # ╓─── [包B 隔离安全] owner=B ── ASG/userdata/LiteLLM/DNS-FW/Wazuh/FlowLogs/AgentCore ─╖
     # ========== ASG (P1-4) ==========
@@ -570,7 +405,6 @@ def build_compute(self, ctx):
     ctx.amp_remote_write_url = locals().get("amp_remote_write_url")
     ctx.gateway_url = locals().get("gateway_url")
     ctx.host_role = locals().get("host_role")
-    ctx.image_ready = locals().get("image_ready")
     ctx.instance_profile = locals().get("instance_profile")
     ctx.metrics_cfg = locals().get("metrics_cfg")
     ctx.sec_cfg = locals().get("sec_cfg")

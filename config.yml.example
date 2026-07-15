@@ -134,6 +134,12 @@ redis:
   # valkey→"7.2";redis→"7.1"。参数组 family 自动取 <engine><major>(valkey7 / redis7)。
   engine_version: "7.2"
   num_replicas: 2             # 总节点数 = 1 primary + num_replicas replica
+  # #281 复用现网(imported 场景):填了就复用客户已有的子网组/参数组,不建新的、不改现有。
+  #   传 ARN,代码取末段作 group name。空(默认)= 按上面 subnet_ids/engine 自建。
+  #   ⚠️ 复用者自保:子网组须覆盖 ≥2 AZ(automatic_failover 要求);参数组 family 须匹配
+  #      engine+major(valkey7 / redis7),不匹配 CreateReplicationGroup 400。
+  existing_subnet_group_arn: ""     # 如 arn:aws:elasticache:<region>:<acct>:subnetgroup:<name>
+  existing_parameter_group_arn: ""  # 如 arn:aws:elasticache:<region>:<acct>:parametergroup:<name>
 
 # ========== 数据面边缘 OpenResty ASG(P2b · #187,§6 HA 核心)==========
 # 独立 ASG(跨 3 AZ,不与 host ASG 混)。挂一台自动拉新——ELB health check
@@ -194,7 +200,7 @@ scaler:
 # 只管 create/start 的高并发装箱聚合。一期 push=聚合 SSM(单 host 一条命令带 batch
 # manifest),二期 pull=写 assignments 表让 host-agent 自取。设计契约:
 # SPEC/specs/sqs-dispatch/interfaces.md。ADR:
-# the SQS-dispatch design doc。
+# 见 SQS-dispatch 设计文档。
 #
 # 开关矩阵(interfaces.md L30):
 #   dispatch.enabled=false → 什么都不建,现状不变(向后兼容)。
@@ -454,7 +460,7 @@ security:
   #   测试期可先用一把手工指定的 CMK 加密验证链路,部署后切成本栈输出的 ARN。
   clawpool_cmk_enabled: false
   guardduty_enabled: false   # true=CDK 启 GuardDuty detector + 把 Finding 经 EventBridge 路由到 SNS(供 Wazuh/订阅者消费)。账号已有 detector 时保持 false。
-  guardduty_runtime_monitoring: false   # true=在 detector 上启 RUNTIME_MONITORING feature,同时把 EC2_AGENT_MANAGEMENT 显式设为 DISABLED —— 开 automated agent management 会给账号内所有 EC2 装 GuardDuty agent(SSM association),会波及本栈之外的 host。安全开启法:只给需要监控的实例打 inclusion tag GuardDutyManaged=true(或反向给不想装的 host 打 exclusion tag GuardDutyManaged=false)。account 层威胁检测(GD 自身的 9 feature)不受此开关影响,一手证据 the 8-layer verification evidence。前置:guardduty_enabled: true。默认 false。
+  guardduty_runtime_monitoring: false   # true=在 detector 上启 RUNTIME_MONITORING feature,同时把 EC2_AGENT_MANAGEMENT 显式设为 DISABLED —— 开 automated agent management 会给账号内所有 EC2 装 GuardDuty agent(SSM association),会波及本栈之外的 host。安全开启法:只给需要监控的实例打 inclusion tag GuardDutyManaged=true(或反向给不想装的 host 打 exclusion tag GuardDutyManaged=false)。account 层威胁检测(GD 自身的 9 feature)不受此开关影响,(详见 AWS GuardDuty runtime monitoring 文档)。前置:guardduty_enabled: true。默认 false。
   inspector_enabled: false   # true=在本 region 启用 Amazon Inspector v2(经 AwsCustomResource 调 inspector2:Enable),对 EC2/ECR 做 CVE 与配置扫描,Finding 经 EventBridge 路由到 SNS。默认 false:Enable 是账号级动作(按扫描资源计费),建议由账号运营方显式打开。stack destroy 时会 Disable。
   inspector_resource_types: ["EC2", "ECR"]   # inspector_enabled=true 时扫描的资源类型。可选 EC2/ECR/LAMBDA/LAMBDA_CODE/CODE_REPOSITORY。默认覆盖 host CVE(EC2) + 镜像 CVE(ECR)。
   wazuh_enabled: false       # true=CDK 起一台专用监控 EC2(m7i.xlarge/AL2023),userdata 自动装 docker+compose 跑 Wazuh manager/indexer/dashboard,从 assets bucket 拉 deployment/monitoring/*。SG 仅 VPC CIDR 入站(1514/1515/55000/443,绝不 0.0.0.0)。默认 false。
@@ -526,8 +532,8 @@ image:
 
 # ========== 可观测性:数据面日志管道(issue #219 / #209 spec)==========
 # Fluent Bit(edge)→ Kinesis Data Firehose → Amazon OpenSearch Service
-# 与 Wazuh 告警域(deploy/monitoring/wazuh-two-ec2/)绝不共域(设计红线):
-# 安全审计与运维日志故障+权限隔离。guest microVM 内零凭据零 agent,
+# 与 Wazuh 告警域(deploy/monitoring/wazuh-two-ec2/)绝不共域(设计红线,
+# 硬红线):安全审计与运维日志故障+权限隔离。guest microVM 内零凭据零 agent,
 # 采集只在 host/edge 侧(L5 卖点,SHALL NOT 破坏)。
 #
 # 尺寸默认取最小可上线的形状(2 数据节点 + 无专用主节点)。真实 sizing 必须

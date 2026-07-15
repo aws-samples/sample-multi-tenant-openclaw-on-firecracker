@@ -140,10 +140,22 @@ def build_observability(self, ctx):
 
     # #272 — logging.aos.subnet_ids 非空时显式选 OpenSearch 域子网(imported 私有
     # 子网场景);缺省回落 PRIVATE_WITH_EGRESS → private_subnets。
+    # #280 — 用 from_subnet_attributes 显式带 AZ:from_subnet_id 不带 AZ,CDK 拿到
+    # dummy AZ token,OpenSearch Domain 的 zone_awareness 多 AZ 分布错乱、LogDomain
+    # 部署失败。契约:subnet_ids 书写顺序须与 stack AZ 顺序(self.availability_zones)
+    # 一致 —— 按 index 配对,乱序填会给子网标错 AZ。
     _aos_subnet_ids = _aos_cfg.get("subnet_ids") or []
     if _aos_subnet_ids:
+        _stack_azs = list(self.availability_zones)
         _subnets = [
-            ec2.Subnet.from_subnet_id(self, f"AosSubnet{_i}", _sid)
+            ec2.Subnet.from_subnet_attributes(
+                self,
+                f"AosSubnet{_i}",
+                subnet_id=_sid,
+                availability_zone=_stack_azs[_i]
+                if _i < len(_stack_azs)
+                else _stack_azs[0],
+            )
             for _i, _sid in enumerate(_aos_subnet_ids)
         ]
     else:

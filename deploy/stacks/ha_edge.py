@@ -1023,7 +1023,14 @@ def build_ha_edge(self, ctx):
             raise ValueError(
                 f"redis.engine={_redis_engine!r} 不支持;只能是 'redis' 或 'valkey'"
             )
-        _redis_engine_version = str(_redis_cfg.get("engine_version", "7.1"))
+        # engine_version 兜底按引擎给对应默认:valkey 最低 7.2(无 7.1),redis 用 7.1。
+        # 防呆:engine=valkey 但漏 engine_version 时兜底 7.1 = 非法组合(ElastiCache
+        # 无 Valkey 7.1),部署 400。只填 major.minor("7.2"),补丁号(如 7.2.6)由 AWS
+        # 托管不显式指定(设计决策)。
+        _redis_default_ver = "7.2" if _redis_engine == "valkey" else "7.1"
+        _redis_engine_version = str(
+            _redis_cfg.get("engine_version") or _redis_default_ver
+        )
         # 参数组 family:引擎 + major(如 redis7 / valkey7)。DoD 要求显式建、
         # 不用 default parameter group(便于后续调 maxmemory-policy 等)。
         _redis_major = _redis_engine_version.split(".")[0]
@@ -1052,8 +1059,10 @@ def build_ha_edge(self, ctx):
             cache_subnet_group_name=_redis_subnet_group.ref,
             security_group_ids=[_redis_sg.security_group_id],
             port=6379,
-            # 不开 transit/auth_token:SG 隔离即够(私网内 6379 只对 host/edge SG)。
-            # 拉长部署链、host-agent redis-py + lua-resty-redis 都要额外配。
+            # 显式关 transit 加密(设计决策):SG 隔离即够(私网内 6379 只对 host/edge
+            # SG),不开 TLS/auth_token —— 拉长部署链、host-agent redis-py +
+            # lua-resty-redis 都要额外配。显式 False 优于隐式(防未来引擎默认变化)。
+            transit_encryption_enabled=False,
         )
         _redis_rg.add_dependency(_redis_subnet_group)
         _redis_rg.add_dependency(_redis_param_group)

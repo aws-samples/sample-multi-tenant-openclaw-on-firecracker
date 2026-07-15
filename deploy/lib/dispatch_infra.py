@@ -161,9 +161,18 @@ class DispatchInfra(Construct):
         # ---------- DLQ + 标准队列 ----------
         # 标准队列(非 FIFO):dispatch 一期靠"预生成 tenant_id + tenants 条件写(attribute_
         # not_exists) + 消费端认领闸(dispatch_claim CAS)"做幂等,不依赖 FIFO 的
-        # MessageDeduplicationId(interfaces.md L52-53)。visibility_timeout 300s 给聚合
-        # SSM 命令留足推导 executionTimeout 空间(SPEC L118 要求 executionTimeout ≤
-        # visibility - 60s);dlq_max_receive_count 从 cfg,默认 3。
+        # MessageDeduplicationId(interfaces.md L52-53)。dlq_max_receive_count 从 cfg,默认 3。
+        #
+        # visibility_timeout 必须 ≥ 消费 Lambda 的 timeout(AWS SQS→Lambda 硬约束,否则
+        # CFN CreateQueue/ESM 报 "visibility less than function timeout" 400)。ESM 挂在
+        # api_fn 上(见下 add_event_source_mapping),api_fn timeout=900s(#217 pull-image
+        # 金丝雀链)。取 960 = 900 + 60s buffer:AWS 硬约束是 ≥(900 恰好合法),但官方
+        # 最佳实践建议 visibility 大于 function timeout 留边界余量,避免 function 跑满
+        # 900s 时消息在同一刻可见性到期被重投的竞态。消费侧 env 未显式下发:
+        # clients.DISPATCH_VISIBILITY_TIMEOUT_SEC 走默认 900,cap SSM executionTimeout
+        # = 900-60=840s(dispatch_service._derive_exec_timeout)≤ 960,方向安全
+        # (消费侧假设的 visibility 比真实值小,只会更保守不会撞重投)。旧值
+        # 300 < 900 是 bug(基础设施与消费侧不同源,dispatch.enabled=true 首次部署即 CFN 400)。
         dlq_max_receive = int(merged.get("dlq_max_receive_count", 3))
         self.dlq = sqs.Queue(
             self,
@@ -175,7 +184,7 @@ class DispatchInfra(Construct):
             self,
             "DispatchQueue",
             queue_name=_QUEUE_NAME,
-            visibility_timeout=Duration.seconds(300),
+            visibility_timeout=Duration.seconds(960),
             dead_letter_queue=sqs.DeadLetterQueue(
                 max_receive_count=dlq_max_receive, queue=self.dlq
             ),

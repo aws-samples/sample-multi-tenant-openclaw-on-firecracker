@@ -40,7 +40,7 @@ docker compose --env-file deploy/monitoring/.env -f deploy/monitoring/docker-com
 
 microVM 镜像已烤 auditd + `openclaw-fim.sh`(build-rootfs)。让它们转发到 manager 的两条路(任选/并用):
 
-- **A. Wazuh agent(推荐)**:在 build-rootfs 的镜像里装 `wazuh-agent`,`ossec.conf` 指向 manager `1514`,enrollment 走 `1515`。agent 跑在 guest 内、agent 进程对 OpenClaw agent 不可见(同生产级 Wazuh-in-ns 思路)。注册用 per-tenant key,不复用。
+- **A. Wazuh agent(推荐)**:在 build-rootfs 的镜像里装 `wazuh-agent`,`ossec.conf` 指向 manager `1514`,enrollment 走 `1515`。agent 跑在 guest 内、agent 进程对 OpenClaw agent 不可见(同 the reference platform Wazuh-in-ns 思路)。注册用 per-tenant key,不复用。
 - **B. 无 agent(轻量)**:FIM/auditd 告警已落 guest 内日志,host-agent 旁路把这些行经 manager syslog `514/udp` 转发(不下沉凭据到 guest)。
   > 验证:在测试 microVM 内触发 reverse-shell 探测(规则 100210)或改一个受保护身份文件(规则 100110),Wazuh dashboard 的 Security events 里**几秒内出现该 alert**(rule.id 100210/100110)。这是端到端真验,不是看进程起没起。
 

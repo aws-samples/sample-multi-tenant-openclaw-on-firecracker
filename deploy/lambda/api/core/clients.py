@@ -91,7 +91,7 @@ batch_jobs_table = (
     else None
 )
 
-# #97 档A — optional external-platform → Cognito-IdP map (the design docs §2.7). Absent →
+# #97 档A — optional external-platform → Cognito-IdP map (the design doc §2.7). Absent →
 # federation not configured; /tenantmatch returns 404 (front-end falls back to
 # passing identity_provider explicitly). Partition key: platform_id (S).
 tenant_idp_table = (
@@ -181,7 +181,7 @@ COGNITO_REGION = os.environ.get("AWS_REGION", "") or os.environ.get(
     "AWS_DEFAULT_REGION", ""
 )
 
-# ── End-to-end Cognito for the (retired) channel plane ──
+# ── : end-to-end Cognito for the channel plane ──
 # The app client (public, USER_PASSWORD_AUTH) the per-tenant machine-user signs
 # in with. Injected by CDK from the stack-owned pool. Empty = channel Cognito
 # DISABLED → create_tenant keeps minting the legacy HMAC channel_secret only

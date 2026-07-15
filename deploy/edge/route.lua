@@ -5,7 +5,7 @@
 -- Each phase is a thin dispatcher — logic lives in edge.lib.*.
 --
 -- Data contract with host-agent + iac-dev:
---   the data-plane interface contract
+--   internal-docs/00-knowledge-base/the data-plane design/the data-plane interface contract
 --
 -- Do not add business logic here. Keep this file the "entry only, routes to
 -- domain" boundary per .claude/rules/code-craft-discipline.md.

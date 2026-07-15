@@ -4,7 +4,7 @@ This section describes the reference architecture of this solution, the high-lev
 
 ## Architecture diagram
 
-Deploying this solution with the default parameters builds the following components in your AWS account. The delivery-level architecture comprises three areas: the data plane (end users flow through Amazon CloudFront → Application Load Balancer → OpenResty edge Auto Scaling group with a Redis route table → host iptables PREROUTING DNAT → the OpenClaw-native gateway inside the virtual machine), the control plane (fully managed and serverless, orchestrating the full tenant lifecycle), and the L1-through-L5 defense-in-depth boundaries. The numbered flow below and the component descriptions in Architecture details cover each of these areas.
+Deploying this solution with the default parameters builds the following components in your AWS account. The delivery-level architecture comprises three areas: the data plane (end users flow through the platform backend WebSocket gateway → Amazon CloudFront → Application Load Balancer → the OpenResty edge → the OpenClaw gateway inside the virtual machine), the control plane (fully managed and serverless, orchestrating the full tenant lifecycle), and the L1-through-L5 defense-in-depth boundaries. The numbered flow below and the component descriptions in Architecture details cover each of these areas.
 
 > **Note**
 >
@@ -12,27 +12,29 @@ Deploying this solution with the default parameters builds the following compone
 
 > **Note**
 >
-> The AWS resources of this solution are created based on AWS Cloud Development Kit (AWS CDK) constructs. At deployment time, the AWS CDK synthesizes an AWS CloudFormation template and manages the lifecycle of the resources. The rendered diagram may still show the legacy WebSocket hub; that component has been removed. The authoritative data-plane flow is the two-tier edge route described in the text below: an OpenResty edge Auto Scaling group behind the Application Load Balancer resolves each tenant's route from a Redis route table and forwards to the tenant's virtual machine through host iptables DNAT.
+> The AWS resources of this solution are created based on AWS Cloud Development Kit (AWS CDK) constructs. At deployment time, the AWS CDK synthesizes an AWS CloudFormation template and manages the lifecycle of the resources. The data plane (OpenResty edge Auto Scaling group + Amazon ElastiCache Redis routing table) is an opt-in capability, controlled by `edge.enabled` / `redis.enabled` in `config.yml` and disabled by default; see [Chapter 13, Data-plane two-tier routing](13-data-plane-redesign.md) for details when enabled.
 
 The components of the solution deployed by the AWS CloudFormation template follow this high-level flow.
 
-1. A platform engineer or automation program calls the control plane REST API through Amazon API Gateway to submit management operations such as tenant registration, lifecycle, and backup. The request carries a token issued by Amazon Cognito (`Authorization: Bearer`), which the control plane verifies and then authorizes by role-based access control (RBAC).
+1. A platform engineer or automation program calls the control plane REST API through Amazon API Gateway to submit management operations such as tenant registration, lifecycle, and backup. The request carries an `x-api-key`; when RBAC is enabled, write operations additionally carry a token issued by Amazon Cognito (`Authorization: Bearer`), which the control plane verifies and then authorizes by role-based access control (RBAC).
 
-2. Amazon API Gateway invokes the AWS Lambda control plane functions, which read and write metadata in Amazon DynamoDB (such as tenants, hosts, and skill groups) and issue virtual machine lifecycle commands to the target host through AWS Systems Manager.
+2. Amazon API Gateway invokes the AWS Lambda control plane functions, which read and write metadata in Amazon DynamoDB (such as tenants, hosts, and skill groups) and dispatch virtual machine lifecycle commands to the target host (through AWS Systems Manager by default; at large scale, commands are load-leveled through Amazon SQS and pulled by the host agent).
 
 3. The hosts (Amazon EC2 bare metal instances) are managed by an Amazon EC2 Auto Scaling group. After a new host starts, it bootstraps itself, downloads the read-only golden image, registers into the host table, and starts a Firecracker microVM for each tenant on top of KVM.
 
-4. Before each microVM starts, the host script cold-injects identity, skills, and tenant-specific configuration (gateway_token, billing virtual key) to disk. The microVM mounts the read-only golden image disk and is a finished product at boot. This step is entirely completed before the Firecracker `InstanceStart`, corresponding to "zero runtime operations."
+4. Before each microVM starts, the host script cold-injects identity, skills, and tenant-specific configuration (gateway token, device pairing file, billing virtual key) to disk. The microVM mounts the read-only golden image disk and is a finished product at boot. This step is entirely completed before the Firecracker `InstanceStart`, corresponding to "zero runtime operations."
 
-5. End users access the chat interface through a browser or frontend, which reaches the platform back end and then Amazon CloudFront. CloudFront serves as the single public entry point, originating to the Application Load Balancer (least-outstanding-requests), which forwards to the OpenResty edge Auto Scaling group.
+5. End users connect through a browser or frontend to the platform backend WebSocket gateway over wss `/gw/ws`. The gateway verifies the platform session token (an HS256 JWT, not Cognito); the frontend never touches any secret.
 
-6. The OpenResty edge Auto Scaling group looks up the tenant's route in a Redis route table, backed by three cache tiers: an L1 lrucache (5s), an L2 shared_dict (60s), and L3 Amazon ElastiCache. The resolved route identifies the host and port that front the tenant's virtual machine.
+6. Acting as a WebSocket client, the platform backend gateway connects through Amazon CloudFront → Application Load Balancer → the OpenResty edge to the target microVM's OpenClaw gateway, authenticating with the OpenClaw-native Ed25519 asymmetric device handshake (the private key is held by the platform backend; the public key is cold-injected into the microVM pairing file).
 
-7. Host iptables PREROUTING DNAT (ports 10000-10400) forwards the request to the OpenClaw-native gateway on the virtual machine's `:18789`. The gateway authenticates the request solely with the tenant's `gateway_token` (`Authorization: Bearer`); the gateway's controlUi is disabled. The sole data-plane credential is a per-tenant, AWS KMS envelope-encrypted `gateway_token` (`EncryptionContext={tenant_id}`), whose ciphertext is stored in Amazon DynamoDB with a 15-minute TTL and cold-injected by `launch-vm.sh`; the control-plane API Lambda holds no `kms:Decrypt` permission.
+7. The OpenResty edge looks up the Amazon ElastiCache Redis routing table by `tenant_id` (`route:{tenant_id}`), strips the `/ws/{tenant_id}` prefix, and delivers the connection via host iptables DNAT straight to port 18789 of the corresponding microVM gateway. The microVM exposes this port only on the host-internal TAP interface and opens no public inbound access.
 
-8. Media and image handling (for example, upload and download via Amazon Simple Storage Service presigned URLs) is out of scope of the current sample chat demo, which exchanges text messages only.
+8. Key events of the control plane and data plane are recorded as metrics and logs through Amazon CloudWatch; host probes expose Prometheus metrics for the monitoring platform to collect; security-related events can be aggregated into a unified alerting channel through Amazon GuardDuty and Amazon EventBridge (disabled by default, enabled on demand).
 
-9. Key events of the control plane and data plane are recorded as metrics and logs through Amazon CloudWatch; host probes expose Prometheus metrics for the monitoring platform to collect; security-related events can be aggregated into a unified alerting channel through Amazon GuardDuty and Amazon EventBridge (disabled by default, enabled on demand).
+> ⚠️ **Note (superseded)**
+>
+> The data-plane chain above replaces the earlier "claw-hub WebSocket hub + claw-channel outbound dial + triple Amazon Cognito identity" model (data-plane decentralization redesign, 2026-07-08; see [Chapter 13, Data-plane two-tier routing](13-data-plane-redesign.md)). The old model's components (claw-hub, claw-channel, hub tokens, and hub-brokered Amazon S3 presigned URLs for media) have been removed from the deployment code and archived.
 
 ## AWS Well-Architected design considerations
 
@@ -53,8 +55,8 @@ This section describes how this solution applies the principles and best practic
 
 This section describes how this solution applies the principles and best practices of the Security pillar.
 
-- This solution uses Amazon Cognito as the single root of trust for control-plane identity; the control plane accepts only tokens verified by Cognito, and downgrades to least privilege (read-only) whenever verification fails. The data plane does not use Cognito; it authenticates each tenant with a per-tenant `gateway_token`.
-- This solution enables role-based access control (RBAC) by default, enforcing per-route role checks and resource ownership checks.
+- The data-plane identity root of this solution is the OpenClaw-native Ed25519 asymmetric device authentication (private key held by the platform backend, public key cold-injected into the microVM); the control plane is gated by `x-api-key` plus optional Amazon Cognito RBAC, and downgrades to least privilege (read-only) whenever verification fails.
+- This solution enables role-based access control by default (RBAC, `console_auth.rbac_enabled` defaults to `true`), enforcing per-route role checks and resource ownership checks; even with RBAC disabled, the resource ownership (`owner_id`) check is unaffected.
 - This solution provisions a dedicated-kernel Firecracker microVM for each tenant, and drops cross-tenant east-west traffic at host iptables, as well as traffic from the virtual machine to the Instance Metadata Service (IMDS) and to host management ports.
 - The agent tool execution layer of this solution vetoes dangerous actions such as credential exfiltration and sensitive file reads before the tool actually executes, and the content layer intercepts jailbreaks and harmful content through Amazon Bedrock Guardrails.
 - The virtual machine of this solution is a zero-credential golden image that holds no long-term AWS credentials; identity and skills are baked into the read-only disk and cannot be tampered with at runtime.
@@ -76,7 +78,7 @@ This section describes how this solution applies the principles and best practic
 - This solution runs Firecracker with native KVM on Amazon EC2 bare metal instances; the microVM pure startup takes approximately 1.74s (bare metal measured, p50), and from startup to gateway availability takes approximately 6.48s (measured).
 - This solution uses bare metal instance types with AWS Graviton processors (Arm64) as the production foundation, running microVMs with native KVM to avoid the performance overhead of nested virtualization.
 - This solution uses an Amazon SQS load-leveling queue to flatten large-scale lifecycle operations into a controlled concurrency rate, avoiding the AWS Systems Manager per-instance concurrency quota becoming a bottleneck.
-- This solution supports memory overcommit reclamation (balloon, disabled by default, enabled on demand); a single bare metal instance measured to carry 187 fully healthy nodes (constrained by a disk bottleneck, measured).
+- This solution supports memory overcommit reclamation (Firecracker balloon, `balloon.enabled` on by default with `free_page_reporting`); a single bare metal instance measured to carry 187 fully healthy nodes (constrained by a disk bottleneck, measured).
 
 ### Cost Optimization
 

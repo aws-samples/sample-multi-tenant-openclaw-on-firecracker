@@ -79,7 +79,7 @@ if [ "$EXIST_ID" != "None" ] && [ -n "$EXIST_ID" ]; then
   GID="$EXIST_ID"
 else
   # 去品牌收敛(issue #24):存量账号可能有旧品牌名的 guardrail(去品牌前建的,如
-  # 旧品牌-ai-chat-exchange-grade)。若存在,原地 update-guardrail 改名到中性名(id 不变
+  # legacy-ai-chat)。若存在,原地 update-guardrail 改名到中性名(id 不变
   # → LiteLLM/镜像的 guardrailIdentifier 引用不断),而不是另建一个 claw-* 留孤儿。
   # 用同一份 $GR_INPUT(name 已是中性名 + 完整 policy)做 update,replace 语义下 policy 零削减。
   # 探测规则:名字含 "-ai-chat-exchange-grade" 后缀但 name 不等于目标中性名 = 旧品牌残留。

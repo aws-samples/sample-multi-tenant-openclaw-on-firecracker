@@ -1,21 +1,19 @@
 # Deploy the Solution
 
-> **2026-07-08 data-plane redesign notice**: any real-time chat runtime steps in this chapter that reference the old hub/channel model — `claw-hub`, `claw-channel`, `/hub/token`, `/hub/ws`, HMAC `channel_secret` — have been superseded by [Chapter 13 · Data-plane two-tier routing](13-data-plane-redesign.md). Real-time chat now runs over the gateway two-tier route; use Chapter 13 and the Chapter 11 ops manual for current verification and troubleshooting. Control plane deployment and lifecycle steps in this chapter remain valid.
-
 Before you deploy this solution, review the architecture and the planning considerations in this guide. This solution provisions one dedicated-kernel Firecracker microVM per tenant on AWS, running an OpenClaw AI agent equipped with an identity, skills, and guardrails. The control plane (AWS Lambda, Amazon DynamoDB, and Amazon API Gateway) handles registration, lifecycle, backup, and deregistration, and injects no business data into tenant microVMs after they are running. This section describes the deployment process and the required steps.
 
 ## Deployment process overview
 
 This section describes the deployment entry points, configuration files, and recommended order of execution for the solution.
 
-The deployment code for this solution comprises four parts: an infrastructure definition built on the AWS Cloud Development Kit (AWS CDK) (`deploy/app.py` and `deploy/stack.py`), the host and microVM lifecycle scripts (`deploy/userdata/*.sh`), the golden image build script (`build-rootfs.sh`), and the data-plane OpenResty edge routing (`deploy/edge/`) plus the host-side routing script (`deploy/userdata/route_ops.py`: iptables DNAT + Redis route-table dual-write).
+The deployment code for this solution comprises four parts: an infrastructure definition built on the AWS Cloud Development Kit (AWS CDK) (`deploy/app.py` and `deploy/stack.py`, with the stack entry split into domain modules under `deploy/stacks/`), the host and microVM lifecycle scripts (`deploy/userdata/*.sh`), the golden image build script (`build-rootfs.sh`), and the opt-in data-plane edge components (`deploy/edge/`, the OpenResty edge nginx/Lua and bootstrap script).
 
 The AWS CDK entry point `deploy/app.py` reads `region` from context (defaults to `us-east-1`), instantiates `OpenClawOrchestratorStack`, and takes the account from the `CDK_DEFAULT_ACCOUNT` environment variable. The central configuration file `config.yml` defines, in one place, the host specification, microVM defaults, the Auto Scaling Group (ASG), Balloon memory reclamation, health checks, Multi-AZ, and Amazon Cognito authentication. The deployment commands are wrapped in `setup.sh`.
 
 The recommended deployment order is:
 
 1. Review `config.yml`, paying particular attention to the region (`region`), instance type (`instance_type`), and ASG capacity.
-2. Run `setup.sh` to complete the AWS CDK deployment and upload the host scripts and the `deploy/edge/` assets to the Amazon Simple Storage Service (Amazon S3) assets bucket.
+2. Run `setup.sh` to complete the AWS CDK deployment and upload the host/lifecycle scripts, LiteLLM gateway assets, monitoring assets, and console/chat static assets to the Amazon Simple Storage Service (Amazon S3) assets bucket.
 3. The ASG launches the first host, which runs `init-host.sh` to bootstrap itself and register with the hosts table.
 4. Register the first tenant through the control plane API and verify end-to-end connectivity.
 
@@ -45,7 +43,7 @@ A single build produces three independent ext4 images:
 
 - **rootfs (read-only golden image)**: pulled through debootstrap for Ubuntu Noble (arm64 from ports.ubuntu.com, amd64 from ec2.archive.ubuntu.com), with Node.js 22.x, the OpenClaw CLI, uv, auditd, and the GitHub CLI installed inside the chroot. Identity files and skills are baked into the rootfs at build time.
 - **data-template**: the data-disk template, serving as the baseline for the writable data disk on the microVM's first boot.
-- **immutable (read-only authoritative disk)**: contains 7 identity files and the 31 skills listed in `IMMUTABLE_SKILLS`, all of which are hashed with SHA-256 to produce the `golden-image.sha256` baseline.
+- **immutable (read-only authoritative disk)**: contains 7 identity files and the 11 ops/security skills listed in `IMMUTABLE_SKILLS`, all of which are hashed with SHA-256 to produce the `golden-image.sha256` baseline (an in-guest `openclaw-fim.timer` re-checks identity/skill tampering against this baseline every 5 minutes).
 
 The read-only semantics of the three images do not depend on the file system type; they are guaranteed by three overlaid layers: Firecracker's virtio write barrier (`is_read_only:true`), an in-guest `mount -o ro`, and a ro-bind.
 
@@ -67,7 +65,7 @@ Send a `POST /tenants` request to the control plane API to register a tenant. Th
 
 > **Note**
 >
-> Confirm that `POST /tenants` returns (measured at about 1.7 seconds), and that the tenant status changes from `creating` through `running` to `vm_health` up within about 4.0 seconds (measured). Then send a message over the real-time chat path to confirm the agent replies (end-to-end first reply measured at about 27 seconds): sign in with Amazon Cognito to obtain the id_token → `POST {CloudFront}/hub/token` with `Authorization: Bearer {id_token}` and `{"tenant_id":"<id>"}` to exchange for a frontend token → `wss {CloudFront}/hub/ws?token=<frontend token>` to send `{"text":"..."}` → receive `{"type":"reply"}`. Chat messages travel over the claw-hub WebSocket hub and the claw-channel outbound connection inside the VM, and do not pass through any gateway HTTP endpoint. See "Developer Guide — Real-time chat integration". **Legacy — the hub/channel chat path shown here has been superseded**: real-time chat now runs over the gateway two-tier route; use [Chapter 13](13-data-plane-redesign.md) / the Chapter 11 ops manual for current verification steps.
+> Confirm that `POST /tenants` returns (measured at about 1.7 seconds), and that the tenant status changes from `creating` through `running` to `vm_health` up within about 4.0 seconds (measured). Then send a message over the real-time chat path to confirm the agent replies (end-to-end first reply measured at about 27 seconds): the caller reads back the gateway token and device-key KMS ciphertexts from `GET /tenants/{id}` once `status=running` and decrypts them locally → the platform backend, holding the device private key, completes the Ed25519 device handshake with the microVM over the two-tier route (wss `/gw/ws` → CloudFront → ALB → OpenResty edge → microVM gateway:18789) → send a chat message and receive the streamed reply. Chat does not pass through any of the retired hub endpoints. See "Developer Guide — Real-time chat integration" and "Data-plane two-tier routing".
 
 ## Core resources created by the CDK deployment
 
@@ -98,7 +96,7 @@ The following security hardening is hard-coded in the deployment code and takes 
 
 - **Amazon S3 assets bucket fully blocks public access and enforces HTTPS**: the assets bucket (which carries tenant data disks, skills, backups, and images) is set to `block_public_access=BLOCK_ALL` (all four public-access block switches on) and `enforce_ssl=True` (AWS CDK automatically appends a Deny on `aws:SecureTransport=false` to the bucket policy). Amazon CloudFront accesses it through signed Origin Access Control (OAC) without breaking the path.
 - **VPC Flow Logs**: enabled by default (`flow_logs.enabled` defaults to true), delivered to the Amazon CloudWatch log group `/openclaw/vpc/flow-logs`, `traffic_type=ALL`, used to detect east-west cross-tenant anomalies and to verify that the iptables isolation is in effect. Retention defaults to 90 days.
-- **Two AWS WAF baseline rules cannot be trimmed by config**: regardless of how `config.yml`'s `waf.managed_rules` is set, the code side always merges `AWSManagedRulesSQLiRuleSet` and `AWSManagedRulesAmazonIpReputationList` into the rule set (deduplicated in order via `dict.fromkeys`). The current config additionally configures `AWSManagedRulesCommonRuleSet` and `AWSManagedRulesKnownBadInputsRuleSet`, for 4 rules in total after merging.
+- **AWS WAF baseline rules (effective only when WAF is enabled)**: AWS WAF as a whole is config-gated (`waf.enabled` defaults to `false`; when enabled it is associated with the API Gateway stage). Once enabled, regardless of how `waf.managed_rules` is set, the code side always merges `AWSManagedRulesSQLiRuleSet` and `AWSManagedRulesAmazonIpReputationList` into the rule set (deduplicated in order via `dict.fromkeys`); the sample config additionally configures `AWSManagedRulesCommonRuleSet` and `AWSManagedRulesKnownBadInputsRuleSet`, for 4 rules in total after merging. No WebACL is created while WAF is off.
 
 > **Note**
 >
@@ -106,7 +104,7 @@ The following security hardening is hard-coded in the deployment code and takes 
 
 ### Control plane API Lambda specification
 
-The control plane API Lambda runs on ARM_64 architecture, 256 MB of memory, and a 120-second timeout, with all configuration injected through environment variables. Amazon API Gateway is named `openclaw-orchestrator`, with stage `v1`, and routes are defined in the `add_resource` and `add_method` blocks (about 37 `add_method` calls, including GET/POST on the same resource).
+The control plane API Lambda runs on ARM_64 architecture, 256 MB of memory, and a 120-second timeout, with all configuration injected through environment variables. Amazon API Gateway is named `openclaw-orchestrator`, with stage `v1`, and routes are defined in the `add_resource` and `add_method` blocks (about 47 `add_method` calls, including GET/POST on the same resource).
 
 ---
 
@@ -133,7 +131,11 @@ Key points of host bootstrap:
 
 ### Launch a tenant microVM
 
-`launch-vm.sh` receives 9 arguments (defaults in brackets): `tenant_id`, `vm_num`, `vcpu[2]`, `mem_mb[4096]`, `config_template`, `restore_backup_key`, `scoped_skills`, `litellm_vkey`, `channel_secret`. Of these, the 8th, `litellm_vkey` (the per-tenant billing key), and the 9th, `channel_secret` (the per-tenant hub HMAC secret), are minted and passed in by the API Lambda at registration time, with fallbacks when empty (vkey falls back to a shared key, channel_secret is self-generated).
+`launch-vm.sh` receives 13 positional arguments: `tenant_id`, `vm_num`, `vcpu[2]`, `mem_mb[4096]`, `config_template`, `restore_backup_key`, `scoped_skills`, `litellm_vkey`, `channel_secret` (legacy dead parameter, see below), `chat_endpoint_enabled`, a deprecated 11th placeholder, the gateway-token KMS ciphertext, and the device-private-key KMS ciphertext. `litellm_vkey` (the per-tenant billing key) and the two KMS ciphertexts are minted and passed in by the API Lambda at registration time.
+
+> **Note**
+>
+> The 9th argument, `channel_secret`, is a leftover from the old data plane (claw-hub HMAC). It is still accepted in the signature, but its consuming logic (writing the channel HMAC into `openclaw.json`) was removed together with the claw-hub decommissioning; it is a dead parameter with no "self-generate when empty" fallback. Cleanup is tracked in a follow-up issue.
 
 > **Note**
 >
@@ -142,12 +144,13 @@ Key points of host bootstrap:
 All injection in this solution completes before the Firecracker `InstanceStart`; this is where "zero runtime operations" is implemented. The launch flow is:
 
 1. Mount data.ext4, inject shared skills, generate the gateway token, and inject the SSH public key.
-2. Modify `openclaw.json` through jq: write a random `NEW_TOKEN` as `gateway.auth.token`, write the claw-channel HMAC secret, set `claw-channel.enabled=true`, and point hubUrl/wsUrl at port 8790 of the host IP; in the same jq block, delete chatCompletions and dangerouslyDisableDeviceAuth and narrow allowedOrigins to a single CloudFront origin; if the API minted a per-tenant vkey, additionally write `.models.providers.litellm.apiKey`. **Legacy — the claw-channel HMAC secret / `claw-channel.enabled=true` / hubUrl parts of this example belong to the old channel model**; the current gateway model is in [Chapter 13](13-data-plane-redesign.md).
-3. Mount the `/dev/vdd` immutable read-only disk and start Firecracker.
+2. One-time section (first boot only): download the S3 config template, write the gateway token (first minted with `openssl rand`, or overwritten by decrypting the control-plane pre-minted KMS ciphertext under the `tenant_id` encryption context — decryption failure is fail-closed), and assemble the device pairing file `paired.json` per openclaw 2026.2.26 protocol v3.
+3. Idempotent convergence section (runs on every boot via `oc_harden_config`): unconditionally delete `dangerouslyDisableDeviceAuth`, narrow `allowedOrigins` to the current CloudFront origin, converge `baseUrl` to the LiteLLM host, and rewrite `apiKey` only when explicitly non-empty; the `chatCompletions` endpoint is kept or removed per the `chat_endpoint_enabled` argument (removed by default — secure default off).
+4. Mount the `/dev/vdd` immutable read-only disk (and the conditional `/dev/vde` credentials disk), then start Firecracker.
 
 After `InstanceStart`, the script disables strict mode, performs only an nginx reload and ssh-keygen cleanup, and no longer pushes data to the running microVM.
 
-Each tenant microVM uses four virtual disks: `vda` rootfs (read-only), `vdb` overlay (read-write copy-on-write), `vdc` data (read-write persistent), and `vdd` immutable (read-only authoritative disk). The three-layer stack is a read-only rootfs base + a per-microVM sparse writable overlay layer + a writable persistent data disk, with both rootfs and immutable set `is_read_only:true`.
+Each tenant microVM uses four virtual disks by default: `vda` rootfs (read-only), `vdb` overlay (read-write copy-on-write), `vdc` data (read-write persistent), and `vdd` immutable (read-only authoritative disk); tenants with injected credentials mount a fifth disk, `vde` creds (read-only). The core three-layer stack is a read-only rootfs base + a per-microVM sparse writable overlay layer + a writable persistent data disk, with rootfs, immutable, and creds all set `is_read_only:true`.
 
 The solution overlays three firewall isolation layers on each tenant microVM. The rules are all inserted with `-I` at the top of the FORWARD/INPUT chains, ahead of ACCEPT, with one copy inserted per microVM by tap interface:
 
@@ -211,7 +214,7 @@ A tenant with no health update for more than 120 seconds is determined to be sta
 
 ### AZ failover
 
-In the current `config.yml`, `multi_az.enabled=false` and `az_failover.enabled=false`; during the test period, it runs on a single AZ to save cross-AZ traffic costs. Once enabled, the logic is: if all hosts in an AZ are unhealthy for more than 10 consecutive minutes, failover is triggered, with a 30-minute cooldown to prevent repeated triggers. Recovery has a precondition gate — a backup must exist, otherwise the migration is refused and marked `failover_blocked`. The post-failover microVM is verified with three-layer detection: the Firecracker process exists, the nginx configuration exists, and a local HTTP probe returns less than 500; on success it records the audit log `AZ_FAILOVER_TENANT_RECOVERED`. The migration process is monitored with a 15-minute timeout, rolling back to running automatically on timeout; after failover and migration, it also verifies through the public path (through the ALB) that the dashboard is truly reachable, rolling back if unreachable.
+`config.yml.example` defaults to `multi_az.enabled: true` (`az_count: 2`) and `health_check.az_failover.enabled: true` — multi-AZ high availability is on by default. The logic is: if all hosts in an AZ are unhealthy for more than `unhealthy_threshold_minutes` (default 10) consecutive minutes, failover is triggered, with a `cooldown_minutes` (default 30) cooldown to prevent repeated triggers. Disabling multi-AZ saves cross-AZ traffic costs at the price of AZ-level resilience. Recovery has a precondition gate — a backup must exist, otherwise the migration is refused and marked `failover_blocked`. The post-failover microVM is verified with three-layer detection: the Firecracker process exists, the nginx configuration exists, and a local HTTP probe returns less than 500; on success it records the audit log `AZ_FAILOVER_TENANT_RECOVERED`. The migration process is monitored with a 15-minute timeout, rolling back to running automatically on timeout; after failover and migration, it also verifies through the public path (through the ALB) that the dashboard is truly reachable, rolling back if unreachable.
 
 ### Runtime monitoring
 
@@ -244,7 +247,7 @@ Capacity is adjusted through `config.yml`:
 
 - Each tenant microVM defaults to 2 vCPU / 4096 MB, controlled by `vm.default_vcpu` and `vm.default_mem_mb`; capacity is still estimated at a 2 GB-per-microVM memory baseline.
 - The overcommit ratio is controlled by `cpu_overcommit_ratio` and `mem_overcommit_ratio`. Allocatable capacity is computed as `allocatable_vcpu = total_vcpu × CPU_OVERCOMMIT_RATIO`, and the API side schedules based on each host's remaining capacity.
-- Each host is configured with a 600 GB gp3 encrypted EBS data disk (`/dev/sdf` mounted at `/data`), carrying the sparse disks and rootfs overlays of all microVMs. A single microVM's sparse disk actually occupies about 187 MB to 1.3 GB.
+- Each host is configured with a gp3 encrypted EBS data disk (`/dev/sdf` mounted at `/data`; `host.data_volume_gb` in `config.yml` defaults to 900 GB), carrying the sparse disks and rootfs overlays of all microVMs. A single microVM's sparse disk actually occupies about 187 MB to 1.3 GB (roughly 84–187 MB lightly loaded, up to 1.3 GB under heavy load).
 - microVM addressing tops out at vm_num 480 (one /30 point-to-point link per microVM).
 - Allocating vm_num uses a DynamoDB ConditionExpression optimistic lock, with 8 CAS retries.
 
@@ -288,7 +291,7 @@ Locate: SSH to the host, check whether the Firecracker process exists, and view 
 
 Remedy: the host-agent provides two levels of self-recovery, and in most cases no manual intervention is needed. When `vm.json` exists but the process has disappeared, `_recover_vm` restarts it; when Firecracker is alive but the guest network is continuously unreachable up to the threshold, `_force_relaunch_vm` rebuilds through stop plus launch. If all tenants on an entire host go stale at once, the host-agent itself is most likely down, and the health_check Lambda issues `systemctl restart host-agent` through Systems Manager to bring it up, with a 600-second cooldown (`RESTART_COOLDOWN_SECONDS=600`). Do not manually restart repeatedly during the cooldown; wait out the cooldown per `agent_restart_at`.
 
-Chat-specific troubleshooting (health is normal but the user's chat cannot connect): **real-time chat now runs over the gateway two-tier route; use [Chapter 13](13-data-plane-redesign.md) / the Chapter 11 ops manual for current verification and troubleshooting steps.** The steps below are retained as historical reference for the superseded hub/channel model. The chat path and the in-VM gateway control UI are two orthogonal paths; chat travels over the claw-hub WebSocket hub plus the in-VM claw-channel outbound connection, unrelated to the control UI. Troubleshoot in this order — (1) whether the claw-hub service (`claw-hub.service`) is healthy, whether `/hub/healthz` returns normally, and whether the host nginx `/hub/` reverse proxy is in effect; (2) the in-VM claw-channel outbound connection log (`claw-channel.log`), looking for decisions such as `token-fail`, `ws-unexpected-response`, and `ws-close`; (3) whether `channel_secret` in the Amazon DynamoDB tenant record is mirrored and ready (the hub verifies the VM's channel registration signature against it).
+Chat-specific troubleshooting (health is normal but the user's chat cannot connect): the data plane is a two-tier route (platform backend WS gateway → OpenResty edge → host DNAT → microVM gateway:18789); a break at any hop blocks chat. A 404 on `/ws/{tenant_id}` means the edge found no Redis route entry for that tenant; a 503 means Redis is unreachable. Note the gateway exposes no unauthenticated 2xx endpoint and `/healthz` may return 404 — do not treat that as "down"; probing the TCP port is sufficient. Troubleshoot in layers: `redis-cli GET route:<tenant_id>` (empty → the host agent never promoted/reported the route; present → check the edge instance's `edge_redis_host` env and nginx.conf), then `journalctl -u host-agent | grep -i route` on the host.
 
 ### Symptom B: microVM launch errors, the microVM does not come up
 

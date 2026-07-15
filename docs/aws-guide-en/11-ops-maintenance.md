@@ -4,6 +4,9 @@
 > scaling notes, and troubleshooting. This chapter is the operational floor
 > for 100k-tenant scale. Chinese counterpart lives at
 > `docs/aws-guide/11-ops-maintenance.md`; both stay in sync.
+> Source of truth for the data-plane redesign:
+> `internal-docs/00-knowledge-base/the data-plane design/` + the arch review
+> in `internal-docs/progress/aws-architect.md`.
 
 ---
 
@@ -27,7 +30,7 @@ plane `/ws/*` forwarded to the ALB.
 
 **Long-idle WS constraint**: CloudFront HTTP origin `readTimeout` is hard-
 capped at **180s** — this comes from CDK source
-`aws-cloudfront-origins/lib/http-origin.ts:76` where
+`aws-cdk-lib/aws-cloudfront-origins` `HttpOrigin` (line varies by CDK version) where
 `validateSecondsInRangeOrUndefined('readTimeout', 1, 180, ...)` is enforced.
 A WebSocket that goes idle > 180s will be cut by CloudFront regardless of
 the ALB (3600s) or OpenResty (3600s) timeouts. Clients MUST ping every
@@ -44,8 +47,8 @@ the ALB (3600s) or OpenResty (3600s) timeouts. Clients MUST ping every
 
 ## 11.2 Application Load Balancer
 
-**Role**: L7 data-plane entry. LOR routing to the OpenResty edge ASG;
-transitional `/hub/*` routes to the host target group.
+**Role**: L7 data-plane entry. LOR routing to the OpenResty edge ASG
+(the transitional `/hub/*` → host TG rule was removed with #187 P5).
 
 **Routine**: AWS-managed across 3 AZs. On CDK deploy verify
 `idle_timeout=3600s` (SSE/WS) and that the SG only accepts the CloudFront
@@ -272,7 +275,7 @@ redesign.
 
 - Lambda: `update-function-code` must ship the full dependency wheel —
   Python-only updates without deps have broken PyJWT in production (see
-  `memory/e2e-795-passed-and-pyjwt-lesson`).
+  `memory/e2e--passed-and-pyjwt-lesson`).
 - DynamoDB: PITR enabled (35 days). audit table WORM archive controlled
   by `config.yml:audit.worm_archive_enabled`. Snapshot before any delete
   (iron law #4).
@@ -448,6 +451,6 @@ Run these before taking over operations:
    against the actual deployment.
 3. Load Grafana; if there are no dashboards, run the provisioning script.
 4. Execute one manual failover drill (ElastiCache + host AZ).
-5. Review the last 30 days of release notes.
-6. Review the production-safety rules (never delete resources without a
-   snapshot; treat unknowns as production).
+5. Read the last 30 days of `CHANGELOG.md`.
+6. Read `.claude/rules/amazon-production-safety-do-not-delete.md` (never
+   delete resources without a snapshot; treat unknowns as production).

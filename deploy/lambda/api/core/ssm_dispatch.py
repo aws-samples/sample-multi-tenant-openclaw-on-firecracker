@@ -5,7 +5,7 @@
 从 handler.py 机械搬迁,函数体逐字不变:_launch_vm_wake_cmd / _launch_vm /
 _ssm_send / _ssm_run。_ssm_run 被 14 处调用(facade 别名保持 handler.<sym> 可用)。
 共享 ssm client + VM_PORT_BASE 从 core.clients import;stdlib(shlex/time) 本模块自带。
-#187 P5: 原 Cognito b64 分支(base64/json)已随 channel/hub 下线一并移除,
+#187 P5: 原  Cognito b64 分支(base64/json)已随 channel/hub 下线一并移除,
 第 11 位保留空占位("")保持位置对齐。
 按 design.md 层间契约:core 域不反向 import services/routes。
 facade:handler.py re-export 全部符号,旧 patch/调用路径全程有效。
@@ -117,7 +117,7 @@ def _launch_vm(
     # chat_endpoint_enabled=true in DDB get "1" → enabled:true injected.
     chat_ep_arg = "1" if chat_endpoint_enabled else "0"
     # #187 P5: 11th positional arg — 保留空占位。转型前是 INJECTED_COGNITO_B64
-    # (端到端 Cognito 渠道机器用户 base64),随 channel/hub 一起下线;这里
+    # ( 端到端 Cognito 渠道机器用户 base64),随 channel/hub 一起下线;这里
     # 传 "" 保持位置对齐,launch-vm.sh 位置参解析不动。
     cognito_arg = '""'
     # #187 P1: 12th positional arg — base64 ciphertext of the pre-minted gateway

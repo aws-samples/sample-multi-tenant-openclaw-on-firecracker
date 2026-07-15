@@ -2,20 +2,20 @@
 
 > 本章按 **测试 → 上线 → 生产** 三个阶段,把跑到 10 万 microVM 规模需要守的硬约束一次说清。**不重复 13 章**([数据面两级路由](13-data-plane-redesign.md))的架构原理,**也不重复 11 章**([组件运维手册](11-ops-maintenance.md))的日常告警指标。这里只讲三个问题:压测怎么打才算真、灰度上线怎么切、生产稳态守哪些红线。
 >
-> 规模基线来源:`internal design docs § 2`(10 万 microVM · ~300 host · 30 万并发 WS)。
+> 规模基线来源:`internal-docs/00-knowledge-base/the data-plane design/the requirements doc.md § 2`(10 万 microVM · ~300 host · 30 万并发 WS)。
 
 ---
 
 ## 14.1 测试阶段:满负载 380/台 + 反向用例
 
-**满负载硬要求**:真机测试必须打**满负载 380/台**,且用例集合**必含反向场景**,不允许只跑 happy path。
+**硬要求**:真机测试必须打**满负载 380/台**,且用例集合**必含反向场景**,不允许只跑 happy path。
 
 ### 满负载压测
 
-- **单机上限**:`r8g.metal-24xl` 每台 380 microVM(2 GB/VM × 380 = 760 GB,匹配 768 GB 内存)。测试计划见 `internal design docs`。
+- **单机上限**:`r8g.metal-24xl` 每台 380 microVM(2 GB/VM × 380 = 760 GB,匹配 768 GB 内存)。测试计划见 `internal-docs/00-knowledge-base/the data-plane design/the test plan.md`。
 - **不允许绕开的四类测试**(缺一挂 backlog,不许 close issue):
   1. **稳态**:380 microVM 全 running,SSE 保持 30 min 无掉线。
-  2. **突发建租户**:一批 300 create/s 打进 SQS dispatch,验证削峰到 host 单实例 SSM 并发 ≤ 阈值(795 实测 40 并发就撞 TimedOut,`memory: loadtest-380-ssm-concurrency-bottleneck`)。
+  2. **突发建租户**:一批 300 create/s 打进 SQS dispatch,验证削峰到 host 单实例 SSM 并发 ≤ 阈值( 实测 40 并发就撞 TimedOut,`memory: loadtest-380-ssm-concurrency-bottleneck`)。
   3. **单 AZ 挂**:kill 一个 AZ 的 edge + host 混合负载,余两 AZ 承接;验证 `az_failover` 迁租户能力(`config.yml:health_check.az_failover`)。
   4. **conntrack 表满**:边缘 + host 同时打到 `nf_conntrack_max=1048576` 附近,验证不丢包。edge 侧 `install-edge.sh:131`,host 侧 `init-host.sh:85-99`。
 
@@ -31,13 +31,13 @@
 
 ### 证据留痕
 
-所有测试结果必须落 `internal test evidence`——没留痕 = 没测过(per the project test discipline)。
+所有测试结果必须落 `internal-docs/00-knowledge-base/evidence/`——没留痕 = 没测过(the ops guide 测试纪律)。
 
 ---
 
 ## 14.2 上线阶段:灰度滚动 + 分步部署
 
-**核心纪律**(memory `goal-restructure-and-deploy-uswest2-2026-06-30`):不要 `min_capacity=1` 让 host 在镜像就绪前起。**正解顺序:先 min=0 → 烤镜像 → 再 scale 到目标容量**。
+**核心纪律**:不要 `min_capacity=1` 让 host 在镜像就绪前起。**正解顺序:先 min=0 → 烤镜像 → 再 scale 到目标容量**。
 
 ### 冷启部署顺序(fresh region)
 
@@ -57,7 +57,7 @@
 **改 stack.py**(改 IaC 结构、DDB schema、IAM):
 
 - 直接改 `stack.py` → `setup.sh` 走 CFN update。
-- **不可逆改动**(删 DDB 表 / 改 RemovalPolicy · 动安全红线 SG/IAM/凭据 · 动 Guardrail)必走 SHARED-FILES-PROTOCOL 串行 + 人工评审门。
+- **不可逆改动**(删 DDB 表 / 改 RemovalPolicy · 动安全红线 SG/IAM/凭据 · 动 Guardrail)必走 the shared-files protocol 串行 + 人工评审门。
 - DDB 表 `RETAIN` 是硬默认(尤其 tenants / audit / tenant-secrets);删表前必快照(铁律 #4)。
 
 ### 数据面切换状态(旧 hub-WS → 新两级路由,已完成)
@@ -121,7 +121,7 @@
 | CloudFront 长静默门       | **季度** | 打一个 200s 静默 WS · 观察是否被 CloudFront 180s 断 · 验证客户端心跳 SDK 落地情况                                             |
 | Guardrail 拦截采样        | **月度** | OWASP top 10 case 抽样跑 · 拦 14/14 是 baseline · 有掉的立刻查                                                                |
 
-演练结果落 `internal test evidence` 归档。
+演练结果落 `internal-docs/00-knowledge-base/evidence/` 归档。
 
 ---
 
@@ -130,5 +130,5 @@
 - **架构原理**:见 [第 13 章 · 数据面两级路由](13-data-plane-redesign.md)。
 - **组件运维手册**(告警阈值 / 扩缩容触发 / 故障排查):见 [第 11 章 · 组件运维手册](11-ops-maintenance.md)。
 - **私有 API 加固**:见 [第 12 章 · Private API Gateway](12-private-api-hardening.md)。
-- **HA 审计**(15 组件逐条 · 已修 vs 仍单点):见 [`internal design docs`](../../internal design docs)。
-- **交接文档**(新人上手):内部交接文档。
+- **HA 审计**(15 组件逐条 · 已修 vs 仍单点):见 [`internal-docs/00-knowledge-base/the data-plane design/HA-AUDIT-DRAFT.md`](../../internal-docs/00-knowledge-base/the data-plane design/HA-AUDIT-DRAFT.md)。
+- **交接文档**(新人上手):[`internal-docs/03-collaboration/HANDOVER.md`](../../internal-docs/03-collaboration/HANDOVER.md)。

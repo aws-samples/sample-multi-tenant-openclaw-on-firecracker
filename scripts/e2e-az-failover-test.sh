@@ -4,7 +4,8 @@
 #
 # e2e-az-failover-test.sh — REAL AZ-failover test against a live deployment.
 #
-# This drives the actual control plane:
+# Unlike tests/test_az_failover.py (which unit-tests the pure logic with mocked
+# AWS), this drives the actual control plane:
 #   1. Pick a running tenant and ensure it has a fresh backup (AZ failover
 #      restores from the latest backup, not a live snapshot).
 #   2. Mark the tenant's CURRENT AZ unhealthy by back-dating every active
@@ -32,7 +33,7 @@ source .env.deploy
 export E2E_PROFILE="${AWS_PROFILE:-jiasunm-neo}"
 export E2E_REGION="${AWS_REGION:-ap-northeast-1}"
 # shellcheck disable=SC1091
-source "$(dirname "$0")/lib/e2e_failover_helpers.sh"
+source tests/e2e_failover_helpers.sh
 
 REGION="$E2E_REGION"; PROFILE="$E2E_PROFILE"
 AWS=(aws --region "$REGION" --profile "$PROFILE")

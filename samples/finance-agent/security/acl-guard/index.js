@@ -1,6 +1,6 @@
 // acl-guard — programmatic before_tool_call deny-list (L3 "answer-side" enforcement).
 //
-// WHY: prompt-layer disclosure guardrails only live in the prompt (model self-discipline).
+// WHY: ops-guardrails as a skill only lives in the prompt (model self-discipline).
 // Red-teamers bypass that by talking the model into running the command anyway.
 // This plugin moves enforcement DOWN to the tool-execution layer: OpenClaw fires
 // `before_tool_call` BEFORE any tool runs, and a returned { block: true } is a
@@ -12,13 +12,19 @@
 // line 121: "before_tool_call — rewrite tool params, block execution, or require
 // approval"): handler gets { toolName, params, ctx }, returns
 // { block: true, blockReason } to veto.
-import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
+//
+// 2026-07-09: 去掉 `definePluginEntry` 包装(openclaw/plugin-sdk/plugin-entry)。
+// 该导出在 openclaw 2026.2.13/2.26 已不存在(是早期版本 API);2.13/2.26 的
+// plugins/loader.ts:resolvePluginModuleExport 期望 default export 直接是
+// { id, name, register(api){...} } 对象或函数(register?/activate? 二选一,
+// types.ts:236)。register 内 api.on("before_tool_call", ...) 与 hook 名在
+// 2.13/2.26 完全兼容(types.ts:278/306),故只改导出形态,内部逻辑不动。
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
 // Machine-readable deny-list. Each rule: a name + a matcher over the tool's
-// command/path/url fields. Patterns target the exact exfil classes the disclosure
-// guardrails describe in prose, now enforced deterministically.
+// command/path/url fields. Patterns target the exact exfil classes ops-guardrails
+// describes in prose, now enforced deterministically.
 const DENY_RULES = [
   {
     id: "env-dump",
@@ -111,11 +117,11 @@ function logDeny(entry) {
   }
 }
 
-export default definePluginEntry({
+export default {
   id: "acl-guard",
   name: "ACL Guard",
   description:
-    "Pre-tool-call deny-list for secret/IMDS exfiltration (code-enforced disclosure guardrails).",
+    "Pre-tool-call deny-list for secret/IMDS exfiltration (code-enforced ops-guardrails).",
   register(api) {
     api.on(
       "before_tool_call",
@@ -143,7 +149,7 @@ export default definePluginEntry({
               });
               return {
                 block: true,
-                blockReason: `ACL Guard denied: ${rule.why}. This action is blocked by code (disclosure-guardrail enforcement), not policy text.`,
+                blockReason: `ACL Guard denied: ${rule.why}. This action is blocked by code (ops-guardrails enforcement), not policy text.`,
               };
             }
           }
@@ -153,4 +159,4 @@ export default definePluginEntry({
       { priority: 1000 }, // run before any other tool hook
     );
   },
-});
+};

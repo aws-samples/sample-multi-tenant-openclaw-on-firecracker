@@ -99,7 +99,7 @@ _PURCHASE_PROVISIONED = "provisioned"
 _TENANT_SECRET_FIELDS = (
     "channel_secret",
     "litellm_vkey",
-    "cognito_channel_password",  # machine-user password, never to browser
+    "cognito_channel_password",  #  — machine-user password, never to browser
     "gateway_token",  # #100 — per-tenant bearer protecting the gateway control UI;
     # GET /tenants was leaking it in plaintext, letting one x-api-key harvest EVERY
     # tenant's gateway_token (credential batch-exposure). Server-side only (see :1092).
@@ -160,7 +160,7 @@ def _redact_tenant(item):
 # 一起落 openclaw-tenant-secrets 表。SSM 命令把密文按位置 12 传给 launch-vm.sh;host
 # 用同一 tenant_id ctx 解密后写入 openclaw.json 的 `.gateway.auth.token`。
 #
-# **API 侧不解密**(design decision):控制平面调用方
+# **API 侧不解密**(design decision 两次纠正 · the data-plane contract):控制平面调用方
 # 建租户后本就在 loop 里轮询状态,一旦查到 running 就绪、就在 GET /tenants/{id} 的
 # 响应里带回 gateway_token **密文原样**(base64 信封密文);GET /tenants/{id}/token
 # 保留作等价别名,同样只返密文。**调用方自己拿 KMS Decrypt**(它有 kms:Decrypt +
@@ -1183,7 +1183,7 @@ def create_tenant(body=None, event=None, _canary_host=None):
     # this is NOT a consumer replay, enqueue the create and return 202 — the
     # consumer drains the queue at its reserved-concurrency rate, so a burst of
     # 380 POST /tenants no longer fans out 380 synchronous SSM calls and trips the
-    # SSM single-instance concurrency wall (795: 40 concurrent → 11 TimedOut).
+    # SSM single-instance concurrency wall (: 40 concurrent → 11 TimedOut).
     # Parallelism is preserved: MessageGroupId = tenant_id means every create is
     # its own FIFO group and they consume concurrently (only same-tenant ops
     # serialize). We stamp the already-generated tenant_id into the queued body so
@@ -1238,7 +1238,7 @@ def create_tenant(body=None, event=None, _canary_host=None):
     # 64 hex chars == openssl rand -hex 32 (the format launch-vm.sh used).
     channel_secret = secrets.token_hex(32)
 
-    # #187 P5 — Cognito 渠道机器用户随 channel/hub 一起下线;数据面走
+    # #187 P5 — Cognito 渠道机器用户()随 channel/hub 一起下线;数据面走
     # 两级路由到 microVM:18789 gateway,鉴权改走 gateway 原生 token。
 
     # Find host with capacity. The scheduler is normally automatic, but
@@ -1929,7 +1929,7 @@ def delete_tenant(tenant_id, query_params, event=None):
         # Stop VM via SSM.
         # #268 — stop-vm 是关键副作用,不是 best-effort:失败=VM 孤儿(fc 进程还活着
         # 占内存/vCPU)+ 若继续标 deleted 则账本回退但 VM 没停(容量统计失真)。真机实测
-        # (新加坡 795,#263 削峰测试):create 的 launch-vm 挤爆单 host SSM
+        # (新加坡 ,#263 削峰测试):create 的 launch-vm 挤爆单 host SSM
         # CommandWorkersLimit=5,delete 的 stop-vm 排队 >30s → _ssm_run 返 False,旧代码
         # 忽略返回值照常标 deleted → 236 残留目录 + 27 孤儿 fc。这里 fail-loud:stop-vm
         # 失败则回滚 status 到删除前(复用 _abort_restore_status,CAS 保证只回滚自己翻的
@@ -1971,7 +1971,7 @@ def delete_tenant(tenant_id, query_params, event=None):
     # #187 转型:legacy_alb rule 已删,数据面走两级路由,无需再摘 per-tenant ALB rule。
 
     if host_id:
-        # 销毁租户 → 回收数据面路由(design decision)。
+        # 销毁租户 → 回收数据面路由(design decision:delete 可移除路由,stop 保留)。
         # DNAT 规则删除的 argv 必须与 host-agent route_ops.dnat_rule_args 加规则时
         # 完全一致(无 `-i <iface>` 前缀)——旧代码带 `-i` 前缀,与 route_ops 无 `-i`
         # 的规则不匹配,`iptables -D` 删不掉,DNAT 规则永久泄漏在 PREROUTING 链里,

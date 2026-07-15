@@ -3,7 +3,7 @@
 # guest microVM 经 metal host 用私网 IP 访问 litellm:4000，所以源限 VPC CIDR 足够。
 #
 # 用法：./open-sg-4000.sh            # 自动取本机 SG + VPC CIDR，幂等加规则
-#       VPC_CIDR=172.31.0.0/16 ./open-sg-4000.sh   # 手动指定
+#       VPC_CIDR=10.0.0.0/16 ./open-sg-4000.sh   # 手动指定
 #
 # 安全红线（违反即事故）：4000 入站源只能是 VPC CIDR 或 metal host SG，
 #   绝不 0.0.0.0/0。本脚本硬拒任何 0.0.0.0/0 入参。

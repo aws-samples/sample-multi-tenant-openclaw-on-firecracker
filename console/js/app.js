@@ -39,5 +39,8 @@ function app() {
     window.ocLoadtest,
     window.ocPoolOps,
     window.ocEdge,
+    window.ocTraces,
+    window.ocLogs,
+    window.ocAudit,
   );
 }

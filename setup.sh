@@ -456,7 +456,7 @@ aws s3 cp "$SCRIPT_DIR/deploy/userdata/stop-all-vms.sh" "s3://${BUCKET}/deployme
 # 不再单独上传 launch-all-vms.sh。launch-vm.sh 的上传在上方(第 415 行)。
 
 # #187 转型:claw-hub(WebSocket 中枢)数据面已下线。install-hub.sh + deploy/hub/
-# 全部随数据面重构下线归档。数据面改两级路由
+# 全部归档到 an internal archive。数据面改两级路由
 # 直连 microVM 原生 gateway(ALB LOR → OpenResty edge → Redis → host DNAT →
 # microVM:18789),setup.sh 不再上传 hub 资产;init-host.sh 里 install-hub.sh
 # 引用也应一并删(独立 issue,同 stack.py CloudFront /hub behavior + HubTG 收尾)。
@@ -543,7 +543,7 @@ source "$SCRIPT_DIR/.env.deploy"
 
 # 规范化 COGNITO_DOMAIN:前端代码自己拼 "https://" + domain（console/chat 两页
 # 的 fetch/redirect 都是这逻辑），所以注入值必须是**裸主机名**，不能带 scheme。
-# 历史上 795 部署因 stack output 带了 https:// 前缀，sed 进去后拼成 "https://https://…"
+# 历史上  部署因 stack output 带了 https:// 前缀，sed 进去后拼成 "https://https://…"
 # 畸形 URL → 登录重定向 ERR_TIMED_OUT、chat 拿不到用户身份显示"名下无节点"。
 # 这里无条件 strip 掉 scheme 和尾部斜杠，无论上游 output 怎么填都对，随重建继承。
 COGNITO_DOMAIN="$(printf '%s' "${COGNITO_DOMAIN:-}" | sed -E 's#^https?://##; s#/+$##')"
@@ -612,7 +612,7 @@ if [ -n "$CF_ORIGIN_VAL" ]; then
   echo "✓ SSM /openclaw/cloudfront-origin = ${CF_ORIGIN_VAL}"
 fi
 
-# Publish the channel machine-user app client id to SSM so the metal
+#  — publish the channel machine-user app client id to SSM so the metal
 # single-process hub (install-hub.sh) can read it and verify channel access
 # tokens. Empty unless console_auth.channel_cognito_auth is enabled (the stack
 # only emits CognitoChannelClientId then). install-hub treats empty as "channel

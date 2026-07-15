@@ -11,7 +11,7 @@
 // CloudFront /ws/* → ALB LOR → 3 台 OpenResty edge → Redis 查 route:{tenant_id}
 // 拿 host:port → 宿主 iptables DNAT → microVM:18789 OpenClaw gateway。
 // 认证:Authorization: Bearer <gateway_token>,per-租户唯一,由 P1 KMS 预铸
-// (per the API spec);token 明文由 tenant owner 从 console reveal 页面
+// (the API spec 二);token 明文由 tenant owner 从 console reveal 页面
 // 手动贴到 chat 页 localStorage.oc_gw_token(P5 讨论平台后端 relay 是否兜底,
 // 本 chat mini-app 走"用户持 token"最简形态)。
 // 现场 demo(file:// / localhost):走本地代理 127.0.0.1:8799/chat(token 在代理进程内存)。
@@ -361,7 +361,7 @@ function quickAsk(t) {
 }
 
 // 思考过程面板:按用户问题推断 agent 正在做的步骤,在回复气泡里轮换显示
-// (对齐通用 AI 助手的推理步骤展示)。返回 interval id,调用方在
+// (对齐主流 AI 助手的 StatusParts 推理展示)。返回 interval id,调用方在
 // 回复到达/出错时 clearInterval。纯前端 UX,文案是中性的"正在做某类事"。
 function thinkingSteps(q) {
   const r = (q || "").toLowerCase();
@@ -369,15 +369,15 @@ function thinkingSteps(q) {
   if (has("btc", "eth", "价位", "价格", "行情", "多少钱", "$"))
     return [
       "接收请求",
-      "拉取实时行情数据",
-      "解析价位与趋势关键区间",
+      "拉取平台实时行情",
+      "解析价位与多空关键位",
       "组织回复",
     ];
-  if (has("审计", "风险", "合约", "安全"))
+  if (has("审计", "风险", "合约", "蜜罐", "honeypot", "安全"))
     return [
       "接收请求",
       "调用风险评估数据源",
-      "检查合约风险点",
+      "检查蜜罐/owner/税率",
       "汇总风险点",
     ];
   if (has("策略", "回测", "backtest", "信号", "指标"))
@@ -422,7 +422,7 @@ function startThinking(ctEl, q) {
   }, 1400);
 }
 
-// Next-Actions: 每条回复后给 2-3 个相关「下一步」建议(对齐通用 AI 助手
+// Next-Actions: 每条回复后给 2-3 个相关「下一步」建议(对齐主流 AI 助手
 // 的引导按钮)。按回复内容关键词派生,点击回填并发送。纯前端,不依赖后端协议。
 function suggestNextActions(reply) {
   const r = (reply || "").toLowerCase();
@@ -430,12 +430,12 @@ function suggestNextActions(reply) {
   const out = [];
   if (has("btc", "eth", "价位", "价格", "行情", "$", "usdt")) {
     out.push([
-      "📊 看关键指标",
-      "这个标的当前的关键指标怎么样?",
+      "📊 看资金费率",
+      "这个币当前的合约资金费率和持仓量怎么样?",
     ]);
     out.push(["📈 技术信号", "帮我用 SMA/RSI 算下它的短期技术信号。"]);
   }
-  if (has("审计", "风险", "合约")) {
+  if (has("审计", "风险", "合约", "蜜罐", "honeypot", "lp")) {
     out.push([
       "🔍 查持有人分布",
       "这个代币的持有人集中度和 LP 锁仓情况?",
@@ -444,7 +444,7 @@ function suggestNextActions(reply) {
   if (has("策略", "回测", "backtest", "信号")) {
     out.push([
       "🧪 跑回测",
-      "用这个策略跑一次历史数据回测,注意别用未来数据。",
+      "用这个策略在 testnet 跑一次回测,注意别用未来数据。",
     ]);
   }
   if (has("身份", "skill", "技能", "clawpool agent", "🐋")) {
@@ -452,8 +452,8 @@ function suggestNextActions(reply) {
   }
   // 默认兜底:总给一组通用下一步
   if (out.length === 0) {
-    out.push(["📈 行情速览", "某标的现在什么价位?短期趋势关键区间?"]);
-    out.push(["🔍 风险评估", "帮我看一个标的的主要风险点。"]);
+    out.push(["📈 BTC 行情", "BTC 现在什么价位?短期多空关键位?"]);
+    out.push(["🔍 代币审计", "帮我看一个代币合约的风险点。"]);
   }
   return out.slice(0, 3);
 }
@@ -531,7 +531,7 @@ function renderMd(s) {
       '<a href="$2" target="_blank" rel="noopener" style="color:var(--brand2)">$1</a>',
     )
     .replace(/\n/g, "<br>");
-  // 行情卡片(对齐通用行情图表/widget 可视化):agent 回行情时是纯
+  // 行情卡片(对齐主流 AI 助手的图表/widget 可视化):agent 回行情时是纯
   // 文本,这里从真实回复里抽出价格/涨跌/高低/量,渲染成涨跌色卡片。纯前端解析
   // agent 返回的真数据(不造数),抽不到就原样返回文本。
   const card = renderQuoteCard(s);
@@ -543,7 +543,7 @@ function renderQuoteCard(s) {
   const t = String(s || "");
   // 价格:$60,318 / 现价 $1,580
   const price = (t.match(/\$\s?([\d,]+(?:\.\d+)?)/) || [])[1];
-  // 标的:示例代码 A / 示例代码 B
+  // 交易对:BTCUSDT / ETHUSDT / (平台现货 XXX)
   const sym = (t.match(/([A-Z]{2,10}USDT?)/) || [])[1];
   // 24h 变动:+0.33% / -0.20%
   const chg = (t.match(
@@ -634,7 +634,7 @@ async function send() {
     ctEl = addMsg("ai", "");
     ctEl.innerHTML =
       '<span class="typing"><span></span><span></span><span></span></span>';
-    // 思考过程面板(对齐通用 AI 助手的推理步骤):agent 处理期间,根据用户
+    // 思考过程面板(对齐主流 AI 助手 StatusParts):agent 处理期间,根据用户
     // 问题推断它在做什么,轮换显示步骤。首个 reply_delta 到达(callGateway 内 onDelta
     // 改 innerHTML)会自然覆盖掉它。纯前端,不依赖后端真实 step 事件。
     _thinkTimer = startThinking(ctEl, text);
@@ -648,7 +648,7 @@ async function send() {
     const files = typeof res === "string" ? [] : res?.files || [];
     // 护栏拦截识别:当回复是 LLM/Guardrail 错误占位(如 Bedrock Guardrail
     // 返回 400 Violated guardrail policy → 网关给出 "Something went wrong"
-    // 占位)时,不当普通回复渲染,改成像通用 AI 助手那样的明确安全提示。
+    // 占位)时,不当普通回复渲染,改成像主流 AI 助手那样的明确安全提示。
     // 例外:回复带图片(agent 出图)时即使文本为空也不算拦截。
     if (files.length === 0 && isGuardrailBlocked(reply)) {
       ctEl.innerHTML =

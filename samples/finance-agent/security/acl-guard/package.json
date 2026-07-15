@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "type": "module",
   "main": "index.js",
-  "description": "Programmatic before_tool_call deny-list for secret/IMDS exfiltration. Moves disclosure-guardrail enforcement from model self-discipline (prompt layer) to deterministic code (tool-execution layer).",
+  "description": "Programmatic before_tool_call deny-list for secret/IMDS exfiltration. Moves the ops-guardrails enforcement from model self-discipline (prompt layer) to deterministic code (tool-execution layer).",
   "openclaw": {
     "extensions": [
       "./index.js"

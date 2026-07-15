@@ -1,0 +1,285 @@
+# ============================================================================
+# 生产推荐模板 —— 纯私有 API / 内网 ALB / imported 客户 VPC / Valkey / 大规模装箱
+# ----------------------------------------------------------------------------
+# 这是一份「严格生产」姿态的可复用配置模板,不是可直接部署的成品:
+#   1. cp samples/config-sg-prod.yaml config.yml
+#   2. 全局搜索并替换所有 <...> 占位符(见下方【占位符清单】),填成你自己的坐标
+#   3. 逐条核对本文件里带 ⚠️ 的注意项,确认无误再 cdk deploy --no-rollback
+#
+# 姿态:纯内网(API PRIVATE + ALB internal + CloudFront 关)、导入客户已有 VPC、
+#      有状态资源 RETAIN + WORM 防误删、PITR 开、大规模 SQS 装箱调度。
+# 部署命令(示例):
+#   uv run cdk deploy --context region=<REGION>
+#
+# 【占位符清单 —— 部署前必须全部替换】
+#   <REGION>              目标 region,如 ap-southeast-1(所有资源同 region)
+#   <ACCOUNT_ID>          12 位 AWS 账号 ID
+#   <VPC_ID>              导入的客户 VPC id
+#   <VPC_CIDR>            该 VPC 的 CIDR,用于 SG rule 引用
+#   <SUBNET_*>            各用途子网 id(见每段就近注释,数量须与 az_count 对齐)
+#   <ACM_ARN_BFF>        本 region ACM 证书 ARN(控制台 BFF 443 listener)
+#   <LITELLM_BASE_URL>    已有 LiteLLM 网关 base URL,如 http://10.x.x.x:4000/v1
+#   <OFFICE_OR_VPN_CIDR>  允许访问控制台的办公/VPN 出口 CIDR,绝不填 0.0.0.0/0
+#   <SSH_KEY_NAME>        开发期 SSH keypair 名;纯生产建议留空 ""
+#
+# 【当前代码不读的键 —— 本模板已省略或注释,别照抄期待生效】
+#   · redis.instance_type            → 代码读 redis.node_type,用后者
+#   · redis.existing_parameter_group_arn / existing_subnet_group_arn
+#                                     → 不读;当前会新建默认 valkey 参数组(不碰你现有的)
+#   · edge.data_volume_gb / root_volume_gb → edge 段无磁盘键,走 AMI 默认根盘
+#   · alb.certificate_arn            → 单 ALB 的 HTTPS 证书走 console_auth.bff_certificate_arn
+#   · console_auth.bff_in_vpc / bff_alb_subnet_ids → 不读;BFF 是否入 VPC 由是否 imported 自动派生
+#   · asg.scale_in_enabled           → 不读;缩容开关是 scaler.idle_reclaim_enabled
+# ============================================================================
+
+# ========== 宿主机 (EC2) ==========
+host:
+  arch: arm64 # 生产基线 = arm64(Graviton metal 原生 KVM)
+  instance_type: r8g.metal-24xl # 96 vCPU / 768GB,承载数百租户/台
+  data_volume_gb: 900 # 380 VM/台的磁盘硬前提(重载余量,靠 sparse 不全占)
+  root_volume_gb: 20
+  reserved_vcpu: 2 # 预留给 host-agent/系统的 vCPU
+  reserved_mem_mb: 2048 # 预留给 host-agent/系统的内存
+  cpu_overcommit_ratio:
+    6.0 # vCPU 超卖比(agent 多 IO 型)。380/台稳态用 6.0;
+    # 极限压 380 满载可提到 8.0(见 config.yml.example 注释)
+  mem_overcommit_ratio: 2.0 # 内存超卖比 = 硬限。配 balloon 回收时 2.0 可行;无 balloon 应设 ~1.0
+  keep_data_volume: true # 实例删除后保留 EBS 数据卷(防误删丢租户数据)
+  ssh_key_name: "<SSH_KEY_NAME>" # 纯生产建议留空 "";开发期绑 keypair 才可 SSH
+  # openclaw host ASG 落哪些子网(imported 私有子网)。数量须 >= multi_az.az_count。
+  subnet_ids:
+    - <SUBNET_HOST_1A> # 私有 app 子网 AZ-a
+    - <SUBNET_HOST_1B> # 私有 app 子网 AZ-b
+    - <SUBNET_HOST_1C> # 私有 app 子网 AZ-c
+
+# ========== Balloon 内存回收(配合 mem_overcommit) ==========
+balloon:
+  enabled: true
+  max_inflate_ratio: 0.4 # 最多回收 VM 声明内存的 40%
+  min_guest_available_mb: 512 # guest 至少保留 512MB 可用
+  stats_polling_interval_s: 5
+  deflate_on_oom: true # guest OOM 时自动归还
+  free_page_reporting: true # guest 主动报告空闲页(超卖回收主力)
+
+# ========== microVM runtime ==========
+runtime: firecracker # 当前仅 firecracker 完整可用
+
+# ========== Per-VM 默认规格 ==========
+vm:
+  default_vcpu: 2
+  default_mem_mb: 4096
+  rootfs_overlay_mb: 8192 # 每 VM 可写层上限(sparse,不预占)
+  data_disk_mb: 8192 # 每 VM 数据盘上限(sparse);build-rootfs 建 data template 用它
+  gateway_port_base: 18789
+  subnet_prefix: "172.16" # microVM 走 host 内部网段,不占 VPC 子网 IP
+
+# ========== Per-tenant 资源配额 ==========
+quotas:
+  enabled: true
+  max_vcpu_per_tenant: 0 # 0 = 不限;按套餐填
+  max_mem_mb_per_tenant: 0
+  max_data_disk_mb: 0
+
+# ========== API Gateway — 纯私有 ==========
+api:
+  mode: private # PRIVATE REST API + execute-api VPCE,机器流量走私有
+  throttle_rate_limit: 500 # account 级稳态 req/s(批量 lifecycle 的天花板)
+  throttle_burst_limit: 1000 # 瞬时 burst 令牌桶容量
+
+# ========== Auto Scaling ==========
+asg:
+  min_capacity: 2 # 生产起步跨 AZ;按需抬高
+  max_capacity: 100
+  # metal 物理机 Nitro 初始化 + 下载黄金镜像 + 挂盘 + 注册,600s 偏紧会反复 Heartbeat Timeout。
+  lifecycle_hook_timeout: 1200 # 20min 留足冷启余量
+  use_spot: false # 生产控制面 host 不用 Spot
+
+# ========== Multi-AZ HA ==========
+multi_az:
+  enabled: true
+  az_count: 3 # 与各段 3 子网契约对齐;缺一 synth fail-loud
+
+# ========== 网络 — 导入客户已有 VPC ==========
+network:
+  mode: imported # 客户自带 VPC;切模式 = 改部署代码重建栈(不热改)
+  imported:
+    vpc_id: "<VPC_ID>"
+    cidr: "<VPC_CIDR>" # 如 10.0.0.0/16,用于 SG rule 引用
+    # internal ALB 不需要公有子网;纯内网理论上可留空 []。若 synth 报缺 public subnet 再补。
+    public_subnet_ids:
+      - <SUBNET_PUBLIC_1A> # 公有 LB 子网 AZ-a(仅 internet-facing 或 NAT 才需要)
+      - <SUBNET_PUBLIC_1B>
+      - <SUBNET_PUBLIC_1C>
+    private_subnet_ids:
+      - <SUBNET_HOST_1A> # 私有 app 子网(host/edge 落这里),数量与 az_count 对齐
+      - <SUBNET_HOST_1B>
+      - <SUBNET_HOST_1C>
+
+# ========== 控制面 / 边缘 ALB — 纯内网 ==========
+# 单 ALB(DashboardALB):edge(:80/8080)与 BFF(:443)共用它。BFF HTTPS 证书见 console_auth。
+alb:
+  internal: true # internal-only,不经公网;SG 入站仅 VPC CIDR
+  subnet_ids: # 这唯一一个 ALB 的子网。内网访问控制台 → 用 BFF/app 子网
+    - <SUBNET_HOST_1A>
+    - <SUBNET_HOST_1B>
+    - <SUBNET_HOST_1C>
+
+# ========== ElastiCache Valkey 路由表 ==========
+# OpenResty 边缘查 tenant_id→host:port 的准静态路由;host-agent 建/删/迁双写。
+redis:
+  enabled: true
+  engine: "valkey"
+  engine_version: "7.2" # 只填 major.minor,不填补丁号
+  node_type: "cache.r7g.large" # ⚠️ 代码读 node_type(不是 instance_type)
+  num_replicas: 2 # 总节点 = 1 primary + num_replicas replica
+  subnet_ids:
+    - <SUBNET_REDIS_1A> # Valkey 私有子网 AZ-a(>= 2 个,否则 synth fail-loud)
+    - <SUBNET_REDIS_1B>
+    - <SUBNET_REDIS_1C>
+  # ⚠️ 当前代码不读 existing_parameter_group_arn / existing_subnet_group_arn:
+  #    会新建一个默认 valkey 参数组(不修改你现有的)。要复用现有参数组/子网组需先补代码。
+
+# ========== 数据面边缘 OpenResty ASG ==========
+edge:
+  enabled: true # 数据面唯一入口(与 redis.enabled 成对开)
+  instance_type: c6in.4xlarge # x86(apt openresty 直装)
+  min_capacity: 3 # 一 AZ 一台,N-1 容灾
+  max_capacity: 6
+  health_check_grace_period_seconds: 300
+  dnat_port_low: 10000 # host 数据面 DNAT 端口段下界(改动须重建栈)
+  dnat_port_high: 15000 # 上界;5001 槽,消除端口先于内存耗尽
+  migration_drain_seconds: 5 # R6 迁移切流后源旧 DNAT 保留秒数(只重部署 health_check Lambda)
+  subnet_ids:
+    - <SUBNET_HOST_1A> # edge ASG 实例子网(私有)
+    - <SUBNET_HOST_1B>
+    - <SUBNET_HOST_1C>
+  # ⚠️ edge 段无磁盘容量键:走 AMI 默认根盘。需大根盘要先补 edge.root_volume_gb + LaunchTemplate。
+
+# ========== 调度 — 大规模装箱(SQS Dispatch) ==========
+# dispatch.enabled=true 时 create/start 走 dispatch,scaler.create_via_queue 被忽略;
+# 两者同 true 会 synth raise ValueError(防双入队),故下面 create_via_queue 必须 false。
+dispatch:
+  enabled: true
+  mode: ddb # 写 assignments 表 + 一条 SSM 叫醒 host 自查(PutParameter 退热路径)
+  esm_max_concurrency: 10 # SQS Lambda ESM 最大并发(2..1000)
+  batching_window_seconds: 2 # 攒批降冷启开销(0..300)
+  max_batch_size: 30 # 单次 invoke 装箱租户数(1..10000)
+  dlq_max_receive_count: 3 # 进 DLQ 即告警(openclaw-dispatch-dlq-not-empty)
+
+scaler:
+  interval_minutes: 3
+  idle_timeout_minutes: 10
+  lifecycle_queue_enabled: true # lifecycle FIFO 队列削峰(stop/delete 严格有序)
+  create_via_queue: false # ⚠️ 与 dispatch.enabled=true 互斥,必须 false
+  idle_reclaim_enabled: false # 空闲缩容总开关;false = 不自动 terminate 空闲 host
+
+# ========== Console BFF — 纯内网登录门 ==========
+console_auth:
+  enabled: true # BFF Lambda + Lambda 目标组 + Cognito Hosted UI 登录门
+  rbac_enabled: true # 角色鉴权(viewer/operator/admin),生产保持 true
+  # 无 Bearer 的纯 API-key 请求落到的兜底角色。生产内网自动化场景可放到 operator;
+  # 对外/不受信场景保持 viewer(fail-safe,写操作必须带 Cognito id_token)。
+  default_no_jwt_role: operator
+  bff_certificate_arn: "<ACM_ARN_BFF>" # 本 region ACM 证书;配了才在 ALB 开 443 + authenticate-cognito
+  bff_ingress_cidrs: "<OFFICE_OR_VPN_CIDR>" # 允许访问控制台的出口 CIDR,绝不填 0.0.0.0/0
+  # BFF Lambda 子网(imported 私有子网)。BFF 是否入 VPC 由是否 imported 自动派生,无需单独开关。
+  bff_subnet_ids:
+    - <SUBNET_HOST_1A>
+    - <SUBNET_HOST_1B>
+    - <SUBNET_HOST_1C>
+
+# ========== AI Gateway (LiteLLM) ==========
+# guest microVM 零凭据,LLM 调用经 OpenAI 兼容网关 → Bedrock。填已有网关 base URL。
+# 纯 IP/host 会被规范化成 http://<host>:4000/v1;要 HTTPS 直接写完整 https URL。
+ai_gateway:
+  url: "<LITELLM_BASE_URL>"
+
+# ========== 运行时 metrics 后端 ==========
+metrics:
+  enabled: true
+  use_managed: false # 自建 Prometheus/Grafana(AMP/AMG 要 AWS_SSO,刻意规避)
+
+# ========== 健康检查 ==========
+health_check:
+  interval_minutes: 5
+  max_failures: 3
+  app_port: 18789
+  health_check_grace_period_seconds: 360
+  az_failover:
+    enabled: true
+    unhealthy_threshold_minutes: 10 # AZ 全停多久才触发迁移(防抖动误判)
+    cooldown_minutes: 30
+
+# ========== AWS WAF(关联 API Gateway) ==========
+waf:
+  enabled: true # 生产开;stack.py 强制加 SQLi + IpReputation 底线
+  rate_limit_per_ip: 1000 # B2B 单出口场景须按峰值 QPS×300s 上抬,否则单 IP 被打 429
+  managed_rules:
+    - AWSManagedRulesCommonRuleSet
+    - AWSManagedRulesKnownBadInputsRuleSet
+
+# ========== VPC Flow Logs(CIS 3.8 网络审计) ==========
+flow_logs:
+  enabled: true # 抓 ENI accept+reject,多租户隔离取证
+  retention_days: 90
+
+# ========== 可观测性:数据面日志链(AOS / OpenSearch) ==========
+# AOS 是自建 OpenSearch 域,与 metrics 段的托管 AMG/AMP 无关(要 AOS 不代表要托管监控)。
+# ⚠️ 首次一把开 AOS 易撞 drift / AZ 整除坑(见新加坡 #258):稳妥做法是两步部署 ——
+#    首次 enabled=false 出栈,drift 清干净后增量部署再改 true 建 AOS/Firehose 全链。
+#    这里默认给 true(明确要 AOS);若首次部署卡在 AOS 就先降回 false 走两步。
+logging:
+  enabled: true # 要 AOS 日志链;首次部署遇 AOS 报错先降 false 走两步部署
+  aos:
+    subnet_ids:
+      - <SUBNET_REDIS_1A> # OpenSearch data node 私有子网
+      - <SUBNET_REDIS_1B>
+      - <SUBNET_REDIS_1C>
+    data_node_instance_type: "r6g.large.search"
+    data_nodes: 2
+    master_node_instance_type: "m6g.large.search"
+    master_nodes: 0 # 0 = 不建专用 master(小规模);data_nodes 须能整除 AZ 数
+    ebs_volume_size_gib: 500
+  firehose:
+    buffering_interval_seconds: 60
+    buffering_size_mib: 5
+    retry_duration_seconds: 300
+  log_archive_bucket:
+    retention_days: 90
+
+# ========== 黄金镜像 ==========
+image:
+  version: "v1.0" # 黄金镜像版本(CodeBuild 烤 + manifest 校验对齐)
+  build_in_stack: true # true = 独立 OpenClawImageStack 触发 CodeBuild 烤镜像,非阻塞(#283 拆分后);主 stack 不等镜像就绪,build 失败不影响控制面/数据面
+
+# ========== S3 存储 ==========
+s3:
+  rootfs_prefix: "deployment/rootfs"
+  backup_prefix: "backups"
+  backup_retention_days: 7
+  backup_cron: "rate(30 minutes)" # 扫描节拍,非统一时间(错峰 + 削并发)
+  backup_interval_hours: 24 # 每租户至少每 24h 备一次
+  backup_batch_limit: 20 # 单次触发最多备 20 个
+  # backup_bucket_suffix: ""          # 仅当上次部署留下同名 WORM 桶在保留期内、要立刻重建时才填短后缀避撞名
+
+# ========== 审计 ==========
+audit:
+  retention_days: 90 # 审计表 DDB TTL 天数
+  # ⚠️ 以下两项只能在全新 account 首次部署时开(存量表在线切会 replace 丢审计历史):
+  cmk_encryption: false # 审计表客户托管 CMK 加密(CIS 2.2.2)
+  worm_archive_enabled: false # 冷数据归档到 Object Lock COMPLIANCE S3(SEC 17a-4)
+  worm_retention_years: 7
+  archive_prefix: "audit-archive"
+
+# ========== DynamoDB ==========
+dynamodb:
+  point_in_time_recovery: true # 控制面表 PITR,安全默认 true
+  recovery_period_in_days: 35 # 连续备份保留天数(上限 35)
+
+# ========== CloudFront — 纯内网不部署 ==========
+cloudfront:
+  enabled: false
+
+# ========== 有状态资源删除策略 ==========
+deploy:
+  protect_stateful_resources: true # 生产:RETAIN + WORM Object Lock 防误删

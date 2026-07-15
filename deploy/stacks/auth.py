@@ -384,7 +384,7 @@ def build_auth(self, ctx):
                 precedence=precedence,
             )
 
-        # #187 P5 — channel-plane machine-user app client 已随
+        # #187 P5 —  channel-plane machine-user app client 已随
         # channel/hub 数据面下线一并移除(ChannelMachineUserClient + cognito-idp
         # admin IAM + COGNITO_CHANNEL_CLIENT_ID env)。留下的 Cognito 段只服务
         # console RBAC(JWT 验签 + owner_id/RBAC 门),不再有 machine-user 铸造。
@@ -413,7 +413,7 @@ def build_auth(self, ctx):
             )
 
         # ── Task 9.2 (#149): Console BFF — 前端零 key ──────────────────
-        # PoC 已真机验证:BFF Lambda
+        # PoC 已真机验证(an internal PoC):BFF Lambda
         # 托管 console 静态文件 + /capi/* 后端代持 admin key(浏览器全程零真 key),
         # 登录门在 ALB authenticate-cognito(未登录 302 Cognito Hosted UI)。
         # #217 — CTRL_API_KEY 部署时自动注入,根治"全量 deploy 后成占位符 → /capi 全 403"。

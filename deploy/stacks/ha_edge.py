@@ -427,7 +427,7 @@ def build_ha_edge(self, ctx):
     # deploy/monitoring/prometheus.yml 的 ec2_sd_configs 按 tag:Project=openclaw +
     # tag:Role=metal-host 过滤发现 metal host 抓 :8899/metrics。CDK LaunchTemplate
     # 默认只给实例打 Name,不打这俩 tag → Prometheus 发现不到 host、采集断链
-    # (795 实测 metal 实例只有 Name tag)。这里在 LaunchTemplateData 层加
+    # ( 实测 metal 实例只有 Name tag)。这里在 LaunchTemplateData 层加
     # TagSpecifications,让 ASG 起的每台 host(及其卷)都带这俩 tag,随重建继承。
     # key 大小写须与 prometheus.yml filters 完全一致(Project/Role 首字母大写)。
     _host_tags = [
@@ -847,7 +847,7 @@ def build_ha_edge(self, ctx):
         # 长静默 >180s 靠客户端 30s ping 兜)。
         idle_timeout=Duration.seconds(3600),
     )
-    # 安全红线(the ops guide):公网走 CloudFront→ALB,ALB 入站【只】允许
+    # 安全红线(design decision the ops guide):公网走 CloudFront→ALB,ALB 入站【只】允许
     # CloudFront origin-facing managed prefix list,绝不对 0.0.0.0/0 开放。
     # add_listener 默认 open=True 会给 ALB SG 加 0.0.0.0/0:80 —— 必须 open=False,
     # 再显式只放行 CloudFront prefix list。prefix list id 各区不同,从 context 读
@@ -1164,7 +1164,7 @@ def build_ha_edge(self, ctx):
             "ALB to OpenResty edge :8080 (only)",
         )
         # edge SG → host SG DNAT 端口段(host 数据面入站的唯一来源)。
-        # 安全红线(设计决策):host 的数据面流量只能来自 OpenResty
+        # 安全红线(design decision):host 的数据面流量只能来自 OpenResty
         # edge 集群,别处一律拒。端口段上下界从 config edge.dnat_port_{low,high} 读
         # (默认 [10000,15000] = 5001 槽);此处复用上方算好的 _edge_port_{low,high},
         # 与注入 host 位图的 DNAT_PORT_{LOW,HIGH} 同源(Property 2,防两边裂开)。
@@ -1174,7 +1174,7 @@ def build_ha_edge(self, ctx):
             ec2.Port.tcp_range(_edge_port_low, _edge_port_high),
             "edge to host DNAT port range (the data-plane contract)",
         )
-        # 安全红线(设计决策):禁止 host↔host 互访,堵跨租户/跨 host
+        # 安全红线(design decision):禁止 host↔host 互访,堵跨租户/跨 host
         # 横向移动。旧 HostToHostDnatIngress(host SG 自引用放行 DNAT 端口段)
         # 是"edge 曾装在 host 上"旧布局的遗留;现在 OpenResty 是独立 ASG,
         # 数据面链路是 edge→host DNAT→microVM,host 之间无需互通该端口段。

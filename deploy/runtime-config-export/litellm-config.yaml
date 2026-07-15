@@ -40,7 +40,7 @@ guardrails:
       guardrail: bedrock
       mode: "during_call"
       # 部署时注入目标账号的 Bedrock Guardrail ID(apply-hardening.sh 创建后打印)。
-      # 旧账号146=y6w95v95aela;新账号795=od6s8sm533fs(2026-06-30 apply-hardening 真建)。
+      # 旧账号146=y6w95v95aela;新账号=od6s8sm533fs(2026-06-30 apply-hardening 真建)。
       # 不硬编码账号特定 ID,LiteLLM 起容器时 sed 注入(随仓库迭代,跨账号可复用)。
       guardrailIdentifier: __GUARDRAIL_ID__
       guardrailVersion: "DRAFT"

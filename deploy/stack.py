@@ -60,11 +60,11 @@ class OpenClawOrchestratorStack(cdk.Stack):
         self._auto_delete = not _is_prod_region
 
         # ╔══════════════════════════════════════════════════════════════════╗
-        # ║ 三包归属导航(模块边界见各段 [包X] 标记)                          ║
+        # ║ 三包归属导航(配合 the module ownership map)         ║
         # ║ 本 __init__ 顺序构建,资源用局部变量交叉引用,暂不物理拆分(拆 con-  ║
-        # ║ struct 会改 logical ID → 删库风险)。改动时                        ║
+        # ║ struct 会改 logical ID → 删库风险,见 the design notes)。改动时    ║
         # ║ 按下方 [包X] 标记认领自己的段,别动别的包的段;跨段枢纽变量(api_fn/ ║
-        # ║ assets_bucket/vpc/host_role/alb 等)改动走 SHARED-FILES-PROTOCOL。  ║
+        # ║ assets_bucket/vpc/host_role/alb 等)改动走 the shared-files protocol。  ║
         # ║   [包C 控制面+工程化] DDB/S3/Lambda/API GW/CodeBuild/Cognito/Outputs ║
         # ║   [包B 隔离安全]       HostRole/监控/ASG/userdata/DNS-FW/Wazuh/AgentCore║
         # ║   [包A 数据面]         ALB/CloudFront/CORS                          ║

@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="zh">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>二手好物 · Marketplace(联邦测试床)</title>
+    <!--
+      二手电商买卖平台 demo SPA(internal-docs/demo-marketplace)。
+      定位:ADR-dataplane-external-saas-auth 档 A「外部 IdP 联邦」的活体测试床前端。
+      不交付、不开源。极简风。全部配置从 URL 或 window.DEMO_CFG 注入,无硬编码凭据。
+
+      认证:走电商自己的 IdP(entry Cognito pool)Hosted UI + authorization_code + PKCE。
+      开通 AI Pro:前端带 id_token 调电商后端 broker,broker 代开租户(非用户自助)。
+      进入 AI Pro:跳本平台 chat UI(生产中嵌本电商域),携登录态。
+    -->
+    <style>
+      :root {
+        --ink: #1f2733;
+        --sub: #68738a;
+        --line: #e7ebf1;
+        --brand: #2f7d40;
+        --brandink: #fff;
+        --bg: #f6f8fa;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        font-family:
+          "PingFang SC",
+          "Microsoft YaHei",
+          -apple-system,
+          Arial,
+          sans-serif;
+        color: var(--ink);
+        background: var(--bg);
+      }
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 14px 22px;
+        background: #fff;
+        border-bottom: 1px solid var(--line);
+      }
+      .logo {
+        font-weight: 800;
+        font-size: 18px;
+      }
+      .logo span {
+        color: var(--brand);
+      }
+      .who {
+        font-size: 13px;
+        color: var(--sub);
+      }
+      .btn {
+        border: 0;
+        border-radius: 8px;
+        padding: 9px 16px;
+        font-size: 14px;
+        cursor: pointer;
+        background: var(--brand);
+        color: var(--brandink);
+        font-weight: 600;
+      }
+      .btn.ghost {
+        background: #eef1f5;
+        color: var(--ink);
+      }
+      .btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      main {
+        max-width: 960px;
+        margin: 0 auto;
+        padding: 24px 22px 60px;
+      }
+      .hero {
+        background: linear-gradient(120deg, #e9f4ec, #eef4fb);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 22px;
+        margin-bottom: 24px;
+      }
+      .hero h1 {
+        margin: 0 0 6px;
+        font-size: 22px;
+      }
+      .hero p {
+        margin: 0;
+        color: var(--sub);
+        font-size: 14px;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+        gap: 16px;
+      }
+      .card {
+        background: #fff;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        overflow: hidden;
+      }
+      .card .ph {
+        height: 120px;
+        background: #eaeef3;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 40px;
+      }
+      .card .body {
+        padding: 12px 14px;
+      }
+      .card .t {
+        font-size: 14px;
+        font-weight: 600;
+        margin: 0 0 4px;
+      }
+      .card .p {
+        color: var(--brand);
+        font-weight: 700;
+        font-size: 15px;
+      }
+      .card .s {
+        color: var(--sub);
+        font-size: 12px;
+        margin-top: 4px;
+      }
+      .aipro {
+        margin-top: 26px;
+        background: #fff;
+        border: 1px dashed var(--brand);
+        border-radius: 14px;
+        padding: 20px;
+      }
+      .aipro h2 {
+        margin: 0 0 6px;
+        font-size: 17px;
+      }
+      .aipro p {
+        margin: 0 0 14px;
+        color: var(--sub);
+        font-size: 13.5px;
+      }
+      .row {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      .status {
+        font-size: 13px;
+        color: var(--sub);
+        margin-top: 10px;
+        min-height: 18px;
+      }
+      .status b {
+        color: var(--ink);
+      }
+      code {
+        background: #eef1f5;
+        padding: 1px 5px;
+        border-radius: 4px;
+        font-size: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="logo">二手<span>好物</span> · Marketplace</div>
+      <div class="row">
+        <span class="who" id="who">未登录</span>
+        <button class="btn ghost" id="authBtn" onclick="toggleAuth()">
+          登录
+        </button>
+      </div>
+    </header>
+    <main>
+      <div class="hero">
+        <h1>闲置好物,低价转让</h1>
+        <p>
+          这是 ClawPool 档 A「外部 IdP
+          联邦」的开发测试床:模拟一个客户自有的二手电商平台。登录走本电商自己的
+          IdP,开通「AI Pro 助手」时由电商后端代开你的专属 openclaw。
+        </p>
+      </div>
+
+      <div class="grid" id="goods"></div>
+
+      <section class="aipro">
+        <h2>🐋 AI Pro 智能助手</h2>
+        <p>
+          为你开通一个专属 AI 助手(独立 openclaw
+          microVM),帮你砍价、估值、追踪心仪商品。开通由平台后端代办,你无需接触任何底层控制台。
+        </p>
+        <div class="row">
+          <button class="btn" id="buyBtn" onclick="buyAiPro()" disabled>
+            开通 AI Pro 助手
+          </button>
+          <button
+            class="btn ghost"
+            id="enterBtn"
+            onclick="enterAiPro()"
+            disabled
+          >
+            进入 AI Pro
+          </button>
+        </div>
+        <div class="status" id="status">登录后可开通。</div>
+      </section>
+    </main>
+
+    <script>
+      // —— 配置(无硬编码;从 window.DEMO_CFG 或 URL query 注入)——
+      // 需要:entryDomain(电商 IdP Hosted UI 域)、entryClientId、redirectUri、
+      //       brokerUrl(电商后端代开端点)、aiproUrl(本平台 chat UI)。
+      const CFG = Object.assign(
+        {
+          entryDomain: "",
+          entryClientId: "",
+          redirectUri: location.origin + location.pathname,
+          brokerUrl: "",
+          aiproUrl: "",
+          scope: "openid email profile",
+        },
+        window.DEMO_CFG || {},
+        Object.fromEntries(new URLSearchParams(location.search)),
+      );
+
+      const LS = {
+        id: "mkt_id_token",
+        pkce: "mkt_pkce_verifier",
+        tid: "mkt_tenant_id",
+      };
+      const $ = (id) => document.getElementById(id);
+      const setStatus = (h) => {
+        $("status").innerHTML = h;
+      };
+
+      // 极简 PKCE(S256)
+      async function pkce() {
+        const rnd = crypto.getRandomValues(new Uint8Array(32));
+        const verifier = btoa(String.fromCharCode(...rnd)).replace(
+          /[+/=]/g,
+          (c) => ({ "+": "-", "/": "_", "=": "" })[c],
+        );
+        const dig = await crypto.subtle.digest(
+          "SHA-256",
+          new TextEncoder().encode(verifier),
+        );
+        const challenge = btoa(
+          String.fromCharCode(...new Uint8Array(dig)),
+        ).replace(/[+/=]/g, (c) => ({ "+": "-", "/": "_", "=": "" })[c]);
+        return { verifier, challenge };
+      }
+
+      async function login() {
+        if (!CFG.entryDomain || !CFG.entryClientId) {
+          setStatus("⚠️ 未配置 entryDomain/entryClientId(见 README)");
+          return;
+        }
+        const { verifier, challenge } = await pkce();
+        localStorage.setItem(LS.pkce, verifier);
+        const u =
+          `${CFG.entryDomain}/oauth2/authorize?response_type=code&client_id=${encodeURIComponent(CFG.entryClientId)}` +
+          `&redirect_uri=${encodeURIComponent(CFG.redirectUri)}&scope=${encodeURIComponent(CFG.scope)}` +
+          `&code_challenge=${challenge}&code_challenge_method=S256`;
+        location.href = u; // 跳电商 IdP Hosted UI(生产=电商自有账号体系;可再联邦上游)
+      }
+
+      async function exchangeCode(code) {
+        const verifier = localStorage.getItem(LS.pkce) || "";
+        const r = await fetch(`${CFG.entryDomain}/oauth2/token`, {
+          method: "POST",
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            grant_type: "authorization_code",
+            client_id: CFG.entryClientId,
+            code,
+            redirect_uri: CFG.redirectUri,
+            code_verifier: verifier,
+          }),
+        });
+        const t = await r.json();
+        if (t.id_token) {
+          localStorage.setItem(LS.id, t.id_token);
+          history.replaceState({}, "", CFG.redirectUri);
+        }
+        return t.id_token;
+      }
+
+      function logout() {
+        Object.values(LS).forEach((k) => localStorage.removeItem(k));
+        render();
+      }
+      function toggleAuth() {
+        localStorage.getItem(LS.id) ? logout() : login();
+      }
+
+      function claims() {
+        const t = localStorage.getItem(LS.id);
+        if (!t) return null;
+        try {
+          return JSON.parse(atob(t.split(".")[1]));
+        } catch {
+          return null;
+        }
+      }
+
+      // 开通 AI Pro:带 id_token 调电商后端 broker,broker 代开租户(非用户自助)
+      async function buyAiPro() {
+        const id = localStorage.getItem(LS.id);
+        if (!id) return;
+        if (!CFG.brokerUrl) {
+          setStatus("⚠️ 未配置 brokerUrl(电商后端代开端点)");
+          return;
+        }
+        $("buyBtn").disabled = true;
+        setStatus("正在为你开通专属 AI Pro(平台后端代开租户)…");
+        try {
+          const r = await fetch(CFG.brokerUrl, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              authorization: "Bearer " + id,
+            },
+            body: JSON.stringify({ product: "ai-pro" }),
+          });
+          const d = await r.json();
+          if (d.tenant_id) {
+            localStorage.setItem(LS.tid, d.tenant_id);
+            setStatus(
+              `✅ 已开通:租户 <b>${d.tenant_id}</b> 状态 <b>${d.status || "running"}</b>。点「进入 AI Pro」开始对话。`,
+            );
+          } else {
+            setStatus("开通失败:" + JSON.stringify(d).slice(0, 160));
+          }
+        } catch (e) {
+          setStatus("开通异常:" + String(e).slice(0, 120));
+        }
+        render();
+      }
+
+      // 进入 AI Pro:跳本平台 chat UI(生产嵌本电商域),携登录态
+      function enterAiPro() {
+        if (!CFG.aiproUrl) {
+          setStatus("⚠️ 未配置 aiproUrl(本平台 chat UI)");
+          return;
+        }
+        const tid = localStorage.getItem(LS.tid) || "";
+        location.href = `${CFG.aiproUrl}${CFG.aiproUrl.includes("?") ? "&" : "?"}tenant=${encodeURIComponent(tid)}`;
+      }
+
+      const GOODS = [
+        { e: "📷", t: "复古胶片相机", p: "¥480", s: "9成新 · 东京发货" },
+        { e: "🎸", t: "民谣木吉他", p: "¥620", s: "手感良好" },
+        { e: "⌚", t: "机械腕表", p: "¥1,200", s: "含原装表盒" },
+        { e: "📚", t: "技术书一批", p: "¥90", s: "打包出" },
+        { e: "🎧", t: "降噪耳机", p: "¥350", s: "电池健康" },
+        { e: "🪑", t: "实木书桌椅", p: "¥800", s: "自提优先" },
+      ];
+      function renderGoods() {
+        $("goods").innerHTML = GOODS.map(
+          (g) => `<div class="card"><div class="ph">${g.e}</div>
+          <div class="body"><p class="t">${g.t}</p><div class="p">${g.p}</div><div class="s">${g.s}</div></div></div>`,
+        ).join("");
+      }
+
+      function render() {
+        const c = claims();
+        $("who").textContent = c
+          ? c.email || c["cognito:username"] || c.sub || "已登录"
+          : "未登录";
+        $("authBtn").textContent = c ? "退出" : "登录";
+        $("buyBtn").disabled = !c;
+        $("enterBtn").disabled = !localStorage.getItem(LS.tid);
+        if (c && !localStorage.getItem(LS.tid))
+          setStatus("已登录。点「开通 AI Pro 助手」为你创建专属 openclaw。");
+      }
+
+      (async function init() {
+        renderGoods();
+        const code = new URLSearchParams(location.search).get("code");
+        if (code) {
+          setStatus("登录回调:用 code 换 id_token…");
+          await exchangeCode(code);
+        }
+        render();
+      })();
+    </script>
+  </body>
+</html>

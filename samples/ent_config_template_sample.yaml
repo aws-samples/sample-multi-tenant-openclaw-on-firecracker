@@ -1,0 +1,126 @@
+# ============================================================================
+# 企业部署 · 成套样例(填好示例值)— 纯私有 API / 内网控制台 / 大规模装箱
+# ----------------------------------------------------------------------------
+# 这是 samples/ent-config.template 的一份"填好示例值"的样例,展示 imported VPC
+# (客户自带 VPC)场景下每个组件如何指定私有子网。所有 <占位>/示例 id 都要换成
+# 客户真实值。示例值全部脱敏(非真实账号/域名/凭据/子网)。
+#   · 各组件 subnet_ids 已填客户私有子网 id(host/edge/redis/aos/bff)。
+#   · ACM 证书 ARN / VPN CIDR / LiteLLM 私网 IP 用占位,替换后即可部署。
+# ============================================================================
+
+# ========== 宿主机 (EC2) ==========
+host:
+  arch: arm64
+  instance_type: r8g.metal-24xl
+  data_volume_gb: 900
+  cpu_overcommit_ratio: 6.0
+  mem_overcommit_ratio: 1.5
+  subnet_ids: ["subnet-0aaa1111hostaz1", "subnet-0bbb2222hostaz2"]
+
+# ========== Balloon 内存回收 ==========
+balloon:
+  enabled: true
+
+# ========== microVM runtime ==========
+runtime: firecracker
+
+# ========== Per-tenant 资源配额 ==========
+quotas:
+  enabled: true
+  max_vcpu_per_tenant: 4
+  max_mem_mb_per_tenant: 8192
+  max_data_disk_mb: 20480
+
+# ========== API Gateway — 纯私有 ==========
+# 只走 PRIVATE API + execute-api VPCE;resource policy 限 VPCE(x-api-key 照用,不需 SigV4)。
+api:
+  mode: private
+
+# ========== Auto Scaling ==========
+asg:
+  min_capacity: 2
+  max_capacity: 8
+
+# ========== Multi-AZ HA ==========
+multi_az:
+  enabled: true
+  az_count: 2
+
+# ========== 网络 — 客户自带 VPC(imported)==========
+network:
+  mode: imported
+  imported:
+    vpc_id: "vpc-0abc1234deadbeef0"
+    cidr: "10.0.0.0/16"
+    public_subnet_ids: ["subnet-0pub1111az1", "subnet-0pub2222az2"]
+    private_subnet_ids: ["subnet-0prv1111az1", "subnet-0prv2222az2"]
+
+# ========== 控制面 ALB — 纯私有内网 ==========
+alb:
+  internal: true
+  subnet_ids: ["subnet-0prv1111az1", "subnet-0prv2222az2"]
+
+# ========== ElastiCache Redis / Valkey 路由表 ==========
+redis:
+  enabled: true
+  engine: "valkey"
+  engine_version: "8.0"
+  node_type: "cache.r7g.large"
+  num_replicas: 2
+  subnet_ids: ["subnet-0prv1111az1", "subnet-0prv2222az2"]
+
+# ========== 数据面边缘 OpenResty ASG ==========
+edge:
+  enabled: true
+  min_capacity: 2
+  max_capacity: 6
+  instance_type: "c6in.xlarge"
+  subnet_ids: ["subnet-0prv1111az1", "subnet-0prv2222az2"]
+
+# ========== 调度 — 大规模装箱 ==========
+dispatch:
+  enabled: true
+  mode: ddb
+  esm_max_concurrency: 10
+  batching_window_seconds: 2
+  max_batch_size: 500
+
+scaler:
+  lifecycle_queue_enabled: true
+  create_via_queue: false
+
+# ========== Console 认证 — 内网登录门 ==========
+console_auth:
+  enabled: true
+  rbac_enabled: true
+  default_no_jwt_role: operator
+  bff_certificate_arn: "<REPLACE_ACM_ARN_IN_REGION>"
+  bff_ingress_cidrs: "<REPLACE_OFFICE_VPN_CIDR>"
+  bff_subnet_ids: ["subnet-0prv1111az1", "subnet-0prv2222az2"]
+
+# ========== AI Gateway (LiteLLM) — 复用已有网关 ==========
+ai_gateway:
+  url: "http://<REPLACE_EXISTING_LITELLM_IP>:4000/v1"
+
+# ========== 运行时 metrics 后端 ==========
+metrics:
+  enabled: true
+  use_managed: false
+
+# ========== 可观测性:数据面日志管道 ==========
+logging:
+  enabled: true
+  aos:
+    subnet_ids: ["subnet-0prv1111az1", "subnet-0prv2222az2"]
+    data_node_instance_type: "r6g.large.search"
+    data_nodes: 2
+    master_nodes: 0
+    ebs_volume_size_gib: 100
+
+# ========== CloudFront — 不部署 ==========
+cloudfront:
+  enabled: false
+
+# ========== 有状态资源删除策略 ==========
+deploy:
+  protect_stateful_resources: false

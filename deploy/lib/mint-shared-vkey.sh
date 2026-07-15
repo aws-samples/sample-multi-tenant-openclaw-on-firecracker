@@ -174,7 +174,7 @@ log "拿到 shared vkey(前 8 字符=${VKEY:0:8}…,长度=${#VKEY})"
 # #17 修复:显式指定 --key-id,用 host role 已被授权 Decrypt 的 CMK(alias/clawpool-general)。
 # 若省略,SecureString 会用账号默认 alias/aws/ssm 加密 —— host instance role 无该 key 的
 # kms:Decrypt 权限,导致 launch-vm 侧 `get-parameter --with-decryption` 报 AccessDenied、vkey 读空。
-# 可用 VKEY_KMS_KEY_ID 覆盖(默认 alias/clawpool-general;795 环境用同名 alias)。
+# 可用 VKEY_KMS_KEY_ID 覆盖(默认 alias/clawpool-general; 环境用同名 alias)。
 : "${VKEY_KMS_KEY_ID:=alias/clawpool-general}"
 if ! aws $AWS_ARGS ssm put-parameter \
        --name "$VKEY_SSM_NAME" \

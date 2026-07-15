@@ -469,9 +469,9 @@ done
 
 # #187 转型:step4a2 claw-hub 本地安装已下线。数据面改两级路由直连 microVM
 # 原生 gateway(ALB LOR → OpenResty edge → Redis 查表 → host iptables DNAT →
-# microVM:18789)。旧 hub 数据面(install-hub.sh 等)已随数据面重构下线归档。
-# #187 P5:CLAW_HUB_URL/CLAW_HUB_WS env 与 stack.py 模板替换、CloudFront
-# /hub/* behavior、HubTargetGroup 已一并删除。
+# microVM:18789)。install-hub.sh + deploy/hub/ 源已归档到
+# an internal archive。#187 P5:CLAW_HUB_URL/CLAW_HUB_WS
+# env 与 stack.py 模板替换、CloudFront /hub/* behavior、HubTargetGroup 已一并删除。
 
 # Step 4b: AgentCore config (if enabled)
 AGENTCORE_GW_URL="{{AGENTCORE_GATEWAY_URL}}"

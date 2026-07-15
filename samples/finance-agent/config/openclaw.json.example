@@ -7,8 +7,6 @@
       },
       "heartbeat": {
         "every": "30m",
-        "isolatedSession": true,
-        "lightContext": true,
         "target": "last"
       },
       "contextPruning": {
@@ -34,10 +32,6 @@
         "keepRecentTokens": 100000,
         "reserveTokensFloor": 100000,
         "maxHistoryShare": 0.4,
-        "midTurnPrecheck": {
-          "enabled": true
-        },
-        "maxActiveTranscriptBytes": "20mb",
         "memoryFlush": {
           "enabled": true,
           "softThresholdTokens": 6000

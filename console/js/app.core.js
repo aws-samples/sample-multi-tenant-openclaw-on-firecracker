@@ -24,6 +24,8 @@ window.ocCore = {
       "poolops",
       "loadtest",
       "edge",
+      "traces",
+      "logs",
       "settings",
     ];
     const saved = localStorage.getItem("oc_page");

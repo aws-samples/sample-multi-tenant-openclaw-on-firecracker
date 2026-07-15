@@ -440,4 +440,4 @@ curl -s -H "x-api-key: $KEY" "$BASE/tenants/quickstart-xxxx"
 | `{HUB}/hub/ws`                                         | WSS            | 前端短 token                 | 实时对话                                                                                         |
 | `{HUB}/files/upload-url` `/download-url`               | POST/GET       | hub token                    | 文件预签(租户段守卫)                                                                             |
 
-> 验证来源:控制面路由与 RBAC 分级来自 `deploy/lambda/api/handler.py` 路由表(`routes` 字典)+ `_VIEWER_OK`/`_RBAC_SKIP`/`_rbac_check` 定义;端点行为经真机 curl 部署环境验证(证据 `internal test evidence`);hub/wss 参数来自 the internal design spec。分页页大小语义、AgentCore 工具清单以实际部署配置为准。
+> 验证来源:控制面路由与 RBAC 分级来自 `deploy/lambda/api/handler.py` 路由表(`routes` 字典)+ `_VIEWER_OK`/`_RBAC_SKIP`/`_rbac_check` 定义;端点行为经真机 curl 部署环境验证(证据 `internal-docs/00-knowledge-base/evidence/`);hub/wss 参数来自 `the hub design doc` + `the hub server`。分页页大小语义、AgentCore 工具清单以实际部署配置为准。

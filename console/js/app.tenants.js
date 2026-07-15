@@ -15,17 +15,6 @@ window.ocTenants = {
   },
   statusFilter: "all", // filter for tenants list
   tagFilter: "", // filter expression: "k1:v1,k2:v2" — AND across pairs
-  // #187 转型:reveal token + descriptor modal 状态。
-  // reveal 显示的是 KMS 密文(base64 信封),调用方
-  // 拿 tenant_id 作 EncryptionContext 自解得明文;API 侧不 decrypt。
-  revealState: {
-    open: false,
-    tenantId: "",
-    ciphertext: "",
-    error: "",
-    descriptor: null,
-    loading: false,
-  },
 
   async loadTenants() {
     if (!this.apiUrl || !this.apiKey) return;
@@ -113,7 +102,15 @@ window.ocTenants = {
   },
   async deleteTenant(id) {
     if (!confirm("Delete tenant " + id + "?")) return;
-    await this.api("DELETE", "tenants/" + id);
+    // #263 — delete 走队列后返 202 {status:"queued"}(不再是同步 deleted)。乐观
+    // 把本地这行标 deleting,让用户立刻看到反馈、避免重复点;真正的终态由后台
+    // consumer 收敛,几秒后 loadTenants 刷新会显示 deleting→消失,失败则靠 DLQ 告警
+    // (运维可见)兜底。不引入轮询。同步路径(队列没开)返 deleted,行为不变。
+    const r = await this.api("DELETE", "tenants/" + id);
+    const t = this.tenants.find((x) => x.id === id);
+    if (t && r && (r.status === "queued" || r.status === "deleting")) {
+      t.status = "deleting";
+    }
     this.loadTenants();
   },
   async tenantAction(id, action) {
@@ -128,56 +125,6 @@ window.ocTenants = {
     this.toast = "✓ " + action;
     setTimeout(() => (this.toast = ""), 2000);
     this.loadTenants();
-  },
-  // #187 转型:GET /tenants/{id} 一个接口返回全部字段(含 gateway_token 密文 +
-  // descriptor)。running 时 API Lambda 把 openclaw-tenant-secrets 表里的密文原样
-  // 折进详情响应(不 decrypt),调用方拷回本地自解。不再有专用 /token 端点。
-  async viewToken(id) {
-    this.revealState = {
-      open: true,
-      tenantId: id,
-      ciphertext: "",
-      error: "",
-      descriptor: null,
-      loading: true,
-    };
-    try {
-      // GET /tenants/{id} 详情:running 响应体载 gateway_token(base64 KMS 密文)
-      // + host_id/guest_ip/host_port/status 等字段。
-      const r = await this.api("GET", "tenants/" + id);
-      if (r && r.error) {
-        this.revealState.error = r.error;
-      } else {
-        this.revealState.ciphertext = r.gateway_token || "";
-        this.revealState.descriptor = {
-          host_private_ip: r.host_private_ip || r.host_id || "",
-          host_port: r.host_port || "",
-          guest_ip: r.guest_ip || "",
-          status: r.status || "",
-          encryption_context: (r.device && r.device.encryption_context) || {
-            tenant_id: id,
-          },
-        };
-        if (!this.revealState.ciphertext) {
-          this.revealState.error =
-            "gateway_token 不在响应里(租户非 running 或 token 未铸/已过窗)";
-        }
-      }
-    } catch (e) {
-      this.revealState.error = String((e && e.message) || e);
-    } finally {
-      this.revealState.loading = false;
-    }
-  },
-  closeReveal() {
-    this.revealState = {
-      open: false,
-      tenantId: "",
-      ciphertext: "",
-      error: "",
-      descriptor: null,
-      loading: false,
-    };
   },
   async copyText(s) {
     try {

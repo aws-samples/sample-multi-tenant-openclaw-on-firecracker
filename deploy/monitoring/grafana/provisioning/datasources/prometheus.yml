@@ -1,0 +1,14 @@
+# Grafana datasource 自动 provisioning — 把同栈的 Prometheus 注册为默认数据源。
+# Grafana 启动时自动加载,无需手点 UI。容器走 monitoring 网络,主机名 prometheus。
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      httpMethod: POST
+      timeInterval: "30s" # 对齐 prometheus.yml 的 scrape_interval

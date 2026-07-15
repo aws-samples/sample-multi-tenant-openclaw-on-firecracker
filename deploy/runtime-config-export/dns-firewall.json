@@ -1,0 +1,13 @@
+{
+  "_comment": "DNS Firewall 配置参考(非部署源)。权威定义在 deploy/stack.py(CfnFirewallDomainList/RuleGroup,config-gated security.dns_firewall_enabled);带外回放走 apply-hardening.sh,按资源名(openclaw-egress-fw/openclaw-egress-blocklist)动态 list/create,不读取本文件里的资源 ID。资源 ID 每账号不同、属运行态独有,本仓库不硬编码(已去除旧账号 ID,占位 __RUNTIME_GENERATED__)。真实 C2 域名清单是安全敏感数据,不入仓库,运营用 import-firewall-domains 从受控来源灌。",
+  "rule_group_id": "__RUNTIME_GENERATED__",
+  "rules": [
+    {
+      "name": "block-c2",
+      "action": "BLOCK",
+      "block_response": "NXDOMAIN",
+      "priority": 100,
+      "domain_list_id": "__RUNTIME_GENERATED__"
+    }
+  ]
+}

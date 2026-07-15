@@ -138,10 +138,19 @@ def build_observability(self, ctx):
         description="HTTPS from VPC (Firehose delivery ENIs, BFF, bootstrap script)",
     )
 
-    _subnets = (
-        vpc.select_subnets(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS).subnets
-        or vpc.private_subnets
-    )
+    # #272 — logging.aos.subnet_ids 非空时显式选 OpenSearch 域子网(imported 私有
+    # 子网场景);缺省回落 PRIVATE_WITH_EGRESS → private_subnets。
+    _aos_subnet_ids = _aos_cfg.get("subnet_ids") or []
+    if _aos_subnet_ids:
+        _subnets = [
+            ec2.Subnet.from_subnet_id(self, f"AosSubnet{_i}", _sid)
+            for _i, _sid in enumerate(_aos_subnet_ids)
+        ]
+    else:
+        _subnets = (
+            vpc.select_subnets(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS).subnets
+            or vpc.private_subnets
+        )
     _data_nodes = int(_aos_cfg.get("data_nodes", 2))
     _capacity_kwargs = {
         "data_node_instance_type": str(

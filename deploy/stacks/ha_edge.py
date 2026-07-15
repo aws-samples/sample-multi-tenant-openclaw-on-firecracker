@@ -139,16 +139,6 @@ def build_ha_edge(self, ctx):
     _edge_port_high = int((CFG.get("edge", {}) or {}).get("dnat_port_high", 15000))
     init_sh = init_sh.replace("{{DNAT_PORT_LOW}}", str(_edge_port_low))
     init_sh = init_sh.replace("{{DNAT_PORT_HIGH}}", str(_edge_port_high))
-    # #266 端口 quarantine 冷却期(config.yml → edge.port_quarantine_seconds →
-    # /etc/platform.env,route_ops.py:48 读)。#222 加了 init-host.sh 的占位符
-    # 却漏了这条渲染 → 真机 host-agent 起来 import route_ops 时
-    # int("{{PORT_QUARANTINE_SECONDS}}") 抛 ValueError,host-agent 崩溃重启循环、
-    # 整台 host 不可调度(2026-07-15 美东1 真机复现)。默认 20 与 route_ops.py
-    # 的 os.environ.get 兜底同源;0 = 关。
-    init_sh = init_sh.replace(
-        "{{PORT_QUARANTINE_SECONDS}}",
-        str((CFG.get("edge", {}) or {}).get("port_quarantine_seconds", 20)),
-    )
     init_sh = init_sh.replace(
         "{{AGENTCORE_GATEWAY_URL}}", gateway_url if gateway_url else "none"
     )
@@ -584,7 +574,17 @@ def build_ha_edge(self, ctx):
     # 判据 4);default_vpc 兼容档回落 public(默认 VPC 没私有子网,存量部署
     # byte-identical)。短路 `or` 之前会让 self_managed 也吃 public——已修。
     _net_mode = (CFG.get("network", {}) or {}).get("mode", "default_vpc")
-    if _net_mode in ("self_managed", "imported"):
+    # #272 — host.subnet_ids 非空时显式选 openclaw host 机器子网(imported 私有
+    # 子网场景);缺省回落按 network.mode 的私有/公有逻辑。
+    _host_subnet_ids = (CFG.get("host", {}) or {}).get("subnet_ids") or []
+    if _host_subnet_ids:
+        _host_subnets = ec2.SubnetSelection(
+            subnets=[
+                ec2.Subnet.from_subnet_id(self, f"HostSubnet{_i}", _sid)
+                for _i, _sid in enumerate(_host_subnet_ids)
+            ]
+        )
+    elif _net_mode in ("self_managed", "imported"):
         _host_subnets = ec2.SubnetSelection(subnets=vpc.private_subnets[:_az_count])
     else:
         _host_subnets = ec2.SubnetSelection(
@@ -810,16 +810,38 @@ def build_ha_edge(self, ctx):
     # always claims max(2, az_count) subnets so single-AZ ASG mode still
     # produces a valid load balancer.
     _alb_az_count = max(2, _az_count)
-    _alb_subnets = (
-        vpc.public_subnets[:_alb_az_count] or vpc.private_subnets[:_alb_az_count]
+    # #272 — internal ALB + 子网可选(imported 私有子网场景)。
+    #   · alb.internal(bool):派生默认 api.mode=private → internal(控制台内网,
+    #     不经公网 CloudFront 回源);其余 → internet-facing(向后兼容)。显式设
+    #     alb.internal 优先于派生。ctx._api_mode 由 build_network_vpc 先跑设好,
+    #     缺失时回落 CFG api.mode。
+    #   · alb.subnet_ids(可选 list):客户显式指定子网 id,用 from_subnet_id 导入;
+    #     缺省回落现有 public/private 逻辑。
+    _alb_cfg = CFG.get("alb", {}) or {}
+    _api_mode_for_alb = (
+        getattr(ctx, "_api_mode", None)
+        or str((CFG.get("api", {}) or {}).get("mode", "")).strip().lower()
     )
+    _alb_internal = bool(_alb_cfg.get("internal", _api_mode_for_alb == "private"))
+    _alb_subnet_ids = _alb_cfg.get("subnet_ids") or []
+    if _alb_subnet_ids:
+        _alb_subnets = [
+            ec2.Subnet.from_subnet_id(self, f"AlbSubnet{_i}", _sid)
+            for _i, _sid in enumerate(_alb_subnet_ids)
+        ]
+    elif _alb_internal:
+        _alb_subnets = vpc.private_subnets[:_alb_az_count]
+    else:
+        _alb_subnets = (
+            vpc.public_subnets[:_alb_az_count] or vpc.private_subnets[:_alb_az_count]
+        )
     alb = elbv2.ApplicationLoadBalancer(
         self,
         "DashboardALB",
         load_balancer_name="openclaw-dashboard",
         vpc=vpc,
         vpc_subnets=ec2.SubnetSelection(subnets=_alb_subnets),
-        internet_facing=True,
+        internet_facing=not _alb_internal,
         # P2b · the data-plane contract:数据面是 SSE 流式 + WS 长连,ALB 默认
         # idle_timeout=60s 会掐断 >1min 无字节的连接。设 3600s(ALB 硬上限 4000s
         # 内),与 OpenResty proxy_read/send_timeout 3600s 对齐。CloudFront origin
@@ -840,30 +862,40 @@ def build_ha_edge(self, ctx):
             404, content_type="text/plain", message_body="not found"
         ),
     )
-    # CloudFront origin-facing managed prefix list,按 region 映射(context 可覆盖)。
-    # 之前只从 context 读,不传就降级 VPC-only → CloudFront 回源被 SG 拒 → /hub 504
-    # (重建实撞:必须手动补 pl 才通)。给常用 region 内置默认值让一键部署即可用。
-    # ap-southeast-1=pl-31a34658 已真机实测放行后 CloudFront→ALB 通;其余 region 值
-    # 若未列,部署时传 -c cf_origin_facing_prefix_list=<pl-id>(否则降级 VPC-only)。
     _CF_PL_BY_REGION = {
         "ap-southeast-1": "pl-31a34658",
         "us-east-1": "pl-3b927c52",
         "us-west-2": "pl-82a045eb",
     }
-    _cf_pl = self.node.try_get_context(
-        "cf_origin_facing_prefix_list"
-    ) or _CF_PL_BY_REGION.get(self.region)
-    if _cf_pl:
-        listener.connections.allow_default_port_from(
-            ec2.Peer.prefix_list(_cf_pl),
-            "CloudFront origin-facing only (no 0.0.0.0/0)",
-        )
+    if _alb_internal:
+        # #272 — internal ALB 不经公网 CloudFront 回源,CloudFront prefix list
+        # 无意义(那是公网回源用)。改放行 VPC CIDR 到 :80/:443(绝不 0.0.0.0/0)。
+        for _p in (80, 443):
+            alb.connections.allow_from(
+                ec2.Peer.ipv4(vpc.vpc_cidr_block),
+                ec2.Port.tcp(_p),
+                "internal ALB: VPC CIDR only (no 0.0.0.0/0)",
+            )
     else:
-        # 未知 region 且没传 context 则 fail-safe:只放 VPC 内(绝不退回 0.0.0.0/0)。
-        listener.connections.allow_default_port_from(
-            ec2.Peer.ipv4(vpc.vpc_cidr_block),
-            "fallback VPC-only: pass cf_origin_facing_prefix_list to lock to CloudFront",
-        )
+        # CloudFront origin-facing managed prefix list,按 region 映射(context 可覆盖)。
+        # 之前只从 context 读,不传就降级 VPC-only → CloudFront 回源被 SG 拒 → /hub 504
+        # (重建实撞:必须手动补 pl 才通)。给常用 region 内置默认值让一键部署即可用。
+        # ap-southeast-1=pl-31a34658 已真机实测放行后 CloudFront→ALB 通;其余 region 值
+        # 若未列,部署时传 -c cf_origin_facing_prefix_list=<pl-id>(否则降级 VPC-only)。
+        _cf_pl = self.node.try_get_context(
+            "cf_origin_facing_prefix_list"
+        ) or _CF_PL_BY_REGION.get(self.region)
+        if _cf_pl:
+            listener.connections.allow_default_port_from(
+                ec2.Peer.prefix_list(_cf_pl),
+                "CloudFront origin-facing only (no 0.0.0.0/0)",
+            )
+        else:
+            # 未知 region 且没传 context 则 fail-safe:只放 VPC 内(绝不退回 0.0.0.0/0)。
+            listener.connections.allow_default_port_from(
+                ec2.Peer.ipv4(vpc.vpc_cidr_block),
+                "fallback VPC-only: pass cf_origin_facing_prefix_list to lock to CloudFront",
+            )
     # #187 P5 — hub-WS 数据面(HubTargetGroup + /hub/* listener rule + ASG 关联)
     # 已随 channel/hub 下线一并删除。数据面走 EdgeTargetGroup(OpenResty)
     # → DNAT → microVM:18789,由 P2b-iac 已建。/hub/* CloudFront behavior 也已删。
@@ -951,13 +983,19 @@ def build_ha_edge(self, ctx):
             ec2.Port.tcp(6379),
             "host-agent writes route:{tenant_id}",
         )
-        _redis_subnets = vpc.select_subnets(
-            subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
-        ).subnet_ids
-        if not _redis_subnets:
-            # default_vpc / imported 场景可能没有 PRIVATE_WITH_EGRESS,回落
-            # private_subnets(imported 明确传的私有子网 id)。全空 fail-loud。
-            _redis_subnets = [s.subnet_id for s in vpc.private_subnets]
+        # #272 — redis.subnet_ids 非空时显式选路由表 Redis/Valkey 子网(imported
+        # 私有子网场景);缺省回落 PRIVATE_WITH_EGRESS → private_subnets。
+        _redis_subnet_ids_cfg = _redis_cfg.get("subnet_ids") or []
+        if _redis_subnet_ids_cfg:
+            _redis_subnets = list(_redis_subnet_ids_cfg)
+        else:
+            _redis_subnets = vpc.select_subnets(
+                subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
+            ).subnet_ids
+            if not _redis_subnets:
+                # default_vpc / imported 场景可能没有 PRIVATE_WITH_EGRESS,回落
+                # private_subnets(imported 明确传的私有子网 id)。全空 fail-loud。
+                _redis_subnets = [s.subnet_id for s in vpc.private_subnets]
         if len(_redis_subnets) < 2:
             raise ValueError(
                 "redis.enabled=true 需要 ≥2 私有子网跨 AZ,当前 VPC 私有子网数="
@@ -971,12 +1009,41 @@ def build_ha_edge(self, ctx):
             cache_subnet_group_name=f"openclaw-redis-subnets{self._gsuffix}",
         )
         _replicas = int(_redis_cfg.get("num_replicas", 2))
+        # #271 引擎可选 redis|valkey。Valkey 是 Redis OSS 的 BSD fork,ElastiCache
+        # 支持 engine="valkey";协议/端口 6379 与 Redis 客户端(host-agent redis-py +
+        # edge lua-resty-redis)线级兼容,数据面 route.lua 读写无需改。
+        # engine_version 传 major.minor(如 "7.2"),补丁号(7.2.6)由 AWS 托管、
+        # 不显式指定 —— 依据 AWS ElastiCache 文档"Supported ElastiCache (Valkey)
+        # versions"页:CreateReplicationGroup 的 EngineVersion 取 7.2 这类 major.minor
+        # (docs.aws.amazon.com/AmazonElastiCache/latest/dg/supported-engine-versions.html)。
+        # 默认 redis 向后兼容:存量 config.yml 无 engine 键 → 仍起 Redis,不触发
+        # 已部署路由集群的 replacement。config.yml.example 出厂默认 valkey(迁移到位)。
+        _redis_engine = str(_redis_cfg.get("engine", "redis")).lower()
+        if _redis_engine not in ("redis", "valkey"):
+            raise ValueError(
+                f"redis.engine={_redis_engine!r} 不支持;只能是 'redis' 或 'valkey'"
+            )
+        _redis_engine_version = str(_redis_cfg.get("engine_version", "7.1"))
+        # 参数组 family:引擎 + major(如 redis7 / valkey7)。DoD 要求显式建、
+        # 不用 default parameter group(便于后续调 maxmemory-policy 等)。
+        _redis_major = _redis_engine_version.split(".")[0]
+        _redis_pg_family = f"{_redis_engine}{_redis_major}"
+        _redis_param_group = elasticache.CfnParameterGroup(
+            self,
+            "RouteRedisParamGroup",
+            cache_parameter_group_family=_redis_pg_family,
+            description=(
+                f"OpenClaw route table {_redis_engine} {_redis_engine_version} "
+                "(explicit param group, #271)"
+            ),
+        )
         _redis_rg = elasticache.CfnReplicationGroup(
             self,
             "RouteRedis",
             replication_group_description="OpenClaw tenant to host route table",
-            engine="redis",
-            engine_version=str(_redis_cfg.get("engine_version", "7.1")),
+            engine=_redis_engine,
+            engine_version=_redis_engine_version,
+            cache_parameter_group_name=_redis_param_group.ref,
             cache_node_type=str(_redis_cfg.get("node_type", "cache.r7g.large")),
             num_cache_clusters=1 + _replicas,
             automatic_failover_enabled=True,
@@ -989,6 +1056,7 @@ def build_ha_edge(self, ctx):
             # 拉长部署链、host-agent redis-py + lua-resty-redis 都要额外配。
         )
         _redis_rg.add_dependency(_redis_subnet_group)
+        _redis_rg.add_dependency(_redis_param_group)
         redis_endpoint = (
             f"{_redis_rg.attr_primary_end_point_address}:"
             f"{_redis_rg.attr_primary_end_point_port}"
@@ -1064,7 +1132,7 @@ def build_ha_edge(self, ctx):
             "ALB to OpenResty edge :8080 (only)",
         )
         # edge SG → host SG DNAT 端口段(host 数据面入站的唯一来源)。
-        # 安全红线():host 的数据面流量只能来自 OpenResty
+        # 安全红线(设计决策):host 的数据面流量只能来自 OpenResty
         # edge 集群,别处一律拒。端口段上下界从 config edge.dnat_port_{low,high} 读
         # (默认 [10000,15000] = 5001 槽);此处复用上方算好的 _edge_port_{low,high},
         # 与注入 host 位图的 DNAT_PORT_{LOW,HIGH} 同源(Property 2,防两边裂开)。
@@ -1074,7 +1142,7 @@ def build_ha_edge(self, ctx):
             ec2.Port.tcp_range(_edge_port_low, _edge_port_high),
             "edge to host DNAT port range (the data-plane contract)",
         )
-        # 安全红线():禁止 host↔host 互访,堵跨租户/跨 host
+        # 安全红线(设计决策):禁止 host↔host 互访,堵跨租户/跨 host
         # 横向移动。旧 HostToHostDnatIngress(host SG 自引用放行 DNAT 端口段)
         # 是"edge 曾装在 host 上"旧布局的遗留;现在 OpenResty 是独立 ASG,
         # 数据面链路是 edge→host DNAT→microVM,host 之间无需互通该端口段。
@@ -1138,10 +1206,21 @@ def build_ha_edge(self, ctx):
             role=_edge_role,  # S3 拉 edge 资产 + SSM 运维通道
             associate_public_ip_address=False,  # 私有子网 + NAT 出网
         )
-        _edge_subnets = (
-            vpc.select_subnets(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS).subnets
-            or vpc.private_subnets
-        )
+        # #272 — edge.subnet_ids 非空时显式选 OpenResty edge 子网;缺省回落
+        # PRIVATE_WITH_EGRESS(带 NAT 出网的私有子网)。
+        _edge_subnet_ids = _edge_cfg.get("subnet_ids") or []
+        if _edge_subnet_ids:
+            _edge_subnets = [
+                ec2.Subnet.from_subnet_id(self, f"EdgeSubnet{_i}", _sid)
+                for _i, _sid in enumerate(_edge_subnet_ids)
+            ]
+        else:
+            _edge_subnets = (
+                vpc.select_subnets(
+                    subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
+                ).subnets
+                or vpc.private_subnets
+            )
         _edge_asg = autoscaling.AutoScalingGroup(
             self,
             "EdgeASG",
@@ -1178,20 +1257,26 @@ def build_ha_edge(self, ctx):
     # Explicit OAC with a region-suffixed name. The default auto-named OAC is
     # derived from the stack name, so a same-named stack in another region
     # (ap-southeast-1) collides on this account-global CloudFront resource.
-    _assets_oac = cloudfront.S3OriginAccessControl(
-        self,
-        "AssetsOAC",
-        origin_access_control_name=f"openclaw-assets-oac{self._gsuffix}",
-    )
-    s3_origin = origins.S3BucketOrigin.with_origin_access_control(
-        assets_bucket, origin_access_control=_assets_oac
-    )
-    # CloudFront Function: rewrite /console/ → /console/index.html, / → /console/index.html
-    url_rewrite_fn = cloudfront.Function(
-        self,
-        "UrlRewrite",
-        function_name=f"openclaw-url-rewrite{self._gsuffix}",
-        code=cloudfront.FunctionCode.from_inline("""
+    # #270 — cloudfront.enabled 开关(缺省 true=建,向后兼容)。false 时整个
+    # CloudFront 构建段零资源(不建任何 Distribution/OAC/Function/ResponseHeaders),
+    # console/dashboard host 回落 ALB DNS,cf_distribution=None,cf id 输出为空。
+    # 内网/自管入口(internal ALB 或客户自带 CDN)时关掉,省 CF 资源。
+    _cf_enabled = bool((CFG.get("cloudfront", {}) or {}).get("enabled", True))
+    if _cf_enabled:
+        _assets_oac = cloudfront.S3OriginAccessControl(
+            self,
+            "AssetsOAC",
+            origin_access_control_name=f"openclaw-assets-oac{self._gsuffix}",
+        )
+        s3_origin = origins.S3BucketOrigin.with_origin_access_control(
+            assets_bucket, origin_access_control=_assets_oac
+        )
+        # CloudFront Function: rewrite /console/ → /console/index.html, / → /console/index.html
+        url_rewrite_fn = cloudfront.Function(
+            self,
+            "UrlRewrite",
+            function_name=f"openclaw-url-rewrite{self._gsuffix}",
+            code=cloudfront.FunctionCode.from_inline("""
 function handler(event) {
   var uri = event.request.uri;
   if (uri === '/') {
@@ -1203,178 +1288,88 @@ function handler(event) {
   }
   return event.request;
 }"""),
-    )
-
-    # Security response headers for edge-served content (#88 follow-up).
-    # Static assets (S3 origin) shipped without HSTS / anti-clickjacking /
-    # nosniff headers; add them at the edge so every cached response carries
-    # them without touching each HTML file. Applied to the console/static
-    # behaviors below.
-    # #63 — CSP for XSS-in-depth. 前端 chat/console 内联 <script> 已全部
-    # 搬到 js/*.js(console/chat/js/auth.js/chat.js 与 console/js/auth.js),
-    # setup.sh 注入的账号占位符走 <script type=application/json>(不受 CSP
-    # 执行策略约束)。不采用 'unsafe-inline'(对主威胁 renderMd/innerHTML
-    # 注入防护为零),静态托管无服务端也不做 nonce(静态 nonce=常量=没用)。
-    # 'unsafe-eval' 保留给 Alpine.js v3(x-data/@click 用 new Function 求值,
-    # 拿掉整个 console 挂);marked/alpine CDN 白名单显式列。connect-src
-    # 覆盖同源 /hub /chat/sign /tenants + Cognito /oauth2/token 跨域 fetch
-    # (Cognito domain 由部署时决定,不硬编码进 CSP,故收敛成 https:/wss:)。
-    _csp = (CFG.get("cloudfront", {}) or {}).get("csp") or (
-        "default-src 'self'; "
-        "script-src 'self' 'unsafe-eval' https://cdn.jsdelivr.net; "
-        "style-src 'self' 'unsafe-inline'; "
-        # #177 — agent 出图/附件走 hub 签发的 S3 直连预签名 URL(跨源),
-        # 预签名 host 部署时才定、无法硬编码,收敛成 https:(同 connect-src)。
-        "img-src 'self' data: blob: https:; "
-        "connect-src 'self' https: wss:; "
-        "frame-ancestors 'none'; "
-        "base-uri 'self'; "
-        "object-src 'none'"
-    )
-    sec_headers_policy = cloudfront.ResponseHeadersPolicy(
-        self,
-        "SecHeadersPolicy",
-        response_headers_policy_name=f"openclaw-sec-headers{self._gsuffix}",
-        comment="OpenClaw edge security headers",
-        security_headers_behavior=cloudfront.ResponseSecurityHeadersBehavior(
-            strict_transport_security=cloudfront.ResponseHeadersStrictTransportSecurity(
-                access_control_max_age=Duration.days(365),
-                include_subdomains=True,
-                override=True,
-            ),
-            content_type_options=cloudfront.ResponseHeadersContentTypeOptions(
-                override=True
-            ),
-            frame_options=cloudfront.ResponseHeadersFrameOptions(
-                frame_option=cloudfront.HeadersFrameOption.DENY,
-                override=True,
-            ),
-            referrer_policy=cloudfront.ResponseHeadersReferrerPolicy(
-                referrer_policy=cloudfront.HeadersReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN,
-                override=True,
-            ),
-            content_security_policy=cloudfront.ResponseHeadersContentSecurityPolicy(
-                content_security_policy=_csp,
-                override=True,
-            ),
-        ),
-    )
-
-    cf_cfg = CFG.get("cloudfront", {}) or {}
-    # ----- DUAL mode candidates -----
-    console_domain = (cf_cfg.get("console_domain") or "").strip()
-    console_cert_arn = (cf_cfg.get("console_cert_arn") or "").strip()
-    app_domain = (cf_cfg.get("app_domain") or "").strip()
-    app_cert_arn = (cf_cfg.get("app_cert_arn") or "").strip()
-    dual_mode = bool(
-        console_domain and console_cert_arn and app_domain and app_cert_arn
-    )
-    # ----- LEGACY single-domain fallback -----
-    custom_domain = (cf_cfg.get("custom_domain") or "").strip()
-    acm_cert_arn = (cf_cfg.get("acm_cert_arn") or "").strip()
-
-    if dual_mode:
-        # ===== DUAL mode: two distributions, two certs, two aliases =====
-        # Distribution A: console — S3 origin only, /console/* + redirect / → /console/
-        console_cf = cloudfront.Distribution(
-            self,
-            "ConsoleCF",
-            comment="OpenClaw Operator Console",
-            domain_names=[console_domain],
-            certificate=acm.Certificate.from_certificate_arn(
-                self, "ConsoleCert", console_cert_arn
-            ),
-            default_behavior=cloudfront.BehaviorOptions(
-                origin=s3_origin,
-                viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-                cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
-                response_headers_policy=sec_headers_policy,
-                function_associations=[
-                    cloudfront.FunctionAssociation(
-                        function=url_rewrite_fn,
-                        event_type=cloudfront.FunctionEventType.VIEWER_REQUEST,
-                    )
-                ],
-            ),
-            default_root_object="",
         )
-        # Distribution B: per-tenant dashboards — ALB origin only, /vm/*
-        app_cf = cloudfront.Distribution(
+
+        # Security response headers for edge-served content (#88 follow-up).
+        # Static assets (S3 origin) shipped without HSTS / anti-clickjacking /
+        # nosniff headers; add them at the edge so every cached response carries
+        # them without touching each HTML file. Applied to the console/static
+        # behaviors below.
+        # #63 — CSP for XSS-in-depth. 前端 chat/console 内联 <script> 已全部
+        # 搬到 js/*.js(console/chat/js/auth.js/chat.js 与 console/js/auth.js),
+        # setup.sh 注入的账号占位符走 <script type=application/json>(不受 CSP
+        # 执行策略约束)。不采用 'unsafe-inline'(对主威胁 renderMd/innerHTML
+        # 注入防护为零),静态托管无服务端也不做 nonce(静态 nonce=常量=没用)。
+        # 'unsafe-eval' 保留给 Alpine.js v3(x-data/@click 用 new Function 求值,
+        # 拿掉整个 console 挂);marked/alpine CDN 白名单显式列。connect-src
+        # 覆盖同源 /hub /chat/sign /tenants + Cognito /oauth2/token 跨域 fetch
+        # (Cognito domain 由部署时决定,不硬编码进 CSP,故收敛成 https:/wss:)。
+        _csp = (CFG.get("cloudfront", {}) or {}).get("csp") or (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-eval' https://cdn.jsdelivr.net; "
+            "style-src 'self' 'unsafe-inline'; "
+            # #177 — agent 出图/附件走 hub 签发的 S3 直连预签名 URL(跨源),
+            # 预签名 host 部署时才定、无法硬编码,收敛成 https:(同 connect-src)。
+            "img-src 'self' data: blob: https:; "
+            "connect-src 'self' https: wss:; "
+            "frame-ancestors 'none'; "
+            "base-uri 'self'; "
+            "object-src 'none'"
+        )
+        sec_headers_policy = cloudfront.ResponseHeadersPolicy(
             self,
-            "AppCF",
-            comment="OpenClaw Per-Tenant Dashboards",
-            domain_names=[app_domain],
-            certificate=acm.Certificate.from_certificate_arn(
-                self, "AppCert", app_cert_arn
-            ),
-            default_behavior=cloudfront.BehaviorOptions(
-                origin=origins.HttpOrigin(
-                    alb.load_balancer_dns_name,
-                    protocol_policy=cloudfront.OriginProtocolPolicy.HTTP_ONLY,
-                    http_port=80,
-                    # P2b · CF origin read_timeout:CDK 校验上限 180s,但账号
-                    # 配额 L-AECE9FA7 "Response timeout per origin" 默认 120s,
-                    # 写 180 会 CreateDistribution 400(P7 真机实撞 2026-07-08)。
-                    # 取 120s(账号默认可部署);要 180s 先提配额再调。SSE 场景
-                    # 120s 内几乎必有 token 流出;WS 长静默走 CF 断,靠客户端
-                    # 30s ping 兜(契约 §8)。
-                    read_timeout=Duration.seconds(120),
-                    keepalive_timeout=Duration.seconds(60),
+            "SecHeadersPolicy",
+            response_headers_policy_name=f"openclaw-sec-headers{self._gsuffix}",
+            comment="OpenClaw edge security headers",
+            security_headers_behavior=cloudfront.ResponseSecurityHeadersBehavior(
+                strict_transport_security=cloudfront.ResponseHeadersStrictTransportSecurity(
+                    access_control_max_age=Duration.days(365),
+                    include_subdomains=True,
+                    override=True,
                 ),
-                viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-                allowed_methods=cloudfront.AllowedMethods.ALLOW_ALL,
-                cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
-                origin_request_policy=cloudfront.OriginRequestPolicy.ALL_VIEWER,
+                content_type_options=cloudfront.ResponseHeadersContentTypeOptions(
+                    override=True
+                ),
+                frame_options=cloudfront.ResponseHeadersFrameOptions(
+                    frame_option=cloudfront.HeadersFrameOption.DENY,
+                    override=True,
+                ),
+                referrer_policy=cloudfront.ResponseHeadersReferrerPolicy(
+                    referrer_policy=cloudfront.HeadersReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN,
+                    override=True,
+                ),
+                content_security_policy=cloudfront.ResponseHeadersContentSecurityPolicy(
+                    content_security_policy=_csp,
+                    override=True,
+                ),
             ),
-            default_root_object="",
-        )
-        console_host = console_domain
-        dashboard_host = app_domain
-        console_cf_id = console_cf.distribution_id
-        app_cf_id = app_cf.distribution_id
-        cf_distribution = console_cf  # for downstream Cognito wiring
-    else:
-        # ===== LEGACY single-distribution mode =====
-        domain_names = [custom_domain] if custom_domain else None
-        certificate = (
-            acm.Certificate.from_certificate_arn(self, "CustomCert", acm_cert_arn)
-            if custom_domain and acm_cert_arn
-            else None
         )
 
-        cf_distribution = cloudfront.Distribution(
-            self,
-            "DashboardCF",
-            comment="OpenClaw Dashboard (single-domain mode)",
-            domain_names=domain_names,
-            certificate=certificate,
-            default_behavior=cloudfront.BehaviorOptions(
-                origin=origins.HttpOrigin(
-                    alb.load_balancer_dns_name,
-                    protocol_policy=cloudfront.OriginProtocolPolicy.HTTP_ONLY,
-                    http_port=80,
-                    # P2b · CF origin read_timeout:CDK 校验上限 180s,但账号
-                    # 配额 L-AECE9FA7 "Response timeout per origin" 默认 120s,
-                    # 写 180 会 CreateDistribution 400(P7 真机实撞 2026-07-08)。
-                    # 取 120s(账号默认可部署);要 180s 先提配额再调。SSE 场景
-                    # 120s 内几乎必有 token 流出;WS 长静默走 CF 断,靠客户端
-                    # 30s ping 兜(契约 §8)。
-                    read_timeout=Duration.seconds(120),
-                    keepalive_timeout=Duration.seconds(60),
+        cf_cfg = CFG.get("cloudfront", {}) or {}
+        # ----- DUAL mode candidates -----
+        console_domain = (cf_cfg.get("console_domain") or "").strip()
+        console_cert_arn = (cf_cfg.get("console_cert_arn") or "").strip()
+        app_domain = (cf_cfg.get("app_domain") or "").strip()
+        app_cert_arn = (cf_cfg.get("app_cert_arn") or "").strip()
+        dual_mode = bool(
+            console_domain and console_cert_arn and app_domain and app_cert_arn
+        )
+        # ----- LEGACY single-domain fallback -----
+        custom_domain = (cf_cfg.get("custom_domain") or "").strip()
+        acm_cert_arn = (cf_cfg.get("acm_cert_arn") or "").strip()
+
+        if dual_mode:
+            # ===== DUAL mode: two distributions, two certs, two aliases =====
+            # Distribution A: console — S3 origin only, /console/* + redirect / → /console/
+            console_cf = cloudfront.Distribution(
+                self,
+                "ConsoleCF",
+                comment="OpenClaw Operator Console",
+                domain_names=[console_domain],
+                certificate=acm.Certificate.from_certificate_arn(
+                    self, "ConsoleCert", console_cert_arn
                 ),
-                viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-                allowed_methods=cloudfront.AllowedMethods.ALLOW_ALL,
-                cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
-                origin_request_policy=cloudfront.OriginRequestPolicy.ALL_VIEWER,
-                function_associations=[
-                    cloudfront.FunctionAssociation(
-                        function=url_rewrite_fn,
-                        event_type=cloudfront.FunctionEventType.VIEWER_REQUEST,
-                    )
-                ],
-            ),
-            additional_behaviors={
-                "/console/*": cloudfront.BehaviorOptions(
+                default_behavior=cloudfront.BehaviorOptions(
                     origin=s3_origin,
                     viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
                     cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
@@ -1386,28 +1381,129 @@ function handler(event) {
                         )
                     ],
                 ),
-                # /chat/* — chat 小程序前端,与 console 同 S3 origin(桶根 chat/,
-                # 见 setup.sh 把 console/chat/index.html 传到 s3://<assets>/chat/)。
-                # 缺这条 behavior 时 /chat/* 走 default→ALB(metal)→404。不挂
-                # url_rewrite_fn(那是 /console 路径改写专用);chat 是单 index.html。
-                "/chat/*": cloudfront.BehaviorOptions(
-                    origin=s3_origin,
-                    viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-                    cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
-                    response_headers_policy=sec_headers_policy,
+                default_root_object="",
+            )
+            # Distribution B: per-tenant dashboards — ALB origin only, /vm/*
+            app_cf = cloudfront.Distribution(
+                self,
+                "AppCF",
+                comment="OpenClaw Per-Tenant Dashboards",
+                domain_names=[app_domain],
+                certificate=acm.Certificate.from_certificate_arn(
+                    self, "AppCert", app_cert_arn
                 ),
-                # #187 P5 — /hub/* behavior 已随 claw-hub 数据面下线一并删除。
-                # 数据面 WebSocket 走 /ws/{tenant_id} 直连 microVM gateway,由
-                # ALB default forward EdgeTG(P2b-iac)承担。
-            },
-            default_root_object="",
-        )
+                default_behavior=cloudfront.BehaviorOptions(
+                    origin=origins.HttpOrigin(
+                        alb.load_balancer_dns_name,
+                        protocol_policy=cloudfront.OriginProtocolPolicy.HTTP_ONLY,
+                        http_port=80,
+                        # P2b · CF origin read_timeout:CDK 校验上限 180s,但账号
+                        # 配额 L-AECE9FA7 "Response timeout per origin" 默认 120s,
+                        # 写 180 会 CreateDistribution 400(P7 真机实撞 2026-07-08)。
+                        # 取 120s(账号默认可部署);要 180s 先提配额再调。SSE 场景
+                        # 120s 内几乎必有 token 流出;WS 长静默走 CF 断,靠客户端
+                        # 30s ping 兜(契约 §8)。
+                        read_timeout=Duration.seconds(120),
+                        keepalive_timeout=Duration.seconds(60),
+                    ),
+                    viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+                    allowed_methods=cloudfront.AllowedMethods.ALLOW_ALL,
+                    cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
+                    origin_request_policy=cloudfront.OriginRequestPolicy.ALL_VIEWER,
+                ),
+                default_root_object="",
+            )
+            console_host = console_domain
+            dashboard_host = app_domain
+            console_cf_id = console_cf.distribution_id
+            app_cf_id = app_cf.distribution_id
+            cf_distribution = console_cf  # for downstream Cognito wiring
+        else:
+            # ===== LEGACY single-distribution mode =====
+            domain_names = [custom_domain] if custom_domain else None
+            certificate = (
+                acm.Certificate.from_certificate_arn(self, "CustomCert", acm_cert_arn)
+                if custom_domain and acm_cert_arn
+                else None
+            )
 
-        # Single mode: console and dashboard share the same host
-        console_host = custom_domain or cf_distribution.distribution_domain_name
-        dashboard_host = console_host
-        console_cf_id = cf_distribution.distribution_id
-        app_cf_id = cf_distribution.distribution_id
+            cf_distribution = cloudfront.Distribution(
+                self,
+                "DashboardCF",
+                comment="OpenClaw Dashboard (single-domain mode)",
+                domain_names=domain_names,
+                certificate=certificate,
+                default_behavior=cloudfront.BehaviorOptions(
+                    origin=origins.HttpOrigin(
+                        alb.load_balancer_dns_name,
+                        protocol_policy=cloudfront.OriginProtocolPolicy.HTTP_ONLY,
+                        http_port=80,
+                        # P2b · CF origin read_timeout:CDK 校验上限 180s,但账号
+                        # 配额 L-AECE9FA7 "Response timeout per origin" 默认 120s,
+                        # 写 180 会 CreateDistribution 400(P7 真机实撞 2026-07-08)。
+                        # 取 120s(账号默认可部署);要 180s 先提配额再调。SSE 场景
+                        # 120s 内几乎必有 token 流出;WS 长静默走 CF 断,靠客户端
+                        # 30s ping 兜(契约 §8)。
+                        read_timeout=Duration.seconds(120),
+                        keepalive_timeout=Duration.seconds(60),
+                    ),
+                    viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+                    allowed_methods=cloudfront.AllowedMethods.ALLOW_ALL,
+                    cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
+                    origin_request_policy=cloudfront.OriginRequestPolicy.ALL_VIEWER,
+                    function_associations=[
+                        cloudfront.FunctionAssociation(
+                            function=url_rewrite_fn,
+                            event_type=cloudfront.FunctionEventType.VIEWER_REQUEST,
+                        )
+                    ],
+                ),
+                additional_behaviors={
+                    "/console/*": cloudfront.BehaviorOptions(
+                        origin=s3_origin,
+                        viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+                        cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
+                        response_headers_policy=sec_headers_policy,
+                        function_associations=[
+                            cloudfront.FunctionAssociation(
+                                function=url_rewrite_fn,
+                                event_type=cloudfront.FunctionEventType.VIEWER_REQUEST,
+                            )
+                        ],
+                    ),
+                    # /chat/* — chat 小程序前端,与 console 同 S3 origin(桶根 chat/,
+                    # 见 setup.sh 把 console/chat/index.html 传到 s3://<assets>/chat/)。
+                    # 缺这条 behavior 时 /chat/* 走 default→ALB(metal)→404。不挂
+                    # url_rewrite_fn(那是 /console 路径改写专用);chat 是单 index.html。
+                    "/chat/*": cloudfront.BehaviorOptions(
+                        origin=s3_origin,
+                        viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+                        cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
+                        response_headers_policy=sec_headers_policy,
+                    ),
+                    # #187 P5 — /hub/* behavior 已随 claw-hub 数据面下线一并删除。
+                    # 数据面 WebSocket 走 /ws/{tenant_id} 直连 microVM gateway,由
+                    # ALB default forward EdgeTG(P2b-iac)承担。
+                },
+                default_root_object="",
+            )
+
+            # Single mode: console and dashboard share the same host
+            console_host = custom_domain or cf_distribution.distribution_domain_name
+            dashboard_host = console_host
+            console_cf_id = cf_distribution.distribution_id
+            app_cf_id = cf_distribution.distribution_id
+    else:
+        # #270 gate 关闭:无 CloudFront。host 回落 ALB DNS(internal ALB 时
+        # 是内网 DNS;客户自管 CDN 指到该 ALB)。cf_distribution=None → 下游
+        # Cognito wiring 只在 custom_domain 真值时才 deref,故此处安全。
+        cf_distribution = None
+        console_host = alb.load_balancer_dns_name
+        dashboard_host = alb.load_balancer_dns_name
+        console_cf_id = ""
+        app_cf_id = ""
+        custom_domain = ""
+        dual_mode = False
 
     # ========== Assets bucket CORS (chat mini-app 图片功能) ==========
     # The chat mini-app uploads/downloads images via S3 presigned URLs

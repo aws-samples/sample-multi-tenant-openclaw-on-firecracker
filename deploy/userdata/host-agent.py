@@ -21,7 +21,7 @@ from botocore.config import Config as BotoConfig
 # P2b (2026-07-08): route_ops lives in the same userdata directory. Add it to
 # sys.path so the tenant-route helpers (port bitmap / DNAT / Redis writer /
 # drift reconcile) resolve when host-agent runs as a systemd ExecStart from
-# /opt/openclaw/. See the data-plane design docs
+# /opt/openclaw/. See internal-docs/00-knowledge-base/the data-plane design/
 # the data-plane interface contract §1/§3/§4/§6/§8.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import route_ops  # noqa: E402

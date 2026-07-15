@@ -93,7 +93,7 @@ def _query_user_tenants(
 # GOAL: the control plane consumes 380 (×N hosts) openclaw start/stop within 1
 # minute. The per-tenant path (batch_tenants → tenant_action → one SSM per VM)
 # can't: SSM single-instance concurrency caps at ~5-10, so 380 commands serialize
-# and 40 concurrent already TimedOut 11 (measured on 795). The fix is HOST-LEVEL
+# and 40 concurrent already TimedOut 11 (measured on ). The fix is HOST-LEVEL
 # fan-out: send ONE SSM command per host (start-all-vms.sh / stop-all-vms.sh),
 # and each host starts/stops all its local VMs in bounded parallel. SSM
 # concurrency then equals the number of HOSTS (single/low-double digits), not the

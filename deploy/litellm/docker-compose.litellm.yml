@@ -13,7 +13,7 @@
 # 详见同目录 LITELLM-RUNBOOK.md。
 #
 # 安全边界（硬红线，见 runbook §安全）：
-#   - LiteLLM 4000 端口映射到宿主，但 SG 入站只对 VPC CIDR(172.31.0.0/16) 开，
+#   - LiteLLM 4000 端口映射到宿主，但 SG 入站只对 VPC CIDR(10.0.0.0/16) 开，
 #     绝不 0.0.0.0/0。guest microVM 经 metal host 用私网 IP 访问。
 #   - Postgres 不映射宿主端口，只在 compose 内网（litellm-net）暴露给 LiteLLM。
 #   - master_key / pg 密码走 .env(600,不提交)；config 里 __GUARDRAIL_ID__ 起容器前 sed 注入。
@@ -48,7 +48,7 @@ services:
       - ./config.runtime.yaml:/etc/litellm/config.yaml:ro
     ports:
       # 4000 映射到宿主全网卡(0.0.0.0)，使 VPC 内 metal host 可达；
-      # 真正的暴露控制在 SG（只放 172.31.0.0/16），见 runbook。绝不靠 0.0.0.0/0 SG。
+      # 真正的暴露控制在 SG（只放 10.0.0.0/16），见 runbook。绝不靠 0.0.0.0/0 SG。
       - "4000:4000"
     # depends_on 用 required=false, 让 HA 模式(litellm-db 不启动, DATABASE_URL
     # 指向外部 RDS Multi-AZ)不因缺 litellm-db 服务而报错; 单机模式(默认)

@@ -121,7 +121,7 @@ def build_compute(self, ctx):
     # ——AMG 强制 AWS_SSO,正是要规避的。所以这段 AMP+AMG 托管资源只在显式
     # metrics.use_managed=true 时才建;默认(含只设 enabled=true)走自建,不建任何
     # 托管 workspace。这样 cdk deploy 默认行为与架构决策一致,不会意外建出强制 SSO
-    # 的 AMG(795 实测 AMP workspace 为空,正是走自建)。想用 AWS 托管再显式开。
+    # 的 AMG( 实测 AMP workspace 为空,正是走自建)。想用 AWS 托管再显式开。
     metrics_cfg = CFG.get("metrics", {})
     amp_remote_write_url = "none"
     if metrics_cfg.get("enabled", False) and metrics_cfg.get("use_managed", False):
@@ -218,9 +218,9 @@ def build_compute(self, ctx):
         # naive path (features=[{RUNTIME_MONITORING, ENABLED}]) also flips
         # EC2_AGENT_MANAGEMENT to ENABLED at the account level, and that
         # associates SSM to auto-install the GuardDuty agent on EVERY EC2
-        # in the account (per AWS "how GuardDuty runtime monitoring works on
-        # EC2" — automated agent management associates SSM fleet-wide). That is
-        # not safe for a shared account
+        # in the account (evidence: internal-docs/00-knowledge-base/evidence/
+        # metal-experiments/8layer-evidence.md:163-181 — AWS "how runtime
+        # monitoring works ec2" doc). That is not safe for a shared account
         # hosting other teams' hosts.
         # Safe stance when the flag is true:
         #   RUNTIME_MONITORING=ENABLED but EC2_AGENT_MANAGEMENT=DISABLED,

@@ -7,10 +7,11 @@ the open-source repo.
 
 ## What lives here
 
-| Item                                            | Where it actually comes from                                                        | Notes                                                                       |
-| ----------------------------------------------- | ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| `openclaw.json` (model/provider/baseUrl/apiKey) | repo root `templates/openclaw.json` (copied from `templates/openclaw.json.example`) | baked into the image by `build-rootfs.sh`; **gitignored** at the repo root  |
-| `claw-channel` HMAC secret                      | minted by the control plane per tenant, injected at **launch** (`launch-vm.sh`)     | never baked into the read-only image — zero credentials in the golden image |
+| Item                                                            | Where it actually comes from                                                        | Notes                                                                       |
+| --------------------------------------------------------------- | ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| `openclaw.json` (model/provider/baseUrl/apiKey)                 | repo root `templates/openclaw.json` (copied from `templates/openclaw.json.example`) | baked into the image by `build-rootfs.sh`; **gitignored** at the repo root  |
+| `claw-channel` HMAC secret                                      | minted by the control plane per tenant, injected at **launch** (`launch-vm.sh`)     | never baked into the read-only image — zero credentials in the golden image |
+| `MARKET_DATA_API_BASE` (optional market-data endpoint)          | env, injected per tenant if a non-default provider is used                          | the read-only `market-data` skill needs **no** key; this only points it at a provider |
 
 ## Why it is its own layer
 

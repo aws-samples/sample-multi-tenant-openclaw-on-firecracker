@@ -1,10 +1,10 @@
-# LiteLLM 网关部署 Runbook（<AWS_ACCOUNT_ID> / ap-southeast-1）
+# LiteLLM 网关部署 Runbook（ 新账号 / ap-southeast-1）
 
 LiteLLM 是数据面 chat 推理的前提：guest microVM 的 OpenClaw 走 `http://<host>:4000/v1` →
 LiteLLM → Bedrock（ap-southeast-1）。本栈跑在堡垒机（docker），用受限 instance role 调 Bedrock。
 
 - 账号：<AWS_ACCOUNT_ID>，region ap-southeast-1。
-- 堡垒机：`ssh -i ~/.ssh/<bastion-key>.pem ubuntu@<BASTION_HOST>`，repo 在 `~/openclaw`。
+- 堡垒机：`ssh -i ~/.ssh/open<aws-profile>-bastion-key.pem ubuntu@<bastion-ip>`，repo 在 `~/openclaw`。
 - 部署资产目录：`deploy/litellm/`（本目录）。
 
 ---
@@ -70,7 +70,7 @@ LiteLLM 容器调 Bedrock 走宿主 **IMDS instance role**，不放任何静态 
   model 的 `aws_region_name: ap-southeast-1` 显式指定，不依赖容器默认 region。
 - IMDS hop limit 须 ≥2（docker bridge 容器多一跳）。堡垒机已是 2。
 
-> 历史坑：堡垒机本身用某 IAM user(admin) 的静态 key（`~/.aws/credentials`），IMDS 上
+> 历史坑：堡垒机本身用 IAM user `<aws-profile>`(admin) 的静态 key（`~/.aws/credentials`），IMDS 上
 > **没有 instance profile**，所以容器 boto3 默认取不到凭据（报 `Unable to locate credentials`）。
 > 解法不是把 admin key 挂进容器（爆炸半径太大），而是建上述最小权限 instance profile attach 到堡垒机。
 
@@ -85,7 +85,7 @@ aws ec2 disassociate-iam-instance-profile --association-id <assoc-id> --region a
 
 ## 安全边界（硬红线）
 
-- **4000 入站只对 VPC CIDR（172.31.0.0/16），绝不 0.0.0.0/0。** guest microVM 经 metal host
+- **4000 入站只对 VPC CIDR（10.0.0.0/16），绝不 0.0.0.0/0。** guest microVM 经 metal host
   用私网 IP 访问。开 SG：`./open-sg-4000.sh`（脚本硬拒 0.0.0.0/0 入参）。
   > 验证：`aws ec2 describe-security-groups --group-ids <sg> --query 'SecurityGroups[].IpPermissions'`
   > 看 4000 的 IpRanges 只有 VPC CIDR。
@@ -116,7 +116,7 @@ curl -s http://127.0.0.1:4000/v1/chat/completions \
 
 ## per-tenant vkey 计费拆分
 
-铸租户 vkey（host 侧用 master_key 调）：
+铸租户 vkey（host 侧用 master_key 调，见 `the per-tenant billing notes`）：
 
 ```bash
 curl -s -X POST http://127.0.0.1:4000/key/generate \

@@ -39,7 +39,7 @@
 #     shared key 兜底覆盖数据盘上的 per-tenant vkey——那会坏计费拆分)
 #
 # fail-loud:jq exit 非零、或输出空,一律不 clobber 原 openclaw.json,return 1。
-# 静默吞过一次异常就是事故(踩过——see the ops guide)。
+# 静默吞过一次异常就是事故(踩过——见 the ops guide 血泪教训)。
 oc_harden_config() {
   __hc_oc="$1"
   __hc_origin="$2"

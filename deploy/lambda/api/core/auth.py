@@ -4,7 +4,7 @@ handler-split #132 T1.1(auth 域试点)—— 从 handler.py 逐字搬迁,行为
 安全域(RBAC 角色门 / owner_id 越权防护 / JWT RS256 验签),
 搬后经 test_rbac + test_audit_idor + test_external_authz 全绿确认「不窜数据」红线。
 
-#187 P5 — Cognito 渠道机器用户在数据面去中枢化转型中随 channel/hub 一起下线,
+#187 P5 — Cognito 渠道机器用户()在数据面去中枢化转型中随 channel/hub 一起下线,
 本文件只保留 Cognito id_token 验签用于 console RBAC(gate 默认关,fail-closed 到 viewer)。
 
 依赖方向:core.auth → core.clients(env 常量)+ core.utils(_resp / _PLATFORM_ID_RE),

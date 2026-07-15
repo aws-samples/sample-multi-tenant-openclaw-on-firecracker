@@ -4,7 +4,7 @@ This section describes the cost, security, supported AWS Regions, and service qu
 
 ## Cost
 
-You are responsible for the cost of the AWS services used while running this solution. As of the writing of this guide, based on 80% Savings Plans plus 20% Spot Instances, the compute cost of this solution is estimated at about $8.36/tenant/month (cost estimate, not measured). Actual cost depends on the host instance type, tenant density, large language model call volume, and whether the optional monitoring components are enabled.
+You are responsible for the cost of the AWS services used while running this solution. As of the writing of this guide, based on 80% Savings Plans plus 20% Spot Instances, the compute cost of this solution is estimated at about $8.36/tenant/month (cost estimate, not measured). This figure amortizes bare-metal instance hours only and does not factor in EBS data volumes, the memory oversubscription ratio (default 1.5), and similar items; with those included, the actual per-tenant cost can be significantly higher. Actual cost depends on the host instance type, tenant density, large language model call volume, and whether the optional monitoring components are enabled; use the AWS Pricing Calculator as the source of truth.
 
 > **Important**
 >
@@ -12,21 +12,21 @@ You are responsible for the cost of the AWS services used while running this sol
 
 The primary cost components of this solution are as follows.
 
-| AWS service              | Billing dimension                     | Description                                                                                          |
-| ------------------------ | ------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| Amazon EC2 (metal hosts) | Instance hours (Savings Plans / Spot) | Primary cost item. Carries all tenant microVMs; production uses Graviton Arm64 metal                 |
-| Amazon EBS               | Provisioned capacity (gp3, encrypted) | Each host mounts data volumes carrying the sparse disks and image overlays of all microVMs           |
-| AWS Lambda               | Number of requests + runtime duration | Control plane API, health checks, scaling, and backup functions                                      |
-| Amazon DynamoDB          | On-demand read/write + storage + PITR | Tenant, host, skill group, and audit metadata                                                        |
-| Amazon S3                | Storage + requests                    | Golden image, tenant backups, and log archives                                                       |
-| Amazon API Gateway       | Number of requests                    | Control plane REST API                                                                               |
-| Amazon CloudFront        | Data transfer + requests              | Sole public entry point, reverse-proxying the chat UI and hub                                        |
-| Elastic Load Balancing   | Load balancer hours + LCU             | Application Load Balancer, receiving CloudFront origin traffic                                       |
-| Amazon CloudWatch        | Log ingestion + storage + metrics     | Control plane logs and metrics; the log group default retention is described in Architecture details |
+| AWS service              | Billing dimension                     | Description                                                                                                      |
+| ------------------------ | ------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| Amazon EC2 (metal hosts) | Instance hours (Savings Plans / Spot) | Primary cost item. Carries all tenant microVMs; production uses Graviton Arm64 metal                             |
+| Amazon EBS               | Provisioned capacity (gp3, encrypted) | Each host mounts data volumes carrying the sparse disks and image overlays of all microVMs                       |
+| AWS Lambda               | Number of requests + runtime duration | Control plane API, health checks, scaling, and backup functions                                                  |
+| Amazon DynamoDB          | On-demand read/write + storage + PITR | Tenant, host, skill group, and audit metadata                                                                    |
+| Amazon S3                | Storage + requests                    | Golden image, tenant backups, and log archives                                                                   |
+| Amazon API Gateway       | Number of requests                    | Control plane REST API                                                                                           |
+| Amazon CloudFront        | Data transfer + requests              | Sole public entry point, reverse-proxying the console/chat static assets and the data plane (origins to the ALB) |
+| Elastic Load Balancing   | Load balancer hours + LCU             | Application Load Balancer, receiving CloudFront origin traffic                                                   |
+| Amazon CloudWatch        | Log ingestion + storage + metrics     | Control plane logs and metrics; the log group default retention is described in Architecture details             |
 
 > **Note**
 >
-> The per-tenant billing virtual key (LiteLLM virtual key) of this solution splits large language model call spend by "the Amazon Cognito identity corresponding to the tenant", making it easy to attribute inference cost to a specific tenant. This capability is off by default and takes effect only after the billing section is enabled in the configuration.
+> The per-tenant billing virtual key (LiteLLM virtual key) of this solution splits large language model call spend per tenant (`tenant_id`), making it easy to attribute inference cost to a specific tenant. This capability is off by default and takes effect only after the billing section is enabled in the configuration.
 
 ## Security
 
@@ -44,7 +44,7 @@ AWS Identity and Access Management (IAM) roles allow customers to assign fine-gr
 
 ### Identity and access control
 
-This solution uses Amazon Cognito as the single root of trust for identity. Both the control plane and the data plane accept only tokens issued and verified through Cognito, and verification failure always degrades to the least privilege (read-only viewer). This solution enables role-based access control (RBAC) by default, enforcing per-route role checks and resource-owner checks.
+Identity in this solution is split across two planes. On the **data plane**, the root of trust is OpenClaw's native Ed25519 asymmetric device authentication: the platform backend holds the device private key, the public key is cold-injected into the microVM, and the microVM gateway verifies the signature; Amazon Cognito is not involved. On the **control plane**, `x-api-key` is the first gate; when RBAC is enabled, Amazon Cognito token verification (RS256 + JWKS) is layered on top, and verification failure always degrades to the least privilege (read-only viewer). This solution enables role-based access control (RBAC, `console_auth.rbac_enabled` defaults to `true`) by default, enforcing per-route role checks and resource-owner checks; even with RBAC disabled, the resource-owner (`owner_id`) check still applies independently. In the current deployment code, Amazon Cognito is used only for the control plane console sign-in (disabled by default).
 
 ### Network and public exposure
 
@@ -54,7 +54,7 @@ This solution enforces three classes of drop rules on the host iptables for each
 
 > **Important**
 >
-> This solution explicitly removes OpenClaw's native OpenAI-compatible `chatCompletions` HTTP endpoint. This endpoint is a bypass that goes straight to the large language model and circumvents the control UI's device authentication; enabling it globally adds an external attack surface to every tenant. If an external chat endpoint is genuinely required, the correct approach is a per-tenant switch, enabled at rebuild only for the tenants that truly need it, rather than enabling it globally. The current code has no path that injects this endpoint, and the per-tenant switch is planned (not implemented).
+> This solution removes OpenClaw's native OpenAI-compatible `chatCompletions` HTTP endpoint by default. This endpoint is a bypass that goes straight to the large language model and circumvents device authentication; enabling it globally adds an external attack surface to every tenant. The correct approach is a per-tenant switch, and this switch is implemented and off by default: the endpoint is kept at launch for a tenant only when `chat_endpoint_enabled: true` is passed at tenant registration; it is not injected by default. Do not enable it globally.
 
 ### Encryption
 
@@ -80,13 +80,13 @@ The core AWS services used by this solution (AWS Lambda, Amazon API Gateway, Ama
 
 Certain AWS services used by this solution have quota limits. Confirm that the following quotas satisfy your target scale before deploying and scaling.
 
-| Service / resource        | Quota of concern                                              | Description                                                                                                                |
-| ------------------------- | ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| Amazon EC2                | Instance quota for the target metal instance type, Spot quota | Determines the number of hosts that can be launched and total tenant capacity                                              |
-| AWS Systems Manager       | Concurrent commands per instance                              | The real bottleneck for large-scale tenant creation; enable an Amazon SQS smoothing queue to avoid it                      |
-| Application Load Balancer | Number of rules per load balancer                             | Each tenant occupies one forwarding rule; the relationship between the rule-count hard wall and capacity is to be verified |
-| AWS Lambda                | Concurrent executions                                         | Concurrency of the control plane and lifecycle functions                                                                   |
-| Amazon DynamoDB           | On-demand throughput                                          | On-demand billing scales automatically with traffic                                                                        |
+| Service / resource  | Quota of concern                                              | Description                                                                                              |
+| ------------------- | ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| Amazon EC2          | Instance quota for the target metal instance type, Spot quota | Determines the number of hosts that can be launched and total tenant capacity                            |
+| AWS Systems Manager | Concurrent commands per instance                              | The real bottleneck for large-scale tenant creation; enable an Amazon SQS smoothing queue to avoid it    |
+| Amazon ElastiCache  | Node memory and connection count (data plane opt-in)          | Edge routing table; per-tenant routing looks up Redis `route:{tenant_id}` and does not consume ALB rules |
+| AWS Lambda          | Concurrent executions                                         | Concurrency of the control plane and lifecycle functions                                                 |
+| Amazon DynamoDB     | On-demand throughput                                          | On-demand billing scales automatically with traffic                                                      |
 
 > **Important**
 >

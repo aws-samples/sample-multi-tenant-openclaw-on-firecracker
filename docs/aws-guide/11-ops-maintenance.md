@@ -1,7 +1,7 @@
 # 组件运维手册
 
 > 本章按组件列日常维护、监控指标、告警阈值、扩缩容与故障排查。**十万级规模化的运维底线在这一章**,给运营和 SRE 团队用。
-> 上游改动源:`internal design docs`(数据面重构后新增)+ `internal architecture notes`(架构 review 结论)。
+> 上游改动源:`internal-docs/00-knowledge-base/the data-plane design/`(数据面重构后新增)+ `internal-docs/progress/aws-architect.md`(架构 review 结论)。
 > 冲突裁决:AWS 官方文档 > 本手册 > 记忆。改变化以 CHANGELOG 为准。
 
 ---
@@ -196,7 +196,7 @@
 
 **日常维护**:
 
-- Lambda:`update-function-code` 时带完整依赖 wheel(项目坑 `e2e-795-passed-and-pyjwt-lesson`);别只传 .py。
+- Lambda:`update-function-code` 时带完整依赖 wheel(项目坑 `e2e--passed-and-pyjwt-lesson`);别只传 .py。
 - DDB 表:PITR 已开(35 天),audit 表 WORM 归档另配(config.yml:audit.worm_archive_enabled)。**删表前必快照**(项目铁律 #4)。
 
 **监控**:

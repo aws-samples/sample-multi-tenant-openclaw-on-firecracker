@@ -401,7 +401,7 @@ INJECTED_CHANNEL_SECRET="${9:-}"
 # stay regardless: per-tenant gateway.auth.token + CloudFront/nginx reverse proxy +
 # Bedrock Guardrail + LiteLLM vkey limit. Empty (legacy SSM commands) → off.
 CHAT_EP_ENABLED="${10:-}"
-# #187 P5 — 11th arg 保留空占位(转型前是 INJECTED_COGNITO_B64 端到端
+# #187 P5 — 11th arg 保留空占位(转型前是 INJECTED_COGNITO_B64  端到端
 # Cognito 渠道机器用户 base64)。channel/hub 数据面已下线,数据面走两级路由直连
 # microVM:18789 gateway。参数位保留以维持 12 位对齐,取值不再使用。
 INJECTED_COGNITO_B64="${11:-}"

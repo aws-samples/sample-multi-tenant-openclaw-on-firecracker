@@ -123,7 +123,7 @@
   </g>
 
   <g font-size="11" fill="#6b7a92">
-    <text x="44" y="1502">来源(一手 file:line):hub 端点/token/wss 帧 the internal design spec;控制面 POST /tenants(代开路径)</text>
+    <text x="44" y="1502">来源(一手 file:line):hub 端点/token/wss 帧 the hub design doc §1-5 + server.mjs:249-267(JWKS 验签)/402-472(token)/623-772(撮合);控制面 POST /tenants(代开路径)</text>
     <text x="44" y="1520">+ owner 门控 handler.py + Pre-Token-Gen/TenantTable/多 IdP 联邦照抄 aws-samples/amazon-cognito-example-for-multi-tenant(已 clone opensource/);AI pro 前端复用现有 console/chat(Hosted UI+PKCE 联邦就绪)。</text>
     <text x="44" y="1538" fill="#c15c14">关键:禁用户自助注册(/tenants/self 存在但本流程不用),租户由交易平台后端代开;AI pro chat UI 生产中嵌客户电商域、非独立域名。custom claim/联邦/Pre-Token-Gen 属档 A 待实现,当前单 Cognito Pool 直连未接外部 IdP。</text>
   </g>

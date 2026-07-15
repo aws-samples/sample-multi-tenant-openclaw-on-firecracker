@@ -1,13 +1,14 @@
 # 13 · Data-plane two-tier routing (post-2026-07-08 redesign)
 
-> This chapter describes the real-time chat data-plane after the 2026-07-08 decentralization redesign. It **supersedes** the "claw-hub real-time chat" section in [03 Architecture Details](03-architecture-details.md) (the old hub-WS + `claw-channel` outbound dial + triple Cognito identity + HMAC `channel_secret` model). Rationale: customer OIDC does not support headless/browserless login, so Cognito and the outbound-dial hub were dropped in favor of OpenClaw-native gateway auth. Ops (monitoring, alerts, troubleshooting) lives in [Chapter 11 Component Ops Manual](11-ops-maintenance.md); not duplicated here.
+> This chapter describes the real-time chat data-plane after the 2026-07-08 decentralization redesign. It **supersedes** the "claw-hub real-time chat" section in [03 Architecture Details](03-architecture-details.md) (the old hub-WS + `claw-channel` outbound dial + triple Cognito identity + HMAC `channel_secret` model). Rationale: `internal-docs/00-knowledge-base/decisions/DECISION-drop-oidc-cognito-use-openclaw-native-auth.md`. Interface contract: `internal-docs/00-knowledge-base/the data-plane design/the data-plane interface contract`. Ops (monitoring, alerts, troubleshooting) lives in [Chapter 11 Component Ops Manual](11-ops-maintenance.md); not duplicated here.
 
 ## 13.1 End-to-end data-plane
 
 Chat traffic follows a two-tier route with no hub relay. The microVM's OpenClaw gateway is the sole backend:
 
 ```
-Browser ── wss ─▶ Platform BE /gw/ws ── HTTP+SSE ─▶ Amazon CloudFront ─▶ ALB(LOR, single default rule)
+Browser ── wss /gw/ws (platform session JWT) ─▶ Platform backend WebSocket gateway
+   Platform backend as ws client ── ws ─▶ Amazon CloudFront ─▶ ALB (LOR, single default rule)
                                                                                             │
                                                                              (3-AZ)         ▼
                                                                                      OpenResty edge ASG (3 nodes)
@@ -23,25 +24,25 @@ Browser ── wss ─▶ Platform BE /gw/ws ── HTTP+SSE ─▶ Amazon Cloud
                                                                                  └──────────┬──────────┘
                                                                                             ▼
                                                                              microVM OpenClaw gateway :18789
-                                                                             POST /v1/chat/completions (SSE)
+                                                                             (Ed25519 device handshake + gateway token)
 ```
 
-Code file:line: OpenResty side in `deploy/edge/nginx.conf` (single `microvm_gateway` upstream + 3-tier cache) and `deploy/edge/route.lua` (rewrite/balancer/init_worker phases) and `deploy/edge/lib/backend.lua` (L1 lrucache + L2 shared_dict + L3 Redis + fail-static). Host side: `deploy/userdata/host-agent.py` (port bitmap 10000-10400 + iptables DNAT + descriptor double-write to Redis). IaC side: `deploy/stack.py` (EdgeASG + ElastiCache Multi-AZ replication group + ALB LOR).
+Code file:line: OpenResty side in `deploy/edge/nginx.conf` (single `microvm_gateway` upstream + 3-tier cache) and `deploy/edge/route.lua` (rewrite/balancer/init_worker phases) and `deploy/edge/lib/backend.lua` (L1 lrucache + L2 shared_dict + L3 Redis + fail-static). Host side: `deploy/userdata/host-agent.py` (port bitmap [10000, dnat_port_high] + iptables DNAT + descriptor double-write to Redis). IaC side: `deploy/stack.py` (EdgeASG + ElastiCache Multi-AZ replication group + ALB LOR).
 
-## 13.2 Auth (token-only, single credential)
+## 13.2 Auth (gateway token + Ed25519 device handshake)
 
-`gateway.auth.mode=token` + `gateway.controlUi.enabled=false` on the OpenClaw gateway (`templates/openclaw.json:10-17`). Sole authorization is per-tenant `Authorization: Bearer <gateway_token>`. Token lifecycle:
+The OpenClaw gateway enables device auth (`gateway.auth`, see `templates/openclaw.json.example`). Data-plane credentials = per-tenant gateway token (`Authorization: Bearer`) + Ed25519 device handshake (the platform backend holds the private key; the public key is cold-injected into the microVM's `paired.json`). Token lifecycle:
 
-1. **Mint**: on `POST /tenants`, `deploy/lambda/api/services/tenant_service.py:162-214 mint_gateway_token` calls KMS GenerateRandom 32B → base64url → `kms_envelope.encrypt_with_tenant(plaintext, tenant_id, ClawPoolCMK)` with `EncryptionContext={"tenant_id":<id>}` → PUT the ciphertext into the `openclaw-tenant-secrets` DDB table with `expires_at=now+900`.
-2. **Inject into microVM**: the ciphertext travels as launch-vm positional arg #12 to `deploy/userdata/launch-vm.sh`. On the host, `kms:Decrypt(EC={tenant_id})` recovers the plaintext into the read-only disk's `openclaw.json .gateway.auth.token`. Plaintext never touches host disk beyond that file, never appears in SSM commands, never lands in CloudTrail.
-3. **Callers fetch ciphertext**: the platform backend calls `GET /tenants/{id}`; when `status=running` the response body includes a `gateway_token` field (base64 KMS ciphertext; `handler.py:346-357`, via `tenant_service.read_gateway_token_ct`). This is the only way to fetch the token — the dedicated `GET /tenants/{id}/token` endpoint has been removed. **The API Lambda never decrypts** and does not hold `kms:Decrypt` — the caller decrypts locally with the same EncryptionContext.
-4. **Window**: DDB TTL is 900s (15 min). After expiry the `gateway_token` field drops out of the `GET` response and the token must be re-minted (SPEC §7.1 open question).
+1. **Mint**: on `POST /tenants`, `deploy/lambda/api/services/tenant_service.py:162-214 mint_gateway_token` calls KMS GenerateRandom 32B → base64url → `kms_envelope.encrypt_with_tenant(plaintext, tenant_id, ClawPoolCMK)` with `EncryptionContext={"tenant_id":<id>}` → PUT the ciphertext into the `openclaw-tenant-secrets` DDB table with `expires_at = now + _GATEWAY_TOKEN_TTL_SEC` (30 days).
+2. **Inject into microVM**: the ciphertext travels as launch-vm positional arg #12 (#187 P1) to `deploy/userdata/launch-vm.sh`. On the host, `kms:Decrypt(EC={tenant_id})` recovers the plaintext into the read-only disk's `openclaw.json .gateway.auth.token`. Plaintext never touches host disk beyond that file, never appears in SSM commands, never lands in CloudTrail.
+3. **Callers fetch ciphertext**: the platform backend calls `GET /tenants/{id}`; when `status=running` the response body includes the `gateway_token` field (base64 KMS envelope ciphertext) plus the device credential trio. This is the only way to fetch the token — the dedicated `GET /tenants/{id}/token` endpoint has been removed. The caller decrypts locally with `kms:Decrypt` (EncryptionContext={"tenant_id":<id>}). Note: the API Lambda does hold `kms:Decrypt` on the symmetric ClawPool CMK (used by `GET /tenants/{id}/credentials` to re-encrypt outbound credentials to the recipient's RSA public key), but gateway-token delivery remains "return ciphertext, caller decrypts" — the Lambda does not decrypt the token on the `GET /tenants/{id}` path.
+4. **Window**: the ciphertext table's DDB TTL is tenant-lifecycle scale (`_GATEWAY_TOKEN_TTL_SEC = 30*24*3600`, i.e. 30 days). The early 900s window left a running platform backend unable to re-fetch the token after ~15 minutes, so it was lengthened. After expiry the `gateway_token` field drops out of the `GET` response and the token must be re-minted.
 
 **Removed by this redesign**: hub-WS (`claw-hub`), `claw-channel` outbound dial, the three Cognito identities (user pool + two app clients + `custom:tenant_user_id`), `POST /chat/sign` HMAC signing, `channel_secret`.
 
 ## 13.3 Edge routing: the OpenResty edge ASG
 
-**Shape**: dedicated ASG (not mixed with the host ASG), 3 AZs, min=3 desired=3 (N-1), `health_check_type=ELB`. Userdata `deploy/edge/install-edge.sh` installs OpenResty (Ubuntu apt / AL2023 dnf, arm64 + x86), templates `local-ipv4` from IMDS into nginx.conf, tunes sysctl, starts the `claw-edge.service` systemd unit, and **polls `/healthz` until it returns 200 before exiting 0**. The ASG lifecycle hook only signals CONTINUE after that warmup gate (SPEC §6).
+**Shape**: dedicated ASG (not mixed with the host ASG), 3 AZs, min=3 desired=3 (N-1), `health_check_type=ELB`, `health_check_grace_period=300s` (covers apt install + Lua warmup on cold start). Userdata `deploy/edge/install-edge.sh` installs OpenResty (Ubuntu apt / AL2023 dnf, arm64 + x86), templates `local-ipv4` from IMDS into nginx.conf, tunes sysctl, starts the `claw-edge.service` systemd unit, and **polls `/healthz` until it returns 200 before exiting 0**. Cold-start protection relies on the ELB health check + grace period — the edge ASG itself carries no lifecycle hook (only the host ASG has init/terminate hooks).
 
 **Three-tier route cache** (`deploy/edge/lib/backend.lua`):
 
@@ -51,15 +52,15 @@ Code file:line: OpenResty side in `deploy/edge/nginx.conf` (single `microvm_gate
 | L2   | `lua_shared_dict route_cache 128m`        | 60s         | cross-worker + fail-static cover for ElastiCache failover |
 | L3   | ElastiCache Redis `GET route:{tenant_id}` | —           | authoritative (host-agent double-writes)                  |
 
-On L3 miss, `resty.lock` single-flights the origin fetch (stampede shield). When Redis is unreachable, L2 serves stale (fail-static). **The 60s L2 TTL is a quantified lower bound** — it must be "≥ the longest expected failover window (recommended ≥30-60s)" and ElastiCache Multi-AZ automatic failover typically takes 15-30s.
+On L3 miss, `resty.lock` single-flights the origin fetch (stampede shield). When Redis is unreachable, L2 serves stale (fail-static). **The 60s L2 TTL is a quantified lower bound** — the data-plane contract requires "≥ the longest expected failover window (recommended ≥30-60s)" and ElastiCache Multi-AZ automatic failover typically takes 15-30s.
 
 **DNS + connection layer**: `resolver 169.254.169.253 valid=30s ipv6=off;`; `lua-resty-redis set_keepalive(60000ms, 100)`. Never hard-code Redis node IPs — always use the primary-endpoint DNS name, which AWS updates on failover.
 
 ## 13.4 Host DNAT + port bitmap
 
-`deploy/userdata/host-agent.py` (single-worker serial):
+The port bitmap, iptables DNAT, and Redis route double-write live in a dedicated module, `deploy/userdata/route_ops.py`, called by `host-agent.py` (single-worker serial):
 
-- **Port range**: 10000-10400 (401 slots, one per microVM ≤ 400).
+- **Port range**: [10000, dnat_port_high] (default upper bound 15000 = 5001 slots, above the per-host memory ceiling so ports never exhaust before memory; bound read from config, SG and bitmap share one source; `the data-plane contract §3`).
 - **Allocation**: local bitmap + `iptables -C` conflict check under mutex — three steps atomic to prevent concurrent double-alloc.
 - **DNAT insertion**: `iptables -t nat -A PREROUTING -p tcp --dport <host_port> -j DNAT --to-destination <guest_ip>:18789`.
 - **Descriptor double-write**: after VM probe + gateway-token verification, DDB first, Redis second. On delete/migrate, `DEL route:{tenant_id}` + symmetric DNAT `-D` + slot release.
@@ -103,4 +104,4 @@ Operational rigor (rolling deploys, monitoring, alert thresholds, scaling trigge
 | Route authority      | Hub in-memory + owner check                                                                          | ElastiCache Redis `route:{tenant_id}` + 3-tier cache                                                |
 | Image/media pipeline | claw-hub presigned S3                                                                                | To be redesigned (SPEC §7.2 open question; current sample chat demo has no image feature)           |
 
-**Components landed (2026-07-08)**: P1 control-plane token pre-mint, P2-edge trio (nginx.conf / route.lua / install-edge.sh), P2b-host (port bitmap + DNAT), P2b-iac (stack.py EdgeASG + ElastiCache + ALB), P3 image v5 (channel removal), P4-①② demo / frontend cutover. P4-③ (edge admin console) and P5-P7 land in follow-up phases.
+**Merged phases**: P1 control-plane token pre-mint · P2-edge trio (nginx.conf / route.lua / install-edge.sh) · P2b-host (port bitmap + DNAT) · P2b-iac (EdgeASG + ElastiCache + ALB) · P3 image channel removal · P4 demo / frontend cutover · P5 (Cognito gate default-off + hub leftover cleanup: hub target group / listener rules removed, `console_auth` defaults to false). The full chain has been verified end-to-end in the demo environment; the data-plane components are opt-in (`edge` / `redis` gates default to false) and are wired in via rebuild when enabled in production.

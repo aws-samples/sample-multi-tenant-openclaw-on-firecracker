@@ -31,6 +31,9 @@
     <script src="js/app.loadtest.js"></script>
     <script src="js/app.poolops.js"></script>
     <script src="js/app.edge.js"></script>
+    <script src="js/app.traces.js"></script>
+    <script src="js/app.logs.js"></script>
+    <script src="js/app.audit.js"></script>
     <script src="js/app.js"></script>
     <script
       defer
@@ -391,7 +394,7 @@
             margin-right: 10px;
             vertical-align: middle;
           "
-          >🦞</span
+          >B</span
         >ClawPool Agent · Pool Management Console
       </h1>
       <span class="status-dot" :class="connected ? 'ok' : 'err'"></span>
@@ -451,6 +454,27 @@
         @click="page='edge'; refreshEdge()"
       >
         Edge
+      </button>
+      <button
+        class="nav-tab"
+        :class="page==='traces' && 'active'"
+        @click="page='traces'; loadTraces()"
+      >
+        Traces
+      </button>
+      <button
+        class="nav-tab"
+        :class="page==='logs' && 'active'"
+        @click="page='logs'"
+      >
+        Logs
+      </button>
+      <button
+        class="nav-tab"
+        :class="page==='audit' && 'active'"
+        @click="page='audit'; loadAudit(); loadImages()"
+      >
+        Audit &amp; Ops
       </button>
       <button
         class="nav-tab"
@@ -684,7 +708,7 @@
               </button>
               <button
                 class="btn btn-cyan btn-sm"
-                @click="restoreSource=null; showModal=true"
+                @click="restoreSource=null; loadTemplates(); showModal=true"
               >
                 + New
               </button>
@@ -871,20 +895,12 @@
                         </button>
                         <!-- #187 转型:controlUi.enabled=false(P3 已烤),
                              gateway Control UI 死代码 + oc-dashboard.sh 复制按钮
-                             同时下线;租户操作走本控制台其余入口。 -->
-                        <template x-if="t.status==='running'">
-                          <button
-                            class="btn-act"
-                            title="查看租户详情:gateway token 密文 + descriptor(GET /tenants/{id};调用方自解)"
-                            @click="viewToken(t.id)"
-                          >
-                            <svg class="icon s13"><use href="#i-key" /></svg
-                            ><span class="act-lbl">Token</span>
-                          </button>
-                        </template>
+                             同时下线;租户操作走本控制台其余入口。
+                             Token(reveal gateway_token 密文)按钮 2026-07-09 下线:
+                             gateway_token 是服务端代持凭据,不在控制面 UI 暴露入口。 -->
                         <template x-if="t.status==='running'">
                           <span>
-                            <!-- #187 — pause/resume 本期未开(SPEC 标 Disabled),
+                            <!-- #187: pause/resume 本期未开(SPEC 标 Disabled),
                                  按钮灰化 + tooltip 明说,防误点。 -->
                             <button
                               class="btn-act"
@@ -943,7 +959,7 @@
                           </span>
                         </template>
                         <template x-if="t.status==='paused'">
-                          <!-- #187 — paused 态本期理论上不会出现(pause 已 Disabled);
+                          <!-- #187: paused 态本期理论上不会出现(pause 已 Disabled);
                                留占位并灰按钮,兜底防未来出现 -->
                           <button
                             class="btn-act"
@@ -1515,7 +1531,10 @@
         >
           <div>
             <div style="font-size: 11px; color: var(--gray)">
-              Prometheus (AMP)
+              Prometheus
+              <span
+                x-text="'(' + (systemInfo?.metrics?.backend === 'managed' ? 'AMP' : 'self-hosted') + ')'"
+              ></span>
             </div>
             <div style="font-size: 13px">
               <span
@@ -1526,7 +1545,10 @@
           </div>
           <div>
             <div style="font-size: 11px; color: var(--gray)">
-              Grafana (AMG) Workspace
+              Grafana
+              <span
+                x-text="'(' + (systemInfo?.metrics?.backend === 'managed' ? 'AMG' : 'self-hosted') + ')'"
+              ></span>
             </div>
             <div style="font-size: 13px">
               <template x-if="systemInfo?.metrics?.grafana_url">
@@ -1566,9 +1588,12 @@
           "
         >
           💡 To enable: set <code>metrics.enabled: true</code> in
-          <code>config.yml</code> and redeploy. The stack will provision Amazon
-          Managed Prometheus + Grafana, and ADOT collectors on each host start
-          scraping in ~3 minutes after rollout.
+          <code>config.yml</code> and redeploy. The default backend is
+          self-hosted Prometheus + Grafana on EC2 (<code
+            >use_managed: false</code
+          >); set <code>use_managed: true</code> for Amazon Managed Prometheus +
+          Grafana instead. Either way, host-agent starts exposing per-VM
+          CPU/memory/health on <code>:8899/metrics</code> after rollout.
         </div>
       </div>
 
@@ -2234,7 +2259,8 @@ openclaw_vm_disk_used_pct &gt; 90</pre
           <strong>Error:</strong> <span x-text="edgeError"></span>
           <p style="font-size: 12px; margin-top: 8px">
             If message includes <code>EDGE_STACK_NOT_DEPLOYED</code>, run
-            <code>cdk deploy</code> with <code>edge.enabled=true</code>.
+            <code>cdk deploy</code> with <code>edge.enabled=true</code> (see
+            the data-plane design/the design doc P2b-iac).
           </p>
         </div>
       </template>
@@ -2342,6 +2368,597 @@ openclaw_vm_disk_used_pct &gt; 90</pre
           </ul>
         </template>
       </section>
+    </div>
+
+    <!-- Page: Traces (#221 — X-Ray query APIs, read-only) -->
+    <div x-show="page==='traces'" class="page-content">
+      <h2>🔎 Traces</h2>
+
+      <div class="section-card">
+        <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: end">
+          <label>
+            Window (minutes)
+            <input
+              type="number"
+              min="1"
+              max="360"
+              x-model.number="traceFilter.minutes"
+              style="width: 90px"
+            />
+          </label>
+          <label>
+            Tenant ID (annotation filter)
+            <input
+              type="text"
+              x-model="traceFilter.tenant"
+              placeholder="t-1234"
+              style="width: 200px"
+            />
+          </label>
+          <label style="display: flex; align-items: center; gap: 6px">
+            <input type="checkbox" x-model="traceFilter.errorOnly" />
+            Errors/Faults only
+          </label>
+          <button class="btn" @click="loadTraces()" :disabled="tracesLoading">
+            Search
+          </button>
+          <button
+            class="btn"
+            @click="loadServiceMap()"
+            :disabled="serviceMapLoading"
+          >
+            Load service map
+          </button>
+        </div>
+
+        <div
+          x-show="tracesError === 'throttled'"
+          style="color: #c78500; margin-top: 8px"
+        >
+          X-Ray throttled the request. Retry in a few seconds.
+        </div>
+        <div
+          x-show="tracesError === 'unavailable'"
+          style="color: #c53030; margin-top: 8px"
+        >
+          X-Ray query API is unavailable — trace search is temporarily degraded.
+          The rest of the console is unaffected.
+        </div>
+      </div>
+
+      <!-- Trace list -->
+      <div class="section-card">
+        <h3>Recent traces (<span x-text="traceRows.length"></span>)</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Trace ID</th>
+                <th>Started</th>
+                <th>Duration</th>
+                <th>HTTP</th>
+                <th>Tenant</th>
+                <th>Status</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              <template x-for="row in traceRows" :key="row.Id">
+                <tr>
+                  <td><code x-text="row.Id"></code></td>
+                  <td
+                    x-text="row.StartTime ? new Date(row.StartTime * 1000).toISOString().replace('T',' ').slice(0,19) : '-'"
+                  ></td>
+                  <td
+                    x-text="row.Duration != null ? row.Duration.toFixed(3) + 's' : '-'"
+                  ></td>
+                  <td x-text="(row.Http && row.Http.HttpStatus) || '-'"></td>
+                  <td
+                    x-text="(row.Annotations && row.Annotations.tenant_id && row.Annotations.tenant_id[0] && row.Annotations.tenant_id[0].AnnotationValue && row.Annotations.tenant_id[0].AnnotationValue.StringValue) || '-'"
+                  ></td>
+                  <td>
+                    <span x-show="row.HasError" style="color: #c53030"
+                      >error</span
+                    >
+                    <span x-show="row.HasFault" style="color: #c53030"
+                      >fault</span
+                    >
+                    <span
+                      x-show="!row.HasError && !row.HasFault"
+                      style="color: #3f8f4f"
+                      >ok</span
+                    >
+                  </td>
+                  <td>
+                    <button class="btn" @click="openTrace(row.Id)">Open</button>
+                    <button
+                      class="btn"
+                      @click="openLogsForTrace(row)"
+                      title="按该租户查 VM/host/Lambda 日志 (#266)"
+                    >
+                      Logs
+                    </button>
+                  </td>
+                </tr>
+              </template>
+              <tr x-show="traceRows.length === 0 && !tracesLoading">
+                <td colspan="7" style="text-align: center; color: #888">
+                  No traces in this window.
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div style="margin-top: 8px">
+          <button
+            class="btn"
+            @click="loadMoreTraces()"
+            :disabled="!traceNextToken || tracesLoading"
+          >
+            Load more
+          </button>
+          <span x-show="tracesLoading" style="margin-left: 8px">Loading…</span>
+        </div>
+      </div>
+
+      <!-- Trace detail (waterfall) -->
+      <div class="section-card" x-show="traceSelected">
+        <div
+          style="
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+          "
+        >
+          <h3>
+            Waterfall —
+            <code
+              x-text="(traceSelected && traceSelected.tree && traceSelected.tree.Id) || ''"
+            ></code>
+          </h3>
+          <button class="btn" @click="closeTrace()">Close</button>
+        </div>
+        <div x-show="traceDetailLoading">Loading trace…</div>
+        <template x-if="traceSelected && traceSelected.error">
+          <div
+            style="color: #c53030"
+            x-text="'Trace unavailable: ' + traceSelected.error"
+          ></div>
+        </template>
+        <template
+          x-if="traceSelected && traceSelected.tree && traceSelected.tree.LimitExceeded"
+        >
+          <div style="color: #c78500">
+            Truncated by X-Ray (LimitExceeded=true) — segments may be
+            incomplete.
+          </div>
+        </template>
+        <template x-if="traceSelected && traceSelected.tree">
+          <div>
+            <template
+              x-for="span in flattenSpans(traceSelected.tree).rows"
+              :key="span.id"
+            >
+              <div
+                style="
+                  display: flex;
+                  align-items: center;
+                  gap: 6px;
+                  padding: 2px 0;
+                  font-family: monospace;
+                  font-size: 12px;
+                "
+              >
+                <span
+                  :style="'display:inline-block; width:' + (span.depth * 14) + 'px'"
+                ></span>
+                <span
+                  style="
+                    width: 220px;
+                    overflow: hidden;
+                    text-overflow: ellipsis;
+                    white-space: nowrap;
+                  "
+                  :style="span.error ? 'color:#c53030' : ''"
+                  x-text="span.name"
+                ></span>
+                <span
+                  style="width: 70px; text-align: right"
+                  x-text="span.durationMs + 'ms'"
+                ></span>
+                <span
+                  style="
+                    flex: 1;
+                    position: relative;
+                    background: #eee;
+                    height: 10px;
+                    border-radius: 3px;
+                  "
+                >
+                  <span
+                    :style="'position:absolute; left:' + span.offsetPct + '%; width:' + span.widthPct + '%; height:100%; background:' + (span.error ? '#c53030' : '#3182ce') + '; border-radius:3px'"
+                  ></span>
+                </span>
+              </div>
+            </template>
+          </div>
+        </template>
+      </div>
+
+      <!-- Service map -->
+      <div class="section-card" x-show="serviceMap">
+        <h3>Service map</h3>
+        <template x-if="serviceMap && serviceMap.error">
+          <div
+            style="color: #c53030"
+            x-text="'Service map unavailable: ' + serviceMap.error"
+          ></div>
+        </template>
+        <template x-if="serviceMap && serviceMap.Services">
+          <div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Service</th>
+                    <th>Type</th>
+                    <th>Traces</th>
+                    <th>OK / Err / Fault / Throttle</th>
+                    <th>Downstream</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template
+                    x-for="svc in serviceMap.Services"
+                    :key="svc.ReferenceId"
+                  >
+                    <tr>
+                      <td x-text="svc.Name || '(unnamed)'"></td>
+                      <td x-text="svc.Type || '-'"></td>
+                      <td
+                        x-text="(svc.SummaryStatistics && svc.SummaryStatistics.TotalCount) || 0"
+                      ></td>
+                      <td>
+                        <span
+                          x-text="(svc.SummaryStatistics && svc.SummaryStatistics.OkCount) || 0"
+                        ></span>
+                        /
+                        <span
+                          x-text="(svc.SummaryStatistics && svc.SummaryStatistics.ErrorStatistics && svc.SummaryStatistics.ErrorStatistics.TotalCount) || 0"
+                        ></span>
+                        /
+                        <span
+                          x-text="(svc.SummaryStatistics && svc.SummaryStatistics.FaultStatistics && svc.SummaryStatistics.FaultStatistics.TotalCount) || 0"
+                        ></span>
+                        /
+                        <span
+                          x-text="(svc.SummaryStatistics && svc.SummaryStatistics.ErrorStatistics && svc.SummaryStatistics.ErrorStatistics.ThrottleCount) || 0"
+                        ></span>
+                      </td>
+                      <td>
+                        <template
+                          x-for="edge in (svc.Edges || [])"
+                          :key="edge.ReferenceId"
+                        >
+                          <span
+                            style="display: inline-block; margin-right: 6px"
+                            x-text="'→ #' + edge.ReferenceId"
+                          ></span>
+                        </template>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+            <div style="color: #888; margin-top: 6px; font-size: 12px">
+              Downstream references use X-Ray service graph ReferenceId (index
+              into the Services array above).
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- Page: Logs (#266 — 按租户查 VM firecracker 启动 / host / Lambda 日志) -->
+    <div x-show="page==='logs'" class="page-content">
+      <h2>📜 Logs</h2>
+      <div class="section-card">
+        <p style="color: #888; margin-top: 0; font-size: 13px">
+          租户从创建到启动不健康时的日志抓手。<b>VM</b> = firecracker 每租户
+          启动日志(AOS claw-logs-vm,按 tenant_id 精确匹配);<b>Host</b> = launch
+          诊断(AOS claw-logs-host,自由文本匹配);<b>Lambda</b> =
+          控制面链路(CloudWatch Logs Insights,按 tenant_id 过滤)。
+        </p>
+        <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: end">
+          <label>
+            Tenant (name 或 id)
+            <input
+              type="text"
+              x-model="logFilter.tenant"
+              list="oc-tenant-list"
+              placeholder="acme 或 acme-1a2b"
+              style="width: 220px"
+            />
+            <datalist id="oc-tenant-list">
+              <template x-for="t in tenants" :key="t.id || t.tenant_id">
+                <option
+                  :value="t.name"
+                  x-text="(t.name || '') + ' — ' + (t.id || t.tenant_id)"
+                ></option>
+              </template>
+            </datalist>
+          </label>
+          <label>
+            Source
+            <select x-model="logFilter.source" style="width: 130px">
+              <option value="vm">VM (firecracker)</option>
+              <option value="host">Host (launch)</option>
+              <option value="lambda">Lambda (控制面)</option>
+            </select>
+          </label>
+          <label>
+            Window (minutes)
+            <input
+              type="number"
+              min="1"
+              max="1440"
+              x-model.number="logFilter.minutes"
+              style="width: 90px"
+            />
+          </label>
+          <button class="btn" @click="loadLogs()" :disabled="logsLoading">
+            Search
+          </button>
+        </div>
+        <div
+          x-show="logsError === 'timeout'"
+          style="color: #c78500; margin-top: 8px"
+        >
+          日志查询超时,缩小时间窗后重试。
+        </div>
+        <div
+          x-show="logsError === 'unavailable'"
+          style="color: #c53030; margin-top: 8px"
+        >
+          日志源不可用(AOS/CloudWatch 或该租户 tenant_id 无法解析)。
+        </div>
+        <div
+          x-show="logApproximate"
+          style="color: #c78500; margin-top: 8px; font-size: 12px"
+        >
+          Host 日志无结构化 tenant 字段,以下为按 tenant_id 全文匹配的近似结果。
+        </div>
+      </div>
+
+      <div class="section-card">
+        <h3>Log lines (<span x-text="logRows.length"></span>)</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th style="width: 180px">Time</th>
+                <th style="width: 70px">Level</th>
+                <th>Message</th>
+              </tr>
+            </thead>
+            <tbody>
+              <template x-for="(row, i) in logRows" :key="i">
+                <tr>
+                  <td
+                    x-text="row.ts"
+                    style="white-space: nowrap; font-size: 12px"
+                  ></td>
+                  <td x-text="row.level || '-'"></td>
+                  <td
+                    style="
+                      font-family: monospace;
+                      font-size: 12px;
+                      white-space: pre-wrap;
+                      word-break: break-word;
+                    "
+                    x-text="row.message"
+                  ></td>
+                </tr>
+              </template>
+              <tr x-show="logRows.length === 0 && !logsLoading">
+                <td colspan="3" style="text-align: center; color: #888">
+                  该窗口内无日志。选一个租户 + source 后 Search。
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <span x-show="logsLoading" style="margin-left: 8px">Loading…</span>
+      </div>
+    </div>
+
+    <!-- Page: Audit & Ops (#236 — audit-log / images / per-user fleet) -->
+    <div x-show="page==='audit'" class="page-content">
+      <h2>🧾 Audit &amp; Ops</h2>
+
+      <!-- Audit log -->
+      <div class="section-card">
+        <div style="display: flex; align-items: center; gap: 10px">
+          <h3 style="margin: 0">Audit Log</h3>
+          <button class="btn-act" @click="loadAudit()" :disabled="auditLoading">
+            <svg class="icon s13"><use href="#i-refresh" /></svg>
+          </button>
+          <span
+            x-show="auditLoading"
+            style="color: var(--gray); font-size: 12px"
+            >loading…</span
+          >
+          <span
+            x-show="auditError"
+            style="color: #c53030; font-size: 12px"
+            x-text="auditError"
+          ></span>
+        </div>
+        <template x-if="auditItems && auditItems.length">
+          <table
+            style="
+              width: 100%;
+              margin-top: 8px;
+              font-size: 12px;
+              border-collapse: collapse;
+            "
+          >
+            <thead>
+              <tr style="text-align: left; color: var(--gray)">
+                <th style="padding: 4px 8px">Time</th>
+                <th style="padding: 4px 8px">Action</th>
+                <th style="padding: 4px 8px">Actor</th>
+                <th style="padding: 4px 8px">Target</th>
+              </tr>
+            </thead>
+            <tbody>
+              <template x-for="(row, i) in auditItems" :key="i">
+                <tr style="border-top: 1px solid #23324a">
+                  <td
+                    style="padding: 4px 8px; font-family: monospace"
+                    x-text="row.ts || row.timestamp || row.time || '—'"
+                  ></td>
+                  <td
+                    style="padding: 4px 8px"
+                    x-text="row.action || row.event || '—'"
+                  ></td>
+                  <td
+                    style="padding: 4px 8px"
+                    x-text="row.actor || row.actor_owner_id || row.owner_id || '—'"
+                  ></td>
+                  <td
+                    style="padding: 4px 8px; font-family: monospace"
+                    x-text="row.target || row.tenant_id || row.id || '—'"
+                  ></td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </template>
+        <template x-if="auditItems && !auditItems.length && !auditLoading">
+          <div class="empty">No audit entries</div>
+        </template>
+      </div>
+
+      <!-- Golden images -->
+      <div class="section-card">
+        <div style="display: flex; align-items: center; gap: 10px">
+          <h3 style="margin: 0">Golden Images</h3>
+          <button class="btn-act" @click="loadImages()">
+            <svg class="icon s13"><use href="#i-refresh" /></svg>
+          </button>
+          <span
+            x-show="imagesError"
+            style="color: #c53030; font-size: 12px"
+            x-text="imagesError"
+          ></span>
+        </div>
+        <template x-if="images">
+          <div style="margin-top: 8px; font-size: 12px">
+            <div>
+              Live version:
+              <span
+                style="color: var(--cyan); font-family: monospace"
+                x-text="images.live_version || images.version || '—'"
+              ></span>
+            </div>
+            <template x-if="images.versions || images.images">
+              <ul style="margin: 6px 0 0 16px; color: var(--gray)">
+                <template
+                  x-for="(v, i) in (images.versions || images.images || [])"
+                  :key="i"
+                >
+                  <li
+                    x-text="(typeof v === 'string' ? v : (v.version || JSON.stringify(v)))"
+                  ></li>
+                </template>
+              </ul>
+            </template>
+          </div>
+        </template>
+      </div>
+
+      <!-- Per-user fleet (users/{uid}) -->
+      <div class="section-card">
+        <h3 style="margin: 0 0 6px">Per-User Fleet</h3>
+        <div style="display: flex; gap: 8px; align-items: center">
+          <input
+            x-model="userQuery"
+            placeholder="tenant_user_id"
+            class="settings-input"
+            style="max-width: 280px"
+            @keydown.enter="lookupUser()"
+          />
+          <button class="btn" @click="lookupUser()" :disabled="userLoading">
+            Look up
+          </button>
+          <button
+            class="btn-danger"
+            @click="userBulkAction('stop')"
+            x-show="userTenants"
+            title="Stop every node this user owns"
+          >
+            Bulk Stop
+          </button>
+          <button
+            class="btn"
+            @click="userBulkAction('start')"
+            x-show="userTenants"
+            title="Start every node this user owns"
+          >
+            Bulk Start
+          </button>
+        </div>
+        <span
+          x-show="userError"
+          style="color: #c53030; font-size: 12px"
+          x-text="userError"
+        ></span>
+        <template x-if="userSummary">
+          <div style="margin-top: 8px; font-size: 12px">
+            Total: <b x-text="userSummary.total"></b>
+            <span x-show="userSummary.truncated" style="color: var(--gray)">
+              (truncated)</span
+            >
+            · by status:
+            <span x-text="JSON.stringify(userSummary.by_status || {})"></span>
+          </div>
+        </template>
+        <template x-if="userTenants && userTenants.tenants">
+          <table
+            style="
+              width: 100%;
+              margin-top: 8px;
+              font-size: 12px;
+              border-collapse: collapse;
+            "
+          >
+            <thead>
+              <tr style="text-align: left; color: var(--gray)">
+                <th style="padding: 4px 8px">Tenant ID</th>
+                <th style="padding: 4px 8px">Status</th>
+                <th style="padding: 4px 8px">Host</th>
+              </tr>
+            </thead>
+            <tbody>
+              <template x-for="t in userTenants.tenants" :key="t.id">
+                <tr style="border-top: 1px solid #23324a">
+                  <td
+                    style="padding: 4px 8px; font-family: monospace"
+                    x-text="t.id"
+                  ></td>
+                  <td style="padding: 4px 8px" x-text="t.status || '—'"></td>
+                  <td
+                    style="padding: 4px 8px; font-family: monospace"
+                    x-text="t.host_id || '—'"
+                  ></td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </template>
+      </div>
     </div>
 
     <!-- Page: Settings -->
@@ -2875,144 +3492,6 @@ openclaw_vm_disk_used_pct &gt; 90</pre
               x-text="restoreSource ? 'Create from Backup' : 'Create'"
             ></button>
           </div>
-        </div>
-      </div>
-    </template>
-
-    <!-- #187 Token / Descriptor Modal(2026-07-08:控制面功能全上 console)
-         GET /tenants/{id} → running 详情响应体折入 gateway_token KMS 密文(base64 信封);
-         API 侧不 decrypt,调用方拿 EncryptionContext={tenant_id: <id>} 自解得明文。
-         附 descriptor:host_private_ip / host_port / guest_ip / status。 -->
-    <template x-if="revealState.open">
-      <div class="overlay" @click.self="closeReveal()">
-        <div class="modal" style="max-width: 700px">
-          <button class="close-btn" @click="closeReveal()">
-            <svg class="icon s16"><use href="#i-delete" /></svg>
-          </button>
-          <h2>Gateway Token &amp; Descriptor</h2>
-          <div
-            style="
-              margin: -4px 0 12px;
-              padding: 8px 10px;
-              border: 1px solid var(--border);
-              border-radius: 6px;
-              background: var(--bg);
-              font-size: 12px;
-            "
-          >
-            <div style="color: var(--gray)">Tenant</div>
-            <div
-              style="
-                color: var(--text);
-                margin-top: 2px;
-                font-family: monospace;
-              "
-              x-text="revealState.tenantId"
-            ></div>
-          </div>
-          <template x-if="revealState.loading">
-            <p style="color: var(--gray); font-size: 13px">加载中…</p>
-          </template>
-          <template x-if="revealState.error">
-            <p
-              style="color: var(--red); font-size: 13px"
-              x-text="revealState.error"
-            ></p>
-          </template>
-          <template x-if="revealState.descriptor && !revealState.loading">
-            <div>
-              <h4 style="margin: 12px 0 6px; font-size: 13px">Descriptor</h4>
-              <table
-                style="
-                  font-size: 12px;
-                  width: 100%;
-                  border-collapse: collapse;
-                  margin-bottom: 12px;
-                "
-              >
-                <tbody>
-                  <tr>
-                    <td
-                      style="
-                        color: var(--gray);
-                        padding: 2px 8px 2px 0;
-                        width: 140px;
-                      "
-                    >
-                      host_private_ip
-                    </td>
-                    <td
-                      style="font-family: monospace"
-                      x-text="revealState.descriptor.host_private_ip || '—'"
-                    ></td>
-                  </tr>
-                  <tr>
-                    <td style="color: var(--gray); padding: 2px 8px 2px 0">
-                      host_port
-                    </td>
-                    <td
-                      style="font-family: monospace"
-                      x-text="revealState.descriptor.host_port || '—'"
-                    ></td>
-                  </tr>
-                  <tr>
-                    <td style="color: var(--gray); padding: 2px 8px 2px 0">
-                      guest_ip
-                    </td>
-                    <td
-                      style="font-family: monospace"
-                      x-text="revealState.descriptor.guest_ip || '—'"
-                    ></td>
-                  </tr>
-                  <tr>
-                    <td style="color: var(--gray); padding: 2px 8px 2px 0">
-                      status
-                    </td>
-                    <td
-                      style="font-family: monospace"
-                      x-text="revealState.descriptor.status || '—'"
-                    ></td>
-                  </tr>
-                </tbody>
-              </table>
-              <h4 style="margin: 12px 0 6px; font-size: 13px">
-                Gateway Token(KMS 信封密文)
-              </h4>
-              <p style="color: var(--gray); font-size: 12px; line-height: 1.5">
-                下方是 base64 信封密文,API Lambda 从
-                <code>openclaw-tenant-secrets</code> DDB 表原样吐出、
-                <b>不 decrypt</b>。调用方拿到后用 <code>kms:Decrypt</code> +
-                EncryptionContext=<code
-                  x-text="JSON.stringify(revealState.descriptor.encryption_context)"
-                ></code>
-                自解得明文,再作 Bearer 打
-                <code>/ws/{tenant_id}/v1/chat/completions</code>。TTL 900s,
-                过窗口需重铸(不从 VM 回读)。
-              </p>
-              <textarea
-                readonly
-                x-model="revealState.ciphertext"
-                style="
-                  width: 100%;
-                  height: 120px;
-                  font-family: monospace;
-                  font-size: 11px;
-                  padding: 8px;
-                  border: 1px solid var(--border);
-                  border-radius: 4px;
-                  resize: vertical;
-                "
-              ></textarea>
-              <div style="text-align: right; margin-top: 8px">
-                <button
-                  class="btn btn-cyan"
-                  @click="copyText(revealState.ciphertext)"
-                >
-                  复制密文
-                </button>
-              </div>
-            </div>
-          </template>
         </div>
       </div>
     </template>

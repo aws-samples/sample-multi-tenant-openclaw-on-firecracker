@@ -10,7 +10,7 @@
     />
     <style>
       :root {
-        /* 金融理财风格主题:黑 + 橙黄 accent */
+        /* 深色主题:黑 + 橙黄 accent */
         --bg: #0b0e11;
         --bg2: #12161c;
         --panel: #161b22;
@@ -52,7 +52,7 @@
         flex-direction: column;
         height: 100vh;
       }
-      /* 全站导航条(仿金融站头):AI Pro 无关项灰化,仅装饰 */
+      /* 全站导航条(导航):AI Pro 无关项灰化,仅装饰 */
       .topnav {
         height: 48px;
         flex-shrink: 0;
@@ -763,7 +763,7 @@
         }
       }
 
-      /* 行情卡片(agent 行情回复的可视化,对齐主流行情 widget) */
+      /* 行情卡片(agent 行情回复的可视化,对齐主流第三方行情 widget) */
       .quote-card {
         border: 1px solid var(--line);
         border-radius: 12px;
@@ -899,7 +899,7 @@
   <body>
     <!-- 鉴权/初始化遮罩,JS 起来后移除 -->
     <div class="boot" id="boot">
-      <div class="lg">🦞</div>
+      <div class="lg">B</div>
       <div class="tx">正在验证身份并连接你的智能体节点…</div>
     </div>
 
@@ -908,7 +908,7 @@
         <!-- 左侧栏 -->
         <aside class="side">
           <div class="brand">
-            <div class="logo">🦞</div>
+            <div class="logo">🐋</div>
             <div class="nm">ClawPool<span class="pro">Agent</span></div>
           </div>
           <button class="newbtn" data-action="new-session">＋ 新建对话</button>
@@ -939,7 +939,7 @@
         <main class="main">
           <div class="topbar">
             <div class="ti">
-              <div class="av">🦞</div>
+              <div class="av">🐋</div>
               <div>
                 <div class="nm" id="hdrName">ClawPool Agent</div>
                 <div class="st">
@@ -957,28 +957,28 @@
           <div class="chat" id="chat">
             <div class="welcome" id="welcome">
               <div class="big">
-                你好,我是 <span class="g">ClawPool Agent</span> 🦞
+                你好,我是 <span class="g">ClawPool Agent</span> 🐋
               </div>
               <div class="sb">
                 运行在你专属的隔离微虚拟机里 · 身份与技能不可篡改 ·
-                数据不出你的沙箱<br />问我行情、做风险评估、跑历史数据回测,或聊聊市场。
+                数据不出你的沙箱<br />问我行情、查代币审计、跑策略回测,或聊聊市场。
               </div>
               <div class="cards">
                 <div
                   class="qcard"
                   data-action="quick-ask"
-                  data-quick="某标的现在什么价位?简短说下短期趋势和关键区间。"
+                  data-quick="BTC 现在什么价位?简短说下短期多空关键位。"
                 >
-                  <div class="qt">📈 行情速览</div>
-                  <div class="qd">价位 + 短期趋势关键区间</div>
+                  <div class="qt">📈 BTC 行情速览</div>
+                  <div class="qd">价位 + 短期多空关键位</div>
                 </div>
                 <div
                   class="qcard"
                   data-action="quick-ask"
-                  data-quick="帮我评估某个标的的主要风险点该看哪些。"
+                  data-quick="帮我查一下某个代币的合约审计风险点该看哪些。"
                 >
-                  <div class="qt">🔍 风险评估</div>
-                  <div class="qd">主要风险点速查</div>
+                  <div class="qt">🔍 代币审计</div>
+                  <div class="qd">合约风险点速查</div>
                 </div>
                 <div
                   class="qcard"

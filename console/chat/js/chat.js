@@ -10,8 +10,8 @@
 // 原生 gateway** —— POST {ORIGIN}/ws/{tenant_id}/v1/chat/completions,
 // CloudFront /ws/* → ALB LOR → 3 台 OpenResty edge → Redis 查 route:{tenant_id}
 // 拿 host:port → 宿主 iptables DNAT → microVM:18789 OpenClaw gateway。
-// 认证:Authorization: Bearer <gateway_token>,per-租户唯一,由 KMS 预铸;
-// token 明文由 tenant owner 从 console reveal 页面
+// 认证:Authorization: Bearer <gateway_token>,per-租户唯一,由 P1 KMS 预铸
+// (the API spec 二);token 明文由 tenant owner 从 console reveal 页面
 // 手动贴到 chat 页 localStorage.oc_gw_token(P5 讨论平台后端 relay 是否兜底,
 // 本 chat mini-app 走"用户持 token"最简形态)。
 // 现场 demo(file:// / localhost):走本地代理 127.0.0.1:8799/chat(token 在代理进程内存)。
@@ -366,24 +366,24 @@ function quickAsk(t) {
 function thinkingSteps(q) {
   const r = (q || "").toLowerCase();
   const has = (...ws) => ws.some((w) => r.includes(w));
-  if (has("价格", "行情", "报价", "多少钱", "$"))
+  if (has("btc", "eth", "价位", "价格", "行情", "多少钱", "$"))
     return [
       "接收请求",
-      "拉取实时行情",
-      "解析关键区间",
+      "拉取平台实时行情",
+      "解析价位与多空关键位",
       "组织回复",
     ];
-  if (has("审计", "风险", "评估", "安全"))
+  if (has("审计", "风险", "合约", "蜜罐", "honeypot", "安全"))
     return [
       "接收请求",
-      "调用数据源核查",
-      "检查权限与合规",
+      "调用风险评估数据源",
+      "检查蜜罐/owner/税率",
       "汇总风险点",
     ];
   if (has("策略", "回测", "backtest", "信号", "指标"))
     return [
       "接收请求",
-      "拉历史数据",
+      "拉历史K线",
       "计算技术指标/信号",
       "校验无未来数据",
       "组织结论",
@@ -428,32 +428,32 @@ function suggestNextActions(reply) {
   const r = (reply || "").toLowerCase();
   const has = (...ws) => ws.some((w) => r.includes(w));
   const out = [];
-  if (has("价格", "行情", "报价", "$")) {
+  if (has("btc", "eth", "价位", "价格", "行情", "$", "usdt")) {
     out.push([
-      "📊 看趋势",
-      "这个资产近期的价格趋势和波动情况怎么样?",
+      "📊 看资金费率",
+      "这个币当前的合约资金费率和持仓量怎么样?",
     ]);
     out.push(["📈 技术信号", "帮我用 SMA/RSI 算下它的短期技术信号。"]);
   }
-  if (has("审计", "风险", "评估", "安全")) {
+  if (has("审计", "风险", "合约", "蜜罐", "honeypot", "lp")) {
     out.push([
-      "🔍 查风险点",
-      "这个标的的主要风险点和合规注意事项有哪些?",
+      "🔍 查持有人分布",
+      "这个代币的持有人集中度和 LP 锁仓情况?",
     ]);
   }
   if (has("策略", "回测", "backtest", "信号")) {
     out.push([
       "🧪 跑回测",
-      "用这个策略在历史数据上跑一次回测,注意别用未来数据。",
+      "用这个策略在 testnet 跑一次回测,注意别用未来数据。",
     ]);
   }
-  if (has("身份", "skill", "技能", "clawpool agent", "🦞")) {
-    out.push(["🛡️ 能力边界", "你哪些技能是只读不可篡改的?能动我的账户吗?"]);
+  if (has("身份", "skill", "技能", "clawpool agent", "🐋")) {
+    out.push(["🛡️ 能力边界", "你哪些技能是只读不可篡改的?能动我的钱吗?"]);
   }
   // 默认兜底:总给一组通用下一步
   if (out.length === 0) {
-    out.push(["📈 行情速览", "帮我看下当前市场行情概览。"]);
-    out.push(["🔍 风险评估", "帮我评估一个标的的主要风险点。"]);
+    out.push(["📈 BTC 行情", "BTC 现在什么价位?短期多空关键位?"]);
+    out.push(["🔍 代币审计", "帮我看一个代币合约的风险点。"]);
   }
   return out.slice(0, 3);
 }
@@ -502,7 +502,7 @@ function addMsg(role, text) {
   const div = document.createElement("div");
   div.className = "msg " + (isAI ? "ai" : "me");
   div.innerHTML = `
-<div class="ava">${isAI ? "🦞" : userInitialChar()}</div>
+<div class="ava">${isAI ? "🐋" : userInitialChar()}</div>
 <div class="bd">
   <div class="who">${isAI ? "ClawPool Agent" : "你"}<span class="t">${t}</span></div>
   <div class="ct">${isAI ? "" : escapeHtml(text)}</div>
@@ -543,7 +543,7 @@ function renderQuoteCard(s) {
   const t = String(s || "");
   // 价格:$60,318 / 现价 $1,580
   const price = (t.match(/\$\s?([\d,]+(?:\.\d+)?)/) || [])[1];
-  // 行情符号示例:如 XXXUSDT 交易对格式
+  // 交易对:BTCUSDT / ETHUSDT / (平台现货 XXX)
   const sym = (t.match(/([A-Z]{2,10}USDT?)/) || [])[1];
   // 24h 变动:+0.33% / -0.20%
   const chg = (t.match(

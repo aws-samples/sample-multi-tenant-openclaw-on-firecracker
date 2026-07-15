@@ -123,7 +123,7 @@ _cleanup() {
 # ────────────────────────────────────────────────────────────────
 
 # Ship the project tarball to S3 so the builder can sync it. Skipping
-# .git, .venv, cdk.out keeps the upload small.
+# .git, .venv, cdk.out, tests/__pycache__ keeps the upload small.
 TARBALL="/tmp/openclaw-build-src-$$.tar.gz"
 echo "→ packaging source tree → $TARBALL"
 tar -C "$SCRIPT_DIR" \

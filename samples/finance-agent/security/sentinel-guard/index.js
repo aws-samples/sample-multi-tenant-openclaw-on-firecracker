@@ -410,20 +410,20 @@ const COMMAND_RULES = [
     rx: /\bchmod\b.*[ug]\+s\b/i,
   },
 
-  // ── Fund-movement actions (code-layer veto — defense in depth) ─────────
+  // ── Fund-movement actions (code-layer veto — DEVIL R2 fix) ─────────
   // The agent must NOT execute signed money moves (withdraw / transfer /
-  // sub-account move) via any CLI unless the command carries an explicit
-  // --dry-run / preview, OR a confirm token the platform injects out-of-band.
-  // This is a HARD veto at before_tool_call, NOT prompt self-discipline — so a
-  // prompt-injected "transfer to attacker addr" is blocked at the tool layer
-  // even if the model is fooled. Belt-and-suspenders: it holds even if a future
-  // extension wires a money-moving CLI into the workspace.
+  // sub-account move) via an exchange CLI unless the command carries an
+  // explicit --dry-run / preview, OR a confirm token the platform injects
+  // out-of-band. This is a HARD veto at before_tool_call, NOT prompt self-
+  // discipline — so a prompt-injected "transfer to attacker addr" is blocked
+  // at the tool layer even if the model is fooled. (Until exchange-cli is really
+  // wired this is belt-and-suspenders; it must be in place BEFORE that day.)
   {
     id: "fund-withdraw",
     cat: "fund-action",
     sev: "critical",
     why: "signed withdrawal without --dry-run / confirm token (irreversible money movement)",
-    // any *-cli withdraw, unless --dry-run or --confirm-token=
+    // exchange-cli withdraw ... / any *-cli withdraw, unless --dry-run or --confirm-token=
     rx: /\b\S*-?cli\b.*\bwithdraw(al)?\b(?!.*(--dry-run|--preview|--confirm-token=))/i,
   },
   {
@@ -437,8 +437,8 @@ const COMMAND_RULES = [
     id: "fund-order-live",
     cat: "fund-action",
     sev: "high",
-    why: "order placement without --dry-run / preview / confirm token",
-    rx: /\b\S*-?cli\b.*\b(place-?order|create-?order|order\s+(create|place))\b(?!.*(--dry-run|--preview|--confirm-token=))/i,
+    why: "live order placement without --dry-run / testnet / confirm token",
+    rx: /\b\S*-?cli\b.*\b(place-?order|create-?order|order\s+(create|place))\b(?!.*(--dry-run|--preview|--testnet|--confirm-token=))/i,
   },
 ];
 
@@ -841,13 +841,14 @@ const L1_RULES = [
     rx: /(?:mongodb|postgres|postgresql|mysql|redis|amqp):\/\/[^:]+:[^@\s]+@[^\s]+/i,
     as: "[REDACTED:DB_CONNECTION]",
   },
-  // Generic API key shape: a 64-hex/base62 token near a "key/secret" word.
-  // Brand-neutral — catches a leaked long API key/secret without naming any vendor.
+  // Generic exchange/API key shape: a 64-hex/base62 token near a "key/secret"
+  // word.  Brand-neutral — catches a leaked exchange-style API key/secret without
+  // naming any exchange.
   {
-    id: "generic-api-key",
-    label: "API key/secret",
+    id: "exchange-api-key",
+    label: "Exchange API key/secret",
     rx: /\b[A-Za-z0-9]{64}\b(?=[\s\S]{0,40}(?:api[_-]?key|api[_-]?secret|secret))/i,
-    as: "[REDACTED:API_KEY]",
+    as: "[REDACTED:EXCHANGE_KEY]",
   },
   {
     id: "bearer",
@@ -1267,9 +1268,9 @@ function blockResult(guard, hit, tool, field, sample, ctx) {
   };
 }
 
-import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
-
-export default definePluginEntry({
+// 2026-07-09: 去 definePluginEntry 包装(openclaw 2.13/2.26 无此导出);loader
+// 期望 default export 直接是 { id, register(api){...} } 对象。见同批 acl-guard 注释。
+export default {
   id: "sentinel-guard",
   name: "Sentinel Guard",
   description:
@@ -1524,4 +1525,4 @@ export default definePluginEntry({
       return undefined;
     });
   },
-});
+};

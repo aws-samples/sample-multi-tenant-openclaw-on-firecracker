@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "type": "module",
   "main": "index.js",
-  "description": "Comprehensive code-enforced runtime security layer for the golden image. Moves disclosure guardrails from model self-discipline (prompt layer) to deterministic code (tool-execution layer): command/path/SSRF veto, identity-file protection, three-layer secret redaction, prompt-injection screening, skill-content scan, and behaviour-anomaly monitoring.",
+  "description": "Comprehensive code-enforced runtime security layer for the golden image. Moves ops-guardrails from model self-discipline (prompt layer) to deterministic code (tool-execution layer): command/path/SSRF veto, identity-file protection, three-layer secret redaction, prompt-injection screening, skill-content scan, and behaviour-anomaly monitoring.",
   "openclaw": {
     "extensions": [
       "./index.js"

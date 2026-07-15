@@ -8,7 +8,7 @@
 # NOT number of VMs (380×N). This is the only architecture that hits the
 # "control plane consumes 380 openclaw starts within 1 minute" goal — the old
 # per-tenant SSM path collapsed at ~40 concurrent (SSM single-instance limit,
-# measured on 795: 40 concurrent → 11 TimedOut).
+# measured on : 40 concurrent → 11 TimedOut).
 #
 # Each VM start is just `launch-vm.sh <tenant_id> <vm_num>` (data disk is
 # reused, .stopped marker is cleared by launch-vm.sh:76). We reuse the EXACT

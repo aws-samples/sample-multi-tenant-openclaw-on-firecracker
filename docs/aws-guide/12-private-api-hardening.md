@@ -7,7 +7,7 @@
 
 > 两者都是 **config-gated,默认关**,开了才建对应资源(不影响现有部署)。私有化是"生产加固选项",demo 现状用默认 EDGE 端点即可跑通;需要机器面收敛到私有网络时按本节启用。
 
-架构图见同目录 `arch-private-api-hardening.svg`(私有 API 数据流)与 `../../internal design docs`(凭据注入端到端)。
+架构图见同目录 `arch-private-api-hardening.svg`(私有 API 数据流)与 `../../internal-docs/00-knowledge-base/research/credential-kms-injection-e2e-diagram.svg`(凭据注入端到端)。
 
 ---
 

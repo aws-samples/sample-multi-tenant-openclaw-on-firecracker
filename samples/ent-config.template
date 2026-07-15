@@ -1,0 +1,140 @@
+# ============================================================================
+# 企业部署模版 — 纯私有 API / 内网控制台 / 大规模装箱
+# ----------------------------------------------------------------------------
+# 用法:cp samples/ent-config.template config.yml,按下方占位符替换真实值。
+# 定位:面向"控制面不暴露公网、机器流量全走 VPC 内网、单台 metal 大规模装箱"的
+#       生产/预生产环境。与仓库根 config.yml.example(全字段带注释的字典)互补:
+#       example 是字段词典,本模版是一份可直接落地的成套取值。
+#
+# 【必须替换的占位符】(留着占位符部署会失败或起错资源):
+#   <REPLACE_ACM_ARN_IN_REGION>   — console BFF 443 listener 用的 ACM 证书 ARN,
+#                                   必须是本部署 region 内签发的证书(不是 us-east-1)。
+#   <REPLACE_OFFICE_VPN_CIDR>     — 放行 console 443 入站的办公/VPN 出口 CIDR。
+#                                   绝不填 0.0.0.0/0(synth 会炸,AWS 暴露红线)。
+#   <REPLACE_EXISTING_LITELLM_IP> — 已有 LiteLLM 网关的私网 IP。填了=复用现网关;
+#                                   整段留空反而会让 CDK 自动起一台 LiteLLM EC2。
+#
+# 【子网指定】各组件的 subnet_ids 默认留空 = 按 network 模式自动选私有子网。
+#   若走 network.mode=imported(客户自带 VPC),把各组件的 subnet_ids 填成客户
+#   自己的私有子网 id(host / edge / redis(valkey)/ aos(OpenSearch)/ bff 各自可指定)。
+# ============================================================================
+
+# ========== 宿主机 (EC2) ==========
+host:
+  arch: arm64                      # arm64=Graviton metal 原生 KVM(生产基线)
+  instance_type: r8g.metal-24xl    # 96 vCPU / 768GB,380 租户/台
+  data_volume_gb: 900              # 380 VM/台的磁盘硬前提
+  cpu_overcommit_ratio: 6.0        # vCPU 超卖(agent 多为 IO/等待型)
+  mem_overcommit_ratio: 1.5        # 内存才是硬限;配 balloon 回收时可 1.5
+  subnet_ids: []                   # openclaw host 机器子网;空=按 network 私有子网自动选
+
+# ========== Balloon 内存回收 ==========
+balloon:
+  enabled: true                    # 大规模装箱的内存超配前提
+
+# ========== microVM runtime ==========
+runtime: firecracker
+
+# ========== Per-tenant 资源配额 ==========
+# 企业环境按合同给每租户封顶。上限先占位 0(不限),按客户套餐填真实值。
+quotas:
+  enabled: true
+  max_vcpu_per_tenant: 0           # TODO: 按套餐填(0=不限)
+  max_mem_mb_per_tenant: 0         # TODO: 按套餐填
+  max_data_disk_mb: 0              # TODO: 按套餐填
+
+# ========== API Gateway — 纯私有 ==========
+# mode=private:只走 PRIVATE API + execute-api Interface VPCE,机器流量全内网。
+# 私有 API 靠 resource policy 限 VPCE 做门控(x-api-key 照用,不需 AWS_IAM/SigV4)。
+api:
+  mode: private
+
+# ========== Auto Scaling ==========
+asg:
+  min_capacity: 2
+  max_capacity: 8
+
+# ========== Multi-AZ HA ==========
+multi_az:
+  enabled: true
+  az_count: 2
+
+# ========== 网络 — 自建私有 VPC ==========
+# 客户自带 VPC 改 mode: imported 并填 imported.vpc_id/cidr/public_subnet_ids/
+# private_subnet_ids;此时各组件 subnet_ids 填客户自己的私有子网 id。
+network:
+  mode: self_managed
+  self_managed:
+    cidr: "10.20.0.0/20"           # 4096 IP,3 AZ × (公 /24 + 私 /22) 富余
+
+# ========== 控制面 ALB — 纯私有内网 ==========
+alb:
+  internal: true                   # 纯私有内网 ALB,不对公网(api.mode=private 也会派生 internal)
+  subnet_ids: []                   # 空=按 self_managed 私有子网自动选
+
+# ========== ElastiCache Redis / Valkey 路由表 ==========
+# 数据面边缘 OpenResty 查 tenant_id→host:port 的准静态路由;edge.enabled 的配套前提。
+redis:
+  enabled: true
+  engine: "redis"                  # 可切 "valkey"(切引擎=replacement 须重建);Valkey 版本填 engine_version("7.2"/"8.0" 等)
+  subnet_ids: []                   # 空=私有子网自动选(≥2 跨 AZ)
+
+# ========== 数据面边缘 OpenResty ASG ==========
+edge:
+  enabled: true                    # 需 redis.enabled=true 配套(缺则 synth 拦)
+  subnet_ids: []                   # 空=PRIVATE_WITH_EGRESS 自动选
+
+# ========== 调度 — 大规模装箱 ==========
+# dispatch(标准队列 + 装箱消费)与 scaler.create_via_queue 互斥:两者同 true 会
+# 在 stack.py synth 直接 raise。企业大规模建租户走 dispatch,create_via_queue 保持 false。
+dispatch:
+  enabled: true
+  mode: ddb                        # 写 assignments 表 + 一条 --from-ddb SSM 叫醒 host 自查
+  esm_max_concurrency: 10
+  batching_window_seconds: 2
+  max_batch_size: 500              # 单次 invoke 装箱租户数上界
+
+scaler:
+  lifecycle_queue_enabled: true    # lifecycle FIFO 管 stop/delete(per-tenant 有序)
+  create_via_queue: false          # ⚠ 与 dispatch.enabled=true 互斥,双 true 会 synth raise
+
+# ========== Console 认证 — 内网登录门 ==========
+console_auth:
+  enabled: true
+  rbac_enabled: true               # 角色鉴权(viewer/operator/admin)
+  # 纯私有内网自动化:无 Cognito token 的纯 api-key 请求兜底=operator(可写)。
+  # 内网受信环境走 api-key 直接建/改租户;若要收紧到"必须带 Cognito 登录才写"改 viewer。
+  default_no_jwt_role: operator
+  # 443 listener 用的 ACM 证书,必须本 region 内签发(不是 us-east-1)。
+  bff_certificate_arn: "<REPLACE_ACM_ARN_IN_REGION>"
+  # 放行 443 入站的办公/VPN 出口 CIDR,逗号分隔。绝不 0.0.0.0/0(synth 会炸)。
+  bff_ingress_cidrs: "<REPLACE_OFFICE_VPN_CIDR>"
+  bff_subnet_ids: []               # BFF Lambda 子网;空=PRIVATE_WITH_EGRESS 自动选(BFF 默认进 VPC)
+
+# ========== AI Gateway (LiteLLM) ==========
+# 填已有网关私网 IP=复用现网关不部署 LiteLLM;整段留空反而会自动起一台 LiteLLM EC2。
+ai_gateway:
+  url: "http://<REPLACE_EXISTING_LITELLM_IP>:4000/v1"
+
+# ========== 运行时 metrics 后端 ==========
+# use_managed=false=自建 Prom/Grafana(不挂 ADOT);ADOT 只在 use_managed=true 才起。
+metrics:
+  enabled: true
+  use_managed: false
+
+# ========== 可观测性:数据面日志管道 ==========
+# 建 AOS 域 + 三条 Firehose(edge/host/vm)。data_nodes≥3 才达 HA 底线。
+logging:
+  enabled: true
+  aos:
+    subnet_ids: []                 # OpenSearch 域子网;空=PRIVATE_WITH_EGRESS 自动选(数量与 az_count 对齐)
+
+# ========== CloudFront — 不部署 ==========
+# 纯内网 ALB 直连,不建任何 CloudFront 分发。
+cloudfront:
+  enabled: false
+
+# ========== 有状态资源删除策略 ==========
+# 测试/预生产可重建=false;正式生产改 true(RETAIN + WORM Object Lock)。
+deploy:
+  protect_stateful_resources: false

@@ -23,15 +23,15 @@ This section lists the terms used in this guide. For a general reference of AWS 
 
 ## Technical protocols and formats
 
-**HMAC**: Hash-based message authentication code, used for channel signatures and external authorization signatures.
+**HMAC**: Hash-based message authentication code, used for external authorization signatures (`POST /external/authz`) and the platform session JWT (HS256).
 
-**JWT**: JSON Web Token, the identity token format issued by Amazon Cognito and verified with an RS256 signature.
+**JWT**: JSON Web Token. The data-plane platform session token is a platform-issued HS256 (symmetric-key) JWT; control-plane console sign-in uses RS256 JWTs issued by Amazon Cognito.
 
-**JWKS**: JSON Web Key Set, the public key set endpoint exposed by Amazon Cognito, used to verify JWT signatures.
+**JWKS**: JSON Web Key Set, the public key set endpoint exposed by Amazon Cognito, used to verify the control-plane Cognito RS256 JWT signatures.
 
-**OAuth 2.0 / PKCE**: The authorization code flow and Proof Key for Code Exchange extension used for end-user sign-in.
+**Ed25519 device authentication**: The data-plane identity root — OpenClaw's native asymmetric device authentication. The platform backend signs the gateway challenge with the device private key, and the microVM verifies it with the cold-injected public key.
 
-**OIDC**: OpenID Connect, the protocol used to federate external identity providers into an Amazon Cognito user pool.
+**OAuth 2.0 / PKCE**: The authorization code flow and Proof Key for Code Exchange extension used for control-plane console sign-in (optional, disabled by default).
 
 **WebSocket**: The full-duplex protocol used by the data plane real-time chat path.
 

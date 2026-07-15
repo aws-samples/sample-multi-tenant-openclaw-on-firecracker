@@ -1,6 +1,6 @@
 # 数据面两级路由(2026-07-08 转型后)
 
-> 本章描述 2026-07-08 数据面去中枢化改造后的实时聊天链路。**代替** [03-架构详情](03-architecture-details.md) 里"实时聊天中枢 claw-hub"一节的旧模型(hub-WS + claw-channel 出站拨号 + Cognito 三处身份 + HMAC channel_secret 等)。改造缘由与影响面见 `internal design docs`;权威接口契约见 `the data-plane contract`。运维手册(监控、告警、故障排查)见 [第 11 章 · 组件运维手册](11-ops-maintenance.md),本章不重复。
+> 本章描述 2026-07-08 数据面去中枢化改造后的实时聊天链路。**代替** [03-架构详情](03-architecture-details.md) 里"实时聊天中枢 claw-hub"一节的旧模型(hub-WS + claw-channel 出站拨号 + Cognito 三处身份 + HMAC channel_secret 等)。改造缘由与影响面见 `internal-docs/00-knowledge-base/decisions/DECISION-drop-oidc-cognito-use-openclaw-native-auth.md`;权威接口契约见 `internal-docs/00-knowledge-base/the data-plane design/the data-plane interface contract`。运维手册(监控、告警、故障排查)见 [第 11 章 · 组件运维手册](11-ops-maintenance.md),本章不重复。
 
 ## 13.1 端到端数据面链路
 
@@ -52,7 +52,7 @@ OpenClaw gateway 端启用 device 认证(`gateway.auth`,见 `templates/openclaw.
 | L2  | `lua_shared_dict route_cache 128m`        | 60s     | 跨 worker 共享 + fail-static 兜 ElastiCache failover 窗口 |
 | L3  | ElastiCache Redis `GET route:{tenant_id}` | —       | 权威源(host-agent 双写)                                   |
 
-L3 miss 时 `resty.lock` 单飞回源(防 stampede);Redis 不可达时 L2 保底服务旧值(fail-static)。**L2 TTL 60s 是量化下限**——the data-plane contract §8 明确 "≥ 预期最长 failover 窗口(建议 ≥30-60s)",ElastiCache Multi-AZ automatic failover 通常 15-30s。
+L3 miss 时 `resty.lock` 单飞回源(防 stampede);Redis 不可达时 L2 保底服务旧值(fail-static)。**L2 TTL 60s 是量化下限**——the data-plane contract 明确 "≥ 预期最长 failover 窗口(建议 ≥30-60s)",ElastiCache Multi-AZ automatic failover 通常 15-30s。
 
 **DNS 与连接层**:nginx.conf 有 `resolver 169.254.169.253 valid=30s ipv6=off`;`lua-resty-redis` `set_keepalive(60000ms, 100)`(池化短生命)。禁止硬编码 Redis 节点 IP;必须用 primary endpoint DNS(AWS 侧 failover 时更新 CNAME)。
 

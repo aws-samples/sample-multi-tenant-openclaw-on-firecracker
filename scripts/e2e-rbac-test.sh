@@ -5,7 +5,8 @@
 # e2e-rbac-test.sh — REAL RBAC fail-safe + JWT-forgery verification against a
 # live deployment (1.5.0 security hardening).
 #
-# This drives the deployed openclaw-api through API Gateway and
+# Unlike tests/test_rbac.py (which unit-tests _get_user_role with a patched
+# JWKS seam), this drives the deployed openclaw-api through API Gateway and
 # proves the production Lambda actually:
 #   1. fails SAFE — a request with NO Bearer token resolves to `viewer`, so
 #      writes (POST/DELETE) return 403 while reads (GET) return 200;

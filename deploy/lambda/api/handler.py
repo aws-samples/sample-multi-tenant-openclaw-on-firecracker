@@ -412,7 +412,7 @@ def get_tenant(tenant_id, event=None):
     body = _redact_tenant(item)
     # #187 P1 — fold the KMS **ciphertext** of the pre-minted gateway token into
     # the status-poll response once the tenant is `running` (the data-plane contract
-    # §5, 二次纠正). Poll semantics: control-plane callers loop
+    # §5, design decision 二次纠正). Poll semantics: control-plane callers loop
     # GET /tenants/{id}; on `creating` they keep polling; on `running` they read
     # `gateway_token` (base64 ciphertext) out of this same response and decrypt
     # it locally with EncryptionContext={"tenant_id":<id>}. API Lambda does NOT
@@ -660,7 +660,7 @@ def tenant_match(query_params=None):
     Pre-login lookup: the browser calls this BEFORE any Cognito login to learn which
     upstream IdP (Cognito provider name) to federate to for a given external platform,
     then does federatedSignIn(customProvider=<idp_provider_name>). Read-only, leaks no
-    tenant data — only the platform→IdP routing (the design docs §2.7). Mirrors aws-samples/
+    tenant data — only the platform→IdP routing (the design doc §2.7). Mirrors aws-samples/
     amazon-cognito-example-for-multi-tenant TenantAPI.ts:13-22 (there keyed by email
     domain; here by explicit platform_id).
 
@@ -1447,7 +1447,7 @@ def batch_tenants(body=None, event=None):
 # GOAL: the control plane consumes 380 (×N hosts) openclaw start/stop within 1
 # minute. The per-tenant path (batch_tenants → tenant_action → one SSM per VM)
 # can't: SSM single-instance concurrency caps at ~5-10, so 380 commands serialize
-# and 40 concurrent already TimedOut 11 (measured on 795). The fix is HOST-LEVEL
+# and 40 concurrent already TimedOut 11 (measured on ). The fix is HOST-LEVEL
 # fan-out: send ONE SSM command per host (start-all-vms.sh / stop-all-vms.sh),
 # and each host starts/stops all its local VMs in bounded parallel. SSM
 # concurrency then equals the number of HOSTS (single/low-double digits), not the

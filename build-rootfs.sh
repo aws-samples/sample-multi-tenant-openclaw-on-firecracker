@@ -454,7 +454,7 @@ chmod +x /usr/local/sbin/openclaw-mount-creds.sh
 systemctl enable openclaw-creds.service
 
 # === FIM: host-invisible file-integrity monitor (our Wazuh-style analogue) ===
-# The real production-grade hardened sandbox runs Wazuh syscheck (FIM) + logcollector +
+# The real a production-grade hardened sandbox runs Wazuh syscheck (FIM) + logcollector +
 # active-response in a separate namespace the agent CANNOT see or modify:
 # `/var/ossec` simply does not exist in the agent's mount namespace, so even a
 # fully compromised agent cannot tamper with the monitor that watches it.
@@ -838,11 +838,11 @@ if [ -d /tmp/image-sample ]; then
     # jq merge keeps whatever the template already had under .plugins.
     #   acl-guard / sentinel-guard — before_tool_call hooks (priority 1000 / 200)
     # claw-channel was retired in the data-plane refactor
-    # (per the data-plane design): the WSS-hub reverse channel
+    # (the data-plane design doc §A): the WSS-hub reverse channel
     # is replaced by two-tier routing (OpenResty edge → host DNAT → in-VM native
     # gateway on :18789). The gateway now serves chat via the OpenAI-compatible
     # /v1/chat/completions and /v1/responses HTTP endpoints directly; the plugin
-    # is kept in an internal archive for history.
+    # is archived under an internal archive for history.
     if command -v jq >/dev/null 2>&1; then
       jq '
         (.plugins // {}) as $p |
@@ -887,8 +887,8 @@ Environment=OPENCLAW_SYSTEMD_UNIT=openclaw-gateway.service
 Environment=OPENCLAW_SERVICE_MARKER=openclaw
 Environment=OPENCLAW_SERVICE_KIND=gateway
 
-# ── HARDENING (privilege drop) — our adaptation of hardened-sandbox CapBnd=0 ──
-# The reference hardened sandbox runs the agent with CapBnd=0000…0000
+# ── HARDENING (privilege drop) — our adaptation of a production-grade hardened CapBnd=0 ──
+# The real reference hardened sandbox runs the agent with CapBnd=0000…0000
 # (root inside, but ZERO Linux capabilities) plus a seccomp filter. Our gateway
 # already runs as the unprivileged `agent` user (uid 1000, a systemd *user*
 # service — never root), so we layer defence-in-depth on top:
@@ -919,8 +919,8 @@ RestrictRealtime=true
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 
-# ── HARDENING (cgroup resource limits) — our adaptation of a hardened cgroup v2 profile ──
-# The reference profile pins each sandbox to memory.max=4GB + cpu.max=2.5cores at the cgroup
+# ── HARDENING (cgroup resource limits) — our adaptation of a hardened cgroup v2 ──
+# the reference profile pins each sandbox to memory.max=4GB + cpu.max=2.5cores at the cgroup
 # layer. Our microVM is already capped by Firecracker (≈2GB/1vCPU on the dense
 # default), so this is a *sub-limit* INSIDE the guest: it bounds the gateway +
 # all its tool-exec children so a runaway/forked workload OOMs its own slice

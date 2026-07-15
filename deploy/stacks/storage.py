@@ -23,7 +23,7 @@ def build_storage(self, ctx):
 
     # ========== DynamoDB ==========
     # 控制面表 PITR(时间点恢复)。租户数据本身有 backup_fn→WORM 桶兜底,但
-    # 控制面元数据(tenants/hosts/audit)误删/误改/坏写后无法回滚 —— 795 实跑
+    # 控制面元数据(tenants/hosts/audit)误删/误改/坏写后无法回滚 ——  实跑
     # 5 张表 PITR 全 DISABLED(2026-06-30 巡检发现)。开 PITR 后 DynamoDB 维持
     # 35 天连续备份,可恢复到任意秒级时点。config 开关默认 true,短命的
     # batch-jobs(DESTROY+TTL)不开。开 PITR 对 PAY_PER_REQUEST 表只按备份存储
@@ -208,7 +208,7 @@ def build_storage(self, ctx):
         time_to_live_attribute="expires_ttl",
         removal_policy=RemovalPolicy.DESTROY,
     )
-    # #97 档A — external-platform → Cognito upstream-IdP routing map (the design docs §2.7).
+    # #97 档A — external-platform → Cognito upstream-IdP routing map (the design doc §2.7).
     # partition_key platform_id; rows {idp_provider_name, issuer_url, created_at}.
     # GET /tenantmatch reads it pre-login to route to the right federated IdP.
     # Rebuildable routing config (no tenant data) → DESTROY removal is fine.
@@ -285,7 +285,7 @@ def build_storage(self, ctx):
         # #217 V2 版本模型(ADR 第9节):开 versioning,每次覆盖 deployment/rootfs、
         # deployment/scripts 下的文件都留不可变 VersionId,让 version-snapshots 表能按
         # 精确 VersionId 重建任意历史时刻的完整文件集(镜像+脚本一致)。开 versioning 后
-        # 旧对象版本不随覆盖丢失——是 stateful 属性变更(RemovalPolicy 域),MR 需 @the maintainer。
+        # 旧对象版本不随覆盖丢失——是 stateful 属性变更(RemovalPolicy 域),需人工评审。
         versioned=True,
     )
 
@@ -311,7 +311,7 @@ def build_storage(self, ctx):
     # ========== Tenant-Backup CMK + WORM backup bucket (insider-threat hardening) ==========
     # 威胁模型:租户 data.ext4 备份是真实资产数据。光放 assets 桶(默认 SSE-S3,
     # AWS 托管密钥)防不住「拥有该桶权限的 S3 管理员」——他能 GetObject 读明文、
-    # PutObject 覆盖、DeleteObject 删除。平台级要堵的就是这个内部威胁面。两层独立机制:
+    # PutObject 覆盖、DeleteObject 删除。生产级要堵的就是这个内部威胁面。两层独立机制:
     #
     # 1) 防篡改/防删 — S3 Object Lock COMPLIANCE 模式 + Versioning。AWS 官方:
     #    COMPLIANCE 模式下在保留期内**连 root 账户都不能删除/覆盖对象版本、不能缩短

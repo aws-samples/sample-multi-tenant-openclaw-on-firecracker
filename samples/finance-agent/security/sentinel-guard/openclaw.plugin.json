@@ -1,0 +1,13 @@
+{
+  "id": "sentinel-guard",
+  "name": "Sentinel Guard",
+  "description": "Comprehensive code-enforced runtime security layer: command/path/SSRF veto, identity-file protection, three-layer secret redaction, prompt-injection screening, skill-content scan, and behaviour-anomaly monitoring. Enforced in code at the tool-execution layer, not prompt text.",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

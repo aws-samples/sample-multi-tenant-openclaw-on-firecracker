@@ -1,0 +1,13 @@
+{
+  "id": "acl-guard",
+  "name": "ACL Guard",
+  "description": "Programmatic before_tool_call deny-list for secret/IMDS exfiltration. Enforces disclosure guardrails in code (tool-execution layer), not just prompt text.",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

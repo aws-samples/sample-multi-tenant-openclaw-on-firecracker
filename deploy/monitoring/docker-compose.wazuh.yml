@@ -1,0 +1,71 @@
+# Wazuh 监控数据平台 — manager + indexer + dashboard (10h-goal #20).
+# 聚合三源: ① in-guest auditd/FIM 告警(microVM 内 openclaw-fim.sh + auditd,
+# 经 Wazuh agent forward 到本 manager) ② GuardDuty Finding(经 SNS→SQS→
+# custom integration 灌入,见 WAZUH-RUNBOOK.md) ③ openclaw 运行时 metrics
+# (host-agent /metrics → AMP/Grafana,独立路径,Grafana 侧并排展示)。
+#
+# 这是真实可部署的 Wazuh 单节点栈(官方 4.x 镜像),起在一台监控 EC2 上:
+#   docker compose -f docker-compose.wazuh.yml up -d
+# 生产多节点(indexer 集群 + manager worker)按官方 wazuh-docker 扩展。
+# 凭据/证书在首次部署用 wazuh 官方 cert tool 生成,绝不硬编码(见 runbook §2)。
+version: "3.8"
+
+services:
+  wazuh-manager:
+    image: wazuh/wazuh-manager:4.9.0
+    hostname: wazuh-manager
+    restart: always
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 655360, hard: 655360 }
+    ports:
+      - "1514:1514" # agent ← manager (events)
+      - "1515:1515" # agent enrollment
+      - "514:514/udp" # syslog (optional)
+      - "55000:55000" # manager API
+    environment:
+      - INDEXER_URL=https://wazuh-indexer:9200
+      - INDEXER_USERNAME=admin
+      # password injected from env file (not committed); see runbook §2.
+      - INDEXER_PASSWORD=${WAZUH_INDEXER_PASSWORD}
+      - FILEBEAT_SSL_VERIFICATION_MODE=full
+    volumes:
+      - wazuh_manager_data:/var/ossec/data
+      - ./wazuh-rules:/var/ossec/etc/rules/local_rules.d:ro # custom rules (FIM/reverse-shell)
+    networks: [wazuh]
+
+  wazuh-indexer:
+    image: wazuh/wazuh-indexer:4.9.0
+    hostname: wazuh-indexer
+    restart: always
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 655360, hard: 655360 }
+    environment:
+      - "OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g"
+    volumes:
+      - wazuh_indexer_data:/var/lib/wazuh-indexer
+    networks: [wazuh]
+
+  wazuh-dashboard:
+    image: wazuh/wazuh-dashboard:4.9.0
+    hostname: wazuh-dashboard
+    restart: always
+    ports:
+      - "443:5601" # web UI (front it with ALB+ACM in prod; never 0.0.0.0 raw)
+    environment:
+      - INDEXER_USERNAME=admin
+      - INDEXER_PASSWORD=${WAZUH_INDEXER_PASSWORD}
+      - WAZUH_API_URL=https://wazuh-manager
+      - DASHBOARD_USERNAME=kibanaserver
+      - DASHBOARD_PASSWORD=${WAZUH_DASHBOARD_PASSWORD}
+    depends_on: [wazuh-indexer, wazuh-manager]
+    networks: [wazuh]
+
+volumes:
+  wazuh_manager_data:
+  wazuh_indexer_data:
+
+networks:
+  wazuh:
+    driver: bridge

@@ -1,0 +1,14 @@
+# file_sd 占位 — 手填 metal host 私网 IP:8899(无 IAM / 临时验证用)。
+# 推荐生产用 prometheus.yml 的 ec2_sd_configs 自动发现;这里是兜底。
+# Prometheus 按 prometheus.yml 里 refresh_interval(1m)热加载,改完无需重启。
+#
+# 填法(去掉注释,换成真实 metal host 私网 IP):
+# - targets:
+#     - "10.0.12.34:8899"
+#     - "10.0.45.67:8899"
+#   labels:
+#     instance: metal-host-a   # 不填则用 IP:port 作 instance
+#     job_extra: manual
+#
+# 默认空列表 = 全靠 ec2_sd 发现。
+[]

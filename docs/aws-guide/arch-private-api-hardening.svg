@@ -1,0 +1,108 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1420 800" font-family="'PingFang SC','Microsoft YaHei','Helvetica Neue',Arial,sans-serif">
+  <defs>
+    <marker id="a" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#4a5568"/></marker>
+    <marker id="ar" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#d9534f"/></marker>
+    <marker id="ag" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#3f9d52"/></marker>
+  </defs>
+  <rect width="1420" height="800" fill="#ffffff"/>
+
+  <text x="40" y="42" font-size="25" font-weight="700" fill="#16191f">控制面 API Gateway 加固 · 双 API 并存(私有 PRIVATE + 公网 EDGE)</text>
+  <text x="40" y="66" font-size="13" fill="#5f6b7a">#122 · config-gated api.private_api_enabled 默认关(开则 synth 加以下资源,关则字节不变)· 机器/生产走私有 · 浏览器/调试走 EDGE · 两 API 指同一 api_fn</text>
+
+  <!-- legend -->
+  <rect x="980" y="30" width="12" height="12" fill="#fde9d6" stroke="#ec7211"/><text x="996" y="40" font-size="11" fill="#5f6b7a">网关/计算</text>
+  <rect x="1070" y="30" width="12" height="12" fill="#fdeaea" stroke="#d9534f"/><text x="1086" y="40" font-size="11" fill="#5f6b7a">加固/防御</text>
+  <rect x="1160" y="30" width="12" height="12" fill="#ece1fb" stroke="#9b6dff"/><text x="1176" y="40" font-size="11" fill="#5f6b7a">身份/KMS</text>
+  <rect x="1250" y="30" width="12" height="12" fill="#dbeccf" stroke="#3f9d52"/><text x="1266" y="40" font-size="11" fill="#5f6b7a">VPC 内网</text>
+  <rect x="1340" y="30" width="12" height="12" fill="#f1f2f4" stroke="#aab2c0" stroke-dasharray="3 2"/><text x="1356" y="40" font-size="11" fill="#5f6b7a">调用方</text>
+
+  <!-- ============ 上路:公网 EDGE(现状,浏览器/调试) ============ -->
+  <rect x="40" y="92" width="330" height="120" rx="8" fill="#f1f2f4" stroke="#aab2c0" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="56" y="114" font-size="13" font-weight="700" fill="#5f6b7a">浏览器 / 调试(公网)</text>
+  <text x="56" y="136" font-size="11.5" fill="#5f6b7a">console / chat 前端</text>
+  <text x="56" y="154" font-size="11.5" fill="#5f6b7a">认证:x-api-key + Cognito JWT</text>
+  <text x="56" y="172" font-size="11.5" fill="#5f6b7a">走现有公网入口,不受私有化影响</text>
+  <text x="56" y="194" font-size="11" fill="#8a97a8">stack.py:1048 api = RestApi(EDGE)</text>
+
+  <rect x="440" y="92" width="300" height="120" rx="8" fill="#fde9d6" stroke="#ec7211" stroke-width="1.5"/>
+  <text x="456" y="114" font-size="13" font-weight="700" fill="#c05e17">EDGE REST API(公网,默认)</text>
+  <text x="456" y="136" font-size="11.5" fill="#4a5568">openclaw-orchestrator · EndpointType EDGE</text>
+  <text x="456" y="154" font-size="11.5" fill="#4a5568">授权:API Key(usage plan)+ Lambda 内 RBAC</text>
+  <text x="456" y="172" font-size="11.5" fill="#4a5568">经 CloudFront POP 就近路由</text>
+  <text x="456" y="194" font-size="11" fill="#8a97a8">恒建(无条件)· 20+ 路由逐条挂</text>
+
+  <line x1="370" y1="152" x2="438" y2="152" stroke="#4a5568" stroke-width="2" marker-end="url(#a)"/>
+  <text x="378" y="144" font-size="10" fill="#5f6b7a">HTTPS 公网</text>
+
+  <!-- ============ 下路:私有 PRIVATE(加固,机器/生产) ============ -->
+  <rect x="40" y="238" width="330" height="150" rx="8" fill="#f1f2f4" stroke="#aab2c0" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="56" y="260" font-size="13" font-weight="700" fill="#5f6b7a">机器/生产调用方(VPC 内)</text>
+  <text x="56" y="282" font-size="11.5" fill="#5f6b7a">对接方后端 / EC2 实例角色</text>
+  <text x="56" y="300" font-size="11.5" fill="#5f6b7a">botocore SigV4Auth 签名 POST /tenants</text>
+  <text x="56" y="318" font-size="11.5" fill="#5f6b7a">service=execute-api · body 只序列化一次</text>
+  <text x="56" y="336" font-size="11.5" fill="#5f6b7a">IAM: execute-api:Invoke + kms:Encrypt</text>
+  <text x="56" y="358" font-size="11" fill="#8a97a8">docs/aws-guide/private-api-create-tenant-sigv4.py</text>
+  <text x="56" y="376" font-size="11" fill="#d9534f">公网跑连不上私有端点(加固目标)</text>
+
+  <!-- VPC boundary containing VPCE + private API -->
+  <rect x="400" y="228" width="620" height="230" rx="10" fill="#eef7ee" stroke="#3f9d52" stroke-width="1.5"/>
+  <text x="416" y="248" font-size="12" font-weight="700" fill="#2f7d40">VPC(默认 VPC;#119 落地后迁私有子网)· private DNS 开</text>
+
+  <rect x="416" y="262" width="270" height="180" rx="8" fill="#fdeaea" stroke="#d9534f" stroke-width="1.5"/>
+  <text x="432" y="284" font-size="12.5" font-weight="700" fill="#b03a3a">execute-api Interface VPCE</text>
+  <text x="432" y="304" font-size="11" fill="#4a5568">InterfaceVpcEndpointAwsService</text>
+  <text x="432" y="320" font-size="11" fill="#4a5568">.APIGATEWAY(= execute-api)</text>
+  <text x="432" y="338" font-size="11" fill="#4a5568">private_dns_enabled=True</text>
+  <text x="432" y="360" font-size="12" font-weight="700" fill="#b03a3a">专用 SG(open=False)</text>
+  <text x="432" y="378" font-size="11" fill="#4a5568">入站只放 443 from VPC CIDR</text>
+  <text x="432" y="396" font-size="11" fill="#d9534f">绝不 0.0.0.0/0</text>
+  <text x="432" y="418" font-size="11" fill="#8a97a8">stack.py #122 · CfnOutput</text>
+  <text x="432" y="434" font-size="11" fill="#8a97a8">ExecuteApiVpceId</text>
+
+  <rect x="702" y="262" width="302" height="180" rx="8" fill="#fde9d6" stroke="#ec7211" stroke-width="1.5"/>
+  <text x="718" y="284" font-size="12.5" font-weight="700" fill="#c05e17">PRIVATE REST API</text>
+  <text x="718" y="304" font-size="11" fill="#4a5568">openclaw-orchestrator-private</text>
+  <text x="718" y="320" font-size="11" fill="#4a5568">EndpointType PRIVATE + 关联该 VPCE</text>
+  <text x="718" y="340" font-size="12" font-weight="700" fill="#9b6dff">① resource policy(部署必需)</text>
+  <text x="718" y="357" font-size="11" fill="#4a5568">Deny 非本 VPCE(aws:SourceVpce)</text>
+  <text x="718" y="377" font-size="12" font-weight="700" fill="#9b6dff">② AWS_IAM(SigV4)+ api-key 双因子</text>
+  <text x="718" y="394" font-size="11" fill="#4a5568">SigV4 验签 + execute-api:Invoke + x-api-key</text>
+  <text x="718" y="414" font-size="11" fill="#4a5568">{proxy+} ANY → 同一 api_fn(全路由)</text>
+  <text x="718" y="432" font-size="11" fill="#8a97a8">grant_invoke_from_vpc_endpoints_only</text>
+
+  <line x1="370" y1="308" x2="414" y2="330" stroke="#d9534f" stroke-width="2" marker-end="url(#ar)"/>
+  <text x="360" y="300" font-size="10" fill="#d9534f">PrivateLink</text>
+  <line x1="686" y1="352" x2="700" y2="352" stroke="#4a5568" stroke-width="2" marker-end="url(#a)"/>
+
+  <!-- shared backend -->
+  <rect x="1050" y="238" width="330" height="230" rx="8" fill="#fde9d6" stroke="#ec7211" stroke-width="1.5"/>
+  <text x="1066" y="260" font-size="13" font-weight="700" fill="#c05e17">同一控制面 Lambda(api_fn)</text>
+  <text x="1066" y="282" font-size="11.5" fill="#4a5568">EDGE 与 PRIVATE 两个 API 共用后端</text>
+  <text x="1066" y="300" font-size="11.5" fill="#4a5568">api Lambda 不进 VPC</text>
+  <text x="1066" y="322" font-size="12" font-weight="700" fill="#c05e17">POST /tenants · create_tenant</text>
+  <text x="1066" y="340" font-size="11" fill="#4a5568">校验 injected_credentials(密文透传)</text>
+  <text x="1066" y="358" font-size="11" fill="#4a5568">owner_id 必填(EC 绑定 + 归属)</text>
+  <text x="1066" y="376" font-size="11" fill="#4a5568">存 DDB 密文 · API 不解密</text>
+  <text x="1066" y="398" font-size="11.5" fill="#9b6dff">凭据注入端到端见 KMS 注入图</text>
+  <text x="1066" y="416" font-size="11" fill="#8a97a8">credential-kms-injection-e2e-diagram.svg</text>
+  <text x="1066" y="438" font-size="11" fill="#8a97a8">→ host kms:Decrypt → 只读盘 → agent</text>
+
+  <line x1="1004" y1="160" x2="1048" y2="300" stroke="#4a5568" stroke-width="1.6" marker-end="url(#a)"/>
+  <line x1="1004" y1="352" x2="1048" y2="352" stroke="#4a5568" stroke-width="2" marker-end="url(#a)"/>
+
+  <!-- three-gate summary strip -->
+  <rect x="40" y="486" width="1340" height="128" rx="8" fill="#fdeaea" stroke="#d9534f" stroke-width="1.5"/>
+  <text x="56" y="508" font-size="14" font-weight="700" fill="#b03a3a">私有通道三道关(层层收紧,任一不过即拒)</text>
+  <text x="56" y="532" font-size="12" fill="#4a5568">① 网络层:只能从 VPC 内经 execute-api VPCE(PrivateLink)到达,流量不出 AWS 骨干网,公网连不上 PRIVATE 端点。</text>
+  <text x="56" y="554" font-size="12" fill="#4a5568">② 资源策略层:resource policy Deny 掉 aws:SourceVpce ≠ 本 VPCE 的请求(私有 API 无 resource policy 无法部署 = fail-closed 默认全拒)。</text>
+  <text x="56" y="576" font-size="12" fill="#4a5568">③ 身份层双因子:method AWS_IAM(SigV4 签名 + IAM execute-api:Invoke)+ api_key_required(x-api-key 应用层密钥门)。私有 API 复用控制面 Lambda,handler 把"无 Bearer"当 god-admin,故必须 api-key 兜(评审 HIGH 修复)。</text>
+  <text x="56" y="600" font-size="11.5" fill="#3f9d52">依据:AWS 官方文档查证(apigateway-private-apis / resource-policies-examples / control-access-using-iam / SigV4)。EDGE 恒在,私有 API 加固为可选附录。</text>
+
+  <!-- footer -->
+  <rect x="40" y="632" width="1340" height="128" rx="8" fill="#ece1fb" stroke="#9b6dff" stroke-width="1.5"/>
+  <text x="56" y="654" font-size="14" font-weight="700" fill="#6b3fd4">SigV4 调用方(Python botocore)· 与凭据 KMS 加密一条龙</text>
+  <text x="56" y="678" font-size="12" fill="#4a5568">1) 用 ClawPool CMK kms:Encrypt 每条凭据(EncryptionContext=owner_id)→ base64 密文,组 injected_credentials。明文只在本进程,不出网。</text>
+  <text x="56" y="700" font-size="12" fill="#4a5568">2) body=json.dumps(payload) 只序列化一次 → AWSRequest → SigV4Auth(creds,"execute-api",region).add_auth(req) → requests.post(headers=signed, data=body)。</text>
+  <text x="56" y="722" font-size="12" fill="#4a5568">3) 经私有 API 提交 POST /tenants,返 202。之后 GET /tenants/{id} 轮询 running,VM 内 agent 用注入的 AKSK 调 AWS。</text>
+  <text x="56" y="744" font-size="11.5" fill="#d9534f">高频坑:别用 requests 的 json=(重新序列化 → payload hash 不匹配 → 403);service 固定 execute-api;region 填 API 部署 region。</text>
+</svg>

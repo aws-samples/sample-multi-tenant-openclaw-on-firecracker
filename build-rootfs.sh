@@ -837,11 +837,12 @@ if [ -d /tmp/image-sample ]; then
     # Register the two guard plugins in config: load paths + enabled entries.
     # jq merge keeps whatever the template already had under .plugins.
     #   acl-guard / sentinel-guard — before_tool_call hooks (priority 1000 / 200)
-    # claw-channel was retired in the data-plane refactor: the WSS-hub reverse
-    # channel is replaced by two-tier routing (OpenResty edge → host DNAT →
-    # in-VM native gateway on :18789). The gateway now serves chat via the
-    # OpenAI-compatible /v1/chat/completions and /v1/responses HTTP endpoints
-    # directly; the retired plugin is kept in an internal archive for history.
+    # claw-channel was retired in the data-plane refactor
+    # (per the data-plane design): the WSS-hub reverse channel
+    # is replaced by two-tier routing (OpenResty edge → host DNAT → in-VM native
+    # gateway on :18789). The gateway now serves chat via the OpenAI-compatible
+    # /v1/chat/completions and /v1/responses HTTP endpoints directly; the plugin
+    # is kept in an internal archive for history.
     if command -v jq >/dev/null 2>&1; then
       jq '
         (.plugins // {}) as $p |
@@ -989,7 +990,14 @@ sudo chmod +x "${ROOTFS_DIR}/sbin/overlay-init"
 sudo umount -l ${ROOTFS_DIR}/proc ${ROOTFS_DIR}/sys ${ROOTFS_DIR}/dev
 
 # === Build data template from /home/agent ===
-DATA_DISK_MB=$(grep 'data_disk_mb:' "${SCRIPT_DIR}/config.yml" | awk '{print $2}')
+# 行首缩进锚定,只取 vm 段的 data_disk_mb。裸 grep 'data_disk_mb:' 是子串匹配,
+# 会连 quotas 段的 max_data_disk_mb 一起命中 → DATA_DISK_MB 变多行 "8192\n0" →
+# truncate -s 解析失败 → mkfs "Not enough space"(#276 首次部署实撞)。^\s+ 锚定
+# 排除 max_ 前缀行;head -1 兜底防未来再有同名键。
+DATA_DISK_MB=$(grep -E '^[[:space:]]+data_disk_mb:' "${SCRIPT_DIR}/config.yml" | awk '{print $2}' | head -1)
+# #277 fail-loud:config 里连 vm.data_disk_mb 都没有时,DATA_DISK_MB 为空会让
+# 下面的 truncate 报含糊错;这里显式拦下,直接说清缺哪个键。
+[ -n "${DATA_DISK_MB}" ] || { echo "[FATAL] config.yml 未解析到 vm.data_disk_mb"; exit 1; }
 echo "=== Building data template (${DATA_DISK_MB}MB) ==="
 DATA_DIR="/tmp/openclaw-data-build"
 truncate -s ${DATA_DISK_MB}M ${DATA_IMG}

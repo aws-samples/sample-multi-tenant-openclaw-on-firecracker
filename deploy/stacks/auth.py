@@ -457,15 +457,16 @@ def build_auth(self, ctx):
             )
             _ctrl_key_cr.node.add_dependency(_admin_key)
             _ctrl_key_value = _ctrl_key_cr.get_response_field("value")
-        # #266 — 当 logging.enabled 时 BFF 进 VPC,才够得着 VPC-only 的 AOS 域查
-        # vm/host 日志(observability.py 回填 AOS_ENDPOINT/AOS_SECRET_ARN + SG 入站)。
-        # VPC 内经现有 3 NAT 出公网,control-plane API / Cognito / SSM / CloudWatch
-        # 调用不断。private_dns 的 execute-api VPCE 只在 api.mode=private/both 建
-        # (network_vpc.py:83),edge 模式(默认)不劫持 DNS,/capi 公网代理照走。
-        _bff_in_vpc = (
-            bool((CFG.get("logging", {}) or {}).get("enabled", False))
-            and vpc is not None
-        )
+        # #272 — BFF 默认进 VPC(只要 default_vpc 建了就进,不再要求 logging.enabled)。
+        # 纯私有部署(api.mode=private)时 BFF 从 VPC 内经 execute-api VPCE 的 private
+        # DNS 调私有控制面 API(resource policy 限 VPCE,x-api-key 照用,不需 SigV4);
+        # 也够得着 VPC-only 的 AOS 域(observability.py 回填 AOS_ENDPOINT + SG 入站)。
+        # 经现有 NAT 出公网,Cognito / SSM / CloudWatch 调用不断。vpc is None 才回落非 VPC。
+        # 子网可选:console_auth.bff_subnet_ids 非空时显式选那几个子网(imported 私有
+        # 子网场景);缺省回落 PRIVATE_WITH_EGRESS(带 NAT 出网的私有子网)。
+        # ENI 权限:CDK 配 vpc= 且用默认执行角色时,自动挂 service-role/
+        # AWSLambdaVPCAccessExecutionRole(Create/Describe/DeleteNetworkInterface),无需显式加。
+        _bff_in_vpc = vpc is not None
         _bff_vpc_kwargs = {}
         _bff_sg = None
         if _bff_in_vpc:
@@ -476,11 +477,21 @@ def build_auth(self, ctx):
                 description="console BFF Lambda ENIs - egress only (NAT + AOS 443)",
                 allow_all_outbound=True,
             )
+            _bff_subnet_ids = auth_cfg.get("bff_subnet_ids") or []
+            if _bff_subnet_ids:
+                _bff_subnets = ec2.SubnetSelection(
+                    subnets=[
+                        ec2.Subnet.from_subnet_id(self, f"BffSubnet{_i}", _sid)
+                        for _i, _sid in enumerate(_bff_subnet_ids)
+                    ]
+                )
+            else:
+                _bff_subnets = ec2.SubnetSelection(
+                    subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
+                )
             _bff_vpc_kwargs = {
                 "vpc": vpc,
-                "vpc_subnets": ec2.SubnetSelection(
-                    subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
-                ),
+                "vpc_subnets": _bff_subnets,
                 "security_groups": [_bff_sg],
             }
         console_bff_fn = _lambda.Function(

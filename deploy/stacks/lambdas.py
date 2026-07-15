@@ -1333,6 +1333,13 @@ def build_lambdas(self, ctx):
     backup_cmk.grant_encrypt_decrypt(backup_fn)  # CMK 解密权限只授备份执行者
     _attach_ssm_policies(backup_fn)  # #62 IAM 收窄:拆 SSM 多 statement
     backup_fn.grant_invoke(api_fn)  # API Lambda async invokes Backup Lambda
+    # #263 — 走 FIFO 队列的删除由 lifecycle_consumer 执行 delete_tenant,keep_data=false
+    # 时它同步 invoke backup Lambda 做删前备份(铁律#4 不可逆操作前先保护)。consumer role
+    # 缺 lambda:InvokeFunction → invoke AccessDenied → delete fail-closed 返 5xx → 消息卡
+    # FIFO 无限重试、租户永久删不掉。真机实证(ap-southeast-1,2026-07-15):开
+    # lifecycle_queue_enabled 后单删返 202 但消息卡 NotVisible、租户始终 running。
+    if getattr(self, "_lifecycle_consumer", None) is not None:
+        backup_fn.grant_invoke(self._lifecycle_consumer)
 
     # PRD 2.6: backup_cron 现在是"扫描节拍"而非"统一备份时间"——每次触发只备到期
     # 的一批(错峰+限并发)。配高频(如 rate(30 minutes))让全量在 INTERVAL_HOURS

@@ -138,6 +138,16 @@ def build_ha_edge(self, ctx):
     _edge_port_high = int((CFG.get("edge", {}) or {}).get("dnat_port_high", 15000))
     init_sh = init_sh.replace("{{DNAT_PORT_LOW}}", str(_edge_port_low))
     init_sh = init_sh.replace("{{DNAT_PORT_HIGH}}", str(_edge_port_high))
+    # #266 端口 quarantine 冷却期(config.yml → edge.port_quarantine_seconds →
+    # /etc/platform.env,route_ops.py:48 读)。#222 加了 init-host.sh 的占位符
+    # 却漏了这条渲染 → 真机 host-agent 起来 import route_ops 时
+    # int("{{PORT_QUARANTINE_SECONDS}}") 抛 ValueError,host-agent 崩溃重启循环、
+    # 整台 host 不可调度(2026-07-15 美东1 真机复现)。默认 20 与 route_ops.py
+    # 的 os.environ.get 兜底同源;0 = 关。#272 rebase 误删本段致复发,#266 二次补回。
+    init_sh = init_sh.replace(
+        "{{PORT_QUARANTINE_SECONDS}}",
+        str((CFG.get("edge", {}) or {}).get("port_quarantine_seconds", 20)),
+    )
     init_sh = init_sh.replace(
         "{{AGENTCORE_GATEWAY_URL}}", gateway_url if gateway_url else "none"
     )
@@ -427,7 +437,7 @@ def build_ha_edge(self, ctx):
     # deploy/monitoring/prometheus.yml 的 ec2_sd_configs 按 tag:Project=openclaw +
     # tag:Role=metal-host 过滤发现 metal host 抓 :8899/metrics。CDK LaunchTemplate
     # 默认只给实例打 Name,不打这俩 tag → Prometheus 发现不到 host、采集断链
-    # ( 实测 metal 实例只有 Name tag)。这里在 LaunchTemplateData 层加
+    # (795 实测 metal 实例只有 Name tag)。这里在 LaunchTemplateData 层加
     # TagSpecifications,让 ASG 起的每台 host(及其卷)都带这俩 tag,随重建继承。
     # key 大小写须与 prometheus.yml filters 完全一致(Project/Role 首字母大写)。
     _host_tags = [

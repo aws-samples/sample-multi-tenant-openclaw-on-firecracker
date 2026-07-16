@@ -30,6 +30,17 @@ shift 2
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# instance-role 模式:PROFILE="-" 表示不带 --profile,让 aws-cli 和 cdk 都走默认凭据链吃 IMDS
+# (堡垒机 / CI / EC2 instance role 场景)。沿用 deploy/lib/mint-shared-vkey.sh 早有的 "-" 约定。
+# 为什么必须这样:cdk(aws-sdk-js)读不了只有 `credential_source=Ec2InstanceMetadata`、没有
+# `role_arn` 的畸形 profile(aws-cli 宽容能读,sdk 严格拒绝 → "no credentials configured")。
+# 全脚本用 PROFILE_ARGS 展开:instance-role 模式为空(不传 profile),否则 --profile <name>。
+if [ "$PROFILE" = "-" ]; then
+  PROFILE_ARGS=()
+else
+  PROFILE_ARGS=(--profile "$PROFILE")
+fi
+
 # Parse domain flags. Both legacy single-domain and new dual-domain are supported.
 DOMAIN_FLAG=""; CERT_FLAG=""
 CONSOLE_DOMAIN_FLAG=""; CONSOLE_CERT_FLAG=""
@@ -121,7 +132,7 @@ fi
 # so only user_pool_id needs to be carried forward.
 EXISTING_POOL=$(aws cloudformation describe-stacks --stack-name OpenClawOrchestrator \
   --query 'Stacks[0].Outputs[?OutputKey==`CognitoUserPoolId`].OutputValue' \
-  --output text --profile "$PROFILE" --region "$REGION" 2>/dev/null || true)
+  --output text "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" 2>/dev/null || true)
 if [ -n "${EXISTING_POOL:-}" ] && [ "$EXISTING_POOL" != "None" ]; then
   POOL="$EXISTING_POOL" python3 - <<'PYEOF'
 import os, re, pathlib
@@ -359,20 +370,20 @@ fi
 # --all: app 拆多 stack(OpenClawOrchestrator + OpenClawImage,#283)后,不带
 # stack 选择符的裸 cdk deploy 会报 "specify which stacks ... or --all" 并退出。
 # --all 按 add_dependency 拓扑序先 Orchestrator(建桶)后 OpenClawImage(烤镜像)。
-PATH=".venv/bin:$PATH" cdk deploy --all -c region="$REGION" --profile "$PROFILE" --require-approval never ${CDK_ARGS[@]+"${CDK_ARGS[@]}"}
+PATH=".venv/bin:$PATH" cdk deploy --all -c region="$REGION" "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --require-approval never ${CDK_ARGS[@]+"${CDK_ARGS[@]}"}
 
 # Upload scripts to S3 (after deploy creates the bucket)
 BUCKET=$(aws cloudformation describe-stacks --stack-name OpenClawOrchestrator \
   --query 'Stacks[0].Outputs[?OutputKey==`AssetsBucket`].OutputValue' --output text \
-  --profile "$PROFILE" --region "$REGION")
+  "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION")
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/host-agent.py" "s3://${BUCKET}/deployment/scripts/host-agent.py" \
-  --profile "$PROFILE" --region "$REGION" --quiet
+  "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 # route_ops.py — host-agent.py:27 `import route_ops`(同目录 /opt/openclaw)。P2b 两级
 # 路由的端口位图 + iptables DNAT + Redis 路由全在这。**没上传 → host-agent
 # ModuleNotFoundError crashloop、数据面 host 侧从没工作过**(P7 真机实撞)。同 #64/#22
 # 同类:源码在但 setup.sh 上传清单漏了。init-host.sh 拉到 /opt/openclaw/route_ops.py。
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/route_ops.py" "s3://${BUCKET}/deployment/scripts/route_ops.py" \
-  --profile "$PROFILE" --region "$REGION" --quiet
+  "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 
 # Re-deploy is a no-op if nothing changed but it forces ASG hosts to retry
 # pulling scripts now that S3 has them — guards against the race where the
@@ -382,9 +393,9 @@ echo "✓ Scripts uploaded; existing hosts will pick them up via init-host.sh re
 # edge ASG userdata 从 deployment/edge/ 拉全套后跑 install-edge.sh 自举(P7 补,
 # 之前占位 userdata 不装 OpenResty → ELB 永 unhealthy → ASG 无限换机)。
 aws s3 cp "$SCRIPT_DIR/deploy/edge/" "s3://${BUCKET}/deployment/edge/" \
-  --recursive --exclude "test/*" --profile "$PROFILE" --region "$REGION" --quiet
+  --recursive --exclude "test/*" "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/adot-config.yaml" "s3://${BUCKET}/deployment/scripts/adot-config.yaml" \
-  --profile "$PROFILE" --region "$REGION" --quiet
+  "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 
 # ── #229 观测配置 S3 asset 化 ──────────────────────────────────────────
 # ADOT + Fluent Bit 配置额外上传到 deployment/observability/ 独立前缀,
@@ -398,7 +409,7 @@ _obs_upload() {
   local src="$1" key="$2"
   local sha; sha=$(shasum -a 256 "$src" | awk '{print $1}')
   aws s3 cp "$src" "s3://${BUCKET}/${key}" \
-    --profile "$PROFILE" --region "$REGION" --quiet \
+    "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet \
     --metadata "sha256=${sha},uploaded-at=${_OBS_TS},git-commit=${_OBS_COMMIT}"
 }
 _obs_upload "$SCRIPT_DIR/deploy/userdata/adot-config.yaml"                  "deployment/observability/adot/adot-config.yaml"
@@ -414,52 +425,52 @@ _obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/host/parsers.conf"           "de
 _obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/host/extract_tenant_id.lua"  "deployment/observability/fluent-bit/host/extract_tenant_id.lua"
 echo "✓ Observability configs uploaded to s3://${BUCKET}/deployment/observability/ (commit=${_OBS_COMMIT})"
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/backup-data.sh" "s3://${BUCKET}/deployment/scripts/backup-data.sh" \
-  --profile "$PROFILE" --region "$REGION" --quiet
+  "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/launch-vm.sh" "s3://${BUCKET}/deployment/scripts/launch-vm.sh" \
-  --profile "$PROFILE" --region "$REGION" --quiet
+  "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 # setup-egress-allowlist.sh(#39)— host 侧 dnsmasq + ipset 出网白名单基建。独立成脚本
 # 而非内联 init-host.sh(避免撑爆 user-data 16KB 硬限);init-host.sh 拉到 /home/ubuntu/
 # 后执行,config security.egress_allowlist_enabled 默认 false 时脚本自身跳过。缺它 →
 # init-host WARN 跳过(host-agent 仍起),egress 退回现状放行(非致命)。
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/setup-egress-allowlist.sh" "s3://${BUCKET}/deployment/scripts/setup-egress-allowlist.sh" \
-  --profile "$PROFILE" --region "$REGION" --quiet
+  "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 # harden-config.sh(#41)— launch-vm.sh source 的 POSIX sh 幂等 openclaw.json
 # 收敛库(每次启动跑,不管 fresh/wake)。同 host-agent.py / launch-vm.sh 的下发
 # 契约:setup.sh 上传到 S3,init-host.sh 拉到 /home/ubuntu/lib/。缺它 →
 # launch-vm.sh 顶部 `. lib/harden-config.sh` 失败 → 每次启动 exit 1,一台起不来。
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/lib/harden-config.sh" "s3://${BUCKET}/deployment/scripts/lib/harden-config.sh" \
-  --profile "$PROFILE" --region "$REGION" --quiet
+  "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 # cred-inject.sh(#118)— launch-vm.sh source 的凭据 KMS 解密库。同 harden-config
 # 契约:setup.sh 上传,init-host.sh 拉到 /home/ubuntu/lib/。只在租户有 injected_
 # credentials 时才 source;缺它则该 VM fail-loud 中止(不静默注入空凭据)。
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/lib/cred-inject.sh" "s3://${BUCKET}/deployment/scripts/lib/cred-inject.sh" \
-  --profile "$PROFILE" --region "$REGION" --quiet
+  "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/stop-vm.sh" "s3://${BUCKET}/deployment/scripts/stop-vm.sh" \
-  --profile "$PROFILE" --region "$REGION" --quiet
+  "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/clone-data.sh" "s3://${BUCKET}/deployment/scripts/clone-data.sh" \
-  --profile "$PROFILE" --region "$REGION" --quiet
+  "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 # Issue #64 — migrate-vm.sh (Firecracker live migration snapshot/restore).
 # Shipped in source since v1.2.0 (#20/#45) but never uploaded → SSM hit a
 # missing file (exit 127) and live migration silently failed end-to-end.
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/migrate-vm.sh" "s3://${BUCKET}/deployment/scripts/migrate-vm.sh" \
-  --profile "$PROFILE" --region "$REGION" --quiet
+  "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 # Issue #22 (same defect class as #64) — resize-disk.sh (offline ext4 grow of
 # the tenant data volume). Referenced by the resize-disk API but never uploaded.
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/resize-disk.sh" "s3://${BUCKET}/deployment/scripts/resize-disk.sh" \
-  --profile "$PROFILE" --region "$REGION" --quiet
+  "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 # start-all-vms / stop-all-vms — host-local fan-out for the 1-minute fleet power
 # goal (control plane sends ONE SSM per host; host starts/stops all its VMs in
 # bounded parallel). Same upload-or-404 contract as the helpers above.
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/start-all-vms.sh" "s3://${BUCKET}/deployment/scripts/start-all-vms.sh" \
-  --profile "$PROFILE" --region "$REGION" --quiet
+  "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/stop-all-vms.sh" "s3://${BUCKET}/deployment/scripts/stop-all-vms.sh" \
-  --profile "$PROFILE" --region "$REGION" --quiet
+  "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 # #256 — launch-all-vms.sh 已内联进 launch-vm.sh 的 fan_out_main(唯一起 VM 脚本)。
 # 聚合 SSM 命令现调 `launch-vm.sh --manifest|--from-ddb ...`(见 dispatch_service.py),
 # 不再单独上传 launch-all-vms.sh。launch-vm.sh 的上传在上方(第 415 行)。
 
 # #187 转型:claw-hub(WebSocket 中枢)数据面已下线。install-hub.sh + deploy/hub/
-# 全部归档到 an internal archive。数据面改两级路由
+# 全部归档到 engineering/04-archive/p4-cutover-deprecated/。数据面改两级路由
 # 直连 microVM 原生 gateway(ALB LOR → OpenResty edge → Redis → host DNAT →
 # microVM:18789),setup.sh 不再上传 hub 资产;init-host.sh 里 install-hub.sh
 # 引用也应一并删(独立 issue,同 stack.py CloudFront /hub behavior + HubTG 收尾)。
@@ -467,12 +478,12 @@ aws s3 cp "$SCRIPT_DIR/deploy/userdata/stop-all-vms.sh" "s3://${BUCKET}/deployme
 # LiteLLM 网关资产(ai_gateway.url 留空时,CDK 起的 LiteLLM EC2 userdata 从这拉
 # docker-compose + config 跑起网关)。总是上传(幂等),开关在 CDK 侧。
 aws s3 cp "$SCRIPT_DIR/deploy/litellm/" "s3://${BUCKET}/deployment/litellm/" \
-  --recursive --exclude "*.md" --profile "$PROFILE" --region "$REGION" --quiet 2>/dev/null || true
+  --recursive --exclude "*.md" "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet 2>/dev/null || true
 # config 模板在 runtime-config-export/(litellm-up.sh 默认从 ../runtime-config-export 读),
 # 单独补传进 deployment/litellm/ 让 EC2 userdata 能就地 sed 生成 config.runtime.yaml。
 # 缺它 → compose 把不存在的挂载源当目录建 → 容器 IsADirectoryError 崩溃(已踩坑)。
 aws s3 cp "$SCRIPT_DIR/deploy/runtime-config-export/litellm-config.yaml" "s3://${BUCKET}/deployment/litellm/litellm-config.yaml" \
-  --profile "$PROFILE" --region "$REGION" --quiet 2>/dev/null || true
+  "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet 2>/dev/null || true
 
 # 监控平台资产 → s3://.../deployment/monitoring/。
 # 自建 Prometheus+Grafana(stack.py PromGrafanaMonitor)+ Wazuh(WazuhMonitor)
@@ -484,7 +495,7 @@ aws s3 cp "$SCRIPT_DIR/deploy/runtime-config-export/litellm-config.yaml" "s3://$
 # --exclude 掉 wazuh-two-ec2/(那是双机 Wazuh 的独立 userdata, 不进本前缀)。
 aws s3 sync "$SCRIPT_DIR/deploy/monitoring/" "s3://${BUCKET}/deployment/monitoring/" \
   --exclude "wazuh-two-ec2/*" --exclude "*.md" \
-  --profile "$PROFILE" --region "$REGION" --quiet
+  "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 
 # #80 — 部署时序保证:LiteLLM shared vkey 铸到 SSM /openclaw/litellm-shared-vkey。
 # 编排层(post-deploy,非 CFN CR)——CR 塞进去会让部署耦合 LiteLLM 健康态、timeout
@@ -512,7 +523,7 @@ fi
 echo "→ 导出部署信息..."
 OUTPUTS=$(aws cloudformation describe-stacks --stack-name OpenClawOrchestrator \
   --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' --output text \
-  --profile "$PROFILE" --region "$REGION")
+  "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION")
 
 cat > "$SCRIPT_DIR/.env.deploy" << EOF
 # Auto-generated by setup.sh — $(date -Iseconds)
@@ -534,7 +545,7 @@ EOF
 API_KEY_ID=$(grep '^API_KEY_ID=' "$SCRIPT_DIR/.env.deploy" | cut -d= -f2)
 if [ -n "$API_KEY_ID" ]; then
   API_KEY=$(aws apigateway get-api-key --api-key "$API_KEY_ID" --include-value \
-    --query 'value' --output text --profile "$PROFILE" --region "$REGION")
+    --query 'value' --output text "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION")
   echo "API_KEY=$API_KEY" >> "$SCRIPT_DIR/.env.deploy"
 fi
 
@@ -570,14 +581,14 @@ sed -e "s|__OC_COGNITO_DOMAIN__|${COGNITO_DOMAIN:-}|g" \
     -e "s|__OC_API_KEY__|${API_KEY:-}|g" \
     "$SCRIPT_DIR/console/chat/index.html" > "$CHAT_TMP"
 aws s3 cp "$CHAT_TMP" "s3://${ASSETS_BUCKET}/chat/index.html" \
-  --profile "$PROFILE" --region "$REGION" --quiet --content-type text/html
+  "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet --content-type text/html
 rm -f "$CHAT_TMP"
 
 # #63 CSP:chat 页内联 <script> 已搬到 console/chat/js/{auth,chat}.js,
 # 需一起上传到桶根 chat/js/。占位符只在 index.html,js/ 无需 sed。
 if [ -d "$SCRIPT_DIR/console/chat/js" ]; then
   aws s3 sync "$SCRIPT_DIR/console/chat/js/" "s3://${ASSETS_BUCKET}/chat/js/" \
-    --profile "$PROFILE" --region "$REGION" --quiet --delete \
+    "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet --delete \
     --content-type application/javascript
 fi
 echo "✓ Chat uploaded to s3://${ASSETS_BUCKET}/chat/ (account values injected, CSP-safe external scripts)"
@@ -587,11 +598,11 @@ echo "✓ Chat uploaded to s3://${ASSETS_BUCKET}/chat/ (account values injected,
 # 仅当配了 console_auth.bff_certificate_arn 部署出该 Lambda 时才注;没部署则 describe 失败静默跳过。
 if [ -n "${API_KEY:-}" ] && \
    aws lambda get-function --function-name openclaw-console-bff \
-     --profile "$PROFILE" --region "$REGION" >/dev/null 2>&1; then
+     "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" >/dev/null 2>&1; then
   # update-function-configuration 的 --environment 是整体替换,故先完整读回现有 env、只覆写
   # CTRL_API_KEY,用 jq 合并回去(不丢 CDK 注入的 CTRL_API_BASE 及其它 env)。
   CUR_ENV_JSON="$(aws lambda get-function-configuration --function-name openclaw-console-bff \
-    --profile "$PROFILE" --region "$REGION" \
+    "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" \
     --query 'Environment.Variables' --output json 2>/dev/null)"
   if [ -z "$CUR_ENV_JSON" ] || [ "$CUR_ENV_JSON" = "null" ]; then
     echo "⚠ Console BFF: 读现有 env 失败,跳过 key 注入(避免整体替换丢 CTRL_API_BASE)"
@@ -600,7 +611,7 @@ if [ -n "${API_KEY:-}" ] && \
     ENV_ARG="$(printf '%s' "$CUR_ENV_JSON" | jq -c --arg k "$API_KEY" '{Variables: (. + {CTRL_API_KEY:$k})}')"
     aws lambda update-function-configuration --function-name openclaw-console-bff \
       --environment "$ENV_ARG" \
-      --profile "$PROFILE" --region "$REGION" >/dev/null 2>&1 \
+      "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" >/dev/null 2>&1 \
       && echo "✓ Console BFF: admin key injected into openclaw-console-bff env (browser stays key-less)" \
       || echo "⚠ Console BFF: key injection failed (check openclaw-console-bff exists / IAM lambda:UpdateFunctionConfiguration)"
   fi
@@ -611,7 +622,7 @@ fi
 CF_ORIGIN_VAL="${DASHBOARD_BASE:-${CONSOLE_BASE:-}}"
 if [ -n "$CF_ORIGIN_VAL" ]; then
   aws ssm put-parameter --name /openclaw/cloudfront-origin --type String \
-    --value "$CF_ORIGIN_VAL" --overwrite --profile "$PROFILE" --region "$REGION" >/dev/null 2>&1
+    --value "$CF_ORIGIN_VAL" --overwrite "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" >/dev/null 2>&1
   echo "✓ SSM /openclaw/cloudfront-origin = ${CF_ORIGIN_VAL}"
 fi
 
@@ -622,7 +633,7 @@ fi
 # Cognito disabled" → HMAC-only, so this is a no-op for non-opted-in deployments.
 if [ -n "${COGNITO_CHANNEL_CLIENT_ID:-}" ]; then
   aws ssm put-parameter --name /openclaw/cognito-channel-client-id --type String \
-    --value "$COGNITO_CHANNEL_CLIENT_ID" --overwrite --profile "$PROFILE" --region "$REGION" >/dev/null 2>&1
+    --value "$COGNITO_CHANNEL_CLIENT_ID" --overwrite "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" >/dev/null 2>&1
   echo "✓ SSM /openclaw/cognito-channel-client-id = ${COGNITO_CHANNEL_CLIENT_ID}"
 fi
 
@@ -631,12 +642,12 @@ fi
 # (重建实撞)。栈每次重建 pool/client 都会变,故 setup.sh 拿到新值后覆写 SSM。
 if [ -n "${COGNITO_USER_POOL_ID:-}" ]; then
   aws ssm put-parameter --name /openclaw/cognito-user-pool-id --type String \
-    --value "$COGNITO_USER_POOL_ID" --overwrite --profile "$PROFILE" --region "$REGION" >/dev/null 2>&1
+    --value "$COGNITO_USER_POOL_ID" --overwrite "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" >/dev/null 2>&1
   echo "✓ SSM /openclaw/cognito-user-pool-id = ${COGNITO_USER_POOL_ID}"
 fi
 if [ -n "${COGNITO_CLIENT_ID:-}" ]; then
   aws ssm put-parameter --name /openclaw/cognito-client-id --type String \
-    --value "$COGNITO_CLIENT_ID" --overwrite --profile "$PROFILE" --region "$REGION" >/dev/null 2>&1
+    --value "$COGNITO_CLIENT_ID" --overwrite "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" >/dev/null 2>&1
   echo "✓ SSM /openclaw/cognito-client-id = ${COGNITO_CLIENT_ID}"
 fi
 echo ""

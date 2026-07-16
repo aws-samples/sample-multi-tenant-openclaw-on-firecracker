@@ -167,11 +167,11 @@ scaler:
   # +DLQ+consumer Lambda,create/start/stop/delete 入队由 consumer 受控并发消费
   # (治同步直驱 SSM 在持续高并发下的雪崩,见 控制面重构设计)。
   # 默认 false=走原同步路径(向后兼容,小规模/demo 够用)。
-  # ⚠ 大规模建租户必开,触发阈值远低于"千级": 实测(2026-06-30)同步路径下
+  # ⚠ 大规模建租户必开,触发阈值远低于"千级":795 实测(2026-06-30)同步路径下
   # **仅 40 并发 POST /tenants 就有 11 个永久卡 creating**,根因是每租户一条
   # ssm.send_command 打同一 metal,超 SSM 单实例并发配额 → TimedOut → launch-vm 没跑。
   # 所以一次性建满 380/台(扩容、重建、压测)这类场景必须开本队列削峰,不是只有
-  # 上线峰值才开(见 memory loadtest-380-ssm-concurrency-bottleneck + LOADTEST-RESULT-380-)。
+  # 上线峰值才开(见 memory loadtest-380-ssm-concurrency-bottleneck + LOADTEST-RESULT-380-795)。
   lifecycle_queue_enabled: false
   # Phase 2 — 把 POST /tenants 建租户也走 FIFO 队列(默认 false=同步直驱,向后兼容)。
   # 开了之后:建租户做完廉价校验即入队返 202,consumer 按 lifecycle_consumer_concurrency
@@ -180,7 +180,7 @@ scaler:
   # 需 lifecycle_queue_enabled=true(共用同一 FIFO 队列)。建租户端到端时延经 CloudWatch
   # OpenClaw/ControlPlane TenantCreateLatencySeconds 指标实测(1 分钟 SLA 守护)。
   create_via_queue: false
-  # consumer 并发上限=限流阀,设到「SSM 单实例可承受的并发」而非越大越好。 实测
+  # consumer 并发上限=限流阀,设到「SSM 单实例可承受的并发」而非越大越好。795 实测
   # 40 并发就触发 SSM TimedOut,故单 metal 场景应设到约 5-10(实测 SSM 单实例承受区间),
   # 不是 50;多 host 可按 host 数线性放大。瞬时千级入队、consumer 按此速率平稳消费。
   lifecycle_consumer_concurrency: 50
@@ -440,7 +440,7 @@ notifications:
 # enabled=true 开 metrics 采集(host-agent :8899/metrics)。后端二选一:
 #   - 默认(use_managed 缺省 false)= 自建 EC2 Prometheus+Grafana(deploy/monitoring/,
 #     运维手册 §5.6),不建任何 AWS 托管 workspace。这是本项目既定架构(AMG 要 AWS_SSO,
-#     刻意规避)。 实测 AMP workspace 为空,正是走自建。
+#     刻意规避)。795 实测 AMP workspace 为空,正是走自建。
 #   - use_managed=true = CDK 建 Amazon Managed Prometheus(AMP)+ Managed Grafana(AMG,
 #     强制 AWS_SSO)+ host_role 的 aps:RemoteWrite 权限。想用 AWS 托管再显式开。
 metrics:
@@ -466,7 +466,7 @@ security:
   wazuh_enabled: false       # true=CDK 起一台专用监控 EC2(m7i.xlarge/AL2023),userdata 自动装 docker+compose 跑 Wazuh manager/indexer/dashboard,从 assets bucket 拉 deployment/monitoring/*。SG 仅 VPC CIDR 入站(1514/1515/55000/443,绝不 0.0.0.0)。默认 false。
   # Wazuh manager 部署见 deploy/monitoring/WAZUH-RUNBOOK.md(docker-compose 起 manager+indexer+dashboard,in-guest agent forward)。
   dns_firewall_enabled: false  # true=CDK 建 Route53 Resolver DNS Firewall(domain list openclaw-egress-blocklist + rule group openclaw-egress-fw + BLOCK 规则 NXDOMAIN + 关联 VPC),在 DNS 解析层拦 C2/外泄域名(L4 出网防线)。默认 false。真实 C2 域名清单不入仓库(domain list 只放 demo 占位),运营用 route53resolver import-firewall-domains 从受控威胁情报源另灌。此前由 apply-hardening.sh 旁路建,现纳入 stack.py 随重建对账。注意:DNS FW 只拦经 VPC Route53 Resolver 的查询;microVM guest DNS 硬编码公网 8.8.8.8 不经 VPC Resolver,故 DNS FW 对 microVM 出网无效(定位=带外 C2 黑名单)。收 microVM 出网走下面的 egress_allowlist(#39,tap 级 iptables 白名单)。
-  guardrail_managed_by_stack: false  # true=CDK 用 aws_bedrock.CfnGuardrail 从 deploy/runtime-config-export/bedrock-guardrail.json 建 Bedrock Guardrail,id 写 SSM /openclaw/bedrock-guardrail-id(LiteLLM userdata/apply-hardening.sh 都从 SSM 读、不硬编码)。默认 false 保存量兼容——存量账号已有 apply-hardening.sh 建过的 Guardrail(=od6s8sm533fs)保持 false,LiteLLM 继续走硬编码兜底 id。切 true 前必须先把带外那个 Guardrail 改名或删了,否则 CFN 建同名 Guardrail 冲突。#80。
+  guardrail_managed_by_stack: false  # true=CDK 用 aws_bedrock.CfnGuardrail 从 deploy/runtime-config-export/bedrock-guardrail.json 建 Bedrock Guardrail,id 写 SSM /openclaw/bedrock-guardrail-id(LiteLLM userdata/apply-hardening.sh 都从 SSM 读、不硬编码)。默认 false 保存量兼容——存量账号已有 apply-hardening.sh 建过的 Guardrail(795=od6s8sm533fs)保持 false,LiteLLM 继续走硬编码兜底 id。切 true 前必须先把带外那个 Guardrail 改名或删了,否则 CFN 建同名 Guardrail 冲突。#80。
 
   # ── #39 microVM 出网默认拒绝白名单(L4 tap 级 iptables egress allowlist)──
   # false(默认)= 现状:launch-vm.sh 末尾 FORWARD ACCEPT 放行 guest→全部公网出网(零变化)。
@@ -523,12 +523,13 @@ ai_gateway:
   ha_enabled: false
 
 # ========== 黄金镜像 ==========
-# 控制面部署时由栈内 CodeBuild 烤镜像(buildspec-golden-image.yml),ASG 依赖它
-# 完成后才起 host —— 解"host 抢在镜像就绪前启动"的鸡生蛋死结,无需手动两阶段。
+# 独立 OpenClawImage stack 用 CodeBuild 烤镜像(buildspec-golden-image.yml),#283
+# 拆出主 stack 且非阻塞:build 失败只回滚 OpenClawImage,不连累控制面/数据面。
+# 主 stack 不再依赖镜像就绪 —— 全新 region 首个 host 可能抢在镜像烤好前启动、
+# lifecycle-hook 超时 churn 几分钟(非部署失败),镜像烤完自愈。
 image:
   version: "v1.0"                  # 黄金镜像版本(CodeBuild 烤 + manifest 校验对齐)。
-  build_in_stack: true             # true=独立 OpenClawImageStack 触发 CodeBuild 烤镜像,非阻塞(#283 拆分后);
-                                   #   主 stack 不等镜像就绪,build 失败不影响控制面/数据面,ImageStack 烤完自愈。
+  build_in_stack: true             # true=部署 OpenClawImage stack 触发 CodeBuild 烤镜像(非阻塞,#283);
                                    # false=跳过(沿用桶里已有镜像,或自己跑 build-rootfs-on-ec2.sh)。
 
 # ========== 可观测性:数据面日志管道(issue #219 / #209 spec)==========

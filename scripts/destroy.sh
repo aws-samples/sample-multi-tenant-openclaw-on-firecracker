@@ -31,10 +31,12 @@ if $PURGE && [ -n "${ASSETS_BUCKET:-}" ]; then
   aws s3 rm "s3://$ASSETS_BUCKET" --recursive --profile "$PROFILE" --region "$REGION" 2>/dev/null || true
 fi
 
-# CDK destroy
-echo "→ Destroying CDK stack..."
-cd "$SCRIPT_DIR/deploy"
-PATH=".venv/bin:$PATH" cdk destroy -c region="$REGION" --profile "$PROFILE" --force
+# CDK destroy — --all covers both OpenClawOrchestrator and OpenClawImage
+# (golden-image bake split into its own stack, #283). Without --all, a
+# multi-stack app errors: "specify which stacks to use ... or specify --all".
+echo "→ Destroying CDK stacks..."
+cd "$SCRIPT_DIR"
+PATH="deploy/.venv/bin:$PATH" cdk destroy --all -c region="$REGION" --profile "$PROFILE" --force
 
 if $PURGE; then
   echo "→ Purging retained resources..."

@@ -436,6 +436,36 @@ def build_observability(self, ctx):
         description="HTTPS from AOS rolesmapping bootstrap Lambda SG",
     )
 
+    # Secrets Manager Interface VPCE:AosRolesMapFn 在 VPC 内,运行时 boto3 调 secretsmanager
+    # 取 AOS master 口令。imported 客户 VPC 无法保证 private 子网真有 NAT 出网(from_vpc_attributes
+    # 只按名字当 egress,不验路由)——2026-07-17 真机实撞:主栈部署到 AOS rolesmapping 时 Lambda
+    # `Connect timeout on secretsmanager.<region>.amazonaws.com` → 整栈 ROLLBACK(#295,codex 判根因)。
+    # VPCE 走 VPC 内直达(private_dns 让标准域名自动导向,代码不改),不依赖 NAT,对 imported/self_managed
+    # 都普适(客户 imported VPC 大概率也没这个 VPCE)。无条件建(测试+生产都需要;Interface VPCE 月费
+    # 可接受,换 one-shot 可靠)。SG 只放 rolesmapping Lambda SG 443。
+    _sm_vpce_sg = ec2.SecurityGroup(
+        self,
+        "SecretsManagerVpceSg",
+        vpc=vpc,
+        description="Secrets Manager VPCE - 443 from AOS rolesmapping Lambda SG only",
+        allow_all_outbound=False,
+    )
+    _sm_vpce_sg.add_ingress_rule(
+        peer=ec2.Peer.security_group_id(_rmap_sg.security_group_id),
+        connection=ec2.Port.tcp(443),
+        description="HTTPS from AOS rolesmapping Lambda",
+    )
+    _sm_vpce = ec2.InterfaceVpcEndpoint(
+        self,
+        "SecretsManagerVpce",
+        vpc=vpc,
+        service=ec2.InterfaceVpcEndpointAwsService.SECRETS_MANAGER,
+        private_dns_enabled=True,
+        open=False,
+        security_groups=[_sm_vpce_sg],
+        subnets=ec2.SubnetSelection(subnets=_subnets),
+    )
+
     # onEvent handler(纯 stdlib urllib + ssl,无三方依赖;boto3 为 Lambda 运行时自带)。
     # Create/Update:取口令 → basic-auth GET 现有 all_access 映射 → 并集 backend_roles
     #   → PUT。幂等(已含该 ARN 则不重复)。域刚就绪/ENI 冷启的瞬态做退避重试。
@@ -573,6 +603,8 @@ def build_observability(self, ctx):
     _rmap_cr.node.add_dependency(log_domain)
     for _s in _all_streams:
         _rmap_cr.node.add_dependency(_s)
+    # VPCE 必须先就绪:Lambda 运行时经它调 secretsmanager 取口令(否则 imported VPC 无 NAT 时超时)。
+    _rmap_cr.node.add_dependency(_sm_vpce)
 
     # #219 修复(真机 us-east-1 2026-07-14):edge 的 Fluent Bit 用 **edge instance
     # role** 调 firehose:PutRecordBatch 往 edge stream 送 nginx access log,但此前

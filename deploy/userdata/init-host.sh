@@ -31,14 +31,31 @@ trap _complete_hook EXIT
 # Query stack outputs — retries because the host can race ahead of CFN
 # finalising outputs / setup.sh uploading scripts to S3 (issue: real-deploy
 # regression surfaced in v1.0 E2E).
+# $1 = output key. Matches by EXACT key first, then falls back to a prefix/
+# substring match — CDK prefixes outputs defined inside a nested Construct with
+# the construct path + a hash suffix (e.g. the DispatchInfra construct turns
+# `AssignmentsTableName` into `DispatchAssignmentsTableName676F1D7B`). Querying
+# the bare name would never match → the retry loop below burns the full
+# 20×15s=5min then gives up empty, silently, on every host boot → blows the ASG
+# lifecycle heartbeat → ABANDON. So we grep the full output list for `<key>` as
+# a substring after the exact match misses.
+# $2 = "optional": single attempt, no 5-min retry (key legitimately may not
+# exist, e.g. dispatch disabled). Absent = required, retry up to 5 min for the
+# chicken-and-egg window (host launches mid-CREATE, before outputs are visible).
 _stack_output() {
-  for _i in $(seq 1 20); do
-    val=$(aws cloudformation describe-stacks --stack-name OpenClawOrchestrator \
-      --query "Stacks[0].Outputs[?OutputKey==\`$1\`].OutputValue" --output text --region ${REGION} 2>/dev/null)
+  _key="$1"; _optional="${2:-}"
+  _attempts=20; [ "$_optional" = "optional" ] && _attempts=1
+  for _i in $(seq 1 "$_attempts"); do
+    # one describe-stacks, then match exact-or-substring locally (avoids a
+    # second API call and resolves nested-construct suffixed keys).
+    _all=$(aws cloudformation describe-stacks --stack-name OpenClawOrchestrator \
+      --query "Stacks[0].Outputs[].[OutputKey,OutputValue]" --output text --region ${REGION} 2>/dev/null)
+    val=$(printf '%s\n' "$_all" | awk -v k="$_key" '$1==k{print $2; found=1; exit} END{if(!found)exit 1}')
+    [ -z "$val" ] && val=$(printf '%s\n' "$_all" | awk -v k="$_key" 'index($1,k){print $2; exit}')
     if [ -n "$val" ] && [ "$val" != "None" ]; then echo "$val"; return; fi
-    sleep 15
+    [ "$_i" -lt "$_attempts" ] && sleep 15
   done
-  echo "" # 5 minutes elapsed; give up
+  echo "" # gave up (required: 5 min elapsed; optional: single miss)
 }
 
 # S3 download with retries (scripts are uploaded by setup.sh AFTER cdk deploy
@@ -83,7 +100,7 @@ fi
 # host 不转发也守住 IPv6 IMDS fd00:ec2::254。
 sysctl -q -w net.ipv6.conf.all.forwarding=0 2>/dev/null || true
 # nf_conntrack table sizing for NFR-3 (the data-plane contract / the data-plane design
-# the requirements doc): a single r8g.metal-24xl runs up to 400 microVMs, each
+# the requirements doc NFR-3): a single r8g.metal-24xl runs up to 400 microVMs, each
 # with 2-3 outbound WS + per-tap DNAT rules. Kernel default nf_conntrack_max is
 # 262144 on Ubuntu 22.04 aarch64 which the host can blow past under peak fan-in
 # well before all 400 tenants are active. Load the module first (host may not
@@ -134,9 +151,11 @@ log "firecracker ${FC_VER} installed"
 HOSTS_TABLE=$(_stack_output HostsTable)
 TENANTS_TABLE=$(_stack_output TenantsTable)
 # SQS dispatch 二期 pull 模式:host-agent 从 openclaw-assignments 拉每台 host 的
-# desired 状态。栈没启用 dispatch(config.yml dispatch.enabled=false)时 output 不存在,
-# _stack_output 会打印 "None" → 我们清空,让 host-agent 不启 dispatch 线程(零变化)。
-ASSIGNMENTS_TABLE=$(_stack_output AssignmentsTable)
+# desired 状态。真实 output key 是 `DispatchAssignmentsTableName<hash>`(定义在
+# DispatchInfra 构造内,CDK 自动前缀化)——_stack_output 现按子串匹配 `AssignmentsTable`
+# 命中它。dispatch 关时该 output 不存在 → 传 optional 单次探测不空烧 5min,
+# 清空让 host-agent 不启 dispatch 线程(零变化)。
+ASSIGNMENTS_TABLE=$(_stack_output AssignmentsTable optional)
 # Fallback to known constants if stack outputs aren't ready yet (chicken-
 # and-egg: outputs only become visible AFTER the stack reaches
 # CREATE_COMPLETE, but the host is launched mid-CREATE by the ASG).
@@ -169,6 +188,7 @@ ASSETS_BUCKET=${ASSETS_BUCKET}
 BACKUP_BUCKET=${BACKUP_BUCKET}
 BACKUP_CMK_KEY_ID=${BACKUP_CMK_KEY_ID}
 TENANTS_TABLE=${TENANTS_TABLE}
+TENANT_SECRETS_TABLE=openclaw-tenant-secrets
 HOSTS_TABLE=${HOSTS_TABLE}
 ASSIGNMENTS_TABLE=${ASSIGNMENTS_TABLE}
 INSTANCE_ID=${INSTANCE_ID}

@@ -405,9 +405,23 @@ aws s3 cp "$SCRIPT_DIR/deploy/userdata/adot-config.yaml" "s3://${BUCKET}/deploym
 # host/edge 重建 / systemd reload 时会拉到新版(不开热注入,铁律#3)。
 _OBS_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 _OBS_COMMIT="$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+# 跨平台 sha256:Linux(bastion/AL2023)只有 sha256sum,macOS 只有 shasum。之前硬用 shasum
+# 在 AL2023 上 `command not found`,叠加 `set -euo pipefail` 让 setup.sh 恰好卡在第一个
+# _obs_upload,后续 launch-vm/stop-vm/harden-config 全没上传 → host init fail-loud fast-ABANDON
+# (2026-07-17 新加坡 8 连 ABANDON 真根因,非 hook 超时)。挑存在的那个;两个都没有 fail-loud
+# 中止(codex 重审3:别静默上传空 sha 摘要降低证据完整性,宁停不吞)。
+_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}';
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}';
+  else echo "FATAL: 无 sha256sum/shasum,装一个再部署(证据摘要不可空)" >&2; return 1; fi
+}
 _obs_upload() {
   local src="$1" key="$2"
-  local sha; sha=$(shasum -a 256 "$src" | awk '{print $1}')
+  local sha; sha=$(_sha256 "$src") || return 1
+  # 校验是 64 位十六进制(codex 重审4#8:防工具输出格式异常静默写坏摘要)
+  if ! echo "$sha" | grep -qiE '^[0-9a-f]{64}$'; then
+    echo "FATAL: sha256($src) 格式非法: '$sha'(期望 64 hex)" >&2; return 1
+  fi
   aws s3 cp "$src" "s3://${BUCKET}/${key}" \
     "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet \
     --metadata "sha256=${sha},uploaded-at=${_OBS_TS},git-commit=${_OBS_COMMIT}"
@@ -470,7 +484,7 @@ aws s3 cp "$SCRIPT_DIR/deploy/userdata/stop-all-vms.sh" "s3://${BUCKET}/deployme
 # 不再单独上传 launch-all-vms.sh。launch-vm.sh 的上传在上方(第 415 行)。
 
 # #187 转型:claw-hub(WebSocket 中枢)数据面已下线。install-hub.sh + deploy/hub/
-# 全部归档到 engineering/04-archive/p4-cutover-deprecated/。数据面改两级路由
+# 全部归档到 an internal archive。数据面改两级路由
 # 直连 microVM 原生 gateway(ALB LOR → OpenResty edge → Redis → host DNAT →
 # microVM:18789),setup.sh 不再上传 hub 资产;init-host.sh 里 install-hub.sh
 # 引用也应一并删(独立 issue,同 stack.py CloudFront /hub behavior + HubTG 收尾)。

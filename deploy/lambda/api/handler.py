@@ -11,6 +11,37 @@ from botocore.exceptions import ClientError  # process_pending CAS 认领(#9 跨
 from core.logging import logger, inject_trace_root, reset_invocation_keys
 
 
+def _resolve_proxy_route(method, path, route_keys):
+    """#298 — 私有 API 是 `{proxy+}` 代理,event["resource"] 恒为 `/{proxy+}`,与 handler 按
+    resource 模板分发的 routes 对不上(除 /ping 外全 404)。这里把具体 path(如 /tenants/abc/stop)
+    按已注册的路由模板(routes.keys(),唯一真相源,不另维护清单免漂移)反解成 (resource_template,
+    path_params)。段数相等 + 逐段(字面量相等 或 {param} 占位)匹配;字面量段更多者优先(/tenants/self
+    胜 /tenants/{id}),杜绝跨模板误路由。无匹配返 (None, {})。EDGE API 走显式资源不进这里。
+    """
+    segs = [s for s in path.split("/") if s]
+    best = None  # (resource_template, params, literal_count)
+    for m, tmpl in route_keys:
+        if m != method:
+            continue
+        tsegs = [s for s in tmpl.split("/") if s]
+        if len(tsegs) != len(segs):
+            continue
+        params = {}
+        literal = 0
+        ok = True
+        for a, b in zip(tsegs, segs):
+            if a.startswith("{") and a.endswith("}"):
+                params[a[1:-1]] = b
+            elif a == b:
+                literal += 1
+            else:
+                ok = False
+                break
+        if ok and (best is None or literal > best[2]):
+            best = (tmpl, params, literal)
+    return (best[0], best[1]) if best else (None, {})
+
+
 # ============================================================
 # Groups CRUD (1.4.0 / #62)
 # ============================================================
@@ -257,6 +288,18 @@ def lambda_handler(event, context):
         ("POST", "/recipient-key/disable"): lambda: _disable_recipient_key(event),
         ("GET", "/clawpool-rsa-public-key"): lambda: _get_clawpool_rsa_public_key(),
     }
+
+    # #298 — 私有 API 用 `{proxy+}` 代理时 resource 恒为 `/{proxy+}`,不匹配任何真实模板。
+    # 用 event["path"](已剥 stage 前缀的资源路径)按 routes.keys() 反解成真实 resource 模板 +
+    # path_params,并原地更新(routes 里的 lambda 闭包引用同一个 path_params 字典,看得到更新)。
+    # 只在 proxy 占位符时介入;EDGE API 的显式 resource 原样不动,零行为变化。
+    if resource == "/{proxy+}":
+        _resolved, _pp = _resolve_proxy_route(
+            method, event.get("path", ""), routes.keys()
+        )
+        if _resolved is not None:
+            resource = _resolved
+            path_params.update(_pp)
 
     handler = routes.get((method, resource))
     if not handler:
@@ -660,7 +703,7 @@ def tenant_match(query_params=None):
     Pre-login lookup: the browser calls this BEFORE any Cognito login to learn which
     upstream IdP (Cognito provider name) to federate to for a given external platform,
     then does federatedSignIn(customProvider=<idp_provider_name>). Read-only, leaks no
-    tenant data — only the platform→IdP routing (the design doc §2.7). Mirrors aws-samples/
+    tenant data — only the platform→IdP routing (the data-plane design §2.7). Mirrors aws-samples/
     amazon-cognito-example-for-multi-tenant TenantAPI.ts:13-22 (there keyed by email
     domain; here by explicit platform_id).
 
@@ -1447,7 +1490,7 @@ def batch_tenants(body=None, event=None):
 # GOAL: the control plane consumes 380 (×N hosts) openclaw start/stop within 1
 # minute. The per-tenant path (batch_tenants → tenant_action → one SSM per VM)
 # can't: SSM single-instance concurrency caps at ~5-10, so 380 commands serialize
-# and 40 concurrent already TimedOut 11 (measured on ). The fix is HOST-LEVEL
+# and 40 concurrent already TimedOut 11 (measured on 795). The fix is HOST-LEVEL
 # fan-out: send ONE SSM command per host (start-all-vms.sh / stop-all-vms.sh),
 # and each host starts/stops all its local VMs in bounded parallel. SSM
 # concurrency then equals the number of HOSTS (single/low-double digits), not the

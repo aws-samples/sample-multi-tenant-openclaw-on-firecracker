@@ -1,0 +1,8 @@
+{
+  "synced_at": "2026-07-17 23:34 (UTC+8)",
+  "summary": "Sync post-#311 data-plane fixes from internal main: paired.json + gateway token re-injection on VM recovery/rebuild (previously skipped under the NEW_DATA write gate, causing NOT_PAIRED after image update).",
+  "updated_files": [
+    "deploy/lambda/api/services/tenant_service.py — persist device_paired_b64 to tenants table + fallback; paired-device backfill",
+    "deploy/userdata/launch-vm.sh — recovery relaunch re-injects paired.json / gateway token"
+  ]
+}

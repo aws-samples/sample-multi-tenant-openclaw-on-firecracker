@@ -99,7 +99,7 @@ _PURCHASE_PROVISIONED = "provisioned"
 _TENANT_SECRET_FIELDS = (
     "channel_secret",
     "litellm_vkey",
-    "cognito_channel_password",  #  — machine-user password, never to browser
+    "cognito_channel_password",  # WI-002 — machine-user password, never to browser
     "gateway_token",  # #100 — per-tenant bearer protecting the gateway control UI;
     # GET /tenants was leaking it in plaintext, letting one x-api-key harvest EVERY
     # tenant's gateway_token (credential batch-exposure). Server-side only (see :1092).
@@ -155,12 +155,12 @@ def _redact_tenant(item):
     return {k: v for k, v in item.items() if k not in _TENANT_SECRET_FIELDS}
 
 
-# ── #187 P1 — pre-mint gateway token + reveal (the data-plane design D 段)──────
+# ── #187 P1 — pre-mint gateway token + reveal (11-ENGINE-TRANSFORM D 段)──────
 # 建租户时预铸 32 字节随机 token,KMS 信封绑 tenant_id 加密,密文与 expires_at=now+900
 # 一起落 openclaw-tenant-secrets 表。SSM 命令把密文按位置 12 传给 launch-vm.sh;host
 # 用同一 tenant_id ctx 解密后写入 openclaw.json 的 `.gateway.auth.token`。
 #
-# **API 侧不解密**(design decision 两次纠正 · the data-plane contract):控制平面调用方
+# **API 侧不解密**(design decision · INTERFACE-CONTRACT §5):控制平面调用方
 # 建租户后本就在 loop 里轮询状态,一旦查到 running 就绪、就在 GET /tenants/{id} 的
 # 响应里带回 gateway_token **密文原样**(base64 信封密文);GET /tenants/{id}/token
 # 保留作等价别名,同样只返密文。**调用方自己拿 KMS Decrypt**(它有 kms:Decrypt +
@@ -367,6 +367,37 @@ def build_paired_json_b64(device):
         }
     }
     return _b64.b64encode(json.dumps(paired).encode()).decode()
+
+
+def persist_device_paired_b64(tenant_id, device_paired_b64):
+    """#314(codex review 缺陷2 修复):把 device_paired_b64 长期存 tenants 表(无 TTL),
+    带一次重试 + fail-loud。dispatch 与 sync 两条创建路径共用,避免重复内联。
+
+    device_paired_b64 是 launch-vm restart/镜像更新自愈重注入 paired.json 的唯一长期
+    来源(tenant_secrets 不存该组装字段)。写失败若静默吞 → 该租户 data 盘丢失后无源重建
+    → NOT_PAIRED 无告警。这里 DDB 瞬时失败重试一次(消化大部分),仍失败则 print ERROR
+    醒目告警(不阻塞 create——paired 是增强;且 launch-vm 侧对读到空会按需 backfill 兜底)。
+    返回 True/False 供调用方按需处理。
+    """
+    if not device_paired_b64:
+        return False
+    for _attempt in (1, 2):
+        try:
+            clients.tenants_table.update_item(
+                Key={"id": tenant_id},
+                UpdateExpression="SET device_paired_b64 = :dpb",
+                ExpressionAttributeValues={":dpb": device_paired_b64},
+            )
+            return True
+        except Exception as e:  # noqa: BLE001 — 重试一次;仍失败 fail-loud 不吞
+            if _attempt == 2:
+                print(
+                    f"[#314][ERROR] persist device_paired_b64 to tenants table FAILED "
+                    f"after retry for {tenant_id}: {type(e).__name__}: {e} — "
+                    f"该租户 data 盘丢失后将无源重建 paired.json(NOT_PAIRED),"
+                    f"依赖 launch-vm 侧 backfill 兜底或运维 reconciliation"
+                )
+    return False
 
 
 def read_gateway_token_ct(tenant_id):
@@ -888,7 +919,7 @@ def create_tenant(body=None, event=None, _canary_host=None):
     # per-tenant chatCompletions switch (default off = secure default). Only
     # tenants explicitly created with chat_endpoint_enabled=true get the
     # OpenAI-compatible HTTP endpoint; launch-vm.sh injects enabled:true for them
-    # and deletes the endpoint for everyone else. See the ops guide security decision.
+    # and deletes the endpoint for everyone else. See CLAUDE.md security decision.
     # #95 adversarial C-017: bool("false") / bool("0") are both True, so a JSON
     # string used to silently OPEN this deviceAuth-bypassing endpoint. This is a
     # secure-default switch — accept only a real JSON boolean; anything else
@@ -1114,6 +1145,16 @@ def create_tenant(body=None, event=None, _canary_host=None):
                 # owner==API_KEY_OWNER / 空 → mint_device_identity 返 None → paired 空。
                 _device = mint_device_identity(tenant_id, owner_id)
                 device_paired_b64 = build_paired_json_b64(_device)
+                # #312 — device_paired_b64 是 paired.json(deviceId+publicKey+roles+
+                # scopes,**无私钥**,纯公开信息)。除了随 dispatch manifest 一次性下发,
+                # 还长期存进 tenants 表(无 TTL)。根因:device 私钥密文在 tenant_secrets
+                # 表有 15min TTL,几小时后 restart/recovery(镜像更新自愈)时 #290 DDB
+                # fallback 拿到空 → launch-vm 无法重注入 paired.json → 网关读到空盘配对
+                # → 前端 NOT_PAIRED(新加坡真机复现 + message-handler.ts:786 getPairedDevice
+                # → isPaired=false)。paired.json 本身无私钥,长期留存不泄密,让 launch-vm
+                # 每次(重)启动都能从 tenants 表幂等重建 approved backend 条目。
+                # #314 — 带重试 + fail-loud 的持久化(dispatch 路径)。
+                persist_device_paired_b64(tenant_id, device_paired_b64)
             except Exception as e:  # noqa: BLE001 — 可选增强,失败不回滚
                 print(
                     f"[#188] dispatch mint_device_identity failed (non-fatal): "
@@ -1238,7 +1279,7 @@ def create_tenant(body=None, event=None, _canary_host=None):
     # 64 hex chars == openssl rand -hex 32 (the format launch-vm.sh used).
     channel_secret = secrets.token_hex(32)
 
-    # #187 P5 — Cognito 渠道机器用户()随 channel/hub 一起下线;数据面走
+    # #187 P5 — Cognito 渠道机器用户(WI-002)随 channel/hub 一起下线;数据面走
     # 两级路由到 microVM:18789 gateway,鉴权改走 gateway 原生 token。
 
     # Find host with capacity. The scheduler is normally automatic, but
@@ -1649,6 +1690,13 @@ def create_tenant(body=None, event=None, _canary_host=None):
             # 组装成 paired.json base64 传给 launch-vm 冷注入(#188 免人工 approve)。
             _device = mint_device_identity(tenant_id, owner_id)
             device_paired_b64 = build_paired_json_b64(_device)
+            # #312 — 同步/pinned 创建路径(canary 灰度 / preferred_host_id / clone)与
+            # dispatch 路径(:1125)同样必须把 device_paired_b64 长期存 tenants 表(无 TTL)。
+            # 否则这类租户某次 4 参 restart 若盘上 paired.json 恰空,三级回落全空
+            # (位置参空 → tenant_secrets 无此组装字段 → tenants 表也没有)→ NOT_PAIRED
+            # 无源重建。device_paired_b64 无私钥,长期留存不泄密。
+            # #314 — 带重试 + fail-loud 的持久化(sync/pinned 路径,与 dispatch 共用 helper)。
+            persist_device_paired_b64(tenant_id, device_paired_b64)
         except Exception as e:  # noqa: BLE001 — 可选增强,失败不回滚租户
             print(
                 f"[#10] mint_device_identity failed (non-fatal): {type(e).__name__}: {e}"
@@ -1697,7 +1745,7 @@ def create_tenant(body=None, event=None, _canary_host=None):
         litellm_vkey=tenant_vkey or "",  # task #15 per-tenant billing key
         channel_secret=channel_secret,  # mint-up-front (kills hub handshake race)
         chat_endpoint_enabled=chat_endpoint_enabled,  # per-tenant chatCompletions
-        gateway_token_ct=gateway_token_ct,  # #187 P1 — the data-plane design D
+        gateway_token_ct=gateway_token_ct,  # #187 P1 — SPEC/11-ENGINE-TRANSFORM D
         device_paired_b64=device_paired_b64,  # #188 — paired.json 冷注入(免 approve)
     )
     # loop 2026-07-01 bugfix: launch-vm's SSM SendCommand can be throttled when

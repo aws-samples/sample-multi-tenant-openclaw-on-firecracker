@@ -1,46 +1,54 @@
-# Patch #311 · 第 2 层:Lambda 代码修复(需重部署函数)
+# Patch 311 — Layer 2: Lambda code fixes (redeploy the function)
 
-这一层的修复在**控制面 API Lambda** 里,不能靠替换 host 脚本生效,必须更新 Lambda 函数代码。
+These fixes live in the control-plane API Lambda. They cannot be applied by
+swapping a host script — the Lambda function code must be updated.
 
-## 涉及的修复
+## What this layer fixes
 
-| 修复 | 文件 | 解决什么 | 谁需要 |
-| ---- | ---- | -------- | ------ |
-| #298 | `deploy/lambda/api/handler.py` | 纯私有 API(`{proxy+}` 集成)下 handler 按 resource 分发与 `/{proxy+}` 对不上,除 `/ping` 外全 404 → 数据面基准跑不通 | **只有走私有 API 姿态的部署需要**(公有 API 网关不受影响) |
-| #303/#304/#305 | `deploy/lambda/api/services/tenant_service.py`、`host_service.py` | rebuild/restart 语义:升级必须走 rebuild(丢 overlay + 采用校验),restart 只软重启;升级采用校验防版本谎报;存量数据盘遇模板尺寸漂移不重建(防数据丢失) | 所有做镜像升级 / rebuild 的部署 |
+| Fix | File | What it solves | Who needs it |
+| --- | ---- | -------------- | ------------ |
+| Private-API routing | `deploy/lambda/api/handler.py` | On a private API (a `{proxy+}` integration), `event["resource"]` is always `/{proxy+}`, so the handler's resource-template dispatch matches nothing and every route except `/ping` returns 404. The fix resolves the concrete path against the registered route templates. | **Private-API deployments only** (public API Gateway is unaffected). |
+| Rebuild / restart semantics | `deploy/lambda/api/services/tenant_service.py`, `host_service.py` | A rootfs upgrade must go through `rebuild` (drop the overlay + verify adoption), not `restart` (which keeps the old overlay -> half-new/half-old). Adds adoption verification so the version is stamped only after the VM actually boots the new rootfs, and keeps an existing data disk instead of rebuilding it on a template size drift (which would lose data). | Any deployment that upgrades images / rebuilds. |
 
-## 怎么应用
+## How to apply
 
-这些是 CDK 管理的 Lambda(源码在 `deploy/lambda/api/`)。两种更新方式,任选其一:
+These are CDK-managed Lambdas (source under `deploy/lambda/api/`). Either method:
 
-### 方式 A:整栈 `cdk deploy`(推荐,一并带上第 3 层 CDK 修复)
+### Method A: full `cdk deploy` (recommended — also carries Layer 3)
 
 ```bash
-# 从仓库根,用你的部署方式(见主 README / setup.sh):
-bash setup.sh <region> <profile-or-dash>   # profile 传 "-" = 走 instance role
-# 或直接: cdk deploy OpenClawOrchestrator --require-approval never -c region=<region>
+# From the repo root, using your deploy method (see the top-level README / setup.sh):
+bash setup.sh <region> <profile-or-dash>   # pass "-" as the profile to use the instance role
+# or: cdk deploy OpenClawOrchestrator --require-approval never -c region=<region>
 ```
 
-`cdk deploy` 会把 `deploy/lambda/api/` 的最新源码重新打包上传到 API Lambda,#298 + #303-305 一起生效。**这也是第 3 层(#307 IAM grant / #310 VPCE 开关)生效的方式** —— 一次 deploy 全带上,最省事。
+`cdk deploy` repackages the latest `deploy/lambda/api/` source onto the API Lambda,
+applying both fixes at once. This is also how Layer 3 (the IAM grant and the
+VPC-endpoint toggle) takes effect — one deploy covers everything.
 
-### 方式 B:只更新 API Lambda 函数代码(不做全栈 deploy)
-
-若你只想更新函数、不动其它资源:
+### Method B: update the API Lambda code only (no full stack deploy)
 
 ```bash
-# 1. 打包 API Lambda 源码(从仓库根)
+# 1. Package the API Lambda source (from the repo root)
 cd deploy/lambda/api && zip -r /tmp/api-lambda.zip . && cd -
-# 2. 找到 API 函数名(从栈输出或控制台;通常含 "OpenClawOrchestrator" + "ApiFn")
+# 2. Find the API function name (from stack outputs or the console; usually
+#    contains "OpenClawOrchestrator" and "ApiFn")
 FN=$(aws lambda list-functions --region <region> \
   --query "Functions[?contains(FunctionName,'ApiFn')].FunctionName" --output text)
-# 3. 覆盖代码
+# 3. Update the code
 aws lambda update-function-code --function-name "$FN" \
   --zip-file fileb:///tmp/api-lambda.zip --region <region>
 ```
 
-> ⚠️ 方式 B 只更新代码,**不会**带上第 3 层的 IAM grant(#307)和 VPCE 开关(#310)。若你的环境还没打 host_role 读 tenant-secrets 权限,先跑 `../iam/apply-iam.sh`(见 APPLY-INSTRUCTIONS 的依赖顺序)。
+> Method B updates code only; it does **not** apply the Layer 3 IAM grant or the
+> VPC-endpoint toggle. If the host role does not yet have read access to
+> `openclaw-tenant-secrets`, run `../iam/apply-iam.sh` first (see the dependency
+> order in APPLY-INSTRUCTIONS).
 
-## 验证
+## Verify
 
-- **#298**:私有 API 下 `curl` 一个非 `/ping` 路由(如 `GET /tenants`),应正常返回而非 404。
-- **#303-305**:对一个租户做 rebuild(镜像升级路径),确认:① 存量数据盘保留(没被重建清空);② 版本号只在 VM 真起在新 rootfs 后才更新(不谎报)。
+- **Private-API routing:** on a private API, `curl` a non-`/ping` route (e.g.
+  `GET /tenants`); it should respond instead of returning 404.
+- **Rebuild semantics:** rebuild a tenant (the image-upgrade path) and confirm
+  (1) the existing data disk is preserved, and (2) the version number updates only
+  after the VM actually boots the new rootfs.

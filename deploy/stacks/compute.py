@@ -27,6 +27,7 @@ def build_compute(self, ctx):
     hosts_table = getattr(ctx, "hosts_table", None)
     notifications_topic = getattr(ctx, "notifications_topic", None)
     tenants_table = getattr(ctx, "tenants_table", None)
+    tenant_secrets_table = getattr(ctx, "tenant_secrets_table", None)
 
     # ========== Host EC2 Role (SSM + S3 backup + self-register) ==========
     host_role = iam.Role(
@@ -54,6 +55,13 @@ def build_compute(self, ctx):
         clawpool_rsa_cmk.grant_decrypt(host_role)
     hosts_table.grant_read_write_data(host_role)
     tenants_table.grant_read_write_data(host_role)  # host-agent writes health status
+    # #290 DDB fallback:dispatch/recovery 路径位置参 12/13 空时,launch-vm.sh 以 host
+    # instance-role get-item openclaw-tenant-secrets 读 gateway_token_ct/device_paired_b64
+    # (fail-closed:读失败即拒起)。缺此 grant → AccessDenied → 纯 CDK one-shot 部署的
+    # host 每次 fallback 都拒起、租户卡 creating(新加坡靠手工 inline policy 顶着)。只读:
+    # host 从不写该表(mint 归 api_fn),密文解密另靠 CMK grant(权限分离)。
+    if tenant_secrets_table is not None:
+        tenant_secrets_table.grant_read_data(host_role)
     host_role.add_to_policy(
         iam.PolicyStatement(
             actions=["autoscaling:CompleteLifecycleAction"],

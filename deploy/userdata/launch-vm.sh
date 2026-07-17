@@ -457,6 +457,34 @@ if [ -z "${RESTORE_KEY}" ] || [ -z "${CONFIG_TEMPLATE}" ]; then
     exit 1
   fi
 fi
+# #290 fix(token 漂移级):host-agent _recover_vm / _force_relaunch_vm 只传 4 位置参数,
+# 位置 12/13(gateway_token_ct / device_paired_b64)为空。若此时 NEW_DATA=true(首次
+# 建盘或数据盘被清),token 注入段会走 openssl rand 回退,产出的 token 跟 DDB 里控制
+# 面 mint 的不一致 → JDWS 拿到 DDB 的 A,VM 实际是 B → 连不上。
+# 修法同 #199 模式:位置参数空时从 tenant_secrets 表回退读取。fail-CLOSED:读失败即
+# 中止(throttle/IAM/network),绝不用随机 token 覆盖已 mint 的 token。
+if [ -z "${INJECTED_GATEWAY_TOKEN_CT}" ] || [ -z "${INJECTED_DEVICE_PAIRED_B64}" ]; then
+  _SECRETS_TABLE="${TENANT_SECRETS_TABLE:-openclaw-tenant-secrets}"
+  if _SEC_RAW="$(aws dynamodb get-item \
+    --table-name "${_SECRETS_TABLE}" \
+    --key "{\"tenant_id\":{\"S\":\"${TENANT_ID}\"}}" \
+    --projection-expression 'gateway_token_ct, device_paired_b64' \
+    --consistent-read \
+    --region "${OC_REGION:-ap-northeast-1}" \
+    --output json 2>/dev/null)"; then
+    [ -z "${INJECTED_GATEWAY_TOKEN_CT}" ] && INJECTED_GATEWAY_TOKEN_CT="$(printf '%s' "${_SEC_RAW}" | jq -r '.Item.gateway_token_ct.S // ""' 2>/dev/null || true)"
+    [ -z "${INJECTED_DEVICE_PAIRED_B64}" ] && INJECTED_DEVICE_PAIRED_B64="$(printf '%s' "${_SEC_RAW}" | jq -r '.Item.device_paired_b64.S // ""' 2>/dev/null || true)"
+    # 不能用 log():它定义在本块之后(GUEST_MAC 段),set -e 下此处调用 rc=127
+    # 直接退出——恰在 fallback 读到 token 的成功路径上崩,#290 修复被自己废掉。
+    # 与本块 else 分支同款,直接 echo。
+    [ -n "${INJECTED_GATEWAY_TOKEN_CT}" ] && echo "[oc:launch] DDB fallback: got gateway_token_ct from ${_SECRETS_TABLE} (#290)"
+    [ -n "${INJECTED_DEVICE_PAIRED_B64}" ] && echo "[oc:launch] DDB fallback: got device_paired_b64 from ${_SECRETS_TABLE} (#290)"
+  else
+    echo "[oc:launch] FATAL(#290): DDB get-item for gateway_token_ct/device_paired_b64 failed (throttle/IAM/network) — fail-closed, scheduler will retry" >&2
+    exit 1
+  fi
+  unset _SEC_RAW _SECRETS_TABLE
+fi
 # #41 — harden-config.sh 提供 POSIX sh 幂等 openclaw.json 收敛函数
 # (oc_harden_config + oc_normalize_litellm_baseurl)。launch-vm.sh 每次启动都调
 # oc_harden_config,不管 fresh/wake,收敛部署相关值(CloudFront origin/LiteLLM
@@ -533,8 +561,16 @@ NEEDS_INIT=false
 if [ ! -f "${DATA_VOL}" ]; then
   NEEDS_INIT=true
 elif [ -z "${RESTORE_KEY}" ] && [ "$(stat -c%s ${DATA_VOL})" != "${DATA_SIZE}" ]; then
-  # Template size drift — rebuild only if we're using the template path.
-  NEEDS_INIT=true
+  # #303 数据丢失级修复:一个**已存在**的 data.ext4 是该租户的真实数据盘
+  # (identity/skills/config/channel_secret/vkey/用户数据全在里面)。升级镜像时
+  # refresh_rootfs 会 mv 换新 data-template(host_service.py:377),其逻辑尺寸常
+  # 与租户现有盘不同;而 rebuild/restart 的 wake 传空 RESTORE_KEY。原逻辑在此
+  # 分支 NEEDS_INIT=true → 下面 `rm -f ${DATA_VOL}` 从模板重建 = **静默删光客户数据**
+  # (真机复现:升级后 rebuild 数据全丢)。铁律 no-data-loss:存量盘遇模板尺寸漂移
+  # **绝不重建**,保留原盘照常挂载启动(模板尺寸只是"新建时用多大",不是"存量盘必须
+  # 等于它")。真要扩盘走显式 resize-disk(#22,resize2fs 在线扩,不删数据);真要
+  # 换盘走显式 RESTORE_KEY(下面恢复路径)。这里只对存量盘 fail-safe 保留 + 告警。
+  log "WARN(#303): data.ext4 尺寸($(stat -c%s ${DATA_VOL}))≠ 模板(${DATA_SIZE}),但存量盘含客户数据 — 保留原盘不重建(扩盘用 resize-disk,换盘用 restore)"
 fi
 if [ "${NEEDS_INIT}" = "true" ]; then
   rm -f ${DATA_VOL}
@@ -795,7 +831,11 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
   if [ "$NEW_DATA" = "true" ]; then
     # Download custom template from S3 (if specified). 幂等段跑之前先下,让
     # oc_harden_config 收敛新拉下来的模板;唤醒不重下(会冲掉用户配置)。
-    if [ -n "${CONFIG_TEMPLATE}" ] && [ -n "${ASSETS_BUCKET:-}" ]; then
+    # #301 — "default" 是烤进 rootfs 的基线模板(OC_JSON 已是它),S3 无
+    # templates/openclaw/default/openclaw.json。旧代码对字面 "default" 也 s3 cp →
+    # 404 → set -e 在 token 注入前 die → 半盘 → 重投 token 漂移。跳过 default(与空
+    # 模板同义:都用基线),只对真正的具名自定义模板拉 S3。
+    if [ -n "${CONFIG_TEMPLATE}" ] && [ "${CONFIG_TEMPLATE}" != "default" ] && [ -n "${ASSETS_BUCKET:-}" ]; then
       aws s3 cp "s3://${ASSETS_BUCKET}/templates/openclaw/${CONFIG_TEMPLATE}/openclaw.json" "${OC_JSON}" --region "${OC_REGION:-ap-northeast-1}" --quiet
       log "config template '${CONFIG_TEMPLATE}' applied"
     fi

@@ -399,7 +399,14 @@ fi
     except Exception as e:
         return _resp(500, {"error": str(e)})
 
-    # Mark version as in-flight; host-agent confirms after files are on disk.
+    # #304 — host.rootfs_version = 该 host **已 staged(将服务)**的镜像版本:新建
+    # 租户(tenant_service.py:1536)和 rebuild 采用(:2705)都读它。注意这是异步
+    # send_command,此刻文件可能还没在盘上换完(set -eu + .tmp→mv 保证要么换成功
+    # 要么整段失败,不会半成品;但本函数不等它跑完)。**关键的防谎报在采用侧**:
+    # rebuild 分支(#304)relaunch 后校验 FC 未抱 (deleted) 旧 inode 才把该版本标到
+    # 租户,校验不过就不标 → 即便这里 host 版本先行,租户级 GET /tenants 也不会谎报
+    # "已升级"。原注释宣称"host-agent confirms after files are on disk"是不实的
+    # (host-agent 健康检查不验版本),已删除该说法。
     for host_id in ids:
         hosts_table.update_item(
             Key={"instance_id": host_id},

@@ -1183,7 +1183,7 @@ def create_tenant(body=None, event=None, _canary_host=None):
     # this is NOT a consumer replay, enqueue the create and return 202 — the
     # consumer drains the queue at its reserved-concurrency rate, so a burst of
     # 380 POST /tenants no longer fans out 380 synchronous SSM calls and trips the
-    # SSM single-instance concurrency wall (: 40 concurrent → 11 TimedOut).
+    # SSM single-instance concurrency wall (795: 40 concurrent → 11 TimedOut).
     # Parallelism is preserved: MessageGroupId = tenant_id means every create is
     # its own FIFO group and they consume concurrently (only same-tenant ops
     # serialize). We stamp the already-generated tenant_id into the queued body so
@@ -1929,7 +1929,7 @@ def delete_tenant(tenant_id, query_params, event=None):
         # Stop VM via SSM.
         # #268 — stop-vm 是关键副作用,不是 best-effort:失败=VM 孤儿(fc 进程还活着
         # 占内存/vCPU)+ 若继续标 deleted 则账本回退但 VM 没停(容量统计失真)。真机实测
-        # (新加坡 ,#263 削峰测试):create 的 launch-vm 挤爆单 host SSM
+        # (新加坡 795,#263 削峰测试):create 的 launch-vm 挤爆单 host SSM
         # CommandWorkersLimit=5,delete 的 stop-vm 排队 >30s → _ssm_run 返 False,旧代码
         # 忽略返回值照常标 deleted → 236 残留目录 + 27 孤儿 fc。这里 fail-loud:stop-vm
         # 失败则回滚 status 到删除前(复用 _abort_restore_status,CAS 保证只回滚自己翻的
@@ -2456,6 +2456,11 @@ def tenant_action(tenant_id, action, body=None, event=None):
         )
 
     if action == "restart":
+        # #305 语义边界:restart = 软重启,**保留 overlay.ext4**(per-VM 写时复制层)。
+        # overlay 是叠在共享只读 rootfs 之上的,旧 overlay 是针对旧 rootfs 建的 →
+        # 若镜像升级后用 restart 想让新 rootfs 生效,只会得到"半新半旧"(未被 overlay
+        # COW 覆盖的块才是新的)。**镜像升级必须走 rebuild(丢 overlay + 采用校验),
+        # 不要用 restart**。restart 只用于"不换代码的软重启"(保留运行态数据盘 + overlay)。
         vm_num = int(item.get("vm_num", 1))
         guest_ip = item.get("guest_ip", "")
         host_port = item.get("host_port", "")
@@ -2571,7 +2576,24 @@ def tenant_action(tenant_id, action, body=None, event=None):
         full_cmd = f"{stop_cmd} && {drop_overlay} && sleep 2 && {launch_cmd}"
         if dnat_cmd:
             full_cmd += f" && {dnat_cmd}"
-        ssm_dispatch._ssm_run(item["host_id"], full_cmd, timeout=300)
+        # #304 — 升级采用校验:relaunch 后确认新 FC 打开的 rootfs FD **不是
+        # (deleted)** 旧 inode。refresh_rootfs 用 mv 原子换 rootfs,若旧 FC 没被
+        # stop-vm 真杀掉(cmdline 不匹配/race),新旧并存时老进程抱 (deleted) 旧
+        # inode → VM 跑旧代码,而下面却把 rootfs_version 标成新的 = 谎报漂移。
+        # 扫该租户 fc.sock 进程的 fd,指向 openclaw-rootfs.ext4 (deleted) 就 exit 1
+        # → _ssm_run 返回 False → _rebuild_verified=False → 下面不谎报版本。
+        _sock = f"/data/firecracker-vms/{tenant_id}/fc.sock"
+        verify_cmd = (
+            f"_fpid=$(pgrep -f 'api-sock {_sock}' | head -1); "
+            "[ -n \"$_fpid\" ] || { echo 'rebuild-verify: no firecracker after relaunch' >&2; exit 1; }; "
+            "if ls -l /proc/$_fpid/fd 2>/dev/null | grep -q 'openclaw-rootfs.ext4 (deleted)'; then "
+            "echo 'rebuild-verify: FC still on DELETED old rootfs inode — upgrade did NOT take' >&2; exit 1; fi; "
+            "echo rebuild-verify-ok"
+        )
+        full_cmd += f" && {verify_cmd}"
+        _rebuild_verified = ssm_dispatch._ssm_run(
+            item["host_id"], full_cmd, timeout=300
+        )
         new_status = "running"
     elif action == "pause":
         vm_dir = f"/data/firecracker-vms/{tenant_id}"
@@ -2672,10 +2694,15 @@ def tenant_action(tenant_id, action, body=None, event=None):
 
     update_expr = "SET #s = :s, updated_at = :t"
     expr_values = {":s": new_status, ":t": utils._now()}
-    if action in ("reset", "rebuild"):
-        # Record the host's current rootfs_version on the tenant: after a rebuild
-        # the VM runs whatever version the host has staged, so GET /tenants must
-        # reflect that (drift visibility — who's been upgraded, who's stale).
+    # #304 — 只在校验通过后才标 rootfs_version,不谎报漂移。
+    #   · reset:非升级语义(丢 overlay 回出厂),照旧无条件标 host 当前版本。
+    #   · rebuild:是升级采用,只有 relaunch 校验(FC 不在 deleted 旧 inode 上)
+    #     通过(_rebuild_verified 为真)才标新版本;校验失败 → 不标,GET /tenants
+    #     仍显示旧版本 = 如实反映"这台没升成",而不是谎报新。
+    _stamp_rootfs = action == "reset" or (
+        action == "rebuild" and locals().get("_rebuild_verified", False)
+    )
+    if _stamp_rootfs:
         host = clients.hosts_table.get_item(
             Key={"instance_id": item["host_id"]}, ConsistentRead=True
         ).get("Item", {})

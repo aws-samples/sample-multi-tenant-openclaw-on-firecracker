@@ -395,23 +395,23 @@ INJECTED_CHANNEL_SECRET="${9:-}"
 # chat_endpoint_enabled (10th arg) — per-tenant switch for the OpenAI-compatible
 # gateway.http.endpoints.chatCompletions endpoint. DEFAULT OFF (empty / "0" /
 # "false"): we keep deleting the endpoint (OpenClaw's secure default + this
-# fork's policy — see the del() below and CLAUDE.md "chatCompletions 为什么不能
+# fork's policy — see the del() below and the ops guide "chatCompletions 为什么不能
 # 全局默认开"). Only when the API Lambda passes "1"/"true" (the tenant record's
 # chat_endpoint_enabled flag) do we inject enabled:true for THAT tenant. Mitigations
 # stay regardless: per-tenant gateway.auth.token + CloudFront/nginx reverse proxy +
 # Bedrock Guardrail + LiteLLM vkey limit. Empty (legacy SSM commands) → off.
 CHAT_EP_ENABLED="${10:-}"
-# #187 P5 — 11th arg 保留空占位(转型前是 INJECTED_COGNITO_B64 WI-002 端到端
+# #187 P5 — 11th arg 保留空占位(转型前是 INJECTED_COGNITO_B64  端到端
 # Cognito 渠道机器用户 base64)。channel/hub 数据面已下线,数据面走两级路由直连
 # microVM:18789 gateway。参数位保留以维持 12 位对齐,取值不再使用。
 INJECTED_COGNITO_B64="${11:-}"
-# #187 P1 (SPEC/11-ENGINE-TRANSFORM D+B): 12th positional arg — base64 KMS
+# #187 P1 (the data-plane design D+B): 12th positional arg — base64 KMS
 # ciphertext of the pre-minted gateway token (tenant_id EncryptionContext, ClawPool
 # CMK). Empty (legacy SSM commands / feature off) → keep the openssl-generated
 # in-VM token. Non-empty → we `aws kms decrypt` here on the host (has kms:Decrypt
 # on the ClawPool CMK), inject the plaintext as `.gateway.auth.token`, replacing
 # the openssl one. This closes the "control plane can't reveal the gateway token"
-# gap that hub → gateway direct-connect (11-ENGINE-TRANSFORM) needs. Reveal window
+# gap that hub → gateway direct-connect (the data-plane design) needs. Reveal window
 # is enforced control-side (openclaw-tenant-secrets TTL 15min); this side is just
 # the injection step.
 INJECTED_GATEWAY_TOKEN_CT="${12:-}"
@@ -570,7 +570,7 @@ if [ "${NEEDS_INIT}" = "true" ]; then
     _RESTORE_BUCKET="${BACKUP_BUCKET:-${ASSETS_BUCKET}}"
     log "restoring from s3://${_RESTORE_BUCKET}/${RESTORE_KEY}"
     # #199 fail-loud(对标 restic checker:missing/truncated 绝不静默放行,
-    # internal/repository/checker.go:232 用实际大小≠期望判 Truncated 报错)。
+    # 内部校验逻辑用实际大小≠期望判 Truncated 报错)。
     # 现状:aws s3 cp --quiet 失败或拿到 0 字节 → pigz 出空盘 → e2fsck 在空盘上
     # 可能过 → VM 带空白盘 running = 数据丢失级。三道 fail-loud 守卫,任一不过
     # 立即 exit 1(绝不 fall through 到建空白盘):
@@ -835,7 +835,7 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
     # tenant_id EncryptionContext), decrypt it here on the host and use THAT as
     # NEW_TOKEN, overriding the openssl rand above. Rationale:
     #   • Control plane needs `GET /tenants/{id}/token` reveal for direct-gateway
-    #     data plane (11-ENGINE-TRANSFORM): only pre-minted tokens can be revealed.
+    #     data plane (the data-plane design): only pre-minted tokens can be revealed.
     #   • openssl rand stays as the FEATURE-OFF fallback (byte-identical old path
     #     for un-migrated deployments; no CMK → no ciphertext → no override).
     # Fail-closed: ciphertext present but decrypt fails (EC mismatch, no perm,

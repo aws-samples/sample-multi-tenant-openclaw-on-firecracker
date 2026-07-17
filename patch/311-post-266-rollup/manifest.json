@@ -1,15 +1,17 @@
 {
   "id": "311-post-266-rollup",
   "base_sha": "f7a4d08756802141bc2dc292371f9d954e85efd1",
-  "patch_sha": "18e469e963ad086d64af317499465b0319ba09f5",
+  "patch_sha": "c4d95ae9ced1adfad2fc270b72b90e8178b26b00",
   "no_cdk": true,
-  "note": "cdk deploy is FORBIDDEN on this deployment: it was CDK-deployed once and then manually modified on the live system; a cdk deploy would overwrite those manual changes. Every change below has a manual apply path.",
+  "self_contained": true,
+  "note": "cdk deploy is FORBIDDEN on this deployment: it was CDK-deployed once and then manually modified on the live system; a cdk deploy would overwrite those manual changes. Every change below has a manual apply path. SELF-CONTAINED: every changed file is shipped in full inside this patch dir (host scripts as *.patched, the whole Lambda source tree under lambda/api/); the two CDK-stack changes (compute.py IAM grant, observability.py Secrets Manager VPCE) ship as ready-to-run AWS CLI under iam/ and network/ — you never need the repo. patch_sha advanced from 18e469e to c4d95ae to fold in the post-#311 data-plane fix (paired.json + gateway-token re-injection on VM recovery/rebuild, #312/#314) previously tracked in a standalone patch/manifest-2026-07-17-2334.json.",
   "paths": {
     "deploy/userdata/launch-vm.sh": {
       "layer": "B-s3-pulled",
       "artifact": "host-scripts/launch-vm.sh.patched",
       "base_hash": "51c7049b04c4225b073e2e23152e044bf5436ba50d894e38e82bcffe769612d6",
-      "patch_hash": "376559e78d4b8ec715e9374a8762d9ff3e1a0182d2b008548ecf8e413e55c99c"
+      "patch_hash": "f2f95c20fa909d35becd234706d01c4f3caabdc3af9a8bf2a134e1d22a30aa4a",
+      "note": "log()-before-def rc=127 fix (post-266) + #312/#314 idempotent re-injection of paired.json and pre-minted gateway token on every boot (fresh + wake/restart/recovery), with device_paired_b64 second-level fallback/backfill from the tenants table (previously the NEW_DATA-gated cold-inject block was skipped on recovery relaunch, causing NOT_PAIRED after an image update); ALSO #312 per-tenant LiteLLM vkey second-level fallback from the tenants table on wake/restart (an empty positional arg 8 used to let oc_harden_config overwrite the disk's per-tenant apiKey with the shared vkey, silently drifting per-tenant billing to shared). Folded from standalone manifest-2026-07-17-2334.json (synced_at 2026-07-17 23:34 UTC+8)."
     },
     "deploy/userdata/init-host.sh": {
       "layer": "A-launch-template-baked",
@@ -19,18 +21,20 @@
     },
     "deploy/lambda/api/handler.py": {
       "layer": "C-lambda",
-      "artifact": "lambda/APPLY-LAMBDA.md",
-      "note": "private-API {proxy+} routing fix #298 — only needed on a private API Gateway"
+      "artifact": "lambda/api/handler.py",
+      "note": "private-API {proxy+} routing fix #298 — only needed on a private API Gateway. Full Lambda source shipped under lambda/api/; deploy via lambda/APPLY-LAMBDA.md."
     },
     "deploy/lambda/api/services/host_service.py": {
       "layer": "C-lambda",
-      "artifact": "lambda/APPLY-LAMBDA.md",
-      "note": "rebuild adoption-verify #304"
+      "artifact": "lambda/api/services/host_service.py",
+      "note": "rebuild adoption-verify #304. Full Lambda source shipped under lambda/api/."
     },
     "deploy/lambda/api/services/tenant_service.py": {
       "layer": "C-lambda",
-      "artifact": "lambda/APPLY-LAMBDA.md",
-      "note": "restart-vs-rebuild semantics #304/#305"
+      "artifact": "lambda/api/services/tenant_service.py",
+      "base_hash": "df168b44df7506e6202b92327549111b05d10162c2f11d8b0f7a4ac5be310205",
+      "patch_hash": "1757da2e572c569ec7fa907176554ff00708b59c63c92e360464e9ca664f2044",
+      "note": "restart-vs-rebuild semantics #304/#305 + #314 persist_device_paired_b64: persists device_paired_b64 to the tenants table (no TTL) with one retry and fail-loud, the long-term source for launch-vm to re-inject paired.json on recovery/image-update. Full Lambda source shipped under lambda/api/."
     },
     "deploy/stacks/compute.py": {
       "layer": "D-cdk-tier1-iam",

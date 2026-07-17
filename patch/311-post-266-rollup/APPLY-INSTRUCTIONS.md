@@ -37,13 +37,18 @@ LIVE copy and branch:
 
 ```bash
 LIVE=$(ssh -i <key> ubuntu@<host> 'sha256sum /home/ubuntu/launch-vm.sh' | awk '{print $1}')
-# launch-vm.sh: base=51c7049b… patch=376559e7…   (init-host.sh: base=2b91afa5… patch=5e8f50c1…)
+# launch-vm.sh: base=51c7049b… patch=f2f95c20…   (init-host.sh: base=2b91afa5… patch=5e8f50c1…)
+# known-intermediate (safe to overwrite): launch-vm.sh 376559e7… = the PRE-#312/#314 version of
+#   this same 311 patch (hosts that applied the earlier 311 bundle). Upgrading it to f2f95c20…
+#   is a forward fix (adds paired.json/gateway-token re-injection), NOT a revert.
 ```
 
-- `LIVE == patch_hash` → already applied, **SKIP**.
-- `LIVE == base_hash` → clean apply, proceed.
-- `LIVE == neither` → **diverged. STOP.** Show `diff` to the terminal user; overwrite only
-  on explicit approval (the live copy may be a newer fix — don't revert it).
+- `LIVE == patch_hash` (`f2f95c20…`) → already applied, **SKIP**.
+- `LIVE == base_hash` (`51c7049b…`) → clean apply, proceed.
+- `LIVE == 376559e7…` (pre-#312/#314 311 build) → **known intermediate, proceed** — this
+  upgrade adds the re-injection fix; it is forward, not a revert.
+- `LIVE == none of the above` → **diverged. STOP.** Show `diff` to the terminal user; overwrite
+  only on explicit approval (the live copy may be a newer fix — don't revert it).
 
 ## Step 2 — Hot-fix running machines (restore service now)
 
@@ -122,8 +127,19 @@ Verify BOTH paths (they log differently):
 curl -X POST "https://<api>/tenants" -H "x-api-key: <key>" -d '{"tenant_id":"patch-311-test"}'
 # ~30s later on host: expect "using control-plane pre-minted gateway token", no rc=127
 ssh -i <key> ubuntu@<host> 'journalctl -t claw-launch --no-pager -n 100 | grep -iE "pre-minted|rc=127"'
-# recovery path: kill the fc process, let host-agent relaunch with 4 args, expect DDB fallback logs
-ssh -i <key> ubuntu@<host> 'journalctl -t claw-launch --no-pager -n 100 | grep -iE "DDB fallback"'
+# recovery path (#312/#314) — actually reproduce the failure, don't just grep old logs.
+# This is the whole point: prove paired.json is REBUILT after the data disk lost it.
+TID=patch-311-test
+# a) prove the pre-fix failure mode is reachable: blank the on-disk paired.json, then kill FC.
+#    (the mount path is host-specific; find it under the tenant's data mount — devices/paired.json)
+ssh -i <key> ubuntu@<host> "sudo truncate -s 0 \$(sudo find /mnt /srv -path '*'$TID'*/.openclaw/devices/paired.json' 2>/dev/null | head -1) || true"
+ssh -i <key> ubuntu@<host> "sudo pkill -f \"firecracker.*$TID\""
+# b) host-agent relaunches with 4 args (NEW_DATA=false). Watch for the re-inject to fire:
+sleep 30
+ssh -i <key> ubuntu@<host> "journalctl -t claw-launch --since '-2min' --no-pager | grep -iE 'DDB fallback|re-inject|paired'"
+# c) confirm paired.json is non-empty again and the gateway reports the device PAIRED:
+ssh -i <key> ubuntu@<host> "sudo cat \$(sudo find /mnt /srv -path '*'$TID'*/.openclaw/devices/paired.json' 2>/dev/null | head -1) | jq 'keys'"
+# then in the frontend / gateway status: the tenant is PAIRED, not NOT_PAIRED.
 # private API: a non-/ping route responds
 curl -s "https://<api>/tenants" -H "x-api-key: <key>" | head
 # cleanup

@@ -395,23 +395,23 @@ INJECTED_CHANNEL_SECRET="${9:-}"
 # chat_endpoint_enabled (10th arg) — per-tenant switch for the OpenAI-compatible
 # gateway.http.endpoints.chatCompletions endpoint. DEFAULT OFF (empty / "0" /
 # "false"): we keep deleting the endpoint (OpenClaw's secure default + this
-# fork's policy — see the del() below and the ops guide "chatCompletions 为什么不能
+# fork's policy — see the del() below and CLAUDE.md "chatCompletions 为什么不能
 # 全局默认开"). Only when the API Lambda passes "1"/"true" (the tenant record's
 # chat_endpoint_enabled flag) do we inject enabled:true for THAT tenant. Mitigations
 # stay regardless: per-tenant gateway.auth.token + CloudFront/nginx reverse proxy +
 # Bedrock Guardrail + LiteLLM vkey limit. Empty (legacy SSM commands) → off.
 CHAT_EP_ENABLED="${10:-}"
-# #187 P5 — 11th arg 保留空占位(转型前是 INJECTED_COGNITO_B64  端到端
+# #187 P5 — 11th arg 保留空占位(转型前是 INJECTED_COGNITO_B64 WI-002 端到端
 # Cognito 渠道机器用户 base64)。channel/hub 数据面已下线,数据面走两级路由直连
 # microVM:18789 gateway。参数位保留以维持 12 位对齐,取值不再使用。
 INJECTED_COGNITO_B64="${11:-}"
-# #187 P1 (the data-plane design D+B): 12th positional arg — base64 KMS
+# #187 P1 (SPEC/11-ENGINE-TRANSFORM D+B): 12th positional arg — base64 KMS
 # ciphertext of the pre-minted gateway token (tenant_id EncryptionContext, ClawPool
 # CMK). Empty (legacy SSM commands / feature off) → keep the openssl-generated
 # in-VM token. Non-empty → we `aws kms decrypt` here on the host (has kms:Decrypt
 # on the ClawPool CMK), inject the plaintext as `.gateway.auth.token`, replacing
 # the openssl one. This closes the "control plane can't reveal the gateway token"
-# gap that hub → gateway direct-connect (the data-plane design) needs. Reveal window
+# gap that hub → gateway direct-connect (11-ENGINE-TRANSFORM) needs. Reveal window
 # is enforced control-side (openclaw-tenant-secrets TTL 15min); this side is just
 # the injection step.
 INJECTED_GATEWAY_TOKEN_CT="${12:-}"
@@ -485,6 +485,45 @@ if [ -z "${INJECTED_GATEWAY_TOKEN_CT}" ] || [ -z "${INJECTED_DEVICE_PAIRED_B64}"
   fi
   unset _SEC_RAW _SECRETS_TABLE
 fi
+# #312 — device_paired_b64 二级回落到 tenants 表(长期,无 TTL)。tenant_secrets 表的
+# device 密文有 15min TTL(mint_device_identity 设 device_expires_at=now+900),几小时后
+# 镜像更新自愈 restart 时上面 #290 一级回落(查 tenant_secrets)拿到空 → paired.json 无源
+# 重注入 → 网关读空盘配对 → 前端 NOT_PAIRED(真机复现)。paired.json 是公开信息(deviceId+
+# publicKey+roles+scopes,无私钥),create 时已长期存 tenants.device_paired_b64(无 TTL),
+# 这里作长期兜底。gateway_token 不做此回落:它是机密且短期(reveal 窗口),过期即应重铸,
+# 不长期留明文密文在无 TTL 表。fail-open:tenants 读失败不中止(paired 缺失只是回退到
+# 人工 approve,非 fail-closed 安全事件)。
+_PAIRED_FROM_TENANTS=0
+if [ -z "${INJECTED_DEVICE_PAIRED_B64}" ]; then
+  _TENANTS_TABLE="${TENANTS_TABLE:-openclaw-tenants}"
+  if _TEN_RAW="$(aws dynamodb get-item \
+    --table-name "${_TENANTS_TABLE}" \
+    --key "{\"id\":{\"S\":\"${TENANT_ID}\"}}" \
+    --projection-expression 'device_paired_b64' \
+    --consistent-read \
+    --region "${OC_REGION:-ap-northeast-1}" \
+    --output json 2>/dev/null)"; then
+    INJECTED_DEVICE_PAIRED_B64="$(printf '%s' "${_TEN_RAW}" | jq -r '.Item.device_paired_b64.S // ""' 2>/dev/null || true)"
+    [ -n "${INJECTED_DEVICE_PAIRED_B64}" ] && { echo "[oc:launch] DDB fallback: got device_paired_b64 from ${_TENANTS_TABLE} (#312 long-term)"; _PAIRED_FROM_TENANTS=1; }
+  fi
+  unset _TEN_RAW _TENANTS_TABLE
+fi
+# #314(codex review 缺陷2 修复:存量租户 backfill)——若 device_paired_b64 来自位置参
+# (12/13,首建 dispatch)或 tenant_secrets 一级回落(#290),而【不是】从 tenants 表读来的,
+# 说明 tenants 表可能还没这条(存量租户:改动前建的;或 create 时持久化失败被兜底)。
+# 回写 tenants 表(无 TTL),让该租户下次 restart data 盘丢了也有长期源可重建。host_role
+# 有 tenants 表读写权(compute.py:57)。幂等 update 单字段;写失败 fail-open(不阻塞 launch)。
+if [ -n "${INJECTED_DEVICE_PAIRED_B64}" ] && [ "${_PAIRED_FROM_TENANTS}" != "1" ]; then
+  aws dynamodb update-item \
+    --table-name "${TENANTS_TABLE:-openclaw-tenants}" \
+    --key "{\"id\":{\"S\":\"${TENANT_ID}\"}}" \
+    --update-expression "SET device_paired_b64 = :dpb" \
+    --expression-attribute-values "{\":dpb\":{\"S\":\"${INJECTED_DEVICE_PAIRED_B64}\"}}" \
+    --region "${OC_REGION:-ap-northeast-1}" >/dev/null 2>&1 \
+    && echo "[oc:launch] backfilled device_paired_b64 to tenants table (#314 存量租户自愈)" \
+    || echo "[oc:launch] WARN(#314): backfill device_paired_b64 to tenants failed (non-fatal)"
+fi
+unset _PAIRED_FROM_TENANTS
 # #41 — harden-config.sh 提供 POSIX sh 幂等 openclaw.json 收敛函数
 # (oc_harden_config + oc_normalize_litellm_baseurl)。launch-vm.sh 每次启动都调
 # oc_harden_config,不管 fresh/wake,收敛部署相关值(CloudFront origin/LiteLLM
@@ -581,7 +620,7 @@ if [ "${NEEDS_INIT}" = "true" ]; then
     _RESTORE_BUCKET="${BACKUP_BUCKET:-${ASSETS_BUCKET}}"
     log "restoring from s3://${_RESTORE_BUCKET}/${RESTORE_KEY}"
     # #199 fail-loud(对标 restic checker:missing/truncated 绝不静默放行,
-    # 镜像完整性校验用实际大小≠期望判 Truncated 报错)。
+    # internal/repository/checker.go:232 用实际大小≠期望判 Truncated 报错)。
     # 现状:aws s3 cp --quiet 失败或拿到 0 字节 → pigz 出空盘 → e2fsck 在空盘上
     # 可能过 → VM 带空白盘 running = 数据丢失级。三道 fail-loud 守卫,任一不过
     # 立即 exit 1(绝不 fall through 到建空白盘):
@@ -745,7 +784,7 @@ _CREDS_ENV=""   # set below iff env-class creds were decrypted; drives disk buil
 if _IC_RAW="$(aws dynamodb get-item \
   --table-name "${TENANTS_TABLE:-openclaw-tenants}" \
   --key "{\"id\":{\"S\":\"${TENANT_ID}\"}}" \
-  --projection-expression 'injected_credentials, owner_id, frozen_injection_plan, scheme, registry_version' \
+  --projection-expression 'injected_credentials, owner_id, frozen_injection_plan, scheme, registry_version, litellm_vkey' \
   --consistent-read \
   --region "${OC_REGION:-ap-northeast-1}" \
   --output json 2>/dev/null)"; then
@@ -850,7 +889,7 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
     # tenant_id EncryptionContext), decrypt it here on the host and use THAT as
     # NEW_TOKEN, overriding the openssl rand above. Rationale:
     #   • Control plane needs `GET /tenants/{id}/token` reveal for direct-gateway
-    #     data plane (the data-plane design): only pre-minted tokens can be revealed.
+    #     data plane (11-ENGINE-TRANSFORM): only pre-minted tokens can be revealed.
     #   • openssl rand stays as the FEATURE-OFF fallback (byte-identical old path
     #     for un-migrated deployments; no CMK → no ciphertext → no override).
     # Fail-closed: ciphertext present but decrypt fails (EC mismatch, no perm,
@@ -938,7 +977,22 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
   CF_ORIGIN="${CLOUDFRONT_ORIGIN:-}"
   LITELLM_BASEURL="$(oc_normalize_litellm_baseurl "${LITELLM_HOST:-}")"
 
-  # apiKey:优先 per-tenant LITELLM_VKEY 参数(SSM 传入,per-tenant 计费拆分);
+  # #312 — per-tenant vkey 二级回落(tenants 表,无 TTL)。gap:vkey 只在 create/push
+  # 作位置参 8 传入;wake/restart(start-all-vms/自愈/fan-out)位置 8 传空 → 原逻辑落到
+  # LITELLM_SHARED_VKEY → oc_harden_config 每次启动把盘上 per-tenant apiKey 覆盖成
+  # 共享 key → 每次 restart/镜像更新 per-tenant 计费拆分静默漂成 shared(task #15)。
+  # 修:位置参空时,从 :767 已读的 tenants 表(_IC_RAW,投影含 litellm_vkey,无 TTL)回落。
+  # 只在开了 per-tenant 计费的部署有 litellm_vkey 字段;没开则读空→行为不变(向后兼容)。
+  if [ -z "${LITELLM_VKEY}" ]; then
+    _TEN_VKEY="$(printf '%s' "${_IC_RAW}" | jq -r '.Item.litellm_vkey.S // ""' 2>/dev/null || true)"
+    if [ -n "${_TEN_VKEY}" ]; then
+      LITELLM_VKEY="${_TEN_VKEY}"
+      log "per-tenant vkey re-read from tenants table (#312; restart 不漂成 shared)"
+    fi
+    unset _TEN_VKEY
+  fi
+
+  # apiKey:优先 per-tenant LITELLM_VKEY 参数(SSM 传入 / #312 tenants 回落,per-tenant 计费拆分);
   # 参数为空时才 fall back 到 platform.env 的 LITELLM_SHARED_VKEY(shared)。
   # 关键 fail-safe:LITELLM_VKEY 参数空 + LITELLM_SHARED_VKEY 也空 → _APIKEY 空 →
   # oc_harden_config 不写 apiKey(不会拿 shared 覆盖数据盘上的 per-tenant vkey)。
@@ -1003,6 +1057,89 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
     exit 1
   fi
   sudo chown 1000:1000 "${OC_JSON}"
+
+  # ─────────────────────────────────────────────────────────────────────
+  # #312 幂等重注入 device 配对 + pre-minted gateway token —— 每次启动都跑
+  # (fresh + wake/restart/recovery),与上面 #41 apiKey/origin 幂等收敛同源思路。
+  # 根因(新加坡真机 + openclaw 源码双证):镜像更新 → 在跑 FC 掉线 → 平台自愈
+  # restart(fleet-power → start-all-vms.sh → launch-vm 只传 4 参 + 复用 data 盘
+  # NEW_DATA=false)→ 上面 NEW_DATA-only 冷注入块整体跳过 → 若那次盘上 paired.json
+  # 恰空(新盘/被清)→ gateway 读到空(message-handler.ts:786 getPairedDevice→
+  # isPaired=false)→ 前端 NOT_PAIRED。修:每次都把控制面权威的 device_paired_b64
+  # + pre-minted token(脚本头 #290 DDB fallback 已从 openclaw-tenant-secrets 补齐,
+  # 4 参调用也拿得到)幂等写回 data 盘,网关(重)启动永远读到 approved backend 条目。
+  # 仅在 INJECTED_* 非空时写(老租户/无 pre-minted → 空 → 不动,保留盘上现值,零漂移;
+  # gateway token 的 openssl rand 首铸仍只在 NEW_DATA 块,这里绝不用随机值覆盖)。
+  # ─────────────────────────────────────────────────────────────────────
+  if [ -n "${INJECTED_GATEWAY_TOKEN_CT}" ]; then
+    _GW_TOKEN_RI="$(printf '%s' "${INJECTED_GATEWAY_TOKEN_CT}" | base64 -d 2>/dev/null \
+      | aws kms decrypt \
+          --ciphertext-blob fileb:///dev/stdin \
+          --encryption-context "tenant_id=${TENANT_ID}" \
+          --region "${OC_REGION:-ap-northeast-1}" \
+          --query Plaintext --output text 2>/dev/null \
+      | base64 -d 2>/dev/null || true)"
+    if [ -z "${_GW_TOKEN_RI}" ]; then
+      log "FATAL(#312): pre-minted gateway token decrypt failed on re-inject — aborting fail-closed"
+      exit 1
+    fi
+    if [ "$(printf '%s' "${_GW_TOKEN_RI}" | LC_ALL=C tr -dc '[:cntrl:]' | wc -c | tr -d ' ')" != "0" ]; then
+      log "FATAL(#312): re-inject gateway token contains control chars (rejected)"
+      exit 1
+    fi
+    # 幂等:只在盘上 token 与权威值不一致时改写(避免每次 launch 无谓写盘)。
+    _CUR_TOK="$(jq -r '.gateway.auth.token // ""' "${OC_JSON}" 2>/dev/null || true)"
+    if [ "${_CUR_TOK}" != "${_GW_TOKEN_RI}" ]; then
+      jq --arg t "${_GW_TOKEN_RI}" '.gateway.auth.token = $t' \
+        "${OC_JSON}" > "${OC_JSON}.tmp" && mv "${OC_JSON}.tmp" "${OC_JSON}"
+      sudo chown 1000:1000 "${OC_JSON}"
+      log "gateway token re-injected (#312 idempotent; 盘上 token 与控制面权威不一致已收敛)"
+    fi
+    unset _GW_TOKEN_RI _CUR_TOK
+  fi
+  if [ -n "${INJECTED_DEVICE_PAIRED_B64}" ]; then
+    _PAIRED_RI="$(printf '%s' "${INJECTED_DEVICE_PAIRED_B64}" | base64 -d 2>/dev/null || true)"
+    if [ -z "${_PAIRED_RI}" ]; then
+      log "FATAL(#312): paired.json base64 decode failed on re-inject — aborting fail-closed"
+      exit 1
+    fi
+    if [ "$(printf '%s' "${_PAIRED_RI}" | LC_ALL=C tr -dc '[:cntrl:]' | wc -c | tr -d ' ')" != "0" ]; then
+      log "FATAL(#312): re-inject paired.json contains control chars (rejected)"
+      exit 1
+    fi
+    if ! printf '%s' "${_PAIRED_RI}" | jq -e 'type == "object"' >/dev/null 2>&1; then
+      log "FATAL(#312): re-inject paired.json is not a JSON object — aborting fail-closed"
+      exit 1
+    fi
+    _DEVICES_DIR_RI="${MOUNT_TMP}/.openclaw/devices"
+    mkdir -p "${_DEVICES_DIR_RI}"
+    # #314(codex review 缺陷1 修复):按 deviceId **merge**,不整体覆盖。
+    # 盘上 paired.json 可能含网关运行时 approve 的【其它设备】+ 每设备运行时字段
+    # (tokens/lastSeen*)。整体覆盖会删掉它们(丢运行时授权状态)。用 jq 递归 merge
+    # `盘上 * 控制面`:控制面这条(们)device 新增/更新公钥·roles·scopes;盘上已有的
+    # 其它 deviceId 原样保留;同 deviceId 递归 merge(盘上在左),盘上运行时独有字段
+    # (tokens/lastSeen)保留,控制面的 tokens:{} 空对象 merge 不覆盖盘上非空 tokens。
+    _CUR_PAIRED="$(cat "${_DEVICES_DIR_RI}/paired.json" 2>/dev/null || true)"
+    if ! printf '%s' "${_CUR_PAIRED}" | jq -e 'type == "object"' >/dev/null 2>&1; then
+      _CUR_PAIRED='{}'  # 盘上空/损坏 → 退化成只用控制面这份(等价冷注入)
+    fi
+    _MERGED_RI="$(jq -cn --argjson cur "${_CUR_PAIRED}" --argjson ctl "${_PAIRED_RI}" '$cur * $ctl' 2>/dev/null || true)"
+    if [ -z "${_MERGED_RI}" ]; then
+      log "FATAL(#314): paired.json merge(jq \$cur * \$ctl)失败 — aborting fail-closed"
+      exit 1
+    fi
+    # 幂等:merge 结果与盘上一致则不写(避免无谓写盘 + mtime 抖动)。
+    if [ "${_CUR_PAIRED}" != "${_MERGED_RI}" ]; then
+      printf '%s' "${_MERGED_RI}" > "${_DEVICES_DIR_RI}/paired.json"
+      chmod 600 "${_DEVICES_DIR_RI}/paired.json"
+      sudo chown -R 1000:1000 "${_DEVICES_DIR_RI}"
+      _DID16_RI="$(printf '%s' "${_PAIRED_RI}" | jq -r 'keys[0] // "?"' 2>/dev/null | cut -c1-16)"
+      log "paired.json re-injected (#312/#314 merge; device=${_DID16_RI}… 控制面这条已 merge,盘上其它设备+运行时字段保留)"
+      unset _DID16_RI
+    fi
+    unset _PAIRED_RI _DEVICES_DIR_RI _CUR_PAIRED _MERGED_RI
+  fi
+
   # AgentCore Gateway MCP injection (if configured).
   #
   # OpenClaw 2026.5+ moved MCP servers from a top-level `mcpServers` key to

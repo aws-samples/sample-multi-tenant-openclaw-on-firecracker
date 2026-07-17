@@ -2,8 +2,10 @@
 
 Companion to `patch/266-token-drift-fix/`. Patch 266 fixed gateway-token drift on the VM
 recovery path. **This patch bundles every customer-facing fix made after 266** — covering
-`base_sha f7a4d08` → `patch_sha 18e469e` (see `manifest.json`) — so you can apply them all
-from one place, **without `cdk deploy`.**
+`base_sha f7a4d08` → `patch_sha c4d95ae` (see `manifest.json`) — so you can apply them all
+from one place, **without `cdk deploy`.** (The range was extended from `18e469e` to `c4d95ae`
+to fold in the post-#311 paired.json / gateway-token re-injection fix, #312/#314, which was
+previously tracked in a standalone `patch/manifest-2026-07-17-2334.json`.)
 
 ## `cdk deploy` is forbidden on this deployment
 
@@ -16,25 +18,34 @@ no safe CLI path is listed as "manual intervention required" for a human — nev
 
 ## What this patch fixes
 
-| Symptom                                                                                                        | Root cause                                                                                                                                                         | Layer                    |
-| -------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------ |
-| VM creation fails with `log: command not found` (rc=127); tenant stuck creating/down                           | DDB token-fallback block calls `log()` before it is defined; under `set -e` the call returns 127 and the script exits on the fallback success path.                | host script (S3)         |
-| After a rootfs upgrade the VM still runs old code / a rebuild wipes the data disk / the version is misreported | `restart` keeps the old overlay; a rebuild on a data-template size drift rebuilt the disk; the version was stamped without verifying the VM booted the new rootfs. | Lambda                   |
-| On a private-API deployment every route except `/ping` returns 404                                             | A private API's `event["resource"]` is always `/{proxy+}`, so the resource-template dispatch matched nothing.                                                      | Lambda                   |
-| Host boot hangs at "installing tools + firecracker"; hosts end up ABANDONED                                    | A stack-output lookup queried a CDK-prefixed key that never matched, burning a 5-minute silent retry per boot.                                                     | host script (LT-baked)   |
-| Host fails to launch VMs with AccessDenied; tenants stuck creating                                             | The token fallback reads `openclaw-tenant-secrets` with the host role, which was never granted read on that table.                                                 | IAM (was CDK)            |
-| The AOS rolesmapping Lambda times out reaching Secrets Manager on an imported VPC                              | No NAT egress and no Secrets Manager VPC endpoint.                                                                                                                 | network (was CDK)        |
-| A manual S3 upload fails on a Linux bastion with `shasum: command not found`                                   | `setup.sh` used `shasum` (macOS) not `sha256sum` (Linux/AL2023).                                                                                                   | meta (folded into apply) |
+| Symptom                                                                                                        | Root cause                                                                                                                                                                                                                         | Layer                     |
+| -------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------- |
+| VM creation fails with `log: command not found` (rc=127); tenant stuck creating/down                           | DDB token-fallback block calls `log()` before it is defined; under `set -e` the call returns 127 and the script exits on the fallback success path.                                                                                | host script (S3)          |
+| After a rootfs upgrade the VM still runs old code / a rebuild wipes the data disk / the version is misreported | `restart` keeps the old overlay; a rebuild on a data-template size drift rebuilt the disk; the version was stamped without verifying the VM booted the new rootfs.                                                                 | Lambda                    |
+| On a private-API deployment every route except `/ping` returns 404                                             | A private API's `event["resource"]` is always `/{proxy+}`, so the resource-template dispatch matched nothing.                                                                                                                      | Lambda                    |
+| Host boot hangs at "installing tools + firecracker"; hosts end up ABANDONED                                    | A stack-output lookup queried a CDK-prefixed key that never matched, burning a 5-minute silent retry per boot.                                                                                                                     | host script (LT-baked)    |
+| Host fails to launch VMs with AccessDenied; tenants stuck creating                                             | The token fallback reads `openclaw-tenant-secrets` with the host role, which was never granted read on that table.                                                                                                                 | IAM (was CDK)             |
+| The AOS rolesmapping Lambda times out reaching Secrets Manager on an imported VPC                              | No NAT egress and no Secrets Manager VPC endpoint.                                                                                                                                                                                 | network (was CDK)         |
+| A manual S3 upload fails on a Linux bastion with `shasum: command not found`                                   | `setup.sh` used `shasum` (macOS) not `sha256sum` (Linux/AL2023).                                                                                                                                                                   | meta (folded into apply)  |
+| After an image update / VM recovery the frontend is stuck on `NOT_PAIRED`                                      | The `paired.json` + gateway-token cold-inject was gated on `NEW_DATA`, so a recovery relaunch (existing data disk) skipped it, and there was no long-term source to re-inject the paired blob from. (#312/#314)                    | host script (S3) + Lambda |
+| After a restart / image update a per-tenant billing vkey silently drifts to the shared vkey                    | On wake/restart the per-tenant `LITELLM_VKEY` positional arg is empty, so the config-converge step overwrote the disk's per-tenant apiKey with the shared key; the fix re-reads the per-tenant vkey from the tenants table. (#312) | host script (S3)          |
 
 ## Layers and how each is applied (all CDK-free)
+
+> **Self-contained:** every changed file is shipped in full inside this directory — host
+> scripts as `*.patched`, the entire Lambda source tree under `lambda/api/`, and the two
+> CDK-stack changes as ready-to-run AWS CLI under `iam/` and `network/`. You never need the
+> repository to apply this patch.
 
 - **Host scripts (S3-pulled, hot-swappable)** — `host-scripts/launch-vm.sh.patched`: scp
   onto the live host, then upload to S3 for future hosts.
 - **Launch-Template-baked** — `launch-template/init-host.sh.patched` +
   `launch-template/APPLY-LT.md`: full file + manual new-LT-version + `update-auto-scaling-group`
   (this ASG pins a version; a new default is ignored).
-- **Lambda code** — `lambda/APPLY-LAMBDA.md`: `update-function-code` (private-API routing +
-  rebuild semantics).
+- **Lambda code** — full source shipped under `lambda/api/` (36 files); apply with
+  `lambda/APPLY-LAMBDA.md`: `pip install` deps + `update-function-code` + `publish-version` +
+  `update-alias live`, for BOTH `openclaw-api` and `openclaw-lifecycle-consumer` (private-API
+  routing + rebuild semantics + #312/#314 paired-device persistence).
 - **IAM** — `iam/apply-iam.sh`: inline policy granting the host role read on
   `openclaw-tenant-secrets` (fail-closed prerequisite — applied first).
 - **Network / VPCE** — `network/APPLY-NETWORK.md`: **describe-only, human-gated**. Probe
@@ -52,16 +63,17 @@ no safe CLI path is listed as "manual intervention required" for a human — nev
 
 ## Files
 
-| Path                                                   | Purpose                                                           |
-| ------------------------------------------------------ | ----------------------------------------------------------------- |
-| `manifest.json`                                        | base/patch SHAs + every changed path → layer + anti-revert hashes |
-| `README.md`                                            | This file                                                         |
-| `APPLY-INSTRUCTIONS.md`                                | Step-by-step, CDK-free, confirmation-gated apply guide            |
-| `host-scripts/launch-vm.sh.patched`                    | Full replacement for the S3-pulled launch-vm.sh                   |
-| `launch-template/init-host.sh.patched` + `APPLY-LT.md` | LT-baked file + manual LT/ASG update                              |
-| `lambda/APPLY-LAMBDA.md`                               | Lambda redeploy via update-function-code                          |
-| `iam/apply-iam.sh` + `host-role-tenant-secrets.json`   | Inline-policy hotfix (fail-closed prereq)                         |
-| `network/APPLY-NETWORK.md`                             | Probe-driven, human-gated Secrets Manager VPCE                    |
+| Path                                                   | Purpose                                                             |
+| ------------------------------------------------------ | ------------------------------------------------------------------- |
+| `manifest.json`                                        | base/patch SHAs + every changed path → layer + anti-revert hashes   |
+| `README.md`                                            | This file                                                           |
+| `APPLY-INSTRUCTIONS.md`                                | Step-by-step, CDK-free, confirmation-gated apply guide              |
+| `host-scripts/launch-vm.sh.patched`                    | Full replacement for the S3-pulled launch-vm.sh                     |
+| `launch-template/init-host.sh.patched` + `APPLY-LT.md` | LT-baked file + manual LT/ASG update                                |
+| `lambda/api/` (36 files)                               | Full Lambda source tree (== repo `deploy/lambda/api/` at patch_sha) |
+| `lambda/APPLY-LAMBDA.md`                               | Lambda redeploy: bundle deps + update-function-code + alias         |
+| `iam/apply-iam.sh` + `host-role-tenant-secrets.json`   | Inline-policy hotfix (fail-closed prereq)                           |
+| `network/APPLY-NETWORK.md`                             | Probe-driven, human-gated Secrets Manager VPCE                      |
 
 ## Verification summary
 

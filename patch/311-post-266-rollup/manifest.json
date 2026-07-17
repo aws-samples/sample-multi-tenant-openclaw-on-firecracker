@@ -1,0 +1,56 @@
+{
+  "id": "311-post-266-rollup",
+  "base_sha": "f7a4d08756802141bc2dc292371f9d954e85efd1",
+  "patch_sha": "18e469e963ad086d64af317499465b0319ba09f5",
+  "no_cdk": true,
+  "note": "cdk deploy is FORBIDDEN on this deployment: it was CDK-deployed once and then manually modified on the live system; a cdk deploy would overwrite those manual changes. Every change below has a manual apply path.",
+  "paths": {
+    "deploy/userdata/launch-vm.sh": {
+      "layer": "B-s3-pulled",
+      "artifact": "host-scripts/launch-vm.sh.patched",
+      "base_hash": "51c7049b04c4225b073e2e23152e044bf5436ba50d894e38e82bcffe769612d6",
+      "patch_hash": "376559e78d4b8ec715e9374a8762d9ff3e1a0182d2b008548ecf8e413e55c99c"
+    },
+    "deploy/userdata/init-host.sh": {
+      "layer": "A-launch-template-baked",
+      "artifact": "launch-template/init-host.sh.patched",
+      "base_hash": "2b91afa53ed535b7624643838fce57bda5b093ed50213db5663d6e221d0e72fc",
+      "patch_hash": "5e8f50c1f26cf6decce5612f8f3241b741c66da9cf0e713aacd66856966690f0"
+    },
+    "deploy/lambda/api/handler.py": {
+      "layer": "C-lambda",
+      "artifact": "lambda/APPLY-LAMBDA.md",
+      "note": "private-API {proxy+} routing fix #298 — only needed on a private API Gateway"
+    },
+    "deploy/lambda/api/services/host_service.py": {
+      "layer": "C-lambda",
+      "artifact": "lambda/APPLY-LAMBDA.md",
+      "note": "rebuild adoption-verify #304"
+    },
+    "deploy/lambda/api/services/tenant_service.py": {
+      "layer": "C-lambda",
+      "artifact": "lambda/APPLY-LAMBDA.md",
+      "note": "restart-vs-rebuild semantics #304/#305"
+    },
+    "deploy/stacks/compute.py": {
+      "layer": "D-cdk-tier1-iam",
+      "artifact": "iam/apply-iam.sh",
+      "note": "host role dynamodb:GetItem on openclaw-tenant-secrets — inline policy, no cdk"
+    },
+    "deploy/stacks/observability.py": {
+      "layer": "D-cdk-network",
+      "artifact": "network/APPLY-NETWORK.md",
+      "note": "secretsmanager Interface VPCE #309 — DESCRIBE-ONLY, human-gated create; probe before touching"
+    },
+    "setup.sh": {
+      "layer": "meta",
+      "artifact": "host-scripts (sha256 helper folded into APPLY Step 3)",
+      "note": "cross-platform sha256 (_obs_upload): shasum missing on Linux/AL2023 — a manual S3 upload hits the same trap"
+    },
+    "config.yml.example": {
+      "layer": "meta",
+      "artifact": "not shipped",
+      "note": "documents create_secretsmanager_vpce toggle; not applied to customer env"
+    }
+  }
+}

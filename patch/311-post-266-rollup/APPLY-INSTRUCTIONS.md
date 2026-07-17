@@ -1,138 +1,131 @@
-# Applying Patch 311 (Post-266 Rollup)
+# Applying Patch 311 (Post-266 Rollup) — CDK-free
 
-Step-by-step guide to apply the post-266 fixes to a running OpenClaw on Firecracker
-deployment. Follow the steps in order — the dependency order matters (a wrong order
-fails mid-way). Suitable for a human operator or an AI assistant.
+Step-by-step guide for a human operator or a Claude Code executor. Follow the order — it
+matters (fail-closed IAM first; running machines before future-machine sources; network
+last and human-gated).
 
-## Step 0: Gather information
+## Absolute rule: no `cdk deploy`
 
-```
-1. Host IP(s) (metal instances) and SSH key path.
-2. AWS region and account id.
-3. The host instance-role name (if unknown, run `aws sts get-caller-identity`
-   on the host and read it from the ARN).
-4. Is your API a private API Gateway or public? (decides whether the private-API
-   routing fix is needed).
-5. Can you run `cdk deploy`? (yes -> a single deploy is simplest; no -> use the
-   per-layer hotfix steps).
-6. Any tenants stuck creating / unable to connect, or a stack stuck in ROLLBACK?
-```
+This deployment was CDK-deployed once and then **manually modified on the live system.**
+Running `cdk deploy` or `setup.sh` now would overwrite those manual changes and break it.
+**Never run either.** Every step below is a targeted AWS CLI / ssh command.
 
-## Step 1: IAM grant (do this FIRST — fail-closed prerequisite)
-
-`launch-vm.sh` reads the gateway token from `openclaw-tenant-secrets` on the
-recovery path and **aborts if that read is denied**. Ensure the host role can read
-that table before replacing scripts or rebuilding tenants.
-
-Probe on the host:
+## Step 0 — Probe: gather the real values (read-only first)
 
 ```bash
-aws dynamodb get-item --table-name openclaw-tenant-secrets \
-  --key '{"tenant_id":{"S":"__probe__"}}' --region <region>
+aws sts get-caller-identity                              # region/account/identity
+# Host IP(s) + SSH key path: <fill in>
+# Is the API a PRIVATE or PUBLIC API Gateway? (decides if the private-API Lambda fix applies)
+ssh -i <key> ubuntu@<host> 'journalctl -t claw-launch --no-pager -n 200'
+ssh -i <key> ubuntu@<host> 'sudo tail -n 200 /var/log/openclaw-init.log'
+curl -s "https://<api>/tenants" -H "x-api-key: <key>" | head
+ssh -i <key> ubuntu@<host> "grep -o 's3://[^ ]*' /var/log/openclaw-init.log | sort -u"  # real S3 path
 ```
 
-- Returns `{}` or an item -> already granted, skip this step.
-- `AccessDeniedException` -> grant it:
-  - If you will `cdk deploy` (Step 4), the grant is included — you can defer.
-  - Otherwise apply the inline policy now:
-    ```bash
-    bash iam/apply-iam.sh <host-role-name> <region> <account-id>
-    # Re-run the probe to confirm it no longer returns AccessDenied.
-    ```
+## Step 1 — Impact assessment (write before any change)
 
-## Step 2: Host scripts
+- **Affected:** <tenants / hosts / regions, from the probe evidence>
+- **Symptom:** <rc=127 / 404 on private API / ABANDONED hosts / VPCE timeout — whichever you see>
+- **Root cause:** per the README table.
+- **Expected post-fix state:** <the concrete signal you'll verify in Step 6>
 
-### 2a. Hot-replace on the current host (back up first, diff after)
+## Step 1.5 — Anti-revert hash gate + full change list (RUN BEFORE ANY WRITE)
 
-If your deployment runs a customized `launch-vm.sh`, do not blind-replace: diff
-first and confirm the only differences are the fixes; otherwise merge by hand.
+This deployment is patched iteratively; a blind replace can DOWNGRADE it. `manifest.json`
+lists every changed path with `base_hash` and `patch_hash`. For each shipped file, hash the
+LIVE copy and branch:
+
+```bash
+LIVE=$(ssh -i <key> ubuntu@<host> 'sha256sum /home/ubuntu/launch-vm.sh' | awk '{print $1}')
+# launch-vm.sh: base=51c7049b… patch=376559e7…   (init-host.sh: base=2b91afa5… patch=5e8f50c1…)
+```
+
+- `LIVE == patch_hash` → already applied, **SKIP**.
+- `LIVE == base_hash` → clean apply, proceed.
+- `LIVE == neither` → **diverged. STOP.** Show `diff` to the terminal user; overwrite only
+  on explicit approval (the live copy may be a newer fix — don't revert it).
+
+## Step 2 — Hot-fix running machines (restore service now)
+
+### 2a. Fail-closed prerequisite: IAM grant — FIRST. Probe with the HOST role, not yours.
+
+Permissions: `iam:PutRolePolicy` (to grant); the probe runs on the host so it uses the host
+instance role.
+
+```bash
+# Probe from the host (uses the EC2 host role — the identity launch-vm.sh actually uses):
+ssh -i <key> ubuntu@<host> "aws dynamodb get-item --table-name openclaw-tenant-secrets \
+  --key '{\"tenant_id\":{\"S\":\"__probe__\"}}' --region <region>"
+# AccessDenied -> grant, then re-probe:
+bash iam/apply-iam.sh <host-role-name> <region> <account-id>
+```
+
+(Your own admin creds reading the table proves nothing about the host role.)
+
+### 2b. Replace launch-vm.sh on the live host (after the Step-1.5 gate cleared it)
+
+Permissions: SSH key to the host. Back up, replace, `bash -n`, diff-guard, roll back.
 
 ```bash
 ssh -i <key> ubuntu@<host> 'cp /home/ubuntu/launch-vm.sh /home/ubuntu/launch-vm.sh.bak.311'
 scp -i <key> host-scripts/launch-vm.sh.patched ubuntu@<host>:/home/ubuntu/launch-vm.sh
 ssh -i <key> ubuntu@<host> 'bash -n /home/ubuntu/launch-vm.sh && echo syntax-ok'
+ssh -i <key> ubuntu@<host> 'diff /home/ubuntu/launch-vm.sh.bak.311 /home/ubuntu/launch-vm.sh'
+# rollback: cp /home/ubuntu/launch-vm.sh.bak.311 /home/ubuntu/launch-vm.sh
 ```
 
-Roll back if anything looks wrong:
-`ssh -i <key> ubuntu@<host> 'cp /home/ubuntu/launch-vm.sh.bak.311 /home/ubuntu/launch-vm.sh'`
+## Step 3 — Lambda code (private-API routing + rebuild semantics)
 
-### 2b. Future hosts: upload to S3
+Permissions: `lambda:ListFunctions`, `lambda:UpdateFunctionCode`. The private-API routing
+fix is only needed on a private API Gateway (Step 0). See `lambda/APPLY-LAMBDA.md`.
 
-New hosts download these scripts at boot. Upload to the exact path the boot script
-reads from — verify it, do not guess:
+## Step 4 — Future-machine source (S3 + Launch Template)
+
+### 4a. S3-pulled launch-vm.sh — temp key, verify, promote (keep old version to roll back)
+
+Permissions: `s3:PutObject`, `s3:GetObject` (+ `s3:GetObjectVersion` for rollback). Use the
+cross-platform sha256 helper (a bare `shasum` fails on Linux/AL2023):
 
 ```bash
-# Find the real S3 path this deployment pulls from:
-grep -o 's3://[^ ]*launch-vm.sh' /var/log/openclaw-init.log
-grep -o 's3://[^ ]*init-host.sh' /var/log/openclaw-init.log
-
-# Upload (in the public repo the path is s3://<assets-bucket>/deployment/scripts/):
-aws s3 cp host-scripts/launch-vm.sh.patched  <real-s3-launch-vm-path>  --region <region>
-aws s3 cp host-scripts/init-host.sh.patched  <real-s3-init-host-path>  --region <region>
-
-# Verify round-trip:
-aws s3 cp <real-s3-launch-vm-path> /tmp/verify.sh --region <region>; bash -n /tmp/verify.sh && echo ok
+_sha() { if command -v sha256sum >/dev/null; then sha256sum "$1"|awk '{print $1}';
+  elif command -v shasum >/dev/null; then shasum -a 256 "$1"|awk '{print $1}';
+  else echo FATAL-no-sha256 >&2; return 1; fi; }
+REAL=$(ssh -i <key> ubuntu@<host> "grep -o 's3://[^ ]*launch-vm.sh' /var/log/openclaw-init.log" | head -1)
+aws s3 cp host-scripts/launch-vm.sh.patched "${REAL}.311.tmp" --region <region>
+aws s3 cp "${REAL}.311.tmp" /tmp/verify --region <region>
+diff /tmp/verify host-scripts/launch-vm.sh.patched && bash -n /tmp/verify && echo promote-ok
+aws s3 cp "${REAL}.311.tmp" "$REAL" --region <region>   # promote only after ok
 ```
 
-## Step 3: Lambda code
+### 4b. LT-baked init-host.sh
 
-See `lambda/APPLY-LAMBDA.md`. If you can `cdk deploy`, defer to Step 4 (it
-repackages the Lambda). Otherwise update the API function code directly. The
-private-API routing fix is only needed on private-API deployments (Step 0, Q4).
+See `launch-template/APPLY-LT.md` — running hosts were hot-fixed already; future hosts need
+a new LT version + `update-auto-scaling-group` (the ASG pins a version). NO cdk deploy.
 
-## Step 4: CDK deploy (IAM grant + VPC-endpoint toggle) — simplest one-shot
+## Step 5 — Network / VPCE (describe-only, human-gated)
 
-**Before deploying, check the Secrets Manager VPC endpoint** (see `cdk/APPLY-CDK.md`):
+**AI runs only the `describe` probes.** See `network/APPLY-NETWORK.md`: probe whether the
+Secrets Manager VPCE is even needed (skip entirely if AOS isn't deployed or NAT egress
+exists), and if it is, present the proposed `create-vpc-endpoint` to the terminal user and
+STOP. Do not create/modify any network resource without explicit approval.
 
-```bash
-aws ec2 describe-vpc-endpoints --region <region> \
-  --filters "Name=service-name,Values=com.amazonaws.<region>.secretsmanager" \
-            "Name=vpc-id,Values=<vpc-id>" \
-  --query 'VpcEndpoints[].[VpcEndpointId,PrivateDnsEnabled]' --output text
-```
+## Step 6 — Verify (dual path) + fresh-machine check + cleanup
 
-- If an endpoint with private DNS already exists, set
-  `logging.aos.create_secretsmanager_vpce: false` in `config.yml` to reuse it —
-  otherwise the deploy conflicts and rolls back.
+**Fresh-machine validation:** because this patch touched the LT-baked init-host.sh, after
+Step 4b launch ONE new host and confirm it registers healthy on its own (boots clean with
+no hot-fix). If you only applied the S3 script, the hot-fixed live host suffices.
 
-Then deploy:
+Verify BOTH paths (they log differently):
 
 ```bash
-bash setup.sh <region> <profile-or-dash>    # pass "-" as the profile to use the instance role
-# or: cdk deploy OpenClawOrchestrator --require-approval never -c region=<region>
-```
-
-A single deploy covers the IAM grant, the VPC-endpoint toggle, and the Lambda code.
-
-## Step 5: Fix affected tenants / stacks
-
-- **Stack still in ROLLBACK** (from a VPC-endpoint conflict): wait for rollback to
-  finish, handle the endpoint per Step 4, then deploy again.
-- **Tenants stuck creating** (from the token / permission issue): rebuild after the
-  fix is in place:
-  ```bash
-  curl -X DELETE "https://<api>/tenants/<tid>" -H "x-api-key: <key>"; sleep 15
-  curl -X POST   "https://<api>/tenants" -H "x-api-key: <key>" \
-    -H "Content-Type: application/json" -d '{"tenant_id":"<tid>"}'
-  ```
-
-## Step 6: Verify
-
-```bash
-# Host: launch no longer exits rc=127 and no longer hangs at the tools step
-ssh -i <key> ubuntu@<host> 'journalctl -t claw-launch --no-pager -n 100 | grep -iE "rc=127|DDB fallback"'
-
-# Permission: the probe no longer returns AccessDenied
-aws dynamodb get-item --table-name openclaw-tenant-secrets \
-  --key '{"tenant_id":{"S":"__probe__"}}' --region <region>
-
-# CDK: stack reaches CREATE_COMPLETE, no VPC-endpoint conflict
-aws cloudformation describe-stacks --stack-name OpenClawOrchestrator \
-  --region <region> --query 'Stacks[0].StackStatus'
-
-# Private API: a non-/ping route responds
+# normal path
+curl -X POST "https://<api>/tenants" -H "x-api-key: <key>" -d '{"tenant_id":"patch-311-test"}'
+# ~30s later on host: expect "using control-plane pre-minted gateway token", no rc=127
+ssh -i <key> ubuntu@<host> 'journalctl -t claw-launch --no-pager -n 100 | grep -iE "pre-minted|rc=127"'
+# recovery path: kill the fc process, let host-agent relaunch with 4 args, expect DDB fallback logs
+ssh -i <key> ubuntu@<host> 'journalctl -t claw-launch --no-pager -n 100 | grep -iE "DDB fallback"'
+# private API: a non-/ping route responds
 curl -s "https://<api>/tenants" -H "x-api-key: <key>" | head
-
-# End to end: create a tenant, wait for status=running and app_health=up,
-# then connect over WebSocket (token matches, no manual approve needed).
+# cleanup
+curl -X DELETE "https://<api>/tenants/patch-311-test" -H "x-api-key: <key>"
 ```

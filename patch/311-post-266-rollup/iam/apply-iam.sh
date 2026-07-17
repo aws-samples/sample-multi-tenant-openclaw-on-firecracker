@@ -11,9 +11,10 @@
 # aborts. Without this permission the VM never starts and the tenant is stuck
 # creating.
 #
-# The proper fix is via CDK (compute.py grants this; `cdk deploy` applies it). This
-# script is the equivalent inline-policy hotfix for "can't deploy yet, need the
-# live system working now". You can remove the inline policy after a later deploy.
+# In the source, compute.py grants this. But `cdk deploy` is FORBIDDEN on this deployment
+# (it was CDK-deployed once and then manually modified; a deploy would overwrite those
+# changes). This inline policy IS the fix here — permanent, not a stopgap. Idempotent:
+# put-role-policy overwrites the same policy name, so re-running is safe.
 #
 # Usage:  bash apply-iam.sh <host-role-name> <region> <account-id>
 #   host-role-name: from `aws sts get-caller-identity` on the host (ARN tail), or

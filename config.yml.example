@@ -551,6 +551,7 @@ logging:
   enabled: false
   aos:
     subnet_ids: []                                # #272 — 可选,显式指定 OpenSearch 域子网 id;空=PRIVATE_WITH_EGRESS 自动选(数量须与 az_count 对齐)。
+    create_secretsmanager_vpce: true              # #309 — 建 secretsmanager Interface VPCE 供 AOS rolesmapping Lambda 取口令。VPC 里已有一个开 private DNS 的 secretsmanager VPCE(残留/客户自建)时设 false 复用它(AWS 同服务同 VPC 只许一个开 private DNS,否则整栈 ROLLBACK)。
     data_node_instance_type: "r6g.large.search"   # 日志型写多读少,内存型优于 m 系
     data_nodes: 2                                 # 与 AZ 数取整数倍;≥3 才达 HA 底线(Multi-AZ)
     master_node_instance_type: "m6g.large.search"

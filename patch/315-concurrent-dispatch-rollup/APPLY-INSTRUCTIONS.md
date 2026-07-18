@@ -337,9 +337,20 @@ cp -a "$LAMBDA_DIR/api/." /tmp/api-overlay/
 unzip -l /tmp/api-lambda.zip | grep -qE 'core/dispatch/binpack.py' && unzip -l /tmp/api-lambda.zip | grep -qi 'cryptography/' \
   || { echo "STOP: overlay zip missing #315 code or deps"; exit 1; }
 
-# openclaw-api: update $LATEST (no --publish), wait, publish once, move the alias (if any)
+# openclaw-api: update $LATEST → wait → INVOKE-VERIFY $LATEST → only then publish + move alias.
+# The verify gate matters: update-function-code makes the dispatch ($LATEST) path run the new
+# code immediately, but the API-GW alias still points at the OLD version. So invoke $LATEST here
+# and confirm it cold-starts; if the overlay zip is broken (bad import), STOP and roll $LATEST
+# back from backup — API-GW users are untouched because the alias never moved.
 aws lambda update-function-code --function-name openclaw-api --zip-file fileb:///tmp/api-lambda.zip --region $REGION >/dev/null
 aws lambda wait function-updated --function-name openclaw-api --region $REGION
+# invoke $LATEST with a read-only /ping; require StatusCode 200 + no FunctionError + no import error
+printf '{"resource":"/ping","path":"/ping","httpMethod":"GET","headers":{},"requestContext":{"resourcePath":"/ping","httpMethod":"GET"}}' > /tmp/ping.json
+FERR=$(aws lambda invoke --function-name openclaw-api --qualifier '$LATEST' \
+  --payload fileb:///tmp/ping.json /tmp/ping.out --region $REGION --query FunctionError --output text)
+[ "$FERR" = "None" ] || { echo "STOP: \$LATEST invoke has FunctionError=$FERR — overlay likely broken; roll \$LATEST back from backup, alias untouched"; exit 1; }
+grep -qiE 'Unable to import|ModuleNotFound|ImportError' /tmp/ping.out && { echo "STOP: import error in new code — roll \$LATEST back"; exit 1; } || echo "\$LATEST invoke OK — safe to publish + move alias"
+# verified → publish and move the alias (if any)
 NEW_VER=$(aws lambda publish-version --function-name openclaw-api --region $REGION --query Version --output text)
 [ -n "$API_ALIAS" ] && aws lambda update-alias --function-name openclaw-api --name "$API_ALIAS" --function-version "$NEW_VER" --region $REGION >/dev/null
 ```

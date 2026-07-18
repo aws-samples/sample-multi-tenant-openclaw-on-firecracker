@@ -131,7 +131,8 @@ ROLE=<host-role-name>; ACCOUNT=<account-id>
 aws iam put-role-policy --role-name "$ROLE" --policy-name patch-315-tenant-secrets-read \
   --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"Patch315\",\"Effect\":\"Allow\",\"Action\":\"dynamodb:GetItem\",\"Resource\":\"arn:aws:dynamodb:$REGION:$ACCOUNT:table/openclaw-tenant-secrets\"}]}"
 # verify (re-run Step 0e — should no longer be AccessDenied).
-# rollback: aws iam delete-role-policy --role-name "$ROLE" --policy-name patch-315-tenant-secrets-read
+# NOTE: do NOT roll this back — it's a read-only, fail-closed prerequisite; harmless to keep,
+# and removing it can break the rolled-back code paths that read this table.
 ```
 
 ---
@@ -160,7 +161,9 @@ done
 ## Step 4 — Hot-fix the running hosts (per host; restore service now)
 
 For EACH live host. Atomic replace (temp file + `mv`) so a launch firing mid-copy never reads a
-half-written file.
+half-written file. **No `chmod +x` needed:** launch-vm.sh is invoked as `bash launch-vm.sh` and
+host-agent.py as `python3 host-agent.py` (explicit interpreters), so the execute bit is
+irrelevant — mode 0644 is correct.
 
 ```bash
 # 4a. launch-vm.sh
@@ -454,14 +457,27 @@ Alternative for the alias path: instead of the anchor version you can `update-fu
 $LATEST from `openclaw-api.code.zip`, then `publish-version` and point the alias at it — but the
 pre-patch **anchor version** is cleaner (it's the exact pre-patch code+config, already immutable).
 
-## Rollback the host / S3 / IAM layers
+## Rollback the host / S3 / LT layers
 
-- **host scripts**: restore `.bak.315` on each host; `systemctl restart host-agent` (the
-  `KillMode=process` drop-in can stay — it's a correctness fix, harmless to keep).
-- **S3 scripts**: `aws s3 cp $BK/s3/<f> "$BASE/<f>"`.
-- **IAM**: `aws iam delete-role-policy --role-name <role> --policy-name patch-315-tenant-secrets-read`.
+- **host scripts (both files, every host)** — restore the `.bak.315` copies and restart the
+  agent. host-agent.py is run by systemd as `python3 /opt/openclaw/host-agent.py` and
+  launch-vm.sh as `bash /home/ubuntu/launch-vm.sh`, so **neither needs an execute bit** — a
+  plain `cp` (mode 0644) is fine on both restore and apply.
+
+  ```bash
+  for h in <host1> <host2>; do
+    ssh -i <key> ubuntu@$h '
+      sudo cp /opt/openclaw/host-agent.py.bak.315 /opt/openclaw/host-agent.py
+      cp /home/ubuntu/launch-vm.sh.bak.315 /home/ubuntu/launch-vm.sh
+      sudo systemctl restart host-agent; sleep 3; systemctl is-active host-agent'
+  done
+  # the KillMode=process drop-in can stay — it's a correctness fix, harmless to keep.
+  ```
+
+- **S3 scripts** — also roll back, or a future host will re-pull the new code at boot:
+  `for f in launch-vm.sh host-agent.py; do aws s3 cp "$BK/s3/$f" "$BASE/$f" --region $REGION; done`
 - **LT** (only if you added a version in Step 6): point the ASG back at the prior version number.
-- **consumer / scaler** (`$LATEST`, no alias): re-deploy their backup `.code.zip`.
-- **S3 scripts**: `aws s3 cp $BK/s3/<f> "$BASE/<f>"`.
-- **IAM**: `aws iam delete-role-policy --role-name <role> --policy-name patch-315-tenant-secrets-read`.
-- **LT** (if you added a version): point the ASG back to the prior version number.
+- **IAM — do NOT roll back.** The Step-2 grant is a read-only permission
+  (`dynamodb:GetItem` on `openclaw-tenant-secrets`) and a fail-closed prerequisite of the token
+  fallback. It is harmless to keep, and removing it can break the (rolled-back) code paths that
+  rely on it. Leave it in place.

@@ -141,6 +141,17 @@ The launch-vm token fallback reads `openclaw-tenant-secrets` with the host role;
 aborts the launch. Grant it before the new launch-vm.sh. Patch-specific policy name so it can't
 collide with a customer policy; idempotent.
 
+> **If Step 0e already succeeded (no AccessDenied), the grant exists — SKIP, do NOT add a
+> duplicate.** A 266 customer typically already has an equivalent grant under a DIFFERENT policy
+> name (e.g. `openclaw-patch266-tenant-secrets-getitem`). Adding `patch-315-...` on top would
+> just leave a second, identical statement — redundant, and clutter for whoever cleans up IAM
+> later. Confirm equivalence, don't name-match: the grant is sufficient when, for the SAME
+> `openclaw-tenant-secrets` table ARN, some attached policy allows `dynamodb:GetItem`
+> (Effect=Allow) AND no policy Denies it (explicit Deny beats Allow). The Sid/policy NAME is
+> irrelevant to authorization. Best proof is Step 0e itself: a `get-item` run **with the host
+> role** (not your admin creds) returning no AccessDenied means it's live right now. Only if
+> that probe is denied do you run the grant below.
+
 ```bash
 ROLE=<host-role-name>; ACCOUNT=<account-id>
 aws iam put-role-policy --role-name "$ROLE" --policy-name patch-315-tenant-secrets-read \

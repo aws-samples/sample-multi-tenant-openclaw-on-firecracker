@@ -439,6 +439,35 @@ aws ec2 describe-launch-template-versions --launch-template-name "$LT" --version
 #    refresh unless you explicitly choose to). Keep $CUR_VER as the rollback anchor.
 ```
 
+**Validate the new LT by booting ONE new host — never trust the re-bake blind.** A bad re-bake
+(unreplaced `{{...}}`, gzip/base64 wrong) only shows up at boot, and it must not reach the fleet.
+So: point the ASG at the new version but do a controlled single-host launch and watch it come up
+clean, BEFORE it can affect anything. Existing hosts are never touched (no instance refresh).
+
+```bash
+REGION=<region>; ASG=<asg-name>; LT=openclaw-host-lt
+# 0. sanity BEFORE boot: the re-baked UserData must NOT contain literal placeholders.
+aws ec2 describe-launch-template-versions --launch-template-name "$LT" --versions '$Latest' --region $REGION \
+  --query 'LaunchTemplateVersions[0].LaunchTemplateData.UserData' --output text | base64 -d > /tmp/ud.new
+grep -qE '\{\{[A-Z_]+\}\}' /tmp/ud.new && { echo "STOP: new UserData still has {{placeholders}} — re-bake wrong, do NOT roll out"; } || echo "no literal placeholders — ok to boot one"
+#   (if UserData is a bootstrap that gunzips an inner blob, decode that inner blob and grep it instead)
+
+# 1. launch ONE new host on the new LT (temporary +1; do NOT instance-refresh existing hosts).
+#    e.g. bump desired by 1 and confirm ASG uses the new LT version, or launch a standalone
+#    instance from the new LT version into the host subnet.
+# 2. watch that ONE host boot clean — three signals (fails => the re-bake is bad):
+#    a) init log has no placeholder/interpreter error:
+ssh_or_ssm <new-host> 'grep -nE "\{\{|command not found|FATAL" /var/log/openclaw-init.log | tail'   # expect empty
+#    b) it registered into the hosts table (init-host step5 registers on success):
+aws dynamodb get-item --table-name openclaw-hosts --key '{"host_id":{"S":"<new-instance-id>"}}' --region $REGION --query 'Item.status.S'
+#    c) the ASG lifecycle hook got CONTINUE (not Heartbeat Timeout -> ABANDON):
+aws autoscaling describe-scaling-activities --auto-scaling-group-name "$ASG" --region $REGION --max-items 5 \
+  --query 'Activities[].{S:StatusCode,D:Description}' --output table
+# 3. GREEN (registered + no init error + lifecycle CONTINUE) -> the new LT is good; leave it.
+#    RED -> terminate that one host, roll the ASG back to $CUR_VER (the anchor). Existing hosts
+#    never saw the new LT, so the fleet is unaffected either way.
+```
+
 This whole step is **optional for this customer** (skip unless #300 is confirmed in Step 0d).
 Running hosts already booted past init-host, so it only affects future scale-out.
 

@@ -114,7 +114,11 @@ for FN in openclaw-api openclaw-lifecycle-consumer openclaw-scaler; do
     || { echo "STOP: $FN code download failed/invalid — irreversible without it, abort"; exit 1; }
 done
 
-# 1b. Host scripts — the exact bytes we overwrite on each host.
+# 1b. Host scripts — the exact bytes we overwrite on each host. Back up PER HOST (separate dir
+#     per instance-id): hosts legitimately run DIFFERENT versions (one booted earlier, or was
+#     hand-patched), so a fleet-wide drift is EXPECTED — don't be alarmed by mismatched hashes.
+#     Per-host backup means each rolls back to its OWN prior version. The patch converges them
+#     all to the target hash in Step 4, which intentionally flattens the drift.
 for h in <host1> <host2>; do
   mkdir -p "$BK/hosts/$h"
   scp -i <key> "ubuntu@$h:/home/ubuntu/launch-vm.sh" "$BK/hosts/$h/launch-vm.sh"
@@ -154,6 +158,14 @@ Hosts pull `launch-vm.sh` / `host-agent.py` from S3 at boot (`init-host.sh`). Up
 the Lambda step so that any host that boots (ASG replacement / health-recovery / manual
 scale-out) during the rollout gets the new #315 host code — not old code paired with a new
 Lambda that's already allowing higher concurrency.
+
+> **Do NOT chmod +x these files, and do not require it.** S3 objects carry no unix permission
+> bit — a `+x` you set before `aws s3 cp` is NOT stored in S3 and NOT propagated to the next
+> host; the downloaded file's mode comes from the host's umask (0644). The code never needs it:
+> it runs them as `bash launch-vm.sh` / `python3 host-agent.py` (explicit interpreters, which
+> ignore the execute bit). A `./launch-vm.sh`-style direct exec is never used. So mode 0644 is
+> correct everywhere; "must be +x or it won't run on Linux" is a myth here and, worse, would be
+> a permission that can't survive the S3 round-trip anyway.
 
 ```bash
 BASE=<s3://...deployment/scripts>

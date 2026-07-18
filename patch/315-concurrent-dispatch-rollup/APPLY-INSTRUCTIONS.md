@@ -409,10 +409,38 @@ openclaw-api needs BOTH its alias path and its `$LATEST`/dispatch path reverted.
 
 `init-host.sh` is baked into LT `openclaw-host-lt` UserData, not pulled from S3. Running hosts
 already booted — this only matters for future scale-out, and only if Step 0d showed #300.
-Create a NEW LT version carrying the patched `init-host.sh` and point the ASG at it; do **not**
-edit the existing version, and do **not** trigger an instance refresh (that would replace live
-hosts). New scale-outs pick it up; existing hosts are untouched. (Full render/`update-auto-scaling-group`
-commands: this is optional for this customer — skip unless #300 is confirmed.)
+
+> **Two traps here — read before touching the LT:**
+>
+> 1. **The shipped `init-host.sh.patched` is a TEMPLATE, not a ready file.** It still contains
+>    ~32 `{{PLACEHOLDER}}` tokens (`{{SUBNET_PREFIX}}`, `{{AVAIL_VCPU}}`, `{{AMP_REMOTE_WRITE_URL}}`,
+>    …) that CDK substitutes at synth time before baking into UserData. **Do NOT base64/gzip the
+>    shipped template into a new LT version as-is** — a host booting it would get literal `{{...}}`
+>    and fail. Instead, work like the Lambda overlay: take your CURRENT LT version's already-
+>    rendered UserData (decode it), apply ONLY the #300 change to that rendered init-host, and
+>    re-bake. Reuse your rendered values; don't re-render.
+> 2. **Find the version the ASG actually uses — NOT `$Default`.** LT default and latest commonly
+>    diverge (e.g. Default=2 but the ASG pins v4, hand-modified). Decode the version the ASG
+>    references, record it as your rollback anchor, and diff/patch against THAT.
+
+```bash
+REGION=<region>; LT=openclaw-host-lt; ASG=<asg-name>
+# 1. which LT version does the ASG actually use? (rollback anchor — do NOT assume $Default)
+aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG" --region $REGION \
+  --query 'AutoScalingGroups[0].[LaunchTemplate,MixedInstancesPolicy.LaunchTemplate.LaunchTemplateSpecification]' --output json
+# 2. decode THAT version's UserData (already-rendered init-host, no {{...}}):
+CUR_VER=<the version number from step 1>
+aws ec2 describe-launch-template-versions --launch-template-name "$LT" --versions "$CUR_VER" --region $REGION \
+  --query 'LaunchTemplateVersions[0].LaunchTemplateData.UserData' --output text | base64 -d > /tmp/ud.cur
+#    (if UserData is a bootstrap that gunzips an inner blob, that inner blob is the real init-host.sh)
+# 3. apply ONLY the #300 fix to the RENDERED init-host (diff the shipped template vs your rendered
+#    file to isolate the #300 hunk, then apply just that hunk — keep all your rendered values).
+# 4. re-bake as a NEW LT version and point the ASG at it (existing hosts untouched; NO instance
+#    refresh unless you explicitly choose to). Keep $CUR_VER as the rollback anchor.
+```
+
+This whole step is **optional for this customer** (skip unless #300 is confirmed in Step 0d).
+Running hosts already booted past init-host, so it only affects future scale-out.
 
 ---
 

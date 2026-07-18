@@ -21,8 +21,8 @@ from botocore.config import Config as BotoConfig
 # P2b (2026-07-08): route_ops lives in the same userdata directory. Add it to
 # sys.path so the tenant-route helpers (port bitmap / DNAT / Redis writer /
 # drift reconcile) resolve when host-agent runs as a systemd ExecStart from
-# /opt/openclaw/. See internal-docs/00-knowledge-base/the data-plane design/
-# the data-plane interface contract §1/§3/§4/§6/§8.
+# /opt/openclaw/. See engineering/00-knowledge-base/SPEC/11-ENGINE-TRANSFORM/
+# INTERFACE-CONTRACT.md §1/§3/§4/§6/§8.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import route_ops  # noqa: E402
 
@@ -314,6 +314,11 @@ def _get_ddb():
 
 
 _recovering = set()  # Track VMs being recovered to avoid duplicate launches
+# #315 — recover 失败退避时刻表 tenant_id → earliest-retry-epoch。修 _recovering 泄漏后,
+# 失败的 recover 不再每 5s 紧密重试(thundering herd:同 tid 反复 fire launch-vm 抢 flock 空转),
+# 按 RECOVER_BACKOFF_SEC + jitter 退避;成功即清除。
+_recover_backoff = {}
+RECOVER_BACKOFF_SEC = float(os.environ.get("OC_RECOVER_BACKOFF", "15"))
 
 # #208 — 已回填过 phys_vm_num 的 tenant_id(每进程只写一次,避免每 tick 重复 update)。
 # if_not_exists 保证幂等且绝不覆盖已有值(迁移后 phys_vm_num 必须恒等原始 launch 号),
@@ -355,8 +360,23 @@ def _launch_argv(*args):
 
 
 def _recover_vm(tenant_id, cfg):
-    """Launch VM that has vm.json but no running Firecracker process."""
+    """Launch VM that has vm.json but no running Firecracker process.
+
+    #315 修 _recovering 永久泄漏(真机 28/300 卡 creating 根因):旧版只在 Popen 抛异常时
+    discard,起 VM 子进程失败(flock-skip rc75 / START 后被杀 / 半成品)【不抛异常】→
+    _recovering 永留 → 下个 probe `if tid in _recovering: return` 永久跳过 → recover 只试
+    一次、失败即永久卡(host-agent.py 的 discard 只在 fc_running=True 才走到)。
+    修:Popen fire-and-forget(不等子进程,不设 timeout——`subprocess.call(timeout=)` 超时会
+    p.kill() 腰斩满载几十秒的 launch,codex review6 P1),**finally 释放 _recovering** 让下个
+    probe 能重试,并记 backoff 防每 5s 紧密重试的 thundering herd。真正清 backoff/_recovering
+    交给 _probe_all 的 fc_running=True 分支(确认 FC 真活才算 recover 成功);flock 防同租户重复起。
+    """
     if tenant_id in _recovering:
+        return
+    # backoff:上次 recover 未到重试时刻 → 本 tick 跳过(不占 flock、不踩踏)。
+    now = time.time()
+    due = _recover_backoff.get(tenant_id, 0)
+    if due and now < due:
         return
     _recovering.add(tenant_id)
     vm_num = cfg.get("vm_num", 1)
@@ -378,7 +398,11 @@ def _recover_vm(tenant_id, cfg):
         )
     except Exception as e:
         print(f"recover {tenant_id} failed: {e}")
+    finally:
+        # fire-and-forget:Popen 返回≠FC 真活,记 backoff 防下 probe 立即再 fire;
+        # 真正清 backoff + _recovering 交给 _probe_all 确认 fc_running=True 的分支。
         _recovering.discard(tenant_id)
+        _recover_backoff[tenant_id] = time.time() + _jitter(RECOVER_BACKOFF_SEC)
 
 
 def _force_relaunch_vm(tenant_id, cfg):
@@ -488,6 +512,10 @@ def _probe_all():
             continue
 
         _recovering.discard(tenant_id)
+        # #315(codex review4 #4)—— FC 进程真活了才算 recover 成功 → 清 backoff。
+        # recover 里对任何尝试(含 rc==0)都记了 backoff,只有这里(确认 fc_running=True)才清,
+        # 避免"launch-vm 退 0 但 FC 随即死"被误判成功后每 probe 重启。
+        _recover_backoff.pop(tenant_id, None)
 
         vm_health = "down"
         app_health = "down"
@@ -1562,25 +1590,38 @@ def _promote_tenant_running(tenant_id):
 
 
 def _bump_dispatch_retries(tenant_id):
-    """Atomic tenants.dispatch_retries += 1. Poller cap check is separate."""
+    """Atomic tenants.dispatch_retries += 1。返回新值(#315:调用方据此判是否超预算标终态);
+    表缺失/异常返回 None(调用方按"未知,不标终态"处理,留给下轮重试,fail-safe 不误终态)。"""
     if not TENANTS_TABLE:
-        return
+        return None
     try:
         table = _get_ddb().Table(TENANTS_TABLE)
-        table.update_item(
+        resp = table.update_item(
             Key={"id": tenant_id},
             UpdateExpression="ADD dispatch_retries :one",
             ExpressionAttributeValues={":one": 1},
+            ReturnValues="UPDATED_NEW",
         )
+        return int((resp.get("Attributes") or {}).get("dispatch_retries", 0))
     except Exception as e:
         print(f"bump retries {tenant_id} failed: {e}")
+        return None
 
 
 def _flag_requires_intervention(tenant_id):
     """Budget exhausted: tenants.status=requires_intervention (no reset). Only
-    from creating/failed to avoid clobbering a subsequent recovery."""
+    from creating/failed to avoid clobbering a subsequent recovery.
+
+    #315(codex review7 P2)返回 assignment 应写的终态字符串,让 assignment 与 tenant 状态一致:
+    - 写成功 → "failed":tenant 刚翻 requires_intervention,assignment 标 failed 匹配。
+    - CCF → 回读 tenant 真实状态定夺(不再一律当 failed,否则健康线程已 promote running 时会留下
+      tenant=running / assignment=failed 矛盾):
+        · running → "done":VM 已活,assignment 应标 done(与 _mark_assignment_done 一致)。
+        · 其它终态(deleted/stopped/已 intervention)→ "failed":标 failed 无害。
+    - 真异常(DDB 5xx/throttle,非 CCF)/回读失败 → None:tenant 终态未确认,调用方【保持 assignment
+      pending】下轮重试,不能标终态(否则 assignment 脱离 pending + tenant 仍 creating = 断链)。"""
     if not TENANTS_TABLE:
-        return
+        return None
     try:
         table = _get_ddb().Table(TENANTS_TABLE)
         table.update_item(
@@ -1595,9 +1636,23 @@ def _flag_requires_intervention(tenant_id):
                 ":t": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             },
         )
+        return "failed"
     except Exception as e:
         if "ConditionalCheckFailedException" not in str(e):
             print(f"requires_intervention {tenant_id} failed: {e}")
+            return None  # 真异常:终态未确认,保持 assignment pending
+        # CCF:tenant 已非 creating/failed → 回读真实状态,让 assignment 与之一致。
+        # #315(codex review8 P2)ConsistentRead=True:健康线程刚 promote running 触发本 CCF,
+        # 默认最终一致的 get_item 可能仍读到旧 creating → 误返 "failed" 再成矛盾态。强一致读拿
+        # 到刚写入的 running。
+        try:
+            cur = table.get_item(Key={"id": tenant_id}, ConsistentRead=True).get(
+                "Item", {}
+            )
+            return "done" if cur.get("status") == "running" else "failed"
+        except Exception as e2:
+            print(f"requires_intervention {tenant_id} status reread failed: {e2}")
+            return None  # 回读失败:不确定,保持 pending 下轮重试
 
 
 def _execute_launch(assignment):
@@ -1694,12 +1749,21 @@ def _dispatch_tick(table):
         tid = step["tenant_id"]
         if step["action"] == "skip_done":
             _mark_assignment_done(table, INSTANCE_ID, tid)
-            _promote_tenant_running(tid)
+            # #315 — 不在此处直接 promote:_promote_tenant_running 无健康/路由检查,会把
+            # 半成品 VM(vm.json 在但 FC 没起/gateway 没活)误标 running(真机 28/300 卡的
+            # 反面:误 promote 更糟)。统一由健康探测路径 _write_ddb 在 vm_health+app_health
+            # (gateway 18789 应答)+ _ensure_route 都成立后才 creating→running(codex 判:唯一 promote 写手)。
         elif step["action"] == "over_budget":
-            _mark_assignment_failed(
-                table, INSTANCE_ID, tid, reason="retry budget exhausted"
-            )
-            _flag_requires_intervention(tid)
+            # #315(codex review7 P2)先写 tenant 终态,按返回的终态给 assignment 打一致标签:
+            # "failed"→标 failed;"done"(tenant 已被健康线程 promote running)→标 done 避免
+            # tenant=running/assignment=failed 矛盾;None(DDB 异常)→保持 pending 下轮重试不断链。
+            _final = _flag_requires_intervention(tid)
+            if _final == "done":
+                _mark_assignment_done(table, INSTANCE_ID, tid)
+            elif _final == "failed":
+                _mark_assignment_failed(
+                    table, INSTANCE_ID, tid, reason="retry budget exhausted"
+                )
         elif step["action"] == "skip_inflight":
             # Prior tick is still running; next tick will re-plan.
             continue
@@ -1741,7 +1805,9 @@ def _dispatch_tick(table):
                 continue
             if ok:
                 _mark_assignment_done(table, INSTANCE_ID, tid)
-                _promote_tenant_running(tid)
+                # #315 — 不在此处直接 promote(见 skip_done 分支同款理由):launch-vm 返回 0
+                # 只代表脚本退出 0,不代表 gateway 已活、路由已通。半成品 VM(START 后被杀/
+                # gateway 没起)会被误标 running。统一由 _write_ddb 健康门 promote(唯一写手)。
             else:
                 # P0.1: classify the failure. Transient (throttle/timeout) →
                 # short jittered retry, do NOT burn retry budget. Real
@@ -1749,10 +1815,31 @@ def _dispatch_tick(table):
                 # budget cap still catches genuinely stuck tenants.
                 delay = _backoff_for_reason(err_reason)
                 is_transient = delay <= DISPATCH_BACKOFF_TRANSIENT_SEC
-                _mark_assignment_failed(table, INSTANCE_ID, tid, reason=err_reason)
                 _dispatch_enqueue(tid, delay)
                 if not is_transient:
-                    _bump_dispatch_retries(tid)
+                    new_retries = _bump_dispatch_retries(tid)
+                # #315(codex 点 5)真机 15/300 卡 creating 根因:旧版无条件
+                # _mark_assignment_failed(pending→failed),但 _query_pending_assignments
+                # 只查 pending → assignment 一旦 failed,dispatch_tick 下轮再也捞不到它,
+                # _dispatch_enqueue 的 backoff 成摆设(队列说"可起"但 DDB 捞不到 pending 就不起)
+                # → tenant 永久卡 creating、assignment=failed、无 vm.json(真机实证:flock 争用下
+                # 起 VM 真失败一次即永久卡)。修:普通失败【保持 assignment pending】(下轮 backoff
+                # 到期 dispatch_tick 重新捞到重试),【只有 retries 超预算】才标终态 failed(不再重试)。
+                if (
+                    not is_transient
+                    and new_retries is not None
+                    and (new_retries >= DISPATCH_RETRY_BUDGET)
+                ):
+                    # #315(codex review7 P2)先写 tenant 终态,按返回的终态给 assignment 一致标签:
+                    # "failed"→failed;"done"(健康线程已 promote running)→done 避免矛盾态;
+                    # None(DDB 异常)→保持 pending 下轮重捞重试,不断链(两写不原子的安全顺序)。
+                    _final = _flag_requires_intervention(tid)
+                    if _final == "done":
+                        _mark_assignment_done(table, INSTANCE_ID, tid)
+                    elif _final == "failed":
+                        _mark_assignment_failed(
+                            table, INSTANCE_ID, tid, reason=err_reason
+                        )
 
 
 def _dispatch_loop():

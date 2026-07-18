@@ -205,8 +205,14 @@ fan_out_main() {
       _fo_log "launch skip(flock held) tenant=${tid} rc=75 — 保持 pending 待重投"
     else
       echo "failed" > "${rfile}"
-      [ "${FROM_DDB}" -eq 1 ] && _mark_assignment "${tid}" "failed" "launch-vm rc=${rc}"
-      _fo_log "launch fail tenant=${tid} rc=${rc}"
+      # #315(codex 8.4 HIGH)—— ddb 模式:普通非零退出【不】标 assignment failed,保持 pending。
+      # 与 host-agent _dispatch_tick 点5 同源:assignment 一旦 failed,host-agent
+      # _query_pending_assignments 只查 pending → 再也捞不到 → 永久卡 creating、不经预算、不进 DLQ
+      # (SSM --from-ddb 执行器的"首败即终态",与 Python reconciler 是同一 bug 的 shell 副本)。
+      # 保持 pending 让 host-agent 下轮重捞重试;retry budget 耗尽转终态由控制面单一处判(host-agent
+      # _bump_dispatch_retries + 点5),执行体不知道 budget、不做终态判定。rfile 仍写 "failed" 供
+      # push 模式 v2 报告给 poller(push 保留原语义,不受此改影响)。
+      _fo_log "launch fail tenant=${tid} rc=${rc} — ddb 保持 pending 待重投(不标终态)"
     fi
   }
 

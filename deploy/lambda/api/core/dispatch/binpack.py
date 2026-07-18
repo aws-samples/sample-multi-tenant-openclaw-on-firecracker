@@ -32,7 +32,13 @@ def _slots_needed(tenant: Dict[str, Any]) -> int:
 def _rank_hosts_by_capacity(
     hosts: List[Dict[str, Any]], skip_simulated: bool
 ) -> List[Dict[str, Any]]:
-    """按 free_slots 降序排;可选跳过 simulated host(push 模式)。inflight_ok=False 一律跳过。"""
+    """按 free_slots 降序排;可选跳过 simulated host(push 模式);inflight_ok=False 跳过。
+
+    #315 SPLIT_BY_MODE:inflight_ok 的取值由调用方(_snapshot_hosts)按 dispatch 模式给——
+    - push 模式:host 有未过期在途命令 → inflight_ok=False → 这里跳过(host 级串行,poller 需要)。
+    - ddb 模式:inflight_ok 恒 True → 这里不跳过,允许一台 host 并发多批(host-agent 兜底,
+      可扩 1000 host)。容量安全由 _try_reserve_host 的 slot 级 CAS 保证,与 inflight 无关。
+    本函数逻辑对两模式统一(照 inflight_ok 跳),真正的模式差异在 _snapshot_hosts 怎么算 inflight_ok。"""
     usable = []
     for h in hosts:
         if not h.get("inflight_ok", True):

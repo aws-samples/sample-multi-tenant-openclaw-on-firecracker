@@ -5,52 +5,64 @@
   "for": "a deployment that applied ONLY patch/266-token-drift-fix; rolls up every post-266 customer-facing fix (former 311-rollup: #290/#298/#300/#303/#304/#305/#306/#307/#312/#314) PLUS #315 (concurrent-tenant dispatch: remove host-level inflight gate in ddb mode + host-agent reconciler race fixes + scaler idle auto-scale-down off).",
   "no_cdk": true,
   "note": "cdk deploy is FORBIDDEN (this deployment was CDK-deployed once then hand-modified; a deploy would overwrite the manual changes). All shipped files are a byte-for-byte snapshot of the public gateway branch HEAD. APPLY-INSTRUCTIONS.md carries the commands we test-verified; the operator/AI adapts placeholders (<region>/<host>/<key>/resource names) to the target environment. Backup only the minimal set below (the files/functions this patch actually replaces) — nothing else is touched.",
+  "verify_source_before_apply": {
+    "why": "Each shipped artifact must equal its SOURCE file in the repo at patch_sha — this catches a mis-packaged (張冠李戴) patch before you push anything to the live system. For each entry in 'replaces', `source` is the repo path and `sha256` is that file's SHA-256 at patch_sha; the shipped `artifact` must hash to the same value.",
+    "how": "In a checkout of the gateway branch at patch_sha (or compare against the shipped artifact directly): `git show <patch_sha>:<source> | shasum -a 256` must equal the entry's `sha256`, AND `shasum -a 256 <artifact>` must equal it too. All hashes here are SHA-256 (not SHA-1 — a tool defaulting to SHA-1 will show a false mismatch).",
+    "dir_case": "For the api tree (a directory, not one file), verify the file COUNT matches (36 files at patch_sha under deploy/lambda/api) and spot-check the #315-changed files: core/clients.py, core/dispatch/binpack.py, services/dispatch_poller.py, services/dispatch_service.py."
+  },
   "replaces": {
     "host-scripts (S3-pulled + hot on live hosts)": {
-      "deploy/userdata/launch-vm.sh": {
+      "launch-vm.sh": {
+        "source": "deploy/userdata/launch-vm.sh",
         "artifact": "host-scripts/launch-vm.sh.patched",
+        "sha256": "f73a601cbbd926060a09977843116005fcfee03fa3a869adbab4e38ab7e66d2d",
         "on_host": "/home/ubuntu/launch-vm.sh",
         "s3": "s3://<assets-bucket>/deployment/scripts/launch-vm.sh",
-        "sha256": "f73a601cbbd926060a09977843116005fcfee03fa3a869adbab4e38ab7e66d2d",
         "why": "#290/#306 token fallback + rc=127 fix, #301 default-template skip-S3, #312/#314 paired.json/vkey re-inject, #315 ddb-mode non-zero-exit keeps assignment pending. Cumulative."
       },
-      "deploy/userdata/host-agent.py": {
+      "host-agent.py": {
+        "source": "deploy/userdata/host-agent.py",
         "artifact": "host-scripts/host-agent.py.patched",
+        "sha256": "a7daa3ceecdc675dd2116c76195657eca4842789906c8f8037bb33b1ad30e6cd",
         "on_host": "/opt/openclaw/host-agent.py (systemd unit: host-agent)",
         "s3": "s3://<assets-bucket>/deployment/scripts/host-agent.py",
-        "sha256": "a7daa3ceecdc675dd2116c76195657eca4842789906c8f8037bb33b1ad30e6cd",
         "why": "#315 reconciler race fixes (_recovering leak, failed-launch keeps pending, health-gated promote). New in #315.",
         "restart_caveat": "host-agent.service has no KillMode -> default control-group -> `systemctl restart` SIGTERMs the whole cgroup and kills EVERY tenant firecracker on that host. Set KillMode=process (drop-in) BEFORE restart. See APPLY Step 4."
       }
     },
     "lambda (update-function-code only; NEVER update-function-configuration; ESM untouched)": {
-      "deploy/lambda/api/**": {
+      "api-tree": {
+        "source": "deploy/lambda/api/ (36 files at patch_sha)",
         "artifact": "lambda/api/ (36 files, gateway HEAD snapshot)",
+        "verify": "compare file count (36) + spot-check the #315-changed files; whole-tree, not a single sha256",
         "functions": [
           "openclaw-api (API GW -> live alias; dispatch SQS ESM -> $LATEST)",
           "openclaw-lifecycle-consumer ($LATEST; handles start/stop/restart/rebuild/delete — create does NOT go through it since create_via_queue=false)"
         ],
         "why": "#298 private-API routing, #303/#304/#305 rebuild semantics, #312/#314 device_paired persistence, #315 dispatch (clients/binpack/dispatch_poller/dispatch_service)."
       },
-      "deploy/lambda/scaler/handler.py": {
+      "scaler-handler": {
+        "source": "deploy/lambda/scaler/handler.py",
         "artifact": "lambda/scaler/handler.py",
-        "functions": ["openclaw-scaler ($LATEST; EventBridge)"],
         "sha256": "17f600d401fe70fb452921726275c37ba4e47240c1fb9521467c20e2bf20e061",
+        "also_shipped_as": "lambda/scaler/openclaw-scaler.zip (prebuilt; same handler.py)",
+        "functions": ["openclaw-scaler ($LATEST; EventBridge)"],
         "why": "#315 IDLE_RECLAIM_ENABLED=False (never terminates idle hosts)."
       }
     },
     "launch-template-baked (manual new-LT-version; NO cdk deploy)": {
-      "deploy/userdata/init-host.sh": {
+      "init-host.sh": {
+        "source": "deploy/userdata/init-host.sh",
         "artifact": "launch-template/init-host.sh.patched",
-        "baked_into": "LT openclaw-host-lt UserData (base64(gzip(...)))",
         "sha256": "5e8f50c1f26cf6decce5612f8f3241b741c66da9cf0e713aacd66856966690f0",
+        "baked_into": "LT openclaw-host-lt UserData (base64(gzip(...)))",
         "why": "#300 stack-output key substring match. Unchanged by #315. Only needed if the customer hasn't picked up #300. Running hosts already booted — only affects future scale-out."
       }
     },
     "iam (inline policy; only if the host-role probe returns AccessDenied)": {
-      "host-role dynamodb:GetItem on openclaw-tenant-secrets": {
-        "why": "#307/#308 fail-closed prerequisite of the launch-vm token fallback. A 266 customer may already have it. Command inline in APPLY Step 2.",
-        "not_a_file": true
+      "host-role-tenant-secrets-read": {
+        "not_a_file": true,
+        "why": "#307/#308 fail-closed prerequisite of the launch-vm token fallback. A 266 customer may already have it under a different policy name — confirm equivalence (same table ARN, Allow dynamodb:GetItem, no Deny) and SKIP; do not add a duplicate. Command inline in APPLY Step 2."
       }
     }
   },

@@ -349,12 +349,17 @@ printf '%s\n' "$ZIPLIST" | grep -qE 'core/dispatch/binpack\.py' && printf '%s\n'
 # back from backup — API-GW users are untouched because the alias never moved.
 aws lambda update-function-code --function-name openclaw-api --zip-file fileb:///tmp/api-lambda.zip --region $REGION >/dev/null
 aws lambda wait function-updated --function-name openclaw-api --region $REGION
-# invoke $LATEST with a read-only /ping; require StatusCode 200 + no FunctionError + no import error
+# invoke $LATEST with a read-only synthetic event. This gate ONLY proves the new code LOADS
+# (no import/dependency breakage) — judge it by FunctionError=None, NOT by the response body.
+# On a private API a synthetic {"resource":"/ping"} legitimately returns a 404 body: #298 makes
+# the handler route by event["path"] via /{proxy+}, and this synthetic event isn't a real proxy
+# event, so a 404 here is EXPECTED and fine. A broken overlay shows up as FunctionError!=None
+# (e.g. Unhandled/import error), which is what we trap. Real route behavior is validated in Step 7.
 printf '{"resource":"/ping","path":"/ping","httpMethod":"GET","headers":{},"requestContext":{"resourcePath":"/ping","httpMethod":"GET"}}' > /tmp/ping.json
 FERR=$(aws lambda invoke --function-name openclaw-api --qualifier '$LATEST' \
   --payload fileb:///tmp/ping.json /tmp/ping.out --region $REGION --query FunctionError --output text)
 [ "$FERR" = "None" ] || { echo "STOP: \$LATEST invoke has FunctionError=$FERR — overlay likely broken; roll \$LATEST back from backup, alias untouched"; exit 1; }
-grep -qiE 'Unable to import|ModuleNotFound|ImportError' /tmp/ping.out && { echo "STOP: import error in new code — roll \$LATEST back"; exit 1; } || echo "\$LATEST invoke OK — safe to publish + move alias"
+grep -qiE 'Unable to import|ModuleNotFound|ImportError' /tmp/ping.out && { echo "STOP: import error in new code — roll \$LATEST back"; exit 1; } || echo "\$LATEST invoke OK (body may be 404 — that's expected; FunctionError=None is the pass) — safe to publish + move alias"
 # verified → publish and move the alias (if any)
 NEW_VER=$(aws lambda publish-version --function-name openclaw-api --region $REGION --query Version --output text)
 [ -n "$API_ALIAS" ] && aws lambda update-alias --function-name openclaw-api --name "$API_ALIAS" --function-version "$NEW_VER" --region $REGION >/dev/null
@@ -464,8 +469,10 @@ API_ALIAS=$(aws lambda list-aliases --function-name openclaw-api --region $REGIO
 [ -n "$API_ALIAS" ] && echo "openclaw-api alias '$API_ALIAS' -> v$(aws lambda get-alias --function-name openclaw-api --name "$API_ALIAS" --region $REGION --query FunctionVersion --output text)"
 
 # (iii) the code actually cold-starts (no dependency/import breakage) — invoke a read-only route.
-#       200 + no FunctionError + no 'Unable to import' in logs = the repackaged deps load fine.
-#       (this is the key check for the "reuse existing deps + overlay patched source" packaging.)
+#       PASS = FunctionError=null + no 'Unable to import' in logs. Do NOT require a 200 body:
+#       on a private API this synthetic /ping returns a 404 body (it's not a real /{proxy+}
+#       event — #298 routes by path), which is EXPECTED and not a failure. FunctionError=null
+#       is the signal that the repackaged deps load. Real route behavior = Step 7b.
 cat > /tmp/ping.json <<'E'
 {"resource":"/ping","path":"/ping","httpMethod":"GET","headers":{},"requestContext":{"resourcePath":"/ping","httpMethod":"GET"}}
 E

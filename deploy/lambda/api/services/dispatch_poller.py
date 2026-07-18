@@ -203,7 +203,29 @@ def _params_from_tenant(item: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def poll_inflight() -> Dict[str, Any]:
-    """扫在途命令,推进终态或回滚。返回统计 dict(供指标/日志)。"""
+    """扫在途命令,推进终态或回滚。返回统计 dict(供指标/日志)。
+
+    #315 SPLIT_BY_MODE(codex 判):**ddb 模式直接空转返回**。ddb 下 host-agent reconciler
+    (每 5s 查 assignment 表)是 promote/重投的主驱动,dispatch 不写 inflight 标量;poller 若在
+    ddb 下动容量(_rollback_host 按 batch 盲扣)会错扣被其他并发命令占用的槽位(codex 上轮 Error),
+    900s reaper 只能事后修、中间过度装箱。故 ddb 模式 poller 不碰租户状态/assignment/host 容量。
+    push 模式(无 assignment 表 + 无 host-agent reconciler)poller 仍是唯一 promote/回滚驱动,照常跑。
+    """
+    if clients.DISPATCH_MODE.lower() == "ddb":
+        # #315(codex review6)—— ddb 模式 poller 纯空转:host-agent reconciler(每 5s 查
+        # assignment 表)是 promote/重投的唯一驱动;dispatch 不写 inflight 标量(_try_reserve_host
+        # write_inflight=False),_snapshot_hosts(gate_inflight=False)也【忽略】残留 inflight。
+        # 故 ddb 稳态下 inflight 标量对调度完全无害,无需 drain。曾在 review4 加过一次性 drain
+        # 清残留,但滚动切换期间"旧 push 在 scan 后又写了新 inflight"这类竞态下,CAS 只证 command_id
+        # 未变、不证已过期,仍可能误删活跃 inflight(review6 P1)。切换前遗留的在途租户由 health_check
+        # 的 900s reaper(卡 creating 兜底)收敛,不靠 poller。
+        return {
+            "hosts": 0,
+            "success": 0,
+            "failed": 0,
+            "still_running": 0,
+            "skipped_ddb": True,
+        }
     hosts = _list_inflight_hosts()
     stats = {"hosts": len(hosts), "success": 0, "failed": 0, "still_running": 0}
     for h in hosts:
@@ -237,11 +259,26 @@ def poll_inflight() -> Dict[str, Any]:
                 batch = _query_batch_tenants(command_id)
                 for t in batch:
                     _mark_running(t["id"])
-            # 清 host inflight 标记(不回滚容量:VM 真起了)
+            # 清 host inflight 标记(不回滚容量:VM 真起了)。
+            # #315 guard(codex A_NEEDS_GUARD):去掉 host 级 inflight 门后,一台 host 可同时有
+            # 多条并发在途命令,dispatch_inflight/dispatch_ssm_cid 是标量 last-write-wins。清理
+            # 必须带 CAS 条件"当前值仍是本 poller 观测到的那条"(dispatch_inflight=:cid AND
+            # dispatch_ssm_cid=:sc),否则本 poller 读到旧命令、处理期间新命令已覆盖标记,无条件
+            # REMOVE 会把【新命令】的 inflight/ssm_cid 误清 → 新命令的租户 poller 再也追不到
+            # (host-agent 5s 轮询仍会 promote,但 poller 兜底链断)。CCF = 已被新命令覆盖,
+            # 本就不该由我清,静默跳过。
+            ccf = clients.hosts_table.meta.client.exceptions.ConditionalCheckFailedException
             try:
                 clients.hosts_table.update_item(
                     Key={"instance_id": instance_id},
                     UpdateExpression="REMOVE dispatch_inflight, dispatch_inflight_ts, dispatch_inflight_ts_epoch, dispatch_ssm_cid",
+                    ConditionExpression="dispatch_inflight = :cid AND dispatch_ssm_cid = :sc",
+                    ExpressionAttributeValues={":cid": command_id, ":sc": ssm_cid},
+                )
+            except ccf:
+                # 已被新命令覆盖(并发在途)→ 不是本 poller 该清的标记,跳过。
+                print(
+                    f"[poller] clear inflight {instance_id} skipped: inflight/ssm_cid moved on"
                 )
             except Exception as e:  # noqa: BLE001
                 print(f"[poller] clear inflight {instance_id}: {e}")

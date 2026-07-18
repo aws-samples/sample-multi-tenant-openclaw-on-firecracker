@@ -91,7 +91,7 @@ batch_jobs_table = (
     else None
 )
 
-# #97 档A — optional external-platform → Cognito-IdP map (the design doc §2.7). Absent →
+# #97 档A — optional external-platform → Cognito-IdP map (SPEC/02 §2.7). Absent →
 # federation not configured; /tenantmatch returns 404 (front-end falls back to
 # passing identity_provider explicitly). Partition key: platform_id (S).
 tenant_idp_table = (
@@ -181,7 +181,7 @@ COGNITO_REGION = os.environ.get("AWS_REGION", "") or os.environ.get(
     "AWS_DEFAULT_REGION", ""
 )
 
-# ── : end-to-end Cognito for the channel plane ──
+# ── WI-002: end-to-end Cognito for the channel plane ──
 # The app client (public, USER_PASSWORD_AUTH) the per-tenant machine-user signs
 # in with. Injected by CDK from the stack-owned pool. Empty = channel Cognito
 # DISABLED → create_tenant keeps minting the legacy HMAC channel_secret only
@@ -243,6 +243,14 @@ DISPATCH_INFLIGHT_TTL_SEC = int(
 )
 
 DISPATCH_RETRY_BUDGET = int(os.environ.get("DISPATCH_RETRY_BUDGET", "3") or "3")
+
+# #315 容量不足溢出短退避秒数。unplaced(纯容量不够)租户走【原消息】重投:对原 SQS 消息调
+# ChangeMessageVisibility 把可见性从队列默认 960s(VisibilityTimeout)缩到此值,让 SQS 快速
+# 重投(而非等 48min),receiveCount 自然递增到 maxReceiveCount 进 DLQ,预算走现有 _release_claims。
+# 不发新消息 → 不重置 receiveCount、无 send/write 原子性窗口(区别于曾陷泥潭的"发新消息"方案)。
+DISPATCH_UNPLACED_DELAY_BASE_SEC = int(
+    os.environ.get("DISPATCH_UNPLACED_DELAY_BASE_SEC", "15") or "15"
+)
 
 # 认领标记的死锁回收阈值:claim 打上后消费中途炸批,消息重投时旧 claim 超过
 # 该秒数即视为残留可接管(Powertools INPROGRESS 超时释放同款语义)。必须明显

@@ -19,11 +19,14 @@ tenants_table = (
 ASG_NAME = os.environ["ASG_NAME"]
 IDLE_TIMEOUT = int(os.environ["IDLE_TIMEOUT_MINUTES"])
 
-# R8 — 空闲缩容总开关,默认 OFF(不自动 terminate host)。现状无开关无条件缩,是
-# "缩到 0 撞 pending 租户 → no-host → requires_intervention" 的坑源(memory
-# scaler-idle-reclaim-races-pending-tenant)。OFF 时仍做 idle 标记/恢复,只是不
-# terminate/decrement,host 留在池不被回收。开发紧张期不自动缩,客户按需开。
-IDLE_RECLAIM_ENABLED = os.environ.get("IDLE_RECLAIM_ENABLED", "false").lower() == "true"
+# R8 — 空闲缩容总开关。**当前阶段硬禁自动缩容**(设计决策:去掉 ASG 自动缩容
+# 功能):大规模集群里自动 terminate idle host 风险 > 收益——误删刚空但马上要接新租户的
+# host、缩到 0 撞 pending 租户 → no-host → requires_intervention、下线本就慢
+# (lifecycle 串行停 VM)。当前功能+稳定优先,host 留池不回收比误删安全。
+# 硬禁方式:总门 IDLE_RECLAIM_ENABLED 恒 False,不再读 env(env 设 true 也不缩)。idle
+# 标记/恢复仍无条件做(无害,保留可观测:哪些 host 空了)。未来要恢复自动缩容:改回读 env +
+# 补 pending 门 + 缩容前查在途租户,单独 issue 评审。
+IDLE_RECLAIM_ENABLED = False  # 硬禁自动缩容(不读 env);idle 标记仍做,只是永不 terminate
 # autoscaling client 配 standard retry(指数退避+jitter),对标 K8s CA
 # aws_sdk_provider 复用 SDK 内置 retryer,不手搓(references.md#R8-Ref-4)。
 try:
@@ -289,13 +292,17 @@ def _set_status(instance_id, status):
             ConditionExpression="#s IN (:a, :i)",
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
-                ":s": status, ":a": "active", ":i": "idle",
+                ":s": status,
+                ":a": "active",
+                ":i": "idle",
             },
         )
     except hosts_table.meta.client.exceptions.ConditionalCheckFailedException:
         # host 不在 active/idle(多半正 upgrading / 已 terminating)→ scaler 不该改它的
         # status。静默跳过(下一 tick host 回 active/idle 后再正常参与 idle 回收)。
-        print(f"{instance_id}: skip status→{status} (host not active/idle, likely upgrading)")
+        print(
+            f"{instance_id}: skip status→{status} (host not active/idle, likely upgrading)"
+        )
 
 
 def _set_idle_since(instance_id, ts):

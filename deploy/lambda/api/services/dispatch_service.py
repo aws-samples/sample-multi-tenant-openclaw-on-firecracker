@@ -108,6 +108,9 @@ def _parse_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out = []
     for rec in records:
         mid = rec.get("messageId")
+        # #315 receiptHandle 供 unplaced 短退避:对容量不够的消息 ChangeMessageVisibility
+        # 缩短可见性(960→15s),不必等默认 visibility 才重投。SQS 事件每条 record 原生带。
+        rh = rec.get("receiptHandle")
         body = rec.get("body") or "{}"
         try:
             msg = json.loads(body)
@@ -120,6 +123,7 @@ def _parse_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         out.append(
             {
                 "msg_id": mid,
+                "receipt_handle": rh,
                 "action": msg.get("action"),
                 "tenant_id": msg.get("tenant_id"),
                 "request_token": msg.get("request_token"),
@@ -217,9 +221,16 @@ def _mark_over_budget_best_effort(tenant_id: str) -> None:
 
 
 # ── hosts 快照 + inflight/CAS ─────────────────────────────────────────
-def _snapshot_hosts(now_epoch: int) -> List[Dict[str, Any]]:
+def _snapshot_hosts(now_epoch: int, gate_inflight: bool = True) -> List[Dict[str, Any]]:
     """扫 active/idle host,算 free_slots + inflight_ok + simulated。ConsistentRead 强一致
-    (与 core.scheduling._find_host 同款,防跨实例装满同一 host)。"""
+    (与 core.scheduling._find_host 同款,防跨实例装满同一 host)。
+
+    #315 SPLIT_BY_MODE:gate_inflight 控制是否按"host 有未过期在途命令"算 inflight_ok。
+    - push 模式(gate_inflight=True):保留旧逻辑——host 有未过期 inflight → inflight_ok=False,
+      binpack 跳过它(host 级串行,poller 靠 inflight 标量追踪 SSM 终态需要这个串行)。
+    - ddb 模式(gate_inflight=False):inflight_ok 恒 True,不因在途命令挡装箱(host-agent 每 5s
+      从 assignment 表兜底,允许一台 host 并发多批,可扩 1000 host;容量安全由 slot 级 CAS 保证)。
+    """
     hosts = clients.hosts_table.scan(
         FilterExpression="#s IN (:a, :i)",
         ExpressionAttributeNames={"#s": "status"},
@@ -236,10 +247,13 @@ def _snapshot_hosts(now_epoch: int) -> List[Dict[str, Any]]:
         # 一租户默认 1 slot(2 vCPU 单位);free_slots = 剩余 vcpu / VM_DEFAULT_VCPU 保守值
         vcpu_per_vm = max(1, int(clients.VM_DEFAULT_VCPU or 2))
         free_slots = max(0, (allocatable - used_vcpu) // vcpu_per_vm)
-        inflight_ts = int(h.get("dispatch_inflight_ts_epoch", 0) or 0)
-        inflight_ok = (not h.get("dispatch_inflight")) or (
-            inflight_ts and (now_epoch - inflight_ts) > ttl
-        )
+        if gate_inflight:
+            inflight_ts = int(h.get("dispatch_inflight_ts_epoch", 0) or 0)
+            inflight_ok = (not h.get("dispatch_inflight")) or (
+                inflight_ts and (now_epoch - inflight_ts) > ttl
+            )
+        else:
+            inflight_ok = True  # ddb:不设门,并发多批
         out.append(
             {
                 "instance_id": h["instance_id"],
@@ -259,50 +273,80 @@ def _try_reserve_host(
     command_id: str,
     now_epoch: int,
     allocatable_vcpu: int,
+    write_inflight: bool = True,
 ) -> Optional[int]:
-    """单 host 单条 UpdateItem: next_vm_num+=n / used_vcpu+=n*vcpu / 打 inflight_ok。
+    """单 host 单条 UpdateItem: next_vm_num+=n / used_vcpu+=n*vcpu(+ push 模式打 inflight)。
 
-    返回该批第一个 vm_num(reserved base);失败(容量不够或 inflight 未过期)→ None。
-    DDB ConditionExpression 不支持算术,照 handler._reserve_slot 范式调用方预计算
-    cap(:cap_v = allocatable - dv),条件写成 used_vcpu <= :cap_v ——写前 used_vcpu
-    加上本批增量不超 allocatable 的等价式。真机洪峰抓出:`used_vcpu + :dv <=
-    total_vcpu * :ratio` 直接 ValidationException(Syntax error token "+")。
+    返回该批第一个 vm_num(reserved base);容量不够 → None。
+
+    #315 SPLIT_BY_MODE(codex 判):按 dispatch 模式分道——
+    - **push 模式**(write_inflight=True):保留旧行为——写 inflight 标量 + CAS 含 host 级
+      inflight 排他门(一台 host 同一时刻一条在途命令)。push 无 assignment 表 + 无 host-agent
+      reconciler,poller 是 promote/回滚唯一驱动,必须靠 inflight 标量 + 串行门追踪 SSM 终态。
+    - **ddb 模式**(write_inflight=False):【不写 inflight 标量】+ CAS 只留 slot 级容量闸
+      (used_vcpu <= cap_v),允许一台 host 并发多条在途命令。ddb 有 host-agent 每 5s 从
+      assignment 表(desired-state 真相源)自愈 promote/重投,poller 冗余、不启用;不写标量 →
+      无 last-write-wins 竞争 → 无 poller 误清/误回滚容量(codex 上轮 3 个 Error 的根)。
+      这也是 1000 host 稳定启动的前提:控制面零集中扫描,host-agent 分布式自治才扩得上去。
+    容量安全两模式都由 slot 级 CAS(used_vcpu <= :cap_v)保证,与 inflight 无关。
     """
     ccf = clients.hosts_table.meta.client.exceptions.ConditionalCheckFailedException
-    ttl = clients.DISPATCH_INFLIGHT_TTL_SEC
     vcpu_per_vm = max(1, int(clients.VM_DEFAULT_VCPU or 2))
     mem_per_vm = max(0, int(clients.VM_DEFAULT_MEM or 2048))
     dv = n * vcpu_per_vm
     cap_v = int(allocatable_vcpu) - dv
     if cap_v < 0:
         return None
-    try:
-        resp = clients.hosts_table.update_item(
-            Key={"instance_id": instance_id},
-            UpdateExpression=(
-                "SET next_vm_num = if_not_exists(next_vm_num, :zero) + :n, "
-                "used_vcpu = if_not_exists(used_vcpu, :zero) + :dv, "
-                "used_mem_mb = if_not_exists(used_mem_mb, :zero) + :dm, "
-                "vm_count = if_not_exists(vm_count, :zero) + :n, "
-                "dispatch_inflight = :cid, dispatch_inflight_ts = :now, "
-                "dispatch_inflight_ts_epoch = :now_epoch"
-            ),
-            ConditionExpression=(
-                "used_vcpu <= :cap_v "
-                "AND (attribute_not_exists(dispatch_inflight) "
-                "OR dispatch_inflight_ts_epoch < :expired)"
-            ),
-            ExpressionAttributeValues={
-                ":n": n,
-                ":dv": dv,
-                ":dm": n * mem_per_vm,
-                ":zero": 0,
+    set_expr = (
+        "next_vm_num = if_not_exists(next_vm_num, :zero) + :n, "
+        "used_vcpu = if_not_exists(used_vcpu, :zero) + :dv, "
+        "used_mem_mb = if_not_exists(used_mem_mb, :zero) + :dm, "
+        "vm_count = if_not_exists(vm_count, :zero) + :n"
+    )
+    vals = {
+        ":n": n,
+        ":dv": dv,
+        ":dm": n * mem_per_vm,
+        ":zero": 0,
+        ":cap_v": cap_v,
+    }
+    if write_inflight:
+        # push 模式:写 inflight 标量 + 走 host 级排他门(旧行为逐字保留)。
+        set_expr += (
+            ", dispatch_inflight = :cid, dispatch_inflight_ts = :now, "
+            "dispatch_inflight_ts_epoch = :now_epoch"
+        )
+        cond = (
+            "used_vcpu <= :cap_v "
+            "AND (attribute_not_exists(dispatch_inflight) "
+            "OR dispatch_inflight_ts_epoch < :expired)"
+        )
+        vals.update(
+            {
                 ":cid": command_id,
                 ":now": _now(),
                 ":now_epoch": now_epoch,
-                ":expired": now_epoch - ttl,
-                ":cap_v": cap_v,
-            },
+                ":expired": now_epoch - clients.DISPATCH_INFLIGHT_TTL_SEC,
+            }
+        )
+    else:
+        # ddb 模式:只 slot 级容量闸,不写 inflight 标量(无并发标量竞争)。
+        cond = "used_vcpu <= :cap_v"
+    update_expr = "SET " + set_expr
+    if write_inflight:
+        # #315(codex review7 P1)—— 写新 dispatch_inflight(command_id)时,必须原子清掉旧
+        # dispatch_ssm_cid,否则出现"新 command B + 上一命令 A 的 SSM CID(SA)"矛盾组合:
+        # host 短暂停在 B/SA,poller 把 SA 的 SSM 终态错误应用到 B 的租户(误 promote/误回滚 B 容量),
+        # 且 review5 加的 CAS(dispatch_inflight=:cid)校的正是 B、照样通过。SendCommand 成功后
+        # _record_ssm_cid 会写回 B 自己的 CID;在那之前 ssm_cid 缺失 → poller 走 missing_ssm_cid
+        # 分支(still_running,等下轮),不会误清。ddb 模式不写 inflight 也无 ssm_cid,不需要。
+        update_expr += " REMOVE dispatch_ssm_cid"
+    try:
+        resp = clients.hosts_table.update_item(
+            Key={"instance_id": instance_id},
+            UpdateExpression=update_expr,
+            ConditionExpression=cond,
+            ExpressionAttributeValues=vals,
             ReturnValues="UPDATED_NEW",
         )
         new_next = int(resp["Attributes"]["next_vm_num"])
@@ -625,9 +669,14 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         return {"batchItemFailures": []}
 
     # 2) hosts 快照 + 装箱
-    hosts = _snapshot_hosts(now_epoch)
     mode = clients.DISPATCH_MODE.lower()
     push_mode = mode == "push"
+    ddb_mode = mode == "ddb"
+    # #315 SPLIT_BY_MODE(codex review4 #3:精确按 mode==ddb 判,不把"非 push"一律当 ddb——
+    # pull/误配也会误关 inflight 门):【仅 ddb】不设 inflight 门(host-agent 兜底,可扩 1000 host);
+    # push 和 pull(及任何非 ddb)都【保留】旧 inflight 门 + 写标量(逐字旧行为,poller 追踪需要)。
+    gate_inflight = not ddb_mode
+    hosts = _snapshot_hosts(now_epoch, gate_inflight=gate_inflight)
     # push/ddb 都发真 SSM,simulated host 收不到命令 → 装箱跳过它们(压测用);
     # pull 二期由 host-agent 轮询,simulated host 可参与。
     dispatches_ssm = mode in ("push", "ddb")
@@ -641,8 +690,15 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     # msg_id 反查:tenant_id → msg_id(唯一,认领已保证)
     tid_to_msg = {w["tenant_id"]: w["msg_id"] for w in winners}
+    # #315 tenant_id → receiptHandle(供 unplaced 短退避 ChangeMessageVisibility)
+    tid_to_rh = {w["tenant_id"]: w.get("receipt_handle") for w in winners}
     alloc_by_host = {h["instance_id"]: h["allocatable_vcpu"] for h in hosts}
     failures: List[str] = []
+    # #315(codex final MR P1#3):容量类失败(unplaced 装箱没位子 + CAS loser 装箱给了位子
+    # 但 reserve 时被并发抢输)的租户 tid,稍后对其【原消息】缩短 visibility(960→15s)快速
+    # 重投——高并发接近满容量时 CAS loser 是最常见的溢出类型,漏了它容量竞争输家仍卡 960s。
+    # 只缩容量类(非 SSM/manifest/写库失败):那些是基础设施故障,按默认 visibility 重投即可。
+    capacity_retry_tids: set = set()
     ssm_consec_fail = 0
 
     # #141 — fail-loud:每个进 batchItemFailures(→ 重投,超预算才进 DLQ)的租户
@@ -659,13 +715,23 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     # 3) 每 host 一批:CAS → 分发
     for instance_id, batch in result.assignments.items():
         n = len(batch)
+        # #315 SPLIT_BY_MODE:push 模式写 inflight 标量 + 走 host 级排他门(poller 靠它);
+        # ddb 模式不写标量、只 slot CAS,允许一台 host 并发多批(host-agent 兜底,可扩 1000 host)。
         base = _try_reserve_host(
-            instance_id, n, command_id, now_epoch, alloc_by_host.get(instance_id, 0)
+            instance_id,
+            n,
+            command_id,
+            now_epoch,
+            alloc_by_host.get(instance_id, 0),
+            write_inflight=gate_inflight,
         )
         if base is None:
-            # CAS 输(容量不够 or inflight 未过期)→ 该批全 unplaced 走重试
+            # CAS 输(容量不够;push 模式还含 inflight 未过期)→ 该批全 unplaced 走重试
+            # #315(codex final MR P1#3):CAS loser 是容量类失败,纳入短退避快速重投(15s),
+            # 不然高并发满容量时最常见的这类输家仍卡 960s。
             for t in batch:
                 _fail(t["tenant_id"], "host CAS lost (capacity/inflight)", instance_id)
+                capacity_retry_tids.add(t["tenant_id"])
             continue
 
         # #139:CAS 赢了 = 放置已定,先回写 host_id/vm_num/guest_ip 再分发
@@ -752,9 +818,15 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
                 for t in batch:
                     _fail(t["tenant_id"], "assignments write failed", instance_id)
 
-    # 4) unplaced(容量不够、装箱阶段跳过的 host) → 全报失败重试
+    # 4) unplaced(容量不够、装箱阶段跳过的 host)→ 走【原消息】重投,不发新消息。
+    # #315 容量溢出体感根治(codex 认可的极简路,替代曾陷入 send/write 原子性泥潭的"发新
+    # 消息"状态机):unplaced 就是普通失败(进 batchItemFailures + 下面 _release_claims 释放
+    # claim/计预算,与 CAS/SSM 失败同一条久经考验的路)。缩短原消息 visibility 挪到释放 claim
+    # 【之后】、只缩成功释放的(见 #6 段),不在此立即缩——codex simple review P1:先缩后释放
+    # 会在释放慢于 15s/失败时丢消息。
     for t in result.unplaced:
         _fail(t["tenant_id"], "unplaced: no host capacity this round")
+        capacity_retry_tids.add(t["tenant_id"])
 
     # dedup 保序
     seen = set()
@@ -769,7 +841,23 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     # creating——unplaced 尾巴 ~16% 全灭在这)。条件写限定 claim 归属本 claim_id,
     # 绝不误删并发实例的新 claim;顺带 ADD dispatch_retries 计预算。
     msg_to_tid = {v: k for k, v in tid_to_msg.items()}
-    _release_claims([msg_to_tid[m] for m in dedup if m in msg_to_tid], command_id)
+    released = _release_claims(
+        [msg_to_tid[m] for m in dedup if m in msg_to_tid], command_id
+    )
+    # #315 极简方案:只对【容量类失败(unplaced+CAS loser)且成功释放 claim 且仍需重投】的租户
+    # 缩短原消息 visibility(960→15s),让容量溢出快速重投而非等 48min。顺序在释放【之后】+ 只缩
+    # 释放成功的 → 消除 codex simple review P1(先缩后释放会在释放慢/失败时 15s 内撞新鲜 claim
+    # 丢消息)。释放失败/被接管/已终态的不缩,保留队列默认 960s(或到 maxReceiveCount 进 DLQ)兜底,
+    # 不丢。#315 codex final MR P1#3:capacity_retry_tids 含 CAS loser,不再只 unplaced。
+    # #315 codex MR recheck 阻断#1:【仅 ddb 模式】缩 visibility。push 模式(CDK 默认)的 unplaced
+    # 多是 host 级 inflight 串行的正常等待(合法 SSM 可跑 840s),15s 就催会误伤——push 走原 960s。
+    if ddb_mode:
+        capacity_rh = [
+            tid_to_rh[tid]
+            for tid in capacity_retry_tids
+            if tid in released and tid_to_rh.get(tid)
+        ]
+        _shorten_visibility_best_effort(capacity_rh)
     # #141 — batch-level fail-loud summary: 一眼看清本次 invoke 收敛多少/回退多少,
     # 不用 grep per-tenant 行。dedup 非空 = 有租户回队列重投(超预算才最终进 DLQ)。
     # #256 — 全链路可观测:打出本批 won 的**全部** tenant_id(不截断、不丢),让"按任意租户
@@ -792,8 +880,13 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {"batchItemFailures": [{"itemIdentifier": m} for m in dedup]}
 
 
-def _release_claims(tenant_ids: List[str], claim_id: str) -> None:
+def _release_claims(tenant_ids: List[str], claim_id: str) -> set:
     """失败重试路径释放认领标记(条件:claim 是我打的),让重投消息能重新认领。
+    返回【成功释放且仍需重投(未达预算终态)】的 tenant_id 集合——#315 极简方案据此
+    只对这些的原消息缩短 visibility(codex simple review P1:缩 visibility 必须在释放
+    claim【之后】、且只对释放成功的做,否则释放慢于 15s/释放失败时消息 15s 回可见撞新鲜
+    claim 被静默 ack 删 → 丢消息;释放失败的保留队列默认 960s visibility(或到 maxReceiveCount
+    进 DLQ,由 DLQ 告警/redrive 恢复)兜底重投,不静默丢)。
 
     #141 收敛主修:ADD dispatch_retries 后,若新值达到重试预算,立刻转
     requires_intervention。为什么在这里而非只靠认领闸的 over-budget 分支——
@@ -805,6 +898,7 @@ def _release_claims(tenant_ids: List[str], claim_id: str) -> None:
     条件 `>= budget`,幂等(仅 creating 且达阈值才转,不误标已 running/终态的)。
     ReturnValues 拿新值避免二次读。"""
     ccf = clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException
+    released_needs_retry = set()
     for tid in tenant_ids:
         try:
             resp = clients.tenants_table.update_item(
@@ -821,11 +915,38 @@ def _release_claims(tenant_ids: List[str], claim_id: str) -> None:
             # budget 之前(receiveCount < budget)就进 DLQ,`>= budget` 触发不了 → 仍永久
             # stuck。当前两者默认都 3(成立)。改任一配置须同步保持 maxReceive >= budget。
             if new_retries >= clients.DISPATCH_RETRY_BUDGET:
-                _mark_retry_exhausted(tid)
+                _mark_retry_exhausted(tid)  # 已终态,不缩 visibility(不进返回集)
+            else:
+                released_needs_retry.add(
+                    tid
+                )  # 释放成功且还要重投 → 可安全缩 visibility
         except ccf:
-            pass  # claim 已被别的实例接管/已释放,不动
+            pass  # claim 已被别的实例接管/已释放 → 不动、不缩 visibility(交持有者)
         except Exception as e:  # noqa: BLE001
+            # 释放失败 → 不进返回集,原消息保留队列默认 960s visibility(或进 DLQ 兜底)重投(不缩到 15s,
+            # 否则 15s 回可见时 claim 还在会被静默 ack 删 → 丢消息,codex simple review P1)。
             print(f"[dispatch] release claim {tid} failed (non-fatal): {e}")
+    return released_needs_retry
+
+
+def _shorten_visibility_best_effort(receipt_handles):
+    """#315 容量溢出短退避:把 unplaced 消息的可见性从队列默认 960s 缩到 15s,让 SQS 快速
+    重投(而非等 48min),receiveCount 自然递增到 maxReceiveCount 进 DLQ。best-effort:失败
+    (receiptHandle 过期/权限/限流)不影响正确性——消息仍按默认 visibility 兜底重投,只是慢。
+    不发新消息,故无 send/write 原子性问题(#318 曾陷入的泥潭)。"""
+    if not receipt_handles or not clients.DISPATCH_QUEUE_URL:
+        return
+    delay = clients.DISPATCH_UNPLACED_DELAY_BASE_SEC
+    for rh in receipt_handles:
+        try:
+            _sqs().change_message_visibility(
+                QueueUrl=clients.DISPATCH_QUEUE_URL,
+                ReceiptHandle=rh,
+                VisibilityTimeout=delay,
+            )
+        except Exception as e:  # noqa: BLE001
+            # 缩短失败纯属优化未生效(消息仍会按默认 visibility 重投),不炸 invocation。
+            print(f"[dispatch] shorten visibility non-fatal: {e}")
 
 
 def _mark_retry_exhausted(tenant_id: str) -> None:

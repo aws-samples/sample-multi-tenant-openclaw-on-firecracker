@@ -279,6 +279,21 @@ FC_AFTER=$(ssh -i <key> ubuntu@<host> 'pgrep -fc firecracker'); echo "FC after: 
 > `a7daa3ce…` afterward. A mixed fleet (new Lambda + an un-updated agent) can hand concurrent
 > work to an agent that still leaks `_recovering`.
 
+> **⚠️ The `KillMode=process` drop-in only covers the hosts you touch here — NEW hosts are born
+> unsafe.** The drop-in lives in `/etc/systemd/system/host-agent.service.d/` on each existing
+> host; it is NOT baked into the Launch Template. So every host the ASG launches later
+> (scale-out, health-replacement, instance-refresh) comes up with the DEFAULT
+> `KillMode=control-group` again — a latent trap: fine at steady state, but a future
+> `systemctl restart host-agent` on that host would SIGTERM the whole cgroup and kill every
+> tenant VM on it. This is a real gap confirmed on a freshly-launched host. Two fixes:
+>
+> - **Stopgap:** apply the same drop-in to each new host as it appears (doesn't scale — the ASG
+>   keeps making new ones).
+> - **Durable:** bake `KillMode=process` into `host-agent.service` in the Launch Template
+>   (Step 6's LT-rebuild path — decode the current UserData, add the line to the unit, re-bake),
+>   so new hosts are born safe. The proper long-term fix is in the source `host-agent.service`
+>   (upstream `deploy/userdata/host-agent.service` has no `KillMode` today) — track it there.
+
 ---
 
 ## Step 5 — Update the three Lambda functions (update-function-code only)

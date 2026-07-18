@@ -332,9 +332,14 @@ curl -fsSL "$URL" -o /tmp/api-cur.zip && ( cd /tmp/api-overlay && unzip -q /tmp/
 ( cd /tmp/api-overlay && rm -rf consumers core routes services handler.py requirements.txt test_*.py __pycache__ )
 # 3. overlay the shipped patched source tree
 cp -a "$LAMBDA_DIR/api/." /tmp/api-overlay/
-# 4. re-zip; sanity-check both the #315 code AND the reused deps are present
+# 4. re-zip; sanity-check both the #315 code AND the reused deps are present.
+#    NOTE: capture the listing into a var first, THEN grep it. Piping `unzip -l big.zip | grep -q`
+#    lets grep close the pipe on first match, SIGPIPE-killing unzip (exit 141) — under
+#    `set -o pipefail` that would mark the whole line failed and STOP even though the match
+#    succeeded (a false negative). Grepping a variable avoids the pipe entirely.
 ( cd /tmp/api-overlay && zip -qr /tmp/api-lambda.zip . )
-unzip -l /tmp/api-lambda.zip | grep -qE 'core/dispatch/binpack.py' && unzip -l /tmp/api-lambda.zip | grep -qi 'cryptography/' \
+ZIPLIST=$(unzip -l /tmp/api-lambda.zip)
+printf '%s\n' "$ZIPLIST" | grep -qE 'core/dispatch/binpack\.py' && printf '%s\n' "$ZIPLIST" | grep -qi 'cryptography/' \
   || { echo "STOP: overlay zip missing #315 code or deps"; exit 1; }
 
 # openclaw-api: update $LATEST → wait → INVOKE-VERIFY $LATEST → only then publish + move alias.
@@ -363,7 +368,8 @@ pip install --no-cache-dir --platform manylinux2014_aarch64 --implementation cp 
   --only-binary=:all: --upgrade -r "$LAMBDA_DIR/api/requirements.txt" -t /tmp/api-build
 cp -a "$LAMBDA_DIR/api/." /tmp/api-build/
 ( cd /tmp/api-build && zip -qr /tmp/api-lambda.zip . )
-unzip -l /tmp/api-lambda.zip | grep -qi aws_lambda_powertools || { echo "STOP: deps not bundled"; exit 1; }
+ZIPLIST=$(unzip -l /tmp/api-lambda.zip)   # capture then grep (avoid SIGPIPE false-fail under pipefail)
+printf '%s\n' "$ZIPLIST" | grep -qi aws_lambda_powertools || { echo "STOP: deps not bundled"; exit 1; }
 # then the same update-function-code / publish / update-alias as above.
 ```
 

@@ -38,6 +38,32 @@ is touched).
 
 ---
 
+## Step 0.0 — Verify the shipped artifacts are authentic (do this FIRST, before anything)
+
+Confirm each shipped file equals its SOURCE in the repo — this catches a mis-packaged patch
+(wrong file / wrong place) before you touch the live system. `manifest.json` → `replaces` lists,
+per entry, the `source` (repo path), the `artifact` (the shipped file), and the `sha256` (that
+file at `patch_sha`). **All hashes are SHA-256** — a review tool defaulting to SHA-1 will show a
+false mismatch.
+
+```bash
+# from inside the patch dir. Each shipped artifact must hash to the manifest sha256:
+shasum -a 256 host-scripts/launch-vm.sh.patched host-scripts/host-agent.py.patched \
+              launch-template/init-host.sh.patched lambda/scaler/handler.py
+#   expect: launch-vm.sh.patched=f73a601c…  host-agent.py.patched=a7daa3ce…
+#           init-host.sh.patched=5e8f50c1…  scaler/handler.py=17f600d4…
+# If you also have a gateway checkout at patch_sha, cross-check the SOURCE matches the artifact:
+#   git show <patch_sha>:deploy/userdata/launch-vm.sh | shasum -a 256   # == f73a601c…
+# api tree is a directory: confirm 36 files under lambda/api/ and that the #315 files are present
+# (core/clients.py, core/dispatch/binpack.py, services/dispatch_poller.py, services/dispatch_service.py).
+find lambda/api -type f ! -path '*__pycache__*' | wc -l   # expect 36
+```
+
+If any hash doesn't match (and it's genuinely SHA-256, not a SHA-1 false alarm) → **STOP**, the
+patch is mis-packaged; do not apply.
+
+---
+
 ## Step 0 — Confirm the problems are real on THIS system (read-only; apply a layer only if its probe hits)
 
 Don't apply blindly. Each probe is read-only; the verdict decides whether that layer is needed.

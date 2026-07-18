@@ -24,6 +24,17 @@ is touched).
   never touch the ESM.**
 - **Only apply the layers your system actually needs** — decide by the Step 0 probes, not by
   assumption.
+- **Host access: SSH may be blocked — use SSM if so.** The commands below are written as
+  `ssh/scp -i <key> ubuntu@<host>` for readability, but in most deployments the hosts sit in a
+  **private subnet with no inbound SSH** (this is the norm when `api.mode=private`), reachable
+  only via **SSM**. If SSH doesn't work, run the SAME commands through SSM instead — no logic
+  changes, just the transport:
+  - a shell command `ssh … 'CMD'` → `aws ssm send-command --instance-ids <i-...> --document-name AWS-RunShellScript --parameters commands='["CMD"]' --region <region>` (then `get-command-invocation` for output).
+  - a file push `scp local host:/path` → base64 the file and write it on the host via
+    send-command: `B64=$(base64 -i local); ssm send-command … commands='["echo <B64> | base64 -d > /path"]'`.
+  - a file pull (backup) → `ssm send-command` a `base64 /path`, read stdout from
+    `get-command-invocation`, `base64 -d` locally.
+    Use the host's real instance-id (from the ASG / `describe-instances`), not an IP.
 
 ---
 

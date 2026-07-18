@@ -178,7 +178,17 @@ Lambda that's already allowing higher concurrency.
 > correct everywhere; "must be +x or it won't run on Linux" is a myth here and, worse, would be
 > a permission that can't survive the S3 round-trip anyway.
 
+> **Hashes in `manifest.json` are SHA-256** — verify with `shasum -a 256 <file>`. If your review
+> tool prints a shorter/different hash it's almost certainly SHA-1 (the common default); that is
+> a **false mismatch**, not a bad artifact. E.g. `launch-vm.sh.patched` is SHA-256 `f73a601c…`
+> (matches manifest) but SHA-1 `edd7e6e2…`; `host-agent.py.patched` is SHA-256 `a7daa3ce…`.
+> Always compare the SHA-256, not whatever a tool defaults to.
+
 ```bash
+# optional pre-upload integrity check against manifest (SHA-256):
+shasum -a 256 host-scripts/launch-vm.sh.patched host-scripts/host-agent.py.patched
+#   expect launch-vm.sh.patched=f73a601c…  host-agent.py.patched=a7daa3ce…
+
 BASE=<s3://...deployment/scripts>
 for f in launch-vm.sh host-agent.py; do
   aws s3 cp host-scripts/${f}.patched "$BASE/${f}.tmp" --region $REGION      # upload to temp key

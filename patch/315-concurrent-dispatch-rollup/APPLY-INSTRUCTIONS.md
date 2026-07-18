@@ -210,8 +210,14 @@ FC_AFTER=$(ssh -i <key> ubuntu@<host> 'pgrep -fc firecracker'); echo "FC after: 
 
 ## Step 5 — Update the three Lambda functions (update-function-code only)
 
-Full source is shipped under `lambda/api/` (36 files) + `lambda/scaler/handler.py` (gateway HEAD
-snapshot). Save the block below as a script and run it from the patch's `lambda/` dir.
+Two shapes shipped:
+
+- **`lambda/api/`** — source TREE (36 files), NOT a prebuilt zip. Its deps (`cryptography` etc.)
+  are arm64 native wheels, so the zip must be built for the Lambda arm64 runtime — you build it
+  at apply time (on an arm64 host, or with `--platform manylinux2014_aarch64`), OR reuse the
+  deps already inside the live package (the "overlay" approach — verified; see the box below).
+- **`lambda/scaler/openclaw-scaler.zip`** — PREBUILT zip (scaler is pure source, no third-party
+  deps), so you upload it directly, no build step.
 
 - **openclaw-api**: API Gateway calls it through an **alias** (commonly named `live`, but
   **do NOT assume** — discover it, some deployments use a different alias or none). The dispatch
@@ -222,7 +228,15 @@ snapshot). Save the block below as a script and run it from the patch's `lambda/
   **create does NOT go through the consumer** — it handles start/stop/restart/rebuild/delete.
   It must still be updated (same `api/` source) for the #303/#304/#305 rebuild + #263 delete
   semantics. **Verify it via a rebuild/delete, not via create.**
-- **openclaw-scaler** (`$LATEST`): separate source-only zip; carries #315 idle-off.
+- **openclaw-scaler** (`$LATEST`): upload the prebuilt `openclaw-scaler.zip` directly.
+
+> **Zero-build option for the api zip (avoids the arm64/deps problem entirely — verified):**
+> #315 changed only `.py`, not `requirements.txt`, so the deps in the LIVE package are already
+> correct. Instead of `pip install`, download the current api package, delete only the
+> first-party source dirs (`consumers core routes services handler.py requirements.txt test_*.py`),
+> overlay the shipped `lambda/api/` tree on top (keeping `cryptography/ jwt/ aws_lambda_powertools/`
+> and the arm64 `.so`), re-zip. This reuses platform-correct deps and cold-starts cleanly —
+> confirmed on an arm64/ddb test env. Use this if you don't have an arm64 build host.
 
 ```bash
 set -euo pipefail
@@ -259,9 +273,8 @@ NEW_VER=$(aws lambda publish-version --function-name openclaw-api --region $REGI
 aws lambda update-function-code --function-name openclaw-lifecycle-consumer --zip-file fileb:///tmp/api-lambda.zip --region $REGION >/dev/null
 aws lambda wait function-updated --function-name openclaw-lifecycle-consumer --region $REGION
 
-# scaler: own zip, $LATEST
-rm -f /tmp/scaler.zip && ( cd "$LAMBDA_DIR/scaler" && zip -qr /tmp/scaler.zip handler.py )
-aws lambda update-function-code --function-name openclaw-scaler --zip-file fileb:///tmp/scaler.zip --region $REGION >/dev/null
+# scaler: upload the PREBUILT zip directly (pure source, no deps — no build step)
+aws lambda update-function-code --function-name openclaw-scaler --zip-file "fileb://$LAMBDA_DIR/scaler/openclaw-scaler.zip" --region $REGION >/dev/null
 aws lambda wait function-updated --function-name openclaw-scaler --region $REGION
 
 # confirm all THREE CodeSha256 changed vs backup (a missed one = fix half-applied)
@@ -285,6 +298,36 @@ Create a NEW LT version carrying the patched `init-host.sh` and point the ASG at
 edit the existing version, and do **not** trigger an instance refresh (that would replace live
 hosts). New scale-outs pick it up; existing hosts are untouched. (Full render/`update-auto-scaling-group`
 commands: this is optional for this customer — skip unless #300 is confirmed.)
+
+---
+
+## Step 6.5 — Secrets Manager VPCE (carried from #309; probe first, describe-only, human-gated)
+
+**Not a #315 change** — carried forward for a 266-only customer. **AI is describe-only on
+network resources: run only the probes, then STOP and ask a human before any create.** A wrong
+VPCE/DNS change can break resolution for the whole VPC.
+
+**When it's needed:** only if the observability/AOS stack (OpenSearch + the in-VPC roles-mapping
+Lambda) is deployed AND that Lambda can't reach Secrets Manager (no NAT). If `logging.enabled=false`
+(this customer), AOS isn't deployed → **this whole layer is a no-op, skip it.**
+
+```bash
+REGION=<region>
+# Probe with TWO signals (a renamed function could slip a single name match):
+aws opensearch list-domain-names --region $REGION --output text        # (a) any OpenSearch domain?
+aws lambda list-functions --region $REGION \
+  --query "Functions[?contains(FunctionName,'oles')||contains(FunctionName,'aos')||contains(FunctionName,'AOS')].FunctionName" --output text   # (b) any roles-mapping Lambda?
+#   BOTH empty  => observability not deployed => VPCE not needed => SKIP this whole step.
+#   Either non-empty => an AOS component may exist. Do NOT auto-create. Identify the in-VPC
+#     roles-mapping Lambda with the operator; if it already reaches Secrets Manager (NAT default
+#     route on its subnets, or an existing Interface VPCE with private DNS), nothing to do.
+#   Only if it genuinely lacks egress: PROPOSE (do not run) this, and STOP for human approval:
+#     aws ec2 create-security-group --group-name openclaw-sm-vpce-315 --vpc-id <vpc> --region $REGION ...
+#     aws ec2 authorize-security-group-ingress --group-id <sg> --protocol tcp --port 443 --source-group <lambda-sg> ...
+#     aws ec2 create-vpc-endpoint --vpc-endpoint-type Interface --service-name com.amazonaws.$REGION.secretsmanager \
+#       --vpc-id <vpc> --subnet-ids <lambda-subnets> --security-group-ids <sg> --private-dns-enabled --region $REGION
+# rollback (only if you created it): aws ec2 delete-vpc-endpoints --vpc-endpoint-ids <id>; delete-security-group --group-id <sg>
+```
 
 ---
 

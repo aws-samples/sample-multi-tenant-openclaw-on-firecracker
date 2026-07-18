@@ -230,13 +230,15 @@ Two shapes shipped:
   semantics. **Verify it via a rebuild/delete, not via create.**
 - **openclaw-scaler** (`$LATEST`): upload the prebuilt `openclaw-scaler.zip` directly.
 
-> **Zero-build option for the api zip (avoids the arm64/deps problem entirely — verified):**
-> #315 changed only `.py`, not `requirements.txt`, so the deps in the LIVE package are already
-> correct. Instead of `pip install`, download the current api package, delete only the
-> first-party source dirs (`consumers core routes services handler.py requirements.txt test_*.py`),
-> overlay the shipped `lambda/api/` tree on top (keeping `cryptography/ jwt/ aws_lambda_powertools/`
-> and the arm64 `.so`), re-zip. This reuses platform-correct deps and cold-starts cleanly —
-> confirmed on an arm64/ddb test env. Use this if you don't have an arm64 build host.
+> **Why the api ships as a source tree, not a prebuilt zip:** its deps (`cryptography`) are
+> arm64 native wheels. A zip we prebuild would freeze OUR deps versions onto your function —
+> a change you didn't ask for. #315 changed only `.py`, not `requirements.txt`, so the RIGHT
+> move is to **reuse the deps already in your live package** and overlay only the new source.
+> That keeps YOUR dep versions untouched and needs no build host. This is the primary recipe
+> below (verified end-to-end on an arm64/ddb env). A `pip`-build fallback follows if you'd
+> rather rebuild deps (e.g. your live package is somehow missing them).
+
+**Primary — overlay (reuse the live package's deps; no build host, no dep change):**
 
 ```bash
 set -euo pipefail
@@ -247,43 +249,61 @@ BK=~/Downloads/315-concurrent-dispatch-rollup/backup
 # $LATEST directly; then there's no alias to move and rollback is purely $LATEST re-deploy.
 API_ALIAS=$(aws lambda list-aliases --function-name openclaw-api --region $REGION \
   --query 'Aliases[0].Name' --output text 2>/dev/null); [ "$API_ALIAS" = "None" ] && API_ALIAS=""
-ROLLBACK_VER=$([ -n "$API_ALIAS" ] && aws lambda get-alias --function-name openclaw-api --name "$API_ALIAS" --region $REGION --query FunctionVersion --output text || echo "")
-echo "openclaw-api alias='${API_ALIAS:-<none>}' currently -> version '${ROLLBACK_VER:-N/A}'"
-echo "pre-patch anchor versions (from Step 1) are in $BK/lambda/anchors.txt — that is your durable rollback point"
+echo "openclaw-api alias='${API_ALIAS:-<none>}'; pre-patch anchor versions are in $BK/lambda/anchors.txt (durable rollback)"
 
-# build api zip WITH deps — MUST be ARM64/manylinux wheels (cryptography has native code).
-# Simplest reliable way: run this ON AN arm64 host (bastion) so `pip install` gives native wheels.
-# Cross-platform alternative (any host): use --platform manylinux2014_aarch64 as below.
-# EITHER WAY the goal is deps that match the Lambda arm64 runtime — a source-only or wrong-arch
-# zip fails cold start with "Unable to import module".
-rm -rf /tmp/api-build && mkdir -p /tmp/api-build
-pip install --no-cache-dir --platform manylinux2014_aarch64 --implementation cp --python-version 3.12 \
-  --only-binary=:all: --upgrade -r "$LAMBDA_DIR/api/requirements.txt" -t /tmp/api-build
-cp -a "$LAMBDA_DIR/api/." /tmp/api-build/
-( cd /tmp/api-build && zip -qr /tmp/api-lambda.zip . )
-unzip -l /tmp/api-lambda.zip | grep -qi aws_lambda_powertools || { echo "STOP: deps not bundled"; exit 1; }
+# 1. download the CURRENT api package (it already contains your platform-correct deps)
+rm -rf /tmp/api-overlay && mkdir -p /tmp/api-overlay
+URL=$(aws lambda get-function --function-name openclaw-api --region $REGION --query 'Code.Location' --output text)
+curl -fsSL "$URL" -o /tmp/api-cur.zip && ( cd /tmp/api-overlay && unzip -q /tmp/api-cur.zip )
+# 2. delete ONLY the first-party source dirs (keep cryptography/ jwt/ aws_lambda_powertools/ + the .so)
+( cd /tmp/api-overlay && rm -rf consumers core routes services handler.py requirements.txt test_*.py __pycache__ )
+# 3. overlay the shipped patched source tree
+cp -a "$LAMBDA_DIR/api/." /tmp/api-overlay/
+# 4. re-zip; sanity-check both the #315 code AND the reused deps are present
+( cd /tmp/api-overlay && zip -qr /tmp/api-lambda.zip . )
+unzip -l /tmp/api-lambda.zip | grep -qE 'core/dispatch/binpack.py' && unzip -l /tmp/api-lambda.zip | grep -qi 'cryptography/' \
+  || { echo "STOP: overlay zip missing #315 code or deps"; exit 1; }
 
 # openclaw-api: update $LATEST (no --publish), wait, publish once, move the alias (if any)
 aws lambda update-function-code --function-name openclaw-api --zip-file fileb:///tmp/api-lambda.zip --region $REGION >/dev/null
 aws lambda wait function-updated --function-name openclaw-api --region $REGION
 NEW_VER=$(aws lambda publish-version --function-name openclaw-api --region $REGION --query Version --output text)
 [ -n "$API_ALIAS" ] && aws lambda update-alias --function-name openclaw-api --name "$API_ALIAS" --function-version "$NEW_VER" --region $REGION >/dev/null
+```
+
+<details><summary><b>Fallback — rebuild deps with pip (only if the live package lacks them; needs arm64/manylinux)</b></summary>
+
+```bash
+rm -rf /tmp/api-build && mkdir -p /tmp/api-build
+pip install --no-cache-dir --platform manylinux2014_aarch64 --implementation cp --python-version 3.12 \
+  --only-binary=:all: --upgrade -r "$LAMBDA_DIR/api/requirements.txt" -t /tmp/api-build
+cp -a "$LAMBDA_DIR/api/." /tmp/api-build/
+( cd /tmp/api-build && zip -qr /tmp/api-lambda.zip . )
+unzip -l /tmp/api-lambda.zip | grep -qi aws_lambda_powertools || { echo "STOP: deps not bundled"; exit 1; }
+# then the same update-function-code / publish / update-alias as above.
+```
+
+</details>
 
 # consumer: same api zip, $LATEST
+
 aws lambda update-function-code --function-name openclaw-lifecycle-consumer --zip-file fileb:///tmp/api-lambda.zip --region $REGION >/dev/null
 aws lambda wait function-updated --function-name openclaw-lifecycle-consumer --region $REGION
 
 # scaler: upload the PREBUILT zip directly (pure source, no deps — no build step)
+
 aws lambda update-function-code --function-name openclaw-scaler --zip-file "fileb://$LAMBDA_DIR/scaler/openclaw-scaler.zip" --region $REGION >/dev/null
 aws lambda wait function-updated --function-name openclaw-scaler --region $REGION
 
 # confirm all THREE CodeSha256 changed vs backup (a missed one = fix half-applied)
+
 for FN in openclaw-api openclaw-lifecycle-consumer openclaw-scaler; do
-  NOW=$(aws lambda get-function --function-name $FN --region $REGION --query 'Configuration.CodeSha256' --output text)
+NOW=$(aws lambda get-function --function-name $FN --region $REGION --query 'Configuration.CodeSha256' --output text)
   WAS=$(python3 -c "import json;print(json.load(open('$HOME/Downloads/315-concurrent-dispatch-rollup/backup/lambda/$FN.get-function.json'))['Configuration']['CodeSha256'])")
-  [ "$NOW" != "$WAS" ] && echo "$FN updated OK" || { echo "STOP: $FN CodeSha256 unchanged — not updated"; exit 1; }
+[ "$NOW" != "$WAS" ] && echo "$FN updated OK" || { echo "STOP: $FN CodeSha256 unchanged — not updated"; exit 1; }
 done
-```
+
+````
 
 **Rollback:** see the dedicated "Rollback the control-plane Lambdas" section below —
 openclaw-api needs BOTH its alias path and its `$LATEST`/dispatch path reverted.
@@ -327,7 +347,7 @@ aws lambda list-functions --region $REGION \
 #     aws ec2 create-vpc-endpoint --vpc-endpoint-type Interface --service-name com.amazonaws.$REGION.secretsmanager \
 #       --vpc-id <vpc> --subnet-ids <lambda-subnets> --security-group-ids <sg> --private-dns-enabled --region $REGION
 # rollback (only if you created it): aws ec2 delete-vpc-endpoints --vpc-endpoint-ids <id>; delete-security-group --group-id <sg>
-```
+````
 
 ---
 

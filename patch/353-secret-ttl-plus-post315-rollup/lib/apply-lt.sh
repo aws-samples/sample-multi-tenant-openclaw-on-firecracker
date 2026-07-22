@@ -7,7 +7,6 @@
 # Verbs (run in order; every mutating step is a confirmation gate):
 #   pull     <asg> <region>                 discover LT-id/version the ASG ACTUALLY uses; decode rendered UserData
 #   push     <asg> <region>                 create a NEW LT version from your edited plaintext (does NOT touch the ASG)
-#   canary   <asg> <region>                 launch ONE host on the new version, verify 3 signals, terminate it
 #   promote  <asg> <region>                 point the ASG at the new version (MIP-safe), preserving all other config
 #   refresh  <asg> <region>                 start a CONTROLLED instance-refresh (high MinHealthy)
 #   rollback <asg> <region>                 re-point the ASG at the exact prior config captured at pull
@@ -18,11 +17,11 @@
 #     which would flatten a MIP. Plain-LT ASGs use `--launch-template`.
 #  #2 identity: operate on the immutable LaunchTemplateId read FROM the ASG, not a passed name.
 #  #3 no $Latest/$Default: pull refuses them — you must pin a concrete numeric version first, so a
-#     freshly-created version can't be picked up by natural scaling before canary.
+#     freshly-created version can't be picked up by natural scaling before promote.
 #  #4/#5 drift + state: pull snapshots the full ASG config + its sha; every later verb re-reads and
 #     aborts if the live config drifted; state is a 0600 JSON file in a 0700 dir (never /tmp `source`).
-#  #9 verify-before-promote: push creates a version but leaves the ASG alone; canary proves ONE host
-#     on it BEFORE promote points the fleet at it.
+#  #9 verify-before-promote: push creates a version, reads it back, and leaves the ASG alone; promote
+#     is a separate gated step. The fleet is controlled, so a controlled instance-refresh is the boot proof.
 #  #10 refresh uses a HIGH MinHealthyPercentage (default 100 — small = bigger blast radius, backwards).
 #  #11 host registration key is instance_id.  #13 every mutation is read back and compared.
 set -euo pipefail
@@ -57,7 +56,7 @@ _lt_ref() { # stdin = ASG JSON -> "ltid<TAB>version<TAB>ismip"
     | @tsv'
 }
 
-[ $# -ge 1 ] || { echo "usage: apply-lt.sh pull|push|canary|promote|refresh|rollback <asg> <region>" >&2; exit 2; }
+[ $# -ge 1 ] || { echo "usage: apply-lt.sh pull|push|promote|refresh|rollback <asg> <region>" >&2; exit 2; }
 cmd="$1"; shift
 
 case "$cmd" in
@@ -69,7 +68,7 @@ case "$cmd" in
     [ -n "$LTID" ] || { echo "FATAL: ASG '$ASG' has no launch template (LaunchConfiguration ASGs unsupported)" >&2; exit 1; }
     case "$VER" in '$Latest'|'$Default'|''|null)
       echo "FATAL: ASG pins version '$VER' — refusing (#3). Pin a CONCRETE numeric version on the ASG first," >&2
-      echo "       so a freshly-created version can't be launched by natural scaling before canary." >&2
+      echo "       so a freshly-created version can't be launched by natural scaling before promote." >&2
       exit 2 ;;
     esac
     echo "ASG '$ASG' uses LT id=$LTID version=$VER (type=$ISMIP) — operating on the immutable id, not a name."
@@ -109,41 +108,16 @@ case "$cmd" in
       || { echo "FATAL: created version $NEWVER does NOT read back as edited plaintext — do NOT promote" >&2; exit 2; }
     jq --arg nv "$NEWVER" '.new_version=$nv' "$ST" > "$ST.tmp" && mv "$ST.tmp" "$ST"; chmod 600 "$ST"
     echo "OK: LT $LTID new version $NEWVER created + read-back verified. ASG UNCHANGED."
-    echo "NEXT: apply-lt.sh canary $ASG $REGION   (prove ONE host on v$NEWVER BEFORE promoting the fleet)"
-    ;;
-
-  canary)
-    ASG="${1:?asg}"; REGION="${2:?region}"; ST="$(_statefile "$ASG")"
-    NEWVER="$(jq -r .new_version "$ST")"; LTID="$(jq -r .lt_id "$ST")"
-    [ "$NEWVER" != "null" ] || { echo "FATAL: run push first" >&2; exit 1; }
-    echo "############################################################################"
-    echo "# EXPERIMENTAL — do NOT rely on this for production gating yet.             #"
-    echo "# A standalone canary running the REAL init-host.sh registers itself into  #"
-    echo "# openclaw-hosts status=active (init-host.sh:595) and the scheduler WILL    #"
-    echo "# place real tenants on it; terminating it leaves a dead schedulable host   #"
-    echo "# (no ASG lifecycle cleanup). Until a scheduler-ignored 'canary' status is  #"
-    echo "# wired in, verify the new UserData OUT OF BAND (decode has no {{ }};        #"
-    echo "# bash -n the plaintext) and rely on a controlled instance-refresh's first  #"
-    echo "# host — which goes through normal ASG lifecycle — as the real boot proof.  #"
-    echo "############################################################################"
-    echo "Canary: launch ONE standalone instance on LT $LTID v$NEWVER (NOT via the ASG), watch 3 signals,"
-    echo "then terminate it. This proves the new UserData boots before the fleet ever sees it."
-    echo "  signal 1 (no placeholder): the new version's decoded UserData has no {{ }} (already enforced by decode)."
-    echo "  signal 2 (registers):  aws dynamodb get-item --table-name openclaw-hosts \\"
-    echo "                           --key '{\"instance_id\":{\"S\":\"<canary-iid>\"}}' --consistent-read --region $REGION"
-    echo "  signal 3 (boot clean): SSM the canary; 'cloud-init status --wait' == done, host-agent active, no {{ }} in /var/lib/cloud/instance/user-data.txt"
-    echo
-    echo "Run the launch yourself (subnet/SG/profile are env-specific), e.g.:"
-    echo "  aws ec2 run-instances --launch-template LaunchTemplateId=$LTID,Version=$NEWVER \\"
-    echo "    --subnet-id <host-subnet> --region $REGION --tag-specifications 'ResourceType=instance,Tags=[{Key=oc-canary,Value=$ASG}]'"
-    echo "Only after all 3 pass, terminate the canary and run: apply-lt.sh promote $ASG $REGION"
+    echo "The new UserData is already proven at push (decode = no placeholders + round-trip + read-back)."
+    echo "NEXT: apply-lt.sh promote $ASG $REGION   (point the ASG at v$NEWVER; the running fleet is controlled,"
+    echo "      so a small controlled instance-refresh's first host — via normal ASG lifecycle — is the boot proof)."
     ;;
 
   promote)
     ASG="${1:?asg}"; REGION="${2:?region}"; ST="$(_statefile "$ASG")"
     LTID="$(jq -r .lt_id "$ST")"; NEWVER="$(jq -r .new_version "$ST")"; ISMIP="$(jq -r .is_mip "$ST")"
     PREVSHA="$(jq -r .asg_sha "$ST")"
-    [ "$NEWVER" != "null" ] || { echo "FATAL: run push (and canary) first" >&2; exit 1; }
+    [ "$NEWVER" != "null" ] || { echo "FATAL: run push first" >&2; exit 1; }
     _gate "point ASG '$ASG' at LT $LTID v$NEWVER (new instances only; running fleet untouched)"
     # drift guard (#4): re-read AFTER the confirm gate (not before) so a change during the prompt can't
     # slip through, and build the update from the re-read live JSON, not the stale pull snapshot.
@@ -201,5 +175,5 @@ case "$cmd" in
     echo "OK: ASG re-pointed at v$PREV. (The bad LT version is left in place — immutable, cheap; don't delete.)"
     ;;
 
-  *) echo "usage: apply-lt.sh pull|push|canary|promote|refresh|rollback <asg> <region>" >&2; exit 2 ;;
+  *) echo "usage: apply-lt.sh pull|push|promote|refresh|rollback <asg> <region>" >&2; exit 2 ;;
 esac

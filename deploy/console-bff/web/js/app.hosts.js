@@ -7,6 +7,13 @@ window.ocHosts = {
   snapshots: [], selectedSnapshot: '',
   // #217 — 每台 host 各自选的快照(instance_id→snapshot_time);未选默认最新(hostSnapFor)。
   hostSnapChoice: {},
+  // #309 — copy-file modal (replaces native prompt so the EC2 target path is clear).
+  // copy-file updates host scripts, so the target must be under /opt/openclaw/ (.py
+  // host-agent service) or /home/ubuntu/ (.sh + lib/*) — the two roots init-host.sh
+  // installs deployment/scripts/ to. Image disks (/data/firecracker-assets/) are off-limits.
+  copyModal: { show: false, host_id: '', s3_uri: 's3://', target: '/opt/openclaw/', busy: false, error: '' },
+  // #309 — latest pull-image progress line per host, auto-polled while upgrading.
+  pullProgress: {}, _progressInFlight: {},
 
   async loadHosts() {
     if (!this.apiUrl || !this.apiKey) return;
@@ -16,7 +23,7 @@ window.ocHosts = {
     this.loadingHosts = false;
     try { this.rootfsVersion = (await this.api('GET', 'hosts/rootfs-version')).version; } catch {}
     try { this.agentcoreStatus = await this.api('GET', 'agentcore/status'); } catch {}
-    try { this.snapshots = await this.api('GET', 'snapshots'); } catch {}  // #217 顶部下拉
+    try { this.snapshots = await this.api('GET', 'list_image_versions'); } catch {}  // #337(原#217 /snapshots)顶部下拉
     // Load skills + groups (v1.4.0/1.4.1)
     this.loadSkills();
     this.loadGroups();
@@ -63,6 +70,89 @@ window.ocHosts = {
     }
     setTimeout(() => { this.toast = ''; this.loadHosts(); }, 3000);
   },
+  // #309 — copy a single file from S3 to this host (EC2). Opens an in-app modal
+  // (not a native prompt) so the EC2 target path is a clear, editable field.
+  // Target must be under /data/firecracker-assets/ (server enforces the allowlist).
+  // #309 — host-script target roots (mirror of backend _COPY_FILE_ALLOWED_ROOTS).
+  copyAllowedRoots: ['/opt/openclaw/', '/home/ubuntu/'],
+  openCopyFileModal(host_id) {
+    this.copyModal = {
+      show: true, host_id, s3_uri: 's3://',
+      target: '/opt/openclaw/', busy: false, error: '',
+    };
+  },
+  closeCopyFileModal() { this.copyModal.show = false; },
+  async submitCopyFile() {
+    const m = this.copyModal;
+    const s3_uri = (m.s3_uri || '').trim();
+    const target = (m.target || '').trim();
+    if (!s3_uri.startsWith('s3://') || s3_uri.length <= 5) {
+      m.error = 'S3 URI must be s3://<bucket>/<key>'; return;
+    }
+    if (!this.copyAllowedRoots.some(r => target.startsWith(r))) {
+      m.error = 'Target must be under ' + this.copyAllowedRoots.join(' or '); return;
+    }
+    // #334 — 必须是完整文件路径(含文件名),拒目录/尾斜杠/裸根:否则 aws s3 cp 到目录后
+    // chown 改的是目录、真文件仍 root:root(与后端 _validate_copy_target 一致)。
+    if (target.endsWith('/') || this.copyAllowedRoots.some(r => target.replace(/\/+$/, '') === r.replace(/\/+$/, ''))) {
+      m.error = 'Target must include a filename (not a directory). e.g. /opt/openclaw/host_agent.py'; return;
+    }
+    m.error = ''; m.busy = true;
+    try {
+      // #336 — copy-file 返回合并契约:靠【body 的 ProcessingJobStatus】判成败,不靠 HTTP 码
+      // (api() 遇非 2xx 不 throw、直接返回 body)。成功 Completed;失败带 code + error。
+      const r = await this.api('POST', `hosts/${m.host_id}/copy-file-from-s3`, { target, s3_uri });
+      if (r && r.ProcessingJobStatus === 'Completed') {
+        this.toast = `✓ copy-file done: ${target}`;
+        m.show = false;
+      } else {
+        // Failed(COPY_FAILED / COPY_DISPATCH_FAILED)或校验错(VALIDATION):显 code + 真实原因。
+        const reason = (r && (r.error || r.code)) || 'unknown error';
+        m.error = `copy-file failed${r && r.code ? ' [' + r.code + ']' : ''}: ${reason}`;
+      }
+    } catch (e) {
+      m.error = 'copy-file failed: ' + (e && e.message ? e.message : 'error');
+    } finally {
+      m.busy = false;
+    }
+    setTimeout(() => { this.toast = ''; }, 4000);
+  },
+  // #333 — GET /hosts/{id}/pull-image-progress 返回 SageMaker ProcessingJob 风格 JSON:
+  //   ProcessingJobStatus: Completed|Failed|InProgress
+  //   last_status: 进度文件末行原文(带时间戳+做了什么)
+  //   Failed 时: ErrorCode + FailureReason
+  // 组装成一行 inline 展示:进行中显进度原文;成功/失败显状态(+失败原因)。
+  // (旧字段 p.progress 已移除,#333 改契约——这里同步消费新字段。)
+  // Guards against overlapping calls per host so the 5s poll can't stack requests.
+  async _fetchPullProgress(host_id) {
+    if (this._progressInFlight[host_id]) return this.pullProgress[host_id];
+    this._progressInFlight[host_id] = true;
+    try {
+      const p = await this.api('GET', `hosts/${host_id}/pull-image-progress`);
+      let line;
+      if (p.ProcessingJobStatus === 'Failed') {
+        line = `Failed: ${p.ErrorCode || ''} ${p.FailureReason || p.last_pull_error || ''}`.trim();
+      } else if (p.ProcessingJobStatus === 'Completed') {
+        line = 'Completed';
+      } else {
+        // InProgress: 显进度文件末行原文(哪个文件在下载/解压)
+        line = p.last_status || p.last_pull_error || 'In progress…';
+      }
+      this.pullProgress[host_id] = line;
+      return line;
+    } catch (e) {
+      return this.pullProgress[host_id] || '';
+    } finally {
+      this._progressInFlight[host_id] = false;
+    }
+  },
+  // #309 — on each poll beat, refresh progress for every host that's upgrading so
+  // the card shows the live pull-image status line (no manual button needed).
+  pollUpgradingProgress() {
+    for (const h of this.hosts) {
+      if (h.status === 'upgrading') this._fetchPullProgress(h.instance_id);
+    }
+  },
   // #217 — quiet poll: refresh the host list (status/snapshot) WITHOUT flipping
   // loadingHosts, so the manual-refresh spinner doesn't blink every beat. A host's
   // active→upgrading→active cycle after a Pull then updates on its own.
@@ -71,7 +161,7 @@ window.ocHosts = {
     try {
       this.hosts = await this.api('GET', 'hosts');
       this.connected = true;
-      this.snapshots = await this.api('GET', 'snapshots');
+      this.snapshots = await this.api('GET', 'list_image_versions');  // #337(原#217 /snapshots)
     } catch { this.connected = false; }
   },
   // v1.2.8 — host AZ lookup for the new "AZ" column in the tenants table.

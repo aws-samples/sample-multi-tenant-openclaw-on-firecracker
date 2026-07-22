@@ -24,31 +24,53 @@ class PackResult:
     unplaced: List[Dict[str, Any]] = field(default_factory=list)
 
 
-def _slots_needed(tenant: Dict[str, Any]) -> int:
-    """一个租户消耗几个 slot。当前一租户=一 microVM=1 slot(vcpu 单位由 host 层保证)。"""
-    return 1
+def normalize_spec(
+    params: Optional[Dict[str, Any]], default_vcpu: int, default_mem: int
+) -> tuple[int, int]:
+    """从租户 params 提取【已校验】的 (vcpu, mem_mb)。非法/缺失/非正 → 回落默认值。
+
+    #330:params 来自 SQS 消息体(信任边界外),会喂进容量账本算术。负数/非数字若直接参与
+    会腐蚀 used_vcpu/used_mem_mb(下溢)或在算术里炸批。这里在装箱+CAS 求和的【唯一入口】统一
+    校验:coerce int 失败或 <=0 一律回落默认(与旧 `.get(k, default)` 意图一致的 fail-safe,
+    不把坏输入放进账本)。装箱与 CAS 用同一函数取数 → 两者口径必然一致,消除轴错配。
+    非 dict 的 params(list/str/int 等畸形消息体)也 fail-safe 全回落默认,绝不炸批(codex review)。"""
+    p = params if isinstance(params, dict) else {}
+
+    def _pos_int(v: Any, dflt: int) -> int:
+        # OverflowError:int(1e309)=inf 会炸;ValueError/TypeError:非数字字符串/None。
+        # 全 fail-safe 回落默认,绝不把 inf/NaN/非正数放进容量算术(codex review)。
+        try:
+            iv = int(v)
+        except (TypeError, ValueError, OverflowError):
+            return dflt
+        return iv if iv > 0 else dflt
+
+    return _pos_int(p.get("vcpu"), default_vcpu), _pos_int(p.get("mem_mb"), default_mem)
 
 
 def _rank_hosts_by_capacity(
     hosts: List[Dict[str, Any]], skip_simulated: bool
 ) -> List[Dict[str, Any]]:
-    """按 free_slots 降序排;可选跳过 simulated host(push 模式);inflight_ok=False 跳过。
+    """按 free_vcpu 降序排;跳过 inflight_ok=False / simulated(push) / 无 vcpu 容量 /
+    内存未知(mem_known=False,fail-safe:缺 total_mem_mb 的 host 不参与,不当无限内存)。
 
-    #315 SPLIT_BY_MODE:inflight_ok 的取值由调用方(_snapshot_hosts)按 dispatch 模式给——
-    - push 模式:host 有未过期在途命令 → inflight_ok=False → 这里跳过(host 级串行,poller 需要)。
-    - ddb 模式:inflight_ok 恒 True → 这里不跳过,允许一台 host 并发多批(host-agent 兜底,
-      可扩 1000 host)。容量安全由 _try_reserve_host 的 slot 级 CAS 保证,与 inflight 无关。
-    本函数逻辑对两模式统一(照 inflight_ok 跳),真正的模式差异在 _snapshot_hosts 怎么算 inflight_ok。"""
+    #315 SPLIT_BY_MODE:inflight_ok 取值由调用方(_snapshot_hosts)按 dispatch 模式给。
+    #330:排序键从 free_slots(VM_DEFAULT 折算的名额)改为 free_vcpu(真实剩余 vcpu),与
+    CAS 的真实记账同轴,避免"装箱按名额给、CAS 按真实拒"的整批拒绝饿死。"""
     usable = []
     for h in hosts:
         if not h.get("inflight_ok", True):
             continue
         if skip_simulated and h.get("simulated"):
             continue
-        if int(h.get("free_slots", 0) or 0) <= 0:
+        if int(h.get("free_vcpu", 0) or 0) <= 0:
             continue
+        if not h.get("mem_known", False):
+            continue  # #330 fail-safe:内存容量未知的 host 不调度(待回填),不 fail-open 当无限
+        if not h.get("disk_ok", True):
+            continue  # #340 磁盘软门:/data 物理将满的 host 不接新租户(缺该键默认 True=旧行为)
         usable.append(h)
-    usable.sort(key=lambda h: int(h.get("free_slots", 0) or 0), reverse=True)
+    usable.sort(key=lambda h: int(h.get("free_vcpu", 0) or 0), reverse=True)
     return usable
 
 
@@ -58,11 +80,16 @@ def pack(
     per_host_cap: Optional[int] = None,
     *,
     skip_simulated: bool = False,
+    default_vcpu: int = 2,
+    default_mem: int = 4096,
 ) -> PackResult:
-    """贪婪装箱:每步挑一个能装下最多剩余租户的 host,装满即闭合并下一 host。
+    """贪婪装箱:按【真实 vcpu+mem 预算】把租户塞进 host,预算或并行度上限用尽即下一 host。
 
-    per_host_cap:单次批量拉起并行度上限(如 DISPATCH_MAX_PARALLEL=96);None=不限。
-    skip_simulated:push 模式下 simulated host 不参与(pull 模式传 False)。
+    #330:装箱按每租户真实 vcpu/mem 扣减 host 的 free_vcpu/free_mem 双预算(不再一租户=1 名额),
+    与 _try_reserve_host 的真实 CAS 同轴——装箱放得进的批,CAS 必不会因容量整批拒(消除饿死),
+    且 1c:2G 租户能装到真实 vcpu 上限(r8g 564 而非 282 名额),达成 380 目标。
+    per_host_cap:单批并行度上限(DISPATCH_MAX_PARALLEL,限 VM 数不限资源);None=不限。
+    default_vcpu/default_mem:params 缺省时的回落规格(调用方传 clients.VM_DEFAULT_*)。
     """
     result = PackResult()
     if not pending:
@@ -70,39 +97,38 @@ def pack(
 
     usable = _rank_hosts_by_capacity(hosts, skip_simulated=skip_simulated)
     if not usable:
-        # 所有 host 都在途或没容量 → 全 unplaced,回队列退避重试
         result.unplaced = list(pending)
         return result
 
-    remaining = list(pending)
-    # host 剩余可用槽的可变字典,避免修改入参 dict
-    host_free = {
-        h["instance_id"]: min(
-            int(h.get("free_slots", 0) or 0),
-            per_host_cap
-            if per_host_cap is not None
-            else int(h.get("free_slots", 0) or 0),
-        )
+    # #330 first-fit-decreasing(codex score):资源需求大的租户先放——它们最难塞,FIFO 下
+    # 常被小租户占满预算后无处可去(饿死)。按 (vcpu, mem) 降序排,大租户优先落 host。
+    # stable sort:同规格租户保持原始入队顺序(既有 identity-order 测试不变)。
+    remaining = sorted(
+        pending,
+        key=lambda t: normalize_spec(t.get("params"), default_vcpu, default_mem),
+        reverse=True,
+    )
+    # 每 host 可变预算:剩余 vcpu / 剩余 mem / 本批还能起几个 VM(并行度上限)
+    hv = {h["instance_id"]: int(h.get("free_vcpu", 0) or 0) for h in usable}
+    hm = {h["instance_id"]: int(h.get("free_mem", 0) or 0) for h in usable}
+    vm_cap = {
+        h["instance_id"]: per_host_cap if per_host_cap is not None else len(remaining)
         for h in usable
     }
 
     for host in usable:
         hid = host["instance_id"]
-        cap = host_free[hid]
-        if cap <= 0:
-            continue
         batch: List[Dict[str, Any]] = []
-        # 从 remaining 顺序取,直到 cap 用光或 pending 用光
         i = 0
-        while i < len(remaining) and len(batch) < cap:
-            t = remaining[i]
-            need = _slots_needed(t)
-            if need <= cap - len(batch):
-                batch.append(t)
-                remaining.pop(i)
+        while i < len(remaining) and len(batch) < vm_cap[hid]:
+            v, m = normalize_spec(remaining[i].get("params"), default_vcpu, default_mem)
+            if v <= hv[hid] and m <= hm[hid]:
+                batch.append(remaining.pop(i))
+                hv[hid] -= v
+                hm[hid] -= m
                 # 不 i+=1:pop 后 i 已指向下一个
             else:
-                i += 1
+                i += 1  # 这个租户在本 host 放不下,试下一个(小租户可能仍能塞)
         if batch:
             result.assignments[hid] = batch
         if not remaining:

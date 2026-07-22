@@ -23,7 +23,7 @@ def build_storage(self, ctx):
 
     # ========== DynamoDB ==========
     # 控制面表 PITR(时间点恢复)。租户数据本身有 backup_fn→WORM 桶兜底,但
-    # 控制面元数据(tenants/hosts/audit)误删/误改/坏写后无法回滚 ——  实跑
+    # 控制面元数据(tenants/hosts/audit)误删/误改/坏写后无法回滚 —— 795 实跑
     # 5 张表 PITR 全 DISABLED(2026-06-30 巡检发现)。开 PITR 后 DynamoDB 维持
     # 35 天连续备份,可恢复到任意秒级时点。config 开关默认 true,短命的
     # batch-jobs(DESTROY+TTL)不开。开 PITR 对 PAY_PER_REQUEST 表只按备份存储
@@ -208,7 +208,7 @@ def build_storage(self, ctx):
         time_to_live_attribute="expires_ttl",
         removal_policy=RemovalPolicy.DESTROY,
     )
-    # #97 档A — external-platform → Cognito upstream-IdP routing map (the design doc §2.7).
+    # #97 档A — external-platform → Cognito upstream-IdP routing map (SPEC/02 §2.7).
     # partition_key platform_id; rows {idp_provider_name, issuer_url, created_at}.
     # GET /tenantmatch reads it pre-login to route to the right federated IdP.
     # Rebuildable routing config (no tenant data) → DESTROY removal is fine.
@@ -222,11 +222,16 @@ def build_storage(self, ctx):
         billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
         removal_policy=RemovalPolicy.DESTROY,
     )
-    # #187 P1 — short-lived per-tenant secret ciphertext store (the data-plane design
-    # F). Holds the KMS-envelope-encrypted gateway token (tenant_id EncryptionContext)
-    # with a 15-min TTL (`expires_at` = now+900 seconds). Rows are ROTATED (not deleted)
-    # on each tenant create; DDB TTL sweeps expired rows within minutes; delete_tenant
-    # additionally best-effort removes on delete to close the reveal window immediately.
+    # #187 P1 — per-tenant secret ciphertext store (SPEC/11-ENGINE-TRANSFORM F).
+    # Holds the KMS-envelope-encrypted gateway token + device identity (tenant_id
+    # EncryptionContext). Rows are ROTATED (not deleted) on each tenant create.
+    # #353 — NO DDB TTL (design decision, direction A): the ciphertext persists for the tenant's
+    # whole life so rebuild/recover/restore months or years later can still read
+    # back the original token/device identity. An expired read → openssl fallback →
+    # token mismatch → JDWS can't connect (the #290/#312 recover paths read this
+    # table). delete_tenant no longer removes the row either. (Was a 15-min TTL then
+    # 30 days; both dropped — the `time_to_live_attribute` and the code-side
+    # `expires_at`/`device_expires_at` soft-expiry checks are all removed.)
     # Ciphertext-only — plaintext is never persisted anywhere (only travels through the
     # `aws kms encrypt` call from control-plane Lambda → SSM command line → host
     # `aws kms decrypt` fresh at each launch). RETAIN in prod (rebuildable ciphertext
@@ -240,8 +245,21 @@ def build_storage(self, ctx):
             name="tenant_id", type=dynamodb.AttributeType.STRING
         ),
         billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
-        time_to_live_attribute="expires_at",
         removal_policy=self._stateful_removal,
+    )
+    # #353 — 显式声明 TTL 【disabled】,而不是仅删除 timeToLiveAttribute。理由:从 CFN
+    # 模板删掉 TimeToLiveSpecification 不会 disable 存量表上已启用的 TTL(存量表继续删
+    # 带过期 expires_at 的行 → recover 读空 → openssl 回退 → token 不一致 → JDWS 连不上)。
+    # 用 L1 escape hatch 声明 Enabled=false,让 CloudFormation 在存量表上真正调
+    # UpdateTimeToLive 关掉 TTL(cdk deploy 直接生效,不依赖 setup.sh 脚本、不被绕过)。
+    # 全新部署等价于本就无 TTL。CDK L2 Table 不支持显式 disable,故走 CfnTable override。
+    # AttributeName 必带:CFN TimeToLiveSpecification 文档规定 AttributeName 在
+    # "enabling TTL 或 TTL 已 enabled" 时为 conditional-required —— 存量表 TTL 正开着时
+    # 只给 {Enabled:false} 会参数校验失败,disable 跑不成、TTL 继续生效。带上原属性名。
+    _cfn_secrets = tenant_secrets_table.node.default_child
+    _cfn_secrets.add_property_override(
+        "TimeToLiveSpecification",
+        {"AttributeName": "expires_at", "Enabled": False},
     )
     # ========== Parameter Registry + Recipient Keys (tenant-credential-contract) ==========
     param_registry_table = dynamodb.Table(

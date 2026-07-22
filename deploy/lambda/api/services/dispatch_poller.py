@@ -20,6 +20,7 @@ import time
 from typing import Any, Dict, List, Tuple
 
 import core.clients as clients
+from core.dispatch import normalize_spec
 from core.utils import _now
 from services import dispatch_service as ds
 
@@ -288,7 +289,15 @@ def poll_inflight() -> Dict[str, Any]:
         elif status in ("Failed", "TimedOut", "Cancelled"):
             batch = _query_batch_tenants(command_id)
             n = len(batch) or int(h.get("vm_count_delta", 0) or 0) or 1
-            ds._rollback_host(instance_id, n)
+            # #330 — _rollback_host 现按【真实 vcpu/mem 之和】对称释放(与 reserve 同轴),不再
+            # n×VM_DEFAULT。用 binpack.normalize_spec 从 tenant item 的 vcpu/mem_mb 取【已校验】规格
+            # (同 _params_from_tenant 口径),批空时回落 n×VM_DEFAULT 保底(至少扣回本命令占的名额)。
+            dvm = int(clients.VM_DEFAULT_VCPU or 2)
+            dmm = int(clients.VM_DEFAULT_MEM or 4096)
+            specs = [normalize_spec(t, dvm, dmm) for t in batch]
+            sum_vcpu = sum(v for v, _ in specs) or (n * dvm)
+            sum_mem = sum(m for _, m in specs) or (n * dmm)
+            ds._rollback_host(instance_id, n, sum_vcpu, sum_mem)
             for t in batch:
                 new_retries = _bump_retry(t["id"])
                 if new_retries > clients.DISPATCH_RETRY_BUDGET:

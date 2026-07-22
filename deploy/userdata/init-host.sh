@@ -7,6 +7,16 @@ exec > >(tee /var/log/openclaw-init.log > /dev/console) 2>&1
 log() { echo "[oc:init] $(date +%H:%M:%S) $*"; }
 log "Starting host setup..."
 
+# IMDSv2 token. TTL=300s covers L11-14 (取完立即用),但后面 _stack_output 必需项会
+# 等最多 20×15s=300s(每个,累计更久) → 到取 accountId 时这个 token 早过期 → 401 空 →
+# accountId 空 → bucket 名拼成 `openclaw-assets--<region>`(double-dash)→ 拉镜像 404 →
+# crashloop → ABANDON 换机器死循环(2026-07-17 新加坡实撞根因,pit#14)。
+# 修:凡在可能耗时的 _stack_output 之后再取 IMDS 的,一律现取 fresh token(_fresh_imds)。
+_fresh_imds() {  # $1=metadata-path(如 dynamic/instance-identity/document);现取 token,不复用过期的
+  local _tok
+  _tok=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')
+  curl -s -H "X-aws-ec2-metadata-token: $_tok" "http://169.254.169.254/latest/$1"
+}
 TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')
 REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
 AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
@@ -99,8 +109,8 @@ fi
 # 里做),host 侧 all.forwarding=0 是纵深防御:即便某台 tap 漏配了 disable_ipv6,
 # host 不转发也守住 IPv6 IMDS fd00:ec2::254。
 sysctl -q -w net.ipv6.conf.all.forwarding=0 2>/dev/null || true
-# nf_conntrack table sizing for NFR-3 (the data-plane contract / the data-plane design
-# the requirements doc NFR-3): a single r8g.metal-24xl runs up to 400 microVMs, each
+# nf_conntrack table sizing for NFR-3 (INTERFACE-CONTRACT §6/§7 / 11-ENGINE-TRANSFORM
+# 01-REQUIREMENTS NFR-3): a single r8g.metal-24xl runs up to 400 microVMs, each
 # with 2-3 outbound WS + per-tap DNAT rules. Kernel default nf_conntrack_max is
 # 262144 on Ubuntu 22.04 aarch64 which the host can blow past under peak fan-in
 # well before all 400 tenants are active. Load the module first (host may not
@@ -171,10 +181,16 @@ log "tables: hosts=${HOSTS_TABLE} tenants=${TENANTS_TABLE}"
 # blowing the limit. Pulling them from outputs here keeps user-data a plain,
 # compressible string. ACCOUNT_ID from IMDS gives a deterministic fallback for
 # the chicken-and-egg window before outputs are visible (host launches mid-CREATE).
-ACCOUNT_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/dynamic/instance-identity/document | sed -n 's/.*"accountId"[ ]*:[ ]*"\([0-9]*\)".*/\1/p')
+# fresh token(上面 _stack_output 可能已烧掉 L10 那个 300s token,pit#14)。
+ACCOUNT_ID=$(_fresh_imds dynamic/instance-identity/document | sed -n 's/.*"accountId"[ ]*:[ ]*"\([0-9]*\)".*/\1/p')
 _RSFX=$([ "$REGION" = "ap-southeast-1" ] && echo "" || echo "-${REGION}")
 ASSETS_BUCKET=$(_stack_output AssetsBucket)
-[ -z "$ASSETS_BUCKET" ] || [ "$ASSETS_BUCKET" = "None" ] && ASSETS_BUCKET="openclaw-assets-${ACCOUNT_ID}${_RSFX}"
+# fallback 拼 bucket 名前必须有合法 12 位 accountId,否则拼出 `openclaw-assets--<region>`
+# (double-dash)→ 拉镜像 404 → crashloop。宁 fail-loud 中止(ABANDON 带明确错)也不静默拼坏名。
+if [ -z "$ASSETS_BUCKET" ] || [ "$ASSETS_BUCKET" = "None" ]; then
+  echo "$ACCOUNT_ID" | grep -qE '^[0-9]{12}$' || { echo "[oc:init] FATAL: stack output AssetsBucket 未就绪且 IMDS accountId 非法('$ACCOUNT_ID'),拒绝拼 double-dash bucket 名" > /dev/console; exit 1; }
+  ASSETS_BUCKET="openclaw-assets-${ACCOUNT_ID}${_RSFX}"
+fi
 BACKUP_BUCKET=$(_stack_output BackupBucket)
 [ -z "$BACKUP_BUCKET" ] || [ "$BACKUP_BUCKET" = "None" ] && BACKUP_BUCKET="openclaw-backups-${ACCOUNT_ID}${_RSFX}"
 BACKUP_CMK_KEY_ID=$(_stack_output BackupCmkKeyId)
@@ -209,6 +225,7 @@ EGRESS_VPC_CIDR={{EGRESS_VPC_CIDR}}
 EGRESS_ALLOWLIST_CIDRS={{EGRESS_ALLOWLIST_CIDRS}}
 EGRESS_ALLOWLIST_DOMAINS={{EGRESS_ALLOWLIST_DOMAINS}}
 EGRESS_DNS_UPSTREAM={{EGRESS_DNS_UPSTREAM}}
+OC_HOST_LAUNCH_SLOTS={{OC_HOST_LAUNCH_SLOTS}}
 ENVEOF
 
 # CLOUDFRONT_ORIGIN:CloudFront 分发域在 CDK 里晚于 LaunchTemplate 创建(循环依赖),
@@ -378,6 +395,50 @@ if [ "${LOGGING_ENABLED}" = "true" ]; then
   ASSETS_BUCKET="${ASSETS_BUCKET}" \
   AWS_REGION="${REGION}" \
     bash /opt/openclaw/fluent-bit/install-fluent-bit.sh
+  # guest 日志 reader:收 guest 从 vsock 写来的日志落 per-VM oc-guest.log,交给上面
+  # 装的 Fluent Bit tail 管道(见 fluent-bit host conf 的 oc-guest.log input)。复用
+  # LOGGING_ENABLED 门控(guest 日志采集是 host 日志能力的一部分,不新造开关)。
+  # 实际是否采集还取决于 launch-vm 的 OC_GUEST_LOG_ENABLED(控制 PUT /vsock);二者都开
+  # 才成链路。reader 空跑无害(无 vsock UDS 时只是空扫)。
+  aws s3 cp s3://${ASSETS_BUCKET}/deployment/scripts/oc-guest-log-reader.py /opt/openclaw/oc-guest-log-reader.py \
+    --region ${REGION} --no-progress \
+    || { log "ERROR: oc-guest-log-reader.py 未拉到 (S3 miss)"; exit 1; }
+  # fresh-host 首启时 /data/firecracker-vms 可能还没建(还没起过 VM),而 sandbox 的
+  # ReadWritePaths= 指向不存在的目录会让 reader 启动失败(codex + 真机 h1 实测:reader
+  # 卡 activating 起不来)。先建好目录,unit 再 RequiresMountsFor 确保 /data 挂载后才起。
+  install -d -m 0755 /data/firecracker-vms
+  cat > /etc/systemd/system/oc-guest-log-reader.service << 'GLRSVC'
+[Unit]
+Description=OpenClaw guest log reader (vsock -> per-VM file for Fluent Bit)
+After=network.target host-agent.service
+RequiresMountsFor=/data/firecracker-vms
+[Service]
+# 不加载 /etc/platform.env:reader 处理不可信 guest 帧,不该把含共享密钥的 env 带进
+# 这个进程(codex:最小权限)。它只需 VSOCK_PORT,单独 Environment 给。
+ExecStart=/usr/bin/python3 /opt/openclaw/oc-guest-log-reader.py
+Restart=always
+RestartSec=5
+KillMode=process
+Environment=OC_GUEST_LOG_VSOCK_PORT=9999
+UMask=0077
+# systemd 沙箱:reader 以 root 处理不可信帧,收紧攻击面(codex)。只需读写
+# /data/firecracker-vms 下的 UDS + oc-guest.log,其余文件系统只读/隔离。
+# CapabilityBoundingSet= 清空:reader 不需要任何 Linux capability(仿 gateway CapBnd=0)。
+NoNewPrivileges=true
+CapabilityBoundingSet=
+ProtectSystem=strict
+ReadWritePaths=/data/firecracker-vms
+ProtectHome=true
+PrivateTmp=true
+RestrictSUIDSGID=true
+[Install]
+WantedBy=multi-user.target
+GLRSVC
+  systemctl daemon-reload
+  systemctl enable oc-guest-log-reader
+  systemctl start oc-guest-log-reader
+  log "guest log reader started (vsock -> per-VM oc-guest.log -> Fluent Bit)"
+
   # fc.log local rotation: keep 3 days on-host; AOS holds the searchable copy.
   cat > /etc/logrotate.d/openclaw-fcvm <<'LOGROTATE'
 /data/firecracker-vms/*/fc.log {
@@ -490,7 +551,7 @@ done
 # #187 转型:step4a2 claw-hub 本地安装已下线。数据面改两级路由直连 microVM
 # 原生 gateway(ALB LOR → OpenResty edge → Redis 查表 → host iptables DNAT →
 # microVM:18789)。install-hub.sh + deploy/hub/ 源已归档到
-# an internal archive。#187 P5:CLAW_HUB_URL/CLAW_HUB_WS
+# engineering/04-archive/p4-cutover-deprecated/。#187 P5:CLAW_HUB_URL/CLAW_HUB_WS
 # env 与 stack.py 模板替换、CloudFront /hub/* behavior、HubTargetGroup 已一并删除。
 
 # Step 4b: AgentCore config (if enabled)

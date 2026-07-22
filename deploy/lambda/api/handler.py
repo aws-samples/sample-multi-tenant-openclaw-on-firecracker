@@ -87,8 +87,8 @@ def _resolve_proxy_route(method, path, route_keys):
 # #187 转型:C 端聊天不再走 claw-channel + hub 中枢签名路径。
 # 前端直接 POST /ws/{tenant_id}/v1/chat/completions,SSE 流式,鉴权用租户 gateway
 # token(GET /tenants/{id}/token 拿密文,调用方自解)。旧 chat_sign 路由 + claw-
-# channel HMAC + hub relay 全部下线。参见 the data-plane design doc G/D
-# 与 the API spec 一、二节。
+# channel HMAC + hub relay 全部下线。参见 SPEC/11-ENGINE-TRANSFORM/02-DEV-PLAN.md G/D
+# 与 04-API-SPEC.md 一、二节。
 
 
 def lambda_handler(event, context):
@@ -119,17 +119,34 @@ def lambda_handler(event, context):
     if event.get("_batch_job"):
         return run_batch_job(event["_batch_job"])
 
-    # #217 fix(504) — async pull-image worker: self-invoked with
-    # {"_pull_image_async": {instance_id, snapshot_time, prev_status}}. pull_image
+    # #309 — async pull-image worker: self-invoked with
+    # {"_pull_image_async": {instance_id, snapshot_time, prev_status, job_id}}. pull_image
     # 已 CAS 置 upgrading + 回 202;这里在无客户端等待的 fire-and-forget 调用里跑
-    # 装 live + 金丝雀验证的数分钟长链(超 APIGW 29s,故必须异步)。
+    # stage + 校验 + 备份 + copy/unzip 装 live 的数分钟长链(超 APIGW 29s,故必须异步)。
     _pia = event.get("_pull_image_async")
     if _pia:
-        return _run_pull_pipeline(
-            _pia["instance_id"],
-            _pia["snapshot_time"],
-            _pia.get("prev_status"),
-        )
+        # #333 — 异步 Lambda 调用(InvocationType=Event)对【函数抛错】自动重试 2 次(AWS 官方:
+        # invocation-retries.html)→ 重试 = 同 job 第二个 worker。并发由 host 侧 flock + status/owner
+        # fence 兜住(见 _snapshot_pull_script);这里【吞掉所有异常、永远正常 return】只是【额外】
+        # 减少重投噪声,不是并发防线本身。失败信息由 _run_pull_pipeline 内部写进度文件/last_pull_error
+        # 透出。意外异常(_run_pull_pipeline 未捕获的)在此兜底【只记错误、不复位 status】。
+        try:
+            return _run_pull_pipeline(
+                _pia["instance_id"],
+                _pia["snapshot_time"],
+                _pia.get("prev_status"),
+                _pia.get("job_id"),
+            )
+        except Exception as e:
+            print(f"[pull] worker unexpected error (swallowed to prevent async retry): {e}")
+            # #333(codex round7)绝不在此复位 active:异常可能发生在 SSM 已下发/phase2 已动 live 之后,
+            # 复位 active = 谎报让租户落到半写坏的 live(踩 no-data-loss/no-cross-tenant)。status 由
+            # 脚本 trap 按阶段自决(phase1 复位 prev / phase2 留 upgrading);_run_pull_pipeline 的
+            # "SSM 未下发"路径已在内部显式复位。这里只 job-conditional 记错误供 progress 透出,保持
+            # 脚本设定的 status(通常 upgrading,待运维/下一轮 pull 收敛)。
+            _host_service._record_pull_error(
+                _pia["instance_id"], f"worker unexpected error: {e}", _pia.get("job_id"))
+            return {"statusCode": 500, "body": "pull worker error (logged; not retried)"}
 
     # 控制面重构阶段1 — SQS lifecycle consumer。lifecycle 写操作(create/start/
     # stop/delete)入 SQS,本 Lambda 作为 consumer 被 SQS 触发(event.Records,
@@ -223,6 +240,14 @@ def lambda_handler(event, context):
         ("POST", "/hosts/{instance_id}/pull-image"): lambda: pull_image(
             path_params["instance_id"], event.get("queryStringParameters") or {}
         ),
+        # #309 — GET pull-image 长任务进度:tail host 上 /tmp/<job_id>.txt 最后一行当状态。
+        ("GET", "/hosts/{instance_id}/pull-image-progress"): lambda: pull_image_progress(
+            path_params["instance_id"]
+        ),
+        # #309 — 把单个文件从 S3 copy 到 EC2 指定位置(目标限 firecracker 资产目录白名单)。
+        ("POST", "/hosts/{instance_id}/copy-file-from-s3"): lambda: copy_file_from_s3(
+            path_params["instance_id"], event.get("body")
+        ),
         # Fleet power: start/stop EVERY VM across all hosts via host-local fan-out
         # (1-minute fleet power goal). Admin-only (gated inside fleet_power).
         ("POST", "/hosts/fleet-power"): lambda: fleet_power(event.get("body"), event),
@@ -235,7 +260,7 @@ def lambda_handler(event, context):
         ),
         # #217 V2 — list version snapshots (time+label+count) so the console can
         # let an operator pick which snapshot_time to pull onto a host.
-        ("GET", "/snapshots"): lambda: list_snapshots(),
+        ("GET", "/list_image_versions"): lambda: list_image_versions(),
         ("GET", "/agentcore/status"): agentcore_status,
         ("GET", "/agentcore/tools"): agentcore_tools,
         ("GET", "/system/info"): system_info,
@@ -454,7 +479,7 @@ def get_tenant(tenant_id, event=None):
     # Strip server-side secrets before returning (see _redact_tenant).
     body = _redact_tenant(item)
     # #187 P1 — fold the KMS **ciphertext** of the pre-minted gateway token into
-    # the status-poll response once the tenant is `running` (the data-plane contract
+    # the status-poll response once the tenant is `running` (INTERFACE-CONTRACT
     # §5, design decision 二次纠正). Poll semantics: control-plane callers loop
     # GET /tenants/{id}; on `creating` they keep polling; on `running` they read
     # `gateway_token` (base64 ciphertext) out of this same response and decrypt
@@ -703,7 +728,7 @@ def tenant_match(query_params=None):
     Pre-login lookup: the browser calls this BEFORE any Cognito login to learn which
     upstream IdP (Cognito provider name) to federate to for a given external platform,
     then does federatedSignIn(customProvider=<idp_provider_name>). Read-only, leaks no
-    tenant data — only the platform→IdP routing (the data-plane design §2.7). Mirrors aws-samples/
+    tenant data — only the platform→IdP routing (SPEC/02 §2.7). Mirrors aws-samples/
     amazon-cognito-example-for-multi-tenant TenantAPI.ts:13-22 (there keyed by email
     domain; here by explicit platform_id).
 
@@ -1786,9 +1811,11 @@ _run_pull_pipeline = _host_service._run_pull_pipeline  # #217 fix(504) async pul
 rootfs_drift = _host_service.rootfs_drift
 _get_manifest = _host_service._get_manifest
 list_images = _host_service.list_images
-list_snapshots = _host_service.list_snapshots  # #217 V2 — 列快照供 console 选
+list_image_versions = _host_service.list_image_versions  # #337(原#217 /snapshots)— 列镜像版本快照供 console 选
 refresh_rootfs = _host_service.refresh_rootfs
 pull_image = _host_service.pull_image  # #217 V2 — snapshot pull → install live
+pull_image_progress = _host_service.pull_image_progress  # #309 — tail /tmp/<job_id>.txt
+copy_file_from_s3 = _host_service.copy_file_from_s3  # #309 — single file S3 → EC2 (allowlist target)
 
 # T1.8 — services/console_info:控制台只读端点(备份清单 + AgentCore 工具清单,4 函数)。
 from services import console_info as _console_info  # noqa: E402

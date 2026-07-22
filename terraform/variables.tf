@@ -25,6 +25,24 @@ variable "backup_prefix" {
   default     = "backups"
 }
 
+variable "cpu_overcommit_ratio" {
+  description = "Allocatable vCPU multiplier per host (parity with config.yml host.cpu_overcommit_ratio; keep ≤ 4.0)"
+  type        = number
+  default     = 2.0
+}
+
+variable "mem_overcommit_ratio" {
+  description = "Allocatable memory multiplier per host (>1.0 requires balloon; keep ≤ 4.0)"
+  type        = number
+  default     = 1.0
+}
+
+variable "max_vms_per_host" {
+  description = "Absolute per-host microVM ceiling (0 = ratio-only, no cap) — issue #77"
+  type        = number
+  default     = 0
+}
+
 variable "backup_retention_days" {
   description = "Days to keep tenant backup archives"
   type        = number

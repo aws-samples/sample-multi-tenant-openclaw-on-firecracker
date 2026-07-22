@@ -49,6 +49,24 @@ def _normalize_config(cfg):
               "Deploying with effective ratio 1.0; set balloon.enabled=true to use overcommit.")
         cfg.setdefault("host", {})["mem_overcommit_ratio"] = 1.0
 
+    # Issue #77 — guardrail on the overcommit ratios. A too-high ratio (the
+    # prod incident ran CPU=8.0) lets ~100 microVMs pile onto a 15-vCPU host,
+    # pegging its CPU and starving the control plane. Clamp to a sane ceiling
+    # so a stray config / stale env can't silently oversubscribe a host.
+    _CPU_RATIO_CEILING = 4.0
+    _MEM_RATIO_CEILING = 4.0
+    cpu_ratio = float(cfg.get("host", {}).get("cpu_overcommit_ratio", 1.0))
+    if cpu_ratio > _CPU_RATIO_CEILING:
+        print(f"⚠️  config.yml: host.cpu_overcommit_ratio={cpu_ratio} exceeds the "
+              f"{_CPU_RATIO_CEILING}× safety ceiling — clamping. Very high CPU "
+              "overcommit saturates the host and starves SSM/health polling.")
+        cfg.setdefault("host", {})["cpu_overcommit_ratio"] = _CPU_RATIO_CEILING
+    mem_ratio = float(cfg.get("host", {}).get("mem_overcommit_ratio", 1.0))
+    if mem_ratio > _MEM_RATIO_CEILING:
+        print(f"⚠️  config.yml: host.mem_overcommit_ratio={mem_ratio} exceeds the "
+              f"{_MEM_RATIO_CEILING}× safety ceiling — clamping.")
+        cfg.setdefault("host", {})["mem_overcommit_ratio"] = _MEM_RATIO_CEILING
+
 
 _normalize_config(CFG)
 
@@ -233,6 +251,8 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 "HOST_RESERVED_MEM": str(CFG["host"]["reserved_mem_mb"]),
                 "CPU_OVERCOMMIT_RATIO": str(CFG["host"].get("cpu_overcommit_ratio", 1.0)),
                 "MEM_OVERCOMMIT_RATIO": str(CFG["host"].get("mem_overcommit_ratio", 1.0)),
+                # Issue #77 — absolute per-host VM ceiling (0 = ratio-only, no cap).
+                "MAX_VMS_PER_HOST": str(CFG["host"].get("max_vms_per_host", 0)),
                 "VM_DEFAULT_VCPU": str(CFG["vm"]["default_vcpu"]),
                 "VM_DEFAULT_MEM": str(CFG["vm"]["default_mem_mb"]),
                 "VM_DATA_DISK_MB": str(CFG["vm"]["data_disk_mb"]),
@@ -590,11 +610,17 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 "TENANTS_TABLE": tenants_table.table_name,
                 "ASG_NAME": "openclaw-hosts-asg",
                 "IDLE_TIMEOUT_MINUTES": str(CFG["scaler"]["idle_timeout_minutes"]),
+                # Issue #71 — scaler audits its automated actions (TTL expiry,
+                # scheduled office-hours stop/start, idle-host reclaim).
+                "AUDIT_TABLE": audit_table.table_name,
+                "AUDIT_TTL_DAYS": str(audit_retention_days),
             },
         )
         hosts_table.grant_read_write_data(scaler_fn)
         # Issue #15 — TTL processing reads tenants and updates status (stop/delete)
         tenants_table.grant_read_write_data(scaler_fn)
+        # Issue #71 — scaler writes audit rows for its automated actions.
+        audit_table.grant_write_data(scaler_fn)
         scaler_fn.add_to_role_policy(ssm_policy)  # SSM stop-vm.sh on TTL expiry
         scaler_fn.add_to_role_policy(iam.PolicyStatement(
             actions=["autoscaling:DescribeAutoScalingGroups",

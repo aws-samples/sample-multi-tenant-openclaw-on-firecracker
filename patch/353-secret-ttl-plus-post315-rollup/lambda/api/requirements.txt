@@ -1,0 +1,17 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# Runtime deps for the openclaw-api Lambda. Bundled into the deployment
+# asset by CDK (see deploy/stack.py ApiHandler bundling) inside the Lambda
+# PYTHON_3_12 image so cryptography's native (manylinux) wheel matches the
+# Lambda runtime. boto3 is provided by the Lambda runtime and is NOT pinned
+# here to avoid shadowing the platform SDK.
+#
+# 1.5.0 (security hardening): JWT RS256 signature verification against the
+# Cognito User Pool JWKS. PyJWT needs cryptography for the RSA algorithms.
+PyJWT>=2.8.0
+cryptography>=42.0.0
+
+# #209 Task2: Powertools Logger for structured JSON logging (only Logger,
+# no Tracer/Metrics — tracing is handled by ADOT Layer separately).
+aws-lambda-powertools>=2.40.0

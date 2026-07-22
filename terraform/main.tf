@@ -94,9 +94,9 @@ resource "aws_iam_role" "lambda_exec" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect = "Allow"
+      Effect    = "Allow"
       Principal = { Service = "lambda.amazonaws.com" }
-      Action = "sts:AssumeRole"
+      Action    = "sts:AssumeRole"
     }]
   })
 }
@@ -163,12 +163,18 @@ resource "aws_lambda_function" "api" {
 
   environment {
     variables = {
-      TENANTS_TABLE  = aws_dynamodb_table.tenants.name
-      HOSTS_TABLE    = aws_dynamodb_table.hosts.name
-      ASSETS_BUCKET  = aws_s3_bucket.assets.bucket
-      ROOTFS_PREFIX  = var.rootfs_prefix
-      BACKUP_PREFIX  = var.backup_prefix
-      ASG_NAME       = "openclaw-hosts-asg"
+      TENANTS_TABLE = aws_dynamodb_table.tenants.name
+      HOSTS_TABLE   = aws_dynamodb_table.hosts.name
+      ASSETS_BUCKET = aws_s3_bucket.assets.bucket
+      ROOTFS_PREFIX = var.rootfs_prefix
+      BACKUP_PREFIX = var.backup_prefix
+      ASG_NAME      = "openclaw-hosts-asg"
+      # Issue #77 — scheduler parity with the CDK stack. Without these the
+      # handler defaults kick in (1.0 / 1.0 / no cap), which differs from
+      # config.yml.example and silently changes placement behavior.
+      CPU_OVERCOMMIT_RATIO = tostring(var.cpu_overcommit_ratio)
+      MEM_OVERCOMMIT_RATIO = tostring(var.mem_overcommit_ratio)
+      MAX_VMS_PER_HOST     = tostring(var.max_vms_per_host)
     }
   }
 }
@@ -188,10 +194,10 @@ resource "aws_api_gateway_resource" "tenants" {
 }
 
 resource "aws_api_gateway_method" "tenants_get" {
-  rest_api_id   = aws_api_gateway_rest_api.api.id
-  resource_id   = aws_api_gateway_resource.tenants.id
-  http_method   = "GET"
-  authorization = "NONE"
+  rest_api_id      = aws_api_gateway_rest_api.api.id
+  resource_id      = aws_api_gateway_resource.tenants.id
+  http_method      = "GET"
+  authorization    = "NONE"
   api_key_required = true
 }
 

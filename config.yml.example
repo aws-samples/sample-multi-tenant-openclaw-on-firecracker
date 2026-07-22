@@ -18,7 +18,8 @@ host:
 
 # ========== Balloon 内存回收 (配合 mem_overcommit) ==========
 balloon:
-  enabled: false                   # 启用 balloon 设备实现内存超配（与 live migration 互斥）
+  enabled: false                   # 启用 balloon 设备实现内存超配
+  migrate_mode: cold               # balloon 开启时如何迁移: cold(默认,停机搬移,永远安全) | live(快照迁移,保留内存态) | reject(拒绝,409)
   max_inflate_ratio: 0.4           # 最多回收 VM 声明内存的 40%
   min_guest_available_mb: 512      # guest 至少保留 512MB 可用内存
   stats_polling_interval_s: 5      # balloon 统计采集间隔

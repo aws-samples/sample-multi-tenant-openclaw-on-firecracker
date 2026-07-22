@@ -55,9 +55,22 @@ QUOTAS_MAX_VCPU = int(os.environ.get("QUOTAS_MAX_VCPU", "0") or "0")
 QUOTAS_MAX_MEM_MB = int(os.environ.get("QUOTAS_MAX_MEM_MB", "0") or "0")
 QUOTAS_MAX_DATA_DISK_MB = int(os.environ.get("QUOTAS_MAX_DATA_DISK_MB", "0") or "0")
 
-# Firecracker can't snapshot a VM with an active balloon device, so live
-# migrate is unavailable while balloon is on (issue #72). Reject early.
 BALLOON_ENABLED = os.environ.get("BALLOON_ENABLED", "false").lower() == "true"
+# Issue #72 — how to migrate a tenant when balloon (memory overcommit) is on.
+# Firecracker v1.15.1 CAN snapshot a balloon VM (no documented incompatibility),
+# but the balloon device can't have its stats polling disabled post-boot, and
+# host-agent's balloon polling races the snapshot on FC's single-threaded API
+# socket. Modes:
+#   cold          (default) — stop source VM, ship its data volume, re-launch on
+#                             target. Always works; costs a restart (no in-mem
+#                             state). Safe universal path.
+#   live          — snapshot/restore with a host-agent quiesce sentinel so the
+#                   poller backs off during the pause window (preserves in-mem
+#                   state). Requires the migrate-vm.sh balloon-aware path.
+#   reject        — pre-1.5.9 behavior: refuse migration outright (409).
+# When balloon is OFF, migration always uses the plain live snapshot path
+# regardless of this setting.
+BALLOON_MIGRATE_MODE = os.environ.get("BALLOON_MIGRATE_MODE", "cold").lower()
 
 # ── 1.5.0 security hardening: Cognito JWT signature verification ──
 # COGNITO_USER_POOL_ID is injected by CDK from the genuine, stack-owned pool
@@ -1009,13 +1022,17 @@ def tenant_action(tenant_id, action, body=None):
     if action == "migrate":
         # Live migration via Firecracker snapshot/restore (issue #20).
         # Body shape: {"target_host_id": "i-...."}
-        # Firecracker can't snapshot a VM with an active balloon device, live migrate is unavailable while balloon is on (issue #72). 
-        # Reject up front instead of failing ~minutes later in the snapshot step.
+        # Issue #72: choose the migration strategy based on balloon state +
+        # BALLOON_MIGRATE_MODE. balloon off → live snapshot. balloon on →
+        # reject / cold / live per config.
+        migrate_mode = "live"  # default for non-balloon tenants
         if BALLOON_ENABLED:
-            return _resp(409, {
-                "error": "Live migration isn't available while memory overcommit (balloon) is on. To move this tenant, back it up, recreate it on the target host, then restore the backup — no data is lost.",
-                "reason": "balloon_enabled"
-            })
+            if BALLOON_MIGRATE_MODE == "reject":
+                return _resp(409, {
+                    "error": "Live migration is disabled while memory overcommit (balloon) is on (balloon.migrate_mode=reject). Set balloon.migrate_mode to 'cold' (restart-based, always safe) or 'live' (snapshot-based) to enable it.",
+                    "reason": "balloon_enabled",
+                })
+            migrate_mode = "cold" if BALLOON_MIGRATE_MODE == "cold" else "live"
         try:
             payload = json.loads(body) if isinstance(body, str) else (body or {})
         except Exception:
@@ -1070,11 +1087,14 @@ def tenant_action(tenant_id, action, body=None):
         # only mutated after the whole move is proven — same fail-safe contract
         # as before, just driven out-of-band instead of in the request path.
 
+        # cold mode dumps the (stopped) data volume; live mode snapshots the
+        # running VM. The sweep branches on migration_mode for the restore step.
+        src_verb = "cold-dump" if migrate_mode == "cold" else "snapshot"
         snap_cmd = _ssm_send(
             source_host_id,
-            f"/home/ubuntu/migrate-vm.sh snapshot {tenant_id} {vm_num} "
+            f"/home/ubuntu/migrate-vm.sh {src_verb} {tenant_id} {vm_num} "
             f"s3://{bucket}/{snap_prefix}",
-            timeout=600,   # snapshot + multi-GB disk upload to S3
+            timeout=600,   # snapshot/dump + multi-GB disk upload to S3
         )
         if not snap_cmd:
             # Couldn't even submit the SSM command — nothing started, DDB clean.
@@ -1092,6 +1112,7 @@ def tenant_action(tenant_id, action, body=None):
                 "SET #s = :s, migration_target = :tgt, "
                 "migration_target_vm_num = :tvn, migration_source = :src, "
                 "migration_snap_cmd = :scmd, migration_phase = :ph, "
+                "migration_mode = :mode, "
                 "migration_started_at = :st, migration_snapshot_uri = :uri, "
                 "updated_at = :t"
             ),
@@ -1103,6 +1124,7 @@ def tenant_action(tenant_id, action, body=None):
                 ":src": source_host_id,
                 ":scmd": snap_cmd,
                 ":ph": "snapshot",
+                ":mode": migrate_mode,
                 ":st": now,
                 ":uri": f"s3://{bucket}/{snap_prefix}",
                 ":t": now,
@@ -1113,7 +1135,7 @@ def tenant_action(tenant_id, action, body=None):
         # until status is `running` (success) or back to its prior value with
         # migration_failed set (failure).
         return _resp(202, {
-            "id": tenant_id, "status": "migrating",
+            "id": tenant_id, "status": "migrating", "mode": migrate_mode,
             "source_host_id": source_host_id, "target_host_id": target_host_id,
             "snapshot_uri": f"s3://{bucket}/{snap_prefix}",
             "poll": f"/tenants/{tenant_id}",

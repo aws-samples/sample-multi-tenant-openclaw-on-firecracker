@@ -158,6 +158,31 @@ class TestSnapshotPhase:
             "restore fired despite snapshot failure"
         _assert_rolled_back_to_running(mod)
 
+    def test_cold_mode_fires_cold_restore(self):
+        """Issue #72: a cold migration (migration_mode=cold) must fire the
+        cold-restore verb on the target, not the live snapshot restore."""
+        mod = _load_hc()
+        _ssm_status(mod, "Success")
+        mod._advance_migration(_migrating_tenant("snapshot", migration_mode="cold"),
+                               _now(mod))
+        sends = mod._test_mocks["ssm"].send_command.call_args_list
+        assert sends, "no restore SSM command fired"
+        cmd = " ".join(str(c.kwargs.get("Parameters", {})) for c in sends)
+        assert "migrate-vm.sh cold-restore" in cmd, f"expected cold-restore, got: {cmd}"
+
+    def test_cold_rollback_relaunches_on_source(self):
+        """Issue #72: a failed COLD migration stopped the source VM, so rollback
+        must relaunch it on the source (not just flip DDB to running)."""
+        mod = _load_hc()
+        _ssm_status(mod, "Failed")
+        mod._advance_migration(_migrating_tenant("snapshot", migration_mode="cold"),
+                               _now(mod))
+        # A launch-vm.sh command must have been fired at the source host.
+        sends = mod._test_mocks["ssm"].send_command.call_args_list
+        cmd = " ".join(str(c.kwargs.get("Parameters", {})) for c in sends)
+        assert "launch-vm.sh" in cmd, f"cold rollback did not relaunch source: {cmd}"
+        _assert_rolled_back_to_running(mod)
+
     def test_snapshot_in_progress_is_noop(self):
         mod = _load_hc()
         _ssm_status(mod, "InProgress")

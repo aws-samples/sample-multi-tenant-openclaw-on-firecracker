@@ -61,3 +61,45 @@ def test_snapshot_pause_failure_is_handled():
     block = _snapshot_block()
     # A failed pause must not silently `set -e` abort with no message.
     assert "pause failed" in block.lower()
+
+
+# ── Issue #72: balloon-aware snapshot + cold-migration modes ──
+
+def _full():
+    return SCRIPT.read_text()
+
+
+def test_snapshot_quiesces_host_agent_when_balloon_on():
+    block = _snapshot_block()
+    # The balloon-aware branch must drop the migration sentinel (so host-agent
+    # backs off) and clear it via a trap even on unexpected exit.
+    assert "_migration_begin" in block and "_migration_end" in block
+    assert "trap" in block
+    # Gated on BALLOON_ENABLED so non-balloon VMs are unaffected.
+    assert 'BALLOON_ENABLED' in block
+
+
+def test_sentinel_helpers_defined():
+    t = _full()
+    assert 'SENTINEL="${VM_DIR}/.migrating"' in t
+    assert "_migration_begin()" in t and "_migration_end()" in t
+    # Must source platform.env to learn BALLOON_ENABLED on the host.
+    assert "/etc/platform.env" in t
+
+
+def test_cold_modes_exist():
+    t = _full()
+    assert "cold-dump)" in t, "cold-dump mode missing"
+    assert "cold-restore)" in t, "cold-restore mode missing"
+    # cold-dump must stop the VM before copying the data volume (quiescent copy).
+    cold = t[t.index("cold-dump)"):t.index("cold-restore)")]
+    assert "stop-vm.sh" in cold
+    assert "data.ext4" in cold
+
+
+def test_restore_uses_sentinel_against_recover_race():
+    t = _full()
+    restore = t[t.index("restore)"):t.index("cold-dump)")]
+    # The target's host-agent would race _recover_vm against snapshot/load
+    # unless the sentinel is set before vm.json lands.
+    assert "SENTINEL" in restore

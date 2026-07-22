@@ -199,19 +199,37 @@ def _bump_target_counters(target_host_id, target_vm_num, vcpu, mem_mb):
 
 def _rollback_migration(tenant, reason):
     """Roll a failed/stuck migration back to `running` and clear the async
-    context. The source VM was only briefly paused for the snapshot and then
+    context. For LIVE migration the source VM was only briefly paused and then
     resumed by migrate-vm.sh, and host_id / counters / routing were never
-    touched — so 'running' is the truthful state and there is nothing to undo
-    on the data plane. We record migration_failed + the reason for operators.
+    touched — so 'running' is the truthful state and there is nothing to undo.
+
+    For COLD migration the source VM was STOPPED (its data volume shipped)
+    before the target launch, so on failure the source has no running VM. We
+    relaunch it on the source host so 'running' is truthful again. host_id was
+    never flipped, so the tenant returns to exactly where it started.
     """
     tid = tenant["id"]
+    migration_mode = tenant.get("migration_mode", "live")
+    if migration_mode == "cold":
+        # Re-launch on the (unchanged) source host from its data volume.
+        src = tenant.get("migration_source", "") or tenant.get("host_id", "")
+        vm_num = int(tenant.get("vm_num", 1))
+        vcpu = int(tenant.get("vcpu", 2))
+        mem_mb = int(tenant.get("mem_mb", 4096))
+        if src:
+            relaunch = _ssm_send_hc(
+                src,
+                f"/home/ubuntu/launch-vm.sh {tid} {vm_num} {vcpu} {mem_mb}",
+                timeout=300,
+            )
+            print(f"cold rollback {tid}: relaunch on source {src} → {relaunch}")
     tenants_table.update_item(
         Key={"id": tid},
         UpdateExpression=(
             "SET #s = :r, migration_failed = :reason, updated_at = :t "
             "REMOVE migration_target, migration_target_vm_num, migration_source, "
             "migration_snap_cmd, migration_restore_cmd, migration_phase, "
-            "migration_started_at, migration_snapshot_uri"
+            "migration_mode, migration_started_at, migration_snapshot_uri"
         ),
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={
@@ -219,7 +237,8 @@ def _rollback_migration(tenant, reason):
             ":t": datetime.now(timezone.utc).isoformat(),
         },
     )
-    _emit_audit("MIGRATION_FAILED", {"tenant_id": tid, "reason": reason[:200]})
+    _emit_audit("MIGRATION_FAILED", {"tenant_id": tid, "reason": reason[:200],
+                                     "mode": migration_mode})
     print(f"migration rollback {tid}: {reason}")
 
 
@@ -247,6 +266,11 @@ def _advance_migration(tenant, now):
     target_vm_num = int(tenant.get("migration_target_vm_num", 1))
     snap_uri = tenant.get("migration_snapshot_uri", "")
     vm_num = int(tenant.get("vm_num", 1))
+    # Issue #72: "cold" migration ships the (stopped) data volume and re-launches
+    # on the target; "live" (default) does snapshot/restore. The restore verb
+    # differs; everything else in the state machine is identical.
+    migration_mode = tenant.get("migration_mode", "live")
+    restore_verb = "cold-restore" if migration_mode == "cold" else "restore"
 
     # Watchdog — never let a tenant sit in `migrating` forever.
     started = tenant.get("migration_started_at", "")
@@ -271,10 +295,10 @@ def _advance_migration(tenant, now):
         if not ok:
             _rollback_migration(tenant, "snapshot command failed on source host")
             return
-        # Snapshot done — fire restore on the target host.
+        # Snapshot/dump done — fire the (mode-appropriate) restore on the target.
         restore_cmd = _ssm_send_hc(
             target_host_id,
-            f"/home/ubuntu/migrate-vm.sh restore {tid} {target_vm_num} {snap_uri}",
+            f"/home/ubuntu/migrate-vm.sh {restore_verb} {tid} {target_vm_num} {snap_uri}",
             timeout=600,
         )
         if not restore_cmd:
@@ -336,7 +360,8 @@ def _advance_migration(tenant, now):
                 "SET host_id = :h, vm_num = :n, #s = :running, updated_at = :t "
                 "REMOVE migration_target, migration_target_vm_num, migration_source, "
                 "migration_snap_cmd, migration_restore_cmd, migration_phase, "
-                "migration_started_at, migration_snapshot_uri, migration_failed"
+                "migration_mode, migration_started_at, migration_snapshot_uri, "
+                "migration_failed"
             ),
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={

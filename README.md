@@ -21,7 +21,7 @@
   <a href="https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues">
     <img src="https://img.shields.io/github/issues/aws-samples/sample-multi-tenant-openclaw-on-firecracker?color=brightgreen" alt="Open issues"/>
   </a>
-  <img src="https://img.shields.io/badge/tests-426%20passing-brightgreen" alt="Tests passing"/>
+  <img src="https://img.shields.io/badge/tests-667%20passing-brightgreen" alt="Tests passing"/>
 </p>
 
 <p align="center">
@@ -74,8 +74,8 @@
 **🔒 Strong isolation by design**
 Each tenant runs in its own Firecracker microVM — same lightweight virtualization powering AWS Lambda and Fargate. Independent kernel, OverlayFS rootfs, /24 subnet, KMS-encrypted EBS. Not Linux namespaces sharing one kernel.
 
-**🛡 Real, battle-tested AZ failover**
-Default 2-host multi-AZ deployment + automatic AZ failover. Verified end-to-end on real AWS — multi-tenant simultaneous failover with 2/2 dashboards back to HTTP 200 in ~90s. Six deep race conditions hunted down and locked in by unit tests.
+**🛡 Real, battle-tested failover & migration**
+Default 2-host multi-AZ deployment + automatic AZ failover, plus cross-host tenant migration that works even for memory-overcommit (balloon) tenants. Both **proven end-to-end on real AWS** — AZ failover recovers tenants to a healthy AZ (dashboard back to HTTP 200), and a live balloon tenant migrates host-to-host with zero data loss and a fail-safe rollback if anything goes wrong (1.5.9).
 
 **🤖 Bedrock AgentCore native**
 One toggle and every microVM auto-connects to AgentCore Gateway, Memory, Code Interpreter, Browser, and Workload Identity. Among the few AWS Samples that fully wire all five AgentCore components.
@@ -171,12 +171,13 @@ curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" \
 | **Automatic AZ failover** | Lambda detects AZ outages every 5 min, migrates affected tenants to a healthy AZ. |
 | **30-min cooldown** | Per-AZ debounce against flapping outages. |
 | **ALB rule auto-tracking** | Tenant migration auto-updates ALB listener rules — Dashboard URL never changes. |
-| **Backup-required policy** | Path A: tenant has no backup → refuse to migrate + SNS alert (data safety > availability). |
+| **Balloon-aware migration** | Cross-host migration works even for memory-overcommit (balloon) tenants via `balloon.migrate_mode` — `cold` (stop→ship→relaunch, always safe), `live` (snapshot/restore, keeps in-memory state), or `reject` (1.5.9). |
+| **Fail-safe rollback** | Every migration flips `host_id` only after snapshot/restore + a public-path dashboard probe both pass; any failure (or a 15-min watchdog) rolls the tenant back to the source with no data loss. |
 | **Concurrent Lambda safety** | `reserved_concurrent_executions=1` + DDB ConditionalCheck → no race conditions. |
 | **SSM-vs-VM verify probe** | Cross-checks `pgrep firecracker` + nginx conf — distinguishes "real failure" from "misleading SSM exit". |
-| **Audit log** | Every failover event — `AZ_OUTAGE_DETECTED`, `AZ_FAILOVER_RECOVERED_BY_VERIFY`, etc. |
+| **Audit log** | Every failover / migration event — `AZ_FAILOVER_TENANT_RECOVERED`, `MIGRATION_COMPLETED`, `MIGRATION_FAILED`, etc. |
 
-> **Real-environment proof (v1.3.2)**: 2 tenants on the failed AZ, both back to `status=running` + Dashboard HTTP 200 in ~90s. `tenants_failed_over: 2, tenants_failed: 0, tenants_blocked: 0`.
+> **Real-environment proof.** *AZ failover (v1.3.2):* 2 tenants on the failed AZ, both back to `status=running` + Dashboard HTTP 200 in ~90s. *Cross-host migration (v1.5.9):* a live balloon tenant migrated between AZs — `host_id` flipped, 0 Firecracker processes left on the source, dashboard HTTP 200 through CloudFront; the fail-safe rollback was itself triggered and verified (tenant returned to source, no data loss).
 
 </details>
 
@@ -192,7 +193,7 @@ curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" \
 | **Backup** | `/backup` | Manual snapshot of data volume to S3. |
 | **Hot-resize vCPU** | `/resize` | Add vCPU online without restart. |
 | **Resize disk** | `/resize-disk` | Grow the data volume; `resize2fs` runs automatically. |
-| **Live migrate** | `/migrate` | Snapshot/restore to another host — Dashboard URL unchanged. |
+| **Migrate** | `/migrate` | Move a tenant to another host — Dashboard URL unchanged. Live snapshot/restore by default; balloon tenants use `cold`/`live`/`reject` per `balloon.migrate_mode` (1.5.9). |
 | **Clone** | `clone_from` on create | Same-host `cp` of the data volume — much faster than backup-restore. |
 | **Restore** | `restore_from` on create | Restore from any backup (orphan or active). |
 | **Tags + TTL + schedule** | Body fields on create | Tag-based filter, auto-stop on TTL, office-hours schedule. |
@@ -225,7 +226,7 @@ curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" \
 | **Amazon Managed Grafana** | IAM Identity Center login + AMP datasource + sample dashboards. |
 | **ADOT collector** | Auto SigV4-signed remote-write — no static credentials anywhere. |
 | **6 per-VM gauges** | `openclaw_vm_health`, `cpu_pct`, `memory_used_mb`, `memory_balloon_mib`, `disk_used_mb`, `disk_used_pct` — all labeled by `tenant` and `instance`. |
-| **Audit log** | Every mutating API call → DynamoDB with 90-day TTL; queryable via `GET /audit-log`. |
+| **Audit log** | Every mutating API call + automated action (AZ failover, migration, TTL/schedule) → DynamoDB with 90-day TTL. Records the real Cognito principal + role, a typed object, and event-style operation names; queryable via `GET /audit-log` and surfaced in the Console **Logs** tab (1.5.8). |
 
 </details>
 
@@ -292,7 +293,7 @@ curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" \
 
 ## 🖥️ Web Console
 
-Web-based console hosted on CloudFront (`/console/`), Cognito-authenticated. Five tabs covering everything an operator needs.
+Web-based console hosted on CloudFront (`/console/`), Cognito-authenticated. Six tabs covering everything an operator needs.
 
 ### Tenants tab — Multi-host, multi-AZ live operations
 
@@ -317,6 +318,10 @@ Observability page: AMP / Grafana / SNS status, full per-VM Prometheus gauge inv
 Cross-tenant explorer marking active vs orphan backups (orphan = source tenant deleted, but the backup is still restorable into a fresh tenant). 7-day S3 lifecycle by default:
 
 ![Backups tab](docs/web_console_backup.png)
+
+### Logs tab — Operations audit trail (1.5.8)
+
+Reverse-chronological activity log over `GET /audit-log`: **Time / Object / Operation / Actor / Result** columns, filterable by object type (tenant / host / group / skill / template) and free-text on operation/actor, with "Load older" cursor pagination. Rows carry the real Cognito principal (or `system:<source>` for automated actors like AZ failover, migration, TTL/schedule) and event-style operation names (`tenant.created`, `vm.migrated`, `backup.created`, `host.terminated`, …). Read-only, available to `viewer`+; degrades to an informative empty state when the audit table is disabled.
 
 ### Settings tab — Infrastructure status & Fleet by AZ
 
@@ -396,7 +401,7 @@ sample-multi-tenant-openclaw-on-firecracker/
 │       ├── launch-vm.sh       # microVM launch
 │       └── stop-vm.sh         # microVM stop
 ├── console/                   # Web management console
-├── tests/                     # 426+ tests (unit / integration / e2e)
+├── tests/                     # 683 tests (unit / integration / e2e)
 ├── templates/                 # OpenClaw config templates
 ├── scripts/
 │   ├── build-rootfs-on-ec2.sh # Cloud build (no local Linux required)
@@ -426,11 +431,13 @@ sample-multi-tenant-openclaw-on-firecracker/
 | Section | Key | Default | Description |
 |---|---|---|---|
 | `host` | `instance_type` | `m8i.2xlarge` | Must support nested virtualization (c8i / m8i / r8i / r8g). |
-| `host` | `cpu_overcommit_ratio` | `2.0` | CPU overcommit factor. |
-| `host` | `mem_overcommit_ratio` | `1.0` | Memory overcommit (requires balloon enabled). |
+| `host` | `cpu_overcommit_ratio` | `2.0` | CPU overcommit factor (clamped to 4.0 ceiling — 1.5.8). |
+| `host` | `mem_overcommit_ratio` | `1.0` | Memory overcommit (requires balloon enabled; 4.0 ceiling). |
+| `host` | `max_vms_per_host` | `0` | Absolute per-host microVM cap (0 = ratio-only — 1.5.8). |
 | `vm` | `default_vcpu` | `2` | Default vCPU per tenant. |
 | `vm` | `default_mem_mb` | `4096` | Default memory (MB) per tenant. |
 | `balloon` | `enabled` | `false` | Firecracker balloon device for memory overcommit. |
+| `balloon` | `migrate_mode` | `cold` | How balloon tenants migrate: `cold` (stop→ship→relaunch, always safe) / `live` (snapshot/restore) / `reject` (1.5.9). |
 | `asg` | `min_capacity` | `2` | Minimum host instances (default Multi-AZ). |
 | `asg` | `use_spot` | `false` | Spot instances (60–70% savings, may be reclaimed). |
 | `multi_az` | `enabled` | `true` | Multi-AZ HA — enables AZ failover. |
@@ -471,7 +478,7 @@ All requests require the `x-api-key` header.
 | `POST` | `/tenants/{id}/backup` | Manual data backup. |
 | `POST` | `/tenants/{id}/resize` | Hot-add vCPU. Body: `{"vcpu":4}`. |
 | `POST` | `/tenants/{id}/resize-disk` | Offline grow data disk. Body: `{"new_size_mb":16384}`. |
-| `POST` | `/tenants/{id}/migrate` | Live migration. Body: `{"target_host_id":"i-..."}`. |
+| `POST` | `/tenants/{id}/migrate` | Migrate to another host (async, returns `202`). Body: `{"target_host_id":"i-..."}`. Balloon tenants follow `balloon.migrate_mode` (1.5.9). |
 | `GET` | `/tenants/{id}/backups` | Backups for one tenant. |
 | `POST` | `/batch/tenants` | Batch op. Body: `{"action":"stop\|start\|delete\|backup", "ids":[...]\|"filter":{"tag":"k:v"}}`. |
 
@@ -762,6 +769,8 @@ Everything else is covered by `git pull && ./setup.sh`.
 | **v1.5.0** | Cognito id_token RS256 verification; microVM SSH → pubkey-only (shared password removed) | Deploy with Docker; rebuild rootfs + roll hosts for SSH (see below) |
 | **v1.3.4** | Dual-domain mode scopes the Cognito cookie to the console domain ([#61](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/61)) — opt-in | If adopting: two us-east-1 ACM certs + `--console-domain/--console-cert/--app-domain/--app-cert` |
 | **v1.3.0** | ASG default → 2 hosts / 2 AZs (AZ failover needs a target) | None, or set `asg.min_capacity: 1` / `multi_az.enabled: false` for single-AZ |
+
+**Recent non-breaking upgrades** (just `git pull && ./setup.sh`, plus roll host-side scripts to existing hosts — see above): balloon-aware cross-host migration + `balloon.migrate_mode` (1.5.9), least-loaded scheduler + concurrency-safe provisioning + overcommit-ratio guardrails + operations Logs tab / enriched audit trail (1.5.8), bring-your-own VPC/subnets + optional CloudFront (1.5.7). Full history in [CHANGELOG.md](CHANGELOG.md).
 
 **v1.5.0 details.** RBAC role-gating is opt-in (`console_auth.rbac_enabled: false` by default — `x-api-key` reads and writes unchanged, no Bearer needed). With `rbac_enabled: true`, writes require a valid Cognito id_token (`Authorization: Bearer …`); forged / `alg:none` / expired tokens fall back to `DEFAULT_NO_JWT_ROLE` (default `viewer`). The SSH change is data-plane — existing VMs keep the old password until their host is rolled:
 

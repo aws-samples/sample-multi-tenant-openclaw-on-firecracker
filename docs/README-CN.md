@@ -484,7 +484,7 @@ sample-multi-tenant-openclaw-on-firecracker/
 | `GET` | `/hosts/rootfs-version` | 查询当前 rootfs 版本。|
 | `GET` | `/agentcore/status` | AgentCore 启用状态 + Gateway URL。|
 | `GET` | `/agentcore/tools` | 列出 Gateway 上注册的 MCP 工具。|
-| `GET` | `/audit-log` | 查 audit log。`?since=<ISO8601>&limit=<n>` — 90 天 TTL。|
+| `GET` | `/audit-log` | 查 audit log。`?since=<ISO8601>&before=<ISO8601>&limit=<n>` — 90 天 TTL。记录含 `event`（如 `tenant.created`）、类型化 `object`（`tenant:<id>`）、`actor`（Cognito 用户或 `system:<source>`）+ `actor_role`。Console **Logs** 标签页可视化。|
 | `GET` | `/skills` | 列出共享 Skills（S3 管理）。|
 | `GET` · `PUT` · `DELETE` | `/templates/{name}` | 配置模板 CRUD（`default` 只读）。|
 | `GET` | `/system/info` | feature flag + config 快照（region、version、multi_az、metrics、…）。|

@@ -37,13 +37,35 @@ _curl_fc() {
 case "$MODE" in
   snapshot)
     [ -S "$SOCK" ] || { echo "no fc.sock at $SOCK"; exit 1; }
-    # 1) Pause for a consistent snapshot.
-    _curl_fc PATCH /vm '{"state":"Paused"}'
-    # 2) Snapshot to local files.
+    # 1) Pause for a consistent snapshot. Tolerate a pause failure with a
+    #    visible message rather than a bare `set -e` abort (the VM stays
+    #    running, so we can still bail cleanly below).
+    if ! _curl_fc PATCH /vm '{"state":"Paused"}'; then
+      echo "pause failed on source; aborting snapshot (VM left running)" >&2
+      exit 51
+    fi
+    # 2) Snapshot to local files. Capture Firecracker's error body (issue #72):
+    #    a balloon device with active stats polling makes /snapshot/create fail
+    #    with an empty reply, and the old bare `curl -sf` under `set -e` turned
+    #    that into a silent exit 52 AND skipped the Resume below, stranding the
+    #    tenant Paused. Echo the FC body FIRST (the health_check sweep truncates
+    #    SSM stderr to ~200 chars) and always resume the source on failure.
     SNAPSHOT_PATH="${VM_DIR}/snapshot.vm"
     MEMFILE_PATH="${VM_DIR}/snapshot.mem"
-    _curl_fc PUT /snapshot/create \
-      "{\"snapshot_path\":\"${SNAPSHOT_PATH}\",\"mem_file_path\":\"${MEMFILE_PATH}\"}"
+    SNAP_RC=0
+    SNAP_OUT=$(curl -s --show-error --unix-socket "$SOCK" -X PUT \
+      "http://localhost/snapshot/create" -H "Content-Type: application/json" \
+      -d "{\"snapshot_path\":\"${SNAPSHOT_PATH}\",\"mem_file_path\":\"${MEMFILE_PATH}\"}" \
+      -w 'HTTP:%{http_code}' 2>&1) || SNAP_RC=$?
+    if [ "$SNAP_RC" -ne 0 ] || ! printf '%s' "$SNAP_OUT" | grep -q 'HTTP:2[0-9][0-9]'; then
+      echo "snapshot/create failed (curl rc=$SNAP_RC). Firecracker said: ${SNAP_OUT}" >&2
+      echo "(a balloon device with stats polling blocks Firecracker snapshot — issue #72)" >&2
+      tail -5 "${VM_DIR}/fc.log" >&2 2>/dev/null || true
+      # Never leave the source paused — the async sweep's rollback assumes the
+      # source VM was resumed after a failed snapshot.
+      _curl_fc PATCH /vm '{"state":"Resumed"}' || true
+      exit 52
+    fi
     # 3) Resume the source so the user only sees a brief pause if migration fails.
     _curl_fc PATCH /vm '{"state":"Resumed"}' || true
     # 4) Upload snapshot files + vm.json to S3.

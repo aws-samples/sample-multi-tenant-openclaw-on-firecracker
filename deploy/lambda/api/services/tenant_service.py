@@ -30,6 +30,7 @@ facade 指向同一模块对象)即可全局生效。
 import json
 import os
 import re
+import shlex
 import time
 import secrets
 
@@ -156,8 +157,8 @@ def _redact_tenant(item):
 
 
 # ── #187 P1 — pre-mint gateway token + reveal (11-ENGINE-TRANSFORM D 段)──────
-# 建租户时预铸 32 字节随机 token,KMS 信封绑 tenant_id 加密,密文与 expires_at=now+900
-# 一起落 openclaw-tenant-secrets 表。SSM 命令把密文按位置 12 传给 launch-vm.sh;host
+# 建租户时预铸 32 字节随机 token,KMS 信封绑 tenant_id 加密,密文落 openclaw-tenant-secrets
+# 表(#353 起无 TTL,长存)。SSM 命令把密文按位置 12 传给 launch-vm.sh;host
 # 用同一 tenant_id ctx 解密后写入 openclaw.json 的 `.gateway.auth.token`。
 #
 # **API 侧不解密**(design decision · INTERFACE-CONTRACT §5):控制平面调用方
@@ -170,15 +171,12 @@ def _redact_tenant(item):
 # 不进 tenants 表(独立表隔离)——避免 _redact_tenant 需要新增字段。
 import core.kms_envelope as kms_envelope  # noqa: E402  (关键路径依赖显式在这里 import,不与顶层 import 混)
 
-# 密文 TTL = 租户生命周期级(30 天),不是短 reveal 窗口。设计是 GET /tenants/{id}
-# 一站返全(status/token/device/vkey),调用方(如 JDWS 平台网关)按需反复取,不是
-# "创建后秒级拉走存本地"的一次性 reveal。旧 900s(15min)窗口会让 DynamoDB TTL 把
-# gateway_token_ct/device_* 密文自动删掉 → 运行中的长期服务十几分钟后 GET 拿不回
-# token(报 missing/500),而 microVM 里冷注入的 token 明文一直有效、gateway 一直认
-# ——控制面副本被过早 TTL 清扫是 bug。密文本身 KMS 加密(EncryptionContext 锁死)+ 表
-# 在私网,15min 二次锁属过度设计。改 30 天让密文活到租户生命周期,JDWS 侧另有进程内
-# 缓存(gw-ws.mjs _credsCache)握手成功即代持,双保险。
-_GATEWAY_TOKEN_TTL_SEC = 30 * 24 * 3600  # 30 天:租户生命周期级,非短 reveal 窗口
+# #353 — 密文无 TTL,随租户生命周期长存(方向 A,design decision)。设计是 GET /tenants/{id}
+# 一站返全(status/token/device/vkey),调用方(如 JDWS 平台网关)按需反复取。密文长存
+# 让 rebuild/recover/restore 在租户创建 1-2 年后仍能回读原始 token/device 身份 —— 过期
+# 读空会走 openssl 回退产生不一致 token → JDWS 连不上(#290/#312 recover 路径读此表)。
+# 历史:旧 900s(15min)→ 30 天 → 现无 TTL;表 TTL 属性 + expires_at/device_expires_at
+# 软过期检查全部移除。密文本身 KMS 加密(EncryptionContext 锁 tenant_id)+ 表在私网。
 _GATEWAY_TOKEN_BYTES = 32  # 32 字节 → 43 char base64url(比 hex 短、URL 安全)
 
 # #10 WSS 直连丝滑授权 —— 设备身份三件套(Ed25519)。控制面创建租户时铸一对
@@ -231,19 +229,16 @@ def mint_gateway_token(tenant_id):
     ciphertext = kms_envelope.encrypt_with_tenant(
         token_plaintext, tenant_id, clients.CLAWPOOL_CMK_ARN
     )
-    expires_at = int(time.time()) + _GATEWAY_TOKEN_TTL_SEC
     # #10 fix(对称):用 update_item SET merge,不用 put_item。gateway token 与 device
     # 身份共用同一 tenant_secrets 行(主键 tenant_id),无论谁先写,put_item 整条替换都会
     # 抹掉对方的字段。两侧都改 update_item 才真共存(reviewer 抓 device 侧覆盖 gateway,
-    # 反序测试又暴露 gateway 侧同样会覆盖 device)。`expires_at` 是表 TTL 属性。
+    # 反序测试又暴露 gateway 侧同样会覆盖 device)。
+    # #353 — 不再写 expires_at(表 TTL 属性已移除,密文随租户生命周期长存,方向 A)。
     clients.tenant_secrets_table.update_item(
         Key={"tenant_id": tenant_id},
-        UpdateExpression=(
-            "SET gateway_token_ct = :ct, expires_at = :ea, created_at = :ca"
-        ),
+        UpdateExpression="SET gateway_token_ct = :ct, created_at = :ca",
         ExpressionAttributeValues={
             ":ct": ciphertext,
-            ":ea": expires_at,
             ":ca": utils._now(),
         },
     )
@@ -302,25 +297,23 @@ def mint_device_identity(tenant_id, owner_id, scopes=None):
     public_key_b64u = _b64.urlsafe_b64encode(pub_raw).rstrip(b"=").decode()
     scopes = list(scopes) if scopes else list(_DEVICE_SCOPES_DEFAULT)
     private_key_ct = kms_envelope.encrypt(priv_pem, owner_id, clients.CLAWPOOL_CMK_ARN)
-    expires_at = int(time.time()) + _GATEWAY_TOKEN_TTL_SEC
     # #10 fix(reviewer CONFIRMED): 用 update_item SET merge,不用 put_item。
     # gateway token 和 device 身份共用同一 tenant_secrets 行(主键 tenant_id),
-    # put_item 是整条替换 → 会把先写的 gateway_token_ct/expires_at 抹掉(reveal 410、
-    # TTL 属性 expires_at 丢失致私钥密文永不清扫)。update_item 只加/改 device_* 字段,
-    # gateway token 字段原样保留。字段名故意分开(expires_at vs device_expires_at)就是为共存。
+    # put_item 是整条替换 → 会把先写的 gateway_token_ct 抹掉。update_item 只加/改
+    # device_* 字段,gateway token 字段原样保留(反之亦然),两侧共存。
+    # #353 — 不再写 device_expires_at(表 TTL 属性已移除,device 密文随租户生命周期长存)。
     clients.tenant_secrets_table.update_item(
         Key={"tenant_id": tenant_id},
         UpdateExpression=(
             "SET device_id = :did, device_public_key = :pk, "
             "device_private_key_ct = :ct, device_scopes = :sc, "
-            "device_expires_at = :de, device_created_at = :dc"
+            "device_created_at = :dc"
         ),
         ExpressionAttributeValues={
             ":did": device_id,
             ":pk": public_key_b64u,
             ":ct": private_key_ct,
             ":sc": scopes,
-            ":de": expires_at,
             ":dc": utils._now(),
         },
     )
@@ -401,12 +394,18 @@ def persist_device_paired_b64(tenant_id, device_paired_b64):
 
 
 def read_gateway_token_ct(tenant_id):
-    """Helper for GET /tenants/{id} (handler.get_tenant): if a valid ciphertext
-    row exists inside the TTL window, return the base64 ciphertext string; else
-    return None. Silent (no error responses) — the caller decides how to shape
-    the response and whether to include the field.
+    """Helper for GET /tenants/{id} (handler.get_tenant): if a ciphertext row
+    exists, return the base64 ciphertext string; else return None. Silent (no
+    error responses) — the caller decides how to shape the response and whether
+    to include the field.
 
-    Returns None on: feature-off / no row / expired. Never raises.
+    Returns None on: feature-off / no row. Never raises.
+
+    #353 — no TTL expiry check: the ciphertext persists for the tenant's whole
+    life so rebuild/recover/restore months or years later can still read back
+    the original token (an expired read → openssl fallback → token mismatch →
+    JDWS can't connect). The `expires_at` field is no longer written/read; the
+    table's DynamoDB TTL attribute is removed (storage.py).
     """
     if clients.tenant_secrets_table is None:
         return None
@@ -420,9 +419,7 @@ def read_gateway_token_ct(tenant_id):
         return None
     if not row:
         return None
-    if int(row.get("expires_at", 0)) <= int(time.time()):
-        return None
-    return row["gateway_token_ct"]
+    return row.get("gateway_token_ct")
 
 
 def read_device_identity(tenant_id):
@@ -431,7 +428,10 @@ def read_device_identity(tenant_id):
     同款 fold-into-poll 语义。
 
     返回 dict {device_id, public_key(明文), private_key(KMS 密文), scopes} 或 None。
-    device_expires_at 独立于 gateway token 的 expires_at(同表不同字段)。
+
+    #353 — 去掉 device_expires_at 软过期检查:device 私钥密文随租户生命周期长存,
+    让 1-2 年后 rebuild/recover 仍能回读原始设备身份,不因 TTL 过期读空 →
+    paired.json 无源重注入 → NOT_PAIRED / token 不一致连不上。
     """
     if clients.tenant_secrets_table is None:
         return None
@@ -443,8 +443,6 @@ def read_device_identity(tenant_id):
         return None
     if not row or not row.get("device_id"):
         return None
-    if int(row.get("device_expires_at", 0)) <= int(time.time()):
-        return None
     return {
         "device_id": row["device_id"],
         "public_key": row["device_public_key"],
@@ -454,15 +452,29 @@ def read_device_identity(tenant_id):
 
 
 def _cleanup_gateway_token_secret(tenant_id):
-    """Best-effort remove the secrets-table row on delete_tenant. Failures don't
-    block the delete: TTL sweeps the row within minutes anyway; this just closes
-    the window immediately when the caller says the tenant is gone."""
+    """Best-effort remove the secrets-table row. #353 (方案 B) — called on BOTH
+    the delete_tenant happy path (terminal cleanup: a deleted tenant can't rebuild,
+    so drop its ciphertext to shrink the host-compromise blast radius to active
+    tenants only) AND the create-failure / rollback paths (clear a half-written row
+    for a tenant that never came up). Active tenants keep their ciphertext forever
+    (no TTL) so rebuild/recover years later works — only terminal/failed rows are
+    dropped. Failures are non-fatal — with no TTL sweep there's no auto-cleanup
+    fallback, but a leftover row is inert (KMS ciphertext, private-subnet table)
+    and reconciliation can clean it."""
     if clients.tenant_secrets_table is None:
         return
     try:
         clients.tenant_secrets_table.delete_item(Key={"tenant_id": tenant_id})
-    except Exception as e:  # noqa: BLE001 — best-effort cleanup, TTL is the guarantee
-        print(f"[#187] tenant_secrets delete_item best-effort failed: {e}")
+    except Exception as e:  # noqa: BLE001 — best-effort cleanup of a half-write orphan
+        # #353 — 保持 best-effort(不阻塞删除,避免 DDB 瞬时抖动把租户卡在 deleting/
+        # 删除路径,违反幂等收敛)。但 TTL 移除后没有自动清扫兜底,失败 = 该 tenant_id
+        # 的密文行残留,需 reconciliation 清。故升级为醒目 ERROR(原为普通 print),让
+        # 巡检能发现残留凭据。tenant_id 是删除态租户的 key,残留行 KMS 加密 + 私网表。
+        print(
+            f"[#353][ERROR] tenant_secrets delete_item FAILED for {tenant_id}: "
+            f"{type(e).__name__}: {e} — no TTL sweep fallback, ciphertext row "
+            f"REMAINS; reconciliation must clean it"
+        )
 
 
 def _attribution_override(body, event):
@@ -637,14 +649,11 @@ def _phys_tap_occupied(host_id, phys_num, exclude_id=None):
         return True
 
 
-def create_tenant(body=None, event=None, _canary_host=None):
-    # #217 §10.6 — _canary_host is an INTERNAL param, never a body/HTTP field.
-    # The route lambda calls create_tenant(body, event) with exactly two args
-    # (handler.py) and create_tenant_self delegates with two args, so external
-    # callers can never set it. Only pull_image passes _canary_host=<this host>
-    # to let its canary tenant land on the host being upgraded (status=upgrading).
-    # It ONLY relaxes the status gate for that one pinned host — capacity CAS,
-    # vm_num uniqueness, and every other guard are unchanged.
+def create_tenant(body=None, event=None):
+    # #309 — the _canary_host param + its "land on an upgrading host" exemption were
+    # removed with the canary (owner 2026-07-17). An upgrading host now blocks ALL
+    # tenant placement with NO exception (no-cross-tenant: a tenant must never land on
+    # a host mid image-swap). See scheduling._get_specific_host_with_capacity.
     if body is None:
         return utils._resp(400, {"error": "missing body"})
     # 坏 JSON → 400 不 500;合法但非对象(list/数字)→ 400(否则下面 body.get / 各处
@@ -1013,9 +1022,15 @@ def create_tenant(body=None, event=None, _canary_host=None):
     # so the consumer materializes exactly the id the caller was handed in its 202
     # (no second _gen_id → no orphaned/duplicate tenant). Fresh sync path mints a
     # new id as before.
-    tenant_id = body.get("_assigned_tenant_id") or utils._gen_id(
-        name, client_token, owner_id
+    # #321(codex 复审):_assigned_tenant_id 只在 consumer 重放(带 _consumer_ident,内部信号)
+    # 时才认——否则外部 POST 传任意 _assigned_tenant_id 会成为 id → 进下游 SSM/rm shell。外部
+    # 首次调用一律用 _gen_id(受控字符集),杜绝注入源。
+    _replay_id = (
+        body.get("_assigned_tenant_id")
+        if (event or {}).get("_consumer_ident")
+        else None
     )
+    tenant_id = _replay_id or utils._gen_id(name, client_token, owner_id)
     now = utils._now()
 
     # ── R16.2 在途去重:同 owner_id+tenant_user_id 只允许一个在途创建 ──
@@ -1037,13 +1052,12 @@ def create_tenant(body=None, event=None, _canary_host=None):
             inflight_dedup.release_inflight_lock(owner_id, tenant_user_id)
             return _name_err[0]
 
-    # #217 — pinned 放置(金丝雀 / preferred_host_id / clone 同 host)不走 dispatch 队列。
+    # #217/#309 — pinned 放置(preferred_host_id / clone 同 host)不走 dispatch 队列。
     # dispatch → binpack 是"不指定 host 的批量创建"优化:binpack 无 pinned 概念、且
-    # dispatch msg 不带 preferred_host_id / _canary_host → 走它会把指定 host 丢掉,
-    # 金丝雀落不到正 upgrading 的那台(unplaced)。pinned 走下方同步路径,那里的
-    # _get_specific_host_with_capacity(allow_upgrading=<金丝雀>) 才认指定 host + upgrading 豁免。
+    # dispatch msg 不带 preferred_host_id → 走它会把指定 host 丢掉(unplaced)。pinned
+    # 走下方同步路径。(#309:_canary_host 分支已随金丝雀移除。)
     _pinned_placement = bool(
-        _canary_host or (body.get("preferred_host_id") or "").strip() or clone_from
+        (body.get("preferred_host_id") or "").strip() or clone_from
     )
     # ── [hackathon] Dispatch (SQS 标准队列 + 装箱消费,SPEC/sqs-dispatch) ──
     # DISPATCH_QUEUE_URL 非空 且 非 consumer 回放 且 非 pinned → 走装箱路径,优先于旧
@@ -1203,6 +1217,9 @@ def create_tenant(body=None, event=None, _canary_host=None):
                 clients.tenants_table.delete_item(Key={"id": tenant_id})
             except Exception:  # noqa: BLE001
                 pass
+            # #353 — 回滚也清 secrets 行:此前已 mint gateway token(:1136)+ device
+            # 身份(:1152)。TTL 移除后没有自动清扫兜底,不清 = 无主凭据永久残留。
+            _cleanup_gateway_token_secret(tenant_id)
             inflight_dedup.release_inflight_lock(owner_id, tenant_user_id)
             return utils._resp(503, {"error": "dispatch enqueue failed; retry"})
         # 在途窗口关闭:租户已落库(creating)+ 已入 dispatch 队列,"创建在途"结束,
@@ -1304,10 +1321,9 @@ def create_tenant(body=None, event=None, _canary_host=None):
                 },
             )
     elif preferred_host_id:
-        # #217 §10.6 — a canary for THIS host may land on it while it's upgrading.
-        _allow_upg = bool(_canary_host) and _canary_host == preferred_host_id
+        # #309 — upgrading host 一律挡放置(canary 豁免已删,no-cross-tenant 无例外)。
         host = scheduling._get_specific_host_with_capacity(
-            preferred_host_id, vcpu, mem_mb, allow_upgrading=_allow_upg
+            preferred_host_id, vcpu, mem_mb
         )
         if not host:
             # Distinguish "host doesn't exist" from "host full" so the
@@ -1440,43 +1456,25 @@ def create_tenant(body=None, event=None, _canary_host=None):
         expected = int(h.get("next_vm_num", 1))
         cap_v = int(int(h["total_vcpu"]) * clients.CPU_OVERCOMMIT_RATIO) - vcpu
         cap_m = int(int(h["total_mem_mb"]) * clients.MEM_OVERCOMMIT_RATIO) - mem_mb
-        # #217 — 普通租户落到 host → 顺手把 host 标 active(有租户即活跃)。但【金丝雀】落到
-        # 正 pull-image(status=upgrading)的 host 时【绝不能】把 host 拍成 active:那会在
-        # 回滚/晋级前就谎报 active,而 live 可能还是待验证/poison 版本(真机实测:UI 见 canary
-        # creating 即转 active + upgrading_at 残留)。故金丝雀预留槽只加计数、REMOVE idle_since,
-        # 【不写 #s】——host 保持 upgrading,status 完全交给 pull 编排(晋级/回滚)决定。
-        _is_canary = bool(_canary_host) and h["instance_id"] == _canary_host
-        if _is_canary:
-            _set_expr = (
-                "SET used_vcpu = used_vcpu + :v, used_mem_mb = used_mem_mb + :m, "
-                "vm_count = vm_count + :one, next_vm_num = next_vm_num + :one "
-                "REMOVE idle_since"
-            )
-            _names = None
-            _vals = {
-                ":v": vcpu,
-                ":m": mem_mb,
-                ":one": 1,
-                ":expected": expected,
-                ":cap_v": cap_v,
-                ":cap_m": cap_m,
-            }
-        else:
-            _set_expr = (
-                "SET used_vcpu = used_vcpu + :v, used_mem_mb = used_mem_mb + :m, "
-                "vm_count = vm_count + :one, next_vm_num = next_vm_num + :one, "
-                "#s = :a REMOVE idle_since"
-            )
-            _names = {"#s": "status"}
-            _vals = {
-                ":v": vcpu,
-                ":m": mem_mb,
-                ":one": 1,
-                ":a": "active",
-                ":expected": expected,
-                ":cap_v": cap_v,
-                ":cap_m": cap_m,
-            }
+        # 普通租户落到 host → 顺手把 host 标 active(有租户即活跃)。
+        # #309 — 金丝雀预留槽分支(_is_canary,原不写 #s 以免谎报 upgrading host active)
+        # 已随金丝雀移除:upgrading host 现在根本到不了 _reserve_slot(在
+        # _get_specific_host_with_capacity 就被挡),故只剩这一条正常路径。
+        _set_expr = (
+            "SET used_vcpu = used_vcpu + :v, used_mem_mb = used_mem_mb + :m, "
+            "vm_count = vm_count + :one, next_vm_num = next_vm_num + :one, "
+            "#s = :a REMOVE idle_since"
+        )
+        _names = {"#s": "status"}
+        _vals = {
+            ":v": vcpu,
+            ":m": mem_mb,
+            ":one": 1,
+            ":a": "active",
+            ":expected": expected,
+            ":cap_v": cap_v,
+            ":cap_m": cap_m,
+        }
         try:
             _kwargs = dict(
                 Key={"instance_id": h["instance_id"]},
@@ -2051,8 +2049,21 @@ def delete_tenant(tenant_id, query_params, event=None):
             # consumer 收 502 重投,重投时 CAS 撞 deleting → 上方 CCF 分支放行 consumer 重投
             # 继续重试(VM 已停,补删盘幂等);账本回退在本步之后(:2020),此刻未扣,重投
             # 成功那次才扣一次(guard 防负)。
+            # #321 — 先写平级 tombstone 再 rm -rf(单条命令原子下发)。tombstone 是"控制面
+            # 已判定该数据盘应销毁(keep_data=false)"的 host 侧持久信号:若 rm -rf 被 SSM
+            # 中断/超时漏删,tombstone 仍在(放【VM 目录外】的平级路径 .purge-<tid>,不会被
+            # rm -rf <tid> 连带删掉,codex 复审:标记在被删目录内会随半删消失),host-agent
+            # 的 _gc_orphan_vm_dirs 下轮据此补删。keep_data=true 的软删走不到这里 → 无
+            # tombstone → GC 绝不碰其盘(no-data-loss)。
+            # 命令安全(codex 复审):① `&&` 非 `;`——tombstone touch 失败就整条失败、走 #268
+            # 重投,杜绝"盘没写 tombstone 却已 rm"导致 GC 漏兜底;② tenant_id 经 shlex.quote 进
+            # root shell 防注入(纵深防御:tenant_id 虽已过 registry 正则,但可源自 body 的
+            # _assigned_tenant_id;正常 tid quote 后原样不变,不影响下游/测试子串匹配)。
+            _root = "/data/firecracker-vms"
+            _q_tomb = shlex.quote(f"{_root}/.purge-{tenant_id}")
+            _q_vmd = shlex.quote(f"{_root}/{tenant_id}")
             if not ssm_dispatch._ssm_run(
-                host_id, f"rm -rf /data/firecracker-vms/{tenant_id}"
+                host_id, f"touch {_q_tomb} && rm -rf {_q_vmd}"
             ):
                 print(
                     f"delete_tenant #268: rm -rf data disk FAILED for {tenant_id} on "
@@ -2144,9 +2155,13 @@ def delete_tenant(tenant_id, query_params, event=None):
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues=expr_vals,
     )
-    # #187 P1 — best-effort remove the gateway-token ciphertext row (feature-gated
-    # inside _cleanup; no-op when TENANT_SECRETS_TABLE is unset). Closes the
-    # reveal window immediately on delete instead of waiting for the DDB TTL sweep.
+    # #353 — 删租户【仍】清 gateway-token/device 密文行(方案 B,design decision)。TTL 已移除
+    # (密文不再自动过期,活跃租户的凭据永久留存,让 1-2 年后 rebuild/recover 拿回原 token),
+    # 但删租户属【终态】清理:已 deleted 的租户不能 rebuild(_async_actions 不含已删态),
+    # 所以删除时主动 delete_item 清密文,把"任一 host 失陷可解密的范围"收窄到活跃租户,
+    # 不留所有历史租户密文永久可解密的暴露面(HostRole grant_read_data 整张表 +
+    # clawpool_cmk grant_decrypt 无 EncryptionContext 条件,compute.py:64/51)。既满足
+    # rebuild 需求(只发生在活跃租户),又收敛暴露面(codex review Error3 权衡)。
     _cleanup_gateway_token_secret(tenant_id)
     # R16.2 — 终态释放在途占位(best-effort,TTL 兜底)
     inflight_dedup.release_inflight_lock(
@@ -2243,6 +2258,28 @@ def tenant_action(tenant_id, action, body=None, event=None):
     denied = auth._assert_owner_or_admin(item, event or {})
     if denied is not None:
         return denied
+
+    # #321 — 已删/删除中租户拒绝【一切改状态/动 VM 的动作】。既是正确性(删了的租户不该能
+    # start/stop/migrate…),也堵住磁盘 GC 的 TOCTOU(codex 复审):GC 强一致读到 deleted 后到
+    # rm 之间,若被 start/restart 拉起、或 stop/pause/migrate 把状态改回 stopped/migrating
+    # 复活租户,会误删新盘或破坏 GC 判据。只读/无害动作(access 等)不在此列,不受影响。
+    _mutating_actions = {
+        "start",
+        "stop",
+        "restart",
+        "pause",
+        "resume",
+        "reset",
+        "rebuild",
+        "migrate",
+        "resize",
+        "resize-disk",
+    }
+    if action in _mutating_actions and item.get("status") in ("deleted", "deleting"):
+        return utils._resp(
+            409,
+            {"error": f"tenant is {item['status']}; cannot {action}", "id": tenant_id},
+        )
 
     # 控制面重构阶段1 — 产端入队:纯 lifecycle 动作(start/stop/restart/pause/resume)
     # 只是经 SSM 下发、无特殊同步返回值,队列开启时入 SQS 由 consumer 受控并发消费

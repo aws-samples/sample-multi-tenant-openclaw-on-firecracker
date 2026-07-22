@@ -51,6 +51,7 @@ window.ocCore = {
       if (document.hidden) return; // backgrounded → skip this beat, keep the timer
       this.pollHosts();
       this.pollTenants();
+      this.pollUpgradingProgress(); // #309 — live pull-image status for upgrading hosts
     };
     this._pollTimer = setInterval(tick, this.pollMs);
     document.addEventListener("visibilitychange", () => {

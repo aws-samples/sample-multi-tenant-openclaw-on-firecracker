@@ -254,6 +254,17 @@ def build_ha_edge(self, ctx):
     init_sh = init_sh.replace("{{EGRESS_ALLOWLIST_CIDRS}}", _egress_cidrs)
     init_sh = init_sh.replace("{{EGRESS_ALLOWLIST_DOMAINS}}", _egress_domains)
     init_sh = init_sh.replace("{{EGRESS_DNS_UPSTREAM}}", _egress_dns_upstream)
+    # #331/#327 — host 级冷启动并发闸槽数(launch-vm.sh/migrate-vm.sh 跨进程 flock 信号量上限)。
+    # 一台 host 同时冷启的 VM 数不超过它,防批量 recover/多批 SSM fan-out 二次洪峰压垮 host。
+    # 默认 30(与 Lambda 侧 DISPATCH_HOST_LAUNCH_CONCURRENCY 单一来源同读 vm.host_launch_slots)。
+    # 校验正整数:0/负/非法 fail-safe 回落 30,防 migrate-vm 抢锁循环因 N<1 死循环(codex #4)。
+    try:
+        _launch_slots = int((CFG.get("vm", {}) or {}).get("host_launch_slots", 30))
+    except (TypeError, ValueError):
+        _launch_slots = 30
+    if _launch_slots < 1:
+        _launch_slots = 30
+    init_sh = init_sh.replace("{{OC_HOST_LAUNCH_SLOTS}}", str(_launch_slots))
     # backup-data.sh is pulled from S3 at runtime (uses the $ASSETS_BUCKET shell
     # var init-host.sh resolves from the AssetsBucket stack output).
     init_sh = init_sh.replace(
@@ -381,7 +392,7 @@ def build_ha_edge(self, ctx):
     # be ignored on metal. We gate the nested-virt CustomResource on this.
     _is_metal = ".metal" in _instance_type_str
 
-    # 开发期 SSH(the ops guide 铁律:开发用 SSH 不用 SSM)。config host.ssh_key_name
+    # 开发期 SSH(CLAUDE.md 铁律:开发用 SSH 不用 SSM)。config host.ssh_key_name
     # 配了就给 metal 绑 keypair,让堡垒机能 SSH 进去调试/起节点。生产留空=无 key。
     _host_key_name = (CFG.get("host", {}) or {}).get("ssh_key_name") or None
     # 私有子网模式下 host 不要公网 IP(默认 VPC 公有子网需要公 IP 出网,
@@ -850,7 +861,7 @@ def build_ha_edge(self, ctx):
         vpc=vpc,
         vpc_subnets=ec2.SubnetSelection(subnets=_alb_subnets),
         internet_facing=not _alb_internal,
-        # P2b · the data-plane contract:数据面是 SSE 流式 + WS 长连,ALB 默认
+        # P2b · INTERFACE-CONTRACT §6:数据面是 SSE 流式 + WS 长连,ALB 默认
         # idle_timeout=60s 会掐断 >1min 无字节的连接。设 3600s(ALB 硬上限 4000s
         # 内),与 OpenResty proxy_read/send_timeout 3600s 对齐。CloudFront origin
         # 由硬上限 180s 兜(§6 更新:CF 180s → ALB 3600s → OpenResty 3600s,WS
@@ -1044,7 +1055,7 @@ def build_ha_edge(self, ctx):
         # engine_version 兜底按引擎给对应默认:valkey 最低 7.2(无 7.1),redis 用 7.1。
         # 防呆:engine=valkey 但漏 engine_version 时兜底 7.1 = 非法组合(ElastiCache
         # 无 Valkey 7.1),部署 400。只填 major.minor("7.2"),补丁号(如 7.2.6)由 AWS
-        # 托管不显式指定(设计决策)。
+        # 托管不显式指定(design decision)。
         _redis_default_ver = "7.2" if _redis_engine == "valkey" else "7.1"
         _redis_engine_version = str(
             _redis_cfg.get("engine_version") or _redis_default_ver
@@ -1089,7 +1100,7 @@ def build_ha_edge(self, ctx):
             cache_subnet_group_name=_redis_subnet_group_name,
             security_group_ids=[_redis_sg.security_group_id],
             port=6379,
-            # 显式关 transit 加密(设计决策):SG 隔离即够(私网内 6379 只对 host/edge
+            # 显式关 transit 加密(design decision):SG 隔离即够(私网内 6379 只对 host/edge
             # SG),不开 TLS/auth_token —— 拉长部署链、host-agent redis-py +
             # lua-resty-redis 都要额外配。显式 False 优于隐式(防未来引擎默认变化)。
             transit_encryption_enabled=False,
@@ -1182,7 +1193,7 @@ def build_ha_edge(self, ctx):
         sg.add_ingress_rule(
             ec2.Peer.security_group_id(_edge_sg.security_group_id),
             ec2.Port.tcp_range(_edge_port_low, _edge_port_high),
-            "edge to host DNAT port range (the data-plane contract)",
+            "edge to host DNAT port range (INTERFACE-CONTRACT S3)",
         )
         # 安全红线(design decision):禁止 host↔host 互访,堵跨租户/跨 host
         # 横向移动。旧 HostToHostDnatIngress(host SG 自引用放行 DNAT 端口段)

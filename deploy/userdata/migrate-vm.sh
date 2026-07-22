@@ -30,6 +30,20 @@ SOCK="${VM_DIR}/fc.sock"
 # /etc/platform.env 取(与 launch-vm.sh:90 同源),缺省与 launch-vm 一致。
 [ -f /etc/platform.env ] && source /etc/platform.env
 
+# #331/#327 — restore 是第二条"拉起 VM"路径(S3 拉 snapshot/磁盘 + firecracker + load,全是 CPU/IO
+# 重活),必须与 launch-vm.sh 共用同一批 host 级冷启动并发槽(/run/lock/oc-launch-slot-<i>.lock),
+# 否则批量迁移恢复绕过槽闸造洪峰。抢法与 launch-vm 一致(非阻塞快扫一遍→全满 flock -w 内核阻塞睡等,
+# 零 fork 零自旋);launcher 自持 fd8,起 firecracker 时 8>&- 关掉不让 FC 继承占死槽。
+_oc_acquire_slot() {
+  # 与 launch-vm.sh 同款:随机选一把固定槽,单次无超时阻塞 flock(仅 1 次 exec,零自旋零重扫)。
+  local n="${OC_HOST_LAUNCH_SLOTS:-30}" i
+  case "$n" in ''|*[!0-9]*) n=30;; esac; [ "$n" -lt 1 ] && n=1
+  mkdir -p /run/lock 2>/dev/null || true
+  i=$(( (RANDOM % n) + 1 ))
+  exec 8>"/run/lock/oc-launch-slot-${i}.lock"
+  flock 8
+}
+
 # _harden_restored_tap <vm_num> — 为 restore 复活的 VM 建 tap + 配 /30 + 打满
 # 与 launch-vm.sh:503-582 一致的隔离规则(IMDS DROP / 东西向超网 DROP / 管理端口
 # INPUT DROP / IPv6 关 / MASQUERADE)。tap 名 tap-vm{N} 与源 host 一致(同 vm_num),
@@ -125,6 +139,14 @@ case "$MODE" in
     ;;
   restore)
     mkdir -p "$VM_DIR"
+    # #331 codex — 先抢 per-tenant 互斥锁(fd7,与 launch-vm.sh:oc-launch-<tid>.lock 同一把),防两个
+    # restore 或 restore 与 launch 同时改同一 VM_DIR。抢不到=另一进程正起同租户 → skip(exit 75)。
+    mkdir -p /run/lock 2>/dev/null || true
+    exec 7>"/run/lock/oc-launch-${TENANT}.lock"
+    flock -n 7 || { echo "restore skip: ${TENANT} launch/restore already in progress (flock held)" >&2; exit 75; }
+    # 再抢 host 级启动槽【再】拉 S3(下载+load+FC 全是重活,codex:抢槽必须早于下载)。
+    # 抢到才占额度、超限排队;fd8 常驻本进程到 restore 完成显式关。
+    _oc_acquire_slot
     # Download the block-device backing files FIRST — Firecracker opens them by
     # the absolute path baked into snapshot.vm during /snapshot/load, so they
     # must already be on local disk before the load call below. Missing disks
@@ -188,8 +210,9 @@ case "$MODE" in
     echo "  [#179] source vm_num=${SRC_VM_NUM} (target arg vm_num=${VM_NUM}); hardening the tap the snapshot will actually attach to"
     _harden_restored_tap "${SRC_VM_NUM}"
     # Start a Firecracker process bound to the new socket.
+    # 8>&- 关掉槽锁 fd,不让长命 firecracker 继承占死槽(否则本 migrate 退出后槽仍被 FC 持着)。
     rm -f "$SOCK"
-    nohup firecracker --api-sock "$SOCK" >"${VM_DIR}/fc.log" 2>&1 &
+    nohup firecracker --api-sock "$SOCK" >"${VM_DIR}/fc.log" 2>&1 8>&- &
     sleep 1
     # Load the snapshot. Surface Firecracker's own error body on failure so the
     # SSM output explains *why* (e.g. a missing backing file) instead of just
@@ -201,6 +224,8 @@ case "$MODE" in
       tail -5 "${VM_DIR}/fc.log" >&2 || true
       exit 22
     fi
+    # 恢复完成(VM 已 resume),释放启动槽让排队的下一个进来。
+    exec 8>&- 2>/dev/null || true
     echo "restored ${TENANT} on this host"
     ;;
   *)

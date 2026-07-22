@@ -375,6 +375,46 @@ VM_NUM="${2:?Usage: launch-vm.sh <tenant_id> <vm_num> [vcpu] [mem_mb] [config_te
 mkdir -p /run/lock 2>/dev/null || true
 exec 9>"/run/lock/oc-launch-${TENANT_ID}.lock"
 flock -n 9 || { trap - ERR EXIT; echo "[oc:launch] ${TENANT_ID} launch already in progress (flock held) — skip" >&2; exit 75; }
+# #331/#327 — host 级启动并发闸(跨进程):一个 host 同时冷启的 VM 数不超过 N 个,防批量 FC
+# 死亡 recover / 多批 SSM fan-out 各自 fire 几百个 launch-vm 造成二次 CPU/IO 洪峰压垮 host。
+# 所有起 VM 的路径(dispatch fan-out / host-agent recover/force-relaunch / ssm wake)都走本脚本,
+# 故在此单一咽喉口装一把跨进程信号量:N 把槽锁 fd10-fd(9+N),抢到任一把才继续,抢不到就阻塞等
+# (非 skip:本租户该起,只是排队限速)。flock 是 inode advisory 锁,持锁进程死/OOM/SIGKILL 内核
+# 自动释放,永不泄漏、无死锁。N=OC_HOST_LAUNCH_SLOTS(默认 30,与 dispatch 波宽同量级)。per-tenant
+# 锁(fd9)先抢:同租户重复调只有一个进到这里,不会占多把槽。取消 flock 超时兜底=让洪峰真排队,
+# 慢启不压垮(design decision:可以启动得慢一些)。
+# platform.env 完整 source 在下方(:476);slot 数在抢锁前就要,先补读一次(幂等、cheap)。
+[ -f /etc/platform.env ] && . /etc/platform.env 2>/dev/null || true
+_OC_SLOTS="${OC_HOST_LAUNCH_SLOTS:-30}"
+case "$_OC_SLOTS" in ''|*[!0-9]*) _OC_SLOTS=30 ;; esac
+[ "$_OC_SLOTS" -lt 1 ] && _OC_SLOTS=1
+# launcher 自持锁模型(codex review 定案,零 fork):launcher 进程【自己】持某把槽的 flock fd8,
+# 不起任何后台/子进程抢锁(旧 guardian 版每等待者每 0.3s fork setsid×N = 进程风暴,codex 抓)。
+# 抢法:先 flock -n 非阻塞扫一遍 N 把槽(纯 in-process,零 fork);全满则对轮转的一把做【阻塞】
+# flock -w(在内核里睡等,不自旋、不 fork),超时再换一把扫。抢到即 fd8 常驻本进程。
+# fd 不泄漏给 firecracker:起 firecracker 时 8>&- 显式关掉,长命 FC 不继承/不占死槽。
+# launcher 被 SIGKILL/OOM/正常退出 → fd8 关 → 内核自动释放槽(无 fail-open:持锁的就是干活的本尊,
+# 不存在"锁没了但还在冷启"的窗口)。释放=InstanceStart 后 exec 8>&-(重活已完)。
+_OC_SLOT_HELD=0
+_oc_acquire_launch_slot() {
+  # 每 launcher 恰好【1 次 flock exec】:随机选一把固定槽,单次【无超时阻塞】flock——内核睡等到这
+  # 把槽空出(不扫 N 把、不自旋、不周期重扫,彻底无 fork 洪峰,codex 反复抓的点)。随机选槽让 N 个
+  # 等待者按均匀分布摊到 N 把槽,谁先释放谁的排队者先进,整体稳态吞吐 = N 并发。
+  local i
+  i=$(( (RANDOM % _OC_SLOTS) + 1 ))
+  exec 8>"/run/lock/oc-launch-slot-${i}.lock"
+  echo "[oc:launch] ${TENANT_ID} acquiring host launch slot ${i}/${_OC_SLOTS}" >&2
+  flock 8
+  _OC_SLOT_HELD=1
+}
+_oc_release_launch_slot() {
+  # 关 fd8 → 内核放锁。★槽闸限【冷启动 CPU/IO 重活】(mkfs/cp/解压/boot),到 InstanceStart
+  # 成功那刻重活结束、VM 自持运行 → 在此释放;不持到 VM 生命周期(否则封顶常驻数=灾难)。幂等。
+  [ "${_OC_SLOT_HELD}" -eq 1 ] || return 0
+  exec 8>&- 2>/dev/null || true
+  _OC_SLOT_HELD=0
+}
+_oc_acquire_launch_slot
 VCPU="${3:-2}"
 MEM_MB="${4:-4096}"
 CONFIG_TEMPLATE="${5:-}"
@@ -491,14 +531,13 @@ if [ -z "${INJECTED_GATEWAY_TOKEN_CT}" ] || [ -z "${INJECTED_DEVICE_PAIRED_B64}"
   fi
   unset _SEC_RAW _SECRETS_TABLE
 fi
-# #312 — device_paired_b64 二级回落到 tenants 表(长期,无 TTL)。tenant_secrets 表的
-# device 密文有 15min TTL(mint_device_identity 设 device_expires_at=now+900),几小时后
-# 镜像更新自愈 restart 时上面 #290 一级回落(查 tenant_secrets)拿到空 → paired.json 无源
-# 重注入 → 网关读空盘配对 → 前端 NOT_PAIRED(真机复现)。paired.json 是公开信息(deviceId+
-# publicKey+roles+scopes,无私钥),create 时已长期存 tenants.device_paired_b64(无 TTL),
-# 这里作长期兜底。gateway_token 不做此回落:它是机密且短期(reveal 窗口),过期即应重铸,
-# 不长期留明文密文在无 TTL 表。fail-open:tenants 读失败不中止(paired 缺失只是回退到
-# 人工 approve,非 fail-closed 安全事件)。
+# #312 — device_paired_b64 二级回落到 tenants 表(长期,无 TTL)。存量租户(改动前建的)
+# 或 create 时持久化失败的租户,tenant_secrets 里可能没有 device_paired_b64,上面 #290
+# 一级回落(查 tenant_secrets)拿到空 → paired.json 无源重注入 → 网关读空盘配对 → 前端
+# NOT_PAIRED(真机复现)。paired.json 是公开信息(deviceId+publicKey+roles+scopes,无私钥),
+# create 时已长期存 tenants.device_paired_b64(无 TTL),这里作长期兜底。gateway_token 不做
+# 此回落:它是机密,只从 tenant_secrets 读(#353 起该表也无 TTL 长存,回读不会落空)。
+# fail-open:tenants 读失败不中止(paired 缺失只是回退到人工 approve,非 fail-closed 安全事件)。
 _PAIRED_FROM_TENANTS=0
 if [ -z "${INJECTED_DEVICE_PAIRED_B64}" ]; then
   _TENANTS_TABLE="${TENANTS_TABLE:-openclaw-tenants}"
@@ -578,6 +617,13 @@ log "START ${TENANT_ID} vm${VM_NUM} ${VCPU}vCPU/${MEM_MB}MB"
 pkill -f "api-sock ${SOCK}" 2>/dev/null || true
 sudo ip link del ${TAP} 2>/dev/null || true
 rm -f ${SOCK}; sleep 0.5
+# 清残留 vsock UDS:stop-vm 只删 fc.sock/fc.log,Firecracker PUT /vsock 要 bind 的
+# 裸 vsock.sock 会存活 → 下次 PUT 撞 "Address in use"(真机实测)。此处每次 launch 都
+# 跑、由 :376 的 per-tenant flock 保护,覆盖 create/restart/restore/recover 所有路径。
+# 只清裸 vsock.sock:后缀 socket vsock.sock_<port> 是 reader 侧 listen 的落点,归 reader
+# 独占管理(reader _bind 自己 unlink),launch 不能通配删,否则删掉 reader 正在监听的
+# socket → reader 线程仍登记但连接断、重启后永久丢日志(codex 复审抓出)。
+rm -f ${VM_DIR}/vsock.sock
 
 # Prepare disks
 log "preparing disks..."
@@ -1359,7 +1405,10 @@ fi
 
 # Start Firecracker
 log "starting firecracker..."
-nohup firecracker --api-sock ${SOCK} --log-path ${VM_DIR}/fc.log --level Info &>/dev/null & disown
+# #331/#327 — 8>&- 关掉本 launcher 持的槽锁 fd,不让长命 disown 的 firecracker 继承它:否则
+# launcher 退出后 FC 仍持槽 → host 封顶 N 个【常驻】VM(而非 N 个【并发启动】)。槽在 InstanceStart
+# 后由 _oc_release_launch_slot 显式释放;这里只是确保 FC 子进程不继承。
+nohup firecracker --api-sock ${SOCK} --log-path ${VM_DIR}/fc.log --level Info &>/dev/null 8>&- & disown
 sleep 1
 
 # Configure VM
@@ -1418,6 +1467,59 @@ curl -s --unix-socket ${SOCK} -X PUT http://localhost/machine-config \
   -H 'Content-Type: application/json' \
   -d '{"vcpu_count":'${VCPU}',"mem_size_mib":'${MEM_MB}'}'
 
+# guest 日志采集通道(vsock)——默认关,OC_GUEST_LOG_ENABLED=true 才配。
+# 必须在 InstanceStart 之前 PUT(vsock 不能热挂,真机实测)。这是所有生命周期
+# 路径(create/restart/restore/recover)的单一 boot 收敛点 → 一处覆盖全部。
+# guest_cid 固定 3:每个 VM 是独立 firecracker 进程 + 独立 UDS,CID 只在单 VM
+# vsock 命名空间内有意义,不跨 VM(两租户真机实测 cid=3 无冲突)。guest forwarder
+# connect(HOST_CID=2, port) → Firecracker 落到 ${VM_DIR}/vsock.sock_<port>,
+# host vsock reader 在那 listen(guest 只 connect 不 bind,不开入站面)。
+# 两级开关都开才挂 vsock:① host 级 OC_GUEST_LOG_ENABLED,默认 true(采集默认开)
+# ② per-tenant DDB flag guest_log_enabled(强一致读)。语义(codex 复审):
+#   - 显式 false → 关(不能用 jq `.BOOL // true`:`//` 对布尔 false 也兜底成 true,吞掉显式关)
+#   - 属性缺失/true(调用成功但没设或设 true)→ 开(功能测试阶段默认收)
+#   - DDB 调用失败(网络/IAM/限流)→ 【不确定】,对含会话的敏感采集 fail-CLOSED 不挂 vsock
+#     (与只读 fail-open 相反:读不到 flag 时宁可不采,也不冒险把敏感会话重新抽出去)。
+if [ "${OC_GUEST_LOG_ENABLED:-true}" != "false" ]; then
+  if _GLOG_RAW="$(aws dynamodb get-item \
+    --table-name "${TENANTS_TABLE:-openclaw-tenants}" \
+    --key "{\"id\":{\"S\":\"${TENANT_ID}\"}}" \
+    --projection-expression 'guest_log_enabled' \
+    --consistent-read \
+    --region "${OC_REGION:-ap-northeast-1}" \
+    --output json 2>/dev/null)"; then
+    # 调用成功:精确三态,严格类型校验(codex 三次抓的同源坑)。绝不用 `.BOOL // x`
+    # (`//` 对布尔 false 也兜底)。要求 guest_log_enabled 字段【存在且确实是 BOOL 类型】
+    # 才取值(true/false);字段缺失=unset(默认开);类型不对(存了 S/N 等)=当不确定,
+    # 归 read_failed 走 fail-closed,不能取到 null 被当"开"。
+    # 先判 .Item 整体:DDB get-item 未命中返回 {}(无 Item 键)→ 租户记录不存在,是异常
+    # 状态,当 read_failed 走 fail-closed(codex:不能把'整个 Item 不存在'当字段 unset 开)。
+    # Item 存在再看字段:缺失=unset(默认开);是 BOOL=取值;其他类型=read_failed。
+    _GLOG_TENANT_FLAG="$(printf '%s' "${_GLOG_RAW}" | jq -r '
+      if (has("Item") | not) then "read_failed"
+      else (.Item.guest_log_enabled) as $f
+        | if $f == null then "unset"
+          elif ($f | type) == "object" and ($f | has("BOOL")) then ($f.BOOL | tostring)
+          else "read_failed" end
+      end' 2>/dev/null || echo read_failed)"
+  else
+    _GLOG_TENANT_FLAG="read_failed"  # DDB 读失败:fail-closed 不挂 vsock
+  fi
+  if [ "${_GLOG_TENANT_FLAG}" != "false" ] && [ "${_GLOG_TENANT_FLAG}" != "read_failed" ]; then
+    # #vsock PUT 必须检查 HTTP 结果:失败不能假成功打印 attached(codex)。--fail-with-body
+    # 让 4xx/5xx 返非零,--max-time 防挂死。失败 → 记 degraded,不打印 attached。
+    if _VSOCK_RES="$(curl -s --fail-with-body --max-time 5 --unix-socket ${SOCK} \
+        -X PUT http://localhost/vsock -H 'Content-Type: application/json' \
+        -d '{"guest_cid":3,"uds_path":"'${VM_DIR}/vsock.sock'"}' 2>&1)"; then
+      log "guest-log vsock attached uds=${VM_DIR}/vsock.sock (default-on; both flags not false)"
+    else
+      log "WARN: guest-log vsock PUT failed (degraded, 采集不启用): ${_VSOCK_RES}"
+    fi
+  else
+    log "guest-log skipped: per-tenant guest_log_enabled=${_GLOG_TENANT_FLAG}"
+  fi
+fi
+
 curl -s --unix-socket ${SOCK} -X PUT http://localhost/network-interfaces/eth0 \
   -H 'Content-Type: application/json' \
   -d '{"iface_id":"eth0","guest_mac":"'${GUEST_MAC}'","host_dev_name":"'${TAP}'"}'
@@ -1438,6 +1540,9 @@ RESULT=$(curl -s --unix-socket ${SOCK} -X PUT http://localhost/actions \
   -H 'Content-Type: application/json' -d '{"action_type":"InstanceStart"}')
 [ -n "${RESULT}" ] && log "ERROR: ${RESULT}" && exit 1
 log "InstanceStart succeeded — VM is now booting"
+# #331/#327 — 冷启动重活(mkfs/cp/解压/firecracker boot)到此结束,VM 已自持运行 →
+# 立刻释放 host 级启动槽,让排队的下一个 launch 进来。之后的 nginx/ssh 收尾不占启动并发额度。
+_oc_release_launch_slot
 # 1.3.2: Past this point the VM is genuinely running. Any later step
 # failing (nginx reload race, ssh-keygen leftovers, etc) shouldn't
 # tear down a working VM. Disable strict mode + clear ERR trap so the

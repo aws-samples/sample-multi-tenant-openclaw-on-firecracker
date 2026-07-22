@@ -8,7 +8,7 @@
 契约:SPEC/specs/sqs-dispatch/interfaces.md。
 """
 
-from .binpack import PackResult, pack
+from .binpack import PackResult, normalize_spec, pack
 from .manifest import (
     MANIFEST_PART_MAX_BYTES,
     decode_manifest_lines,
@@ -19,6 +19,7 @@ from .manifest import (
 __all__ = [
     "PackResult",
     "pack",
+    "normalize_spec",
     "MANIFEST_PART_MAX_BYTES",
     "encode_manifest_line",
     "split_manifest_parts",

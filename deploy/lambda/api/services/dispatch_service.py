@@ -32,6 +32,7 @@ import core.clients as clients
 from core.dispatch import (
     MANIFEST_PART_MAX_BYTES,
     encode_manifest_line,
+    normalize_spec,
     pack,
     split_manifest_parts,
 )
@@ -238,15 +239,35 @@ def _snapshot_hosts(now_epoch: int, gate_inflight: bool = True) -> List[Dict[str
         ConsistentRead=True,
     ).get("Items", [])
 
+    # #340(codex review)— 磁盘新鲜度基准用【扫描此刻】的时间,不用 invocation 起点 now_epoch。
+    # 长批次认领可能已耗时 > TTL,此时刚上报的满盘记录(ts≈real-now)相对 now_epoch 会落进"离谱
+    # 未来"被误判 fail-open。用 scan 时刻做基准,ts 与它的差恒是真实新鲜度。inflight 判定仍用
+    # now_epoch(那是它与 SendCommand 时序的既有语义,不动)。
+    disk_now = int(time.time())
     ttl = clients.DISPATCH_INFLIGHT_TTL_SEC
     out = []
     for h in hosts:
         total_vcpu = int(h.get("total_vcpu", 0) or 0)
         used_vcpu = int(h.get("used_vcpu", 0) or 0)
         allocatable = int(total_vcpu * float(clients.CPU_OVERCOMMIT_RATIO or 1.0))
-        # 一租户默认 1 slot(2 vCPU 单位);free_slots = 剩余 vcpu / VM_DEFAULT_VCPU 保守值
-        vcpu_per_vm = max(1, int(clients.VM_DEFAULT_VCPU or 2))
-        free_slots = max(0, (allocatable - used_vcpu) // vcpu_per_vm)
+        # #330 — mem 维度可分配上限(total_mem_mb × MEM_OVERCOMMIT),CAS vcpu+mem 双闸,
+        # 与同步 create 路径(handler.py:954-960)一致,防大内存租户超卖 OOM。
+        # ★缺 total_mem_mb(旧 host DDB item 没写这字段)→ allocatable_mem=0 当【未知】哨兵,
+        # 下游 mem 闸跳过(回落纯 vcpu 闸),绝不因字段缺失误拒整台 host(codex review 指出)。
+        total_mem = int(h.get("total_mem_mb", 0) or 0)
+        allocatable_mem = int(total_mem * float(clients.MEM_OVERCOMMIT_RATIO or 1.0))
+        used_mem = int(h.get("used_mem_mb", 0) or 0)
+        # #330 — 装箱按【真实剩余资源】双预算(free_vcpu/free_mem),不再折算成 VM_DEFAULT 名额
+        # (旧 free_slots=剩余vcpu//2 把 1c:2G 租户的可装数腰斩到 282,达不到 380)。mem_known=缺
+        # total_mem_mb 的老 host 内存容量未知 → 装箱侧 fail-safe 不调度(不 fail-open 当无限内存)。
+        free_vcpu = max(0, allocatable - used_vcpu)
+        mem_known = total_mem > 0
+        free_mem = max(0, allocatable_mem - used_mem)
+        # #340 — 磁盘软门:host-agent 每 poll 用 statvfs('/data') 写 avail_disk_mb +
+        # disk_check_ts_epoch。剩余低于水位就不接新租户(防 /data 满 → mkdir No space →
+        # requires_intervention)。fail-open:字段缺失(旧 host 从没上报)或上报陈旧
+        # (host-agent 挂了/漏报,读数不可信)→ disk_ok=True 退回旧行为,绝不用过期读数误杀。
+        disk_ok = _host_disk_ok(h, disk_now)
         if gate_inflight:
             inflight_ts = int(h.get("dispatch_inflight_ts_epoch", 0) or 0)
             inflight_ok = (not h.get("dispatch_inflight")) or (
@@ -257,14 +278,61 @@ def _snapshot_hosts(now_epoch: int, gate_inflight: bool = True) -> List[Dict[str
         out.append(
             {
                 "instance_id": h["instance_id"],
-                "free_slots": free_slots,
+                "free_vcpu": free_vcpu,
+                "free_mem": free_mem,
+                "mem_known": mem_known,
                 "allocatable_vcpu": allocatable,
+                "allocatable_mem": allocatable_mem,
                 "simulated": bool(h.get("simulated", False)),
                 "inflight_ok": bool(inflight_ok),
+                "disk_ok": bool(disk_ok),
                 "raw": h,
             }
         )
     return out
+
+
+def _host_disk_ok(h: Dict[str, Any], now_epoch: int) -> bool:
+    """#340 — host /data 是否还有足够物理余量接新租户(装箱磁盘软门的判据)。
+
+    True = 可接(含所有 fail-open 情形);False = 【新鲜确认】盘将满、跳过该 host。
+
+    只在【新鲜确认盘将满】时才阻断,其余一律 fail-open(退回旧的"只看 vcpu/mem"):
+    - 门关闭(DISPATCH_HOST_DISK_MIN_FREE_MB<=0)→ True;
+    - 没有磁盘信号(avail_disk_mb 缺失 → 旧 host / host-agent 未升级)→ True(过渡期);
+    - 磁盘信号陈旧(now - disk_check_ts_epoch > TTL,或无时间戳)→ True;
+    - 新鲜且剩余 < 水位 → False(唯一阻断分支);新鲜且剩余 ≥ 水位 → True。
+
+    ★为什么陈旧要 fail-open(codex score:陈旧阻断会误摘健康 host + 旧字段永久封锁):
+    磁盘上报已剥离到【独立线程】(host-agent._disk_report_loop),不再搭 poll 心跳便车,
+    所以读数陈旧不再是"VM probe 慢拖累",而是真·agent 没在跑。agent 死是正交问题,交
+    health_check(租户全 stale → SSM 重启 agent)+ ASG(实例失联替换)兜底,磁盘门不越权
+    用一个可能过期的读数【永久封锁】host(那会让 agent 回滚后残留旧字段的 host 再不可调度)。
+    代价权衡:漏挡"曾满但现在 agent 死"的 host 窗口 → 该 host 若真满,派过去 mkdir 失败仍
+    走 requires_intervention(退化回本 bug,但仅限"agent 死且盘真满"这个窄交集,且 agent
+    一旦被 health_check 拉活、独立线程立刻刷新读数即恢复拦截);误挡健康 host 的代价(整机
+    产能损失 + 无法自愈)更大。故对陈旧取 fail-open。TTL<=0 = 不校验新鲜度(有值就按值判)。
+    """
+    min_free = int(clients.DISPATCH_HOST_DISK_MIN_FREE_MB or 0)
+    if min_free <= 0:
+        return True  # 门关闭
+    if "avail_disk_mb" not in h:
+        return True  # 没上报 → fail-open(旧 host / 未升级 / 取不到磁盘)
+    # 信任边界外(DDB item 可能被别的写者写脏/半写):任何 coerce 失败都当【不可信信号】
+    # 逐 host fail-open,绝不让一台 host 的畸形值抛异常炸掉整批装箱(codex score #2)。
+    try:
+        ttl = int(clients.DISPATCH_DISK_REPORT_TTL_SEC or 0)
+        if ttl > 0:
+            ts = int(h.get("disk_check_ts_epoch", 0) or 0)
+            # now_epoch 是 invocation 起点;认领 + host scan 期间独立线程可能刚上报,ts 会略大于
+            # now_epoch(codex review:那样会被"未来时间戳"误判 fail-open,即使报的是满盘)。故给
+            # 时钟漂移容差 = TTL:|now - ts| ≤ TTL 都算【新鲜】按值判;只有离谱的过去(陈旧,agent
+            # 死)或离谱的未来(> now+TTL,时钟错乱/伪造)才当不可信 → fail-open。无/坏时间戳同样放行。
+            if ts <= 0 or ts > now_epoch + ttl or (now_epoch - ts) > ttl:
+                return True
+        return int(h.get("avail_disk_mb", 0) or 0) >= min_free
+    except (TypeError, ValueError):
+        return True  # 畸形数值 → 不可信 → fail-open(单 host,不炸批)
 
 
 def _try_reserve_host(
@@ -273,9 +341,18 @@ def _try_reserve_host(
     command_id: str,
     now_epoch: int,
     allocatable_vcpu: int,
+    sum_vcpu: int,
+    sum_mem: int,
+    allocatable_mem: int,
     write_inflight: bool = True,
 ) -> Optional[int]:
-    """单 host 单条 UpdateItem: next_vm_num+=n / used_vcpu+=n*vcpu(+ push 模式打 inflight)。
+    """单 host 单条 UpdateItem: next_vm_num+=n / used_vcpu+=Σ真实vcpu / used_mem_mb+=Σ真实mem
+    (+ push 模式打 inflight)。CAS 双闸(used_vcpu<=cap_v 且 used_mem_mb<=cap_m)。
+
+    #330 修:预留按【本批各租户真实 vcpu/mem 之和】(sum_vcpu/sum_mem),不再 n×VM_DEFAULT
+    ——旧版记 n×(2/4096) 与租户声明规格无关,导致 ①账本高估(1c:2G 记成 2c/4G,r8g 有效容量
+    从 564 腰斩到 282,达不到 380 目标)②与 reaper 按真实值释放不对称→双向漂移 ③mem 无闸→大内存
+    租户超卖 OOM。释放侧 _rollback_host 同步按真实和扣(对称)。参照同步 create 路径(handler.py:954)。
 
     返回该批第一个 vm_num(reserved base);容量不够 → None。
 
@@ -291,11 +368,16 @@ def _try_reserve_host(
     容量安全两模式都由 slot 级 CAS(used_vcpu <= :cap_v)保证,与 inflight 无关。
     """
     ccf = clients.hosts_table.meta.client.exceptions.ConditionalCheckFailedException
-    vcpu_per_vm = max(1, int(clients.VM_DEFAULT_VCPU or 2))
-    mem_per_vm = max(0, int(clients.VM_DEFAULT_MEM or 2048))
-    dv = n * vcpu_per_vm
+    # #330 — 预留量 = 本批各租户【真实】vcpu/mem 之和(调用方从 batch 的 params 求和传入),
+    # 不再 n×VM_DEFAULT。cap_v/cap_m = 允许上限 - 本批增量;任一维负 = 装不下,直接拒。
+    dv = int(sum_vcpu)
+    dm = int(sum_mem)
     cap_v = int(allocatable_vcpu) - dv
-    if cap_v < 0:
+    # ★mem 闸【恒开】(codex review Error3:allocatable_mem<=0 若跳过闸 = 把未知容量当无限 →
+    # 大内存租户仍可超卖 OOM)。装箱侧 mem_known=False 的 host 已 fail-safe 排除,正常不会到这;
+    # 万一到了(allocatable_mem<=0),cap_m<0 → 拒(fail-safe,绝不把未知当无限内存放行)。
+    cap_m = int(allocatable_mem) - dm
+    if cap_v < 0 or cap_m < 0:
         return None
     set_expr = (
         "next_vm_num = if_not_exists(next_vm_num, :zero) + :n, "
@@ -306,18 +388,21 @@ def _try_reserve_host(
     vals = {
         ":n": n,
         ":dv": dv,
-        ":dm": n * mem_per_vm,
+        ":dm": dm,
         ":zero": 0,
         ":cap_v": cap_v,
+        ":cap_m": cap_m,
     }
+    # CAS 双闸恒开:vcpu + mem(#330 防大内存租户超卖 OOM;mem 未知的 host 已在装箱侧排除)。
+    mem_clause = " AND used_mem_mb <= :cap_m"
     if write_inflight:
-        # push 模式:写 inflight 标量 + 走 host 级排他门(旧行为逐字保留)。
+        # push 模式:写 inflight 标量 + 走 host 级排他门(旧行为保留,加 mem 闸)。
         set_expr += (
             ", dispatch_inflight = :cid, dispatch_inflight_ts = :now, "
             "dispatch_inflight_ts_epoch = :now_epoch"
         )
         cond = (
-            "used_vcpu <= :cap_v "
+            "used_vcpu <= :cap_v" + mem_clause + " "
             "AND (attribute_not_exists(dispatch_inflight) "
             "OR dispatch_inflight_ts_epoch < :expired)"
         )
@@ -330,8 +415,8 @@ def _try_reserve_host(
             }
         )
     else:
-        # ddb 模式:只 slot 级容量闸,不写 inflight 标量(无并发标量竞争)。
-        cond = "used_vcpu <= :cap_v"
+        # ddb 模式:vcpu 闸 + (已知时)mem 闸,不写 inflight 标量。
+        cond = "used_vcpu <= :cap_v" + mem_clause
     update_expr = "SET " + set_expr
     if write_inflight:
         # #315(codex review7 P1)—— 写新 dispatch_inflight(command_id)时,必须原子清掉旧
@@ -395,13 +480,22 @@ def _backfill_placement(
             print(f"[dispatch] placement backfill {t['tenant_id']} non-fatal: {e}")
 
 
-def _rollback_host(instance_id: str, n: int) -> None:
-    """回滚 CAS:used_vcpu-N / used_mem_mb-N*vm / vm_count-N。next_vm_num 不倒退。
+def _rollback_host(instance_id: str, n: int, sum_vcpu: int, sum_mem: int) -> None:
+    """回滚 CAS:used_vcpu-Σ真实vcpu / used_mem_mb-Σ真实mem / vm_count-N。next_vm_num 不倒退。
 
-    与 scheduling._release_slot 同款 best-effort。REMOVE dispatch_inflight 一并做。
+    #330 修:释放量与 _try_reserve_host 的预留量【对称】(都用本批真实 vcpu/mem 之和),
+    不再 n×VM_DEFAULT——否则预留真实、回滚默认(或反之)会双向漂移账本。与 scheduling._release_slot
+    同款 best-effort;REMOVE dispatch_inflight 一并做。
+
+    ⚠️ 幂等边界(codex review):本函数【非幂等】,只能由【本次 CAS 新鲜获胜】的调用方调一次。
+    调用契约:dispatch_batch 里 base=_try_reserve_host() 返回非 None(赢下 CAS)后,该批在同一
+    invocation 内 5 个失败分支【互斥且 continue】,最多回滚一次;重投走认领闸(dispatch_claim)+
+    新一轮 CAS,看到 slot 已占用会退出,不会拿旧金额二次回滚。used_mem_mb>=:dm/used_vcpu>=:dv
+    下溢条件是最后防线。若未来放开"重试接管已有 slot",必须改成可消费的 reservation_id token
+    (预留时原子写、回滚时条件校验+删除+扣资源一次完成),command_id 不够——见后续 issue。
     """
-    vcpu_per_vm = max(1, int(clients.VM_DEFAULT_VCPU or 2))
-    mem_per_vm = max(0, int(clients.VM_DEFAULT_MEM or 2048))
+    dv = int(sum_vcpu)
+    dm = int(sum_mem)
     try:
         clients.hosts_table.update_item(
             Key={"instance_id": instance_id},
@@ -411,10 +505,14 @@ def _rollback_host(instance_id: str, n: int) -> None:
                 "vm_count = vm_count - :n "
                 "REMOVE dispatch_inflight, dispatch_inflight_ts, dispatch_inflight_ts_epoch, dispatch_ssm_cid"
             ),
-            ConditionExpression="used_vcpu >= :dv AND vm_count >= :n",
+            # #330 — cond 加 used_mem_mb >= :dm(与 vcpu 对称),防回滚把 mem 账本扣成负数
+            # (codex review:原只护 vcpu/vm_count,mem 可被扣负)。
+            ConditionExpression=(
+                "used_vcpu >= :dv AND used_mem_mb >= :dm AND vm_count >= :n"
+            ),
             ExpressionAttributeValues={
-                ":dv": n * vcpu_per_vm,
-                ":dm": n * mem_per_vm,
+                ":dv": dv,
+                ":dm": dm,
                 ":n": n,
             },
         )
@@ -481,11 +579,17 @@ def _delete_manifest_parts(command_id: str, instance_id: str, part_count: int) -
 
 
 def _derive_exec_timeout(batch_size: int) -> int:
-    """SSM executionTimeout = ceil(batch × per-vm-budget / parallelism) + 120s 余量,
-    并 ≤ visibility_timeout - 60s(防假超时→回滚活 VM→账本分叉)。"""
+    """SSM executionTimeout = ceil(batch × per-vm-budget / 有效并发) + 120s 余量,
+    并 ≤ visibility_timeout - 60s(防假超时→回滚活 VM→账本分叉)。
+
+    #331/#327:有效并发 = host 级槽闸数(DISPATCH_HOST_LAUNCH_CONCURRENCY,~30)不是装箱密度
+    DISPATCH_MAX_PARALLEL(96)。VM 经跨进程 flock 槽【排队限速】起:batch 个 VM 分 ceil(batch/slots)
+    【轮】跑,每轮并行 slots 个、耗时约 per_vm 秒。故公式 = ceil(batch/slots)×per_vm + 120 余量
+    (codex #327:不是 batch×per_vm/slots——后者在不整除时少算一整轮尾巴)。"""
     per_vm = max(1, int(clients.DISPATCH_PER_VM_BUDGET_SEC or 8))
-    parallel = max(1, int(clients.DISPATCH_MAX_PARALLEL or 96))
-    est = -(-batch_size * per_vm // parallel) + 120  # ceil div
+    parallel = max(1, int(clients.DISPATCH_HOST_LAUNCH_CONCURRENCY or 30))
+    rounds = -(-batch_size // parallel)  # ceil(batch/slots):要跑几轮
+    est = rounds * per_vm + 120
     cap = max(60, int(clients.DISPATCH_VISIBILITY_TIMEOUT_SEC or 900) - 60)
     return min(est, cap)
 
@@ -514,7 +618,10 @@ def _send_ssm_manifest(
 ) -> Optional[str]:
     """发聚合 SSM 命令。返回 CommandId(SSM 分配的);发送失败返回 None(调用方回滚)。"""
     ssm = _ssm_adaptive()
-    parallel = max(1, int(clients.DISPATCH_MAX_PARALLEL or 96))
+    # #331/#327 — 传给 launch-vm.sh 的 MAX_PARALLEL(3rd arg,in-process jobs 上限)对齐 host 级
+    # flock 槽数:起的后台 job 数不超过槽数(否则多出的 job 全阻塞在抢槽上,白占内存/句柄)。真正的
+    # 跨进程硬闸是 launch-vm.sh 的 OC_HOST_LAUNCH_SLOTS,这里只是让 in-process 并发不虚高。
+    parallel = max(1, int(clients.DISPATCH_HOST_LAUNCH_CONCURRENCY or 30))
     exec_timeout = _derive_exec_timeout(batch_size)
     try:
         resp = ssm.send_command(
@@ -546,7 +653,10 @@ def _send_ssm_from_ddb(
     发送失败返回 None(调用方回滚 + 清 assignments)。
     """
     ssm = _ssm_adaptive()
-    parallel = max(1, int(clients.DISPATCH_MAX_PARALLEL or 96))
+    # #331/#327 — 传给 launch-vm.sh 的 MAX_PARALLEL(3rd arg,in-process jobs 上限)对齐 host 级
+    # flock 槽数:起的后台 job 数不超过槽数(否则多出的 job 全阻塞在抢槽上,白占内存/句柄)。真正的
+    # 跨进程硬闸是 launch-vm.sh 的 OC_HOST_LAUNCH_SLOTS,这里只是让 in-process 并发不虚高。
+    parallel = max(1, int(clients.DISPATCH_HOST_LAUNCH_CONCURRENCY or 30))
     exec_timeout = _derive_exec_timeout(batch_size)
     try:
         resp = ssm.send_command(
@@ -680,12 +790,28 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     # push/ddb 都发真 SSM,simulated host 收不到命令 → 装箱跳过它们(压测用);
     # pull 二期由 host-agent 轮询,simulated host 可参与。
     dispatches_ssm = mode in ("push", "ddb")
-    pending = [{"tenant_id": w["tenant_id"], "params": w["params"]} for w in winners]
+    # #330(codex Error5)—— 在【认领后、装箱前】把每个 winner 的 params 里的 vcpu/mem 规范化一次
+    # (唯一入口):normalize_spec 校验信任边界外的值(非 dict/负/inf/非数字 → fail-safe 回落 VM_DEFAULT)。
+    # ★只覆盖 vcpu/mem_mb,【原 params 其余字段全保留】——chat_ep / restore_backup_key(#199 空盘=
+    # 数据丢失)/ gateway_token_ct / device_paired_b64(#188 冷注入)等仍要透传给 manifest/assignment,
+    # 否则静默空盘/丢配对(codex review 阻断级回归)。之后 pending 的 params 恒是 dict,装箱/CAS 求和/
+    # manifest/assignment 全读同一份 → 启动规格与账本一致,且下游 .get("params") 不会遇到非 dict 炸批。
+    dvm = int(clients.VM_DEFAULT_VCPU or 2)
+    dmm = int(clients.VM_DEFAULT_MEM or 4096)
+    pending = []
+    for w in winners:
+        raw = w.get("params")
+        nv, nm = normalize_spec(raw, dvm, dmm)
+        merged = {**raw} if isinstance(raw, dict) else {}
+        merged["vcpu"], merged["mem_mb"] = nv, nm
+        pending.append({"tenant_id": w["tenant_id"], "params": merged})
     result = pack(
         pending,
         hosts,
         per_host_cap=clients.DISPATCH_MAX_PARALLEL,
         skip_simulated=dispatches_ssm,
+        default_vcpu=dvm,
+        default_mem=dmm,
     )
 
     # msg_id 反查:tenant_id → msg_id(唯一,认领已保证)
@@ -693,6 +819,8 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     # #315 tenant_id → receiptHandle(供 unplaced 短退避 ChangeMessageVisibility)
     tid_to_rh = {w["tenant_id"]: w.get("receipt_handle") for w in winners}
     alloc_by_host = {h["instance_id"]: h["allocatable_vcpu"] for h in hosts}
+    # #330 — mem 维度可分配上限(CAS mem 闸用),与 alloc_by_host(vcpu)对称。
+    alloc_mem_by_host = {h["instance_id"]: h.get("allocatable_mem", 0) for h in hosts}
     failures: List[str] = []
     # #315(codex final MR P1#3):容量类失败(unplaced 装箱没位子 + CAS loser 装箱给了位子
     # 但 reserve 时被并发抢输)的租户 tid,稍后对其【原消息】缩短 visibility(960→15s)快速
@@ -715,6 +843,14 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     # 3) 每 host 一批:CAS → 分发
     for instance_id, batch in result.assignments.items():
         n = len(batch)
+        # #330 — 本批各租户【真实且已校验】vcpu/mem 之和,用 binpack.normalize_spec(装箱同一入口)
+        # 取数 → 装箱与 CAS 口径必然一致;非法/非正/非数字 params 在此统一 fail-safe 回落 VM_DEFAULT
+        # (codex Error5:SQS 消息体是信任边界外,负数/非数字直接进账本算术会腐蚀 used_* 或炸批)。
+        dvm = int(clients.VM_DEFAULT_VCPU or 2)
+        dmm = int(clients.VM_DEFAULT_MEM or 4096)
+        specs = [normalize_spec(t.get("params"), dvm, dmm) for t in batch]
+        sum_vcpu = sum(v for v, _ in specs)
+        sum_mem = sum(m for _, m in specs)
         # #315 SPLIT_BY_MODE:push 模式写 inflight 标量 + 走 host 级排他门(poller 靠它);
         # ddb 模式不写标量、只 slot CAS,允许一台 host 并发多批(host-agent 兜底,可扩 1000 host)。
         base = _try_reserve_host(
@@ -723,6 +859,9 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             command_id,
             now_epoch,
             alloc_by_host.get(instance_id, 0),
+            sum_vcpu,
+            sum_mem,
+            alloc_mem_by_host.get(instance_id, 0),
             write_inflight=gate_inflight,
         )
         if base is None:
@@ -742,14 +881,14 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             try:
                 part_count = _put_manifest_parts(command_id, instance_id, batch, base)
             except Exception as e:  # noqa: BLE001
-                _rollback_host(instance_id, n)
+                _rollback_host(instance_id, n, sum_vcpu, sum_mem)
                 for t in batch:
                     _fail(t["tenant_id"], f"manifest write failed: {e}", instance_id)
                 continue
             sent = _send_ssm_manifest(instance_id, command_id, part_count, n)
             if sent is None:
                 ssm_consec_fail += 1
-                _rollback_host(instance_id, n)
+                _rollback_host(instance_id, n, sum_vcpu, sum_mem)
                 _delete_manifest_parts(command_id, instance_id, part_count)
                 for t in batch:
                     _fail(t["tenant_id"], "SSM SendCommand failed", instance_id)
@@ -780,14 +919,14 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             # 写序重要:表里有行,叫醒命令到达时 host 才查得到(同步路径先落账
             # 再发命令同款,#139 教训)。写失败或叫醒失败都回滚 host + 清 assignments。
             if not _write_assignments(instance_id, batch, base, now_epoch):
-                _rollback_host(instance_id, n)
+                _rollback_host(instance_id, n, sum_vcpu, sum_mem)
                 for t in batch:
                     _fail(t["tenant_id"], "assignments write failed", instance_id)
                 continue
             sent = _send_ssm_from_ddb(instance_id, command_id, n)
             if sent is None:
                 ssm_consec_fail += 1
-                _rollback_host(instance_id, n)
+                _rollback_host(instance_id, n, sum_vcpu, sum_mem)
                 _clear_assignments(instance_id, batch)
                 for t in batch:
                     _fail(t["tenant_id"], "SSM from-ddb wake failed", instance_id)
@@ -814,7 +953,7 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         else:  # pull(二期 host-agent 轮询,无 SSM 叫醒)
             ok = _write_assignments(instance_id, batch, base, now_epoch)
             if not ok:
-                _rollback_host(instance_id, n)
+                _rollback_host(instance_id, n, sum_vcpu, sum_mem)
                 for t in batch:
                     _fail(t["tenant_id"], "assignments write failed", instance_id)
 

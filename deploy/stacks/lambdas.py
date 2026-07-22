@@ -363,7 +363,7 @@ def build_lambdas(self, ctx):
     # #97 档A — /tenantmatch only reads the IdP map (least privilege: read-only).
     tenant_idp_table.grant_read_data(api_fn)
     # #187 P1 / #149 出站 — control-plane mints the per-tenant gateway token +
-    # device identity ciphertext (the data-plane design · the data-plane contract).
+    # device identity ciphertext (SPEC/11-ENGINE-TRANSFORM · INTERFACE-CONTRACT §5).
     # Lambda needs:
     #   • r/w on the secrets table (put on mint, get on reveal, delete on cleanup);
     #   • kms:GenerateRandom (32B CSPRNG for the token, API-level not per-key);
@@ -515,7 +515,7 @@ def build_lambdas(self, ctx):
         batch_jobs_table.grant_read_write_data(lifecycle_consumer)
         # #187 P1 — consumer replays create_tenant which now mints gateway token.
         # Same grants as api_fn (secrets table r/w + CMK encrypt + GenerateRandom).
-        # **No kms:Decrypt** — API side never decrypts (the data-plane contract,
+        # **No kms:Decrypt** — API side never decrypts (INTERFACE-CONTRACT §5,
         # ciphertext is folded into GET responses verbatim; caller decrypts).
         tenant_secrets_table.grant_read_write_data(lifecycle_consumer)
         # #264 — consumer replay 走 config_template / injected_parameters /
@@ -1007,11 +1007,17 @@ def build_lambdas(self, ctx):
 
     host_resource = hosts_resource.add_resource("{instance_id}")
     host_resource.add_method("DELETE", _li(), **key_required)
-    # #217 V2 — POST /hosts/{instance_id}/pull-image?snapshot_time=<ISO>: 照 DDB
-    # 快照按精确 VersionId 拉 host 相关文件(镜像+脚本),校验 etag 后装到 live 原位置
-    # (launch-vm/service 直接读)。只作用一台 host。Admin op (x-api-key)。
+    # #309 V1 — POST /hosts/{instance_id}/pull-image?snapshot_time=<ISO>: 照 DDB 快照按
+    # 精确 VersionId 拉 deployment/rootfs/(镜像三盘+manifest),校验 etag 后 copy+unzip 装 live。
+    # 只作用一台 host。Admin op (x-api-key)。
     pull_image_resource = host_resource.add_resource("pull-image")
     pull_image_resource.add_method("POST", _li(), **key_required)
+    # #309 — GET /hosts/{instance_id}/pull-image-progress:tail host 上 /tmp/<job_id>.txt。
+    pull_image_progress_resource = host_resource.add_resource("pull-image-progress")
+    pull_image_progress_resource.add_method("GET", _li(), **key_required)
+    # #309 — POST /hosts/{instance_id}/copy-file-from-s3:单文件 S3→EC2(目标限资产目录白名单)。
+    copy_file_resource = host_resource.add_resource("copy-file-from-s3")
+    copy_file_resource.add_method("POST", _li(), **key_required)
 
     backups_resource = api.root.add_resource("backups")
     backups_resource.add_method("GET", _li(), **key_required)
@@ -1021,8 +1027,9 @@ def build_lambdas(self, ctx):
     images_resource = api.root.add_resource("images")
     images_resource.add_method("GET", _li(), **key_required)
 
-    # #217 V2 — GET /snapshots: 列版本快照(time+label+count),console 选 snapshot_time 拉。
-    snapshots_resource = api.root.add_resource("snapshots")
+    # #337(原#217 /snapshots)— GET /list_image_versions: 列镜像版本快照(time+label+count),
+    # console 选 snapshot_time 拉。改名避免与 /images(列镜像文件)混淆。
+    snapshots_resource = api.root.add_resource("list_image_versions")
     snapshots_resource.add_method("GET", _li(), **key_required)
 
     # 1.4.0 (#62) — Groups CRUD endpoints

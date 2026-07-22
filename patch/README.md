@@ -1,7 +1,17 @@
 # `patch/` — apply-by-reading hotfix kits (no CDK / CloudFormation redeploy)
 
-> **Executor prompt:** _"Apply the patch kit at `patch/<id>/`: read `manifest.json`, then follow
-> `APPLY-INSTRUCTIONS.md` top to bottom — every step is a confirmation gate; never run cdk/CFN."_
+> **Executor prompt (copy verbatim, fill `<id>`):**
+> _"Start applying the OpenClaw patch kit `patch/<id>/`. First read `manifest.json` and
+> `APPLY-INSTRUCTIONS.md` fully, then execute it top to bottom. This is a PRODUCTION environment,
+> so: before touching any file or resource, BACK IT UP (record the live host script / S3
+> object-version / Lambda code + config / DDB item, so every step is reversible). Run Step 0
+> probes first and fill in the real values; verify each artifact's SHA-256 == manifest
+> `patch_sha256` before use; treat EVERY side-effecting command as a confirmation gate — show it,
+> back up, wait for my OK, apply, then verify. Hot-fix running hosts before future-machine
+> sources. NEVER run `cdk deploy` / `setup.sh` / any CloudFormation redeploy — use the manual CLI
+> the kit gives. If `status != READY`, stop and surface the manual-review ops first. Run every
+> falsifiable verification in the manifest before any teardown, and never delete with a wildcard —
+> only the exact ids you created."_
 
 Each `patch/<id>/` fixes a **live** deployment in place (it was CDK-provisioned once then
 hand-modified — a redeploy would wipe that). Two files are all you read:

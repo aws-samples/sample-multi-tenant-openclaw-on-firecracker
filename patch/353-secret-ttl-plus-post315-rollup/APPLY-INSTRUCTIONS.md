@@ -20,27 +20,37 @@ file push/pull → base64 via `send-command`). All hashes are **SHA-256**.
 
 ## Step 0 — DISCOVER: auto-probe the environment, then CONFIRM (don't hand-type these)
 
-Run the read-only discovery tool FIRST — it senses the values you'd otherwise guess (the
-LIVE control-plane API by behavior not name, which Lambda alias the API actually invokes vs
-`$LATEST`, the SQS dispatch ESM target, the ASG-pinned LT version, live host ids, and a
-per-fix applies_when verdict) and writes `environment.json`. Read its CONFIRM block and verify
-every line before proceeding — this is how two different operators start from the SAME real
-values instead of each filling a blank.
+Run the read-only discovery tool FIRST — it REPORTS the values you'd otherwise guess (every
+REST API candidate with its route shape + per-method auth + resource-policy fact, which Lambda
+alias the API invokes vs `$LATEST`, the SQS dispatch ESM target, the uniquely-identified HOST
+ASG and its pinned LT version, live host ids, and a per-fix applies_when verdict) and writes
+`environment.json`. It does NOT decide the control-plane API for you — it gives you the facts so
+you can match it to how YOUR deployment is actually called. Read its CONFIRM block and verify
+every line before proceeding — this is how two operators start from the SAME real values.
 
 ```bash
 REGION=<region>; export AWS_DEFAULT_REGION=$REGION
 bash lib/discover-env.sh "$REGION"        # READ-ONLY; writes environment.json + prints CONFIRM block
-# Read the CONFIRM block. In particular verify (rule 9 + the 315 Lambda-link lesson):
-#   - control-plane API = the non-proxy one with /tenants+/hosts; PROVE it with a host-SSM
-#     GET /tenants that returns 200 (a /{proxy+} API named "-private" is the trap).
-#   - the API invokes a specific Lambda ALIAS; the dispatch SQS ESM binds $LATEST — a code
-#     update must hit BOTH, or it lands on a version nothing serves.
-#   - the ASG's pinned LT version (NOT $Default); the live host ids; each fix's IN-SCOPE/CHECK verdict.
+# Read the CONFIRM block, then clear the TWO HARD GATES it prints:
+#   1) control-plane API: route shape does NOT prove which API serves. Pick the one your own config
+#      (PRIVATE_API_URL / CTRL_API_BASE) points to AND that answers a real call from your call site
+#      using YOUR auth. The CONFIRM block lists each candidate's method_auth (NONE/AWS_IAM/CUSTOM),
+#      api_key_required, and resource_policy (a VPCE-only policy fences access even when method_auth
+#      is NONE) — match those to how you call it. A 403 means wrong API *or* wrong auth for that API.
+#      Set control_plane_api.confirmed=true in environment.json only after a real call succeeds.
+#   2) HOST ASG must be uniquely identified (candidate_count==1) and pin a HOST launch template
+#      (e.g. openclaw-host-lt), NOT the edge/OpenResty LT — host userdata on the edge LT breaks edge.
+#      If it is not unique, re-run with OC_HOST_ASG_NAME=<host-fleet-asg>. Never run apply-lt.sh until
+#      resolved. Also confirm the LT version is concrete (NOT $Default/$Latest).
+#   Plus the 315 Lambda-link lesson: the API invokes a specific alias; the dispatch SQS ESM binds
+#   $LATEST — a code update must hit BOTH, or it lands on a version nothing serves.
 # If any line is wrong, STOP and fix your target/credentials. Only then use the values below.
 ```
 
-Everything downstream reads from `environment.json` (API id, `lambda_link.api_invokes_alias`,
-`asg.lt_version_pinned`, `hosts.instance_ids`) — no hand-typed resource names.
+Everything downstream reads from `environment.json` (`control_plane_api.id` — confirmed by you,
+`lambda_link.api_invokes_alias`, `asg.name`/`asg.lt_version_pinned`, `hosts.instance_ids`) — no
+hand-typed resource names. Do not proceed while `control_plane_api.confirmed` is false or
+`asg.candidate_count != 1`.
 
 ## Step 1 — Impact assessment (write before changing anything)
 

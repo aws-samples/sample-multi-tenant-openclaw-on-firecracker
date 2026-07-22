@@ -1,0 +1,1033 @@
+{
+  "id": "353-secret-ttl-plus-post315-rollup",
+  "base_sha": "63dfed092763c83157352627ec7028185f355774",
+  "patch_sha": "6edbf2abbfa4069bab8ee385a0b5cb3f22f57543",
+  "status": "MANUAL_REVIEW",
+  "excludes": [],
+  "paths": {
+    "build-rootfs.sh": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "launch-template/build-rootfs.sh.patched",
+      "base_sha256": "52ae5e46f64b2e77411315cc25fb6bcb2b2efcc732ea78c470ac93f1b0f971f8",
+      "patch_sha256": "7dd1bc93fc74772a68e9524786872ebd1a70e83bf16d51382aecee948d1503e2",
+      "operations": [
+        {
+          "resource": "build-rootfs.sh (deploy-other code replacement)",
+          "class": "AUTO_CLI",
+          "apply_cli": "code replacement (pool-core); apply per its layer; rollback = restore prior artifact",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#345"
+      ]
+    },
+    "config.yml.example": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": null,
+      "base_sha256": "8bd17ef567632b93ac0395f5c7dbb9610682f958d5bcb4774c237d62e80777a2",
+      "patch_sha256": "8d33e791d6f344d5d546385b670c1be802df7b3e770fb99c57a5ddc43e83dcbe",
+      "operations": [
+        {
+          "resource": "config.yml.example (deploy-other code replacement)",
+          "class": "AUTO_CLI",
+          "apply_cli": "code replacement (pool-core); apply per its layer; rollback = restore prior artifact",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#331"
+      ]
+    },
+    "deploy/console-bff/web/index.html": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": null,
+      "base_sha256": "0e2b8814624490d287f56dba1332b5171084df814348e6575ca82cdc32f64eb9",
+      "patch_sha256": "9748ee7e69e7333567382a5bf8102b7d4a3c945bb497bb7c1b2b2e31b0b0061e",
+      "operations": [
+        {
+          "resource": "deploy/console-bff/web/index.html (deploy-other code replacement)",
+          "class": "AUTO_CLI",
+          "apply_cli": "code replacement (pool-core); apply per its layer; rollback = restore prior artifact",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": []
+    },
+    "deploy/console-bff/web/js/app.core.js": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": null,
+      "base_sha256": "6ece87456bcea1a1e1d0c77ce1056aa8e4bdc99ea1b2c8048326cda9a7bd3fb8",
+      "patch_sha256": "d217c503e4bc93ff592cb4fde790c27ba4cebdc6b02ec1971a90b7f07c640cab",
+      "operations": [
+        {
+          "resource": "deploy/console-bff/web/js/app.core.js (deploy-other code replacement)",
+          "class": "AUTO_CLI",
+          "apply_cli": "code replacement (pool-core); apply per its layer; rollback = restore prior artifact",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": []
+    },
+    "deploy/console-bff/web/js/app.hosts.js": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": null,
+      "base_sha256": "046c07d70035383b106584c7ad12520f5557a1cfd2840d3232b3637370887fc1",
+      "patch_sha256": "503da9b879ce762742ccdc940d5157aa19f6eb44e40a672c5b25bb9fe2e64570",
+      "operations": [
+        {
+          "resource": "deploy/console-bff/web/js/app.hosts.js (deploy-other code replacement)",
+          "class": "AUTO_CLI",
+          "apply_cli": "code replacement (pool-core); apply per its layer; rollback = restore prior artifact",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": []
+    },
+    "deploy/edge/fluent-bit/host/extract_tenant_id.lua": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/fluent-bit/extract_tenant_id.lua",
+      "base_sha256": "0f385c6537c2dca2cf3f069c6916cff73346f41f1a280f914d64ced5885af486",
+      "patch_sha256": "f97f32cd89f342a04f24318f6517404f3126c577c954d068c28c1458c3257fca",
+      "operations": [
+        {
+          "resource": "deploy/edge/fluent-bit/host/extract_tenant_id.lua (deploy-other code replacement)",
+          "class": "AUTO_CLI",
+          "apply_cli": "code replacement (pool-core); apply per its layer; rollback = restore prior artifact",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#345",
+        "#338"
+      ]
+    },
+    "deploy/edge/fluent-bit/host/fluent-bit.conf": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/fluent-bit/fluent-bit.conf",
+      "base_sha256": "6362a74e7edb969fa0ac35a1a70dc3d526b8587a26e7c06cdd8084167f930b9e",
+      "patch_sha256": "60ffdb53d90749e5c2d88fadfdbd4a740bdd7400c07d3a5fdb156d1ea5a87dba",
+      "operations": [
+        {
+          "resource": "deploy/edge/fluent-bit/host/fluent-bit.conf (deploy-other code replacement)",
+          "class": "AUTO_CLI",
+          "apply_cli": "code replacement (pool-core); apply per its layer; rollback = restore prior artifact",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#345",
+        "#338"
+      ]
+    },
+    "deploy/edge/fluent-bit/host/parsers.conf": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/fluent-bit/parsers.conf",
+      "base_sha256": "ee5ec193ce994592090fb30cc28b16cc9a4701f7d0c7597302b0205e8a41b38a",
+      "patch_sha256": "cf0f11ff6fcb9b4ca13d0da5b7256920ef6b81785312bd122d656cc873175d0b",
+      "operations": [
+        {
+          "resource": "deploy/edge/fluent-bit/host/parsers.conf (deploy-other code replacement)",
+          "class": "AUTO_CLI",
+          "apply_cli": "code replacement (pool-core); apply per its layer; rollback = restore prior artifact",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#345",
+        "#338"
+      ]
+    },
+    "deploy/lambda/api/core/auth.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/core/auth.py",
+      "base_sha256": "c5574480b1dccc25fe2e81cd11c86216a844b6e55e143b3b11eccef606409566",
+      "patch_sha256": "b9dc041487ade0c2296fafc3c0dd470e4f08df447fca5bf88a4b4bb4ff6f2727",
+      "operations": [
+        {
+          "resource": "deploy/lambda/api/core/auth.py (C-lambda code replacement)",
+          "class": "AUTO_CLI",
+          "apply_cli": "update-function-code overlay (reuse live deps); rollback = redeploy old zip + revert alias/$LATEST",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": []
+    },
+    "deploy/lambda/api/core/clients.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/core/clients.py",
+      "base_sha256": "701ba5e143689748ae50fa9b3824ddb7e3dd38b6632ed8069d14986b30f5bf30",
+      "patch_sha256": "17b41b2dcefc557c5adb228b01bfdd1cc014c20825886fdc5944940b2ace8efb",
+      "operations": [
+        {
+          "resource": "deploy/lambda/api/core/clients.py (C-lambda code replacement)",
+          "class": "AUTO_CLI",
+          "apply_cli": "update-function-code overlay (reuse live deps); rollback = redeploy old zip + revert alias/$LATEST",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#330"
+      ]
+    },
+    "deploy/lambda/api/core/dispatch/__init__.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/core/dispatch/__init__.py",
+      "base_sha256": "72d6c80acd0ed7d1ce896619416a0147511b220958e002bc508622a8d9c480bd",
+      "patch_sha256": "6ad016875ae3836efb8fc599c6cfe4a7e27b5bc6e847dacb46c7a9c8a69cfffd",
+      "operations": [
+        {
+          "resource": "deploy/lambda/api/core/dispatch/__init__.py (C-lambda code replacement)",
+          "class": "AUTO_CLI",
+          "apply_cli": "update-function-code overlay (reuse live deps); rollback = redeploy old zip + revert alias/$LATEST",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#330"
+      ]
+    },
+    "deploy/lambda/api/core/dispatch/binpack.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/core/dispatch/binpack.py",
+      "base_sha256": "5642779ba046b3426a32706bbd29cd9028e52e8865a1b8ed3d7a30b3c35db104",
+      "patch_sha256": "a30ec2f1d97fca6e1a4736c03e3d570783b89d2844fb70e434a16b08564684e5",
+      "operations": [
+        {
+          "resource": "deploy/lambda/api/core/dispatch/binpack.py (C-lambda code replacement)",
+          "class": "AUTO_CLI",
+          "apply_cli": "update-function-code overlay (reuse live deps); rollback = redeploy old zip + revert alias/$LATEST",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#330"
+      ]
+    },
+    "deploy/lambda/api/core/scheduling.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/core/scheduling.py",
+      "base_sha256": "0229ff4cc7402e7a85095402f6b7c7f1e0e87cd744e63d8b6b4e59445c1205ce",
+      "patch_sha256": "d3744e269eb794878a4939f1e1dd39495c91e1561c0570f96470b8b45d761dce",
+      "operations": [
+        {
+          "resource": "deploy/lambda/api/core/scheduling.py (C-lambda code replacement)",
+          "class": "AUTO_CLI",
+          "apply_cli": "update-function-code overlay (reuse live deps); rollback = redeploy old zip + revert alias/$LATEST",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#330"
+      ]
+    },
+    "deploy/lambda/api/handler.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/handler.py",
+      "base_sha256": "72f483600bb8158f8c2ecf1712c971d7d1f5c851e6c3734d7c52f3bec644619c",
+      "patch_sha256": "43862ac76f5192e9db8a2f3e92706ffa1f6157e57c1cceed784f589c1f22153c",
+      "operations": [
+        {
+          "resource": "deploy/lambda/api/handler.py (C-lambda code replacement)",
+          "class": "AUTO_CLI",
+          "apply_cli": "update-function-code overlay (reuse live deps); rollback = redeploy old zip + revert alias/$LATEST",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#336"
+      ]
+    },
+    "deploy/lambda/api/services/dispatch_poller.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/services/dispatch_poller.py",
+      "base_sha256": "a36da00f2881fa9bc3d6ee83056eb68241c030f4a71b820f6f7ac2fb76dcb9ae",
+      "patch_sha256": "030a0fb926fe4fa041cd3e6e578995265e1a5ef23cdf0a19c335eb4605cce326",
+      "operations": [
+        {
+          "resource": "deploy/lambda/api/services/dispatch_poller.py (C-lambda code replacement)",
+          "class": "AUTO_CLI",
+          "apply_cli": "update-function-code overlay (reuse live deps); rollback = redeploy old zip + revert alias/$LATEST",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#330"
+      ]
+    },
+    "deploy/lambda/api/services/dispatch_service.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/services/dispatch_service.py",
+      "base_sha256": "f1f116b7bd52959f16c51d88120d9d8ae711c959df15ffc0b119eda87b2c7123",
+      "patch_sha256": "6b998941b86734bcb8f9fc0901cc49d5704d4a8082f0862b70c856ccf16cc6a3",
+      "operations": [
+        {
+          "resource": "deploy/lambda/api/services/dispatch_service.py (C-lambda code replacement)",
+          "class": "AUTO_CLI",
+          "apply_cli": "update-function-code overlay (reuse live deps); rollback = redeploy old zip + revert alias/$LATEST",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#331",
+        "#330",
+        "#340"
+      ]
+    },
+    "deploy/lambda/api/services/host_service.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/services/host_service.py",
+      "base_sha256": "e7ecef5d9057253e75ec98f651becdbbd21686dfe191261d5b0794d533fcd21e",
+      "patch_sha256": "5f21b053ceaa88d5d12780ad360f5a430374e428116c62b11bfffce84432faed",
+      "operations": [
+        {
+          "resource": "deploy/lambda/api/services/host_service.py (C-lambda code replacement)",
+          "class": "AUTO_CLI",
+          "apply_cli": "update-function-code overlay (reuse live deps); rollback = redeploy old zip + revert alias/$LATEST",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#336",
+        "#343",
+        "#338"
+      ]
+    },
+    "deploy/lambda/api/services/tenant_service.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/services/tenant_service.py",
+      "base_sha256": "1757da2e572c569ec7fa907176554ff00708b59c63c92e360464e9ca664f2044",
+      "patch_sha256": "8839cd464e86147d05b8d30a31626383b44d3f6bbbb107b3cf267809153cd054",
+      "operations": [
+        {
+          "resource": "deploy/lambda/api/services/tenant_service.py (C-lambda code replacement)",
+          "class": "AUTO_CLI",
+          "apply_cli": "update-function-code overlay (reuse live deps); rollback = redeploy old zip + revert alias/$LATEST",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#353"
+      ]
+    },
+    "deploy/lib/dispatch_infra.py": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": null,
+      "base_sha256": "300683e3b96dd6f9393eeb79d34bd02336cf1710ed5f01b4c773225324ba5348",
+      "patch_sha256": "dfacde766fea84485d64518c9ca91813d568194593c174271b0cbb83e20c6766",
+      "operations": [
+        {
+          "resource": "deploy/lib/dispatch_infra.py (C-lambda code replacement)",
+          "class": "AUTO_CLI",
+          "apply_cli": "update-function-code overlay (reuse live deps); rollback = redeploy old zip + revert alias/$LATEST",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#331",
+        "#340"
+      ]
+    },
+    "deploy/stacks/compute.py": {
+      "change": "M",
+      "layer": "D-cdk",
+      "artifact": null,
+      "base_sha256": "768dc481541342c0f5ea380b58c413fa0aeb965e136e78ff9e940fb4befb261b",
+      "patch_sha256": "1da91fd9f92e15e62b4ce4fc03714a01ad871449d3fa6b7f6c5cbead2003d7f6",
+      "operations": [
+        {
+          "resource": "host IAM / instance wiring (#331 host role, disk-ledger)",
+          "class": "AUTO_CLI",
+          "apply_cli": "review: IAM grant delta only; apply inline if host-role probe returns AccessDenied (see APPLY step 2)",
+          "rollback_policy": "RETAIN"
+        }
+      ],
+      "fix_ids": []
+    },
+    "deploy/stacks/ha_edge.py": {
+      "change": "M",
+      "layer": "D-cdk",
+      "artifact": null,
+      "base_sha256": "fca19a1d2304a583eb5b7974e4e71c31bb282272c890583e03c673cea433d2ec",
+      "patch_sha256": "e5ecf05e135364cf28195e5ca705cb72d313d8dbc67b90affff3985d2abbf973",
+      "operations": [
+        {
+          "resource": "edge/ALB SG + host-agent.service LT injection (#323/#338)",
+          "class": "MANUAL_CLI_REVIEW",
+          "apply_cli": "SG/edge changes: review by-hand; host-agent.service KillMode ships via LT re-bake (APPLY step 3)",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": []
+    },
+    "deploy/stacks/lambdas.py": {
+      "change": "M",
+      "layer": "D-cdk",
+      "artifact": null,
+      "base_sha256": "1366d0e9aa9fc4b341728b1636dc53ac1544cffd2c0361a343cf364bce798e6e",
+      "patch_sha256": "02a84f0dbdc83ddb8d130903c65b7486b9805f07a6200a083b1218603f060ab0",
+      "operations": [
+        {
+          "resource": "Lambda env: DISPATCH_HOST_LAUNCH_CONCURRENCY, disk/mem gate, guest-log (#331/#330/#340)",
+          "class": "AUTO_CLI",
+          "apply_cli": "aws lambda update-function-configuration --function-name openclaw-api --environment '<merged env incl DISPATCH_HOST_LAUNCH_CONCURRENCY=30>' --region <region>",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": []
+    },
+    "deploy/stacks/storage.py": {
+      "change": "M",
+      "layer": "D-cdk",
+      "artifact": null,
+      "base_sha256": "103b37ab79467018c12307c681a4c5d379f53d229ed823ac3ef0f76cb6dbdd6e",
+      "patch_sha256": "d192a13303254b24b5b51a2e5e6c53b7b6201a3c37583de892f6af6f5df080e1",
+      "operations": [
+        {
+          "resource": "DynamoDB openclaw-tenant-secrets TTL (#353)",
+          "class": "MANUAL_CLI_REVIEW",
+          "apply_cli": "aws dynamodb update-time-to-live --table-name openclaw-tenant-secrets --time-to-live-specification 'Enabled=false,AttributeName=expires_at' --region <region>",
+          "rollback_policy": "RETAIN"
+        }
+      ],
+      "fix_ids": [
+        "#353"
+      ]
+    },
+    "deploy/userdata/host-agent.py": {
+      "change": "M",
+      "layer": "B-s3",
+      "artifact": "host-scripts/host-agent.py.patched",
+      "base_sha256": "a7daa3ceecdc675dd2116c76195657eca4842789906c8f8037bb33b1ad30e6cd",
+      "patch_sha256": "c59d450daba3a50a1ef1e0b9026e072122361a1b6e565659c2b270ef0cc85339",
+      "operations": [
+        {
+          "resource": "deploy/userdata/host-agent.py (B-s3 code replacement)",
+          "class": "AUTO_CLI",
+          "apply_cli": "scp patched file to live host + s3 cp to deployment/scripts (future); rollback = restore prior S3 version-id + re-scp",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#321"
+      ]
+    },
+    "deploy/userdata/host-agent.service": {
+      "change": "M",
+      "layer": "A-lt",
+      "artifact": "launch-template/host-agent.service.patched",
+      "base_sha256": "66b2d70eca22510b4b3f0dbaa5d72a91d9bf90abb5f493631dceede97b5f4937",
+      "patch_sha256": "88214e096d411635cc256eaf011a9953eb0f3d5f0e0b01bc6ea806a8e0fbb4a4",
+      "operations": [
+        {
+          "resource": "deploy/userdata/host-agent.service (A-lt code replacement)",
+          "class": "AUTO_CLI",
+          "apply_cli": "hot: drop-in/scp to live host; future: LT re-bake + update-asg to new version; rollback = prior LT version",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#323"
+      ]
+    },
+    "deploy/userdata/init-host.sh": {
+      "change": "M",
+      "layer": "A-lt",
+      "artifact": "launch-template/init-host.sh.patched",
+      "base_sha256": "5e8f50c1f26cf6decce5612f8f3241b741c66da9cf0e713aacd66856966690f0",
+      "patch_sha256": "d81adcf566aadc47e83979869834a88d9a7bba3f7e41432689c9cd6d8a0fb1d0",
+      "operations": [
+        {
+          "resource": "deploy/userdata/init-host.sh (A-lt code replacement)",
+          "class": "AUTO_CLI",
+          "apply_cli": "hot: drop-in/scp to live host; future: LT re-bake + update-asg to new version; rollback = prior LT version",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#331",
+        "#345"
+      ]
+    },
+    "deploy/userdata/launch-vm.sh": {
+      "change": "M",
+      "layer": "B-s3",
+      "artifact": "host-scripts/launch-vm.sh.patched",
+      "base_sha256": "f73a601cbbd926060a09977843116005fcfee03fa3a869adbab4e38ab7e66d2d",
+      "patch_sha256": "a1e80333da934676307ad6e40361a166f392940b05e4b234908fbde4bf9c1221",
+      "operations": [
+        {
+          "resource": "deploy/userdata/launch-vm.sh (B-s3 code replacement)",
+          "class": "AUTO_CLI",
+          "apply_cli": "scp patched file to live host + s3 cp to deployment/scripts (future); rollback = restore prior S3 version-id + re-scp",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#331",
+        "#345",
+        "#321"
+      ]
+    },
+    "deploy/userdata/migrate-vm.sh": {
+      "change": "M",
+      "layer": "B-s3",
+      "artifact": "host-scripts/migrate-vm.sh.patched",
+      "base_sha256": "6340f125c57010cdfb3ec6849d1e409aa0d60592b30b8b4bde002317fe63895a",
+      "patch_sha256": "a98ba597e9449a7c0f52ede541620788c0d25f88081f99c6c20f13fa3a13a052",
+      "operations": [
+        {
+          "resource": "deploy/userdata/migrate-vm.sh (B-s3 code replacement)",
+          "class": "AUTO_CLI",
+          "apply_cli": "scp patched file to live host + s3 cp to deployment/scripts (future); rollback = restore prior S3 version-id + re-scp",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": []
+    },
+    "deploy/userdata/oc-guest-log-forwarder.py": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/oc-guest-log-forwarder.py.patched",
+      "base_sha256": null,
+      "patch_sha256": "f64516fdb34e2ede722fdb8d8eea16febff6cdaa6ee2e35aef41fd145a18aa0f",
+      "operations": [
+        {
+          "resource": "deploy/userdata/oc-guest-log-forwarder.py (B-s3 code replacement)",
+          "class": "AUTO_CLI",
+          "apply_cli": "scp patched file to live host + s3 cp to deployment/scripts (future); rollback = restore prior S3 version-id + re-scp",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#345"
+      ]
+    },
+    "deploy/userdata/oc-guest-log-reader.py": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/oc-guest-log-reader.py.patched",
+      "base_sha256": null,
+      "patch_sha256": "004c2464378bb0e490f5acea5d48bd6dc6284efdb88e1417da3db39a0413de03",
+      "operations": [
+        {
+          "resource": "deploy/userdata/oc-guest-log-reader.py (B-s3 code replacement)",
+          "class": "AUTO_CLI",
+          "apply_cli": "scp patched file to live host + s3 cp to deployment/scripts (future); rollback = restore prior S3 version-id + re-scp",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#345"
+      ]
+    },
+    "setup.sh": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": null,
+      "base_sha256": "81c74f4afcad381ca8bc206d7af6a7ef853720ba053ccad46c79bd996a6264a6",
+      "patch_sha256": "f30e79c6a5ba695c4e7035eb34ee5b0da3f61ac38d71d80cb33e4f98e9ab0d52",
+      "operations": [
+        {
+          "resource": "setup.sh (deploy-other code replacement)",
+          "class": "AUTO_CLI",
+          "apply_cli": "code replacement (pool-core); apply per its layer; rollback = restore prior artifact",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/api/copy-file-from-s3-api.md": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "base_sha256": null,
+      "patch_sha256": "27cd26f545b7d5b0076960f2449d9999669fa1bd90400f3218685346406e8701",
+      "operations": [
+        {
+          "resource": "docs/api/copy-file-from-s3-api.md (meta/inert — no apply action)",
+          "class": "AUTO_CLI",
+          "apply_cli": "inert doc/tool, not applied by this patch",
+          "rollback_policy": "RETAIN"
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/api/pull-image-api.md": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "base_sha256": null,
+      "patch_sha256": "7c2dfccbb975d063f4bbaef12f3e05192f039aa12c6aaa81bd1712cc3b02cddc",
+      "operations": [
+        {
+          "resource": "docs/api/pull-image-api.md (meta/inert — no apply action)",
+          "class": "AUTO_CLI",
+          "apply_cli": "inert doc/tool, not applied by this patch",
+          "rollback_policy": "RETAIN"
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/pull-image-flow-333.excalidraw": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "base_sha256": null,
+      "patch_sha256": "a4f5fd87f4c8b48f2e52f4c01e84d3b18a9c300a489fa244256c3533b8b4e0b6",
+      "operations": [
+        {
+          "resource": "docs/pull-image-flow-333.excalidraw (meta/inert — no apply action)",
+          "class": "AUTO_CLI",
+          "apply_cli": "inert doc/tool, not applied by this patch",
+          "rollback_policy": "RETAIN"
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/pull-image-flow-333.png": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "base_sha256": null,
+      "patch_sha256": "a6a9ae2465fa549564db95efe6c54e5b2b82206ae891efb6dccd327be4bccdf1",
+      "operations": [
+        {
+          "resource": "docs/pull-image-flow-333.png (meta/inert — no apply action)",
+          "class": "AUTO_CLI",
+          "apply_cli": "inert doc/tool, not applied by this patch",
+          "rollback_policy": "RETAIN"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/manifest-2026-07-22-2000-98200f9e.json": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "base_sha256": null,
+      "patch_sha256": "a03336767211c5e6cc2b4d58bad0b5780ab3fe2306ffba23ff3ea794c3657c9c",
+      "operations": [
+        {
+          "resource": "patch/manifest-2026-07-22-2000-98200f9e.json (meta/inert — no apply action)",
+          "class": "AUTO_CLI",
+          "apply_cli": "inert doc/tool, not applied by this patch",
+          "rollback_policy": "RETAIN"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/push-marker-2026-07-22-2000-98200f9e.md": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "base_sha256": null,
+      "patch_sha256": "8073dfbd81f9cb4e8b6caa7e23eb662af371697d1211323cd64e119d5240339a",
+      "operations": [
+        {
+          "resource": "patch/push-marker-2026-07-22-2000-98200f9e.md (meta/inert — no apply action)",
+          "class": "AUTO_CLI",
+          "apply_cli": "inert doc/tool, not applied by this patch",
+          "rollback_policy": "RETAIN"
+        }
+      ],
+      "fix_ids": []
+    },
+    "scripts/PREFLIGHT-README.md": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "base_sha256": null,
+      "patch_sha256": "be87484a1d1d1aaf5975343b336063c9553f961bddc71a8d351979259cab1419",
+      "operations": [
+        {
+          "resource": "scripts/PREFLIGHT-README.md (meta/inert — no apply action)",
+          "class": "AUTO_CLI",
+          "apply_cli": "inert doc/tool, not applied by this patch",
+          "rollback_policy": "RETAIN"
+        }
+      ],
+      "fix_ids": []
+    },
+    "scripts/checks/preflight-region.sh": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": null,
+      "base_sha256": null,
+      "patch_sha256": "904ff7b626c5a21afa15e0937e9bf46513bc3792bb07e831579efdf1238334fb",
+      "operations": [
+        {
+          "resource": "scripts/checks/preflight-region.sh (deploy-time preflight tool, not a hotfix)",
+          "class": "AUTO_CLI",
+          "apply_cli": "ship with deploy tooling; not applied to running hosts by this patch",
+          "rollback_policy": "RETAIN"
+        }
+      ],
+      "fix_ids": []
+    },
+    "scripts/preflight-check.sh": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": null,
+      "base_sha256": null,
+      "patch_sha256": "c611387f5879d7c43983a0a97ffdb83256daefb457e047ad10d7a8b516c0c40b",
+      "operations": [
+        {
+          "resource": "scripts/preflight-check.sh (deploy-time preflight tool, not a hotfix)",
+          "class": "AUTO_CLI",
+          "apply_cli": "ship with deploy tooling; not applied to running hosts by this patch",
+          "rollback_policy": "RETAIN"
+        }
+      ],
+      "fix_ids": []
+    }
+  },
+  "fixes": [
+    {
+      "id": "#353",
+      "summary": "remove tenant-secrets DDB TTL; ciphertext persists for tenant life so rebuild/recover reads back the original token",
+      "paths": [
+        "deploy/stacks/storage.py",
+        "deploy/lambda/api/services/tenant_service.py"
+      ],
+      "applies_when": "always (tenant-secrets table exists)",
+      "params_changed": [
+        {
+          "name": "openclaw-tenant-secrets DDB TTL",
+          "layer": "D-cdk",
+          "old_default": "TTL enabled (was 15-min then 30-day; expires_at attribute swept rows)",
+          "new_default": "TTL disabled (ciphertext retained for the tenant lifetime)",
+          "runtime_impact": "must disable TTL on the LIVE table via update-time-to-live (a template edit alone won't disable an already-enabled TTL); Lambda side stops writing expires_at + drops soft-expiry checks + delete_tenant no longer removes the row; recover/rebuild months later reads back the original token instead of an openssl fallback that mismatches; RETAIN — never re-enable (would sweep retained ciphertext = data loss)"
+        }
+      ],
+      "verification_ids": [
+        "v-353-ttl-disabled",
+        "v-353-token-consistency"
+      ]
+    },
+    {
+      "id": "#331",
+      "summary": "per-host cold-start launch concurrency gate (flock slots) so a burst recover doesn't fire hundreds of launch-vm and crush the host",
+      "paths": [
+        "deploy/userdata/launch-vm.sh",
+        "deploy/lambda/api/services/dispatch_service.py",
+        "deploy/lib/dispatch_infra.py",
+        "config.yml.example",
+        "deploy/userdata/init-host.sh"
+      ],
+      "applies_when": "always (all hosts launch VMs)",
+      "params_changed": [
+        {
+          "name": "host_launch_slots / OC_HOST_LAUNCH_SLOTS / DISPATCH_HOST_LAUNCH_CONCURRENCY",
+          "layer": "B-s3",
+          "old_default": "no gate (unbounded concurrent launch-vm; a batch recover crushes the host)",
+          "new_default": "30 (single source; injected to host as OC_HOST_LAUNCH_SLOTS and to Lambda as DISPATCH_HOST_LAUNCH_CONCURRENCY)",
+          "runtime_impact": "host launch-vm queues via flock advisory slots (rate-limit, never drops a tenant); Lambda uses it as the SSM-timeout formula denominator ceil(batch/slots)*per_vm+120; future hosts get it via LT env re-bake; too small slows cold start, too large loses the protection"
+        }
+      ],
+      "verification_ids": [
+        "v-331-burst-no-crush"
+      ]
+    },
+    {
+      "id": "#323",
+      "summary": "host-agent.service KillMode=process so restarting host-agent doesn't cgroup-kill every tenant firecracker on the host",
+      "paths": [
+        "deploy/userdata/host-agent.service"
+      ],
+      "applies_when": "always (every host runs host-agent)",
+      "params_changed": [
+        {
+          "name": "host-agent.service KillMode",
+          "layer": "A-lt",
+          "old_default": "control-group (systemd default — restart SIGTERMs the whole cgroup, killing every tenant VM; #323 real-run killed 30 VMs)",
+          "new_default": "process (only the main host-agent.py is signalled; restart kept 67/68 VMs alive)",
+          "runtime_impact": "running hosts get a systemd drop-in + daemon-reload (do NOT restart host-agent during apply — this restart would still cgroup-kill); future ASG hosts get it via LT re-bake (CDK injects host-agent.service into the LT UserData, ha_edge.py:276 — NOT a golden-image bake); real-run gap: a new host before LT re-bake still boots control-group, so drop-in each new host until the new LT version is live"
+        }
+      ],
+      "verification_ids": [
+        "v-323-killmode-survives"
+      ]
+    },
+    {
+      "id": "#330",
+      "summary": "dispatch capacity ledger gains a memory dimension (CAS on vcpu+mem) to stop oversell/OOM",
+      "paths": [
+        "deploy/lambda/api/services/dispatch_service.py",
+        "deploy/lambda/api/core/dispatch/binpack.py",
+        "deploy/lambda/api/core/dispatch/__init__.py",
+        "deploy/lambda/api/core/clients.py",
+        "deploy/lambda/api/services/dispatch_poller.py",
+        "deploy/lambda/api/core/scheduling.py"
+      ],
+      "applies_when": "dispatch.mode==ddb",
+      "params_changed": [
+        {
+          "name": "MEM_OVERCOMMIT_RATIO / mem-dimension CAS gate",
+          "layer": "C-lambda",
+          "old_default": "no mem gate (capacity CAS on vcpu only; a mem-heavy tenant could OOM the host)",
+          "new_default": "mem CAS gate on total_mem_mb*MEM_OVERCOMMIT_RATIO; a host missing total_mem_mb falls back to allocatable_mem=0 sentinel = vcpu-only gate (never wrongly rejects a whole host on a missing field)",
+          "runtime_impact": "new dispatch invocations only; running tenants untouched; a host DDB item without total_mem_mb keeps the old vcpu-only behavior until it re-registers with the field"
+        }
+      ],
+      "verification_ids": [
+        "v-330-no-oversell"
+      ]
+    },
+    {
+      "id": "#340",
+      "summary": "dispatch soft-gate on host /data free disk so a full-disk host isn't handed new tenants",
+      "paths": [
+        "deploy/lambda/api/services/dispatch_service.py",
+        "deploy/lib/dispatch_infra.py"
+      ],
+      "applies_when": "dispatch.mode==ddb",
+      "params_changed": [
+        {
+          "name": "host /data free-disk soft gate",
+          "layer": "C-lambda",
+          "old_default": "no disk dimension (a full /data host still got new tenants -> mkdir No space -> converge requires_intervention)",
+          "new_default": "soft-gate on reported avail_disk_mb; a host without the field is not rejected (soft, fail-open)",
+          "runtime_impact": "new dispatch only; soft/fail-open so a missing metric never blocks placement, just deprioritizes a full host"
+        }
+      ],
+      "verification_ids": [
+        "v-340-disk-gate"
+      ]
+    },
+    {
+      "id": "#345",
+      "summary": "guest log forwarding over vsock: guest tails logs -> local vsock (zero-credential) -> host reader -> Fluent Bit",
+      "paths": [
+        "deploy/userdata/oc-guest-log-forwarder.py",
+        "deploy/userdata/oc-guest-log-reader.py",
+        "deploy/userdata/launch-vm.sh",
+        "deploy/userdata/init-host.sh",
+        "build-rootfs.sh",
+        "deploy/edge/fluent-bit/host/extract_tenant_id.lua",
+        "deploy/edge/fluent-bit/host/fluent-bit.conf",
+        "deploy/edge/fluent-bit/host/parsers.conf"
+      ],
+      "applies_when": "logging.enabled==true",
+      "params_changed": [
+        {
+          "name": "OC_GUEST_LOG_ENABLED (guest-log vsock collection)",
+          "layer": "B-s3",
+          "old_default": "no guest-log collection",
+          "new_default": "enabled by default (OC_GUEST_LOG_ENABLED=true); launch-vm PUTs the vsock before InstanceStart",
+          "runtime_impact": "TWO-PART. Host side (reader oc-guest-log-reader.py + launch-vm vsock PUT + init-host reader unit) = B-s3/A-lt, HOT-APPLYABLE, apply first — safe because a guest without the forwarder just yields no logs (reader listens, forwarder connect-fail drops lines, never blocks the tenant). Guest side (oc-guest-log-forwarder.py + build-rootfs bake) lives in the read-only golden rootfs layer (not the per-VM data disk); to reach running tenants: bake a NEW rootfs with the forwarder, upload to S3, host pull-image swaps openclaw-rootfs.ext4, then rebuild existing tenants (swaps the rootfs layer, PRESERVES the data disk). The new rootfs is NOT baked yet — APPLY carries 'bake+upload rootfs' as an explicit prerequisite step before the guest side takes effect."
+        }
+      ],
+      "verification_ids": [
+        "v-345-host-reader",
+        "v-345-guest-forwarder"
+      ]
+    },
+    {
+      "id": "#321",
+      "summary": "host disk leak: delete-tenant now removes the VM dir (overlay/data disks) so orphans don't fill /data",
+      "paths": [
+        "deploy/userdata/launch-vm.sh",
+        "deploy/userdata/host-agent.py"
+      ],
+      "applies_when": "always",
+      "params_changed": [],
+      "verification_ids": [
+        "v-321-no-orphan-dir"
+      ]
+    },
+    {
+      "id": "#336",
+      "summary": "copy-file-from-s3 contract: owner ubuntu:ubuntu + mode 755 + atomic write + status return",
+      "paths": [
+        "deploy/lambda/api/handler.py",
+        "deploy/lambda/api/services/host_service.py"
+      ],
+      "applies_when": "always",
+      "params_changed": [],
+      "verification_ids": [
+        "v-336-copyfile-contract"
+      ]
+    },
+    {
+      "id": "#343",
+      "summary": "pull-image writes host.rootfs_version after success so scaler/rebuild don't misjudge/mis-report drift",
+      "paths": [
+        "deploy/lambda/api/services/host_service.py"
+      ],
+      "applies_when": "always",
+      "params_changed": [],
+      "verification_ids": [
+        "v-343-rootfs-version-synced"
+      ]
+    },
+    {
+      "id": "#338",
+      "summary": "pull-image progress streamed to Fluent Bit -> OpenSearch",
+      "paths": [
+        "deploy/lambda/api/services/host_service.py",
+        "deploy/edge/fluent-bit/host/fluent-bit.conf",
+        "deploy/edge/fluent-bit/host/parsers.conf",
+        "deploy/edge/fluent-bit/host/extract_tenant_id.lua"
+      ],
+      "applies_when": "logging.enabled==true",
+      "params_changed": [],
+      "verification_ids": [
+        "v-338-pull-progress-visible"
+      ]
+    }
+  ],
+  "verifications": [
+    {
+      "id": "v-353-ttl-disabled",
+      "fix_id": "#353",
+      "phase": "A-readonly",
+      "action": "aws dynamodb describe-time-to-live --table-name openclaw-tenant-secrets",
+      "observable": "TimeToLiveStatus",
+      "pass_when": "DISABLED",
+      "fail_when": "ENABLED or ENABLING",
+      "timeout_s": 30,
+      "cleanup": "none (read-only)"
+    },
+    {
+      "id": "v-353-token-consistency",
+      "fix_id": "#353",
+      "phase": "B-lifecycle",
+      "action": "create tenant -> rebuild -> get-credentials; KMS-decrypt the openclaw-tenant-secrets row vs guest openclaw.json .gateway.auth.token",
+      "observable": "token equality after rebuild",
+      "pass_when": "decrypted token == guest token (no openssl fallback)",
+      "fail_when": "token mismatch / row missing after rebuild",
+      "timeout_s": 600,
+      "cleanup": "DELETE the exact id ?keep_data=false"
+    },
+    {
+      "id": "v-331-burst-no-crush",
+      "fix_id": "#331",
+      "phase": "B-lifecycle",
+      "action": "burst-create N tenants ~10/s on one host; watch host CPU/load + launch-vm flock queue",
+      "observable": "openclaw-tenants status + host load",
+      "pass_when": "all reach running (queued, rate-limited), host not crushed, 0 stuck creating",
+      "fail_when": "any stuck creating past boot window OR host load runaway",
+      "timeout_s": 900,
+      "cleanup": "DELETE each exact id ?keep_data=false"
+    },
+    {
+      "id": "v-323-killmode-survives",
+      "fix_id": "#323",
+      "phase": "B-lifecycle",
+      "action": "on a host with running tenant VMs, systemctl restart host-agent; count surviving firecracker procs (pgrep)",
+      "observable": "firecracker process count before vs after restart",
+      "pass_when": "tenant VMs survive the host-agent restart (count unchanged)",
+      "fail_when": "restart kills tenant VMs (count drops)",
+      "timeout_s": 120,
+      "cleanup": "none"
+    },
+    {
+      "id": "v-330-no-oversell",
+      "fix_id": "#330",
+      "phase": "B-lifecycle",
+      "action": "burst-create until a host is near capacity; check ledger vs physical",
+      "observable": "used_vcpu/used_mem_mb vs cap on openclaw-hosts",
+      "pass_when": "used_vcpu<=cap AND used_mem_mb<=mem cap; no OOM",
+      "fail_when": "used>cap (oversell) or host OOM",
+      "timeout_s": 900,
+      "cleanup": "DELETE each exact id ?keep_data=false"
+    },
+    {
+      "id": "v-340-disk-gate",
+      "fix_id": "#340",
+      "phase": "A-readonly",
+      "action": "inspect dispatch placement when a host reports low avail_disk_mb",
+      "observable": "dispatch host selection",
+      "pass_when": "a near-full host is deprioritized, not handed new tenants",
+      "fail_when": "full-disk host still selected -> mkdir No space",
+      "timeout_s": 60,
+      "cleanup": "none"
+    },
+    {
+      "id": "v-345-host-reader",
+      "fix_id": "#345",
+      "phase": "B-lifecycle",
+      "action": "on a hot-fixed host, launch a tenant with OC_GUEST_LOG_ENABLED=true; check oc-guest-log-reader.service active + per-VM oc-guest.log created",
+      "observable": "reader unit state + oc-guest.log presence",
+      "pass_when": "reader active; per-VM log file appears when a guest with forwarder connects",
+      "fail_when": "reader fails to start / vsock bind error",
+      "timeout_s": 300,
+      "cleanup": "DELETE the exact id ?keep_data=false"
+    },
+    {
+      "id": "v-345-guest-forwarder",
+      "fix_id": "#345",
+      "phase": "B-optional",
+      "action": "after baking+pull-image the new rootfs and rebuilding a tenant, check guest openclaw-log-forwarder.service and end-to-end log arrival in OpenSearch",
+      "observable": "guest forwarder unit + OpenSearch log docs",
+      "pass_when": "rebuilt tenant's guest logs reach OpenSearch",
+      "fail_when": "no guest logs after rootfs swap+rebuild",
+      "timeout_s": 900,
+      "cleanup": "DELETE the exact id ?keep_data=false"
+    },
+    {
+      "id": "v-321-no-orphan-dir",
+      "fix_id": "#321",
+      "phase": "B-lifecycle",
+      "action": "create then DELETE ?keep_data=false a tenant; SSM-check /data/firecracker-vms/<id> is gone",
+      "observable": "VM dir presence on host",
+      "pass_when": "dir removed, no orphan overlay/data",
+      "fail_when": "dir/overlay left behind",
+      "timeout_s": 300,
+      "cleanup": "none (delete IS the test)"
+    },
+    {
+      "id": "v-336-copyfile-contract",
+      "fix_id": "#336",
+      "phase": "A-readonly",
+      "action": "call copy-file-from-s3 for a known object; check owner/mode/atomicity + status return",
+      "observable": "copied file owner:mode + API status",
+      "pass_when": "owner ubuntu:ubuntu, mode 755, status returned",
+      "fail_when": "wrong owner/mode or partial write or no status",
+      "timeout_s": 120,
+      "cleanup": "remove the copied test file"
+    },
+    {
+      "id": "v-343-rootfs-version-synced",
+      "fix_id": "#343",
+      "phase": "A-readonly",
+      "action": "after a pull-image on a host, read host.rootfs_version on openclaw-hosts",
+      "observable": "host.rootfs_version field",
+      "pass_when": "matches the pulled image version",
+      "fail_when": "stale/absent (scaler would misjudge drift)",
+      "timeout_s": 60,
+      "cleanup": "none"
+    },
+    {
+      "id": "v-338-pull-progress-visible",
+      "fix_id": "#338",
+      "phase": "A-readonly",
+      "action": "trigger a pull-image; query OpenSearch for the progress log lines",
+      "observable": "pull-image progress docs in OpenSearch",
+      "pass_when": "progress lines visible",
+      "fail_when": "no progress docs",
+      "timeout_s": 300,
+      "cleanup": "none"
+    }
+  ]
+}

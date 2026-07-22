@@ -206,3 +206,35 @@ class TestNewEndpointsWired:
             "refresh() must call loadSystemInfo() so all tabs see "
             "systemInfo (multi_az flag, fleet-by-AZ, etc.)"
         )
+
+
+# ═════════════════════════════════════════════
+# Logs / Activity tab (issue #71)
+# ═════════════════════════════════════════════
+
+
+@pytest.mark.unit
+class TestLogsTabWired:
+    def test_audit_log_route_in_handler(self, handler):
+        assert hasattr(handler, "_list_audit_log")
+        # GET /audit-log must be viewer-readable.
+        assert ("GET", "/audit-log") in handler._VIEWER_OK
+
+    def test_console_calls_audit_log(self):
+        assert re.search(r"this\.api\(['\"]GET['\"],\s*['\"]audit-log", INDEX_HTML), (
+            "Logs tab must call GET /audit-log")
+
+    def test_console_supports_before_cursor(self):
+        # Pagination cursor must be wired for "load older".
+        assert "before=" in INDEX_HTML, "Logs tab missing the `before` pagination cursor"
+
+    def test_handler_supports_before_param(self, handler):
+        import inspect
+        src = inspect.getsource(handler._list_audit_log)
+        assert "before" in src, "_list_audit_log must honor the `before` cursor param"
+
+    def test_audit_write_records_enriched_fields(self, handler):
+        import inspect
+        src = inspect.getsource(handler._audit_write)
+        for field in ('"event"', '"object"', '"actor"'):
+            assert field in src, f"_audit_write must record {field}"

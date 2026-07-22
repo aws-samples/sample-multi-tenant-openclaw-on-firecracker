@@ -77,6 +77,7 @@ input { font-family: inherit; }
 .badge-stopped { border: 1px solid var(--red, #f44); color: var(--red, #f44); }
 .badge-paused { border: 1px solid var(--yellow, #fa0); color: var(--yellow, #fa0); }
 .badge-draining { border: 1px solid var(--gray); color: var(--gray); }
+.badge-warn { border: 1px solid var(--yellow, #fa0); color: var(--yellow, #fa0); }
 .badge-count { font-size: 9px; padding: 1px 6px; border: 1px solid var(--cyan-dim); color: var(--cyan-dim); font-weight: 400; }
 .backup-toggle { color: var(--cyan-dim); transition: transform .15s; font-size: 14px; }
 .backup-toggle:hover { color: var(--cyan); }

@@ -54,6 +54,7 @@
 <script src="js/app.skills.js"></script>
 <script src="js/app.groups.js"></script>
 <script src="js/app.monitoring.js"></script>
+<script src="js/app.logs.js"></script>
 <script src="js/app.format.js"></script>
 <script src="js/app.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.9/dist/cdn.min.js" integrity="sha384-9Ax3MmS9AClxJyd5/zafcXXjxmwFhZCdsT6HJoJjarvCaAkJlk5QDzjLJm+Wdx5F" crossorigin="anonymous"></script>
@@ -99,6 +100,7 @@
   <button class="nav-tab" :class="page==='app' && 'active'" @click="page='app'; loadAgentCoreTools()">Agent Config</button>
   <button class="nav-tab" :class="page==='monitoring' && 'active'" @click="page='monitoring'; loadSystemInfo()">Monitoring</button>
   <button class="nav-tab" :class="page==='backups' && 'active'" @click="page='backups'; loadBackups()">Backups</button>
+  <button class="nav-tab" :class="page==='logs' && 'active'" @click="page='logs'; loadAuditLog()">Logs</button>
   <button class="nav-tab" :class="page==='settings' && 'active'" @click="page='settings'; loadSystemInfo()">Settings</button>
 </div>
 
@@ -696,6 +698,60 @@
     Backups are retained for 7 days (S3 lifecycle). Orphan backups are from tenants that have been deleted —
     restoring creates a new tenant with the backup's data volume.
   </p>
+</div>
+
+<!-- Page: Logs / Activity (issue #71) -->
+<div x-show="page==='logs'" class="page-content">
+  <h2>Activity Logs</h2>
+  <div class="panel-header">
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <label style="font-size:12px;color:var(--gray)">Object</label>
+      <select class="settings-input" x-model="logFilterObject" style="width:130px">
+        <option value="all">All</option>
+        <option value="tenant">Tenant</option>
+        <option value="host">Host</option>
+        <option value="group">Group</option>
+        <option value="skill">Skill</option>
+        <option value="template">Template</option>
+      </select>
+      <input class="settings-input" type="text" x-model="logFilterText" placeholder="filter operation / actor" style="width:220px">
+      <span style="font-size:12px;color:var(--gray)" x-text="filteredAuditEntries.length + ' shown'"></span>
+    </div>
+    <button class="btn btn-outline btn-sm" @click="loadAuditLog()" :disabled="loadingAudit">
+      Refresh <span :class="loadingAudit && 'spin'"><svg class="icon s13"><use href="#i-refresh"/></svg></span>
+    </button>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Time</th><th>Object</th><th>Operation</th><th>Actor</th><th>Result</th></tr>
+      </thead>
+      <tbody>
+        <template x-if="filteredAuditEntries.length === 0 && !loadingAudit">
+          <tr><td colspan="5" class="empty"
+            x-text="auditEntries.length === 0 ? 'No audit entries — the audit log may be disabled on this deployment, or no operations have been recorded yet.' : 'No entries match the current filter'"></td></tr>
+        </template>
+        <template x-for="row in filteredAuditEntries" :key="row.id || (row.ts + row.operation)">
+          <tr>
+            <td x-text="formatTs(row.ts)"></td>
+            <td x-text="logObject(row)"></td>
+            <td x-text="logOperation(row)"></td>
+            <td x-text="logActor(row)"></td>
+            <td><span class="badge" :class="logResultClass(row)" x-text="logResult(row)"></span></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+  <div style="display:flex;align-items:center;gap:12px;margin-top:12px">
+    <button class="btn btn-outline btn-sm" @click="loadMoreAuditLog()"
+            x-show="!logsExhausted && auditEntries.length > 0" :disabled="loadingAudit">
+      Load older
+    </button>
+    <span style="color:var(--gray);font-size:12px"
+          x-show="logsExhausted && auditEntries.length > 0">— end of log —</span>
+    <span style="color:var(--gray);font-size:12px">Retained 90 days (DynamoDB TTL). Viewable by viewer+.</span>
+  </div>
 </div>
 
 <!-- Page: Settings -->

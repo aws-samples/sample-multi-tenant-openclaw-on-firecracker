@@ -204,10 +204,12 @@ def cmd_batch(args):
 
 
 def cmd_audit_log(args):
-    """GET /audit-log?since=...&limit=... — query the API audit trail."""
+    """GET /audit-log?since=...&before=...&limit=... — query the API audit trail."""
     params = []
     if args.since:
         params.append(f"since={urllib.parse.quote(args.since)}")
+    if getattr(args, "before", None):
+        params.append(f"before={urllib.parse.quote(args.before)}")
     if args.limit:
         params.append(f"limit={args.limit}")
     qs = ("?" + "&".join(params)) if params else ""
@@ -290,6 +292,7 @@ def _build_parser():
 
     al = sub.add_parser("audit-log", help="Query API audit log (mutating ops only)")
     al.add_argument("--since", help="ISO 8601 timestamp, e.g. 2026-05-01T00:00:00Z")
+    al.add_argument("--before", help="ISO 8601 cursor — only entries older than this (paging)")
     al.add_argument("--limit", type=int, help="max entries to return (default 50, max 500)")
     al.set_defaults(func=cmd_audit_log)
 

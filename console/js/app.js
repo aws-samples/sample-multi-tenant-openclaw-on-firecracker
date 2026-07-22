@@ -25,6 +25,7 @@ function app() {
     window.ocSkills,
     window.ocGroups,
     window.ocMonitoring,
+    window.ocLogs,
     window.ocFormat,
   );
 }

@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT-0
 
 import os
+import json
+import uuid
 import boto3
 from datetime import datetime, timezone
 
@@ -10,9 +12,41 @@ autoscaling = boto3.client("autoscaling")
 ssm = boto3.client("ssm")
 hosts_table = ddb.Table(os.environ["HOSTS_TABLE"])
 tenants_table = ddb.Table(os.environ["TENANTS_TABLE"]) if os.environ.get("TENANTS_TABLE") else None
+# Issue #71 — optional audit table; absent in legacy deployments (no-op).
+audit_table = ddb.Table(os.environ["AUDIT_TABLE"]) if os.environ.get("AUDIT_TABLE") else None
+AUDIT_TTL_DAYS = int(os.environ.get("AUDIT_TTL_DAYS", "90"))
 
 ASG_NAME = os.environ["ASG_NAME"]
 IDLE_TIMEOUT = int(os.environ["IDLE_TIMEOUT_MINUTES"])
+
+
+def _audit(event_name, obj, resource_id, actor, detail=None):
+    """Best-effort audit row for the scaler's automated actions (issue #71).
+    Same schema as the API/health_check audit writers so they render in one
+    console Logs table. Never raises."""
+    if audit_table is None:
+        return
+    try:
+        ts = datetime.now(timezone.utc)
+        item = {
+            "pk": "audit",
+            "id": str(uuid.uuid4()),
+            "ts": ts.isoformat(),
+            "operation": event_name,
+            "resource_id": resource_id or "",
+            "api_key_id": actor,
+            "response_status": 200,
+            "expires_ttl": int(ts.timestamp()) + AUDIT_TTL_DAYS * 86400,
+            "event": event_name,
+            "object": obj,
+            "actor": actor,
+            "actor_role": "system",
+        }
+        if detail is not None:
+            item["detail"] = json.dumps(detail, default=str)[:1000]
+        audit_table.put_item(Item=item)
+    except Exception as e:
+        print(f"scaler audit failed (non-fatal): {e}")
 
 # Issue #15 — terminal statuses where TTL processing is a no-op
 _TTL_TERMINAL = {"stopped", "deleted", "failed"}
@@ -64,6 +98,8 @@ def lambda_handler(event, context):
                         InstanceId=instance_id,
                         ShouldDecrementDesiredCapacity=True,
                     )
+                    _audit("host.scale_in", f"host:{instance_id}", instance_id,
+                           "system:scaler", {"reason": "idle"})
                 except Exception as e:
                     print(f"terminate failed: {e}")
             else:
@@ -115,9 +151,13 @@ def _process_ttl_expirations():
                 except Exception as e:
                     print(f"ttl stop SSM failed for {tid}: {e}")
             _update_tenant_status(tid, "stopped")
+            _audit("tenant.stopped", f"tenant:{tid}", tid, "system:ttl-expiry",
+                   {"expires_at": t.get("expires_at")})
             print(f"ttl: stopped {tid} (expired at {t['expires_at']})")
         elif action == "delete":
             _update_tenant_status(tid, "deleted")
+            _audit("tenant.deleted", f"tenant:{tid}", tid, "system:ttl-expiry",
+                   {"expires_at": t.get("expires_at")})
             print(f"ttl: deleted {tid} (expired at {t['expires_at']})")
 
 
@@ -231,6 +271,7 @@ def _reconcile_schedules():
                 ExpressionAttributeNames={"#s": "status"},
                 ExpressionAttributeValues={":s": "running"},
             )
+            _audit("tenant.started", f"tenant:{tid}", tid, "system:schedule")
         elif (not should_run) and status == "running":
             vm_num = int(it.get("vm_num", 1))
             ssm.send_command(
@@ -246,3 +287,4 @@ def _reconcile_schedules():
                 ExpressionAttributeNames={"#s": "status"},
                 ExpressionAttributeValues={":s": "stopped"},
             )
+            _audit("tenant.stopped", f"tenant:{tid}", tid, "system:schedule")

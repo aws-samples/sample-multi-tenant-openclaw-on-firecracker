@@ -113,3 +113,42 @@ class TestScalerTwoRound:
         sc.hosts_table.scan.return_value = {"Items": []}  # scan filters deleted
         sc.lambda_handler({}, None)
         sc.hosts_table.update_item.assert_not_called()
+
+
+# ═══════════════════════════════════════════
+# Issue #71 — scaler audits its automated actions
+# ═══════════════════════════════════════════
+
+
+class TestScalerAudit:
+    def setup_method(self):
+        sc.hosts_table = make_ddb_table()
+        sc.hosts_table.scan.return_value = {"Items": []}
+        sc.tenants_table = make_ddb_table()
+        sc.audit_table = make_ddb_table()
+
+    @pytest.mark.unit
+    def test_ttl_stop_writes_audit(self):
+        sc.tenants_table.scan.return_value = {"Items": [{
+            "id": "tt-1", "status": "running", "on_expiry": "stop",
+            "host_id": "i-1", "vm_num": 1,
+            "expires_at": _ago(60),  # already expired
+        }]}
+        sc.ssm = MagicMock()
+        sc.lambda_handler({}, None)
+        assert sc.audit_table.put_item.called
+        item = sc.audit_table.put_item.call_args[1]["Item"]
+        assert item["event"] == "tenant.stopped"
+        assert item["object"] == "tenant:tt-1"
+        assert item["actor"] == "system:ttl-expiry"
+        assert item["actor_role"] == "system"
+
+    @pytest.mark.unit
+    def test_no_audit_when_table_absent(self):
+        # Legacy deployment without AUDIT_TABLE → _audit is a no-op, no crash.
+        sc.audit_table = None
+        sc.tenants_table.scan.return_value = {"Items": [{
+            "id": "tt-2", "status": "running", "on_expiry": "delete",
+            "expires_at": _ago(60),
+        }]}
+        sc.lambda_handler({}, None)  # must not raise

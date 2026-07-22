@@ -485,7 +485,7 @@ All requests require the `x-api-key` header.
 | `GET` | `/hosts/rootfs-version` | Query current rootfs version. |
 | `GET` | `/agentcore/status` | AgentCore enable status + Gateway URL. |
 | `GET` | `/agentcore/tools` | List MCP tools registered with Gateway. |
-| `GET` | `/audit-log` | Query audit log. `?since=<ISO8601>&limit=<n>` — 90-day TTL. |
+| `GET` | `/audit-log` | Query audit log. `?since=<ISO8601>&before=<ISO8601>&limit=<n>` — 90-day TTL. Rows carry `event` (e.g. `tenant.created`), typed `object` (`tenant:<id>`), `actor` (Cognito principal or `system:<source>`) + `actor_role`. Surfaced in the Console **Logs** tab. |
 | `GET` | `/skills` | List shared skills (S3-managed). `?tenant=<id>` filters to that tenant's effective set. |
 | `GET` · `PUT` · `DELETE` | `/skills/{name}` | CRUD on individual SKILL.md (1.4.1). PUT body: `{"content":"<markdown>"}`. |
 | `GET` · `POST` | `/groups` | List / create skill groups (1.4.0). |

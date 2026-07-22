@@ -1,0 +1,46 @@
+# `patch/` — apply-by-reading hotfix kits (no CDK / CloudFormation redeploy)
+
+## Getting started
+
+1. **Clone the gateway branch** (this branch has the kits):
+   `git clone --branch gateway --single-branch <this-repo-url> && cd sample-multi-tenant-openclaw-on-firecracker`
+2. **Open Claude Code** in that directory (with credentials for the TARGET environment).
+3. **Switch to max reasoning: `/effort xhigh`** — applying a patch to production is high-stakes;
+   run at the highest reasoning effort so nothing is skimmed.
+4. **Paste the executor prompt below** (fill in `<id>`, e.g. `353-secret-ttl-plus-post315-rollup`).
+
+> **Executor prompt (copy verbatim, fill `<id>`):**
+> _"Start applying the OpenClaw patch kit `patch/<id>/`. First read `manifest.json` and
+> `APPLY-INSTRUCTIONS.md` fully, then execute it top to bottom. This is a PRODUCTION environment,
+> so: before touching any file or resource, BACK IT UP (record the live host script / S3
+> object-version / Lambda code + config / DDB item, so every step is reversible). Run Step 0
+> probes first and fill in the real values; verify each artifact's SHA-256 == manifest
+> `patch_sha256` before use; treat EVERY side-effecting command as a confirmation gate — show it,
+> back up, wait for my OK, apply, then verify. Hot-fix running hosts before future-machine
+> sources. NEVER run `cdk deploy` / `setup.sh` / any CloudFormation redeploy — use the manual CLI
+> the kit gives. If `status != READY`, stop and surface the manual-review ops first. Run every
+> falsifiable verification in the manifest before any teardown, and never delete with a wildcard —
+> only the exact ids you created."_
+
+Each `patch/<id>/` fixes a **live** deployment in place (it was CDK-provisioned once then
+hand-modified — a redeploy would wipe that). Two files are all you read:
+
+- **`manifest.json`** — source of truth: `base_sha`/`patch_sha` (range), `status`
+  (`READY`/`MANUAL_REVIEW`/`BLOCKED`), each file's `patch_sha256`, `fixes[]`
+  (+ `params_changed`), `verifications[]` (a falsifiable check per fix).
+- **`APPLY-INSTRUCTIONS.md`** — the one apply doc, fixed order: probe → hash-verify →
+  hot-fix running hosts → future-machine source (S3 + Launch Template) → stack changes as
+  manual CLI → verify every fix → precise teardown.
+
+**How:** pick the kit matching what's already applied → verify each artifact's SHA-256 ==
+`patch_sha256` → follow the doc, approving each gated command → if `status != READY`, clear
+the listed manual ops first. A kit's `lib/` (when present) holds deterministic tooling
+(e.g. `apply-lt.sh` for a MIP-safe Launch-Template roll — never hand-wrangle base64).
+
+**Chain (apply in order, each rolls up the prior):** `266` → `311` → `315` (ran on real prod —
+the reference shape) → `353` (latest).
+
+**Root `manifest-*.json` / `push-marker-*.md`** are publish-sync audit logs, not kits — not applied.
+
+**Iron rule:** never `cdk deploy` / `setup.sh` / any CloudFormation redeploy — every stack change
+has a manual CLI path in the kit.

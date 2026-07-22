@@ -137,6 +137,21 @@ fi
 EXISTING_POOL=$(aws cloudformation describe-stacks --stack-name OpenClawOrchestrator \
   --query 'Stacks[0].Outputs[?OutputKey==`CognitoUserPoolId`].OutputValue' \
   --output text --profile "$PROFILE" --region "$REGION" 2>/dev/null || true)
+# 1.5.8: skip the carry-forward when the pool is ALREADY a stack-owned resource
+# (the ≥1.2.x "new pool" branch, stable logical id + RETAIN). Injecting
+# user_pool_id then flips the stack to the import branch, which tries to
+# re-create the `openclaw-console` UserPoolDomain that CFN already owns —
+# Cognito allows one domain per pool → deploy fails with AlreadyExists and
+# rolls back (see CHANGELOG 1.5.0 "config.yml had two console_auth blocks").
+if [ -n "${EXISTING_POOL:-}" ] && [ "$EXISTING_POOL" != "None" ]; then
+  STACK_OWNED_POOL=$(aws cloudformation list-stack-resources --stack-name OpenClawOrchestrator \
+    --query "StackResourceSummaries[?ResourceType=='AWS::Cognito::UserPool' && PhysicalResourceId=='${EXISTING_POOL}'] | [0].LogicalResourceId" \
+    --output text --profile "$PROFILE" --region "$REGION" 2>/dev/null || true)
+  if [ -n "${STACK_OWNED_POOL:-}" ] && [ "$STACK_OWNED_POOL" != "None" ]; then
+    echo "✓ Cognito pool ${EXISTING_POOL} is stack-owned (${STACK_OWNED_POOL}) — not importing (user_pool_id stays unset)"
+    EXISTING_POOL=""
+  fi
+fi
 if [ -n "${EXISTING_POOL:-}" ] && [ "$EXISTING_POOL" != "None" ]; then
   POOL="$EXISTING_POOL" python3 - <<'PYEOF'
 import os, re, pathlib

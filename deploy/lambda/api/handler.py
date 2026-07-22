@@ -1826,10 +1826,15 @@ def _reserve_host_slot(host, vcpu, mem_mb):
     instance_id = host["instance_id"]
     allocatable_vcpu = int(int(host["total_vcpu"]) * CPU_OVERCOMMIT_RATIO)
     allocatable_mem = int(int(host["total_mem_mb"]) * MEM_OVERCOMMIT_RATIO)
-    cond = ("used_vcpu + :v <= :cap_v AND used_mem_mb + :m <= :cap_m")
+    # DynamoDB ConditionExpression does NOT support arithmetic ("used_vcpu +
+    # :v" is a ValidationException — caught in live verification, not by the
+    # mocked unit tests). Compute the ceiling client-side instead: booking
+    # `vcpu` more is allowed iff used_vcpu <= allocatable - vcpu.
+    cond = ("used_vcpu <= :max_used_v AND used_mem_mb <= :max_used_m")
     values = {
         ":v": vcpu, ":m": mem_mb, ":one": 1,
-        ":cap_v": allocatable_vcpu, ":cap_m": allocatable_mem,
+        ":max_used_v": allocatable_vcpu - vcpu,
+        ":max_used_m": allocatable_mem - mem_mb,
     }
     if MAX_VMS_PER_HOST:
         cond += " AND vm_count < :maxvm"

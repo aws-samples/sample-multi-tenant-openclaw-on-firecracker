@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.5.8] — live-verified follow-ups (post-release)
+
+Deployed 1.5.8 to the live ap-northeast-1 stack and ran the REAL e2e suite (not just the offline/mocked one). The live run caught two defects the mocked tests could not, plus one deploy-path regression:
+
+### Fixed (found only by live verification)
+
+- **`_reserve_host_slot` used arithmetic in a DynamoDB ConditionExpression** (`used_vcpu + :v <= :cap_v`) — DynamoDB does not support arithmetic there; every real `POST /tenants` failed with `ValidationException` (500). The mocked unit tests accepted the invalid syntax silently. The capacity ceiling is now precomputed client-side (`used_vcpu <= allocatable - requested`); a new regression test statically rejects arithmetic in the expression.
+- **`setup.sh` pool carry-forward re-broke the deploy** (the CHANGELOG-1.5.0 `openclaw-console` `AlreadyExists` gotcha, re-triggered): it injected `user_pool_id` from the stack *output* even when the pool is a stack-OWNED resource, flipping the stack to the import branch which re-creates the domain CFN already owns → `UPDATE_ROLLBACK`. `setup.sh` now checks `list-stack-resources` and skips the injection when the pool is stack-owned.
+- **e2e write-path tests can now authenticate**: `_api()` attaches `Authorization: Bearer $OC_E2E_ID_TOKEN` when set, so RBAC-enabled deployments exercise the write paths for real instead of skipping on 403.
+
+### Verified live (ap-northeast-1, 2-host fleet, RBAC_ENABLED=true)
+
+- **Full e2e suite: 16/16 passed** (`OPENCLAW_E2E=1 OC_E2E_ID_TOKEN=… pytest tests/test_e2e.py -m e2e`) — tenant lifecycle (create→get→delete), backup→restore roundtrip on real Firecracker microVMs, restore-validation 404/400, API connectivity, regression set.
+- **#77 spread**: two consecutive creates landed on **different hosts** (first on the empty 1d host, second on 1a) — least-loaded placement working against real DynamoDB.
+- **#72 balloon guard**: live `POST /tenants/{id}/migrate` with `BALLOON_ENABLED=true` → immediate `409 {"reason":"balloon_enabled"}`, no SSM fired.
+- **#71 audit**: live rows carry `event`/`object`/`actor` — `tenant.created | tenant:… | e2e-operator@openclaw.local` (real Cognito principal, not the shared key); `?before=` cursor returns strictly-older rows; Console `index.html` + `app.logs.js` served from CloudFront with the Logs tab wired; `GET /audit-log` readable by api-key-only viewer.
+- **RBAC** (`scripts/e2e-rbac-test.sh`): 5/5 — no-token write→403 / read→200, forged-RS256 admin→403, alg:none→403.
+
 ## [1.5.8]
 
 Closes the remaining open issues: scheduler spread + concurrency-safe provisioning (#77), a clear balloon-migration failure path (#72), an operations audit trail with a Console Logs tab (#71), and a hermetic test suite (#80).

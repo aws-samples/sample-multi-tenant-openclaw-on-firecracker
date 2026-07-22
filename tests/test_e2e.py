@@ -50,10 +50,18 @@ def _api(method, path, body=None, timeout=30, max_retries=3):
     import time
     url = f"{API_URL}/{path.lstrip('/')}"
     data = json.dumps(body).encode() if body else None
-    req = urllib.request.Request(url, data=data, method=method, headers={
+    headers = {
         "x-api-key": API_KEY,
         "Content-Type": "application/json",
-    })
+    }
+    # 1.5.8: RBAC-enabled deployments downgrade API-key-only requests to
+    # `viewer`, which 403s every write-path e2e test. Operators can supply a
+    # verified Cognito id_token (e.g. from admin-initiate-auth) so the write
+    # tests actually exercise the live API instead of skipping.
+    id_token = os.environ.get("OC_E2E_ID_TOKEN", "")
+    if id_token:
+        headers["Authorization"] = f"Bearer {id_token}"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
     last_err = None
     for attempt in range(max_retries):
         try:

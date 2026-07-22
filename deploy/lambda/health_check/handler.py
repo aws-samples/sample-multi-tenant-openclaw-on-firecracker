@@ -157,6 +157,46 @@ def lambda_handler(event, context):
 MIGRATION_WATCHDOG_MINUTES = int(os.environ.get("MIGRATION_WATCHDOG_MINUTES", "15"))
 
 
+def _bump_target_counters(target_host_id, target_vm_num, vcpu, mem_mb):
+    """Book a migrated/failed-over VM onto the target host's counters.
+
+    Issue #77 follow-up: the old inline code did `SET next_vm_num = :n` with an
+    absolute value computed from a STALE read taken when the move started. If a
+    concurrent tenant create had already advanced next_vm_num past that value,
+    the write would rewind it and a future create could hand out a duplicate
+    vm_num (→ duplicate guest_ip / host_port). Split the write:
+      1. counters (vm_count / used_vcpu / used_mem_mb) — plain atomic adds;
+      2. next_vm_num — raised to target_vm_num+1 ONLY if that moves it forward
+         (ConditionExpression), otherwise left alone.
+    Best-effort like before: failures are logged, never raised.
+    """
+    try:
+        hosts_table.update_item(
+            Key={"instance_id": target_host_id},
+            UpdateExpression=("SET vm_count = if_not_exists(vm_count, :z) + :one, "
+                              "used_vcpu = if_not_exists(used_vcpu, :z) + :v, "
+                              "used_mem_mb = if_not_exists(used_mem_mb, :z) + :m"),
+            ExpressionAttributeValues={":one": 1, ":v": vcpu, ":m": mem_mb, ":z": 0},
+        )
+    except Exception as e:
+        print(f"target counter inc failed (non-fatal): {e}")
+    try:
+        hosts_table.update_item(
+            Key={"instance_id": target_host_id},
+            UpdateExpression="SET next_vm_num = :nn",
+            ConditionExpression=("attribute_not_exists(next_vm_num) OR "
+                                 "next_vm_num < :nn"),
+            ExpressionAttributeValues={":nn": target_vm_num + 1},
+        )
+    except Exception as e:
+        # ConditionalCheckFailed = a concurrent create already moved it past
+        # target_vm_num+1 — exactly the case we must NOT rewind. Anything else
+        # is logged and tolerated (same best-effort contract as before).
+        msg = str(e)
+        if "ConditionalCheckFailed" not in msg:
+            print(f"target next_vm_num raise failed (non-fatal): {e}")
+
+
 def _rollback_migration(tenant, reason):
     """Roll a failed/stuck migration back to `running` and clear the async
     context. The source VM was only briefly paused for the snapshot and then
@@ -317,18 +357,7 @@ def _advance_migration(tenant, now):
                 )
             except Exception as e:
                 print(f"source counter dec failed (non-fatal): {e}")
-        try:
-            hosts_table.update_item(
-                Key={"instance_id": target_host_id},
-                UpdateExpression=("SET next_vm_num = :nn, "
-                                  "vm_count = if_not_exists(vm_count, :z) + :one, "
-                                  "used_vcpu = if_not_exists(used_vcpu, :z) + :v, "
-                                  "used_mem_mb = if_not_exists(used_mem_mb, :z) + :m"),
-                ExpressionAttributeValues={":nn": target_vm_num + 1, ":one": 1,
-                                           ":v": vcpu, ":m": mem_mb, ":z": 0},
-            )
-        except Exception as e:
-            print(f"target counter inc failed (non-fatal): {e}")
+        _bump_target_counters(target_host_id, target_vm_num, vcpu, mem_mb)
 
         # Best-effort: stop the old VM on the source + clean its nginx conf so
         # the slot is freed and it stops advertising as a backend.
@@ -905,23 +934,7 @@ def _failover_tenant_to_host(tenant, target_host, source_az, now):
                 ":b": backup_key,
             },
         )
-        try:
-            hosts_table.update_item(
-                Key={"instance_id": target_host_id},
-                UpdateExpression=("SET next_vm_num = :n, "
-                                  "vm_count = if_not_exists(vm_count, :z) + :one, "
-                                  "used_vcpu = if_not_exists(used_vcpu, :z) + :v, "
-                                  "used_mem_mb = if_not_exists(used_mem_mb, :z) + :m"),
-                ExpressionAttributeValues={
-                    ":n": target_vm_num + 1,
-                    ":one": 1,
-                    ":v": vcpu,
-                    ":m": mem_mb,
-                    ":z": 0,
-                },
-            )
-        except Exception as e:
-            print(f"host counter update failed (non-fatal): {e}")
+        _bump_target_counters(target_host_id, target_vm_num, vcpu, mem_mb)
 
         _emit_audit("AZ_FAILOVER_TENANT_RECOVERED", {
             "tenant_id": tenant_id,

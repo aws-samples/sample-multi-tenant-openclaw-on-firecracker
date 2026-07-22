@@ -273,3 +273,49 @@ def _assert_rolled_back_to_running(mod):
                 and "REMOVE" in expr:
             found = True
     assert found, "no rollback-to-running (status=running + migration_failed + REMOVE)"
+
+
+# ═══════════════════════════════════════════
+# Issue #77 follow-up — _bump_target_counters must never REWIND next_vm_num
+# ═══════════════════════════════════════════
+
+
+@pytest.mark.unit
+class TestBumpTargetCounters:
+    def test_next_vm_num_raise_is_conditional(self):
+        """next_vm_num is raised with a forward-only ConditionExpression, so a
+        stale migration/failover flip can't rewind it past values already
+        handed out by concurrent tenant creates (duplicate vm_num/IP/port)."""
+        mod = _load_hc()
+        mod.hosts_table = make_ddb_table()
+        mod._bump_target_counters("i-target", 5, 2, 4096)
+        calls = mod.hosts_table.update_item.call_args_list
+        assert len(calls) == 2
+        # 1st call: plain atomic counter adds, no next_vm_num.
+        first = calls[0][1]
+        assert "next_vm_num" not in first["UpdateExpression"]
+        assert "vm_count" in first["UpdateExpression"]
+        # 2nd call: next_vm_num with a forward-only condition.
+        second = calls[1][1]
+        assert "next_vm_num" in second["UpdateExpression"]
+        assert "next_vm_num < :nn" in second["ConditionExpression"]
+        assert second["ExpressionAttributeValues"][":nn"] == 6
+
+    def test_conditional_failure_is_tolerated(self):
+        """A ConditionalCheckFailed (concurrent create already advanced the
+        counter) must be swallowed — counters call still succeeds."""
+        mod = _load_hc()
+        mod.hosts_table = make_ddb_table()
+
+        class _CCF(Exception):
+            pass
+        calls = {"n": 0}
+
+        def _update(**kwargs):
+            calls["n"] += 1
+            if "ConditionExpression" in kwargs:
+                raise _CCF("ConditionalCheckFailedException")
+            return {}
+        mod.hosts_table.update_item.side_effect = _update
+        mod._bump_target_counters("i-target", 5, 2, 4096)  # must not raise
+        assert calls["n"] == 2

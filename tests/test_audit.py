@@ -177,6 +177,92 @@ class TestMutationAudits:
 
 
 # ═══════════════════════════════════════════
+# Issue #71 — enriched audit fields (event / object / actor / actor_role)
+# ═══════════════════════════════════════════
+
+
+class TestAuditEnrichment:
+    def setup_method(self):
+        api.tenants_table = make_ddb_table()
+        api.hosts_table = make_ddb_table()
+        api.audit_table = make_ddb_table()
+
+    def _tenant(self):
+        api.tenants_table.get_item.return_value = {"Item": {
+            "id": "t1", "name": "t1", "status": "running",
+            "host_id": "i-1", "vm_num": 1, "vcpu": 2, "mem_mb": 4096,
+            "guest_ip": "172.16.1.2", "host_port": 18789,
+        }}
+
+    @pytest.mark.unit
+    def test_create_has_event_and_typed_object(self):
+        api.lambda_handler(_api_event("POST", "/tenants", body={"name": "x"}), None)
+        item = api.audit_table.put_item.call_args[1]["Item"]
+        assert item["event"] == "tenant.created"
+        # object is typed even though POST /tenants has no id path param yet.
+        assert item["object"] == "tenant"
+
+    @pytest.mark.unit
+    def test_delete_has_typed_object_with_id(self):
+        self._tenant()
+        api.lambda_handler(_api_event("DELETE", "/tenants/{id}",
+                                      path_params={"id": "t1"}), None)
+        item = api.audit_table.put_item.call_args[1]["Item"]
+        assert item["event"] == "tenant.deleted"
+        assert item["object"] == "tenant:t1"
+
+    @pytest.mark.unit
+    def test_action_maps_to_event_name(self):
+        self._tenant()
+        api.lambda_handler(_api_event("POST", "/tenants/{id}/{action}",
+                                      path_params={"id": "t1", "action": "stop"}), None)
+        item = api.audit_table.put_item.call_args[1]["Item"]
+        assert item["event"] == "tenant.stopped"
+        assert item["object"] == "tenant:t1"
+
+    @pytest.mark.unit
+    def test_group_object_uses_name_param(self):
+        # Regression: group routes carry `name`, not `id`; the old code recorded
+        # an empty resource_id. The typed object must now be group:<name>.
+        api.lambda_handler(_api_event("POST", "/groups/{name}/skills",
+                                      path_params={"name": "sre"}, body={"skill": "k8s"}), None)
+        if api.audit_table.put_item.called:
+            item = api.audit_table.put_item.call_args[1]["Item"]
+            assert item["object"] == "group:sre"
+            assert item["event"] == "group.skill_added"
+
+    @pytest.mark.unit
+    def test_actor_is_api_key_without_jwt(self):
+        # No Bearer token → actor falls back to the api-key principal.
+        api.lambda_handler(_api_event("POST", "/tenants", body={"name": "x"},
+                                      api_key_id="key-42"), None)
+        item = api.audit_table.put_item.call_args[1]["Item"]
+        assert item["actor"].startswith("api-key")
+        assert "actor_role" in item
+
+    @pytest.mark.unit
+    def test_actor_is_cognito_principal_with_verified_jwt(self):
+        # A verified id_token → actor is the email/username, role from claims.
+        with patch.object(api, "_verify_and_decode",
+                          return_value={"email": "aleck@openclaw.local",
+                                        "cognito:groups": ["admin"]}):
+            evt = _api_event("POST", "/tenants", body={"name": "x"})
+            evt["headers"] = {"Authorization": "Bearer good.token.sig"}
+            api.lambda_handler(evt, None)
+        item = api.audit_table.put_item.call_args[1]["Item"]
+        assert item["actor"] == "aleck@openclaw.local"
+        assert item["actor_role"] == "admin"
+
+    @pytest.mark.unit
+    def test_backward_compat_fields_present(self):
+        # The pre-#71 fields must survive for existing readers.
+        api.lambda_handler(_api_event("POST", "/tenants", body={"name": "x"}), None)
+        item = api.audit_table.put_item.call_args[1]["Item"]
+        for k in ("operation", "resource_id", "api_key_id", "response_status", "expires_ttl"):
+            assert k in item
+
+
+# ═══════════════════════════════════════════
 # GETs are NOT audited (read-only, high volume)
 # ═══════════════════════════════════════════
 

@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.5.8]
+
+Closes the remaining open issues: scheduler spread + concurrency-safe provisioning (#77), a clear balloon-migration failure path (#72), an operations audit trail with a Console Logs tab (#71), and a hermetic test suite (#80).
+
+### Added
+
+- **Console Logs / Activity tab (#71).** A reverse-chronological, filterable, paginated table (Time / Object / Operation / Actor / Result) over `GET /audit-log`. Read-only, available to `viewer`+. Filter by object type (tenant/host/group/skill/template) and free-text on operation/actor; "Load older" pages via a `before` cursor. Degrades to an informative empty state when the audit table is disabled.
+- **Enriched audit records (#71).** Every audit row now carries the real principal (`actor` = Cognito email/username + `actor_role` from the verified id_token, falling back to `api-key:<id>` / `system:<source>`), a typed `object` (`tenant:<id>` / `host:<id>` / `group:<name>` …), and an event-style `operation` name (`tenant.created`, `vm.migrated`, `backup.created`, `host.terminated`, …). The legacy `operation` / `resource_id` / `api_key_id` fields are retained for back-compat.
+- **Non-API actors are audited (#71).** VM migration completion/failure and AZ failover (health_check), host termination + tenant reap (ASG lifecycle), and scaler TTL-expiry / scheduled start-stop / idle scale-in now all write audit rows in the same schema — `actor = system:<source>` — so they appear in one Console log.
+- **Per-host VM ceiling (#77).** `host.max_vms_per_host` caps microVMs per host independent of the overcommit ratio (0 = ratio-only).
+
+### Fixed
+
+- **Scheduler piled every tenant onto one host (#77).** `_find_host` was first-fit; it now picks the least-loaded host (most free vCPU, then free mem, deterministic tie-break), so the warm pool actually spreads load.
+- **Concurrent tenant creation failed with `PriorityInUseException` 500s (#77).** ALB rule creation read the in-use priorities once and took the lowest free slot, so concurrent creates collided (16–48% first-try 500s). It now picks a random free priority and retries on collision, re-reading live rules each attempt — in both the API and health_check (AZ-failover) paths.
+- **Concurrent creates could double-book a host / reuse a vm_num (#77).** Host capacity is now reserved with an atomic DynamoDB conditional update that also yields a unique `vm_num`; on contention the tenant falls back to `pending` + scale-out instead of overcommitting.
+- **Overcommit-ratio drift guardrail (#77).** `deploy/stack.py` clamps `cpu_overcommit_ratio` / `mem_overcommit_ratio` to a 4× ceiling (with a warning), so a stray/stale config can't silently oversubscribe a host (the prod incident ran 8.0).
+- **Live migration failed with a bare `exit 52` on balloon VMs (#72).** `migrate-vm.sh` snapshot mode used a silent `curl -sf` that swallowed Firecracker's error and could strand the source VM Paused. It now captures and surfaces the Firecracker error body (the SSM output explains the balloon incompatibility) and always resumes the source on failure. The API's fast-fail 409 guard (1.5.3) is confirmed to fire before any SSM/DDB work.
+- **Test suite is now hermetic (#80).** `test_balloon.py` leaked `BALLOON_ENABLED=true` into the process env at collection time, flipping the migrate guard on and failing 8 `test_migration.py` tests in the full suite; the env is now restored. `test_network_and_cloudfront.py` synthesized from the developer's gitignored `config.yml` (dual-domain → 2 distributions) instead of the tracked `config.yml.example`; it now uses a known baseline. `conftest.py` materializes `config.yml` from the example on a clean checkout, and e2e tests auto-skip unless `OPENCLAW_E2E=1` or `-m e2e` (they were failing a plain `pytest` run against a real API).
+
 ## [1.5.7]
 
 Enterprise landing (#79): deploy into an existing VPC and optionally skip CloudFront for your own CDN. Both opt-in, default off — zero-config path unchanged.

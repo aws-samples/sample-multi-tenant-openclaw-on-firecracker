@@ -11,7 +11,7 @@ window.ocCore = {
     this.apiKey = localStorage.getItem('oc_api_key') || window.OC_DEFAULT_API_KEY || '';
     // Restore the last-viewed tab so a refresh doesn't snap back to Tenants.
     // Whitelist guards against a stale/garbage value pointing at a dead tab.
-    const pages = ['tenants', 'app', 'monitoring', 'backups', 'settings'];
+    const pages = ['tenants', 'app', 'monitoring', 'backups', 'logs', 'settings'];
     const saved = localStorage.getItem('oc_page');
     if (pages.includes(saved)) this.page = saved;
     this.$watch('page', v => localStorage.setItem('oc_page', v));
@@ -21,6 +21,7 @@ window.ocCore = {
       // straight onto one of them, fire its loader so the page isn't empty.
       if (this.page === 'app') this.loadAgentCoreTools();
       if (this.page === 'backups') this.loadBackups();
+      if (this.page === 'logs') this.loadAuditLog();
     }
   },
   saveSettings() {

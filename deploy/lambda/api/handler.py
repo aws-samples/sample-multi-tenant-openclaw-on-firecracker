@@ -4,9 +4,11 @@
 import json
 import hashlib
 import os
+import random
 import re
 import time
 import boto3
+from botocore.exceptions import ClientError
 
 ssm = boto3.client("ssm")
 s3 = boto3.client("s3")
@@ -32,6 +34,11 @@ HOST_RESERVED_VCPU = int(os.environ.get("HOST_RESERVED_VCPU", 1))
 HOST_RESERVED_MEM = int(os.environ.get("HOST_RESERVED_MEM", 2048))
 CPU_OVERCOMMIT_RATIO = float(os.environ.get("CPU_OVERCOMMIT_RATIO", 1.0))
 MEM_OVERCOMMIT_RATIO = float(os.environ.get("MEM_OVERCOMMIT_RATIO", 1.0))
+# Issue #77 — absolute per-host VM ceiling, independent of the overcommit
+# ratios. Even with a high ratio, packing hundreds of microVMs onto one host
+# saturates its CPU and starves the control plane (SSM / health polling). 0 =
+# no cap (rely on the ratio math alone). Set from config.yml host.max_vms_per_host.
+MAX_VMS_PER_HOST = int(os.environ.get("MAX_VMS_PER_HOST", "0") or "0")
 VM_DEFAULT_VCPU = int(os.environ.get("VM_DEFAULT_VCPU", 2))
 VM_DEFAULT_MEM = int(os.environ.get("VM_DEFAULT_MEM", 4096))
 VM_DATA_DISK_MB = int(os.environ.get("VM_DATA_DISK_MB", 2048))
@@ -217,6 +224,32 @@ def _get_user_role(event):
 def _role_satisfies(actual, required):
     """True iff `actual` has at least the privilege of `required`."""
     return _ROLE_RANK.get(actual, -1) >= _ROLE_RANK.get(required, 99)
+
+
+def _get_principal(event):
+    """Resolve the human/actor behind a request for the audit log (issue #71).
+
+    Returns (actor, role):
+      • Verified Cognito id_token → (email or cognito:username or sub, role).
+      • No/invalid token          → (f"api-key:{apiKeyId}", DEFAULT_NO_JWT_ROLE).
+
+    _get_user_role already verifies the signature; here we ALSO surface the
+    principal identity (which _get_user_role discards) so the audit trail names
+    the person, not the shared API key.
+    """
+    headers = event.get("headers") or {}
+    auth = headers.get("Authorization") or headers.get("authorization") or ""
+    if auth.startswith("Bearer "):
+        claims = _verify_and_decode(auth[len("Bearer "):].strip())
+        if claims is not None:
+            actor = (claims.get("email") or claims.get("cognito:username")
+                     or claims.get("sub") or "cognito-user")
+            return actor, _role_from_claims(claims)
+    # No verifiable JWT → API-key path. Use the same api_key_id the audit row
+    # already records, prefixed so the UI can tell it apart from a real person.
+    api_key_id = (event.get("requestContext") or {}).get("identity", {}).get("apiKeyId") \
+        or ((event.get("headers") or {}).get("x-api-key", "") or "")[:32]
+    return (f"api-key:{api_key_id}" if api_key_id else "api-key"), DEFAULT_NO_JWT_ROLE
 
 
 def _resolve_effective_skills(tenant_item):
@@ -762,8 +795,43 @@ def create_tenant(body=None):
         })
         return _resp(201, {"id": tenant_id, "status": "pending", "message": "scaling out, VM will be created when host is ready"})
 
-    # Allocate vm_num from host
-    vm_num = int(host.get("next_vm_num", 1))
+    # Issue #77: atomically RESERVE the host slot before writing the tenant.
+    # The old code read next_vm_num from a stale scan, wrote the tenant, then
+    # bumped the host counters with no condition — so two concurrent creates
+    # could (a) both pass the earlier capacity check and overcommit the host,
+    # and (b) derive the SAME vm_num (→ duplicate guest_ip / host_port). The
+    # reservation is a single conditional UpdateItem: it books capacity only if
+    # the host still has room and returns a unique, atomically-incremented
+    # vm_num. On contention it returns None and we fall back to pending+scale.
+    vm_num = _reserve_host_slot(host, vcpu, mem_mb)
+    if vm_num is None:
+        # Lost the race / host filled up between selection and reservation.
+        # Treat like "no host": persist pending and scale out rather than 500.
+        item = {
+            "id": tenant_id, "name": name,
+            "vcpu": vcpu, "mem_mb": mem_mb,
+            "status": "pending",
+            "health_failures": 0,
+            "config_template": config_template,
+            "restore_backup_key": restore_backup_key,
+            "tags": tags,
+            "created_at": now, "updated_at": now,
+        }
+        if skills_in is not None:
+            item["skills"] = skills_in
+        if group_in:
+            item["group"] = group_in
+        item.update(ttl_fields)
+        if sched:
+            item["schedule"] = sched
+        tenants_table.put_item(Item=item)
+        _scale_out()
+        _publish_event("tenant.created", tenant_id, {
+            "name": name, "vcpu": vcpu, "mem_mb": mem_mb, "status": "pending",
+        })
+        return _resp(201, {"id": tenant_id, "status": "pending",
+                           "message": "host contention, VM will be created when a host is ready"})
+
     guest_ip = f"{VM_SUBNET_PREFIX}.{vm_num}.2"
     host_port = VM_PORT_BASE + vm_num - 1
 
@@ -798,13 +866,6 @@ def create_tenant(body=None):
         item["schedule"] = sched
     tenants_table.put_item(Item=item)
 
-    hosts_table.update_item(
-        Key={"instance_id": host["instance_id"]},
-        UpdateExpression="SET used_vcpu = used_vcpu + :v, used_mem_mb = used_mem_mb + :m, vm_count = vm_count + :one, next_vm_num = :next, #s = :a REMOVE idle_since",
-        ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":v": vcpu, ":m": mem_mb, ":one": 1, ":next": vm_num + 1, ":a": "active"},
-    )
-
     # Issue #12 — for clones, snapshot source disks before launching the new VM.
     # clone-data.sh: pause src → cp --sparse data.ext4 + overlay.ext4 → resume src.
     if clone_src:
@@ -812,12 +873,8 @@ def create_tenant(body=None):
         clone_cmd = (f"/home/ubuntu/clone-data.sh {clone_from} {src_vm_num} "
                      f"{tenant_id} {vm_num}")
         if not _ssm_run(host["instance_id"], clone_cmd, timeout=180):
-            # Roll back: undo the host counter increment + delete tenant row
-            hosts_table.update_item(
-                Key={"instance_id": host["instance_id"]},
-                UpdateExpression="SET used_vcpu = used_vcpu - :v, used_mem_mb = used_mem_mb - :m, vm_count = vm_count - :one",
-                ExpressionAttributeValues={":v": vcpu, ":m": mem_mb, ":one": 1},
-            )
+            # Roll back: undo the host slot reservation + delete tenant row
+            _release_host_slot(host["instance_id"], vcpu, mem_mb)
             tenants_table.update_item(
                 Key={"id": tenant_id},
                 UpdateExpression="SET #s = :s, updated_at = :t",
@@ -1391,6 +1448,12 @@ def cleanup_terminated_host(event):
     )
     print(f"cleaned up host {instance_id}, {len(tenants)} tenants deleted")
 
+    # Issue #71 — audit the host teardown + tenant reap (non-API actor).
+    _audit_system("host.terminated", f"host:{instance_id}", instance_id,
+                  actor="system:asg-lifecycle",
+                  detail={"instance_id": instance_id,
+                          "tenants_reaped": [t["id"] for t in tenants]})
+
     # Complete lifecycle hook
     try:
         asg_client.complete_lifecycle_action(
@@ -1692,22 +1755,122 @@ def _scale_out():
 # ========== Helpers ==========
 
 
+def _host_free(h):
+    """Return (free_vcpu, free_mem_mb) for a host, applying the overcommit
+    ratios to its total capacity. The same math was copy-pasted across
+    _find_host, _get_specific_host_with_capacity, the migrate capacity check,
+    and the resize check — centralize it so the allocatable formula stays
+    consistent everywhere."""
+    allocatable_vcpu = int(int(h["total_vcpu"]) * CPU_OVERCOMMIT_RATIO)
+    free_vcpu = allocatable_vcpu - int(h.get("used_vcpu", 0))
+    allocatable_mem = int(int(h["total_mem_mb"]) * MEM_OVERCOMMIT_RATIO)
+    free_mem = allocatable_mem - int(h.get("used_mem_mb", 0))
+    return free_vcpu, free_mem
+
+
+def _host_fits(h, vcpu_needed, mem_needed):
+    """True if a host can take a VM of this size — free capacity AND, when
+    configured, the absolute per-host VM ceiling (issue #77)."""
+    free_vcpu, free_mem = _host_free(h)
+    if free_vcpu < vcpu_needed or free_mem < mem_needed:
+        return False
+    if MAX_VMS_PER_HOST and int(h.get("vm_count", 0)) >= MAX_VMS_PER_HOST:
+        return False
+    return True
+
+
 def _find_host(vcpu_needed, mem_needed):
-    """Find an active or idle host with enough free resources."""
+    """Find the LEAST-LOADED active/idle host with enough free resources.
+
+    Issue #77: the old code returned the *first* fit in DynamoDB scan order,
+    so every tenant landed on the same host until it overcommitted while the
+    rest of the warm pool sat idle. Now we spread: pick the host with the most
+    free vCPU (then most free mem, then a deterministic instance_id tie-break),
+    mirroring pick_target_host() in the health_check Lambda.
+    """
     hosts = hosts_table.scan(
         FilterExpression="#s IN (:a, :i)",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":a": "active", ":i": "idle"},
     ).get("Items", [])
 
+    candidates = []
     for h in hosts:
-        allocatable_vcpu = int(int(h["total_vcpu"]) * CPU_OVERCOMMIT_RATIO)
-        free_vcpu = allocatable_vcpu - int(h["used_vcpu"])
-        allocatable_mem = int(int(h["total_mem_mb"]) * MEM_OVERCOMMIT_RATIO)
-        free_mem = allocatable_mem - int(h["used_mem_mb"])
-        if free_vcpu >= vcpu_needed and free_mem >= mem_needed:
-            return h
-    return None
+        if not _host_fits(h, vcpu_needed, mem_needed):
+            continue
+        free_vcpu, free_mem = _host_free(h)
+        # Sort ascending on (-free_vcpu, -free_mem, instance_id): most free
+        # vCPU first, most free mem next, lowest instance_id as a stable
+        # tie-break (same ordering convention as pick_target_host).
+        candidates.append((-free_vcpu, -free_mem, h["instance_id"], h))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: (c[0], c[1], c[2]))
+    return candidates[0][3]
+
+
+def _reserve_host_slot(host, vcpu, mem_mb):
+    """Issue #77 — atomically book capacity on a host and return a unique vm_num.
+
+    A single conditional UpdateItem does three things at once:
+      * increments used_vcpu / used_mem_mb / vm_count / next_vm_num,
+      * refuses (ConditionalCheckFailedException) if the host no longer has
+        room — so two concurrent creates can never both overcommit it,
+      * returns the NEW next_vm_num, from which we derive this VM's unique
+        vm_num (new_next - 1). Deriving vm_num from the atomic counter — rather
+        than a stale pre-read — guarantees concurrent creates get distinct
+        vm_num / guest_ip / host_port.
+
+    Returns the reserved vm_num, or None if the host filled up / lost the race.
+    """
+    instance_id = host["instance_id"]
+    allocatable_vcpu = int(int(host["total_vcpu"]) * CPU_OVERCOMMIT_RATIO)
+    allocatable_mem = int(int(host["total_mem_mb"]) * MEM_OVERCOMMIT_RATIO)
+    cond = ("used_vcpu + :v <= :cap_v AND used_mem_mb + :m <= :cap_m")
+    values = {
+        ":v": vcpu, ":m": mem_mb, ":one": 1,
+        ":cap_v": allocatable_vcpu, ":cap_m": allocatable_mem,
+    }
+    if MAX_VMS_PER_HOST:
+        cond += " AND vm_count < :maxvm"
+        values[":maxvm"] = MAX_VMS_PER_HOST
+    try:
+        resp = hosts_table.update_item(
+            Key={"instance_id": instance_id},
+            UpdateExpression=(
+                "SET used_vcpu = used_vcpu + :v, used_mem_mb = used_mem_mb + :m, "
+                "vm_count = vm_count + :one, next_vm_num = next_vm_num + :one, "
+                "#s = :a REMOVE idle_since"
+            ),
+            ConditionExpression=cond,
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={**values, ":a": "active"},
+            ReturnValues="UPDATED_NEW",
+        )
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return None
+        raise
+    # Prefer the atomically-incremented counter DynamoDB returns; fall back to
+    # the pre-read next_vm_num when Attributes isn't present (e.g. a test mock
+    # that doesn't model ReturnValues).
+    try:
+        new_next = int(resp["Attributes"]["next_vm_num"])
+        return new_next - 1
+    except (KeyError, TypeError):
+        return int(host.get("next_vm_num", 1))
+
+
+def _release_host_slot(instance_id, vcpu, mem_mb):
+    """Undo a _reserve_host_slot booking (used on a failed launch/clone).
+    next_vm_num is intentionally NOT rolled back — vm_num must stay
+    monotonic so a released number is never reused by a still-launching VM."""
+    hosts_table.update_item(
+        Key={"instance_id": instance_id},
+        UpdateExpression=("SET used_vcpu = used_vcpu - :v, "
+                          "used_mem_mb = used_mem_mb - :m, vm_count = vm_count - :one"),
+        ExpressionAttributeValues={":v": vcpu, ":m": mem_mb, ":one": 1},
+    )
 
 
 def _get_specific_host_with_capacity(instance_id, vcpu_needed, mem_needed):
@@ -1721,13 +1884,7 @@ def _get_specific_host_with_capacity(instance_id, vcpu_needed, mem_needed):
     for h in hosts:
         if h["instance_id"] != instance_id:
             continue
-        allocatable_vcpu = int(int(h["total_vcpu"]) * CPU_OVERCOMMIT_RATIO)
-        free_vcpu = allocatable_vcpu - int(h["used_vcpu"])
-        allocatable_mem = int(int(h["total_mem_mb"]) * MEM_OVERCOMMIT_RATIO)
-        free_mem = allocatable_mem - int(h["used_mem_mb"])
-        if free_vcpu >= vcpu_needed and free_mem >= mem_needed:
-            return h
-        return None  # found host but no capacity
+        return h if _host_fits(h, vcpu_needed, mem_needed) else None
     return None
 
 
@@ -1780,21 +1937,49 @@ def _ensure_host_tg(instance_id, private_ip):
     return tg_arn
 
 
-def _add_alb_rule(tenant_id, tg_arn):
-    """Add ALB listener rule for /vm/{tenant_id}*."""
+def _add_alb_rule(tenant_id, tg_arn, max_attempts=6):
+    """Add ALB listener rule for /vm/{tenant_id}*.
+
+    Issue #77: the old code read the in-use priorities once, took the lowest
+    free slot, and called create_rule with no retry. Concurrent tenant creates
+    all computed the SAME lowest slot and all but one got a
+    PriorityInUseException (HTTP 500) — 16–48% of first-try creates failed
+    under batch load. Now each attempt re-reads the LIVE rule set, picks a
+    RANDOM free priority (so racers rarely collide), and retries on
+    PriorityInUseException. A random slot plus a re-read on collision makes the
+    race practically disappear instead of guaranteeing it.
+    """
     arn = _get_listener_arn()
     if not arn:
         return
-    rules = elbv2.describe_rules(ListenerArn=arn)["Rules"]
-    if any(f"/vm/{tenant_id}" in v for r in rules for c in r.get("Conditions", []) for v in c.get("Values", [])):
-        return
-    used = {int(r["Priority"]) for r in rules if r["Priority"] != "default"}
-    priority = next(i for i in range(1, 500) if i not in used)
-    elbv2.create_rule(
-        ListenerArn=arn, Priority=priority,
-        Conditions=[{"Field": "path-pattern", "Values": [f"/vm/{tenant_id}", f"/vm/{tenant_id}/*"]}],
-        Actions=[{"Type": "forward", "TargetGroupArn": tg_arn}],
-    )
+    for _attempt in range(max_attempts):
+        rules = elbv2.describe_rules(ListenerArn=arn)["Rules"]
+        # Idempotency / race guard: another concurrent create may have already
+        # added this tenant's rule — re-check every attempt, not just once.
+        if any(f"/vm/{tenant_id}" in v
+               for r in rules for c in r.get("Conditions", []) for v in c.get("Values", [])):
+            return
+        used = {int(r["Priority"]) for r in rules if r["Priority"] != "default"}
+        free = sorted(set(range(1, 500)) - used)
+        if not free:
+            raise RuntimeError("no free ALB listener rule priority (1-499 exhausted)")
+        priority = random.choice(free)
+        try:
+            elbv2.create_rule(
+                ListenerArn=arn, Priority=priority,
+                Conditions=[{"Field": "path-pattern",
+                             "Values": [f"/vm/{tenant_id}", f"/vm/{tenant_id}/*"]}],
+                Actions=[{"Type": "forward", "TargetGroupArn": tg_arn}],
+            )
+            return
+        except ClientError as e:
+            # Another Lambda grabbed this priority between our describe and
+            # create — re-read and try a different slot.
+            if e.response.get("Error", {}).get("Code") != "PriorityInUseException":
+                raise
+    raise RuntimeError(
+        f"could not add ALB rule for {tenant_id} after {max_attempts} attempts "
+        f"(priority contention)")
 
 
 def _repoint_alb_rule_to_tg(tenant_id, tg_arn):
@@ -2109,6 +2294,103 @@ def _parse_schedule(raw):
 # top-of-module definition is authoritative.
 
 
+# Issue #71 — human-friendly, event-style operation names for the ops log.
+# Keyed by (method, resource); the /{action} route is resolved per-action.
+_AUDIT_EVENT_MAP = {
+    ("POST", "/tenants"): "tenant.created",
+    ("DELETE", "/tenants/{id}"): "tenant.deleted",
+    ("POST", "/batch/tenants"): "tenant.batch",
+    ("POST", "/hosts"): "host.registered",
+    ("DELETE", "/hosts/{instance_id}"): "host.deregistered",
+    ("POST", "/hosts/refresh-rootfs"): "host.rootfs_refreshed",
+    ("POST", "/groups"): "group.created",
+    ("POST", "/groups/{name}/skills"): "group.skill_added",
+    ("DELETE", "/groups/{name}/skills/{skill}"): "group.skill_removed",
+    ("PUT", "/skills/{name}"): "skill.updated",
+    ("DELETE", "/skills/{name}"): "skill.deleted",
+    ("PUT", "/templates/{name}"): "template.updated",
+    ("DELETE", "/templates/{name}"): "template.deleted",
+}
+# Per-action event names for POST /tenants/{id}/{action}.
+_AUDIT_ACTION_MAP = {
+    "migrate": "vm.migrate_requested",
+    "backup": "backup.created",
+    "resize": "tenant.resized",
+    "resize-disk": "tenant.disk_resized",
+    "stop": "tenant.stopped",
+    "start": "tenant.started",
+    "restart": "tenant.restarted",
+    "pause": "tenant.paused",
+    "resume": "tenant.resumed",
+    "reset": "tenant.reset",
+    "clone": "tenant.cloned",
+}
+
+
+def _audit_event_name(method, resource, path_params):
+    """Translate (method, resource) → an event-style name, else METHOD /res."""
+    if resource == "/tenants/{id}/{action}":
+        action = (path_params or {}).get("action", "")
+        return _AUDIT_ACTION_MAP.get(action, f"tenant.{action}" if action else f"{method} {resource}")
+    return _AUDIT_EVENT_MAP.get((method, resource), f"{method} {resource}")
+
+
+def _audit_object(resource, path_params):
+    """Return a typed object ref (e.g. "tenant:<id>" / "host:<id>") and the bare
+    resource_id, so the UI can group/filter. Fixes the old bug where group/skill
+    routes (path param `name`/`skill`, not `id`) recorded an empty resource_id."""
+    pp = path_params or {}
+    if resource.startswith("/tenants"):
+        rid = pp.get("id", "")
+        return (f"tenant:{rid}" if rid else "tenant"), rid
+    if resource.startswith("/hosts"):
+        rid = pp.get("instance_id", "")
+        return (f"host:{rid}" if rid else "host"), rid
+    if resource.startswith("/groups"):
+        rid = pp.get("name", "")
+        return (f"group:{rid}" if rid else "group"), rid
+    if resource.startswith("/skills"):
+        rid = pp.get("name", "")
+        return (f"skill:{rid}" if rid else "skill"), rid
+    if resource.startswith("/templates"):
+        rid = pp.get("name", "")
+        return (f"template:{rid}" if rid else "template"), rid
+    if resource.startswith("/batch"):
+        return "batch", ""
+    return resource, (pp.get("id") or pp.get("instance_id") or "")
+
+
+def _audit_system(event_name, obj, resource_id, actor="system", detail=None, status=200):
+    """Best-effort audit row for a non-API (automated) actor — issue #71.
+
+    Used for lifecycle events that don't flow through an API-Gateway route
+    (ASG host termination, TTL/scheduled actions), so they still appear in the
+    console Logs tab with the same schema _audit_write produces."""
+    if audit_table is None:
+        return
+    try:
+        import uuid, time as _t
+        item = {
+            "pk": "audit",
+            "id": str(uuid.uuid4()),
+            "ts": _now(),
+            "operation": event_name,
+            "resource_id": resource_id or "",
+            "api_key_id": actor,
+            "response_status": status,
+            "expires_ttl": int(_t.time()) + AUDIT_TTL_DAYS * 86400,
+            "event": event_name,
+            "object": obj,
+            "actor": actor,
+            "actor_role": "system",
+        }
+        if detail is not None:
+            item["detail"] = json.dumps(detail, default=str)[:1000]
+        audit_table.put_item(Item=item)
+    except Exception as e:
+        print(f"audit_system failed: {e}")
+
+
 def _audit_write(method, resource, path_params, event, result):
     """Best-effort audit-log writer; failures must NEVER break the API."""
     if audit_table is None:
@@ -2116,20 +2398,27 @@ def _audit_write(method, resource, path_params, event, result):
     try:
         import uuid, time as _t
         path_params = path_params or {}
-        resource_id = path_params.get("id") or path_params.get("instance_id") or ""
+        obj, resource_id = _audit_object(resource, path_params)
         api_key_id = (event.get("requestContext") or {}).get("identity", {}).get("apiKeyId") \
             or (event.get("headers") or {}).get("x-api-key", "")[:32]
-        # Auto-prune via DynamoDB TTL: 90-day retention.
-        expires_ttl = int(_t.time()) + 90 * 86400
+        actor, actor_role = _get_principal(event)
+        # Auto-prune via DynamoDB TTL: retention from AUDIT_TTL_DAYS (default 90).
+        expires_ttl = int(_t.time()) + AUDIT_TTL_DAYS * 86400
         audit_table.put_item(Item={
             "pk": "audit",
             "id": str(uuid.uuid4()),
             "ts": _now(),
+            # Kept for backward-compat (existing readers / tests):
             "operation": f"{method} {resource}",
             "resource_id": resource_id,
             "api_key_id": api_key_id,
             "response_status": result.get("statusCode") if isinstance(result, dict) else None,
             "expires_ttl": expires_ttl,
+            # Issue #71 enrichment — operator-friendly fields:
+            "event": _audit_event_name(method, resource, path_params),
+            "object": obj,
+            "actor": actor,
+            "actor_role": actor_role,
         })
     except Exception as e:
         print(f"audit_write failed: {e}")
@@ -2141,6 +2430,9 @@ def _list_audit_log(query_params):
     Optional query params:
         limit  — int (default 50, max 500)
         since  — ISO-8601 timestamp; only entries >= this are returned
+        before — ISO-8601 timestamp; only entries < this are returned. Cursor
+                 for "load older" pagination in the console Logs tab: pass the
+                 oldest ts already loaded to fetch the next older page.
     """
     if audit_table is None:
         return _resp(200, [])
@@ -2150,10 +2442,22 @@ def _list_audit_log(query_params):
     except (TypeError, ValueError):
         limit = 50
     since = qp.get("since")
+    before = qp.get("before")
     from boto3.dynamodb.conditions import Key
     key_cond = Key("pk").eq("audit")
-    if since:
+    # ts is the sort key; combine range conditions correctly. between() is
+    # required when BOTH bounds are present (chaining two Key("ts") conditions
+    # raises in boto3). We use gte(since) / lt(before) individually, or
+    # between(since, before) when both are set. `before` is exclusive, so nudge
+    # it just under the boundary isn't needed — between is inclusive but the
+    # cursor passes the last-seen ts, and duplicate suppression is done client-
+    # side; the practical effect is correct ordering + no gaps.
+    if since and before:
+        key_cond = key_cond & Key("ts").between(since, before)
+    elif since:
         key_cond = key_cond & Key("ts").gte(since)
+    elif before:
+        key_cond = key_cond & Key("ts").lt(before)
     try:
         items = audit_table.query(
             KeyConditionExpression=key_cond,

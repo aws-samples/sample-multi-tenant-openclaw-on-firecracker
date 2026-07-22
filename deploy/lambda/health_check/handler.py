@@ -26,7 +26,9 @@ shell so it can be unit-tested without DDB/SSM/SNS access.
 
 import os
 import json
+import random
 import boto3
+from botocore.exceptions import ClientError
 from datetime import datetime, timezone, timedelta
 
 ddb = boto3.resource("dynamodb")
@@ -1212,15 +1214,29 @@ def _repoint_alb_rule(tenant_id, target_host_id, target_private_ip):
         if rule_arn:
             break
     if not rule_arn:
-        # No existing rule — create a fresh one. Pick a free priority.
-        used = {int(r["Priority"]) for r in rules if r["Priority"] != "default"}
-        priority = next(i for i in range(1, 500) if i not in used)
-        elbv2.create_rule(
-            ListenerArn=ALB_LISTENER_ARN, Priority=priority,
-            Conditions=[{"Field": "path-pattern",
-                         "Values": [f"/vm/{tenant_id}", f"/vm/{tenant_id}/*"]}],
-            Actions=[{"Type": "forward", "TargetGroupArn": tg_arn}],
-        )
+        # No existing rule — create a fresh one. Issue #77: pick a RANDOM free
+        # priority and retry on PriorityInUseException (re-reading live rules
+        # each attempt) instead of the racy read-once/lowest-free pattern.
+        for _attempt in range(6):
+            live = elbv2.describe_rules(ListenerArn=ALB_LISTENER_ARN)["Rules"]
+            if any(f"/vm/{tenant_id}" in v
+                   for r in live for c in r.get("Conditions", []) for v in c.get("Values", [])):
+                break  # another actor created it meanwhile
+            used = {int(r["Priority"]) for r in live if r["Priority"] != "default"}
+            free = sorted(set(range(1, 500)) - used)
+            if not free:
+                raise RuntimeError("no free ALB listener rule priority (1-499 exhausted)")
+            try:
+                elbv2.create_rule(
+                    ListenerArn=ALB_LISTENER_ARN, Priority=random.choice(free),
+                    Conditions=[{"Field": "path-pattern",
+                                 "Values": [f"/vm/{tenant_id}", f"/vm/{tenant_id}/*"]}],
+                    Actions=[{"Type": "forward", "TargetGroupArn": tg_arn}],
+                )
+                break
+            except ClientError as e:
+                if e.response.get("Error", {}).get("Code") != "PriorityInUseException":
+                    raise
     else:
         elbv2.modify_rule(
             RuleArn=rule_arn,
@@ -1228,23 +1244,66 @@ def _repoint_alb_rule(tenant_id, target_host_id, target_private_ip):
         )
 
 
+# Issue #71 — map the health_check UPPERCASE operation constants to the same
+# event-style vocabulary the API audit log uses, so both sources render in one
+# console Logs table.
+_HC_EVENT_MAP = {
+    "MIGRATION_COMPLETED": "vm.migrated",
+    "MIGRATION_FAILED": "vm.migrate_failed",
+    "AZ_FAILOVER_TRIGGERED": "az.failover_triggered",
+    "AZ_FAILOVER_COMPLETED": "az.failover_completed",
+    "AZ_FAILOVER_NO_TENANTS_AFFECTED": "az.failover_noop",
+    "AZ_FAILOVER_NO_TARGET": "az.failover_no_target",
+    "AZ_FAILOVER_PARTIAL": "az.failover_partial",
+    "AZ_FAILOVER_SKIPPED_COOLDOWN": "az.failover_cooldown",
+    "HOST_TERMINATED": "host.terminated",
+    "HOST_REAPED_TENANTS": "host.tenants_reaped",
+}
+
+
 def _emit_audit(operation, detail):
-    """Best-effort audit log entry. Never raises."""
+    """Best-effort audit log entry. Never raises.
+
+    Writes the SAME schema as the API Lambda's _audit_write (issue #71) so the
+    console Logs tab shows control-plane events (migration, AZ failover, host
+    lifecycle) alongside API operations. `operation` is kept as the original
+    UPPERCASE constant for back-compat (test_az_failover asserts on it); the
+    enriched `event` / `object` / `actor` fields are added for the UI.
+    """
     if not audit_table:
         return
     try:
         import uuid
         ttl = int(datetime.now(timezone.utc).timestamp()) + 90 * 86400
+        tenant_id = detail.get("tenant_id")
+        az = detail.get("az")
+        host_id = detail.get("host_id") or detail.get("instance_id")
+        if tenant_id:
+            obj, rid = f"tenant:{tenant_id}", tenant_id
+        elif host_id:
+            obj, rid = f"host:{host_id}", host_id
+        elif az:
+            obj, rid = f"az:{az}", az
+        else:
+            obj, rid = "system", ""
+        # actor = the automated source that performed the action.
+        source = detail.get("source") or ("az-failover" if az and "FAILOVER" in operation
+                                           else "health-check")
         audit_table.put_item(Item={
             "pk": "audit",
             "id": str(uuid.uuid4()),
             "ts": datetime.now(timezone.utc).isoformat(),
-            "operation": operation,
-            "resource_id": detail.get("tenant_id") or detail.get("az") or "",
+            "operation": operation,          # kept for back-compat
+            "resource_id": rid,
             "api_key_id": "system:health-check-lambda",
             "response_status": 200,
             "detail": json.dumps(detail)[:1000],
             "expires_ttl": ttl,
+            # Issue #71 enrichment (unified schema):
+            "event": _HC_EVENT_MAP.get(operation, operation.lower()),
+            "object": obj,
+            "actor": f"system:{source}",
+            "actor_role": "system",
         })
     except Exception as e:
         print(f"audit emit failed (non-fatal): {e}")

@@ -15,17 +15,36 @@ from conftest import make_ddb_table
 _mock_ddb = MagicMock()
 _mock_ssm = MagicMock()
 
+# These env vars are only needed *while* host-agent.py is imported below (it
+# reads them into module-level constants at import). They must NOT leak into
+# os.environ afterwards: pytest collects test modules in one process, and
+# test_migration.py imports the API handler at its own module scope — if
+# BALLOON_ENABLED is still "true" then, the handler bakes the balloon migrate
+# guard on and every migration test wrongly gets a 409. So snapshot and restore.
+_BALLOON_IMPORT_ENV = {
+    "BALLOON_ENABLED": "true",
+    "BALLOON_MAX_INFLATE_RATIO": "0.4",
+    "BALLOON_MIN_GUEST_AVAILABLE_MB": "512",
+}
+_saved_balloon_env = {k: os.environ.get(k) for k in _BALLOON_IMPORT_ENV}
+
 with patch("boto3.resource", return_value=_mock_ddb), \
      patch("boto3.client", return_value=_mock_ssm):
     _mock_ddb.Table.side_effect = lambda name: make_ddb_table()
     # Set balloon env vars before import
-    os.environ["BALLOON_ENABLED"] = "true"
-    os.environ["BALLOON_MAX_INFLATE_RATIO"] = "0.4"
-    os.environ["BALLOON_MIN_GUEST_AVAILABLE_MB"] = "512"
+    os.environ.update(_BALLOON_IMPORT_ENV)
     spec = importlib.util.spec_from_file_location("agent", "deploy/userdata/host-agent.py")
     agent = importlib.util.module_from_spec(spec)
     sys.modules["agent"] = agent
     spec.loader.exec_module(agent)
+
+# Restore the environment so importing this module can't contaminate the env
+# that later test modules (e.g. test_migration.py) read at their import time.
+for _k, _v in _saved_balloon_env.items():
+    if _v is None:
+        os.environ.pop(_k, None)
+    else:
+        os.environ[_k] = _v
 
 
 def _make_stats(available_mb=2048, free_mb=1024, actual_mib=0):

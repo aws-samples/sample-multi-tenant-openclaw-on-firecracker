@@ -12,8 +12,9 @@ host:
   keep_data_volume:  true          # 实例删除后是否保留EBS卷
   reserved_vcpu: 1
   reserved_mem_mb: 2048
-  cpu_overcommit_ratio: 2.0        # 1.0=不超配, 2.0=可分配 2 倍 vCPU
-  mem_overcommit_ratio: 1.0        # 1.0=不超配, >1.0 需启用 balloon 才有回收机制
+  cpu_overcommit_ratio: 2.0        # 1.0=不超配, 2.0=可分配 2 倍 vCPU (上限 4.0, 超出会被 clamp)
+  mem_overcommit_ratio: 1.0        # 1.0=不超配, >1.0 需启用 balloon 才有回收机制 (上限 4.0)
+  max_vms_per_host: 0              # 每台 host 的 microVM 数量硬上限 (0=仅按 overcommit 比例, 不额外限制)
 
 # ========== Balloon 内存回收 (配合 mem_overcommit) ==========
 balloon:

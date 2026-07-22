@@ -27,23 +27,54 @@ echo "== discover-env (READ-ONLY) region=$REGION ==" >&2
 ACCT="$(aws sts get-caller-identity --query Account --output text)"
 CALLER="$(aws sts get-caller-identity --query Arn --output text)"
 
-# --- rule 9: pick the control-plane API by BEHAVIOR, not name ---------------------------------------
-# The right one is a NON-proxy REST API that has explicit /tenants and /hosts resources. A /{proxy+}
-# API (often the one literally named "-private") is the trap. We list candidates + flag the match;
-# the operator still confirms (a host-SSM GET /tenants 200 is the final proof, printed as a follow-up).
-API_CANDIDATES="$(Q apigateway get-rest-apis \
-  | jq -c '[.items[] | {id, name}]')"
-API_MATCH="null"; API_WHY=""
+# --- control-plane API: REPORT candidates + their auth facts; let the OPERATOR confirm --------------
+# Do NOT hard-code which API is "right". Deployments differ: the control plane may be a proxy
+# (/{proxy+}) API or one with explicit /tenants,/hosts routes; its methods may use AWS_IAM (SigV4),
+# API keys, a custom authorizer, or NONE; access may be fenced by a resource policy (e.g. VPCE-only)
+# rather than method auth. A route-shape heuristic alone picks the wrong one (real-run: the explicit
+# -routes API and the proxy API can swap roles between environments). So we list EVERY REST API with
+# the facts an operator needs — route shape, per-method authorizationType/apiKeyRequired, and whether
+# a resource policy restricts it — and let them match it to how THEY actually call it (config like
+# PRIVATE_API_URL / CTRL_API_BASE + the auth their client sends). The winner is confirmed by a real
+# call from the real call site returning 200, using the SAME auth the client uses (SigV4, api key, or
+# whatever the resource policy allows) — NOT by a shape guess and NOT by assuming SigV4.
+API_CANDIDATES="$(Q apigateway get-rest-apis | jq -c '[.items[] | {id, name}]')"
+API_FACTS="[]"
 for id in $(printf '%s' "$API_CANDIDATES" | jq -r '.[].id'); do
-  res="$(Q apigateway get-resources --rest-api-id "$id" | jq -r '[.items[].path]')"
+  nm="$(printf '%s' "$API_CANDIDATES" | jq -r --arg id "$id" '(.[]|select(.id==$id)).name // "?"')"
+  res_json="$(Q apigateway get-resources --rest-api-id "$id" 2>/dev/null || echo '{"items":[]}')"
+  res="$(printf '%s' "$res_json" | jq -r '[.items[].path]')"
   has_tenants=$(printf '%s' "$res" | jq 'any(.[]; . == "/tenants" or startswith("/tenants"))')
   has_hosts=$(printf '%s' "$res" | jq 'any(.[]; . == "/hosts" or startswith("/hosts"))')
   has_proxy=$(printf '%s' "$res" | jq 'any(.[]; contains("{proxy+}"))')
-  if [ "$has_tenants" = true ] && [ "$has_hosts" = true ] && [ "$has_proxy" = false ]; then
-    API_MATCH="$id"; API_WHY="explicit /tenants + /hosts, no {proxy+}"; break
+  # sample the auth on the first resource that has methods (proxy ANY, or an explicit route)
+  rid="$(printf '%s' "$res_json" | jq -r '[.items[] | select(.resourceMethods)] | .[0].id // ""')"
+  meth="$(printf '%s' "$res_json" | jq -r 'first(.items[] | select(.resourceMethods) | .resourceMethods | keys[] | select(. != "OPTIONS")) // ""')"
+  auth="unknown"; apikey="unknown"
+  if [ -n "$rid" ] && [ -n "$meth" ]; then
+    am="$(Q apigateway get-method --rest-api-id "$id" --resource-id "$rid" --http-method "$meth" 2>/dev/null | jq -c '{auth:.authorizationType, apikey:.apiKeyRequired}')" || am=""
+    [ -n "$am" ] && { auth="$(printf '%s' "$am" | jq -r '.auth // "unknown"')"; apikey="$(printf '%s' "$am" | jq -r '.apikey // "unknown"')"; }
   fi
+  # resource policy present? (VPCE-only fencing lives here, not in method auth)
+  has_respolicy="$(Q apigateway get-rest-api --rest-api-id "$id" 2>/dev/null | jq -r 'if (.policy // "") != "" then "yes" else "no" end')" || has_respolicy=unknown
+  API_FACTS="$(printf '%s' "$API_FACTS" | jq -c \
+    --arg id "$id" --arg nm "$nm" --argjson t "$has_tenants" --argjson h "$has_hosts" --argjson p "$has_proxy" \
+    --arg au "$auth" --arg ak "$apikey" --arg rp "$has_respolicy" \
+    '. + [{id:$id, name:$nm, has_tenants:$t, has_hosts:$h, proxy:$p, method_auth:$au, api_key_required:$ak, resource_policy:$rp}]')"
 done
-[ "$API_MATCH" = null ] && warn "no non-proxy /tenants+/hosts API auto-matched — pick manually + host-SSM-probe GET /tenants==200"
+# A neutral SUGGESTION only: an API that can serve control-plane calls (explicit /tenants+/hosts OR a
+# proxy that forwards them). If exactly one, suggest it; otherwise leave null and make the operator pick.
+API_SUGGESTED="$(printf '%s' "$API_FACTS" | jq -c '[.[] | select((.has_tenants and .has_hosts) or .proxy)]')"
+API_SUGGEST_N="$(printf '%s' "$API_SUGGESTED" | jq 'length')"
+if [ "$API_SUGGEST_N" = 1 ]; then
+  API_MATCH="$(printf '%s' "$API_SUGGESTED" | jq -r '.[0].id')"
+  API_WHY="only candidate that can serve control-plane routes — UNCONFIRMED (verify with a real call from your call site, using your client's auth)"
+else
+  API_MATCH="null"
+  API_WHY="$API_SUGGEST_N candidates could serve the control plane — operator must confirm (do NOT guess by route shape); pick the one your config (PRIVATE_API_URL/CTRL_API_BASE) points to AND that answers a real call with your auth"
+  warn "control-plane API not auto-resolved ($API_SUGGEST_N candidates). Match it to how YOU call it (your config + your auth: SigV4 / api key / resource-policy VPCE), not to route shape. Candidates + auth facts:"
+  printf '%s' "$API_FACTS" | jq -r '.[] | "      - \(.id) (\(.name))  tenants=\(.has_tenants) hosts=\(.has_hosts) proxy=\(.proxy)  method_auth=\(.method_auth) api_key=\(.api_key_required) resource_policy=\(.resource_policy)"' >&2
+fi
 
 # --- which Lambda LINK is actually SERVING (315 real-run: API GW -> live ALIAS; dispatch SQS ESM ->
 #     $LATEST; they diverge). A code update must hit BOTH the alias the API invokes AND $LATEST, or the
@@ -63,13 +94,46 @@ API_LATEST_SHA="$(Q lambda get-function-configuration --function-name openclaw-a
 DISPATCH_ESM_TARGET="$(Q lambda list-event-source-mappings --function-name openclaw-api 2>/dev/null | jq -r '[.EventSourceMappings[] | select(.EventSourceArn|test("sqs";"i")) | .FunctionArn] | .[0] // ""' | grep -oE '(:[0-9]+|:[A-Za-z0-9_-]+)$' | tr -d ':' | head -1)" || DISPATCH_ESM_TARGET=""
 [ -z "$API_INTEGRATION_TARGET" ] && warn "could not read the API's Lambda integration target — confirm which alias the API GW invokes before update-function-code"
 
-# --- ASG + the LT version it ACTUALLY pins (never assume $Default) -----------------------------------
-ASG_JSON="$(Q autoscaling describe-auto-scaling-groups | jq -c '[.AutoScalingGroups[] | select(.AutoScalingGroupName|test("openclaw|host";"i"))]')"
-ASG_NAME="$(printf '%s' "$ASG_JSON" | jq -r '.[0].AutoScalingGroupName // ""')"
-ASG_LT="$(printf '%s' "$ASG_JSON" | jq -c '.[0] | (.MixedInstancesPolicy.LaunchTemplate.LaunchTemplateSpecification // .LaunchTemplate // {})')"
-ASG_LT_ID="$(printf '%s' "$ASG_LT" | jq -r '.LaunchTemplateId // ""')"
-ASG_LT_VER="$(printf '%s' "$ASG_LT" | jq -r '.Version // ""')"
-ASG_IS_MIP="$(printf '%s' "$ASG_JSON" | jq -r 'if .[0].MixedInstancesPolicy then "mip" else "plain" end')"
+# --- the HOST ASG + the LT version it ACTUALLY pins (never assume $Default) --------------------------
+# CRITICAL (real-run bug): this patch targets the FIRECRACKER HOST fleet only (#331 launch-vm slots,
+# #323 host-agent KillMode in the LT userdata, #321 disk-GC). A deployment usually has TWO matching
+# ASGs — the OpenResty EDGE fleet (openclaw-edge-asg / openclaw-edge-lt) and the host fleet
+# (openclaw-hosts-asg / openclaw-host-lt). Selecting by a loose name regex and taking [0] can pick the
+# EDGE ASG and silently roll host userdata onto the wrong fleet (apply-lt.sh's floating-version guard
+# does NOT catch a wrong-but-concrete target). So: identify the host fleet by identity, require a
+# UNIQUE match, and refuse to guess. The operator can override with OC_HOST_ASG_NAME.
+ASG_ALL="$(Q autoscaling describe-auto-scaling-groups | jq -c '[.AutoScalingGroups[] | {name:.AutoScalingGroupName, lt:((.MixedInstancesPolicy.LaunchTemplate.LaunchTemplateSpecification // .LaunchTemplate // {}))}]')"
+# 1) explicit override wins (deterministic escape hatch).
+if [ -n "${OC_HOST_ASG_NAME:-}" ]; then
+  ASG_CANDS="$(printf '%s' "$ASG_ALL" | jq -c --arg n "$OC_HOST_ASG_NAME" '[.[] | select(.name==$n)]')"
+  ASG_WHY="OC_HOST_ASG_NAME override"
+else
+  # 2) prefer host identity, NEVER match "edge": ASG name or its LT name says host, and NOT edge.
+  #    (LT-name signal is the reliable discriminator: openclaw-host-lt vs openclaw-edge-lt.)
+  ASG_CANDS="$(printf '%s' "$ASG_ALL" | jq -c '[.[]
+    | . as $a
+    | (.lt.LaunchTemplateName // "") as $ltn
+    | select( (($a.name|test("host";"i")) or ($ltn|test("host";"i")))
+              and (($a.name|test("edge";"i"))|not) and (($ltn|test("edge";"i"))|not) )]')"
+  ASG_WHY="name/LT says host, not edge"
+fi
+ASG_CANDS_N="$(printf '%s' "$ASG_CANDS" | jq 'length')"
+ASG_NAME=""; ASG_LT_ID=""; ASG_LT_VER=""; ASG_IS_MIP="plain"
+if [ "$ASG_CANDS_N" = 1 ]; then
+  ASG_NAME="$(printf '%s' "$ASG_CANDS" | jq -r '.[0].name')"
+  ASG_LT_ID="$(printf '%s' "$ASG_CANDS" | jq -r '.[0].lt.LaunchTemplateId // ""')"
+  ASG_LT_VER="$(printf '%s' "$ASG_CANDS" | jq -r '.[0].lt.Version // ""')"
+  ASG_IS_MIP="$(printf '%s' "$ASG_ALL" | jq -r --arg n "$ASG_NAME" '(.[]|select(.name==$n)) as $x | "plain"')"
+  # verify the pinned LT really is a HOST template, not edge (defense in depth vs a mis-named ASG).
+  LTN="$(Q ec2 describe-launch-templates --launch-template-ids "$ASG_LT_ID" 2>/dev/null | jq -r '.LaunchTemplates[0].LaunchTemplateName // ""')" || LTN=""
+  case "$LTN" in *edge*) warn "SELECTED ASG '$ASG_NAME' pins LT '$LTN' which looks like the EDGE template — STOP and set OC_HOST_ASG_NAME to the host fleet before running apply-lt.sh";; esac
+  ASG_LT_NAME="$LTN"
+else
+  # 0 or >1: do NOT guess. Print every candidate and force the operator to disambiguate.
+  ASG_WHY="AMBIGUOUS ($ASG_CANDS_N candidates) — set OC_HOST_ASG_NAME"
+  warn "host ASG not uniquely identified ($ASG_CANDS_N candidates matched '$ASG_WHY'). Do NOT run apply-lt.sh until resolved — re-run with OC_HOST_ASG_NAME=<host-fleet-asg>. Candidates below:"
+  printf '%s' "$ASG_ALL" | jq -r '.[] | "      - \(.name)  LT=\(.lt.LaunchTemplateName // .lt.LaunchTemplateId // "?") v\(.lt.Version // "?")"' >&2
+fi
 case "$ASG_LT_VER" in '$Latest'|'$Default') warn "ASG pins '$ASG_LT_VER' (floating) — pin a concrete numeric version before an LT roll (apply-lt.sh refuses floating)";; esac
 
 # --- live host instance-ids (from the hosts table = what the scheduler sees) ------------------------
@@ -93,18 +157,23 @@ FIX_VERDICTS="$(jq -c --arg dm "$DISPATCH_MODE" --arg log "$LOGGING_ON" '
 # --- write environment.json (the machine record) ----------------------------------------------------
 jq -n --arg region "$REGION" --arg acct "$ACCT" --arg caller "$CALLER" \
       --arg api "$API_MATCH" --arg apiwhy "$API_WHY" --argjson apicands "$API_CANDIDATES" \
+      --argjson apifacts "$API_FACTS" \
       --argjson stages "$API_DEPLOYED_STAGES" --arg apitarget "$API_INTEGRATION_TARGET" \
       --argjson aliases "$API_ALIASES" --arg latestsha "$API_LATEST_SHA" --arg esm "$DISPATCH_ESM_TARGET" \
       --arg asg "$ASG_NAME" --arg ltid "$ASG_LT_ID" --arg ltver "$ASG_LT_VER" --arg ismip "$ASG_IS_MIP" \
       --arg htable "$HOSTS_TABLE" --argjson hosts "$HOST_IDS" --argjson fixes "$FIX_VERDICTS" \
       --arg dm "$DISPATCH_MODE" \
+      --arg ltname "${ASG_LT_NAME:-}" --arg asgn "$ASG_CANDS_N" --arg apin "$API_SUGGEST_N" \
   '{region:$region, account:$acct, caller_arn:$caller,
-    control_plane_api:{id:$api, why:$apiwhy, candidates:$apicands, deployed_stages:$stages,
-                       lambda_integration:$apitarget, note:"confirm with a host-SSM GET /tenants==200"},
+    control_plane_api:{id:$api, why:$apiwhy, candidates:$apicands, candidate_facts:$apifacts,
+                       deployed_stages:$stages, lambda_integration:$apitarget, candidate_count:($apin|tonumber),
+                       confirmed:false, note:"SUGGESTION ONLY, not confirmed. Pick the API your own config (PRIVATE_API_URL/CTRL_API_BASE) points to AND that answers a real call from your call site using YOUR auth (SigV4 / api key / resource-policy VPCE — see candidate_facts[].method_auth+resource_policy). Set confirmed:true only after that call succeeds."},
     lambda_link:{function:"openclaw-api", api_invokes_alias:$apitarget, aliases:$aliases,
                  latest_code_sha256:$latestsha, dispatch_sqs_esm_binds:$esm,
                  note:"update-function-code must hit BOTH the API-invoked alias AND $LATEST (dispatch ESM binds $LATEST) — 315 real-run"},
-    asg:{name:$asg, lt_id:$ltid, lt_version_pinned:$ltver, type:$ismip},
+    asg:{name:$asg, lt_id:$ltid, lt_name:$ltname, lt_version_pinned:$ltver, type:$ismip,
+         candidate_count:($asgn|tonumber),
+         note:"HOST fleet only. If name/lt_name is empty or count!=1 this is UNRESOLVED — set OC_HOST_ASG_NAME and re-run; NEVER run apply-lt.sh against an edge LT"},
     hosts:{table:$htable, instance_ids:$hosts, count:($hosts|length)},
     dispatch_mode:$dm, fix_applicability:$fixes}' > "$OUT"
 
@@ -112,17 +181,33 @@ jq -n --arg region "$REGION" --arg acct "$ACCT" --arg caller "$CALLER" \
 {
   echo; echo "======================= CONFIRM BEFORE APPLY (read every line) ======================="
   echo "account/region : $ACCT / $REGION   caller: $CALLER"
-  echo "control-plane API: ${API_MATCH}  ($API_WHY)   << rule 9: confirm host-SSM GET /tenants == 200"
+  echo "control-plane API: ${API_MATCH}  ($API_WHY)"
+  echo "  candidates + auth (match to how YOU call it — config + your auth, NOT route shape):"
+  printf '%s' "$API_FACTS" | jq -r '.[] | "     - \(.id) (\(.name))  tenants=\(.has_tenants) hosts=\(.has_hosts) proxy=\(.proxy)  method_auth=\(.method_auth) api_key=\(.api_key_required) resource_policy=\(.resource_policy)"'
   echo "  API stages     : $(printf '%s' "$API_DEPLOYED_STAGES" | jq -rc '[.[].stage]')   integrates -> ${API_INTEGRATION_TARGET:-<unknown>}"
   echo "LIVE Lambda link : openclaw-api  API invokes -> ${API_INTEGRATION_TARGET:-<confirm!>}"
   echo "  aliases        : $(printf '%s' "$API_ALIASES" | jq -rc '.')   \$LATEST sha=${API_LATEST_SHA:0:12}"
   echo "  dispatch ESM   : SQS binds -> ${DISPATCH_ESM_TARGET:-\$LATEST?}   << update-function-code must hit BOTH the API alias AND \$LATEST"
-  echo "ASG            : ${ASG_NAME:-<none found>}   LT id=$ASG_LT_ID version=$ASG_LT_VER ($ASG_IS_MIP)"
+  echo "ASG (HOST fleet): ${ASG_NAME:-<UNRESOLVED>}   LT ${ASG_LT_NAME:-$ASG_LT_ID} version=$ASG_LT_VER ($ASG_IS_MIP)   [candidates=$ASG_CANDS_N]"
   echo "hosts          : $(printf '%s' "$HOST_IDS" | jq -r 'length') live (table $HOSTS_TABLE)"
   echo "dispatch.mode  : $DISPATCH_MODE"
   echo "fix applicability (skip a CHECK/out-of-scope fix, don't force it):"
   printf '%s' "$FIX_VERDICTS" | jq -r '.[] | "   \(.id): \(.verdict)   [\(.applies_when)]"'
   echo "written to     : $OUT   (READ-ONLY probe — nothing on AWS was changed)"
+  echo
+  echo "--- TWO HARD GATES before you run apply-lt.sh / update-function-code (do NOT skip) ---"
+  echo " [ ] 1. control-plane API confirmed: from your real call site, call the API your config"
+  echo "        (PRIVATE_API_URL / CTRL_API_BASE) points to, using YOUR auth (SigV4, api key, or"
+  echo "        whatever its resource_policy/method_auth requires — see the candidates line above)."
+  echo "        It must answer (e.g. 200 on GET /tenants). A 403 usually means WRONG api OR wrong auth"
+  echo "        for THAT api ($API_SUGGEST_N candidate(s) can serve — route shape alone does NOT prove it)."
+  if [ "${ASG_CANDS_N:-0}" != 1 ]; then
+    echo " [ ] 2. HOST ASG UNRESOLVED ($ASG_CANDS_N candidates). apply-lt.sh would target the WRONG fleet."
+    echo "        Re-run:  OC_HOST_ASG_NAME=<host-fleet-asg> discover-env.sh $REGION"
+  else
+    echo " [ ] 2. HOST ASG = '$ASG_NAME' pins LT '${ASG_LT_NAME:-$ASG_LT_ID}'. Confirm this is the FIRECRACKER"
+    echo "        host fleet, NOT the edge (OpenResty) fleet — host userdata on the edge LT breaks edge."
+  fi
   echo "If any line is wrong, STOP and fix your target/credentials before touching APPLY-INSTRUCTIONS.md."
   echo "======================================================================================="
 } >&2

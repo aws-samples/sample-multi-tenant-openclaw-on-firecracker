@@ -160,3 +160,22 @@ class TestReserveHostSlotAtomic:
         assert "vm_count < :maxvm" in kwargs["ConditionExpression"]
         assert kwargs["ExpressionAttributeValues"][":maxvm"] == 10
         _reset_overcommit()
+
+    def test_condition_has_no_arithmetic(self):
+        """Live-deploy regression (1.5.8): DynamoDB ConditionExpression does
+        NOT support arithmetic — `used_vcpu + :v <= :cap` is a
+        ValidationException on real DynamoDB, but MagicMock happily accepted
+        it, so only the live e2e caught it. Guard the syntax statically: the
+        capacity ceiling must be precomputed client-side."""
+        _reset_overcommit()
+        api.hosts_table = make_ddb_table()
+        api.hosts_table.update_item.return_value = {"Attributes": {"next_vm_num": 2}}
+        api._reserve_host_slot(_host("i-x"), 2, 4096)
+        _, kwargs = api.hosts_table.update_item.call_args
+        cond = kwargs["ConditionExpression"]
+        assert "+" not in cond and "-" not in cond and "*" not in cond, (
+            f"arithmetic in ConditionExpression is invalid DynamoDB syntax: {cond}")
+        # The precomputed ceilings must reflect allocatable - requested.
+        vals = kwargs["ExpressionAttributeValues"]
+        assert vals[":max_used_v"] == int(15 * 2.0) - 2
+        assert vals[":max_used_m"] == int(32768 * 1.5) - 4096

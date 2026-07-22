@@ -18,22 +18,29 @@ file push/pull → base64 via `send-command`). All hashes are **SHA-256**.
 
 ---
 
-## Step 0 — Probe: gather the real values (run these first, fill them in)
+## Step 0 — DISCOVER: auto-probe the environment, then CONFIRM (don't hand-type these)
+
+Run the read-only discovery tool FIRST — it senses the values you'd otherwise guess (the
+LIVE control-plane API by behavior not name, which Lambda alias the API actually invokes vs
+`$LATEST`, the SQS dispatch ESM target, the ASG-pinned LT version, live host ids, and a
+per-fix applies_when verdict) and writes `environment.json`. Read its CONFIRM block and verify
+every line before proceeding — this is how two different operators start from the SAME real
+values instead of each filling a blank.
 
 ```bash
 REGION=<region>; export AWS_DEFAULT_REGION=$REGION
-aws sts get-caller-identity
-# The non-proxy control-plane API (pick by BEHAVIOR, not name — rule 9): the one with explicit
-# /tenants /hosts resources AND a host-SSM GET /tenants that returns 200 (never the /{proxy+} one).
-API_ID=<fill>
-# ASG + Launch Template that the host fleet uses, and the version the ASG ACTUALLY pins:
-ASG=<fill>; LT=<fill>
-aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG" \
-  --query 'AutoScalingGroups[0].LaunchTemplate' --output json   # note the pinned Version (NOT $Default)
-# Assets bucket + live host instance-ids:
-ASSETS=<openclaw-assets-...>; HOSTS=$(aws dynamodb scan --table-name openclaw-hosts \
-  --projection-expression host_id --query 'Items[].host_id.S' --output text)
+bash lib/discover-env.sh "$REGION"        # READ-ONLY; writes environment.json + prints CONFIRM block
+# Read the CONFIRM block. In particular verify (rule 9 + the 315 Lambda-link lesson):
+#   - control-plane API = the non-proxy one with /tenants+/hosts; PROVE it with a host-SSM
+#     GET /tenants that returns 200 (a /{proxy+} API named "-private" is the trap).
+#   - the API invokes a specific Lambda ALIAS; the dispatch SQS ESM binds $LATEST — a code
+#     update must hit BOTH, or it lands on a version nothing serves.
+#   - the ASG's pinned LT version (NOT $Default); the live host ids; each fix's IN-SCOPE/CHECK verdict.
+# If any line is wrong, STOP and fix your target/credentials. Only then use the values below.
 ```
+
+Everything downstream reads from `environment.json` (API id, `lambda_link.api_invokes_alias`,
+`asg.lt_version_pinned`, `hosts.instance_ids`) — no hand-typed resource names.
 
 ## Step 1 — Impact assessment (write before changing anything)
 
@@ -165,8 +172,15 @@ rm -rf core services routes consumers handler.py   # first-party dirs only; KEEP
 cp -r <patch>/lambda/api/{core,services,routes,consumers,handler.py,requirements.txt} .
 zip -qr /tmp/new.zip . && aws lambda update-function-code --function-name openclaw-api --zip-file fileb:///tmp/new.zip --region $REGION
 aws lambda wait function-updated --function-name openclaw-api --region $REGION
-# invoke-verify: FunctionError=None (a 404 body on a private API /ping is EXPECTED, not a failure)
-# rollback covers BOTH the alias (API GW) AND $LATEST (the dispatch SQS ESM binds $LATEST).
+# invoke-verify on $LATEST FIRST: FunctionError=None (a 404 body on a private API /ping is EXPECTED).
+# NOW cover BOTH serving paths (environment.json lambda_link) — update-function-code only moved $LATEST:
+#   • dispatch SQS ESM binds $LATEST  -> already covered by the update above.
+#   • API GW invokes a specific ALIAS -> publish a version from the new $LATEST and repoint that alias,
+#     else the HTTP path keeps serving the OLD code:
+ALIAS=$(jq -r .lambda_link.api_invokes_alias environment.json | grep -oE '[^:]+$')   # the alias the API actually invokes
+VER=$(aws lambda publish-version --function-name openclaw-api --region $REGION --query Version --output text)
+aws lambda update-alias --function-name openclaw-api --name "$ALIAS" --function-version "$VER" --region $REGION
+# rollback = redeploy the prior zip to $LATEST AND repoint $ALIAS back to its prior version (record both first).
 ```
 
 ## Step 5 — Post-fix: fresh-machine validation

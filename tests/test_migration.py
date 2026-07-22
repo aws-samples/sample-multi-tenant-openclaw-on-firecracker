@@ -51,6 +51,11 @@ os.environ.setdefault("TENANTS_TABLE", "openclaw-tenants")
 os.environ.setdefault("HOSTS_TABLE", "openclaw-hosts")
 os.environ.setdefault("ASSETS_BUCKET", "test")
 os.environ.setdefault("ROOTFS_PREFIX", "deployment/rootfs")
+# These migration tests assume balloon is OFF (the balloon migrate guard,
+# handler.py:957, short-circuits to 409 when BALLOON_ENABLED). The handler
+# reads BALLOON_ENABLED once, at the module import below, so pin it here in
+# case an earlier-collected test module (test_balloon.py) left it "true".
+os.environ["BALLOON_ENABLED"] = "false"
 
 # Make tenants_table and hosts_table independent MagicMocks so per-table
 # return_values don't bleed across calls.
@@ -340,3 +345,62 @@ class TestMigrationCapacityCheck:
             r = handler.lambda_handler(ev, None)
         assert r["statusCode"] == 409
         assert "draining" in r["body"].lower()
+
+
+# ═══════════════════════════════════════════
+# Issue #72 — balloon guard: live migrate must fail FAST (before any SSM /
+# snapshot) with an actionable error when memory overcommit (balloon) is on,
+# because Firecracker can't snapshot a VM with an active balloon device.
+# ═══════════════════════════════════════════
+
+
+@pytest.mark.unit
+class TestMigrationBalloonGuard:
+    def test_rejects_when_balloon_enabled_with_actionable_error(self):
+        handler.tenants_table.get_item.return_value = {
+            "Item": {"id": "t1", "host_id": "i-source", "vm_num": 1,
+                     "vcpu": 2, "mem_mb": 4096, "status": "running"},
+        }
+        ev = _migrate_event("t1", body={"target_host_id": "i-target"})
+        with patch.object(handler, "BALLOON_ENABLED", True), \
+             patch.object(handler, "_ssm_send") as mock_send:
+            r = handler.lambda_handler(ev, None)
+        assert r["statusCode"] == 409, f"expected 409 got {r}"
+        body = json.loads(r["body"])
+        assert body["reason"] == "balloon_enabled"
+        # Actionable: tells the operator how to move the tenant (backup+restore).
+        assert "back it up" in body["error"].lower()
+        # Fail-fast: never reached the snapshot SSM command.
+        mock_send.assert_not_called()
+
+    def test_fires_before_target_validation(self):
+        """The balloon 409 must precede target-host lookup — a missing target
+        should still surface the balloon error, not a 404, when balloon is on."""
+        handler.tenants_table.get_item.return_value = {
+            "Item": {"id": "t1", "host_id": "i-source", "vm_num": 1,
+                     "vcpu": 2, "mem_mb": 4096, "status": "running"},
+        }
+        handler.hosts_table.get_item.return_value = {}  # target "missing"
+        ev = _migrate_event("t1", body={"target_host_id": "i-does-not-exist"})
+        with patch.object(handler, "BALLOON_ENABLED", True):
+            r = handler.lambda_handler(ev, None)
+        assert r["statusCode"] == 409
+        assert json.loads(r["body"])["reason"] == "balloon_enabled"
+
+    def test_allows_migrate_when_balloon_disabled(self):
+        """Sanity: with balloon off, a valid request proceeds to 202 (not 409)."""
+        handler.tenants_table.get_item.return_value = {
+            "Item": {"id": "t1", "host_id": "i-source", "vm_num": 1,
+                     "vcpu": 2, "mem_mb": 4096, "status": "running"},
+        }
+        handler.hosts_table.get_item.return_value = {
+            "Item": {"instance_id": "i-target", "private_ip": "10.0.0.5",
+                     "next_vm_num": 1, "used_vcpu": 0, "used_mem_mb": 0,
+                     "vm_count": 0, "total_vcpu": 4, "total_mem_mb": 16384,
+                     "status": "active"},
+        }
+        ev = _migrate_event("t1", body={"target_host_id": "i-target"})
+        with patch.object(handler, "BALLOON_ENABLED", False), \
+             patch.object(handler, "_ssm_send", return_value="cmd-1"):
+            r = handler.lambda_handler(ev, None)
+        assert r["statusCode"] == 202, f"expected 202 got {r}"

@@ -85,6 +85,21 @@ def _api(method, path, body=None, timeout=30, max_retries=3):
     raise urllib.error.URLError(f"exhausted {max_retries} retries: {last_err}")
 
 
+def _skip_if_rbac_forbidden(status, body):
+    """Skip (don't fail) when the API key lacks the operator role.
+
+    Write-path e2e tests need an `operator`+ key. When RBAC is on and the
+    configured key resolves to `viewer`, the handler returns 403 with an
+    `rbac` body BEFORE doing anything — so no resource is created and it's
+    safe to treat this as an environment gap, not a code failure. This is a
+    read-only check on a response we already have; it never issues a probe
+    write of its own.
+    """
+    if status in (401, 403) and isinstance(body, dict) and body.get("rbac"):
+        pytest.skip(f"API key role={body['rbac'].get('role')!r} lacks "
+                    f"{body['rbac'].get('required')!r} — skipping write-path e2e")
+
+
 # ═══════════════════════════════════════════
 # API connectivity
 # ═══════════════════════════════════════════
@@ -140,6 +155,7 @@ class TestTenantLifecycle:
         status, body = _api("POST", "tenants", {"name": self.TENANT_NAME, "vcpu": 1, "mem_mb": 2048})
         if status == 500 and "AccessDenied" in str(body):
             pytest.skip("Environment IAM permissions insufficient — redeploy with latest stack.py")
+        _skip_if_rbac_forbidden(status, body)
         assert status == 201, f"Create failed: {body}"
         tenant_id = body["id"]
         assert tenant_id.startswith(f"{self.TENANT_NAME}-")
@@ -284,6 +300,7 @@ class TestBackupRestoreRoundtrip:
         status, body = _api("POST", "tenants", {"name": self.SRC_NAME, "vcpu": 1, "mem_mb": 2048})
         if status == 500 and "AccessDenied" in str(body):
             pytest.skip("IAM permissions insufficient")
+        _skip_if_rbac_forbidden(status, body)
         assert status == 201, f"Create source failed: {body}"
         src_id = body["id"]
         dst_id = None
@@ -337,6 +354,7 @@ class TestBackupRestoreRoundtrip:
             "name": "e2e-restore-badts",
             "restore_from": {"tenant_id": "nonexistent-xxxx", "timestamp": "20990101-000000"},
         })
+        _skip_if_rbac_forbidden(status, body)
         assert status == 404
 
     @pytest.mark.e2e
@@ -345,6 +363,7 @@ class TestBackupRestoreRoundtrip:
             "name": "e2e-restore-nobody",
             "restore_from": {"timestamp": "20260101-000000"},
         })
+        _skip_if_rbac_forbidden(status, body)
         assert status == 400
 
 

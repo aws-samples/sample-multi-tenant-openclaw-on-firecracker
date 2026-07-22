@@ -23,7 +23,14 @@ pytestmark = pytest.mark.unit
 
 
 def _synth_with_config(cfg_overrides):
-    base = yaml.safe_load((Path(ROOT) / "config.yml").read_text())
+    # Base off the git-tracked config.yml.example, NOT the developer's local
+    # config.yml (which is .gitignored and absent on a clean checkout / CI).
+    # config.yml.example ships cloudfront.enabled=true with empty domains =>
+    # exactly one LEGACY single-domain distribution, which is the documented
+    # zero-config default this test asserts. Reading the local config.yml made
+    # the result depend on whatever the developer had configured (e.g. a
+    # dual-domain setup => 2 distributions => spurious failure).
+    base = yaml.safe_load((Path(ROOT) / "config.yml.example").read_text())
     cfg = dict(base)
     for k, v in cfg_overrides.items():
         cfg[k] = v

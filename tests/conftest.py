@@ -9,6 +9,59 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 
+def pytest_configure(config):
+    """Ensure a config.yml exists for the test session.
+
+    config.yml is .gitignored (only config.yml.example is tracked), and
+    deploy/stack.py reads config.yml at import time. On a clean checkout / CI
+    it's absent, so every stack-synth test would die with FileNotFoundError at
+    import. Materialize it from config.yml.example for the session, and remove
+    the copy on teardown so we don't leave an untracked file behind. A
+    developer's real config.yml is left untouched.
+    """
+    import os as _os
+    here = _os.path.dirname(_os.path.abspath(__file__))
+    repo_root = _os.path.dirname(here)
+    cfg = _os.path.join(repo_root, "config.yml")
+    example = _os.path.join(repo_root, "config.yml.example")
+    if not _os.path.exists(cfg) and _os.path.exists(example):
+        import shutil
+        shutil.copyfile(example, cfg)
+        config._oc_created_config_yml = cfg
+
+
+def pytest_unconfigure(config):
+    import os as _os
+    created = getattr(config, "_oc_created_config_yml", None)
+    if created and _os.path.exists(created):
+        _os.remove(created)
+
+
+def pytest_collection_modifyitems(config, items):
+    """Skip e2e tests by default — they hit a real deployed AWS API.
+
+    pytest markers are just labels; registering `e2e` in pyproject.toml does
+    NOT deselect it. Without this hook a plain `pytest` run executes every
+    e2e test against whatever `.env.deploy` points at, which fails (e.g. a
+    viewer-role API key 403s the write-path tests) instead of skipping.
+
+    e2e tests run only when explicitly opted in:
+      - `OPENCLAW_E2E=1 pytest ...`               (CI / operator env), or
+      - `pytest tests/test_e2e.py -m e2e -v`      (the documented invocation;
+        the `-m e2e` selector puts "e2e" in the mark expression).
+    """
+    if os.environ.get("OPENCLAW_E2E") == "1":
+        return
+    if "e2e" in (config.option.markexpr or ""):
+        return
+    skip_e2e = pytest.mark.skip(
+        reason="e2e tests need OPENCLAW_E2E=1 or `-m e2e` (they call a real AWS API)"
+    )
+    for item in items:
+        if "e2e" in item.keywords:
+            item.add_marker(skip_e2e)
+
+
 @pytest.fixture(autouse=True)
 def _fast_clock(request):
     """Make sleep-based polling loops finish instantly in unit tests.

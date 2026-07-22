@@ -130,6 +130,7 @@ class DispatchInfra(Construct):
         cfg: Dict[str, Any],
         api_fn: _lambda.IFunction,
         host_role: iam.IRole,
+        host_launch_slots: int = 30,
         removal_policy: Optional[RemovalPolicy] = None,
     ) -> None:
         super().__init__(scope, construct_id)
@@ -150,6 +151,17 @@ class DispatchInfra(Construct):
                 "or 'ddb' (interfaces.md L11)."
             )
         self.mode = mode
+
+        # #331/#327 — host 级冷启动并发槽数,注入 Lambda 的 DISPATCH_HOST_LAUNCH_CONCURRENCY
+        # (SSM 超时公式分母)。【单一来源】= 调用方(compute.py)从 vm.host_launch_slots 读入传进来,
+        # 与 ha_edge.py 注入 host 侧 OC_HOST_LAUNCH_SLOTS 同读一处,不再各读各的(codex #4)。
+        # 校验正整数,非法(0/负/非数)fail-safe 回落 30,防两侧漂移或 migrate 抢锁死循环。
+        try:
+            self._launch_slots = int(host_launch_slots)
+        except (TypeError, ValueError):
+            self._launch_slots = 30
+        if self._launch_slots < 1:
+            self._launch_slots = 30
 
         # dev 环境 assignments 表用 DESTROY,生产由调用方覆盖为 RETAIN。默认 DESTROY 跟
         # SPEC L105(RemovalPolicy DESTROY(dev))对齐。删表算不可逆(铁律#4),生产
@@ -434,9 +446,20 @@ class DispatchInfra(Construct):
             "DISPATCH_MODE": self.mode,
             "ASSIGNMENTS_TABLE": self.assignments_table.table_name,
             "DISPATCH_PARAM_PREFIX": _PARAM_PREFIX,
-            # 下面三个是运行时可调的默认值,契约默认写死在这里,想改运行时行为
-            # 应直接改 SSM /openclaw/dispatch/config,不重 deploy。
-            "DISPATCH_MAX_PARALLEL": "96",
+            # 下面几个是默认值,写在 Lambda 环境变量里。⚠️(codex #327 Error4)当前【只有 andon
+            # 字段】从 SSM /openclaw/dispatch/config 热读(见 dispatch_service._check_andon);
+            # 下面这些旋钮只能改 Lambda env(update-function-configuration)后生效,不是改 SSM config。
+            # 之前注释误称"改 SSM config 不重 deploy"——已更正:改这些要动 Lambda env,不重 cdk deploy 即可。
+            "DISPATCH_MAX_PARALLEL": "96",  # 装箱密度(per_host_cap),一批往一台塞几个 VM
+            # #331/#327 — host 级冷启动并发(SSM 超时公式分母 + launch-vm MAX_PARALLEL),
+            # 须与 host 侧 OC_HOST_LAUNCH_SLOTS 同值(默认 30)。要调改这里 + ha_edge 的
+            # vm.host_launch_slots 两处一起改(两侧同一物理含义,分别注入 Lambda / host)。
+            "DISPATCH_HOST_LAUNCH_CONCURRENCY": str(self._launch_slots),
             "DISPATCH_INFLIGHT_TTL_SEC": "180",
             "DISPATCH_RETRY_BUDGET": "3",
+            # #340 — dispatch 磁盘软门:host /data 物理剩余低于此(MB)不接新租户;上报超此
+            # 秒数视为陈旧、跳过该门(fail-open)。改这两个同样是动 Lambda env(不重 cdk deploy)。
+            # 0 关门。默认留一个默认 data 盘余量给新租户初始写入。
+            "DISPATCH_HOST_DISK_MIN_FREE_MB": "2048",
+            "DISPATCH_DISK_REPORT_TTL_SEC": "90",
         }

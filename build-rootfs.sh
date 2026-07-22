@@ -950,6 +950,40 @@ WantedBy=default.target
 GWSVC
 ln -sf ../openclaw-gateway.service /home/agent/.config/systemd/user/default.target.wants/openclaw-gateway.service
 
+# --- guest log forwarder (vsock) user unit ---
+# tail 三类 OpenClaw 日志 → guest 主动 connect vsock → host 侧 reader。guest 零凭据,
+# 只往本地 vsock 写(学 Lambda/FireLens:凭据在 host 侧,不在 guest)。默认不采集:
+# host 侧 launch-vm 只在 OC_GUEST_LOG_ENABLED=true 时才 PUT /vsock;forwarder connect
+# 失败即丢行不阻塞,所以未启用时它空跑无害(不拖垮 gateway)。脚本 :OCFWDBIN 段装入。
+#
+# 【放 rootfs 全局 user 目录 /usr/lib/systemd/user,不放 data 盘 /home/agent/.config】
+# 因为 /home/agent 是 data 盘(vdc),存量租户 rebuild 换 rootfs 时复用旧 data.ext4 →
+# 若 unit 在 data 盘,存量租户升级后只有新脚本没有 unit,采集永不启动(codex 复审抓出:
+# "rebuild 后仍有效"的硬要求)。rootfs 每次 rebuild 刷新,全局 user unit 随之更新,
+# 存量租户换 rootfs 即拿到。全局 enable 用 /usr/lib/systemd/user/default.target.wants。
+mkdir -p /usr/lib/systemd/user/default.target.wants
+cat > /usr/lib/systemd/user/openclaw-log-forwarder.service << 'FWDSVC'
+[Unit]
+Description=OpenClaw guest log forwarder (tail -> vsock -> host)
+After=openclaw-gateway.service
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/oc-guest-log-forwarder.py
+Restart=always
+RestartSec=5
+Environment=HOME=/home/agent
+# 背压兜底 + 零凭据:纯本地 vsock 写,无出网、无云凭据。收紧权限(仿 gateway)。
+NoNewPrivileges=true
+CapabilityBoundingSet=
+RestrictSUIDSGID=true
+MemoryMax=128M
+TasksMax=16
+
+[Install]
+WantedBy=default.target
+FWDSVC
+ln -sf ../openclaw-log-forwarder.service /usr/lib/systemd/user/default.target.wants/openclaw-log-forwarder.service
+
 # Delegate the memory/cpu/pids cgroup controllers to the agent's user manager so
 # the gateway service's MemoryMax / CPUQuota / TasksMax above actually bite.
 # Without delegation, a systemd *user* service silently ignores resource limits
@@ -985,6 +1019,10 @@ CHROOT
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 sudo cp "${SCRIPT_DIR}/deploy/userdata/overlay-init" "${ROOTFS_DIR}/sbin/overlay-init"
 sudo chmod +x "${ROOTFS_DIR}/sbin/overlay-init"
+
+# Install guest log forwarder (referenced by openclaw-log-forwarder.service above)
+sudo cp "${SCRIPT_DIR}/deploy/userdata/oc-guest-log-forwarder.py" "${ROOTFS_DIR}/usr/local/bin/oc-guest-log-forwarder.py"
+sudo chmod 755 "${ROOTFS_DIR}/usr/local/bin/oc-guest-log-forwarder.py"
 
 # Unmount chroot binds first
 sudo umount -l ${ROOTFS_DIR}/proc ${ROOTFS_DIR}/sys ${ROOTFS_DIR}/dev

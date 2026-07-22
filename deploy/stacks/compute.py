@@ -106,6 +106,11 @@ def build_compute(self, ctx):
             cfg=_dispatch_cfg,
             api_fn=api_fn,
             host_role=host_role,
+            # #331/#327 — host 级冷启动并发槽数【单一来源】= vm.host_launch_slots(与 ha_edge.py
+            # 注入 host 侧 OC_HOST_LAUNCH_SLOTS 同读一处,避免 dispatch/vm 两处配置漂移,codex #4)。
+            # 传原值不裸 int()(非数字会炸 synth);dispatch_infra 内 try/except 校验回落 30,与 ha_edge
+            # 同款 fail-safe。
+            host_launch_slots=(CFG.get("vm", {}) or {}).get("host_launch_slots", 30),
         )
         # 契约 env(interfaces.md L6-17)注入 api_fn。lifecycle_consumer 复用同一
         # handler 代码,create_via_queue 迁移期两者共存,一并给到 consumer,避免
@@ -225,7 +230,7 @@ def build_compute(self, ctx):
         # naive path (features=[{RUNTIME_MONITORING, ENABLED}]) also flips
         # EC2_AGENT_MANAGEMENT to ENABLED at the account level, and that
         # associates SSM to auto-install the GuardDuty agent on EVERY EC2
-        # in the account (evidence: internal-docs/00-knowledge-base/evidence/
+        # in the account (evidence: engineering/00-knowledge-base/evidence/
         # metal-experiments/8layer-evidence.md:163-181 — AWS "how runtime
         # monitoring works ec2" doc). That is not safe for a shared account
         # hosting other teams' hosts.

@@ -1,0 +1,380 @@
+{
+  "synced_at": "2026-07-22 20:00 (UTC+8)",
+  "base_sha": "c55997cb2f8c8989ff7169c7f17136bbcb118706",
+  "source_commit": "98200f9e8bdd097baf259b38c856b4405e5549de",
+  "commit_count": 56,
+  "file_count": 38,
+  "summary": "Sync the bb increment c55997cb..98200f9e to the public gateway branch. Sync-LOG only (which customer-facing files reached gateway + the issues behind them); the applyable patch kit is NOT built yet (folded_into pending).",
+  "issues_synced_note": "Index back to the issue tracker for whoever builds the patch kit: before assembling the kit, walk each issue and confirm it's covered. `title` is a ≤20-char gist only — open the issue for the full problem/fix/test. Lists only issues that touched a released file this sync.",
+  "issues_synced": [
+    {
+      "id": "#321",
+      "type": "fix",
+      "title": "host 磁盘泄漏"
+    },
+    {
+      "id": "#323",
+      "type": "fix",
+      "title": "host-agent.service 缺…"
+    },
+    {
+      "id": "#324",
+      "type": "fix",
+      "title": "deploy-clawpool all-…"
+    },
+    {
+      "id": "#330",
+      "type": "fix",
+      "title": "异步 dispatch 容量账本按 VM…"
+    },
+    {
+      "id": "#331",
+      "type": "fix",
+      "title": "host-agent recover/r…"
+    },
+    {
+      "id": "#336",
+      "type": "fix",
+      "title": "copy-file-from-s3"
+    },
+    {
+      "id": "#338",
+      "type": "feat",
+      "title": "pull-image 进度接入 Flue…"
+    },
+    {
+      "id": "#340",
+      "type": "fix",
+      "title": "dispatch 容量账本缺磁盘维度"
+    },
+    {
+      "id": "#343",
+      "type": "fix",
+      "title": "pull-image 成功后漏写 hos…"
+    },
+    {
+      "id": "#345",
+      "type": "feat",
+      "title": "guest 日志经 vsock 实时采集"
+    },
+    {
+      "id": "#353",
+      "type": "fix",
+      "title": "删除 tenant-secrets 密文…"
+    }
+  ],
+  "needs_config_on_apply": [
+    {
+      "file": "config.yml.example",
+      "param": "host_launch_slots",
+      "change": "new",
+      "value": "30"
+    },
+    {
+      "file": "deploy/stacks/storage.py",
+      "param": "DDB-TTL / RemovalPolicy",
+      "change": "state-change (apply out-of-band on live tables — a template edit alone won't)"
+    },
+    {
+      "file": "deploy/userdata/host-agent.service",
+      "param": "KillMode",
+      "change": "systemd-directive",
+      "value": "process"
+    }
+  ],
+  "updated_files": {
+    "cdk-stack (cdk deploy OR hand-apply)": [
+      {
+        "path": "deploy/stacks/compute.py",
+        "status": "modified",
+        "issues": [
+          "#331"
+        ]
+      },
+      {
+        "path": "deploy/stacks/ha_edge.py",
+        "status": "modified",
+        "issues": [
+          "#331"
+        ]
+      },
+      {
+        "path": "deploy/stacks/lambdas.py",
+        "status": "modified",
+        "issues": [
+          "#336"
+        ]
+      },
+      {
+        "path": "deploy/stacks/storage.py",
+        "status": "modified",
+        "issues": [
+          "#353"
+        ]
+      }
+    ],
+    "console (static assets, S3 sync)": [
+      {
+        "path": "deploy/console-bff/web/index.html",
+        "status": "modified",
+        "issues": [
+          "#336"
+        ]
+      },
+      {
+        "path": "deploy/console-bff/web/js/app.core.js",
+        "status": "modified",
+        "issues": [
+          "#336"
+        ]
+      },
+      {
+        "path": "deploy/console-bff/web/js/app.hosts.js",
+        "status": "modified",
+        "issues": [
+          "#336"
+        ]
+      }
+    ],
+    "docs": [
+      {
+        "path": "docs/api/copy-file-from-s3-api.md",
+        "status": "added",
+        "issues": [
+          "#336"
+        ]
+      },
+      {
+        "path": "docs/api/pull-image-api.md",
+        "status": "added",
+        "issues": [
+          "#336"
+        ]
+      },
+      {
+        "path": "docs/pull-image-flow-333.excalidraw",
+        "status": "added",
+        "issues": [
+          "#336"
+        ]
+      },
+      {
+        "path": "docs/pull-image-flow-333.png",
+        "status": "added",
+        "issues": [
+          "#336"
+        ]
+      }
+    ],
+    "edge (OpenResty / Fluent Bit host config)": [
+      {
+        "path": "deploy/edge/fluent-bit/host/extract_tenant_id.lua",
+        "status": "modified",
+        "issues": [
+          "#345"
+        ]
+      },
+      {
+        "path": "deploy/edge/fluent-bit/host/fluent-bit.conf",
+        "status": "modified",
+        "issues": [
+          "#345"
+        ]
+      },
+      {
+        "path": "deploy/edge/fluent-bit/host/parsers.conf",
+        "status": "modified",
+        "issues": [
+          "#345"
+        ]
+      }
+    ],
+    "host-scripts (S3-pulled / baked into rootfs)": [
+      {
+        "path": "deploy/userdata/host-agent.py",
+        "status": "modified",
+        "issues": [
+          "#321",
+          "#340"
+        ]
+      },
+      {
+        "path": "deploy/userdata/host-agent.service",
+        "status": "modified",
+        "issues": [
+          "#323"
+        ]
+      },
+      {
+        "path": "deploy/userdata/init-host.sh",
+        "status": "modified",
+        "issues": [
+          "#324",
+          "#331",
+          "#345"
+        ]
+      },
+      {
+        "path": "deploy/userdata/launch-vm.sh",
+        "status": "modified",
+        "issues": [
+          "#331",
+          "#345",
+          "#353"
+        ]
+      },
+      {
+        "path": "deploy/userdata/migrate-vm.sh",
+        "status": "modified",
+        "issues": [
+          "#331"
+        ]
+      },
+      {
+        "path": "deploy/userdata/oc-guest-log-forwarder.py",
+        "status": "added",
+        "issues": [
+          "#345"
+        ]
+      },
+      {
+        "path": "deploy/userdata/oc-guest-log-reader.py",
+        "status": "added",
+        "issues": [
+          "#345"
+        ]
+      }
+    ],
+    "lambda (update-function-code only)": [
+      {
+        "path": "deploy/lambda/api/core/auth.py",
+        "status": "modified",
+        "issues": [
+          "#336"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/clients.py",
+        "status": "modified",
+        "issues": [
+          "#331",
+          "#340",
+          "#353"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/dispatch/__init__.py",
+        "status": "modified",
+        "issues": [
+          "#330"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/dispatch/binpack.py",
+        "status": "modified",
+        "issues": [
+          "#330",
+          "#340"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/scheduling.py",
+        "status": "modified",
+        "issues": [
+          "#336"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/handler.py",
+        "status": "modified",
+        "issues": [
+          "#336"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/dispatch_poller.py",
+        "status": "modified",
+        "issues": [
+          "#330"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/dispatch_service.py",
+        "status": "modified",
+        "issues": [
+          "#330",
+          "#331",
+          "#340"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/host_service.py",
+        "status": "modified",
+        "issues": [
+          "#336",
+          "#338",
+          "#343"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/tenant_service.py",
+        "status": "modified",
+        "issues": [
+          "#321",
+          "#336",
+          "#353"
+        ]
+      },
+      {
+        "path": "deploy/lib/dispatch_infra.py",
+        "status": "modified",
+        "issues": [
+          "#331",
+          "#340"
+        ]
+      }
+    ],
+    "root / other": [
+      {
+        "path": "build-rootfs.sh",
+        "status": "modified",
+        "issues": [
+          "#345"
+        ]
+      },
+      {
+        "path": "config.yml.example",
+        "status": "modified",
+        "issues": [
+          "#331"
+        ]
+      },
+      {
+        "path": "setup.sh",
+        "status": "modified",
+        "issues": [
+          "#324",
+          "#345"
+        ]
+      }
+    ],
+    "scripts": [
+      {
+        "path": "scripts/PREFLIGHT-README.md",
+        "status": "added"
+      },
+      {
+        "path": "scripts/checks/preflight-region.sh",
+        "status": "added",
+        "issues": [
+          "#324"
+        ]
+      },
+      {
+        "path": "scripts/preflight-check.sh",
+        "status": "added"
+      }
+    ]
+  },
+  "folded_into": "(pending) — no patch kit built for this sync yet; a later kit should cite this manifest as source-of-record and set base_sha/patch_sha. cdk deploy is FORBIDDEN on hand-modified live deployments — the kit must ship *.patched host scripts + the full lambda tree + AWS CLI for stack changes, same shape as patch/315-concurrent-dispatch-rollup/."
+}

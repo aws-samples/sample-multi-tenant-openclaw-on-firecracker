@@ -665,6 +665,25 @@
                       x-text="h.rootfs_version||''"
                     ></span>
                   </div>
+                  <!-- #309 — 从 S3 复制【单个文件】到这台 host(目标限 host 脚本根:
+                       /opt/openclaw/ 或 /home/ubuntu/)。放在 snapshot 行之上。 -->
+                  <template x-if="canWrite()">
+                    <div
+                      class="host-row"
+                      style="gap: 6px; margin-top: 4px"
+                      @click.stop
+                    >
+                      <span class="host-label">copy</span>
+                      <button
+                        class="btn-act"
+                        style="font-size: 11px; white-space: nowrap; flex-shrink: 0"
+                        title="Copy a single file from S3 to this host (host scripts: /opt/openclaw/ or /home/ubuntu/)"
+                        @click.stop="openCopyFileModal(h.instance_id)"
+                      >
+                        Copy file S3→EC2
+                      </button>
+                    </div>
+                  </template>
                   <!-- #217 — 当前 host 装的快照版本(pull-image 成功后写 hosts.snapshot_time);
                        显示 snapshot_time(rootfs版),rootfs 版从 snapshots 列表按 time 反查 label。
                        没做过 snapshot pull 的 host 无此字段,整行隐藏。 -->
@@ -730,6 +749,33 @@
                       </button>
                     </div>
                   </template>
+                  <!-- #309 — pull-image 进度:host 处于 upgrading 时,poll 循环持续拉
+                       /tmp/<job_id>.txt 末行,inline 显示实时状态。放在 pull 行之下。
+                       只读,所有角色可见。 -->
+                  <div
+                    class="host-row"
+                    x-show="h.status === 'upgrading'"
+                    style="
+                      gap: 6px;
+                      margin-top: 4px;
+                      align-items: flex-start;
+                    "
+                  >
+                    <span class="host-label">progress</span>
+                    <span
+                      style="
+                        flex: 1;
+                        min-width: 0;
+                        font-size: 11px;
+                        line-height: 1.4;
+                        color: var(--cyan);
+                        white-space: normal;
+                        word-break: break-word;
+                      "
+                      :title="pullProgress[h.instance_id] || 'installing…'"
+                      x-text="pullProgress[h.instance_id] || 'installing…'"
+                    ></span>
+                  </div>
                 </div>
               </template>
             </div>
@@ -3647,6 +3693,86 @@ openclaw_vm_disk_used_pct &gt; 90</pre
             <button class="btn btn-cyan btn-sm" @click="createGroup()">
               Create
             </button>
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <!-- #309 — Copy file S3→EC2 modal (in-app, replaces native prompt). -->
+    <!-- #333 — 太容易误关(填了 s3_uri/target 点偏就丢)。close 只留【明确动作】:右上角 X
+         或 Cancel 按钮。①遮罩点击【不关】(去掉 @click.self,防点偏/拖选松手误关)②keydown.stop
+         隔离按键、不加 Escape ③打开自动聚焦输入框、按钮 type=button(防误触发)。 -->
+    <template x-if="copyModal.show">
+      <div class="overlay">
+        <div class="modal" style="width: 620px; position: relative" @keydown.stop>
+          <button
+            type="button"
+            class="close-btn"
+            @click="closeCopyFileModal()"
+            :disabled="copyModal.busy"
+            title="Close"
+          >
+            <svg class="icon s16"><use href="#i-delete" /></svg>
+          </button>
+          <h3>Copy file: S3 → EC2 host</h3>
+          <div
+            style="font-size: 11px; color: var(--gray); margin: -4px 0 10px"
+            x-text="'Host: ' + copyModal.host_id"
+          ></div>
+          <div class="form-row">
+            <label>S3 object</label>
+            <input
+              type="text"
+              x-model="copyModal.s3_uri"
+              x-init="$nextTick(() => $el.focus())"
+              @keydown.enter.prevent="!copyModal.busy && submitCopyFile()"
+              placeholder="s3://bucket/path/to/file"
+              style="width: 100%"
+            />
+          </div>
+          <div class="form-row">
+            <label>Target path on EC2 host</label>
+            <input
+              type="text"
+              x-model="copyModal.target"
+              @keydown.enter.prevent="!copyModal.busy && submitCopyFile()"
+              placeholder="/opt/openclaw/..."
+              style="width: 100%"
+            />
+            <small style="color: var(--gray); font-size: 11px"
+              >For host scripts. Must be under <code>/opt/openclaw/</code> (.py
+              host-agent) or <code>/home/ubuntu/</code> (.sh + lib/*) — server-enforced
+              allowlist. Include the destination filename.</small
+            >
+          </div>
+          <div
+            x-show="copyModal.error"
+            style="color: var(--red); font-size: 12px; margin-top: 6px"
+            x-text="copyModal.error"
+          ></div>
+          <div
+            style="
+              display: flex;
+              gap: 8px;
+              justify-content: flex-end;
+              margin-top: 12px;
+            "
+          >
+            <button
+              type="button"
+              class="btn btn-outline btn-sm"
+              @click="closeCopyFileModal()"
+              :disabled="copyModal.busy"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              class="btn btn-cyan btn-sm"
+              @click="submitCopyFile()"
+              :disabled="copyModal.busy"
+              x-text="copyModal.busy ? 'Copying…' : 'Copy'"
+            ></button>
           </div>
         </div>
       </div>

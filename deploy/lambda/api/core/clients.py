@@ -41,7 +41,7 @@ CLAWPOOL_CMK_ARN = os.environ.get("CLAWPOOL_CMK_ARN", "")
 # when security.clawpool_cmk_enabled=false → GET /clawpool-rsa-public-key returns 404.
 CLAWPOOL_RSA_CMK_ARN = os.environ.get("CLAWPOOL_RSA_CMK_ARN", "")
 
-# #187 P1 — 短寿命密文表(pk=tenant_id,TTL=expires_at=now+900),存 gateway token
+# #187 P1 — 密文表(pk=tenant_id,#353 起无 TTL,随租户生命周期长存),存 gateway token
 # 密文(tenant_id EncryptionContext)。控制面 mint、reveal 从这里读;host 侧不读该表
 # (host 走 SSM 位置 12 参数拿密文,和 #118 host 直读 injected_credentials from
 # tenants_table 是两条独立路径)。Absent → gate 该功能没启用(P1 未部署环境用),
@@ -238,6 +238,15 @@ DISPATCH_PARAM_PREFIX = os.environ.get("DISPATCH_PARAM_PREFIX", "/openclaw/dispa
 
 DISPATCH_MAX_PARALLEL = int(os.environ.get("DISPATCH_MAX_PARALLEL", "96") or "96")
 
+# #331/#327 — host 侧【真实】冷启动并发(launch-vm.sh 跨进程 flock 槽数 OC_HOST_LAUNCH_SLOTS
+# 的镜像值,默认 30)。仅用于 SSM executionTimeout 公式的分母:VM 现在经 host 级槽闸【排队限速】
+# 起,有效并发是槽数(~30)不是装箱密度 DISPATCH_MAX_PARALLEL(96)。用 96 算会低估耗时 → 一批
+# 排队尾部的 VM 还没起完 SSM 就假超时 → 回滚活 VM → 账本分叉(codex #327 Error2)。两值须一致
+# (都由 config vm.host_launch_slots 派生),这里给默认兜底。
+DISPATCH_HOST_LAUNCH_CONCURRENCY = int(
+    os.environ.get("DISPATCH_HOST_LAUNCH_CONCURRENCY", "30") or "30"
+)
+
 DISPATCH_INFLIGHT_TTL_SEC = int(
     os.environ.get("DISPATCH_INFLIGHT_TTL_SEC", "180") or "180"
 )
@@ -269,6 +278,24 @@ DISPATCH_CIRCUIT_THRESHOLD = int(
 # executionTimeout. host-parallelism defaults to DISPATCH_MAX_PARALLEL.
 DISPATCH_PER_VM_BUDGET_SEC = int(
     os.environ.get("DISPATCH_PER_VM_BUDGET_SEC", "8") or "8"
+)
+
+# #340 — dispatch 磁盘软门水位(MB):host /data 物理剩余低于此值就不再接新租户。
+# 根因:CAS 只门控 vcpu/mem,看不见磁盘;高密度下 /data 被存量活 VM 真实占满(data.ext4
+# 是稀疏盘,随使用逐渐写实),新租户被派过来 `mkdir ${VM_DIR}` 报 No space → requires_intervention。
+# host-agent 独立线程(_disk_report_loop)用 statvfs('/data') 写 host 表 avail_disk_mb;
+# 装箱侧据此排除盘将满的 host。这是【软门】(装箱侧过滤,同 inflight_ok),不是 CAS 硬账本
+# ——完整声明式磁盘预留触 DDB 状态机(高危),留 #332/#339。0 = 关闭该门(纯旧行为)。
+# 默认 2048MB:留出至少一个默认 data 盘(VM_DATA_DISK_MB)的物理余量给新租户初始写入。
+DISPATCH_HOST_DISK_MIN_FREE_MB = int(
+    os.environ.get("DISPATCH_HOST_DISK_MIN_FREE_MB", "2048") or "2048"
+)
+
+# #340 — host 磁盘上报新鲜度阈值(秒):avail_disk_mb 的 disk_check_ts_epoch 超过此秒数视为
+# 陈旧,磁盘门对该 host 【跳过】(fail-open,退回旧行为)。防 host-agent 挂了/旧 host 从没
+# 上报时,用过期读数误杀整台 host。默认 90s(3× 默认 poll 15s,容一次漏报);0 = 不校验新鲜度。
+DISPATCH_DISK_REPORT_TTL_SEC = int(
+    os.environ.get("DISPATCH_DISK_REPORT_TTL_SEC", "90") or "90"
 )
 
 # SQS visibility timeout — used to cap the SSM executionTimeout so a slow SSM

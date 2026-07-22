@@ -7,6 +7,12 @@ set -uo pipefail
 E2E_PROFILE="${E2E_PROFILE:-jiasunm-neo}"
 E2E_REGION="${E2E_REGION:-ap-northeast-1}"
 
+# 1.5.9: under RBAC the shared api key is `viewer`; write calls (create/backup/
+# delete) need an operator id_token. OC_E2E_ID_TOKEN authorizes them; without
+# RBAC the header is ignored. Kept as an array so it expands to nothing when unset.
+E2E_AUTH_HDR=()
+[ -n "${OC_E2E_ID_TOKEN:-}" ] && E2E_AUTH_HDR=(-H "Authorization: Bearer ${OC_E2E_ID_TOKEN}")
+
 # Hosts (use describe to discover, fail loudly if not found)
 e2e_az_a_host() {
   aws ec2 describe-instances --profile "$E2E_PROFILE" --region "$E2E_REGION" \
@@ -77,7 +83,7 @@ e2e_lambda_log_last_failover() {
 e2e_create_tenant() {
   local name="$1" host_id="$2" vcpu="${3:-1}" mem_mb="${4:-2048}"
   curl -s -X POST "${API_URL}tenants" \
-    -H "x-api-key: $API_KEY" \
+    -H "x-api-key: $API_KEY" "${E2E_AUTH_HDR[@]}" \
     -d "{\"name\":\"${name}\",\"vcpu\":${vcpu},\"mem_mb\":${mem_mb},\"preferred_host_id\":\"${host_id}\",\"tags\":{\"purpose\":\"e2e-failover\"}}" \
     | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))"
 }
@@ -104,7 +110,7 @@ e2e_get_tenant_field() {
 e2e_trigger_backup_and_wait() {
   local tenant_id="$1"
   curl -s -X POST "${API_URL}tenants/${tenant_id}/backup" \
-    -H "x-api-key: $API_KEY" >/dev/null
+    -H "x-api-key: $API_KEY" "${E2E_AUTH_HDR[@]}" >/dev/null
   # Wait for the .gz to appear in S3
   for i in $(seq 1 18); do
     sleep 3
@@ -141,7 +147,7 @@ e2e_alb_rule_target_for() {
 
 e2e_delete_tenant() {
   local tenant_id="$1"
-  curl -s -X DELETE "${API_URL}tenants/${tenant_id}" -H "x-api-key: $API_KEY" >/dev/null
+  curl -s -X DELETE "${API_URL}tenants/${tenant_id}" -H "x-api-key: $API_KEY" "${E2E_AUTH_HDR[@]}" >/dev/null
 }
 
 e2e_audit_search() {

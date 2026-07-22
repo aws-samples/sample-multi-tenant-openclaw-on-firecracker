@@ -1,5 +1,32 @@
 # Changelog
 
+## [1.5.9] — balloon-aware migration, live-proven
+
+Turns the #72 "can't migrate a balloon VM" hard-409 into a **working, live-proven** migration, and proves AZ failover end-to-end on a real deployment.
+
+### Why the old 409 was wrong
+
+Firecracker v1.15.1 CAN snapshot a microVM with a balloon device (its snapshot docs list no balloon incompatibility, and the FC CHANGELOG explicitly supports balloon across snapshot/restore). The real cause of the original #72 `exit 52` was operational, not fundamental: host-agent polls `/balloon/statistics` every ~5s, and that traffic races `PUT /snapshot/create` on Firecracker's single-threaded API socket — plus the paused VM was being force-relaunched by the dead-zone detector mid-snapshot. (Balloon stats also genuinely can't be disabled post-boot on v1.15.1, so the issue's "Option 1: disable stats" was never executable as written.)
+
+### Added
+
+- **`balloon.migrate_mode` config** (default `cold`): `cold` = stop source VM, ship its data volume, relaunch on target (always correct, brief restart, no in-memory state); `live` = snapshot/restore with a host-agent quiesce sentinel (preserves in-memory state); `reject` = the old 409. Balloon-off tenants always use the plain live snapshot path.
+- **host-agent migration sentinel** (`/data/.../<tenant>/.migrating`, TTL-guarded): while set, host-agent reports the VM as `migrating` and skips it entirely — no ping/pgrep (so no dead-zone relaunch of a paused VM), no `_recover_vm` race against `snapshot/load` on the target, and no `/balloon` PATCH racing the snapshot.
+- **`migrate-vm.sh` cold-dump / cold-restore modes** reusing `stop-vm.sh` + `launch-vm.sh`; snapshot mode now quiesces the sentinel around pause→create→resume (trap-guarded) and best-effort deflates the balloon first.
+
+### Fixed
+
+- **A fresh migration now clears a stale `migration_failed`** left by a prior attempt (a poller watching that field would otherwise abort immediately).
+- **cold-restore fetches `vm.json`** before parsing vcpu/mem (the first live run aborted with `exit 2` under `set -e` parsing a not-yet-fetched file); parse is now defensive.
+- **`_rollback_migration` relaunches the source VM for a failed COLD migration** (its VM was stopped), instead of falsely reporting `running` with no VM.
+
+### Verified LIVE (ap-northeast-1, balloon on, RBAC on, 2 AZs)
+
+- **Real cross-host migration of a balloon tenant** (`cold` mode): `POST /migrate` 202 → cold-dump on source → cold-restore (launch-vm) on target → sweep flip. Confirmed: host_id moved 1a→1d, status `running`, **0 firecracker procs left on source**, **dashboard HTTP 200** via CloudFront.
+- **Real AZ failover**: stopped host-agent on the tenant's AZ (genuine outage — a DDB back-date alone loses to the live 5s heartbeat), back-dated it, invoked health_check → tenant recovered **1d→1a**, `running`, audit `AZ_FAILOVER_TENANT_RECOVERED`, dashboard HTTP 200.
+- **Fail-safe proven**: the first cold-restore attempt (pre-fix) failed on the target; the sweep rolled the tenant back to `running` on the source with `host_id` untouched — no data loss.
+- `scripts/e2e-migrate-test.sh` and `scripts/e2e-az-failover-test.sh` now attach an operator id_token (RBAC) and simulate a genuine AZ outage by stopping host-agent.
+
 ## [1.5.8] — live-verified follow-ups (post-release)
 
 Deployed 1.5.8 to the live ap-northeast-1 stack and ran the REAL e2e suite (not just the offline/mocked one). The live run caught two defects the mocked tests could not, plus one deploy-path regression:

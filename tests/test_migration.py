@@ -423,3 +423,14 @@ class TestMigrationBalloonMode:
         # balloon off → always live snapshot, regardless of migrate_mode.
         assert json.loads(r["body"])["mode"] == "live"
         assert "migrate-vm.sh snapshot" in mock_send.call_args[0][1]
+
+    def test_fresh_migrate_clears_stale_migration_failed(self):
+        """A new migration must REMOVE any migration_failed left by a prior
+        failed attempt, or a poller watching that field aborts immediately."""
+        _running_tenant(); _active_target()
+        ev = _migrate_event("t1", body={"target_host_id": "i-target"})
+        with patch.object(handler, "BALLOON_ENABLED", False), \
+             patch.object(handler, "_ssm_send", return_value="cmd-1"):
+            handler.lambda_handler(ev, None)
+        upd = handler.tenants_table.update_item.call_args[1]["UpdateExpression"]
+        assert "REMOVE migration_failed" in upd

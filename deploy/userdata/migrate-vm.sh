@@ -195,13 +195,23 @@ case "$MODE" in
       aws s3 cp "${S3_URI}/${disk}" "${VM_DIR}/${disk}" --quiet 2>/dev/null \
         && echo "  fetched ${disk}" || true
     done
+    # vm.json carries the tenant's vcpu/mem — fetch it BEFORE parsing (the
+    # earlier bug: parsing a not-yet-fetched vm.json under `set -e` made the
+    # command substitution abort the whole script with exit 2).
+    aws s3 cp "${S3_URI}/vm.json" "${VM_DIR}/vm.json" --quiet 2>/dev/null \
+      && echo "  fetched vm.json" || true
     # Re-launch from the shipped data volume. launch-vm.sh boots a fresh VM
     # bound to VM_NUM on this host using the standard rootfs + the tenant's
     # data.ext4 (its persistent /home/agent). It derives guest_ip / host_port
-    # from VM_NUM internally, so we only pass vcpu/mem (read from vm.json).
-    # No snapshot involved — no in-memory state is preserved.
-    VCPU="${VCPU:-$(sed -n 's/.*"vcpu"[ ]*:[ ]*\([0-9]*\).*/\1/p' "${VM_DIR}/vm.json" 2>/dev/null)}"
-    MEM="${MEM:-$(sed -n 's/.*"mem_mb"[ ]*:[ ]*\([0-9]*\).*/\1/p' "${VM_DIR}/vm.json" 2>/dev/null)}"
+    # from VM_NUM internally, so we only pass vcpu/mem. No snapshot involved —
+    # no in-memory state is preserved. Parse defensively (|| true so a missing
+    # field can't abort under set -e; launch-vm.sh defaults 2 vCPU / 4096 MB).
+    VCPU=""
+    MEM=""
+    if [ -f "${VM_DIR}/vm.json" ]; then
+      VCPU=$(sed -n 's/.*"vcpu"[ ]*:[ ]*\([0-9]*\).*/\1/p' "${VM_DIR}/vm.json" 2>/dev/null) || true
+      MEM=$(sed -n 's/.*"mem_mb"[ ]*:[ ]*\([0-9]*\).*/\1/p' "${VM_DIR}/vm.json" 2>/dev/null) || true
+    fi
     if [ -x /home/ubuntu/launch-vm.sh ]; then
       /home/ubuntu/launch-vm.sh "$TENANT" "$VM_NUM" "${VCPU:-2}" "${MEM:-4096}" || {
         echo "launch-vm.sh failed on cold-restore" >&2; exit 23; }

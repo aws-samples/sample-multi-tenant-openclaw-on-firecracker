@@ -96,8 +96,13 @@ say "migrating $TENANT  ${SRC} → ${TARGET}"
 # status leaves `migrating` (→ running on success, or back to running with
 # migration_failed set on failure). The sweep runs on the health_check
 # schedule (every few minutes), so allow generous time.
+# 1.5.9: with RBAC on, the shared api key resolves to `viewer` and the write
+# path (POST /migrate) 403s. An operator id_token (OC_E2E_ID_TOKEN) authorizes
+# it; without RBAC the header is simply ignored.
+AUTH_HDR=()
+[ -n "${OC_E2E_ID_TOKEN:-}" ] && AUTH_HDR=(-H "Authorization: Bearer ${OC_E2E_ID_TOKEN}")
 RESP=$(curl -s -w '\n%{http_code}' -X POST "${API_URL%/}/tenants/$TENANT/migrate" \
-  -H "x-api-key: ${API_KEY}" -H "Content-Type: application/json" \
+  -H "x-api-key: ${API_KEY}" "${AUTH_HDR[@]}" -H "Content-Type: application/json" \
   -d "{\"target_host_id\":\"$TARGET\"}")
 CODE=$(echo "$RESP" | tail -1)
 BODY=$(echo "$RESP" | sed '$d')

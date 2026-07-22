@@ -1114,7 +1114,11 @@ def tenant_action(tenant_id, action, body=None):
                 "migration_snap_cmd = :scmd, migration_phase = :ph, "
                 "migration_mode = :mode, "
                 "migration_started_at = :st, migration_snapshot_uri = :uri, "
-                "updated_at = :t"
+                "updated_at = :t "
+                # Clear any migration_failed left by a PRIOR failed attempt so
+                # a fresh migration doesn't inherit a stale failure marker (a
+                # poller watching migration_failed would otherwise abort early).
+                "REMOVE migration_failed"
             ),
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={

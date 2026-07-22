@@ -81,8 +81,13 @@ fi
 # ── cleanup trap: always un-stale the source hosts ──
 FRESH_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 cleanup() {
-  say "cleanup: restoring health timestamps on source-AZ hosts"
+  say "cleanup: restart host-agent + refresh health on source-AZ hosts"
   for h in $SRC_AZ_HOSTS; do
+    # Bring the heartbeat back (genuine-outage sim stopped it below).
+    "${AWS[@]}" ssm send-command --instance-ids "$h" \
+      --document-name AWS-RunShellScript \
+      --parameters 'commands=["systemctl start host-agent.service || true"]' \
+      --query 'Command.CommandId' --output text >/dev/null 2>&1 && echo "  restarted host-agent on $h"
     "${AWS[@]}" dynamodb update-item --table-name "$HOSTS_TABLE" \
       --key "{\"instance_id\":{\"S\":\"$h\"}}" \
       --update-expression "SET last_seen = :t, last_health_check = :t" \
@@ -93,7 +98,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ── 3. Inject AZ outage + trigger failover ──
+# ── 3. Inject a GENUINE AZ outage + trigger failover ──
+# A live host-agent heartbeats every ~5s and would immediately overwrite a
+# back-dated last_seen, so a DDB-only back-date can't simulate an outage on a
+# running fleet. Stop host-agent on the source-AZ hosts FIRST so the heartbeat
+# truly stops, THEN back-date. This is a real "AZ went dark" simulation.
+say "stopping host-agent on source-AZ hosts (genuine outage sim)"
+for h in $SRC_AZ_HOSTS; do
+  "${AWS[@]}" ssm send-command --instance-ids "$h" \
+    --document-name AWS-RunShellScript \
+    --parameters 'commands=["systemctl stop host-agent.service"]' \
+    --query 'Command.CommandId' --output text >/dev/null 2>&1 && echo "  stopped host-agent on $h"
+done
+sleep 8  # let any in-flight heartbeat finish
 say "marking $SRC_AZ unhealthy (back-dating ${SRC_AZ_HOSTS//$'\n'/, })"
 for h in $SRC_AZ_HOSTS; do e2e_inject_stale "$h" "2026-05-20T00:00:00Z"; echo "  staled $h"; done
 e2e_clear_cooldown

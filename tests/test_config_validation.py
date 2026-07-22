@@ -82,3 +82,25 @@ def test_warns_when_clamping_cpu_ceiling(capsys):
     normalize(cfg)
     out = capsys.readouterr().out
     assert "cpu_overcommit_ratio" in out and "ceiling" in out
+
+
+# ── Issue #72: balloon.migrate_mode validation ──
+
+def test_valid_migrate_modes_preserved():
+    for mode in ("cold", "live", "reject"):
+        cfg = {"balloon": {"enabled": True, "migrate_mode": mode}}
+        normalize(cfg)
+        assert cfg["balloon"]["migrate_mode"] == mode
+
+
+def test_invalid_migrate_mode_defaults_to_cold():
+    cfg = {"balloon": {"enabled": True, "migrate_mode": "warp-speed"}}
+    normalize(cfg)
+    assert cfg["balloon"]["migrate_mode"] == "cold"
+
+
+def test_missing_migrate_mode_is_not_added_when_no_balloon():
+    # Absent key must not raise; default is applied at read time (env), not here.
+    cfg = {}
+    normalize(cfg)  # must not raise
+    assert cfg.get("balloon", {}).get("migrate_mode", "cold") == "cold"

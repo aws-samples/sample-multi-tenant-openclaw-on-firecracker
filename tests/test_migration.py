@@ -348,59 +348,89 @@ class TestMigrationCapacityCheck:
 
 
 # ═══════════════════════════════════════════
-# Issue #72 — balloon guard: live migrate must fail FAST (before any SSM /
-# snapshot) with an actionable error when memory overcommit (balloon) is on,
-# because Firecracker can't snapshot a VM with an active balloon device.
+# Issue #72 — balloon-aware migration. Firecracker v1.15.1 CAN snapshot a
+# balloon VM; the migrate strategy is chosen by BALLOON_MIGRATE_MODE:
+#   reject → 409; cold (default) → cold-dump then relaunch; live → snapshot.
+# Balloon-off tenants always use the live snapshot path.
 # ═══════════════════════════════════════════
 
 
+def _running_tenant():
+    handler.tenants_table.get_item.return_value = {
+        "Item": {"id": "t1", "host_id": "i-source", "vm_num": 1,
+                 "vcpu": 2, "mem_mb": 4096, "status": "running"},
+    }
+
+
+def _active_target():
+    handler.hosts_table.get_item.return_value = {
+        "Item": {"instance_id": "i-target", "private_ip": "10.0.0.5",
+                 "next_vm_num": 1, "used_vcpu": 0, "used_mem_mb": 0,
+                 "vm_count": 0, "total_vcpu": 4, "total_mem_mb": 16384,
+                 "status": "active"},
+    }
+
+
 @pytest.mark.unit
-class TestMigrationBalloonGuard:
-    def test_rejects_when_balloon_enabled_with_actionable_error(self):
-        handler.tenants_table.get_item.return_value = {
-            "Item": {"id": "t1", "host_id": "i-source", "vm_num": 1,
-                     "vcpu": 2, "mem_mb": 4096, "status": "running"},
-        }
+class TestMigrationBalloonMode:
+    def test_reject_mode_returns_409_before_ssm(self):
+        _running_tenant()
         ev = _migrate_event("t1", body={"target_host_id": "i-target"})
         with patch.object(handler, "BALLOON_ENABLED", True), \
+             patch.object(handler, "BALLOON_MIGRATE_MODE", "reject"), \
              patch.object(handler, "_ssm_send") as mock_send:
             r = handler.lambda_handler(ev, None)
         assert r["statusCode"] == 409, f"expected 409 got {r}"
-        body = json.loads(r["body"])
-        assert body["reason"] == "balloon_enabled"
-        # Actionable: tells the operator how to move the tenant (backup+restore).
-        assert "back it up" in body["error"].lower()
-        # Fail-fast: never reached the snapshot SSM command.
+        assert json.loads(r["body"])["reason"] == "balloon_enabled"
         mock_send.assert_not_called()
 
-    def test_fires_before_target_validation(self):
-        """The balloon 409 must precede target-host lookup — a missing target
-        should still surface the balloon error, not a 404, when balloon is on."""
-        handler.tenants_table.get_item.return_value = {
-            "Item": {"id": "t1", "host_id": "i-source", "vm_num": 1,
-                     "vcpu": 2, "mem_mb": 4096, "status": "running"},
-        }
-        handler.hosts_table.get_item.return_value = {}  # target "missing"
-        ev = _migrate_event("t1", body={"target_host_id": "i-does-not-exist"})
-        with patch.object(handler, "BALLOON_ENABLED", True):
+    def test_cold_mode_fires_cold_dump_and_returns_202(self):
+        _running_tenant(); _active_target()
+        ev = _migrate_event("t1", body={"target_host_id": "i-target"})
+        with patch.object(handler, "BALLOON_ENABLED", True), \
+             patch.object(handler, "BALLOON_MIGRATE_MODE", "cold"), \
+             patch.object(handler, "_ssm_send", return_value="cmd-cold") as mock_send:
             r = handler.lambda_handler(ev, None)
-        assert r["statusCode"] == 409
-        assert json.loads(r["body"])["reason"] == "balloon_enabled"
+        assert r["statusCode"] == 202, f"expected 202 got {r}"
+        body = json.loads(r["body"])
+        assert body["mode"] == "cold"
+        # The source-side command must be the cold-dump verb, not snapshot.
+        sent_cmd = mock_send.call_args[0][1]
+        assert "migrate-vm.sh cold-dump" in sent_cmd
+        # migration_mode is persisted so the sweep runs cold-restore.
+        upd = handler.tenants_table.update_item.call_args[1]["ExpressionAttributeValues"]
+        assert upd[":mode"] == "cold"
 
-    def test_allows_migrate_when_balloon_disabled(self):
-        """Sanity: with balloon off, a valid request proceeds to 202 (not 409)."""
-        handler.tenants_table.get_item.return_value = {
-            "Item": {"id": "t1", "host_id": "i-source", "vm_num": 1,
-                     "vcpu": 2, "mem_mb": 4096, "status": "running"},
-        }
-        handler.hosts_table.get_item.return_value = {
-            "Item": {"instance_id": "i-target", "private_ip": "10.0.0.5",
-                     "next_vm_num": 1, "used_vcpu": 0, "used_mem_mb": 0,
-                     "vm_count": 0, "total_vcpu": 4, "total_mem_mb": 16384,
-                     "status": "active"},
-        }
+    def test_live_mode_fires_snapshot_and_returns_202(self):
+        _running_tenant(); _active_target()
+        ev = _migrate_event("t1", body={"target_host_id": "i-target"})
+        with patch.object(handler, "BALLOON_ENABLED", True), \
+             patch.object(handler, "BALLOON_MIGRATE_MODE", "live"), \
+             patch.object(handler, "_ssm_send", return_value="cmd-live") as mock_send:
+            r = handler.lambda_handler(ev, None)
+        assert r["statusCode"] == 202
+        assert json.loads(r["body"])["mode"] == "live"
+        assert "migrate-vm.sh snapshot" in mock_send.call_args[0][1]
+
+    def test_balloon_off_uses_live_snapshot(self):
+        _running_tenant(); _active_target()
+        ev = _migrate_event("t1", body={"target_host_id": "i-target"})
+        with patch.object(handler, "BALLOON_ENABLED", False), \
+             patch.object(handler, "BALLOON_MIGRATE_MODE", "cold"), \
+             patch.object(handler, "_ssm_send", return_value="cmd-1") as mock_send:
+            r = handler.lambda_handler(ev, None)
+        assert r["statusCode"] == 202, f"expected 202 got {r}"
+        # balloon off → always live snapshot, regardless of migrate_mode.
+        assert json.loads(r["body"])["mode"] == "live"
+        assert "migrate-vm.sh snapshot" in mock_send.call_args[0][1]
+
+    def test_fresh_migrate_clears_stale_migration_failed(self):
+        """A new migration must REMOVE any migration_failed left by a prior
+        failed attempt, or a poller watching that field aborts immediately."""
+        _running_tenant(); _active_target()
         ev = _migrate_event("t1", body={"target_host_id": "i-target"})
         with patch.object(handler, "BALLOON_ENABLED", False), \
              patch.object(handler, "_ssm_send", return_value="cmd-1"):
-            r = handler.lambda_handler(ev, None)
-        assert r["statusCode"] == 202, f"expected 202 got {r}"
+            handler.lambda_handler(ev, None)
+        upd = handler.tenants_table.update_item.call_args[1]["UpdateExpression"]
+        assert "REMOVE migration_failed" in upd

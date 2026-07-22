@@ -25,6 +25,34 @@ PORT = int(os.environ.get("OC_AGENT_PORT", "8899"))
 VM_DIR = "/data/firecracker-vms"
 GATEWAY_PORT = 18789
 TENANTS_TABLE = os.environ.get("TENANTS_TABLE", "")
+
+# Issue #72 — migration sentinel. While a tenant is being live-migrated,
+# migrate-vm.sh (a transient SSM subprocess) pauses the VM and takes a
+# Firecracker snapshot. During that window host-agent must NOT touch the VM:
+#   * balloon paths (GET /balloon/statistics, PATCH /balloon) racing
+#     PUT /snapshot/create on Firecracker's single-threaded API socket was the
+#     most likely cause of the #72 "empty reply / curl exit 52";
+#   * MORE IMPORTANTLY, a Paused VM stops answering ping, so _probe_all's
+#     dead-zone detector would fire _force_relaunch_vm (stop+launch) mid-
+#     snapshot, and on the target _recover_vm would race /snapshot/load.
+# migrate-vm.sh drops a sentinel file per migrating tenant; host-agent skips
+# any tenant with a live sentinel. A sentinel older than MIGRATION_SENTINEL_TTL
+# is treated as leaked (migrate-vm.sh crashed) and ignored, so a dead migration
+# can't wedge a VM out of health-checking forever.
+MIGRATION_SENTINEL_TTL = int(os.environ.get("OC_MIGRATION_SENTINEL_TTL", "900"))
+
+
+def _is_migrating(tenant_id):
+    """True if a live (non-stale) migration sentinel exists for this tenant."""
+    sentinel = os.path.join(VM_DIR, tenant_id, ".migrating")
+    try:
+        age = time.time() - os.path.getmtime(sentinel)
+    except OSError:
+        return False
+    if age > MIGRATION_SENTINEL_TTL:
+        # Leaked by a crashed migrate-vm.sh — resume normal supervision.
+        return False
+    return True
 # Since 1.3.0: host-agent also writes a heartbeat to the hosts table so the
 # health_check Lambda can do AZ-level failover (it needs to know which hosts
 # are still alive at the host level, not just whether their tenants reported).
@@ -212,6 +240,15 @@ def _probe_all():
         # Skip intentionally stopped VMs
         stopped_marker = os.path.join(vm_path, ".stopped")
         if os.path.exists(stopped_marker):
+            continue
+
+        # Issue #72: skip VMs mid-migration. A paused (snapshot) or not-yet-
+        # loaded (restore) VM must NOT be probed, or the dead-zone detector
+        # relaunches it / _recover_vm races /snapshot/load. Report a neutral
+        # "migrating" status so the metrics/DDB view is truthful.
+        if _is_migrating(tenant_id):
+            results[tenant_id] = {"vm_health": "migrating", "app_health": "down",
+                                  "guest_ip": ""}
             continue
 
         # Auto-recover: vm.json exists but Firecracker not running.
@@ -718,6 +755,10 @@ def _adjust_balloons(probe_results):
 
     for tid, info in probe_results.items():
         if info.get("vm_health") != "up":
+            continue
+        # Issue #72: never PATCH /balloon for a migrating tenant, even if these
+        # probe_results were captured just before the sentinel appeared.
+        if _is_migrating(tid):
             continue
         sock_file = os.path.join(VM_DIR, tid, "fc.sock")
         if not os.path.exists(sock_file):

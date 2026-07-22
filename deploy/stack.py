@@ -67,6 +67,14 @@ def _normalize_config(cfg):
               f"{_MEM_RATIO_CEILING}× safety ceiling — clamping.")
         cfg.setdefault("host", {})["mem_overcommit_ratio"] = _MEM_RATIO_CEILING
 
+    # Issue #72 — validate balloon.migrate_mode (how a balloon tenant migrates).
+    _MIGRATE_MODES = ("cold", "live", "reject")
+    mode = str(cfg.get("balloon", {}).get("migrate_mode", "cold")).lower()
+    if mode not in _MIGRATE_MODES:
+        print(f"⚠️  config.yml: balloon.migrate_mode={mode!r} invalid — "
+              f"must be one of {_MIGRATE_MODES}. Defaulting to 'cold'.")
+        cfg.setdefault("balloon", {})["migrate_mode"] = "cold"
+
 
 _normalize_config(CFG)
 
@@ -271,10 +279,13 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 "MULTI_AZ_ENABLED": str(CFG.get("multi_az", {}).get("enabled", False)).lower(),
                 "MULTI_AZ_COUNT": str(CFG.get("multi_az", {}).get("az_count", 1)),
                 "WAF_ENABLED": str(CFG.get("waf", {}).get("enabled", False)).lower(),
-                # Balloon blocks Firecracker snapshot, so live migrate is
-                # unavailable when it's on (issue #72). API uses this to reject
-                # migrate fast instead of failing deep in the snapshot step.
+                # Issue #72: balloon state + how to migrate a balloon tenant.
+                # cold (default) = stop+ship+relaunch (always safe, brief
+                # restart); live = snapshot/restore with a host-agent quiesce
+                # sentinel; reject = refuse (409). Off-balloon tenants always
+                # use the plain live snapshot path.
                 "BALLOON_ENABLED": str(CFG.get("balloon", {}).get("enabled", False)).lower(),
+                "BALLOON_MIGRATE_MODE": str(CFG.get("balloon", {}).get("migrate_mode", "cold")).lower(),
                 # COGNITO_USER_POOL_ID / COGNITO_CLIENT_ID are injected AFTER the
                 # Cognito section computes the real, stack-owned pool/client ids
                 # (see add_environment below). The config.yml value is unreliable

@@ -24,6 +24,28 @@ S3_URI="${4:?missing s3 uri}"
 VM_DIR="/data/firecracker-vms/${TENANT}"
 SOCK="${VM_DIR}/fc.sock"
 
+# Issue #72: BALLOON_ENABLED comes from /etc/platform.env (written by
+# init-host.sh). When balloon is on, host-agent polls this VM's /balloon
+# socket every few seconds; that traffic races PUT /snapshot/create on
+# Firecracker's single-threaded API server. We drop a per-tenant sentinel so
+# host-agent backs off (skips probing + balloon PATCH) for the pause window.
+[ -f /etc/platform.env ] && . /etc/platform.env 2>/dev/null || true
+BALLOON_ENABLED="${BALLOON_ENABLED:-false}"
+SENTINEL="${VM_DIR}/.migrating"
+
+_migration_begin() {
+  # Signal host-agent to quiesce, then let any in-flight agent curl drain.
+  : > "$SENTINEL" 2>/dev/null || true
+  # host-agent poll interval is 5s (host-agent.service OC_AGENT_POLL_INTERVAL=5);
+  # sleep just over one interval so an already-started probe/balloon curl
+  # finishes before we pause + snapshot.
+  sleep 6
+}
+
+_migration_end() {
+  rm -f "$SENTINEL" 2>/dev/null || true
+}
+
 _curl_fc() {
   local method="$1" path="$2" body="${3:-}"
   if [ -n "$body" ]; then
@@ -37,19 +59,35 @@ _curl_fc() {
 case "$MODE" in
   snapshot)
     [ -S "$SOCK" ] || { echo "no fc.sock at $SOCK"; exit 1; }
+    # Issue #72: quiesce host-agent's balloon poller for the whole pause window.
+    # The sentinel is honored by host-agent (_is_migrating) so it stops probing
+    # (no dead-zone relaunch of the paused VM) and stops PATCHing /balloon. A
+    # trap guarantees the sentinel + a Resume attempt happen even on an
+    # unexpected exit, so we never strand the VM Paused or wedged out of
+    # supervision.
+    if [ "$BALLOON_ENABLED" = "true" ]; then
+      _snap_cleanup() { _curl_fc PATCH /vm '{"state":"Resumed"}' >/dev/null 2>&1 || true; _migration_end; }
+      trap '_snap_cleanup' EXIT
+      _migration_begin
+      # Best-effort: deflate the balloon to 0 before snapshot (FC maintainer
+      # guidance, firecracker#5566). stats_polling_interval_s can't be disabled
+      # post-boot, but a deflated + quiesced balloon snapshots cleanly.
+      _curl_fc PATCH /balloon '{"amount_mib":0}' >/dev/null 2>&1 || true
+    fi
     # 1) Pause for a consistent snapshot. Tolerate a pause failure with a
     #    visible message rather than a bare `set -e` abort (the VM stays
     #    running, so we can still bail cleanly below).
     if ! _curl_fc PATCH /vm '{"state":"Paused"}'; then
       echo "pause failed on source; aborting snapshot (VM left running)" >&2
+      [ "$BALLOON_ENABLED" = "true" ] && _migration_end
       exit 51
     fi
     # 2) Snapshot to local files. Capture Firecracker's error body (issue #72):
-    #    a balloon device with active stats polling makes /snapshot/create fail
-    #    with an empty reply, and the old bare `curl -sf` under `set -e` turned
-    #    that into a silent exit 52 AND skipped the Resume below, stranding the
-    #    tenant Paused. Echo the FC body FIRST (the health_check sweep truncates
-    #    SSM stderr to ~200 chars) and always resume the source on failure.
+    #    if /snapshot/create fails (e.g. a stray concurrent /balloon request on
+    #    Firecracker's single-threaded API socket) the old bare `curl -sf` under
+    #    `set -e` turned it into a silent exit 52 AND skipped the Resume below,
+    #    stranding the tenant Paused. Echo the FC body FIRST (the health_check
+    #    sweep truncates SSM stderr to ~200 chars) and always resume on failure.
     SNAPSHOT_PATH="${VM_DIR}/snapshot.vm"
     MEMFILE_PATH="${VM_DIR}/snapshot.mem"
     SNAP_RC=0
@@ -59,15 +97,18 @@ case "$MODE" in
       -w 'HTTP:%{http_code}' 2>&1) || SNAP_RC=$?
     if [ "$SNAP_RC" -ne 0 ] || ! printf '%s' "$SNAP_OUT" | grep -q 'HTTP:2[0-9][0-9]'; then
       echo "snapshot/create failed (curl rc=$SNAP_RC). Firecracker said: ${SNAP_OUT}" >&2
-      echo "(a balloon device with stats polling blocks Firecracker snapshot — issue #72)" >&2
+      echo "(balloon migrate_mode=cold avoids this path entirely — issue #72)" >&2
       tail -5 "${VM_DIR}/fc.log" >&2 2>/dev/null || true
       # Never leave the source paused — the async sweep's rollback assumes the
       # source VM was resumed after a failed snapshot.
       _curl_fc PATCH /vm '{"state":"Resumed"}' || true
+      [ "$BALLOON_ENABLED" = "true" ] && _migration_end
       exit 52
     fi
     # 3) Resume the source so the user only sees a brief pause if migration fails.
     _curl_fc PATCH /vm '{"state":"Resumed"}' || true
+    # Balloon quiesced window is over — let host-agent resume supervision.
+    if [ "$BALLOON_ENABLED" = "true" ]; then _migration_end; trap - EXIT; fi
     # 4) Upload snapshot files + vm.json to S3.
     aws s3 cp "$SNAPSHOT_PATH" "${S3_URI}/snapshot.vm" --quiet
     aws s3 cp "$MEMFILE_PATH"  "${S3_URI}/snapshot.mem" --quiet
@@ -87,6 +128,11 @@ case "$MODE" in
     ;;
   restore)
     mkdir -p "$VM_DIR"
+    # Issue #72: sentinel BEFORE writing vm.json — otherwise the target host's
+    # host-agent sees vm.json with no Firecracker process and races _recover_vm
+    # (launch-vm.sh) against our /snapshot/load. Cleared once the VM is loaded.
+    : > "$SENTINEL" 2>/dev/null || true
+    trap 'rm -f "$SENTINEL" 2>/dev/null || true' EXIT
     # Download the block-device backing files FIRST — Firecracker opens them by
     # the absolute path baked into snapshot.vm during /snapshot/load, so they
     # must already be on local disk before the load call below. Missing disks
@@ -114,7 +160,66 @@ case "$MODE" in
       tail -5 "${VM_DIR}/fc.log" >&2 || true
       exit 22
     fi
+    rm -f "$SENTINEL" 2>/dev/null || true; trap - EXIT
     echo "restored ${TENANT} on this host"
+    ;;
+
+  # ── Issue #72: COLD migration (always-correct fallback, balloon-agnostic) ──
+  # No live snapshot: stop the source VM (quiescing its data volume), ship the
+  # disks + vm.json to S3, then re-launch on the target. Costs a restart (loses
+  # in-memory state) but works for any VM regardless of balloon/free-page-
+  # reporting. Used when balloon.migrate_mode=cold.
+  cold-dump)
+    [ -S "$SOCK" ] || echo "warn: no fc.sock at $SOCK (VM may already be stopped)" >&2
+    # Stop the VM cleanly FIRST so data.ext4 is quiescent before we copy it.
+    # stop-vm.sh writes the .stopped marker, so host-agent already skips it.
+    if [ -x /home/ubuntu/stop-vm.sh ]; then
+      /home/ubuntu/stop-vm.sh "$TENANT" "$VM_NUM" || echo "warn: stop-vm.sh rc=$?" >&2
+    else
+      _curl_fc PATCH /vm '{"state":"Paused"}' >/dev/null 2>&1 || true
+    fi
+    sleep 2
+    for disk in data.ext4 overlay.ext4 rootfs.ext4; do
+      if [ -f "${VM_DIR}/${disk}" ]; then
+        aws s3 cp "${VM_DIR}/${disk}" "${S3_URI}/${disk}" --quiet && echo "  uploaded ${disk}"
+      fi
+    done
+    [ -f "${VM_DIR}/vm.json" ] && aws s3 cp "${VM_DIR}/vm.json" "${S3_URI}/vm.json" --quiet
+    echo "cold-dump ${TENANT} → ${S3_URI}"
+    ;;
+  cold-restore)
+    mkdir -p "$VM_DIR"
+    : > "$SENTINEL" 2>/dev/null || true
+    trap 'rm -f "$SENTINEL" 2>/dev/null || true' EXIT
+    for disk in data.ext4 overlay.ext4 rootfs.ext4; do
+      aws s3 cp "${S3_URI}/${disk}" "${VM_DIR}/${disk}" --quiet 2>/dev/null \
+        && echo "  fetched ${disk}" || true
+    done
+    # vm.json carries the tenant's vcpu/mem — fetch it BEFORE parsing (the
+    # earlier bug: parsing a not-yet-fetched vm.json under `set -e` made the
+    # command substitution abort the whole script with exit 2).
+    aws s3 cp "${S3_URI}/vm.json" "${VM_DIR}/vm.json" --quiet 2>/dev/null \
+      && echo "  fetched vm.json" || true
+    # Re-launch from the shipped data volume. launch-vm.sh boots a fresh VM
+    # bound to VM_NUM on this host using the standard rootfs + the tenant's
+    # data.ext4 (its persistent /home/agent). It derives guest_ip / host_port
+    # from VM_NUM internally, so we only pass vcpu/mem. No snapshot involved —
+    # no in-memory state is preserved. Parse defensively (|| true so a missing
+    # field can't abort under set -e; launch-vm.sh defaults 2 vCPU / 4096 MB).
+    VCPU=""
+    MEM=""
+    if [ -f "${VM_DIR}/vm.json" ]; then
+      VCPU=$(sed -n 's/.*"vcpu"[ ]*:[ ]*\([0-9]*\).*/\1/p' "${VM_DIR}/vm.json" 2>/dev/null) || true
+      MEM=$(sed -n 's/.*"mem_mb"[ ]*:[ ]*\([0-9]*\).*/\1/p' "${VM_DIR}/vm.json" 2>/dev/null) || true
+    fi
+    if [ -x /home/ubuntu/launch-vm.sh ]; then
+      /home/ubuntu/launch-vm.sh "$TENANT" "$VM_NUM" "${VCPU:-2}" "${MEM:-4096}" || {
+        echo "launch-vm.sh failed on cold-restore" >&2; exit 23; }
+    else
+      echo "launch-vm.sh not found on target host" >&2; exit 24
+    fi
+    rm -f "$SENTINEL" 2>/dev/null || true; trap - EXIT
+    echo "cold-restored ${TENANT} on this host"
     ;;
   *)
     echo "unknown mode: $MODE" >&2

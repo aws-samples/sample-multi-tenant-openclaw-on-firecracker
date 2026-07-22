@@ -114,29 +114,21 @@ def _find_host(vcpu_needed, mem_needed):
     return best
 
 
-def _get_specific_host_with_capacity(
-    instance_id, vcpu_needed, mem_needed, allow_upgrading=False
-):
+def _get_specific_host_with_capacity(instance_id, vcpu_needed, mem_needed):
     """Issue #12 — locate a specific host (used for same-host clone) and
     confirm it has capacity. Returns the host item or None.
 
-    #217 §10.6 — allow_upgrading widens the status gate to include `upgrading`
-    for the ONE pinned host, so pull_image's canary tenant can land on the host
-    it is validating. Only pull_image sets this (via create_tenant(_canary_host=)),
-    and only for that exact instance_id — every other caller keeps the strict
-    active/idle gate. Capacity CAS is unchanged (canary still occupies real slots).
+    #309 — status gate is strictly active/idle with NO exception. The old
+    allow_upgrading widening (for pull_image's canary tenant, #217 §10.6) was
+    removed with the canary: an upgrading host must NEVER accept a tenant
+    (no-cross-tenant — a tenant must not land on a host mid image-swap).
     """
     # Phase 6: strong read so the capacity gate for a pinned/clone host sees the
     # freshest used_* a concurrent create may have just reserved.
-    statuses = {":a": "active", ":i": "idle"}
-    status_filter = "#s IN (:a, :i)"
-    if allow_upgrading:
-        statuses[":u"] = "upgrading"
-        status_filter = "#s IN (:a, :i, :u)"
     hosts = clients.hosts_table.scan(
-        FilterExpression=status_filter,
+        FilterExpression="#s IN (:a, :i)",
         ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues=statuses,
+        ExpressionAttributeValues={":a": "active", ":i": "idle"},
         ConsistentRead=True,
     ).get("Items", [])
     for h in hosts:

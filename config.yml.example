@@ -48,6 +48,11 @@ vm:
   data_disk_mb: 8192               # 每个 VM 数据盘 /home/agent 上限 (sparse)
   gateway_port_base: 18789
   subnet_prefix: "172.16"
+  # #331/#327 — 一台 host 同时【冷启动】的 microVM 数上限(跨进程 flock 槽信号量)。防批量 FC 死亡
+  # recover / 多批 SSM fan-out 一轮 fire 几百个 launch-vm,瞬时 CPU/IO 二次洪峰压垮 host。超出的排队
+  # 等(限速不丢租户)。默认 30(真机验证值);单一来源,同时注入 host(OC_HOST_LAUNCH_SLOTS)与
+  # Lambda(DISPATCH_HOST_LAUNCH_CONCURRENCY,SSM 超时公式分母)。非正数回落 30。
+  host_launch_slots: 30
 
 # ========== Per-tenant 资源配额 ==========
 # 每租户 vCPU / 内存 / 数据盘上限,注入 API Lambda env(lambdas.py:263-267 读)。

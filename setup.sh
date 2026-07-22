@@ -384,6 +384,11 @@ aws s3 cp "$SCRIPT_DIR/deploy/userdata/host-agent.py" "s3://${BUCKET}/deployment
 # 同类:源码在但 setup.sh 上传清单漏了。init-host.sh 拉到 /opt/openclaw/route_ops.py。
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/route_ops.py" "s3://${BUCKET}/deployment/scripts/route_ops.py" \
   "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
+# oc-guest-log-reader.py — init-host.sh 在 LOGGING_ENABLED=true 时拉到 /opt/openclaw/
+# 装成 oc-guest-log-reader.service(收 guest vsock 日志落 per-VM oc-guest.log)。
+# 漏传 → reader service 拉不起来(同 route_ops.py 的"源码在但清单漏"类)。
+aws s3 cp "$SCRIPT_DIR/deploy/userdata/oc-guest-log-reader.py" "s3://${BUCKET}/deployment/scripts/oc-guest-log-reader.py" \
+  "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 
 # Re-deploy is a no-op if nothing changed but it forces ASG hosts to retry
 # pulling scripts now that S3 has them — guards against the race where the
@@ -479,12 +484,35 @@ aws s3 cp "$SCRIPT_DIR/deploy/userdata/start-all-vms.sh" "s3://${BUCKET}/deploym
   "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/stop-all-vms.sh" "s3://${BUCKET}/deployment/scripts/stop-all-vms.sh" \
   "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
+
+# ── 上传后 fail-loud 校验(根治「源码在但没进桶」这一类反复踩的 bug:route_ops.py /
+#    #64 migrate-vm / #22 resize-disk 都是逐个 cp 清单漏了一条 → host 起来 404/exit127
+#    → crashloop → lifecycle ABANDON 换机器死循环,顺路径测不出来,只有真部署才炸)。
+#    不用 `s3 sync deploy/userdata/`:那目录里有 init-host.sh(LT 烤进镜像的,不走 S3)、
+#    *.bak / __pycache__ / runtimes/ / host-agent.service,sync 会把它们污染进 scripts 前缀。
+#    保留逐个 cp(每条带 why),这里独立维护一份「host init 必需脚本」清单,传完直接查桶——
+#    缺任一个立即停,别把「某脚本静默没传」的软 bug 拖成「host 永远起不来」的硬 bug。
+#    也兜住上面 `|| true` 吞错、SSM 后台跑到一半被砍这类 set -e 抓不到的漏传。
+_REQUIRED_SCRIPTS="host-agent.py route_ops.py oc-guest-log-reader.py launch-vm.sh stop-vm.sh backup-data.sh clone-data.sh migrate-vm.sh resize-disk.sh start-all-vms.sh stop-all-vms.sh setup-egress-allowlist.sh adot-config.yaml lib/harden-config.sh lib/cred-inject.sh"
+_UPLOADED=$(aws s3 ls "s3://${BUCKET}/deployment/scripts/" --recursive \
+  "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" 2>/dev/null | awk '{print $NF}')
+_MISSING=""
+for _s in $_REQUIRED_SCRIPTS; do
+  echo "$_UPLOADED" | grep -qF "deployment/scripts/$_s" || _MISSING="$_MISSING $_s"
+done
+if [ -n "$_MISSING" ]; then
+  echo "FATAL: host init 必需脚本没进 S3(host 会 crashloop-ABANDON):$_MISSING" >&2
+  echo "  桶 s3://${BUCKET}/deployment/scripts/ 缺上面这些,现在停。查上面对应 aws s3 cp 是否失败/被跳过。" >&2
+  exit 1
+fi
+echo "✓ 校验 host init 必需脚本全部在桶($(echo $_REQUIRED_SCRIPTS | wc -w) 个)"
+
 # #256 — launch-all-vms.sh 已内联进 launch-vm.sh 的 fan_out_main(唯一起 VM 脚本)。
 # 聚合 SSM 命令现调 `launch-vm.sh --manifest|--from-ddb ...`(见 dispatch_service.py),
 # 不再单独上传 launch-all-vms.sh。launch-vm.sh 的上传在上方(第 415 行)。
 
 # #187 转型:claw-hub(WebSocket 中枢)数据面已下线。install-hub.sh + deploy/hub/
-# 全部归档到 an internal archive。数据面改两级路由
+# 全部归档到 engineering/04-archive/p4-cutover-deprecated/。数据面改两级路由
 # 直连 microVM 原生 gateway(ALB LOR → OpenResty edge → Redis → host DNAT →
 # microVM:18789),setup.sh 不再上传 hub 资产;init-host.sh 里 install-hub.sh
 # 引用也应一并删(独立 issue,同 stack.py CloudFront /hub behavior + HubTG 收尾)。
@@ -640,7 +668,7 @@ if [ -n "$CF_ORIGIN_VAL" ]; then
   echo "✓ SSM /openclaw/cloudfront-origin = ${CF_ORIGIN_VAL}"
 fi
 
-#  — publish the channel machine-user app client id to SSM so the metal
+# WI-002 — publish the channel machine-user app client id to SSM so the metal
 # single-process hub (install-hub.sh) can read it and verify channel access
 # tokens. Empty unless console_auth.channel_cognito_auth is enabled (the stack
 # only emits CognitoChannelClientId then). install-hub treats empty as "channel

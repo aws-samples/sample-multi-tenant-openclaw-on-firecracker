@@ -8,7 +8,7 @@
 # 分级:🔴 BLOCK(会导致 CREATE_FAILED/ROLLBACK 或 synth 报错,必须先解决)
 #       🟡 WARN (可能有问题/静默失效/需人工确认)
 #       ✅ PASS
-# 经验来源:多轮真机部署的坑清单 + 各 stack 的 fail-loud 校验点。
+# 经验来源:两个真机部署环境的坑清单 + FAILURE-MODES + stack 各 fail-loud 点。
 # 只读:全程只 describe/list/get + 解析 config,绝不建/删/改任何资源。
 set -uo pipefail
 

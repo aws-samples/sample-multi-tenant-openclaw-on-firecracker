@@ -272,42 +272,51 @@ def _release_route(tenant_id: str, host_port: int | None, guest_ip: str) -> None
         writer.del_route(tenant_id)
 
 
+def _resolve_region():
+    """Region: env override first, else IMDSv2, else ap-northeast-1 fallback.
+    Shared by _get_ddb and the #340 disk-report thread's independent resource so
+    neither reimplements IMDS."""
+    env = os.environ.get("OC_REGION") or os.environ.get("AWS_REGION")
+    if env:
+        return env
+    # Get region from IMDS (IMDSv2 with session token)
+    # EC2 IMDS only supports http:// on link-local 169.254.169.254
+    try:
+        import urllib.request
+
+        tok = (
+            urllib.request.urlopen(
+                urllib.request.Request(  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected
+                    "http://169.254.169.254/latest/api/token",  # nosemgrep: python.lang.security.audit.insecure-transport.urllib.insecure-urllib-request
+                    headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"},
+                    method="PUT",
+                ),
+                timeout=2,
+            )
+            .read()
+            .decode()
+        )
+        return (
+            urllib.request.urlopen(
+                urllib.request.Request(  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected
+                    "http://169.254.169.254/latest/meta-data/placement/region",  # nosemgrep: python.lang.security.audit.insecure-transport.urllib.insecure-urllib-request
+                    headers={"X-aws-ec2-metadata-token": tok},
+                ),
+                timeout=2,
+            )
+            .read()
+            .decode()
+        )
+    except Exception:
+        return "ap-northeast-1"
+
+
 def _get_ddb():
     global _ddb
     if _ddb is None:
-        # Get region from IMDS (IMDSv2 with session token)
-        # EC2 IMDS only supports http:// on link-local 169.254.169.254
-        try:
-            import urllib.request
-
-            tok = (
-                urllib.request.urlopen(
-                    urllib.request.Request(  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected
-                        "http://169.254.169.254/latest/api/token",  # nosemgrep: python.lang.security.audit.insecure-transport.urllib.insecure-urllib-request
-                        headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"},
-                        method="PUT",
-                    ),
-                    timeout=2,
-                )
-                .read()
-                .decode()
-            )
-            region = (
-                urllib.request.urlopen(
-                    urllib.request.Request(  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected
-                        "http://169.254.169.254/latest/meta-data/placement/region",  # nosemgrep: python.lang.security.audit.insecure-transport.urllib.insecure-urllib-request
-                        headers={"X-aws-ec2-metadata-token": tok},
-                    ),
-                    timeout=2,
-                )
-                .read()
-                .decode()
-            )
-        except Exception:
-            region = "ap-northeast-1"
         _ddb = boto3.resource(
             "dynamodb",
-            region_name=region,
+            region_name=_resolve_region(),
             config=BotoConfig(retries={"max_attempts": 2}),
         )
     return _ddb
@@ -594,6 +603,94 @@ def _probe_all():
 # (P3/P4). Host→VM SSH management channel remains via /etc/openclaw/host_vm_key
 # for other uses (guest health probes, launch-vm cleanup) — no callers remain
 # here.
+
+
+VM_DATA_MOUNT = "/data"
+# #340 磁盘上报独立线程节奏。默认 15s(= poll 默认),但走自己的线程不被 VM probe 拖累。
+# 消费侧 TTL(DISPATCH_DISK_REPORT_TTL_SEC,默认 90s)是它的数倍,容几次漏报不误判陈旧。
+_DISK_REPORT_INTERVAL_SEC = int(os.environ.get("OC_DISK_REPORT_INTERVAL_SEC", "15"))
+
+# #340 — 磁盘上报线程【专属】DDB resource。boto3 Session/Resource 非线程安全(AWS 官方),
+# 全局 _get_ddb() 的 _ddb 已被 poll/GC/dispatch 共享,故磁盘线程用【独立 Session】完全绕开它
+# (codex review:之前从 _get_ddb() 取 region 又碰了共享对象)。超时收紧到远小于消费侧 TTL:
+# 默认 connect/read 各 60s + 重试,最坏可远超 90s TTL → 写卡顿时报告陈旧、消费侧 fail-open,
+# 满盘 host 又接单。connect 3s + read 5s + 总尝试 2 次,最坏 ~16s << 90s,写慢也不会拖成陈旧。
+_disk_ddb = None
+_DISK_DDB_CFG = BotoConfig(
+    connect_timeout=3, read_timeout=5, retries={"total_max_attempts": 2}
+)
+
+
+def _get_disk_ddb():
+    """磁盘上报线程专属 DDB resource(独立 Session,线程隔离 + 短超时;codex review)。"""
+    global _disk_ddb
+    if _disk_ddb is None:
+        _disk_ddb = boto3.Session().resource(
+            "dynamodb", region_name=_resolve_region(), config=_DISK_DDB_CFG
+        )
+    return _disk_ddb
+
+
+def _data_disk_free_mb():
+    """#340 — host /data 物理剩余可用空间(MB),给 dispatch 的磁盘软门用。
+
+    返回值三态(codex review:区分"确诊坏"和"测不了"):
+    - int ≥ 0:正常读数(statvfs f_bavail×f_frsize,非特权可写块,已扣 root 保留);
+    - 0:**/data 未挂载**——确诊的坏状态(init-host `mount ${DATA_DEV} /data` 失败,目录落
+      根盘;派租户过去 launch-vm `mkdir /data/firecracker-vms` 会写进根盘/起在错盘)。上报 0
+      让消费侧【阻断】这台 host,不能 fail-open 放行(那才会把租户写进根盘);
+    - None:**探测本身失败**(statvfs 抛异常,权限/瞬时 IO)——测不了,unknown,调用方不写字段,
+      消费侧 fail-open(与"没上报"同待,交存活兜底,不拿一次瞬时抖动误摘)。
+    绝不抛(上报线程不能因取磁盘失败崩)。"""
+    try:
+        if not os.path.ismount(VM_DATA_MOUNT):
+            # 确诊坏:未挂载。上报 0 让消费侧阻断(不是 None——未挂载是明确的"不可用",
+            # 不能 fail-open,否则租户被派来写进根盘)。
+            print(f"{VM_DATA_MOUNT} not a mountpoint — report 0 (block this host)")
+            return 0
+        st = os.statvfs(VM_DATA_MOUNT)
+        return int(st.f_bavail * st.f_frsize // (1024 * 1024))
+    except Exception as e:  # noqa: BLE001
+        # 测不了(unknown):statvfs 抛。返 None → 不上报 → 消费侧 fail-open(不拿一次瞬时
+        # 探测失败误摘健康 host;交存活兜底)。
+        print(f"data disk statvfs failed (non-fatal): {e}")
+        return None
+
+
+def _write_disk_report():
+    """#340 — 上报 host /data 物理剩余(avail_disk_mb + disk_check_ts_epoch)给 dispatch
+    磁盘软门。【独立线程】跑(_disk_report_loop),不塞进 poll 心跳。
+
+    为什么独立线程(codex score:关键):poll 心跳同一轮还要串行 probe 所有 VM(几十个
+    curl,慢 host 累计可超 TTL),若磁盘时间戳搭 poll 便车,一台【健康但 VM 多/probe 慢】
+    的 host 会周期性上报陈旧 → 被消费侧误摘。剥离到独立快循环后,磁盘时间戳只反映"磁盘
+    探测这件小事跑没跑",陈旧才真正 ⟺ agent 没在跑(与 _disk_gc_loop 同款隔离理由,#321)。
+    取不到磁盘(非挂载点/statvfs 失败)→ 不写字段(消费侧缺字段 fail-open)。best-effort。"""
+    if not HOSTS_TABLE or not INSTANCE_ID:
+        return
+    free_mb = _data_disk_free_mb()
+    if free_mb is None:
+        return  # 取不到 → 不写(消费侧缺 avail_disk_mb → fail-open)
+    try:
+        table = _get_disk_ddb().Table(HOSTS_TABLE)  # 线程专属 resource(非线程安全隔离)
+        table.update_item(
+            Key={"instance_id": INSTANCE_ID},
+            UpdateExpression="SET avail_disk_mb = :d, disk_check_ts_epoch = :de",
+            ExpressionAttributeValues={":d": free_mb, ":de": int(time.time())},
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"disk report failed (non-fatal): {e}")
+
+
+def _disk_report_loop():
+    """#340 — 独立单例线程上报 /data 剩余(与 _disk_gc_loop/#321 同款隔离:一次 statvfs/DDB
+    写卡住也不阻塞 poll 心跳,反之 poll 的慢 probe 也不拖累磁盘时间戳新鲜度)。"""
+    while True:
+        try:
+            _write_disk_report()
+        except Exception as e:  # noqa: BLE001
+            print(f"disk-report loop error (non-fatal): {e}")
+        time.sleep(_DISK_REPORT_INTERVAL_SEC)
 
 
 def _write_host_heartbeat():
@@ -1220,6 +1317,105 @@ def _adjust_balloons(probe_results):
 # ORPHAN that no probe ever revisits — it silently holds ~600MB-1GB RSS forever.
 # This sweep finds firecrackers whose socket dir has no vm.json and SIGKILLs them.
 _ORPHAN_GRACE_SEC = int(os.environ.get("OC_ORPHAN_GRACE_SEC", "120"))
+
+# #321 — 已删租户的 VM 目录(data.ext4+overlay.ext4,~85M/个)磁盘回收兜底。delete 侧
+# tenant_service.py rm -rf 在高负载下 SSM 丢/超时会漏删,孤儿累积撑满 /data(真机实测:
+# host 82% 目录是漏删孤儿,/data 64~70% → 撑满后新 VM mkdir 失败转 intervention)。
+# 独立单例线程(不阻塞 poll heartbeat:50×rm 超时最坏会累计撑过 stale 门槛误判重启,
+# codex 复审),每 _DISK_GC_INTERVAL_SEC 跑一次,每轮回收上限防单轮抖动。
+_DISK_GC_MAX_PER_SWEEP = int(os.environ.get("OC_DISK_GC_MAX_PER_SWEEP", "50"))
+_DISK_GC_INTERVAL_SEC = int(os.environ.get("OC_DISK_GC_INTERVAL_SEC", "60"))
+_PURGE_PREFIX = ".purge-"  # 平级 tombstone: /data/firecracker-vms/.purge-<tid>
+_disk_gc_cursor = (
+    ""  # 轮转游标:上轮处理到的最后一个 tombstone 名,下轮从它之后起(防饥饿)
+)
+
+
+def _gc_orphan_vm_dirs():
+    """回收 delete 侧 rm -rf 漏删的 VM 目录(兜底 GC)。双门确认,绝不误删有效数据:
+
+    判据(两条都满足才删):
+      ① 存在平级 tombstone `.purge-<tid>` —— 控制面 delete(keep_data=false)在 rm -rf 前
+         写的"该数据盘应销毁"持久信号,放【VM 目录外】故 rm -rf <tid> 中断也不丢(codex:
+         标记在被删目录内会随半删消失)。keep_data=true 软删不写 tombstone → 保盘。
+      ② DDB 强一致读该租户 status=deleted —— 确认删除【已完成】。deleting(备份/停机前、
+         可回滚 running)、记录不存在(同 id 重建的最终一致空窗口,误删新盘)一律【不删】
+         (codex 复审:只认明确 deleted,强一致读避开重建竞态)。
+    删成功后清 tombstone。任一查询/删除异常 → 跳过(no-data-loss:绝不因不确定而删)。
+    每轮回收上限,余量下一轮继续。
+    """
+    if not TENANTS_TABLE:
+        return 0
+    try:
+        entries = os.listdir(VM_DIR)
+    except FileNotFoundError:
+        return 0
+    table = _get_ddb().Table(TENANTS_TABLE)
+    global _disk_gc_cursor
+    # 门①:先筛出所有【平级 tombstone、普通文件、非符号链接】(codex:伪造成 .purge-<victim>
+    # 符号链接/目录可诱导删他人目录)。排序 + 从上轮游标之后环绕起(codex:防前 50 个长期删不掉
+    # 时第 51 个永远轮不到的饥饿)。
+    tombs = sorted(
+        n
+        for n in entries
+        if n.startswith(_PURGE_PREFIX)
+        and not os.path.islink(os.path.join(VM_DIR, n))
+        and os.path.isfile(os.path.join(VM_DIR, n))
+    )
+    if tombs:
+        start = next((i for i, n in enumerate(tombs) if n > _disk_gc_cursor), 0)
+        tombs = tombs[start:] + tombs[:start]  # 环绕:游标后 → 回头补前面
+    reclaimed = 0
+    # checked = 处理过的 tombstone 数(含 DDB 查询失败/rm 超时),上限防单轮扫完整个目录 +
+    # 打满 DDB/rm 时间上界;余量下一轮从游标续。
+    for name in tombs[:_DISK_GC_MAX_PER_SWEEP]:
+        _disk_gc_cursor = name
+        tid = name[len(_PURGE_PREFIX) :]
+        # tid 路径穿越防护(codex 复审):`.purge-..` 解出 tid=".." → join 出 VM_DIR 父目录 →
+        # rm -rf 可能删到 /data。拒空/`.`/`..`/含分隔符,并 commonpath 确认目标仍在 VM_DIR 下。
+        vm_path = os.path.join(VM_DIR, tid)
+        if (
+            not tid
+            or tid in (".", "..")
+            or "/" in tid
+            or os.path.commonpath([VM_DIR, os.path.realpath(vm_path)]) != VM_DIR
+        ):
+            print(f"disk-gc: unsafe tid from tombstone {name!r} — skip")
+            continue
+        tomb = os.path.join(VM_DIR, name)
+        # 门②:强一致读,只认明确 deleted。异常/deleting/记录不存在 → 跳过(不删)。
+        try:
+            item = table.get_item(
+                Key={"id": tid},
+                ConsistentRead=True,
+                ProjectionExpression="#s",
+                ExpressionAttributeNames={"#s": "status"},
+            ).get("Item")
+        except Exception as e:
+            print(f"disk-gc: DDB get {tid} failed (skip): {e}")
+            continue
+        if not item or item.get("status") != "deleted":
+            continue
+        try:
+            subprocess.run(["rm", "-rf", vm_path], check=True, timeout=30)
+            os.remove(tomb)  # 删净后清 tombstone(下轮不再扫);删失败留着下轮重试
+            reclaimed += 1
+        except Exception as e:
+            print(f"disk-gc: rm -rf {vm_path} failed: {e}")
+    if reclaimed:
+        print(f"disk-gc: reclaimed {reclaimed} purged-tenant VM dir(s) from {VM_DIR}")
+    return reclaimed
+
+
+def _disk_gc_loop():
+    """#321 — 独立单例线程跑磁盘 GC。与 poll/dispatch/housekeeping 分开,一次 sweep 卡住
+    (rm -rf 在 IO hang 下超时)也不阻塞 host heartbeat → 不会误判 host stale 触发重启。"""
+    while True:
+        try:
+            _gc_orphan_vm_dirs()
+        except Exception as e:
+            print(f"disk-gc loop error (non-fatal): {e}")
+        time.sleep(_DISK_GC_INTERVAL_SEC)
 
 
 def _reap_orphan_firecrackers():
@@ -2077,6 +2273,15 @@ def main():
     )
     t = threading.Thread(target=_poll_loop, daemon=True)
     t.start()
+    # #321: disk GC on its own always-on thread (independent of dispatch/poll so a
+    # stuck rm -rf never blocks heartbeat → no false stale-restart).
+    g = threading.Thread(target=_disk_gc_loop, daemon=True)
+    g.start()
+    # #340: /data free-space report on its own thread (independent of poll's slow VM
+    # probes so a busy host's disk timestamp stays fresh → stale ⟺ agent actually down,
+    # letting dispatch fail-open safely on stale reads instead of mis-blocking).
+    dr = threading.Thread(target=_disk_report_loop, daemon=True)
+    dr.start()
     # Pull-mode dispatch reconciler (二期 SPEC/specs/sqs-dispatch/interfaces.md).
     # Only starts when ASSIGNMENTS_TABLE is injected via systemd (dispatch.enabled
     # && dispatch.mode=pull in config.yml). One extra daemon thread; no impact

@@ -1,5 +1,14 @@
 # `patch/` — apply-by-reading hotfix kits (no CDK / CloudFormation redeploy)
 
+## Getting started
+
+1. **Clone the gateway branch** (this branch has the kits):
+   `git clone --branch gateway --single-branch <this-repo-url> && cd sample-multi-tenant-openclaw-on-firecracker`
+2. **Open Claude Code** in that directory (with credentials for the TARGET environment).
+3. **Switch to max reasoning: `/effort xhigh`** — applying a patch to production is high-stakes;
+   run at the highest reasoning effort so nothing is skimmed.
+4. **Paste the executor prompt below** (fill in `<id>`, e.g. `353-secret-ttl-plus-post315-rollup`).
+
 > **Executor prompt (copy verbatim, fill `<id>`):**
 > _"Start applying the OpenClaw patch kit `patch/<id>/`. First read `manifest.json` and
 > `APPLY-INSTRUCTIONS.md` fully, then execute it top to bottom. This is a PRODUCTION environment,

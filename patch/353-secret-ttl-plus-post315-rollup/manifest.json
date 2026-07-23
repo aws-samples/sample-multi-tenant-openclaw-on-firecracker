@@ -7,7 +7,7 @@
   "field_corrections": [
     {
       "path": "build-rootfs.sh",
-      "reason": "Ubuntu Noble user manager exits 218/CAPABILITIES when the guest forwarder unit sets CapabilityBoundingSet"
+      "reason": "Ubuntu Noble user manager exits 218/CAPABILITIES when the guest forwarder unit sets CapabilityBoundingSet; quoted gateway-unit heredocs prevent comment backticks from executing during the chroot build"
     },
     {
       "path": "deploy/edge/fluent-bit/host/fluent-bit.conf",
@@ -20,7 +20,7 @@
       "layer": "deploy-other",
       "artifact": "launch-template/build-rootfs.sh.patched",
       "base_sha256": "52ae5e46f64b2e77411315cc25fb6bcb2b2efcc732ea78c470ac93f1b0f971f8",
-      "patch_sha256": "f7917c0328ffa8a96a005d104df99e482cea6f1ee5a8cd55b12169cc08d918ee",
+      "patch_sha256": "4dbb1400914ef3a8f67144e572290afae6fe2bb39f7d271339ec4322daa2541b",
       "operations": [
         {
           "resource": "build-rootfs.sh (deploy-other code replacement)",

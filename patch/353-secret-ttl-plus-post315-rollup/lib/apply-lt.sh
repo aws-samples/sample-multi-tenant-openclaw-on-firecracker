@@ -9,6 +9,7 @@
 #   push     <asg> <region>                 create a NEW LT version from your edited plaintext (does NOT touch the ASG)
 #   promote  <asg> <region>                 point the ASG at the new version (MIP-safe), preserving all other config
 #   refresh  <asg> <region>                 start a CONTROLLED instance-refresh (high MinHealthy)
+#   verify   <asg> <region> [instance-id]   verify one healthy ASG host running the new LT version
 #   rollback <asg> <region>                 re-point the ASG at the exact prior config captured at pull
 #
 # Design decisions from the 2026-07-22 cross-model review:
@@ -20,8 +21,8 @@
 #     freshly-created version can't be picked up by natural scaling before promote.
 #  #4/#5 drift + state: pull snapshots the full ASG config + its sha; every later verb re-reads and
 #     aborts if the live config drifted; state is a 0600 JSON file in a 0700 dir (never /tmp `source`).
-#  #9 verify-before-promote: push creates a version, reads it back, and leaves the ASG alone; promote
-#     is a separate gated step. The fleet is controlled, so a controlled instance-refresh is the boot proof.
+#  #9 boot verification: push creates a version, reads it back, and leaves the ASG alone; promote
+#     is a separate gated step. Verify a host created by the controlled instance-refresh.
 #  #10 refresh uses a HIGH MinHealthyPercentage (default 100 — small = bigger blast radius, backwards).
 #  #11 host registration key is instance_id.  #13 every mutation is read back and compared.
 set -euo pipefail
@@ -35,6 +36,16 @@ STATE_DIR="${OC_APPLY_LT_STATE_DIR:-$HOME/.oc-apply-lt}"
 _gate() { echo; echo ">>> $1"; printf "    type '%s' to proceed (else abort): " "$CONFIRM"; read -r a; [ "$a" = "$CONFIRM" ] || { echo aborted; exit 3; }; }
 _need() { command -v "$1" >/dev/null || { echo "FATAL: need '$1' on PATH" >&2; exit 1; }; }
 _need aws; _need jq; _need python3
+_sha256_stdin() {
+  if command -v sha256sum >/dev/null; then
+    sha256sum | awk '{print $1}'
+  elif command -v shasum >/dev/null; then
+    shasum -a 256 | awk '{print $1}'
+  else
+    echo "FATAL: need 'sha256sum' or 'shasum' on PATH" >&2
+    return 1
+  fi
+}
 _statefile() { echo "$STATE_DIR/$1.json"; }   # $1 = asg name
 
 # The plaintext the operator edits, keyed by asg so two concurrent patches don't collide.
@@ -56,7 +67,12 @@ _lt_ref() { # stdin = ASG JSON -> "ltid<TAB>version<TAB>ismip"
     | @tsv'
 }
 
-[ $# -ge 1 ] || { echo "usage: apply-lt.sh pull|push|promote|refresh|rollback <asg> <region>" >&2; exit 2; }
+_usage() {
+  echo "usage: apply-lt.sh pull|push|promote|refresh|rollback <asg> <region>" >&2
+  echo "       apply-lt.sh verify <asg> <region> [instance-id]" >&2
+}
+
+[ $# -ge 1 ] || { _usage; exit 2; }
 cmd="$1"; shift
 
 case "$cmd" in
@@ -66,7 +82,7 @@ case "$cmd" in
     ASGJSON="$(_read_asg "$ASG" "$REGION")"
     IFS=$'\t' read -r LTID VER ISMIP < <(printf '%s' "$ASGJSON" | _lt_ref)
     [ -n "$LTID" ] || { echo "FATAL: ASG '$ASG' has no launch template (LaunchConfiguration ASGs unsupported)" >&2; exit 1; }
-    case "$VER" in '$Latest'|'$Default'|''|null)
+    case "$VER" in "\$Latest"|"\$Default"|''|null)
       echo "FATAL: ASG pins version '$VER' — refusing (#3). Pin a CONCRETE numeric version on the ASG first," >&2
       echo "       so a freshly-created version can't be launched by natural scaling before promote." >&2
       exit 2 ;;
@@ -75,8 +91,8 @@ case "$cmd" in
     # decode the rendered UserData of THAT exact version
     aws ec2 describe-launch-template-versions --launch-template-id "$LTID" --versions "$VER" --region "$REGION" \
       --query 'LaunchTemplateVersions[0].LaunchTemplateData.UserData' --output text | base64 -d \
-      | python3 "$LTU" decode - > "$(_plain "$ASG")"   # decode refuses {{ }} + strict bootstrap
-    ASG_SHA="$(printf '%s' "$ASGJSON" | jq -S . | shasum -a 256 | awk '{print $1}')"
+      | python3 "$LTU" decode - > "$(_plain "$ASG")"   # strict bootstrap; refuses unresolved {{TOKEN}}
+    ASG_SHA="$(printf '%s' "$ASGJSON" | jq -S . | _sha256_stdin)"
     jq -n --arg asg "$ASG" --arg region "$REGION" --arg ltid "$LTID" --arg ver "$VER" \
           --arg ismip "$ISMIP" --arg sha "$ASG_SHA" --argjson asgjson "$ASGJSON" \
       '{asg:$asg,region:$region,lt_id:$ltid,prev_version:$ver,is_mip:$ismip,asg_sha:$sha,asg_snapshot:$asgjson}' \
@@ -91,7 +107,7 @@ case "$cmd" in
     [ -f "$ST" ] || { echo "FATAL: run pull first (no $ST)" >&2; exit 1; }
     LTID="$(jq -r .lt_id "$ST")"; PREV="$(jq -r .prev_version "$ST")"; EDITED="$(_plain "$ASG")"
     [ -f "$EDITED" ] || { echo "FATAL: $EDITED missing" >&2; exit 1; }
-    # repack (no strip — decoded content is already CDK-stripped; refuses {{ }}; 16KB-checked)
+    # repack (no strip — decoded content is already CDK-stripped; refuses unresolved tokens; 16KB-checked)
     UD_B64="$(python3 "$LTU" repack "$EDITED" | base64 | tr -d '\n')"
     # sanity: decode(repack(edited)) == edited, before we ever create a version
     printf '%s' "$UD_B64" | base64 -d | python3 "$LTU" decode - > "$STATE_DIR/$ASG.roundtrip" 2>/dev/null
@@ -108,9 +124,9 @@ case "$cmd" in
       || { echo "FATAL: created version $NEWVER does NOT read back as edited plaintext — do NOT promote" >&2; exit 2; }
     jq --arg nv "$NEWVER" '.new_version=$nv' "$ST" > "$ST.tmp" && mv "$ST.tmp" "$ST"; chmod 600 "$ST"
     echo "OK: LT $LTID new version $NEWVER created + read-back verified. ASG UNCHANGED."
-    echo "The new UserData is already proven at push (decode = no placeholders + round-trip + read-back)."
+    echo "The new UserData is already proven at push (no unresolved placeholders + round-trip + read-back)."
     echo "NEXT: apply-lt.sh promote $ASG $REGION   (point the ASG at v$NEWVER; the running fleet is controlled,"
-    echo "      so a small controlled instance-refresh's first host — via normal ASG lifecycle — is the boot proof)."
+    echo "      so a controlled instance-refresh's first host — via normal ASG lifecycle — is the boot proof)."
     ;;
 
   promote)
@@ -122,7 +138,7 @@ case "$cmd" in
     # drift guard (#4): re-read AFTER the confirm gate (not before) so a change during the prompt can't
     # slip through, and build the update from the re-read live JSON, not the stale pull snapshot.
     ASGNOW="$(_read_asg "$ASG" "$REGION")"
-    NOWSHA="$(printf '%s' "$ASGNOW" | jq -S . | shasum -a 256 | awk '{print $1}')"
+    NOWSHA="$(printf '%s' "$ASGNOW" | jq -S . | _sha256_stdin)"
     [ "$NOWSHA" = "$PREVSHA" ] || { echo "FATAL: ASG config drifted since pull (someone/CDK changed it). Re-run pull." >&2; exit 2; }
     if [ "$ISMIP" = "mip" ]; then
       # MIP-safe (#1/#2): take the FULL live policy, swap ONLY the version via --arg (env.NEWVER was a
@@ -140,7 +156,9 @@ case "$cmd" in
     IFS=$'\t' read -r _id NOWVER _mip < <(_read_asg "$ASG" "$REGION" | _lt_ref)
     [ "$NOWVER" = "$NEWVER" ] || { echo "FATAL: post-update ASG references v$NOWVER, not v$NEWVER" >&2; exit 2; }
     echo "OK: ASG launches NEW hosts on LT $LTID v$NEWVER (verified). Running hosts unchanged."
-    echo "NEXT (optional): apply-lt.sh refresh $ASG $REGION   |   rollback: apply-lt.sh rollback $ASG $REGION"
+    echo "NEXT: apply-lt.sh refresh $ASG $REGION"
+    echo "      Then verify the first healthy replacement: apply-lt.sh verify $ASG $REGION"
+    echo "      Rollback: apply-lt.sh rollback $ASG $REGION"
     ;;
 
   refresh)
@@ -155,7 +173,89 @@ case "$cmd" in
     aws autoscaling start-instance-refresh --auto-scaling-group-name "$ASG" --region "$REGION" \
       --preferences "MinHealthyPercentage=$MINH,InstanceWarmup=300"
     echo "OK: instance-refresh started (MinHealthy=$MINH). Watch: aws autoscaling describe-instance-refreshes --auto-scaling-group-name $ASG --region $REGION"
+    echo "NEXT: once a new host is healthy, run: apply-lt.sh verify $ASG $REGION"
     echo "NOTE (experimental): rollback of an in-flight refresh isn't wired here — to natively roll back you'd need DesiredConfiguration set. Cancel manually if needed: aws autoscaling cancel-instance-refresh --auto-scaling-group-name $ASG --region $REGION"
+    ;;
+
+  verify)
+    ASG="${1:?asg}"; REGION="${2:?region}"; REQUESTED_IID="${3:-}"; ST="$(_statefile "$ASG")"
+    [ -f "$ST" ] || { echo "FATAL: run pull and push first (no $ST)" >&2; exit 1; }
+    LTID="$(jq -r .lt_id "$ST")"; NEWVER="$(jq -r .new_version "$ST")"
+    [ -n "$LTID" ] && [ "$LTID" != "null" ] || { echo "FATAL: state has no launch template id; re-run pull" >&2; exit 1; }
+    [ -n "$NEWVER" ] && [ "$NEWVER" != "null" ] || { echo "FATAL: run push first (state has no new version)" >&2; exit 1; }
+
+    # A standalone canary is unsafe because init-host registers it as schedulable. Verify only a
+    # healthy host created through the ASG's normal lifecycle on the exact pushed LT version.
+    ASGJSON="$(_read_asg "$ASG" "$REGION")"
+    CANDIDATES="$(printf '%s' "$ASGJSON" | jq -r --arg ltid "$LTID" --arg ver "$NEWVER" '
+      .Instances[]?
+      | select(
+          .LifecycleState == "InService"
+          and .HealthStatus == "Healthy"
+          and .LaunchTemplate.LaunchTemplateId == $ltid
+          and (.LaunchTemplate.Version | tostring) == $ver
+        )
+      | .InstanceId
+    ')"
+    [ -n "$CANDIDATES" ] || {
+      echo "FATAL: no healthy InService host on LT $LTID v$NEWVER yet." >&2
+      echo "       Promote + refresh first, then retry verify when the first replacement is healthy." >&2
+      exit 2
+    }
+    if [ -n "$REQUESTED_IID" ]; then
+      printf '%s\n' "$CANDIDATES" | grep -Fxq "$REQUESTED_IID" || {
+        echo "FATAL: requested instance $REQUESTED_IID is not a healthy ASG host on LT $LTID v$NEWVER" >&2
+        exit 2
+      }
+      IID="$REQUESTED_IID"
+    else
+      IID="$(printf '%s\n' "$CANDIDATES" | sed -n '1p')"
+    fi
+    echo "signal 1/3 PASS: $IID is Healthy/InService in ASG '$ASG' on LT $LTID v$NEWVER"
+
+    PING="$(aws ssm describe-instance-information --filters "Key=InstanceIds,Values=$IID" \
+      --region "$REGION" --query 'InstanceInformationList[0].PingStatus' --output text)"
+    [ "$PING" = "Online" ] || {
+      echo "FATAL: signal 2/3 failed: SSM PingStatus for $IID is '$PING', expected Online" >&2
+      exit 2
+    }
+    echo "signal 2/3 PASS: $IID is SSM Online"
+
+    PARAMS="$(jq -cn '{
+      commands: [
+        "set -euo pipefail",
+        "cloud-init status --wait",
+        "test \"$(systemctl is-active host-agent.service)\" = active",
+        "test \"$(systemctl show host-agent.service --property KillMode --value)\" = process",
+        "grep -Eq \"^OC_HOST_LAUNCH_SLOTS=[1-9][0-9]*$\" /etc/platform.env",
+        "test -f /tmp/init-host.sh",
+        "! grep -Eq \"\\{\\{[A-Z][A-Z0-9_]*\\}\\}\" /tmp/init-host.sh"
+      ]
+    }')"
+    COMMAND_ID="$(aws ssm send-command --instance-ids "$IID" --document-name AWS-RunShellScript \
+      --comment "verify patch 353 launch template" --parameters "$PARAMS" --timeout-seconds 180 \
+      --region "$REGION" --query 'Command.CommandId' --output text)"
+    case "$COMMAND_ID" in ''|None|null)
+      echo "FATAL: signal 3/3 failed: SSM send-command returned no command id" >&2
+      exit 2 ;;
+    esac
+    if ! aws ssm wait command-executed --command-id "$COMMAND_ID" --instance-id "$IID" --region "$REGION"; then
+      echo "FATAL: signal 3/3 failed: remote boot checks did not succeed" >&2
+      aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$IID" \
+        --region "$REGION" --output json >&2 || true
+      exit 2
+    fi
+    RESULT="$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$IID" \
+      --region "$REGION" --output json)"
+    STATUS="$(printf '%s' "$RESULT" | jq -r .Status)"
+    [ "$STATUS" = "Success" ] || {
+      echo "FATAL: signal 3/3 failed: SSM command status is '$STATUS'" >&2
+      printf '%s\n' "$RESULT" | jq . >&2
+      exit 2
+    }
+    echo "signal 3/3 PASS: cloud-init completed; host-agent active with KillMode=process;"
+    echo "                 launch slots rendered; decoded UserData has no unresolved placeholders"
+    echo "OK: LT $LTID v$NEWVER boot verification passed on ASG host $IID"
     ;;
 
   rollback)
@@ -175,5 +275,5 @@ case "$cmd" in
     echo "OK: ASG re-pointed at v$PREV. (The bad LT version is left in place — immutable, cheap; don't delete.)"
     ;;
 
-  *) echo "usage: apply-lt.sh pull|push|promote|refresh|rollback <asg> <region>" >&2; exit 2 ;;
+  *) _usage; exit 2 ;;
 esac

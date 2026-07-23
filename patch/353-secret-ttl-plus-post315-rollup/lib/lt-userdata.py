@@ -16,12 +16,15 @@
 # Therefore repack defaults to NO strip (byte-faithful). `--strip` is only for CDK's very first bake
 # from a fully-commented source, never in a hot patch.
 #
-# Placeholder guard (Codex #8): BOTH decode and repack REFUSE content containing `{{` or `}}` — a raw
-# CDK template (with {{PLACEHOLDER}} tokens) must never be packed into a live LT (hosts would boot
-# with literal {{...}}). The shell wrapper's guard is a backstop; the real gate is here in Python.
-import sys, base64, gzip, re
+# Placeholder guard (Codex #8): BOTH decode and repack REFUSE unresolved CDK tokens such as
+# {{PLACEHOLDER}}. Literal brace pairs used by shell/application content are allowed.
+import base64
+import gzip
+import re
+import sys
 
 LIMIT = 16384
+_PLACEHOLDER_RE = re.compile(r"\{\{[A-Z][A-Z0-9_]*\}\}")
 # The exact 4-line bootstrap CDK emits (and repack emits). decode does a strict fullmatch on this so a
 # fake blob hidden in a comment / a second payload can't be picked up (Codex #12).
 _BOOT_RE = re.compile(
@@ -33,10 +36,11 @@ _BOOT_RE = re.compile(
 
 
 def _refuse_placeholders(text: str, where: str):
-    if "{{" in text or "}}" in text:
+    match = _PLACEHOLDER_RE.search(text)
+    if match:
         sys.stderr.write(
-            f"{where}: content contains {{{{ }}}} placeholders — this is a raw CDK template, not "
-            f"rendered UserData. Refusing (hosts would boot with literal placeholders).\n"
+            f"{where}: content contains unresolved template placeholder {match.group(0)!r} — "
+            "this is raw CDK template content, not rendered UserData. Refusing.\n"
         )
         sys.exit(2)
 

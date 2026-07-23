@@ -6,7 +6,9 @@ gate · **#323** host-agent KillMode · **#330** capacity mem-dimension CAS · *
 **#345** guest-log vsock · **#321** disk-leak GC · **#336** copy-file contract · **#343** rootfs_version
 sync · **#338** pull-progress → Fluent Bit.
 
-- `base_sha` (previous patch = 315) → `patch_sha` = the exact source in `manifest.json`.
+- `base_sha` (previous patch = 315) → `patch_sha` = the upstream source snapshot in `manifest.json`.
+  Entries in `field_corrections` intentionally postdate that snapshot and carry their corrected
+  artifact hash in `paths.<path>.patch_sha256`.
 - **status: MANUAL_REVIEW** — two operations need a human before you run them (#353 DDB-TTL disable
   on the live table; the ha_edge SG/edge review). Everything else is hot-applyable, NO CloudFormation redeploy.
 - **stack `cdk`-based redeploy is FORBIDDEN** on this deployment (it was provisioned once via CDK then hand-modified; a
@@ -67,10 +69,13 @@ hand-typed resource names. Do not proceed while `control_plane_api.confirmed` is
 ## Step 1.5 — Full change list + anti-revert hash gate (RUN BEFORE ANY WRITE)
 
 `manifest.json` `paths{}` lists every file + its `patch_sha256`. For each artifact you ship, confirm
-it equals both the repo source at `patch_sha` and the shipped file (catches a mis-packaged patch):
+the shipped file matches that hash. Also compare it with the repo source at `patch_sha`, except for
+the explicitly listed `field_corrections`; those must match the current checkout's canonical source
+and their corrected manifest hash:
 
 ```bash
 # for a host-scripts/*.patched:  sha256sum host-scripts/launch-vm.sh.patched   == manifest patch_sha256
+# for field_corrections:          cmp host-scripts/fluent-bit/fluent-bit.conf ../../deploy/edge/fluent-bit/host/fluent-bit.conf
 # for the live target before overwrite (record for rollback):
 ssh $HOST 'sha256sum /home/ubuntu/launch-vm.sh'      # or: aws s3 cp <real-s3-path> - | sha256sum
 ```

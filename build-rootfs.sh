@@ -974,7 +974,8 @@ RestartSec=5
 Environment=HOME=/home/agent
 # 背压兜底 + 零凭据:纯本地 vsock 写,无出网、无云凭据。收紧权限(仿 gateway)。
 NoNewPrivileges=true
-CapabilityBoundingSet=
+# 该全局 unit 由非特权 user manager 启动。Ubuntu Noble 会拒绝 capability 设置并报
+# 218/CAPABILITIES；进程本身已是 uid 1000，依靠 NoNewPrivileges 保持不可提权。
 RestrictSUIDSGID=true
 MemoryMax=128M
 TasksMax=16

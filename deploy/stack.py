@@ -268,15 +268,44 @@ class OpenClawOrchestratorStack(cdk.Stack):
         )
 
         # ========== Lambda Shared Policy ==========
-        ssm_policy = iam.PolicyStatement(
-            actions=["ssm:SendCommand", "ssm:GetCommandInvocation"],
-            resources=["*"],
-        )
-        ec2_policy = iam.PolicyStatement(
-            actions=["ec2:DescribeInstances", "ec2:DescribeInstanceTypes",
-                     "ec2:TerminateInstances"],
-            resources=["*"],
-        )
+        # T2-5: scope the wildcards. These statements are declared before the
+        # ASG (created later) so we build literal ARNs from the well-known
+        # names rather than referencing constructs. A tag condition applies to
+        # ALL resources in a statement, so the untagged RunShellScript document
+        # ARN must live in its own conditionless statement — else SendCommand
+        # to the document breaks.
+        _asg_arn = Fn.join("", [
+            "arn:", cdk.Aws.PARTITION, ":autoscaling:", cdk.Aws.REGION, ":",
+            cdk.Aws.ACCOUNT_ID, ":autoScalingGroup:*:autoScalingGroupName/openclaw-hosts-asg"])
+        _run_shell_doc_arn = Fn.join("", [
+            "arn:", cdk.Aws.PARTITION, ":ssm:", cdk.Aws.REGION, "::document/AWS-RunShellScript"])
+        # ssm:SendCommand needs BOTH the document (untagged) and the target
+        # instances (scoped by ASG tag); GetCommandInvocation has no resource
+        # granularity, so it stays *.
+        ssm_policies = [
+            iam.PolicyStatement(actions=["ssm:SendCommand"],
+                                resources=[_run_shell_doc_arn]),
+            iam.PolicyStatement(
+                actions=["ssm:SendCommand"],
+                resources=[Fn.join("", ["arn:", cdk.Aws.PARTITION, ":ec2:",
+                    cdk.Aws.REGION, ":", cdk.Aws.ACCOUNT_ID, ":instance/*"])],
+                conditions={"StringEquals": {
+                    "aws:ResourceTag/aws:autoscaling:groupName": "openclaw-hosts-asg"}}),
+            iam.PolicyStatement(actions=["ssm:GetCommandInvocation"], resources=["*"]),
+        ]
+        # ec2 Describe* has no resource-level support (stays *); TerminateInstances
+        # is scoped to ASG-tagged instances.
+        ec2_policies = [
+            iam.PolicyStatement(
+                actions=["ec2:DescribeInstances", "ec2:DescribeInstanceTypes"],
+                resources=["*"]),
+            iam.PolicyStatement(
+                actions=["ec2:TerminateInstances"],
+                resources=[Fn.join("", ["arn:", cdk.Aws.PARTITION, ":ec2:",
+                    cdk.Aws.REGION, ":", cdk.Aws.ACCOUNT_ID, ":instance/*"])],
+                conditions={"StringEquals": {
+                    "aws:ResourceTag/aws:autoscaling:groupName": "openclaw-hosts-asg"}}),
+        ]
 
         # ========== SNS Lifecycle Notifications (issue #13, optional) ==========
         notif_cfg = CFG.get("notifications", {}) or {}
@@ -395,13 +424,17 @@ class OpenClawOrchestratorStack(cdk.Stack):
         # Issue #13 — allow publishing tenant lifecycle events
         if notifications_topic is not None:
             notifications_topic.grant_publish(api_fn)
-        api_fn.add_to_role_policy(ssm_policy)
-        api_fn.add_to_role_policy(ec2_policy)
+        for _s in ssm_policies + ec2_policies:
+            api_fn.add_to_role_policy(_s)
+        # T2-5: Describe* has no resource-level support (stays *); the three
+        # mutating actions scope to the openclaw ASG ARN.
         api_fn.add_to_role_policy(iam.PolicyStatement(
-            actions=["autoscaling:DescribeAutoScalingGroups", "autoscaling:SetDesiredCapacity",
+            actions=["autoscaling:DescribeAutoScalingGroups"], resources=["*"]))
+        api_fn.add_to_role_policy(iam.PolicyStatement(
+            actions=["autoscaling:SetDesiredCapacity",
                      "autoscaling:CompleteLifecycleAction",
                      "autoscaling:TerminateInstanceInAutoScalingGroup"],
-            resources=["*"],
+            resources=[_asg_arn],
         ))
 
         # ========== API Gateway ==========
@@ -624,18 +657,33 @@ class OpenClawOrchestratorStack(cdk.Stack):
         if notifications_topic is not None:
             notifications_topic.grant_publish(health_fn)
         # 1.3.1: ALB rule re-pointing during cross-host failover.
+        # T2-5: ELB Describe* has no resource-level support (stays *); the
+        # mutating actions scope to this account+region's ELB ARN space (rule
+        # and target-group ARNs are created dynamically, so an account-scoped
+        # prefix is the tightest safe bound without the not-yet-created ARNs).
+        _elb_arns = [
+            Fn.join("", ["arn:", cdk.Aws.PARTITION, ":elasticloadbalancing:",
+                cdk.Aws.REGION, ":", cdk.Aws.ACCOUNT_ID, ":listener-rule/app/*"]),
+            Fn.join("", ["arn:", cdk.Aws.PARTITION, ":elasticloadbalancing:",
+                cdk.Aws.REGION, ":", cdk.Aws.ACCOUNT_ID, ":listener/app/*"]),
+            Fn.join("", ["arn:", cdk.Aws.PARTITION, ":elasticloadbalancing:",
+                cdk.Aws.REGION, ":", cdk.Aws.ACCOUNT_ID, ":targetgroup/*"]),
+        ]
+        health_fn.add_to_role_policy(iam.PolicyStatement(
+            actions=["elasticloadbalancing:DescribeRules",
+                     "elasticloadbalancing:DescribeTargetGroups"],
+            resources=["*"]))
         health_fn.add_to_role_policy(iam.PolicyStatement(
             actions=[
-                "elasticloadbalancing:DescribeRules",
-                "elasticloadbalancing:DescribeTargetGroups",
                 "elasticloadbalancing:CreateRule",
                 "elasticloadbalancing:ModifyRule",
                 "elasticloadbalancing:CreateTargetGroup",
                 "elasticloadbalancing:RegisterTargets",
             ],
-            resources=["*"],
+            resources=_elb_arns,
         ))
-        health_fn.add_to_role_policy(ssm_policy)
+        for _s in ssm_policies:
+            health_fn.add_to_role_policy(_s)
 
         events.Rule(self, "HealthCheckSchedule",
             schedule=events.Schedule.rate(Duration.minutes(CFG["health_check"]["interval_minutes"])),
@@ -712,11 +760,13 @@ class OpenClawOrchestratorStack(cdk.Stack):
         tenants_table.grant_read_write_data(scaler_fn)
         # Issue #71 — scaler writes audit rows for its automated actions.
         audit_table.grant_write_data(scaler_fn)
-        scaler_fn.add_to_role_policy(ssm_policy)  # SSM stop-vm.sh on TTL expiry
+        for _s in ssm_policies:  # SSM stop-vm.sh on TTL expiry
+            scaler_fn.add_to_role_policy(_s)
         scaler_fn.add_to_role_policy(iam.PolicyStatement(
-            actions=["autoscaling:DescribeAutoScalingGroups",
-                     "autoscaling:TerminateInstanceInAutoScalingGroup"],
-            resources=["*"],
+            actions=["autoscaling:DescribeAutoScalingGroups"], resources=["*"]))
+        scaler_fn.add_to_role_policy(iam.PolicyStatement(
+            actions=["autoscaling:TerminateInstanceInAutoScalingGroup"],
+            resources=[_asg_arn],
         ))
         events.Rule(self, "ScalerSchedule",
             schedule=events.Schedule.rate(Duration.minutes(CFG["scaler"]["interval_minutes"])),
@@ -740,7 +790,8 @@ class OpenClawOrchestratorStack(cdk.Stack):
         )
         tenants_table.grant_read_write_data(backup_fn)
         assets_bucket.grant_read_write(backup_fn)
-        backup_fn.add_to_role_policy(ssm_policy)
+        for _s in ssm_policies:
+            backup_fn.add_to_role_policy(_s)
         backup_fn.grant_invoke(api_fn)  # API Lambda async invokes Backup Lambda
 
         events.Rule(self, "BackupSchedule",
@@ -798,17 +849,28 @@ class OpenClawOrchestratorStack(cdk.Stack):
         assets_bucket.grant_read_write(host_role)
         hosts_table.grant_read_write_data(host_role)
         tenants_table.grant_read_write_data(host_role)  # host-agent writes health status
+        # T2-5: CompleteLifecycleAction is scopable to the ASG ARN.
         host_role.add_to_policy(iam.PolicyStatement(
             actions=["autoscaling:CompleteLifecycleAction"],
-            resources=["*"],
+            resources=[_asg_arn],
         ))
+        # DescribeVolumes has no resource-level support (stays *); CreateTags is
+        # scoped to the account's volumes + instances (host tags its own EBS).
         host_role.add_to_policy(iam.PolicyStatement(
-            actions=["ec2:DescribeVolumes", "ec2:CreateTags"],
-            resources=["*"],
+            actions=["ec2:DescribeVolumes"], resources=["*"]))
+        host_role.add_to_policy(iam.PolicyStatement(
+            actions=["ec2:CreateTags"],
+            resources=[
+                Fn.join("", ["arn:", cdk.Aws.PARTITION, ":ec2:", cdk.Aws.REGION,
+                    ":", cdk.Aws.ACCOUNT_ID, ":volume/*"]),
+                Fn.join("", ["arn:", cdk.Aws.PARTITION, ":ec2:", cdk.Aws.REGION,
+                    ":", cdk.Aws.ACCOUNT_ID, ":instance/*"]),
+            ],
         ))
+        # host-agent only reads its own stack outputs → scope to this stack ARN.
         host_role.add_to_policy(iam.PolicyStatement(
             actions=["cloudformation:DescribeStacks"],
-            resources=["*"],
+            resources=[cdk.Aws.STACK_ID],
         ))
 
         # ========== Amazon Managed Prometheus + Grafana (issue #4) ==========
@@ -1272,16 +1334,21 @@ class OpenClawOrchestratorStack(cdk.Stack):
         # hits http://<alb_dns>/vm/<tenant_id>/ — same path CloudFront
         # would forward to anyway.
         health_fn.add_environment("PUBLIC_BASE_URL", f"http://{alb.load_balancer_dns_name}")
+        # T2-5: Describe* stays * (no resource-level support); the create/delete/
+        # modify/register actions scope to this account+region's ELB ARN space.
+        api_fn.add_to_role_policy(iam.PolicyStatement(
+            actions=["elasticloadbalancing:DescribeRules",
+                     "elasticloadbalancing:DescribeTargetGroups",
+                     "elasticloadbalancing:DescribeListeners"],
+            resources=["*"]))
         api_fn.add_to_role_policy(iam.PolicyStatement(
             actions=[
                 "elasticloadbalancing:CreateTargetGroup", "elasticloadbalancing:DeleteTargetGroup",
                 "elasticloadbalancing:RegisterTargets", "elasticloadbalancing:DeregisterTargets",
                 "elasticloadbalancing:CreateRule", "elasticloadbalancing:DeleteRule",
                 "elasticloadbalancing:ModifyRule",
-                "elasticloadbalancing:DescribeRules", "elasticloadbalancing:DescribeTargetGroups",
-                "elasticloadbalancing:DescribeListeners",
             ],
-            resources=["*"],
+            resources=_elb_arns,
         ))
 
         # ========== CloudFront ==========

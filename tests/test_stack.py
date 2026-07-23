@@ -199,3 +199,49 @@ class TestObservability:
                     pass
         joined = json.dumps(rules)
         assert "DeadLetterConfig" in joined, "no EventBridge target has a DLQ"
+
+
+# ═══════════════════════════════════════════
+# T2-5 — IAM wildcards scoped
+# ═══════════════════════════════════════════
+
+
+class TestIamScoping:
+    @pytest.mark.unit
+    @pytest.mark.regression
+    def test_ssm_sendcommand_conditioned_on_asg_tag(self, synthesized_template):
+        # SendCommand to instances must carry the ASG-tag condition (no bare *).
+        pols = synthesized_template.find_resources("AWS::IAM::Policy")
+        blob = json.dumps(pols)
+        assert "aws:autoscaling:groupName" in blob, \
+            "ssm:SendCommand not scoped by ASG tag condition"
+        assert "AWS-RunShellScript" in blob, "SendCommand document ARN not scoped"
+
+    @pytest.mark.unit
+    def test_terminate_and_lifecycle_scoped_not_star(self, synthesized_template):
+        # ec2:TerminateInstances and autoscaling mutations must not appear on a
+        # bare "*" resource — they should reference an instance/ASG ARN.
+        pols = synthesized_template.find_resources("AWS::IAM::Policy")
+        import re
+        for p in pols.values():
+            for stmt in p["Properties"]["PolicyDocument"]["Statement"]:
+                actions = stmt.get("Action", [])
+                actions = [actions] if isinstance(actions, str) else actions
+                mutating = {"ec2:TerminateInstances",
+                            "autoscaling:TerminateInstanceInAutoScalingGroup",
+                            "autoscaling:SetDesiredCapacity",
+                            "autoscaling:CompleteLifecycleAction"}
+                if mutating & set(actions):
+                    assert stmt.get("Resource") != "*", \
+                        f"mutating action on bare *: {actions}"
+
+    @pytest.mark.unit
+    def test_describestacks_scoped_to_this_stack(self, synthesized_template):
+        pols = synthesized_template.find_resources("AWS::IAM::Policy")
+        for p in pols.values():
+            for stmt in p["Properties"]["PolicyDocument"]["Statement"]:
+                actions = stmt.get("Action", [])
+                actions = [actions] if isinstance(actions, str) else actions
+                if "cloudformation:DescribeStacks" in actions:
+                    assert stmt.get("Resource") != "*", \
+                        "cloudformation:DescribeStacks left on bare *"

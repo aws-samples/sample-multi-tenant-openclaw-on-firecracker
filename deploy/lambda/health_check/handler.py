@@ -631,8 +631,14 @@ def _check_and_handle_az_failover(now, tenants):
         "skipped_cooldown": [],
     }
 
-    # 1) Load all hosts.
-    hosts = hosts_table.scan().get("Items", [])
+    # 1) Load hosts, excluding status=deleted so stale zombie rows (a
+    #    terminated instance whose row lingered) can't be bucketed into their AZ
+    #    and counted as "unhealthy", faking an AZ outage. Rows with no status
+    #    field are kept (they're normal in the pre-status data model / tests);
+    #    the __az_failover_state__ bookkeeping record has no `az` field so
+    #    group_hosts_by_az already skips it.
+    hosts = [h for h in hosts_table.scan().get("Items", [])
+             if h.get("status") != "deleted"]
 
     # 2) Detect outage AZs.
     outages = detect_unhealthy_azs(hosts, now, AZ_UNHEALTHY_THRESHOLD_MINUTES)

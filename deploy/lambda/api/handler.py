@@ -1480,13 +1480,12 @@ def cleanup_terminated_host(event):
     # Remove host target group
     _remove_host_tg(instance_id)
 
-    # Delete host
-    hosts_table.update_item(
-        Key={"instance_id": instance_id},
-        UpdateExpression="SET #s = :s, updated_at = :t",
-        ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":s": "deleted", ":t": _now()},
-    )
+    # Hard-delete the host row. A soft "status=deleted" left every terminated
+    # instance behind forever (161 zombie rows observed live); register_host
+    # creates a FRESH row per new instance_id, so there is nothing to preserve.
+    # Every _find_host / failover / scaler scan previously paid RCU + latency to
+    # read all those dead rows. Its tenants are already reaped above.
+    hosts_table.delete_item(Key={"instance_id": instance_id})
     print(f"cleaned up host {instance_id}, {len(tenants)} tenants deleted")
 
     # Issue #71 — audit the host teardown + tenant reap (non-API actor).

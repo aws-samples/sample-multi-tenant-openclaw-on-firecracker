@@ -450,6 +450,29 @@ class TestRouting:
         assert resp["statusCode"] == 200
 
 
+class TestHostCleanupHardDelete:
+    """cleanup_terminated_host must HARD-delete the host row, not soft-mark it
+    status=deleted — soft rows accumulated (161 zombies observed live) and
+    inflated every scan / faked AZ outages."""
+
+    @pytest.mark.unit
+    @pytest.mark.regression
+    def test_host_row_is_deleted_not_soft_marked(self):
+        api.tenants_table = make_ddb_table()
+        api.tenants_table.scan.return_value = {"Items": []}  # no tenants on host
+        api.hosts_table = make_ddb_table()
+        with patch.object(api, "_remove_host_tg"), \
+             patch.object(api, "asg_client"):
+            api.cleanup_terminated_host({"detail": {
+                "EC2InstanceId": "i-dead",
+                "LifecycleHookName": "hook", "AutoScalingGroupName": "asg"}})
+        api.hosts_table.delete_item.assert_called_once_with(Key={"instance_id": "i-dead"})
+        # And it must NOT leave a soft status=deleted update on the host row.
+        for c in api.hosts_table.update_item.call_args_list:
+            vals = c.kwargs.get("ExpressionAttributeValues", {})
+            assert vals.get(":s") != "deleted", "host was soft-marked instead of deleted"
+
+
 # ═══════════════════════════════════════════
 # Helper: _gen_id
 # ═══════════════════════════════════════════

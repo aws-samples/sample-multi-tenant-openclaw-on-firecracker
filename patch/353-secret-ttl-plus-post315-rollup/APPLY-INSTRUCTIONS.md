@@ -198,6 +198,43 @@ aws lambda update-alias --function-name openclaw-api --name "$ALIAS" --function-
 # rollback = redeploy the prior zip to $LATEST AND repoint $ALIAS back to its prior version (record both first).
 ```
 
+## Step 4.6 — API Gateway routes (required for a no-CDK hot upgrade)
+
+Updating Lambda code does not create API Gateway resources. Install the three routes introduced by
+this rollup with the gated helper. It clones auth and the Lambda alias integration from the live
+`GET /images` method, adds CDK-equivalent `OPTIONS` CORS methods, records the current stage
+deployment, then creates and promotes a new immutable deployment.
+
+```bash
+API=$(jq -r '.control_plane_api | select(.confirmed == true) | .id' environment.json)
+STAGE=$(jq -r '.control_plane_api.deployed_stages[0].stage' environment.json)
+[ -n "$API" ] && [ "$API" != null ] && [ -n "$STAGE" ] && [ "$STAGE" != null ]
+
+bash lib/apply-api-routes.sh plan   "$API" "$STAGE" "$REGION"  # read-only
+bash lib/apply-api-routes.sh apply  "$API" "$STAGE" "$REGION"  # gated write + deployment
+bash lib/apply-api-routes.sh verify "$API" "$STAGE" "$REGION"  # structural read-back
+```
+
+Then call the deployed stage with its real authentication. These probes are non-destructive:
+the fake host id cannot match a host, and the copy request fails validation before SSM dispatch.
+
+```bash
+BASE="https://$API.execute-api.$REGION.amazonaws.com/$STAGE"
+curl -i -H "x-api-key: $API_KEY" "$BASE/list_image_versions"                       # 200
+curl -i -H "x-api-key: $API_KEY" "$BASE/hosts/__route_probe__/pull-image-progress" # 404 from Lambda, not API GW 403
+curl -i -X POST -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
+  -d '{}' "$BASE/hosts/__route_probe__/copy-file-from-s3"                          # 400 VALIDATION from Lambda
+curl -i -X OPTIONS -H "Origin: https://example.invalid" \
+  -H "Access-Control-Request-Method: GET" "$BASE/list_image_versions"              # 204 + CORS headers
+```
+
+Rollback is exact and gated: it first points the stage back to the deployment captured before apply,
+then deletes only the three resource ids recorded by this helper.
+
+```bash
+bash lib/apply-api-routes.sh rollback "$API" "$STAGE" "$REGION"
+```
+
 ## Step 5 — Post-fix: fresh-machine validation
 
 Because Step 3 touched the LT/init-host + S3 scripts, launch **one** new host on the new LT and let it

@@ -57,9 +57,8 @@ jwt = pytest.importorskip("jwt", reason="PyJWT required for RBAC signature tests
 _crypto = pytest.importorskip(
     "cryptography.hazmat.primitives.asymmetric.rsa",
     reason="cryptography required for RBAC signature tests")
-from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: E402
 from cryptography.hazmat.primitives import serialization  # noqa: E402
-
+from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: E402
 
 # ═══════════════════════════════════════════
 # Load handler with mocked SDK + Cognito env

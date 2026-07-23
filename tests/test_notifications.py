@@ -15,14 +15,14 @@ Topic ARN is read from `NOTIFICATIONS_TOPIC_ARN` env var. When absent,
 publishing is a no-op (legacy/local mode).
 """
 
+import importlib.util
 import json
 import os
 import sys
-import importlib.util
-import pytest
-from unittest.mock import patch, MagicMock
-from conftest import make_ddb_table
+from unittest.mock import MagicMock, patch
 
+import pytest
+from conftest import make_ddb_table
 
 _mock_ddb = MagicMock()
 _mock_ssm = MagicMock()

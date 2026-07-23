@@ -24,12 +24,13 @@ The AZ failover path is implemented as pure functions plus a thin AWS
 shell so it can be unit-tested without DDB/SSM/SNS access.
 """
 
-import os
 import json
+import os
 import random
+from datetime import datetime, timezone
+
 import boto3
 from botocore.exceptions import ClientError
-from datetime import datetime, timezone, timedelta
 
 ddb = boto3.resource("dynamodb")
 ssm = boto3.client("ssm")
@@ -631,8 +632,14 @@ def _check_and_handle_az_failover(now, tenants):
         "skipped_cooldown": [],
     }
 
-    # 1) Load all hosts.
-    hosts = hosts_table.scan().get("Items", [])
+    # 1) Load hosts, excluding status=deleted so stale zombie rows (a
+    #    terminated instance whose row lingered) can't be bucketed into their AZ
+    #    and counted as "unhealthy", faking an AZ outage. Rows with no status
+    #    field are kept (they're normal in the pre-status data model / tests);
+    #    the __az_failover_state__ bookkeeping record has no `az` field so
+    #    group_hosts_by_az already skips it.
+    hosts = [h for h in hosts_table.scan().get("Items", [])
+             if h.get("status") != "deleted"]
 
     # 2) Detect outage AZs.
     outages = detect_unhealthy_azs(hosts, now, AZ_UNHEALTHY_THRESHOLD_MINUTES)
@@ -1162,8 +1169,8 @@ def _verify_dashboard_reachable_via_alb(tenant_id, public_base_url, timeout_sec=
     here because we're probing freshness anyway.
     """
     import time as _t
-    import urllib.request
     import urllib.error
+    import urllib.request
 
     if not public_base_url:
         # Couldn't resolve a base URL — fail closed. Operator must inject
@@ -1223,7 +1230,7 @@ def _repoint_alb_rule(tenant_id, target_host_id, target_private_ip):
         # Need VPC ID for create — pulled from existing TG of source host.
         existing = elbv2.describe_target_groups()["TargetGroups"]
         if not existing:
-            raise RuntimeError("no existing target groups to clone VPC from")
+            raise RuntimeError("no existing target groups to clone VPC from") from None
         vpc_id = existing[0]["VpcId"]
         tg_arn = elbv2.create_target_group(
             Name=tg_name, Protocol="HTTP", Port=80, VpcId=vpc_id,

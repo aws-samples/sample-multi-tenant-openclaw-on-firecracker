@@ -3,10 +3,11 @@
 
 """Shared fixtures for all tests."""
 
-import os
 import json
-import pytest
+import os
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 
 def pytest_configure(config):

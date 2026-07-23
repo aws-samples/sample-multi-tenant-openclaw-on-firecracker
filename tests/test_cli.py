@@ -238,7 +238,6 @@ class TestErrorHandling:
         assert e.value.code != 0
 
     def test_http_error_returns_nonzero(self):
-        captured = {}
         cli = _load_cli()
         # Simulate 500
         def boom(req, timeout=None):

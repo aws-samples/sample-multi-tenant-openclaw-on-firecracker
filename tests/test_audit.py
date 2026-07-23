@@ -17,14 +17,14 @@ API:
 - GET /audit-log?since=ISO8601&limit=N
 """
 
-import json
-import sys
-import os
 import importlib.util
-import pytest
-from unittest.mock import patch, MagicMock
-from conftest import make_ddb_table
+import json
+import os
+import sys
+from unittest.mock import MagicMock, patch
 
+import pytest
+from conftest import make_ddb_table
 
 # Set audit env before import so AUDIT_TABLE picks up
 os.environ.setdefault("AUDIT_TABLE", "openclaw-audit-log")
@@ -326,6 +326,42 @@ class TestAuditFailureIsolation:
         resp = api.lambda_handler(_api_event(
             "POST", "/tenants", body={"name": "x"}), None)
         assert resp["statusCode"] == 201
+
+
+# ═══════════════════════════════════════════
+# Denied (403) mutating attempts are audited (issue-audit-6)
+# ═══════════════════════════════════════════
+
+
+class TestRbacDenialAudited:
+    def setup_method(self):
+        api.tenants_table = make_ddb_table()
+        api.hosts_table = make_ddb_table()
+        api.audit_table = make_ddb_table()
+
+    @pytest.mark.unit
+    @pytest.mark.regression
+    def test_denied_delete_writes_403_audit_row(self):
+        # RBAC on, caller resolves to viewer → DELETE is forbidden and must
+        # still leave an audit trail (it was previously silent).
+        with patch.object(api, "RBAC_ENABLED", True), \
+             patch.object(api, "_get_user_role", return_value="viewer"):
+            resp = api.lambda_handler(_api_event(
+                "DELETE", "/tenants/{id}", path_params={"id": "t1"}), None)
+        assert resp["statusCode"] == 403
+        assert api.audit_table.put_item.called, "denied write left no audit row"
+        item = api.audit_table.put_item.call_args[1]["Item"]
+        assert item["response_status"] == 403
+        assert item["object"] == "tenant:t1"
+
+    @pytest.mark.unit
+    def test_denied_read_not_audited(self):
+        # A forbidden GET (if any) should not spam the audit log — only
+        # mutating methods are audited on denial.
+        with patch.object(api, "RBAC_ENABLED", True), \
+             patch.object(api, "_get_user_role", return_value="viewer"):
+            api.lambda_handler(_api_event("GET", "/tenants"), None)
+        assert not api.audit_table.put_item.called
 
 
 # ═══════════════════════════════════════════

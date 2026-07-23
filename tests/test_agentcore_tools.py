@@ -3,10 +3,11 @@
 
 """Unit tests for deploy/lambda/agentcore_tools/handler.py."""
 
-import json
-import pytest
 import importlib.util
+import json
 import sys
+
+import pytest
 
 spec = importlib.util.spec_from_file_location("ac_tools", "deploy/lambda/agentcore_tools/handler.py")
 ac = importlib.util.module_from_spec(spec)

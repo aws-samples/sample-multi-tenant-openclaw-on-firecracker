@@ -24,14 +24,14 @@ Behavior:
   must succeed before DDB updates).
 """
 
-import json
-import sys
-import os
 import importlib.util
-import pytest
-from unittest.mock import patch, MagicMock
-from conftest import make_ddb_table
+import json
+import os
+import sys
+from unittest.mock import MagicMock, patch
 
+import pytest
+from conftest import make_ddb_table
 
 _mock_ddb = MagicMock()
 _mock_ssm = MagicMock()

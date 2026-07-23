@@ -5,11 +5,12 @@
 Covers: two-round idle reclamation, ASG min protection, recovery.
 """
 
-import pytest
 import importlib.util
 import sys
-from unittest.mock import patch, MagicMock
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, patch
+
+import pytest
 from conftest import make_ddb_table
 
 _mock_ddb = MagicMock()

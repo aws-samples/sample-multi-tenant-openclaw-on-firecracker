@@ -18,7 +18,6 @@ Why ABC and not duck typing?
 
 from abc import ABC, abstractmethod
 
-
 SUPPORTED_RUNTIMES = ("firecracker", "cloud_hypervisor", "qemu")
 
 

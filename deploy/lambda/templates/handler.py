@@ -3,8 +3,9 @@
 
 """Templates Lambda — manage OpenClaw config templates in S3."""
 
-import os
 import json
+import os
+
 import boto3
 
 s3 = boto3.client("s3")
@@ -14,7 +15,6 @@ PREFIX = "templates/openclaw/"
 
 def lambda_handler(event, context):
     method = event.get("httpMethod", "")
-    path = event.get("path", "")
     path_params = event.get("pathParameters") or {}
     name = path_params.get("name", "")
 

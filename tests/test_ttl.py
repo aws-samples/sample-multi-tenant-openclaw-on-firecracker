@@ -12,15 +12,15 @@ Covers:
 - Non-expired and TTL-less tenants are untouched (regression)
 """
 
+import importlib.util
 import json
 import os
 import sys
-import importlib.util
-import pytest
-from unittest.mock import patch, MagicMock
-from datetime import datetime, timezone, timedelta
-from conftest import make_ddb_table
+from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, patch
 
+import pytest
+from conftest import make_ddb_table
 
 # ── Import api/handler.py with mocked AWS SDK ──
 _mock_ddb_api = MagicMock()

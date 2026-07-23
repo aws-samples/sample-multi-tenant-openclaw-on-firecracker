@@ -3,9 +3,9 @@
 
 """Static regression test for init-host.sh lifecycle-hook safety (issue #73).
 
-init-host.sh runs under ``set -e`` as ASG launch user-data. 
-The DDB self-register step used to have no error tolerance and ran *before* the explicit complete-lifecycle-action call, 
-so a transient ``put-item`` failure (common when a batch scale-out throttles DDB writes) aborted the script before the hook was settled — leaving the instance stuck ``MidLifecycleAction`` until the 600s timeout. 
+init-host.sh runs under ``set -e`` as ASG launch user-data.
+The DDB self-register step used to have no error tolerance and ran *before* the explicit complete-lifecycle-action call,
+so a transient ``put-item`` failure (common when a batch scale-out throttles DDB writes) aborted the script before the hook was settled — leaving the instance stuck ``MidLifecycleAction`` until the 600s timeout.
 Several hosts in a burst launch could hang this way.
 
 The fix:

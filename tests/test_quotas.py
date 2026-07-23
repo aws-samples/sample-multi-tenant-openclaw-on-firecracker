@@ -16,14 +16,14 @@ Quotas are opt-in via config.yml:
 When `enabled: false` (default), no checks are performed — backward compat.
 """
 
+import importlib.util
 import json
 import os
 import sys
-import importlib.util
-import pytest
-from unittest.mock import patch, MagicMock
-from conftest import make_ddb_table
+from unittest.mock import MagicMock, patch
 
+import pytest
+from conftest import make_ddb_table
 
 # Set quotas env BEFORE import
 os.environ["QUOTAS_ENABLED"] = "true"

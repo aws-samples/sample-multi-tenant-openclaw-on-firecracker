@@ -9,9 +9,10 @@ CloudFront created) must be unchanged.
 
 import os
 import sys
-import yaml
-import pytest
 from pathlib import Path
+
+import pytest
+import yaml
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "deploy"))

@@ -47,10 +47,10 @@ def _synth_template(metrics_enabled=True):
     by `cdk synth`; mirror the pattern in tests/test_stack.py.
     """
     import aws_cdk as cdk
-    from aws_cdk import assertions
 
     # Toggle metrics in config without mutating the file on disk.
     import yaml
+    from aws_cdk import assertions
     cfg_path = ROOT / "config.yml"
     original = cfg_path.read_text()
     cfg = yaml.safe_load(original)

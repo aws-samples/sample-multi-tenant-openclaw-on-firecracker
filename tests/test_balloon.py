@@ -3,12 +3,13 @@
 
 """Unit tests for balloon memory overcommit logic in host-agent.py."""
 
+import importlib.util
 import json
 import os
-import pytest
-import importlib.util
 import sys
-from unittest.mock import patch, MagicMock, call
+from unittest.mock import MagicMock, call, patch
+
+import pytest
 from conftest import make_ddb_table
 
 # Import host-agent with mocked dependencies
@@ -158,7 +159,7 @@ class TestAdjustBalloons:
         """When host pressure between 20-40%, no action (hysteresis)."""
         self._setup_vm("t1", 4096)
         with patch.object(agent, "_get_host_mem_info", return_value=(16384, 5000)), \
-             patch.object(agent, "_get_balloon_stats") as mock_stats, \
+             patch.object(agent, "_get_balloon_stats"), \
              patch.object(agent, "_set_balloon_target") as mock_set:
             agent._adjust_balloons({"t1": {"vm_health": "up"}})
             mock_set.assert_not_called()

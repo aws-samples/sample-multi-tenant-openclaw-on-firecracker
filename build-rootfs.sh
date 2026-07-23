@@ -868,14 +868,17 @@ NODE_BIN=$(which node)
 OC_DIST=$(npm root -g)/openclaw/dist/index.js
 
 mkdir -p /home/agent/.config/systemd/user/default.target.wants
-cat > /home/agent/.config/systemd/user/openclaw-gateway.service << GWSVC
+cat > /home/agent/.config/systemd/user/openclaw-gateway.service << 'GWSVC_HEAD'
 [Unit]
 Description=OpenClaw Gateway
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=${NODE_BIN} ${OC_DIST} gateway --port 18789
+GWSVC_HEAD
+printf 'ExecStart=%s %s gateway --port 18789\n' "$NODE_BIN" "$OC_DIST" \
+  >> /home/agent/.config/systemd/user/openclaw-gateway.service
+cat >> /home/agent/.config/systemd/user/openclaw-gateway.service << 'GWSVC_BODY'
 Restart=always
 RestartSec=5
 KillMode=process
@@ -947,7 +950,7 @@ TasksMax=512
 
 [Install]
 WantedBy=default.target
-GWSVC
+GWSVC_BODY
 ln -sf ../openclaw-gateway.service /home/agent/.config/systemd/user/default.target.wants/openclaw-gateway.service
 
 # --- guest log forwarder (vsock) user unit ---

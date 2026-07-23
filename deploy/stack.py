@@ -37,6 +37,12 @@ from aws_cdk import (
     aws_cloudfront_origins as origins,
 )
 from aws_cdk import (
+    aws_cloudwatch as cloudwatch,
+)
+from aws_cdk import (
+    aws_cloudwatch_actions as cw_actions,
+)
+from aws_cdk import (
     aws_cognito as cognito,
 )
 from aws_cdk import (
@@ -68,6 +74,9 @@ from aws_cdk import (
 )
 from aws_cdk import (
     aws_sns as sns,
+)
+from aws_cdk import (
+    aws_sqs as sqs,
 )
 from aws_cdk import (
     aws_wafv2 as wafv2,
@@ -279,6 +288,15 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 display_name="OpenClaw Tenant Lifecycle Events",
             )
             notifications_topic_arn = notifications_topic.topic_arn
+
+        # T2-3: shared DLQ for EventBridge → Lambda targets. Captures events
+        # EventBridge could not deliver after retries (throttle / 5xx) so a
+        # dropped host-terminate or health tick is recoverable, not silently lost.
+        events_dlq = sqs.Queue(self, "EventsDLQ",
+            queue_name="openclaw-events-dlq",
+            retention_period=Duration.days(14),
+            enforce_ssl=True,
+        )
 
         # ========== API Lambda ==========
         api_fn = _lambda.Function(self, "ApiHandler",
@@ -621,7 +639,8 @@ class OpenClawOrchestratorStack(cdk.Stack):
 
         events.Rule(self, "HealthCheckSchedule",
             schedule=events.Schedule.rate(Duration.minutes(CFG["health_check"]["interval_minutes"])),
-            targets=[targets.LambdaFunction(health_fn)],
+            targets=[targets.LambdaFunction(health_fn,
+                dead_letter_queue=events_dlq, retry_attempts=2)],
         )
 
         # ========== Skills Lambda ==========
@@ -701,7 +720,8 @@ class OpenClawOrchestratorStack(cdk.Stack):
         ))
         events.Rule(self, "ScalerSchedule",
             schedule=events.Schedule.rate(Duration.minutes(CFG["scaler"]["interval_minutes"])),
-            targets=[targets.LambdaFunction(scaler_fn)],
+            targets=[targets.LambdaFunction(scaler_fn,
+                dead_letter_queue=events_dlq, retry_attempts=2)],
         )
 
         # ========== Backup Lambda (daily data backup) ==========
@@ -725,8 +745,48 @@ class OpenClawOrchestratorStack(cdk.Stack):
 
         events.Rule(self, "BackupSchedule",
             schedule=events.Schedule.expression(CFG["s3"]["backup_cron"]),
-            targets=[targets.LambdaFunction(backup_fn)],
+            targets=[targets.LambdaFunction(backup_fn,
+                dead_letter_queue=events_dlq, retry_attempts=2)],
         )
+
+        # ===== CloudWatch alarms (T2-3) =====
+        # There were ZERO alarms — every failure mode was log-only. Alarm on
+        # errors>0 and throttles>0 for each control-plane Lambda, routed to the
+        # lifecycle SNS topic when the operator enabled it, else a dedicated
+        # alarms topic so an alarm always has somewhere to fire.
+        alarms_topic = notifications_topic or sns.Topic(self, "AlarmsTopic",
+            topic_name="openclaw-alarms",
+            display_name="OpenClaw Lambda Alarms",
+        )
+        _sns_action = cw_actions.SnsAction(alarms_topic)
+        for _fn, _label in ((api_fn, "Api"), (health_fn, "Health"),
+                            (scaler_fn, "Scaler"), (backup_fn, "Backup")):
+            err = cloudwatch.Alarm(self, f"{_label}ErrorsAlarm",
+                alarm_name=f"openclaw-{_label.lower()}-errors",
+                metric=_fn.metric_errors(period=Duration.minutes(5)),
+                threshold=1, evaluation_periods=1,
+                comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+                treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+            )
+            err.add_alarm_action(_sns_action)
+            thr = cloudwatch.Alarm(self, f"{_label}ThrottlesAlarm",
+                alarm_name=f"openclaw-{_label.lower()}-throttles",
+                metric=_fn.metric_throttles(period=Duration.minutes(5)),
+                threshold=1, evaluation_periods=1,
+                comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+                treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+            )
+            thr.add_alarm_action(_sns_action)
+        # Alert when EventBridge parks an undeliverable event in the DLQ.
+        dlq_alarm = cloudwatch.Alarm(self, "EventsDlqAlarm",
+            alarm_name="openclaw-events-dlq-not-empty",
+            metric=events_dlq.metric_approximate_number_of_messages_visible(
+                period=Duration.minutes(5)),
+            threshold=1, evaluation_periods=1,
+            comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+            treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+        )
+        dlq_alarm.add_alarm_action(_sns_action)
 
         # ========== Host EC2 Role (SSM + S3 backup + self-register) ==========
         host_role = iam.Role(self, "HostRole",
@@ -1062,7 +1122,8 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 source=["aws.autoscaling"],
                 detail_type=["EC2 Instance Launch Successful"],
             ),
-            targets=[targets.LambdaFunction(api_fn)],
+            targets=[targets.LambdaFunction(api_fn,
+                dead_letter_queue=events_dlq, retry_attempts=2)],
         )
 
         # When a host is terminating → cleanup DynamoDB records
@@ -1071,7 +1132,8 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 source=["aws.autoscaling"],
                 detail_type=["EC2 Instance-terminate Lifecycle Action"],
             ),
-            targets=[targets.LambdaFunction(api_fn)],
+            targets=[targets.LambdaFunction(api_fn,
+                dead_letter_queue=events_dlq, retry_attempts=2)],
         )
 
         # ========== AgentCore (optional, continued) ==========
@@ -1297,7 +1359,10 @@ function handler(event) {
                 default_behavior=cloudfront.BehaviorOptions(
                     origin=s3_origin,
                     viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-                    cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
+                    # T2-2: the console is static S3 assets — cache them at the
+                    # edge (was CACHING_DISABLED = 100% origin fetches). The
+                    # per-tenant dashboards (AppCF, /vm/*) stay uncached below.
+                    cache_policy=cloudfront.CachePolicy.CACHING_OPTIMIZED,
                     function_associations=[cloudfront.FunctionAssociation(
                         function=url_rewrite_fn,
                         event_type=cloudfront.FunctionEventType.VIEWER_REQUEST,
@@ -1362,7 +1427,10 @@ function handler(event) {
                     "/console/*": cloudfront.BehaviorOptions(
                         origin=s3_origin,
                         viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-                        cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
+                        # T2-2: static console assets cached at the edge. The
+                        # default behavior (ALB origin, incl. /vm/*) stays
+                        # CACHING_DISABLED so tenant dashboards are never cached.
+                        cache_policy=cloudfront.CachePolicy.CACHING_OPTIMIZED,
                         function_associations=[cloudfront.FunctionAssociation(
                             function=url_rewrite_fn,
                             event_type=cloudfront.FunctionEventType.VIEWER_REQUEST,

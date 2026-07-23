@@ -106,3 +106,44 @@ class TestEbsEncryption:
                 }),
             },
         )
+
+
+# ═══════════════════════════════════════════
+# Audit-4/#3 — control-plane DynamoDB tables have PITR + deletion protection
+# ═══════════════════════════════════════════
+
+
+class TestControlPlaneTableBackup:
+    """The tenants/hosts/groups tables hold authoritative state; they must have
+    point-in-time recovery AND deletion protection. The audit table has PITR
+    but intentionally no deletion protection (per-deploy suffixed, TTL-churned)."""
+
+    @pytest.mark.unit
+    @pytest.mark.regression
+    def test_authoritative_tables_have_pitr_and_deletion_protection(self, synthesized_template):
+        import json
+        tables = synthesized_template.find_resources("AWS::DynamoDB::Table")
+        by_name = {}
+        for _lid, res in tables.items():
+            props = res.get("Properties", {})
+            name = props.get("TableName")
+            # TableName may be a plain string or an Fn::Join (audit table)
+            key = name if isinstance(name, str) else "audit"
+            by_name[key] = props
+        for tname in ("openclaw-tenants", "openclaw-hosts", "openclaw-groups"):
+            props = by_name.get(tname)
+            assert props, f"{tname} not found in template"
+            pitr = props.get("PointInTimeRecoverySpecification", {})
+            assert pitr.get("PointInTimeRecoveryEnabled") is True, f"{tname} missing PITR"
+            assert props.get("DeletionProtectionEnabled") is True, f"{tname} missing deletion protection"
+
+    @pytest.mark.unit
+    def test_audit_table_has_pitr(self, synthesized_template):
+        tables = synthesized_template.find_resources("AWS::DynamoDB::Table")
+        audit = None
+        for _lid, res in tables.items():
+            props = res.get("Properties", {})
+            if not isinstance(props.get("TableName"), str):  # Fn::Join → audit table
+                audit = props
+        assert audit, "audit table not found"
+        assert audit.get("PointInTimeRecoverySpecification", {}).get("PointInTimeRecoveryEnabled") is True

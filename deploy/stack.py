@@ -106,10 +106,17 @@ class OpenClawOrchestratorStack(cdk.Stack):
         super().__init__(scope, id, **kwargs)
 
         # ========== DynamoDB ==========
+        # All control-plane tables enable point-in-time recovery (35-day
+        # continuous backup → restore to any second) and deletion protection.
+        # These tables hold the authoritative tenant→host→port→ALB-rule mapping;
+        # a bad bulk edit (cleanup scripts exist), buggy deploy, or accidental
+        # delete would otherwise be unrecoverable while tenant VMs keep running.
         tenants_table = dynamodb.Table(self, "Tenants",
             table_name="openclaw-tenants",
             partition_key=dynamodb.Attribute(name="id", type=dynamodb.AttributeType.STRING),
             billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            point_in_time_recovery=True,
+            deletion_protection=True,
             removal_policy=RemovalPolicy.RETAIN,
         )
 
@@ -117,6 +124,8 @@ class OpenClawOrchestratorStack(cdk.Stack):
             table_name="openclaw-hosts",
             partition_key=dynamodb.Attribute(name="instance_id", type=dynamodb.AttributeType.STRING),
             billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            point_in_time_recovery=True,
+            deletion_protection=True,
             removal_policy=RemovalPolicy.RETAIN,
         )
 
@@ -130,6 +139,8 @@ class OpenClawOrchestratorStack(cdk.Stack):
             table_name="openclaw-groups",
             partition_key=dynamodb.Attribute(name="name", type=dynamodb.AttributeType.STRING),
             billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            point_in_time_recovery=True,
+            deletion_protection=True,
             removal_policy=RemovalPolicy.RETAIN,
         )
 
@@ -152,6 +163,10 @@ class OpenClawOrchestratorStack(cdk.Stack):
             sort_key=dynamodb.Attribute(name="ts", type=dynamodb.AttributeType.STRING),
             billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
             time_to_live_attribute="expires_ttl",
+            # PITR yes; NOT deletion_protection — the per-deploy-suffixed name is
+            # deliberately designed for cdk destroy + redeploy, and audit rows
+            # are TTL-churned reconstructable data, not authoritative state.
+            point_in_time_recovery=True,
             removal_policy=RemovalPolicy.RETAIN,
         )
 

@@ -1,7 +1,8 @@
 # pull-image API 文档
 
-> ClawPool 控制面 —— 把指定版本快照装到单台宿主机(host),并轮询安装进度。
-> 单一真相源:`engineering/backend/openapi-control-plane.yaml`(operationId `pullImage` / `pullImageProgress`)。
+> ClawPool 控制面 —— 镜像版本快照的完整生命周期:**打快照 → 列快照 → 装到单台宿主机(host) → 轮询安装进度**。
+> 生命周期:`POST /create-image-snapshot`(打)→ `GET /list_image_versions`(列)→ `POST /hosts/{id}/pull-image?snapshot_time=`(拉)→ `GET /hosts/{id}/pull-image-progress`(轮询)。
+> 单一真相源:`engineering/backend/openapi-control-plane.yaml`(operationId `createImageSnapshot` / `listImageVersions` / `pullImage` / `pullImageProgress`)。
 > 本文按人读文档的六要素结构组织;**返回体是本仓真实契约**(不是通用 `{code,message,data}` 信封)。
 
 ## 通用约定
@@ -14,10 +15,87 @@
 
 ---
 
-## 1. GET /list_image_versions
+## 1. POST /create-image-snapshot
 
 ### 接口描述
-列出黄金镜像的**各版本快照**(供 pull 流程第一步选一个时间点)。返回 version-snapshots 表的元数据——`snapshot_time` + `label` + `file_count`,按 `snapshot_time` 倒序(最新在前)。**不返回**每个快照的大 `files` 列表(那在 pull 时才逐文件读)。
+给 assets 桶**打一个版本快照**(生命周期第一步)。扫 S3 `deployment/` 前缀下**全部当前版对象**(rootfs 镜像 + scripts + edge + litellm + monitoring),采集每个对象的 `{path, s3_version_id, etag}`,写一条快照到 DynamoDB 表 `openclaw-version-snapshots`(主键 `snapshot_time`)。等价于运维脚本 `scripts/snapshot-version.sh`。打完即可被 `GET /list_image_versions` 列出、被 `POST /hosts/{id}/pull-image?snapshot_time=` 拉到 host。
+> **bucket 不是客户参数**:后端 Lambda 从环境变量 `ASSETS_BUCKET` 自读,客户端不传 bucket/region。
+> **snapshot_time 格式**:服务端按 `%Y-%m-%dT%H:%M:%SZ`(秒级 UTC + Z,如 `2026-07-23T15:52:09Z`)生成——与 pull-image 校验的格式一致,故刚打的快照立即可拉。
+> (单一真相源 operationId `createImageSnapshot`,#376。)
+
+### 请求路径与方法
+```
+POST /create-image-snapshot
+```
+
+### 请求参数
+Body 可选(JSON 对象,可不传/传 `{}`)。RBAC:**operator+**(该路由不在 `_VIEWER_OK`,viewer 会被 403)。
+
+| 字段 | 型态 | 必需 | 说明 |
+|---|---|---|---|
+| `label` | string | 否 | 人读标签(console 快照列表显示用)。留空/不传 → 后端自动读 `deployment/rootfs/manifest.json` 的 `version` 当标签。校验:须匹配 `^[A-Za-z0-9._-]{1,128}$`。 |
+
+**curl 范例**(不含真实 key,用占位符):
+```bash
+# 传 label
+curl -X POST "$API_URL/create-image-snapshot" \
+  -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
+  -d '{"label":"v1.4"}'
+# → 200 {"snapshot_time":"2026-07-24T02:15:30Z","label":"v1.4","file_count":66}
+
+# 不传 label → 后端自动从 deployment/rootfs/manifest.json 的 version 填
+curl -X POST "$API_URL/create-image-snapshot" -H "x-api-key: $API_KEY" -d '{}'
+```
+
+### 成功返回范例
+**200 OK** —— 快照已落库:
+```json
+{ "snapshot_time": "2026-07-23T15:52:09Z", "label": "sg-test-376", "file_count": 66 }
+```
+
+| 字段 | 型态 | 说明 |
+|---|---|---|
+| `snapshot_time` | string | 本次快照的 ISO8601 UTC 主键;传给后续 pull-image。 |
+| `label` | string | 生效的标签(未传时为自动派生值;manifest 无 version 时为 `""`)。 |
+| `file_count` | integer | 本次采集到的对象数。 |
+
+### 失败返回范例
+**400 Validation** —— `code: VALIDATION`。三种情形:
+```json
+{ "error": "body must be valid JSON", "code": "VALIDATION" }
+{ "error": "body must be a JSON object", "code": "VALIDATION" }
+{ "error": "label must match [A-Za-z0-9._-]{1,128}", "code": "VALIDATION" }
+```
+- `body must be valid JSON`:body 是坏 JSON 字符串。
+- `body must be a JSON object`:合法 JSON 但是标量/数组(非对象)。
+- `label ...`:label 不符字符集/长度。
+
+**409 Conflict** —— `code: CONFLICT`。同一墙钟秒内并发/重放两次 → 主键(秒级 `snapshot_time`)撞键,第二次拒写(快照不可变),稍后重试(下一秒即不同键):
+```json
+{ "error": "a snapshot at 2026-07-23T15:52:09Z already exists; retry in a moment", "code": "CONFLICT" }
+```
+
+**500 Empty snapshot** —— `code: EMPTY_SNAPSHOT`。fail-loud:`deployment/` 下扫到 0 个文件(桶/前缀不对或权限问题)→ 拒写空快照:
+```json
+{ "error": "no files found under deployment/ — bucket/prefix incorrect or permission issue", "code": "EMPTY_SNAPSHOT" }
+```
+
+**503 Not configured** —— `code: NOT_CONFIGURED`。部署缺配置:
+```json
+{ "error": "VERSION_SNAPSHOTS_TABLE not configured", "code": "NOT_CONFIGURED" }
+{ "error": "ASSETS_BUCKET not configured", "code": "NOT_CONFIGURED" }
+```
+
+**403 Forbidden** —— 缺/错 x-api-key(API GW `{"message":"Forbidden"}`);或低于 operator 的 JWT(RBAC)。
+
+> **真机证据**(新加坡环境 2026-07-23):POST 返 200 `{"snapshot_time":"2026-07-23T15:52:09Z","label":"sg-test-376","file_count":66}`,直接读 DDB 确认落库,`GET /list_image_versions` 列表置顶可见。
+
+---
+
+## 2. GET /list_image_versions
+
+### 接口描述
+列出黄金镜像的**各版本快照**(供 pull 流程选一个时间点)。返回 version-snapshots 表的元数据——`snapshot_time` + `label` + `file_count`,按 `snapshot_time` 倒序(最新在前)。**不返回**每个快照的大 `files` 列表(那在 pull 时才逐文件读)。
 > 与 `GET /images` 区别:`/images` 列 S3 里的镜像【文件】产物(rootfs/data-template/... + 当前 manifest);`/list_image_versions` 列【版本快照时间点】。选出的 `snapshot_time` 用于下一步 `POST /hosts/{id}/pull-image?snapshot_time=`。
 > (曾用名 `GET /snapshots`,#337 改名避免与 `/images` 混淆。)
 
@@ -53,7 +131,7 @@ GET /list_image_versions
 
 ---
 
-## 2. POST /hosts/{instance_id}/pull-image
+## 3. POST /hosts/{instance_id}/pull-image
 
 ### 接口描述
 把某个**版本快照**装到指定的一台宿主机。读该快照的 `manifest.json`,只装 manifest 点名的盘(rootfs / data-template / immutable)+ manifest 本身,按各自**精确 S3 VersionId** 拉取、校验 ETag,再装到 live。**异步**:先把 host 从 active/idle 原子 CAS 成 `upgrading`(pull 期间不接新租户),然后自调用后台 worker,**立即返回 202**;长链(下载+解压+装 live,可能数分钟)在后台跑,进度走下面的 `pull-image-progress`。失败只报错,不自动回滚。
@@ -128,7 +206,7 @@ POST /hosts/{instance_id}/pull-image?snapshot_time=<ISO8601>
 
 ---
 
-## 3. GET /hosts/{instance_id}/pull-image-progress
+## 4. GET /hosts/{instance_id}/pull-image-progress
 
 ### 接口描述
 轮询某台宿主机上 pull-image 任务的进度。返回 **SageMaker ProcessingJob 风格**的三态:`Completed` / `Failed` / `InProgress`。读 host 记录的 `pull_command_id`,再 tail host 上的进度文件末行判态、取最近一条 `ERROR:<CODE>` 行作失败原因。若终态已持久化到 DDB(`last_pull_error`)但进度文件读不到(worker 早退),会强制判 `Failed`,不会一直卡 `InProgress`。
@@ -237,20 +315,21 @@ GET /hosts/{instance_id}/pull-image-progress
 
 ---
 
-## 4. 状态码速查表
+## 5. 状态码速查表
 
 ### HTTP 状态码
 
 | HTTP | 接口 | 含义 |
 |---|---|---|
+| 200 | create-image-snapshot | 快照已落库(返回 `snapshot_time` + `label` + `file_count`) |
 | 202 | pull-image | 已受理,异步安装启动(≠ 装成功) |
 | 200 | pull-image-progress | 进度快照(具体成败看 `ProcessingJobStatus`) |
-| 400 | 两者 | 参数校验失败(`code: VALIDATION`) |
-| 403 | 两者 | 缺/错 x-api-key(API GW `{message}`)或 viewer 级 JWT(RBAC `{error,rbac}`);纯 API-key 默认 operator 不触发 |
-| 404 | 两者 | 快照 / host 不存在(`code: NOT_FOUND`) |
-| 409 | pull-image | host 非 active/idle,或快照不自洽(`code: CONFLICT`) |
-| 500 | pull-image | 异步 worker 自调用失败,host 状态已复位(`code: DISPATCH_FAILED`) |
-| 503 | pull-image | 后端未配置(表/桶)(`code: NOT_CONFIGURED`) |
+| 400 | 三者 | 参数校验失败(`code: VALIDATION`);create 另含 body 非 JSON / 非对象 / label 非法 |
+| 403 | 三者 | 缺/错 x-api-key(API GW `{message}`)或角色不足(RBAC `{error,rbac}`);create/pull 需 operator+ |
+| 404 | pull | 快照 / host 不存在(`code: NOT_FOUND`) |
+| 409 | create / pull | create:同秒撞键(`code: CONFLICT`,快照不可变);pull:host 非 active/idle 或快照不自洽(`code: CONFLICT`) |
+| 500 | create / pull | create:`deployment/` 扫到 0 文件拒写(`code: EMPTY_SNAPSHOT`);pull:异步 worker 自调用失败,host 已复位(`code: DISPATCH_FAILED`) |
+| 503 | create / pull | 后端未配置(表/桶)(`code: NOT_CONFIGURED`) |
 
 > **错误信封统一**:pull-image 链路所有失败(400/404/409/500/503)都返回 `{"error": <原因>, "code": <码>}`——`VALIDATION` / `NOT_FOUND` / `CONFLICT` / `DISPATCH_FAILED` / `NOT_CONFIGURED`。客户按 `code` 判即可。唯一例外是缺 x-api-key 的 403(API Gateway 层 `{"message":"Forbidden"}`,不进 Lambda)。
 
@@ -276,9 +355,10 @@ GET /hosts/{instance_id}/pull-image-progress
 
 ---
 
-## 5. 典型调用流程
+## 6. 典型调用流程
 
 ```
+0. POST /create-image-snapshot                       → 200 + snapshot_time(打一版,label 可省)
 1. GET  /list_image_versions                         → 选一个 snapshot_time
 2. POST /hosts/{id}/pull-image?snapshot_time=<...>   → 202 + job_id (host → upgrading)
 3. 轮询 GET /hosts/{id}/pull-image-progress(每 5s):

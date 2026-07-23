@@ -490,6 +490,26 @@
                行1:只读 "Latest snapshot"(fleet 最新快照,完整不折行);
                行2:版本选择控件条(下拉 + Pull all),仅 operator+(canWrite)显示,viewer 不渲染。 -->
           <div style="padding: 0 4px 8px">
+            <!-- #376 — 行0:打一版镜像快照(等价 snapshot-version.sh),group 级,置于
+                 "Latest snapshot" 之上;打完刷新下拉。operator+ 才显示。 -->
+            <template x-if="canWrite()">
+              <button
+                class="btn-act"
+                style="
+                  display: inline-flex;
+                  align-items: center;
+                  gap: 4px;
+                  font-size: 11px;
+                  white-space: nowrap;
+                  margin-bottom: 6px;
+                "
+                title="Take a version snapshot of the assets bucket (equivalent to snapshot-version.sh)"
+                @click="takeSnapshot()"
+              >
+                <svg class="icon s13"><use href="#i-restore" /></svg>
+                <span>Take snapshot</span>
+              </button>
+            </template>
             <!-- 行1:只读最新快照 -->
             <div
               style="

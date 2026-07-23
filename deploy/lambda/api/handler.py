@@ -261,6 +261,12 @@ def lambda_handler(event, context):
         # #217 V2 — list version snapshots (time+label+count) so the console can
         # let an operator pick which snapshot_time to pull onto a host.
         ("GET", "/list_image_versions"): lambda: list_image_versions(),
+        # #376 — take a version snapshot of the assets bucket (equivalent to
+        # scripts/snapshot-version.sh): scan deployment/, record every current
+        # object's {path, s3_version_id, etag} into the snapshots table. Operator+.
+        ("POST", "/create-image-snapshot"): lambda: create_image_snapshot(
+            event.get("body")
+        ),
         ("GET", "/agentcore/status"): agentcore_status,
         ("GET", "/agentcore/tools"): agentcore_tools,
         ("GET", "/system/info"): system_info,
@@ -1812,6 +1818,7 @@ rootfs_drift = _host_service.rootfs_drift
 _get_manifest = _host_service._get_manifest
 list_images = _host_service.list_images
 list_image_versions = _host_service.list_image_versions  # #337(原#217 /snapshots)— 列镜像版本快照供 console 选
+create_image_snapshot = _host_service.create_image_snapshot  # #376 — 打版本快照(等价 snapshot-version.sh)
 refresh_rootfs = _host_service.refresh_rootfs
 pull_image = _host_service.pull_image  # #217 V2 — snapshot pull → install live
 pull_image_progress = _host_service.pull_image_progress  # #309 — tail /tmp/<job_id>.txt

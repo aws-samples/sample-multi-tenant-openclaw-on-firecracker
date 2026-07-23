@@ -291,7 +291,7 @@ curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" \
 
 ## 🖥️ Web Console
 
-CloudFront 上托管的 Web Console（`/console/`），Cognito 鉴权，5 个 tab 涵盖运维所需。
+CloudFront 上托管的 Web Console（`/console/`），Cognito 鉴权，6 个 tab 涵盖运维所需。
 
 ### Tenants tab — 多 host、多 AZ 实时操作
 
@@ -316,6 +316,14 @@ Config Templates 管理器 + MCP Tools 卡片（自动通过 AgentCore Gateway �
 跨租户备份浏览器，标记 active vs orphan（orphan = 源租户已删但备份仍可恢复进新租户）。默认 S3 lifecycle 7 天清理：
 
 ![Backups tab](../docs/web_console_backup.png)
+
+### Logs tab — 运维审计日志（1.5.8）
+
+基于 `GET /audit-log` 的倒序活动日志：**Time / Object / Operation / Actor / Result** 五列，可按对象类型（tenant / host / group / skill / template）过滤 + operation/actor 自由文本搜索，"Load older" 游标翻页。每行记录真实的 Cognito 用户（自动化操作则为 `system:<source>`，如 AZ failover、迁移、TTL/定时）和事件式操作名（`tenant.created`、`vm.migrated`、`backup.created`、`host.terminated` …）。只读，`viewer`+ 可见；审计表未启用时优雅降级为提示性空态。
+
+下图就是 1.5.9 真实环境验证留下的审计轨迹——真实的 `vm.migrated`、fail-safe 的 `vm.migrate_failed` 回滚、以及 `az_failover_tenant_recovered`，actor 归属到真实操作者与 `system:health-check`：
+
+![Logs tab](../docs/web_console_logs.png)
 
 ### Settings tab — 基础设施状态 + Fleet by AZ
 

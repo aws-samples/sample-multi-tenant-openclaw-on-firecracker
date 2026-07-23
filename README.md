@@ -323,6 +323,10 @@ Cross-tenant explorer marking active vs orphan backups (orphan = source tenant d
 
 Reverse-chronological activity log over `GET /audit-log`: **Time / Object / Operation / Actor / Result** columns, filterable by object type (tenant / host / group / skill / template) and free-text on operation/actor, with "Load older" cursor pagination. Rows carry the real Cognito principal (or `system:<source>` for automated actors like AZ failover, migration, TTL/schedule) and event-style operation names (`tenant.created`, `vm.migrated`, `backup.created`, `host.terminated`, …). Read-only, available to `viewer`+; degrades to an informative empty state when the audit table is disabled.
 
+The capture below is the live trail of the 1.5.9 verification itself — a real `vm.migrated`, the fail-safe `vm.migrate_failed` rollback, and an `az_failover_tenant_recovered`, attributed to the real operator and `system:health-check`:
+
+![Logs tab](docs/web_console_logs.png)
+
 ### Settings tab — Infrastructure status & Fleet by AZ
 
 At-a-glance infrastructure status: API connection, AgentCore Gateway URL, Multi-AZ HA, Prometheus + Grafana, AWS WAF, Cognito + RBAC, SNS lifecycle events, per-tenant quotas, host overcommit ratios, and a live **Fleet by AZ** table showing how hosts and VMs are spread across availability zones:

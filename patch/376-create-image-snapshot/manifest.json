@@ -1,0 +1,177 @@
+{
+  "id": "376-create-image-snapshot",
+  "base_sha": "85faaafb2d9a5fb1a72c0dc46460c7b8567192a3",
+  "patch_sha": "12ad3e5cff6aa13d253535ba421e51a73b417eda",
+  "status": "READY",
+  "excludes": ["docs/api/pull-image-api.md"],
+  "paths": {
+    "deploy/lambda/api/handler.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/handler.py",
+      "base_sha256": "43862ac76f5192e9db8a2f3e92706ffa1f6157e57c1cceed784f589c1f22153c",
+      "patch_sha256": "6157fd3445b9d120c81f6b850b4580e84a70aa63f5fe5a3e4516ddf66432432e",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api route ('POST','/create-image-snapshot') + create_image_snapshot alias",
+          "class": "AUTO_CLI",
+          "apply_cli": "Surgical Lambda overlay: pull live openclaw-api zip, gate that the two target files' live bytes equal manifest base_sha256 (STOP on drift), overwrite ONLY handler.py + services/host_service.py in place (never rm -rf a tree; unrelated live files untouched), re-zip, aws lambda update-function-code --revision-id (optimistic concurrency); then publish-version + update-alias AND leave $LATEST current so both the API-GW alias and any SQS $LATEST binding see the new code.",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": ["#376"]
+    },
+    "deploy/lambda/api/services/host_service.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/services/host_service.py",
+      "base_sha256": "5f21b053ceaa88d5d12780ad360f5a430374e428116c62b11bfffce84432faed",
+      "patch_sha256": "4f8469830fb061e85f17f360a3782261769b5275fb7c48747e0d8384a45f7098",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api create_image_snapshot + _scan_deployment_files + _SNAPSHOT_LABEL_RE",
+          "class": "AUTO_CLI",
+          "apply_cli": "Same openclaw-api overlay as handler.py (one zip carries both files); rollback = redeploy old zip + revert alias/$LATEST.",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": ["#376"]
+    },
+    "deploy/stacks/lambdas.py": {
+      "change": "M",
+      "layer": "D-cdk",
+      "artifact": null,
+      "base_sha256": "02a84f0dbdc83ddb8d130903c65b7486b9805f07a6200a083b1218603f060ab0",
+      "patch_sha256": "329ab8950c0c62de533cf6d69d569bfc5f81182e1645f75e44401fb76d620ac2",
+      "operations": [
+        {
+          "resource": "iam:openclaw-api-role version-snapshots-table dynamodb:PutItem (minimal grant, no Delete/Update)",
+          "class": "AUTO_CLI",
+          "apply_cli": "aws iam put-role-policy --role-name <openclaw-api role> --policy-name claw-patch-376-snapshot-putitem --policy-document '{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"dynamodb:PutItem\",\"Resource\":\"<version-snapshots table arn>\"}]}'",
+          "rollback_policy": "RETAIN"
+        },
+        {
+          "resource": "apigw:<rest-api-id> POST /create-image-snapshot (operator+, key_required)",
+          "class": "AUTO_CLI",
+          "apply_cli": "bash lib/apply-api-routes.sh apply <region> — clones auth (authorizationType/apiKeyRequired/authorizerId/scopes) + AWS_PROXY integration from live GET /list_image_versions onto a new root resource create-image-snapshot, adds OPTIONS MOCK->204 CORS; rollback = bash lib/apply-api-routes.sh rollback <region> (deletes the new resource, restores the prior deployment from the state file).",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": ["#376"]
+    },
+    "deploy/console-bff/web/index.html": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "lib/console-web/index.html",
+      "base_sha256": "9748ee7e69e7333567382a5bf8102b7d4a3c945bb497bb7c1b2b2e31b0b0061e",
+      "patch_sha256": "ca2c10b3b30405a6a46fbd54f32ccbe79b30677979c260e71594393e9dd825bb",
+      "operations": [
+        {
+          "resource": "file:console-bff/web/index.html — 'Take snapshot' button under canWrite() block",
+          "class": "AUTO_CLI",
+          "apply_cli": "code replacement (pool-core console-bff web); upload the patched file to the console web origin per its layer (S3 object / host path init-host.sh installs it to), then invalidate the console cache.",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": ["#376"]
+    },
+    "deploy/console-bff/web/js/app.hosts.js": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "lib/console-web/js/app.hosts.js",
+      "base_sha256": "503da9b879ce762742ccdc940d5157aa19f6eb44e40a672c5b25bb9fe2e64570",
+      "patch_sha256": "9fac6fdd1214b73a6614414661297030c6cd8e9ba14aa370fd267bc05cdb6c42",
+      "operations": [
+        {
+          "resource": "file:console-bff/web/js/app.hosts.js — takeSnapshot() POST create-image-snapshot",
+          "class": "AUTO_CLI",
+          "apply_cli": "code replacement (pool-core console-bff web); upload the patched file to the console web origin per its layer, then invalidate the console cache.",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": ["#376"]
+    },
+    "patch/push-marker-2026-07-24-0217-8796ab8e.md": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "base_sha256": null,
+      "patch_sha256": "e96136b26c35c6cbc16d995dafb6e9f3a4fa17b53cac862559faf7312404d625",
+      "operations": [
+        {
+          "resource": "meta:gateway push-audit marker (inert, not applied to any running system)",
+          "class": "AUTO_CLI",
+          "apply_cli": "inert doc/tool, not applied by this patch",
+          "rollback_policy": "RETAIN"
+        }
+      ]
+    }
+  },
+  "fixes": [
+    {
+      "id": "#376",
+      "summary": "POST /create-image-snapshot control-plane endpoint: scan deployment/ for every current object's {path, s3_version_id, etag} and record one snapshot row (snapshot_time PK) into the version-snapshots table — the API equivalent of scripts/snapshot-version.sh, so a snapshot can be taken from the console and then pulled onto hosts. Fail-loud on an empty scan (500 EMPTY_SNAPSHOT), label whitelist-validated ([A-Za-z0-9._-]{1,128}) or derived from the rootfs manifest version, conditional put (attribute_not_exists) -> 409 on a same-second collision. Reaches the running system via a Lambda overlay (handler route + host_service logic), a minimal DDB PutItem IAM grant, a cloned API-GW POST route, and the console 'Take snapshot' button.",
+      "paths": [
+        "deploy/lambda/api/handler.py",
+        "deploy/lambda/api/services/host_service.py",
+        "deploy/stacks/lambdas.py",
+        "deploy/console-bff/web/index.html",
+        "deploy/console-bff/web/js/app.hosts.js"
+      ],
+      "applies_when": "always",
+      "params_changed": [],
+      "verification_ids": [
+        "v-376-created",
+        "v-376-listed",
+        "v-376-viewer-denied",
+        "v-376-label-reject"
+      ]
+    }
+  ],
+  "verifications": [
+    {
+      "id": "v-376-created",
+      "fix_id": "#376",
+      "phase": "B-lifecycle",
+      "action": "curl -s -o /tmp/snap.json -w '%{http_code}' -X POST \"$API_URL/create-image-snapshot\" -H \"x-api-key: $OPERATOR_KEY\" -H 'content-type: application/json' -d '{}'",
+      "observable": "http_code + response body {snapshot_time,label,file_count}",
+      "pass_when": "http_code==200 AND file_count > 0 AND snapshot_time matches ^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$",
+      "fail_when": "http_code==403 (api-key not operator+ / route auth wrong) OR http_code==500 with code EMPTY_SNAPSHOT (IAM PutItem grant missing or ASSETS_BUCKET/deployment prefix wrong) OR http_code==503 NOT_CONFIGURED",
+      "timeout_s": 60,
+      "cleanup": null
+    },
+    {
+      "id": "v-376-listed",
+      "fix_id": "#376",
+      "phase": "B-lifecycle",
+      "action": "SNAP_TS from /tmp/snap.json; curl -s \"$API_URL/list_image_versions\" -H \"x-api-key: $OPERATOR_KEY\" | python3 -c 'import sys,json; rows=json.load(sys.stdin); print([r[\"snapshot_time\"] for r in rows][:3])'; aws dynamodb get-item --table-name \"$SNAP_TABLE\" --region \"$REGION\" --key \"{\\\"snapshot_time\\\":{\\\"S\\\":\\\"$SNAP_TS\\\"}}\" --query 'Item.snapshot_time.S' --output text",
+      "observable": "the snapshot_time from v-376-created appears in GET /list_image_versions AND get-item returns that same snapshot_time from the version-snapshots table",
+      "pass_when": "SNAP_TS is present in the list (newest-first) AND dynamodb get-item returns exactly SNAP_TS (the row is really in the datastore, not just echoed by the list route)",
+      "fail_when": "SNAP_TS absent from the list OR get-item returns None (write went to the wrong table / list route reads a different source)",
+      "timeout_s": 30,
+      "cleanup": null
+    },
+    {
+      "id": "v-376-viewer-denied",
+      "fix_id": "#376",
+      "phase": "B-lifecycle",
+      "action": "curl -s -o /tmp/vd.json -w '%{http_code}' -X POST \"$API_URL/create-image-snapshot\" -H \"x-api-key: $VIEWER_KEY\" -H 'content-type: application/json' -d '{}'",
+      "observable": "http_code for a viewer-scoped (non-operator) api-key",
+      "pass_when": "http_code==403 (the route is operator+, cloned from GET /images; a viewer is refused before reaching the write path)",
+      "fail_when": "http_code==200 OR http_code==500 (a non-operator reached the snapshot write path — the auth clone is wrong and the route is under-protected)",
+      "timeout_s": 30,
+      "cleanup": null
+    },
+    {
+      "id": "v-376-label-reject",
+      "fix_id": "#376",
+      "phase": "B-lifecycle",
+      "action": "BEFORE=dynamodb scan --select COUNT; curl -s -o /tmp/snap_bad.json -w '%{http_code}' -X POST \"$API_URL/create-image-snapshot\" -H \"x-api-key: $OPERATOR_KEY\" -H 'content-type: application/json' --data-binary '{\"label\":\"bad; touch /tmp/x\"}'; AFTER=dynamodb scan --select COUNT",
+      "observable": "http_code + response body code + version-snapshots row count before/after",
+      "pass_when": "http_code==400 AND body code==VALIDATION AND AFTER==BEFORE (label whitelist rejected shell metacharacters before any write; no row created)",
+      "fail_when": "http_code==200 OR AFTER>BEFORE (an unsanitized label with shell metacharacters was accepted and a row was stored)",
+      "timeout_s": 30,
+      "cleanup": null
+    }
+  ]
+}

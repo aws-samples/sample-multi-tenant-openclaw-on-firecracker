@@ -10,8 +10,9 @@ endpoint returns the full broadcast catalog (legacy v1.3.x behavior),
 which the operator console uses for the "Skills library" view.
 """
 
-import os
 import json
+import os
+
 import boto3
 
 s3 = boto3.client("s3")

@@ -20,14 +20,14 @@ Tenants without a probe failure get a `metrics` field on their DDB record:
               disk_total_mb, disk_used_pct, cpu_pct}
 """
 
+import importlib.util
 import json
 import os
 import sys
-import importlib.util
-import pytest
-from unittest.mock import patch, MagicMock
-from conftest import make_ddb_table
+from unittest.mock import MagicMock, patch
 
+import pytest
+from conftest import make_ddb_table
 
 # Import host-agent.py with mocked SDK (mirror test_balloon.py setup)
 _mock_ddb = MagicMock()

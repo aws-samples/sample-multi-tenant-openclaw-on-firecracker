@@ -10,6 +10,7 @@ no actual deployment.
 
 import os
 import sys
+
 import pytest
 
 # Ensure deploy/ is importable so we can import stack.py
@@ -18,7 +19,6 @@ sys.path.insert(0, os.path.join(ROOT, "deploy"))
 
 import aws_cdk as cdk
 from aws_cdk import assertions
-
 from stack import OpenClawOrchestratorStack  # noqa: E402
 
 
@@ -86,8 +86,9 @@ class TestEbsEncryption:
     def test_data_volume_size_unchanged(self, synthesized_template):
         """Regression: data volume size still comes from config.yml host.data_volume_gb."""
         # Read the configured size from config.yml so the test stays in sync with config.
-        import yaml
         from pathlib import Path
+
+        import yaml
         cfg = yaml.safe_load((Path(ROOT) / "config.yml").read_text())
         expected_size = cfg["host"]["data_volume_gb"]
 

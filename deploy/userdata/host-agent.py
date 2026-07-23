@@ -11,7 +11,7 @@ import os
 import subprocess
 import threading
 import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import boto3
 from botocore.config import Config as BotoConfig
@@ -782,7 +782,6 @@ def _adjust_balloons(probe_results):
 
         # Guest available memory (from balloon stats)
         guest_available_mb = stats.get("stats", {}).get("available_memory", 0) // (1024 * 1024)
-        guest_free_mb = stats.get("stats", {}).get("free_memory", 0) // (1024 * 1024)
 
         if host_pressure < 0.20:
             # Host under pressure — try to reclaim from this VM

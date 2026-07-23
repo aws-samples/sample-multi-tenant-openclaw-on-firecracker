@@ -8,12 +8,13 @@ Run: pytest tests/test_e2e.py -m e2e -v
 These tests create and delete real resources. They are idempotent and clean up after themselves.
 """
 
+import json
 import os
 import time
-import json
-import pytest
-import urllib.request
 import urllib.error
+import urllib.request
+
+import pytest
 from conftest import load_env_deploy
 
 ENV = load_env_deploy()
@@ -413,7 +414,10 @@ class TestAgentCoreMemoryE2E:
     @pytest.mark.e2e
     def test_memory_write_and_list_events(self):
         """Write conversation events to Memory, verify they exist."""
-        import boto3, uuid, datetime
+        import datetime
+        import uuid
+
+        import boto3
         ac_status = _api("GET", "agentcore/status")[1]
         if not ac_status.get("enabled"):
             pytest.skip("AgentCore not enabled")
@@ -500,7 +504,9 @@ class TestAgentCoreBrowserE2E:
     @pytest.mark.e2e
     def test_browser_session_lifecycle(self):
         """Start browser session, verify READY status, stop."""
-        import boto3, time
+        import time
+
+        import boto3
         ac_status = _api("GET", "agentcore/status")[1]
         if not ac_status.get("enabled"):
             pytest.skip("AgentCore not enabled")

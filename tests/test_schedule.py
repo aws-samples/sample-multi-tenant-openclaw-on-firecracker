@@ -17,14 +17,14 @@ Behavior:
 - Scaler tick reconciles actual status with the desired status
 """
 
+import importlib.util
 import json
 import sys
-import importlib.util
-import pytest
-from unittest.mock import patch, MagicMock
-from datetime import datetime, timezone, timedelta
-from conftest import make_ddb_table
+from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, patch
 
+import pytest
+from conftest import make_ddb_table
 
 # ── Load api/handler.py with mocked SDK ──
 _mock_ddb_api = MagicMock()

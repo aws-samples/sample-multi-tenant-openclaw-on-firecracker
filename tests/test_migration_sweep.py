@@ -29,11 +29,10 @@ on whether a restore SSM command was fired, not on read-back state.
 
 import importlib.util
 import sys
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
-
 from conftest import make_ddb_table
 
 

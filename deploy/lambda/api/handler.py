@@ -1,12 +1,13 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-import json
 import hashlib
+import json
 import os
 import random
 import re
 import time
+
 import boto3
 from botocore.exceptions import ClientError
 
@@ -84,8 +85,8 @@ COGNITO_REGION = os.environ.get("AWS_REGION", "") or os.environ.get("AWS_DEFAULT
 # "viewer" = least privilege (fail-safe). Trusted automation that needs write
 # access must present a Cognito id_token.
 DEFAULT_NO_JWT_ROLE = os.environ.get("DEFAULT_NO_JWT_ROLE", "viewer")
-# RBAC role-gating is its own switch, independent of console_auth (Cognito login). 
-# Default OFF: login can be required for the console UI without forcing every write to carry a Cognito id_token. 
+# RBAC role-gating is its own switch, independent of console_auth (Cognito login).
+# Default OFF: login can be required for the console UI without forcing every write to carry a Cognito id_token.
 # Set RBAC_ENABLED=true to enforce per-route role checks (viewer/operator/admin).
 RBAC_ENABLED = os.environ.get("RBAC_ENABLED", "false").lower() == "true"
 
@@ -2421,7 +2422,8 @@ def _audit_system(event_name, obj, resource_id, actor="system", detail=None, sta
     if audit_table is None:
         return
     try:
-        import uuid, time as _t
+        import time as _t
+        import uuid
         item = {
             "pk": "audit",
             "id": str(uuid.uuid4()),
@@ -2448,7 +2450,8 @@ def _audit_write(method, resource, path_params, event, result):
     if audit_table is None:
         return
     try:
-        import uuid, time as _t
+        import time as _t
+        import uuid
         path_params = path_params or {}
         obj, resource_id = _audit_object(resource, path_params)
         api_key_id = (event.get("requestContext") or {}).get("identity", {}).get("apiKeyId") \

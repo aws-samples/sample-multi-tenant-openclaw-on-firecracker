@@ -1,11 +1,12 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-import os
 import json
+import os
 import uuid
-import boto3
 from datetime import datetime, timezone
+
+import boto3
 
 ddb = boto3.resource("dynamodb")
 autoscaling = boto3.client("autoscaling")

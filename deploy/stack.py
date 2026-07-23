@@ -2,34 +2,80 @@
 # SPDX-License-Identifier: MIT-0
 
 import platform as _platform
-import yaml
+from pathlib import Path
+
 import aws_cdk as cdk
+import yaml
+from aws_cdk import (
+    BundlingOptions,
+    Duration,
+    Fn,
+    RemovalPolicy,
+)
+from aws_cdk import (
+    aws_apigateway as apigw,
+)
+from aws_cdk import (
+    aws_aps as aps,
+)
+from aws_cdk import (
+    aws_autoscaling as autoscaling,
+)
+from aws_cdk import (
+    aws_bedrock_agentcore_alpha as agentcore,
+)
+from aws_cdk import (
+    aws_bedrockagentcore as agentcore_l1,
+)
+from aws_cdk import (
+    aws_certificatemanager as acm,
+)
+from aws_cdk import (
+    aws_cloudfront as cloudfront,
+)
+from aws_cdk import (
+    aws_cloudfront_origins as origins,
+)
+from aws_cdk import (
+    aws_cognito as cognito,
+)
 from aws_cdk import (
     aws_dynamodb as dynamodb,
-    aws_lambda as _lambda,
-    aws_apigateway as apigw,
-    aws_events as events,
-    aws_events_targets as targets,
-    aws_iam as iam,
-    aws_s3 as s3,
-    aws_sns as sns,
+)
+from aws_cdk import (
     aws_ec2 as ec2,
-    aws_autoscaling as autoscaling,
+)
+from aws_cdk import (
     aws_elasticloadbalancingv2 as elbv2,
-    aws_cloudfront as cloudfront,
-    aws_cloudfront_origins as origins,
-    aws_certificatemanager as acm,
-    aws_cognito as cognito,
-    aws_wafv2 as wafv2,
-    aws_aps as aps,
+)
+from aws_cdk import (
+    aws_events as events,
+)
+from aws_cdk import (
+    aws_events_targets as targets,
+)
+from aws_cdk import (
     aws_grafana as grafana,
-    aws_bedrock_agentcore_alpha as agentcore,
-    aws_bedrockagentcore as agentcore_l1,
+)
+from aws_cdk import (
+    aws_iam as iam,
+)
+from aws_cdk import (
+    aws_lambda as _lambda,
+)
+from aws_cdk import (
+    aws_s3 as s3,
+)
+from aws_cdk import (
+    aws_sns as sns,
+)
+from aws_cdk import (
+    aws_wafv2 as wafv2,
+)
+from aws_cdk import (
     custom_resources as cr,
-    BundlingOptions, Duration, Fn, RemovalPolicy,
 )
 from constructs import Construct
-from pathlib import Path
 
 CFG = yaml.safe_load((Path(__file__).parent.parent / "config.yml").read_text())
 

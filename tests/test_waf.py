@@ -10,18 +10,19 @@ resources should appear in the synthesized template — backward compatible.
 
 import os
 import sys
-import yaml
-import pytest
 from pathlib import Path
+
+import pytest
+import yaml
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "deploy"))
 
-import aws_cdk as cdk
-from aws_cdk import assertions
-
 # Stack module is imported per-fixture so we can swap CFG cleanly
 import importlib
+
+import aws_cdk as cdk
+from aws_cdk import assertions
 
 
 def _synth_with_config(cfg_overrides):

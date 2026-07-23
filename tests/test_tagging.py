@@ -11,11 +11,12 @@ Covers:
 - Tagging is fully optional — old callers unaffected
 """
 
-import json
-import pytest
 import importlib.util
+import json
 import sys
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
+
+import pytest
 from conftest import make_ddb_table
 
 # ── Re-import handler with mocked AWS SDK (mirrors test_api.py pattern) ──

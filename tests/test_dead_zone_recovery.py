@@ -13,10 +13,9 @@ transient blips don't trigger an unnecessary rebuild.
 
 import importlib.util
 import sys
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
-
 
 # Import host-agent.py with mocked SDK (mirror test_monitoring.py setup)
 _mock_ddb = MagicMock()

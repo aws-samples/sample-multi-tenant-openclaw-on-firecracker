@@ -18,13 +18,11 @@ Two layers:
 import importlib.util
 import json
 import sys
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
-
 from conftest import make_ddb_table
-
 
 # ──────────────────────────────────────────────────────────────────────
 # Module loader (re-imports a fresh copy with mocked AWS for each test)
@@ -69,7 +67,8 @@ def _load_hc_module(env_overrides=None):
     mock_ssm.exceptions.InvocationDoesNotExist = _FakeInvocationDoesNotExist
     # Default S3 list returns a single fake backup so _find_latest_backup_key
     # works in the happy-path tests. Tests that need empty can override.
-    from datetime import datetime, timezone as _tz
+    from datetime import datetime
+    from datetime import timezone as _tz
     mock_s3.list_objects_v2.return_value = {
         "Contents": [{
             "Key": "backups/t-stuck/2026-05-23T18:00:00Z.gz",
@@ -570,7 +569,8 @@ class TestFailoverTenant:
     def test_happy_path_updates_ddb_and_calls_ssm(self):
         hc = self._make_hc()
         # 1.3.1: seed S3 list with a real backup key for tenant t1.
-        from datetime import datetime as _dt, timezone as _tz
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
         hc._test_mocks["s3"].list_objects_v2.return_value = {
             "Contents": [{
                 "Key": "backups/t1/2026-05-23T18:00:00Z.gz",
@@ -639,7 +639,8 @@ class TestFailoverTenant:
     def test_ssm_failure_marks_tenant_failed(self):
         hc = self._make_hc()
         # Seed S3 with a real backup so we get past the path-A check.
-        from datetime import datetime as _dt, timezone as _tz
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
         hc._test_mocks["s3"].list_objects_v2.return_value = {
             "Contents": [{
                 "Key": "backups/t1/2026-05-23T18:00:00Z.gz",
@@ -664,7 +665,8 @@ class TestFailoverTenant:
         the script exits non-zero on target host) and marks tenant failed.
         """
         hc = self._make_hc()
-        from datetime import datetime as _dt, timezone as _tz
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
         hc._test_mocks["s3"].list_objects_v2.return_value = {
             "Contents": [{
                 "Key": "backups/t1/2026-05-23T18:00:00Z.gz",
@@ -727,7 +729,8 @@ class TestFindLatestBackupKey:
         s3://${ASSETS_BUCKET}/${RESTORE_KEY} itself; double prefix breaks it.
         """
         hc = self._make_hc()
-        from datetime import datetime as _dt, timezone as _tz
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
         hc._test_mocks["s3"].list_objects_v2.return_value = {
             "Contents": [{
                 "Key": "backups/t1/2026-05-23T18:00:00Z.gz",
@@ -742,7 +745,8 @@ class TestFindLatestBackupKey:
     @pytest.mark.unit
     def test_multiple_backups_returns_most_recent(self):
         hc = self._make_hc()
-        from datetime import datetime as _dt, timezone as _tz
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
         hc._test_mocks["s3"].list_objects_v2.return_value = {
             "Contents": [
                 {"Key": "backups/t1/2026-05-20T12:00:00Z.gz",
@@ -899,7 +903,8 @@ class TestSsmFailButVerifySucceeds:
     @pytest.mark.unit
     def test_ssm_fail_but_verified_running_treats_as_success(self):
         hc = self._make_hc()
-        from datetime import datetime as _dt, timezone as _tz
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
         hc._test_mocks["s3"].list_objects_v2.return_value = {
             "Contents": [{
                 "Key": "backups/t1/2026-05-23T18:00:00Z.gz",
@@ -940,7 +945,8 @@ class TestSsmFailButVerifySucceeds:
         we DO mark tenant failover_failed (no false-positive success).
         """
         hc = self._make_hc()
-        from datetime import datetime as _dt, timezone as _tz
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
         hc._test_mocks["s3"].list_objects_v2.return_value = {
             "Contents": [{
                 "Key": "backups/t1/2026-05-23T18:00:00Z.gz",
@@ -1085,7 +1091,8 @@ class TestConcurrentGuard:
         NOT crash and NOT report success.
         """
         hc = self._make_hc()
-        from datetime import datetime as _dt, timezone as _tz
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
         hc._test_mocks["s3"].list_objects_v2.return_value = {
             "Contents": [{
                 "Key": "backups/t1/2026-05-23T18:00:00Z.gz",
@@ -1185,7 +1192,8 @@ class TestVmNumAllocationBatch:
         ]}
         hc.hosts_table.get_item.return_value = {"Item": {}}
         # Each tenant has its own backup.
-        from datetime import datetime as _dt, timezone as _tz
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
         hc._test_mocks["s3"].list_objects_v2.return_value = {
             "Contents": [{
                 "Key": "backups/dummy/2026-05-23T18:00:00Z.gz",

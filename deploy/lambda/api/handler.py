@@ -615,6 +615,13 @@ def lambda_handler(event, context):
     # RBAC enforcement — checked AFTER routing so unknown paths still 404.
     forbidden = _rbac_check(event, method, resource)
     if forbidden is not None:
+        # Audit DENIED mutating attempts (issue-audit-6): _rbac_check returns
+        # the 403 before the handler runs, so without this an unauthorized
+        # write (e.g. a viewer trying DELETE /tenants/{id}) left NO trace —
+        # exactly the event incident response most wants. Reuse _audit_write so
+        # the row carries the real principal + resolved role + 403 status.
+        if method in ("POST", "PUT", "DELETE"):
+            _audit_write(method, resource, path_params, event, forbidden)
         return forbidden
     try:
         result = handler() if callable(handler) else handler

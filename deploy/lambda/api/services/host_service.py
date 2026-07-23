@@ -520,6 +520,11 @@ _SAFE_DISK_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 # (快照不存在)。别让乱输入默默查 DB 走成 404,误导调用方"快照不存在"(owner 2026-07-14)。
 _SNAPSHOT_TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
+# #376 — create_image_snapshot 的 label 是 API 调用方可控输入(shell 脚本从 manifest 读,
+# 但 API 直接收任意文本)。label 会进 console 显示 + 日志,故白名单校验:长度 ≤128 + 只允许
+# 文件名常见安全字符 [A-Za-z0-9._-],挡 shell 元字符/空格(纵深防御,不裸存未净化的值)。
+_SNAPSHOT_LABEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}\Z")
+
 # #217 V2 — 镜像盘文件名 → 盘类型(build-rootfs.sh:1134-1136 命名):
 # openclaw-{rootfs,data-template,immutable}-<VER>.ext4.gz。snapshot pull 要按此识别
 # 出镜像盘,拉下来解压成 launch-vm 认的【扁平】名 openclaw-<kind>.ext4;非镜像(脚本)
@@ -1002,6 +1007,85 @@ def list_image_versions():
     ]
     out.sort(key=lambda s: s["snapshot_time"], reverse=True)  # 最新在前
     return _resp(200, out)
+
+
+def _scan_deployment_files(bucket):
+    """#376 — 扫 S3 deployment/ 前缀下【全部】对象的当前版,采集
+    {path, s3_version_id, etag}。用 list_object_versions + IsLatest 过滤(同 key 的旧版本
+    不进快照);吃 paginator 处理多页。返回 list(可能为空,调用方 fail-loud)。"""
+    files = []
+    paginator = s3.get_paginator("list_object_versions")
+    for page in paginator.paginate(Bucket=bucket, Prefix="deployment/"):
+        for v in page.get("Versions", []):
+            if not v.get("IsLatest"):
+                continue  # 只记当前版(快照 = 此刻当前版的定格)
+            files.append({
+                "path": v["Key"],
+                "s3_version_id": v.get("VersionId"),
+                "etag": v.get("ETag"),
+            })
+    return files
+
+
+def create_image_snapshot(body):
+    """POST /create-image-snapshot — 给 assets 桶打一个版本快照(等价 snapshot-version.sh)。
+
+    扫 deployment/ 下全部对象(rootfs 镜像 + scripts + edge + litellm + monitoring)的
+    {path, s3_version_id, etag},写一条快照到 DDB(主键 snapshot_time=ISO8601 UTC)。之后
+    GET /list_image_versions 可列出、POST /hosts/{id}/pull-image?snapshot_time=<> 可按精确
+    VersionId 拉回。
+
+    · fail-loud:采集 0 文件 → 拒写空快照(500),不落一条无用记录。
+    · label:未传则读 deployment/rootfs/manifest.json 的 version;传了校验字符集后用传的。
+    · snapshot_time 用 %Y-%m-%dT%H:%M:%SZ(匹配 _SNAPSHOT_TIME_RE),否则 pull 判非法拉不动。"""
+    if version_snapshots_table is None:
+        return _err(503, "NOT_CONFIGURED", "VERSION_SNAPSHOTS_TABLE not configured")
+    bucket = os.environ.get("ASSETS_BUCKET", "")
+    if not bucket:
+        return _err(503, "NOT_CONFIGURED", "ASSETS_BUCKET not configured")
+
+    if isinstance(body, str):
+        try:
+            body = json.loads(body) if body.strip() else {}
+        except (ValueError, TypeError):
+            return _err(400, "VALIDATION", "body must be valid JSON")
+    body = body or {}
+    # 合法 JSON 标量/数组(如 "5"、"[1]")也会过 json.loads,但 body.get 会抛 → 先挡成 400。
+    if not isinstance(body, dict):
+        return _err(400, "VALIDATION", "body must be a JSON object")
+    label = body.get("label")
+    if label is not None:
+        if not isinstance(label, str) or not _SNAPSHOT_LABEL_RE.match(label):
+            return _err(400, "VALIDATION",
+                        "label must match [A-Za-z0-9._-]{1,128}")
+    else:
+        label = _get_manifest().get("version", "")  # 缺省派生 rootfs 版本(读不到 → "")
+
+    files = _scan_deployment_files(bucket)
+    if not files:
+        return _err(500, "EMPTY_SNAPSHOT",
+                    "no files found under deployment/ — bucket/prefix incorrect or permission issue")
+
+    # snapshot_time 主键:秒级 UTC + Z(与 snapshot-version.sh 逐字对齐,匹配 _SNAPSHOT_TIME_RE)。
+    snap_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    item = {
+        "snapshot_time": snap_ts,
+        "files": json.dumps(files, separators=(",", ":")),
+        "file_count": len(files),
+    }
+    if label:
+        item["label"] = label
+    # 条件写:snapshot_time 是主键,秒级精度下同秒并发/重放两次会静默覆盖前一条(破坏快照
+    # 不可变性)。attribute_not_exists 挡住 → 撞了返 409 让调用方稍后重试(下一秒即不同键)。
+    ccf = version_snapshots_table.meta.client.exceptions.ConditionalCheckFailedException
+    try:
+        version_snapshots_table.put_item(
+            Item=item, ConditionExpression="attribute_not_exists(snapshot_time)"
+        )
+    except ccf:
+        return _err(409, "CONFLICT",
+                    f"a snapshot at {snap_ts} already exists; retry in a moment")
+    return _resp(200, {"snapshot_time": snap_ts, "label": label, "file_count": len(files)})
 
 
 def _set_host_upgrading(instance_id, job_id):

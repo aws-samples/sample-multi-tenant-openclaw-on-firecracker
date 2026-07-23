@@ -342,6 +342,8 @@ def build_lambdas(self, ctx):
     hosts_table.grant_read_write_data(api_fn)
     groups_table.grant_read_write_data(api_fn)
     version_snapshots_table.grant_read_data(api_fn)  # #217 V2 — pull-image 只读快照
+    # #376 — create_image_snapshot 落新快照:只加 PutItem(最小权限,不给 Delete/Update)。
+    version_snapshots_table.grant(api_fn, "dynamodb:PutItem")
     # #152/#118 — the ClawPool credential-injection CMK ARN. Added ONLY when the
     # feature is on so synth stays byte-identical when off (no key on the env).
     # The API uses it as the real gate: it rejects injected_credentials whose
@@ -1031,6 +1033,12 @@ def build_lambdas(self, ctx):
     # console 选 snapshot_time 拉。改名避免与 /images(列镜像文件)混淆。
     snapshots_resource = api.root.add_resource("list_image_versions")
     snapshots_resource.add_method("GET", _li(), **key_required)
+
+    # #376 — POST /create-image-snapshot: 打一个版本快照(等价 snapshot-version.sh):
+    # 扫 deployment/ 全量对象 → 写 openclaw-version-snapshots 表。operator+(不在 _VIEWER_OK)。
+    # 路径用连字符(与 pull-image/copy-file-from-s3/refresh-rootfs 等一致)。
+    create_snapshot_resource = api.root.add_resource("create-image-snapshot")
+    create_snapshot_resource.add_method("POST", _li(), **key_required)
 
     # 1.4.0 (#62) — Groups CRUD endpoints
     groups_resource = api.root.add_resource("groups")

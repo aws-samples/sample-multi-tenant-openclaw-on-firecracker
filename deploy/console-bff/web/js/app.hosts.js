@@ -48,6 +48,22 @@ window.ocHosts = {
     this.toast = `✓ pull started: ${ok} ok${fail ? ', ' + fail + ' failed' : ''}${skipped ? ', ' + skipped + ' skipped (upgrading)' : ''}`;
     setTimeout(() => { this.toast = ''; this.loadHosts(); }, 4000);
   },
+  // #376 — 打一版镜像快照(POST /create-image-snapshot):扫 deployment/ 全量对象写快照表。
+  // 零输入:bucket 由后端 Lambda 从 ASSETS_BUCKET env 自读,label 留空后端自动取
+  // deployment/rootfs/manifest.json 的 version。点一下即打,打完刷新 snapshots 下拉,新快照
+  // 置顶(供随后 Pull 选)。operator+ 才可见(按钮在 canWrite 块里)。
+  async takeSnapshot() {
+    if (!confirm('Take a version snapshot of the assets bucket now?\n(label auto-filled from the current rootfs version)')) return;
+    this.toast = 'taking snapshot…';
+    try {
+      const r = await this.api('POST', 'create-image-snapshot', {});
+      this.toast = `✓ snapshot ${r.snapshot_time}${r.label ? ' (' + r.label + ')' : ''} · ${r.file_count} files`;
+      try { this.snapshots = await this.api('GET', 'list_image_versions'); } catch {}
+    } catch (e) {
+      this.toast = '✗ snapshot failed: ' + (e && e.message ? e.message : 'error');
+    }
+    setTimeout(() => { this.toast = ''; }, 4000);
+  },
   // #217 — 每台 host 当前选中的快照:选过用选的,没选默认最新(snapshots[0])。
   hostSnapFor(host_id) {
     return this.hostSnapChoice[host_id] || (this.snapshots[0] || {}).snapshot_time || '';
@@ -59,7 +75,7 @@ window.ocHosts = {
     const h = this.hosts.find(x => x.instance_id === host_id);
     if (h && h.status === 'upgrading') { alert('Host is upgrading (pull in progress).'); return; }
     const st = this.hostSnapFor(host_id);
-    if (!st) { alert('No snapshot available to pull (take one with snapshot-version.sh).'); return; }
+    if (!st) { alert('No snapshot available to pull (use "Take snapshot" above first).'); return; }
     if (!confirm(`Pull snapshot ${st} → ${host_id}?\n(installs to live; this host takes no new tenants while upgrading)`)) return;
     this.toast = `pull-image ${st}…`;
     try {

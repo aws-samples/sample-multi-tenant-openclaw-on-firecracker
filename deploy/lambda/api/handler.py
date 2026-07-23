@@ -90,6 +90,26 @@ DEFAULT_NO_JWT_ROLE = os.environ.get("DEFAULT_NO_JWT_ROLE", "viewer")
 # Set RBAC_ENABLED=true to enforce per-route role checks (viewer/operator/admin).
 RBAC_ENABLED = os.environ.get("RBAC_ENABLED", "false").lower() == "true"
 
+
+def _scan_all(table, **kwargs):
+    """Fully scan a DynamoDB table, following LastEvaluatedKey (T2-6).
+
+    boto3 Table.scan() returns at most 1 MB per call, so a bare .scan()
+    silently truncates once the control plane grows past a single page
+    (~500-1000 rows) — e.g. the health watchdog would stop monitoring tenants
+    beyond page 1. This loops until the table is exhausted. All scan kwargs
+    (FilterExpression, ExpressionAttributeNames/Values, ...) are forwarded to
+    every page. Callers MUST NOT pass ExclusiveStartKey.
+    """
+    items = []
+    resp = table.scan(**kwargs)
+    items.extend(resp.get("Items", []))
+    while resp.get("LastEvaluatedKey"):
+        resp = table.scan(ExclusiveStartKey=resp["LastEvaluatedKey"], **kwargs)
+        items.extend(resp.get("Items", []))
+    return items
+
+
 # Lazily-built, module-cached JWKS client. Cognito rotates signing keys
 # rarely; PyJWKClient caches fetched keys in-process, so we pay the JWKS
 # HTTP fetch at most once per cold container (and on key rotation).
@@ -314,8 +334,8 @@ def list_groups():
     if groups_table is None:
         return _resp(503, {"error": "groups table not configured (1.3.x deployment?)"})
     try:
-        resp = groups_table.scan()
-        return _resp(200, {"groups": resp.get("Items", [])})
+        groups = _scan_all(groups_table)
+        return _resp(200, {"groups": groups})
     except Exception as e:
         return _resp(500, {"error": str(e)})
 
@@ -642,11 +662,12 @@ def lambda_handler(event, context):
 
 
 def list_tenants(query_params=None, multi_query_params=None):
-    items = tenants_table.scan(
+    items = _scan_all(
+        tenants_table,
         FilterExpression="#s <> :d",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":d": "deleted"},
-    ).get("Items", [])
+    )
     # Ensure every record exposes a tags field so the console can render it
     for it in items:
         it.setdefault("tags", {})
@@ -1304,7 +1325,7 @@ def list_all_backups():
     prefix = os.environ.get("BACKUP_PREFIX", "backups")
 
     # Build tenant_id → (name, exists) map from DDB (include soft-deleted for name resolution)
-    tenants = tenants_table.scan().get("Items", [])
+    tenants = _scan_all(tenants_table)
     tenant_info = {
         t["id"]: {"name": t.get("name", ""), "exists": t.get("status") != "deleted"}
         for t in tenants
@@ -1345,11 +1366,12 @@ def tenant_get_action(tenant_id, action):
 
 
 def list_hosts():
-    items = hosts_table.scan(
+    items = _scan_all(
+        hosts_table,
         FilterExpression="#s <> :d",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":d": "deleted"},
-    ).get("Items", [])
+    )
     # Filter out synthetic records (e.g. __az_failover_state__ used by the
     # health_check Lambda to remember per-AZ cooldown — added in 1.3.0).
     # Anything starting with "__" is reserved for internal bookkeeping and
@@ -1471,11 +1493,12 @@ def cleanup_terminated_host(event):
     print(f"cleanup_terminated_host: {instance_id}")
 
     # Delete all tenants on this host
-    tenants = tenants_table.scan(
+    tenants = _scan_all(
+        tenants_table,
         FilterExpression="host_id = :h AND #s <> :d",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":h": instance_id, ":d": "deleted"},
-    ).get("Items", [])
+    )
     for t in tenants:
         _remove_alb_rule(t["id"])
         tenants_table.update_item(
@@ -1669,11 +1692,12 @@ def refresh_rootfs():
     region = os.environ.get("AWS_REGION", "ap-northeast-1")
     version = manifest["version"]
 
-    hosts = hosts_table.scan(
+    hosts = _scan_all(
+        hosts_table,
         FilterExpression="#s IN (:a, :i)",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":a": "active", ":i": "idle"},
-    ).get("Items", [])
+    )
 
     if not hosts:
         return _resp(200, {"message": "no active hosts", "updated": 0})
@@ -1729,11 +1753,12 @@ fallocate --dig-holes "$ASSETS/openclaw-data-template.ext4"
 
 def process_pending():
     """Called when a new host becomes InService. Assign pending tenants to available hosts."""
-    pending = tenants_table.scan(
+    pending = _scan_all(
+        tenants_table,
         FilterExpression="#s = :p",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":p": "pending"},
-    ).get("Items", [])
+    )
 
     if not pending:
         return {"statusCode": 200, "body": "no pending tenants"}
@@ -1836,11 +1861,12 @@ def _find_host(vcpu_needed, mem_needed):
     free vCPU (then most free mem, then a deterministic instance_id tie-break),
     mirroring pick_target_host() in the health_check Lambda.
     """
-    hosts = hosts_table.scan(
+    hosts = _scan_all(
+        hosts_table,
         FilterExpression="#s IN (:a, :i)",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":a": "active", ":i": "idle"},
-    ).get("Items", [])
+    )
 
     candidates = []
     for h in hosts:
@@ -1928,17 +1954,15 @@ def _release_host_slot(instance_id, vcpu, mem_mb):
 
 def _get_specific_host_with_capacity(instance_id, vcpu_needed, mem_needed):
     """Issue #12 — locate a specific host (used for same-host clone) and
-    confirm it has capacity. Returns the host item or None."""
-    hosts = hosts_table.scan(
-        FilterExpression="#s IN (:a, :i)",
-        ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":a": "active", ":i": "idle"},
-    ).get("Items", [])
-    for h in hosts:
-        if h["instance_id"] != instance_id:
-            continue
-        return h if _host_fits(h, vcpu_needed, mem_needed) else None
-    return None
+    confirm it has capacity. Returns the host item or None.
+
+    T2-7: instance_id IS the hosts-table partition key, so fetch the one row
+    with get_item (0.5 RCU) instead of scanning the whole table and linear-
+    searching — the old scan cost grew with fleet + dead-row count."""
+    item = hosts_table.get_item(Key={"instance_id": instance_id}).get("Item")
+    if not item or item.get("status") not in ("active", "idle"):
+        return None
+    return item if _host_fits(item, vcpu_needed, mem_needed) else None
 
 
 def _gen_id(name):
@@ -2635,11 +2659,13 @@ def batch_tenants(body=None):
 
 def _resolve_filter(flt):
     """Convert filter dict → list of matching tenant ids (excludes soft-deleted)."""
-    items = tenants_table.scan(
+    items = _scan_all(
+        tenants_table,
         FilterExpression="#s <> :d",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":d": "deleted"},
-    ).get("Items", []) or []
+
+    ) or []
     items = [it for it in items if it.get("status") != "deleted"]
     tag_expr = flt.get("tag", "")
     if tag_expr and ":" in tag_expr:

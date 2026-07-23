@@ -13,6 +13,20 @@ BUCKET = os.environ["ASSETS_BUCKET"]
 PREFIX = os.environ.get("BACKUP_PREFIX", "backups")
 
 
+def _scan_all(table, **kwargs):
+    """Fully scan a DynamoDB table, following LastEvaluatedKey (T2-6).
+
+    A bare Table.scan() truncates at the 1 MB (~500-1000 row) page, so past
+    that the sweep silently stops seeing rows. This loops until exhausted;
+    all scan kwargs are forwarded to every page. No ExclusiveStartKey arg.
+    """
+    items = []
+    resp = table.scan(**kwargs)
+    items.extend(resp.get("Items", []))
+    while resp.get("LastEvaluatedKey"):
+        resp = table.scan(ExclusiveStartKey=resp["LastEvaluatedKey"], **kwargs)
+        items.extend(resp.get("Items", []))
+    return items
 def lambda_handler(event, context):
     """Triggered by EventBridge schedule or API Gateway (manual backup)."""
     # Manual single-tenant backup via API
@@ -24,11 +38,11 @@ def lambda_handler(event, context):
         return backup_tenant(item)
 
     # Scheduled: backup all running tenants
-    tenants = tenants_table.scan(
-        FilterExpression="#s = :r",
+    tenants = _scan_all(
+        tenants_table,        FilterExpression="#s = :r",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":r": "running"},
-    ).get("Items", [])
+    )
 
     results = []
     for t in tenants:

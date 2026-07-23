@@ -1,0 +1,61 @@
+name: CI
+
+# Project CI for the OpenClaw sample: lint (ruff), shell checks, and the
+# offline test suite (683 tests; e2e is gated separately behind OPENCLAW_E2E).
+# Runs on every PR and on pushes to main.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: ruff check
+        run: uvx ruff check .
+
+  shell:
+    name: Shell checks (bash -n + shellcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n (syntax) on all scripts
+        run: |
+          set -e
+          for f in deploy/userdata/*.sh scripts/*.sh setup.sh build-rootfs.sh; do
+            echo "bash -n $f"
+            bash -n "$f"
+          done
+      - name: shellcheck (error severity) — skip CDK-templated init-host.sh
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          # init-host.sh carries {{PLACEHOLDER}} tokens that CDK substitutes at
+          # synth time, so it is not valid bash until rendered — exclude it.
+          files=$(grep -L '{{[A-Z_]*}}' deploy/userdata/*.sh scripts/*.sh setup.sh build-rootfs.sh)
+          echo "shellchecking: $files"
+          shellcheck -S error $files
+
+  test:
+    name: Offline tests (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Sync test deps
+        run: uv sync --group test
+      # CDK-synth tests bundle the api Lambda in Docker (cryptography arm64
+      # wheel). ubuntu-latest ships Docker, so bundling works unmodified.
+      - name: pytest (offline; e2e excluded)
+        run: uv run pytest -m "not e2e" -q --cov=deploy --cov=cli --cov-report=term-missing

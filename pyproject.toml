@@ -14,7 +14,7 @@ dependencies = [
 # JWT verification path the Lambda uses (sign a test RS256 token, assert the
 # handler verifies/rejects it). The Lambda gets these via CDK bundling
 # (deploy/lambda/api/requirements.txt), not from this group.
-test = ["pytest", "moto", "boto3", "pyjwt>=2.8.0", "cryptography>=48.0.1"]
+test = ["pytest", "pytest-cov", "moto", "boto3", "pyjwt>=2.8.0", "cryptography>=48.0.1"]
 
 [build-system]
 requires = ["setuptools"]
@@ -22,6 +22,29 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = []
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+# Bug-catching rules (pyflakes F, bugbear B) + import order (I) + core
+# pycodestyle (E/W). E501 (line-too-long) is deliberately NOT enforced — the
+# existing control-plane code has 200+ long lines and reflowing them now is
+# churn with no bug-catching value; line-length is a soft 120 for new code.
+select = ["E", "F", "W", "I", "B"]
+# E501 (line length): 200+ pre-existing long lines, no bug value in reflowing.
+# E701/E702 (colon/semicolon one-liners): intentional compact validation idioms.
+# B018 (useless expression): the runtime-stub probe (instance.launch_vm) is a
+# deliberate attribute-access trigger. Bug-catching rules (F*, B904, most of B)
+# stay ON.
+ignore = ["E501", "E701", "E702", "B018"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests import handlers via importlib and rebind module globals; import-not-at-
+# top (E402), unused-import (F401), ambiguous name (E741) and assert-False
+# (B011, used to force a failure path) are intentional in the test harness.
+"tests/*" = ["E402", "F401", "E741", "B011"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

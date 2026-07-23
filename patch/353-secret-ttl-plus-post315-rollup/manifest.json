@@ -4,13 +4,23 @@
   "patch_sha": "6edbf2abbfa4069bab8ee385a0b5cb3f22f57543",
   "status": "MANUAL_REVIEW",
   "excludes": [],
+  "field_corrections": [
+    {
+      "path": "build-rootfs.sh",
+      "reason": "Ubuntu Noble user manager exits 218/CAPABILITIES when the guest forwarder unit sets CapabilityBoundingSet"
+    },
+    {
+      "path": "deploy/edge/fluent-bit/host/fluent-bit.conf",
+      "reason": "multiple systemd filters default to AND and exclude claw-launch records without _SYSTEMD_UNIT"
+    }
+  ],
   "paths": {
     "build-rootfs.sh": {
       "change": "M",
       "layer": "deploy-other",
       "artifact": "launch-template/build-rootfs.sh.patched",
       "base_sha256": "52ae5e46f64b2e77411315cc25fb6bcb2b2efcc732ea78c470ac93f1b0f971f8",
-      "patch_sha256": "7dd1bc93fc74772a68e9524786872ebd1a70e83bf16d51382aecee948d1503e2",
+      "patch_sha256": "f7917c0328ffa8a96a005d104df99e482cea6f1ee5a8cd55b12169cc08d918ee",
       "operations": [
         {
           "resource": "build-rootfs.sh (deploy-other code replacement)",
@@ -113,7 +123,7 @@
       "layer": "deploy-other",
       "artifact": "host-scripts/fluent-bit/fluent-bit.conf",
       "base_sha256": "6362a74e7edb969fa0ac35a1a70dc3d526b8587a26e7c06cdd8084167f930b9e",
-      "patch_sha256": "60ffdb53d90749e5c2d88fadfdbd4a740bdd7400c07d3a5fdb156d1ea5a87dba",
+      "patch_sha256": "ab3ed3b91c6bc5ba83b0da5afd07f85331b8e98981f794110badf10c8718a3b7",
       "operations": [
         {
           "resource": "deploy/edge/fluent-bit/host/fluent-bit.conf (deploy-other code replacement)",

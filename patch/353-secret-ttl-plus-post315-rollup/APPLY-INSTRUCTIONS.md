@@ -136,17 +136,20 @@ done
 ```
 
 **Launch Template (A-lt) — #323 KillMode + #331 slot env into future hosts. USE `lib/apply-lt.sh`,
-do NOT hand-wrangle base64** (it reads the ASG-pinned version, refuses raw `{{ }}` templates,
+do NOT hand-wrangle base64** (it reads the ASG-pinned version, refuses unresolved `{{TOKEN}}` templates,
 16KB-checks, and gates every mutation):
 
 ```bash
-bash lib/apply-lt.sh pull  $LT $ASG $REGION      # -> /tmp/lt-$LT.cur.sh (rendered, no placeholders) + saves prior version
-# edit /tmp/lt-$LT.cur.sh: apply ONLY this patch's init-host.sh hunk (host-agent.service now carries
+STATE_DIR=${OC_APPLY_LT_STATE_DIR:-$HOME/.oc-apply-lt}
+bash lib/apply-lt.sh pull  $ASG $REGION           # -> $STATE_DIR/$ASG.init-host.sh + saves prior version
+# edit $STATE_DIR/$ASG.init-host.sh: apply ONLY this patch's init-host.sh hunk (host-agent.service now carries
 #   KillMode=process; add OC_HOST_LAUNCH_SLOTS=30 to /etc/platform.env write; add the reader unit).
 #   compare against launch-template/init-host.sh.patched for the exact hunk — keep all rendered values.
-bash lib/apply-lt.sh push  $LT $ASG $REGION      # repack + create-launch-template-version + point ASG (gated)
-bash lib/apply-lt.sh verify $ASG $REGION         # prints the 3-signal check for ONE new host
-# rollback if a signal fails: bash lib/apply-lt.sh rollback $LT $ASG $REGION
+bash lib/apply-lt.sh push    $ASG $REGION         # repack + create LT version; ASG remains unchanged
+bash lib/apply-lt.sh promote $ASG $REGION         # point ASG at the read-back-verified version
+bash lib/apply-lt.sh refresh $ASG $REGION         # controlled replacement; default MinHealthy=100
+bash lib/apply-lt.sh verify  $ASG $REGION         # real 3-signal check on one healthy replacement
+# rollback if a signal fails: bash lib/apply-lt.sh rollback $ASG $REGION
 ```
 
 ## Step 4 — CDK stack changes → manual CLI equivalents (review-gated, NO CloudFormation redeploy)
@@ -201,8 +204,10 @@ aws lambda update-alias --function-name openclaw-api --name "$ALIAS" --function-
 ## Step 5 — Post-fix: fresh-machine validation
 
 Because Step 3 touched the LT/init-host + S3 scripts, launch **one** new host on the new LT and let it
-boot clean (no hot-fix) — watch the 3 signals from `apply-lt.sh verify`. Only after it passes, run a
-**controlled** instance-refresh (small MinHealthyPercentage), never a mass replace.
+boot clean through the ASG (no standalone canary and no hot-fix). Start the controlled refresh with
+the default high `MinHealthyPercentage=100`, then run `apply-lt.sh verify` as soon as the first
+replacement is healthy. It checks the exact LT version, SSM online state, and clean boot/service
+configuration. If it fails, cancel the refresh and run `rollback`; never mass-replace the fleet.
 
 **#345 guest side — needs a NEW golden rootfs (prerequisite, not yet baked)**: the guest forwarder
 lives in the read-only golden rootfs. To reach tenants: `build-rootfs.sh` (shipped as

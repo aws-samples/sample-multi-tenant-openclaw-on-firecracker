@@ -59,6 +59,31 @@ def _is_migrating(tenant_id):
 HOSTS_TABLE = os.environ.get("HOSTS_TABLE", "")
 INSTANCE_ID = os.environ.get("INSTANCE_ID", "")
 
+# Write-amplification control (T3-5). At 1000 VMs the old "SSH + failed
+# conditional promote + health write, every 15s, per VM" cost ~11.5M wasted
+# DDB writes/day + 5.7M SSH execs (~$430/mo). We now:
+#   * SSH-read the gateway token + attempt the creating→running promote ONLY
+#     until a tenant is known past `creating` (tracked in _promoted); and
+#   * write tenant health to DDB only when (vm_health, app_health) changes,
+#     plus a slow liveness refresh so the health_check watchdog never sees a
+#     stable tenant as stale.
+# OC_AGENT_DDB_REFRESH is clamped below STALE_SECONDS (=120 in
+# health_check/handler.py) so a stable tenant is always re-stamped at least
+# twice per staleness window — a misconfigured refresh can't fake staleness.
+_DDB_REFRESH = min(int(os.environ.get("OC_AGENT_DDB_REFRESH", "60")), 110)
+
+# Tenants known to be past `creating` — skip the SSH token read + the
+# guaranteed-to-fail conditional promote for these. Seeded on a successful
+# promote OR a ConditionalCheckFailedException (already running). Reset on
+# agent restart (one cheap SSH+failed-promote per VM on the first tick) and
+# GC'd when a tenant disappears, so a recreated tenant re-promotes.
+_promoted = set()
+
+# tid -> (vm_health, app_health, monotonic_ts_of_last_write). Drives the
+# state-change-or-refresh write decision. Only updated on a SUCCESSFUL write,
+# so a failed write is retried on the next tick (never-raise contract kept).
+_last_ddb_write = {}
+
 
 # ═══════════════════════════════════════════
 # Prometheus exporter (issue #4)
@@ -353,73 +378,123 @@ def _write_host_heartbeat():
         print(f"host heartbeat failed (non-fatal): {e}")
 
 
+def _enrich_metrics(results):
+    """Compose per-VM metrics for healthy VMs and mirror them into the probe
+    results in place, so the Prometheus exporter (/metrics, scraped by ADOT →
+    AMP) always sees fresh gauges — independent of whether _write_ddb decides
+    to skip the DDB write on this tick (T3-5).
+
+    Skipped for down/recovering/migrating VMs so their last-known metrics are
+    kept rather than overwritten with zeros (which would mask the failure).
+    Also keeps _sample_cpu_pct's rolling baseline advancing every tick.
+    """
+    for tid, info in results.items():
+        if info.get("vm_health") != "up":
+            continue
+        sock_file = os.path.join(VM_DIR, tid, "fc.sock")
+        data_file = os.path.join(VM_DIR, tid, "data.ext4")
+        cfg_file = os.path.join(VM_DIR, tid, "vm.json")
+        vm_mem_mb = 4096
+        vm_vcpu = 1
+        try:
+            with open(cfg_file, encoding="utf-8") as f:
+                cfg = json.load(f)
+                vm_mem_mb = cfg.get("mem_mb", 4096)
+                vm_vcpu = cfg.get("vcpu", 1) or 1
+        except Exception:
+            pass
+        try:
+            info["metrics"] = _compose_metrics(
+                tid, vm_mem_mb, sock_file, data_file,
+                fc_pid=info.get("fc_pid"), vcpu=vm_vcpu)
+        except Exception as e:
+            print(f"compose_metrics {tid}: {e}")
+
+
 def _write_ddb(results):
-    """Update tenant health in DynamoDB. Promote creating → running when VM is up."""
-    if not TENANTS_TABLE or not results:
+    """Update tenant health in DynamoDB. Promote creating → running when VM is up.
+
+    T3-5 write-amplification fix: only touches DDB when a tenant's
+    (vm_health, app_health) changed since its last successful write, or when
+    the OC_AGENT_DDB_REFRESH liveness timer elapsed. The SSH token read + the
+    creating→running conditional promote run only until a tenant is in
+    _promoted. Metrics are composed by _enrich_metrics in the poll loop, so
+    this function just reads info["metrics"].
+    """
+    if not TENANTS_TABLE:
+        return
+    if not results:
+        # No VMs on this host — every tracked tenant is gone; GC and bail
+        # (no table round-trip needed).
+        _promoted.clear()
+        _last_ddb_write.clear()
         return
     table = _get_ddb().Table(TENANTS_TABLE)
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    seen = set()
     for tid, info in results.items():
-        # Compute per-VM metrics for healthy VMs (issue #3).
-        # Skipped for down/recovering VMs to keep their last-known metrics
-        # rather than overwriting with zeros (which would mask the failure).
-        metrics = None
-        if info["vm_health"] == "up":
-            sock_file = os.path.join(VM_DIR, tid, "fc.sock")
-            data_file = os.path.join(VM_DIR, tid, "data.ext4")
-            cfg_file = os.path.join(VM_DIR, tid, "vm.json")
-            vm_mem_mb = 4096
-            vm_vcpu = 1
-            try:
-                with open(cfg_file, encoding="utf-8") as f:
-                    cfg = json.load(f)
-                    vm_mem_mb = cfg.get("mem_mb", 4096)
-                    vm_vcpu = cfg.get("vcpu", 1) or 1
-            except Exception:
-                pass
-            fc_pid = info.get("fc_pid")
-            try:
-                metrics = _compose_metrics(tid, vm_mem_mb, sock_file, data_file,
-                                           fc_pid=fc_pid, vcpu=vm_vcpu)
-            except Exception as e:
-                print(f"compose_metrics {tid}: {e}")
-            # Mirror computed metrics back into the in-memory snapshot so
-            # the Prometheus exporter (/metrics endpoint scraped by ADOT
-            # → AMP) sees the actual per-VM gauges. Without this only
-            # vm_health was being exposed, leaving openclaw_vm_memory_used_mb
-            # / disk_used_mb / disk_used_pct etc. empty in AMP. (Companion
-            # fix to the 8899/9090 port-mismatch — both shipped 1.2.5.)
-            if metrics is not None:
-                info["metrics"] = metrics
+        seen.add(tid)
+        metrics = info.get("metrics") if info.get("vm_health") == "up" else None
 
-        try:
-            if info["vm_health"] == "up":
-                # Promote creating → running + read gateway token
-                token = _read_gateway_token(info["guest_ip"])
-                if not token:
-                    continue  # Wait for SSH/gateway to be ready
-                # NOTE: `metrics` is a DynamoDB reserved keyword, so it must be
-                # referenced via an ExpressionAttributeNames placeholder (#m).
-                # Same for `status` (#s, already aliased). Without #m the
-                # update_item call returns ValidationException and the tenant
-                # never gets promoted to running.
-                update_expr = ("SET #s = :r, vm_health = :vh, app_health = :ah, "
-                               "health_failures = :z, last_health_check = :t, "
-                               "updated_at = :t, gateway_token = :tk, #m = :m")
-                update_vals = {
-                    ":r": "running", ":c": "creating",
-                    ":vh": info["vm_health"], ":ah": info["app_health"],
-                    ":z": 0, ":t": now, ":tk": token,
-                    ":m": metrics or {},
-                }
+        # Promote-once: attempt the SSH token read + creating→running write
+        # only while the tenant hasn't been confirmed past `creating`.
+        if info["vm_health"] == "up" and tid not in _promoted:
+            token = _read_gateway_token(info["guest_ip"])
+            if not token:
+                continue  # Gateway not ready yet — retry next tick, stay un-promoted
+            try:
                 table.update_item(
                     Key={"id": tid},
-                    UpdateExpression=update_expr,
+                    UpdateExpression=(
+                        "SET #s = :r, vm_health = :vh, app_health = :ah, "
+                        "health_failures = :z, last_health_check = :t, "
+                        "updated_at = :t, gateway_token = :tk, #m = :m"),
                     ConditionExpression="#s = :c",
                     ExpressionAttributeNames={"#s": "status", "#m": "metrics"},
-                    ExpressionAttributeValues=update_vals,
+                    ExpressionAttributeValues={
+                        ":r": "running", ":c": "creating",
+                        ":vh": info["vm_health"], ":ah": info["app_health"],
+                        ":z": 0, ":t": now, ":tk": token,
+                        ":m": metrics or {},
+                    },
                 )
-                print(f"promoted {tid} creating → running (token={'yes' if token else 'no'})")
+                print(f"promoted {tid} creating → running")
+                _promoted.add(tid)
+                _last_ddb_write[tid] = (info["vm_health"], info["app_health"], time.monotonic())
+            except table.meta.client.exceptions.ConditionalCheckFailedException:
+                # Already running — the promote write was a no-op. Mark promoted
+                # and fall through to the steady-state writer to refresh health.
+                _promoted.add(tid)
+            except Exception as e:
+                print(f"ddb promote {tid}: {e}")
+                continue
+            else:
+                continue  # promote wrote everything; nothing more to do this tick
+
+        # Steady-state: write only on state change or when the refresh timer
+        # elapsed. Keeps a stable tenant at 1 write / _DDB_REFRESH instead of
+        # 2 writes / poll while never breaching the staleness watchdog.
+        state = (info["vm_health"], info["app_health"])
+        prev = _last_ddb_write.get(tid)
+        due = (prev is None
+               or prev[:2] != state
+               or (time.monotonic() - prev[2]) >= _DDB_REFRESH)
+        if not due:
+            continue
+
+        try:
+            if metrics is not None:
+                # `metrics` is a DDB reserved keyword — alias via #m.
+                table.update_item(
+                    Key={"id": tid},
+                    UpdateExpression=("SET vm_health = :vh, app_health = :ah, "
+                                      "last_health_check = :t, #m = :m"),
+                    ExpressionAttributeNames={"#m": "metrics"},
+                    ExpressionAttributeValues={
+                        ":vh": info["vm_health"], ":ah": info["app_health"],
+                        ":t": now, ":m": metrics,
+                    },
+                )
             else:
                 table.update_item(
                     Key={"id": tid},
@@ -428,33 +503,18 @@ def _write_ddb(results):
                         ":vh": info["vm_health"], ":ah": info["app_health"], ":t": now,
                     },
                 )
-        except table.meta.client.exceptions.ConditionalCheckFailedException:
-            # Not in creating status — already running. Refresh health + metrics.
-            try:
-                if metrics is not None:
-                    # `metrics` is a DDB reserved keyword — alias via #m.
-                    table.update_item(
-                        Key={"id": tid},
-                        UpdateExpression=("SET vm_health = :vh, app_health = :ah, "
-                                          "last_health_check = :t, #m = :m"),
-                        ExpressionAttributeNames={"#m": "metrics"},
-                        ExpressionAttributeValues={
-                            ":vh": info["vm_health"], ":ah": info["app_health"],
-                            ":t": now, ":m": metrics,
-                        },
-                    )
-                else:
-                    table.update_item(
-                        Key={"id": tid},
-                        UpdateExpression="SET vm_health = :vh, app_health = :ah, last_health_check = :t",
-                        ExpressionAttributeValues={
-                            ":vh": info["vm_health"], ":ah": info["app_health"], ":t": now,
-                        },
-                    )
-            except Exception as e:
-                print(f"ddb update {tid}: {e}")
+            _last_ddb_write[tid] = (state[0], state[1], time.monotonic())
         except Exception as e:
+            # Never-raise: leave _last_ddb_write untouched so the next tick retries.
             print(f"ddb update {tid}: {e}")
+
+    # GC per-tenant state for VMs no longer present (deleted / migrated away),
+    # so a recreated tenant with the same id re-runs the SSH promote and the
+    # dicts don't grow unboundedly.
+    for gone in _promoted - seen:
+        _promoted.discard(gone)
+    for gone in set(_last_ddb_write) - seen:
+        _last_ddb_write.pop(gone, None)
 
 
 # ═══════════════════════════════════════════
@@ -807,6 +867,9 @@ def _poll_loop():
             # don't suppress the host-level liveness signal.
             _write_host_heartbeat()
             results = _probe_all()
+            # Compose metrics every tick (T3-5) so /metrics keeps 15s
+            # resolution even on ticks where the DDB write is throttled.
+            _enrich_metrics(results)
             ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             with _lock:
                 _status.clear()

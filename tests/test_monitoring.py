@@ -375,23 +375,38 @@ class TestSampleCpuPct:
 # ═══════════════════════════════════════════
 
 
+_METRICS = {
+    "memory_used_mb": 2048, "memory_balloon_mib": 0,
+    "disk_used_mb": 100, "disk_total_mb": 8192,
+    "disk_used_pct": 1, "cpu_pct": 0,
+}
+
+
+def _up(guest_ip="172.16.1.2", with_metrics=True):
+    """A probe result for a healthy VM, metrics pre-composed the way
+    _enrich_metrics does before _write_ddb runs (T3-5)."""
+    info = {"vm_health": "up", "app_health": "up", "guest_ip": guest_ip}
+    if with_metrics:
+        info["metrics"] = dict(_METRICS)
+    return info
+
+
 class TestWriteMetricsToDDB:
+    def setup_method(self):
+        # T3-5 module state must be reset between tests, like _CPU_SAMPLES.
+        agent._promoted.clear()
+        agent._last_ddb_write.clear()
+
     @pytest.mark.unit
     def test_write_ddb_includes_metrics_field(self):
-        """When the VM is up and metrics are computed, DDB update should
-        carry a `metrics` map field."""
+        """When the VM is up (freshly promoted) and metrics were composed, the
+        DDB update carries a `metrics` map field."""
         agent.tenants_table = make_ddb_table()
         agent.TENANTS_TABLE = "test"
         with patch.object(agent, "_get_ddb") as mock_ddb_resource, \
-             patch.object(agent, "_compose_metrics", return_value={
-                 "memory_used_mb": 2048, "memory_balloon_mib": 0,
-                 "disk_used_mb": 100, "disk_total_mb": 8192,
-                 "disk_used_pct": 1, "cpu_pct": 0,
-             }), \
              patch.object(agent, "_read_gateway_token", return_value="token"):
             mock_ddb_resource.return_value.Table.return_value = agent.tenants_table
-            results = {"t1": {"vm_health": "up", "app_health": "up", "guest_ip": "172.16.1.2"}}
-            agent._write_ddb(results)
+            agent._write_ddb({"t1": _up()})
         # update_item should have been called with metrics in expression values
         calls = agent.tenants_table.update_item.call_args_list
         # Promotion path includes metrics
@@ -425,15 +440,9 @@ class TestWriteMetricsToDDB:
         agent.tenants_table = make_ddb_table()
         agent.TENANTS_TABLE = "test"
         with patch.object(agent, "_get_ddb") as mock_ddb_resource, \
-             patch.object(agent, "_compose_metrics", return_value={
-                 "memory_used_mb": 2048, "memory_balloon_mib": 0,
-                 "disk_used_mb": 100, "disk_total_mb": 8192,
-                 "disk_used_pct": 1, "cpu_pct": 0,
-             }), \
              patch.object(agent, "_read_gateway_token", return_value="token"):
             mock_ddb_resource.return_value.Table.return_value = agent.tenants_table
-            results = {"t1": {"vm_health": "up", "app_health": "up", "guest_ip": "172.16.1.2"}}
-            agent._write_ddb(results)
+            agent._write_ddb({"t1": _up()})
         for c in agent.tenants_table.update_item.call_args_list:
             ue = c.kwargs.get("UpdateExpression", "") or ""
             ean = c.kwargs.get("ExpressionAttributeNames", {}) or {}
@@ -460,6 +469,7 @@ class TestWriteMetricsToDDB:
     def test_write_ddb_skips_metrics_when_health_down(self):
         """When VM is down, no metrics; just health flag."""
         agent.tenants_table = make_ddb_table()
+        agent.TENANTS_TABLE = "test"
         with patch.object(agent, "_get_ddb") as mock_ddb_resource:
             mock_ddb_resource.return_value.Table.return_value = agent.tenants_table
             results = {"t1": {"vm_health": "down", "app_health": "down", "guest_ip": "172.16.1.2"}}
@@ -468,6 +478,149 @@ class TestWriteMetricsToDDB:
         for c in agent.tenants_table.update_item.call_args_list:
             ue = c.kwargs.get("UpdateExpression", "")
             assert "metrics" not in ue
+
+
+# ══════════════════════════════════════════════════════════════════════
+# T3-5 — write-amplification reduction (promote-once + throttled writes)
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestWriteAmplification:
+    """The old agent did, per stable VM per 15s tick: 1 SSH (token discarded),
+    1 guaranteed-to-fail conditional promote (still burns WCU), and 1 real
+    health write. T3-5 makes the SSH+promote happen once and throttles steady-
+    state writes to state-change-or-refresh. These tests pin that behavior and
+    the watchdog-staleness contract that makes it safe.
+    """
+
+    def setup_method(self):
+        agent._promoted.clear()
+        agent._last_ddb_write.clear()
+        agent.tenants_table = make_ddb_table()
+        agent.TENANTS_TABLE = "test"
+
+    def _run(self, results, token="token"):
+        with patch.object(agent, "_get_ddb") as mock_ddb_resource, \
+             patch.object(agent, "_read_gateway_token", return_value=token) as ssh:
+            mock_ddb_resource.return_value.Table.return_value = agent.tenants_table
+            agent._write_ddb(results)
+        return ssh
+
+    @pytest.mark.unit
+    def test_first_tick_promotes_and_reads_token(self):
+        """First sighting of an up VM: one SSH + one promote write, tid marked
+        promoted, last-write state seeded."""
+        ssh = self._run({"t1": _up()})
+        assert ssh.call_count == 1
+        assert agent.tenants_table.update_item.call_count == 1
+        assert "t1" in agent._promoted
+        assert agent._last_ddb_write["t1"][:2] == ("up", "up")
+
+    @pytest.mark.unit
+    def test_steady_state_identical_results_skip_ssh_and_write(self):
+        """Second consecutive up/up tick: NO SSH, NO update_item — the whole
+        point of the fix."""
+        self._run({"t1": _up()})           # promote
+        agent.tenants_table.reset_mock()
+        ssh = self._run({"t1": _up()})     # steady state, timer not elapsed
+        ssh.assert_not_called()
+        agent.tenants_table.update_item.assert_not_called()
+
+    @pytest.mark.unit
+    def test_refresh_timer_forces_a_liveness_write(self):
+        """After OC_AGENT_DDB_REFRESH seconds, a stable tenant is re-stamped
+        once — no SSH, no ConditionExpression (not a promote)."""
+        self._run({"t1": _up()})
+        # Age the last-write timestamp past the refresh window.
+        vh, ah, ts = agent._last_ddb_write["t1"]
+        agent._last_ddb_write["t1"] = (vh, ah, ts - agent._DDB_REFRESH - 1)
+        agent.tenants_table.reset_mock()
+        ssh = self._run({"t1": _up()})
+        ssh.assert_not_called()
+        assert agent.tenants_table.update_item.call_count == 1
+        c = agent.tenants_table.update_item.call_args
+        assert "last_health_check" in c.kwargs["UpdateExpression"]
+        assert "ConditionExpression" not in c.kwargs
+
+    @pytest.mark.unit
+    def test_state_change_triggers_immediate_write(self):
+        """up→down within the refresh window still writes immediately (a real
+        health transition must not wait for the timer)."""
+        self._run({"t1": _up()})
+        agent.tenants_table.reset_mock()
+        self._run({"t1": {"vm_health": "down", "app_health": "down", "guest_ip": "172.16.1.2"}})
+        assert agent.tenants_table.update_item.call_count == 1
+        assert agent._last_ddb_write["t1"][:2] == ("down", "down")
+
+    @pytest.mark.unit
+    def test_conditional_check_failed_seeds_promoted(self):
+        """A VM already running (promote raises ConditionalCheckFailed) is still
+        marked promoted so subsequent ticks stop SSHing."""
+        agent.tenants_table.update_item.side_effect = \
+            agent.tenants_table.meta.client.exceptions.ConditionalCheckFailedException(
+                {"Error": {"Code": "ConditionalCheckFailedException"}}, "UpdateItem")
+        self._run({"t1": _up()})
+        assert "t1" in agent._promoted
+
+    @pytest.mark.unit
+    def test_empty_token_leaves_tenant_unpromoted(self):
+        """A still-booting gateway (empty token) must NOT be marked promoted —
+        the next tick retries the SSH."""
+        ssh = self._run({"t1": _up()}, token="")
+        assert ssh.call_count == 1
+        assert "t1" not in agent._promoted
+        agent.tenants_table.update_item.assert_not_called()
+
+    @pytest.mark.unit
+    def test_gc_evicts_absent_tenant_and_re_promotes(self):
+        """A tenant that disappears is GC'd from both dicts; if it reappears
+        with the same id, the SSH promote runs again."""
+        self._run({"t1": _up()})
+        assert "t1" in agent._promoted
+        self._run({})  # t1 gone → GC
+        assert "t1" not in agent._promoted
+        assert "t1" not in agent._last_ddb_write
+        ssh = self._run({"t1": _up()})  # reappears → re-promote
+        assert ssh.call_count == 1
+
+    @pytest.mark.unit
+    def test_failed_steady_write_is_retried_next_tick(self):
+        """If a steady-state write raises, _last_ddb_write is NOT updated so the
+        next tick retries (never-raise + no silent drop)."""
+        self._run({"t1": _up()})  # promote, seeds last-write
+        # Age past refresh so the next tick is due, then make the write fail.
+        vh, ah, ts = agent._last_ddb_write["t1"]
+        agent._last_ddb_write["t1"] = (vh, ah, ts - agent._DDB_REFRESH - 1)
+        stamp_before = agent._last_ddb_write["t1"][2]
+        agent.tenants_table.update_item.side_effect = Exception("Throttled")
+        self._run({"t1": _up()})
+        # Timestamp unchanged → next tick still considers it due.
+        assert agent._last_ddb_write["t1"][2] == stamp_before
+
+    @pytest.mark.unit
+    def test_refresh_default_below_stale_threshold(self):
+        """Cross-module contract guard: the agent's liveness refresh MUST stay
+        below the health_check watchdog's staleness threshold, or a stable
+        tenant would flap 'stale' every Lambda tick."""
+        spec = importlib.util.spec_from_file_location(
+            "hc_stale_probe", "deploy/lambda/health_check/handler.py")
+        hc = importlib.util.module_from_spec(spec)
+        with patch("boto3.resource", return_value=MagicMock()), \
+             patch("boto3.client", return_value=MagicMock()):
+            spec.loader.exec_module(hc)
+        assert agent._DDB_REFRESH < hc.STALE_SECONDS
+
+    @pytest.mark.unit
+    def test_metrics_freshness_independent_of_ddb_write(self):
+        """/metrics must reflect fresh gauges even on a tick where the DDB
+        write is skipped — _enrich_metrics runs every tick in the poll loop."""
+        results = {"t1": {"vm_health": "up", "app_health": "up",
+                          "guest_ip": "172.16.1.2", "fc_pid": 1234}}
+        with patch.object(agent, "_compose_metrics", return_value=dict(_METRICS)):
+            agent._enrich_metrics(results)
+        assert results["t1"]["metrics"] == _METRICS
+        text = agent._render_metrics_text(results)
+        assert "openclaw_vm_memory_used_mb{tenant=\"t1\"} 2048" in text
 
 
 

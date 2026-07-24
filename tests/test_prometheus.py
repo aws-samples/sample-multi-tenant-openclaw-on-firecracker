@@ -203,23 +203,32 @@ class TestPromExporter:
         # But health is still exported (0)
         assert 'openclaw_vm_health{tenant="t1"} 0' in text
 
-    def test_write_ddb_mirrors_metrics_back_into_status_for_prom_exporter(self):
-        """Regression for 1.2.5: per-VM metrics computed in _write_ddb()
-        must also be assigned back into the in-memory `info` dict so the
-        /metrics Prometheus endpoint (read from the same dict via _status)
-        actually exposes them. Before the fix only openclaw_vm_health was
-        ever scraped — every other gauge was empty in AMP because _status
-        only ever held the bare _probe_all() output."""
-        import inspect
-        src = inspect.getsource(agent._write_ddb)
-        # The function MUST assign metrics back into info before / alongside
-        # the DDB write. We don't care about the exact phrasing, only that
-        # the assignment exists.
-        assert "info[\"metrics\"] = metrics" in src or 'info["metrics"] = metrics' in src, (
-            "_write_ddb must mirror computed metrics back into info[] so the "
+    def test_enrich_metrics_mirrors_metrics_back_into_status_for_prom_exporter(self):
+        """Regression for 1.2.5: per-VM metrics must be assigned back into the
+        in-memory `info` dict so the /metrics Prometheus endpoint (read from
+        the same dict via _status) actually exposes them. Before the fix only
+        openclaw_vm_health was ever scraped — every other gauge was empty in
+        AMP because _status only ever held the bare _probe_all() output.
+
+        T3-5 moved the composition+mirror out of _write_ddb into _enrich_metrics
+        (called every poll tick, independent of the throttled DDB write) so the
+        gauges stay fresh even on ticks where no DDB write happens. Assert the
+        actual mirror BEHAVIOR rather than a source-string match."""
+        results = {"t1": {"vm_health": "up", "app_health": "up",
+                          "guest_ip": "172.16.1.2", "fc_pid": 1234}}
+        with patch.object(agent, "_compose_metrics", return_value={
+                "memory_used_mb": 2048, "memory_balloon_mib": 0,
+                "disk_used_mb": 100, "disk_total_mb": 8192,
+                "disk_used_pct": 1, "cpu_pct": 0}):
+            agent._enrich_metrics(results)
+        assert results["t1"].get("metrics", {}).get("memory_used_mb") == 2048, (
+            "_enrich_metrics must mirror computed metrics back into info[] so the "
             "Prometheus exporter sees them. See deploy/userdata/host-agent.py "
-            "comment block referencing 1.2.5 + the AMP scrape fix."
-        )
+            "comment block referencing 1.2.5 + the AMP scrape fix.")
+        # And it must be skipped for non-up VMs (keeps last-known, no zeros).
+        recovering = {"t2": {"vm_health": "recovering"}}
+        agent._enrich_metrics(recovering)
+        assert "metrics" not in recovering["t2"]
 
 
 @pytest.mark.unit

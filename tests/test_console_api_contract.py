@@ -260,3 +260,27 @@ class TestSkillPreviewSanitized:
         # returning it into the x-html sink.
         assert re.search(r"DOMPurify\.sanitize\s*\(", INDEX_HTML), \
             "renderMd does not sanitize markdown before x-html"
+
+
+# ═════════════════════════════════════════════
+# T2-8 operator endpoints wired (API + console)
+# ═════════════════════════════════════════════
+
+
+@pytest.mark.unit
+@pytest.mark.regression
+class TestOpsEndpointsWired:
+    def test_api_has_drain_and_failover_routes(self, handler):
+        import inspect
+        src = inspect.getsource(handler.lambda_handler)
+        assert '"/hosts/{instance_id}/drain"' in src, "drain route not registered"
+        assert '"/failover/{az}"' in src, "failover route not registered"
+
+    def test_console_calls_new_endpoints(self):
+        assert "cancel-migration" in INDEX_HTML, "console has no cancel-migration call"
+        assert re.search(r"hosts/'?\s*\+\s*\w+\s*\+\s*'/drain", INDEX_HTML) or \
+               "'/drain'" in INDEX_HTML or "/drain" in INDEX_HTML, "console has no drain call"
+        assert "failover/" in INDEX_HTML, "console has no failover call"
+
+    def test_console_has_inflight_panel(self):
+        assert "inflightMigrations" in INDEX_HTML, "no in-flight migrations panel"

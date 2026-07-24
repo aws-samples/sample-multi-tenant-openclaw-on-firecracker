@@ -691,6 +691,11 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 dead_letter_queue=events_dlq, retry_attempts=2)],
         )
 
+        # T2-8: the api Lambda's POST /failover/{az} invokes the health-check
+        # Lambda (which owns the AZ-failover routine) for manual evacuation.
+        api_fn.add_environment("HEALTH_CHECK_FUNCTION", health_fn.function_name)
+        health_fn.grant_invoke(api_fn)
+
         # ========== Skills Lambda ==========
         skills_fn = _lambda.Function(self, "Skills",
             function_name="openclaw-skills",

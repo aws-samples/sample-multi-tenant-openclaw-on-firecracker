@@ -560,12 +560,23 @@ def delete_skill(name):
         return _resp(500, {"error": str(e)})
 
 
+# T2-8: destructive fleet-wide actions require admin, not just operator.
+_ADMIN_ONLY = {
+    ("POST", "/failover/{az}"),
+}
+
+
 def _rbac_check(event, method, resource):
     """Return None if allowed, else a 403 response."""
     if not RBAC_ENABLED:
         return None  # role-gating disabled — all routes open
     role = _get_user_role(event)
-    needed = "viewer" if (method, resource) in _VIEWER_OK else "operator"
+    if (method, resource) in _ADMIN_ONLY:
+        needed = "admin"
+    elif (method, resource) in _VIEWER_OK:
+        needed = "viewer"
+    else:
+        needed = "operator"
     if not _role_satisfies(role, needed):
         return _resp(403, {
             "error": "forbidden",
@@ -614,6 +625,13 @@ def lambda_handler(event, context):
         ("GET", "/audit-log"): lambda: _list_audit_log(event.get("queryStringParameters") or {}),
         ("DELETE", "/hosts/{instance_id}"): lambda: deregister_host(
             path_params["instance_id"]
+        ),
+        # T2-8: operator endpoints — graceful host drain + manual AZ failover.
+        ("POST", "/hosts/{instance_id}/drain"): lambda: drain_host(
+            path_params["instance_id"], event.get("body")
+        ),
+        ("POST", "/failover/{az}"): lambda: trigger_failover(
+            path_params["az"], event.get("body")
         ),
         # 1.4.0 (#62) — per-tenant / per-group skill scoping
         ("GET", "/groups"): list_groups,
@@ -1020,6 +1038,31 @@ def tenant_action(tenant_id, action, body=None):
     item = tenants_table.get_item(Key={"id": tenant_id}).get("Item")
     if not item:
         return _resp(404, {"error": "tenant not found"})
+
+    # ── T2-8: cancel an in-flight migration ──
+    # Only valid while migrating. The migrate sweep flips host_id ONLY at the
+    # final step, so until then the source VM is still running and untouched —
+    # cancel = revert status to running + clear the async context (same end
+    # state as _rollback_migration in the sweep). If the sweep already flipped
+    # host_id, the migration completed and there's nothing to cancel.
+    if action == "cancel-migration":
+        if item.get("status") != "migrating":
+            return _resp(409, {"error": f"tenant is {item.get('status')}, not migrating"})
+        tenants_table.update_item(
+            Key={"id": tenant_id},
+            UpdateExpression=(
+                "SET #s = :r, migration_failed = :reason, updated_at = :t "
+                "REMOVE migration_target, migration_target_vm_num, migration_source, "
+                "migration_snap_cmd, migration_restore_cmd, migration_phase, "
+                "migration_mode, migration_started_at, migration_snapshot_uri"
+            ),
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":r": "running", ":reason": "cancelled by operator", ":t": _now()},
+        )
+        _publish_event("migration.cancelled", tenant_id, {})
+        return _resp(200, {"id": tenant_id, "status": "running",
+                           "message": "migration cancelled; tenant remains on source host"})
 
     # ── Issue #16: live VM resize (hot-add vCPU) ──
     if action == "resize":
@@ -1484,6 +1527,76 @@ def deregister_host(instance_id):
     except Exception as e:
         print(f"Failed to terminate {instance_id}: {e}")
     return _resp(200, {"instance_id": instance_id, "status": "draining"})
+
+
+def drain_host(instance_id, body=None):
+    """T2-8: gracefully evacuate a host before decommissioning it.
+
+    Unlike deregister_host (which terminates immediately → cleanup_terminated_host
+    HARD-DELETES every tenant on it), drain migrates each running tenant off to
+    another host first, then marks the host draining. The operator terminates
+    only once it's empty. Migration is async (202 each), so this returns the set
+    of migrations it kicked off; the caller polls the tenants until they land.
+    """
+    host = hosts_table.get_item(Key={"instance_id": instance_id}).get("Item")
+    if not host:
+        return _resp(404, {"error": f"host {instance_id} not found"})
+    tenants = _scan_all(
+        tenants_table,
+        FilterExpression="host_id = :h AND #s = :r",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":h": instance_id, ":r": "running"},
+    )
+    # Mark draining so the scheduler stops placing NEW tenants here while we move.
+    hosts_table.update_item(
+        Key={"instance_id": instance_id},
+        UpdateExpression="SET #s = :s, updated_at = :t",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":s": "draining", ":t": _now()},
+    )
+    started, failed = [], []
+    for t in tenants:
+        tid = t["id"]
+        vcpu, mem_mb = int(t.get("vcpu", 0)), int(t.get("mem_mb", 0))
+        target = _find_host(vcpu, mem_mb)
+        # _find_host excludes non-active/idle hosts, but not necessarily THIS
+        # draining one from a stale scan — guard explicitly.
+        if not target or target["instance_id"] == instance_id:
+            failed.append({"id": tid, "error": "no target host with capacity"})
+            continue
+        r = tenant_action(tid, "migrate", {"target_host_id": target["instance_id"]})
+        if r.get("statusCode") == 202:
+            started.append({"id": tid, "target": target["instance_id"]})
+        else:
+            failed.append({"id": tid, "error": json.loads(r.get("body", "{}")).get("error", "migrate failed")})
+    _audit_system("host.drain_started", f"host:{instance_id}", instance_id,
+                  actor="api", detail={"migrations": started, "failed": failed})
+    return _resp(202 if started or not tenants else 409, {
+        "instance_id": instance_id, "status": "draining",
+        "migrations_started": started, "failed": failed,
+        "message": ("host will be empty once migrations complete; terminate it "
+                    "then (DELETE /hosts/{id}) — it will NOT hard-delete tenants"),
+    })
+
+
+def trigger_failover(az, body=None):
+    """T2-8: manually trigger AZ evacuation without waiting for the 10-min
+    auto-detection. The health_check Lambda owns the failover routine, so we
+    invoke it — it re-detects and evacuates any unhealthy AZ. (A targeted
+    single-AZ force is a future refinement; today this kicks the same sweep.)"""
+    fn = os.environ.get("HEALTH_CHECK_FUNCTION", "")
+    if not fn:
+        return _resp(501, {"error": "manual failover unavailable "
+                                    "(HEALTH_CHECK_FUNCTION not configured)"})
+    try:
+        boto3.client("lambda").invoke(
+            FunctionName=fn, InvocationType="Event",
+            Payload=json.dumps({"manual_failover_az": az}).encode())
+    except Exception as e:
+        return _resp(502, {"error": f"failed to invoke health check: {e}"})
+    _audit_system("az.failover_requested", f"az:{az}", az, actor="api")
+    return _resp(202, {"az": az, "status": "failover_triggered",
+                       "message": "health-check sweep invoked; poll tenants for recovery"})
 
 
 def cleanup_terminated_host(event):
@@ -2387,10 +2500,13 @@ _AUDIT_EVENT_MAP = {
     ("DELETE", "/skills/{name}"): "skill.deleted",
     ("PUT", "/templates/{name}"): "template.updated",
     ("DELETE", "/templates/{name}"): "template.deleted",
+    ("POST", "/hosts/{instance_id}/drain"): "host.drain_started",
+    ("POST", "/failover/{az}"): "az.failover_requested",
 }
 # Per-action event names for POST /tenants/{id}/{action}.
 _AUDIT_ACTION_MAP = {
     "migrate": "vm.migrate_requested",
+    "cancel-migration": "vm.migrate_cancelled",
     "backup": "backup.created",
     "resize": "tenant.resized",
     "resize-disk": "tenant.disk_resized",

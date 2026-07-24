@@ -87,11 +87,11 @@ def _stale_host(iid, az, seconds_stale=3600):
             "last_health_check": _ago(seconds_stale)}
 
 
-def _healthy_host(iid, az, total_vcpu=16):
+def _healthy_host(iid, az, total_vcpu=16, total_mem_mb=65536):
     return {"instance_id": iid, "az": az, "status": "active",
             "last_health_check": _ago(5), "total_vcpu": total_vcpu,
-            "used_vcpu": 0, "vm_count": 0, "next_vm_num": 1,
-            "private_ip": "10.0.0.9"}
+            "total_mem_mb": total_mem_mb, "used_vcpu": 0, "used_mem_mb": 0,
+            "vm_count": 0, "next_vm_num": 1, "private_ip": "10.0.0.9"}
 
 
 def _tenant(tid, host_id, vcpu=2):

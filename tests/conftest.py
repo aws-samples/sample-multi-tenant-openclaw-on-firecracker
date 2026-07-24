@@ -21,8 +21,16 @@ def pytest_configure(config):
     developer's real config.yml is left untouched.
     """
     import os as _os
+    import sys as _sys
     here = _os.path.dirname(_os.path.abspath(__file__))
     repo_root = _os.path.dirname(here)
+    # T3-3: handlers are loaded by file path (importlib.spec_from_file_location)
+    # and now do `from common import ...`. Put deploy/lambda on sys.path so that
+    # import resolves in-tree (at deploy runtime `common/` is copied next to the
+    # handler by stack._stage_lambda_asset, so no path hack is needed there).
+    lambda_dir = _os.path.join(repo_root, "deploy", "lambda")
+    if lambda_dir not in _sys.path:
+        _sys.path.insert(0, lambda_dir)
     cfg = _os.path.join(repo_root, "config.yml")
     example = _os.path.join(repo_root, "config.yml.example")
     if not _os.path.exists(cfg) and _os.path.exists(example):

@@ -311,3 +311,45 @@ class TestIamScoping:
                 if "cloudformation:DescribeStacks" in actions:
                     assert stmt.get("Resource") != "*", \
                         "cloudformation:DescribeStacks left on bare *"
+
+
+# ═══════════════════════════════════════════
+# T3-3 — shared common/ lib staging + failover overcommit env
+# ═══════════════════════════════════════════
+
+
+class TestSharedLibStaging:
+    @pytest.mark.unit
+    def test_health_fn_has_overcommit_env(self, synthesized_template):
+        """The failover placer now shares capacity math with the API scheduler,
+        so the health_check Lambda must receive the overcommit ratios + VM cap
+        it previously lacked (else it silently fell back to 1.0/1.0/0)."""
+        fns = synthesized_template.find_resources("AWS::Lambda::Function")
+        health = next(f for f in fns.values()
+                      if f["Properties"].get("FunctionName") == "openclaw-health-check")
+        env = health["Properties"]["Environment"]["Variables"]
+        for k in ("CPU_OVERCOMMIT_RATIO", "MEM_OVERCOMMIT_RATIO", "MAX_VMS_PER_HOST"):
+            assert k in env, f"health_check Lambda missing {k} (T3-3)"
+
+    @pytest.mark.unit
+    def test_failover_worker_has_overcommit_env(self, synthesized_template):
+        fns = synthesized_template.find_resources("AWS::Lambda::Function")
+        worker = next(f for f in fns.values()
+                      if f["Properties"].get("FunctionName") == "openclaw-failover-worker")
+        env = worker["Properties"]["Environment"]["Variables"]
+        for k in ("CPU_OVERCOMMIT_RATIO", "MEM_OVERCOMMIT_RATIO", "MAX_VMS_PER_HOST"):
+            assert k in env, f"failover worker missing {k} (T3-3)"
+
+    @pytest.mark.unit
+    def test_common_staged_into_each_lambda_asset(self):
+        """_stage_lambda_asset must copy common/ next to every handler that
+        imports it, so `from common import ...` resolves at runtime."""
+        import pathlib
+
+        import stack as _stack
+        for name in ("api", "health_check", "scaler", "backup"):
+            dest = _stack._stage_lambda_asset(name)
+            common = pathlib.Path(dest) / "common"
+            assert common.is_dir(), f"common/ not staged into {name} asset"
+            assert (common / "capacity.py").is_file()
+            assert (common / "ddb.py").is_file()

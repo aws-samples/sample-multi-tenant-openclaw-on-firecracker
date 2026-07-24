@@ -5,6 +5,7 @@ import os
 import time
 
 import boto3
+from common import ddb as _ddb_helpers
 
 ssm = boto3.client("ssm")
 ddb = boto3.resource("dynamodb")
@@ -14,19 +15,10 @@ PREFIX = os.environ.get("BACKUP_PREFIX", "backups")
 
 
 def _scan_all(table, **kwargs):
-    """Fully scan a DynamoDB table, following LastEvaluatedKey (T2-6).
+    """Thin wrapper over the shared paginating scan (T3-3)."""
+    return _ddb_helpers.scan_all(table, **kwargs)
 
-    A bare Table.scan() truncates at the 1 MB (~500-1000 row) page, so past
-    that the sweep silently stops seeing rows. This loops until exhausted;
-    all scan kwargs are forwarded to every page. No ExclusiveStartKey arg.
-    """
-    items = []
-    resp = table.scan(**kwargs)
-    items.extend(resp.get("Items", []))
-    while resp.get("LastEvaluatedKey"):
-        resp = table.scan(ExclusiveStartKey=resp["LastEvaluatedKey"], **kwargs)
-        items.extend(resp.get("Items", []))
-    return items
+
 def lambda_handler(event, context):
     """Triggered by EventBridge schedule or API Gateway (manual backup)."""
     # Manual single-tenant backup via API

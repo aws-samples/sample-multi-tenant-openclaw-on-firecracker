@@ -10,6 +10,8 @@ import time
 
 import boto3
 from botocore.exceptions import ClientError
+from common import capacity as _capacity
+from common import ddb as _ddb_helpers
 
 ssm = boto3.client("ssm")
 s3 = boto3.client("s3")
@@ -94,20 +96,11 @@ RBAC_ENABLED = os.environ.get("RBAC_ENABLED", "false").lower() == "true"
 def _scan_all(table, **kwargs):
     """Fully scan a DynamoDB table, following LastEvaluatedKey (T2-6).
 
-    boto3 Table.scan() returns at most 1 MB per call, so a bare .scan()
-    silently truncates once the control plane grows past a single page
-    (~500-1000 rows) — e.g. the health watchdog would stop monitoring tenants
-    beyond page 1. This loops until the table is exhausted. All scan kwargs
-    (FilterExpression, ExpressionAttributeNames/Values, ...) are forwarded to
-    every page. Callers MUST NOT pass ExclusiveStartKey.
+    Thin wrapper over the shared helper (T3-3) — kept as a module-level name so
+    the ~30 tests that monkeypatch `api_handler._scan_all` / assert on it stay
+    unchanged.
     """
-    items = []
-    resp = table.scan(**kwargs)
-    items.extend(resp.get("Items", []))
-    while resp.get("LastEvaluatedKey"):
-        resp = table.scan(ExclusiveStartKey=resp["LastEvaluatedKey"], **kwargs)
-        items.extend(resp.get("Items", []))
-    return items
+    return _ddb_helpers.scan_all(table, **kwargs)
 
 
 # Lazily-built, module-cached JWKS client. Cognito rotates signing keys
@@ -1136,18 +1129,19 @@ def tenant_action(tenant_id, action, body=None):
         if target.get("status") in ("draining", "deleted"):
             return _resp(409, {"error": f"target host {target_host_id} is {target['status']}"})
 
-        # Capacity check — same allocatable formula as _find_host().
+        # Capacity check — unified with the scheduler (T3-3). Using _host_fits
+        # here (rather than the old inline free-only math) also enforces
+        # MAX_VMS_PER_HOST on migration targets, which the previous inline copy
+        # silently skipped.
         vcpu = int(item.get("vcpu", 0))
         mem_mb = int(item.get("mem_mb", 0))
-        allocatable_vcpu = int(int(target["total_vcpu"]) * CPU_OVERCOMMIT_RATIO)
-        free_vcpu = allocatable_vcpu - int(target.get("used_vcpu", 0))
-        allocatable_mem = int(int(target["total_mem_mb"]) * MEM_OVERCOMMIT_RATIO)
-        free_mem = allocatable_mem - int(target.get("used_mem_mb", 0))
-        if free_vcpu < vcpu or free_mem < mem_mb:
+        if not _host_fits(target, vcpu, mem_mb):
+            free_vcpu, free_mem = _host_free(target)
             return _resp(409, {"error": (
                 f"target host has insufficient capacity "
                 f"(free vcpu={free_vcpu}, free mem={free_mem}MB; "
-                f"need vcpu={vcpu}, mem={mem_mb}MB)"
+                f"need vcpu={vcpu}, mem={mem_mb}MB; "
+                f"vm_count={int(target.get('vm_count', 0))}, max={MAX_VMS_PER_HOST or 'none'})"
             )})
 
         vm_num = int(item.get("vm_num", 1))
@@ -1943,26 +1937,17 @@ def _scale_out():
 
 def _host_free(h):
     """Return (free_vcpu, free_mem_mb) for a host, applying the overcommit
-    ratios to its total capacity. The same math was copy-pasted across
-    _find_host, _get_specific_host_with_capacity, the migrate capacity check,
-    and the resize check — centralize it so the allocatable formula stays
-    consistent everywhere."""
-    allocatable_vcpu = int(int(h["total_vcpu"]) * CPU_OVERCOMMIT_RATIO)
-    free_vcpu = allocatable_vcpu - int(h.get("used_vcpu", 0))
-    allocatable_mem = int(int(h["total_mem_mb"]) * MEM_OVERCOMMIT_RATIO)
-    free_mem = allocatable_mem - int(h.get("used_mem_mb", 0))
-    return free_vcpu, free_mem
+    ratios to its total capacity. Delegates to the shared capacity module
+    (T3-3) so the API scheduler and AZ-failover placer agree on the math."""
+    return _capacity.host_free(h, CPU_OVERCOMMIT_RATIO, MEM_OVERCOMMIT_RATIO)
 
 
 def _host_fits(h, vcpu_needed, mem_needed):
     """True if a host can take a VM of this size — free capacity AND, when
     configured, the absolute per-host VM ceiling (issue #77)."""
-    free_vcpu, free_mem = _host_free(h)
-    if free_vcpu < vcpu_needed or free_mem < mem_needed:
-        return False
-    if MAX_VMS_PER_HOST and int(h.get("vm_count", 0)) >= MAX_VMS_PER_HOST:
-        return False
-    return True
+    return _capacity.host_fits(h, vcpu_needed, mem_needed,
+                               CPU_OVERCOMMIT_RATIO, MEM_OVERCOMMIT_RATIO,
+                               MAX_VMS_PER_HOST)
 
 
 def _find_host(vcpu_needed, mem_needed):

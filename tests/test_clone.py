@@ -73,8 +73,11 @@ class TestCloneSuccess:
         api.hosts_table = make_ddb_table()
         # Source tenant exists and is running
         api.tenants_table.get_item.return_value = {"Item": _running_tenant("src", "i-1", 1)}
-        # Hosts scan returns the source's host with capacity
+        # Hosts scan returns the source's host with capacity (used by _find_host)
         api.hosts_table.scan.return_value = {"Items": [_host()]}
+        # T2-7: same-host clone resolves the source host via get_item (PK lookup)
+        # instead of a full scan, so stub it too.
+        api.hosts_table.get_item.return_value = {"Item": _host()}
 
     @pytest.mark.unit
     def test_clone_creates_new_tenant_201(self):
@@ -197,6 +200,7 @@ class TestCloneFailureIsolation:
         api.hosts_table = make_ddb_table()
         api.tenants_table.get_item.return_value = {"Item": _running_tenant("src", "i-1", 1)}
         api.hosts_table.scan.return_value = {"Items": [_host()]}
+        api.hosts_table.get_item.return_value = {"Item": _host()}  # T2-7 PK lookup
 
     @pytest.mark.unit
     def test_clone_data_script_failure_returns_502(self):

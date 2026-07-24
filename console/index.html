@@ -10,6 +10,9 @@
 <!-- 1.4.1 (#63) — Marked for SKILL.md preview rendering. Tiny (~30KB), no
      bundler needed, fits the existing Alpine.js / no-build approach. -->
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<!-- DOMPurify sanitizes the marked() output before it hits the x-html sink in
+     the skill preview (stored-XSS defense). Pinned + SRI, like Alpine below. -->
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.7/dist/purify.min.js" integrity="sha384-XQqX/4yiUGu+oyr87jvWzRuqBUK/adrY0DunhL+tID9m/9dwSpV8h9Fk/Sg6ifVQ" crossorigin="anonymous"></script>
 <script>
 // Cognito OAuth2 implicit flow (skip if not configured)
 (function() {
@@ -129,6 +132,9 @@
               <svg class="icon s12"><use href="#i-globe"/></svg>
               <span x-text="grp.az"></span>
               <span style="color:var(--gray)" x-text="' · '+grp.hosts.length+' host(s) · '+grp.hosts.reduce((s,h)=>s+(h.vm_count||0),0)+' VM(s)'"></span>
+              <!-- T2-8: manual AZ failover (admin) -->
+              <button x-show="canWrite()" class="btn btn-outline btn-sm" style="margin-left:auto"
+                      title="Evacuate this AZ now (admin)" @click.stop="triggerFailover(grp.az)">Failover</button>
             </div>
           </template>
           <template x-for="h in grp.hosts" :key="h.instance_id">
@@ -164,6 +170,14 @@
                 <span style="color:#fff" x-text="h.vm_count"></span>
                 <span style="margin-left:auto;font-size:11px;color:var(--gray)" x-text="h.rootfs_version||''"></span>
               </div>
+              <!-- T2-8: drain migrates every tenant off before you terminate,
+                   instead of decommission which hard-deletes them. -->
+              <div class="host-row" x-show="selectedHost === h.instance_id && canWrite()" style="margin-top:6px">
+                <button class="btn btn-outline btn-sm" style="width:100%"
+                        title="Migrate all tenants off this host, then it's safe to terminate"
+                        @click.stop="drainHost(h.instance_id)"
+                        x-text="'Drain '+ (h.vm_count||0) +' VM(s)'"></button>
+              </div>
             </div>
           </template>
         </div>
@@ -179,6 +193,25 @@
           <span style="font-size:13px;color:var(--green)">⚡ AgentCore</span>
           <span style="font-size:11px;color:var(--gray)">enabled</span>
           <a :href="'https://'+agentcoreRegion+'.console.aws.amazon.com/cloudwatch/home?region='+agentcoreRegion+'#dashboards'" target="_blank" style="font-size:11px;color:var(--cyan);margin-left:8px">📊 CloudWatch</a>
+        </div>
+      </template>
+
+      <!-- T2-8: In-flight migrations panel — visible only while something is
+           mid-migration; shows phase + elapsed and a Cancel for a wedged one. -->
+      <template x-if="inflightMigrations.length">
+        <div class="section-card mini-panel" style="border-color:#fa03;display:block">
+          <div style="font-size:13px;color:var(--yellow,#fa0);margin-bottom:6px">
+            ⇄ <span x-text="inflightMigrations.length"></span> in-flight migration(s)
+          </div>
+          <template x-for="m in inflightMigrations" :key="m.id">
+            <div style="display:flex;align-items:center;gap:8px;font-size:11px;font-family:monospace;padding:2px 0">
+              <span style="color:#fff" x-text="m.id"></span>
+              <span style="color:var(--gray)" x-text="m.mode+' · '+m.phase+' · '+m.elapsed"></span>
+              <span style="color:var(--cyan-dim)" x-text="m.source+' → '+m.target"></span>
+              <button x-show="canWrite()" class="btn btn-outline btn-sm" style="margin-left:auto"
+                      title="Abort — tenant stays on its source host" @click="cancelMigration(m.id)">Cancel</button>
+            </div>
+          </template>
         </div>
       </template>
 

@@ -238,3 +238,49 @@ class TestLogsTabWired:
         src = inspect.getsource(handler._audit_write)
         for field in ('"event"', '"object"', '"actor"'):
             assert field in src, f"_audit_write must record {field}"
+
+
+# ═════════════════════════════════════════════
+# XSS defense: skill markdown preview must be sanitized (T2-4)
+# ═════════════════════════════════════════════
+
+
+@pytest.mark.unit
+@pytest.mark.regression
+class TestSkillPreviewSanitized:
+    def test_dompurify_is_loaded(self):
+        assert "dompurify" in INDEX_HTML.lower(), "DOMPurify CDN script not included"
+        # Must be pinned + SRI, like the other CDN deps.
+        assert re.search(r"dompurify@\d", INDEX_HTML), "DOMPurify not version-pinned"
+        assert re.search(r"purify\.min\.js\"[^>]*integrity=", INDEX_HTML), \
+            "DOMPurify include missing SRI integrity"
+
+    def test_render_md_sanitizes_marked_output(self):
+        # renderMd must pass marked() output through DOMPurify.sanitize before
+        # returning it into the x-html sink.
+        assert re.search(r"DOMPurify\.sanitize\s*\(", INDEX_HTML), \
+            "renderMd does not sanitize markdown before x-html"
+
+
+# ═════════════════════════════════════════════
+# T2-8 operator endpoints wired (API + console)
+# ═════════════════════════════════════════════
+
+
+@pytest.mark.unit
+@pytest.mark.regression
+class TestOpsEndpointsWired:
+    def test_api_has_drain_and_failover_routes(self, handler):
+        import inspect
+        src = inspect.getsource(handler.lambda_handler)
+        assert '"/hosts/{instance_id}/drain"' in src, "drain route not registered"
+        assert '"/failover/{az}"' in src, "failover route not registered"
+
+    def test_console_calls_new_endpoints(self):
+        assert "cancel-migration" in INDEX_HTML, "console has no cancel-migration call"
+        assert re.search(r"hosts/'?\s*\+\s*\w+\s*\+\s*'/drain", INDEX_HTML) or \
+               "'/drain'" in INDEX_HTML or "/drain" in INDEX_HTML, "console has no drain call"
+        assert "failover/" in INDEX_HTML, "console has no failover call"
+
+    def test_console_has_inflight_panel(self):
+        assert "inflightMigrations" in INDEX_HTML, "no in-flight migrations panel"

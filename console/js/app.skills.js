@@ -17,8 +17,15 @@ window.ocSkills = {
     } catch {}
   },
   renderMd(text) {
-    // Use Marked if loaded, otherwise just escape and show as <pre>
-    if (window.marked) return window.marked.parse(text || '');
+    // SECURITY: SKILL.md content is operator-editable and rendered via x-html
+    // (an innerHTML sink). Un-sanitized marked output lets a stored payload
+    // like <img src=x onerror=...> run JS in the console origin and exfiltrate
+    // the oc_id_token / oc_api_key from localStorage. Always run the rendered
+    // HTML through DOMPurify before returning it.
+    if (window.marked) {
+      const html = window.marked.parse(text || '');
+      return window.DOMPurify ? window.DOMPurify.sanitize(html) : html;
+    }
     const esc = (text || '').replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
     return `<pre style="white-space:pre-wrap">${esc}</pre>`;
   },

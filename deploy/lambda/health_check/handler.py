@@ -63,13 +63,27 @@ PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "")
 ALB_LISTENER_ARN = os.environ.get("ALB_LISTENER_ARN", "")
 
 
+def _scan_all(table, **kwargs):
+    """Fully scan a DynamoDB table, following LastEvaluatedKey (T2-6).
+
+    A bare Table.scan() truncates at the 1 MB (~500-1000 row) page, so past
+    that the sweep silently stops seeing rows. This loops until exhausted;
+    all scan kwargs are forwarded to every page. No ExclusiveStartKey arg.
+    """
+    items = []
+    resp = table.scan(**kwargs)
+    items.extend(resp.get("Items", []))
+    while resp.get("LastEvaluatedKey"):
+        resp = table.scan(ExclusiveStartKey=resp["LastEvaluatedKey"], **kwargs)
+        items.extend(resp.get("Items", []))
+    return items
 def lambda_handler(event, context):
     """Scan running tenants, recover host-agent if needed, then check AZ-level health."""
-    tenants = tenants_table.scan(
-        FilterExpression="#s = :r",
+    tenants = _scan_all(
+        tenants_table,        FilterExpression="#s = :r",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":r": "running"},
-    ).get("Items", [])
+    )
 
     now = datetime.now(timezone.utc)
     stale_count = 0
@@ -132,11 +146,11 @@ def lambda_handler(event, context):
     # host_id untouched, so the tenant is never stranded. `migrating` tenants
     # are NOT in the `running` scan above, so query them separately.
     try:
-        migrating = tenants_table.scan(
-            FilterExpression="#s = :m",
+        migrating = _scan_all(
+        tenants_table,            FilterExpression="#s = :m",
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={":m": "migrating"},
-        ).get("Items", [])
+    )
         for tenant in migrating:
             # Defensive re-filter: only advance tenants that are *actually*
             # migrating with an in-flight phase. Guards against a scan that
@@ -638,7 +652,7 @@ def _check_and_handle_az_failover(now, tenants):
     #    field are kept (they're normal in the pre-status data model / tests);
     #    the __az_failover_state__ bookkeeping record has no `az` field so
     #    group_hosts_by_az already skips it.
-    hosts = [h for h in hosts_table.scan().get("Items", [])
+    hosts = [h for h in _scan_all(hosts_table)
              if h.get("status") != "deleted"]
 
     # 2) Detect outage AZs.

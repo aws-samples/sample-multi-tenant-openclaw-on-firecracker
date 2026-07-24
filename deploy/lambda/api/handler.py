@@ -90,6 +90,26 @@ DEFAULT_NO_JWT_ROLE = os.environ.get("DEFAULT_NO_JWT_ROLE", "viewer")
 # Set RBAC_ENABLED=true to enforce per-route role checks (viewer/operator/admin).
 RBAC_ENABLED = os.environ.get("RBAC_ENABLED", "false").lower() == "true"
 
+
+def _scan_all(table, **kwargs):
+    """Fully scan a DynamoDB table, following LastEvaluatedKey (T2-6).
+
+    boto3 Table.scan() returns at most 1 MB per call, so a bare .scan()
+    silently truncates once the control plane grows past a single page
+    (~500-1000 rows) — e.g. the health watchdog would stop monitoring tenants
+    beyond page 1. This loops until the table is exhausted. All scan kwargs
+    (FilterExpression, ExpressionAttributeNames/Values, ...) are forwarded to
+    every page. Callers MUST NOT pass ExclusiveStartKey.
+    """
+    items = []
+    resp = table.scan(**kwargs)
+    items.extend(resp.get("Items", []))
+    while resp.get("LastEvaluatedKey"):
+        resp = table.scan(ExclusiveStartKey=resp["LastEvaluatedKey"], **kwargs)
+        items.extend(resp.get("Items", []))
+    return items
+
+
 # Lazily-built, module-cached JWKS client. Cognito rotates signing keys
 # rarely; PyJWKClient caches fetched keys in-process, so we pay the JWKS
 # HTTP fetch at most once per cold container (and on key rotation).
@@ -314,8 +334,8 @@ def list_groups():
     if groups_table is None:
         return _resp(503, {"error": "groups table not configured (1.3.x deployment?)"})
     try:
-        resp = groups_table.scan()
-        return _resp(200, {"groups": resp.get("Items", [])})
+        groups = _scan_all(groups_table)
+        return _resp(200, {"groups": groups})
     except Exception as e:
         return _resp(500, {"error": str(e)})
 
@@ -540,12 +560,23 @@ def delete_skill(name):
         return _resp(500, {"error": str(e)})
 
 
+# T2-8: destructive fleet-wide actions require admin, not just operator.
+_ADMIN_ONLY = {
+    ("POST", "/failover/{az}"),
+}
+
+
 def _rbac_check(event, method, resource):
     """Return None if allowed, else a 403 response."""
     if not RBAC_ENABLED:
         return None  # role-gating disabled — all routes open
     role = _get_user_role(event)
-    needed = "viewer" if (method, resource) in _VIEWER_OK else "operator"
+    if (method, resource) in _ADMIN_ONLY:
+        needed = "admin"
+    elif (method, resource) in _VIEWER_OK:
+        needed = "viewer"
+    else:
+        needed = "operator"
     if not _role_satisfies(role, needed):
         return _resp(403, {
             "error": "forbidden",
@@ -595,6 +626,13 @@ def lambda_handler(event, context):
         ("DELETE", "/hosts/{instance_id}"): lambda: deregister_host(
             path_params["instance_id"]
         ),
+        # T2-8: operator endpoints — graceful host drain + manual AZ failover.
+        ("POST", "/hosts/{instance_id}/drain"): lambda: drain_host(
+            path_params["instance_id"], event.get("body")
+        ),
+        ("POST", "/failover/{az}"): lambda: trigger_failover(
+            path_params["az"], event.get("body")
+        ),
         # 1.4.0 (#62) — per-tenant / per-group skill scoping
         ("GET", "/groups"): list_groups,
         ("POST", "/groups"): lambda: create_group(event.get("body")),
@@ -642,11 +680,12 @@ def lambda_handler(event, context):
 
 
 def list_tenants(query_params=None, multi_query_params=None):
-    items = tenants_table.scan(
+    items = _scan_all(
+        tenants_table,
         FilterExpression="#s <> :d",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":d": "deleted"},
-    ).get("Items", [])
+    )
     # Ensure every record exposes a tags field so the console can render it
     for it in items:
         it.setdefault("tags", {})
@@ -1000,6 +1039,31 @@ def tenant_action(tenant_id, action, body=None):
     if not item:
         return _resp(404, {"error": "tenant not found"})
 
+    # ── T2-8: cancel an in-flight migration ──
+    # Only valid while migrating. The migrate sweep flips host_id ONLY at the
+    # final step, so until then the source VM is still running and untouched —
+    # cancel = revert status to running + clear the async context (same end
+    # state as _rollback_migration in the sweep). If the sweep already flipped
+    # host_id, the migration completed and there's nothing to cancel.
+    if action == "cancel-migration":
+        if item.get("status") != "migrating":
+            return _resp(409, {"error": f"tenant is {item.get('status')}, not migrating"})
+        tenants_table.update_item(
+            Key={"id": tenant_id},
+            UpdateExpression=(
+                "SET #s = :r, migration_failed = :reason, updated_at = :t "
+                "REMOVE migration_target, migration_target_vm_num, migration_source, "
+                "migration_snap_cmd, migration_restore_cmd, migration_phase, "
+                "migration_mode, migration_started_at, migration_snapshot_uri"
+            ),
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":r": "running", ":reason": "cancelled by operator", ":t": _now()},
+        )
+        _publish_event("migration.cancelled", tenant_id, {})
+        return _resp(200, {"id": tenant_id, "status": "running",
+                           "message": "migration cancelled; tenant remains on source host"})
+
     # ── Issue #16: live VM resize (hot-add vCPU) ──
     if action == "resize":
         return tenant_resize(tenant_id, body)
@@ -1304,7 +1368,7 @@ def list_all_backups():
     prefix = os.environ.get("BACKUP_PREFIX", "backups")
 
     # Build tenant_id → (name, exists) map from DDB (include soft-deleted for name resolution)
-    tenants = tenants_table.scan().get("Items", [])
+    tenants = _scan_all(tenants_table)
     tenant_info = {
         t["id"]: {"name": t.get("name", ""), "exists": t.get("status") != "deleted"}
         for t in tenants
@@ -1345,11 +1409,12 @@ def tenant_get_action(tenant_id, action):
 
 
 def list_hosts():
-    items = hosts_table.scan(
+    items = _scan_all(
+        hosts_table,
         FilterExpression="#s <> :d",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":d": "deleted"},
-    ).get("Items", [])
+    )
     # Filter out synthetic records (e.g. __az_failover_state__ used by the
     # health_check Lambda to remember per-AZ cooldown — added in 1.3.0).
     # Anything starting with "__" is reserved for internal bookkeeping and
@@ -1464,6 +1529,76 @@ def deregister_host(instance_id):
     return _resp(200, {"instance_id": instance_id, "status": "draining"})
 
 
+def drain_host(instance_id, body=None):
+    """T2-8: gracefully evacuate a host before decommissioning it.
+
+    Unlike deregister_host (which terminates immediately → cleanup_terminated_host
+    HARD-DELETES every tenant on it), drain migrates each running tenant off to
+    another host first, then marks the host draining. The operator terminates
+    only once it's empty. Migration is async (202 each), so this returns the set
+    of migrations it kicked off; the caller polls the tenants until they land.
+    """
+    host = hosts_table.get_item(Key={"instance_id": instance_id}).get("Item")
+    if not host:
+        return _resp(404, {"error": f"host {instance_id} not found"})
+    tenants = _scan_all(
+        tenants_table,
+        FilterExpression="host_id = :h AND #s = :r",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":h": instance_id, ":r": "running"},
+    )
+    # Mark draining so the scheduler stops placing NEW tenants here while we move.
+    hosts_table.update_item(
+        Key={"instance_id": instance_id},
+        UpdateExpression="SET #s = :s, updated_at = :t",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":s": "draining", ":t": _now()},
+    )
+    started, failed = [], []
+    for t in tenants:
+        tid = t["id"]
+        vcpu, mem_mb = int(t.get("vcpu", 0)), int(t.get("mem_mb", 0))
+        target = _find_host(vcpu, mem_mb)
+        # _find_host excludes non-active/idle hosts, but not necessarily THIS
+        # draining one from a stale scan — guard explicitly.
+        if not target or target["instance_id"] == instance_id:
+            failed.append({"id": tid, "error": "no target host with capacity"})
+            continue
+        r = tenant_action(tid, "migrate", {"target_host_id": target["instance_id"]})
+        if r.get("statusCode") == 202:
+            started.append({"id": tid, "target": target["instance_id"]})
+        else:
+            failed.append({"id": tid, "error": json.loads(r.get("body", "{}")).get("error", "migrate failed")})
+    _audit_system("host.drain_started", f"host:{instance_id}", instance_id,
+                  actor="api", detail={"migrations": started, "failed": failed})
+    return _resp(202 if started or not tenants else 409, {
+        "instance_id": instance_id, "status": "draining",
+        "migrations_started": started, "failed": failed,
+        "message": ("host will be empty once migrations complete; terminate it "
+                    "then (DELETE /hosts/{id}) — it will NOT hard-delete tenants"),
+    })
+
+
+def trigger_failover(az, body=None):
+    """T2-8: manually trigger AZ evacuation without waiting for the 10-min
+    auto-detection. The health_check Lambda owns the failover routine, so we
+    invoke it — it re-detects and evacuates any unhealthy AZ. (A targeted
+    single-AZ force is a future refinement; today this kicks the same sweep.)"""
+    fn = os.environ.get("HEALTH_CHECK_FUNCTION", "")
+    if not fn:
+        return _resp(501, {"error": "manual failover unavailable "
+                                    "(HEALTH_CHECK_FUNCTION not configured)"})
+    try:
+        boto3.client("lambda").invoke(
+            FunctionName=fn, InvocationType="Event",
+            Payload=json.dumps({"manual_failover_az": az}).encode())
+    except Exception as e:
+        return _resp(502, {"error": f"failed to invoke health check: {e}"})
+    _audit_system("az.failover_requested", f"az:{az}", az, actor="api")
+    return _resp(202, {"az": az, "status": "failover_triggered",
+                       "message": "health-check sweep invoked; poll tenants for recovery"})
+
+
 def cleanup_terminated_host(event):
     """Called by termination lifecycle hook — cleanup DynamoDB then complete hook."""
     detail = event["detail"]
@@ -1471,11 +1606,12 @@ def cleanup_terminated_host(event):
     print(f"cleanup_terminated_host: {instance_id}")
 
     # Delete all tenants on this host
-    tenants = tenants_table.scan(
+    tenants = _scan_all(
+        tenants_table,
         FilterExpression="host_id = :h AND #s <> :d",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":h": instance_id, ":d": "deleted"},
-    ).get("Items", [])
+    )
     for t in tenants:
         _remove_alb_rule(t["id"])
         tenants_table.update_item(
@@ -1669,11 +1805,12 @@ def refresh_rootfs():
     region = os.environ.get("AWS_REGION", "ap-northeast-1")
     version = manifest["version"]
 
-    hosts = hosts_table.scan(
+    hosts = _scan_all(
+        hosts_table,
         FilterExpression="#s IN (:a, :i)",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":a": "active", ":i": "idle"},
-    ).get("Items", [])
+    )
 
     if not hosts:
         return _resp(200, {"message": "no active hosts", "updated": 0})
@@ -1729,11 +1866,12 @@ fallocate --dig-holes "$ASSETS/openclaw-data-template.ext4"
 
 def process_pending():
     """Called when a new host becomes InService. Assign pending tenants to available hosts."""
-    pending = tenants_table.scan(
+    pending = _scan_all(
+        tenants_table,
         FilterExpression="#s = :p",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":p": "pending"},
-    ).get("Items", [])
+    )
 
     if not pending:
         return {"statusCode": 200, "body": "no pending tenants"}
@@ -1836,11 +1974,12 @@ def _find_host(vcpu_needed, mem_needed):
     free vCPU (then most free mem, then a deterministic instance_id tie-break),
     mirroring pick_target_host() in the health_check Lambda.
     """
-    hosts = hosts_table.scan(
+    hosts = _scan_all(
+        hosts_table,
         FilterExpression="#s IN (:a, :i)",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":a": "active", ":i": "idle"},
-    ).get("Items", [])
+    )
 
     candidates = []
     for h in hosts:
@@ -1928,17 +2067,15 @@ def _release_host_slot(instance_id, vcpu, mem_mb):
 
 def _get_specific_host_with_capacity(instance_id, vcpu_needed, mem_needed):
     """Issue #12 — locate a specific host (used for same-host clone) and
-    confirm it has capacity. Returns the host item or None."""
-    hosts = hosts_table.scan(
-        FilterExpression="#s IN (:a, :i)",
-        ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":a": "active", ":i": "idle"},
-    ).get("Items", [])
-    for h in hosts:
-        if h["instance_id"] != instance_id:
-            continue
-        return h if _host_fits(h, vcpu_needed, mem_needed) else None
-    return None
+    confirm it has capacity. Returns the host item or None.
+
+    T2-7: instance_id IS the hosts-table partition key, so fetch the one row
+    with get_item (0.5 RCU) instead of scanning the whole table and linear-
+    searching — the old scan cost grew with fleet + dead-row count."""
+    item = hosts_table.get_item(Key={"instance_id": instance_id}).get("Item")
+    if not item or item.get("status") not in ("active", "idle"):
+        return None
+    return item if _host_fits(item, vcpu_needed, mem_needed) else None
 
 
 def _gen_id(name):
@@ -2363,10 +2500,13 @@ _AUDIT_EVENT_MAP = {
     ("DELETE", "/skills/{name}"): "skill.deleted",
     ("PUT", "/templates/{name}"): "template.updated",
     ("DELETE", "/templates/{name}"): "template.deleted",
+    ("POST", "/hosts/{instance_id}/drain"): "host.drain_started",
+    ("POST", "/failover/{az}"): "az.failover_requested",
 }
 # Per-action event names for POST /tenants/{id}/{action}.
 _AUDIT_ACTION_MAP = {
     "migrate": "vm.migrate_requested",
+    "cancel-migration": "vm.migrate_cancelled",
     "backup": "backup.created",
     "resize": "tenant.resized",
     "resize-disk": "tenant.disk_resized",
@@ -2635,11 +2775,13 @@ def batch_tenants(body=None):
 
 def _resolve_filter(flt):
     """Convert filter dict → list of matching tenant ids (excludes soft-deleted)."""
-    items = tenants_table.scan(
+    items = _scan_all(
+        tenants_table,
         FilterExpression="#s <> :d",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":d": "deleted"},
-    ).get("Items", []) or []
+
+    ) or []
     items = [it for it in items if it.get("status") != "deleted"]
     tag_expr = flt.get("tag", "")
     if tag_expr and ":" in tag_expr:

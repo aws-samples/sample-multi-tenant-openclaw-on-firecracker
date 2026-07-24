@@ -21,6 +21,20 @@ ASG_NAME = os.environ["ASG_NAME"]
 IDLE_TIMEOUT = int(os.environ["IDLE_TIMEOUT_MINUTES"])
 
 
+def _scan_all(table, **kwargs):
+    """Fully scan a DynamoDB table, following LastEvaluatedKey (T2-6).
+
+    A bare Table.scan() truncates at the 1 MB (~500-1000 row) page, so past
+    that the sweep silently stops seeing rows. This loops until exhausted;
+    all scan kwargs are forwarded to every page. No ExclusiveStartKey arg.
+    """
+    items = []
+    resp = table.scan(**kwargs)
+    items.extend(resp.get("Items", []))
+    while resp.get("LastEvaluatedKey"):
+        resp = table.scan(ExclusiveStartKey=resp["LastEvaluatedKey"], **kwargs)
+        items.extend(resp.get("Items", []))
+    return items
 def _audit(event_name, obj, resource_id, actor, detail=None):
     """Best-effort audit row for the scaler's automated actions (issue #71).
     Same schema as the API/health_check audit writers so they render in one
@@ -61,11 +75,11 @@ def lambda_handler(event, context):
     _reconcile_schedules()
 
     now = datetime.now(timezone.utc)
-    hosts = hosts_table.scan(
-        FilterExpression="#s <> :d",
+    hosts = _scan_all(
+        hosts_table,        FilterExpression="#s <> :d",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":d": "deleted"},
-    ).get("Items", [])
+    )
 
     for h in hosts:
         instance_id = h["instance_id"]
@@ -117,9 +131,9 @@ def _process_ttl_expirations():
     if tenants_table is None:
         return  # backward compat: if env var missing, no-op
     try:
-        items = tenants_table.scan(
-            FilterExpression="attribute_exists(expires_at)",
-        ).get("Items", [])
+        items = _scan_all(
+        tenants_table,            FilterExpression="attribute_exists(expires_at)",
+    )
     except Exception as e:
         print(f"ttl scan failed: {e}")
         return
@@ -243,7 +257,7 @@ def _reconcile_schedules():
     """Walk scheduled tenants and start/stop to match window."""
     if tenants_table is None:
         return
-    items = tenants_table.scan().get("Items", []) or []
+    items = _scan_all(tenants_table) or []
     now = _now_utc()
     for it in items:
         sched = it.get("schedule")

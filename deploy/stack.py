@@ -37,6 +37,12 @@ from aws_cdk import (
     aws_cloudfront_origins as origins,
 )
 from aws_cdk import (
+    aws_cloudwatch as cloudwatch,
+)
+from aws_cdk import (
+    aws_cloudwatch_actions as cw_actions,
+)
+from aws_cdk import (
     aws_cognito as cognito,
 )
 from aws_cdk import (
@@ -68,6 +74,9 @@ from aws_cdk import (
 )
 from aws_cdk import (
     aws_sns as sns,
+)
+from aws_cdk import (
+    aws_sqs as sqs,
 )
 from aws_cdk import (
     aws_wafv2 as wafv2,
@@ -259,15 +268,44 @@ class OpenClawOrchestratorStack(cdk.Stack):
         )
 
         # ========== Lambda Shared Policy ==========
-        ssm_policy = iam.PolicyStatement(
-            actions=["ssm:SendCommand", "ssm:GetCommandInvocation"],
-            resources=["*"],
-        )
-        ec2_policy = iam.PolicyStatement(
-            actions=["ec2:DescribeInstances", "ec2:DescribeInstanceTypes",
-                     "ec2:TerminateInstances"],
-            resources=["*"],
-        )
+        # T2-5: scope the wildcards. These statements are declared before the
+        # ASG (created later) so we build literal ARNs from the well-known
+        # names rather than referencing constructs. A tag condition applies to
+        # ALL resources in a statement, so the untagged RunShellScript document
+        # ARN must live in its own conditionless statement — else SendCommand
+        # to the document breaks.
+        _asg_arn = Fn.join("", [
+            "arn:", cdk.Aws.PARTITION, ":autoscaling:", cdk.Aws.REGION, ":",
+            cdk.Aws.ACCOUNT_ID, ":autoScalingGroup:*:autoScalingGroupName/openclaw-hosts-asg"])
+        _run_shell_doc_arn = Fn.join("", [
+            "arn:", cdk.Aws.PARTITION, ":ssm:", cdk.Aws.REGION, "::document/AWS-RunShellScript"])
+        # ssm:SendCommand needs BOTH the document (untagged) and the target
+        # instances (scoped by ASG tag); GetCommandInvocation has no resource
+        # granularity, so it stays *.
+        ssm_policies = [
+            iam.PolicyStatement(actions=["ssm:SendCommand"],
+                                resources=[_run_shell_doc_arn]),
+            iam.PolicyStatement(
+                actions=["ssm:SendCommand"],
+                resources=[Fn.join("", ["arn:", cdk.Aws.PARTITION, ":ec2:",
+                    cdk.Aws.REGION, ":", cdk.Aws.ACCOUNT_ID, ":instance/*"])],
+                conditions={"StringEquals": {
+                    "aws:ResourceTag/aws:autoscaling:groupName": "openclaw-hosts-asg"}}),
+            iam.PolicyStatement(actions=["ssm:GetCommandInvocation"], resources=["*"]),
+        ]
+        # ec2 Describe* has no resource-level support (stays *); TerminateInstances
+        # is scoped to ASG-tagged instances.
+        ec2_policies = [
+            iam.PolicyStatement(
+                actions=["ec2:DescribeInstances", "ec2:DescribeInstanceTypes"],
+                resources=["*"]),
+            iam.PolicyStatement(
+                actions=["ec2:TerminateInstances"],
+                resources=[Fn.join("", ["arn:", cdk.Aws.PARTITION, ":ec2:",
+                    cdk.Aws.REGION, ":", cdk.Aws.ACCOUNT_ID, ":instance/*"])],
+                conditions={"StringEquals": {
+                    "aws:ResourceTag/aws:autoscaling:groupName": "openclaw-hosts-asg"}}),
+        ]
 
         # ========== SNS Lifecycle Notifications (issue #13, optional) ==========
         notif_cfg = CFG.get("notifications", {}) or {}
@@ -279,6 +317,15 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 display_name="OpenClaw Tenant Lifecycle Events",
             )
             notifications_topic_arn = notifications_topic.topic_arn
+
+        # T2-3: shared DLQ for EventBridge → Lambda targets. Captures events
+        # EventBridge could not deliver after retries (throttle / 5xx) so a
+        # dropped host-terminate or health tick is recoverable, not silently lost.
+        events_dlq = sqs.Queue(self, "EventsDLQ",
+            queue_name="openclaw-events-dlq",
+            retention_period=Duration.days(14),
+            enforce_ssl=True,
+        )
 
         # ========== API Lambda ==========
         api_fn = _lambda.Function(self, "ApiHandler",
@@ -377,13 +424,17 @@ class OpenClawOrchestratorStack(cdk.Stack):
         # Issue #13 — allow publishing tenant lifecycle events
         if notifications_topic is not None:
             notifications_topic.grant_publish(api_fn)
-        api_fn.add_to_role_policy(ssm_policy)
-        api_fn.add_to_role_policy(ec2_policy)
+        for _s in ssm_policies + ec2_policies:
+            api_fn.add_to_role_policy(_s)
+        # T2-5: Describe* has no resource-level support (stays *); the three
+        # mutating actions scope to the openclaw ASG ARN.
         api_fn.add_to_role_policy(iam.PolicyStatement(
-            actions=["autoscaling:DescribeAutoScalingGroups", "autoscaling:SetDesiredCapacity",
+            actions=["autoscaling:DescribeAutoScalingGroups"], resources=["*"]))
+        api_fn.add_to_role_policy(iam.PolicyStatement(
+            actions=["autoscaling:SetDesiredCapacity",
                      "autoscaling:CompleteLifecycleAction",
                      "autoscaling:TerminateInstanceInAutoScalingGroup"],
-            resources=["*"],
+            resources=[_asg_arn],
         ))
 
         # ========== API Gateway ==========
@@ -606,23 +657,44 @@ class OpenClawOrchestratorStack(cdk.Stack):
         if notifications_topic is not None:
             notifications_topic.grant_publish(health_fn)
         # 1.3.1: ALB rule re-pointing during cross-host failover.
+        # T2-5: ELB Describe* has no resource-level support (stays *); the
+        # mutating actions scope to this account+region's ELB ARN space (rule
+        # and target-group ARNs are created dynamically, so an account-scoped
+        # prefix is the tightest safe bound without the not-yet-created ARNs).
+        _elb_arns = [
+            Fn.join("", ["arn:", cdk.Aws.PARTITION, ":elasticloadbalancing:",
+                cdk.Aws.REGION, ":", cdk.Aws.ACCOUNT_ID, ":listener-rule/app/*"]),
+            Fn.join("", ["arn:", cdk.Aws.PARTITION, ":elasticloadbalancing:",
+                cdk.Aws.REGION, ":", cdk.Aws.ACCOUNT_ID, ":listener/app/*"]),
+            Fn.join("", ["arn:", cdk.Aws.PARTITION, ":elasticloadbalancing:",
+                cdk.Aws.REGION, ":", cdk.Aws.ACCOUNT_ID, ":targetgroup/*"]),
+        ]
+        health_fn.add_to_role_policy(iam.PolicyStatement(
+            actions=["elasticloadbalancing:DescribeRules",
+                     "elasticloadbalancing:DescribeTargetGroups"],
+            resources=["*"]))
         health_fn.add_to_role_policy(iam.PolicyStatement(
             actions=[
-                "elasticloadbalancing:DescribeRules",
-                "elasticloadbalancing:DescribeTargetGroups",
                 "elasticloadbalancing:CreateRule",
                 "elasticloadbalancing:ModifyRule",
                 "elasticloadbalancing:CreateTargetGroup",
                 "elasticloadbalancing:RegisterTargets",
             ],
-            resources=["*"],
+            resources=_elb_arns,
         ))
-        health_fn.add_to_role_policy(ssm_policy)
+        for _s in ssm_policies:
+            health_fn.add_to_role_policy(_s)
 
         events.Rule(self, "HealthCheckSchedule",
             schedule=events.Schedule.rate(Duration.minutes(CFG["health_check"]["interval_minutes"])),
-            targets=[targets.LambdaFunction(health_fn)],
+            targets=[targets.LambdaFunction(health_fn,
+                dead_letter_queue=events_dlq, retry_attempts=2)],
         )
+
+        # T2-8: the api Lambda's POST /failover/{az} invokes the health-check
+        # Lambda (which owns the AZ-failover routine) for manual evacuation.
+        api_fn.add_environment("HEALTH_CHECK_FUNCTION", health_fn.function_name)
+        health_fn.grant_invoke(api_fn)
 
         # ========== Skills Lambda ==========
         skills_fn = _lambda.Function(self, "Skills",
@@ -693,15 +765,18 @@ class OpenClawOrchestratorStack(cdk.Stack):
         tenants_table.grant_read_write_data(scaler_fn)
         # Issue #71 — scaler writes audit rows for its automated actions.
         audit_table.grant_write_data(scaler_fn)
-        scaler_fn.add_to_role_policy(ssm_policy)  # SSM stop-vm.sh on TTL expiry
+        for _s in ssm_policies:  # SSM stop-vm.sh on TTL expiry
+            scaler_fn.add_to_role_policy(_s)
         scaler_fn.add_to_role_policy(iam.PolicyStatement(
-            actions=["autoscaling:DescribeAutoScalingGroups",
-                     "autoscaling:TerminateInstanceInAutoScalingGroup"],
-            resources=["*"],
+            actions=["autoscaling:DescribeAutoScalingGroups"], resources=["*"]))
+        scaler_fn.add_to_role_policy(iam.PolicyStatement(
+            actions=["autoscaling:TerminateInstanceInAutoScalingGroup"],
+            resources=[_asg_arn],
         ))
         events.Rule(self, "ScalerSchedule",
             schedule=events.Schedule.rate(Duration.minutes(CFG["scaler"]["interval_minutes"])),
-            targets=[targets.LambdaFunction(scaler_fn)],
+            targets=[targets.LambdaFunction(scaler_fn,
+                dead_letter_queue=events_dlq, retry_attempts=2)],
         )
 
         # ========== Backup Lambda (daily data backup) ==========
@@ -720,13 +795,54 @@ class OpenClawOrchestratorStack(cdk.Stack):
         )
         tenants_table.grant_read_write_data(backup_fn)
         assets_bucket.grant_read_write(backup_fn)
-        backup_fn.add_to_role_policy(ssm_policy)
+        for _s in ssm_policies:
+            backup_fn.add_to_role_policy(_s)
         backup_fn.grant_invoke(api_fn)  # API Lambda async invokes Backup Lambda
 
         events.Rule(self, "BackupSchedule",
             schedule=events.Schedule.expression(CFG["s3"]["backup_cron"]),
-            targets=[targets.LambdaFunction(backup_fn)],
+            targets=[targets.LambdaFunction(backup_fn,
+                dead_letter_queue=events_dlq, retry_attempts=2)],
         )
+
+        # ===== CloudWatch alarms (T2-3) =====
+        # There were ZERO alarms — every failure mode was log-only. Alarm on
+        # errors>0 and throttles>0 for each control-plane Lambda, routed to the
+        # lifecycle SNS topic when the operator enabled it, else a dedicated
+        # alarms topic so an alarm always has somewhere to fire.
+        alarms_topic = notifications_topic or sns.Topic(self, "AlarmsTopic",
+            topic_name="openclaw-alarms",
+            display_name="OpenClaw Lambda Alarms",
+        )
+        _sns_action = cw_actions.SnsAction(alarms_topic)
+        for _fn, _label in ((api_fn, "Api"), (health_fn, "Health"),
+                            (scaler_fn, "Scaler"), (backup_fn, "Backup")):
+            err = cloudwatch.Alarm(self, f"{_label}ErrorsAlarm",
+                alarm_name=f"openclaw-{_label.lower()}-errors",
+                metric=_fn.metric_errors(period=Duration.minutes(5)),
+                threshold=1, evaluation_periods=1,
+                comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+                treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+            )
+            err.add_alarm_action(_sns_action)
+            thr = cloudwatch.Alarm(self, f"{_label}ThrottlesAlarm",
+                alarm_name=f"openclaw-{_label.lower()}-throttles",
+                metric=_fn.metric_throttles(period=Duration.minutes(5)),
+                threshold=1, evaluation_periods=1,
+                comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+                treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+            )
+            thr.add_alarm_action(_sns_action)
+        # Alert when EventBridge parks an undeliverable event in the DLQ.
+        dlq_alarm = cloudwatch.Alarm(self, "EventsDlqAlarm",
+            alarm_name="openclaw-events-dlq-not-empty",
+            metric=events_dlq.metric_approximate_number_of_messages_visible(
+                period=Duration.minutes(5)),
+            threshold=1, evaluation_periods=1,
+            comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+            treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+        )
+        dlq_alarm.add_alarm_action(_sns_action)
 
         # ========== Host EC2 Role (SSM + S3 backup + self-register) ==========
         host_role = iam.Role(self, "HostRole",
@@ -738,17 +854,28 @@ class OpenClawOrchestratorStack(cdk.Stack):
         assets_bucket.grant_read_write(host_role)
         hosts_table.grant_read_write_data(host_role)
         tenants_table.grant_read_write_data(host_role)  # host-agent writes health status
+        # T2-5: CompleteLifecycleAction is scopable to the ASG ARN.
         host_role.add_to_policy(iam.PolicyStatement(
             actions=["autoscaling:CompleteLifecycleAction"],
-            resources=["*"],
+            resources=[_asg_arn],
         ))
+        # DescribeVolumes has no resource-level support (stays *); CreateTags is
+        # scoped to the account's volumes + instances (host tags its own EBS).
         host_role.add_to_policy(iam.PolicyStatement(
-            actions=["ec2:DescribeVolumes", "ec2:CreateTags"],
-            resources=["*"],
+            actions=["ec2:DescribeVolumes"], resources=["*"]))
+        host_role.add_to_policy(iam.PolicyStatement(
+            actions=["ec2:CreateTags"],
+            resources=[
+                Fn.join("", ["arn:", cdk.Aws.PARTITION, ":ec2:", cdk.Aws.REGION,
+                    ":", cdk.Aws.ACCOUNT_ID, ":volume/*"]),
+                Fn.join("", ["arn:", cdk.Aws.PARTITION, ":ec2:", cdk.Aws.REGION,
+                    ":", cdk.Aws.ACCOUNT_ID, ":instance/*"]),
+            ],
         ))
+        # host-agent only reads its own stack outputs → scope to this stack ARN.
         host_role.add_to_policy(iam.PolicyStatement(
             actions=["cloudformation:DescribeStacks"],
-            resources=["*"],
+            resources=[cdk.Aws.STACK_ID],
         ))
 
         # ========== Amazon Managed Prometheus + Grafana (issue #4) ==========
@@ -1062,7 +1189,8 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 source=["aws.autoscaling"],
                 detail_type=["EC2 Instance Launch Successful"],
             ),
-            targets=[targets.LambdaFunction(api_fn)],
+            targets=[targets.LambdaFunction(api_fn,
+                dead_letter_queue=events_dlq, retry_attempts=2)],
         )
 
         # When a host is terminating → cleanup DynamoDB records
@@ -1071,7 +1199,8 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 source=["aws.autoscaling"],
                 detail_type=["EC2 Instance-terminate Lifecycle Action"],
             ),
-            targets=[targets.LambdaFunction(api_fn)],
+            targets=[targets.LambdaFunction(api_fn,
+                dead_letter_queue=events_dlq, retry_attempts=2)],
         )
 
         # ========== AgentCore (optional, continued) ==========
@@ -1210,16 +1339,21 @@ class OpenClawOrchestratorStack(cdk.Stack):
         # hits http://<alb_dns>/vm/<tenant_id>/ — same path CloudFront
         # would forward to anyway.
         health_fn.add_environment("PUBLIC_BASE_URL", f"http://{alb.load_balancer_dns_name}")
+        # T2-5: Describe* stays * (no resource-level support); the create/delete/
+        # modify/register actions scope to this account+region's ELB ARN space.
+        api_fn.add_to_role_policy(iam.PolicyStatement(
+            actions=["elasticloadbalancing:DescribeRules",
+                     "elasticloadbalancing:DescribeTargetGroups",
+                     "elasticloadbalancing:DescribeListeners"],
+            resources=["*"]))
         api_fn.add_to_role_policy(iam.PolicyStatement(
             actions=[
                 "elasticloadbalancing:CreateTargetGroup", "elasticloadbalancing:DeleteTargetGroup",
                 "elasticloadbalancing:RegisterTargets", "elasticloadbalancing:DeregisterTargets",
                 "elasticloadbalancing:CreateRule", "elasticloadbalancing:DeleteRule",
                 "elasticloadbalancing:ModifyRule",
-                "elasticloadbalancing:DescribeRules", "elasticloadbalancing:DescribeTargetGroups",
-                "elasticloadbalancing:DescribeListeners",
             ],
-            resources=["*"],
+            resources=_elb_arns,
         ))
 
         # ========== CloudFront ==========
@@ -1297,7 +1431,10 @@ function handler(event) {
                 default_behavior=cloudfront.BehaviorOptions(
                     origin=s3_origin,
                     viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-                    cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
+                    # T2-2: the console is static S3 assets — cache them at the
+                    # edge (was CACHING_DISABLED = 100% origin fetches). The
+                    # per-tenant dashboards (AppCF, /vm/*) stay uncached below.
+                    cache_policy=cloudfront.CachePolicy.CACHING_OPTIMIZED,
                     function_associations=[cloudfront.FunctionAssociation(
                         function=url_rewrite_fn,
                         event_type=cloudfront.FunctionEventType.VIEWER_REQUEST,
@@ -1362,7 +1499,10 @@ function handler(event) {
                     "/console/*": cloudfront.BehaviorOptions(
                         origin=s3_origin,
                         viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-                        cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
+                        # T2-2: static console assets cached at the edge. The
+                        # default behavior (ALB origin, incl. /vm/*) stays
+                        # CACHING_DISABLED so tenant dashboards are never cached.
+                        cache_policy=cloudfront.CachePolicy.CACHING_OPTIMIZED,
                         function_associations=[cloudfront.FunctionAssociation(
                             function=url_rewrite_fn,
                             event_type=cloudfront.FunctionEventType.VIEWER_REQUEST,

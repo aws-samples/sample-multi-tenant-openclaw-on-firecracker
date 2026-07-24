@@ -77,6 +77,13 @@ health_check:
     enabled: true
     unhealthy_threshold_minutes: 10  # AZ 多久 (>=) 全停才触发, 防止短暂网络抖动误判
     cooldown_minutes: 30             # 同一 AZ 触发一次后, 多久才能再次触发
+    # T3-2: 失效切换改为「检测/执行分离」——detector(health_check)只负责检测+入队,
+    # 每个受影响 tenant 一条 SQS 消息交由 openclaw-failover-worker 并行执行, 全 AZ 恢复
+    # 从 O(5min × tenant 数) 降到 O(单 tenant)。以下为 worker Lambda 的 env 默认值
+    # (由 stack.py 注入, 非本文件读取; 列出仅供参考):
+    #   FAILOVER_QUEUE_URL         : 队列 URL, 设置即启用异步路径(未设则回退旧同步逻辑)
+    #   FAILOVER_WATCHDOG_MINUTES  : 30, 卡在 failover_queued/recovering 超时后判失败
+    #   worker max_concurrency     : 10, 限制并行 launch-vm.sh 对目标 host 的冲击
 
 # ========== Console 认证 (可选) ==========
 console_auth:

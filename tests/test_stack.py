@@ -202,6 +202,72 @@ class TestObservability:
 
 
 # ═══════════════════════════════════════════
+# T3-2 — AZ-failover worker queue
+# ═══════════════════════════════════════════
+
+
+class TestFailoverQueue:
+    @pytest.mark.unit
+    def test_failover_queue_and_dlq_exist(self, synthesized_template):
+        queues = synthesized_template.find_resources("AWS::SQS::Queue")
+        qnames = {q["Properties"].get("QueueName") for q in queues.values()}
+        assert "openclaw-failover" in qnames, "failover queue missing"
+        assert "openclaw-failover-dlq" in qnames, "failover DLQ missing"
+
+    @pytest.mark.unit
+    def test_queue_has_redrive_and_visibility_900(self, synthesized_template):
+        queues = synthesized_template.find_resources("AWS::SQS::Queue")
+        fq = next(q for q in queues.values()
+                  if q["Properties"].get("QueueName") == "openclaw-failover")
+        assert fq["Properties"]["VisibilityTimeout"] == 900
+        assert "RedrivePolicy" in fq["Properties"]
+        assert fq["Properties"]["RedrivePolicy"]["maxReceiveCount"] == 2
+
+    @pytest.mark.unit
+    def test_worker_function_and_event_source(self, synthesized_template):
+        fns = synthesized_template.find_resources("AWS::Lambda::Function")
+        worker = [f for f in fns.values()
+                  if f["Properties"].get("FunctionName") == "openclaw-failover-worker"]
+        assert worker, "failover worker Lambda missing"
+        assert worker[0]["Properties"]["Handler"] == "worker.lambda_handler"
+        assert worker[0]["Properties"]["Timeout"] == 600
+        # Event source mapping: batch_size 1, max concurrency 10.
+        esms = synthesized_template.find_resources("AWS::Lambda::EventSourceMapping")
+        assert esms, "no SQS event source mapping"
+        esm = list(esms.values())[0]["Properties"]
+        assert esm["BatchSize"] == 1
+        assert esm["ScalingConfig"]["MaximumConcurrency"] == 10
+
+    @pytest.mark.unit
+    def test_detector_has_failover_queue_url_env(self, synthesized_template):
+        fns = synthesized_template.find_resources("AWS::Lambda::Function")
+        health = next(f for f in fns.values()
+                      if f["Properties"].get("FunctionName") == "openclaw-health-check")
+        env_keys = health["Properties"]["Environment"]["Variables"].keys()
+        assert "FAILOVER_QUEUE_URL" in env_keys
+
+    @pytest.mark.unit
+    @pytest.mark.regression
+    def test_visibility_timeout_exceeds_worker_timeout(self, synthesized_template):
+        """INVARIANT: queue visibility (900s) MUST be > worker timeout (600s),
+        or a live worker could be raced by a redelivery and the re-claim-on-
+        recovering safety argument breaks."""
+        queues = synthesized_template.find_resources("AWS::SQS::Queue")
+        fq = next(q for q in queues.values()
+                  if q["Properties"].get("QueueName") == "openclaw-failover")
+        fns = synthesized_template.find_resources("AWS::Lambda::Function")
+        worker = next(f for f in fns.values()
+                      if f["Properties"].get("FunctionName") == "openclaw-failover-worker")
+        assert fq["Properties"]["VisibilityTimeout"] > worker["Properties"]["Timeout"]
+
+    @pytest.mark.unit
+    def test_failover_dlq_alarmed(self, synthesized_template):
+        alarms = synthesized_template.find_resources("AWS::CloudWatch::Alarm")
+        names = {a["Properties"].get("AlarmName") for a in alarms.values()}
+        assert "openclaw-failover-dlq-not-empty" in names
+
+
+# ═══════════════════════════════════════════
 # T2-5 — IAM wildcards scoped
 # ═══════════════════════════════════════════
 

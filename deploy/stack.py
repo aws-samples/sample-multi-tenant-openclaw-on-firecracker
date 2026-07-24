@@ -70,6 +70,9 @@ from aws_cdk import (
     aws_lambda as _lambda,
 )
 from aws_cdk import (
+    aws_lambda_event_sources as lambda_event_sources,
+)
+from aws_cdk import (
     aws_s3 as s3,
 )
 from aws_cdk import (
@@ -696,6 +699,79 @@ class OpenClawOrchestratorStack(cdk.Stack):
         api_fn.add_environment("HEALTH_CHECK_FUNCTION", health_fn.function_name)
         health_fn.grant_invoke(api_fn)
 
+        # ========== AZ-failover worker queue (T3-2) ==========
+        # The detector (health_fn) enqueues one job per affected tenant; the
+        # worker executes them in PARALLEL. This turns full-AZ recovery from
+        # O(5min × tenant count) — the old synchronous loop died mid-loop past
+        # ~1 tenant — into O(one tenant). Gated by FAILOVER_QUEUE_URL: unset ⇒
+        # health_fn falls back to the legacy synchronous path (TF-path safe).
+        failover_dlq = sqs.Queue(self, "FailoverDLQ",
+            queue_name="openclaw-failover-dlq",
+            retention_period=Duration.days(14),
+            enforce_ssl=True,
+        )
+        # INVARIANT (asserted in tests): visibility_timeout (900s) MUST exceed
+        # the worker's timeout (600s). A redelivery then proves the prior
+        # attempt is dead, making the worker's re-claim-on-recovering safe.
+        failover_queue = sqs.Queue(self, "FailoverQueue",
+            queue_name="openclaw-failover",
+            visibility_timeout=Duration.seconds(900),
+            retention_period=Duration.days(4),
+            enforce_ssl=True,
+            dead_letter_queue=sqs.DeadLetterQueue(
+                max_receive_count=2, queue=failover_dlq),
+        )
+        failover_worker_fn = _lambda.Function(self, "FailoverWorker",
+            function_name="openclaw-failover-worker",
+            runtime=_lambda.Runtime.PYTHON_3_12,
+            handler="worker.lambda_handler",
+            # Same asset dir as health_fn so worker.py can `import handler`.
+            code=_lambda.Code.from_asset("deploy/lambda/health_check"),
+            timeout=Duration.seconds(600),
+            memory_size=256,
+            environment={
+                "TENANTS_TABLE": tenants_table.table_name,
+                "HOSTS_TABLE": hosts_table.table_name,
+                "AUDIT_TABLE": audit_table.table_name,
+                "SNS_TOPIC_ARN": notifications_topic_arn,
+                "ASSETS_BUCKET": assets_bucket.bucket_name,
+                "AZ_FAILOVER_ENABLED": str(bool(az_failover_cfg.get("enabled", True))).lower(),
+                "AZ_UNHEALTHY_THRESHOLD_MINUTES": str(int(az_failover_cfg.get("unhealthy_threshold_minutes", 10))),
+                "AZ_COOLDOWN_MINUTES": str(int(az_failover_cfg.get("cooldown_minutes", 30))),
+                # ALB_LISTENER_ARN / PUBLIC_BASE_URL injected after listener creation.
+            },
+        )
+        tenants_table.grant_read_write_data(failover_worker_fn)
+        hosts_table.grant_read_write_data(failover_worker_fn)
+        audit_table.grant_write_data(failover_worker_fn)
+        assets_bucket.grant_read(failover_worker_fn)
+        if notifications_topic is not None:
+            notifications_topic.grant_publish(failover_worker_fn)
+        # Worker re-points ALB rules + runs SSM launch-vm.sh, same as the
+        # detector — mirror the ELB + SSM grants.
+        failover_worker_fn.add_to_role_policy(iam.PolicyStatement(
+            actions=["elasticloadbalancing:DescribeRules",
+                     "elasticloadbalancing:DescribeTargetGroups"],
+            resources=["*"]))
+        failover_worker_fn.add_to_role_policy(iam.PolicyStatement(
+            actions=[
+                "elasticloadbalancing:CreateRule",
+                "elasticloadbalancing:ModifyRule",
+                "elasticloadbalancing:CreateTargetGroup",
+                "elasticloadbalancing:RegisterTargets",
+            ],
+            resources=_elb_arns,
+        ))
+        for _s in ssm_policies:
+            failover_worker_fn.add_to_role_policy(_s)
+        # SQS event source: batch_size=1 (one tenant per invocation), capped
+        # concurrency so parallel launch-vm.sh runs don't overwhelm a target.
+        failover_worker_fn.add_event_source(lambda_event_sources.SqsEventSource(
+            failover_queue, batch_size=1, max_concurrency=10))
+        # Detector sends jobs; wire the URL so the queue path activates.
+        health_fn.add_environment("FAILOVER_QUEUE_URL", failover_queue.queue_url)
+        failover_queue.grant_send_messages(health_fn)
+
         # ========== Skills Lambda ==========
         skills_fn = _lambda.Function(self, "Skills",
             function_name="openclaw-skills",
@@ -816,7 +892,8 @@ class OpenClawOrchestratorStack(cdk.Stack):
         )
         _sns_action = cw_actions.SnsAction(alarms_topic)
         for _fn, _label in ((api_fn, "Api"), (health_fn, "Health"),
-                            (scaler_fn, "Scaler"), (backup_fn, "Backup")):
+                            (scaler_fn, "Scaler"), (backup_fn, "Backup"),
+                            (failover_worker_fn, "FailoverWorker")):
             err = cloudwatch.Alarm(self, f"{_label}ErrorsAlarm",
                 alarm_name=f"openclaw-{_label.lower()}-errors",
                 metric=_fn.metric_errors(period=Duration.minutes(5)),
@@ -843,6 +920,17 @@ class OpenClawOrchestratorStack(cdk.Stack):
             treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
         )
         dlq_alarm.add_alarm_action(_sns_action)
+        # T3-2: alert when a failover job exhausts its retries and lands in the
+        # failover DLQ — a tenant that could not be recovered needs a human.
+        failover_dlq_alarm = cloudwatch.Alarm(self, "FailoverDlqAlarm",
+            alarm_name="openclaw-failover-dlq-not-empty",
+            metric=failover_dlq.metric_approximate_number_of_messages_visible(
+                period=Duration.minutes(5)),
+            threshold=1, evaluation_periods=1,
+            comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+            treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+        )
+        failover_dlq_alarm.add_alarm_action(_sns_action)
 
         # ========== Host EC2 Role (SSM + S3 backup + self-register) ==========
         host_role = iam.Role(self, "HostRole",
@@ -1339,6 +1427,10 @@ class OpenClawOrchestratorStack(cdk.Stack):
         # hits http://<alb_dns>/vm/<tenant_id>/ — same path CloudFront
         # would forward to anyway.
         health_fn.add_environment("PUBLIC_BASE_URL", f"http://{alb.load_balancer_dns_name}")
+        # T3-2: the failover worker runs the same repoint + verify gates, so it
+        # needs the same ALB env as the detector.
+        failover_worker_fn.add_environment("ALB_LISTENER_ARN", listener.listener_arn)
+        failover_worker_fn.add_environment("PUBLIC_BASE_URL", f"http://{alb.load_balancer_dns_name}")
         # T2-5: Describe* stays * (no resource-level support); the create/delete/
         # modify/register actions scope to this account+region's ELB ARN space.
         api_fn.add_to_role_policy(iam.PolicyStatement(

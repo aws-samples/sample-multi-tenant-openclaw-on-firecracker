@@ -37,6 +37,7 @@ ssm = boto3.client("ssm")
 sns = boto3.client("sns")
 s3 = boto3.client("s3")
 elbv2 = boto3.client("elbv2")
+sqs = boto3.client("sqs")
 tenants_table = ddb.Table(os.environ["TENANTS_TABLE"])
 hosts_table = ddb.Table(os.environ["HOSTS_TABLE"])
 
@@ -62,6 +63,21 @@ ASSETS_BUCKET = os.environ.get("ASSETS_BUCKET", "")
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "")
 ALB_LISTENER_ARN = os.environ.get("ALB_LISTENER_ARN", "")
 
+# T3-2: AZ-failover detection/execution split. When FAILOVER_QUEUE_URL is set,
+# the detector (this Lambda) only detects the outage, claims each affected
+# tenant, reserves a target host+vm_num, and enqueues one SQS message per
+# tenant; a separate worker Lambda (worker.lambda_handler, same asset dir)
+# executes the launch/verify/repoint pipeline per tenant in PARALLEL. This
+# makes full-AZ recovery O(one tenant) instead of O(5min × tenant count) — the
+# old synchronous loop died mid-loop past ~1 tenant because a single failover
+# can take ~240s > the Lambda's 180s timeout. When the flag is unset, the
+# legacy synchronous path runs verbatim (no behavior change, TF-path safe).
+FAILOVER_QUEUE_URL = os.environ.get("FAILOVER_QUEUE_URL", "")
+# A tenant stuck in failover_queued/failover_recovering longer than this (a lost
+# SQS message, a dead worker) is force-flipped to failover_failed + audited, so
+# it can never be stranded invisibly. Mirrors MIGRATION_WATCHDOG_MINUTES.
+FAILOVER_WATCHDOG_MINUTES = int(os.environ.get("FAILOVER_WATCHDOG_MINUTES", "30"))
+
 
 def _scan_all(table, **kwargs):
     """Fully scan a DynamoDB table, following LastEvaluatedKey (T2-6).
@@ -78,7 +94,17 @@ def _scan_all(table, **kwargs):
         items.extend(resp.get("Items", []))
     return items
 def lambda_handler(event, context):
-    """Scan running tenants, recover host-agent if needed, then check AZ-level health."""
+    """Scan running tenants, recover host-agent if needed, then check AZ-level health.
+
+    T3-2: an event carrying ``{"manual_failover_az": "<az>"}`` (fired by the API
+    Lambda's POST /failover/{az}) forces a synthetic outage for that AZ even if
+    the automatic detector wouldn't flag it, and bypasses the per-AZ cooldown for
+    the forced AZ. Previously this payload was silently ignored, so the T2-8
+    manual-failover endpoint was a no-op.
+    """
+    force_az = (event or {}).get("manual_failover_az") if isinstance(event, dict) else None
+    force_azs = {force_az} if force_az else set()
+
     tenants = _scan_all(
         tenants_table,        FilterExpression="#s = :r",
         ExpressionAttributeNames={"#s": "status"},
@@ -126,14 +152,27 @@ def lambda_handler(event, context):
         print(f"watchdog: {stale_count} stale tenant(s), {recovered} host-agent restart(s)")
 
     # ------- AZ-level failover (1.3.0) -------
-    if AZ_FAILOVER_ENABLED:
+    # A manual /failover/{az} invoke must act even when AZ_FAILOVER_ENABLED is
+    # off (the operator explicitly asked for it); auto detection stays gated.
+    if AZ_FAILOVER_ENABLED or force_azs:
         try:
-            failover_summary = _check_and_handle_az_failover(now, tenants)
+            failover_summary = _check_and_handle_az_failover(now, tenants, force_azs=force_azs)
             if failover_summary["az_outages_detected"]:
                 print(f"az_failover: {json.dumps(failover_summary)}")
         except Exception as e:
             # AZ failover failures must NEVER take down the watchdog.
             print(f"az_failover error (non-fatal): {e}")
+
+    # ------- Failover watchdog (T3-2 P3) -------
+    # A tenant stuck in failover_queued/failover_recovering past the watchdog
+    # window (lost SQS message, dead worker) is force-flipped to failover_failed
+    # so it surfaces to operators instead of hanging invisibly. Only meaningful
+    # when the queue path is active; harmless otherwise.
+    if FAILOVER_QUEUE_URL:
+        try:
+            _sweep_stuck_failovers(now)
+        except Exception as e:
+            print(f"failover watchdog error (non-fatal): {e}")
 
     # ------- In-flight live-migration sweep (1.4.4, issue #64) -------
     # POST /tenants/{id}/migrate is async: it fires the snapshot SSM command,
@@ -629,12 +668,21 @@ def should_skip_az_for_cooldown(az_state, az, now, cooldown_minutes):
         return False
 
 
-def _check_and_handle_az_failover(now, tenants):
+def _check_and_handle_az_failover(now, tenants, force_azs=None):
     """End-to-end AZ failover: detect outages, pick target, relaunch tenants.
 
     This is the AWS-side entrypoint. Pure logic lives in the helpers above.
     Returns a summary dict for logging / audit.
+
+    ``force_azs`` (T3-2): a set of AZ names to treat as down even if automatic
+    detection wouldn't flag them — the manual /failover/{az} path. Forced AZs
+    also bypass the per-AZ cooldown guard (the operator asked explicitly) while
+    still stamping cooldown state to suppress the next automatic tick.
+
+    When ``FAILOVER_QUEUE_URL`` is set, affected tenants are claimed + enqueued
+    to the failover worker queue instead of being recovered synchronously here.
     """
+    force_azs = force_azs or set()
     summary = {
         "az_outages_detected": 0,
         "tenants_failed_over": 0,
@@ -643,6 +691,8 @@ def _check_and_handle_az_failover(now, tenants):
         # from "failed" (SSM error, capacity exhausted, etc.) so summaries
         # accurately reflect WHY a tenant didn't migrate.
         "tenants_blocked": 0,
+        # T3-2: tenants handed to the async worker queue (queue path only).
+        "tenants_queued": 0,
         "skipped_cooldown": [],
     }
 
@@ -655,8 +705,17 @@ def _check_and_handle_az_failover(now, tenants):
     hosts = [h for h in _scan_all(hosts_table)
              if h.get("status") != "deleted"]
 
-    # 2) Detect outage AZs.
+    # 2) Detect outage AZs, then splice in any operator-forced AZs that
+    #    detection didn't already flag (synthetic outage = all non-deleted
+    #    hosts in that AZ).
     outages = detect_unhealthy_azs(hosts, now, AZ_UNHEALTHY_THRESHOLD_MINUTES)
+    detected_azs = {o["az"] for o in outages}
+    for faz in force_azs:
+        if faz in detected_azs:
+            continue
+        forced_host_ids = [h["instance_id"] for h in hosts if h.get("az") == faz]
+        outages.append({"az": faz, "host_ids": forced_host_ids,
+                        "host_count": len(forced_host_ids), "forced": True})
     if not outages:
         return summary
     summary["az_outages_detected"] = len(outages)
@@ -667,9 +726,13 @@ def _check_and_handle_az_failover(now, tenants):
     ).get("Item") or {}
     az_state = state_record.get("az_last_failover", {}) or {}
 
+    # A forced AZ's hosts may still look healthy to is_host_unhealthy, so
+    # exclude forced AZs explicitly — we must never pick a target inside an AZ
+    # the operator just declared down.
     healthy_azs = {
         h.get("az") for h in hosts
-        if h.get("az") and not is_host_unhealthy(h, now, AZ_UNHEALTHY_THRESHOLD_MINUTES)
+        if h.get("az") and h.get("az") not in force_azs
+        and not is_host_unhealthy(h, now, AZ_UNHEALTHY_THRESHOLD_MINUTES)
     }
     if not healthy_azs:
         # All AZs are out — nothing we can do; surface and bail.
@@ -679,7 +742,11 @@ def _check_and_handle_az_failover(now, tenants):
 
     for outage in outages:
         az = outage["az"]
-        if should_skip_az_for_cooldown(az_state, az, now, AZ_COOLDOWN_MINUTES):
+        forced = az in force_azs
+        # Forced (manual) failover bypasses the cooldown guard — the operator
+        # asked explicitly — but we still stamp cooldown state below to suppress
+        # the next automatic tick from re-acting on the same AZ.
+        if not forced and should_skip_az_for_cooldown(az_state, az, now, AZ_COOLDOWN_MINUTES):
             summary["skipped_cooldown"].append(az)
             continue
 
@@ -719,13 +786,17 @@ def _check_and_handle_az_failover(now, tenants):
             _emit_sns_notification(az, outage, recovered_count=0)
             continue
 
+        # Never place a recovered tenant back into ANY down AZ (this one plus
+        # every other detected/forced outage in the same tick).
+        exclude = {o["az"] for o in outages} | force_azs
+
         for tenant in tenants:
             if tenant["id"] not in affected_tenant_ids:
                 continue
             target = pick_target_host(
                 hosts, now,
                 threshold_minutes=AZ_UNHEALTHY_THRESHOLD_MINUTES,
-                exclude_azs={az},
+                exclude_azs=exclude,
                 required_vcpu=int(tenant.get("vcpu") or 1),
             )
             if not target:
@@ -733,6 +804,25 @@ def _check_and_handle_az_failover(now, tenants):
                 _emit_audit("AZ_FAILOVER_NO_TARGET",
                             {"tenant_id": tenant["id"], "from_az": az})
                 continue
+
+            if FAILOVER_QUEUE_URL:
+                # T3-2: enqueue for the parallel worker instead of recovering
+                # synchronously here. _enqueue_failover does the no-backup
+                # refusal, the running→failover_queued claim, and the atomic
+                # target vm_num reservation, then sends one SQS message.
+                outcome = _enqueue_failover(tenant, target, az, now)
+                if outcome == "queued":
+                    summary["tenants_queued"] += 1
+                    # Book the reservation in-memory so the next tenant in this
+                    # batch spreads onto capacity rather than colliding.
+                    target["vm_count"] = int(target.get("vm_count") or 0) + 1
+                    target["used_vcpu"] = int(target.get("used_vcpu") or 0) + int(tenant.get("vcpu") or 1)
+                elif outcome == "blocked":
+                    summary["tenants_blocked"] += 1
+                else:
+                    summary["tenants_failed"] += 1
+                continue
+
             outcome = _failover_tenant_to_host(tenant, target, az, now)
             # 1.3.2: outcome can be True (migrated), False (real failure),
             # or "blocked" (path-A no-backup refusal — accounted separately).
@@ -752,8 +842,11 @@ def _check_and_handle_az_failover(now, tenants):
             if outcome != "blocked":
                 target["next_vm_num"] = int(target.get("next_vm_num") or 1) + 1
 
-        # 6) SNS notification (best-effort).
-        _emit_sns_notification(az, outage, summary["tenants_failed_over"])
+        # 6) SNS notification (best-effort). Report queued count on the queue
+        # path (recovery happens later in the workers), recovered otherwise.
+        _emit_sns_notification(
+            az, outage,
+            summary["tenants_queued"] if FAILOVER_QUEUE_URL else summary["tenants_failed_over"])
 
     # State already persisted at the start of each outage handling above.
     return summary
@@ -785,11 +878,7 @@ def _failover_tenant_to_host(tenant, target_host, source_az, now):
     an audit row so a human can act.
     """
     tenant_id = tenant["id"]
-    vcpu = int(tenant.get("vcpu") or 2)
-    mem_mb = int(tenant.get("mem_mb") or 4096)
-    target_host_id = target_host["instance_id"]
     target_vm_num = int(target_host.get("next_vm_num") or 1)
-    config_template = tenant.get("config_template") or ""
     source_host_id = tenant.get("host_id", "")
 
     # 1) Find latest backup (path A: refuse if missing).
@@ -830,33 +919,55 @@ def _failover_tenant_to_host(tenant, target_host, source_az, now):
                 pass
         return "blocked"  # 1.3.2: distinct from failures — caller buckets separately
 
+    # 2) Mark recovering — with conditional update on host_id to prevent
+    # concurrent Lambda invocations from both trying to migrate the same
+    # tenant. If another invocation already moved it, ConditionalCheckFailed
+    # raises; we skip cleanly and don't report failure.
     try:
-        # 2) Mark recovering — with conditional update on host_id to prevent
-        # concurrent Lambda invocations from both trying to migrate the same
-        # tenant. If another invocation already moved it, ConditionalCheckFailed
-        # raises; we skip cleanly and don't report failure.
-        try:
-            tenants_table.update_item(
-                Key={"id": tenant_id},
-                UpdateExpression=("SET previous_host_id = :p, "
-                                  "failover_from_az = :az, failover_at = :t, "
-                                  "#s = :recover"),
-                ConditionExpression="host_id = :p",
-                ExpressionAttributeNames={"#s": "status"},
-                ExpressionAttributeValues={
-                    ":p": source_host_id,
-                    ":az": source_az,
-                    ":t": now.isoformat(),
-                    ":recover": "failover_recovering",
-                },
-            )
-        except tenants_table.meta.client.exceptions.ConditionalCheckFailedException:
-            # Another invocation already migrated this tenant — back off cleanly.
-            print(f"skip {tenant_id}: already migrated by concurrent invocation")
-            _emit_audit("AZ_FAILOVER_SKIPPED_CONCURRENT",
-                        {"tenant_id": tenant_id, "from_az": source_az})
-            return False
+        tenants_table.update_item(
+            Key={"id": tenant_id},
+            UpdateExpression=("SET previous_host_id = :p, "
+                              "failover_from_az = :az, failover_at = :t, "
+                              "#s = :recover"),
+            ConditionExpression="host_id = :p",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":p": source_host_id,
+                ":az": source_az,
+                ":t": now.isoformat(),
+                ":recover": "failover_recovering",
+            },
+        )
+    except tenants_table.meta.client.exceptions.ConditionalCheckFailedException:
+        # Another invocation already migrated this tenant — back off cleanly.
+        print(f"skip {tenant_id}: already migrated by concurrent invocation")
+        _emit_audit("AZ_FAILOVER_SKIPPED_CONCURRENT",
+                    {"tenant_id": tenant_id, "from_az": source_az})
+        return False
 
+    # Claim held — run the launch/verify/repoint/flip pipeline. Extracted so
+    # the T3-2 worker Lambda can reuse it after doing its own SQS-side claim.
+    return _execute_failover(tenant, target_host, source_az, backup_key,
+                             target_vm_num, now)
+
+
+def _execute_failover(tenant, target_host, source_az, backup_key, target_vm_num, now):
+    """Steps 3-8 of AZ failover: launch on target, verify gates, repoint ALB,
+    flip DDB ownership. Assumes the caller already (a) found ``backup_key`` and
+    (b) claimed the tenant into ``failover_recovering``. Shared by the
+    synchronous detector path and the async worker (T3-2).
+
+    Returns True on full recovery; False on failure (tenant flipped to
+    failover_failed / failover_failed_partial, audit emitted). Never raises.
+    """
+    tenant_id = tenant["id"]
+    vcpu = int(tenant.get("vcpu") or 2)
+    mem_mb = int(tenant.get("mem_mb") or 4096)
+    target_host_id = target_host["instance_id"]
+    config_template = tenant.get("config_template") or ""
+    source_host_id = tenant.get("host_id", "") or tenant.get("previous_host_id", "")
+
+    try:
         # 3) Launch on target host via SSM with POSITIONAL args.
         #    launch-vm.sh signature:
         #      launch-vm.sh <tenant_id> <vm_num> <vcpu> <mem_mb>
@@ -1024,6 +1135,177 @@ def _failover_tenant_to_host(tenant, target_host, source_az, now):
             "status_set": new_status,
         })
         return False
+
+
+def _reserve_target_vm_num(target_host_id):
+    """Atomically reserve the next vm_num on the target host and return it.
+
+    Uses an atomic increment with ReturnValues=UPDATED_OLD so parallel workers
+    (T3-2) never hand out the same vm_num — the in-memory ``next_vm_num`` bump
+    the synchronous path relied on is not safe once failovers run concurrently.
+    A reserved number is never reused (leak-on-failure is intentional, same as
+    the 1.3.2 sync path: a partially-created tap-vmN device would trip
+    TUNSETIFF EBUSY if the number were recycled). Returns 1 on error.
+    """
+    try:
+        resp = hosts_table.update_item(
+            Key={"instance_id": target_host_id},
+            UpdateExpression="SET next_vm_num = if_not_exists(next_vm_num, :one) + :one",
+            ExpressionAttributeValues={":one": 1},
+            ReturnValues="UPDATED_OLD",
+        )
+        old = resp.get("Attributes", {}).get("next_vm_num")
+        # UPDATED_OLD returns the value BEFORE the add; that's the slot to use.
+        # if_not_exists made the pre-value absent on first use → slot 1.
+        return int(old) if old is not None else 1
+    except Exception as e:
+        print(f"reserve vm_num on {target_host_id} failed (non-fatal): {e}")
+        return 1
+
+
+def _enqueue_failover(tenant, target_host, source_az, now):
+    """Detector-side of the T3-2 split: do the no-backup refusal + the
+    running→failover_queued claim + the atomic target vm_num reservation, then
+    send one SQS message for the worker to execute. Returns "queued", "blocked"
+    (no backup — data-loss refusal), or "failed" (claim lost / send error).
+
+    The claim's ConditionExpression requires BOTH host_id==source AND
+    status==running, so a manual + scheduled tick racing past cooldown can't
+    double-enqueue the same tenant.
+    """
+    tenant_id = tenant["id"]
+    source_host_id = tenant.get("host_id", "")
+    target_host_id = target_host["instance_id"]
+
+    # 1) No-backup refusal (path A) — run in the detector so blocked tenants
+    #    never enqueue and the alert fires immediately. Mirrors the sync path.
+    backup_key = _find_latest_backup_key(tenant_id) if ASSETS_BUCKET else None
+    if not backup_key:
+        _emit_audit("AZ_FAILOVER_NO_BACKUP", {
+            "tenant_id": tenant_id, "from_az": source_az,
+            "reason": "no backup available — failover refused to avoid data loss",
+        })
+        try:
+            tenants_table.update_item(
+                Key={"id": tenant_id},
+                UpdateExpression="SET #s = :b, failover_error = :e",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={":b": "failover_blocked",
+                                           ":e": "no_backup_available"},
+            )
+        except Exception:
+            pass
+        if _SNS_TOPIC_ARN:
+            try:
+                sns.publish(
+                    TopicArn=_SNS_TOPIC_ARN,
+                    Subject=f"[OpenClaw] AZ failover BLOCKED: {tenant_id} has no backup",
+                    Message=json.dumps({
+                        "event": "az_failover_blocked", "tenant_id": tenant_id,
+                        "reason": "no_backup_available", "source_az": source_az,
+                        "action_required": "manual recovery — restore from snapshot or accept data loss",
+                    }, indent=2),
+                )
+            except Exception:
+                pass
+        return "blocked"
+
+    # 2) Claim: running→failover_queued, guarded on host_id AND status so a
+    #    concurrent enqueue for the same tenant loses the race cleanly.
+    try:
+        tenants_table.update_item(
+            Key={"id": tenant_id},
+            UpdateExpression=("SET previous_host_id = :p, failover_from_az = :az, "
+                              "failover_at = :t, #s = :queued"),
+            ConditionExpression="host_id = :p AND #s = :running",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":p": source_host_id, ":az": source_az, ":t": now.isoformat(),
+                ":queued": "failover_queued", ":running": "running",
+            },
+        )
+    except tenants_table.meta.client.exceptions.ConditionalCheckFailedException:
+        print(f"skip {tenant_id}: already claimed by a concurrent tick")
+        _emit_audit("AZ_FAILOVER_SKIPPED_CONCURRENT",
+                    {"tenant_id": tenant_id, "from_az": source_az})
+        return "failed"
+
+    # 3) Reserve the target vm_num atomically (parallel-worker safe).
+    target_vm_num = _reserve_target_vm_num(target_host_id)
+
+    # 4) Enqueue one job for the worker.
+    try:
+        sqs.send_message(
+            QueueUrl=FAILOVER_QUEUE_URL,
+            MessageBody=json.dumps({
+                "tenant_id": tenant_id,
+                "source_az": source_az,
+                "source_host_id": source_host_id,
+                "target_host_id": target_host_id,
+                "target_vm_num": target_vm_num,
+                "backup_key": backup_key,
+                "queued_at": now.isoformat(),
+            }),
+        )
+    except Exception as e:
+        # Claim already flipped to failover_queued; the watchdog will reap it
+        # if we can't enqueue. Report failed so the summary is truthful.
+        print(f"enqueue failover for {tenant_id} failed: {e}")
+        _emit_audit("AZ_FAILOVER_ENQUEUE_FAILED",
+                    {"tenant_id": tenant_id, "error": str(e)[:200]})
+        return "failed"
+
+    _emit_audit("AZ_FAILOVER_TENANT_QUEUED", {
+        "tenant_id": tenant_id, "from_az": source_az,
+        "to_host": target_host_id, "target_vm_num": target_vm_num,
+    })
+    return "queued"
+
+
+def _sweep_stuck_failovers(now):
+    """Watchdog (T3-2 P3): tenants stuck in failover_queued/failover_recovering
+    past FAILOVER_WATCHDOG_MINUTES (a lost SQS message, a dead worker) are
+    force-flipped to failover_failed + audited so they surface to operators
+    rather than hanging invisibly. Mirrors the migration watchdog.
+    """
+    cutoff = FAILOVER_WATCHDOG_MINUTES * 60
+    stuck = _scan_all(
+        tenants_table,
+        FilterExpression="#s = :q OR #s = :r",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":q": "failover_queued", ":r": "failover_recovering"},
+    )
+    reaped = 0
+    for tenant in stuck:
+        at = tenant.get("failover_at", "")
+        if at:
+            try:
+                if (now - datetime.fromisoformat(at)).total_seconds() < cutoff:
+                    continue  # still within the grace window
+            except Exception:
+                pass
+        tid = tenant["id"]
+        try:
+            tenants_table.update_item(
+                Key={"id": tid},
+                UpdateExpression="SET #s = :f, failover_error = :e",
+                ConditionExpression="#s = :q OR #s = :r",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={
+                    ":f": "failover_failed",
+                    ":e": f"watchdog: stuck > {FAILOVER_WATCHDOG_MINUTES}min",
+                    ":q": "failover_queued", ":r": "failover_recovering",
+                },
+            )
+            reaped += 1
+            _emit_audit("AZ_FAILOVER_WATCHDOG_REAPED",
+                        {"tenant_id": tid, "stuck_since": at})
+        except tenants_table.meta.client.exceptions.ConditionalCheckFailedException:
+            pass  # a worker just finished it — fine
+        except Exception as e:
+            print(f"failover watchdog reap {tid} failed (non-fatal): {e}")
+    if reaped:
+        print(f"failover watchdog: reaped {reaped} stuck tenant(s)")
 
 
 def _find_latest_backup_key(tenant_id):

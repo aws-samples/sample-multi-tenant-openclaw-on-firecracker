@@ -146,6 +146,31 @@ def _sam_build_image_for_host():
     return "public.ecr.aws/sam/build-python3.12:latest-x86_64"
 
 
+_LAMBDA_SRC = Path(__file__).parent / "lambda"
+_LAMBDA_STAGE = Path(__file__).parent.parent / ".build" / "lambda"
+
+
+def _stage_lambda_asset(name):
+    """Stage a Lambda's source + the shared `common/` package into a build dir
+    and return its path for Code.from_asset (T3-3).
+
+    The shared helpers live in deploy/lambda/common/, a sibling of each
+    handler dir, so a plain Code.from_asset("deploy/lambda/<name>") would NOT
+    include them. We copytree the handler dir, then overlay common/ inside it,
+    so at runtime `from common import ...` resolves next to the handler. Rebuilt
+    from scratch every synth (rmtree first) so a deleted source file can't
+    linger in the bundle. __pycache__ is skipped to keep the asset hash stable.
+    """
+    import shutil
+    dest = _LAMBDA_STAGE / name
+    if dest.exists():
+        shutil.rmtree(dest)
+    ignore = shutil.ignore_patterns("__pycache__", "*.pyc")
+    shutil.copytree(_LAMBDA_SRC / name, dest, ignore=ignore)
+    shutil.copytree(_LAMBDA_SRC / "common", dest / "common", ignore=ignore)
+    return str(dest)
+
+
 def _read_pyproject_version():
     """Best-effort read of the project version so the API can advertise it
     via /system/info. Falls back to "dev" if pyproject.toml is unreadable
@@ -339,7 +364,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
             architecture=_lambda.Architecture.ARM_64,
             handler="handler.lambda_handler",
             code=_lambda.Code.from_asset(
-                "deploy/lambda/api",
+                _stage_lambda_asset("api"),
                 bundling=BundlingOptions(
                     # Image arch = build host (not Lambda) to avoid arm64-on-x86
                     # exec format error; pip cross-downloads the aarch64 wheel.
@@ -630,7 +655,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
             function_name="openclaw-health-check",
             runtime=_lambda.Runtime.PYTHON_3_12,
             handler="handler.lambda_handler",
-            code=_lambda.Code.from_asset("deploy/lambda/health_check"),
+            code=_lambda.Code.from_asset(_stage_lambda_asset("health_check")),
             timeout=Duration.seconds(180),  # 1.3.1: room for synchronous SSM wait during failover
             memory_size=256,
             # 1.3.2: prevent concurrent invocations from racing on the same
@@ -647,6 +672,14 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 "AUDIT_TABLE": audit_table.table_name,
                 "SNS_TOPIC_ARN": notifications_topic_arn,
                 "ASSETS_BUCKET": assets_bucket.bucket_name,
+                # T3-3: failover placement now uses the SAME capacity math as
+                # the API scheduler (common.capacity), so the health_check
+                # Lambda needs the overcommit ratios + per-host VM ceiling it
+                # never had before. Without these it silently fell back to
+                # 1.0/1.0/0 and could place a VM where the API would reject it.
+                "CPU_OVERCOMMIT_RATIO": str(CFG["host"].get("cpu_overcommit_ratio", 1.0)),
+                "MEM_OVERCOMMIT_RATIO": str(CFG["host"].get("mem_overcommit_ratio", 1.0)),
+                "MAX_VMS_PER_HOST": str(CFG["host"].get("max_vms_per_host", 0)),
                 # ALB_LISTENER_ARN injected after listener creation (see below)
                 "AZ_FAILOVER_ENABLED": str(bool(az_failover_cfg.get("enabled", True))).lower(),
                 "AZ_UNHEALTHY_THRESHOLD_MINUTES": str(int(az_failover_cfg.get("unhealthy_threshold_minutes", 10))),
@@ -726,7 +759,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
             runtime=_lambda.Runtime.PYTHON_3_12,
             handler="worker.lambda_handler",
             # Same asset dir as health_fn so worker.py can `import handler`.
-            code=_lambda.Code.from_asset("deploy/lambda/health_check"),
+            code=_lambda.Code.from_asset(_stage_lambda_asset("health_check")),
             timeout=Duration.seconds(600),
             memory_size=256,
             environment={
@@ -735,6 +768,11 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 "AUDIT_TABLE": audit_table.table_name,
                 "SNS_TOPIC_ARN": notifications_topic_arn,
                 "ASSETS_BUCKET": assets_bucket.bucket_name,
+                # Worker imports handler.py, which reads these at module load;
+                # keep them in sync with the detector (T3-3).
+                "CPU_OVERCOMMIT_RATIO": str(CFG["host"].get("cpu_overcommit_ratio", 1.0)),
+                "MEM_OVERCOMMIT_RATIO": str(CFG["host"].get("mem_overcommit_ratio", 1.0)),
+                "MAX_VMS_PER_HOST": str(CFG["host"].get("max_vms_per_host", 0)),
                 "AZ_FAILOVER_ENABLED": str(bool(az_failover_cfg.get("enabled", True))).lower(),
                 "AZ_UNHEALTHY_THRESHOLD_MINUTES": str(int(az_failover_cfg.get("unhealthy_threshold_minutes", 10))),
                 "AZ_COOLDOWN_MINUTES": str(int(az_failover_cfg.get("cooldown_minutes", 30))),
@@ -777,7 +815,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
             function_name="openclaw-skills",
             runtime=_lambda.Runtime.PYTHON_3_12,
             handler="handler.lambda_handler",
-            code=_lambda.Code.from_asset("deploy/lambda/skills"),
+            code=_lambda.Code.from_asset(_stage_lambda_asset("skills")),
             timeout=Duration.seconds(30),
             memory_size=128,
             environment={
@@ -804,7 +842,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
             function_name="openclaw-templates",
             runtime=_lambda.Runtime.PYTHON_3_12,
             handler="handler.lambda_handler",
-            code=_lambda.Code.from_asset("deploy/lambda/templates"),
+            code=_lambda.Code.from_asset(_stage_lambda_asset("templates")),
             timeout=Duration.seconds(30),
             memory_size=128,
             environment={"ASSETS_BUCKET": assets_bucket.bucket_name},
@@ -822,7 +860,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
             function_name="openclaw-scaler",
             runtime=_lambda.Runtime.PYTHON_3_12,
             handler="handler.lambda_handler",
-            code=_lambda.Code.from_asset("deploy/lambda/scaler"),
+            code=_lambda.Code.from_asset(_stage_lambda_asset("scaler")),
             timeout=Duration.seconds(60),
             memory_size=128,
             environment={
@@ -860,7 +898,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
             function_name="openclaw-backup",
             runtime=_lambda.Runtime.PYTHON_3_12,
             handler="handler.lambda_handler",
-            code=_lambda.Code.from_asset("deploy/lambda/backup"),
+            code=_lambda.Code.from_asset(_stage_lambda_asset("backup")),
             timeout=Duration.seconds(900),
             memory_size=256,
             environment={
@@ -1301,7 +1339,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
                     function_name="openclaw-agentcore-tools",
                     runtime=_lambda.Runtime.PYTHON_3_12,
                     handler="handler.lambda_handler",
-                    code=_lambda.Code.from_asset("deploy/lambda/agentcore_tools"),
+                    code=_lambda.Code.from_asset(_stage_lambda_asset("agentcore_tools")),
                     timeout=Duration.seconds(30),
                     memory_size=128,
                 )

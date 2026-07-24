@@ -31,6 +31,8 @@ from datetime import datetime, timezone
 
 import boto3
 from botocore.exceptions import ClientError
+from common import capacity as _capacity
+from common import ddb as _ddb_helpers
 
 ddb = boto3.resource("dynamodb")
 ssm = boto3.client("ssm")
@@ -48,6 +50,13 @@ _SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
 
 STALE_SECONDS = 120  # No health update for 2 min → agent may be down
 RESTART_COOLDOWN_SECONDS = 600  # Don't restart agent more than once per 10 min
+
+# T3-3: capacity math is now shared with the API scheduler (common.capacity).
+# Defaults 1.0/1.0/0 reproduce legacy behavior for stacks that haven't been
+# redeployed with these env vars injected into the health_check Lambda.
+CPU_OVERCOMMIT_RATIO = float(os.environ.get("CPU_OVERCOMMIT_RATIO", 1.0))
+MEM_OVERCOMMIT_RATIO = float(os.environ.get("MEM_OVERCOMMIT_RATIO", 1.0))
+MAX_VMS_PER_HOST = int(os.environ.get("MAX_VMS_PER_HOST", "0") or "0")
 
 # AZ failover configuration (read from env, populated by stack.py).
 AZ_FAILOVER_ENABLED = os.environ.get("AZ_FAILOVER_ENABLED", "false").lower() == "true"
@@ -80,19 +89,11 @@ FAILOVER_WATCHDOG_MINUTES = int(os.environ.get("FAILOVER_WATCHDOG_MINUTES", "30"
 
 
 def _scan_all(table, **kwargs):
-    """Fully scan a DynamoDB table, following LastEvaluatedKey (T2-6).
+    """Thin wrapper over the shared paginating scan (T3-3); kept as a
+    module-level name so existing test monkeypatches stay put."""
+    return _ddb_helpers.scan_all(table, **kwargs)
 
-    A bare Table.scan() truncates at the 1 MB (~500-1000 row) page, so past
-    that the sweep silently stops seeing rows. This loops until exhausted;
-    all scan kwargs are forwarded to every page. No ExclusiveStartKey arg.
-    """
-    items = []
-    resp = table.scan(**kwargs)
-    items.extend(resp.get("Items", []))
-    while resp.get("LastEvaluatedKey"):
-        resp = table.scan(ExclusiveStartKey=resp["LastEvaluatedKey"], **kwargs)
-        items.extend(resp.get("Items", []))
-    return items
+
 def lambda_handler(event, context):
     """Scan running tenants, recover host-agent if needed, then check AZ-level health.
 
@@ -611,48 +612,30 @@ def detect_unhealthy_azs(hosts, now, threshold_minutes):
     return out
 
 
-def pick_target_host(hosts, now, threshold_minutes, exclude_azs, required_vcpu=0):
+def pick_target_host(hosts, now, threshold_minutes, exclude_azs,
+                     required_vcpu=0, required_mem=0):
     """Choose the best healthy host outside ``exclude_azs`` for failover.
 
-    Priority:
-      1. Healthy host with the most spare vCPU (capacity - vm_count * default_vcpu).
-      2. Tie-breaker: lowest current vm_count.
-      3. Tie-breaker: lexicographic instance_id (deterministic).
+    T3-3: the health/AZ filtering (unhealthy, excluded AZ, deleted) stays here,
+    but the *capacity* verdict + ranking now delegate to common.capacity — the
+    SAME math the API scheduler uses. This closes the divergence where failover
+    ignored the overcommit ratios, never checked memory, and never enforced
+    MAX_VMS_PER_HOST, so it could place a VM on a host the API would reject.
 
-    Returns the host record, or None if no candidate exists.
+    ``required_mem`` is new; callers should pass the tenant's mem_mb so a
+    memory-exhausted host is rejected. Returns the host record, or None.
     """
-    candidates = []
-    for h in hosts:
-        az = h.get("az", "")
-        if az in exclude_azs:
-            continue
-        if is_host_unhealthy(h, now, threshold_minutes):
-            continue
-        if h.get("status") == "deleted":
-            continue
-        # Estimate spare capacity. Hosts publish total_vcpu (decimal stored
-        # as Number in DDB; we coerce to int via Decimal-friendly path).
-        # Fall back to legacy field names just in case.
-        raw_total = (h.get("total_vcpu") or h.get("vcpu_total")
-                     or h.get("max_vcpu") or 0)
-        vcpu_total = int(raw_total)
-        vm_count = int(h.get("vm_count") or 0)
-        raw_used = h.get("used_vcpu")
-        if raw_used is not None:
-            # Prefer the actual booked vCPU when host-agent publishes it.
-            spare = vcpu_total - int(raw_used)
-        else:
-            # Approximate per-VM cost; fallback to 2 if unknown.
-            avg_vcpu = int(h.get("avg_vcpu_per_vm") or 2)
-            spare = vcpu_total - vm_count * avg_vcpu
-        if required_vcpu and spare < required_vcpu:
-            continue
-        candidates.append((-spare, vm_count, h["instance_id"], h))
-
-    if not candidates:
-        return None
-    candidates.sort()
-    return candidates[0][3]
+    eligible = [
+        h for h in hosts
+        if h.get("az", "") not in exclude_azs
+        and not is_host_unhealthy(h, now, threshold_minutes)
+        and h.get("status") != "deleted"
+    ]
+    ranked = _capacity.rank_hosts(
+        eligible, required_vcpu, required_mem,
+        cpu_ratio=CPU_OVERCOMMIT_RATIO, mem_ratio=MEM_OVERCOMMIT_RATIO,
+        max_vms=MAX_VMS_PER_HOST)
+    return ranked[0] if ranked else None
 
 
 def should_skip_az_for_cooldown(az_state, az, now, cooldown_minutes):
@@ -798,6 +781,7 @@ def _check_and_handle_az_failover(now, tenants, force_azs=None):
                 threshold_minutes=AZ_UNHEALTHY_THRESHOLD_MINUTES,
                 exclude_azs=exclude,
                 required_vcpu=int(tenant.get("vcpu") or 1),
+                required_mem=int(tenant.get("mem_mb") or 4096),
             )
             if not target:
                 summary["tenants_failed"] += 1

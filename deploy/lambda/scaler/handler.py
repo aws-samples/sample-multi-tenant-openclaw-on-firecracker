@@ -7,6 +7,7 @@ import uuid
 from datetime import datetime, timezone
 
 import boto3
+from common import ddb as _ddb_helpers
 
 ddb = boto3.resource("dynamodb")
 autoscaling = boto3.client("autoscaling")
@@ -22,19 +23,10 @@ IDLE_TIMEOUT = int(os.environ["IDLE_TIMEOUT_MINUTES"])
 
 
 def _scan_all(table, **kwargs):
-    """Fully scan a DynamoDB table, following LastEvaluatedKey (T2-6).
+    """Thin wrapper over the shared paginating scan (T3-3)."""
+    return _ddb_helpers.scan_all(table, **kwargs)
 
-    A bare Table.scan() truncates at the 1 MB (~500-1000 row) page, so past
-    that the sweep silently stops seeing rows. This loops until exhausted;
-    all scan kwargs are forwarded to every page. No ExclusiveStartKey arg.
-    """
-    items = []
-    resp = table.scan(**kwargs)
-    items.extend(resp.get("Items", []))
-    while resp.get("LastEvaluatedKey"):
-        resp = table.scan(ExclusiveStartKey=resp["LastEvaluatedKey"], **kwargs)
-        items.extend(resp.get("Items", []))
-    return items
+
 def _audit(event_name, obj, resource_id, actor, detail=None):
     """Best-effort audit row for the scaler's automated actions (issue #71).
     Same schema as the API/health_check audit writers so they render in one

@@ -293,14 +293,20 @@ class TestPickTargetHost:
     def hc(self):
         return _load_hc_module()
 
+    # T3-3: pick_target_host now shares common.capacity with the API scheduler,
+    # which reads `total_vcpu`/`total_mem_mb`/`used_vcpu` (the fields host-agent
+    # actually publishes) and applies the overcommit ratios. The legacy fixtures
+    # used a `vcpu_total` alias + an `avg_vcpu_per_vm` heuristic the API never
+    # honored; re-expressed here against the real host shape, with used_vcpu
+    # standing in for load (ratios default to 1.0 in these tests).
     @pytest.mark.unit
     def test_picks_host_with_most_spare_vcpu(self, hc):
         now = datetime.now(timezone.utc)
         hosts = [
             {"instance_id": "i-busy", "az": "az-c", "last_health_check": _ago_iso(30),
-             "vcpu_total": 16, "vm_count": 7, "avg_vcpu_per_vm": 2},
+             "total_vcpu": 16, "total_mem_mb": 65536, "used_vcpu": 14, "vm_count": 7},
             {"instance_id": "i-free", "az": "az-c", "last_health_check": _ago_iso(30),
-             "vcpu_total": 16, "vm_count": 1, "avg_vcpu_per_vm": 2},
+             "total_vcpu": 16, "total_mem_mb": 65536, "used_vcpu": 2, "vm_count": 1},
         ]
         target = hc.pick_target_host(hosts, now, threshold_minutes=10,
                                      exclude_azs={"az-a"})
@@ -311,9 +317,9 @@ class TestPickTargetHost:
         now = datetime.now(timezone.utc)
         hosts = [
             {"instance_id": "i-bad", "az": "az-a", "last_health_check": _ago_iso(30),
-             "vcpu_total": 16, "vm_count": 0, "avg_vcpu_per_vm": 2},
+             "total_vcpu": 16, "total_mem_mb": 65536, "used_vcpu": 0, "vm_count": 0},
             {"instance_id": "i-ok", "az": "az-c", "last_health_check": _ago_iso(30),
-             "vcpu_total": 16, "vm_count": 5, "avg_vcpu_per_vm": 2},
+             "total_vcpu": 16, "total_mem_mb": 65536, "used_vcpu": 10, "vm_count": 5},
         ]
         target = hc.pick_target_host(hosts, now, threshold_minutes=10,
                                      exclude_azs={"az-a"})
@@ -324,17 +330,19 @@ class TestPickTargetHost:
         now = datetime.now(timezone.utc)
         hosts = [
             {"instance_id": "i-stale", "az": "az-c", "last_health_check": _ago_iso(20 * 60),
-             "vcpu_total": 16, "vm_count": 0, "avg_vcpu_per_vm": 2},
+             "total_vcpu": 16, "total_mem_mb": 65536, "used_vcpu": 0, "vm_count": 0},
         ]
         assert hc.pick_target_host(hosts, now, threshold_minutes=10, exclude_azs=set()) is None
 
     @pytest.mark.unit
     def test_required_vcpu_filter(self, hc):
         now = datetime.now(timezone.utc)
-        # Only host has 2 spare vcpu but we need 4 → no candidate.
+        # T3-3: capacity now honors CPU_OVERCOMMIT_RATIO (the test session sets
+        # it to 2.0 in conftest). allocatable = total_vcpu*2 - used_vcpu.
+        # total 4 * 2.0 = 8, minus used 6 → free 2. need 4 → reject, need 2 → ok.
         hosts = [
             {"instance_id": "i-tight", "az": "az-c", "last_health_check": _ago_iso(30),
-             "vcpu_total": 4, "vm_count": 1, "avg_vcpu_per_vm": 2},
+             "total_vcpu": 4, "total_mem_mb": 16384, "used_vcpu": 6, "vm_count": 1},
         ]
         assert hc.pick_target_host(hosts, now, threshold_minutes=10,
                                    exclude_azs=set(), required_vcpu=4) is None
@@ -351,7 +359,8 @@ class TestPickTargetHost:
         now = datetime.now(timezone.utc)
         hosts = [
             {"instance_id": "i-dead", "az": "az-c", "last_health_check": _ago_iso(30),
-             "status": "deleted", "vcpu_total": 16, "vm_count": 0, "avg_vcpu_per_vm": 2},
+             "status": "deleted", "total_vcpu": 16, "total_mem_mb": 65536,
+             "used_vcpu": 0, "vm_count": 0},
         ]
         assert hc.pick_target_host(hosts, now, threshold_minutes=10, exclude_azs=set()) is None
 
@@ -361,9 +370,9 @@ class TestPickTargetHost:
         now = datetime.now(timezone.utc)
         hosts = [
             {"instance_id": "i-zzz", "az": "az-c", "last_health_check": _ago_iso(30),
-             "vcpu_total": 16, "vm_count": 0, "avg_vcpu_per_vm": 2},
+             "total_vcpu": 16, "total_mem_mb": 65536, "used_vcpu": 0, "vm_count": 0},
             {"instance_id": "i-aaa", "az": "az-c", "last_health_check": _ago_iso(30),
-             "vcpu_total": 16, "vm_count": 0, "avg_vcpu_per_vm": 2},
+             "total_vcpu": 16, "total_mem_mb": 65536, "used_vcpu": 0, "vm_count": 0},
         ]
         target = hc.pick_target_host(hosts, now, threshold_minutes=10, exclude_azs=set())
         assert target["instance_id"] == "i-aaa"
@@ -430,9 +439,9 @@ class TestAZFailoverOrchestration:
         # Set up mocks: 2 hosts in 2 AZs, both healthy.
         hc.hosts_table.scan.return_value = {"Items": [
             {"instance_id": "i-1", "az": "az-a", "last_health_check": _ago_iso(30),
-             "vcpu_total": 16, "vm_count": 2},
+             "total_vcpu": 16, "total_mem_mb": 65536, "vm_count": 2},
             {"instance_id": "i-2", "az": "az-c", "last_health_check": _ago_iso(30),
-             "vcpu_total": 16, "vm_count": 2},
+             "total_vcpu": 16, "total_mem_mb": 65536, "vm_count": 2},
         ]}
         hc.hosts_table.get_item.return_value = {}
         result = hc._check_and_handle_az_failover(now, [])
@@ -446,9 +455,9 @@ class TestAZFailoverOrchestration:
         # az-a all dead, az-c healthy.
         hc.hosts_table.scan.return_value = {"Items": [
             {"instance_id": "i-1a", "az": "az-a", "last_health_check": _ago_iso(15 * 60),
-             "vcpu_total": 16, "vm_count": 1},
+             "total_vcpu": 16, "total_mem_mb": 65536, "vm_count": 1},
             {"instance_id": "i-2c", "az": "az-c", "last_health_check": _ago_iso(60),
-             "vcpu_total": 16, "vm_count": 1, "next_vm_num": 2,
+             "total_vcpu": 16, "total_mem_mb": 65536, "vm_count": 1, "next_vm_num": 2,
              "avg_vcpu_per_vm": 2, "private_ip": "10.0.2.5"},
         ]}
         hc.hosts_table.get_item.return_value = {"Item": {}}  # no cooldown state
@@ -489,9 +498,9 @@ class TestAZFailoverOrchestration:
         now = datetime.now(timezone.utc)
         hc.hosts_table.scan.return_value = {"Items": [
             {"instance_id": "i-1a", "az": "az-a", "last_health_check": _ago_iso(15 * 60),
-             "vcpu_total": 16, "vm_count": 0},
+             "total_vcpu": 16, "total_mem_mb": 65536, "vm_count": 0},
             {"instance_id": "i-2c", "az": "az-c", "last_health_check": _ago_iso(60),
-             "vcpu_total": 16, "vm_count": 0, "next_vm_num": 1, "avg_vcpu_per_vm": 2,
+             "total_vcpu": 16, "total_mem_mb": 65536, "vm_count": 0, "next_vm_num": 1, "avg_vcpu_per_vm": 2,
              # 1.4.2: private_ip is required by the fake-failover guard so
              # _failover_tenant_to_host can re-point the ALB rule.
              "private_ip": "172.16.2.10"},
@@ -515,9 +524,9 @@ class TestAZFailoverOrchestration:
         # Both AZs failed.
         hc.hosts_table.scan.return_value = {"Items": [
             {"instance_id": "i-1a", "az": "az-a", "last_health_check": _ago_iso(15 * 60),
-             "vcpu_total": 16, "vm_count": 1},
+             "total_vcpu": 16, "total_mem_mb": 65536, "vm_count": 1},
             {"instance_id": "i-2c", "az": "az-c", "last_health_check": _ago_iso(15 * 60),
-             "vcpu_total": 16, "vm_count": 1},
+             "total_vcpu": 16, "total_mem_mb": 65536, "vm_count": 1},
         ]}
         hc.hosts_table.get_item.return_value = {"Item": {}}
         tenants = [{"id": "t-stuck", "host_id": "i-1a", "status": "running",
@@ -535,9 +544,9 @@ class TestAZFailoverOrchestration:
         now = datetime.now(timezone.utc)
         hc.hosts_table.scan.return_value = {"Items": [
             {"instance_id": "i-1a", "az": "az-a", "last_health_check": _ago_iso(15 * 60),
-             "vcpu_total": 16, "vm_count": 0},
+             "total_vcpu": 16, "total_mem_mb": 65536, "vm_count": 0},
             {"instance_id": "i-2c", "az": "az-c", "last_health_check": _ago_iso(60),
-             "vcpu_total": 16, "vm_count": 0, "next_vm_num": 1, "avg_vcpu_per_vm": 2,
+             "total_vcpu": 16, "total_mem_mb": 65536, "vm_count": 0, "next_vm_num": 1, "avg_vcpu_per_vm": 2,
              # 1.4.2: private_ip is required by the fake-failover guard so
              # _failover_tenant_to_host can re-point the ALB rule.
              "private_ip": "172.16.2.10"},
@@ -1139,9 +1148,9 @@ class TestBlockedSummaryBucket:
         # AZ-a is dead; AZ-c has healthy host with capacity.
         hc.hosts_table.scan.return_value = {"Items": [
             {"instance_id": "i-1a", "az": "az-a", "last_health_check": _ago_iso(15 * 60),
-             "total_vcpu": 16, "vm_count": 1},
+             "total_vcpu": 16, "total_mem_mb": 65536, "vm_count": 1},
             {"instance_id": "i-2c", "az": "az-c", "last_health_check": _ago_iso(60),
-             "total_vcpu": 16, "vm_count": 1, "next_vm_num": 2,
+             "total_vcpu": 16, "total_mem_mb": 65536, "vm_count": 1, "next_vm_num": 2,
              "private_ip": "10.0.2.5"},
         ]}
         hc.hosts_table.get_item.return_value = {"Item": {}}
@@ -1185,9 +1194,9 @@ class TestVmNumAllocationBatch:
         # Both tenants in the dead AZ; one healthy target host.
         hc.hosts_table.scan.return_value = {"Items": [
             {"instance_id": "i-1a", "az": "az-a", "last_health_check": _ago_iso(15 * 60),
-             "total_vcpu": 16, "vm_count": 2},
+             "total_vcpu": 16, "total_mem_mb": 65536, "vm_count": 2},
             {"instance_id": "i-2c", "az": "az-c", "last_health_check": _ago_iso(60),
-             "total_vcpu": 16, "vm_count": 0, "next_vm_num": 5,
+             "total_vcpu": 16, "total_mem_mb": 65536, "vm_count": 0, "next_vm_num": 5,
              "private_ip": "10.0.2.5"},
         ]}
         hc.hosts_table.get_item.return_value = {"Item": {}}
@@ -1251,9 +1260,9 @@ class TestCooldownIdempotency:
         hc = self._make_hc()
         hc.hosts_table.scan.return_value = {"Items": [
             {"instance_id": "i-1a", "az": "az-a", "last_health_check": _ago_iso(15 * 60),
-             "total_vcpu": 16, "vm_count": 0},
+             "total_vcpu": 16, "total_mem_mb": 65536, "vm_count": 0},
             {"instance_id": "i-2c", "az": "az-c", "last_health_check": _ago_iso(60),
-             "total_vcpu": 16, "vm_count": 0, "next_vm_num": 1,
+             "total_vcpu": 16, "total_mem_mb": 65536, "vm_count": 0, "next_vm_num": 1,
              "private_ip": "10.0.2.5"},
         ]}
         hc.hosts_table.get_item.return_value = {"Item": {}}
@@ -1280,9 +1289,9 @@ class TestCooldownIdempotency:
         hc = self._make_hc()
         hc.hosts_table.scan.return_value = {"Items": [
             {"instance_id": "i-1a", "az": "az-a", "last_health_check": _ago_iso(15 * 60),
-             "total_vcpu": 16, "vm_count": 0},
+             "total_vcpu": 16, "total_mem_mb": 65536, "vm_count": 0},
             {"instance_id": "i-2c", "az": "az-c", "last_health_check": _ago_iso(60),
-             "total_vcpu": 16, "vm_count": 0, "next_vm_num": 1,
+             "total_vcpu": 16, "total_mem_mb": 65536, "vm_count": 0, "next_vm_num": 1,
              "private_ip": "10.0.2.5"},
         ]}
         hc.hosts_table.get_item.return_value = {"Item": {}}

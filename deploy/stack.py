@@ -223,6 +223,32 @@ class OpenClawOrchestratorStack(cdk.Stack):
     def __init__(self, scope: Construct, id: str, **kwargs):
         super().__init__(scope, id, **kwargs)
 
+        self._build_tables()
+        self._build_assets_bucket()
+        self._build_lambda_shared_policy()
+        self._build_sns_notifications()
+        self._build_api_lambda()
+        self._build_api_gateway()
+        self._build_waf()
+        self._build_api_routes()
+        self._build_health_check()
+        self._build_failover_queue()
+        self._build_skills_lambda()
+        self._build_templates_lambda()
+        self._build_scaler_lambda()
+        self._build_backup_lambda()
+        self._build_alarms()
+        self._build_host_role()
+        self._build_prometheus_grafana()
+        self._build_asg()
+        self._build_multi_az()
+        self._build_agentcore()
+        self._build_alb()
+        self._build_cloudfront()
+        self._build_console_auth()
+        self._build_outputs()
+
+    def _build_tables(self):
         # ========== DynamoDB ==========
         # All control-plane tables enable point-in-time recovery (35-day
         # continuous backup → restore to any second) and deletion protection.
@@ -288,6 +314,13 @@ class OpenClawOrchestratorStack(cdk.Stack):
             removal_policy=RemovalPolicy.RETAIN,
         )
 
+        self.tenants_table = tenants_table
+        self.hosts_table = hosts_table
+        self.groups_table = groups_table
+        self.audit_table = audit_table
+        self.audit_retention_days = audit_retention_days
+
+    def _build_assets_bucket(self):
         # ========== S3 Assets Bucket ==========
         assets_bucket = s3.Bucket(self, "Assets",
             bucket_name=f"openclaw-assets-{self.account}",
@@ -330,6 +363,9 @@ class OpenClawOrchestratorStack(cdk.Stack):
             ]),
         )
 
+        self.assets_bucket = assets_bucket
+
+    def _build_lambda_shared_policy(self):
         # ========== Lambda Shared Policy ==========
         # T2-5: scope the wildcards. These statements are declared before the
         # ASG (created later) so we build literal ARNs from the well-known
@@ -370,6 +406,11 @@ class OpenClawOrchestratorStack(cdk.Stack):
                     "aws:ResourceTag/aws:autoscaling:groupName": "openclaw-hosts-asg"}}),
         ]
 
+        self._asg_arn = _asg_arn
+        self.ssm_policies = ssm_policies
+        self.ec2_policies = ec2_policies
+
+    def _build_sns_notifications(self):
         # ========== SNS Lifecycle Notifications (issue #13, optional) ==========
         notif_cfg = CFG.get("notifications", {}) or {}
         notifications_topic = None
@@ -389,6 +430,23 @@ class OpenClawOrchestratorStack(cdk.Stack):
             retention_period=Duration.days(14),
             enforce_ssl=True,
         )
+
+        self.notifications_topic = notifications_topic
+        self.notifications_topic_arn = notifications_topic_arn
+        self.events_dlq = events_dlq
+
+    def _build_api_lambda(self):
+        tenants_table = self.tenants_table
+        hosts_table = self.hosts_table
+        groups_table = self.groups_table
+        audit_table = self.audit_table
+        audit_retention_days = self.audit_retention_days
+        assets_bucket = self.assets_bucket
+        notifications_topic = self.notifications_topic
+        notifications_topic_arn = self.notifications_topic_arn
+        ssm_policies = self.ssm_policies
+        ec2_policies = self.ec2_policies
+        _asg_arn = self._asg_arn
 
         # ========== API Lambda ==========
         api_fn = _lambda.Function(self, "ApiHandler",
@@ -500,6 +558,9 @@ class OpenClawOrchestratorStack(cdk.Stack):
             resources=[_asg_arn],
         ))
 
+        self.api_fn = api_fn
+
+    def _build_api_gateway(self):
         # ========== API Gateway ==========
         api = apigw.RestApi(self, "Api",
             rest_api_name="openclaw-orchestrator",
@@ -521,6 +582,12 @@ class OpenClawOrchestratorStack(cdk.Stack):
             api_stages=[apigw.UsagePlanPerApiStage(api=api, stage=api.deployment_stage)],
         )
         plan.add_api_key(api_key)
+
+        self.api = api
+        self.api_key = api_key
+
+    def _build_waf(self):
+        api = self.api
 
         # ========== WAF (issue #7, optional) ==========
         waf_cfg = CFG.get("waf", {}) or {}
@@ -592,6 +659,10 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 resource_arn=stage_arn,
                 web_acl_arn=web_acl.attr_arn,
             )
+
+    def _build_api_routes(self):
+        api = self.api
+        api_fn = self.api_fn
 
         key_required = {"api_key_required": True}
 
@@ -683,6 +754,20 @@ class OpenClawOrchestratorStack(cdk.Stack):
         audit_log_resource = api.root.add_resource("audit-log")
         audit_log_resource.add_method("GET", _li(), **key_required)
 
+        self.key_required = key_required
+        self._li = _li
+
+    def _build_health_check(self):
+        tenants_table = self.tenants_table
+        hosts_table = self.hosts_table
+        audit_table = self.audit_table
+        assets_bucket = self.assets_bucket
+        notifications_topic = self.notifications_topic
+        notifications_topic_arn = self.notifications_topic_arn
+        ssm_policies = self.ssm_policies
+        events_dlq = self.events_dlq
+        api_fn = self.api_fn
+
         # ========== Health Check Lambda ==========
         hc_cfg = CFG.get("health_check", {}) or {}
         az_failover_cfg = hc_cfg.get("az_failover", {}) or {}
@@ -767,6 +852,23 @@ class OpenClawOrchestratorStack(cdk.Stack):
         api_fn.add_environment("HEALTH_CHECK_FUNCTION", health_fn.function_name)
         health_fn.grant_invoke(api_fn)
 
+        self.hc_cfg = hc_cfg
+        self.az_failover_cfg = az_failover_cfg
+        self.health_fn = health_fn
+        self._elb_arns = _elb_arns
+
+    def _build_failover_queue(self):
+        tenants_table = self.tenants_table
+        hosts_table = self.hosts_table
+        audit_table = self.audit_table
+        assets_bucket = self.assets_bucket
+        notifications_topic = self.notifications_topic
+        notifications_topic_arn = self.notifications_topic_arn
+        ssm_policies = self.ssm_policies
+        az_failover_cfg = self.az_failover_cfg
+        health_fn = self.health_fn
+        _elb_arns = self._elb_arns
+
         # ========== AZ-failover worker queue (T3-2) ==========
         # The detector (health_fn) enqueues one job per affected tenant; the
         # worker executes them in PARALLEL. This turns full-AZ recovery from
@@ -845,6 +947,18 @@ class OpenClawOrchestratorStack(cdk.Stack):
         health_fn.add_environment("FAILOVER_QUEUE_URL", failover_queue.queue_url)
         failover_queue.grant_send_messages(health_fn)
 
+        self.failover_dlq = failover_dlq
+        self.failover_queue = failover_queue
+        self.failover_worker_fn = failover_worker_fn
+
+    def _build_skills_lambda(self):
+        tenants_table = self.tenants_table
+        groups_table = self.groups_table
+        assets_bucket = self.assets_bucket
+        api = self.api
+        key_required = self.key_required
+        _li = self._li
+
         # ========== Skills Lambda ==========
         skills_fn = _lambda.Function(self, "Skills",
             function_name="openclaw-skills",
@@ -872,6 +986,11 @@ class OpenClawOrchestratorStack(cdk.Stack):
         skill_resource.add_method("PUT", _li(), **key_required)
         skill_resource.add_method("DELETE", _li(), **key_required)
 
+    def _build_templates_lambda(self):
+        assets_bucket = self.assets_bucket
+        api = self.api
+        key_required = self.key_required
+
         # ========== Templates Lambda ==========
         templates_fn = _lambda.Function(self, "Templates",
             function_name="openclaw-templates",
@@ -889,6 +1008,15 @@ class OpenClawOrchestratorStack(cdk.Stack):
         template_item.add_method("GET", apigw.LambdaIntegration(templates_fn), **key_required)
         template_item.add_method("PUT", apigw.LambdaIntegration(templates_fn), **key_required)
         template_item.add_method("DELETE", apigw.LambdaIntegration(templates_fn), **key_required)
+
+    def _build_scaler_lambda(self):
+        tenants_table = self.tenants_table
+        hosts_table = self.hosts_table
+        audit_table = self.audit_table
+        audit_retention_days = self.audit_retention_days
+        ssm_policies = self.ssm_policies
+        events_dlq = self.events_dlq
+        _asg_arn = self._asg_arn
 
         # ========== Scaler Lambda (idle host reclaim) ==========
         scaler_fn = _lambda.Function(self, "Scaler",
@@ -928,6 +1056,15 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 dead_letter_queue=events_dlq, retry_attempts=2)],
         )
 
+        self.scaler_fn = scaler_fn
+
+    def _build_backup_lambda(self):
+        tenants_table = self.tenants_table
+        assets_bucket = self.assets_bucket
+        ssm_policies = self.ssm_policies
+        events_dlq = self.events_dlq
+        api_fn = self.api_fn
+
         # ========== Backup Lambda (daily data backup) ==========
         backup_fn = _lambda.Function(self, "Backup",
             function_name="openclaw-backup",
@@ -953,6 +1090,18 @@ class OpenClawOrchestratorStack(cdk.Stack):
             targets=[targets.LambdaFunction(backup_fn,
                 dead_letter_queue=events_dlq, retry_attempts=2)],
         )
+
+        self.backup_fn = backup_fn
+
+    def _build_alarms(self):
+        notifications_topic = self.notifications_topic
+        events_dlq = self.events_dlq
+        api_fn = self.api_fn
+        health_fn = self.health_fn
+        scaler_fn = self.scaler_fn
+        backup_fn = self.backup_fn
+        failover_worker_fn = self.failover_worker_fn
+        failover_dlq = self.failover_dlq
 
         # ===== CloudWatch alarms (T2-3) =====
         # There were ZERO alarms — every failure mode was log-only. Alarm on
@@ -1005,6 +1154,12 @@ class OpenClawOrchestratorStack(cdk.Stack):
         )
         failover_dlq_alarm.add_alarm_action(_sns_action)
 
+    def _build_host_role(self):
+        tenants_table = self.tenants_table
+        hosts_table = self.hosts_table
+        assets_bucket = self.assets_bucket
+        _asg_arn = self._asg_arn
+
         # ========== Host EC2 Role (SSM + S3 backup + self-register) ==========
         host_role = iam.Role(self, "HostRole",
             assumed_by=iam.ServicePrincipal("ec2.amazonaws.com"),
@@ -1038,6 +1193,12 @@ class OpenClawOrchestratorStack(cdk.Stack):
             actions=["cloudformation:DescribeStacks"],
             resources=[cdk.Aws.STACK_ID],
         ))
+
+        self.host_role = host_role
+
+    def _build_prometheus_grafana(self):
+        host_role = self.host_role
+        api_fn = self.api_fn
 
         # ========== Amazon Managed Prometheus + Grafana (issue #4) ==========
         # Host-agent exposes /metrics on :8899 (same listener as /health);
@@ -1094,6 +1255,12 @@ class OpenClawOrchestratorStack(cdk.Stack):
             instance_profile_name="openclaw-host-profile",
         )
 
+        self.amp_remote_write_url = amp_remote_write_url
+        self.instance_profile = instance_profile
+
+    def _build_asg(self):
+        host_role = self.host_role
+
         # ========== ASG (P1-4) ==========
         ac_cfg = CFG.get("agentcore", {})
         ac_enabled = ac_cfg.get("enabled", False)
@@ -1128,6 +1295,23 @@ class OpenClawOrchestratorStack(cdk.Stack):
             if vpc.public_subnets:
                 return ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC)
             return ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS)
+
+        self.ac_cfg = ac_cfg
+        self.ac_enabled = ac_enabled
+        self.gateway_url = gateway_url
+        self.ac_gateway = ac_gateway
+        self.vpc = vpc
+        self._subnet_selection = _subnet_selection
+
+    def _build_multi_az(self):
+        assets_bucket = self.assets_bucket
+        events_dlq = self.events_dlq
+        api_fn = self.api_fn
+        host_role = self.host_role
+        amp_remote_write_url = self.amp_remote_write_url
+        gateway_url = self.gateway_url
+        vpc = self.vpc
+        _subnet_selection = self._subnet_selection
 
         # ========== Multi-AZ HA (issue #8) ==========
         # `_az_count` controls how many AZs the ASG and ALB span. Default is
@@ -1364,6 +1548,15 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 dead_letter_queue=events_dlq, retry_attempts=2)],
         )
 
+        self.sg = sg
+
+    def _build_agentcore(self):
+        api_fn = self.api_fn
+        ac_cfg = self.ac_cfg
+        ac_enabled = self.ac_enabled
+        gateway_url = self.gateway_url
+        ac_gateway = self.ac_gateway
+
         # ========== AgentCore (optional, continued) ==========
         if ac_enabled:
             # Gateway already created above (before userdata processing)
@@ -1462,6 +1655,15 @@ class OpenClawOrchestratorStack(cdk.Stack):
                 api_fn.add_environment("AGENTCORE_GATEWAY_URL", gateway_url)
 
 
+    def _build_alb(self):
+        api_fn = self.api_fn
+        health_fn = self.health_fn
+        failover_worker_fn = self.failover_worker_fn
+        _elb_arns = self._elb_arns
+        vpc = self.vpc
+        _subnet_selection = self._subnet_selection
+        sg = self.sg
+
         # ========== ALB (Dashboard Proxy) ==========
         # ALB requires ≥2 subnets in different AZs (AWS API constraint).
         # The multi_az.az_count knob controls ASG fan-out; ALB independently
@@ -1525,6 +1727,12 @@ class OpenClawOrchestratorStack(cdk.Stack):
             ],
             resources=_elb_arns,
         ))
+
+        self.alb = alb
+
+    def _build_cloudfront(self):
+        assets_bucket = self.assets_bucket
+        alb = self.alb
 
         # ========== CloudFront ==========
         # 1.3.4 (#61): support two-distribution mode for security boundary between
@@ -1688,6 +1896,21 @@ function handler(event) {
             console_cf_id = cf_distribution.distribution_id
             app_cf_id = cf_distribution.distribution_id
 
+        self.dual_mode = dual_mode
+        self.custom_domain = custom_domain
+        self.console_host = console_host
+        self.dashboard_host = dashboard_host
+        self.console_cf_id = console_cf_id
+        self.app_cf_id = app_cf_id
+        self.cf_distribution = cf_distribution
+
+    def _build_console_auth(self):
+        api_fn = self.api_fn
+        dual_mode = self.dual_mode
+        custom_domain = self.custom_domain
+        console_host = self.console_host
+        cf_distribution = self.cf_distribution
+
         # ========== Console Auth (Cognito) ==========
         auth_cfg = CFG.get("console_auth", {})
         cognito_outputs = {}
@@ -1794,6 +2017,23 @@ function handler(event) {
                                    cognito_outputs.get("CognitoUserPoolId", ""))
             api_fn.add_environment("COGNITO_CLIENT_ID",
                                    cognito_outputs.get("CognitoClientId", ""))
+
+        self.cognito_outputs = cognito_outputs
+
+    def _build_outputs(self):
+        api = self.api
+        api_key = self.api_key
+        tenants_table = self.tenants_table
+        hosts_table = self.hosts_table
+        assets_bucket = self.assets_bucket
+        instance_profile = self.instance_profile
+        notifications_topic_arn = self.notifications_topic_arn
+        dual_mode = self.dual_mode
+        console_host = self.console_host
+        dashboard_host = self.dashboard_host
+        console_cf_id = self.console_cf_id
+        app_cf_id = self.app_cf_id
+        cognito_outputs = self.cognito_outputs
 
         # ========== Outputs ==========
         for key, val in {

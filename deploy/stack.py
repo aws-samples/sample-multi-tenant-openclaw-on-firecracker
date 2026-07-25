@@ -154,20 +154,55 @@ def _stage_lambda_asset(name):
     """Stage a Lambda's source + the shared `common/` package into a build dir
     and return its path for Code.from_asset (T3-3).
 
-    The shared helpers live in deploy/lambda/common/, a sibling of each
-    handler dir, so a plain Code.from_asset("deploy/lambda/<name>") would NOT
-    include them. We copytree the handler dir, then overlay common/ inside it,
-    so at runtime `from common import ...` resolves next to the handler. Rebuilt
-    from scratch every synth (rmtree first) so a deleted source file can't
-    linger in the bundle. __pycache__ is skipped to keep the asset hash stable.
+    The shared helpers live in deploy/lambda/common/, a sibling of each handler
+    dir, so a plain Code.from_asset("deploy/lambda/<name>") would NOT include
+    them. We copytree the handler dir, then overlay common/ inside it, so at
+    runtime `from common import ...` resolves next to the handler.
+
+    The staging dir is suffixed with a hash of the source contents, so:
+      * identical source → identical path (reused, never rebuilt);
+      * the path is NEVER rmtree'd while a concurrent/deferred CDK asset bundle
+        is still executing pip from it (the api Lambda bundles from this dir).
+    Rebuilding a fixed path in place (the old approach) let one synth's rmtree
+    pull the directory out from under another synth's in-flight pip bundle →
+    "The folder you are executing pip from can no longer be found." Content-
+    addressed dirs make staging idempotent and collision-free instead.
     """
+    import hashlib
     import shutil
-    dest = _LAMBDA_STAGE / name
+
+    src_handler = _LAMBDA_SRC / name
+    src_common = _LAMBDA_SRC / "common"
+
+    # Fingerprint every .py under the handler dir + common/ (path + bytes) so
+    # any edit yields a fresh dir and a stale file can never linger in a reused
+    # bundle.
+    h = hashlib.sha256()
+    for root in (src_handler, src_common):
+        for f in sorted(root.rglob("*.py")):
+            if "__pycache__" in f.parts:
+                continue
+            h.update(str(f.relative_to(_LAMBDA_SRC)).encode())
+            h.update(f.read_bytes())
+    dest = _LAMBDA_STAGE / f"{name}-{h.hexdigest()[:12]}"
+
     if dest.exists():
-        shutil.rmtree(dest)
+        return str(dest)  # already staged for this exact source; reuse
+    _LAMBDA_STAGE.mkdir(parents=True, exist_ok=True)
+
+    # Stage into a temp sibling then atomically rename, so a half-copied dir is
+    # never observed under `dest` by a parallel synth.
     ignore = shutil.ignore_patterns("__pycache__", "*.pyc")
-    shutil.copytree(_LAMBDA_SRC / name, dest, ignore=ignore)
-    shutil.copytree(_LAMBDA_SRC / "common", dest / "common", ignore=ignore)
+    tmp = _LAMBDA_STAGE / f".{name}-{h.hexdigest()[:12]}.tmp"
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    shutil.copytree(src_handler, tmp, ignore=ignore)
+    shutil.copytree(src_common, tmp / "common", ignore=ignore)
+    try:
+        tmp.rename(dest)
+    except OSError:
+        # Another synth won the race and created dest first — drop our temp.
+        shutil.rmtree(tmp, ignore_errors=True)
     return str(dest)
 
 

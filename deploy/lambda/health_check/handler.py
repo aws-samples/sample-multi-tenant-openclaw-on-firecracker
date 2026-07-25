@@ -31,8 +31,10 @@ from datetime import datetime, timezone
 
 import boto3
 from botocore.exceptions import ClientError
+from common import audit as _audit
 from common import capacity as _capacity
 from common import ddb as _ddb_helpers
+from common import ssm as _ssm_helpers
 
 ddb = boto3.resource("dynamodb")
 ssm = boto3.client("ssm")
@@ -46,6 +48,10 @@ hosts_table = ddb.Table(os.environ["HOSTS_TABLE"])
 # Optional tables / topics — feature-flag friendly.
 _AUDIT_TABLE_NAME = os.environ.get("AUDIT_TABLE", "")
 audit_table = ddb.Table(_AUDIT_TABLE_NAME) if _AUDIT_TABLE_NAME else None
+# T3-3: honor AUDIT_TTL_DAYS like the api/scaler writers. The old _emit_audit
+# hard-coded 90 days, so health_check rows outlived everything else's when an
+# operator shortened retention.
+AUDIT_TTL_DAYS = int(os.environ.get("AUDIT_TTL_DAYS", "90"))
 _SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
 
 STALE_SECONDS = 120  # No health update for 2 min → agent may be down
@@ -465,48 +471,17 @@ def _advance_migration(tenant, now):
 
 
 def _poll_ssm(command_id, instance_id):
-    """Single, instantaneous check of an SSM command's status. Returns
-    (done, ok):
-      (False, _)    — Pending / InProgress / Delayed / not yet registered;
-                      re-check on the next sweep tick (do NOT block here)
-      (True, True)  — Success
-      (True, False) — Failed / TimedOut / Cancelled
-
-    Deliberately does NOT reuse _wait_ssm_done: that helper blocks in a sleep
-    loop and collapses 'still running' and 'failed' into the same (False, msg),
-    which the sweep must distinguish. We read Status once and return."""
-    try:
-        inv = ssm.get_command_invocation(
-            CommandId=command_id, InstanceId=instance_id,
-        )
-    except ssm.exceptions.InvocationDoesNotExist:
-        return False, False  # not registered yet; try next tick
-    except Exception as e:
-        print(f"_poll_ssm error {command_id}/{instance_id}: {e}")
-        return False, False
-    status = inv.get("Status", "Pending")
-    if status == "Success":
-        return True, True
-    if status in ("Failed", "TimedOut", "Cancelled"):
-        print(f"_poll_ssm {command_id}: {status} - "
-              f"{(inv.get('StandardErrorContent') or '')[:200]}")
-        return True, False
-    return False, False  # Pending / InProgress / Delayed
+    """Single, non-blocking SSM status check → (done, ok). Thin wrapper over the
+    shared helper (T3-3); kept as a module name for existing monkeypatches."""
+    return _ssm_helpers.poll(ssm, command_id, instance_id)
 
 
 def _ssm_send_hc(instance_id, command, timeout=120):
-    """Fire-and-forget SSM from the health_check Lambda; returns CommandId or
-    None. Mirrors the api Lambda's _ssm_send (wraps HOME/cd, returns the id so
-    the sweep can poll it on the next tick)."""
+    """Fire-and-forget SSM from the health_check Lambda → CommandId or None.
+    Thin wrapper over the shared helper (was a byte-identical copy of api
+    _ssm_send)."""
     try:
-        wrapped = f'export HOME=/home/ubuntu && cd /home/ubuntu && {command}'
-        resp = ssm.send_command(
-            InstanceIds=[instance_id],
-            DocumentName="AWS-RunShellScript",
-            Parameters={"commands": [wrapped], "executionTimeout": [str(timeout)]},
-            TimeoutSeconds=timeout + 10,
-        )
-        return resp["Command"]["CommandId"]
+        return _ssm_helpers.send(ssm, instance_id, command, timeout)
     except Exception as e:
         print(f"_ssm_send_hc error: {e}")
         return None
@@ -1317,28 +1292,9 @@ def _find_latest_backup_key(tenant_id):
 
 
 def _wait_ssm_done(command_id, instance_id, timeout_sec=90, poll_sec=3):
-    """Block until an SSM command completes. Returns (ok, error_or_None)."""
-    import time as _t
-    deadline = _t.time() + timeout_sec
-    last_status = "Pending"
-    while _t.time() < deadline:
-        _t.sleep(poll_sec)
-        try:
-            inv = ssm.get_command_invocation(
-                CommandId=command_id, InstanceId=instance_id,
-            )
-        except ssm.exceptions.InvocationDoesNotExist:
-            continue
-        except Exception as e:
-            return False, f"get_command_invocation: {e}"
-        last_status = inv.get("Status", "Unknown")
-        if last_status in ("Success",):
-            return True, None
-        if last_status in ("Cancelled", "TimedOut", "Failed"):
-            err = (inv.get("StandardErrorContent") or "")[:500]
-            return False, f"SSM {last_status}: {err}"
-        # else: keep polling (InProgress, Pending, Delayed)
-    return False, f"SSM timeout after {timeout_sec}s (last_status={last_status})"
+    """Block until an SSM command completes → (ok, error_or_None). Thin wrapper
+    over the shared helper (T3-3)."""
+    return _ssm_helpers.wait(ssm, command_id, instance_id, timeout_sec, poll_sec)
 
 
 def _verify_vm_actually_running(host_id, tenant_id, timeout_sec=90, poll_sec=10):
@@ -1597,41 +1553,29 @@ def _emit_audit(operation, detail):
     """
     if not audit_table:
         return
-    try:
-        import uuid
-        ttl = int(datetime.now(timezone.utc).timestamp()) + 90 * 86400
-        tenant_id = detail.get("tenant_id")
-        az = detail.get("az")
-        host_id = detail.get("host_id") or detail.get("instance_id")
-        if tenant_id:
-            obj, rid = f"tenant:{tenant_id}", tenant_id
-        elif host_id:
-            obj, rid = f"host:{host_id}", host_id
-        elif az:
-            obj, rid = f"az:{az}", az
-        else:
-            obj, rid = "system", ""
-        # actor = the automated source that performed the action.
-        source = detail.get("source") or ("az-failover" if az and "FAILOVER" in operation
-                                           else "health-check")
-        audit_table.put_item(Item={
-            "pk": "audit",
-            "id": str(uuid.uuid4()),
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "operation": operation,          # kept for back-compat
-            "resource_id": rid,
-            "api_key_id": "system:health-check-lambda",
-            "response_status": 200,
-            "detail": json.dumps(detail)[:1000],
-            "expires_ttl": ttl,
-            # Issue #71 enrichment (unified schema):
-            "event": _HC_EVENT_MAP.get(operation, operation.lower()),
-            "object": obj,
-            "actor": f"system:{source}",
-            "actor_role": "system",
-        })
-    except Exception as e:
-        print(f"audit emit failed (non-fatal): {e}")
+    tenant_id = detail.get("tenant_id")
+    az = detail.get("az")
+    host_id = detail.get("host_id") or detail.get("instance_id")
+    if tenant_id:
+        obj, rid = f"tenant:{tenant_id}", tenant_id
+    elif host_id:
+        obj, rid = f"host:{host_id}", host_id
+    elif az:
+        obj, rid = f"az:{az}", az
+    else:
+        obj, rid = "system", ""
+    # actor = the automated source that performed the action.
+    source = detail.get("source") or ("az-failover" if az and "FAILOVER" in operation
+                                       else "health-check")
+    # T3-3: delegate the row write; honors AUDIT_TTL_DAYS (was hard-coded 90d).
+    # `operation` keeps the UPPERCASE constant for back-compat (tests assert it);
+    # `event` is the enriched lowercase name for the UI.
+    _audit.put_audit_row(
+        audit_table,
+        event=_HC_EVENT_MAP.get(operation, operation.lower()),
+        obj=obj, resource_id=rid, actor=f"system:{source}", actor_role="system",
+        operation=operation, response_status=200, detail=detail,
+        ttl_days=AUDIT_TTL_DAYS, api_key_id="system:health-check-lambda")
 
 
 def _emit_sns_notification(az, outage, recovered_count):

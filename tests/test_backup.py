@@ -111,27 +111,32 @@ class TestScheduledBackup:
 
 
 class TestSsmRun:
+    # T3-3: _ssm_run delegates to common.ssm.run, so the blocking sleep now
+    # lives there — patch that module's time.sleep.
     def test_success_status_returns_true(self):
+        from common import ssm as _ssm
         backup.ssm = MagicMock()
         backup.ssm.send_command.return_value = {"Command": {"CommandId": "c1"}}
         backup.ssm.get_command_invocation.return_value = {
             "Status": "Success", "StandardOutputContent": "done"}
-        with patch.object(backup.time, "sleep"):
+        with patch.object(_ssm.time, "sleep"):
             ok, out = backup._ssm_run("i-1", "cmd", timeout=9)
         assert ok is True and out == "done"
 
     def test_failed_status_returns_false_with_stderr(self):
+        from common import ssm as _ssm
         backup.ssm = MagicMock()
         backup.ssm.send_command.return_value = {"Command": {"CommandId": "c1"}}
         backup.ssm.get_command_invocation.return_value = {
             "Status": "Failed", "StandardErrorContent": "boom"}
-        with patch.object(backup.time, "sleep"):
+        with patch.object(_ssm.time, "sleep"):
             ok, out = backup._ssm_run("i-1", "cmd", timeout=9)
         assert ok is False and out == "boom"
 
     def test_send_command_exception_is_caught(self):
+        from common import ssm as _ssm
         backup.ssm = MagicMock()
         backup.ssm.send_command.side_effect = RuntimeError("throttled")
-        with patch.object(backup.time, "sleep"):
+        with patch.object(_ssm.time, "sleep"):
             ok, out = backup._ssm_run("i-1", "cmd", timeout=9)
         assert ok is False and "throttled" in out

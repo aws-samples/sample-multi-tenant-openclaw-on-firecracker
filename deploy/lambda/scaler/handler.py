@@ -1,12 +1,11 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-import json
 import os
-import uuid
 from datetime import datetime, timezone
 
 import boto3
+from common import audit as _audit_lib
 from common import ddb as _ddb_helpers
 
 ddb = boto3.resource("dynamodb")
@@ -29,31 +28,12 @@ def _scan_all(table, **kwargs):
 
 def _audit(event_name, obj, resource_id, actor, detail=None):
     """Best-effort audit row for the scaler's automated actions (issue #71).
-    Same schema as the API/health_check audit writers so they render in one
-    console Logs table. Never raises."""
-    if audit_table is None:
-        return
-    try:
-        ts = datetime.now(timezone.utc)
-        item = {
-            "pk": "audit",
-            "id": str(uuid.uuid4()),
-            "ts": ts.isoformat(),
-            "operation": event_name,
-            "resource_id": resource_id or "",
-            "api_key_id": actor,
-            "response_status": 200,
-            "expires_ttl": int(ts.timestamp()) + AUDIT_TTL_DAYS * 86400,
-            "event": event_name,
-            "object": obj,
-            "actor": actor,
-            "actor_role": "system",
-        }
-        if detail is not None:
-            item["detail"] = json.dumps(detail, default=str)[:1000]
-        audit_table.put_item(Item=item)
-    except Exception as e:
-        print(f"scaler audit failed (non-fatal): {e}")
+    Delegates to common.audit (T3-3) — one schema across all Lambdas."""
+    _audit_lib.put_audit_row(
+        audit_table, event=event_name, obj=obj, resource_id=resource_id,
+        actor=actor, actor_role="system", operation=event_name,
+        response_status=200, detail=detail, ttl_days=AUDIT_TTL_DAYS,
+        api_key_id=actor)
 
 # Issue #15 — terminal statuses where TTL processing is a no-op
 _TTL_TERMINAL = {"stopped", "deleted", "failed"}

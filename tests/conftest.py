@@ -31,6 +31,13 @@ def pytest_configure(config):
     lambda_dir = _os.path.join(repo_root, "deploy", "lambda")
     if lambda_dir not in _sys.path:
         _sys.path.insert(0, lambda_dir)
+    # T3-4 Phase 2: the api handler does `from domains.common import ...`; the
+    # domains/ package sits inside deploy/lambda/api (copied to the Lambda task
+    # root at deploy time). Put that dir on sys.path so importlib-loaded handler
+    # tests resolve it too.
+    api_dir = _os.path.join(lambda_dir, "api")
+    if api_dir not in _sys.path:
+        _sys.path.insert(0, api_dir)
     cfg = _os.path.join(repo_root, "config.yml")
     example = _os.path.join(repo_root, "config.yml.example")
     if not _os.path.exists(cfg) and _os.path.exists(example):

@@ -77,6 +77,12 @@ ASSETS_BUCKET = os.environ.get("ASSETS_BUCKET", "")
 # (and operators get a CloudWatch warning each failover).
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "")
 ALB_LISTENER_ARN = os.environ.get("ALB_LISTENER_ARN", "")
+# T3-3: the VPC to create a host target group in during failover. The API
+# Lambda always used its VPC_ID env; health_check used to clone VpcId from an
+# arbitrary existing target group (existing[0]), which breaks when none exist
+# yet (cold start / after cleanup) or when a cross-VPC TG is present. Prefer the
+# env; the clone stays only as a fallback for un-redeployed stacks.
+VPC_ID = os.environ.get("VPC_ID", "")
 
 # T3-2: AZ-failover detection/execution split. When FAILOVER_QUEUE_URL is set,
 # the detector (this Lambda) only detects the outage, claims each affected
@@ -1463,11 +1469,17 @@ def _repoint_alb_rule(tenant_id, target_host_id, target_private_ip):
         tg_arn = resp["TargetGroups"][0]["TargetGroupArn"]
     except Exception:
         # Host TG doesn't exist yet (e.g. host registered without API path).
-        # Need VPC ID for create — pulled from existing TG of source host.
-        existing = elbv2.describe_target_groups()["TargetGroups"]
-        if not existing:
-            raise RuntimeError("no existing target groups to clone VPC from") from None
-        vpc_id = existing[0]["VpcId"]
+        # T3-3: use the VPC_ID env (same source the API scheduler uses). Only
+        # fall back to cloning from an existing TG on stacks not yet redeployed
+        # with VPC_ID injected into this Lambda.
+        vpc_id = VPC_ID
+        if not vpc_id:
+            existing = elbv2.describe_target_groups()["TargetGroups"]
+            if not existing:
+                raise RuntimeError(
+                    "cannot create target group: VPC_ID env not set and no "
+                    "existing target group to clone VPC from") from None
+            vpc_id = existing[0]["VpcId"]
         tg_arn = elbv2.create_target_group(
             Name=tg_name, Protocol="HTTP", Port=80, VpcId=vpc_id,
             TargetType="ip", HealthCheckPath="/health",

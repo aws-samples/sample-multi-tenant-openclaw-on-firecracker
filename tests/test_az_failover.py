@@ -379,6 +379,38 @@ class TestPickTargetHost:
 
 
 # ══════════════════════════════════════════════════════════════════════
+# T3-3: _repoint_alb_rule creates the host TG in VPC_ID, not a cloned VpcId
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestRepointUsesVpcIdEnv:
+    @pytest.mark.unit
+    def test_creates_tg_in_vpc_id_env_no_clone(self):
+        """When the host TG doesn't exist, create_target_group must use the
+        VPC_ID env — NOT clone VpcId from an arbitrary existing TG (the old
+        drift bug, which broke on cold start / cross-VPC TGs)."""
+        hc = _load_hc_module(env_overrides={
+            "ALB_LISTENER_ARN": "arn:listener", "VPC_ID": "vpc-correct"})
+        elbv2 = hc._test_mocks["elbv2"]
+        # Host TG missing → describe by name raises; fall through to create.
+        elbv2.describe_target_groups.side_effect = Exception("not found")
+        elbv2.create_target_group.return_value = {
+            "TargetGroups": [{"TargetGroupArn": "arn:tg:new"}]}
+        elbv2.describe_rules.return_value = {"Rules": [{
+            "RuleArn": "arn:rule:1", "Priority": "10",
+            "Conditions": [{"Field": "path-pattern", "Values": ["/vm/t1", "/vm/t1/*"]}],
+            "Actions": [{"Type": "forward", "TargetGroupArn": "arn:tg:old"}]}]}
+        hc._repoint_alb_rule("t1", "i-target", "10.0.9.9")
+        # The create used the env VPC, and never listed all TGs to clone one.
+        assert elbv2.create_target_group.call_args.kwargs["VpcId"] == "vpc-correct"
+        # describe_target_groups was only called by NAME (the lookup), never
+        # the argument-less "list all to clone VpcId" form.
+        for call in elbv2.describe_target_groups.call_args_list:
+            assert call.kwargs.get("Names"), \
+                "must not list all TGs to clone a VpcId when VPC_ID is set"
+
+
+# ══════════════════════════════════════════════════════════════════════
 # 5. should_skip_az_for_cooldown
 # ══════════════════════════════════════════════════════════════════════
 

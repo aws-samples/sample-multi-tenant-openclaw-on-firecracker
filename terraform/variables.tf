@@ -48,3 +48,43 @@ variable "backup_retention_days" {
   type        = number
   default     = 7
 }
+
+# ─────────────────────────────────────────────
+# T3-6: API Lambda env parity toggles (were CDK-only)
+# ─────────────────────────────────────────────
+
+variable "audit_ttl_days" {
+  description = "Audit-log row retention in days (DDB TTL). Parity with config.yml audit.ttl_days."
+  type        = number
+  default     = 90
+}
+
+variable "rbac_enabled" {
+  description = "Enable role-based access control (viewer/operator/admin). Requires console auth + Cognito (CDK-only) to be meaningful."
+  type        = bool
+  default     = false
+}
+
+variable "console_auth_enabled" {
+  description = "Enable Cognito console login. Note: Cognito resources themselves are CDK-only; set the COGNITO_* env via api_env_overrides on the TF path."
+  type        = bool
+  default     = false
+}
+
+variable "default_no_jwt_role" {
+  description = "Role assumed for requests without a JWT when RBAC is on."
+  type        = string
+  default     = "viewer"
+}
+
+variable "vm_data_disk_mb" {
+  description = "Per-tenant data disk size in MB. Parity with config.yml (handler fallback is only 2048)."
+  type        = number
+  default     = 8192
+}
+
+variable "api_env_overrides" {
+  description = "Extra/override env vars for the api Lambda (e.g. COGNITO_USER_POOL_ID on the TF path). Merged last, wins over all defaults."
+  type        = map(string)
+  default     = {}
+}

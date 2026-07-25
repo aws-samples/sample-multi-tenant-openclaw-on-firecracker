@@ -24,6 +24,46 @@ provider "aws" {
 data "aws_caller_identity" "current" {}
 
 # ─────────────────────────────────────────────
+# API Lambda static env (T3-6)
+# ─────────────────────────────────────────────
+# The config-derived env vars the CDK stack sets but the TF path was missing.
+# Values mirror config.yml.example defaults; toggles that operators commonly
+# flip are exposed as variables. Anything here can be overridden per-deploy via
+# var.api_env_overrides without editing this block. A pytest drift-guard asserts
+# every os.environ name the handler reads is either here, resource-derived in
+# the Lambda block, or explicitly marked CDK-only in README.
+locals {
+  api_env_static = {
+    # Audit log (#71) — retention + the table is wired in the Lambda block.
+    AUDIT_TTL_DAYS = tostring(var.audit_ttl_days)
+    # RBAC / console auth (#14) — off by default, same as config.yml.example.
+    RBAC_ENABLED         = tostring(var.rbac_enabled)
+    CONSOLE_AUTH_ENABLED = tostring(var.console_auth_enabled)
+    DEFAULT_NO_JWT_ROLE  = var.default_no_jwt_role
+    # VM shape / networking defaults — handler fallback VM_DATA_DISK_MB=2048
+    # differs from config.yml.example 8192, so TF tenants silently got 2 GB
+    # data disks. Pin the config value explicitly.
+    VM_DATA_DISK_MB    = tostring(var.vm_data_disk_mb)
+    VM_DEFAULT_VCPU    = "2"
+    VM_DEFAULT_MEM     = "4096"
+    VM_PORT_BASE       = "18789"
+    VM_SUBNET_PREFIX   = "172.16"
+    HOST_RESERVED_VCPU = "1"
+    HOST_RESERVED_MEM  = "2048"
+    # Feature flags — default off, parity with config.yml.example.
+    QUOTAS_ENABLED          = "false"
+    QUOTAS_MAX_VCPU         = "0"
+    QUOTAS_MAX_MEM_MB       = "0"
+    QUOTAS_MAX_DATA_DISK_MB = "0"
+    MULTI_AZ_ENABLED        = "false"
+    MULTI_AZ_COUNT          = "1"
+    WAF_ENABLED             = "false"
+    BALLOON_ENABLED         = "false"
+    BALLOON_MIGRATE_MODE    = "cold"
+  }
+}
+
+# ─────────────────────────────────────────────
 # DynamoDB
 # ─────────────────────────────────────────────
 
@@ -50,6 +90,53 @@ resource "aws_dynamodb_table" "hosts" {
   attribute {
     name = "instance_id"
     type = "S"
+  }
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+# T3-6: parity with the CDK stack. Without these tables the api handler's
+# fallback kicks in — GROUPS_TABLE unset → groups_table=None → every /groups
+# endpoint silently no-ops; AUDIT_TABLE unset → audit_table=None → /audit-log
+# returns nothing and zero audit rows are ever written. Both are feature-
+# disabling-by-omission bugs on the TF deploy path.
+resource "aws_dynamodb_table" "groups" {
+  name         = "openclaw-groups"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "name"
+
+  attribute {
+    name = "name"
+    type = "S"
+  }
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "aws_dynamodb_table" "audit" {
+  # Single-partition by design (pk="audit"), ts as range key for time-range
+  # queries; DDB TTL on expires_ttl auto-prunes per AUDIT_TTL_DAYS.
+  name         = "openclaw-audit-log-tf"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "pk"
+  range_key    = "ts"
+
+  attribute {
+    name = "pk"
+    type = "S"
+  }
+  attribute {
+    name = "ts"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "expires_ttl"
+    enabled        = true
   }
 
   lifecycle {
@@ -121,6 +208,8 @@ resource "aws_iam_role_policy" "lambda_inline" {
         Resource = [
           aws_dynamodb_table.tenants.arn,
           aws_dynamodb_table.hosts.arn,
+          aws_dynamodb_table.groups.arn,
+          aws_dynamodb_table.audit.arn,
         ]
       },
       {
@@ -162,9 +251,17 @@ resource "aws_lambda_function" "api" {
   source_code_hash = filebase64sha256(var.lambda_zip_path)
 
   environment {
-    variables = {
+    # T3-6: env parity with the CDK stack. `local.api_env_static` carries the
+    # config-derived vars that were missing on the TF path (feature-gating +
+    # VM defaults); resource-derived names (table/bucket/ASG) are merged over
+    # it; `var.api_env_overrides` lets operators tune without editing this file.
+    # Resource-derived CDK-only vars (COGNITO_*, ALB_LISTENER_ARN, AGENTCORE_*,
+    # AMP/GRAFANA) are intentionally absent — see terraform/README.md.
+    variables = merge(local.api_env_static, {
       TENANTS_TABLE = aws_dynamodb_table.tenants.name
       HOSTS_TABLE   = aws_dynamodb_table.hosts.name
+      GROUPS_TABLE  = aws_dynamodb_table.groups.name
+      AUDIT_TABLE   = aws_dynamodb_table.audit.name
       ASSETS_BUCKET = aws_s3_bucket.assets.bucket
       ROOTFS_PREFIX = var.rootfs_prefix
       BACKUP_PREFIX = var.backup_prefix
@@ -175,7 +272,7 @@ resource "aws_lambda_function" "api" {
       CPU_OVERCOMMIT_RATIO = tostring(var.cpu_overcommit_ratio)
       MEM_OVERCOMMIT_RATIO = tostring(var.mem_overcommit_ratio)
       MAX_VMS_PER_HOST     = tostring(var.max_vms_per_host)
-    }
+    }, var.api_env_overrides)
   }
 }
 

@@ -98,3 +98,81 @@ class TestReadmeQuality:
         text = (TF_DIR / "README.md").read_text().lower()
         # Must explain that this is parity with the CDK stack
         assert "cdk" in text
+
+
+# ══════════════════════════════════════════════════════════════════════
+# T3-6: env-var parity between the api handler and the Terraform path
+# ══════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.unit
+class TestEnvParity:
+    """The api handler silently disables features when an env var is unset
+    (GROUPS_TABLE→no /groups, AUDIT_TABLE→no audit, RBAC_ENABLED→RBAC off, ...).
+    The TF path used to set only 9 of ~42 vars. This is the drift guard: every
+    os.environ name the handler reads MUST be provided by main.tf — as a static
+    local, resource-derived in the Lambda block, or an explicit CDK-only var
+    (features this minimal module doesn't create the backing resource for)."""
+
+    HANDLER = ROOT / "deploy" / "lambda" / "api" / "handler.py"
+
+    # Injected by the Lambda runtime — never set by IaC.
+    _RUNTIME_PROVIDED = {"AWS_REGION", "AWS_DEFAULT_REGION"}
+
+    # Resource-derived and CDK-only: this minimal TF module doesn't create the
+    # backing resource (Cognito, ALB, VPC wiring, AgentCore, AMP/AMG, the
+    # sibling Lambdas). Documented as intentionally absent in README; operators
+    # supply them via api_env_overrides. Keep in sync with the README list.
+    _CDK_ONLY = {
+        "COGNITO_USER_POOL_ID", "COGNITO_CLIENT_ID",
+        "ALB_LISTENER_ARN", "VPC_ID",
+        "AGENTCORE_ENABLED", "AGENTCORE_GATEWAY_URL",
+        "AMP_REMOTE_WRITE_URL", "GRAFANA_WORKSPACE_URL",
+        "HEALTH_CHECK_FUNCTION", "BACKUP_FUNCTION",
+        "NOTIFICATIONS_TOPIC_ARN", "PROJECT_VERSION",
+    }
+
+    def _handler_env_names(self):
+        src = self.HANDLER.read_text()
+        return set(re.findall(
+            r'os\.environ(?:\.get)?\(\s*["\']([A-Z_][A-Z0-9_]*)["\']', src))
+
+    def _tf_provided_names(self):
+        text = "\n".join(p.read_text() for p in TF_DIR.glob("*.tf"))
+        # Any `NAME = ...` inside a local/env map (uppercase snake keys).
+        return set(re.findall(r'^\s*([A-Z_][A-Z0-9_]*)\s*=', text, re.MULTILINE))
+
+    def test_every_handler_env_is_provided_or_documented(self):
+        read = self._handler_env_names()
+        provided = self._tf_provided_names()
+        missing = read - provided - self._RUNTIME_PROVIDED - self._CDK_ONLY
+        assert not missing, (
+            "api handler reads env vars the Terraform path neither sets nor "
+            f"documents as CDK-only: {sorted(missing)}. Add them to "
+            "local.api_env_static / the Lambda env block, or (if resource-"
+            "derived) to the _CDK_ONLY allowlist + terraform/README.md.")
+
+    def test_feature_gating_vars_present(self):
+        """The specific vars whose absence silently disabled features."""
+        provided = self._tf_provided_names()
+        for name in ("GROUPS_TABLE", "AUDIT_TABLE", "AUDIT_TTL_DAYS",
+                     "RBAC_ENABLED", "CONSOLE_AUTH_ENABLED", "VM_DATA_DISK_MB"):
+            assert name in provided, f"TF path missing feature-gating {name}"
+
+    def test_groups_and_audit_tables_exist(self):
+        text = "\n".join(p.read_text() for p in TF_DIR.glob("*.tf"))
+        matches = re.findall(r'resource\s+"aws_dynamodb_table"\s+"(\w+)"', text)
+        assert "groups" in matches and "audit" in matches, \
+            f"missing groups/audit DDB tables; found {matches}"
+        # Audit table must carry a TTL block so rows auto-prune.
+        assert re.search(r'ttl\s*\{[^}]*attribute_name\s*=\s*"expires_ttl"',
+                         text, re.DOTALL), "audit table missing TTL on expires_ttl"
+
+    def test_vm_data_disk_default_matches_config(self):
+        """The headline drift: handler fallback 2048 vs config 8192. TF must
+        pin the config value, not inherit the handler default."""
+        vs = (TF_DIR / "variables.tf").read_text()
+        m = re.search(r'variable\s+"vm_data_disk_mb"\s*\{.*?default\s*=\s*(\d+)',
+                      vs, re.DOTALL)
+        assert m and int(m.group(1)) == 8192, \
+            "vm_data_disk_mb must default to 8192 (config parity), not 2048"

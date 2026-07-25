@@ -341,6 +341,17 @@ class TestSharedLibStaging:
             assert k in env, f"failover worker missing {k} (T3-3)"
 
     @pytest.mark.unit
+    def test_failover_lambdas_have_vpc_id(self, synthesized_template):
+        """T3-3: the failover placer creates host target groups in VPC_ID
+        rather than cloning VpcId from an arbitrary existing TG."""
+        fns = synthesized_template.find_resources("AWS::Lambda::Function")
+        for fname in ("openclaw-health-check", "openclaw-failover-worker"):
+            fn = next(f for f in fns.values()
+                      if f["Properties"].get("FunctionName") == fname)
+            assert "VPC_ID" in fn["Properties"]["Environment"]["Variables"], \
+                f"{fname} missing VPC_ID (T3-3)"
+
+    @pytest.mark.unit
     def test_common_staged_into_each_lambda_asset(self):
         """_stage_lambda_asset must copy common/ next to every handler that
         imports it, so `from common import ...` resolves at runtime."""

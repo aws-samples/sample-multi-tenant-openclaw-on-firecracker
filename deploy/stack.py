@@ -1492,6 +1492,11 @@ class OpenClawOrchestratorStack(cdk.Stack):
         # 1.3.1: health_check Lambda needs ALB listener for AZ failover
         # to repoint /vm/<tenant_id>* rules across hosts.
         health_fn.add_environment("ALB_LISTENER_ARN", listener.listener_arn)
+        # T3-3: give the failover placer the VPC_ID env so it creates host
+        # target groups in the right VPC instead of cloning VpcId from an
+        # arbitrary existing TG. The worker runs the same repoint path.
+        health_fn.add_environment("VPC_ID", vpc.vpc_id)
+        failover_worker_fn.add_environment("VPC_ID", vpc.vpc_id)
         # 1.4.2 (#fake-failover fix): the failover gate verifies the
         # tenant's dashboard URL is genuinely reachable through the public
         # path (ALB → nginx → VM) before flipping DDB to running. We use

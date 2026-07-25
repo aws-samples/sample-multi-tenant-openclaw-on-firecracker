@@ -84,3 +84,7 @@ docs/screenshots-tmp/
 
 # T3-3: CDK Lambda asset staging (common/ copied next to each handler)
 .build/
+
+# Terraform init artifacts (local validate runs)
+terraform/.terraform/
+terraform/.terraform.lock.hcl

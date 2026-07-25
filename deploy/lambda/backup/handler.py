@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: MIT-0
 
 import os
-import time
 
 import boto3
 from common import ddb as _ddb_helpers
+from common import ssm as _ssm_helpers
 
 ssm = boto3.client("ssm")
 ddb = boto3.resource("dynamodb")
@@ -65,27 +65,12 @@ def backup_tenant(tenant):
 
 
 def _ssm_run(instance_id, command, timeout=300):
-    try:
-        resp = ssm.send_command(
-            InstanceIds=[instance_id],
-            DocumentName="AWS-RunShellScript",
-            Parameters={"commands": [command]},
-            TimeoutSeconds=timeout,
-        )
-        cmd_id = resp["Command"]["CommandId"]
-        time.sleep(5)
-        for _ in range(timeout // 3):
-            result = ssm.get_command_invocation(
-                CommandId=cmd_id, InstanceId=instance_id,
-            )
-            if result["Status"] == "Success":
-                return True, result.get("StandardOutputContent", "")
-            if result["Status"] in ("Failed", "TimedOut", "Cancelled"):
-                return False, result.get("StandardErrorContent", "")
-            time.sleep(3)
-        return False, "timeout"
-    except Exception as e:
-        return False, str(e)
+    """Run a backup command on the host, blocking → (ok, output). Thin wrapper
+    over the shared helper (T3-3). NOTE: the shared runner HOME-wraps the
+    command (the old backup copy did not); backup-data.sh is invoked by absolute
+    path, so the wrap is inert."""
+    return _ssm_helpers.run(ssm, instance_id, command, timeout,
+                            initial_sleep=5, poll_sec=3)
 
 
 def _now():

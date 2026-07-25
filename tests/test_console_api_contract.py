@@ -234,10 +234,21 @@ class TestLogsTabWired:
         assert "before" in src, "_list_audit_log must honor the `before` cursor param"
 
     def test_audit_write_records_enriched_fields(self, handler):
-        import inspect
-        src = inspect.getsource(handler._audit_write)
-        for field in ('"event"', '"object"', '"actor"'):
-            assert field in src, f"_audit_write must record {field}"
+        # T3-3 moved the row write into common.audit, so assert the BEHAVIOR
+        # (the enriched #71 fields land in the written item) rather than
+        # grepping _audit_write's source.
+        from unittest.mock import MagicMock
+        table = MagicMock()
+        with patch.object(handler, "audit_table", table):
+            handler._audit_write(
+                "POST", "/tenants", {},
+                {"httpMethod": "POST", "resource": "/tenants",
+                 "headers": {"x-api-key": "k"}, "requestContext": {}},
+                {"statusCode": 201})
+        assert table.put_item.called, "_audit_write must write a row"
+        item = table.put_item.call_args.kwargs["Item"]
+        for field in ("event", "object", "actor", "resource_id", "expires_ttl"):
+            assert field in item, f"_audit_write must record {field}"
 
 
 # ═════════════════════════════════════════════

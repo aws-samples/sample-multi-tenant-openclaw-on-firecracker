@@ -10,8 +10,10 @@ import time
 
 import boto3
 from botocore.exceptions import ClientError
+from common import audit as _audit
 from common import capacity as _capacity
 from common import ddb as _ddb_helpers
+from common import ssm as _ssm
 
 ssm = boto3.client("ssm")
 s3 = boto3.client("s3")
@@ -2243,57 +2245,17 @@ def _launch_vm(instance_id, tenant_id, vm_num, vcpu, mem_mb, guest_ip, host_port
 
 
 def _ssm_send(instance_id, command, timeout=120):
-    """Fire-and-forget SSM command. Returns the CommandId (str) so callers can
-    later poll get_command_invocation for completion, or None if submission
-    failed. Existing call sites that ignore the return value are unaffected;
-    the async migrate path (issue #64) stores the CommandId in DynamoDB so the
-    health_check sweep can advance the migration out-of-band."""
-    try:
-        wrapped = f'export HOME=/home/ubuntu && cd /home/ubuntu && {command}'
-        resp = ssm.send_command(
-            InstanceIds=[instance_id],
-            DocumentName="AWS-RunShellScript",
-            Parameters={"commands": [wrapped], "executionTimeout": [str(timeout)]},
-            TimeoutSeconds=timeout + 10,
-        )
-        return resp["Command"]["CommandId"]
-    except Exception as e:
-        print(f"SSM send error: {e}")
-        return None
+    """Fire-and-forget SSM command → CommandId or None. Thin wrapper over the
+    shared helper (T3-3); the async migrate path (issue #64) stores the
+    CommandId so the health_check sweep can advance the migration out-of-band."""
+    return _ssm.send(ssm, instance_id, command, timeout)
 
 
 def _ssm_run(instance_id, command, timeout=30):
-    """Execute command on host via SSM Run Command. Returns True on success."""
-    try:
-        # SSM runs as root; set HOME so ~ resolves to /home/ubuntu
-        wrapped = f'export HOME=/home/ubuntu && cd /home/ubuntu && {command}'
-        resp = ssm.send_command(
-            InstanceIds=[instance_id],
-            DocumentName="AWS-RunShellScript",
-            Parameters={"commands": [wrapped], "executionTimeout": [str(timeout)]},
-            TimeoutSeconds=timeout + 10,
-        )
-        cmd_id = resp["Command"]["CommandId"]
-        time.sleep(3)  # Wait for invocation to register
-        for _ in range(timeout // 2):
-            try:
-                result = ssm.get_command_invocation(
-                    CommandId=cmd_id, InstanceId=instance_id,
-                )
-                status = result["Status"]
-                if status == "Success":
-                    return True
-                if status in ("Failed", "TimedOut", "Cancelled"):
-                    print(f"SSM failed: {status} - {result.get('StandardErrorContent', '')}")
-                    return False
-            except ssm.exceptions.InvocationDoesNotExist:
-                pass
-            time.sleep(2)
-        print(f"SSM timeout waiting for command {cmd_id}")
-        return False
-    except Exception as e:
-        print(f"SSM error: {e}")
-        return False
+    """Execute command on host via SSM Run Command. Returns True on success.
+    Delegates to the shared blocking runner (which returns (ok, output))."""
+    ok, _out = _ssm.run(ssm, instance_id, command, timeout)
+    return ok
 
 
 def _now():
@@ -2544,64 +2506,33 @@ def _audit_system(event_name, obj, resource_id, actor="system", detail=None, sta
     Used for lifecycle events that don't flow through an API-Gateway route
     (ASG host termination, TTL/scheduled actions), so they still appear in the
     console Logs tab with the same schema _audit_write produces."""
-    if audit_table is None:
-        return
-    try:
-        import time as _t
-        import uuid
-        item = {
-            "pk": "audit",
-            "id": str(uuid.uuid4()),
-            "ts": _now(),
-            "operation": event_name,
-            "resource_id": resource_id or "",
-            "api_key_id": actor,
-            "response_status": status,
-            "expires_ttl": int(_t.time()) + AUDIT_TTL_DAYS * 86400,
-            "event": event_name,
-            "object": obj,
-            "actor": actor,
-            "actor_role": "system",
-        }
-        if detail is not None:
-            item["detail"] = json.dumps(detail, default=str)[:1000]
-        audit_table.put_item(Item=item)
-    except Exception as e:
-        print(f"audit_system failed: {e}")
+    _audit.put_audit_row(
+        audit_table, event=event_name, obj=obj, resource_id=resource_id,
+        actor=actor, actor_role="system", operation=event_name,
+        response_status=status, detail=detail, ttl_days=AUDIT_TTL_DAYS,
+        api_key_id=actor, ts=_now())
 
 
 def _audit_write(method, resource, path_params, event, result):
-    """Best-effort audit-log writer; failures must NEVER break the API."""
+    """Best-effort audit-log writer; failures must NEVER break the API.
+
+    Request parsing (obj, actor, api_key_id) stays here; the row write delegates
+    to common.audit (T3-3). `operation` keeps the "METHOD /resource" back-compat
+    label existing readers/tests expect."""
     if audit_table is None:
         return
-    try:
-        import time as _t
-        import uuid
-        path_params = path_params or {}
-        obj, resource_id = _audit_object(resource, path_params)
-        api_key_id = (event.get("requestContext") or {}).get("identity", {}).get("apiKeyId") \
-            or (event.get("headers") or {}).get("x-api-key", "")[:32]
-        actor, actor_role = _get_principal(event)
-        # Auto-prune via DynamoDB TTL: retention from AUDIT_TTL_DAYS (default 90).
-        expires_ttl = int(_t.time()) + AUDIT_TTL_DAYS * 86400
-        audit_table.put_item(Item={
-            "pk": "audit",
-            "id": str(uuid.uuid4()),
-            "ts": _now(),
-            # Kept for backward-compat (existing readers / tests):
-            "operation": f"{method} {resource}",
-            "resource_id": resource_id,
-            "api_key_id": api_key_id,
-            "response_status": result.get("statusCode") if isinstance(result, dict) else None,
-            "expires_ttl": expires_ttl,
-            # Issue #71 enrichment — operator-friendly fields:
-            "event": _audit_event_name(method, resource, path_params),
-            "object": obj,
-            "actor": actor,
-            "actor_role": actor_role,
-        })
-    except Exception as e:
-        print(f"audit_write failed: {e}")
+    path_params = path_params or {}
+    obj, resource_id = _audit_object(resource, path_params)
+    api_key_id = (event.get("requestContext") or {}).get("identity", {}).get("apiKeyId") \
+        or (event.get("headers") or {}).get("x-api-key", "")[:32]
+    actor, actor_role = _get_principal(event)
+    _audit.put_audit_row(
+        audit_table,
+        event=_audit_event_name(method, resource, path_params),
+        obj=obj, resource_id=resource_id, actor=actor, actor_role=actor_role,
+        operation=f"{method} {resource}",
+        response_status=result.get("statusCode") if isinstance(result, dict) else None,
+        ttl_days=AUDIT_TTL_DAYS, api_key_id=api_key_id, ts=_now())
 
 
 def _list_audit_log(query_params):

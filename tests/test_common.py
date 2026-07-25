@@ -7,12 +7,23 @@ Covers ddb.scan_all pagination and the capacity math that is now the single
 source of truth for both the API scheduler and AZ-failover placement.
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
-from common import capacity, ddb
+from common import audit, capacity, ddb
+from common import ssm as ssm_helpers
 
 pytestmark = pytest.mark.unit
+
+
+class _FakeInvocationDoesNotExist(Exception):
+    pass
+
+
+def _ssm_mock():
+    m = MagicMock()
+    m.exceptions.InvocationDoesNotExist = _FakeInvocationDoesNotExist
+    return m
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -111,3 +122,117 @@ class TestCapacityMath:
         ranked = capacity.rank_hosts([a, full], 1, 1024, cpu_ratio=1.0, mem_ratio=1.0,
                                      exclude_ids={"i-a"})
         assert ranked == []  # a excluded, full doesn't fit
+
+
+# ══════════════════════════════════════════════════════════════════════
+# ssm — send / run / poll / wait
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestSsmHelpers:
+    def test_send_wraps_home_and_returns_command_id(self):
+        m = _ssm_mock()
+        m.send_command.return_value = {"Command": {"CommandId": "c-1"}}
+        cid = ssm_helpers.send(m, "i-1", "launch-vm.sh x", timeout=60)
+        assert cid == "c-1"
+        cmd = m.send_command.call_args.kwargs["Parameters"]["commands"][0]
+        assert cmd.startswith("export HOME=/home/ubuntu && cd /home/ubuntu &&")
+        assert "launch-vm.sh x" in cmd
+
+    def test_send_returns_none_on_error(self):
+        m = _ssm_mock()
+        m.send_command.side_effect = RuntimeError("throttled")
+        assert ssm_helpers.send(m, "i-1", "cmd") is None
+
+    def test_run_success_returns_output(self):
+        m = _ssm_mock()
+        m.send_command.return_value = {"Command": {"CommandId": "c-1"}}
+        m.get_command_invocation.return_value = {"Status": "Success",
+                                                 "StandardOutputContent": "ok"}
+        with patch.object(ssm_helpers.time, "sleep"):
+            assert ssm_helpers.run(m, "i-1", "cmd", timeout=9) == (True, "ok")
+
+    def test_run_failure_returns_stderr(self):
+        m = _ssm_mock()
+        m.send_command.return_value = {"Command": {"CommandId": "c-1"}}
+        m.get_command_invocation.return_value = {"Status": "Failed",
+                                                 "StandardErrorContent": "boom"}
+        with patch.object(ssm_helpers.time, "sleep"):
+            assert ssm_helpers.run(m, "i-1", "cmd", timeout=9) == (False, "boom")
+
+    @pytest.mark.parametrize("status,expected", [
+        ("Success", (True, True)),
+        ("Failed", (True, False)),
+        ("TimedOut", (True, False)),
+        ("InProgress", (False, False)),
+        ("Pending", (False, False)),
+    ])
+    def test_poll_truth_table(self, status, expected):
+        m = _ssm_mock()
+        m.get_command_invocation.return_value = {"Status": status}
+        assert ssm_helpers.poll(m, "c-1", "i-1") == expected
+
+    def test_poll_not_registered_is_not_done(self):
+        m = _ssm_mock()
+        m.get_command_invocation.side_effect = _FakeInvocationDoesNotExist()
+        assert ssm_helpers.poll(m, "c-1", "i-1") == (False, False)
+
+    def test_wait_success(self):
+        m = _ssm_mock()
+        m.get_command_invocation.return_value = {"Status": "Success"}
+        with patch.object(ssm_helpers.time, "sleep"):
+            assert ssm_helpers.wait(m, "c-1", "i-1", timeout_sec=9) == (True, None)
+
+    def test_wait_failure_reports_status(self):
+        m = _ssm_mock()
+        m.get_command_invocation.return_value = {"Status": "Failed",
+                                                 "StandardErrorContent": "x"}
+        with patch.object(ssm_helpers.time, "sleep"):
+            ok, err = ssm_helpers.wait(m, "c-1", "i-1", timeout_sec=9)
+        assert ok is False and "Failed" in err
+
+
+# ══════════════════════════════════════════════════════════════════════
+# audit — unified row writer (fixes health_check's hard-coded 90d TTL)
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestAuditWriter:
+    def test_writes_full_71_schema(self):
+        t = MagicMock()
+        audit.put_audit_row(t, event="vm.migrated", obj="tenant:t1",
+                            resource_id="t1", actor="system:health-check",
+                            ttl_days=30, ts="2026-07-25T00:00:00Z")
+        item = t.put_item.call_args.kwargs["Item"]
+        for k in ("pk", "id", "ts", "operation", "resource_id", "api_key_id",
+                  "response_status", "expires_ttl", "event", "object", "actor",
+                  "actor_role"):
+            assert k in item, f"missing {k}"
+        assert item["pk"] == "audit"
+        assert item["event"] == "vm.migrated"
+        assert item["ts"] == "2026-07-25T00:00:00Z"
+
+    def test_ttl_honors_ttl_days(self):
+        import time as _t
+        t = MagicMock()
+        audit.put_audit_row(t, event="e", obj="o", resource_id="r", actor="a",
+                            ttl_days=7)
+        ttl = t.put_item.call_args.kwargs["Item"]["expires_ttl"]
+        # ~ now + 7 days, allow a few seconds of slack.
+        assert abs(ttl - (int(_t.time()) + 7 * 86400)) < 10
+
+    def test_detail_truncated_to_1000(self):
+        t = MagicMock()
+        audit.put_audit_row(t, event="e", obj="o", resource_id="r", actor="a",
+                            detail={"big": "x" * 5000})
+        assert len(t.put_item.call_args.kwargs["Item"]["detail"]) == 1000
+
+    def test_none_table_is_noop(self):
+        # Must not raise when audit is disabled.
+        audit.put_audit_row(None, event="e", obj="o", resource_id="r", actor="a")
+
+    def test_raising_table_never_propagates(self):
+        t = MagicMock()
+        t.put_item.side_effect = RuntimeError("ddb down")
+        # Best-effort: swallow the error.
+        audit.put_audit_row(t, event="e", obj="o", resource_id="r", actor="a")

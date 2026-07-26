@@ -103,3 +103,57 @@ def test_restore_uses_sentinel_against_recover_race():
     # The target's host-agent would race _recover_vm against snapshot/load
     # unless the sentinel is set before vm.json lands.
     assert "SENTINEL" in restore
+
+
+# ══════════════════════════════════════════════════════════════════════
+# T3-1 P2b: live-restore must rebuild the guest network (incl. the IMDS
+# DROP) and write the tenant's nginx conf, else the restored tenant is
+# unreachable AND can steal host IMDS credentials.
+# ══════════════════════════════════════════════════════════════════════
+
+
+def _restore_block():
+    """Text of the live `restore)` case branch (up to cold-dump)."""
+    text = SCRIPT.read_text()
+    start = text.index("restore)")
+    end = text.index("cold-dump)", start)
+    return text[start:end]
+
+
+def test_restore_creates_tap_from_source_vm_num():
+    b = _restore_block()
+    # The tap MUST key off the SOURCE vm_num parsed from vm.json (the snapshot
+    # baked in the source's guest network), NOT this invocation's target VM_NUM.
+    assert 'SRC_VM_NUM=' in b and '"vm_num"' in b, \
+        "restore must parse source vm_num from vm.json"
+    assert "ip tuntap add dev" in b and "tap-vm${SRC_VM_NUM}" in b, \
+        "restore must recreate tap-vm<src_vm_num>"
+
+
+def test_restore_blocks_guest_to_imds():
+    """SECURITY regression guard: omitting the IMDS DROP lets a restored tenant
+    reach 169.254.169.254 and steal the host EC2 instance-profile creds."""
+    b = _restore_block()
+    assert "169.254.169.254 -j DROP" in b, "restore missing IMDSv4 DROP"
+    assert "169.254.169.253 -j DROP" in b, "restore missing IMDS (.253) DROP"
+    # The DROP must be INSERTED (top of FORWARD), i.e. before the ACCEPT rules.
+    assert "iptables -I FORWARD 1 -i" in b, \
+        "IMDS DROP must be -I FORWARD 1 (above the FORWARD ACCEPT)"
+
+
+def test_restore_writes_nginx_conf():
+    b = _restore_block()
+    assert "/etc/nginx/conf.d/tenants/${TENANT}.conf" in b, \
+        "restore must write the tenant nginx location (host-tg routing needs it)"
+    assert "proxy_pass http://${R_GUEST_IP}:18789" in b, \
+        "restore nginx conf must proxy to the source guest IP on :18789"
+    assert "nginx -s reload" in b
+
+
+def test_restore_imds_drop_precedes_masquerade():
+    """Ordering: the FORWARD DROP must appear before the MASQUERADE rule in the
+    script so guest→IMDS is blocked before any NAT could expose it."""
+    b = _restore_block()
+    drop_pos = b.index("169.254.169.254 -j DROP")
+    masq_pos = b.index("POSTROUTING")
+    assert drop_pos < masq_pos, "IMDS DROP must be set up before MASQUERADE"

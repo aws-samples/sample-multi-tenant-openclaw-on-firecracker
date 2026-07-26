@@ -146,6 +146,45 @@ case "$MODE" in
     aws s3 cp "${S3_URI}/snapshot.vm"  "${VM_DIR}/snapshot.vm" --quiet
     aws s3 cp "${S3_URI}/snapshot.mem" "${VM_DIR}/snapshot.mem" --quiet
     aws s3 cp "${S3_URI}/vm.json"      "${VM_DIR}/vm.json" --quiet
+
+    # ── T3-1 P2b: reconstruct the guest's network + route on this host ──
+    # The live snapshot preserves the SOURCE's guest networking baked into
+    # snapshot.mem: guest IP 10.0.<src_vm_num>.2 talking to tap tap-vm<src_vm_num>.
+    # We MUST recreate that exact tap here (NOT this invocation's target VM_NUM)
+    # or the resumed guest sends packets into a tap that doesn't exist and the
+    # dashboard is dead. Parse the source vm_num / guest_ip from the shipped
+    # vm.json. Previously `restore` skipped ALL of this — cold-restore got it via
+    # launch-vm.sh, but live restore left the VM unreachable AND (critically)
+    # without the IMDS DROP, i.e. a tenant→instance-credential theft hole.
+    SRC_VM_NUM=$(sed -n 's/.*"vm_num"[ ]*:[ ]*\([0-9]*\).*/\1/p' "${VM_DIR}/vm.json" 2>/dev/null) || true
+    SRC_GUEST_IP=$(sed -n 's/.*"guest_ip"[ ]*:[ ]*"\([0-9.]*\)".*/\1/p' "${VM_DIR}/vm.json" 2>/dev/null) || true
+    if [ -z "${SRC_VM_NUM}" ]; then
+      echo "restore: no vm_num in vm.json — cannot rebuild guest network" >&2
+      exit 25
+    fi
+    R_TAP="tap-vm${SRC_VM_NUM}"
+    R_HOST_TAP_IP="${SUBNET_PREFIX:-10.0}.${SRC_VM_NUM}.1"
+    R_GUEST_IP="${SRC_GUEST_IP:-${SUBNET_PREFIX:-10.0}.${SRC_VM_NUM}.2}"
+    R_IFACE=$(ip route show default | awk '{print $5}' | head -1)
+    sudo ip link del "${R_TAP}" 2>/dev/null || true
+    sudo ip tuntap add dev "${R_TAP}" mode tap
+    sudo ip addr add "${R_HOST_TAP_IP}/24" dev "${R_TAP}"
+    sudo ip link set dev "${R_TAP}" up
+    sudo sysctl -q -w net.ipv4.ip_forward=1
+    # SECURITY: block guest → IMDS BEFORE the ACCEPT/MASQUERADE rules (identical
+    # to launch-vm.sh) — omitting it lets the restored tenant steal the host's
+    # EC2 instance-profile credentials. -I inserts above the FORWARD ACCEPT.
+    sudo iptables -C FORWARD -i "${R_TAP}" -d 169.254.169.254 -j DROP 2>/dev/null || \
+      sudo iptables -I FORWARD 1 -i "${R_TAP}" -d 169.254.169.254 -j DROP
+    sudo iptables -C FORWARD -i "${R_TAP}" -d 169.254.169.253 -j DROP 2>/dev/null || \
+      sudo iptables -I FORWARD 1 -i "${R_TAP}" -d 169.254.169.253 -j DROP
+    sudo iptables -t nat -C POSTROUTING -o "${R_IFACE}" -j MASQUERADE 2>/dev/null || \
+      sudo iptables -t nat -A POSTROUTING -o "${R_IFACE}" -j MASQUERADE
+    sudo iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+      sudo iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    sudo iptables -C FORWARD -i "${R_TAP}" -o "${R_IFACE}" -j ACCEPT 2>/dev/null || \
+      sudo iptables -A FORWARD -i "${R_TAP}" -o "${R_IFACE}" -j ACCEPT
+
     # Start a Firecracker process bound to the new socket.
     rm -f "$SOCK"
     nohup firecracker --api-sock "$SOCK" >"${VM_DIR}/fc.log" 2>&1 &
@@ -160,6 +199,30 @@ case "$MODE" in
       tail -5 "${VM_DIR}/fc.log" >&2 || true
       exit 22
     fi
+
+    # ── T3-1 P2b: route this tenant locally on the NEW owner ──
+    # Under host-tg routing the ALB /vm/* catch-all can land any host, which
+    # proxies to the owner's :8081; that owner is now THIS host, so nginx here
+    # MUST have the tenant's location block or every request 404s. (Under legacy
+    # per-tenant routing the ALB rule was repointed by health_check, masking
+    # this gap.) Mirror launch-vm.sh's block verbatim except the upstream is the
+    # SOURCE guest IP preserved in the snapshot. Best-effort reload.
+    sudo tee "/etc/nginx/conf.d/tenants/${TENANT}.conf" > /dev/null <<NGX
+location ~ ^/vm/${TENANT}(/.*)?\$ {
+    proxy_pass http://${R_GUEST_IP}:18789\$1;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection \$connection_upgrade;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_read_timeout 86400s;
+    proxy_send_timeout 86400s;
+}
+NGX
+    sudo nginx -s reload 2>/dev/null || true
+
     rm -f "$SENTINEL" 2>/dev/null || true; trap - EXIT
     echo "restored ${TENANT} on this host"
     ;;

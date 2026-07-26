@@ -72,6 +72,14 @@ VM_SUBNET_PREFIX = os.environ.get("VM_SUBNET_PREFIX", "172.16")
 ASG_NAME = os.environ.get("ASG_NAME", "openclaw-hosts-asg")
 ALB_LISTENER_ARN = os.environ.get("ALB_LISTENER_ARN", "")
 VPC_ID = os.environ.get("VPC_ID", "")
+# T3-1: routing model. "per-tenant" (default) = one ALB listener rule per
+# tenant (the legacy path, hard-capped at ~499 tenants). "host-tg" = a single
+# shared target group + /vm/* catch-all rule + an nginx peer-map on the hosts
+# (host-agent._sync_tenant_routes), lifting the cap to hosts×VMs. Under
+# host-tg the per-tenant ALB helpers below become no-ops. Default preserves
+# legacy behavior, so shipping this is zero-behavior-change until an operator
+# flips config.yml routing.mode.
+ROUTING_MODE = os.environ.get("ROUTING_MODE", "per-tenant")
 elbv2 = boto3.client("elbv2")
 
 # Issue #16 / #9 — quota ceilings (0 = unlimited; ENABLED=false → no checks)
@@ -2111,6 +2119,8 @@ def _get_listener_arn():
 
 def _ensure_host_tg(instance_id, private_ip):
     """Create or return target group ARN for a host."""
+    if ROUTING_MODE == "host-tg":
+        return ""  # host-tg mode: no per-host TG; the shared CDK TG serves all
     tg_name = f"oc-{instance_id[-8:]}"
     try:
         resp = elbv2.describe_target_groups(Names=[tg_name])
@@ -2139,6 +2149,8 @@ def _add_alb_rule(tenant_id, tg_arn, max_attempts=6):
     PriorityInUseException. A random slot plus a re-read on collision makes the
     race practically disappear instead of guaranteeing it.
     """
+    if ROUTING_MODE == "host-tg":
+        return  # host-tg mode: the static /vm/* catch-all rule routes all tenants
     arn = _get_listener_arn()
     if not arn:
         return
@@ -2180,6 +2192,11 @@ def _repoint_alb_rule_to_tg(tenant_id, tg_arn):
     old host's TG, modifies it in place to point at the new TG. Without
     this, traffic keeps hitting the dead/old host after a host change.
     """
+    # T3-1: currently dead code (no callers), but gate explicitly — its
+    # modify_rule branch is NOT covered by the _add_alb_rule gate, so a future
+    # caller would silently reintroduce per-tenant rule mutation in host-tg mode.
+    if ROUTING_MODE == "host-tg":
+        return
     arn = _get_listener_arn()
     if not arn:
         return
@@ -2205,6 +2222,8 @@ def _repoint_alb_rule_to_tg(tenant_id, tg_arn):
 
 def _remove_alb_rule(tenant_id):
     """Remove ALB listener rule for a tenant."""
+    if ROUTING_MODE == "host-tg":
+        return  # host-tg mode: no per-tenant rule to remove
     arn = _get_listener_arn()
     if not arn:
         return

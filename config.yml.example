@@ -62,6 +62,17 @@ multi_az:
   enabled: true
   az_count: 2
 
+# ========== 租户路由模型 (T3-1) ==========
+routing:
+  # per-tenant (默认): 每租户一条 ALB listener rule — 简单，但硬上限 ~499 租户
+  #   (AWS 默认 quota ~100，代码 range(1,500))。
+  # host-tg: 一个共享 target group + /vm/* catch-all rule + 各 host 上的 nginx
+  #   peer-map (host-agent 每 ~60s 同步)。租户上限升到 hosts×VMs。切换前需先
+  #   部署 T3-1 P1 数据平面 (shared TG + :8081 peer server)，且各 host 已经过
+  #   instance refresh 拿到新的 init-host.sh。切到 host-tg 后新租户不再建
+  #   per-tenant rule；已存在的 legacy rule 继续生效直到 Phase 3 清理。
+  mode: per-tenant
+
 scaler:
   interval_minutes: 3
   idle_timeout_minutes: 10

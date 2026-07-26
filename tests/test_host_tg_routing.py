@@ -227,3 +227,134 @@ class TestSyncTenantRoutes:
         with patch.object(agent, "_scan_projected", side_effect=RuntimeError("throttled")), \
              patch("time.monotonic", return_value=10_000.0):
             agent._sync_tenant_routes()  # must not raise
+
+
+# ══════════════════════════════════════════════════════════════════════
+# T3-1 Phase 2: ROUTING_MODE gates + tightened reachability
+# ══════════════════════════════════════════════════════════════════════
+
+
+def _load_api():
+    mock_ddb = MagicMock()
+    with patch("boto3.resource", return_value=mock_ddb), \
+         patch("boto3.client", return_value=MagicMock()):
+        mock_ddb.Table.side_effect = lambda name: MagicMock()
+        spec = importlib.util.spec_from_file_location(
+            "api_t31", str(ROOT / "deploy" / "lambda" / "api" / "handler.py"))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["api_t31"] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+
+class TestApiRoutingModeGates:
+    def test_default_mode_is_per_tenant(self):
+        api = _load_api()
+        assert api.ROUTING_MODE == "per-tenant"
+
+    def test_host_tg_gates_add_alb_rule(self):
+        api = _load_api()
+        api.elbv2 = MagicMock()
+        with patch.object(api, "ROUTING_MODE", "host-tg"):
+            api._add_alb_rule("t1", "arn:tg")
+        api.elbv2.describe_rules.assert_not_called()
+        api.elbv2.create_rule.assert_not_called()
+
+    def test_host_tg_ensure_host_tg_returns_empty_no_call(self):
+        api = _load_api()
+        api.elbv2 = MagicMock()
+        with patch.object(api, "ROUTING_MODE", "host-tg"):
+            assert api._ensure_host_tg("i-1", "10.0.0.1") == ""
+        api.elbv2.create_target_group.assert_not_called()
+
+    def test_host_tg_gates_remove_alb_rule(self):
+        api = _load_api()
+        api.elbv2 = MagicMock()
+        with patch.object(api, "ROUTING_MODE", "host-tg"):
+            api._remove_alb_rule("t1")
+        api.elbv2.describe_rules.assert_not_called()
+
+    def test_host_tg_gates_repoint_to_tg_dead_code(self):
+        # The 4th mutator the recon flagged — its modify_rule must be gated too.
+        api = _load_api()
+        api.elbv2 = MagicMock()
+        with patch.object(api, "ROUTING_MODE", "host-tg"):
+            api._repoint_alb_rule_to_tg("t1", "arn:tg")
+        api.elbv2.modify_rule.assert_not_called()
+        api.elbv2.describe_rules.assert_not_called()
+
+    def test_per_tenant_mode_still_creates_rules(self):
+        # Regression guard: default mode must NOT be gated.
+        api = _load_api()
+        api.elbv2 = MagicMock()
+        api.elbv2.describe_rules.return_value = {"Rules": []}
+        api._get_listener_arn = MagicMock(return_value="arn:listener")
+        with patch.object(api, "ROUTING_MODE", "per-tenant"):
+            api._add_alb_rule("t1", "arn:tg")
+        api.elbv2.create_rule.assert_called()
+
+
+class TestHealthRepointGate:
+    def _load_hc(self):
+        with patch("boto3.resource", return_value=MagicMock()), \
+             patch("boto3.client", return_value=MagicMock()):
+            spec = importlib.util.spec_from_file_location(
+                "hc_t31gate", str(ROOT / "deploy" / "lambda" / "health_check" / "handler.py"))
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules["hc_t31gate"] = mod
+            spec.loader.exec_module(mod)
+            return mod
+
+    def test_host_tg_gates_repoint(self):
+        hc = self._load_hc()
+        hc.elbv2 = MagicMock()
+        hc.ALB_LISTENER_ARN = "arn:listener"
+        with patch.object(hc, "ROUTING_MODE", "host-tg"):
+            hc._repoint_alb_rule("t1", "i-tgt", "10.0.0.9")
+        hc.elbv2.describe_rules.assert_not_called()
+        hc.elbv2.create_target_group.assert_not_called()
+
+    def test_reachable_status_allowset(self):
+        hc = self._load_hc()
+        # 2xx/3xx and auth 401/403 are "alive"; 404 and 5xx are not.
+        assert hc._reachable_status(200) is True
+        assert hc._reachable_status(302) is True
+        assert hc._reachable_status(401) is True
+        assert hc._reachable_status(403) is True
+        assert hc._reachable_status(404) is False   # the host-tg catch-all miss
+        assert hc._reachable_status(500) is False
+        assert hc._reachable_status(502) is False
+
+
+class TestRoutingModeStackFanout:
+    def test_all_three_lambdas_get_routing_mode(self):
+        import yaml
+        sys.path.insert(0, str(ROOT / "deploy"))
+        import aws_cdk as cdk
+        from aws_cdk import assertions
+        if "stack" in sys.modules:
+            del sys.modules["stack"]
+        import stack as stack_mod
+        stack_mod.CFG = yaml.safe_load((ROOT / "config.yml.example").read_text())
+        app = cdk.App()
+        s = stack_mod.OpenClawOrchestratorStack(
+            app, "OpenClawOrchestrator",
+            env=cdk.Environment(account="123456789012", region="ap-northeast-1"))
+        tmpl = assertions.Template.from_stack(s)
+        fns = tmpl.find_resources("AWS::Lambda::Function")
+        for name in ("openclaw-api", "openclaw-health-check", "openclaw-failover-worker"):
+            fn = next(f for f in fns.values()
+                      if f["Properties"].get("FunctionName") == name)
+            assert "ROUTING_MODE" in fn["Properties"]["Environment"]["Variables"], \
+                f"{name} missing ROUTING_MODE"
+
+    def test_invalid_routing_mode_raises_at_synth(self):
+        import yaml
+        sys.path.insert(0, str(ROOT / "deploy"))
+        if "stack" in sys.modules:
+            del sys.modules["stack"]
+        import stack as stack_mod
+        cfg = yaml.safe_load((ROOT / "config.yml.example").read_text())
+        cfg.setdefault("routing", {})["mode"] = "bogus"
+        with pytest.raises(ValueError, match="routing.mode"):
+            stack_mod._normalize_config(cfg)

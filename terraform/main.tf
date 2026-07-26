@@ -50,6 +50,11 @@ locals {
     VM_SUBNET_PREFIX   = "172.16"
     HOST_RESERVED_VCPU = "1"
     HOST_RESERVED_MEM  = "2048"
+    # T3-1: tenant routing model. per-tenant (default) = one ALB rule/tenant
+    # (~499 cap); host-tg = shared TG + nginx peer-map (no cap). Keep per-tenant
+    # on the TF path unless the host-tg data plane (shared TG + :8081) is also
+    # provisioned here (it is CDK-only today — see the host-tg blueprint).
+    ROUTING_MODE = "per-tenant"
     # Feature flags — default off, parity with config.yml.example.
     QUOTAS_ENABLED          = "false"
     QUOTAS_MAX_VCPU         = "0"

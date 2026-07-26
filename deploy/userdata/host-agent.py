@@ -84,6 +84,22 @@ _promoted = set()
 # so a failed write is retried on the next tick (never-raise contract kept).
 _last_ddb_write = {}
 
+# ── T3-1 peer-map (host-tg routing) ──
+# Every ~60s this host scans the tenants + hosts tables and renders an nginx
+# location conf for each tenant owned by ANOTHER host into
+# /etc/nginx/conf.d/tenant-peers/, proxying /vm/<tid> to that host's :8081. A
+# shared ALB target group + a /vm/* catch-all rule (added in stack.py Phase 1)
+# lets any host answer any tenant's request in ≤2 hops, so tenant capacity is
+# hosts×VMs instead of the ~499 per-tenant-ALB-rule ceiling.
+OC_ROUTE_SYNC_INTERVAL = int(os.environ.get("OC_ROUTE_SYNC_INTERVAL", "60"))
+_PEER_DIR = "/etc/nginx/conf.d/tenant-peers"
+_last_route_sync = 0.0        # monotonic ts of last sync attempt (interval gate)
+_last_peer_hash = None        # content hash of last-applied peer set (reload gate)
+# Tenant statuses whose dashboard should be routable via the peer-map. Include
+# failover_queued/recovering so a tenant keeps a route through the T3-2 failover
+# window (its host_id already points at the target once the sweep flips it).
+_ROUTABLE_STATUSES = ("running", "failover_queued", "failover_recovering")
+
 
 # ═══════════════════════════════════════════
 # Prometheus exporter (issue #4)
@@ -860,6 +876,116 @@ def _adjust_balloons(probe_results):
                 print(f"balloon deflate {tid}: {current_balloon_mib}→0MB (host_avail={host_available}MB)")
 
 
+def _scan_projected(table_name, projection, names=None):
+    """Paginated scan returning only the projected attributes. Best-effort."""
+    table = _get_ddb().Table(table_name)
+    kwargs = {"ProjectionExpression": projection}
+    if names:
+        kwargs["ExpressionAttributeNames"] = names
+    items = []
+    resp = table.scan(**kwargs)
+    items.extend(resp.get("Items", []))
+    while resp.get("LastEvaluatedKey"):
+        resp = table.scan(ExclusiveStartKey=resp["LastEvaluatedKey"], **kwargs)
+        items.extend(resp.get("Items", []))
+    return items
+
+
+def _render_peer_conf(tid, owner_ip):
+    """nginx location for a tenant owned by another host — proxy /vm/<tid> to
+    that host's internal :8081 server. Mirrors the launch-vm.sh per-tenant block
+    (proxy_http_version 1.1 + Upgrade/Connection + 86400s) so WebSocket
+    dashboards survive the extra hop; only the upstream differs (:8081, not the
+    local guest :18789)."""
+    return (
+        f"location ~ ^/vm/{tid}(/.*)?$ {{\n"
+        f"    proxy_pass http://{owner_ip}:8081$1;\n"
+        f"    proxy_http_version 1.1;\n"
+        f"    proxy_set_header Upgrade $http_upgrade;\n"
+        f"    proxy_set_header Connection $connection_upgrade;\n"
+        f"    proxy_set_header Host $host;\n"
+        f"    proxy_set_header X-Real-IP $remote_addr;\n"
+        f"    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
+        f"    proxy_set_header X-Forwarded-Proto $scheme;\n"
+        f"    proxy_read_timeout 86400s;\n"
+        f"    proxy_send_timeout 86400s;\n"
+        f"}}\n"
+    )
+
+
+def _sync_tenant_routes():
+    """T3-1 peer-map: render nginx confs for tenants owned by OTHER hosts so
+    this host can serve any /vm/<tid> the ALB catch-all sends it (≤2 hops).
+
+    Interval-gated (~60s) and never-raise. Only reloads nginx when the desired
+    peer set actually changed (content hash). A tenant present LOCALLY is skipped
+    even if DDB host_id lags, so we never shadow a local route with a peer one.
+    """
+    global _last_route_sync, _last_peer_hash
+    if not TENANTS_TABLE or not HOSTS_TABLE or not INSTANCE_ID:
+        return  # can't distinguish local vs peer without our own instance id
+    now = time.monotonic()
+    if now - _last_route_sync < OC_ROUTE_SYNC_INTERVAL:
+        return
+    _last_route_sync = now
+    try:
+        # host_id / status are DDB reserved-ish words → alias via #-names.
+        tenants = _scan_projected(
+            TENANTS_TABLE, "id, host_id, #s",
+            names={"#s": "status"})
+        hosts = _scan_projected(HOSTS_TABLE, "instance_id, private_ip")
+        ip_by_host = {h["instance_id"]: h.get("private_ip")
+                      for h in hosts if h.get("private_ip")}
+        # Tenants physically present on THIS host right now (vm.json on disk),
+        # so a lagging host_id can't make us write a peer conf for a local VM.
+        try:
+            local_tids = set(os.listdir(VM_DIR))
+        except OSError:
+            local_tids = set()
+
+        desired = {}  # tid -> rendered conf
+        for t in tenants:
+            tid = t.get("id")
+            owner = t.get("host_id")
+            if not tid or t.get("status") not in _ROUTABLE_STATUSES:
+                continue
+            if owner == INSTANCE_ID or tid in local_tids:
+                continue  # local tenant — served by conf.d/tenants, not a peer
+            owner_ip = ip_by_host.get(owner)
+            if not owner_ip:
+                continue  # owner host unknown / no private_ip yet
+            desired[tid] = _render_peer_conf(tid, owner_ip)
+
+        # Reload only if the desired set changed since last apply.
+        import hashlib
+        digest = hashlib.sha256(
+            "".join(f"{k}\n{desired[k]}" for k in sorted(desired)).encode()
+        ).hexdigest()
+        if digest == _last_peer_hash:
+            return
+
+        os.makedirs(_PEER_DIR, exist_ok=True)
+        want_files = {f"{tid}.conf" for tid in desired}
+        for fname in os.listdir(_PEER_DIR):
+            if fname not in want_files and fname.endswith(".conf"):
+                try:
+                    os.remove(os.path.join(_PEER_DIR, fname))
+                except OSError:
+                    pass
+        for tid, conf in desired.items():
+            path = os.path.join(_PEER_DIR, f"{tid}.conf")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(conf)
+        subprocess.run(["nginx", "-s", "reload"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=10)
+        _last_peer_hash = digest
+        print(f"peer-map synced: {len(desired)} peer route(s)")
+    except Exception as e:
+        # Never let a DDB throttle / nginx hiccup starve the poll loop.
+        print(f"peer-map sync failed (non-fatal): {e}")
+
+
 def _poll_loop():
     while True:
         try:
@@ -878,6 +1004,10 @@ def _poll_loop():
                     _status[tid] = info
             _write_ddb(results)
             _adjust_balloons(results)
+            # T3-1: refresh the host-tg peer-map (interval-gated internally, so
+            # this is cheap most ticks). Never-raises; a failure here must not
+            # affect health writes or balloon adjustment.
+            _sync_tenant_routes()
         except Exception as e:
             print(f"poll error: {e}")
         time.sleep(POLL_INTERVAL)

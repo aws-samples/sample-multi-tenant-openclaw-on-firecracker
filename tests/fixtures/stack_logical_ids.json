@@ -119,6 +119,7 @@
   "DashboardALBBD8D82D3": "AWS::ElasticLoadBalancingV2::LoadBalancer",
   "DashboardALBHTTP37846F61": "AWS::ElasticLoadBalancingV2::Listener",
   "DashboardALBSecurityGroup8584192F": "AWS::EC2::SecurityGroup",
+  "DashboardALBSecurityGrouptoOpenClawOrchestratorHostSGF88CFB1B80D81CA374": "AWS::EC2::SecurityGroupEgress",
   "DashboardCF02936376": "AWS::CloudFront::Distribution",
   "DashboardCFOrigin2S3OriginAccessControl3C41C44B": "AWS::CloudFront::OriginAccessControl",
   "EventsDLQ3D9C0575": "AWS::SQS::Queue",
@@ -152,9 +153,12 @@
   "HostRole96745B4B": "AWS::IAM::Role",
   "HostRoleDefaultPolicy61397894": "AWS::IAM::Policy",
   "HostSGADEDC116": "AWS::EC2::SecurityGroup",
+  "HostSGfromOpenClawOrchestratorDashboardALBSecurityGroup86C3F91F8072157DD6": "AWS::EC2::SecurityGroupIngress",
+  "HostSGfromOpenClawOrchestratorHostSGF88CFB1B8081724D25E8": "AWS::EC2::SecurityGroupIngress",
   "HostTerminateRule5562D8D9": "AWS::Events::Rule",
   "HostTerminateRuleAllowEventRuleOpenClawOrchestratorApiHandlerF3374B9906359BE9": "AWS::Lambda::Permission",
   "Hosts3EBB0FED": "AWS::DynamoDB::Table",
+  "HostsSharedTG3FAAD4DF": "AWS::ElasticLoadBalancingV2::TargetGroup",
   "InitHook": "AWS::AutoScaling::LifecycleHook",
   "NestedVirt36A6A468": "Custom::AWS",
   "NestedVirtCustomResourcePolicy6AB85F26": "AWS::IAM::Policy",
@@ -175,5 +179,6 @@
   "TemplatesServiceRoleDefaultPolicy68BE62DC": "AWS::IAM::Policy",
   "TenantsA9C48FD3": "AWS::DynamoDB::Table",
   "TerminateHook": "AWS::AutoScaling::LifecycleHook",
-  "UrlRewriteE50C993D": "AWS::CloudFront::Function"
+  "UrlRewriteE50C993D": "AWS::CloudFront::Function",
+  "VmCatchAll5AA03D32": "AWS::ElasticLoadBalancingV2::ListenerRule"
 }

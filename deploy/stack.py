@@ -1324,6 +1324,14 @@ class OpenClawOrchestratorStack(cdk.Stack):
             vpc=vpc, security_group_name="openclaw-host-sg",
             allow_all_outbound=True,
         )
+        # T3-1 Phase 1: host↔host peer-map nginx proxy port. Each host runs an
+        # internal `listen 8081` nginx server serving ONLY its local tenants;
+        # peers proxy /vm/<tid> to the owning host's :8081. Self-referencing
+        # ingress (this SG → this SG) so it's host-fleet-only, never widened to
+        # the VPC. No traffic uses it until the peer-map ships (Phase 2), so
+        # this is additive and behavior-neutral.
+        sg.add_ingress_rule(sg, ec2.Port.tcp(8081),
+                            "T3-1 host peer-map nginx (host-to-host /vm proxy)")
 
         # Compute allocatable resources from instance type. Fallback to the
         # arch-aware default if config.yml omits instance_type (issue #19).
@@ -1549,6 +1557,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
         )
 
         self.sg = sg
+        self.asg = asg  # T3-1: _build_alb attaches the shared /vm/* target group
 
     def _build_agentcore(self):
         api_fn = self.api_fn
@@ -1687,6 +1696,45 @@ class OpenClawOrchestratorStack(cdk.Stack):
             ec2.Port.tcp(80), "ALB to Nginx")
         sg.add_ingress_rule(ec2.Peer.ipv4(vpc.vpc_cidr_block),
             ec2.Port.tcp(80), "VPC to Nginx (ALB IP target health check)")
+
+        # ── T3-1 Phase 1: shared host target group + static /vm/* catch-all ──
+        # The scaling ceiling today is per-tenant ALB listener rules: the api
+        # Lambda allocates one rule per tenant from range(1,500) (handler.py
+        # _add_alb_rule), so tenant count is hard-capped at ~499 (and the AWS
+        # default quota is ~100). The endgame (Phase 2/3) pushes tenant→host
+        # resolution into an nginx peer-map on the hosts, served by ONE shared
+        # target group behind ONE catch-all rule — making capacity hosts×VMs
+        # instead of 499.
+        #
+        # Phase 1 is ADDITIVE and behavior-neutral: this rule sits at priority
+        # 999, and ALB evaluates lowest-priority-first, so the per-tenant rules
+        # the Lambda still creates at 1-499 always match first. The catch-all
+        # only receives /vm/* requests that have NO per-tenant rule — of which
+        # there are none while every tenant is still individually routed. It is
+        # wired now so the data plane exists before the control-plane flag flip.
+        hosts_tg = elbv2.ApplicationTargetGroup(self, "HostsSharedTG",
+            target_group_name="openclaw-hosts-shared",
+            vpc=vpc,
+            port=80,
+            protocol=elbv2.ApplicationProtocol.HTTP,
+            target_type=elbv2.TargetType.INSTANCE,
+            health_check=elbv2.HealthCheck(
+                path="/health",
+                interval=Duration.seconds(10),
+                healthy_threshold_count=2,
+            ),
+        )
+        # Register every ASG instance (current + future) automatically, so host
+        # scale-out/in never needs a control-plane ELB call. /health on :80
+        # gates out still-initializing hosts.
+        self.asg.attach_to_application_target_group(hosts_tg)
+        elbv2.ApplicationListenerRule(self, "VmCatchAll",
+            listener=listener,
+            priority=999,
+            conditions=[elbv2.ListenerCondition.path_patterns(["/vm/*"])],
+            action=elbv2.ListenerAction.forward([hosts_tg]),
+        )
+        self.hosts_tg = hosts_tg
 
         # Pass ALB info to API Lambda for path-based routing
         api_fn.add_environment("ALB_LISTENER_ARN", listener.listener_arn)

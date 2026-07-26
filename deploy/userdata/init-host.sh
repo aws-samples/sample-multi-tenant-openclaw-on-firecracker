@@ -119,15 +119,33 @@ ENVEOF
 
 # Nginx reverse proxy for tenant dashboards
 mkdir -p /etc/nginx/conf.d/tenants
+# T3-1: peer-map confs for tenants owned by OTHER hosts (populated by
+# host-agent._sync_tenant_routes). Empty today → the include is a no-op.
+mkdir -p /etc/nginx/conf.d/tenant-peers
 cat > /etc/nginx/conf.d/openclaw-proxy.conf <<'NGINX'
 map $http_upgrade $connection_upgrade {
     default upgrade;
     ''      close;
 }
+# Public server (ALB → :80). Serves local tenants (conf.d/tenants) AND, via the
+# T3-1 peer-map (conf.d/tenant-peers), forwards /vm/<tid> for tenants owned by
+# other hosts to that host's internal :8081. `tenant-peers` sorts before
+# `tenants` in the glob, but a tenant is EITHER local or peered, never both
+# (host-agent skips local tids), so include order is immaterial.
 server {
     listen 80 default_server;
     location /health { return 200 'ok'; add_header Content-Type text/plain; }
     location /agent/health { proxy_pass http://127.0.0.1:8899/health; }
+    include /etc/nginx/conf.d/tenant-peers/*.conf;
+    include /etc/nginx/conf.d/tenants/*.conf;
+}
+# T3-1 internal server (host↔host, :8081). Serves ONLY this host's local
+# tenants — deliberately NO tenant-peers include, so a peered request can never
+# be re-proxied onward: ALB→ownerless-host:80(peer conf)→owner:8081→local VM is
+# capped at 2 hops by construction. SG allows :8081 only from the host fleet.
+server {
+    listen 8081;
+    location /health { return 200 'ok'; add_header Content-Type text/plain; }
     include /etc/nginx/conf.d/tenants/*.conf;
 }
 NGINX

@@ -77,6 +77,10 @@ ASSETS_BUCKET = os.environ.get("ASSETS_BUCKET", "")
 # (and operators get a CloudWatch warning each failover).
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "")
 ALB_LISTENER_ARN = os.environ.get("ALB_LISTENER_ARN", "")
+# T3-1: "host-tg" makes _repoint_alb_rule a no-op (routing lives in the nginx
+# peer-map, driven by the DDB host_id flip). Default "per-tenant" = legacy ALB
+# rule repointing. Kept in sync with the api Lambda via one config.yml value.
+ROUTING_MODE = os.environ.get("ROUTING_MODE", "per-tenant")
 # T3-3: the VPC to create a host target group in during failover. The API
 # Lambda always used its VPC_ID env; health_check used to clone VpcId from an
 # arbitrary existing target group (existing[0]), which breaks when none exist
@@ -402,18 +406,36 @@ def _advance_migration(tenant, now):
         target = hosts_table.get_item(
             Key={"instance_id": target_host_id}).get("Item") or {}
         target_ip = target.get("private_ip", "")
-        try:
-            if target_ip:
-                _repoint_alb_rule(tid, target_host_id, target_ip)
-            else:
-                _rollback_migration(tenant, "target host has no private_ip")
+        if ROUTING_MODE == "host-tg":
+            # host-tg: routing follows the DDB host_id flip via the peer-map, no
+            # ALB repoint. Best-effort drop the target's stale peer conf for this
+            # tenant so it serves locally immediately instead of after the ~60s
+            # sync. private_ip is NOT required here (unlike the legacy repoint).
+            try:
+                _ssm_send_hc(target_host_id,
+                             f"rm -f /etc/nginx/conf.d/tenant-peers/{tid}.conf "
+                             f"&& nginx -s reload", timeout=15)
+            except Exception as e:
+                print(f"peer-conf cleanup on {target_host_id} (non-fatal): {e}")
+        else:
+            try:
+                if target_ip:
+                    _repoint_alb_rule(tid, target_host_id, target_ip)
+                else:
+                    _rollback_migration(tenant, "target host has no private_ip")
+                    return
+            except Exception as e:
+                _rollback_migration(tenant, f"ALB repoint failed: {e}")
                 return
-        except Exception as e:
-            _rollback_migration(tenant, f"ALB repoint failed: {e}")
-            return
 
+        # T3-1: under host-tg the request may round-robin across hosts before
+        # landing on the owner, and the peer-map takes ≤1 sync interval (~60s)
+        # to converge — so give it 90s. In per-tenant mode the repointed rule
+        # deterministically hits the target, so keep the legacy 30s (unchanged
+        # behavior + fast tests).
+        _verify_timeout = 90 if ROUTING_MODE == "host-tg" else 30
         if PUBLIC_BASE_URL and not _verify_dashboard_reachable_via_alb(
-                tid, PUBLIC_BASE_URL, timeout_sec=30, poll_sec=3):
+                tid, PUBLIC_BASE_URL, timeout_sec=_verify_timeout, poll_sec=3):
             _rollback_migration(tenant, "dashboard not reachable via ALB after restore")
             return
 
@@ -960,6 +982,19 @@ def _execute_failover(tenant, target_host, source_az, backup_key, target_vm_num,
             # Fall through to verify gate — verify is the source of truth.
             print(f"SSM reported failure ({ssm_err}); verify gate decides.")
 
+        # T3-1 host-tg: the tenant now lives locally on the target, so drop any
+        # stale peer conf the target host was using to proxy this tenant to its
+        # OLD owner (else the target would forward to a dead/wrong host until its
+        # ~60s peer sync). Best-effort — a failure here must not fail the
+        # failover (the peer sync converges it within one interval anyway).
+        if ROUTING_MODE == "host-tg":
+            try:
+                _ssm_send_hc(target_host_id,
+                             f"rm -f /etc/nginx/conf.d/tenant-peers/{tenant_id}.conf "
+                             f"&& nginx -s reload", timeout=15)
+            except Exception as e:
+                print(f"peer-conf cleanup on {target_host_id} (non-fatal): {e}")
+
         # 4) GATE: verify the VM is genuinely running on the target host.
         #    1.4.2: this now includes a curl probe against
         #    http://127.0.0.1/vm/<tid>/ to catch the case where the
@@ -989,7 +1024,11 @@ def _execute_failover(tenant, target_host, source_az, backup_key, target_vm_num,
         #    "fake failover" where audit shows RECOVERED but the public
         #    dashboard URL still 502s because traffic still routes to the
         #    dead source host. We refuse to silently leave that state.
-        if ALB_LISTENER_ARN:
+        # T3-1: skip the ALB repoint block entirely in host-tg mode — the
+        # private_ip is only needed for the (now no-op) repoint, so requiring it
+        # would spuriously fail a host-tg failover whose routing converges via
+        # the peer-map instead.
+        if ALB_LISTENER_ARN and ROUTING_MODE != "host-tg":
             target_private_ip = target_host.get("private_ip")
             if not target_private_ip:
                 raise RuntimeError(
@@ -1013,8 +1052,12 @@ def _execute_failover(tenant, target_host, source_az, backup_key, target_vm_num,
         #    1.4.1 gates (process + conf + local curl) which still catch
         #    most fake-failover cases.
         if PUBLIC_BASE_URL:
+            # T3-1: 90s under host-tg (round-robin + ≤1 peer-sync interval),
+            # legacy 30s in per-tenant mode (repointed rule hits the target
+            # deterministically → unchanged behavior).
+            _verify_timeout = 90 if ROUTING_MODE == "host-tg" else 30
             if not _verify_dashboard_reachable_via_alb(
-                tenant_id, PUBLIC_BASE_URL, timeout_sec=30, poll_sec=3
+                tenant_id, PUBLIC_BASE_URL, timeout_sec=_verify_timeout, poll_sec=3
             ):
                 raise RuntimeError(
                     f"dashboard not reachable via ALB at {PUBLIC_BASE_URL}/vm/{tenant_id}/ "
@@ -1379,6 +1422,15 @@ def _verify_vm_actually_running(host_id, tenant_id, timeout_sec=90, poll_sec=10)
     return False
 
 
+def _reachable_status(status):
+    """True iff an HTTP status from the public /vm/<tid>/ probe proves the
+    tenant backend is genuinely serving (T3-1). 2xx/3xx = alive; 401/403 = alive
+    behind auth. Everything else — notably 404 (host-tg catch-all landed on a
+    host without the tenant's nginx conf) and 5xx — is treated as not-yet-
+    reachable so the caller keeps polling instead of falsely passing."""
+    return (200 <= status < 400) or status in (401, 403)
+
+
 def _verify_dashboard_reachable_via_alb(tenant_id, public_base_url, timeout_sec=30, poll_sec=3):
     """Cross-check that the tenant's dashboard URL is **reachable through
     the public path** (ALB → nginx → VM), not just locally on the host.
@@ -1432,13 +1484,18 @@ def _verify_dashboard_reachable_via_alb(tenant_id, public_base_url, timeout_sec=
             # IPv4 only. Don't follow redirects — a 302 is fine evidence.
             with urllib.request.urlopen(req, timeout=5) as resp:
                 last_status = resp.status
-                if last_status < 500:
+                if _reachable_status(last_status):
                     return True
         except urllib.error.HTTPError as e:
-            # 4xx is reachable evidence (auth challenge, CORS preflight,
-            # etc.) — only 5xx counts as backend dead.
+            # T3-1: only genuine "backend is alive" codes count as reachable.
+            # A bare 404 used to pass (last_status < 500) — but under the
+            # host-tg catch-all, a request routed to a host without the
+            # tenant's nginx conf returns 404, which would falsely pass this
+            # gate and flip DDB to running on an unreachable tenant (the 1.4.2
+            # fake-failover class). Treat 404/other 4xx (except auth 401/403)
+            # as NOT-YET-reachable and keep polling until the deadline.
             last_status = e.code
-            if e.code < 500:
+            if _reachable_status(e.code):
                 return True
         except urllib.error.URLError as e:
             last_err = str(e.reason) if hasattr(e, "reason") else str(e)
@@ -1459,6 +1516,12 @@ def _repoint_alb_rule(tenant_id, target_host_id, target_private_ip):
     or failover, this Action must be updated, otherwise CloudFront/ALB
     keeps sending traffic to the dead source host.
     """
+    # T3-1: single gate covering BOTH callers — _advance_migration and
+    # _execute_failover (the latter also invoked by worker.py). In host-tg mode
+    # the routing change IS the DDB host_id flip; the nginx peer-map converges
+    # from that, so no ALB rule mutation is needed here.
+    if ROUTING_MODE == "host-tg":
+        return
     if not ALB_LISTENER_ARN:
         return
 

@@ -133,6 +133,16 @@ def _normalize_config(cfg):
               f"must be one of {_MIGRATE_MODES}. Defaulting to 'cold'.")
         cfg.setdefault("balloon", {})["migrate_mode"] = "cold"
 
+    # T3-1 — validate routing.mode. A typo must NOT silently mean "per-tenant"
+    # (that would mask a botched host-tg cutover), so hard-fail at synth.
+    _ROUTING_MODES = ("per-tenant", "host-tg")
+    rmode = str(cfg.get("routing", {}).get("mode", "per-tenant")).lower()
+    if rmode not in _ROUTING_MODES:
+        raise ValueError(
+            f"config.yml routing.mode={rmode!r} invalid — must be one of "
+            f"{_ROUTING_MODES}")
+    cfg.setdefault("routing", {})["mode"] = rmode
+
 
 _normalize_config(CFG)
 
@@ -1759,6 +1769,12 @@ class OpenClawOrchestratorStack(cdk.Stack):
         # needs the same ALB env as the detector.
         failover_worker_fn.add_environment("ALB_LISTENER_ARN", listener.listener_arn)
         failover_worker_fn.add_environment("PUBLIC_BASE_URL", f"http://{alb.load_balancer_dns_name}")
+        # T3-1: fan ONE routing.mode value to all three ALB-aware Lambdas so a
+        # half-flipped state is impossible (api creating rules while health_check
+        # still repoints, or vice versa). Validated in _normalize_config.
+        _routing_mode = CFG.get("routing", {}).get("mode", "per-tenant")
+        for _fn in (api_fn, health_fn, failover_worker_fn):
+            _fn.add_environment("ROUTING_MODE", _routing_mode)
         # T2-5: Describe* stays * (no resource-level support); the create/delete/
         # modify/register actions scope to this account+region's ELB ARN space.
         api_fn.add_to_role_policy(iam.PolicyStatement(

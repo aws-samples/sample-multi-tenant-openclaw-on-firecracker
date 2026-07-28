@@ -10,6 +10,7 @@ Firecracker v1.15.1 CAN snapshot a microVM with a balloon device (its snapshot d
 
 ### Added
 
+- **`routing.mode` — a second tenant routing model that lifts the ALB rule ceiling (#77).** `per-tenant` (default, unchanged) is one ALB rule per tenant, so AWS's ~100-rule listener quota caps tenant count. `host-tg` uses a single shared target group plus a peer-map on each host's nginx, moving the ceiling to hosts × VMs. It ships **inactive**: existing deployments route exactly as before until you flip the mode and roll the hosts. Trade-off is one extra hop for non-owner hosts and ~60s to converge after a migration.
 - **`balloon.migrate_mode` config** (default `cold`): `cold` = stop source VM, ship its data volume, relaunch on target (always correct, brief restart, no in-memory state); `live` = snapshot/restore with a host-agent quiesce sentinel (preserves in-memory state); `reject` = the old 409. Balloon-off tenants always use the plain live snapshot path.
 - **host-agent migration sentinel** (`/data/.../<tenant>/.migrating`, TTL-guarded): while set, host-agent reports the VM as `migrating` and skips it entirely — no ping/pgrep (so no dead-zone relaunch of a paused VM), no `_recover_vm` race against `snapshot/load` on the target, and no `/balloon` PATCH racing the snapshot.
 - **`migrate-vm.sh` cold-dump / cold-restore modes** reusing `stop-vm.sh` + `launch-vm.sh`; snapshot mode now quiesces the sentinel around pause→create→resume (trap-guarded) and best-effort deflates the balloon first.

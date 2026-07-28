@@ -196,6 +196,15 @@
         </div>
       </template>
 
+      <!-- Skills mini-panel — counts only; per-tenant scoping is via Groups,
+           so don't flatten every skill here (it reads as "all tenants get all").
+           Kept above the transient migration banner so it doesn't shift. -->
+      <div class="section-card mini-panel" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <span style="font-size:13px;color:var(--cyan)"><svg class="icon s14" style="vertical-align:-2px"><use href="#i-brain"/></svg> <span x-text="skills.length"></span> shared skill(s)</span>
+        <span style="font-size:12px;color:var(--gray)">· scope per tenant with Skill Groups</span>
+        <a @click.prevent="page='app'" href="#" style="margin-left:auto;font-size:12px;color:var(--cyan)">Manage →</a>
+      </div>
+
       <!-- T2-8: In-flight migrations panel — visible only while something is
            mid-migration; shows phase + elapsed and a Cancel for a wedged one. -->
       <template x-if="inflightMigrations.length">
@@ -214,14 +223,6 @@
           </template>
         </div>
       </template>
-
-      <!-- Skills mini-panel — counts only; per-tenant scoping is via Groups,
-           so don't flatten every skill here (it reads as "all tenants get all"). -->
-      <div class="section-card mini-panel" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-        <span style="font-size:13px;color:var(--cyan)"><svg class="icon s14" style="vertical-align:-2px"><use href="#i-brain"/></svg> <span x-text="skills.length"></span> shared skill(s)</span>
-        <span style="font-size:12px;color:var(--gray)">· scope per tenant with Skill Groups</span>
-        <a @click.prevent="page='app'" href="#" style="margin-left:auto;font-size:12px;color:var(--cyan)">Manage →</a>
-      </div>
 
       <div class="panel-header">
         <span class="panel-title">Tenants <template x-if="selectedHost"><span style="font-size:12px;color:var(--cyan-dim)">— <span x-text="selectedHost"></span> <button class="btn-icon" @click="selectedHost=null" style="font-size:12px"><svg class="icon s12"><use href="#i-delete"/></svg></button></span></template></span>

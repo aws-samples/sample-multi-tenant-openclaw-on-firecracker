@@ -25,6 +25,7 @@
 | [15 镜像构建快速上手](15-image-build-getting-started.md)                      | 第一次给项目构建镜像的入门                                     |
 | [16 API 接入手册（中文备份）](API-接入手册.md)                                | 内部备份，正式对接以第 9 章为准                                |
 | [17 可观测性运维手册](17-observability-ops.md)                                | 部署后维护：三层可观测性巡检、容量、告警、排查路径             |
+| [18 Host/Edge S3 user-hook](18-s3-user-hooks.md)                             | 客户扩展脚本契约、安全边界、发布与排障                         |
 
 ## 推荐阅读路径
 
@@ -34,4 +35,4 @@
 
 ## 权威数字与工程知识源
 
-对外一切性能/容量/隔离/拦截数字以 `internal-docs/02-system-constraints/FACT-BASELINE.md` 为唯一真相源，本指南各章引用的数字均可回查该表。架构现状读 `internal-docs/00-knowledge-base/wss-two-tier-chain-status-2026-07-09.md`。
+对外一切性能/容量/隔离/拦截数字以 `engineering/02-system-constraints/FACT-BASELINE.md` 为唯一真相源，本指南各章引用的数字均可回查该表。架构现状读 `engineering/00-knowledge-base/wss-two-tier-chain-status-2026-07-09.md`。

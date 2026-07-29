@@ -23,7 +23,7 @@ def build_storage(self, ctx):
 
     # ========== DynamoDB ==========
     # 控制面表 PITR(时间点恢复)。租户数据本身有 backup_fn→WORM 桶兜底,但
-    # 控制面元数据(tenants/hosts/audit)误删/误改/坏写后无法回滚 —— 795 实跑
+    # 控制面元数据(tenants/hosts/audit)误删/误改/坏写后无法回滚 —— 实跑
     # 5 张表 PITR 全 DISABLED(2026-06-30 巡检发现)。开 PITR 后 DynamoDB 维持
     # 35 天连续备份,可恢复到任意秒级时点。config 开关默认 true,短命的
     # batch-jobs(DESTROY+TTL)不开。开 PITR 对 PAY_PER_REQUEST 表只按备份存储
@@ -74,6 +74,30 @@ def build_storage(self, ctx):
             index_name="gsi_tenant_user",
             partition_key=dynamodb.Attribute(
                 name="tenant_user_id", type=dynamodb.AttributeType.STRING
+            ),
+            projection_type=dynamodb.ProjectionType.ALL,
+        )
+    if (CFG.get("scaler", {}) or {}).get("add_gsi_tenant_host", False):
+        tenants_table.add_global_secondary_index(
+            index_name="gsi_host",
+            partition_key=dynamodb.Attribute(
+                name="host_id", type=dynamodb.AttributeType.STRING
+            ),
+            projection_type=dynamodb.ProjectionType.ALL,
+        )
+    if (CFG.get("scaler", {}) or {}).get("add_gsi_tenant_status", False):
+        tenants_table.add_global_secondary_index(
+            index_name="gsi_status",
+            partition_key=dynamodb.Attribute(
+                name="status", type=dynamodb.AttributeType.STRING
+            ),
+            projection_type=dynamodb.ProjectionType.ALL,
+        )
+    if (CFG.get("scaler", {}) or {}).get("add_gsi_tenant_rootfs", False):
+        tenants_table.add_global_secondary_index(
+            index_name="gsi_rootfs_version",
+            partition_key=dynamodb.Attribute(
+                name="q_rootfs_version", type=dynamodb.AttributeType.STRING
             ),
             projection_type=dynamodb.ProjectionType.ALL,
         )
@@ -326,10 +350,22 @@ def build_storage(self, ctx):
         point_in_time_recovery_specification=_pitr_spec,
     )
 
+    tenant_stats_table = dynamodb.Table(
+        self,
+        "TenantStats",
+        table_name="openclaw-tenant-stats",
+        partition_key=dynamodb.Attribute(
+            name="id", type=dynamodb.AttributeType.STRING
+        ),
+        billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+        removal_policy=self._stateful_removal,
+        point_in_time_recovery_specification=_pitr_spec,
+    )
+
     # ========== Tenant-Backup CMK + WORM backup bucket (insider-threat hardening) ==========
     # 威胁模型:租户 data.ext4 备份是真实资产数据。光放 assets 桶(默认 SSE-S3,
     # AWS 托管密钥)防不住「拥有该桶权限的 S3 管理员」——他能 GetObject 读明文、
-    # PutObject 覆盖、DeleteObject 删除。生产级要堵的就是这个内部威胁面。两层独立机制:
+    # PutObject 覆盖、DeleteObject 删除。企业级要堵的就是这个内部威胁面。两层独立机制:
     #
     # 1) 防篡改/防删 — S3 Object Lock COMPLIANCE 模式 + Versioning。AWS 官方:
     #    COMPLIANCE 模式下在保留期内**连 root 账户都不能删除/覆盖对象版本、不能缩短
@@ -559,3 +595,4 @@ def build_storage(self, ctx):
     ctx.tenant_secrets_table = locals().get("tenant_secrets_table")
     ctx.tenants_table = locals().get("tenants_table")
     ctx.version_snapshots_table = locals().get("version_snapshots_table")  # #217 V2
+    ctx.tenant_stats_table = locals().get("tenant_stats_table")

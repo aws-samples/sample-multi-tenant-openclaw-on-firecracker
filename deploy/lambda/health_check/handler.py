@@ -74,9 +74,11 @@ ALB_LISTENER_ARN = os.environ.get("ALB_LISTENER_ARN", "")
 def lambda_handler(event, context):
     """Scan running tenants, recover host-agent if needed, then check AZ-level health."""
     tenants = tenants_table.scan(
-        FilterExpression="#s = :r",
+        FilterExpression=(
+            "#s = :r AND (attribute_not_exists(synthetic) OR synthetic <> :true)"
+        ),
         ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":r": "running"},
+        ExpressionAttributeValues={":r": "running", ":true": True},
     ).get("Items", [])
 
     now = datetime.now(timezone.utc)
@@ -200,9 +202,12 @@ def _reap_stuck_creating(now):
     lek = None
     while True:
         kw = {
-            "FilterExpression": "#s = :c",
+            "FilterExpression": (
+                "#s = :c AND "
+                "(attribute_not_exists(synthetic) OR synthetic <> :true)"
+            ),
             "ExpressionAttributeNames": {"#s": "status"},
-            "ExpressionAttributeValues": {":c": "creating"},
+            "ExpressionAttributeValues": {":c": "creating", ":true": True},
         }
         if lek:
             kw["ExclusiveStartKey"] = lek

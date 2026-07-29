@@ -1,6 +1,6 @@
 {
-  "name": "claw-ai-chat-exchange-grade",
-  "description": "Exchange-grade Guardrail for the exchange toC AI agent. Covers OWASP LLM Top 10 V2025 (5-layer). DENY targets guaranteed-profit/fund-ops, not educational TA.",
+  "name": "openclaw-ai-chat-production-grade",
+  "description": "Production-grade Guardrail for a consumer-facing AI agent. Covers OWASP LLM Top 10 V2025 (5-layer). DENY targets guaranteed-profit/fund-ops, not educational TA.",
   "guardrailId": "__RUNTIME_GENERATED__",
   "guardrailArn": "__RUNTIME_GENERATED__",
   "version": "DRAFT",

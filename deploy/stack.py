@@ -23,6 +23,7 @@ from stacks.auth import build_auth
 from stacks.observability import build_observability
 from stacks.outputs import build_outputs
 from stacks.alarms import build_alarms
+from stacks.tenant_query_rollout import validate_tenant_query_config
 
 
 class OpenClawOrchestratorStack(cdk.Stack):
@@ -60,11 +61,11 @@ class OpenClawOrchestratorStack(cdk.Stack):
         self._auto_delete = not _is_prod_region
 
         # ╔══════════════════════════════════════════════════════════════════╗
-        # ║ 三包归属导航(配合 the module ownership map)         ║
+        # ║ 三包归属导航(配合 engineering/03-collaboration/OWNERS.md)         ║
         # ║ 本 __init__ 顺序构建,资源用局部变量交叉引用,暂不物理拆分(拆 con-  ║
-        # ║ struct 会改 logical ID → 删库风险,见 the design notes)。改动时    ║
+        # ║ struct 会改 logical ID → 删库风险,见 work-items/WI-001)。改动时    ║
         # ║ 按下方 [包X] 标记认领自己的段,别动别的包的段;跨段枢纽变量(api_fn/ ║
-        # ║ assets_bucket/vpc/host_role/alb 等)改动走 the shared-files protocol。  ║
+        # ║ assets_bucket/vpc/host_role/alb 等)改动走 SHARED-FILES-PROTOCOL。  ║
         # ║   [包C 控制面+工程化] DDB/S3/Lambda/API GW/CodeBuild/Cognito/Outputs ║
         # ║   [包B 隔离安全]       HostRole/监控/ASG/userdata/DNS-FW/Wazuh/AgentCore║
         # ║   [包A 数据面]         ALB/CloudFront/CORS                          ║
@@ -78,6 +79,7 @@ class OpenClawOrchestratorStack(cdk.Stack):
         ctx._deploy_region = _deploy_region
         ctx._is_prod_region = _is_prod_region
 
+        validate_tenant_query_config(CFG)
         build_storage(self, ctx)
         build_lambdas(self, ctx)
         build_compute(self, ctx)

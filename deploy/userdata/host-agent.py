@@ -80,12 +80,21 @@ _PROM_GAUGES = (
 )
 
 
-def _render_metrics_text(snapshots):
+def _render_metrics_text(snapshots, port_stats=None, agent_stats=None):
     """Render the in-memory snapshots dict as Prometheus exposition text.
 
     Pure function — no I/O — so it is easy to assert against in unit tests.
     Always emits HELP/TYPE headers (even with zero samples) so that scrapers
     that validate metadata don't choke on a quiet host.
+
+    #387: port_stats/agent_stats are OPTIONAL dict snapshots taken by the
+    caller (do_GET) from already-initialized singletons/state. This function
+    MUST NOT touch _get_port_bitmap() or any lazy-init singleton — rendering
+    a metrics page must never mutate global routing state. When port_stats
+    is None (bitmap not yet initialized, i.e. no route was ever allocated on
+    this host) the three openclaw_host_dnat_ports_* series are ABSENT —
+    deliberately no fake zeros, so dashboards can tell "no data yet" from
+    "0 ports used".
     """
     out = []
     for metric_name, help_text, key in _PROM_GAUGES:
@@ -105,6 +114,95 @@ def _render_metrics_text(snapshots):
             continue
         v = 1 if info.get("vm_health") == "up" else 0
         out.append(f'openclaw_vm_health{{tenant="{tid}"}} {v}')
+    # #387 (#197 病史): app_health as 0/1 — gateway HTTP liveness per tenant.
+    # vm_health=1 + app_health=0 is exactly the "ping ok, gateway crashloop"
+    # blind spot (#197: gateway crashed 2715x while vm_health stayed green).
+    out.append(
+        "# HELP openclaw_app_health 1 if the tenant gateway answered HTTP, else 0"
+    )
+    out.append("# TYPE openclaw_app_health gauge")
+    for tid, info in snapshots.items():
+        if not isinstance(info, dict):
+            continue
+        v = 1 if info.get("app_health") == "up" else 0
+        out.append(f'openclaw_app_health{{tenant="{tid}"}} {v}')
+    # #387 容量红线: host DNAT port pool watermark. Port exhaustion means new
+    # VMs can never be promoted (PortAllocationError → skip-promote forever).
+    # HELP semantics: "used" INCLUDES stopped tenants — stop/start keeps the
+    # route (and its port); only delete releases it. quarantined = ports in
+    # cooldown, not yet re-allocatable, and NOT counted in used.
+    if isinstance(port_stats, dict) and port_stats:
+        out.append(
+            "# HELP openclaw_host_dnat_ports_used DNAT ports currently allocated"
+            " (includes stopped tenants: stop keeps the route+port, only delete"
+            " frees it)"
+        )
+        out.append("# TYPE openclaw_host_dnat_ports_used gauge")
+        out.append(f"openclaw_host_dnat_ports_used {int(port_stats['used'])}")
+        out.append(
+            "# HELP openclaw_host_dnat_ports_total total slots in the DNAT port"
+            " range (high-low+1, from runtime env)"
+        )
+        out.append("# TYPE openclaw_host_dnat_ports_total gauge")
+        out.append(f"openclaw_host_dnat_ports_total {int(port_stats['total'])}")
+        out.append(
+            "# HELP openclaw_host_dnat_ports_quarantined ports inside the range"
+            " in cooldown (not in used, not allocatable yet)"
+        )
+        out.append("# TYPE openclaw_host_dnat_ports_quarantined gauge")
+        out.append(
+            f"openclaw_host_dnat_ports_quarantined {int(port_stats['quarantined'])}"
+        )
+    # #387 v4: agent self-health/operational metrics (kata_agent_*/kubelet_
+    # runtime_operations_* layer). All host-level; kept out of the tenant map.
+    if isinstance(agent_stats, dict):
+        ticks = agent_stats.get("loop_last_tick") or {}
+        if ticks:
+            out.append(
+                "# HELP openclaw_agent_loop_last_tick_epoch unix epoch of each"
+                " background loop's last completed iteration (absent label ="
+                " loop not enabled; stale value = loop hung while HTTP still"
+                " serves old snapshots)"
+            )
+            out.append("# TYPE openclaw_agent_loop_last_tick_epoch gauge")
+            for loop_name, epoch in sorted(ticks.items()):
+                out.append(
+                    f'openclaw_agent_loop_last_tick_epoch{{loop="{loop_name}"}}'
+                    f" {int(epoch)}"
+                )
+        sha = agent_stats.get("build_sha")
+        if sha:
+            out.append(
+                "# HELP openclaw_agent_build_info full sha256 of this agent's"
+                " own file, computed once at process start (NOT git sha) —"
+                " exposes disk-new/process-old drift (#373)"
+            )
+            out.append("# TYPE openclaw_agent_build_info gauge")
+            out.append(f'openclaw_agent_build_info{{sha="{sha}"}} 1')
+        if "route_ensure_failures" in agent_stats:
+            out.append(
+                "# HELP openclaw_route_ensure_failures_total promote-blocking"
+                " route failures: _ensure_route raised (port exhausted /"
+                " iptables broke) OR returned degraded (host_ip/port missing)"
+                " — both leave the tenant stuck at creating"
+            )
+            out.append("# TYPE openclaw_route_ensure_failures_total counter")
+            out.append(
+                "openclaw_route_ensure_failures_total"
+                f" {int(agent_stats['route_ensure_failures'])}"
+            )
+        ssm = agent_stats.get("ssm_agent_up")
+        if ssm is not None:
+            out.append(
+                "# HELP openclaw_host_ssm_agent_up 1 if the local SSM agent"
+                " systemd unit is active, else 0. Local-active does NOT imply"
+                " control-plane PingStatus=Online (network/IAM breakage is"
+                " invisible here); the authoritative signal stays with the"
+                " control plane. This scrape path is independent of SSM, so"
+                " a dead SSM agent is still reportable."
+            )
+            out.append("# TYPE openclaw_host_ssm_agent_up gauge")
+            out.append(f"openclaw_host_ssm_agent_up {1 if ssm else 0}")
     return "\n".join(out) + "\n"
 
 
@@ -119,6 +217,47 @@ BALLOON_MIN_GUEST_AVAILABLE_MB = int(
 _ddb = None
 _status = {}
 _lock = threading.Lock()
+
+# #387 v4: agent self-metrics live in their OWN dict — NOT in _status.
+# _status is a tenant map; a host-level key mixed in would be rendered as a
+# phantom tenant by the per-tenant gauge loops above. Guarded by _lock (same
+# lock as _status: all writers already hold it or write scalar values).
+_agent_metrics = {
+    "loop_last_tick": {},  # loop_name -> unix epoch of last completed pass
+    "route_ensure_failures": 0,  # counter: skip-promote route failures
+    # "build_sha" set once in main(); "ssm_agent_up" set by poll loop probe.
+}
+
+
+def _agent_loop_tick(loop_name: str) -> None:
+    """#387: each background loop stamps ITS OWN heartbeat at the end of every
+    pass (never stamped centrally — a central stamper would defeat the whole
+    point of detecting an individual hung loop)."""
+    with _lock:
+        _agent_metrics["loop_last_tick"][loop_name] = int(time.time())
+
+
+def _probe_ssm_agent() -> None:
+    """#387: cache the local SSM agent unit state (probed from the poll loop,
+    NEVER at scrape time). Unit name verified on real hosts 2026-07-26:
+    snap.amazon-ssm-agent.amazon-ssm-agent.service. Any failure mode
+    (inactive / timeout / systemctl missing) records 0 — fail-loud."""
+    try:
+        r = subprocess.run(
+            [
+                "systemctl",
+                "is-active",
+                "snap.amazon-ssm-agent.amazon-ssm-agent.service",
+            ],
+            capture_output=True,
+            timeout=2,
+            check=False,
+        )
+        up = (r.stdout or b"").decode().strip() == "active"
+    except Exception:
+        up = False
+    with _lock:
+        _agent_metrics["ssm_agent_up"] = up
 
 # P2b: cached host private IP (contract §4 descriptor.host_private_ip). IMDS
 # is 100% reliable but avoids repeat calls per poll cycle.
@@ -308,7 +447,7 @@ def _resolve_region():
             .decode()
         )
     except Exception:
-        return "ap-northeast-1"
+        return "ap-northeast-1"  # fallback default (env+IMDSv2 unavailable)
 
 
 def _get_ddb():
@@ -690,6 +829,7 @@ def _disk_report_loop():
             _write_disk_report()
         except Exception as e:  # noqa: BLE001
             print(f"disk-report loop error (non-fatal): {e}")
+        _agent_loop_tick("disk_report")  # #387 self-stamped
         time.sleep(_DISK_REPORT_INTERVAL_SEC)
 
 
@@ -856,9 +996,15 @@ def _write_ddb(results):
                     host_private_ip, host_port = _ensure_route(tid, info["guest_ip"])
                 except Exception as e:
                     print(f"ensure_route {tid} failed (skip promote this tick): {e}")
+                    # #387: count BOTH skip-promote branches — each leaves the
+                    # tenant stuck at creating; counting only one under-reports.
+                    with _lock:
+                        _agent_metrics["route_ensure_failures"] += 1
                     continue
                 if not host_private_ip or host_port is None:
                     print(f"ensure_route {tid} degraded (host_ip or port missing)")
+                    with _lock:
+                        _agent_metrics["route_ensure_failures"] += 1
                     continue
                 # NOTE: `metrics` is a DynamoDB reserved keyword, so it must be
                 # referenced via an ExpressionAttributeNames placeholder (#m).
@@ -1415,6 +1561,7 @@ def _disk_gc_loop():
             _gc_orphan_vm_dirs()
         except Exception as e:
             print(f"disk-gc loop error (non-fatal): {e}")
+        _agent_loop_tick("disk_gc")  # #387 self-stamped
         time.sleep(_DISK_GC_INTERVAL_SEC)
 
 
@@ -2047,6 +2194,7 @@ def _dispatch_loop():
         except Exception as e:
             # Never crash — main _poll_loop keeps the host alive.
             print(f"dispatch loop error (non-fatal): {e}")
+        _agent_loop_tick("dispatch")  # #387 self-stamped
         time.sleep(DISPATCH_POLL)
 
 
@@ -2215,6 +2363,7 @@ def _housekeeping_loop():
             _report_route_drift()
         except Exception as e:
             print(f"route drift check error (non-fatal): {e}")
+        _agent_loop_tick("housekeeping")  # #387 self-stamped
         time.sleep(DISPATCH_HOUSEKEEPING_SEC)
 
 
@@ -2234,8 +2383,10 @@ def _poll_loop():
                     _status[tid] = info
             _write_ddb(results)
             _adjust_balloons(results)
+            _probe_ssm_agent()  # #387: cached here, never at scrape time
         except Exception as e:
             print(f"poll error: {e}")
+        _agent_loop_tick("poll")  # #387: self-stamped (period=POLL_INTERVAL)
         time.sleep(POLL_INTERVAL)
 
 
@@ -2246,7 +2397,39 @@ class Handler(BaseHTTPRequestHandler):
             # ADOT collector that remote-writes to AMP.
             with _lock:
                 data = dict(_status)
-            body = _render_metrics_text(data).encode()
+                agent_stats = {
+                    "loop_last_tick": dict(_agent_metrics["loop_last_tick"]),
+                    "route_ensure_failures": _agent_metrics[
+                        "route_ensure_failures"
+                    ],
+                    "build_sha": _agent_metrics.get("build_sha"),
+                    "ssm_agent_up": _agent_metrics.get("ssm_agent_up"),
+                }
+            # #387: read the port bitmap ONLY if already initialized — going
+            # through _get_port_bitmap() here would lazily rebuild from
+            # iptables (mutating global state) on a host that never allocated
+            # a route. Uninitialized → port_stats=None → series absent.
+            port_stats = None
+            bitmap = _port_bitmap
+            if bitmap is not None:
+                try:
+                    used = bitmap.used_count()
+                    quarantined = len(
+                        route_ops.get_quarantined_ports() - bitmap.snapshot()
+                    )
+                    port_stats = {
+                        "used": used,
+                        "total": route_ops.PORT_RANGE_HIGH
+                        - route_ops.PORT_RANGE_LOW
+                        + 1,
+                        "quarantined": quarantined,
+                    }
+                except Exception as e:  # noqa: BLE001
+                    # Collection failure → omit the whole group (no fake 0s,
+                    # never crash /metrics).
+                    print(f"port stats collection failed (omitted): {e}")
+                    port_stats = None
+            body = _render_metrics_text(data, port_stats, agent_stats).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; version=0.0.4")
             self.send_header("Content-Length", str(len(body)))
@@ -2271,6 +2454,36 @@ def main():
     print(
         f"openclaw-agent starting on :{PORT}, poll every {POLL_INTERVAL}s, table={TENANTS_TABLE}"
     )
+    # #387 (#373 病史): freeze THIS process's own file sha256 at startup.
+    # Hot-copying host-agent.py without restarting leaves disk-new/process-old
+    # drift — a startup-frozen hash makes that drift observable in /metrics.
+    try:
+        import hashlib
+        from pathlib import Path
+
+        _sha = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+        with _lock:
+            _agent_metrics["build_sha"] = _sha
+        print(f"agent build sha256: {_sha}")
+    except Exception as e:  # noqa: BLE001
+        print(f"build sha capture failed (metric absent): {e}")
+    # #387 (codex 评审): startup port-bitmap recovery. Without this, an agent
+    # restart on a host whose VMs are ALL stopped/down leaves _port_bitmap None
+    # forever (no promote → no lazy init) and the port gauges stay absent while
+    # real DNAT allocations exist — exhaustion alerts go blind. Rebuild once at
+    # startup; only publish the singleton when recovery found in-use ports, so
+    # a genuinely fresh host still reports absent (DoD ⓪: no fake zeros).
+    try:
+        _probe_bm = route_ops.PortBitmap()
+        _recovered = route_ops.rebuild_bitmap_from_iptables(_probe_bm)
+        if _recovered > 0:
+            global _port_bitmap
+            with _route_singleton_lock:
+                if _port_bitmap is None:
+                    _port_bitmap = _probe_bm
+            print(f"port_bitmap: startup recovery found {_recovered} in-use ports")
+    except Exception as e:  # noqa: BLE001
+        print(f"port_bitmap startup recovery failed (stays lazy): {e}")
     t = threading.Thread(target=_poll_loop, daemon=True)
     t.start()
     # #321: disk GC on its own always-on thread (independent of dispatch/poll so a

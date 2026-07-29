@@ -454,7 +454,7 @@ chmod +x /usr/local/sbin/openclaw-mount-creds.sh
 systemctl enable openclaw-creds.service
 
 # === FIM: host-invisible file-integrity monitor (our Wazuh-style analogue) ===
-# The real a production-grade hardened sandbox runs Wazuh syscheck (FIM) + logcollector +
+# The production reference sandbox runs Wazuh syscheck (FIM) + logcollector +
 # active-response in a separate namespace the agent CANNOT see or modify:
 # `/var/ossec` simply does not exist in the agent's mount namespace, so even a
 # fully compromised agent cannot tamper with the monitor that watches it.
@@ -837,12 +837,12 @@ if [ -d /tmp/image-sample ]; then
     # Register the two guard plugins in config: load paths + enabled entries.
     # jq merge keeps whatever the template already had under .plugins.
     #   acl-guard / sentinel-guard — before_tool_call hooks (priority 1000 / 200)
-    # claw-channel was retired in the data-plane refactor
-    # (the data-plane design doc §A): the WSS-hub reverse channel
+    # claw-channel was retired in the 11-ENGINE-TRANSFORM data-plane refactor
+    # (SPEC/11-ENGINE-TRANSFORM/02-DEV-PLAN.md §A): the WSS-hub reverse channel
     # is replaced by two-tier routing (OpenResty edge → host DNAT → in-VM native
     # gateway on :18789). The gateway now serves chat via the OpenAI-compatible
     # /v1/chat/completions and /v1/responses HTTP endpoints directly; the plugin
-    # is archived under an internal archive for history.
+    # is archived under engineering/04-archive/claw-channel-plugin/ for history.
     if command -v jq >/dev/null 2>&1; then
       jq '
         (.plugins // {}) as $p |
@@ -890,8 +890,8 @@ Environment=OPENCLAW_SYSTEMD_UNIT=openclaw-gateway.service
 Environment=OPENCLAW_SERVICE_MARKER=openclaw
 Environment=OPENCLAW_SERVICE_KIND=gateway
 
-# ── HARDENING (privilege drop) — our adaptation of a production-grade hardened CapBnd=0 ──
-# The real reference hardened sandbox runs the agent with CapBnd=0000…0000
+# ── HARDENING (privilege drop) — our adaptation of the reference CapBnd=0 model ──
+# The production reference sandbox runs the agent with CapBnd=0000…0000
 # (root inside, but ZERO Linux capabilities) plus a seccomp filter. Our gateway
 # already runs as the unprivileged `agent` user (uid 1000, a systemd *user*
 # service — never root), so we layer defence-in-depth on top:
@@ -899,14 +899,14 @@ Environment=OPENCLAW_SERVICE_KIND=gateway
 #                            gateway cannot regain privileges via exec (mirrors
 #                            CapBnd=0's "cannot re-acquire any cap").
 #   CapabilityBoundingSet= — empty bounding set: no capability obtainable
-#                            (the systemd analogue of the hardened-sandbox CapBnd=0).
+#                            (the systemd analogue of the reference CapBnd=0).
 #   RestrictSUIDSGID       — block creating SUID/SGID files.
 #   ProtectKernelTunables / ProtectKernelModules / ProtectControlGroups —
 #                            read-only /proc/sys, /sys; no module load; no cgroup
 #                            edits from inside the gateway.
 #   RestrictNamespaces / LockPersonality / MemoryDenyWriteExecute(off — Node JIT
 #                            needs W^X relaxed) — narrow the kernel attack surface.
-#   SystemCallFilter=@system-service — seccomp allowlist (the reference sandbox had 1 active
+#   SystemCallFilter=@system-service — seccomp allowlist (the reference had 1 active
 #                            BPF filter; this is our equivalent, scoped to the
 #                            syscalls a Node service legitimately needs).
 NoNewPrivileges=true
@@ -922,8 +922,8 @@ RestrictRealtime=true
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 
-# ── HARDENING (cgroup resource limits) — our adaptation of a hardened cgroup v2 ──
-# the reference profile pins each sandbox to memory.max=4GB + cpu.max=2.5cores at the cgroup
+# ── HARDENING (cgroup resource limits) — our adaptation of the reference cgroup v2 ──
+# The reference pins each sandbox to memory.max=4GB + cpu.max=2.5cores at the cgroup
 # layer. Our microVM is already capped by Firecracker (≈2GB/1vCPU on the dense
 # default), so this is a *sub-limit* INSIDE the guest: it bounds the gateway +
 # all its tool-exec children so a runaway/forked workload OOMs its own slice
@@ -976,9 +976,10 @@ Restart=always
 RestartSec=5
 Environment=HOME=/home/agent
 # 背压兜底 + 零凭据:纯本地 vsock 写,无出网、无云凭据。收紧权限(仿 gateway)。
+# 该 unit 由非特权 user manager(uid 1000)启动。Ubuntu Noble 会拒绝 user unit 设
+# capability 并报 218/CAPABILITIES,forwarder 起不来;进程本身已是 uid 1000,靠
+# NoNewPrivileges 保持不可提权,不需要也不能再设 CapabilityBoundingSet。
 NoNewPrivileges=true
-# 该全局 unit 由非特权 user manager 启动。Ubuntu Noble 会拒绝 capability 设置并报
-# 218/CAPABILITIES；进程本身已是 uid 1000，依靠 NoNewPrivileges 保持不可提权。
 RestrictSUIDSGID=true
 MemoryMax=128M
 TasksMax=16
@@ -993,7 +994,7 @@ ln -sf ../openclaw-log-forwarder.service /usr/lib/systemd/user/default.target.wa
 # Without delegation, a systemd *user* service silently ignores resource limits
 # (the controllers aren't available in the user slice). Ubuntu Noble is cgroup
 # v2 unified, so memory+cpu+pids are delegatable. This is the plumbing that turns
-# the hardened cgroup sub-limit from decoration into enforcement.
+# the reference-style cgroup sub-limit from decoration into enforcement.
 mkdir -p /etc/systemd/system/user@.service.d
 cat > /etc/systemd/system/user@.service.d/10-openclaw-delegate.conf << 'DELEG'
 [Service]

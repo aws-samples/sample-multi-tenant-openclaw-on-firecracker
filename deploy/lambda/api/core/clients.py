@@ -56,6 +56,12 @@ tenants_table = ddb.Table(os.environ["TENANTS_TABLE"])
 
 hosts_table = ddb.Table(os.environ["HOSTS_TABLE"])
 
+tenant_stats_table = (
+    ddb.Table(os.environ["TENANT_STATS_TABLE"])
+    if os.environ.get("TENANT_STATS_TABLE")
+    else None
+)
+
 # #217 V2 — 文件版本快照表(pull-image?snapshot_time 按此逐文件按精确 VersionId 拉)。
 # env-gated:未部署 V2 的环境无此 env → None,pull-image 的 snapshot 分支 fail-loud。
 version_snapshots_table = (

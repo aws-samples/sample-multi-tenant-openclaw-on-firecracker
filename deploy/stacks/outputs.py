@@ -1,63 +1,12 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
-import json
-import platform as _platform
-import re
 import aws_cdk as cdk
-from aws_cdk import (
-    aws_dynamodb as dynamodb,
-    aws_lambda as _lambda,
-    aws_apigateway as apigw,
-    aws_events as events,
-    aws_events_targets as targets,
-    aws_iam as iam,
-    aws_kms as kms,
-    aws_s3 as s3,
-    aws_sns as sns,
-    aws_ec2 as ec2,
-    aws_logs as logs,
-    aws_autoscaling as autoscaling,
-    aws_elasticloadbalancingv2 as elbv2,
-    aws_elasticloadbalancingv2_actions as elbv2_actions,
-    aws_elasticloadbalancingv2_targets as elbv2_targets,
-    aws_cloudfront as cloudfront,
-    aws_cloudfront_origins as origins,
-    aws_certificatemanager as acm,
-    aws_cognito as cognito,
-    aws_wafv2 as wafv2,
-    aws_aps as aps,
-    aws_grafana as grafana,
-    aws_guardduty as guardduty,
-    aws_route53resolver as route53resolver,
-    aws_sqs as sqs,
-    aws_lambda_event_sources as lambda_event_sources,
-    aws_bedrock as bedrock,
-    aws_bedrock_agentcore_alpha as agentcore,
-    aws_bedrockagentcore as agentcore_l1,
-    aws_codebuild as codebuild,
-    aws_s3_assets as s3_assets,
-    aws_ssm as ssm,
-    aws_secretsmanager as secretsmanager,
-    aws_elasticache as elasticache,
-    aws_rds as rds,
-    aws_cloudwatch as cloudwatch,
-    aws_cloudwatch_actions as cw_actions,
-    custom_resources as cr,
-    BundlingOptions,
-    BundlingFileAccess,
-    Duration,
-    Fn,
-    RemovalPolicy,
-)
-from constructs import Construct
-from pathlib import Path
 
 
 def build_outputs(self, ctx):
     """Build outputs resources (mechanical transplant from stack.py, issue #87)."""
     # --- Unpack from ctx ---
-    CFG = ctx.CFG
     alb = getattr(ctx, 'alb', None)
     api = getattr(ctx, 'api', None)
     api_key = getattr(ctx, 'api_key', None)
@@ -164,5 +113,4 @@ def build_outputs(self, ctx):
             cfn = resource.node.default_child
             if cfn is not None:
                 cfn.override_logical_id(logical_id)
-
 

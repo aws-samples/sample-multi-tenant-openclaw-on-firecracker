@@ -55,7 +55,7 @@
 | `dynamodb`       | P    | config.yml                      | 重部署(PITR 开关,安全默认开)                                                                      |
 | `audit`          | P    | config.yml                      | 重建栈;CMK/WORM 只能全新账号首次开(存量切会丢历史)                                                |
 | `external_authz` | C    | config.yml + Secrets Manager    | 重建栈(映射写权威外置;HMAC 密钥走 CFN 动态引用)                                                   |
-| `exchange_idp`   | C    | config.yml + Secrets Manager    | 重建栈(OIDC 联邦;端点由平台侧提供,不硬编造)                                                     |
+| `exchange_idp`   | C    | config.yml + Secrets Manager    | 重建栈(OIDC 联邦;端点由外部 IdP 侧提供,不硬编造)                                                  |
 | `cloudfront`     | C    | config.yml + setup(证书)        | 重建栈(自定义域名;证书须 us-east-1)                                                               |
 | `notifications`  | C    | config.yml                      | 重建栈(SNS topic;部署后订阅)                                                                      |
 | `metrics`        | C    | config.yml                      | 重建栈;use_managed=true 走 AMP+AMG(强制 SSO),默认自建 Prom/Grafana                                |

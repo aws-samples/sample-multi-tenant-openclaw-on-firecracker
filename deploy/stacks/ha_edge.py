@@ -1,7 +1,11 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
+import hashlib
 import re
+import shlex
+from collections.abc import Mapping
+from urllib.parse import urlsplit
 from aws_cdk import (
     aws_lambda as _lambda,
     aws_events as events,
@@ -17,11 +21,154 @@ from aws_cdk import (
     aws_bedrockagentcore as agentcore_l1,
     aws_ssm as ssm,
     aws_elasticache as elasticache,
+    aws_s3_deployment as s3deploy,
     custom_resources as cr,
     Duration,
     Fn,
+    Token,
 )
 from pathlib import Path
+
+
+def _valid_s3_bucket_name(bucket):
+    return bool(
+        re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", bucket)
+        and ".." not in bucket
+        and ".-" not in bucket
+        and "-." not in bucket
+        and not re.fullmatch(r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}", bucket)
+    )
+
+
+def _parse_user_hook(cfg, role):
+    """Validate one optional root hook without accepting shell-shaped input."""
+    user_hooks = cfg.get("user_hooks")
+    if user_hooks is None:
+        user_hooks = {}
+    if not isinstance(user_hooks, Mapping):
+        raise ValueError("user_hooks must be a mapping")
+    raw = user_hooks.get(role)
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"user_hooks.{role} must be a mapping")
+    uri = str(raw.get("s3_uri") or "").strip()
+    if not uri:
+        return None
+
+    parsed = urlsplit(uri)
+    key = parsed.path[1:] if parsed.path.startswith("/") else ""
+    if (
+        parsed.scheme != "s3"
+        or not _valid_s3_bucket_name(parsed.netloc)
+        or not key
+        or parsed.path.startswith("//")
+        or key.endswith("/")
+        or parsed.query
+        or parsed.fragment
+        or any(ord(ch) < 32 or ord(ch) == 127 for ch in uri)
+        or "*" in key
+        or "?" in key
+    ):
+        raise ValueError(
+            f"user_hooks.{role}.s3_uri must be an exact private "
+            "s3://bucket/object URI (no prefix, wildcard, query, or fragment)"
+        )
+
+    sha256 = str(raw.get("sha256") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", sha256):
+        raise ValueError(
+            f"user_hooks.{role}.sha256 must be the object's full 64-char SHA256"
+        )
+
+    timeout = raw.get("timeout_seconds", 300)
+    if isinstance(timeout, bool) or not isinstance(timeout, int):
+        raise ValueError(f"user_hooks.{role}.timeout_seconds must be an integer")
+    if not 1 <= timeout <= 3600:
+        raise ValueError(
+            f"user_hooks.{role}.timeout_seconds must be between 1 and 3600"
+        )
+
+    failure_policy = str(raw.get("failure_policy") or "fail").strip().lower()
+    if failure_policy not in {"fail", "warn"}:
+        raise ValueError(f"user_hooks.{role}.failure_policy must be fail or warn")
+
+    return {
+        "uri": uri,
+        "bucket": parsed.netloc,
+        "key": key,
+        "sha256": sha256,
+        "timeout": timeout,
+        "failure_policy": failure_policy,
+    }
+
+
+def _render_user_hook(
+    role,
+    hook,
+    region_expr,
+    fail_cleanup=":",
+    install_dir="/var/lib/openclaw/user-hooks",
+):
+    """Return a bounded download/verify/execute block for Host or Edge."""
+    if hook is None:
+        return ""
+
+    uri = shlex.quote(hook["uri"])
+    sha256 = shlex.quote(hook["sha256"])
+    hook_dir = shlex.quote(install_dir)
+    timeout = int(hook["timeout"])
+    failure = hook["failure_policy"]
+    fail_lines = (
+        [
+            f'echo "[oc:user-hook] FATAL role={role} rc=${{_oc_hook_rc}}" >&2',
+            fail_cleanup,
+            'exit "${_oc_hook_rc}"',
+        ]
+        if failure == "fail"
+        else [f'echo "[oc:user-hook] WARN role={role} rc=${{_oc_hook_rc}}" >&2']
+    )
+    lines = [
+        f'echo "[oc:user-hook] START role={role}"',
+        f"_oc_hook_uri={uri}",
+        f"_oc_hook_sha={sha256}",
+        f"_oc_hook_region=\"{region_expr}\"",
+        f"_oc_hook_dir={hook_dir}",
+        f'_oc_hook_path="${{_oc_hook_dir}}/{role}.sh"',
+        '_oc_hook_next="${_oc_hook_path}.new"',
+        '_oc_hook_tmp=$(mktemp "/tmp/openclaw-user-hook.XXXXXX")',
+        "_oc_hook_rc=0",
+        'if aws s3 cp "${_oc_hook_uri}" "${_oc_hook_tmp}" '
+        '--region "${_oc_hook_region}" --no-progress; then',
+        "  if printf '%s  %s\\n' \"${_oc_hook_sha}\" \"${_oc_hook_tmp}\" "
+        "| sha256sum -c - >/dev/null; then",
+        '    if install -d -m 0755 "${_oc_hook_dir}" '
+        '&& install -m 0700 "${_oc_hook_tmp}" "${_oc_hook_next}" '
+        '&& mv -f "${_oc_hook_next}" "${_oc_hook_path}"; then',
+        f'      if OC_REGION="${{_oc_hook_region}}" OC_NODE_ROLE={role} '
+        "timeout --signal=TERM --kill-after=10s "
+        f'{timeout}s bash "${{_oc_hook_path}}"; then',
+        f'        echo "[oc:user-hook] PASS role={role}"',
+        "      else",
+        "        _oc_hook_rc=$?",
+        "      fi",
+        "    else",
+        "      _oc_hook_rc=$?",
+        "    fi",
+        "  else",
+        "    _oc_hook_rc=$?",
+        "  fi",
+        "else",
+        "  _oc_hook_rc=$?",
+        "fi",
+        'rm -f "${_oc_hook_tmp}" "${_oc_hook_next}"',
+        'if [ "${_oc_hook_rc}" -ne 0 ]; then',
+        *[f"  {line}" for line in fail_lines],
+        "fi",
+        "unset _oc_hook_uri _oc_hook_sha _oc_hook_region _oc_hook_dir "
+        "_oc_hook_path _oc_hook_next _oc_hook_tmp _oc_hook_rc",
+    ]
+    return "\n".join(lines)
 
 
 def build_ha_edge(self, ctx):
@@ -110,6 +257,18 @@ def build_ha_edge(self, ctx):
     _vcpu_total, _mem_total = _host_capacity(_itype)
     _avail_vcpu = _vcpu_total - CFG["host"]["reserved_vcpu"]
     _avail_mem = _mem_total - CFG["host"]["reserved_mem_mb"]
+    _host_user_hook = _parse_user_hook(CFG, "host")
+    _edge_user_hook = _parse_user_hook(CFG, "edge")
+
+    if _host_user_hook is not None:
+        host_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3:GetObject"],
+                resources=[
+                    f"arn:{self.partition}:s3:::{_host_user_hook['bucket']}/{_host_user_hook['key']}"
+                ],
+            )
+        )
 
     # Load scripts from userdata/ and inject config
     ud_dir = Path(__file__).parent.parent / "userdata"
@@ -148,10 +307,18 @@ def build_ha_edge(self, ctx):
         "{{PORT_QUARANTINE_SECONDS}}",
         str((CFG.get("edge", {}) or {}).get("port_quarantine_seconds", 20)),
     )
+    # Source.data resolves CDK tokens while deploying the object. Hashing the
+    # tokenized string at synth time would therefore bind the bootstrap to a
+    # digest that cannot match the deployed bytes. Keep dynamic service URLs in
+    # the small LaunchTemplate bootstrap and inherit them as environment values.
     init_sh = init_sh.replace(
-        "{{AGENTCORE_GATEWAY_URL}}", gateway_url if gateway_url else "none"
+        "{{AGENTCORE_GATEWAY_URL}}",
+        "${OC_BOOTSTRAP_AGENTCORE_GATEWAY_URL:-none}",
     )
-    init_sh = init_sh.replace("{{AMP_REMOTE_WRITE_URL}}", amp_remote_write_url)
+    init_sh = init_sh.replace(
+        "{{AMP_REMOTE_WRITE_URL}}",
+        "${OC_BOOTSTRAP_AMP_REMOTE_WRITE_URL:-none}",
+    )
     # #245 host Fluent Bit: logging gate + the two host-side stream names.
     # Hardcode the names (same pattern as edge's claw-logs{gsuffix} in the edge
     # userdata below) — build_observability runs after build_ha_edge, so
@@ -278,6 +445,10 @@ def build_ha_edge(self, ctx):
         "{{HOST_AGENT_SCRIPT}}",
         f"cat > /etc/systemd/system/host-agent.service << 'SVCEOF'\n{host_agent_svc}SVCEOF",
     )
+    init_sh = init_sh.replace(
+        "{{HOST_USER_HOOK}}",
+        _render_user_hook("host", _host_user_hook, "${REGION}"),
+    )
 
     # NOTE: assets/backup bucket names + backup CMK key id are no longer injected
     # here. init-host.sh resolves them at runtime from stack outputs (AssetsBucket
@@ -285,53 +456,97 @@ def build_ha_edge(self, ctx):
     # This removes the ~19 Fn::Join bucket tokens that, together with the 21KB
     # script, blew the hard 16KB EC2 user-data limit.
 
-    # user-data is now a plain string (no CFN tokens). The post-injection script
-    # is ~23KB, over the hard 16KB EC2 limit. Raw gzip bytes can't go in a CFN
-    # template (binary → "Template contains invalid characters"), so we embed a
-    # base64(gzip(...)) blob inside a tiny ASCII bootstrap that decodes, gunzips
-    # and execs it. base64 is ASCII-safe for the template; gzip keeps it small
-    # (~9KB gzipped → ~12.5KB base64, comfortably under 16KB).
-    import base64 as _b64
-    import gzip as _gzip
-    import re as _re
+    # Keep the rendered init script out of EC2 user-data. BucketDeployment uses a
+    # CDK file asset, so CloudFormation stages this object before the Host ASG is
+    # allowed to launch. The content hash is part of the destination key: old
+    # versions remain addressable for rollback and an init change necessarily
+    # changes the LaunchTemplate user-data.
+    if Token.is_unresolved(init_sh):
+        raise ValueError(
+            "rendered init-host.sh contains an unresolved CDK token; resolve it "
+            "at Host runtime before computing the immutable asset digest"
+        )
+    _init_sha256 = hashlib.sha256(init_sh.encode("utf-8")).hexdigest()
+    _init_key_prefix = f"deployment/bootstrap/host/{_init_sha256}"
+    _init_key = f"{_init_key_prefix}/init-host.sh"
+    _host_init_asset = s3deploy.BucketDeployment(
+        self,
+        "HostInitAssetDeployment",
+        sources=[s3deploy.Source.data("init-host.sh", init_sh)],
+        destination_bucket=assets_bucket,
+        destination_key_prefix=_init_key_prefix,
+        prune=False,
+        retain_on_delete=True,
+    )
 
-    # user-data 逼近 16KB 硬限:打包进 user-data 前剥掉整行注释 + 空行(源文件保留
-    # 可读性,只瘦打包体)。heredoc-aware:sysctl/nginx conf 等 heredoc 体内的 `#`
-    # 是配置内容不是注释,必须原样保留;保 shebang(#!)。不改脚本语义。
-    def _strip_for_userdata(script: str) -> str:
-        out = []
-        heredoc_delim = None
-        for line in script.splitlines():
-            if heredoc_delim is not None:
-                out.append(line)
-                if line.strip() == heredoc_delim:
-                    heredoc_delim = None
-                continue
-            m = _re.search(r"<<[-']?([A-Za-z_][A-Za-z0-9_]*)", line)
-            if m:
-                heredoc_delim = m.group(1)
-                out.append(line)
-                continue
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if stripped.startswith("#") and not stripped.startswith("#!"):
-                continue
-            out.append(line)
-        return "\n".join(out) + "\n"
-
-    init_sh = _strip_for_userdata(init_sh)
-    _blob = _b64.b64encode(_gzip.compress(init_sh.encode("utf-8"), 9)).decode("ascii")
+    # Ubuntu does not guarantee awscli on a clean AMI, so the bootstrap installs
+    # the architecture-correct CLI before reading the private S3 object. Never
+    # pipe remote bytes into bash: download, verify the full digest, then exec.
+    # A bootstrap failure settles the lifecycle hook as ABANDON when awscli is
+    # available; init-host.sh installs its own EXIT trap after exec.
     _bootstrap = (
         "#!/bin/bash\n"
-        "set -e\n"
-        f"echo {_blob} | base64 -d | gunzip > /tmp/init-host.sh\n"
-        "exec bash /tmp/init-host.sh\n"
+        "set -euo pipefail\n"
+        "exec > >(tee /var/log/openclaw-bootstrap.log > /dev/console) 2>&1\n"
+        'echo "[oc:bootstrap] starting immutable init-host download"\n'
+        f'export OC_BOOTSTRAP_AMP_REMOTE_WRITE_URL="{amp_remote_write_url or "none"}"\n'
+        f'export OC_BOOTSTRAP_AGENTCORE_GATEWAY_URL="{gateway_url or "none"}"\n'
+        "_install_packages() {\n"
+        "  export DEBIAN_FRONTEND=noninteractive\n"
+        "  apt-get -o DPkg::Lock::Timeout=60 update -qq\n"
+        "  apt-get -o DPkg::Lock::Timeout=60 install -y -qq \"$@\" >/dev/null\n"
+        "}\n"
+        "command -v curl >/dev/null 2>&1 || _install_packages ca-certificates curl\n"
+        "TOKEN=$(curl -fsS -X PUT http://169.254.169.254/latest/api/token "
+        "-H 'X-aws-ec2-metadata-token-ttl-seconds: 300')\n"
+        'imds() { curl -fsS -H "X-aws-ec2-metadata-token: ${TOKEN}" '
+        '"http://169.254.169.254/latest/meta-data/$1"; }\n'
+        "REGION=$(imds placement/region)\n"
+        "INSTANCE_ID=$(imds instance-id)\n"
+        "_abandon() {\n"
+        "  rc=$?; trap - EXIT\n"
+        "  [ -z \"${tmp:-}\" ] || rm -f \"$tmp\" || true\n"
+        "  [ -z \"${staged:-}\" ] || rm -f \"$staged\" || true\n"
+        "  if [ \"$rc\" -ne 0 ] && command -v aws >/dev/null 2>&1; then\n"
+        "    aws autoscaling complete-lifecycle-action "
+        "--lifecycle-hook-name openclaw-host-init "
+        "--auto-scaling-group-name openclaw-hosts-asg "
+        "--lifecycle-action-result ABANDON "
+        "--instance-id \"${INSTANCE_ID}\" --region \"${REGION}\" || true\n"
+        "  fi\n"
+        "  exit \"$rc\"\n"
+        "}\n"
+        "trap _abandon EXIT\n"
+        "if ! command -v aws >/dev/null 2>&1; then\n"
+        "  command -v unzip >/dev/null 2>&1 || _install_packages unzip\n"
+        "  case \"$(uname -m)\" in\n"
+        "    x86_64|amd64) AWSCLI_ARCH=x86_64 ;;\n"
+        "    aarch64|arm64) AWSCLI_ARCH=aarch64 ;;\n"
+        "    *) echo '[oc:bootstrap] FATAL: unsupported CPU architecture'; exit 1 ;;\n"
+        "  esac\n"
+        "  curl -fsSL \"https://awscli.amazonaws.com/awscli-exe-linux-${AWSCLI_ARCH}.zip\" "
+        "-o /tmp/awscliv2.zip\n"
+        "  (cd /tmp && unzip -qo awscliv2.zip && ./aws/install)\n"
+        "fi\n"
+        "tmp=$(mktemp /tmp/init-host.XXXXXX)\n"
+        "for attempt in $(seq 1 20); do\n"
+        f"  if aws s3 cp \"s3://{assets_bucket.bucket_name}/{_init_key}\" "
+        "\"$tmp\" --region \"$REGION\" --no-progress; then break; fi\n"
+        "  [ \"$attempt\" -lt 20 ] || exit 1\n"
+        "  sleep 15\n"
+        "done\n"
+        f"printf '%s  %s\\n' '{_init_sha256}' \"$tmp\" | sha256sum -c -\n"
+        "staged=/var/lib/cloud/.init-host.sh.$$\n"
+        "install -o root -g root -m 0700 \"$tmp\" \"$staged\"\n"
+        "mv -f \"$staged\" /var/lib/cloud/init-host.sh\n"
+        "rm -f \"$tmp\"\n"
+        'echo "[oc:bootstrap] verified init-host '
+        f"{_init_sha256}, executing\"\n"
+        "exec bash /var/lib/cloud/init-host.sh\n"
     )
     if len(_bootstrap.encode()) > 16384:
         raise ValueError(
-            f"host user-data {len(_bootstrap.encode())}B exceeds 16KB even gzipped; "
-            "move init-host.sh body to S3 bootstrap"
+            f"host bootstrap user-data {len(_bootstrap.encode())}B exceeds 16KB"
         )
     user_data = ec2.UserData.custom(_bootstrap)
 
@@ -448,7 +663,7 @@ def build_ha_edge(self, ctx):
     # deploy/monitoring/prometheus.yml 的 ec2_sd_configs 按 tag:Project=openclaw +
     # tag:Role=metal-host 过滤发现 metal host 抓 :8899/metrics。CDK LaunchTemplate
     # 默认只给实例打 Name,不打这俩 tag → Prometheus 发现不到 host、采集断链
-    # (795 实测 metal 实例只有 Name tag)。这里在 LaunchTemplateData 层加
+    # (实测 metal 实例只有 Name tag)。这里在 LaunchTemplateData 层加
     # TagSpecifications,让 ASG 起的每台 host(及其卷)都带这俩 tag,随重建继承。
     # key 大小写须与 prometheus.yml filters 完全一致(Project/Role 首字母大写)。
     _host_tags = [
@@ -621,6 +836,10 @@ def build_ha_edge(self, ctx):
         max_capacity=CFG["asg"]["max_capacity"],
     )
     asg.node.add_dependency(set_default)
+    # The bootstrap cannot perform its own retry until init-host.sh exists.
+    # Gate Host launch on the immutable object deployment instead of setup.sh's
+    # post-CDK uploader, which is intentionally only for second-stage scripts.
+    asg.node.add_dependency(_host_init_asset)
     # Golden-image bake is a separate, non-blocking stack (OpenClawImageStack)
     # now, so the ASG no longer depends on image readiness. On a fresh region the
     # first host may boot before the image is in S3 and churn a few minutes via
@@ -1184,6 +1403,17 @@ def build_ha_edge(self, ctx):
             ec2.Port.tcp(8080),
             "ALB to OpenResty edge :8080 (only)",
         )
+        # #387: VPC → edge :9145(独立 metrics 端口,Prometheus scrape)。
+        # 沿用 host :8899 的 VPC CIDR 放行模式;8080 入站仍只属 ALB SG(数据面
+        # 红线不动,metrics 不走数据面端口)。绝不对 0.0.0.0/0 开。
+        # 已知残余(codex 评审确认,issue #387 明确"另开 issue ④"):microVM 出网
+        # 经 MASQUERADE 后源=host VPC IP,VPC CIDR 放行无法区分租户/节点流量——
+        # 8899 与 9145 一起收窄到 Prometheus SG 白名单归后续 issue,本条不预做。
+        _edge_sg.add_ingress_rule(
+            ec2.Peer.ipv4(vpc.vpc_cidr_block),
+            ec2.Port.tcp(9145),
+            "VPC to edge nginx :9145 (Prometheus /metrics scrape, #387)",
+        )
         # edge SG → host SG DNAT 端口段(host 数据面入站的唯一来源)。
         # 安全红线(design decision):host 的数据面流量只能来自 OpenResty
         # edge 集群,别处一律拒。端口段上下界从 config edge.dnat_port_{low,high} 读
@@ -1228,8 +1458,17 @@ def build_ha_edge(self, ctx):
             ],
         )
         assets_bucket.grant_read(_edge_role)
+        if _edge_user_hook is not None:
+            _edge_role.add_to_policy(
+                iam.PolicyStatement(
+                    actions=["s3:GetObject"],
+                    resources=[
+                        f"arn:{self.partition}:s3:::{_edge_user_hook['bucket']}/{_edge_user_hook['key']}"
+                    ],
+                )
+            )
         _edge_ud = ec2.UserData.for_linux()
-        _edge_ud.add_commands(
+        _edge_commands = [
             "set -euxo pipefail",
             # ENGINE_REDIS_ENDPOINT 需在 install-edge.sh 执行时可见(userdata
             # 属 CFN 模板,Redis endpoint token 在 deploy 期正确解析)。
@@ -1242,7 +1481,16 @@ def build_ha_edge(self, ctx):
             '[ -f /opt/openclaw-edge/install-edge.sh ] || { echo "[edge-userdata] FATAL: edge assets missing after 600s" >&2; exit 1; }',
             f'ENGINE_REDIS_ENDPOINT="{redis_endpoint}" EDGE_LISTEN_PORT=8080 '
             "bash /opt/openclaw-edge/install-edge.sh",
+        ]
+        _edge_hook_command = _render_user_hook(
+            "edge",
+            _edge_user_hook,
+            str(self.region),
+            fail_cleanup="systemctl stop claw-edge.service 2>/dev/null || true",
         )
+        if _edge_hook_command:
+            _edge_commands.append(_edge_hook_command)
+        _edge_ud.add_commands(*_edge_commands)
         _edge_lt = ec2.LaunchTemplate(
             self,
             "EdgeLaunchTemplate",
@@ -1258,6 +1506,24 @@ def build_ha_edge(self, ctx):
             security_group=_edge_sg,
             role=_edge_role,  # S3 拉 edge 资产 + SSM 运维通道
             associate_public_ip_address=False,  # 私有子网 + NAT 出网
+        )
+        # ── #387 实例 tag:让 edge 被 Prometheus ec2_sd 自动发现 ──
+        # 照抄 host LT 的做法(上方 _host_tags 段):CDK LaunchTemplate 默认只给
+        # 实例打 Name,不打 Project/Role → prometheus.yml 的 openclaw-edge-nginx
+        # ec2_sd job 发现 0 target。必须打在 LaunchTemplateData.TagSpecifications
+        # (ResourceType=instance)层——只给 LT 资源本身打标签对实例无效。
+        # 注意:只对新起实例生效,存量 edge 需 instance refresh 或手工补 tag。
+        _edge_tags = [
+            {"Key": "Project", "Value": "openclaw"},
+            {"Key": "Role", "Value": "edge"},
+        ]
+        _edge_cfn_lt = _edge_lt.node.default_child
+        _edge_cfn_lt.add_property_override(
+            "LaunchTemplateData.TagSpecifications",
+            [
+                {"ResourceType": "instance", "Tags": _edge_tags},
+                {"ResourceType": "volume", "Tags": _edge_tags},
+            ],
         )
         # #272 — edge.subnet_ids 非空时显式选 OpenResty edge 子网;缺省回落
         # PRIVATE_WITH_EGRESS(带 NAT 出网的私有子网)。

@@ -11,7 +11,7 @@
 // CloudFront /ws/* → ALB LOR → 3 台 OpenResty edge → Redis 查 route:{tenant_id}
 // 拿 host:port → 宿主 iptables DNAT → microVM:18789 OpenClaw gateway。
 // 认证:Authorization: Bearer <gateway_token>,per-租户唯一,由 P1 KMS 预铸
-// (the API spec 二);token 明文由 tenant owner 从 console reveal 页面
+// (04-API-SPEC.md 二);token 明文由 tenant owner 从 console reveal 页面
 // 手动贴到 chat 页 localStorage.oc_gw_token(P5 讨论平台后端 relay 是否兜底,
 // 本 chat mini-app 走"用户持 token"最简形态)。
 // 现场 demo(file:// / localhost):走本地代理 127.0.0.1:8799/chat(token 在代理进程内存)。
@@ -61,9 +61,7 @@ function pickOwnNode(nodes) {
   const sub = mySub();
   if (sub) {
     const pfx = "u-" + sub.slice(0, 8).toLowerCase();
-    const own = nodes.find((n) =>
-      (n.id || "").toLowerCase().startsWith(pfx),
-    );
+    const own = nodes.find((n) => (n.id || "").toLowerCase().startsWith(pfx));
     if (own) return own;
   }
   return nodes[0];
@@ -133,10 +131,7 @@ async function loadNodes(opts) {
     const msg = String(e.message || e);
     // 缺/错网关 key — 提示用户输入一次(存 localStorage,不进源码)。
     // 不自动弹窗骚扰;在节点区放一个「连接」入口,点了才提示。
-    if (
-      (msg === "NO_API_KEY" || msg === "BAD_API_KEY") &&
-      !opts.noPrompt
-    ) {
+    if ((msg === "NO_API_KEY" || msg === "BAD_API_KEY") && !opts.noPrompt) {
       // The gateway key is ONLY for the optional "list my nodes" sidebar;
       // chat itself runs over Cognito + the hub WS and needs no key. So a
       // missing key is not an error — render the quiet sidebar prompt but
@@ -144,10 +139,7 @@ async function loadNodes(opts) {
       // as "chat is broken"). Only a genuinely bad key warrants the banner.
       renderNeedKey(msg === "BAD_API_KEY");
       if (msg === "BAD_API_KEY") {
-        showConn(
-          "网关连接 key 无效(仅影响左侧节点列表,不影响对话)。",
-          true,
-        );
+        showConn("网关连接 key 无效(仅影响左侧节点列表,不影响对话)。", true);
       }
       return;
     }
@@ -367,19 +359,9 @@ function thinkingSteps(q) {
   const r = (q || "").toLowerCase();
   const has = (...ws) => ws.some((w) => r.includes(w));
   if (has("btc", "eth", "价位", "价格", "行情", "多少钱", "$"))
-    return [
-      "接收请求",
-      "拉取平台实时行情",
-      "解析价位与多空关键位",
-      "组织回复",
-    ];
-  if (has("审计", "风险", "合约", "蜜罐", "honeypot", "安全"))
-    return [
-      "接收请求",
-      "调用风险评估数据源",
-      "检查蜜罐/owner/税率",
-      "汇总风险点",
-    ];
+    return ["接收请求", "拉取实时行情", "解析价位与多空关键位", "组织回复"];
+  if (has("审计", "风险", "安全", "检查"))
+    return ["接收请求", "调用风险审计引擎", "检查异常指标", "汇总风险点"];
   if (has("策略", "回测", "backtest", "信号", "指标"))
     return [
       "接收请求",
@@ -429,17 +411,11 @@ function suggestNextActions(reply) {
   const has = (...ws) => ws.some((w) => r.includes(w));
   const out = [];
   if (has("btc", "eth", "价位", "价格", "行情", "$", "usdt")) {
-    out.push([
-      "📊 看资金费率",
-      "这个币当前的合约资金费率和持仓量怎么样?",
-    ]);
+    out.push(["📊 看资金费率", "这个币当前的合约资金费率和持仓量怎么样?"]);
     out.push(["📈 技术信号", "帮我用 SMA/RSI 算下它的短期技术信号。"]);
   }
   if (has("审计", "风险", "合约", "蜜罐", "honeypot", "lp")) {
-    out.push([
-      "🔍 查持有人分布",
-      "这个代币的持有人集中度和 LP 锁仓情况?",
-    ]);
+    out.push(["🔍 查持有人分布", "这个代币的持有人集中度和 LP 锁仓情况?"]);
   }
   if (has("策略", "回测", "backtest", "信号")) {
     out.push([
@@ -543,7 +519,7 @@ function renderQuoteCard(s) {
   const t = String(s || "");
   // 价格:$60,318 / 现价 $1,580
   const price = (t.match(/\$\s?([\d,]+(?:\.\d+)?)/) || [])[1];
-  // 交易对:BTCUSDT / ETHUSDT / (平台现货 XXX)
+  // 交易对:BTCUSDT / ETHUSDT / (示例现货 XXX)
   const sym = (t.match(/([A-Z]{2,10}USDT?)/) || [])[1];
   // 24h 变动:+0.33% / -0.20%
   const chg = (t.match(
@@ -955,8 +931,7 @@ async function callGateway(node, text, ctEl) {
       const payload = JSON.parse(
         atob(tok.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")),
       );
-      email =
-        payload.email || payload["cognito:username"] || payload.sub || "";
+      email = payload.email || payload["cognito:username"] || payload.sub || "";
     }
   } catch (_) {}
   if (IS_LOCAL && !email) email = "本地 demo";
@@ -1081,4 +1056,3 @@ function logout() {
   var fi = document.getElementById("fileInput");
   if (fi) fi.addEventListener("change", onPickImage);
 })();
-

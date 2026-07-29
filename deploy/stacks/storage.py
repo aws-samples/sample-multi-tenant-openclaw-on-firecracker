@@ -23,7 +23,7 @@ def build_storage(self, ctx):
 
     # ========== DynamoDB ==========
     # 控制面表 PITR(时间点恢复)。租户数据本身有 backup_fn→WORM 桶兜底,但
-    # 控制面元数据(tenants/hosts/audit)误删/误改/坏写后无法回滚 —— 795 实跑
+    # 控制面元数据(tenants/hosts/audit)误删/误改/坏写后无法回滚 —— 实跑
     # 5 张表 PITR 全 DISABLED(2026-06-30 巡检发现)。开 PITR 后 DynamoDB 维持
     # 35 天连续备份,可恢复到任意秒级时点。config 开关默认 true,短命的
     # batch-jobs(DESTROY+TTL)不开。开 PITR 对 PAY_PER_REQUEST 表只按备份存储

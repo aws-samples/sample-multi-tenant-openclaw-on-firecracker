@@ -22,17 +22,17 @@
 # they are emitted to stdout / /tmp at run time. Edit the CONFIG block per env.
 set -euo pipefail
 
-# ---------- CONFIG (per environment; defaults = verified 795 ap-southeast-1) ----------
+# ---------- CONFIG (per environment; defaults = verified ap-southeast-1 ref env) ----------
 REGION="${REGION:-ap-southeast-1}"
-VPC_ID="${VPC_ID:-vpc-0b308aa094fbf39e5}"
+VPC_ID="${VPC_ID:-vpc-0abc123def4567890}"
 VPC_CIDR="${VPC_CIDR:-172.31.0.0/16}"
 # Private subnet that routes egress via NAT (no public IP on instances):
-PRIVATE_SUBNET="${PRIVATE_SUBNET:-subnet-09a74f97b5b6f8f09}"
+PRIVATE_SUBNET="${PRIVATE_SUBNET:-subnet-0abc123def4567890}"
 KEY_NAME="${KEY_NAME:-openclaw-bastion}"
 # Bastion SG — the ONLY source allowed to reach SSH / dashboard / API:
-BASTION_SG="${BASTION_SG:-sg-0a78b7b8632997ee0}"
+BASTION_SG="${BASTION_SG:-sg-0abc123def4567890}"
 # Ubuntu 22.04 LTS amd64 (matches the article's OS; pin to a known AMI per region):
-AMI_ID="${AMI_ID:-ami-06c2685db9a20aac5}"
+AMI_ID="${AMI_ID:-ami-0abc123def4567890}"
 MANAGER_TYPE="${MANAGER_TYPE:-m7i-flex.large}"   # >=4GB RAM for the indexer
 AGENT_TYPE="${AGENT_TYPE:-t3.micro}"
 AWS="${AWS:-/usr/local/bin/aws}"

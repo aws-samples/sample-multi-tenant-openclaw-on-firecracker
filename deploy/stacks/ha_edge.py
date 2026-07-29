@@ -663,7 +663,7 @@ def build_ha_edge(self, ctx):
     # deploy/monitoring/prometheus.yml 的 ec2_sd_configs 按 tag:Project=openclaw +
     # tag:Role=metal-host 过滤发现 metal host 抓 :8899/metrics。CDK LaunchTemplate
     # 默认只给实例打 Name,不打这俩 tag → Prometheus 发现不到 host、采集断链
-    # (795 实测 metal 实例只有 Name tag)。这里在 LaunchTemplateData 层加
+    # (实测 metal 实例只有 Name tag)。这里在 LaunchTemplateData 层加
     # TagSpecifications,让 ASG 起的每台 host(及其卷)都带这俩 tag,随重建继承。
     # key 大小写须与 prometheus.yml filters 完全一致(Project/Role 首字母大写)。
     _host_tags = [

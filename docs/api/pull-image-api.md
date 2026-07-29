@@ -145,7 +145,7 @@ POST /hosts/{instance_id}/pull-image?snapshot_time=<ISO8601>
 
 | 位置 | 参数 | 型态 | 必填 | 说明 |
 |---|---|---|---|---|
-| Path | `instance_id` | string | ✅ | 目标宿主机的 EC2 instance id(如 `i-0c3843987566fbcd9`)。 |
+| Path | `instance_id` | string | ✅ | 目标宿主机的 EC2 instance id(如 `i-0abc123def4567890`)。 |
 | Query | `snapshot_time` | string | ✅ | 快照主键,ISO8601 UTC 格式 `YYYY-MM-DDTHH:MM:SSZ`(从 `GET /list_image_versions` 拿),如 `2026-07-20T10:21:17Z`。 |
 | Body | — | — | — | 无请求体。 |
 
@@ -156,7 +156,7 @@ POST /hosts/{instance_id}/pull-image?snapshot_time=<ISO8601>
 ```json
 {
   "message": "pull-image started (async; poll pull-image-progress)",
-  "instance_id": "i-0c3843987566fbcd9",
+  "instance_id": "i-0abc123def4567890",
   "snapshot_time": "2026-07-20T10:21:17Z",
   "status": "upgrading",
   "job_id": "pull-476ffa9179294d5a"
@@ -191,7 +191,7 @@ POST /hosts/{instance_id}/pull-image?snapshot_time=<ISO8601>
 
 **409 Conflict** —— host 当前不可 pull(状态非 active/idle,已在 upgrading),或快照不自洽(manifest 点名的盘在快照里缺失)。
 ```json
-{ "error": "host i-0c3843987566fbcd9 not available for pull (status must be active/idle; already upgrading or missing)", "code": "CONFLICT" }
+{ "error": "host i-0abc123def4567890 not available for pull (status must be active/idle; already upgrading or missing)", "code": "CONFLICT" }
 ```
 
 **500 Internal Server Error** —— 异步 worker 自调用没发出去(此时 host 状态已复位回原态)。
@@ -227,7 +227,7 @@ GET /hosts/{instance_id}/pull-image-progress
 **200 OK —— InProgress**(phase2 正解压第 2/4 个盘,真机 2026-07-20 取样):
 ```json
 {
-  "instance_id": "i-0c3843987566fbcd9",
+  "instance_id": "i-0abc123def4567890",
   "host_status": "upgrading",
   "job_id": "pull-491daf780b7d484a",
   "snapshot_time": "2026-07-20T10:21:17Z",
@@ -241,7 +241,7 @@ GET /hosts/{instance_id}/pull-image-progress
 **200 OK —— Completed**(装成功,带 `ExitCode: 0`;host 复位回**原态**,原是 active 就 active、原是 idle 就 idle):
 ```json
 {
-  "instance_id": "i-0c3843987566fbcd9",
+  "instance_id": "i-0abc123def4567890",
   "host_status": "active",
   "job_id": "pull-476ffa9179294d5a",
   "snapshot_time": "2026-07-20T10:21:17Z",
@@ -256,7 +256,7 @@ GET /hosts/{instance_id}/pull-image-progress
 **200 OK —— Failed**(装失败;带 `ErrorCode` + `FailureReason`。注:phase2 装 live 失败 host 留 `upgrading` 待运维,phase1/下发失败会复位回原态):
 ```json
 {
-  "instance_id": "i-0c3843987566fbcd9",
+  "instance_id": "i-0abc123def4567890",
   "host_status": "upgrading",
   "job_id": "pull-491daf780b7d484a",
   "snapshot_time": "2026-07-20T10:21:17Z",
@@ -273,7 +273,7 @@ GET /hosts/{instance_id}/pull-image-progress
 **200 OK —— 从没 pull 过这台 host**(无 job):
 ```json
 {
-  "instance_id": "i-0c3843987566fbcd9",
+  "instance_id": "i-0abc123def4567890",
   "host_status": "active",
   "job_id": null,
   "snapshot_time": "2026-07-20T10:21:17Z",
@@ -310,7 +310,7 @@ GET /hosts/{instance_id}/pull-image-progress
 
 **404 Not Found** —— host 不存在。
 ```json
-{ "error": "host i-0c3843987566fbcd9 not found", "code": "NOT_FOUND" }
+{ "error": "host i-0abc123def4567890 not found", "code": "NOT_FOUND" }
 ```
 
 ---

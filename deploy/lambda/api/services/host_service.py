@@ -1656,7 +1656,7 @@ def pull_image_progress(instance_id):
 
     #333 真实响应样例(InProgress,phase2 正解压第 2/4 个盘,真机 2026-07-20 取):
       {
-        "instance_id": "i-0c3843987566fbcd9",
+        "instance_id": "i-0abc123def4567890",
         "host_status": "upgrading",
         "job_id": "pull-491daf780b7d484a",
         "snapshot_time": "2026-07-20T10:21:17Z",

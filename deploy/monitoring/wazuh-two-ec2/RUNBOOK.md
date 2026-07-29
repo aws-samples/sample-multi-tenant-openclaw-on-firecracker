@@ -66,7 +66,7 @@ cd deploy/monitoring/wazuh-two-ec2
 ./setup-wazuh-two-ec2.sh        # creates 2 SGs, launches both EC2
 ```
 
-Defaults target the verified 795 / ap-southeast-1 env; override via env vars
+Defaults target the verified `ap-southeast-1` reference env; override via env vars
 (`REGION`, `VPC_ID`, `PRIVATE_SUBNET`, `BASTION_SG`, `AMI_ID`, `KEY_NAME`, ...).
 The manager installer runs unattended for ~5-10 min.
 

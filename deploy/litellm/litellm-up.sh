@@ -42,14 +42,14 @@ gen_if_empty LITELLM_MASTER_KEY 'echo sk-$(openssl rand -hex 32)'
 gen_if_empty POSTGRES_PASSWORD  'openssl rand -hex 24'
 : "${AWS_REGION:=ap-southeast-1}"
 # #80 — guardrail id 先查 SSM(栈内 CfnGuardrail 写入的 /openclaw/bedrock-guardrail-id),
-# 环境变量显式指定优先(便于本地调试),存量账号 SSM 没值时兜底走 od6s8sm533fs(现存  账号)。
+# 环境变量显式指定优先(便于本地调试),SSM 没值时兜底走 GUARDRAIL_ID 的占位默认值。
 # 后者在 security.guardrail_managed_by_stack 切开后应删,现在保留是为了让存量部署不断服。
 if [ -z "${GUARDRAIL_ID:-}" ]; then
   GUARDRAIL_ID="$(aws ssm get-parameter --name /openclaw/bedrock-guardrail-id \
     --region "$AWS_REGION" --query 'Parameter.Value' --output text 2>/dev/null || true)"
 fi
-: "${GUARDRAIL_ID:=od6s8sm533fs}"
-echo "[up] guardrail id: ${GUARDRAIL_ID} (SSM 优先,兜底=od6s8sm533fs)"
+: "${GUARDRAIL_ID:=REPLACE_WITH_YOUR_GUARDRAIL_ID}"
+echo "[up] guardrail id: ${GUARDRAIL_ID} (SSM 优先,兜底=占位默认值)"
 chmod 600 "$ENV_FILE"
 
 # --- 2. guardrail 注入 ---

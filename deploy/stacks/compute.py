@@ -133,7 +133,7 @@ def build_compute(self, ctx):
     # ——AMG 强制 AWS_SSO,正是要规避的。所以这段 AMP+AMG 托管资源只在显式
     # metrics.use_managed=true 时才建;默认(含只设 enabled=true)走自建,不建任何
     # 托管 workspace。这样 cdk deploy 默认行为与架构决策一致,不会意外建出强制 SSO
-    # 的 AMG(795 实测 AMP workspace 为空,正是走自建)。想用 AWS 托管再显式开。
+    # 的 AMG(实测 AMP workspace 为空,正是走自建)。想用 AWS 托管再显式开。
     metrics_cfg = CFG.get("metrics", {})
     amp_remote_write_url = "none"
     if metrics_cfg.get("enabled", False) and metrics_cfg.get("use_managed", False):

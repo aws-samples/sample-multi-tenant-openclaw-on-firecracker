@@ -27,9 +27,9 @@ DEFAULT_TEMPLATE = "default"
 # shipped default 模板的预置 Registry_Entries(publish_snapshot 的种子输入)
 #
 # R14.2 llm_key 注入契约(文档化,防再踩新加坡 kpweqnkwm9 2026-07-11 的 400):
-#   llm_key 与平台凭据走同一条 injected_parameters 通道、同一套 envelope 校验
+#   llm_key 与业务凭据走同一条 injected_parameters 通道、同一套 envelope 校验
 #   (envelope._validate_injected_parameters_v2)。**接受两种形态,拒第三种**:
-#     ① `enc:v1:` 信封 → owner_id 绑定加密路径(与平台凭据同等 owner 隔离,首选)
+#     ① `enc:v1:` 信封 → owner_id 绑定加密路径(与业务凭据同等 owner 隔离,首选)
 #     ② 裸 base64(≤8192)→ 原值透传、**无 owner 绑定**;仅可承载自隔离的 opaque
 #        值(如 per-tenant mint 的 litellm vkey),SHALL NOT 放需 owner 隔离的敏感值
 #     ③ 原始 `sk-...` key(既非 enc:v1: 也非合法 base64)→ 400 must be base64(真机

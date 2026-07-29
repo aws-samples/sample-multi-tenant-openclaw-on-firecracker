@@ -230,7 +230,7 @@ def build_litellm(self, ctx):
             f'--region {self.region} --query "Parameter.Value" '
             f'--output text 2>/dev/null || echo "")',
             # SSM 有值 → 启用 guardrail;无值(默认) → 删 guardrails 段无 guardrail 跑。
-            # 绝不 fallback 到账号特定硬编码(od6s8sm533fs 是 ap-southeast-1 的 id,
+            # 绝不 fallback 到账号特定硬编码(旧 id 只在建它的那个 region 存在,
             # 跨账号 400,memory #167)。与单机路径对称。
             'if [ -n "$GR_ID" ]; then '
             'echo "[litellm-ha-userdata] guardrail enabled id: $GR_ID"; '
@@ -398,7 +398,7 @@ def build_litellm(self, ctx):
                 ],
             )
         )
-        # #80 — LiteLLM userdata 从 SSM 读 guardrail id(去硬编码 od6s8sm533fs)。
+        # #80 — LiteLLM userdata 从 SSM 读 guardrail id(去账号特定硬编码)。
         # 栈内建 Guardrail 时(security.guardrail_managed_by_stack=true)param 由本栈写;
         # 未开开关时 param 可能不存在,userdata 会走硬编码兜底(保存量兼容)+ 日志留痕。
         litellm_role.add_to_policy(
@@ -472,7 +472,7 @@ def build_litellm(self, ctx):
             #   • SSM 有值(账号建了 Bedrock Guardrail 并写了 param) → sed 注入 id,启用 guardrail;
             #   • SSM 无值(默认;Bedrock guardrail 可能不在部署账号 / 客户不配) → 删掉整个
             #     guardrails 段,LiteLLM 无 guardrail 正常跑。绝不 fallback 到账号特定硬编码
-            #     (旧 od6s8sm533fs 是 ap-southeast-1 的 id,美东一不存在 → ApplyGuardrail 400
+            #     (旧 id 只在建它的 region 存在,换 region 就不存在 → ApplyGuardrail 400
             #     每条对话被拒,memory #167 踩过)。想启用只需写 SSM param,不动部署代码。
             f'GR_ID=$(aws ssm get-parameter --name {_guardrail_ssm_param_name} --region {self.region} --query "Parameter.Value" --output text 2>/dev/null || echo "")',
             'if [ -n "$GR_ID" ]; then '

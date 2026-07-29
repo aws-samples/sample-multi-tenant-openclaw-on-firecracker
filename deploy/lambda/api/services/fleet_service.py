@@ -48,6 +48,8 @@ def _authorize_user_scope(tenant_user_id, event):
     if not tenant_user_id:
         return _resp(400, {"error": "tenant_user_id required"})
     ident = auth._get_caller_identity(event or {})
+    if ident.get("platform_scope") is not None:
+        return _resp(403, {"error": "forbidden: platform-scoped fleet query disabled"})
     if ident.get("is_admin"):
         return None
     caller_user = ident.get("tenant_user_id")
@@ -93,7 +95,7 @@ def _query_user_tenants(
 # GOAL: the control plane consumes 380 (×N hosts) openclaw start/stop within 1
 # minute. The per-tenant path (batch_tenants → tenant_action → one SSM per VM)
 # can't: SSM single-instance concurrency caps at ~5-10, so 380 commands serialize
-# and 40 concurrent already TimedOut 11 (measured on ). The fix is HOST-LEVEL
+# and 40 concurrent already TimedOut 11 (measured). The fix is HOST-LEVEL
 # fan-out: send ONE SSM command per host (start-all-vms.sh / stop-all-vms.sh),
 # and each host starts/stops all its local VMs in bounded parallel. SSM
 # concurrency then equals the number of HOSTS (single/low-double digits), not the

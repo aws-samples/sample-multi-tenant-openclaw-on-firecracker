@@ -60,7 +60,7 @@ empty snapshot.
 
 Environment: account `454394050889`, region `ap-southeast-1` (the #217 **test** env),
 bucket `openclaw-assets-454394050889`, S3 versioning **Enabled**, canary host
-`i-02429918757092fb0`.
+`i-0abc123def4567890`.
 
 ```bash
 export AWS_PAGER="" AWS_REGION=ap-southeast-1

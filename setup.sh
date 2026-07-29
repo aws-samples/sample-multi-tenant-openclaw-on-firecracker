@@ -370,7 +370,9 @@ fi
 # --all: app 拆多 stack(OpenClawOrchestrator + OpenClawImage,#283)后,不带
 # stack 选择符的裸 cdk deploy 会报 "specify which stacks ... or --all" 并退出。
 # --all 按 add_dependency 拓扑序先 Orchestrator(建桶)后 OpenClawImage(烤镜像)。
-PATH=".venv/bin:$PATH" cdk deploy --all -c region="$REGION" "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --require-approval never ${CDK_ARGS[@]+"${CDK_ARGS[@]}"}
+PATH=".venv/bin:$PATH" scripts/deploy-cdk.sh "$REGION" "$PROFILE" \
+  --all -c region="$REGION" "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" \
+  --require-approval never ${CDK_ARGS[@]+"${CDK_ARGS[@]}"}
 
 # Upload scripts to S3 (after deploy creates the bucket)
 BUCKET=$(aws cloudformation describe-stacks --stack-name OpenClawOrchestrator \
@@ -599,7 +601,7 @@ source "$SCRIPT_DIR/.env.deploy"
 
 # 规范化 COGNITO_DOMAIN:前端代码自己拼 "https://" + domain（console/chat 两页
 # 的 fetch/redirect 都是这逻辑），所以注入值必须是**裸主机名**，不能带 scheme。
-# 历史上 795 部署因 stack output 带了 https:// 前缀，sed 进去后拼成 "https://https://…"
+# 历史上有部署因 stack output 带了 https:// 前缀，sed 进去后拼成 "https://https://…"
 # 畸形 URL → 登录重定向 ERR_TIMED_OUT、chat 拿不到用户身份显示"名下无节点"。
 # 这里无条件 strip 掉 scheme 和尾部斜杠，无论上游 output 怎么填都对，随重建继承。
 COGNITO_DOMAIN="$(printf '%s' "${COGNITO_DOMAIN:-}" | sed -E 's#^https?://##; s#/+$##')"

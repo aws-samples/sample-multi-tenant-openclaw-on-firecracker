@@ -97,16 +97,16 @@ Each tenant runs in its own Firecracker microVM — lightweight KVM-based virtua
 Default 2-host multi-AZ deployment + automatic AZ failover. Verified end-to-end on real AWS — multi-tenant simultaneous failover with 2/2 dashboards back to HTTP 200 in ~90s. Six deep race conditions hunted down and locked in by unit tests.
 
 **🤖 Bedrock AgentCore native**
-One toggle and every microVM auto-connects to AgentCore Gateway, Memory, Code Interpreter, Browser, and Workload Identity. Among the few AWS Samples that fully wire all five AgentCore components.
+One toggle provisions the AgentCore control plane — Gateway, Memory, Code Interpreter, Browser, and a Workload Identity resource — and points every microVM's gateway at it. Among the few AWS Samples that provision all five AgentCore components and verify Gateway, Memory, Code Interpreter, and Browser with E2E tests (Workload Identity is provisioned but not yet injected into the guest — the microVM stays zero-credential by design).
 
 </td>
 <td width="50%" valign="top">
 
 **📊 Full-stack observability, zero static creds**
-Amazon Managed Prometheus + Grafana out of the box. ADOT collector auto-signs SigV4 from each host. Six per-VM gauges (`openclaw_vm_cpu_pct`, `memory_used_mb`, `disk_used_pct`, …) + audit log + console PromQL examples.
+Self-managed Prometheus + Grafana by default (opt-in `metrics.use_managed: true` for AMP + AMG). ADOT collector auto-signs SigV4 from each host. Six per-VM gauges (`openclaw_vm_cpu_pct`, `memory_used_mb`, `disk_used_pct`, …) + audit log + console PromQL examples.
 
 **⚡ High density at low cost**
-**380 microVMs on a single `r8g.metal-24xl`** (768 GB ÷ 2 GB/VM) — boot ready in **1.74s**, register→available in **~4.0s**. CPU overcommit + Firecracker balloon free-page-reporting; 80% Savings Plan + 20% Spot lands at **~$8.36/tenant/month**. Per-tenant quotas guard against noisy neighbors.
+**Up to 380 microVMs on a single `r8g.metal-24xl`** — a capacity projection at 2 GB/VM (768 GB ÷ 2 GB; config default is 4 GB/VM). Each microVM is boot-ready in **1.74s** (measured p50) and register→available in **~4.0s** (measured). CPU overcommit + Firecracker balloon free-page-reporting stretch density; a projected 80% Savings Plan + 20% Spot blend lands around **$8.36/tenant/month** (projection, not a measurement). Per-tenant quotas guard against noisy neighbors.
 
 **🚀 One-command CDK deploy**
 `./setup.sh <region> <profile>` brings up the full stack in 5 minutes — self-managed VPC (/20, 3 AZ, 3 NAT GW), host ASG, OpenResty edge ASG, ALB (idle 3600 s), ElastiCache Multi-AZ Redis, API Lambda, DynamoDB tables (tenant records + short-TTL secret store), a customer-managed KMS key, and AgentCore, all wired and ready. Cloud rootfs build means **no local Linux required** (works from macOS / Windows).
@@ -125,16 +125,20 @@ Amazon Managed Prometheus + Grafana out of the box. ADOT collector auto-signs Si
 
 End users sign in through your own platform's identity provider. The platform back end mints a short-lived, platform-signed token per session; the pool never sees end-user credentials and never trusts a client's self-reported identity. Every authorization decision — which user may reach which tenant — is made server-side against an ownership ledger held by the control plane.
 
-### Delivery-level architecture
+### Platform overview
 
 <p align="center">
-  <img src="docs/arch-overview-en.png" alt="ClawPool delivery-level architecture — data plane, control plane, and L1–L5 defense in depth" width="96%"/>
+  <img src="docs/diagrams/overview-en.svg" alt="ClawPool platform overview — data plane two-tier route, serverless control plane, and L1–L5 defense in depth" width="98%"/>
 </p>
-<p align="center"><i>Separate end-user and admin entry paths, a serverless control plane orchestrating the full tenant lifecycle, and L1–L5 defense in depth. See the <a href="docs/aws-guide-en/">implementation guide</a> for the annotated walkthrough.</i></p>
+<p align="center"><i>One dedicated-kernel microVM per tenant on Graviton bare-metal, a serverless control plane orchestrating the full tenant lifecycle, and L1–L5 defense in depth. See the <a href="docs/aws-guide-en/">implementation guide</a> for the annotated walkthrough.</i></p>
 
 ### Data plane: two-tier route with token-only auth
 
 The single most important design choice in the pool is **how the browser reaches a tenant's agent**. ClawPool runs a **two-tier route** through an OpenResty edge fleet that looks up each tenant in Redis and forwards through the host's iptables DNAT into the microVM's gateway. There is one credential end-to-end: a per-tenant, KMS-envelope-encrypted gateway token that the platform back end holds and never exposes to the browser.
+
+<p align="center">
+  <img src="docs/diagrams/dataplane-en.svg" alt="Data plane — two-tier route from tenant browser to Bedrock, three-tier route cache, and per-tenant microVM with four base disks plus an optional credential disk" width="98%"/>
+</p>
 
 ```
 Browser  ─ wss ─▶  Platform back end  ─ HTTP+SSE, bearer token ─▶
@@ -193,7 +197,7 @@ ROUTE AUTHORITY — ElastiCache Redis (Multi-AZ, automatic failover)
      host iptables (cross-tenant + IMDS DROP · MASQUERADE)
        → Route 53 DNS Firewall (threat list → NXDOMAIN, config-gated)
        → [planned] AWS Network Firewall (TLS SNI allowlist) — not yet deployed
-       → NAT Gateway → internet (allowlist only, else reject)
+       → NAT Gateway → internet (open by default; allowlist opt-in)
 
 CONTROL PLANE — fully-managed serverless (no ops servers)
   Admin → create-tenant API → API Gateway (API key)
@@ -209,6 +213,14 @@ CONTROL PLANE — fully-managed serverless (no ops servers)
 
 > **Deep dive:** for the full architecture and security design — the trust model, the L1–L5 defense-in-depth detail, the two-tier data-plane route, and the **known limitations** — see the AWS-style implementation guide under [`docs/aws-guide-en/`](docs/aws-guide-en/).
 
+### Control plane & microVM lifecycle
+
+The control plane is fully serverless — no ops servers to run. An API request authenticates by `x-api-key` and lands on a single 3-in-1 `api` Lambda (HTTP router + SQS consumer + poller). State lives in DynamoDB; mutating actions are dispatched to the host via `SSM SendCommand` (the default synchronous path). Two optional SQS queues — a standard `dispatch` queue for create-burst throttling (`dispatch.enabled`) and a `lifecycle.fifo` queue for per-tenant ordering (`scaler.lifecycle_queue_enabled`) — can be enabled independently (both default `false`). The host executes lifecycle actions — it never hot-patches a live VM.
+
+<p align="center">
+  <img src="docs/diagrams/control-en.svg" alt="Control plane and microVM lifecycle — serverless request path, optional SQS dispatch and lifecycle queues, DynamoDB state, and the 14-operation lifecycle state machine" width="98%"/>
+</p>
+
 ### Network Model
 
 Each VM gets a dedicated **/30 point-to-point link** to the host via a TAP device — all inside `172.16.0.0/16`, so a single east-west `FORWARD DROP` over the `/16` covers every VM (this replaced the old per-VM `/24`, which capped a host at 254 VMs):
@@ -219,7 +231,7 @@ VM2: tap-vm2  host=172.16.0.5/30  guest=172.16.0.6/30
 VMn: tap-vmN  host=172.16.x.(4n-3)/30  guest=172.16.x.(4n-2)/30
 ```
 
-- **Outbound**: host iptables MASQUERADE → DNS FW → NAT → internet (allowlist only). _(A TLS_SNI-allowlisting AWS Network Firewall hop is planned but not yet deployed.)_
+- **Outbound**: host iptables MASQUERADE → NAT → internet. Optionally: TAP-level egress allowlist (`egress_allowlist_enabled`, default off) and Route 53 DNS Firewall (`dns_firewall_enabled`, default off; note: covers VPC-resolved DNS only, not microVM direct-to-public-DNS). _(A TLS_SNI-allowlisting AWS Network Firewall hop is planned but not yet deployed.)_
 - **Inbound**: Browser → platform back end → CloudFront → ALB → OpenResty edge → host DNAT → microVM gateway (token-only). The edge looks up each tenant's route in Redis; the browser holds no key and reaches the agent only through the platform back end. Admin REST goes via API Gateway.
 - **Inter-VM**: `FORWARD DROP` across the whole `/16` — 100% packet loss, measured. IMDS `169.254.169.254` also `FORWARD DROP`ed (anti credential-theft).
 
@@ -279,7 +291,7 @@ sample-multi-tenant-openclaw-on-firecracker/
 | **L1 · Prompt**                              | Two gates around the model: input intercepts intent, output intercepts leaks         | LiteLLM pre/post hooks + **Bedrock `ApplyGuardrail` (input + output)**, decoupled from the base model. Jailbreak **14/14 blocked, 0 false positives** (measured).                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | **L2 · Tool**                                | Hard-deny tool execution before it runs (default-deny)                               | `before_tool_call` ACL — path/command denylist; reading `.env`/IMDS/credential paths is **vetoed before execution**. `sentinel-guard` 41/41, `acl-guard` 8/8 unit tests.                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | **L3 · Identity**                            | Control-plane identity gate + east-west hard isolation                               | Data plane: OpenClaw-native Ed25519 device auth (server-held key, pubkey cold-injected). Control plane: x-api-key + optional Cognito RBAC → `owner_id` gate (code `if`). Cross-tenant `iptables FORWARD DROP` — **100% packet loss, kernel-level hard cut**.                                                                                                                                                                                                                                                                                                                                                                        |
-| **L4 · Network**                             | Block credential theft + control egress destinations                                 | IMDS `169.254.169.254` `FORWARD DROP` (anti credential-theft) · Route53 DNS Firewall (threat list → NXDOMAIN, config-gated) · host `iptables` NAT egress allowlist, else REJECT. _(AWS Network Firewall TLS_SNI allowlist is planned, not yet deployed — no `stack.py` reference today.)_                                                                                                                                                                                                                                                                                                                                           |
+| **L4 · Network**                             | Block credential theft + control egress destinations                                 | IMDS `169.254.169.254` `FORWARD DROP` (anti credential-theft) · Route53 DNS Firewall (threat list → NXDOMAIN, config-gated) · host `iptables` TAP egress allowlist (opt-in, default open). _(AWS Network Firewall TLS_SNI allowlist is planned, not yet deployed — no `stack.py` reference today.)_                                                                                                                                                                                                                                                                                                                                 |
 | **L5 · Credential · Read-only · Monitoring** | Credentials never reach the model + guardrails are immutable + full-stack monitoring | Zero long-lived AWS creds in the guest; secrets live in tool files, not the conversation; **read-only ext4 golden image (Firecracker `is_read_only:true` virtio write-barrier — root inside the guest can't modify it)**; in-guest runtime monitoring via Wazuh FIM/auditd (measured). Account-level GuardDuty (VPC/DNS/EC2/S3 findings, config-gated) — its `RUNTIME_MONITORING` is disabled by default, so in-guest runtime is Wazuh/auditd, not the GuardDuty Runtime agent. CloudTrail Object Lock (COMPLIANCE WORM) applies to the tenant backup bucket; Inspector (host CVE) is account-level and not deployed by this stack. |
 
 **Why it holds (red-team takeaway):** everything that _can_ be bypassed is the part that "asks the model to judge intent"; everything that _holds_ is the deterministic code/device layer — which is exactly why this design pushes control down to code.
@@ -325,7 +337,7 @@ sample-multi-tenant-openclaw-on-firecracker/
 </details>
 
 <details>
-<summary><b>🔧 Complete Tenant Lifecycle</b> — 12 first-class operations, all available via API + Console</summary>
+<summary><b>🔧 Complete Tenant Lifecycle</b> — 14 first-class operations, all available via API + Console</summary>
 
 | Operation                 | API                                      | What it does                                                          |
 | ------------------------- | ---------------------------------------- | --------------------------------------------------------------------- |
@@ -361,30 +373,29 @@ sample-multi-tenant-openclaw-on-firecracker/
 <details>
 <summary><b>📊 Observability</b> — Two-tier health + Prometheus + Grafana, zero static credentials</summary>
 
-| Capability                    | Detail                                                                                                                                             |
-| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **host-agent (5s)**           | Per-host systemd service polling all VMs and writing live metrics to DynamoDB.                                                                     |
-| **Lambda watchdog (5min)**    | Cross-fleet sweep, AZ-outage detection, failover orchestration.                                                                                    |
-| **Amazon Managed Prometheus** | Fully-managed AMP workspace with PromQL compatibility.                                                                                             |
-| **Amazon Managed Grafana**    | IAM Identity Center login + AMP datasource + sample dashboards.                                                                                    |
-| **ADOT collector**            | Auto SigV4-signed remote-write — no static credentials anywhere.                                                                                   |
-| **6 per-VM gauges**           | `openclaw_vm_health`, `cpu_pct`, `memory_used_mb`, `memory_balloon_mib`, `disk_used_mb`, `disk_used_pct` — all labeled by `tenant` and `instance`. |
-| **Audit log**                 | Every mutating API call → DynamoDB with 90-day TTL; queryable via `GET /audit-log`.                                                                |
+| Capability                 | Detail                                                                                                                                             |
+| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **host-agent (5s)**        | Per-host systemd service polling all VMs and writing live metrics to DynamoDB.                                                                     |
+| **Lambda watchdog (5min)** | Cross-fleet sweep, AZ-outage detection, failover orchestration.                                                                                    |
+| **Prometheus + Grafana**   | Self-managed by default; opt-in `metrics.use_managed: true` provisions AMP + AMG (requires IAM Identity Center).                                   |
+| **ADOT collector**         | Auto SigV4-signed remote-write — no static credentials anywhere.                                                                                   |
+| **6 per-VM gauges**        | `openclaw_vm_health`, `cpu_pct`, `memory_used_mb`, `memory_balloon_mib`, `disk_used_mb`, `disk_used_pct` — all labeled by `tenant` and `instance`. |
+| **Audit log**              | Every mutating API call → DynamoDB with 90-day TTL; queryable via `GET /audit-log`.                                                                |
 
 </details>
 
 <details>
 <summary><b>🤖 Bedrock AgentCore Integration</b> — Optional one-toggle, full 5-component wire-up</summary>
 
-| Component             | Role                                                                                                                   |
-| --------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| **Gateway**           | MCP tool hub — Lambda functions exposed as MCP tools. Three demo tools: `hello`, `system_info`, `timestamp`.           |
-| **Memory**            | Multi-turn conversation context. `create_event` / `list_events` / `batch_create_memory_records`. Per-tenant isolation. |
-| **Code Interpreter**  | Python 3.12 sandbox. `start_session` → `executeCode` → `stop_session`.                                                 |
-| **Browser**           | Remote Chromium with WebSocket stream. Automation-ready.                                                               |
-| **Workload Identity** | Each VM auto-injected with temporary credentials at boot — no static keys, auto-refresh.                               |
+| Component             | Role                                                                                                                                                              |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Gateway**           | MCP tool hub — Lambda functions exposed as MCP tools. Three demo tools: `hello`, `system_info`, `timestamp`.                                                      |
+| **Memory**            | Multi-turn conversation context. `create_event` / `list_events` / `batch_create_memory_records`. Per-tenant isolation.                                            |
+| **Code Interpreter**  | Secure sandboxed code execution. `start_session` → `executeCode` → `stop_session`.                                                                                |
+| **Browser**           | Remote Chromium with WebSocket stream. Automation-ready.                                                                                                          |
+| **Workload Identity** | An AgentCore workload-identity resource for agent AWS access — provisioned in the control plane, not injected into the guest (the microVM stays zero-credential). |
 
-> Among the few AWS Samples projects that wire **all five AgentCore components** end-to-end and verify them with E2E tests.
+> Among the few AWS Samples projects that provision **all five AgentCore components** and verify Gateway, Memory, Code Interpreter, and Browser with E2E tests (Workload Identity is provisioned but not yet integrated into the guest runtime).
 
 </details>
 
@@ -405,16 +416,16 @@ sample-multi-tenant-openclaw-on-firecracker/
 <details>
 <summary><b>🔐 Security & Compliance</b> — Defense in depth, 7 independent layers</summary>
 
-| Layer                      | Implementation                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Encryption at rest**     | EBS volumes (rootfs + data) KMS-encrypted by default.                                                                                                                                                                                                                                                                                                                                                                                              |
-| **Encryption in transit**  | Browser → platform back end → CloudFront → ALB → OpenResty edge → microVM gateway, TLS end-to-end. The edge routes by an in-memory Redis lookup; the microVM gateway trusts only a per-tenant bearer token that the platform back end holds. The browser never sees any gateway secret.                                                                                                                                                            |
-| **API authentication**     | API Gateway with `x-api-key` + optional AWS WAF (rate limit, geo block, OWASP).                                                                                                                                                                                                                                                                                                                                                                    |
-| **Console authentication** | Cognito OAuth2 implicit flow + optional MFA.                                                                                                                                                                                                                                                                                                                                                                                                       |
-| **RBAC**                   | Cognito Groups: `admin` / `operator` / `viewer`. Opt-in via `console_auth.rbac_enabled` (default off, independent of login — 1.5.4). When enabled, the id_token's **RS256 signature is verified** against the pool JWKS before any claim is trusted (1.5.0); a forged / `alg:none` / expired token is downgraded to `viewer`, and a request with no Bearer token fail-safes to `viewer` so writes 403 unless a genuine Cognito token is presented. |
-| **microVM SSH**            | **Pubkey-only** (1.5.0). Each host self-generates an `ed25519` keypair at boot; the public key is injected per-VM at launch (one key per host). Root login and password auth are disabled in the rootfs and both accounts are locked — no shared password anywhere.                                                                                                                                                                                |
-| **Audit log**              | All `POST` / `PUT` / `DELETE` operations recorded with 90-day TTL.                                                                                                                                                                                                                                                                                                                                                                                 |
-| **Network isolation**      | iptables `FORWARD DROP` between tenant subnets _and_ to the host IMDS (`169.254.169.254`) — cross-tenant and credential-theft paths explicitly disabled.                                                                                                                                                                                                                                                                                           |
+| Layer                      | Implementation                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Encryption at rest**     | EBS volumes (rootfs + data) KMS-encrypted by default.                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| **Encryption in transit**  | Browser → platform back end → CloudFront → ALB → OpenResty edge → microVM gateway, TLS terminates at CloudFront; CloudFront→ALB is HTTP over public network (ALB SG restricts inbound to CloudFront prefix-list only); ALB→edge→microVM are VPC-internal HTTP. The edge routes by an in-memory Redis lookup; the microVM gateway trusts only a per-tenant bearer token that the platform back end holds. The browser never sees any gateway secret.                                                                                                                                                        |
+| **API authentication**     | API Gateway with `x-api-key` + optional AWS WAF (rate limit, geo block, OWASP).                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| **Console authentication** | Cognito OAuth2 **authorization-code + PKCE** flow (Hosted UI; id/refresh tokens, no implicit-grant token in the URL) + optional MFA.                                                                                                                                                                                                                                                                                                                                                                              |
+| **RBAC**                   | Cognito Groups: `admin` / `operator` / `viewer`. On by default via `console_auth.rbac_enabled: true` (secure default — least privilege; set `false` only for a fully-open demo/dev deploy), independent of login. The id_token's **RS256 signature is verified** against the pool JWKS before any claim is trusted (1.5.0); a forged / `alg:none` / expired token is downgraded to `viewer`, and a request with no Bearer token fail-safes to `viewer` so writes 403 unless a genuine Cognito token is presented. |
+| **microVM SSH**            | **Pubkey-only** (1.5.0). Each host self-generates an `ed25519` keypair at boot; the public key is injected per-VM at launch (one key per host). Root login and password auth are disabled in the rootfs and both accounts are locked — no shared password anywhere.                                                                                                                                                                                                                                               |
+| **Audit log**              | All `POST` / `PUT` / `DELETE` operations recorded with 90-day TTL.                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| **Network isolation**      | iptables `FORWARD DROP` between tenant subnets _and_ to the host IMDS (`169.254.169.254`) — cross-tenant and credential-theft paths explicitly disabled.                                                                                                                                                                                                                                                                                                                                                          |
 
 </details>
 
@@ -455,6 +466,9 @@ cp templates/openclaw.json.example templates/openclaw.json        # provider/mod
 ./setup.sh us-west-2 your-aws-profile
 
 # 3️⃣ Create your first tenant
+#     NOTE: RBAC is ON by default (console_auth.rbac_enabled: true).
+#     Writes require a Cognito id_token. For a quick demo without Cognito,
+#     set `console_auth.rbac_enabled: false` in config.yml before deploy.
 source .env.deploy
 curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" \
   -d '{"name":"my-first-agent","vcpu":2,"mem_mb":4096}' | jq .
@@ -520,23 +534,23 @@ At-a-glance infrastructure status: API connection, AgentCore Gateway URL, Multi-
 
 ### Key `config.yml` knobs
 
-| Section        | Key                    | Default              | Description                                                                                                                                                  |
-| -------------- | ---------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `host`         | `instance_type`        | `r8g.metal-24xl`     | Production baseline: Graviton4 bare-metal native KVM (96 vCPU / 768 GB, 380 tenants/host). Dev can use `m8g.xlarge`, or Intel `c8i/m8i/r8i` via nested virt. |
-| `host`         | `cpu_overcommit_ratio` | `6.0`                | vCPU is the soft dimension (agents are mostly IO/wait-bound); 380÷95≈4×, 6.0 leaves headroom. Memory is the hard limit.                                      |
-| `host`         | `mem_overcommit_ratio` | `1.5`                | Memory is the hard cap: 380×2 GB = 760 GB on 768 GB. With balloon reclaim → 1.5 (1129 GB allocatable); without balloon set ~1.0 to avoid OOM.                |
-| `vm`           | `default_vcpu`         | `2`                  | Default vCPU per tenant.                                                                                                                                     |
-| `vm`           | `default_mem_mb`       | `4096`               | Default memory (MB) per tenant.                                                                                                                              |
-| `balloon`      | `enabled`              | `false`              | Firecracker balloon device for memory overcommit.                                                                                                            |
-| `asg`          | `min_capacity`         | `2`                  | Minimum host instances (default Multi-AZ).                                                                                                                   |
-| `asg`          | `use_spot`             | `false`              | Spot instances (60–70% savings, may be reclaimed).                                                                                                           |
-| `multi_az`     | `enabled`              | `true`               | Multi-AZ HA — enables AZ failover.                                                                                                                           |
-| `health_check` | `interval_minutes`     | `5`                  | Lambda watchdog interval.                                                                                                                                    |
-| `metrics`      | `enabled`              | `false`              | Provision AMP + Grafana + ADOT.                                                                                                                              |
-| `agentcore`    | `enabled`              | `false`              | Provision Gateway + Memory + CodeInterpreter + Browser + Identity.                                                                                           |
-| `console_auth` | `enabled`              | `false`              | Cognito authentication for Console.                                                                                                                          |
-| `console_auth` | `rbac_enabled`         | `false`              | Enforce viewer/operator/admin role checks on writes (independent of login).                                                                                  |
-| `backup_cron`  | —                      | `cron(0 19 * * ? *)` | UTC 19:00 daily backups.                                                                                                                                     |
+| Section        | Key                    | Default            | Description                                                                                                                                                                                         |
+| -------------- | ---------------------- | ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `host`         | `instance_type`        | `r8g.metal-24xl`   | Production baseline: Graviton4 bare-metal native KVM (96 vCPU / 768 GB, 380 tenants/host). Dev can use `m8g.xlarge`, or Intel `c8i/m8i/r8i` via nested virt.                                        |
+| `host`         | `cpu_overcommit_ratio` | `6.0`              | vCPU is the soft dimension (agents are mostly IO/wait-bound); 380÷95≈4×, 6.0 leaves headroom. Memory is the hard limit.                                                                             |
+| `host`         | `mem_overcommit_ratio` | `1.5`              | Memory is the hard cap: 380×2 GB = 760 GB on 768 GB. With balloon reclaim → 1.5 (1129 GB allocatable); without balloon set ~1.0 to avoid OOM.                                                       |
+| `vm`           | `default_vcpu`         | `2`                | Default vCPU per tenant.                                                                                                                                                                            |
+| `vm`           | `default_mem_mb`       | `4096`             | Default memory (MB) per tenant.                                                                                                                                                                     |
+| `balloon`      | `enabled`              | `true`             | Firecracker balloon device for memory overcommit.                                                                                                                                                   |
+| `asg`          | `min_capacity`         | `2`                | Minimum host instances (default Multi-AZ).                                                                                                                                                          |
+| `asg`          | `use_spot`             | `false`            | Spot instances (60–70% savings, may be reclaimed).                                                                                                                                                  |
+| `multi_az`     | `enabled`              | `true`             | Multi-AZ HA — enables AZ failover.                                                                                                                                                                  |
+| `health_check` | `interval_minutes`     | `5`                | Lambda watchdog interval.                                                                                                                                                                           |
+| `metrics`      | `enabled`              | `true`             | Provision Prometheus + Grafana + ADOT (self-managed by default; `use_managed: true` for AMP + AMG).                                                                                                 |
+| `agentcore`    | `enabled`              | `false`            | Provision Gateway + Memory + CodeInterpreter + Browser + Identity.                                                                                                                                  |
+| `console_auth` | `enabled`              | `false`            | Cognito authentication for Console.                                                                                                                                                                 |
+| `console_auth` | `rbac_enabled`         | `true`             | Enforce viewer/operator/admin role checks on writes (independent of login). Secure default; set `false` for a fully-open demo/dev deploy.                                                           |
+| `backup_cron`  | —                      | `rate(30 minutes)` | Scan tempo, not a fixed backup time: each trigger backs up the batch that is due (last backup > `backup_interval_hours`, default 24h), capped at `backup_batch_limit` (default 20) to stagger load. |
 
 > See [`config.yml.example`](config.yml.example) for the complete reference.
 
@@ -759,7 +773,7 @@ Existing tenants (no `skills` and no `group`) keep receiving every skill — **f
 <details>
 <summary><b>Observability (Optional) — AMP + Grafana + sample PromQL</b></summary>
 
-When `metrics.enabled: true` in `config.yml`, the stack provisions an Amazon Managed Prometheus (AMP) workspace and an Amazon Managed Grafana (AMG) workspace. Each host runs an ADOT collector as a sibling systemd service that scrapes `host-agent`'s `/metrics` endpoint every 30 s and SigV4-signs a remote-write to AMP — no static credentials.
+When `metrics.enabled: true` in `config.yml`, the stack provisions self-managed Prometheus + Grafana on EC2 (the default). Set `metrics.use_managed: true` to provision Amazon Managed Prometheus (AMP) + Amazon Managed Grafana (AMG) instead (requires IAM Identity Center). Each host runs an ADOT collector as a sibling systemd service that scrapes `host-agent`'s `/metrics` endpoint every 30 s and SigV4-signs a remote-write — no static credentials.
 
 Per-VM gauges exposed (with `tenant=<tenant_id>` and `instance=<host_instance_id>` labels):
 
@@ -862,7 +876,7 @@ Everything else is covered by `git pull && ./setup.sh`.
 | **v1.3.4** | Dual-domain mode scopes the Cognito cookie to the console domain ([#61](https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/issues/61)) — opt-in | If adopting: two us-east-1 ACM certs + `--console-domain/--console-cert/--app-domain/--app-cert` |
 | **v1.3.0** | ASG default → 2 hosts / 2 AZs (AZ failover needs a target)                                                                                                              | None, or set `asg.min_capacity: 1` / `multi_az.enabled: false` for single-AZ                     |
 
-**v1.5.0 details.** RBAC role-gating is opt-in (`console_auth.rbac_enabled: false` by default — `x-api-key` reads and writes unchanged, no Bearer needed). With `rbac_enabled: true`, writes require a valid Cognito id_token (`Authorization: Bearer …`); forged / `alg:none` / expired tokens fall back to `DEFAULT_NO_JWT_ROLE` (default `viewer`). The SSH change is data-plane — existing VMs keep the old password until their host is rolled:
+**v1.5.0 details.** RBAC role-gating is on by default (`console_auth.rbac_enabled: true` — the secure, least-privilege default; set `false` for a fully-open demo/dev deploy). `x-api-key` reads are unchanged; with RBAC on, writes require a valid Cognito id_token (`Authorization: Bearer …`); forged / `alg:none` / expired tokens fall back to `DEFAULT_NO_JWT_ROLE` (default `viewer`). The SSH change is data-plane — existing VMs keep the old password until their host is rolled:
 
 ```bash
 source .env.deploy && ./scripts/build-rootfs-on-ec2.sh <rootfs_version> <arch>   # rootfs content tag (e.g. v1.1), not the product version

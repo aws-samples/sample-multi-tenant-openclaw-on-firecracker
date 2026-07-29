@@ -22,17 +22,17 @@
 # they are emitted to stdout / /tmp at run time. Edit the CONFIG block per env.
 set -euo pipefail
 
-# ---------- CONFIG (per environment; defaults = verified  ap-southeast-1) ----------
+# ---------- CONFIG (per environment; defaults = verified ap-southeast-1 ref env) ----------
 REGION="${REGION:-ap-southeast-1}"
-VPC_ID="${VPC_ID:-vpc-0b308aa094fbf39e5}"
-VPC_CIDR="${VPC_CIDR:-10.0.0.0/16}"
+VPC_ID="${VPC_ID:-vpc-0abc123def4567890}"
+VPC_CIDR="${VPC_CIDR:-172.31.0.0/16}"
 # Private subnet that routes egress via NAT (no public IP on instances):
-PRIVATE_SUBNET="${PRIVATE_SUBNET:-subnet-09a74f97b5b6f8f09}"
-KEY_NAME="${KEY_NAME:-open<aws-profile>-bastion}"
+PRIVATE_SUBNET="${PRIVATE_SUBNET:-subnet-0abc123def4567890}"
+KEY_NAME="${KEY_NAME:-openclaw-bastion}"
 # Bastion SG — the ONLY source allowed to reach SSH / dashboard / API:
-BASTION_SG="${BASTION_SG:-sg-0a78b7b8632997ee0}"
+BASTION_SG="${BASTION_SG:-sg-0abc123def4567890}"
 # Ubuntu 22.04 LTS amd64 (matches the article's OS; pin to a known AMI per region):
-AMI_ID="${AMI_ID:-ami-06c2685db9a20aac5}"
+AMI_ID="${AMI_ID:-ami-0abc123def4567890}"
 MANAGER_TYPE="${MANAGER_TYPE:-m7i-flex.large}"   # >=4GB RAM for the indexer
 AGENT_TYPE="${AGENT_TYPE:-t3.micro}"
 AWS="${AWS:-/usr/local/bin/aws}"
@@ -40,7 +40,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # --- 告警留存后端:独立 Amazon OpenSearch Service 域(治 all-in-one 单点全丢)---
 # 默认 OFF。这套是生产推荐形态:告警从 manager 本地 indexer 改送一个**独立托管**的
 # OpenSearch 域,manager 那台 EC2 挂了/被删/被攻陷,告警仍在独立信任域里(对标
-# a production-grade hardened 中心化 HIDS)。⚠ Amazon OpenSearch Service 按小时持续计费、停不掉
+# 生产级中心化 HIDS)。⚠ Amazon OpenSearch Service 按小时持续计费、停不掉
 # (不像 EC2 能 stop),最小 t3.small.search 约 $26/月起,multi-AZ 翻倍。所以默认 OFF,
 # 明确接受持续成本再设 ALERTS_OPENSEARCH_ENABLED=true 开。开关打开时建:VPC 内私网域
 # (不公网暴露)+ 域 SG 入站 443 只对 manager SG(零 0.0.0.0/0)+ 细粒度访问控制 +
@@ -88,7 +88,7 @@ echo "red-line OK: no 0.0.0.0/0 inbound"
 echo "== 1b. Manager instance role: 告警外发到独立留存(防本地单点丢失) =="
 # 问题:Wazuh 告警默认只落 manager 本地 /var/ossec/logs/alerts/alerts.json + 本地
 # indexer —— 那台 EC2 挂了/被删/被攻陷先删日志,告警历史全没,等于没监控。
-# 生产级要求告警出本机、汇到独立信任域、防删(对标 a production-grade hardened 的中心化 HIDS)。
+# 生产级要求告警出本机、汇到独立信任域、防删(对标生产级中心化 HIDS)。
 # 这里给 manager 配最小权限 role:① CloudWatch Logs(把 alerts.json 推到独立 log group,
 # manager 没了告警仍在)② SNS Publish(高危告警实时外发,不靠人盯 dashboard)③ SSM core
 # (运维)。幂等:已存在则复用。

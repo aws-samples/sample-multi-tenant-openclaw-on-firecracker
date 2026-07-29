@@ -48,7 +48,7 @@ POST /hosts/{instance_id}/copy-file-from-s3
 **200 OK** —— 拷贝完成。判成功看 `ProcessingJobStatus == "Completed"`(不必只靠 HTTP 200)。
 ```json
 {
-  "instance_id": "i-0c3843987566fbcd9",
+  "instance_id": "i-0abc123def4567890",
   "target": "/home/ubuntu/manifest3.json",
   "s3_uri": "s3://openclaw-assets-454394050889/deployment/rootfs/manifest.json",
   "ProcessingJobStatus": "Completed",
@@ -76,7 +76,7 @@ POST /hosts/{instance_id}/copy-file-from-s3
 {
   "error": "SSM send-command dispatch failed",
   "code": "COPY_DISPATCH_FAILED",
-  "instance_id": "i-0c3843987566fbcd9",
+  "instance_id": "i-0abc123def4567890",
   "target": "/home/ubuntu/manifest3.json",
   "s3_uri": "s3://openclaw-assets-454394050889/deployment/rootfs/manifest.json",
   "ProcessingJobStatus": "Failed"
@@ -88,7 +88,7 @@ POST /hosts/{instance_id}/copy-file-from-s3
 {
   "error": "[copy-file] resolved parent escapes allowed roots: /etc (symlink escape?)",
   "code": "COPY_FAILED",
-  "instance_id": "i-0c3843987566fbcd9",
+  "instance_id": "i-0abc123def4567890",
   "target": "/home/ubuntu/manifest3.json",
   "s3_uri": "s3://openclaw-assets-454394050889/deployment/rootfs/manifest.json",
   "ProcessingJobStatus": "Failed"

@@ -696,7 +696,11 @@
                       <span class="host-label">copy</span>
                       <button
                         class="btn-act"
-                        style="font-size: 11px; white-space: nowrap; flex-shrink: 0"
+                        style="
+                          font-size: 11px;
+                          white-space: nowrap;
+                          flex-shrink: 0;
+                        "
                         title="Copy a single file from S3 to this host (host scripts: /opt/openclaw/ or /home/ubuntu/)"
                         @click.stop="openCopyFileModal(h.instance_id)"
                       >
@@ -775,11 +779,7 @@
                   <div
                     class="host-row"
                     x-show="h.status === 'upgrading'"
-                    style="
-                      gap: 6px;
-                      margin-top: 4px;
-                      align-items: flex-start;
-                    "
+                    style="gap: 6px; margin-top: 4px; align-items: flex-start"
                   >
                     <span class="host-label">progress</span>
                     <span
@@ -1067,7 +1067,7 @@
                         <template x-if="t.status==='running'">
                           <button
                             class="btn-act"
-                            title="展示 gateway token 密文(调用方自解;§the data-plane contract)"
+                            title="展示 gateway token 密文(调用方自解;§INTERFACE-CONTRACT §5)"
                             @click="revealToken(t.id)"
                           >
                             <svg class="icon s13"><use href="#i-key" /></svg
@@ -2238,7 +2238,7 @@ openclaw_vm_disk_used_pct &gt; 90</pre
           <p style="font-size: 12px; margin-top: 8px">
             If message includes <code>EDGE_STACK_NOT_DEPLOYED</code>, run
             <code>cdk deploy</code> with <code>edge.enabled=true</code> (see
-            the data-plane design/the design doc P2b-iac).
+            SPEC/11-ENGINE-TRANSFORM/02-DEV-PLAN P2b-iac).
           </p>
         </div>
       </template>
@@ -3115,7 +3115,7 @@ openclaw_vm_disk_used_pct &gt; 90</pre
       <!-- 入站 flow(inbound):平台公钥本地加密业务凭据 → 建租户注入 -->
       <h2 style="margin-top: 28px">📥 入站凭据注入(inbound · 反方向)</h2>
       <p class="rsa-lede">
-        调用方拿【平台】RSA 公钥,浏览器本地 OAEP-SHA256 加密业务凭据(平台 API
+        调用方拿【平台】RSA 公钥,浏览器本地 OAEP-SHA256 加密业务凭据(业务 API
         key 等),<code>POST /tenants</code> 带
         <code>env_injected_credentials</code>,host 在 VM launch 时
         <code>kms:Decrypt</code> 注入。调用方零 AWS 依赖、不碰
@@ -3724,7 +3724,11 @@ openclaw_vm_disk_used_pct &gt; 90</pre
          隔离按键、不加 Escape ③打开自动聚焦输入框、按钮 type=button(防误触发)。 -->
     <template x-if="copyModal.show">
       <div class="overlay">
-        <div class="modal" style="width: 620px; position: relative" @keydown.stop>
+        <div
+          class="modal"
+          style="width: 620px; position: relative"
+          @keydown.stop
+        >
           <button
             type="button"
             class="close-btn"
@@ -3761,8 +3765,9 @@ openclaw_vm_disk_used_pct &gt; 90</pre
             />
             <small style="color: var(--gray); font-size: 11px"
               >For host scripts. Must be under <code>/opt/openclaw/</code> (.py
-              host-agent) or <code>/home/ubuntu/</code> (.sh + lib/*) — server-enforced
-              allowlist. Include the destination filename.</small
+              host-agent) or <code>/home/ubuntu/</code> (.sh + lib/*) —
+              server-enforced allowlist. Include the destination
+              filename.</small
             >
           </div>
           <div
@@ -3939,7 +3944,7 @@ openclaw_vm_disk_used_pct &gt; 90</pre
 
     <!-- #187 Reveal Token / Descriptor Modal(design decision:控制面功能全上 console)
          GET /tenants/{id}/token → 显示 KMS 密文(base64 信封);API 侧不 decrypt,
-         调用方拿 EncryptionContext={tenant_id: <id>} 自解得明文(§the data-plane contract)。
+         调用方拿 EncryptionContext={tenant_id: <id>} 自解得明文(§INTERFACE-CONTRACT §5)。
          附 descriptor:host_private_ip / host_port / guest_ip / status。 -->
     <template x-if="revealState.open">
       <div class="overlay" @click.self="closeReveal()">

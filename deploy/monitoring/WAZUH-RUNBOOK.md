@@ -40,7 +40,7 @@ docker compose --env-file deploy/monitoring/.env -f deploy/monitoring/docker-com
 
 microVM 镜像已烤 auditd + `openclaw-fim.sh`(build-rootfs)。让它们转发到 manager 的两条路(任选/并用):
 
-- **A. Wazuh agent(推荐)**:在 build-rootfs 的镜像里装 `wazuh-agent`,`ossec.conf` 指向 manager `1514`,enrollment 走 `1515`。agent 跑在 guest 内、agent 进程对 OpenClaw agent 不可见(同 the reference platform Wazuh-in-ns 思路)。注册用 per-tenant key,不复用。
+- **A. Wazuh agent(推荐)**:在 build-rootfs 的镜像里装 `wazuh-agent`,`ossec.conf` 指向 manager `1514`,enrollment 走 `1515`。agent 跑在 guest 内、agent 进程对 OpenClaw agent 不可见(Wazuh-in-ns 思路)。注册用 per-tenant key,不复用。
 - **B. 无 agent(轻量)**:FIM/auditd 告警已落 guest 内日志,host-agent 旁路把这些行经 manager syslog `514/udp` 转发(不下沉凭据到 guest)。
   > 验证:在测试 microVM 内触发 reverse-shell 探测(规则 100210)或改一个受保护身份文件(规则 100110),Wazuh dashboard 的 Security events 里**几秒内出现该 alert**(rule.id 100210/100110)。这是端到端真验,不是看进程起没起。
 
@@ -68,4 +68,4 @@ host-agent `/metrics` → ADOT → AMP → Grafana(`deploy/stack.py` AMP/AMG 段
 ## 现状标注(诚实)
 
 - ✅ 真实可部署:compose 栈、自定义规则、GuardDuty→SNS(CDK)、AMP/Grafana(已有)。
-- ⏳ 待真机:在 146 监控 EC2 上 `docker compose up` + 测试 VM 装 wazuh-agent 跑通端到端告警上屏。这步是基础设施部署(需起监控 EC2),runbook 给确切步骤,真机执行时按 §3 验证告警上屏。
+- ⏳ 待真机:在监控 EC2 上 `docker compose up` + 测试 VM 装 wazuh-agent 跑通端到端告警上屏。这步是基础设施部署(需起监控 EC2),runbook 给确切步骤,真机执行时按 §3 验证告警上屏。

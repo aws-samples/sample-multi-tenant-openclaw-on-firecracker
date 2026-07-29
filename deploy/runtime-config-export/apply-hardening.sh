@@ -79,12 +79,12 @@ if [ "$EXIST_ID" != "None" ] && [ -n "$EXIST_ID" ]; then
   GID="$EXIST_ID"
 else
   # 去品牌收敛(issue #24):存量账号可能有旧品牌名的 guardrail(去品牌前建的,如
-  # legacy-ai-chat)。若存在,原地 update-guardrail 改名到中性名(id 不变
+  # 旧的带品牌后缀的名)。若存在,原地 update-guardrail 改名到中性名(id 不变
   # → LiteLLM/镜像的 guardrailIdentifier 引用不断),而不是另建一个 claw-* 留孤儿。
   # 用同一份 $GR_INPUT(name 已是中性名 + 完整 policy)做 update,replace 语义下 policy 零削减。
-  # 探测规则:名字含 "-ai-chat-exchange-grade" 后缀但 name 不等于目标中性名 = 旧品牌残留。
+  # 探测规则:名字含 "-ai-chat-" 但 name 不等于目标中性名 = 旧命名残留。
   LEGACY_ID=$($AWS bedrock list-guardrails \
-    --query "guardrails[?contains(name,'-ai-chat-exchange-grade') && name!='$GR_NAME'].id|[0]" \
+    --query "guardrails[?contains(name,'-ai-chat-') && name!='$GR_NAME'].id|[0]" \
     --output text 2>/dev/null || echo "None")
   if [ "$LEGACY_ID" != "None" ] && [ -n "$LEGACY_ID" ]; then
     LEGACY_NAME=$($AWS bedrock get-guardrail --guardrail-identifier "$LEGACY_ID" --guardrail-version DRAFT --query name --output text 2>/dev/null || echo "?")
@@ -106,14 +106,14 @@ echo "=== 2. Route53 Resolver DNS Firewall 回放 ==="
 # 内容在旧账号 rslvr-fdl-...)。C2 域清单是安全敏感数据,本仓库不存明文域名。
 # 这里建一个空壳 domain list + rule group + BLOCK 规则,域名清单由运营用
 # import-firewall-domains 从受控来源灌(留 TODO 指针,不编造域名)。
-# 命名对齐旧账号146(rule group=openclaw-egress-fw, domain list=openclaw-egress-blocklist),
+# 命名沿用既有约定(rule group=openclaw-egress-fw, domain list=openclaw-egress-blocklist),
 # 跨账号迁移命名一致(两账号巡检对得上,避免漂移)。
 DL_NAME="openclaw-egress-blocklist"
 DL_ID=$($AWS route53resolver list-firewall-domain-lists --query "FirewallDomainLists[?Name=='$DL_NAME'].Id|[0]" --output text 2>/dev/null || echo "None")
 if [ "$DL_ID" = "None" ] || [ -z "$DL_ID" ]; then
   DL_ID=$($AWS route53resolver create-firewall-domain-list --name "$DL_NAME" --query "FirewallDomainList.Id" --output text)
   echo "  ✓ 建 domain list $DL_NAME ($DL_ID)"
-  # 灌默认 demo 黑名单(与旧账号146一致的演示域名,证明 DNS egress 拦截可演示)。
+  # 灌默认 demo 黑名单(演示域名,证明 DNS egress 拦截可演示)。
   # 这两个是 demo 占位非真实情报;真实 C2 清单运营另用 import-firewall-domains 从
   # 受控威胁情报源灌(仓库不存真实 C2 明文)。update-firewall-domains ADD 幂等。
   $AWS route53resolver update-firewall-domains --firewall-domain-list-id "$DL_ID" \

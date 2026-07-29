@@ -182,7 +182,7 @@ def build_network_vpc(self, ctx):
     # ========== Bedrock Guardrail (#80 部署时序 — 栈内资源,SSM 输出) ==========
     # 长期做法:把带外 apply-hardening.sh 建的 Guardrail 挪进 CDK 栈内,拿到 id 后
     # 写 SSM /openclaw/bedrock-guardrail-id,LiteLLM userdata 从 SSM 读(不硬编码
-    # od6s8sm533fs 那种账号特定 id)。策略定义单一真相源仍是
+    # 账号特定的 id)。策略定义单一真相源仍是
     # deploy/runtime-config-export/bedrock-guardrail.json —— apply-hardening.sh
     # 和这里的 CfnGuardrail 都从这个 JSON 转换,保证两条路径策略一致。
     #

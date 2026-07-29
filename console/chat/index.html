@@ -52,7 +52,7 @@
         flex-direction: column;
         height: 100vh;
       }
-      /* 全站导航条(导航):AI Pro 无关项灰化,仅装饰 */
+      /* 全站导航条:AI Pro 无关项灰化,仅装饰 */
       .topnav {
         height: 48px;
         flex-shrink: 0;
@@ -763,7 +763,7 @@
         }
       }
 
-      /* 行情卡片(agent 行情回复的可视化,对齐主流第三方行情 widget) */
+      /* 行情卡片(agent 行情回复的可视化,对齐主流行情 widget) */
       .quote-card {
         border: 1px solid var(--line);
         border-radius: 12px;
@@ -913,14 +913,24 @@
           </div>
           <button class="newbtn" data-action="new-session">＋ 新建对话</button>
           <div class="navrow"><span class="i">⇆</span> 转账资金</div>
-          <div class="navrow" data-action="load-history" style="cursor: pointer">
+          <div
+            class="navrow"
+            data-action="load-history"
+            style="cursor: pointer"
+          >
             <span class="i">◷</span> 历史记录
           </div>
           <div class="navrow"><span class="i">⚙</span> 设置</div>
 
           <div class="seclbl">
             我的智能体节点
-            <span class="rf" title="刷新节点" data-action="load-nodes" style="cursor: pointer">↻</span>
+            <span
+              class="rf"
+              title="刷新节点"
+              data-action="load-nodes"
+              style="cursor: pointer"
+              >↻</span
+            >
           </div>
           <div class="nodes" id="nodeList">
             <div class="empty">加载节点中…</div>
@@ -1026,7 +1036,9 @@
                     <button class="tool" title="语音">🎙</button>
                     <span style="margin-left: 4px">标准模式</span>
                   </div>
-                  <button class="send" id="sendBtn" data-action="send">↑</button>
+                  <button class="send" id="sendBtn" data-action="send">
+                    ↑
+                  </button>
                 </div>
               </div>
               <div class="disclaimer">

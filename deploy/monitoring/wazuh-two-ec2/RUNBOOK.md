@@ -66,7 +66,7 @@ cd deploy/monitoring/wazuh-two-ec2
 ./setup-wazuh-two-ec2.sh        # creates 2 SGs, launches both EC2
 ```
 
-Defaults target the verified  / ap-southeast-1 env; override via env vars
+Defaults target the verified `ap-southeast-1` reference env; override via env vars
 (`REGION`, `VPC_ID`, `PRIVATE_SUBNET`, `BASTION_SG`, `AMI_ID`, `KEY_NAME`, ...).
 The manager installer runs unattended for ~5-10 min.
 
@@ -149,7 +149,7 @@ ssh -i <bastion-key>.pem -L 8443:<manager-private-ip>:443 ubuntu@<bastion-public
 
 默认 Wazuh 告警只落 manager 本地 `/var/ossec/logs/alerts/alerts.json` + 本地 indexer。
 那台 EC2 挂了 / 被删 / 被攻陷先删日志,告警历史全没 —— 等于没监控。生产级要求
-告警出本机、汇到独立信任域、防删(对标 a production-grade hardened 的中心化 HIDS,监控数据不在
+告警出本机、汇到独立信任域、防删(对标生产级中心化 HIDS,监控数据不在
 被监控方信任域内)。本部署把这步落进代码:
 
 - `setup-wazuh-two-ec2.sh` 阶段 1b 建 manager instance role(最小权限:只写本告警
@@ -171,7 +171,7 @@ ssh -i <bastion-key>.pem -L 8443:<manager-private-ip>:443 ubuntu@<bastion-public
 CloudWatch 兜底解决"告警证据不丢",但查询/看板体验差。**生产推荐**把告警从 manager
 本地 indexer 改送一个**独立托管**的 OpenSearch 域 —— all-in-one 是 manager+indexer+
 dashboard 挤一台,那台没了告警数据库一锅端;独立域让告警落在独立信任域,查询用
-OpenSearch Dashboards(SIEM 该有的体验)。对标 a production-grade hardened 监控数据不在被监控方信任域。
+OpenSearch Dashboards(SIEM 该有的体验)。对标生产级实践:监控数据不在被监控方信任域。
 
 **⚠ 成本**:Amazon OpenSearch Service 按小时持续计费、停不掉(不像 EC2 能 stop)。
 最小 `t3.small.search` 单节点约 $26/月起,multi-AZ 翻倍。所以 `setup` 脚本默认

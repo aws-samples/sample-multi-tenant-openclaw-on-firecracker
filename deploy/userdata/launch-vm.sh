@@ -1332,7 +1332,11 @@ sudo iptables -C FORWARD -i ${TAP} -d ${TENANT_SUPERNET} -j DROP 2>/dev/null || 
 # (traffic to the host itself hits INPUT, not FORWARD). host-agent SSHes INTO
 # the guest (host→guest, a NEW outbound conn from the host), so blocking
 # guest→host:22 here does not affect host-agent's reverse management.
-for _port in 8899 9090 22; do
+# 9100 (#387 防御性): the platform does NOT install node_exporter, but the
+# Runbook guides users to self-install it on hosts at the standard :9100 —
+# pre-dropping guest→host:9100 protects users who install the exporter but
+# forget the isolation step. Keep this list in sync with migrate-vm.sh.
+for _port in 8899 9090 22 9100; do
   sudo iptables -C INPUT -i ${TAP} -p tcp --dport ${_port} -j DROP 2>/dev/null || \
     sudo iptables -I INPUT 1 -i ${TAP} -p tcp --dport ${_port} -j DROP
 done
@@ -1405,10 +1409,11 @@ fi
 
 # Start Firecracker
 log "starting firecracker..."
-# #331/#327 — 8>&- 关掉本 launcher 持的槽锁 fd,不让长命 disown 的 firecracker 继承它:否则
-# launcher 退出后 FC 仍持槽 → host 封顶 N 个【常驻】VM(而非 N 个【并发启动】)。槽在 InstanceStart
-# 后由 _oc_release_launch_slot 显式释放;这里只是确保 FC 子进程不继承。
-nohup firecracker --api-sock ${SOCK} --log-path ${VM_DIR}/fc.log --level Info &>/dev/null 8>&- & disown
+# #331/#327 — close both launcher-owned locks in the long-lived Firecracker
+# child. fd8 is the host launch slot; fd9 is the per-tenant lifecycle lock
+# shared with stop-vm.sh. The launcher parent keeps both until InstanceStart,
+# but Firecracker must not retain either for the VM lifetime.
+nohup firecracker --api-sock ${SOCK} --log-path ${VM_DIR}/fc.log --level Info &>/dev/null 8>&- 9>&- & disown
 sleep 1
 
 # Configure VM

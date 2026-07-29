@@ -510,6 +510,7 @@ def _assert_owner_or_admin(item, event):
 _RBAC_SKIP = {
     ("POST", "/external/authz"),
     ("GET", "/tenantmatch"),
+    ("GET", "/tenants-stats"),
     ("GET", "/registry/{config_template}"),
     ("POST", "/registry/{config_template}"),
     ("POST", "/registry/{config_template}/rollback"),

@@ -9,6 +9,11 @@ from boto3.dynamodb.conditions import Attr, Key
 from botocore.exceptions import ClientError  # process_pending CAS 认领(#9 跨租户串修复)
 
 from core.logging import logger, inject_trace_root, reset_invocation_keys
+from services.tenant_query_service import (
+    QUERY_FIELDS as _TENANT_QUERY_FIELDS,
+    list_tenants_by_condition,
+)
+from services.tenant_stats_service import get_tenant_stats
 
 
 def _resolve_proxy_route(method, path, route_keys):
@@ -192,6 +197,7 @@ def lambda_handler(event, context):
             event.get("multiValueQueryStringParameters") or {},
             event,
         ),
+        ("GET", "/tenants-stats"): lambda: get_tenant_stats(event),
         ("POST", "/tenants"): lambda: create_tenant(event.get("body"), event),
         # self-service: a logged-in user provisions their OWN node (viewer-level,
         # owner forced to caller, per-user cap). See create_tenant_self.
@@ -231,7 +237,9 @@ def lambda_handler(event, context):
         # must bypass the Cognito role gate (added to the RBAC skip list below).
         ("POST", "/external/authz"): lambda: external_authz(event.get("body"), event),
         # #187 转型:POST /chat/sign 下线,前端改经 /ws/{tenant_id} 直连 gateway。
-        ("GET", "/hosts"): list_hosts,
+        ("GET", "/hosts"): lambda: list_hosts(
+            event.get("queryStringParameters") or {}
+        ),
         ("POST", "/hosts"): lambda: register_host(event.get("body")),
         ("POST", "/hosts/refresh-rootfs"): refresh_rootfs,
         # #217 V2 — 照 DDB 快照按精确 VersionId 拉 host 相关文件(镜像+脚本),校验 etag
@@ -366,12 +374,15 @@ def lambda_handler(event, context):
 
 
 def list_tenants(query_params=None, multi_query_params=None, event=None):
+    query_params = query_params or {}
+    if any(field in query_params for field in _TENANT_QUERY_FIELDS):
+        return list_tenants_by_condition(query_params, event or {})
     # PRD #53 — optional pagination. Backward compatible: no ?limit → scan to the
     # end and return a bare array (legacy shape small deployments rely on). With
     # ?limit=N → one page of ≤N rows + an opaque next_token, wrapped in an object
     # so a 100k-row table never blows the 30s API-GW timeout or the client.
-    paginate = bool((query_params or {}).get("limit")) or bool(
-        (query_params or {}).get("next_token")
+    paginate = bool(query_params.get("limit")) or bool(
+        query_params.get("next_token")
     )
     scan_kwargs = {
         "FilterExpression": "#s <> :d",
@@ -1021,19 +1032,27 @@ def process_pending():
         now = _now()
 
         # Update pending tenant with host assignment (host slot 已 CAS 占好)
+        rootfs_version = host.get("rootfs_version", "")
+        update_expression = "SET #s = :s, host_id = :h, vm_num = :n, guest_ip = :g, host_port = :p, rootfs_version = :rv, creation_started_at = :t, updated_at = :t"
+        values = {
+            ":s": "creating",
+            ":h": host["instance_id"],
+            ":n": vm_num,
+            ":g": guest_ip,
+            ":p": host_port,
+            ":rv": rootfs_version,
+            ":t": now,
+        }
+        if rootfs_version and len(rootfs_version.encode("utf-8")) <= 256:
+            update_expression += ", q_rootfs_version = :qrv"
+            values[":qrv"] = rootfs_version
+        else:
+            update_expression += " REMOVE q_rootfs_version"
         tenants_table.update_item(
             Key={"id": tenant["id"]},
-            UpdateExpression="SET #s = :s, host_id = :h, vm_num = :n, guest_ip = :g, host_port = :p, rootfs_version = :rv, creation_started_at = :t, updated_at = :t",
+            UpdateExpression=update_expression,
             ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={
-                ":s": "creating",
-                ":h": host["instance_id"],
-                ":n": vm_num,
-                ":g": guest_ip,
-                ":p": host_port,
-                ":rv": host.get("rootfs_version", ""),
-                ":t": now,
-            },
+            ExpressionAttributeValues=values,
         )
 
         _launch_vm(

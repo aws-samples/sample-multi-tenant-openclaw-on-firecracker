@@ -59,6 +59,30 @@ scrape_configs:
           - /etc/prometheus/targets/metal-hosts.yml
         refresh_interval: 1m
 
+  # ---- #387: 各 edge 节点的 nginx metrics(:9145,EC2 service discovery) ----
+  # 发现依赖 Edge LT 实例 tag(Project=openclaw + Role=edge,ha_edge.py 打)。
+  # edge_connections{state} 只统计客户端连接,不含 upstream;WS 主导场景近似
+  # 压力 = 2*active/(workers*worker_connections),是估算不是精确水位。
+  - job_name: openclaw-edge-nginx
+    metrics_path: /metrics
+    scheme: http
+    ec2_sd_configs:
+      - region: ap-southeast-1 # 改成实际部署 region
+        port: 9145
+        filters:
+          - name: "tag:Project"
+            values: ["openclaw"]
+          - name: "tag:Role"
+            values: ["edge"]
+          - name: "instance-state-name"
+            values: ["running"]
+    relabel_configs:
+      - source_labels: [__meta_ec2_private_ip]
+        replacement: "${1}:9145"
+        target_label: __address__
+      - source_labels: [__meta_ec2_instance_id]
+        target_label: instance
+
   # ---- 监控机自身(node_exporter,自监控) ----
   - job_name: monitoring-host-self
     static_configs:

@@ -562,6 +562,11 @@ if [ -n "${AGENTCORE_GW_URL}" ] && [ "${AGENTCORE_GW_URL}" != "none" ]; then
   log "AgentCore config written: gateway=${AGENTCORE_GW_URL}"
 fi
 
+# Optional customer-managed root hook (#390). CDK renders an empty string when
+# disabled; enabled hooks are private-S3 downloaded, SHA256 verified, atomically
+# installed and bounded by timeout before this host can register active.
+{{HOST_USER_HOOK}}
+
 # Step 5: register to DDB. Retry (concurrent launches throttle writes); on
 # total failure exit non-zero → trap ABANDONs (unregistered host is useless) (#73)
 #

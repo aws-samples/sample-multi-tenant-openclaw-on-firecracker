@@ -99,10 +99,24 @@ L1 Prompt（LiteLLM pre/post + Bedrock Guardrail 双向）、L2 工具（`before
 
 ### 交付级架构总览
 
-下图给出交付级架构总览：左侧数据面（终端用户经平台后端 WebSocket 网关 → CloudFront → ALB → OpenResty 边缘 → microVM gateway），中部控制面（全托管无服务器，编排租户全生命周期），右侧 L1–L5 纵深防御边界。
+三张图分别给出平台总览、数据面每次请求路径、控制面与 microVM 生命周期，数据均对齐 `engineering/02-system-constraints/FACT-BASELINE.md` 与当前代码实现。
+
+**平台总览** —— 左侧数据面（终端用户经平台后端 WebSocket 网关 → CloudFront → ALB → OpenResty 边缘 → microVM gateway），中部无服务器控制面（编排租户全生命周期），右侧 L1–L5 纵深防御边界。
 
 <p align="center">
-  <img src="arch-overview-cn.png" alt="ClawPool 交付级架构总览 — 数据面、控制面、L1–L5 纵深防御" width="96%"/>
+  <img src="diagrams/overview-cn.svg" alt="ClawPool 平台总览 — 数据面两级路由、无服务器控制面、L1–L5 纵深防御" width="98%"/>
+</p>
+
+**数据面** —— 从租户浏览器到 Bedrock 的每次请求路径（7 跳），三级路由缓存（L1 进程内 LRU ~5s / L2 共享字典 ~60s / L3 Valkey 权威源、无 TTL、失败降级），以及每租户一台 microVM、四块基础盘 + 可选凭据盘。
+
+<p align="center">
+  <img src="diagrams/dataplane-cn.svg" alt="数据面 — 两级路由、三级路由缓存、每租户 microVM 四块基础盘 + 可选凭据盘" width="98%"/>
+</p>
+
+**控制面与生命周期** —— 无服务器请求路径，默认同步 SSM 派发（可选开启 SQS dispatch 队列和 lifecycle.fifo 削峰），DynamoDB 状态，14 个一等租户操作的状态机。
+
+<p align="center">
+  <img src="diagrams/control-cn.svg" alt="控制面与 microVM 生命周期 — 无服务器请求路径、可选 SQS 削峰队列、DynamoDB 状态、14 操作状态机" width="98%"/>
 </p>
 
 <details>
@@ -307,9 +321,9 @@ sample-multi-tenant-openclaw-on-firecracker/
 | **Memory**            | 多轮对话上下文持久化，每租户独立。                                 |
 | **Code Interpreter**  | Python sandbox。`start_session` → `executeCode` → `stop_session`。 |
 | **Browser**           | 远程 Chromium + WebSocket stream。可自动化。                       |
-| **Workload Identity** | 每个 VM 启动时自动注入临时凭证 — 零静态 key、自动刷新。            |
+| **Workload Identity** | 控制面 provision 资源，但不注入 guest（microVM 保持零凭据设计）。  |
 
-> 一个 toggle（`agentcore.enabled`）让每个 microVM 自动接入 AgentCore Gateway / Memory / Code Interpreter / Browser / Workload Identity。
+> 一个 toggle（`agentcore.enabled`）provision AgentCore Gateway / Memory / Code Interpreter / Browser / Workload Identity，并将 microVM 网关指向它。Gateway、Memory、Code Interpreter、Browser 已 E2E 验证；Workload Identity 仅 provision 未接入 guest 运行时。
 
 </details>
 
@@ -319,7 +333,7 @@ sample-multi-tenant-openclaw-on-firecracker/
 | 层                 | 实现                                                                                                                                                                                                                                 |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | **静态加密**       | EBS 卷（rootfs + data）默认 KMS 加密。                                                                                                                                                                                               |
-| **传输加密**       | C 端聊天链路 平台后端 → CloudFront → ALB → OpenResty 边缘 全程 TLS（TLS 在 ALB 卸载）；控制面 API Gateway HTTPS。                                                                                                                    |
+| **传输加密**       | TLS 在 CloudFront 终结；CloudFront→ALB 走公网 HTTP（ALB SG 仅放行 CloudFront 前缀列表）；ALB→边缘→microVM 走 VPC 内部 HTTP；控制面 API Gateway HTTPS。                                                                               |
 | **API 鉴权**       | API Gateway 带 `x-api-key` + 可选 AWS WAF（rate limit / geo block / OWASP）。                                                                                                                                                        |
 | **Console 鉴权**   | Cognito **authorization-code + PKCE** flow + 可选 MFA。                                                                                                                                                                              |
 | **RBAC**           | Cognito Groups `admin` / `operator` / `viewer`，由 `console_auth.rbac_enabled` 控制（默认 `true`，安全默认）。id_token 经 JWKS 校验 RS256 签名，伪造 / `alg:none` / 过期 token 降级为 `viewer`，无 token 兜底 `viewer`、写操作 403。 |
@@ -659,7 +673,7 @@ curl -s -X POST "${API_URL}hosts/refresh-rootfs" -H "x-api-key: ${API_KEY}" | jq
 
 想快速跑通，先读 [`docs/aws-guide/00-quickstart-and-runbook.md`](./aws-guide/00-quickstart-and-runbook.md)（快速上手与部署运行手册：结论先行 + 环境要求警告 + 部署 Checklist + 常见报错排查 + CTO/工程师双视角摘要）。
 
-完整的实施指南见 [`docs/OpenClaw-on-Firecracker-实施指南.pdf`](./OpenClaw-on-Firecracker-实施指南.pdf)（AWS 解决方案实施指南风格，含架构总览、部署、运维、开发人员指南与 Well-Architected 对照）。英文版见 [`docs/OpenClaw-on-Firecracker-Implementation-Guide.pdf`](./OpenClaw-on-Firecracker-Implementation-Guide.pdf)。章节源见 [`docs/aws-guide/`](./aws-guide/)（中文）与 [`docs/aws-guide-en/`](./aws-guide-en/)（英文）。
+完整的实施指南采用 AWS 解决方案实施指南风格，含架构总览、部署、运维、开发人员指南与 Well-Architected 对照，按章节分文件维护：中文见 [`docs/aws-guide/`](./aws-guide/)，英文见 [`docs/aws-guide-en/`](./aws-guide-en/)。
 
 ---
 

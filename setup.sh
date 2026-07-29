@@ -370,7 +370,9 @@ fi
 # --all: app 拆多 stack(OpenClawOrchestrator + OpenClawImage,#283)后,不带
 # stack 选择符的裸 cdk deploy 会报 "specify which stacks ... or --all" 并退出。
 # --all 按 add_dependency 拓扑序先 Orchestrator(建桶)后 OpenClawImage(烤镜像)。
-PATH=".venv/bin:$PATH" cdk deploy --all -c region="$REGION" "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --require-approval never ${CDK_ARGS[@]+"${CDK_ARGS[@]}"}
+PATH=".venv/bin:$PATH" scripts/deploy-cdk.sh "$REGION" "$PROFILE" \
+  --all -c region="$REGION" "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" \
+  --require-approval never ${CDK_ARGS[@]+"${CDK_ARGS[@]}"}
 
 # Upload scripts to S3 (after deploy creates the bucket)
 BUCKET=$(aws cloudformation describe-stacks --stack-name OpenClawOrchestrator \

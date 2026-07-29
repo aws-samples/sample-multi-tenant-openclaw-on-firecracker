@@ -12,6 +12,7 @@ import re
 import shlex
 import time
 import uuid
+import ipaddress
 
 import boto3
 
@@ -27,15 +28,16 @@ from core.clients import (
     s3,
     ssm,
 )
-from core.utils import _now, _resp, _err
+from core.utils import (
+    _now,
+    _resp,
+    _err,
+    _parse_limit,
+)
+from core.pagination import decode_cursor, encode_cursor
 
 
-def list_hosts():
-    items = hosts_table.scan(
-        FilterExpression="#s <> :d",
-        ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":d": "deleted"},
-    ).get("Items", [])
+def _public_hosts(items):
     # Filter out synthetic records (e.g. __az_failover_state__ used by the
     # health_check Lambda to remember per-AZ cooldown — added in 1.3.0).
     # Anything starting with "__" is reserved for internal bookkeeping and
@@ -44,7 +46,76 @@ def list_hosts():
     for item in items:
         item["cpu_overcommit_ratio"] = CPU_OVERCOMMIT_RATIO
         item["mem_overcommit_ratio"] = MEM_OVERCOMMIT_RATIO
-    return _resp(200, items)
+    return items
+
+
+def list_hosts(query_params=None):
+    query_params = query_params or {}
+    parameterized = any(key in query_params for key in ("ip", "limit", "next_token"))
+    scan_kwargs = {
+        "FilterExpression": "#s <> :d",
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {":d": "deleted"},
+    }
+
+    # Preserve the legacy endpoint byte-for-byte: no parameters means one scan
+    # and a bare array, including its existing 1 MB scan-page behavior.
+    if not parameterized:
+        items = hosts_table.scan(**scan_kwargs).get("Items", [])
+        return _resp(200, _public_hosts(items))
+
+    ip = query_params.get("ip")
+    if ip is not None:
+        try:
+            parsed_ip = ipaddress.ip_address(str(ip))
+            if parsed_ip.version != 4 or str(parsed_ip) != str(ip):
+                raise ValueError
+        except ValueError:
+            return _err(400, "VALIDATION", "ip must be a canonical IPv4 address")
+        scan_kwargs["FilterExpression"] += " AND private_ip = :ip"
+        scan_kwargs["ExpressionAttributeValues"][":ip"] = str(ip)
+
+    has_limit = "limit" in query_params or "next_token" in query_params
+    if has_limit:
+        limit, err = _parse_limit(query_params)
+        if err is not None:
+            return err
+        condition = {"route": "/hosts", "ip": ip}
+        try:
+            start_key = decode_cursor(query_params.get("next_token"), condition)
+        except ValueError as exc:
+            return _err(400, "VALIDATION", str(exc))
+        scan_kwargs["Limit"] = limit
+        if start_key:
+            scan_kwargs["ExclusiveStartKey"] = start_key
+        out = hosts_table.scan(**scan_kwargs)
+        items = _public_hosts(out.get("Items", []))
+        return _resp(
+            200,
+            {
+                "hosts": items,
+                "next_token": encode_cursor(
+                    out.get("LastEvaluatedKey"), condition
+                ),
+                "count": len(items),
+            },
+        )
+
+    # ip-only must scan all bounded host pages so an exact match after the
+    # first DynamoDB 1 MB page is not reported as a false negative.
+    items = []
+    while True:
+        out = hosts_table.scan(**scan_kwargs)
+        items.extend(out.get("Items", []))
+        key = out.get("LastEvaluatedKey")
+        if not key:
+            break
+        scan_kwargs["ExclusiveStartKey"] = key
+    items = _public_hosts(items)
+    return _resp(
+        200,
+        {"hosts": items, "next_token": None, "count": len(items)},
+    )
 
 
 # Same _sizes / _mem_ratio fallback as deploy/stack.py (kept in sync

@@ -136,3 +136,75 @@ datasource(Prometheus)与 dashboard(`OpenClaw microVM Fleet (host-agent)`,uid `o
 ```
 
 ```
+
+## 5. 集成方接入(#387:外部自建 Prometheus 私网 scrape)
+
+**前提(逐条核实,不满足走退化路径)**:
+1. 集成方 Prometheus 与 ClawPool **同 VPC**(SG 按 VPC CIDR 放行)。peering 场景须显式放行 peer CIDR/SG 并从真实集成方位置验收。
+2. ec2_sd 自动发现要求集成方 Prometheus 的实际身份(instance role)能调 `ec2:DescribeInstances` + `ec2:DescribeAvailabilityZones`(同账号**不自动授权**,必须实测)。不满足 → 用 file_sd(`targets/` 目录模式,见上文 job `openclaw-host-agent-file`)。
+
+**端点清单(全部私网,SG 已放行 VPC CIDR)**:
+
+| 端点 | 指标 | 说明 |
+|---|---|---|
+| host `:8899/metrics` | `openclaw_vm_*` 7 gauge + `openclaw_vm_health`/`openclaw_app_health` | per-tenant 资源与健康 |
+| host `:8899/metrics` | `openclaw_host_dnat_ports_{used,total,quarantined}` | **容量红线①**:端口耗尽=新 VM 起不来。bitmap 未初始化(该 host 从未分配过路由)时三条 absent,不吐假 0 |
+| host `:8899/metrics` | `openclaw_agent_loop_last_tick_epoch{loop}` / `openclaw_agent_build_info{sha}` / `openclaw_route_ensure_failures_total` / `openclaw_host_ssm_agent_up` | agent 自身健康(v4)。loop label 只吐实际启用的线程:poll/disk_gc/disk_report 常驻,dispatch/housekeeping 仅 pull 模式 |
+| edge `:9145/metrics` | `edge_connections{state}` + `edge_worker_{connections_limit,processes}` + `edge_up` | **容量红线②**:连接耗尽=全部租户连不上。`edge_up` 只证 nginx 活着,业务就绪用 blackbox probe ALB `/healthz` |
+
+**发现标签约定**:`tag:Project=openclaw` + `tag:Role=metal-host|edge`(LaunchTemplate 实例级打的,随 ASG 重建继承;存量 edge 需 instance refresh 或手工补 tag)。
+
+**告警阈值样例**:
+```yaml
+# 端口水位:quarantined 与 used 一样不可分配,合并计算
+- alert: HostDnatPortsHigh
+  expr: (openclaw_host_dnat_ports_used + openclaw_host_dnat_ports_quarantined) / openclaw_host_dnat_ports_total > 0.8
+# 连接近似压力(估算口径:active 不含 upstream,WS 主导 ×2)
+- alert: EdgeConnPressure
+  # 分子分母都按 instance 聚合(codex 评审:sum by 丢 job label 而分母保留 →
+  # 默认向量匹配无样本、告警永不触发)
+  expr: 2 * sum by (instance) (edge_connections{state="active"}) / sum by (instance) (edge_worker_processes * edge_worker_connections_limit) > 0.7
+# agent loop 卡死(HTTP 还活着但后台线程 hang 的假绿场景)
+- alert: AgentLoopStale
+  expr: time() - openclaw_agent_loop_last_tick_epoch{loop=~"poll|disk_report"} > 60
+- alert: AgentLoopStaleSlow
+  expr: time() - openclaw_agent_loop_last_tick_epoch{loop=~"disk_gc|housekeeping"} > 300
+# SSM agent 挂(数据面照跑但控制面失联;本 scrape 通道独立于 SSM,拉得到)
+- alert: HostSsmAgentDown
+  expr: openclaw_host_ssm_agent_up == 0
+```
+
+## 6. OS 级指标:平台使用者自装(对标 K8s node_exporter DaemonSet 模式)
+
+平台只暴露自己组件才知道的指标;OS 级 CPU/Mem/Disk(`node_memory_*`/`node_filesystem_*` 等)由**平台使用者**自选 exporter(node_exporter/CW Agent/自研)并自装。样例(在你自己 checkout 的 `init-host.sh`(host,arm64)/`install-edge.sh`(edge,x86_64)末尾追加):
+
+```bash
+# ---- node_exporter 自装样例(按架构选包 + SHA256 校验 + systemd)----
+NE_VER="1.8.2"
+case "$(uname -m)" in
+  aarch64) NE_ARCH="arm64";  NE_SHA256="<官网 sha256sums 里 arm64 包的值>" ;;
+  x86_64)  NE_ARCH="amd64";  NE_SHA256="<官网 sha256sums 里 amd64 包的值>" ;;
+esac
+curl -sL -o /tmp/ne.tgz "https://github.com/prometheus/node_exporter/releases/download/v${NE_VER}/node_exporter-${NE_VER}.linux-${NE_ARCH}.tar.gz"
+echo "${NE_SHA256}  /tmp/ne.tgz" | sha256sum -c - || exit 1
+tar xzf /tmp/ne.tgz -C /opt && ln -sf /opt/node_exporter-${NE_VER}.linux-${NE_ARCH}/node_exporter /usr/local/bin/node_exporter
+cat > /etc/systemd/system/node_exporter.service <<'UNIT'
+[Unit]
+Description=node_exporter
+[Service]
+ExecStart=/usr/local/bin/node_exporter --web.listen-address=:9100
+Restart=always
+User=nobody
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload && systemctl enable --now node_exporter
+```
+
+**安全注意事项(必读,两条都是硬要求)**:
+1. **SG 入站只允许 Prometheus 所在 SG(或其 /32),禁止放行 VPC CIDR。** 原因:microVM 出网经 MASQUERADE 后源地址=host VPC IP,访问**另一台** host/edge 的 :9100 时 SG 无法区分租户流量与节点流量——放 VPC CIDR 等于把宿主机 OS 指标暴露给所有租户 microVM。
+2. **自装端口必须加进 guest→host 的 INPUT DROP 清单。** 平台已预防性把 9100 加进 `launch-vm.sh`/`migrate-vm.sh` 的 DROP 清单(本机维度);若你用非标准端口,须自行在两个脚本的 `for _port in ...` 行追加。
+
+**ec2_sd job 样例**(复用平台实例标签,把 port 换成你的 exporter 端口):照抄上文 `openclaw-edge-nginx` job,`port: 9100`、`Role` 按 host/edge 选。
+
+**升级责任声明**:修改 `init-host.sh`/`install-edge.sh` 属于你维护自己的脚本分支;平台升级这两个脚本时的合并冲突由使用者自行解决——它们不是平台的稳定扩展接口。

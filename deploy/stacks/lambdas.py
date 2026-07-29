@@ -12,6 +12,7 @@ from aws_cdk import (
     aws_sns as sns,
     aws_wafv2 as wafv2,
     aws_sqs as sqs,
+    aws_secretsmanager as secretsmanager,
     aws_lambda_event_sources as lambda_event_sources,
     BundlingOptions,
     BundlingFileAccess,
@@ -47,7 +48,11 @@ def build_lambdas(self, ctx):
     tenant_idp_table = getattr(ctx, "tenant_idp_table", None)
     version_snapshots_table = getattr(ctx, "version_snapshots_table", None)  # #217 V2
     tenant_secrets_table = getattr(ctx, "tenant_secrets_table", None)
+    tenant_stats_table = getattr(ctx, "tenant_stats_table", None)
     tenants_table = getattr(ctx, "tenants_table", None)
+    tenant_stats_enabled = bool(
+        (CFG.get("tenant_stats", {}) or {}).get("enabled", False)
+    )
 
     # ========== Lambda Shared Policy ==========
     #
@@ -237,6 +242,9 @@ def build_lambdas(self, ctx):
         "BATCH_JOBS_TABLE": batch_jobs_table.table_name,
         "TENANT_IDP_TABLE": tenant_idp_table.table_name,  # #97 档A /tenantmatch
         "TENANT_SECRETS_TABLE": tenant_secrets_table.table_name,  # #187 P1 gateway token
+        "TENANT_QUERY_ENABLED": str(
+            (CFG.get("tenant_query", {}) or {}).get("enabled", False)
+        ).lower(),
         "PARAM_REGISTRY_TABLE": param_registry_table.table_name,
         "RECIPIENT_KEYS_TABLE": recipient_keys_table.table_name,
         "VERSION_SNAPSHOTS_TABLE": version_snapshots_table.table_name,  # #217 V2
@@ -285,6 +293,8 @@ def build_lambdas(self, ctx):
         "EXTERNAL_AUTHZ_SECRET": _external_authz_secret_ref,
         "PROJECT_VERSION": _read_pyproject_version(),
     }
+    if tenant_stats_enabled:
+        _api_env["TENANT_STATS_TABLE"] = tenant_stats_table.table_name
 
     api_fn = _lambda.Function(
         self,
@@ -326,6 +336,21 @@ def build_lambdas(self, ctx):
         memory_size=2048,
         environment=dict(_api_env),
     )
+    pagination_secret = secretsmanager.Secret(
+        self,
+        "PaginationCursorSecret",
+        secret_name="openclaw/pagination-cursor",
+        generate_secret_string=secretsmanager.SecretStringGenerator(
+            secret_string_template='{"purpose":"pagination-aes-gcm"}',
+            generate_string_key="key",
+            password_length=43,
+            exclude_punctuation=True,
+        ),
+    )
+    api_fn.add_environment(
+        "PAGINATION_AES_KEY",
+        pagination_secret.secret_value_from_json("key").unsafe_unwrap(),
+    )
     # ── Lambda Version + Alias "live" (#149) ──────────────────────────────
     # 目标拓扑: API GW → alias "live" → Version N
     # 每次部署自动发新 Version,alias "live" 始终指向最新。日后回滚只需
@@ -339,11 +364,43 @@ def build_lambdas(self, ctx):
         version=api_fn_version,
     )
     tenants_table.grant_read_write_data(api_fn)
+    if tenant_stats_enabled:
+        tenant_stats_table.grant_read_data(api_fn)
     hosts_table.grant_read_write_data(api_fn)
     groups_table.grant_read_write_data(api_fn)
     version_snapshots_table.grant_read_data(api_fn)  # #217 V2 — pull-image 只读快照
     # #376 — create_image_snapshot 落新快照:只加 PutItem(最小权限,不给 Delete/Update)。
     version_snapshots_table.grant(api_fn, "dynamodb:PutItem")
+
+    if tenant_stats_enabled:
+        tenant_stats_fn = _lambda.Function(
+            self,
+            "TenantStatsWriter",
+            function_name="openclaw-tenant-stats-writer",
+            runtime=_lambda.Runtime.PYTHON_3_12,
+            architecture=_lambda.Architecture.ARM_64,
+            handler="handler.lambda_handler",
+            code=_lambda.Code.from_asset("deploy/lambda/tenant_stats"),
+            timeout=Duration.seconds(50),
+            memory_size=8192,
+            reserved_concurrent_executions=1,
+            environment={
+                "TENANTS_TABLE": tenants_table.table_name,
+                "TENANT_STATS_TABLE": tenant_stats_table.table_name,
+                "ASSETS_BUCKET": assets_bucket.bucket_name,
+                "ROOTFS_PREFIX": CFG["s3"]["rootfs_prefix"],
+                "STATS_SCAN_SEGMENTS": "8",
+            },
+        )
+        tenants_table.grant_read_data(tenant_stats_fn)
+        tenant_stats_table.grant_read_write_data(tenant_stats_fn)
+        assets_bucket.grant_read(tenant_stats_fn)
+        events.Rule(
+            self,
+            "TenantStatsSchedule",
+            schedule=events.Schedule.rate(Duration.minutes(1)),
+            targets=[targets.LambdaFunction(tenant_stats_fn)],
+        )
     # #152/#118 — the ClawPool credential-injection CMK ARN. Added ONLY when the
     # feature is on so synth stays byte-identical when off (no key on the env).
     # The API uses it as the real gate: it rejects injected_credentials whose
@@ -964,6 +1021,8 @@ def build_lambdas(self, ctx):
     tenants_resource = api.root.add_resource("tenants")
     tenants_resource.add_method("GET", _li(), **key_required)
     tenants_resource.add_method("POST", _li(), **key_required)
+    tenant_stats_resource = api.root.add_resource("tenants-stats")
+    tenant_stats_resource.add_method("GET", _li(), **key_required)
 
     # self-service: POST /tenants/self — a logged-in user provisions their
     # own node. Literal `self` is matched before the `{id}` greedy param by

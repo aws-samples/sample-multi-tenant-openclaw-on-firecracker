@@ -156,6 +156,39 @@ def _redact_tenant(item):
     return {k: v for k, v in item.items() if k not in _TENANT_SECRET_FIELDS}
 
 
+def _dnat_rule_values(host_port, guest_ip):
+    """Return shell-quoted values shared by the exact DNAT commands."""
+    port = shlex.quote(str(int(host_port)))
+    destination = shlex.quote(f"{guest_ip}:{clients.VM_PORT_BASE}")
+    return port, destination
+
+
+def _dnat_add_idempotent_cmd(host_port, guest_ip):
+    port, destination = _dnat_rule_values(host_port, guest_ip)
+    check = (
+        f"sudo iptables --wait 3 -t nat -C PREROUTING -p tcp --dport {port} "
+        f"-j DNAT --to-destination {destination}"
+    )
+    add = (
+        f"sudo iptables --wait 3 -t nat -A PREROUTING -p tcp --dport {port} "
+        f"-j DNAT --to-destination {destination}"
+    )
+    return f"({check} 2>/dev/null || {add})"
+
+
+def _dnat_remove_all_cmd(host_port, guest_ip):
+    port, destination = _dnat_rule_values(host_port, guest_ip)
+    check = (
+        f"sudo iptables --wait 3 -t nat -C PREROUTING -p tcp --dport {port} "
+        f"-j DNAT --to-destination {destination}"
+    )
+    delete = (
+        f"sudo iptables --wait 3 -t nat -D PREROUTING -p tcp --dport {port} "
+        f"-j DNAT --to-destination {destination}"
+    )
+    return f"while {check} 2>/dev/null; do {delete} || exit $?; done"
+
+
 # ── #187 P1 — pre-mint gateway token + reveal (11-ENGINE-TRANSFORM D 段)──────
 # 建租户时预铸 32 字节随机 token,KMS 信封绑 tenant_id 加密,密文落 openclaw-tenant-secrets
 # 表(#353 起无 TTL,长存)。SSM 命令把密文按位置 12 传给 launch-vm.sh;host
@@ -1583,6 +1616,8 @@ def create_tenant(body=None, event=None):
         # BEFORE the VM boots (kills the host-agent read-back race; see above).
         "channel_secret": channel_secret,
     }
+    if item["rootfs_version"] and len(item["rootfs_version"].encode("utf-8")) <= 256:
+        item["q_rootfs_version"] = item["rootfs_version"]
     if owner_id:  # issue #80 — record ownership for IDOR enforcement
         item["owner_id"] = owner_id
         item["uuid"] = owner_id  # #93 — stable Cognito-sub principal (= owner_id);
@@ -2028,9 +2063,7 @@ def delete_tenant(tenant_id, query_params, event=None):
         if _hp and _gip:
             ssm_dispatch._ssm_run(
                 host_id,
-                f"sudo iptables --wait 3 -t nat -D PREROUTING -p tcp --dport {_hp} "
-                f"-j DNAT --to-destination {_gip}:{clients.VM_PORT_BASE} "
-                f"2>/dev/null || true",
+                _dnat_remove_all_cmd(_hp, _gip),
             )
         # #134 修:delete 显式清 Redis route:{tenant} 键(contract §8 要求,原实现漏了 →
         # edge 仍缓存指向已删 VM 的 host:port,DNAT 已摘 → 502)。控制面无 Redis 客户端,
@@ -2555,10 +2588,7 @@ def tenant_action(tenant_id, action, body=None, event=None):
         launch_cmd = ssm_dispatch._launch_vm_wake_cmd(tenant_id, item)
         # Re-add DNAT after restart
         dnat_cmd = (
-            (
-                f"sudo iptables --wait 3 -t nat -A PREROUTING "
-                f"-p tcp --dport {host_port} -j DNAT --to-destination {guest_ip}:{clients.VM_PORT_BASE}"
-            )
+            _dnat_add_idempotent_cmd(host_port, guest_ip)
             if guest_ip and host_port
             else ""
         )
@@ -2574,17 +2604,21 @@ def tenant_action(tenant_id, action, body=None, event=None):
         stop_cmd = f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num}"
         # Remove DNAT rule
         dnat_del = (
-            (
-                f"sudo iptables --wait 3 -t nat -D PREROUTING "
-                f"-p tcp --dport {host_port} -j DNAT --to-destination {guest_ip}:{clients.VM_PORT_BASE} 2>/dev/null || true"
-            )
+            _dnat_remove_all_cmd(host_port, guest_ip)
             if guest_ip and host_port
             else ""
         )
         full_cmd = stop_cmd
         if dnat_del:
-            full_cmd += f" && {dnat_del}"
-        ssm_dispatch._ssm_run(item["host_id"], full_cmd)
+            # Keep cleanup best-effort without letting it mask stop-vm failure.
+            full_cmd += f" && ({dnat_del} || true)"
+        if not ssm_dispatch._ssm_run(item["host_id"], full_cmd):
+            return utils._resp(
+                502,
+                {
+                    "error": "stop-vm failed (SSM timeout/error); tenant status was not changed"
+                },
+            )
         new_status = "stopped"
     elif action == "start":
         vm_num = int(item.get("vm_num", 1))
@@ -2594,17 +2628,20 @@ def tenant_action(tenant_id, action, body=None, event=None):
         # 到 launch-vm 幂等段;老版本只填 4 位、CHAT_EP_ENABLED 恒空致唤醒漂移。
         launch_cmd = ssm_dispatch._launch_vm_wake_cmd(tenant_id, item)
         dnat_cmd = (
-            (
-                f"sudo iptables --wait 3 -t nat -A PREROUTING "
-                f"-p tcp --dport {host_port} -j DNAT --to-destination {guest_ip}:{clients.VM_PORT_BASE}"
-            )
+            _dnat_add_idempotent_cmd(host_port, guest_ip)
             if guest_ip and host_port
             else ""
         )
         full_cmd = launch_cmd
         if dnat_cmd:
             full_cmd += f" && {dnat_cmd}"
-        ssm_dispatch._ssm_run(item["host_id"], full_cmd, timeout=300)
+        if not ssm_dispatch._ssm_run(item["host_id"], full_cmd, timeout=300):
+            return utils._resp(
+                502,
+                {
+                    "error": "start-vm failed (SSM timeout/error); tenant status was not changed"
+                },
+            )
         new_status = "running"
     elif action == "reset":
         vm_num = int(item.get("vm_num", 1))
@@ -2617,10 +2654,7 @@ def tenant_action(tenant_id, action, body=None, event=None):
         # 到 launch-vm 幂等段;老版本只填 4 位、CHAT_EP_ENABLED 恒空致唤醒漂移。
         launch_cmd = ssm_dispatch._launch_vm_wake_cmd(tenant_id, item)
         dnat_cmd = (
-            (
-                f"sudo iptables --wait 3 -t nat -A PREROUTING "
-                f"-p tcp --dport {host_port} -j DNAT --to-destination {guest_ip}:{clients.VM_PORT_BASE}"
-            )
+            _dnat_add_idempotent_cmd(host_port, guest_ip)
             if guest_ip and host_port
             else ""
         )
@@ -2651,10 +2685,7 @@ def tenant_action(tenant_id, action, body=None, event=None):
         # 到 launch-vm 幂等段;老版本只填 4 位、CHAT_EP_ENABLED 恒空致唤醒漂移。
         launch_cmd = ssm_dispatch._launch_vm_wake_cmd(tenant_id, item)
         dnat_cmd = (
-            (
-                f"sudo iptables --wait 3 -t nat -A PREROUTING "
-                f"-p tcp --dport {host_port} -j DNAT --to-destination {guest_ip}:{clients.VM_PORT_BASE}"
-            )
+            _dnat_add_idempotent_cmd(host_port, guest_ip)
             if guest_ip and host_port
             else ""
         )
@@ -2793,6 +2824,11 @@ def tenant_action(tenant_id, action, body=None, event=None):
         ).get("Item", {})
         update_expr += ", rootfs_version = :rv"
         expr_values[":rv"] = host.get("rootfs_version", "")
+        if expr_values[":rv"] and len(expr_values[":rv"].encode("utf-8")) <= 256:
+            update_expr += ", q_rootfs_version = :qrv"
+            expr_values[":qrv"] = expr_values[":rv"]
+        else:
+            update_expr += " REMOVE q_rootfs_version"
 
     clients.tenants_table.update_item(
         Key={"id": tenant_id},

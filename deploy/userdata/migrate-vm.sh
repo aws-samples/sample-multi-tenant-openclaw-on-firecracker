@@ -85,8 +85,10 @@ _harden_restored_tap() {
   # 东西向超网 DROP:堵 guest→其它租户 /30(同 SUBNET_PREFIX/16)。这是「不跨租户串网」的核心。
   sudo iptables -C FORWARD -i "${tap}" -d "${tenant_supernet}" -j DROP 2>/dev/null || \
     sudo iptables -I FORWARD 1 -i "${tap}" -d "${tenant_supernet}" -j DROP
-  # 管理端口 INPUT DROP:堵 guest→host 的 host-agent(:8899/:9090)+ sshd(:22)。
-  for _port in 8899 9090 22; do
+  # 管理端口 INPUT DROP:堵 guest→host 的 host-agent(:8899/:9090)+ sshd(:22)
+  # + 9100(#387 防御性:用户按 Runbook 自装 node_exporter 的标准端口,与
+  # launch-vm.sh 清单保持同步,防漂移)。
+  for _port in 8899 9090 22 9100; do
     sudo iptables -C INPUT -i "${tap}" -p tcp --dport "${_port}" -j DROP 2>/dev/null || \
       sudo iptables -I INPUT 1 -i "${tap}" -p tcp --dport "${_port}" -j DROP
   done

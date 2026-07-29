@@ -124,7 +124,7 @@ Host an isolated AI agent instance for each of thousands of end users or tenants
 
 **Multi-tenant scenarios with compliance requirements on isolation strength**
 
-In industries such as finance and exchanges that have strong requirements on tenant isolation and data residue, use virtual machine-level isolation to meet the compliance expectation that "privilege escalation within a single tenant does not spill over."
+In industries such as finance that have strong requirements on tenant isolation and data residue, use virtual machine-level isolation to meet the compliance expectation that "privilege escalation within a single tenant does not spill over."
 
 **Self-service provisioning of AI assistants for end users**
 

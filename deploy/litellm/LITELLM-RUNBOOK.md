@@ -36,7 +36,7 @@ cd ~/openclaw/deploy/litellm
 
 1. 没有 `.env` 就从 `.env.example` 初始化（600）；`LITELLM_MASTER_KEY` / `POSTGRES_PASSWORD`
    为空则用 `openssl rand` 现生成写回 `.env`（值脱敏不打印）。**绝不硬编码、绝不迁旧账号值。**
-2. 把权威 config 的 `__GUARDRAIL_ID__` sed 成 `GUARDRAIL_ID`（默认 `od6s8sm533fs`）产出
+2. 把权威 config 的 `__GUARDRAIL_ID__` sed 成 `GUARDRAIL_ID`（你自己账号的 guardrail id）产出
    `config.runtime.yaml`，并把 config 里的 `master_key` 行改成 `os.environ/LITELLM_MASTER_KEY`
    （运行态由容器环境变量覆盖，不用 config 里的 `[REDACTED]` 字面值）。
 3. `docker compose up -d`。

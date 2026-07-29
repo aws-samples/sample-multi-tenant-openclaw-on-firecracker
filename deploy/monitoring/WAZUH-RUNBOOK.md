@@ -68,4 +68,4 @@ host-agent `/metrics` → ADOT → AMP → Grafana(`deploy/stack.py` AMP/AMG 段
 ## 现状标注(诚实)
 
 - ✅ 真实可部署:compose 栈、自定义规则、GuardDuty→SNS(CDK)、AMP/Grafana(已有)。
-- ⏳ 待真机:在 146 监控 EC2 上 `docker compose up` + 测试 VM 装 wazuh-agent 跑通端到端告警上屏。这步是基础设施部署(需起监控 EC2),runbook 给确切步骤,真机执行时按 §3 验证告警上屏。
+- ⏳ 待真机:在监控 EC2 上 `docker compose up` + 测试 VM 装 wazuh-agent 跑通端到端告警上屏。这步是基础设施部署(需起监控 EC2),runbook 给确切步骤,真机执行时按 §3 验证告警上屏。

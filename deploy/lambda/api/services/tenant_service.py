@@ -1274,7 +1274,7 @@ def create_tenant(body=None, event=None):
     # this is NOT a consumer replay, enqueue the create and return 202 — the
     # consumer drains the queue at its reserved-concurrency rate, so a burst of
     # 380 POST /tenants no longer fans out 380 synchronous SSM calls and trips the
-    # SSM single-instance concurrency wall (795: 40 concurrent → 11 TimedOut).
+    # SSM single-instance concurrency wall (measured: 40 concurrent → 11 TimedOut).
     # Parallelism is preserved: MessageGroupId = tenant_id means every create is
     # its own FIFO group and they consume concurrently (only same-tenant ops
     # serialize). We stamp the already-generated tenant_id into the queued body so
@@ -2010,7 +2010,7 @@ def delete_tenant(tenant_id, query_params, event=None):
         # Stop VM via SSM.
         # #268 — stop-vm 是关键副作用,不是 best-effort:失败=VM 孤儿(fc 进程还活着
         # 占内存/vCPU)+ 若继续标 deleted 则账本回退但 VM 没停(容量统计失真)。真机实测
-        # (新加坡 795,#263 削峰测试):create 的 launch-vm 挤爆单 host SSM
+        # (#263 削峰测试):create 的 launch-vm 挤爆单 host SSM
         # CommandWorkersLimit=5,delete 的 stop-vm 排队 >30s → _ssm_run 返 False,旧代码
         # 忽略返回值照常标 deleted → 236 残留目录 + 27 孤儿 fc。这里 fail-loud:stop-vm
         # 失败则回滚 status 到删除前(复用 _abort_restore_status,CAS 保证只回滚自己翻的

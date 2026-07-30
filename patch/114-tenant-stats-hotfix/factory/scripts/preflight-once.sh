@@ -103,6 +103,53 @@ if [[ -f "$KIT/manifest.json" ]]; then
   if [[ "$ST" == "READY" ]]; then ok "manifest status READY"
   else bad "manifest status $ST — only a READY kit may run unattended"; fi
 
+  CONFIG_PATH="${OC_PATCH_CUSTOMER_CONFIG:-}"
+  CONFIG_SHA="$(jq -r '.target_confirmation.customer_config_sha256 // ""' \
+    "$KIT/manifest.json")"
+  if [[ -z "$CONFIG_PATH" ]]; then
+    bad "OC_PATCH_CUSTOMER_CONFIG must name the customer config.yml used to generate this kit"
+  elif [[ ! -f "$CONFIG_PATH" || -L "$CONFIG_PATH" ]]; then
+    bad "customer config is missing, not regular, or a symlink: $CONFIG_PATH"
+  elif [[ "$(sha256sum "$CONFIG_PATH" | awk '{print $1}')" == "$CONFIG_SHA" ]]; then
+    ok "customer config matches the manifest source hash"
+  else
+    bad "customer config changed after kit generation; regenerate and review the kits"
+  fi
+
+  HEADERS_PATH="${OC_PATCH_HTTP_HEADERS_FILE:-}"
+  EXPECTED_HEADERS_SHA="$(jq -r \
+    '.target_confirmation.authenticated_probe_headers_sha256 // ""' \
+    "$KIT/manifest.json")"
+  if [[ -z "$HEADERS_PATH" ]]; then
+    bad "OC_PATCH_HTTP_HEADERS_FILE must name the authenticated probe headers confirmed by the operator"
+  elif [[ ! -f "$HEADERS_PATH" || -L "$HEADERS_PATH" ]]; then
+    bad "probe headers file is missing, not regular, or a symlink: $HEADERS_PATH"
+  elif [[ ! "$EXPECTED_HEADERS_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+    bad "manifest has no valid authenticated probe headers hash"
+  elif [[ "$(sha256sum "$HEADERS_PATH" | awk '{print $1}')" == "$EXPECTED_HEADERS_SHA" ]]; then
+    ok "authenticated probe headers match the operator-confirmed manifest hash"
+  else
+    bad "probe headers changed after API confirmation; rediscover and review the kits"
+  fi
+
+  if jq -e --slurpfile env_file "$ENVJSON" '
+      ($env_file[0]) as $env
+      | .target_confirmation as $target
+      | $target.entrypoint_kind == "explicit-rest-resources"
+      and $target.proxy_resources_are_not_targets == true
+      and $target.confirmed_api_id == $env.control_plane_api.id
+      and $target.confirmed_stage == $env.control_plane_api.stage
+      and $target.confirmed_client_url == $env.control_plane_api.configured_client_url
+      and $target.authenticated_probe_headers_sha256
+          == $env.control_plane_api.probe_headers_sha256
+      and $env.control_plane_api.confirmed == true
+      and $env.control_plane_api.entrypoint_kind == "explicit-rest-resources"
+    ' "$KIT/manifest.json" >/dev/null 2>&1; then
+    ok "operator-confirmed explicit REST API matches environment.json"
+  else
+    bad "manifest target and environment.json disagree, or target is a proxy resource"
+  fi
+
   # Every generated lib file and every packaged runtime file is hash-bound. Checking only the
   # three lane entrypoints lets a tampered helper or driver reach the live runner.
   if jq -e '.kit_files | type == "object" and length > 0' "$KIT/manifest.json" >/dev/null 2>&1; then
@@ -168,6 +215,12 @@ if [[ -f "$KIT/manifest.json" ]]; then
       # defect anywhere else.
       if [[ -n "$LAMBDA_DIR" ]]; then
         case "$LANE" in
+          tenantstats)
+            backend="$(jq -r '.tenant_stats_backends[0].writer.function_name // ""' \
+              "$KIT/manifest.json")"
+            [[ -n "$backend" ]] \
+              && ok "tenant statistics backend declared for $backend" \
+              || bad "tenant statistics backend target is missing" ;;
           ddb)
             # A DDB kit ships no file: the whole change is a table SETTING, declared in the
             # manifest and baked into the recipe. Zero artifacts is correct here.
@@ -211,7 +264,29 @@ say "== 5. target reachability =="
 # A control-plane kit has no host fleet: demanding a host snapshot would reject a perfectly
 # valid Lambda-only environment, and passing without checking the Lambda would let the run
 # discover a missing permission after the interview. Check what this kit actually touches.
-if [[ "$LANE" == "ddb" ]]; then
+if [[ "$LANE" == "tenantstats" ]]; then
+  API_FN="$(jq -r '.lambda_link.function // ""' "$ENVJSON")"
+  TBL="$(jq -r '.tenant_stats_backends[0].table.name' "$KIT/manifest.json")"
+  if aws lambda get-function-configuration --region "$REGION" \
+      --function-name "$API_FN" --query FunctionName --output text >/dev/null 2>&1; then
+    ok "source API Lambda contract is readable"
+  else
+    bad "cannot read openclaw-api to cross-check writer inputs"
+  fi
+  set +e
+  TABLE_READ="$(aws dynamodb describe-table --region "$REGION" --table-name "$TBL" \
+    --query 'Table.TableStatus' --output text 2>&1)"
+  TABLE_READ_RC=$?
+  set -e
+  if [[ "$TABLE_READ_RC" -eq 0 ]]; then
+    ok "table $TBL exists; apply will verify its exact schema"
+  elif grep -q 'ResourceNotFoundException' <<< "$TABLE_READ"; then
+    ok "table $TBL is absent; apply will create it before the writer"
+  else
+    bad "cannot determine whether table $TBL exists: ${TABLE_READ:0:160}"
+  fi
+  mapfile -t HOSTS < <(printf '')
+elif [[ "$LANE" == "ddb" ]]; then
   # A DDB kit's target is a table setting, so reachability means "can I read the setting this
   # kit owns". Checking a Lambda here would report a null function and fail a valid kit.
   TBL="$(jq -r '.ddb_settings[0].table' "$KIT/manifest.json")"
@@ -346,7 +421,34 @@ if [[ -f "$KIT/manifest.json" ]]; then
 fi
 
 say "== 7. write permissions the run needs =="
-if [[ "$LANE" == "ddbnew" ]]; then
+if [[ "$LANE" == "tenantstats" ]]; then
+  ACTIONS=(
+    dynamodb:CreateTable dynamodb:DescribeTable dynamodb:ListTagsOfResource
+    dynamodb:DescribeContinuousBackups dynamodb:UpdateContinuousBackups dynamodb:GetItem
+    iam:GetRole iam:CreateRole iam:ListRoleTags iam:GetRolePolicy iam:PutRolePolicy iam:TagRole
+    lambda:GetFunction lambda:GetFunctionConcurrency lambda:CreateFunction
+    lambda:PutFunctionConcurrency lambda:InvokeFunction lambda:AddPermission
+    lambda:RemovePermission lambda:GetPolicy lambda:TagResource
+    events:DescribeRule events:ListTagsForResource events:ListTargetsByRule
+    events:PutRule events:PutTargets events:EnableRule events:DisableRule
+    events:RemoveTargets events:TagResource
+  )
+  SIM="$(aws iam simulate-principal-policy --policy-source-arn "$(principal_arn)" \
+    --action-names "${ACTIONS[@]}" \
+    --query 'EvaluationResults[].[EvalActionName,EvalDecision]' \
+    --output text 2>/dev/null || true)"
+  if [[ -z "$SIM" ]]; then
+    bad "iam:SimulatePrincipalPolicy unavailable — backend permissions unverified"
+  else
+    for act in "${ACTIONS[@]}"; do
+      dec="$(awk -F '\t' -v wanted="$act" '$1 == wanted { print $2; exit }' <<< "$SIM")"
+      if [[ "$dec" == "allowed" ]]; then ok "$act allowed"
+      elif [[ -z "$dec" ]]; then bad "$act has no simulation result"
+      else bad "$act is $dec — backend apply would fail partway"; fi
+    done
+  fi
+  verdict
+elif [[ "$LANE" == "ddbnew" ]]; then
   TBL="$(jq -r '.ddb_tables[0].table' "$KIT/manifest.json")"
   ACTIONS=(dynamodb:CreateTable dynamodb:DescribeTable dynamodb:UpdateContinuousBackups)
   SIM="$(aws iam simulate-principal-policy --policy-source-arn "$(principal_arn)"     --action-names "${ACTIONS[@]}"     --query 'EvaluationResults[].[EvalActionName,EvalDecision]' --output text 2>/dev/null || true)"

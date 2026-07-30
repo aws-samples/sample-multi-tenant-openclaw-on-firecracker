@@ -24,6 +24,7 @@ def lane(manifest: dict[str, object]) -> str:
         ("ddb_settings", "ddb"),
         ("ddb_tables", "ddb-create"),
         ("api_routes", "api-gateway"),
+        ("tenant_stats_backends", "tenant-stats-backend"),
     )
     selected = [
         name

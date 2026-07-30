@@ -30,8 +30,10 @@
 ## Step 0 — DISCOVER (read-only probe)
 
 ```bash
-# Run discover-env.sh to populate environment.json
-bash lib/discover-env.sh
+# discover-env.sh REQUIRES the target region as its first arg (it exits 2 without it).
+# This is the one value the operator supplies by hand; everything else is discovered.
+REGION=<your-deploy-region>     # e.g. ap-southeast-1
+bash lib/discover-env.sh "$REGION"
 # Review environment.json: region, account, API URL, ASG, LT version, host IDs
 cat environment.json
 ```
@@ -179,12 +181,43 @@ aws lambda update-function-configuration --function-name $API_FN --region $REGIO
   python3 -c 'import sys,json; d=json.load(sys.stdin); d["TENANT_QUERY_ENABLED"]="false"; print(",".join(f"{k}={v}" for k,v in d.items()))')}"
 ```
 
-### 4b. GET /tenants-stats API route (AUTO_CLI)
+### 4b. GET /tenants-stats API route (AUTO_CLI) — only if `tenant_stats.enabled=true`
 
+NOTE: do NOT use `lib/apply-api-routes.sh` here — the copy shipped in this kit is
+patch 376's (it builds `POST /create-image-snapshot` cloned from `GET /images`, and
+takes `plan|apply|verify|rollback <rest-api-id> <stage> <region>`). This patch needs
+`GET /tenants-stats`, a root resource with the same auth as `GET /tenants`
+(lambdas.py:1024-1025: method GET, AWS_PROXY to the api Lambda, api-key required).
+Clone it inline:
 ```bash
 API_ID=$(jq -r .api_id environment.json)
-# Create /tenants-stats resource + GET method (clone auth from existing routes)
-bash lib/apply-api-routes.sh apply $REGION
+STAGE=$(jq -r .api_stage environment.json)     # e.g. v1
+ROOT_ID=$(aws apigateway get-resources --rest-api-id "$API_ID" --region "$REGION" \
+  --query "items[?path=='/'].id" --output text)
+# reuse the exact AWS_PROXY integration URI + auth of the existing GET /tenants
+TENANTS_ID=$(aws apigateway get-resources --rest-api-id "$API_ID" --region "$REGION" \
+  --query "items[?path=='/tenants'].id" --output text)
+INT_URI=$(aws apigateway get-integration --rest-api-id "$API_ID" --region "$REGION" \
+  --resource-id "$TENANTS_ID" --http-method GET --query uri --output text)
+AUTH_TYPE=$(aws apigateway get-method --rest-api-id "$API_ID" --region "$REGION" \
+  --resource-id "$TENANTS_ID" --http-method GET --query authorizationType --output text)
+AUTHZ_ID=$(aws apigateway get-method --rest-api-id "$API_ID" --region "$REGION" \
+  --resource-id "$TENANTS_ID" --http-method GET --query authorizerId --output text 2>/dev/null)
+# create /tenants-stats resource + GET method + integration, matching GET /tenants
+STATS_ID=$(aws apigateway create-resource --rest-api-id "$API_ID" --region "$REGION" \
+  --parent-id "$ROOT_ID" --path-part tenants-stats --query id --output text)
+aws apigateway put-method --rest-api-id "$API_ID" --region "$REGION" \
+  --resource-id "$STATS_ID" --http-method GET \
+  --authorization-type "$AUTH_TYPE" ${AUTHZ_ID:+--authorizer-id "$AUTHZ_ID"} \
+  --api-key-required
+aws apigateway put-integration --rest-api-id "$API_ID" --region "$REGION" \
+  --resource-id "$STATS_ID" --http-method GET \
+  --type AWS_PROXY --integration-http-method POST --uri "$INT_URI"
+# redeploy the stage so the new route goes live
+aws apigateway create-deployment --rest-api-id "$API_ID" --region "$REGION" --stage-name "$STAGE"
+# verify (private API: run from inside the VPC with the API key; 503 = feature not
+# yet configured/no snapshot, still proves the route resolves — NOT 403/404):
+# curl -s -o /dev/null -w '%{http_code}' -H "x-api-key: <key>" "$CTRL_API_BASE/tenants-stats"
 ```
 
 ### 4c. MANUAL_CLI_REVIEW items (operator reviews, then runs the exact CLI)
@@ -286,13 +319,20 @@ Rollback: `events remove-targets` + `events delete-rule` + `lambda delete-functi
 `iam delete-role-policy`/`delete-role`. The `openclaw-tenant-stats` table is RETAIN
 (stateful) — delete only if abandoning the feature.
 
-**4. LT UserData update for `{{HOST_USER_HOOK}}`** — only if `user_hooks.host_init` configured.
-```bash
-# decode current LT -> patch the {{HOST_USER_HOOK}} block -> re-encode -> new LT version,
-# then roll the ASG onto it. lib/apply-lt.sh drives the MIP-safe roll; lib/lt-userdata.py
-# does the CDK-exact gzip+base64 (refuses to ship a template still containing {{ }}).
-bash lib/apply-lt.sh roll "$REGION"
-```
+**4. LT UserData update for the `{{HOST_USER_HOOK}}` block** — only if `user_hooks.host_init`
+is configured. This changes what FUTURE hosts run, so it edits the Launch Template UserData.
+⚠️ **This monitoring kit does NOT ship the LT re-bake tooling** (`lib/apply-lt.sh` +
+`lib/lt-userdata.py`) — only `discover-env.sh` and `apply-api-routes.sh` are in `lib/`.
+The LT UserData is baked (gzip+base64, CDK-exact, refuses any template still containing
+`{{ }}`), so it must NOT be hand-edited. If you need the host user-hook on future hosts:
+- the shipped `launch-template/init-host.sh.patched` is the new rendered source of truth;
+- perform the LT roll with the `apply-lt.sh`/`lt-userdata.py` tools from an LT-touching
+  patch kit (e.g. patch 315), which: decode the CURRENT LT version's already-rendered
+  UserData → apply only the changed hunk → re-encode → publish a new immutable LT version →
+  MIP-safe ASG instance-refresh, validating one new host (no `{{}}` in decoded UserData;
+  registers into `openclaw-hosts`; ASG lifecycle CONTINUE) before rolling the fleet.
+Running hosts are unaffected until they are replaced. Skip this item entirely if
+`user_hooks.host_init` is not set (the default).
 
 **5. GSIs on `openclaw-tenants` — MANDATORY foundation for the query feature (item 6).**
 `tenant_query_service.py:18-21` maps the four query params to four indexes:
@@ -420,4 +460,9 @@ done
 - **LT**: revert ASG to pin previous LT version
 - **DDB table/GSI**: delete table (if newly created) or remove GSI
 - **Secrets Manager**: delete secret (if newly created)
-- **API route**: `bash lib/apply-api-routes.sh rollback $REGION`
+- **API route**: delete the added resource (removes its GET method + integration) and
+  redeploy the stage:
+  ```bash
+  aws apigateway delete-resource --rest-api-id "$API_ID" --region "$REGION" --resource-id "$STATS_ID"
+  aws apigateway create-deployment --rest-api-id "$API_ID" --region "$REGION" --stage-name "$STAGE"
+  ```

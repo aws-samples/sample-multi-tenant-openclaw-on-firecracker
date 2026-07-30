@@ -1,0 +1,950 @@
+{
+  "id": "monitor-patch",
+  "base_sha": "a547dc74fe25ea0219c804933c5a7da8af1e3b39",
+  "patch_sha": "c6fafab7f9c8e33a2c889d93d2033e78a0cb20ee",
+  "status": "MANUAL_REVIEW",
+  "excludes": [
+    "README.md",
+    "docs/**",
+    "deploy/litellm/**",
+    "deploy/monitoring/MONITORING-RUNBOOK.md",
+    "deploy/monitoring/WAZUH-RUNBOOK.md",
+    "deploy/monitoring/wazuh-two-ec2/**",
+    "deploy/monitoring/prometheus.yml",
+    "deploy/runtime-config-export/**",
+    "config.yml.example",
+    "pyproject.toml",
+    "uv.lock",
+    "scripts/**",
+    "console/**"
+  ],
+  "paths": {
+    "deploy/userdata/host-agent.py": {
+      "change": "M",
+      "layer": "B-s3",
+      "artifact": "host-scripts/host-agent.py.patched",
+      "base_sha256": "c59d450daba3a50a1ef1e0b9026e072122361a1b6e565659c2b270ef0cc85339",
+      "patch_sha256": "11b4a23934e7c2e80eb0a8c1bb657e6520e9db4e5976fba2a879fa78a1327a27",
+      "operations": [
+        {
+          "resource": "s3:deployment/scripts/host-agent.py on live hosts + S3",
+          "class": "AUTO_CLI",
+          "apply_cli": "scp/SSM push host-scripts/host-agent.py.patched to live hosts /opt/openclaw/host-agent.py + aws s3 cp to deployment/scripts/host-agent.py",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor",
+        "#390-hooks",
+        "#stop-serialize"
+      ]
+    },
+    "deploy/userdata/launch-vm.sh": {
+      "change": "M",
+      "layer": "B-s3",
+      "artifact": "host-scripts/launch-vm.sh.patched",
+      "base_sha256": "a1e80333da934676307ad6e40361a166f392940b05e4b234908fbde4bf9c1221",
+      "patch_sha256": "059b73b8fab568df056a9bd2ea44873da62325624e5f044a3368a44476f75b75",
+      "operations": [
+        {
+          "resource": "s3:deployment/scripts/launch-vm.sh on live hosts + S3",
+          "class": "AUTO_CLI",
+          "apply_cli": "scp/SSM push host-scripts/launch-vm.sh.patched to live hosts /opt/openclaw/launch-vm.sh + aws s3 cp to deployment/scripts/launch-vm.sh",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor",
+        "#390-hooks",
+        "#stop-serialize"
+      ]
+    },
+    "deploy/userdata/stop-vm.sh": {
+      "change": "M",
+      "layer": "B-s3",
+      "artifact": "host-scripts/stop-vm.sh.patched",
+      "base_sha256": "c15104c4f1a91311b99c74fe0a3058c4e77f0ad9eddaafb2a3c7f02f3b98f2b9",
+      "patch_sha256": "5089f59039a7691ac93c973c620e8603898d3a1c721a38215b6514d30ec02a78",
+      "operations": [
+        {
+          "resource": "s3:deployment/scripts/stop-vm.sh on live hosts + S3",
+          "class": "AUTO_CLI",
+          "apply_cli": "scp/SSM push host-scripts/stop-vm.sh.patched to live hosts /opt/openclaw/stop-vm.sh + aws s3 cp to deployment/scripts/stop-vm.sh",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor",
+        "#390-hooks",
+        "#stop-serialize"
+      ]
+    },
+    "deploy/userdata/migrate-vm.sh": {
+      "change": "M",
+      "layer": "B-s3",
+      "artifact": "host-scripts/migrate-vm.sh.patched",
+      "base_sha256": "a98ba597e9449a7c0f52ede541620788c0d25f88081f99c6c20f13fa3a13a052",
+      "patch_sha256": "13a130e6c4edc2b106f4691c4354bbe4f7a2ff2495e5a23eb25351a94982e421",
+      "operations": [
+        {
+          "resource": "s3:deployment/scripts/migrate-vm.sh on live hosts + S3",
+          "class": "AUTO_CLI",
+          "apply_cli": "scp/SSM push host-scripts/migrate-vm.sh.patched to live hosts /opt/openclaw/migrate-vm.sh + aws s3 cp to deployment/scripts/migrate-vm.sh",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor",
+        "#390-hooks",
+        "#stop-serialize"
+      ]
+    },
+    "deploy/userdata/init-host.sh": {
+      "change": "M",
+      "layer": "A-lt",
+      "artifact": "launch-template/init-host.sh.patched",
+      "base_sha256": "d81adcf566aadc47e83979869834a88d9a7bba3f7e41432689c9cd6d8a0fb1d0",
+      "patch_sha256": "7b347726c9445c8c77da0675d854369ffd7652ec4e3d914f46cc96b0207baf0d",
+      "operations": [
+        {
+          "resource": "lt:init-host.sh (UserData template — {{HOST_USER_HOOK}} placeholder added)",
+          "class": "MANUAL_CLI_REVIEW",
+          "apply_cli": "Decode current LT UserData, patch the hook block, re-encode, create new LT version, update ASG to pin new version, instance-refresh",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#390-hooks"
+      ]
+    },
+    "deploy/lambda/api/handler.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/handler.py",
+      "base_sha256": "6157fd3445b9d120c81f6b850b4580e84a70aa63f5fe5a3e4516ddf66432432e",
+      "patch_sha256": "6501dd44a679de85d0da6eddeb95acaf0da5c1f84666fb87a92a6ca479e4772e",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api overlay",
+          "class": "AUTO_CLI",
+          "apply_cli": "Pull live openclaw-api zip, overlay patched source, re-zip, update-function-code --revision-id, publish-version + update-alias + $LATEST current",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor",
+        "#tenant-query",
+        "#tenant-stats"
+      ]
+    },
+    "deploy/lambda/api/core/auth.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/core/auth.py",
+      "base_sha256": "b9dc041487ade0c2296fafc3c0dd470e4f08df447fca5bf88a4b4bb4ff6f2727",
+      "patch_sha256": "99ee267e2dac16d70c6948b174ebb8199ad4af9f8f97ba6e7f51afddf4506ab9",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api overlay",
+          "class": "AUTO_CLI",
+          "apply_cli": "Pull live openclaw-api zip, overlay patched source, re-zip, update-function-code --revision-id, publish-version + update-alias + $LATEST current",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor",
+        "#tenant-query",
+        "#tenant-stats"
+      ]
+    },
+    "deploy/lambda/api/core/clients.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/core/clients.py",
+      "base_sha256": "17b41b2dcefc557c5adb228b01bfdd1cc014c20825886fdc5944940b2ace8efb",
+      "patch_sha256": "04c24a71fb5b6418c61a2a889c03fea5ada47f5ee46797fdaa98322670c432b9",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api overlay",
+          "class": "AUTO_CLI",
+          "apply_cli": "Pull live openclaw-api zip, overlay patched source, re-zip, update-function-code --revision-id, publish-version + update-alias + $LATEST current",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor",
+        "#tenant-query",
+        "#tenant-stats"
+      ]
+    },
+    "deploy/lambda/api/core/pagination.py": {
+      "change": "A",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/core/pagination.py",
+      "base_sha256": null,
+      "patch_sha256": "dfe3b93521c7c5dbb03fdc8da507c76422fe696c013ee686e4b25c7bbad0ac9b",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api overlay",
+          "class": "AUTO_CLI",
+          "apply_cli": "Pull live openclaw-api zip, overlay patched source, re-zip, update-function-code --revision-id, publish-version + update-alias + $LATEST current",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor",
+        "#tenant-query",
+        "#tenant-stats"
+      ]
+    },
+    "deploy/lambda/api/services/fleet_service.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/services/fleet_service.py",
+      "base_sha256": "c974aa015444fb715e919f70db3aca48ffc6cc209b71a93224d827baa6b2d2e8",
+      "patch_sha256": "cc703f18d8013613de489cc17709624feb9da12068282b035b25bc3bcc026152",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api overlay",
+          "class": "AUTO_CLI",
+          "apply_cli": "Pull live openclaw-api zip, overlay patched source, re-zip, update-function-code --revision-id, publish-version + update-alias + $LATEST current",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor",
+        "#tenant-query",
+        "#tenant-stats"
+      ]
+    },
+    "deploy/lambda/api/services/host_service.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/services/host_service.py",
+      "base_sha256": "4f8469830fb061e85f17f360a3782261769b5275fb7c48747e0d8384a45f7098",
+      "patch_sha256": "8af4ad419ec9dc4e846ea2f7947443ec3ecf276d1e648d7c150f9ad2b2b277a8",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api overlay",
+          "class": "AUTO_CLI",
+          "apply_cli": "Pull live openclaw-api zip, overlay patched source, re-zip, update-function-code --revision-id, publish-version + update-alias + $LATEST current",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor",
+        "#tenant-query",
+        "#tenant-stats"
+      ]
+    },
+    "deploy/lambda/api/services/registry_service.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/services/registry_service.py",
+      "base_sha256": "f89d6822d2c31f9e0179ff297347d78b3262abb73c6ea9564ebefd8fc9d8f4de",
+      "patch_sha256": "db1aaf3f2d3548760b2317a6b294284a590df89b4d81174e9c5e28ceb241d6ef",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api overlay",
+          "class": "AUTO_CLI",
+          "apply_cli": "Pull live openclaw-api zip, overlay patched source, re-zip, update-function-code --revision-id, publish-version + update-alias + $LATEST current",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor",
+        "#tenant-query",
+        "#tenant-stats"
+      ]
+    },
+    "deploy/lambda/api/services/tenant_query_service.py": {
+      "change": "A",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/services/tenant_query_service.py",
+      "base_sha256": null,
+      "patch_sha256": "c8ec9c7abdf6e358782dbc0353990182c3c1c1d2c6fc61949c0bd980aba9fd35",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api overlay",
+          "class": "AUTO_CLI",
+          "apply_cli": "Pull live openclaw-api zip, overlay patched source, re-zip, update-function-code --revision-id, publish-version + update-alias + $LATEST current",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor",
+        "#tenant-query",
+        "#tenant-stats"
+      ]
+    },
+    "deploy/lambda/api/services/tenant_service.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/services/tenant_service.py",
+      "base_sha256": "8839cd464e86147d05b8d30a31626383b44d3f6bbbb107b3cf267809153cd054",
+      "patch_sha256": "be7f743d615b81b04bc5bedfbf850df7679c7517382137b3b9d035fb938a3938",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api overlay",
+          "class": "AUTO_CLI",
+          "apply_cli": "Pull live openclaw-api zip, overlay patched source, re-zip, update-function-code --revision-id, publish-version + update-alias + $LATEST current",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor",
+        "#tenant-query",
+        "#tenant-stats"
+      ]
+    },
+    "deploy/lambda/api/services/tenant_stats_service.py": {
+      "change": "A",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/services/tenant_stats_service.py",
+      "base_sha256": null,
+      "patch_sha256": "467ed09957f932104a08e1f394a0fd895d8c8455d421e35bf3814667835bd1ea",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api overlay",
+          "class": "AUTO_CLI",
+          "apply_cli": "Pull live openclaw-api zip, overlay patched source, re-zip, update-function-code --revision-id, publish-version + update-alias + $LATEST current",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor",
+        "#tenant-query",
+        "#tenant-stats"
+      ]
+    },
+    "deploy/lambda/tenant_stats/handler.py": {
+      "change": "A",
+      "layer": "C-lambda",
+      "artifact": "lambda/tenant_stats/handler.py",
+      "base_sha256": null,
+      "patch_sha256": "6dab0f466663bcb7c5510abb5ed376172350260ed065e4be958763af2e5e6103",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-tenant-stats-writer (NEW function, feature-gated)",
+          "class": "MANUAL_CLI_REVIEW",
+          "apply_cli": "Create new Lambda function openclaw-tenant-stats-writer with ARM64, 8192MB, reserved=1, EventBridge 1min schedule; requires DDB tenant_stats_table + IAM grants",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#tenant-stats"
+      ]
+    },
+    "deploy/lambda/health_check/handler.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/health_check/handler.py",
+      "base_sha256": "ea25e4a99dff77df5dc8f6762344830f7d2386894c069ab17390f9a7148c3d3d",
+      "patch_sha256": "66a06280b2e8fb58447d31d2eee84c89ad9fe5f28418fec8d028d38ef59ebdcf",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-health-check overlay",
+          "class": "AUTO_CLI",
+          "apply_cli": "Pull live health-check zip, overlay handler.py, re-zip, update-function-code",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor"
+      ]
+    },
+    "deploy/stack.py": {
+      "change": "M",
+      "layer": "D-cdk",
+      "artifact": null,
+      "base_sha256": "a816b8d7b805687caaa4fd5b082adc6b64c6284f127f83ed4a05d4538394261d",
+      "patch_sha256": "0604105955778ef63a6c48f3d1df6c9387deadc958b514fbe2483e8cff690ebe",
+      "operations": [
+        {
+          "resource": "stack:import tenant_query_rollout validator",
+          "class": "AUTO_CLI",
+          "apply_cli": "No runtime effect — CDK entry point only",
+          "rollback_policy": "RETAIN"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor",
+        "#tenant-query",
+        "#tenant-stats",
+        "#390-hooks"
+      ]
+    },
+    "deploy/stacks/compute.py": {
+      "change": "M",
+      "layer": "D-cdk",
+      "artifact": null,
+      "base_sha256": "1da91fd9f92e15e62b4ce4fc03714a01ad871449d3fa6b7f6c5cbead2003d7f6",
+      "patch_sha256": "f6a71769530e0857d1e29212afb31f87d05fb7ab0cdd51189086ad5912d51b52",
+      "operations": [
+        {
+          "resource": "stack:comment-only de-branding",
+          "class": "AUTO_CLI",
+          "apply_cli": "No runtime effect — comment change only",
+          "rollback_policy": "RETAIN"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor",
+        "#tenant-query",
+        "#tenant-stats",
+        "#390-hooks"
+      ]
+    },
+    "deploy/stacks/ha_edge.py": {
+      "change": "M",
+      "layer": "D-cdk",
+      "artifact": null,
+      "base_sha256": "e5ecf05e135364cf28195e5ca705cb72d313d8dbc67b90affff3985d2abbf973",
+      "patch_sha256": "3323c2910569040b1ba7ee94db326dfd922ed739a821709f5a80ae62f00b617d",
+      "operations": [
+        {
+          "resource": "iam:host-role S3 GetObject grant for user_hooks bucket",
+          "class": "AUTO_CLI",
+          "apply_cli": "aws iam put-role-policy --role-name <host-role> --policy-name claw-patch-monitor-user-hook-s3 --policy-document <s3-read-hook-bucket>",
+          "rollback_policy": "RETAIN"
+        },
+        {
+          "resource": "lt:UserData {{HOST_USER_HOOK}} injection + S3 deployment for edge nginx/fluent-bit",
+          "class": "MANUAL_CLI_REVIEW",
+          "apply_cli": "Update LT UserData with hook block; upload new nginx.conf/fluent-bit.conf to S3 edge path",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor",
+        "#tenant-query",
+        "#tenant-stats",
+        "#390-hooks"
+      ]
+    },
+    "deploy/stacks/lambdas.py": {
+      "change": "M",
+      "layer": "D-cdk",
+      "artifact": null,
+      "base_sha256": "329ab8950c0c62de533cf6d69d569bfc5f81182e1645f75e44401fb76d620ac2",
+      "patch_sha256": "5298ba154c1ea0c20c8d0ca0210c211ad0ee38a92b3d6bc1900923a36596ddfa",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api env TENANT_QUERY_ENABLED + PAGINATION_AES_KEY",
+          "class": "AUTO_CLI",
+          "apply_cli": "aws lambda update-function-configuration --function-name openclaw-api --environment add TENANT_QUERY_ENABLED=false,PAGINATION_AES_KEY=<from-secret>",
+          "rollback_policy": "RESTORE"
+        },
+        {
+          "resource": "secretsmanager:openclaw/pagination-cursor (NEW)",
+          "class": "MANUAL_CLI_REVIEW",
+          "apply_cli": "aws secretsmanager create-secret --name openclaw/pagination-cursor --generate-random-password ...",
+          "rollback_policy": "RESTORE"
+        },
+        {
+          "resource": "apigw:GET /tenants-stats route (NEW)",
+          "class": "AUTO_CLI",
+          "apply_cli": "bash lib/apply-api-routes.sh — add GET /tenants-stats resource",
+          "rollback_policy": "RESTORE"
+        },
+        {
+          "resource": "lambda:openclaw-tenant-stats-writer + EventBridge schedule (feature-gated)",
+          "class": "MANUAL_CLI_REVIEW",
+          "apply_cli": "Create Lambda + schedule rule (only if tenant_stats.enabled=true)",
+          "rollback_policy": "RESTORE"
+        },
+        {
+          "resource": "iam:openclaw-api tenant_stats_table read (feature-gated)",
+          "class": "AUTO_CLI",
+          "apply_cli": "aws iam put-role-policy (DDB read on tenant-stats table)",
+          "rollback_policy": "RETAIN"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor",
+        "#tenant-query",
+        "#tenant-stats",
+        "#390-hooks"
+      ]
+    },
+    "deploy/stacks/litellm.py": {
+      "change": "M",
+      "layer": "D-cdk",
+      "artifact": null,
+      "base_sha256": "bd37c1ff09925d8f3a68ae49ed0fc76a5a6a8f7c4fb1cb9d34df6f8f0a1ab209",
+      "patch_sha256": "e5b225090d151fe55a39ab4f3adfa986f7a68664d9afe64c1545ca5219621e0b",
+      "operations": [
+        {
+          "resource": "stack:comment-only de-branding",
+          "class": "AUTO_CLI",
+          "apply_cli": "No runtime effect — comment change only",
+          "rollback_policy": "RETAIN"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor",
+        "#tenant-query",
+        "#tenant-stats",
+        "#390-hooks"
+      ]
+    },
+    "deploy/stacks/network_vpc.py": {
+      "change": "M",
+      "layer": "D-cdk",
+      "artifact": null,
+      "base_sha256": "499495b9fb17cb54fdeb45e5edc0bc2aa7b65a05cd1585698da3fe87aa4507b2",
+      "patch_sha256": "1722bf363ff8cef9e88ee8a57f8c22a7714124b0f9539e9a20688789a88a7e5a",
+      "operations": [
+        {
+          "resource": "stack:comment-only de-branding",
+          "class": "AUTO_CLI",
+          "apply_cli": "No runtime effect — comment change only",
+          "rollback_policy": "RETAIN"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor",
+        "#tenant-query",
+        "#tenant-stats",
+        "#390-hooks"
+      ]
+    },
+    "deploy/stacks/outputs.py": {
+      "change": "M",
+      "layer": "D-cdk",
+      "artifact": null,
+      "base_sha256": "f62810ab6b2cfa5a065454a1871f297c8beb6629a4c0c1b88ea77b4b6099fa81",
+      "patch_sha256": "5bcb7254bf8575f536272d2aa49e77f44f69fd71051d9baecc17c7e36c3b42d2",
+      "operations": [
+        {
+          "resource": "stack:dead import cleanup",
+          "class": "AUTO_CLI",
+          "apply_cli": "No runtime effect — import cleanup only",
+          "rollback_policy": "RETAIN"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor",
+        "#tenant-query",
+        "#tenant-stats",
+        "#390-hooks"
+      ]
+    },
+    "deploy/stacks/storage.py": {
+      "change": "M",
+      "layer": "D-cdk",
+      "artifact": null,
+      "base_sha256": "d192a13303254b24b5b51a2e5e6c53b7b6201a3c37583de892f6af6f5df080e1",
+      "patch_sha256": "6c6b8416764cd1d26e6916251e0946f3a63f5732d6b1a63b14ed08cc62feb7a8",
+      "operations": [
+        {
+          "resource": "dynamodb:openclaw-tenant-stats (NEW table)",
+          "class": "MANUAL_CLI_REVIEW",
+          "apply_cli": "aws dynamodb create-table --table-name openclaw-tenant-stats --attribute-definitions '[{\"AttributeName\":\"id\",\"AttributeType\":\"S\"}]' --key-schema '[{\"AttributeName\":\"id\",\"KeyType\":\"HASH\"}]' --billing-mode PAY_PER_REQUEST --point-in-time-recovery-specification PointInTimeRecoveryEnabled=true",
+          "rollback_policy": "RESTORE"
+        },
+        {
+          "resource": "dynamodb:openclaw-tenants GSI gsi_host/gsi_status/gsi_rootfs_version (feature-gated)",
+          "class": "MANUAL_CLI_REVIEW",
+          "apply_cli": "aws dynamodb update-table --table-name openclaw-tenants --attribute-definitions + --global-secondary-index-updates (only if scaler.add_gsi_* enabled in config)",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor",
+        "#tenant-query",
+        "#tenant-stats",
+        "#390-hooks"
+      ]
+    },
+    "deploy/stacks/tenant_query_rollout.py": {
+      "change": "A",
+      "layer": "D-cdk",
+      "artifact": null,
+      "base_sha256": null,
+      "patch_sha256": "ffc89f92676271e69969c72ba836958bdea780e9befd7d093fd39cdec79d8797",
+      "operations": [
+        {
+          "resource": "stack:config validator for tenant_query (synth-time only)",
+          "class": "AUTO_CLI",
+          "apply_cli": "No runtime effect — CDK validation logic only",
+          "rollback_policy": "RETAIN"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor",
+        "#tenant-query",
+        "#tenant-stats",
+        "#390-hooks"
+      ]
+    },
+    "deploy/edge/fluent-bit/host/fluent-bit.conf": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": null,
+      "base_sha256": "ab3ed3b91c6bc5ba83b0da5afd07f85331b8e98981f794110badf10c8718a3b7",
+      "patch_sha256": "ea9ef977c38431688404061449cc76cc1d5e9af8e7243ac98f647da2884af6bd",
+      "operations": [
+        {
+          "resource": "file:deploy/edge/fluent-bit/host/fluent-bit.conf",
+          "class": "AUTO_CLI",
+          "apply_cli": "Replace deploy/edge/fluent-bit/host/fluent-bit.conf on live system via S3/SSM",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor"
+      ]
+    },
+    "deploy/edge/nginx.conf": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": null,
+      "base_sha256": "de7a174503cebfd5f6f15620dc33e650a03d42b6d7c5fb233dd5c7d4f5e8a0d6",
+      "patch_sha256": "fb1c3f1e714b4685741f0ba31113285a9b774fe5d147cfbd47b4ee540e0eb459",
+      "operations": [
+        {
+          "resource": "file:deploy/edge/nginx.conf",
+          "class": "AUTO_CLI",
+          "apply_cli": "Replace deploy/edge/nginx.conf on live system via S3/SSM",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor"
+      ]
+    },
+    "deploy/console-bff/web/chat/index.html": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": null,
+      "base_sha256": "2ab39d8370eb3bccab96303a538be8669a170ad2e2721e46b8b4883cebc58d63",
+      "patch_sha256": "b661834390179185444ee1ba4e9e709ecc9706e27e8fac9167723434ba26753a",
+      "operations": [
+        {
+          "resource": "file:deploy/console-bff/web/chat/index.html",
+          "class": "AUTO_CLI",
+          "apply_cli": "Replace deploy/console-bff/web/chat/index.html on live system via S3/SSM",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor"
+      ]
+    },
+    "deploy/console-bff/web/chat/js/chat.js": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": null,
+      "base_sha256": "5c8cac50d6e6c5b0936e9c9a5b0604055fc84a5a00976074a9fa9b5917bd8422",
+      "patch_sha256": "5dcdfd41132275f2d3c3853c4bfb0a099394e4ab413e023815dccd7e34c1da36",
+      "operations": [
+        {
+          "resource": "file:deploy/console-bff/web/chat/js/chat.js",
+          "class": "AUTO_CLI",
+          "apply_cli": "Replace deploy/console-bff/web/chat/js/chat.js on live system via S3/SSM",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor"
+      ]
+    },
+    "deploy/console-bff/web/index.html": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": null,
+      "base_sha256": "ca2c10b3b30405a6a46fbd54f32ccbe79b30677979c260e71594393e9dd825bb",
+      "patch_sha256": "79d5cb28d6ed355f284c527e725168ec3afccf83c090c58a08acf2cfbba227c9",
+      "operations": [
+        {
+          "resource": "file:deploy/console-bff/web/index.html",
+          "class": "AUTO_CLI",
+          "apply_cli": "Replace deploy/console-bff/web/index.html on live system via S3/SSM",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor"
+      ]
+    },
+    "build-rootfs.sh": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": null,
+      "base_sha256": "4dbb1400914ef3a8f67144e572290afae6fe2bb39f7d271339ec4322daa2541b",
+      "patch_sha256": "f8c5bac6667fdd426dec53e02a633b0c8deff5213757d8443ed05f312b74f7a1",
+      "operations": [
+        {
+          "resource": "file:build-rootfs.sh",
+          "class": "AUTO_CLI",
+          "apply_cli": "Replace build-rootfs.sh on live system via S3/SSM",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor"
+      ]
+    },
+    "setup.sh": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": null,
+      "base_sha256": "f30e79c6a5ba695c4e7035eb34ee5b0da3f61ac38d71d80cb33e4f98e9ab0d52",
+      "patch_sha256": "cb6d07a5ae6da3bbd677cf8140a0416566e4ac308e136016379975e958b2e3a9",
+      "operations": [
+        {
+          "resource": "file:setup.sh",
+          "class": "AUTO_CLI",
+          "apply_cli": "Replace setup.sh on live system via S3/SSM",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor"
+      ]
+    }
+  },
+  "fixes": [
+    {
+      "id": "#387-monitor",
+      "summary": "Host-agent Prometheus exporter: app_health gauge (gateway HTTP liveness per tenant — closes the #197 blind spot where vm_health=1 but gateway crashlooped), DNAT port pool watermark (used/total/quarantined), host build_info with SHA256 self-hash, loop_tick heartbeat, ssm_agent liveness, and route_failure counter. Health-check Lambda enhanced to surface host-agent metrics endpoint status.",
+      "paths": [
+        "deploy/userdata/host-agent.py",
+        "deploy/lambda/health_check/handler.py",
+        "deploy/lambda/api/handler.py",
+        "deploy/lambda/api/services/host_service.py",
+        "deploy/edge/fluent-bit/host/fluent-bit.conf",
+        "deploy/edge/nginx.conf"
+      ],
+      "applies_when": "always",
+      "params_changed": [
+        {
+          "name": "METRICS_PORT",
+          "layer": "B-s3",
+          "old_default": "none (metrics endpoint did not exist)",
+          "new_default": "9200",
+          "runtime_impact": "host-agent now listens on :9200 for Prometheus scraping; no effect on tenant traffic"
+        }
+      ],
+      "verification_ids": [
+        "v-metrics-endpoint",
+        "v-app-health-gauge",
+        "v-port-watermark"
+      ]
+    },
+    {
+      "id": "#tenant-query",
+      "summary": "Scalable tenant queries: paginated GET /tenants with cursor-based pagination (AES-GCM encrypted cursors via Secrets Manager key), optional GSIs (gsi_host, gsi_status, gsi_rootfs_version) for efficient queries by host/status/version. Feature-gated by config tenant_query.enabled.",
+      "paths": [
+        "deploy/lambda/api/handler.py",
+        "deploy/lambda/api/core/pagination.py",
+        "deploy/lambda/api/core/clients.py",
+        "deploy/lambda/api/services/tenant_query_service.py",
+        "deploy/lambda/api/services/tenant_service.py",
+        "deploy/stacks/lambdas.py",
+        "deploy/stacks/storage.py"
+      ],
+      "applies_when": "when tenant_query.enabled=true in config",
+      "params_changed": [
+        {
+          "name": "TENANT_QUERY_ENABLED",
+          "layer": "C-lambda",
+          "old_default": "not present",
+          "new_default": "false",
+          "runtime_impact": "When false, new query routes return 404; existing /tenants GET unchanged"
+        },
+        {
+          "name": "PAGINATION_AES_KEY",
+          "layer": "C-lambda",
+          "old_default": "not present",
+          "new_default": "from Secrets Manager",
+          "runtime_impact": "Used for cursor encryption; required when tenant_query enabled"
+        }
+      ],
+      "verification_ids": [
+        "v-paginated-list",
+        "v-cursor-decrypt"
+      ]
+    },
+    {
+      "id": "#tenant-stats",
+      "summary": "Periodic tenant stats aggregation: new openclaw-tenant-stats-writer Lambda (1min EventBridge schedule, scans tenants table, writes summary stats to openclaw-tenant-stats DDB table). New GET /tenants-stats API route exposes the pre-computed stats. Feature-gated by config tenant_stats.enabled.",
+      "paths": [
+        "deploy/lambda/tenant_stats/handler.py",
+        "deploy/lambda/api/services/tenant_stats_service.py",
+        "deploy/lambda/api/handler.py",
+        "deploy/stacks/lambdas.py",
+        "deploy/stacks/storage.py"
+      ],
+      "applies_when": "when tenant_stats.enabled=true in config",
+      "params_changed": [
+        {
+          "name": "TENANT_STATS_TABLE",
+          "layer": "C-lambda",
+          "old_default": "not present",
+          "new_default": "openclaw-tenant-stats",
+          "runtime_impact": "New env var on openclaw-api only when feature enabled"
+        },
+        {
+          "name": "STATS_SCAN_SEGMENTS",
+          "layer": "C-lambda",
+          "old_default": "not present",
+          "new_default": "8",
+          "runtime_impact": "Parallel DDB scan segments for stats writer"
+        }
+      ],
+      "verification_ids": [
+        "v-stats-route",
+        "v-stats-writer-runs"
+      ]
+    },
+    {
+      "id": "#390-hooks",
+      "summary": "S3 user hooks: optional customer-managed root hook (s3_uri + sha256 + timeout + failure_policy) downloaded and executed at host init before DDB registration. CDK validates hook config at synth; init-host.sh gains {{HOST_USER_HOOK}} placeholder. ha_edge.py grants host-role S3 read on the hook bucket.",
+      "paths": [
+        "deploy/userdata/init-host.sh",
+        "deploy/stacks/ha_edge.py"
+      ],
+      "applies_when": "when user_hooks.host_init configured in config",
+      "params_changed": [
+        {
+          "name": "HOST_USER_HOOK",
+          "layer": "A-lt",
+          "old_default": "not present",
+          "new_default": "empty string (disabled)",
+          "runtime_impact": "No effect when unconfigured; when configured, hook runs before host registers"
+        }
+      ],
+      "verification_ids": [
+        "v-hook-disabled-noop"
+      ]
+    },
+    {
+      "id": "#stop-serialize",
+      "summary": "stop-vm.sh lifecycle lock serialization: stop acquires the same per-tenant flock as launch-vm.sh (fd9) to prevent race between stop and cold-launch. Legacy Firecracker fd9 holder detection avoids deadlock on pre-patch VMs. launch-vm.sh closes fd9 in the Firecracker child (9>&-).",
+      "paths": [
+        "deploy/userdata/stop-vm.sh",
+        "deploy/userdata/launch-vm.sh"
+      ],
+      "applies_when": "always",
+      "params_changed": [],
+      "verification_ids": [
+        "v-stop-no-race",
+        "v-legacy-compat"
+      ]
+    }
+  ],
+  "verifications": [
+    {
+      "id": "v-metrics-endpoint",
+      "fix_id": "#387-monitor",
+      "phase": "A-readonly",
+      "action": "curl -s http://<host-ip>:9200/metrics",
+      "observable": "Prometheus exposition text with openclaw_vm_health, openclaw_app_health, openclaw_host_dnat_ports_*, openclaw_host_build_info, openclaw_host_loop_tick, openclaw_host_ssm_agent_up",
+      "pass_when": "HTTP 200 AND all expected metric families present with valid samples",
+      "fail_when": "Connection refused (agent not listening on 9200) OR missing metric families",
+      "timeout_s": 10,
+      "cleanup": null
+    },
+    {
+      "id": "v-app-health-gauge",
+      "fix_id": "#387-monitor",
+      "phase": "B-lifecycle",
+      "action": "Create a tenant, wait running, curl metrics, check openclaw_app_health{tenant=<id>}",
+      "observable": "openclaw_app_health gauge value for the test tenant",
+      "pass_when": "openclaw_app_health{tenant=<id>} == 1 (gateway HTTP is up)",
+      "fail_when": "gauge absent or == 0 when tenant is running with healthy gateway",
+      "timeout_s": 120,
+      "cleanup": "DELETE /tenants/<id>?keep_data=false"
+    },
+    {
+      "id": "v-port-watermark",
+      "fix_id": "#387-monitor",
+      "phase": "A-readonly",
+      "action": "curl -s http://<host-ip>:9200/metrics | grep openclaw_host_dnat_ports",
+      "observable": "openclaw_host_dnat_ports_used, _total, _quarantined gauges",
+      "pass_when": "All three present; _total > 0; _used >= 0; _used <= _total",
+      "fail_when": "Any of the three absent OR _used > _total (accounting error)",
+      "timeout_s": 10,
+      "cleanup": null
+    },
+    {
+      "id": "v-paginated-list",
+      "fix_id": "#tenant-query",
+      "phase": "B-lifecycle",
+      "action": "curl GET /tenants?limit=2 → check response has 'next_cursor'; curl GET /tenants?cursor=<next_cursor> → check returns next page",
+      "observable": "Paginated response with cursor field and correct page size",
+      "pass_when": "First page has exactly limit items + non-null next_cursor; second page decrypts cursor and returns subsequent items",
+      "fail_when": "500 (PAGINATION_AES_KEY missing) OR cursor decryption fails OR returns all items ignoring limit",
+      "timeout_s": 30,
+      "cleanup": null
+    },
+    {
+      "id": "v-cursor-decrypt",
+      "fix_id": "#tenant-query",
+      "phase": "A-readonly",
+      "action": "Send a tampered/invalid cursor → expect 400",
+      "observable": "HTTP status code for invalid cursor",
+      "pass_when": "HTTP 400 with clear error (bad cursor)",
+      "fail_when": "HTTP 500 (unhandled decrypt error) OR HTTP 200 (cursor not validated)",
+      "timeout_s": 10,
+      "cleanup": null
+    },
+    {
+      "id": "v-stats-route",
+      "fix_id": "#tenant-stats",
+      "phase": "A-readonly",
+      "action": "curl GET /tenants-stats -H x-api-key:$KEY",
+      "observable": "HTTP response from the new stats route",
+      "pass_when": "HTTP 200 with JSON stats object (even if empty when no stats computed yet)",
+      "fail_when": "HTTP 404 (route not created) OR 403 (api-key auth not configured on route)",
+      "timeout_s": 10,
+      "cleanup": null
+    },
+    {
+      "id": "v-stats-writer-runs",
+      "fix_id": "#tenant-stats",
+      "phase": "B-lifecycle",
+      "action": "Wait 2 minutes, then aws dynamodb scan --table-name openclaw-tenant-stats --select COUNT",
+      "observable": "Item count in tenant-stats table after schedule fires",
+      "pass_when": "Count > 0 (writer ran and wrote at least one stats record)",
+      "fail_when": "Count == 0 after 2min (schedule not firing or writer erroring)",
+      "timeout_s": 150,
+      "cleanup": null
+    },
+    {
+      "id": "v-hook-disabled-noop",
+      "fix_id": "#390-hooks",
+      "phase": "A-readonly",
+      "action": "Decode LT UserData, grep for HOST_USER_HOOK or the hook download block",
+      "observable": "Presence of hook placeholder or rendered empty block in UserData",
+      "pass_when": "When user_hooks not configured: the rendered block is empty/no-op (host boots normally without hook)",
+      "fail_when": "Literal {{HOST_USER_HOOK}} in rendered UserData (template not substituted — host would fail)",
+      "timeout_s": 30,
+      "cleanup": null
+    },
+    {
+      "id": "v-stop-no-race",
+      "fix_id": "#stop-serialize",
+      "phase": "B-lifecycle",
+      "action": "Launch a tenant; immediately issue stop while launch is in progress (race condition test)",
+      "observable": "stop-vm.sh blocks on flock until launch completes, then cleanly stops",
+      "pass_when": "Tenant reaches stopped state without 'kill: No such process' errors in stop log",
+      "fail_when": "stop-vm.sh kills a half-built VM OR deadlocks (legacy Firecracker holds fd9)",
+      "timeout_s": 180,
+      "cleanup": "DELETE /tenants/<id>?keep_data=false"
+    },
+    {
+      "id": "v-legacy-compat",
+      "fix_id": "#stop-serialize",
+      "phase": "B-lifecycle",
+      "action": "Stop a tenant that was launched BEFORE this patch (Firecracker still holds fd9 from old launch-vm.sh)",
+      "observable": "stop-vm.sh detects legacy lock holder and proceeds without deadlock",
+      "pass_when": "Log shows 'legacy Firecracker lock holder detected' + tenant stops cleanly",
+      "fail_when": "Deadlock (stop hangs on flock forever) OR incorrect PID killed",
+      "timeout_s": 120,
+      "cleanup": null
+    }
+  ]
+}

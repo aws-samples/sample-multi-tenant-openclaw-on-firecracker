@@ -3,18 +3,17 @@
 # SPDX-License-Identifier: MIT-0
 set -euo pipefail
 
-printf '%s\n' \
-  "PATCH_114_FACTORY_DISABLED: refusing to generate or execute this hotfix." \
-  "The factory is incomplete: it omits the tenant-stats writer Lambda, writer IAM and environment, the EventBridge schedule, and an authenticated HTTP end-to-end test." \
-  "Its route hard-codes authorization_type=NONE and can bypass the platform CUSTOM authorizer in platform-key mode." \
-  "Do not use previously generated kits. Replace the factory with a complete, authenticated, end-to-end-verified patch before re-enabling it." >&2
-exit 78
+if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
+  echo "PREPARE_FAILED: bash 4+ is required; found $BASH_VERSION" >&2
+  exit 3
+fi
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PATCH_ROOT="$(cd "$HERE/../.." && pwd)"
 REPO="$(git -C "$PATCH_ROOT" rev-parse --show-toplevel)"
-REGION="${1:?usage: prepare.sh <region> [environment.json] [--skip-review]}"
-shift
+REGION="${1:?usage: prepare.sh <region> <customer-config.yml> [environment.json] [--skip-review]}"
+CUSTOMER_CONFIG="${2:?usage: prepare.sh <region> <customer-config.yml> [environment.json] [--skip-review]}"
+shift 2
 ENVIRONMENT=""
 SKIP_REVIEW=0
 while [[ $# -gt 0 ]]; do
@@ -30,6 +29,12 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+CUSTOMER_CONFIG="$(cd "$(dirname "$CUSTOMER_CONFIG")" && pwd)/$(basename "$CUSTOMER_CONFIG")"
+[[ -f "$CUSTOMER_CONFIG" && ! -L "$CUSTOMER_CONFIG" ]] || {
+  echo "PREPARE_FAILED: customer config is not a regular file: $CUSTOMER_CONFIG" >&2
+  exit 2
+}
 
 for tool in bash git jq python3 sha256sum; do
   command -v "$tool" >/dev/null || {
@@ -56,6 +61,8 @@ if [[ -e "$OUTPUT" || -L "$OUTPUT" ]]; then
   mv "$OUTPUT" "$TRASH/$(date +%Y%m%dT%H%M%S)-$$"
 fi
 mkdir -p "$OUTPUT"
+CONFIG_FACTS="$OUTPUT/config-facts.json"
+python3 "$HERE/read-customer-config.py" "$CUSTOMER_CONFIG" "$CONFIG_FACTS"
 
 if [[ -z "$ENVIRONMENT" ]]; then
   ENVIRONMENT="$OUTPUT/environment.json"
@@ -76,6 +83,7 @@ jq -e --arg region "$REGION" '.region == $region' "$ENVIRONMENT" >/dev/null || {
 KITS="$OUTPUT/kits"
 MATERIALIZE_ARGS=(
   "$ENVIRONMENT"
+  "$CONFIG_FACTS"
   "$HERE/../manifests/114-api-lambda.json"
   "$KITS"
 )
@@ -90,10 +98,16 @@ for name in "${ORDER[@]}"; do
 done
 
 for name in "${ORDER[@]}"; do
-  bad="$(grep -R -c $'\\\\ ' "$KITS/$name/lib/compiled" || true)"
-  if printf '%s\n' "$bad" | awk -F: '$NF != 0 { bad=1 } END { exit bad ? 0 : 1 }'; then
+  if bad="$(grep -R -F -l $'\\ ' "$KITS/$name/lib/compiled")"; then
     echo "PREPARE_FAILED: malformed shell continuation in $name" >&2
+    printf '  %s\n' "$bad" >&2
     exit 2
+  else
+    grep_rc=$?
+    if [[ "$grep_rc" -ne 1 ]]; then
+      echo "PREPARE_FAILED: could not scan shell continuations in $name" >&2
+      exit 2
+    fi
   fi
   while IFS= read -r script; do
     bash -n "$script"

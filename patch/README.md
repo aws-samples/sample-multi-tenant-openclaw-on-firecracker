@@ -42,11 +42,12 @@ the reference shape) → `353` (latest).
 
 ## Target-bound generated patches
 
-`114-tenant-stats-hotfix/` is disabled and fail-closed. Its factory omits the
-tenant-stats writer Lambda, writer IAM and environment, EventBridge schedule,
-and authenticated HTTP end-to-end coverage. Its generated route can also bypass
-the platform `CUSTOM` authorizer. Do not run the factory or any kit previously
-generated from it.
+`114-tenant-stats-hotfix/` generates three target-bound kits for the tenant
+statistics backend, API Lambda overlay, and explicit REST API route. It requires
+operator-confirmed API coordinates, authenticated `/tenants` and `/hosts`
+probes, independent AI review, ordered apply, live HTTP verification, and a
+second no-write run. It always rejects `ANY /{proxy+}` as a target. Read its
+`CLAUDE.md` before use.
 
 **Root `manifest-*.json` / `push-marker-*.md`** are publish-sync audit logs, not kits — not applied.
 

@@ -20,10 +20,9 @@ from pathlib import Path
 
 SUPPORTED_KINDS = {"lambda-proxy-route"}
 PROBE_METHODS = {"DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"}
-_PROBE_HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
 _PROBE_KEYS = {
     "method",
-    "headers",
+    "headers_file_sha256",
     "body",
     "expected_status",
     "expected_body_fields",
@@ -265,8 +264,8 @@ def expected_route_methods(spec):
     base_method = {
         "authorizationType": spec.get("authorization_type") or "NONE",
         "apiKeyRequired": bool(spec["api_key_required"]),
-        "authorizer": None,
-        "authorizationScopes": [],
+        "authorizer": spec.get("authorizer_name"),
+        "authorizationScopes": sorted(spec.get("authorization_scopes") or []),
         "operationName": None,
         "requestParameters": {},
         "requestModels": {},
@@ -333,18 +332,13 @@ def _validate_probe(spec):
             "api_routes[0].probe.method must be one of "
             f"{sorted(PROBE_METHODS)}"
         )
-    headers = probe["headers"]
-    if not isinstance(headers, dict):
-        raise SystemExit("api_routes[0].probe.headers must be an object")
-    for name, value in headers.items():
-        if not isinstance(name, str) or not _PROBE_HEADER_NAME_RE.fullmatch(name):
-            raise SystemExit(
-                f"api_routes[0].probe header name {name!r} is not a valid HTTP token"
-            )
-        if not isinstance(value, str) or "\r" in value or "\n" in value:
-            raise SystemExit(
-                f"api_routes[0].probe header {name!r} must be a single-line string"
-            )
+    headers_sha = probe["headers_file_sha256"]
+    if not isinstance(headers_sha, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", headers_sha
+    ):
+        raise SystemExit(
+            "api_routes[0].probe.headers_file_sha256 must be 64 lowercase hex"
+        )
     status = probe["expected_status"]
     if (
         isinstance(status, bool)
@@ -370,6 +364,16 @@ def _validate_probe(spec):
 def _common(manifest, spec):
     api_key_required = bool(spec["api_key_required"])
     api_key_flag = "--api-key-required" if api_key_required else "--no-api-key-required"
+    authorizer_id = spec.get("authorizer_id") or ""
+    authorization_scopes = sorted(spec.get("authorization_scopes") or [])
+    auth_flags = [
+        "--authorization-type",
+        spec.get("authorization_type") or "NONE",
+    ]
+    if authorizer_id:
+        auth_flags.extend(["--authorizer-id", authorizer_id])
+    if authorization_scopes:
+        auth_flags.extend(["--authorization-scopes", *authorization_scopes])
     cors = spec["cors"]
     cors_headers = ",".join(cors["allow_headers"])
     cors_methods = ",".join(cors["allow_methods"])
@@ -400,9 +404,7 @@ def _common(manifest, spec):
     if probe is not None:
         probe_enabled = "true"
         probe_method = probe["method"].upper()
-        probe_headers = " ".join(
-            _q(f"{name}: {value}") for name, value in probe["headers"].items()
-        )
+        probe_headers_sha = probe["headers_file_sha256"]
         probe_has_body = str(probe["body"] is not None).lower()
         probe_body_b64 = base64.b64encode(
             json.dumps(probe["body"], separators=(",", ":")).encode()
@@ -416,7 +418,7 @@ def _common(manifest, spec):
     else:
         probe_enabled = "false"
         probe_method = ""
-        probe_headers = ""
+        probe_headers_sha = ""
         probe_has_body = "false"
         probe_body_b64 = ""
         probe_expected_status = ""
@@ -437,6 +439,10 @@ METHOD={_q(str(spec["method"]).upper())}
 TARGET_FUNCTION={_q(spec["target_function"])}
 TARGET_QUALIFIER={_q(spec.get("target_qualifier") or "")}
 AUTHORIZATION={_q(spec.get("authorization_type") or "NONE")}
+AUTHORIZER_ID={_q(authorizer_id)}
+AUTHORIZER_NAME={_q(spec.get("authorizer_name") or "")}
+AUTHORIZATION_SCOPES_JSON={_q(json.dumps(authorization_scopes))}
+AUTH_FLAGS=({" ".join(_q(value) for value in auth_flags)})
 API_KEY_REQUIRED={_q(str(api_key_required).lower())}
 API_KEY_FLAG={_q(api_key_flag)}
 CORS_ALLOW_ORIGIN={_q(cors_origin)}
@@ -454,7 +460,7 @@ APIGW_SNAPSHOT_HELPER="$SCRIPT_DIR/apigw-snapshot.py"
 REVIEW_RECEIPT="$SCRIPT_DIR/../../../REVIEW.json"
 PROBE_ENABLED={probe_enabled}
 PROBE_METHOD={_q(probe_method)}
-PROBE_HEADERS=({probe_headers})
+PROBE_HEADERS_FILE_SHA256={_q(probe_headers_sha)}
 PROBE_HAS_BODY={probe_has_body}
 PROBE_BODY_B64={_q(probe_body_b64)}
 PROBE_EXPECTED_STATUS={_q(probe_expected_status)}
@@ -763,19 +769,23 @@ current_method_matches() {{
     printf '%s\\n' "$out" >&2
     return "$(classify_aws_error "$out")"
   fi
-  python3 - "$AUTHORIZATION" "$API_KEY_REQUIRED" "$out" <<'PYEOF' || rc=$?
+  python3 - "$AUTHORIZATION" "$API_KEY_REQUIRED" "$AUTHORIZER_ID" \
+      "$AUTHORIZATION_SCOPES_JSON" "$out" <<'PYEOF' || rc=$?
 import json
 import sys
 
-want_auth, want_key, raw = sys.argv[1:]
+want_auth, want_key, want_authorizer, want_scopes_raw, raw = sys.argv[1:]
 try:
     method = json.loads(raw)
+    want_scopes = json.loads(want_scopes_raw)
 except Exception as exc:
     print("method parse failed: %s" % exc, file=sys.stderr)
     raise SystemExit(46)
 if (
     method.get("authorizationType", "NONE") != want_auth
     or bool(method.get("apiKeyRequired", False)) != (want_key == "true")
+    or (method.get("authorizerId") or "") != want_authorizer
+    or sorted(method.get("authorizationScopes") or []) != sorted(want_scopes)
 ):
     raise SystemExit(40)
 PYEOF
@@ -1021,7 +1031,7 @@ recycle_applied_marker() {{
   mv -f "$STATE_DIR/applied" "$STATE_DIR/recycle/applied.$(date +%s).$$"
 }}
 
-INVOKE_URL="${{OC_PATCH_APIGW_URL:-https://${{API_ID}}.execute-api.${{REGION}}.amazonaws.com/${{STAGE}}}}"
+INVOKE_URL={_q(spec["invoke_url"].rstrip("/"))}
 
 observe_http() {{
   local code rc body_file="$STATE_DIR/http-observation.body"
@@ -1032,13 +1042,56 @@ observe_http() {{
 }}
 
 run_http_probe() {{
-  local code rc=0 header
+  local code rc=0 header headers_file headers_sha
   local request_file="$STATE_DIR/http-probe.request"
   local body_file="$STATE_DIR/http-probe.body"
-  local -a curl_args
+  local normalized_headers="$STATE_DIR/http-probe.headers"
+  local -a curl_args probe_headers
+  headers_file="${{OC_PATCH_HTTP_HEADERS_FILE:-}}"
+  [[ -n "$headers_file" ]] || {{
+    echo "OC_PATCH_HTTP_HEADERS_FILE is required for authenticated HTTP verification" >&2
+    return 43
+  }}
+  [[ -f "$headers_file" && ! -L "$headers_file" ]] || {{
+    echo "HTTP probe headers file is missing, not regular, or a symlink" >&2
+    return 43
+  }}
+  headers_sha="$(sha256sum "$headers_file" | awk '{{print $1}}')"
+  [[ "$headers_sha" == "$PROBE_HEADERS_FILE_SHA256" ]] || {{
+    echo "HTTP probe headers changed after target discovery" >&2
+    return 43
+  }}
+  if ! python3 - "$headers_file" > "$normalized_headers.tmp" <<'PYEOF'
+import json
+import re
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        headers = json.load(handle)
+except Exception as exc:
+    print("HTTP probe headers parse failed: %s" % exc, file=sys.stderr)
+    raise SystemExit(43)
+if not isinstance(headers, dict):
+    raise SystemExit(43)
+for name, value in headers.items():
+    if not isinstance(name, str) or not re.fullmatch(
+        r"[A-Za-z0-9!#$%&'*+.^_`|~-]+", name
+    ):
+        raise SystemExit(43)
+    if not isinstance(value, str) or any(ch in value for ch in "\\r\\n\\t"):
+        raise SystemExit(43)
+    print("%s: %s" % (name, value))
+PYEOF
+  then
+    echo "HTTP probe headers file is not a safe string-valued JSON object" >&2
+    return 43
+  fi
+  mv -f "$normalized_headers.tmp" "$normalized_headers"
+  mapfile -t probe_headers < "$normalized_headers"
   curl_args=(curl -sS -o "$body_file" -w '%{{http_code}}' --max-time 15 \\
     --request "$PROBE_METHOD")
-  for header in "${{PROBE_HEADERS[@]-}}"; do
+  for header in "${{probe_headers[@]-}}"; do
     [[ -n "$header" ]] || continue
     curl_args+=(--header "$header")
   done
@@ -1280,7 +1333,7 @@ else
   RES="$parent"
 
   if method_out="$(aws apigateway put-method --region "$REGION" --rest-api-id "$API_ID" \\
-      --resource-id "$RES" --http-method "$METHOD" --authorization-type "$AUTHORIZATION" \\
+      --resource-id "$RES" --http-method "$METHOD" "${{AUTH_FLAGS[@]}}" \\
       "$API_KEY_FLAG" 2>&1)"; then
     printf '%s' "$RES" > "$STATE_DIR/method_owned.tmp"
     mv -f "$STATE_DIR/method_owned.tmp" "$STATE_DIR/method_owned"
@@ -1650,15 +1703,40 @@ def _validate_spec(manifest, spec):
         "method",
         "target_function",
         "authorization_type",
+        "invoke_url",
     ):
         if not spec.get(key):
             raise SystemExit(f"api_routes[0].{key} is required")
     if "api_key_required" not in spec or not isinstance(spec["api_key_required"], bool):
         raise SystemExit("api_routes[0].api_key_required must be an explicit boolean")
-    if spec["authorization_type"] != "NONE":
+    if spec["authorization_type"] not in {
+        "NONE",
+        "CUSTOM",
+        "COGNITO_USER_POOLS",
+    }:
         raise SystemExit(
-            "api_routes[0].authorization_type must be NONE until authorizer or "
-            "AWS_IAM bindings and signed probes are modeled"
+            "api_routes[0].authorization_type must be NONE, CUSTOM, or "
+            "COGNITO_USER_POOLS; AWS_IAM requires a signed HTTP probe lane"
+        )
+    authorizer_id = spec.get("authorizer_id")
+    authorizer_name = spec.get("authorizer_name")
+    scopes = spec.get("authorization_scopes", [])
+    if not isinstance(scopes, list) or not all(
+        isinstance(value, str) and value for value in scopes
+    ):
+        raise SystemExit("api_routes[0].authorization_scopes must be a string array")
+    if spec["authorization_type"] in {"CUSTOM", "COGNITO_USER_POOLS"}:
+        if not isinstance(authorizer_id, str) or not authorizer_id:
+            raise SystemExit(
+                "api_routes[0].authorizer_id is required for protected methods"
+            )
+        if not isinstance(authorizer_name, str) or not authorizer_name:
+            raise SystemExit(
+                "api_routes[0].authorizer_name is required for deployment comparison"
+            )
+    elif authorizer_id or authorizer_name or scopes:
+        raise SystemExit(
+            "api_routes[0] must not declare authorizer fields for authorization NONE"
         )
     cors = spec.get("cors")
     if not isinstance(cors, dict):
@@ -1696,6 +1774,8 @@ def _validate_spec(manifest, spec):
         )
     if not str(spec["path"]).startswith("/"):
         raise SystemExit("api_routes[0].path must start with '/'")
+    if not str(spec["invoke_url"]).startswith("https://"):
+        raise SystemExit("api_routes[0].invoke_url must start with https://")
     if manifest.get("status") != "READY":
         raise SystemExit(
             f"preflight: manifest.status={manifest.get('status')} (not READY) - a flagged kit "
@@ -1704,13 +1784,6 @@ def _validate_spec(manifest, spec):
 
 
 def compile_apigw_kit(kit, _repo=None):
-    print(
-        "PATCH_114_FACTORY_DISABLED: the incomplete tenant-stats factory "
-        "cannot compile API Gateway kits",
-        file=sys.stderr,
-    )
-    raise SystemExit(78)
-
     with open(os.path.join(kit, "manifest.json"), encoding="utf-8") as handle:
         manifest = json.load(handle)
     specs = manifest.get("api_routes") or []
@@ -1757,13 +1830,6 @@ def compile_apigw_kit(kit, _repo=None):
 
 
 def main(argv):
-    print(
-        "PATCH_114_FACTORY_DISABLED: the incomplete tenant-stats factory "
-        "cannot compile API Gateway kits",
-        file=sys.stderr,
-    )
-    return 78
-
     if len(argv) < 2:
         print("usage: _compile_apigw.py <patch-kit> [<source-repo>]", file=sys.stderr)
         return 2

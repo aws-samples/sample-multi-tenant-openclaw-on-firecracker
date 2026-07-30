@@ -113,13 +113,16 @@ API_MATCH="null"
 API_CONFIRMED=false
 STAGE_NAME=""
 API_PROBE_RESULTS="[]"
-API_WHY="unresolved: set OC_CONTROL_PLANE_URL and run from the real client call site with its auth headers"
+API_PROBE_HEADERS_SHA=""
+CONFIGURED_CLIENT_URL=""
+API_WHY="unresolved: operator must set OC_CONTROL_PLANE_API_ID, OC_CONTROL_PLANE_STAGE, OC_CONTROL_PLANE_URL, and OC_CONTROL_PLANE_PROBE_HEADERS_FILE"
 
 # A route/name match is only a candidate. Resolve an API only when the configured
 # client URL identifies it and authenticated calls to every required route succeed.
 if [ -n "${OC_CONTROL_PLANE_URL:-}" ]; then
   _need curl
   configured_url="${OC_CONTROL_PLANE_URL%/}"
+  CONFIGURED_CLIENT_URL="$configured_url"
   configured_host="${configured_url#*://}"
   configured_host="${configured_host%%/*}"
   # Base path as API Gateway stores it: no scheme, no host, no leading slash.
@@ -133,14 +136,22 @@ if [ -n "${OC_CONTROL_PLANE_URL:-}" ]; then
       derived_api_id="${configured_host%%.*}"
       ;;
   esac
-  configured_api_id="${OC_CONTROL_PLANE_API_ID:-$derived_api_id}"
+  configured_api_id="${OC_CONTROL_PLANE_API_ID:-}"
+  confirmed_stage="${OC_CONTROL_PLANE_STAGE:-}"
   if [ -z "$configured_api_id" ]; then
-    API_WHY="unresolved: custom domain requires OC_CONTROL_PLANE_API_ID"
+    API_WHY="unresolved: operator must explicitly confirm OC_CONTROL_PLANE_API_ID"
+  elif ! [[ "$configured_api_id" =~ ^[a-z0-9]{10}$ ]]; then
+    API_WHY="unresolved: operator-confirmed REST API id is invalid"
+  elif [ -z "$confirmed_stage" ]; then
+    API_WHY="unresolved: operator must explicitly confirm OC_CONTROL_PLANE_STAGE"
   elif [ -n "$derived_api_id" ] && [ "$configured_api_id" != "$derived_api_id" ]; then
     API_WHY="unresolved: configured URL API id disagrees with OC_CONTROL_PLANE_API_ID"
   elif ! printf '%s' "$API_CANDIDATES" |
     jq -e --arg id "$configured_api_id" 'any(.[]; .id == $id)' >/dev/null; then
     API_WHY="unresolved: configured API id is not present in this account/region"
+  elif [ -n "$derived_api_id" ] &&
+    [ "${configured_base_path%%/*}" != "$confirmed_stage" ]; then
+    API_WHY="unresolved: execute-api URL stage disagrees with OC_CONTROL_PLANE_STAGE"
   elif [ -z "$derived_api_id" ] &&
     ! mapped_stage="$(resolve_custom_domain_stage \
       "$configured_host" "$configured_base_path" "$configured_api_id")"; then
@@ -148,32 +159,40 @@ if [ -n "${OC_CONTROL_PLANE_URL:-}" ]; then
     # Require a base-path mapping that actually routes this URL to the configured
     # id, or the probe could confirm an unrelated API and we'd patch the wrong one.
     API_WHY="unresolved: no base-path mapping on $configured_host routes '/$configured_base_path' to API $configured_api_id"
+  elif [ -z "$derived_api_id" ] && [ "$mapped_stage" != "$confirmed_stage" ]; then
+    API_WHY="unresolved: custom-domain mapping stage disagrees with OC_CONTROL_PLANE_STAGE"
   else
+    [ -n "${OC_CONTROL_PLANE_PROBE_HEADERS_FILE:-}" ] || {
+      echo "FATAL: OC_CONTROL_PLANE_PROBE_HEADERS_FILE is required; unauthenticated probes cannot confirm the customer entry point" >&2
+      exit 2
+    }
     probe_headers=()
-    if [ -n "${OC_CONTROL_PLANE_PROBE_HEADERS_FILE:-}" ]; then
-      [ -f "$OC_CONTROL_PLANE_PROBE_HEADERS_FILE" ] || {
-        echo "FATAL: OC_CONTROL_PLANE_PROBE_HEADERS_FILE not found" >&2
-        exit 2
-      }
-      jq -e '
-        type == "object"
-        and all(to_entries[];
-          (.key | test("^[A-Za-z0-9-]+$"))
-          and (.value | type) == "string"
-          and (.value | test("[\r\n\t]") | not)
-        )
-      ' "$OC_CONTROL_PLANE_PROBE_HEADERS_FILE" >/dev/null || {
-        echo "FATAL: probe headers must be a safe string-valued JSON object" >&2
-        exit 2
-      }
-      while IFS=$'\t' read -r header_name header_value; do
-        probe_headers+=(-H "$header_name: $header_value")
-      done < <(jq -r 'to_entries[] | [.key,.value] | @tsv' \
-        "$OC_CONTROL_PLANE_PROBE_HEADERS_FILE")
-    fi
+    [ -f "$OC_CONTROL_PLANE_PROBE_HEADERS_FILE" ] &&
+      [ ! -L "$OC_CONTROL_PLANE_PROBE_HEADERS_FILE" ] || {
+      echo "FATAL: OC_CONTROL_PLANE_PROBE_HEADERS_FILE must be a regular non-symlink file" >&2
+      exit 2
+    }
+    jq -e '
+      type == "object"
+      and length > 0
+      and all(to_entries[];
+        (.key | test("^[A-Za-z0-9!#$%&'\''*+.^_`|~-]+$"))
+        and (.value | type) == "string"
+        and (.value | test("[\r\n\t]") | not)
+      )
+    ' "$OC_CONTROL_PLANE_PROBE_HEADERS_FILE" >/dev/null || {
+      echo "FATAL: probe headers must be a non-empty, safe string-valued JSON object" >&2
+      exit 2
+    }
+    API_PROBE_HEADERS_SHA="$(sha256sum "$OC_CONTROL_PLANE_PROBE_HEADERS_FILE" |
+      awk '{print $1}')"
+    while IFS=$'\t' read -r header_name header_value; do
+      probe_headers+=(-H "$header_name: $header_value")
+    done < <(jq -r 'to_entries[] | [.key,.value] | @tsv' \
+      "$OC_CONTROL_PLANE_PROBE_HEADERS_FILE")
     probes_ok=true
     probe_header_count="${#probe_headers[@]}"
-    IFS=',' read -r -a probe_paths <<< "${OC_CONTROL_PLANE_PROBE_PATHS:-/tenants,/hosts}"
+    IFS=',' read -r -a probe_paths <<< "/tenants,/hosts"
     for probe_path in "${probe_paths[@]}"; do
       case "$probe_path" in
         /*) ;;
@@ -198,11 +217,7 @@ if [ -n "${OC_CONTROL_PLANE_URL:-}" ]; then
       esac
     done
     if [ "$probes_ok" = true ]; then
-      if [ -n "${mapped_stage:-}" ]; then
-        candidate_stage="$mapped_stage"
-      else
-        candidate_stage="${configured_base_path%%/*}"
-      fi
+      candidate_stage="$confirmed_stage"
       if [ -z "$candidate_stage" ]; then
         API_WHY="unresolved: configured client URL does not identify a REST API stage"
       elif ! Q apigateway get-stage --rest-api-id "$configured_api_id" \
@@ -231,10 +246,65 @@ fi
 
 API_DEPLOYED_STAGES="[]"
 API_INTEGRATION_TARGET=""
+API_ENTRYPOINT_KIND="unresolved"
+API_REFERENCE_CONTRACT="null"
 if [ "$API_MATCH" != "null" ]; then
   API_DEPLOYED_STAGES="$(Q apigateway get-stages --rest-api-id "$API_MATCH" |
     jq -c '[.item[]? | {stage:.stageName, deployed:.lastUpdatedDate}]')"
   matched_resources="$(Q apigateway get-resources --rest-api-id "$API_MATCH")"
+  exact_tenants="$(printf '%s' "$matched_resources" |
+    jq 'any(.items[]; .path == "/tenants" and (.resourceMethods.GET != null))')"
+  exact_hosts="$(printf '%s' "$matched_resources" |
+    jq 'any(.items[]; .path == "/hosts" and (.resourceMethods.GET != null))')"
+  if [ "$exact_tenants" = true ] && [ "$exact_hosts" = true ]; then
+    API_ENTRYPOINT_KIND="explicit-rest-resources"
+  elif printf '%s' "$matched_resources" |
+    jq -e 'any(.items[]; .path == "/{proxy+}" and (.resourceMethods.ANY != null))' \
+      >/dev/null; then
+    API_ENTRYPOINT_KIND="proxy-resource"
+  fi
+  if [ "$API_ENTRYPOINT_KIND" != "explicit-rest-resources" ]; then
+    API_CONFIRMED=false
+    API_WHY="rejected: the confirmed REST API lacks exact GET /tenants and GET /hosts resources; ANY /{proxy+} is never a target for this patch"
+  fi
+
+  reference_rid="$(printf '%s' "$matched_resources" |
+    jq -r 'first(.items[] | select(.path == "/tenants" and .resourceMethods.GET) | .id) // empty')"
+  if [ -n "$reference_rid" ]; then
+    reference_method="$(Q apigateway get-method --rest-api-id "$API_MATCH" \
+      --resource-id "$reference_rid" --http-method GET)"
+    reference_integration="$(Q apigateway get-integration --rest-api-id "$API_MATCH" \
+      --resource-id "$reference_rid" --http-method GET)"
+    reference_authorizer_id="$(printf '%s' "$reference_method" |
+      jq -r '.authorizerId // empty')"
+    reference_authorizer_name=""
+    if [ -n "$reference_authorizer_id" ]; then
+      reference_authorizer_name="$(Q apigateway get-authorizer \
+        --rest-api-id "$API_MATCH" --authorizer-id "$reference_authorizer_id" |
+        jq -r '.name // empty')"
+    fi
+    API_REFERENCE_CONTRACT="$(jq -n \
+      --arg path "/tenants" --arg method "GET" \
+      --arg auth "$(printf '%s' "$reference_method" |
+        jq -r '.authorizationType // "NONE"')" \
+      --argjson api_key "$(printf '%s' "$reference_method" |
+        jq '.apiKeyRequired // false')" \
+      --arg authorizer_id "$reference_authorizer_id" \
+      --arg authorizer_name "$reference_authorizer_name" \
+      --argjson scopes "$(printf '%s' "$reference_method" |
+        jq -c '.authorizationScopes // []')" \
+      --arg uri "$(printf '%s' "$reference_integration" | jq -r '.uri // empty')" '
+      {
+        path:$path,
+        method:$method,
+        authorization_type:$auth,
+        api_key_required:$api_key,
+        authorizer_id:(if $authorizer_id == "" then null else $authorizer_id end),
+        authorizer_name:(if $authorizer_name == "" then null else $authorizer_name end),
+        authorization_scopes:$scopes,
+        integration_uri:$uri
+      }')"
+  fi
   # Derive the control-plane Lambda ONLY from the integrations behind the probed,
   # authenticated paths, and require them to resolve to a single function. Taking
   # the first method on any resource could bind a co-hosted Lambda on the same
@@ -348,6 +418,13 @@ if [ -n "$API_FUNCTION" ]; then
 else
   warn "serving Lambda unresolved; API must be confirmed before ASG correlation"
 fi
+
+TENANTS_TABLE="$(printf '%s' "$API_FUNCTION_CONFIG" |
+  jq -r '.Environment.Variables.TENANTS_TABLE // empty')"
+WRITER_ASSETS_BUCKET="$(printf '%s' "$API_FUNCTION_CONFIG" |
+  jq -r '.Environment.Variables.ASSETS_BUCKET // empty')"
+WRITER_ROOTFS_PREFIX="$(printf '%s' "$API_FUNCTION_CONFIG" |
+  jq -r '.Environment.Variables.ROOTFS_PREFIX // empty')"
 
 # Resolve the hosts table from the serving Lambda contract, then use its live
 # instance ids as the machine identity for the Firecracker fleet.
@@ -480,6 +557,9 @@ fi
 jq -n \
   --arg region "$REGION" --arg account "$ACCT" --arg caller "$CALLER" \
   --arg api "$API_MATCH" --arg api_stage "$STAGE_NAME" --arg api_why "$API_WHY" \
+  --arg api_url "$CONFIGURED_CLIENT_URL" --arg api_entry "$API_ENTRYPOINT_KIND" \
+  --arg headers_sha "$API_PROBE_HEADERS_SHA" \
+  --argjson api_reference "$API_REFERENCE_CONTRACT" \
   --argjson api_confirmed "$API_CONFIRMED" --argjson api_probes "$API_PROBE_RESULTS" \
   --argjson api_candidates "$API_CANDIDATES" --argjson api_facts "$API_FACTS" \
   --argjson stages "$API_DEPLOYED_STAGES" --arg api_target "$API_INTEGRATION_TARGET" \
@@ -492,6 +572,9 @@ jq -n \
   --argjson hosts "$HOST_IDS" --argjson fixes "$FIX_VERDICTS" \
   --arg dispatch "$DISPATCH_MODE" --arg api_function "$API_FUNCTION" \
   --arg api_qualifier "$API_QUALIFIER" \
+  --arg tenants_table "$TENANTS_TABLE" \
+  --arg writer_assets_bucket "$WRITER_ASSETS_BUCKET" \
+  --arg writer_rootfs_prefix "$WRITER_ROOTFS_PREFIX" \
   --argjson bindings "$FB_BINDINGS" --arg assets_bucket "$ASSETS_BUCKET" '
   {
     region:$region, account:$account, caller_arn:$caller,
@@ -500,6 +583,10 @@ jq -n \
     control_plane_api:{
       id:(if $api == "null" then null else $api end),
       stage:(if $api_stage == "" then null else $api_stage end),
+      configured_client_url:(if $api_url == "" then null else $api_url end),
+      entrypoint_kind:$api_entry,
+      reference_method:$api_reference,
+      probe_headers_sha256:(if $headers_sha == "" then null else $headers_sha end),
       why:$api_why, candidates:$api_candidates,
       candidate_facts:$api_facts, candidate_count:($api_candidates_n | tonumber),
       deployed_stages:$stages, lambda_integration:$api_target,
@@ -510,6 +597,11 @@ jq -n \
       function:$api_function, api_invokes:$api_target, aliases:$aliases,
       serving_qualifier:$api_qualifier, latest_code_sha256:$latest_sha,
       dispatch_sqs_esm_binds:$esm
+    },
+    tenant_stats_inputs:{
+      tenants_table:(if $tenants_table == "" then null else $tenants_table end),
+      assets_bucket:(if $writer_assets_bucket == "" then null else $writer_assets_bucket end),
+      rootfs_prefix:(if $writer_rootfs_prefix == "" then null else $writer_rootfs_prefix end)
     },
     asg:{
       name:$asg, why:$asg_why, lt_id:$lt_id, lt_name:$lt_name,

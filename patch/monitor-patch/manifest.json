@@ -1,7 +1,7 @@
 {
   "id": "monitor-patch",
   "base_sha": "a547dc74fe25ea0219c804933c5a7da8af1e3b39",
-  "patch_sha": "c6fafab7f9c8e33a2c889d93d2033e78a0cb20ee",
+  "patch_sha": "e63bc7d9df85b4c8918a0612391be9cccf458186",
   "status": "MANUAL_REVIEW",
   "excludes": [
     "README.md",
@@ -10,13 +10,23 @@
     "deploy/monitoring/MONITORING-RUNBOOK.md",
     "deploy/monitoring/WAZUH-RUNBOOK.md",
     "deploy/monitoring/wazuh-two-ec2/**",
-    "deploy/monitoring/prometheus.yml",
     "deploy/runtime-config-export/**",
     "config.yml.example",
     "pyproject.toml",
     "uv.lock",
     "scripts/**",
-    "console/**"
+    "console/**",
+    "tests/**"
+  ],
+  "field_corrections": [
+    {
+      "path": "deploy/edge/nginx.conf",
+      "reason": "The shipped artifact removes internal documentation references from comments for open-source publication; runtime directives are unchanged."
+    },
+    {
+      "path": "deploy/userdata/route_ops.py",
+      "reason": "The shipped artifact removes an internal documentation reference from its module comment for open-source publication; runtime code is unchanged."
+    }
   ],
   "paths": {
     "deploy/userdata/host-agent.py": {
@@ -24,7 +34,7 @@
       "layer": "B-s3",
       "artifact": "host-scripts/host-agent.py.patched",
       "base_sha256": "c59d450daba3a50a1ef1e0b9026e072122361a1b6e565659c2b270ef0cc85339",
-      "patch_sha256": "11b4a23934e7c2e80eb0a8c1bb657e6520e9db4e5976fba2a879fa78a1327a27",
+      "patch_sha256": "fc7a67b9b1a2bad2384069c0a9819c383e01515e2af83d22d9d0b52bcc68bac1",
       "operations": [
         {
           "resource": "s3:deployment/scripts/host-agent.py on live hosts + S3",
@@ -36,7 +46,26 @@
       "fix_ids": [
         "#387-monitor",
         "#390-hooks",
-        "#stop-serialize"
+        "#stop-serialize",
+        "#route-cleanup"
+      ]
+    },
+    "deploy/userdata/route_ops.py": {
+      "change": "M",
+      "layer": "B-s3",
+      "artifact": "host-scripts/route_ops.py.patched",
+      "base_sha256": "b15d3279d609acc5c86a1a2bd5aa165f1e2618764518eebf46bb3b02b624a45f",
+      "patch_sha256": "ba77c83be8d0433966fe13ae17c59c998d5f16a8242feb7fd6370b3ad24da14d",
+      "operations": [
+        {
+          "resource": "s3:deployment/scripts/route_ops.py on live hosts + S3",
+          "class": "AUTO_CLI",
+          "apply_cli": "SSM push host-scripts/route_ops.py.patched to live hosts /opt/openclaw/route_ops.py and promote the verified object to deployment/scripts/route_ops.py",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#route-cleanup"
       ]
     },
     "deploy/userdata/launch-vm.sh": {
@@ -177,6 +206,24 @@
         "#tenant-stats"
       ]
     },
+    "deploy/lambda/api/core/ssm_dispatch.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/core/ssm_dispatch.py",
+      "base_sha256": "0e7a57ed59796410bc434ef23082787017ff53a355df46d53883b09cbfd0c4b2",
+      "patch_sha256": "e57539edb47e586d909a438088a0d25f09dcbdc8ac702387c0660d1b61ee8091",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api overlay",
+          "class": "AUTO_CLI",
+          "apply_cli": "Pull the live openclaw-api zip, overlay lambda/api/core/ssm_dispatch.py, update $LATEST with RevisionId, publish, then update only the serving alias",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#route-cleanup"
+      ]
+    },
     "deploy/lambda/api/core/pagination.py": {
       "change": "A",
       "layer": "C-lambda",
@@ -282,7 +329,7 @@
       "layer": "C-lambda",
       "artifact": "lambda/api/services/tenant_service.py",
       "base_sha256": "8839cd464e86147d05b8d30a31626383b44d3f6bbbb107b3cf267809153cd054",
-      "patch_sha256": "be7f743d615b81b04bc5bedfbf850df7679c7517382137b3b9d035fb938a3938",
+      "patch_sha256": "c5f8d43f3bca3787aeb1fe54f195d5f3a0fa4349de44b8655ef39d31160688d7",
       "operations": [
         {
           "resource": "lambda:openclaw-api overlay",
@@ -294,7 +341,8 @@
       "fix_ids": [
         "#387-monitor",
         "#tenant-query",
-        "#tenant-stats"
+        "#tenant-stats",
+        "#route-cleanup"
       ]
     },
     "deploy/lambda/api/services/tenant_stats_service.py": {
@@ -400,7 +448,7 @@
       "layer": "D-cdk",
       "artifact": null,
       "base_sha256": "e5ecf05e135364cf28195e5ca705cb72d313d8dbc67b90affff3985d2abbf973",
-      "patch_sha256": "3323c2910569040b1ba7ee94db326dfd922ed739a821709f5a80ae62f00b617d",
+      "patch_sha256": "733b002c2c4aba84e13831069e28d3181622a1cb7cfc2255bf51c7b82994c05f",
       "operations": [
         {
           "resource": "iam:host-role S3 GetObject grant for user_hooks bucket",
@@ -419,7 +467,8 @@
         "#387-monitor",
         "#tenant-query",
         "#tenant-stats",
-        "#390-hooks"
+        "#390-hooks",
+        "#edge-fluent-bit"
       ]
     },
     "deploy/stacks/lambdas.py": {
@@ -444,7 +493,7 @@
         {
           "resource": "apigw:GET /tenants-stats route (NEW)",
           "class": "AUTO_CLI",
-          "apply_cli": "bash lib/apply-api-routes.sh — add GET /tenants-stats resource",
+          "apply_cli": "Use AWS CLI to copy GET /tenants method auth, API-key requirement, authorizer and AWS_PROXY integration onto GET /tenants-stats, add OPTIONS/CORS, then create a deployment and update only the confirmed stage",
           "rollback_policy": "RESTORE"
         },
         {
@@ -578,17 +627,35 @@
         "#390-hooks"
       ]
     },
+    "deploy/edge/fluent-bit/install-fluent-bit.sh": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/edge/install-fluent-bit.sh",
+      "base_sha256": "9c900c9494e711e6e8acb42af4550d3e3341ef70233d90533e1a5e1ffd4db25f",
+      "patch_sha256": "2200429850c36396a28af70332db2f5bf5764fb5314cc6369b0bec426b025c58",
+      "operations": [
+        {
+          "resource": "file:deploy/edge/fluent-bit/install-fluent-bit.sh on running Edge instances and S3",
+          "class": "AUTO_CLI",
+          "apply_cli": "SSM install the patched script and validated Edge Fluent Bit config, then promote the verified objects to the customer Edge S3 keys",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#edge-fluent-bit"
+      ]
+    },
     "deploy/edge/fluent-bit/host/fluent-bit.conf": {
       "change": "M",
       "layer": "deploy-other",
-      "artifact": null,
+      "artifact": "host-scripts/edge/fluent-bit/host/fluent-bit.conf",
       "base_sha256": "ab3ed3b91c6bc5ba83b0da5afd07f85331b8e98981f794110badf10c8718a3b7",
       "patch_sha256": "ea9ef977c38431688404061449cc76cc1d5e9af8e7243ac98f647da2884af6bd",
       "operations": [
         {
           "resource": "file:deploy/edge/fluent-bit/host/fluent-bit.conf",
           "class": "AUTO_CLI",
-          "apply_cli": "Replace deploy/edge/fluent-bit/host/fluent-bit.conf on live system via S3/SSM",
+          "apply_cli": "SSM install host-scripts/edge/fluent-bit/host/fluent-bit.conf on active hosts, validate and restart Fluent Bit, then promote it to deployment/observability/fluent-bit/host/fluent-bit.conf",
           "rollback_policy": "RESTORE"
         }
       ],
@@ -599,14 +666,32 @@
     "deploy/edge/nginx.conf": {
       "change": "M",
       "layer": "deploy-other",
-      "artifact": null,
+      "artifact": "host-scripts/edge/nginx.conf",
       "base_sha256": "de7a174503cebfd5f6f15620dc33e650a03d42b6d7c5fb233dd5c7d4f5e8a0d6",
-      "patch_sha256": "fb1c3f1e714b4685741f0ba31113285a9b774fe5d147cfbd47b4ee540e0eb459",
+      "patch_sha256": "e361787460a052fa15f7062021de31e0a0dd1f2619c216c833302cf17c09ff1f",
       "operations": [
         {
           "resource": "file:deploy/edge/nginx.conf",
           "class": "AUTO_CLI",
-          "apply_cli": "Replace deploy/edge/nginx.conf on live system via S3/SSM",
+          "apply_cli": "SSM install host-scripts/edge/nginx.conf on active Edge instances, validate and reload nginx, then promote it to the Edge S3 config key",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "#387-monitor"
+      ]
+    },
+    "deploy/monitoring/prometheus.yml": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/monitoring/prometheus.yml",
+      "base_sha256": "84b457c79a78511a6d49c82285c52f67aec20b8e56be3130265b6f12edd047d3",
+      "patch_sha256": "66a04045c2211594b0065f22b72c9358f0ee5a66283685e15b11bc63dbc06d5b",
+      "operations": [
+        {
+          "resource": "file:deploy/monitoring/prometheus.yml on the remote monitoring node",
+          "class": "AUTO_CLI",
+          "apply_cli": "Install host-scripts/monitoring/prometheus.yml on the remote monitoring node, render the customer region, validate with promtool, and reload Prometheus",
           "rollback_policy": "RESTORE"
         }
       ],
@@ -715,7 +800,8 @@
         "deploy/lambda/api/handler.py",
         "deploy/lambda/api/services/host_service.py",
         "deploy/edge/fluent-bit/host/fluent-bit.conf",
-        "deploy/edge/nginx.conf"
+        "deploy/edge/nginx.conf",
+        "deploy/monitoring/prometheus.yml"
       ],
       "applies_when": "always",
       "params_changed": [
@@ -723,8 +809,8 @@
           "name": "METRICS_PORT",
           "layer": "B-s3",
           "old_default": "none (metrics endpoint did not exist)",
-          "new_default": "9200",
-          "runtime_impact": "host-agent now listens on :9200 for Prometheus scraping; no effect on tenant traffic"
+          "new_default": "8899",
+          "runtime_impact": "host-agent now listens on :8899 for Prometheus scraping; no effect on tenant traffic"
         }
       ],
       "verification_ids": [
@@ -821,6 +907,34 @@
       ]
     },
     {
+      "id": "#edge-fluent-bit",
+      "summary": "Edge Fluent Bit deployment now fails closed on an empty delivery stream or unresolved template variables, validates the rendered config with --dry-run, and passes the logging bucket, region, and stream through future Edge launch-template userdata.",
+      "paths": [
+        "deploy/edge/fluent-bit/install-fluent-bit.sh",
+        "deploy/stacks/ha_edge.py"
+      ],
+      "applies_when": "when edge logging is enabled",
+      "params_changed": [],
+      "verification_ids": [
+        "v-edge-fluent-bit"
+      ]
+    },
+    {
+      "id": "#route-cleanup",
+      "summary": "Remove the unused legacy launch-time DNAT family and make delete reclaim bitmap DNAT, legacy DNAT, Redis route, and the in-process bitmap slot. Route-cleanup failure keeps the tenant retryable instead of finalizing a hidden leak.",
+      "paths": [
+        "deploy/userdata/host-agent.py",
+        "deploy/userdata/route_ops.py",
+        "deploy/lambda/api/core/ssm_dispatch.py",
+        "deploy/lambda/api/services/tenant_service.py"
+      ],
+      "applies_when": "always",
+      "params_changed": [],
+      "verification_ids": [
+        "v-route-cleanup"
+      ]
+    },
+    {
       "id": "#stop-serialize",
       "summary": "stop-vm.sh lifecycle lock serialization: stop acquires the same per-tenant flock as launch-vm.sh (fd9) to prevent race between stop and cold-launch. Legacy Firecracker fd9 holder detection avoids deadlock on pre-patch VMs. launch-vm.sh closes fd9 in the Firecracker child (9>&-).",
       "paths": [
@@ -840,10 +954,10 @@
       "id": "v-metrics-endpoint",
       "fix_id": "#387-monitor",
       "phase": "A-readonly",
-      "action": "curl -s http://<host-ip>:9200/metrics",
+      "action": "curl -s http://<host-ip>:8899/metrics",
       "observable": "Prometheus exposition text with openclaw_vm_health, openclaw_app_health, openclaw_host_dnat_ports_*, openclaw_host_build_info, openclaw_host_loop_tick, openclaw_host_ssm_agent_up",
       "pass_when": "HTTP 200 AND all expected metric families present with valid samples",
-      "fail_when": "Connection refused (agent not listening on 9200) OR missing metric families",
+      "fail_when": "Connection refused (agent not listening on 8899) OR missing metric families",
       "timeout_s": 10,
       "cleanup": null
     },
@@ -862,7 +976,7 @@
       "id": "v-port-watermark",
       "fix_id": "#387-monitor",
       "phase": "A-readonly",
-      "action": "curl -s http://<host-ip>:9200/metrics | grep openclaw_host_dnat_ports",
+      "action": "curl -s http://<host-ip>:8899/metrics | grep openclaw_host_dnat_ports",
       "observable": "openclaw_host_dnat_ports_used, _total, _quarantined gauges",
       "pass_when": "All three present; _total > 0; _used >= 0; _used <= _total",
       "fail_when": "Any of the three absent OR _used > _total (accounting error)",
@@ -923,6 +1037,28 @@
       "fail_when": "Literal {{HOST_USER_HOOK}} in rendered UserData (template not substituted — host would fail)",
       "timeout_s": 30,
       "cleanup": null
+    },
+    {
+      "id": "v-edge-fluent-bit",
+      "fix_id": "#edge-fluent-bit",
+      "phase": "A-readonly",
+      "action": "On every Edge instance: systemctl is-active fluent-bit; run fluent-bit --dry-run; verify no unresolved FB variables and a non-empty Firehose stream",
+      "observable": "Fluent Bit service state and rendered configuration",
+      "pass_when": "Every Edge is active, dry-run succeeds, and the configured stream is the selected customer stream",
+      "fail_when": "Any Edge is inactive/failed, delivery_stream is empty, or a template variable remains",
+      "timeout_s": 120,
+      "cleanup": null
+    },
+    {
+      "id": "v-route-cleanup",
+      "fix_id": "#route-cleanup",
+      "phase": "B-lifecycle",
+      "action": "Create one exact test tenant to running, record bitmap DNAT and Redis route, delete it with keep_data=false, then inspect the same host",
+      "observable": "Bitmap DNAT, legacy DNAT, Redis route, bitmap used gauge, VM directory, and Firecracker process",
+      "pass_when": "One bitmap rule exists while running; no legacy rule is created; after delete both counts are zero, Redis is empty, bitmap used drops by one, and VM state is absent",
+      "fail_when": "A legacy rule appears, route cleanup returns 5xx without remaining retryable, or any exact route/VM state remains after successful delete",
+      "timeout_s": 360,
+      "cleanup": "DELETE only the exact recorded test tenant ID; never use a prefix wildcard"
     },
     {
       "id": "v-stop-no-race",

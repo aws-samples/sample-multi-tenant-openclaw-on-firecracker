@@ -4,7 +4,7 @@
 
 从 handler.py 机械搬迁,函数体逐字不变:_launch_vm_wake_cmd / _launch_vm /
 _ssm_send / _ssm_run。_ssm_run 被 14 处调用(facade 别名保持 handler.<sym> 可用)。
-共享 ssm client + VM_PORT_BASE 从 core.clients import;stdlib(shlex/time) 本模块自带。
+共享 ssm client 从 core.clients import;stdlib(shlex/time) 本模块自带。
 #187 P5: 原  Cognito b64 分支(base64/json)已随 channel/hub 下线一并移除,
 第 11 位保留空占位("")保持位置对齐。
 按 design.md 层间契约:core 域不反向 import services/routes。
@@ -14,7 +14,7 @@ facade:handler.py re-export 全部符号,旧 patch/调用路径全程有效。
 import shlex
 import time
 
-from core.clients import ssm, VM_PORT_BASE
+from core.clients import ssm
 
 
 def _launch_vm_wake_cmd(tenant_id, item):
@@ -138,10 +138,16 @@ def _launch_vm(
     # (byte-identical pre-#188 behavior; feature off = no paired.json). The value
     # is already base64 text from create_tenant, shell-quote defensively.
     device_paired_arg = _q(device_paired_b64) if device_paired_b64 else '""'
+    # The live two-tier route is allocated by host-agent from the configured
+    # bitmap range and committed to Redis after the guest passes health checks.
+    # The historical VM_PORT_BASE+vm_num rule was never consumed by edge, was
+    # outside the edge->host SG range, and could not be reconstructed from DDB
+    # after host-agent replaced host_port during promotion. Do not create that
+    # second, permanently leaked DNAT family.
     cmd = (
-        f"/home/ubuntu/launch-vm.sh {tenant_id} {vm_num} {vcpu} {mem_mb} {tpl_arg} {restore_arg} {skills_arg} {vkey_arg} {csecret_arg} {chat_ep_arg} {cognito_arg} {gw_token_arg} {device_paired_arg} && "
-        f"sudo iptables --wait 3 -t nat -A PREROUTING "
-        f"-p tcp --dport {host_port} -j DNAT --to-destination {guest_ip}:{VM_PORT_BASE}"
+        f"/home/ubuntu/launch-vm.sh {tenant_id} {vm_num} {vcpu} {mem_mb} "
+        f"{tpl_arg} {restore_arg} {skills_arg} {vkey_arg} {csecret_arg} "
+        f"{chat_ep_arg} {cognito_arg} {gw_token_arg} {device_paired_arg}"
     )
     # Return the SSM CommandId (or None if submission failed — notably an SSM
     # SendCommand ThrottlingException under concurrent consumer fan-out, loop

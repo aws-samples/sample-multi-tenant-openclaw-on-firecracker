@@ -1,0 +1,7 @@
+Review this create-only DynamoDB hot-patch kit for unattended production use.
+The table is a dependency for later kits. It must bind account and region, create
+only the declared on-demand table and key schema, enable PITR, distinguish read
+errors from transient writes and permanent failures, refuse a conflicting
+existing table, converge on retry, and never delete the table in rollback.
+Treat cross-kit business behavior as out of scope. Score 0-10; pass requires at
+least 6.5 and zero blockers. Name concrete defects with file and line.

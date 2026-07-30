@@ -1,0 +1,418 @@
+{
+  "base_sha": "a547dc74fe25ea0219c804933c5a7da8af1e3b39",
+  "cloudformation": {
+    "provenance": null,
+    "reason": "this Lambda source lane contains no CDK source paths",
+    "stacks": [],
+    "status": "NOT_APPLICABLE"
+  },
+  "excludes": [],
+  "fixes": [
+    {
+      "applies_when": "openclaw-api exists with alias live and the patch does not change requirements.txt",
+      "id": "F-control-plane",
+      "params_changed": [],
+      "paths": [
+        "deploy/lambda/api/core/auth.py",
+        "deploy/lambda/api/core/clients.py",
+        "deploy/lambda/api/core/pagination.py",
+        "deploy/lambda/api/handler.py",
+        "deploy/lambda/api/services/fleet_service.py",
+        "deploy/lambda/api/services/host_service.py",
+        "deploy/lambda/api/services/registry_service.py",
+        "deploy/lambda/api/services/tenant_query_service.py",
+        "deploy/lambda/api/services/tenant_service.py",
+        "deploy/lambda/api/services/tenant_stats_service.py"
+      ],
+      "summary": "Replace 10 first-party module(s) in the openclaw-api package with the compiled overlay",
+      "verification_ids": [
+        "V-latest-then-alias"
+      ]
+    }
+  ],
+  "id": "114-api-lambda",
+  "lambda_functions": [
+    {
+      "alias": "live",
+      "environment_updates": {
+        "TENANT_STATS_TABLE": "openclaw-tenant-stats"
+      },
+      "esm_binding_conflict": "LEAVES_BINDING_UNCHANGED",
+      "function_name": "openclaw-api",
+      "iam_read_tables": [
+        "openclaw-tenant-stats"
+      ],
+      "package_root": "deploy/lambda/api",
+      "verify_expect": {
+        "statusCode": 404
+      },
+      "verify_payload": {
+        "headers": {},
+        "httpMethod": "GET",
+        "path": "/__oc_patch_probe",
+        "requestContext": {
+          "identity": {}
+        },
+        "resource": "/__oc_patch_probe"
+      }
+    }
+  ],
+  "patch_sha": "f8b9e14e5f456a24dc8fc597528a7b1b1540a9f3",
+  "paths": {
+    "deploy/lambda/api/core/auth.py": {
+      "artifact": "lambda/api/core/auth.py",
+      "artifact_disposition": null,
+      "artifact_status": "SHIPPED",
+      "base_sha256": "b9dc041487ade0c2296fafc3c0dd470e4f08df447fca5bf88a4b4bb4ff6f2727",
+      "change": "M",
+      "fix_ids": [
+        "F-control-plane"
+      ],
+      "layer": "C-lambda",
+      "operations": [
+        {
+          "apply_cli": null,
+          "artifact_refs": [],
+          "class": "AUTO_CLI",
+          "resource": "lambda openclaw-api :: deploy/lambda/api/core/auth.py",
+          "resource_refs": [],
+          "rollback_cli": null,
+          "rollback_policy": "REDEPLOY_ZIP",
+          "verify_cli": null
+        }
+      ],
+      "patch_sha256": "99ee267e2dac16d70c6948b174ebb8199ad4af9f8f97ba6e7f51afddf4506ab9",
+      "propagation": [
+        {
+          "location": "openclaw-api:$LATEST",
+          "surface": "lambda-latest"
+        },
+        {
+          "location": "openclaw-api:live",
+          "surface": "lambda-alias"
+        }
+      ]
+    },
+    "deploy/lambda/api/core/clients.py": {
+      "artifact": "lambda/api/core/clients.py",
+      "artifact_disposition": null,
+      "artifact_status": "SHIPPED",
+      "base_sha256": "17b41b2dcefc557c5adb228b01bfdd1cc014c20825886fdc5944940b2ace8efb",
+      "change": "M",
+      "fix_ids": [
+        "F-control-plane"
+      ],
+      "layer": "C-lambda",
+      "operations": [
+        {
+          "apply_cli": null,
+          "artifact_refs": [],
+          "class": "AUTO_CLI",
+          "resource": "lambda openclaw-api :: deploy/lambda/api/core/clients.py",
+          "resource_refs": [],
+          "rollback_cli": null,
+          "rollback_policy": "REDEPLOY_ZIP",
+          "verify_cli": null
+        }
+      ],
+      "patch_sha256": "04c24a71fb5b6418c61a2a889c03fea5ada47f5ee46797fdaa98322670c432b9",
+      "propagation": [
+        {
+          "location": "openclaw-api:$LATEST",
+          "surface": "lambda-latest"
+        },
+        {
+          "location": "openclaw-api:live",
+          "surface": "lambda-alias"
+        }
+      ]
+    },
+    "deploy/lambda/api/core/pagination.py": {
+      "artifact": "lambda/api/core/pagination.py",
+      "artifact_disposition": null,
+      "artifact_status": "SHIPPED",
+      "base_sha256": null,
+      "change": "A",
+      "fix_ids": [
+        "F-control-plane"
+      ],
+      "layer": "C-lambda",
+      "operations": [
+        {
+          "apply_cli": null,
+          "artifact_refs": [],
+          "class": "AUTO_CLI",
+          "resource": "lambda openclaw-api :: deploy/lambda/api/core/pagination.py",
+          "resource_refs": [],
+          "rollback_cli": null,
+          "rollback_policy": "REDEPLOY_ZIP",
+          "verify_cli": null
+        }
+      ],
+      "patch_sha256": "dfe3b93521c7c5dbb03fdc8da507c76422fe696c013ee686e4b25c7bbad0ac9b",
+      "propagation": [
+        {
+          "location": "openclaw-api:$LATEST",
+          "surface": "lambda-latest"
+        },
+        {
+          "location": "openclaw-api:live",
+          "surface": "lambda-alias"
+        }
+      ]
+    },
+    "deploy/lambda/api/handler.py": {
+      "artifact": "lambda/api/handler.py",
+      "artifact_disposition": null,
+      "artifact_status": "SHIPPED",
+      "base_sha256": "6157fd3445b9d120c81f6b850b4580e84a70aa63f5fe5a3e4516ddf66432432e",
+      "change": "M",
+      "fix_ids": [
+        "F-control-plane"
+      ],
+      "layer": "C-lambda",
+      "operations": [
+        {
+          "apply_cli": null,
+          "artifact_refs": [],
+          "class": "AUTO_CLI",
+          "resource": "lambda openclaw-api :: deploy/lambda/api/handler.py",
+          "resource_refs": [],
+          "rollback_cli": null,
+          "rollback_policy": "REDEPLOY_ZIP",
+          "verify_cli": null
+        }
+      ],
+      "patch_sha256": "6501dd44a679de85d0da6eddeb95acaf0da5c1f84666fb87a92a6ca479e4772e",
+      "propagation": [
+        {
+          "location": "openclaw-api:$LATEST",
+          "surface": "lambda-latest"
+        },
+        {
+          "location": "openclaw-api:live",
+          "surface": "lambda-alias"
+        }
+      ]
+    },
+    "deploy/lambda/api/services/fleet_service.py": {
+      "artifact": "lambda/api/services/fleet_service.py",
+      "artifact_disposition": null,
+      "artifact_status": "SHIPPED",
+      "base_sha256": "c974aa015444fb715e919f70db3aca48ffc6cc209b71a93224d827baa6b2d2e8",
+      "change": "M",
+      "fix_ids": [
+        "F-control-plane"
+      ],
+      "layer": "C-lambda",
+      "operations": [
+        {
+          "apply_cli": null,
+          "artifact_refs": [],
+          "class": "AUTO_CLI",
+          "resource": "lambda openclaw-api :: deploy/lambda/api/services/fleet_service.py",
+          "resource_refs": [],
+          "rollback_cli": null,
+          "rollback_policy": "REDEPLOY_ZIP",
+          "verify_cli": null
+        }
+      ],
+      "patch_sha256": "cc703f18d8013613de489cc17709624feb9da12068282b035b25bc3bcc026152",
+      "propagation": [
+        {
+          "location": "openclaw-api:$LATEST",
+          "surface": "lambda-latest"
+        },
+        {
+          "location": "openclaw-api:live",
+          "surface": "lambda-alias"
+        }
+      ]
+    },
+    "deploy/lambda/api/services/host_service.py": {
+      "artifact": "lambda/api/services/host_service.py",
+      "artifact_disposition": null,
+      "artifact_status": "SHIPPED",
+      "base_sha256": "4f8469830fb061e85f17f360a3782261769b5275fb7c48747e0d8384a45f7098",
+      "change": "M",
+      "fix_ids": [
+        "F-control-plane"
+      ],
+      "layer": "C-lambda",
+      "operations": [
+        {
+          "apply_cli": null,
+          "artifact_refs": [],
+          "class": "AUTO_CLI",
+          "resource": "lambda openclaw-api :: deploy/lambda/api/services/host_service.py",
+          "resource_refs": [],
+          "rollback_cli": null,
+          "rollback_policy": "REDEPLOY_ZIP",
+          "verify_cli": null
+        }
+      ],
+      "patch_sha256": "8af4ad419ec9dc4e846ea2f7947443ec3ecf276d1e648d7c150f9ad2b2b277a8",
+      "propagation": [
+        {
+          "location": "openclaw-api:$LATEST",
+          "surface": "lambda-latest"
+        },
+        {
+          "location": "openclaw-api:live",
+          "surface": "lambda-alias"
+        }
+      ]
+    },
+    "deploy/lambda/api/services/registry_service.py": {
+      "artifact": "lambda/api/services/registry_service.py",
+      "artifact_disposition": null,
+      "artifact_status": "SHIPPED",
+      "base_sha256": "f89d6822d2c31f9e0179ff297347d78b3262abb73c6ea9564ebefd8fc9d8f4de",
+      "change": "M",
+      "fix_ids": [
+        "F-control-plane"
+      ],
+      "layer": "C-lambda",
+      "operations": [
+        {
+          "apply_cli": null,
+          "artifact_refs": [],
+          "class": "AUTO_CLI",
+          "resource": "lambda openclaw-api :: deploy/lambda/api/services/registry_service.py",
+          "resource_refs": [],
+          "rollback_cli": null,
+          "rollback_policy": "REDEPLOY_ZIP",
+          "verify_cli": null
+        }
+      ],
+      "patch_sha256": "db1aaf3f2d3548760b2317a6b294284a590df89b4d81174e9c5e28ceb241d6ef",
+      "propagation": [
+        {
+          "location": "openclaw-api:$LATEST",
+          "surface": "lambda-latest"
+        },
+        {
+          "location": "openclaw-api:live",
+          "surface": "lambda-alias"
+        }
+      ]
+    },
+    "deploy/lambda/api/services/tenant_query_service.py": {
+      "artifact": "lambda/api/services/tenant_query_service.py",
+      "artifact_disposition": null,
+      "artifact_status": "SHIPPED",
+      "base_sha256": null,
+      "change": "A",
+      "fix_ids": [
+        "F-control-plane"
+      ],
+      "layer": "C-lambda",
+      "operations": [
+        {
+          "apply_cli": null,
+          "artifact_refs": [],
+          "class": "AUTO_CLI",
+          "resource": "lambda openclaw-api :: deploy/lambda/api/services/tenant_query_service.py",
+          "resource_refs": [],
+          "rollback_cli": null,
+          "rollback_policy": "REDEPLOY_ZIP",
+          "verify_cli": null
+        }
+      ],
+      "patch_sha256": "c8ec9c7abdf6e358782dbc0353990182c3c1c1d2c6fc61949c0bd980aba9fd35",
+      "propagation": [
+        {
+          "location": "openclaw-api:$LATEST",
+          "surface": "lambda-latest"
+        },
+        {
+          "location": "openclaw-api:live",
+          "surface": "lambda-alias"
+        }
+      ]
+    },
+    "deploy/lambda/api/services/tenant_service.py": {
+      "artifact": "lambda/api/services/tenant_service.py",
+      "artifact_disposition": null,
+      "artifact_status": "SHIPPED",
+      "base_sha256": "8839cd464e86147d05b8d30a31626383b44d3f6bbbb107b3cf267809153cd054",
+      "change": "M",
+      "fix_ids": [
+        "F-control-plane"
+      ],
+      "layer": "C-lambda",
+      "operations": [
+        {
+          "apply_cli": null,
+          "artifact_refs": [],
+          "class": "AUTO_CLI",
+          "resource": "lambda openclaw-api :: deploy/lambda/api/services/tenant_service.py",
+          "resource_refs": [],
+          "rollback_cli": null,
+          "rollback_policy": "REDEPLOY_ZIP",
+          "verify_cli": null
+        }
+      ],
+      "patch_sha256": "be7f743d615b81b04bc5bedfbf850df7679c7517382137b3b9d035fb938a3938",
+      "propagation": [
+        {
+          "location": "openclaw-api:$LATEST",
+          "surface": "lambda-latest"
+        },
+        {
+          "location": "openclaw-api:live",
+          "surface": "lambda-alias"
+        }
+      ]
+    },
+    "deploy/lambda/api/services/tenant_stats_service.py": {
+      "artifact": "lambda/api/services/tenant_stats_service.py",
+      "artifact_disposition": null,
+      "artifact_status": "SHIPPED",
+      "base_sha256": null,
+      "change": "A",
+      "fix_ids": [
+        "F-control-plane"
+      ],
+      "layer": "C-lambda",
+      "operations": [
+        {
+          "apply_cli": null,
+          "artifact_refs": [],
+          "class": "AUTO_CLI",
+          "resource": "lambda openclaw-api :: deploy/lambda/api/services/tenant_stats_service.py",
+          "resource_refs": [],
+          "rollback_cli": null,
+          "rollback_policy": "REDEPLOY_ZIP",
+          "verify_cli": null
+        }
+      ],
+      "patch_sha256": "467ed09957f932104a08e1f394a0fd895d8c8455d421e35bf3814667835bd1ea",
+      "propagation": [
+        {
+          "location": "openclaw-api:$LATEST",
+          "surface": "lambda-latest"
+        },
+        {
+          "location": "openclaw-api:live",
+          "surface": "lambda-alias"
+        }
+      ]
+    }
+  },
+  "status": "READY",
+  "verifications": [
+    {
+      "action": "invoke $LATEST and the live alias with the declared probe event and compare their recorded code and version state",
+      "cleanup": "none (read-only)",
+      "fail_when": "code or alias state differs, either invoke has FunctionError, or either response statusCode differs from 404",
+      "fix_id": "F-control-plane",
+      "id": "V-latest-then-alias",
+      "observable": "CodeSha256, alias FunctionVersion, FunctionError, and response statusCode",
+      "pass_when": "both invokes have no FunctionError and return statusCode 404 with the recorded patch code and alias version",
+      "phase": "A-readonly",
+      "timeout_s": 300
+    }
+  ],
+  "kit_files": {}
+}

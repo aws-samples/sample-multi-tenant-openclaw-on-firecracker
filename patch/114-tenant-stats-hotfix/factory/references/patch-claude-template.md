@@ -16,6 +16,12 @@ and `CLAUDE-REVIEW.txt` before doing anything.
   only the resources declared in its manifest.
 - Discovery and planning are read-only. Apply only after the account, region, target
   resource, plan, and review receipt all agree.
+- Customer `api.mode` is only a hint. Never infer an API target from it. The operator
+  must explicitly confirm the REST API ID, stage, client URL, and authentication
+  headers file before any write.
+- `ANY /{proxy+}` is never a valid target for this patch. The confirmed API must
+  expose exact `GET /tenants` and `GET /hosts` resources, and both authenticated
+  live probes must return 2xx.
 - Backups and state are create-only. Do not replace an existing anchor.
 - Do not treat a timeout as proof of failure. Inspect the recorded operation, wait for
   a terminal result, then rerun the same fixed driver so it can resume.
@@ -24,15 +30,28 @@ and `CLAUDE-REVIEW.txt` before doing anything.
 
 ## Complete workflow
 
-1. Resolve the intended AWS region from the operator's current configuration. Run:
+1. Resolve the intended AWS region and customer config. Ask the operator to confirm
+   the real explicit-resource REST API coordinates, then export:
+
+   ```bash
+   export OC_CONTROL_PLANE_API_ID='<rest-api-id>'
+   export OC_CONTROL_PLANE_STAGE='<stage>'
+   export OC_CONTROL_PLANE_URL='<https-client-base-url>'
+   export OC_CONTROL_PLANE_PROBE_HEADERS_FILE='<absolute-headers-json>'
+   export OC_PATCH_HTTP_HEADERS_FILE="$OC_CONTROL_PLANE_PROBE_HEADERS_FILE"
+   export OC_PATCH_CUSTOMER_CONFIG='<absolute-config.yml>'
+   ```
+
+   Run:
 
    ```bash
    bash runtime/scripts/discover-env.sh "$REGION" manifest.json ../environment.json
    ```
 
-   Read the full confirmation block. For an API route, `control_plane_api.confirmed`
-   must be true and its id/stage must come from the configured client URL plus
-   authenticated probes. A name or route-shape guess is not enough.
+   Read the full confirmation block. `control_plane_api.confirmed` must be true,
+   `entrypoint_kind` must be `explicit-rest-resources`, and the ID/stage must match
+   the operator-confirmed URL plus authenticated `/tenants` and `/hosts` probes. A
+   name, route-shape guess, config mode, or proxy resource is not enough.
 
 2. Check the independent review receipt:
 
@@ -58,9 +77,9 @@ and `CLAUDE-REVIEW.txt` before doing anything.
    python3 runtime/scripts/interview-once.py ask .
    ```
 
-   If the operator already explicitly authorized unattended execution for this test
-   environment, create one answers JSON that approves the shown scope and rollback
-   policy. Otherwise, present the plan and questions once and wait for approval.
+   Present the exact API ID, stage, URL, and proxy rejection to the operator. Record
+   `Q-api-entrypoint=yes` only after explicit confirmation. Never infer this answer
+   from config or discovery.
 
 5. Run the fixed set driver. For one kit:
 

@@ -69,6 +69,32 @@ def questions(m):
         }
     )
 
+    target = m.get("target_confirmation")
+    if isinstance(target, dict):
+        out.append(
+            {
+                "id": "Q-api-entrypoint",
+                "topic": "target",
+                "ask": (
+                    "This target is NOT inferred from config. Customer config reports api.mode="
+                    f"{target.get('configured_api_mode')}, but config does not select "
+                    "the live client entry point. Confirm 100% that this patch must use "
+                    f"the explicit-resource REST API {target.get('confirmed_api_id')} "
+                    f"stage {target.get('confirmed_stage')} at "
+                    f"{target.get('confirmed_client_url')}. The exact GET /tenants "
+                    "reference contract that will be copied is "
+                    f"authorization_type={target.get('reference_authorization_type')}, "
+                    f"authorizer={target.get('reference_authorizer_name') or '<none>'}, "
+                    f"api_key_required={target.get('reference_api_key_required')}, "
+                    f"scopes={target.get('reference_authorization_scopes') or []}. "
+                    "Confirm that contract is intentional, and that discovered "
+                    "ANY /{proxy+} resources are invalid and must never receive this patch."
+                ),
+                "expects": "yes/no",
+                "blocking": True,
+            }
+        )
+
     for path, spec in m["paths"].items():
         act = spec.get("activation") or {}
         if act:
@@ -140,15 +166,29 @@ def questions(m):
             for op in spec.get("operations", [])
         }
     )
+    rollback_notice = m.get("rollback_notice")
+    explicit_notice = ""
+    if isinstance(rollback_notice, dict):
+        retained = rollback_notice.get("retained_resources", [])
+        retained_text = (
+            ", ".join(str(item) for item in retained)
+            if isinstance(retained, list)
+            else str(retained)
+        )
+        explicit_notice = (
+            f" Explicit notice: {rollback_notice.get('behavior', '')} "
+            f"Resources retained after rollback: {retained_text}. "
+            f"Reason: {rollback_notice.get('reason', '')}"
+        )
     out.append(
         {
             "id": "Q-rollback",
             "topic": "rollback",
             "ask": (
                 f"Rollback policies in this kit: {', '.join(policies)}. If the canary fails "
-                f"verification, the run stops and `rollback.sh` restores the backup. Confirm "
-                f"you accept these policies — and note that RETAIN means a rollback will NOT "
-                f"undo that operation."
+                "verification, the run stops and invokes `rollback.sh` according to the "
+                "declared policy. Confirm you accept these policies; RETAIN means rollback "
+                f"will NOT undo that operation.{explicit_notice}"
             ),
             "expects": "yes/no",
             "blocking": True,
@@ -274,6 +314,17 @@ def cmd_check(kit):
         )
         return 3
     qs = questions(m)
+    if (
+        d.get("kit_id") != m.get("id")
+        or d.get("patch_sha") != m.get("patch_sha")
+        or d.get("question_count") != len(qs)
+    ):
+        print(
+            "STALE_DECISION: kit identity, patch SHA, or question count changed. "
+            "Re-run the interview.",
+            file=sys.stderr,
+        )
+        return 4
     unanswered = [q["id"] for q in qs if q["id"] not in d.get("answers", {})]
     if unanswered:
         print(
@@ -282,6 +333,25 @@ def cmd_check(kit):
             file=sys.stderr,
         )
         return 4
+    rejected = [
+        q["id"]
+        for q in qs
+        if q["expects"] == "yes/no"
+        and str(d["answers"].get(q["id"], "")).strip().lower() not in ("yes", "y")
+    ]
+    if rejected:
+        print(
+            "REJECTED_DECISION: these required approvals are not yes:\n  "
+            + "\n  ".join(rejected),
+            file=sys.stderr,
+        )
+        return 5
+    if d.get("fleet_widening") not in {"pre-approve", "hold"}:
+        print(
+            "INVALID_DECISION: fleet_widening must be pre-approve or hold",
+            file=sys.stderr,
+        )
+        return 5
     print(f"DECISION_OK {m['id']} ({len(qs)} questions answered)")
     return 0
 

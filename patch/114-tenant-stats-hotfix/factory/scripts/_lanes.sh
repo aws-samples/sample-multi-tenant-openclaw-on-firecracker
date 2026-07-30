@@ -15,7 +15,7 @@
 # Sourced, not executed: it defines functions and sets no traps or options.
 
 # Directory-name prefix -> lane. The prefix is what the compiler emits under lib/compiled/.
-OC_LANE_PREFIXES=('fn-*' 'ddbnew-*' 'ddb-*' 'apigw-*')
+OC_LANE_PREFIXES=('tenantstats-*' 'fn-*' 'ddbnew-*' 'ddb-*' 'apigw-*')
 
 # Print the compiled entry directory for a kit, or the host-config directory when no
 # control-plane lane matches.
@@ -34,6 +34,7 @@ oc_kit_lane() {
   local entry
   entry="$(oc_kit_entry "$1")"
   case "$(basename "$entry")" in
+    tenantstats-*) printf 'tenantstats' ;;
     fn-*)     printf 'lambda' ;;
     ddbnew-*) printf 'ddbnew' ;;
     ddb-*)    printf 'ddb' ;;
@@ -51,6 +52,7 @@ oc_lane_manifest_key() {
     ddb)    printf 'ddb_settings' ;;
     ddbnew) printf 'ddb_tables' ;;
     apigw)  printf 'api_routes' ;;
+    tenantstats) printf 'tenant_stats_backends' ;;
     *)      printf '' ;;
   esac
 }

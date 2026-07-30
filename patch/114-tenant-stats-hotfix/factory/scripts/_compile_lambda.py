@@ -121,6 +121,30 @@ def _validate_configuration(fn):
         value = fn.get(key)
         if value is not None and not isinstance(value, dict):
             raise SystemExit(f"lambda_functions[0].{key} must be an object")
+    target_account = fn.get("target_account")
+    if not isinstance(target_account, str) or not re.fullmatch(
+        r"[0-9]{12}", target_account
+    ):
+        if target_account is None or target_account == "":
+            raise SystemExit(
+                "lambda_functions[0].target_account is required: the run checks "
+                "the live STS caller against the kit target"
+            )
+        raise SystemExit(
+            "lambda_functions[0].target_account must be a 12-digit account id"
+        )
+    target_region = fn.get("target_region")
+    if not isinstance(target_region, str) or not re.fullmatch(
+        r"[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+", target_region
+    ):
+        if target_region is None:
+            raise SystemExit(
+                "lambda_functions[0].target_region is required: the run checks "
+                "the runtime region against the kit target"
+            )
+        raise SystemExit(
+            "lambda_functions[0].target_region must be a valid AWS region code"
+        )
 
 
 def _state_helper():
@@ -132,8 +156,10 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import sys
-from pathlib import Path
+import zipfile
+from pathlib import Path, PurePosixPath
 from urllib.parse import unquote
 
 
@@ -278,9 +304,242 @@ def normalize_policy(path):
     return value
 
 
+NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+DIR_FLAGS = os.O_RDONLY | DIRECTORY | NOFOLLOW
+
+
+def archive_parts(name):
+    if "\\" in name:
+        fail(f"unsafe zip backslash in path: {name}", 49)
+    if name.startswith("/") or re.match(r"^[A-Za-z]:/", name):
+        fail(f"unsafe zip absolute path: {name}", 49)
+    trimmed = name[:-1] if name.endswith("/") else name
+    raw = trimmed.split("/")
+    if not trimmed or any(part in ("", ".") for part in raw):
+        fail(f"unsafe zip ambiguous path: {name}", 49)
+    if ".." in raw:
+        fail(f"unsafe zip parent traversal: {name}", 49)
+    path = PurePosixPath(trimmed)
+    if path.is_absolute():
+        fail(f"unsafe zip absolute path: {name}", 49)
+    return tuple(path.parts)
+
+
+def scan_archive(package):
+    entries = []
+    kinds = {}
+    for info in package.infolist():
+        parts = archive_parts(info.filename)
+        mode = info.external_attr >> 16
+        file_type = stat.S_IFMT(mode)
+        if file_type == stat.S_IFLNK:
+            fail(f"unsafe zip symlink: {info.filename}", 49)
+        if info.is_dir():
+            if file_type not in (0, stat.S_IFDIR):
+                fail(f"unsafe zip special file: {info.filename}", 49)
+            kind = "dir"
+        else:
+            if file_type not in (0, stat.S_IFREG):
+                fail(f"unsafe zip special file: {info.filename}", 49)
+            kind = "file"
+        if parts in kinds:
+            fail(f"unsafe zip duplicate path: {info.filename}", 49)
+        for depth in range(1, len(parts)):
+            if kinds.get(parts[:depth]) == "file":
+                fail(f"unsafe zip parent/child conflict: {info.filename}", 49)
+        if kind == "file" and any(
+            len(other) > len(parts) and other[: len(parts)] == parts
+            for other in kinds
+        ):
+            fail(f"unsafe zip parent/child conflict: {info.filename}", 49)
+        kinds[parts] = kind
+        entries.append((info, parts, kind, mode & 0o777))
+    return entries
+
+
+def open_directory_path(path):
+    path = Path(path).absolute()
+    fd = os.open("/", DIR_FLAGS)
+    try:
+        for part in path.parts[1:]:
+            try:
+                child = os.open(part, DIR_FLAGS, dir_fd=fd)
+            except OSError as error:
+                fail(f"unsafe symlink or non-directory path component: {path}: {error}", 49)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def create_root(path):
+    path = Path(path).absolute()
+    parent_fd = open_directory_path(path.parent)
+    try:
+        try:
+            os.mkdir(path.name, 0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            fail(f"unsafe extraction root already exists: {path}", 49)
+        try:
+            return os.open(path.name, DIR_FLAGS, dir_fd=parent_fd)
+        except OSError as error:
+            fail(f"unsafe symlink extraction root: {path}: {error}", 49)
+    finally:
+        os.close(parent_fd)
+
+
+def descend(root_fd, parts, create):
+    fd = os.dup(root_fd)
+    try:
+        for part in parts:
+            try:
+                child = os.open(part, DIR_FLAGS, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(part, 0o700, dir_fd=fd)
+                child = os.open(part, DIR_FLAGS, dir_fd=fd)
+            except OSError as error:
+                fail(
+                    f"unsafe symlink or non-directory path component: "
+                    f"{'/'.join(parts)}: {error}",
+                    49,
+                )
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def secure_read(root_fd, parts):
+    try:
+        parent_fd = descend(root_fd, parts[:-1], False)
+    except FileNotFoundError:
+        return None
+    try:
+        try:
+            fd = os.open(parts[-1], os.O_RDONLY | NOFOLLOW, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            fail(f"unsafe symlink or special overlay path: {'/'.join(parts)}: {error}", 49)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                fail(f"unsafe special overlay file: {'/'.join(parts)}", 49)
+            with os.fdopen(fd, "rb", closefd=False) as handle:
+                return handle.read()
+        finally:
+            os.close(fd)
+    finally:
+        os.close(parent_fd)
+
+
+def secure_write(root_fd, parts, content, mode=0o600, exclusive=False):
+    parent_fd = descend(root_fd, parts[:-1], True)
+    flags = os.O_WRONLY | os.O_CREAT | NOFOLLOW
+    flags |= os.O_EXCL if exclusive else os.O_TRUNC
+    try:
+        try:
+            fd = os.open(parts[-1], flags, mode or 0o600, dir_fd=parent_fd)
+        except OSError as error:
+            fail(f"unsafe symlink or special write path: {'/'.join(parts)}: {error}", 49)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                fail(f"unsafe special write file: {'/'.join(parts)}", 49)
+            with os.fdopen(fd, "wb", closefd=False) as handle:
+                if hasattr(content, "read"):
+                    shutil.copyfileobj(content, handle)
+                else:
+                    handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.fchmod(fd, mode or 0o600)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(parent_fd)
+
+
+def safe_extract(archive, root):
+    try:
+        package = zipfile.ZipFile(archive)
+    except (OSError, zipfile.BadZipFile) as error:
+        fail(f"unsafe or unreadable live zip: {error}", 49)
+    with package:
+        entries = scan_archive(package)
+        root_fd = create_root(root)
+        try:
+            for _, parts, kind, mode in entries:
+                if kind == "dir":
+                    directory_fd = descend(root_fd, parts, True)
+                    try:
+                        os.fchmod(directory_fd, mode or 0o700)
+                    finally:
+                        os.close(directory_fd)
+            for info, parts, kind, mode in entries:
+                if kind == "file":
+                    try:
+                        with package.open(info) as source:
+                            secure_write(
+                                root_fd,
+                                parts,
+                                source,
+                                mode or 0o600,
+                                exclusive=True,
+                            )
+                    except (OSError, RuntimeError, zipfile.BadZipFile) as error:
+                        fail(f"unsafe or unreadable live zip member: {info.filename}: {error}", 49)
+        finally:
+            os.close(root_fd)
+
+
+def apply_overlay(root, payload_path):
+    payload = load(payload_path)
+    base = payload["base_hashes"]
+    patched = payload["patch_hashes"]
+    sources = payload["sources"]
+    root_fd = open_directory_path(root)
+    try:
+        for rel, want in base.items():
+            parts = archive_parts(rel)
+            content = secure_read(root_fd, parts)
+            if content is None:
+                if want is None:
+                    continue
+                fail(f"DRIFT: {rel} is missing from the live package")
+            got = hashlib.sha256(content).hexdigest()
+            if got not in (want, patched.get(rel)):
+                fail(
+                    f"DRIFT: {rel} live hash {got[:12]} is neither the base this "
+                    "patch was built against nor the patched content - refusing "
+                    "to overwrite someone else's change"
+                )
+        for rel, encoded in sources.items():
+            parts = archive_parts(rel)
+            try:
+                content = base64.b64decode(encoded, validate=True)
+            except (ValueError, TypeError):
+                fail(f"invalid base64 overlay source: {rel}", 49)
+            secure_write(root_fd, parts, content)
+    finally:
+        os.close(root_fd)
+    print(f"baseline verified and overlaid {len(sources)} file(s), deleted none")
+
+
 command = sys.argv[1]
 
-if command == "field":
+if command == "safe-extract":
+    safe_extract(sys.argv[2], sys.argv[3])
+
+elif command == "apply-overlay":
+    apply_overlay(sys.argv[2], sys.argv[3])
+
+elif command == "field":
     print(load(sys.argv[2])[sys.argv[3]])
 
 elif command == "review-fingerprint":
@@ -502,6 +761,8 @@ ARTIFACT_ID={_q(manifest["id"])}
 CONTENT_VERSION={_q(manifest["patch_sha"])}
 FUNCTION={_q(fn["function_name"])}
 ALIAS={_q(fn.get("alias") or "live")}
+TARGET_ACCOUNT={_q(fn["target_account"])}
+TARGET_REGION={_q(fn["target_region"])}
 RESOURCE_ID={_q(lambda_recipe_id(fn["function_name"]))}
 POLICY_NAME={_q(_policy_name(manifest, fn))}
 HAS_ENVIRONMENT={int(has_environment)}
@@ -522,20 +783,43 @@ STATE_ROOT="${{OC_PATCH_STATE_ROOT:-${{HOME:-/tmp}}/.oc-patch-lambda}}"
 # rollback in env B could restore env A's code. The account is resolved below before use.
 STATE_DIR=""  # set after ACCOUNT_ID is known
 REGION="${{OC_PATCH_REGION:?OC_PATCH_REGION required}}"
+[[ "$REGION" =~ ^[a-z]{{2}}(-[a-z0-9]+)+-[0-9]+$ ]] || {{
+  echo "FATAL: runtime region is not a valid AWS region code: $REGION" >&2
+  exit 3
+}}
+[[ "$REGION" == "$TARGET_REGION" ]] || {{
+  echo "FATAL: runtime region $REGION != kit target $TARGET_REGION" >&2
+  exit 3
+}}
 [[ -f "$STATE_HELPER" && -f "$REVIEW_RECEIPT" ]] || {{
   echo "FATAL: compiled helper or final REVIEW.json is missing" >&2
   exit 44
 }}
 KIT_FINGERPRINT="$(python3 "$STATE_HELPER" review-fingerprint "$REVIEW_RECEIPT")"
-ACCOUNT_ID="${{OC_PATCH_ACCOUNT:-$(aws sts get-caller-identity --region "$REGION" \\
-  --query Account --output text)}}" || {{
+CONFIGURED_ACCOUNT="${{OC_PATCH_ACCOUNT:-}}"
+if [[ -n "$CONFIGURED_ACCOUNT" && ! "$CONFIGURED_ACCOUNT" =~ ^[0-9]{{12}}$ ]]; then
+  echo "FATAL: OC_PATCH_ACCOUNT is not a 12-digit account id" >&2
+  exit 3
+fi
+STS_ACCOUNT="$(AWS_IGNORE_CONFIGURED_ENDPOINT_URLS=true \\
+  aws sts get-caller-identity --region "$REGION" \\
+  --query Account --output text)" || {{
   echo "FATAL: could not read the caller account" >&2
   exit 46
 }}
-[[ "$ACCOUNT_ID" =~ ^[0-9]{{12}}$ ]] || {{
+[[ "$STS_ACCOUNT" =~ ^[0-9]{{12}}$ ]] || {{
   echo "FATAL: could not resolve the account id" >&2
-  exit 46
+  exit 3
 }}
+[[ "$STS_ACCOUNT" == "$TARGET_ACCOUNT" ]] || {{
+  echo "FATAL: live STS account $STS_ACCOUNT != kit target $TARGET_ACCOUNT" >&2
+  exit 3
+}}
+[[ -z "$CONFIGURED_ACCOUNT" || "$CONFIGURED_ACCOUNT" == "$STS_ACCOUNT" ]] || {{
+  echo "FATAL: OC_PATCH_ACCOUNT $CONFIGURED_ACCOUNT != live STS account $STS_ACCOUNT" >&2
+  exit 3
+}}
+ACCOUNT_ID="$STS_ACCOUNT"
 STATE_DIR="${{STATE_ROOT}}/${{ACCOUNT_ID}}/${{REGION}}/${{ARTIFACT_ID}}/${{CONTENT_VERSION}}/${{KIT_FINGERPRINT}}/${{RESOURCE_ID}}"
 umask 077
 mkdir -p "$STATE_DIR"
@@ -553,7 +837,7 @@ done
 
 archive_existing() {{
   local path="$1" target
-  [[ -e "$path" ]] || return 0
+  [[ -e "$path" || -L "$path" ]] || return 0
   target="$STATE_DIR/archive/$(basename "$path").$(date +%s).$$.${{RANDOM}}"
   mv "$path" "$target"
 }}
@@ -681,48 +965,17 @@ build_overlay() {{
   local work="$1" zip_out="$2"
   archive_existing "$work"
   archive_existing "$zip_out"
-  mkdir -p "$work/pkg"
+  mkdir -p "$work"
   local url
   url="$(aws lambda get-function --region "$REGION" --function-name "$FUNCTION" \\
     --query Code.Location --output text)"
   curl -sSfL "$url" -o "$work/live.zip"
-  ( cd "$work/pkg" && unzip -q "$work/live.zip" )
+  python3 "$STATE_HELPER" safe-extract "$work/live.zip" "$work/pkg"
   # Before replacing anything, prove the live file is the one this patch was built against.
   # A file the customer edited by hand, or a package from a different revision, must NOT be
   # silently overwritten: that is the same "clobbering a hot change" failure this whole skill
   # exists to prevent, just one layer down.
-  python3 - "$work/pkg" "$OVERLAY_PAYLOAD_FILE" <<'PYEOF'
-import base64, json, hashlib, os, sys
-
-root = os.path.abspath(sys.argv[1])
-with open(sys.argv[2]) as handle:
-    payload = json.load(handle)
-base = payload["base_hashes"]
-patched = payload["patch_hashes"]
-for rel, want in base.items():
-    live = os.path.join(root, rel)
-    if not os.path.exists(live):
-        if want is None:
-            continue          # the patch ADDS this file; absence is expected
-        raise SystemExit(f"DRIFT: {{rel}} is missing from the live package")
-    got = hashlib.sha256(open(live, "rb").read()).hexdigest()
-    if got in (want, patched.get(rel)):
-        continue              # base, or already patched (a rerun must converge)
-    raise SystemExit(
-        f"DRIFT: {{rel}} live hash {{got[:12]}} is neither the base this patch was built "
-        f"against nor the patched content — refusing to overwrite someone else's change"
-    )
-sources = payload["sources"]
-for rel, b64 in sources.items():
-    dest = os.path.normpath(os.path.join(root, rel))
-    if not dest.startswith(os.path.abspath(root) + os.sep) and dest != os.path.abspath(root):
-        # A path escaping the package root would write outside the build dir.
-        raise SystemExit(f"FATAL: source path escapes the package: {{rel}}")
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-    with open(dest, "wb") as handle:
-        handle.write(base64.b64decode(b64))
-print(f"baseline verified and overlaid {{len(sources)}} file(s), deleted none")
-PYEOF
+  python3 "$STATE_HELPER" apply-overlay "$work/pkg" "$OVERLAY_PAYLOAD_FILE"
   # Overlay EXACT FILES. Unchanged first-party modules and third-party dependencies remain.
   # The large source document is a single hash-bound kit file, never argv or environment data.
   ( cd "$work/pkg" && zip -qr "$zip_out" . )
@@ -998,7 +1251,7 @@ def _apply(common):
 set -euo pipefail
 {common}
 
-for t in aws curl unzip zip python3; do
+for t in aws curl zip python3; do
   command -v "$t" >/dev/null || {{ echo "FATAL: need $t" >&2; exit 2; }}
 done
 
@@ -1477,13 +1730,6 @@ def _assert_auto_appliable(manifest, root):
 
 
 def compile_lambda_kit(kit, repo):
-    print(
-        "PATCH_114_FACTORY_DISABLED: the incomplete tenant-stats factory "
-        "cannot compile Lambda kits",
-        file=sys.stderr,
-    )
-    raise SystemExit(78)
-
     with open(os.path.join(kit, "manifest.json")) as handle:
         manifest = json.load(handle)
     _assert_no_unresolved_esm_conflict(manifest)
@@ -1622,13 +1868,6 @@ def compile_lambda_kit(kit, repo):
 
 
 def main(argv):
-    print(
-        "PATCH_114_FACTORY_DISABLED: the incomplete tenant-stats factory "
-        "cannot compile Lambda kits",
-        file=sys.stderr,
-    )
-    return 78
-
     if len(argv) != 3:
         print("usage: _compile_lambda.py <patch-kit> <source-repo>", file=sys.stderr)
         return 2

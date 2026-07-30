@@ -6,13 +6,6 @@
 # from manifest data, compiles it, then packages the fixed runtime into the kit.
 set -euo pipefail
 
-printf '%s\n' \
-  "PATCH_114_FACTORY_DISABLED: refusing to generate or execute this hotfix." \
-  "The factory is incomplete: it omits the tenant-stats writer Lambda, writer IAM and environment, the EventBridge schedule, and an authenticated HTTP end-to-end test." \
-  "Its route hard-codes authorization_type=NONE and can bypass the platform CUSTOM authorizer in platform-key mode." \
-  "Do not use previously generated kits. Replace the factory with a complete, authenticated, end-to-end-verified patch before re-enabling it." >&2
-exit 78
-
 HERE="$(cd "$(dirname "$0")" && pwd)"
 KIT="${1:?usage: compile-kit.sh <patch-kit> <source-repo>}"
 REPO="${2:?usage: compile-kit.sh <patch-kit> <source-repo>}"
@@ -32,14 +25,16 @@ LANE_JSON="$(jq -cer '
     .lambda_functions // [],
     .ddb_settings // [],
     .ddb_tables // [],
-    .api_routes // []
+    .api_routes // [],
+    .tenant_stats_backends // []
   ] as $fields
   | if all($fields[]; type == "array") then
       [
         if ($fields[0] | length) > 0 then "lambda" else empty end,
         if ($fields[1] | length) > 0 then "ddb" else empty end,
         if ($fields[2] | length) > 0 then "ddbnew" else empty end,
-        if ($fields[3] | length) > 0 then "apigw" else empty end
+        if ($fields[3] | length) > 0 then "apigw" else empty end,
+        if ($fields[4] | length) > 0 then "tenantstats" else empty end
       ]
     else
       error("typed lane fields must be arrays")
@@ -97,6 +92,7 @@ case "$LANE" in
   ddb)    python3 "$HERE/_compile_ddb.py" "$KIT" "$REPO" ;;
   ddbnew) python3 "$HERE/_compile_ddb_create.py" "$KIT" "$REPO" ;;
   apigw)  python3 "$HERE/_compile_apigw.py" "$KIT" "$REPO" ;;
+  tenantstats) python3 "$HERE/_compile_tenant_stats_backend.py" "$KIT" "$REPO" ;;
   host-config) bash "$HERE/compile-recipe.sh" "$KIT" "$REPO" ;;
   *) echo "COMPILE_KIT_FAILED: unsupported lane $LANE" >&2; exit 2 ;;
 esac

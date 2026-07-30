@@ -72,6 +72,18 @@ principal_arn() {
   esac
 }
 case "$KIND" in
+  tenantstats)
+          ACTIONS=(dynamodb:CreateTable dynamodb:DescribeTable
+                   dynamodb:ListTagsOfResource dynamodb:DescribeContinuousBackups
+                   dynamodb:UpdateContinuousBackups dynamodb:GetItem
+                   iam:GetRole iam:CreateRole iam:ListRoleTags iam:GetRolePolicy
+                   iam:PutRolePolicy iam:TagRole
+                   lambda:GetFunction lambda:GetFunctionConcurrency lambda:CreateFunction
+                   lambda:PutFunctionConcurrency lambda:InvokeFunction lambda:AddPermission
+                   lambda:RemovePermission lambda:GetPolicy lambda:TagResource
+                   events:DescribeRule events:ListTagsForResource events:ListTargetsByRule
+                   events:PutRule events:PutTargets events:EnableRule events:DisableRule
+                   events:RemoveTargets events:TagResource) ;;
   lambda) ACTIONS=(lambda:GetFunction lambda:UpdateFunctionCode lambda:PublishVersion
                    lambda:UpdateAlias lambda:InvokeFunction lambda:ListEventSourceMappings) ;;
   ddbnew) # Create-only: no rollback call to probe, because there is no rollback.
@@ -113,7 +125,11 @@ else
 fi
 
 printf '\n-- 3. conflicts with the live system --\n'
-if [[ "$KIND" == "ddbnew" ]]; then
+if [[ "$KIND" == "tenantstats" ]]; then
+  note "backend lane owns one retained table, one tagged writer/role, and one tagged schedule"
+  note "apply refuses same-name writer resources without this patch marker"
+  note "apply invokes the writer once and requires the current snapshot before scheduling"
+elif [[ "$KIND" == "ddbnew" ]]; then
   TBL="$(jq -r '.ddb_tables[0].table' "$KIT/manifest.json")"
   LIVE_ST="$(aws dynamodb describe-table --region "$REGION" --table-name "$TBL" \
     --query 'Table.TableStatus' --output text 2>/dev/null || true)"
@@ -268,7 +284,12 @@ else
 fi
 
 printf '\n-- 4. rollout plan --\n'
-if [[ "$KIND" == "ddbnew" ]]; then
+if [[ "$KIND" == "tenantstats" ]]; then
+  note "one backend unit: retained table -> writer IAM/function -> initial snapshot -> schedule"
+  note "rerun must verify every resource and SKIP without replaying writes"
+  note "rollback never deletes the table; it disables only patch-owned scheduling and preserves"
+  note "the recorded resources for explicit cleanup after CloudFormation adoption"
+elif [[ "$KIND" == "ddbnew" ]]; then
   note "one table, created if absent; no canary (a table is not a fleet)"
   note "apply waits for ACTIVE, because a write to a CREATING table fails"
   note "rerunning is a no-op: an existing table with the declared key schema SKIPs"

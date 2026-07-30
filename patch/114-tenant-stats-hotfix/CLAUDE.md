@@ -1,32 +1,70 @@
-# DISABLED: tenant statistics hotfix factory
+# Claude executor contract: tenant statistics hotfix
 
-This patch factory is fail-closed. Do not generate, review, or run its kits.
+Complete this patch through the packaged drivers. Do not rewrite generated kit
+files or improvise AWS/CDK commands.
 
-## Hard Rules
+## Stop Before Any Write
 
-- Do not run `factory/scripts/prepare.sh`, `materialize-patch.py`,
-  `compile-kit.sh`, `patch-set.sh`, or `autopatch.sh`.
-- Do not run any previously generated kit from this factory.
-- Do not bypass the guards or invoke generated `lib/compiled/*` scripts.
-- Do not improvise AWS write commands, CDK, setup, or CloudFormation deployment
-  as a substitute.
+Read the customer `config.yml`, but treat `api.mode` only as a hint. Ask the
+operator to explicitly confirm all of these:
 
-## Why It Is Disabled
+- the real REST API ID;
+- the deployed stage;
+- the exact client base URL;
+- the JSON file containing the same authentication headers used by the client;
+- that this patch must use the explicit `GET /tenants` and `GET /hosts`
+  resources, and that every `ANY /{proxy+}` resource is invalid for this patch.
 
-The factory creates only a DynamoDB table, an API Lambda update, and an API
-Gateway route. That is not the complete tenant statistics feature. It omits:
+Do not infer or auto-select those values. Discovery must make authenticated
+`GET /tenants` and `GET /hosts` calls and both must return 2xx. The selected API
+must expose both as exact REST resources. Otherwise stop without generating or
+applying a kit.
 
-1. the tenant-stats writer Lambda;
-2. the writer's IAM permissions and environment;
-3. the EventBridge schedule that invokes the writer;
-4. an authenticated HTTP end-to-end test against the deployed route.
+## Fixed Workflow
 
-The route manifest also hard-codes `authorization_type=NONE` with
-`api_key_required=true`. In platform-key mode that can bypass the platform
-`CUSTOM` authorizer.
+1. Export the operator-confirmed values:
 
-## Re-enable Gate
+   ```bash
+   export OC_CONTROL_PLANE_API_ID='<rest-api-id>'
+   export OC_CONTROL_PLANE_STAGE='<stage>'
+   export OC_CONTROL_PLANE_URL='<https-client-base-url>'
+   export OC_CONTROL_PLANE_PROBE_HEADERS_FILE='<absolute-headers-json>'
+   export OC_PATCH_HTTP_HEADERS_FILE="$OC_CONTROL_PLANE_PROBE_HEADERS_FILE"
+   export OC_PATCH_CUSTOMER_CONFIG='<absolute-config.yml>'
+   ```
 
-Keep the factory disabled until one reviewed patch includes all four missing
-pieces, preserves the live platform authorizer configuration, and passes a real
-authenticated HTTP end-to-end test in the target environment.
+2. Generate the three kits:
+
+   ```bash
+   bash factory/scripts/prepare.sh '<region>' "$OC_PATCH_CUSTOMER_CONFIG"
+   ```
+
+   Read `environment.json`, every `PLAN.json`, `REVIEW.json`, and
+   `CLAUDE-REVIEW.txt`. Review must be at least 6.5 with zero blockers.
+
+3. Print each interview and show the operator the exact API ID, stage, URL, and
+   the statement that proxy resources are invalid. Record `yes` only after the
+   operator confirms them.
+
+4. Apply through the first kit's packaged `runtime/scripts/patch-set.sh`, in
+   this dependency order:
+
+   ```text
+   114-tenant-stats-table
+   114-api-lambda
+   114-tenants-stats-route
+   ```
+
+   The first kit creates the table, writer IAM/Lambda, initial snapshot, and
+   EventBridge schedule. The second updates the API Lambda. The third creates
+   the explicit REST method by copying the deployed `GET /tenants`
+   authorization, authorizer, scopes, API-key requirement, and Lambda alias.
+
+5. Completion requires `SET_COMPLETE`, a real authenticated
+   `GET /tenants-stats` returning HTTP 200 with a `business` object, and the
+   driver's automatic second run returning `SKIP` with zero writes.
+
+Never invoke `lib/compiled/*` directly. Never edit a reviewed kit. Never run
+CDK, setup, or CloudFormation. On any nonzero exit, preserve the output and
+follow the documented exit-code branch; do not change generated code to hide
+the failure.

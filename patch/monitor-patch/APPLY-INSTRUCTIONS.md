@@ -363,7 +363,7 @@ aws s3 cp deploy/edge/fluent-bit/host/fluent-bit.conf \
 | ID | Action | Pass |
 |---|---|---|
 | v-metrics-endpoint | `curl http://<host>:8899/metrics` | HTTP 200, all metric families present (host-agent binds OC_AGENT_PORT=8899, NOT 9200) |
-| v-port-watermark | grep `openclaw_host_dnat_ports` in metrics | used/total/quarantined present, used <= total. NOTE on port range: `used` counts the **host-side DNAT ingress port** (the iptables `--dport`), allocated by route_ops.PortBitmap from `[DNAT_PORT_LOW, DNAT_PORT_HIGH]` (default [10000,15000], ha_edge.py renders these from `edge.dnat_port_{low,high}`). Do NOT confuse this with the `--to-destination :18789` in `iptables -t nat -S PREROUTING` — 18789 is the guest-side gateway port (GATEWAY_GUEST_PORT), NOT the counted host port. `total` reflects the runtime range width, so if this deployment overrode `edge.dnat_port_high`, the metric follows it (bitmap + edge SG + this gauge all read the same config value — they never split). |
+| v-port-watermark | grep `openclaw_host_dnat_ports` in metrics | used/total/quarantined present, used <= total. **Port-range semantics (a real host carries TWO DNAT rule families — do not conflate them):** (1) the LIVE data-plane rule uses `--dport ∈ [10000,15000]` (route_ops.PortBitmap, allocated at promote, published to Redis, the port the edge actually dials; SG admits only this range, ha_edge.py:1423-1426). This gauge counts exactly this `--dport`. (2) a DEAD rule the control-plane adds at launch (`ssm_dispatch.py:143`) uses `--dport = 18789+vm_num` → `--to-destination guest:18789`; it is never dialed (edge uses the bitmap port) and SG-blocked, but it IS visible in `iptables -t nat -S PREROUTING`. So a real host shows both `--dport 10000-15000` (counted, live) and `--dport 18789+` (uncounted, dead) rules — if you `grep 18789` you see the dead family + every rule's `--to-destination :18789`. The gauge deliberately counts only the live [10000,15000] `--dport` (bitmap + edge SG + this gauge read the same `edge.dnat_port_{low,high}`, they never split). |
 | v-stats-route | `curl GET /tenants-stats` | HTTP 200 with snapshot; HTTP **503 UNAVAILABLE** if tenant_stats not configured or no snapshot yet (expected, NOT a failure — tenant_stats_service.py returns 503, never 404) |
 | v-cursor-decrypt | Send invalid cursor to paginated endpoint | HTTP 400 (not 500) |
 | v-hook-disabled-noop | Decode LT UserData, check no literal `{{` | No raw placeholder in rendered output |
@@ -395,15 +395,23 @@ done
 ## Known limitations (not fixed by this patch — data-plane code, separate issue)
 
 - **Residual PREROUTING DNAT rules after tenant delete.** The control-plane delete path
-  DOES remove a tenant's DNAT rule (tenant_service.py `_dnat_remove_all_cmd` via SSM, gated
-  on `if host_id`), but a host can still show orphan `--to-destination :18789` PREROUTING
-  rules from: tenants deleted BEFORE the argv-alignment fix landed (old rules carried an
-  `-i <iface>` prefix that `iptables -D` couldn't match), or a delete where the DDB record
-  had no `host_port`/`host_id`. These leaked rules also inflate `openclaw_host_dnat_ports_used`
-  after a startup bitmap-rebuild. This is a data-plane route-lifecycle bug, NOT introduced by
-  this monitoring patch; it is tracked separately and must not block this patch. Manual sweep
-  if a host shows DNAT rules with zero live VMs: compare `iptables -t nat -S PREROUTING | grep
-  18789` against `openclaw-tenants` rows with a `host_port` on that host, and `-D` the orphans.
+  removes the LIVE bitmap rule (tenant_service.py:2061-2067 `_dnat_remove_all_cmd` via SSM,
+  gated on `if host_id`; the `:2056` comment shows this is the fix for a historical
+  `-i <iface>`-prefix leak). But three residue paths remain, so a host with zero live VMs can
+  still show DNAT rules — the real-machine "7 residual rules" observation is genuine:
+  (a) the Scheme-A launch rule `--dport 18789+vm_num` (`ssm_dispatch.py:143`) is **never
+  removed** — at promote the DDB `host_port` was overwritten to the bitmap value, so delete's
+  `_dnat_remove_all_cmd` targets only the bitmap rule and the 18789+ rule leaks permanently
+  (dead + uncounted, but present); (b) delete's SSM removal is best-effort/unchecked
+  (`:2064`) — an SSM timeout silently leaves the bitmap rule; (c) the in-memory bitmap slot
+  is never freed on delete (no `release-route` call in tenant_service — grep-confirmed), so
+  the LIVE gauge over-counts deleted tenants until the agent restarts and rebuilds from
+  iptables. The orphan-reap/drift backstops do NOT remove DNAT (host-agent.py:1662 passes
+  `host_port=None`; drift is report-only). This is a data-plane route-lifecycle bug, NOT
+  introduced by this monitoring patch — tracked separately, must not block this patch.
+  Manual sweep on a host with zero live VMs: for each `--dport 10000-15000` PREROUTING rule
+  with no matching `openclaw-tenants` row carrying that `host_port`, `-D` it; the `--dport
+  18789+` rules are always safe to remove (never dialed).
 
 ## Rollback
 

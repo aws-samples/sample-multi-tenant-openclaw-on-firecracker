@@ -1,0 +1,10 @@
+Review this API Gateway REST API hot-patch kit for unattended production use.
+The target API and stage were machine-confirmed before generation. The kit must
+fail closed on unreadable current or deployed state, refuse third-party pending
+changes unless explicitly approved, publish only its declared route and CORS
+method, preserve auth and unrelated API configuration, bind Lambda permission
+to the exact route and qualifier, verify the deployed stage export rather than
+current configuration, distinguish retryable and permanent failures, converge
+on retry, and roll back to the recorded deployment without deleting unrelated
+configuration. Cross-kit backend health is out of scope. Score 0-10; pass
+requires at least 6.5 and zero blockers. Name concrete defects with file and line.

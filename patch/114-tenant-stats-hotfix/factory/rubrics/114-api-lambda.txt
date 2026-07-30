@@ -1,0 +1,10 @@
+Review this Lambda overlay hot-patch kit for unattended production use. It must
+preserve unrelated package files and environment keys, hash-bind every source,
+apply its exact-table read policy without widening IAM, protect updates with
+RevisionId, verify $LATEST before publishing or moving the alias, detect
+FunctionError and the expected response, pass large payloads through files,
+resume only patch-owned work, and roll back code, configuration, policy, and
+alias without overwriting later third-party changes. Requirements are reused
+from the live package by design. Cross-kit business behavior is out of scope.
+Score 0-10; pass requires at least 6.5 and zero blockers. Name concrete defects
+with file and line.

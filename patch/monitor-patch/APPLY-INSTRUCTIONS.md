@@ -180,50 +180,140 @@ API_ID=$(jq -r .api_id environment.json)
 bash lib/apply-api-routes.sh apply $REGION
 ```
 
-### 4c. MANUAL_REVIEW items (operator must review before executing)
+### 4c. MANUAL_CLI_REVIEW items (operator reviews, then runs the exact CLI)
 
-The following require operator review:
+Every command below is complete and executable — no "see manifest" placeholders.
+`$REGION`/`$ACCT`/`$API_FN`/`$BUCKET` come from `environment.json` (Step 0). Each item is
+feature-gated: run it ONLY if the paired config flag is on. **Ordering matters** —
+item 2 (pagination key) MUST complete before item 6 flips `TENANT_QUERY_ENABLED=true`,
+or the first `GET /tenants?...` 500s on a missing key (fail-closed by design).
 
-1. **New DDB table `openclaw-tenant-stats`** (only if `tenant_stats.enabled=true`):
-   ```bash
-   aws dynamodb create-table \
-     --table-name openclaw-tenant-stats \
-     --attribute-definitions '[{"AttributeName":"id","AttributeType":"S"}]' \
-     --key-schema '[{"AttributeName":"id","KeyType":"HASH"}]' \
-     --billing-mode PAY_PER_REQUEST \
-     --region $REGION
-   aws dynamodb update-continuous-backups \
-     --table-name openclaw-tenant-stats \
-     --point-in-time-recovery-specification PointInTimeRecoveryEnabled=true \
-     --region $REGION
-   ```
+**1. New DDB table `openclaw-tenant-stats`** — only if `tenant_stats.enabled=true`.
+The stats-writer publishes its snapshot here; `GET /tenants-stats` reads it.
+```bash
+aws dynamodb create-table \
+  --table-name openclaw-tenant-stats \
+  --attribute-definitions '[{"AttributeName":"id","AttributeType":"S"}]' \
+  --key-schema '[{"AttributeName":"id","KeyType":"HASH"}]' \
+  --billing-mode PAY_PER_REQUEST --region "$REGION"
+aws dynamodb wait table-exists --table-name openclaw-tenant-stats --region "$REGION"
+aws dynamodb update-continuous-backups --table-name openclaw-tenant-stats \
+  --point-in-time-recovery-specification PointInTimeRecoveryEnabled=true --region "$REGION"
+```
 
-2. **New Secrets Manager secret `openclaw/pagination-cursor`** (only if `tenant_query.enabled=true`):
-   ```bash
-   aws secretsmanager create-secret \
-     --name "openclaw/pagination-cursor" \
-     --region $REGION \
-     --secret-string '{"purpose":"pagination-aes-gcm","key":"'$(openssl rand -base64 32)'"}'
-   # Then add PAGINATION_AES_KEY to the Lambda env:
-   # (extract key value and add to update-function-configuration)
-   ```
+**2. Pagination cursor key** — only if `tenant_query.enabled=true`. **Do this BEFORE item 6.**
+The API base64url-decodes `PAGINATION_AES_KEY` and requires **exactly 32 bytes**
+(`pagination.py:_key()`). The CDK generates a 43-char URL-safe alnum string
+(`password_length=43, exclude_punctuation`), NOT `openssl rand -base64 32` (that is
+standard base64 with `+/=` — it mis-decodes and 500s). Generate a matching key:
+```bash
+# 43 URL-safe alnum chars == 32 bytes after base64url-decode (matches the CDK generator)
+PAGKEY=$(python3 -c "import secrets,string; print(''.join(secrets.choice(string.ascii_letters+string.digits) for _ in range(43)))")
+aws secretsmanager create-secret --name "openclaw/pagination-cursor" --region "$REGION" \
+  --secret-string "{\"purpose\":\"pagination-aes-gcm\",\"key\":\"$PAGKEY\"}"
+# Inject as a plaintext env var (the CDK injects the resolved value, not a secret ref):
+aws lambda get-function-configuration --function-name "$API_FN" --region "$REGION" \
+  --query 'Environment.Variables' --output json > /tmp/api-env.json
+python3 - "$PAGKEY" <<'PY' > /tmp/api-env-new.json
+import json,sys
+d=json.load(open("/tmp/api-env.json")); d["PAGINATION_AES_KEY"]=sys.argv[1]
+print("Variables={%s}" % ",".join(f"{k}={v}" for k,v in d.items()))
+PY
+aws lambda update-function-configuration --function-name "$API_FN" --region "$REGION" \
+  --environment "$(cat /tmp/api-env-new.json)"
+aws lambda wait function-updated --function-name "$API_FN" --region "$REGION"
+```
+Rollback: `delete-secret --force-delete-without-recovery` + remove the env key.
 
-3. **New Lambda `openclaw-tenant-stats-writer`** (only if `tenant_stats.enabled=true`):
-   ```bash
-   # Create the function + EventBridge 1min schedule
-   # See manifest operations for full parameters
-   ```
+**3. New Lambda `openclaw-tenant-stats-writer` + EventBridge 1-min schedule** — only if
+`tenant_stats.enabled=true`. Reserved concurrency 1 (the CDK pins it so overlapping
+minute-ticks cannot double-scan). First its execution role, then the function, then the rule.
+```bash
+# 3.1 execution role: scan tenants (read) + read/write the stats table + read assets manifest + logs
+cat > /tmp/stats-writer-trust.json <<'JSON'
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}
+JSON
+aws iam create-role --role-name openclaw-tenant-stats-writer-role \
+  --assume-role-policy-document file:///tmp/stats-writer-trust.json
+aws iam attach-role-policy --role-name openclaw-tenant-stats-writer-role \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+cat > /tmp/stats-writer-inline.json <<JSON
+{"Version":"2012-10-17","Statement":[
+ {"Effect":"Allow","Action":["dynamodb:Scan","dynamodb:DescribeTable"],"Resource":"arn:aws:dynamodb:$REGION:$ACCT:table/openclaw-tenants"},
+ {"Effect":"Allow","Action":["dynamodb:GetItem","dynamodb:PutItem","dynamodb:Query"],"Resource":"arn:aws:dynamodb:$REGION:$ACCT:table/openclaw-tenant-stats"},
+ {"Effect":"Allow","Action":["s3:GetObject"],"Resource":"arn:aws:s3:::$BUCKET/*"}
+]}
+JSON
+aws iam put-role-policy --role-name openclaw-tenant-stats-writer-role \
+  --policy-name stats-writer --policy-document file:///tmp/stats-writer-inline.json
+sleep 10   # let the role propagate before create-function
 
-4. **LT UserData update for {{HOST_USER_HOOK}}** (only if `user_hooks.host_init` configured):
-   ```bash
-   # Use lib/lt-userdata.py to decode current LT → patch → re-encode → new LT version
-   # Then update ASG to pin new version + instance-refresh
-   ```
+# 3.2 package + create the function (source shipped in this patch: lambda/tenant_stats/)
+( cd lambda/tenant_stats && zip -qr /tmp/tenant-stats-writer.zip . )
+aws lambda create-function --function-name openclaw-tenant-stats-writer --region "$REGION" \
+  --runtime python3.12 --architectures arm64 --handler handler.lambda_handler \
+  --timeout 50 --memory-size 8192 \
+  --role "arn:aws:iam::$ACCT:role/openclaw-tenant-stats-writer-role" \
+  --zip-file fileb:///tmp/tenant-stats-writer.zip \
+  --environment "Variables={TENANTS_TABLE=openclaw-tenants,TENANT_STATS_TABLE=openclaw-tenant-stats,ASSETS_BUCKET=$BUCKET,ROOTFS_PREFIX=deployment/rootfs,STATS_SCAN_SEGMENTS=8}"
+aws lambda wait function-active --function-name openclaw-tenant-stats-writer --region "$REGION"
+# pin reserved concurrency 1 (no overlapping scans)
+aws lambda put-function-concurrency --function-name openclaw-tenant-stats-writer \
+  --reserved-concurrent-executions 1 --region "$REGION"
 
-5. **Optional GSIs on openclaw-tenants** (only if `scaler.add_gsi_*` enabled):
-   ```bash
-   # aws dynamodb update-table with GSI additions (one at a time, wait for ACTIVE)
-   ```
+# 3.3 EventBridge rate(1 minute) -> the function
+aws events put-rule --name openclaw-tenant-stats-schedule --region "$REGION" \
+  --schedule-expression "rate(1 minute)" --state ENABLED
+aws lambda add-permission --function-name openclaw-tenant-stats-writer --region "$REGION" \
+  --statement-id tenant-stats-events --action lambda:InvokeFunction \
+  --principal events.amazonaws.com \
+  --source-arn "arn:aws:events:$REGION:$ACCT:rule/openclaw-tenant-stats-schedule"
+aws events put-targets --rule openclaw-tenant-stats-schedule --region "$REGION" \
+  --targets "Id=stats-writer,Arn=arn:aws:lambda:$REGION:$ACCT:function:openclaw-tenant-stats-writer"
+# verify one tick lands a snapshot (wait ~70s for the first fire):
+sleep 70
+aws dynamodb scan --table-name openclaw-tenant-stats --region "$REGION" --max-items 1 \
+  --query 'Count' --output text   # expect >= 1
+```
+Rollback: `events remove-targets` + `events delete-rule` + `lambda delete-function` +
+`iam delete-role-policy`/`delete-role`. The `openclaw-tenant-stats` table is RETAIN
+(stateful) — delete only if abandoning the feature.
+
+**4. LT UserData update for `{{HOST_USER_HOOK}}`** — only if `user_hooks.host_init` configured.
+```bash
+# decode current LT -> patch the {{HOST_USER_HOOK}} block -> re-encode -> new LT version,
+# then roll the ASG onto it. lib/apply-lt.sh drives the MIP-safe roll; lib/lt-userdata.py
+# does the CDK-exact gzip+base64 (refuses to ship a template still containing {{ }}).
+bash lib/apply-lt.sh roll "$REGION"
+```
+
+**5. Optional GSIs on `openclaw-tenants`** — only if `scaler.add_gsi_*` enabled. One at a
+time; each must reach ACTIVE before the next (DDB builds one GSI at a time):
+```bash
+aws dynamodb update-table --table-name openclaw-tenants --region "$REGION" \
+  --attribute-definitions AttributeName=tenant_user_id,AttributeType=S \
+  --global-secondary-index-updates '[{"Create":{"IndexName":"gsi_tenant_user","KeySchema":[{"AttributeName":"tenant_user_id","KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"}}}]'
+# poll until IndexStatus=ACTIVE before creating the next GSI:
+aws dynamodb describe-table --table-name openclaw-tenants --region "$REGION" \
+  --query 'Table.GlobalSecondaryIndexes[?IndexName==`gsi_tenant_user`].IndexStatus' --output text
+```
+
+**6. Enable the query feature flag** — only if `tenant_query.enabled=true`, and ONLY after
+item 2 completed. This is the switch that makes `GET /tenants?user_id=|host_id=|status=`
+live; keeping it last means the key exists before the first query decodes a cursor.
+```bash
+aws lambda get-function-configuration --function-name "$API_FN" --region "$REGION" \
+  --query 'Environment.Variables' --output json > /tmp/api-env.json
+python3 - <<'PY' > /tmp/api-env-on.json
+import json
+d=json.load(open("/tmp/api-env.json")); d["TENANT_QUERY_ENABLED"]="true"
+print("Variables={%s}" % ",".join(f"{k}={v}" for k,v in d.items()))
+PY
+aws lambda update-function-configuration --function-name "$API_FN" --region "$REGION" \
+  --environment "$(cat /tmp/api-env-on.json)"
+aws lambda wait function-updated --function-name "$API_FN" --region "$REGION"
+```
+Rollback: set `TENANT_QUERY_ENABLED=false` (no-param `GET /tenants` is byte-identical either way).
 
 ---
 

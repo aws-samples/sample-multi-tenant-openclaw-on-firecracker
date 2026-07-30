@@ -111,7 +111,7 @@ API_PLAUSIBLE="$(printf '%s' "$API_FACTS" |
 API_PLAUSIBLE_N="$(printf '%s' "$API_PLAUSIBLE" | jq 'length')"
 API_MATCH="null"
 API_CONFIRMED=false
-API_STAGE=""
+STAGE_NAME=""
 API_PROBE_RESULTS="[]"
 API_WHY="unresolved: set OC_CONTROL_PLANE_URL and run from the real client call site with its auth headers"
 
@@ -210,7 +210,7 @@ if [ -n "${OC_CONTROL_PLANE_URL:-}" ]; then
         API_WHY="unresolved: configured client URL names stage '$candidate_stage', but get-stage cannot confirm it"
       else
         API_MATCH="$configured_api_id"
-        API_STAGE="$candidate_stage"
+        STAGE_NAME="$candidate_stage"
         API_CONFIRMED=true
         API_WHY="machine-confirmed by configured client URL, deployed stage, and authenticated required-route probes"
         if [ -n "${mapped_stage:-}" ]; then
@@ -479,7 +479,7 @@ fi
 
 jq -n \
   --arg region "$REGION" --arg account "$ACCT" --arg caller "$CALLER" \
-  --arg api "$API_MATCH" --arg api_stage "$API_STAGE" --arg api_why "$API_WHY" \
+  --arg api "$API_MATCH" --arg api_stage "$STAGE_NAME" --arg api_why "$API_WHY" \
   --argjson api_confirmed "$API_CONFIRMED" --argjson api_probes "$API_PROBE_RESULTS" \
   --argjson api_candidates "$API_CANDIDATES" --argjson api_facts "$API_FACTS" \
   --argjson stages "$API_DEPLOYED_STAGES" --arg api_target "$API_INTEGRATION_TARGET" \
@@ -528,7 +528,7 @@ jq -n \
   echo "account/region : $ACCT / $REGION"
   echo "caller         : $CALLER"
   echo "API confirmed  : $API_MATCH ($API_WHY)"
-  echo "API stage      : ${API_STAGE:-<unresolved>}"
+  echo "API stage      : ${STAGE_NAME:-<unresolved>}"
   printf '%s' "$API_FACTS" | jq -r '
     .[] | "  API \(.id) \(.name): tenants=\(.has_tenants) hosts=\(.has_hosts) " +
     "proxy=\(.proxy) auth=\(.method_auth) key=\(.api_key_required) policy=\(.resource_policy)"'

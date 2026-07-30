@@ -847,6 +847,13 @@ exit 25
 
 
 def compile_ddb_create_kit(kit, _repo=None):
+    print(
+        "PATCH_114_FACTORY_DISABLED: the incomplete tenant-stats factory "
+        "cannot compile DynamoDB kits",
+        file=sys.stderr,
+    )
+    raise SystemExit(78)
+
     with open(os.path.join(kit, "manifest.json")) as handle:
         manifest = json.load(handle)
     specs = manifest.get("ddb_tables") or []
@@ -937,6 +944,13 @@ def compile_ddb_create_kit(kit, _repo=None):
 
 
 def main(argv):
+    print(
+        "PATCH_114_FACTORY_DISABLED: the incomplete tenant-stats factory "
+        "cannot compile DynamoDB kits",
+        file=sys.stderr,
+    )
+    return 78
+
     if len(argv) < 2:
         print(
             "usage: _compile_ddb_create.py <patch-kit> [<source-repo>]", file=sys.stderr

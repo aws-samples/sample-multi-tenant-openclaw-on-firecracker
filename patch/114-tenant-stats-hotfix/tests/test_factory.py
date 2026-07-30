@@ -3,13 +3,39 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 PATCH = Path(__file__).resolve().parents[1]
-PREPARE = PATCH / "factory" / "scripts" / "prepare.sh"
+SCRIPTS = PATCH / "factory" / "scripts"
+PREPARE = SCRIPTS / "prepare.sh"
+DISABLED_EXIT = 78
+DISABLED_DETAILS = (
+    "PATCH_114_FACTORY_DISABLED",
+    "tenant-stats writer Lambda",
+    "writer IAM and environment",
+    "EventBridge schedule",
+    "authenticated HTTP end-to-end test",
+    "CUSTOM authorizer",
+)
+
+# These are the infrastructure-generating entry points and the two runtime
+# drivers that can execute generated infrastructure changes.
+FACTORY_ENTRYPOINTS = (
+    ("prepare", ("bash", str(PREPARE))),
+    ("materialize", ("python3", str(SCRIPTS / "materialize-patch.py"))),
+    ("compile", ("bash", str(SCRIPTS / "compile-kit.sh"))),
+    ("compile-apigw", ("python3", str(SCRIPTS / "_compile_apigw.py"))),
+    ("compile-ddb", ("python3", str(SCRIPTS / "_compile_ddb_create.py"))),
+    ("compile-lambda", ("python3", str(SCRIPTS / "_compile_lambda.py"))),
+    ("patch-set", ("bash", str(SCRIPTS / "patch-set.sh"))),
+    ("autopatch", ("bash", str(SCRIPTS / "autopatch.sh"))),
+)
 
 
 def environment() -> dict[str, object]:
@@ -29,7 +55,43 @@ def environment() -> dict[str, object]:
     }
 
 
-def test_prepare_compiles_three_target_bound_kits_without_review(tmp_path):
+def load_script(name: str):
+    path = SCRIPTS / name
+    spec = importlib.util.spec_from_file_location(f"patch114_{path.stem}", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize(
+    ("name", "command"),
+    FACTORY_ENTRYPOINTS,
+    ids=[entry[0] for entry in FACTORY_ENTRYPOINTS],
+)
+def test_every_factory_entrypoint_fails_closed_before_argument_parsing(
+    tmp_path, name, command
+):
+    env = os.environ.copy()
+    env["HOME"] = str(tmp_path / "home")
+
+    result = subprocess.run(
+        command,
+        cwd=PATCH,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == DISABLED_EXIT, (name, result.stderr)
+    details = (
+        DISABLED_DETAILS[:1] if name.startswith("compile-") else DISABLED_DETAILS
+    )
+    for detail in details:
+        assert detail in result.stderr, (name, detail, result.stderr)
+
+
+def test_prepare_fails_without_creating_build_output(tmp_path):
     env_path = tmp_path / "environment.json"
     env_path.write_text(json.dumps(environment()), encoding="utf-8")
     output = tmp_path / "build"
@@ -38,139 +100,106 @@ def test_prepare_compiles_three_target_bound_kits_without_review(tmp_path):
     env["HOME"] = str(tmp_path / "home")
 
     result = subprocess.run(
-        ["bash", str(PREPARE), "us-east-1", str(env_path), "--skip-review"],
+        ["bash", str(PREPARE), "example-region", str(env_path), "--skip-review"],
         cwd=PATCH,
         env=env,
         capture_output=True,
         text=True,
     )
 
-    assert result.returncode == 0, result.stderr
-    kits = output / "kits"
-    names = [
-        "114-tenant-stats-table",
-        "114-api-lambda",
-        "114-tenants-stats-route",
-    ]
-    for name in names:
-        kit = kits / name
-        assert (kit / "CLAUDE.md").is_file()
-        assert (kit / "APPLY-INSTRUCTIONS.md").is_file()
-        assert (kit / "runtime" / "scripts" / "patch-set.sh").is_file()
-        manifest = json.loads((kit / "manifest.json").read_text())
-        assert manifest["kit_files"]
-    route = json.loads(
-        (kits / "114-tenants-stats-route" / "manifest.json").read_text()
-    )["api_routes"][0]
-    assert route["target_account"] == "111111" + "111111"
-    assert route["target_region"] == "us-east-1"
-    assert route["api_id"] == "abcdefghij"
-    assert route["stage"] == "v1"
+    assert result.returncode == DISABLED_EXIT, result.stderr
+    assert not output.exists()
 
 
-def test_prepare_runs_fresh_claude_review_and_seals_each_kit(tmp_path):
+def test_materializer_fails_without_creating_kits(tmp_path):
     env_path = tmp_path / "environment.json"
     env_path.write_text(json.dumps(environment()), encoding="utf-8")
-    output = tmp_path / "build"
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    claude = bin_dir / "claude"
-    claude.write_text(
-        "#!/usr/bin/env python3\n"
-        "import re, sys\n"
-        "prompt = sys.stdin.read()\n"
-        "fingerprint = re.search("
-        "r'KIT_FINGERPRINT=([0-9a-f]{64})', prompt).group(1)\n"
-        "print('fixture independent review')\n"
-        "print('KIT_REVIEW_VERDICT: PASS SCORE=7.0 BLOCKERS=0 "
-        "FINGERPRINT=' + fingerprint)\n",
-        encoding="utf-8",
-    )
-    claude.chmod(0o755)
-    env = os.environ.copy()
-    env["OC_PATCH_BUILD_ROOT"] = str(output)
-    env["HOME"] = str(tmp_path / "home")
-    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    output = tmp_path / "kits"
 
-    result = subprocess.run(
-        ["bash", str(PREPARE), "us-east-1", str(env_path)],
-        cwd=PATCH,
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-
-    assert result.returncode == 0, result.stderr
-    for kit in (output / "kits").iterdir():
-        receipt = json.loads((kit / "REVIEW.json").read_text())
-        assert receipt["reviewer"] == "Claude Code safe-mode review-kit.sh"
-        assert receipt["score"] == 7.0
-        assert (kit / "CLAUDE-REVIEW.txt").is_file()
-
-
-def test_materializer_refuses_unconfirmed_api(tmp_path):
-    value = environment()
-    value["control_plane_api"]["confirmed"] = False
-    env_path = tmp_path / "environment.json"
-    env_path.write_text(json.dumps(value), encoding="utf-8")
     result = subprocess.run(
         [
             "python3",
-            str(PATCH / "factory" / "scripts" / "materialize-patch.py"),
+            str(SCRIPTS / "materialize-patch.py"),
             str(env_path),
             str(PATCH / "factory" / "manifests" / "114-api-lambda.json"),
-            str(tmp_path / "out"),
+            str(output),
         ],
+        cwd=PATCH,
         capture_output=True,
         text=True,
     )
-    assert result.returncode != 0
-    assert "not machine-confirmed" in result.stderr
+
+    assert result.returncode == DISABLED_EXIT, result.stderr
+    assert not output.exists()
 
 
-def test_materializer_refuses_ambiguous_stage(tmp_path):
-    value = environment()
-    value["control_plane_api"]["deployed_stages"] = [
-        {"stage": "blue"},
-        {"stage": "green"},
-    ]
-    env_path = tmp_path / "environment.json"
-    env_path.write_text(json.dumps(value), encoding="utf-8")
-    result = subprocess.run(
-        [
-            "python3",
-            str(PATCH / "factory" / "scripts" / "materialize-patch.py"),
-            str(env_path),
-            str(PATCH / "factory" / "manifests" / "114-api-lambda.json"),
-            str(tmp_path / "out"),
-        ],
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode != 0
-    assert "stage is ambiguous" in result.stderr
+@pytest.mark.parametrize(
+    ("script", "function", "args"),
+    (
+        (
+            "materialize-patch.py",
+            "materialize",
+            (Path("environment.json"), Path("lambda.json"), Path("kits"), None),
+        ),
+        ("_compile_apigw.py", "compile_apigw_kit", ("kit",)),
+        ("_compile_ddb_create.py", "compile_ddb_create_kit", ("kit",)),
+        ("_compile_lambda.py", "compile_lambda_kit", ("kit", "repo")),
+    ),
+)
+def test_direct_generator_functions_fail_closed(tmp_path, script, function, args):
+    module = load_script(script)
+    before = sorted(tmp_path.iterdir())
+
+    with pytest.raises(SystemExit) as raised:
+        getattr(module, function)(*args)
+
+    assert raised.value.code == DISABLED_EXIT
+    assert sorted(tmp_path.iterdir()) == before
 
 
-def test_prepare_refuses_environment_from_another_region(tmp_path):
-    env_path = tmp_path / "environment.json"
-    env_path.write_text(json.dumps(environment()), encoding="utf-8")
+def test_compiler_fails_without_modifying_existing_kit(tmp_path):
+    kit = tmp_path / "kit"
+    kit.mkdir()
+    manifest = kit / "manifest.json"
+    original = b'{"id":"existing-kit","sentinel":"unchanged"}\n'
+    manifest.write_bytes(original)
     env = os.environ.copy()
-    env["OC_PATCH_BUILD_ROOT"] = str(tmp_path / "build")
     env["HOME"] = str(tmp_path / "home")
 
     result = subprocess.run(
-        [
-            "bash",
-            str(PREPARE),
-            "eu-west-1",
-            str(env_path),
-            "--skip-review",
-        ],
+        ["bash", str(SCRIPTS / "compile-kit.sh"), str(kit), str(PATCH.parents[1])],
         cwd=PATCH,
         env=env,
         capture_output=True,
         text=True,
     )
 
-    assert result.returncode == 3
-    assert "does not match" in result.stderr
+    assert result.returncode == DISABLED_EXIT, result.stderr
+    assert manifest.read_bytes() == original
+    assert list(kit.iterdir()) == [manifest]
+
+
+@pytest.mark.parametrize("driver", ("patch-set.sh", "autopatch.sh"))
+def test_runtime_driver_fails_closed_with_apply_arguments(tmp_path, driver):
+    kit = tmp_path / "kit"
+    kit.mkdir()
+    env_path = tmp_path / "environment.json"
+    env_path.write_text(json.dumps(environment()), encoding="utf-8")
+    answers = tmp_path / "answers"
+    answers.mkdir()
+    command = ["bash", str(SCRIPTS / driver)]
+    if driver == "patch-set.sh":
+        command.extend(["apply", str(env_path), str(answers), str(kit)])
+    else:
+        command.extend([str(kit), str(env_path)])
+
+    result = subprocess.run(
+        command,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == DISABLED_EXIT, result.stderr
+    assert "PATCH_114_FACTORY_DISABLED" in result.stderr
+    assert sorted(tmp_path.iterdir()) == [answers, env_path, kit]

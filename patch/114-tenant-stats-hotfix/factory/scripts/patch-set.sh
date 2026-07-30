@@ -20,6 +20,13 @@
 #   patch-set.sh status   <environment.json> <kit> [<kit> ...]
 set -euo pipefail
 
+printf '%s\n' \
+  "PATCH_114_FACTORY_DISABLED: refusing to generate or execute this hotfix." \
+  "The factory is incomplete: it omits the tenant-stats writer Lambda, writer IAM and environment, the EventBridge schedule, and an authenticated HTTP end-to-end test." \
+  "Its route hard-codes authorization_type=NONE and can bypass the platform CUSTOM authorizer in platform-key mode." \
+  "Do not use previously generated kits. Replace the factory with a complete, authenticated, end-to-end-verified patch before re-enabling it." >&2
+exit 78
+
 # No braces in the message: `${1:?...}` text goes through brace expansion, so a literal
 # {apply|verify} would be expanded and end up assigned to MODE.
 MODE="${1:?usage: patch-set.sh apply|verify|rollback|status <environment.json> ...}"

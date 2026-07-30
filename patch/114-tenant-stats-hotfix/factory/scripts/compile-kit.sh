@@ -6,6 +6,13 @@
 # from manifest data, compiles it, then packages the fixed runtime into the kit.
 set -euo pipefail
 
+printf '%s\n' \
+  "PATCH_114_FACTORY_DISABLED: refusing to generate or execute this hotfix." \
+  "The factory is incomplete: it omits the tenant-stats writer Lambda, writer IAM and environment, the EventBridge schedule, and an authenticated HTTP end-to-end test." \
+  "Its route hard-codes authorization_type=NONE and can bypass the platform CUSTOM authorizer in platform-key mode." \
+  "Do not use previously generated kits. Replace the factory with a complete, authenticated, end-to-end-verified patch before re-enabling it." >&2
+exit 78
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 KIT="${1:?usage: compile-kit.sh <patch-kit> <source-repo>}"
 REPO="${2:?usage: compile-kit.sh <patch-kit> <source-repo>}"

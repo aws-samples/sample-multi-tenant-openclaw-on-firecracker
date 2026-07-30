@@ -1704,6 +1704,13 @@ def _validate_spec(manifest, spec):
 
 
 def compile_apigw_kit(kit, _repo=None):
+    print(
+        "PATCH_114_FACTORY_DISABLED: the incomplete tenant-stats factory "
+        "cannot compile API Gateway kits",
+        file=sys.stderr,
+    )
+    raise SystemExit(78)
+
     with open(os.path.join(kit, "manifest.json"), encoding="utf-8") as handle:
         manifest = json.load(handle)
     specs = manifest.get("api_routes") or []
@@ -1750,6 +1757,13 @@ def compile_apigw_kit(kit, _repo=None):
 
 
 def main(argv):
+    print(
+        "PATCH_114_FACTORY_DISABLED: the incomplete tenant-stats factory "
+        "cannot compile API Gateway kits",
+        file=sys.stderr,
+    )
+    return 78
+
     if len(argv) < 2:
         print("usage: _compile_apigw.py <patch-kit> [<source-repo>]", file=sys.stderr)
         return 2

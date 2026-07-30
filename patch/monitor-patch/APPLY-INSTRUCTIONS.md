@@ -363,7 +363,7 @@ aws s3 cp deploy/edge/fluent-bit/host/fluent-bit.conf \
 | ID | Action | Pass |
 |---|---|---|
 | v-metrics-endpoint | `curl http://<host>:8899/metrics` | HTTP 200, all metric families present (host-agent binds OC_AGENT_PORT=8899, NOT 9200) |
-| v-port-watermark | grep `openclaw_host_dnat_ports` in metrics | used/total/quarantined present, used <= total |
+| v-port-watermark | grep `openclaw_host_dnat_ports` in metrics | used/total/quarantined present, used <= total. NOTE on port range: `used` counts the **host-side DNAT ingress port** (the iptables `--dport`), allocated by route_ops.PortBitmap from `[DNAT_PORT_LOW, DNAT_PORT_HIGH]` (default [10000,15000], ha_edge.py renders these from `edge.dnat_port_{low,high}`). Do NOT confuse this with the `--to-destination :18789` in `iptables -t nat -S PREROUTING` — 18789 is the guest-side gateway port (GATEWAY_GUEST_PORT), NOT the counted host port. `total` reflects the runtime range width, so if this deployment overrode `edge.dnat_port_high`, the metric follows it (bitmap + edge SG + this gauge all read the same config value — they never split). |
 | v-stats-route | `curl GET /tenants-stats` | HTTP 200 with snapshot; HTTP **503 UNAVAILABLE** if tenant_stats not configured or no snapshot yet (expected, NOT a failure — tenant_stats_service.py returns 503, never 404) |
 | v-cursor-decrypt | Send invalid cursor to paginated endpoint | HTTP 400 (not 500) |
 | v-hook-disabled-noop | Decode LT UserData, check no literal `{{` | No raw placeholder in rendered output |
@@ -391,6 +391,19 @@ done
 ```
 
 ---
+
+## Known limitations (not fixed by this patch — data-plane code, separate issue)
+
+- **Residual PREROUTING DNAT rules after tenant delete.** The control-plane delete path
+  DOES remove a tenant's DNAT rule (tenant_service.py `_dnat_remove_all_cmd` via SSM, gated
+  on `if host_id`), but a host can still show orphan `--to-destination :18789` PREROUTING
+  rules from: tenants deleted BEFORE the argv-alignment fix landed (old rules carried an
+  `-i <iface>` prefix that `iptables -D` couldn't match), or a delete where the DDB record
+  had no `host_port`/`host_id`. These leaked rules also inflate `openclaw_host_dnat_ports_used`
+  after a startup bitmap-rebuild. This is a data-plane route-lifecycle bug, NOT introduced by
+  this monitoring patch; it is tracked separately and must not block this patch. Manual sweep
+  if a host shows DNAT rules with zero live VMs: compare `iptables -t nat -S PREROUTING | grep
+  18789` against `openclaw-tenants` rows with a `host_port` on that host, and `-D` the orphans.
 
 ## Rollback
 

@@ -9,12 +9,34 @@ import argparse
 import copy
 import json
 import re
+import sys
 from pathlib import Path
 
 
 BASE_SHA = "a547dc74fe25ea0219c804933c5a7da8af1e3b39"
 PATCH_SHA = "f8b9e14e5f456a24dc8fc597528a7b1b1540a9f3"
 TABLE = "openclaw-tenant-stats"
+
+
+def factory_disabled() -> None:
+    print(
+        "\n".join(
+            (
+                "PATCH_114_FACTORY_DISABLED: refusing to generate or execute "
+                "this hotfix.",
+                "The factory is incomplete: it omits the tenant-stats writer "
+                "Lambda, writer IAM and environment, the EventBridge schedule, "
+                "and an authenticated HTTP end-to-end test.",
+                "Its route hard-codes authorization_type=NONE and can bypass "
+                "the platform CUSTOM authorizer in platform-key mode.",
+                "Do not use previously generated kits. Replace the factory "
+                "with a complete, authenticated, end-to-end-verified patch "
+                "before re-enabling it.",
+            )
+        ),
+        file=sys.stderr,
+    )
+    raise SystemExit(78)
 
 
 def fail(message: str) -> None:
@@ -215,6 +237,7 @@ def materialize(
     output: Path,
     stage_override: str | None,
 ) -> None:
+    factory_disabled()
     environment = load_object(environment_path, "environment")
     account = str(environment.get("account", ""))
     region = environment.get("region")
@@ -279,6 +302,8 @@ def materialize(
 
 
 def main() -> None:
+    factory_disabled()
+
     parser = argparse.ArgumentParser()
     parser.add_argument("environment", type=Path)
     parser.add_argument("lambda_template", type=Path)

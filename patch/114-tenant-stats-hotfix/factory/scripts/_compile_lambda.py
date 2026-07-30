@@ -1477,6 +1477,13 @@ def _assert_auto_appliable(manifest, root):
 
 
 def compile_lambda_kit(kit, repo):
+    print(
+        "PATCH_114_FACTORY_DISABLED: the incomplete tenant-stats factory "
+        "cannot compile Lambda kits",
+        file=sys.stderr,
+    )
+    raise SystemExit(78)
+
     with open(os.path.join(kit, "manifest.json")) as handle:
         manifest = json.load(handle)
     _assert_no_unresolved_esm_conflict(manifest)
@@ -1615,6 +1622,13 @@ def compile_lambda_kit(kit, repo):
 
 
 def main(argv):
+    print(
+        "PATCH_114_FACTORY_DISABLED: the incomplete tenant-stats factory "
+        "cannot compile Lambda kits",
+        file=sys.stderr,
+    )
+    return 78
+
     if len(argv) != 3:
         print("usage: _compile_lambda.py <patch-kit> <source-repo>", file=sys.stderr)
         return 2

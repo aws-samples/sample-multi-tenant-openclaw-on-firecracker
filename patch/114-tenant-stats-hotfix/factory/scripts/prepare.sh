@@ -3,6 +3,13 @@
 # SPDX-License-Identifier: MIT-0
 set -euo pipefail
 
+printf '%s\n' \
+  "PATCH_114_FACTORY_DISABLED: refusing to generate or execute this hotfix." \
+  "The factory is incomplete: it omits the tenant-stats writer Lambda, writer IAM and environment, the EventBridge schedule, and an authenticated HTTP end-to-end test." \
+  "Its route hard-codes authorization_type=NONE and can bypass the platform CUSTOM authorizer in platform-key mode." \
+  "Do not use previously generated kits. Replace the factory with a complete, authenticated, end-to-end-verified patch before re-enabling it." >&2
+exit 78
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PATCH_ROOT="$(cd "$HERE/../.." && pwd)"
 REPO="$(git -C "$PATCH_ROOT" rev-parse --show-toplevel)"

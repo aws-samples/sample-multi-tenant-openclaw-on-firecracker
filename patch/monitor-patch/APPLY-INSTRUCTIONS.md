@@ -9,8 +9,15 @@
 1. **#387 Host-agent Prometheus exporter** — app_health (gateway HTTP liveness per tenant),
    DNAT port watermark, build_info SHA, loop_tick heartbeat, ssm_agent liveness, route_failure
    counter. Closes the #197 blind spot.
-2. **Scalable tenant queries** — paginated GET /tenants with AES-GCM cursor encryption,
-   optional GSIs (gsi_host/gsi_status/gsi_rootfs_version). Feature-gated: `tenant_query.enabled`.
+2. **Scalable tenant queries** — Feature-gated by `tenant_query.enabled` (default OFF).
+   IMPORTANT cursor semantics: the **default** `GET /tenants` (no new params) keeps the
+   LEGACY cursor — `base64(JSON(LastEvaluatedKey))`, plaintext, tenant ids readable
+   (utils.py:_encode_next_token). **AES-GCM encrypted cursors apply ONLY to** `GET /hosts`
+   pagination and the new single-condition query paths (`?user_id=|host_id=|status=|
+   rootfs_version=`) once the flag is on (core/pagination.py, used only by host_service.py +
+   tenant_query_service.py). Those query paths ALSO require 4 GSIs on openclaw-tenants —
+   gsi_tenant_user / gsi_host / gsi_status / gsi_rootfs_version — see item 5 caveat below;
+   without them the query returns 503 UNAVAILABLE (fail-closed, not a crash).
 3. **Tenant stats aggregation** — new openclaw-tenant-stats-writer Lambda (1min schedule),
    GET /tenants-stats route. Feature-gated: `tenant_stats.enabled`.
 4. **S3 user hooks (#390)** — optional customer-managed root hook at host init. Feature-gated:
@@ -287,16 +294,34 @@ Rollback: `events remove-targets` + `events delete-rule` + `lambda delete-functi
 bash lib/apply-lt.sh roll "$REGION"
 ```
 
-**5. Optional GSIs on `openclaw-tenants`** — only if `scaler.add_gsi_*` enabled. One at a
-time; each must reach ACTIVE before the next (DDB builds one GSI at a time):
+**5. GSIs on `openclaw-tenants` — MANDATORY foundation for the query feature (item 6).**
+`tenant_query_service.py:18-21` maps the four query params to four indexes:
+`user_id→gsi_tenant_user`, `host_id→gsi_host`, `status→gsi_status`,
+`rootfs_version→gsi_rootfs_version`. **A stock deployment has only `gsi_owner`**
+(storage.py builds `gsi_owner` always + `gsi_tenant_user` only when
+`scaler.add_gsi_tenant_user=true`). The CDK does **NOT define gsi_host / gsi_status /
+gsi_rootfs_version at all** — so `?host_id=|status=|rootfs_version=` return **503
+UNAVAILABLE** ("index is not active") until you create them here. Create all four,
+one at a time (DDB builds one GSI per update-table; each must reach ACTIVE first):
 ```bash
-aws dynamodb update-table --table-name openclaw-tenants --region "$REGION" \
-  --attribute-definitions AttributeName=tenant_user_id,AttributeType=S \
-  --global-secondary-index-updates '[{"Create":{"IndexName":"gsi_tenant_user","KeySchema":[{"AttributeName":"tenant_user_id","KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"}}}]'
-# poll until IndexStatus=ACTIVE before creating the next GSI:
-aws dynamodb describe-table --table-name openclaw-tenants --region "$REGION" \
-  --query 'Table.GlobalSecondaryIndexes[?IndexName==`gsi_tenant_user`].IndexStatus' --output text
+create_gsi () {  # $1=index  $2=attr_name
+  aws dynamodb update-table --table-name openclaw-tenants --region "$REGION" \
+    --attribute-definitions "AttributeName=$2,AttributeType=S" \
+    --global-secondary-index-updates "[{\"Create\":{\"IndexName\":\"$1\",\"KeySchema\":[{\"AttributeName\":\"$2\",\"KeyType\":\"HASH\"}],\"Projection\":{\"ProjectionType\":\"ALL\"}}}]"
+  echo "waiting for $1 ACTIVE..."
+  until [ "$(aws dynamodb describe-table --table-name openclaw-tenants --region "$REGION" \
+    --query "Table.GlobalSecondaryIndexes[?IndexName=='$1'].IndexStatus" --output text)" = "ACTIVE" ]; do sleep 20; done
+}
+create_gsi gsi_tenant_user     tenant_user_id
+create_gsi gsi_host            host_id
+create_gsi gsi_status          status
+create_gsi gsi_rootfs_version  q_rootfs_version   # attr name is q_rootfs_version (tenant_query_service.py:21)
 ```
+Note the `status` attribute: back-filling a GSI hash key requires every tenant row to
+carry a non-empty `status`/`host_id`/`q_rootfs_version` attribute, or that row is simply
+absent from the index (DDB sparse-index semantics) — acceptable for a query index, but
+means the counts from these queries are over indexed rows only. Rollback: `update-table
+--global-secondary-index-updates '[{"Delete":{"IndexName":"..."}}]'` per index.
 
 **6. Enable the query feature flag** — only if `tenant_query.enabled=true`, and ONLY after
 item 2 completed. This is the switch that makes `GET /tenants?user_id=|host_id=|status=`
@@ -337,9 +362,9 @@ aws s3 cp deploy/edge/fluent-bit/host/fluent-bit.conf \
 
 | ID | Action | Pass |
 |---|---|---|
-| v-metrics-endpoint | `curl http://<host>:9200/metrics` | HTTP 200, all metric families present |
+| v-metrics-endpoint | `curl http://<host>:8899/metrics` | HTTP 200, all metric families present (host-agent binds OC_AGENT_PORT=8899, NOT 9200) |
 | v-port-watermark | grep `openclaw_host_dnat_ports` in metrics | used/total/quarantined present, used <= total |
-| v-stats-route | `curl GET /tenants-stats` | HTTP 200 (or 404 if feature disabled — expected) |
+| v-stats-route | `curl GET /tenants-stats` | HTTP 200 with snapshot; HTTP **503 UNAVAILABLE** if tenant_stats not configured or no snapshot yet (expected, NOT a failure — tenant_stats_service.py returns 503, never 404) |
 | v-cursor-decrypt | Send invalid cursor to paginated endpoint | HTTP 400 (not 500) |
 | v-hook-disabled-noop | Decode LT UserData, check no literal `{{` | No raw placeholder in rendered output |
 

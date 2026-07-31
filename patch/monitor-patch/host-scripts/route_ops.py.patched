@@ -4,7 +4,7 @@
 
 """Host-side routing operations for the P2 two-tier data plane.
 
-Contract: internal-docs/00-knowledge-base/the data-plane design/the data-plane interface contract
+Contract: shared by the host route CLI, host agent, and Edge routing data plane.
     §1 Redis key schema (`route:{tenant_id}` -> JSON host/port/guest_ip/updated_at)
     §3 Port bitmap [10000, dnat_port_high] + iptables DNAT (atomic three-step)
     §4 DDB descriptor fields (host_private_ip, host_port, guest_ip)

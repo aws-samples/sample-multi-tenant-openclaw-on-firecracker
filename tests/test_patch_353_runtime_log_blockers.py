@@ -5,6 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 KIT = ROOT / "patch" / "353-secret-ttl-plus-post315-rollup"
+CURRENT_KIT = ROOT / "patch" / "monitor-patch"
 
 BUILD_ROOTFS_FILES = (
     ROOT / "build-rootfs.sh",
@@ -44,21 +45,20 @@ def test_host_journal_filters_use_or_semantics():
         assert "Systemd_Filter_Type Or" in text
 
 
-def test_corrected_artifacts_match_sources_and_manifest():
-    manifest = json.loads((KIT / "manifest.json").read_text())
+def test_historical_artifacts_and_current_sources_match_their_manifests():
+    historical = json.loads((KIT / "manifest.json").read_text())
+    current = json.loads((CURRENT_KIT / "manifest.json").read_text())
     pairs = (
         (
             BUILD_ROOTFS_FILES,
-            manifest["paths"]["build-rootfs.sh"]["patch_sha256"],
+            "build-rootfs.sh",
         ),
         (
             FLUENT_BIT_FILES,
-            manifest["paths"]["deploy/edge/fluent-bit/host/fluent-bit.conf"][
-                "patch_sha256"
-            ],
+            "deploy/edge/fluent-bit/host/fluent-bit.conf",
         ),
     )
 
-    for (source, artifact), expected_hash in pairs:
-        assert source.read_bytes() == artifact.read_bytes()
-        assert _sha256(source) == expected_hash
+    for (source, artifact), manifest_path in pairs:
+        assert _sha256(artifact) == historical["paths"][manifest_path]["patch_sha256"]
+        assert _sha256(source) == current["paths"][manifest_path]["patch_sha256"]

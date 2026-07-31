@@ -1,10 +1,24 @@
 """Read the latest complete tenant statistics snapshot."""
 
 from datetime import datetime, timezone
+from decimal import Decimal
 
 from core.auth import _get_caller_identity
 from core.clients import tenant_stats_table
 from core.utils import _err, _resp
+
+
+def _normalize_decimal_numbers(value):
+    """Convert DynamoDB Decimal values into JSON numbers recursively."""
+    if isinstance(value, Decimal):
+        if value == value.to_integral_value():
+            return int(value)
+        return float(value)
+    if isinstance(value, dict):
+        return {key: _normalize_decimal_numbers(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_normalize_decimal_numbers(item) for item in value]
+    return value
 
 
 def get_tenant_stats(event):
@@ -26,4 +40,4 @@ def get_tenant_stats(event):
         ).total_seconds() > 90
     except (KeyError, TypeError, ValueError):
         item["snapshot_stale"] = True
-    return _resp(200, item)
+    return _resp(200, _normalize_decimal_numbers(item))

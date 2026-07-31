@@ -1480,6 +1480,10 @@ def build_ha_edge(self, ctx):
             f'echo "waiting for edge assets in S3 ($i)"; sleep 10; done',
             '[ -f /opt/openclaw-edge/install-edge.sh ] || { echo "[edge-userdata] FATAL: edge assets missing after 600s" >&2; exit 1; }',
             f'ENGINE_REDIS_ENDPOINT="{redis_endpoint}" EDGE_LISTEN_PORT=8080 '
+            f'LOGGING_ENABLED="{str(_logging_enabled).lower()}" '
+            f'ASSETS_BUCKET="{assets_bucket.bucket_name}" '
+            f'AWS_REGION="{self.region}" '
+            f'FIREHOSE_DELIVERY_STREAM="claw-logs{self._gsuffix}" '
             "bash /opt/openclaw-edge/install-edge.sh",
         ]
         _edge_hook_command = _render_user_hook(

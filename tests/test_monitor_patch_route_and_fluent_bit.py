@@ -309,6 +309,7 @@ def test_monitor_runbook_updates_the_independent_lifecycle_consumer():
     assert "/tmp/lifecycle.patched.zip" in runbook
     assert '--function-name "$LIFECYCLE_FN"' in runbook
     assert "update-event-source-mapping" in runbook
+    assert "curl -fsS http://127.0.0.1:8899/metrics >/dev/null && break" in runbook
 
     api_entries = [
         entry

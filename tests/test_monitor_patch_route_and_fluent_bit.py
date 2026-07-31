@@ -295,3 +295,41 @@ def test_edge_fluent_bit_inputs_are_injected_and_fail_closed():
     assert "delivery_stream rendered empty" in installer
     assert "--dry-run" in installer
     assert "systemctl is-active --quiet fluent-bit" in installer
+
+
+def test_monitor_runbook_updates_the_independent_lifecycle_consumer():
+    patch_dir = ROOT / "patch" / "monitor-patch"
+    runbook = (patch_dir / "APPLY-INSTRUCTIONS.md").read_text()
+    manifest = json.loads((patch_dir / "manifest.json").read_text())
+
+    assert 'test -n "${BASH_VERSION:-}"' in runbook
+    assert "LIFECYCLE_QUEUE_ARN" in runbook
+    assert "LIFECYCLE_ESM_UUID" in runbook
+    assert "/tmp/lifecycle.before.zip" in runbook
+    assert "/tmp/lifecycle.patched.zip" in runbook
+    assert '--function-name "$LIFECYCLE_FN"' in runbook
+    assert "update-event-source-mapping" in runbook
+
+    api_entries = [
+        entry
+        for path, entry in manifest["paths"].items()
+        if path.startswith("deploy/lambda/api/") and entry["layer"] == "C-lambda"
+    ]
+    assert len(api_entries) == 11
+    assert all(
+        "lifecycle consumer" in entry["operations"][0]["resource"]
+        for entry in api_entries
+    )
+
+
+def test_monitor_runbook_uses_rendered_edge_paths_and_fails_closed():
+    runbook = (
+        ROOT / "patch" / "monitor-patch" / "APPLY-INSTRUCTIONS.md"
+    ).read_text()
+
+    assert "/opt/openclaw-edge/install-edge.sh" in runbook
+    assert "/usr/local/openresty/nginx/sbin/nginx -t" in runbook
+    assert "systemctl is-active --quiet claw-edge.service" in runbook
+    assert "compared directly with the source artifact hash" in runbook
+    assert "A node containing only `/opt/monitoring/.env`" in runbook
+    assert "test -f /opt/monitoring/docker-compose.prom-grafana.yml" in runbook

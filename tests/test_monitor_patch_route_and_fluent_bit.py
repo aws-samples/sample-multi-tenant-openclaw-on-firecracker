@@ -1,6 +1,11 @@
+import ast
 import importlib.util
+import json
 from pathlib import Path
 from subprocess import CompletedProcess
+import sys
+from decimal import Decimal
+from types import ModuleType
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -9,6 +14,61 @@ ROOT = Path(__file__).resolve().parents[1]
 def _load_route_ops():
     path = ROOT / "deploy" / "userdata" / "route_ops.py"
     spec = importlib.util.spec_from_file_location("monitor_patch_route_ops", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_function(path, function_name):
+    tree = ast.parse(path.read_text())
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == function_name
+    )
+    module = ast.Module(body=[function], type_ignores=[])
+    namespace = {}
+    exec(compile(module, str(path), "exec"), namespace)
+    return namespace[function_name]
+
+
+def _load_tenant_stats_service(monkeypatch, table):
+    core = ModuleType("core")
+    core.__path__ = []
+    auth = ModuleType("core.auth")
+    auth._get_caller_identity = lambda event: {
+        "is_admin": True,
+        "platform_scope": None,
+    }
+    clients = ModuleType("core.clients")
+    clients.tenant_stats_table = table
+    utils = ModuleType("core.utils")
+    utils._err = lambda code, error_code, message: {
+        "statusCode": code,
+        "body": json.dumps({"code": error_code, "error": message}),
+    }
+    utils._resp = lambda code, body: {
+        "statusCode": code,
+        "body": json.dumps(body),
+    }
+    for name, module in {
+        "core": core,
+        "core.auth": auth,
+        "core.clients": clients,
+        "core.utils": utils,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    path = (
+        ROOT
+        / "deploy"
+        / "lambda"
+        / "api"
+        / "services"
+        / "tenant_stats_service.py"
+    )
+    spec = importlib.util.spec_from_file_location("monitor_patch_tenant_stats", path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -58,6 +118,29 @@ def test_delete_route_releases_live_and_legacy_rules(monkeypatch):
     assert ("redis", "tenant-1") in calls
 
 
+def test_delete_route_fails_when_redis_writer_is_unconfigured(monkeypatch):
+    route_ops = _load_route_ops()
+    monkeypatch.setattr(route_ops, "rebuild_bitmap_from_iptables", lambda bitmap: 0)
+    monkeypatch.setattr(route_ops, "release_port_and_dnat", lambda *args: None)
+    monkeypatch.setattr(route_ops, "_cli_redis_writer", lambda: None)
+
+    assert route_ops._cli_delete_route("tenant-1", 10001, "10.0.0.2", 0) == 1
+
+
+def test_delete_route_fails_when_redis_delete_fails(monkeypatch):
+    route_ops = _load_route_ops()
+    monkeypatch.setattr(route_ops, "rebuild_bitmap_from_iptables", lambda bitmap: 0)
+    monkeypatch.setattr(route_ops, "release_port_and_dnat", lambda *args: None)
+
+    class Writer:
+        def del_route(self, tenant_id):
+            return False
+
+    monkeypatch.setattr(route_ops, "_cli_redis_writer", lambda: Writer())
+
+    assert route_ops._cli_delete_route("tenant-1", 10001, "10.0.0.2", 0) == 1
+
+
 def test_remove_all_does_not_hide_iptables_errors(monkeypatch):
     route_ops = _load_route_ops()
     monkeypatch.setattr(
@@ -96,6 +179,56 @@ def test_delete_route_is_a_retryable_hard_gate():
     assert "route cleanup failed (bitmap/DNAT/Redis)" in delete_body
     assert "_mark_delete_retryable()" in delete_body
     assert "route_ops.py del-route" not in delete_body
+
+
+def test_missing_host_with_route_state_cannot_finalize_delete():
+    path = (
+        ROOT / "deploy" / "lambda" / "api" / "services" / "tenant_service.py"
+    )
+    requires_host = _load_function(path, "_route_cleanup_requires_host")
+
+    assert requires_host({"host_port": 10001, "guest_ip": "10.0.0.2"})
+    assert requires_host({"host_private_ip": "10.0.1.2"})
+    assert not requires_host({"host_id": "i-123", "host_port": 10001})
+    assert not requires_host({"status": "creating"})
+
+    delete_body = path.read_text().split("def delete_tenant(", 1)[1].split(
+        "\ndef _reserve_migration_slot(", 1
+    )[0]
+    gate = delete_body.index("if _route_cleanup_requires_host(item):")
+    finalize = delete_body.index("# Go-live C: reclaim")
+    assert gate < finalize
+    assert '"requires_intervention": True' in delete_body
+    assert "_mark_delete_retryable()" in delete_body[gate:finalize]
+
+
+def test_tenant_stats_response_preserves_json_number_types(monkeypatch):
+    class Table:
+        def get_item(self, **kwargs):
+            return {
+                "Item": {
+                    "id": "current",
+                    "data_as_of": "2099-01-01T00:00:00Z",
+                    "business": {
+                        "total": Decimal("2"),
+                        "running": Decimal("1"),
+                    },
+                    "status_counts": [
+                        {"status": "running", "count": Decimal("1")}
+                    ],
+                    "ratio": Decimal("0.5"),
+                }
+            }
+
+    service = _load_tenant_stats_service(monkeypatch, Table())
+    response = service.get_tenant_stats({})
+    body = json.loads(response["body"])
+
+    assert response["statusCode"] == 200
+    assert body["business"] == {"total": 2, "running": 1}
+    assert body["status_counts"][0]["count"] == 1
+    assert isinstance(body["business"]["total"], int)
+    assert isinstance(body["ratio"], float)
 
 
 def test_edge_fluent_bit_inputs_are_injected_and_fail_closed():

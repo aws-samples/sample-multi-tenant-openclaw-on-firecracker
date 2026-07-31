@@ -189,6 +189,16 @@ def _dnat_remove_all_cmd(host_port, guest_ip):
     return f"while {check} 2>/dev/null; do {delete} || exit $?; done"
 
 
+def _route_cleanup_requires_host(item):
+    """Return whether persisted route state cannot be cleaned without a host."""
+    if item.get("host_id"):
+        return False
+    return any(
+        item.get(field) not in (None, "", 0)
+        for field in ("host_port", "guest_ip", "host_private_ip")
+    )
+
+
 # ── #187 P1 — pre-mint gateway token + reveal (11-ENGINE-TRANSFORM D 段)──────
 # 建租户时预铸 32 字节随机 token,KMS 信封绑 tenant_id 加密,密文落 openclaw-tenant-secrets
 # 表(#353 起无 TTL,长存)。SSM 命令把密文按位置 12 传给 launch-vm.sh;host
@@ -1995,6 +2005,19 @@ def delete_tenant(tenant_id, query_params, event=None):
             )
         except Exception:
             pass
+
+    if _route_cleanup_requires_host(item):
+        _mark_delete_retryable()
+        return utils._resp(
+            502,
+            {
+                "error": "route cleanup blocked: tenant has persisted route state but "
+                "no host_id. Tenant remains deleting; restore host_id or clean the "
+                "exact DNAT/Redis route after identifying its host, then retry.",
+                "id": tenant_id,
+                "requires_intervention": True,
+            },
+        )
 
     if host_id and not keep_data and not skip_backup:
         try:

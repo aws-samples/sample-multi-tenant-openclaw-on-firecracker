@@ -6,6 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 KIT = ROOT / "patch" / "353-secret-ttl-plus-post315-rollup"
+CURRENT_KIT = ROOT / "patch" / "monitor-patch"
 BUILD_ROOTFS_FILES = (
     ROOT / "build-rootfs.sh",
     KIT / "launch-template" / "build-rootfs.sh.patched",
@@ -30,10 +31,14 @@ def test_build_scripts_remain_valid_bash():
         subprocess.run(["bash", "-n", str(path)], check=True)
 
 
-def test_artifact_and_manifest_hash_follow_canonical_source():
+def test_historical_artifact_and_current_source_follow_their_manifests():
     source, artifact = BUILD_ROOTFS_FILES
-    manifest = json.loads((KIT / "manifest.json").read_text())
-    expected = manifest["paths"]["build-rootfs.sh"]["patch_sha256"]
+    historical = json.loads((KIT / "manifest.json").read_text())
+    current = json.loads((CURRENT_KIT / "manifest.json").read_text())
 
-    assert source.read_bytes() == artifact.read_bytes()
-    assert hashlib.sha256(source.read_bytes()).hexdigest() == expected
+    assert hashlib.sha256(artifact.read_bytes()).hexdigest() == historical["paths"][
+        "build-rootfs.sh"
+    ]["patch_sha256"]
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == current["paths"][
+        "build-rootfs.sh"
+    ]["patch_sha256"]

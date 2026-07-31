@@ -377,6 +377,10 @@ def _ensure_route(tenant_id: str, guest_ip: str) -> tuple[str, int | None]:
     """
     host_ip = _get_host_private_ip()
     bitmap = _get_port_bitmap()
+    # A route_ops CLI delete runs outside this process. Reconcile the singleton
+    # from authoritative iptables before allocating so a released slot does not
+    # remain reserved until host-agent restarts.
+    route_ops.rebuild_bitmap_from_iptables(bitmap)
     # 1. Check whether iptables already has a rule for this guest_ip that
     #    was just recovered at bootstrap. If yes, reuse it — same tenant
     #    same slot after a restart.
@@ -2413,6 +2417,9 @@ class Handler(BaseHTTPRequestHandler):
             bitmap = _port_bitmap
             if bitmap is not None:
                 try:
+                    # Cross-process delete-route updates iptables, not this
+                    # process's bitmap. Refresh before exporting the watermark.
+                    route_ops.rebuild_bitmap_from_iptables(bitmap)
                     used = bitmap.used_count()
                     quarantined = len(
                         route_ops.get_quarantined_ports() - bitmap.snapshot()

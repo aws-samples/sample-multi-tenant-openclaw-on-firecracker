@@ -189,6 +189,16 @@ def _dnat_remove_all_cmd(host_port, guest_ip):
     return f"while {check} 2>/dev/null; do {delete} || exit $?; done"
 
 
+def _route_cleanup_requires_host(item):
+    """Return whether persisted route state cannot be cleaned without a host."""
+    if item.get("host_id"):
+        return False
+    return any(
+        item.get(field) not in (None, "", 0)
+        for field in ("host_port", "guest_ip", "host_private_ip")
+    )
+
+
 # ── #187 P1 — pre-mint gateway token + reveal (11-ENGINE-TRANSFORM D 段)──────
 # 建租户时预铸 32 字节随机 token,KMS 信封绑 tenant_id 加密,密文落 openclaw-tenant-secrets
 # 表(#353 起无 TTL,长存)。SSM 命令把密文按位置 12 传给 launch-vm.sh;host
@@ -1885,12 +1895,17 @@ def delete_tenant(tenant_id, query_params, event=None):
     try:
         clients.tenants_table.update_item(
             Key={"id": tenant_id},
-            UpdateExpression="SET #s = :deleting, updated_at = :t",
+            UpdateExpression=(
+                "SET #s = :deleting, updated_at = :t, "
+                "delete_retryable = :false, delete_prev_status = :prev"
+            ),
             ConditionExpression="#s <> :deleted AND #s <> :deleting",
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
                 ":deleting": "deleting",
                 ":deleted": "deleted",
+                ":false": False,
+                ":prev": prev_status,
                 ":t": utils._now(),
             },
         )
@@ -1911,13 +1926,32 @@ def delete_tenant(tenant_id, query_params, event=None):
         if cur.get("status") == "deleted":
             return utils._resp(200, {"id": tenant_id, "status": "deleted"})
         is_consumer_replay = bool((event or {}).get("_consumer_ident"))
-        if not is_consumer_replay:
-            # 同步路径并发双删的输家:幂等 200,不碰副作用/账本(#107)。
-            return utils._resp(200, {"id": tenant_id, "status": "deleting"})
+        if not is_consumer_replay and cur.get("delete_retryable") is not True:
+            # Another request still owns the delete. A failed attempt explicitly
+            # sets delete_retryable=true below; only then may a synchronous retry
+            # acquire the replay gate.
+            return utils._resp(202, {"id": tenant_id, "status": "deleting"})
+        if cur.get("delete_retryable") is True:
+            try:
+                clients.tenants_table.update_item(
+                    Key={"id": tenant_id},
+                    UpdateExpression="SET delete_retryable = :false, updated_at = :t",
+                    ConditionExpression="#s = :deleting AND delete_retryable = :true",
+                    ExpressionAttributeNames={"#s": "status"},
+                    ExpressionAttributeValues={
+                        ":deleting": "deleting",
+                        ":true": True,
+                        ":false": False,
+                        ":t": utils._now(),
+                    },
+                )
+            except clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException:
+                return utils._resp(202, {"id": tenant_id, "status": "deleting"})
         # consumer 重投卡在 deleting 的删除:status 已是 deleting,不再翻转,直接往下
         # 重试副作用(stop-vm/rm 幂等)。#107 账本回退由下方 `used_vcpu >= :v` guard
         # 防重复扣穿(第一次已扣过则 CCF → skip),不会二次扣账本。
-        prev_status = cur.get("status", prev_status)
+        prev_status = cur.get("delete_prev_status", prev_status)
+        item = cur
 
     keep_data = query_params.get("keep_data", "true").lower() == "true"
     host_id = item.get("host_id")
@@ -1939,7 +1973,10 @@ def delete_tenant(tenant_id, query_params, event=None):
         try:
             clients.tenants_table.update_item(
                 Key={"id": tenant_id},
-                UpdateExpression="SET #s = :prev, updated_at = :t",
+                UpdateExpression=(
+                    "SET #s = :prev, updated_at = :t "
+                    "REMOVE delete_retryable, delete_prev_status"
+                ),
                 ConditionExpression="#s = :deleting",
                 ExpressionAttributeNames={"#s": "status"},
                 ExpressionAttributeValues={
@@ -1951,6 +1988,36 @@ def delete_tenant(tenant_id, query_params, event=None):
         except Exception:
             # Best-effort restore; if another op already moved it, leave as-is.
             pass
+
+    def _mark_delete_retryable():
+        """Allow one caller to resume a failed post-stop delete."""
+        try:
+            clients.tenants_table.update_item(
+                Key={"id": tenant_id},
+                UpdateExpression="SET delete_retryable = :true, updated_at = :t",
+                ConditionExpression="#s = :deleting",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={
+                    ":deleting": "deleting",
+                    ":true": True,
+                    ":t": utils._now(),
+                },
+            )
+        except Exception:
+            pass
+
+    if _route_cleanup_requires_host(item):
+        _mark_delete_retryable()
+        return utils._resp(
+            502,
+            {
+                "error": "route cleanup blocked: tenant has persisted route state but "
+                "no host_id. Tenant remains deleting; restore host_id or clean the "
+                "exact DNAT/Redis route after identifying its host, then retry.",
+                "id": tenant_id,
+                "requires_intervention": True,
+            },
+        )
 
     if host_id and not keep_data and not skip_backup:
         try:
@@ -2016,7 +2083,8 @@ def delete_tenant(tenant_id, query_params, event=None):
         # 失败则回滚 status 到删除前(复用 _abort_restore_status,CAS 保证只回滚自己翻的
         # deleting)+ 返 502。delete 走队列(#263)时 consumer 收 5xx 会重投,重投时租户又
         # 是 running→CAS 重新翻 deleting→重试 stop(幂等:已停的 VM 再停无害)。best-effort
-        # 的 iptables/route(下方)失败仍容忍,有 host-agent orphan-reap 兜底。
+        # route cleanup below is also a hard gate: a failed bitmap/DNAT/Redis
+        # release keeps this record deleting and opens the explicit retry gate.
         vm_num = int(item.get("vm_num", 1))
         if not ssm_dispatch._ssm_run(
             host_id, f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num}"
@@ -2052,28 +2120,29 @@ def delete_tenant(tenant_id, query_params, event=None):
     # #187 转型:legacy_alb rule 已删,数据面走两级路由,无需再摘 per-tenant ALB rule。
 
     if host_id:
-        # 销毁租户 → 回收数据面路由(design decision:delete 可移除路由,stop 保留)。
-        # DNAT 规则删除的 argv 必须与 host-agent route_ops.dnat_rule_args 加规则时
-        # 完全一致(无 `-i <iface>` 前缀)——旧代码带 `-i` 前缀,与 route_ops 无 `-i`
-        # 的规则不匹配,`iptables -D` 删不掉,DNAT 规则永久泄漏在 PREROUTING 链里,
-        # 累计租户越多链越长(线性匹配退化的真正元凶)。修成对齐 argv 后 delete
-        # 真回收端口段槽位,单 host 规则数回落到活跃租户量级。
-        _hp = item.get("host_port", 0)
+        # One host-side command owns all route state: live bitmap DNAT, the
+        # historical VM_PORT_BASE+vm_num DNAT family, quarantine, and Redis.
+        # Its SSM result is mandatory; finalizing deleted after a timeout would
+        # hide leaked state and prevent a safe retry.
+        _hp = int(item.get("host_port", 0) or 0)
         _gip = item.get("guest_ip", "")
-        if _hp and _gip:
-            ssm_dispatch._ssm_run(
-                host_id,
-                _dnat_remove_all_cmd(_hp, _gip),
-            )
-        # #134 修:delete 显式清 Redis route:{tenant} 键(contract §8 要求,原实现漏了 →
-        # edge 仍缓存指向已删 VM 的 host:port,DNAT 已摘 → 502)。控制面无 Redis 客户端,
-        # 经 SSM 调 host 上 route_ops.py CLI(host 在 VPC 内、有 ENGINE_REDIS_ENDPOINT)。
-        # best-effort:host-agent 的 orphan-reap 也会补删(双保险)。
-        ssm_dispatch._ssm_run(
-            host_id,
-            f"set -a; . /etc/environment 2>/dev/null; . /etc/platform.env 2>/dev/null; set +a; "
-            f"python3 /opt/openclaw/route_ops.py del-route {tenant_id} 2>/dev/null || true",
+        _legacy_hp = clients.VM_PORT_BASE + int(item.get("vm_num", 1)) - 1
+        _route_cmd = (
+            "set -a; . /etc/environment 2>/dev/null; "
+            ". /etc/platform.env 2>/dev/null; set +a; "
+            "python3 /opt/openclaw/route_ops.py delete-route "
+            f"{shlex.quote(tenant_id)} {_hp} {shlex.quote(_gip)} {_legacy_hp}"
         )
+        if not ssm_dispatch._ssm_run(host_id, _route_cmd):
+            _mark_delete_retryable()
+            return utils._resp(
+                502,
+                {
+                    "error": "route cleanup failed (bitmap/DNAT/Redis); tenant remains "
+                    "deleting and may be retried safely.",
+                    "id": tenant_id,
+                },
+            )
 
         if not keep_data:
             # #268 — rm -rf 数据盘是关键(no-data-loss:盘泄漏累积撑爆 host 容量)。
@@ -2098,6 +2167,7 @@ def delete_tenant(tenant_id, query_params, event=None):
             if not ssm_dispatch._ssm_run(
                 host_id, f"touch {_q_tomb} && rm -rf {_q_vmd}"
             ):
+                _mark_delete_retryable()
                 print(
                     f"delete_tenant #268: rm -rf data disk FAILED for {tenant_id} on "
                     f"host {host_id} (SSM timeout/error) — VM stopped but disk leaked; "
@@ -2174,12 +2244,14 @@ def delete_tenant(tenant_id, query_params, event=None):
     if item.get("litellm_vkey") and not vkey_revoked:
         update_expr = (
             "SET #s = :s, updated_at = :t, vkey_revoke_failed = :vf "
-            "REMOVE cognito_channel_password"
+            "REMOVE cognito_channel_password, delete_retryable, delete_prev_status"
         )
         expr_vals = {":s": "deleted", ":t": utils._now(), ":vf": True}
     else:
         update_expr = (
-            "SET #s = :s, updated_at = :t REMOVE litellm_vkey, cognito_channel_password"
+            "SET #s = :s, updated_at = :t "
+            "REMOVE litellm_vkey, cognito_channel_password, "
+            "delete_retryable, delete_prev_status"
         )
         expr_vals = {":s": "deleted", ":t": utils._now()}
     clients.tenants_table.update_item(

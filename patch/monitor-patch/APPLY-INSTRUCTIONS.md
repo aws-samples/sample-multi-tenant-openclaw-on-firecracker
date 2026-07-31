@@ -285,8 +285,13 @@ install -o root -g root -m 0644 "$STAGE/route_ops.py" /opt/openclaw/route_ops.py
 install -o root -g root -m 0755 "$STAGE/launch-vm.sh" /home/ubuntu/launch-vm.sh
 install -o root -g root -m 0755 "$STAGE/stop-vm.sh" /home/ubuntu/stop-vm.sh
 install -o root -g root -m 0755 "$STAGE/migrate-vm.sh" /home/ubuntu/migrate-vm.sh
+systemctl daemon-reload
 systemctl restart host-agent
 systemctl is-active --quiet host-agent
+for attempt in $(seq 1 30); do
+  curl -fsS http://127.0.0.1:8899/metrics >/dev/null && break
+  sleep 1
+done
 curl -fsS http://127.0.0.1:8899/metrics >/dev/null
 for i in "${!DESTS[@]}"; do
   printf '%s  %s\n' "${SHAS[$i]}" "${DESTS[$i]}" | sha256sum -c -
@@ -390,7 +395,15 @@ build_api_overlay() {
     mkdir -p "$work_dir/$(dirname "$rel")"
     install -m 0644 "$PATCH_DIR/lambda/api/$rel" "$work_dir/$rel"
   done
-  python3 -m compileall -q "$work_dir"
+  python3 - "$work_dir" "${API_OVERLAY_FILES[@]}" <<'PY'
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+for relative_path in sys.argv[2:]:
+    path = root / relative_path
+    compile(path.read_bytes(), str(path), "exec")
+PY
   rm -f "$output_zip"
   (cd "$work_dir" && zip -qr "$output_zip" .)
 }
@@ -1039,8 +1052,10 @@ hosts. The live `/etc/fluent-bit/fluent-bit.conf` is a rendered file and must
 not be compared directly with the source artifact hash. On each active host,
 record its current non-empty region and both Firehose streams, back up the whole
 `/etc/fluent-bit` directory, render the source template with those three values,
-run Fluent Bit `--dry-run`, restart the service, and confirm it is active.
-Restore the directory backup on any failure.
+and stage it together with the current parser and Lua files. Run Fluent Bit
+`--dry-run` from that staging directory so relative `Parsers_File` and `script`
+references resolve correctly. Then install, restart the service, and confirm it
+is active. Restore the directory backup on any failure.
 
 When either `edge_logs=true` or `monitoring=true`, apply
 `host-scripts/edge/nginx.conf` to all running Edge instances through a temporary

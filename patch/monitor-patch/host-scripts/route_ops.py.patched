@@ -807,7 +807,13 @@ def _cli_delete_route(
         return 1
 
     writer = _cli_redis_writer()
-    if writer is not None and not writer.del_route(tenant_id):
+    if writer is None:
+        print(
+            f"delete-route {tenant_id}: no ENGINE_REDIS_ENDPOINT; "
+            "refusing partial cleanup"
+        )
+        return 1
+    if not writer.del_route(tenant_id):
         print(f"delete-route {tenant_id}: Redis DEL failed")
         return 1
     print(

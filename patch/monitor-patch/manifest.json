@@ -1,7 +1,7 @@
 {
   "id": "monitor-patch",
   "base_sha": "a547dc74fe25ea0219c804933c5a7da8af1e3b39",
-  "patch_sha": "e63bc7d9df85b4c8918a0612391be9cccf458186",
+  "patch_sha": "74406d30749d91ecd98b075cc04aedc11585264b",
   "status": "MANUAL_REVIEW",
   "excludes": [
     "README.md",
@@ -55,7 +55,7 @@
       "layer": "B-s3",
       "artifact": "host-scripts/route_ops.py.patched",
       "base_sha256": "b15d3279d609acc5c86a1a2bd5aa165f1e2618764518eebf46bb3b02b624a45f",
-      "patch_sha256": "ba77c83be8d0433966fe13ae17c59c998d5f16a8242feb7fd6370b3ad24da14d",
+      "patch_sha256": "a25d4496c72d894cae2212bc8ac560b0d60ce42f097390dc77152b73fe4439c8",
       "operations": [
         {
           "resource": "s3:deployment/scripts/route_ops.py on live hosts + S3",
@@ -329,7 +329,7 @@
       "layer": "C-lambda",
       "artifact": "lambda/api/services/tenant_service.py",
       "base_sha256": "8839cd464e86147d05b8d30a31626383b44d3f6bbbb107b3cf267809153cd054",
-      "patch_sha256": "c5f8d43f3bca3787aeb1fe54f195d5f3a0fa4349de44b8655ef39d31160688d7",
+      "patch_sha256": "9fbaec9fc53b843b48d563acb5e5847413c809ad0908aa545e5bb47c280f2e16",
       "operations": [
         {
           "resource": "lambda:openclaw-api overlay",
@@ -350,7 +350,7 @@
       "layer": "C-lambda",
       "artifact": "lambda/api/services/tenant_stats_service.py",
       "base_sha256": null,
-      "patch_sha256": "467ed09957f932104a08e1f394a0fd895d8c8455d421e35bf3814667835bd1ea",
+      "patch_sha256": "1fda49731cc1caca7d6b6c1d98113a8b52228fb6b450c2fd6f47d36a2c5b3825",
       "operations": [
         {
           "resource": "lambda:openclaw-api overlay",
@@ -855,7 +855,7 @@
     },
     {
       "id": "#tenant-stats",
-      "summary": "Periodic tenant stats aggregation: new openclaw-tenant-stats-writer Lambda (1min EventBridge schedule, scans tenants table, writes summary stats to openclaw-tenant-stats DDB table). New GET /tenants-stats API route exposes the pre-computed stats. Feature-gated by config tenant_stats.enabled.",
+      "summary": "Periodic tenant stats aggregation: new openclaw-tenant-stats-writer Lambda (1min EventBridge schedule, scans tenants table, writes summary stats to openclaw-tenant-stats DDB table). New GET /tenants-stats API route exposes the pre-computed stats with DynamoDB Decimal counts normalized to JSON numbers. Feature-gated by config tenant_stats.enabled.",
       "paths": [
         "deploy/lambda/tenant_stats/handler.py",
         "deploy/lambda/api/services/tenant_stats_service.py",
@@ -921,7 +921,7 @@
     },
     {
       "id": "#route-cleanup",
-      "summary": "Remove the unused legacy launch-time DNAT family and make delete reclaim bitmap DNAT, legacy DNAT, Redis route, and the in-process bitmap slot. Route-cleanup failure keeps the tenant retryable instead of finalizing a hidden leak.",
+      "summary": "Remove the unused legacy launch-time DNAT family and make delete reclaim bitmap DNAT, legacy DNAT, Redis route, and the in-process bitmap slot. Missing Redis configuration, Redis deletion failure, or persisted route state without host_id keeps the tenant retryable instead of finalizing a hidden leak.",
       "paths": [
         "deploy/userdata/host-agent.py",
         "deploy/userdata/route_ops.py",

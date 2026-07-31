@@ -865,12 +865,16 @@ ID/scopes, Lambda AWS_PROXY URI/qualifier, credentials, and integration HTTP
 method from `GET /tenants`. Stop on a partially present or mismatched route.
 
 ```bash
-export ROOT_RID="$(aws apigateway get-resources --rest-api-id "$API_ID" \
-  --region "$REGION" --query 'items[?path==`/`].id | [0]' --output text)"
-export TENANTS_RID="$(aws apigateway get-resources --rest-api-id "$API_ID" \
-  --region "$REGION" --query 'items[?path==`/tenants`].id | [0]' --output text)"
-test -n "$ROOT_RID" && test "$ROOT_RID" != None
-test -n "$TENANTS_RID" && test "$TENANTS_RID" != None
+aws apigateway get-resources --rest-api-id "$API_ID" --region "$REGION" \
+  --output json >/tmp/api-resources.route-current.json
+export ROOT_RID="$(jq -r \
+  '[.items[] | select(.path == "/")] | if length == 1 then .[0].id else empty end' \
+  /tmp/api-resources.route-current.json)"
+export TENANTS_RID="$(jq -r \
+  '[.items[] | select(.path == "/tenants")] | if length == 1 then .[0].id else empty end' \
+  /tmp/api-resources.route-current.json)"
+test -n "$ROOT_RID"
+test -n "$TENANTS_RID"
 SOURCE_METHOD=$(aws apigateway get-method --rest-api-id "$API_ID" \
   --resource-id "$TENANTS_RID" --http-method GET --region "$REGION")
 SOURCE_INTEGRATION=$(aws apigateway get-integration --rest-api-id "$API_ID" \
@@ -879,12 +883,16 @@ test "$(jq -r .type <<<"$SOURCE_INTEGRATION")" = AWS_PROXY
 export PREVIOUS_DEPLOYMENT="$(aws apigateway get-stage --rest-api-id "$API_ID" \
   --stage-name "$STAGE" --region "$REGION" --query deploymentId --output text)"
 
-EXISTING_STATS_RID="$(aws apigateway get-resources --rest-api-id "$API_ID" \
-  --region "$REGION" --query 'items[?path==`/tenants-stats`].id | [0]' --output text)"
-test "$EXISTING_STATS_RID" = None || {
-  echo "FATAL: /tenants-stats already exists; validate/adopt it instead of overwriting" >&2
-  exit 1
-}
+EXISTING_STATS_RID="$(jq -r \
+  '[.items[] | select(.path == "/tenants-stats")] | if length == 0 then empty else .[0].id end' \
+  /tmp/api-resources.route-current.json)"
+case "$EXISTING_STATS_RID" in
+  "") ;;
+  *)
+    echo "FATAL: /tenants-stats already exists; validate/adopt it instead of overwriting" >&2
+    exit 1
+    ;;
+esac
 export STATS_RID="$(aws apigateway create-resource --rest-api-id "$API_ID" \
   --parent-id "$ROOT_RID" --path-part tenants-stats --region "$REGION" \
   --query id --output text)"
@@ -921,10 +929,15 @@ aws apigateway put-method-response --rest-api-id "$API_ID" \
   --resource-id "$STATS_RID" --http-method OPTIONS --status-code 204 \
   --response-parameters 'method.response.header.Access-Control-Allow-Headers=true,method.response.header.Access-Control-Allow-Methods=true,method.response.header.Access-Control-Allow-Origin=true' \
   --region "$REGION"
-aws apigateway put-integration-response --rest-api-id "$API_ID" \
-  --resource-id "$STATS_RID" --http-method OPTIONS --status-code 204 \
-  --response-parameters "method.response.header.Access-Control-Allow-Headers='Content-Type,x-api-key,Authorization',method.response.header.Access-Control-Allow-Methods='OPTIONS,GET',method.response.header.Access-Control-Allow-Origin='*'" \
-  --region "$REGION"
+OPTIONS_RESPONSE_INPUT=$(jq -nc --arg api "$API_ID" --arg rid "$STATS_RID" '{
+  restApiId:$api,resourceId:$rid,httpMethod:"OPTIONS",statusCode:"204",
+  responseParameters:{
+    "method.response.header.Access-Control-Allow-Headers":
+      "\u0027Content-Type,x-api-key,Authorization\u0027",
+    "method.response.header.Access-Control-Allow-Methods":"\u0027OPTIONS,GET\u0027",
+    "method.response.header.Access-Control-Allow-Origin":"\u0027*\u0027"}}')
+aws apigateway put-integration-response \
+  --cli-input-json "$OPTIONS_RESPONSE_INPUT" --region "$REGION"
 
 PERMISSION_ARGS=(--function-name "$API_FN")
 if [ -n "${API_ALIAS:-}" ]; then

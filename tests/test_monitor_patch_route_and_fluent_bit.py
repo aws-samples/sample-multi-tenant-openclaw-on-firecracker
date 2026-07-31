@@ -307,6 +307,9 @@ def test_monitor_runbook_updates_the_independent_lifecycle_consumer():
     assert "LIFECYCLE_ESM_UUID" in runbook
     assert "/tmp/lifecycle.before.zip" in runbook
     assert "/tmp/lifecycle.patched.zip" in runbook
+    assert "/tmp/api-resources.route-current.json" in runbook
+    assert 'select(.path == "/tenants-stats")' in runbook
+    assert 'OPTIONS_RESPONSE_INPUT=$(jq -nc' in runbook
     assert '--function-name "$LIFECYCLE_FN"' in runbook
     assert "update-event-source-mapping" in runbook
     assert "curl -fsS http://127.0.0.1:8899/metrics >/dev/null && break" in runbook

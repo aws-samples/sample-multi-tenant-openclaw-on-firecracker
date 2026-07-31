@@ -13,10 +13,18 @@ environment.
 
 The customer-side agent needs only this `patch/monitor-patch` directory from the
 same Git revision. It must not call anything under `lib/`: those scripts are
-operator/test helpers and are not part of this workflow. Start in the patch
-directory and verify the required tools and artifacts:
+operator/test helpers and are not part of this workflow. Every shell block in
+this runbook requires Bash; zsh is not supported because names such as `path`
+and `status` are special there, and the workflow uses Bash arrays and process
+substitution. Start an interactive Bash, enter the patch directory, and verify
+the required tools and artifacts:
 
 ```bash
+command -v bash
+test -n "${BASH_VERSION:-}" || {
+  echo "FATAL: start bash before running this runbook" >&2
+  exit 2
+}
 export PATCH_DIR="$(pwd -P)"
 test -f "$PATCH_DIR/manifest.json"
 command -v aws jq curl zip unzip sha256sum python3
@@ -93,6 +101,35 @@ aws lambda get-function-configuration --function-name "$API_FN" \
 jq '.Environment.Variables' /tmp/api-config.before.json
 ```
 
+The API Lambda is not necessarily the only function running this package.
+Discover the independent lifecycle consumer from the API's lifecycle queue.
+Exactly one enabled event-source mapping must consume that queue, and its target
+must be recorded separately from the API Lambda:
+
+```bash
+export LIFECYCLE_QUEUE_URL="$(jq -r \
+  '.Environment.Variables.LIFECYCLE_QUEUE_URL // empty' \
+  /tmp/api-config.before.json)"
+test -n "$LIFECYCLE_QUEUE_URL"
+export LIFECYCLE_QUEUE_ARN="$(aws sqs get-queue-attributes \
+  --queue-url "$LIFECYCLE_QUEUE_URL" --attribute-names QueueArn \
+  --region "$REGION" --query 'Attributes.QueueArn' --output text)"
+aws lambda list-event-source-mappings \
+  --event-source-arn "$LIFECYCLE_QUEUE_ARN" --region "$REGION" \
+  >/tmp/lifecycle-esm.before.json
+jq -e '.EventSourceMappings
+  | length == 1 and .[0].State == "Enabled"' \
+  /tmp/lifecycle-esm.before.json >/dev/null
+export LIFECYCLE_ESM_UUID="$(jq -r \
+  '.EventSourceMappings[0].UUID' /tmp/lifecycle-esm.before.json)"
+export LIFECYCLE_FN_ARN="$(jq -r \
+  '.EventSourceMappings[0].FunctionArn' /tmp/lifecycle-esm.before.json)"
+export LIFECYCLE_FN="${LIFECYCLE_FN_ARN#*:function:}"
+test -n "$LIFECYCLE_FN" && test "$LIFECYCLE_FN" != "$API_FN"
+aws lambda get-function-configuration --function-name "$LIFECYCLE_FN" \
+  --region "$REGION" >/tmp/lifecycle-config.before.json
+```
+
 Scan the hosts table and ignore rows whose `status` is `deleted`. Correlate that
 active instance set with every ASG. Exactly one non-Edge ASG must have the same
 instance set. Separately identify the Edge ASG and monitoring node from their
@@ -122,9 +159,18 @@ Back up before writes:
 ```bash
 # Lambda code/config and alias.
 aws lambda get-function --function-name "$API_FN" --region "$REGION" \
-  --query 'Code.Location' --output text | xargs curl -fsSL -o /tmp/api.before.zip
+  >/tmp/api-function.before.json
+curl -fsSL "$(jq -r '.Code.Location' /tmp/api-function.before.json)" \
+  -o /tmp/api.before.zip
 aws lambda list-aliases --function-name "$API_FN" --region "$REGION" \
   > /tmp/api-aliases.before.json
+
+# The lifecycle consumer is a separate deployment target, even when its zip
+# initially matches the API package.
+aws lambda get-function --function-name "$LIFECYCLE_FN" --region "$REGION" \
+  >/tmp/lifecycle-function.before.json
+curl -fsSL "$(jq -r '.Code.Location' /tmp/lifecycle-function.before.json)" \
+  -o /tmp/lifecycle.before.zip
 
 # S3 objects: record VersionId, or copy each object to a unique backup prefix.
 aws s3api head-object --bucket "$BUCKET" \
@@ -140,6 +186,13 @@ aws autoscaling describe-auto-scaling-groups \
 aws apigateway get-stage --rest-api-id "$API_ID" --stage-name "$STAGE" \
   --region "$REGION" > /tmp/api-stage.before.json
 ```
+
+Unpack both `/tmp/api.before.zip` and `/tmp/lifecycle.before.zip`. Apply every
+`C-lambda` hash gate independently to both packages: an existing artifact must
+equal its manifest base or patch hash, and a manifest entry with an empty base
+hash must be absent or already equal the patch hash. Stop if either package is
+divergent. Updating only the API Lambda leaves queued delete operations running
+old route-cleanup code and is not a valid deployment.
 
 ## Step 2 - Hot-Fix Running Hosts
 
@@ -306,33 +359,121 @@ trap - ERR
 Retain the S3 state file, backup prefix, VersionIds, and per-host backup paths
 until post-deployment verification is complete.
 
-## Step 3 - Lambda Overlay
+## Step 3 - API And Lifecycle Lambda Overlay
 
-Do not replace the customer's native dependencies. Download the live package,
-overlay only patch source, and rezip:
+Do not replace the customer's native dependencies. Build separate overlays from
+the two live packages. Each function retains its own dependencies and package
+layout; only the same patch source files are overlaid:
 
 ```bash
-mkdir -p /tmp/api-overlay/live
-unzip -oq /tmp/api.before.zip -d /tmp/api-overlay/live
-
-# Overlay these patch files at the same paths under /tmp/api-overlay/live:
-# handler.py
-# core/{auth.py,clients.py,pagination.py,ssm_dispatch.py}
-# services/{fleet_service.py,host_service.py,registry_service.py,
-#           tenant_query_service.py,tenant_service.py,tenant_stats_service.py}
-
-(cd /tmp/api-overlay/live && zip -qr /tmp/api.patched.zip .)
-REV=$(aws lambda get-function-configuration --function-name "$API_FN" \
-  --region "$REGION" --query RevisionId --output text)
-aws lambda update-function-code --function-name "$API_FN" --region "$REGION" \
-  --revision-id "$REV" --zip-file fileb:///tmp/api.patched.zip
-aws lambda wait function-updated --function-name "$API_FN" --region "$REGION"
+API_OVERLAY_FILES=(
+  handler.py
+  core/auth.py
+  core/clients.py
+  core/pagination.py
+  core/ssm_dispatch.py
+  services/fleet_service.py
+  services/host_service.py
+  services/registry_service.py
+  services/tenant_query_service.py
+  services/tenant_service.py
+  services/tenant_stats_service.py
+)
+build_api_overlay() {
+  source_zip=$1
+  work_dir=$2
+  output_zip=$3
+  rm -rf -- "$work_dir"
+  mkdir -p "$work_dir"
+  unzip -oq "$source_zip" -d "$work_dir"
+  for rel in "${API_OVERLAY_FILES[@]}"; do
+    mkdir -p "$work_dir/$(dirname "$rel")"
+    install -m 0644 "$PATCH_DIR/lambda/api/$rel" "$work_dir/$rel"
+  done
+  python3 -m compileall -q "$work_dir"
+  rm -f "$output_zip"
+  (cd "$work_dir" && zip -qr "$output_zip" .)
+}
+build_api_overlay /tmp/api.before.zip \
+  /tmp/api-overlay/live /tmp/api.patched.zip
+build_api_overlay /tmp/lifecycle.before.zip \
+  /tmp/lifecycle-overlay/live /tmp/lifecycle.patched.zip
 ```
 
-Probe `$LATEST` before changing the serving alias. Build the payload with `jq`;
-it must include `httpMethod`, `resource`, and `path`. Success means invocation
-metadata has no `FunctionError` (a 404 response body for the synthetic path is
-acceptable):
+Pause the lifecycle event-source mapping before either code write. Stop normal
+create/delete/migrate operations for this maintenance window. If either update
+or verification fails, restore both saved zips before returning the mapping to
+its captured state:
+
+```bash
+export LIFECYCLE_ESM_WAS_ENABLED="$(jq -r \
+  '.EventSourceMappings[0].State == "Enabled"' /tmp/lifecycle-esm.before.json)"
+aws lambda update-event-source-mapping --uuid "$LIFECYCLE_ESM_UUID" \
+  --no-enabled --region "$REGION" >/tmp/lifecycle-esm.disabled.json
+for attempt in $(seq 1 30); do
+  state=$(aws lambda get-event-source-mapping --uuid "$LIFECYCLE_ESM_UUID" \
+    --region "$REGION" --query State --output text)
+  [ "$state" = Disabled ] && break
+  sleep 2
+done
+test "$state" = Disabled
+
+LIFECYCLE_REV=$(aws lambda get-function-configuration \
+  --function-name "$LIFECYCLE_FN" --region "$REGION" \
+  --query RevisionId --output text)
+aws lambda update-function-code --function-name "$LIFECYCLE_FN" \
+  --region "$REGION" --revision-id "$LIFECYCLE_REV" \
+  --zip-file fileb:///tmp/lifecycle.patched.zip >/dev/null
+aws lambda wait function-updated --function-name "$LIFECYCLE_FN" \
+  --region "$REGION"
+
+API_REV=$(aws lambda get-function-configuration --function-name "$API_FN" \
+  --region "$REGION" --query RevisionId --output text)
+aws lambda update-function-code --function-name "$API_FN" --region "$REGION" \
+  --revision-id "$API_REV" --zip-file fileb:///tmp/api.patched.zip >/dev/null
+aws lambda wait function-updated --function-name "$API_FN" --region "$REGION"
+
+python3 - /tmp/lifecycle.patched.zip "$LIFECYCLE_FN" \
+  /tmp/api.patched.zip "$API_FN" "$REGION" <<'PY'
+import base64
+import hashlib
+import subprocess
+import sys
+
+region = sys.argv[-1]
+for package, function_name in zip(sys.argv[1:-1:2], sys.argv[2:-1:2]):
+    with open(package, "rb") as stream:
+        local = base64.b64encode(hashlib.sha256(stream.read()).digest()).decode()
+    remote = subprocess.check_output(
+        [
+            "aws", "lambda", "get-function-configuration",
+            "--function-name", function_name, "--region", region,
+            "--query", "CodeSha256", "--output", "text",
+        ],
+        text=True,
+    ).strip()
+    assert local == remote, (function_name, local, remote)
+PY
+
+if [ "$LIFECYCLE_ESM_WAS_ENABLED" = true ]; then
+  aws lambda update-event-source-mapping --uuid "$LIFECYCLE_ESM_UUID" \
+    --enabled --region "$REGION" >/tmp/lifecycle-esm.enabled.json
+  for attempt in $(seq 1 30); do
+    state=$(aws lambda get-event-source-mapping --uuid "$LIFECYCLE_ESM_UUID" \
+      --region "$REGION" --query State --output text)
+    [ "$state" = Enabled ] && break
+    sleep 2
+  done
+  test "$state" = Enabled
+fi
+```
+
+Probe API `$LATEST` before changing the serving alias. Build the payload with
+`jq`; it must include `httpMethod`, `resource`, and `path`. Success means
+invocation metadata has no `FunctionError` (a 404 response body for the
+synthetic path is acceptable). The lifecycle consumer is verified by the code
+checksum above and by the real queued delete in Step 7; do not send a fabricated
+SQS record that could mutate tenant state:
 
 ```bash
 jq -nc '{httpMethod:"GET",resource:"/__monitor_patch_probe",
@@ -891,29 +1032,65 @@ created by this patch so rollback cannot remove pre-existing access.
 
 ## Step 5 - Host And Edge Fluent Bit
 
-When `host_logs=true`, apply
-`host-scripts/edge/fluent-bit/host/fluent-bit.conf` to every active Firecracker
-host through a temporary S3 key and SSM. Back up
-`/etc/fluent-bit/fluent-bit.conf`, install the verified file, run Fluent Bit
-`--dry-run`, restart the service, and confirm it is active. Promote the same
-verified file to
-`deployment/observability/fluent-bit/host/fluent-bit.conf` for future hosts.
+When `host_logs=true`, hash-gate the unrendered canonical object
+`deployment/observability/fluent-bit/host/fluent-bit.conf` against the manifest,
+then promote `host-scripts/edge/fluent-bit/host/fluent-bit.conf` there for future
+hosts. The live `/etc/fluent-bit/fluent-bit.conf` is a rendered file and must
+not be compared directly with the source artifact hash. On each active host,
+record its current non-empty region and both Firehose streams, back up the whole
+`/etc/fluent-bit` directory, render the source template with those three values,
+run Fluent Bit `--dry-run`, restart the service, and confirm it is active.
+Restore the directory backup on any failure.
 
-When `edge_logs=true`, apply these artifacts to all running Edge instances
-through temporary S3 keys and SSM:
+When either `edge_logs=true` or `monitoring=true`, apply
+`host-scripts/edge/nginx.conf` to all running Edge instances through a temporary
+S3 key and SSM. When `edge_logs=true`, also apply:
 
-- `host-scripts/edge/nginx.conf`;
 - `host-scripts/edge/install-fluent-bit.sh`;
 - `host-scripts/edge/fluent-bit/edge/*`.
 
-Render `fluent-bit.conf` with the customer's non-empty region and Firehose stream.
-Fail if `${FB_*}` remains or the stream is empty. Run Fluent Bit `--dry-run`,
-back up `/etc/fluent-bit`, install the files, restart Fluent Bit, and verify it is
-active. Render nginx with the live Redis endpoint and instance private IP, run
-`nginx -t`, reload, and verify `http://127.0.0.1:9145/metrics`.
+Install the source files under `/opt/openclaw-edge`, preserving a backup of that
+directory and `/etc/fluent-bit`. Discover the live Redis endpoint from the
+current environment and use a non-empty customer region and Firehose stream.
+Re-run the customer entry point with explicit inputs:
 
-Promote the same verified artifacts to the Edge S3 keys used by customer
-userdata.
+```bash
+test -x /usr/local/openresty/nginx/sbin/nginx
+test -f /opt/openclaw-edge/install-edge.sh
+test -f /opt/openclaw-edge/nginx.conf
+test -n "$ENGINE_REDIS_ENDPOINT"
+if [ "$EDGE_LOGS_ENABLED" = true ]; then
+  test -n "$FIREHOSE_DELIVERY_STREAM"
+fi
+ENGINE_REDIS_ENDPOINT="$ENGINE_REDIS_ENDPOINT" \
+EDGE_LISTEN_PORT=8080 \
+LOGGING_ENABLED="$EDGE_LOGS_ENABLED" \
+ASSETS_BUCKET="$BUCKET" \
+AWS_REGION="$REGION" \
+FIREHOSE_DELIVERY_STREAM="$FIREHOSE_DELIVERY_STREAM" \
+  bash /opt/openclaw-edge/install-edge.sh
+/usr/local/openresty/nginx/sbin/nginx -t \
+  -c /usr/local/openresty/nginx/conf/nginx.conf
+systemctl is-active --quiet claw-edge.service
+curl -fsS http://127.0.0.1:9145/metrics | grep -q '^edge_up 1$'
+if [ "$EDGE_LOGS_ENABLED" = true ]; then
+  systemctl is-active --quiet fluent-bit.service
+fi
+```
+
+The installer renders nginx to
+`/usr/local/openresty/nginx/conf/nginx.conf`; never install the template there
+without rendering and never validate with a bare `nginx -t` because OpenResty
+is not on the default PATH. Fail if `${FB_*}` remains or a `delivery_stream`
+value is empty when `edge_logs=true`. Set `EDGE_LOGS_ENABLED=true` only for that
+profile; otherwise set it to `false` and leave `FIREHOSE_DELIVERY_STREAM` empty.
+
+Always promote the verified nginx source to `deployment/edge/nginx.conf`. When
+`edge_logs=true`, also promote the verified logging sources to the exact S3 keys
+used by customer userdata: `deployment/edge/fluent-bit/install-fluent-bit.sh`,
+`deployment/edge/fluent-bit/edge/*`, and
+`deployment/observability/fluent-bit/edge/*`. Record each prior VersionId or
+backup object first.
 
 For future Edge instances, decode the current Edge LT userdata and change only
 the `install-edge.sh` invocation to pass:
@@ -935,9 +1112,29 @@ and rendered host userdata.
 
 ## Step 6 - Monitoring
 
-Only when `monitoring=true`. Copy
-`host-scripts/monitoring/prometheus.yml` to the remote monitoring node, replace
-the region with the customer region, and validate remotely:
+Only when `monitoring=true`. This patch updates an existing Prometheus/Grafana
+deployment; it does not bootstrap the monitoring stack. Before any monitoring
+write, require all of these on the remote node:
+
+```bash
+test -f /opt/monitoring/.env
+test -f /opt/monitoring/docker-compose.prom-grafana.yml
+test -d /opt/monitoring/targets
+test -d /opt/monitoring/grafana/provisioning
+command -v docker
+cd /opt/monitoring
+docker compose --env-file .env -f docker-compose.prom-grafana.yml ps \
+  --status running prometheus | grep -q prometheus
+```
+
+If any check fails, stop the `monitoring` profile without changing SGs or files.
+Deploy the complete customer monitoring stack separately, then rerun this
+profile. A node containing only `/opt/monitoring/.env` is not a deployed
+monitoring stack.
+
+After the preflight passes, copy `host-scripts/monitoring/prometheus.yml` to the
+remote monitoring node, replace the region with the customer region, and
+validate remotely:
 
 ```bash
 cd /opt/monitoring
@@ -956,7 +1153,8 @@ Confirm active `openclaw-host-agent-ec2` and `openclaw-edge-nginx` targets.
 Read-only checks:
 
 - `/tenants`, `/hosts`, and enabled `/tenants-stats` return authenticated JSON;
-- API alias and `$LATEST` have the intended code;
+- API alias, API `$LATEST`, and the lifecycle consumer have the intended code;
+- the lifecycle event-source mapping returned to its captured enabled state;
 - all four selected GSIs are `ACTIVE`;
 - stats writer has reserved concurrency `1` and table item `id=current`;
 - every host serves 8899 metrics;
@@ -997,6 +1195,7 @@ into a customer production environment:
   delete failure injection only in an isolated test deployment.
 
 Rollback in reverse order using captured pre-state: restore ASG LT pointers,
-Edge/host backups and S3 versions, API stage deployment, Lambda zip and alias,
-and API environment. Retain tables, GSIs, secrets, and read-only IAM unless the
-customer separately approves destructive removal.
+Edge/host backups and S3 versions, API stage deployment, API and lifecycle
+consumer zips, API alias and environment, and the lifecycle ESM state. Retain
+tables, GSIs, secrets, and read-only IAM unless the customer separately approves
+destructive removal.

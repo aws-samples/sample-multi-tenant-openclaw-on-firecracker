@@ -154,9 +154,9 @@
       "patch_sha256": "6501dd44a679de85d0da6eddeb95acaf0da5c1f84666fb87a92a6ca479e4772e",
       "operations": [
         {
-          "resource": "lambda:openclaw-api overlay",
+          "resource": "lambda:serving API + discovered lifecycle consumer overlays",
           "class": "AUTO_CLI",
-          "apply_cli": "Pull live openclaw-api zip, overlay patched source, re-zip, update-function-code --revision-id, publish-version + update-alias + $LATEST current",
+          "apply_cli": "Pull both live zips, stop the lifecycle ESM, overlay the same patched sources into each native package, update each $LATEST with RevisionId, verify both CodeSha256 values, restore the ESM state, then publish and move only the serving API alias",
           "rollback_policy": "RESTORE"
         }
       ],
@@ -174,9 +174,9 @@
       "patch_sha256": "99ee267e2dac16d70c6948b174ebb8199ad4af9f8f97ba6e7f51afddf4506ab9",
       "operations": [
         {
-          "resource": "lambda:openclaw-api overlay",
+          "resource": "lambda:serving API + discovered lifecycle consumer overlays",
           "class": "AUTO_CLI",
-          "apply_cli": "Pull live openclaw-api zip, overlay patched source, re-zip, update-function-code --revision-id, publish-version + update-alias + $LATEST current",
+          "apply_cli": "Pull both live zips, stop the lifecycle ESM, overlay the same patched sources into each native package, update each $LATEST with RevisionId, verify both CodeSha256 values, restore the ESM state, then publish and move only the serving API alias",
           "rollback_policy": "RESTORE"
         }
       ],
@@ -194,9 +194,9 @@
       "patch_sha256": "04c24a71fb5b6418c61a2a889c03fea5ada47f5ee46797fdaa98322670c432b9",
       "operations": [
         {
-          "resource": "lambda:openclaw-api overlay",
+          "resource": "lambda:serving API + discovered lifecycle consumer overlays",
           "class": "AUTO_CLI",
-          "apply_cli": "Pull live openclaw-api zip, overlay patched source, re-zip, update-function-code --revision-id, publish-version + update-alias + $LATEST current",
+          "apply_cli": "Pull both live zips, stop the lifecycle ESM, overlay the same patched sources into each native package, update each $LATEST with RevisionId, verify both CodeSha256 values, restore the ESM state, then publish and move only the serving API alias",
           "rollback_policy": "RESTORE"
         }
       ],
@@ -214,9 +214,9 @@
       "patch_sha256": "e57539edb47e586d909a438088a0d25f09dcbdc8ac702387c0660d1b61ee8091",
       "operations": [
         {
-          "resource": "lambda:openclaw-api overlay",
+          "resource": "lambda:serving API + discovered lifecycle consumer overlays",
           "class": "AUTO_CLI",
-          "apply_cli": "Pull the live openclaw-api zip, overlay lambda/api/core/ssm_dispatch.py, update $LATEST with RevisionId, publish, then update only the serving alias",
+          "apply_cli": "Pull both live zips, stop the lifecycle ESM, overlay the same patched sources into each native package, update each $LATEST with RevisionId, verify both CodeSha256 values, restore the ESM state, then publish and move only the serving API alias",
           "rollback_policy": "RESTORE"
         }
       ],
@@ -232,9 +232,9 @@
       "patch_sha256": "dfe3b93521c7c5dbb03fdc8da507c76422fe696c013ee686e4b25c7bbad0ac9b",
       "operations": [
         {
-          "resource": "lambda:openclaw-api overlay",
+          "resource": "lambda:serving API + discovered lifecycle consumer overlays",
           "class": "AUTO_CLI",
-          "apply_cli": "Pull live openclaw-api zip, overlay patched source, re-zip, update-function-code --revision-id, publish-version + update-alias + $LATEST current",
+          "apply_cli": "Pull both live zips, stop the lifecycle ESM, overlay the same patched sources into each native package, update each $LATEST with RevisionId, verify both CodeSha256 values, restore the ESM state, then publish and move only the serving API alias",
           "rollback_policy": "RESTORE"
         }
       ],
@@ -252,9 +252,9 @@
       "patch_sha256": "cc703f18d8013613de489cc17709624feb9da12068282b035b25bc3bcc026152",
       "operations": [
         {
-          "resource": "lambda:openclaw-api overlay",
+          "resource": "lambda:serving API + discovered lifecycle consumer overlays",
           "class": "AUTO_CLI",
-          "apply_cli": "Pull live openclaw-api zip, overlay patched source, re-zip, update-function-code --revision-id, publish-version + update-alias + $LATEST current",
+          "apply_cli": "Pull both live zips, stop the lifecycle ESM, overlay the same patched sources into each native package, update each $LATEST with RevisionId, verify both CodeSha256 values, restore the ESM state, then publish and move only the serving API alias",
           "rollback_policy": "RESTORE"
         }
       ],
@@ -272,9 +272,9 @@
       "patch_sha256": "8af4ad419ec9dc4e846ea2f7947443ec3ecf276d1e648d7c150f9ad2b2b277a8",
       "operations": [
         {
-          "resource": "lambda:openclaw-api overlay",
+          "resource": "lambda:serving API + discovered lifecycle consumer overlays",
           "class": "AUTO_CLI",
-          "apply_cli": "Pull live openclaw-api zip, overlay patched source, re-zip, update-function-code --revision-id, publish-version + update-alias + $LATEST current",
+          "apply_cli": "Pull both live zips, stop the lifecycle ESM, overlay the same patched sources into each native package, update each $LATEST with RevisionId, verify both CodeSha256 values, restore the ESM state, then publish and move only the serving API alias",
           "rollback_policy": "RESTORE"
         }
       ],
@@ -292,9 +292,9 @@
       "patch_sha256": "db1aaf3f2d3548760b2317a6b294284a590df89b4d81174e9c5e28ceb241d6ef",
       "operations": [
         {
-          "resource": "lambda:openclaw-api overlay",
+          "resource": "lambda:serving API + discovered lifecycle consumer overlays",
           "class": "AUTO_CLI",
-          "apply_cli": "Pull live openclaw-api zip, overlay patched source, re-zip, update-function-code --revision-id, publish-version + update-alias + $LATEST current",
+          "apply_cli": "Pull both live zips, stop the lifecycle ESM, overlay the same patched sources into each native package, update each $LATEST with RevisionId, verify both CodeSha256 values, restore the ESM state, then publish and move only the serving API alias",
           "rollback_policy": "RESTORE"
         }
       ],
@@ -312,9 +312,9 @@
       "patch_sha256": "c8ec9c7abdf6e358782dbc0353990182c3c1c1d2c6fc61949c0bd980aba9fd35",
       "operations": [
         {
-          "resource": "lambda:openclaw-api overlay",
+          "resource": "lambda:serving API + discovered lifecycle consumer overlays",
           "class": "AUTO_CLI",
-          "apply_cli": "Pull live openclaw-api zip, overlay patched source, re-zip, update-function-code --revision-id, publish-version + update-alias + $LATEST current",
+          "apply_cli": "Pull both live zips, stop the lifecycle ESM, overlay the same patched sources into each native package, update each $LATEST with RevisionId, verify both CodeSha256 values, restore the ESM state, then publish and move only the serving API alias",
           "rollback_policy": "RESTORE"
         }
       ],
@@ -332,9 +332,9 @@
       "patch_sha256": "9fbaec9fc53b843b48d563acb5e5847413c809ad0908aa545e5bb47c280f2e16",
       "operations": [
         {
-          "resource": "lambda:openclaw-api overlay",
+          "resource": "lambda:serving API + discovered lifecycle consumer overlays",
           "class": "AUTO_CLI",
-          "apply_cli": "Pull live openclaw-api zip, overlay patched source, re-zip, update-function-code --revision-id, publish-version + update-alias + $LATEST current",
+          "apply_cli": "Pull both live zips, stop the lifecycle ESM, overlay the same patched sources into each native package, update each $LATEST with RevisionId, verify both CodeSha256 values, restore the ESM state, then publish and move only the serving API alias",
           "rollback_policy": "RESTORE"
         }
       ],
@@ -353,9 +353,9 @@
       "patch_sha256": "1fda49731cc1caca7d6b6c1d98113a8b52228fb6b450c2fd6f47d36a2c5b3825",
       "operations": [
         {
-          "resource": "lambda:openclaw-api overlay",
+          "resource": "lambda:serving API + discovered lifecycle consumer overlays",
           "class": "AUTO_CLI",
-          "apply_cli": "Pull live openclaw-api zip, overlay patched source, re-zip, update-function-code --revision-id, publish-version + update-alias + $LATEST current",
+          "apply_cli": "Pull both live zips, stop the lifecycle ESM, overlay the same patched sources into each native package, update each $LATEST with RevisionId, verify both CodeSha256 values, restore the ESM state, then publish and move only the serving API alias",
           "rollback_policy": "RESTORE"
         }
       ],

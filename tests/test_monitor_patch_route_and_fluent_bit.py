@@ -1,8 +1,9 @@
 import ast
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
-from subprocess import CompletedProcess
+from subprocess import CalledProcessError, CompletedProcess, check_output
 import sys
 from decimal import Decimal
 from types import ModuleType
@@ -229,6 +230,56 @@ def test_tenant_stats_response_preserves_json_number_types(monkeypatch):
     assert body["status_counts"][0]["count"] == 1
     assert isinstance(body["business"]["total"], int)
     assert isinstance(body["ratio"], float)
+
+
+def test_monitor_artifacts_match_manifest_hashes():
+    patch_dir = ROOT / "patch" / "monitor-patch"
+    manifest = json.loads((patch_dir / "manifest.json").read_text())
+    artifacts = [
+        entry for entry in manifest["paths"].values() if entry["artifact"] is not None
+    ]
+
+    assert len(artifacts) == 23
+    for entry in artifacts:
+        actual = hashlib.sha256((patch_dir / entry["artifact"]).read_bytes()).hexdigest()
+        assert actual == entry["patch_sha256"]
+
+
+def test_layered_353_then_376_state_matches_monitor_base():
+    patch_root = ROOT / "patch"
+    monitor = json.loads((patch_root / "monitor-patch" / "manifest.json").read_text())
+    patch_353 = json.loads(
+        (
+            patch_root / "353-secret-ttl-plus-post315-rollup" / "manifest.json"
+        ).read_text()
+    )
+    patch_376 = json.loads(
+        (patch_root / "376-create-image-snapshot" / "manifest.json").read_text()
+    )
+
+    checked = 0
+    for path, entry in monitor["paths"].items():
+        if entry["artifact"] is None:
+            continue
+        if path in patch_376["paths"]:
+            predecessor_hash = patch_376["paths"][path]["patch_sha256"]
+        elif path in patch_353["paths"]:
+            predecessor_hash = patch_353["paths"][path]["patch_sha256"]
+        else:
+            try:
+                content = check_output(
+                    ["git", "show", f"{patch_353['base_sha']}:{path}"],
+                    cwd=ROOT,
+                    stderr=-3,
+                )
+            except CalledProcessError:
+                predecessor_hash = None
+            else:
+                predecessor_hash = hashlib.sha256(content).hexdigest()
+        assert predecessor_hash == entry["base_sha256"], path
+        checked += 1
+
+    assert checked == 23
 
 
 def test_edge_fluent_bit_inputs_are_injected_and_fail_closed():

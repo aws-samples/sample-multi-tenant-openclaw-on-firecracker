@@ -14,7 +14,7 @@ dependencies = [
 # JWT verification path the Lambda uses (sign a test RS256 token, assert the
 # handler verifies/rejects it). The Lambda gets these via CDK bundling
 # (deploy/lambda/api/requirements.txt), not from this group.
-test = ["pytest", "pytest-cov", "moto", "boto3", "pyjwt>=2.8.0", "cryptography>=48.0.1"]
+test = ["pytest", "pytest-cov", "moto", "boto3", "pyjwt>=2.8.0", "cryptography>=50.0.0"]
 
 [build-system]
 requires = ["setuptools"]

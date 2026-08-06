@@ -3,11 +3,11 @@ window.ocTenants = {
   tenants: [], selectedHost: null,
   loadingTenants: false,
   showModal: false,
-  form: { name: '', vcpu: null, memory_mb: null, config_template: '', preferred_host_id: '', group: '', tags_text: '' },
+  form: { name: '', vcpu: null, memory_mb: null, config_template: '', preferred_host_id: '', group: '', tags_text: '', image_channel: 'live' },
   statusFilter: 'all',   // filter for tenants list
   tagFilter: '',         // filter expression: "k1:v1,k2:v2" — AND across pairs
   // #187 转型:reveal token + descriptor modal 状态。
-  // reveal 显示的是 KMS 密文(base64 信封,§the data-plane contract),调用方
+  // reveal 显示的是 KMS 密文(base64 信封,§INTERFACE-CONTRACT §5),调用方
   // 拿 tenant_id 作 EncryptionContext 自解得明文;API 侧不 decrypt。
   revealState: { open: false, tenantId: '', ciphertext: '', error: '', descriptor: null, loading: false },
 
@@ -42,6 +42,10 @@ window.ocTenants = {
     if (this.form.memory_mb) body.mem_mb = this.form.memory_mb;
     if (this.form.config_template) body.config_template = this.form.config_template;
     if (this.form.preferred_host_id) body.preferred_host_id = this.form.preferred_host_id;
+    // #394 — canary tenant: boots the host's canary slot. Requires preferred_host_id
+    // (the canary slot only exists on the host it was pulled to). Default 'live' →
+    // omit the field so legacy create behavior is byte-identical.
+    if (this.form.image_channel === 'canary') body.image_channel = 'canary';
     // Group scopes which shared skills the VM gets; empty = broadcast (all skills).
     if (this.form.group) body.group = this.form.group;
     // Parse tags from textarea — supports "key:value" per line, also comma-separated.
@@ -69,7 +73,7 @@ window.ocTenants = {
   closeCreateModal() {
     this.showModal = false;
     this.restoreSource = null;
-    this.form = { name: '', vcpu: null, memory_mb: null, config_template: '', preferred_host_id: '', group: '', tags_text: '' };
+    this.form = { name: '', vcpu: null, memory_mb: null, config_template: '', preferred_host_id: '', group: '', tags_text: '', image_channel: 'live' };
   },
   parseTagsInput(text) {
     // Accepts "key:value" pairs separated by newline or comma. Empty → {}.

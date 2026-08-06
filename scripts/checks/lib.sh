@@ -2,7 +2,7 @@
 # lib.sh — scripts/checks/ 各 check 脚本的公共库(颜色 / 工具探测 / 降级契约 / 变更文件集)。
 #
 # 为什么存在:本仓近乎全 AI 生成,ADR-genai-code-quality-gates 定的三层 check 要「单一实现三处
-# 复用」(本地 commit-hook / review 阶段 / CI 都调同一批脚本)。这份库把
+# 复用」(本地 commit-hook / oc-dev-flow review 阶段 / GitLab CI 都调同一批脚本)。这份库把
 # 三处共用的东西收口一处,避免漂移。
 #
 # 降级契约(重要,别乱改):
@@ -38,8 +38,9 @@ ck_changed_files() {
   local filter="${1:-}" base files
   cd "$CK_ROOT"
   # 相对 bb 的三点 diff(功能分支 vs bb 分叉点)
-  if git rev-parse --verify -q origin/main >/dev/null 2>&1; then base="origin/main"
-  elif git rev-parse --verify -q main >/dev/null 2>&1; then base="main"
+  if git rev-parse --verify -q gitlab/bb >/dev/null 2>&1; then base="gitlab/bb"
+  elif git rev-parse --verify -q origin/bb >/dev/null 2>&1; then base="origin/bb"
+  elif git rev-parse --verify -q bb >/dev/null 2>&1; then base="bb"
   else base=""; fi
 
   if [ -n "$base" ]; then
@@ -50,7 +51,8 @@ ck_changed_files() {
   # 叠加 staged + 工作区改动(commit-hook 场景 HEAD 还没提交)
   files="$files
 $(git diff --name-only --diff-filter=ACMR --cached 2>/dev/null || true)
-$(git diff --name-only --diff-filter=ACMR 2>/dev/null || true)"
+$(git diff --name-only --diff-filter=ACMR 2>/dev/null || true)
+$(git ls-files --others --exclude-standard 2>/dev/null || true)"
 
   # 去空、去重、只保留真实存在的文件;按后缀过滤
   printf '%s\n' "$files" | sed '/^$/d' | sort -u | while IFS= read -r f; do
@@ -65,13 +67,14 @@ ck_all_files() {
   local filter="${1:-}"
   cd "$CK_ROOT"
   # shellcheck disable=SC2086
-  # -not -name .git 也排除 worktree 根的 .git 指针文件(是文件不是目录,'./.git/*' 漏它)
-  # .remote-drift/ 是本地远程漂移暂存(已 gitignore,不进 CI clone),扫它会误报暂存的旧品牌/账号
-  find . -type f ${filter:+-name "*$filter"} \
-    -not -name .git -not -path './.git/*' -not -path './.remote-drift/*' \
-    -not -path './.venv/*' -not -path './node_modules/*' \
-    -not -path './opensource/*' -not -path '*/__pycache__/*' -not -path '*/.ruff_cache/*' \
-    -not -path './cdk.out/*' -not -path './tests/fixtures/*' 2>/dev/null | sed 's|^\./||'
+  # prune .git 也排除 worktree 根的 .git 指针文件(是文件不是目录)。
+  # .remote-drift/ 是本地远程漂移暂存(已 gitignore,不进 CI clone),扫它会误报暂存的旧品牌/账号。
+  find . \
+    \( -name .git -o -name .venv -o -name node_modules -o -name __pycache__ \
+       -o -name .ruff_cache -o -name cdk.out -o -path './.remote-drift' \
+       -o -path './.claude/worktrees' -o -path './opensource' \
+       -o -path './tests/fixtures' \) -prune -o \
+    -type f ${filter:+-name "*$filter"} -print 2>/dev/null | sed 's|^\./||'
 }
 
 # 决定扫描目标:CK_SCAN_ALL=1 → 全量;否则变更集。

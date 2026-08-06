@@ -1,7 +1,7 @@
 # 组件运维手册
 
 > 本章按组件列日常维护、监控指标、告警阈值、扩缩容与故障排查。**十万级规模化的运维底线在这一章**,给运营和 SRE 团队用。
-> 上游改动源:`internal-docs/00-knowledge-base/the data-plane design/`(数据面重构后新增)+ `internal-docs/progress/aws-architect.md`(架构 review 结论)。
+> 上游改动源:`engineering/00-knowledge-base/SPEC/11-ENGINE-TRANSFORM/`(数据面重构后新增)+ `engineering/progress/aws-architect.md`(架构 review 结论)。
 > 冲突裁决:AWS 官方文档 > 本手册 > 记忆。改变化以 CHANGELOG 为准。
 
 ---
@@ -98,7 +98,7 @@
 **冷启到 healthy 的墙钟(SPEC §6 关键)**:
 
 - **grace_period 建议 300s**。真机在 P7 阶段实测冷启:EC2 boot ~60s + install-edge apt 装 openresty ~90s + nginx 起 <5s + route.lua async Redis warmup 最多 30s(每 2s 一次共 15 次)+ 缓冲。
-- **warmup gate 已落 install-edge.sh**:userdata 尾部轮询 `/healthz` 到 200 才让 lifecycle 成功,ASG lifecycle hook 命中此才 CONTINUE。若某台反复 warmup 失败,journalctl -u claw-edge 看具体 err。
+- **warmup gate 已落 install-edge.sh**:userdata 尾部轮询 `/healthz` 到 200 才成功退出。edge ASG 没有 lifecycle hook；失败实例由 ELB health check 在 grace period 后替换。
 
 **故障排查**:
 
@@ -109,7 +109,7 @@
 
 ## 11.4 Host ASG(metal Firecracker 池)
 
-**职责**:每台 r8g.metal-24xl 启 380 microVM,是"堡垒"(见项目铁律 #3)。
+**职责**:承载 Firecracker microVM 舰队。380/台仅是显式 2 GB/VM 配置下的容量目标档;仓库默认 4 GB/VM,当前实测证据为 187 个全健康节点。
 
 **日常维护**:
 
@@ -142,17 +142,17 @@
 
 **十万级规模化注意事项**:
 
-- 单 host 380 租户是硬容量上限(2GB/VM × 380 = 760GB 匹配 768GB metal 内存),超了会 OOM。别为了塞多而拉高 `mem_overcommit_ratio` 到 >1.5,会掉进 balloon 回收窗口窄的坑(SPEC §firecracker-hardening `free_page_reporting=true` 是主力回收)。
+- 380 租户/host 是按 760 GB ÷ 2 GB 得出的容量推算，不是实测硬上限。当前一手实测是 187 个全健康节点且受磁盘瓶颈约束。上线容量必须按目标 VM 内存、磁盘、IOPS 和真实压测确定，不得只按物理内存除法放量。
 - 300 host 到位后跨 AZ 分布确认均匀(不要一个 AZ 集中,单 AZ 挂损失过大)。ASG 的 `AvailabilityZoneImpaired` 自愈能力靠这个。
 - 冷启时间 lifecycle_hook_timeout 已设 1200s(config.yml:71 注释:842MB 黄金镜像下载 + 解压 + 挂盘),300 host 满量启动需要一次买 1200s 冷窗口,压测时用 wave 上限(每 3-5min 一批 20 台)避免 SSM 打爆。
 
 ---
 
-## 11.5 ElastiCache Redis(路由缓存权威源)
+## 11.5 ElastiCache Valkey/Redis(路由缓存权威源)
 
 **职责**:tenant_id → {host, port, guest_ip} 权威路由表;host-agent 单向写,edge 单向读。
 
-**部署形态**:Multi-AZ replication group,3 节点(1 primary + 2 replicas 跨 AZ),`automatic_failover_enabled=true`,Redis 7.x,私有子网,SG 只放 host + edge。
+**部署形态**:Multi-AZ replication group,3 节点(1 primary + 2 replicas 跨 AZ),`automatic_failover_enabled=true`;默认 Valkey 7.2,兼容 Redis OSS 7.1;私有子网,SG 只放 host + edge。
 
 **日常维护**:
 
@@ -196,7 +196,7 @@
 
 **日常维护**:
 
-- Lambda:`update-function-code` 时带完整依赖 wheel(项目坑 `e2e--passed-and-pyjwt-lesson`);别只传 .py。
+- Lambda:`update-function-code` 时必须带完整依赖 wheel;只传 .py 会丢失 PyJWT 等依赖。
 - DDB 表:PITR 已开(35 天),audit 表 WORM 归档另配(config.yml:audit.worm_archive_enabled)。**删表前必快照**(项目铁律 #4)。
 
 **监控**:
@@ -339,4 +339,4 @@
 3. Grafana 打开看有没有 dashboard;没有跑一遍 provisioning。
 4. 一次手动 failover 演练(ElastiCache + host AZ)。
 5. 打开 CHANGELOG.md 看最近 30 天改动。
-6. 读 `.claude/rules/amazon-production-safety-do-not-delete.md` 铁律(删资源前必快照;假设生产)。
+6. 读 `engineering/02-system-constraints/ENGINEERING-RULES.md` 的 AWS 安全约束；删资源前先完成并确认快照。

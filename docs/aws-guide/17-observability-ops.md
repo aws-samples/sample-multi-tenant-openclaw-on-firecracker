@@ -1,7 +1,7 @@
 # 可观测性运维手册（部署后维护）
 
 > 本章给部署完成后的运维/SRE 团队用：可观测性三层（metrics / logs+tracing / alarms）各组件的日常维护、健康巡检、容量管理与故障排查。
-> 设计与实施细节的权威源：`.kiro/specs/platform-observability/`（requirements/design/tasks 三件套）。本章只写"跑起来之后怎么养"，不重复设计论证。
+> 设计与实施细节的权威源：`engineering/00-knowledge-base/SPEC/kiro/platform-observability/`（requirements/design/tasks 三件套）。本章只写"跑起来之后怎么养"，不重复设计论证。
 > 与第 11 章（组件运维手册）的分工：11 章按业务组件（ALB/Redis/host ASG）分节，本章按可观测性链路分节；同一告警只在一处写阈值，本章为准。
 
 ---

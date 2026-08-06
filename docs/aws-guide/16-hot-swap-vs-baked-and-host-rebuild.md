@@ -1,47 +1,72 @@
-# 关键脚本:哪些热替换、哪些烤死、各自生效路径 + host 一键重建
+# Host 脚本、镜像与配置的生效边界
 
-> 面向运维:改一个脚本后"下次 VM 启动就继承"还是"必须重建 host"?本文把边界钉死,避免"改了没生效"或"以为要重建其实热拉即可"。覆盖 R18 的 14.2(热替换边界文档 + init-host 一键重建路径)。
+本章说明修改后何时生效。核心原则：运行中的 host 和 microVM 不会因为 Amazon S3
+对象变化而自动更新。热补只用于验证假设，最终修复必须回到仓库、CDK、镜像或
+bootstrap，并通过重建收敛。
 
-## 一、两类脚本的边界
+## 1. 交付矩阵
 
-### A. 热拉脚本(改 S3 → 下次 VM 启动继承,不需重烤镜像/不需重建 host)
+| 改动 | 权威源与交付方式 | 已运行资源是否自动更新 | 正确生效路径 |
+| --- | --- | --- | --- |
+| `init-host.sh` | CDK 渲染后发布到 `deployment/bootstrap/host/<sha256>/init-host.sh`；Launch Template 小 bootstrap 下载并校验 | 否 | `cdk deploy` 生成新不可变 key/LT 版本，再滚动重建 host |
+| `host-agent.py`、`route_ops.py`、`launch-vm.sh`、`stop-vm.sh` 等 host 脚本 | `setup.sh` 上传到 assets bucket；新 host 的 `init-host.sh` 下载到 `/home/ubuntu/` | 否 | 上传新资产后重建 host；不能只改 S3 就声称现有 host 已更新 |
+| rootfs、data-template、immutable 盘 | 版本化镜像快照与 host live/canary 槽 | 否 | build → snapshot → pull canary → 验证 → promote/rollout |
+| config template | S3 `templates/openclaw/<name>/openclaw.json` | 已运行 VM 否 | 新建或 rebuild 时重新注入 |
+| tenant gateway/device/vkey/skills | DynamoDB/KMS/S3 状态，`launch-vm.sh` 启动前冷注入 | 已运行 VM 否 | restart/rebuild 走受控生命周期；不得向运行中 VM 热灌 |
+| S3 user-hook | config 指定的 versioned object + SHA-256，bootstrap 时下载执行 | 否 | 更新 version/SHA 后重建目标 host/edge |
 
-`init-host.sh` 启动时从 `s3://${ASSETS_BUCKET}/deployment/scripts/` 拉这些(走 `_s3_get` 重试骨架 `init-host.sh:46`):
+`launch-vm.sh` 在已有 host 上从本地路径执行。它不会在每次起 VM 前重新下载自己的
+脚本。因此“覆盖 S3 后下次 VM 启动自然用新版”是错误操作口径。
 
-| 脚本                         | 拉取点                           | 改它怎么生效                                           |
-| ---------------------------- | -------------------------------- | ------------------------------------------------------ |
-| `host-agent.py`              | `init-host.sh:289-290`           | S3 覆盖 → host 重启(或下次 host 起)拉新版              |
-| `route_ops.py`               | `init-host.sh:294-295`           | 同上;host-agent import 它,host 重启生效                |
-| `launch-vm.sh`               | `init-host.sh:413-414`           | S3 覆盖 → **下次 VM 启动**即用新版(每次 launch 都热拉) |
-| `harden-config.sh`           | launch-vm 内热拉(同 launch 路径) | 下次 VM 启动继承                                       |
-| `setup-egress-allowlist.sh`  | `init-host.sh:277-278`           | S3 覆盖 → host 重启拉新版                              |
-| `openclaw.json` / restore 盘 | launch-vm 内热拉                 | 下次 VM 启动继承                                       |
+## 2. Host 重建
 
-**改法**:`aws s3 cp <新版> s3://${ASSETS_BUCKET}/deployment/scripts/<脚本>` → 影响下次 VM/host 启动。不需重烤黄金镜像、不需改 launch template。
+1. 在仓库修改权威源。
+2. 运行相关静态/单元测试和 `cdk synth`。
+3. 执行 `cdk deploy` / `setup.sh`，确认 bootstrap 与 host 资产上传成功。
+4. 记录当前 Launch Template 版本、目标 ASG、host 与 tenant 清单。
+5. 对一台测试 host 做 canary replacement。
+6. 验证 bootstrap SHA、DynamoDB host 注册、host-agent、Firecracker、路由、
+   日志和至少一个真实 tenant 生命周期。
+7. 通过后使用 ASG instance refresh 分批滚动，并设置健康百分比控制爆炸半径。
 
-### B. 烤死脚本(改它必须"改 launch template → 滚动重建 host")
+新 host 的 bootstrap 日志是 `/var/log/openclaw-bootstrap.log`。它下载
+`init-host.sh` 后校验完整 SHA-256，原子安装到
+`/var/lib/cloud/init-host.sh`。下载、摘要或脚本失败必须触发 lifecycle
+`ABANDON`，不能注册为 active。
 
-| 脚本                                     | 为什么烤死                                                                                                                                        | 改它的路径                                                |
-| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
-| `init-host.sh` 本身                      | 烤进 launch template user-data(16KB 硬限,`init-host.sh:270-272` 注释自认脚本外置正是为避免撑爆 user-data);它是"拉其它脚本的那个脚本",不能自己热拉 | 改 launch template → 更新版本 → ASG 滚动/单台重建(铁律#3) |
-| 黄金镜像内容(rootfs/skills/persona/护栏) | 冷注入只读盘,启动即成品                                                                                                                           | 改 build-rootfs → CodeBuild 烤新镜像 → 滚动重建(铁律#3)   |
+## 3. 镜像发布
 
-判据:**这个脚本是不是被 init-host 从 S3 拉的?** 是 → 热拉(改 S3 即可);否(它本身在 user-data 里,或在只读镜像盘里)→ 烤死(改部署代码 → 重建)。
+不要用 host replacement 代替镜像版本管理。镜像变更走：
 
-## 二、host 一键重建运维路径(纪要2:切镜像/跑脚本全靠手工无 API)
+```text
+build image
+  -> POST /create-image-snapshot
+  -> POST /hosts/{id}/pull-image?slot=canary
+  -> GET pull-image-progress + image-slots
+  -> create pinned canary tenant
+  -> verify
+  -> POST promote-canary
+  -> staged rollout
+```
 
-改烤死脚本(init-host.sh)或修 host AMI 时的可复现操作序列,避免"只有原作者知道怎么重建":
+回滚不是独立接口：将已保留的旧 snapshot pull 到 `slot=live`。未提升 canary 可被
+下一次 canary pull 覆盖；无人引用的版本由 `reclaim-images` 回收。
 
-1. **改 user-data**:改 `init-host.sh`(或 launch template 里引用的 user-data 模板)。
-2. **更新 launch template 版本**:`cdk deploy` 会渲染新 user-data 生成 launch template 新版本;或手工 `aws ec2 create-launch-template-version`。
-3. **滚动/单台重建**:
-   - 单台修复:`aws autoscaling terminate-instance-in-auto-scaling-group --instance-id <id> --should-decrement-desired-capacity false`(ASG 用新 launch template 版本拉新)。
-   - 全量滚动:`aws autoscaling start-instance-refresh --auto-scaling-group-name openclaw-hosts-asg`(灰度滚动,min healthy % 控爆炸半径)。
-4. **验证**:新 host 注册 DDB(`init-host.sh` 注册段)+ lifecycle hook CONTINUE(`asg.lifecycle_hook_timeout` 内),再 chat/dashboard 数据面端到端可达。
+## 4. 诊断性热补
 
-> host AMI 修复(R18-E N13)复用同一序列:改镜像 → CodeBuild 烤 → 更 launch template image → instance-refresh。
+`copy-file-from-s3` 或 SSH/SSM 临时替换文件只用于复现和验证假设。使用时必须：
 
-## 三、本文档边界
+- 记录原文件摘要和备份；
+- 限定单台测试 host；
+- 记录命令、退出码和恢复步骤；
+- 不把临时状态当完成证据；
+- 随后把相同修复落回权威源并走重建。
 
-- 本文只文档化既有机制(热拉/烤死已在 `init-host.sh` 实现),**未改任何脚本**。
-- 去 host nginx(14.1)、死代码清理(14.3)、日志→CloudWatch(14.4,碰 host IAM)等 R18 改动碰网络/IAM,留独立 MR + 人工评审,拓扑核实证据见 `internal-docs/00-knowledge-base/evidence/r18-topology-confirm-2026-07-12.md`。
+涉及删除、回收或替换数据盘时，先创建并确认快照为 `available`，再执行任何不可逆
+步骤。
+
+## 5. 验收
+
+完成声明必须绑定本次部署的 commit、Launch Template 版本、bootstrap SHA、host
+实例、镜像 snapshot/slot 和验证时间。只看到 S3 对象已更新、CDK 已返回成功或进程
+已启动，都不足以证明新资源使用了新版本。

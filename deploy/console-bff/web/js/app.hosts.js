@@ -14,6 +14,12 @@ window.ocHosts = {
   copyModal: { show: false, host_id: '', s3_uri: 's3://', target: '/opt/openclaw/', busy: false, error: '' },
   // #309 — latest pull-image progress line per host, auto-polled while upgrading.
   pullProgress: {}, _progressInFlight: {},
+  // #394 — per-host canary snapshot choice (instance_id→snapshot_time), independent of
+  // the live-pull choice (hostSnapChoice). Empty → default latest (canarySnapFor).
+  canarySnapChoice: {},
+  // #394 — in-flight canary pull job per host (instance_id→job_id). Canary pull doesn't
+  // set host.status=upgrading, so this is how the poll loop knows to show its progress.
+  canaryJob: {},
 
   async loadHosts() {
     if (!this.apiUrl || !this.apiKey) return;
@@ -23,7 +29,7 @@ window.ocHosts = {
     this.loadingHosts = false;
     try { this.rootfsVersion = (await this.api('GET', 'hosts/rootfs-version')).version; } catch {}
     try { this.agentcoreStatus = await this.api('GET', 'agentcore/status'); } catch {}
-    try { this.snapshots = await this.api('GET', 'list_image_versions'); } catch {}  // #337(原#217 /snapshots)顶部下拉
+    try { this.snapshots = await this.api('GET', 'list_image_versions?show_deleted=true'); } catch {}  // #337(原#217 /snapshots)顶部下拉
     // Load skills + groups (v1.4.0/1.4.1)
     this.loadSkills();
     this.loadGroups();
@@ -58,9 +64,61 @@ window.ocHosts = {
     try {
       const r = await this.api('POST', 'create-image-snapshot', {});
       this.toast = `✓ snapshot ${r.snapshot_time}${r.label ? ' (' + r.label + ')' : ''} · ${r.file_count} files`;
-      try { this.snapshots = await this.api('GET', 'list_image_versions'); } catch {}
+      try { this.snapshots = await this.api('GET', 'list_image_versions?show_deleted=true'); } catch {}
     } catch (e) {
       this.toast = '✗ snapshot failed: ' + (e && e.message ? e.message : 'error');
+    }
+    setTimeout(() => { this.toast = ''; }, 4000);
+  },
+  // #394 — 可拉取的快照(过滤软删):Image Snapshot 面板用 this.snapshots 看全量(含
+  // deleted,带标记,这样被 host 槽位引用却被误删的版本仍显示徽标);pull 下拉只列可拉的,
+  // 绝不让运维选一个已软删版本去 pull(后端也会拒)。
+  get pullableSnapshots() {
+    return (this.snapshots || []).filter(s => s.status !== 'deleted');
+  },
+  // #394 — 某快照被哪些 host 槽位引用(live/canary/previous_live),从已加载的 this.hosts
+  // 本地推导(不额外打 API)。用于表格"使用中"列 + 禁用 Delete(引用中删会 409)。
+  // 返回人读串(如 "i-abc:live")或空串(未被引用)。
+  snapshotUsage(snapshot_time) {
+    const roleShort = { live: 'live', canary: 'canary', previous_live: 'prev' };
+    const hits = [];
+    for (const h of (this.hosts || [])) {
+      const sl = h.image_slots || {};
+      for (const key of ['live', 'canary', 'previous_live']) {
+        // 紧凑串:host id 末 5 位 + 角色短名(完整 id 太长,pill 里放不下也没必要)。
+        if (sl[key] === snapshot_time) hits.push(`…${h.instance_id.slice(-5)} ${roleShort[key]}`);
+      }
+    }
+    return hits.join(', ');
+  },
+  // 明确的布尔:是否被 host 槽位引用(供 :disabled 用,别直接把字符串塞给 :disabled)。
+  snapshotInUse(snapshot_time) { return this.snapshotUsage(snapshot_time).length > 0; },
+  // #394 — 灰度流水线当前处在第几步(1=待装 canary,2=canary 已装待验证/提升,3=已 promote 有 previous_live)。
+  // 用于流水线 UI 高亮"你在哪一步"。有 canary → step2;否则有 previous_live(promote 过)→ step3;都没 → step1。
+  canaryStage(h) {
+    if (this.hostCanary(h)) return 2;
+    if (this.hostPrevLive(h)) return 3;
+    return 1;
+  },
+  // #394 — 软删一条快照记录(POST /delete-image-snapshot,与 create 对称)。后端引用保护:
+  // 仍被 host 槽位/租户固定引用 → 409 IMAGE_VERSION_IN_USE(前端已按 host 引用禁用按钮,
+  // 但租户引用只有后端知道,故仍可能 409 → 如实提示)。软删只标记不物删,可审计。
+  async deleteSnapshot(snapshot_time) {
+    if (!confirm(`Soft-delete image snapshot ${snapshot_time}?\n(marks the record deleted + drops it from the pullable list; refused if any host slot or tenant still pins it; does NOT remove S3 image files)`)) return;
+    this.toast = `deleting ${snapshot_time}…`;
+    try {
+      const r = await this.api('POST', 'delete-image-snapshot', { snapshot_time });
+      // api() 遇非 2xx 不 throw、直接返回 body → 按 code 判引用中拒删。
+      if (r && r.code === 'IMAGE_VERSION_IN_USE') {
+        this.toast = `✗ still in use: ${r.error || ''}`;
+      } else if (r && r.code) {
+        this.toast = `✗ delete failed [${r.code}]: ${r.error || ''}`;
+      } else {
+        this.toast = `✓ snapshot ${snapshot_time} deleted (soft)`;
+        try { this.snapshots = await this.api('GET', 'list_image_versions?show_deleted=true'); } catch {}
+      }
+    } catch (e) {
+      this.toast = '✗ delete failed: ' + (e && e.message ? e.message : 'error');
     }
     setTimeout(() => { this.toast = ''; }, 4000);
   },
@@ -85,6 +143,156 @@ window.ocHosts = {
       this.toast = '✗ pull-image failed: ' + (e && e.message ? e.message : 'error');
     }
     setTimeout(() => { this.toast = ''; this.loadHosts(); }, 3000);
+  },
+  // ─────────────────────────────────────────────────────────────────────────
+  // #394 — per-VM canary image controls. All hit REAL control-plane endpoints:
+  //   pull canary   → POST /hosts/{id}/pull-image?slot=canary   (installs to the
+  //                   host's canary slot; does NOT flip host.status → live tenants
+  //                   keep running on this host)
+  //   promote       → POST /hosts/{id}/promote-canary            (admin, CAS)
+  //   rollback      → 用 pull-image 选老版到 live(无独立 rollback;本地已装则秒级翻指针)
+  //   reclaim       → POST /hosts/{id}/reclaim-images            (admin, prune 无引用版本)
+  // Slot state comes from h.image_slots (the control-plane mirror surfaced by
+  // GET /hosts). Promote/reclaim are admin-only (isAdmin gate).
+  // ─────────────────────────────────────────────────────────────────────────
+  // canary version this host will pull: explicit choice, else latest snapshot.
+  canarySnapFor(host_id) {
+    return this.canarySnapChoice[host_id] || (this.snapshots[0] || {}).snapshot_time || '';
+  },
+  // host's current slots (control-plane mirror). Absent on legacy flat-layout hosts.
+  hostSlots(h) { return (h && h.image_slots) || {}; },
+  hostCanary(h) { return this.hostSlots(h).canary || ''; },
+  hostLiveSlot(h) { return this.hostSlots(h).live || ''; },
+  hostPrevLive(h) { return this.hostSlots(h).previous_live || ''; },
+  hostSlotGen(h) { const g = this.hostSlots(h).generation; return g == null ? '' : g; },
+  // Pull the chosen snapshot into THIS host's canary slot (no host.status change).
+  async pullCanaryToHost(host_id) {
+    const st = this.canarySnapFor(host_id);
+    if (!st) { alert('No snapshot available (use "Take snapshot" first).'); return; }
+    if (!confirm(`Install snapshot ${st} into ${host_id}'s CANARY slot?\n(live tenants on this host are unaffected; validate with a canary tenant, then promote)`)) return;
+    this.toast = `pull canary ${st}…`;
+    try {
+      const r = await this.api('POST', `hosts/${host_id}/pull-image?snapshot_time=${encodeURIComponent(st)}&slot=canary`);
+      this.toast = `✓ canary pull started (job ${r.job_id ? r.job_id.slice(0, 10) : '?'})`;
+      // #394 — canary pull 不置 host.status=upgrading,所以既有 "upgrading 才轮询/显示进度"
+      // 那套看不到它。这里记下 canary job_id,poll 循环据此按 job_id 查进度并显示,终态后清除。
+      if (r && r.job_id) this.canaryJob[host_id] = r.job_id;
+    } catch (e) {
+      this.toast = '✗ canary pull failed: ' + (e && e.message ? e.message : 'error');
+    }
+    setTimeout(() => { this.toast = ''; this.loadHosts(); }, 3000);
+  },
+  // #394 — 一键"在这台 host 上建 canary 验证租户":打开创建弹窗并预填 image_channel=canary
+  // + preferred_host_id=本 host(canary 槽只在这台,必须 pin)。省得运维手动开弹窗再逐项设。
+  createCanaryTenant(host_id) {
+    const h = this.hosts.find(x => x.instance_id === host_id);
+    if (!this.hostCanary(h)) { alert('This host has no canary staged — pull a canary first.'); return; }
+    this.restoreSource = null;
+    // 复用既有 create 表单结构;只预置灰度相关字段,其余留默认由运维填。
+    this.form = {
+      name: '', vcpu: null, memory_mb: null, config_template: '',
+      preferred_host_id: host_id, group: '', tags_text: '', image_channel: 'canary',
+    };
+    this.showModal = true;
+  },
+  // #394 —— 真机实读:GET /hosts/{id}/image-slots 读 host 盘上真实 slots.json + versions/,
+  // 覆盖显示用的 image_slots(DDB 镜像可能滞后)。debug 灰度时点一下看盘上真相。
+  hostDiskSlots: {},  // instance_id → {slots, installed_versions, flat_layout, mirror}
+  async refreshHostDiskSlots(host_id) {
+    this.toast = `reading ${host_id} disk image state…`;
+    try {
+      const r = await this.api('GET', `hosts/${host_id}/image-slots`);
+      if (r && (r.code || r.error)) {
+        this.toast = `✗ read failed${r.code ? ' [' + r.code + ']' : ''}: ${r.error || ''}`;
+      } else {
+        this.hostDiskSlots[host_id] = r;
+        // 把 host 卡片上显示的 image_slots 覆盖成盘上真值(消除"看着漂移"的困惑)。
+        const h = this.hosts.find(x => x.instance_id === host_id);
+        if (h && r.slots) h.image_slots = r.slots;
+        this.toast = `✓ disk: live=${(r.slots && r.slots.live) || '—'} · canary=${(r.slots && r.slots.canary) || '—'} · gen ${r.slots ? r.slots.generation : '?'} · ${r.installed_versions.length} version(s)`;
+      }
+    } catch (e) {
+      this.toast = '✗ read failed: ' + (e && e.message ? e.message : 'error');
+    }
+    setTimeout(() => { this.toast = ''; }, 5000);
+  },
+  // #394 Step5 —— 这台 host 上仍活着的 canary 验证租户(image_channel=canary,非 deleted)。
+  // 用于流水线第 5 步"清理测试租户":读已加载的 this.tenants 本地过滤,不额外打 API。
+  canaryTenantsOnHost(host_id) {
+    return (this.tenants || []).filter(
+      t => t.host_id === host_id && t.image_channel === 'canary'
+        && t.status && t.status !== 'deleted'
+    );
+  },
+  // Step5 —— 删除这台 host 上的 canary 验证租户(灰度收尾:验证完/放弃后清掉测试 VM)。
+  // 逐个走既有 DELETE /tenants/{id};一个失败不挡其余,汇总提示。
+  async deleteCanaryTenants(host_id) {
+    const list = this.canaryTenantsOnHost(host_id);
+    if (!list.length) { alert('No canary validation tenants on this host to clean up.'); return; }
+    if (!confirm(`Delete ${list.length} canary validation tenant(s) on ${host_id}?\n(` + list.map(t => t.id).join(', ') + ')\nThis removes the test VMs you created in step 2.')) return;
+    let ok = 0, fail = 0;
+    for (const t of list) {
+      this.toast = `deleting canary tenant ${t.id}…`;
+      try { await this.api('DELETE', 'tenants/' + t.id); ok++; }
+      catch { fail++; }
+    }
+    this.toast = `✓ canary tenants deleted: ${ok}${fail ? ', ' + fail + ' failed' : ''}`;
+    setTimeout(() => { this.toast = ''; this.loadTenants(); this.loadHosts(); }, 3000);
+  },
+  // Promote this host's canary slot to live (admin, CAS on the mirrored snapshot+generation).
+  async promoteCanary(host_id) {
+    const h = this.hosts.find(x => x.instance_id === host_id);
+    const canary = this.hostCanary(h);
+    if (!canary) { alert('No canary staged on this host to promote.'); return; }
+    if (!confirm(`Promote canary ${canary} → LIVE on ${host_id}?\n(new live tenants boot this version; running VMs keep their image until rebuilt. Irreversible pointer change.)`)) return;
+    this.toast = `promote ${canary}…`;
+    try {
+      const gen = this.hostSlotGen(h);
+      const body = { expected_canary_snapshot_time: canary };
+      if (gen !== '') body.expected_canary_generation = gen;
+      const r = await this.api('POST', `hosts/${host_id}/promote-canary`, body);
+      // api() 遇非 2xx 不 throw、直接返回 body → 先按 code/error 判失败,别把错误体当成功
+      // 读出 live_snapshot_time=undefined("promoted → live undefined")。
+      if (r && (r.code || r.error)) {
+        this.toast = `✗ promote failed${r.code ? ' [' + r.code + ']' : ''}: ${r.error || ''}`;
+      } else if (r && r.already_promoted) {
+        this.toast = `✓ already live: ${r.live_snapshot_time}`;
+      } else {
+        this.toast = `✓ promoted → live ${r.live_snapshot_time}`;
+      }
+    } catch (e) {
+      this.toast = '✗ promote failed: ' + (e && e.message ? e.message : 'error');
+    }
+    // 刷新:先拉 hosts(DDB 镜像),若该 host 已展开盘上真值则也重读磁盘(promote 后指针变了)。
+    await this.refreshHostAfterSlotOp(host_id);
+  },
+  // 槽位操作后刷新该 host 的显示:重载 hosts(DDB 镜像已被 host 回写),并且——只有当用户
+  // 之前点过 ↻ disk 展开了盘上真值时——重读磁盘真值,让 live/canary/prev 立刻反映新状态,
+  // 不用手动再点一次 ↻ disk。
+  async refreshHostAfterSlotOp(host_id) {
+    await this.loadHosts();
+    if (this.hostDiskSlots[host_id]) { try { await this.refreshHostDiskSlots(host_id); } catch {} }
+  },
+  // #394 —— 无独立 rollback:回滚 = 用上方 pull 下拉选老版到 live(pull-image;本地版本目录
+  // 已完整则后端快路径秒级翻指针,不重新下载)。previous_live 仅作展示,不再有 swap 动作。
+  // Step4 —— 回收这台 host 上无人引用的版本目录(手动 prune,admin)。保留
+  // live/canary/previous_live + 租户固定引用的版本,其余 versions/<snap>/ 删掉释放盘。
+  async reclaimImages(host_id) {
+    if (!confirm(`Reclaim unreferenced image versions on ${host_id}?\n(deletes versions/ dirs NOT referenced by live/canary/previous_live or any running tenant. Frees disk; irreversible.)`)) return;
+    this.toast = `reclaiming old versions on ${host_id}…`;
+    try {
+      const r = await this.api('POST', `hosts/${host_id}/reclaim-images`, {});
+      if (r && (r.code || r.error)) {
+        this.toast = `✗ reclaim failed${r.code ? ' [' + r.code + ']' : ''}: ${r.error || ''}`;
+      } else {
+        this.toast = r.reclaimed_count
+          ? `✓ reclaimed ${r.reclaimed_count} version(s): ${r.reclaimed_versions.join(', ')}`
+          : `✓ nothing to reclaim (kept ${r.kept_versions.length})`;
+      }
+    } catch (e) {
+      this.toast = '✗ reclaim failed: ' + (e && e.message ? e.message : 'error');
+    }
+    setTimeout(() => { this.toast = ''; this.loadHosts(); }, 4000);
   },
   // #309 — copy a single file from S3 to this host (EC2). Opens an in-app modal
   // (not a native prompt) so the EC2 target path is a clear, editable field.
@@ -140,11 +348,14 @@ window.ocHosts = {
   // 组装成一行 inline 展示:进行中显进度原文;成功/失败显状态(+失败原因)。
   // (旧字段 p.progress 已移除,#333 改契约——这里同步消费新字段。)
   // Guards against overlapping calls per host so the 5s poll can't stack requests.
-  async _fetchPullProgress(host_id) {
+  async _fetchPullProgress(host_id, job_id) {
     if (this._progressInFlight[host_id]) return this.pullProgress[host_id];
     this._progressInFlight[host_id] = true;
     try {
-      const p = await this.api('GET', `hosts/${host_id}/pull-image-progress`);
+      // #394 — 带 job_id 时精确查该 job(canary pull 走这条:host.status 不是 upgrading,
+      // 只能靠 job_id 定位);不带时查该 host 最近一次(live pull 兼容路径)。
+      const qs = job_id ? `?job_id=${encodeURIComponent(job_id)}` : '';
+      const p = await this.api('GET', `hosts/${host_id}/pull-image-progress${qs}`);
       let line;
       if (p.ProcessingJobStatus === 'Failed') {
         line = `Failed: ${p.ErrorCode || ''} ${p.FailureReason || p.last_pull_error || ''}`.trim();
@@ -155,6 +366,10 @@ window.ocHosts = {
         line = p.last_status || p.last_pull_error || 'In progress…';
       }
       this.pullProgress[host_id] = line;
+      // #394 — canary job 到终态就清除跟踪,进度行随之隐藏(下次 loadHosts 拿到新 slots)。
+      if (job_id && (p.ProcessingJobStatus === 'Completed' || p.ProcessingJobStatus === 'Failed')) {
+        delete this.canaryJob[host_id];
+      }
       return line;
     } catch (e) {
       return this.pullProgress[host_id] || '';
@@ -162,11 +377,13 @@ window.ocHosts = {
       this._progressInFlight[host_id] = false;
     }
   },
-  // #309 — on each poll beat, refresh progress for every host that's upgrading so
-  // the card shows the live pull-image status line (no manual button needed).
+  // #309/#394 — on each poll beat, refresh progress for every host that's either doing a
+  // LIVE pull (status=upgrading) or a CANARY pull (tracked canaryJob), so the card shows
+  // the pull-image status line for both (no manual button needed).
   pollUpgradingProgress() {
     for (const h of this.hosts) {
       if (h.status === 'upgrading') this._fetchPullProgress(h.instance_id);
+      else if (this.canaryJob[h.instance_id]) this._fetchPullProgress(h.instance_id, this.canaryJob[h.instance_id]);
     }
   },
   // #217 — quiet poll: refresh the host list (status/snapshot) WITHOUT flipping
@@ -177,7 +394,7 @@ window.ocHosts = {
     try {
       this.hosts = await this.api('GET', 'hosts');
       this.connected = true;
-      this.snapshots = await this.api('GET', 'list_image_versions');  // #337(原#217 /snapshots)
+      this.snapshots = await this.api('GET', 'list_image_versions?show_deleted=true');  // #337(原#217 /snapshots)
     } catch { this.connected = false; }
   },
   // v1.2.8 — host AZ lookup for the new "AZ" column in the tenants table.

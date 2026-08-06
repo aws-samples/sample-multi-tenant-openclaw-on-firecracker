@@ -77,4 +77,8 @@ window.ocFormat = {
     } catch (e) { return 'viewer'; }
   },
   canWrite() { return this.role() !== 'viewer'; },
+  // #394 — promote/rollback/discard canary are admin-only (backend x-rbac: admin).
+  // Note: the API-key path resolves is_admin server-side regardless; this only gates
+  // UI visibility so non-admins don't see buttons that would 403.
+  isAdmin() { return this.role() === 'admin'; },
 };

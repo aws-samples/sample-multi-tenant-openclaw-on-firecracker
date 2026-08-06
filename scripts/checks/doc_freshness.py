@@ -5,7 +5,7 @@
 本工具让过期文档"自己喊死":扫 fact 文件里已写的 file:line 引用做锚点,
 记目标行内容指纹到 lock;代码一改指纹就变,check 报 STALE 挡 merge。
 
-三个确定性信号(参考 Dosu freshness / Fiberplane Drift):
+三个确定性信号(参考 Dosu freshness / Fiberplane Drift,见 engineering/ 调研报告):
   1. 锚点漂移:file:line 死链 / 行号越界 / 目标行内容指纹变了(STALE)
   2. frontmatter TTL:文件头 verified_until / verified_against 过期
   3. git age delta:引用的代码文件比文档新(可疑,弱信号只扣分不挡)
@@ -15,7 +15,7 @@
   check [files...]  重算,报 STALE/死链/越界/TTL 过期;有硬漂移退出码 1(CI 门用)
   score [files...]  输出每文件 0-100 保鲜分 + 汇总(巡检/趋势用)
 
-不带 files 时用默认 fact 清单(FACT_GLOBS)。lock 放 docs/.doc-anchors.lock。
+不带 files 时用默认 fact 清单(FACT_GLOBS)。lock 放 engineering/.doc-anchors.lock。
 """
 
 from __future__ import annotations
@@ -38,12 +38,15 @@ REPO = (
     or os.getcwd()
 )
 
-LOCK_PATH = os.path.join(REPO, "docs", ".doc-anchors.lock")
+LOCK_PATH = os.path.join(REPO, "engineering", ".doc-anchors.lock")
 
 # 默认重点保护的 fact 文件(相对仓库根的 glob)。新增 fact 文件加这里。
 FACT_GLOBS = [
-    "README.md",
-    "docs/**/*.md",
+    "CLAUDE.md",
+    "CLAUDE.local.md",
+    "engineering/02-system-constraints/FACT-BASELINE.md",
+    "engineering/00-knowledge-base/diagrams/fig*.svg",
+    "engineering/00-knowledge-base/map.md",
 ]
 
 # file:line[-line] 引用。只认代码扩展名,避免把版本号/端口误当引用。
@@ -120,7 +123,7 @@ def parse_anchors(text: str) -> list[tuple[str, int, int | None]]:
 
 
 # 全仓彻查模式排除的路径(历史归档 + 外部代码,本就不该核当前性)
-ALL_EXCLUDE = re.compile(r"(^|/)(archive|node_modules)/")
+ALL_EXCLUDE = re.compile(r"(^|/)(04-archive|opensource|node_modules)/")
 
 
 def expand_facts(files: list[str]) -> list[str]:

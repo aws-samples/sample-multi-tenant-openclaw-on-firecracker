@@ -13,6 +13,21 @@ def _sam_build_image_for_host():
     return "public.ecr.aws/sam/build-python3.12:latest-x86_64"
 
 
+def host_golden_ami_parameter_name(gsuffix):
+    """SSM parameter holding the current host golden AMI id (#389 v2 block 2).
+
+    Lives here, not in host_image.py, because two stacks must agree on it: the Image
+    Builder pipeline WRITES it at distribution and the host LaunchTemplate READS it as
+    ``resolve:ssm:``. A name computed independently on each side would drift into an ASG
+    whose every launch fails on a nonexistent parameter.
+
+    Under ``/imagebuilder/`` deliberately: the EC2ImageBuilderExecutionPolicy managed
+    policy grants ``ssm:PutParameter`` only on that prefix, so any other name needs a
+    hand-written policy and fails the bake at distribution time rather than at synth.
+    """
+    return f"/imagebuilder/openclaw/host-ami{gsuffix or ''}"
+
+
 def _read_pyproject_version():
     """Best-effort read of the project version so the API can advertise it
     via /system/info. Falls back to "dev" if pyproject.toml is unreadable
@@ -28,7 +43,7 @@ def _read_pyproject_version():
 
 
 def _build_vpc(scope, net_cfg):
-    """P2b · #187 FR-10 · the data-plane contract:三档 VPC。
+    """P2b · #187 FR-10 · INTERFACE-CONTRACT §6:三档 VPC。
 
     - default_vpc: 存量 from_lookup 默认 VPC(host 裸公网,不推荐)。
     - self_managed: 自建 /20,PUBLIC×3(/24)+ PRIVATE_ISOLATED×3(Database /26,

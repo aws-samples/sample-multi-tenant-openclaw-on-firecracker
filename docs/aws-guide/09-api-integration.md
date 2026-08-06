@@ -2,11 +2,11 @@
 
 本节面向要把本平台集成进自有系统的对接方(客户后端 / 运营控制台 / 自动化脚本)。控制面接口示例经真实调用验证(直接对部署环境 curl,响应为真机返回、凭据已脱敏)。
 
-> 本章数据面部分（`{HUB}/hub/*` 等）已被两级路由取代，请以第 13 章为准；控制面 REST 部分仍然有效。
+> 本章只定义控制面 REST API。实时聊天走平台后端 `/gw/ws` 两级路由，不存在可调用的 `{HUB}/hub/*` 接口；见第 13 章。
 
 > 本文所有 `{BASE}` 指控制面 API 网关地址(形如 `https://<api-id>.execute-api.<region>.amazonaws.com/v1`,部署后由 `console/config.js` 的 `OC_DEFAULT_API_URL` 给出)。真实账号 ID / 域名 / 凭据请以你自己的部署为准,本文用占位符。
 
-> **字段级契约** 本文是人读的端点参考;逐字段(类型 / 必填 / 默认 / 枚举 / 正则 / 敏感)机器可校验的真相源是同目录 `openapi.yaml`(OpenAPI 3.1,37 路径),可用 `swagger.html` 本地浏览(`cd docs/aws-guide && python3 -m http.server`,浏览器开 `swagger.html`)。下文各端点标注的 `openapi.yaml <operationId>` 即对应条目。
+> **字段级契约** 本文是人读的端点参考;逐字段(类型 / 必填 / 默认 / 枚举 / 正则 / 敏感)机器可校验的真相源是同目录 `openapi.yaml`(OpenAPI 3.1,38 路径),可用 `swagger.html` 本地浏览(`cd docs/aws-guide && python3 -m http.server`,浏览器开 `swagger.html`)。下文各端点标注的 `openapi.yaml <operationId>` 即对应条目。
 
 ---
 
@@ -14,22 +14,22 @@
 
 > 本节是可拷贝的调用参考，设计与角色语义见第 6 章。
 
-控制面对每个请求做三层校验,对接前必须理解:
+控制面对每个请求做三层校验:
 
-1. **API Key(网关层,`x-api-key` 头)** — API 网关 usage plan 校验。缺失或错误一律 `403 {"message":"Forbidden"}`,请求根本不进业务逻辑(真机验证:缺 key 与错 key 返回一致,不区分,防枚举)。所有控制面调用都要带 `x-api-key`。
-2. **Cognito JWT(身份层,`Authorization: Bearer <id_token>` 头)** — 面向"以某个登录用户身份"操作的路由(如自助注册 `POST /tenants/self`)。网关侧 Cognito authorizer + Lambda 内 JWKS 验签(RS256,校验 issuer + 过期 + client_id)。纯后端自动化可只用 API Key 走管理员路径(`owner_id = API_KEY_OWNER`,全量可见)。
-3. **RBAC + owner 归属门控(授权层,Lambda 内)** — 校验过的 Cognito `sub` 作为 `owner_id` 落到租户记录;每个 per-tenant 路由强制 `owner == caller`(或 admin / api-key)。非 owner 的跨用户访问返 `403`。
+1. **Usage plan 标识(`x-api-key`)** — 当前 API Gateway 方法都要求该头;缺失或错误返回 `403`。AWS 明确说明 API Key 不应单独承担认证或授权,usage-plan 配额/限流也是 best effort。
+2. **身份(`Authorization: Bearer <id_token>`)** — 启用 Amazon Cognito 时,Lambda 用 JWKS 验证 RS256、issuer、过期时间与可选 client id,再从 `sub` 和 `cognito:groups` 得到身份与角色。
+3. **授权(Lambda 内)** — RBAC 决定 viewer/operator/admin 路由权限,owner 与 platform scope 门控限制资源范围。无效 Bearer token 不会退化为受信 API-key 调用。
 
-判据一句话:**纯后端集成用 `x-api-key`;要按平台用户身份建/管各自的 openclaw,叠加 `Authorization: Bearer <Cognito id_token>`。**
+默认配置把无 Bearer 的 API-key-only 请求映射为 `viewer`,因此只能调用只读路由。受信内网自动化若要只带 `x-api-key` 写入,部署方必须显式把 `console_auth.default_no_jwt_role` 调到 `operator` 或 `admin`,并用私网、IAM/Lambda authorizer 等额外边界保护该路径。
 
-数据面(实时对话)另有独立的 token 兑换,见 §5。
+AWS 依据:[API Gateway API Key 与 usage plan 最佳实践](https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-api-usage-plans.html)。
 
 ### 1.1 RBAC 角色与路由权限(config-gated)
 
 RBAC 由环境变量 `RBAC_ENABLED` 控制(默认开)。角色分三级 `viewer < operator < admin`,来自 Cognito `cognito:groups` claim(取最高级)。授权在路由命中之后校验,因此未知路径仍返 `404` 而非 `403`。失败安全:无 Bearer token 落到 `DEFAULT_NO_JWT_ROLE`(默认 `viewer`);token 验不过 → `403`。
 
 - **跳过 RBAC(自带认证)**:`POST /external/authz`(HMAC 签名)、`GET /tenantmatch`(登录前的 IdP 路由查询)。
-- **viewer 即可**:所有只读 `GET`(列表/详情/系统信息/审计/镜像/分组读/技能读)+ `POST /tenants/self`(自助注册)+ `POST /chat/sign`(路由层 viewer,函数内另做 owner 门控)。
+- **viewer 即可**:所有只读 `GET`(列表/详情/系统信息/审计/镜像/分组读/技能读)+ `POST /tenants/self`(自助注册)。
 - **operator 及以上**:所有写操作(创建/生命周期/宿主管理/技能写删/分组写删/批量)。
 - **admin 专属**:`POST /hosts/fleet-power`(全舰队启停,路由层要 operator,函数内再校验 admin)。
 
@@ -48,7 +48,7 @@ per-tenant 路由(带 `{id}`)在 RBAC 之上再做 owner 门控:非 admin / 非 
 
 ---
 
-## 3. 端点参考(每条经真机验证)
+## 3. 端点参考
 
 ### 3.1 系统与容量(只读)
 
@@ -112,7 +112,7 @@ curl -s -H "x-api-key: $KEY" "{BASE}/system/info"
 
 ### 3.2 租户生命周期
 
-**`POST {BASE}/tenants`** — 创建租户(建一个独立 openclaw microVM)。管理员/后端路径(`x-api-key`,RBAC operator+)。
+**`POST {BASE}/tenants`** — 创建租户(建一个独立 openclaw microVM)。需要 `x-api-key` 且 RBAC 角色达到 operator;默认 `viewer` 配置下还需有效的 operator/admin Bearer token。
 
 ```bash
 curl -s -X POST -H "x-api-key: $KEY" -H "content-type: application/json" \
@@ -161,9 +161,9 @@ curl -s -X POST -H "x-api-key: $KEY" -H "content-type: application/json" \
 返回码取决于部署是否开启创建削峰队列(`CREATE_VIA_QUEUE`,`config.yml` 的 `scaler.create_via_queue`,**默认关**):
 
 - **默认(同步)**:有宿主容量返 `201 {"id":"acme-xxxx","status":"creating",...}`,无容量返 `201 {"id":"...","status":"pending"}`(自动触发扩容,后台处理)。
-- **开启削峰队列后(异步)**:入 SQS 削峰,返 `202 {"id":"acme-xxxx","status":"queued","message":"create accepted; provisioning asynchronously"}`。大规模建租户时推荐开(见规划部署章的 SSM 并发说明)。
+- **开启削峰队列后(异步)**:入 SQS 削峰,返 `202 {"id":"t-<16hex>","status":"queued","message":"create accepted; provisioning asynchronously"}`。大规模建租户时推荐开(见规划部署章的 SSM 并发说明)。
 
-带 `client_token` 时 id 由 `(owner, client_token)` 决定,同键重放返 `409 CONFLICT`。两种模式都**随后轮询 `GET /tenants/{id}` 直到 `status:running`**。
+带 `client_token` 时 id 由 `(owner, client_token)` 决定,形态固定为 `t-` 加 16 位十六进制;同键重放返 `409 CONFLICT`。不带 `client_token` 时才使用 `<name>-<4hex>`。两种模式都**随后轮询 `GET /tenants/{id}` 直到 `status:running`**。该差异由 `tests/api-regress` 真机回归锁定。
 
 > **已知缺陷(#160)— 走 SQS 削峰队列(`DISPATCH_QUEUE_URL` 开启)建租户时,部分字段不注入 VM。** 真机核实(2026-07-07):dispatch 分支给消费端的消息 params 只带 `vcpu`/`mem_mb`/`owner_id`/`chat_ep`/`image`(`tenant_service.py:440-451`),**`skills`/`group`/`schedule`/`ttl_hours`/`chat_endpoint_enabled` 都不进**——`platform_id`/`tags` 会落库(查得到),但 `skills` 不会真正注入 VM(`effective_skills` 恒 `*` 广播),`chat_endpoint_enabled` 也丢(字段名读成 `chat_ep`)。**同步路径(默认,队列关)不受影响,上表所有字段都生效。** 要用这些字段又开了削峰队列的部署,在 #160 修复前需注意此差异。
 
@@ -173,11 +173,11 @@ curl -s -X POST -H "x-api-key: $KEY" -H "content-type: application/json" \
 
 - 无参:裸数组(全量)。每条为该租户 DDB 记录去除服务端凭据字段后的投影,含 `id/name/status/owner_id/host_port/guest_ip/vm_health/app_health` 等字段(`vm_health`/`app_health` 由 health_check Lambda 写入,新建租户在首次健康检查前可能尚未出现)。
 - 分页:`GET {BASE}/tenants?limit=5` → `{"tenants":[…],"next_token":"<opaque>","count":<本页条数>}`。
-- 边界(真机验证):`?limit=-1` → `400 {"code":"VALIDATION","error":"limit must be a positive integer (>= 1)"}`;`?next_token=garbage` → `400 {"code":"VALIDATION","error":"next_token is invalid or expired"}`。
+- 边界证据:`?limit=-1` → `400 {"code":"VALIDATION","error":"limit must be a positive integer (>= 1)"}`;`?next_token=garbage` → `400 {"code":"VALIDATION","error":"next_token is invalid or expired"}`。
 - 可选 `?tag=key:value` 按标签过滤(可多个,AND 语义)。
-  > **Important** 控制面已在 `_redact_tenant`(`services/tenant_service.py:130`,list/get 响应均套,见 `handler.py:398/424`)剥离租户级凭据字段——`_TENANT_SECRET_FIELDS`(`tenant_service.py:84`)含 `channel_secret`、`litellm_vkey`、`gateway_token`、`cognito_channel_password`,这四个只在服务端使用、绝不出网关。对接方仍**不得把响应原样透传到不可信前端**(纵深防御:防镜像/版本回退期或自定义投影漏剥),前端只消费展示字段(`id/name/status/...`)。
+  > **Important** 列表响应会剥离租户级凭据。对接方仍**不得把响应原样透传到不可信前端**,前端只消费展示字段。
 
-**`GET {BASE}/tenants/{id}`** — 单租户详情(owner 门控)。
+**`GET {BASE}/tenants/{id}`** — 单租户详情(owner/admin 门控)。基础记录先脱敏;当租户为 `running` 时,响应会额外附加 `gateway_token` 的 KMS 密文和 `device`(device id、公钥、私钥 KMS 密文、scopes),供受信平台后端按 encryption context 本地解密并完成 WSS device 握手。它们不是明文,但仍是敏感交付物,不得下发浏览器。`GET /tenants/{id}/credentials` 则把同一凭据重包为 recipient-key asymmetric-v1 形态。
 
 **`POST {BASE}/tenants/{id}/{action}`** — 生命周期动作(RBAC operator+ + owner 门控)。支持的 `action`:
 
@@ -250,6 +250,14 @@ curl -s -H "x-api-key: $KEY" "{BASE}/images"
 
 字段:`live_version`(`manifest.json` 指向的版本,取不到为 `"unknown"`)、`manifest`(原样内容,取不到为 `{}`)、`artifact_count`、`artifacts[]` 按 `(kind, name)` 排序,每条含 `name`、`kind`、`size_bytes`、`last_modified`(ISO8601,缺失为 `null`)、`is_backup`(名字含 `.bak` 为 `true`)。`kind` 枚举:`rootfs`(根文件系统只读盘)、`data-template`(数据盘模板)、`kernel`(`vmlinux`)、`integrity-baseline`(`golden-image.sha256`)、`manifest`、`other`。错误:`ASSETS_BUCKET` 未配 → `503`;S3 列举失败 → `500`。
 
+镜像快照与灰度槽位接口:
+
+- **`POST {BASE}/create-image-snapshot`** — body `{"label":"<1-128位 A-Za-z0-9._->"}`。空字符串不会由控制面自动派生,而是 `400 VALIDATION`;label 派生或去重若需要,由上游调用方负责。
+- **`GET {BASE}/list_image_versions`** / **`POST {BASE}/delete-image-snapshot`** — 列出或删除版本快照。
+- **`POST {BASE}/hosts/{id}/pull-image?snapshot_time=<ISO>&slot=live|canary`** — 拉取到 live 或 canary 槽。
+- **`GET {BASE}/hosts/{id}/pull-image-progress`** / **`GET {BASE}/hosts/{id}/image-slots`** — 查询异步 job 与宿主真实槽位。
+- **`POST {BASE}/hosts/{id}/promote-canary`** / **`POST {BASE}/hosts/{id}/reclaim-images`** — 提升经验证的 canary,或回收无人引用的版本。完整状态与冲突码见 `openapi.yaml` 和 [pull-image API](../api/pull-image-api.md)。
+
 ### 3.5 宿主机管理(运维)
 
 **`POST {BASE}/hosts`** — 把一台 EC2 实例注册为 Firecracker 宿主(RBAC operator+)。body `{instance_id:"i-..."}`。平台侧 DescribeInstances 拿 vCPU/内存/AZ,扣除 `HOST_RESERVED_*` 后记账,返 `201 {instance_id,status:"active",az}`。
@@ -289,7 +297,7 @@ curl -s -H "x-api-key: $KEY" "{BASE}/skills"
 
 ### 3.9 授权对接(外部后端)
 
-**`POST {BASE}/external/authz`** — 外部后端推送"用户 ↔ 租户"授权映射(**跳过 RBAC,自带 HMAC 签名认证**,`EXTERNAL_AUTHZ` 开启时生效)。用于把授权判定权交给客户自有平台:平台说"用户 X 可访问租户 Y",写入 `authorized_users`,数据面 hub 据此放行。
+**`POST {BASE}/external/authz`** — 外部后端推送"用户 ↔ 租户"授权映射(**跳过 RBAC,自带 HMAC 签名认证**,`EXTERNAL_AUTHZ` 开启时生效)。用于把授权判定权交给客户自有平台:平台说"用户 X 可访问租户 Y",写入 `authorized_users`;平台 WebSocket 网关在为用户选择 tenant 前查询同一授权事实。
 
 - 签名头:`x-claw-authz-signature`(= HMAC-SHA256(secret, `"{timestamp}.{raw_body}"`))+ `x-claw-authz-timestamp`(unix 秒,±`EXTERNAL_AUTHZ_TS_WINDOW` 默认 300s,防重放)。
 - body:`{tenant_id, principal, op:"grant"|"revoke", role?, expire_at?}`。
@@ -317,7 +325,7 @@ curl -s -H "x-api-key: $KEY" "{BASE}/skills"
 
 ### 3.11 config 模板 CRUD(独立 Lambda)
 
-OpenClaw config 模板(`config_template` 字段引用的那些)由**独立的 templates Lambda** 服务(`deploy/lambda/templates/handler.py`,注册 `deploy/stacks/lambdas.py:1245`)。**认证模型:只过网关 `x-api-key`,不经 Cognito RBAC、不落审计**(与 §3.6 走 api Lambda 的 skill CRUD 不同)。存储在 S3 `templates/openclaw/<name>/openclaw.json`。
+OpenClaw config 模板由独立的 templates Lambda 服务。该路由目前只要求 API Gateway `x-api-key`,不经 Cognito RBAC、不落 API Lambda 审计。由于 API Key 不是认证机制,这些模板写接口只能放在受信网络或额外 authorizer 后面,不得直接公网暴露。对象存储在 S3 `templates/openclaw/<name>/openclaw.json`。
 
 **`GET {BASE}/templates`** — 模板清单(`openapi.yaml` `listTemplates`)。真机返 `{"templates":[{"name","size","modified"}]}`。
 
@@ -331,82 +339,57 @@ curl -s -H "x-api-key: $KEY" "{BASE}/templates"
 
 ---
 
-## 4. 数据面:换取前端令牌 + 消息签名(hub)
+## 4. 数据面:平台 WebSocket 网关
 
-数据面把"浏览器/前端 ⇄ 用户自己的 openclaw"经 hub(WS 中枢)打通。前端不直连 microVM(VM 不开入站端口),而是双方各自向 hub 出站汇合。
+实时聊天不是控制面 API 的子资源。终端只连接客户平台自己的
+`wss://<platform>/gw/ws?token=<platform-session-token>`。平台后端验证自己的会话
+token,根据服务端归属账本选择 tenant,再作为 OpenClaw WebSocket 客户端连接
+`/ws/{tenant_id}`。第二跳通过 Amazon CloudFront、Application Load Balancer、
+OpenResty edge、宿主 DNAT 到 microVM `:18789`。
 
-**`POST {HUB}/hub/token`** — 前端用 Cognito `id_token` 换 hub 短 token。
+平台后端从控制面取得 gateway token 与 device 私钥的 KMS 密文,在进程内使用正确
+EncryptionContext 解密,完成 `connect.challenge` → Ed25519 签名 → `hello-ok`。
+浏览器不接触 `x-api-key`、gateway token 或 device 私钥。已删除的
+`/hub/token`、`/hub/ws`、`/channel-token`、`/chat/sign` 和 hub 文件预签接口均不是
+当前契约。消息帧、关闭码与重试规则见第 13 章和 `engineering/backend/lib/gw-ws.mjs`。
 
-```bash
-curl -s -X POST -H "Authorization: Bearer <cognito_id_token>" \
-  -H "content-type: application/json" -d '{"tenant_id":"acme-xxxx"}' "{HUB}/hub/token"
-```
-
-hub 侧:JWKS 验签(`token_use=id` + audience)+ `authorizeSubForTenant(sub, tenant_id)` 查 `owner_id`/`authorized_users`。通过则返 `{"token":"<前端短token>","expires_in":300}`。短 token claim=`{role:"frontend", sub:<验证过>, tenant, access, exp:+300s}`,HMAC 签(密钥多副本经 Secrets Manager 共享)。403 表示该 sub 无权访问该租户。
-
-**`POST {HUB}/channel-token`** — microVM 出站侧(claw-channel)证明自己是某租户:Cognito machine-user access token(`username` claim = 租户,不可伪造),换等价 `{role:"channel"}` 短 token。对接方通常无需直接调用(由 VM 内 channel 自动完成)。
-
-**`POST {BASE}/chat/sign`** — 控制面侧为一条 C 端消息信封签名,投给 per-VM webhook 的备用旁路(RBAC viewer+,函数内做 owner/admin 门控)。需 `Authorization: Bearer <Cognito id_token>` + body `{tenant_id, text}`(`text` ≤8000 字符)。返 `{path:"/chat/{tenant_id}/inbound", body:"<签名信封>", headers:{x-claw-signature, x-claw-random, x-claw-timestamp}}`,由 HMAC 派生的 `channel_secret` 签。租户 channel 密钥未就绪(VM 还在启动)返 `409`。日常实时对话走 §5 的 WebSocket,不需要直接调本端点。
-
-**文件**:`POST {HUB}/files/upload-url`(MIME 白名单 + size)返 S3 预签 PUT;`GET {HUB}/files/download-url?fileKey=` 带租户段守卫(fileKey 第二段必须 == 调用者租户,防跨租户 IDOR)返预签 GET。
-
----
-
-## 5. WebSocket 实时对话
-
-1. 前端按 §4 拿到前端短 token。
-2. 建连:`wss {HUB}/hub/ws?token=<前端短token>`(经 CloudFront `/hub/*` → ALB → hub)。hub 校验 token、盖 `_tenant/_sub`、注册到 frontends 表。连接后 hub 每 25s 发协议级 PING keepalive(扛 agent 冷启动期间空闲断连)。
-3. 发消息(帧 shape):
-
-```json
-{
-  "operationType": "msg_create",
-  "parts": [{ "kind": "TEXT", "text": "你好" }],
-  "threadId": "<会话id,正则 ^[A-Za-z0-9._:-]+$ 长度≤80>",
-  "clientMessageId": "<前端关联id>"
-}
-```
-
-hub 把 `senderId` 设为**服务端验证过的 Cognito sub**(不信客户端自报,防冒充),投递给该租户的 channel → microVM 内 openclaw 推理。4. 收回复:`type:"reply_delta"` 或 `operationType:"msg_update"` 流式增量(前端按 `clientMessageId` 替换气泡)。hub 只投给 `_tenant` 匹配的该 sub 的所有 tab(跨租户隔离)。5. 历史:发 `type:"history_request"` → 收 `type:"history_reply"`(messages 数组)。
-
-**跨租户隔离(结构性,不信客户端自报)**:① 前端短 token 绑单一 tenant ② channel 用 Cognito access token 的 username claim 证明租户身份 ③ 撮合仅在 `fws._tenant === frame._tenant` 时发生 + senderId 用服务端验过的 sub + 授权查 `owner_id`/`authorized_users`。
+文件上传/下载需要由客户平台后端单独设计租户授权和 Amazon S3 预签流程。预签 URL
+属于 bearer capability,有效期还受签名凭据生命周期限制;不得复用已删除 hub 接口。
+AWS 依据:[Amazon S3 预签 URL](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html)。
 
 ---
 
-## 6. 快速上手:端到端跑通(客户视角)
+## 5. 快速上手:端到端跑通(客户视角)
 
 ```bash
 export KEY="<你的 x-api-key>"
+export TOKEN="<operator 或 admin Cognito id_token>"
 export BASE="https://<api-id>.execute-api.<region>.amazonaws.com/v1"
 
 # 1) 确认环境
 curl -s -H "x-api-key: $KEY" "$BASE/system/info" | python3 -m json.tool
 
 # 2) 建租户(带幂等键)
-curl -s -X POST -H "x-api-key: $KEY" -H "content-type: application/json" \
+curl -s -X POST -H "x-api-key: $KEY" -H "Authorization: Bearer $TOKEN" \
+  -H "content-type: application/json" \
   -d '{"name":"quickstart","client_token":"qs-0001"}' "$BASE/tenants"
-# → 默认同步: 201 {"id":"quickstart-xxxx","status":"creating"}
-# → 开削峰队列: 202 {"id":"quickstart-xxxx","status":"queued"}
+# → 带 client_token:id 固定为 t-<16hex>
+# → 默认同步:201 {"id":"t-...","status":"creating"}
+# → 开削峰队列:202 {"id":"t-...","status":"queued"}
 
 # 3) 轮询到 running
-curl -s -H "x-api-key: $KEY" "$BASE/tenants/quickstart-xxxx"
+curl -s -H "x-api-key: $KEY" "$BASE/tenants/t-<16hex>"
 # → 直到 {"status":"running","vm_health":"up","app_health":"up"}
 
-# 4) 前端换 hub token(浏览器/前端,需 Cognito 登录拿 id_token)
-#    POST {HUB}/hub/token  Bearer <id_token> + {"tenant_id":"quickstart-xxxx"}
-#    → {"token":"<前端短token>","expires_in":300}
-
-# 5) 建 wss 发消息收回复
-#    wss {HUB}/hub/ws?token=<前端短token>
-#    发 {operationType:msg_create, parts:[{kind:TEXT,text:"..."}], threadId, clientMessageId}
-#    收 reply_delta 流式回复
+# 4) 聊天由客户平台后端提供 /gw/ws;浏览器只带平台自己的会话 token
+#    wss://<platform>/gw/ws?token=<platform-session-token>
 ```
 
-控制面步骤(1–3)纯 `curl` 可跑;数据面(4–5)需 Cognito 登录态 + WS 客户端(参考 chat UI)。端到端首回复实测约 27s(含 agent 冷启动)。
+步骤 1–3 是控制面。默认配置下,写请求还需 operator/admin Bearer token;仅当部署方明确把 API-key-only 角色放宽到 operator/admin 时才可省略。步骤 4 的平台后端接入见第 13 章。
 
 ---
 
-## 7. 附:端点速查表
+## 6. 附:端点速查表
 
 | 端点                                                   | 方法           | 认证 / RBAC                  | 用途                                                                                             |
 | ------------------------------------------------------ | -------------- | ---------------------------- | ------------------------------------------------------------------------------------------------ |
@@ -433,11 +416,10 @@ curl -s -H "x-api-key: $KEY" "$BASE/tenants/quickstart-xxxx"
 | `/skills/{name}`                                       | GET/PUT/DELETE | viewer / operator            | 技能内容 CRUD                                                                                    |
 | `/templates` `/templates/{name}`                       | GET/PUT/DELETE | api-key(独立 Lambda,无 RBAC) | config 模板 CRUD(`default` 写保护)                                                               |
 | `/agentcore/status` `/agentcore/tools`                 | GET            | viewer                       | AgentCore 网关状态/工具(config-gated)                                                            |
-| `/tenantmatch`                                         | GET            | 无(登录前)                   | 平台→IdP 路由查询                                                                                |
+| `/tenantmatch`                                         | GET            | api-key;无 RBAC              | documented-but-unreachable;网关尚未接线                                                         |
 | `/external/authz`                                      | POST           | HMAC                         | 外部授权推送(config-gated,默认未启用)                                                            |
-| `/chat/sign`                                           | POST           | Bearer · viewer + owner      | C 端消息签名(备用旁路)                                                                           |
-| `{HUB}/hub/token` `/channel-token`                     | POST           | Bearer / Cognito access      | 数据面令牌兑换                                                                                   |
-| `{HUB}/hub/ws`                                         | WSS            | 前端短 token                 | 实时对话                                                                                         |
-| `{HUB}/files/upload-url` `/download-url`               | POST/GET       | hub token                    | 文件预签(租户段守卫)                                                                             |
+| `/hosts/{id}/pull-image` `/promote-canary`             | POST           | operator / admin             | 镜像拉取与 canary 提升                                                                           |
+| `/hosts/{id}/image-slots` `/pull-image-progress`       | GET            | viewer                       | 宿主槽位与拉取进度                                                                               |
+| `/hosts/{id}/reclaim-images`                           | POST           | admin                        | 回收无人引用的镜像版本                                                                           |
 
-> 验证来源:控制面路由与 RBAC 分级来自 `deploy/lambda/api/handler.py` 路由表(`routes` 字典)+ `_VIEWER_OK`/`_RBAC_SKIP`/`_rbac_check` 定义;端点行为经真机 curl 部署环境验证(证据 `internal-docs/00-knowledge-base/evidence/`);hub/wss 参数来自 `the hub design doc` + `the hub server`。分页页大小语义、AgentCore 工具清单以实际部署配置为准。
+> 验证来源:控制面路由与 RBAC 分级来自 `deploy/lambda/api/handler.py`、`deploy/lambda/api/core/auth.py` 与 `deploy/stacks/lambdas.py`;字段契约来自 `openapi.yaml`;真机基线来自 `tests/api-regress/`。数据面参数来自 `engineering/backend/lib/gw-ws.mjs`,不再引用已删除的 hub。

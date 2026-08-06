@@ -111,7 +111,7 @@ Self-managed Prometheus + Grafana by default (opt-in `metrics.use_managed: true`
 **🚀 One-command CDK deploy**
 `./setup.sh <region> <profile>` brings up the full stack in 5 minutes — self-managed VPC (/20, 3 AZ, 3 NAT GW), host ASG, OpenResty edge ASG, ALB (idle 3600 s), ElastiCache Multi-AZ Redis, API Lambda, DynamoDB tables (tenant records + short-TTL secret store), a customer-managed KMS key, and AgentCore, all wired and ready. Cloud rootfs build means **no local Linux required** (works from macOS / Windows).
 
-> 📘 **需要在专用 Linux 部署机(Amazon Linux 2023)上做可复现全量部署** —— 权限(IAM instance role)、网络(VPC/子网/SG)、`config.yml`、工具链(docker/node/cdk/python)前置条件与逐步命令 + 真实踩坑清单,见 **[DEPLOYMENT.md](./DEPLOYMENT.md)**。本地跑 CDK Docker bundling 受阻(公司网/磁盘)时走这条路。
+> 📘 **需要在专用 Linux 部署机(Amazon Linux 2023)上做可复现全量部署** —— 权限(IAM instance role)、网络(VPC/子网/SG)、`config.yml`、工具链(docker/node/cdk/python)前置条件与逐步命令 + 真实踩坑清单,见 **[DEPLOYMENT.md](engineering/runbooks/DEPLOYMENT.md)**。本地跑 CDK Docker bundling 受阻(公司网/磁盘)时走这条路。
 
 </td>
 </tr>

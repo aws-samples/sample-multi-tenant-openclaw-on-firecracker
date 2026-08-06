@@ -10,6 +10,7 @@ from pathlib import Path
 import aws_cdk as cdk
 from stack import OpenClawOrchestratorStack
 from stacks.image import OpenClawImageStack
+from stacks.host_image import OpenClawHostImageStack
 
 app = cdk.App()
 region = app.node.try_get_context("region") or "us-east-1"
@@ -30,4 +31,12 @@ image_stack = OpenClawImageStack(
     app, "OpenClawImage", cfg=_cfg, gsuffix=_gsuffix, env=env
 )
 image_stack.add_dependency(orchestrator)
+
+# Host golden AMI (#389 v2 block 2). Own stack for the same reason as OpenClawImage: a
+# failed bake must not roll back the control plane. NO dependency in either direction —
+# it needs nothing from the orchestrator (the AWSTOE component carries its scripts
+# inline), and the orchestrator must not wait on it, because the LaunchTemplate reads the
+# AMI id through resolve:ssm at launch rather than at deploy. Deploy order is therefore
+# free: bake first and the ASG picks the image up on its next scale-out.
+OpenClawHostImageStack(app, "OpenClawHostImage", cfg=_cfg, gsuffix=_gsuffix, env=env)
 app.synth()

@@ -67,4 +67,4 @@ cdk deploy --context region=ap-northeast-1 \
 
 **部署后一步(在本平台 ClawPool 侧做)**:把 `EntryIssuer` + `FederationClientId` 注册为 ClawPool Cognito 的 upstream OIDC provider(provider-name = `demo-marketplace`),挂 Pre-Token-Gen trigger(见档A #97)。之后二手电商用户经此 entry pool 联邦进 ClawPool,id_token 带 `custom:tenant_user_id/platform_id`,broker 代开租户,进 AI pro chat。此联邦链路已在  真机跑通(证据 #97 evidence)。
 
-凭据(x-api-key / client secret)走 Secrets Manager + context,不硬编码(the ops guide 铁律)。
+凭据(x-api-key / client secret)走 Secrets Manager + context,不硬编码(CLAUDE.md 铁律)。

@@ -29,7 +29,7 @@ This solution lets you host thousands of mutually isolated AI agents on AWS in S
 - **Isolation foundation**: Firecracker microVMs on the host's native KVM (`r8g.metal-24xl`, Graviton4, no nested virtualization). Each tenant gets a dedicated Linux kernel + an OverlayFS rootfs (read-only base + per-VM sparse writable layer) + KMS-encrypted EBS.
 - **Network isolation**: each VM owns a dedicated `/30` point-to-point TAP link, all within the `SUBNET_PREFIX/16` supernet; host iptables applies an east-west `FORWARD DROP` to the entire `/16` (100% cross-tenant packet loss, measured); each VM additionally inserts three DROP rules toward IMDS, the tenant supernet, and the host management ports.
 - **Security boundary (L1–L5)**: L1 content layer, Bedrock Guardrails in both directions; L2 tool layer, `before_tool_call` ACL default-deny; L3 identity layer, OpenClaw native Ed25519 asymmetric device authentication + control-plane RBAC + `owner_id` gating; L4 network layer, IMDS blocking + DNS Firewall + NAT egress allowlist; L5 credential layer, zero long-term credentials in the guest + read-only golden image disk + in-guest auditd/Wazuh runtime monitoring.
-- **Data plane**: Browser ─wss `/gw/ws`─▶ platform backend (verifies the platform JWT) ─ws─▶ ALB ─▶ OpenResty edge ASG (ElastiCache Redis routing table lookup + strips the `/ws/{tid}` prefix) ─▶ microVM gateway:18789 (Ed25519 device handshake). Opt-in (`edge`/`redis` gates).
+- **Data plane**: Browser ─wss `/gw/ws`─▶ platform backend (verifies the platform JWT) ─ws─▶ ALB ─▶ OpenResty edge ASG (ElastiCache route store; Valkey default, Redis compatible) ─▶ microVM gateway:18789 (Ed25519 device handshake). Opt-in (`edge`/`redis` gates).
 - **Scalability figures**: microVM boot 1.74s (p50, measured); a single host carries 187 fully healthy nodes (disk bottleneck, measured) / 380 tenants at steady state (estimated); per-VM RSS ~609 MB (measured); large-scale tenant creation goes through SQS buffering to get around the SSM per-instance concurrency ceiling.
 
 ---
@@ -124,7 +124,7 @@ Host an isolated AI agent instance for each of thousands of end users or tenants
 
 **Multi-tenant scenarios with compliance requirements on isolation strength**
 
-In industries such as finance that have strong requirements on tenant isolation and data residue, use virtual machine-level isolation to meet the compliance expectation that "privilege escalation within a single tenant does not spill over."
+In industries such as finance and exchanges that have strong requirements on tenant isolation and data residue, use virtual machine-level isolation to meet the compliance expectation that "privilege escalation within a single tenant does not spill over."
 
 **Self-service provisioning of AI assistants for end users**
 

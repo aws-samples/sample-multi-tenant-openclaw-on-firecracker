@@ -126,36 +126,81 @@ _ipv6fwd=$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || echo n/a)
 _ctmax=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo n/a)
 log "step1b done: ksm=$(cat /sys/kernel/mm/ksm/run 2>/dev/null||echo n/a) swaps=$(grep -c partition /proc/swaps 2>/dev/null||echo 0) smt=$(cat /sys/devices/system/cpu/smt/control 2>/dev/null||echo n/a) ipv6fwd=${_ipv6fwd} conntrack_max=${_ctmax}"
 
-# Step 2: Install tools + Firecracker
-log "step2: installing tools + firecracker"
-apt-get -o DPkg::Lock::Timeout=60 update -qq
-apt-get -o DPkg::Lock::Timeout=60 install -y -qq curl jq unzip pigz python3-redis > /dev/null 2>&1
+# Step 2: components (provision stage) + per-host identity
+# #389 v2 C2: every component install and every external download moved to
+# provision-host.sh, which EC2 Image Builder bakes into the host AMI. This file is
+# the configure stage: it runs on EVERY boot and only does work that needs per-host
+# identity or per-deployment config. The boundary is "does it reach the internet",
+# not the old step numbering — network installs are the unreliable part (wrong-arch
+# awscli, firecracker tgz 404, aarch64 vmlinux 404 have each ABANDONed a metal).
+#
+# provision-host.sh is inlined here rather than fetched, so its bytes are part of
+# this file's sha256 — which is the LaunchTemplate-bound digest (#389 DoD 2/4).
+# A provision change therefore changes the LT, exactly like an init change does.
+log "step2: components + host identity"
+mkdir -p /etc/openclaw /opt/openclaw
+{{PROVISION_SCRIPT}}
+# Golden AMI already ran it: skip. Plain Ubuntu AMI: run it now, so the non-golden
+# path keeps working byte-for-byte as before. Idempotent either way.
+if [ -f /etc/openclaw/.ami-provisioned ]; then
+  log "step2: AMI pre-provisioned ($(tr '\n' ' ' < /etc/openclaw/.ami-provisioned)) — skipping component install"
+  _OC_AMI_PROVISIONED=1
+else
+  log "step2: no provision marker — running provision-host.sh inline (plain-AMI path)"
+  _OC_AMI_PROVISIONED=0
+  bash /opt/openclaw/provision-host.sh
+fi
 
 # 1.5.0: per-host ed25519 key for host→guest SSH (private stays here, public
-# injected into each VM by launch-vm.sh). Guarded for set -e re-runs.
-mkdir -p /etc/openclaw
+# injected into each VM by launch-vm.sh).
+#
+# #389 v2 G2, configure side of the two-way defence. An AMI is shared by the whole
+# fleet, so a key baked into one would let ANY host's private key SSH into ANY
+# tenant's microVM on ANY host. provision never creates the key and its bake mode
+# refuses to snapshot one; this side proves the key on disk belongs to THIS instance.
+#
+# The .instance marker records who generated it. Rules, and why they are safe:
+#   marker matches this instance   -> adopt (normal reboot / re-run)
+#   marker names another instance  -> inherited, unambiguously. Rotate.
+#   marker absent + AMI-provisioned-> the key can only have come from the image
+#                                     (a fresh golden boot has run nothing else).
+#                                     Rotate, loudly.
+#   marker absent + plain AMI      -> pre-#389v2 host: the key was necessarily made
+#                                     by an earlier configure run on this same
+#                                     instance, so adopt and backfill the marker.
+#                                     Rotating here would break host→guest SSH for
+#                                     microVMs already holding the public half.
+# Rotation is the fail-closed action, not ABANDON: it removes the hazard instead of
+# bricking the host, and a host that reaches this line has no tenant VMs yet.
+_OC_KEY_INSTANCE_FILE=/etc/openclaw/host_vm_key.instance
+if [ -f /etc/openclaw/host_vm_key ]; then
+  _oc_key_owner="$(cat "${_OC_KEY_INSTANCE_FILE}" 2>/dev/null || echo "")"
+  if [ "${_oc_key_owner}" = "${INSTANCE_ID}" ]; then
+    log "host_vm_key belongs to this instance — keeping"
+  elif [ -z "${_oc_key_owner}" ] && [ "${_OC_AMI_PROVISIONED}" = "0" ]; then
+    log "host_vm_key predates the provenance marker on a plain-AMI host — adopting, backfilling marker"
+    printf '%s\n' "${INSTANCE_ID}" > "${_OC_KEY_INSTANCE_FILE}"
+  else
+    log "SECURITY: host_vm_key was inherited (owner='${_oc_key_owner}' this='${INSTANCE_ID}' ami_provisioned=${_OC_AMI_PROVISIONED}) — rotating so no key is shared across hosts"
+    rm -f /etc/openclaw/host_vm_key /etc/openclaw/host_vm_key.pub "${_OC_KEY_INSTANCE_FILE}"
+  fi
+fi
 if [ ! -f /etc/openclaw/host_vm_key ]; then
   ssh-keygen -t ed25519 -N "" -C "openclaw-host-$(hostname)" -f /etc/openclaw/host_vm_key
   chmod 600 /etc/openclaw/host_vm_key
+  printf '%s\n' "${INSTANCE_ID}" > "${_OC_KEY_INSTANCE_FILE}"
+  log "host_vm_key generated for ${INSTANCE_ID}"
 fi
+chmod 600 /etc/openclaw/host_vm_key
+chmod 644 "${_OC_KEY_INSTANCE_FILE}"
+
 ARCH="$(uname -m)"
-# awscli zip 必须匹配 host 架构。arm64 metal(r8g/Graviton)是 aarch64;装错架构
-# (x86_64)→ /usr/local/bin/aws "Exec format error" → _stack_output 里每次 aws 调用
-# 失败 → 20×15s sleep 循环 ×2 = 10min > 600s lifecycle timeout → Heartbeat Timeout
-# → ASG ABANDON 反复替换 metal,host 永远起不来。按 uname -m 选对 zip。
-if ! command -v aws &>/dev/null; then
-  AWSCLI_ARCH="x86_64"; [ "${ARCH}" = "aarch64" ] && AWSCLI_ARCH="aarch64"
-  curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-${AWSCLI_ARCH}.zip" -o /tmp/awscliv2.zip
-  cd /tmp && unzip -qo awscliv2.zip && ./aws/install &>/dev/null; cd -
-fi
-FC_URL="https://github.com/firecracker-microvm/firecracker/releases"
-# Pin Firecracker version — `latest` may not have CI guest-kernel yet, 404s step3b (#74)
+# Pin Firecracker version — `latest` may not have CI guest-kernel yet, 404s step3b (#74).
+# Kept here (not only in provision) because step3b derives the guest-kernel path from it.
 FC_VER="${FC_VERSION:-v1.15.1}"
-curl -sL ${FC_URL}/download/${FC_VER}/firecracker-${FC_VER}-${ARCH}.tgz | tar -xz
-mv release-${FC_VER}-${ARCH}/firecracker-${FC_VER}-${ARCH} /usr/local/bin/firecracker
-mv release-${FC_VER}-${ARCH}/jailer-${FC_VER}-${ARCH} /usr/local/bin/jailer
-rm -rf release-${FC_VER}-${ARCH}
-log "firecracker ${FC_VER} installed"
+command -v aws >/dev/null 2>&1 || { echo "[oc:init] FATAL: awscli absent after provision" > /dev/console; exit 1; }
+[ -x /usr/local/bin/firecracker ] || { echo "[oc:init] FATAL: firecracker absent after provision" > /dev/console; exit 1; }
+log "components ready: $(aws --version 2>&1 | head -1) / $(/usr/local/bin/firecracker --version 2>/dev/null | head -1)"
 
 # Resolve table names from stack outputs
 HOSTS_TABLE=$(_stack_output HostsTable)
@@ -323,12 +368,11 @@ log "host agent started on :8899 (health + prom metrics)"
 # AMP_REMOTE_WRITE_URL is unset (metrics.enabled: false in config.yml).
 AMP_REMOTE_WRITE_URL="{{AMP_REMOTE_WRITE_URL}}"
 if [ -n "${AMP_REMOTE_WRITE_URL}" ] && [ "${AMP_REMOTE_WRITE_URL}" != "none" ]; then
-  log "step2b: installing aws-otel-collector"
-  ARCH_DEB="amd64"; [ "$(uname -m)" = "aarch64" ] && ARCH_DEB="arm64"
-  curl -fsSL "https://aws-otel-collector.s3.amazonaws.com/ubuntu/${ARCH_DEB}/latest/aws-otel-collector.deb" \
-    -o /tmp/aws-otel-collector.deb
-  dpkg -i /tmp/aws-otel-collector.deb >/dev/null 2>&1 || apt-get -f install -y -qq
-  rm -f /tmp/aws-otel-collector.deb
+  log "step2b: configuring aws-otel-collector"
+  # #389 v2: the .deb install moved to provision-host.sh (external download). Only the
+  # per-deployment part stays here — the config carries the AMP remote-write URL, which
+  # differs per deployment and must never be baked into a shared AMI.
+  dpkg -s aws-otel-collector >/dev/null 2>&1 || { echo "[oc:init] FATAL: aws-otel-collector absent after provision" > /dev/console; exit 1; }
   # Pull the templated config from S3. #229: 优先 deployment/observability/adot/
   # (S3 asset 化,可下发新版无需重烤镜像);拉失败回退老前缀 deployment/scripts/
   # 保兼容;两个都拉不到 fail-loud(镜像没烤兜底,静默继续 = ADOT 起不来还蒙在鼓里)。
@@ -366,13 +410,44 @@ if [ -z "$DATA_DEV" ]; then log "ERROR: data volume not found"; exit 1; fi
 log "step3: mounting data volume ${DATA_DEV}"
 if ! blkid ${DATA_DEV} | grep -q ext4; then mkfs.ext4 -q ${DATA_DEV}; fi
 mkdir -p /data
-mount ${DATA_DEV} /data
+# #389 v2 idempotency. Each of the three lines below used to assume a first-ever boot:
+#   mount        -> exit 32 "already mounted" on a re-run, and `set -e` turns that into
+#                   ABANDON, so a host that merely re-ran configure got replaced.
+#   >> /etc/fstab-> appended a duplicate UUID line on every run; enough reboots and the
+#                   file is unreadable, and a stale duplicate can shadow the real device.
+#   rm -rf       -> if /home/ubuntu/firecracker-assets were ever a real directory holding
+#                   downloaded images instead of the symlink, this silently destroys them.
+# Guard by observed state, not by assuming which boot this is.
+if mountpoint -q /data; then
+  log "/data already mounted from $(findmnt -no SOURCE /data)"
+else
+  mount ${DATA_DEV} /data
+fi
 DATA_UUID=$(blkid -s UUID -o value ${DATA_DEV})
-echo "UUID=${DATA_UUID} /data ext4 defaults,nofail 0 2" >> /etc/fstab
+if [ -z "${DATA_UUID}" ]; then
+  echo "[oc:init] FATAL: no filesystem UUID on ${DATA_DEV}; refusing to write a blank fstab entry" > /dev/console; exit 1
+fi
+# Match on the UUID only: an existing entry with different options is still an entry for
+# this device, and rewriting it on every boot would fight an operator's deliberate change.
+if grep -q "UUID=${DATA_UUID}[[:space:]]" /etc/fstab; then
+  log "fstab already has an entry for ${DATA_UUID}"
+else
+  echo "UUID=${DATA_UUID} /data ext4 defaults,nofail 0 2" >> /etc/fstab
+  log "fstab entry added for ${DATA_UUID}"
+fi
 mkdir -p /data/firecracker-assets
 chown ubuntu:ubuntu /data /data/firecracker-assets
-rm -rf /home/ubuntu/firecracker-assets
-ln -sfn /data/firecracker-assets /home/ubuntu/firecracker-assets
+# Only replace it when it is not already the symlink we want. Never rm -rf a real
+# directory: if one exists here it holds multi-GB rootfs images someone downloaded.
+if [ "$(readlink -f /home/ubuntu/firecracker-assets 2>/dev/null || echo "")" != "/data/firecracker-assets" ]; then
+  if [ -d /home/ubuntu/firecracker-assets ] && [ ! -L /home/ubuntu/firecracker-assets ]; then
+    log "WARN: /home/ubuntu/firecracker-assets is a real directory; moving it aside instead of deleting"
+    mv -f /home/ubuntu/firecracker-assets "/home/ubuntu/firecracker-assets.pre-oc.$$"
+  else
+    rm -f /home/ubuntu/firecracker-assets
+  fi
+  ln -sfn /data/firecracker-assets /home/ubuntu/firecracker-assets
+fi
 
 # Step 3a2: Fluent Bit host log shipper (#245). Runs after /data is mounted
 # so the vm pipeline can tail /data/firecracker-vms/*/fc.log. Shared installer
@@ -469,7 +544,17 @@ FC_MAJOR=$(echo ${FC_VER} | grep -oP "v\d+\.\d+")
 # aarch64 该后缀的对象不存在(实测 404 → curl -f exit 22 → init ABANDON,metal 永远起不来),
 # arm64 用标准 vmlinux-5.10.245(实测 firecracker-ci/<ver>/aarch64/ 下真实存在)。
 if [ "${ARCH}" = "aarch64" ]; then VMLINUX_NAME="vmlinux-5.10.245"; else VMLINUX_NAME="vmlinux-5.10.245-no-acpi"; fi
-curl -fsSL -o ${ASSETS}/vmlinux "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${FC_MAJOR}/${ARCH}/${VMLINUX_NAME}"
+# #389 v2: prefer the copy provision baked into the AMI. /data is reformatted per host so
+# the kernel cannot be staged there at bake time; it lives on the root volume and is copied
+# across here. This is the download the aarch64 404 killed, so on a golden AMI it is the
+# single most valuable fetch to have already done.
+if [ -s /opt/openclaw/baked/vmlinux ]; then
+  install -o ubuntu -g ubuntu -m 0644 /opt/openclaw/baked/vmlinux ${ASSETS}/vmlinux
+  log "guest kernel from baked AMI copy ($(stat -c %s ${ASSETS}/vmlinux) bytes)"
+else
+  curl -fsSL -o ${ASSETS}/vmlinux "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${FC_MAJOR}/${ARCH}/${VMLINUX_NAME}"
+  log "guest kernel downloaded (${VMLINUX_NAME}) — AMI had no baked copy"
+fi
 MANIFEST_URL="s3://${ASSETS_BUCKET}/{{ROOTFS_PREFIX}}/manifest.json"
 for i in $(seq 1 20); do
   aws s3 cp ${MANIFEST_URL} ${ASSETS}/manifest.json --region ${REGION} --no-progress 2>/dev/null && break

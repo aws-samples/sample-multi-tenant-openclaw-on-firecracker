@@ -230,7 +230,7 @@ def build_compute(self, ctx):
         # naive path (features=[{RUNTIME_MONITORING, ENABLED}]) also flips
         # EC2_AGENT_MANAGEMENT to ENABLED at the account level, and that
         # associates SSM to auto-install the GuardDuty agent on EVERY EC2
-        # in the account (evidence: engineering/00-knowledge-base/evidence/
+        # in the account (evidence: engineering/evidence/
         # metal-experiments/8layer-evidence.md:163-181 — AWS "how runtime
         # monitoring works ec2" doc). That is not safe for a shared account
         # hosting other teams' hosts.

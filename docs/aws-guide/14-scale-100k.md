@@ -2,19 +2,20 @@
 
 > 本章按 **测试 → 上线 → 生产** 三个阶段,把跑到 10 万 microVM 规模需要守的硬约束一次说清。**不重复 13 章**([数据面两级路由](13-data-plane-redesign.md))的架构原理,**也不重复 11 章**([组件运维手册](11-ops-maintenance.md))的日常告警指标。这里只讲三个问题:压测怎么打才算真、灰度上线怎么切、生产稳态守哪些红线。
 >
-> 规模基线来源:`internal-docs/00-knowledge-base/the data-plane design/the requirements doc.md § 2`(10 万 microVM · ~300 host · 30 万并发 WS)。
+> 规模基线来源:`engineering/00-knowledge-base/SPEC/11-ENGINE-TRANSFORM/01-REQUIREMENTS.md § 2`(10 万 microVM · ~300 host · 30 万并发 WS)。
 
 ---
 
-## 14.1 测试阶段:满负载 380/台 + 反向用例
+## 14.1 测试阶段:容量档位 + 反向用例
 
-**硬要求**:真机测试必须打**满负载 380/台**,且用例集合**必含反向场景**,不允许只跑 happy path。
+380/台是按 2 GB/VM 得出的目标容量档,不是仓库默认配置或已测硬上限。仓库默认 `vm.default_mem_mb=4096`,一手实测为 187 个全健康节点且受磁盘瓶颈约束。测试必须先声明 VM 内存、数据盘和 host 盘/IOPS,再选择档位;任何档位都必须包含反向场景。
 
 ### 满负载压测
 
-- **单机上限**:`r8g.metal-24xl` 每台 380 microVM(2 GB/VM × 380 = 760 GB,匹配 768 GB 内存)。测试计划见 `internal-docs/00-knowledge-base/the data-plane design/the test plan.md`。
+- **默认档**:4096 MB/VM,以 187 节点实测作为现有证据,不能外推为 380。
+- **380 目标档**:仅在显式设为 2048 MB/VM、确认磁盘/IOPS/balloon 与恢复余量后执行;结果仍标容量目标验证,不是生产硬上限。
 - **不允许绕开的四类测试**(缺一挂 backlog,不许 close issue):
-  1. **稳态**:380 microVM 全 running,SSE 保持 30 min 无掉线。
+  1. **稳态**:目标档全部 microVM 为 running,WebSocket 保持 30 min 无掉线。
   2. **突发建租户**:一批 300 create/s 打进 SQS dispatch,验证削峰到 host 单实例 SSM 并发 ≤ 阈值( 实测 40 并发就撞 TimedOut,`memory: loadtest-380-ssm-concurrency-bottleneck`)。
   3. **单 AZ 挂**:kill 一个 AZ 的 edge + host 混合负载,余两 AZ 承接;验证 `az_failover` 迁租户能力(`config.yml:health_check.az_failover`)。
   4. **conntrack 表满**:边缘 + host 同时打到 `nf_conntrack_max=1048576` 附近,验证不丢包。edge 侧 `install-edge.sh:131`,host 侧 `init-host.sh:85-99`。
@@ -23,28 +24,28 @@
 
 铁律 #11 明确:安全/隔离/删除类改动测试强度按爆炸半径上调。至少覆盖:
 
-- **跨租户越权**:A 拿 B 的 tenant_id + 自己的 gateway_token → gateway 401(EncryptionContext 不匹配,`kms:Decrypt` 拒)。
-- **过期 token**:密文表 TTL 900s 过期后 `GET /tenants/{id}/token` 返 410,再拉不到明文。
+- **跨租户越权**:A 请求 B 的凭据密文或用错误 `tenant_id` encryption context 解密 → 平台后端本地 KMS `Decrypt` 失败,不得建立到 gateway 的连接。
+- **凭据持久化**:`openclaw-tenant-secrets` 已显式禁用 TTL。扩容、rebuild 和 recover 必须复用原 token/device 密文;凭据读取走 owner/admin 门控的单租户详情或 `/credentials` 契约。
 - **Redis brownout**:kill primary,15-30s failover 期 edge fail-static(L2 stale 60s)兜住 5xx。真机演练命令:`aws elasticache test-failover --replication-group-id openclaw-routes --node-group-id 0001`。
 - **端口位图并发**:两个 host-agent worker 同时 alloc,期望不撞端口(`route_ops.alloc_and_dnat_atomic` 三步原子)。
 - **descriptor 三方对账**:构造 iptables DNAT 有、DDB descriptor 无的漂移场景,`_probe_all` 应告警并自愈。
 
 ### 证据留痕
 
-所有测试结果必须落 `internal-docs/00-knowledge-base/evidence/`——没留痕 = 没测过(the ops guide 测试纪律)。
+所有测试结果必须落 `engineering/evidence/`——没留痕 = 没测过(CLAUDE.md 测试纪律)。
 
 ---
 
 ## 14.2 上线阶段:灰度滚动 + 分步部署
 
-**核心纪律**:不要 `min_capacity=1` 让 host 在镜像就绪前起。**正解顺序:先 min=0 → 烤镜像 → 再 scale 到目标容量**。
+**核心纪律**(memory `goal-restructure-and-deploy-uswest2-2026-06-30`):不要 `min_capacity=1` 让 host 在镜像就绪前起。**正解顺序:先 min=0 → 烤镜像 → 再 scale 到目标容量**。
 
 ### 冷启部署顺序(fresh region)
 
-1. **VPC + 网络先起**:`./setup.sh <region> <profile>` 走 `deploy/stack.py:_build_vpc(mode=self_managed)`(自建 /20 + 3 AZ + 3 NAT GW)。这一步栈成功但 host_asg **min=0**、edge_asg **min=0**。
+1. **VPC + 网络先起**:`./setup.sh <region> <profile>` 由 `deploy/stacks/network_vpc.py` 构建 self-managed VPC；CIDR、AZ 数和 NAT 数量以 `config.yml` 为准，不把示例值当硬编码。
 2. **烤镜像**:`build-rootfs.sh --arch arm64` 或 stack 内 CodeBuild 自动烤(`image.build_in_stack=true`)。等 S3 里有对应 rootfs.
 3. **拉 host 到最小容量**:改 `config.yml:asg.min_capacity=2` 再 `setup.sh` 一次。host 拉起时 rootfs 已在 S3,不会 Heartbeat Timeout 反复替换(踩过:`memory: uswest2-deploy-deadlock-and-fixes`)。
-4. **拉 edge 到 min=3**:`config.yml:edge.enabled=true` + `edge.min_capacity=3`,`setup.sh`。edge userdata 会轮询 `/healthz` 到 200 才 CONTINUE(`install-edge.sh:170-183` warmup gate),ASG lifecycle 只在真能路由时才放行。
+4. **拉 edge 到 min=3**:`config.yml:edge.enabled=true` + `edge.min_capacity=3`,`setup.sh`。edge userdata 轮询 `/healthz` 到 200 才成功退出；edge 无 lifecycle hook,ELB health check + grace period 控制替换。
 
 ### 滚动升级(改镜像 / 改 stack.py)
 
@@ -57,7 +58,7 @@
 **改 stack.py**(改 IaC 结构、DDB schema、IAM):
 
 - 直接改 `stack.py` → `setup.sh` 走 CFN update。
-- **不可逆改动**(删 DDB 表 / 改 RemovalPolicy · 动安全红线 SG/IAM/凭据 · 动 Guardrail)必走 the shared-files protocol 串行 + 人工评审门。
+- **不可逆改动**(删 DDB 表 / 改 RemovalPolicy · 动安全红线 SG/IAM/凭据 · 动 Guardrail)必走 SHARED-FILES-PROTOCOL 串行 + 人工评审门。
 - DDB 表 `RETAIN` 是硬默认(尤其 tenants / audit / tenant-secrets);删表前必快照(铁律 #4)。
 
 ### 数据面切换状态(旧 hub-WS → 新两级路由,已完成)
@@ -70,9 +71,9 @@
 
 生产 = 10 万 microVM 稳态。以下六条红线**破一条即事故**:
 
-### R1 · conntrack 表 · 单机 400 microVM 硬门
+### R1 · conntrack 表容量
 
-- **值**:`nf_conntrack_max = 1048576`(edge `install-edge.sh:131` + host `init-host.sh:85-99` 都设)。
+- **值**:`nf_conntrack_max = 1048576`(edge 与 host 均配置)。这是网络容量参数,不是“支持 400 VM”的调度硬门。
 - **背景**:Ubuntu 22.04 aarch64 内核默认 262144,单机 380 microVM × 每 VM 5-10 stateful conn + 跨 host DNAT + LLM 出站 = 稳态几万到峰值 10 万级,靠默认会撞。
 - **切换点(未来密度)**:单机 DNAT 规则 >1000 时(未来 microVM 密度提升),`iptables PREROUTING` 顺序匹配变热路径瓶颈,**迁 `nftables sets`** 常数时间查找。当前 400 条内 O(n) 走完 μs 级,不动。**记 backlog,不做**。
 - **监控**:`cat /proc/sys/net/netfilter/nf_conntrack_max`(限)+ `wc -l /proc/net/nf_conntrack`(实占)· 实占 > 80% 限即 warning。
@@ -97,7 +98,7 @@
 
 ### R5 · KMS 权限最小化 · API 无 Decrypt
 
-- **值**:`deploy/stacks/lambdas.py:406-425` API Lambda role 只授 `kms:GenerateRandom + Encrypt`,**不授 `Decrypt`**。调用方(平台后端)本地 Decrypt(EncryptionContext={tenant_id})。
+- **值**:lifecycle consumer 只授 `kms:GenerateRandom + Encrypt`;API Lambda 为 `/credentials` recipient-key 重包持有 ClawPool CMK `Decrypt`。普通 `GET /tenants/{id}` 仍返回密文,平台后端本地解密。
 - **背景**:API 若能 Decrypt,一旦 Lambda role 被误授给别的 IAM principal,gateway_token 明文可被拉库枚举。分离权限使得 CloudTrail 上 `Decrypt` 事件只可能来自调用方 IAM,越权即可查。
 - **监控**:CloudTrail `Decrypt` 事件超预期 IAM principal 立即 critical 告警。
 
@@ -121,7 +122,7 @@
 | CloudFront 长静默门       | **季度** | 打一个 200s 静默 WS · 观察是否被 CloudFront 180s 断 · 验证客户端心跳 SDK 落地情况                                             |
 | Guardrail 拦截采样        | **月度** | OWASP top 10 case 抽样跑 · 拦 14/14 是 baseline · 有掉的立刻查                                                                |
 
-演练结果落 `internal-docs/00-knowledge-base/evidence/` 归档。
+演练结果落 `engineering/evidence/` 归档。
 
 ---
 
@@ -130,5 +131,5 @@
 - **架构原理**:见 [第 13 章 · 数据面两级路由](13-data-plane-redesign.md)。
 - **组件运维手册**(告警阈值 / 扩缩容触发 / 故障排查):见 [第 11 章 · 组件运维手册](11-ops-maintenance.md)。
 - **私有 API 加固**:见 [第 12 章 · Private API Gateway](12-private-api-hardening.md)。
-- **HA 审计**(15 组件逐条 · 已修 vs 仍单点):见 [`internal-docs/00-knowledge-base/the data-plane design/HA-AUDIT-DRAFT.md`](../../internal-docs/00-knowledge-base/the data-plane design/HA-AUDIT-DRAFT.md)。
-- **交接文档**(新人上手):[`internal-docs/03-collaboration/HANDOVER.md`](../../internal-docs/03-collaboration/HANDOVER.md)。
+- **HA 审计**(15 组件逐条 · 已修 vs 仍单点):见 [`engineering/00-knowledge-base/SPEC/11-ENGINE-TRANSFORM/HA-AUDIT-DRAFT.md`](../../engineering/00-knowledge-base/SPEC/11-ENGINE-TRANSFORM/HA-AUDIT-DRAFT.md)。
+- **交接文档**(新人上手):[`engineering/03-collaboration/HANDOVER.md`](../../engineering/03-collaboration/HANDOVER.md)。

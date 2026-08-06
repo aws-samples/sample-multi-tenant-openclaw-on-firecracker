@@ -42,8 +42,8 @@
 ## 跑法
 
 - 前端/broker 逻辑单测:已做(A2/A3/A4 骨架自测通过,见 broker/handler.py 自测)。
-- 真机端到端(A1/B*/C*):`setup-federation.sh` 起 entry pool + 联邦 → 浏览器 chrome-cdp 驱动 marketplace.html 走完整流程 → 核对渲染 + 抓 wss。凭据见本地配置。
-- 结果与截图存证。
+- 真机端到端(A1/B*/C*):`setup-federation.sh` 起 entry pool + 联邦 → 浏览器 chrome-cdp 驱动 marketplace.html 走完整流程 → 核对渲染 + 抓 wss。凭据见 CLAUDE.local.md。
+- 结果落 `engineering/evidence/`,截图存证。
 
 ## 当前诚实标注
 

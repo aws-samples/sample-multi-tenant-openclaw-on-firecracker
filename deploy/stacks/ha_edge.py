@@ -29,6 +29,10 @@ from aws_cdk import (
 )
 from pathlib import Path
 
+from stacks._helpers import host_golden_ami_parameter_name
+from stacks.edge_bundle import BUNDLE_OBJECT_NAME as EDGE_BUNDLE_OBJECT_NAME
+from stacks.edge_bundle import build_edge_bundle
+
 
 def _valid_s3_bucket_name(bucket):
     return bool(
@@ -445,6 +449,28 @@ def build_ha_edge(self, ctx):
         "{{HOST_AGENT_SCRIPT}}",
         f"cat > /etc/systemd/system/host-agent.service << 'SVCEOF'\n{host_agent_svc}SVCEOF",
     )
+    # #389 v2 C2 — inline the provision stage instead of fetching it at boot.
+    # Inlining, not `aws s3 cp`, is deliberate on three counts:
+    #   1. provision's bytes become part of init-host.sh's sha256, which is the digest the
+    #      LaunchTemplate binds and verifies (#389 DoD 2/4). Editing provision therefore
+    #      changes the LT, so the "what will this host run" question has one answer.
+    #   2. A boot-time fetch of provision would be a network dependency in the stage whose
+    #      whole purpose is removing network dependencies from boot.
+    #   3. Image Builder reads the same file from S3, so one source of truth serves both
+    #      the bake path and the plain-AMI fallback.
+    # The heredoc is quoted so provision's own $VARs survive verbatim.
+    _provision_sh = (ud_dir / "provision-host.sh").read_text()
+    if "{{" in _provision_sh:
+        raise ValueError(
+            "provision-host.sh must not contain template placeholders: it is baked into a "
+            "fleet-wide AMI, so it can carry no per-deployment value"
+        )
+    init_sh = init_sh.replace(
+        "{{PROVISION_SCRIPT}}",
+        "cat > /opt/openclaw/provision-host.sh << 'PROVISIONEOF'\n"
+        f"{_provision_sh}PROVISIONEOF\n"
+        "chmod 0755 /opt/openclaw/provision-host.sh",
+    )
     init_sh = init_sh.replace(
         "{{HOST_USER_HOOK}}",
         _render_user_hook("host", _host_user_hook, "${REGION}"),
@@ -555,10 +581,28 @@ def build_ha_edge(self, ctx):
     # AMI + instance type fails to boot, so we couple the two.
     _arch = (CFG.get("host", {}) or {}).get("arch", "x86_64")
     _ami_arch = "arm64" if _arch == "arm64" else "amd64"
-    ami = ec2.MachineImage.lookup(
-        name=f"ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-{_ami_arch}-server-*",
-        owners=["099720109477"],
-    )
+    # #389 v2 block 2 — golden AMI, opt-in. host.golden_ami.use=true points the LT at the
+    # SSM parameter OpenClawHostImage's pipeline writes, so hosts boot an image that
+    # already has every component installed and download nothing.
+    #
+    # resolve:ssm, not a lookup: the value is resolved by EC2 at each launch, so a new bake
+    # takes effect on the next scale-out with no cdk deploy. Per the EC2 docs, changing the
+    # parameter does NOT touch running instances — that is K1 (no automatic instance
+    # refresh) for free. A lookup would instead freeze today's AMI id into the template.
+    #
+    # Both paths run the same init-host.sh; the only difference is whether provision
+    # already ran. Falling back to the plain Canonical AMI therefore stays safe.
+    _golden = (CFG.get("host", {}) or {}).get("golden_ami", {}) or {}
+    if _golden.get("use", False):
+        _golden_param = _golden.get("ssm_parameter") or host_golden_ami_parameter_name(
+            self._gsuffix
+        )
+        ami = ec2.MachineImage.resolve_ssm_parameter_at_launch(_golden_param)
+    else:
+        ami = ec2.MachineImage.lookup(
+            name=f"ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-{_ami_arch}-server-*",
+            owners=["099720109477"],
+        )
 
     # InstanceType: honor an explicit override, otherwise pick a sensible
     # default per arch (m8g for Graviton, m8i for Intel).
@@ -846,7 +890,13 @@ def build_ha_edge(self, ctx):
     # the lifecycle-hook timeout until the bake lands the rootfs — not a deploy
     # failure. Steady-state redeploys are unaffected (image already present).
     cfn_asg = asg.node.default_child
-    _pinned_ver = nested_virt.get_response_field("LaunchTemplateVersion.VersionNumber")
+    # #389 v2 块5:ASG 跟踪 `$Default`(不再 pin 数字版本)。SetDefaultLTVersion CR 已把
+    # nested-virt 版本设为默认,所以 $Default 天然带 nested-virt/IMDS 加固;而 bootstrap 版本
+    # 切换 API 靠 ModifyLaunchTemplate 翻默认版本即可让下次 launch 生效,【无需】
+    # UpdateAutoScalingGroup(那会强制 RunInstances+PassRole 高危 dry-run,提权面大)。EC2 在
+    # 每次 launch 解析 $Default,故翻默认不碰存量在跑实例(K1)。set_default 依赖保证首次部署时
+    # 默认版本已就绪再起 ASG。
+    _pinned_ver = "$Default"
     if len(_instance_pool) >= 2:
         # MixedInstancesPolicy across the equal-capacity pool. This property
         # is mutually exclusive with the plain LaunchTemplate property, so
@@ -895,6 +945,36 @@ def build_ha_edge(self, ctx):
         lifecycle_transition="autoscaling:EC2_INSTANCE_TERMINATING",
         heartbeat_timeout=120,
         default_result="CONTINUE",
+    )
+
+    # ── #389 v2 块5:bootstrap 版本切换 API 的 host-fleet IAM ──────────────────
+    # POST /bootstrap/promote 在【cdk deploy 已发布的 LT 版本】之间切默认版本:
+    # DescribeLaunchTemplateVersions(枚举已发布版本、按 bootstrap sha 对账)+ ModifyLaunchTemplate
+    # (把该 LT 的默认版本翻到目标已发布版本)。两台 ASG 都跟踪 `$Default`,EC2 每次 launch 解析默认
+    # 版本,故翻默认 = 下次开机读那个版本的 bootstrap,不碰存量在跑实例(K1)。IAM 加在这里而不是
+    # lambdas.py:LT/ASG 在 stack build 顺序里晚于 lambdas.py 才存在,照 :1225 的既有先例。
+    #
+    # 提权红线(codex 评审确认):API 【绝不】拿 CreateLaunchTemplateVersion / RunInstances /
+    # PassRole / UpdateAutoScalingGroup。Create/RunInstances 能写任意 user-data/AMI(继承实例角色
+    # → 任意代码),即便本代码只做版本切换也无法从 IAM 层保证;故彻底不授予。API 只能切到 cdk 部署
+    # 过的版本(拿不到写脚本的能力)。ModifyLaunchTemplate 资源级死锁到本 host LT ARN。
+    _host_lt_arn = self.format_arn(
+        service="ec2", resource="launch-template",
+        resource_name=launch_template.launch_template_id,
+    )
+    api_fn.add_to_role_policy(
+        iam.PolicyStatement(
+            # DescribeLaunchTemplateVersions 不支持资源级权限(AWS 文档明确),必须 "*" 无条件。
+            # 纯只读,爆炸半径低(同既有 ec2_describe_policy 里的 Describe* 处置)。
+            actions=["ec2:DescribeLaunchTemplateVersions"],
+            resources=["*"],
+        )
+    )
+    api_fn.add_to_role_policy(
+        iam.PolicyStatement(
+            actions=["ec2:ModifyLaunchTemplate"],
+            resources=[_host_lt_arn],
+        )
     )
 
     # When a new host completes init → process pending tenants
@@ -1467,24 +1547,71 @@ def build_ha_edge(self, ctx):
                     ],
                 )
             )
+        # ── #389 v2 块 4:edge 与 host 同构的不可变 bootstrap ──────────────
+        # 旧形态是 `aws s3 cp --recursive` 拉可变前缀 deployment/edge/,由 setup.sh
+        # 手工上传,再 60×10s 轮询等 install-edge.sh 出现。两种真实故障出自这里:
+        # patch 忘了上传 → 前缀留旧版、改动静默不生效(#265 病根);上传到一半 →
+        # 目录被当完整集消费,因为没有任何东西校验这一整套。
+        #
+        # 现在整棵 deploy/edge/ 打成一个 tar.gz(base64 文本,因为 Source.data 收
+        # 文本),整体一个 sha256,key 里带这个 sha256 —— 与 host 的
+        # deployment/bootstrap/host/<sha>/init-host.sh 同一套语义。BucketDeployment
+        # 让 CloudFormation 在 edge ASG 允许启动之前就把对象放好,轮询本来就是为了
+        # 绕这个竞态,竞态没了,轮询跟着删。
+        #
+        # 已知副作用(H1 决策时明确接受):改 deploy/edge/ 不再"改 S3 即生效",
+        # 必须走 cdk deploy 或块 5 的版本切换 API。
+        _edge_bundle, _edge_bundle_sha256 = build_edge_bundle(
+            Path(__file__).parent.parent / "edge"
+        )
+        _edge_key_prefix = f"deployment/bootstrap/edge/{_edge_bundle_sha256}"
+        _edge_key = f"{_edge_key_prefix}/{EDGE_BUNDLE_OBJECT_NAME}"
+        _edge_bundle_asset = s3deploy.BucketDeployment(
+            self,
+            "EdgeBundleAssetDeployment",
+            sources=[s3deploy.Source.data(EDGE_BUNDLE_OBJECT_NAME, _edge_bundle)],
+            destination_bucket=assets_bucket,
+            destination_key_prefix=_edge_key_prefix,
+            prune=False,
+            retain_on_delete=True,
+        )
+        # 解到 /opt/openclaw-edge/<sha>/ 而不是固定目录:每个版本独占一个目录,
+        # 新旧文件在盘上物理上不可能混在一起(旧 --recursive 会把删掉的文件留下),
+        # 重跑同一版本是同字节覆盖同路径 → 天然幂等。install-edge.sh 用
+        # `dirname "$0"` 定位 route.lua / lib/ / nginx.conf / fluent-bit/edge,
+        # tar 保留了这个相对结构,所以子目录对它透明。
+        _edge_dir = f"/opt/openclaw-edge/{_edge_bundle_sha256}"
+        # edge 没有 lifecycle hook(失败语义是 exit 1 → ELB unhealthy → ASG 换机),
+        # 所以这里不需要 host 那样的 ABANDON 陷阱,只要失败得响。
         _edge_ud = ec2.UserData.for_linux()
         _edge_commands = [
             "set -euxo pipefail",
             # ENGINE_REDIS_ENDPOINT 需在 install-edge.sh 执行时可见(userdata
             # 属 CFN 模板,Redis endpoint token 在 deploy 期正确解析)。
             f'echo "ENGINE_REDIS_ENDPOINT={redis_endpoint}" >> /etc/environment',
-            "mkdir -p /opt/openclaw-edge",
-            f"for i in $(seq 1 60); do "
-            f"aws s3 cp s3://{assets_bucket.bucket_name}/deployment/edge/ /opt/openclaw-edge/ --recursive --region {self.region} 2>/dev/null; "
-            f"[ -f /opt/openclaw-edge/install-edge.sh ] && [ -f /opt/openclaw-edge/nginx.conf ] && break; "
-            f'echo "waiting for edge assets in S3 ($i)"; sleep 10; done',
-            '[ -f /opt/openclaw-edge/install-edge.sh ] || { echo "[edge-userdata] FATAL: edge assets missing after 600s" >&2; exit 1; }',
+            # AL2023 自带 awscli v2(AL2023 用户指南 "AWS CLI v2"),缺了就是 AMI
+            # 被换过,继续跑只会在下一行报更难读的错。
+            'command -v aws >/dev/null 2>&1 || { echo "[oc:edge-bootstrap] FATAL: '
+            'awscli missing from AMI" >&2; exit 1; }',
+            'tmp="$(mktemp /tmp/edge-bundle.XXXXXX)"',
+            '_edge_cleanup() { rm -f "$tmp" || true; }',
+            # 不带 exit:让 install-edge.sh 的退出码原样传给 cloud-init。
+            "trap _edge_cleanup EXIT",
+            f'for attempt in $(seq 1 20); do if aws s3 cp "s3://{assets_bucket.bucket_name}/{_edge_key}" '
+            f'"$tmp" --region {self.region} --no-progress; then break; fi; '
+            '[ "$attempt" -lt 20 ] || exit 1; sleep 15; done',
+            # 摘要对的是 base64 文本本身,也就是实例真正下载到的字节;去校验里层
+            # tar 会让传输编码这一段不设防。
+            f"printf '%s  %s\\n' '{_edge_bundle_sha256}' \"$tmp\" | sha256sum -c -",
+            f'install -d -o root -g root -m 0755 "{_edge_dir}"',
+            f'base64 -d < "$tmp" | tar -xzf - -C "{_edge_dir}"',
+            f'echo "[oc:edge-bootstrap] verified edge bundle {_edge_bundle_sha256}, installing"',
             f'ENGINE_REDIS_ENDPOINT="{redis_endpoint}" EDGE_LISTEN_PORT=8080 '
             f'LOGGING_ENABLED="{str(_logging_enabled).lower()}" '
             f'ASSETS_BUCKET="{assets_bucket.bucket_name}" '
             f'AWS_REGION="{self.region}" '
             f'FIREHOSE_DELIVERY_STREAM="claw-logs{self._gsuffix}" '
-            "bash /opt/openclaw-edge/install-edge.sh",
+            f'bash "{_edge_dir}/install-edge.sh"',
         ]
         _edge_hook_command = _render_user_hook(
             "edge",
@@ -1529,6 +1656,63 @@ def build_ha_edge(self, ctx):
                 {"ResourceType": "volume", "Tags": _edge_tags},
             ],
         )
+        # #389 v2 块5:edge ASG 跟踪 $Default(见下)。bootstrap 版本切换 API 用 ModifyLaunchTemplate
+        # 翻默认版本做临时切换;每次 cdk deploy 必须把默认版本【重置】回 CDK 当次发布的最新版本
+        # (edge LT 每次 deploy 因 user-data 变化产生新版本),否则 API 的临时切换会永久盖过 IaC。
+        # 这与 host 的 SetDefaultLTVersion CR 同一语义(host 那条把默认设成 nested-virt 版本)。
+        # physical_resource_id 带 LatestVersionNumber → 版本变化时 CR 触发 on_update 重设默认。
+        _edge_set_default = cr.AwsCustomResource(
+            self,
+            "EdgeSetDefaultLTVersion",
+            on_create=cr.AwsSdkCall(
+                service="EC2",
+                action="modifyLaunchTemplate",
+                parameters={
+                    "LaunchTemplateId": _edge_lt.launch_template_id,
+                    "DefaultVersion": Fn.get_att(
+                        _edge_cfn_lt.logical_id, "LatestVersionNumber"
+                    ).to_string(),
+                },
+                physical_resource_id=cr.PhysicalResourceId.of(
+                    Fn.join("-", [
+                        "edge-set-default",
+                        Fn.get_att(
+                            _edge_cfn_lt.logical_id, "LatestVersionNumber"
+                        ).to_string(),
+                    ])
+                ),
+            ),
+            on_update=cr.AwsSdkCall(
+                service="EC2",
+                action="modifyLaunchTemplate",
+                parameters={
+                    "LaunchTemplateId": _edge_lt.launch_template_id,
+                    "DefaultVersion": Fn.get_att(
+                        _edge_cfn_lt.logical_id, "LatestVersionNumber"
+                    ).to_string(),
+                },
+                physical_resource_id=cr.PhysicalResourceId.of(
+                    Fn.join("-", [
+                        "edge-set-default",
+                        Fn.get_att(
+                            _edge_cfn_lt.logical_id, "LatestVersionNumber"
+                        ).to_string(),
+                    ])
+                ),
+            ),
+            install_latest_aws_sdk=False,
+            policy=cr.AwsCustomResourcePolicy.from_statements([
+                # 资源级死锁到本 edge LT ARN(codex 评审:不能 "*",否则可重定向账户内任意 LT 默认版本)。
+                iam.PolicyStatement(
+                    actions=["ec2:ModifyLaunchTemplate"],
+                    resources=[self.format_arn(
+                        service="ec2", resource="launch-template",
+                        resource_name=_edge_lt.launch_template_id,
+                    )],
+                ),
+            ]),
+        )
+        _edge_set_default.node.add_dependency(_edge_lt)
         # #272 — edge.subnet_ids 非空时显式选 OpenResty edge 子网;缺省回落
         # PRIVATE_WITH_EGRESS(带 NAT 出网的私有子网)。
         _edge_subnet_ids = _edge_cfg.get("subnet_ids") or []
@@ -1560,7 +1744,35 @@ def build_ha_edge(self, ctx):
                 )
             ),
         )
+        # 同 HostASG:bootstrap 只能重试下载,不能凭空造出对象。把 edge 启动挡在
+        # 不可变对象部署之后,这正是删掉 60×10s 轮询后必须补上的那条保证。
+        _edge_asg.node.add_dependency(_edge_bundle_asset)
+        # 也挡在 EdgeSetDefaultLTVersion 之后:$Default 必须先被设成本次 CDK 版本,edge 才起
+        # (否则首启可能读到过期默认版本)。
+        _edge_asg.node.add_dependency(_edge_set_default)
         _edge_asg.attach_to_application_target_group(edge_tg)
+        # #389 v2 块5:edge ASG 也跟踪 `$Default`。这样 bootstrap 版本切换 API 用
+        # ModifyLaunchTemplate 翻默认版本即对 edge 下次 launch 生效,无需 UpdateAutoScalingGroup
+        # (避开 RunInstances+PassRole 高危 dry-run)。默认版本随 cdk deploy 由上面的
+        # EdgeSetDefaultLTVersion CR 重置回 CDK 当次发布版本。
+        _edge_cfn_asg = _edge_asg.node.default_child
+        _edge_cfn_asg.add_property_override("LaunchTemplate.Version", "$Default")
+
+        # ── #389 v2 块5:bootstrap 版本切换 API 的 edge-fleet IAM ──────────────────
+        # 只需在 edge LT 上 ModifyLaunchTemplate(翻默认版本到已发布版本)。【不】要
+        # CreateLaunchTemplateVersion / RunInstances / PassRole / UpdateAutoScalingGroup —— promote
+        # 只在 cdk 已发布版本间切默认,拿不到写 user-data 的能力。DescribeLaunchTemplateVersions
+        # 已在 host 段以 "*" 授过一次(不支持资源级)。edge LT 名带 _gsuffix,故 service 从 ASG 反查。
+        _edge_lt_arn = self.format_arn(
+            service="ec2", resource="launch-template",
+            resource_name=_edge_lt.launch_template_id,
+        )
+        api_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["ec2:ModifyLaunchTemplate"],
+                resources=[_edge_lt_arn],
+            )
+        )
 
     # ========== CloudFront ==========
     # 1.3.4 (#61): support two-distribution mode for security boundary between

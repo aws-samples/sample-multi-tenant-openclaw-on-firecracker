@@ -2,7 +2,7 @@
 
 > **Note (data-plane model transitioned)**
 >
-> The data plane in this chapter is described according to the **two-tier routing** model introduced by the 2026-07-08 de-hubbing redesign (platform backend WebSocket gateway → OpenResty edge → microVM gateway). It replaces the earlier model of a claw-hub WebSocket hub + claw-channel outbound dialing + three Amazon Cognito identities + an HMAC channel_secret; the old model's components have been removed from the deployment code and archived. For the full data-plane chain, timeouts, and scale baseline, see [Chapter 13 · Data-plane two-tier routing](13-data-plane-redesign.md). For the rationale, see `internal-docs/00-knowledge-base/decisions/DECISION-drop-oidc-cognito-use-openclaw-native-auth.md`.
+> The data plane in this chapter is described according to the **two-tier routing** model introduced by the 2026-07-08 de-hubbing redesign (platform backend WebSocket gateway → OpenResty edge → microVM gateway). It replaces the earlier model of a claw-hub WebSocket hub + claw-channel outbound dialing + three Amazon Cognito identities + an HMAC channel_secret; the old model's components have been removed from the deployment code and archived. For the full data-plane chain, timeouts, and scale baseline, see [Chapter 13 · Data-plane two-tier routing](13-data-plane-redesign.md). For the rationale, see `engineering/00-knowledge-base/decisions/DECISION-drop-oidc-cognito-use-openclaw-native-auth.md`.
 
 This section describes the components and AWS services that make up this solution, along with details of how these components work together. The solution comprises three major components: a control plane (lifecycle management plane) responsible for registration, lifecycle, backup, and deregistration; a data plane (two-tier routing) that connects real-time chat directly to the gateway inside each tenant's microVM; and tenant microVMs (independent-kernel runtimes based on Firecracker) that run an OpenClaw AI agent with identity, skills, and guardrails for each tenant. The three responsibilities are orthogonal: the control plane performs lifecycle management only and injects no business data into a microVM after startup; the data plane performs per-tenant message routing only; and the tenant microVM is an isolated runtime that is a finished product at startup. The security model is layered on top of these three components as five layers of defense in depth, described in "Defense in depth: the five-layer security model" in this section.
 
@@ -41,7 +41,7 @@ The data plane is an opt-in capability, controlled by `edge.enabled` and `redis.
 ```
 Browser ── wss /gw/ws ─▶ platform backend WebSocket gateway
   platform backend gateway ── ws ─▶ CloudFront ─▶ ALB ─▶ OpenResty edge ASG
-    OpenResty edge ── ElastiCache Redis route:{tenant_id} lookup ─▶ host iptables DNAT ─▶ microVM gateway:18789
+    OpenResty edge ── ElastiCache Valkey/Redis route:{tenant_id} lookup ─▶ host iptables DNAT ─▶ microVM gateway:18789
 ```
 
 Identity divides into two orthogonal planes, neither of which depends on Amazon Cognito any longer:
@@ -104,7 +104,7 @@ The tool execution layer guardrails ship with their own regression tests. The au
 
 This layer divides into two planes. The **data plane** roots identity in OpenClaw's native Ed25519 device asymmetric authentication: the platform backend signs the challenge issued by the gateway with the device private key, the microVM gateway verifies the signature with the cold-injected public key, and the pairing gate admits only the public keys and roles registered in `paired.json`; the private key is held server-side and never reaches the front end, and the KMS `EncryptionContext` of the token and private-key ciphertexts is bound to `tenant_id`/`owner_id`, so a mismatched decryption context is rejected (fail-closed). The data plane is structurally non-cross-tenant: one device binds to one tenant, the edge routes on the single `tenant_id` key, and a missing route returns 404 rather than crossing over to another tenant.
 
-The **control plane** uses `x-api-key` as the first gate, layering Amazon Cognito token verification on top when RBAC is enabled: Cognito-issued tokens are verified with RS256 + the JWKS public key, the `cognito:groups` claim maps to the three-tier roles viewer/operator/admin, and forged, expired, `alg:none`, or wrong-issuer tokens all degrade to read-only; a pure `x-api-key` request without a Bearer takes its role from `DEFAULT_NO_JWT_ROLE` (default `viewer`). RBAC gating is itself an independent switch, `RBAC_ENABLED`, defaulting to `true`; even with RBAC off, the resource owner (`owner_id`) check remains independently in force, so turning RBAC off does not open cross-tenant privilege escalation (IDOR).
+The **control plane** requires `x-api-key` as a usage-plan client identifier, not as standalone authentication, and layers Amazon Cognito verification when RBAC is enabled. Cognito tokens are verified with RS256 and JWKS; `cognito:groups` maps to viewer/operator/admin. A request without a Bearer uses `DEFAULT_NO_JWT_ROLE` (default `viewer`). RBAC is enabled by default, while owner and platform-scope checks are independent.
 
 > **Note**
 >

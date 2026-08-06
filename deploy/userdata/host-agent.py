@@ -40,6 +40,10 @@ TENANTS_TABLE = os.environ.get("TENANTS_TABLE", "")
 # are still alive at the host level, not just whether their tenants reported).
 HOSTS_TABLE = os.environ.get("HOSTS_TABLE", "")
 INSTANCE_ID = os.environ.get("INSTANCE_ID", "")
+# #394 — Host-local slot pointer is authoritative. Heartbeat mirrors it continuously so
+# global snapshot deletion can fail closed on a freshness timestamp instead of trusting a
+# one-shot best-effort write from the mutation that may have failed.
+IMAGE_SLOTS_FILE = os.environ.get("IMAGE_SLOTS_FILE", "/data/firecracker-assets/slots.json")
 # P2b: ElastiCache primary endpoint DNS name (contract §8 — never a node IP).
 # Empty string disables Redis writes; host-agent still writes DDB as normal
 # so an ungated deploy stays backwards-compatible with pre-P2 environments.
@@ -377,25 +381,7 @@ def _ensure_route(tenant_id: str, guest_ip: str) -> tuple[str, int | None]:
     """
     host_ip = _get_host_private_ip()
     bitmap = _get_port_bitmap()
-    # A route_ops CLI delete runs outside this process. Reconcile the singleton
-    # from authoritative iptables before allocating so a released slot does not
-    # remain reserved until host-agent restarts.
-    route_ops.rebuild_bitmap_from_iptables(bitmap)
-    # 1. Check whether iptables already has a rule for this guest_ip that
-    #    was just recovered at bootstrap. If yes, reuse it — same tenant
-    #    same slot after a restart.
-    try:
-        existing = route_ops.list_dnat_rules()
-    except Exception:
-        existing = {}
-    port: int | None = None
-    for p, g in existing.items():
-        if g == guest_ip and route_ops.PORT_RANGE_LOW <= p <= route_ops.PORT_RANGE_HIGH:
-            bitmap.mark_used(p)
-            port = p
-            break
-    if port is None:
-        port = route_ops.alloc_and_dnat_atomic(bitmap, guest_ip)
+    port = route_ops.ensure_port_and_dnat(bitmap, guest_ip)
     writer = _get_redis_writer()
     if writer is not None and host_ip:
         writer.set_route(tenant_id, host_ip, port, guest_ip)
@@ -837,22 +823,51 @@ def _disk_report_loop():
         time.sleep(_DISK_REPORT_INTERVAL_SEC)
 
 
+def _read_image_slots():
+    """Read and validate the Host-authoritative slots pointer for heartbeat mirroring.
+
+    Missing/unparseable state returns None and deliberately does not refresh the mirror
+    timestamp. Snapshot deletion then treats the control-plane mirror as stale and refuses
+    to delete rather than guessing that an unobserved Host reference does not exist.
+    """
+    try:
+        with open(IMAGE_SLOTS_FILE, encoding="utf-8") as fh:
+            slots = json.load(fh)
+        if not isinstance(slots, dict):
+            return None
+        generation = int(slots.get("generation") or 0)
+        return {
+            "generation": generation,
+            "live": slots.get("live"),
+            "canary": slots.get("canary"),
+            "previous_live": slots.get("previous_live"),
+        }
+    except (OSError, ValueError, TypeError):
+        return None
+
+
 def _write_host_heartbeat():
-    """Update this host's ``last_seen`` and ``last_health_check`` timestamps in
-    the hosts table. Called every poll so the health_check Lambda can detect
-    AZ-level outages by checking host-level freshness (not just tenant-level
-    health, which goes stale only when a tenant exists). Best-effort; never
-    raises.
+    """Update host liveness and continuously reconcile the slots.json DDB mirror.
+
+    The slots freshness marker is written in the same UpdateItem as the mirror. If reading
+    local slots fails, only liveness is updated; the old marker ages out and destructive
+    snapshot deletion fails closed.
     """
     if not HOSTS_TABLE or not INSTANCE_ID:
         return
     try:
         ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         table = _get_ddb().Table(HOSTS_TABLE)
+        slots = _read_image_slots()
+        expression = "SET last_seen = :t, last_health_check = :t"
+        values = {":t": ts}
+        if slots is not None:
+            expression += ", image_slots = :slots, image_slots_synced_at_epoch = :se"
+            values.update({":slots": slots, ":se": int(time.time())})
         table.update_item(
             Key={"instance_id": INSTANCE_ID},
-            UpdateExpression="SET last_seen = :t, last_health_check = :t",
-            ExpressionAttributeValues={":t": ts},
+            UpdateExpression=expression,
+            ExpressionAttributeValues=values,
         )
     except Exception as e:
         # Heartbeat failures must never crash the poll loop.
@@ -1026,11 +1041,17 @@ def _write_ddb(results):
                 # this is the fresh creating→running promote, whose guest_ip is
                 # already correct; the logical(DDB)↔physical(vm.json) vm_num split
                 # after migration is #208's job (phys_vm_num), not host-agent's.
+                # #412(codex review2 #1)—— promote creating→running 时 REMOVE
+                # capacity_reservation_id:VM 已真起,容量归 running 租户合法持有,后续正常
+                # delete(按 item.vcpu 扣)回收。清掉令牌后,poller/rollback 的失败释放
+                # (条件 capacity_reservation_id=:rid)对已 running 租户落空(no-op)→ 绝不误删
+                # 活租户放置/容量(data-loss 红线)。是控制面 _mark_running 的 host-agent 对偶。
                 update_expr = (
                     "SET #s = :r, vm_health = :vh, app_health = :ah, "
                     "health_failures = :z, last_health_check = :t, "
                     "updated_at = :t, host_private_ip = :hpi, host_id = :self, "
-                    "host_port = :hp, guest_ip = :gi, #m = :m"
+                    "host_port = :hp, guest_ip = :gi, #m = :m "
+                    "REMOVE capacity_reservation_id"
                 )
                 # NOTE (loop 2026-07-01): we tried widening this to
                 # `#s IN (creating, stopped)` to self-heal a "stopped-but-alive"
@@ -1058,11 +1079,37 @@ def _write_ddb(results):
                     ":self": INSTANCE_ID,
                     ":m": metrics or {},
                 }
+                # #412(codex review5 #2)—— host_id 不是 ABA-safe 的 promote 闸:租户被释放后
+                # 重投【落回同一 host】拿【新】预留(新 vm_num N2,vm_num 单调不复用),此时本机
+                # 若残留【旧】vm.json(旧 vm_num N1)会把 N2 的租户按 N1 promote → DDB 放置与实跑
+                # VM 的 vm_num 分叉。加 vm_num=:phys 闸:只 promote 【DDB vm_num == 本机 vm.json
+                # vm_num】的租户,旧 vm.json 的 N1≠N2 → 条件失败跳过(等旧 VM 被 orphan-reap 清)。
+                # 只【条件】用 vm_num,不【写】它(#208:promote 不写 vm_num,迁移安全不变)。
+                # phys_vm_num 缺失(legacy vm.json 无 vm_num)→ 回落仅 host_id 闸(不比现状差)。
+                _phys = info.get("phys_vm_num")
+                if _phys is not None:
+                    promote_cond = (
+                        "#s = :c AND host_id = :self AND vm_num = :phys "
+                        "AND attribute_not_exists(dispatch_settle)"
+                    )
+                    update_vals[":phys"] = int(_phys)
+                else:
+                    promote_cond = (
+                        "#s = :c AND host_id = :self "
+                        "AND attribute_not_exists(dispatch_settle)"
+                    )
+                # #412(codex review3 #1)—— promote 必须与令牌释放【互斥】,否则:poller/rollback
+                # 释放清了 host_id/token/容量但留 status=creating,本 promote 若只判 #s=:c 会把
+                # 已释放的租户"复活"成 running,而容量已扣 → 未记账的 running VM(超卖)。fence 加
+                # host_id=:self:promote 的租户来自本机 vm.json(reserve 时 host_id 已原子写成本机),
+                # 释放会 REMOVE host_id → host_id=:self 条件失败 → 不复活。#412 后 dispatch 租户在
+                # reserve 就落 host_id(不再有 host_id-less 的 creating 需要 #237 自愈),故 fence 安全;
+                # 队列等待的无 host_id 租户没有本机 vm.json、根本到不了 promote。
                 try:
                     table.update_item(
                         Key={"id": tid},
                         UpdateExpression=update_expr,
-                        ConditionExpression="#s = :c",
+                        ConditionExpression=promote_cond,
                         ExpressionAttributeNames={"#s": "status", "#m": "metrics"},
                         ExpressionAttributeValues=update_vals,
                     )
@@ -1071,12 +1118,11 @@ def _write_ddb(results):
                         f"(host={host_private_ip}:{host_port} guest={info['guest_ip']})"
                     )
                 except table.meta.client.exceptions.ConditionalCheckFailedException:
-                    # promote's `#s = :c` lost: tenant is already running (normal
-                    # — just refresh), or its record was deleted / migrated away.
-                    # Fall back to the guarded refresh, which reconciles
-                    # health/vm_num/guest_ip or fails cleanly (attribute_exists(id)
-                    # + host_id). Scoped to the promote attempt so an else-branch
-                    # refresh CCF doesn't get retried a second time every poll.
+                    # promote's `#s = :c AND host_id = :self` lost: tenant is already
+                    # running (normal — just refresh), deleted / migrated away, OR
+                    # #412 —— 其 dispatch 预留已被释放(host_id 被 REMOVE)→ 正在拆除,
+                    # 【绝不复活】。回落 guarded refresh(attribute_exists(id) + host_id);
+                    # 已释放租户 host_id 没了 → refresh 的 host_id 守卫也 CCF → 干净 no-op。
                     _refresh_health(table, tid, info, now, metrics)
             else:
                 # Not promoted this tick (still creating w/ gateway not up, or a
@@ -1920,10 +1966,12 @@ def _promote_tenant_running(tenant_id):
         return
     try:
         table = _get_ddb().Table(TENANTS_TABLE)
+        # #412(codex review2 #1)—— promote 时 REMOVE capacity_reservation_id(同 _write_ddb
+        # 的对偶):running 租户容量归其合法持有,清令牌后失败释放对它落空、绝不误删活租户。
         table.update_item(
             Key={"id": tenant_id},
-            UpdateExpression="SET #s = :r, running_ts = :t",
-            ConditionExpression="#s = :c",
+            UpdateExpression="SET #s = :r, running_ts = :t REMOVE capacity_reservation_id",
+            ConditionExpression="#s = :c AND attribute_not_exists(dispatch_settle)",
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
                 ":r": "running",
@@ -2030,6 +2078,10 @@ def _execute_launch(assignment):
                 "",
                 "",
                 chat_ep,
+                "",
+                "",
+                "",
+                str(assignment.get("capacity_reservation_id", "")),
             ),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -2040,6 +2092,15 @@ def _execute_launch(assignment):
         # 下一 tick 自然收敛或 winner 已起好后 vm.json 存在被跳过。systemd-cat 透传
         # 退出码(systemd 255 真机实测:exit 75→rc 75),故这里能拿到真实 75。
         if rc == 75:
+            return "skip"
+        # #411/6.3 codex(round5) — launch-vm status 闸的两个新退出码,pull 路径也要按语义分开,
+        # 不能落进 `rc == 0` 的 False 当普通失败(那会烧 retry 预算 + 把在途/回滚态误判终态):
+        #   44 = 租户已 deleted(终态)→ "abort":调用点标 assignment done、不重投、不计失败。
+        #   45 = deleting/状态未知/读失败(非终态,delete 可能回滚)→ "skip":保持 pending、
+        #        不消耗 retry 预算,下一 tick 重判(同 rc75 的 pending 语义)。
+        if rc == 44:
+            return "abort"
+        if rc == 45:
             return "skip"
         return rc == 0
     except Exception as e:
@@ -2149,6 +2210,14 @@ def _dispatch_tick(table):
             # 可能也失败),孤儿。skip = 良性(另一进程在起同租户),保持 pending 不动,
             # 不标 done/failed、不消耗 retry 预算、不重入队,下一 tick 由 DDB 行决定。
             if ok == "skip":
+                continue
+            # #411/6.3 codex(round5) — "abort" = launch-vm status 闸读到租户已 deleted(rc44,
+            # 终态)。与 "skip"(rc45/75,保持 pending)不同:deleted 是终态,标 assignment done
+            # 停止重投(否则每 tick 反复叫醒 host 起一个已删租户的 VM)。必须在 `if ok:` 之前判
+            # ——"abort" 也是 truthy 字符串,落 `if ok:` 会被 _mark_assignment_done 但走的是
+            # "成功起了"的语义分支(误标 running)。这里显式终结:标 done、不重投、不算失败。
+            if ok == "abort":
+                _mark_assignment_done(table, INSTANCE_ID, tid)
                 continue
             if ok:
                 _mark_assignment_done(table, INSTANCE_ID, tid)
@@ -2417,8 +2486,6 @@ class Handler(BaseHTTPRequestHandler):
             bitmap = _port_bitmap
             if bitmap is not None:
                 try:
-                    # Cross-process delete-route updates iptables, not this
-                    # process's bitmap. Refresh before exporting the watermark.
                     route_ops.rebuild_bitmap_from_iptables(bitmap)
                     used = bitmap.used_count()
                     quarantined = len(

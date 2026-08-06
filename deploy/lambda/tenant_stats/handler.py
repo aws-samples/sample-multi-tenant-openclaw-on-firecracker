@@ -18,6 +18,11 @@ REGISTERED_STATUSES = (
     "migrating",
     "deleting",
     "deleted",
+    # #422 — 休眠/恢复三态。suspending/restoring 是过渡态,suspended 是冷备稳定态
+    # (本地 VM 已删 + 数据盘备份 S3 + slot 已释放,记录与 tenant_id 保留)。均非异常。
+    "suspending",
+    "suspended",
+    "restoring",
     "failed",
     "requires_intervention",
     "failover_recovering",

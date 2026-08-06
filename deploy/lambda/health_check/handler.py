@@ -26,7 +26,9 @@ shell so it can be unit-tested without DDB/SSM/SNS access.
 
 import os
 import json
+import shlex
 import boto3
+from botocore.exceptions import ClientError
 from datetime import datetime, timezone
 
 ddb = boto3.resource("dynamodb")
@@ -73,6 +75,7 @@ ALB_LISTENER_ARN = os.environ.get("ALB_LISTENER_ARN", "")
 
 def lambda_handler(event, context):
     """Scan running tenants, recover host-agent if needed, then check AZ-level health."""
+    _stop_confirm_budget["n"] = 0  # #412 blocker-B:每次 invocation 重置 stop-confirm 预算
     tenants = tenants_table.scan(
         FilterExpression=(
             "#s = :r AND (attribute_not_exists(synthetic) OR synthetic <> :true)"
@@ -137,6 +140,18 @@ def lambda_handler(event, context):
         # Never let ledger reaping take down the watchdog.
         print(f"reap error (non-fatal): {e}")
 
+    # ------- #412(codex review2 #4)—— 令牌孤儿清扫(requires_intervention)-------
+    # dispatch 失败超预算的租户被 poller 转 requires_intervention(非 creating),逃出上面
+    # 只扫 creating 的 reaper。若它仍带 capacity_reservation_id,那份容量就永久搁浅。此扫把
+    # 【requires_intervention 且仍持令牌】的租户令牌化释放(扣 host + 删令牌一个事务),兜底
+    # 任何令牌路径的残留(reserve 提交后崩溃转 RI、释放 retry 反复失败等)。
+    try:
+        orphans = _reap_orphan_reservations(now)
+        if orphans:
+            print(f"reap: released {orphans} orphan reservation token(s)")
+    except Exception as e:
+        print(f"reap orphan-token error (non-fatal): {e}")
+
     # ------- AZ-level failover (1.3.0) -------
     if AZ_FAILOVER_ENABLED:
         try:
@@ -189,9 +204,51 @@ MIGRATION_WATCHDOG_MINUTES = int(os.environ.get("MIGRATION_WATCHDOG_MINUTES", "1
 MIGRATION_DRAIN_SECONDS = int(os.environ.get("MIGRATION_DRAIN_SECONDS", "5"))
 
 
+# #412 blocker-B(codex CHANGES_NEEDED #3)——每次 Lambda invocation 里 reaper 做的同步
+# stop-confirm 有上限。每条 stop-vm 阻塞至多 STOP_CONFIRM_TIMEOUT 秒;若不设上限,数台不可达
+# host 上的卡住租户会串行耗光整个 invocation(默认 180s),把后面的 orphan 清扫 / AZ failover /
+# 迁移 sweep 全饿死。超预算则本轮不再 confirm(返 False = 不释放,留下轮再试),不是错误。
+_REAP_STOP_CONFIRM_MAX = int(os.environ.get("REAP_STOP_CONFIRM_MAX", "6"))
+STOP_CONFIRM_TIMEOUT = int(os.environ.get("STOP_CONFIRM_TIMEOUT", "20"))
+_stop_confirm_budget = {"n": 0}  # 每次 lambda_handler 顶部重置(warm invocation 复用模块态)
+
+
+def _confirm_vm_stopped(host_id, tenant_id, vm_num):
+    """#412 blocker-B(reviewer 复现):reaper 在【释放容量/消费令牌之前】必须先确认该租户的
+    VM 确已停止,否则会释放一个仍在跑的 Firecracker 的容量记账 → 未记账活 VM(overcommit,
+    账本红线)。launch-vm.sh 明确在失败后可能保留活 FC(:345),故"卡 creating/requires_
+    intervention 超时"不等于"VM 已停"。这里走与 delete 同款权威停机:同步跑 stop-vm.sh(幂等,
+    已停的 VM 再停是 no-op success),SSM 回执 Success 才算确认。stop-vm 失败/未确认 → 返 False,
+    调用方本轮【不释放】,留容量账本原样,下轮 reaper 再试(时序不替代正确性:确认了才扣)。
+
+    调用前必须已【围栏】该行(flip 到 failed 且条件锁 creating+令牌),使正在 promote 的 running
+    租户 CCF 出局——否则会 stop 掉一个刚起来的活 VM(codex #2)。host_id 缺失 → False,不释放。
+    tenant_id/vm_num 经 shlex.quote 进 root shell(纵深防御,与 delete 同)。每次 invocation 的
+    stop-confirm 数受 _REAP_STOP_CONFIRM_MAX 限,超额直接返 False(不烧 SSM),防饿死后续工作。"""
+    if not host_id:
+        return False
+    if _stop_confirm_budget["n"] >= _REAP_STOP_CONFIRM_MAX:
+        print(f"reap: stop-confirm budget ({_REAP_STOP_CONFIRM_MAX}) exhausted — deferring "
+              f"{tenant_id} to next sweep (avoid starving orphan/failover/migration work)")
+        return False
+    _stop_confirm_budget["n"] += 1
+    _q_tid = shlex.quote(str(tenant_id))
+    _q_vm = shlex.quote(str(int(vm_num)))
+    ok, _out = _ssm_run_capture(
+        host_id, f"/home/ubuntu/stop-vm.sh {_q_tid} {_q_vm}", timeout=STOP_CONFIRM_TIMEOUT
+    )
+    if not ok:
+        print(f"reap: {tenant_id} on {host_id} stop-vm unconfirmed — NOT releasing this "
+              f"cycle (avoid releasing a possibly-live VM's capacity); retry next sweep")
+    return ok
+
+
 def _reap_stuck_creating(now):
     """Mark tenants stuck in `creating` past CREATING_TIMEOUT_SECONDS as failed
     and release their host capacity reservation. Returns the count reaped.
+
+    #412 blocker-B:释放前先 _confirm_vm_stopped(host 权威停机确认),绝不释放可能仍在跑的
+    VM 的容量(overcommit 账本红线)。stop 未确认则本轮跳过、下轮再试。
 
     Capacity is decremented with the same if_not_exists-guarded, conditional
     pattern the create/delete paths use, so a row whose slot was already released
@@ -247,7 +304,100 @@ def _reap_stuck_creating(now):
         host_id = t.get("host_id", "")
         vcpu = int(t.get("vcpu", 1) or 1)
         mem_mb = int(t.get("mem_mb", 2048) or 2048)
-        # Flip status only if still creating (don't clobber a just-succeeded launch).
+        rid = t.get("capacity_reservation_id")
+        # #412 — dispatch 预留的租户带 capacity_reservation_id 令牌。令牌是跨 delete/poller/批
+        # 回滚的互斥锚(防 ABA 双扣):谁先消费令牌谁扣一次,其余幂等。释放事务条件双锚:tenant 侧
+        # status=failed AND capacity_reservation_id=:rid,host 侧下溢守卫。令牌缺失(同步 create
+        # 租户卡 creating)→ 走下面旧的 fence + guarded decrement(那条路无令牌、无 #412 泄漏)。
+        # NB(codex #3 原来的"flip+release 一个事务"已被 blocker-B 拆成 fence→stop→release 三步:
+        # fence 保留令牌,release 前崩溃 → failed+令牌由 _reap_orphan_reservations 兜底,故不留无主增量)。
+        _reaped_reason = f"reaped: stuck in creating > {CREATING_TIMEOUT_SECONDS}s"
+        if rid and host_id:
+            # #412 blocker-B(codex CHANGES_NEEDED #2)——顺序必须是【先围栏 → 再停 → 后释放】:
+            # ① 原子把 creating→failed(条件 status=creating AND token=rid),【保留】令牌+放置。
+            #    一个并发 promote(creating→running,条件也锁 creating)与本 flip 互斥:promote
+            #    已赢则本 flip CCF → 跳过,【绝不 stop 那个刚起来的活 VM】;本 flip 赢则该行进 failed
+            #    终态,promote 再也提交不了(其条件锁 creating)——此后 stop 该 VM 恒安全。
+            # ② failed 后才 stop-confirm(不能在 stop 后释放前才判 promote,那样已停了活 VM)。
+            # ③ 确认停了才释放:REMOVE 令牌+放置(条件 status=failed AND token=rid)+ 扣 host。
+            # 崩在①②③之间:行停在 failed 且仍带令牌 → _reap_orphan_reservations(含 failed)下轮
+            # 兜底(同样 stop-confirm 后释放)。故释放与围栏拆两步不会永久搁浅令牌。
+            try:
+                tenants_table.update_item(
+                    Key={"id": tid},
+                    UpdateExpression="SET #s = :f, updated_at = :t, reaped_reason = :r",
+                    ConditionExpression="#s = :c AND capacity_reservation_id = :rid",
+                    ExpressionAttributeNames={"#s": "status"},
+                    ExpressionAttributeValues={
+                        ":f": "failed", ":c": "creating", ":rid": rid,
+                        ":t": now.isoformat(), ":r": _reaped_reason,
+                    },
+                )
+            except ClientError as e:
+                if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                    # promote 赢了(已 running)/ 已被别的释放者流转 → 跳过,不 stop、不释放。
+                    print(f"reap-skip {tid}: promoted or status moved (fence CCF)")
+                    continue
+                print(f"reap-skip {tid}: fence flip failed ({e})")
+                continue
+            # 行已 failed(不可再 promote)→ 停 VM 恒安全。未确认停止 → 留 failed+令牌,下轮兜底。
+            if not _confirm_vm_stopped(host_id, tid, t.get("vm_num", 1)):
+                continue
+            try:
+                hosts_table.meta.client.transact_write_items(
+                    TransactItems=[
+                        {
+                            "Update": {
+                                "TableName": tenants_table.table_name,
+                                "Key": {"id": tid},
+                                "UpdateExpression": (
+                                    "REMOVE capacity_reservation_id, dispatch_settle, "
+                                    "host_id, vm_num, guest_ip, host_port"
+                                ),
+                                "ConditionExpression": (
+                                    "#s = :f AND capacity_reservation_id = :rid"
+                                ),
+                                "ExpressionAttributeNames": {"#s": "status"},
+                                "ExpressionAttributeValues": {":f": "failed", ":rid": rid},
+                            }
+                        },
+                        {
+                            "Update": {
+                                "TableName": hosts_table.table_name,
+                                "Key": {"instance_id": host_id},
+                                "UpdateExpression": (
+                                    "SET used_vcpu = used_vcpu - :v, "
+                                    "used_mem_mb = used_mem_mb - :m, "
+                                    "vm_count = vm_count - :one"
+                                ),
+                                "ConditionExpression": (
+                                    "used_vcpu >= :v AND used_mem_mb >= :m AND vm_count >= :one"
+                                ),
+                                "ExpressionAttributeValues": {
+                                    ":v": vcpu,
+                                    ":m": mem_mb,
+                                    ":one": 1,
+                                },
+                            }
+                        },
+                    ]
+                )
+            except ClientError as e:
+                if e.response["Error"]["Code"] == "TransactionCanceledException":
+                    # 令牌已被别的释放者消费 / 下溢守卫命中 → 幂等跳过(不是错误)。
+                    print(f"reap-skip {tid}: reservation already released or status moved")
+                    continue
+                print(f"reap-skip {tid}: token release txn failed ({e})")
+                continue
+            reaped += 1
+            print(f"reap: {tid} on {host_id} token-release (elapsed={int(elapsed)}s)")
+            continue
+
+        # 非令牌(pre-#412 sync-create)租户:保持 bb 原行为——fence flip creating→failed
+        # (条件 creating,promote 赢则 CCF 跳过)后 guarded 释放 slot,不 stop-confirm。这条路
+        # 无令牌、无 orphan-reaper 兜底,若在此加"停不了就不释放"会永久漏 slot;且 #412 的
+        # overcommit 修复本就聚焦令牌路径,这里不扩范围(codex #2 的 stop-before-fence 隐患
+        # 仅存在于上面令牌分支,已改为 fence→stop→release)。
         try:
             tenants_table.update_item(
                 Key={"id": tid},
@@ -258,7 +408,7 @@ def _reap_stuck_creating(now):
                     ":f": "failed",
                     ":c": "creating",
                     ":t": now.isoformat(),
-                    ":r": f"reaped: stuck in creating > {CREATING_TIMEOUT_SECONDS}s",
+                    ":r": _reaped_reason,
                 },
             )
         except Exception as e:
@@ -292,6 +442,104 @@ def _reap_stuck_creating(now):
         reaped += 1
         print(f"reap: {tid} on {host_id} (stuck creating, elapsed={int(elapsed)}s)")
     return reaped
+
+
+# #412 —— 逃出 creating-only reaper 的【终态但仍持令牌】的 tenant 状态。两者都非 creating,
+# _reap_stuck_creating 扫不到;若仍带 capacity_reservation_id,那份容量永久搁浅:
+#   - requires_intervention:dispatch 失败超预算转此(review2 #4)。
+#   - deleting:delete 的令牌释放遇瞬时失败返 502 留 deleting,而 delete replay 若在到达释放前
+#     的某步(如 backup 重跑打已删目录)反复失败,令牌永不释放(review8 #2)。deleting 是终态
+#     意图(VM 正被拆),释放其容量恒安全。
+# requires_intervention:终态失败,VM 非活跃语义,令牌可【立即】回收(reserve 已提交、无论
+# VM 起没起都不再重试)。**deleting 不在此列**(codex review9 #1 + review10 #1):deleting 的 VM
+# 可能【还活着】(delete 先翻 deleting 再 backup+stop-vm,释放在 stop 成功之后),单靠 age 证明
+# 不了 stop-vm 已跑——一个在 stop 前崩溃的 delete 会被误 reap 掉活 VM 的容量/放置(欠记账红线)。
+# deleting 的令牌搁浅已由 delete 自身的重投兜底(队列 502 replay 带 _consumer_ident 重跑释放;
+# 同步无队列路径 review7 #2 也会对仍持令牌的 deleting 恢复释放),无需在此再兜一道有风险的。
+# 真正安全的 deleting 回收需 host 侧 "stop-vm 已跑/vm.json 已删" 持久标记 → 归 follow-up #420。
+#
+# #412 blocker-B(codex CHANGES_NEEDED #2)—— 追加 "failed":_reap_stuck_creating 现按
+# 【先围栏(creating→failed 保留令牌)→ stop-confirm → 释放】三步做,避免 stop 掉一个刚 promote
+# 成 running 的活 VM。若 stop 本轮未确认,行会停在【failed 且仍带令牌】,creating-reaper 再也扫
+# 不到它。此处把 failed 纳入孤儿兜底:下轮同样 stop-confirm 后释放。安全性:全仓仅 reaper 的
+# 围栏步会写出【failed + 令牌】(poller 转 running 删令牌、转 requires_intervention 属另一孤儿态、
+# _release_reservation 释放即删令牌);且 failed 绝不会被 promote 成活 VM(promote 条件锁 creating)。
+_ORPHAN_REAP_STATUSES = ("requires_intervention", "failed")
+
+
+def _reap_orphan_reservations(now=None):
+    """#412(review2 #4)—— 清扫【requires_intervention 且仍持 capacity_reservation_id】的令牌
+    孤儿(dispatch 失败超预算转此、非 creating,逃出 _reap_stuck_creating)。令牌化释放:扣 host
+    + 删令牌 + 清放置一个 TransactWriteItems,tenant 项条件 status=requires_intervention AND
+    capacity_reservation_id=:rid(与其它释放者同锚,幂等不双扣),host 项下溢守卫。释放后 status
+    保持不变(仍待上层处置),只是不再占容量。全量翻页。now 参数保留(签名稳定,当前未用)。"""
+    released = 0
+    for st in _ORPHAN_REAP_STATUSES:
+        lek = None
+        while True:
+            kw = {
+                "FilterExpression": (
+                    "#s = :st AND attribute_exists(capacity_reservation_id)"
+                ),
+                "ExpressionAttributeNames": {"#s": "status"},
+                "ExpressionAttributeValues": {":st": st},
+            }
+            if lek:
+                kw["ExclusiveStartKey"] = lek
+            page = tenants_table.scan(**kw)
+            for t in page.get("Items", []):
+                tid = t["id"]
+                host_id = t.get("host_id", "")
+                rid = t.get("capacity_reservation_id")
+                if not (host_id and rid):
+                    continue
+                vcpu = int(t.get("vcpu", 1) or 1)
+                mem_mb = int(t.get("mem_mb", 2048) or 2048)
+                # #412 blocker-B:释放令牌/扣账前先确认 VM 已停(requires_intervention 的 VM
+                # 可能仍在跑,launch-vm.sh 失败后会留活 FC)。未确认 → 本轮跳过,下轮再试。
+                if not _confirm_vm_stopped(host_id, tid, t.get("vm_num", 1)):
+                    continue
+                try:
+                    hosts_table.meta.client.transact_write_items(TransactItems=[
+                        {"Update": {
+                            "TableName": tenants_table.table_name,
+                            "Key": {"id": tid},
+                            "UpdateExpression": (
+                                "REMOVE capacity_reservation_id, dispatch_settle, "
+                                "host_id, vm_num, guest_ip, host_port"
+                            ),
+                            # 条件锁在【该行当前状态】+ 令牌:防扫描后 status 流转(如 deleting→
+                            # deleted 或被别的释放者消费)误扣。
+                            "ConditionExpression": (
+                                "#s = :st AND capacity_reservation_id = :rid"
+                            ),
+                            "ExpressionAttributeNames": {"#s": "status"},
+                            "ExpressionAttributeValues": {":st": st, ":rid": rid},
+                        }},
+                        {"Update": {
+                            "TableName": hosts_table.table_name,
+                            "Key": {"instance_id": host_id},
+                            "UpdateExpression": (
+                                "SET used_vcpu = used_vcpu - :v, "
+                                "used_mem_mb = used_mem_mb - :m, vm_count = vm_count - :one"
+                            ),
+                            "ConditionExpression": (
+                                "used_vcpu >= :v AND used_mem_mb >= :m AND vm_count >= :one"
+                            ),
+                            "ExpressionAttributeValues": {":v": vcpu, ":m": mem_mb, ":one": 1},
+                        }},
+                    ])
+                    released += 1
+                    print(f"reap-orphan: released token {rid} tenant={tid} host={host_id} st={st}")
+                except ClientError as e:
+                    if e.response["Error"]["Code"] == "TransactionCanceledException":
+                        # 令牌已被别的释放者消费 / status 已流转 → 幂等跳过。
+                        continue
+                    print(f"reap-orphan {tid}: release failed (non-fatal): {e}")
+            lek = page.get("LastEvaluatedKey")
+            if not lek:
+                break
+    return released
 
 
 def _rollback_migration(tenant, reason):

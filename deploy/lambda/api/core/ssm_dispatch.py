@@ -5,7 +5,7 @@
 从 handler.py 机械搬迁,函数体逐字不变:_launch_vm_wake_cmd / _launch_vm /
 _ssm_send / _ssm_run。_ssm_run 被 14 处调用(facade 别名保持 handler.<sym> 可用)。
 共享 ssm client 从 core.clients import;stdlib(shlex/time) 本模块自带。
-#187 P5: 原  Cognito b64 分支(base64/json)已随 channel/hub 下线一并移除,
+#187 P5: 原 WI-002 Cognito b64 分支(base64/json)已随 channel/hub 下线一并移除,
 第 11 位保留空占位("")保持位置对齐。
 按 design.md 层间契约:core 域不反向 import services/routes。
 facade:handler.py re-export 全部符号,旧 patch/调用路径全程有效。
@@ -79,8 +79,14 @@ def _launch_vm(
     chat_endpoint_enabled=False,
     gateway_token_ct=None,
     device_paired_b64="",
+    sync=False,
 ):
     """Fire-and-forget: launch VM + set up DNAT.
+
+    #422 — sync=True 时改走 _ssm_run(同步等 SSM 完成,返 bool),供 restore 冷恢复用:
+    restore 必须确认 launch-vm.sh 真跑成功(返 rc=0)才把租户翻 running,否则 fire-and-forget
+    的 CommandId 只证明"提交了",VM 可能没起来(假成功)。默认 sync=False 保持 create/migrate
+    的异步语义不变(它们靠 health_check sweep 异步推进,不阻塞 API)。
 
     If restore_backup_key is non-empty, launch-vm.sh will restore data.ext4 from that S3 key instead of using the template.
 
@@ -112,12 +118,12 @@ def _launch_vm(
     # host-agent read-back race). Non-empty (normal path) → DDB & guest share it.
     csecret_arg = _q(channel_secret)
     # 10th positional arg — per-tenant chatCompletions switch. Default off ("0")
-    # keeps launch-vm.sh deleting the endpoint (secure default; see the ops guide
+    # keeps launch-vm.sh deleting the endpoint (secure default; see CLAUDE.md
     # "chatCompletions 为什么不能全局默认开"). Only tenants with
     # chat_endpoint_enabled=true in DDB get "1" → enabled:true injected.
     chat_ep_arg = "1" if chat_endpoint_enabled else "0"
     # #187 P5: 11th positional arg — 保留空占位。转型前是 INJECTED_COGNITO_B64
-    # ( 端到端 Cognito 渠道机器用户 base64),随 channel/hub 一起下线;这里
+    # (WI-002 端到端 Cognito 渠道机器用户 base64),随 channel/hub 一起下线;这里
     # 传 "" 保持位置对齐,launch-vm.sh 位置参解析不动。
     cognito_arg = '""'
     # #187 P1: 12th positional arg — base64 ciphertext of the pre-minted gateway
@@ -138,17 +144,22 @@ def _launch_vm(
     # (byte-identical pre-#188 behavior; feature off = no paired.json). The value
     # is already base64 text from create_tenant, shell-quote defensively.
     device_paired_arg = _q(device_paired_b64) if device_paired_b64 else '""'
-    # The live two-tier route is allocated by host-agent from the configured
-    # bitmap range and committed to Redis after the guest passes health checks.
-    # The historical VM_PORT_BASE+vm_num rule was never consumed by edge, was
-    # outside the edge->host SG range, and could not be reconstructed from DDB
-    # after host-agent replaced host_port during promotion. Do not create that
-    # second, permanently leaked DNAT family.
+    # The live route is allocated by host-agent from the configured bitmap
+    # range and committed to Redis after health succeeds. The historical
+    # VM_PORT_BASE+vm_num DNAT family was never consumed by Edge and leaked one
+    # rule per lifecycle retry. Keep host_port in the record for the live
+    # bitmap route, but do not create a second rule here.
     cmd = (
         f"/home/ubuntu/launch-vm.sh {tenant_id} {vm_num} {vcpu} {mem_mb} "
         f"{tpl_arg} {restore_arg} {skills_arg} {vkey_arg} {csecret_arg} "
         f"{chat_ep_arg} {cognito_arg} {gw_token_arg} {device_paired_arg}"
     )
+    # #422 — sync=True(restore):同步等 launch-vm.sh 跑完,返 (ok, rc) 元组。restore 据此
+    # 三分:ok=True→翻 running;ok=False 且 rc==75→flock-skip(另一次同租户 launch 在跑,VM
+    # 正被拉起)→保持 restoring 等重投收敛,【不回滚不释放 slot】;ok=False 且 rc!=75→真失败回滚。
+    # `cmd` 只运行 launch-vm.sh;flock-skip 时脚本 exit 75,SSM ResponseCode 如实反映。
+    if sync:
+        return _ssm_run(instance_id, cmd, timeout=300, want_rc=True)
     # Return the SSM CommandId (or None if submission failed — notably an SSM
     # SendCommand ThrottlingException under concurrent consumer fan-out, loop
     # 2026-07-01 real-machine bug). Callers on the create path check this: a
@@ -177,8 +188,16 @@ def _ssm_send(instance_id, command, timeout=120):
         return None
 
 
-def _ssm_run(instance_id, command, timeout=30):
-    """Execute command on host via SSM Run Command. Returns True on success."""
+def _ssm_run(instance_id, command, timeout=30, want_rc=False):
+    """Execute command on host via SSM Run Command. Returns True on success.
+
+    want_rc=True: return (ok: bool, rc: int|None) instead of bare bool, where rc is
+    the host script's shell exit code (SSM ResponseCode). #422 restore needs this to
+    tell a benign flock-skip (launch-vm.sh exits 75 when another launch of the SAME
+    tenant already holds the per-tenant flock — see launch-vm.sh:395) apart from a
+    real failure: on rc==75 the VM is being brought up by the concurrent/redelivered
+    launch, so restore must NOT roll back. rc is None when we never got an invocation
+    result (submit error / timeout / InvocationDoesNotExist throughout)."""
     try:
         # SSM runs as root; set HOME so ~ resolves to /home/ubuntu
         wrapped = f"export HOME=/home/ubuntu && cd /home/ubuntu && {command}"
@@ -198,17 +217,19 @@ def _ssm_run(instance_id, command, timeout=30):
                 )
                 status = result["Status"]
                 if status == "Success":
-                    return True
+                    return (True, result.get("ResponseCode", 0)) if want_rc else True
                 if status in ("Failed", "TimedOut", "Cancelled"):
+                    rc = result.get("ResponseCode")
                     print(
-                        f"SSM failed: {status} - {result.get('StandardErrorContent', '')}"
+                        f"SSM failed: {status} (rc={rc}) - "
+                        f"{result.get('StandardErrorContent', '')}"
                     )
-                    return False
+                    return (False, rc) if want_rc else False
             except ssm.exceptions.InvocationDoesNotExist:
                 pass
             time.sleep(2)
         print(f"SSM timeout waiting for command {cmd_id}")
-        return False
+        return (False, None) if want_rc else False
     except Exception as e:
         print(f"SSM error: {e}")
-        return False
+        return (False, None) if want_rc else False

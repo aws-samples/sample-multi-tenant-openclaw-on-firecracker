@@ -1,80 +1,119 @@
-# 外部平台集成指南(客户视角)
+# 外部平台集成指南
 
-本节面向**要把 ClawPool 集成进自有平台的客户**(如交易平台、二手电商、任意 SaaS)。读完你能让平台的每个自由用户拥有一个专属的 AI 助手(独立 openclaw),全程用你自己的账号体系,用户不接触任何底层控制台。
+本章面向把 ClawPool 集成进自有 SaaS、交易平台或企业门户的客户。当前推荐路径是：
 
-> 采用「控制面代开 + 平台自签会话令牌」路径：租户开通用 `x-api-key` 调 `POST /tenants` 代开（归属见第 2 节）；实时聊天走两级路由（第 13 章），第一跳用平台自签 HS256 JWT，第二跳用 OpenClaw 原生 Ed25519 device 认证。早期 Cognito 联邦方案已于 2026-07-07 SUPERSEDED。
+- 用户身份、登录和会话由客户平台自己管理。
+- 客户后端调用 ClawPool 控制面创建和管理 tenant。
+- 浏览器只连接客户平台的 `/gw/ws`。
+- 客户后端代持每租户 gateway token 和 Ed25519 device 私钥，连接 microVM。
 
-> 定位区分:上一节《控制面 API 对接文档》是**逐接口参考**;本节是**集成方案与步骤**——你的平台该怎么接、认证怎么串、用户怎么用。术语「本平台/ClawPool」指被集成方(提供 openclaw pool),「你的平台」指集成方(客户自有平台)。
+早期“把客户 IdP 联邦进 ClawPool Cognito，再换 hub token”的方案已废弃。
 
-## 1. 集成后长什么样
+## 1. 责任边界
 
-- 你的用户在**你自己的平台**用**你自己的账号**登录(不新注册 ClawPool 账号)。
-- 用户在你平台内「开通 AI 助手」→ **你的后端**为该用户开一个专属 openclaw microVM。
-- 用户进入 AI 助手界面(嵌在你的域名下)→ 实时对话。
-- 每个用户的 openclaw 相互隔离,一个用户看不到另一个用户的会话/数据。
+| 责任 | 客户平台 | ClawPool |
+| --- | --- | --- |
+| 终端用户注册、登录、会话 | 负责 | 不接触用户密码 |
+| 购买、配额、退款、停用 | 负责 | 接收生命周期调用 |
+| 用户到 tenant 的归属 | 生成并持久化映射 | 存 `owner_id`、`tenant_user_id`、`platform_id` |
+| 浏览器实时入口 | `/gw/ws` | 不提供 hub token 兑换 |
+| 第二跳认证 | 代持并解密租户凭据 | gateway token + Ed25519 device 验证 |
+| microVM、调度、镜像、备份 | 不负责 | 负责 |
 
-## 2. 三个集成决策(先定这三件)
+## 2. 控制面身份
 
-**① 身份怎么接(联邦优先)**
-把你平台的 IdP(OIDC 或 SAML)注册为 ClawPool 单个 Cognito User Pool 的 upstream IdP。你的用户登录时经你的 IdP 认证,Cognito 联邦签发 ClawPool 信任的 JWT。**你不需要把用户导入 ClawPool,也不需要 ClawPool 账号体系**——信任根仍是 ClawPool 的 Cognito,但用户身份来自你。若你平台没有独立 IdP,也可直接用 ClawPool 为你分配的 Cognito app client 做账号密码登录(最简)。
+所有控制面调用都带 `x-api-key`，但 API Key 仅用于 API Gateway usage plan 客户
+标识，不是独立认证。写调用还必须满足以下一种部署合同：
 
-**② 租户谁来开(你的后端代开,不是用户自助)**
-用户点「开通 AI 助手」→ 你的前端带用户的 JWT 调**你的后端** → 你的后端持 ClawPool 发给你的 `x-api-key` 调 `POST /tenants`。这样你能在开通前插入自己的**购买/计费/配额**逻辑,用户不直接建节点。ClawPool 提供了自助注册端点 `POST /tenants/self`,但**推荐走后端代开**以保留你的商业门控。
+1. 带有效的 operator/admin Cognito Bearer token。
+2. 在受信私网中显式把 `console_auth.default_no_jwt_role` 配为
+   `operator` 或 `admin`，并用 IAM SigV4、private API resource policy 或 Lambda
+   authorizer 约束真实身份。
 
-> **Note** 租户归属有两条路,按你的调用方式二选一,**不可混用**。**路 1 · 纯 api-key 代开(推荐,最简)**:请求只带 `x-api-key`(不带用户 Bearer),body 里直接传 `owner_id`(用户在 ClawPool Cognito 的 sub,UUID)与 `tenant_user_id`(你平台的用户稳定 id),控制面校验后落库。**路 2 · 转发用户 `id_token`**:请求带 `x-api-key` + 用户的 Bearer `id_token`(联邦签发),归属自动取自 token(sub → `owner_id`、`custom:tenant_user_id` claim → `tenant_user_id`);**此路下 body 不得再传这两个字段,带了返回 403**(owner 只能来自验证过的 token,防止把节点开到他人名下)。`platform_id` 两条路都可在 body 传(可选,正则 `^[a-zA-Z0-9._-]{1,128}$`,外部平台代开时标记归属平台;见 `tenant_service.py:252`/`core/utils.py:110`)。
->
-> **`tenant_user_id` 是数据归因标签,不是授权凭据**:它不参与聊天/生命周期的授权判定(授权走 `owner_id`/`authorized_users`),但你给某租户落了 `tenant_user_id`,持相同 `custom:tenant_user_id` claim 的联邦登录用户就能经 `GET /users/{tenant_user_id}/tenants` 列出该租户的元数据(不含凭据)——落这个字段即表示允许该用户看到这份列表。请用**全局唯一**的用户 id(建议带你的平台前缀,如 `yourplatform:12345`),不同平台用相同裸数字 id 会互相看到对方同名用户的节点列表。
+生产环境优先使用 platform-scoped API key/authorizer，把调用方限制到自己的
+`platform_id`。浏览器绝不能持有 `x-api-key` 或控制面 Bearer token。
 
-**③ AI 助手界面放哪(嵌你的域)**
-AI 助手前端(chat UI)嵌在你的域名下,用户从你的登录态无缝进入(不跳转到陌生域名)。前端用联邦签发的 JWT 换取实时对话令牌。ClawPool 提供参考实现(Hosted UI + authorization_code + PKCE + refresh,已联邦就绪)。
+## 3. 用户归属
 
-## 3. 集成步骤
+客户平台为每个用户维护：
 
-**Step 1 · 注册你的平台**
-联系 ClawPool 运营,提供:你的 IdP 元数据(OIDC issuer + JWKS URL,或 SAML metadata)、你的 `platform_id`、回调 URL。ClawPool 侧:把你的 IdP 注册为 Cognito upstream provider + 配 Pre-Token-Generation 注入 `custom:tenant_user_id`/`custom:platform_id` + 发给你一个 `x-api-key`(后端代开租户用,server-side 保管,勿入前端)。
+- `owner_id`：UUID，控制面 owner 门使用。
+- `tenant_user_id`：客户平台稳定用户 id，用于用户维度查询；建议加平台前缀。
+- `platform_id`：平台命名空间。
 
-**Step 2 · 前端接联邦登录**
-你的前端发起 `authorization_code + PKCE` 登录到 Cognito Hosted UI,带 `identity_provider=<你的platform_id>` 直接跳你的 IdP(跳过选择器)。用户登录后拿到含 `custom:tenant_user_id`/`custom:platform_id` 的 `id_token`。
+`tenant_user_id` 是查询/归因字段，不是独立授权凭据。平台后端必须从已验证的会话
+推导这些值，不接受浏览器自报 owner 或 platform。
 
-**Step 3 · 后端代开租户**
+## 4. 开通流程
 
+```text
+Browser -> customer backend: activate assistant
+customer backend:
+  1. verify platform session
+  2. run purchase/quota checks
+  3. POST /tenants with control-plane credentials
+  4. poll GET /tenants/{id}
+  5. return readiness only
 ```
-用户点开通 → 你的前端 POST 你的后端(Bearer <用户 id_token>)
-你的后端:① 校验 id_token(联邦签发,JWKS 验签) ② 跑你的购买/配额门
-         ③ 持 x-api-key 调 POST {CTRL_API}/tenants(不带用户 Bearer)
-            body: {name, client_token:<幂等键>,
-                   owner_id:<用户的 Cognito sub>, tenant_user_id:<你平台的用户id>,
-                   platform_id:<你的平台标识>}
-         ④ 轮询 GET {CTRL_API}/tenants/{id} 到 status:running
-         ⑤ 回前端 {tenant_id, status}
+
+请求示例：
+
+```json
+{
+  "name": "assistant-user-123",
+  "client_token": "market:user-123",
+  "owner_id": "11111111-2222-3333-4444-555555555555",
+  "tenant_user_id": "market:user-123",
+  "platform_id": "market"
+}
 ```
 
-`client_token` 用 `<platform_id>:<用户id>` 保证同用户重复开通幂等(不双开)。
+带 `client_token` 时返回 ID 形态为 `t-<16hex>`。`creating`、`pending` 或 `queued`
+都不是完成；继续轮询到 `status=running`，需要应用就绪时再检查
+`app_health=up`。
 
-> **Important** 要让「按用户管理 fleet」(Step 5)与「用户在 chat UI 看到自己的节点」生效,创建时必须让归属字段落库:纯 api-key 代开就**在 body 里显式传 `owner_id` + `tenant_user_id`**(上例);转发用户 id_token 则归属自动取自 token。两者都不给,租户会落在系统名下——用户 `GET /tenants` 列不出它、`GET /users/{tenant_user_id}/tenants` 也查不到。参考实现 `console/marketplace-demo/broker/handler.py` 展示了整体流程骨架,以本节口径为准。
+## 5. 聊天流程
 
-**Step 4 · 进入 AI 助手**
-用户点「进入 AI 助手」→ 跳你域名下的 chat UI → 你的后端 `GET {CTRL_API}/tenants/{id}` 取回该租户 gateway token 与 device 三件套的 KMS 密文并本地解密，用你的平台会话令牌（HS256 JWT）建 `wss {你的平台后端}/gw/ws?token=` → 平台后端作为 WS 客户端经边缘与 microVM gateway 完成 Ed25519 device 握手 → 对话。链路细节见「数据面两级路由」章。
+```text
+Browser
+  -> wss://<customer-platform>/gw/ws?token=<platform-session-token>
+  -> customer backend
+  -> /ws/{tenant_id}
+  -> CloudFront -> ALB -> OpenResty -> host DNAT
+  -> microVM gateway :18789
+```
 
-**Step 5 · 按用户管理**
+客户后端：
 
-- 查某用户所有 AI 助手:`GET {CTRL_API}/users/{tenant_user_id}/tenants`
-- 该用户节点汇总:`GET {CTRL_API}/users/{tenant_user_id}/summary`
-- 批量启停(如用户退订):`POST {CTRL_API}/users/{tenant_user_id}/action {action:stop}`
+1. 验证平台会话并从服务端映射选择 tenant。
+2. 调 `GET /tenants/{id}` 或 `/credentials` 获取 gateway/device 密文。
+3. 在进程内用正确 KMS encryption context 解密或解开 recipient 信封。
+4. 完成 `connect.challenge` 的 Ed25519 签名和 gateway token 认证。
+5. 映射 `chat.send` 与 `reply_delta` / `reply` / `reply_error`。
 
-## 4. 隔离与安全保证(给你的用户的承诺)
+浏览器从不接触 ClawPool 凭据。旧 `/hub/token`、`/hub/ws`、`/channel-token` 与
+hub 文件接口都不存在。
 
-- **跨用户隔离**:每个用户的 openclaw 是独立 microVM(独立内核),用户 A 无法访问用户 B 的会话/数据/节点。实时通道三段闸:令牌绑单一租户 + 服务端验证的用户身份撮合 + 授权查服务端账本(绝不信客户端自报)。
-- **你的用户凭据不出你平台**:用户密码只在你的 IdP / 你的账号体系;ClawPool 侧数据面只认你的平台会话令牌与 device 认证,不碰你的用户密码。
-- **数据面凭据服务端代持**:每租户 gateway token 与 device 私钥以 AWS KMS 信封加密(上下文绑 `tenant_id`/`owner_id`),由你的平台后端解密后代持,不下发到浏览器;前端只拿你的平台会话令牌。
-- **凭据保管**:后端代开用的 `x-api-key` 是 server-side 凭据,绝不放前端;定期轮换。
+## 6. 用户维度管理
 
-## 5. 多 region
+- `GET /users/{tenant_user_id}/tenants`：列该用户的 tenant。
+- `GET /users/{tenant_user_id}/summary`：按状态汇总。
+- `POST /users/{tenant_user_id}/action`：批量 start/stop。
+- `POST /external/authz`：启用外部授权模式后，HMAC 签名写 grant/revoke。
 
-你的平台与 ClawPool pool 可以不在同一 region。控制面 API 跨 region 调用即可;数据面第一跳落在你的平台后端、由你决定部署点。
+这些接口仍受 owner、platform scope 与 RBAC 约束。
 
-## 6. 参考实现
+## 7. 安全要求
 
-`console/marketplace-demo/`(开发测试床,不随产品交付)给了一套最小可跑的集成参考:二手电商 SPA(`marketplace.html`)+ 后端代开(`broker/handler.py`)+ 联邦配置脚本(`setup-federation.sh`)+ 测试矩阵(`TESTPLAN.md`)。你可照它的结构接自己的平台。
+- API Key、控制面 Bearer、gateway token、device 私钥都只存在后端。
+- 平台后端不得把 `GET /tenants/{id}` 或 `/credentials` 原样返回浏览器。
+- KMS 解密必须带与加密时完全一致的 `tenant_id` 或 `owner_id` context。
+- `client_token` 必须稳定，防止重试双开。
+- 文件功能需要平台后端自行实现 tenant 授权、MIME/size 限制与 Amazon S3 预签。
+- 多 region 调用要显式配置超时、重试和幂等；不能把网络超时当失败后盲目重建。
 
-> 状态:控制面 API(创建/查询/生命周期/按用户管理)已上线可用;数据面身份以 device 认证 + 平台会话令牌为准（第 13 章）。
+## 8. 参考实现
+
+`engineering/backend/` 展示平台 JWT、`/gw/ws`、控制面客户端和 device 握手。
+`console/marketplace-demo/` 是历史开发测试床，其中仍可能包含已废弃的 Cognito/hub
+用例，不作为当前契约。上线前以第 9 章、OpenAPI、第 13 章和目标环境回归为准。

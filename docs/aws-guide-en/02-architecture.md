@@ -12,7 +12,7 @@ Deploying this solution with the default parameters builds the following compone
 
 > **Note**
 >
-> The AWS resources of this solution are created based on AWS Cloud Development Kit (AWS CDK) constructs. At deployment time, the AWS CDK synthesizes an AWS CloudFormation template and manages the lifecycle of the resources. The data plane (OpenResty edge Auto Scaling group + Amazon ElastiCache Redis routing table) is an opt-in capability, controlled by `edge.enabled` / `redis.enabled` in `config.yml` and disabled by default; see [Chapter 13, Data-plane two-tier routing](13-data-plane-redesign.md) for details when enabled.
+> The AWS resources are created with AWS Cloud Development Kit (AWS CDK) constructs. The data plane uses an OpenResty edge Auto Scaling group plus an Amazon ElastiCache route store (Valkey by default, Redis-compatible) and is controlled by `edge.enabled` / `redis.enabled`; see Chapter 13.
 
 The components of the solution deployed by the AWS CloudFormation template follow this high-level flow.
 
@@ -28,7 +28,7 @@ The components of the solution deployed by the AWS CloudFormation template follo
 
 6. Acting as a WebSocket client, the platform backend gateway connects through Amazon CloudFront → Application Load Balancer → the OpenResty edge to the target microVM's OpenClaw gateway, authenticating with the OpenClaw-native Ed25519 asymmetric device handshake (the private key is held by the platform backend; the public key is cold-injected into the microVM pairing file).
 
-7. The OpenResty edge looks up the Amazon ElastiCache Redis routing table by `tenant_id` (`route:{tenant_id}`), strips the `/ws/{tenant_id}` prefix, and delivers the connection via host iptables DNAT straight to port 18789 of the corresponding microVM gateway. The microVM exposes this port only on the host-internal TAP interface and opens no public inbound access.
+7. The OpenResty edge looks up the Amazon ElastiCache route store by `tenant_id` (`route:{tenant_id}` over the Valkey/Redis wire protocol) and delivers the connection through host iptables DNAT to port 18789 of the corresponding microVM gateway.
 
 8. Key events of the control plane and data plane are recorded as metrics and logs through Amazon CloudWatch; host probes expose Prometheus metrics for the monitoring platform to collect; security-related events can be aggregated into a unified alerting channel through Amazon GuardDuty and Amazon EventBridge (disabled by default, enabled on demand).
 

@@ -3,7 +3,7 @@
 > 面向客户/接入方:如何让某个租户用**你自己的 LLM 网关地址**(尤其自建 `http://` 的
 > litellm / OpenAI-兼容网关),而不是平台默认的共享网关。
 
-## TL;DR(一句话)
+## 接入摘要
 
 改某个租户的 LLM `baseUrl`,**唯一稳定入口是「创建租户时」在请求体传
 `injected_parameters.items.llm_base_url`**。**不要**登进 microVM 手改 `openclaw.json`
@@ -34,7 +34,7 @@
 
 同理可用于 OpenAI-兼容的任意网关地址(只要 litellm/OpenClaw 认这个 baseUrl 形态)。
 
-## 2. 为什么不能登进 VM 手改 openclaw.json
+## 2. 禁止在运行中 VM 手工修改
 
 平台每次 VM 启动(全新创建 + 唤醒都算)都会跑一次配置**收敛**(`oc_harden_config`),把
 `models.providers.litellm.baseUrl` 收敛回"该租户应有的值":
@@ -48,7 +48,7 @@ bug,是刻意的部署纪律(运行态不留手改漂移——LLM 网关 IP 变�
 收敛保证配置和部署代码一致)。"改成 http 却反复被覆盖回去"的现象,根因就是这个:改了
 运行态文件、但没通过创建参数落进 `frozen_injection_plan`,每次开机被还原。
 
-## 3. 存量(老)租户想换网关怎么办
+## 3. 存量租户切换网关
 
 `frozen_injection_plan` 是**创建时冻结、之后不可变**(目前没有"改注入计划"的 API)。所以:
 
@@ -56,7 +56,7 @@ bug,是刻意的部署纪律(运行态不留手改漂移——LLM 网关 IP 变�
   旧租户,新建时带上 `injected_parameters.items.llm_base_url`。
 - 需要保数据的,先按备份/恢复流程做(删除默认会同步备份,见部署手册)。
 
-## 4. 排查:我看到的 baseUrl 是 https,谁改的?
+## 4. baseUrl 协议排查
 
 平台侧**不会**产生 https(已核实:收敛脚本 `oc_normalize_litellm_baseurl` 只在地址**无
 scheme** 时才补 scheme,且默认补 `http`;不存在任何把 http 改 https 的逻辑)。如果你反复

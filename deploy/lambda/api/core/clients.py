@@ -70,6 +70,15 @@ version_snapshots_table = (
     else None
 )
 
+# #394 step1 — 持久化 pull Job 表(progress 按 job_id 精确查;host 重启 /tmp 丢了终态仍在)。
+# env-gated 同上:未部署本步的环境无此 env → None,core/image_jobs.py 全部降级成 no-op,
+# 现有 live pull 行为不变(ADR §12 step1"不改变现有 live 路径")。
+image_jobs_table = (
+    ddb.Table(os.environ["IMAGE_JOBS_TABLE"])
+    if os.environ.get("IMAGE_JOBS_TABLE")
+    else None
+)
+
 # PRD #50-58 — control-plane scale-out GSIs on the tenants table (defined in
 # deploy/stack.py). gsi_owner partitions by owner_id (Cognito sub) for "my
 # nodes"; gsi_tenant_user partitions by tenant_user_id for the external backend's

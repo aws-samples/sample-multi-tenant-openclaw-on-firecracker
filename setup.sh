@@ -396,11 +396,12 @@ aws s3 cp "$SCRIPT_DIR/deploy/userdata/oc-guest-log-reader.py" "s3://${BUCKET}/d
 # pulling scripts now that S3 has them — guards against the race where the
 # host's user-data ran before scripts were uploaded.
 echo "✓ Scripts uploaded; existing hosts will pick them up via init-host.sh retry loop"
-# deploy/edge/ — OpenResty 边缘全套(install-edge.sh + nginx.conf + route.lua + lib/)。
-# edge ASG userdata 从 deployment/edge/ 拉全套后跑 install-edge.sh 自举(P7 补,
-# 之前占位 userdata 不装 OpenResty → ELB 永 unhealthy → ASG 无限换机)。
-aws s3 cp "$SCRIPT_DIR/deploy/edge/" "s3://${BUCKET}/deployment/edge/" \
-  --recursive --exclude "test/*" "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
+# deploy/edge/ 不再从这里上传(#389 v2 块 4)。整棵树由 CDK 打成单个 tar.gz
+# 发到 deployment/bootstrap/edge/<sha256>/,edge userdata 绑同一个 sha256 —— 与
+# host 的 deployment/bootstrap/host/<sha256>/init-host.sh 同一套语义。
+# 这里手工传的旧形态是"patch 忘了传 → 前缀留旧版、改动静默不生效"(#265)的成因,
+# 删掉它才让 sha 绑定真的具备权威性:否则两个上传者写同一份资产,谁赢看时序。
+# 改 edge 资产 = cdk deploy(或块 5 的 /bootstrap/promote 在已有版本间切换)。
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/adot-config.yaml" "s3://${BUCKET}/deployment/scripts/adot-config.yaml" \
   "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 

@@ -1,7 +1,7 @@
 #!/bin/bash
 # 在新账号用 CodeBuild 烤黄金镜像(arm64)。代码从本地仓库打包→S3 当 source(禁账号间拷数据)。
 # 用法: ./build-golden-on-codebuild.sh <PROFILE> <ASSETS_BUCKET> <IMAGE_VERSION> [REGION]
-#   ./build-golden-on-codebuild.sh <aws-profile> openclaw-assets-<acct> v1 <region>
+#   ./build-golden-on-codebuild.sh ${AWS_PROFILE} openclaw-assets-<acct> v1 <region>
 set -euo pipefail
 PROFILE="${1:?profile}"; BUCKET="${2:?assets bucket}"; VER="${3:?image version}"; REGION="${4:-ap-southeast-1}"
 PROJ="openclaw-golden-image-builder"

@@ -5,8 +5,8 @@
 > for 100k-tenant scale. Chinese counterpart lives at
 > `docs/aws-guide/11-ops-maintenance.md`; both stay in sync.
 > Source of truth for the data-plane redesign:
-> `internal-docs/00-knowledge-base/the data-plane design/` + the arch review
-> in `internal-docs/progress/aws-architect.md`.
+> `engineering/00-knowledge-base/SPEC/11-ENGINE-TRANSFORM/` + the arch review
+> in `engineering/progress/aws-architect.md`.
 
 ---
 
@@ -142,7 +142,9 @@ CloudWatch Agent tails journald for the `claw-edge` unit — grep `WARN` or
 
 ## 11.4 Host ASG (metal Firecracker pool)
 
-**Role**: Each r8g.metal-24xl runs 380 microVMs — the "fortress" (project
+**Role**: Hosts run the Firecracker microVM fleet. 380 per host is a 2 GB/VM
+target profile; the repository default is 4 GB/VM and the current primary
+measurement is 187 fully healthy nodes.
 iron law #3).
 
 **Routine**:
@@ -192,9 +194,10 @@ az_failover` — should trigger).
 
 **100k-scale notes**:
 
-- 380 tenants per host (2GB/VM × 380 = 760GB matches the 768GB metal) is
-  a hard ceiling. Raising `mem_overcommit_ratio` above 1.5 lands you in
-  the narrow `free_page_reporting` balloon window and risks OOM.
+- 380 tenants per host is a capacity estimate from 760 GB / 2 GB, not a measured
+  hard limit. The current primary measurement is 187 fully healthy nodes with a
+  disk bottleneck. Establish production capacity from target VM memory, disk,
+  IOPS, and load tests rather than memory division alone.
 - 300 hosts must spread evenly across AZs. Skewed placement (all in one
   AZ) magnifies the blast radius of an AZ event.
 - `lifecycle_hook_timeout=1200s` is already generous (842MB golden image
@@ -204,13 +207,14 @@ az_failover` — should trigger).
 
 ---
 
-## 11.5 ElastiCache Redis (route cache authority)
+## 11.5 ElastiCache Valkey/Redis (route cache authority)
 
 **Role**: `tenant_id → {host, port, guest_ip}` — the authoritative routing
 map. host-agent writes; edge reads. Both are one-way.
 
 **Shape**: Multi-AZ replication group. 3 nodes (1 primary + 2 replicas
-across AZs), `automatic_failover_enabled=true`, Redis 7.x, private subnet,
+across AZs), `automatic_failover_enabled=true`, Valkey 7.2 by default with
+Redis OSS 7.1 compatibility, private subnet,
 SG accepts only host + edge.
 
 **Routine**:
@@ -275,7 +279,7 @@ redesign.
 
 - Lambda: `update-function-code` must ship the full dependency wheel —
   Python-only updates without deps have broken PyJWT in production (see
-  `memory/e2e--passed-and-pyjwt-lesson`).
+  the operational troubleshooting guidance in this chapter).
 - DynamoDB: PITR enabled (35 days). audit table WORM archive controlled
   by `config.yml:audit.worm_archive_enabled`. Snapshot before any delete
   (iron law #4).
@@ -452,5 +456,5 @@ Run these before taking over operations:
 3. Load Grafana; if there are no dashboards, run the provisioning script.
 4. Execute one manual failover drill (ElastiCache + host AZ).
 5. Read the last 30 days of `CHANGELOG.md`.
-6. Read `.claude/rules/amazon-production-safety-do-not-delete.md` (never
-   delete resources without a snapshot; treat unknowns as production).
+6. Read `engineering/02-system-constraints/ENGINEERING-RULES.md` and complete
+   the required snapshot checks before deleting AWS resources.

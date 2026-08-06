@@ -13,6 +13,7 @@ import shlex
 import time
 import uuid
 import ipaddress
+from datetime import datetime
 
 import boto3
 
@@ -28,13 +29,11 @@ from core.clients import (
     s3,
     ssm,
 )
-from core.utils import (
-    _now,
-    _resp,
-    _err,
-    _parse_limit,
-)
+from core.utils import _now, _resp, _err, _parse_limit
 from core.pagination import decode_cursor, encode_cursor
+from core import image_jobs
+from core import image_slots
+from core import image_lease
 
 
 def _public_hosts(items):
@@ -218,6 +217,16 @@ def register_host(body):
 
 
 def deregister_host(instance_id):
+    # #394(ADR §6.4)—— 正被镜像操作独占的 host 不得直接下线:pull/promote 写到一半被
+    # terminate 会留下"控制面以为装好了、机器已不存在"的不可对账状态。持有【有效】lease
+    # 时拒绝(过期 lease 不拦:那台机器上的操作早已死掉,不该永久挡住运维回收)。
+    lease = image_lease.read(instance_id)
+    if image_lease.is_held(lease):
+        return _err(
+            409, "IMAGE_OPERATION_IN_PROGRESS",
+            f"host {instance_id} has an image operation in progress "
+            f"({lease.get('active_image_operation_id')}); wait for it to finish or expire",
+        )
     hosts_table.update_item(
         Key={"instance_id": instance_id},
         UpdateExpression="SET #s = :s",
@@ -591,6 +600,12 @@ _SAFE_DISK_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 # (快照不存在)。别让乱输入默默查 DB 走成 404,误导调用方"快照不存在"(owner 2026-07-14)。
 _SNAPSHOT_TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
+# Host agent normally reconciles slots.json every 15s. A destructive global delete only trusts
+# a mirror refreshed within this window; missing/stale evidence fails closed. The generous
+# default tolerates transient throttling while still making a stopped/old agent visible.
+_IMAGE_SLOTS_MIRROR_MAX_AGE_S = int(os.environ.get("IMAGE_SLOTS_MIRROR_MAX_AGE_S", "120"))
+_DELETE_GATE_STALE_S = int(os.environ.get("IMAGE_SNAPSHOT_DELETE_STALE_S", "300"))
+
 # #376 — create_image_snapshot 的 label 是 API 调用方可控输入(shell 脚本从 manifest 读,
 # 但 API 直接收任意文本)。label 会进 console 显示 + 日志,故白名单校验:长度 ≤128 + 只允许
 # 文件名常见安全字符 [A-Za-z0-9._-],挡 shell 元字符/空格(纵深防御,不裸存未净化的值)。
@@ -772,28 +787,41 @@ def _stage_lines(f):
     return [f"BASE={q(base)}", f'echo "[stage] $BASE → {staged}"', f"cp {src} {staged}"]
 
 
-def _commit_lines(f):
-    """Phase2 循环②(commit):把已 stage 好的文件 mv/cp 到 live 原位置(launch-vm/service
-    直接读的地方)。全是同盘原子 rename(镜像盘)或 cp(脚本),极快、窗口极小。
-    · 镜像盘:mv "$ARCH"/openclaw-<kind>.ext4 → /data/firecracker-assets/openclaw-<kind>.ext4。
+def _commit_lines(f, snapshot_time=None):
+    """Phase2 循环②(commit):把已 stage 好的文件 mv/cp 到最终位置。全是同盘原子 rename
+    (镜像盘)或 cp(脚本),极快、窗口极小。
+    · 镜像盘:
+      - #394 传了 snapshot_time → mv 到【不可变版本目录】
+        /data/firecracker-assets/versions/<snapshot_time>/openclaw-<kind>.ext4。
+        装进版本目录【不】改变任何 VM 的启动版本 —— 启动版本只由 slots.json 指针决定,
+        故装 canary 期间同 host 的 live 租户完全不受影响(ADR §11.1)。
+      - 未传(兼容路径)→ 保持历史行为 mv 到扁平 live 位。
     · 脚本/manifest:mv "$ARCH"/staged-<base> → init-host 映射的 dest(.sh chmod+chown;
       常驻 .py service 装文件但不自动重启,只提示)。
     · adot-config.yaml(dest=None):stage 段已跳过,这里也跳过。
-    失败 INSTALL_MV_FAILED exit1 → 此时可能已动部分 live,trap 不复位(留 upgrading 给 ops)。"""
+    失败 INSTALL_MV_FAILED exit1。注:装版本目录时 live 指针尚未改,失败不影响存量。"""
     q = shlex.quote
     path = f["path"]
     base = path.rsplit("/", 1)[-1]
     kind = _disk_kind_of(f)
     if kind is not None:
         staged = _staged_disk_path(kind)
-        live = f"{_LIVE}/openclaw-{kind}.ext4"
+        if snapshot_time:
+            dest_disk = image_slots.disk_path(snapshot_time, kind)
+        else:
+            dest_disk = f"{_LIVE}/openclaw-{kind}.ext4"
         return [
             f"BASE={q(base)}",
-            f'echo "[commit] $BASE → {live}"',
-            f'mv {staged} {live} '  # 同盘原子 rename → live
-            f'|| {{ _perr "INSTALL_MV_FAILED mv $BASE to live failed"; exit 1; }}',
+            f'echo "[commit] $BASE → {dest_disk}"',
+            f'mkdir -p "$(dirname {q(dest_disk)})"',
+            f'mv {staged} {q(dest_disk)} '  # 同盘原子 rename
+            f'|| {{ _perr "INSTALL_MV_FAILED mv $BASE to {dest_disk} failed"; exit 1; }}',
         ]
     dest, is_service = _script_live_dest(path)
+    # #394 —— manifest.json 随三盘一起进版本目录(版本目录要自洽:盘 + 它的 manifest 同处
+    # 一目录,才能事后核对"这套盘是哪版")。扁平 live 位的 manifest.json 由 promote 时另写。
+    if snapshot_time and dest is not None and path.endswith("rootfs/manifest.json"):
+        dest = image_slots.manifest_path(snapshot_time)
     if dest is None:  # adot-config.yaml:stage 已跳过,commit 也跳过
         return [f"BASE={q(base)}"]
     d = q(dest)
@@ -807,6 +835,202 @@ def _commit_lines(f):
     if is_service:  # 常驻 service:装文件不自动重启(避免打断在途生命周期),只提示
         out.append(f'echo "[commit] $BASE updated — a host-agent restart is required to apply" >&2')
     return out
+
+
+def _mirror_canary_slot(instance_id, snapshot_time, live_snapshot_time=None):
+    """#394 —— canary 装好后把槽位投影写到 host 记录(create-tenant 准入读它)。
+
+    投影 canary + generation 自增;host 上的 slots.json 才是真值(ADR §4.2),这是控制面副本。
+    best-effort(不抛):写失败时 create-tenant 读不到 canary → 返回 CANARY_NOT_READY 让调用方
+    重试(fail-closed,不会误把 live 当 canary 给出去),故不值得让 pull 结果失败。
+    live_snapshot_time(self-heal 时传):旧 host 刚把扁平 live 迁进版本目录、host 侧已解析
+    slots.live;此处把控制面镜像的 live 一并回填(仅当当前镜像 live 为空,避免覆盖已有 live)。
+    否则镜像 live 仍 null → promote 出 previous_live=null / 前端 undefined。
+    """
+    # 组装 SET:canary + generation 恒写;live 仅在传入且当前为空时补(if_not_exists 防覆盖)。
+    set_parts = [
+        "image_slots.#c = :s",
+        "image_slots.#g = if_not_exists(image_slots.#g, :zero) + :one",
+    ]
+    names = {"#c": "canary", "#g": "generation"}
+    values = {":s": snapshot_time, ":zero": 0, ":one": 1}
+    if live_snapshot_time:
+        set_parts.append("image_slots.#l = if_not_exists(image_slots.#l, :lv)")
+        names["#l"] = "live"
+        values[":lv"] = live_snapshot_time
+    try:
+        hosts_table.update_item(
+            Key={"instance_id": instance_id},
+            UpdateExpression="SET " + ", ".join(set_parts),
+            ConditionExpression="attribute_exists(image_slots)",
+            ExpressionAttributeNames=names,
+            ExpressionAttributeValues=values,
+        )
+    except Exception:  # noqa: BLE001 — 含 image_slots 尚不存在(首次)的 CCF
+        # 首次:整个 image_slots map 还不存在 → 建一份(self-heal 时连 live 一起建)。
+        try:
+            hosts_table.update_item(
+                Key={"instance_id": instance_id},
+                UpdateExpression="SET image_slots = :m",
+                ExpressionAttributeValues={
+                    ":m": {"canary": snapshot_time, "generation": 1,
+                           "live": live_snapshot_time or None, "previous_live": None},
+                },
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[pull] WARN mirror canary slot to host record failed: {e}")
+
+
+# 提交点 fence 的有界续租窗口(秒):conditional renew 成功后,该窗口内无人能接管 lease
+# (acquire 要求 image_lease_until<=now 才能抢)。#394 NB3 —— fence 现折进 _slots_commit_lines
+# 的 python 进程里、紧贴 os.rename 的前一条语句(无 shell 级调度缝),该常量作为续租秒数传入。
+# 60s 远大于 rename 耗时,又远小于 lease TTL(1200s),不影响正常接管时序。
+_COMMIT_FENCE_RENEW_S = 60
+
+
+def _slots_commit_lines(slot, snapshot_time, hosts_table, region, instance_id, job_id=None):
+    """#394 —— host 侧就地 read-modify-write slots.json(唯一提交点)+ 回写 DDB 镜像。
+
+    为什么在 host 上算而不是 Lambda 预先算好整份 JSON:slots.json 的当前值是 host 本地
+    真值(ADR §4.2 "Host slots.json 是启动路径本地真值"),Lambda 读到的可能已过期;
+    盲写整份会把并发/上一轮的 generation 与 previous_live 覆盖掉。故把迁移逻辑用 python3
+    在 host 上对【刚读到的】那份施加 —— 与 core/image_slots.apply_pull 语义保持一致:
+      · canary:只填 canary,live/previous_live 不动;
+      · live:旧 live 落 previous_live(仅当版本不同,重装同版保留回滚锚点);
+      · generation +1。
+    并发保护由外层 pull.lock(flock)+ 控制面 image lease 提供;此处只保证单次写原子。
+    写坏/失败一律 _perr + exit 1,绝不留半个指针。
+    """
+    q = shlex.quote
+    # #394(codex B3/NB3)—— fence 折进【同一个 python 进程】,紧贴 os.rename 的【前一条语句】:
+    # 先备好 tmp 文件,再做条件续租(boto3 conditional update-item:owner==本 job 且 until>now →
+    # 同写续租到 now+窗口),【紧接着】os.rename。fence 与 rename 是相邻 python 语句,无 shell 级
+    # 调度缝;续租成功后接管者的 acquire(要求 until<=now)在窗口内必失败,且 worker 全程持
+    # pull.lock 使并发 worker 无法同时进 commit 段。job_id/region 为空(扁平兼容路径)→ 跳过 fence,
+    # 保持既有行为(那些路径不走版本-lease 模型)。
+    _fenced = bool(job_id and region and hosts_table)
+    fence_py = ""
+    if _fenced:
+        fence_py = (
+            "import boto3,time as _t\n"
+            "_c=boto3.client('dynamodb',region_name=sys.argv[4])\n"
+            "_now=int(_t.time()); _renew=_now+int(sys.argv[6])\n"
+            "try:\n"
+            "    _c.update_item(TableName=sys.argv[5],\n"
+            "        Key={'instance_id':{'S':sys.argv[7]}},\n"
+            "        UpdateExpression='SET image_lease_until = :r',\n"
+            "        ConditionExpression='active_image_operation_id = :j AND image_lease_until > :n',\n"
+            "        ExpressionAttributeValues={':j':{'S':sys.argv[8]},':n':{'N':str(_now)},':r':{'N':str(_renew)}})\n"
+            "except Exception as e:\n"
+            "    raise SystemExit('COMMIT_FENCED lease not held/renewable at commit (superseded/expired): %s' % e)\n"
+        )
+    py = (
+        "import json,os,sys\n"
+        "p=sys.argv[1]; slot=sys.argv[2]; snap=sys.argv[3]\n"
+        "s={'generation':0,'live':None,'canary':None,'previous_live':None}\n"
+        "if os.path.exists(p):\n"
+        "    with open(p) as fh: cur=json.load(fh)\n"
+        "    if not isinstance(cur,dict): raise SystemExit('slots.json not an object')\n"
+        "    s['generation']=int(cur.get('generation') or 0)\n"
+        "    for k in ('live','canary','previous_live'): s[k]=cur.get(k) or None\n"
+        "if slot=='canary':\n"
+        "    s['canary']=snap\n"
+        "else:\n"
+        "    if s['live'] and s['live']!=snap: s['previous_live']=s['live']\n"
+        "    s['live']=snap\n"
+        "s['generation']=s['generation']+1\n"
+        "tmp=p+'.tmp'\n"
+        "with open(tmp,'w') as fh:\n"
+        "    json.dump(s,fh,sort_keys=True,separators=(',',':')); fh.flush(); os.fsync(fh.fileno())\n"
+        # ↓↓↓ fence 就在这里:tmp 已就绪,续租成功【紧接着】rename;二者相邻,无中间语句。
+        + fence_py +
+        "os.rename(tmp,p)\n"
+        "d=os.open(os.path.dirname(p),os.O_RDONLY); os.fsync(d); os.close(d)\n"
+        "print(json.dumps(s))\n"
+    )
+    # fence 需要的额外 argv:region, hosts_table, renew_seconds, instance_id, job_id。
+    fence_args = (
+        f" {q(region)} {q(hosts_table)} {q(str(_COMMIT_FENCE_RENEW_S))} "
+        f"{q(instance_id)} {q(job_id)}"
+        if _fenced else ""
+    )
+    out = [f"mkdir -p {q(image_slots.LIVE_ROOT)}"]
+    out += [
+        f"SLOTS_NEW=$(python3 - {q(image_slots.SLOTS_FILE)} {q(slot)} {q(snapshot_time)}"
+        f"{fence_args} <<'SLOTSEOF'\n"
+        f"{py}SLOTSEOF\n"
+        f') || {{ _perr "SLOTS_WRITE_FAILED could not update slots.json ({slot}) — see COMMIT_FENCED if lease lost"; exit 1; }}',
+        '_p "slots.json updated: $SLOTS_NEW"',
+    ]
+    # #394 —— host 侧把【最终 slots.json】原样回写 DDB hosts.image_slots(消除控制面镜像
+    # 与 host 真值漂移:之前只由 Lambda 增量 patch canary,live/generation/previous_live 都
+    # 会对不上,导致 promote 误报 CANARY_CHANGED、UI 显示 live=null)。host 角色有 hosts
+    # 表 UpdateItem 权(心跳在用)。用 python3 把 SLOTS_NEW(纯 JSON)转成 DDB M 格式写入。
+    # best-effort(|| true):镜像回写失败不该让已成功的 slots 提交判失败;下次操作会再纠。
+    out += image_slots.slots_mirror_writeback_lines(hosts_table, region, instance_id)
+    return out
+
+
+def _slots_selfheal_lines(flat_snapshot_time):
+    """#394 —— 旧版 host self-heal:pull canary 前,若 slots.live 未解析(旧扁平布局:
+    live=null / 无 slots.json),把当前扁平 live 三盘【硬链接】进 versions/<flat_snap>/ 并
+    把 slots.live 指向它。之后 canary/promote/rollback 才有合法 live 锚点(否则 promote 出
+    previous_live=null 的半状态,前端显示 undefined;rollback 无锚点)。
+
+    为什么用硬链接:扁平盘与版本目录盘在【同一文件系统】,`ln`(非 cp)= 同 inode、零额外
+    占盘、瞬时;运行中 VM 仍持扁平路径 inode 不受影响;rootfs 只读挂载,共享 inode 无写偏斜。
+    幂等:versions/<flat_snap>/ 的盘已在 + slots.live 已解析 → 整段跳过(不重复链、不改指针)。
+    fail-loud:扁平盘缺失(真空 host,无 live 可迁)→ 不建半个版本目录,交给上层 preflight
+    (这里只在扁平盘齐全时迁;缺盘则 slots.live 仍空,canary 装完 live 仍走扁平回落,不恶化)。
+    """
+    q = shlex.quote
+    root = image_slots.LIVE_ROOT
+    snap = flat_snapshot_time
+    vdir = image_slots.version_dir(snap)
+    slots = image_slots.SLOTS_FILE
+    # python3 就地做:读 slots.live;为空则(扁平三盘齐全时)硬链接进版本目录 + 写 slots.live。
+    # rootfs/data-template 必须齐(immutable 可选,与 launch-vm 一致)。
+    py = (
+        "import json,os,sys\n"
+        "root,snap,vdir,slots=sys.argv[1],sys.argv[2],sys.argv[3],sys.argv[4]\n"
+        "cur={}\n"
+        "if os.path.exists(slots):\n"
+        "    with open(slots) as fh: cur=json.load(fh)\n"
+        "    if not isinstance(cur,dict): raise SystemExit('slots.json not an object')\n"
+        "if cur.get('live'):\n"
+        "    print('live already resolved: '+cur['live']); raise SystemExit(0)\n"
+        # live 未解析 → 检查扁平盘
+        "flat={'rootfs':root+'/openclaw-rootfs.ext4','data-template':root+'/openclaw-data-template.ext4','immutable':root+'/openclaw-immutable.ext4'}\n"
+        "if not (os.path.exists(flat['rootfs']) and os.path.exists(flat['data-template'])):\n"
+        "    print('no flat live disks to migrate; leaving live unresolved'); raise SystemExit(0)\n"
+        "os.makedirs(vdir,exist_ok=True)\n"
+        "for kind,src in flat.items():\n"
+        "    if not os.path.exists(src): continue\n"
+        "    dst=vdir+'/openclaw-'+kind+'.ext4'\n"
+        "    if not os.path.exists(dst):\n"
+        "        os.link(src,dst)\n"   # 硬链接:同 inode 零拷贝
+        # manifest:有就 cp 进版本目录(版本目录自洽);扁平位 manifest 名固定
+        "m=root+'/manifest.json'\n"
+        "if os.path.exists(m) and not os.path.exists(vdir+'/manifest.json'):\n"
+        "    import shutil; shutil.copy2(m,vdir+'/manifest.json')\n"
+        # 原子写 slots.live(tmp+fsync+rename+fsync parent),不动 canary/previous_live
+        "cur.setdefault('generation',0); cur['live']=snap\n"
+        "cur.setdefault('canary',None); cur.setdefault('previous_live',None)\n"
+        "cur['generation']=int(cur.get('generation') or 0)+1\n"
+        "tmp=slots+'.tmp'\n"
+        "with open(tmp,'w') as fh:\n"
+        "    json.dump(cur,fh,sort_keys=True,separators=(',',':')); fh.flush(); os.fsync(fh.fileno())\n"
+        "os.rename(tmp,slots)\n"
+        "d=os.open(os.path.dirname(slots),os.O_RDONLY); os.fsync(d); os.close(d)\n"
+        "print('migrated flat live → '+snap)\n"
+    )
+    return [
+        f"mkdir -p {q(root)}",
+        f"SELFHEAL=$(python3 - {q(root)} {q(snap)} {q(vdir)} {q(slots)} <<'HEALEOF'\n"
+        f"{py}HEALEOF\n"
+        f') || {{ _perr "SELFHEAL_FAILED could not migrate flat live to version dir"; exit 1; }}',
+        '_p "self-heal: $SELFHEAL"',
+    ]
 
 
 def _reset_status_cmd(
@@ -856,7 +1080,7 @@ def _reset_status_cmd(
 
 def _snapshot_pull_script(
     bucket, region, host_files, snapshot_time, hosts_table, instance_id, prev_status,
-    job_id, rootfs_version="",
+    job_id, rootfs_version="", slot=None, flat_live_snapshot_time=None,
 ):
     """#309 V1 — SSM shell:照【已选好的】host_files(#317:_select_pull_files 已按 manifest
     点名的盘 + manifest 本身选好,不含多余版本),按【精确 VersionId】拉。两段式:
@@ -889,10 +1113,19 @@ def _snapshot_pull_script(
     # #333(codex round9)owner-conditional 复位:带 job_id,只当前 owner 才复位(防 DDB 模糊重试
     # 在新 job CAS 后覆盖回旧状态)。脚本走到复位处已过 fence(status==upgrading + owner==job),故
     # 条件通常满足;真被新 job 抢占时 CCF(被 `|| true` 吞,不误覆盖)。
-    reset_fail = _reset_status_cmd(hosts_table, region, instance_id, prev_status, None, job_id)
-    reset_ok = _reset_status_cmd(
-        hosts_table, region, instance_id, prev_status, snapshot_time, job_id, rootfs_version
-    )
+    # #394 —— canary pull 全程不碰 host.status / host.snapshot_time:
+    #  · 没置过 upgrading,"复位"会凭空把别人的维护门解除;
+    #  · host.snapshot_time 语义是"本机 live 版本",canary 装好并没换 live,写了就是谎报。
+    # 故 canary 的两个 reset 函数体降级成 `:`(shell no-op),脚本骨架、fence、marker、
+    # 进度输出全部保持不变(改动面最小),只是不发那两条 DDB update-item。
+    if slot == image_slots.SLOT_CANARY:
+        reset_fail = ":"
+        reset_ok = ":"
+    else:
+        reset_fail = _reset_status_cmd(hosts_table, region, instance_id, prev_status, None, job_id)
+        reset_ok = _reset_status_cmd(
+            hosts_table, region, instance_id, prev_status, snapshot_time, job_id, rootfs_version
+        )
 
     # _p():进度写手,把【UTC 时间 + 消息】追加到 /tmp/<job_id>.txt(pull_image_progress tail 它)。
     # trap:任何 nonzero 退出都往进度文件写 FAILED;仅当 INSTALLING=0(还没动 live)才 rm 暂存
@@ -961,8 +1194,23 @@ def _snapshot_pull_script(
         f'--query "[Item.status.S, Item.pull_command_id.S]" --output text 2>/dev/null) || FENCE=""; fi',
         'if [ -z "$FENCE" ]; then echo "[pull] OWNERSHIP_CHECK_FAILED cannot read host state from DDB; abort" >&2; exit 1; fi',
         'ST=$(printf "%s" "$FENCE" | cut -f1); OWNER=$(printf "%s" "$FENCE" | cut -f2)',
-        'if [ "$ST" != upgrading ]; then echo "[pull] STALE_JOB host status=$ST (not upgrading); superseded/completed, abort" >&2; exit 1; fi',
-        f'if [ "$OWNER" != {q(job_id)} ]; then echo "[pull] STALE_JOB job={job_id} owner=$OWNER; superseded, abort" >&2; exit 1; fi',
+        # #394 —— canary pull 不置 upgrading,故这道 status 门只对 live pull 生效;canary 的
+        # 陈旧 worker 由控制面 image lease + fence_epoch 拦(ADR §4.8),不靠 host.status。
+        # owner 门对两者都保留(pull_command_id 只在 live 路径写,canary 用 lease owner,
+        # 故 canary 也跳过 owner 门 —— 见下面 CANARY_FENCE 注释)。
+        *([] if slot == image_slots.SLOT_CANARY else [
+            'if [ "$ST" != upgrading ]; then echo "[pull] STALE_JOB host status=$ST (not upgrading); superseded/completed, abort" >&2; exit 1; fi',
+            f'if [ "$OWNER" != {q(job_id)} ]; then echo "[pull] STALE_JOB job={job_id} owner=$OWNER; superseded, abort" >&2; exit 1; fi',
+        ]),
+        # Unified lease fence for both slots. Owner equality alone is insufficient because an
+        # expired lease keeps its owner field; after expiry a reconciler may declare the Job
+        # recoverable and another operation may take over. Old workers must not commit then.
+        f'LEASE=$(aws dynamodb get-item --table-name {q(hosts_table)} --region {q(region)} '
+        f'--key {q(json.dumps({"instance_id": {"S": instance_id}}))} --consistent-read '
+        f'--query "[Item.active_image_operation_id.S, Item.image_lease_until.N]" --output text 2>/dev/null) || LEASE=""',
+        'LEASE_OWNER=$(printf "%s" "$LEASE" | cut -f1); LEASE_UNTIL=$(printf "%s" "$LEASE" | cut -f2)',
+        f'if [ "$LEASE_OWNER" != {q(job_id)} ]; then echo "[pull] STALE_JOB lease owner=$LEASE_OWNER job={job_id}; superseded, abort" >&2; exit 1; fi',
+        'if [ -z "$LEASE_UNTIL" ] || [ "$LEASE_UNTIL" -le "$(date +%s)" ]; then echo "[pull] STALE_JOB lease expired; abort" >&2; exit 1; fi',
         "LOCKED=1",  # 抢到锁 + 确认 upgrading + owner → 自此拥有 $ARCH/status 所有权,trap 可写终态/清理/复位
         # #333(codex round7/9)幂等重装防线:marker 记 "<job_id>:<state>"(done/failed)。若 marker
         # 的 job==本 job,说明本 job 的上一个 worker 已【终结】(装完 or phase2 已动 live 后失败),
@@ -989,6 +1237,34 @@ def _snapshot_pull_script(
         f'else _perr "INSTALL_MV_FAILED prior worker touched live but did not finish (marker=$MSTATE); no reinstall"; _p "FAIL"; '
         f'exec 9>&-; LOCKED=0; '
         f'echo "[pull] job={job_id} prior worker did not finish (marker=$MSTATE); host stays upgrading" >&2; exit 1; fi; fi',
+    ]
+    # #394 快路径 —— slot 模式下,若目标版本目录【已完整装好】(.complete 标记在 + 三盘非空),
+    # 跳过下载/解压,直接翻 slots 指针(秒级)。这让"回滚 = pull 老版到 live"零下载:老版目录
+    # 已在盘上(promote/上次 pull 装的,reclaim 之前一直保留)→ 只翻指针。半装目录(下载一半盘满、
+    # 无 .complete)判不完整 → 落到下面正常重下自愈(fail-safe,绝不翻半盘)。兼容扁平路径(slot=None)
+    # 没有版本目录概念,不走快路径。快路径成功后走与文末【完全相同】的收尾(slots 提交 + 终态 + 复位)。
+    if slot:
+        fast = ['_p "checking if version already installed on disk (fast-path)"']
+        fast += image_slots.version_complete_check_lines(snapshot_time)
+        fast.append('if [ "$VER_COMPLETE" = 1 ]; then')
+        fast.append(f'  _p "fast-path: version {snapshot_time} already complete on disk; flipping {slot} pointer (no download)"')
+        fast.append(f'  echo "[pull] fast-path: {snapshot_time} already installed; skip download, flip {slot}"')
+        # canary self-heal(与慢路径同):翻 canary 指针前若 live 未解析先迁扁平 live。
+        if slot == image_slots.SLOT_CANARY and flat_live_snapshot_time:
+            fast += ["  " + ln for ln in _slots_selfheal_lines(flat_live_snapshot_time)]
+        # 唯一提交点:翻 slots 指针(原子)。与慢路径 phase2c 同一函数,语义一致。
+        fast += ["  " + ln for ln in _slots_commit_lines(slot, snapshot_time, hosts_table, region, instance_id, job_id)]
+        # 收尾:done marker + SUCCESS + 复位 + 释锁(与文末慢路径完全相同,持锁内)。
+        fast.append(f'  printf "%s" {q(job_id)}:done > "$DONE_MARKER".tmp && mv "$DONE_MARKER".tmp "$DONE_MARKER"')
+        fast.append('  _p "SUCCESS"')
+        fast.append("  _reset_ok")
+        fast.append("  exec 9>&-")
+        fast.append("  LOCKED=0")
+        fast.append(f'  echo "[pull] fast-path done: {slot}={snapshot_time}, no download"')
+        fast.append("  exit 0")
+        fast.append("fi")
+        lines += fast
+    lines += [
         # 清空 target 再下载(固定名每轮覆盖,清上轮残留)。不做 df 盘满预检(预估易漂);盘真满
         # 时下载(DOWNLOAD_FAILED)或解压(UNZIP_FAILED "disk full?")自然失败并 surface。
         f'rm -rf "$ARCH"; mkdir -p "$ARCH" {_LIVE}',
@@ -1031,11 +1307,35 @@ def _snapshot_pull_script(
     # 写不成 marker,延迟重复 worker 就会在半装的 live 上重装。故进 commit、动第一个盘【之前】先落
     # installing marker;成功后替换成 done(见文末)。重复 worker 见任何非 done 一律拒绝重装。
     lines.append(f'printf "%s" {q(job_id)}:installing > "$DONE_MARKER".tmp && mv "$DONE_MARKER".tmp "$DONE_MARKER"')
-    # ── 循环② commit:逐个 mv/cp 暂存区 → live(同盘原子 rename,极快)──
+    # ── 循环② commit:逐个 mv/cp 暂存区 → 目标位置(同盘原子 rename,极快)──
+    # #394 —— slot 模式(slot 非空)装进不可变版本目录 versions/<snapshot_time>/;
+    # 兼容模式(slot 为空)保持历史扁平 live 位。
+    dest_desc = f"version dir {snapshot_time}" if slot else "live"
     for i, f in enumerate(host_files, 1):
         base = f["path"].rsplit("/", 1)[-1]
-        lines.append(f'_p "phase2b [{i}/{n}]: committing {base} to live"')
-        lines.extend(_commit_lines(f))
+        lines.append(f'_p "phase2b [{i}/{n}]: committing {base} to {dest_desc}"')
+        lines.extend(_commit_lines(f, snapshot_time if slot else None))
+    # #394 —— 版本目录装好后,最后一步才改 slots.json 指针(唯一提交点)。指针改成功之前,
+    # 任何 VM 的启动版本都没变:装 canary 完全不影响存量 live;装 live 失败也不会让存量
+    # 租户拿到半套盘(ADR §4.1"提交点只有一个小文件 rename")。
+    if slot:
+        # #394 —— 三盘 + manifest 全部 commit 进版本目录后,【最后】原子写 .complete 完整标记
+        # (先于翻指针)。它是"这套版本目录已装齐"的唯一信号,快路径据它判断"本地已完整→秒级
+        # 翻指针"。半装目录(装到一半盘满/掉电)没有标记 → 下次 pull 快路径不认它、走重下自愈。
+        version_disks = [
+            image_slots.disk_path(snapshot_time, _disk_kind_of(f))
+            for f in host_files if _disk_kind_of(f) is not None
+        ]
+        lines.append('_p "phase2b.9: writing .complete marker (version dir fully installed)"')
+        lines.extend(image_slots.write_complete_marker_lines(snapshot_time, version_disks))
+        # #394 self-heal —— canary 装完、写 canary 指针【之前】,先把旧扁平 live 迁进版本目录
+        # 并解析 slots.live(仅当 live 未解析且有已知的扁平 live 版本时)。否则 promote 会产出
+        # previous_live=null 的半状态(前端 undefined),rollback 无锚点。幂等,已迁则跳过。
+        if slot == image_slots.SLOT_CANARY and flat_live_snapshot_time:
+            lines.append('_p "phase2b.5: self-heal legacy flat live → version dir (if unresolved)"')
+            lines.extend(_slots_selfheal_lines(flat_live_snapshot_time))
+        lines.append(f'_p "phase2c: updating slots.json ({slot} → {snapshot_time})"')
+        lines.extend(_slots_commit_lines(slot, snapshot_time, hosts_table, region, instance_id, job_id))
     setting = json.dumps(
         {"snapshot_time": snapshot_time, "staged_dir": _STAGE, "file_count": n}
     )
@@ -1059,25 +1359,315 @@ def _snapshot_pull_script(
     return "\n".join(lines)
 
 
-def list_image_versions():
+def list_image_versions(query_params=None):
     """#337(原#217 GET /snapshots,改名避免与 /images 列镜像文件混淆)— GET /list_image_versions:
-    列快照表所有条目的元数据(snapshot_time + label + file_count),供 console 让运维选不同时间点去
-    pull。按 snapshot_time 倒序(最新在前)。不回 files 大 JSON(那是 pull 时才逐文件读);
-    表未配置 → 503 fail-loud。"""
+    列快照表条目的元数据(snapshot_time + label + file_count + status),供 console 让运维选不同
+    时间点去 pull。按 snapshot_time 倒序(最新在前)。不回 files 大 JSON(那是 pull 时才逐文件读);
+    表未配置 → 503 fail-loud。
+
+    #394 — `?show_deleted=true`(默认 false):默认过滤软删条目(status=deleted),因为可拉取
+    面绝不该列出已下架版本(pull 也会拒);Image Snapshot 面板传 true 看全量,这样"某 host 槽位
+    仍引用、但快照记录被误软删"的版本仍会出现(带 deleted 标记),不会因过滤而在 UI 里凭空消失
+    (那会导致 live 版本没有徽标——本次修复的 bug)。每条带 `status`,前端据此标记 + 过滤。"""
     if version_snapshots_table is None:
         return _err(503, "NOT_CONFIGURED", "VERSION_SNAPSHOTS_TABLE not configured")
-    items = version_snapshots_table.scan().get("Items", [])
+    show_deleted = str((query_params or {}).get("show_deleted", "")).lower() == "true"
+    # #394 P2-1 —— 翻页到底:快照表 >1MB 时只读第一页会静默漏掉后续版本(目录 API 漏列 =
+    # 运维选不到那些版本去 pull/回滚)。删除保护扫描已翻页,目录查询同样必须翻。
+    items = []
+    _kw = {}
+    while True:
+        _resp_scan = version_snapshots_table.scan(**_kw)
+        items.extend(_resp_scan.get("Items") or [])
+        _lek = _resp_scan.get("LastEvaluatedKey")
+        if not _lek:
+            break
+        _kw["ExclusiveStartKey"] = _lek
     out = [
         {
             "snapshot_time": it.get("snapshot_time"),
             "label": it.get("label", ""),
             "file_count": int(it.get("file_count", 0)),
+            "status": it.get("status") or "active",
         }
         for it in items
         if it.get("snapshot_time")
+        and (show_deleted or it.get("status") != "deleted")
     ]
     out.sort(key=lambda s: s["snapshot_time"], reverse=True)  # 最新在前
     return _resp(200, out)
+
+
+def _snapshot_still_referenced(snapshot_time):
+    """#394 —— 删快照记录前的保护:该版本是否仍被任何 host 槽位或租户固定引用。
+
+    返回 (referenced: bool, reason: str)。检查两处:
+      · host 记录的 image_slots(live/canary/previous_live)—— 删了记录但 host 仍指向它,
+        该 host rebuild/新建租户时会照 snapshot_time 去 pull,快照记录没了就拉不回(no-data-loss)。
+      · 租户记录的 image_snapshot_time(canary 租户固定的版本)—— 删了记录那些租户 restart
+        解析不到自己的版本目录。
+    只读扫描,不改任何东西。任一命中即拒删(fail-closed)。
+
+    #394 P1-5 —— 两处 scan 都【翻页到底】(处理 LastEvaluatedKey)。DynamoDB 单页上限 1MB,
+    只读第一页会漏掉后续页的引用 → 把仍被引用的版本误判"无人用"而软删 → host 丢失/恢复时
+    拉不回在运行的版本(no-data-loss)。删除保护必须 fail-closed:宁可多扫几页,不可漏判。
+    """
+    # 1) host 槽位引用。Host slots.json 是权威真值；DDB mirror 只有带新鲜同步时间才可
+    # 用于 destructive delete。host-agent 每轮心跳持续覆盖 mirror，写失败/agent 旧版/停机都会
+    # 让时间戳老化并 fail-closed，而不是把 stale mirror 当成“无引用”。旧扁平 host 的
+    # snapshot_time 也直接纳入保护。
+    # codex NB1 —— 删除是破坏性且不可逆(软删后引用方拉不回)。引用扫描必须【强一致读】:
+    # 默认最终一致 Scan 可能漏掉刚提交的引用(host 槽刚翻、租户刚固定)→ 误判无引用而软删在用
+    # 版本(no-data-loss)。base table Scan 支持 ConsistentRead=True(GSI 不支持,此处扫主表)。
+    kwargs = {
+        "ProjectionExpression": (
+            "instance_id, #st, snapshot_time, image_slots, image_slots_synced_at_epoch"
+        ),
+        "ExpressionAttributeNames": {"#st": "status"},
+        "ConsistentRead": True,
+    }
+    mirror_now = int(time.time())
+    while True:
+        resp = hosts_table.scan(**kwargs)
+        for h in resp.get("Items") or []:
+            host_id = str(h.get("instance_id") or "")
+            if not host_id or host_id.startswith("__") or h.get("status") == "deleted":
+                continue
+            if h.get("snapshot_time") == snapshot_time:
+                return True, f"host {host_id} legacy live snapshot_time still points at it"
+            slots = h.get("image_slots") or {}
+            # Even a stale mirror that explicitly references the target is sufficient to block.
+            # Freshness is only needed before concluding that the target is absent.
+            for key in ("live", "canary", "previous_live"):
+                if slots.get(key) == snapshot_time:
+                    return True, f"host {host_id} slot '{key}' still points at it"
+            synced_at = int(h.get("image_slots_synced_at_epoch") or 0)
+            age = mirror_now - synced_at if synced_at else None
+            if not synced_at or age < 0 or age > _IMAGE_SLOTS_MIRROR_MAX_AGE_S:
+                return True, (
+                    f"host {host_id} slot mirror is missing/stale"
+                    f" (age={age!r}s); refusing destructive delete until host-agent reconciles"
+                )
+        lek = resp.get("LastEvaluatedKey")
+        if not lek:
+            break
+        kwargs["ExclusiveStartKey"] = lek
+    # 2) 租户固定引用(canary 租户)—— 翻页到底。同样强一致读(codex NB1):漏掉刚固定
+    # 该版本的租户 = 删掉它在用的底盘。
+    kwargs = {
+        "FilterExpression": "image_snapshot_time = :s AND #st <> :deleted",
+        "ExpressionAttributeNames": {"#st": "status"},
+        "ExpressionAttributeValues": {":s": snapshot_time, ":deleted": "deleted"},
+        "ProjectionExpression": "id",
+        "ConsistentRead": True,
+    }
+    pinned_ids = []
+    while True:
+        resp = tenants_table.scan(**kwargs)
+        pinned_ids.extend(t["id"] for t in (resp.get("Items") or []))
+        lek = resp.get("LastEvaluatedKey")
+        if not lek or len(pinned_ids) >= 10:
+            break
+        kwargs["ExclusiveStartKey"] = lek
+    if pinned_ids:
+        return True, f"tenants still pin it: {pinned_ids[:10]}"
+    # 3) #394 P1-3(盲点 B)—— 在飞 pull:已受理但版本尚未提交进 slots 的 Job。若此刻删,
+    # 那个 worker 会把已下架版本装进 live/canary(no-data-loss)。任何非终态 Job 命中即拒删。
+    # codex B2 —— 再加 SUCCEEDED grace:刚提交成功但 mirror 回写失败的窗口内(≤ mirror 最大
+    # 陈旧时间),mirror 尚未反映新指针,slots 扫描看不到 → 用 Job 兜底,等下轮心跳同步真值。
+    active = image_jobs.active_jobs_for_snapshot(
+        snapshot_time, success_grace_s=_IMAGE_SLOTS_MIRROR_MAX_AGE_S
+    )
+    if active:
+        desc = [f"{j.get('job_id')}({j.get('state')}→{j.get('instance_id')})" for j in active[:5]]
+        return True, f"in-flight pull(s) targeting it: {desc}"
+    return False, ""
+
+
+def delete_image_snapshot(body):
+    """POST /delete-image-snapshot — 【软删】一条镜像快照记录(#394)。
+
+    与 create-image-snapshot 对称:body `{snapshot_time}`(不用 path 带冒号的 ISO 时间,
+    避开 path segment 编码坑,且与 create/pull 的参数风格一致)。
+    不物理删除 DDB 记录,而是打 deleted 标记(status=deleted + deleted_at),对齐租户
+    status=deleted 的软删范式:可审计、可恢复、不丢历史。list_image_versions 会过滤掉
+    已软删的条目,pull-image 也拒用(见各自过滤)。同样不动 S3 镜像文件。
+    删前 fail-closed 保护:该版本仍被任何 host 槽位或租户固定引用则拒删
+    (409 IMAGE_VERSION_IN_USE),否则标了 deleted 会让引用方 pull/restart 拉不回。
+    幂等:记录不存在 → 404;已是 deleted → 200(重复软删收敛,不报错)。operator+。"""
+    # body 解析:与 create_image_snapshot 同款(容忍字符串/dict,标量/数组→400)。
+    if isinstance(body, str):
+        try:
+            body = json.loads(body) if body.strip() else {}
+        except (ValueError, TypeError):
+            return _err(400, "VALIDATION", "body must be valid JSON")
+    body = body or {}
+    if not isinstance(body, dict):
+        return _err(400, "VALIDATION", "body must be a JSON object")
+    snapshot_time = (body.get("snapshot_time") or "").strip()
+    if not snapshot_time:
+        return _err(400, "VALIDATION", "snapshot_time required")
+    if not _SNAPSHOT_TIME_RE.match(snapshot_time):
+        return _err(400, "VALIDATION",
+                    f"snapshot_time must be ISO8601 UTC (YYYY-MM-DDTHH:MM:SSZ); got {snapshot_time!r}")
+    if version_snapshots_table is None:
+        return _err(503, "NOT_CONFIGURED", "VERSION_SNAPSHOTS_TABLE not configured")
+    existing = version_snapshots_table.get_item(
+        Key={"snapshot_time": snapshot_time}, ConsistentRead=True
+    ).get("Item")
+    if not existing:
+        return _err(404, "NOT_FOUND", f"snapshot {snapshot_time} not found")
+    if existing.get("status") == "deleted":
+        return _resp(200, {
+            "message": "snapshot record already deleted",
+            "snapshot_time": snapshot_time,
+            "label": existing.get("label", ""),
+            "status": "deleted",
+        })
+    ccf = version_snapshots_table.meta.client.exceptions.ConditionalCheckFailedException
+    if existing.get("status") == "deleting":
+        # Lambda hard-kill 可能发生在 ACTIVE→DELETING 之后。短窗口内拒绝并发删除；超过
+        # stale 阈值则以 deletion_started_at 条件接管，先恢复 ACTIVE 再重新走完整保护流程。
+        started = existing.get("deletion_started_at")
+        try:
+            age = time.time() - datetime.fromisoformat(
+                str(started or "").replace("Z", "+00:00")
+            ).timestamp()
+        except (TypeError, ValueError):
+            age = _DELETE_GATE_STALE_S + 1
+        if age <= _DELETE_GATE_STALE_S:
+            return _err(409, "DELETE_IN_PROGRESS",
+                        f"snapshot {snapshot_time} deletion is already in progress; retry shortly")
+        try:
+            version_snapshots_table.update_item(
+                Key={"snapshot_time": snapshot_time},
+                UpdateExpression="SET #s = :active REMOVE deletion_started_at, deletion_owner",
+                ConditionExpression="#s = :deleting AND deletion_started_at = :started",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={
+                    ":active": "active", ":deleting": "deleting", ":started": started
+                },
+            )
+        except ccf:
+            return _err(409, "DELETE_IN_PROGRESS",
+                        f"snapshot {snapshot_time} deletion ownership changed; retry shortly")
+        existing = {**existing, "status": "active"}
+    # 删除安全依赖 Job 事务作为 Pull admission 的线性化点；未部署 Job 表时无法关闭
+    # scan→delete 间插入新 Pull 的窗口，因此必须 fail-closed，不能退化为空引用集合。
+    if not image_jobs.is_enabled():
+        return _err(503, "JOB_RECORD_UNAVAILABLE",
+                    "IMAGE_JOBS_TABLE is required for safe snapshot deletion")
+
+    original_had_status = "status" in existing
+    original_status = existing.get("status", "active")
+    # #394(codex B1)每次进入 DELETING 都盖一个唯一 owner token,后续【所有】状态转移(终态
+    # deleted / 引用存在回滚)都条件在【本 token】上。否则仅凭 #s=deleting 做条件:A 置 DELETING
+    # 后卡死→B 超时接管(恢复 active→自己再置 DELETING+重扫)→A 复活时它的 finalize 条件
+    # #s=deleting 又成立(B 刚置的),A 会拿【自己的陈旧扫描结果】把版本 finalize 成 deleted,
+    # 绕过 B 的引用检查(no-data-loss 缺口)。token 让 A 的写在 owner 不符时失败。
+    delete_owner = uuid.uuid4().hex
+    # 先以条件写 ACTIVE→DELETING，阻止新的 guarded Job transaction 入队；然后再扫描引用。
+    # 与 Pull 的 ConditionCheck+Put 组合后，两种并发顺序都安全：先入队就会被下面扫描发现，
+    # 先 DELETING 就会让 Pull 事务失败。
+    try:
+        version_snapshots_table.update_item(
+            Key={"snapshot_time": snapshot_time},
+            UpdateExpression=(
+                "SET #s = :deleting, deletion_started_at = :t, deletion_owner = :me"
+            ),
+            ConditionExpression=(
+                "attribute_exists(snapshot_time) AND "
+                "(attribute_not_exists(#s) OR #s = :active)"
+            ),
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":deleting": "deleting", ":active": "active",
+                ":t": _now(), ":me": delete_owner
+            },
+        )
+    except ccf:
+        current = version_snapshots_table.get_item(
+            Key={"snapshot_time": snapshot_time}, ConsistentRead=True
+        ).get("Item") or {}
+        if current.get("status") == "deleted":
+            return _resp(200, {
+                "message": "snapshot record already deleted",
+                "snapshot_time": snapshot_time,
+                "label": current.get("label", existing.get("label", "")),
+                "status": "deleted",
+            })
+        return _err(409, "DELETE_IN_PROGRESS",
+                    f"snapshot {snapshot_time} is not active (status={current.get('status')!r})")
+
+    reference_check_error = None
+    try:
+        referenced, reason = _snapshot_still_referenced(snapshot_time)
+    except Exception as e:  # noqa: BLE001
+        # 扫描任一表失败都必须先撤销 DELETING；否则一次 DDB 抖动会把版本永久卡在
+        # deleting，后续 Pull 和 Delete 都无法推进。
+        referenced, reason = True, "reference check unavailable"
+        reference_check_error = e
+    if referenced:
+        # 引用存在时恢复原状态。旧快照没有 status 字段，必须 REMOVE 而非写 active，保持
+        # 兼容数据形状；回滚也带 deleting 条件，绝不覆盖并发状态。
+        try:
+            if original_had_status:
+                version_snapshots_table.update_item(
+                    Key={"snapshot_time": snapshot_time},
+                    UpdateExpression="SET #s = :old REMOVE deletion_started_at, deletion_owner",
+                    ConditionExpression="#s = :deleting AND deletion_owner = :me",
+                    ExpressionAttributeNames={"#s": "status"},
+                    ExpressionAttributeValues={
+                        ":old": original_status, ":deleting": "deleting",
+                        ":me": delete_owner
+                    },
+                )
+            else:
+                version_snapshots_table.update_item(
+                    Key={"snapshot_time": snapshot_time},
+                    UpdateExpression="REMOVE #s, deletion_started_at, deletion_owner",
+                    ConditionExpression="#s = :deleting AND deletion_owner = :me",
+                    ExpressionAttributeNames={"#s": "status"},
+                    ExpressionAttributeValues={
+                        ":deleting": "deleting", ":me": delete_owner
+                    },
+                )
+        except Exception as e:  # noqa: BLE001
+            return _err(503, "DELETE_ROLLBACK_FAILED",
+                        f"snapshot deletion was blocked but ACTIVE state could not be restored: {e}")
+        if reference_check_error is not None:
+            return _err(503, "DELETE_REFERENCE_CHECK_FAILED",
+                        f"could not verify snapshot references; deletion gate was rolled back: "
+                        f"{reference_check_error}")
+        return _err(409, "IMAGE_VERSION_IN_USE",
+                    f"snapshot {snapshot_time} is still in use ({reason}); "
+                    f"repoint/rebuild or delete the referencing hosts/tenants first")
+
+    try:
+        version_snapshots_table.update_item(
+            Key={"snapshot_time": snapshot_time},
+            UpdateExpression=(
+                "SET #s = :d, deleted_at = :t REMOVE deletion_started_at, deletion_owner"
+            ),
+            ConditionExpression="#s = :deleting AND deletion_owner = :me",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":d": "deleted", ":deleting": "deleting", ":t": _now(),
+                ":me": delete_owner
+            },
+        )
+    except ccf:
+        return _err(409, "DELETE_STATE_CHANGED",
+                    f"snapshot {snapshot_time} deletion state changed concurrently; retry")
+    return _resp(200, {
+        "message": "snapshot record marked deleted (soft delete)",
+        "snapshot_time": snapshot_time,
+        "label": existing.get("label", ""),
+        "status": "deleted",
+        # 明说是软删 + 没删 S3 盘,避免运维误以为记录/空间已物理回收。
+        "note": "soft delete: DDB record marked status=deleted (not removed); "
+                "image files under deployment/ were not removed",
+    })
 
 
 def _scan_deployment_files(bucket):
@@ -1143,6 +1733,7 @@ def create_image_snapshot(body):
         "snapshot_time": snap_ts,
         "files": json.dumps(files, separators=(",", ":")),
         "file_count": len(files),
+        "status": "active",
     }
     if label:
         item["label"] = label
@@ -1189,7 +1780,7 @@ def _set_host_upgrading(instance_id, job_id):
     return pre.get("Attributes", {}).get("status", "active"), None
 
 
-def _pull_by_snapshot(instance_id, snapshot_time):
+def _pull_by_snapshot(instance_id, snapshot_time, slot=None, idempotency_key=None):
     """#217 V2 — read the snapshot from DDB, SSM-fetch host files by exact VersionId."""
     # 格式先行:非法 snapshot_time → 400(别拿去查 DB 走成 404 误导调用方)。
     # #336 — 统一错误信封 {error, code}(与 404/409 一致,客户按 code 判)。
@@ -1204,10 +1795,13 @@ def _pull_by_snapshot(instance_id, snapshot_time):
     if not bucket:
         return _err(503, "NOT_CONFIGURED", "ASSETS_BUCKET not configured")
     item = version_snapshots_table.get_item(
-        Key={"snapshot_time": snapshot_time}
+        Key={"snapshot_time": snapshot_time}, ConsistentRead=True
     ).get("Item")
     if not item:
         return _err(404, "NOT_FOUND", f"snapshot {snapshot_time} not found")
+    # #394 — 软删的快照不可再拉(等同不存在,但给明确原因区别于从未打过)。
+    if item.get("status") == "deleted":
+        return _err(404, "NOT_FOUND", f"snapshot {snapshot_time} has been deleted")
     try:
         files = json.loads(item.get("files", "[]"))
     except (ValueError, TypeError):
@@ -1219,15 +1813,102 @@ def _pull_by_snapshot(instance_id, snapshot_time):
     if sel_err:
         return _err(409, "CONFLICT", f"snapshot {snapshot_time}: {sel_err}")
 
+    # #394 —— canary pull 前置守卫 canary==live(读 DDB 镜像 hosts.image_slots;准入前的建议性
+    # 校验,镜像滞后最坏是漏判后落到幂等 pull,无害):目标版本已是该 host 的 live → 没有可验证
+    # 的东西(在同一镜像上建"金丝雀"租户是无意义操作)→ 409 CANARY_EQUALS_LIVE,提示 pull 一个
+    # 【不同】的候选版本。
+    #
+    # 【为何不做"canary 已就位→already_staged 短路"】:DDB 镜像只记指针,不保证盘上那份
+    #   versions/<snap>/ 是【完整】的(可能上次 pull 崩在 commit 中途,无 .complete 标记)。若凭
+    #   镜像 canary==目标就短路,会对一个【半装】的 canary 谎报"已就位",跳过本该自愈的重装。
+    #   故【不】短路——放行到正常 pull:pull 自己的快路径会检查 .complete,完整则秒级翻指针
+    #   (等价你要的 no-op,但【经过盘上验证】),不完整则重下自愈。真值判据永远在盘上,不在镜像。
+    if slot == image_slots.SLOT_CANARY:
+        _mirror = (hosts_table.get_item(
+            Key={"instance_id": instance_id}, ConsistentRead=True
+        ).get("Item") or {}).get("image_slots") or {}
+        if _mirror.get("live") == snapshot_time:
+            return _err(
+                409, "CANARY_EQUALS_LIVE",
+                f"snapshot {snapshot_time} is already live on host {instance_id}; nothing to "
+                f"validate — pull a different candidate to the canary slot",
+            )
+
+    # #394 P2-1 —— Idempotency-Key 重放:带同 key 的重试在【抢闸之前】先查原 Job,命中即回原
+    # job_id(202),绝不再抢 lease / 再置 upgrading / 再起一次真 pull(否则前一任务结束后会创建
+    # 第二个真实 pull,且重试可能吃 409)。key 缺失 → 跳过,退化成旧"每次真跑"语义。
+    if idempotency_key:
+        prior = image_jobs.find_by_idempotency_key(instance_id, idempotency_key)
+        if prior:
+            # #394 P2-1 —— 同 key 必须对应同请求体,否则报 409 IDEMPOTENCY_KEY_REUSED(调用方
+            # bug:拿装 A-live 的 key 去请求 B-canary,不能返回旧 A-live job 让它误以为受理了)。
+            # 比较规范化指纹:(snapshot_time, slot)。一致才重放原 job。
+            prior_slot = prior.get("target_slot", "live")
+            prior_snap = prior.get("requested_snapshot_time")
+            if prior_snap != snapshot_time or prior_slot != (slot or "live"):
+                return _err(
+                    409, "IDEMPOTENCY_KEY_REUSED",
+                    f"Idempotency-Key already used for pull of {prior_snap!r}→{prior_slot}; "
+                    f"this request is {snapshot_time!r}→{slot or 'live'}. Use a fresh key.",
+                )
+            return _resp(202, {
+                "message": "pull-image already accepted (idempotent replay)",
+                "instance_id": instance_id,
+                "snapshot_time": prior_snap or snapshot_time,
+                "slot": prior_slot,
+                "job_id": prior.get("job_id"),
+                "replayed": True,
+            })
+
     # #309 —— job_id 在【同步路径】生成(SSM CommandId 要 dispatch 后才有、脚本无法自知它,
     # 故用自生成 id 命名进度文件 /tmp/<job_id>.txt)。#333(codex round8)先生成 job_id,再在
     # _set_host_upgrading 的【同一条原子 UpdateItem】里连 pull_command_id 一起写(见该函数注释:
     # 消除 CAS 与写 owner 分两步的窗口)。pull_image_progress 据 pull_command_id tail 进度文件。
     job_id = f"pull-{uuid.uuid4().hex[:16]}"
-    # #217 status(ADR §10 ★A):CAS active/idle→upgrading + 原子写 owner,挡 pull 期间控制面派新租户。
-    prev_status, err = _set_host_upgrading(instance_id, job_id)
-    if err:
-        return err
+    # #394 P1-2 —— 准入闸:【两种 pull 都先抢 image lease】,再按槽位处理 status。
+    #  · image lease 是"同一 host 同时只跑一个镜像操作"的统一互斥(ADR §4.8 规则 1):
+    #    抢到它,promote/cleanup/reclaim 全被 409 挡(它们也走同一把 lease)。原先只有 canary
+    #    抢 lease、live pull 只靠 status upgrading 门 → live pull 与 promote/cleanup/reclaim
+    #    可并发写同一 slots.json / 把半装 live 当孤儿删(P1-2)。现在 live 也抢 lease 堵死。
+    #  · status:仅 live pull 额外置 upgrading(维护门:pull 期间不接新租户);canary【绝不】改
+    #    status(否则该 host 停接 live 租户,违背"存量零影响"),互斥完全靠 lease。
+    lease_epoch, lease_err = image_lease.acquire(instance_id, job_id, "pull-image")
+    if lease_err:
+        return _err(409, "IMAGE_OPERATION_IN_PROGRESS", lease_err)
+    if slot == image_slots.SLOT_CANARY:
+        cur = hosts_table.get_item(
+            Key={"instance_id": instance_id}, ConsistentRead=True
+        ).get("Item") or {}
+        prev_status = cur.get("status", "active")
+    else:
+        # live:CAS active/idle→upgrading + 原子写 owner。失败 → 还掉刚抢的 lease 再返回
+        # (否则该 host 镜像操作被占死到 lease 自然过期)。
+        prev_status, err = _set_host_upgrading(instance_id, job_id)
+        if err:
+            image_lease.release(instance_id, job_id)
+            return err
+
+    # #394 step1(ADR §4.4)—— 落一条持久化 Job(state=QUEUED)。放在准入闸【之后】:闸是
+    # 真正的入口,没抢到就不该留 Job 记录(否则 409 也会攒一堆 QUEUED 垃圾)。
+    # #394 P1-2 —— 区分两种 create 失败:
+    #  · 表未配置(is_enabled=False):Job 功能整体关闭,progress 回退 /tmp,返 202 无妨(旧行为);
+    #  · 表已启用但写失败(fresh uuid 不可能撞 dup → 只能是 DDB 超时/限流/权限):此时若照常
+    #    dispatch,progress 精确查会 404 JOB_NOT_FOUND、canary 又无 /tmp 回退 → 从 202 起就不可观测,
+    #    违背持久化 Job 契约。故【释放刚抢的准入闸 + 返回可重试错误】,不做无记录的盲跑。
+    created = image_jobs.create(
+        job_id, instance_id, slot or "live", snapshot_time,
+        idempotency_key=idempotency_key,
+        snapshot_table=version_snapshots_table,
+    )
+    if image_jobs.is_enabled() and not created:
+        if slot != image_slots.SLOT_CANARY:
+            _reset_host_status(instance_id, prev_status)
+        image_lease.release(instance_id, job_id)
+        return _err(
+            503, "JOB_RECORD_UNAVAILABLE",
+            "could not persist pull job record (control-plane store unavailable); "
+            "admission released, retry shortly",
+        )
 
     # #217 fix(504) —— stage + 校验 + 备份 + copy/unzip 装 live 需【数分钟】,远超 APIGW REST
     # 29s 硬上限 → 客户端必吃 504。故 CAS 置 upgrading 后【异步自调用】跑长链,立即回 202;
@@ -1240,22 +1921,50 @@ def _pull_by_snapshot(instance_id, snapshot_time):
                 {"_pull_image_async": {"instance_id": instance_id,
                                        "snapshot_time": snapshot_time,
                                        "prev_status": prev_status,
-                                       "job_id": job_id}}
+                                       "job_id": job_id,
+                                       "slot": slot}}
             ).encode("utf-8"),
         )
-    except Exception as e:  # 自调用都没发出去 → 复位 status,别卡 upgrading
-        _reset_host_status(instance_id, prev_status)
+    except Exception as e:  # 自调用都没发出去 → 收尾,别卡 upgrading / 别占死 lease
+        # #394 P1-2 —— 两种 pull 都持 lease,都要还(否则该 host 镜像操作被占死到 lease
+        # 自然过期,期间 promote/cleanup/reclaim 全被 409 挡)。live 额外复位 status。
+        if slot != image_slots.SLOT_CANARY:
+            _reset_host_status(instance_id, prev_status)
+        image_lease.release(instance_id, job_id)
         # #336 — 统一错误信封 {error, code}。
         return _err(500, "DISPATCH_FAILED", f"failed to dispatch pull-image worker: {e}")
     return _resp(
         202,
         {"message": "pull-image started (async; poll pull-image-progress)",
          "instance_id": instance_id, "snapshot_time": snapshot_time,
-         "status": "upgrading", "job_id": job_id},
+         # #394 —— 回显目标槽位;canary 不改 host.status,故 status 透传当前真实态。
+         "slot": slot or "live",
+         "status": prev_status if slot == image_slots.SLOT_CANARY else "upgrading",
+         "job_id": job_id},
     )
 
 
-def _run_pull_pipeline(instance_id, snapshot_time, prev_status, job_id):
+def _run_pull_pipeline(instance_id, snapshot_time, prev_status, job_id, slot=None):
+    """#394 —— 薄壳:pull 无论走哪条早退路径都必须归还 image lease。
+
+    为什么用 try/finally 包壳而不是在每个 return 前加 release:内层管线有 8+ 条早退路径
+    (未配置/快照不存在/选盘失败/拼脚本异常/下发失败/fence 失败/脚本失败/成功),漏掉任一条
+    都会把该 host 的镜像操作占死到 lease 自然过期(期间 promote/cleanup/reclaim 全被 409 挡)。
+
+    #394 P1-2 —— live 与 canary 现在都持 lease(统一互斥,ADR §4.8 规则 1),故【两者都】要
+    在此归还。释放是 owner-conditional(release 内部条件写校验 owner==job_id),超时重投的旧
+    worker 不会误释放接管者的 lease。live 的 status 复位另在 _finalize_success/失败路径处理,
+    与 lease 释放正交(lease 管镜像操作互斥,status 管是否接新租户)。
+    """
+    try:
+        return _run_pull_pipeline_impl(
+            instance_id, snapshot_time, prev_status, job_id, slot
+        )
+    finally:
+        image_lease.release(instance_id, job_id)
+
+
+def _run_pull_pipeline_impl(instance_id, snapshot_time, prev_status, job_id, slot=None):
     """#309 V1 — 异步 worker:stage + 校验 + copy/unzip 装 live 的长链(数分钟)。#333 去 backup。
     由 pull_image 经 InvocationType=Event 自调用触发({"_pull_image_async": {...}}),
     在无客户端等待的 fire-and-forget 调用里跑满(可达 Lambda 900s)。host 已被 pull_image
@@ -1267,7 +1976,11 @@ def _run_pull_pipeline(instance_id, snapshot_time, prev_status, job_id):
     # (live 未碰,安全)。所有下发【前】的早退路径都走它,不漏记错误。
     def _fail_before_dispatch(reason):
         _record_pull_error(instance_id, reason, job_id)
-        _reset_host_status(instance_id, prev_status, job_id)
+        # #394 —— canary pull 从未改 host.status,所以【不能】在这里"复位":那会把一台正被
+        # 别的操作置为 upgrading 的 host 写回 active(凭空解除维护门)。canary 的收尾是还
+        # lease(由外层 finally 保证),status 一字不动。
+        if slot != image_slots.SLOT_CANARY:
+            _reset_host_status(instance_id, prev_status, job_id)
 
     # SSM 下发【前】的所有步骤(读快照/选盘/拼脚本)都在 live 未碰的阶段:任何异常(含未预期的
     # DDB/S3 抛错)或已知早退都安全复位回 prev(别卡 upgrading),让 handler 兜底不至于永久占 upgrading。
@@ -1294,9 +2007,22 @@ def _run_pull_pipeline(instance_id, snapshot_time, prev_status, job_id):
             _fail_before_dispatch(f"snapshot {snapshot_time}: {sel_err}")
             return {"statusCode": 409, "body": f"snapshot {snapshot_time}: {sel_err}"}
         hosts_table_name = os.environ.get("HOSTS_TABLE", "")
+        # #394 self-heal —— canary pull 时,若该 host 的 slots.live 还没解析(旧扁平布局),
+        # 用 host 记录里的扁平 live 版本(host.snapshot_time,pull-image 成功时写的)迁进
+        # 版本目录。只在 canary + host 已有 image_slots.live 为空 + 有扁平 snapshot_time 时传;
+        # 否则传 None(self-heal 段不生成)。读 host 记录:强一致,拿最新状态。
+        flat_live_snap = None
+        if slot == image_slots.SLOT_CANARY:
+            _hrec = hosts_table.get_item(
+                Key={"instance_id": instance_id}, ConsistentRead=True
+            ).get("Item") or {}
+            _slots_now = _hrec.get("image_slots") or {}
+            if not _slots_now.get("live"):  # live 未解析 → 需 self-heal
+                flat_live_snap = (_hrec.get("snapshot_time") or "").strip() or None
         install_cmd = _snapshot_pull_script(
             bucket, region, host_files, snapshot_time,
             hosts_table_name, instance_id, prev_status, job_id, rootfs_version,
+            slot=slot, flat_live_snapshot_time=flat_live_snap,
         )
     except Exception as e:
         _fail_before_dispatch(f"pre-dispatch error: {e}")
@@ -1326,7 +2052,8 @@ def _run_pull_pipeline(instance_id, snapshot_time, prev_status, job_id):
         # 【真失败】处理:job-conditional 记错误 + 复位回 prev(别卡 upgrading、progress 别永 InProgress)。
         if "OWNERSHIP_CHECK_FAILED" in (tail or ""):
             _record_pull_error(instance_id, reason, job_id)
-            _reset_host_status(instance_id, prev_status, job_id)  # live 未碰,安全复位
+            if slot != image_slots.SLOT_CANARY:  # #394 canary 未改 status,不复位(同 _fail_before_dispatch)
+                _reset_host_status(instance_id, prev_status, job_id)  # live 未碰,安全复位
             return _resp(502, {"error": "pull-image fence DDB read failed (live untouched, reset)",
                                "command_id": cmd_id, "detail": reason})
         # #309 V1 —— 脚本【跑了】但失败(真失败)。status 由脚本 trap 按阶段自决(靠 INSTALLING):
@@ -1343,6 +2070,29 @@ def _run_pull_pipeline(instance_id, snapshot_time, prev_status, job_id):
 
     # 成功:脚本已 _reset_ok 自管收尾(survives Lambda 死);Lambda 再 _finalize_success 兜一次
     # (防脚本 host 侧 aws cli 的 `|| true` 静默失败),两条幂等同值,保证 DDB 终态反映真实。
+    # #394 —— canary 成功【不】走 _finalize_success:那个函数条件写 status==upgrading 并把
+    # host.snapshot_time 改成本次版本。而 host.snapshot_time 的语义是"这台 host 的 live 版本",
+    # canary 装好并不改变 live —— 写了就等于谎报该 host 已在跑候选版本(存量 live 租户其实
+    # 还在旧版)。canary 的成功事实由 slots.json 的 canary 指针 + 持久化 Job result 表达。
+    if slot == image_slots.SLOT_CANARY:
+        image_jobs.record_transition(
+            job_id, "SUCCEEDED", phase="done", progress_percent=100,
+            result={"snapshot_time": snapshot_time, "slot": image_slots.SLOT_CANARY},
+        )
+        # #394 —— 把 canary 槽镜像到 host 记录(控制面副本,供 create-tenant 准入读取)。
+        # 真值仍是 host 上的 slots.json(ADR §4.2);这里只是控制面读得到的一份投影,
+        # 故 best-effort:写失败不影响 pull 结果(create-tenant 拿不到会 CANARY_NOT_READY
+        # 让调用方重试,不会误起 live —— fail-closed 方向)。
+        # self-heal:host 侧刚把扁平 live 迁进版本目录并解析了 slots.live;把控制面镜像的
+        # live 也一并回填(否则镜像 live 仍 null → promote 出 previous_live=null / 前端 undefined)。
+        _mirror_canary_slot(instance_id, snapshot_time,
+                            live_snapshot_time=flat_live_snap)
+        return _resp(
+            200,
+            {"message": "pull-image installed to canary slot (live untouched)",
+             "snapshot_time": snapshot_time, "instance_id": instance_id,
+             "slot": image_slots.SLOT_CANARY, "install_command_id": cmd_id},
+        )
     _finalize_success(instance_id, snapshot_time, prev_status, job_id, rootfs_version)
     return _resp(
         200,
@@ -1423,7 +2173,13 @@ def _record_pull_error(instance_id, reason, job_id=None):
     (status 由脚本 trap 按阶段自决:phase1 已复位 prev / phase2 留 upgrading)。
     #334(codex round6)job-conditional:传 job_id 时条件写 pull_command_id==job_id。否则
     at-least-once/超时重投的【旧 worker】失败后,新 pull 已写入新 job,旧 Lambda 会把旧错误写到
-    新 job 的槽 → pull_image_progress 的 DDB 终态优先逻辑据此把新任务误报 Failed。非 owner → CCF 跳过。"""
+    新 job 的槽 → pull_image_progress 的 DDB 终态优先逻辑据此把新任务误报 Failed。非 owner → CCF 跳过。
+
+    #394 P1-3 —— host 行的 last_pull_error 写是 owner-gated(共享行,防旧 worker 污染);但
+    持久化 Job 行是【按 job_id 主键】的,天生 owner-safe(每个 job 只有自己那条)。canary pull
+    从不写 pull_command_id,故 host 行 CCF 必然失败——但那【不该】连累 Job 终态。原来 CCF 后
+    直接 return,导致 canary 失败永远停在 QUEUED(host 重启/进度文件丢后 progress 永报
+    InProgress)。改为:host 行写失败只跳过 host 行,Job FAILED 转移【始终】执行。"""
     ccf = hosts_table.meta.client.exceptions.ConditionalCheckFailedException
     kw = {
         "Key": {"instance_id": instance_id},
@@ -1436,9 +2192,17 @@ def _record_pull_error(instance_id, reason, job_id=None):
     try:
         hosts_table.update_item(**kw)
     except ccf:
-        print(f"[pull] record error {instance_id} skipped: not current owner (job={job_id})")
+        # 非 owner(含 canary 从不写 pull_command_id 的正常情形):跳过 host 行写,但 Job 终态
+        # 仍要落(Job 按 job_id 主键,不会污染别的 job)。live 的旧 worker 场景同样安全:它写的
+        # 是自己那条 job 的 FAILED,新 job 是另一条 job_id。
+        print(f"[pull] record error {instance_id} host-row skipped (not owner / canary); job still marked FAILED (job={job_id})")
     except Exception as e:
         print(f"[pull] WARN record error {instance_id} failed: {e}")
+    # #394 step1/P1-3 —— 失败【始终】落到持久化 Job(state=FAILED)。这正是"worker 早退 / host
+    # 重启 /tmp 丢了仍能判终态"的来源(ADR §7)。旁路 fail-open,不抛。
+    image_jobs.record_transition(
+        job_id, "FAILED", phase="failed", error={"reason": (reason or "")[:400]}
+    )
 
 
 def _finalize_success(instance_id, snapshot_time, prev_status, job_id, rootfs_version=""):
@@ -1475,21 +2239,110 @@ def _finalize_success(instance_id, snapshot_time, prev_status, job_id, rootfs_ve
         # 非当前 owner(pull_command_id 被新 pull 覆盖)或 host 已非 upgrading(被移去
         # draining/deleted)→ 本就不该 finalize,静默跳过。
         print(f"[pull] finalize {instance_id} skipped: not current owner or not upgrading (job={job_id})")
+        return  # 非 owner/非 upgrading:同样不该把 Job 标成功(见 _record_pull_error 同源理由)
     except Exception as e:
         print(f"[pull] WARN finalize {instance_id} failed: {e}")
+    # #394 step1 —— 成功终态落持久化 Job,result 带上 promote/建 canary 租户要用的版本信息
+    # (ADR §4.4 "pull 成功后 result 提供版本信息")。本步 target_slot 恒 live。
+    image_jobs.record_transition(
+        job_id, "SUCCEEDED", phase="done", progress_percent=100,
+        result={"snapshot_time": snapshot_time, "slot": "live"},
+    )
 
 
-def pull_image(instance_id, query_params):
+def host_image_slots(instance_id):
+    """GET /hosts/{id}/image-slots — 读【该 EC2 磁盘上真实】的镜像状态(#394 debug 视图)。
+
+    与 GET /hosts 的 image_slots(DDB 镜像,可能滞后)不同:这个 SSM 进 host 直接读
+    /data/firecracker-assets/slots.json 真值 + ls versions/ 已装的版本目录,返回盘上真相。
+    用途:一眼看出镜像是否与 DDB 镜像漂移、host 上到底装了哪些版本。只读,viewer 可读。
+
+    返回:
+      {instance_id, source:"host-disk", slots:{live,canary,previous_live,generation},
+       installed_versions:[<snapshot_time>...], flat_layout:bool, mirror:{...DDB 镜像...}}
+    slots.json 不存在(老扁平 host)→ slots 全 null + flat_layout=true。
+    SSM 读失败 → 503(host 不可达/离线),不谎报空。"""
+    if not instance_id:
+        return _err(400, "VALIDATION", "missing instance_id")
+    item = hosts_table.get_item(Key={"instance_id": instance_id}).get("Item")
+    if not item:
+        return _err(404, "NOT_FOUND", f"host {instance_id} not found")
+    q = shlex.quote
+    slots_f = q(image_slots.SLOTS_FILE)
+    vers_d = q(image_slots.VERSIONS_DIR)
+    # 一次 SSM 取两样,用前缀分隔:slots.json 内容 + versions/ 下的目录名(每行一个)。
+    script = (
+        f'echo "__SLOTS__$(cat {slots_f} 2>/dev/null || echo __NONE__)"; '
+        f'echo "__VERS__"; ls -1 {vers_d} 2>/dev/null || true'
+    )
+    cmd_id, ok, out = _ssm_wait(instance_id, script, timeout=60)
+    if not ok:
+        return _err(503, "DEPENDENCY_UNAVAILABLE",
+                    f"could not read image state from host {instance_id} (SSM failed/offline)")
+    # 解析:__SLOTS__<json|__NONE__> 换行 __VERS__ 换行 <dir per line>
+    raw = out or ""
+    slots_line = ""
+    versions = []
+    in_vers = False
+    for ln in raw.splitlines():
+        if ln.startswith("__SLOTS__"):
+            slots_line = ln[len("__SLOTS__"):]
+        elif ln.strip() == "__VERS__":
+            in_vers = True
+        elif in_vers and ln.strip():
+            versions.append(ln.strip())
+    flat = False
+    try:
+        slots = image_slots.normalize(None if "__NONE__" in slots_line or not slots_line.strip()
+                                      else slots_line)
+        if "__NONE__" in slots_line or not slots_line.strip():
+            flat = True
+    except (ValueError, json.JSONDecodeError):  # 损坏 slots.json → fail-loud 到 500
+        return _err(500, "SLOTS_CORRUPT",
+                    f"host {instance_id} slots.json is unparseable")
+    return _resp(200, {
+        "instance_id": instance_id,
+        "source": "host-disk",
+        "slots": slots,
+        "installed_versions": sorted(versions, reverse=True),
+        "flat_layout": flat,
+        # 一并回 DDB 镜像,方便调用方直接比对是否漂移。
+        "mirror": item.get("image_slots") or None,
+        "command_id": cmd_id,
+    })
+
+
+def pull_image(instance_id, query_params, headers=None):
     """#309 V1 — POST /hosts/{id}/pull-image?snapshot_time=<ISO>. 照快照按精确 VersionId
     拉 deployment/rootfs/(镜像三盘 + manifest.json),校验 etag 后 copy+unzip 装到 live 原位置
     (launch-vm 直接读的地方)。只作用一台 host。异步跑,立即回 202 + job_id;进度走
-    pull_image_progress。金丝雀已移除,失败只报错不自动 restore(留 V2)。"""
+    pull_image_progress。金丝雀已移除,失败只报错不自动 restore(留 V2)。
+
+    #394 P2-1 —— 支持 Idempotency-Key:响应丢失后带同 key 重试 → 返回原 job,不再新起一次真
+    pull(与 promote/cleanup 幂等语义一致,兑现文档承诺)。"""
     if not instance_id:
         return _err(400, "VALIDATION", "missing instance_id")
     snapshot_time = ((query_params or {}).get("snapshot_time") or "").strip()
     if not snapshot_time:
         return _err(400, "VALIDATION", "snapshot_time required (version mode removed)")
-    return _pull_by_snapshot(instance_id, snapshot_time)
+    # #394 —— ?slot=live|canary。缺省 = live(向后兼容:旧客户端不传 slot,行为不变);
+    # 取值非法一律 400,绝不"猜"成 live(猜错会把候选版本装成正式版)。
+    slot = ((query_params or {}).get("slot") or "").strip()
+    if slot and not image_slots.is_valid_slot(slot):
+        return _err(
+            400, "VALIDATION",
+            f"slot must be 'live' or 'canary'; got {slot!r}",
+        )
+    idem_key = _idempotency_key_from_headers(headers)
+    return _pull_by_snapshot(instance_id, snapshot_time, slot or None, idem_key)
+
+
+def _idempotency_key_from_headers(headers):
+    """取 Idempotency-Key 头(大小写不敏感;缺失/空 → None,退化成"每次都真跑"的旧语义)。"""
+    for key, value in (headers or {}).items():
+        if key.lower() == "idempotency-key":
+            return (value or "").strip() or None
+    return None
 
 
 # #309 — copy-file 目标位置白名单根:只允许写 firecracker 资产目录,挡任意路径覆盖(越权)。
@@ -1642,7 +2495,60 @@ def _pull_status_from_line(last_line):
     return "InProgress"
 
 
-def pull_image_progress(instance_id):
+def _progress_from_job(base, job):
+    """#394 step1 —— 持久化 Job 已是终态时,直接由 Job 组出 progress 响应(不探 host)。
+
+    ProcessingJobStatus 与既有语义一一对齐,老客户端读法不变:
+      SUCCEEDED → Completed(+ ExitCode 0);FAILED / RECOVERY_REQUIRED → Failed
+      (+ ErrorCode/FailureReason)。RECOVERY_REQUIRED 对外仍报 Failed(老字段只有三态),
+      细分靠新增的 state 字段区分 —— 不给老客户端造第四种它不认识的值。
+    """
+    state = job.get("state")
+    err = job.get("error") or {}
+    out = {**base, "last_status": job.get("phase")}
+    if state == "SUCCEEDED":
+        out["ProcessingJobStatus"] = "Completed"
+        out["ExitCode"] = 0
+        return out
+    out["ProcessingJobStatus"] = "Failed"
+    out["ErrorCode"] = err.get("code")
+    out["FailureReason"] = err.get("reason") or base.get("last_pull_error")
+    return out
+
+
+def _resolve_progress_job(instance_id, requested_job_id, host_item):
+    """#394 step1(ADR §4.4)—— 定位本次 progress 要查的 job。
+
+    返回 (job_id, job_item, err_response):
+      · 传了 job_id → 按 id 精确查持久化 Job;查不到 / 不属于该 host → 404 JOB_NOT_FOUND
+        (不能默默回退成"该 host 最近那次",否则调用方以为查的是自己那个 job);
+      · 没传 job_id(兼容窗口)→ 优先持久化 Job 里该 host 最近一条,其次退回 host 记录的
+        pull_command_id(未部署 Job 表的环境行为完全不变)。
+    Job 表未配置时 job_item 为 None,调用方照旧走 /tmp 进度文件路径。
+    """
+    if requested_job_id:
+        job = image_jobs.get(requested_job_id)
+        if job is None:
+            # 表未配置时无法证伪 job 归属 → 不谎报 404,按传入 id 照旧 tail 进度文件。
+            if image_jobs.is_enabled():
+                return None, None, _err(
+                    404, "JOB_NOT_FOUND",
+                    f"pull job {requested_job_id} not found for host {instance_id}",
+                )
+            return requested_job_id, None, None
+        if job.get("instance_id") != instance_id:
+            return None, None, _err(
+                404, "JOB_NOT_FOUND",
+                f"pull job {requested_job_id} not found for host {instance_id}",
+            )
+        return requested_job_id, job, None
+    latest = image_jobs.latest_for_host(instance_id)
+    if latest:
+        return latest.get("job_id"), latest, None
+    return host_item.get("pull_command_id"), None, None
+
+
+def pull_image_progress(instance_id, query_params=None):
     """#309 — GET /hosts/{id}/pull-image-progress:读 host DDB 项拿本轮 pull 的 job_id
     (pull_command_id),SSM 取进度文件的末行(判三态)+ 最近 ERROR 行(失败原因)。返回
     SageMaker ProcessingJob 风格 JSON(owner 2026-07-20):
@@ -1667,10 +2573,16 @@ def pull_image_progress(instance_id):
       }"""
     if not instance_id:
         return _err(400, "VALIDATION", "missing instance_id")
-    item = hosts_table.get_item(Key={"instance_id": instance_id}).get("Item")
+    item = hosts_table.get_item(
+        Key={"instance_id": instance_id}, ConsistentRead=True
+    ).get("Item")
     if not item:
         return _err(404, "NOT_FOUND", f"host {instance_id} not found")
-    job_id = item.get("pull_command_id")
+    # #394 step1 —— ?job_id= 精确查(新客户端);不传则兼容窗口取该 host 最近一条。
+    requested_job_id = ((query_params or {}).get("job_id") or "").strip()
+    job_id, job, job_err = _resolve_progress_job(instance_id, requested_job_id, item)
+    if job_err:
+        return job_err
     base = {
         "instance_id": instance_id,
         "host_status": item.get("status"),  # host DDB 态(active/idle/upgrading),别与 pull status 混
@@ -1678,19 +2590,39 @@ def pull_image_progress(instance_id):
         "snapshot_time": item.get("snapshot_time"),
         "last_pull_error": item.get("last_pull_error"),
     }
+    if job:
+        # 新契约附加字段(ADR §4.4):既有 ProcessingJobStatus 保留,另给 state/phase/result/error。
+        base.update({
+            "state": job.get("state"),
+            "phase": job.get("phase"),
+            "target_slot": job.get("target_slot"),
+            "requested_snapshot_time": job.get("requested_snapshot_time"),
+            "result": job.get("result"),
+            "error": job.get("error"),
+        })
     if not job_id:
         return _resp(200, {**base, "ProcessingJobStatus": "InProgress", "last_status": None,
                            "message": "no pull-image job for this host"})
+    # #394 step1 —— Job 已是终态就直接回,不必再 SSM 探 host 进度文件:host 重启 /tmp 丢了
+    # 也能给出正确终态(ADR §7 "Host 重启导致 /tmp 丢失"),同时省一次 SSM 往返。
+    if job and job.get("state") in image_jobs.TERMINAL_STATES:
+        return _resp(200, _progress_from_job(base, job))
     q = shlex.quote
     jf = f"/tmp/{q(str(job_id))}.txt"
-    # 一次 SSM 取两样:① 末行(判三态)② 最近一条 ERROR:<CODE> 行(作 FailureReason)。
-    # 用 __LAST__/__ERR__ 前缀分隔,Lambda 侧解析(grep 无命中不致命,回空)。
+    # 一次 SSM 取三样:① 文件在不在(__EXISTS__)② 末行(判三态)③ 最近一条 ERROR:<CODE> 行。
+    # #394 —— 显式区分"文件不存在"与"文件空":worker 刚起还没写、或 host 重启 /tmp 丢了,
+    # 都会让 tail 回空;单看空行分不清是"没建"还是"在建"。加一行 [ -f ] 探测,Lambda 据此
+    # 在响应里透出 progress_file_missing,但【不因此报错】(fresh/in-flight job 文件本就可能暂缺)。
     script = (
+        f'if [ -f {jf} ]; then echo "__EXISTS__yes"; else echo "__EXISTS__no"; fi; '
         f'echo "__LAST__$(tail -n 1 {jf} 2>/dev/null)"; '
         f'echo "__ERR__$(grep "ERROR:" {jf} 2>/dev/null | tail -n 1)"'
     )
     cmd_id, ok, tail = _ssm_wait(instance_id, script, timeout=60)
     last_line, err_line = _parse_progress_output(tail if ok else "")
+    # 文件缺失判定:SSM 读成功且明确回 __EXISTS__no → 文件不在;SSM 读失败(host 不可达/重启)
+    # 也视作"进度不可用"。两者都进 progress_file_missing,交由下方 reconciler 用 host 真值对账。
+    file_missing = (not ok) or ("__EXISTS__no" in (tail or ""))
     job_status = _pull_status_from_line(last_line)
     # #333(codex round4/5)终态持久化优先:worker 早退(SSM 未下发/进度文件没建)时,进度文件
     # 判不出终态(永远 InProgress),但 Lambda 侧 _record_pull_error 把失败写进了 DDB last_pull_error。
@@ -1698,15 +2630,114 @@ def pull_image_progress(instance_id):
     ddb_err = item.get("last_pull_error")
     if job_status != "Completed" and ddb_err:
         job_status = "Failed"
-    # SageMaker ProcessingJob 风格:Completed 带 ExitCode=0;Failed 带 FailureReason + ErrorCode。
+    # #394 reconciler:非终态 Job + progress 文件丢失/终态写失败时，从持久真值收敛。
+    # live 以 host.status + snapshot_time 为证据；canary 以 lease 已结束且 slots mirror
+    # 在 Job 入队后完成过同步为证据。后者由 pull commit 和 host-agent 心跳共同维护，避免
+    # 把 canary 正在执行期间的旧指针误判为失败。所有推断终态必须先成功写回 Job；写失败
+    # 返回可重试 503，绝不再输出 ProcessingJobStatus 与 state/phase 互相矛盾的 200。
+    if job and job.get("state") not in image_jobs.TERMINAL_STATES:
+        req_snap = job.get("requested_snapshot_time")
+        target_slot = job.get("target_slot", "live")
+        terminal_state = terminal_phase = None
+        terminal_result = terminal_error = None
+
+        if job_status == "Completed":
+            terminal_state, terminal_phase = "SUCCEEDED", "done"
+            terminal_result = {"snapshot_time": req_snap, "slot": target_slot}
+        elif job_status == "Failed":
+            code, reason = _parse_error_line(err_line)
+            terminal_state, terminal_phase = "FAILED", "failed"
+            terminal_error = {"code": code, "reason": reason or ddb_err or last_line}
+        elif (not ok) or job_status == "InProgress":
+            if target_slot == "live":
+                host_snap = item.get("snapshot_time")
+                host_status = item.get("status")
+                if host_status and host_status != "upgrading":
+                    if host_snap and req_snap and host_snap == req_snap:
+                        terminal_state, terminal_phase = "SUCCEEDED", "done"
+                        terminal_result = {"snapshot_time": req_snap, "slot": "live"}
+                    else:
+                        terminal_state, terminal_phase = "RECOVERY_REQUIRED", "recovery"
+                        terminal_error = {
+                            "code": "RECOVERY_REQUIRED",
+                            "reason": "progress lost and host truth does not confirm this "
+                                      "live version; manual recovery required",
+                        }
+            elif target_slot == image_slots.SLOT_CANARY:
+                lease = image_lease.read(instance_id)
+                still_running = (
+                    bool(lease)
+                    and lease.get("active_image_operation_id") == job_id
+                    and image_lease.is_held(lease)
+                )
+                # Re-read slot truth after the lease read. Both lease and mirror live on the
+                # same Host item, so a strong read here observes any mirror write ordered before
+                # release. If commit mirror failed, host-agent must sync after release/expiry
+                # before absence can be treated as proof of failure.
+                truth = hosts_table.get_item(
+                    Key={"instance_id": instance_id}, ConsistentRead=True
+                ).get("Item") or item
+                synced_at = int(truth.get("image_slots_synced_at_epoch") or 0)
+                try:
+                    created_at = int(datetime.fromisoformat(
+                        str(job.get("created_at") or "").replace("Z", "+00:00")
+                    ).timestamp())
+                except (TypeError, ValueError):
+                    created_at = 0
+                mirror_canary = (truth.get("image_slots") or {}).get("canary")
+                mirror_is_post_admission = synced_at > 0 and synced_at >= created_at
+                released_at = 0
+                if lease and lease.get("image_lease_released_operation_id") == job_id:
+                    released_at = int(lease.get("image_lease_released_at_epoch") or 0)
+                elif (lease and lease.get("active_image_operation_id") == job_id
+                      and not image_lease.is_held(lease)):
+                    released_at = int(lease.get("image_lease_until") or 0)
+                # codex NB4 —— 必须【严格】晚于 release:秒级时间戳下,一个在 release 同一秒
+                # 落库的【release 前】旧心跳若用 >= 会被当成 post-release 证据 → 误判 RECOVERY。
+                # 用 > 让同秒心跳不作数(留给下一轮心跳),宁可暂不终结也不误报恢复。
+                mirror_is_post_end = released_at > 0 and synced_at > released_at
+                if not still_running and mirror_canary == req_snap and mirror_is_post_admission:
+                    terminal_state, terminal_phase = "SUCCEEDED", "done"
+                    terminal_result = {"snapshot_time": req_snap, "slot": "canary"}
+                elif not still_running and mirror_is_post_end:
+                    terminal_state, terminal_phase = "RECOVERY_REQUIRED", "recovery"
+                    terminal_error = {
+                        "code": "RECOVERY_REQUIRED",
+                        "reason": "progress lost after canary lease ended and fresh Host "
+                                  "slot truth does not confirm the requested version; "
+                                  "manual recovery required",
+                    }
+
+        if terminal_state:
+            persisted = image_jobs.record_transition(
+                job_id, terminal_state, phase=terminal_phase,
+                progress_percent=100 if terminal_state == "SUCCEEDED" else None,
+                result=terminal_result, error=terminal_error,
+            )
+            if not persisted:
+                return _err(
+                    503, "JOB_RECORD_UNAVAILABLE",
+                    f"reconciled pull job {job_id} to {terminal_state} but could not persist "
+                    "the terminal state; retry progress shortly",
+                )
+            job = {**job, "state": terminal_state, "phase": terminal_phase,
+                   "result": terminal_result, "error": terminal_error}
+            base.update({"state": terminal_state, "phase": terminal_phase,
+                         "result": terminal_result, "error": terminal_error})
+            out = _progress_from_job(base, job)
+            out.update({"last_status": last_line, "command_id": cmd_id,
+                        "progress_file_missing": file_missing})
+            return _resp(200, out)
+
+    # Legacy/no-Job path or a genuinely running Job.
     out = {**base, "ProcessingJobStatus": job_status,
-           "last_status": last_line, "command_id": cmd_id}
+           "last_status": last_line, "command_id": cmd_id,
+           "progress_file_missing": file_missing}
     if job_status == "Completed":
         out["ExitCode"] = 0
     elif job_status == "Failed":
         code, reason = _parse_error_line(err_line)
-        # FailureReason 优先级:进度文件的 ERROR 行 > DDB last_pull_error > 末行原文。
-        out["ErrorCode"] = code                        # 结构化错误码(见 _PULL_ERROR_CODES)
+        out["ErrorCode"] = code
         out["FailureReason"] = reason or ddb_err or last_line
     return _resp(200, out)
 

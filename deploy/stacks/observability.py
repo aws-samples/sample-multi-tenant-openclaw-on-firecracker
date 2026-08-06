@@ -4,7 +4,7 @@
 """Observability data-plane log domain (issue #219, task 6 of #209 spec).
 
 Wires the Fluent Bit → Kinesis Data Firehose → Amazon OpenSearch Service
-pipeline described in `.kiro/specs/platform-observability/design.md` §5-§6.
+pipeline described in `engineering/00-knowledge-base/SPEC/kiro/platform-observability/design.md` §5-§6.
 
 Design constraints enforced here (also see spec R5.1-R5.8):
 
@@ -441,13 +441,14 @@ def build_observability(self, ctx):
     # 只按名字当 egress,不验路由)——2026-07-17 真机实撞:主栈部署到 AOS rolesmapping 时 Lambda
     # `Connect timeout on secretsmanager.<region>.amazonaws.com` → 整栈 ROLLBACK(#295,codex 判根因)。
     # VPCE 走 VPC 内直达(private_dns 让标准域名自动导向,代码不改),不依赖 NAT,对 imported/self_managed
-    # 都普适(客户 imported VPC 大概率也没这个 VPCE)。无条件建(测试+生产都需要;Interface VPCE 月费
-    # 可接受,换 one-shot 可靠)。SG 只放 rolesmapping Lambda SG 443。
-    # #309 — 幂等门 create_secretsmanager_vpce(默认 true,保存量行为):AWS 硬规则同一
+    # 都普适。SG 只放 rolesmapping Lambda SG 443。
+    #
+    # #309 — 幂等门 `create_secretsmanager_vpce`(默认 true,保存量行为):AWS 硬规则同一
     # 服务在同一 VPC 只允许一个 Interface VPCE 开 private_dns_enabled。若 VPC 里已存在一个
-    # secretsmanager VPCE(上轮 RETAIN 残留 / 客户自建),再建开 private DNS 的必冲突 → 整栈
-    # ROLLBACK。已有 VPCE 的环境把此开关设 false:栈不建自己的,复用现有那个(private DNS
-    # 让标准域名照样解到它,Lambda 透明可用)。全新 VPC 保持 true。
+    # secretsmanager VPCE(上轮 RETAIN 残留 / 客户自建),再建开 private DNS 的必冲突报
+    # `private-dns-enabled ... conflicts` → 整栈 ROLLBACK(2026-07-17 真机撞)。已有 VPCE 的
+    # 环境把此开关设 false:栈不建自己的,复用现有那个(private DNS 让标准域名照样解到它,
+    # Lambda 透明可用)。default_vpc/self_managed 全新 VPC 保持 true。
     _create_sm_vpce = bool(_aos_cfg.get("create_secretsmanager_vpce", True))
     _sm_vpce = None
     if _create_sm_vpce:
@@ -612,6 +613,8 @@ def build_observability(self, ctx):
     for _s in _all_streams:
         _rmap_cr.node.add_dependency(_s)
     # VPCE 必须先就绪:Lambda 运行时经它调 secretsmanager 取口令(否则 imported VPC 无 NAT 时超时)。
+    # #309 — 仅当本栈建了 VPCE 才钉依赖;复用现有 VPCE(create_secretsmanager_vpce=false)时
+    # 它已存在、无需 add_dependency。
     if _sm_vpce is not None:
         _rmap_cr.node.add_dependency(_sm_vpce)
 

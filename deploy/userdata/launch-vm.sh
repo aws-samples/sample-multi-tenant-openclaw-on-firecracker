@@ -88,7 +88,8 @@ fan_out_main() {
       --output json 2>/dev/null \
     | jq -c '.Items[] | {t:.tenant_id.S, n:(.vm_num.N|tonumber),
                           c:(.vcpu.N|tonumber), m:(.mem_mb.N|tonumber),
-                          e:(if .chat_ep.BOOL then 1 else 0 end)}
+                          e:(if .chat_ep.BOOL then 1 else 0 end),
+                          q:(.capacity_reservation_id.S // "")}
                          + (if .gateway_token_ct.S then {g:.gateway_token_ct.S} else {} end)
                          + (if .device_paired_b64.S then {d:.device_paired_b64.S} else {} end)
                          + (if .restore_backup_key.S then {r:.restore_backup_key.S} else {} end)'
@@ -126,6 +127,7 @@ fan_out_main() {
   _launch_one() {
     local tid="$1" vm_num="$2" vcpu="$3" mem_mb="$4" chat_ep="$5"
     local gw_token_ct="${6:-}" device_paired="${7:-}" restore_key="${8:-}"
+    local reservation_id="${9:-}"
     local vm_path="${FAN_VM_DIR}/${tid}"
     # Idempotent check: if vm.json already exists we treat this as an at-least-once
     # duplicate delivery. host-agent's poll loop will still recover it if FC died.
@@ -146,7 +148,8 @@ fan_out_main() {
     # 批量创建卡住时,console Logs viewer 才查得到某租户为何没起来。
     systemd-cat -t claw-launch \
       bash "$0" "${tid}" "${vm_num}" "${vcpu}" "${mem_mb}" \
-      "" "${restore_key}" "" "" "" "${chat_ep}" "" "${gw_token_ct}" "${device_paired}"
+      "" "${restore_key}" "" "" "" "${chat_ep}" "" "${gw_token_ct}" \
+      "${device_paired}" "${reservation_id}"
     return $?
   }
 
@@ -170,6 +173,7 @@ fan_out_main() {
     # (base64 paired.json, #188). 缺省空串 → launch-vm fail-open。
     local line="$1" rfile="$2"
     local tid vm_num vcpu mem_mb chat_ep gw_token_ct device_paired restore_key
+    local reservation_id
     tid=$(jq -r '.t // empty' <<<"${line}" 2>/dev/null)
     vm_num=$(jq -r '.n // empty' <<<"${line}" 2>/dev/null)
     vcpu=$(jq -r '.c // 2' <<<"${line}" 2>/dev/null)
@@ -179,13 +183,14 @@ fan_out_main() {
     device_paired=$(jq -r '.d // empty' <<<"${line}" 2>/dev/null)
     # #199 — restore 意图(r=S3 backup key);空 → 普通建盘,非空 → launch 恢复该备份
     restore_key=$(jq -r '.r // empty' <<<"${line}" 2>/dev/null)
+    reservation_id=$(jq -r '.q // empty' <<<"${line}" 2>/dev/null)
     if [ -z "${tid}" ] || [ -z "${vm_num}" ]; then
       echo "failed" > "${rfile}"
       _fo_log "parse-error line=${line}"
       return
     fi
     _launch_one "${tid}" "${vm_num}" "${vcpu}" "${mem_mb}" "${chat_ep}" \
-      "${gw_token_ct}" "${device_paired}" "${restore_key}"
+      "${gw_token_ct}" "${device_paired}" "${restore_key}" "${reservation_id}"
     rc=$?
     printf '%s' "${tid}" > "${rfile}.tid"  # v2 per-tenant report (see stdout JSON)
     if [ "${rc}" -eq 0 ]; then
@@ -194,6 +199,21 @@ fan_out_main() {
     elif [ "${rc}" -eq 42 ]; then
       echo "skipped" > "${rfile}"
       [ "${FROM_DDB}" -eq 1 ] && _mark_assignment "${tid}" "done"
+    elif [ "${rc}" -eq 44 ]; then
+      # #411/6.3 — 租户 status=deleted(终态):删除已定,重投只会反复叫醒 host 起一个
+      # 马上要删的 VM。标 assignment done 让它从 pending 过滤掉(停止重捞),写独立哨兵
+      # aborted → 不进 launched/failed 清单、不触发批回滚(codex#4)。
+      echo "aborted" > "${rfile}"
+      [ "${FROM_DDB}" -eq 1 ] && _mark_assignment "${tid}" "done"
+      _fo_log "launch abort(deleted) tenant=${tid} rc=44 — 租户已删,拒起并停重投"
+    elif [ "${rc}" -eq 45 ]; then
+      # #411/6.3(codex round3)— 租户 status=deleting(删除在途,【非】终态):delete 失败
+      # 会把状态回滚到 creating/running。绝不标 assignment done —— 那会让回滚后的 creating
+      # 租户永久无 VM 无 pending。写 inprogress 哨兵(同 flock-skip rc75 语义):不进
+      # launched/skipped/failed 清单、不触发批回滚、保持 pending → 下轮重投重判(读到
+      # deleted 走 44 终结,读到 creating 正常起)。
+      echo "inprogress" > "${rfile}"
+      _fo_log "launch defer(deleting) tenant=${tid} rc=45 — 删除在途,保持 pending 待重投重判"
     elif [ "${rc}" -eq 75 ]; then
       # #256 — launch-vm.sh 抢 per-tenant flock 失败(另一进程正在起同租户)的 skip 哨兵。
       # 关键:绝不 _mark_assignment done。持锁 winner 可能死在写 vm.json 之前(如 #199
@@ -267,6 +287,9 @@ fan_out_main() {
         launched)   launched=$((launched + 1)) ;;
         skipped)    skipped=$((skipped + 1)) ;;
         inprogress) ;;  # #256 flock skip:不计 launched/skipped/failed,不进 v2 清单,不触发批回滚(保持 pending 待重投)
+        aborted)    ;;  # #411/6.3 status 闸拒起(deleted/deleting)= 终态且【非失败】。
+                        # codex#4:绝不落进下面 *) 失败计数——那会让整批 EXIT 1、健康
+                        # 兄弟被 Poller 判 partial 回滚/重投。assignment 已由 caller 标 done。
         *)          failed=$((failed + 1)) ;;
       esac
     done
@@ -470,6 +493,12 @@ INJECTED_GATEWAY_TOKEN_CT="${12:-}"
 # Empty (legacy SSM commands / feature off / owner unknown / CMK off) → skip the
 # write (byte-identical pre-#188 behavior; no paired.json = default pairing gate).
 INJECTED_DEVICE_PAIRED_B64="${13:-}"
+# #412 — DDB assignment generation token. Only pull/from-ddb paths provide it.
+# Before touching disks or Firecracker, the status gate below verifies that the
+# tenant still owns this exact reservation, host and vm_num. A stale assignment
+# whose reservation was rolled back therefore exits 45 instead of launching an
+# unaccounted VM.
+EXPECTED_RESERVATION_ID="${14:-}"
 # Caller may pass literal "" (quoted) as placeholder when only restore_key is set.
 [ "${CONFIG_TEMPLATE}" = '""' ] && CONFIG_TEMPLATE=""
 [ "${RESTORE_KEY}" = '""' ] && RESTORE_KEY=""
@@ -480,8 +509,88 @@ INJECTED_DEVICE_PAIRED_B64="${13:-}"
 [ "${INJECTED_COGNITO_B64}" = '""' ] && INJECTED_COGNITO_B64=""
 [ "${INJECTED_GATEWAY_TOKEN_CT}" = '""' ] && INJECTED_GATEWAY_TOKEN_CT=""
 [ "${INJECTED_DEVICE_PAIRED_B64}" = '""' ] && INJECTED_DEVICE_PAIRED_B64=""
+[ "${EXPECTED_RESERVATION_ID}" = '""' ] && EXPECTED_RESERVATION_ID=""
 VM_DIR="/data/firecracker-vms/${TENANT_ID}"
 [ -f /etc/platform.env ] && source /etc/platform.env
+# #411/6.3 fix(控制面一致性级):launch 前强一致复查租户 status,拒起已删/删除中的租户。
+# 现实触发源(新加坡真机 5 轮坐实):dispatch 已认领 host(host_id 已写)但 VM 未 launch
+# 的窗口内 DELETE → tenant_service 把 status 改 deleting、_backfill_placement 的
+# ConditionExpression(#s=:creating)写 CCF 被跳过(赢家已推进,跳过本身是对的),但
+# 随后的 SSM wake / assignment 仍照发,而此处历史上只查 assignment=pending、无 status 闸
+# → 删意图之后 VM 照起 → 租户遗留 running + 活 firecracker。这里在建任何盘/起 FC 之前
+# 补一道强一致 status 闸。
+# codex(round4)#521 — fail-CLOSED:get-item 调用失败(throttle/IAM/network)、读不到
+# item、或 status 非明确可起态,一律【暂拒起 + 保持 pending 待重投】(exit 45),绝不
+# fail-open 放行。原实现把调用失败 `|| true` 塞成空串再落 * 放行 → DDB 抖动窗口内一条
+# 属于已删租户的陈旧 assignment 会被放过起孤儿 VM。判据反转为白名单:只有【确证读到】
+# 一个可起状态(creating/running/stopped/…)才 launch;deleted 终态 exit 44,其余(含读
+# 失败/空/未知/deleting)exit 45 保持 pending —— 拒起从不丢数据(scheduler 会重投),
+# fail-open 才会起错。get-item 与 jq 分两步,才能区分"调用失败"与"读到但状态不可起"。
+# codex(round6)#529 — 本 status 闸是【纯只读 DDB 检查,未分配任何资源(tap/sock 都还没建,
+# SOCK 变量尚未定义)】。此刻 EXIT trap(_oc_cleanup_on_err,line 378)已装,其"FC 在则不动"
+# 守卫靠 ${SOCK} 判断,而 SOCK 要到 line ~650 才赋值 → 若这里带着 trap 退出(44/45),cleanup
+# 会跳过守卫直冲到 `rm -f ${VM_DIR}/fc.sock` → 误删【正在被 winner / 回滚后 VM 使用】的 live
+# sock。故进闸前先 `trap - ERR EXIT` 摘掉 trap(与 flock-skip rc75:line 395 同款处理);闸内
+# 三个 intentional exit(44/45)都在无 trap 下安全退出;放行(可起态)时再把 trap 装回,后续
+# 真正建盘/起 FC 的失败仍由它兜底清理。
+trap - ERR EXIT
+if _OC_TS_RAW="$(aws dynamodb get-item \
+  --table-name "${TENANTS_TABLE:-openclaw-tenants}" \
+  --key "{\"id\":{\"S\":\"${TENANT_ID}\"}}" \
+  --projection-expression '#s, host_id, vm_num, capacity_reservation_id' \
+  --expression-attribute-names '{"#s":"status"}' \
+  --consistent-read \
+  --region "${OC_REGION:-ap-northeast-1}" \
+  --output json 2>/dev/null)"; then
+  _OC_TSTATUS="$(printf '%s' "${_OC_TS_RAW}" | jq -r '.Item.status.S // ""' 2>/dev/null || echo "")"
+else
+  # get-item 调用失败 → 未知,fail-closed 暂拒起待重投(绝不放行冒充可起)。
+  echo "[oc:launch] DEFER(#411/6.3): tenant ${TENANT_ID} status get-item 调用失败(throttle/IAM/network)— fail-closed 暂拒起、保持 pending 待重投" >&2
+  exit 45
+fi
+if [ -n "${EXPECTED_RESERVATION_ID}" ]; then
+  _OC_ASSIGNMENT_MATCH="$(
+    printf '%s' "${_OC_TS_RAW:-}" | jq -r \
+      --arg host "${INSTANCE_ID:-}" \
+      --arg vm "${VM_NUM}" \
+      --arg rid "${EXPECTED_RESERVATION_ID}" '
+        if (.Item.status.S // "") == "creating"
+           and (.Item.host_id.S // "") == $host
+           and (.Item.vm_num.N // "") == $vm
+           and (.Item.capacity_reservation_id.S // "") == $rid
+        then "yes" else "no" end
+      ' 2>/dev/null || echo "no"
+  )"
+  if [ "${_OC_ASSIGNMENT_MATCH}" != "yes" ]; then
+    echo "[oc:launch] DEFER(#412): stale assignment reservation/host/vm mismatch for ${TENANT_ID}" >&2
+    exit 45
+  fi
+  unset _OC_ASSIGNMENT_MATCH
+fi
+unset _OC_TS_RAW
+case "${_OC_TSTATUS}" in
+  creating|running|stopped|paused|stopping|starting|restarting|rebuilding|migrating|restoring)
+    # #422 — restoring 是休眠恢复的在途可起态(语义同 creating:控制面已 CAS 到 restoring
+    # 并发起冷恢复 launch,此处正是要起 VM)。不加它会被下方 *) 分支 exit 45 DEFER 拒起 →
+    # restore 永远起不来。它非终态(恢复失败控制面回滚 suspended),放行安全。
+    :  # 明确可起态(白名单)→ 放行:把 EXIT trap 装回,后续建盘/起 FC 失败仍被兜底清理。
+    trap _oc_cleanup_on_err ERR EXIT
+    ;;
+  deleted)
+    # 终态:租户已删。拒起 + 让 caller 标 assignment done(不再重投)。trap 已摘,安全退。
+    echo "[oc:launch] ABORT(#411/6.3): tenant ${TENANT_ID} status=deleted — 已删,拒起 VM 并停重投" >&2
+    exit 44
+    ;;
+  *)
+    # deleting / 空 / 未知状态:非终态、非明确可起 → fail-closed 暂拒起,保持 pending。
+    # deleting 尤其【不是】终态(delete 失败会回滚到 creating/running),若标 done 会让回滚后
+    # 的 creating 租户永久无 VM 无 pending。exit 45 保持 pending 待重投重判:delete 成功则下轮
+    # 读到 deleted 走 44 终结,delete 回滚则下轮读到 creating 正常起,读不到也下轮再判。
+    echo "[oc:launch] DEFER(#411/6.3): tenant ${TENANT_ID} status='${_OC_TSTATUS}'(deleting/空/未知)— fail-closed 暂拒起、保持 pending 待重投重判" >&2
+    exit 45
+    ;;
+esac
+unset _OC_TSTATUS
 # #199 fix(数据丢失级):pull 模式 dispatch(host-agent _execute_launch)把位置参数
 # 5/6 留空,让 launch-vm 自己从 DDB 读——但历史上只读了 injected_credentials,漏了
 # restore_backup_key/config_template。结果 restore-create 走队列时 RESTORE_KEY 为空,
@@ -628,13 +737,81 @@ rm -f ${VM_DIR}/vsock.sock
 # Prepare disks
 log "preparing disks..."
 T0=$SECONDS
-ROOTFS="/data/firecracker-assets/openclaw-rootfs.ext4"
-DATA_TPL="/data/firecracker-assets/openclaw-data-template.ext4"
+# ─────────────────────────────────────────────────────────────────────────
+# #394 —— 按 VM 选镜像版本(ADR §4.1/§4.3)。一次启动【只解析一个】版本目录,之后
+# 三块盘全部从这一个目录取,绝不混版。
+#
+# 解析顺序:
+#   1. 租户记录里固定的 image_snapshot_time(canary 租户在 admission 时固定下来的具体
+#      版本)→ 直接用该版本目录。restart/reset/recover 都走这条,所以 canary 租户【不会】
+#      因为 canary 指针被 promote 清空而漂移到别的版本(ADR §6.1)。
+#   2. 否则读 slots.json 的 live 指针(普通 live 租户;每次启动解析一次当前 live)。
+#   3. slots.json 不存在(还没导入版本目录的老 host)→ 回落到历史扁平路径。
+#      这是唯一的兼容回落,且只在"整台 host 都还没有版本目录"时成立。
+#
+# fail-loud 边界:租户固定了版本、但该版本目录在本机【缺失】→ 拒起(exit 1),绝不
+# 静默改用 live 或扁平盘。起错版本比起不来更糟:验证结论会挂在错误的镜像上,而且
+# 客户看到的是"验证通过"的假信号(ADR §11.1 末条 / §6.1)。
+# ─────────────────────────────────────────────────────────────────────────
+_FC_ASSETS="/data/firecracker-assets"
+_SLOTS_FILE="${_FC_ASSETS}/slots.json"
+IMAGE_SNAPSHOT_TIME=""   # 本次启动实际使用的版本(空=走扁平回落);写进 vm.json 供审计
+
+# (1) 租户固定版本:位置参不传,统一从 DDB 读(与 :491-505 读 restore_backup_key 同款
+# fail-CLOSED 模式 —— get-item 调用失败即中止,绝不在读不到版本时盲目起 live)。
+if _IMG_RAW="$(aws dynamodb get-item \
+  --table-name "${TENANTS_TABLE:-openclaw-tenants}" \
+  --key "{\"id\":{\"S\":\"${TENANT_ID}\"}}" \
+  --projection-expression 'image_snapshot_time' \
+  --consistent-read \
+  --region "${OC_REGION:-ap-northeast-1}" \
+  --output json 2>/dev/null)"; then
+  IMAGE_SNAPSHOT_TIME="$(printf '%s' "${_IMG_RAW}" | jq -r '.Item.image_snapshot_time.S // ""' 2>/dev/null || true)"
+else
+  log "FATAL(#394): DDB get-item for image_snapshot_time failed (throttle/IAM/network) — 拒起 fail-closed,绝不猜版本"
+  exit 1
+fi
+unset _IMG_RAW
+
+# (2) 没固定版本 → 读 slots.json 的 live 指针。解析失败(文件损坏)也 fail-loud:
+#     静默当空会回落到扁平盘 = 起了运维以为已经换掉的旧版本。
+if [ -z "${IMAGE_SNAPSHOT_TIME}" ] && [ -f "${_SLOTS_FILE}" ]; then
+  IMAGE_SNAPSHOT_TIME="$(jq -er '.live // ""' "${_SLOTS_FILE}" 2>/dev/null)" || {
+    log "FATAL(#394): ${_SLOTS_FILE} 存在但无法解析(损坏?)— 拒起,不回落扁平盘冒充"
+    exit 1
+  }
+fi
+
+if [ -n "${IMAGE_SNAPSHOT_TIME}" ]; then
+  _VER_DIR="${_FC_ASSETS}/versions/${IMAGE_SNAPSHOT_TIME}"
+  ROOTFS="${_VER_DIR}/openclaw-rootfs.ext4"
+  DATA_TPL="${_VER_DIR}/openclaw-data-template.ext4"
+  IMMUTABLE_TPL="${_VER_DIR}/openclaw-immutable.ext4"
+  # 版本目录里 rootfs/data-template 必须都在(immutable 仍是可选盘,与历史一致)。
+  if [ ! -f "${ROOTFS}" ] || [ ! -f "${DATA_TPL}" ]; then
+    log "FATAL(#394): 版本 ${IMAGE_SNAPSHOT_TIME} 在本机缺失(${_VER_DIR})— 拒起,绝不改用其它版本"
+    exit 1
+  fi
+  log "image version pinned: ${IMAGE_SNAPSHOT_TIME} (dir=${_VER_DIR})"
+else
+  # (3) 兼容回落:整台 host 还没 slots.json/版本目录 → 历史扁平路径,行为与改动前一致。
+  ROOTFS="${_FC_ASSETS}/openclaw-rootfs.ext4"
+  DATA_TPL="${_FC_ASSETS}/openclaw-data-template.ext4"
+  IMMUTABLE_TPL="${_FC_ASSETS}/openclaw-immutable.ext4"
+  log "image version: legacy flat layout (no slots.json on this host)"
+fi
+# 记录本次启动【实际使用】的版本到 vm.json(ADR §4.3 末句:每次启动记录实际 snapshot_time,
+# 供审计与迁移判断)。vm.json 在上面已写好,这里补一个字段;失败不阻断启动(纯审计信息)。
+if [ -n "${IMAGE_SNAPSHOT_TIME}" ] && command -v jq >/dev/null 2>&1; then
+  jq --arg v "${IMAGE_SNAPSHOT_TIME}" '.image_snapshot_time = $v' \
+    "${VM_DIR}/vm.json" > "${VM_DIR}/vm.json.tmp" 2>/dev/null \
+    && mv "${VM_DIR}/vm.json.tmp" "${VM_DIR}/vm.json" \
+    || rm -f "${VM_DIR}/vm.json.tmp"
+fi
 DATA_SIZE=$(stat -c%s ${DATA_TPL})
 # Immutable authority disk (identity files + ops skills). Shared, read-only,
 # attached to every VM as /dev/vdd with is_read_only:true. Optional: if the
 # asset is absent (older image set), we skip the 4th drive so launch still works.
-IMMUTABLE_TPL="/data/firecracker-assets/openclaw-immutable.ext4"
 
 # Overlay: sparse file for rootfs copy-on-write (shared read-only rootfs + per-VM writable layer)
 OVERLAY="${VM_DIR}/overlay.ext4"
@@ -1006,13 +1183,19 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
       fi
       _DEVICES_DIR="${MOUNT_TMP}/.openclaw/devices"
       mkdir -p "${_DEVICES_DIR}"
-      printf '%s' "${_PAIRED_JSON}" > "${_DEVICES_DIR}/paired.json"
-      chmod 600 "${_DEVICES_DIR}/paired.json"
-      sudo chown -R 1000:1000 "${_DEVICES_DIR}"
+      # #415(codex review 第7轮)——原子写:temp+mv,防中途被杀留半个损坏 paired.json
+      # (配合 re-inject 的损坏 fail-closed,半文件会让后续重启永久拒起)。
+      # #415(第8轮)——owner 在 mv 前设到 temp 上,防 mv 后 chown 前被杀致永久 root:root。
+      _TMP_CI="${_DEVICES_DIR}/.paired.json.tmp.$$"
+      printf '%s' "${_PAIRED_JSON}" > "${_TMP_CI}"
+      chmod 600 "${_TMP_CI}"
+      sudo chown 1000:1000 "${_TMP_CI}"
+      mv -f "${_TMP_CI}" "${_DEVICES_DIR}/paired.json"
+      sudo chown 1000:1000 "${_DEVICES_DIR}"
       # Log只打 deviceId 前16字符(paired.json 的顶层 key),不泄全量。
       _DID16="$(printf '%s' "${_PAIRED_JSON}" | jq -r 'keys[0] // "?"' 2>/dev/null | cut -c1-16)"
       log "paired.json cold-injected (one-time; #188 device=${_DID16}… wss 免 approve)"
-      unset _PAIRED_JSON _DID16
+      unset _PAIRED_JSON _DID16 _TMP_CI
     fi
   fi
 
@@ -1167,29 +1350,78 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
     mkdir -p "${_DEVICES_DIR_RI}"
     # #314(codex review 缺陷1 修复):按 deviceId **merge**,不整体覆盖。
     # 盘上 paired.json 可能含网关运行时 approve 的【其它设备】+ 每设备运行时字段
-    # (tokens/lastSeen*)。整体覆盖会删掉它们(丢运行时授权状态)。用 jq 递归 merge
-    # `盘上 * 控制面`:控制面这条(们)device 新增/更新公钥·roles·scopes;盘上已有的
-    # 其它 deviceId 原样保留;同 deviceId 递归 merge(盘上在左),盘上运行时独有字段
-    # (tokens/lastSeen)保留,控制面的 tokens:{} 空对象 merge 不覆盖盘上非空 tokens。
-    _CUR_PAIRED="$(cat "${_DEVICES_DIR_RI}/paired.json" 2>/dev/null || true)"
-    if ! printf '%s' "${_CUR_PAIRED}" | jq -e 'type == "object"' >/dev/null 2>&1; then
-      _CUR_PAIRED='{}'  # 盘上空/损坏 → 退化成只用控制面这份(等价冷注入)
+    # (tokens/lastSeen*)。整体覆盖会删掉它们(丢运行时授权状态)。
+    # #415(codex review 缺陷:token 回退)——控制面自 7.1 起在 tokens.operator 预铸活
+    # token(不再是 #314 时的 tokens:{} 空对象)。若仍用朴素 `盘上 * 控制面`,jq 的 `*`
+    # 深合并会让【控制面的非空 tokens 覆盖盘上 tokens】——盘上 openclaw 运行时若已轮换
+    # operator token,重启 re-inject 就会被预铸值压回,使新 token 失效、旧 token 复活。
+    # #415(codex review 缺陷:撤销失效)——更严的一层:管理员 `openclaw devices remove`
+    # 后盘上是【有效文件但缺该 device】。#314 时代控制面下发 tokens:{},重加回来的 device
+    # 因 effective roles 为空在 7.1 上仍连不上(remove 事实生效);但 #415 起下发非空预铸
+    # token,重加回来就带活 token → 撤销被复活(安全回归)。故 re-inject 必须区分:
+    #   • 盘上 paired.json 文件【存在且是合法 JSON object,含空 {}】(_DISK_VALID=true):
+    #     这是 gateway 维护的【权威已批准名单】。只更新盘上【已存在】的 device
+    #     (更新 publicKey/roles/scopes,tokens 盘上优先);盘上【缺失】的 device = 被
+    #     `openclaw devices remove` 撤销,尊重撤销、绝不重加(reduce 里 `$c[$k]==null` 跳过)。
+    #     ★ 含空 {}:单 device 租户 remove 掉唯一 device 后盘上正是 {},必须视为权威空名单、
+    #       不复活(codex review 第5轮:否则普通重启即绕过撤销)。
+    #   • 盘上文件【缺失/读不到/损坏(非合法 JSON)】(_DISK_VALID=false):灾难恢复/从未
+    #     注入过 → 全量注入控制面这份(等价冷注入,7.1 首连免 approve)。
+    # NEW_DATA=true 的首次冷注入走上面 :1077 整文件写,不进本 re-inject 块;故本块跑时盘已
+    # 初始化过,文件存在即代表 gateway 权威状态(含被清空成 {} 的情形)。
+    # 三态(codex review 第6轮:损坏不得静默复活):
+    #   • 文件【不存在】(从没注入过/盘全新)→ _DISK_VALID=false,全量注入控制面这份
+    #     (7.1 首连免 approve;这是唯一该"凭空注入"的情形)。
+    #   • 文件【存在但读不到 / 非合法 JSON object】(写中断/坏块/被截断)→ **fail-closed**:
+    #     不能当"缺失"去凭空注入(那会把 remove 后损坏的盘静默重新授权该 device);也不能
+    #     拿损坏内容 merge。exit 1 让调度重试(下次要么读到完好文件、要么盘已被判坏重建)。
+    #   • 文件【存在且合法 object,含 {}】→ _DISK_VALID=true,权威名单,merge(尊重缺失=remove)。
+    _PAIRED_FILE_RI="${_DEVICES_DIR_RI}/paired.json"
+    if [ ! -e "${_PAIRED_FILE_RI}" ]; then
+      _DISK_VALID=false            # 文件不存在 → 首连/灾难恢复:全量注入
+      _CUR_PAIRED='{}'
+    elif _CUR_PAIRED="$(cat "${_PAIRED_FILE_RI}" 2>/dev/null)" \
+         && printf '%s' "${_CUR_PAIRED}" | jq -e 'type == "object"' >/dev/null 2>&1; then
+      _DISK_VALID=true             # 文件存在且合法 object(含 {})→ 权威名单,尊重 remove
+    else
+      # 文件存在但读不到/损坏 → fail-closed,绝不静默凭空注入(防 remove 后损坏静默复活)
+      log "FATAL(#415): 盘上 paired.json 存在但读不到/非合法 JSON object(写中断/坏块?)— fail-closed 拒起,调度重试"
+      exit 1
     fi
-    _MERGED_RI="$(jq -cn --argjson cur "${_CUR_PAIRED}" --argjson ctl "${_PAIRED_RI}" '$cur * $ctl' 2>/dev/null || true)"
+    unset _PAIRED_FILE_RI
+    _MERGED_RI="$(jq -cn --argjson cur "${_CUR_PAIRED}" --argjson ctl "${_PAIRED_RI}" --argjson valid "${_DISK_VALID}" '
+      $cur as $c
+      | reduce ($ctl | keys[]) as $k ($c;
+          if ($valid and ($c[$k] == null))
+          then .                                       # 盘上有效但无此 device = 被 remove,尊重撤销,不重加
+          else .[$k] = (($c[$k] // {}) * $ctl[$k])
+               | (if (($c[$k].tokens // {}) | length) > 0
+                  then .[$k].tokens = $c[$k].tokens     # 盘上已有非空 tokens(运行时权威)→ 保留,不被预铸值覆盖
+                  else . end)
+          end)' 2>/dev/null || true)"
     if [ -z "${_MERGED_RI}" ]; then
       log "FATAL(#314): paired.json merge(jq \$cur * \$ctl)失败 — aborting fail-closed"
       exit 1
     fi
     # 幂等:merge 结果与盘上一致则不写(避免无谓写盘 + mtime 抖动)。
     if [ "${_CUR_PAIRED}" != "${_MERGED_RI}" ]; then
-      printf '%s' "${_MERGED_RI}" > "${_DEVICES_DIR_RI}/paired.json"
-      chmod 600 "${_DEVICES_DIR_RI}/paired.json"
-      sudo chown -R 1000:1000 "${_DEVICES_DIR_RI}"
+      # #415(codex review 第7轮)——原子写:先写同目录临时文件再 mv(rename 原子)。
+      # 否则 `printf > paired.json` 中途被杀会留半个损坏文件,配合上面的损坏 fail-closed
+      # 会让后续每次重试都 exit 1、租户永久起不来。temp+mv 保证盘上要么旧内容、要么完整新内容。
+      # #415(codex review 第8轮)——owner 必须在 mv **之前**就设到 temp 文件上:否则
+      # mv(root:root)后、chown 前被杀 → 下次重试因内容相同(幂等)跳过写入+chown →
+      # paired.json 永久 root:root,uid 1000 读不了 → gateway 永久起不来。故先 chown temp。
+      _TMP_RI="${_DEVICES_DIR_RI}/.paired.json.tmp.$$"
+      printf '%s' "${_MERGED_RI}" > "${_TMP_RI}"
+      chmod 600 "${_TMP_RI}"
+      sudo chown 1000:1000 "${_TMP_RI}"
+      mv -f "${_TMP_RI}" "${_DEVICES_DIR_RI}/paired.json"
+      sudo chown 1000:1000 "${_DEVICES_DIR_RI}"
       _DID16_RI="$(printf '%s' "${_PAIRED_RI}" | jq -r 'keys[0] // "?"' 2>/dev/null | cut -c1-16)"
       log "paired.json re-injected (#312/#314 merge; device=${_DID16_RI}… 控制面这条已 merge,盘上其它设备+运行时字段保留)"
-      unset _DID16_RI
+      unset _DID16_RI _TMP_RI
     fi
-    unset _PAIRED_RI _DEVICES_DIR_RI _CUR_PAIRED _MERGED_RI
+    unset _PAIRED_RI _DEVICES_DIR_RI _CUR_PAIRED _MERGED_RI _DISK_VALID
   fi
 
   # AgentCore Gateway MCP injection (if configured).

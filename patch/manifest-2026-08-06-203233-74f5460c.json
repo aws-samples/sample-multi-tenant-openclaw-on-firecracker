@@ -1,0 +1,1131 @@
+{
+  "synced_at": "2026-08-06 20:32:33 UTC+08:00",
+  "base_sha": "1fe6edb3b45066fa5a23feb8285dc93bb9edc513",
+  "source_commit": "74f5460c2ed454774e5bbcb986a230b0909ed50c",
+  "commit_count": 90,
+  "file_count": 128,
+  "summary": "Sync the bb increment 1fe6edb3..74f5460c to the public gateway branch. Sync-LOG only (which customer-facing files reached gateway + the issues behind them); the applyable patch kit is NOT built yet (folded_into pending).",
+  "issues_synced_note": "Index back to the issue tracker for whoever builds the patch kit: before assembling the kit, walk each issue and confirm it's covered. `title` is a ≤20-char gist only — open the issue for the full problem/fix/test. Lists only issues that touched a released file this sync.",
+  "issues_synced": [
+    {
+      "id": "#2",
+      "type": "fix",
+      "title": "hardcoded 资源 id 规则改逐…"
+    },
+    {
+      "id": "#341",
+      "type": "fix",
+      "title": "create 路径 DNAT 下发幂等"
+    },
+    {
+      "id": "#370",
+      "type": "fix",
+      "title": "create 路径 DNAT 下发幂等"
+    },
+    {
+      "id": "#389",
+      "type": "feat",
+      "title": "Host init-host boots…"
+    },
+    {
+      "id": "#392",
+      "type": "feat",
+      "title": "claw-patch-skill 执行引…"
+    },
+    {
+      "id": "#393",
+      "type": "fix",
+      "title": "租户休眠/恢复"
+    },
+    {
+      "id": "#394",
+      "type": "fix",
+      "title": "镜像发布灰度全链路"
+    },
+    {
+      "id": "#401",
+      "type": "fix",
+      "title": "preserve scrubbed de…"
+    },
+    {
+      "id": "#407",
+      "type": "chore",
+      "title": "Claude Code 工程化过重"
+    },
+    {
+      "id": "#411",
+      "type": "fix",
+      "title": "控制面 API 4 类使用问题汇总"
+    },
+    {
+      "id": "#412",
+      "type": "feat",
+      "title": "dispatch host 容量预留泄漏"
+    },
+    {
+      "id": "#415",
+      "type": "fix",
+      "title": "paired.json 预铸 token…"
+    },
+    {
+      "id": "#418",
+      "type": "docs",
+      "title": "align customer guide…"
+    },
+    {
+      "id": "#422",
+      "type": "fix",
+      "title": "租户休眠/恢复"
+    },
+    {
+      "id": "#425",
+      "type": "fix",
+      "title": "回流 monitor-patch 公共侧…"
+    }
+  ],
+  "needs_config_on_apply": [
+    {
+      "file": "config.yml.example",
+      "param": "golden_ami",
+      "change": "new",
+      "value": ""
+    },
+    {
+      "file": "config.yml.example",
+      "param": "build_pipeline",
+      "change": "new",
+      "value": "false           # true=部署 Image Builder 流水线(component/recipe/distribution)"
+    },
+    {
+      "file": "config.yml.example",
+      "param": "use",
+      "change": "new",
+      "value": "false                      # true=host LT 用 resolve:ssm 读 golden AMI;false=用 Canonical 公共 AMI"
+    },
+    {
+      "file": "config.yml.example",
+      "param": "recipe_version",
+      "change": "new",
+      "value": "\"1.0.0\"         # 改这里=新版本 component+recipe(必须 x.y.z;同版本号重复部署会被 Image Builder 拒绝)"
+    },
+    {
+      "file": "config.yml.example",
+      "param": "ssm_parameter",
+      "change": "new",
+      "value": "\"\"               # 留空=用默认 /imagebuilder/openclaw/host-ami<region后缀>;跨 stack 复用别人烤的镜像时才填"
+    },
+    {
+      "file": "config.yml.example",
+      "param": "build_instance_type",
+      "change": "new",
+      "value": "\"\"         # 留空=按 arch 选 c7g.large / c7i.large。烤制机是一次性的,不用 metal"
+    },
+    {
+      "file": "config.yml.example",
+      "param": "guardduty_runtime_monitoring",
+      "change": "changed",
+      "value": "false   # true=在 detector 上启 RUNTIME_MONITORING feature,同时把 EC2_AGENT_MANAGEMENT 显式设为 DISABLED —— 开 automated agent management 会给账号内所有 EC2 装 GuardDuty agent(SSM association),会波及本栈之外的 host。安全开启法:只给需要监控的实例打 inclusion tag GuardDutyManaged=true(或反向给不想装的 host 打 exclusion tag GuardDutyManaged=false)。account 层威胁检测(GD 自身的 9 feature)不受此开关影响,一手证据 engineering/evidence/metal-experiments/8layer-evidence.md:163-181。前置:guardduty_enabled: true。默认 false。"
+    },
+    {
+      "file": "config.yml.example",
+      "param": "guardrail_managed_by_stack",
+      "change": "changed",
+      "value": "false  # true=CDK 用 aws_bedrock.CfnGuardrail 从 deploy/runtime-config-export/bedrock-guardrail.json 建 Bedrock Guardrail,id 写 SSM /openclaw/bedrock-guardrail-id(LiteLLM userdata/apply-hardening.sh 都从 SSM 读、不硬编码)。默认 false 保存量兼容——存量账号已有 apply-hardening.sh 建过的 Guardrail 时保持 false,LiteLLM 在 SSM 缺失时按仓库 Guardrail 名精确发现 id。切 true 前必须先把带外那个 Guardrail 改名或删了,否则 CFN 建同名 Guardrail 冲突。#80。"
+    },
+    {
+      "file": "deploy/stacks/storage.py",
+      "param": "DDB-TTL / RemovalPolicy",
+      "change": "state-change (apply out-of-band on live tables — a template edit alone won't)"
+    },
+    {
+      "file": "docs/aws-guide/05-uninstall-solution.md",
+      "param": "DDB-TTL / RemovalPolicy",
+      "change": "state-change (apply out-of-band on live tables — a template edit alone won't)"
+    },
+    {
+      "file": "docs/aws-guide/05-update-solution.md",
+      "param": "DDB-TTL / RemovalPolicy",
+      "change": "state-change (apply out-of-band on live tables — a template edit alone won't)"
+    }
+  ],
+  "updated_files": {
+    "cdk-stack (cdk deploy OR hand-apply)": [
+      {
+        "path": "deploy/stacks/_helpers.py",
+        "status": "modified",
+        "issues": [
+          "#389"
+        ]
+      },
+      {
+        "path": "deploy/stacks/compute.py",
+        "status": "modified",
+        "issues": [
+          "#401",
+          "#407"
+        ]
+      },
+      {
+        "path": "deploy/stacks/edge_bundle.py",
+        "status": "added",
+        "issues": [
+          "#389"
+        ]
+      },
+      {
+        "path": "deploy/stacks/ha_edge.py",
+        "status": "modified",
+        "issues": [
+          "#389",
+          "#401",
+          "#425"
+        ]
+      },
+      {
+        "path": "deploy/stacks/host_image.py",
+        "status": "added",
+        "issues": [
+          "#389"
+        ]
+      },
+      {
+        "path": "deploy/stacks/lambdas.py",
+        "status": "modified",
+        "issues": [
+          "#389",
+          "#393",
+          "#394",
+          "#411",
+          "#412",
+          "#422"
+        ]
+      },
+      {
+        "path": "deploy/stacks/litellm.py",
+        "status": "modified",
+        "issues": [
+          "#401"
+        ]
+      },
+      {
+        "path": "deploy/stacks/network_vpc.py",
+        "status": "modified",
+        "issues": [
+          "#401"
+        ]
+      },
+      {
+        "path": "deploy/stacks/observability.py",
+        "status": "modified",
+        "issues": [
+          "#401",
+          "#407"
+        ]
+      },
+      {
+        "path": "deploy/stacks/storage.py",
+        "status": "modified",
+        "issues": [
+          "#394",
+          "#401"
+        ]
+      }
+    ],
+    "console (static assets, S3 sync)": [
+      {
+        "path": "deploy/console-bff/traces.mjs",
+        "status": "modified",
+        "issues": [
+          "#407"
+        ]
+      },
+      {
+        "path": "deploy/console-bff/web/index.html",
+        "status": "modified",
+        "issues": [
+          "#394",
+          "#401"
+        ]
+      },
+      {
+        "path": "deploy/console-bff/web/js/app.core.js",
+        "status": "modified",
+        "issues": [
+          "#394"
+        ]
+      },
+      {
+        "path": "deploy/console-bff/web/js/app.format.js",
+        "status": "modified",
+        "issues": [
+          "#394"
+        ]
+      },
+      {
+        "path": "deploy/console-bff/web/js/app.hosts.js",
+        "status": "modified",
+        "issues": [
+          "#394"
+        ]
+      },
+      {
+        "path": "deploy/console-bff/web/js/app.tenants.js",
+        "status": "modified",
+        "issues": [
+          "#394"
+        ]
+      },
+      {
+        "path": "deploy/console-bff/web/style.css",
+        "status": "modified",
+        "issues": [
+          "#394"
+        ]
+      }
+    ],
+    "docs": [
+      {
+        "path": "docs/README-CN.md",
+        "status": "modified",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/api/copy-file-from-s3-api.md",
+        "status": "modified",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/api/host-edge-bootstrap-api.md",
+        "status": "added",
+        "issues": [
+          "#389"
+        ]
+      },
+      {
+        "path": "docs/api/pull-image-api.md",
+        "status": "modified",
+        "issues": [
+          "#394",
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide-en/01-overview.md",
+        "status": "modified",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide-en/02-architecture.md",
+        "status": "modified",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide-en/03-architecture-details.md",
+        "status": "modified",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide-en/04-plan.md",
+        "status": "modified",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide-en/05-deploy-use-troubleshoot.md",
+        "status": "modified",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide-en/06-developer-guide.md",
+        "status": "modified",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide-en/09-api-integration.md",
+        "status": "modified",
+        "issues": [
+          "#407",
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide-en/10-external-platform-integration.md",
+        "status": "modified",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide-en/11-ops-maintenance.md",
+        "status": "modified",
+        "issues": [
+          "#401",
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide-en/13-data-plane-redesign.md",
+        "status": "modified",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide-en/14-scale-100k.md",
+        "status": "modified",
+        "issues": [
+          "#401",
+          "#407",
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide-en/arch-delivery-overview.svg",
+        "status": "modified",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide-en/arch-federation-flow.svg",
+        "status": "deleted",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/00-quickstart-and-runbook.md",
+        "status": "modified",
+        "issues": [
+          "#407"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/01-overview.md",
+        "status": "modified",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/02-architecture.md",
+        "status": "modified",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/03-architecture-details.md",
+        "status": "modified",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/04-plan.md",
+        "status": "modified",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/05-deploy-use-troubleshoot.md",
+        "status": "modified",
+        "issues": [
+          "#401",
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/05-uninstall-solution.md",
+        "status": "added",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/05-update-solution.md",
+        "status": "added",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/06-customer-deploy-and-teardown.md",
+        "status": "modified",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/06-developer-guide.md",
+        "status": "modified",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/08-reference.md",
+        "status": "modified",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/09-api-integration.md",
+        "status": "modified",
+        "issues": [
+          "#407",
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/09-custom-llm-gateway.md",
+        "status": "modified",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/10-external-platform-integration.md",
+        "status": "modified",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/11-ops-maintenance.md",
+        "status": "modified",
+        "issues": [
+          "#401",
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/12-private-api-hardening.md",
+        "status": "modified",
+        "issues": [
+          "#407",
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/13-data-plane-redesign.md",
+        "status": "modified",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/14-scale-100k.md",
+        "status": "modified",
+        "issues": [
+          "#401",
+          "#407",
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/15-image-build-getting-started.md",
+        "status": "modified",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/16-hot-swap-vs-baked-and-host-rebuild.md",
+        "status": "modified",
+        "issues": [
+          "#407",
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/17-observability-ops.md",
+        "status": "modified",
+        "issues": [
+          "#401",
+          "#407"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/README.md",
+        "status": "modified",
+        "issues": [
+          "#407",
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/arch-delivery-overview.svg",
+        "status": "modified",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/arch-federation-flow.svg",
+        "status": "deleted",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/arch-wss-dataplane-controlplane.svg",
+        "status": "modified",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/openapi.yaml",
+        "status": "modified",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/prepare_test_snapshot.md",
+        "status": "modified",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/pull-image-flow-333.excalidraw",
+        "status": "modified",
+        "issues": [
+          "#394"
+        ]
+      },
+      {
+        "path": "docs/pull-image-flow-333.png",
+        "status": "modified",
+        "issues": [
+          "#394"
+        ]
+      },
+      {
+        "path": "docs/web_console.png",
+        "status": "modified",
+        "issues": [
+          "#418"
+        ]
+      },
+      {
+        "path": "docs/web_console_settings.png",
+        "status": "modified",
+        "issues": [
+          "#418"
+        ]
+      }
+    ],
+    "edge (OpenResty / Fluent Bit host config)": [
+      {
+        "path": "deploy/edge/fluent-bit/edge/fluent-bit.conf",
+        "status": "modified",
+        "issues": [
+          "#407"
+        ]
+      },
+      {
+        "path": "deploy/edge/fluent-bit/install-fluent-bit.sh",
+        "status": "modified",
+        "issues": [
+          "#389",
+          "#425"
+        ]
+      }
+    ],
+    "host-scripts (S3-pulled / baked into rootfs)": [
+      {
+        "path": "deploy/userdata/host-agent.py",
+        "status": "modified",
+        "issues": [
+          "#394",
+          "#411",
+          "#412",
+          "#425"
+        ]
+      },
+      {
+        "path": "deploy/userdata/init-host.sh",
+        "status": "modified",
+        "issues": [
+          "#389"
+        ]
+      },
+      {
+        "path": "deploy/userdata/launch-vm.sh",
+        "status": "modified",
+        "issues": [
+          "#393",
+          "#394",
+          "#401",
+          "#411",
+          "#412",
+          "#415",
+          "#422"
+        ]
+      },
+      {
+        "path": "deploy/userdata/provision-host.sh",
+        "status": "added",
+        "issues": [
+          "#389"
+        ]
+      },
+      {
+        "path": "deploy/userdata/route_ops.py",
+        "status": "modified",
+        "issues": [
+          "#425"
+        ]
+      },
+      {
+        "path": "deploy/userdata/start-all-vms.sh",
+        "status": "modified",
+        "issues": [
+          "#401"
+        ]
+      }
+    ],
+    "lambda (update-function-code only)": [
+      {
+        "path": "deploy/lambda/api/core/auth.py",
+        "status": "modified",
+        "issues": [
+          "#389",
+          "#394"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/bootstrap_lt.py",
+        "status": "added",
+        "issues": [
+          "#389"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/clients.py",
+        "status": "modified",
+        "issues": [
+          "#394"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/image_channel.py",
+        "status": "added",
+        "issues": [
+          "#394"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/image_jobs.py",
+        "status": "added",
+        "issues": [
+          "#394"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/image_lease.py",
+        "status": "added",
+        "issues": [
+          "#394"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/image_ops.py",
+        "status": "added",
+        "issues": [
+          "#394"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/image_slots.py",
+        "status": "added",
+        "issues": [
+          "#394"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/scheduling.py",
+        "status": "modified",
+        "issues": [
+          "#341",
+          "#370"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/ssm_dispatch.py",
+        "status": "modified",
+        "issues": [
+          "#341",
+          "#370",
+          "#393",
+          "#422",
+          "#425"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/handler.py",
+        "status": "modified",
+        "issues": [
+          "#389",
+          "#393",
+          "#394",
+          "#401",
+          "#422"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/bootstrap_version_service.py",
+        "status": "added",
+        "issues": [
+          "#389"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/dispatch_poller.py",
+        "status": "modified",
+        "issues": [
+          "#412"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/dispatch_service.py",
+        "status": "modified",
+        "issues": [
+          "#411",
+          "#412"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/fleet_service.py",
+        "status": "modified",
+        "issues": [
+          "#401"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/host_service.py",
+        "status": "modified",
+        "issues": [
+          "#394",
+          "#401"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/image_slot_service.py",
+        "status": "added",
+        "issues": [
+          "#394"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/lifecycle_dispatch.py",
+        "status": "modified",
+        "issues": [
+          "#411"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/tenant_service.py",
+        "status": "modified",
+        "issues": [
+          "#393",
+          "#394",
+          "#401",
+          "#411",
+          "#412",
+          "#415",
+          "#422",
+          "#425"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/tenant_stats_service.py",
+        "status": "modified",
+        "issues": [
+          "#425"
+        ]
+      },
+      {
+        "path": "deploy/lambda/health_check/handler.py",
+        "status": "modified",
+        "issues": [
+          "#412"
+        ]
+      },
+      {
+        "path": "deploy/lambda/scaler/handler.py",
+        "status": "modified",
+        "issues": [
+          "#393",
+          "#394",
+          "#401",
+          "#422"
+        ]
+      },
+      {
+        "path": "deploy/lambda/tenant_stats/handler.py",
+        "status": "modified",
+        "issues": [
+          "#393",
+          "#422"
+        ]
+      },
+      {
+        "path": "deploy/lib/mint-shared-vkey.sh",
+        "status": "modified",
+        "issues": [
+          "#401"
+        ]
+      }
+    ],
+    "root / other": [
+      {
+        "path": "README.md",
+        "status": "modified",
+        "issues": [
+          "#407"
+        ]
+      },
+      {
+        "path": "config.yml.example",
+        "status": "modified",
+        "issues": [
+          "#389",
+          "#401",
+          "#407"
+        ]
+      },
+      {
+        "path": "console/index.html",
+        "status": "modified",
+        "issues": [
+          "#401"
+        ]
+      },
+      {
+        "path": "console/marketplace-demo/README.md",
+        "status": "modified",
+        "issues": [
+          "#401"
+        ]
+      },
+      {
+        "path": "console/marketplace-demo/TESTPLAN.md",
+        "status": "modified",
+        "issues": [
+          "#401",
+          "#407"
+        ]
+      },
+      {
+        "path": "console/marketplace-demo/setup-federation.sh",
+        "status": "modified",
+        "issues": [
+          "#401"
+        ]
+      },
+      {
+        "path": "deploy/app.py",
+        "status": "modified",
+        "issues": [
+          "#389"
+        ]
+      },
+      {
+        "path": "deploy/codebuild/build-golden-on-codebuild.sh",
+        "status": "modified",
+        "issues": [
+          "#401"
+        ]
+      },
+      {
+        "path": "deploy/codebuild/build-image-demo.sh",
+        "status": "modified",
+        "issues": [
+          "#401"
+        ]
+      },
+      {
+        "path": "deploy/litellm/.env.example",
+        "status": "modified",
+        "issues": [
+          "#401"
+        ]
+      },
+      {
+        "path": "deploy/litellm/LITELLM-RUNBOOK.md",
+        "status": "modified",
+        "issues": [
+          "#401"
+        ]
+      },
+      {
+        "path": "deploy/litellm/litellm-up.sh",
+        "status": "modified",
+        "issues": [
+          "#401"
+        ]
+      },
+      {
+        "path": "deploy/monitoring/WAZUH-RUNBOOK.md",
+        "status": "modified",
+        "issues": [
+          "#401"
+        ]
+      },
+      {
+        "path": "deploy/monitoring/wazuh-two-ec2/RUNBOOK.md",
+        "status": "modified",
+        "issues": [
+          "#401"
+        ]
+      },
+      {
+        "path": "deploy/monitoring/wazuh-two-ec2/setup-wazuh-two-ec2.sh",
+        "status": "modified",
+        "issues": [
+          "#401"
+        ]
+      },
+      {
+        "path": "deploy/runtime-config-export/apply-hardening.sh",
+        "status": "modified",
+        "issues": [
+          "#401"
+        ]
+      },
+      {
+        "path": "deploy/runtime-config-export/bedrock-guardrail.json",
+        "status": "modified",
+        "issues": [
+          "#401"
+        ]
+      },
+      {
+        "path": "deploy/runtime-config-export/litellm-config.yaml",
+        "status": "modified",
+        "issues": [
+          "#401"
+        ]
+      },
+      {
+        "path": "pyproject.toml",
+        "status": "modified",
+        "issues": [
+          "#392",
+          "#407"
+        ]
+      },
+      {
+        "path": "samples/finance-agent/tests/sentinel-guard/fund-action.test.mjs",
+        "status": "modified",
+        "issues": [
+          "#401"
+        ]
+      },
+      {
+        "path": "samples/finance-agent/tests/sentinel-guard/test-harness.mjs",
+        "status": "modified",
+        "issues": [
+          "#401"
+        ]
+      },
+      {
+        "path": "setup.sh",
+        "status": "modified",
+        "issues": [
+          "#389",
+          "#401"
+        ]
+      },
+      {
+        "path": "uv.lock",
+        "status": "modified",
+        "issues": [
+          "#407"
+        ]
+      }
+    ],
+    "scripts": [
+      {
+        "path": "scripts/checks/ai-review-checklist.md",
+        "status": "deleted",
+        "issues": [
+          "#407"
+        ]
+      },
+      {
+        "path": "scripts/checks/doc_freshness.py",
+        "status": "modified",
+        "issues": [
+          "#407"
+        ]
+      },
+      {
+        "path": "scripts/checks/hardcoded.sh",
+        "status": "modified",
+        "issues": [
+          "#2",
+          "#401",
+          "#407"
+        ]
+      },
+      {
+        "path": "scripts/checks/lib.sh",
+        "status": "modified",
+        "issues": [
+          "#407"
+        ]
+      },
+      {
+        "path": "scripts/checks/preflight-region.sh",
+        "status": "deleted",
+        "issues": [
+          "#407"
+        ]
+      },
+      {
+        "path": "scripts/checks/python.sh",
+        "status": "modified",
+        "issues": [
+          "#407"
+        ]
+      },
+      {
+        "path": "scripts/checks/secrets.sh",
+        "status": "modified",
+        "issues": [
+          "#407"
+        ]
+      },
+      {
+        "path": "scripts/preflight-check.sh",
+        "status": "modified",
+        "issues": [
+          "#401"
+        ]
+      }
+    ]
+  },
+  "folded_into": "(pending) — no patch kit built for this sync yet; a later kit should cite this manifest as source-of-record and set base_sha/patch_sha. cdk deploy is FORBIDDEN on hand-modified live deployments — the kit must ship *.patched host scripts + the full lambda tree + AWS CLI for stack changes, same shape as patch/315-concurrent-dispatch-rollup/."
+}

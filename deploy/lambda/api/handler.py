@@ -141,6 +141,8 @@ def lambda_handler(event, context):
                 _pia["snapshot_time"],
                 _pia.get("prev_status"),
                 _pia.get("job_id"),
+                # #394 — 目标槽位(live/canary);旧 payload 无此键 → None = 兼容扁平路径。
+                _pia.get("slot"),
             )
         except Exception as e:
             print(f"[pull] worker unexpected error (swallowed to prevent async retry): {e}")
@@ -246,11 +248,30 @@ def lambda_handler(event, context):
         # 后装到 live 原位置(launch-vm/service 直接读)。?snapshot_time=<ISO>,只作用一台
         # host。Admin op。旧 ?version=/version-verdict 已废弃(统一快照模型)。
         ("POST", "/hosts/{instance_id}/pull-image"): lambda: pull_image(
-            path_params["instance_id"], event.get("queryStringParameters") or {}
+            path_params["instance_id"], event.get("queryStringParameters") or {},
+            event.get("headers") or {},
         ),
         # #309 — GET pull-image 长任务进度:tail host 上 /tmp/<job_id>.txt 最后一行当状态。
+        # #394 step1 — 透传 query:?job_id=<id> 精确查持久化 Job(不传=兼容取该 host 最近一条)。
         ("GET", "/hosts/{instance_id}/pull-image-progress"): lambda: pull_image_progress(
+            path_params["instance_id"], event.get("queryStringParameters") or {}
+        ),
+        # #394 step5 — 同步槽位操作(admin-only,只改 host 上 slots.json 一个小文件,不搬盘)。
+        # promote:canary 槽升为 live(带 expected snapshot+generation 的 CAS,防"验证 A 提升 B")。
+        ("POST", "/hosts/{instance_id}/promote-canary"): lambda: _image_slot_op(
+            path_params["instance_id"], event, "promote-canary"
+        ),
+        # #394 —— 无独立 rollback:回滚 = pull 老版到 live(本地已完整则快路径秒级翻指针)。
+        # #394 — GET the host's REAL on-disk image state (slots.json + versions/ dir),
+        # the authoritative counterpart to the possibly-stale DDB image_slots mirror. viewer.
+        # #394 —— 无 DELETE image-slots/canary(cleanup-canary 已移除,精简 API):放弃未提升的
+        # canary 无需显式清指针——下次 pull canary 覆盖该槽,promote 成功也会清空它。
+        ("GET", "/hosts/{instance_id}/image-slots"): lambda: host_image_slots(
             path_params["instance_id"]
+        ),
+        # #394 — 回收该 host 上无人引用的版本目录(手动 prune;保留 live/canary/prev + 租户固定引用)。
+        ("POST", "/hosts/{instance_id}/reclaim-images"): lambda: _image_slot_op(
+            path_params["instance_id"], event, "reclaim-images"
         ),
         # #309 — 把单个文件从 S3 copy 到 EC2 指定位置(目标限 firecracker 资产目录白名单)。
         ("POST", "/hosts/{instance_id}/copy-file-from-s3"): lambda: copy_file_from_s3(
@@ -268,11 +289,20 @@ def lambda_handler(event, context):
         ),
         # #217 V2 — list version snapshots (time+label+count) so the console can
         # let an operator pick which snapshot_time to pull onto a host.
-        ("GET", "/list_image_versions"): lambda: list_image_versions(),
+        ("GET", "/list_image_versions"): lambda: list_image_versions(
+            event.get("queryStringParameters") or {}
+        ),
         # #376 — take a version snapshot of the assets bucket (equivalent to
         # scripts/snapshot-version.sh): scan deployment/, record every current
         # object's {path, s3_version_id, etag} into the snapshots table. Operator+.
         ("POST", "/create-image-snapshot"): lambda: create_image_snapshot(
+            event.get("body")
+        ),
+        # #394 — soft-delete ONE snapshot record by snapshot_time (body {snapshot_time},
+        # symmetric with /create-image-snapshot; avoids colons-in-path). Refuses (409
+        # IMAGE_VERSION_IN_USE) if any host slot or tenant still pins it. Metadata only
+        # — marks status=deleted, does not remove S3 image files. Operator+.
+        ("POST", "/delete-image-snapshot"): lambda: delete_image_snapshot(
             event.get("body")
         ),
         ("GET", "/agentcore/status"): agentcore_status,
@@ -326,6 +356,10 @@ def lambda_handler(event, context):
         ("POST", "/recipient-key"): lambda: _register_recipient_key(event),
         ("POST", "/recipient-key/disable"): lambda: _disable_recipient_key(event),
         ("GET", "/clawpool-rsa-public-key"): lambda: _get_clawpool_rsa_public_key(),
+        # #389 v2 块5 — bootstrap 版本切换(admin-only,handler 内 identity 门)。只在【已存在】
+        # 的 S3 bootstrap 版本间切换(传 sha256,不传脚本内容);切 host/edge 两套 LT+ASG。
+        ("GET", "/bootstrap/versions"): lambda: _bootstrap_versions(event),
+        ("POST", "/bootstrap/promote"): lambda: _bootstrap_promote(event),
     }
 
     # #298 — 私有 API 用 `{proxy+}` 代理时 resource 恒为 `/{proxy+}`,不匹配任何真实模板。
@@ -597,6 +631,11 @@ def create_tenant_self(body=None, event=None):
     # a Bearer body carrying it (403), so strip it here like owner_id (a
     # self-service user's identity comes from the verified token, not the body).
     body.pop("tenant_user_id", None)
+    # #422 — 纵深防御:viewer 级自助创建的是「自己的全新节点」,绝不该从任意备份恢复/克隆
+    # 他人数据。create_tenant 的 restore_from 分支现已补属主校验(no-cross-tenant),但自助
+    # 路径根本不该触达恢复语义 → 在入口显式剥掉,把 IDOR 面从 viewer 入口彻底断开(双保险)。
+    body.pop("restore_from", None)
+    body.pop("clone_from", None)
     if not body.get("name"):
         # short, DNS-safe, unique-ish per user; create_tenant appends a hash.
         body["name"] = f"u-{str(sub)[:8].lower().replace('_', '-')}"
@@ -1838,9 +1877,11 @@ _get_manifest = _host_service._get_manifest
 list_images = _host_service.list_images
 list_image_versions = _host_service.list_image_versions  # #337(原#217 /snapshots)— 列镜像版本快照供 console 选
 create_image_snapshot = _host_service.create_image_snapshot  # #376 — 打版本快照(等价 snapshot-version.sh)
+delete_image_snapshot = _host_service.delete_image_snapshot  # #394 — 删一条快照记录(引用保护)
 refresh_rootfs = _host_service.refresh_rootfs
 pull_image = _host_service.pull_image  # #217 V2 — snapshot pull → install live
 pull_image_progress = _host_service.pull_image_progress  # #309 — tail /tmp/<job_id>.txt
+host_image_slots = _host_service.host_image_slots  # #394 — 真机实读 host 磁盘镜像状态
 copy_file_from_s3 = _host_service.copy_file_from_s3  # #309 — single file S3 → EC2 (allowlist target)
 
 # T1.8 — services/console_info:控制台只读端点(备份清单 + AgentCore 工具清单,4 函数)。
@@ -1952,6 +1993,76 @@ def _get_tenant_credentials(tenant_id, event):
     from services.tenant_service import get_tenant_credentials
 
     return get_tenant_credentials(tenant_id, event)
+
+
+def _image_slot_op(instance_id, event, op):
+    """#394 step5 —— promote-canary / reclaim-images 的统一入口(admin-only)。
+
+    这些都改变一台 host 的 live 镜像指向(或回收版本),属不可逆镜像变更 → admin 门
+    (ADR §8:api-key 只承担 usage-plan,不单独授予管理员变更能力)。admin 判定与
+    fleet_power/registry 同款 identity-based(本 stack 无自定义 authorizer)。
+    回滚不在此列:回滚 = pull 老版到 live(pull-image,operator 权限,本地已完整则秒级翻指针)。
+    cleanup-canary 已移除(精简 API):放弃 canary 靠下次 pull 覆盖 / promote 清空。
+    """
+    if not _get_caller_identity(event or {}).get("is_admin"):
+        return _err(403, "ACCESS_DENIED", f"{op} requires admin role")
+    from services import image_slot_service
+
+    ssm_wait = _host_service._ssm_wait  # 复用既有 SSM 同步等待(含轮询/超时语义)
+    headers = event.get("headers") or {}
+    if op == "promote-canary":
+        return image_slot_service.promote_canary(
+            instance_id, event.get("body"), ssm_wait, headers
+        )
+    return image_slot_service.reclaim_images(instance_id, headers, ssm_wait)
+
+
+def _bootstrap_versions(event):
+    """GET /bootstrap/versions — 列 host+edge 可切换的 bootstrap 版本(admin-only)。
+
+    admin 门与 fleet_power/registry 同款 identity-based(本 stack 无自定义 authorizer,
+    requestContext.authorizer.role 永远为空)。这里刻意用 is_admin 而非 role:api-key 路径
+    在 core/auth.py 里 role 解析成 viewer 但 is_admin=True(受信自动化全权)—— 未来读者别把
+    这行"当 bug 修成 role==admin",那会锁死持 key 的运维脚本。
+    """
+    if not _get_caller_identity(event or {}).get("is_admin"):
+        return _err(403, "ACCESS_DENIED", "bootstrap version listing requires admin role")
+    from services import bootstrap_version_service
+
+    return bootstrap_version_service.list_versions()
+
+
+def _bootstrap_promote(event):
+    """POST /bootstrap/promote — 切到某个已存在的 bootstrap 版本(admin-only,见上门说明)。
+
+    改的是整机队【下次开机】读哪个 init 脚本(host/edge 各一套 LT+ASG),属高权限、可回退但
+    影响面广的变更 → admin。body {fleet, target_sha, expected_current_sha}。
+    """
+    ident = _get_caller_identity(event or {})
+    if not ident.get("is_admin"):
+        return _err(403, "ACCESS_DENIED", "bootstrap promote requires admin role")
+    import json as _json
+
+    from services import bootstrap_version_service
+
+    body = event.get("body")
+    if isinstance(body, str):
+        try:
+            body = _json.loads(body) if body else {}
+        except (ValueError, TypeError):
+            return _err(400, "VALIDATION", "body must be a JSON object")
+    if body is None:
+        body = {}
+    # 合法 JSON 但非对象(数组/标量/true)→ body.get 会抛 → 先挡成 400,不 500(同
+    # create_image_snapshot 的 _parse_body 纪律)。
+    if not isinstance(body, dict):
+        return _err(400, "VALIDATION", "body must be a JSON object")
+    fleet_raw = body.get("fleet")
+    # fleet 非字符串(如 fleet:1)会让 .strip() 抛 → 先判类型挡成 400,不 500。
+    if fleet_raw is not None and not isinstance(fleet_raw, str):
+        return _err(400, "VALIDATION", "fleet must be a string")
+    fleet = (fleet_raw or "").strip()
+    return bootstrap_version_service.promote(fleet, body, ident)
 
 
 def _get_registry(config_template, event):

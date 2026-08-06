@@ -4,7 +4,7 @@
 
 """Host-side routing operations for the P2 two-tier data plane.
 
-Contract: internal-docs/00-knowledge-base/the data-plane design/the data-plane interface contract
+Contract: engineering/00-knowledge-base/SPEC/11-ENGINE-TRANSFORM/INTERFACE-CONTRACT.md
     §1 Redis key schema (`route:{tenant_id}` -> JSON host/port/guest_ip/updated_at)
     §3 Port bitmap [10000, dnat_port_high] + iptables DNAT (atomic three-step)
     §4 DDB descriptor fields (host_private_ip, host_port, guest_ip)
@@ -223,13 +223,7 @@ class PortBitmap:
             return set(self._used)
 
     def replace_used(self, ports: set[int]) -> None:
-        """Replace the recovered state with one iptables snapshot.
-
-        route_ops CLI commands run in a separate process from host-agent. A
-        delete therefore changes iptables immediately but cannot mutate the
-        agent's in-memory bitmap. Replacing, instead of only marking, lets the
-        next allocation or metrics scrape observe cross-process releases.
-        """
+        """Replace local state with one authoritative iptables snapshot."""
         with self._lock:
             self._used = {
                 port for port in ports if self._low <= port <= self._high
@@ -320,12 +314,7 @@ def dnat_remove(host_port: int, guest_ip: str) -> None:
 
 
 def dnat_remove_all(host_port: int, guest_ip: str) -> None:
-    """Remove every duplicate of one exact rule, idempotently.
-
-    A plain ``dnat_check`` returns false for every non-zero exit status, which
-    is correct for allocation but unsafe for delete: xtables lock/permission
-    errors must not be mistaken for "already absent".
-    """
+    """Remove every duplicate of one exact rule without hiding real errors."""
     while True:
         checked = _run_iptables(_dnat_argv("-C", host_port, guest_ip))
         if checked.returncode != 0:
@@ -381,18 +370,45 @@ def list_dnat_rules() -> dict[int, str]:
     return out
 
 
+_alloc_lock = threading.Lock()
+
+
+def _refresh_bitmap_locked(bitmap: PortBitmap) -> dict[int, str]:
+    """Replace the bitmap from live rules while the allocation lock is held."""
+    rules = list_dnat_rules()
+    bitmap.replace_used(
+        {
+            port
+            for port in rules
+            if PORT_RANGE_LOW <= port <= PORT_RANGE_HIGH
+        }
+    )
+    return rules
+
+
 def rebuild_bitmap_from_iptables(bitmap: PortBitmap) -> int:
     """Boot recovery entrypoint. Returns the count of ports marked used."""
-    rules = list_dnat_rules()
-    used = {
-        port for port in rules if PORT_RANGE_LOW <= port <= PORT_RANGE_HIGH
-    }
-    bitmap.replace_used(used)
-    return len(used)
+    with _alloc_lock:
+        rules = _refresh_bitmap_locked(bitmap)
+        return sum(
+            PORT_RANGE_LOW <= port <= PORT_RANGE_HIGH for port in rules
+        )
 
 
 # ─── Atomic alloc + DNAT ────────────────────────────────────────
-_alloc_lock = threading.Lock()
+def _alloc_and_dnat_locked(bitmap: PortBitmap, guest_ip: str) -> int:
+    port = bitmap.alloc()
+    try:
+        if dnat_check(port, guest_ip):
+            raise RuntimeError(
+                f"DNAT rule already exists for port={port} guest={guest_ip} "
+                "(bitmap out of sync with iptables?)"
+            )
+        dnat_add(port, guest_ip)
+        return port
+    except Exception:
+        bitmap.free(port)
+        raise
 
 
 def alloc_and_dnat_atomic(bitmap: PortBitmap, guest_ip: str) -> int:
@@ -403,21 +419,20 @@ def alloc_and_dnat_atomic(bitmap: PortBitmap, guest_ip: str) -> int:
     the same port even though PortBitmap is itself thread-safe.
     """
     with _alloc_lock:
-        port = bitmap.alloc()
-        try:
-            if dnat_check(port, guest_ip):
-                # Foreign identical rule — extremely unlikely (would mean
-                # bootstrap didn't mark_used this port), but bail out
-                # rather than silently double-count.
-                raise RuntimeError(
-                    f"DNAT rule already exists for port={port} guest={guest_ip} "
-                    "(bitmap out of sync with iptables?)"
-                )
-            dnat_add(port, guest_ip)
-            return port
-        except Exception:
-            bitmap.free(port)
-            raise
+        return _alloc_and_dnat_locked(bitmap, guest_ip)
+
+
+def ensure_port_and_dnat(bitmap: PortBitmap, guest_ip: str) -> int:
+    """Refresh live state, then reuse or allocate one route atomically."""
+    with _alloc_lock:
+        rules = _refresh_bitmap_locked(bitmap)
+        for port, rule_guest in sorted(rules.items()):
+            if (
+                rule_guest == guest_ip
+                and PORT_RANGE_LOW <= port <= PORT_RANGE_HIGH
+            ):
+                return port
+        return _alloc_and_dnat_locked(bitmap, guest_ip)
 
 
 def release_port_and_dnat(bitmap: PortBitmap, host_port: int, guest_ip: str) -> None:
@@ -787,11 +802,13 @@ def _cli_release_route(tenant_id: str, host_port: int, guest_ip: str) -> int:
 def _cli_delete_route(
     tenant_id: str, host_port: int, guest_ip: str, legacy_port: int
 ) -> int:
-    """Delete-time hard gate for bitmap DNAT, legacy DNAT, and Redis.
-
-    This command is intentionally fail-loud. The control plane keeps the
-    tenant in ``deleting`` and retries instead of finalizing a partial cleanup.
-    """
+    """Delete live/legacy DNAT and Redis state as one fail-loud gate."""
+    if (host_port > 0 or legacy_port > 0) and not guest_ip:
+        print(
+            f"delete-route {tenant_id}: port state exists without guest_ip; "
+            "refusing partial cleanup"
+        )
+        return 1
     try:
         if guest_ip and host_port > 0:
             if PORT_RANGE_LOW <= host_port <= PORT_RANGE_HIGH:

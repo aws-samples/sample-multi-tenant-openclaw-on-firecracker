@@ -12,8 +12,8 @@
 #
 # 用法:
 #   ./build-image-demo.sh <PROFILE> <REGION> [--arch arm64|x86_64] [--version vX] [--sample NAME]
-#   ./build-image-demo.sh <aws-profile> us-east-1 --arch arm64   --version demo-arm
-#   ./build-image-demo.sh <aws-profile> us-east-1 --arch x86_64  --version demo-x86
+#   ./build-image-demo.sh ${AWS_PROFILE} us-east-1 --arch arm64   --version demo-arm
+#   ./build-image-demo.sh ${AWS_PROFILE} us-east-1 --arch x86_64  --version demo-x86
 #
 # 边界:demo 用独立空桶(openclaw-imgdemo-<acct>-<region>),在其中写自己的
 # manifest.json 演示"版本指针",不碰任何生产桶,生产 host 不会误拉 demo 镜像。

@@ -16,10 +16,12 @@ boto3 走 dispatch_service 的属性访问(_ssm_adaptive/_cw/_sqs),测试重绑�
 from __future__ import annotations
 
 import json
+import shlex
 import time
 from typing import Any, Dict, List, Tuple
 
 import core.clients as clients
+import core.ssm_dispatch as ssm_dispatch
 from core.dispatch import normalize_spec
 from core.utils import _now
 from services import dispatch_service as ds
@@ -51,18 +53,27 @@ def _query_assignments(instance_id: str, command_id: str) -> List[Dict[str, Any]
 
 
 def _query_batch_tenants(command_id: str) -> List[Dict[str, Any]]:
-    """按 dispatch_claim 反查一批租户(用于 push 模式清算+回滚)。GSI 未建时退化为 scan。"""
-    try:
+    """按 dispatch_claim 反查一批租户(用于 push 模式清算+回滚)。GSI 未建时退化为 scan。
+
+    #412(codex review2 #6)—— 【全量翻页】(LastEvaluatedKey)且【读失败向上抛】,不再单页
+    + 吞异常返 []:单页会漏掉 >1MB 或 FilterExpression 命中在后页的租户,吞异常返 [] 会让
+    失败分支误判"batch 空 → 全落定 → 清 inflight",而残留预留仍占容量卡死。调用方对异常
+    的处置(保留 inflight/不推进 retry)比"当空"安全。"""
+    items: List[Dict[str, Any]] = []
+    kwargs = {
+        "FilterExpression": "dispatch_claim = :c AND #s = :creating",
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {":c": command_id, ":creating": "creating"},
+        "ConsistentRead": True,
+    }
+    resp = clients.tenants_table.scan(**kwargs)
+    items.extend(resp.get("Items", []))
+    while resp.get("LastEvaluatedKey"):
         resp = clients.tenants_table.scan(
-            FilterExpression="dispatch_claim = :c AND #s = :creating",
-            ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={":c": command_id, ":creating": "creating"},
-            ConsistentRead=True,
+            ExclusiveStartKey=resp["LastEvaluatedKey"], **kwargs
         )
-        return resp.get("Items", [])
-    except Exception as e:  # noqa: BLE001
-        print(f"[poller] tenant scan failed: {e}")
-        return []
+        items.extend(resp.get("Items", []))
+    return items
 
 
 def _get_ssm_status(command_id: str, instance_id: str) -> Tuple[str, Dict[str, Any]]:
@@ -101,21 +112,42 @@ def _get_ssm_status(command_id: str, instance_id: str) -> Tuple[str, Dict[str, A
         return "InProgress", {}
 
 
-def _mark_running(tenant_id: str) -> bool:
-    """条件写 tenants: status creating→running,清 dispatch_claim/inflight 标记。"""
+def _mark_running(tenant_id: str, instance_id: str, command_id: str) -> bool:
+    """条件写 tenants: status creating→running,清 dispatch_claim/inflight 标记。
+
+    #412(codex review2 #1)—— 转 running 时【一并 REMOVE capacity_reservation_id】:
+    VM 已真起,容量归 running 租户合法持有,后续由正常 delete 路径(按 item.vcpu 扣)回收。
+
+    #412(codex review3 #1)—— fence host_id=:self:promote 与令牌释放【互斥】,防复活已释放租户。
+
+    #412(codex review9 #2)—— ABA 闸【改用 capacity_reservation_id=:rid】(rid=command_id:tenant_id):
+    host_id 单独不够——租户被释放后重投【落回同一 host】拿【新】预留(新 command_id、新 rid),本
+    (旧 command)poller 迟到 promote 会 host_id=:self 命中 → 把【新预留】的租户按旧命令 promote、
+    清掉新令牌 → VM/放置漂移 + 未记账容量。改锚 capacity_reservation_id=本命令的 rid:只 promote
+    仍持【本命令那张令牌】的租户;新预留的令牌是新 rid → CCF 跳过。
+    为何这次能用 rid 当条件(review5 #2 曾担心 claim 被清):令牌【不】在退避路径被清(只 dispatch_
+    claim 被清,见 grep:capacity_reservation_id 仅 release/promote 清)——reported 路径的租户即便
+    claim 已清,令牌仍在,故 rid 是稳定锚,不会把'claim 已清但真起了'的租户误挡在 creating。"""
     ccf = clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException
+    rid = ds._reservation_id(command_id, tenant_id)
     try:
         clients.tenants_table.update_item(
             Key={"id": tenant_id},
             UpdateExpression=(
                 "SET #s = :run, running_ts = :now "
-                "REMOVE dispatch_claim, dispatch_claim_ts"
+                "REMOVE dispatch_claim, dispatch_claim_ts, capacity_reservation_id"
             ),
-            ConditionExpression="#s = :creating",
+            ConditionExpression=(
+                "#s = :creating AND host_id = :self "
+                "AND capacity_reservation_id = :rid "
+                "AND attribute_not_exists(dispatch_settle)"
+            ),
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
                 ":run": "running",
                 ":creating": "creating",
+                ":self": instance_id,
+                ":rid": rid,
                 ":now": _now(),
             },
         )
@@ -127,8 +159,13 @@ def _mark_running(tenant_id: str) -> bool:
         return False
 
 
-def _bump_retry(tenant_id: str) -> int:
-    """dispatch_retries+=1,返回新值。超预算调用方转 requires_intervention。"""
+def _bump_retry(tenant_id: str, command_id: str) -> int:
+    """dispatch_retries+=1 且清 dispatch_claim,返回新值。超预算调用方转 requires_intervention。
+
+    #412(codex review9 #3)—— fence dispatch_claim=:cid:只清【本命令】打的 claim。否则一个
+    迟到的旧 poller 会清掉【新一轮 dispatch 刚打的 claim】,让新预留的活租户被后续误当 stale
+    释放。CCF(claim 已被新命令接管)→ 返 -1,调用方跳过本租户的 retry/requeue(不误动新命令)。"""
+    ccf = clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException
     try:
         resp = clients.tenants_table.update_item(
             Key={"id": tenant_id},
@@ -136,13 +173,69 @@ def _bump_retry(tenant_id: str) -> int:
                 "SET dispatch_retries = if_not_exists(dispatch_retries, :z) + :one "
                 "REMOVE dispatch_claim, dispatch_claim_ts"
             ),
-            ExpressionAttributeValues={":one": 1, ":z": 0},
+            ConditionExpression="#s = :creating AND dispatch_claim = :cid",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":one": 1,
+                ":z": 0,
+                ":cid": command_id,
+                ":creating": "creating",
+            },
             ReturnValues="UPDATED_NEW",
         )
         return int(resp["Attributes"]["dispatch_retries"])
+    except ccf:
+        # claim 已被新命令接管 → 本租户已归新一轮 dispatch,不该由旧 poller 计 retry/清 claim。
+        print(f"[poller] bump_retry {tenant_id} skipped: claim moved to newer command")
+        return -1  # 调用方据此跳过 retry/requeue
     except Exception as e:  # noqa: BLE001
         print(f"[poller] bump_retry {tenant_id} error: {e}")
         return clients.DISPATCH_RETRY_BUDGET + 1  # 保守当已耗尽
+
+
+def _claim_failed_settlement(
+    tenant_id: str, instance_id: str, command_id: str, reservation_id: str
+) -> bool:
+    """Fence promotion before stopping a VM reported failed.
+
+    The launcher can return nonzero after Firecracker has started. A durable
+    dispatch_settle claim keeps both poller and host-agent promotion from racing
+    the stop/release sequence. Re-entering the same command is idempotent.
+    """
+    ccf = clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException
+    try:
+        clients.tenants_table.update_item(
+            Key={"id": tenant_id},
+            UpdateExpression="SET dispatch_settle = :cid",
+            ConditionExpression=(
+                "#s = :creating AND host_id = :host "
+                "AND dispatch_claim = :cid AND capacity_reservation_id = :rid "
+                "AND (attribute_not_exists(dispatch_settle) OR dispatch_settle = :cid)"
+            ),
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":creating": "creating",
+                ":host": instance_id,
+                ":cid": command_id,
+                ":rid": reservation_id,
+            },
+        )
+        return True
+    except ccf:
+        return False
+    except Exception as e:  # noqa: BLE001
+        print(f"[poller] settle fence {tenant_id} failed: {e}")
+        return False
+
+
+def _stop_failed_tenant(instance_id: str, tenant_id: str, vm_num: int) -> bool:
+    tenant_arg = shlex.quote(str(tenant_id))
+    vm_arg = shlex.quote(str(int(vm_num)))
+    return ssm_dispatch._ssm_run(
+        instance_id,
+        f"/home/ubuntu/stop-vm.sh {tenant_arg} {vm_arg}",
+        timeout=30,
+    )
 
 
 def _mark_requires_intervention(tenant_id: str) -> None:
@@ -255,11 +348,20 @@ def poll_inflight() -> Dict[str, Any]:
             ]
             if reported:
                 for tid in reported:
-                    _mark_running(tid)
+                    _mark_running(tid, instance_id, command_id)
             else:
-                batch = _query_batch_tenants(command_id)
-                for t in batch:
-                    _mark_running(t["id"])
+                # 老脚本无 tenants 报告 → claim 反查降级 promote。#412 review2 #6:反查
+                # 现在会抛;成功路径 VM 真起了,反查失败就跳过降级 promote(host-agent 5s
+                # 自愈仍会 promote),不阻断下方 inflight 清理。
+                # #412 review3 #2:一个 command_id 跨多 host,降级 promote 必须【按 host_id 收窄】
+                # ——否则会把落在【别台 host】、命令还在跑的租户提前 promote、清其令牌,毁其失败回滚。
+                try:
+                    for t in _query_batch_tenants(command_id):
+                        if t.get("host_id") == instance_id:
+                            _mark_running(t["id"], instance_id, command_id)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[poller] success-path batch scan {instance_id} failed "
+                          f"(host-agent will promote): {e}")
             # 清 host inflight 标记(不回滚容量:VM 真起了)。
             # #315 guard(codex A_NEEDS_GUARD):去掉 host 级 inflight 门后,一台 host 可同时有
             # 多条并发在途命令,dispatch_inflight/dispatch_ssm_cid 是标量 last-write-wins。清理
@@ -287,24 +389,100 @@ def poll_inflight() -> Dict[str, Any]:
             _cleanup_manifest_best_effort(command_id, instance_id)
             stats["success"] += 1
         elif status in ("Failed", "TimedOut", "Cancelled"):
-            batch = _query_batch_tenants(command_id)
-            n = len(batch) or int(h.get("vm_count_delta", 0) or 0) or 1
-            # #330 — _rollback_host 现按【真实 vcpu/mem 之和】对称释放(与 reserve 同轴),不再
-            # n×VM_DEFAULT。用 binpack.normalize_spec 从 tenant item 的 vcpu/mem_mb 取【已校验】规格
-            # (同 _params_from_tenant 口径),批空时回落 n×VM_DEFAULT 保底(至少扣回本命令占的名额)。
+            # #412(codex review #1)—— 一个 command_id 可跨多台 host(dispatch_batch 一次
+            # invocation 给多台 host 各发一条命令、共用同一 command_id)。本 poller 迭代只处理
+            # 【本 host(instance_id)】这条 SSM 命令的终态,故必须把 batch 收窄到 host_id==本 host
+            # 的租户——否则会错误释放/重投别台 host 上还在跑的租户,扣错 host 账本、毁其放置。
+            try:
+                batch = [
+                    t for t in _query_batch_tenants(command_id)
+                    if t.get("host_id") == instance_id
+                ]
+            except Exception as e:  # noqa: BLE001
+                # #412(codex review2 #6)—— 反查失败:不能当 batch 空(那会误清 inflight、
+                # 搁浅残留预留)。保留 inflight + 跳过本 host,下轮 poll 重试反查。
+                print(f"[poller] batch scan {instance_id} cmd={command_id} failed, "
+                      f"retain inflight, retry next poll: {e}")
+                stats["still_running"] += 1
+                continue
+            # #412(review7 #1 + review8 #1)—— 命令级 Failed/TimedOut/Cancelled ≠ 每个 VM 都没起。
+            # 安全规则:**只释放 launch-all v2 报告【明确列为 failed】的租户**;launched/skipped 的
+            # promote;其余(报告没提到的 unknown / 老脚本无报告 / TimedOut/Cancelled 根本没解析
+            # stdout)一律【既不释放也不 promote,保留 creating + 令牌】,交 _reap_stuck_creating
+            # (900s 超时)兜底。为什么不再"非 launched 就整批释放"(review8 #1):TimedOut/Cancelled
+            # 的 report 为空 → 那样会把整批(可能含真起了的 VM)全释放 → 欠记账 + 重复 launch(红线)。
+            # 宁可让真死的租户多等一个 reaper 周期(容量延迟回收),也绝不释放一个可能还活着的 VM。
+            t_report = (report or {}).get("tenants") or {}
+            launched_ok = {
+                tid
+                for k in ("launched", "skipped")
+                for tid in (t_report.get(k) or [])
+                if isinstance(tid, str) and tid
+            }
+            failed_reported = {
+                tid for tid in (t_report.get("failed") or [])
+                if isinstance(tid, str) and tid
+            }
+            for _tid in launched_ok:
+                _mark_running(_tid, instance_id, command_id)  # 真起了 → promote(fence host_id=:self)
+            # 只释放【明确 failed】的;unknown/无报告 → 保留,reaper 超时兜底(绝不释放可能活的 VM)。
             dvm = int(clients.VM_DEFAULT_VCPU or 2)
             dmm = int(clients.VM_DEFAULT_MEM or 4096)
-            specs = [normalize_spec(t, dvm, dmm) for t in batch]
-            sum_vcpu = sum(v for v, _ in specs) or (n * dvm)
-            sum_mem = sum(m for _, m in specs) or (n * dmm)
-            ds._rollback_host(instance_id, n, sum_vcpu, sum_mem)
-            for t in batch:
-                new_retries = _bump_retry(t["id"])
+            to_release = [t for t in batch if t["id"] in failed_reported]
+            unknown = [
+                t for t in batch
+                if t["id"] not in failed_reported and t["id"] not in launched_ok
+            ]
+            if unknown:
+                print(f"[poller] {instance_id} cmd={command_id}: {len(unknown)} tenant(s) "
+                      f"unknown outcome (report incomplete/TimedOut) — retained for reaper")
+            settled = []  # 释放已落定(consumed/already)的租户,才可推进 retry-budget/requeue
+            # unknown 租户没定论(保留等 reaper)→ 本命令未落定,不清 inflight/manifest,
+            # 下轮 poll 继续观察;reaper 900s 把 unknown 翻出 creating 后,批清空 → 自然落定。
+            all_settled = not unknown
+            for t in to_release:
+                v, m = normalize_spec(t, dvm, dmm)
+                rid = t.get("capacity_reservation_id") or ds._reservation_id(
+                    command_id, t["id"]
+                )
+                if not _claim_failed_settlement(
+                    t["id"], instance_id, command_id, rid
+                ):
+                    all_settled = False
+                    continue
+                if not _stop_failed_tenant(
+                    instance_id, t["id"], int(t.get("vm_num", 1) or 1)
+                ):
+                    # Keep dispatch_settle + token + claim. Promotion is fenced,
+                    # and the next poll retries the authoritative stop.
+                    all_settled = False
+                    continue
+                if ds._release_reservation(t["id"], instance_id, rid, v, m) == ds.RELEASE_RETRY:
+                    # 瞬时失败:令牌可能仍占容量。本轮【不动】该租户的 claim/inflight/retry
+                    # (codex review2 #3:_bump_retry 会清 claim → 下轮 poll 反查不到、令牌搁浅、
+                    # 最终误 requires_intervention 逃出 reaper 覆盖)。保留 claim+inflight,靠下轮
+                    # poll 重新反查同一 command_id 再释放(令牌仍在 → 幂等消费一次)。
+                    all_settled = False
+                else:
+                    settled.append(t)
+            # inflight 是 host 级批状态;仅当本 host 令牌全部落定才清(带 CAS 防误清并发新命令)。
+            # 有 retry 悬空则留 inflight —— 下轮 poll 仍能反查本 command_id 的残留租户继续释放。
+            if all_settled:
+                ds._clear_inflight_scalar(instance_id, command_id)
+            # 只对释放落定的租户推进 retry-budget / 重投;retry 悬空的留原样等下轮。
+            for t in settled:
+                new_retries = _bump_retry(t["id"], command_id)
+                if new_retries < 0:
+                    # #412 review9 #3:claim 已被【新一轮 dispatch】接管 → 本租户已归新命令,
+                    # 旧 poller 不再计 retry/重投它(否则会踩新预留)。跳过。
+                    continue
                 if new_retries > clients.DISPATCH_RETRY_BUDGET:
                     _mark_requires_intervention(t["id"])
                 else:
                     _requeue(t["id"], _params_from_tenant(t))
-            _cleanup_manifest_best_effort(command_id, instance_id)
+            # manifest 仅在本 host 全部落定后清(未落定说明还要下轮 poll,清早了下轮取不到）。
+            if all_settled:
+                _cleanup_manifest_best_effort(command_id, instance_id)
             stats["failed"] += 1
         else:
             stats["still_running"] += 1

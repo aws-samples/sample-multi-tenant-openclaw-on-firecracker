@@ -2,9 +2,9 @@
 
 OpenClaw on Firecracker 多租户 AI Agent 平台在 AWS 上为成千上万的租户各自交付一台独立内核的轻量虚拟机，在其中运行带身份、技能与安全护栏的 OpenClaw AI agent。它用 Firecracker microVM 把"越权止于单租户"从容器级别提升到虚拟机级别，并叠加从内容层到凭据层的五层纵深防护，面向需要承载大规模 AI agent、且对租户隔离与性能都有强要求的场景。
 
-## 结论先行：这套方案解决什么、代价是什么
+## 解决方案定位与权衡
 
-**它解决的核心问题**：多租户共享内核的容器隔离一旦被逃逸，攻击面是整个宿主上的所有租户；本方案给每个租户一台独立 Linux 内核的 Firecracker microVM（与 AWS Lambda、Fargate 同一种轻量虚拟化技术），把单租户的越权或逃逸物理封在它自己的虚拟机里。隔离不靠模型自律，而是落到部署代码与设备：跨租户东西向流量在宿主 iptables 上被丢弃（加固后目标态 100% 丢包），身份走 OpenClaw 原生 Ed25519 非对称认证，凭据用 KMS 信封加密、guest 内零长期 AWS 凭据。
+**它解决的核心问题**：多租户共享内核的容器隔离一旦被逃逸，攻击面是整个宿主上的所有租户；本方案给每个租户一台独立 Linux 内核的 Firecracker microVM（与 AWS Lambda、AWS Fargate 同类的轻量虚拟化技术），把单租户的越权或逃逸物理封在它自己的虚拟机里。隔离不靠模型自律，而是落到部署代码与设备：跨租户东西向流量在宿主 iptables 上被丢弃，身份走 OpenClaw 原生 Ed25519 非对称认证，凭据用 AWS Key Management Service (AWS KMS) 信封加密、guest 内零长期 AWS 凭据。
 
 **它的关键取舍**：安全边界下沉到 VM 级换来的是每租户约 2 GB 内存的固定开销（`r8g.metal-24xl` 单台稳态承载约 380 租户，容量推算），以及"改配置必须重建镜像、不热改运行中 VM"的运维纪律。
 
@@ -20,7 +20,7 @@ OpenClaw on Firecracker 多租户 AI Agent 平台在 AWS 上为成千上万的�
 
 ---
 
-## 核心摘要（两个受众版本）
+## 受众摘要
 
 ### 【CTO / 业务视角版】
 
@@ -33,9 +33,9 @@ OpenClaw on Firecracker 多租户 AI Agent 平台在 AWS 上为成千上万的�
 ### 【基础架构工程师版】
 
 - **隔离底座**：Firecracker microVM on 宿主原生 KVM（`r8g.metal-24xl`，Graviton4，非嵌套虚拟化）。每租户独立 Linux 内核 + OverlayFS rootfs（只读 base + per-VM 稀疏可写层）+ KMS 加密 EBS。
-- **网络隔离**：每 VM 独占一条 `/30` 点对点 TAP 链路，全部落在 `SUBNET_PREFIX/16` 超网内；宿主 iptables 对整个 `/16` 做东西向 `FORWARD DROP`（跨租户 100% 丢包，实测）；每 VM 另插三条规则 DROP 到 IMDS、到租户超网、到宿主管理端口。
-- **安全边界（L1–L5）**：L1 内容层 Bedrock Guardrails 输入输出双向；L2 工具层 `before_tool_call` ACL default-deny；L3 身份层 OpenClaw 原生 Ed25519 device 非对称认证 + 控制面 RBAC + `owner_id` 门控；L4 网络层 IMDS 封锁 + DNS Firewall + NAT 出网白名单；L5 凭据层 guest 零长期凭据 + 只读黄金镜像盘 + in-guest auditd/Wazuh 运行时监控。
-- **数据面**：浏览器 ─wss `/gw/ws`─▶ 平台后端（验平台 JWT）─ws─▶ ALB ─▶ OpenResty edge ASG（查 ElastiCache Redis 路由表 + strip `/ws/{tid}` 前缀）─▶ microVM gateway:18789（Ed25519 device 握手）。opt-in（`edge`/`redis` gate）。
+- **网络隔离**：每 VM 独占一条 `/30` 点对点 TAP 链路，全部落在 `SUBNET_PREFIX/16` 超网内；宿主 iptables 对整个 `/16` 做东西向 `FORWARD DROP`（跨租户 100% 丢包，实测）；每 VM 另插规则阻断 EC2 Instance Metadata Service (IMDS)、租户超网和宿主管理端口。
+- **安全边界（L1–L5）**：L1 内容层 Bedrock Guardrails 输入输出双向；L2 工具层 `before_tool_call` ACL default-deny；L3 身份层 OpenClaw 原生 Ed25519 device 非对称认证 + 控制面 role-based access control (RBAC) + `owner_id` 门控；L4 网络层 IMDS 封锁 + DNS Firewall + NAT 出网白名单；L5 凭据层 guest 零长期凭据 + 只读黄金镜像盘 + in-guest auditd/Wazuh 运行时监控。
+- **数据面**：浏览器 ─wss `/gw/ws`─▶ 平台后端（验平台 JWT）─ws─▶ ALB ─▶ OpenResty edge ASG（查 ElastiCache 路由存储；默认 Valkey、兼容 Redis）─▶ microVM gateway:18789（Ed25519 device 握手）。opt-in（`edge`/`redis` gate）。
 - **扩展性指标**：microVM 纯启动 1.74s（p50，实测）；单台全健康承载 187 节点（磁盘瓶颈，实测）/ 稳态 380 租户（推算）；per-VM RSS ~609 MB（实测）；大规模建租户经 SQS 削峰绕过 SSM 单实例并发墙。
 
 ---
@@ -45,7 +45,7 @@ OpenClaw on Firecracker 多租户 AI Agent 平台在 AWS 上为成千上万的�
 - 为每个租户预配一台独立内核的 Firecracker microVM，在虚拟机级别隔离租户之间的内存、CPU 与内核。
 - 将身份、技能、配置在虚拟机启动前冷注入到只读黄金镜像，虚拟机启动即为成品，运行后控制面不向其注入任何业务数据。
 - 通过两级路由（平台后端 → OpenResty 边缘 → microVM gateway）把浏览器的实时聊天请求按租户直连到对应虚拟机内的 OpenClaw agent，microVM 只对宿主内部暴露端口，不开放公网入站。
-- 以 OpenClaw 原生 device 非对称认证（Ed25519）为数据面身份根，控制面以 `x-api-key` + 可选 Cognito RBAC 守门；验签失败一律降级到最小权限。
+- 以 OpenClaw 原生 device 非对称认证（Ed25519）为数据面身份根，控制面要求 usage-plan key 并叠加可选 Cognito RBAC；无效 Bearer token 无可信 owner 身份，受保护路由返回 `403`。
 - 叠加五层纵深防护：内容层、工具执行层、身份层、网络层、凭据与只读监控层，每一层都落实到部署代码或设备，不依赖模型自律。
 
 本实施指南概述参考架构与组件、部署规划注意事项，以及将其部署到 Amazon Web Services (AWS) 云的配置步骤。它面向在 AWS 云中具有架构实践经验的平台工程师、安全评审人员、运维工程师与应用开发人员。

@@ -21,8 +21,9 @@ IDLE_TIMEOUT = int(os.environ["IDLE_TIMEOUT_MINUTES"])
 
 # R8 — 空闲缩容总开关。**当前阶段硬禁自动缩容**(设计决策:去掉 ASG 自动缩容
 # 功能):大规模集群里自动 terminate idle host 风险 > 收益——误删刚空但马上要接新租户的
-# host、缩到 0 撞 pending 租户 → no-host → requires_intervention、下线本就慢
-# (lifecycle 串行停 VM)。当前功能+稳定优先,host 留池不回收比误删安全。
+# host、缩到 0 撞 pending 租户 → no-host → requires_intervention(memory
+# scaler-idle-reclaim-races-pending-tenant)、下线本就慢(lifecycle 串行停 VM)。当前
+# 功能+稳定优先(铁律#1)+ 成本不是约束,host 留池不回收比误删安全。
 # 硬禁方式:总门 IDLE_RECLAIM_ENABLED 恒 False,不再读 env(env 设 true 也不缩)。idle
 # 标记/恢复仍无条件做(无害,保留可观测:哪些 host 空了)。未来要恢复自动缩容:改回读 env +
 # 补 pending 门 + 缩容前查在途租户,单独 issue 评审。
@@ -42,7 +43,19 @@ except Exception:  # noqa: BLE001 — botocore 恒在,兜底不改行为
 # delete is in flight. TTL处置对它必须是 no-op:租户正在被显式删除,若 TTL 循环
 # 再对它下发 stop/delete,会把 "deleting" 逆转成活跃态(重开账本扣穿窗口)或抢在
 # delete 主流程完成副作用前误标终态(致 _abort_restore_status 回滚失败 + slot 泄漏)。
-_TTL_TERMINAL = {"stopped", "deleted", "failed", "deleting"}
+# #422 — 休眠三态同理必须是 TTL no-op(no-data-loss):suspended 租户的 VM 已删、数据盘
+# 已备份 S3、slot 已释放——TTL 的"释放资源"目的已达成,若再对它下发 stop/delete 会把状态
+# 破坏(restore 找不到 suspended 态)、甚至走 delete 清理链删掉 S3 备份 = 数据丢失。
+# suspending/restoring 是在途态,更不能被 TTL 打断。三态全部 no-op。
+_TTL_TERMINAL = {
+    "stopped",
+    "deleted",
+    "failed",
+    "deleting",
+    "suspending",
+    "suspended",
+    "restoring",
+}
 
 # ── Seamless image refresh (task #21) ───────────────────────────────────
 # Force-rotate every tenant onto the current golden image every N hours so
@@ -115,6 +128,15 @@ def lambda_handler(event, context):
             print(f"{instance_id}: upgrading (pull-image in progress) — scaler skips")
             continue
 
+        # #394 —— canary pull / promote / rollback / cleanup 【刻意不置 upgrading】(否则该
+        # host 停接 live 租户,违背"存量零影响"),所以上面那道 status 门保护不到它们。
+        # 改用镜像操作 lease 判断:持有有效 lease 的 host 正在被镜像操作独占,scaler 一律
+        # 不碰(不标 idle、不复位 active、不 terminate),避免与 pull/promote 并发拍脏。
+        # 过期 lease 不算(可被接管),故用 image_lease_until 与当前时间比,不只看字段存在。
+        if _holds_image_lease(h, now):
+            print(f"{instance_id}: image operation in progress (lease held) — scaler skips")
+            continue
+
         if vm_count > 0:
             # Has VMs — ensure active (recover from idle if tenant was assigned)
             if status == "idle":
@@ -166,6 +188,23 @@ def lambda_handler(event, context):
     # Runs after idle bookkeeping so it sees current host usage. Gated OFF default.
     if RESERVE_ENABLED:
         _ensure_reserve_capacity(hosts)
+
+
+def _holds_image_lease(host_item, now):
+    """#394 —— 该 host 是否正被镜像操作(canary pull / promote / rollback / cleanup)独占。
+
+    纯函数(便于单测):只看 host 记录里的 lease 字段。
+    · 无 active_image_operation_id → 不持有;
+    · image_lease_until <= now → 已过期(可被接管),不算持有 —— 否则一次崩溃的 pull 会
+      让 scaler 永久跳过这台 host(既不标 idle 也不复位),等于静默漏管。
+    """
+    if not host_item.get("active_image_operation_id"):
+        return False
+    try:
+        until = int(host_item.get("image_lease_until") or 0)
+    except (TypeError, ValueError):
+        return False
+    return until > int(now.timestamp())
 
 
 def _ensure_reserve_capacity(hosts):
@@ -500,6 +539,11 @@ _REFRESH_SKIP_STATUS = {
     "creating",
     "migrating",
     "deleting",
+    # #422 — 休眠三态跳过 image-refresh(与 TTL 同理):suspended 租户 VM 已删、盘在 S3,
+    # refresh 链会强制 launch 它到新镜像 = 破坏 suspended 态 + 可能空盘启动。在途态更不能碰。
+    "suspending",
+    "suspended",
+    "restoring",
 }
 
 

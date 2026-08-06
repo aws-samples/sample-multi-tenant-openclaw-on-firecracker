@@ -17,7 +17,7 @@
 
 ## 部署流程概述
 
-部署代码由四部分组成：基于 AWS Cloud Development Kit (AWS CDK) 的基础设施定义（`deploy/app.py` 与 `deploy/stack.py`，`stack.py` 入口已拆分为 `deploy/stacks/` 下的域模块）、host 与 microVM 生命周期脚本（`deploy/userdata/*.sh`）、黄金镜像构建脚本（`build-rootfs.sh`），以及 opt-in 数据面的边缘组件（`deploy/edge/`，OpenResty 边缘的 nginx/Lua 与自举脚本）。
+部署代码由四部分组成：AWS Cloud Development Kit (AWS CDK) 入口 `deploy/app.py`、编排器 `deploy/stack.py` 与 `deploy/stacks/` 域模块，host 与 microVM 生命周期脚本（`deploy/userdata/*.sh`），黄金镜像构建脚本（`build-rootfs.sh`），以及 opt-in 数据面的边缘组件（`deploy/edge/`）。
 
 AWS CDK 入口 `deploy/app.py` 读取 context 中的 `region`（默认 `us-east-1`），实例化 `OpenClawOrchestratorStack`，账号取自环境变量 `CDK_DEFAULT_ACCOUNT`。中心配置文件 `config.yml`（不入库，从 `config.yml.example` 复制）集中定义 host 规格、microVM 默认值、Auto Scaling Group (ASG)、Balloon 内存回收、健康检查、网络模式、Multi-AZ 与可选的数据面/认证开关。部署命令封装在 `setup.sh` 中。
 
@@ -224,7 +224,7 @@ sed -e 's/ACCOUNT_ID/123456789012/g' -e 's/REGION/us-east-1/g' \
 }
 ```
 
-各语句用途分两组。**首次 bootstrap 相关**（仅在初始化 `CDKToolkit` 栈时用到，之后闲置）：`BootstrapIamRoles` / `BootstrapIamPolicies` 创建并管理 `cdk-hnb659fds-*` 前缀的 IAM 角色与策略；`BootstrapStagingBucket` 创建 CDK staging 桶；`BootstrapContainerAssetsRepo` 创建容器镜像仓库；`CdkBootstrapAndVersionParameters` 写入并读取 bootstrap 版本参数。**日常部署相关**：`CloudFormationManageStacks` 只允许操作本解决方案的 `OpenClawOrchestrator` 与 `CDKToolkit` 两个堆栈（含读回 assets 桶、backup 桶、备份密钥等 Outputs）；`AssumeCdkDeployRoles` 让 AWS CDK 扮演四个执行角色完成资产发布与堆栈变更；`SetupUploadHostScriptsAndConsoleAssets` 覆盖 `setup.sh` 向 assets 桶（`openclaw-assets-<account>`，带可选区域后缀）上传 host/hub 脚本与 console/chat 静态资产；`SetupWriteRuntimeCoordinatesToSsm` 覆盖 `setup.sh` 向 `/openclaw/*` 写入 CloudFront origin、Cognito 客户端 ID、共享 vkey 等运行时坐标；`SetupReadSharedVkeyApiKey` 覆盖 `setup.sh` 读取 API Gateway API key 明文以铸造共享 vkey。
+各语句用途分两组。**首次 bootstrap 相关**（仅在初始化 `CDKToolkit` 栈时用到，之后闲置）：`BootstrapIamRoles` / `BootstrapIamPolicies` 创建并管理 `cdk-hnb659fds-*` 前缀的 IAM 角色与策略；`BootstrapStagingBucket` 创建 CDK staging 桶；`BootstrapContainerAssetsRepo` 创建容器镜像仓库；`CdkBootstrapAndVersionParameters` 写入并读取 bootstrap 版本参数。**日常部署相关**：`CloudFormationManageStacks` 只允许操作本解决方案的 `OpenClawOrchestrator` 与 `CDKToolkit` 两个堆栈（含读回 assets 桶、backup 桶、备份密钥等 Outputs）；`AssumeCdkDeployRoles` 让 AWS CDK 扮演四个执行角色完成资产发布与堆栈变更；`SetupUploadHostScriptsAndConsoleAssets` 覆盖 `setup.sh` 向 assets 桶上传 host/edge 脚本与 console/chat 静态资产；`SetupWriteRuntimeCoordinatesToSsm` 覆盖 `setup.sh` 向 `/openclaw/*` 写入运行时坐标；`SetupReadSharedVkeyApiKey` 覆盖 `setup.sh` 读取 API Gateway API key 以铸造共享 vkey。
 
 > **安全边界**：这份 policy 不含任何创建业务资源（EC2/Lambda/DynamoDB/VPC/Redis 等）的权限——那些由 bootstrap 产出的 `cfn-exec-role` 承担。它对 IAM、S3、ECR 的创建权限严格锁定在 `cdk-hnb659fds-*` 命名前缀内，对 CloudFormation 的操作仅限 `OpenClawOrchestrator` 与 `CDKToolkit` 两个栈；即使部署身份凭据泄露，也无法用它创建任意 IAM 角色或触碰其他资源。
 
@@ -238,7 +238,7 @@ sed -e 's/ACCOUNT_ID/123456789012/g' -e 's/REGION/us-east-1/g' \
 
 ## 步骤 1：部署基础设施
 
-整套基础设施定义在 `deploy/stack.py` 的 `OpenClawOrchestratorStack` 类中。部署命令的核心是一行带区域参数的 `cdk deploy`：
+`deploy/stack.py` 的 `OpenClawOrchestratorStack` 按顺序调用 `deploy/stacks/` 下的 storage、lambdas、compute、network、edge、auth、observability 等域构建器；黄金镜像另由 `deploy/stacks/image.py` 的 `OpenClawImageStack` 管理。部署命令的核心是一行带区域参数的 `cdk deploy`：
 
 ```bash
 cdk deploy -c region="<region>" --profile "<profile>" --require-approval never
@@ -323,7 +323,7 @@ tenants、hosts、groups 与审计四张 `RETAIN` 表均开启时间点恢复（
 
 新 host 由 ASG 拉起后，`init-host.sh` 按以下顺序自举：配置 KVM 权限、host 加固、安装工具与 Firecracker、挂载数据卷、下载镜像（rootfs 与 vmlinux）、从 S3 同步 shared skills、部署生命周期脚本，最后向 `openclaw-hosts` 表注册。
 
-EC2 user-data 有 16 KB 硬上限，而 `init-host.sh` 注入后约 23 KB。AWS CDK 将 `base64(gzip(init-host.sh))` 嵌入一个纯 ASCII 小 bootstrap，该 bootstrap 把脚本解码到 `/tmp/init-host.sh` 并执行。排查自举失败时，真正在运行的是 `/tmp/init-host.sh` 而非 user-data 原文；`/var/log/cloud-init-output.log` 记录 bootstrap 解码与 init-host 执行日志。
+EC2 user-data 有 16 KB 上限，因此 `init-host.sh` 不再内联。CDK 把渲染后的脚本发布到不可变 S3 key `deployment/bootstrap/host/<sha256>/init-host.sh`，Launch Template 只携带小 bootstrap。新 host 安装/发现架构匹配的 AWS CLI，下载对象，校验完整 SHA-256，原子安装到 `/var/lib/cloud/init-host.sh` 后执行。下载、摘要或脚本失败都会走 ASG lifecycle `ABANDON`。排障先看 `/var/log/openclaw-bootstrap.log` 和 `/var/log/cloud-init-output.log`。
 
 host 自举的几个要点：
 
@@ -381,17 +381,17 @@ host 自举的几个要点：
 >
 > 多个生命周期脚本在边角场景的健壮性待加固：`resize-disk.sh` 假设无坏块，备份恢复后若前置 e2fsck 报码 4 未再复查可能导致扩容后文件系统损坏；`clone-data.sh` 的 e2fsck 后无返回码检查；`migrate-vm.sh` restore 模式容忍磁盘缺失，跨 host 时若快照引用路径不匹配会在 `/snapshot/load` 阶段失败；`stop-vm.sh` 后临时文件的空间回收机制未在脚本中显式说明。
 
-## 镜像升级与灰度
+## 镜像版本边界
 
-升级 OpenClaw、修改配置或更换身份的正确做法是修改部署代码后重建，而非热改运行中的 microVM。修改租户身份需要重新构建镜像，而非调用运行时 API。具体路径为：修改 `build-rootfs.sh` 或 `launch-vm.sh`，烤制新镜像或调整 launch template，灰度后滚动重建，出问题时回滚 `manifest.json`。手改运行中的 microVM 仅可用于验证假设，验证完毕后必须落回部署代码。
+升级 OpenClaw、修改配置或更换身份必须回到部署代码和镜像，而非热改运行中的 microVM。完整 canary、回滚和 host 更新顺序见 [更新解决方案](05-update-solution.md)。
 
 这条纪律是整套隔离设计的基础：身份、技能、凭据与配置走启动前冷注入，运行后不开启 host 到 microVM 的批量热注入通道，少一条活通道就少一个横向移动面。
 
-灰度发布通过 `SKIP_MANIFEST` 实现（参见『部署解决方案 — 步骤 2：构建黄金镜像』）。流程为：以 `SKIP_MANIFEST=1` 烤制新镜像、在少量测试节点验证、验证通过后更新 `manifest.json`、滚动重建。
+旧 `SKIP_MANIFEST` 流程只适用于旧 manifest 发布路径。当前 host-local 灰度以 live/canary 槽、pinned canary tenant 与 `promote-canary` 为准。
 
 > **Important**
 >
-> 滚动重建会逐台用新镜像重建 host 上的 microVM。重建会重新生成每个 microVM 的 gateway token 与 channel secret，并以新镜像启动。执行前确认新镜像已在测试节点验证通过；出问题时将 `manifest.json` 指回旧版本即可回滚。
+> 滚动重建前确认新镜像已在 pinned canary tenant 上验证。gateway token 与 device 身份密文无 TTL,重建必须复用原身份；不得生成另一套 token。回滚是把已保留旧 snapshot pull 到 live。
 
 ## 监控告警与容灾
 
@@ -432,7 +432,7 @@ backup 的 `backup_cron` 是扫描节拍而非统一备份时间：每次触发�
 
 ### ASG 弹性伸缩与机型
 
-宿主机扩缩容交由 Amazon EC2 Auto Scaling 托管，Auto Scaling Group 与启动模板管理整队宿主机的拉起与滚动重建。host 由 ASG 拉起、自举注册，空闲超时由 scaler 经两轮确认后受控回收，整池容量按 `config.yml` 调整，默认值 `min_capacity: 1` / `max_capacity: 8` 台。
+宿主机扩缩容交由 Amazon EC2 Auto Scaling 托管，Auto Scaling Group 与启动模板管理整队宿主机的拉起与滚动重建。host 由 ASG 拉起、自举注册，空闲超时由 scaler 经两轮确认后受控回收，整池容量按 `config.yml` 调整，仓库默认值为 `min_capacity: 2` / `max_capacity: 8` 台。
 
 生产机型使用 metal 系列（Graviton4 ARM64，原生 KVM 运行 Firecracker，而非 x86 嵌套虚拟化）。`config.yml` 以 `arch: arm64` 与 `instance_type` 配置机型，容量推导由部署代码按 size token 查表并结合内存比计算。metal 机型走原生 KVM、不开启嵌套虚拟化；生产底座固定为 metal 原生 KVM。
 
@@ -506,7 +506,7 @@ docker ps                 # 能列出即可（无需有容器在跑）
 
 - **修复步骤**：在部署机启动 Docker Desktop / dockerd，`docker ps` 通过后重跑 `setup.sh`。
 
-### 问题 3：`setup.sh` 一上来就报错（`config.yml` 缺失或 CDK 未 bootstrap）
+### 问题 3：`setup.sh` 前置检查失败
 
 - **错误现象**：全新克隆后 `./setup.sh` 报 `VPC mode not configured` 或读 `config.yml` 抛 `FileNotFoundError`；或 `cdk deploy` 报 `SSM parameter /cdk-bootstrap/hnb659fds/version not found. Has the environment been bootstrapped?`。
 - **根本原因**：`config.yml` 在 `.gitignore`，仓库只有 `config.yml.example`；全新账号/区域没跑过 `cdk bootstrap`，`CDKToolkit` 栈不存在。
@@ -577,7 +577,7 @@ journalctl -u host-agent -n 200 | grep -i route
 
 - **修复步骤**：`redis-cli GET route:<tid>` 有值→查边缘实例的 `edge_redis_host` 环境与 nginx.conf；无值→查 host-agent 路由上报（VM 探活是否通过 promote 门，即数据面判活升级门控）。404 指向路由缺失、503 指向 Redis 链路断，两个状态码定位不同层。
 
-### 问题 8：模板带新版本 key 毒死 gateway（`app_health` down、崩溃循环）
+### 问题 8：模板 schema 与 OpenClaw 版本不兼容
 
 - **错误现象**：guest 内 openclaw gateway 崩溃重启数千次，租户 `app_health`（gateway 健康上报字段）长期 down、数据面全死，但控制面 DDB 仍报 `running`；console 上 VM Health 绿 / Gateway 红。
 - **根本原因**：镜像钉死 openclaw `2026.2.26`，其 config schema 严格校验（`.strict()`）。模板（`templates/openclaw.json` 等）若带 2026.6.x 才有的 key（如 `heartbeat.isolatedSession`、`compaction.*`），gateway 启动校验直接拒起、循环崩溃。

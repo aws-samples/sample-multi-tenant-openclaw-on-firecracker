@@ -10,7 +10,7 @@
 
 > **Note**
 >
-> 平台的 AWS 资源基于 AWS Cloud Development Kit (AWS CDK) 构造创建。AWS CDK 在部署时合成 AWS CloudFormation 模板并管理资源的生命周期。数据面（OpenResty 边缘 ASG + Amazon ElastiCache Redis 路由表）为 opt-in 能力，由 `config.yml` 的 `edge.enabled` / `redis.enabled` 控制，默认关闭；启用后详见"数据面两级路由"章。
+> 平台的 AWS 资源基于 AWS Cloud Development Kit (AWS CDK) 构造创建。AWS CDK 在部署时合成 AWS CloudFormation 模板并管理资源的生命周期。数据面（OpenResty 边缘 ASG + Amazon ElastiCache 路由存储，默认 Valkey、兼容 Redis）为 opt-in 能力，由 `config.yml` 的 `edge.enabled` / `redis.enabled` 控制；启用后详见"数据面两级路由"章。
 
 使用 AWS CloudFormation 模板部署的解决方案组件，其高级流程如下。
 
@@ -26,7 +26,7 @@
 
 6. 平台后端网关作为 WebSocket 客户端，经 Amazon CloudFront → Application Load Balancer → OpenResty 边缘连到目标 microVM 的 OpenClaw gateway，用 OpenClaw 原生 Ed25519 device 非对称握手认证（私钥由平台后端代持，公钥冷注入 microVM 配对文件）。
 
-7. OpenResty 边缘按 `tenant_id` 查 Amazon ElastiCache Redis 路由表（`route:{tenant_id}`），strip 掉 `/ws/{tenant_id}` 前缀后经宿主 iptables DNAT 直投到对应 microVM gateway 的 18789 端口。microVM 只对宿主内部 TAP 网卡暴露该端口，不开放任何公网入站。
+7. OpenResty 边缘按 `tenant_id` 查 Amazon ElastiCache 路由存储（`route:{tenant_id}`；Valkey/Redis wire protocol），经宿主 iptables DNAT 直投到对应 microVM gateway 的 18789 端口。microVM 只对宿主内部 TAP 网卡暴露该端口，不开放任何公网入站。
 
 8. 控制面与数据面的关键事件经 Amazon CloudWatch 记录指标与日志；宿主探针暴露 Prometheus 指标供监控平台采集；安全相关事件可经 Amazon GuardDuty 与 Amazon EventBridge 汇入统一告警通道（默认关闭，按需启用）。
 
@@ -53,7 +53,7 @@
 
 本节介绍平台如何运用安全性支柱的原则和最佳实践。
 
-- 平台的数据面身份根是 OpenClaw 原生 Ed25519 device 非对称认证（私钥平台后端代持、公钥冷注入 microVM）；控制面以 `x-api-key` + 可选 Amazon Cognito RBAC 守门，验签失败一律降级到最小权限（只读）。
+- 平台的数据面身份根是 OpenClaw 原生 Ed25519 device 非对称认证（私钥平台后端代持、公钥冷注入 microVM）；控制面要求 usage-plan key 并叠加可选 Amazon Cognito RBAC。无效 Bearer token 无可信 owner 身份，受保护路由返回 `403`。
 - 平台默认启用基于角色的访问控制（RBAC，`console_auth.rbac_enabled` 默认 `true`），强制按路由的角色检查与资源属主检查；即使关闭 RBAC，资源属主（`owner_id`）检查仍不受影响。
 - 平台为每个租户预配独立内核的 Firecracker microVM，并在宿主 iptables 上丢弃跨租户东西向流量、丢弃虚拟机访问实例元数据服务（IMDS）与宿主管理端口的流量。
 - 平台的 agent 工具执行层在工具真正执行前否决凭据外泄、敏感文件读取等危险动作，内容层经 Amazon Bedrock Guardrails 拦截越狱与有害内容。

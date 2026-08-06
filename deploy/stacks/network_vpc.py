@@ -23,7 +23,7 @@ def build_network_vpc(self, ctx):
     api_fn = getattr(ctx, "api_fn", None)
     sec_cfg = getattr(ctx, "sec_cfg", None)
 
-    # ========== VPC (P2b · #187 FR-10, the data-plane contract) ==========
+    # ========== VPC (P2b · #187 FR-10, INTERFACE-CONTRACT §6) ==========
     # 3 档:default_vpc(存量兼容,host 裸公网,不推荐)/ self_managed(自建 /20
     # + 3 公 + 3 私 + 3 NAT)/ imported(客户传 vpc_id + 6 subnet id)。
     # 生产走 self_managed(host 全落私有子网,守 AWS 暴露红线);切档=重建栈。

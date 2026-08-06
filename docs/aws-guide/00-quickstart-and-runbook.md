@@ -2,7 +2,7 @@
 
 > 本文是一份自包含的"从零到跑通"的可用文档，按倒金字塔组织：先给结论与系统价值，再给架构，最后是可勾选的部署步骤与常见报错排查。要逐章深读，见 `docs/aws-guide/` 的分章实施指南（本文的每一节都指向对应章）。
 >
-> 数字口径以 `internal-docs/02-system-constraints/FACT-BASELINE.md` 为准；架构口径以 `internal-docs/00-knowledge-base/wss-two-tier-chain-status-2026-07-09.md` 为准。示例中的账号 ID、域名、凭据均为占位符。
+> 数字口径以 `engineering/02-system-constraints/FACT-BASELINE.md` 为准；架构口径以 `engineering/00-knowledge-base/map.md` 为准。示例中的账号 ID、域名、凭据均为占位符。
 
 ---
 
@@ -234,4 +234,4 @@
 | 完整部署/运维/排查             | 第 5 章（部署解决方案 — 使用 — 问题排查）            |
 | 生产私有化 API + 凭据 KMS 加密 | 第 12 章                                             |
 | 十万级规模化与生产红线         | 第 14 章                                             |
-| 权威数字来源                   | `internal-docs/02-system-constraints/FACT-BASELINE.md` |
+| 权威数字来源                   | `engineering/02-system-constraints/FACT-BASELINE.md` |

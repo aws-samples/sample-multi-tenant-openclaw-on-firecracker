@@ -47,6 +47,7 @@ def build_lambdas(self, ctx):
     recipient_keys_table = getattr(ctx, "recipient_keys_table", None)
     tenant_idp_table = getattr(ctx, "tenant_idp_table", None)
     version_snapshots_table = getattr(ctx, "version_snapshots_table", None)  # #217 V2
+    image_jobs_table = getattr(ctx, "image_jobs_table", None)  # #394 step1 pull Job
     tenant_secrets_table = getattr(ctx, "tenant_secrets_table", None)
     tenant_stats_table = getattr(ctx, "tenant_stats_table", None)
     tenants_table = getattr(ctx, "tenants_table", None)
@@ -223,8 +224,12 @@ def build_lambdas(self, ctx):
             # producer; content_based_deduplication=True is a safety net for
             # any future producer that forgets to pass one.
             content_based_deduplication=True,
-            # 可见性超时 ≥ consumer 处理时长(launch ~6s);留足够重试窗口
-            visibility_timeout=Duration.seconds(180),
+            # #411/6.4 — 可见性超时必须【严格大于】consumer Lambda timeout,否则 Lambda
+            # 超时那一刻消息刚好重新可见、而远端 SSM 可能仍在跑 → 重投与在途操作叠加
+            # (codex round5#231)。#422 codex round2 #6 — consumer timeout 提到 900s(覆盖
+            # suspend 同步 backup 900s 预算),visibility 同步提到 960s = 900s + 60s 余量
+            # (沿用仓库 "timeout+60s" 惯例)。非重动作处理完即删,不受影响。
+            visibility_timeout=Duration.seconds(960),
             dead_letter_queue=sqs.DeadLetterQueue(
                 max_receive_count=5, queue=lifecycle_dlq
             ),
@@ -248,6 +253,7 @@ def build_lambdas(self, ctx):
         "PARAM_REGISTRY_TABLE": param_registry_table.table_name,
         "RECIPIENT_KEYS_TABLE": recipient_keys_table.table_name,
         "VERSION_SNAPSHOTS_TABLE": version_snapshots_table.table_name,  # #217 V2
+        "IMAGE_JOBS_TABLE": image_jobs_table.table_name,  # #394 step1 pull Job
         "ASSETS_BUCKET": assets_bucket.bucket_name,
         "NOTIFICATIONS_TOPIC_ARN": notifications_topic_arn,
         "ROOTFS_PREFIX": CFG["s3"]["rootfs_prefix"],
@@ -295,6 +301,14 @@ def build_lambdas(self, ctx):
     }
     if tenant_stats_enabled:
         _api_env["TENANT_STATS_TABLE"] = tenant_stats_table.table_name
+    # #368/#422 — api Lambda(及复用 _api_env 的 lifecycle consumer)恢复/备份列表读桶
+    # (_resolve_backup / list_backups / list_all_backups)读 `BACKUP_BUCKET or ASSETS_BUCKET`;
+    # 此前只有 backup Lambda 拿到 BACKUP_BUCKET(见 :1481),api Lambda 缺 → 永远回退 assets 桶
+    # → 恢复必 404、备份清单永远空(#368 RPO 兜底断裂)。备份写在 WORM+CMK 的专用桶,读也必须
+    # 指向它。backup_bucket 可能未建(getattr None),判空 fail-safe(不建桶的部署不注入,读侧
+    # 仍回退 assets,与旧行为一致)。IAM 读权限在下方 grant(:523 附近)。
+    if backup_bucket is not None:
+        _api_env["BACKUP_BUCKET"] = backup_bucket.bucket_name
 
     api_fn = _lambda.Function(
         self,
@@ -371,6 +385,31 @@ def build_lambdas(self, ctx):
     version_snapshots_table.grant_read_data(api_fn)  # #217 V2 — pull-image 只读快照
     # #376 — create_image_snapshot 落新快照:只加 PutItem(最小权限,不给 Delete/Update)。
     version_snapshots_table.grant(api_fn, "dynamodb:PutItem")
+    # #394 — delete_image_snapshot 是【软删】(status=deleted 标记),用 UpdateItem 打标而非
+    # 物删,故加 UpdateItem。不给 DeleteItem(软删不物理删,记录留档可审计/可恢复)。
+    version_snapshots_table.grant(api_fn, "dynamodb:UpdateItem")
+    # #394 step1 — pull Job 记录:api_fn 建/读/推进 Job(含两个 GSI 的 Query)。
+    # 不给 DeleteItem:Job 记录由 TTL(expires_at)回收,控制面无删除路径。
+    image_jobs_table.grant_read_write_data(api_fn)
+    # #394 — 两处 TransactWriteItems 都要显式授权(否则条件在测试里对、生产 AccessDenied):
+    #  · Pull admission:snapshot ConditionCheck + Job Put(→ 每次 pull 都 JOB_RECORD_UNAVAILABLE);
+    #  · codex NB2 canary 租户固定:snapshot ConditionCheck + tenant Put(→ canary 建租户 AccessDenied)。
+    # 真机实测教训:除 TransactWriteItems 外还必须显式给 **ConditionCheckItem** —— 事务里的
+    # ConditionCheck 项按【被检查表】单独鉴权,缺它报
+    # "not authorized to perform: dynamodb:ConditionCheckItem on .../openclaw-version-snapshots"。
+    # resources 覆盖三张表:version-snapshots(被 ConditionCheck)+ image-jobs + tenants(被 Put)。
+    # #412 — 新增 hosts 表:dispatch reserve(_reserve_batch_txn)+ 令牌释放(_release_reservation
+    # / poller)都用 TransactWriteItems 原子写 hosts+tenants;grant_read_write_data 不含
+    # TransactWriteItems,漏加会运行时 AccessDenied(与上面 #394 同类坑,moto/mock 测不出)。
+    api_fn.add_to_role_policy(iam.PolicyStatement(
+        actions=["dynamodb:TransactWriteItems", "dynamodb:ConditionCheckItem"],
+        resources=[
+            version_snapshots_table.table_arn,
+            image_jobs_table.table_arn,
+            tenants_table.table_arn,
+            hosts_table.table_arn,
+        ],
+    ))
 
     if tenant_stats_enabled:
         tenant_stats_fn = _lambda.Function(
@@ -494,6 +533,12 @@ def build_lambdas(self, ctx):
         ],
     )
     assets_bucket.grant_read(api_fn)
+    # #368/#422 — api Lambda 读备份专用桶(恢复下载 restore_backup_key + 备份清单)。此前
+    # 只 backup_bucket.grant_read_write(backup_fn)(:1492),api_fn 对 backups 桶零权限 →
+    # 即使 BACKUP_BUCKET env 指对了,IAM 也拒读 → 恢复 404。grant_read 只读(恢复不写备份桶,
+    # 写由 backup Lambda 负责);判空与 env 注入对称。
+    if backup_bucket is not None:
+        backup_bucket.grant_read(api_fn)
 
     # 控制面重构阶段1 — 把队列 URL 注入 api Lambda(产端:create/start/stop/delete
     # 入队)+ 建 consumer Lambda(同 handler 代码,SQS 事件触发,reserved
@@ -553,7 +598,14 @@ def build_lambdas(self, ctx):
                     ],
                 ),
             ),
-            timeout=Duration.seconds(180),
+            # #411/6.4 — consumer 必须活到能看完最慢的同步动作。
+            # #422 codex round2 #6 — suspend/restore 走 consumer 同步执行,最坏链路远超原
+            # 360s:suspend 同步 RequestResponse invoke backup Lambda(其 timeout=900s,见
+            # backup_fn :1496)+ stop-vm(30s)+ rm(30s);restore 同步 _ssm_run launch(300s)。
+            # 360s 会把合法执行硬杀在中途、卡中间态(suspending/restoring)。提到 Lambda 上限
+            # 900s 覆盖最坏 backup 预算(与 delete 的删前备份同款同步 invoke,既有已接受模式);
+            # 队列 visibility(:232)同步提到 >900s 防重投叠加。rebuild(300s)等旧动作不受影响。
+            timeout=Duration.seconds(900),
             memory_size=2048,
             # 限流阀:consumer 并发上限 = SSM/host 可承受速率(削峰核心)
             reserved_concurrent_executions=_consumer_reserved,
@@ -584,6 +636,31 @@ def build_lambdas(self, ctx):
         # 带模板/凭据注入的租户 replay 时 AccessDenied → 穿窄 except → 重试进
         # DLQ → 永久卡 creating/queued(默认可达:lifecycle_queue+create_via_queue 均默认开)。
         param_registry_table.grant_read_write_data(lifecycle_consumer)
+        # #394 codex NB2 —— consumer replay 走 create_tenant 的 canary 分支时,
+        # _persist_tenant_record 用 TransactWriteItems(snapshot ConditionCheck + tenant Put)
+        # 把"租户固定版本"与"删快照"线性化。与上面 #264 同一类漏授权:api_fn 给了(:359)但
+        # consumer 漏 → 真机实测 AccessDeniedException(ConditionCheckItem on version-snapshots)
+        # → 穿 except → 消息重试进 DLQ → canary 租户永远建不出来(202 queued 后凭空消失)。
+        # 需要:snapshot 表读(resolve/校验)+ 事务两个 action 覆盖被检查表与被写表。
+        if version_snapshots_table is not None:
+            version_snapshots_table.grant_read_data(lifecycle_consumer)
+            lifecycle_consumer.add_to_role_policy(iam.PolicyStatement(
+                actions=["dynamodb:TransactWriteItems", "dynamodb:ConditionCheckItem"],
+                resources=[
+                    version_snapshots_table.table_arn,
+                    tenants_table.table_arn,
+                ],
+            ))
+        # #412 — 队列化 delete 在 lifecycle_consumer 里跑,dispatch 预留的租户走令牌化释放
+        # (_release_capacity_reservation:TransactWriteItems 扣 hosts + 清 tenants 令牌)。
+        # 与 snapshot 事务分开、无条件授权(hosts+tenants),漏加则 delete 消费令牌时 AccessDenied。
+        lifecycle_consumer.add_to_role_policy(iam.PolicyStatement(
+            actions=["dynamodb:TransactWriteItems"],
+            resources=[
+                hosts_table.table_arn,
+                tenants_table.table_arn,
+            ],
+        ))
         if clawpool_cmk is not None:
             clawpool_cmk.grant_encrypt(lifecycle_consumer)
             lifecycle_consumer.add_to_role_policy(
@@ -594,6 +671,12 @@ def build_lambdas(self, ctx):
             )
         assets_bucket.grant_read(lifecycle_consumer)
         assets_bucket.grant_put(lifecycle_consumer)
+        # #422 codex-blocker — suspend/restore 走 _async_actions 由 consumer 异步执行,
+        # consumer 复用 _api_env(含 BACKUP_BUCKET)但缺 IAM grant → _resolve_backup 读备份桶
+        # AccessDenied → suspend 停 VM/释放 slot 后消息重试、409 被 ack → 租户永久卡 suspending。
+        # 与 api_fn 的 backup_bucket.grant_read 对称补上(consumer 只读备份,写归 backup Lambda)。
+        if backup_bucket is not None:
+            backup_bucket.grant_read(lifecycle_consumer)
         lifecycle_queue.grant_consume_messages(lifecycle_consumer)
         # consumer emits the create-latency SLA metric on the create path.
         lifecycle_consumer.add_to_role_policy(
@@ -677,7 +760,13 @@ def build_lambdas(self, ctx):
         _lc_esm = lifecycle_consumer.add_event_source_mapping(
             "LifecycleQueueEsm",
             event_source_arn=lifecycle_queue.queue_arn,
-            batch_size=10,
+            # #411/6.4 codex(round3) — batch_size=1(原 10)。原来一个 invocation 串行处理
+            # 10 条:两个各 ~300s 的 rebuild 就超过 consumer 360s 硬超时,invocation 被杀 →
+            # 已完成的前几条副作用在重投时重放;且 503 后继续处理同组后续消息 = FIFO 组内
+            # 乱序(rebuild 失败被后到的 stop/start 越过)。每次只取 1 条:单条最长 = rebuild
+            # 300s < 360s 有余量,失败重投的就是那一条、天然不越序。吞吐由 consumer 的
+            # reserved concurrency(不同租户不同 MessageGroup 并发)保证,不受 batch_size 影响。
+            batch_size=1,
             report_batch_item_failures=True,
             enabled=True,
         )
@@ -758,7 +847,13 @@ def build_lambdas(self, ctx):
         default_cors_preflight_options=apigw.CorsOptions(
             allow_origins=apigw.Cors.ALL_ORIGINS,
             allow_methods=apigw.Cors.ALL_METHODS,
-            allow_headers=["Content-Type", "x-api-key", "Authorization"],
+            # #394 — If-Match(cleanup-canary 的 CAS)、Idempotency-Key(promote/
+            # cleanup 的幂等键)是浏览器眼中的自定义请求头,不在 allow-headers 里就会被 CORS
+            # 预检拦掉 → 请求根本到不了 Lambda(前端只看到 "discard failed",Lambda 无日志)。
+            allow_headers=[
+                "Content-Type", "x-api-key", "Authorization",
+                "If-Match", "Idempotency-Key",
+            ],
         ),
     )
 
@@ -1062,6 +1157,15 @@ def build_lambdas(self, ctx):
     rsa_pubkey_resource = api.root.add_resource("clawpool-rsa-public-key")
     rsa_pubkey_resource.add_method("GET", _li(), **key_required)
 
+    # #389 v2 块5 — bootstrap 版本切换(admin-only,handler 内 identity 门)。
+    #   GET  /bootstrap/versions   列 host+edge 可切换版本 + 各 fleet 当前启动摘要
+    #   POST /bootstrap/promote    切到某个已存在的 S3 bootstrap 版本(传 sha256,不传脚本内容)
+    bootstrap_resource = api.root.add_resource("bootstrap")
+    bootstrap_versions_resource = bootstrap_resource.add_resource("versions")
+    bootstrap_versions_resource.add_method("GET", _li(), **key_required)
+    bootstrap_promote_resource = bootstrap_resource.add_resource("promote")
+    bootstrap_promote_resource.add_method("POST", _li(), **key_required)
+
     hosts_resource = api.root.add_resource("hosts")
     hosts_resource.add_method("GET", _li(), **key_required)
     hosts_resource.add_method("POST", _li(), **key_required)
@@ -1079,6 +1183,20 @@ def build_lambdas(self, ctx):
     # #309 — POST /hosts/{instance_id}/copy-file-from-s3:单文件 S3→EC2(目标限资产目录白名单)。
     copy_file_resource = host_resource.add_resource("copy-file-from-s3")
     copy_file_resource.add_method("POST", _li(), **key_required)
+    # #394 step5 — 同步槽位操作(admin-only,handler 内 identity 门):只改 host 上 slots.json
+    # 一个小文件,不搬盘,故走同步 200(不需要 progress 轮询)。
+    promote_canary_resource = host_resource.add_resource("promote-canary")
+    promote_canary_resource.add_method("POST", _li(), **key_required)
+    # #394 —— 无 rollback-image 路由:回滚 = pull 老版到 live(pull-image,快路径秒级翻指针)。
+    # #394 — POST /hosts/{instance_id}/reclaim-images:回收无人引用的版本目录(手动 prune)。
+    reclaim_images_resource = host_resource.add_resource("reclaim-images")
+    reclaim_images_resource.add_method("POST", _li(), **key_required)
+    # #394 — GET /hosts/{instance_id}/image-slots:真机实读 host 磁盘镜像状态(slots.json +
+    # versions/),DDB 镜像的权威对照。viewer 可读(handler 内不额外 admin 门,只读)。
+    # #394 —— 无 DELETE image-slots/canary(cleanup-canary 已移除,精简 API):放弃 canary 靠下次
+    # pull 覆盖 / promote 清空,不再提供显式清指针接口。
+    image_slots_resource = host_resource.add_resource("image-slots")
+    image_slots_resource.add_method("GET", _li(), **key_required)
 
     backups_resource = api.root.add_resource("backups")
     backups_resource.add_method("GET", _li(), **key_required)
@@ -1087,6 +1205,11 @@ def build_lambdas(self, ctx):
     # (per-tenant data snapshot reuses GET /tenants/{id}/{action} action=data)
     images_resource = api.root.add_resource("images")
     images_resource.add_method("GET", _li(), **key_required)
+    # #394 — POST /delete-image-snapshot: 软删一条快照记录(引用保护 → 409 IMAGE_VERSION_IN_USE)。
+    # body {snapshot_time},与 create-image-snapshot 对称(不用 path 带冒号的 ISO 时间)。
+    # 只标 status=deleted,不动 S3 镜像文件。operator+。
+    delete_snapshot_resource = api.root.add_resource("delete-image-snapshot")
+    delete_snapshot_resource.add_method("POST", _li(), **key_required)
 
     # #337(原#217 /snapshots)— GET /list_image_versions: 列镜像版本快照(time+label+count),
     # console 选 snapshot_time 拉。改名避免与 /images(列镜像文件)混淆。
@@ -1218,6 +1341,16 @@ def build_lambdas(self, ctx):
     )
     tenants_table.grant_read_write_data(health_fn)
     hosts_table.grant_read_write_data(health_fn)
+    # #412 — reaper 对带 capacity_reservation_id 的卡 creating 租户走令牌化释放
+    # (creating→failed + 扣 hosts 账本 + 清令牌一个 TransactWriteItems)。
+    # grant_read_write_data 不含 TransactWriteItems,漏加则 reaper 释放时 AccessDenied。
+    health_fn.add_to_role_policy(iam.PolicyStatement(
+        actions=["dynamodb:TransactWriteItems"],
+        resources=[
+            hosts_table.table_arn,
+            tenants_table.table_arn,
+        ],
+    ))
     audit_table.grant_write_data(health_fn)
     assets_bucket.grant_read(health_fn)  # 1.3.1: list backups for failover
     if notifications_topic is not None:

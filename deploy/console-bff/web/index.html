@@ -481,72 +481,39 @@
     <div x-show="page==='tenants'" class="page-content">
       <h2>🖥 Tenants Management</h2>
       <div class="flex-layout">
-        <!-- Hosts -->
+        <!-- 左列:Image Snapshot(与 Hosts 同宽 330px)在上,Hosts (Group) 在下 -->
         <div class="hosts-panel">
-          <div class="panel-header">
-            <span class="panel-title">Hosts (Group)</span>
+          <!-- #394 — Image Snapshot 移入左列,与 Hosts 对齐;窄栏用紧凑竖排(非宽表格)。
+               Take snapshot / Pull all(live)在此;per-host canary 在各 host 卡片。 -->
+          <div class="panel-header" style="margin-bottom: 8px">
+            <span class="panel-title">🖼 Image Snapshot</span>
           </div>
-          <!-- #217 V2 — 版本区:纵向两行,避免横向挤成一行折行(旧布局标题+下拉+按钮挤丑)。
-               行1:只读 "Latest snapshot"(fleet 最新快照,完整不折行);
-               行2:版本选择控件条(下拉 + Pull all),仅 operator+(canWrite)显示,viewer 不渲染。 -->
-          <div style="padding: 0 4px 8px">
-            <!-- #376 — 行0:打一版镜像快照(等价 snapshot-version.sh),group 级,置于
-                 "Latest snapshot" 之上;打完刷新下拉。operator+ 才显示。 -->
-            <template x-if="canWrite()">
+          <div
+            style="font-size: 11px; color: var(--gray); margin: -4px 0 8px 2px"
+            :title="'Fleet 最新快照:'+(latestSnapshot||'—')"
+          >
+            latest: <span style="color: var(--text)" x-text="latestSnapshot||'—'"></span>
+          </div>
+          <!-- 工具条(窄栏竖排):Take snapshot;版本下拉 + Pull all → live -->
+          <template x-if="canWrite()">
+            <div style="display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px">
               <button
                 class="btn-act"
-                style="
-                  display: inline-flex;
-                  align-items: center;
-                  gap: 4px;
-                  font-size: 11px;
-                  white-space: nowrap;
-                  margin-bottom: 6px;
-                "
+                style="display: inline-flex; align-items: center; gap: 4px; font-size: 11px; white-space: nowrap; align-self: flex-start"
                 title="Take a version snapshot of the assets bucket (equivalent to snapshot-version.sh)"
                 @click="takeSnapshot()"
               >
                 <svg class="icon s13"><use href="#i-restore" /></svg>
                 <span>Take snapshot</span>
               </button>
-            </template>
-            <!-- 行1:只读最新快照 -->
-            <div
-              style="
-                font-size: 12px;
-                color: var(--gray);
-                white-space: nowrap;
-                overflow: hidden;
-                text-overflow: ellipsis;
-                margin-bottom: 6px;
-              "
-              :title="'Fleet 最新快照(各 host 当前版本见卡片 snapshot 行):'+(latestSnapshot||'—')"
-            >
-              Latest snapshot:
-              <span
-                style="color: var(--text)"
-                x-text="latestSnapshot||'—'"
-              ></span>
-            </div>
-            <!-- 行2:版本选择 + Pull all(operator+ 才显示) -->
-            <template x-if="canWrite()">
-              <div style="display: flex; align-items: center; gap: 6px">
+              <div style="display: flex; gap: 6px; align-items: center">
                 <select
                   x-model="selectedSnapshot"
-                  style="
-                    flex: 1;
-                    min-width: 0;
-                    font-size: 11px;
-                    background: var(--bg);
-                    color: var(--text);
-                    border: 1px solid var(--border);
-                    border-radius: 4px;
-                    padding: 3px 6px;
-                  "
-                  title="Pick a snapshot version to pull to all hosts"
+                  style="flex: 1; min-width: 0; font-size: 11px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 3px 6px"
+                  title="Pick a snapshot version to pull to all hosts (live)"
                 >
                   <option value="">Snapshot version…</option>
-                  <template x-for="s in snapshots" :key="s.snapshot_time">
+                  <template x-for="s in pullableSnapshots" :key="s.snapshot_time">
                     <option
                       :value="s.snapshot_time"
                       x-text="s.snapshot_time + (s.label ? ' ('+s.label+')' : '')"
@@ -555,22 +522,48 @@
                 </select>
                 <button
                   class="btn-act"
-                  style="
-                    display: inline-flex;
-                    align-items: center;
-                    gap: 4px;
-                    font-size: 11px;
-                    white-space: nowrap;
-                    flex-shrink: 0;
-                  "
-                  title="Pull the selected snapshot to all hosts (fleet-wide pull-image)"
+                  style="display: inline-flex; align-items: center; gap: 3px; font-size: 11px; white-space: nowrap; flex-shrink: 0"
+                  title="Pull the selected snapshot to all hosts as their LIVE image (fleet-wide pull-image)"
                   @click="pullSnapshotToAll()"
                 >
                   <svg class="icon s13"><use href="#i-download" /></svg>
                   <span>Pull all</span>
                 </button>
               </div>
+            </div>
+          </template>
+          <!-- 紧凑竖排:每个快照一行(time+label 一行,in-use + Delete 一行)。 -->
+          <template x-if="snapshots.length === 0">
+            <div style="font-size: 11px; color: var(--gray); margin-bottom: 10px">No snapshots yet — “Take snapshot”.</div>
+          </template>
+          <div style="display: flex; flex-direction: column; margin-bottom: 14px; max-height: 260px; overflow-y: auto">
+            <template x-for="s in snapshots" :key="s.snapshot_time">
+              <div class="snap-row" :style="s.status === 'deleted' && 'opacity: 0.55'">
+                <div style="flex: 1; min-width: 0">
+                  <!-- 主行:label(主标识)+ deleted 标记;次行:时间戳(mono,弱化)+ 使用中。 -->
+                  <div style="font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: flex; align-items: center; gap: 5px">
+                    <span x-text="s.label || '(no label)'"></span>
+                    <span x-show="s.status === 'deleted'" class="snap-tag-deleted">deleted</span>
+                    <template x-if="snapshotUsage(s.snapshot_time)">
+                      <span class="snap-tag-use" x-text="snapshotUsage(s.snapshot_time)"></span>
+                    </template>
+                  </div>
+                  <div style="font-family: monospace; font-size: 10px; color: var(--gray); white-space: nowrap; overflow: hidden; text-overflow: ellipsis" x-text="s.snapshot_time"></div>
+                </div>
+                <!-- 已软删的快照不再显示删除按钮(已经 deleted,没有可删的动作)。 -->
+                <button
+                  x-show="canWrite() && s.status !== 'deleted'"
+                  class="btn-act danger"
+                  style="font-size: 10px; flex-shrink: 0"
+                  :disabled="snapshotInUse(s.snapshot_time)"
+                  :title="snapshotInUse(s.snapshot_time) ? ('host 槽位仍引用: '+snapshotUsage(s.snapshot_time)+' — 先 repoint/rebuild 再删') : '软删该快照记录(仍被 host 槽位或租户引用时后端会 409 拒绝)'"
+                  @click="deleteSnapshot(s.snapshot_time)"
+                >🗑</button>
+              </div>
             </template>
+          </div>
+          <div class="panel-header">
+            <span class="panel-title">Hosts (Group)</span>
           </div>
           <template x-if="hosts.length === 0 && !loadingHosts">
             <div class="empty">No hosts</div>
@@ -745,7 +738,7 @@
                         "
                         title="Pick a snapshot version to pull to this host"
                       >
-                        <template x-for="s in snapshots" :key="s.snapshot_time">
+                        <template x-for="s in pullableSnapshots" :key="s.snapshot_time">
                           <option
                             :value="s.snapshot_time"
                             x-text="s.snapshot_time + (s.label ? ' ('+s.label+')' : '')"
@@ -773,29 +766,172 @@
                       </button>
                     </div>
                   </template>
-                  <!-- #309 — pull-image 进度:host 处于 upgrading 时,poll 循环持续拉
-                       /tmp/<job_id>.txt 末行,inline 显示实时状态。放在 pull 行之下。
-                       只读,所有角色可见。 -->
-                  <div
-                    class="host-row"
-                    x-show="h.status === 'upgrading'"
-                    style="gap: 6px; margin-top: 4px; align-items: flex-start"
-                  >
-                    <span class="host-label">progress</span>
-                    <span
-                      style="
-                        flex: 1;
-                        min-width: 0;
-                        font-size: 11px;
-                        line-height: 1.4;
-                        color: var(--cyan);
-                        white-space: normal;
-                        word-break: break-word;
-                      "
-                      :title="pullProgress[h.instance_id] || 'installing…'"
-                      x-text="pullProgress[h.instance_id] || 'installing…'"
-                    ></span>
-                  </div>
+                  <!-- #394 — 按 VM 灰度【流水线】UI:把散落的 canary 按钮做成 1→2→3→4 四步,
+                       每步显示序号 + 当前所在步高亮,按钮 enabled/disabled 反映"你在哪一步"。
+                       canWrite 可做 1/2;promote/rollback/discard(3/4)admin-only。 -->
+                  <template x-if="canWrite()">
+                    <div class="canary-pipe" @click.stop>
+                      <div class="canary-pipe-head" style="align-items: flex-start">
+                        <span class="panel-title" style="font-size: 12px">🕯 Canary Pipeline</span>
+                        <span style="display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0">
+                          <!-- #394 — 真机实读:点它 SSM 读 host 盘上真实 slots.json + versions/(DDB 镜像滞后时对照真相)。 -->
+                          <button
+                            class="btn-act"
+                            style="font-size: 10px; padding: 1px 5px"
+                            title="Read the host's REAL on-disk image state (slots.json + versions/) via SSM — authoritative vs the DDB mirror"
+                            @click.stop="refreshHostDiskSlots(h.instance_id)"
+                          >↻ disk</button>
+                          <span x-show="hostDiskSlots[h.instance_id]" style="font-size: 10px; color: var(--cyan)"
+                                x-text="hostDiskSlots[h.instance_id] ? (hostDiskSlots[h.instance_id].installed_versions.length + ' on disk') : ''"></span>
+                        </span>
+                      </div>
+                      <!-- slot 状态:live / canary / previous_live 各占一行(DDB 镜像),gen 附在末行。 -->
+                      <div x-show="h.image_slots" style="margin: 4px 0 6px; display: flex; flex-direction: column; gap: 1px">
+                        <div class="slot-row">
+                          <span class="slot-pill live">live</span>
+                          <span class="slot-ver" x-text="snapshotLabel(hostLiveSlot(h)) || '—'"></span>
+                        </div>
+                        <div class="slot-row" x-show="hostCanary(h)">
+                          <span class="slot-pill canary">canary</span>
+                          <span class="slot-ver" x-text="snapshotLabel(hostCanary(h))"></span>
+                        </div>
+                        <div class="slot-row" x-show="hostPrevLive(h) && hostPrevLive(h) !== hostLiveSlot(h)">
+                          <span class="slot-pill prev">prev</span>
+                          <span class="slot-ver" x-text="snapshotLabel(hostPrevLive(h))"></span>
+                        </div>
+                        <div class="slot-row" x-show="hostSlotGen(h) !== ''" style="opacity: 0.5">
+                          <span class="slot-pill" style="border-color: transparent">gen</span>
+                          <span class="slot-ver" x-text="hostSlotGen(h)"></span>
+                        </div>
+                      </div>
+                      <!-- #394 — host 盘上已装的版本列表(点 ↻ disk 后显示):每个版本一行,
+                           带角色 pill(live/canary/prev/orphan),一眼看出哪些在用、哪些可回收。 -->
+                      <div x-show="hostDiskSlots[h.instance_id] && hostDiskSlots[h.instance_id].installed_versions.length"
+                           style="margin: 2px 0 8px; display: flex; flex-direction: column; gap: 1px">
+                        <span style="font-size: 10px; color: var(--gray); opacity: 0.7">on disk:</span>
+                        <template x-for="v in (hostDiskSlots[h.instance_id] ? hostDiskSlots[h.instance_id].installed_versions : [])" :key="v">
+                          <div class="slot-row"
+                               :title="v + (v === hostLiveSlot(h) ? ' (live)' : v === hostCanary(h) ? ' (canary)' : v === hostPrevLive(h) ? ' (previous_live)' : ' (unreferenced — reclaimable)')">
+                            <span class="slot-pill"
+                                  :class="v === hostLiveSlot(h) ? 'live' : v === hostCanary(h) ? 'canary' : v === hostPrevLive(h) ? 'prev' : 'orphan'"
+                                  x-text="v === hostLiveSlot(h) ? 'live' : v === hostCanary(h) ? 'canary' : v === hostPrevLive(h) ? 'prev' : '—'"></span>
+                            <span class="slot-ver" :style="!(v === hostLiveSlot(h) || v === hostCanary(h) || v === hostPrevLive(h)) && 'opacity: 0.55'" x-text="snapshotLabel(v)"></span>
+                          </div>
+                        </template>
+                      </div>
+
+                      <!-- Step 1 — Pull canary (装候选版本到 canary 槽) -->
+                      <div class="canary-step" :class="canaryStage(h) === 1 && 'canary-step-active'">
+                        <span class="canary-num" :class="hostCanary(h) && 'canary-num-done'" x-text="hostCanary(h) ? '✓' : '1'"></span>
+                        <div class="canary-step-body">
+                          <div class="canary-step-title">Pull canary <span style="color: var(--gray); font-weight: 400">— 装候选镜像到 canary 槽(不影响 live 租户)</span></div>
+                          <div style="display: flex; gap: 6px; margin-top: 3px">
+                            <select
+                              :value="canarySnapFor(h.instance_id)"
+                              @change="canarySnapChoice[h.instance_id] = $event.target.value"
+                              style="flex: 1; min-width: 0; font-size: 11px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 3px 6px"
+                              title="Pick a snapshot to install into this host's canary slot"
+                            >
+                              <template x-for="s in pullableSnapshots" :key="s.snapshot_time">
+                                <option :value="s.snapshot_time" x-text="s.snapshot_time + (s.label ? ' ('+s.label+')' : '')"></option>
+                              </template>
+                            </select>
+                            <button
+                              class="btn-act"
+                              style="display: inline-flex; align-items: center; gap: 4px; font-size: 11px; white-space: nowrap; flex-shrink: 0"
+                              :title="'Install '+canarySnapFor(h.instance_id)+' into this host\'s canary slot (live tenants unaffected)'"
+                              @click.stop="pullCanaryToHost(h.instance_id)"
+                            ><svg class="icon s13"><use href="#i-download" /></svg><span>Pull</span></button>
+                          </div>
+                        </div>
+                      </div>
+
+                      <!-- Step 2 — Create canary tenant (在该 host 起固定到候选版本的验证 VM) -->
+                      <div class="canary-step" :class="canaryStage(h) === 2 && 'canary-step-active'">
+                        <span class="canary-num" x-text="'2'"></span>
+                        <div class="canary-step-body">
+                          <div class="canary-step-title">Create canary tenant <span style="color: var(--gray); font-weight: 400">— 起验证 VM 跑候选版本</span></div>
+                          <button
+                            class="btn-act"
+                            style="font-size: 11px; white-space: nowrap; margin-top: 3px"
+                            :disabled="!hostCanary(h)"
+                            :title="hostCanary(h) ? ('Create a validation tenant booting canary '+hostCanary(h)) : 'Pull a canary first (step 1)'"
+                            @click.stop="createCanaryTenant(h.instance_id)"
+                          >+ Create canary tenant</button>
+                        </div>
+                      </div>
+
+                      <!-- Step 3 — Promote(验证通过 → canary 成为 live)。admin。
+                           回滚不在此处:用上方 pull 选老版到 live(本地已装则秒级翻指针,不重新下载)。 -->
+                      <div class="canary-step" :class="canaryStage(h) === 2 && isAdmin() && 'canary-step-active'" x-show="isAdmin()">
+                        <span class="canary-num" x-text="'3'"></span>
+                        <div class="canary-step-body">
+                          <div class="canary-step-title">Promote <span style="color: var(--gray); font-weight: 400">— 验证通过,canary 成为 live(回滚 = 用上方 pull 选老版到 live)</span></div>
+                          <div style="display: flex; gap: 6px; margin-top: 3px; flex-wrap: wrap">
+                            <button
+                              class="btn-act"
+                              style="font-size: 11px"
+                              :disabled="!hostCanary(h)"
+                              :title="hostCanary(h) ? ('Promote canary '+hostCanary(h)+' to live') : 'No canary staged — do step 1 first'"
+                              @click.stop="promoteCanary(h.instance_id)"
+                            >⬆ Promote canary</button>
+                          </div>
+                        </div>
+                      </div>
+
+                      <!-- Step 4 — Cleanup:删验证租户 + 回收无人引用的旧版本释放盘。
+                           未提升的 canary 无需显式 discard:下次 pull canary 会覆盖该槽,promote 也会清空它。 -->
+                      <div class="canary-step">
+                        <span class="canary-num" x-text="'4'"></span>
+                        <div class="canary-step-body">
+                          <div class="canary-step-title">Cleanup <span style="color: var(--gray); font-weight: 400">— 删验证租户;回收无人引用的旧版本释放盘</span></div>
+                          <div style="display: flex; gap: 6px; margin-top: 3px; flex-wrap: wrap">
+                            <button
+                              class="btn-act danger"
+                              style="font-size: 11px"
+                              :disabled="canaryTenantsOnHost(h.instance_id).length === 0"
+                              :title="canaryTenantsOnHost(h.instance_id).length ? ('Delete '+canaryTenantsOnHost(h.instance_id).length+' canary validation tenant(s) on this host') : 'No canary validation tenants to clean up'"
+                              @click.stop="deleteCanaryTenants(h.instance_id)"
+                            >🗑 Delete canary tenant<span x-show="canaryTenantsOnHost(h.instance_id).length > 1" x-text="' ('+canaryTenantsOnHost(h.instance_id).length+')'"></span></button>
+                            <button
+                              x-show="isAdmin()"
+                              class="btn-act danger"
+                              style="font-size: 11px"
+                              :disabled="!hostLiveSlot(h)"
+                              :title="hostLiveSlot(h) ? 'Reclaim disk: delete versions/ dirs NOT referenced by live/canary/previous_live or any running tenant' : 'No live version on this host — reclaim refused (pull an image first)'"
+                              @click.stop="reclaimImages(h.instance_id)"
+                            >♻ Reclaim old versions</button>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </template>
+                  <!-- #309/#394 — pull-image 进度:host upgrading(live pull)或有在飞的 canary
+                       pull job 时显示。poll 循环持续拉进度末行,inline 实时状态。只读,所有角色可见。
+                       用 hr 分隔线 + 明确标出这是哪个操作的进度(pull→live / pull→canary),
+                       避免和上面的 Canary Pipeline 混在一起看不清归属。 -->
+                  <template x-if="h.status === 'upgrading' || canaryJob[h.instance_id]">
+                    <div style="margin-top: 8px">
+                      <hr style="border: none; border-top: 1px dashed var(--border); margin: 0 0 6px" />
+                      <!-- 标题独占一行(不再与进度文本 inline,避免 label 与时间戳重叠);进度文本换行显示在下方。 -->
+                      <div style="display: flex; flex-direction: column; gap: 2px">
+                        <span style="font-size: 11px; font-weight: 600; color: var(--cyan)"
+                              x-text="canaryJob[h.instance_id] ? '⏳ pull → canary' : '⏳ pull → live'"></span>
+                        <span
+                          style="
+                            font-size: 11px;
+                            line-height: 1.4;
+                            color: var(--cyan);
+                            opacity: 0.85;
+                            white-space: normal;
+                            word-break: break-word;
+                          "
+                          :title="pullProgress[h.instance_id] || 'installing…'"
+                          x-text="pullProgress[h.instance_id] || 'installing…'"
+                        ></span>
+                      </div>
+                    </div>
+                  </template>
                 </div>
               </template>
             </div>
@@ -1035,10 +1171,21 @@
                     </td>
                     <td x-text="t.guest_ip || '-'"></td>
                     <td x-text="t.host_port || '-'"></td>
-                    <td
-                      style="font-size: 11px; color: var(--gray)"
-                      x-text="t.rootfs_version||'-'"
-                    ></td>
+                    <!-- #394 — Rootfs 列同时显示镜像 channel/版本,方便 debug 灰度:
+                         canary 租户显橙色 canary 徽章 + 固定的 image_snapshot_time;
+                         live/旧租户显 rootfs 版本(跑 host 当前 live)。 -->
+                    <td style="font-size: 11px; color: var(--gray)">
+                      <div x-text="t.rootfs_version||'-'"></div>
+                      <template x-if="t.image_channel === 'canary'">
+                        <div style="margin-top: 1px">
+                          <span style="color: var(--orange); font-weight: 600">canary</span>
+                          <span style="opacity: 0.8" x-text="t.image_snapshot_time ? ('@'+snapshotLabel(t.image_snapshot_time)) : ''"></span>
+                        </div>
+                      </template>
+                      <template x-if="t.image_channel === 'live' || !t.image_channel">
+                        <div style="opacity: 0.6" x-text="'live'"></div>
+                      </template>
+                    </td>
                     <td>
                       <span
                         class="health-dot"
@@ -3906,6 +4053,25 @@ openclaw_vm_disk_used_pct &gt; 90</pre
               ></option>
             </template>
           </select>
+          <!-- #394 — image channel: live (default) or canary (validate a candidate
+               image). Canary requires a pinned host that has a canary slot staged. -->
+          <label
+            >Image channel
+            <span class="opt">canary = validate a candidate image (needs a pinned host with a canary slot)</span></label
+          >
+          <select
+            x-model="form.image_channel"
+            class="settings-input"
+            style="margin-bottom: 14px"
+          >
+            <option value="live">live (default)</option>
+            <option value="canary">canary</option>
+          </select>
+          <template x-if="form.image_channel === 'canary' && !form.preferred_host_id">
+            <div style="color: var(--orange); font-size: 11px; margin: -8px 0 12px">
+              ⚠ canary requires a Target host above (the canary slot only exists on the host you pulled it to)
+            </div>
+          </template>
           <label
             >Tags
             <span class="opt">optional — one per line, key:value</span></label

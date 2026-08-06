@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # secrets.sh — 凭据/密钥泄漏扫描(第一层机械门 · 命根子)。
 #
-# 为什么是命根子:真实账号 ID/活 API key 进库是不可逆泄漏,
+# 为什么是命根子:本仓踩过账号 ID/活 API key 进库(memory engineering-consolidation-2026-07-01),
 # 铁律 #5 脱敏红线。所以这条**不允许因工具没装就 skip**:gitleaks 在就用 gitleaks(规则全),
 # 不在就用内置正则兜底扫(覆盖 AWS AKID/私钥/常见 token)。
 #
@@ -22,7 +22,7 @@ if have gitleaks; then
   [ -f "$CK_ROOT/.gitleaks.toml" ] && cfg="--config $CK_ROOT/.gitleaks.toml"
   # 扫整个工作区目录(默认:leaks found → exit 1,干净 → exit 0)。allowlist 在 .gitleaks.toml。
   # shellcheck disable=SC2086
-  if gitleaks dir "$CK_ROOT" --no-banner --redact $cfg >/tmp/ck-gitleaks.log 2>&1; then
+  if (cd "$CK_ROOT" && gitleaks dir . --no-banner --redact $cfg >/tmp/ck-gitleaks.log 2>&1); then
     ck_ok "gitleaks:无泄漏"
   else
     ck_bad "gitleaks 发现疑似凭据(已 redact):"
@@ -33,12 +33,13 @@ else
   # ── 内置正则兜底(gitleaks 未装也扫,绝不 skip)──────────────
   ck_warn "gitleaks 未装,用内置正则兜底扫(建议装 gitleaks 拿全规则:brew install gitleaks)"
   hits=0
-  # 只扫变更集/全量的文本文件,排除本脚本自身与 fixtures 与文档示例
+  # 只扫变更集/全量的文本文件,排除本脚本自身与 fixtures。
+  # Markdown 也必须扫:skill/运行手册曾出现真实测试密码。
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     case "$f" in
       scripts/checks/*) continue;;                 # 别扫到自己的正则
-      *.md|*.svg) continue;;                        # 文档/图里的示例不算泄漏(单独脱敏门管)
+      *.svg) continue;;                             # 图由发布脱敏门处理
     esac
     # AKID(AKIA/ASIA + 16 大写数字)、私钥头、Slack/GitHub token、通用 secret 赋值
     m="$(grep -nE \

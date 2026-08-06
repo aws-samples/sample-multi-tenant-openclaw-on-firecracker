@@ -2,19 +2,20 @@
 
 > This chapter is arranged by **test → rollout → production**, covering the hard constraints that must be respected when running toward 100k microVMs. It **does not repeat** [Chapter 13 · Data-plane two-tier routing](13-data-plane-redesign.md) (architecture) or [Chapter 11 · Component Ops Manual](11-ops-maintenance.md) (day-to-day metrics). It answers three questions: how to make a load test count, how to roll out safely, and which lines never move in production.
 >
-> Scale baseline: `internal-docs/00-knowledge-base/the data-plane design/the requirements doc.md § 2` (100k microVMs · ~300 hosts · 300k concurrent WS).
+> Scale baseline: `engineering/00-knowledge-base/SPEC/11-ENGINE-TRANSFORM/01-REQUIREMENTS.md § 2` (100k microVMs · ~300 hosts · 300k concurrent WS).
 
 ---
 
-## 14.1 Test phase · full-load 380 per host + adversarial cases
+## 14.1 Test phase · capacity profiles + adversarial cases
 
-**Hard requirement** : real-host tests must drive **380 microVMs per host at full load** and include **adversarial cases**, not just happy path.
+380 tenants per host is a 2 GB/VM target profile, not the repository default or a measured hard ceiling. The repository defaults to 4096 MB/VM, and the current primary measurement is 187 fully healthy nodes with a disk bottleneck. Declare VM memory, data disk, host disk/IOPS, and recovery margin before selecting a profile; every profile includes adversarial cases.
 
 ### Full-load pressure
 
-- **Per-host ceiling**: `r8g.metal-24xl` supports 380 microVMs (2 GB/VM × 380 = 760 GB, matches the 768 GB memory). Test plan: `internal-docs/00-knowledge-base/the data-plane design/the test plan.md`.
+- **Default profile**: 4096 MB/VM; use the 187-node measurement as existing evidence and do not extrapolate it to 380.
+- **380 target profile**: run only with an explicit 2048 MB/VM configuration after validating disk, IOPS, balloon, and recovery margin. A pass validates the target profile; it does not create a production hard ceiling.
 - **Four tests that block issue-close** (missing any goes to backlog, not "done"):
-  1. **Steady state** — 380 microVMs running, SSE holds 30 min without dropouts.
+  1. **Steady state** — every microVM in the selected profile is running, with WebSocket connections held for 30 minutes without drops.
   2. **Bursty create** — 300 create/s into SQS dispatch; verify the SSM per-instance concurrency stays under the ceiling ( measured: 40 concurrent create hit `TimedOut`, `memory: loadtest-380-ssm-concurrency-bottleneck`).
   3. **Single-AZ down** — kill one AZ of edge + host mixed load; verify the other two AZs absorb traffic and `az_failover` migrates tenants (`config.yml:health_check.az_failover`).
   4. **conntrack near cap** — drive edge + host to `nf_conntrack_max=1048576` neighborhood; verify no packet loss. Edge: `install-edge.sh:131`. Host: `init-host.sh:85-99`.
@@ -23,25 +24,27 @@
 
 Iron law #11 mandates test intensity scales with blast radius on isolation / delete / auth-affecting changes. Minimum coverage:
 
-- **Cross-tenant** — A presents B's tenant_id with A's gateway_token → gateway 401 (EncryptionContext mismatch, `kms:Decrypt` rejects).
-- **Token expiry** — after the 900 s TTL, `GET /tenants/{id}/token` returns 410; no plaintext obtainable.
+- **Cross-tenant** — A requests B's ciphertext or decrypts with the wrong
+  `tenant_id` encryption context. The platform backend must receive a local KMS
+  `Decrypt` failure and must not open a gateway connection.
+- **Credential persistence** — `openclaw-tenant-secrets` explicitly disables TTL. Scale-out, rebuild, and recovery must reuse the original token/device ciphertext through owner/admin-gated tenant details or `/credentials`.
 - **Redis brownout** — kill primary; during the 15-30 s failover the edge serves stale from L2 (60 s TTL). Live drill: `aws elasticache test-failover --replication-group-id openclaw-routes --node-group-id 0001`.
 - **Port bitmap race** — two host-agent workers alloc concurrently; the `route_ops.alloc_and_dnat_atomic` three-step atomic must prevent collisions.
 - **Descriptor drift** — construct DDB descriptor without matching iptables DNAT (or vice versa); `_probe_all` must alarm and self-heal.
 
 ### Evidence
 
-All test results must land in `internal-docs/00-knowledge-base/evidence/` — no traces = not tested (the ops guide test discipline).
+All test results must land in `engineering/evidence/` — no traces = not tested (CLAUDE.md test discipline).
 
 ---
 
 ## 14.2 Rollout phase · canary rolling + staged bring-up
 
-**Core discipline** : do not `min_capacity=1` and start hosts before the golden image is ready. **Correct order: min=0 → bake image → then scale up.**
+**Core discipline** (memory `goal-restructure-and-deploy-uswest2-2026-06-30`): do not `min_capacity=1` and start hosts before the golden image is ready. **Correct order: min=0 → bake image → then scale up.**
 
 ### Cold-start order (fresh region)
 
-1. **VPC and networking first** — `./setup.sh <region> <profile>` runs `deploy/stack.py:_build_vpc(mode=self_managed)` (self-managed /20 + 3 AZ + 3 NAT GW). At this point `host_asg` **min=0**, `edge_asg` **min=0**.
+1. **VPC and networking first** — `./setup.sh <region> <profile>` uses `deploy/stacks/network_vpc.py` to build the self-managed VPC. CIDR, AZ count, and NAT count come from `config.yml`; example values are not hard-coded guarantees.
 2. **Bake the image** — `build-rootfs.sh --arch arm64`, or in-stack CodeBuild (`image.build_in_stack=true`). Wait for the rootfs in S3.
 3. **Scale hosts to minimum** — set `config.yml:asg.min_capacity=2`, re-run `setup.sh`. The rootfs is already in S3, so hosts won't Heartbeat-Timeout-replace (burned on this: `memory: uswest2-deploy-deadlock-and-fixes`).
 4. **Scale edge to min=3** — set `config.yml:edge.enabled=true` + `edge.min_capacity=3`, re-run `setup.sh`. Edge userdata polls `/healthz` to 200 before CONTINUE (`install-edge.sh:170-183` warmup gate); the ASG lifecycle hook only lets the instance take traffic once it truly routes.
@@ -57,7 +60,7 @@ All test results must land in `internal-docs/00-knowledge-base/evidence/` — no
 **stack.py change** (IaC structure, DDB schema, IAM):
 
 - Edit `stack.py` → `setup.sh` runs a CFN update.
-- **Irreversible changes** (drop a DDB table / flip RemovalPolicy · alter a security guardrail SG/IAM/credential · alter Guardrail) go through the shared-files protocol serial + human review.
+- **Irreversible changes** (drop a DDB table / flip RemovalPolicy · alter a security guardrail SG/IAM/credential · alter Guardrail) go through SHARED-FILES-PROTOCOL serial + human review.
 - All DDB tables are `RETAIN` by default (especially `tenants` / `audit` / `tenant-secrets`); take a snapshot before drop (iron law #4).
 
 ### Cutting over the data plane (hub-WS → two-tier route)
@@ -126,7 +129,7 @@ Once in production, establish drills — don't wait for real incidents. Recommen
 | CloudFront long-idle cap | **Quarterly** | Hold an idle WS 200 s — observe whether CloudFront cuts at 180 s — verify client-heartbeat SDK deployment |
 | Guardrail intercept sampling | **Monthly** | Sample OWASP top-10 through the guardrail — 14/14 blocked is baseline — any regression escalates |
 
-All drill results land in `internal-docs/00-knowledge-base/evidence/`.
+All drill results land in `engineering/evidence/`.
 
 ---
 
@@ -134,6 +137,6 @@ All drill results land in `internal-docs/00-knowledge-base/evidence/`.
 
 - Architecture: [Chapter 13 · Data-plane two-tier routing](13-data-plane-redesign.md).
 - Component ops (alert thresholds, scaling triggers, troubleshooting): [Chapter 11 · Component Ops Manual](11-ops-maintenance.md).
-- Private API hardening: [Chapter 12 · Private API Gateway](12-private-api-hardening.md).
-- HA audit (15 components, fixed vs still-single): [`internal-docs/00-knowledge-base/the data-plane design/HA-AUDIT-DRAFT.md`](../../internal-docs/00-knowledge-base/the data-plane design/HA-AUDIT-DRAFT.md).
-- Handover (new-engineer onramp): [`internal-docs/03-collaboration/HANDOVER.md`](../../internal-docs/03-collaboration/HANDOVER.md).
+- Private API hardening: [Chapter 12 · Private API Gateway](../aws-guide/12-private-api-hardening.md).
+- HA audit (15 components, fixed vs still-single): [`engineering/00-knowledge-base/SPEC/11-ENGINE-TRANSFORM/HA-AUDIT-DRAFT.md`](../../engineering/00-knowledge-base/SPEC/11-ENGINE-TRANSFORM/HA-AUDIT-DRAFT.md).
+- Handover (new-engineer onramp): [`engineering/03-collaboration/HANDOVER.md`](../../engineering/03-collaboration/HANDOVER.md).

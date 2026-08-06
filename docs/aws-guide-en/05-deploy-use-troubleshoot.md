@@ -6,7 +6,7 @@ Before you deploy this solution, review the architecture and the planning consid
 
 This section describes the deployment entry points, configuration files, and recommended order of execution for the solution.
 
-The deployment code for this solution comprises four parts: an infrastructure definition built on the AWS Cloud Development Kit (AWS CDK) (`deploy/app.py` and `deploy/stack.py`, with the stack entry split into domain modules under `deploy/stacks/`), the host and microVM lifecycle scripts (`deploy/userdata/*.sh`), the golden image build script (`build-rootfs.sh`), and the opt-in data-plane edge components (`deploy/edge/`, the OpenResty edge nginx/Lua and bootstrap script).
+The deployment code comprises the AWS Cloud Development Kit (AWS CDK) entry point `deploy/app.py`, the orchestrator in `deploy/stack.py` and domain builders under `deploy/stacks/`; host and microVM lifecycle scripts under `deploy/userdata/`; the golden-image builder `build-rootfs.sh`; and the opt-in OpenResty edge under `deploy/edge/`.
 
 The AWS CDK entry point `deploy/app.py` reads `region` from context (defaults to `us-east-1`), instantiates `OpenClawOrchestratorStack`, and takes the account from the `CDK_DEFAULT_ACCOUNT` environment variable. The central configuration file `config.yml` defines, in one place, the host specification, microVM defaults, the Auto Scaling Group (ASG), Balloon memory reclamation, health checks, Multi-AZ, and Amazon Cognito authentication. The deployment commands are wrapped in `setup.sh`.
 
@@ -21,7 +21,7 @@ The recommended deployment order is:
 
 This section describes how to deploy the control plane and network infrastructure of the solution.
 
-The entire infrastructure is defined in the `OpenClawOrchestratorStack` class in `deploy/stack.py`. The core of the deployment command is a single `cdk deploy` line with a region parameter:
+`OpenClawOrchestratorStack` in `deploy/stack.py` invokes the storage, Lambda, compute, network, edge, authentication, and observability builders under `deploy/stacks/`. `OpenClawImageStack` in `deploy/stacks/image.py` manages the separate golden-image build. The core deployment command is:
 
 ```bash
 cdk deploy -c region="<region>" --profile "<profile>" --require-approval never
@@ -120,7 +120,7 @@ This section describes host bootstrap, the tenant microVM launch flow, and the r
 
 After a new host is launched by the ASG, `init-host.sh` bootstraps in the following order: configure KVM permissions, harden the host, install tools and Firecracker, mount the data volume, download images (rootfs and vmlinux), sync shared skills from S3, deploy the lifecycle scripts, and finally register with the `openclaw-hosts` table.
 
-EC2 user-data has a hard 16 KB limit, whereas `init-host.sh` is about 23 KB after injection. AWS CDK embeds `base64(gzip(init-host.sh))` into a small pure-ASCII bootstrap that decodes the script to `/tmp/init-host.sh` and executes it. When troubleshooting bootstrap failures, the file actually running is `/tmp/init-host.sh`, not the user-data original; `/var/log/cloud-init-output.log` records the bootstrap decode and init-host execution logs.
+EC2 user-data has a 16 KB limit, so `init-host.sh` is no longer embedded. CDK publishes the rendered script to the immutable S3 key `deployment/bootstrap/host/<sha256>/init-host.sh`; the Launch Template contains only a small bootstrap. A new host installs or discovers the architecture-matched AWS CLI, downloads the object, verifies the full SHA-256, atomically installs `/var/lib/cloud/init-host.sh`, and executes it. Download, digest, or script failure completes the ASG lifecycle action as `ABANDON`. Troubleshoot with `/var/log/openclaw-bootstrap.log` and `/var/log/cloud-init-output.log`.
 
 Key points of host bootstrap:
 

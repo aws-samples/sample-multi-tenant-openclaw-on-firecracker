@@ -8,8 +8,8 @@
 #      让本平台签发含 custom:tenant_user_id/platform_id 的 id_token。
 #   3) 打印 marketplace.html / broker 需要的配置值(entryDomain/entryClientId/redirectUri/…)。
 #
-# 前置:AWS_PROFILE 指向能在日本 region 建 Cognito 的凭据(见本地配置,不入库)。
-# 幂等:重复跑先查已存在再建。凭据/pool-id 输出到 stdout,自己写进本地配置,别提交。
+# 前置:AWS_PROFILE 指向能在日本 region 建 Cognito 的凭据(见 CLAUDE.local.md,不入库)。
+# 幂等:重复跑先查已存在再建。凭据/pool-id 输出到 stdout,自己写进 CLAUDE.local.md,别提交。
 #
 # 状态:骨架脚本。真跑需有效日本 region 凭据 + 本平台 ClawPool 的 upstream IdP 写权限。
 # 未真跑前标「待真机」(ADR 档 A 五步链条 step 4)。
@@ -53,7 +53,7 @@ ENTRY_DOMAIN="https://${DOMAIN_PREFIX}.auth.${REGION}.amazoncognito.com"
 ENTRY_ISSUER="https://cognito-idp.${REGION}.amazonaws.com/${POOL_ID}"
 
 echo
-echo "== marketplace.html / broker 配置(写进本地配置,勿提交)=="
+echo "== marketplace.html / broker 配置(写进 CLAUDE.local.md,勿提交)=="
 echo "  DEMO_CFG.entryDomain   = ${ENTRY_DOMAIN}"
 echo "  DEMO_CFG.entryClientId = ${CLIENT_ID}"
 echo "  DEMO_CFG.redirectUri   = ${CALLBACK}"

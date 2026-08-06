@@ -9,7 +9,7 @@
 #   → host scale。评审拍板走这条路。
 #
 # 使用 (在 setup.sh 里):
-#   REGION=ap-southeast-1 PROFILE=<aws-profile> bash deploy/lib/mint-shared-vkey.sh
+#   REGION=ap-southeast-1 PROFILE="${AWS_PROFILE}" bash deploy/lib/mint-shared-vkey.sh
 #
 # 环境变量 hook(单测/幂等控制):
 #   REGION            — AWS region(必填)

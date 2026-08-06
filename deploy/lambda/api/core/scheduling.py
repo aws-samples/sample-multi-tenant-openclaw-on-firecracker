@@ -22,7 +22,24 @@ import core.clients as clients
 
 
 def _scale_out():
-    """Increment ASG desired capacity by 1 (capped at max)."""
+    """Bump ASG desired capacity toward covering the pending backlog, but only
+    for capacity that is not already on the way (#341).
+
+    Old behavior was an unconditional `desired += 1` on every no-capacity
+    create. A metal host is slow to boot and only registers in the hosts table
+    after init-host.sh finishes, so N creates arriving in the cold-start window
+    each fired their own +1 — over-provisioning N-1 empty hosts that one booting
+    host would have absorbed (真机 2026-07-21: 3 creates → 4 hosts, 3 idle).
+
+    Fix: count in-flight ASG capacity = desired - registered(active/idle) hosts.
+    A positive value means a host is already booting but not yet in the ledger,
+    so it will absorb this pending tenant — skip the redundant +1. Only bump when
+    no un-registered host is coming (in_flight <= 0). This makes concurrent
+    no-capacity creates idempotent: the first raises desired, the rest see the
+    booting host in-flight and don't stack. Capacity safety is unchanged — the
+    create-path CAS (_reserve_slot) still gates actual placement; this only stops
+    cost waste. Fail-safe: on any read error fall back to the old +1 (better to
+    over-provision than strand a pending tenant with no host coming)."""
     try:
         resp = clients.asg_client.describe_auto_scaling_groups(
             AutoScalingGroupNames=[clients.ASG_NAME]
@@ -30,16 +47,70 @@ def _scale_out():
         group = resp["AutoScalingGroups"][0]
         desired = group["DesiredCapacity"]
         max_size = group["MaxSize"]
-        if desired < max_size:
-            clients.asg_client.set_desired_capacity(
-                AutoScalingGroupName=clients.ASG_NAME,
-                DesiredCapacity=desired + 1,
-            )
-            print(f"ASG scaled out: {desired} → {desired + 1}")
-        else:
+        if desired >= max_size:
             print(f"ASG at max capacity ({max_size}), cannot scale out")
+            return
+        try:
+            registered = _registered_host_count()
+            in_flight = desired - registered
+        except Exception as e:
+            # Fail-safe: the ledger read failed but ASG state is known. Fall back
+            # to the old unconditional +1 rather than strand a pending tenant with
+            # no host coming — over-provisioning is cheaper than a stuck tenant.
+            print(f"Scale out: registered-host count unavailable ({e}); bumping +1")
+            registered, in_flight = -1, 0
+        if in_flight > 0:
+            # A host is already booting (ASG desired counts it, hosts table
+            # doesn't yet) — it will absorb this pending tenant. Don't stack.
+            print(
+                f"ASG scale-out skipped: {in_flight} host(s) already in flight "
+                f"(desired={desired}, registered={registered})"
+            )
+            return
+        clients.asg_client.set_desired_capacity(
+            AutoScalingGroupName=clients.ASG_NAME,
+            DesiredCapacity=desired + 1,
+        )
+        print(
+            f"ASG scaled out: {desired} → {desired + 1} "
+            f"(registered={registered}, no host in flight)"
+        )
     except Exception as e:
         print(f"Scale out error: {e}")
+
+
+def _registered_host_count():
+    """Count hosts already registered as active/idle in the ledger (#341).
+
+    These are hosts whose init-host.sh finished and wrote their DDB row, so they
+    can serve tenants now. ASG desired minus this count = hosts still booting
+    (in flight). Strong read so a sibling create's just-registered host is seen
+    and we don't double-count it as still-missing. On error the caller's
+    try/except falls back to the old unconditional +1 (fail-safe).
+
+    Paginates through LastEvaluatedKey: a DynamoDB Scan returns at most 1MB per
+    call, and openclaw-hosts accumulates `deleted` rows over its lifetime. A
+    single Scan page could hold only part of the table, undercount active/idle,
+    falsely see in-flight capacity, and permanently skip legitimate scale-out —
+    stranding pending tenants. The FilterExpression is applied server-side AFTER
+    the 1MB read, so pagination is required even though the match set is small.
+    Same discipline as scaler/handler.py _has_pending_tenants."""
+    kwargs = {
+        "FilterExpression": "#s IN (:a, :i)",
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {":a": "active", ":i": "idle"},
+        "ConsistentRead": True,
+        "ProjectionExpression": "instance_id",
+    }
+    count = 0
+    resp = clients.hosts_table.scan(**kwargs)
+    count += len(resp.get("Items", []))
+    while resp.get("LastEvaluatedKey"):
+        resp = clients.hosts_table.scan(
+            ExclusiveStartKey=resp["LastEvaluatedKey"], **kwargs
+        )
+        count += len(resp.get("Items", []))
+    return count
 
 
 # ========== Helpers ==========

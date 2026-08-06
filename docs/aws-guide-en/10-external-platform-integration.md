@@ -1,87 +1,133 @@
-# External Platform Integration Guide (from the customer's perspective)
+# External Platform Integration
 
-This section is for **customers who want to integrate ClawPool into their own platform** (a trading platform, a secondhand marketplace, any SaaS). By the end you will be able to give every one of your platform's free users a dedicated AI assistant (an independent openclaw), entirely through your own account system, with the user never touching any underlying console.
+This chapter is for customers integrating ClawPool into a SaaS product, trading
+platform, or enterprise portal. The current path is:
 
-> ⚠️ **Note (superseded): the identity approach in this chapter has changed — use only the "backend create-on-behalf + platform-issued session token" path**
->
-> This chapter was originally written against the Amazon Cognito federation ADR (`ADR-dataplane-external-saas-auth`, Track A). That federation approach was marked **SUPERSEDED** on 2026-07-07 (reason: the customer's OIDC does not support page-less login), and identity has converged on OpenClaw's native gateway authentication. The integration path that is **still valid and recommended** today:
->
-> - **Tenant activation**: your backend holds the `x-api-key` that ClawPool issued to you and calls `POST /tenants` on the user's behalf (`owner_id` + `tenant_user_id` attribution: see §2), optionally scoping by `platform_id`. This control-plane path is live.
-> - **Real-time chat**: the data plane goes through two-tier routing (platform backend WebSocket gateway → edge → microVM gateway). The first hop uses **your platform's self-issued session token** (an HS256 JWT, not a Cognito `id_token`); the second hop uses OpenClaw's native Ed25519 device authentication. It no longer goes through `POST /hub/token` + `wss /hub/ws` (the hub has been removed). See chapter 13, _Data-plane two-tier routing_.
->
-> Everything below that describes "federating your IdP into ClawPool's Cognito User Pool", "Pre-Token-Generation claim injection", or "exchanging tokens via `/hub/token`" belongs to the superseded approach and is kept only to explain the evolution — do not build against it.
+- The customer platform owns end-user identity, login, and sessions.
+- The customer backend calls the ClawPool control plane to manage tenants.
+- The browser connects only to the customer platform `/gw/ws`.
+- The customer backend holds each tenant's gateway token and Ed25519 device
+  private key and connects to the microVM.
 
-> Positioning distinction: the previous section, the _Control Plane API Integration_, is a **per-endpoint reference**; this section is an **integration approach and steps** — how your platform should connect, how to thread authentication, and how users use it. The term "the platform / ClawPool" refers to the integratee (which provides the openclaw pool), and "your platform" refers to the integrator (the customer's own platform).
+The earlier design that federated the customer IdP into ClawPool Cognito and
+exchanged hub tokens is retired.
 
-## 1. What It Looks Like After Integration
+## 1. Responsibility Boundary
 
-- Your users log in on **your own platform** with **your own account** (they do not register a new ClawPool account).
-- A user "activates the AI assistant" inside your platform → **your backend** spins up a dedicated openclaw microVM for that user.
-- The user enters the AI assistant interface (embedded under your domain) → real-time chat.
-- Each user's openclaw is isolated from the others; one user cannot see another user's sessions/data.
+| Responsibility | Customer platform | ClawPool |
+| --- | --- | --- |
+| End-user registration, login, session | Owns | Never receives user passwords |
+| Purchase, quota, refund, deactivation | Owns | Receives lifecycle calls |
+| User-to-tenant mapping | Creates and stores | Stores `owner_id`, `tenant_user_id`, `platform_id` |
+| Browser real-time entry | `/gw/ws` | No hub-token exchange |
+| Second-hop authentication | Holds and decrypts tenant credentials | Verifies gateway token and Ed25519 device |
+| microVM, scheduling, image, backup | No | Owns |
 
-## 2. Three Integration Decisions (settle these three first)
+## 2. Control Plane Identity
 
-**① How to connect identity (federation first)**
-Register your platform's IdP (OIDC or SAML) as an upstream IdP of ClawPool's single Cognito User Pool. When your users log in they authenticate through your IdP, and Cognito federation issues a JWT that ClawPool trusts. **You do not need to import users into ClawPool, nor do you need a ClawPool account system** — the trust root remains ClawPool's Cognito, but the user identity comes from you. If your platform has no independent IdP, you can also simply use the Cognito app client that ClawPool allocates to you for username/password login (the simplest).
+Every control plane request carries `x-api-key`, but the API key is only an API
+Gateway usage-plan identifier, not standalone authentication. Writes also need
+one of these deployment contracts:
 
-**② Who creates the tenant (your backend creates it on the user's behalf, not user self-service)**
-The user clicks "activate the AI assistant" → your frontend calls **your backend** with the user's JWT → your backend, holding the `x-api-key` that ClawPool issued to you, calls `POST /tenants`. This way you can insert your own **purchase / billing / quota** logic before activation, and the user does not create nodes directly. ClawPool provides the self-service registration endpoint `POST /tenants/self`, but **going through backend-side creation is recommended** to preserve your commercial gating.
+1. A valid operator/admin Cognito Bearer token.
+2. An explicitly trusted private deployment with
+   `console_auth.default_no_jwt_role=operator|admin`, protected by IAM SigV4, a
+   private API resource policy, or a Lambda authorizer.
 
-> **Note** Tenant ownership takes one of two paths — pick one by how you call, and **do not mix them**. **Path 1 · api-key-only create-on-behalf (recommended, simplest)**: the request carries only `x-api-key` (no user Bearer), and you pass `owner_id` (the user's `sub` in ClawPool's Cognito, a UUID) and `tenant_user_id` (your platform's stable user id) directly in the body; the control plane validates them and persists. **Path 2 · forward the user's `id_token`**: the request carries `x-api-key` plus the user's Bearer `id_token` (federation-issued), and ownership is derived automatically from the token (`sub` → `owner_id`, the `custom:tenant_user_id` claim → `tenant_user_id`); **on this path the body must NOT carry those two fields — if it does, the create returns 403** (the owner may only come from a verified token, preventing a node from being created under someone else's name). `platform_id` may be passed in the body on **either** path (optional, matching `^[a-zA-Z0-9._-]{1,128}$`; tags the owning platform when an external platform creates on behalf of its users; see `tenant_service.py:252` / `core/utils.py:110`).
->
-> **`tenant_user_id` is a data-attribution label, not an authorization credential**: it does not take part in chat/lifecycle authorization decisions (authorization goes through `owner_id`/`authorized_users`), but once you stamp a `tenant_user_id` onto a tenant, any federated-login user holding the same `custom:tenant_user_id` claim can list that tenant's metadata (no credentials) via `GET /users/{tenant_user_id}/tenants` — stamping the field means you allow that user to see this list. Use a **globally unique** user id (prefix it with your platform, e.g. `yourplatform:12345`); different platforms using the same bare numeric id would otherwise see each other's same-numbered users' node lists.
+Use a platform-scoped API key/authorizer in production so a caller is limited to
+its own `platform_id`. Never expose an API key or control plane Bearer token to
+the browser.
 
-**③ Where to put the AI assistant interface (embed it in your domain)**
-The AI assistant frontend (chat UI) is embedded under your domain, and the user enters seamlessly from your logged-in session (no redirect to an unfamiliar domain). The frontend uses the federation-issued JWT to exchange for a real-time chat token. ClawPool provides a reference implementation (Hosted UI + authorization_code + PKCE + refresh, federation-ready).
+## 3. User Attribution
 
-## 3. Integration Steps
+The customer platform maintains:
 
-**Step 1 · Register your platform**
-Contact ClawPool operations and provide: your IdP metadata (OIDC issuer + JWKS URL, or SAML metadata), your `platform_id`, and callback URLs. On the ClawPool side: register your IdP as a Cognito upstream provider + configure Pre-Token-Generation to inject `custom:tenant_user_id`/`custom:platform_id` + issue you an `x-api-key` (used for backend-side tenant creation, kept server-side, kept out of the frontend).
+- `owner_id`: a UUID used by the control plane owner gate.
+- `tenant_user_id`: the stable customer-platform user id; prefix it with the
+  platform name.
+- `platform_id`: the platform namespace.
 
-**Step 2 · Wire up federated login on the frontend**
-Your frontend initiates an `authorization_code + PKCE` login to the Cognito Hosted UI, carrying `identity_provider=<your platform_id>` to jump straight to your IdP (skipping the selector). After logging in, the user obtains an `id_token` containing `custom:tenant_user_id`/`custom:platform_id`.
+`tenant_user_id` is attribution and query data, not an authorization credential.
+The backend must derive all three values from a verified platform session and
+must not trust browser-supplied owner or platform values.
 
-**Step 3 · Backend creates the tenant on the user's behalf**
+## 4. Activation
 
+```text
+Browser -> customer backend: activate assistant
+customer backend:
+  1. verify platform session
+  2. run purchase/quota checks
+  3. POST /tenants with control-plane credentials
+  4. poll GET /tenants/{id}
+  5. return readiness only
 ```
-User clicks activate → your frontend POSTs your backend (Bearer <user id_token>)
-Your backend: ① validate the id_token (federation-issued, JWKS signature verification) ② run your purchase/quota gate
-             ③ hold x-api-key, call POST {CTRL_API}/tenants (no user Bearer)
-                body: {name, client_token:<idempotency key>,
-                       owner_id:<the user's Cognito sub>, tenant_user_id:<your platform's user id>,
-                       platform_id:<your platform id>}
-             ④ poll GET {CTRL_API}/tenants/{id} until status:running
-             ⑤ return {tenant_id, status} to the frontend
+
+Example:
+
+```json
+{
+  "name": "assistant-user-123",
+  "client_token": "market:user-123",
+  "owner_id": "11111111-2222-3333-4444-555555555555",
+  "tenant_user_id": "market:user-123",
+  "platform_id": "market"
+}
 ```
 
-Use `<platform_id>:<user id>` for `client_token` to guarantee idempotent repeat activation for the same user (no double creation).
+With `client_token`, the ID has shape `t-<16hex>`. `creating`, `pending`, and
+`queued` are not completion. Poll until `status=running`; require
+`app_health=up` when application readiness is needed.
 
-> **Important** For "manage a fleet by user" (Step 5) and "the user sees their own nodes in the chat UI" to work, the attribution fields must land at create time: on the api-key-only path **pass `owner_id` + `tenant_user_id` explicitly in the body** (as above); on the forward-the-id_token path ownership is derived automatically from the token. Give neither and the tenant lands under the system sentinel — the user's `GET /tenants` will not list it and `GET /users/{tenant_user_id}/tenants` will not find it. The reference implementation `console/marketplace-demo/broker/handler.py` shows the overall flow skeleton; treat this section's convention as authoritative.
+## 5. Chat
 
-**Step 4 · Enter the AI assistant**
-The user clicks "enter the AI assistant" → jumps to the chat UI under your domain → your backend calls `GET {CTRL_API}/tenants/{id}` to fetch the tenant's gateway token and device-credential KMS ciphertexts and decrypts them locally → the chat UI opens `wss {your platform backend}/gw/ws?token=` with your platform session token (an HS256 JWT) → your platform backend, acting as the WS client, completes the Ed25519 device handshake with the microVM gateway through the edge → chats. See chapter 13, _Data-plane two-tier routing_, for the full chain.
+```text
+Browser
+  -> wss://<customer-platform>/gw/ws?token=<platform-session-token>
+  -> customer backend
+  -> /ws/{tenant_id}
+  -> CloudFront -> ALB -> OpenResty -> host DNAT
+  -> microVM gateway :18789
+```
 
-**Step 5 · Manage by user**
+The customer backend:
 
-- Query all AI assistants of a given user: `GET {CTRL_API}/users/{tenant_user_id}/tenants`
-- That user's node summary: `GET {CTRL_API}/users/{tenant_user_id}/summary`
-- Batch stop/start (e.g. when the user unsubscribes): `POST {CTRL_API}/users/{tenant_user_id}/action {action:stop}`
+1. Verifies the platform session and selects a tenant from server-side data.
+2. Calls `GET /tenants/{id}` or `/credentials` for gateway/device ciphertext.
+3. Decrypts in process with the correct KMS context or recipient envelope.
+4. Completes Ed25519 `connect.challenge` signing and gateway-token auth.
+5. Maps `chat.send` and `reply_delta` / `reply` / `reply_error`.
 
-## 4. Isolation and Security Guarantees (the promise to your users)
+The browser never receives ClawPool credentials. The retired `/hub/token`,
+`/hub/ws`, `/channel-token`, and hub file endpoints do not exist.
 
-- **Cross-user isolation**: each user's openclaw is an independent microVM (an independent kernel); user A cannot access user B's sessions/data/nodes. The real-time channel has three gates: the token is bound to a single tenant + matching by the server-validated user identity + authorization looks up the server-side ledger (it never trusts the client's self-report).
-- **Your users' credentials never leave your platform**: user passwords stay only in your IdP / your own account system; on the ClawPool side the data plane accepts only your platform session token plus device authentication, and never touches your users' passwords.
-- **Data-plane credentials are held server-side**: each tenant's gateway token and device private key are envelope-encrypted with AWS KMS (encryption context bound to `tenant_id`/`owner_id`) and are decrypted and held by your platform backend — never sent down to the browser; the frontend only ever holds your platform session token.
-- **Credential custody**: the `x-api-key` used for backend-side creation is a server-side credential; never put it in the frontend, and rotate it regularly.
+## 6. Per-User Operations
 
-## 5. Multi-region
+- `GET /users/{tenant_user_id}/tenants`: list the user's tenants.
+- `GET /users/{tenant_user_id}/summary`: summarize by state.
+- `POST /users/{tenant_user_id}/action`: batch start/stop.
+- `POST /external/authz`: in external-authorization mode, write HMAC-signed
+  grant/revoke updates.
 
-Your platform and the ClawPool pool need not be in the same region. The control-plane API is simply called cross-region; the first hop of the data plane lands on your own platform backend, so you decide where it is deployed.
+Owner, platform-scope, and RBAC checks still apply.
 
-## 6. Reference Implementation
+## 7. Security Requirements
 
-`console/marketplace-demo/` (a development test bed, not shipped with the product) provides a minimal runnable integration reference: a secondhand marketplace SPA (`marketplace.html`) + backend-side creation (`broker/handler.py`) + a federation configuration script (`setup-federation.sh`) + a test matrix (`TESTPLAN.md`). You can connect your own platform following its structure.
+- API keys, control plane Bearers, gateway tokens, and device private keys stay
+  in backend processes.
+- Never forward `GET /tenants/{id}` or `/credentials` responses to a browser.
+- KMS decrypt must use the exact `tenant_id` or `owner_id` context used at
+  encryption time.
+- Keep `client_token` stable so retries cannot create duplicates.
+- File support requires platform-side tenant authorization, MIME/size checks,
+  and Amazon S3 presigning.
+- Cross-Region calls need explicit timeouts, retries, and idempotency. Do not
+  treat a network timeout as proof that creation failed.
 
-> Status: the control-plane API (create/query/lifecycle/manage-by-user) is live and available. The external IdP federation + Pre-Token-Generation custom-claim injection this chapter originally described (`ADR-dataplane-external-saas-auth`, Track A) has been SUPERSEDED and is no longer an integration basis (see the notice at the top of this chapter); data-plane identity is device authentication plus your platform session token.
+## 8. Reference Implementation
+
+`engineering/backend/` demonstrates platform JWTs, `/gw/ws`, the control-plane
+client, and the device handshake. `console/marketplace-demo/` is a historical
+test bed and can still contain retired Cognito/hub scenarios; it is not the
+current contract. Before launch, use Chapter 9, OpenAPI, Chapter 13, and the
+target-environment regression suite.

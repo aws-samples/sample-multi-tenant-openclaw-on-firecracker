@@ -1,0 +1,4597 @@
+openapi: 3.1.0
+info:
+  title: OpenClaw on Firecracker — 控制面 API(ClawPool 多租户平台)
+  version: 1.6.0
+  description: |-
+    ClawPool 控制面 REST API(API Gateway + Lambda):租户 microVM 生命周期、宿主机/舰队、
+    镜像槽位、技能/分组/模板、联邦与外部授权。实时聊天数据面不属于本 API。
+
+    ## 在本页怎么试跑
+    本页默认走**同域只读代理**(`/api/cp-proxy`):后端代持 x-api-key,浏览器**零输入**即可对 GET 接口
+    点 Try it out 看真实返回;写操作(POST/PUT/DELETE)代理返回 405(公开页不做无鉴权写)。
+    要真跑写操作或连自己的部署 → 用页面上方「高级」填 ApiUrl + x-api-key。
+
+    ## 鉴权模型(直连真实控制面时)
+    1. **API key**(`x-api-key` 头)—— 每个控制面调用都过 API Gateway usage-plan;缺/错 → 403。
+    2. **Cognito JWT**(`Authorization: Bearer <id_token>`)—— 用户身份路由(如 `POST /tenants/self`),Lambda 内 JWKS RS256 验签。
+    3. **RBAC + owner 门控** —— 角色 viewer < operator < admin(来自 cognito:groups);按租户的路由额外校验 owner==调用者(或 admin / api-key)。
+
+    错误信封:较新的校验路径返回 `{"error","code"}`(code ∈ VALIDATION/CONFLICT/FORBIDDEN…);旧路径返回 `{"error"}`。
+servers:
+  - url: /api/cp-proxy
+    description: 本页默认同域只读代理(后端代持 x-api-key,GET 零输入试跑;写操作 405)。直连真实控制面/跑写操作请用页面「高级」填 ApiUrl + x-api-key。
+components:
+  securitySchemes:
+    apiKey:
+      type: apiKey
+      in: header
+      name: x-api-key
+      description: API Gateway usage-plan key. Required on every control-plane call.
+    cognitoJwt:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Cognito id_token (RS256, JWKS-verified in Lambda).
+  schemas:
+    TenantRecord:
+      type: object
+      description: |
+        A tenant record as returned by GET /tenants and GET /tenants/{id}. Secret fields (channel_secret, litellm_vkey, cognito_channel_password, gateway_token) are ALWAYS stripped by _redact_tenant before response. Numeric fields (vcpu/mem_mb/vm_num) are STRING-typed (DynamoDB N-as-S). Field set verified against a live ap-southeast-1 response (2026-07-07).
+      x-source: deploy/lambda/api/services/tenant_service.py:84 (_TENANT_SECRET_FIELDS redaction)
+      properties:
+        id:
+          type: string
+          description: Tenant id (name-hash or deterministic from client_token).
+        name:
+          type: string
+        status:
+          type: string
+          description: creating | pending | queued | running | stopped | deleted | requires_intervention
+        desired_status:
+          type: string
+          description: Reconciliation target status.
+        owner_id:
+          type: string
+          description: Cognito sub or API_KEY_OWNER.
+        tenant_user_id:
+          type:
+            - string
+            - 'null'
+          description: External-federation stable user id (from JWT custom claim).
+        uuid:
+          type: string
+        vcpu:
+          type: string
+          description: String-typed integer.
+        mem_mb:
+          type: string
+          description: String-typed integer.
+        vm_num:
+          type:
+            - string
+            - 'null'
+          description: Per-host VM slot number.
+        host_id:
+          type:
+            - string
+            - 'null'
+          description: Instance id of the placing host; null while queued/pending.
+        host_port:
+          type:
+            - string
+            - 'null'
+        guest_ip:
+          type:
+            - string
+            - 'null'
+        image_id:
+          type: string
+        config_template:
+          type:
+            - string
+            - 'null'
+        tags:
+          type: object
+          additionalProperties:
+            type: string
+        vm_health:
+          type:
+            - string
+            - 'null'
+          description: up | down | unknown
+        app_health:
+          type:
+            - string
+            - 'null'
+        health_failures:
+          type:
+            - string
+            - integer
+            - 'null'
+        last_health_check:
+          type:
+            - string
+            - 'null'
+        metrics:
+          type:
+            - object
+            - 'null'
+        created_at:
+          type:
+            - string
+            - 'null'
+        creation_started_at:
+          type:
+            - string
+            - 'null'
+        updated_at:
+          type:
+            - string
+            - 'null'
+        last_backup_at:
+          type:
+            - string
+            - 'null'
+        restore_backup_key:
+          type:
+            - string
+            - 'null'
+        dispatch_claim:
+          type:
+            - string
+            - 'null'
+          description: Dispatch consumer claim token (internal).
+        dispatch_claim_ts:
+          type:
+            - string
+            - 'null'
+        dispatch_retries:
+          type:
+            - string
+            - integer
+            - 'null'
+    HostRecord:
+      type: object
+      description: |
+        A Firecracker host record from GET /hosts. Capacity numbers are STRING-typed. Field set verified against a live ap-southeast-1 response (2026-07-07).
+      x-source: deploy/lambda/api/services/host_service.py:26
+      properties:
+        instance_id:
+          type: string
+        status:
+          type: string
+          description: active | draining
+        az:
+          type: string
+        private_ip:
+          type: string
+        total_vcpu:
+          type: string
+        used_vcpu:
+          type: string
+        total_mem_mb:
+          type: string
+        used_mem_mb:
+          type: string
+        vm_count:
+          type: string
+        next_vm_num:
+          type: string
+        rootfs_version:
+          type: string
+        cpu_overcommit_ratio:
+          type:
+            - string
+            - number
+        mem_overcommit_ratio:
+          type:
+            - string
+            - number
+        idle_since:
+          type:
+            - string
+            - 'null'
+        last_seen:
+          type:
+            - string
+            - 'null'
+        last_health_check:
+          type:
+            - string
+            - 'null'
+security:
+  - apiKey: []
+paths:
+  /tenants:
+    get:
+      operationId: listTenants
+      summary: 列出租户
+      description: |
+        Returns non-deleted tenants. Without ?limit / ?next_token the response is a BARE ARRAY (legacy shape); with either param it is a paginated object. Rows lacking a status or host_id (half-written / queued placeholders) are filtered out. Non-admin Cognito callers see only tenants they own; a platform-scoped API key sees only its own platform's tenants.
+      x-source: deploy/lambda/api/handler.py:306
+      x-rbac: viewer
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: |
+            Page size 1-1000 (values above 1000 are clamped). Present-but-malformed (non-integer, <1) is a 400 VALIDATION. Absent = legacy bare-array scan.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+          x-source: deploy/lambda/api/core/utils.py:306
+        - name: next_token
+          in: query
+          required: false
+          description: Opaque pagination cursor from a previous page. Tampered/garbage tokens are a 400 VALIDATION, not a silent first-page reset.
+          schema:
+            type: string
+          x-source: deploy/lambda/api/core/utils.py:329
+        - name: tag
+          in: query
+          required: false
+          description: Filter by tag, format key:value. Repeatable; multiple occurrences AND together. Malformed values (no colon) match nothing.
+          schema:
+            type: string
+          style: form
+          explode: true
+          x-source: deploy/lambda/api/core/utils.py:168
+        - name: platform_id
+          in: query
+          required: false
+          description: Exact-match filter on the external-platform attribution field.
+          schema:
+            type: string
+            pattern: ^[a-zA-Z0-9._-]{1,128}$
+          x-source: deploy/lambda/api/handler.py:379
+        - name: purchase_status
+          in: query
+          required: false
+          description: Filter by purchase stage.
+          schema:
+            type: string
+            enum:
+              - pending
+              - provisioned
+          x-source: deploy/lambda/api/handler.py:385
+      responses:
+        '200':
+          description: |
+            Bare array of tenant records (no pagination params), or {tenants, next_token, count} when paginating. Secret fields (channel_secret, litellm_vkey, cognito_channel_password, gateway_token) are stripped from every record.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: array
+                    description: Legacy shape (no ?limit / ?next_token).
+                    items:
+                      $ref: '#/components/schemas/TenantRecord'
+                  - type: object
+                    description: Paginated shape.
+                    properties:
+                      tenants:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/TenantRecord'
+                      next_token:
+                        type:
+                          - string
+                          - 'null'
+                        description: Cursor for the next page; null when exhausted.
+                      count:
+                        type: integer
+          x-source: deploy/lambda/api/handler.py:400
+        '400':
+          description: Bad limit / next_token / platform_id / purchase_status filter.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - VALIDATION
+      tags:
+        - 租户生命周期
+    post:
+      operationId: createTenant
+      summary: 创建租户(operator/API-key 路径)
+      description: |
+        Creates a tenant microVM. Three return modes: 201 synchronous (status creating, or pending when no host has capacity and a scale-out is triggered); 202 queued when either the SQS dispatch queue (DISPATCH_QUEUE_URL) or create-via-queue FIFO (CREATE_VIA_QUEUE) is enabled. With a client_token the tenant id is deterministic (t-<hash(owner,token)>) so a retried POST returns 409 CONFLICT instead of opening a second VM.
+      x-source: deploy/lambda/api/services/tenant_service.py:218
+      x-rbac: operator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+                  maxLength: 32
+                  pattern: ^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$
+                  description: Lowercase DNS-label; drives the tenant id.
+                  x-source: deploy/lambda/api/core/utils.py:128
+                vcpu:
+                  type: integer
+                  minimum: 1
+                  default: 2
+                  description: Positive integer. Default from env VM_DEFAULT_VCPU (2). Subject to optional quota (QUOTAS_ENABLED).
+                  x-source: deploy/lambda/api/services/tenant_service.py:307
+                mem_mb:
+                  type: integer
+                  minimum: 1
+                  default: 4096
+                  description: Positive integer MB. Default from env VM_DEFAULT_MEM (4096).
+                  x-source: deploy/lambda/api/services/tenant_service.py:310
+                data_disk_mb:
+                  type: integer
+                  minimum: 1
+                  default: 2048
+                  description: |
+                    Positive integer MB, validated and quota-checked at create, but NOT persisted on the record nor passed to launch-vm by any create path (code gap; the effective disk size is the image default until a resize-disk action writes data_disk_mb).
+                  x-source: deploy/lambda/api/services/tenant_service.py:313
+                image_id:
+                  type: string
+                  default: v2
+                  pattern: ^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$
+                  description: Golden rootfs version recorded at creation.
+                  x-source: deploy/lambda/api/services/tenant_service.py:344
+                config_template:
+                  type: string
+                  pattern: ^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$
+                  description: S3 template slug (DNS-label only; flows into an SSM shell command, injection rejected at the edge). Empty = no custom template.
+                  x-source: deploy/lambda/api/services/tenant_service.py:322
+                security:
+                  type: object
+                  description: Optional per-tenant encryption/cert config. Invariants enforced; absent behaves exactly as before the field existed.
+                  x-source: deploy/lambda/api/core/utils.py:50
+                  properties:
+                    storage_encrypted:
+                      type: boolean
+                      default: false
+                    encryption_type:
+                      type: string
+                      enum:
+                        - none
+                        - platform_managed
+                        - tenant_cmk
+                      description: Defaults to none when storage_encrypted=false, platform_managed when true. tenant_cmk requires kms_key_arn.
+                    kms_key_arn:
+                      type: string
+                      description: Full ARN required. Rejected if storage_encrypted=false.
+                    cert_arn:
+                      type: string
+                      description: Full ARN required.
+                    secret_ref:
+                      type: string
+                      description: Full ARN required.
+                client_token:
+                  type: string
+                  minLength: 4
+                  maxLength: 128
+                  pattern: ^[\x21-\x7e]{4,128}$
+                  description: Optional idempotency key (printable ASCII 33-126, no spaces/control chars). Same owner+token yields the same tenant id; replay returns 409.
+                  x-source: deploy/lambda/api/services/tenant_service.py:354
+                chat_endpoint_enabled:
+                  type: boolean
+                  default: false
+                  description: |
+                    Per-tenant OpenAI-compatible chatCompletions switch. Must be a real JSON boolean; strings/numbers are a 400 (secure default off). KNOWN BUG (#160): when the SQS dispatch queue is enabled, the enqueue path reads body.chat_ep (not chat_endpoint_enabled) so this flag is silently dropped on the queued path — effective only on the synchronous path until #160 lands.
+                  x-source: deploy/lambda/api/services/tenant_service.py:384
+                  x-known-bug: 160
+                skills:
+                  type: array
+                  items:
+                    type: string
+                  description: Per-tenant skill scope; deduplicated, sorted, blanks dropped. Absent = broadcast all skills.
+                  x-source: deploy/lambda/api/services/tenant_service.py:369
+                group:
+                  type: string
+                  pattern: ^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$
+                  description: Optional group membership; the group must already exist (404 otherwise).
+                  x-source: deploy/lambda/api/services/tenant_service.py:393
+                tags:
+                  type: object
+                  additionalProperties:
+                    type: string
+                  maxProperties: 20
+                  description: String map. Keys <=50 chars, values <=100 chars, ':' forbidden in both (reserved for query syntax).
+                  x-source: deploy/lambda/api/core/utils.py:144
+                ttl_hours:
+                  type: integer
+                  minimum: 1
+                  maximum: 8760
+                  description: Optional TTL (max 1 year). Computes expires_at server-side.
+                  x-source: deploy/lambda/api/core/utils.py:203
+                on_expiry:
+                  type: string
+                  enum:
+                    - stop
+                    - delete
+                  default: stop
+                  description: Requires ttl_hours.
+                  x-source: deploy/lambda/api/core/utils.py:223
+                schedule:
+                  type: object
+                  description: Optional start/stop schedule.
+                  x-source: deploy/lambda/api/core/utils.py:242
+                  required:
+                    - start
+                    - stop
+                  properties:
+                    start:
+                      type: string
+                      pattern: ^\d{2}:\d{2}$
+                      description: HH:MM, strictly parsed.
+                    stop:
+                      type: string
+                      pattern: ^\d{2}:\d{2}$
+                      description: HH:MM, must differ from start.
+                    timezone:
+                      type: string
+                      default: UTC
+                      description: IANA zone name.
+                    days:
+                      type: array
+                      items:
+                        type: string
+                        enum:
+                          - Mon
+                          - Tue
+                          - Wed
+                          - Thu
+                          - Fri
+                          - Sat
+                          - Sun
+                      description: Defaults to all seven days.
+                restore_from:
+                  type: object
+                  description: Seed the new tenant from an existing backup. Mutually exclusive with clone_from.
+                  x-source: deploy/lambda/api/services/tenant_service.py:455
+                  required:
+                    - tenant_id
+                  properties:
+                    tenant_id:
+                      type: string
+                      description: Source tenant id.
+                    timestamp:
+                      type: string
+                      description: Exact backup timestamp; absent = most recent backup.
+                clone_from:
+                  type: string
+                  description: Clone a RUNNING tenant you own (forces same-host scheduling). Mutually exclusive with restore_from.
+                  x-source: deploy/lambda/api/services/tenant_service.py:413
+                preferred_host_id:
+                  type: string
+                  description: Pin scheduling to a specific host (404 if missing/draining, 400 if it lacks capacity).
+                  x-source: deploy/lambda/api/services/tenant_service.py:638
+                image_channel:
+                  type: string
+                  enum: [live, canary]
+                  default: live
+                  description: >-
+                    #394 — which image slot this tenant boots from. Absent/`live` (default) =
+                    byte-identical legacy behavior (boots the host''s live slot; version is NOT
+                    pinned — restart re-resolves the current live pointer). `canary` boots the
+                    host''s canary slot to validate a candidate; it REQUIRES preferred_host_id
+                    (the canary slot only exists on the host you pulled it to) and pins the
+                    resolved concrete image_snapshot_time onto the tenant record so
+                    restart/reset/recover never drift to another version. Never falls back to
+                    live: host has no canary → 409 CANARY_NOT_READY; candidate replaced → 409
+                    CANARY_CHANGED.
+                  x-source: deploy/lambda/api/services/tenant_service.py:1310
+                expected_image_snapshot_time:
+                  type: string
+                  description: >-
+                    #394 — for image_channel=canary: the candidate version the caller read from
+                    the pull job result. Admission verifies the host canary still matches this
+                    (TOCTOU guard); mismatch → 409 CANARY_CHANGED.
+                expected_image_generation:
+                  type: integer
+                  description: >-
+                    #394 — optional slots generation guard for canary admission. Only used at
+                    create time; the tenant is pinned to a concrete version, so later host
+                    generation changes (e.g. promote) do not invalidate it.
+                platform_id:
+                  type: string
+                  pattern: ^[a-zA-Z0-9._-]{1,128}$
+                  description: External-platform attribution. A platform-scoped API key may only name its own platform (403 otherwise).
+                  x-source: deploy/lambda/api/services/tenant_service.py:252
+                owner_id:
+                  type: string
+                  format: uuid
+                  description: Create-on-behalf attribution override. API-key callers ONLY; Bearer callers get 403. Must be a Cognito sub UUID. Refused (403) when EXTERNAL_AUTHZ is on.
+                  x-source: deploy/lambda/api/services/tenant_service.py:139
+                tenant_user_id:
+                  type: string
+                  pattern: ^[\x21-\x7e]{1,128}$
+                  description: External platform's own stable user id (not a Cognito sub). API-key callers only (403 for Bearer).
+                  x-source: deploy/lambda/api/services/tenant_service.py:201
+                order_id:
+                  type: string
+                  minLength: 1
+                  maxLength: 128
+                  pattern: ^[\x21-\x7e]{1,128}$
+                  description: External order id (billing anchor). Any purchase field present marks the record purchase_status=pending.
+                  x-source: deploy/lambda/api/services/tenant_service.py:103
+                plan_tier:
+                  type: string
+                  enum:
+                    - free
+                    - standard
+                    - pro
+                    - enterprise
+                  x-source: deploy/lambda/api/services/tenant_service.py:111
+                purchase_status:
+                  type: string
+                  enum:
+                    - pending
+                  description: On create only omitted or explicit 'pending' is accepted; 'provisioned' is rejected (use POST /tenants/{id}/provision).
+                  x-source: deploy/lambda/api/services/tenant_service.py:116
+      responses:
+        '201':
+          description: |
+            Synchronous create. status=creating with placement fields when a host was reserved; status=pending (id/status/message only) when no capacity exists and a scale-out was triggered.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    description: Host reserved, VM launching.
+                    properties:
+                      id:
+                        type: string
+                      host_id:
+                        type: string
+                      guest_ip:
+                        type: string
+                      host_port:
+                        type: integer
+                      status:
+                        type: string
+                        enum:
+                          - creating
+                    x-source: deploy/lambda/api/services/tenant_service.py:985
+                  - type: object
+                    description: No capacity; saved as pending, scaling out.
+                    properties:
+                      id:
+                        type: string
+                      status:
+                        type: string
+                        enum:
+                          - pending
+                      message:
+                        type: string
+                    x-source: deploy/lambda/api/services/tenant_service.py:745
+        '202':
+          description: Accepted onto the dispatch queue (DISPATCH_QUEUE_URL) or create-via-queue FIFO; poll GET /tenants/{id}.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  status:
+                    type: string
+                    enum:
+                      - queued
+                  message:
+                    type: string
+          x-source: deploy/lambda/api/services/tenant_service.py:556
+        '400':
+          description: |
+            Validation failure (name/vcpu/mem_mb/data_disk_mb/config_template/ image_id/security/client_token/chat_endpoint_enabled/skills/group/ tags/ttl/schedule/purchase fields/platform_id/owner_id/tenant_user_id, clone+restore mutual exclusion, clone source not running, quota exceeded, preferred host lacks capacity). Newer validators include code=VALIDATION; older paths return {error} only.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - VALIDATION
+        '403':
+          description: owner_id/tenant_user_id override on a Bearer call; owner_id under EXTERNAL_AUTHZ; platform-scoped key naming another platform; not owner of clone source.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - FORBIDDEN
+          x-source: deploy/lambda/api/services/tenant_service.py:269
+        '404':
+          description: Referenced group / clone source / restore backup / preferred host not found.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        '409':
+          description: |
+            Tenant id already exists (client_token replay or duplicate consume) or clone slot contention. Sync path returns code=CONFLICT + id (tenant_service.py:728); the dispatch placeholder path returns {error, id} without a code field (tenant_service.py:525).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - CONFLICT
+                  id:
+                    type: string
+        '502':
+          description: clone-data.sh failed on host, or launch-vm SSM dispatch failed (throttled); tenant rolled back, safe to retry.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  id:
+                    type: string
+          x-source: deploy/lambda/api/services/tenant_service.py:960
+        '503':
+          description: Dispatch enqueue failed, or host slot allocation contended out after retries; retry.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+          x-source: deploy/lambda/api/services/tenant_service.py:820
+      tags:
+        - 租户生命周期
+  /tenants/self:
+    post:
+      operationId: createTenantSelf
+      summary: 已登录用户自助开通节点
+      description: |
+        Any VERIFIED Cognito user provisions their OWN node. owner_id is forced to the caller's verified sub; owner/owner_id/tenant_user_id in the body are stripped. A per-user cap (env SELF_MAX_NODES_PER_USER, default 1; 0 = unlimited) is enforced via the gsi_owner index (fail-closed on count errors). Delegates to create_tenant, so create's full body schema and 201/202/4xx responses apply.
+      x-source: deploy/lambda/api/handler.py:459
+      x-rbac: viewer
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Same schema as POST /tenants minus owner_id/owner/tenant_user_id (stripped). name defaults to u-<sub-prefix> when omitted.
+      responses:
+        '201':
+          description: Created (same shapes as POST /tenants 201).
+        '202':
+          description: Queued (same shape as POST /tenants 202).
+        '401':
+          description: No verified Cognito user (API-key path or unverified token).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+          x-source: deploy/lambda/api/handler.py:474
+        '403':
+          description: Self-service disabled because tenant authority is external (EXTERNAL_AUTHZ on).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+          x-source: deploy/lambda/api/handler.py:479
+        '409':
+          description: Per-user node limit reached (n/SELF_MAX_NODES_PER_USER).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+          x-source: deploy/lambda/api/handler.py:487
+      tags:
+        - 租户生命周期
+  /tenants/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+        description: Tenant id (name-xxxx, or t-<hash16> for client_token creates).
+    get:
+      operationId: getTenant
+      summary: 查询单个租户
+      description: |
+        Returns the tenant DDB record plus computed effective_skills ("*" = broadcast all, or the resolved list). Owner/admin/API-key only (IDOR guard). Secret fields are stripped server-side.
+      x-source: deploy/lambda/api/handler.py:407
+      x-rbac: viewer
+      responses:
+        '200':
+          description: Tenant record (secrets redacted).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  name:
+                    type: string
+                  status:
+                    type: string
+                    description: Lifecycle state (pending/creating/running/stopped/paused/migrating/deleting/deleted).
+                  host_id:
+                    type: string
+                  vm_num:
+                    type: integer
+                  guest_ip:
+                    type: string
+                  host_port:
+                    type: integer
+                  vcpu:
+                    type: integer
+                  mem_mb:
+                    type: integer
+                  image_id:
+                    type: string
+                  rootfs_version:
+                    type: string
+                  config_template:
+                    type: string
+                  tags:
+                    type: object
+                    additionalProperties:
+                      type: string
+                  effective_skills:
+                    description: '"*" (broadcast all) or the resolved skill list.'
+                    oneOf:
+                      - type: string
+                        const: '*'
+                      - type: array
+                        items:
+                          type: string
+                    x-source: deploy/lambda/api/handler.py:421
+                  skills:
+                    type: array
+                    items:
+                      type: string
+                  group:
+                    type: string
+                  owner_id:
+                    type: string
+                  tenant_user_id:
+                    type: string
+                  platform_id:
+                    type: string
+                  order_id:
+                    type: string
+                  plan_tier:
+                    type: string
+                    enum:
+                      - free
+                      - standard
+                      - pro
+                      - enterprise
+                  purchase_status:
+                    type: string
+                    enum:
+                      - pending
+                      - provisioned
+                  security:
+                    type: object
+                  schedule:
+                    type: object
+                  ttl_hours:
+                    type: integer
+                  on_expiry:
+                    type: string
+                    enum:
+                      - stop
+                      - delete
+                  expires_at:
+                    type: string
+                  chat_endpoint_enabled:
+                    type: boolean
+                  authorized_users:
+                    type: object
+                    description: Map sub -> {role, granted_at, expire_at?}.
+                  created_at:
+                    type: string
+                  updated_at:
+                    type: string
+                  channel_secret:
+                    type: string
+                    x-sensitive: true
+                    description: NEVER returned — stripped server-side (per-tenant HMAC secret).
+                    x-source: deploy/lambda/api/services/tenant_service.py:84
+                  litellm_vkey:
+                    type: string
+                    x-sensitive: true
+                    description: NEVER returned — stripped server-side (per-tenant LLM billing key).
+                  cognito_channel_password:
+                    type: string
+                    x-sensitive: true
+                    description: NEVER returned — stripped server-side (machine-user password).
+                  gateway_token:
+                    type: string
+                    x-sensitive: true
+                    description: KMS ciphertext returned only for a running tenant after owner/admin authorization. Never expose to a browser.
+                  device:
+                    type: object
+                    description: Device credentials returned only for a running tenant after owner/admin authorization.
+                    properties:
+                      device_id:
+                        type: string
+                      public_key:
+                        type: string
+                      private_key:
+                        type: string
+                        x-sensitive: true
+                        description: KMS ciphertext, not plaintext.
+                      scopes:
+                        type: array
+                        items:
+                          type: string
+        '403':
+          description: Caller is not the owner (and not admin/API-key), or outside platform scope.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        '404':
+          description: Tenant not found.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+      tags:
+        - 租户生命周期
+    delete:
+      operationId: deleteTenant
+      summary: 删除租户
+      description: |
+        Idempotent delete guarded by a status CAS (only one concurrent DELETE wins; losers get 200 {status:deleting}). With keep_data=false a SYNCHRONOUS pre-delete backup runs first and the delete aborts (502) if it fails, unless skip_backup=true. Reclaims the LiteLLM vkey and Cognito machine-user best-effort.
+      x-source: deploy/lambda/api/services/tenant_service.py:997
+      x-rbac: operator
+      parameters:
+        - name: keep_data
+          in: query
+          required: false
+          schema:
+            type: string
+            enum:
+              - 'true'
+              - 'false'
+            default: 'true'
+          description: false = destroy the data disk (after a mandatory backup unless skip_backup=true).
+          x-source: deploy/lambda/api/services/tenant_service.py:1037
+        - name: skip_backup
+          in: query
+          required: false
+          schema:
+            type: string
+            enum:
+              - 'true'
+              - 'false'
+            default: 'false'
+          description: Opt out of the pre-destroy backup (only with keep_data=false).
+          x-source: deploy/lambda/api/services/tenant_service.py:1046
+      responses:
+        '200':
+          description: Deleted (status deleted), already deleted (idempotent), or a concurrent delete in flight (status deleting).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  status:
+                    type: string
+                    enum:
+                      - deleted
+                      - deleting
+        '403':
+          description: Not the owner / outside platform scope.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        '404':
+          description: Tenant not found.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        '502':
+          description: Pre-delete backup failed or errored; destroy aborted, status rolled back. Retry or pass ?skip_backup=true.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+          x-source: deploy/lambda/api/services/tenant_service.py:1081
+      tags:
+        - 租户生命周期
+  /tenants/{id}/{action}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: tenantAction
+      summary: 对租户执行生命周期/管理动作(start/stop/restart/resize…)
+      description: |
+        Dispatches on {action}. When the lifecycle SQS queue is enabled (LIFECYCLE_QUEUE_URL), start/stop/restart/pause/resume/reset/rebuild are enqueued and return 202 {status:queued}; otherwise they run synchronously via SSM and return 200 {id,status}. resize / resize-disk / migrate / backup / access / provision always keep their own synchronous semantics. Every action is owner/admin gated (403).
+      x-source: deploy/lambda/api/services/tenant_service.py:1196
+      x-rbac: operator
+      parameters:
+        - name: action
+          in: path
+          required: true
+          schema:
+            type: string
+            enum:
+              - resize
+              - resize-disk
+              - migrate
+              - restart
+              - stop
+              - start
+              - reset
+              - rebuild
+              - pause
+              - resume
+              - backup
+              - access
+              - provision
+          description: Unknown values return 400 {"error":"unknown action:..."}.
+          x-source: deploy/lambda/api/services/tenant_service.py:1638
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - title: resize
+                  type: object
+                  description: Hot-add vCPU on a RUNNING tenant. mem_mb live-resize is rejected (stop + recreate instead). vcpu must be an integer strictly greater than current (Firecracker cannot shrink).
+                  x-source: deploy/lambda/api/services/tenant_service.py:1743
+                  properties:
+                    vcpu:
+                      type: integer
+                      description: New vCPU count, > current.
+                    mem_mb:
+                      type: integer
+                      description: Always rejected with 400.
+                - title: resize-disk
+                  type: object
+                  required:
+                    - new_size_mb
+                  description: Offline grow of data.ext4. Runs synchronously on the host; DDB size persisted only on success.
+                  x-source: deploy/lambda/api/services/tenant_service.py:1230
+                  properties:
+                    new_size_mb:
+                      type: integer
+                      maximum: 1048576
+                      description: Must be an integer, strictly larger than the current size (shrink not supported), and <= 1 TiB.
+                - title: migrate
+                  type: object
+                  required:
+                    - target_host_id
+                  description: Async snapshot/restore migration (202). Rejected 409 when memory-overcommit balloon is enabled. Target must exist, differ from source, not be draining/deleted, and have capacity.
+                  x-source: deploy/lambda/api/services/tenant_service.py:1285
+                  properties:
+                    target_host_id:
+                      type: string
+                - title: access
+                  type: object
+                  required:
+                    - principal
+                  description: Grant/revoke another Cognito sub's access. Owner access is implicit and cannot be modified here.
+                  x-source: deploy/lambda/api/services/tenant_service.py:1677
+                  properties:
+                    principal:
+                      type: string
+                      description: Cognito sub.
+                    op:
+                      type: string
+                      enum:
+                        - grant
+                        - revoke
+                      default: grant
+                    role:
+                      type: string
+                      default: member
+                      description: Grant only.
+                    expire_at:
+                      type: integer
+                      description: Optional epoch seconds (> 0).
+                - title: lifecycle-or-empty
+                  type: object
+                  description: restart/stop/start/reset/rebuild/pause/resume/backup/provision take no body fields.
+      responses:
+        '200':
+          description: |
+            Synchronous action result. Lifecycle actions: {id,status} (running/ stopped/paused). resize: {id,vcpu,mem_mb,delta}. resize-disk: {id,status,old_size_mb,new_size_mb}. access: {id,authorized_users}. provision: {id,purchase_status,provisioned|message} (idempotent when already provisioned).
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    title: lifecycle
+                    properties:
+                      id:
+                        type: string
+                      status:
+                        type: string
+                        enum:
+                          - running
+                          - stopped
+                          - paused
+                    x-source: deploy/lambda/api/services/tenant_service.py:1674
+                  - type: object
+                    title: resize
+                    properties:
+                      id:
+                        type: string
+                      vcpu:
+                        type: integer
+                      mem_mb:
+                        type: integer
+                      delta:
+                        type: integer
+                    x-source: deploy/lambda/api/services/tenant_service.py:1829
+                  - type: object
+                    title: resize-disk
+                    properties:
+                      id:
+                        type: string
+                      status:
+                        type: string
+                      old_size_mb:
+                        type: integer
+                      new_size_mb:
+                        type: integer
+                    x-source: deploy/lambda/api/services/tenant_service.py:1275
+                  - type: object
+                    title: access
+                    properties:
+                      id:
+                        type: string
+                      authorized_users:
+                        type: object
+                    x-source: deploy/lambda/api/services/tenant_service.py:1721
+                  - type: object
+                    title: provision
+                    properties:
+                      id:
+                        type: string
+                      purchase_status:
+                        type: string
+                        enum:
+                          - provisioned
+                      provisioned:
+                        type: boolean
+                      message:
+                        type: string
+                    x-source: deploy/lambda/api/services/tenant_service.py:1630
+        '202':
+          description: |
+            Queued lifecycle action ({id,action,status:queued}); backup started ({id,action:backup,status:started}); or migration in flight ({id,status:migrating,source_host_id,target_host_id,snapshot_uri,poll}).
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    title: queued-lifecycle
+                    properties:
+                      id:
+                        type: string
+                      action:
+                        type: string
+                      status:
+                        type: string
+                        enum:
+                          - queued
+                    x-source: deploy/lambda/api/services/tenant_service.py:1219
+                  - type: object
+                    title: backup-started
+                    properties:
+                      id:
+                        type: string
+                      action:
+                        type: string
+                        const: backup
+                      status:
+                        type: string
+                        const: started
+                    x-source: deploy/lambda/api/services/tenant_service.py:1569
+                  - type: object
+                    title: migrating
+                    properties:
+                      id:
+                        type: string
+                      status:
+                        type: string
+                        const: migrating
+                      source_host_id:
+                        type: string
+                      target_host_id:
+                        type: string
+                      snapshot_uri:
+                        type: string
+                      poll:
+                        type: string
+                        description: Path to poll (GET /tenants/{id}).
+                    x-source: deploy/lambda/api/services/tenant_service.py:1414
+        '400':
+          description: |
+            Unknown action; resize on non-running / vcpu not greater / mem_mb requested / insufficient host capacity; resize-disk missing or non-larger new_size_mb / over 1 TiB / no host; migrate missing target_host_id or target==source; access missing principal / bad op / principal is owner; provision on a record with no purchase (code=VALIDATION).
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - VALIDATION
+                  id:
+                    type: string
+        '403':
+          description: Not the owner / outside platform scope.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        '404':
+          description: Tenant not found; migrate target host not found.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        '409':
+          description: Migrate refused while balloon is enabled ({error,reason:balloon_enabled}), target host draining/deleted, or target lacks capacity.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  reason:
+                    type: string
+          x-source: deploy/lambda/api/services/tenant_service.py:1290
+        '502':
+          description: Host-side SSM failure (resize-disk script, Firecracker machine-config PATCH, migration snapshot submit); state unchanged / rolled back.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  id:
+                    type: string
+                  data_disk_mb:
+                    type: integer
+      tags:
+        - 租户生命周期
+    get:
+      operationId: tenantGetAction
+      summary: 读租户子资源(backups / data / access)
+      description: Owner/admin gated (403). Any other action value returns 400.
+      x-source: deploy/lambda/api/handler.py:607
+      x-rbac: viewer
+      parameters:
+        - name: action
+          in: path
+          required: true
+          schema:
+            type: string
+            enum:
+              - backups
+              - data
+              - access
+      responses:
+        '200':
+          description: |
+            backups: {tenant_id, backups:[{key,timestamp,size_mb}]}. data: zero-credential metadata snapshot (placement, spec, effective_skills, schedule/TTL, has_billing_vkey boolean — never the key value, backup_count; -1 when S3 count failed). access: {id, owner_id, authorized_users}.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    title: backups
+                    properties:
+                      tenant_id:
+                        type: string
+                      backups:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            key:
+                              type: string
+                            timestamp:
+                              type: string
+                            size_mb:
+                              type: number
+                    x-source: deploy/lambda/api/services/console_info.py:13
+                  - type: object
+                    title: data
+                    properties:
+                      id:
+                        type: string
+                      status:
+                        type: string
+                      host_id:
+                        type: string
+                      guest_ip:
+                        type: string
+                      vm_num:
+                        type: integer
+                      vcpu:
+                        type: integer
+                      mem_mb:
+                        type: integer
+                      data_disk_mb:
+                        type:
+                          - integer
+                          - 'null'
+                        description: Null unless a resize-disk action persisted it (create never writes it).
+                      rootfs_version:
+                        type: string
+                      effective_skills:
+                        oneOf:
+                          - type: string
+                            const: '*'
+                          - type: array
+                            items:
+                              type: string
+                      group:
+                        type: string
+                      schedule:
+                        type: object
+                      ttl_hours:
+                        type: integer
+                      expires_at:
+                        type: string
+                      owner_id:
+                        type: string
+                      tenant_user_id:
+                        type: string
+                      has_billing_vkey:
+                        type: boolean
+                        description: Presence only — the vkey value itself is never exposed.
+                      backup_count:
+                        type: integer
+                        description: -1 = unknown (S3 list failed).
+                      created_at:
+                        type: string
+                      updated_at:
+                        type: string
+                      tags:
+                        type: object
+                    x-source: deploy/lambda/api/handler.py:748
+                  - type: object
+                    title: access
+                    properties:
+                      id:
+                        type: string
+                      owner_id:
+                        type: string
+                      authorized_users:
+                        type: object
+                    x-source: deploy/lambda/api/handler.py:622
+        '400':
+          description: 'Unknown GET action ({"error":"unknown GET action: ..."}).'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+          x-source: deploy/lambda/api/handler.py:633
+        '403':
+          description: Not the owner / outside platform scope.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        '404':
+          description: Tenant not found.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+      tags:
+        - 租户生命周期
+  /batch/tenants:
+    post:
+      operationId: batchTenants
+      summary: 批量对多个租户执行一个生命周期动作
+      description: |
+        Applies one action (start/stop/delete/backup) to a set of tenants given either an explicit `ids` list or a `filter`. Small batches (<=100 ids) run synchronously; larger batches or an explicit `async: true` are recorded as an async job executed by a self-invoked worker (202 + job_id). For non-admin callers the `filter` path resolves only tenants owned by the caller (issue #80); platform-scoped API keys are confined to their own platform namespace (#108). Requires API Gateway x-api-key.
+      x-source: deploy/lambda/api/handler.py:1253
+      x-rbac: operator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - action
+              properties:
+                action:
+                  type: string
+                  enum:
+                    - backup
+                    - delete
+                    - start
+                    - stop
+                  description: Lifecycle action applied to every target tenant.
+                  x-source: deploy/lambda/api/handler.py:1248
+                ids:
+                  type: array
+                  items:
+                    type: string
+                  maxItems: 100000
+                  description: |
+                    Explicit tenant id list. Mutually exclusive with `filter` (exactly one of the two must be present, else 400). Lists larger than 100 route to the async job path; the hard per-request cap is 100000.
+                  x-source: deploy/lambda/api/handler.py:1263-1278
+                filter:
+                  type: object
+                  description: |
+                    Server-side target resolution. The only supported key is `tag` with a "key:value" string; a tag value without a colon matches nothing. Unknown keys are rejected with 400. Non-admin callers only match tenants they own.
+                  properties:
+                    tag:
+                      type: string
+                      description: Tag filter in "key:value" form.
+                      x-source: deploy/lambda/api/services/fleet_service.py:460-465
+                  additionalProperties: false
+                  x-source: deploy/lambda/api/handler.py:1249,1280-1287
+                async:
+                  type: boolean
+                  default: false
+                  description: |
+                    Force the async job path even for small batches. Implicitly true when ids/filter resolve to more than 100 targets.
+                  x-source: deploy/lambda/api/handler.py:1294
+      responses:
+        '200':
+          description: Synchronous batch executed (<=100 targets, no async).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  succeeded:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        action:
+                          type: string
+                  failed:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        error:
+                          type: string
+                x-source: deploy/lambda/api/handler.py:1311-1312, deploy/lambda/api/services/fleet_service.py:277-304
+        '202':
+          description: Async job accepted (async:true or >100 targets, ledger deployed).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id:
+                    type: string
+                    description: Poll GET /batch/jobs/{job_id} for progress.
+                  status:
+                    type: string
+                    enum:
+                      - queued
+                  total:
+                    type: integer
+                x-source: deploy/lambda/api/services/fleet_service.py:367
+        '400':
+          description: |
+            Validation failure. Cases: missing body; action not in [backup, delete, start, stop]; both or neither of ids/filter; ids not an array; more than 100000 ids; unknown filter key; >100 ids on the sync path without async:true. Body is {"error": "<message>"} (no `code` field on this route).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                x-source: deploy/lambda/api/handler.py:1255-1310
+        '403':
+          description: RBAC role below operator (when RBAC_ENABLED).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: forbidden
+                  rbac:
+                    type: object
+                    properties:
+                      role:
+                        type: string
+                      required:
+                        type: string
+                x-source: deploy/lambda/api/core/auth.py:592-608
+        '500':
+          description: |
+            Async worker dispatch failed (job recorded as dispatch_failed; body includes job_id) or unhandled exception (body {"error": "<exception text>"}).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  job_id:
+                    type: string
+                x-source: deploy/lambda/api/services/fleet_service.py:357-366, deploy/lambda/api/handler.py:288-292
+        '503':
+          description: |
+            Async required (>100 ids) but the async job ledger is not deployed (BATCH_JOBS_TABLE env absent).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: async batch not configured (BATCH_JOBS_TABLE absent)
+                x-source: deploy/lambda/api/handler.py:1296-1303
+      tags:
+        - 批量操作
+  /batch/jobs/{job_id}:
+    get:
+      operationId: getBatchJob
+      summary: 查询异步批量任务进度
+      description: |
+        Returns the progress of an async batch job created by POST /batch/tenants. The raw target id list is not echoed (can be huge); progress counters and per-id results are. NOTE: there is no ownership check on this route — any caller passing the viewer RBAC floor may read any job_id. Requires API Gateway x-api-key.
+      x-source: deploy/lambda/api/handler.py:1391
+      x-rbac: viewer
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Job id returned by the 202 response of POST /batch/tenants.
+      responses:
+        '200':
+          description: Job progress.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id:
+                    type: string
+                  action:
+                    type: string
+                  status:
+                    type: string
+                    enum:
+                      - queued
+                      - running
+                      - done
+                      - dispatch_failed
+                    x-source: deploy/lambda/api/services/fleet_service.py:327,362,406,429
+                  total:
+                    type: integer
+                    default: 0
+                  done:
+                    type: integer
+                    default: 0
+                  succeeded:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        action:
+                          type: string
+                  failed:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        error:
+                          type: string
+                  created_at:
+                    type: string
+                    format: date-time
+                  updated_at:
+                    type: string
+                    format: date-time
+                x-source: deploy/lambda/api/handler.py:1399-1412
+        '404':
+          description: Job not found.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: job not found
+                x-source: deploy/lambda/api/handler.py:1396-1397
+        '503':
+          description: Async job ledger not deployed (BATCH_JOBS_TABLE env absent).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: batch jobs not configured
+                x-source: deploy/lambda/api/handler.py:1393-1394
+      tags:
+        - 批量操作
+  /users/{tenant_user_id}/tenants:
+    get:
+      operationId: listUserTenants
+      summary: 列出某平台用户名下所有租户(索引/分页)
+      description: |
+        GSI-backed (gsi_tenant_user) paginated listing of every node attributed to a tenant_user_id — never a full table scan. Soft-deleted tenants are excluded. Authorization: admin / api-key callers may target any user; a federated Cognito user may only list their own fleet (identity-keyed, independent of the RBAC_ENABLED flag, #60). Requires the gsi_tenant_user index (config switch scaler.add_gsi_tenant_user; deploys without it fail this route with 500). Requires API Gateway x-api-key.
+      x-source: deploy/lambda/api/handler.py:1139
+      x-rbac: viewer+owner-gated
+      parameters:
+        - name: tenant_user_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: External stable user id (platform-native, not a Cognito sub).
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+          description: |
+            Page size. Absent -> 100. Malformed / zero / negative / fractional -> 400 VALIDATION (fail-loud, #95). Values above 1000 are clamped down to 1000.
+          x-source: deploy/lambda/api/core/utils.py:282-283,306-326
+        - name: next_token
+          in: query
+          required: false
+          schema:
+            type: string
+          description: |
+            Opaque pagination cursor (base64 of the DynamoDB LastEvaluatedKey) from a previous response. A tampered/garbage token is rejected with 400 VALIDATION, never silently reset to page 1.
+          x-source: deploy/lambda/api/core/utils.py:286-303,329-345
+      responses:
+        '200':
+          description: One page of the user's tenant records.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenants:
+                    type: array
+                    items:
+                      type: object
+                      description: |
+                        Tenant record as stored (GSI projection ALL). `tags` is defaulted to {} when absent. WARNING: unlike GET /tenants, this route does NOT strip server-side secret fields at the time of reading the code — see the fields marked x-sensitive.
+                      properties:
+                        id:
+                          type: string
+                        name:
+                          type: string
+                        status:
+                          type: string
+                        owner_id:
+                          type: string
+                        tenant_user_id:
+                          type: string
+                        tags:
+                          type: object
+                          default: {}
+                        channel_secret:
+                          type: string
+                          x-sensitive: true
+                          description: Server-side HMAC secret — must never reach a client.
+                        litellm_vkey:
+                          type: string
+                          x-sensitive: true
+                          description: Per-tenant LLM billing key — must never reach a client.
+                        cognito_channel_password:
+                          type: string
+                          x-sensitive: true
+                          description: Channel machine-user password — must never reach a client.
+                        gateway_token:
+                          type: string
+                          x-sensitive: true
+                          description: Per-tenant gateway control-UI bearer — must never reach a client.
+                      additionalProperties: true
+                      x-source: deploy/lambda/api/services/fleet_service.py:59-78, deploy/lambda/api/services/tenant_service.py:84-91
+                  next_token:
+                    type:
+                      - string
+                      - 'null'
+                    description: Cursor for the next page; null/absent when exhausted.
+                  count:
+                    type: integer
+                    description: Number of items in this page.
+                x-source: deploy/lambda/api/handler.py:1151-1156
+        '400':
+          description: Malformed limit or next_token (structured VALIDATION error).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - VALIDATION
+                x-source: deploy/lambda/api/core/utils.py:323,325,344,360-364
+        '403':
+          description: Caller is neither admin/api-key nor the fleet's own user.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: 'forbidden: not authorized for this user''s fleet'
+                x-source: deploy/lambda/api/services/fleet_service.py:35-56
+      tags:
+        - 按用户管理舰队
+  /users/{tenant_user_id}/summary:
+    get:
+      operationId: userSummary
+      summary: 某平台用户的节点数与各状态分布
+      description: |
+        Read-only roll-up for a backend dashboard / reconciliation. Pages through the gsi_tenant_user index internally (up to 50 pages x 1000 rows) so the count is exact for any realistic fleet; `truncated: true` signals the pathological over-50k case. Same admin-or-self authorization as the fleet listing. Requires API Gateway x-api-key.
+      x-source: deploy/lambda/api/handler.py:1159
+      x-rbac: viewer+owner-gated
+      parameters:
+        - name: tenant_user_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Aggregated fleet summary.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenant_user_id:
+                    type: string
+                  total:
+                    type: integer
+                    description: Total non-deleted nodes attributed to the user.
+                  by_status:
+                    type: object
+                    additionalProperties:
+                      type: integer
+                    description: Map of tenant status -> count (missing status counted as "unknown").
+                  truncated:
+                    type: boolean
+                    description: True when the 50-page safety bound stopped the paging loop early.
+                x-source: deploy/lambda/api/handler.py:1169-1194
+        '403':
+          description: Caller is neither admin/api-key nor the fleet's own user.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                x-source: deploy/lambda/api/services/fleet_service.py:35-56
+      tags:
+        - 按用户管理舰队
+  /users/{tenant_user_id}/action:
+    post:
+      operationId: userAction
+      summary: 批量启停某平台用户名下全部节点
+      description: |
+        Applies one lifecycle action to EVERY node the user owns. The target set is resolved server-side from the gsi_tenant_user index (never a client-supplied id list). Each node goes through the same tenant_action path (RBAC + SSM + audit); per-node failures are isolated into failed[]. Same admin-or-self authorization as the fleet listing, on top of the operator RBAC floor. Requires API Gateway x-api-key.
+      x-source: deploy/lambda/api/handler.py:1197
+      x-rbac: operator+owner-gated
+      parameters:
+        - name: tenant_user_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - action
+              properties:
+                action:
+                  type: string
+                  enum:
+                    - start
+                    - stop
+                  x-source: deploy/lambda/api/handler.py:1136,1209-1213
+      responses:
+        '200':
+          description: Bulk action dispatched; per-node results.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenant_user_id:
+                    type: string
+                  action:
+                    type: string
+                    enum:
+                      - start
+                      - stop
+                  succeeded:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        action:
+                          type: string
+                  failed:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        error:
+                          type: string
+                  truncated:
+                    type: boolean
+                    description: True when the 50-page fleet resolution bound was hit.
+                x-source: deploy/lambda/api/handler.py:1235-1244
+        '400':
+          description: action missing or not one of [start, stop].
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: action must be one of ['start', 'stop']
+                x-source: deploy/lambda/api/handler.py:1210-1213
+        '403':
+          description: |
+            RBAC role below operator, or caller is neither admin/api-key nor the fleet's own user.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                x-source: deploy/lambda/api/core/auth.py:592-608, deploy/lambda/api/services/fleet_service.py:35-56
+      tags:
+        - 按用户管理舰队
+  /backups:
+    get:
+      operationId: listAllBackups
+      summary: 列出全局所有租户备份(最新在前)
+      description: |
+        Lists every backup object under the S3 backup prefix across ALL tenants, left-joined with the tenants table to resolve names and flag orphans (backups whose tenant no longer exists). Paginates the S3 listing internally. NOTE: no per-owner scoping — any caller passing the viewer RBAC floor sees all tenants' backup metadata. Requires API Gateway x-api-key.
+      x-source: deploy/lambda/api/services/console_info.py:30
+      x-rbac: viewer
+      responses:
+        '200':
+          description: Bare array of backup descriptors, sorted by last_modified descending.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    tenant_id:
+                      type: string
+                    tenant_name:
+                      type:
+                        - string
+                        - 'null'
+                      description: Resolved from the tenants table; null when the tenant row is gone.
+                    tenant_exists:
+                      type: boolean
+                      description: False for orphaned backups (tenant deleted or missing).
+                    timestamp:
+                      type: string
+                      description: Backup object basename with the ".gz" suffix stripped.
+                    size_bytes:
+                      type: integer
+                    last_modified:
+                      type: string
+                      format: date-time
+                x-source: deploy/lambda/api/services/console_info.py:44-66
+      tags:
+        - 运维与审计
+  /audit-log:
+    get:
+      operationId: listAuditLog
+      summary: 读最近审计日志(最新在前)
+      description: |
+        Returns audit entries for mutating control-plane operations (POST/PUT/DELETE), retained 90 days via DynamoDB TTL. Ownership scoping (#61): a verified Cognito admin (Bearer, RS256-verified, not api-key-only) sees everyone and may target one owner via ?owner=; every other caller is silently clamped to their own owner_id (the ?owner= parameter is discarded); an unverifiable Bearer token gets 403 fail-closed. Reads are served from the gsi_audit_owner index when owner-scoped, with a paged fallback when the index is absent. Requires API Gateway x-api-key. Returns 200 [] when the audit table is not configured.
+      x-source: deploy/lambda/api/handler.py:974
+      x-rbac: viewer+owner-gated
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+            default: 50
+          description: |
+            Silently clamped into [1, 500]; a non-integer value falls back to 50 (unlike the fleet listing's fail-loud limit handling).
+          x-source: deploy/lambda/api/handler.py:1011-1017
+        - name: since
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: ISO-8601 timestamp; only entries with ts >= this value are returned.
+          x-source: deploy/lambda/api/handler.py:1018,1045-1046
+        - name: owner
+          in: query
+          required: false
+          schema:
+            type: string
+          description: |
+            Target another owner's trail. Honored ONLY for a verified Cognito admin; ignored (clamped to self) for every other caller.
+          x-source: deploy/lambda/api/handler.py:1019,1022-1034
+      responses:
+        '200':
+          description: |
+            Array of audit entries (newest first, at most `limit`). Empty array when the audit table is not deployed or the query fails.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    pk:
+                      type: string
+                      const: audit
+                    id:
+                      type: string
+                      format: uuid
+                    ts:
+                      type: string
+                      format: date-time
+                    operation:
+                      type: string
+                      description: '"<METHOD> <resource>", e.g. "POST /tenants".'
+                    resource_id:
+                      type: string
+                      description: Path id / instance_id when present, else "".
+                    api_key_id:
+                      type: string
+                      x-sensitive: true
+                      description: |
+                        API Gateway key id when available; otherwise the FIRST 32 CHARS OF THE RAW x-api-key HEADER VALUE (credential-prefix exposure — see notes).
+                      x-source: deploy/lambda/api/handler.py:938-940
+                    actor_owner_id:
+                      type: string
+                    actor_role:
+                      type: string
+                    response_status:
+                      type:
+                        - integer
+                        - 'null'
+                    expires_ttl:
+                      type: integer
+                      description: Epoch seconds; DynamoDB TTL at write time + 90 days.
+                  x-source: deploy/lambda/api/handler.py:951-965
+        '403':
+          description: Bearer token present but cryptographically untrusted (fail-closed).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: forbidden
+                x-source: deploy/lambda/api/handler.py:1027-1029
+      tags:
+        - 运维与审计
+  /hosts:
+    get:
+      operationId: listHosts
+      summary: 列出已注册的 microVM 宿主机
+      description: 'Returns every non-deleted host record from the hosts table. Synthetic bookkeeping rows (instance_id starting with "__") are filtered out. Type quirk: numeric attributes stored in DynamoDB (total_vcpu, total_mem_mb, used_vcpu, used_mem_mb, vm_count, next_vm_num) are serialized as JSON strings because the response encoder stringifies DynamoDB Decimal values (json.dumps default=str, core/utils.py:356), while the injected cpu_overcommit_ratio / mem_overcommit_ratio are native Python floats and serialize as JSON numbers.'
+      x-source: deploy/lambda/api/services/host_service.py:26
+      x-rbac: viewer
+      responses:
+        '200':
+          description: Array of host records.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    instance_id:
+                      type: string
+                      description: EC2 instance id of the host.
+                      x-source: deploy/lambda/api/services/host_service.py:123
+                    private_ip:
+                      type: string
+                      x-source: deploy/lambda/api/services/host_service.py:124
+                    az:
+                      type: string
+                      description: Availability Zone; may be "" if Placement was missing at registration.
+                      x-source: deploy/lambda/api/services/host_service.py:111
+                    status:
+                      type: string
+                      enum:
+                        - active
+                        - idle
+                        - draining
+                      description: Lifecycle state. "deleted" rows are filtered out of this endpoint.
+                      x-source: deploy/lambda/api/services/host_service.py:132
+                    total_vcpu:
+                      type: string
+                      description: Schedulable vCPU (instance vCPU minus HOST_RESERVED_VCPU, default 1). DynamoDB Decimal serialized as string.
+                      x-source: deploy/lambda/api/services/host_service.py:126
+                    total_mem_mb:
+                      type: string
+                      description: Schedulable memory MiB (advertised RAM minus HOST_RESERVED_MEM, default 2048). Serialized as string.
+                      x-source: deploy/lambda/api/services/host_service.py:127
+                    used_vcpu:
+                      type: string
+                      description: Currently allocated vCPU. Serialized as string.
+                    used_mem_mb:
+                      type: string
+                      description: Currently allocated memory MiB. Serialized as string.
+                    vm_count:
+                      type: string
+                      description: Number of microVMs on this host. Serialized as string.
+                    next_vm_num:
+                      type: string
+                      description: Next per-host VM slot number (CAS-allocated). Serialized as string.
+                      x-source: deploy/lambda/api/services/host_service.py:131
+                    idle_since:
+                      type: string
+                      format: date-time
+                      description: ISO-8601 UTC timestamp (core/utils.py:91 _now).
+                    rootfs_version:
+                      type: string
+                      description: Rootfs manifest version staged on this host (set by POST /hosts/refresh-rootfs).
+                      x-source: deploy/lambda/api/services/host_service.py:391
+                    image_slots:
+                      type: object
+                      description: >-
+                        #394 — control-plane mirror of the host''s slots.json (source of truth is
+                        the file on the host). Present once a canary has been pulled to this host;
+                        absent on hosts still on the legacy flat layout. Ops/console read it to see
+                        which candidate is staged.
+                      properties:
+                        live: {type: [string, 'null']}
+                        canary: {type: [string, 'null']}
+                        previous_live: {type: [string, 'null']}
+                        generation: {type: integer}
+                      x-source: deploy/lambda/api/services/host_service.py:1373
+                    cpu_overcommit_ratio:
+                      type: number
+                      description: Injected at read time from env CPU_OVERCOMMIT_RATIO (float, default 1.0). JSON number, not string.
+                      x-source: deploy/lambda/api/services/host_service.py:38
+                    mem_overcommit_ratio:
+                      type: number
+                      description: Injected at read time from env MEM_OVERCOMMIT_RATIO (float, default 1.0). JSON number, not string.
+                      x-source: deploy/lambda/api/services/host_service.py:39
+                    last_seen:
+                      type:
+                        - string
+                        - 'null'
+                      format: date-time
+                      description: ISO-8601 UTC of the last host-agent heartbeat (health reporter update). Verified present in live ap-southeast-1 response 2026-07-07.
+                    last_health_check:
+                      type:
+                        - string
+                        - 'null'
+                      format: date-time
+                      description: ISO-8601 UTC of the last control-plane health probe against this host. Verified present in live ap-southeast-1 response 2026-07-07.
+        '403':
+          description: RBAC denied (viewer role required when RBAC_ENABLED).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: forbidden
+                  rbac:
+                    type: object
+                    properties:
+                      role:
+                        type: string
+                      required:
+                        type: string
+                x-source: deploy/lambda/api/core/auth.py:601
+      tags:
+        - 主机与镜像
+    post:
+      operationId: registerHost
+      summary: 把 EC2 实例注册为 microVM 宿主机
+      description: 'Describes the instance via EC2 API, resolves schedulable vCPU/memory (minus host reserve) and writes the host record with status "active". Memory resolution tries ec2:DescribeInstanceTypes first, then a static family/size table, then a 16384 MiB last-ditch default (host_service.py:61-92). An invalid/unknown instance_id makes describe_instances raise; the exception is caught only by the top-level handler and surfaces as a generic 500 {"error": "<boto message>"} (handler.py:288-292).'
+      x-source: deploy/lambda/api/services/host_service.py:94
+      x-rbac: operator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - instance_id
+              properties:
+                instance_id:
+                  type: string
+                  description: EC2 instance id of the metal host to register.
+                  x-source: deploy/lambda/api/services/host_service.py:98
+      responses:
+        '201':
+          description: Host registered.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  instance_id:
+                    type: string
+                  status:
+                    type: string
+                    enum:
+                      - active
+                  az:
+                    type: string
+                x-source: deploy/lambda/api/services/host_service.py:136
+        '400':
+          description: Missing body or missing instance_id.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    enum:
+                      - missing body
+                      - missing instance_id
+                x-source: deploy/lambda/api/services/host_service.py:96
+        '403':
+          description: RBAC denied (operator+ required when RBAC_ENABLED).
+        '500':
+          description: Uncaught EC2 describe_instances failure (bad instance id, permissions) via the handler catch-all.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                x-source: deploy/lambda/api/handler.py:292
+      tags:
+        - 主机与镜像
+  /hosts/{instance_id}:
+    delete:
+      operationId: deregisterHost
+      summary: 排空并终止一台宿主机
+      description: 'Sets the host row''s status to "draining", then calls terminate_instance_in_auto_scaling_group (ShouldDecrementDesiredCapacity false) so the ASG termination lifecycle hook runs cleanup. The ASG terminate failure is swallowed with a log line — the response is 200 either way. No existence check: an unknown instance_id still returns 200 and the update_item upsert creates a phantom row containing only status=draining.'
+      x-source: deploy/lambda/api/services/host_service.py:138
+      x-rbac: operator
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Draining initiated (always returned, even if ASG terminate failed or the host does not exist).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  instance_id:
+                    type: string
+                  status:
+                    type: string
+                    enum:
+                      - draining
+                x-source: deploy/lambda/api/services/host_service.py:153
+        '403':
+          description: RBAC denied (operator+ required when RBAC_ENABLED).
+      tags:
+        - 主机与镜像
+  /hosts/{instance_id}/pull-image:
+    post:
+      operationId: pullImage
+      summary: 把指定版本快照装到单台宿主机(异步)
+      description: >-
+        #309/#333 — Install a specific version snapshot onto ONE host. Reads the snapshot from the
+        version-snapshots DDB table, selects exactly the disks named by that snapshot's manifest.json
+        (rootfs / data-template / immutable) plus manifest.json itself (ignores other versions' disks
+        in the snapshot — deterministic), fetches each by its exact S3 VersionId, verifies ETag, then
+        installs to live under /data/firecracker-assets. CAS-flips the host active/idle→upgrading (and
+        atomically stamps pull_command_id) so the control plane places no new tenants during the pull,
+        then self-invokes asynchronously (InvocationType=Event) and returns 202 immediately — the long
+        stage+unzip+commit chain runs in the fire-and-forget worker (can take minutes; the poller is
+        pull-image-progress). On failure it only reports (no auto-restore). Idempotent: replaying the
+        same snapshot is harmless. #394 fast-path: when the target version dir is already fully installed
+        on disk (a .complete marker present + all disks non-empty), pull SKIPS download/unzip and just
+        flips the slots pointer (seconds) — this is how rollback works (pull an older, already-installed
+        version to live with no re-download). A half-installed dir (interrupted/disk-full, no .complete
+        marker) is treated as incomplete and re-downloaded (fail-safe: never flips onto a partial disk set).
+      x-source: deploy/lambda/api/services/host_service.py:1278
+      x-rbac: operator
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: EC2 instance id of the target host.
+        - name: snapshot_time
+          in: query
+          required: true
+          schema:
+            type: string
+            pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$'
+          description: 'ISO8601 UTC snapshot key (YYYY-MM-DDTHH:MM:SSZ), from GET /snapshots.'
+        - name: slot
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [live, canary]
+            default: live
+          description: >-
+            #394 — target image slot. Absent/`live` (default) = byte-identical legacy behavior
+            (installs the flat live disks, CAS-flips the host to `upgrading` for the duration).
+            `canary` installs into an immutable per-host version dir
+            (versions/<snapshot_time>/) and updates only the canary pointer in slots.json —
+            it does NOT change host.status, so live tenants keep being created/scheduled on
+            the host. Mutual exclusion for canary is provided by the host-level image lease,
+            not the status gate. Any other value → 400 VALIDATION.
+          x-source: deploy/lambda/api/services/host_service.py:1441
+      responses:
+        '202':
+          description: Pull started (async). Poll pull-image-progress with the returned job_id.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    enum:
+                      - pull-image started (async; poll pull-image-progress)
+                  instance_id:
+                    type: string
+                  snapshot_time:
+                    type: string
+                  slot:
+                    type: string
+                    enum: [live, canary]
+                    description: '#394 — echoes the target slot for this pull (live/canary).'
+                  status:
+                    type: string
+                    description: >-
+                      #394 — for slot=live this is `upgrading`; for slot=canary the host status
+                      is NOT changed, so this echoes the host''s current real status (e.g.
+                      active/idle).
+                  job_id:
+                    type: string
+                    description: Self-generated pull job id (pull-<hex>). Names /tmp/<job_id>.txt on the host; pull-image-progress tails it.
+              x-source: deploy/lambda/api/services/host_service.py:1053
+        '400':
+          description: Missing/invalid snapshot_time (ISO8601 UTC), or invalid slot value.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - VALIDATION
+        '403':
+          description: RBAC denied (operator+ required when RBAC_ENABLED).
+        '404':
+          description: Snapshot snapshot_time not found in the version-snapshots table.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - NOT_FOUND
+        '409':
+          description: >-
+            Host not available for pull (status must be active/idle; already upgrading or missing);
+            the snapshot is not self-consistent (manifest names disks absent from the snapshot);
+            CANARY_EQUALS_LIVE (#394 — slot=canary but the requested snapshot is already this host's
+            live, so there is nothing to validate — pull a different candidate); or
+            IDEMPOTENCY_KEY_REUSED (same Idempotency-Key used for a different snapshot/slot).
+            Note: re-pulling the SAME version to a slot is an idempotent no-op that still re-verifies
+            the on-disk .complete marker (heals a half-installed version), it is not rejected.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - CONFLICT
+                      - CANARY_EQUALS_LIVE
+                      - IDEMPOTENCY_KEY_REUSED
+        '500':
+          description: Failed to dispatch the async pull-image worker (Lambda self-invoke failed). Status is reset to prev.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - DISPATCH_FAILED
+        '503':
+          description: VERSION_SNAPSHOTS_TABLE or ASSETS_BUCKET not configured.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - NOT_CONFIGURED
+      tags:
+        - 主机与镜像
+  /hosts/{instance_id}/promote-canary:
+    post:
+      operationId: promoteCanary
+      summary: 把该 host 的 canary 槽提升为 live(同步,#394)
+      description: >-
+        #394 — Synchronously promote the host''s canary slot to live. Only rewrites the small
+        slots.json pointer (no disk move), so it returns 200 in seconds — no async job. CAS is on
+        snapshot_time only: the caller must pass the expected_canary_snapshot_time it verified; if
+        the current canary snapshot_time differs, returns 409 CANARY_CHANGED and writes nothing
+        (guarantees you promote the exact version you validated). expected_canary_generation is
+        optional and ADVISORY only — a lagging generation (normal DDB-mirror vs on-disk drift) does
+        NOT cause rejection. Idempotent: if live is already the expected version, returns 200
+        already_promoted=true (safe to retry after a lost response). Holds the host image lease
+        (mutual exclusion with pull/cleanup/reclaim). Supports Idempotency-Key.
+      x-source: deploy/lambda/api/services/image_slot_service.py:174
+      x-rbac: admin
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Caller-generated UUID; replaying with the same key returns the stored result.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [expected_canary_snapshot_time]
+              properties:
+                expected_canary_snapshot_time:
+                  type: string
+                  description: The canary snapshot the caller verified (CAS anchor).
+                expected_canary_generation:
+                  type: integer
+                  description: >-
+                    Slots generation the caller read. Advisory/observability only — NOT a rejection
+                    gate (#394); the version CAS is snapshot_time. A stale generation never 409s.
+      responses:
+        '200':
+          description: Canary promoted to live (or already_promoted on idempotent replay).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: {type: string}
+                  instance_id: {type: string}
+                  already_promoted: {type: boolean}
+                  live_snapshot_time: {type: string}
+                  previous_live_snapshot_time: {type: [string, 'null']}
+                  generation: {type: integer}
+        '403':
+          description: RBAC denied (admin required).
+        '404':
+          description: Host not found (code NOT_FOUND).
+        '409':
+          description: >-
+            CANARY_CHANGED (current canary snapshot_time != expected_canary_snapshot_time; generation
+            is advisory only and never causes rejection — #394), IMAGE_OPERATION_IN_PROGRESS
+            (another image op holds the lease, or same Idempotency-Key still executing),
+            or IDEMPOTENCY_KEY_REUSED.
+        '500':
+          description: SLOTS_CORRUPT (host slots.json unparseable — fail-loud, not treated as empty).
+        '503':
+          description: OPERATION_STATUS_UNKNOWN (write not confirmed; retry with same Idempotency-Key).
+      tags:
+        - 主机与镜像
+  # #394 —— rollback-image 已移除:回滚 = pull 老版到 live(POST /hosts/{id}/pull-image?slot=live)。
+  # pull 有快路径:目标版本目录已 .complete(装齐)时跳过下载/解压,直接翻 slots.live 指针(秒级);
+  # 半装目录(下载中断/盘满,无 .complete)判不完整 → 正常重下自愈。这与 Lambda alias / K8s revision
+  # 的"选定一个已保留版本重指指针"模型一致,不再需要独立的 live↔previous_live swap 操作。
+  /hosts/{instance_id}/image-slots:
+    get:
+      operationId: hostImageSlots
+      summary: 读该 host 磁盘上真实的镜像状态(#394 debug 视图)
+      description: >-
+        #394 — Read the REAL on-disk image state of one EC2 host via SSM: its actual
+        slots.json (live/canary/previous_live/generation) plus the installed version dirs
+        under /data/firecracker-assets/versions/. This is the authoritative counterpart to
+        the possibly-stale DDB image_slots mirror returned by GET /hosts — the response also
+        echoes that mirror side-by-side so an operator can spot drift at a glance. Read-only.
+        Hosts still on the legacy flat layout (no slots.json) return slots all-null +
+        flat_layout=true. SSM read failure (host offline/unreachable) → 503.
+      x-source: deploy/lambda/api/services/host_service.py:1841
+      x-rbac: viewer
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: On-disk image state (+ DDB mirror for comparison).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  instance_id: {type: string}
+                  source: {type: string, enum: [host-disk]}
+                  slots:
+                    type: object
+                    properties:
+                      live: {type: [string, 'null']}
+                      canary: {type: [string, 'null']}
+                      previous_live: {type: [string, 'null']}
+                      generation: {type: integer}
+                  installed_versions:
+                    type: array
+                    items: {type: string}
+                  flat_layout: {type: boolean}
+                  mirror: {type: [object, 'null']}
+        '404':
+          description: Host not found (code NOT_FOUND).
+        '500':
+          description: Host slots.json unparseable (code SLOTS_CORRUPT).
+        '503':
+          description: Could not read from host via SSM — offline/unreachable (code DEPENDENCY_UNAVAILABLE).
+      tags:
+        - 主机与镜像
+  # #394 —— DELETE /hosts/{instance_id}/image-slots/canary (cleanupCanary) 已移除,精简 API。
+  # 放弃未提升的 canary 无需显式清指针:下次 `pull-image?slot=canary` 覆盖该槽,promote 成功也会
+  # 清空它;磁盘回收由 reclaim-images 承担(保护 {live,canary,previous_live}∪租户固定版本)。
+  /hosts/{instance_id}/reclaim-images:
+    post:
+      operationId: reclaimImages
+      summary: 回收该 host 上无人引用的版本目录(手动 prune,释放盘,#394)
+      description: >-
+        #394 — Manual disk prune. Deletes every versions/<snapshot>/ directory on the host that is
+        NOT in the protected keep-set. The keep-set is computed server-side (the host cannot see DDB
+        tenant pins) as {live, canary, previous_live} ∪ {every snapshot_time still pinned by a
+        non-deleted tenant on this host}, and passed to the host as an explicit allowlist — the host
+        only ever subtracts. Safety: launch-vm mounts versions/<snap>/rootfs as the read-only COW
+        backing file, so deleting an in-use version would break that VM's next boot (no-data-loss);
+        the prune is allowlist-only, fails loud (exit 1, deletes nothing) if it cannot list the full
+        versions/ inventory, and never follows symlinks out of versions/. Refuses with 409
+        NO_LIVE_VERSION when slots.json has no live (a flat/broken host) — pruning then could delete
+        the host's only bootable backing disk. Holds the image lease (mutual exclusion with
+        pull/promote/rollback/cleanup) so a half-pulled canary dir is never mistaken for an orphan.
+        Idempotent (re-run is harmless); supports Idempotency-Key.
+      x-source: deploy/lambda/api/services/image_slot_service.py:349
+      x-rbac: admin
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Reclaim completed (reclaimed_count may be 0 when nothing was orphaned).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: {type: string}
+                  instance_id: {type: string}
+                  kept_versions:
+                    type: array
+                    items: {type: string}
+                    description: The protected keep-set (slots pointers ∪ tenant-pinned versions).
+                  reclaimed_versions:
+                    type: array
+                    items: {type: string}
+                    description: Version dirs deleted this run.
+                  reclaimed_count: {type: integer}
+        '403':
+          description: RBAC denied (admin required).
+        '404':
+          description: Host not found.
+        '409':
+          description: >-
+            NO_LIVE_VERSION (host has no live in slots.json — reclaim refused so the host's only
+            bootable backing disk is never pruned) or IMAGE_OPERATION_IN_PROGRESS (pull/slot-op holds the lease).
+        '503':
+          description: OPERATION_STATUS_UNKNOWN (host did not confirm; safe to retry).
+      tags:
+        - 主机与镜像
+  /hosts/{instance_id}/pull-image-progress:
+    get:
+      operationId: pullImageProgress
+      summary: 查询单台宿主机 pull-image 进度(SageMaker ProcessingJob 风格)
+      description: >-
+        #309/#333 — Poll the progress of a pull-image job on ONE host. Reads the host's pull_command_id
+        from DDB, then SSM-tails /tmp/<job_id>.txt on the host: the last line decides the tri-state, and
+        the most recent ERROR:<CODE> line becomes the failure detail. Returns SageMaker ProcessingJob-style
+        JSON. If a terminal error was persisted to DDB (last_pull_error) but the progress file can't be
+        read (worker exited early), the status is forced to Failed so the host never appears stuck
+        InProgress. No pull_command_id → the host was never pulled (InProgress, last_status=null).
+      x-source: deploy/lambda/api/services/host_service.py:1441
+      x-rbac: viewer
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: job_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: >-
+            #394 — exact pull-job lookup. New clients SHOULD always pass it. Unknown job_id or a
+            job that belongs to a different host → 404 JOB_NOT_FOUND (never silently falls back
+            to "this host''s latest"). Absent (compat window) → the host''s most recent job, else
+            the legacy host.pull_command_id path. When the persisted job is already terminal, the
+            response is answered from the job record without SSM (survives host /tmp loss).
+            Adds state/phase/target_slot/requested_snapshot_time/result/error alongside the
+            legacy ProcessingJobStatus tri-state.
+      responses:
+        '200':
+          description: Progress snapshot (tri-state via ProcessingJobStatus).
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - instance_id
+                  - ProcessingJobStatus
+                properties:
+                  instance_id:
+                    type: string
+                  host_status:
+                    type: string
+                    description: Host DDB status (active/idle/upgrading) — NOT the pull status; do not conflate.
+                  job_id:
+                    type:
+                      - string
+                      - 'null'
+                    description: pull_command_id from the host row (null if never pulled).
+                  snapshot_time:
+                    type:
+                      - string
+                      - 'null'
+                    description: snapshot_time the host currently records (set on successful install).
+                  last_pull_error:
+                    type:
+                      - string
+                      - 'null'
+                    description: Last persisted failure reason (DDB), if any.
+                  ProcessingJobStatus:
+                    type: string
+                    enum:
+                      - Completed
+                      - Failed
+                      - InProgress
+                    description: Completed=last line SUCCESS; Failed=last line FAIL or DDB last_pull_error set; else InProgress.
+                  last_status:
+                    type:
+                      - string
+                      - 'null'
+                    description: Raw last line of the progress file (timestamp + what it was doing); null when no job.
+                  command_id:
+                    type: string
+                    description: SSM command id used to tail the progress file.
+                  ExitCode:
+                    type: integer
+                    enum:
+                      - 0
+                    description: Present only when Completed.
+                  ErrorCode:
+                    type:
+                      - string
+                      - 'null'
+                    description: >-
+                      Present only when Failed. One of DOWNLOAD_FAILED / ETAG_MISMATCH / MANIFEST_MISMATCH /
+                      UNZIP_FAILED / INSTALL_MV_FAILED / OWNERSHIP_CHECK_FAILED / UNKNOWN (see _PULL_ERROR_CODES).
+                  FailureReason:
+                    type: string
+                    description: Present only when Failed. Detail from the progress file's ERROR line, or DDB last_pull_error.
+              x-source: deploy/lambda/api/services/host_service.py:1498
+              examples:
+                inProgress:
+                  summary: phase2 unzipping (real ap-southeast-1 sample 2026-07-20)
+                  value:
+                    instance_id: i-0123456789abcdef0
+                    host_status: upgrading
+                    job_id: pull-491daf780b7d484a
+                    snapshot_time: '2026-07-20T10:21:17Z'
+                    last_pull_error: null
+                    ProcessingJobStatus: InProgress
+                    last_status: '2026-07-20T15:10:46Z phase2 [2/4]: unzipping openclaw-data-template-v1.2.ext4.gz to live'
+                    command_id: 4cdd0e05-6a6b-4cfc-ad2a-c20f75c8a68d
+                completed:
+                  summary: install succeeded
+                  value:
+                    instance_id: i-0123456789abcdef0
+                    host_status: active
+                    job_id: pull-476ffa9179294d5a
+                    snapshot_time: '2026-07-20T10:21:17Z'
+                    ProcessingJobStatus: Completed
+                    ExitCode: 0
+                    last_status: '2026-07-21T03:00:40Z SUCCESS'
+        '400':
+          description: Missing instance_id.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - VALIDATION
+        '403':
+          description: RBAC denied (viewer+ required when RBAC_ENABLED).
+        '404':
+          description: >-
+            Host instance_id not found (code NOT_FOUND), or a job_id was given but is unknown /
+            belongs to a different host (code JOB_NOT_FOUND — #394; never silently falls back to
+            this host''s latest job).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - NOT_FOUND
+                      - JOB_NOT_FOUND
+      tags:
+        - 主机与镜像
+  /hosts/{instance_id}/copy-file-from-s3:
+    post:
+      operationId: copyFileFromS3
+      summary: 从 S3 拷贝单个文件到宿主机指定位置(同步)
+      description: >-
+        #309/#334 — Copy ONE file from S3 to a specific path on ONE host (synchronous; single-file copy is
+        seconds). For updating host scripts only — the target must be under /opt/openclaw/ (.py host-agent
+        service) or /home/ubuntu/ (.sh + lib/*); the image-disk dir /data/firecracker-assets/ is off-limits
+        (that's pull-image's job). Landed file is chown ubuntu:ubuntu + chmod 755 (host-agent runs as
+        ubuntu; scripts/binaries must be executable). Atomic write (download to same-dir temp → verify →
+        chown/chmod → mv), so a truncated transfer never leaves a corrupt file. Path safety: rejects
+        directory/trailing-slash/bare-root targets, existing dir/symlink targets, and parent-directory
+        symlink escape (resolves the deepest existing ancestor and verifies it stays under an allowed root
+        before mkdir). NOTE (#335 follow-up): the pre-check is not a hard TOCTOU boundary against an
+        already-compromised host-ubuntu; not reachable from tenant microVMs.
+        Return shape merges the repo-standard _err (error+code) with a parseable ProcessingJobStatus, so
+        callers can judge success from the JSON alone without depending on the HTTP status code.
+      x-source: deploy/lambda/api/services/host_service.py:1319
+      x-rbac: operator
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - target
+                - s3_uri
+              properties:
+                target:
+                  type: string
+                  description: 'Absolute EC2 path, full filename, under /opt/openclaw/ or /home/ubuntu/ (no .., no trailing slash, not the dir itself).'
+                  example: /home/ubuntu/manifest3.json
+                s3_uri:
+                  type: string
+                  pattern: '^s3://.+'
+                  description: >-
+                    s3://<bucket>/<key> of the source object. API-layer check only requires the s3://
+                    prefix and length > "s3://" (so s3://bucket with no key passes API validation; a
+                    missing/invalid object then fails at the host aws s3 cp step → 502).
+                  example: s3://<assets-bucket>/deployment/rootfs/manifest.json
+      responses:
+        '200':
+          description: Copy done. Judge via ProcessingJobStatus=Completed (not just HTTP 200).
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ProcessingJobStatus
+                properties:
+                  instance_id:
+                    type: string
+                  target:
+                    type: string
+                  s3_uri:
+                    type: string
+                  ProcessingJobStatus:
+                    type: string
+                    enum:
+                      - Completed
+                  ExitCode:
+                    type: integer
+                    enum:
+                      - 0
+              x-source: deploy/lambda/api/services/host_service.py:1421
+              example:
+                instance_id: i-0123456789abcdef0
+                target: /home/ubuntu/manifest3.json
+                s3_uri: s3://<assets-bucket>/deployment/rootfs/manifest.json
+                ProcessingJobStatus: Completed
+                ExitCode: 0
+        '400':
+          description: Validation error (s3_uri not s3://, target outside allowlist / is a dir / contains ..).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - VALIDATION
+        '403':
+          description: RBAC denied (operator+ required when RBAC_ENABLED).
+        '500':
+          description: SSM send-command was never dispatched. ProcessingJobStatus=Failed, code=COPY_DISPATCH_FAILED.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - COPY_DISPATCH_FAILED
+                  instance_id:
+                    type: string
+                  target:
+                    type: string
+                  s3_uri:
+                    type: string
+                  ProcessingJobStatus:
+                    type: string
+                    enum:
+                      - Failed
+        '502':
+          description: >-
+            SSM invocation was dispatched but did not complete successfully — script failed (validation
+            reject / symlink escape / download failure / disk problem), OR the invocation never appeared /
+            timed out / was cancelled. ProcessingJobStatus=Failed, code=COPY_FAILED, error=SSM stderr tail
+            (or "copy-file failed (see SSM log)" when no output).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - COPY_FAILED
+                  instance_id:
+                    type: string
+                  target:
+                    type: string
+                  s3_uri:
+                    type: string
+                  ProcessingJobStatus:
+                    type: string
+                    enum:
+                      - Failed
+              x-source: deploy/lambda/api/services/host_service.py:1419
+              example:
+                error: '[copy-file] resolved parent escapes allowed roots: /etc (symlink escape?)'
+                code: COPY_FAILED
+                instance_id: i-0123456789abcdef0
+                target: /home/ubuntu/manifest3.json
+                s3_uri: s3://<assets-bucket>/deployment/rootfs/manifest.json
+                ProcessingJobStatus: Failed
+      tags:
+        - 主机与镜像
+  /hosts/refresh-rootfs:
+    post:
+      operationId: refreshRootfs
+      summary: 把当前黄金镜像预热到所有活跃/空闲宿主机
+      description: 'Reads manifest.json from S3, then dispatches ONE SSM RunShellScript command to every active/idle host to download and decompress the rootfs, data-template and (if present) immutable images. Fire-and-forget: returns as soon as the SSM command is sent, and optimistically stamps rootfs_version on each host row. No request body.'
+      x-source: deploy/lambda/api/services/host_service.py:321
+      x-rbac: operator
+      responses:
+        '200':
+          description: Refresh dispatched, or no active hosts to refresh.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    description: Dispatched.
+                    properties:
+                      message:
+                        type: string
+                        enum:
+                          - refresh started
+                      version:
+                        type: string
+                        description: Manifest version being staged.
+                      hosts:
+                        type: array
+                        items:
+                          type: string
+                        description: Instance ids the SSM command was sent to.
+                    x-source: deploy/lambda/api/services/host_service.py:395
+                  - type: object
+                    description: No active/idle hosts.
+                    properties:
+                      message:
+                        type: string
+                        enum:
+                          - no active hosts
+                      updated:
+                        type: integer
+                        enum:
+                          - 0
+                    x-source: deploy/lambda/api/services/host_service.py:339
+        '403':
+          description: RBAC denied (operator+ required when RBAC_ENABLED).
+        '500':
+          description: manifest.json not found in S3, or SSM send_command failed.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                x-source: deploy/lambda/api/services/host_service.py:325
+      tags:
+        - 主机与镜像
+  /hosts/rootfs-version:
+    get:
+      operationId: getRootfsVersion
+      summary: 当前黄金镜像清单版本
+      x-source: deploy/lambda/api/services/host_service.py:199
+      x-rbac: viewer
+      responses:
+        '200':
+          description: Manifest version ("unknown" when manifest.json is missing/unreadable).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version:
+                    type: string
+                    description: manifest.json "version", or "unknown" fallback.
+                    x-source: deploy/lambda/api/services/host_service.py:201
+        '403':
+          description: RBAC denied (viewer required when RBAC_ENABLED).
+      tags:
+        - 主机与镜像
+  /hosts/rootfs-drift:
+    get:
+      operationId: getRootfsDrift
+      summary: 哪些租户还没升到当前镜像版本
+      description: Rolling-upgrade companion. Pages the whole tenants table (non-deleted) and buckets each tenant by comparing its rootfs_version to the current manifest version. Pure read.
+      x-source: deploy/lambda/api/services/host_service.py:203
+      x-rbac: viewer
+      responses:
+        '200':
+          description: Drift report.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  current_version:
+                    type: string
+                  up_to_date:
+                    type: integer
+                  unknown:
+                    type: integer
+                    description: Tenants with no rootfs_version attribute.
+                  stale_count:
+                    type: integer
+                  stale:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        rootfs_version:
+                          type: string
+                        host_id:
+                          type: string
+                x-source: deploy/lambda/api/services/host_service.py:239
+        '403':
+          description: RBAC denied (viewer required when RBAC_ENABLED).
+      tags:
+        - 主机与镜像
+  /hosts/fleet-power:
+    post:
+      operationId: fleetPower
+      summary: 启停所有宿主机上的每一台 microVM(舰队电源)
+      description: 'Highest-blast-radius control-plane operation. Dispatches ONE SSM command per host list (single send_command with all InstanceIds) running the host-local start-all-vms.sh / stop-all-vms.sh fan-out, then best-effort reconciles tenant status rows (running<->stopped only, CAS-guarded). Double auth layer: the RBAC route gate requires operator+, and the handler additionally requires an admin identity — the admin gate keys off identity, not the RBAC_ENABLED flag, so disabling RBAC cannot open it to non-admin Cognito users (fleet_service.py:118-131).'
+      x-source: deploy/lambda/api/services/fleet_service.py:103
+      x-rbac: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - action
+              properties:
+                action:
+                  type: string
+                  enum:
+                    - start
+                    - stop
+                  description: Must be a JSON string. A non-string action (list/dict) is caught by an isinstance guard and returns 400 instead of an unhashable-type 500 (fleet_service.py:135-141).
+                  x-source: deploy/lambda/api/services/fleet_service.py:138
+      responses:
+        '200':
+          description: No active/idle hosts — nothing dispatched.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  action:
+                    type: string
+                  hosts:
+                    type: integer
+                    enum:
+                      - 0
+                  message:
+                    type: string
+                    enum:
+                      - no active hosts
+                x-source: deploy/lambda/api/services/fleet_service.py:153
+        '202':
+          description: Fan-out dispatched (fire-and-forget; state converges via host-agent).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  action:
+                    type: string
+                    enum:
+                      - start
+                      - stop
+                  hosts:
+                    type: integer
+                    description: Number of hosts dispatched to.
+                  command_id:
+                    type: string
+                    description: The single SSM CommandId covering all hosts.
+                  reconciled:
+                    type: integer
+                    description: Tenant rows flipped running<->stopped by the reconcile pass.
+                  status:
+                    type: string
+                    enum:
+                      - dispatched
+                  message:
+                    type: string
+                x-source: deploy/lambda/api/services/fleet_service.py:261
+        '400':
+          description: action missing, non-string, or not one of start/stop.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: action must be one of ['start', 'stop']
+                x-source: deploy/lambda/api/services/fleet_service.py:139
+        '403':
+          description: Caller identity is not admin (in-handler gate), or RBAC route gate denied.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: 'forbidden: fleet-power requires admin'
+                  required:
+                    type: string
+                    enum:
+                      - admin
+                x-source: deploy/lambda/api/services/fleet_service.py:129
+        '502':
+          description: SSM send_command failed.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                x-source: deploy/lambda/api/services/fleet_service.py:183
+      tags:
+        - 主机与镜像
+  /images:
+    get:
+      operationId: listImages
+      summary: 列出 S3 里的黄金镜像产物 + 当前清单
+      description: Read-only inventory of the rootfs S3 prefix. Classifies each object by filename into a kind bucket and reports which version manifest.json currently points at. Never exposes image bytes. Query parameters are accepted by the function signature but ignored.
+      x-source: deploy/lambda/api/services/host_service.py:260
+      x-rbac: viewer
+      responses:
+        '200':
+          description: Artifact inventory.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  live_version:
+                    type: string
+                    description: manifest.json "version", or "unknown".
+                  manifest:
+                    type: object
+                    description: The raw manifest.json content ({} when unreadable).
+                  artifact_count:
+                    type: integer
+                  artifacts:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name:
+                          type: string
+                          description: Object filename (last path segment).
+                        kind:
+                          type: string
+                          enum:
+                            - data-template
+                            - rootfs
+                            - kernel
+                            - integrity-baseline
+                            - manifest
+                            - other
+                          description: Filename-based classification (checked in this order; "data-template" wins over "rootfs").
+                          x-source: deploy/lambda/api/services/host_service.py:283
+                        size_bytes:
+                          type: integer
+                        last_modified:
+                          type:
+                            - string
+                            - 'null'
+                          format: date-time
+                        is_backup:
+                          type: boolean
+                          description: True when the filename contains ".bak".
+                x-source: deploy/lambda/api/services/host_service.py:311
+        '403':
+          description: RBAC denied (viewer required when RBAC_ENABLED).
+        '500':
+          description: S3 list failed.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: 'list images failed: ...'
+                x-source: deploy/lambda/api/services/host_service.py:309
+        '503':
+          description: ASSETS_BUCKET env not configured.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    enum:
+                      - ASSETS_BUCKET not configured
+                x-source: deploy/lambda/api/services/host_service.py:271
+      tags:
+        - 主机与镜像
+  /delete-image-snapshot:
+    post:
+      operationId: deleteImageSnapshot
+      summary: 软删除一条镜像快照记录(#394,引用保护)
+      description: >-
+        #394 — Soft-delete a global image snapshot record. Symmetric with
+        POST /create-image-snapshot: takes snapshot_time in the JSON body (not a colon-bearing
+        ISO timestamp in the path). Marks the version-snapshots row status=deleted + deleted_at
+        (does NOT physically remove the DDB row, S3 deployment/ objects, or hosts' local version
+        dirs) — auditable and recoverable. After delete the snapshot is dropped from
+        GET /list_image_versions and pull-image (live/canary) rejects it (404). Reference-protected:
+        refuses (409 IMAGE_VERSION_IN_USE) if any host slot (live/canary/previous_live) or any
+        non-deleted tenant's image_snapshot_time still pins it. Idempotent: already-deleted → 200;
+        never-existed → 404 NOT_FOUND. Uses a conditional update (attribute_exists) to guard TOCTOU.
+        operator+.
+      x-source: deploy/lambda/api/services/host_service.py:1183
+      x-rbac: operator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [snapshot_time]
+              properties:
+                snapshot_time:
+                  type: string
+                  pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$'
+                  description: 'ISO8601 UTC snapshot key to soft-delete.'
+      responses:
+        '200':
+          description: Snapshot record marked deleted (or already-deleted idempotent replay).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: {type: string}
+                  snapshot_time: {type: string}
+                  label: {type: string}
+                  status: {type: string, enum: [deleted]}
+                  note: {type: string}
+        '400':
+          description: Missing/invalid snapshot_time (code VALIDATION).
+        '403':
+          description: RBAC denied (operator+ required).
+        '404':
+          description: Snapshot record never existed (code NOT_FOUND).
+        '409':
+          description: >-
+            Still referenced by a host slot (live/canary/previous_live) or a tenant's
+            image_snapshot_time (code IMAGE_VERSION_IN_USE); repoint/rebuild/delete the
+            referencing hosts/tenants first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: {type: string}
+                  code: {type: string, enum: [IMAGE_VERSION_IN_USE]}
+        '503':
+          description: VERSION_SNAPSHOTS_TABLE not configured (code NOT_CONFIGURED).
+      tags:
+        - 主机与镜像
+  /create-image-snapshot:
+    post:
+      operationId: createImageSnapshot
+      summary: 给 assets 桶打一个版本快照(等价 snapshot-version.sh)
+      description: >-
+        #376. Take a version snapshot of the assets bucket: scans the S3 `deployment/` prefix for ALL
+        current-version objects (rootfs image + scripts + edge + litellm + monitoring), records each
+        object's {path, s3_version_id, etag}, and writes one row to DynamoDB openclaw-version-snapshots
+        (primary key snapshot_time, format %Y-%m-%dT%H:%M:%SZ — matches the regex pull-image enforces, so
+        a fresh snapshot is immediately pullable). API equivalent of scripts/snapshot-version.sh; pairs with
+        GET /list_image_versions (list) and POST /hosts/{id}/pull-image?snapshot_time= (pull). The bucket is
+        read from the ASSETS_BUCKET env var, NOT a client parameter. The DDB write is conditional
+        (attribute_not_exists) so two calls in the same second collide → 409 (snapshots are immutable).
+      x-source: deploy/lambda/api/services/host_service.py:1030
+      x-rbac: operator
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                label:
+                  type: string
+                  pattern: '^[A-Za-z0-9._-]{1,128}$'
+                  description: >-
+                    Optional human label for the console snapshot list. If omitted/blank, the backend
+                    auto-derives it from the `version` field of deployment/rootfs/manifest.json.
+      responses:
+        '200':
+          description: Snapshot written.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  snapshot_time:
+                    type: string
+                    description: ISO8601 UTC snapshot key (%Y-%m-%dT%H:%M:%SZ); pass to pull-image?snapshot_time=.
+                  label:
+                    type: string
+                    description: Effective label (auto-derived when not supplied; "" if manifest had no version).
+                  file_count:
+                    type: integer
+                    description: Number of objects captured under deployment/.
+              x-source: deploy/lambda/api/services/host_service.py:1030
+        '400':
+          description: Bad body or label (code VALIDATION).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - VALIDATION
+        '403':
+          description: RBAC denied (operator+ required when RBAC_ENABLED) / missing x-api-key at API GW.
+        '409':
+          description: Same-second key collision; snapshot immutable, retry in a moment (code CONFLICT).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - CONFLICT
+        '500':
+          description: 0 files found under deployment/ — refuse to write empty snapshot (code EMPTY_SNAPSHOT).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - EMPTY_SNAPSHOT
+        '503':
+          description: VERSION_SNAPSHOTS_TABLE or ASSETS_BUCKET not configured.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - NOT_CONFIGURED
+      tags:
+        - 主机与镜像
+  /list_image_versions:
+    get:
+      operationId: listImageVersions
+      summary: 列出黄金镜像的各版本快照(供选择时间点 pull)
+      description: >-
+        #337(原 #217 GET /snapshots,改名避免与 /images 列镜像文件混淆)。Read-only listing of the
+        version-snapshots table metadata (snapshot_time + label + file_count) so the console can let an
+        operator pick which point-in-time snapshot to pull onto a host (pairs with
+        POST /hosts/{id}/pull-image?snapshot_time=). Sorted by snapshot_time descending (newest first).
+        Does NOT return the large per-snapshot `files` blob (read only at pull time). Distinct from
+        GET /images, which lists the S3 golden-image FILE artifacts.
+      x-source: deploy/lambda/api/services/host_service.py:952
+      x-rbac: viewer
+      responses:
+        '200':
+          description: Snapshot metadata list, newest first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    snapshot_time:
+                      type: string
+                      description: ISO8601 UTC snapshot key; pass to pull-image?snapshot_time=.
+                    label:
+                      type: string
+                      description: Human label (auto-filled from manifest.json rootfs version at snapshot time); "" if none.
+                    file_count:
+                      type: integer
+                      description: Number of files recorded in the snapshot.
+              x-source: deploy/lambda/api/services/host_service.py:959
+        '403':
+          description: RBAC denied (viewer required when RBAC_ENABLED).
+        '503':
+          description: VERSION_SNAPSHOTS_TABLE not configured.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - NOT_CONFIGURED
+      tags:
+        - 主机与镜像
+  /system/info:
+    get:
+      operationId: getSystemInfo
+      summary: 控制台用的功能开关与配置快照
+      description: Read-only snapshot of env-derived stack configuration so the console Settings tab can render feature state without an out-of-band copy of config.yml. All values come from Lambda environment variables wired in deploy/stacks/lambdas.py.
+      x-source: deploy/lambda/api/handler.py:688
+      x-rbac: viewer
+      responses:
+        '200':
+          description: Config snapshot.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version:
+                    type: string
+                    description: env PROJECT_VERSION, default "dev".
+                    x-source: deploy/lambda/api/handler.py:699
+                  region:
+                    type: string
+                  agentcore:
+                    type: object
+                    properties:
+                      enabled:
+                        type: boolean
+                        description: env AGENTCORE_ENABLED == "true".
+                      gateway_url:
+                        type:
+                          - string
+                          - 'null'
+                  metrics:
+                    type: object
+                    properties:
+                      enabled:
+                        type: boolean
+                        description: True when AMP_REMOTE_WRITE_URL is set.
+                      amp_remote_write_url:
+                        type:
+                          - string
+                          - 'null'
+                      grafana_url:
+                        type:
+                          - string
+                          - 'null'
+                  multi_az:
+                    type: object
+                    properties:
+                      enabled:
+                        type: boolean
+                      az_count:
+                        type: integer
+                        description: env MULTI_AZ_COUNT
+                        default 1.: null
+                  waf:
+                    type: object
+                    properties:
+                      enabled:
+                        type: boolean
+                  cognito:
+                    type: object
+                    properties:
+                      enabled:
+                        type: boolean
+                        description: Driven by CONSOLE_AUTH_ENABLED (not COGNITO_USER_POOL_ID — 1.2.9 fix).
+                      user_pool_id:
+                        type:
+                          - string
+                          - 'null'
+                      rbac_enabled:
+                        type: boolean
+                        description: env RBAC_ENABLED (default true)
+                        independent switch from login.: null
+                  notifications:
+                    type: object
+                    properties:
+                      enabled:
+                        type: boolean
+                      topic_arn:
+                        type:
+                          - string
+                          - 'null'
+                  quotas:
+                    type: object
+                    properties:
+                      enabled:
+                        type: boolean
+                        description: env QUOTAS_ENABLED
+                        default false.: null
+                      max_vcpu_per_tenant:
+                        type: integer
+                        description: 0 = unlimited.
+                      max_mem_mb_per_tenant:
+                        type: integer
+                      max_data_disk_mb:
+                        type: integer
+                  host_config:
+                    type: object
+                    properties:
+                      cpu_overcommit_ratio:
+                        type: number
+                        description: float
+                        default 1.0.: null
+                      mem_overcommit_ratio:
+                        type: number
+                      vm_default_vcpu:
+                        type: integer
+                        description: default 2.
+                      vm_default_mem_mb:
+                        type: integer
+                        description: default 4096.
+                x-source: deploy/lambda/api/handler.py:696
+        '403':
+          description: RBAC denied (viewer required when RBAC_ENABLED).
+      tags:
+        - 运维与审计
+  /admin/edge/instances:
+    get:
+      operationId: listEdgeInstances
+      summary: 列出 edge OpenResty 舰队实例(P7 两级路由)
+      description: 'Read-only list of the edge OpenResty fleet (ASG openclaw-edge-asg): per-instance lifecycle/health/target-health/private_ip plus ASG min/max/desired. Returns 500 EDGE_STACK_NOT_DEPLOYED when edge.enabled=false or the edge stack is not deployed. target_health is null with a note until elbv2:DescribeTarget* IAM is added to the api Lambda (P5).'
+      tags: [运维与审计]
+      x-source: deploy/lambda/api/services/edge_admin.py:87
+      x-rbac: operator
+      responses:
+        '200':
+          description: Edge fleet snapshot.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  asg_name:
+                    type: string
+                  asg:
+                    type: object
+                    properties:
+                      min_size: { type: integer }
+                      max_size: { type: integer }
+                      desired_capacity: { type: integer }
+                  instances:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        instance_id: { type: string }
+                        availability_zone: { type: string }
+                        lifecycle_state: { type: string }
+                        health_status: { type: string }
+                        target_health: { type: string, nullable: true }
+                        target_health_reason: { type: string }
+                        private_ip: { type: string }
+                        launched_at: { type: string }
+                  generated_at: { type: string, format: date-time }
+                  notes:
+                    type: array
+                    items: { type: string }
+        '500':
+          description: Edge stack not deployed (EDGE_STACK_NOT_DEPLOYED).
+  /admin/edge/metrics:
+    get:
+      operationId: listEdgeMetrics
+      summary: edge 舰队聚合指标(P4-③ stub,P6 观测接线后填真值)
+      description: 'Aggregated edge metrics skeleton. Currently a stub: per-instance metrics/reachable return null (not 0, to avoid the UI showing an un-reported 0). Reuses list_edge_instances for the ASG/IP data plane. P6 observability wiring replaces the stub with CloudWatch GetMetricData / AMP scrape (l1/l2/l3/cache_hit_rate/upstream_latency).'
+      tags: [运维与审计]
+      x-source: deploy/lambda/api/services/edge_admin.py:150
+      x-rbac: operator
+      responses:
+        '200':
+          description: Edge metrics (stub until P6).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  generated_at: { type: string, format: date-time }
+                  metrics_source: { type: string, example: stub }
+                  instances:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        instance_id: { type: string }
+                        private_ip: { type: string }
+                        reachable: { type: boolean, nullable: true }
+                        metrics: { type: object, nullable: true }
+                  notes:
+                    type: array
+                    items: { type: string }
+        '500':
+          description: Edge stack not deployed (EDGE_STACK_NOT_DEPLOYED).
+  /agentcore/status:
+    get:
+      operationId: getAgentcoreStatus
+      summary: AgentCore Gateway 启用状态
+      x-source: deploy/lambda/api/services/console_info.py:69
+      x-rbac: viewer
+      responses:
+        '200':
+          description: Enablement flag + gateway URL.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled:
+                    type: boolean
+                    description: env AGENTCORE_ENABLED == "true".
+                  gateway_url:
+                    type:
+                      - string
+                      - 'null'
+                    description: env AGENTCORE_GATEWAY_URL; null when AgentCore is disabled.
+                x-source: deploy/lambda/api/services/console_info.py:72
+        '403':
+          description: RBAC denied (viewer required when RBAC_ENABLED).
+      tags:
+        - 运维与审计
+  /agentcore/tools:
+    get:
+      operationId: listAgentcoreTools
+      summary: 列出注册到 AgentCore Gateway 的 MCP 工具
+      description: Static list hard-coded at deploy time (hello / system_info / timestamp, defined declaratively in stack.py) — NOT a live bedrock-agentcore list_targets() call. Empty list with enabled=false when AgentCore is off.
+      x-source: deploy/lambda/api/services/console_info.py:121
+      x-rbac: viewer
+      responses:
+        '200':
+          description: Tool list.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled:
+                    type: boolean
+                  tools:
+                    type: array
+                    description: Empty when disabled; the 3 built-in tools when enabled.
+                    items:
+                      type: object
+                      properties:
+                        name:
+                          type: string
+                          enum:
+                            - hello
+                            - system_info
+                            - timestamp
+                        description:
+                          type: string
+                        input_schema:
+                          type: object
+                          description: JSON-Schema fragment for the tool input.
+                    x-source: deploy/lambda/api/services/console_info.py:96
+        '403':
+          description: RBAC denied (viewer required when RBAC_ENABLED).
+      tags:
+        - 运维与审计
+  /tenantmatch:
+    get:
+      operationId: tenantMatch
+      summary: 登录前:外部平台→Cognito IdP 路由查询
+      description: 'Handler + Lambda routing + DDB table + IAM read grant exist, but deploy/stacks/lambdas.py does not add a tenantmatch API Gateway resource. API Gateway therefore rejects this path before Lambda; this operation is documented-but-unreachable. Intended semantics: a client calls this before Cognito login to resolve platform_id to idp_provider_name. It leaks no tenant data. If the resource is wired later, the API Gateway x-api-key requirement still applies.'
+      x-source: deploy/lambda/api/handler.py:649
+      x-rbac: none
+      x-status: documented-but-unreachable
+      x-tracking-issue: 159
+      parameters:
+        - name: platform_id
+          in: query
+          required: true
+          schema:
+            type: string
+            pattern: ^[a-zA-Z0-9._-]{1,128}$
+            description: Validated against _PLATFORM_ID_RE (core/utils.py:110, anchored with \Z).
+      responses:
+        '200':
+          description: IdP routing found.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  platform_id:
+                    type: string
+                  idp_provider_name:
+                    type: string
+                    description: Cognito identity-provider name to pass to federatedSignIn.
+                  issuer_url:
+                    type: string
+                    description: Public OIDC metadata; "" when absent.
+                x-source: deploy/lambda/api/handler.py:678
+        '400':
+          description: platform_id missing or fails the pattern.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - VALIDATION
+                x-source: deploy/lambda/api/handler.py:666
+        '404':
+          description: Federation table not configured (code NOT_CONFIGURED) or platform not registered (code NOT_FOUND).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - NOT_CONFIGURED
+                      - NOT_FOUND
+                x-source: deploy/lambda/api/handler.py:670
+        '502':
+          description: DDB lookup raised (fail-loud, exception class name only).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: 'idp map lookup failed: ClientError'
+                  code:
+                    type: string
+                    enum:
+                      - UPSTREAM
+                x-source: deploy/lambda/api/handler.py:674
+      tags:
+        - 联邦与外部授权
+  /external/authz:
+    post:
+      operationId: externalAuthz
+      summary: 外部后端写入权威的用户↔租户授权映射
+      description: 'Config-gated (env EXTERNAL_AUTHZ, default false — returns 404 when disabled). Authenticated by HMAC signature, NOT Cognito/RBAC: the route is in _RBAC_SKIP (core/auth.py:589) and verified inside the handler. Signature = HMAC-SHA256(EXTERNAL_AUTHZ_SECRET, "{timestamp}.{raw_body}") hex digest, compared with hmac.compare_digest; timestamp must be unix seconds within +/-EXTERNAL_AUTHZ_TS_WINDOW (default 300s) for replay protection. Writes grant/revoke into the tenant''s authorized_users map.'
+      x-source: deploy/lambda/api/handler.py:513
+      x-rbac: hmac
+      parameters:
+        - name: x-claw-authz-signature
+          in: header
+          required: true
+          schema:
+            type: string
+          description: Hex HMAC-SHA256 of "{timestamp}.{raw_body}" keyed by the shared secret. The secret itself never transits the API.
+          x-source: deploy/lambda/api/handler.py:534
+          x-sensitive: true
+        - name: x-claw-authz-timestamp
+          in: header
+          required: true
+          schema:
+            type: string
+            description: Unix seconds as string; parsed with int().
+          x-source: deploy/lambda/api/handler.py:539
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - tenant_id
+              properties:
+                tenant_id:
+                  type: string
+                tenant_user_id:
+                  type: string
+                  description: External user id; used when principal is absent. One of principal/tenant_user_id is required.
+                principal:
+                  type: string
+                  description: Cognito sub the hub will match. Takes precedence over tenant_user_id.
+                  x-source: deploy/lambda/api/handler.py:566
+                op:
+                  type: string
+                  enum:
+                    - grant
+                    - revoke
+                  default: grant
+                  x-source: deploy/lambda/api/handler.py:569
+                role:
+                  type: string
+                  default: member
+                  description: Stored on the grant; free-form string, defaults to "member" (also when blank).
+                  x-source: deploy/lambda/api/handler.py:590
+                expire_at:
+                  type: number
+                  description: Optional unix-seconds expiry; stored (as int) only when numeric and > 0, otherwise silently ignored.
+                  x-source: deploy/lambda/api/handler.py:592
+      responses:
+        '200':
+          description: Grant/revoke persisted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    description: tenant_id echoed back.
+                  op:
+                    type: string
+                    enum:
+                      - grant
+                      - revoke
+                  principal:
+                    type: string
+                x-source: deploy/lambda/api/handler.py:604
+        '400':
+          description: Invalid JSON body, missing tenant_id/principal, or op not grant/revoke.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                x-source: deploy/lambda/api/handler.py:564
+        '401':
+          description: Missing signature/timestamp, non-integer timestamp, timestamp outside window, or bad signature.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    enum:
+                      - missing signature/timestamp
+                      - bad timestamp
+                      - timestamp outside window
+                      - bad signature
+                x-source: deploy/lambda/api/handler.py:544
+        '404':
+          description: Feature disabled (env EXTERNAL_AUTHZ false) or tenant not found.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    enum:
+                      - external authz disabled
+                      - tenant not found
+                x-source: deploy/lambda/api/handler.py:529
+        '503':
+          description: EXTERNAL_AUTHZ on but EXTERNAL_AUTHZ_SECRET not configured.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    enum:
+                      - external authz secret not configured
+                x-source: deploy/lambda/api/handler.py:531
+      tags:
+        - 联邦与外部授权
+  /groups:
+    get:
+      operationId: listGroups
+      summary: 列出所有技能分组
+      description: Returns every group item from the groups DynamoDB table (full scan). Requires API Gateway `x-api-key` (route wiring in deploy/stacks/lambdas.py).
+      tags:
+        - 技能与模板
+      x-source: deploy/lambda/api/routes/skills_groups.py:14
+      x-rbac: viewer
+      responses:
+        '200':
+          description: Group list.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - groups
+                properties:
+                  groups:
+                    type: array
+                    description: Raw group items from DynamoDB.
+                    items:
+                      type: object
+                      properties:
+                        name:
+                          type: string
+                          description: Group name (DNS-label rules enforced at create time).
+                          x-source: deploy/lambda/api/routes/skills_groups.py:50
+                        skills:
+                          type: array
+                          items:
+                            type: string
+                          description: Sorted, de-duplicated skill names in the group.
+                          x-source: deploy/lambda/api/routes/skills_groups.py:51
+                        description:
+                          type: string
+                          x-source: deploy/lambda/api/routes/skills_groups.py:52
+                        created_at:
+                          type: string
+                          description: ISO 8601 UTC creation timestamp.
+                          x-source: deploy/lambda/api/routes/skills_groups.py:53
+        '403':
+          description: RBAC denied (viewer role required when RBAC_ENABLED).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  rbac:
+                    type: object
+                    properties:
+                      role:
+                        type: string
+                      required:
+                        type: string
+                x-source: deploy/lambda/api/core/auth.py:601-607
+        '500':
+          description: DynamoDB scan failure.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    description: Human-readable error message. NOTE — this domain returns bare {"error"} without a "code" field.
+        '503':
+          description: Groups table not configured (pre-1.4.0 deployment).
+          x-source: deploy/lambda/api/routes/skills_groups.py:17
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    description: Human-readable error message. NOTE — this domain returns bare {"error"} without a "code" field.
+    post:
+      operationId: createGroup
+      summary: 创建技能分组
+      description: Creates a group with an optional initial skill list. Group names reuse the tenant DNS-label rules. The skills array is de-duplicated and sorted server-side; empty strings are dropped. Fails with 409 if the group already exists (conditional put). Requires `x-api-key` (route wiring in deploy/stacks/lambdas.py). Mutations through the api Lambda are audit-logged.
+      tags:
+        - 技能与模板
+      x-source: deploy/lambda/api/routes/skills_groups.py:23
+      x-rbac: operator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+                  pattern: ^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$
+                  description: Group name, DNS-label rules (max 32 chars). Same regex as tenant names.
+                  x-source: deploy/lambda/api/core/utils.py:100
+                skills:
+                  type: array
+                  items:
+                    type: string
+                  default: []
+                  description: Initial skill names. Must be a list of strings; individual entries are NOT validated against the skill-name regex.
+                  x-source: deploy/lambda/api/routes/skills_groups.py:43-45
+                description:
+                  type: string
+                  default: ''
+                  description: Free-text description (whitespace-trimmed).
+                  x-source: deploy/lambda/api/routes/skills_groups.py:46
+      responses:
+        '201':
+          description: Group created; returns the stored item.
+          x-source: deploy/lambda/api/routes/skills_groups.py:65
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - name
+                  - skills
+                  - description
+                  - created_at
+                properties:
+                  name:
+                    type: string
+                  skills:
+                    type: array
+                    items:
+                      type: string
+                  description:
+                    type: string
+                  created_at:
+                    type: string
+        '400':
+          description: Invalid JSON body, missing name, name fails the DNS-label regex, or skills is not a list of strings.
+          x-source: deploy/lambda/api/routes/skills_groups.py:33-45
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    description: Human-readable error message. NOTE — this domain returns bare {"error"} without a "code" field.
+        '403':
+          description: RBAC denied (operator role required).
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    description: Human-readable error message. NOTE — this domain returns bare {"error"} without a "code" field.
+        '409':
+          description: A group with this name already exists.
+          x-source: deploy/lambda/api/routes/skills_groups.py:61-62
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    description: Human-readable error message. NOTE — this domain returns bare {"error"} without a "code" field.
+        '500':
+          description: DynamoDB write failure.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    description: Human-readable error message. NOTE — this domain returns bare {"error"} without a "code" field.
+        '503':
+          description: Groups table not configured.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    description: Human-readable error message. NOTE — this domain returns bare {"error"} without a "code" field.
+  /groups/{name}/skills:
+    post:
+      operationId: addSkillToGroup
+      summary: 给分组追加技能(幂等)
+      description: Adds one skill name to the group's set. Idempotent — re-adding an existing skill returns 200 with the unchanged set. The skill value is only checked for non-emptiness, NOT against the skill-name regex. Requires `x-api-key` (route wiring in deploy/stacks/lambdas.py).
+      tags:
+        - 技能与模板
+      x-source: deploy/lambda/api/routes/skills_groups.py:66
+      x-rbac: operator
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Group name. Not re-validated against the regex here; a nonexistent group yields 404.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - skill
+              properties:
+                skill:
+                  type: string
+                  minLength: 1
+                  description: Skill name to add (whitespace-trimmed, must be non-empty).
+                  x-source: deploy/lambda/api/routes/skills_groups.py:74-76
+      responses:
+        '200':
+          description: Updated (sorted) skill set for the group.
+          x-source: deploy/lambda/api/routes/skills_groups.py:88
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - name
+                  - skills
+                properties:
+                  name:
+                    type: string
+                  skills:
+                    type: array
+                    items:
+                      type: string
+        '400':
+          description: Invalid JSON body or missing/empty skill field.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    description: Human-readable error message. NOTE — this domain returns bare {"error"} without a "code" field.
+        '403':
+          description: RBAC denied (operator role required).
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    description: Human-readable error message. NOTE — this domain returns bare {"error"} without a "code" field.
+        '404':
+          description: Group not found.
+          x-source: deploy/lambda/api/routes/skills_groups.py:79-80
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    description: Human-readable error message. NOTE — this domain returns bare {"error"} without a "code" field.
+        '500':
+          description: DynamoDB read/write failure.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    description: Human-readable error message. NOTE — this domain returns bare {"error"} without a "code" field.
+        '503':
+          description: Groups table not configured.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    description: Human-readable error message. NOTE — this domain returns bare {"error"} without a "code" field.
+  /groups/{name}/skills/{skill}:
+    delete:
+      operationId: removeSkillFromGroup
+      summary: 从分组移除技能(幂等)
+      description: Removes one skill from the group's set via set.discard — removing a skill that is not in the group still returns 200. 404 only when the group itself does not exist. Requires `x-api-key` (route wiring in deploy/stacks/lambdas.py).
+      tags:
+        - 技能与模板
+      x-source: deploy/lambda/api/routes/skills_groups.py:91
+      x-rbac: operator
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Group name.
+        - name: skill
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Skill name to remove.
+      responses:
+        '200':
+          description: Updated (sorted) skill set after removal.
+          x-source: deploy/lambda/api/routes/skills_groups.py:106
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - name
+                  - skills
+                properties:
+                  name:
+                    type: string
+                  skills:
+                    type: array
+                    items:
+                      type: string
+        '403':
+          description: RBAC denied (operator role required).
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    description: Human-readable error message. NOTE — this domain returns bare {"error"} without a "code" field.
+        '404':
+          description: Group not found.
+          x-source: deploy/lambda/api/routes/skills_groups.py:97-98
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    description: Human-readable error message. NOTE — this domain returns bare {"error"} without a "code" field.
+        '500':
+          description: DynamoDB read/write failure.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    description: Human-readable error message. NOTE — this domain returns bare {"error"} without a "code" field.
+        '503':
+          description: Groups table not configured.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    description: Human-readable error message. NOTE — this domain returns bare {"error"} without a "code" field.
+  /skills/{name}:
+    get:
+      operationId: readSkill
+      summary: 读技能的 SKILL.md 内容
+      description: Returns the raw SKILL.md markdown for the console editor. Routed through the api Lambda for RBAC and audit reuse (route wiring in deploy/stacks/lambdas.py). Requires `x-api-key`.
+      tags:
+        - 技能与模板
+      x-source: deploy/lambda/api/routes/skills_groups.py:111
+      x-rbac: viewer
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: ^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$
+          description: Skill name (lowercase letters, digits, hyphens; max 64 chars).
+          x-source: deploy/lambda/api/routes/skills_groups.py:109
+      responses:
+        '200':
+          description: Skill content and metadata.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - name
+                  - content
+                  - size
+                properties:
+                  name:
+                    type: string
+                  content:
+                    type: string
+                    description: Full SKILL.md markdown (UTF-8, replacement chars on decode errors).
+                    x-source: deploy/lambda/api/routes/skills_groups.py:127
+                  size:
+                    type: integer
+                    description: S3 object ContentLength in bytes.
+                    x-source: deploy/lambda/api/routes/skills_groups.py:133
+                  last_modified:
+                    type:
+                      - string
+                      - 'null'
+                    description: ISO 8601 S3 LastModified, null when unavailable.
+                    x-source: deploy/lambda/api/routes/skills_groups.py:134-136
+        '400':
+          description: Skill name fails the regex.
+          x-source: deploy/lambda/api/routes/skills_groups.py:119-120
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    description: Human-readable error message. NOTE — this domain returns bare {"error"} without a "code" field.
+        '403':
+          description: RBAC denied (viewer role required).
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    description: Human-readable error message. NOTE — this domain returns bare {"error"} without a "code" field.
+        '404':
+          description: Skill (skills/{name}/SKILL.md) does not exist.
+          x-source: deploy/lambda/api/routes/skills_groups.py:139-145
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    description: Human-readable error message. NOTE — this domain returns bare {"error"} without a "code" field.
+        '500':
+          description: S3 read failure.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    description: Human-readable error message. NOTE — this domain returns bare {"error"} without a "code" field.
+        '503':
+          description: ASSETS_BUCKET not configured.
+          x-source: deploy/lambda/api/routes/skills_groups.py:122-123
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    description: Human-readable error message. NOTE — this domain returns bare {"error"} without a "code" field.
+    put:
+      operationId: updateSkill
+      summary: 创建/替换技能的 SKILL.md
+      description: 'Uploads the markdown to s3://$ASSETS_BUCKET/skills/{name}/SKILL.md. Content must be valid UTF-8, at most 262144 bytes (256 KiB), and contain at least one non-empty top-level "# Title" line. The per-host S3 cron sync picks the file up within ~5 min; new VMs receive it at launch. NOTE: over-size content returns 400, not 413. Requires `x-api-key`; mutation is audit-logged via the api Lambda.'
+      tags:
+        - 技能与模板
+      x-source: deploy/lambda/api/routes/skills_groups.py:147
+      x-rbac: operator
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: ^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$
+          description: Skill name (lowercase letters, digits, hyphens; max 64 chars).
+          x-source: deploy/lambda/api/routes/skills_groups.py:109
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - content
+              properties:
+                content:
+                  type: string
+                  minLength: 1
+                  description: SKILL.md markdown. UTF-8 encoded size must be <= 262144 bytes and must contain at least one top-level '# Title' heading.
+                  x-source: deploy/lambda/api/routes/skills_groups.py:166-180
+      responses:
+        '200':
+          description: Existing skill replaced.
+          x-source: deploy/lambda/api/routes/skills_groups.py:198-205
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - name
+                  - size
+                  - created
+                properties:
+                  name:
+                    type: string
+                  size:
+                    type: integer
+                    description: Stored UTF-8 byte size.
+                  created:
+                    type: boolean
+                    description: true when the skill did not previously exist.
+        '201':
+          description: New skill created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - name
+                  - size
+                  - created
+                properties:
+                  name:
+                    type: string
+                  size:
+                    type: integer
+                    description: Stored UTF-8 byte size.
+                  created:
+                    type: boolean
+                    description: true when the skill did not previously exist.
+        '400':
+          description: Invalid skill name, invalid JSON body, missing/empty content, content exceeds 262144 bytes, or no top-level '# Title' heading.
+          x-source: deploy/lambda/api/routes/skills_groups.py:158-180
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    description: Human-readable error message. NOTE — this domain returns bare {"error"} without a "code" field.
+        '403':
+          description: RBAC denied (operator role required).
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    description: Human-readable error message. NOTE — this domain returns bare {"error"} without a "code" field.
+        '500':
+          description: S3 write failure.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    description: Human-readable error message. NOTE — this domain returns bare {"error"} without a "code" field.
+        '503':
+          description: ASSETS_BUCKET not configured.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    description: Human-readable error message. NOTE — this domain returns bare {"error"} without a "code" field.
+    delete:
+      operationId: deleteSkill
+      summary: 删除技能(整个 S3 前缀)
+      description: Removes skills/{name}/ recursively — SKILL.md plus any auxiliary files — via paginated list + batch delete (1000 keys per call). Returns 404 when the prefix is already empty (so a second delete of the same skill is 404, not 200). Requires `x-api-key`; audit-logged via the api Lambda.
+      tags:
+        - 技能与模板
+      x-source: deploy/lambda/api/routes/skills_groups.py:208
+      x-rbac: operator
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: ^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$
+          description: Skill name (lowercase letters, digits, hyphens; max 64 chars).
+          x-source: deploy/lambda/api/routes/skills_groups.py:109
+      responses:
+        '200':
+          description: Skill prefix deleted.
+          x-source: deploy/lambda/api/routes/skills_groups.py:234
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - name
+                  - deleted
+                properties:
+                  name:
+                    type: string
+                  deleted:
+                    type: integer
+                    description: Number of S3 objects removed.
+        '400':
+          description: Skill name fails the regex.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    description: Human-readable error message. NOTE — this domain returns bare {"error"} without a "code" field.
+        '403':
+          description: RBAC denied (operator role required).
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    description: Human-readable error message. NOTE — this domain returns bare {"error"} without a "code" field.
+        '404':
+          description: No objects under the skill's prefix (skill not found).
+          x-source: deploy/lambda/api/routes/skills_groups.py:228-229
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    description: Human-readable error message. NOTE — this domain returns bare {"error"} without a "code" field.
+        '500':
+          description: S3 list/delete failure.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    description: Human-readable error message. NOTE — this domain returns bare {"error"} without a "code" field.
+        '503':
+          description: ASSETS_BUCKET not configured.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                    description: Human-readable error message. NOTE — this domain returns bare {"error"} without a "code" field.
+tags:
+  - name: 租户生命周期
+    description: 开通 / 查询 / 停删 / 生命周期动作 —— 外部平台最常用
+  - name: 批量操作
+    description: 一次对多个租户执行动作 + 异步任务进度
+  - name: 按用户管理舰队
+    description: 按 tenant_user_id 查/管一个平台用户名下所有 microVM
+  - name: 主机与镜像
+    description: microVM 宿主机注册/排空 + 黄金镜像版本/漂移
+  - name: 运维与审计
+    description: 备份 / 审计日志 / 系统信息 / AgentCore 状态
+  - name: 联邦与外部授权
+    description: 平台→Cognito IdP 路由 / 外部后端写授权 / 聊天签名
+  - name: 技能与模板
+    description: 技能分组 / 技能 CRUD / openclaw 配置模板
+  - name: 数据面 Hub
+    description: hub token 换取 / 文件 / WebSocket(由 hub 服务提供,非控制面 Lambda)

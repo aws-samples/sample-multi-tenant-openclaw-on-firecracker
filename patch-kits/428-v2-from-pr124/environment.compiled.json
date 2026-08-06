@@ -1,0 +1,1 @@
+{"account":"123456789012","policy":{"preserve_unowned":true,"write_mode":"QUALIFY_ONLY"},"region":"us-east-1","resources":{"api_function":"openclaw-api","host_asg_locator_status":"DISCOVER_REQUIRED","probe_handler":"handlers/aws_probe.py","python":"/Users/yuhangze/Desktop/code/bb-on-firecracker-dev/.claude/worktrees/publish-run-2/.venv/bin/python3"},"schema_version":1}

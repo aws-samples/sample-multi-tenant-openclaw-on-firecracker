@@ -259,6 +259,10 @@ _VIEWER_OK = {
     ("GET", "/images"),
     # #337(原#217 /snapshots)— 列镜像版本快照(time+label+count),只读,供 console 选。同 /images 级。
     ("GET", "/list_image_versions"),
+    # #394 P2-4 —— 这两个是只读镜像视图,契约(doc/OpenAPI)声明 viewer;不列入则默认 operator,
+    # 按公开契约实现的 viewer 客户端会吃 403。pull 进度轮询 + host 盘上真实镜像状态,纯读。
+    ("GET", "/hosts/{instance_id}/pull-image-progress"),
+    ("GET", "/hosts/{instance_id}/image-slots"),
     ("GET", "/agentcore/status"),
     ("GET", "/agentcore/tools"),
     ("GET", "/system/info"),
@@ -517,6 +521,11 @@ _RBAC_SKIP = {
     ("GET", "/recipient-key"),
     ("POST", "/recipient-key"),
     ("POST", "/recipient-key/disable"),
+    # #389 v2 块5 — admin 门在 handler 内(identity-based is_admin)。前置 RBAC 门按 role 判定,
+    # 而 api-key 路径 role 解析成 viewer(is_admin=True),不 skip 会在门口被 viewer<operator 挡掉,
+    # 持 key 的运维脚本永远进不来。故与 registry/recipient-key 同样列入 skip。
+    ("GET", "/bootstrap/versions"),
+    ("POST", "/bootstrap/promote"),
 }
 
 

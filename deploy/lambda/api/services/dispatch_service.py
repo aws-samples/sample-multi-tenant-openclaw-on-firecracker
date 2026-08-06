@@ -27,6 +27,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from botocore.config import Config as _BotoConfig
+from botocore.exceptions import ClientError
 
 import core.clients as clients
 from core.dispatch import (
@@ -165,7 +166,7 @@ def _claim_tenants(
             ack_drop.append(rec["msg_id"])
             continue
         try:
-            clients.tenants_table.update_item(
+            _claim_resp = clients.tenants_table.update_item(
                 Key={"id": tid},
                 UpdateExpression=(
                     "SET dispatch_claim = :cid, dispatch_claim_ts = :now"
@@ -187,7 +188,21 @@ def _claim_tenants(
                     ":stale": stale_before,
                     ":budget": clients.DISPATCH_RETRY_BUDGET,
                 },
+                # #412(codex review5 #1)—— 拿 ALL_OLD:若本租户【重投前已带 capacity_
+                # reservation_id】(上一次 dispatch 装箱过、释放遇 RETRY 没清掉),赢得认领后
+                # 记下那张陈旧令牌,装箱前先【结算掉】它(见 dispatch_batch)。否则新一轮 reserve
+                # 的 attribute_not_exists(capacity_reservation_id) 恒失败 → 白烧 retry 预算 →
+                # 最终误判 failed/requires_intervention(令牌自己占着自己,活锁)。
+                ReturnValues="ALL_OLD",
             )
+            old = (_claim_resp or {}).get("Attributes") or {}
+            if old.get("capacity_reservation_id"):
+                rec["stale_reservation"] = {
+                    "rid": old["capacity_reservation_id"],
+                    "host_id": old.get("host_id"),
+                    "vcpu": int(old.get("vcpu", 0) or 0),
+                    "mem_mb": int(old.get("mem_mb", 0) or 0),
+                }
             winners.append(rec)
         except ccf:
             # 别的实例赢了 / 状态不再 creating / 超预算 → 静默 ack drop。
@@ -335,78 +350,164 @@ def _host_disk_ok(h: Dict[str, Any], now_epoch: int) -> bool:
         return True  # 畸形数值 → 不可信 → fail-open(单 host,不炸批)
 
 
-def _try_reserve_host(
+def _reservation_id(command_id: str, tenant_id: str) -> str:
+    """本次预留的唯一可消费令牌(#412)。每租户每次装箱唯一 → 释放侧条件写
+    `capacity_reservation_id = :rid` 保证【恰好一个写手】消费它、扣一次账本。
+
+    为什么不能用 host_id 当锚(codex #3 ABA):host_id 会被同租户后续重新落到
+    【同一台 host】复用 → 迟到的旧释放匹配上新放置 → 误扣。command_id 也不够
+    (同命令重投会复用)。command_id:tenant_id 组合每次装箱唯一(command_id 含
+    epoch+msgid),且随租户行存活到 delete,是跨 4 条释放路径的互斥锚。"""
+    return f"{command_id}:{tenant_id}"
+
+
+def _reserve_batch_txn(
+    tenants: List[Dict[str, Any]],
     instance_id: str,
-    n: int,
     command_id: str,
     now_epoch: int,
+    expected_next: int,
     allocatable_vcpu: int,
     sum_vcpu: int,
     sum_mem: int,
     allocatable_mem: int,
+    specs: List[Tuple[int, int]],
     write_inflight: bool = True,
+    rootfs_version: str = "",
 ) -> Optional[int]:
-    """单 host 单条 UpdateItem: next_vm_num+=n / used_vcpu+=Σ真实vcpu / used_mem_mb+=Σ真实mem
-    (+ push 模式打 inflight)。CAS 双闸(used_vcpu<=cap_v 且 used_mem_mb<=cap_m)。
+    """#412 —— 每 host 一批【一个 TransactWriteItems】:host 账本增量 + 每租户放置写
+    + 唯一 capacity_reservation_id,全有或全无。返回该批 base vm_num;取消(容量/乐观锁
+    /delete 抢赢/冲突)→ None。
 
-    #330 修:预留按【本批各租户真实 vcpu/mem 之和】(sum_vcpu/sum_mem),不再 n×VM_DEFAULT
-    ——旧版记 n×(2/4096) 与租户声明规格无关,导致 ①账本高估(1c:2G 记成 2c/4G,r8g 有效容量
-    从 564 腰斩到 282,达不到 380 目标)②与 reaper 按真实值释放不对称→双向漂移 ③mem 无闸→大内存
-    租户超卖 OOM。释放侧 _rollback_host 同步按真实和扣(对称)。参照同步 create 路径(handler.py:954)。
+    替代旧的"_try_reserve_host(整批 CAS)+ _backfill_placement(逐租户另写)"两步:两步之间
+    delete 把某租户翻 deleting → 该租户 backfill CCF 跳过、host_id 永不写,而 host 账本增量
+    已落 → 那份增量【无主】,delete(if host_id)与 reaper(status=creating)都不认领 →
+    host 账本慢性高估(#412 真机报告)。合成一个事务后:任一租户 status≠creating → 整批取消
+    → host 增量也不生效 → 无无主增量。建立不变量【used_* 为租户 T 增量 ⟺ T 带
+    capacity_reservation_id】,释放侧(_release_reservation)据此令牌幂等消费。
 
-    返回该批第一个 vm_num(reserved base);容量不够 → None。
+    事务项(N≤DISPATCH_MAX_PARALLEL=96,+1 host 项 ≤97 < DDB 100 上限):
+    - host 项(Update):next_vm_num/used_vcpu/used_mem_mb/vm_count 增量;条件
+      next_vm_num=:expected(乐观锁,同步 create 路径 _reserve_slot 同款)AND 容量双闸;
+      push 模式并入 inflight 标量写 + 排他门(语义逐字保留)。
+    - 每租户项(Update):SET host_id/vm_num/guest_ip/host_port/capacity_reservation_id;
+      条件 status=creating AND dispatch_claim=:cid AND attribute_not_exists(
+      capacity_reservation_id)——最后一项防 crash 重投对已预留租户二次增量(codex #2)。
 
-    #315 SPLIT_BY_MODE(codex 判):按 dispatch 模式分道——
-    - **push 模式**(write_inflight=True):保留旧行为——写 inflight 标量 + CAS 含 host 级
-      inflight 排他门(一台 host 同一时刻一条在途命令)。push 无 assignment 表 + 无 host-agent
-      reconciler,poller 是 promote/回滚唯一驱动,必须靠 inflight 标量 + 串行门追踪 SSM 终态。
-    - **ddb 模式**(write_inflight=False):【不写 inflight 标量】+ CAS 只留 slot 级容量闸
-      (used_vcpu <= cap_v),允许一台 host 并发多条在途命令。ddb 有 host-agent 每 5s 从
-      assignment 表(desired-state 真相源)自愈 promote/重投,poller 冗余、不启用;不写标量 →
-      无 last-write-wins 竞争 → 无 poller 误清/误回滚容量(codex 上轮 3 个 Error 的根)。
-      这也是 1000 host 稳定启动的前提:控制面零集中扫描,host-agent 分布式自治才扩得上去。
-    容量安全两模式都由 slot 级 CAS(used_vcpu <= :cap_v)保证,与 inflight 无关。
+    vm_num:事务不返回 Attributes,故不能读回 next_vm_num。用乐观锁把 base 钉死为
+    expected_next(=快照的 next_vm_num);并发另一批改了它 → 事务取消 → 走 CAS-loss 重投。
     """
-    ccf = clients.hosts_table.meta.client.exceptions.ConditionalCheckFailedException
-    # #330 — 预留量 = 本批各租户【真实】vcpu/mem 之和(调用方从 batch 的 params 求和传入),
-    # 不再 n×VM_DEFAULT。cap_v/cap_m = 允许上限 - 本批增量;任一维负 = 装不下,直接拒。
+    from core.auth import _guest_ip  # noqa: PLC0415 — 避免模块级环(auth→clients)
+
     dv = int(sum_vcpu)
     dm = int(sum_mem)
     cap_v = int(allocatable_vcpu) - dv
-    # ★mem 闸【恒开】(codex review Error3:allocatable_mem<=0 若跳过闸 = 把未知容量当无限 →
-    # 大内存租户仍可超卖 OOM)。装箱侧 mem_known=False 的 host 已 fail-safe 排除,正常不会到这;
-    # 万一到了(allocatable_mem<=0),cap_m<0 → 拒(fail-safe,绝不把未知当无限内存放行)。
     cap_m = int(allocatable_mem) - dm
     if cap_v < 0 or cap_m < 0:
+        return None  # fail-safe:任一维负(含 mem 未知 allocatable_mem<=0)→ 拒
+
+    n = len(tenants)
+    # #412(codex review6 #1)—— next_vm_num 乐观锁在【同 host 并发多批】下会让输家取消。旧行为
+    # 直接返 None 当 CAS-loss → 输家白烧 tenant retry 预算、最终误 requires_intervention(明明有
+    # 容量)。这里对【纯 next_vm_num 冲突】(host 项 idx0 取消、租户项都没失败)做【有界 reread-retry】
+    # (重读 next_vm_num 重算 base 再试,线性退避,同步 create CAS 同款 tenant_service.py:1788),
+    # 【不】计租户预算;真容量不够/delete 抢赢(租户项失败)则照旧返 None 走重投。
+    for _attempt in range(_RESERVE_MAX_ATTEMPTS):
+        r = _reserve_batch_txn_once(
+            tenants, instance_id, command_id, now_epoch, expected_next,
+            cap_v, cap_m, dv, dm, n, write_inflight, _guest_ip, rootfs_version,
+        )
+        if r == _RESERVE_TXN_CONFLICT:
+            # 明确的事务冲突/限流(TransactionConflict/throttle)→ 纯瞬时,重读重算重试。
+            fresh_next = _read_next_vm_num(instance_id)
+            if fresh_next is None:
+                return _RESERVE_TRANSIENT  # 读不到 host → 瞬时,重投不烧预算(review8 #3)
+            expected_next = fresh_next
+            time.sleep(0.02 * (_attempt + 1))
+            continue
+        if r != _RESERVE_HOST_CCF:
+            return r  # base vm_num(成功)或 None(真失败:租户项 CCF = delete 抢赢)
+        # host 项 CCF:可能是 next_vm_num 乐观锁冲突,【也可能】是容量/inflight 门失败
+        # (codex review10 #2:三者共用 host ConditionExpression,DDB 不区分)。重读 next_vm_num
+        # 判别:变了 = 真 next_vm_num 竞争 → 重算重试;没变 = 容量/inflight 失败 → 真失败返 None
+        # (别当瞬时空转烧完 4 次再 TRANSIENT,那会让满 host 的批延迟重投)。
+        fresh_next = _read_next_vm_num(instance_id)
+        if fresh_next is None:
+            return _RESERVE_TRANSIENT  # 读不到 host → 瞬时
+        if fresh_next == expected_next:
+            # next_vm_num 没动 → host CCF 是容量/inflight 门(非乐观锁)→ 真容量类失败。
+            return None
+        expected_next = fresh_next  # next_vm_num 真被并发批推进了 → 重算 base 重试
+        time.sleep(0.02 * (_attempt + 1))
+    print(f"[dispatch] reserve next_vm_num conflict exhausted host={instance_id} cmd={command_id}")
+    # 多次仍是 next_vm_num 竞争(高并发同 host)→ 瞬时,重投不烧预算(review8 #3)。
+    return _RESERVE_TRANSIENT
+
+
+_RESERVE_MAX_ATTEMPTS = 4
+_RESERVE_HOST_CCF = "__host_ccf__"            # 哨兵:host 项条件失败(next_vm_num 竞争 或 容量/inflight
+#                                              门失败——DDB 不区分,调用方重读 next_vm_num 判别)
+_RESERVE_TXN_CONFLICT = "__txn_conflict__"    # 哨兵:明确瞬时(TransactionConflict/throttle),重读重试
+_RESERVE_TRANSIENT = "__reserve_transient__"  # 哨兵:瞬时高竞争耗尽/读失败,重投不烧预算
+
+
+def _read_next_vm_num(instance_id: str) -> Optional[int]:
+    """强一致读 host 的 next_vm_num(reserve 乐观锁冲突后重算 base 用)。读不到/出错返 None。"""
+    try:
+        resp = clients.hosts_table.get_item(
+            Key={"instance_id": instance_id},
+            ConsistentRead=True,
+            ProjectionExpression="next_vm_num",
+        )
+        item = resp.get("Item")
+        if not item:
+            return None
+        return int(item.get("next_vm_num", 1) or 1)
+    except Exception as e:  # noqa: BLE001
+        print(f"[dispatch] reread next_vm_num {instance_id} failed: {e}")
         return None
-    set_expr = (
+
+
+def _reserve_batch_txn_once(
+    tenants, instance_id, command_id, now_epoch, expected_next,
+    cap_v, cap_m, dv, dm, n, write_inflight, _guest_ip, rootfs_version="",
+):
+    """跑一次 reserve 事务。返回:base vm_num(成功)/ None(真失败:租户项 CCF=delete 抢赢)
+    / _RESERVE_TXN_CONFLICT(明确瞬时冲突/限流)/ _RESERVE_HOST_CCF(host 项条件失败,调用方重读
+    next_vm_num 判别是乐观锁竞争还是容量/inflight 门失败)。"""
+    # ---- host 项 ----
+    host_set = (
         "next_vm_num = if_not_exists(next_vm_num, :zero) + :n, "
         "used_vcpu = if_not_exists(used_vcpu, :zero) + :dv, "
         "used_mem_mb = if_not_exists(used_mem_mb, :zero) + :dm, "
         "vm_count = if_not_exists(vm_count, :zero) + :n"
     )
-    vals = {
+    host_vals: Dict[str, Any] = {
         ":n": n,
         ":dv": dv,
         ":dm": dm,
         ":zero": 0,
+        ":expected": expected_next,
         ":cap_v": cap_v,
         ":cap_m": cap_m,
     }
-    # CAS 双闸恒开:vcpu + mem(#330 防大内存租户超卖 OOM;mem 未知的 host 已在装箱侧排除)。
-    mem_clause = " AND used_mem_mb <= :cap_m"
+    # 乐观锁 + 容量双闸(#330 mem 闸恒开,防大内存租户超卖 OOM)。
+    host_cond = (
+        "next_vm_num = :expected AND used_vcpu <= :cap_v AND used_mem_mb <= :cap_m"
+    )
+    host_update_expr = "SET " + host_set
     if write_inflight:
-        # push 模式:写 inflight 标量 + 走 host 级排他门(旧行为保留,加 mem 闸)。
-        set_expr += (
-            ", dispatch_inflight = :cid, dispatch_inflight_ts = :now, "
-            "dispatch_inflight_ts_epoch = :now_epoch"
+        # push 模式:inflight 标量 + 排他门 + 原子清旧 ssm_cid(#315 逐字保留)。
+        host_update_expr = (
+            "SET " + host_set + ", dispatch_inflight = :cid, "
+            "dispatch_inflight_ts = :now, dispatch_inflight_ts_epoch = :now_epoch "
+            "REMOVE dispatch_ssm_cid"
         )
-        cond = (
-            "used_vcpu <= :cap_v" + mem_clause + " "
-            "AND (attribute_not_exists(dispatch_inflight) "
+        host_cond += (
+            " AND (attribute_not_exists(dispatch_inflight) "
             "OR dispatch_inflight_ts_epoch < :expired)"
         )
-        vals.update(
+        host_vals.update(
             {
                 ":cid": command_id,
                 ":now": _now(),
@@ -414,110 +515,242 @@ def _try_reserve_host(
                 ":expired": now_epoch - clients.DISPATCH_INFLIGHT_TTL_SEC,
             }
         )
+    txn_items: List[Dict[str, Any]] = [
+        {
+            "Update": {
+                "TableName": clients.hosts_table.table_name,
+                "Key": {"instance_id": instance_id},
+                "UpdateExpression": host_update_expr,
+                "ConditionExpression": host_cond,
+                "ExpressionAttributeValues": host_vals,
+            }
+        }
+    ]
+    # ---- 每租户项 ----
+    now = _now()
+    # #411/6.2(merge:随 reserve 回写 host 的 rootfs_version,补齐队列化 create 漏写)—— #412 把
+    # _backfill_placement 并进本事务后,#411 这份回写改由 reserve 的 tenant 项承载。语义同 #411:
+    # version 非空 → SET rootfs_version(+ ≤256B 才建查询投影 q_rootfs_version,否则 REMOVE 投影);
+    # version 空 → REMOVE 两个陈旧字段(重投可能落到别版本写过的行,不清则 GET 与 GSI 不一致)。
+    _rv_set = ""
+    _rv_remove: List[str] = []
+    if rootfs_version:
+        _rv_set = ", rootfs_version = :rv"
+        if len(rootfs_version.encode("utf-8")) <= 256:
+            _rv_set += ", q_rootfs_version = :rv"
+        else:
+            _rv_remove = ["q_rootfs_version"]
     else:
-        # ddb 模式:vcpu 闸 + (已知时)mem 闸,不写 inflight 标量。
-        cond = "used_vcpu <= :cap_v" + mem_clause
-    update_expr = "SET " + set_expr
-    if write_inflight:
-        # #315(codex review7 P1)—— 写新 dispatch_inflight(command_id)时,必须原子清掉旧
-        # dispatch_ssm_cid,否则出现"新 command B + 上一命令 A 的 SSM CID(SA)"矛盾组合:
-        # host 短暂停在 B/SA,poller 把 SA 的 SSM 终态错误应用到 B 的租户(误 promote/误回滚 B 容量),
-        # 且 review5 加的 CAS(dispatch_inflight=:cid)校的正是 B、照样通过。SendCommand 成功后
-        # _record_ssm_cid 会写回 B 自己的 CID;在那之前 ssm_cid 缺失 → poller 走 missing_ssm_cid
-        # 分支(still_running,等下轮),不会误清。ddb 模式不写 inflight 也无 ssm_cid,不需要。
-        update_expr += " REMOVE dispatch_ssm_cid"
-    try:
-        resp = clients.hosts_table.update_item(
-            Key={"instance_id": instance_id},
-            UpdateExpression=update_expr,
-            ConditionExpression=cond,
-            ExpressionAttributeValues=vals,
-            ReturnValues="UPDATED_NEW",
-        )
-        new_next = int(resp["Attributes"]["next_vm_num"])
-        return new_next - n + 1  # base vm_num of this batch
-    except ccf:
-        return None
-
-
-def _backfill_placement(
-    tenants: List[Dict[str, Any]], instance_id: str, base_vm_num: int
-) -> None:
-    """装箱 CAS 成功后把放置结果回写 tenants(#139 真机缺陷修复)。
-
-    同步路径的 item 一开始就带 host_id/vm_num/guest_ip/host_port(tenant_service
-    ~L750);dispatch 路径这些值在消费端装箱才产生,不回写则 stop/restart/delete
-    找不到 VM 在哪台 host——e2e 只验"到 running"没验往返,#139 抓出。guest_ip 用
-    auth._guest_ip(与 launch-vm.sh /30 编址的唯一真相源对齐)。条件写限 creating:
-    重复投递的输家批(claim 已被接管)不得覆盖赢家的放置。best-effort:单租户
-    失败不炸批,Poller/对账兜底。"""
-    from core.auth import _guest_ip  # noqa: PLC0415 — 避免模块级环(auth→clients)
-
-    ccf = clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException
+        _rv_remove = ["rootfs_version", "q_rootfs_version"]
     for offset, t in enumerate(tenants):
-        vm_num = base_vm_num + offset
-        try:
-            clients.tenants_table.update_item(
-                Key={"id": t["tenant_id"]},
-                UpdateExpression=(
-                    "SET host_id = :h, vm_num = :n, guest_ip = :g, "
-                    "host_port = :p, updated_at = :now"
-                ),
-                ConditionExpression="#s = :creating",
-                ExpressionAttributeNames={"#s": "status"},
-                ExpressionAttributeValues={
-                    ":h": instance_id,
-                    ":n": vm_num,
-                    ":g": _guest_ip(vm_num),
-                    ":p": clients.VM_PORT_BASE + vm_num - 1,
-                    ":creating": "creating",
-                    ":now": _now(),
-                },
+        vm_num = expected_next + offset
+        rid = _reservation_id(command_id, t["tenant_id"])
+        # #412(codex review6 #2)—— reserve 一并 SET phys_vm_num = :vn(与同步 create 路径
+        # tenant_service.py:1866 同款)。否则 dispatch 路径 phys_vm_num 仅靠 host-agent if_not_exists
+        # 回填,重投改了 vm_num 后 phys 被冻旧号,#208 撞 tap 检查(键在 phys_vm_num)漏租户真实 tap
+        # → 跨租户 tap 复用(红线)。plain SET 让 phys 随 vm_num 走(reserve 只作用于 creating 租户)。
+        _upd = (
+            "SET host_id = :h, vm_num = :vn, phys_vm_num = :vn, "
+            "guest_ip = :g, host_port = :p, capacity_reservation_id = :rid, "
+            "updated_at = :now" + _rv_set
+        )
+        if _rv_remove:
+            _upd += " REMOVE " + ", ".join(_rv_remove)
+        _vals = {
+            ":h": instance_id,
+            ":vn": vm_num,
+            ":g": _guest_ip(vm_num),
+            ":p": clients.VM_PORT_BASE + vm_num - 1,
+            ":rid": rid,
+            ":cid": command_id,
+            ":creating": "creating",
+            ":now": now,
+        }
+        if rootfs_version:
+            _vals[":rv"] = rootfs_version
+        txn_items.append(
+            {
+                "Update": {
+                    "TableName": clients.tenants_table.table_name,
+                    "Key": {"id": t["tenant_id"]},
+                    "UpdateExpression": _upd,
+                    "ConditionExpression": (
+                        "#s = :creating AND dispatch_claim = :cid "
+                        "AND attribute_not_exists(capacity_reservation_id)"
+                    ),
+                    "ExpressionAttributeNames": {"#s": "status"},
+                    "ExpressionAttributeValues": _vals,
+                }
+            }
+        )
+    try:
+        clients.hosts_table.meta.client.transact_write_items(TransactItems=txn_items)
+        return expected_next  # base vm_num of this batch
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code == "TransactionCanceledException":
+            reasons = e.response.get("CancellationReasons", []) or []
+            codes = [r.get("Code") for r in reasons]
+            print(
+                f"[dispatch] reserve txn cancelled host={instance_id} "
+                f"cmd={command_id} reasons={codes}"
             )
-        except ccf:
-            pass  # 状态已非 creating(赢家已推进)——不覆盖
-        except Exception as e:  # noqa: BLE001
-            print(f"[dispatch] placement backfill {t['tenant_id']} non-fatal: {e}")
+            # #412 review6/7/10:分三类返回,调用方精确处置。host 项 idx0,租户项 idx1..。
+            _retryable = {"TransactionConflict", "ThrottlingError",
+                          "ProvisionedThroughputExceeded", "RequestLimitExceeded"}
+            host_code = codes[0] if len(codes) > 0 else ""
+            tenant_codes = codes[1:] if len(codes) > 1 else []
+            tenant_failed = any(c and c != "None" for c in tenant_codes)
+            # ① 【最先】判可重试因(review7 #3):任一项冲突/限流 → TXN_CONFLICT(纯瞬时,重读重试)。
+            if any(c in _retryable for c in codes):
+                return _RESERVE_TXN_CONFLICT
+            # ② 仅 host 项(idx0)CCF、租户项没失败 → HOST_CCF。调用方重读 next_vm_num 判别到底是
+            #    next_vm_num 乐观锁竞争(变了→重试)还是容量/inflight 门失败(没变→真失败)——
+            #    DDB 不区分同一 ConditionExpression 里哪个子句失败(review10 #2)。
+            if host_code == "ConditionalCheckFailed" and not tenant_failed:
+                return _RESERVE_HOST_CCF
+            # ③ 租户项失败(delete 抢赢/被接管)等 → 真失败,当 CAS-loss 返 None。
+            return None
+        if code in ("TransactionConflict", "ThrottlingError",
+                    "ProvisionedThroughputExceeded", "RequestLimitExceeded"):
+            return _RESERVE_TXN_CONFLICT  # 顶层瞬时冲突/限流:重读重试,不烧预算
+        raise  # 其它错误 fail-loud(IAM/网络/坏参数),别静默当容量不够
 
 
-def _rollback_host(instance_id: str, n: int, sum_vcpu: int, sum_mem: int) -> None:
-    """回滚 CAS:used_vcpu-Σ真实vcpu / used_mem_mb-Σ真实mem / vm_count-N。next_vm_num 不倒退。
+# 令牌释放三态返回(codex review CHANGES_NEEDED #3/#4:bool 把"已消费(安全)"和"瞬时失败
+# (必须重试)"混为一谈 → delete 会在瞬时失败后照样标 deleted 令牌永久搁浅 / rollback 会在
+# throttle 后清 claim 让令牌卡死每次重投)。三态让调用方精确分流。
+RELEASE_CONSUMED = "consumed"  # 本次消费了令牌并扣了账本
+RELEASE_ALREADY = "already"    # 令牌已不在(别人消费过 / 从没有)或下溢守卫触发 → 安全幂等
+RELEASE_RETRY = "retry"        # 瞬时失败(throttle/conflict/网络)→ 令牌可能仍在,必须重试
 
-    #330 修:释放量与 _try_reserve_host 的预留量【对称】(都用本批真实 vcpu/mem 之和),
-    不再 n×VM_DEFAULT——否则预留真实、回滚默认(或反之)会双向漂移账本。与 scheduling._release_slot
-    同款 best-effort;REMOVE dispatch_inflight 一并做。
 
-    ⚠️ 幂等边界(codex review):本函数【非幂等】,只能由【本次 CAS 新鲜获胜】的调用方调一次。
-    调用契约:dispatch_batch 里 base=_try_reserve_host() 返回非 None(赢下 CAS)后,该批在同一
-    invocation 内 5 个失败分支【互斥且 continue】,最多回滚一次;重投走认领闸(dispatch_claim)+
-    新一轮 CAS,看到 slot 已占用会退出,不会拿旧金额二次回滚。used_mem_mb>=:dm/used_vcpu>=:dv
-    下溢条件是最后防线。若未来放开"重试接管已有 slot",必须改成可消费的 reservation_id token
-    (预留时原子写、回滚时条件校验+删除+扣资源一次完成),command_id 不够——见后续 issue。
+def _release_reservation(
+    tenant_id: str,
+    instance_id: str,
+    reservation_id: str,
+    vcpu: int,
+    mem_mb: int,
+) -> str:
+    """#412 —— 令牌化释放:host 账本扣减 + 清租户 capacity_reservation_id/host_id 放置,
+    放进【一个 TransactWriteItems】,条件 tenants.capacity_reservation_id = :rid。
+
+    这是 dispatch 侧 4 条释放路径(批级失败回滚 / delete / reaper / poller)共用的原子原语。
+    幂等 + 无双扣的锚(codex #3):唯一 reservation_id。谁先消费该令牌谁扣一次账本,其余
+    释放者的 `= :rid` 条件失败 → 事务整体取消(host 扣减也随之作废,DDB all-or-nothing)→
+    幂等 no-op。清 host_id 让 delete/reaper 能区分"dispatch 令牌已释放"(host_id 没了→跳过
+    旧扣减路径)与"同步 create 租户"(host_id 在、无令牌→走旧扣减)。
+
+    返回三态(codex review #3/#4):
+    - RELEASE_CONSUMED:事务成功,本次扣了账本、清了令牌。
+    - RELEASE_ALREADY:令牌已不在(别人消费 / 从没有)或下溢守卫触发——安全,不用重试。
+    - RELEASE_RETRY:瞬时错误(TransactionConflict/throttle/网络)——令牌可能仍在,调用方
+      【不得】就此清 claim/inflight 或标 deleted,必须让消息/删除重投再释放。
     """
-    dv = int(sum_vcpu)
-    dm = int(sum_mem)
+    # TransactItems 顺序固定:[0]=host 扣减(下溢守卫),[1]=tenant 令牌消费(capacity_
+    # reservation_id=:rid)。释放三态按【CancellationReasons 的位次】精确判(codex review2 #2)。
+    txn_items = [
+        {
+            "Update": {
+                "TableName": clients.hosts_table.table_name,
+                "Key": {"instance_id": instance_id},
+                "UpdateExpression": (
+                    "SET used_vcpu = used_vcpu - :v, "
+                    "used_mem_mb = used_mem_mb - :m, vm_count = vm_count - :one"
+                ),
+                # 下溢守卫(最后防线):即便令牌校验被绕过也不把账本扣负。
+                "ConditionExpression": (
+                    "used_vcpu >= :v AND used_mem_mb >= :m AND vm_count >= :one"
+                ),
+                "ExpressionAttributeValues": {":v": int(vcpu), ":m": int(mem_mb), ":one": 1},
+            }
+        },
+        {
+            "Update": {
+                "TableName": clients.tenants_table.table_name,
+                "Key": {"id": tenant_id},
+                "UpdateExpression": (
+                    "REMOVE capacity_reservation_id, dispatch_settle, host_id, "
+                    "vm_num, guest_ip, host_port"
+                ),
+                # 令牌互斥锚:只有仍持有【这张】令牌的租户行能被消费一次。
+                "ConditionExpression": "capacity_reservation_id = :rid",
+                "ExpressionAttributeValues": {":rid": reservation_id},
+            }
+        },
+    ]
+    try:
+        clients.hosts_table.meta.client.transact_write_items(TransactItems=txn_items)
+        return RELEASE_CONSUMED
+    except ClientError as e:
+        return _classify_release_cancel(e, tenant_id)
+    except Exception as e:  # noqa: BLE001
+        print(f"[dispatch] release reservation {tenant_id} error (retry): {e}")
+        return RELEASE_RETRY
+
+
+# CancellationReasons 位次:host 扣减项索引 0,tenant 令牌项索引 1(与 _release_reservation /
+# _release_capacity_reservation 的 TransactItems 顺序一致)。
+_REL_HOST_IDX = 0
+_REL_TENANT_IDX = 1
+_REL_RETRYABLE_CODES = {"TransactionConflict", "ThrottlingError",
+                        "ProvisionedThroughputExceeded", "RequestLimitExceeded"}
+
+
+def _classify_release_cancel(e: "ClientError", tenant_id: str) -> str:
+    """按【位次】把释放事务的取消/错误分成三态(codex review2 #2):
+    - 只有 tenant 项(索引1)的条件失败(令牌已被别人消费)才算 RELEASE_ALREADY(安全);
+    - host 项(索引0)下溢守卫触发 = 账本异常,不是"令牌已释放" → RELEASE_RETRY 并告警;
+    - 任一项可重试因(冲突/throttle)/ 缺 reasons / 未知错误 → RELEASE_RETRY(宁重试不搁浅)。"""
+    code = e.response.get("Error", {}).get("Code", "")
+    if code == "TransactionCanceledException":
+        reasons = e.response.get("CancellationReasons", []) or []
+
+        def _code_at(idx: int) -> str:
+            return reasons[idx].get("Code", "") if idx < len(reasons) else ""
+
+        host_code = _code_at(_REL_HOST_IDX)
+        tenant_code = _code_at(_REL_TENANT_IDX)
+        # 优先级(codex review4 #2):瞬时因 > 令牌已消费 > host 下溢 > 缺细节。
+        # ① 任一项可重试因 → RETRY(瞬时,重投)。
+        if host_code in _REL_RETRYABLE_CODES or tenant_code in _REL_RETRYABLE_CODES:
+            print(f"[dispatch] release {tenant_id} retryable cancel: {[host_code, tenant_code]}")
+            return RELEASE_RETRY
+        # ② 令牌项(idx1)CCF 优先判 ALREADY —— 即便 host 项(idx0)也 CCF(最后一张预留双重
+        # 释放时账本已被前一次扣到不足,host 下溢与 token-gone 会【同时】失败)。token-gone 说明
+        # 别的释放者已成功消费并扣过账本,本次就是安全幂等,绝不能因 host 下溢误报 RETRY 让
+        # delete 卡 deleting/进 DLQ(codex review4 #2)。
+        if tenant_code == "ConditionalCheckFailed":
+            return RELEASE_ALREADY  # 令牌已被别人消费/从没有 → 安全幂等
+        # ③ 仅 host 项(idx0)CCF、令牌项没失败:账本与令牌不一致的真异常 → 告警 + 重试。
+        if host_code == "ConditionalCheckFailed":
+            print(f"[dispatch] release {tenant_id} host underflow guard tripped — retry+alarm")
+            return RELEASE_RETRY
+        # ④ 缺 reasons 细节的取消:不能确认令牌已释放 → 保守重试(codex review2 #2)。
+        print(f"[dispatch] release {tenant_id} cancel w/o reasons — retry")
+        return RELEASE_RETRY
+    if code in _REL_RETRYABLE_CODES:
+        print(f"[dispatch] release {tenant_id} retryable error: {code}")
+        return RELEASE_RETRY
+    print(f"[dispatch] release reservation {tenant_id} error (retry): {e}")
+    return RELEASE_RETRY  # 未知错误保守当可重试:宁可重试也不搁浅令牌
+
+
+def _clear_inflight_scalar(instance_id: str, command_id: str) -> None:
+    """push 批级回滚时清 host 的 inflight 标量(命令未真正发出)。带 poller 同款 CAS
+    (dispatch_inflight=:cid)防误清并发新命令的标记。best-effort。"""
     try:
         clients.hosts_table.update_item(
             Key={"instance_id": instance_id},
             UpdateExpression=(
-                "SET used_vcpu = used_vcpu - :dv, "
-                "used_mem_mb = used_mem_mb - :dm, "
-                "vm_count = vm_count - :n "
-                "REMOVE dispatch_inflight, dispatch_inflight_ts, dispatch_inflight_ts_epoch, dispatch_ssm_cid"
+                "REMOVE dispatch_inflight, dispatch_inflight_ts, "
+                "dispatch_inflight_ts_epoch, dispatch_ssm_cid"
             ),
-            # #330 — cond 加 used_mem_mb >= :dm(与 vcpu 对称),防回滚把 mem 账本扣成负数
-            # (codex review:原只护 vcpu/vm_count,mem 可被扣负)。
-            ConditionExpression=(
-                "used_vcpu >= :dv AND used_mem_mb >= :dm AND vm_count >= :n"
-            ),
-            ExpressionAttributeValues={
-                ":dv": dv,
-                ":dm": dm,
-                ":n": n,
-            },
+            ConditionExpression="dispatch_inflight = :cid",
+            ExpressionAttributeValues={":cid": command_id},
         )
     except Exception as e:  # noqa: BLE001
-        print(f"[dispatch] rollback {instance_id} non-fatal: {e}")
+        print(f"[dispatch] clear inflight scalar {instance_id} non-fatal: {e}")
 
 
 # ── manifest 上传 + SendCommand (push) ───────────────────────────────
@@ -677,19 +910,30 @@ def _send_ssm_from_ddb(
         return None
 
 
-def _clear_assignments(instance_id: str, tenants: List[Dict[str, Any]]) -> None:
+def _clear_assignments(
+    instance_id: str,
+    tenants: List[Dict[str, Any]],
+    command_id: str,
+) -> None:
     """ddb 载体回滚:删本批刚写的 pending assignments(SSM 叫醒失败时)。
     best-effort:删不掉留 24h TTL 兜底,host 侧 vm.json check 防重复 launch。"""
     if not clients.assignments_table:
         return
-    try:
-        with clients.assignments_table.batch_writer() as bw:
-            for t in tenants:
-                bw.delete_item(
-                    Key={"instance_id": instance_id, "tenant_id": t["tenant_id"]}
-                )
-    except Exception as e:  # noqa: BLE001
-        print(f"[dispatch] clear assignments {instance_id} non-fatal: {e}")
+    ccf = clients.assignments_table.meta.client.exceptions.ConditionalCheckFailedException
+    for t in tenants:
+        try:
+            clients.assignments_table.delete_item(
+                Key={"instance_id": instance_id, "tenant_id": t["tenant_id"]},
+                ConditionExpression="command_id = :cid",
+                ExpressionAttributeValues={":cid": command_id},
+            )
+        except ccf:
+            pass  # a newer command replaced this row; never delete its assignment
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[dispatch] clear assignment {instance_id}/{t['tenant_id']} "
+                f"non-fatal: {e}"
+            )
 
 
 # ── assignments (pull 模式) ───────────────────────────────────────────
@@ -698,6 +942,7 @@ def _write_assignments(
     tenants: List[Dict[str, Any]],
     base_vm_num: int,
     now_epoch: int,
+    command_id: str,
 ) -> bool:
     """Pull 模式:写 openclaw-assignments (PK=instance_id, SK=tenant_id) status=pending。
     失败 → 调用方按 host 批失败回滚。"""
@@ -712,6 +957,10 @@ def _write_assignments(
                 item = {
                     "instance_id": instance_id,
                     "tenant_id": t["tenant_id"],
+                    "command_id": command_id,
+                    "capacity_reservation_id": _reservation_id(
+                        command_id, t["tenant_id"]
+                    ),
                     "action": "create",
                     "vm_num": base_vm_num + offset,
                     "vcpu": int(params.get("vcpu", clients.VM_DEFAULT_VCPU)),
@@ -778,6 +1027,32 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not winners:
         return {"batchItemFailures": []}
 
+    # 1.5) #412(codex review5 #1)—— 结算【重投前遗留的陈旧令牌】。某租户上一次 dispatch 装箱
+    # 过(写了 capacity_reservation_id + host_id),但那批的释放遇 RETRY 没清掉;消息重投、本次
+    # 赢得认领后,若直接重新装箱,reserve 的 attribute_not_exists(capacity_reservation_id) 会恒
+    # 失败 → 白烧 retry 预算 → 误判 failed(令牌自占,活锁)。这里先把陈旧令牌释放掉(令牌互斥锚,
+    # 幂等:已被 reaper/别人清则 already no-op),把租户还原成干净 creating,再走下面正常装箱。
+    stale_unsettled_msgs: List[str] = []
+    _survivors = []
+    for w in winners:
+        stale = w.get("stale_reservation")
+        if stale and stale.get("host_id") and stale.get("rid"):
+            r = _release_reservation(
+                w["tenant_id"], stale["host_id"], stale["rid"],
+                stale["vcpu"], stale["mem_mb"],
+            )
+            print(f"[dispatch] settled stale reservation tenant={w['tenant_id']} "
+                  f"rid={stale['rid']} result={r}")
+            if r == RELEASE_RETRY:
+                # #412(review7 #2)—— 陈旧令牌本轮没结算掉(瞬时失败),令牌仍占容量。若照旧
+                # 装箱,新 reserve 的 attribute_not_exists(capacity_reservation_id) 恒失败白烧预算。
+                # 故把该租户【本轮排除出装箱】:进 batchItemFailures 让 SQS 原消息重投,且【不清
+                # claim/不计 retry】(claim 留着,下轮重投再结算),靠 reaper/孤儿清扫兜底。
+                stale_unsettled_msgs.append(w["msg_id"])
+                continue
+        _survivors.append(w)
+    winners = _survivors
+
     # 2) hosts 快照 + 装箱
     mode = clients.DISPATCH_MODE.lower()
     push_mode = mode == "push"
@@ -821,12 +1096,27 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     alloc_by_host = {h["instance_id"]: h["allocatable_vcpu"] for h in hosts}
     # #330 — mem 维度可分配上限(CAS mem 闸用),与 alloc_by_host(vcpu)对称。
     alloc_mem_by_host = {h["instance_id"]: h.get("allocatable_mem", 0) for h in hosts}
+    # #412 — 每 host 快照的 next_vm_num,供 reserve 事务乐观锁(next_vm_num=:expected)+
+    # 从它派连续 vm_num 段(事务不返回 Attributes,不能读回 → 用乐观锁把 base 钉死)。
+    next_vm_by_host = {
+        h["instance_id"]: int(h.get("raw", {}).get("next_vm_num", 1) or 1) for h in hosts
+    }
+    # #411/6.2 — host 的镜像版本,reserve 事务随 placement 一并回写租户(补齐队列化 create 漏写
+    # rootfs_version)。#412 把 _backfill_placement 并进 _reserve_batch_txn 后,#411 这份回写改由
+    # reserve 事务的 tenant 项承载(见 _reserve_batch_txn 的 rootfs_version 参数)。raw 下取值同 #411。
+    rootfs_by_host = {
+        h["instance_id"]: (h.get("raw") or {}).get("rootfs_version", "") for h in hosts
+    }
     failures: List[str] = []
     # #315(codex final MR P1#3):容量类失败(unplaced 装箱没位子 + CAS loser 装箱给了位子
     # 但 reserve 时被并发抢输)的租户 tid,稍后对其【原消息】缩短 visibility(960→15s)快速
     # 重投——高并发接近满容量时 CAS loser 是最常见的溢出类型,漏了它容量竞争输家仍卡 960s。
     # 只缩容量类(非 SSM/manifest/写库失败):那些是基础设施故障,按默认 visibility 重投即可。
     capacity_retry_tids: set = set()
+    # #412 review3 #3:令牌释放遇 RETRY 的租户——【不】清其 claim、不计 dispatch_retries
+    # (否则清 claim 后重投过认领闸撞新鲜 claim 被静默 ack、令牌搁浅逃出 reaper)。保留 claim
+    # + inflight,靠 SQS 原消息按默认 visibility 重投再释放,或 reaper 令牌孤儿清扫兜底。
+    reserve_retry_tids: set = set()
     ssm_consec_fail = 0
 
     # #141 — fail-loud:每个进 batchItemFailures(→ 重投,超预算才进 DLQ)的租户
@@ -851,44 +1141,82 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         specs = [normalize_spec(t.get("params"), dvm, dmm) for t in batch]
         sum_vcpu = sum(v for v, _ in specs)
         sum_mem = sum(m for _, m in specs)
-        # #315 SPLIT_BY_MODE:push 模式写 inflight 标量 + 走 host 级排他门(poller 靠它);
-        # ddb 模式不写标量、只 slot CAS,允许一台 host 并发多批(host-agent 兜底,可扩 1000 host)。
-        base = _try_reserve_host(
+        # #412 — reserve+placement 原子:一个 TransactWriteItems 完成 host 账本增量 +
+        # 每租户放置写 + 唯一 capacity_reservation_id。取代旧的"_try_reserve_host 整批 CAS
+        # 再 _backfill_placement 逐租户回写"两步(两步之间 delete 抢赢制造无主增量 → #412 泄漏)。
+        # #315 SPLIT_BY_MODE:push 写 inflight 标量 + 排他门(poller 靠它);ddb 不写标量。
+        base = _reserve_batch_txn(
+            batch,
             instance_id,
-            n,
             command_id,
             now_epoch,
+            next_vm_by_host.get(instance_id, 1),
             alloc_by_host.get(instance_id, 0),
             sum_vcpu,
             sum_mem,
             alloc_mem_by_host.get(instance_id, 0),
+            specs,
             write_inflight=gate_inflight,
+            rootfs_version=rootfs_by_host.get(instance_id, ""),
         )
-        if base is None:
-            # CAS 输(容量不够;push 模式还含 inflight 未过期)→ 该批全 unplaced 走重试
-            # #315(codex final MR P1#3):CAS loser 是容量类失败,纳入短退避快速重投(15s),
-            # 不然高并发满容量时最常见的这类输家仍卡 960s。
+        if base == _RESERVE_TRANSIENT:
+            # #412(review8 #3)—— 瞬时高竞争耗尽/读失败(非容量不够、非 delete 抢赢)。host 增量
+            # 未生效。整批进 batchItemFailures 让原消息重投,但【不计 dispatch_retries、不清 claim】
+            # (记 reserve_retry_tids,下方 _release_claims 跳过),否则竞争下反复 +retry 会把健康
+            # 租户误推进 requires_intervention。claim 留着,重投时新一轮认领/reserve 再试。
             for t in batch:
-                _fail(t["tenant_id"], "host CAS lost (capacity/inflight)", instance_id)
+                _fail(t["tenant_id"], "host reserve transient contention (no-budget retry)", instance_id)
+                reserve_retry_tids.add(t["tenant_id"])
+            continue
+        if base is None:
+            # 事务取消(容量不够 / delete 抢赢某租户)→ host 增量未生效,该批全 unplaced 走重试。
+            # #315:CAS loser 是容量类失败,纳入短退避快速重投(15s)。
+            for t in batch:
+                _fail(t["tenant_id"], "host reserve txn cancelled (capacity/race)", instance_id)
                 capacity_retry_tids.add(t["tenant_id"])
             continue
 
-        # #139:CAS 赢了 = 放置已定,先回写 host_id/vm_num/guest_ip 再分发
-        # (顺序重要:先落账再发命令,SSM 再快也查得到 VM 在哪台)。
-        _backfill_placement(batch, instance_id, base)
+        # #139/#412:事务已赢 = 放置 + 令牌已原子落库,直接分发(不再单独 backfill)。
+        # #411/6.2 的 rootfs_version 回写已并入 reserve 事务(_reserve_batch_txn 的 rootfs 参数),
+        # 不再走已删除的 _backfill_placement。批级失败回滚改走 _release_batch(逐租户令牌释放,
+        # 幂等、不双扣;再单独清 host inflight)。
+        def _release_batch() -> None:
+            all_settled = True  # 所有租户都已 consumed/already(令牌确不再占容量)
+            for offset, t in enumerate(batch):
+                v, m = specs[offset]
+                r = _release_reservation(
+                    t["tenant_id"],
+                    instance_id,
+                    _reservation_id(command_id, t["tenant_id"]),
+                    v,
+                    m,
+                )
+                if r == RELEASE_RETRY:
+                    # 瞬时失败:令牌可能仍占容量。租户已进 batchItemFailures 重投,重投时
+                    # reserve 见令牌会取消、reaper 兜底;此刻【不清 inflight】——否则并发新命令
+                    # 会 reserve 这台 host 而陈旧令牌仍占着容量(codex review #4)。
+                    # review3 #3:也【不清该租户 claim / 不计 retry】—— 记入 reserve_retry_tids,
+                    # 下方 _release_claims 跳过它,保 claim + inflight,靠原消息重投或 reaper 兜底。
+                    all_settled = False
+                    reserve_retry_tids.add(t["tenant_id"])
+            # inflight 是 host 级批状态(非 per-tenant),命令未真正发出。仅当本批令牌全部落定
+            # (无 retry 悬空)才清,带 poller 同款 CAS(dispatch_inflight=:cid)防误清并发新命令。
+            # push 才有 inflight;有 retry 悬空则留 inflight,靠 TTL 过期或下轮释放清。
+            if push_mode and all_settled:
+                _clear_inflight_scalar(instance_id, command_id)
 
         if push_mode:
             try:
                 part_count = _put_manifest_parts(command_id, instance_id, batch, base)
             except Exception as e:  # noqa: BLE001
-                _rollback_host(instance_id, n, sum_vcpu, sum_mem)
+                _release_batch()
                 for t in batch:
                     _fail(t["tenant_id"], f"manifest write failed: {e}", instance_id)
                 continue
             sent = _send_ssm_manifest(instance_id, command_id, part_count, n)
             if sent is None:
                 ssm_consec_fail += 1
-                _rollback_host(instance_id, n, sum_vcpu, sum_mem)
+                _release_batch()
                 _delete_manifest_parts(command_id, instance_id, part_count)
                 for t in batch:
                     _fail(t["tenant_id"], "SSM SendCommand failed", instance_id)
@@ -918,16 +1246,19 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             # ddb 载体:先写 assignments(数据),再发 --from-ddb 叫醒(信号)。
             # 写序重要:表里有行,叫醒命令到达时 host 才查得到(同步路径先落账
             # 再发命令同款,#139 教训)。写失败或叫醒失败都回滚 host + 清 assignments。
-            if not _write_assignments(instance_id, batch, base, now_epoch):
-                _rollback_host(instance_id, n, sum_vcpu, sum_mem)
+            if not _write_assignments(
+                instance_id, batch, base, now_epoch, command_id
+            ):
+                _clear_assignments(instance_id, batch, command_id)
+                _release_batch()
                 for t in batch:
                     _fail(t["tenant_id"], "assignments write failed", instance_id)
                 continue
             sent = _send_ssm_from_ddb(instance_id, command_id, n)
             if sent is None:
                 ssm_consec_fail += 1
-                _rollback_host(instance_id, n, sum_vcpu, sum_mem)
-                _clear_assignments(instance_id, batch)
+                _clear_assignments(instance_id, batch, command_id)
+                _release_batch()
                 for t in batch:
                     _fail(t["tenant_id"], "SSM from-ddb wake failed", instance_id)
                 if ssm_consec_fail >= clients.DISPATCH_CIRCUIT_THRESHOLD:
@@ -951,9 +1282,12 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
                 ssm_consec_fail = 0
                 _record_ssm_cid(instance_id, sent)
         else:  # pull(二期 host-agent 轮询,无 SSM 叫醒)
-            ok = _write_assignments(instance_id, batch, base, now_epoch)
+            ok = _write_assignments(
+                instance_id, batch, base, now_epoch, command_id
+            )
             if not ok:
-                _rollback_host(instance_id, n, sum_vcpu, sum_mem)
+                _clear_assignments(instance_id, batch, command_id)
+                _release_batch()
                 for t in batch:
                     _fail(t["tenant_id"], "assignments write failed", instance_id)
 
@@ -966,6 +1300,14 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     for t in result.unplaced:
         _fail(t["tenant_id"], "unplaced: no host capacity this round")
         capacity_retry_tids.add(t["tenant_id"])
+
+    # #412(review7 #2)—— 陈旧令牌本轮没结算掉的租户:进 batchItemFailures 让原消息重投,
+    # 但记入 reserve_retry_tids(下方 _release_claims 跳过它)保 claim 不计 retry,下轮重投再结算。
+    for _msg in stale_unsettled_msgs:
+        failures.append(_msg)
+        _tid = {v: k for k, v in tid_to_msg.items()}.get(_msg)
+        if _tid:
+            reserve_retry_tids.add(_tid)
 
     # dedup 保序
     seen = set()
@@ -980,8 +1322,18 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     # creating——unplaced 尾巴 ~16% 全灭在这)。条件写限定 claim 归属本 claim_id,
     # 绝不误删并发实例的新 claim;顺带 ADD dispatch_retries 计预算。
     msg_to_tid = {v: k for k, v in tid_to_msg.items()}
+    # #412 review3 #3:令牌释放遇 RETRY 的租户【排除】出 _release_claims——保留其 claim +
+    # inflight + 不计 dispatch_retries,靠 SQS 原消息按默认 960s 重投再释放(重投时令牌仍在
+    # → reserve 见令牌取消/或本 host 命令重跑释放),或 reaper 令牌孤儿清扫兜底。清了 claim 会
+    # 让重投撞新鲜认领闸被静默 ack → 令牌搁浅。它们仍在 batchItemFailures(下面 dedup)里,消息
+    # 照常重投,只是不动 claim。
     released = _release_claims(
-        [msg_to_tid[m] for m in dedup if m in msg_to_tid], command_id
+        [
+            msg_to_tid[m]
+            for m in dedup
+            if m in msg_to_tid and msg_to_tid[m] not in reserve_retry_tids
+        ],
+        command_id,
     )
     # #315 极简方案:只对【容量类失败(unplaced+CAS loser)且成功释放 claim 且仍需重投】的租户
     # 缩短原消息 visibility(960→15s),让容量溢出快速重投而非等 48min。顺序在释放【之后】+ 只缩

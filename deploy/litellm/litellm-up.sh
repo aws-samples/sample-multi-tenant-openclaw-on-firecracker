@@ -9,6 +9,7 @@ cd "$(dirname "$0")"
 ENV_FILE=".env"
 EXAMPLE=".env.example"
 SRC_CONFIG="../runtime-config-export/litellm-config.yaml"   # 仓库内权威 config（master_key 已脱敏，guardrail 占位）
+GUARDRAIL_SPEC="../runtime-config-export/bedrock-guardrail.json"
 RUNTIME_CONFIG="config.runtime.yaml"                          # 注入后产物，不提交
 
 # --- 1. .env：缺失项现生成 ---
@@ -42,14 +43,33 @@ gen_if_empty LITELLM_MASTER_KEY 'echo sk-$(openssl rand -hex 32)'
 gen_if_empty POSTGRES_PASSWORD  'openssl rand -hex 24'
 : "${AWS_REGION:=ap-southeast-1}"
 # #80 — guardrail id 先查 SSM(栈内 CfnGuardrail 写入的 /openclaw/bedrock-guardrail-id),
-# 环境变量显式指定优先(便于本地调试),SSM 没值时兜底走 GUARDRAIL_ID 的占位默认值。
-# 后者在 security.guardrail_managed_by_stack 切开后应删,现在保留是为了让存量部署不断服。
+# 环境变量显式指定优先(便于本地调试);SSM 没值时按仓库 Guardrail 名精确发现,
+# 兼容 guardrail_managed_by_stack=false 的存量账号,同时不再携带账号特定 ID。
+GUARDRAIL_SOURCE="environment"
 if [ -z "${GUARDRAIL_ID:-}" ]; then
   GUARDRAIL_ID="$(aws ssm get-parameter --name /openclaw/bedrock-guardrail-id \
     --region "$AWS_REGION" --query 'Parameter.Value' --output text 2>/dev/null || true)"
+  GUARDRAIL_SOURCE="SSM"
 fi
-: "${GUARDRAIL_ID:=REPLACE_WITH_YOUR_GUARDRAIL_ID}"
-echo "[up] guardrail id: ${GUARDRAIL_ID} (SSM 优先,兜底=占位默认值)"
+if [ -z "${GUARDRAIL_ID:-}" ] || [ "$GUARDRAIL_ID" = "None" ]; then
+  if [ ! -f "$GUARDRAIL_SPEC" ]; then
+    echo "[up][ERR] 找不到 Guardrail 真相源: $GUARDRAIL_SPEC" >&2
+    exit 1
+  fi
+  GUARDRAIL_NAME="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["name"])' "$GUARDRAIL_SPEC")"
+  GUARDRAIL_ID="$(aws bedrock list-guardrails --region "$AWS_REGION" \
+    --query "guardrails[?name=='$GUARDRAIL_NAME'].id|[0]" --output text 2>/dev/null || true)"
+  GUARDRAIL_SOURCE="Bedrock name lookup"
+fi
+if [ -z "${GUARDRAIL_ID:-}" ] || [ "$GUARDRAIL_ID" = "None" ]; then
+  echo "[up][ERR] GUARDRAIL_ID is missing after SSM and Bedrock name lookup"
+  exit 1
+fi
+if ! [[ "$GUARDRAIL_ID" =~ ^[a-z0-9]{12}$ ]]; then
+  echo "[up][ERR] GUARDRAIL_ID is not a valid 12-character Bedrock Guardrail ID"
+  exit 1
+fi
+echo "[up] guardrail id: ${GUARDRAIL_ID} (${GUARDRAIL_SOURCE})"
 chmod 600 "$ENV_FILE"
 
 # --- 2. guardrail 注入 ---
@@ -63,7 +83,7 @@ fi
 # master_key 在 config 里仍是 [REDACTED] 占位；运行态由容器环境变量 LITELLM_MASTER_KEY 覆盖。
 # 把 config 里的 master_key 行改成引用环境变量，避免 [REDACTED] 字面值被当成真 key。
 sed -i 's|^\(\s*master_key:\).*|\1 os.environ/LITELLM_MASTER_KEY|' "$RUNTIME_CONFIG"
-echo "[up] guardrail 注入完成 -> $RUNTIME_CONFIG（ID=${GUARDRAIL_ID}，master_key 改引用 env）"
+echo "[up] guardrail 注入完成 -> ${RUNTIME_CONFIG}（ID=${GUARDRAIL_ID}，master_key 改引用 env）"
 
 # --- 3. compose up ---
 echo "[up] docker compose up ..."

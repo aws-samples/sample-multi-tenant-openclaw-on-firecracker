@@ -2,34 +2,34 @@
 
 This section is for integrators who want to embed the platform into their own systems (a customer backend, an operations console, or automation scripts). The control plane endpoint examples below have been verified against a live deployment (a direct `curl` against the environment; responses are real machine output with credentials redacted).
 
-> ⚠️ **Note (superseded): the `{HUB}/hub/*` real-time endpoints in this chapter have been replaced by two-tier routing**
->
-> The control plane REST portion of this chapter (create / query / lifecycle / backup / authorization) remains valid. However, the data plane endpoints that appear below — `{HUB}/hub/token`, `{HUB}/hub/ws`, `{HUB}/channel-token` — belong to the early claw-hub relay model, which was retired on 2026-07-08. Real-time chat now goes through two-tier routing (platform backend WebSocket gateway → edge → microVM gateway, with identity carried by a platform session JWT + Ed25519 device authentication); see the Data Plane Two-Tier Routing chapter (Chapter 13) for the current model.
+> This chapter defines only the control plane REST API. Real-time chat uses the
+> platform backend `/gw/ws` and two-tier routing. There is no current
+> `{HUB}/hub/*` integration contract; see Chapter 13.
 
 > Throughout this document, `{BASE}` refers to the control plane API Gateway address (of the form `https://<api-id>.execute-api.<region>.amazonaws.com/v1`, supplied after deployment by `OC_DEFAULT_API_URL` in `console/config.js`). Use your own deployment for the real account ID / domain / credentials; this document uses placeholders.
 
-> **Machine-readable contract**: the field-level, per-parameter contract for every endpoint below lives in `../aws-guide/openapi.yaml` (OpenAPI 3.1, 37 paths). Browse it interactively with `swagger.html` in that same directory: `cd docs/aws-guide && python3 -m http.server`, then open `swagger.html`. Where this prose and `openapi.yaml` disagree, treat `openapi.yaml` as the field-level source of truth.
+> **Machine-readable contract**: the field-level, per-parameter contract for every endpoint below lives in `../aws-guide/openapi.yaml` (OpenAPI 3.1, 38 paths). Browse it interactively with `swagger.html` in that same directory: `cd docs/aws-guide && python3 -m http.server`, then open `swagger.html`. Where this prose and `openapi.yaml` disagree, treat `openapi.yaml` as the field-level source of truth.
 
 ---
 
 ## 1. Authentication Model (the three-part authorization model)
 
-The control plane runs three layers of validation on every request. Understand them before integrating:
+The control plane applies three layers:
 
-1. **API Key (gateway layer, `x-api-key` header)** — validated by the API Gateway usage plan. A missing or wrong key always returns `403 {"message":"Forbidden"}`, and the request never reaches business logic (verified on a live machine: a missing key and a wrong key return the same response, indistinguishable, to prevent enumeration). Every control plane call must carry `x-api-key`.
-2. **Amazon Cognito JWT (identity layer, `Authorization: Bearer <id_token>` header)** — for routes that operate "as a specific logged-in user" (such as self-service registration `POST /tenants/self`). A Cognito authorizer runs at the gateway plus JWKS signature verification inside AWS Lambda (RS256, checking issuer + expiry + client_id). Pure backend automation can use only the API Key on the administrator path (`owner_id = API_KEY_OWNER`, full visibility).
-3. **RBAC + owner gating (authorization layer, inside Lambda)** — the validated Cognito `sub` becomes the `owner_id` stored on the tenant record; every per-tenant route enforces `owner == caller` (or admin / api-key). Cross-user access by a non-owner returns `403`.
+1. **Usage-plan identity (`x-api-key`)**. Every current API Gateway method requires this header; a missing or invalid value returns `403`. AWS explicitly states that API keys must not be used as authentication or authorization, and usage-plan throttles and quotas are best effort.
+2. **Identity (`Authorization: Bearer <id_token>`)**. When Amazon Cognito is enabled, Lambda verifies RS256, issuer, expiration, and the configured client id through JWKS, then derives the caller and `cognito:groups` role.
+3. **Authorization in Lambda**. RBAC controls viewer/operator/admin route access; owner and platform-scope checks constrain resources. An invalid Bearer token never degrades into the trusted API-key-only identity.
 
-The rule in one line: **use `x-api-key` for pure backend integration; add `Authorization: Bearer <Cognito id_token>` when you need to create/manage each platform user's own openclaw under their identity.**
+The default configuration maps API-key-only requests to `viewer`, so they can call read routes only. A deployment that permits trusted internal automation to write with only `x-api-key` must explicitly set `console_auth.default_no_jwt_role` to `operator` or `admin` and add a real boundary such as private networking, IAM, or a Lambda authorizer.
 
-The data plane (real-time chat) has its own separate token exchange, see §5.
+AWS reference: [API Gateway API key and usage-plan best practices](https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-api-usage-plans.html).
 
 ### 1.1 RBAC Roles and Route Permissions (config-gated)
 
 RBAC is controlled by the environment variable `RBAC_ENABLED` (on by default). Roles come in three levels `viewer < operator < admin`, derived from the Cognito `cognito:groups` claim (highest level taken). Authorization is checked after the route matches, so an unknown path still returns `404` rather than `403`. Fail-safe: with no Bearer token, the caller falls to `DEFAULT_NO_JWT_ROLE` (default `viewer`); if the token fails validation → `403`.
 
 - **Skip RBAC (self-authenticating)**: `POST /external/authz` (HMAC signature), `GET /tenantmatch` (pre-login IdP routing lookup).
-- **viewer suffices**: all read-only `GET` (list / detail / system info / audit / images / group reads / skill reads) + `POST /tenants/self` (self-service registration) + `POST /chat/sign` (viewer at the route layer, with additional owner gating inside the function).
+- **viewer suffices**: all read-only `GET` routes plus `POST /tenants/self` (self-service registration).
 - **operator and above**: all write operations (create / lifecycle / host management / skill write & delete / group write & delete / batch).
 - **admin only**: `POST /hosts/fleet-power` (fleet-wide power on/off; requires operator at the route layer, with an additional admin check inside the function).
 
@@ -112,7 +112,7 @@ The distinction among the three: `/images` (see §3.4) shows which artifacts are
 
 ### 3.2 Tenant Lifecycle
 
-**`POST {BASE}/tenants`** — create a tenant (spins up an independent openclaw microVM). Administrator/backend path (`x-api-key`, RBAC operator+).
+**`POST {BASE}/tenants`** — create a tenant (spins up an independent openclaw microVM). Requires `x-api-key` and an operator-or-higher RBAC role; with the default `viewer` fallback, an operator/admin Bearer token is also required.
 
 ```bash
 curl -s -X POST -H "x-api-key: $KEY" -H "content-type: application/json" \
@@ -165,9 +165,9 @@ Input parameters (all optional except `name`):
 The return code depends on whether the deployment has the create throttling queue enabled (`CREATE_VIA_QUEUE`, the `scaler.create_via_queue` in `config.yml`, **off by default**):
 
 - **Default (synchronous)**: with host capacity available, returns `201 {"id":"acme-xxxx","status":"creating",...}`; with no capacity, returns `201 {"id":"...","status":"pending"}` (automatically triggers scale-out, handled in the background).
-- **With the throttling queue enabled (asynchronous)**: the request is enqueued into Amazon SQS for throttling, returning `202 {"id":"acme-xxxx","status":"queued","message":"create accepted; provisioning asynchronously"}`. Enabling it is recommended when creating tenants at scale (see the SSM concurrency note in the deployment planning chapter).
+- **With the throttling queue enabled (asynchronous)**: the request is enqueued into Amazon SQS for throttling, returning `202 {"id":"t-<16hex>","status":"queued","message":"create accepted; provisioning asynchronously"}`. Enabling it is recommended when creating tenants at scale (see the SSM concurrency note in the deployment planning chapter).
 
-With `client_token`, the id is determined by `(owner, client_token)`, and replaying the same key returns `409 CONFLICT`. In both modes you then **poll `GET /tenants/{id}` until `status:running`**.
+With `client_token`, the id is determined by `(owner, client_token)` and has the fixed shape `t-` plus 16 hexadecimal characters; replaying the same key returns `409 CONFLICT`. Only a create without `client_token` uses `<name>-<4hex>`. In both modes, **poll `GET /tenants/{id}` until `status:running`**. The live `tests/api-regress` suite locks this distinction.
 
 > **Known bug (#160) — when creating via the SQS throttle queue (`DISPATCH_QUEUE_URL` enabled), some fields are not injected into the VM.** Verified live (2026-07-07): the dispatch branch only forwards `vcpu`/`mem_mb`/`owner_id`/`chat_ep`/`image` in the consumer message params (`tenant_service.py:440-451`) — **`skills`/`group`/`schedule`/`ttl_hours`/`chat_endpoint_enabled` are all dropped**. `platform_id`/`tags` are persisted (visible on GET), but `skills` never reaches the VM (`effective_skills` stays `*` broadcast) and `chat_endpoint_enabled` is lost (read as `chat_ep`). **The synchronous path (default, queue off) is unaffected — every field in the table above takes effect.** If your deployment enables the throttle queue and relies on these fields, mind this gap until #160 is fixed.
 
@@ -179,9 +179,9 @@ With `client_token`, the id is determined by `(owner, client_token)`, and replay
 - Pagination: `GET {BASE}/tenants?limit=5` → `{"tenants":[…],"next_token":"<opaque>","count":<count on this page>}`.
 - Boundaries (verified on a live machine): `?limit=-1` → `400 {"code":"VALIDATION","error":"limit must be a positive integer (>= 1)"}`; `?next_token=garbage` → `400 {"code":"VALIDATION","error":"next_token is invalid or expired"}`.
 - Optional `?tag=key:value` to filter by tag (can be repeated, AND semantics).
-  > **Important** The control plane runs `_redact_tenant` (`tenant_service.py:130`) to strip the tenant-level credential fields `channel_secret` / `litellm_vkey` / `gateway_token` / `cognito_channel_password` from both `GET /tenants` and single-tenant responses. Even so, an integrator **must not pass the response through verbatim to an untrusted frontend**; treat these fields as server-side only, and if you extend the projection, re-confirm nothing sensitive leaks.
+  > **Important** List responses strip tenant credentials. An integrator **must not pass the response through verbatim to an untrusted frontend**; expose only display fields.
 
-**`GET {BASE}/tenants/{id}`** — a single tenant's detail (owner-gated).
+**`GET {BASE}/tenants/{id}`** — one tenant (owner/admin-gated). The base record is redacted. When the tenant is `running`, the response adds the gateway-token KMS ciphertext and a `device` object (device id, public key, private-key KMS ciphertext, and scopes) for a trusted platform backend to decrypt with the required encryption contexts and complete the WSS device handshake. These are ciphertext, not public frontend fields. `GET /tenants/{id}/credentials` rewraps the same credentials into the recipient-key `asymmetric-v1` envelope.
 
 **`POST {BASE}/tenants/{id}/{action}`** — lifecycle actions (RBAC operator+ + owner gating). Supported `action` values:
 
@@ -254,6 +254,14 @@ curl -s -H "x-api-key: $KEY" "{BASE}/images"
 
 Fields: `live_version` (the version `manifest.json` points to, `"unknown"` if not obtainable), `manifest` (verbatim content, `{}` if not obtainable), `artifact_count`, `artifacts[]` sorted by `(kind, name)`, each containing `name`, `kind`, `size_bytes`, `last_modified` (ISO8601, `null` if missing), `is_backup` (`true` if the name contains `.bak`). `kind` enum: `rootfs` (the read-only root filesystem disk), `data-template` (the data disk template), `kernel` (`vmlinux`), `integrity-baseline` (`golden-image.sha256`), `manifest`, `other`. Errors: `ASSETS_BUCKET` not configured → `503`; S3 listing failure → `500`.
 
+Image snapshot and canary-slot endpoints:
+
+- **`POST {BASE}/create-image-snapshot`** accepts `{"label":"<1-128 A-Za-z0-9._->"}`. An empty label is not derived by the control plane; it returns `400 VALIDATION`. Any derivation or deduplication belongs to the upstream caller.
+- **`GET {BASE}/list_image_versions`** / **`POST {BASE}/delete-image-snapshot`** list or delete version snapshots.
+- **`POST {BASE}/hosts/{id}/pull-image?snapshot_time=<ISO>&slot=live|canary`** pulls into the live or canary slot.
+- **`GET {BASE}/hosts/{id}/pull-image-progress`** / **`GET {BASE}/hosts/{id}/image-slots`** return the async job and the host's actual slot state.
+- **`POST {BASE}/hosts/{id}/promote-canary`** / **`POST {BASE}/hosts/{id}/reclaim-images`** promote a validated canary or reclaim unreferenced versions. See `openapi.yaml` and the [pull-image API](../api/pull-image-api.md) for state and conflict details.
+
 ### 3.5 Host Management (operations)
 
 **`POST {BASE}/hosts`** — register an EC2 instance as a Firecracker host (RBAC operator+). body `{instance_id:"i-..."}`. The platform runs DescribeInstances to obtain vCPU/memory/AZ, accounts for it after deducting `HOST_RESERVED_*`, and returns `201 {instance_id,status:"active",az}`.
@@ -276,12 +284,12 @@ Fields: `live_version` (the version `manifest.json` points to, `"unknown"` if no
 
 > **Note** A skill name is limited to lowercase letters + digits + hyphens; an illegal name returns `400`. Skill changes land in the image artifact layer and take effect on the next image rebuild / refresh-rootfs, not by hot-patching a running VM (in keeping with the architectural rule "change the image and rebuild, do not hot-patch a live VM").
 
-**Config templates** — CRUD over the OpenClaw config templates under the S3 `templates/openclaw/` prefix, served by a standalone Lambda `deploy/lambda/templates/handler.py`. A `config_template` name passed to `POST /tenants` resolves against these.
+**Config templates** — CRUD over the OpenClaw config templates under the S3 `templates/openclaw/` prefix, served by a standalone Lambda. These routes currently require only API Gateway `x-api-key`; they do not pass through Cognito RBAC or the API Lambda audit path. Because an API key is not authentication, put template writes behind trusted networking or an additional authorizer rather than exposing them directly to the public internet.
 
-- **`GET {BASE}/templates`** (viewer+) — the template list `{"templates":[{name,size,modified},...]}`. (`openapi.yaml` `listTemplates`.)
-- **`GET {BASE}/templates/{name}`** (viewer+) — one template's content `{name,content}` (`content` is the parsed `openclaw.json`), `404` if it does not exist.
-- **`PUT {BASE}/templates/{name}`** (operator+) — create/update a template; body is the `openclaw.json` object; invalid JSON returns `400`; the reserved name `default` cannot be modified (`403`). Returns `{name,status:"saved"}`.
-- **`DELETE {BASE}/templates/{name}`** (operator+) — delete a template; `default` cannot be deleted (`403`). Returns `{name,status:"deleted"}`.
+- **`GET {BASE}/templates`** — the template list `{"templates":[{name,size,modified},...]}`.
+- **`GET {BASE}/templates/{name}`** — one parsed `openclaw.json` object, or `404`.
+- **`PUT {BASE}/templates/{name}`** — create/update; invalid JSON returns `400`, and `default` is write-protected (`403`).
+- **`DELETE {BASE}/templates/{name}`** — delete; `default` is protected (`403`).
 
 ### 3.7 AgentCore (read-only, config-gated)
 
@@ -292,11 +300,11 @@ Fields: `live_version` (the version `manifest.json` points to, `"unknown"` if no
 
 **`GET {BASE}/tenantmatch?platform_id=<id>`** — an external platform → Cognito upstream IdP routing lookup (**skips RBAC**, no identity before login). Given a platform identifier it returns `{platform_id, idp_provider_name, issuer_url}`, and the frontend uses this to redirect the user straight to the corresponding upstream IdP. `platform_id` regex `[a-zA-Z0-9._-]{1,128}`, illegal `400`; IdP federation not configured (`TENANT_IDP_TABLE` unset) `404 NOT_CONFIGURED`; platform not registered `404 NOT_FOUND`; DynamoDB failure `502`. **A pre-login lookup that leaks no tenant data, doing only platform → IdP routing.**
 
-> **Known gap — currently unreachable** The handler, Lambda routing, DDB table, and IAM read grant all exist (`handler.py:649`, `stack.py` `TENANT_IDP_TABLE` env + read grant), but `deploy/stack.py` never calls `add_resource("tenantmatch")` on the REST API, so API Gateway rejects the path before it reaches the Lambda — a live `GET /tenantmatch` returns `403 {"message":"Missing Authentication Token"}`. This endpoint is documented for the day the gateway resource is wired; the gap is tracked in issue #159. Do not depend on it in a current deployment.
+> **Known gap — currently unreachable** The handler, DDB table, Lambda environment, and IAM read grant exist, but `deploy/stacks/lambdas.py` does not add a `tenantmatch` API Gateway resource. API Gateway therefore rejects the path before Lambda. Do not depend on this documented-but-unreachable operation.
 
 ### 3.9 Authorization Integration (external backend)
 
-**`POST {BASE}/external/authz`** — an external backend pushes "user ↔ tenant" authorization mappings (**skips RBAC, self-authenticated with an HMAC signature**, in effect when `EXTERNAL_AUTHZ` is enabled). Used to hand the authorization decision to the customer's own platform: the platform says "user X may access tenant Y", this is written into `authorized_users`, and the data plane hub admits based on it.
+**`POST {BASE}/external/authz`** — an external backend pushes "user ↔ tenant" authorization mappings (**skips RBAC, self-authenticated with an HMAC signature**, in effect when `EXTERNAL_AUTHZ` is enabled). The mapping is written into `authorized_users`; the platform WebSocket gateway consults the same authorization fact before selecting a tenant for a user.
 
 - Signature headers: `x-claw-authz-signature` (= HMAC-SHA256(secret, `"{timestamp}.{raw_body}"`)) + `x-claw-authz-timestamp` (unix seconds, ±`EXTERNAL_AUTHZ_TS_WINDOW` default 300s, replay protection).
 - body: `{tenant_id, principal, op:"grant"|"revoke", role?, expire_at?}`.
@@ -324,82 +332,64 @@ Invariants (a violation returns `400 VALIDATION`): `storage_encrypted:false` can
 
 ---
 
-## 4. Data Plane: Exchange a Frontend Token + Message Signing (hub)
+## 4. Data Plane: Platform WebSocket Gateway
 
-The data plane connects "browser/frontend ⇄ the user's own openclaw" through the hub (the WS central relay). The frontend does not connect directly to the microVM (the VM opens no inbound port); instead both sides make outbound connections that meet at the hub.
+Real-time chat is not a control plane API subresource. The browser connects only
+to the customer's platform endpoint:
+`wss://<platform>/gw/ws?token=<platform-session-token>`. The platform backend
+validates its own session token, chooses the tenant from server-side ownership
+data, and connects as an OpenClaw WebSocket client to `/ws/{tenant_id}`. The
+second hop traverses Amazon CloudFront, an Application Load Balancer, the
+OpenResty edge, host DNAT, and the microVM on port `18789`.
 
-**`POST {HUB}/hub/token`** — the frontend exchanges a Cognito `id_token` for a hub short-lived token.
+The platform backend obtains KMS ciphertext for the gateway token and device
+private key from the control plane, decrypts it in process with the required
+encryption context, and completes `connect.challenge` → Ed25519 signature →
+`hello-ok`. The browser never receives `x-api-key`, a gateway token, or a device
+private key. The retired `/hub/token`, `/hub/ws`, `/channel-token`,
+`/chat/sign`, and hub file-presign endpoints are not current contracts. See
+Chapter 13 and `engineering/backend/lib/gw-ws.mjs` for frames, close codes, and
+retry behavior.
 
-```bash
-curl -s -X POST -H "Authorization: Bearer <cognito_id_token>" \
-  -H "content-type: application/json" -d '{"tenant_id":"acme-xxxx"}' "{HUB}/hub/token"
-```
-
-On the hub side: JWKS signature verification (`token_use=id` + audience) + `authorizeSubForTenant(sub, tenant_id)` looking up `owner_id`/`authorized_users`. On success it returns `{"token":"<frontend short-lived token>","expires_in":300}`. The short-lived token claim = `{role:"frontend", sub:<validated>, tenant, access, exp:+300s}`, HMAC-signed (the key is shared as multiple replicas via AWS Secrets Manager). A 403 means the sub has no permission to access the tenant.
-
-**`POST {HUB}/channel-token`** — the microVM outbound side (claw-channel) proving it is a given tenant: a Cognito machine-user access token (the `username` claim = the tenant, cannot be forged), exchanged for an equivalent `{role:"channel"}` short-lived token. An integrator usually does not need to call this directly (it is done automatically by the channel inside the VM).
-
-**`POST {BASE}/chat/sign`** — on the control plane side, sign a C-side message envelope, delivered to a per-VM webhook as a fallback side path (RBAC viewer+, with owner/admin gating inside the function). Requires `Authorization: Bearer <Cognito id_token>` + body `{tenant_id, text}` (`text` ≤8000 characters). Returns `{path:"/chat/{tenant_id}/inbound", body:"<signed envelope>", headers:{x-claw-signature, x-claw-random, x-claw-timestamp}}`, signed by the HMAC-derived `channel_secret`. If the tenant's channel key is not yet ready (the VM is still booting), returns `409`. Day-to-day real-time chat goes over the WebSocket in §5 and does not need to call this endpoint directly.
-
-**Files**: `POST {HUB}/files/upload-url` (a MIME allowlist + size) returns an S3 pre-signed PUT; `GET {HUB}/files/download-url?fileKey=` with a tenant-segment guard (the second segment of fileKey must == the caller's tenant, to prevent cross-tenant IDOR) returns a pre-signed GET.
-
----
-
-## 5. WebSocket Real-Time Chat
-
-1. The frontend obtains a frontend short-lived token per §4.
-2. Connect: `wss {HUB}/hub/ws?token=<frontend short-lived token>` (via CloudFront `/hub/*` → ALB → hub). The hub validates the token, stamps `_tenant/_sub`, and registers it in the frontends table. After connecting, the hub sends a protocol-level PING keepalive every 25s (to withstand idle disconnection during the agent's cold start).
-3. Send a message (frame shape):
-
-```json
-{
-  "operationType": "msg_create",
-  "parts": [{ "kind": "TEXT", "text": "Hello" }],
-  "threadId": "<thread id, regex ^[A-Za-z0-9._:-]+$ length ≤80>",
-  "clientMessageId": "<frontend correlation id>"
-}
-```
-
-The hub sets `senderId` to the **server-validated Cognito sub** (it does not trust the client's self-report, to prevent impersonation) and delivers it to that tenant's channel → openclaw inference inside the microVM. 4. Receive the reply: `type:"reply_delta"` or `operationType:"msg_update"` streaming increments (the frontend replaces the bubble by `clientMessageId`). The hub only delivers to all tabs of that sub whose `_tenant` matches (cross-tenant isolation). 5. History: send `type:"history_request"` → receive `type:"history_reply"` (a messages array).
-
-**Cross-tenant isolation (structural, not trusting the client's self-report)**: ① the frontend short-lived token is bound to a single tenant ② the channel proves its tenant identity via the username claim of the Cognito access token ③ matching happens only when `fws._tenant === frame._tenant` + senderId uses the server-validated sub + authorization looks up `owner_id`/`authorized_users`.
+A customer platform that needs file upload or download must implement its own
+tenant authorization and Amazon S3 presigning path. A presigned URL is a bearer
+capability and can expire earlier than requested when its signing credentials
+expire; do not call the retired hub endpoints. See
+[Amazon S3 presigned URLs](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html).
 
 ---
 
-## 6. Quick Start: Running End to End (from the customer's perspective)
+## 5. Quick Start: Running End to End (from the customer's perspective)
 
 ```bash
 export KEY="<your x-api-key>"
+export TOKEN="<operator or admin Cognito id_token>"
 export BASE="https://<api-id>.execute-api.<region>.amazonaws.com/v1"
 
 # 1) Confirm the environment
 curl -s -H "x-api-key: $KEY" "$BASE/system/info" | python3 -m json.tool
 
 # 2) Create a tenant (with an idempotency key)
-curl -s -X POST -H "x-api-key: $KEY" -H "content-type: application/json" \
+curl -s -X POST -H "x-api-key: $KEY" -H "Authorization: Bearer $TOKEN" \
+  -H "content-type: application/json" \
   -d '{"name":"quickstart","client_token":"qs-0001"}' "$BASE/tenants"
-# → Default synchronous: 201 {"id":"quickstart-xxxx","status":"creating"}
-# → With the throttling queue: 202 {"id":"quickstart-xxxx","status":"queued"}
+# → With client_token, id is t-<16hex>
+# → Default synchronous: 201 {"id":"t-...","status":"creating"}
+# → With the throttling queue: 202 {"id":"t-...","status":"queued"}
 
 # 3) Poll until running
-curl -s -H "x-api-key: $KEY" "$BASE/tenants/quickstart-xxxx"
+curl -s -H "x-api-key: $KEY" "$BASE/tenants/t-<16hex>"
 # → until {"status":"running","vm_health":"up","app_health":"up"}
 
-# 4) Frontend exchanges a hub token (browser/frontend, requires a Cognito login to obtain an id_token)
-#    POST {HUB}/hub/token  Bearer <id_token> + {"tenant_id":"quickstart-xxxx"}
-#    → {"token":"<frontend short-lived token>","expires_in":300}
-
-# 5) Open a wss, send a message, receive a reply
-#    wss {HUB}/hub/ws?token=<frontend short-lived token>
-#    send {operationType:msg_create, parts:[{kind:TEXT,text:"..."}], threadId, clientMessageId}
-#    receive reply_delta streaming reply
+# 4) Chat uses the customer platform /gw/ws; the browser sends only its platform session token
+#    wss://<platform>/gw/ws?token=<platform-session-token>
 ```
 
-The control plane steps (1–3) can be run with pure `curl`; the data plane (4–5) needs a Cognito login session + a WS client (refer to the chat UI). The measured end-to-end first reply is about 27s (including the agent's cold start).
+Steps 1–3 are control-plane calls. With the default configuration, writes need an operator/admin Bearer token; omit it only when the deployment explicitly grants operator/admin to the API-key-only path. Chapter 13 covers the platform backend in step 4.
 
 ---
 
-## 7. Appendix: Endpoint Quick Reference
+## 6. Appendix: Endpoint Quick Reference
 
 | endpoint                                               | method         | auth / RBAC                | purpose                                                                                          |
 | ------------------------------------------------------ | -------------- | -------------------------- | ------------------------------------------------------------------------------------------------ |
@@ -426,11 +416,10 @@ The control plane steps (1–3) can be run with pure `curl`; the data plane (4�
 | `/skills/{name}`                                       | GET/PUT/DELETE | viewer / operator          | skill content CRUD                                                                               |
 | `/templates` `/templates/{name}`                       | GET/PUT/DELETE | viewer / operator          | config-template list + CRUD (`default` immutable)                                                |
 | `/agentcore/status` `/agentcore/tools`                 | GET            | viewer                     | AgentCore gateway status/tools (config-gated)                                                    |
-| `/tenantmatch`                                         | GET            | none (pre-login)           | platform → IdP routing lookup (**unreachable: gateway resource not wired, see §3.8**)            |
+| `/tenantmatch`                                         | GET            | api-key; no RBAC           | documented-but-unreachable; gateway resource is not wired                                        |
 | `/external/authz`                                      | POST           | HMAC                       | external authorization push (config-gated, off by default)                                       |
-| `/chat/sign`                                           | POST           | Bearer · viewer + owner    | C-side message signing (fallback side path)                                                      |
-| `{HUB}/hub/token` `/channel-token`                     | POST           | Bearer / Cognito access    | data plane token exchange                                                                        |
-| `{HUB}/hub/ws`                                         | WSS            | frontend short-lived token | real-time chat                                                                                   |
-| `{HUB}/files/upload-url` `/download-url`               | POST/GET       | hub token                  | file pre-signing (tenant-segment guard)                                                          |
+| `/hosts/{id}/pull-image` `/promote-canary`             | POST           | operator / admin           | image pull and canary promotion                                                                   |
+| `/hosts/{id}/image-slots` `/pull-image-progress`       | GET            | viewer                     | host slot state and pull progress                                                                 |
+| `/hosts/{id}/reclaim-images`                           | POST           | admin                      | reclaim unreferenced image versions                                                               |
 
-> Verification sources: the control plane routes and RBAC levels come from the route table in `deploy/lambda/api/handler.py` (the `routes` dictionary) + the `_VIEWER_OK`/`_RBAC_SKIP`/`_rbac_check` definitions; endpoint behavior was verified with live `curl` against the deployment environment (evidence in `internal-docs/00-knowledge-base/evidence/`); the hub/wss parameters come from `the hub design doc` + `the hub server`. The pagination page-size semantics and the AgentCore tool list follow the actual deployment configuration.
+> Verification sources: control-plane routes and RBAC come from `deploy/lambda/api/handler.py`, `deploy/lambda/api/core/auth.py`, and `deploy/stacks/lambdas.py`; field contracts come from `openapi.yaml`; live behavior is locked by `tests/api-regress/`. Data-plane behavior comes from `engineering/backend/lib/gw-ws.mjs`, not the retired hub.

@@ -2,7 +2,7 @@
 
 本节面向**第一次给这个项目构建镜像的人**：假设你会用 Linux 命令行、有一个 AWS 账号，但没接触过 Firecracker、也是头一回打这个 OpenClaw 镜像。跟着走，你会在一台 Linux 机器上，把一个带身份和技能的 OpenClaw agent 打成镜像、传到 Amazon S3。
 
-一句话理解要做的事：拿一个 Ubuntu 根文件系统，往里装上 OpenClaw 和一套预设的身份与技能，封成一个只读磁盘镜像，传到 S3。之后平台起 microVM 时，每台都用这个镜像开机，所以每个租户拿到的 agent 身份、技能、安全护栏都一模一样。
+镜像构建将 Ubuntu 根文件系统、OpenClaw、预设身份与技能封装为只读磁盘并上传到 Amazon S3。microVM 以该版本化镜像启动，使租户获得一致的 agent 身份、技能与安全护栏。
 
 > **这份文档只讲"构建镜像"这一件事**，不涉及部署整个平台控制面（那是另一条线，走 `./setup.sh` + `cdk deploy`，本节完全用不到）。构建镜像不需要先部署任何东西。
 
@@ -14,7 +14,7 @@
 - **debootstrap**：Linux 上一个命令，从零拉一套干净的 Ubuntu 根文件系统到指定目录。构建脚本用它打底，它**只能在 Linux 上跑**。
 - **persona**：agent 的身份与行为设定（性格、名字、能干什么、资金操作要不要二次确认），一组 Markdown 文件。换 persona = 换 agent 的"人设"。
 
-> **为什么基座用 Ubuntu**：Firecracker 官方自己的快速上手就用 Ubuntu —— 官方在 `c5.metal` + Ubuntu 24.04 上跑，示例 rootfs 也是 Ubuntu（见官方文档 [firecracker getting-started.md](https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md)）。本项目跟官方一致：golden image 基座是 **Ubuntu 24.04（debootstrap `noble`）**。Firecracker 不挑 rootfs 发行版（换 Amazon Linux 2023 理论可行），但换基座不是改个参数——见文末"关于换 Amazon Linux 2023 基座"。
+> **Ubuntu 基座选择**：Firecracker 官方快速上手在 `c5.metal` + Ubuntu 24.04 上运行，示例 rootfs 也使用 Ubuntu（见 [firecracker getting-started.md](https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md)）。本项目的 golden image 基座是 **Ubuntu 24.04（debootstrap `noble`）**。更换发行版需要重新验证完整构建与运行链路。
 
 ## 开始之前
 
@@ -195,7 +195,7 @@ curl -o /dev/null -w '%{http_code}' http://<guest-ip>:18789/   # 应为 200
 
 完整的启动逻辑（起 tap 网络、配 boot-source/drives、InstanceStart）本项目已封装在 `deploy/userdata/launch-vm.sh`，生产就用它。附录给了本节在裸金属上真跑的实测结果。
 
-## 我没有 Linux 机器怎么办 / 其它两条路径
+## 非 Linux 工作机路径
 
 除了本地 Linux，还有两条路径，都调同一个 `build-rootfs.sh`，只是换个地方跑：
 

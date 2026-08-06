@@ -1,10 +1,10 @@
 openapi: 3.1.0
 info:
   title: OpenClaw on Firecracker — 控制面 API(ClawPool 多租户平台)
-  version: 1.5.5
+  version: 1.6.0
   description: |-
     ClawPool 控制面 REST API(API Gateway + Lambda):租户 microVM 生命周期、宿主机/舰队、
-    技能/分组/模板、联邦与外部授权;外加反向代理在 /hub/* 下的数据面 hub 接口。
+    镜像槽位、技能/分组/模板、联邦与外部授权。实时聊天数据面不属于本 API。
 
     ## 在本页怎么试跑
     本页默认走**同域只读代理**(`/api/cp-proxy`):后端代持 x-api-key,浏览器**零输入**即可对 GET 接口
@@ -474,6 +474,33 @@ paths:
                   type: string
                   description: Pin scheduling to a specific host (404 if missing/draining, 400 if it lacks capacity).
                   x-source: deploy/lambda/api/services/tenant_service.py:638
+                image_channel:
+                  type: string
+                  enum: [live, canary]
+                  default: live
+                  description: >-
+                    #394 — which image slot this tenant boots from. Absent/`live` (default) =
+                    byte-identical legacy behavior (boots the host''s live slot; version is NOT
+                    pinned — restart re-resolves the current live pointer). `canary` boots the
+                    host''s canary slot to validate a candidate; it REQUIRES preferred_host_id
+                    (the canary slot only exists on the host you pulled it to) and pins the
+                    resolved concrete image_snapshot_time onto the tenant record so
+                    restart/reset/recover never drift to another version. Never falls back to
+                    live: host has no canary → 409 CANARY_NOT_READY; candidate replaced → 409
+                    CANARY_CHANGED.
+                  x-source: deploy/lambda/api/services/tenant_service.py:1310
+                expected_image_snapshot_time:
+                  type: string
+                  description: >-
+                    #394 — for image_channel=canary: the candidate version the caller read from
+                    the pull job result. Admission verifies the host canary still matches this
+                    (TOCTOU guard); mismatch → 409 CANARY_CHANGED.
+                expected_image_generation:
+                  type: integer
+                  description: >-
+                    #394 — optional slots generation guard for canary admission. Only used at
+                    create time; the tenant is pinned to a concrete version, so later host
+                    generation changes (e.g. promote) do not invalidate it.
                 platform_id:
                   type: string
                   pattern: ^[a-zA-Z0-9._-]{1,128}$
@@ -818,7 +845,23 @@ paths:
                   gateway_token:
                     type: string
                     x-sensitive: true
-                    description: NEVER returned — stripped server-side (gateway control-UI bearer).
+                    description: KMS ciphertext returned only for a running tenant after owner/admin authorization. Never expose to a browser.
+                  device:
+                    type: object
+                    description: Device credentials returned only for a running tenant after owner/admin authorization.
+                    properties:
+                      device_id:
+                        type: string
+                      public_key:
+                        type: string
+                      private_key:
+                        type: string
+                        x-sensitive: true
+                        description: KMS ciphertext, not plaintext.
+                      scopes:
+                        type: array
+                        items:
+                          type: string
         '403':
           description: Caller is not the owner (and not admin/API-key), or outside platform scope.
           content:
@@ -2020,6 +2063,19 @@ paths:
                       type: string
                       description: Rootfs manifest version staged on this host (set by POST /hosts/refresh-rootfs).
                       x-source: deploy/lambda/api/services/host_service.py:391
+                    image_slots:
+                      type: object
+                      description: >-
+                        #394 — control-plane mirror of the host''s slots.json (source of truth is
+                        the file on the host). Present once a canary has been pulled to this host;
+                        absent on hosts still on the legacy flat layout. Ops/console read it to see
+                        which candidate is staged.
+                      properties:
+                        live: {type: [string, 'null']}
+                        canary: {type: [string, 'null']}
+                        previous_live: {type: [string, 'null']}
+                        generation: {type: integer}
+                      x-source: deploy/lambda/api/services/host_service.py:1373
                     cpu_overcommit_ratio:
                       type: number
                       description: Injected at read time from env CPU_OVERCOMMIT_RATIO (float, default 1.0). JSON number, not string.
@@ -2153,6 +2209,660 @@ paths:
                 x-source: deploy/lambda/api/services/host_service.py:153
         '403':
           description: RBAC denied (operator+ required when RBAC_ENABLED).
+      tags:
+        - 主机与镜像
+  /hosts/{instance_id}/pull-image:
+    post:
+      operationId: pullImage
+      summary: 把指定版本快照装到单台宿主机(异步)
+      description: >-
+        #309/#333 — Install a specific version snapshot onto ONE host. Reads the snapshot from the
+        version-snapshots DDB table, selects exactly the disks named by that snapshot's manifest.json
+        (rootfs / data-template / immutable) plus manifest.json itself (ignores other versions' disks
+        in the snapshot — deterministic), fetches each by its exact S3 VersionId, verifies ETag, then
+        installs to live under /data/firecracker-assets. CAS-flips the host active/idle→upgrading (and
+        atomically stamps pull_command_id) so the control plane places no new tenants during the pull,
+        then self-invokes asynchronously (InvocationType=Event) and returns 202 immediately — the long
+        stage+unzip+commit chain runs in the fire-and-forget worker (can take minutes; the poller is
+        pull-image-progress). On failure it only reports (no auto-restore). Idempotent: replaying the
+        same snapshot is harmless. #394 fast-path: when the target version dir is already fully installed
+        on disk (a .complete marker present + all disks non-empty), pull SKIPS download/unzip and just
+        flips the slots pointer (seconds) — this is how rollback works (pull an older, already-installed
+        version to live with no re-download). A half-installed dir (interrupted/disk-full, no .complete
+        marker) is treated as incomplete and re-downloaded (fail-safe: never flips onto a partial disk set).
+      x-source: deploy/lambda/api/services/host_service.py:1278
+      x-rbac: operator
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: EC2 instance id of the target host.
+        - name: snapshot_time
+          in: query
+          required: true
+          schema:
+            type: string
+            pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$'
+          description: 'ISO8601 UTC snapshot key (YYYY-MM-DDTHH:MM:SSZ), from GET /snapshots.'
+        - name: slot
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [live, canary]
+            default: live
+          description: >-
+            #394 — target image slot. Absent/`live` (default) = byte-identical legacy behavior
+            (installs the flat live disks, CAS-flips the host to `upgrading` for the duration).
+            `canary` installs into an immutable per-host version dir
+            (versions/<snapshot_time>/) and updates only the canary pointer in slots.json —
+            it does NOT change host.status, so live tenants keep being created/scheduled on
+            the host. Mutual exclusion for canary is provided by the host-level image lease,
+            not the status gate. Any other value → 400 VALIDATION.
+          x-source: deploy/lambda/api/services/host_service.py:1441
+      responses:
+        '202':
+          description: Pull started (async). Poll pull-image-progress with the returned job_id.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    enum:
+                      - pull-image started (async; poll pull-image-progress)
+                  instance_id:
+                    type: string
+                  snapshot_time:
+                    type: string
+                  slot:
+                    type: string
+                    enum: [live, canary]
+                    description: '#394 — echoes the target slot for this pull (live/canary).'
+                  status:
+                    type: string
+                    description: >-
+                      #394 — for slot=live this is `upgrading`; for slot=canary the host status
+                      is NOT changed, so this echoes the host''s current real status (e.g.
+                      active/idle).
+                  job_id:
+                    type: string
+                    description: Self-generated pull job id (pull-<hex>). Names /tmp/<job_id>.txt on the host; pull-image-progress tails it.
+              x-source: deploy/lambda/api/services/host_service.py:1053
+        '400':
+          description: Missing/invalid snapshot_time (ISO8601 UTC), or invalid slot value.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - VALIDATION
+        '403':
+          description: RBAC denied (operator+ required when RBAC_ENABLED).
+        '404':
+          description: Snapshot snapshot_time not found in the version-snapshots table.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - NOT_FOUND
+        '409':
+          description: >-
+            Host not available for pull (status must be active/idle; already upgrading or missing);
+            the snapshot is not self-consistent (manifest names disks absent from the snapshot);
+            CANARY_EQUALS_LIVE (#394 — slot=canary but the requested snapshot is already this host's
+            live, so there is nothing to validate — pull a different candidate); or
+            IDEMPOTENCY_KEY_REUSED (same Idempotency-Key used for a different snapshot/slot).
+            Note: re-pulling the SAME version to a slot is an idempotent no-op that still re-verifies
+            the on-disk .complete marker (heals a half-installed version), it is not rejected.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - CONFLICT
+                      - CANARY_EQUALS_LIVE
+                      - IDEMPOTENCY_KEY_REUSED
+        '500':
+          description: Failed to dispatch the async pull-image worker (Lambda self-invoke failed). Status is reset to prev.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - DISPATCH_FAILED
+        '503':
+          description: VERSION_SNAPSHOTS_TABLE or ASSETS_BUCKET not configured.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - NOT_CONFIGURED
+      tags:
+        - 主机与镜像
+  /hosts/{instance_id}/promote-canary:
+    post:
+      operationId: promoteCanary
+      summary: 把该 host 的 canary 槽提升为 live(同步,#394)
+      description: >-
+        #394 — Synchronously promote the host''s canary slot to live. Only rewrites the small
+        slots.json pointer (no disk move), so it returns 200 in seconds — no async job. CAS is on
+        snapshot_time only: the caller must pass the expected_canary_snapshot_time it verified; if
+        the current canary snapshot_time differs, returns 409 CANARY_CHANGED and writes nothing
+        (guarantees you promote the exact version you validated). expected_canary_generation is
+        optional and ADVISORY only — a lagging generation (normal DDB-mirror vs on-disk drift) does
+        NOT cause rejection. Idempotent: if live is already the expected version, returns 200
+        already_promoted=true (safe to retry after a lost response). Holds the host image lease
+        (mutual exclusion with pull/cleanup/reclaim). Supports Idempotency-Key.
+      x-source: deploy/lambda/api/services/image_slot_service.py:174
+      x-rbac: admin
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Caller-generated UUID; replaying with the same key returns the stored result.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [expected_canary_snapshot_time]
+              properties:
+                expected_canary_snapshot_time:
+                  type: string
+                  description: The canary snapshot the caller verified (CAS anchor).
+                expected_canary_generation:
+                  type: integer
+                  description: >-
+                    Slots generation the caller read. Advisory/observability only — NOT a rejection
+                    gate (#394); the version CAS is snapshot_time. A stale generation never 409s.
+      responses:
+        '200':
+          description: Canary promoted to live (or already_promoted on idempotent replay).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: {type: string}
+                  instance_id: {type: string}
+                  already_promoted: {type: boolean}
+                  live_snapshot_time: {type: string}
+                  previous_live_snapshot_time: {type: [string, 'null']}
+                  generation: {type: integer}
+        '403':
+          description: RBAC denied (admin required).
+        '404':
+          description: Host not found (code NOT_FOUND).
+        '409':
+          description: >-
+            CANARY_CHANGED (current canary snapshot_time != expected_canary_snapshot_time; generation
+            is advisory only and never causes rejection — #394), IMAGE_OPERATION_IN_PROGRESS
+            (another image op holds the lease, or same Idempotency-Key still executing),
+            or IDEMPOTENCY_KEY_REUSED.
+        '500':
+          description: SLOTS_CORRUPT (host slots.json unparseable — fail-loud, not treated as empty).
+        '503':
+          description: OPERATION_STATUS_UNKNOWN (write not confirmed; retry with same Idempotency-Key).
+      tags:
+        - 主机与镜像
+  # #394 —— rollback-image 已移除:回滚 = pull 老版到 live(POST /hosts/{id}/pull-image?slot=live)。
+  # pull 有快路径:目标版本目录已 .complete(装齐)时跳过下载/解压,直接翻 slots.live 指针(秒级);
+  # 半装目录(下载中断/盘满,无 .complete)判不完整 → 正常重下自愈。这与 Lambda alias / K8s revision
+  # 的"选定一个已保留版本重指指针"模型一致,不再需要独立的 live↔previous_live swap 操作。
+  /hosts/{instance_id}/image-slots:
+    get:
+      operationId: hostImageSlots
+      summary: 读该 host 磁盘上真实的镜像状态(#394 debug 视图)
+      description: >-
+        #394 — Read the REAL on-disk image state of one EC2 host via SSM: its actual
+        slots.json (live/canary/previous_live/generation) plus the installed version dirs
+        under /data/firecracker-assets/versions/. This is the authoritative counterpart to
+        the possibly-stale DDB image_slots mirror returned by GET /hosts — the response also
+        echoes that mirror side-by-side so an operator can spot drift at a glance. Read-only.
+        Hosts still on the legacy flat layout (no slots.json) return slots all-null +
+        flat_layout=true. SSM read failure (host offline/unreachable) → 503.
+      x-source: deploy/lambda/api/services/host_service.py:1841
+      x-rbac: viewer
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: On-disk image state (+ DDB mirror for comparison).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  instance_id: {type: string}
+                  source: {type: string, enum: [host-disk]}
+                  slots:
+                    type: object
+                    properties:
+                      live: {type: [string, 'null']}
+                      canary: {type: [string, 'null']}
+                      previous_live: {type: [string, 'null']}
+                      generation: {type: integer}
+                  installed_versions:
+                    type: array
+                    items: {type: string}
+                  flat_layout: {type: boolean}
+                  mirror: {type: [object, 'null']}
+        '404':
+          description: Host not found (code NOT_FOUND).
+        '500':
+          description: Host slots.json unparseable (code SLOTS_CORRUPT).
+        '503':
+          description: Could not read from host via SSM — offline/unreachable (code DEPENDENCY_UNAVAILABLE).
+      tags:
+        - 主机与镜像
+  # #394 —— DELETE /hosts/{instance_id}/image-slots/canary (cleanupCanary) 已移除,精简 API。
+  # 放弃未提升的 canary 无需显式清指针:下次 `pull-image?slot=canary` 覆盖该槽,promote 成功也会
+  # 清空它;磁盘回收由 reclaim-images 承担(保护 {live,canary,previous_live}∪租户固定版本)。
+  /hosts/{instance_id}/reclaim-images:
+    post:
+      operationId: reclaimImages
+      summary: 回收该 host 上无人引用的版本目录(手动 prune,释放盘,#394)
+      description: >-
+        #394 — Manual disk prune. Deletes every versions/<snapshot>/ directory on the host that is
+        NOT in the protected keep-set. The keep-set is computed server-side (the host cannot see DDB
+        tenant pins) as {live, canary, previous_live} ∪ {every snapshot_time still pinned by a
+        non-deleted tenant on this host}, and passed to the host as an explicit allowlist — the host
+        only ever subtracts. Safety: launch-vm mounts versions/<snap>/rootfs as the read-only COW
+        backing file, so deleting an in-use version would break that VM's next boot (no-data-loss);
+        the prune is allowlist-only, fails loud (exit 1, deletes nothing) if it cannot list the full
+        versions/ inventory, and never follows symlinks out of versions/. Refuses with 409
+        NO_LIVE_VERSION when slots.json has no live (a flat/broken host) — pruning then could delete
+        the host's only bootable backing disk. Holds the image lease (mutual exclusion with
+        pull/promote/rollback/cleanup) so a half-pulled canary dir is never mistaken for an orphan.
+        Idempotent (re-run is harmless); supports Idempotency-Key.
+      x-source: deploy/lambda/api/services/image_slot_service.py:349
+      x-rbac: admin
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Reclaim completed (reclaimed_count may be 0 when nothing was orphaned).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: {type: string}
+                  instance_id: {type: string}
+                  kept_versions:
+                    type: array
+                    items: {type: string}
+                    description: The protected keep-set (slots pointers ∪ tenant-pinned versions).
+                  reclaimed_versions:
+                    type: array
+                    items: {type: string}
+                    description: Version dirs deleted this run.
+                  reclaimed_count: {type: integer}
+        '403':
+          description: RBAC denied (admin required).
+        '404':
+          description: Host not found.
+        '409':
+          description: >-
+            NO_LIVE_VERSION (host has no live in slots.json — reclaim refused so the host's only
+            bootable backing disk is never pruned) or IMAGE_OPERATION_IN_PROGRESS (pull/slot-op holds the lease).
+        '503':
+          description: OPERATION_STATUS_UNKNOWN (host did not confirm; safe to retry).
+      tags:
+        - 主机与镜像
+  /hosts/{instance_id}/pull-image-progress:
+    get:
+      operationId: pullImageProgress
+      summary: 查询单台宿主机 pull-image 进度(SageMaker ProcessingJob 风格)
+      description: >-
+        #309/#333 — Poll the progress of a pull-image job on ONE host. Reads the host's pull_command_id
+        from DDB, then SSM-tails /tmp/<job_id>.txt on the host: the last line decides the tri-state, and
+        the most recent ERROR:<CODE> line becomes the failure detail. Returns SageMaker ProcessingJob-style
+        JSON. If a terminal error was persisted to DDB (last_pull_error) but the progress file can't be
+        read (worker exited early), the status is forced to Failed so the host never appears stuck
+        InProgress. No pull_command_id → the host was never pulled (InProgress, last_status=null).
+      x-source: deploy/lambda/api/services/host_service.py:1441
+      x-rbac: viewer
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: job_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: >-
+            #394 — exact pull-job lookup. New clients SHOULD always pass it. Unknown job_id or a
+            job that belongs to a different host → 404 JOB_NOT_FOUND (never silently falls back
+            to "this host''s latest"). Absent (compat window) → the host''s most recent job, else
+            the legacy host.pull_command_id path. When the persisted job is already terminal, the
+            response is answered from the job record without SSM (survives host /tmp loss).
+            Adds state/phase/target_slot/requested_snapshot_time/result/error alongside the
+            legacy ProcessingJobStatus tri-state.
+      responses:
+        '200':
+          description: Progress snapshot (tri-state via ProcessingJobStatus).
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - instance_id
+                  - ProcessingJobStatus
+                properties:
+                  instance_id:
+                    type: string
+                  host_status:
+                    type: string
+                    description: Host DDB status (active/idle/upgrading) — NOT the pull status; do not conflate.
+                  job_id:
+                    type:
+                      - string
+                      - 'null'
+                    description: pull_command_id from the host row (null if never pulled).
+                  snapshot_time:
+                    type:
+                      - string
+                      - 'null'
+                    description: snapshot_time the host currently records (set on successful install).
+                  last_pull_error:
+                    type:
+                      - string
+                      - 'null'
+                    description: Last persisted failure reason (DDB), if any.
+                  ProcessingJobStatus:
+                    type: string
+                    enum:
+                      - Completed
+                      - Failed
+                      - InProgress
+                    description: Completed=last line SUCCESS; Failed=last line FAIL or DDB last_pull_error set; else InProgress.
+                  last_status:
+                    type:
+                      - string
+                      - 'null'
+                    description: Raw last line of the progress file (timestamp + what it was doing); null when no job.
+                  command_id:
+                    type: string
+                    description: SSM command id used to tail the progress file.
+                  ExitCode:
+                    type: integer
+                    enum:
+                      - 0
+                    description: Present only when Completed.
+                  ErrorCode:
+                    type:
+                      - string
+                      - 'null'
+                    description: >-
+                      Present only when Failed. One of DOWNLOAD_FAILED / ETAG_MISMATCH / MANIFEST_MISMATCH /
+                      UNZIP_FAILED / INSTALL_MV_FAILED / OWNERSHIP_CHECK_FAILED / UNKNOWN (see _PULL_ERROR_CODES).
+                  FailureReason:
+                    type: string
+                    description: Present only when Failed. Detail from the progress file's ERROR line, or DDB last_pull_error.
+              x-source: deploy/lambda/api/services/host_service.py:1498
+              examples:
+                inProgress:
+                  summary: phase2 unzipping (real ap-southeast-1 sample 2026-07-20)
+                  value:
+                    instance_id: i-0123456789abcdef0
+                    host_status: upgrading
+                    job_id: pull-491daf780b7d484a
+                    snapshot_time: '2026-07-20T10:21:17Z'
+                    last_pull_error: null
+                    ProcessingJobStatus: InProgress
+                    last_status: '2026-07-20T15:10:46Z phase2 [2/4]: unzipping openclaw-data-template-v1.2.ext4.gz to live'
+                    command_id: 4cdd0e05-6a6b-4cfc-ad2a-c20f75c8a68d
+                completed:
+                  summary: install succeeded
+                  value:
+                    instance_id: i-0123456789abcdef0
+                    host_status: active
+                    job_id: pull-476ffa9179294d5a
+                    snapshot_time: '2026-07-20T10:21:17Z'
+                    ProcessingJobStatus: Completed
+                    ExitCode: 0
+                    last_status: '2026-07-21T03:00:40Z SUCCESS'
+        '400':
+          description: Missing instance_id.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - VALIDATION
+        '403':
+          description: RBAC denied (viewer+ required when RBAC_ENABLED).
+        '404':
+          description: >-
+            Host instance_id not found (code NOT_FOUND), or a job_id was given but is unknown /
+            belongs to a different host (code JOB_NOT_FOUND — #394; never silently falls back to
+            this host''s latest job).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - NOT_FOUND
+                      - JOB_NOT_FOUND
+      tags:
+        - 主机与镜像
+  /hosts/{instance_id}/copy-file-from-s3:
+    post:
+      operationId: copyFileFromS3
+      summary: 从 S3 拷贝单个文件到宿主机指定位置(同步)
+      description: >-
+        #309/#334 — Copy ONE file from S3 to a specific path on ONE host (synchronous; single-file copy is
+        seconds). For updating host scripts only — the target must be under /opt/openclaw/ (.py host-agent
+        service) or /home/ubuntu/ (.sh + lib/*); the image-disk dir /data/firecracker-assets/ is off-limits
+        (that's pull-image's job). Landed file is chown ubuntu:ubuntu + chmod 755 (host-agent runs as
+        ubuntu; scripts/binaries must be executable). Atomic write (download to same-dir temp → verify →
+        chown/chmod → mv), so a truncated transfer never leaves a corrupt file. Path safety: rejects
+        directory/trailing-slash/bare-root targets, existing dir/symlink targets, and parent-directory
+        symlink escape (resolves the deepest existing ancestor and verifies it stays under an allowed root
+        before mkdir). NOTE (#335 follow-up): the pre-check is not a hard TOCTOU boundary against an
+        already-compromised host-ubuntu; not reachable from tenant microVMs.
+        Return shape merges the repo-standard _err (error+code) with a parseable ProcessingJobStatus, so
+        callers can judge success from the JSON alone without depending on the HTTP status code.
+      x-source: deploy/lambda/api/services/host_service.py:1319
+      x-rbac: operator
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - target
+                - s3_uri
+              properties:
+                target:
+                  type: string
+                  description: 'Absolute EC2 path, full filename, under /opt/openclaw/ or /home/ubuntu/ (no .., no trailing slash, not the dir itself).'
+                  example: /home/ubuntu/manifest3.json
+                s3_uri:
+                  type: string
+                  pattern: '^s3://.+'
+                  description: >-
+                    s3://<bucket>/<key> of the source object. API-layer check only requires the s3://
+                    prefix and length > "s3://" (so s3://bucket with no key passes API validation; a
+                    missing/invalid object then fails at the host aws s3 cp step → 502).
+                  example: s3://<assets-bucket>/deployment/rootfs/manifest.json
+      responses:
+        '200':
+          description: Copy done. Judge via ProcessingJobStatus=Completed (not just HTTP 200).
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ProcessingJobStatus
+                properties:
+                  instance_id:
+                    type: string
+                  target:
+                    type: string
+                  s3_uri:
+                    type: string
+                  ProcessingJobStatus:
+                    type: string
+                    enum:
+                      - Completed
+                  ExitCode:
+                    type: integer
+                    enum:
+                      - 0
+              x-source: deploy/lambda/api/services/host_service.py:1421
+              example:
+                instance_id: i-0123456789abcdef0
+                target: /home/ubuntu/manifest3.json
+                s3_uri: s3://<assets-bucket>/deployment/rootfs/manifest.json
+                ProcessingJobStatus: Completed
+                ExitCode: 0
+        '400':
+          description: Validation error (s3_uri not s3://, target outside allowlist / is a dir / contains ..).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - VALIDATION
+        '403':
+          description: RBAC denied (operator+ required when RBAC_ENABLED).
+        '500':
+          description: SSM send-command was never dispatched. ProcessingJobStatus=Failed, code=COPY_DISPATCH_FAILED.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - COPY_DISPATCH_FAILED
+                  instance_id:
+                    type: string
+                  target:
+                    type: string
+                  s3_uri:
+                    type: string
+                  ProcessingJobStatus:
+                    type: string
+                    enum:
+                      - Failed
+        '502':
+          description: >-
+            SSM invocation was dispatched but did not complete successfully — script failed (validation
+            reject / symlink escape / download failure / disk problem), OR the invocation never appeared /
+            timed out / was cancelled. ProcessingJobStatus=Failed, code=COPY_FAILED, error=SSM stderr tail
+            (or "copy-file failed (see SSM log)" when no output).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - COPY_FAILED
+                  instance_id:
+                    type: string
+                  target:
+                    type: string
+                  s3_uri:
+                    type: string
+                  ProcessingJobStatus:
+                    type: string
+                    enum:
+                      - Failed
+              x-source: deploy/lambda/api/services/host_service.py:1419
+              example:
+                error: '[copy-file] resolved parent escapes allowed roots: /etc (symlink escape?)'
+                code: COPY_FAILED
+                instance_id: i-0123456789abcdef0
+                target: /home/ubuntu/manifest3.json
+                s3_uri: s3://<assets-bucket>/deployment/rootfs/manifest.json
+                ProcessingJobStatus: Failed
       tags:
         - 主机与镜像
   /hosts/refresh-rootfs:
@@ -2461,11 +3171,227 @@ paths:
                 x-source: deploy/lambda/api/services/host_service.py:271
       tags:
         - 主机与镜像
+  /delete-image-snapshot:
+    post:
+      operationId: deleteImageSnapshot
+      summary: 软删除一条镜像快照记录(#394,引用保护)
+      description: >-
+        #394 — Soft-delete a global image snapshot record. Symmetric with
+        POST /create-image-snapshot: takes snapshot_time in the JSON body (not a colon-bearing
+        ISO timestamp in the path). Marks the version-snapshots row status=deleted + deleted_at
+        (does NOT physically remove the DDB row, S3 deployment/ objects, or hosts' local version
+        dirs) — auditable and recoverable. After delete the snapshot is dropped from
+        GET /list_image_versions and pull-image (live/canary) rejects it (404). Reference-protected:
+        refuses (409 IMAGE_VERSION_IN_USE) if any host slot (live/canary/previous_live) or any
+        non-deleted tenant's image_snapshot_time still pins it. Idempotent: already-deleted → 200;
+        never-existed → 404 NOT_FOUND. Uses a conditional update (attribute_exists) to guard TOCTOU.
+        operator+.
+      x-source: deploy/lambda/api/services/host_service.py:1183
+      x-rbac: operator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [snapshot_time]
+              properties:
+                snapshot_time:
+                  type: string
+                  pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$'
+                  description: 'ISO8601 UTC snapshot key to soft-delete.'
+      responses:
+        '200':
+          description: Snapshot record marked deleted (or already-deleted idempotent replay).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: {type: string}
+                  snapshot_time: {type: string}
+                  label: {type: string}
+                  status: {type: string, enum: [deleted]}
+                  note: {type: string}
+        '400':
+          description: Missing/invalid snapshot_time (code VALIDATION).
+        '403':
+          description: RBAC denied (operator+ required).
+        '404':
+          description: Snapshot record never existed (code NOT_FOUND).
+        '409':
+          description: >-
+            Still referenced by a host slot (live/canary/previous_live) or a tenant's
+            image_snapshot_time (code IMAGE_VERSION_IN_USE); repoint/rebuild/delete the
+            referencing hosts/tenants first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: {type: string}
+                  code: {type: string, enum: [IMAGE_VERSION_IN_USE]}
+        '503':
+          description: VERSION_SNAPSHOTS_TABLE not configured (code NOT_CONFIGURED).
+      tags:
+        - 主机与镜像
+  /create-image-snapshot:
+    post:
+      operationId: createImageSnapshot
+      summary: 给 assets 桶打一个版本快照(等价 snapshot-version.sh)
+      description: >-
+        #376. Take a version snapshot of the assets bucket: scans the S3 `deployment/` prefix for ALL
+        current-version objects (rootfs image + scripts + edge + litellm + monitoring), records each
+        object's {path, s3_version_id, etag}, and writes one row to DynamoDB openclaw-version-snapshots
+        (primary key snapshot_time, format %Y-%m-%dT%H:%M:%SZ — matches the regex pull-image enforces, so
+        a fresh snapshot is immediately pullable). API equivalent of scripts/snapshot-version.sh; pairs with
+        GET /list_image_versions (list) and POST /hosts/{id}/pull-image?snapshot_time= (pull). The bucket is
+        read from the ASSETS_BUCKET env var, NOT a client parameter. The DDB write is conditional
+        (attribute_not_exists) so two calls in the same second collide → 409 (snapshots are immutable).
+      x-source: deploy/lambda/api/services/host_service.py:1030
+      x-rbac: operator
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                label:
+                  type: string
+                  pattern: '^[A-Za-z0-9._-]{1,128}$'
+                  description: >-
+                    Optional human label for the console snapshot list. If omitted/blank, the backend
+                    auto-derives it from the `version` field of deployment/rootfs/manifest.json.
+      responses:
+        '200':
+          description: Snapshot written.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  snapshot_time:
+                    type: string
+                    description: ISO8601 UTC snapshot key (%Y-%m-%dT%H:%M:%SZ); pass to pull-image?snapshot_time=.
+                  label:
+                    type: string
+                    description: Effective label (auto-derived when not supplied; "" if manifest had no version).
+                  file_count:
+                    type: integer
+                    description: Number of objects captured under deployment/.
+              x-source: deploy/lambda/api/services/host_service.py:1030
+        '400':
+          description: Bad body or label (code VALIDATION).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - VALIDATION
+        '403':
+          description: RBAC denied (operator+ required when RBAC_ENABLED) / missing x-api-key at API GW.
+        '409':
+          description: Same-second key collision; snapshot immutable, retry in a moment (code CONFLICT).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - CONFLICT
+        '500':
+          description: 0 files found under deployment/ — refuse to write empty snapshot (code EMPTY_SNAPSHOT).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - EMPTY_SNAPSHOT
+        '503':
+          description: VERSION_SNAPSHOTS_TABLE or ASSETS_BUCKET not configured.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - NOT_CONFIGURED
+      tags:
+        - 主机与镜像
+  /list_image_versions:
+    get:
+      operationId: listImageVersions
+      summary: 列出黄金镜像的各版本快照(供选择时间点 pull)
+      description: >-
+        #337(原 #217 GET /snapshots,改名避免与 /images 列镜像文件混淆)。Read-only listing of the
+        version-snapshots table metadata (snapshot_time + label + file_count) so the console can let an
+        operator pick which point-in-time snapshot to pull onto a host (pairs with
+        POST /hosts/{id}/pull-image?snapshot_time=). Sorted by snapshot_time descending (newest first).
+        Does NOT return the large per-snapshot `files` blob (read only at pull time). Distinct from
+        GET /images, which lists the S3 golden-image FILE artifacts.
+      x-source: deploy/lambda/api/services/host_service.py:952
+      x-rbac: viewer
+      responses:
+        '200':
+          description: Snapshot metadata list, newest first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    snapshot_time:
+                      type: string
+                      description: ISO8601 UTC snapshot key; pass to pull-image?snapshot_time=.
+                    label:
+                      type: string
+                      description: Human label (auto-filled from manifest.json rootfs version at snapshot time); "" if none.
+                    file_count:
+                      type: integer
+                      description: Number of files recorded in the snapshot.
+              x-source: deploy/lambda/api/services/host_service.py:959
+        '403':
+          description: RBAC denied (viewer required when RBAC_ENABLED).
+        '503':
+          description: VERSION_SNAPSHOTS_TABLE not configured.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - NOT_CONFIGURED
+      tags:
+        - 主机与镜像
   /system/info:
     get:
       operationId: getSystemInfo
       summary: 控制台用的功能开关与配置快照
-      description: Read-only snapshot of env-derived stack configuration so the console Settings tab can render feature state without an out-of-band copy of config.yml. All values come from Lambda environment variables wired in deploy/stack.py.
+      description: Read-only snapshot of env-derived stack configuration so the console Settings tab can render feature state without an out-of-band copy of config.yml. All values come from Lambda environment variables wired in deploy/stacks/lambdas.py.
       x-source: deploy/lambda/api/handler.py:688
       x-rbac: viewer
       responses:
@@ -2722,7 +3648,7 @@ paths:
     get:
       operationId: tenantMatch
       summary: 登录前:外部平台→Cognito IdP 路由查询
-      description: 'Handler + Lambda routing + DDB table + IAM read grant all exist (handler.py:247, stack.py TENANT_IDP_TABLE env + read grant), but deploy/stack.py never calls add_resource("tenantmatch") on the REST API, so API Gateway rejects the path before it can reach the Lambda — this operation is currently UNREACHABLE in a deployed stack. Documented for the day the gateway resource is wired. Intended semantics: the browser calls this BEFORE any Cognito login to learn which upstream IdP to federate to; it is in the RBAC skip list (core/auth.py:589) and leaks only platform_id -> idp_provider_name routing, no tenant data. The API Gateway x-api-key gate would still front it once wired.'
+      description: 'Handler + Lambda routing + DDB table + IAM read grant exist, but deploy/stacks/lambdas.py does not add a tenantmatch API Gateway resource. API Gateway therefore rejects this path before Lambda; this operation is documented-but-unreachable. Intended semantics: a client calls this before Cognito login to resolve platform_id to idp_provider_name. It leaks no tenant data. If the resource is wired later, the API Gateway x-api-key requirement still applies.'
       x-source: deploy/lambda/api/handler.py:649
       x-rbac: none
       x-status: documented-but-unreachable
@@ -2930,7 +3856,7 @@ paths:
     get:
       operationId: listGroups
       summary: 列出所有技能分组
-      description: Returns every group item from the groups DynamoDB table (full scan). Requires API Gateway `x-api-key` (deploy/stack.py:1315).
+      description: Returns every group item from the groups DynamoDB table (full scan). Requires API Gateway `x-api-key` (route wiring in deploy/stacks/lambdas.py).
       tags:
         - 技能与模板
       x-source: deploy/lambda/api/routes/skills_groups.py:14
@@ -3013,7 +3939,7 @@ paths:
     post:
       operationId: createGroup
       summary: 创建技能分组
-      description: Creates a group with an optional initial skill list. Group names reuse the tenant DNS-label rules. The skills array is de-duplicated and sorted server-side; empty strings are dropped. Fails with 409 if the group already exists (conditional put). Requires `x-api-key` (deploy/stack.py:1316). Mutations through the api Lambda are audit-logged (deploy/lambda/api/handler.py:285-286).
+      description: Creates a group with an optional initial skill list. Group names reuse the tenant DNS-label rules. The skills array is de-duplicated and sorted server-side; empty strings are dropped. Fails with 409 if the group already exists (conditional put). Requires `x-api-key` (route wiring in deploy/stacks/lambdas.py). Mutations through the api Lambda are audit-logged.
       tags:
         - 技能与模板
       x-source: deploy/lambda/api/routes/skills_groups.py:23
@@ -3134,7 +4060,7 @@ paths:
     post:
       operationId: addSkillToGroup
       summary: 给分组追加技能(幂等)
-      description: Adds one skill name to the group's set. Idempotent — re-adding an existing skill returns 200 with the unchanged set. The skill value is only checked for non-emptiness, NOT against the skill-name regex. Requires `x-api-key` (deploy/stack.py:1319).
+      description: Adds one skill name to the group's set. Idempotent — re-adding an existing skill returns 200 with the unchanged set. The skill value is only checked for non-emptiness, NOT against the skill-name regex. Requires `x-api-key` (route wiring in deploy/stacks/lambdas.py).
       tags:
         - 技能与模板
       x-source: deploy/lambda/api/routes/skills_groups.py:66
@@ -3243,7 +4169,7 @@ paths:
     delete:
       operationId: removeSkillFromGroup
       summary: 从分组移除技能(幂等)
-      description: Removes one skill from the group's set via set.discard — removing a skill that is not in the group still returns 200. 404 only when the group itself does not exist. Requires `x-api-key` (deploy/stack.py:1321).
+      description: Removes one skill from the group's set via set.discard — removing a skill that is not in the group still returns 200. 404 only when the group itself does not exist. Requires `x-api-key` (route wiring in deploy/stacks/lambdas.py).
       tags:
         - 技能与模板
       x-source: deploy/lambda/api/routes/skills_groups.py:91
@@ -3332,7 +4258,7 @@ paths:
     get:
       operationId: readSkill
       summary: 读技能的 SKILL.md 内容
-      description: Returns the raw SKILL.md markdown for the console editor. Routed through the api Lambda (RBAC + audit reuse, deploy/stack.py:1486-1488). Requires `x-api-key`.
+      description: Returns the raw SKILL.md markdown for the console editor. Routed through the api Lambda for RBAC and audit reuse (route wiring in deploy/stacks/lambdas.py). Requires `x-api-key`.
       tags:
         - 技能与模板
       x-source: deploy/lambda/api/routes/skills_groups.py:111

@@ -44,7 +44,7 @@ AWS Identity and Access Management (IAM) roles allow customers to assign fine-gr
 
 ### Identity and access control
 
-Identity in this solution is split across two planes. On the **data plane**, the root of trust is OpenClaw's native Ed25519 asymmetric device authentication: the platform backend holds the device private key, the public key is cold-injected into the microVM, and the microVM gateway verifies the signature; Amazon Cognito is not involved. On the **control plane**, `x-api-key` is the first gate; when RBAC is enabled, Amazon Cognito token verification (RS256 + JWKS) is layered on top, and verification failure always degrades to the least privilege (read-only viewer). This solution enables role-based access control (RBAC, `console_auth.rbac_enabled` defaults to `true`) by default, enforcing per-route role checks and resource-owner checks; even with RBAC disabled, the resource-owner (`owner_id`) check still applies independently. In the current deployment code, Amazon Cognito is used only for the control plane console sign-in (disabled by default).
+Identity is split across two planes. The **data plane** uses OpenClaw-native Ed25519 device authentication: the platform backend holds the private key and the microVM verifies the cold-injected public key; Amazon Cognito is not involved. The **control plane** requires `x-api-key` for usage-plan client identification and uses Cognito, IAM, or a Lambda authorizer for real identity. Lambda applies RBAC, owner, and platform-scope authorization. The repository default `default_no_jwt_role=viewer` makes requests without a Bearer read-only. Cognito console sign-in is disabled by default.
 
 ### Network and public exposure
 

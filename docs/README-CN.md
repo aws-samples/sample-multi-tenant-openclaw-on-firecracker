@@ -87,7 +87,7 @@ L1 Prompt（LiteLLM pre/post + Bedrock Guardrail 双向）、L2 工具（`before
 单台 `r8g.metal-24xl`（768 GB / 96 vCPU）按 2 GB/VM 稳态承载 **380 租户/台**（760 GB ÷ 2 GB，容量推算）；单台全健康实测 **187 节点**（磁盘瓶颈，非内存上限）。Spot + Savings Plan 摊薄按需价，成本约 **$8.36/租户/月**（80% SP + 20% Spot，成本推算）。Per-tenant Quota 防 noisy neighbor。
 
 **🚀 一行命令 CDK 部署**
-`./setup.sh <region> <profile>` 几分钟拉起完整栈 — VPC、ASG、ALB、Lambda、DynamoDB、CloudFront 全部接通即用（Cognito console 登录、OpenResty 边缘数据面等为 opt-in，按 `config.yml` 开关启用）。栈内 CodeBuild 烤镜像意味着**无需本地 Linux**（macOS / Windows 直接用）。
+`./setup.sh <region> <profile>` 拉起 VPC、ASG、ALB、Lambda、DynamoDB 与 CloudFront（Cognito console 登录、OpenResty 边缘数据面等为 opt-in，按 `config.yml` 开关启用）。栈内 CodeBuild 烤镜像意味着**无需本地 Linux**（macOS / Windows 直接用）。
 
 </td>
 </tr>

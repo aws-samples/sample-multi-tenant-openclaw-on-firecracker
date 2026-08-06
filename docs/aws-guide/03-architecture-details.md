@@ -39,7 +39,7 @@
 ```
 浏览器 ── wss /gw/ws ─▶ 平台后端 WebSocket 网关
   平台后端网关 ── ws ─▶ CloudFront ─▶ ALB ─▶ OpenResty 边缘 ASG
-    OpenResty 边缘 ── 查 ElastiCache Redis route:{tenant_id} ─▶ 宿主 iptables DNAT ─▶ microVM gateway:18789
+    OpenResty 边缘 ── 查 ElastiCache Valkey/Redis route:{tenant_id} ─▶ 宿主 iptables DNAT ─▶ microVM gateway:18789
 ```
 
 身份分两个正交平面，均不再依赖 Amazon Cognito：
@@ -100,7 +100,7 @@ Firecracker microVM 挂载四到五块盘，按 Firecracker PUT 顺序分配 `/d
 
 本层分两个平面。**数据面**以 OpenClaw 原生 Ed25519 device 非对称认证为身份根：平台后端用 device 私钥对 gateway 下发的 challenge 签名，microVM gateway 端用冷注入的公钥验签，配对门只放行 `paired.json` 里登记的公钥与角色；私钥服务端代持、不出前端，token 与私钥密文的 KMS `EncryptionContext` 绑 `tenant_id`/`owner_id`，解密上下文不匹配即拒（fail-closed）。数据面结构上不跨租户：一个 device 绑一个租户、边缘按 `tenant_id` 单键路由，路由不到就 404 而非串到别的租户。
 
-**控制面**以 `x-api-key` 为第一道门，启用 RBAC 时叠加 Amazon Cognito 令牌验签：用 RS256 + JWKS 公钥验签 Cognito 签发的 token，`cognito:groups` 声明映射 viewer/operator/admin 三级角色，forged、expired、`alg:none`、错误 issuer 的 token 一律降级到只读；不带 Bearer 的纯 `x-api-key` 请求按 `DEFAULT_NO_JWT_ROLE`（默认 `viewer`）取角色。RBAC 门控自身是独立开关 `RBAC_ENABLED`，默认 `true`；即使关闭 RBAC，资源属主（`owner_id`）检查仍独立生效，不因关 RBAC 变成跨租户越权（IDOR）。
+**控制面**要求 `x-api-key` 做 usage-plan 客户标识，但不把 API Key 当独立认证；启用 RBAC 时叠加 Amazon Cognito 令牌验签。Cognito token 用 RS256 + JWKS 验证，`cognito:groups` 映射 viewer/operator/admin；不带 Bearer 的请求按 `DEFAULT_NO_JWT_ROLE`（默认 `viewer`）取角色。RBAC 门控默认启用，owner/platform scope 检查独立执行。
 
 > **Note**
 >

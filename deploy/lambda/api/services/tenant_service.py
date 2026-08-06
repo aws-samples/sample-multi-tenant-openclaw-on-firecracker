@@ -47,6 +47,7 @@ import core.ssm_dispatch as ssm_dispatch
 # #187 转型:core.legacy_alb 全模块下线(数据面两级路由不再用 per-tenant ALB rule/TG)。
 import core.skills as skills
 import core.audit as audit
+import core.image_channel as image_channel_mod  # #394 — image_channel 准入 + 版本固定
 import services.lifecycle_dispatch as lifecycle_dispatch
 import services.registry_service as registry_service
 import services.inflight_dedup as inflight_dedup
@@ -77,6 +78,7 @@ _DNS_LABEL_RE = _CONFIG_TEMPLATE_RE
 # Restrict to 4-128 printable ASCII (codepoints 33-126): no spaces, no control
 # chars (\n \t \x00), no non-ASCII. .isascii() alone lets control chars through.
 _CLIENT_TOKEN_RE = re.compile(r"^[\x21-\x7e]{4,128}$")
+_DELETE_CLAIM_TTL_SECONDS = 900
 
 # ── #106 下单/购买语义(商业闭环)──────────────────────────────────────────
 # 业务场景:用户在外部平台页面「下单购买一个 claw」。租户记录带三个购买维度字段
@@ -108,7 +110,117 @@ _TENANT_SECRET_FIELDS = (
     # blobs; ciphertext (not plaintext), but still never echoed to any GET caller.
     "frozen_injection_plan",  # tenant-credential-contract Task 4.1 — frozen plan
     # entries carry value_ref (ciphertext or plaintext values); never echoed.
+    "device_paired_b64",  # #415 — paired.json 自 7.1(v4)起在 tokens.operator 预铸
+    # 一枚活 bearer token(免 approve 用)。该字段 #312 存进 tenants 表长期留存,
+    # 若不脱敏会随 GET /tenants(list/detail 都过 _redact_tenant)原样回给持
+    # x-api-key 的调用方 → 一把 key 批量收割每租户的 device token(与 #100 gateway_token
+    # 同类批量泄漏)。launch-vm 直接查 DDB 重注入,不走 _redact_tenant,故脱敏不影响冷注入。
 )
+
+
+# 令牌释放三态(codex review #3:delete 若把瞬时失败当已释放照样标 deleted,令牌永久搁浅
+# ——deleted 租户不被 reaper 兜底 → 容量永漏。三态让 delete 在 retry 时留 deleting 返 5xx 重投)。
+_REL_CONSUMED = "consumed"  # 本次扣了账本、清了令牌
+_REL_ALREADY = "already"    # 令牌已不在(别人消费/从没有)或下溢守卫触发 → 安全幂等
+_REL_RETRY = "retry"        # 瞬时失败(冲突/throttle/网络)→ 令牌可能仍在,必须重投再释放
+
+
+def _release_capacity_reservation(tenant_id, host_id, reservation_id, vcpu, mem_mb):
+    """#412 —— 令牌化释放 dispatch 预留:扣 host 账本 + 清租户令牌/放置,一个
+    TransactWriteItems,条件 tenants.capacity_reservation_id=:rid。与 dispatch_service.
+    _release_reservation / reaper 同款互斥锚:谁先消费令牌谁扣一次账本,其余幂等 no-op
+    (codex #3 防 ABA 双扣)。
+
+    返回三态(codex review #3):_REL_CONSUMED / _REL_ALREADY(安全,可继续标 deleted)/
+    _REL_RETRY(令牌可能仍在,delete 必须留 deleting 返 5xx 重投,绝不 finalize)。
+
+    独立实现(不 import dispatch_service):delete 是 no-data-loss 关键路径,自包含避免跨
+    service 依赖;事务写法与本文件 canary put(:734)同源(原生值,不预 TypeSerializer)。"""
+    retryable = {"TransactionConflict", "ThrottlingError",
+                 "ProvisionedThroughputExceeded", "RequestLimitExceeded"}
+    txn_items = [
+        {
+            "Update": {
+                "TableName": clients.hosts_table.table_name,
+                "Key": {"instance_id": host_id},
+                "UpdateExpression": (
+                    "SET used_vcpu = used_vcpu - :v, "
+                    "used_mem_mb = used_mem_mb - :m, vm_count = vm_count - :one"
+                ),
+                "ConditionExpression": (
+                    "used_vcpu >= :v AND used_mem_mb >= :m AND vm_count >= :one"
+                ),
+                "ExpressionAttributeValues": {":v": vcpu, ":m": mem_mb, ":one": 1},
+            }
+        },
+        {
+            "Update": {
+                "TableName": clients.tenants_table.table_name,
+                "Key": {"id": tenant_id},
+                "UpdateExpression": (
+                    "REMOVE capacity_reservation_id, dispatch_settle, host_id, "
+                    "vm_num, guest_ip, host_port"
+                ),
+                "ConditionExpression": "capacity_reservation_id = :rid",
+                "ExpressionAttributeValues": {":rid": reservation_id},
+            }
+        },
+    ]
+    try:
+        clients.hosts_table.meta.client.transact_write_items(TransactItems=txn_items)
+        return _REL_CONSUMED
+    except ClientError as e:
+        # 按【位次】判(codex review2 #2):TransactItems[0]=host 扣减,[1]=tenant 令牌消费。
+        # 仅 tenant 项(idx1)条件失败才算 already(令牌已被别人消费);host 项(idx0)下溢
+        # 或缺 reasons/可重试因 → retry(不当已释放,否则搁浅令牌 / delete 误 finalize)。
+        code = e.response["Error"]["Code"]
+        if code == "TransactionCanceledException":
+            reasons = e.response.get("CancellationReasons", []) or []
+
+            def _code_at(idx):
+                return reasons[idx].get("Code", "") if idx < len(reasons) else ""
+
+            host_code, tenant_code = _code_at(0), _code_at(1)
+            # 优先级(codex review4 #2):瞬时 > 令牌已消费 > host 下溢 > 缺细节。token 项(idx1)
+            # CCF 优先判 ALREADY——最后一张预留双重释放时 host 下溢与 token-gone 会同时失败,
+            # token-gone 说明别人已成功扣账本,本次安全幂等,绝不能因 host 下溢误报 retry 让 delete
+            # 卡 deleting/进 DLQ。
+            if host_code in retryable or tenant_code in retryable:
+                print(f"delete_tenant #412: release {tenant_id} retryable cancel "
+                      f"{[host_code, tenant_code]}")
+                return _REL_RETRY
+            if tenant_code == "ConditionalCheckFailed":
+                return _REL_ALREADY  # 令牌已被别人消费/从没有 → 安全幂等
+            if host_code == "ConditionalCheckFailed":
+                print(f"delete_tenant #412: release {tenant_id} host underflow — retry+alarm")
+                return _REL_RETRY
+            print(f"delete_tenant #412: release {tenant_id} cancel w/o reasons — retry")
+            return _REL_RETRY
+        if code in retryable:
+            print(f"delete_tenant #412: release {tenant_id} retryable error {code}")
+            return _REL_RETRY
+        print(f"delete_tenant #412: token release {tenant_id} error (retry): {e}")
+        return _REL_RETRY  # 未知错误保守当可重试:宁重投也不搁浅令牌
+    except Exception as e:  # noqa: BLE001
+        print(f"delete_tenant #412: token release {tenant_id} error (retry): {e}")
+        return _REL_RETRY
+
+
+def _maybe_mark_idle(host_id):
+    """令牌释放后若 host 空了则打 idle_since(与旧扣减路径的 idle 逻辑等价;令牌事务不
+    返回 host 属性,单独强一致读一次 vm_count)。best-effort。"""
+    try:
+        h = clients.hosts_table.get_item(
+            Key={"instance_id": host_id}, ConsistentRead=True
+        ).get("Item")
+        if h and int(h.get("vm_count", 0) or 0) == 0:
+            clients.hosts_table.update_item(
+                Key={"instance_id": host_id},
+                UpdateExpression="SET idle_since = :t",
+                ExpressionAttributeValues={":t": utils._now()},
+            )
+    except Exception as e:  # noqa: BLE001
+        print(f"delete_tenant #412: mark idle {host_id} non-fatal: {e}")
 
 
 def _validate_purchase(body):
@@ -373,9 +485,23 @@ def build_paired_json_b64(device):
     paired.json base64。paired.json 是 gateway 侧"已批准设备名单",首连命中即免人工
     approve(INJECTION-SPEC-2026.2.26.md,真机验证)。
 
-    2026.2.26(协议 v3)配对门只看 `roles` 含请求角色 + publicKey 匹配,`tokens`
-    可留空对象——比 6.11 简单(6.11 要 tokens[role] 预铸活跃 token)。故这里只放
-    deviceId/publicKey(raw base64url,非 PEM)/role/roles/scopes/tokens:{}/时间戳。
+    #415(2.26→7.1 升级,真机实测):预铸一枚 `tokens.operator` 活跃 token。
+    - 7.1(协议 v4)配对门 `listEffectivePairedDeviceRoles = 活跃tokens的role ∩ 批准role`,
+      空 `tokens:{}` → effective roles 为空 → operator 被判 role-upgrade → 远程连接
+      被拒(NOT_PAIRED,us-west-2 真机远程拓扑实测)。故必须在 tokens 里放一枚带
+      role 的 entry,该 role 才进 effective 集合、免 approve 放行。
+    - 2.26(协议 v3)配对门只比 publicKey + roles、不读 tokens,故多出的 tokens.operator
+      字段对 2.26 无害(真机 2.26 gateway 实测仍 CONNECTED)。→ 同一份产物兼容两版。
+    - token 值用随机 32B:客户端走 shared-gateway-token 认证(connect 帧 auth.token
+      出示 gateway token 即 authOk,server 跳过 verifyDeviceToken 的明文比对),故 token
+      仅需存在、让 listActiveTokenRoles 能从中派生出 operator role,不必是 server 铸的值
+      (真机 7.1 远程连接实测:随机 token entry → CONNECTED)。
+    - 覆盖语义(#415 codex review):launch-vm.sh 只在 NEW_DATA=true(首次/restore/
+      rebuild 重建数据盘)时整文件写 paired.json,唤醒不重注(one-time,见 launch-vm.sh
+      NEW_DATA 块内注释)。故本预铸 token 不会覆盖运行中 VM 磁盘上的 token;且当前
+      shared-token 认证路径下 server 不轮换 device token(verifyDeviceToken 被跳过),
+      不存在"用预铸值覆盖已轮换运行时 token"的回退。若未来切到 device-token 认证并启用
+      轮换,需改为"设备记录已存在则保留磁盘 tokens、仅首次缺失才注入",此处留提示。
 
     device 为 None(owner 未知 / CMK 关 → mint 返 None)→ 返回 "",launch-vm 侧
     读空跳过写盘(feature-off 字节兼容)。返回单 device 的 paired.json 全量对象的
@@ -388,8 +514,11 @@ def build_paired_json_b64(device):
     device_id = device["device_id"]
     scopes = list(device.get("scopes") or _DEVICE_SCOPES_DEFAULT)
     now_ms = int(time.time() * 1000)
-    # role 固定 operator(2.26 配对门只校 roles 含请求角色;scopes 给 admin 全权,
-    # 无人值守部署需 approve/pairing/管理,与 CLI call.ts:272 对齐)。
+    # 预铸 operator role token(随机 32B,base64url 无填充,与 openclaw
+    # generatePairingToken() 同格式)。7.1 免 approve 依赖此 entry。
+    pairing_token = _b64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
+    # role 固定 operator(scopes 给 admin 全权,无人值守部署需 approve/pairing/管理,
+    # 与 CLI call.ts:272 对齐)。
     paired = {
         device_id: {
             "deviceId": device_id,
@@ -397,7 +526,15 @@ def build_paired_json_b64(device):
             "role": "operator",
             "roles": ["operator"],
             "scopes": scopes,
-            "tokens": {},
+            "tokens": {
+                "operator": {
+                    "token": pairing_token,
+                    "role": "operator",
+                    "scopes": scopes,
+                    "createdAtMs": now_ms,
+                    "lastUsedAtMs": now_ms,
+                }
+            },
             "createdAtMs": now_ms,
             "approvedAtMs": now_ms,
         }
@@ -690,6 +827,68 @@ def _phys_tap_occupied(host_id, phys_num, exclude_id=None):
             f"_phys_tap_occupied({host_id},{phys_num}) scan failed → fail-closed: {e}"
         )
         return True
+
+
+def _persist_tenant_record(item, tenant_id):
+    """把租户记录落库。成功返回 None;可预期冲突返回错误响应;意外异常向上抛(调用方回滚 slot)。
+
+    #93 —— 条件写 attribute_not_exists(id):同 id 重放(重试/双提交/队列重复消费)不覆盖已存在
+    租户,冲突回 409 CONFLICT。
+
+    #394 codex NB2 —— canary 租户固定了具体版本(image_snapshot_time)时,其持久化必须与全局删
+    快照【线性化】:否则 delete 扫描完租户表(即使强一致,也只是时间点)之后、deleting→deleted
+    之前这条 put 才落库 → 版本被删但租户已固定它 → restart 拉不回(no-data-loss)。故 canary 走
+    TransactWriteItems:租户 Put + 快照 status==active 的 ConditionCheck 同一事务。delete 先把 status
+    条件写成 deleting 就让这条事务失败;反之这条先成事务就让 delete 的引用扫描看见该租户。
+    传【原生值】(不预 TypeSerializer;resource client 已挂序列化 transform,预序列化会二次包裹 →
+    Type mismatch,与 image_jobs.create 同源教训)。live 租户不固定版本 → 走普通条件 put。
+    """
+    ccf = clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException
+    pin = item.get("image_snapshot_time")
+    try:
+        if pin and clients.version_snapshots_table is not None:
+            clients.tenants_table.meta.client.transact_write_items(TransactItems=[
+                {"ConditionCheck": {
+                    "TableName": clients.version_snapshots_table.name,
+                    "Key": {"snapshot_time": pin},
+                    "ConditionExpression": (
+                        "attribute_exists(snapshot_time) AND "
+                        "(attribute_not_exists(#s) OR #s = :active)"
+                    ),
+                    "ExpressionAttributeNames": {"#s": "status"},
+                    "ExpressionAttributeValues": {":active": "active"},
+                }},
+                {"Put": {
+                    "TableName": clients.tenants_table.name,
+                    "Item": item,
+                    "ConditionExpression": "attribute_not_exists(id)",
+                }},
+            ])
+        else:
+            clients.tenants_table.put_item(
+                Item=item, ConditionExpression="attribute_not_exists(id)"
+            )
+        return None
+    except (ccf, ClientError) as e:
+        # 事务取消原因在 CancellationReasons(顺序同 TransactItems):第 0 项 = 快照 ConditionCheck,
+        # 第 1 项 = 租户 Put。快照那项 ConditionalCheckFailed → 版本正被删/已删,不能再固定它。
+        reasons = getattr(e, "response", {}).get("CancellationReasons") or []
+        snap_gone = bool(pin) and bool(reasons) and (
+            (reasons[0] or {}).get("Code") == "ConditionalCheckFailed"
+        )
+        if snap_gone:
+            return utils._err(
+                409, "IMAGE_VERSION_SNAPSHOT_UNAVAILABLE",
+                f"image snapshot {pin} is being deleted or no longer active; "
+                f"cannot pin it to a new canary tenant",
+                extra={"snapshot_time": pin},
+            )
+        if isinstance(e, ccf) or reasons:
+            return utils._err(
+                409, "CONFLICT", f"tenant '{tenant_id}' already exists",
+                extra={"id": tenant_id},
+            )
+        raise
 
 
 def create_tenant(body=None, event=None):
@@ -1052,6 +1251,20 @@ def create_tenant(body=None, event=None):
         src_id = restore_from.get("tenant_id")
         if not src_id:
             return utils._resp(400, {"error": "restore_from.tenant_id required"})
+        # #422 — IDOR: 恢复他人备份前必须校验属主(与 clone_from :1106 对称)。缺此校验时,
+        # 任意登录用户经 viewer 级 POST /tenants/self 传 restore_from.tenant_id=<他人 id>,
+        # 即可把他人备份还原到自己名下 = 跨租户数据读取(code-forensics CONFIRMED)。
+        # 校验对象是备份源租户的 DDB 记录(owner_id)。**源记录可能已被彻底删除而 S3 备份仍在**
+        # (合法灾备场景,见 test_restore_when_source_tenant_deleted)——此时用空 item 走同一
+        # 校验:_assert_owner_or_admin 对无 owner_id 的 item 只放行 admin/api-key(灾备本就是
+        # 运维操作),普通 viewer 被拒。既挡 IDOR(记录在→校 owner;记录不在→要 admin),又不
+        # 破坏"源已删仍可恢复"契约。owner_id 为 None 的空 item 传入是该函数明确支持的路径。
+        restore_src = clients.tenants_table.get_item(
+            Key={"id": src_id}, ConsistentRead=True
+        ).get("Item") or {}
+        denied = auth._assert_owner_or_admin(restore_src, event or {})
+        if denied is not None:
+            return denied
         ts = restore_from.get("timestamp")
         restore_backup_key = _resolve_backup(src_id, ts)
         if not restore_backup_key:
@@ -1102,6 +1315,40 @@ def create_tenant(body=None, event=None):
     _pinned_placement = bool(
         (body.get("preferred_host_id") or "").strip() or clone_from
     )
+    # #394 —— canary 准入【前置到入队之前】:image_channel=canary 但目标 host 没有 READY 的
+    # canary 槽(或与 expected 不符)时,必须【同步】返回 409,不能先回 202 queued 再在消费者
+    # 重放时静默失败——那样调用方拿到"provisioning asynchronously"却永远等不到租户(实测:
+    # 无 canary 槽建 canary 租户曾误返 202,租户随后凭空消失)。fail-closed,绝不回落 live。
+    # 只在原始请求上做(消费者重放带 _consumer_ident,重放时下游 1578 那道校验仍会再兜一次)。
+    if not (event or {}).get("_consumer_ident"):
+        _pre_ch, _pre_ch_err = image_channel_mod.normalize_channel(body.get("image_channel"))
+        if _pre_ch_err:
+            inflight_dedup.release_inflight_lock(owner_id, tenant_user_id)
+            return utils._resp(400, {"error": _pre_ch_err, "code": "VALIDATION"})
+        if _pre_ch == "canary":
+            _pre_hid = (body.get("preferred_host_id") or "").strip()
+            if not _pre_hid:
+                inflight_dedup.release_inflight_lock(owner_id, tenant_user_id)
+                return utils._resp(400, {
+                    "error": "image_channel=canary requires preferred_host_id",
+                    "code": "VALIDATION"})
+            _pre_host = clients.hosts_table.get_item(
+                Key={"instance_id": _pre_hid}, ConsistentRead=True
+            ).get("Item")
+            if not _pre_host:
+                inflight_dedup.release_inflight_lock(owner_id, tenant_user_id)
+                return utils._resp(404, {
+                    "error": f"preferred_host_id {_pre_hid} not found", "code": "NOT_FOUND"})
+            _pre_snap, _pre_code, _pre_msg = image_channel_mod.resolve_pinned_version(
+                _pre_ch, _pre_host.get("image_slots") or {},
+                body.get("expected_image_snapshot_time"),
+                body.get("expected_image_generation"),
+            )
+            if _pre_code:
+                inflight_dedup.release_inflight_lock(owner_id, tenant_user_id)
+                return utils._resp(
+                    400 if _pre_code == "VALIDATION" else 409,
+                    {"error": _pre_msg, "code": _pre_code})
     # ── [hackathon] Dispatch (SQS 标准队列 + 装箱消费,SPEC/sqs-dispatch) ──
     # DISPATCH_QUEUE_URL 非空 且 非 consumer 回放 且 非 pinned → 走装箱路径,优先于旧
     # CREATE_VIA_QUEUE FIFO(SPEC 开关优先级矩阵)。tenants 条件写占位保证幂等:
@@ -1350,6 +1597,19 @@ def create_tenant(body=None, event=None):
     #   2. preferred_host_id (admin/operator) → land there or fail
     #   3. default → first host with capacity
     preferred_host_id = (body.get("preferred_host_id") or "").strip()
+    # #394 —— image_channel 准入(ADR §4.3)。缺省 live = 既有行为字节不变。
+    # canary 必须显式 pin 到装过 canary 槽的那台 host(canary 槽不是全 fleet 都有)。
+    image_channel, _ch_err = image_channel_mod.normalize_channel(body.get("image_channel"))
+    if _ch_err:
+        inflight_dedup.release_inflight_lock(owner_id, tenant_user_id)
+        return utils._resp(400, {"error": _ch_err, "code": "VALIDATION"})
+    if image_channel_mod.requires_pinned_host(image_channel) and not preferred_host_id:
+        inflight_dedup.release_inflight_lock(owner_id, tenant_user_id)
+        return utils._resp(400, {
+            "error": "image_channel=canary requires preferred_host_id (the canary slot "
+                     "exists only on the host you pulled it to)",
+            "code": "VALIDATION",
+        })
     if clone_src:
         host = scheduling._get_specific_host_with_capacity(
             clone_src["host_id"], vcpu, mem_mb
@@ -1598,6 +1858,29 @@ def create_tenant(body=None, event=None):
     guest_ip = auth._guest_ip(vm_num)
     host_port = clients.VM_PORT_BASE + vm_num - 1
 
+    # #394 —— canary 租户:把 channel 解析成【具体不可变版本】并固定到租户记录(ADR §4.3)。
+    # 只存 channel 不行 —— promote 清空 canary 指针后该租户 restart 会解析不到 / 解析到别的
+    # 候选版本 = 版本漂移,验证结论作废。expected_* 是调用方从 pull Job result 读到的值,
+    # 在此做 TOCTOU 校验(期间被并发 pull 换掉即拒绝),不回落 live。
+    # 槽位真值读 host 记录上的 image_slots 镜像(控制面副本);canary 装成功时由 pull 落。
+    pinned_image_snapshot_time = None
+    if image_channel == "canary":
+        _slots = host.get("image_slots") or {}
+        pinned_image_snapshot_time, _pin_code, _pin_msg = (
+            image_channel_mod.resolve_pinned_version(
+                image_channel, _slots,
+                body.get("expected_image_snapshot_time"),
+                body.get("expected_image_generation"),
+            )
+        )
+        if _pin_code:
+            scheduling._release_slot(host["instance_id"], vcpu, mem_mb)
+            inflight_dedup.release_inflight_lock(owner_id, tenant_user_id)
+            return utils._resp(
+                400 if _pin_code == "VALIDATION" else 409,
+                {"error": _pin_msg, "code": _pin_code},
+            )
+
     item = {
         "id": tenant_id,
         "name": name,
@@ -1633,6 +1916,12 @@ def create_tenant(body=None, event=None):
         item["uuid"] = owner_id  # #93 — stable Cognito-sub principal (= owner_id);
         # NOT the primary key (id stays name-xxxx so one user can own many tenants)
     item["image_id"] = image_id  # #93 — golden rootfs version at creation
+    # #394 —— 记 channel(审计/展示)+ canary 的固定版本(launch-vm 起盘的权威来源)。
+    # live 租户【不】写 image_snapshot_time:它每次启动解析当前 live 指针(既有产品语义:
+    # 运行中不受指针变化影响,restart 时拿当前 live)。
+    item["image_channel"] = image_channel
+    if pinned_image_snapshot_time:
+        item["image_snapshot_time"] = pinned_image_snapshot_time
     if security:  # #93 — per-tenant encryption/security config (optional)
         item["security"] = security
     if injected_credentials:  # #118/#116 — platform-injected credential ciphertext
@@ -1668,21 +1957,18 @@ def create_tenant(body=None, event=None):
     # tenant. On conflict we release the slot THIS attempt just reserved (the
     # original tenant keeps its own) and return 409 — avoids both a silent clobber
     # and a capacity leak. Any other failure rolls back + re-raises as before.
-    try:
-        clients.tenants_table.put_item(
-            Item=item, ConditionExpression="attribute_not_exists(id)"
-        )
-    except clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException:
+    #
+    # #394 codex NB2 —— canary 租户固定了具体版本(image_snapshot_time):它的持久化必须与
+    # 全局删快照【线性化】。否则:delete 扫描完租户表(即使强一致,那也只是时间点)之后、
+    # deleting→deleted 之前,这条 put 才落库 → 该版本被删,但租户已固定它 → restart 拉不回
+    # (no-data-loss)。故 canary 走 TransactWriteItems:租户 Put(attribute_not_exists(id))
+    # + 快照 status==active 的 ConditionCheck 同一事务;delete 先把 status 条件写成 deleting
+    # 就会让这条事务失败,反之这条先成事务就让 delete 的引用扫描看见租户。传【原生值】
+    # (不预序列化;resource client 已挂序列化 transform,预序列化会二次包裹 → Type mismatch)。
+    _persist_err = _persist_tenant_record(item, tenant_id)
+    if _persist_err is not None:
         scheduling._release_slot(host["instance_id"], vcpu, mem_mb)
-        return utils._err(
-            409,
-            "CONFLICT",
-            f"tenant '{tenant_id}' already exists",
-            extra={"id": tenant_id},
-        )
-    except Exception:
-        scheduling._release_slot(host["instance_id"], vcpu, mem_mb)
-        raise
+        return _persist_err
 
     # #187 P1 — pre-mint gateway token when feature is on (CMK + secrets table
     # both deployed). Enables control-plane reveal (GET /tenants/{id}/token) and
@@ -1865,6 +2151,83 @@ def delete_tenant(tenant_id, query_params, event=None):
     if item.get("status") == "deleted":
         return utils._resp(200, {"id": tenant_id, "status": "deleted"})
 
+    # #422 — suspended 租户的 VM 已停、本地盘已删、host slot 已在 suspend 时释放。若走下方
+    # 常规 delete:①CAS suspended→deleting 后会【二次】扣 slot(used_vcpu -= vcpu),而该 slot
+    # 早已释放 → 账本扣穿/低估 → 过度调度;②stop-vm/rm 对已不存在的 VM 是无效副作用。故走
+    # 【确认回收】专路。落实 ADR "suspended 删除必经确认回收"。
+    # codex round2 #2:只接【稳定 suspended】;中间态 suspending/restoring 是在途操作(与并发
+    # suspend/restore launch 竞争),此刻删除会与那些操作抢状态、可能留孤儿 VM(delete 先翻
+    # deleted、restore 又起 VM)→ 返 409 让调用方等在途操作收敛(达稳定 suspended 或回 running)。
+    if item.get("status") in ("suspending", "restoring"):
+        return utils._resp(
+            409,
+            {
+                "error": f"tenant is {item['status']} (hibernate/restore in flight); "
+                "wait for it to settle (suspended or running) before delete",
+                "id": tenant_id,
+            },
+        )
+    if item.get("status") == "suspended":
+        _keep = query_params.get("keep_data", "true").lower() == "true"
+        _bk = item.get("restore_backup_key", "")
+        # codex round3 #1 + round4 #5 — 【一步 CAS suspended→deleted,不经共享 deleting 中间态】。
+        # 抢闸:CAS 抢下唯一赢家,才做删 S3 备份/撤 vkey(否则并发 restore 先赢 suspended→
+        # restoring、本删除删掉其唯一备份 = 数据丢失)。**直接翻终态 deleted 而非 deleting**:
+        # suspended 租户无 VM/盘的破坏性副作用序列(suspend 时已删),不需要 deleting 保护窗口;
+        # 若经 deleting 且中途崩溃,consumer 重投会走【普通 delete 路径】对已释放的 slot 二次扣账
+        # (codex round4 #5,扣穿其他租户容量)。一步到 deleted 彻底关掉该窗口:重投读到 deleted
+        # 直接幂等返回,永不进普通删除路径。破坏性清理(S3/vkey)放 CAS 之后 best-effort——崩溃则
+        # 泄漏可被对账清理(可恢复),而二次扣 slot 破坏账本正确性(不可接受),两害取轻。
+        _vkey = item.get("litellm_vkey")
+        _remove = "restore_backup_key, suspended_at, suspended_from, cognito_channel_password"
+        _set = "SET #s = :d, updated_at = :t"
+        _vals = {":d": "deleted", ":cur": "suspended", ":t": utils._now()}
+        # vkey 撤销在 CAS 前做(幂等,失败则保留字段+flag);其余破坏性清理在 CAS 赢后做。
+        _vkey_revoked = vkey._revoke_tenant_vkey(_vkey) if _vkey else True
+        if _vkey and not _vkey_revoked:
+            _set += ", vkey_revoke_failed = :vf"
+            _vals[":vf"] = True
+        else:
+            _remove = "litellm_vkey, " + _remove
+        try:
+            clients.tenants_table.update_item(
+                Key={"id": tenant_id},
+                UpdateExpression=f"{_set} REMOVE {_remove}",
+                ConditionExpression="#s = :cur",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues=_vals,
+            )
+        except clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException:
+            cur2 = (clients.tenants_table.get_item(Key={"id": tenant_id}, ConsistentRead=True).get("Item") or {})
+            if cur2.get("status") == "deleted":
+                return utils._resp(200, {"id": tenant_id, "status": "deleted"})
+            return utils._resp(
+                409,
+                {"error": f"tenant is now {cur2.get('status')}; suspended-delete lost the race", "id": tenant_id},
+            )
+        # CAS 赢(已 deleted 终态),破坏性清理 best-effort(崩溃泄漏可对账,不影响 slot 账本)。
+        if not _keep and _bk:
+            try:
+                _bucket = os.environ.get("BACKUP_BUCKET") or os.environ.get("ASSETS_BUCKET", "")
+                if _bucket:
+                    clients.s3.delete_object(Bucket=_bucket, Key=_bk)
+            except Exception as e:  # noqa: BLE001 — best-effort,不阻断终态
+                print(f"delete suspended #{tenant_id}: S3 backup rm best-effort failed: {e}")
+        _cleanup_gateway_token_secret(tenant_id)
+        inflight_dedup.release_inflight_lock(item.get("owner_id"), item.get("tenant_user_id"))
+        name_dedup.release_name_lock(
+            name_dedup.dedup_scope(
+                item.get("owner_id", ""), item.get("tenant_user_id", ""), item.get("platform_id", "")
+            ),
+            item.get("name", ""),
+            tenant_id,
+        )
+        audit._publish_event(
+            "tenant.deleted", tenant_id,
+            {"from_suspended": True, "kept_backup": _keep, "vkey_revoked": _vkey_revoked},
+        )
+        return utils._resp(200, {"id": tenant_id, "status": "deleted"})
+
     # #263 — delete 削峰:队列开启且非 consumer 重放时,入队即返 202,由 consumer
     # 受控并发消费(避免短时间批删把单 host SSM CommandWorkersLimit=5 打爆,饿死
     # launch-vm/start/stop;单删同步 backup+4~5 条阻塞 SSM ~15~35s 还会撞 API GW 29s)。
@@ -1892,12 +2255,19 @@ def delete_tenant(tenant_id, query_params, event=None):
     # 期间 status 已非 running,list/调度不再把它算作活跃;② 万一副作用中途失败,记录
     # 停在 "deleting" 可被巡检发现重试,而不是过早标 "deleted" 把半清理的租户藏起来。
     prev_status = item.get("status")
+    claim_expires_at = int(time.time()) + _DELETE_CLAIM_TTL_SECONDS
+    # #412 — 拿 CAS 后的【新鲜】属性(ReturnValues=ALL_NEW),不再用 CAS 前的陈旧 item
+    # 判 host_id/capacity_reservation_id(codex #1:陈旧快照会漏掉 reserve-won-then-delete
+    # straddle 场景里刚写上的 host_id/令牌 → delete 跳过扣减 → 泄漏)。deleting CAS 一旦赢,
+    # dispatch 的 reserve 事务(条件 status=creating)必不能再提交,故此刻属性是权威终值。
+    fresh = dict(item)
     try:
-        clients.tenants_table.update_item(
+        _cas_resp = clients.tenants_table.update_item(
             Key={"id": tenant_id},
             UpdateExpression=(
                 "SET #s = :deleting, updated_at = :t, "
-                "delete_retryable = :false, delete_prev_status = :prev"
+                "delete_retryable = :false, delete_prev_status = :prev, "
+                "delete_claim_expires_at_epoch = :claim_exp"
             ),
             ConditionExpression="#s <> :deleted AND #s <> :deleting",
             ExpressionAttributeNames={"#s": "status"},
@@ -1906,9 +2276,17 @@ def delete_tenant(tenant_id, query_params, event=None):
                 ":deleted": "deleted",
                 ":false": False,
                 ":prev": prev_status,
+                ":claim_exp": claim_expires_at,
                 ":t": utils._now(),
             },
+            ReturnValues="ALL_NEW",
         )
+        if isinstance(_cas_resp, dict) and _cas_resp.get("Attributes"):
+            # #412(codex review4 #1)—— 用 ALL_NEW 的【完整 post-image】,【不】与陈旧 item 合并。
+            # 合并会把并发 promote 刚 REMOVE 掉的 capacity_reservation_id 从旧 item 里"复活",
+            # 令 delete 误走令牌释放(而该租户已 running、令牌已清),token 释放条件失败 →
+            # 走不到旧的按 item.vcpu 扣减 → 账本永久泄漏。ALL_NEW 是 CAS 之后的真值,直接用。
+            fresh = _cas_resp["Attributes"]
     except clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException:
         # CAS 撞 deleting/deleted。区分两种:
         # ① status 已 deleted → 真幂等,删完了,返 200。
@@ -1926,35 +2304,62 @@ def delete_tenant(tenant_id, query_params, event=None):
         if cur.get("status") == "deleted":
             return utils._resp(200, {"id": tenant_id, "status": "deleted"})
         is_consumer_replay = bool((event or {}).get("_consumer_ident"))
-        if not is_consumer_replay and cur.get("delete_retryable") is not True:
-            # Another request still owns the delete. A failed attempt explicitly
-            # sets delete_retryable=true below; only then may a synchronous retry
-            # acquire the replay gate.
-            return utils._resp(202, {"id": tenant_id, "status": "deleting"})
-        if cur.get("delete_retryable") is True:
+        now_epoch = int(time.time())
+        claim_expired = (
+            int(cur.get("delete_claim_expires_at_epoch", 0) or 0)
+            <= now_epoch
+        )
+        if (
+            not is_consumer_replay
+            and cur.get("delete_retryable") is not True
+            and not claim_expired
+        ):
+            # Another synchronous request still owns an unexpired delete claim.
+            # Return idempotently regardless of reservation-token state; retry
+            # becomes eligible when the owner marks retryable or the claim expires.
+            return utils._resp(200, {"id": tenant_id, "status": "deleting"})
+        if not is_consumer_replay and (
+            cur.get("delete_retryable") is True or claim_expired
+        ):
             try:
+                next_claim_exp = now_epoch + _DELETE_CLAIM_TTL_SECONDS
                 clients.tenants_table.update_item(
                     Key={"id": tenant_id},
-                    UpdateExpression="SET delete_retryable = :false, updated_at = :t",
-                    ConditionExpression="#s = :deleting AND delete_retryable = :true",
+                    UpdateExpression=(
+                        "SET delete_retryable = :false, updated_at = :t, "
+                        "delete_claim_expires_at_epoch = :claim_exp"
+                    ),
+                    ConditionExpression=(
+                        "#s = :deleting AND (delete_retryable = :true OR "
+                        "attribute_not_exists(delete_claim_expires_at_epoch) OR "
+                        "delete_claim_expires_at_epoch <= :now)"
+                    ),
                     ExpressionAttributeNames={"#s": "status"},
                     ExpressionAttributeValues={
                         ":deleting": "deleting",
                         ":true": True,
                         ":false": False,
+                        ":now": now_epoch,
+                        ":claim_exp": next_claim_exp,
                         ":t": utils._now(),
                     },
                 )
+                cur["delete_retryable"] = False
+                cur["delete_claim_expires_at_epoch"] = next_claim_exp
             except clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException:
                 return utils._resp(202, {"id": tenant_id, "status": "deleting"})
+            print(
+                f"delete_tenant #425: {tenant_id} claimed retryable/expired delete"
+            )
         # consumer 重投卡在 deleting 的删除:status 已是 deleting,不再翻转,直接往下
         # 重试副作用(stop-vm/rm 幂等)。#107 账本回退由下方 `used_vcpu >= :v` guard
         # 防重复扣穿(第一次已扣过则 CCF → skip),不会二次扣账本。
         prev_status = cur.get("delete_prev_status", prev_status)
-        item = cur
+        if cur:
+            fresh = cur  # #412 — 重投路径同样用新鲜属性判 host_id/令牌
 
     keep_data = query_params.get("keep_data", "true").lower() == "true"
-    host_id = item.get("host_id")
+    host_id = fresh.get("host_id")
     # Go-live B2: snapshot-before-destroy. Deleting with keep_data=false does an
     # irreversible `rm -rf` of the tenant's data disk. Per the project rule
     # "不可逆操作前先保护", we first take a SYNCHRONOUS backup to S3 so the data
@@ -1973,9 +2378,14 @@ def delete_tenant(tenant_id, query_params, event=None):
         try:
             clients.tenants_table.update_item(
                 Key={"id": tenant_id},
+                # #412 blocker-A(codex round2 #1)—— 回滚到活跃态时【一并 REMOVE predelete_backup_at】。
+                # 该标记只对"本次删除尝试"有效;回滚 = 放弃本次删除,租户重新可用、之后可能写【新】
+                # 数据。若把标记留在活跃租户上,下一次 delete 会凭陈旧标记跳过 backup → rm 掉新写的
+                # 未备份数据(铁律#4)。故回滚必清标记,让下次 delete 重新走 backup。
                 UpdateExpression=(
                     "SET #s = :prev, updated_at = :t "
-                    "REMOVE delete_retryable, delete_prev_status"
+                    "REMOVE predelete_backup_at, delete_retryable, "
+                    "delete_prev_status, delete_claim_expires_at_epoch"
                 ),
                 ConditionExpression="#s = :deleting",
                 ExpressionAttributeNames={"#s": "status"},
@@ -1991,35 +2401,44 @@ def delete_tenant(tenant_id, query_params, event=None):
 
     def _mark_delete_retryable():
         """Allow one caller to resume a failed post-stop delete."""
-        try:
-            clients.tenants_table.update_item(
-                Key={"id": tenant_id},
-                UpdateExpression="SET delete_retryable = :true, updated_at = :t",
-                ConditionExpression="#s = :deleting",
-                ExpressionAttributeNames={"#s": "status"},
-                ExpressionAttributeValues={
-                    ":deleting": "deleting",
-                    ":true": True,
-                    ":t": utils._now(),
-                },
-            )
-        except Exception:
-            pass
+        clients.tenants_table.update_item(
+            Key={"id": tenant_id},
+            UpdateExpression="SET delete_retryable = :true, updated_at = :t",
+            ConditionExpression="#s = :deleting",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":deleting": "deleting",
+                ":true": True,
+                ":t": utils._now(),
+            },
+        )
 
-    if _route_cleanup_requires_host(item):
+    if _route_cleanup_requires_host(fresh):
         _mark_delete_retryable()
         return utils._resp(
             502,
             {
-                "error": "route cleanup blocked: tenant has persisted route state but "
-                "no host_id. Tenant remains deleting; restore host_id or clean the "
-                "exact DNAT/Redis route after identifying its host, then retry.",
+                "error": "route cleanup blocked: tenant has persisted route state "
+                "but no host_id. Tenant remains deleting; restore host_id or "
+                "clean the exact DNAT/Redis route after identifying its host, "
+                "then retry.",
                 "id": tenant_id,
                 "requires_intervention": True,
             },
         )
 
-    if host_id and not keep_data and not skip_backup:
+    # #412 blocker-A(codex review CHANGES_NEEDED #1)——delete replay 幂等 + no-data-loss。
+    # 首次 delete 干净翻 running→deleting 后,若令牌释放/后续步骤遇瞬时错误留 deleting,
+    # consumer replay 会再进来:此时 rm 数据盘可能已跑、盘已没,再跑 pre-delete backup 必失败
+    # (backup 打已删目录)→ fail-closed 502 → 永远到不了令牌释放 → 令牌+容量永久搁浅。
+    # 但【绝不能】仅凭"状态是 deleting"就跳过 backup:CAS 翻 deleting 先于 backup,一个在 backup
+    # 【之前】崩溃的首次 delete 也留 deleting、盘仍在且从未备份——盲跳过会 rm 未备份数据(铁律#4
+    # 数据丢失)。故用【持久标记】判据:backup 成功后写 predelete_backup_at;仅当该标记存在(证明
+    # backup 确已成功)才跳过。无标记 = 销毁前置未完成 = 盘还在 → 照常 backup(重跑幂等:同一
+    # tenant 覆盖同一 S3 key)。
+    _backup_done = bool(fresh.get("predelete_backup_at"))
+    _backup_performed = False
+    if host_id and not keep_data and not skip_backup and not _backup_done:
         try:
             lambda_client = boto3.client("lambda")
             resp = lambda_client.invoke(
@@ -2063,6 +2482,7 @@ def delete_tenant(tenant_id, query_params, event=None):
                         "backup_error": payload_err,
                     },
                 )
+            _backup_performed = True
         except Exception as e:
             _abort_restore_status()
             return utils._resp(
@@ -2072,7 +2492,6 @@ def delete_tenant(tenant_id, query_params, event=None):
                     "or ?skip_backup=true to force.",
                 },
             )
-
     if host_id:
         # Stop VM via SSM.
         # #268 — stop-vm 是关键副作用,不是 best-effort:失败=VM 孤儿(fc 进程还活着
@@ -2083,9 +2502,11 @@ def delete_tenant(tenant_id, query_params, event=None):
         # 失败则回滚 status 到删除前(复用 _abort_restore_status,CAS 保证只回滚自己翻的
         # deleting)+ 返 502。delete 走队列(#263)时 consumer 收 5xx 会重投,重投时租户又
         # 是 running→CAS 重新翻 deleting→重试 stop(幂等:已停的 VM 再停无害)。best-effort
-        # route cleanup below is also a hard gate: a failed bitmap/DNAT/Redis
-        # release keeps this record deleting and opens the explicit retry gate.
-        vm_num = int(item.get("vm_num", 1))
+        # 的 iptables/route(下方)失败仍容忍,有 host-agent orphan-reap 兜底。
+        # #412(codex review #2)—— vm_num/host_port/guest_ip 都用【fresh】(CAS 后 ALL_NEW),
+        # 不用 CAS 前的陈旧 item:reserve/delete 竞态下 host_id 从 fresh 拿了、vm_num 却用陈旧值,
+        # 会 stop/摘 DNAT 到【别的租户】的 tap-vm<n>(no-cross-tenant 违规)。三者同源一致。
+        vm_num = int(fresh.get("vm_num", 1))
         if not ssm_dispatch._ssm_run(
             host_id, f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num}"
         ):
@@ -2099,6 +2520,35 @@ def delete_tenant(tenant_id, query_params, event=None):
                     "id": tenant_id,
                 },
             )
+        # #412:marker 只能在 stop-vm 已确认成功后写。backup-data.sh 在压缩后会恢复 VM;
+        # 若先写 marker、随后进程在 stop 前崩溃，VM 仍可产生晚于备份的新数据，而重放会
+        # 因 marker 跳过备份并删盘。停机后再写可证明 marker 之后没有新写入。
+        # marker 是重放安全的必要状态，不是 best-effort 优化：写失败时盘仍在、VM 已停，
+        # 保留 deleting 并返回 502；重放会重新备份这个静止盘，再尝试落 marker。
+        if _backup_performed:
+            marker_ts = utils._now()
+            try:
+                clients.tenants_table.update_item(
+                    Key={"id": tenant_id},
+                    UpdateExpression="SET predelete_backup_at = :t",
+                    ConditionExpression="#s = :deleting",
+                    ExpressionAttributeNames={"#s": "status"},
+                    ExpressionAttributeValues={
+                        ":t": marker_ts,
+                        ":deleting": "deleting",
+                    },
+                )
+                fresh["predelete_backup_at"] = marker_ts
+            except Exception as e:  # noqa: BLE001
+                return utils._resp(
+                    502,
+                    {
+                        "error": "pre-delete backup marker persistence failed after "
+                        "VM stop; disk retained for safe retry",
+                        "detail": str(e),
+                        "id": tenant_id,
+                    },
+                )
         # Remove vm.json so host-agent won't try to recover. Only after stop
         # succeeded — else we'd delete the recovery marker while the VM is still
         # running (worse: host-agent won't recover, VM stays orphaned untracked).
@@ -2117,16 +2567,14 @@ def delete_tenant(tenant_id, query_params, event=None):
                 },
             )
 
-    # #187 转型:legacy_alb rule 已删,数据面走两级路由,无需再摘 per-tenant ALB rule。
-
     if host_id:
-        # One host-side command owns all route state: live bitmap DNAT, the
-        # historical VM_PORT_BASE+vm_num DNAT family, quarantine, and Redis.
-        # Its SSM result is mandatory; finalizing deleted after a timeout would
-        # hide leaked state and prevent a safe retry.
-        _hp = int(item.get("host_port", 0) or 0)
-        _gip = item.get("guest_ip", "")
-        _legacy_hp = clients.VM_PORT_BASE + int(item.get("vm_num", 1)) - 1
+        # 销毁租户 → 回收数据面路由(design decision:delete 可移除路由,stop 保留)。
+        # One host-side command owns bitmap DNAT, the historical DNAT family,
+        # quarantine, and Redis. Failure keeps the tenant retryable instead of
+        # finalizing a hidden route leak.
+        _hp = int(fresh.get("host_port", 0) or 0)
+        _gip = fresh.get("guest_ip", "")
+        _legacy_hp = clients.VM_PORT_BASE + int(fresh.get("vm_num", 1)) - 1
         _route_cmd = (
             "set -a; . /etc/environment 2>/dev/null; "
             ". /etc/platform.env 2>/dev/null; set +a; "
@@ -2138,8 +2586,8 @@ def delete_tenant(tenant_id, query_params, event=None):
             return utils._resp(
                 502,
                 {
-                    "error": "route cleanup failed (bitmap/DNAT/Redis); tenant remains "
-                    "deleting and may be retried safely.",
+                    "error": "route cleanup failed (bitmap/DNAT/Redis); tenant "
+                    "remains deleting and may be retried safely.",
                     "id": tenant_id,
                 },
             )
@@ -2183,48 +2631,78 @@ def delete_tenant(tenant_id, query_params, event=None):
                 )
 
         # Update host counters.
-        # #107 defense-in-depth: guard the decrement with `>= :v` so it can NEVER
-        # drive the ledger negative even if the status CAS gate is somehow bypassed
-        # (e.g. a concurrent lifecycle action reversed "deleting" back to active and
-        # a second DELETE won the gate again). The gate makes the double-decrement
-        # rare; this guard makes an over-decrement structurally impossible. On a
-        # guard violation we fail LOUD (log the anomaly) instead of silently
-        # subtracting into negative — the tenant is still marked deleted (its VM is
-        # gone), we just refuse to corrupt the capacity ledger.
-        host_resp = None
-        try:
-            host_resp = clients.hosts_table.update_item(
-                Key={"instance_id": host_id},
-                UpdateExpression="SET used_vcpu = used_vcpu - :v, used_mem_mb = used_mem_mb - :m, vm_count = vm_count - :one",
-                ConditionExpression="used_vcpu >= :v AND used_mem_mb >= :m AND vm_count >= :one",
-                ExpressionAttributeValues={
-                    ":v": item["vcpu"],
-                    ":m": item["mem_mb"],
-                    ":one": 1,
-                },
-                ReturnValues="ALL_NEW",
+        # #412 — dispatch 预留的租户带 capacity_reservation_id 令牌:此时账本增量与
+        # host_id 是【一个事务】原子落库的(_reserve_batch_txn),释放也必须【令牌化】——
+        # 扣 host + 删令牌一个事务、条件 capacity_reservation_id=:rid,与 reaper/poller/批回滚
+        # 共用同一互斥锚,谁先消费谁扣一次,其余幂等 no-op(codex #3 防 ABA 双扣)。令牌缺失
+        # (同步 create 租户,reserve 时即写 host_id、无令牌)→ 走下方 #107 的原始扣减路径。
+        rid = fresh.get("capacity_reservation_id")
+        if rid:
+            _rel = _release_capacity_reservation(
+                tenant_id, host_id, rid, int(fresh.get("vcpu", 0)), int(fresh.get("mem_mb", 0))
             )
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-                # Ledger would go negative → a prior decrement already ran for this
-                # tenant (double-delete slipped the gate). Skip the subtract; do NOT
-                # corrupt the ledger. Loud so it's caught, not swallowed.
-                print(
-                    f"delete_tenant #107: refused ledger under-run on host {host_id} "
-                    f"for tenant {tenant_id} (vcpu={item['vcpu']}, mem={item['mem_mb']}) "
-                    f"— counters already reclaimed by a prior delete; skipping."
+            print(
+                f"delete_tenant #412: token release tenant={tenant_id} host={host_id} "
+                f"rid={rid} result={_rel}"
+            )
+            if _rel == _REL_RETRY:
+                # #412(codex review #3)—— 释放瞬时失败,令牌可能仍占容量。绝不能继续标
+                # deleted:deleted 租户不被 reaper 兜底 → 令牌永久搁浅、容量永漏。【留 deleting】
+                # (不 _abort_restore_status 回 running——VM 已停、盘已删,回 running 会谎报已毁
+                # 租户存活)返 502,队列消费者/调用方重投;重投时仍 deleting → CCF 分支放行重试
+                # 副作用(stop/rm 幂等)+ 重跑本释放(令牌仍在 → 幂等消费一次,已消费则 already)。
+                return utils._resp(
+                    502,
+                    {
+                        "error": "capacity reservation release failed (transient); kept "
+                        "status=deleting for re-drive to avoid stranding the reservation.",
+                        "id": tenant_id,
+                    },
                 )
-            else:
-                raise
-        # Record idle_since when host becomes empty (defensive — mocks may
-        # omit Attributes; treat as still-busy and skip).
-        attrs = host_resp.get("Attributes") if isinstance(host_resp, dict) else None
-        if attrs and int(attrs.get("vm_count", 0)) == 0:
-            clients.hosts_table.update_item(
-                Key={"instance_id": host_id},
-                UpdateExpression="SET idle_since = :t",
-                ExpressionAttributeValues={":t": utils._now()},
-            )
+            _maybe_mark_idle(host_id)
+        else:
+            # #107 defense-in-depth: guard the decrement with `>= :v` so it can NEVER
+            # drive the ledger negative even if the status CAS gate is somehow bypassed
+            # (e.g. a concurrent lifecycle action reversed "deleting" back to active and
+            # a second DELETE won the gate again). The gate makes the double-decrement
+            # rare; this guard makes an over-decrement structurally impossible. On a
+            # guard violation we fail LOUD (log the anomaly) instead of silently
+            # subtracting into negative — the tenant is still marked deleted (its VM is
+            # gone), we just refuse to corrupt the capacity ledger.
+            host_resp = None
+            try:
+                host_resp = clients.hosts_table.update_item(
+                    Key={"instance_id": host_id},
+                    UpdateExpression="SET used_vcpu = used_vcpu - :v, used_mem_mb = used_mem_mb - :m, vm_count = vm_count - :one",
+                    ConditionExpression="used_vcpu >= :v AND used_mem_mb >= :m AND vm_count >= :one",
+                    ExpressionAttributeValues={
+                        ":v": item["vcpu"],
+                        ":m": item["mem_mb"],
+                        ":one": 1,
+                    },
+                    ReturnValues="ALL_NEW",
+                )
+            except ClientError as e:
+                if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                    # Ledger would go negative → a prior decrement already ran for this
+                    # tenant (double-delete slipped the gate). Skip the subtract; do NOT
+                    # corrupt the ledger. Loud so it's caught, not swallowed.
+                    print(
+                        f"delete_tenant #107: refused ledger under-run on host {host_id} "
+                        f"for tenant {tenant_id} (vcpu={item['vcpu']}, mem={item['mem_mb']}) "
+                        f"— counters already reclaimed by a prior delete; skipping."
+                    )
+                else:
+                    raise
+            # Record idle_since when host becomes empty (defensive — mocks may
+            # omit Attributes; treat as still-busy and skip).
+            attrs = host_resp.get("Attributes") if isinstance(host_resp, dict) else None
+            if attrs and int(attrs.get("vm_count", 0)) == 0:
+                clients.hosts_table.update_item(
+                    Key={"instance_id": host_id},
+                    UpdateExpression="SET idle_since = :t",
+                    ExpressionAttributeValues={":t": utils._now()},
+                )
 
     # Go-live C: reclaim the per-tenant LiteLLM vkey so it doesn't linger in
     # LiteLLM after the tenant is gone (credential + budget leak over churn).
@@ -2244,14 +2722,16 @@ def delete_tenant(tenant_id, query_params, event=None):
     if item.get("litellm_vkey") and not vkey_revoked:
         update_expr = (
             "SET #s = :s, updated_at = :t, vkey_revoke_failed = :vf "
-            "REMOVE cognito_channel_password, delete_retryable, delete_prev_status"
+            "REMOVE cognito_channel_password, delete_retryable, "
+            "delete_prev_status, delete_claim_expires_at_epoch"
         )
         expr_vals = {":s": "deleted", ":t": utils._now(), ":vf": True}
     else:
         update_expr = (
             "SET #s = :s, updated_at = :t "
             "REMOVE litellm_vkey, cognito_channel_password, "
-            "delete_retryable, delete_prev_status"
+            "delete_retryable, delete_prev_status, "
+            "delete_claim_expires_at_epoch"
         )
         expr_vals = {":s": "deleted", ":t": utils._now()}
     clients.tenants_table.update_item(
@@ -2293,6 +2773,411 @@ def delete_tenant(tenant_id, query_params, event=None):
         },
     )
     return utils._resp(200, {"id": tenant_id, "status": "deleted"})
+
+
+def _cas_status(tenant_id, from_status, to_status):
+    """#422 — CAS 翻租户 status(并发闸)。仅当当前 status == from_status 时翻到
+    to_status,返回 True;CCF(已被别的 op 改)返回 False。suspend/restore 用它抢唯一
+    赢家(抄 delete :2050 的 CAS 形态,但提成小工具供 suspend+restore 复用,避免各写一遍
+    闭包)。status 是 DDB 保留字,必须用 ExpressionAttributeNames 占位。"""
+    try:
+        clients.tenants_table.update_item(
+            Key={"id": tenant_id},
+            UpdateExpression="SET #s = :to, updated_at = :t",
+            ConditionExpression="#s = :from",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":to": to_status,
+                ":from": from_status,
+                ":t": utils._now(),
+            },
+        )
+        return True
+    except clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException:
+        return False
+
+
+def _tenant_suspend(tenant_id, item):
+    """#422 — 休眠一个 running/stopped 租户:无条件同步备份数据盘到 S3(fail-closed)→
+    停 VM → 释放 host slot → 保留 DDB 记录与 tenant_id,翻 status=suspended,写
+    restore_backup_key 供 restore 冷恢复。释放 slot 供新用户调度(休眠的核心目的)。
+
+    fail-closed 语义(no-data-loss 铁律,对齐 delete keep_data=false 的删前备份门):
+    备份未确认成功 → 回滚状态、不停 VM、不释放 slot、不删盘、502。只有备份成功才推进破坏性
+    步骤。stop-vm 失败 → 回滚 + 502(VM 未停不能标 suspended,否则账本失真)。
+    """
+    prev_status = item.get("status")
+    if prev_status not in ("running", "stopped"):
+        return utils._resp(
+            409,
+            {
+                "error": f"can only suspend a running/stopped tenant (current: {prev_status})",
+                "id": tenant_id,
+            },
+        )
+    host_id = item.get("host_id")
+    if not host_id:
+        return utils._resp(
+            400, {"error": "tenant has no host (still pending?)", "id": tenant_id}
+        )
+
+    # 并发闸:CAS prev → suspending,单赢家。输家(并发 suspend/其他 op 已改)幂等/409。
+    if not _cas_status(tenant_id, prev_status, "suspending"):
+        cur = (
+            clients.tenants_table.get_item(
+                Key={"id": tenant_id}, ConsistentRead=True
+            ).get("Item")
+            or {}
+        )
+        cur_s = cur.get("status")
+        if cur_s in ("suspending", "suspended"):
+            return utils._resp(200, {"id": tenant_id, "status": cur_s})
+        return utils._resp(
+            409,
+            {"error": f"tenant is {cur_s}; suspend lost the race", "id": tenant_id},
+        )
+
+    def _rollback():
+        # 回滚 suspending → prev(抄 _abort_restore_status 的 CAS 形态,只回滚自己翻的态)。
+        _cas_status(tenant_id, "suspending", prev_status)
+
+    # 1) 无条件同步备份(复用 delete 备份门的 invoke+双层解析形态,去掉 keep_data 触发条件)。
+    try:
+        lambda_client = boto3.client("lambda")
+        resp = lambda_client.invoke(
+            FunctionName=os.environ.get("BACKUP_FUNCTION", "openclaw-backup"),
+            InvocationType="RequestResponse",  # SYNC:数据落 S3 才继续破坏性步骤
+            # pre_delete=True:绕过 backup "只备 running" 守卫(CAS 已把 status 翻成
+            # suspending,与 delete 翻 deleting 同源;不带这个信号 backup 会 no-op 拒掉)。
+            Payload=json.dumps(
+                {"tenant_id": tenant_id, "pre_delete": True}
+            ).encode("utf-8"),
+        )
+        invoke_ok = resp.get("StatusCode", 500) == 200 and "FunctionError" not in resp
+        payload_ok = False
+        payload_err = "unparseable backup response"
+        if invoke_ok:
+            try:
+                raw = resp["Payload"].read()
+                result = json.loads(raw) if raw else {}
+                payload_ok = result.get("success") is True
+                if not payload_ok:
+                    payload_err = result.get("error") or "backup reported failure"
+            except Exception as pe:  # noqa: BLE001 — 解析失败即 fail-closed
+                payload_err = f"backup response parse error: {pe}"
+        else:
+            payload_err = "backup invoke failed (StatusCode/FunctionError)"
+        if not payload_ok:
+            _rollback()
+            return utils._resp(
+                502,
+                {
+                    "error": "suspend backup failed; aborting to avoid data loss. Retry.",
+                    "backup_error": payload_err,
+                    "id": tenant_id,
+                },
+            )
+        backup_key = result.get("backup_key") or result.get("key") or ""
+    except Exception as e:  # noqa: BLE001
+        _rollback()
+        return utils._resp(
+            502,
+            {"error": f"suspend backup error ({e}); aborting.", "id": tenant_id},
+        )
+
+    # 2) 停 VM(关键副作用,fail-loud;抄 delete #268 语义:失败回滚+502,不释放 slot)。
+    vm_num = int(item.get("vm_num", 1))
+    if not ssm_dispatch._ssm_run(
+        host_id, f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num}"
+    ):
+        _rollback()
+        return utils._resp(
+            502,
+            {
+                "error": "stop-vm failed (SSM timeout/error); suspend aborted, slot not "
+                "released. Retry.",
+                "id": tenant_id,
+            },
+        )
+    # best-effort 摘 DNAT(与 stop 动作一致:失败不阻断,orphan-reap 兜底)。
+    _hp = item.get("host_port", 0)
+    _gip = item.get("guest_ip", "")
+    if _hp and _gip:
+        ssm_dispatch._ssm_run(host_id, f"({_dnat_remove_all_cmd(_hp, _gip)} || true)")
+
+    # 3) 删本地 VM 目录回收 host 磁盘(休眠的核心目的之一是腾磁盘,不只是账本 slot)。
+    # #422 codex-blocker:stop-vm.sh 只杀 FC 进程、保留 data.ext4/VM 目录 → 只停不删=磁盘
+    # 没回收,且 restore 若回同一 host 会撞残留 data.ext4 绕过 S3 恢复。此刻数据已确认在 S3
+    # (备份 payload_ok=True),删本地盘不丢数据。fail-loud(抄 delete #268):rm 失败=磁盘泄漏,
+    # 回滚状态待重投(status 仍 suspending,VM 已停,重投补删幂等),不推进 suspended。
+    # tenant_id 经 shlex.quote 进 root shell 防注入(纵深:虽已过 registry 正则)。
+    _q_vmd = shlex.quote(f"/data/firecracker-vms/{tenant_id}")
+    if not ssm_dispatch._ssm_run(host_id, f"rm -rf {_q_vmd}"):
+        _rollback()
+        return utils._resp(
+            502,
+            {
+                "error": "suspend disk reclaim (rm -rf) failed (SSM timeout/error); VM "
+                "stopped and backup safe in S3, but local disk not reclaimed. Kept "
+                "status=suspending for re-drive.",
+                "id": tenant_id,
+            },
+        )
+
+    # 4) 释放 host slot(归还容量记账,供新用户调度——休眠的核心目的)。
+    # _release_slot 内部带 >= guard 防负、best-effort 不抛;next_vm_num 不回退(restore 重分配)。
+    scheduling._release_slot(host_id, int(item.get("vcpu", 0)), int(item.get("mem_mb", 0)))
+
+    # 4) 终态:写 restore_backup_key + suspended_at,翻 suspended。此刻 status 仍是我们翻的
+    # suspending(单赢家持有),用 CAS 收尾防中途被改。备份 key 优先用 backup Lambda 回传值,
+    # 回退到按 tenant_id 现查(_resolve_backup),保证 restore 能定位。
+    if not backup_key:
+        backup_key = _resolve_backup(tenant_id) or ""
+    try:
+        clients.tenants_table.update_item(
+            Key={"id": tenant_id},
+            UpdateExpression=(
+                "SET #s = :suspended, restore_backup_key = :bk, suspended_at = :t, "
+                "suspended_from = :prev, updated_at = :t"
+            ),
+            ConditionExpression="#s = :suspending",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":suspended": "suspended",
+                ":suspending": "suspending",
+                ":bk": backup_key,
+                ":prev": prev_status,
+                ":t": utils._now(),
+            },
+        )
+    except clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException:
+        # 中途被别的 op 改(极罕见:suspending 是单赢家态)。VM 已停、slot 已释放、备份在 S3,
+        # 数据安全;状态非预期则 fail-loud 让运维查,不谎报成功。
+        return utils._resp(
+            409,
+            {
+                "error": "suspend finalize lost CAS (status changed mid-suspend); "
+                "VM stopped and backup safe in S3 — inspect tenant state.",
+                "id": tenant_id,
+            },
+        )
+    audit._publish_event(
+        "tenant.suspended", tenant_id, {"backup_key": backup_key, "from": prev_status}
+    )
+    return utils._resp(200, {"id": tenant_id, "status": "suspended"})
+
+
+def _reserve_slot_on(host, vcpu, mem_mb):
+    """#422 — 在 host 上原子认领 vm_num + 容量(CAS)。返回认领的 vm_num,或 None(容量不足/
+    输 CAS 竞争)。与 create 路径的内层 `_reserve_slot`(:1642)、migrate 的
+    `_reserve_migration_slot`(:2408)同款 CAS,为 restore 路径抽出模块级版本(本仓既有模式:
+    同款 CAS 按路径各持一份,避免跨函数闭包依赖)。next_vm_num 单调只增。"""
+    expected = int(host.get("next_vm_num", 1))
+    cap_v = int(int(host["total_vcpu"]) * clients.CPU_OVERCOMMIT_RATIO) - vcpu
+    cap_m = int(int(host["total_mem_mb"]) * clients.MEM_OVERCOMMIT_RATIO) - mem_mb
+    try:
+        r = clients.hosts_table.update_item(
+            Key={"instance_id": host["instance_id"]},
+            UpdateExpression=(
+                "SET used_vcpu = used_vcpu + :v, used_mem_mb = used_mem_mb + :m, "
+                "vm_count = vm_count + :one, next_vm_num = next_vm_num + :one, "
+                "#s = :a REMOVE idle_since"
+            ),
+            ConditionExpression=(
+                "next_vm_num = :expected AND used_vcpu <= :cap_v AND used_mem_mb <= :cap_m"
+            ),
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":v": vcpu, ":m": mem_mb, ":one": 1, ":a": "active",
+                ":expected": expected, ":cap_v": cap_v, ":cap_m": cap_m,
+            },
+            ReturnValues="UPDATED_NEW",
+        )
+        return int(r["Attributes"]["next_vm_num"]) - 1
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return None
+        raise
+
+
+def _restore_reserve_slot(vcpu, mem_mb, tenant_id):
+    """#422 — restore 冷恢复重取 host slot(全新 launch,与 create 同款:找 host → CAS 认领
+    vm_num → 物理 tap 撞号复检)。返回 (host, vm_num) 或 (None, resp) 失败响应。
+    冷恢复的 tap 绑新 vm_num(launch-vm.sh:661 TAP=tap-vm{VM_NUM}),故 phys_vm_num 重分配为
+    新 vm_num,不沿用原值(原值那台 host 的 slot 休眠时已释放,物理 tap 也已回收)。"""
+    host = scheduling._find_host(vcpu, mem_mb)
+    if not host:
+        return None, utils._resp(503, {"error": "no host capacity for restore", "id": tenant_id})
+    vm_num = None
+    for attempt in range(8):
+        claimed = _reserve_slot_on(host, vcpu, mem_mb)
+        if claimed is not None:
+            vm_num = claimed
+            break
+        time.sleep(0.05 * (attempt + 1))
+        host = scheduling._find_host(vcpu, mem_mb)
+        if not host:
+            return None, utils._resp(503, {"error": "no host capacity (contended)", "id": tenant_id})
+    if vm_num is None:
+        return None, utils._resp(503, {"error": "slot allocation contended out", "id": tenant_id})
+    # 物理 tap 撞号复检(no-cross-tenant,与 create :1722 同款):占了就丢号认领下一个。
+    for _skip in range(64):
+        if not _phys_tap_occupied(host["instance_id"], vm_num, exclude_id=tenant_id):
+            break
+        scheduling._release_slot(host["instance_id"], vcpu, mem_mb)
+        claimed = _reserve_slot_on(host, vcpu, mem_mb)
+        if claimed is None:
+            return None, utils._resp(503, {"error": "no free vm slot (phys tap contended)", "id": tenant_id})
+        vm_num = claimed
+    else:
+        scheduling._release_slot(host["instance_id"], vcpu, mem_mb)
+        return None, utils._resp(503, {"error": "unable to find free physical vm slot", "id": tenant_id})
+    return host, vm_num
+
+
+def _tenant_restore(tenant_id, item):
+    """#422 — 恢复一个 suspended 租户到【同一 tenant_id】:从 S3 冷恢复数据盘、重取
+    host+vm_num+slot、挂回原记录,status suspended→restoring→running。冷恢复(会话/上下文
+    不续,只还原数据盘);tenant_id 不变(会议硬要求,维护生命周期链路)。
+
+    fail-closed:launch(带 RESTORE_KEY)失败 → 回滚 restoring→suspended、释放刚取的 slot、
+    不删 S3 备份、502。只有 launch 成功才翻 running。restore_backup_key 从 suspend 时写入的
+    租户记录读(_tenant_suspend 落库)。"""
+    if item.get("status") != "suspended":
+        return utils._resp(
+            409,
+            {
+                "error": f"can only restore a suspended tenant (current: {item.get('status')})",
+                "id": tenant_id,
+            },
+        )
+    backup_key = item.get("restore_backup_key") or _resolve_backup(tenant_id) or ""
+    if not backup_key:
+        return utils._resp(
+            409,
+            {
+                "error": "no backup found for this tenant; cannot restore (data may be "
+                "unrecoverable — do NOT create a blank tenant).",
+                "id": tenant_id,
+            },
+        )
+
+    # 并发闸:CAS suspended → restoring,单赢家(与并发 restore/delete 互斥)。
+    if not _cas_status(tenant_id, "suspended", "restoring"):
+        cur = (
+            clients.tenants_table.get_item(Key={"id": tenant_id}, ConsistentRead=True).get("Item")
+            or {}
+        )
+        cur_s = cur.get("status")
+        if cur_s in ("restoring", "running"):
+            return utils._resp(200, {"id": tenant_id, "status": cur_s})
+        return utils._resp(
+            409, {"error": f"tenant is {cur_s}; restore lost the race", "id": tenant_id}
+        )
+
+    vcpu = int(item.get("vcpu", 0))
+    mem_mb = int(item.get("mem_mb", 0))
+    host, vm_num_or_resp = _restore_reserve_slot(vcpu, mem_mb, tenant_id)
+    if host is None:
+        _cas_status(tenant_id, "restoring", "suspended")  # 回滚,slot 没取到无需释放
+        return vm_num_or_resp
+    vm_num = vm_num_or_resp
+    guest_ip = auth._guest_ip(vm_num)
+    host_port = clients.VM_PORT_BASE + vm_num - 1
+
+    # 冷恢复 launch(带 RESTORE_KEY,launch-vm.sh 从 S3 下载/解密/解压/e2fsck 还原 data.ext4)。
+    # #422 codex-blocker:sync=True 同步等 launch-vm.sh 真跑完返 bool —— 不能用 fire-and-forget
+    # 的 CommandId 就翻 running(那只证明"提交了",VM 可能没起=假成功、VM 缺失、slot 泄漏)。
+    # launch-vm.sh 内部已做:RESTORE_KEY 下载/解密/解压 + e2fsck + status 白名单(已含 restoring)
+    # + 起 FC + DNAT;rc=0 才 True。失败(SSM 超时/launch-vm rc≠0)→ 回滚 suspended + 释放 slot,
+    # 备份完好可重试(no-data-loss)。
+    # #422 codex-blocker:sync=True 同步等 launch-vm.sh 真跑完,返 (ok, rc) —— 不能用
+    # fire-and-forget 的 CommandId 就翻 running(那只证明"提交了",VM 可能没起=假成功)。
+    # launch-vm.sh 内部:RESTORE_KEY 下载/解密/解压 + e2fsck + status 白名单(含 restoring)
+    # + 起 FC + DNAT;rc=0 才 ok。
+    launched, launch_rc = ssm_dispatch._launch_vm(
+        host["instance_id"], tenant_id, vm_num, vcpu, mem_mb, guest_ip, host_port,
+        config_template=item.get("config_template", ""),
+        restore_backup_key=backup_key,
+        # codex round4 #5(no-cross-tenant):必须传租户 effective skills。漏传→空值→launch-vm
+        # 走广播分支 cp 全部共享 skills → 受限租户恢复后越权拿到未授权 skills。与 create :1957 同。
+        scoped_skills=skills._resolve_effective_skills(item),
+        chat_endpoint_enabled=bool(item.get("chat_endpoint_enabled", False)),
+        sync=True,
+    )
+    # 真机-bug 修复(flock 竞争):launch-vm.sh 抢不到同租户 per-tenant flock 时 exit 75
+    # (launch-vm.sh:395,skip 专用哨兵)——意味着【另一次同租户 launch 正在把 VM 拉起】
+    # (SQS FIFO 重投 / 并发)。此时【绝不能回滚】:回滚会释放 slot、翻 suspended,而那次在跑的
+    # launch 随后 DONE → VM 活着但账本已回收+状态 suspended = 状态震荡 + slot 泄漏(真机实测:
+    # restoring↔suspended↔running 反复横跳)。
+    # 处理:保持 restoring(不回滚不释放 slot)+ 返 503。为什么 503 不是 202 —— consumer
+    # (handler.py:1651)只有 code>=500 才把消息留队列重投,4xx/2xx 一律 ack。若返 2xx,这条
+    # 消息被 ack 消费掉;万一持锁的那次 launch 最终没能把状态翻 running(它自己也失败),就无人
+    # 再推进→永久卡 restoring。返 503 让本消息留队列:可见性超时后重投,那时持锁者大概率已跑完
+    # (成功→本次重投读到 running 幂等返回;失败→本次重投自己拿到锁重试),收敛有保证。
+    if not launched and launch_rc == 75:
+        return utils._resp(
+            503,
+            {
+                "id": tenant_id,
+                "status": "restoring",
+                "error": "restore launch is already in progress on the host (flock held by "
+                "a concurrent/redelivered launch); kept restoring, will reconverge on retry",
+            },
+        )
+    if not launched:
+        # 真失败(rc≠0 且≠75,或 SSM 超时 rc=None):launch-vm 可能已起 VM(超时≠没起)。
+        # 直接释放 slot 会留孤儿 VM。回滚前先 stop-vm 清目标(幂等),再释放 slot、回 suspended。
+        ssm_dispatch._ssm_run(host["instance_id"], f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num}")
+        scheduling._release_slot(host["instance_id"], vcpu, mem_mb)
+        _cas_status(tenant_id, "restoring", "suspended")
+        return utils._resp(
+            502,
+            {
+                "error": f"restore launch failed (rc={launch_rc}); target VM stopped, "
+                "rolled back to suspended, slot released, S3 backup intact. Retry.",
+                "id": tenant_id,
+            },
+        )
+
+    # 挂回原 tenant_id:更新 host/vm_num/phys_vm_num(冷恢复重分配)/guest_ip/host_port,翻 running。
+    # CAS 条件 status=restoring(单赢家持有)。清 suspended_at/restore_backup_key/suspended_from。
+    try:
+        clients.tenants_table.update_item(
+            Key={"id": tenant_id},
+            UpdateExpression=(
+                "SET #s = :running, host_id = :h, vm_num = :vn, phys_vm_num = :vn, "
+                "guest_ip = :gip, host_port = :hp, updated_at = :t "
+                "REMOVE suspended_at, restore_backup_key, suspended_from"
+            ),
+            ConditionExpression="#s = :restoring",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":running": "running",
+                ":restoring": "restoring",
+                ":h": host["instance_id"],
+                ":vn": vm_num,
+                ":gip": guest_ip,
+                ":hp": host_port,
+                ":t": utils._now(),
+            },
+        )
+    except clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException:
+        scheduling._release_slot(host["instance_id"], vcpu, mem_mb)
+        return utils._resp(
+            409,
+            {
+                "error": "restore finalize lost CAS (status changed mid-restore); "
+                "inspect tenant state.",
+                "id": tenant_id,
+            },
+        )
+    audit._publish_event(
+        "tenant.restored", tenant_id, {"host_id": host["instance_id"], "vm_num": vm_num}
+    )
+    return utils._resp(
+        200, {"id": tenant_id, "status": "running", "host_id": host["instance_id"]}
+    )
 
 
 def _reserve_migration_slot(target, vcpu, mem_mb, attempts=8):
@@ -2379,6 +3264,10 @@ def tenant_action(tenant_id, action, body=None, event=None):
         "migrate",
         "resize",
         "resize-disk",
+        # #422 — 休眠/恢复是改状态+动 VM 的动作,继承对 deleted/deleting 的 409 终态闸
+        # (已删/删除中的租户不该能 suspend/restore)。
+        "suspend",
+        "restore",
     }
     if action in _mutating_actions and item.get("status") in ("deleted", "deleting"):
         return utils._resp(
@@ -2386,12 +3275,67 @@ def tenant_action(tenant_id, action, body=None, event=None):
             {"error": f"tenant is {item['status']}; cannot {action}", "id": tenant_id},
         )
 
+    # #422 codex round3 #3 — 休眠态(suspending/suspended/restoring)下,常规动 VM 的动作
+    # (start/stop/restart/pause/resume/reset/rebuild/migrate/resize/resize-disk)必须拒绝:
+    # suspended 租户本地无 VM(已删)、host_id 可能指向已释放的旧 slot,对它 restart/pause 会
+    # 走底部通用块无条件覆盖 status(留"无 VM 却 running"或抢占别人 slot 的活 VM=未记账孤儿)。
+    # 仅 suspend/restore 两个动作能作用于休眠态(它们自带精确前置校验:suspend 要 running/
+    # stopped,restore 要 suspended),故从本闸排除。suspend 对 suspended 幂等、restore 对
+    # running 幂等都在各自 helper 内处理。
+    _hibernate_states = ("suspending", "suspended", "restoring")
+    if (
+        action in _mutating_actions
+        and action not in ("suspend", "restore")
+        and item.get("status") in _hibernate_states
+    ):
+        return utils._resp(
+            409,
+            {
+                "error": f"tenant is {item['status']} (hibernated/in-flight); only "
+                f"restore/suspend apply — cannot {action}",
+                "id": tenant_id,
+            },
+        )
+
+    # #411/6.4 codex(harness)— pinned 租户拒绝 rebuild 的 409 必须在【入队前】就返回,否则
+    # 队列开启时 API 先返 202-queued、真正的 409 落在 consumer replay 的 rebuild 分支被
+    # ack-drop,调用方永远收不到 PINNED_NO_REBUILD。故在此(同步 API 路径,入队之前)先判。
+    # 语义见下方 rebuild 分支:rebuild 是 live 租户升 host 当前 flat rootfs,pinned(#394
+    # canary,固定 image_snapshot_time)不适用、且会谎标 host 版本。
+    if action == "rebuild" and (item.get("image_snapshot_time") or "").strip():
+        return utils._resp(
+            409,
+            {
+                "error": (
+                    "tenant is pinned to a fixed image snapshot; rebuild (rolling "
+                    "upgrade to host current rootfs) does not apply — re-pin via the "
+                    "canary flow instead"
+                ),
+                "code": "PINNED_NO_REBUILD",
+                "id": tenant_id,
+            },
+        )
+
     # 控制面重构阶段1 — 产端入队:纯 lifecycle 动作(start/stop/restart/pause/resume)
     # 只是经 SSM 下发、无特殊同步返回值,队列开启时入 SQS 由 consumer 受控并发消费
     # (削峰 + 限流阀,治 1000/s 雪崩),立即返 202。resize/backup/migrate/access 等
     # 有同步返回语义的不入队,保持原同步路径。开关关 → 全走同步(向后兼容)。
     # 防重入:consumer 重放时 event 带 _consumer_ident,不再二次入队。
-    _async_actions = {"start", "stop", "restart", "pause", "resume", "reset", "rebuild"}
+    # #422 — suspend/restore 加入 _async_actions:两者含同步备份/冷恢复(下载解密解压
+    # e2fsck),真机耗时可达 20-30s+(会议压测),撞 API GW 29s 同步硬超时。队列开启时入队
+    # 由 consumer 异步执行(无 29s 限制),立即返 202+轮询(会议"走现有 Job 轮询链");队列
+    # 未开则回退同步(小部署可接受)。consumer 重放带 _consumer_ident,不再二次入队。
+    _async_actions = {
+        "start",
+        "stop",
+        "restart",
+        "pause",
+        "resume",
+        "reset",
+        "rebuild",
+        "suspend",
+        "restore",
+    }
     if (
         action in _async_actions
         and clients.LIFECYCLE_QUEUE_URL
@@ -2746,6 +3690,10 @@ def tenant_action(tenant_id, action, body=None, event=None):
         # stage the new image on hosts → rebuild each tenant to adopt it. Same
         # mechanism as reset, but the intent is "upgrade", and we record the new
         # rootfs_version on the tenant so GET /tenants shows the post-upgrade drift.
+        # 注:pinned 租户(#394 canary,image_snapshot_time 非空)拒绝 rebuild 的 409 已在
+        # 上方【入队前】统一返回(codex harness blocker:队列开启时必须同步返回,否则 202
+        # 后 consumer 才判 409 被 ack-drop)。走到这里的必是 live 租户(无 image_snapshot_time),
+        # 故 (deleted)-inode 采用校验对 flat mv 换盘可靠、不会 pinned 误判。
         vm_num = int(item.get("vm_num", 1))
         guest_ip = item.get("guest_ip", "")
         host_port = item.get("host_port", "")
@@ -2761,15 +3709,16 @@ def tenant_action(tenant_id, action, body=None, event=None):
             if guest_ip and host_port
             else ""
         )
-        full_cmd = f"{stop_cmd} && {drop_overlay} && sleep 2 && {launch_cmd}"
-        if dnat_cmd:
-            full_cmd += f" && {dnat_cmd}"
-        # #304 — 升级采用校验:relaunch 后确认新 FC 打开的 rootfs FD **不是
-        # (deleted)** 旧 inode。refresh_rootfs 用 mv 原子换 rootfs,若旧 FC 没被
-        # stop-vm 真杀掉(cmdline 不匹配/race),新旧并存时老进程抱 (deleted) 旧
-        # inode → VM 跑旧代码,而下面却把 rootfs_version 标成新的 = 谎报漂移。
-        # 扫该租户 fc.sock 进程的 fd,指向 openclaw-rootfs.ext4 (deleted) 就 exit 1
-        # → _ssm_run 返回 False → _rebuild_verified=False → 下面不谎报版本。
+        # #304 升级采用校验:relaunch 后新 FC 打开的 rootfs FD 不是 (deleted) 旧 inode。
+        # refresh_rootfs 用 mv 原子换 rootfs;若旧 FC 没被 stop-vm 真杀掉(cmdline 不匹配/race),
+        # 新旧并存时老进程抱 (deleted) 旧 inode → VM 跑旧代码,而下面却把 rootfs_version 标成新的
+        # = 谎报漂移。扫该租户 fc.sock 进程的 fd,指向 openclaw-rootfs.ext4 (deleted) 就 exit 1
+        # → _ssm_run 返回 False → _rebuild_verified=False → 下面不谎报版本(#411/6.4 改为标
+        # rebuild_status=failed + 发 rebuild_failed 事件,GET /tenants 可见,运维手动重试)。
+        # 注:#411/6.4 只做【可观测】——不在 SSM 命令里加"重投短路/完成标记"这类自动收敛逻辑
+        # (那需要 host-local slot identity + 幂等 op_id,连续 8 轮 Codex 证明其表面积过大、
+        # 且引入过丢数据/shell 注入类缺陷),自动重投到收敛单独跟踪(见下方 rebuild_status 注释
+        # 指向的 follow-up issue)。这里保持"破坏性 relaunch 跑一次 + 采用校验"的既有语义不变。
         _sock = f"/data/firecracker-vms/{tenant_id}/fc.sock"
         verify_cmd = (
             f"_fpid=$(pgrep -f 'api-sock {_sock}' | head -1); "
@@ -2778,6 +3727,9 @@ def tenant_action(tenant_id, action, body=None, event=None):
             "echo 'rebuild-verify: FC still on DELETED old rootfs inode — upgrade did NOT take' >&2; exit 1; fi; "
             "echo rebuild-verify-ok"
         )
+        full_cmd = f"{stop_cmd} && {drop_overlay} && sleep 2 && {launch_cmd}"
+        if dnat_cmd:
+            full_cmd += f" && {dnat_cmd}"
         full_cmd += f" && {verify_cmd}"
         _rebuild_verified = ssm_dispatch._ssm_run(
             item["host_id"], full_cmd, timeout=300
@@ -2799,6 +3751,16 @@ def tenant_action(tenant_id, action, body=None, event=None):
             f'-H "Content-Type: application/json" -d \'{{"state":"Resumed"}}\'',
         )
         new_status = "running"
+    elif action == "suspend":
+        # #422 — 休眠:释放 host slot 供新用户调度,同时保住数据可恢复。冷恢复语义
+        # (备份数据盘到 S3 + 停 VM + 释放 slot,保留 DDB 记录与 tenant_id;恢复走 restore)。
+        # 独立同步分支(不落底部通用 update):有 fail-closed 备份+回滚语义,与 backup/migrate 同类。
+        return _tenant_suspend(tenant_id, item)
+    elif action == "restore":
+        # #422 — 恢复:唤醒一个 suspended 租户到【同一 tenant_id】,从 S3 冷恢复数据盘、
+        # 重取 host+vm_num+slot、挂回原记录。走 create 同款冷恢复链(_resolve_backup +
+        # launch-vm RESTORE_KEY),但不新建租户。
+        return _tenant_restore(tenant_id, item)
     elif action == "backup":
         # Async invoke Backup Lambda with single tenant
         lambda_client = boto3.client("lambda")
@@ -2890,6 +3852,10 @@ def tenant_action(tenant_id, action, body=None, event=None):
     _stamp_rootfs = action == "reset" or (
         action == "rebuild" and locals().get("_rebuild_verified", False)
     )
+    # codex#6 — 多个可选片段(rootfs 投影键 + rebuild_status 标记)可能同时要 REMOVE。
+    # DynamoDB UpdateExpression 只允许一个 REMOVE 子句,拼两个(", REMOVE ... REMOVE ...")
+    # 是非法语法 → update 抛错、消息进 DLQ。统一收集 SET/REMOVE 片段,各出一个子句。
+    _remove_attrs: list[str] = []
     if _stamp_rootfs:
         host = clients.hosts_table.get_item(
             Key={"instance_id": item["host_id"]}, ConsistentRead=True
@@ -2900,8 +3866,28 @@ def tenant_action(tenant_id, action, body=None, event=None):
             update_expr += ", q_rootfs_version = :qrv"
             expr_values[":qrv"] = expr_values[":rv"]
         else:
-            update_expr += " REMOVE q_rootfs_version"
+            _remove_attrs.append("q_rootfs_version")
 
+    # #411/6.4 — rebuild 采用校验的结果必须【可见】,不再静默停在旧版本。真机(新加坡
+    # 长轮询 x3)坐实约 1/3 的 rebuild:VM 真重启了(FC pid 变),但 _ssm_run 在 300s 内
+    # 没拿到 Success 回执(SSM lag / consumer 180s 先超时)→ _rebuild_verified=False →
+    # 上面不标 rootfs_version,而 API 仍返 200-running → 客户看不出"没升成",误判卡住。
+    # 沿用 migrate 的 migration_failed 约定:校验未过就标 rebuild_status=failed(+reason);
+    # 校验过则清掉陈旧标记。这不改 SSM/consumer 时序本身(那两条对齐在下方 CDK/consumer 处)。
+    if action == "rebuild":
+        if locals().get("_rebuild_verified", False):
+            _remove_attrs.extend(["rebuild_status", "rebuild_failed_reason"])
+        else:
+            update_expr += ", rebuild_status = :rbs, rebuild_failed_reason = :rbr"
+            expr_values[":rbs"] = "failed"
+            expr_values[":rbr"] = (
+                "relaunch adoption not verified within timeout "
+                "(SSM lag or old FC still on prior rootfs inode); "
+                "rootfs_version not advanced — retry rebuild"
+            )
+
+    if _remove_attrs:
+        update_expr += " REMOVE " + ", ".join(_remove_attrs)
     clients.tenants_table.update_item(
         Key={"id": tenant_id},
         UpdateExpression=update_expr,
@@ -2919,10 +3905,25 @@ def tenant_action(tenant_id, action, body=None, event=None):
         "reset": "tenant.reset",
         "rebuild": "tenant.rebuilt",
     }
-    event_name = _action_to_event.get(action, f"tenant.{new_status}")
+    # codex#8 — rebuild 未采用校验时,绝不发 tenant.rebuilt 成功事件(否则谎报一次成功)。
+    # 改发 tenant.rebuild_failed,与上面 rebuild_status=failed 标记一致(#411/6.4 可观测)。
+    _rebuild_unverified = action == "rebuild" and not locals().get(
+        "_rebuild_verified", False
+    )
+    if _rebuild_unverified:
+        event_name = "tenant.rebuild_failed"
+    else:
+        event_name = _action_to_event.get(action, f"tenant.{new_status}")
     audit._publish_event(
         event_name, tenant_id, {"action": action, "status": new_status}
     )
+    # #411/6.4 —【可观测,不自动重投】。rebuild 采用未校验通过时:上面已标
+    # rebuild_status=failed(+reason)并发 tenant.rebuild_failed 事件,GET /tenants 立即
+    # 可见"这台没升成"(治真机 1/3 版本静默不落的【用户可见性】)。此处返回 200(不是 503):
+    # 不触发 consumer 的自动重投,由运维/客户看到 rebuild_status=failed 后手动重试。
+    # 自动重投到收敛(503→SQS 重投重跑 rebuild)需要 host-local slot identity + 幂等 op_id
+    # 才能不丢数据/不误跳过(连续 8 轮 Codex 复审证明其表面积过大且易引入丢数据/shell 注入
+    # 类缺陷),单独跟踪(follow-up issue,同 #412 量级),不并进本 MR。
     return utils._resp(200, {"id": tenant_id, "status": new_status})
 
 

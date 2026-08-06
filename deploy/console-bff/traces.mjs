@@ -2,7 +2,7 @@
 // Pure business logic (chunking, filter build, span tree parse) lives here so
 // tests can inject a fake xray adapter without pulling the real SDK.
 //
-// Three endpoints (see .kiro/specs/platform-observability/requirements.md R6):
+// Three endpoints (see engineering/00-knowledge-base/SPEC/kiro/platform-observability/requirements.md R6):
 //   GET /capi/traces           — GetTraceSummaries  (list + filter + paging)
 //   GET /capi/traces/detail    — BatchGetTraces     (≤5 ids/call, span tree)
 //   GET /capi/traces/map       — GetServiceGraph    (adjacency, pass-through)

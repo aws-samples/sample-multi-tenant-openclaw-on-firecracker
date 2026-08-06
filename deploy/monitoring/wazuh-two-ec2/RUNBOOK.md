@@ -63,7 +63,8 @@ Run from the bastion (has admin + `aws`):
 
 ```bash
 cd deploy/monitoring/wazuh-two-ec2
-./setup-wazuh-two-ec2.sh        # creates 2 SGs, launches both EC2
+VPC_ID=<vpc-id> PRIVATE_SUBNET=<subnet-id> BASTION_SG=<sg-id> \
+  AMI_ID=<ubuntu-ami-id> KEY_NAME=<ec2-key-name> ./setup-wazuh-two-ec2.sh
 ```
 
 Defaults target the verified `ap-southeast-1` reference env; override via env vars

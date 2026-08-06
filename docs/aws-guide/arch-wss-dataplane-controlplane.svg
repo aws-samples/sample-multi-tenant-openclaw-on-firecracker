@@ -26,7 +26,7 @@
   <!-- BGWS -->
   <rect x="280" y="110" width="220" height="300" rx="12" fill="#fde9d6" stroke="#ec7211" stroke-width="2.5"/>
   <text x="390" y="136" text-anchor="middle" fill="#7a3d00" font-size="15.5" font-weight="700">BGWS 平台网关</text>
-  <text x="390" y="154" text-anchor="middle" fill="#8a5a1a" font-size="10.5">docs/backend · server.mjs</text>
+  <text x="390" y="154" text-anchor="middle" fill="#8a5a1a" font-size="10.5">engineering/backend · server.mjs</text>
   <rect x="296" y="166" width="188" height="108" rx="8" fill="#fff4e8" stroke="#ec7211" stroke-width="1.2"/>
   <text x="390" y="185" text-anchor="middle" fill="#7a3d00" font-size="12" font-weight="700">① 数据面 WS 中继</text>
   <text x="390" y="204" text-anchor="middle" fill="#5a4630" font-size="10.5">lib/gw-ws.mjs</text>
@@ -141,7 +141,7 @@
   <text x="58" y="740" fill="#c4a8ff" font-size="11.5" font-weight="700">注入的 items(name → 加密方式):</text>
   <text x="58" y="759" fill="#c3ccd8" font-size="11">parentAccessKey / parentSecretKey  <tspan fill="#c4a8ff">RSA-OAEP 非对称</tspan></text>
   <text x="58" y="777" fill="#c3ccd8" font-size="11">subAccessKey / subSecretKey        <tspan fill="#c4a8ff">RSA-OAEP 非对称</tspan></text>
-  <text x="58" y="" fill="#c3ccd8" font-size="11">WEBSEARCH_TOKEN                    <tspan fill="#7fe0a0">KMS 对称信封(claw CMK)</tspan></text>
+  <text x="58" y="795" fill="#c3ccd8" font-size="11">WEBSEARCH_TOKEN                    <tspan fill="#7fe0a0">KMS 对称信封(claw CMK)</tspan></text>
   <text x="58" y="811" fill="#8b97a7" font-size="10.5">值本体 AES-256-GCM,AAD 绑 owner_id+name(#189)</text>
 
   <!-- 中间箭头 -->
@@ -264,6 +264,6 @@
   <text x="1060" y="1043" fill="#e0955a" font-size="10.5">橙字/#189 = 目标态(ADR Proposed,未实现)</text>
   <text x="58" y="1066" fill="#8b97a7" font-size="10">现状字段核实:litellm_vkey(tenant_service.py:87/956) · gateway_token 密文(:89/171/372) · device 三件套(:161-168) · injected_credentials 通用信封(core/utils.py:123)</text>
   <text x="58" y="1084" fill="#e0955a" font-size="10">目标态(用户本次给的具体化,当前代码未落地):parent/sub AccessKey+SecretKey 非对称 · WEBSEARCH_TOKEN 对称 · scheme=asymmetric-v1(ADR-cred-injection-asymmetric-v1,Proposed)</text>
-  <text x="1230" y="1066" fill="#6f7c8e" font-size="9.5">来源:docs/backend/lib/{gw-ws,ctrl-plane}.mjs</text>
+  <text x="1230" y="1066" fill="#6f7c8e" font-size="9.5">来源:engineering/backend/lib/{gw-ws,ctrl-plane}.mjs</text>
   <text x="1230" y="1082" fill="#6f7c8e" font-size="9.5">tenant_service.py · ADR · 2026-07-09 核</text>
 </svg>

@@ -9,13 +9,14 @@ from core.utils import _err, _resp
 
 
 def _normalize_decimal_numbers(value):
-    """Convert DynamoDB Decimal values into JSON numbers recursively."""
+    """Convert DynamoDB Decimal values into JSON-native numbers recursively."""
     if isinstance(value, Decimal):
-        if value == value.to_integral_value():
-            return int(value)
-        return float(value)
+        return int(value) if value == value.to_integral_value() else float(value)
     if isinstance(value, dict):
-        return {key: _normalize_decimal_numbers(item) for key, item in value.items()}
+        return {
+            key: _normalize_decimal_numbers(item)
+            for key, item in value.items()
+        }
     if isinstance(value, list):
         return [_normalize_decimal_numbers(item) for item in value]
     return value

@@ -350,6 +350,38 @@ def build_storage(self, ctx):
         point_in_time_recovery_specification=_pitr_spec,
     )
 
+    # #394 step1(ADR §4.4)· 持久化 pull Job 表。
+    image_jobs_table = dynamodb.Table(
+        self,
+        "ImageJobs",
+        table_name="openclaw-image-jobs",
+        partition_key=dynamodb.Attribute(
+            name="job_id", type=dynamodb.AttributeType.STRING
+        ),
+        billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+        removal_policy=self._stateful_removal,
+        point_in_time_recovery_specification=_pitr_spec,
+        time_to_live_attribute="expires_at",
+    )
+    image_jobs_table.add_global_secondary_index(
+        index_name="gsi_idempotency",
+        partition_key=dynamodb.Attribute(
+            name="instance_id", type=dynamodb.AttributeType.STRING
+        ),
+        sort_key=dynamodb.Attribute(
+            name="idempotency_key", type=dynamodb.AttributeType.STRING
+        ),
+    )
+    image_jobs_table.add_global_secondary_index(
+        index_name="gsi_host_created",
+        partition_key=dynamodb.Attribute(
+            name="instance_id", type=dynamodb.AttributeType.STRING
+        ),
+        sort_key=dynamodb.Attribute(
+            name="created_at", type=dynamodb.AttributeType.STRING
+        ),
+    )
+
     tenant_stats_table = dynamodb.Table(
         self,
         "TenantStats",
@@ -595,4 +627,5 @@ def build_storage(self, ctx):
     ctx.tenant_secrets_table = locals().get("tenant_secrets_table")
     ctx.tenants_table = locals().get("tenants_table")
     ctx.version_snapshots_table = locals().get("version_snapshots_table")  # #217 V2
+    ctx.image_jobs_table = locals().get("image_jobs_table")  # #394 step1 pull Job
     ctx.tenant_stats_table = locals().get("tenant_stats_table")

@@ -12,6 +12,12 @@
 # Contract (env set by caller):
 #   FB_ROLE               edge | host — selects S3 subprefix + local fallback dir
 #   LOGGING_ENABLED       true|false (default true); false = skip entirely
+#   FB_INSTALL_ONLY       1 = stop after the package install, write no config (#389 v2).
+#                         Golden-image bake needs the package but MUST NOT bake the
+#                         config: it carries per-deployment Firehose stream names, and
+#                         an AMI is shared by the whole fleet. Boot then renders the
+#                         config through a normal (non-install-only) call, which is a
+#                         no-op on the install step because that is already guarded.
 #   ASSETS_BUCKET         S3 bucket holding deployment/observability/fluent-bit/
 #   AWS_REGION            region for s3 cp + Fluent Bit output
 #   FB_LOCAL_DIR          local fallback config dir (edge only; host has none)
@@ -37,7 +43,17 @@ fi
 FB_REGION="${FB_REGION:-${AWS_REGION:-ap-southeast-1}}"
 
 # ── 1. Install Fluent Bit (Ubuntu apt / AL2023 dnf) ──────────────────────
-if ! command -v fluent-bit >/dev/null 2>&1; then
+# The official package installs the binary at /opt/fluent-bit/bin/fluent-bit, which is NOT
+# on PATH (真机 2026-08-05, `dpkg -L fluent-bit` on Ubuntu 24.04 arm64; the AL2023 package
+# uses the same prefix). So `command -v fluent-bit` alone reports "absent" on a machine that
+# already has it — on a golden AMI that means every boot re-runs apt-get update + install,
+# i.e. the zero-download boot path this whole block exists for is silently broken. Check the
+# packaged location first, keep the PATH probe for a self-built or relocated binary.
+fb_installed() {
+    [[ -x /opt/fluent-bit/bin/fluent-bit ]] || command -v fluent-bit >/dev/null 2>&1
+}
+
+if ! fb_installed; then
     ARCH_DEB="amd64"; [[ "$(uname -m)" == "aarch64" || "$(uname -m)" == "arm64" ]] && ARCH_DEB="arm64"
     if grep -qi ubuntu /etc/os-release 2>/dev/null; then
         curl -fsSL https://packages.fluentbit.io/fluentbit.key \
@@ -64,11 +80,20 @@ FBREPO
     fi
 fi
 
+if [[ "${FB_INSTALL_ONLY:-0}" == "1" ]]; then
+    # #389 v2: package installed, nothing configured or started. Deliberately before the
+    # config pull so a bake needs neither ASSETS_BUCKET nor network S3 access, and cannot
+    # accidentally capture another deployment's stream names into a shared image.
+    log "FB_INSTALL_ONLY=1; package installed, skipping config + enable (bake mode)"
+    exit 0
+fi
+
 # ── 2. Deploy config: pull latest from S3, fall back to baked local copy ──
 # S3-asset first (下发新版无需重烤 AMI); on miss fall back to FB_LOCAL_DIR
 # (edge ships a baked copy). Host has no local dir → S3 miss is fail-loud.
-FB_CONF_DIR=/etc/fluent-bit
-mkdir -p "$FB_CONF_DIR" /var/lib/fluent-bit/storage
+FB_CONF_DIR="${FB_CONF_DIR:-/etc/fluent-bit}"
+FB_STORAGE_DIR="${FB_STORAGE_DIR:-/var/lib/fluent-bit/storage}"
+mkdir -p "$FB_CONF_DIR" "$FB_STORAGE_DIR"
 _s3_prefix="deployment/observability/fluent-bit/${FB_ROLE}"
 if [[ -n "${ASSETS_BUCKET:-}" ]] && \
    aws s3 cp "s3://${ASSETS_BUCKET}/${_s3_prefix}/" "$FB_CONF_DIR/" \
@@ -91,8 +116,6 @@ while IFS='=' read -r _name _val; do
     sed -i "s|\${${_name}}|${_val}|g" "$FB_CONF_DIR/fluent-bit.conf"
 done < <(env)
 
-# Refuse the exact Singapore failure mode: an omitted FB_STREAM rendered
-# `delivery_stream` empty and systemd then failed on every edge.
 if grep -Eq '\$\{FB_[A-Z0-9_]+\}' "$FB_CONF_DIR/fluent-bit.conf"; then
     grep -nE '\$\{FB_[A-Z0-9_]+\}' "$FB_CONF_DIR/fluent-bit.conf" >&2 || true
     die "unresolved FB_* placeholder(s) remain in fluent-bit.conf"

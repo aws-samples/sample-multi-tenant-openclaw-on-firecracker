@@ -62,7 +62,7 @@ window.ocCore = {
     localStorage.setItem("oc_api_url", this.apiUrl);
     localStorage.setItem("oc_api_key", this.apiKey);
   },
-  async api(method, path, body) {
+  async api(method, path, body, extraHeaders) {
     const url =
       this.apiUrl.replace(/\/+$/, "") + "/" + path.replace(/^\/+/, "");
     const headers = {
@@ -73,6 +73,9 @@ window.ocCore = {
     // Without this header every write is downgraded to viewer and 403s.
     const token = localStorage.getItem("oc_id_token");
     if (token) headers["Authorization"] = "Bearer " + token;
+    // #394 — optional per-call headers (e.g. If-Match / Idempotency-Key for slot ops).
+    // Merged last so callers can add, but never drop x-api-key / Authorization above.
+    if (extraHeaders) Object.assign(headers, extraHeaders);
     const opts = { method, headers };
     if (body) opts.body = JSON.stringify(body);
     const r = await fetch(url, opts);

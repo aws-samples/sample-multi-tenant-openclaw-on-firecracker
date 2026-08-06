@@ -44,7 +44,7 @@ AWS Identity and Access Management (IAM) 角色允许客户向 AWS 服务和服�
 
 ### 身份与访问控制
 
-平台的身份分两个平面。**数据面**以 OpenClaw 原生 Ed25519 device 非对称认证为身份根：平台后端代持 device 私钥、公钥冷注入 microVM，microVM gateway 端验签；不依赖 Amazon Cognito。**控制面**以 `x-api-key` 为第一道门，启用 RBAC 时叠加 Amazon Cognito 令牌验签（RS256 + JWKS），验签失败一律降级到最小权限（只读 viewer）。平台默认启用基于角色的访问控制（RBAC，`console_auth.rbac_enabled` 默认 `true`），强制按路由的角色检查与资源属主检查；即使关闭 RBAC，资源属主（`owner_id`）检查仍独立生效。Amazon Cognito 在当前部署代码中仅用于控制面 console 登录（默认关闭）。
+平台的身份分两个平面。**数据面**以 OpenClaw 原生 Ed25519 device 非对称认证为身份根：平台后端代持 device 私钥、公钥冷注入 microVM，microVM gateway 端验签；不依赖 Amazon Cognito。**控制面**要求 `x-api-key` 做 usage-plan 客户标识，并以 Cognito、IAM 或 Lambda authorizer 等机制承担真实身份验证；Lambda 内 RBAC、owner 与 platform scope 执行授权。仓库默认 `default_no_jwt_role=viewer`，无 Bearer 只能读。Amazon Cognito console 登录默认关闭。
 
 ### 网络与公网暴露
 

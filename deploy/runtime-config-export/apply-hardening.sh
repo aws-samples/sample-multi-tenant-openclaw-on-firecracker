@@ -6,7 +6,7 @@
 # 禁账号间拷数据:脚本只读本仓库的 JSON,在目标账号用 CLI create,不从旧账号 API 拉。
 #
 # 用法: ./apply-hardening.sh <PROFILE> [REGION]
-#   ./apply-hardening.sh <aws-profile> ap-southeast-1
+#   ./apply-hardening.sh ${AWS_PROFILE} ap-southeast-1
 #
 # 产出:① Bedrock Guardrail(OWASP 5层)+ 版本,打印 guardrailId/version 供 LiteLLM/镜像引用
 #       ② DNS Firewall domain list(block-c2)+ rule group,关联到 VPC(VPC id 自动发现)
@@ -78,13 +78,15 @@ if [ "$EXIST_ID" != "None" ] && [ -n "$EXIST_ID" ]; then
   echo "  已存在 guardrail $GR_NAME ($EXIST_ID) — 跳过创建(幂等);如要更新用 update-guardrail"
   GID="$EXIST_ID"
 else
-  # 去品牌收敛(issue #24):存量账号可能有旧品牌名的 guardrail(去品牌前建的,如
-  # 旧的带品牌后缀的名)。若存在,原地 update-guardrail 改名到中性名(id 不变
+  # 去品牌收敛(issue #24):存量账号可能有上一版中性名的 guardrail。只匹配明确旧名,
+  # 不能用 `contains("-ai-chat-")` 猜测,否则会覆盖账号里另一个无关 Guardrail。
+  # 若存在,原地 update-guardrail 改名到新中性名(id 不变
   # → LiteLLM/镜像的 guardrailIdentifier 引用不断),而不是另建一个 claw-* 留孤儿。
   # 用同一份 $GR_INPUT(name 已是中性名 + 完整 policy)做 update,replace 语义下 policy 零削减。
-  # 探测规则:名字含 "-ai-chat-" 但 name 不等于目标中性名 = 旧命名残留。
+  # 更老的部署可显式传 LEGACY_GUARDRAIL_NAME,但仍按完整名称精确匹配。
+  LEGACY_GR_NAME="${LEGACY_GUARDRAIL_NAME:-claw-ai-chat-exchange-grade}"
   LEGACY_ID=$($AWS bedrock list-guardrails \
-    --query "guardrails[?contains(name,'-ai-chat-') && name!='$GR_NAME'].id|[0]" \
+    --query "guardrails[?name=='$LEGACY_GR_NAME'].id|[0]" \
     --output text 2>/dev/null || echo "None")
   if [ "$LEGACY_ID" != "None" ] && [ -n "$LEGACY_ID" ]; then
     LEGACY_NAME=$($AWS bedrock get-guardrail --guardrail-identifier "$LEGACY_ID" --guardrail-version DRAFT --query name --output text 2>/dev/null || echo "?")

@@ -44,7 +44,7 @@ wait_gsi_active() {
     status="$(gsi_status "$idx")"
     [ "$status" = "ACTIVE" ] && return 0
     case "$status" in
-      CREATING|UPDATING) ;;
+      CREATING|UPDATING|None) ;; # update-table acceptance can precede describe visibility
       *) echo "FATAL: GSI $idx entered unexpected status $status" >&2; return 1 ;;
     esac
     sleep 10

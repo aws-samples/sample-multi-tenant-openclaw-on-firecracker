@@ -24,7 +24,7 @@
       "sha256": "89526460d1e16a9dd3a3bf35fce844245e52f1795a015361d10674c525dfd036"
     },
     "lib/apply-image-jobs-table.sh": {
-      "sha256": "305c00f38ae8cfa66ba08991ae4998f79c4c66088b7d753c00935f46bf43c4e8"
+      "sha256": "3f9c91a4806d30ee0d632e82ee3eb12c56ca6cc5d2249fca0aa6179af5057a23"
     },
     "lib/image-routes.spec.json": {
       "sha256": "89e8ec5fc34a202c3aa79645028042da9772f4324daf9d61aceca5f51ab5e314"

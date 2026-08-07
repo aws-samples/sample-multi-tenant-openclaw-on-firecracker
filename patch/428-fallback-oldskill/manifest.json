@@ -30,7 +30,7 @@
       "sha256": "89e8ec5fc34a202c3aa79645028042da9772f4324daf9d61aceca5f51ab5e314"
     },
     "lib/overlay-lambda.sh": {
-      "sha256": "66d4ca5d21c675bafdf0836f33917eb7e21bd32a71ac1f957d92186600530e60"
+      "sha256": "5e70d5d4a7a00a2cafca7e152642ba2e4d9dc2bc737bfab013b25ede20605a62"
     }
   },
   "paths": {

@@ -16,6 +16,8 @@ set -euo pipefail
 CMD="${1:?usage: apply-image-jobs-table.sh <apply|verify|rollback> <region>}"
 REGION="${2:?region required}"
 TABLE="openclaw-image-jobs"
+STATE_FILE="./.image-jobs-apply-state"
+GSI_WAIT_SECONDS="${OC_GSI_WAIT_SECONDS:-1800}"
 
 ddb() { aws dynamodb "$@" --table-name "$TABLE" --region "$REGION" --output json; }
 
@@ -35,19 +37,50 @@ wait_table_active() {
 }
 
 wait_gsi_active() {
-  # poll until the named GSI reports ACTIVE (create-GSI is async; no native waiter)
-  local idx="$1" i
-  for i in $(seq 1 60); do
-    [ "$(gsi_status "$idx")" = "ACTIVE" ] && return 0
+  # A GSI build is service-controlled and can exceed one process window.
+  local idx="$1" deadline status
+  deadline=$((SECONDS + GSI_WAIT_SECONDS))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    status="$(gsi_status "$idx")"
+    [ "$status" = "ACTIVE" ] && return 0
+    case "$status" in
+      CREATING|UPDATING) ;;
+      *) echo "FATAL: GSI $idx entered unexpected status $status" >&2; return 1 ;;
+    esac
     sleep 10
   done
-  echo "FATAL: GSI $idx did not reach ACTIVE within the wait window" >&2
+  echo "FATAL: GSI $idx did not reach ACTIVE within ${GSI_WAIT_SECONDS}s; rerun apply in this same directory to resume" >&2
   return 1
+}
+
+ensure_gsi() {
+  local idx="$1" updates="$2" status
+  shift 2
+  status="$(gsi_status "$idx")"
+  case "$status" in
+    None)
+      echo "[image-jobs] creating GSI $idx"
+      ddb update-table \
+        --attribute-definitions "$@" \
+        --global-secondary-index-updates "$updates" >/dev/null
+      wait_gsi_active "$idx"
+      ;;
+    CREATING|UPDATING)
+      echo "[image-jobs] resuming wait for GSI $idx ($status)"
+      wait_gsi_active "$idx"
+      ;;
+    ACTIVE)
+      echo "[image-jobs] GSI $idx already ACTIVE"
+      ;;
+    *)
+      echo "FATAL: GSI $idx has unsupported status $status" >&2
+      return 1
+      ;;
+  esac
 }
 
 case "$CMD" in
 apply)
-  created_table=false
   if [ "$(table_status)" = "ABSENT" ]; then
     echo "[image-jobs] creating table $TABLE (HASH job_id, PAY_PER_REQUEST)"
     ddb create-table \
@@ -55,12 +88,15 @@ apply)
       --key-schema AttributeName=job_id,KeyType=HASH \
       --billing-mode PAY_PER_REQUEST >/dev/null
     wait_table_active
-    created_table=true
     # record the rollback anchor: ONLY a table we created is deletable on rollback.
-    echo "created_table=true" > "./.image-jobs-apply-state"
+    echo "created_table=true" > "$STATE_FILE"
   else
-    echo "[image-jobs] table $TABLE exists — adopt (RETAIN on rollback)"
-    echo "created_table=false" > "./.image-jobs-apply-state"
+    if [ -f "$STATE_FILE" ] && grep -q '^created_table=true$' "$STATE_FILE"; then
+      echo "[image-jobs] table $TABLE exists — resume this run's created table"
+    else
+      echo "[image-jobs] table $TABLE exists — adopt (RETAIN on rollback)"
+      echo "created_table=false" > "$STATE_FILE"
+    fi
   fi
 
   # TTL on expires_at (idempotent: enabling an already-enabled TTL is a no-op error we tolerate)
@@ -72,23 +108,15 @@ apply)
       --time-to-live-specification "Enabled=true,AttributeName=expires_at" >/dev/null
   fi
 
-  # gsi_idempotency (HASH instance_id, RANGE idempotency_key) — only if absent
-  if [ "$(gsi_status gsi_idempotency)" = "None" ]; then
-    echo "[image-jobs] creating GSI gsi_idempotency"
-    ddb update-table \
-      --attribute-definitions AttributeName=instance_id,AttributeType=S AttributeName=idempotency_key,AttributeType=S \
-      --global-secondary-index-updates '[{"Create":{"IndexName":"gsi_idempotency","KeySchema":[{"AttributeName":"instance_id","KeyType":"HASH"},{"AttributeName":"idempotency_key","KeyType":"RANGE"}],"Projection":{"ProjectionType":"ALL"}}}]' >/dev/null
-    wait_gsi_active gsi_idempotency
-  fi
+  ensure_gsi gsi_idempotency \
+    '[{"Create":{"IndexName":"gsi_idempotency","KeySchema":[{"AttributeName":"instance_id","KeyType":"HASH"},{"AttributeName":"idempotency_key","KeyType":"RANGE"}],"Projection":{"ProjectionType":"ALL"}}}]' \
+    AttributeName=instance_id,AttributeType=S \
+    AttributeName=idempotency_key,AttributeType=S
 
-  # gsi_host_created (HASH instance_id, RANGE created_at) — only if absent
-  if [ "$(gsi_status gsi_host_created)" = "None" ]; then
-    echo "[image-jobs] creating GSI gsi_host_created"
-    ddb update-table \
-      --attribute-definitions AttributeName=instance_id,AttributeType=S AttributeName=created_at,AttributeType=S \
-      --global-secondary-index-updates '[{"Create":{"IndexName":"gsi_host_created","KeySchema":[{"AttributeName":"instance_id","KeyType":"HASH"},{"AttributeName":"created_at","KeyType":"RANGE"}],"Projection":{"ProjectionType":"ALL"}}}]' >/dev/null
-    wait_gsi_active gsi_host_created
-  fi
+  ensure_gsi gsi_host_created \
+    '[{"Create":{"IndexName":"gsi_host_created","KeySchema":[{"AttributeName":"instance_id","KeyType":"HASH"},{"AttributeName":"created_at","KeyType":"RANGE"}],"Projection":{"ProjectionType":"ALL"}}}]' \
+    AttributeName=instance_id,AttributeType=S \
+    AttributeName=created_at,AttributeType=S
   echo "PASS: $TABLE ready (table + gsi_idempotency + gsi_host_created + TTL expires_at)"
   ;;
 
@@ -105,7 +133,7 @@ verify)
 
 rollback)
   # RESTORE only a table WE created this run; an adopted pre-existing table is RETAIN.
-  if [ -f "./.image-jobs-apply-state" ] && grep -q "created_table=true" "./.image-jobs-apply-state"; then
+  if [ -f "$STATE_FILE" ] && grep -q "^created_table=true$" "$STATE_FILE"; then
     echo "[image-jobs] rollback: deleting the table this run created"
     aws dynamodb delete-table --table-name "$TABLE" --region "$REGION" --output json >/dev/null
     echo "PASS: deleted $TABLE (created by this run)"

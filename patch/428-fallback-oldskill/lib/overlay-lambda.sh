@@ -23,10 +23,13 @@ set -euo pipefail
 CMD="${1:?usage: overlay-lambda.sh <apply|verify|rollback> ...}"
 
 fn_codesha() {
-  local qualifier_args=()
-  [ -z "${3:-}" ] || qualifier_args=(--qualifier "$3")
-  aws lambda get-function --function-name "$1" "${qualifier_args[@]}" --region "$2" \
-    --query 'Configuration.CodeSha256' --output text
+  if [ -n "${3:-}" ]; then
+    aws lambda get-function --function-name "$1" --qualifier "$3" --region "$2" \
+      --query 'Configuration.CodeSha256' --output text
+  else
+    aws lambda get-function --function-name "$1" --region "$2" \
+      --query 'Configuration.CodeSha256' --output text
+  fi
 }
 
 safe_alias() {
@@ -89,14 +92,19 @@ verify)
   REGION="${3:?region required}"
   ALIAS="${4:-}"
   safe_alias "$ALIAS"
-  qualifier_args=()
-  [ -z "$ALIAS" ] || qualifier_args=(--qualifier "$ALIAS")
   # REST API v1 dry invoke: imports must succeed; the unknown resource may return a normal 4xx.
   out="$(mktemp)"
-  aws lambda invoke --function-name "$FN" "${qualifier_args[@]}" --region "$REGION" \
-    --payload '{"httpMethod":"GET","resource":"/__patch_import_probe","path":"/__patch_import_probe","headers":{},"requestContext":{"identity":{}}}' \
-    --cli-binary-format raw-in-base64-out "$out" \
-    --query 'FunctionError' --output text >"$out.err" 2>/dev/null || true
+  if [ -n "$ALIAS" ]; then
+    aws lambda invoke --function-name "$FN" --qualifier "$ALIAS" --region "$REGION" \
+      --payload '{"httpMethod":"GET","resource":"/__patch_import_probe","path":"/__patch_import_probe","headers":{},"requestContext":{"identity":{}}}' \
+      --cli-binary-format raw-in-base64-out "$out" \
+      --query 'FunctionError' --output text >"$out.err" 2>/dev/null || true
+  else
+    aws lambda invoke --function-name "$FN" --region "$REGION" \
+      --payload '{"httpMethod":"GET","resource":"/__patch_import_probe","path":"/__patch_import_probe","headers":{},"requestContext":{"identity":{}}}' \
+      --cli-binary-format raw-in-base64-out "$out" \
+      --query 'FunctionError' --output text >"$out.err" 2>/dev/null || true
+  fi
   ferr="$(cat "$out.err" 2>/dev/null || echo None)"
   if [ "$ferr" = "None" ] || [ -z "$ferr" ]; then
     echo "PASS: $FN${ALIAS:+:$ALIAS} invoke returned FunctionError=None (new modules import cleanly), CodeSha256=$(fn_codesha "$FN" "$REGION" "$ALIAS")"

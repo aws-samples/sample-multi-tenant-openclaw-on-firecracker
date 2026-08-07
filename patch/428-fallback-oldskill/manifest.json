@@ -10,7 +10,29 @@
     "provenance": null,
     "stacks": []
   },
-  "kit_files": {},
+  "kit_files": {
+    "lib/apply-api-routes.py": {
+      "sha256": "ec6e12e6bb69f49f6fb9e05267cd65566482336106b24b3837434584655312ba"
+    },
+    "lib/apply-api-routes.sh": {
+      "sha256": "d2e782d53feb2eeac23118ee3f27854508a1e98342ae9a58eae4d92169194d8b"
+    },
+    "lib/apply-dispatch-tuning.sh": {
+      "sha256": "549274ad6c4387885b978398333f33aea3e4c81d417bd952055bc7b1138f62bd"
+    },
+    "lib/apply-fn-grants.sh": {
+      "sha256": "89526460d1e16a9dd3a3bf35fce844245e52f1795a015361d10674c525dfd036"
+    },
+    "lib/apply-image-jobs-table.sh": {
+      "sha256": "5e0234b44e89f0d9cd062a95842dd76bc2e1c4b0407e2216f1e7d65666319d89"
+    },
+    "lib/image-routes.spec.json": {
+      "sha256": "89e8ec5fc34a202c3aa79645028042da9772f4324daf9d61aceca5f51ab5e314"
+    },
+    "lib/overlay-lambda.sh": {
+      "sha256": "752badf0d54585add964d32a8f1d9e72504f5c7fd4c183a992986fa44dbfc8f7"
+    }
+  },
   "paths": {
     "README.md": {
       "change": "M",
@@ -700,13 +722,27 @@
       "patch_sha256": "cb1b4801cca4ff445a1281bc07213f20eb46dbe5b902ff04a7b3670764bb6c2c",
       "operations": [
         {
-          "resource": "lambda:openclaw-api control-plane code (overlay)",
+          "resource": "lambda:overlay deploy/lambda/api source onto BOTH openclaw-api AND openclaw-lifecycle-consumer (same asset)",
           "class": "AUTO_CLI",
-          "apply_cli": null,
-          "verify_cli": null,
-          "rollback_cli": null,
-          "artifact_refs": [],
-          "rollback_policy": "ALIAS_FLIP",
+          "apply_cli": "lib/overlay-lambda.sh apply openclaw-api lambda/api $REGION",
+          "verify_cli": "lib/overlay-lambda.sh verify openclaw-api $REGION",
+          "rollback_cli": "lib/overlay-lambda.sh rollback openclaw-api $API_BACKUP_ZIP $REGION",
+          "artifact_refs": [
+            "lib/overlay-lambda.sh"
+          ],
+          "rollback_policy": "REDEPLOY_ZIP",
+          "resource_refs": []
+        },
+        {
+          "resource": "lambda:overlay same deploy/lambda/api source onto openclaw-lifecycle-consumer (queued create/delete/suspend/restore path)",
+          "class": "AUTO_CLI",
+          "apply_cli": "lib/overlay-lambda.sh apply openclaw-lifecycle-consumer lambda/api $REGION",
+          "verify_cli": "lib/overlay-lambda.sh verify openclaw-lifecycle-consumer $REGION",
+          "rollback_cli": "lib/overlay-lambda.sh rollback openclaw-lifecycle-consumer $CONSUMER_BACKUP_ZIP $REGION",
+          "artifact_refs": [
+            "lib/overlay-lambda.sh"
+          ],
+          "rollback_policy": "REDEPLOY_ZIP",
           "resource_refs": []
         }
       ],
@@ -1296,12 +1332,40 @@
       "patch_sha256": "b4093090ebb7ab3e37fe3b65866949b318b5be0d9d5666c53662058dd33e3c16",
       "operations": [
         {
-          "resource": "lambda:openclaw-api dispatch-consumer timeout + SQS visibility + ESM batch_size",
+          "resource": "apigw:6 new control-plane routes (bootstrap/versions|promote, hosts/{id}/promote-canary|reclaim-images|image-slots, delete-image-snapshot) + OPTIONS/CORS + stage redeploy",
           "class": "AUTO_CLI",
-          "apply_cli": null,
-          "verify_cli": null,
-          "rollback_cli": null,
-          "artifact_refs": [],
+          "apply_cli": "lib/apply-api-routes.sh apply lib/image-routes.spec.json $API_ID v1 $REGION",
+          "verify_cli": "lib/apply-api-routes.sh verify lib/image-routes.spec.json $API_ID v1 $REGION",
+          "rollback_cli": "lib/apply-api-routes.sh rollback lib/image-routes.spec.json $API_ID v1 $REGION",
+          "artifact_refs": [
+            "lib/apply-api-routes.sh",
+            "lib/apply-api-routes.py",
+            "lib/image-routes.spec.json"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        },
+        {
+          "resource": "iam/env:IMAGE_JOBS_TABLE+BACKUP_BUCKET env and DDB/EC2/S3/KMS grants for api_fn, lifecycle-consumer, health_fn",
+          "class": "AUTO_CLI",
+          "apply_cli": "lib/apply-fn-grants.sh apply $REGION $ACCOUNT_ID $HOST_LT_ID",
+          "verify_cli": "lib/apply-fn-grants.sh verify $REGION $ACCOUNT_ID",
+          "rollback_cli": "true",
+          "artifact_refs": [
+            "lib/apply-fn-grants.sh"
+          ],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        },
+        {
+          "resource": "lambda/sqs:openclaw-lifecycle-consumer Timeout 900 + openclaw-lifecycle.fifo VisibilityTimeout 960 + consumer ESM BatchSize 1",
+          "class": "AUTO_CLI",
+          "apply_cli": "lib/apply-dispatch-tuning.sh apply $REGION",
+          "verify_cli": "lib/apply-dispatch-tuning.sh verify $REGION",
+          "rollback_cli": "lib/apply-dispatch-tuning.sh rollback $REGION",
+          "artifact_refs": [
+            "lib/apply-dispatch-tuning.sh"
+          ],
           "rollback_policy": "RESTORE",
           "resource_refs": []
         }
@@ -1377,12 +1441,14 @@
       "patch_sha256": "f77de59b86b0d0b1f3ad342d680223254efcedc16e9023db0aadef0a71df7232",
       "operations": [
         {
-          "resource": "ddb:openclaw-image-jobs table + GSI by-instance (NEW)",
+          "resource": "ddb:openclaw-image-jobs (NEW) HASH job_id + TTL expires_at + GSI gsi_idempotency(instance_id,idempotency_key) + GSI gsi_host_created(instance_id,created_at)",
           "class": "MANUAL_CLI_REVIEW",
-          "apply_cli": null,
-          "verify_cli": null,
-          "rollback_cli": null,
-          "artifact_refs": [],
+          "apply_cli": "lib/apply-image-jobs-table.sh apply $REGION",
+          "verify_cli": "lib/apply-image-jobs-table.sh verify $REGION",
+          "rollback_cli": "lib/apply-image-jobs-table.sh rollback $REGION",
+          "artifact_refs": [
+            "lib/apply-image-jobs-table.sh"
+          ],
           "rollback_policy": "RESTORE",
           "resource_refs": []
         }
@@ -3063,7 +3129,8 @@
       "params_changed": [],
       "verification_ids": [
         "v-428-lambda-codesha",
-        "v-428-lambda-invoke"
+        "v-428-lambda-invoke",
+        "v-428-consumer-codesha"
       ]
     },
     {
@@ -3174,7 +3241,9 @@
       ],
       "verification_ids": [
         "v-428-cdk-imagejobs",
-        "v-428-cdk-dispatch"
+        "v-428-cdk-dispatch",
+        "v-428-apigw-routes",
+        "v-428-lambda-grants"
       ]
     }
   ],
@@ -3249,10 +3318,10 @@
       "id": "v-428-cdk-imagejobs",
       "fix_id": "#428-d-cdk",
       "phase": "A-readonly",
-      "action": "aws dynamodb describe-table --table-name openclaw-image-jobs and describe its by-instance GSI",
-      "observable": "table + GSI TableStatus/IndexStatus",
-      "pass_when": "table ACTIVE with TTL on expires_at and the instance_id GSI ACTIVE",
-      "fail_when": "table missing, or GSI absent/CREATING past the wait window",
+      "action": "aws dynamodb describe-table --table-name openclaw-image-jobs and describe its two GSIs",
+      "observable": "TableStatus + IndexStatus for gsi_idempotency and gsi_host_created + TTL attribute",
+      "pass_when": "table ACTIVE, TTL on expires_at, and BOTH gsi_idempotency and gsi_host_created ACTIVE",
+      "fail_when": "table missing, TTL attr != expires_at, or either gsi_idempotency/gsi_host_created absent or not ACTIVE",
       "timeout_s": 300,
       "cleanup": null
     },
@@ -3264,6 +3333,39 @@
       "observable": "Timeout / VisibilityTimeout / BatchSize values",
       "pass_when": "Timeout=900, VisibilityTimeout=960 (>Timeout), BatchSize=1",
       "fail_when": "any value still at the old default (180/180/10) or VisibilityTimeout<=Timeout",
+      "timeout_s": 120,
+      "cleanup": null
+    },
+    {
+      "id": "v-428-apigw-routes",
+      "fix_id": "#428-d-cdk",
+      "phase": "B-lifecycle",
+      "action": "after applying lib/image-routes.spec.json, curl each of the 6 new routes on the v1 stage with a valid x-api-key (GET /bootstrap/versions, POST /bootstrap/promote, POST /hosts/{id}/promote-canary, POST /hosts/{id}/reclaim-images, GET /hosts/{id}/image-slots, POST /delete-image-snapshot)",
+      "observable": "HTTP status per route + apply-api-routes.sh verify exit code",
+      "pass_when": "every new route returns a non-403/non-404 status (reaches the Lambda: 200/400/409 per input) and apply-api-routes.sh verify exits 0 (each method matches the template, OPTIONS/CORS carries If-Match+Idempotency-Key)",
+      "fail_when": "any new route returns 403 Missing Authentication Token or 404 (method/resource never created), or verify exits non-zero",
+      "timeout_s": 300,
+      "cleanup": null
+    },
+    {
+      "id": "v-428-consumer-codesha",
+      "fix_id": "#428-c-lambda",
+      "phase": "A-readonly",
+      "action": "aws lambda get-function --function-name openclaw-lifecycle-consumer --query Configuration.CodeSha256 before/after overlay, then a synthetic import-probe invoke",
+      "observable": "CodeSha256 change + FunctionError on probe invoke",
+      "pass_when": "openclaw-lifecycle-consumer CodeSha256 differs from the pre-apply backup AND the probe invoke returns FunctionError=None (new image_*/bootstrap_* modules import cleanly in the consumer too)",
+      "fail_when": "consumer CodeSha256 unchanged (stale code left in place) or probe invoke FunctionError!=None",
+      "timeout_s": 180,
+      "cleanup": null
+    },
+    {
+      "id": "v-428-lambda-grants",
+      "fix_id": "#428-d-cdk",
+      "phase": "A-readonly",
+      "action": "lib/apply-fn-grants.sh verify $REGION $ACCOUNT_ID — check IMAGE_JOBS_TABLE env on api+consumer and the named inline IAM policies on each role",
+      "observable": "env var value + presence of oc428-* inline role policies",
+      "pass_when": "IMAGE_JOBS_TABLE=openclaw-image-jobs on both api and consumer, and inline policies oc428-image-jobs-txn/oc428-bootstrap-lt (api), oc428-consumer-txn (consumer), oc428-reaper-txn (health) all present",
+      "fail_when": "any env var missing/wrong or any expected inline policy absent",
       "timeout_s": 120,
       "cleanup": null
     }

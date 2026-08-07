@@ -551,6 +551,10 @@ def normalize_bundle(bundle: dict[str, Any] | None) -> Any:
         if isinstance(integration_value, dict)
         else None
     )
+    if integration is not None and integration.get("type") == "MOCK":
+        # API Gateway materializes these service-owned defaults on every MOCK.
+        for key in ("cacheNamespace", "cacheKeyParameters", "timeoutInMillis"):
+            integration.pop(key, None)
     return {"method": method, "integration": integration}
 
 

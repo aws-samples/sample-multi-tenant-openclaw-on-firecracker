@@ -3,13 +3,22 @@
 <!-- Status is MANUAL_REVIEW, NOT READY. Do NOT claim "No CDK required." -->
 
 Not fully CDK-free. This kit carries `MANUAL_CLI_REVIEW` operations (a new DynamoDB table
-`openclaw-image-jobs` + GSI, the new `OpenClawHostImage` / edge-bundle stacks) and the
-CloudFormation resource closure is `PENDING` (see Step 4). Read the MANUAL_CLI_REVIEW /
+`openclaw-image-jobs` + its two GSIs, the opt-in `OpenClawHostImage` / edge-bundle stacks) and the
+CloudFormation resource closure is `PENDING` (by design — see Step 4). Read the MANUAL_CLI_REVIEW /
 PENDING notes below before applying. Apply by reading the files in this directory; follow the
 steps in order. Running machines are hot-fixed before future-machine sources, and fail-closed
-prerequisites go first. Every side-effecting command is a confirmation gate — print it, wait
-for the operator's OK, then run. Running `setup.sh` or triggering any CloudFormation stack
-update is FORBIDDEN, everywhere, always.
+prerequisites (env + IAM grants) go first. Every side-effecting command is a confirmation gate —
+print it, wait for the operator's OK, then run. Running `setup.sh` or triggering any CloudFormation
+stack update is FORBIDDEN, everywhere, always.
+
+Every runtime-path operation carries an EXECUTABLE `apply_cli`/`verify_cli`/`rollback_cli` in
+`manifest.json` that invokes a self-contained tool under `lib/` (declared in `kit_files` with
+sha256) — run those, do not hand-transcribe:
+- `lib/apply-api-routes.sh` (+ `.py`, + `image-routes.spec.json`) — the 6 NEW API-GW routes.
+- `lib/apply-fn-grants.sh` — the NEW Lambda env vars + IAM grants (Step 2 fail-closed prereq).
+- `lib/apply-image-jobs-table.sh` — the NEW `openclaw-image-jobs` table + both GSIs + TTL.
+- `lib/apply-dispatch-tuning.sh` — the dispatch-consumer Timeout/VisibilityTimeout/BatchSize tuning.
+- `lib/overlay-lambda.sh` — the code overlay onto BOTH api-asset functions.
 
 This patch packages the gateway ship commit `a63d7b05` against its parent `f8d7c552`
 (the state before this publish). It is grouped by LAYER, not per file:
@@ -20,7 +29,7 @@ This patch packages the gateway ship commit `a63d7b05` against its parent `f8d7c
 | A-lt | `init-host.sh` (LT-baked host bootstrap) | `#428-a-lt` |
 | B-s3 | 4 S3-pulled host userdata scripts (`launch-vm.sh`, `host-agent.py`, `route_ops.py`, new `provision-host.sh`) | `#428-b-s3` |
 | deploy-other | 28 pool-core / edge / console / gateway orchestration files (`setup.sh`, `config.yml.example`, console-bff web, fluent-bit, litellm, wazuh, hardening, `scripts/checks/*`) | `#428-deploy-other` |
-| D-cdk | 10 CDK stack files → manual CLI equivalents (new DDB table + GSI, dispatch timeout/visibility/batch tuning, golden-AMI opt-in, new image/edge stacks) | `#428-d-cdk` |
+| D-cdk | 10 CDK stack files → executable CLI (6 new API-GW routes, api/consumer/health env+IAM grants, new DDB table + 2 GSIs, dispatch timeout/visibility/batch tuning, golden-AMI opt-in, opt-in image/edge stacks) | `#428-d-cdk` |
 
 The authoritative machine-readable contract is `manifest.json` (per-path `layer`,
 `base_sha256`, `patch_sha256` == the shipped artifact, `operations[].class`, and
@@ -82,36 +91,47 @@ For each shipped file, hash what is LIVE and branch:
 
 ## Step 2 — Hot-fix the RUNNING machines (restore/advance service now)
 
-Fail-closed prerequisites first (any IAM grant the new code depends on — apply the D-cdk
-`AUTO_CLI` IAM/env ops from Step 4 that a running function needs BEFORE overlaying code).
-
-**C-lambda (overlay, reuse the live package's compiled deps — do NOT prebuild a fat zip).**
-The `openclaw-api` function has arm64 native wheels; freezing your own dep versions onto it is
-an unrequested change. Download the live package, overlay only the first-party source, re-zip:
+Fail-closed prerequisites FIRST — the new code depends on env vars + IAM grants that a code
+overlay alone does NOT deliver (they live in `deploy/stacks/lambdas.py`/`ha_edge.py`, applied by
+CDK, not carried in the Lambda package). Apply them via the bundled `lib/apply-fn-grants.sh`
+BEFORE overlaying code, or the new image-jobs / bootstrap / lifecycle paths `AccessDenied` or
+silently no-op:
 
 ```bash
-FN=$(aws lambda list-functions --region "$REGION" \
-  --query "Functions[?contains(FunctionName,'ApiHandler')||contains(FunctionName,'openclaw-api')].FunctionName" --output text)
-# backup anchor: record the live RevisionId + CodeSha256, publish a version, download the zip
-aws lambda get-function --function-name "$FN" --region "$REGION" \
-  --query '{rev:Configuration.RevisionId,sha:Configuration.CodeSha256}'
-aws lambda publish-version --function-name "$FN" --region "$REGION" --query Version   # rollback anchor
-URL=$(aws lambda get-function --function-name "$FN" --region "$REGION" --query Code.Location --output text)
-curl -s "$URL" -o /tmp/openclaw-api-live.zip
-work=$(mktemp -d); (cd "$work" && unzip -q /tmp/openclaw-api-live.zip)
-# delete ONLY the first-party source dirs the overlay replaces, then copy this kit's lambda/ tree in:
-rm -rf "$work/core" "$work/services" "$work/handler.py"
-cp -a lambda/api/. "$work/"
-(cd "$work" && zip -qr /tmp/openclaw-api-new.zip .)
-aws lambda update-function-code --function-name "$FN" --zip-file fileb:///tmp/openclaw-api-new.zip --region "$REGION"
-aws lambda wait function-updated --function-name "$FN" --region "$REGION"
-# invoke-verify (FunctionError=None) then flip the alias if one is used; rollback = re-deploy the
-# downloaded backup zip AND re-point the alias (dispatch ESM binds $LATEST, so cover both).
+# resolve $ACCOUNT_ID (aws sts get-caller-identity) and $HOST_LT_ID (Step 0) first.
+lib/apply-fn-grants.sh apply "$REGION" "$ACCOUNT_ID" "$HOST_LT_ID"
+lib/apply-fn-grants.sh verify "$REGION" "$ACCOUNT_ID"
+# delivers: IMAGE_JOBS_TABLE + BACKUP_BUCKET env on api + consumer; DDB TransactWriteItems/
+# ConditionCheckItem on version-snapshots/image-jobs/tenants/hosts; image-jobs RW (+index/*);
+# backup-bucket read + KMS decrypt; ec2 Describe/ModifyLaunchTemplate (api, for /bootstrap/promote);
+# consumer snapshot/hosts/tenants transacts + backup read; health_fn reaper transact. RETAIN on rollback.
+```
+
+**C-lambda (overlay, reuse the live package's compiled deps — do NOT prebuild a fat zip).**
+`openclaw-api` has arm64 native wheels; freezing your own dep versions onto it is an unrequested
+change. The bundled `lib/overlay-lambda.sh` downloads the live package, publishes a backup version,
+overlays ONLY this kit's first-party `lambda/api` tree, re-zips, and `update-function-code`s.
+
+CRITICAL — overlay BOTH functions built from the `deploy/lambda/api` asset. `openclaw-api` AND
+`openclaw-lifecycle-consumer` load the SAME asset; overlaying only the api function leaves the
+queued create/delete/suspend/restore path (the consumer) on stale code. Both ops are declared on
+`deploy/lambda/api/handler.py` in `manifest.json`.
+
+```bash
+# api function (foreground request path). Emits the backup-zip path on its last line — capture it.
+API_BACKUP=$(lib/overlay-lambda.sh apply openclaw-api lambda/api "$REGION" | tail -1)
+# lifecycle consumer (queued lifecycle path) — SAME asset, second function.
+CONSUMER_BACKUP=$(lib/overlay-lambda.sh apply openclaw-lifecycle-consumer lambda/api "$REGION" | tail -1)
+# verify each imports the new image_*/bootstrap_* modules cleanly (FunctionError=None):
+lib/overlay-lambda.sh verify openclaw-api "$REGION"
+lib/overlay-lambda.sh verify openclaw-lifecycle-consumer "$REGION"
+# rollback (REDEPLOY_ZIP): lib/overlay-lambda.sh rollback <fn> "$API_BACKUP"/"$CONSUMER_BACKUP" "$REGION"
 ```
 
 Pure-source functions (`scaler`, `health_check`, `tenant_stats`) ship as full trees under
 `lambda/` too — for these a prebuilt zip is fine (no third-party deps): `zip -r` the function
-dir and `update-function-code`; rollback = `REDEPLOY_ZIP` of the backup.
+dir and `update-function-code`; rollback = `REDEPLOY_ZIP` of the backup. NOTE `health_check` also
+needs its new reaper IAM grant — applied by the grants step below, not the code overlay.
 
 **B-s3 (hot-replace on live hosts).** Only after Step-1.5 cleared each file. Back up, replace
 via SSM (hosts are usually private — no direct SSH), validate by type, diff-guard:
@@ -175,59 +195,63 @@ host/asset that serves it (same backup → replace → syntax-check → diff-gua
 re-run the specific consumer (e.g. restart the console-bff service, re-run fluent-bit install).
 Do NOT run `setup.sh` — copy the changed files, do not re-orchestrate.
 
-## Step 4 — CDK stack changes → manual CLI equivalents (review-gated, no stack redeploy)
+## Step 4 — API routes + CDK stack changes → executable CLI (review-gated, no stack redeploy)
 
-Per `operations[].class` in `manifest.json`. **NETWORK changes are DESCRIBE-ONLY for the AI** —
-run only `describe`, present the impact + proposed command, and STOP for explicit approval.
+Every runtime-path op below carries a concrete `apply_cli`/`verify_cli`/`rollback_cli` in
+`manifest.json` that invokes a bundled `lib/` tool — run those, don't hand-transcribe. **NETWORK
+changes are DESCRIBE-ONLY for the AI** — run only `describe`, present the command, STOP for approval.
 
-**CloudFormation resource closure is PENDING in this kit** (`manifest.cloudformation.status`).
-A commit-bound `cdk synth --all` on both refs is feasible offline (`network.mode=self_managed` +
-`aws:cdk:bundling-stacks=[]` + a concrete account/region make it Docker-free), but this fallback
-kit classifies the 10 D-cdk paths from the source diff instead of a captured per-resource A/M/D
-closure. Treat the classifications below as reviewed guidance, and re-derive the exact resource
-set from a captured synth before applying anything topology-touching.
+**CloudFormation resource closure is PENDING in this kit** (`manifest.cloudformation.status`) — by
+design. The 6 new API routes are additive and delivered through the bundled typed route applier
+(below); the rest of the diff's API-Gateway churn is ~53 identical OPTIONS-preflight modifications
+(the `If-Match`/`Idempotency-Key` header widening). Owning the full closure the validator's way is
+all-or-nothing over ~93 resources including those 53, so this kit delivers the additive routes via a
+runnable helper and leaves the closure honestly PENDING rather than faking a partial capture.
 
-- **`AUTO_CLI` — apply as safe CLI:**
-  - `lambdas.py` — dispatch consumer tuning: `update-function-configuration --timeout 900`;
-    `set-queue-attributes VisibilityTimeout=960` (must be `>` the function timeout);
-    `update-event-source-mapping --batch-size 1`. Rollback `RESTORE` to 180/180/10.
-  - `compute.py` / `observability.py` — IAM grants + Lambda env + log-group/alarm wiring for
-    the image/bootstrap services: inline `put-role-policy` + `update-function-configuration`
-    env; read-only grants and log groups are `RETAIN` (do not roll back a fail-closed prereq).
-  - `_helpers.py` / `app.py` — synthesis-only wiring (SSM parameter-name helper; register the
-    `OpenClawHostImage` stack). No standalone runtime resource; `rollback_policy: NONE`.
-  - `network_vpc.py` — in-range change is a comment/contract reference only; confirm the synth
-    delta is empty (DESCRIBE-only), take no action.
-  - `ha_edge.py` — host LT gains the golden-AMI opt-in branch (`resolve:ssm` at launch). Handled
-    by the Step-3 A-lt LT-version path, not a stack deploy; rollback `LT_REVERT`.
+**API-GW routes (the functional core — 6 new routes; without this the new endpoints 403/404).**
+The control-plane API is `apigw.RestApi` with EXPLICIT per-route methods (not `{proxy+}`), so a code
+overlay alone does NOT make the new endpoints reachable. `lib/apply-api-routes.sh` (a stateful,
+idempotent, crash-resumable applier bundled in this kit) reads `lib/image-routes.spec.json` and, for
+each of the 6 routes, creates the API-GW resource + method + `AWS_PROXY` integration (copied from a
+live template route, so the Lambda ARN + apiKeyRequired are inherited, never hardcoded) + an
+OPTIONS/CORS preflight carrying `If-Match`+`Idempotency-Key`, then issues ONE `create-deployment` and
+repoints the `v1` stage.
 
-- **`MANUAL_CLI_REVIEW` — exact by-hand CLI, forces `status: MANUAL_REVIEW`:**
-  - `storage.py` — NEW DynamoDB table `openclaw-image-jobs` + a by-`instance_id` GSI. This is a
-    controlled online migration, not unpatchable:
+```bash
+# $API_ID = the RestApi physical id (Step 0: get-rest-apis, name "openclaw-orchestrator").
+lib/apply-api-routes.sh plan   lib/image-routes.spec.json "$API_ID" v1 "$REGION"   # dry preview
+lib/apply-api-routes.sh apply  lib/image-routes.spec.json "$API_ID" v1 "$REGION"   # gated (type APPLY)
+lib/apply-api-routes.sh verify lib/image-routes.spec.json "$API_ID" v1 "$REGION"
+# rollback restores the pre-apply stage deployment + deletes the routes this run created.
+```
+
+- **`AUTO_CLI` — apply via the bundled tool:**
+  - `lambdas.py` (routes) — the 6 routes above (`lib/apply-api-routes.sh`).
+  - `lambdas.py` (env+IAM) — `lib/apply-fn-grants.sh` (Step 2 fail-closed prereq). RETAIN.
+  - `lambdas.py` (dispatch) — `lib/apply-dispatch-tuning.sh apply "$REGION"`: consumer Timeout→900,
+    `openclaw-lifecycle.fifo` VisibilityTimeout→960 (`>` timeout), consumer ESM BatchSize→1.
+    Rollback `RESTORE` to 180/180/10.
+  - `compute.py` / `observability.py` — the runtime IAM/env these describe is delivered by
+    `apply-fn-grants.sh`; the residual (log groups/alarms) is `RETAIN`, additive.
+  - `_helpers.py` / `app.py` — synthesis-only wiring; no standalone runtime resource; `NONE`.
+  - `network_vpc.py` — comment/contract-only; confirm the synth delta is empty (DESCRIBE-only).
+  - `ha_edge.py` — host LT golden-AMI opt-in (`resolve:ssm`); handled by the Step-3 A-lt LT path,
+    plus the api-fn `ec2:Describe/ModifyLaunchTemplate` grant delivered by `apply-fn-grants.sh`.
+
+- **`MANUAL_CLI_REVIEW` — bundled tool, review before running:**
+  - `storage.py` — NEW DynamoDB `openclaw-image-jobs` (HASH `job_id`, TTL `expires_at`) + the TWO
+    GSIs the code actually queries — `gsi_idempotency` (instance_id + idempotency_key) and
+    `gsi_host_created` (instance_id + created_at). Idempotent adopt-or-create migration:
     ```bash
-    # idempotent adopt-or-create, then add the GSI, each waiting ACTIVE (DDB builds one GSI/update):
-    aws dynamodb describe-table --table-name openclaw-image-jobs --region "$REGION" 2>/dev/null \
-      || aws dynamodb create-table --table-name openclaw-image-jobs --region "$REGION" \
-           --billing-mode PAY_PER_REQUEST \
-           --attribute-definitions AttributeName=job_id,AttributeType=S AttributeName=instance_id,AttributeType=S \
-           --key-schema AttributeName=job_id,KeyType=HASH
-    aws dynamodb wait table-exists --table-name openclaw-image-jobs --region "$REGION"
-    # TTL on expires_at:
-    aws dynamodb update-time-to-live --table-name openclaw-image-jobs --region "$REGION" \
-      --time-to-live-specification "Enabled=true,AttributeName=expires_at"
-    # by-instance GSI (only if describe shows it absent):
-    aws dynamodb update-table --table-name openclaw-image-jobs --region "$REGION" \
-      --attribute-definitions AttributeName=instance_id,AttributeType=S \
-      --global-secondary-index-updates '[{"Create":{"IndexName":"by-instance","KeySchema":[{"AttributeName":"instance_id","KeyType":"HASH"}],"Projection":{"ProjectionType":"ALL"}}}]'
-    # verify: describe-table shows TableStatus=ACTIVE and the GSI IndexStatus=ACTIVE.
-    # rollback (RESTORE): a NEWLY-created table -> delete-table openclaw-image-jobs; an adopted
-    #   pre-existing table -> RETAIN (do not delete).
+    lib/apply-image-jobs-table.sh apply  "$REGION"    # creates table + both GSIs (waits ACTIVE each)
+    lib/apply-image-jobs-table.sh verify "$REGION"    # asserts both GSIs + TTL
+    # rollback (RESTORE): deletes ONLY a table this run created; an adopted pre-existing table = RETAIN.
     ```
-  - `host_image.py` — NEW `OpenClawHostImage` EC2 Image Builder pipeline/component/recipe. Opt-in
-    (`host.golden_ami.build_pipeline=false` by default), so the running system is untouched;
-    standing the pipeline up by hand is additive and `RETAIN` on rollback. Review before creating.
-  - `edge_bundle.py` — NEW edge-bootstrap asset-bundling helper feeding the edge LT/bootstrap
-    flow. Additive, review-gated (touches edge bootstrap topology); `RETAIN`.
+  - `host_image.py` — NEW `OpenClawHostImage` EC2 Image Builder pipeline. Opt-in
+    (`host.golden_ami.build_pipeline=false` by default) — the running system is untouched; standing
+    it up by hand is additive and `RETAIN`. Not required for the runtime path; review before creating.
+  - `edge_bundle.py` — NEW edge-bootstrap asset-bundling helper. Additive, review-gated; `RETAIN`.
+    Not required for the runtime request path.
 
 There is NO `UNPATCHABLE` operation in this patch. This whole layer is flagged for codex review.
 

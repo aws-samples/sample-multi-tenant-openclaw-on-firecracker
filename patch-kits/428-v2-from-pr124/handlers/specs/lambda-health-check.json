@@ -1,0 +1,1 @@
+{"files":{"handler.py":{"artifact":"artifacts/repo/deploy/lambda/health_check/handler.py","base":"66a06280b2e8fb58447d31d2eee84c89ad9fe5f28418fec8d028d38ef59ebdcf","target":"a3a8035e7cb8ff761237ab8ec2a52b981686be57ccb3cd1ad4656020a957a48c"}},"function":"replace-with-customer-health-function","id":"lambda-health-check","mode":"overlay"}

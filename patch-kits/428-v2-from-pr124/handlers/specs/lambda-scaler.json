@@ -1,0 +1,1 @@
+{"files":{"handler.py":{"artifact":"artifacts/repo/deploy/lambda/scaler/handler.py","base":"17f600d401fe70fb452921726275c37ba4e47240c1fb9521467c20e2bf20e061","target":"5dc20f11757d58c70e0e0331b2e26de66a84cdcdfe43d8703109517332519b72"}},"function":"replace-with-customer-scaler-function","id":"lambda-scaler","mode":"overlay"}

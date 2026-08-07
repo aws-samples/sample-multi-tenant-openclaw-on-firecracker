@@ -7,8 +7,8 @@
 #
 # Why overlay (not a fresh zip): the api asset carries arm64 native wheels installed at bundle time.
 # Freezing our own dep versions onto it is an unrequested change and can break the runtime. So we
-# download the live zip, delete ONLY the first-party dirs this patch replaces, drop this kit's
-# source tree in, re-zip, update-function-code, and publish-version as the rollback anchor.
+# download the live zip, overwrite only files shipped by this changed-file kit, re-zip,
+# update-function-code, and publish-version as the rollback anchor.
 #
 # Both openclaw-api AND openclaw-lifecycle-consumer are built from the SAME deploy/lambda/api asset
 # (deploy/stacks/lambdas.py), so BOTH must be overlaid or the queued lifecycle path keeps stale code.
@@ -17,7 +17,7 @@
 #         overlay-lambda.sh verify  <function-name> <region> [alias]
 #         overlay-lambda.sh rollback <function-name> <backup-zip> <region> [alias]
 #   <kit-source-dir>  a dir in this kit whose contents overlay the function root (e.g. lambda/api).
-#   The first-party dirs replaced are the top-level entries present in <kit-source-dir>.
+#   The kit source is a partial changed-file tree; unrelated live package files are preserved.
 #   alias: when provided, publish the patched code and move exactly this alias with RevisionId CAS.
 set -euo pipefail
 CMD="${1:?usage: overlay-lambda.sh <apply|verify|rollback> ...}"
@@ -61,11 +61,7 @@ apply)
   fi
   ( cd "$work" && mkdir unz && cd unz && unzip -q ../live.zip )
 
-  # delete ONLY the first-party top-level entries this kit's source tree replaces
-  for entry in "$SRC"/*; do
-    name="$(basename "$entry")"
-    rm -rf "$work/unz/$name"
-  done
+  # This kit contains only changed/added files, not complete core/services trees.
   cp -a "$SRC"/. "$work/unz/"
   ( cd "$work/unz" && zip -qr ../new.zip . )
 

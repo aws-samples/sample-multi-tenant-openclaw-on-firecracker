@@ -110,7 +110,8 @@ lib/apply-fn-grants.sh verify "$REGION" "$ACCOUNT_ID"
 **C-lambda (overlay, reuse the live package's compiled deps — do NOT prebuild a fat zip).**
 `openclaw-api` has arm64 native wheels; freezing your own dep versions onto it is an unrequested
 change. The bundled `lib/overlay-lambda.sh` downloads the live package, publishes a backup version,
-overlays ONLY this kit's first-party `lambda/api` tree, re-zips, and `update-function-code`s.
+overlays ONLY this kit's changed/added `lambda/api` files while preserving unchanged modules,
+re-zips, and `update-function-code`s.
 
 CRITICAL — overlay BOTH functions built from the `deploy/lambda/api` asset. `openclaw-api` AND
 `openclaw-lifecycle-consumer` load the SAME asset; overlaying only the api function leaves the

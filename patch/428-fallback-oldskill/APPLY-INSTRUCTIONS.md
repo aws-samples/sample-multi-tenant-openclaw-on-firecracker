@@ -119,13 +119,15 @@ queued create/delete/suspend/restore path (the consumer) on stale code. Both ops
 
 ```bash
 # api function (foreground request path). Emits the backup-zip path on its last line — capture it.
-API_BACKUP=$(lib/overlay-lambda.sh apply openclaw-api lambda/api "$REGION" | tail -1)
+API_BACKUP=$(lib/overlay-lambda.sh apply openclaw-api lambda/api "$REGION" live | tail -1)
 # lifecycle consumer (queued lifecycle path) — SAME asset, second function.
 CONSUMER_BACKUP=$(lib/overlay-lambda.sh apply openclaw-lifecycle-consumer lambda/api "$REGION" | tail -1)
 # verify each imports the new image_*/bootstrap_* modules cleanly (FunctionError=None):
-lib/overlay-lambda.sh verify openclaw-api "$REGION"
+lib/overlay-lambda.sh verify openclaw-api "$REGION" live
 lib/overlay-lambda.sh verify openclaw-lifecycle-consumer "$REGION"
-# rollback (REDEPLOY_ZIP): lib/overlay-lambda.sh rollback <fn> "$API_BACKUP"/"$CONSUMER_BACKUP" "$REGION"
+# rollback (REDEPLOY_ZIP):
+#   lib/overlay-lambda.sh rollback openclaw-api "$API_BACKUP" "$REGION" live
+#   lib/overlay-lambda.sh rollback openclaw-lifecycle-consumer "$CONSUMER_BACKUP" "$REGION"
 ```
 
 Pure-source functions (`scaler`, `health_check`, `tenant_stats`) ship as full trees under

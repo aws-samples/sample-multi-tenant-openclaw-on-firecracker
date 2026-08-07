@@ -1,0 +1,3373 @@
+{
+  "id": "428-fallback-oldskill",
+  "base_sha": "f8d7c552ecc535730c6c3c292edfa06a5aebc4a7",
+  "patch_sha": "a63d7b058856bc71f90643e77621585fb2b9e317",
+  "status": "MANUAL_REVIEW",
+  "excludes": [],
+  "cloudformation": {
+    "status": "PENDING",
+    "reason": "commit-bound cdk synth --all runs offline and WAS captured for both refs (Docker-free: network.mode=self_managed + aws:cdk:bundling-stacks=[] + a concrete account/region; base=2 stacks, patch=3 stacks). The closure computes 93 resource changes, but 76 are an API Gateway rollout (7 Resource A, 13 Method A, 53 Method M, Deployment A/D, Stage M). The validator only accepts API Gateway resources through the typed apply-api-routes model, which requires every non-OPTIONS method to equal one template-method behavior and is built for ADDING routes -- it cannot represent 53 heterogeneous modifications to existing methods (a mass CORS/integration reconfig). Owning that set through the typed path is infeasible for this diff, so the 10 D-cdk paths are classified AUTO_CLI/MANUAL_CLI_REVIEW from the source diff and the closure is left PENDING rather than shipped incomplete.",
+    "provenance": null,
+    "stacks": []
+  },
+  "kit_files": {
+    "lib/apply-api-routes.py": {
+      "sha256": "ec6e12e6bb69f49f6fb9e05267cd65566482336106b24b3837434584655312ba"
+    },
+    "lib/apply-api-routes.sh": {
+      "sha256": "d2e782d53feb2eeac23118ee3f27854508a1e98342ae9a58eae4d92169194d8b"
+    },
+    "lib/apply-dispatch-tuning.sh": {
+      "sha256": "549274ad6c4387885b978398333f33aea3e4c81d417bd952055bc7b1138f62bd"
+    },
+    "lib/apply-fn-grants.sh": {
+      "sha256": "89526460d1e16a9dd3a3bf35fce844245e52f1795a015361d10674c525dfd036"
+    },
+    "lib/apply-image-jobs-table.sh": {
+      "sha256": "5e0234b44e89f0d9cd062a95842dd76bc2e1c4b0407e2216f1e7d65666319d89"
+    },
+    "lib/image-routes.spec.json": {
+      "sha256": "89e8ec5fc34a202c3aa79645028042da9772f4324daf9d61aceca5f51ab5e314"
+    },
+    "lib/overlay-lambda.sh": {
+      "sha256": "752badf0d54585add964d32a8f1d9e72504f5c7fd4c183a992986fa44dbfc8f7"
+    }
+  },
+  "paths": {
+    "README.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "0054e15c19430b42e0272b58a5c8cc6344f975ea1805a1b87dce9d0a55d26c65",
+      "patch_sha256": "fd4d74125eae7158c5ad363678d8a7f2fd1f98be481980d6eb081f87112f1e3f",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "config.yml.example": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/config.yml.example.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "59d7d7e5c51a0451336207f1e602aa268a604230b990192032b9c0a70765c8b7",
+      "patch_sha256": "802e382f52944a7135490c7d6713f766ac5257260db1c5185874ef5c03549a1a",
+      "operations": [
+        {
+          "resource": "file:config.yml.example (shipped orchestration/console/edge code)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-deploy-other"
+      ]
+    },
+    "console/index.html": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/console/index.html.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "e09f4158e145be549436910279fb8687c2fd7c832d677e2b0235a14bdefc9b91",
+      "patch_sha256": "b06e23a1034d0657cebb155f5834764d4ed3c291264305954bf3682dc04a521e",
+      "operations": [
+        {
+          "resource": "file:console/index.html (shipped orchestration/console/edge code)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-deploy-other"
+      ]
+    },
+    "console/marketplace-demo/README.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "3af51d5295eec084294df2ea2e737c4f70fca5604e003ef2fd0b4faa31fa5fd9",
+      "patch_sha256": "24e0935f4698fe57fc1e848ba83d935865b4c84cc3ee9c2b4ed1921a2fdaac64",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "console/marketplace-demo/TESTPLAN.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "b97718a83fcfa52346d50fd797180a649731187cf80f9ce46e304029c47264d1",
+      "patch_sha256": "a592e49afcccb60abbf110a3d62a90b8f1c05175df5f22f6861932f7536bdf64",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "console/marketplace-demo/setup-federation.sh": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/console/marketplace-demo/setup-federation.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "7669e3ba9bc06ec4ba8c365c5344118319e780a3d992c376b33bbda5ed5af7de",
+      "patch_sha256": "3fa3ce92d8d0621b290036747bcf33a694c5d226c881d767bcf7596093940c9f",
+      "operations": [
+        {
+          "resource": "file:console/marketplace-demo/setup-federation.sh (shipped orchestration/console/edge code)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-deploy-other"
+      ]
+    },
+    "deploy/app.py": {
+      "change": "M",
+      "layer": "D-cdk",
+      "artifact": null,
+      "artifact_status": "OPERATION_ONLY",
+      "artifact_disposition": {
+        "kind": "RESOURCE_OPERATIONS",
+        "evidence": "cloudformation-resource-closure"
+      },
+      "base_sha256": "1ca7adf26385bcb12e8e38c38480049dcda602303de45a93ec5530a03dc488e6",
+      "patch_sha256": "216d933702bbf27ce87994c5a50b33efe3eec2197893d81c14eac64a05038471",
+      "operations": [
+        {
+          "resource": "cdk-app:register OpenClawHostImage stack in the app graph",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-d-cdk"
+      ]
+    },
+    "deploy/codebuild/build-golden-on-codebuild.sh": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/deploy/codebuild/build-golden-on-codebuild.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "1f28b3a75e735f839d0a688254efdf3b5f7549b4493a8f8e01d4a3ac5144bbc1",
+      "patch_sha256": "9aca85e90423613f1030b5dcf5eacc1ac8ce98b61d83a1cd7a32ddefc50473ff",
+      "operations": [
+        {
+          "resource": "file:deploy/codebuild/build-golden-on-codebuild.sh (shipped orchestration/console/edge code)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-deploy-other"
+      ]
+    },
+    "deploy/codebuild/build-image-demo.sh": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/deploy/codebuild/build-image-demo.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "09e735fd36ce2313bdbd2348f3ca73ea7af04b212ae5f99f8bbb0c0d7589819a",
+      "patch_sha256": "4f47a688b211144843083ad91dd7714b34bc6bd6efae24699f7778d1dc2d02ed",
+      "operations": [
+        {
+          "resource": "file:deploy/codebuild/build-image-demo.sh (shipped orchestration/console/edge code)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-deploy-other"
+      ]
+    },
+    "deploy/console-bff/traces.mjs": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/deploy/console-bff/traces.mjs.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "616564c1956411828d9430ec005610af6be6f994da6703fa4c05350c02de93db",
+      "patch_sha256": "72901b25cff816196b5a9652fb3b0581387ac07b303793716c2266a6f0ce3bdb",
+      "operations": [
+        {
+          "resource": "file:deploy/console-bff/traces.mjs (shipped orchestration/console/edge code)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-deploy-other"
+      ]
+    },
+    "deploy/console-bff/web/index.html": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/deploy/console-bff/web/index.html.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "79d5cb28d6ed355f284c527e725168ec3afccf83c090c58a08acf2cfbba227c9",
+      "patch_sha256": "388a44c54dbb1d0312fb71c407ca63f12040a5e70aff49f68c2afcf7dba3d735",
+      "operations": [
+        {
+          "resource": "file:deploy/console-bff/web/index.html (shipped orchestration/console/edge code)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-deploy-other"
+      ]
+    },
+    "deploy/console-bff/web/js/app.core.js": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/deploy/console-bff/web/js/app.core.js.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "d217c503e4bc93ff592cb4fde790c27ba4cebdc6b02ec1971a90b7f07c640cab",
+      "patch_sha256": "8d890d5561dc460260b90114b39b9966fe789f5897cf71ff7889dd9e37166431",
+      "operations": [
+        {
+          "resource": "file:deploy/console-bff/web/js/app.core.js (shipped orchestration/console/edge code)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-deploy-other"
+      ]
+    },
+    "deploy/console-bff/web/js/app.format.js": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/deploy/console-bff/web/js/app.format.js.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "5c0e1b9a7d04c4b3a2906c985287a094a202fa639eddd2022ef83c6a6125e6bf",
+      "patch_sha256": "8f3e0ee18e2f01f16db13e0c9e28b14e93229c45000a95f64bfba09932bbe4af",
+      "operations": [
+        {
+          "resource": "file:deploy/console-bff/web/js/app.format.js (shipped orchestration/console/edge code)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-deploy-other"
+      ]
+    },
+    "deploy/console-bff/web/js/app.hosts.js": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/deploy/console-bff/web/js/app.hosts.js.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "9fac6fdd1214b73a6614414661297030c6cd8e9ba14aa370fd267bc05cdb6c42",
+      "patch_sha256": "63c60b90a24c78f7325f09fd0d072dc539bcd44a974fd7ca4495f9b1ff8c9721",
+      "operations": [
+        {
+          "resource": "file:deploy/console-bff/web/js/app.hosts.js (shipped orchestration/console/edge code)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-deploy-other"
+      ]
+    },
+    "deploy/console-bff/web/js/app.tenants.js": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/deploy/console-bff/web/js/app.tenants.js.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "0b4595e7583a3902fc4b1604a179b5c93cc2fef26729243d0662b7ec1117dfbc",
+      "patch_sha256": "5a94ea798ee004b72e17b61025de76264790b867c1db69cee4941041539b0036",
+      "operations": [
+        {
+          "resource": "file:deploy/console-bff/web/js/app.tenants.js (shipped orchestration/console/edge code)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-deploy-other"
+      ]
+    },
+    "deploy/console-bff/web/style.css": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/deploy/console-bff/web/style.css.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "59923e87a3619c759c39a57e1a00e3a8ba35d0fcd35009e33999aea46a54f73b",
+      "patch_sha256": "98464b697055fe24600921a8d4ea8854e75a340f36075c0aadd60139efe0c7f0",
+      "operations": [
+        {
+          "resource": "file:deploy/console-bff/web/style.css (shipped orchestration/console/edge code)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-deploy-other"
+      ]
+    },
+    "deploy/edge/fluent-bit/edge/fluent-bit.conf": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/deploy/edge/fluent-bit/edge/fluent-bit.conf.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "abfdc5ec210373fc467fd5dd6a255e20f07a1b97154f59743187b6c5d779c638",
+      "patch_sha256": "d1a01d49a1cd731cbb961a57b417833fc739a2a401036111993ed072efb839fe",
+      "operations": [
+        {
+          "resource": "file:deploy/edge/fluent-bit/edge/fluent-bit.conf (shipped orchestration/console/edge code)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-deploy-other"
+      ]
+    },
+    "deploy/edge/fluent-bit/install-fluent-bit.sh": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/deploy/edge/fluent-bit/install-fluent-bit.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "2200429850c36396a28af70332db2f5bf5764fb5314cc6369b0bec426b025c58",
+      "patch_sha256": "d07496e39710de1c05f32172c78bdc70c00cd18067093dc9ee2effef40044aa5",
+      "operations": [
+        {
+          "resource": "file:deploy/edge/fluent-bit/install-fluent-bit.sh (shipped orchestration/console/edge code)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-deploy-other"
+      ]
+    },
+    "deploy/lambda/api/core/auth.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/core/auth.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "99ee267e2dac16d70c6948b174ebb8199ad4af9f8f97ba6e7f51afddf4506ab9",
+      "patch_sha256": "97403eca72b99980923d193a016902a74ba6f1ebaaa97bb7ca0c4e0d66fedd43",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api control-plane code (overlay)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "ALIAS_FLIP",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-c-lambda"
+      ]
+    },
+    "deploy/lambda/api/core/bootstrap_lt.py": {
+      "change": "A",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/core/bootstrap_lt.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "d55fba4a7deeb2bc515fef3e6094f7c7809583d86797264b1e76a49e51d08ef6",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api control-plane code (overlay)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "ALIAS_FLIP",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-c-lambda"
+      ]
+    },
+    "deploy/lambda/api/core/clients.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/core/clients.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "04c24a71fb5b6418c61a2a889c03fea5ada47f5ee46797fdaa98322670c432b9",
+      "patch_sha256": "44ace929a420075838a725c06e5aae837591ad53d3fbca34d9ff139740a41270",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api control-plane code (overlay)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "ALIAS_FLIP",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-c-lambda"
+      ]
+    },
+    "deploy/lambda/api/core/image_channel.py": {
+      "change": "A",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/core/image_channel.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "d064ac5e91c99129f200c4ed96fd8154902540dbb1c5e5a6d4303d3b54b7bd16",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api control-plane code (overlay)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "ALIAS_FLIP",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-c-lambda"
+      ]
+    },
+    "deploy/lambda/api/core/image_jobs.py": {
+      "change": "A",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/core/image_jobs.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "5ca759a57fd1e9099fbee0ab58f3c6211624ecb0e436ed2971c81515fa09808c",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api control-plane code (overlay)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "ALIAS_FLIP",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-c-lambda"
+      ]
+    },
+    "deploy/lambda/api/core/image_lease.py": {
+      "change": "A",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/core/image_lease.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "a1332bb5e3ac2fd1d1ccb5a8d6de6d7e00ff649e068306d714bd08bf2413e5a7",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api control-plane code (overlay)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "ALIAS_FLIP",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-c-lambda"
+      ]
+    },
+    "deploy/lambda/api/core/image_ops.py": {
+      "change": "A",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/core/image_ops.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "a9106209d30b7977833300ad70c87e8a0c8988b5effcf5d8f0e6043861ff0f15",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api control-plane code (overlay)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "ALIAS_FLIP",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-c-lambda"
+      ]
+    },
+    "deploy/lambda/api/core/image_slots.py": {
+      "change": "A",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/core/image_slots.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "073751cc7b202f309c86fc3d1c09ca7db3962c30bba428edee737cd31f2b0d70",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api control-plane code (overlay)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "ALIAS_FLIP",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-c-lambda"
+      ]
+    },
+    "deploy/lambda/api/core/scheduling.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/core/scheduling.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "d3744e269eb794878a4939f1e1dd39495c91e1561c0570f96470b8b45d761dce",
+      "patch_sha256": "c411ca0d3126e49313bcd4dd737ecc8d068e3ef0ccb1bc16e540bda2ebada7dc",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api control-plane code (overlay)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "ALIAS_FLIP",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-c-lambda"
+      ]
+    },
+    "deploy/lambda/api/core/ssm_dispatch.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/core/ssm_dispatch.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "e57539edb47e586d909a438088a0d25f09dcbdc8ac702387c0660d1b61ee8091",
+      "patch_sha256": "2838478dad3e60902062e6774336db6d9cb639da106ddf42c9bde4ed558dfe33",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api control-plane code (overlay)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "ALIAS_FLIP",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-c-lambda"
+      ]
+    },
+    "deploy/lambda/api/handler.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/handler.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "6501dd44a679de85d0da6eddeb95acaf0da5c1f84666fb87a92a6ca479e4772e",
+      "patch_sha256": "cb1b4801cca4ff445a1281bc07213f20eb46dbe5b902ff04a7b3670764bb6c2c",
+      "operations": [
+        {
+          "resource": "lambda:overlay deploy/lambda/api source onto BOTH openclaw-api AND openclaw-lifecycle-consumer (same asset)",
+          "class": "AUTO_CLI",
+          "apply_cli": "lib/overlay-lambda.sh apply openclaw-api lambda/api $REGION",
+          "verify_cli": "lib/overlay-lambda.sh verify openclaw-api $REGION",
+          "rollback_cli": "lib/overlay-lambda.sh rollback openclaw-api $API_BACKUP_ZIP $REGION",
+          "artifact_refs": [
+            "lib/overlay-lambda.sh"
+          ],
+          "rollback_policy": "REDEPLOY_ZIP",
+          "resource_refs": []
+        },
+        {
+          "resource": "lambda:overlay same deploy/lambda/api source onto openclaw-lifecycle-consumer (queued create/delete/suspend/restore path)",
+          "class": "AUTO_CLI",
+          "apply_cli": "lib/overlay-lambda.sh apply openclaw-lifecycle-consumer lambda/api $REGION",
+          "verify_cli": "lib/overlay-lambda.sh verify openclaw-lifecycle-consumer $REGION",
+          "rollback_cli": "lib/overlay-lambda.sh rollback openclaw-lifecycle-consumer $CONSUMER_BACKUP_ZIP $REGION",
+          "artifact_refs": [
+            "lib/overlay-lambda.sh"
+          ],
+          "rollback_policy": "REDEPLOY_ZIP",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-c-lambda"
+      ]
+    },
+    "deploy/lambda/api/services/bootstrap_version_service.py": {
+      "change": "A",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/services/bootstrap_version_service.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "433c9303fa26e7055c72e9bd1ee9c81ebbf27a93112387dbc792391af94d4ca1",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api control-plane code (overlay)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "ALIAS_FLIP",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-c-lambda"
+      ]
+    },
+    "deploy/lambda/api/services/dispatch_poller.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/services/dispatch_poller.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "030a0fb926fe4fa041cd3e6e578995265e1a5ef23cdf0a19c335eb4605cce326",
+      "patch_sha256": "b92288bba55eb9b1a0d904b3d1ac7df9d09d132e0fdc8872161aca314e399028",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api control-plane code (overlay)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "ALIAS_FLIP",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-c-lambda"
+      ]
+    },
+    "deploy/lambda/api/services/dispatch_service.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/services/dispatch_service.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "6b998941b86734bcb8f9fc0901cc49d5704d4a8082f0862b70c856ccf16cc6a3",
+      "patch_sha256": "9d5183734f36bf9c092e55bcaece78bf79399cbd9bc36b69c93567d2bc745424",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api control-plane code (overlay)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "ALIAS_FLIP",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-c-lambda"
+      ]
+    },
+    "deploy/lambda/api/services/host_service.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/services/host_service.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "8af4ad419ec9dc4e846ea2f7947443ec3ecf276d1e648d7c150f9ad2b2b277a8",
+      "patch_sha256": "d40eb38fd7588ae17bfd2cc517e34cbf2caea1c44537fe5d014585ab48b38f8b",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api control-plane code (overlay)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "ALIAS_FLIP",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-c-lambda"
+      ]
+    },
+    "deploy/lambda/api/services/image_slot_service.py": {
+      "change": "A",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/services/image_slot_service.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "6fe67c6f29fea2716022ad00aa2827e96120841a030bd95f561865a93571bafc",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api control-plane code (overlay)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "ALIAS_FLIP",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-c-lambda"
+      ]
+    },
+    "deploy/lambda/api/services/lifecycle_dispatch.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/services/lifecycle_dispatch.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "985198736765c882231b84af8d0bfe3e970ac4732170e5a1e20485f326f2796c",
+      "patch_sha256": "0514111b228578a525e0ec7820377c76fca3283ae0e589d81a3131bc63573be5",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api control-plane code (overlay)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "ALIAS_FLIP",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-c-lambda"
+      ]
+    },
+    "deploy/lambda/api/services/tenant_service.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/services/tenant_service.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "9fbaec9fc53b843b48d563acb5e5847413c809ad0908aa545e5bb47c280f2e16",
+      "patch_sha256": "219778d8770a2886c58742f198e87b150f2f63de2ef13f5729724f83be95eb54",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api control-plane code (overlay)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "ALIAS_FLIP",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-c-lambda"
+      ]
+    },
+    "deploy/lambda/api/services/tenant_stats_service.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/services/tenant_stats_service.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "1fda49731cc1caca7d6b6c1d98113a8b52228fb6b450c2fd6f47d36a2c5b3825",
+      "patch_sha256": "45e0b401450a03dc97ce568b4702c0374ee22f46693c409fb203164c931fe382",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api control-plane code (overlay)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "ALIAS_FLIP",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-c-lambda"
+      ]
+    },
+    "deploy/lambda/health_check/handler.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/health_check/handler.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "66a06280b2e8fb58447d31d2eee84c89ad9fe5f28418fec8d028d38ef59ebdcf",
+      "patch_sha256": "a3a8035e7cb8ff761237ab8ec2a52b981686be57ccb3cd1ad4656020a957a48c",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-health-check code",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "REDEPLOY_ZIP",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-c-lambda"
+      ]
+    },
+    "deploy/lambda/scaler/handler.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/scaler/handler.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "17f600d401fe70fb452921726275c37ba4e47240c1fb9521467c20e2bf20e061",
+      "patch_sha256": "5dc20f11757d58c70e0e0331b2e26de66a84cdcdfe43d8703109517332519b72",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-scaler code",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "REDEPLOY_ZIP",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-c-lambda"
+      ]
+    },
+    "deploy/lambda/tenant_stats/handler.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/tenant_stats/handler.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "6dab0f466663bcb7c5510abb5ed376172350260ed065e4be958763af2e5e6103",
+      "patch_sha256": "d955e88f26689d02c0e047c600622666793f9460d8010f4c8ce4034e2a0b045a",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-tenant-stats code",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "REDEPLOY_ZIP",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-c-lambda"
+      ]
+    },
+    "deploy/lib/mint-shared-vkey.sh": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/deploy/lib/mint-shared-vkey.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "85cd23dda78f42db447fb1d7c60da51cfa0dc811079929fcab55a1549cea200f",
+      "patch_sha256": "4f6d671de4f0d4874b1fed5a6ae307dbfb1265d3a339784def9bf700cca518c1",
+      "operations": [
+        {
+          "resource": "file:deploy/lib/mint-shared-vkey.sh (shipped orchestration/console/edge code)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-deploy-other"
+      ]
+    },
+    "deploy/litellm/.env.example": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/deploy/litellm/.env.example.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "516d98ae18d8b1362d1b3e2613b39a8b08fe8d0cb416d97510a4de54e02feab5",
+      "patch_sha256": "f625bd567eeb7b99cfce41f8ea22b57857beda83353b7c5ad2111b3aad79e596",
+      "operations": [
+        {
+          "resource": "file:deploy/litellm/.env.example (shipped orchestration/console/edge code)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-deploy-other"
+      ]
+    },
+    "deploy/litellm/LITELLM-RUNBOOK.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "db93600cd50a0ca405307f7624b3d25a3861ec68be665cb5738abae9dcce43aa",
+      "patch_sha256": "707cf6a56b2d19440fc218e389de0a817c7aaa919b29ff4a011adf91f773742a",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "deploy/litellm/litellm-up.sh": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/deploy/litellm/litellm-up.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "cb76369ca3e9fdf8ff6b3e0d82035be231aac161f042279fbf367ac5862ba33e",
+      "patch_sha256": "f714b7bc73f2757af556174d107b393cc7a50d96d5db1ffb07f20a2e5c5c482c",
+      "operations": [
+        {
+          "resource": "file:deploy/litellm/litellm-up.sh (shipped orchestration/console/edge code)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-deploy-other"
+      ]
+    },
+    "deploy/monitoring/wazuh-two-ec2/RUNBOOK.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "0602d3aea0db43e5c1ad51fda610c09bc10f3aa48233f2c03c499c87f6408182",
+      "patch_sha256": "5f2cf77141a1056da7256ec05d63418239006f6c1add16ce09c2a466458bfaa6",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "deploy/monitoring/wazuh-two-ec2/setup-wazuh-two-ec2.sh": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/deploy/monitoring/wazuh-two-ec2/setup-wazuh-two-ec2.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "605ec97a372a386038d9536317c35ce5adcf117fc293804409b1aa561b7b398b",
+      "patch_sha256": "8b1f0fa1c2096595e8c44b7ea4d32ffcaf51b812ded09b2a97a47f11c1281af6",
+      "operations": [
+        {
+          "resource": "file:deploy/monitoring/wazuh-two-ec2/setup-wazuh-two-ec2.sh (shipped orchestration/console/edge code)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-deploy-other"
+      ]
+    },
+    "deploy/runtime-config-export/apply-hardening.sh": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/deploy/runtime-config-export/apply-hardening.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "04358fc15a9179202680abd7e5441fa60c1d70f5d9cebe3ef1d6189412b90391",
+      "patch_sha256": "00f87c608b6e58cf83f48e07025e9449213fe4bcb07f3f66f5894fd0edf488f4",
+      "operations": [
+        {
+          "resource": "file:deploy/runtime-config-export/apply-hardening.sh (shipped orchestration/console/edge code)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-deploy-other"
+      ]
+    },
+    "deploy/stacks/_helpers.py": {
+      "change": "M",
+      "layer": "D-cdk",
+      "artifact": null,
+      "artifact_status": "OPERATION_ONLY",
+      "artifact_disposition": {
+        "kind": "RESOURCE_OPERATIONS",
+        "evidence": "cloudformation-resource-closure"
+      },
+      "base_sha256": "b75987ff27b58cc9595a91c6956dd8a6821c6c9d7fdf849e1bccfc2c3745f0b3",
+      "patch_sha256": "134c738d465e1c85dfa59013ee9eb918525c3b0cc2fa13e444899ce0f700618d",
+      "operations": [
+        {
+          "resource": "cdk-helper:host_golden_ami_parameter_name + shared synth helpers",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-d-cdk"
+      ]
+    },
+    "deploy/stacks/compute.py": {
+      "change": "M",
+      "layer": "D-cdk",
+      "artifact": null,
+      "artifact_status": "OPERATION_ONLY",
+      "artifact_disposition": {
+        "kind": "RESOURCE_OPERATIONS",
+        "evidence": "cloudformation-resource-closure"
+      },
+      "base_sha256": "f6a71769530e0857d1e29212afb31f87d05fb7ab0cdd51189086ad5912d51b52",
+      "patch_sha256": "a4928c2dab1551c357300e2552065df72e4ee6ff81c4ca54587348f3f28f1ab1",
+      "operations": [
+        {
+          "resource": "iam/env:control-plane compute grants + env for image/bootstrap",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-d-cdk"
+      ]
+    },
+    "deploy/stacks/edge_bundle.py": {
+      "change": "A",
+      "layer": "D-cdk",
+      "artifact": null,
+      "artifact_status": "OPERATION_ONLY",
+      "artifact_disposition": {
+        "kind": "RESOURCE_OPERATIONS",
+        "evidence": "cloudformation-resource-closure"
+      },
+      "base_sha256": null,
+      "patch_sha256": "3846d40327fefdce615c5c474aa1a813cf6696be3546e8ad1541687b07c695f6",
+      "operations": [
+        {
+          "resource": "s3-assets:edge bootstrap bundle (NEW helper module)",
+          "class": "MANUAL_CLI_REVIEW",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-d-cdk"
+      ]
+    },
+    "deploy/stacks/ha_edge.py": {
+      "change": "M",
+      "layer": "D-cdk",
+      "artifact": null,
+      "artifact_status": "OPERATION_ONLY",
+      "artifact_disposition": {
+        "kind": "RESOURCE_OPERATIONS",
+        "evidence": "cloudformation-resource-closure"
+      },
+      "base_sha256": "733b002c2c4aba84e13831069e28d3181622a1cb7cfc2255bf51c7b82994c05f",
+      "patch_sha256": "da546af5acc6cc579069d60d5cb74f5d13d73899fd18b46b27ac47f7c30eec97",
+      "operations": [
+        {
+          "resource": "ec2:openclaw-host-lt golden-AMI opt-in (resolve:ssm) + host LT wiring",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "LT_REVERT",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-d-cdk"
+      ]
+    },
+    "deploy/stacks/host_image.py": {
+      "change": "A",
+      "layer": "D-cdk",
+      "artifact": null,
+      "artifact_status": "OPERATION_ONLY",
+      "artifact_disposition": {
+        "kind": "RESOURCE_OPERATIONS",
+        "evidence": "cloudformation-resource-closure"
+      },
+      "base_sha256": null,
+      "patch_sha256": "f2252d73c0e4897349328440394f93dc449b6afda670529e953b39a962acacbe",
+      "operations": [
+        {
+          "resource": "imagebuilder:OpenClawHostImage pipeline/component/recipe (NEW stack, opt-in)",
+          "class": "MANUAL_CLI_REVIEW",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-d-cdk"
+      ]
+    },
+    "deploy/stacks/lambdas.py": {
+      "change": "M",
+      "layer": "D-cdk",
+      "artifact": null,
+      "artifact_status": "OPERATION_ONLY",
+      "artifact_disposition": {
+        "kind": "RESOURCE_OPERATIONS",
+        "evidence": "cloudformation-resource-closure"
+      },
+      "base_sha256": "5298ba154c1ea0c20c8d0ca0210c211ad0ee38a92b3d6bc1900923a36596ddfa",
+      "patch_sha256": "b4093090ebb7ab3e37fe3b65866949b318b5be0d9d5666c53662058dd33e3c16",
+      "operations": [
+        {
+          "resource": "apigw:6 new control-plane routes (bootstrap/versions|promote, hosts/{id}/promote-canary|reclaim-images|image-slots, delete-image-snapshot) + OPTIONS/CORS + stage redeploy",
+          "class": "AUTO_CLI",
+          "apply_cli": "lib/apply-api-routes.sh apply lib/image-routes.spec.json $API_ID v1 $REGION",
+          "verify_cli": "lib/apply-api-routes.sh verify lib/image-routes.spec.json $API_ID v1 $REGION",
+          "rollback_cli": "lib/apply-api-routes.sh rollback lib/image-routes.spec.json $API_ID v1 $REGION",
+          "artifact_refs": [
+            "lib/apply-api-routes.sh",
+            "lib/apply-api-routes.py",
+            "lib/image-routes.spec.json"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        },
+        {
+          "resource": "iam/env:IMAGE_JOBS_TABLE+BACKUP_BUCKET env and DDB/EC2/S3/KMS grants for api_fn, lifecycle-consumer, health_fn",
+          "class": "AUTO_CLI",
+          "apply_cli": "lib/apply-fn-grants.sh apply $REGION $ACCOUNT_ID $HOST_LT_ID",
+          "verify_cli": "lib/apply-fn-grants.sh verify $REGION $ACCOUNT_ID",
+          "rollback_cli": "true",
+          "artifact_refs": [
+            "lib/apply-fn-grants.sh"
+          ],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        },
+        {
+          "resource": "lambda/sqs:openclaw-lifecycle-consumer Timeout 900 + openclaw-lifecycle.fifo VisibilityTimeout 960 + consumer ESM BatchSize 1",
+          "class": "AUTO_CLI",
+          "apply_cli": "lib/apply-dispatch-tuning.sh apply $REGION",
+          "verify_cli": "lib/apply-dispatch-tuning.sh verify $REGION",
+          "rollback_cli": "lib/apply-dispatch-tuning.sh rollback $REGION",
+          "artifact_refs": [
+            "lib/apply-dispatch-tuning.sh"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-d-cdk"
+      ]
+    },
+    "deploy/stacks/network_vpc.py": {
+      "change": "M",
+      "layer": "D-cdk",
+      "artifact": null,
+      "artifact_status": "OPERATION_ONLY",
+      "artifact_disposition": {
+        "kind": "RESOURCE_OPERATIONS",
+        "evidence": "cloudformation-resource-closure"
+      },
+      "base_sha256": "1722bf363ff8cef9e88ee8a57f8c22a7714124b0f9539e9a20688789a88a7e5a",
+      "patch_sha256": "c8780080c2cb56f5d2aaeb2111ab6aa027df5e73bcef7fa1529f192a99e7f21e",
+      "operations": [
+        {
+          "resource": "vpc:comment/contract-only touch (no resource delta expected)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-d-cdk"
+      ]
+    },
+    "deploy/stacks/observability.py": {
+      "change": "M",
+      "layer": "D-cdk",
+      "artifact": null,
+      "artifact_status": "OPERATION_ONLY",
+      "artifact_disposition": {
+        "kind": "RESOURCE_OPERATIONS",
+        "evidence": "cloudformation-resource-closure"
+      },
+      "base_sha256": "5ecb475710030c5ea70e123608f5020cf672cea359d8ee5b39816592da2a1049",
+      "patch_sha256": "d7a3ff7271cb3b5807aaf1e8cf2f7a6a6b93da0ee3827b8e93385b69bd684270",
+      "operations": [
+        {
+          "resource": "cloudwatch/logs:observability wiring for image + bootstrap flows",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-d-cdk"
+      ]
+    },
+    "deploy/stacks/storage.py": {
+      "change": "M",
+      "layer": "D-cdk",
+      "artifact": null,
+      "artifact_status": "OPERATION_ONLY",
+      "artifact_disposition": {
+        "kind": "RESOURCE_OPERATIONS",
+        "evidence": "cloudformation-resource-closure"
+      },
+      "base_sha256": "6c6b8416764cd1d26e6916251e0946f3a63f5732d6b1a63b14ed08cc62feb7a8",
+      "patch_sha256": "f77de59b86b0d0b1f3ad342d680223254efcedc16e9023db0aadef0a71df7232",
+      "operations": [
+        {
+          "resource": "ddb:openclaw-image-jobs (NEW) HASH job_id + TTL expires_at + GSI gsi_idempotency(instance_id,idempotency_key) + GSI gsi_host_created(instance_id,created_at)",
+          "class": "MANUAL_CLI_REVIEW",
+          "apply_cli": "lib/apply-image-jobs-table.sh apply $REGION",
+          "verify_cli": "lib/apply-image-jobs-table.sh verify $REGION",
+          "rollback_cli": "lib/apply-image-jobs-table.sh rollback $REGION",
+          "artifact_refs": [
+            "lib/apply-image-jobs-table.sh"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-d-cdk"
+      ]
+    },
+    "deploy/userdata/host-agent.py": {
+      "change": "M",
+      "layer": "B-s3",
+      "artifact": "host-scripts/host-agent.py.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "fc7a67b9b1a2bad2384069c0a9819c383e01515e2af83d22d9d0b52bcc68bac1",
+      "patch_sha256": "a6abd7e08557151719d46bf220b41dfa7faeeaffa605e3dadd85782c41ce9a1a",
+      "operations": [
+        {
+          "resource": "file:/home/ubuntu/host-agent.py (S3 deployment/scripts)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-b-s3"
+      ]
+    },
+    "deploy/userdata/init-host.sh": {
+      "change": "M",
+      "layer": "A-lt",
+      "artifact": "launch-template/init-host.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "7b347726c9445c8c77da0675d854369ffd7652ec4e3d914f46cc96b0207baf0d",
+      "patch_sha256": "1a68df6da1b3405fd32fbbf63addd4ec4fb6985623213f133a327d8ffb6022e8",
+      "operations": [
+        {
+          "resource": "file:/opt/openclaw/init-host.sh (LT-baked userdata)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "LT_REVERT",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-a-lt"
+      ]
+    },
+    "deploy/userdata/launch-vm.sh": {
+      "change": "M",
+      "layer": "B-s3",
+      "artifact": "host-scripts/launch-vm.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "059b73b8fab568df056a9bd2ea44873da62325624e5f044a3368a44476f75b75",
+      "patch_sha256": "bc2ba8a9fe76d80c5019b3433cbfecb1ba51c27aa2aae896b33509b1b2b72358",
+      "operations": [
+        {
+          "resource": "file:/home/ubuntu/launch-vm.sh (S3 deployment/scripts)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-b-s3"
+      ]
+    },
+    "deploy/userdata/provision-host.sh": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/provision-host.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "11a3cbb7e6fe0177e4319cce34e0f20643a6251920da583c3288530c83c2d6cc",
+      "operations": [
+        {
+          "resource": "file:/home/ubuntu/provision-host.sh (S3 deployment/scripts)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-b-s3"
+      ]
+    },
+    "deploy/userdata/route_ops.py": {
+      "change": "M",
+      "layer": "B-s3",
+      "artifact": "host-scripts/route_ops.py.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "ff0b6b5b179562f4f3ee3aab903daa826dd52e1db9df7fc0288633b8802656d1",
+      "patch_sha256": "bdc637723f39ab73e86b03ac27d2a8378978bcb7892148041e989dd0be29a917",
+      "operations": [
+        {
+          "resource": "file:/home/ubuntu/route_ops.py (S3 deployment/scripts)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-b-s3"
+      ]
+    },
+    "docs/README-CN.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "1106d57bfe16fb2154f85f2643e719397d69e39eba589c5e347fc4205cb21477",
+      "patch_sha256": "c49441647d2b9ce1e0e47d0b2c93c473948f2ef8e28d26b4917123ff0b72327c",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/api/copy-file-from-s3-api.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "3530ea7ab7afaf43fe61d2056501d2969fc17c451980b061318fd4d8c52c2729",
+      "patch_sha256": "178cdfc6fc46a8b6b6785dd9fbdf9fe7e959b1a13fb5e0ffb9e801e9bc0e3882",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/api/host-edge-bootstrap-api.md": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "12528292f3be5c7e728f187244bbef338a343580dfaae0dd43603f4abf65b2bc",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/api/pull-image-api.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "c5c1ade183ff0607d732f1e005ff7753ec5ec6294fc697f886e932a764bcacbd",
+      "patch_sha256": "79af98486a619c2d2b428220e867a5468c52d59d30f4b7ab57e9738edbc64960",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide-en/01-overview.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "692931e481d029b442658ae4b13dbc452c2890ee2b8f832e92a9c21cbbf9ba83",
+      "patch_sha256": "eef22a222b448f48a490e54e26c1965d437e84469f351f4c01d8e0eb04139474",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide-en/02-architecture.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "11e606f9c688a101ba69686430b2050658470ebb0444d1a21bcc2313b6608886",
+      "patch_sha256": "5c6b523e1811537224c27bf4bed520afd9de5e499b761b11d7f87362a50024ae",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide-en/03-architecture-details.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "c1bcc323be3979433adf53126836a36ba28ce27d1be7b5e4e70b85227816bec6",
+      "patch_sha256": "426c3e6a11c304193dfb8c93ec5082f5dd2c65bfd27d5dc8f576c7c07bfd9b2e",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide-en/04-plan.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "112b0177627d713887a0a92819666e4f5ce9515a0297a19a6f7f27069db5d012",
+      "patch_sha256": "cccc3d9240b44837bbc3d8b61424ef0fb08013c6ab34a98ef2bc63373982371e",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide-en/05-deploy-use-troubleshoot.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "8c1d342862ab06b76cd4a2da70ac7ef7b47199836b2c29fa896273ea7a36c98a",
+      "patch_sha256": "02f0d31caf2c8f76b851885ddbe0ef1a3069dfc14b595a94c39984998f8f0eb3",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide-en/06-developer-guide.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "08cdf6d1a43d1bcad19488f8e93af053dac735448518474b5b7165275c98259a",
+      "patch_sha256": "01a2615d14d12850b5d4845833fc1c925e9592e23180aa70d317128684054791",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide-en/09-api-integration.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "3d9e38bb6cdd8c8ba735eb9e95e975c0f9891f8d220020ed53328c75d28216f4",
+      "patch_sha256": "70319b1fa88c46b8163c80b8ec14326a1d07a114ef3ca2c3b961f610edb38477",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide-en/10-external-platform-integration.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "9430bf4a515d8bff4fa538beabc76d138cd80c18edbc6d6974fdc952a050ea65",
+      "patch_sha256": "61c104ba1e2d8c79b141e3ce2abbb0c06055fc2e0993f37882e50fd169c7181e",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide-en/11-ops-maintenance.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "c52d3508344900b7682cf459932c058962d139bf4e0e177909d08b933a820fde",
+      "patch_sha256": "89ed5360da49a846a8e96f9ca3358144a6d6087219c90286de9deb2259226b1d",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide-en/13-data-plane-redesign.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "d0f4de0759157bcc660ab37deea819f2e1f903d27ad0a8b08adf41c36c9a485f",
+      "patch_sha256": "321c801d5b901237cc432a4b0524e631f33b57788b14192d0766d18b612d6160",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide-en/14-scale-100k.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "c7061cde2591d54eb7c497abf0de4c424343b6cab505bf7f68c8983101867c04",
+      "patch_sha256": "2b2506fbe3c8f39c92c8a27b5f0c414eb1c2a79eb401c5e9b417b523093ea7f4",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide-en/arch-delivery-overview.svg": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "c268ab7ea572b8f3e64a3dc82eb056c5ba0416518f878dc9476e4780ae9b585e",
+      "patch_sha256": "0196c0bbe746071a8b73dbf4a21c7203830b75458ef7d673684c9c56ddcf9e87",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide-en/arch-federation-flow.svg": {
+      "change": "D",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "DELETED",
+      "artifact_disposition": {
+        "kind": "SOURCE_DELETED",
+        "evidence": "git-diff-delete"
+      },
+      "base_sha256": "ef1e76cd21fc4fcf3b26983380ae01e98a3259708b3d765829e0aae259c76155",
+      "patch_sha256": null,
+      "operations": [
+        {
+          "resource": "file:removed doc (no live artifact)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide/00-quickstart-and-runbook.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "b9463546037c19ad756ffb82fd3f75853c52bca444ec3613837e1401376e07b8",
+      "patch_sha256": "4b9acdb4ff51583de3df3317c0e8c8488ddbe77e08a6602f61662c9b6ff584b8",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide/01-overview.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "216b5da51b8704d75fa527b331a455afcff4d3da71d3ab57b8fd065dd5532cf5",
+      "patch_sha256": "467d8a9c1b62ffa8718dc7b21e20d81fbf60dcf4b54103c8683428b872ca6e87",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide/02-architecture.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "47cac6960361d408de4eb2f4f0ac4b7cf539f6eeb2749845aff3697e77c6b56c",
+      "patch_sha256": "2d3825184561c7fce0f80658d2ab4f820535231a04d2809873edec9078567001",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide/03-architecture-details.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "6ab3ba1bde279f57c22bfa1ab458adfed27245ee5671f23fa6a04879861ba6b3",
+      "patch_sha256": "322b650e520cabfbae4ed6f2b148936aeec0d0884ba973ad2096314b6920b006",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide/04-plan.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "cf3f1bd00fc0c73a73545726b764bc0ab64736740a2615e1485539c066ead7c0",
+      "patch_sha256": "daf771810e1a230334cc01d107a9a30ec6c3dd21b67e780d66e96dd095562e56",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide/05-deploy-use-troubleshoot.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "c0653fa8532ec3ca5df0a5d1681e5fd29ab8c26d3af6a3cc4f831777347b8651",
+      "patch_sha256": "18c8dfd0bb62db6126aba742ad9f75753f4850c92636c369b9fd18c5a6d95b3e",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide/05-uninstall-solution.md": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "3749c5b4b8b28f5e0b96ceb772a82c2a12c40d515e5938c8360882099e8af154",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide/05-update-solution.md": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "2b9dbefeda02f8328282e5d1a62944201adc9112d02ee0c873c1c0a37fc7bd8c",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide/06-customer-deploy-and-teardown.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "87cf520d338c547e5f71a5e2b88bb9d25e8b11e893faafe139c0f14530f5b6b7",
+      "patch_sha256": "bc2d422d3bd119d1c05713ed94bd8d52b98d34f2cdd4fb00fde1bb1855dddfef",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide/06-developer-guide.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "37c529fcff790d40c7b9d78a0959e186d6d8a600c9216ea4e12e9e6798e7bd17",
+      "patch_sha256": "f56e0ffac5da140736b0af8dbd47ad3ccef2caeb6687940546e79d691374479b",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide/08-reference.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "82eaad9bbdd01cdf63a9af78a63a111dcc906ff5cab7c92d6c83cbc419112ddd",
+      "patch_sha256": "736265a3b946ee229bfb736a7fb6c72be142aa77fb5cc78a542e38a082f67df1",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide/09-api-integration.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "b53b463f780709d80074732f6947a08e41c74f3621be99ee4e12a61b11aed98e",
+      "patch_sha256": "d07ea2d2516d70a9c042f5f04fcba1034296d32cd20a00277a2d53cfba3495a5",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide/09-custom-llm-gateway.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "5ebcb1bf7465909c7595dead2fa3b2cd251d613c0a791e92e38aaebec92f3253",
+      "patch_sha256": "16ad9acac81dbac03c94435091eecc85947b8f82b22e27bf456450121a1f94be",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide/10-external-platform-integration.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "a75f4eb62bd3dcc8e07c5ec0eb7171ae69b870d7fae48300c515bca820313d7e",
+      "patch_sha256": "f15768447415fdcb209c09f2a3419860e67e9b8d374d3317b89a2ef1acffada1",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide/11-ops-maintenance.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "2ebcf9006f09fdebe48b3fab4c70a4e61959356fb4f75f3e958f5a922b6b1b9b",
+      "patch_sha256": "fa50a7cfe520094711d8ba9c15c14c3f8f87855f45b4abf2f8b50a5d47fa3d31",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide/12-private-api-hardening.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "8b970dd9965f7e7a01882d6c1306d91664818d6bac645d4ba63cb665674bde0d",
+      "patch_sha256": "12c702dfc34f4e8d42b69a98c976429b80948e89cb125e3ccc48e78b9018c21d",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide/13-data-plane-redesign.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "997e162ec2336b2ed94eb63560fdd6425e871cb0b9aa090b918f2450d2db465f",
+      "patch_sha256": "53c0ecf2f936ac607b163bfda500a8fed4ab4743777499b9ef73ded56af9a676",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide/14-scale-100k.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "51e5fe1cbd3abc6f2c093df7e4b00db7367a5b7239e563f80bf0ab708fa548f5",
+      "patch_sha256": "3aaedc0365a881a922e33480305188107d9e53e6c992892e9d8745ec19fea909",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide/15-image-build-getting-started.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "c30f30d633aa4df6d599d5d36896b9d6115d1f08bf073c7482df6380f9d4e483",
+      "patch_sha256": "0e218b4cf0975032a8138a64060e02d63d14cd6b6d56ac36c9cbc9e9c6166f26",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide/16-hot-swap-vs-baked-and-host-rebuild.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "0d6095d2967f3a8be81aaca18db5c241fbbed712edb2540e1b16a1e6ee201d93",
+      "patch_sha256": "81163b3ff185e027d95011a23ffa433c6512274f6ee711444891d72062a12b60",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide/17-observability-ops.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "6e23febea117b650da74105c2c2a18ef29291ea95b7cf5bd6e181282c629d469",
+      "patch_sha256": "35b4154b0dc95813d3b069a0808a4d596b254a7f2d5a3077d0bcaaa575054857",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide/README.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "e8d7d79ce19b0cf4f64b9e7c7023dcad426eb9e4b5630244f179968415da7c73",
+      "patch_sha256": "29ceb8fb342ddfddbf78a938cd0a55ccc0123d069260627eed10dff90c8e56ab",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide/arch-delivery-overview.svg": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "00b0e82da2e899420e93df92ae2bcdbd629d59e3eb587c1b3ef75b6d275ce3f2",
+      "patch_sha256": "224ba753fbc8a581e3a23db24e6685b76657b915731ae4b1d2922d06ac2eca98",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide/arch-federation-flow.svg": {
+      "change": "D",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "DELETED",
+      "artifact_disposition": {
+        "kind": "SOURCE_DELETED",
+        "evidence": "git-diff-delete"
+      },
+      "base_sha256": "ee3ad843bac457964e6fafe4058a90cab495752be85d7091611a9b515a26bb68",
+      "patch_sha256": null,
+      "operations": [
+        {
+          "resource": "file:removed doc (no live artifact)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide/arch-wss-dataplane-controlplane.svg": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "56ddbdb533e2c1ae32cf3b8cb7c2fe07ea9cb45c97acb88158c94b28233975b2",
+      "patch_sha256": "f29f07639dc041de7a1b74050c7b0070c4f8e3c3f76c620ec3ae801ea180dd10",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide/openapi.yaml": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "0033bcfbcf308d3b6d1f50eeb6a15e6f33ba2a6111eb5c41ffdc2f8973086988",
+      "patch_sha256": "6e717055dd1feea5d39f48b17d11ae274555942ea0eb20f49d8183a693aea33d",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/prepare_test_snapshot.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "875bba86c89df1b34ad8075e28c3a8d6052cf3268f439b0343b3bb5a43f2d724",
+      "patch_sha256": "e94792d13ec7b1b9126b3c08a8a9c624b9009ebf0d8740d82f3ff15b796efffd",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/pull-image-flow-333.excalidraw": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "a4f5fd87f4c8b48f2e52f4c01e84d3b18a9c300a489fa244256c3533b8b4e0b6",
+      "patch_sha256": "2833663b2af229b342b74a8d36dc27254a0cf19245fb8610e98ccce4b093bf1d",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/pull-image-flow-333.png": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "a6a9ae2465fa549564db95efe6c54e5b2b82206ae891efb6dccd327be4bccdf1",
+      "patch_sha256": "51bf97c1a1e24170e9e74a8552cdc08ccc03b9fa8c8c7d604edd7bd50b5dcaa4",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/web_console.png": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "7876ef0ed8f4e485bcbc6497d901b17cd096a817049047fa274af57d17a53c5b",
+      "patch_sha256": "32d6b2b43c74a9debe1ddab83af6118639447324ee97f5cd9839532e25657792",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/web_console_settings.png": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "6af1db3610376cb0a00949f8296c04ae13953b3fc2fe9d52a7a594da358cf6c7",
+      "patch_sha256": "bfb12ef87e0aaf68aeee94c10eaac24989e787b17ec2eca1e9867a5802ccd932",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/manifest-2026-08-06-203233-74f5460c.json": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/patch/manifest-2026-08-06-203233-74f5460c.json.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "0527b73b4bb53793b5a837d904708628b8599f21da55a85274e61e508f66c7bf",
+      "operations": [
+        {
+          "resource": "file:patch/manifest-2026-08-06-203233-74f5460c.json (shipped orchestration/console/edge code)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-deploy-other"
+      ]
+    },
+    "patch/push-marker-2026-08-06-203233-74f5460c.md": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "d443a5fd4345d6cfd0ce52b8beee990f808d2d1bc48fb892c47b4a6b35f8f68f",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "pyproject.toml": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "7d5b3b930e847f1d28dfd1c9eafda34c7e431294b4f8230f414bc5dc2add9b14",
+      "patch_sha256": "fbd2538f53aaeaefa8c0304df30095a51854630d8771aca56f345e18b8c322b3",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "samples/finance-agent/tests/sentinel-guard/test-harness.mjs": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/samples/finance-agent/tests/sentinel-guard/test-harness.mjs.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "5adf14fd288fe4ffacef037d03321aaedec74a3f27b6ec33e031c3b76c71098b",
+      "patch_sha256": "14bf4555da32a9685bab4c0ce8f8bc68d5f98fb7554e56ac2ccc75b03a4bbd01",
+      "operations": [
+        {
+          "resource": "file:samples/finance-agent/tests/sentinel-guard/test-harness.mjs (shipped orchestration/console/edge code)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-deploy-other"
+      ]
+    },
+    "scripts/checks/ai-review-checklist.md": {
+      "change": "D",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "DELETED",
+      "artifact_disposition": {
+        "kind": "SOURCE_DELETED",
+        "evidence": "git-diff-delete"
+      },
+      "base_sha256": "ac56004911fa8c11a35edf70ab79e18575794b9eb4735908b19e4b2c2ceedf32",
+      "patch_sha256": null,
+      "operations": [
+        {
+          "resource": "file:removed doc (no live artifact)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "scripts/checks/doc_freshness.py": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/scripts/checks/doc_freshness.py.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "050c32d050fc4d9843ea22cf3a1d8c36a349f18363512015de3564822d451129",
+      "patch_sha256": "cd247e126aaa643c01d99385969e37eaa5e8d31fa70f6f28f7dc827e1f8a4329",
+      "operations": [
+        {
+          "resource": "file:scripts/checks/doc_freshness.py (shipped orchestration/console/edge code)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-deploy-other"
+      ]
+    },
+    "scripts/checks/hardcoded.sh": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/scripts/checks/hardcoded.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "223ca9e08d752a374a3968420727f3ce17b1c3bc644407229bd39685a4f90bdf",
+      "patch_sha256": "ee4e979494b43c46c998e95b75a292a282d43edabaec7e8174ee889577335d36",
+      "operations": [
+        {
+          "resource": "file:scripts/checks/hardcoded.sh (shipped orchestration/console/edge code)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-deploy-other"
+      ]
+    },
+    "scripts/checks/lib.sh": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/scripts/checks/lib.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "a5cb512ce304629ecb1ed24352d61dbf15a8b1bcb63fa3477be46d5b44a84941",
+      "patch_sha256": "2a7936d41f62e75bd0bda7678b3fa571ad1ede2d9ca1ca232ef6a7aaa59868b3",
+      "operations": [
+        {
+          "resource": "file:scripts/checks/lib.sh (shipped orchestration/console/edge code)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-deploy-other"
+      ]
+    },
+    "scripts/checks/preflight-region.sh": {
+      "change": "D",
+      "layer": "deploy-other",
+      "artifact": null,
+      "artifact_status": "DELETED",
+      "artifact_disposition": {
+        "kind": "SOURCE_DELETED",
+        "evidence": "git-diff-delete"
+      },
+      "base_sha256": "904ff7b626c5a21afa15e0937e9bf46513bc3792bb07e831579efdf1238334fb",
+      "patch_sha256": null,
+      "operations": [
+        {
+          "resource": "file:remove preflight-region.sh from ship surface",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-deploy-other"
+      ]
+    },
+    "scripts/checks/python.sh": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/scripts/checks/python.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "0f9a20b8b65529d0d26f5961da823ee587663518ce11a18ccbe7e5cfeef7fd3e",
+      "patch_sha256": "c675ad516e061f5ef3d8ef76ea512b4ba5e0145d7e286a3753211eb6089e6a89",
+      "operations": [
+        {
+          "resource": "file:scripts/checks/python.sh (shipped orchestration/console/edge code)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-deploy-other"
+      ]
+    },
+    "scripts/checks/secrets.sh": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/scripts/checks/secrets.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "7b1b55822281791a0bd8764e957031dad4076c14802fba2bf3962a4c13617932",
+      "patch_sha256": "df0ebe534e0695de705b6d56417929aae056431e88164666a90f63eaab04bba1",
+      "operations": [
+        {
+          "resource": "file:scripts/checks/secrets.sh (shipped orchestration/console/edge code)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-deploy-other"
+      ]
+    },
+    "setup.sh": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/setup.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "cb6d07a5ae6da3bbd677cf8140a0416566e4ac308e136016379975e958b2e3a9",
+      "patch_sha256": "f9980fb7a897b4b5c6367b800bf7bd428ff3a71799112241a15c18733613603e",
+      "operations": [
+        {
+          "resource": "file:setup.sh (shipped orchestration/console/edge code)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#428-deploy-other"
+      ]
+    },
+    "uv.lock": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "d815f12a09824758a441891e69c7be52cd93b677e908715de0ce329d83102bac",
+      "patch_sha256": "4b6d25e2da7766093cf5bdde7d65181c75833e39852f891ddc2741cbc80cab7f",
+      "operations": [
+        {
+          "resource": "doc:inert metadata (not shipped to runtime)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": null,
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    }
+  },
+  "fixes": [
+    {
+      "id": "#428-c-lambda",
+      "summary": "control-plane Lambda sync: image build/slot/lease/channel + bootstrap-version services (new modules) and dispatch/tenant/host/scheduling service updates; applied by overlaying patched source onto the live openclaw-api package and redeploying the pure-source scaler/health/stats functions.",
+      "paths": [
+        "deploy/lambda/api/core/auth.py",
+        "deploy/lambda/api/core/bootstrap_lt.py",
+        "deploy/lambda/api/core/clients.py",
+        "deploy/lambda/api/core/image_channel.py",
+        "deploy/lambda/api/core/image_jobs.py",
+        "deploy/lambda/api/core/image_lease.py",
+        "deploy/lambda/api/core/image_ops.py",
+        "deploy/lambda/api/core/image_slots.py",
+        "deploy/lambda/api/core/scheduling.py",
+        "deploy/lambda/api/core/ssm_dispatch.py",
+        "deploy/lambda/api/handler.py",
+        "deploy/lambda/api/services/bootstrap_version_service.py",
+        "deploy/lambda/api/services/dispatch_poller.py",
+        "deploy/lambda/api/services/dispatch_service.py",
+        "deploy/lambda/api/services/host_service.py",
+        "deploy/lambda/api/services/image_slot_service.py",
+        "deploy/lambda/api/services/lifecycle_dispatch.py",
+        "deploy/lambda/api/services/tenant_service.py",
+        "deploy/lambda/api/services/tenant_stats_service.py",
+        "deploy/lambda/health_check/handler.py",
+        "deploy/lambda/scaler/handler.py",
+        "deploy/lambda/tenant_stats/handler.py"
+      ],
+      "applies_when": "always",
+      "params_changed": [],
+      "verification_ids": [
+        "v-428-lambda-codesha",
+        "v-428-lambda-invoke",
+        "v-428-consumer-codesha"
+      ]
+    },
+    {
+      "id": "#428-a-lt",
+      "summary": "init-host.sh (LT-baked host bootstrap) updated for the host-image/bootstrap flow; shipped in FULL under launch-template/ and applied via the manual LT-version + controlled-instance-refresh path (never a stack redeploy).",
+      "paths": [
+        "deploy/userdata/init-host.sh"
+      ],
+      "applies_when": "always",
+      "params_changed": [],
+      "verification_ids": [
+        "v-428-lt-newhost"
+      ]
+    },
+    {
+      "id": "#428-b-s3",
+      "summary": "S3-pulled host userdata sync: launch-vm.sh, host-agent.py, route_ops.py and the new provision-host.sh; hot-replaced on live hosts and promoted to the assets bucket deployment/scripts/ prefix (temp-key + verify + promote).",
+      "paths": [
+        "deploy/userdata/host-agent.py",
+        "deploy/userdata/launch-vm.sh",
+        "deploy/userdata/provision-host.sh",
+        "deploy/userdata/route_ops.py"
+      ],
+      "applies_when": "always",
+      "params_changed": [],
+      "verification_ids": [
+        "v-428-s3-syntax",
+        "v-428-s3-live"
+      ]
+    },
+    {
+      "id": "#428-deploy-other",
+      "summary": "pool-core / edge / console / gateway orchestration sync: setup.sh, config.yml.example, console-bff web assets, edge fluent-bit, litellm bring-up, wazuh setup, hardening, vkey minting, and scripts/checks/* gate scripts; each replaced in place with a falsifiable check.",
+      "paths": [
+        "config.yml.example",
+        "console/index.html",
+        "console/marketplace-demo/setup-federation.sh",
+        "deploy/codebuild/build-golden-on-codebuild.sh",
+        "deploy/codebuild/build-image-demo.sh",
+        "deploy/console-bff/traces.mjs",
+        "deploy/console-bff/web/index.html",
+        "deploy/console-bff/web/js/app.core.js",
+        "deploy/console-bff/web/js/app.format.js",
+        "deploy/console-bff/web/js/app.hosts.js",
+        "deploy/console-bff/web/js/app.tenants.js",
+        "deploy/console-bff/web/style.css",
+        "deploy/edge/fluent-bit/edge/fluent-bit.conf",
+        "deploy/edge/fluent-bit/install-fluent-bit.sh",
+        "deploy/lib/mint-shared-vkey.sh",
+        "deploy/litellm/.env.example",
+        "deploy/litellm/litellm-up.sh",
+        "deploy/monitoring/wazuh-two-ec2/setup-wazuh-two-ec2.sh",
+        "deploy/runtime-config-export/apply-hardening.sh",
+        "patch/manifest-2026-08-06-203233-74f5460c.json",
+        "samples/finance-agent/tests/sentinel-guard/test-harness.mjs",
+        "scripts/checks/doc_freshness.py",
+        "scripts/checks/hardcoded.sh",
+        "scripts/checks/lib.sh",
+        "scripts/checks/preflight-region.sh",
+        "scripts/checks/python.sh",
+        "scripts/checks/secrets.sh",
+        "setup.sh"
+      ],
+      "applies_when": "always",
+      "params_changed": [],
+      "verification_ids": [
+        "v-428-other-syntax"
+      ]
+    },
+    {
+      "id": "#428-d-cdk",
+      "summary": "CDK stack sync translated to manual CLI (no stack redeploy): new openclaw-image-jobs DDB table + by-instance GSI (storage.py), dispatch consumer timeout/visibility/batch tuning (lambdas.py), host golden-AMI opt-in + new OpenClawHostImage/edge-bundle stacks, and observability/compute/helper wiring. Each resource is classified AUTO_CLI or MANUAL_CLI_REVIEW with its rollback policy.",
+      "paths": [
+        "deploy/app.py",
+        "deploy/stacks/_helpers.py",
+        "deploy/stacks/compute.py",
+        "deploy/stacks/edge_bundle.py",
+        "deploy/stacks/ha_edge.py",
+        "deploy/stacks/host_image.py",
+        "deploy/stacks/lambdas.py",
+        "deploy/stacks/network_vpc.py",
+        "deploy/stacks/observability.py",
+        "deploy/stacks/storage.py"
+      ],
+      "applies_when": "always",
+      "params_changed": [
+        {
+          "name": "sqs:openclaw dispatch-consumer queue visibility_timeout",
+          "layer": "D-cdk",
+          "old_default": "180s",
+          "new_default": "960s",
+          "runtime_impact": "must stay strictly greater than the consumer Lambda timeout (now 900s) so SQS does not redeliver a still-running message; raising it only lengthens the redrive window for a genuinely stuck message — no data-plane change, applies to new dispatch messages only."
+        },
+        {
+          "name": "lambda:openclaw dispatch-consumer function timeout",
+          "layer": "D-cdk",
+          "old_default": "180s",
+          "new_default": "900s",
+          "runtime_impact": "lets a single dispatch invocation run long enough to synchronously back up a suspend before returning; more wall-clock per invocation but reserved concurrency is unchanged, so fleet throughput and cost ceiling are bounded."
+        },
+        {
+          "name": "lambda:openclaw dispatch-consumer event-source-mapping batch_size",
+          "layer": "D-cdk",
+          "old_default": "10",
+          "new_default": "1",
+          "runtime_impact": "one SQS message per invocation instead of ten serial messages; raises invocation count but removes head-of-line blocking so a slow tenant no longer stalls nine others — bounded by reserved concurrency, no data change."
+        }
+      ],
+      "verification_ids": [
+        "v-428-cdk-imagejobs",
+        "v-428-cdk-dispatch",
+        "v-428-apigw-routes",
+        "v-428-lambda-grants"
+      ]
+    }
+  ],
+  "verifications": [
+    {
+      "id": "v-428-lambda-codesha",
+      "fix_id": "#428-c-lambda",
+      "phase": "A-readonly",
+      "action": "aws lambda get-function --function-name <openclaw-api> --query Configuration.CodeSha256 and compare to the Step-1 pre-apply backup value",
+      "observable": "openclaw-api CodeSha256",
+      "pass_when": "CodeSha256 differs from the pre-apply backup (new code is live)",
+      "fail_when": "CodeSha256 unchanged (overlay did not take)",
+      "timeout_s": 120,
+      "cleanup": null
+    },
+    {
+      "id": "v-428-lambda-invoke",
+      "fix_id": "#428-c-lambda",
+      "phase": "A-readonly",
+      "action": "aws lambda invoke with a synthetic GET /images/channels (bootstrap/image route) event",
+      "observable": "invoke FunctionError field",
+      "pass_when": "FunctionError=None (handler imports the new image_* modules without ImportError)",
+      "fail_when": "FunctionError=Unhandled or an ImportError in the log tail",
+      "timeout_s": 120,
+      "cleanup": null
+    },
+    {
+      "id": "v-428-lt-newhost",
+      "fix_id": "#428-a-lt",
+      "phase": "B-lifecycle",
+      "action": "create a new LT version from the patched init-host.sh, point the ASG at it, launch ONE replacement host, watch its boot",
+      "observable": "decoded UserData + openclaw-hosts registration + ASG lifecycle result",
+      "pass_when": "no {{ }} placeholder in decoded UserData; host registers into openclaw-hosts; ASG lifecycle CONTINUE (not Heartbeat-Timeout/ABANDON)",
+      "fail_when": "literal {{PLACEHOLDER}} in UserData, host never registers, or lifecycle ABANDON",
+      "timeout_s": 900,
+      "cleanup": "terminate the single test host; revert ASG to the prior LT version"
+    },
+    {
+      "id": "v-428-s3-syntax",
+      "fix_id": "#428-b-s3",
+      "phase": "A-readonly",
+      "action": "on a host, byte-compare the replaced files to host-scripts/*.patched and run the per-type syntax check (bash -n for *.sh, python3 -m py_compile for *.py)",
+      "observable": "diff result + syntax-check exit code",
+      "pass_when": "diff empty vs the shipped .patched and every syntax check exits 0",
+      "fail_when": "any diff beyond the intended change or a non-zero syntax check",
+      "timeout_s": 120,
+      "cleanup": null
+    },
+    {
+      "id": "v-428-s3-live",
+      "fix_id": "#428-b-s3",
+      "phase": "B-lifecycle",
+      "action": "create ONE tenant on a hot-fixed host via the real API and poll GET /tenants/{id}",
+      "observable": "openclaw-tenants status field",
+      "pass_when": "reaches running within the boot window (launch-vm.sh path works)",
+      "fail_when": "stuck creating past the boot window",
+      "timeout_s": 600,
+      "cleanup": "DELETE the exact id ?keep_data=false"
+    },
+    {
+      "id": "v-428-other-syntax",
+      "fix_id": "#428-deploy-other",
+      "phase": "A-readonly",
+      "action": "for each replaced deploy-other file, byte-compare to its host-scripts/*.patched artifact and run the per-type check (bash -n / node --check / py_compile / css+html load)",
+      "observable": "diff result + per-type check exit code",
+      "pass_when": "every file matches its shipped artifact and every applicable syntax check exits 0",
+      "fail_when": "any mismatch or non-zero check",
+      "timeout_s": 180,
+      "cleanup": null
+    },
+    {
+      "id": "v-428-cdk-imagejobs",
+      "fix_id": "#428-d-cdk",
+      "phase": "A-readonly",
+      "action": "aws dynamodb describe-table --table-name openclaw-image-jobs and describe its two GSIs",
+      "observable": "TableStatus + IndexStatus for gsi_idempotency and gsi_host_created + TTL attribute",
+      "pass_when": "table ACTIVE, TTL on expires_at, and BOTH gsi_idempotency and gsi_host_created ACTIVE",
+      "fail_when": "table missing, TTL attr != expires_at, or either gsi_idempotency/gsi_host_created absent or not ACTIVE",
+      "timeout_s": 300,
+      "cleanup": null
+    },
+    {
+      "id": "v-428-cdk-dispatch",
+      "fix_id": "#428-d-cdk",
+      "phase": "A-readonly",
+      "action": "aws lambda get-function-configuration on the dispatch consumer (Timeout), get-queue-attributes on its queue (VisibilityTimeout), and list-event-source-mappings (BatchSize)",
+      "observable": "Timeout / VisibilityTimeout / BatchSize values",
+      "pass_when": "Timeout=900, VisibilityTimeout=960 (>Timeout), BatchSize=1",
+      "fail_when": "any value still at the old default (180/180/10) or VisibilityTimeout<=Timeout",
+      "timeout_s": 120,
+      "cleanup": null
+    },
+    {
+      "id": "v-428-apigw-routes",
+      "fix_id": "#428-d-cdk",
+      "phase": "B-lifecycle",
+      "action": "after applying lib/image-routes.spec.json, curl each of the 6 new routes on the v1 stage with a valid x-api-key (GET /bootstrap/versions, POST /bootstrap/promote, POST /hosts/{id}/promote-canary, POST /hosts/{id}/reclaim-images, GET /hosts/{id}/image-slots, POST /delete-image-snapshot)",
+      "observable": "HTTP status per route + apply-api-routes.sh verify exit code",
+      "pass_when": "every new route returns a non-403/non-404 status (reaches the Lambda: 200/400/409 per input) and apply-api-routes.sh verify exits 0 (each method matches the template, OPTIONS/CORS carries If-Match+Idempotency-Key)",
+      "fail_when": "any new route returns 403 Missing Authentication Token or 404 (method/resource never created), or verify exits non-zero",
+      "timeout_s": 300,
+      "cleanup": null
+    },
+    {
+      "id": "v-428-consumer-codesha",
+      "fix_id": "#428-c-lambda",
+      "phase": "A-readonly",
+      "action": "aws lambda get-function --function-name openclaw-lifecycle-consumer --query Configuration.CodeSha256 before/after overlay, then a synthetic import-probe invoke",
+      "observable": "CodeSha256 change + FunctionError on probe invoke",
+      "pass_when": "openclaw-lifecycle-consumer CodeSha256 differs from the pre-apply backup AND the probe invoke returns FunctionError=None (new image_*/bootstrap_* modules import cleanly in the consumer too)",
+      "fail_when": "consumer CodeSha256 unchanged (stale code left in place) or probe invoke FunctionError!=None",
+      "timeout_s": 180,
+      "cleanup": null
+    },
+    {
+      "id": "v-428-lambda-grants",
+      "fix_id": "#428-d-cdk",
+      "phase": "A-readonly",
+      "action": "lib/apply-fn-grants.sh verify $REGION $ACCOUNT_ID — check IMAGE_JOBS_TABLE env on api+consumer and the named inline IAM policies on each role",
+      "observable": "env var value + presence of oc428-* inline role policies",
+      "pass_when": "IMAGE_JOBS_TABLE=openclaw-image-jobs on both api and consumer, and inline policies oc428-image-jobs-txn/oc428-bootstrap-lt (api), oc428-consumer-txn (consumer), oc428-reaper-txn (health) all present",
+      "fail_when": "any env var missing/wrong or any expected inline policy absent",
+      "timeout_s": 120,
+      "cleanup": null
+    }
+  ]
+}

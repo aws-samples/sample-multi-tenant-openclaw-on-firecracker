@@ -1,0 +1,93 @@
+{
+  "version": 1,
+  "target": {
+    "stack": "OpenClawOrchestrator",
+    "rest_api_logical_id": "Api9C0D1E2F",
+    "template_method_logical_id": "ApitenantsGET",
+    "stage": "v1"
+  },
+  "template": {
+    "path": "/tenants",
+    "method": "GET"
+  },
+  "routes": [
+    {
+      "path": "/bootstrap/versions",
+      "resource_change": "A",
+      "methods": [
+        { "method": "GET", "change": "A" }
+      ],
+      "cors": {
+        "change": "A",
+        "allow_origin": "*",
+        "allow_headers": ["Content-Type", "x-api-key", "Authorization", "If-Match", "Idempotency-Key"],
+        "allow_methods": ["OPTIONS", "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"]
+      }
+    },
+    {
+      "path": "/bootstrap/promote",
+      "resource_change": "A",
+      "methods": [
+        { "method": "POST", "change": "A" }
+      ],
+      "cors": {
+        "change": "A",
+        "allow_origin": "*",
+        "allow_headers": ["Content-Type", "x-api-key", "Authorization", "If-Match", "Idempotency-Key"],
+        "allow_methods": ["OPTIONS", "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"]
+      }
+    },
+    {
+      "path": "/hosts/{instance_id}/promote-canary",
+      "resource_change": "A",
+      "methods": [
+        { "method": "POST", "change": "A" }
+      ],
+      "cors": {
+        "change": "A",
+        "allow_origin": "*",
+        "allow_headers": ["Content-Type", "x-api-key", "Authorization", "If-Match", "Idempotency-Key"],
+        "allow_methods": ["OPTIONS", "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"]
+      }
+    },
+    {
+      "path": "/hosts/{instance_id}/reclaim-images",
+      "resource_change": "A",
+      "methods": [
+        { "method": "POST", "change": "A" }
+      ],
+      "cors": {
+        "change": "A",
+        "allow_origin": "*",
+        "allow_headers": ["Content-Type", "x-api-key", "Authorization", "If-Match", "Idempotency-Key"],
+        "allow_methods": ["OPTIONS", "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"]
+      }
+    },
+    {
+      "path": "/hosts/{instance_id}/image-slots",
+      "resource_change": "A",
+      "methods": [
+        { "method": "GET", "change": "A" }
+      ],
+      "cors": {
+        "change": "A",
+        "allow_origin": "*",
+        "allow_headers": ["Content-Type", "x-api-key", "Authorization", "If-Match", "Idempotency-Key"],
+        "allow_methods": ["OPTIONS", "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"]
+      }
+    },
+    {
+      "path": "/delete-image-snapshot",
+      "resource_change": "A",
+      "methods": [
+        { "method": "POST", "change": "A" }
+      ],
+      "cors": {
+        "change": "A",
+        "allow_origin": "*",
+        "allow_headers": ["Content-Type", "x-api-key", "Authorization", "If-Match", "Idempotency-Key"],
+        "allow_methods": ["OPTIONS", "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"]
+      }
+    }
+  ]
+}

@@ -30,7 +30,7 @@
       "sha256": "89e8ec5fc34a202c3aa79645028042da9772f4324daf9d61aceca5f51ab5e314"
     },
     "lib/overlay-lambda.sh": {
-      "sha256": "752badf0d54585add964d32a8f1d9e72504f5c7fd4c183a992986fa44dbfc8f7"
+      "sha256": "e84073d655a5e2db295c4d28ba84f67b8f01aa3fcff36c1a55f7ed3e98d9c127"
     }
   },
   "paths": {
@@ -724,9 +724,9 @@
         {
           "resource": "lambda:overlay deploy/lambda/api source onto BOTH openclaw-api AND openclaw-lifecycle-consumer (same asset)",
           "class": "AUTO_CLI",
-          "apply_cli": "lib/overlay-lambda.sh apply openclaw-api lambda/api $REGION",
-          "verify_cli": "lib/overlay-lambda.sh verify openclaw-api $REGION",
-          "rollback_cli": "lib/overlay-lambda.sh rollback openclaw-api $API_BACKUP_ZIP $REGION",
+          "apply_cli": "lib/overlay-lambda.sh apply openclaw-api lambda/api $REGION live",
+          "verify_cli": "lib/overlay-lambda.sh verify openclaw-api $REGION live",
+          "rollback_cli": "lib/overlay-lambda.sh rollback openclaw-api $API_BACKUP_ZIP $REGION live",
           "artifact_refs": [
             "lib/overlay-lambda.sh"
           ],

@@ -91,10 +91,10 @@ verify)
   safe_alias "$ALIAS"
   qualifier_args=()
   [ -z "$ALIAS" ] || qualifier_args=(--qualifier "$ALIAS")
-  # synthetic dry invoke: the new image_*/bootstrap_* modules must import cleanly (FunctionError=None)
+  # REST API v1 dry invoke: imports must succeed; the unknown resource may return a normal 4xx.
   out="$(mktemp)"
   aws lambda invoke --function-name "$FN" "${qualifier_args[@]}" --region "$REGION" \
-    --payload '{"requestContext":{"http":{"method":"GET"}},"rawPath":"/__patch_import_probe","headers":{}}' \
+    --payload '{"httpMethod":"GET","resource":"/__patch_import_probe","path":"/__patch_import_probe","headers":{},"requestContext":{"identity":{}}}' \
     --cli-binary-format raw-in-base64-out "$out" \
     --query 'FunctionError' --output text >"$out.err" 2>/dev/null || true
   ferr="$(cat "$out.err" 2>/dev/null || echo None)"

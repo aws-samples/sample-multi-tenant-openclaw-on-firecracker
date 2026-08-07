@@ -12,7 +12,7 @@
   },
   "kit_files": {
     "lib/apply-api-routes.py": {
-      "sha256": "ec6e12e6bb69f49f6fb9e05267cd65566482336106b24b3837434584655312ba"
+      "sha256": "0125e8a3026fdafc9222a59f6b3c141975c142303f5258b53b751b53e643accd"
     },
     "lib/apply-api-routes.sh": {
       "sha256": "d2e782d53feb2eeac23118ee3f27854508a1e98342ae9a58eae4d92169194d8b"

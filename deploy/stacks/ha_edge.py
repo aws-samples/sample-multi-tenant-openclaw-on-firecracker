@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT-0
 
 import hashlib
+import json
 import re
 import shlex
 from collections.abc import Mapping
@@ -30,6 +31,7 @@ from aws_cdk import (
 from pathlib import Path
 
 from stacks._helpers import host_golden_ami_parameter_name
+from stacks._helpers import track_default_lt_version
 from stacks.edge_bundle import BUNDLE_OBJECT_NAME as EDGE_BUNDLE_OBJECT_NAME
 from stacks.edge_bundle import build_edge_bundle
 
@@ -191,7 +193,6 @@ def build_ha_edge(self, ctx):
     sec_cfg = getattr(ctx, "sec_cfg", None)
     vpc = getattr(ctx, "vpc", None)
 
-    # ========== Multi-AZ HA (issue #8) ==========
     # `_az_count` controls how many AZs the ASG and ALB span. Default is
     # single-AZ to minimize cross-AZ data-transfer charges; opt in via
     # config.yml `multi_az.enabled: true`.
@@ -218,7 +219,6 @@ def build_ha_edge(self, ctx):
         )
 
     # Compute allocatable resources from instance type. Fallback to the
-    # arch-aware default if config.yml omits instance_type (issue #19).
     _arch_default = (
         "m8g.xlarge"
         if (CFG.get("host", {}) or {}).get("arch") == "arm64"
@@ -249,10 +249,15 @@ def build_ha_edge(self, ctx):
 
     def _host_capacity(itype):
         """(vcpu, mem_mb) for a virtual or bare-metal instance type.
-        All instances in a MixedInstancesPolicy pool must be the same
-        capacity (host total_vcpu/total_mem is injected statically into
-        the hosts table at init), so this is computed from the primary
-        type and shared across the pool."""
+
+        Phase 7 / #430: pool members may be DIFFERENT sizes. Each host's REAL
+        capacity is what init-host.sh self-reports at boot (nproc +
+        /proc/meminfo) and registers into the hosts table, so a smaller member
+        registers its own smaller total and is never oversold. This helper is
+        only a synth-time PLANNING estimate (scale-out headroom), computed from
+        the primary type. Verified against `ec2 describe-instance-types` for the
+        four-type pool: r8g.metal-24xl 96/786432, r7g.metal 64/524288,
+        m8g.metal-24xl 96/393216, m7g.metal 64/262144 — all four match."""
         family, size = itype.split(".")[0], itype.split(".")[1]
         vcpu = _sizes[size]
         mem = vcpu * _mem_ratio[family[0]]
@@ -290,6 +295,58 @@ def build_ha_edge(self, ctx):
     init_sh = init_sh.replace(
         "{{HOST_RESERVED_MEM}}", str(CFG["host"]["reserved_mem_mb"])
     )
+    #
+    # 为什么不能只靠 nproc + /proc/meminfo:那读到的是【真机可用】值,比标称小
+    # 1.8-1.9%(固件/硬件保留:r8g 标称 768GiB 而 MemTotal 只有 754GiB),再扣
+    # reserved_* 后调度器算出的 allocatable 就到不了按标称定义的容量目标
+    # (1c2G 口径实测只到 375/250/187/124,而标称理论值是 384/256/192/128)。
+    # 早先的做法是给每个 family 配一个补偿系数(mem 1.022/1.023/1.025/1.028),
+    # 但那是四个必须手算的魔数 —— 每上一款机型都要重算一次,且极易算错
+    # (2026-08-11 就因为用推算容量而非实测,让 r7g/m7g 少了 5 个和 3 个)。
+    # 改为在 synth 时把标称规格烤进 userdata:host 用 IMDS 已取到的 instance_type
+    # 查表注册,ratio 回到干净的 cpu=4.0 / mem=1.0,零 per-family 系数。
+    #
+    # 规格来源是本文件既有的 _host_capacity(_sizes × _mem_ratio),已对四机型
+    # 逐一核对过与 `aws ec2 describe-instance-types` 一致。表里覆盖池内全部机型
+    # (含单一 instance_type 的非混池场景);host 查不到自己的机型时回落
+    # nproc+/proc/meminfo 自报(保留 Phase 7 的混池安全性,不会因表缺项就注册 0)。
+    _spec_pool = list(
+        dict.fromkeys(
+            [(CFG.get("host", {}) or {}).get("instance_type") or _itype]
+            + list((CFG.get("host", {}) or {}).get("instance_types") or [])
+        )
+    )
+    _spec_lines = []
+    for _t in _spec_pool:
+        if not _t:
+            continue
+        try:
+            _v, _m = _host_capacity(_t)
+        except KeyError:
+            # 未知 size/family token:不猜,留给 host 侧自报回落。
+            continue
+        _spec_lines.append(f"{_t} {_v} {_m}")
+    init_sh = init_sh.replace("{{NOMINAL_SPECS}}", "\n".join(_spec_lines))
+    # (_collect_stranding_stats)按 allocatable = total × ratio 计算,而 allocatable
+    # 是搁浅判据的分母。不渲染的话它只能拿 os.environ 默认 1.0 → m8g 实测
+    # allocatable_vcpu 报 96(真值 384)、stranded_vcpu 报 0(真值 192),扩容决策会
+    # 误判"无搁浅"。同一份 config 值也进 Lambda env(lambdas.py:264),两侧必须同源:
+    # 指标说的搁浅与调度器判定的搁浅得是同一件事。
+    init_sh = init_sh.replace(
+        "{{CPU_OVERCOMMIT_RATIO}}",
+        str((CFG.get("host", {}) or {}).get("cpu_overcommit_ratio", 1.0)),
+    )
+    init_sh = init_sh.replace(
+        "{{MEM_OVERCOMMIT_RATIO}}",
+        str((CFG.get("host", {}) or {}).get("mem_overcommit_ratio", 1.0)),
+    )
+    init_sh = init_sh.replace(
+        "{{OVERCOMMIT_BY_FAMILY}}",
+        json.dumps(
+            (CFG.get("host", {}) or {}).get("overcommit_by_family") or {},
+            separators=(",", ":"),
+        ),
+    )
     init_sh = init_sh.replace("{{SUBNET_PREFIX}}", CFG["vm"]["subnet_prefix"])
     init_sh = init_sh.replace(
         "{{ROOTFS_OVERLAY_MB}}", str(CFG["vm"].get("rootfs_overlay_mb", 8192))
@@ -301,12 +358,10 @@ def build_ha_edge(self, ctx):
     _edge_port_high = int((CFG.get("edge", {}) or {}).get("dnat_port_high", 15000))
     init_sh = init_sh.replace("{{DNAT_PORT_LOW}}", str(_edge_port_low))
     init_sh = init_sh.replace("{{DNAT_PORT_HIGH}}", str(_edge_port_high))
-    # #266 端口 quarantine 冷却期(config.yml → edge.port_quarantine_seconds →
     # /etc/platform.env,route_ops.py:48 读)。#222 加了 init-host.sh 的占位符
     # 却漏了这条渲染 → 真机 host-agent 起来 import route_ops 时
     # int("{{PORT_QUARANTINE_SECONDS}}") 抛 ValueError,host-agent 崩溃重启循环、
     # 整台 host 不可调度(2026-07-15 美东1 真机复现)。默认 20 与 route_ops.py
-    # 的 os.environ.get 兜底同源;0 = 关。#272 rebase 误删本段致复发,#266 二次补回。
     init_sh = init_sh.replace(
         "{{PORT_QUARANTINE_SECONDS}}",
         str((CFG.get("edge", {}) or {}).get("port_quarantine_seconds", 20)),
@@ -323,7 +378,6 @@ def build_ha_edge(self, ctx):
         "{{AMP_REMOTE_WRITE_URL}}",
         "${OC_BOOTSTRAP_AMP_REMOTE_WRITE_URL:-none}",
     )
-    # #245 host Fluent Bit: logging gate + the two host-side stream names.
     # Hardcode the names (same pattern as edge's claw-logs{gsuffix} in the edge
     # userdata below) — build_observability runs after build_ha_edge, so
     # ctx.log_firehose_stream_name_* isn't set yet at template time. Names are
@@ -357,11 +411,9 @@ def build_ha_edge(self, ctx):
         "{{BALLOON_MIN_GUEST_AVAILABLE_MB}}",
         str(balloon_cfg.get("min_guest_available_mb", 512)),
     )
-    # #187 P5 — hub 拨出端点 template 变量已随 channel/hub 数据面下线一并移除。
     # 数据面走两级路由(CloudFront → ALB → OpenResty edge → DNAT → microVM:18789),
     # microVM 不再 dial 回 hub。init-host.sh 的 CLAW_HUB_URL/CLAW_HUB_WS env
     # 已删。
-    # #39 microVM 出网默认拒绝白名单(L4 tap 级 iptables egress allowlist)。
     # 五个值写进 /etc/platform.env,init-host.sh 起 host dnsmasq + ipset 基建、
     # launch-vm.sh source 后据此决定放行/DROP。默认 enabled=false → launch-vm 保持
     # 末尾 FORWARD ACCEPT(现状零变化);true → 切默认拒绝(静态 CIDR + FQDN ipset 放行 +
@@ -425,10 +477,8 @@ def build_ha_edge(self, ctx):
     init_sh = init_sh.replace("{{EGRESS_ALLOWLIST_CIDRS}}", _egress_cidrs)
     init_sh = init_sh.replace("{{EGRESS_ALLOWLIST_DOMAINS}}", _egress_domains)
     init_sh = init_sh.replace("{{EGRESS_DNS_UPSTREAM}}", _egress_dns_upstream)
-    # #331/#327 — host 级冷启动并发闸槽数(launch-vm.sh/migrate-vm.sh 跨进程 flock 信号量上限)。
     # 一台 host 同时冷启的 VM 数不超过它,防批量 recover/多批 SSM fan-out 二次洪峰压垮 host。
     # 默认 30(与 Lambda 侧 DISPATCH_HOST_LAUNCH_CONCURRENCY 单一来源同读 vm.host_launch_slots)。
-    # 校验正整数:0/负/非法 fail-safe 回落 30,防 migrate-vm 抢锁循环因 N<1 死循环(codex #4)。
     try:
         _launch_slots = int((CFG.get("vm", {}) or {}).get("host_launch_slots", 30))
     except (TypeError, ValueError):
@@ -449,10 +499,8 @@ def build_ha_edge(self, ctx):
         "{{HOST_AGENT_SCRIPT}}",
         f"cat > /etc/systemd/system/host-agent.service << 'SVCEOF'\n{host_agent_svc}SVCEOF",
     )
-    # #389 v2 C2 — inline the provision stage instead of fetching it at boot.
     # Inlining, not `aws s3 cp`, is deliberate on three counts:
     #   1. provision's bytes become part of init-host.sh's sha256, which is the digest the
-    #      LaunchTemplate binds and verifies (#389 DoD 2/4). Editing provision therefore
     #      changes the LT, so the "what will this host run" question has one answer.
     #   2. A boot-time fetch of provision would be a network dependency in the stage whose
     #      whole purpose is removing network dependencies from boot.
@@ -581,7 +629,6 @@ def build_ha_edge(self, ctx):
     # AMI + instance type fails to boot, so we couple the two.
     _arch = (CFG.get("host", {}) or {}).get("arch", "x86_64")
     _ami_arch = "arm64" if _arch == "arm64" else "amd64"
-    # #389 v2 block 2 — golden AMI, opt-in. host.golden_ami.use=true points the LT at the
     # SSM parameter OpenClawHostImage's pipeline writes, so hosts boot an image that
     # already has every component installed and download nothing.
     #
@@ -593,6 +640,9 @@ def build_ha_edge(self, ctx):
     # Both paths run the same init-host.sh; the only difference is whether provision
     # already ran. Falling back to the plain Canonical AMI therefore stays safe.
     _golden = (CFG.get("host", {}) or {}).get("golden_ami", {}) or {}
+    # None = 没走 resolve:ssm。tracker 的 IAM 要按这个分支决定是否授 ssm:GetParameters
+    # (见下方 track_default_lt_version 调用处)。
+    _golden_param = None
     if _golden.get("use", False):
         _golden_param = _golden.get("ssm_parameter") or host_golden_ami_parameter_name(
             self._gsuffix
@@ -610,7 +660,6 @@ def build_ha_edge(self, ctx):
         "m8g.xlarge" if _arch == "arm64" else "m8i.xlarge"
     )
 
-    # ── Mixed instance pool (task #22) ───────────────────────────────
     # config host.instance_types: optional list of types the ASG may pick
     # from (availability + Spot resilience). When given, the ASG runs a
     # MixedInstancesPolicy across them; the launch template declares the
@@ -655,7 +704,6 @@ def build_ha_edge(self, ctx):
     # 配了就给 metal 绑 keypair,让堡垒机能 SSH 进去调试/起节点。生产留空=无 key。
     _host_key_name = (CFG.get("host", {}) or {}).get("ssh_key_name") or None
     # 私有子网模式下 host 不要公网 IP(默认 VPC 公有子网需要公 IP 出网,
-    # 存量 byte-identical 保 None)。#119 暴露红线。
     _host_net_mode = (CFG.get("network", {}) or {}).get("mode", "default_vpc")
     _host_assoc_pub_ip = (
         False if _host_net_mode in ("self_managed", "imported") else None
@@ -729,7 +777,6 @@ def build_ha_edge(self, ctx):
     # and HttpPutResponseHopLimit=1 stops a process one network hop away
     # from obtaining a token. host-agent.py / the AWS SDK use the IMDSv2
     # flow, so this is transparent to legitimate callers.
-    # #34 — HttpProtocolIpv6=disabled 关掉 host 侧 IMDS 的 IPv6 端点
     # (fd00:ec2::254),与 launch-vm.sh 的 per-tap disable_ipv6=1 一起把 IPv6
     # IMDS 一刀切断,不留 SSRF via IPv6 的通路。IMDSv6 是 opt-in,disable 是
     # AWS 明确记录的支持值(EC2 metadata options),默认关只是加固纪律。
@@ -763,7 +810,6 @@ def build_ha_edge(self, ctx):
         # CreateLaunchTemplateVersion merges onto SourceVersion=$Latest so
         # this would normally be inherited, but we restate it so the
         # security posture is explicit and cannot silently regress.
-        # #34 — HttpProtocolIpv6=disabled 与上面 override 保持一致。
         "MetadataOptions": {
             "HttpTokens": "required",
             "HttpPutResponseHopLimit": 1,
@@ -849,11 +895,9 @@ def build_ha_edge(self, ctx):
     )
     set_default.node.add_dependency(nested_virt)
 
-    # host 子网:self_managed / imported 走私有(AWS 暴露红线,#119/aws-architect
     # 判据 4);default_vpc 兼容档回落 public(默认 VPC 没私有子网,存量部署
     # byte-identical)。短路 `or` 之前会让 self_managed 也吃 public——已修。
     _net_mode = (CFG.get("network", {}) or {}).get("mode", "default_vpc")
-    # #272 — host.subnet_ids 非空时显式选 openclaw host 机器子网(imported 私有
     # 子网场景);缺省回落按 network.mode 的私有/公有逻辑。
     _host_subnet_ids = (CFG.get("host", {}) or {}).get("subnet_ids") or []
     if _host_subnet_ids:
@@ -890,43 +934,80 @@ def build_ha_edge(self, ctx):
     # the lifecycle-hook timeout until the bake lands the rootfs — not a deploy
     # failure. Steady-state redeploys are unaffected (image already present).
     cfn_asg = asg.node.default_child
-    # #389 v2 块5:ASG 跟踪 `$Default`(不再 pin 数字版本)。SetDefaultLTVersion CR 已把
-    # nested-virt 版本设为默认,所以 $Default 天然带 nested-virt/IMDS 加固;而 bootstrap 版本
-    # 切换 API 靠 ModifyLaunchTemplate 翻默认版本即可让下次 launch 生效,【无需】
-    # UpdateAutoScalingGroup(那会强制 RunInstances+PassRole 高危 dry-run,提权面大)。EC2 在
-    # 每次 launch 解析 $Default,故翻默认不碰存量在跑实例(K1)。set_default 依赖保证首次部署时
-    # 默认版本已就绪再起 ASG。
-    _pinned_ver = "$Default"
+    # ModifyLaunchTemplate 翻默认版本就对下次 launch 生效,不碰存量在跑实例(K1)。
+    # 但 CFN 【不能】把 `$Default` 写进模板(必填 + resource handler 阶段硬拒该字面值),
+    # 所以这里给数字版本过 CFN 校验,再由下面的 TrackDefaultLTVersion CR 改成 `$Default`
+    # —— 详见 _helpers.track_default_lt_version 的 docstring(含真机实测结论)。
+    # SetDefaultLTVersion CR 已把 nested-virt 版本设为默认,故 `$Default` 天然带
+    # nested-virt/IMDS 加固;set_default 依赖保证首次部署时默认版本已就绪再起 ASG。
+    _pinned_ver = nested_virt.get_response_field("LaunchTemplateVersion.VersionNumber")
     if len(_instance_pool) >= 2:
         # MixedInstancesPolicy across the equal-capacity pool. This property
         # is mutually exclusive with the plain LaunchTemplate property, so
         # we null that out and supply the LT ref under the mixed policy.
-        cfn_asg.add_property_override("LaunchTemplate", None)
-        cfn_asg.add_property_override(
-            "MixedInstancesPolicy",
-            {
+        _asg_override = {
+            "MixedInstancesPolicy": {
                 "LaunchTemplate": {
                     "LaunchTemplateSpecification": {
                         "LaunchTemplateId": launch_template.launch_template_id,
                         "Version": _pinned_ver,
                     },
+                    # r8g.metal-24xl → r7g.metal → m8g.metal-24xl → m7g.metal,
+                    # taken verbatim from config host.instance_types.
+                    # Do NOT add a `Priority` key here: that property exists on
+                    # AWS::EC2::SpotFleet's LaunchTemplateOverrides, NOT on the ASG's
+                    # (CFN rejects it with "Unsupported property [Priority]" — real
+                    # deploy failure, apse1 2026-08-10). For ASGs, "highest to lowest
+                    # priority" == "first to last in the list", honored when
+                    # OnDemandAllocationStrategy=prioritized.
                     "Overrides": [{"InstanceType": t} for t in _instance_pool],
                 },
                 # Capacity-optimized lowers Spot interruption by picking from
                 # the deepest-capacity pools; on-demand portion honors
                 # use_spot. Default: all on-demand unless use_spot sets a
                 # spot percentage in config.
+                #
+                # Overrides in Priority order on scale-out (default is
+                # lowest-price, which would ignore our ordering entirely and pick
+                # whatever is cheapest — i.e. m7g first, the exact inverse of the
+                # requirement). This governs which METAL TYPE gets launched;
+                # which host a TENANT lands on is the scheduler's affinity
+                # ranking (core.host_profile.affinity_tier). Both must agree or
+                # the pool fills in one order and drains in another.
+                # Spot keeps capacity-optimized: priority ordering on Spot raises
+                # interruption risk, and use_spot defaults to false for hosts.
                 "InstancesDistribution": {
                     "OnDemandBaseCapacity": CFG["asg"].get("on_demand_base", 0),
                     "OnDemandPercentageAboveBaseCapacity": (
                         0 if CFG["asg"].get("use_spot") else 100
                     ),
+                    "OnDemandAllocationStrategy": "prioritized",
                     "SpotAllocationStrategy": "capacity-optimized",
                 },
-            },
+            }
+        }
+        cfn_asg.add_property_override("LaunchTemplate", None)
+        cfn_asg.add_property_override(
+            "MixedInstancesPolicy", _asg_override["MixedInstancesPolicy"]
         )
     else:
+        _asg_override = {"LaunchTemplate.Version": _pinned_ver}
         cfn_asg.add_property_override("LaunchTemplate.Version", _pinned_ver)
+    # 部署后把 Version 改成 `$Default`(CFN 写不进去,见上)。promote 的
+    # _resolve_lt_id 硬要求字面 `$Default`,否则 409 拒绝执行。
+    # asg_shape 必须带上上面 add_property_override 的内容:L1 getter 读不到 override,
+    # 漏传会让"只改 instance pool / spot 比例"那类变更不触发 tracker 重跑。
+    # ssm_image_parameter:golden_ami.use=true 时 LT 的 ImageId 是 resolve:ssm 占位符,
+    # ASG 的 LT 授权预校验会去解析它,缺 ssm:GetParameters 必失败(见 _helpers 注释)。
+    track_default_lt_version(
+        self,
+        "TrackDefaultLTVersion",
+        asg,
+        launch_template,
+        host_role,
+        asg_shape=_asg_override,
+        ssm_image_parameter=_golden_param,
+    )
     # Lifecycle hooks (standalone resources, not inline LifecycleHookSpecificationList)
     autoscaling.CfnLifecycleHook(
         self,
@@ -947,7 +1028,6 @@ def build_ha_edge(self, ctx):
         default_result="CONTINUE",
     )
 
-    # ── #389 v2 块5:bootstrap 版本切换 API 的 host-fleet IAM ──────────────────
     # POST /bootstrap/promote 在【cdk deploy 已发布的 LT 版本】之间切默认版本:
     # DescribeLaunchTemplateVersions(枚举已发布版本、按 bootstrap sha 对账)+ ModifyLaunchTemplate
     # (把该 LT 的默认版本翻到目标已发布版本)。两台 ASG 都跟踪 `$Default`,EC2 每次 launch 解析默认
@@ -1128,19 +1208,17 @@ def build_ha_edge(self, ctx):
     # always claims max(2, az_count) subnets so single-AZ ASG mode still
     # produces a valid load balancer.
     _alb_az_count = max(2, _az_count)
-    # #272 — internal ALB + 子网可选(imported 私有子网场景)。
-    #   · alb.internal(bool):派生默认 api.mode=private → internal(控制台内网,
-    #     不经公网 CloudFront 回源);其余 → internet-facing(向后兼容)。显式设
-    #     alb.internal 优先于派生。ctx._api_mode 由 build_network_vpc 先跑设好,
-    #     缺失时回落 CFG api.mode。
+    #   · alb.internal(bool):必须显式声明,不再从 api.mode 派生,避免 API 模式
+    #     调整时静默翻转 ALB 的公网/内网形态。
     #   · alb.subnet_ids(可选 list):客户显式指定子网 id,用 from_subnet_id 导入;
     #     缺省回落现有 public/private 逻辑。
     _alb_cfg = CFG.get("alb", {}) or {}
-    _api_mode_for_alb = (
-        getattr(ctx, "_api_mode", None)
-        or str((CFG.get("api", {}) or {}).get("mode", "")).strip().lower()
-    )
-    _alb_internal = bool(_alb_cfg.get("internal", _api_mode_for_alb == "private"))
+    if "internal" not in _alb_cfg:
+        raise ValueError(
+            "config 缺 `alb.internal`。#423 起必须显式声明(不再从 api.mode 派生)—— "
+            "隐式派生会让 api.mode 的改动静默翻转 ALB 的公网/内网形态。"
+        )
+    _alb_internal = bool(_alb_cfg["internal"])
     _alb_subnet_ids = _alb_cfg.get("subnet_ids") or []
     if _alb_subnet_ids:
         _alb_subnets = [
@@ -1167,11 +1245,11 @@ def build_ha_edge(self, ctx):
         # 长静默 >180s 靠客户端 30s ping 兜)。
         idle_timeout=Duration.seconds(3600),
     )
-    # 安全红线(design decision the ops guide):公网走 CloudFront→ALB,ALB 入站【只】允许
-    # CloudFront origin-facing managed prefix list,绝不对 0.0.0.0/0 开放。
+    # 安全红线(design decision the ops guide):ALB 入站绝不对 0.0.0.0/0 开放。
     # add_listener 默认 open=True 会给 ALB SG 加 0.0.0.0/0:80 —— 必须 open=False,
-    # 再显式只放行 CloudFront prefix list。prefix list id 各区不同,从 context 读
-    # (cdk deploy 时 -c cf_origin_facing_prefix_list=pl-xxxx;ap-southeast-1=pl-31a34658)。
+    # 再显式放行 VPC CIDR;公网 ALB 额外放行 CloudFront origin-facing prefix
+    # list。prefix list id 各区不同,从 context 读(cdk deploy 时
+    # -c cf_origin_facing_prefix_list=pl-xxxx;ap-southeast-1=pl-31a34658)。
     listener = alb.add_listener(
         "HTTP",
         port=80,
@@ -1185,21 +1263,23 @@ def build_ha_edge(self, ctx):
         "us-east-1": "pl-3b927c52",
         "us-west-2": "pl-82a045eb",
     }
-    if _alb_internal:
-        # #272 — internal ALB 不经公网 CloudFront 回源,CloudFront prefix list
-        # 无意义(那是公网回源用)。改放行 VPC CIDR 到 :80/:443(绝不 0.0.0.0/0)。
-        for _p in (80, 443):
-            alb.connections.allow_from(
-                ec2.Peer.ipv4(vpc.vpc_cidr_block),
-                ec2.Port.tcp(_p),
-                "internal ALB: VPC CIDR only (no 0.0.0.0/0)",
-            )
-    else:
+    # cloudfront.enabled 默认 false 后,公网 ALB 若只放 CloudFront prefix list 会
+    # 变成公网可达但 SG 全拒的死门。公网访问者 CIDR 由运营员部署后按需追加,
+    # 绝不放行 0.0.0.0/0。
+    for _p in (80, 443):
+        alb.connections.allow_from(
+            ec2.Peer.ipv4(vpc.vpc_cidr_block),
+            ec2.Port.tcp(_p),
+            "ALB baseline: VPC CIDR only (no 0.0.0.0/0, #423)",
+        )
+    if not _alb_internal:
+        # 公网 ALB 启用 CloudFront 回源时,额外放行 origin-facing managed
+        # prefix list;保留 region 映射与 context 覆盖逻辑。
         # CloudFront origin-facing managed prefix list,按 region 映射(context 可覆盖)。
-        # 之前只从 context 读,不传就降级 VPC-only → CloudFront 回源被 SG 拒 → /hub 504
+        # 之前只从 context 读,不传会让 CloudFront 回源被 SG 拒 → /hub 504
         # (重建实撞:必须手动补 pl 才通)。给常用 region 内置默认值让一键部署即可用。
         # ap-southeast-1=pl-31a34658 已真机实测放行后 CloudFront→ALB 通;其余 region 值
-        # 若未列,部署时传 -c cf_origin_facing_prefix_list=<pl-id>(否则降级 VPC-only)。
+        # 若未列,部署时传 -c cf_origin_facing_prefix_list=<pl-id>。
         _cf_pl = self.node.try_get_context(
             "cf_origin_facing_prefix_list"
         ) or _CF_PL_BY_REGION.get(self.region)
@@ -1208,13 +1288,6 @@ def build_ha_edge(self, ctx):
                 ec2.Peer.prefix_list(_cf_pl),
                 "CloudFront origin-facing only (no 0.0.0.0/0)",
             )
-        else:
-            # 未知 region 且没传 context 则 fail-safe:只放 VPC 内(绝不退回 0.0.0.0/0)。
-            listener.connections.allow_default_port_from(
-                ec2.Peer.ipv4(vpc.vpc_cidr_block),
-                "fallback VPC-only: pass cf_origin_facing_prefix_list to lock to CloudFront",
-            )
-    # #187 P5 — hub-WS 数据面(HubTargetGroup + /hub/* listener rule + ASG 关联)
     # 已随 channel/hub 下线一并删除。数据面走 EdgeTargetGroup(OpenResty)
     # → DNAT → microVM:18789,由 P2b-iac 已建。/hub/* CloudFront behavior 也已删。
     alb.connections.allow_to(
@@ -1276,7 +1349,6 @@ def build_ha_edge(self, ctx):
         )
     )
 
-    # ╓─── [P2b · #187] 数据面两级路由 - Redis + EdgeASG + EdgeTG ─╖
     # config-gated 段。存量部署(redis.enabled=false + edge.enabled=false)
     # 零新资源、synth byte-identical。P7 部署新数据面前把两开关翻 true。
     _redis_cfg = CFG.get("redis", {}) or {}
@@ -1301,7 +1373,6 @@ def build_ha_edge(self, ctx):
             ec2.Port.tcp(6379),
             "host-agent writes route:{tenant_id}",
         )
-        # #272 — redis.subnet_ids 非空时显式选路由表 Redis/Valkey 子网(imported
         # 私有子网场景);缺省回落 PRIVATE_WITH_EGRESS → private_subnets。
         _redis_subnet_ids_cfg = _redis_cfg.get("subnet_ids") or []
         if _redis_subnet_ids_cfg:
@@ -1319,7 +1390,6 @@ def build_ha_edge(self, ctx):
                 "redis.enabled=true 需要 ≥2 私有子网跨 AZ,当前 VPC 私有子网数="
                 f"{len(_redis_subnets)}(网络模式改 self_managed 或 imported 传齐)"
             )
-        # #281 复用现网:配了 existing_subnet_group_arn 就复用客户已有子网组
         # (不建新的、不改现有);否则按 subnet_ids 建新子网组。ARN 末段即 group name。
         # ⚠️ 复用者自保:该子网组须已覆盖 ≥2 AZ(automatic_failover+multi_az 要求),
         # 否则 CreateReplicationGroup 400(复用时绕过上面的 <2 fail-loud 校验)。
@@ -1337,7 +1407,6 @@ def build_ha_edge(self, ctx):
             )
             _redis_subnet_group_name = _redis_subnet_group.ref
         _replicas = int(_redis_cfg.get("num_replicas", 2))
-        # #271 引擎可选 redis|valkey。Valkey 是 Redis OSS 的 BSD fork,ElastiCache
         # 支持 engine="valkey";协议/端口 6379 与 Redis 客户端(host-agent redis-py +
         # edge lua-resty-redis)线级兼容,数据面 route.lua 读写无需改。
         # engine_version 传 major.minor(如 "7.2"),补丁号(7.2.6)由 AWS 托管、
@@ -1363,7 +1432,6 @@ def build_ha_edge(self, ctx):
         # 不用 default parameter group(便于后续调 maxmemory-policy 等)。
         _redis_major = _redis_engine_version.split(".")[0]
         _redis_pg_family = f"{_redis_engine}{_redis_major}"
-        # #281 复用现网:配了 existing_parameter_group_arn 就复用客户已有参数组
         # (不建新的、不改现有参数);否则按 family 新建。ARN 末段即 group name。
         # ⚠️ 复用者自保:该参数组 family 须匹配 engine+major(valkey7 / redis7),
         # 否则 CreateReplicationGroup 400(拿 redis7 参数组配 valkey 引擎会被拒)。
@@ -1404,7 +1472,6 @@ def build_ha_edge(self, ctx):
             # lua-resty-redis 都要额外配。显式 False 优于隐式(防未来引擎默认变化)。
             transit_encryption_enabled=False,
         )
-        # #281 只在自建时加依赖;复用现网(existing_*_arn)时不 depend on 外部资源。
         if _redis_subnet_group is not None:
             _redis_rg.add_dependency(_redis_subnet_group)
         if _redis_param_group is not None:
@@ -1456,7 +1523,6 @@ def build_ha_edge(self, ctx):
                 unhealthy_threshold_count=2,
             ),
         )
-        # #187 P5 — hub_tg 已下线,EdgeTG 是数据面唯一 target group。此处保留
         # path-pattern rule(而非提为 default fixed_response 404)因 ALB 只支持
         # 一条 default,保守放 rule 让日后有需要(如加内部管理 UI 挂 default)不冲突。
         listener.add_action(
@@ -1483,10 +1549,8 @@ def build_ha_edge(self, ctx):
             ec2.Port.tcp(8080),
             "ALB to OpenResty edge :8080 (only)",
         )
-        # #387: VPC → edge :9145(独立 metrics 端口,Prometheus scrape)。
         # 沿用 host :8899 的 VPC CIDR 放行模式;8080 入站仍只属 ALB SG(数据面
         # 红线不动,metrics 不走数据面端口)。绝不对 0.0.0.0/0 开。
-        # 已知残余(codex 评审确认,issue #387 明确"另开 issue ④"):microVM 出网
         # 经 MASQUERADE 后源=host VPC IP,VPC CIDR 放行无法区分租户/节点流量——
         # 8899 与 9145 一起收窄到 Prometheus SG 白名单归后续 issue,本条不预做。
         _edge_sg.add_ingress_rule(
@@ -1547,10 +1611,8 @@ def build_ha_edge(self, ctx):
                     ],
                 )
             )
-        # ── #389 v2 块 4:edge 与 host 同构的不可变 bootstrap ──────────────
         # 旧形态是 `aws s3 cp --recursive` 拉可变前缀 deployment/edge/,由 setup.sh
         # 手工上传,再 60×10s 轮询等 install-edge.sh 出现。两种真实故障出自这里:
-        # patch 忘了上传 → 前缀留旧版、改动静默不生效(#265 病根);上传到一半 →
         # 目录被当完整集消费,因为没有任何东西校验这一整套。
         #
         # 现在整棵 deploy/edge/ 打成一个 tar.gz(base64 文本,因为 Source.data 收
@@ -1638,7 +1700,6 @@ def build_ha_edge(self, ctx):
             role=_edge_role,  # S3 拉 edge 资产 + SSM 运维通道
             associate_public_ip_address=False,  # 私有子网 + NAT 出网
         )
-        # ── #387 实例 tag:让 edge 被 Prometheus ec2_sd 自动发现 ──
         # 照抄 host LT 的做法(上方 _host_tags 段):CDK LaunchTemplate 默认只给
         # 实例打 Name,不打 Project/Role → prometheus.yml 的 openclaw-edge-nginx
         # ec2_sd job 发现 0 target。必须打在 LaunchTemplateData.TagSpecifications
@@ -1656,7 +1717,6 @@ def build_ha_edge(self, ctx):
                 {"ResourceType": "volume", "Tags": _edge_tags},
             ],
         )
-        # #389 v2 块5:edge ASG 跟踪 $Default(见下)。bootstrap 版本切换 API 用 ModifyLaunchTemplate
         # 翻默认版本做临时切换;每次 cdk deploy 必须把默认版本【重置】回 CDK 当次发布的最新版本
         # (edge LT 每次 deploy 因 user-data 变化产生新版本),否则 API 的临时切换会永久盖过 IaC。
         # 这与 host 的 SetDefaultLTVersion CR 同一语义(host 那条把默认设成 nested-virt 版本)。
@@ -1713,7 +1773,6 @@ def build_ha_edge(self, ctx):
             ]),
         )
         _edge_set_default.node.add_dependency(_edge_lt)
-        # #272 — edge.subnet_ids 非空时显式选 OpenResty edge 子网;缺省回落
         # PRIVATE_WITH_EGRESS(带 NAT 出网的私有子网)。
         _edge_subnet_ids = _edge_cfg.get("subnet_ids") or []
         if _edge_subnet_ids:
@@ -1751,14 +1810,29 @@ def build_ha_edge(self, ctx):
         # (否则首启可能读到过期默认版本)。
         _edge_asg.node.add_dependency(_edge_set_default)
         _edge_asg.attach_to_application_target_group(edge_tg)
-        # #389 v2 块5:edge ASG 也跟踪 `$Default`。这样 bootstrap 版本切换 API 用
-        # ModifyLaunchTemplate 翻默认版本即对 edge 下次 launch 生效,无需 UpdateAutoScalingGroup
-        # (避开 RunInstances+PassRole 高危 dry-run)。默认版本随 cdk deploy 由上面的
-        # EdgeSetDefaultLTVersion CR 重置回 CDK 当次发布版本。
+        # ModifyLaunchTemplate 翻默认版本即对 edge 下次 launch 生效。CFN 写不进
+        # `$Default`,故模板给数字版本(LatestVersionNumber,即本次 deploy 发布的版本),
+        # 再由 EdgeTrackDefaultLTVersion CR 改成 `$Default`。默认版本本身随 cdk deploy
+        # 由上面的 EdgeSetDefaultLTVersion CR 重置回 CDK 当次发布版本。
         _edge_cfn_asg = _edge_asg.node.default_child
-        _edge_cfn_asg.add_property_override("LaunchTemplate.Version", "$Default")
+        _edge_asg_override = {
+            "LaunchTemplate.Version": Fn.get_att(
+                _edge_cfn_lt.logical_id, "LatestVersionNumber"
+            ).to_string()
+        }
+        _edge_cfn_asg.add_property_override(
+            "LaunchTemplate.Version", _edge_asg_override["LaunchTemplate.Version"]
+        )
+        # asg_shape 同 host:带上 override 内容,L1 getter 读不到它。
+        track_default_lt_version(
+            self,
+            "EdgeTrackDefaultLTVersion",
+            _edge_asg,
+            _edge_lt,
+            _edge_role,
+            asg_shape=_edge_asg_override,
+        )
 
-        # ── #389 v2 块5:bootstrap 版本切换 API 的 edge-fleet IAM ──────────────────
         # 只需在 edge LT 上 ModifyLaunchTemplate(翻默认版本到已发布版本)。【不】要
         # CreateLaunchTemplateVersion / RunInstances / PassRole / UpdateAutoScalingGroup —— promote
         # 只在 cdk 已发布版本间切默认,拿不到写 user-data 的能力。DescribeLaunchTemplateVersions
@@ -1775,111 +1849,29 @@ def build_ha_edge(self, ctx):
         )
 
     # ========== CloudFront ==========
-    # 1.3.4 (#61): support two-distribution mode for security boundary between
-    # operator console and per-tenant dashboards. Configured via:
+    # The retired root console S3 origin is no longer part of CloudFront.
+    # Configured via:
     #
     #   cloudfront:
-    #     console_domain: "console.example.com"     # operator console (S3)
-    #     console_cert_arn: "arn:aws:acm:us-east-1:..."
+    #     console_domain: "console.example.com"     # legacy dual-mode selector
+    #     console_cert_arn: "arn:aws:acm:us-east-1:..."  # selector pair
     #     app_domain:     "app.example.com"         # per-tenant dashboards (ALB)
     #     app_cert_arn:   "arn:aws:acm:us-east-1:..."
     #
-    # If both pairs are set → DUAL mode: two distinct CloudFront distributions
-    # with independent ACM certs. Cognito session cookie scoped to console_domain
-    # only — tenant dashboards on app_domain physically cannot read it.
+    # If both pairs are set → DUAL mode: only the ALB-origin app distribution
+    # remains; the console is served by the internal BFF ALB.
     # If unset (or only legacy custom_domain set) → LEGACY single-distribution
     # mode, kept for backward-compat with v1.3.3 and earlier deployments.
-    # Explicit OAC with a region-suffixed name. The default auto-named OAC is
-    # derived from the stack name, so a same-named stack in another region
-    # (ap-southeast-1) collides on this account-global CloudFront resource.
-    # #270 — cloudfront.enabled 开关(缺省 true=建,向后兼容)。false 时整个
-    # CloudFront 构建段零资源(不建任何 Distribution/OAC/Function/ResponseHeaders),
-    # console/dashboard host 回落 ALB DNS,cf_distribution=None,cf id 输出为空。
-    # 内网/自管入口(internal ALB 或客户自带 CDN)时关掉,省 CF 资源。
-    _cf_enabled = bool((CFG.get("cloudfront", {}) or {}).get("enabled", True))
+    # 旧默认 true 会给内网/自管入口静默引入多余公网 CDN 资源。
+    _cf_cfg_raw = CFG.get("cloudfront")
+    if _cf_cfg_raw is None:
+        raise ValueError(
+            "config 缺 `cloudfront` 段。#423 起必须显式声明 cloudfront.enabled "
+            "(内网/自管入口部署写 false;需要公网 CDN 写 true) —— 默认值曾是 true,"
+            "静默建 CDN 会给内网部署引入多余资源,故改为显式声明。"
+        )
+    _cf_enabled = bool((_cf_cfg_raw or {}).get("enabled", False))
     if _cf_enabled:
-        _assets_oac = cloudfront.S3OriginAccessControl(
-            self,
-            "AssetsOAC",
-            origin_access_control_name=f"openclaw-assets-oac{self._gsuffix}",
-        )
-        s3_origin = origins.S3BucketOrigin.with_origin_access_control(
-            assets_bucket, origin_access_control=_assets_oac
-        )
-        # CloudFront Function: rewrite /console/ → /console/index.html, / → /console/index.html
-        url_rewrite_fn = cloudfront.Function(
-            self,
-            "UrlRewrite",
-            function_name=f"openclaw-url-rewrite{self._gsuffix}",
-            code=cloudfront.FunctionCode.from_inline("""
-function handler(event) {
-  var uri = event.request.uri;
-  if (uri === '/') {
-    return { statusCode: 302, statusDescription: 'Found',
-      headers: { location: { value: '/console/' } } };
-  }
-  if (uri === '/console' || uri === '/console/') {
-    event.request.uri = '/console/index.html';
-  }
-  return event.request;
-}"""),
-        )
-
-        # Security response headers for edge-served content (#88 follow-up).
-        # Static assets (S3 origin) shipped without HSTS / anti-clickjacking /
-        # nosniff headers; add them at the edge so every cached response carries
-        # them without touching each HTML file. Applied to the console/static
-        # behaviors below.
-        # #63 — CSP for XSS-in-depth. 前端 chat/console 内联 <script> 已全部
-        # 搬到 js/*.js(console/chat/js/auth.js/chat.js 与 console/js/auth.js),
-        # setup.sh 注入的账号占位符走 <script type=application/json>(不受 CSP
-        # 执行策略约束)。不采用 'unsafe-inline'(对主威胁 renderMd/innerHTML
-        # 注入防护为零),静态托管无服务端也不做 nonce(静态 nonce=常量=没用)。
-        # 'unsafe-eval' 保留给 Alpine.js v3(x-data/@click 用 new Function 求值,
-        # 拿掉整个 console 挂);marked/alpine CDN 白名单显式列。connect-src
-        # 覆盖同源 /hub /chat/sign /tenants + Cognito /oauth2/token 跨域 fetch
-        # (Cognito domain 由部署时决定,不硬编码进 CSP,故收敛成 https:/wss:)。
-        _csp = (CFG.get("cloudfront", {}) or {}).get("csp") or (
-            "default-src 'self'; "
-            "script-src 'self' 'unsafe-eval' https://cdn.jsdelivr.net; "
-            "style-src 'self' 'unsafe-inline'; "
-            # #177 — agent 出图/附件走 hub 签发的 S3 直连预签名 URL(跨源),
-            # 预签名 host 部署时才定、无法硬编码,收敛成 https:(同 connect-src)。
-            "img-src 'self' data: blob: https:; "
-            "connect-src 'self' https: wss:; "
-            "frame-ancestors 'none'; "
-            "base-uri 'self'; "
-            "object-src 'none'"
-        )
-        sec_headers_policy = cloudfront.ResponseHeadersPolicy(
-            self,
-            "SecHeadersPolicy",
-            response_headers_policy_name=f"openclaw-sec-headers{self._gsuffix}",
-            comment="OpenClaw edge security headers",
-            security_headers_behavior=cloudfront.ResponseSecurityHeadersBehavior(
-                strict_transport_security=cloudfront.ResponseHeadersStrictTransportSecurity(
-                    access_control_max_age=Duration.days(365),
-                    include_subdomains=True,
-                    override=True,
-                ),
-                content_type_options=cloudfront.ResponseHeadersContentTypeOptions(
-                    override=True
-                ),
-                frame_options=cloudfront.ResponseHeadersFrameOptions(
-                    frame_option=cloudfront.HeadersFrameOption.DENY,
-                    override=True,
-                ),
-                referrer_policy=cloudfront.ResponseHeadersReferrerPolicy(
-                    referrer_policy=cloudfront.HeadersReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN,
-                    override=True,
-                ),
-                content_security_policy=cloudfront.ResponseHeadersContentSecurityPolicy(
-                    content_security_policy=_csp,
-                    override=True,
-                ),
-            ),
-        )
-
         cf_cfg = CFG.get("cloudfront", {}) or {}
         # ----- DUAL mode candidates -----
         console_domain = (cf_cfg.get("console_domain") or "").strip()
@@ -1894,31 +1886,7 @@ function handler(event) {
         acm_cert_arn = (cf_cfg.get("acm_cert_arn") or "").strip()
 
         if dual_mode:
-            # ===== DUAL mode: two distributions, two certs, two aliases =====
-            # Distribution A: console — S3 origin only, /console/* + redirect / → /console/
-            console_cf = cloudfront.Distribution(
-                self,
-                "ConsoleCF",
-                comment="OpenClaw Operator Console",
-                domain_names=[console_domain],
-                certificate=acm.Certificate.from_certificate_arn(
-                    self, "ConsoleCert", console_cert_arn
-                ),
-                default_behavior=cloudfront.BehaviorOptions(
-                    origin=s3_origin,
-                    viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-                    cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
-                    response_headers_policy=sec_headers_policy,
-                    function_associations=[
-                        cloudfront.FunctionAssociation(
-                            function=url_rewrite_fn,
-                            event_type=cloudfront.FunctionEventType.VIEWER_REQUEST,
-                        )
-                    ],
-                ),
-                default_root_object="",
-            )
-            # Distribution B: per-tenant dashboards — ALB origin only, /vm/*
+            # ===== DUAL mode:保留 per-tenant dashboards 的 ALB origin distribution =====
             app_cf = cloudfront.Distribution(
                 self,
                 "AppCF",
@@ -1948,11 +1916,11 @@ function handler(event) {
                 ),
                 default_root_object="",
             )
-            console_host = console_domain
+            console_host = alb.load_balancer_dns_name
             dashboard_host = app_domain
-            console_cf_id = console_cf.distribution_id
+            console_cf_id = ""
             app_cf_id = app_cf.distribution_id
-            cf_distribution = console_cf  # for downstream Cognito wiring
+            cf_distribution = app_cf
         else:
             # ===== LEGACY single-distribution mode =====
             domain_names = [custom_domain] if custom_domain else None
@@ -1986,40 +1954,7 @@ function handler(event) {
                     allowed_methods=cloudfront.AllowedMethods.ALLOW_ALL,
                     cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
                     origin_request_policy=cloudfront.OriginRequestPolicy.ALL_VIEWER,
-                    function_associations=[
-                        cloudfront.FunctionAssociation(
-                            function=url_rewrite_fn,
-                            event_type=cloudfront.FunctionEventType.VIEWER_REQUEST,
-                        )
-                    ],
                 ),
-                additional_behaviors={
-                    "/console/*": cloudfront.BehaviorOptions(
-                        origin=s3_origin,
-                        viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-                        cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
-                        response_headers_policy=sec_headers_policy,
-                        function_associations=[
-                            cloudfront.FunctionAssociation(
-                                function=url_rewrite_fn,
-                                event_type=cloudfront.FunctionEventType.VIEWER_REQUEST,
-                            )
-                        ],
-                    ),
-                    # /chat/* — chat 小程序前端,与 console 同 S3 origin(桶根 chat/,
-                    # 见 setup.sh 把 console/chat/index.html 传到 s3://<assets>/chat/)。
-                    # 缺这条 behavior 时 /chat/* 走 default→ALB(metal)→404。不挂
-                    # url_rewrite_fn(那是 /console 路径改写专用);chat 是单 index.html。
-                    "/chat/*": cloudfront.BehaviorOptions(
-                        origin=s3_origin,
-                        viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-                        cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
-                        response_headers_policy=sec_headers_policy,
-                    ),
-                    # #187 P5 — /hub/* behavior 已随 claw-hub 数据面下线一并删除。
-                    # 数据面 WebSocket 走 /ws/{tenant_id} 直连 microVM gateway,由
-                    # ALB default forward EdgeTG(P2b-iac)承担。
-                },
                 default_root_object="",
             )
 
@@ -2029,7 +1964,6 @@ function handler(event) {
             console_cf_id = cf_distribution.distribution_id
             app_cf_id = cf_distribution.distribution_id
     else:
-        # #270 gate 关闭:无 CloudFront。host 回落 ALB DNS(internal ALB 时
         # 是内网 DNS;客户自管 CDN 指到该 ALB)。cf_distribution=None → 下游
         # Cognito wiring 只在 custom_domain 真值时才 deref,故此处安全。
         cf_distribution = None
@@ -2039,55 +1973,6 @@ function handler(event) {
         app_cf_id = ""
         custom_domain = ""
         dual_mode = False
-
-    # ========== Assets bucket CORS (chat mini-app 图片功能) ==========
-    # The chat mini-app uploads/downloads images via S3 presigned URLs
-    # directly from the browser; without CORS the browser blocks the PUT
-    # ("Failed to fetch"). Scope AllowedOrigins to the real CloudFront host
-    # (console_host, set by both single- and dual-domain branches) — NOT "*"
-    # — to keep minimal exposure. Managed via CustomResource because the
-    # bucket is RETAIN (inline cors on an existing bucket won't reliably
-    # update). This codifies the CORS that was first applied by hand during
-    # the 2026-06-27 image-feature bring-up.
-    _media_cors_params = {
-        "Bucket": assets_bucket.bucket_name,
-        "CORSConfiguration": {
-            "CORSRules": [
-                {
-                    "AllowedOrigins": [f"https://{console_host}"],
-                    "AllowedMethods": ["GET", "PUT"],
-                    "AllowedHeaders": ["*"],
-                    "ExposeHeaders": ["ETag"],
-                    "MaxAgeSeconds": 3000,
-                }
-            ]
-        },
-    }
-    cr.AwsCustomResource(
-        self,
-        "AssetsCors",
-        install_latest_aws_sdk=False,
-        on_create=cr.AwsSdkCall(
-            service="S3",
-            action="putBucketCors",
-            parameters=_media_cors_params,
-            physical_resource_id=cr.PhysicalResourceId.of("assets-cors"),
-        ),
-        on_update=cr.AwsSdkCall(
-            service="S3",
-            action="putBucketCors",
-            parameters=_media_cors_params,
-            physical_resource_id=cr.PhysicalResourceId.of("assets-cors"),
-        ),
-        policy=cr.AwsCustomResourcePolicy.from_statements(
-            [
-                iam.PolicyStatement(
-                    actions=["s3:PutBucketCORS"],
-                    resources=[assets_bucket.bucket_arn],
-                ),
-            ]
-        ),
-    )
 
     # ╓─── [包C 控制面+工程化] owner=C ── Cognito 鉴权 + Outputs(引用 cf_distribution/api_fn)─╖
 

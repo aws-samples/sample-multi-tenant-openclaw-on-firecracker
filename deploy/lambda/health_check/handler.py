@@ -98,7 +98,6 @@ def lambda_handler(event, context):
                 if elapsed < STALE_SECONDS:
                     continue
             except Exception as e:
-                # #218: bad timestamp shape → fall through to stale (safe
                 # default) but leave a trail so we can spot ISO drift.
                 print(f"stale-check: bad last_check for {tid}: {last_check!r} ({e})")
 
@@ -128,6 +127,21 @@ def lambda_handler(event, context):
             f"watchdog: {stale_count} stale tenant(s), {recovered} host-agent restart(s)"
         )
 
+    # ------- rebuild 对账(ADR §5.4a/§5.5)——让 unconfirmed 自己收敛 -------
+    # 放在 stale 扫描之后、reaper 之前:此时 host-agent 刚上报过的实际版本已经在表里,
+    # 对账拿到的是最新一手数据。与容量 reaper 无耦合(只动 rebuild_* 字段和 rootfs_version,
+    # 不碰 status/容量账本),顺序不影响正确性,仅影响数据新鲜度。
+    try:
+        _rb_done, _rb_failed, _rb_left = _reconcile_unconfirmed_rebuilds(now)
+        if _rb_done or _rb_failed or _rb_left:
+            print(
+                f"rebuild-reconcile: {_rb_done} → done, {_rb_failed} → failed, "
+                f"{_rb_left} still unconfirmed"
+            )
+    except Exception as e:
+        # 与其他 sweep 同约定:对账永远不该拖垮 watchdog 本身。
+        print(f"rebuild-reconcile error (non-fatal): {e}")
+
     # ------- Reap stuck `creating` tenants (capacity-ledger anti-drift) -------
     # Tenants that never left `creating` past CREATING_TIMEOUT_SECONDS are dead
     # launches still holding a host capacity reservation. Reaping releases the
@@ -140,7 +154,6 @@ def lambda_handler(event, context):
         # Never let ledger reaping take down the watchdog.
         print(f"reap error (non-fatal): {e}")
 
-    # ------- #412(codex review2 #4)—— 令牌孤儿清扫(requires_intervention)-------
     # dispatch 失败超预算的租户被 poller 转 requires_intervention(非 creating),逃出上面
     # 只扫 creating 的 reaper。若它仍带 capacity_reservation_id,那份容量就永久搁浅。此扫把
     # 【requires_intervention 且仍持令牌】的租户令牌化释放(扣 host + 删令牌一个事务),兜底
@@ -162,7 +175,6 @@ def lambda_handler(event, context):
             # AZ failover failures must NEVER take down the watchdog.
             print(f"az_failover error (non-fatal): {e}")
 
-    # ------- In-flight live-migration sweep (1.4.4, issue #64) -------
     # POST /tenants/{id}/migrate is async: it fires the snapshot SSM command,
     # marks the tenant `migrating` with the async context, and returns 202
     # (API Gateway caps a synchronous request at 29s, far less than a multi-GB
@@ -204,7 +216,6 @@ MIGRATION_WATCHDOG_MINUTES = int(os.environ.get("MIGRATION_WATCHDOG_MINUTES", "1
 MIGRATION_DRAIN_SECONDS = int(os.environ.get("MIGRATION_DRAIN_SECONDS", "5"))
 
 
-# #412 blocker-B(codex CHANGES_NEEDED #3)——每次 Lambda invocation 里 reaper 做的同步
 # stop-confirm 有上限。每条 stop-vm 阻塞至多 STOP_CONFIRM_TIMEOUT 秒;若不设上限,数台不可达
 # host 上的卡住租户会串行耗光整个 invocation(默认 180s),把后面的 orphan 清扫 / AZ failover /
 # 迁移 sweep 全饿死。超预算则本轮不再 confirm(返 False = 不释放,留下轮再试),不是错误。
@@ -243,11 +254,236 @@ def _confirm_vm_stopped(host_id, tenant_id, vm_num):
     return ok
 
 
+# ═════════ rebuild 对账 — ADR-rebuild-idempotency-sync-contract §5.4a/§5.5 ═════════
+# 让 `rebuild_status=unconfirmed` 自己收敛,不再是终点。
+#
+# 背景:rebuild 的采用校验依赖 SSM 回执,真机上约 1/3 的 rebuild 是「VM 真重启并升级了,
+# 但回执没在超时内回来」。控制面据此标 unconfirmed(而不是谎报 failed 去引导客户重试 ——
+# 重试会再删一次 overlay、抹掉两次之间的写入)。但 unconfirmed 只是诚实,不是答案。
+#
+# 两条事后对账把它变成答案,且都零新增基础设施:
+#   路 1 — 回头问 SSM。命令执行记录在服务端留 30 天;「超时」只是控制面不想再等,不是记录
+#          消失。api Lambda 已在受理那一刻把 CommandId 落进 rebuild_ssm_command_id。
+#   路 2 — 看宿主机上报的实际运行版本(observed_image_snapshot_time,host-agent 每 15s 从
+#          该租户 vm.json 带上来)。期望 == 实际即确认成功,完全不依赖那次 SSM 调用的成败。
+#
+# 判定矩阵(ADR §5.4a):
+#   | SSM 回音      | 宿主机上报版本 | 结论 |
+#   | Success       | 任意/无        | done   |
+#   | 超时/查不到    | == 目标        | done   ← 这就是那 1/3,由路 2 救回 |
+#   | Failed        | != 目标        | failed(双证,可安全重试) |
+#   | 超时          | != 目标/无     | 仍 unconfirmed,留下轮;超 REBUILD_UNCONFIRMED_
+#                                     TIMEOUT 后转 failed(§5.5 兜底,不无限悬着) |
+#
+# 三条必须遵守的约束,全部落在下面代码里:
+#   1. 只比【具体版本值】,不比「变了没有」。只看「变了」会把普通 restart/recovery 误判成
+#   2. 路 2 只能【确认成功】,不能【判定失败】。launch-vm 写 vm.json 是 best-effort,且记的
+#      是「启动时打算用哪个版本」而非「进程真挂着哪个 rootfs」。宽松方向安全,严格方向误杀。
+#   3. 迟到的确认必须【条件写】,绝不 restamp。所有更新都绑 rebuild_op_id 仍是当次那个,
+#      否则一次晚到的成功回音会盖掉之后一次【新】操作的结果。与 fence ADR §4 同一条不变量,
+#      本阶段就必须遵守,不能等 fence 落地。
+
+# 兜底超时(§5.5):两条对账都长时间给不出结论的 unconfirmed,不能永远悬着 —— 客户无法判断
+# 能否重试,租户也不会被任何巡检收拾。超过这个时长转 failed(明确"可安全重试"),并留下
+# reason 说明是兜底判定而非观测到失败。默认 30 分钟:远大于一次 rebuild 的正常收敛时间
+# (真机约 15s ~ 数分钟),又不至于让客户等一整天。
+REBUILD_UNCONFIRMED_TIMEOUT_SECONDS = int(
+    os.environ.get("REBUILD_UNCONFIRMED_TIMEOUT_SECONDS", "1800")
+)
+
+
+def _parse_iso(ts):
+    """把 DDB 里的 ISO 时间串解析成 aware datetime;失败返 None(调用方自行兜底)。
+
+    与 _reap_stuck_creating 同款归一化:fromisoformat(3.11 前)吃不下结尾的 'Z',
+    naive 时间也没法跟 aware 的 now 相减。"""
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+    except Exception:
+        return None
+
+
+def _rebuild_verdict(tenant, now):
+    """对一个 unconfirmed 的租户做判定,返回 (status, phase, reason) 或 None(留在 unconfirmed)。
+
+    纯函数:不碰 DDB、不发 SSM,SSM 回音以 ssm_done/ssm_ok 形式由调用方查好传进来
+    (放在 tenant 的两个私有键里)。这样判定矩阵本身可被单测穷举,不需要 mock AWS。
+    """
+    target = (tenant.get("rebuild_target_snapshot_time") or "").strip()
+    observed = (tenant.get("observed_image_snapshot_time") or "").strip()
+    ssm_done = tenant.get("_ssm_done")
+    ssm_ok = tenant.get("_ssm_ok")
+
+    # 路 1 命中成功:SSM 明确说 Success → 确认成功。
+    if ssm_done and ssm_ok:
+        return (
+            "done",
+            "done",
+            "confirmed by SSM invocation record (receipt arrived late; "
+            "the rebuild had in fact succeeded on the host)",
+        )
+
+    # 路 2 命中成功:需要【两个】条件同时成立 —— 版本相符 **且** 这个 Firecracker 进程是
+    # 本次 rebuild 之后新起的。
+    #
+    # 为什么不能只看版本(reviewer 抓到的假成功):launch-vm.sh 在起 firecracker 之前 800+
+    # 行就把版本写进了 vm.json,所以"版本==目标"只证明启动流程走到了那一行。两种假成功:
+    #   ① 中途失败 → 版本相符但 VM 没起(host-agent 侧已用 vm_health=up 挡掉,不再上报);
+    #   ② 旧 FC 没被 stop-vm 杀掉 → VM ping 得通、vm.json 已被改成新版本,但进程还挂着
+    #      【旧】rootfs。这种只能靠进程启动时刻识别:它早于本次 rebuild 的发起时刻。
+    # 故要求 observed_boot_at > rebuild_started_at。没有启动证据(读不到 /proc → 空串)时
+    # **不判 done**,保守留在 unconfirmed 等路 1 或兜底 —— 宁可多等,不可谎报成功。
+    if target and observed and observed == target:
+        boot_at = _parse_iso(tenant.get("observed_boot_at"))
+        started = _parse_iso(tenant.get("rebuild_started_at"))
+        if boot_at and started and boot_at >= started:
+            return (
+                "done",
+                "done",
+                "confirmed by host: running image version matches the rebuild target "
+                f"({target}) AND the Firecracker process was (re)started at "
+                f"{tenant.get('observed_boot_at')}, after this rebuild began",
+            )
+        # 版本相符但没有"本次新起"的证据 → 不下 done。这里刻意不 return,继续往下走:
+        # 路 1 的 SSM 回音仍可能给出结论,超时兜底也仍适用。
+
+    # 路 1 命中失败:SSM 明确 Failed/TimedOut/Cancelled → 确认失败,可安全重试。
+    # 注意这里【只信 SSM】,不因 observed != target 就判失败(约束 2:路 2 不可判失败 ——
+    # vm.json 是 best-effort 写,缺失或滞后都不代表没升成)。
+    if ssm_done and not ssm_ok:
+        return (
+            "failed",
+            "failed",
+            "SSM invocation record reports the rebuild command failed on the host; "
+            "rootfs_version not advanced — retrying the rebuild is safe",
+        )
+
+    # 兜底(§5.5):两条路都给不出结论,且已经悬了太久 → 转 failed。
+    # 说"可安全重试"是权衡后的选择:悬着不动客户什么也做不了,而这个时长之后 VM 若真升成了,
+    # 宿主机早该把版本报上来(每 15s 一次)。reason 里明确写这是超时兜底、非观测到失败。
+    started = _parse_iso(tenant.get("rebuild_started_at"))
+    if started and (now - started).total_seconds() >= REBUILD_UNCONFIRMED_TIMEOUT_SECONDS:
+        mins = REBUILD_UNCONFIRMED_TIMEOUT_SECONDS // 60
+        return (
+            "failed",
+            "failed",
+            f"no confirmation from either the SSM invocation record or the host's "
+            f"reported image version within {mins} minutes; giving up on "
+            "reconciliation. This is a timeout verdict, NOT an observed failure — "
+            "verify the tenant's actual version before retrying",
+        )
+
+    return None  # 还有希望,留在 unconfirmed 下轮再看
+
+
+def _reconcile_unconfirmed_rebuilds(now):
+    """扫 rebuild_status=unconfirmed 的租户,用两条对账把它们推向 done/failed。
+
+    返回 (done_count, failed_count, still_unconfirmed_count)。
+
+    写入受两层保护:
+      * ConditionExpression 绑 rebuild_op_id 仍是当次那个 + rebuild_status 仍是
+        unconfirmed(约束 3)。若这期间客户又发了一次 rebuild,op_id 已变 → CCF 出局,
+        绝不用旧结论盖新操作。
+      * 确认成功时才补标 rootfs_version,且只在有具体目标版本时补 —— 不编造版本号。
+    """
+    items = []
+    lek = None
+    while True:
+        kw = {
+            "FilterExpression": "rebuild_status = :u",
+            "ExpressionAttributeValues": {":u": "unconfirmed"},
+        }
+        if lek:
+            kw["ExclusiveStartKey"] = lek
+        page = tenants_table.scan(**kw)
+        items += page.get("Items", [])
+        lek = page.get("LastEvaluatedKey")
+        if not lek:
+            break
+
+    if not items:
+        return 0, 0, 0
+
+    print(f"rebuild-reconcile: {len(items)} unconfirmed tenant(s) to check")
+    n_done = n_failed = n_left = 0
+    for t in items:
+        tid = t["id"]
+        # 路 1:有 CommandId 就回头问 SSM。没有(老记录/下发前就失败)则只靠路 2 与兜底。
+        cmd_id = (t.get("rebuild_ssm_command_id") or "").strip()
+        host_id = (t.get("host_id") or "").strip()
+        if cmd_id and host_id:
+            t["_ssm_done"], t["_ssm_ok"] = _poll_ssm(cmd_id, host_id)
+
+        verdict = _rebuild_verdict(t, now)
+        if verdict is None:
+            n_left += 1
+            continue
+        status, phase, reason = verdict
+
+        expr = (
+            "SET rebuild_status = :s, rebuild_phase = :p, "
+            "rebuild_failed_reason = :r, updated_at = :t"
+        )
+        vals = {
+            ":s": status,
+            ":p": phase,
+            ":r": reason,
+            ":t": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            ":u": "unconfirmed",
+        }
+        # 确认成功且知道具体目标版本 → 补标版本(此前因未确认而没标,GET /tenants 一直
+        # 显示旧版本)。target 为空时不补:没有具体值可写,绝不编造。
+        target = (t.get("rebuild_target_snapshot_time") or "").strip()
+        if status == "done" and target:
+            expr += ", rootfs_version = :rv"
+            vals[":rv"] = target
+            if len(target.encode("utf-8")) <= 256:
+                expr += ", q_rootfs_version = :qrv"
+                vals[":qrv"] = target
+
+        # 约束 3 —— 绑当次 op_id + 仍是 unconfirmed。op_id 缺失(老记录)时退化为只绑
+        # status,仍能防"已被别的路径改成 done/failed 后又被本轮覆盖"。
+        cond = "rebuild_status = :u"
+        op_id = (t.get("rebuild_op_id") or "").strip()
+        if op_id:
+            cond += " AND rebuild_op_id = :o"
+            vals[":o"] = op_id
+        try:
+            tenants_table.update_item(
+                Key={"id": tid},
+                UpdateExpression=expr,
+                ConditionExpression=cond,
+                ExpressionAttributeValues=vals,
+            )
+            if status == "done":
+                n_done += 1
+            else:
+                n_failed += 1
+            print(f"rebuild-reconcile {tid}: unconfirmed → {status} ({reason[:80]})")
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                # 期间又发了一次 rebuild(op_id 变了),或已被别处改掉 → 本轮结论作废。
+                # 这正是约束 3 要防的:绝不用旧操作的结论盖新操作的状态。
+                n_left += 1
+                print(f"rebuild-reconcile {tid}: superseded (op_id/status changed) — skip")
+            else:
+                n_left += 1
+                print(f"rebuild-reconcile {tid} (non-fatal): {e}")
+        except Exception as e:  # noqa: BLE001 — 单个租户的失败不拖垮整轮对账
+            n_left += 1
+            print(f"rebuild-reconcile {tid} (non-fatal): {e}")
+
+    return n_done, n_failed, n_left
+
+
 def _reap_stuck_creating(now):
     """Mark tenants stuck in `creating` past CREATING_TIMEOUT_SECONDS as failed
     and release their host capacity reservation. Returns the count reaped.
 
-    #412 blocker-B:释放前先 _confirm_vm_stopped(host 权威停机确认),绝不释放可能仍在跑的
     VM 的容量(overcommit 账本红线)。stop 未确认则本轮跳过、下轮再试。
 
     Capacity is decremented with the same if_not_exists-guarded, conditional
@@ -305,15 +541,11 @@ def _reap_stuck_creating(now):
         vcpu = int(t.get("vcpu", 1) or 1)
         mem_mb = int(t.get("mem_mb", 2048) or 2048)
         rid = t.get("capacity_reservation_id")
-        # #412 — dispatch 预留的租户带 capacity_reservation_id 令牌。令牌是跨 delete/poller/批
         # 回滚的互斥锚(防 ABA 双扣):谁先消费令牌谁扣一次,其余幂等。释放事务条件双锚:tenant 侧
         # status=failed AND capacity_reservation_id=:rid,host 侧下溢守卫。令牌缺失(同步 create
-        # 租户卡 creating)→ 走下面旧的 fence + guarded decrement(那条路无令牌、无 #412 泄漏)。
-        # NB(codex #3 原来的"flip+release 一个事务"已被 blocker-B 拆成 fence→stop→release 三步:
         # fence 保留令牌,release 前崩溃 → failed+令牌由 _reap_orphan_reservations 兜底,故不留无主增量)。
         _reaped_reason = f"reaped: stuck in creating > {CREATING_TIMEOUT_SECONDS}s"
         if rid and host_id:
-            # #412 blocker-B(codex CHANGES_NEEDED #2)——顺序必须是【先围栏 → 再停 → 后释放】:
             # ① 原子把 creating→failed(条件 status=creating AND token=rid),【保留】令牌+放置。
             #    一个并发 promote(creating→running,条件也锁 creating)与本 flip 互斥:promote
             #    已赢则本 flip CCF → 跳过,【绝不 stop 那个刚起来的活 VM】;本 flip 赢则该行进 failed
@@ -393,10 +625,7 @@ def _reap_stuck_creating(now):
             print(f"reap: {tid} on {host_id} token-release (elapsed={int(elapsed)}s)")
             continue
 
-        # 非令牌(pre-#412 sync-create)租户:保持 bb 原行为——fence flip creating→failed
         # (条件 creating,promote 赢则 CCF 跳过)后 guarded 释放 slot,不 stop-confirm。这条路
-        # 无令牌、无 orphan-reaper 兜底,若在此加"停不了就不释放"会永久漏 slot;且 #412 的
-        # overcommit 修复本就聚焦令牌路径,这里不扩范围(codex #2 的 stop-before-fence 隐患
         # 仅存在于上面令牌分支,已改为 fence→stop→release)。
         try:
             tenants_table.update_item(
@@ -412,7 +641,6 @@ def _reap_stuck_creating(now):
                 },
             )
         except Exception as e:
-            # #218: expected race (status already flipped) or throttle —
             # keep skipping but leave a trail so we can distinguish the
             # two in journalctl if reap stops making progress.
             print(f"reap-skip {tid}: conditional update failed ({e})")
@@ -444,21 +672,15 @@ def _reap_stuck_creating(now):
     return reaped
 
 
-# #412 —— 逃出 creating-only reaper 的【终态但仍持令牌】的 tenant 状态。两者都非 creating,
 # _reap_stuck_creating 扫不到;若仍带 capacity_reservation_id,那份容量永久搁浅:
-#   - requires_intervention:dispatch 失败超预算转此(review2 #4)。
 #   - deleting:delete 的令牌释放遇瞬时失败返 502 留 deleting,而 delete replay 若在到达释放前
-#     的某步(如 backup 重跑打已删目录)反复失败,令牌永不释放(review8 #2)。deleting 是终态
 #     意图(VM 正被拆),释放其容量恒安全。
 # requires_intervention:终态失败,VM 非活跃语义,令牌可【立即】回收(reserve 已提交、无论
 # VM 起没起都不再重试)。**deleting 不在此列**(codex review9 #1 + review10 #1):deleting 的 VM
 # 可能【还活着】(delete 先翻 deleting 再 backup+stop-vm,释放在 stop 成功之后),单靠 age 证明
 # 不了 stop-vm 已跑——一个在 stop 前崩溃的 delete 会被误 reap 掉活 VM 的容量/放置(欠记账红线)。
 # deleting 的令牌搁浅已由 delete 自身的重投兜底(队列 502 replay 带 _consumer_ident 重跑释放;
-# 同步无队列路径 review7 #2 也会对仍持令牌的 deleting 恢复释放),无需在此再兜一道有风险的。
-# 真正安全的 deleting 回收需 host 侧 "stop-vm 已跑/vm.json 已删" 持久标记 → 归 follow-up #420。
 #
-# #412 blocker-B(codex CHANGES_NEEDED #2)—— 追加 "failed":_reap_stuck_creating 现按
 # 【先围栏(creating→failed 保留令牌)→ stop-confirm → 释放】三步做,避免 stop 掉一个刚 promote
 # 成 running 的活 VM。若 stop 本轮未确认,行会停在【failed 且仍带令牌】,creating-reaper 再也扫
 # 不到它。此处把 failed 纳入孤儿兜底:下轮同样 stop-confirm 后释放。安全性:全仓仅 reaper 的
@@ -495,7 +717,6 @@ def _reap_orphan_reservations(now=None):
                     continue
                 vcpu = int(t.get("vcpu", 1) or 1)
                 mem_mb = int(t.get("mem_mb", 2048) or 2048)
-                # #412 blocker-B:释放令牌/扣账前先确认 VM 已停(requires_intervention 的 VM
                 # 可能仍在跑,launch-vm.sh 失败后会留活 FC)。未确认 → 本轮跳过,下轮再试。
                 if not _confirm_vm_stopped(host_id, tid, t.get("vm_num", 1)):
                     continue
@@ -548,7 +769,6 @@ def _rollback_migration(tenant, reason):
     resumed by migrate-vm.sh, so source host_id / routing are untouched — 'running'
     is the truthful state there.
 
-    #172: the migrate API RESERVES the TARGET host's slot up-front via
     _reserve_migration_slot's CAS (used_vcpu/used_mem_mb/vm_count += 1 on the
     target before status=migrating is written). So on failure we MUST release
     that target reservation here, or every failed migration (SSM throttle,
@@ -641,7 +861,6 @@ def _advance_migration(tenant, now):
                 )
                 return
         except Exception as e:
-            # #218: bad migration_started_at → skip watchdog (safer than
             # rollback on garbled input) but surface the drift.
             print(
                 f"migration watchdog {tenant.get('id')}: bad started_at "
@@ -827,7 +1046,6 @@ def _advance_migration(tenant, now):
             return
 
         # 赢家专属:减 SOURCE 计数 + stop 源 VM + release-route 源(硬伤③/R5)。
-        # #172 — 只减 SOURCE;TARGET 的 slot 在 migrate 发起时已 CAS 占用,绝不再动。
         vcpu = int(tenant.get("vcpu", 0))
         mem_mb = int(tenant.get("mem_mb", 0))
         if source_host_id:
@@ -859,7 +1077,6 @@ def _advance_migration(tenant, now):
                     timeout=60,
                 )
             except Exception as e:
-                # #218: source side cleanup is best-effort (source may be
                 # unreachable); note it so we know why tap/nginx residue
                 # occasionally survives migration.
                 print(
@@ -1002,7 +1219,6 @@ def _restart_host_agent(host_id, now):
                 )
                 return False
         except Exception as e:
-            # #218: bad agent_restart_at → let the restart proceed (no
             # cooldown enforced) but surface the timestamp corruption.
             print(
                 f"restart {host_id}: bad agent_restart_at {last_restart!r} "
@@ -1404,7 +1620,6 @@ def _failover_tenant_to_host(tenant, target_host, source_az, now):
                 },
             )
         except Exception as e:
-            # #218: DDB flip to failover_blocked failed — the AZ_FAILOVER_NO_BACKUP
             # audit is already emitted above, but if the status write disappears
             # silently, later sweeps re-attempt failover forever. Surface it.
             print(
@@ -1429,7 +1644,6 @@ def _failover_tenant_to_host(tenant, target_host, source_az, now):
                     ),
                 )
             except Exception as e:
-                # #218: SNS best-effort — audit event captures the same signal,
                 # but silence made "alert never fired" indistinguishable from
                 # "alert fired and was ignored". Log so we can tell.
                 print(
@@ -1477,7 +1691,6 @@ def _failover_tenant_to_host(tenant, target_host, source_az, now):
         #                   <chat_endpoint_enabled> <cognito_b64>
         #    config_template can be empty string ""; restore_backup_key
         #    is an S3 key (no s3:// prefix), e.g. backups/<tid>/<ts>.gz.
-        # #41 — failover 是 wake 场景(从 backup 恢复到 target host),必须穿透
         # chat_endpoint_enabled 到 launch-vm 幂等段(第 10 位);位 7/8/9/11 空占位
         # (数据盘从 backup 恢复,首铸字段随备份带回来,不重铸)。老版本只填 6 位。
         # #排雷 D2 — 所有早返回门已过,现在原子占 target host 的 vm_num + 记账(CAS)。
@@ -1609,7 +1822,6 @@ def _failover_tenant_to_host(tenant, target_host, source_az, now):
         #    #排雷 D2 — target host 的 next_vm_num/used_*/vm_count 记账已在
         #    _reserve_target_vm_num 的 CAS 里原子完成(launch 前),这里**只翻 tenant 记录**,
         #    绝不再无条件 SET next_vm_num=target+1(那会覆盖并发 create 的递增 → 串号,
-        #    与 #172 defect B 同源)。只减/加 host 计数的活全归 CAS 占槽 + source 侧回收。
         tenants_table.update_item(
             Key={"id": tenant_id},
             UpdateExpression=(
@@ -1662,7 +1874,6 @@ def _failover_tenant_to_host(tenant, target_host, source_az, now):
                 },
             )
         except Exception as e:
-            # #218: same class as the no-backup path — audit still fires
             # below, but a silent status miss means the next sweep keeps
             # retrying failover on a tenant that's already broken.
             print(f"az-failover {tenant_id}: mark {new_status} failed (non-fatal): {e}")

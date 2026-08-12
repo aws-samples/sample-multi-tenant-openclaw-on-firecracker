@@ -28,13 +28,25 @@ import core.clients as clients
 from core.auth import _get_caller_identity
 
 
-def enqueue_lifecycle(action, tenant_id, event, extra=None):
-    """把一个 lifecycle 操作入 SQS,供 consumer 受控并发消费。返回 True=已入队。
+def enqueue_lifecycle(action, tenant_id, event, extra=None, before_send=None):
+    """把一个 lifecycle 操作入 SQS,供 consumer 受控并发消费。返回本次操作的 op_id。
+
+    返回值(ADR-rebuild-idempotency-sync-contract §5.3):**已入队 → 返 op_id 字符串**
+    (非空 = truthy),未入队 → 返 False。原先返 `True`,op_id 只当 SQS dedup id 用完就
+    丢,于是 202 响应里没有任何操作标识,客户拿不到"是哪一次"的句柄,无法把后续轮询到
+    的状态与自己刚发的那次请求对上。三个调用点都只做 `if enqueue_lifecycle(...)` 的
+    truthy 判断,故非空字符串与 True 等效,行为不变;False 仍走同步回退路径。
+
+    before_send: 可选回调,签名 before_send(op_id),在 **send_message 之前**被调用。
+    必须在消息发出【前】落库的东西走这里 —— 消息一旦发出,consumer 可能立刻取走并推进
+    phase 到 running/verifying,此时生产者若还没写初始锚点,再写就会把 phase 覆盖回
+    queued(进度倒退);更糟的是若那次写入失败,客户已经拿到 202 和 op_id,却在记录里
+    找不到这个 op,轮询无从下手。回调抛异常则**不发消息**并向上抛:宁可让调用方收到
+    5xx 去重试,也不要发出一条无法被轮询的操作(202 承诺了可轮询)。
 
     LIFECYCLE_QUEUE_URL 未配 → 返 False,调用方回退同步路径(向后兼容)。
     捎带调用者身份(#56:异步消费不绕过 RBAC),与 _enqueue_batch_job 同款。
 
-    #411/6.1(承 #364)— MessageDeduplicationId 每次入队带唯一成分,不再用静态
     `{tenant_id}:{action}`。原键下,同一租户 5 分钟内的第二次同类操作(如两次
     stop)被 SQS FIFO 默认去重窗口判为 duplicate:接收成功但【不投递】,而 API 仍
     返 202 → 用户看到"queued"却实际没执行(客户实测 6.1)。每个 API 调用是一次
@@ -55,12 +67,10 @@ def enqueue_lifecycle(action, tenant_id, event, extra=None):
         "_ident": {
             "owner_id": ident.get("owner_id"),
             "is_admin": ident.get("is_admin"),
-            # #108 — carry platform scope so async replay stays in-namespace.
             # For create-via-queue this is also why we pin platform_id into the
             # queued body below (the sync path pins a local var that the body
             # snapshot didn't capture) — see create_tenant enqueue block.
             "platform_scope": ident.get("platform_scope"),
-            # #143 sibling — carry the OIDC-federated caller's stable id so
             # CREATE_VIA_QUEUE replay lands tenant_user_id too. Without it a
             # federated Bearer user creating via the FIFO queue loses
             # tenant_user_id (consumer's rebuilt ident had no claims), the node
@@ -69,7 +79,6 @@ def enqueue_lifecycle(action, tenant_id, event, extra=None):
             # already land it; this was the FIFO-replay gap.
             "tenant_user_id": ident.get("tenant_user_id"),
         },
-        # #411/6.1 — per-call 唯一操作 id;每次 API 调用一次独立意图,不被静态键折叠。
         "_op_id": uuid.uuid4().hex,
     }
     kwargs = {"QueueUrl": clients.LIFECYCLE_QUEUE_URL, "MessageBody": json.dumps(msg)}
@@ -79,5 +88,12 @@ def enqueue_lifecycle(action, tenant_id, event, extra=None):
         # dedup id = per-call op id:仍拦同一条消息的 SDK 重发,但两次独立的
         # 同类操作(5min 内两次 stop)各自投递,不再被静态 {tenant}:{action} 吞掉。
         kwargs["MessageDeduplicationId"] = msg["_op_id"]
+    # 契约性写入必须在消息发出【之前】完成(见 before_send 文档):否则 consumer 可能已
+    # 推进 phase,生产者随后的写入把它倒退回 queued。回调抛异常 → 不发消息、直接上抛,
+    # 绝不发出一条无法被轮询的操作。
+    if before_send is not None:
+        before_send(msg["_op_id"])
     clients.sqs.send_message(**kwargs)
-    return True
+    # 返 op_id(而非 True):调用方据此把操作标识写进 202 响应与 DDB,客户轮询时能分清
+    # "是哪一次"。send_message 之后才返,失败会抛异常,不会误报入队成功。
+    return msg["_op_id"]

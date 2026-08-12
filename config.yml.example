@@ -17,14 +17,58 @@ host:
   # 启动时按 nproc + /proc/meminfo 自报每台真实容量注册 DDB,小机型注册自己的小
   # 容量不会被超卖。约束:所有成员须与 host.arch 同架构(AMI 是按架构的,x86 与
   # arm64 不能混)。留空=只用上面的单一 instance_type。
-  # instance_types: ["r8g.metal-48xl", "r8g.metal-24xl"]
+  # #430 异构混容量:4 机型混池。ASG 按【本列表顺序】优先启动
+  # (MixedInstancesPolicy.InstancesDistribution.OnDemandAllocationStrategy=prioritized
+  # + 每个 Override 带显式 Priority),租户落哪台则由调度侧亲和排序决定
+  # (scheduling.family_order),两者必须同序。改本列表顺序即改扩容优先级。
+  # 注:列表首项同时是 LaunchTemplate 主类型与 scaler 容量估算基准,应填最高优先级机型。
+  instance_types:
+    - r8g.metal-24xl               # 96 vCPU / 768 GiB · 8.0 GB/vCPU
+    - r7g.metal                    # 64 vCPU / 512 GiB · 8.0 GB/vCPU
+    - m8g.metal-24xl               # 96 vCPU / 384 GiB · 4.0 GB/vCPU
+    - m7g.metal                    # 64 vCPU / 256 GiB · 4.0 GB/vCPU
   root_volume_gb: 20
   data_volume_gb: 900              # 380 VM/台的磁盘硬前提。真机对账(#37,2026-07-04 us-east-1 压 377 VM):/data 实占随负载走——轻载 377 VM 仅占 28G(sparse 单 VM ~84–187M),重载单 VM 实占可达 1.3G,380×1.3G≈494G。600G 够 380 稀疏稳态但重载几乎无冗余;提到 900G 给重载 + 未来密度(#51)余量,仍远低于 380×8G(vm.data_disk_mb 声明上限,靠 sparse 不全占)。改大后 host 重建即带大盘,不依赖运行态扩盘。
   keep_data_volume:  true          # 实例删除后是否保留EBS卷
   reserved_vcpu: 1
   reserved_mem_mb: 2048
-  cpu_overcommit_ratio: 6.0        # 1.0=不超配。设计 380/台、极限压 500 到 r8g.metal-24xl(96 vCPU):vCPU 是超卖维度(agent 多为 IO/等待型),真限制是内存。380÷95≈4x、500÷95≈5.3x,设 6.0 留余量。旧默认 2.0 只让 ~190 个=调度器把机器卡死在远低于设计容量,是上线阻塞 bug。
-  mem_overcommit_ratio: 1.5        # 内存才是硬限:r8g.metal-24xl 768GB,380×2GB=760GB,500×2GB=1000GB。配 balloon 回收时可 1.5(1129GB 可分配),无 balloon 应设 ~1.0 防 OOM。超卖维度看 balloon(见下)。
+  # #430 — vCPU 超卖比统一 1:4。1.0=不超配。CPU 敢超卖是因为 agent 负载多为
+  # IO/等待型,4 个 1c 租户同时跑满的概率低、时间片可复用;内存不能这么做(占住
+  # 就不还,balloon 回收是 best-effort)。
+  # 1:4 不是拍的 —— 理想比 = 物理供给(GB/vCPU) ÷ 租户需求(GB/vCPU):
+  #   R 系 8.0/2.0 = 4.0 → 1:4 恰好匹配(r8g 95×4=380 槽,正是 380/台 目标的来源)
+  #   M 系 4.0/2.0 = 2.0 → 统一 1:4 时 M 系多出的 CPU 槽内存跟不上,会搁浅
+  #                        (m8g 189 vcpu / m7g 125 vcpu),这是【已接受的代价】,
+  #                        由 openclaw_host_stranded_vcpu 指标观测,阈值需相应放宽。
+  # 从 6.0 降到 4.0 是【收紧】放行条件:6.0 的 570 槽是虚容量(内存只够 383),
+  # 真实上限一直由内存决定。r8g 仍满足 380/台,不减容。
+  cpu_overcommit_ratio: 4.0
+  # #430 — 内存不超卖(1.0)。ratio=1.0 => alloc_mem == 物理,"声明内存永不超过物理
+  # 内存"成为可证明的不变量。这是 #352 的直接反制:那次 1.5 让 m8g 声明达物理的
+  # 150%(374 个 1c2G 塞进 384GB),物理内存打满到 0G。
+  # 物理层防护改由 scheduling.mem_safety_floor_ratio 用 host 自报的实测
+  # MemAvailable 兜底(两维职责分离:账本防超卖,实测防 OOM),不再靠记账超卖赌 balloon。
+  mem_overcommit_ratio: 1.0
+  # #430 — per-family 超卖比覆盖(缺项回落上面的全局值)。
+  #
+  # 当前【留空】:四机型统一 cpu=4.0 / mem=1.0 就能达到按标称规格定义的容量目标,
+  # 不需要任何补偿系数。原因是 host 现在按【标称】规格注册容量(init-host.sh 查
+  # synth 时烤进的 {{NOMINAL_SPECS}} 表,表由 ha_edge.py 的 _sizes × _mem_ratio 生成):
+  #     r8g.metal-24xl  96vcpu/768GiB -> min(96×4, 768÷2) = 384
+  #     r7g.metal       64vcpu/512GiB -> min(64×4, 512÷2) = 256
+  #     m8g.metal-24xl  96vcpu/384GiB -> min(96×4, 384÷2) = 192  (内存先耗尽)
+  #     m7g.metal       64vcpu/256GiB -> min(64×4, 256÷2) = 128  (内存先耗尽)
+  #
+  # 早先曾给每个 family 配补偿系数(mem 1.022/1.023/1.025/1.028),因为那时 host 按
+  # nproc+/proc/meminfo 的【实测】值注册 —— 实测比标称小 1.8-1.9%(固件/硬件保留),
+  # 再扣 reserved_* 后只能到 375/250/187/124。但那是四个必须手算的魔数:每上一款
+  # 新机型都要重算,且极易算错(2026-08-11 就因用推算容量而非实测,让 r7g/m7g 少了
+  # 5 个和 3 个)。改为按标称注册后系数全部消失。
+  #
+  # 机制保留:若将来某类机型要单独调超卖比(如 M 系降 cpu 到 2.0 消除 CPU 搁浅),
+  # 在这里加一条即可。形如:
+  #   overcommit_by_family: {m8g: {cpu: 2.0, mem: 1.0}, m7g: {cpu: 2.0, mem: 1.0}}
+  overcommit_by_family: {}
   # ===== host golden AMI(#389 v2 块2)=====
   # 为什么要:开机时装组件不可靠——awscli 拿错架构 zip、aarch64 少 vmlinux 后缀、
   # Firecracker tarball 404,这三个都真实发生过,每次都让 host 超时丢掉 600s
@@ -77,6 +121,30 @@ quotas:
   max_vcpu_per_tenant: 0    # 0=不限
   max_mem_mb_per_tenant: 0
   max_data_disk_mb: 0
+
+# ========== 异构混池调度 (#430) ==========
+# 4 机型混池的租户放置策略。机型池本身在 host.instance_types(那里决定 ASG 启动
+# 哪台机器),这里决定【租户落哪台】。两处顺序必须一致,否则池按一个序扩容、
+# 按另一个序填租户。
+scheduling:
+  # 四级机型亲和排序开关。false = 逐字节回落既有的 free_vcpu / min(两维ratio) 排序
+  # (回退开关:关掉即恢复现状,不需回滚代码)。
+  affinity_enabled: true
+  # 机型优先顺序(family 前缀)。业务要求:R 系优先填满、M 系少接留安全余量。
+  # 排序键是两级 —— 主键 mem_per_vcpu 分档(R 系 8.0 GB/vCPU vs M 系 4.0),次键本表
+  # 定同档内代际。为什么需要次键:4 机型的 GB/vCPU 只有 2 个不同值(r8g=r7g=8.0、
+  # m8g=m7g=4.0),纯靠资源比例分不出 r8g→r7g 与 m8g→m7g 的先后,那是代际决定的。
+  # 新机型上线只改本表,不改代码。
+  family_order: ["r8g", "r7g", "m8g", "m7g"]
+  # 物理内存安全水位:host 自报的实测 MemAvailable 低于 mem_total × 此比例时不接新
+  # 租户。0 = 关闭物理门(只留账本闸)。
+  # 为什么需要它:账本 used_mem_mb 只证明"声明内存没超卖",但租户真实占用可能超出
+  # 声明(balloon 回收是 best-effort)。与既有磁盘软门同款三段逻辑:门关/无信号/
+  # 信号陈旧一律 fail-open,只在【新鲜确认不足】时阻断,绝不用过期读数误摘健康 host。
+  mem_safety_floor_ratio: 0.10
+  # 物理内存信号新鲜度 TTL(秒)。超期即 fail-open —— host-agent 挂了是正交问题,
+  # 交 health_check + ASG 兜底,调度门不越权用过期读数永久封锁 host。0 = 不校验新鲜度。
+  mem_check_ttl_sec: 300
 
 # ========== S3 ==========
 s3:

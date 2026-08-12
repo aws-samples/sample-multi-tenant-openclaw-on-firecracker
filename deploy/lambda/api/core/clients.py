@@ -8,6 +8,7 @@
 facade:handler.py re-export 全部符号,旧 patch/调用路径全程有效。
 """
 
+import json
 import os
 import boto3
 
@@ -23,7 +24,6 @@ ddb = boto3.resource("dynamodb")
 
 elbv2 = boto3.client("elbv2")
 
-# #152/#118 — KMS client for the credential-injection envelope helper
 # (core/kms_envelope). The API path only VALIDATES/relays upstream ciphertext
 # (guest zero-credential baseline: the Lambda has no kms:Decrypt); the host
 # decrypts at VM launch. The client is here to keep boto3 construction in the
@@ -31,19 +31,15 @@ elbv2 = boto3.client("elbv2")
 # unit tests of the envelope round-trip.
 kms = boto3.client("kms")
 
-# ClawPool general credential-injection CMK ARN (#152). Injected by CDK only when
 # security.clawpool_cmk_enabled=true; empty otherwise (feature off → the API
 # rejects any injected_credentials since it can't be encrypted against a key).
 CLAWPOOL_CMK_ARN = os.environ.get("CLAWPOOL_CMK_ARN", "")
 
-# #149 asymmetric-v1 — RSA-4096 CMK ARN. The API serves its PUBLIC key (kms:GetPublicKey)
 # so callers locally OAEP-encrypt env creds; the API never decrypts (host does). Empty
 # when security.clawpool_cmk_enabled=false → GET /clawpool-rsa-public-key returns 404.
 CLAWPOOL_RSA_CMK_ARN = os.environ.get("CLAWPOOL_RSA_CMK_ARN", "")
 
-# #187 P1 — 密文表(pk=tenant_id,#353 起无 TTL,随租户生命周期长存),存 gateway token
 # 密文(tenant_id EncryptionContext)。控制面 mint、reveal 从这里读;host 侧不读该表
-# (host 走 SSM 位置 12 参数拿密文,和 #118 host 直读 injected_credentials from
 # tenants_table 是两条独立路径)。Absent → gate 该功能没启用(P1 未部署环境用),
 # mint_gateway_token 会 fail-loud;这样避免"表没建、悄悄跳过"的假绿。
 tenant_secrets_table = (
@@ -62,7 +58,6 @@ tenant_stats_table = (
     else None
 )
 
-# #217 V2 — 文件版本快照表(pull-image?snapshot_time 按此逐文件按精确 VersionId 拉)。
 # env-gated:未部署 V2 的环境无此 env → None,pull-image 的 snapshot 分支 fail-loud。
 version_snapshots_table = (
     ddb.Table(os.environ["VERSION_SNAPSHOTS_TABLE"])
@@ -70,7 +65,6 @@ version_snapshots_table = (
     else None
 )
 
-# #394 step1 — 持久化 pull Job 表(progress 按 job_id 精确查;host 重启 /tmp 丢了终态仍在)。
 # env-gated 同上:未部署本步的环境无此 env → None,core/image_jobs.py 全部降级成 no-op,
 # 现有 live pull 行为不变(ADR §12 step1"不改变现有 live 路径")。
 image_jobs_table = (
@@ -79,7 +73,6 @@ image_jobs_table = (
     else None
 )
 
-# PRD #50-58 — control-plane scale-out GSIs on the tenants table (defined in
 # deploy/stack.py). gsi_owner partitions by owner_id (Cognito sub) for "my
 # nodes"; gsi_tenant_user partitions by tenant_user_id for the external backend's
 # per-user fleet management. Names must match the CDK index_name exactly.
@@ -87,14 +80,12 @@ GSI_OWNER = "gsi_owner"
 
 GSI_TENANT_USER = "gsi_tenant_user"
 
-# 1.4.0 (#62) — per-tenant / per-group skill scoping. Optional table:
 # legacy deployments without GROUPS_TABLE simply skip the group-resolution
 # branch in _resolve_effective_skills() and continue with broadcast behavior.
 groups_table = (
     ddb.Table(os.environ["GROUPS_TABLE"]) if os.environ.get("GROUPS_TABLE") else None
 )
 
-# Issue #17 — optional audit log; absent in legacy deployments
 audit_table = (
     ddb.Table(os.environ["AUDIT_TABLE"]) if os.environ.get("AUDIT_TABLE") else None
 )
@@ -106,7 +97,6 @@ batch_jobs_table = (
     else None
 )
 
-# #97 档A — optional external-platform → Cognito-IdP map (SPEC/02 §2.7). Absent →
 # federation not configured; /tenantmatch returns 404 (front-end falls back to
 # passing identity_provider explicitly). Partition key: platform_id (S).
 tenant_idp_table = (
@@ -117,7 +107,6 @@ tenant_idp_table = (
 
 AUDIT_TTL_DAYS = int(os.environ.get("AUDIT_TTL_DAYS", "90"))
 
-# Issue #13 — optional SNS topic for tenant lifecycle events.
 # Empty string disables publishing (no-op).
 NOTIFICATIONS_TOPIC_ARN = os.environ.get("NOTIFICATIONS_TOPIC_ARN", "")
 
@@ -129,6 +118,45 @@ HOST_RESERVED_MEM = int(os.environ.get("HOST_RESERVED_MEM", 2048))
 CPU_OVERCOMMIT_RATIO = float(os.environ.get("CPU_OVERCOMMIT_RATIO", 1.0))
 
 MEM_OVERCOMMIT_RATIO = float(os.environ.get("MEM_OVERCOMMIT_RATIO", 1.0))
+
+
+def _parse_overcommit_by_family(raw: str) -> dict:
+    """#430 — per-family 超卖比覆盖。env 传 JSON:{"m8g":{"cpu":2.0,"mem":1.0},...}。
+
+    空/非法 → {}(全部回落全局 CPU/MEM_OVERCOMMIT_RATIO,即当前统一 1:4 行为)。
+    非 dict 的顶层 JSON(list/str/number)一律视作未配置 —— 调度参数 fail-safe 回落
+    默认,不因一个畸形环境变量让整个控制面拒绝放置(host_profile.ratios 侧对单条
+    畸形 entry 另有兜底)。
+    """
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        print(f"[clients] OVERCOMMIT_BY_FAMILY not valid JSON, ignoring: {raw!r}")
+        return {}
+    if not isinstance(parsed, dict):
+        print(f"[clients] OVERCOMMIT_BY_FAMILY must be a JSON object, ignoring: {raw!r}")
+        return {}
+    return parsed
+
+
+OVERCOMMIT_BY_FAMILY = _parse_overcommit_by_family(
+    os.environ.get("OVERCOMMIT_BY_FAMILY", "")
+)
+
+AFFINITY_ENABLED = os.environ.get("AFFINITY_ENABLED", "false") == "true"
+
+# 留空回落 host_profile.DEFAULT_FAMILY_ORDER。
+FAMILY_ORDER = tuple(
+    f.strip()
+    for f in os.environ.get("FAMILY_ORDER", "r8g,r7g,m8g,m7g").split(",")
+    if f.strip()
+)
+
+MEM_SAFETY_FLOOR_RATIO = float(os.environ.get("MEM_SAFETY_FLOOR_RATIO", 0.0))
+
+MEM_CHECK_TTL_SEC = int(os.environ.get("MEM_CHECK_TTL_SEC", 300))
 
 VM_DEFAULT_VCPU = int(os.environ.get("VM_DEFAULT_VCPU", 2))
 
@@ -146,7 +174,6 @@ ALB_LISTENER_ARN = os.environ.get("ALB_LISTENER_ARN", "")
 
 VPC_ID = os.environ.get("VPC_ID", "")
 
-# #187 转型:ENABLE_PER_TENANT_ALB_RULE + legacy_alb 全模块已下线,数据面走两级路由
 # (ALB LOR → OpenResty edge → Redis 查表 → host DNAT → microVM:18789);ALB listener
 # rule 硬上限 100 的历史坑随之消解。
 
@@ -166,7 +193,6 @@ sqs = boto3.client("sqs") if (LIFECYCLE_QUEUE_URL or _DISPATCH_QUEUE_URL_BOOT) e
 # onto SQS and drained at the consumer's reserved-concurrency rate.
 CREATE_VIA_QUEUE = os.environ.get("CREATE_VIA_QUEUE", "false").lower() == "true"
 
-# Issue #16 / #9 — quota ceilings (0 = unlimited; ENABLED=false → no checks)
 QUOTAS_ENABLED = os.environ.get("QUOTAS_ENABLED", "false").lower() == "true"
 
 QUOTAS_MAX_VCPU = int(os.environ.get("QUOTAS_MAX_VCPU", "0") or "0")
@@ -180,7 +206,6 @@ QUOTAS_MAX_DATA_DISK_MB = int(os.environ.get("QUOTAS_MAX_DATA_DISK_MB", "0") or 
 SELF_MAX_NODES_PER_USER = int(os.environ.get("SELF_MAX_NODES_PER_USER", "1") or "0")
 
 # Firecracker can't snapshot a VM with an active balloon device, so live
-# migrate is unavailable while balloon is on (issue #72). Reject early.
 BALLOON_ENABLED = os.environ.get("BALLOON_ENABLED", "false").lower() == "true"
 
 # ── 1.5.0 security hardening: Cognito JWT signature verification ──
@@ -241,7 +266,6 @@ API_KEY_OWNER = "api-key"
 DISPATCH_QUEUE_URL = os.environ.get("DISPATCH_QUEUE_URL", "")
 
 # push=聚合SSM+ParamStore分片(默认,回退用), pull=写 assignments 表让 host-agent 5s 轮询自取(二期),
-# ddb=写 assignments 表 + 一条 --from-ddb SSM 叫醒 host 自查表(一期默认载体,#73:
 #     PutParameter 退出热路径,消除 3 TPS ParamStore 限流墙 + 24KB 参数区上限)
 DISPATCH_MODE = os.environ.get("DISPATCH_MODE", "push")
 
@@ -253,10 +277,8 @@ DISPATCH_PARAM_PREFIX = os.environ.get("DISPATCH_PARAM_PREFIX", "/openclaw/dispa
 
 DISPATCH_MAX_PARALLEL = int(os.environ.get("DISPATCH_MAX_PARALLEL", "96") or "96")
 
-# #331/#327 — host 侧【真实】冷启动并发(launch-vm.sh 跨进程 flock 槽数 OC_HOST_LAUNCH_SLOTS
 # 的镜像值,默认 30)。仅用于 SSM executionTimeout 公式的分母:VM 现在经 host 级槽闸【排队限速】
 # 起,有效并发是槽数(~30)不是装箱密度 DISPATCH_MAX_PARALLEL(96)。用 96 算会低估耗时 → 一批
-# 排队尾部的 VM 还没起完 SSM 就假超时 → 回滚活 VM → 账本分叉(codex #327 Error2)。两值须一致
 # (都由 config vm.host_launch_slots 派生),这里给默认兜底。
 DISPATCH_HOST_LAUNCH_CONCURRENCY = int(
     os.environ.get("DISPATCH_HOST_LAUNCH_CONCURRENCY", "30") or "30"
@@ -268,7 +290,6 @@ DISPATCH_INFLIGHT_TTL_SEC = int(
 
 DISPATCH_RETRY_BUDGET = int(os.environ.get("DISPATCH_RETRY_BUDGET", "3") or "3")
 
-# #315 容量不足溢出短退避秒数。unplaced(纯容量不够)租户走【原消息】重投:对原 SQS 消息调
 # ChangeMessageVisibility 把可见性从队列默认 960s(VisibilityTimeout)缩到此值,让 SQS 快速
 # 重投(而非等 48min),receiveCount 自然递增到 maxReceiveCount 进 DLQ,预算走现有 _release_claims。
 # 不发新消息 → 不重置 receiveCount、无 send/write 原子性窗口(区别于曾陷泥潭的"发新消息"方案)。
@@ -295,18 +316,15 @@ DISPATCH_PER_VM_BUDGET_SEC = int(
     os.environ.get("DISPATCH_PER_VM_BUDGET_SEC", "8") or "8"
 )
 
-# #340 — dispatch 磁盘软门水位(MB):host /data 物理剩余低于此值就不再接新租户。
 # 根因:CAS 只门控 vcpu/mem,看不见磁盘;高密度下 /data 被存量活 VM 真实占满(data.ext4
 # 是稀疏盘,随使用逐渐写实),新租户被派过来 `mkdir ${VM_DIR}` 报 No space → requires_intervention。
 # host-agent 独立线程(_disk_report_loop)用 statvfs('/data') 写 host 表 avail_disk_mb;
 # 装箱侧据此排除盘将满的 host。这是【软门】(装箱侧过滤,同 inflight_ok),不是 CAS 硬账本
-# ——完整声明式磁盘预留触 DDB 状态机(高危),留 #332/#339。0 = 关闭该门(纯旧行为)。
 # 默认 2048MB:留出至少一个默认 data 盘(VM_DATA_DISK_MB)的物理余量给新租户初始写入。
 DISPATCH_HOST_DISK_MIN_FREE_MB = int(
     os.environ.get("DISPATCH_HOST_DISK_MIN_FREE_MB", "2048") or "2048"
 )
 
-# #340 — host 磁盘上报新鲜度阈值(秒):avail_disk_mb 的 disk_check_ts_epoch 超过此秒数视为
 # 陈旧,磁盘门对该 host 【跳过】(fail-open,退回旧行为)。防 host-agent 挂了/旧 host 从没
 # 上报时,用过期读数误杀整台 host。默认 90s(3× 默认 poll 15s,容一次漏报);0 = 不校验新鲜度。
 DISPATCH_DISK_REPORT_TTL_SEC = int(

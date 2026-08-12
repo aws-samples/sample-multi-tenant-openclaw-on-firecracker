@@ -46,7 +46,9 @@ PUBLIC_FIELDS = frozenset(
 )
 _HOST_ID_RE = re.compile(r"^i-[0-9a-f]{8,17}\Z")
 _STATUS_RE = re.compile(r"^[a-z_]{1,64}\Z")
-_INTERNAL_PREFIXES = ("activename#", "inflight#", "__")
+# 与 activename#/inflight# 同款前缀隔离)。不补的话 GET /tenants 会把这些内部记录当成业务
+# 租户返给调用方 —— 既是脏数据,也泄漏别人的 op_id/action 历史。
+_INTERNAL_PREFIXES = ("activename#", "inflight#", "idem#", "__")
 _RESPONSE_ITEM_BUDGET = 4_800_000
 
 

@@ -125,7 +125,6 @@ select option {
   width: 330px;
   flex-shrink: 0;
 }
-/* #394 — fleet-level image/version management, above the hosts/tenants columns */
 .image-panel {
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -133,7 +132,6 @@ select option {
   margin-bottom: 16px;
   background: var(--panel, rgba(255, 255, 255, 0.02));
 }
-/* #394 — per-host canary pipeline (numbered 1→2→3→4 steps) */
 .canary-pipe {
   margin-top: 8px;
   border-top: 1px dashed var(--border);
@@ -190,7 +188,6 @@ select option {
   font-family: var(--mono, monospace);
   white-space: nowrap;
 }
-/* #394 — one row per slot/version: colored role pill + mono version, aligned columns. */
 .slot-row {
   display: flex;
   align-items: center;
@@ -224,7 +221,6 @@ select option {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-/* #394 — Image Snapshot list: label-first rows, timestamp demoted, compact tags. */
 .snap-row {
   display: flex;
   align-items: center;
@@ -445,7 +441,6 @@ select option {
   border-color: var(--border);
   background: rgba(255, 255, 255, 0.03);
 }
-/* #249 — host upgrading 时版本下拉也 disable,变灰 + 禁点(与 Pull 按钮一致)。 */
 select:disabled {
   opacity: 0.4;
   cursor: not-allowed;
@@ -738,7 +733,6 @@ tr:hover td {
   background: var(--gray);
 }
 
-/* Tag badges (issue #10) */
 .tag-badge {
   display: inline-block;
   margin: 1px 3px 1px 0;
@@ -867,6 +861,18 @@ tr:hover td {
 @keyframes spin {
   to {
     transform: rotate(360deg);
+  }
+}
+
+/* #456 — rebuild 进行中的闪烁(Rootfs 列的 in-flight 标记,见 app.format.js
+   rebuildStyle)。只改透明度、不改布局,避免每 5s 轮询重绘时行高跳动。 */
+@keyframes rebuild-blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
   }
 }
 

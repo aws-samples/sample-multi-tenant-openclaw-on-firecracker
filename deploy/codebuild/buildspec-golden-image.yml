@@ -49,20 +49,48 @@ phases:
       - docker pull public.ecr.aws/ubuntu/ubuntu:22.04
       # -e SAMPLE:让 build-image-demo.sh 的 --sample 能选样本目录。生产栈不设此
       # 变量时 docker 不传入容器,build-rootfs.sh 回落默认 finance-agent,生产零影响。
-      - docker run --privileged --rm --network host -v "$CODEBUILD_SRC_DIR":/work -w /work -e ASSETS_BUCKET -e IMAGE_VERSION -e AWS_REGION -e SAMPLE -e AWS_CONTAINER_CREDENTIALS_RELATIVE_URI -e AWS_CONTAINER_CREDENTIALS_FULL_URI -e AWS_CONTAINER_AUTHORIZATION_TOKEN public.ecr.aws/ubuntu/ubuntu:22.04 bash /work/deploy/codebuild/bake-in-container.sh
+      # 指针」(见其 SKIP_MANIFEST 分支),但该变量原先【没有透传进容器】——在 CodeBuild
+      # 上设了也到不了 bake 脚本,那条 escape hatch 从这条链路完全不可达。补上才生效。
+      - docker run --privileged --rm --network host -v "$CODEBUILD_SRC_DIR":/work -w /work -e ASSETS_BUCKET -e IMAGE_VERSION -e AWS_REGION -e SAMPLE -e SKIP_MANIFEST -e AWS_CONTAINER_CREDENTIALS_RELATIVE_URI -e AWS_CONTAINER_CREDENTIALS_FULL_URI -e AWS_CONTAINER_AUTHORIZATION_TOKEN public.ecr.aws/ubuntu/ubuntu:22.04 bash /work/deploy/codebuild/bake-in-container.sh
   post_build:
     commands:
-      - echo "=== 验证产物新鲜度 + manifest version 匹配(防陈旧产物假通过)==="
-      # 校验 manifest.json 的 version 字段确等于本次 IMAGE_VERSION,且 rootfs 对象
-      # 在最近 30 分钟内更新过(本轮真烤的,不是上一轮残留)。任一不符 → FAIL。
+      - echo "=== 验证产物新鲜度(防陈旧产物假通过)==="
+      # 与 build-rootfs.sh 自带的 SKIP_MANIFEST=1(并排烤、不动线上指针)**互斥** ——
+      # 那种模式下 manifest 仍指旧版,断言必失败,于是「并排烤」和「build 报绿」二者
+      # 不可兼得,烤成功也被判 FAILED。现按模式选判据,两种模式都能真验到本轮产物:
+      #   SKIP_MANIFEST=1 → 不看指针,直接校验【本次版本后缀】的三个对象都存在且新鲜;
+      #   否则(发版模式)  → 保留原来的指针断言(它正是防"上一轮残留假通过"的那道门)。
+      # 无论哪种模式,都断言 rootfs 对象的 LastModified 在 90 分钟内,把"陈旧产物"这个
+      # 原注释声明过、但此前【从未真正断言】的判据补成硬门(原代码只 echo 了时间)。
       - |
-        MV=$(aws s3 cp "s3://${ASSETS_BUCKET}/deployment/rootfs/manifest.json" - | python3 -c "import sys,json;print(json.load(sys.stdin)['version'])")
-        echo "manifest.version=$MV expected=$IMAGE_VERSION"
-        [ "$MV" = "$IMAGE_VERSION" ] || { echo "FAIL: manifest version 不匹配,本次烤制未生效"; exit 1; }
-        LM=$(aws s3api head-object --bucket "$ASSETS_BUCKET" --key "deployment/rootfs/openclaw-rootfs-${IMAGE_VERSION}.ext4.gz" --query LastModified --output text)
+        set -e
+        ROOTFS_KEY="deployment/rootfs/openclaw-rootfs-${IMAGE_VERSION}.ext4.gz"
+        if [ "${SKIP_MANIFEST:-0}" = "1" ]; then
+          echo "SKIP_MANIFEST=1 — 并排烤模式:校验版本后缀产物,不校验 manifest 指针"
+          for k in "$ROOTFS_KEY" \
+                   "deployment/rootfs/openclaw-data-template-${IMAGE_VERSION}.ext4.gz" \
+                   "deployment/rootfs/openclaw-immutable-${IMAGE_VERSION}.ext4.gz"; do
+            aws s3api head-object --bucket "$ASSETS_BUCKET" --key "$k" >/dev/null \
+              || { echo "FAIL: 缺产物 s3://${ASSETS_BUCKET}/$k,本次烤制未落地"; exit 1; }
+            echo "  ✓ $k"
+          done
+        else
+          MV=$(aws s3 cp "s3://${ASSETS_BUCKET}/deployment/rootfs/manifest.json" - | python3 -c "import sys,json;print(json.load(sys.stdin)['version'])")
+          echo "manifest.version=$MV expected=$IMAGE_VERSION"
+          [ "$MV" = "$IMAGE_VERSION" ] || { echo "FAIL: manifest version 不匹配,本次烤制未生效"; exit 1; }
+        fi
+        LM=$(aws s3api head-object --bucket "$ASSETS_BUCKET" --key "$ROOTFS_KEY" --query LastModified --output text)
         echo "rootfs LastModified=$LM"
-      - aws s3 cp "s3://${ASSETS_BUCKET}/deployment/rootfs/manifest.json" - | tee /tmp/manifest.json
-      - echo "黄金镜像 ${IMAGE_VERSION} 发版完成(加固随 build-rootfs.sh 继承)"
+        # 单行 python:YAML 块里多行 `python3 -c "` 的缩进会进字符串 → IndentationError。
+        python3 -c "import datetime,sys;lm=datetime.datetime.fromisoformat('$LM'.replace('Z','+00:00'));age=(datetime.datetime.now(datetime.timezone.utc)-lm).total_seconds()/60;print('rootfs age = %.1f min'%age);sys.exit(0 if age<=90 else 1)" \
+          || { echo "FAIL: rootfs 对象超过 90 分钟未更新 —— 这是上一轮残留,不是本次产物"; exit 1; }
+      - |
+        if [ "${SKIP_MANIFEST:-0}" = "1" ]; then
+          printf '{"skipped":true,"image_version":"%s"}\n' "$IMAGE_VERSION" | tee /tmp/manifest.json
+        else
+          aws s3 cp "s3://${ASSETS_BUCKET}/deployment/rootfs/manifest.json" - | tee /tmp/manifest.json
+        fi
+      - echo "黄金镜像 ${IMAGE_VERSION} 烤制完成(加固随 build-rootfs.sh 继承;SKIP_MANIFEST=${SKIP_MANIFEST:-0})"
 artifacts:
   files:
     - /tmp/manifest.json

@@ -13,13 +13,11 @@
 set -euo pipefail
 
 # Show line number + exit code on any failure so users know exactly where things broke.
-# 顺手 lazy-umount ROOTFS_DIR(评审 LOW #4):失败路径下如果 chroot 挂载/主 rootfs 还挂着,
 # 用户手动清理容易忘。lazy(-l)在正常路径已 umount 时也无副作用(路径不存在直接返 0)。
 trap 'rc=$?; echo "❌ build-rootfs.sh failed at line $LINENO (exit $rc)" >&2; echo "💡 To capture full log next run: ./build-rootfs.sh ${1:-v1.0} 2>&1 | tee build.log" >&2; [ -n "${ROOTFS_DIR:-}" ] && sudo umount -l "${ROOTFS_DIR}" 2>/dev/null || true' ERR
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# #35 image hygiene lib — strip/assert 逻辑抽出成可独立执行 + 可 subprocess-test
 # 的 shell 库,让 immutable/data 两条路径共用同一份 find 谓词,消除漂移。
 # shellcheck disable=SC1091
 . "${SCRIPT_DIR}/scripts/lib/image-hygiene.sh"
@@ -70,7 +68,6 @@ if [ ! -f "$OC_TEMPLATE" ]; then
   exit 1
 fi
 
-# #197 build 机器门(升级自旧防呆注释):校验烤入的 openclaw.json 及仓内模板载体
 # key 集 ⊆ pin 版本 gateway schema,超版本 key(6.x-only,2.26 .strict() fail-closed
 # 拒起 → gateway 崩溃重启仍报 running)直接拒烤。gate 从 build-rootfs.sh 的
 # OPENCLAW_PIN 读版本、按 FORBIDDEN_BY_PIN 判。升级版本时更新该表(gate 内有注释)。
@@ -138,7 +135,6 @@ sudo umount -l ${ROOTFS_DIR}/proc ${ROOTFS_DIR}/sys ${ROOTFS_DIR}/dev 2>/dev/nul
 sudo umount -l ${ROOTFS_DIR} 2>/dev/null || true
 rm -f ${ROOTFS_IMG} ${DATA_IMG}
 
-# CPU arch selection (issue #19). Defaults to host arch; pass --arch arm64
 # (or x86_64) to cross-build for Graviton vs Intel/AMD hosts.
 ARCH="${ARCH:-$(dpkg --print-architecture 2>/dev/null || uname -m)}"
 case "$ARCH" in
@@ -371,7 +367,6 @@ IMMSH
 chmod +x /usr/local/sbin/openclaw-mount-immutable.sh
 systemctl enable openclaw-immutable.service
 
-# Mount the per-VM READ-ONLY credentials disk (#118/#116) and bind its .env over
 # ~/.openclaw/.env. launch-vm.sh attaches a per-tenant ext4 (holding a .env of
 # platform-injected creds the HOST decrypted from KMS ciphertext) READ-ONLY.
 # OpenClaw's native dotenv loader reads ~/.openclaw/.env at startup
@@ -776,16 +771,35 @@ echo "node=$(node --version) npm=$(npm --version)"
 # OpenClaw CLI — pin 到确定版本(CalVer),不装 latest:latest 会随上游漂移,
 # 同一份 build 脚本不同时间烤出不同 OpenClaw,launch-vm 的 openclaw.json schema
 # 适配是针对特定版本。
-# #188:钉客户线上版本 2026.2.26(协议 v3),对齐 wss 免 approve 冷注入基准。
-# 2.26 schema 比 6.x 严(.strict()),几个 6.x 才加的 config 键必须不出现在
-# 烤进镜像的 openclaw.json,否则 gateway startup 校验失败拒起(真机用 2.26
-# dist 的 validateConfigObjectWithPlugins 实测):① 本文件下方 sentinel-guard
-# 不带 hooks 键 ② openclaw.json 不含 heartbeat.isolatedSession/lightContext、
-# compaction.midTurnPrecheck/maxActiveTranscriptBytes。**这条不再靠自觉**:
-# 脚本顶部已跑 scripts/checks/template-schema-gate.py 机器门(#197),超版本 key
-# 直接拒烤。升级 OpenClaw = 改这里 OPENCLAW_PIN + 更新 gate 的 FORBIDDEN_BY_PIN 表
-# + 重跑目标版 schema 校验 + 验 launch-vm jq → 重烤。
-OPENCLAW_PIN="2026.2.26"
+# 历史:曾钉 2026.2.26(协议 v3,客户线上同款);曾试钉 2026.6.33(6.x 系),真机实测
+# 配对失败:6.33 协议默认 v4,且 6.x 的配对门要求 paired.json 的 tokens[role] 预铸
+# 活跃 token(2026.4.10 加的门,effective roles = 活跃 token ∩ 批准角色),而
+# build_paired_json_b64 当时写的是空 tokens:{}(为 2.26 校准)→ 握手回 NOT_PAIRED
+# tokens.operator(同一份产物 2.26/7.1 双版兼容,真机实测),那道门因此解除。
+# `2026.7.1` 的 prerelease、排序在其【之前】,而 npm 的 `latest` 是手工标签正好指
+# `2026.7.1-2`;写 `2026.7.1` 或 `^2026.7.1` 都取不到这一版。
+# **这条不再靠自觉**:脚本顶部已跑 scripts/checks/template-schema-gate.py 机器门
+# FORBIDDEN_BY_PIN 表 + 重跑目标版 schema 校验 + 验 launch-vm jq → 重烤。
+OPENCLAW_PIN="2026.7.1-2"
+
+# `>=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0`,且 openclaw CLI **在运行时硬校验**
+# (不达标直接打印 "Node.js >=22.22.3 ... is required" 并拒启动)。2.26 只要
+# setup_22.x 若因 apt 镜像/缓存回退到 22.22.3 以下,gateway 会静默永不监听 18789
+# 在这里拦成拒烤,而不是留给运行时。升 OPENCLAW_PIN 时按目标版 engines 同步本值。
+OPENCLAW_NODE_MIN="22.22.3"
+_node_ver="$(node --version 2>/dev/null | sed 's/^v//')"
+if [ -z "${_node_ver}" ]; then
+  echo "❌ 拒烤:node 不可用,无法校验 openclaw@${OPENCLAW_PIN} 的引擎地板"
+  exit 1
+fi
+# sort -V 取两者最小值:最小值不是地板 → 实装版本低于地板。
+if [ "$(printf '%s\n%s\n' "${OPENCLAW_NODE_MIN}" "${_node_ver}" | sort -V | head -1)" != "${OPENCLAW_NODE_MIN}" ]; then
+  echo "❌ 拒烤:node ${_node_ver} < ${OPENCLAW_NODE_MIN},openclaw@${OPENCLAW_PIN} 会拒启动"
+  echo "   → gateway 永不监听 18789。修:让 [3/8] 的 nodesource 22.x 装到 ≥${OPENCLAW_NODE_MIN}。"
+  exit 1
+fi
+echo "✓ node ${_node_ver} ≥ ${OPENCLAW_NODE_MIN}(openclaw@${OPENCLAW_PIN} 引擎地板)"
+unset _node_ver
 echo "[7/8] OpenClaw CLI (npm install -g openclaw@${OPENCLAW_PIN} — peak ~1GB RAM)"
 npm install -g "openclaw@${OPENCLAW_PIN}"
 chown -R agent:agent /usr/lib/node_modules
@@ -836,7 +850,29 @@ if [ -d /tmp/image-sample ]; then
     find /home/agent/.openclaw/plugins -name 'test-harness.*' -delete 2>/dev/null || true
     # Register the two guard plugins in config: load paths + enabled entries.
     # jq merge keeps whatever the template already had under .plugins.
-    #   acl-guard / sentinel-guard — before_tool_call hooks (priority 1000 / 200)
+    #   acl-guard      — before_tool_call (priority 1000, runs first)
+    #   sentinel-guard — before_tool_call / after_tool_call / llm_input / llm_output
+    #
+    # `llm_input`(拒 prompt injection)与 `llm_output`(脱敏泄漏密钥)两个钩子在
+    # 2026.7.1-2 上被 gateway 静默拦掉,安全层只剩 tool_call 那两个钩子。
+    # 真机实测(apse1,r8g.metal-24xl,guest 跑 OpenClaw 2026.7.1-2 (0790d9f)):
+    #   不带该键 → 启动日志两行
+    #     [gateway] [plugins] typed hook "llm_input"  blocked because non-bundled
+    #       plugins must set plugins.entries.sentinel-guard.hooks.allowConversationAccess=true
+    #     [gateway] [plugins] typed hook "llm_output" blocked because …(同上)
+    #   带该键 → 重启后 `blocked because` 计数归 0、gateway ready、10 插件全载。
+    # 这是 2.26→7.1 的版本行为差异,不是插件缺陷:2.26 全仓无 `blocked because`
+    # 这套门(也无 allowConversationAccess 键),所以那两个钩子在 2.26 上本来就跑。
+    # **2.26 不兼容**:该键在 2.26 的 `.strict()` plugins.entries schema 下会被拒 →
+    # gateway 拒起。本仓已定为只跟 7.1,故此处直接写死。
+    # **回钉旧版时必须连带删掉下面这个 hooks 段**,否则烤出的镜像 gateway 起不来。
+    # 注意顶部那道 template-schema-gate 拦不住这种情况:它在 :78 就跑、扫的是
+    # `templates/openclaw.json`(模板里根本没有 plugins 段),而本键是在这里、在门
+    # 之后才注入的 —— 门看不见它。真正的拦点是 CI 里
+    # `tests/test_476_openclaw_pin_7_1_2.py::test_pin_is_exactly_the_prerelease_build`
+    # 逐字断言 pin == 2026.7.1-2:任何回钉都会先让那条红,从而迫使一起复核本段。
+    # 该键同时登记在 gate 的 2026.2.26 禁用表里,那是给"模板载体里出现该键"用的,
+    # 不覆盖这条 jq 注入路径。
     # claw-channel was retired in the 11-ENGINE-TRANSFORM data-plane refactor
     # (SPEC/11-ENGINE-TRANSFORM/02-DEV-PLAN.md §A): the WSS-hub reverse channel
     # is replaced by two-tier routing (OpenResty edge → host DNAT → in-VM native
@@ -848,7 +884,7 @@ if [ -d /tmp/image-sample ]; then
         (.plugins // {}) as $p |
         .plugins = ($p + {
           "load":    (((($p.load // {})) + { "paths": (((($p.load // {}).paths) // []) + ["/home/agent/.openclaw/plugins/acl-guard", "/home/agent/.openclaw/plugins/sentinel-guard"] | unique) })),
-          "entries": (((($p.entries // {})) + { "acl-guard": { "enabled": true }, "sentinel-guard": { "enabled": true } }))
+          "entries": (((($p.entries // {})) + { "acl-guard": { "enabled": true }, "sentinel-guard": { "enabled": true, "hooks": { "allowConversationAccess": true } } }))
         })
       ' /home/agent/.openclaw/openclaw.json > /home/agent/.openclaw/openclaw.json.tmp \
         && mv /home/agent/.openclaw/openclaw.json.tmp /home/agent/.openclaw/openclaw.json
@@ -1035,10 +1071,20 @@ sudo umount -l ${ROOTFS_DIR}/proc ${ROOTFS_DIR}/sys ${ROOTFS_DIR}/dev
 # === Build data template from /home/agent ===
 # 行首缩进锚定,只取 vm 段的 data_disk_mb。裸 grep 'data_disk_mb:' 是子串匹配,
 # 会连 quotas 段的 max_data_disk_mb 一起命中 → DATA_DISK_MB 变多行 "8192\n0" →
-# truncate -s 解析失败 → mkfs "Not enough space"(#276 首次部署实撞)。^\s+ 锚定
 # 排除 max_ 前缀行;head -1 兜底防未来再有同名键。
+# set -e 就地终止,于是 :1069 那条「未解析到 vm.data_disk_mb」的提示【永远到不了】——
+# 实际只留下一行裸 `grep: …/config.yml: No such file or directory` + 行号,看不出根因。
+# 真撞过:CodeBuild 用 `git archive` 打的 source zip 不含 config.yml(被 .gitignore
+# 忽略,仓库只跟踪 config.yml.example),烤到这里挂掉,排查花了额外一轮。
+# 这里把"文件缺失"和"键缺失"分成两条各自说清的错。
+if [ ! -f "${SCRIPT_DIR}/config.yml" ]; then
+  echo "[FATAL] 找不到 ${SCRIPT_DIR}/config.yml —— 烤制需要它取 vm.data_disk_mb。"
+  echo "        注意 config.yml 被 .gitignore 忽略(仓库只跟踪 config.yml.example),"
+  echo "        所以 \`git archive\` 打的 source zip 不含它;CDK asset 打包才含。"
+  echo "        修:cp config.yml.example config.yml 并按环境填好,或用 CDK asset 作 source。"
+  exit 1
+fi
 DATA_DISK_MB=$(grep -E '^[[:space:]]+data_disk_mb:' "${SCRIPT_DIR}/config.yml" | awk '{print $2}' | head -1)
-# #277 fail-loud:config 里连 vm.data_disk_mb 都没有时,DATA_DISK_MB 为空会让
 # 下面的 truncate 报含糊错;这里显式拦下,直接说清缺哪个键。
 [ -n "${DATA_DISK_MB}" ] || { echo "[FATAL] config.yml 未解析到 vm.data_disk_mb"; exit 1; }
 echo "=== Building data template (${DATA_DISK_MB}MB) ==="
@@ -1047,12 +1093,10 @@ truncate -s ${DATA_DISK_MB}M ${DATA_IMG}
 mkfs.ext4 -q ${DATA_IMG}
 sudo mkdir -p ${DATA_DIR}
 sudo mount ${DATA_IMG} ${DATA_DIR}
-# #35 image hygiene: strip python build caches from the agent home BEFORE it is
 # copied into the data template (scaffold/__pycache__ etc. would otherwise ride
 # into every tenant's writable data disk). Strip source then copy clean.
 sudo bash -c "$(declare -f image_hygiene_strip _image_hygiene_cache_dir_predicate _image_hygiene_pyc_predicate); image_hygiene_strip '${ROOTFS_DIR}/home/agent'"
 sudo cp -a ${ROOTFS_DIR}/home/agent/. ${DATA_DIR}/
-# #35 fail-loud (评审 MEDIUM #1):对称于 immutable 侧,在挂载中的 data 盘上跑
 # 同一份 find 断言。命中即打印 + umount + exit 1,别让污染的数据盘静默滚下去。
 if ! sudo bash -c "$(declare -f image_hygiene_assert image_hygiene_find_hits _image_hygiene_cache_dir_predicate _image_hygiene_pyc_predicate); image_hygiene_assert '${DATA_DIR}' '<data>'"; then
   sudo umount ${DATA_DIR} 2>/dev/null || true
@@ -1085,12 +1129,17 @@ rm -f ${IMMUTABLE_IMG}
 # platform-injected + guardrail-masked) and is a protected identity file, so it
 # must be tamper-proof too.
 IMMUTABLE_WORKSPACE_FILES="SOUL.md AGENTS.md IDENTITY.md HEARTBEAT.md COMMUNICATION_STYLE.md TOOLS.md USER.md"
-# Ops / safety skills that must never be editable from inside the VM. An attacker
-# editing a vetting skill to fabricate a "safe" verdict is a risk, so these are
-# baked read-only + FIM-monitored. This AWS sample ships a minimal neutral set
-# (skill-vetter + weather); brand-specific skills are added when you bake your own
-# golden image (see docs). The cp loop below tolerates a missing dir (`[ -d ]`
-# guard) so trimming the set never breaks the build.
+# Ops / safety skills that must never be editable from inside the VM. Includes
+# the v4 general-capability + controlled-quant skills: intent-router (always-on
+# routing), session-logs (tenant-scoped read), summarize, market-data (read-only
+# quotes), and quant-engine (testnet/paper default + hard CONFIRM/backtest gate).
+# Also includes any read-only market-analysis skills that ship: an attacker
+# editing an audit/ranking skill to fabricate a "safe" verdict or a fake board
+# is a risk, so they are baked read-only + FIM-monitored like the other
+# safety-relevant skills.
+# 非中性的行情/分析类 skill 名已归档,不在中性 finance-advisor 范围,故此处不再
+# 列出;保留与 MANIFEST + 306b4cb 中性 skill 集一致的 11 个。cp 循环(:1035)对缺
+# 目录已 `[ -d ]` 容错跳过+警告,不崩。
 IMMUTABLE_SKILLS="skill-vetter weather"
 
 # Stage the immutable set from the just-built golden /home/agent tree.
@@ -1114,7 +1163,6 @@ for s in ${IMMUTABLE_SKILLS}; do
   fi
 done
 
-# #35 image hygiene: strip Python build caches BEFORE hashing/sizing/baking.
 # scaffold/__pycache__, .ruff_cache, .pytest_cache and *.pyc are build-time
 # debris that would otherwise (a) get sha256-hashed into golden-image.sha256 and
 # baked into the READ-ONLY authority disk (bloat + non-reproducible bytes that
@@ -1143,12 +1191,10 @@ mkfs.ext4 -q ${IMMUTABLE_IMG}
 sudo mkdir -p ${IMMUTABLE_DIR}
 sudo mount ${IMMUTABLE_IMG} ${IMMUTABLE_DIR}
 sudo cp -a ${IMMUTABLE_STAGE}/. ${IMMUTABLE_DIR}/
-# #35 image-hygiene assertion (fail-loud, DoD core): after the content lands on
 # the real immutable disk, assert NO python build cache made it through. If any
 # survives the strip above (e.g. a future skill dir sneaks one in), abort the
 # build rather than silently ship a polluted read-only golden image. Runs while
 # still mounted so it inspects the exact bytes that become the disk image.
-# 谓词与 immutable strip / data strip 共用同一份库函数,避免漂移(评审 LOW #3)。
 if ! sudo bash -c "$(declare -f image_hygiene_assert image_hygiene_find_hits _image_hygiene_cache_dir_predicate _image_hygiene_pyc_predicate); image_hygiene_assert '${IMMUTABLE_DIR}' '<immutable>'"; then
   sudo umount ${IMMUTABLE_DIR} 2>/dev/null || true
   sudo rmdir ${IMMUTABLE_DIR} 2>/dev/null || true

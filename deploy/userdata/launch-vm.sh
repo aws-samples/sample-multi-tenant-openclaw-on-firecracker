@@ -49,10 +49,52 @@ mkdir -p ${VM_DIR}
 rm -f ${VM_DIR}/.stopped
 SOCK="${VM_DIR}/fc.sock"
 TAP="tap-vm${VM_NUM}"
-GUEST_IP="${SUBNET_PREFIX:-10.0}.${VM_NUM}.2"
-HOST_TAP_IP="${SUBNET_PREFIX:-10.0}.${VM_NUM}.1"
-GUEST_MAC="AA:FC:00:00:00:$(printf '%02x' ${VM_NUM})"
 log() { echo "[oc:launch] $(date +%H:%M:%S) $*"; }
+
+# ── Guest addressing ────────────────────────────────────────────────────────
+# VM_NUM used to be dropped straight into the third IP octet AND the last MAC
+# byte (`${PREFIX}.${VM_NUM}.2` / `AA:FC:00:00:00:$(printf '%02x')`). Both are
+# 8-bit, so VM_NUM > 254 produced an invalid IP and a MAC that wrapped around
+# and collided with an existing VM — i.e. two tenants on one L2 segment. That
+# capped a host at 254 microVMs, well under the ~300 production density target
+# (372 theoretical on a 768 GiB box), and the failure mode was silent
+# corruption rather than a refusal.
+#
+# Now VM_NUM is a 16-bit value spread over the second and third octets (and
+# two MAC bytes). The split is chosen so 1..254 is BYTE-IDENTICAL to the old
+# scheme — running VMs keep their addresses across an upgrade:
+#   VM_NUM 1..254   → <A>.<B+0>.<1..254>   (unchanged)
+#   VM_NUM 255..508 → <A>.<B+1>.<1..254>
+_PREFIX="${SUBNET_PREFIX:-10.0}"
+_OCT_A="${_PREFIX%%.*}"
+_OCT_B="${_PREFIX##*.}"
+if [ "${VM_NUM}" -lt 1 ]; then
+  log "FATAL: VM_NUM must be >= 1 (got ${VM_NUM})"; exit 64
+fi
+_HI=$(( (VM_NUM - 1) / 254 ))
+_LO=$(( (VM_NUM - 1) % 254 + 1 ))
+_OCT_B=$(( _OCT_B + _HI ))
+if [ "${_OCT_B}" -gt 255 ]; then
+  log "FATAL: VM_NUM ${VM_NUM} overflows the guest address space starting at ${_PREFIX}"
+  exit 64
+fi
+# The derived /24 must not overlap the VPC — the guest's default route points
+# at the host tap, so an overlapping subnet silently blackholes VPC traffic
+# (Bedrock, S3 endpoints). Compare the first two octets: a lookup-based VPC is
+# often the account default at 172.31.0.0/16, which a wide enough guest range
+# would eventually walk into.
+if [ -n "${OC_VPC_CIDR:-}" ] && [ "${OC_VPC_CIDR}" != "{{VPC_CIDR}}" ]; then
+  _VPC_A=$(echo "${OC_VPC_CIDR}" | cut -d. -f1)
+  _VPC_B=$(echo "${OC_VPC_CIDR}" | cut -d. -f2)
+  if [ "${_OCT_A}" = "${_VPC_A}" ] && [ "${_OCT_B}" = "${_VPC_B}" ]; then
+    log "FATAL: guest subnet ${_OCT_A}.${_OCT_B}.${_LO}.0/24 collides with VPC ${OC_VPC_CIDR}"
+    log "       lower vm.subnet_prefix in config.yml so the guest range stays clear of the VPC"
+    exit 64
+  fi
+fi
+GUEST_IP="${_OCT_A}.${_OCT_B}.${_LO}.2"
+HOST_TAP_IP="${_OCT_A}.${_OCT_B}.${_LO}.1"
+GUEST_MAC="AA:FC:00:00:$(printf '%02x' ${_HI}):$(printf '%02x' ${_LO})"
 
 # Write VM metadata for host-agent discovery
 cat > "${VM_DIR}/vm.json" << VMEOF
@@ -259,6 +301,47 @@ sudo iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>
   sudo iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 sudo iptables -C FORWARD -i ${TAP} -o ${HOST_IFACE} -j ACCEPT 2>/dev/null || \
   sudo iptables -A FORWARD -i ${TAP} -o ${HOST_IFACE} -j ACCEPT
+
+# ── SECURITY (multi-tenant isolation): deny EAST-WEST, three vectors ──
+# The FORWARD policy is ACCEPT and only the two rules above match, so anything
+# they don't cover falls through and is forwarded. README claimed "FORWARD DROP
+# between tenant subnets" but no such rule existed. These are explicit DROPs
+# rather than `-P FORWARD DROP` on purpose: flipping the chain policy would cut
+# every already-running VM on this host the instant it lands, whereas targeted
+# rules are safe to roll out under a live fleet (see docs/RUNBOOK.md).
+#
+# They are inserted at position 1 so they precede the conntrack ACCEPT — no
+# legitimate east-west flow exists, so ESTABLISHED must not grandfather one in.
+# The guest's own egress is unaffected: every rule below requires `-i ${TAP}`
+# plus either a tap output device or a VPC-internal destination, and the
+# internet path is `-i ${TAP} -o ${HOST_IFACE}` to a public address.
+
+# (1) VM ↔ VM on this host. Both taps are local, so the kernel forwards
+#     directly between them: tenant A could reach tenant B's guest IP.
+sudo iptables -C FORWARD -i ${TAP} -o "tap-vm+" -j DROP 2>/dev/null || \
+  sudo iptables -I FORWARD 1 -i ${TAP} -o "tap-vm+" -j DROP
+
+# (2) Guest → this host's own listeners. Traffic to the host (tap IP or its
+#     private IP) traverses INPUT, not FORWARD, and INPUT had no rules at all.
+#     nginx :80/:8081 serve EVERY tenant's dashboard on this host, and :8899 is
+#     host-agent (all tenants' health). DNS (udp/53) is deliberately untouched.
+sudo iptables -C INPUT -i ${TAP} -p tcp -m multiport --dports 80,8081,8899 -j DROP 2>/dev/null || \
+  sudo iptables -I INPUT 1 -i ${TAP} -p tcp -m multiport --dports 80,8081,8899 -j DROP
+
+# (3) Guest → OTHER hosts' listeners. Guest egress is MASQUERADEd to this
+#     host's private IP, so it arrives looking like fleet-internal traffic and
+#     the security groups (:80 open to the VPC CIDR for the ALB health check,
+#     :8081 open host-SG→host-SG) let it straight through. With the T3-1
+#     peer-map every host proxies /vm/<tid> for the whole fleet, so this vector
+#     reads ANY tenant's dashboard, not just co-tenants'.
+#     Scoped to the VPC CIDR so public HTTP egress still works; in-VPC :80 is
+#     only ever our own hosts/ALB (interface endpoints answer on 443).
+if [ -n "${OC_VPC_CIDR:-}" ] && [ "${OC_VPC_CIDR}" != "{{VPC_CIDR}}" ]; then
+  sudo iptables -C FORWARD -i ${TAP} -d ${OC_VPC_CIDR} -p tcp -m multiport --dports 80,8081,8899 -j DROP 2>/dev/null || \
+    sudo iptables -I FORWARD 1 -i ${TAP} -d ${OC_VPC_CIDR} -p tcp -m multiport --dports 80,8081,8899 -j DROP
+else
+  log "WARN: OC_VPC_CIDR unset — guest→fleet east-west NOT blocked (vector 3)."
+fi
 
 # Start Firecracker
 log "starting firecracker..."

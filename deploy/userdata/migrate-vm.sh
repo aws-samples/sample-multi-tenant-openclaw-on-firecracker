@@ -163,8 +163,24 @@ case "$MODE" in
       exit 25
     fi
     R_TAP="tap-vm${SRC_VM_NUM}"
-    R_HOST_TAP_IP="${SUBNET_PREFIX:-10.0}.${SRC_VM_NUM}.1"
-    R_GUEST_IP="${SRC_GUEST_IP:-${SUBNET_PREFIX:-10.0}.${SRC_VM_NUM}.2}"
+    # Derive the fallback the same 16-bit way launch-vm.sh does (VM_NUM spread
+    # over octets 2+3), so a VM_NUM > 254 restores onto the address it actually
+    # booted with instead of an invalid/colliding one. The recorded guest_ip
+    # from vm.json still wins — it is the authoritative value.
+    _R_PREFIX="${SUBNET_PREFIX:-10.0}"
+    _R_A="${_R_PREFIX%%.*}"
+    _R_B="${_R_PREFIX##*.}"
+    _R_HI=$(( (SRC_VM_NUM - 1) / 254 ))
+    _R_LO=$(( (SRC_VM_NUM - 1) % 254 + 1 ))
+    _R_B=$(( _R_B + _R_HI ))
+    if [ -n "${SRC_GUEST_IP}" ]; then
+      # Host-side tap address is the guest's .1 — derive it from the recorded
+      # guest IP so the two can never disagree.
+      R_HOST_TAP_IP="${SRC_GUEST_IP%.*}.1"
+    else
+      R_HOST_TAP_IP="${_R_A}.${_R_B}.${_R_LO}.1"
+    fi
+    R_GUEST_IP="${SRC_GUEST_IP:-${_R_A}.${_R_B}.${_R_LO}.2}"
     R_IFACE=$(ip route show default | awk '{print $5}' | head -1)
     sudo ip link del "${R_TAP}" 2>/dev/null || true
     sudo ip tuntap add dev "${R_TAP}" mode tap
@@ -184,6 +200,19 @@ case "$MODE" in
       sudo iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
     sudo iptables -C FORWARD -i "${R_TAP}" -o "${R_IFACE}" -j ACCEPT 2>/dev/null || \
       sudo iptables -A FORWARD -i "${R_TAP}" -o "${R_IFACE}" -j ACCEPT
+    # SECURITY: east-west isolation, identical to launch-vm.sh. A restored VM
+    # must not come back with weaker isolation than a freshly launched one —
+    # that is exactly how the IMDS DROP went missing on this path before.
+    sudo iptables -C FORWARD -i "${R_TAP}" -o "tap-vm+" -j DROP 2>/dev/null || \
+      sudo iptables -I FORWARD 1 -i "${R_TAP}" -o "tap-vm+" -j DROP
+    sudo iptables -C INPUT -i "${R_TAP}" -p tcp -m multiport --dports 80,8081,8899 -j DROP 2>/dev/null || \
+      sudo iptables -I INPUT 1 -i "${R_TAP}" -p tcp -m multiport --dports 80,8081,8899 -j DROP
+    if [ -n "${OC_VPC_CIDR:-}" ] && [ "${OC_VPC_CIDR}" != "{{VPC_CIDR}}" ]; then
+      sudo iptables -C FORWARD -i "${R_TAP}" -d "${OC_VPC_CIDR}" -p tcp -m multiport --dports 80,8081,8899 -j DROP 2>/dev/null || \
+        sudo iptables -I FORWARD 1 -i "${R_TAP}" -d "${OC_VPC_CIDR}" -p tcp -m multiport --dports 80,8081,8899 -j DROP
+    else
+      echo "restore: WARN OC_VPC_CIDR unset — guest→fleet east-west NOT blocked" >&2
+    fi
 
     # Start a Firecracker process bound to the new socket.
     rm -f "$SOCK"

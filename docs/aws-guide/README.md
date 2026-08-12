@@ -20,7 +20,6 @@
 | [08 参考与术语](08-reference.md)                                              | 数据收集说明、贡献者、术语表、修订记录                         |
 | [09 控制面 API 对接](09-api-integration.md)                                   | 可拷贝的调用参考、逐端点示例、错误码                           |
 | [自带 LLM 网关](09-custom-llm-gateway.md)                                     | LiteLLM / OpenAI-compatible 接入                               |
-| [10 外部平台集成](10-external-platform-integration.md)                        | 客户视角把 ClawPool 集成进自有平台                             |
 | [11 组件运维手册](11-ops-maintenance.md)                                      | 日常维护、监控、告警、扩缩容、故障排查                         |
 | [12 控制面 API Gateway 加固 + 凭据 KMS 加密注入](12-private-api-hardening.md) | 生产附录，两件事 + 可跑 demo                                   |
 | [13 数据面两级路由](13-data-plane-redesign.md)                                | 2026-07-08 转型后的实时聊天链路                                |

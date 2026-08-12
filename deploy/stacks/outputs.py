@@ -7,6 +7,7 @@ import aws_cdk as cdk
 def build_outputs(self, ctx):
     """Build outputs resources (mechanical transplant from stack.py, issue #87)."""
     # --- Unpack from ctx ---
+    CFG = ctx.CFG
     alb = getattr(ctx, 'alb', None)
     api = getattr(ctx, 'api', None)
     api_key = getattr(ctx, 'api_key', None)
@@ -20,6 +21,8 @@ def build_outputs(self, ctx):
     clawpool_cmk = getattr(ctx, 'clawpool_cmk', None)
     cognito_outputs = getattr(ctx, 'cognito_outputs', None)
     console_cf_id = getattr(ctx, 'console_cf_id', None)
+    console_bff_alb = getattr(ctx, 'console_bff_alb', None)
+    console_bff_host = getattr(ctx, 'console_bff_host', None)
     console_host = getattr(ctx, 'console_host', None)
     dashboard_host = getattr(ctx, 'dashboard_host', None)
     dual_mode = getattr(ctx, 'dual_mode', None)
@@ -33,6 +36,16 @@ def build_outputs(self, ctx):
     tenant_secrets_table = getattr(ctx, 'tenant_secrets_table', None)
     tenants_table = getattr(ctx, 'tenants_table', None)
 
+    _bff_host_for_output = (
+        console_bff_host
+        or (CFG.get("console_auth", {}) or {}).get("bff_domain")
+        or (
+            console_bff_alb.load_balancer_dns_name
+            if console_bff_alb is not None
+            else None
+        )
+    )
+
     # ========== Outputs ==========
     for key, val in {
         "ApiUrl": api.url,
@@ -45,22 +58,29 @@ def build_outputs(self, ctx):
         "BackupBucket": backup_bucket.bucket_name,
         "BackupCmkKeyId": backup_cmk.key_id,
         "HostInstanceProfileArn": instance_profile.attr_arn,
-        # 1.3.4: dual-mode outputs.
-        #   ConsoleUrl    — operator console (Cognito-protected, S3-served)
+        # 提供。ConsoleUrl 输出裸 host,路径由 setup.sh 与 Puppeteer 消费方拼接。
+        #   ConsoleUrl    — operator console 裸 host (Cognito-protected, BFF ALB-served)
         #   DashboardUrl  — per-tenant dashboards (ALB-served, app_domain in dual mode)
-        # In legacy single-mode the two URLs are equal and point to the
-        # combined CloudFront distribution, preserving backward compat.
-        "ConsoleUrl": f"https://{console_host}",
+        # 未配置 BFF ALB 时 ConsoleUrl 才回落原 console_host 行为。
+        "ConsoleUrl": (
+            f"https://{_bff_host_for_output}"
+            if console_bff_alb is not None
+            else f"https://{console_host}"
+        ),
         "DashboardUrl": f"https://{dashboard_host}",
         "DualDomainMode": "true" if dual_mode else "false",
         "CloudfrontDistributionId": console_cf_id,
         "AppCloudfrontDistributionId": app_cf_id,
         **(
+            {"ConsoleBffAlbDns": console_bff_alb.load_balancer_dns_name}
+            if console_bff_alb is not None
+            else {}
+        ),
+        **(
             {"NotificationsTopicArn": notifications_topic_arn}
             if notifications_topic_arn
             else {}
         ),
-        # #152/#118 — surface the ClawPool credential-injection CMK ARN so the
         # upstream service (which encrypts credentials before the API Gateway)
         # knows which key to use. Only emitted when the key exists.
         **(
@@ -72,7 +92,6 @@ def build_outputs(self, ctx):
     }.items():
         cdk.CfnOutput(self, key, value=val)
 
-    # ── 钉死有状态资源 logical ID (#149) ──────────────────────────────────
     # 防 CDK refactor/重命名时 CFN 把有状态资源 replace（数据丢失/入口断）。
     # 值 = CDK synth 当前产出的 logical ID（等同已部署的 CFN 真值）。
     # 明确不钉：Lambda/IAM Role/EventBridge（无状态）、LiteLLM/PromGrafana EC2
@@ -113,4 +132,3 @@ def build_outputs(self, ctx):
             cfn = resource.node.default_child
             if cfn is not None:
                 cfn.override_logical_id(logical_id)
-

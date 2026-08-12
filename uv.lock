@@ -871,6 +871,7 @@ source = { editable = "." }
 dependencies = [
     { name = "aws-cdk-aws-bedrock-agentcore-alpha" },
     { name = "aws-cdk-lib" },
+    { name = "boto3" },
     { name = "constructs" },
     { name = "pyyaml" },
 ]
@@ -890,6 +891,7 @@ test = [
 requires-dist = [
     { name = "aws-cdk-aws-bedrock-agentcore-alpha", specifier = "==2.251.0a0" },
     { name = "aws-cdk-lib", specifier = ">=2.253.0" },
+    { name = "boto3", specifier = ">=1.34.0" },
     { name = "constructs", specifier = ">=10.0.0" },
     { name = "pyyaml", specifier = ">=6.0" },
 ]

@@ -30,14 +30,39 @@ from pathlib import Path
 # schema 拒绝的键。**维护**:升级 OPENCLAW_PIN 时,对目标版 dist 的
 # validateConfigObjectWithPlugins 跑一遍,把新版接受的键从此表移除、新禁的加入。
 # 事实来源:opensource/openclaw 2026.2.13(与 pin 2.26 同族)src/ 全仓无这四个键
-# (heartbeat schema 只认 every/target),spec R12.1 + memory #197。
+# 表里没有的 pin 一律 fail-loud 拒过(见 main() 的 forbidden is None 分支),这是有意的:
+# 换 pin 必须先对目标版实测,不许先放行后补证。**不要为了让某个未实测的版本过门而给它
+# 加空集条目**——空集等于「此版无禁用 key」的断言,没实测就不是断言而是猜。例:2026.6.33
+# 的 schema 大概率接受下面这 4 个键(它们正是 6.x 才加的),但 6.33 从未对
+# validateConfigObjectWithPlugins 实测过(且已因配对门差异回退,见 build-rootfs.sh 的
+# OPENCLAW_PIN 注释),所以它不在表里,真要升 6.33 时先实测再补条目。
 FORBIDDEN_BY_PIN = {
     "2026.2.26": {
         "agents.defaults.heartbeat.isolatedSession",
         "agents.defaults.heartbeat.lightContext",
         "agents.defaults.compaction.midTurnPrecheck",
         "agents.defaults.compaction.maxActiveTranscriptBytes",
-    }
+        # 钩子(llm_input / llm_output),故 build-rootfs 的 plugins 注册段现在会写
+        # `plugins.entries.sentinel-guard.hooks.allowConversationAccess=true`。
+        # 该键在 2.26 dist 里**命中 0**(与 allowPromptInjection 同为 6.x/7.x 新增),
+        # 而 2.26 的 plugins.entries.<name> schema 是 `.strict()` → 会被拒 → gateway
+        # 拒起。登记在这里,任何人把 OPENCLAW_PIN 回钉 2.26 时这道门 fail-loud 拒烤,
+        "plugins.entries.sentinel-guard.hooks.allowConversationAccess",
+    },
+    # 不是"没查所以放空"。证据(可复现命令见 evidence 文件):用 7.1-2 自己的
+    # `openclaw config validate` 跑三组,**对照组会失败**所以正例才算数——
+    #   ① templates/openclaw.json.example 原样            → Config valid
+    #   ② 同上 + agents.defaults.compaction.__bogus_nested__ → Invalid input(对照组,证明门真在拒)
+    #   ③ 同上 + 下面这 4 个 2.26-禁用键                   → Config valid
+    # 源码交叉核对(7.1-2 dist,均为合法可选字段):
+    #   heartbeat.isolatedSession            zod-schema.agent-runtime-C02vY4RT.js:79
+    #   heartbeat.lightContext               plugin-sdk/config-schema.d.ts(ZodOptional<ZodBoolean>)
+    #   compaction.midTurnPrecheck           zod-schema-O9ml_nmo.js:220
+    #   compaction.maxActiveTranscriptBytes  zod-schema-O9ml_nmo.js:238
+    # 边界:空集只断言"2.26 禁而 7.1-2 放行"这一向。反向(7.1-2 新禁的键)未穷举,但组 ①
+    # 已证现有模板整体在 7.1-2 下合法,故当前载体无反向风险;往模板加新键时重跑组 ①。
+    # evidence: engineering/evidence/openclaw-pin-7.1-2-schema-probe-2026-08-12.md
+    "2026.7.1-2": set(),
 }
 
 # 仓内已知模板载体(CI 无参全量扫)。build-rootfs 传入实际烤入的那份另算。

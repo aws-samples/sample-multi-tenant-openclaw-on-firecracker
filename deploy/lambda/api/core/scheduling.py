@@ -18,7 +18,11 @@ overcommit/quota 常量**全部**走 `clients.X` 属性访问,不用 from-import
 本模块不持有任何 clients 符号的独立绑定,测试重绑 `clients.X` 即全局生效。
 """
 
+import time
+
+import core.capacity as capacity
 import core.clients as clients
+import core.host_profile as host_profile
 
 
 def _scale_out():
@@ -138,13 +142,23 @@ def _release_slot(instance_id, vcpu, mem_mb):
         print(f"_release_slot {instance_id} (non-fatal): {e}")
 
 
-def _find_host(vcpu_needed, mem_needed):
+def _find_host(vcpu_needed, mem_needed, exclude=None):
     """Find an active or idle host with enough free resources.
 
     Spreads load across the warm pool (least-loaded / max-free-vcpu first)
     instead of packing onto whichever host the DynamoDB scan returns first.
     The old "return first fit" behaviour funneled every tenant onto the same
     host until it was overcommitted, leaving the rest of the pool idle.
+
+    by (mem_tier, -family_rank, balance) so the pool fills in the required
+    order r8g.metal-24xl > r7g.metal > m8g.metal-24xl > m7g.metal. Affinity
+    outranks free capacity ON PURPOSE: the requirement is "fill R first, keep
+    M in reserve", so an emptier M-series host must NOT win over an r8g that
+    still fits. Within one family the balance term keeps the spread.
+
+    `exclude` is the set of instance_ids this caller already lost a CAS race
+    on. Without it a caller that loses on the top-tier host re-picks the SAME
+    host every retry and burns its budget while lower tiers sit idle.
     """
     # Phase 6: strong read. Under a 380-create burst the spread ranking must see
     # each host's freshest used_* (which sibling creates just incremented via the
@@ -168,20 +182,47 @@ def _find_host(vcpu_needed, mem_needed):
     # near-full. Score each host by min(free_vcpu_ratio, free_mem_ratio) so we
     # spread toward the host with the most balanced headroom.
     best = None
-    best_score = -1.0
+    best_key = None
+    now_epoch = int(time.time())
     for h in hosts:
-        allocatable_vcpu = int(int(h["total_vcpu"]) * clients.CPU_OVERCOMMIT_RATIO)
+        if exclude and h["instance_id"] in exclude:
+            continue
+        # family carries no override; today all four types run the uniform 1:4).
+        cpu_ratio, mem_ratio_cfg = host_profile.ratios(
+            h,
+            (clients.CPU_OVERCOMMIT_RATIO, clients.MEM_OVERCOMMIT_RATIO),
+            clients.OVERCOMMIT_BY_FAMILY,
+        )
+        allocatable_vcpu = capacity.allocatable(int(h["total_vcpu"]), cpu_ratio)
         free_vcpu = allocatable_vcpu - int(h["used_vcpu"])
-        allocatable_mem = int(int(h["total_mem_mb"]) * clients.MEM_OVERCOMMIT_RATIO)
+        allocatable_mem = capacity.allocatable(int(h["total_mem_mb"]), mem_ratio_cfg)
         free_mem = allocatable_mem - int(h["used_mem_mb"])
+        # DECLARED memory is not oversold; a tenant's real footprint can exceed
+        # its declaration (balloon reclaim is best-effort). Same three-branch
+        # shape as the disk gate: closed / no signal / stale all fail open, only
+        # a fresh confirmed shortfall blocks.
+        if not capacity.mem_ok(
+            h,
+            clients.MEM_SAFETY_FLOOR_RATIO,
+            clients.MEM_CHECK_TTL_SEC,
+            now_epoch,
+            needed_mb=mem_needed,
+        ):
+            continue
         # Hard gate unchanged: must actually fit on both dimensions.
         if free_vcpu >= vcpu_needed and free_mem >= mem_needed:
             vcpu_ratio = free_vcpu / allocatable_vcpu if allocatable_vcpu else 0
             mem_ratio = free_mem / allocatable_mem if allocatable_mem else 0
             score = min(vcpu_ratio, mem_ratio)  # tightest dimension wins
-            if score > best_score:
+            tier = (
+                host_profile.affinity_tier(h, clients.FAMILY_ORDER)
+                if clients.AFFINITY_ENABLED
+                else (0, 0)
+            )
+            key = (tier[0], tier[1], score)
+            if best_key is None or key > best_key:
                 best = h
-                best_score = score
+                best_key = key
     return best
 
 
@@ -189,7 +230,6 @@ def _get_specific_host_with_capacity(instance_id, vcpu_needed, mem_needed):
     """Issue #12 — locate a specific host (used for same-host clone) and
     confirm it has capacity. Returns the host item or None.
 
-    #309 — status gate is strictly active/idle with NO exception. The old
     allow_upgrading widening (for pull_image's canary tenant, #217 §10.6) was
     removed with the canary: an upgrading host must NEVER accept a tenant
     (no-cross-tenant — a tenant must not land on a host mid image-swap).
@@ -205,10 +245,28 @@ def _get_specific_host_with_capacity(instance_id, vcpu_needed, mem_needed):
     for h in hosts:
         if h["instance_id"] != instance_id:
             continue
-        allocatable_vcpu = int(int(h["total_vcpu"]) * clients.CPU_OVERCOMMIT_RATIO)
+        # single source of truth; per-family overcommit applies here too, or a
+        # pinned/clone target would be judged by a different yardstick).
+        cpu_ratio, mem_ratio = host_profile.ratios(
+            h,
+            (clients.CPU_OVERCOMMIT_RATIO, clients.MEM_OVERCOMMIT_RATIO),
+            clients.OVERCOMMIT_BY_FAMILY,
+        )
+        allocatable_vcpu = capacity.allocatable(int(h["total_vcpu"]), cpu_ratio)
         free_vcpu = allocatable_vcpu - int(h["used_vcpu"])
-        allocatable_mem = int(int(h["total_mem_mb"]) * clients.MEM_OVERCOMMIT_RATIO)
+        allocatable_mem = capacity.allocatable(int(h["total_mem_mb"]), mem_ratio)
         free_mem = allocatable_mem - int(h["used_mem_mb"])
+        # not just _find_host. A pinned/clone target skipping it would be a hole
+        # straight through the water-mark protection: the ledger says there is
+        # room while the host's measured MemAvailable is already under the floor.
+        if not capacity.mem_ok(
+            h,
+            clients.MEM_SAFETY_FLOOR_RATIO,
+            clients.MEM_CHECK_TTL_SEC,
+            int(time.time()),
+            needed_mb=mem_needed,
+        ):
+            return None
         if free_vcpu >= vcpu_needed and free_mem >= mem_needed:
             return h
         return None  # found host but no capacity

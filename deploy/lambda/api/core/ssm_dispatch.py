@@ -5,7 +5,6 @@
 从 handler.py 机械搬迁,函数体逐字不变:_launch_vm_wake_cmd / _launch_vm /
 _ssm_send / _ssm_run。_ssm_run 被 14 处调用(facade 别名保持 handler.<sym> 可用)。
 共享 ssm client 从 core.clients import;stdlib(shlex/time) 本模块自带。
-#187 P5: 原 WI-002 Cognito b64 分支(base64/json)已随 channel/hub 下线一并移除,
 第 11 位保留空占位("")保持位置对齐。
 按 design.md 层间契约:core 域不反向 import services/routes。
 facade:handler.py re-export 全部符号,旧 patch/调用路径全程有效。
@@ -23,7 +22,6 @@ def _launch_vm_wake_cmd(tenant_id, item):
     老版本这四条路径生成的裸 `launch-vm.sh <tid> <vmn> <vcpu> <mem>` 只填 4 个位置参,
     第 10 位 CHAT_EP_ENABLED 恒空 → launch-vm 幂等段拿 "" 走 no-op → 但由于 launch-vm
     老版本把 chatCompletions 收敛塞在 NEW_DATA-only,唤醒本就跳过,配置漂移根本无从修复。
-    #41 把幂等段抽出后,幂等段需要 CHAT_EP_ENABLED 显式的 "1"/"0" 才能正确开/关;这里
     从 tenant record 穿透该 flag,让 restart/start/reset/rebuild 都能带上租户当前的开关值。
     幂等段其它三态(空/未知)按 fail-safe 不动数据盘上的现有 chatCompletions。
 
@@ -47,12 +45,10 @@ def _launch_vm_wake_cmd(tenant_id, item):
     # 该字段(handler.py:1972/2126),所以 .get() 拿 True/None,转 "1"/"0"。
     cee = bool(item.get("chat_endpoint_enabled", False))
     chat_ep_arg = "1" if cee else "0"
-    # #187 P1: position 12 (gateway_token_ct) is intentionally OMITTED on wake —
     # NEW_DATA=false so the openclaw.json guard block doesn't run, and the token
     # baked into the data disk on first launch is authoritative. Also the reveal
     # window has already closed by wake time (>15min after create). launch-vm.sh
     # reads it as `${12:-}` → "" → no-op, safe.
-    # #188: position 13 (device_paired_b64) is likewise OMITTED on wake — the
     # paired.json cold-injected into the data disk on first launch persists (it
     # lives under the data disk's <stateDir>/devices/, not regenerated). NEW_DATA
     # guards the write so wake never re-injects. launch-vm.sh reads `${13:-}` →
@@ -83,7 +79,6 @@ def _launch_vm(
 ):
     """Fire-and-forget: launch VM + set up DNAT.
 
-    #422 — sync=True 时改走 _ssm_run(同步等 SSM 完成,返 bool),供 restore 冷恢复用:
     restore 必须确认 launch-vm.sh 真跑成功(返 rc=0)才把租户翻 running,否则 fire-and-forget
     的 CommandId 只证明"提交了",VM 可能没起来(假成功)。默认 sync=False 保持 create/migrate
     的异步语义不变(它们靠 health_check sweep 异步推进,不阻塞 API)。
@@ -96,7 +91,6 @@ def _launch_vm(
     (empty string == broadcast, comma-list == only those subdirs cp'd).
     """
 
-    # issue #59 (WI-E/M-1) — every caller/external-influenced string below is
     # interpolated into an SSM AWS-RunShellScript command that runs as ROOT on a
     # shared host. Shell-quote each so a value can never break out of its
     # positional argument (defense in depth behind create_tenant's input regex).
@@ -111,7 +105,6 @@ def _launch_vm(
     restore_arg = _q(restore_backup_key)
     # 1.4.0: 7th positional arg — comma-separated skill list (or empty for broadcast).
     skills_arg = _q(",".join(scoped_skills)) if scoped_skills else '""'
-    # task #15: 8th positional arg — per-tenant LiteLLM vkey (empty → shared key).
     vkey_arg = _q(litellm_vkey)
     # 9th positional arg — control-plane-minted channel_secret (hub HMAC). Empty
     # → launch-vm.sh falls back to generating its own (legacy; reintroduces the
@@ -122,26 +115,21 @@ def _launch_vm(
     # "chatCompletions 为什么不能全局默认开"). Only tenants with
     # chat_endpoint_enabled=true in DDB get "1" → enabled:true injected.
     chat_ep_arg = "1" if chat_endpoint_enabled else "0"
-    # #187 P5: 11th positional arg — 保留空占位。转型前是 INJECTED_COGNITO_B64
     # (WI-002 端到端 Cognito 渠道机器用户 base64),随 channel/hub 一起下线;这里
     # 传 "" 保持位置对齐,launch-vm.sh 位置参解析不动。
     cognito_arg = '""'
-    # #187 P1: 12th positional arg — base64 ciphertext of the pre-minted gateway
     # token (tenant_id EncryptionContext, ClawPool CMK). Empty ("") when the CMK
     # feature is off — launch-vm.sh keeps `openssl rand`ing its own token in-VM
-    # (byte-identical pre-#187 behavior for un-migrated deployments). The
     # ciphertext is already base64 text from core.kms_envelope.encrypt_with_tenant,
     # so no re-encoding — shell-quote it defensively even though base64url only
     # produces [A-Za-z0-9_-] (belt-and-suspenders behind the input validation
     # regex on tenant creation).
     gw_token_arg = _q(gateway_token_ct) if gateway_token_ct else '""'
-    # #188: 13th positional arg — base64 of the paired.json entry (one Ed25519
     # device: deviceId + publicKey + roles + scopes, tokens:{} for 2026.2.26).
     # launch-vm.sh base64-decodes it and writes <stateDir>/devices/paired.json so
     # a remote WSS client (JDWS) preloaded with the matching device identity
     # connects to the in-VM gateway with NO manual approve. Empty ("") when no
     # device was minted (owner unknown / CMK off) → launch-vm.sh skips the write
-    # (byte-identical pre-#188 behavior; feature off = no paired.json). The value
     # is already base64 text from create_tenant, shell-quote defensively.
     device_paired_arg = _q(device_paired_b64) if device_paired_b64 else '""'
     # The live route is allocated by host-agent from the configured bitmap
@@ -154,7 +142,6 @@ def _launch_vm(
         f"{tpl_arg} {restore_arg} {skills_arg} {vkey_arg} {csecret_arg} "
         f"{chat_ep_arg} {cognito_arg} {gw_token_arg} {device_paired_arg}"
     )
-    # #422 — sync=True(restore):同步等 launch-vm.sh 跑完,返 (ok, rc) 元组。restore 据此
     # 三分:ok=True→翻 running;ok=False 且 rc==75→flock-skip(另一次同租户 launch 在跑,VM
     # 正被拉起)→保持 restoring 等重投收敛,【不回滚不释放 slot】;ok=False 且 rc!=75→真失败回滚。
     # `cmd` 只运行 launch-vm.sh;flock-skip 时脚本 exit 75,SSM ResponseCode 如实反映。
@@ -188,7 +175,24 @@ def _ssm_send(instance_id, command, timeout=120):
         return None
 
 
-def _ssm_run(instance_id, command, timeout=30, want_rc=False):
+def _notify_result(cb, status, rc):
+    """把终态 (status, rc) 交给 on_result 回调;回调抛异常只记日志,绝不影响 SSM 结果。"""
+    if cb is None:
+        return
+    try:
+        cb(status, rc)
+    except Exception as e:  # noqa: BLE001 — 遥测不得让一次正常的 SSM 运行变成失败
+        print(f"SSM on_result callback error: {e}")
+
+
+def _ssm_run(
+    instance_id,
+    command,
+    timeout=30,
+    want_rc=False,
+    on_command_id=None,
+    on_result=None,
+):
     """Execute command on host via SSM Run Command. Returns True on success.
 
     want_rc=True: return (ok: bool, rc: int|None) instead of bare bool, where rc is
@@ -197,7 +201,30 @@ def _ssm_run(instance_id, command, timeout=30, want_rc=False):
     tenant already holds the per-tenant flock — see launch-vm.sh:395) apart from a
     real failure: on rc==75 the VM is being brought up by the concurrent/redelivered
     launch, so restore must NOT roll back. rc is None when we never got an invocation
-    result (submit error / timeout / InvocationDoesNotExist throughout)."""
+    result (submit error / timeout / InvocationDoesNotExist throughout).
+
+    on_command_id: optional callable invoked with the CommandId the instant SSM
+    accepts the command — i.e. BEFORE the wait loop below can time out. Until now the
+    id was obtained here and then thrown away on every non-Success path (the timeout
+    branch only printed it), so a lost receipt left no handle to ask SSM about the
+    execution afterwards even though SSM retains invocation records server-side.
+    ADR-rebuild-idempotency-sync-contract §5.4a path 1 persists it
+    (tenants.rebuild_ssm_command_id) so a later sweep can reconcile an `unconfirmed`
+    rebuild instead of guessing. Passed as a callback rather than a new return value
+    on purpose: the return contract stays byte-identical for every existing caller,
+    and the id survives the timeout path. Callback errors are swallowed — telemetry
+    must never turn a healthy SSM run into a failure.
+
+    on_result: optional callable invoked with (status: str, rc: int|None) the moment a
+    terminal invocation result arrives. Exists for the same reason as on_command_id —
+    callers that need the exit code should not have to flip want_rc, because that
+    changes the return type from bool to tuple and every existing caller plus ~70 test
+    stubs would have to unpack it (rebuild hit exactly this wall). The rc matters
+    because launch-vm.sh exits 75 to say "another launch of this same tenant holds the
+    per-tenant flock, I skipped — retry later", which is a BENIGN outcome, not a
+    failure: reporting it as a confirmed failure tells the customer a retry is safe,
+    and a repeated rebuild drops the per-VM overlay again. Callback errors are
+    swallowed for the same reason as above."""
     try:
         # SSM runs as root; set HOME so ~ resolves to /home/ubuntu
         wrapped = f"export HOME=/home/ubuntu && cd /home/ubuntu && {command}"
@@ -208,6 +235,11 @@ def _ssm_run(instance_id, command, timeout=30, want_rc=False):
             TimeoutSeconds=timeout + 10,
         )
         cmd_id = resp["Command"]["CommandId"]
+        if on_command_id is not None:
+            try:
+                on_command_id(cmd_id)
+            except Exception as e:  # noqa: BLE001 — never fail the run for telemetry
+                print(f"SSM on_command_id callback error: {e}")
         time.sleep(3)  # Wait for invocation to register
         for _ in range(timeout // 2):
             try:
@@ -217,6 +249,7 @@ def _ssm_run(instance_id, command, timeout=30, want_rc=False):
                 )
                 status = result["Status"]
                 if status == "Success":
+                    _notify_result(on_result, status, result.get("ResponseCode", 0))
                     return (True, result.get("ResponseCode", 0)) if want_rc else True
                 if status in ("Failed", "TimedOut", "Cancelled"):
                     rc = result.get("ResponseCode")
@@ -224,6 +257,7 @@ def _ssm_run(instance_id, command, timeout=30, want_rc=False):
                         f"SSM failed: {status} (rc={rc}) - "
                         f"{result.get('StandardErrorContent', '')}"
                     )
+                    _notify_result(on_result, status, rc)
                     return (False, rc) if want_rc else False
             except ssm.exceptions.InvocationDoesNotExist:
                 pass

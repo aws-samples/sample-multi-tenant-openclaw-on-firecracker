@@ -147,10 +147,12 @@ idempotency key 和回复关联键。浏览器输入缺少非空 `text` 时返�
 
 ### 版本边界
 
-当前 `bb` 的黄金镜像仍钉在 OpenClaw `2026.2.26`。平台网关协议版本必须与目标
-镜像匹配；不要仅依赖参考后端的默认值。升级 OpenClaw 时，需要一起验证
-`build-rootfs.sh` pin、template schema gate、`paired.json` 形状和
-`GW_PROTOCOL_VERSION`，并用远程拓扑完成真实 device 握手。
+当前 `bb` 的黄金镜像钉在 OpenClaw `2026.7.1-2`（协议 v4，#476；版本号必须逐字带
+`-2`，semver 下它是 `2026.7.1` 的 prerelease，写裸 `2026.7.1` 会取到另一版）。平台
+网关下发的是协议**范围** `GW_PROTOCOL_MIN`..`GW_PROTOCOL_MAX`（默认 `3..4`），
+过渡期与存量 `2026.2.26`（v3）租户并存。升级 OpenClaw 时，需要一起验证
+`build-rootfs.sh` pin、`OPENCLAW_NODE_MIN` 引擎地板、template schema gate、
+`paired.json` 形状和协议范围，并用远程拓扑完成真实 device 握手。
 
 ## 能力边界
 

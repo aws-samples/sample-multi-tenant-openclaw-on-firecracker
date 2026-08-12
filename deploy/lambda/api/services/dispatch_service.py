@@ -29,7 +29,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from botocore.config import Config as _BotoConfig
 from botocore.exceptions import ClientError
 
+import core.capacity as capacity
 import core.clients as clients
+import core.host_profile as host_profile
 from core.dispatch import (
     MANIFEST_PART_MAX_BYTES,
     encode_manifest_line,
@@ -110,7 +112,6 @@ def _parse_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out = []
     for rec in records:
         mid = rec.get("messageId")
-        # #315 receiptHandle 供 unplaced 短退避:对容量不够的消息 ChangeMessageVisibility
         # 缩短可见性(960→15s),不必等默认 visibility 才重投。SQS 事件每条 record 原生带。
         rh = rec.get("receiptHandle")
         body = rec.get("body") or "{}"
@@ -188,7 +189,6 @@ def _claim_tenants(
                     ":stale": stale_before,
                     ":budget": clients.DISPATCH_RETRY_BUDGET,
                 },
-                # #412(codex review5 #1)—— 拿 ALL_OLD:若本租户【重投前已带 capacity_
                 # reservation_id】(上一次 dispatch 装箱过、释放遇 RETRY 没清掉),赢得认领后
                 # 记下那张陈旧令牌,装箱前先【结算掉】它(见 dispatch_batch)。否则新一轮 reserve
                 # 的 attribute_not_exists(capacity_reservation_id) 恒失败 → 白烧 retry 预算 →
@@ -241,7 +241,6 @@ def _snapshot_hosts(now_epoch: int, gate_inflight: bool = True) -> List[Dict[str
     """扫 active/idle host,算 free_slots + inflight_ok + simulated。ConsistentRead 强一致
     (与 core.scheduling._find_host 同款,防跨实例装满同一 host)。
 
-    #315 SPLIT_BY_MODE:gate_inflight 控制是否按"host 有未过期在途命令"算 inflight_ok。
     - push 模式(gate_inflight=True):保留旧逻辑——host 有未过期 inflight → inflight_ok=False,
       binpack 跳过它(host 级串行,poller 靠 inflight 标量追踪 SSM 终态需要这个串行)。
     - ddb 模式(gate_inflight=False):inflight_ok 恒 True,不因在途命令挡装箱(host-agent 每 5s
@@ -254,7 +253,6 @@ def _snapshot_hosts(now_epoch: int, gate_inflight: bool = True) -> List[Dict[str
         ConsistentRead=True,
     ).get("Items", [])
 
-    # #340(codex review)— 磁盘新鲜度基准用【扫描此刻】的时间,不用 invocation 起点 now_epoch。
     # 长批次认领可能已耗时 > TTL,此时刚上报的满盘记录(ts≈real-now)相对 now_epoch 会落进"离谱
     # 未来"被误判 fail-open。用 scan 时刻做基准,ts 与它的差恒是真实新鲜度。inflight 判定仍用
     # now_epoch(那是它与 SendCommand 时序的既有语义,不动)。
@@ -264,25 +262,44 @@ def _snapshot_hosts(now_epoch: int, gate_inflight: bool = True) -> List[Dict[str
     for h in hosts:
         total_vcpu = int(h.get("total_vcpu", 0) or 0)
         used_vcpu = int(h.get("used_vcpu", 0) or 0)
-        allocatable = int(total_vcpu * float(clients.CPU_OVERCOMMIT_RATIO or 1.0))
-        # #330 — mem 维度可分配上限(total_mem_mb × MEM_OVERCOMMIT),CAS vcpu+mem 双闸,
+        # 但机制就位:每类机型可分别设。理想比 = 物理供给(GB/vCPU) ÷ 租户需求(GB/vCPU)。
+        cpu_ratio, mem_ratio = host_profile.ratios(
+            h,
+            (clients.CPU_OVERCOMMIT_RATIO, clients.MEM_OVERCOMMIT_RATIO),
+            clients.OVERCOMMIT_BY_FAMILY,
+        )
+        allocatable = capacity.allocatable(total_vcpu, cpu_ratio)
         # 与同步 create 路径(handler.py:954-960)一致,防大内存租户超卖 OOM。
         # ★缺 total_mem_mb(旧 host DDB item 没写这字段)→ allocatable_mem=0 当【未知】哨兵,
         # 下游 mem 闸跳过(回落纯 vcpu 闸),绝不因字段缺失误拒整台 host(codex review 指出)。
         total_mem = int(h.get("total_mem_mb", 0) or 0)
-        allocatable_mem = int(total_mem * float(clients.MEM_OVERCOMMIT_RATIO or 1.0))
+        allocatable_mem = capacity.allocatable(total_mem, mem_ratio)
         used_mem = int(h.get("used_mem_mb", 0) or 0)
-        # #330 — 装箱按【真实剩余资源】双预算(free_vcpu/free_mem),不再折算成 VM_DEFAULT 名额
         # (旧 free_slots=剩余vcpu//2 把 1c:2G 租户的可装数腰斩到 282,达不到 380)。mem_known=缺
         # total_mem_mb 的老 host 内存容量未知 → 装箱侧 fail-safe 不调度(不 fail-open 当无限内存)。
         free_vcpu = max(0, allocatable - used_vcpu)
         mem_known = total_mem > 0
         free_mem = max(0, allocatable_mem - used_mem)
-        # #340 — 磁盘软门:host-agent 每 poll 用 statvfs('/data') 写 avail_disk_mb +
         # disk_check_ts_epoch。剩余低于水位就不接新租户(防 /data 满 → mkdir No space →
         # requires_intervention)。fail-open:字段缺失(旧 host 从没上报)或上报陈旧
         # (host-agent 挂了/漏报,读数不可信)→ disk_ok=True 退回旧行为,绝不用过期读数误杀。
         disk_ok = _host_disk_ok(h, disk_now)
+        # 占用可能超出声明(balloon 是 best-effort)。这里用 host 自报的实测 MemAvailable
+        # 兜底,与磁盘门同款三段逻辑(门关/无信号/陈旧 一律 fail-open,只在新鲜确认
+        # 不足时阻断),基准同样用 disk_now(扫描此刻)而非 now_epoch。
+        mem_ok = capacity.mem_ok(
+            h, clients.MEM_SAFETY_FLOOR_RATIO, clients.MEM_CHECK_TTL_SEC, disk_now
+        )
+        # 放【整批】:逐个问都通过,累加起来照样跌破水位(同步 create 一次一个,传
+        # needed_mb 就够;批量不行)。所以把【水位之上的实测余量】并进 free_mem 预算 ——
+        # binpack 已按每租户 mem 逐个扣减这个预算(binpack.py:148/163),批内累加就被水位
+        # 自然夹住,且 binpack 保持零依赖(不必知道水位这回事)。
+        # 两个预算取小:声明维(账本不超卖)与物理维(实测不跌破水位)都不能破。
+        headroom = capacity.mem_headroom_mb(
+            h, clients.MEM_SAFETY_FLOOR_RATIO, clients.MEM_CHECK_TTL_SEC, disk_now
+        )
+        if headroom is not None:
+            free_mem = min(free_mem, headroom)
         if gate_inflight:
             inflight_ts = int(h.get("dispatch_inflight_ts_epoch", 0) or 0)
             inflight_ok = (not h.get("dispatch_inflight")) or (
@@ -301,6 +318,11 @@ def _snapshot_hosts(now_epoch: int, gate_inflight: bool = True) -> List[Dict[str
                 "simulated": bool(h.get("simulated", False)),
                 "inflight_ok": bool(inflight_ok),
                 "disk_ok": bool(disk_ok),
+                "mem_ok": bool(mem_ok),
+                # (零 boto3、被 tests/test_dispatch_binpack.py 用 importlib 脱包加载),
+                # 所以它不能 import clients/host_profile、也不该读私有 "raw" —— tier
+                # 在这里算好传下去。
+                "affinity_tier": host_profile.affinity_tier(h, clients.FAMILY_ORDER),
                 "raw": h,
             }
         )
@@ -334,7 +356,6 @@ def _host_disk_ok(h: Dict[str, Any], now_epoch: int) -> bool:
     if "avail_disk_mb" not in h:
         return True  # 没上报 → fail-open(旧 host / 未升级 / 取不到磁盘)
     # 信任边界外(DDB item 可能被别的写者写脏/半写):任何 coerce 失败都当【不可信信号】
-    # 逐 host fail-open,绝不让一台 host 的畸形值抛异常炸掉整批装箱(codex score #2)。
     try:
         ttl = int(clients.DISPATCH_DISK_REPORT_TTL_SEC or 0)
         if ttl > 0:
@@ -407,7 +428,6 @@ def _reserve_batch_txn(
         return None  # fail-safe:任一维负(含 mem 未知 allocatable_mem<=0)→ 拒
 
     n = len(tenants)
-    # #412(codex review6 #1)—— next_vm_num 乐观锁在【同 host 并发多批】下会让输家取消。旧行为
     # 直接返 None 当 CAS-loss → 输家白烧 tenant retry 预算、最终误 requires_intervention(明明有
     # 容量)。这里对【纯 next_vm_num 冲突】(host 项 idx0 取消、租户项都没失败)做【有界 reread-retry】
     # (重读 next_vm_num 重算 base 再试,线性退避,同步 create CAS 同款 tenant_service.py:1788),
@@ -428,7 +448,6 @@ def _reserve_batch_txn(
         if r != _RESERVE_HOST_CCF:
             return r  # base vm_num(成功)或 None(真失败:租户项 CCF = delete 抢赢)
         # host 项 CCF:可能是 next_vm_num 乐观锁冲突,【也可能】是容量/inflight 门失败
-        # (codex review10 #2:三者共用 host ConditionExpression,DDB 不区分)。重读 next_vm_num
         # 判别:变了 = 真 next_vm_num 竞争 → 重算重试;没变 = 容量/inflight 失败 → 真失败返 None
         # (别当瞬时空转烧完 4 次再 TRANSIENT,那会让满 host 的批延迟重投)。
         fresh_next = _read_next_vm_num(instance_id)
@@ -440,7 +459,6 @@ def _reserve_batch_txn(
         expected_next = fresh_next  # next_vm_num 真被并发批推进了 → 重算 base 重试
         time.sleep(0.02 * (_attempt + 1))
     print(f"[dispatch] reserve next_vm_num conflict exhausted host={instance_id} cmd={command_id}")
-    # 多次仍是 next_vm_num 竞争(高并发同 host)→ 瞬时,重投不烧预算(review8 #3)。
     return _RESERVE_TRANSIENT
 
 
@@ -491,13 +509,11 @@ def _reserve_batch_txn_once(
         ":cap_v": cap_v,
         ":cap_m": cap_m,
     }
-    # 乐观锁 + 容量双闸(#330 mem 闸恒开,防大内存租户超卖 OOM)。
     host_cond = (
         "next_vm_num = :expected AND used_vcpu <= :cap_v AND used_mem_mb <= :cap_m"
     )
     host_update_expr = "SET " + host_set
     if write_inflight:
-        # push 模式:inflight 标量 + 排他门 + 原子清旧 ssm_cid(#315 逐字保留)。
         host_update_expr = (
             "SET " + host_set + ", dispatch_inflight = :cid, "
             "dispatch_inflight_ts = :now, dispatch_inflight_ts_epoch = :now_epoch "
@@ -528,8 +544,6 @@ def _reserve_batch_txn_once(
     ]
     # ---- 每租户项 ----
     now = _now()
-    # #411/6.2(merge:随 reserve 回写 host 的 rootfs_version,补齐队列化 create 漏写)—— #412 把
-    # _backfill_placement 并进本事务后,#411 这份回写改由 reserve 的 tenant 项承载。语义同 #411:
     # version 非空 → SET rootfs_version(+ ≤256B 才建查询投影 q_rootfs_version,否则 REMOVE 投影);
     # version 空 → REMOVE 两个陈旧字段(重投可能落到别版本写过的行,不清则 GET 与 GSI 不一致)。
     _rv_set = ""
@@ -545,9 +559,7 @@ def _reserve_batch_txn_once(
     for offset, t in enumerate(tenants):
         vm_num = expected_next + offset
         rid = _reservation_id(command_id, t["tenant_id"])
-        # #412(codex review6 #2)—— reserve 一并 SET phys_vm_num = :vn(与同步 create 路径
         # tenant_service.py:1866 同款)。否则 dispatch 路径 phys_vm_num 仅靠 host-agent if_not_exists
-        # 回填,重投改了 vm_num 后 phys 被冻旧号,#208 撞 tap 检查(键在 phys_vm_num)漏租户真实 tap
         # → 跨租户 tap 复用(红线)。plain SET 让 phys 随 vm_num 走(reserve 只作用于 creating 租户)。
         _upd = (
             "SET host_id = :h, vm_num = :vn, phys_vm_num = :vn, "
@@ -595,18 +607,15 @@ def _reserve_batch_txn_once(
                 f"[dispatch] reserve txn cancelled host={instance_id} "
                 f"cmd={command_id} reasons={codes}"
             )
-            # #412 review6/7/10:分三类返回,调用方精确处置。host 项 idx0,租户项 idx1..。
             _retryable = {"TransactionConflict", "ThrottlingError",
                           "ProvisionedThroughputExceeded", "RequestLimitExceeded"}
             host_code = codes[0] if len(codes) > 0 else ""
             tenant_codes = codes[1:] if len(codes) > 1 else []
             tenant_failed = any(c and c != "None" for c in tenant_codes)
-            # ① 【最先】判可重试因(review7 #3):任一项冲突/限流 → TXN_CONFLICT(纯瞬时,重读重试)。
             if any(c in _retryable for c in codes):
                 return _RESERVE_TXN_CONFLICT
             # ② 仅 host 项(idx0)CCF、租户项没失败 → HOST_CCF。调用方重读 next_vm_num 判别到底是
             #    next_vm_num 乐观锁竞争(变了→重试)还是容量/inflight 门失败(没变→真失败)——
-            #    DDB 不区分同一 ConditionExpression 里哪个子句失败(review10 #2)。
             if host_code == "ConditionalCheckFailed" and not tenant_failed:
                 return _RESERVE_HOST_CCF
             # ③ 租户项失败(delete 抢赢/被接管)等 → 真失败,当 CAS-loss 返 None。
@@ -617,7 +626,6 @@ def _reserve_batch_txn_once(
         raise  # 其它错误 fail-loud(IAM/网络/坏参数),别静默当容量不够
 
 
-# 令牌释放三态返回(codex review CHANGES_NEEDED #3/#4:bool 把"已消费(安全)"和"瞬时失败
 # (必须重试)"混为一谈 → delete 会在瞬时失败后照样标 deleted 令牌永久搁浅 / rollback 会在
 # throttle 后清 claim 让令牌卡死每次重投)。三态让调用方精确分流。
 RELEASE_CONSUMED = "consumed"  # 本次消费了令牌并扣了账本
@@ -648,7 +656,6 @@ def _release_reservation(
       【不得】就此清 claim/inflight 或标 deleted,必须让消息/删除重投再释放。
     """
     # TransactItems 顺序固定:[0]=host 扣减(下溢守卫),[1]=tenant 令牌消费(capacity_
-    # reservation_id=:rid)。释放三态按【CancellationReasons 的位次】精确判(codex review2 #2)。
     txn_items = [
         {
             "Update": {
@@ -711,7 +718,6 @@ def _classify_release_cancel(e: "ClientError", tenant_id: str) -> str:
 
         host_code = _code_at(_REL_HOST_IDX)
         tenant_code = _code_at(_REL_TENANT_IDX)
-        # 优先级(codex review4 #2):瞬时因 > 令牌已消费 > host 下溢 > 缺细节。
         # ① 任一项可重试因 → RETRY(瞬时,重投)。
         if host_code in _REL_RETRYABLE_CODES or tenant_code in _REL_RETRYABLE_CODES:
             print(f"[dispatch] release {tenant_id} retryable cancel: {[host_code, tenant_code]}")
@@ -719,14 +725,12 @@ def _classify_release_cancel(e: "ClientError", tenant_id: str) -> str:
         # ② 令牌项(idx1)CCF 优先判 ALREADY —— 即便 host 项(idx0)也 CCF(最后一张预留双重
         # 释放时账本已被前一次扣到不足,host 下溢与 token-gone 会【同时】失败)。token-gone 说明
         # 别的释放者已成功消费并扣过账本,本次就是安全幂等,绝不能因 host 下溢误报 RETRY 让
-        # delete 卡 deleting/进 DLQ(codex review4 #2)。
         if tenant_code == "ConditionalCheckFailed":
             return RELEASE_ALREADY  # 令牌已被别人消费/从没有 → 安全幂等
         # ③ 仅 host 项(idx0)CCF、令牌项没失败:账本与令牌不一致的真异常 → 告警 + 重试。
         if host_code == "ConditionalCheckFailed":
             print(f"[dispatch] release {tenant_id} host underflow guard tripped — retry+alarm")
             return RELEASE_RETRY
-        # ④ 缺 reasons 细节的取消:不能确认令牌已释放 → 保守重试(codex review2 #2)。
         print(f"[dispatch] release {tenant_id} cancel w/o reasons — retry")
         return RELEASE_RETRY
     if code in _REL_RETRYABLE_CODES:
@@ -772,10 +776,8 @@ def _put_manifest_parts(
                     "vcpu": params.get("vcpu", clients.VM_DEFAULT_VCPU),
                     "mem_mb": params.get("mem_mb", clients.VM_DEFAULT_MEM),
                     "chat_ep": params.get("chat_ep", False),
-                    # #199 — restore 意图透传 host(缺则 launch 建空白盘=数据丢失)。
                     # encode 只在非空时写 r;空 → 普通建盘,行逐字节不变。
                     "restore_backup_key": params.get("restore_backup_key"),
-                    # #188 — control-plane 预铸的密文/配对元数据透传给 host 冷注入。
                     # 密文按 tenant_id 一一对应(create 时铸;EncryptionContext 绑
                     # token=tenant_id / device=owner_id),encode 只在非空时写 g/d,
                     # 空 → feature-off 行逐字节不变。part 整体又是 SecureString。
@@ -815,7 +817,6 @@ def _derive_exec_timeout(batch_size: int) -> int:
     """SSM executionTimeout = ceil(batch × per-vm-budget / 有效并发) + 120s 余量,
     并 ≤ visibility_timeout - 60s(防假超时→回滚活 VM→账本分叉)。
 
-    #331/#327:有效并发 = host 级槽闸数(DISPATCH_HOST_LAUNCH_CONCURRENCY,~30)不是装箱密度
     DISPATCH_MAX_PARALLEL(96)。VM 经跨进程 flock 槽【排队限速】起:batch 个 VM 分 ceil(batch/slots)
     【轮】跑,每轮并行 slots 个、耗时约 per_vm 秒。故公式 = ceil(batch/slots)×per_vm + 120 余量
     (codex #327:不是 batch×per_vm/slots——后者在不整除时少算一整轮尾巴)。"""
@@ -851,7 +852,6 @@ def _send_ssm_manifest(
 ) -> Optional[str]:
     """发聚合 SSM 命令。返回 CommandId(SSM 分配的);发送失败返回 None(调用方回滚)。"""
     ssm = _ssm_adaptive()
-    # #331/#327 — 传给 launch-vm.sh 的 MAX_PARALLEL(3rd arg,in-process jobs 上限)对齐 host 级
     # flock 槽数:起的后台 job 数不超过槽数(否则多出的 job 全阻塞在抢槽上,白占内存/句柄)。真正的
     # 跨进程硬闸是 launch-vm.sh 的 OC_HOST_LAUNCH_SLOTS,这里只是让 in-process 并发不虚高。
     parallel = max(1, int(clients.DISPATCH_HOST_LAUNCH_CONCURRENCY or 30))
@@ -886,7 +886,6 @@ def _send_ssm_from_ddb(
     发送失败返回 None(调用方回滚 + 清 assignments)。
     """
     ssm = _ssm_adaptive()
-    # #331/#327 — 传给 launch-vm.sh 的 MAX_PARALLEL(3rd arg,in-process jobs 上限)对齐 host 级
     # flock 槽数:起的后台 job 数不超过槽数(否则多出的 job 全阻塞在抢槽上,白占内存/句柄)。真正的
     # 跨进程硬闸是 launch-vm.sh 的 OC_HOST_LAUNCH_SLOTS,这里只是让 in-process 并发不虚高。
     parallel = max(1, int(clients.DISPATCH_HOST_LAUNCH_CONCURRENCY or 30))
@@ -970,7 +969,6 @@ def _write_assignments(
                     "created_ts": _now(),
                     "ttl": ttl_epoch,
                 }
-                # #188 — 与 push manifest 对称:密文/配对元数据透传给 host 冷注入,
                 # 仅非空写入(空 → 不加字段,feature-off item 逐字节不变)。密文按
                 # tenant_id 一一对应,EncryptionContext 绑定,host 用对的 EC 才解得开。
                 gw_ct = params.get("gateway_token_ct")
@@ -1027,7 +1025,6 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not winners:
         return {"batchItemFailures": []}
 
-    # 1.5) #412(codex review5 #1)—— 结算【重投前遗留的陈旧令牌】。某租户上一次 dispatch 装箱
     # 过(写了 capacity_reservation_id + host_id),但那批的释放遇 RETRY 没清掉;消息重投、本次
     # 赢得认领后,若直接重新装箱,reserve 的 attribute_not_exists(capacity_reservation_id) 会恒
     # 失败 → 白烧 retry 预算 → 误判 failed(令牌自占,活锁)。这里先把陈旧令牌释放掉(令牌互斥锚,
@@ -1044,7 +1041,6 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             print(f"[dispatch] settled stale reservation tenant={w['tenant_id']} "
                   f"rid={stale['rid']} result={r}")
             if r == RELEASE_RETRY:
-                # #412(review7 #2)—— 陈旧令牌本轮没结算掉(瞬时失败),令牌仍占容量。若照旧
                 # 装箱,新 reserve 的 attribute_not_exists(capacity_reservation_id) 恒失败白烧预算。
                 # 故把该租户【本轮排除出装箱】:进 batchItemFailures 让 SQS 原消息重投,且【不清
                 # claim/不计 retry】(claim 留着,下轮重投再结算),靠 reaper/孤儿清扫兜底。
@@ -1057,7 +1053,6 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     mode = clients.DISPATCH_MODE.lower()
     push_mode = mode == "push"
     ddb_mode = mode == "ddb"
-    # #315 SPLIT_BY_MODE(codex review4 #3:精确按 mode==ddb 判,不把"非 push"一律当 ddb——
     # pull/误配也会误关 inflight 门):【仅 ddb】不设 inflight 门(host-agent 兜底,可扩 1000 host);
     # push 和 pull(及任何非 ddb)都【保留】旧 inflight 门 + 写标量(逐字旧行为,poller 追踪需要)。
     gate_inflight = not ddb_mode
@@ -1065,10 +1060,7 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     # push/ddb 都发真 SSM,simulated host 收不到命令 → 装箱跳过它们(压测用);
     # pull 二期由 host-agent 轮询,simulated host 可参与。
     dispatches_ssm = mode in ("push", "ddb")
-    # #330(codex Error5)—— 在【认领后、装箱前】把每个 winner 的 params 里的 vcpu/mem 规范化一次
     # (唯一入口):normalize_spec 校验信任边界外的值(非 dict/负/inf/非数字 → fail-safe 回落 VM_DEFAULT)。
-    # ★只覆盖 vcpu/mem_mb,【原 params 其余字段全保留】——chat_ep / restore_backup_key(#199 空盘=
-    # 数据丢失)/ gateway_token_ct / device_paired_b64(#188 冷注入)等仍要透传给 manifest/assignment,
     # 否则静默空盘/丢配对(codex review 阻断级回归)。之后 pending 的 params 恒是 dict,装箱/CAS 求和/
     # manifest/assignment 全读同一份 → 启动规格与账本一致,且下游 .get("params") 不会遇到非 dict 炸批。
     dvm = int(clients.VM_DEFAULT_VCPU or 2)
@@ -1087,42 +1079,34 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         skip_simulated=dispatches_ssm,
         default_vcpu=dvm,
         default_mem=dmm,
+        # (被 tests/test_dispatch_binpack.py 以 importlib 脱包加载)。
+        affinity=clients.AFFINITY_ENABLED,
     )
 
     # msg_id 反查:tenant_id → msg_id(唯一,认领已保证)
     tid_to_msg = {w["tenant_id"]: w["msg_id"] for w in winners}
-    # #315 tenant_id → receiptHandle(供 unplaced 短退避 ChangeMessageVisibility)
     tid_to_rh = {w["tenant_id"]: w.get("receipt_handle") for w in winners}
     alloc_by_host = {h["instance_id"]: h["allocatable_vcpu"] for h in hosts}
-    # #330 — mem 维度可分配上限(CAS mem 闸用),与 alloc_by_host(vcpu)对称。
     alloc_mem_by_host = {h["instance_id"]: h.get("allocatable_mem", 0) for h in hosts}
-    # #412 — 每 host 快照的 next_vm_num,供 reserve 事务乐观锁(next_vm_num=:expected)+
     # 从它派连续 vm_num 段(事务不返回 Attributes,不能读回 → 用乐观锁把 base 钉死)。
     next_vm_by_host = {
         h["instance_id"]: int(h.get("raw", {}).get("next_vm_num", 1) or 1) for h in hosts
     }
-    # #411/6.2 — host 的镜像版本,reserve 事务随 placement 一并回写租户(补齐队列化 create 漏写
-    # rootfs_version)。#412 把 _backfill_placement 并进 _reserve_batch_txn 后,#411 这份回写改由
-    # reserve 事务的 tenant 项承载(见 _reserve_batch_txn 的 rootfs_version 参数)。raw 下取值同 #411。
     rootfs_by_host = {
         h["instance_id"]: (h.get("raw") or {}).get("rootfs_version", "") for h in hosts
     }
     failures: List[str] = []
-    # #315(codex final MR P1#3):容量类失败(unplaced 装箱没位子 + CAS loser 装箱给了位子
     # 但 reserve 时被并发抢输)的租户 tid,稍后对其【原消息】缩短 visibility(960→15s)快速
     # 重投——高并发接近满容量时 CAS loser 是最常见的溢出类型,漏了它容量竞争输家仍卡 960s。
     # 只缩容量类(非 SSM/manifest/写库失败):那些是基础设施故障,按默认 visibility 重投即可。
     capacity_retry_tids: set = set()
-    # #412 review3 #3:令牌释放遇 RETRY 的租户——【不】清其 claim、不计 dispatch_retries
     # (否则清 claim 后重投过认领闸撞新鲜 claim 被静默 ack、令牌搁浅逃出 reaper)。保留 claim
     # + inflight,靠 SQS 原消息按默认 visibility 重投再释放,或 reaper 令牌孤儿清扫兜底。
     reserve_retry_tids: set = set()
     ssm_consec_fail = 0
 
-    # #141 — fail-loud:每个进 batchItemFailures(→ 重投,超预算才进 DLQ)的租户
     # 打一条带 tenant_id + host + 原因的日志。修复前这些 append 点静默,突发下
     # 部分租户卡 creating 时 CloudWatch 零错误日志、运维只能靠 DLQ 深度发现
-    # (issue #141 真机实证)。日志入口收敛到一个 helper,防再有 append 漏记。
     def _fail(tid: str, reason: str, host: str = "-") -> None:
         print(
             f"[dispatch] FAIL tenant={tid} host={host} cmd={command_id} "
@@ -1133,7 +1117,6 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     # 3) 每 host 一批:CAS → 分发
     for instance_id, batch in result.assignments.items():
         n = len(batch)
-        # #330 — 本批各租户【真实且已校验】vcpu/mem 之和,用 binpack.normalize_spec(装箱同一入口)
         # 取数 → 装箱与 CAS 口径必然一致;非法/非正/非数字 params 在此统一 fail-safe 回落 VM_DEFAULT
         # (codex Error5:SQS 消息体是信任边界外,负数/非数字直接进账本算术会腐蚀 used_* 或炸批)。
         dvm = int(clients.VM_DEFAULT_VCPU or 2)
@@ -1141,10 +1124,7 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         specs = [normalize_spec(t.get("params"), dvm, dmm) for t in batch]
         sum_vcpu = sum(v for v, _ in specs)
         sum_mem = sum(m for _, m in specs)
-        # #412 — reserve+placement 原子:一个 TransactWriteItems 完成 host 账本增量 +
         # 每租户放置写 + 唯一 capacity_reservation_id。取代旧的"_try_reserve_host 整批 CAS
-        # 再 _backfill_placement 逐租户回写"两步(两步之间 delete 抢赢制造无主增量 → #412 泄漏)。
-        # #315 SPLIT_BY_MODE:push 写 inflight 标量 + 排他门(poller 靠它);ddb 不写标量。
         base = _reserve_batch_txn(
             batch,
             instance_id,
@@ -1160,7 +1140,6 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             rootfs_version=rootfs_by_host.get(instance_id, ""),
         )
         if base == _RESERVE_TRANSIENT:
-            # #412(review8 #3)—— 瞬时高竞争耗尽/读失败(非容量不够、非 delete 抢赢)。host 增量
             # 未生效。整批进 batchItemFailures 让原消息重投,但【不计 dispatch_retries、不清 claim】
             # (记 reserve_retry_tids,下方 _release_claims 跳过),否则竞争下反复 +retry 会把健康
             # 租户误推进 requires_intervention。claim 留着,重投时新一轮认领/reserve 再试。
@@ -1170,14 +1149,11 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             continue
         if base is None:
             # 事务取消(容量不够 / delete 抢赢某租户)→ host 增量未生效,该批全 unplaced 走重试。
-            # #315:CAS loser 是容量类失败,纳入短退避快速重投(15s)。
             for t in batch:
                 _fail(t["tenant_id"], "host reserve txn cancelled (capacity/race)", instance_id)
                 capacity_retry_tids.add(t["tenant_id"])
             continue
 
-        # #139/#412:事务已赢 = 放置 + 令牌已原子落库,直接分发(不再单独 backfill)。
-        # #411/6.2 的 rootfs_version 回写已并入 reserve 事务(_reserve_batch_txn 的 rootfs 参数),
         # 不再走已删除的 _backfill_placement。批级失败回滚改走 _release_batch(逐租户令牌释放,
         # 幂等、不双扣;再单独清 host inflight)。
         def _release_batch() -> None:
@@ -1194,8 +1170,6 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
                 if r == RELEASE_RETRY:
                     # 瞬时失败:令牌可能仍占容量。租户已进 batchItemFailures 重投,重投时
                     # reserve 见令牌会取消、reaper 兜底;此刻【不清 inflight】——否则并发新命令
-                    # 会 reserve 这台 host 而陈旧令牌仍占着容量(codex review #4)。
-                    # review3 #3:也【不清该租户 claim / 不计 retry】—— 记入 reserve_retry_tids,
                     # 下方 _release_claims 跳过它,保 claim + inflight,靠原消息重投或 reaper 兜底。
                     all_settled = False
                     reserve_retry_tids.add(t["tenant_id"])
@@ -1245,7 +1219,6 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         elif mode == "ddb":
             # ddb 载体:先写 assignments(数据),再发 --from-ddb 叫醒(信号)。
             # 写序重要:表里有行,叫醒命令到达时 host 才查得到(同步路径先落账
-            # 再发命令同款,#139 教训)。写失败或叫醒失败都回滚 host + 清 assignments。
             if not _write_assignments(
                 instance_id, batch, base, now_epoch, command_id
             ):
@@ -1292,16 +1265,13 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
                     _fail(t["tenant_id"], "assignments write failed", instance_id)
 
     # 4) unplaced(容量不够、装箱阶段跳过的 host)→ 走【原消息】重投,不发新消息。
-    # #315 容量溢出体感根治(codex 认可的极简路,替代曾陷入 send/write 原子性泥潭的"发新
     # 消息"状态机):unplaced 就是普通失败(进 batchItemFailures + 下面 _release_claims 释放
     # claim/计预算,与 CAS/SSM 失败同一条久经考验的路)。缩短原消息 visibility 挪到释放 claim
-    # 【之后】、只缩成功释放的(见 #6 段),不在此立即缩——codex simple review P1:先缩后释放
     # 会在释放慢于 15s/失败时丢消息。
     for t in result.unplaced:
         _fail(t["tenant_id"], "unplaced: no host capacity this round")
         capacity_retry_tids.add(t["tenant_id"])
 
-    # #412(review7 #2)—— 陈旧令牌本轮没结算掉的租户:进 batchItemFailures 让原消息重投,
     # 但记入 reserve_retry_tids(下方 _release_claims 跳过它)保 claim 不计 retry,下轮重投再结算。
     for _msg in stale_unsettled_msgs:
         failures.append(_msg)
@@ -1322,7 +1292,6 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     # creating——unplaced 尾巴 ~16% 全灭在这)。条件写限定 claim 归属本 claim_id,
     # 绝不误删并发实例的新 claim;顺带 ADD dispatch_retries 计预算。
     msg_to_tid = {v: k for k, v in tid_to_msg.items()}
-    # #412 review3 #3:令牌释放遇 RETRY 的租户【排除】出 _release_claims——保留其 claim +
     # inflight + 不计 dispatch_retries,靠 SQS 原消息按默认 960s 重投再释放(重投时令牌仍在
     # → reserve 见令牌取消/或本 host 命令重跑释放),或 reaper 令牌孤儿清扫兜底。清了 claim 会
     # 让重投撞新鲜认领闸被静默 ack → 令牌搁浅。它们仍在 batchItemFailures(下面 dedup)里,消息
@@ -1335,12 +1304,9 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         ],
         command_id,
     )
-    # #315 极简方案:只对【容量类失败(unplaced+CAS loser)且成功释放 claim 且仍需重投】的租户
     # 缩短原消息 visibility(960→15s),让容量溢出快速重投而非等 48min。顺序在释放【之后】+ 只缩
     # 释放成功的 → 消除 codex simple review P1(先缩后释放会在释放慢/失败时 15s 内撞新鲜 claim
     # 丢消息)。释放失败/被接管/已终态的不缩,保留队列默认 960s(或到 maxReceiveCount 进 DLQ)兜底,
-    # 不丢。#315 codex final MR P1#3:capacity_retry_tids 含 CAS loser,不再只 unplaced。
-    # #315 codex MR recheck 阻断#1:【仅 ddb 模式】缩 visibility。push 模式(CDK 默认)的 unplaced
     # 多是 host 级 inflight 串行的正常等待(合法 SSM 可跑 840s),15s 就催会误伤——push 走原 960s。
     if ddb_mode:
         capacity_rh = [
@@ -1349,9 +1315,7 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             if tid in released and tid_to_rh.get(tid)
         ]
         _shorten_visibility_best_effort(capacity_rh)
-    # #141 — batch-level fail-loud summary: 一眼看清本次 invoke 收敛多少/回退多少,
     # 不用 grep per-tenant 行。dedup 非空 = 有租户回队列重投(超预算才最终进 DLQ)。
-    # #256 — 全链路可观测:打出本批 won 的**全部** tenant_id(不截断、不丢),让"按任意租户
     # grep 一键追全链路"成立(原来只记 command_id,tid→command_id 关联断在 dispatch 段,追踪
     # 要中转 SSM/assignments)。**分批写入**:每 50 个 tid 一条日志行(带 [i/n] 序号),既不丢
     # 任何 tid,又不把 380/批挤成一条巨长难读/易被下游截断的行。summary 行先出总数。
@@ -1379,7 +1343,6 @@ def _release_claims(tenant_ids: List[str], claim_id: str) -> set:
     claim 被静默 ack 删 → 丢消息;释放失败的保留队列默认 960s visibility(或到 maxReceiveCount
     进 DLQ,由 DLQ 告警/redrive 恢复)兜底重投,不静默丢)。
 
-    #141 收敛主修:ADD dispatch_retries 后,若新值达到重试预算,立刻转
     requires_intervention。为什么在这里而非只靠认领闸的 over-budget 分支——
     时序:SQS dlq_max_receive_count=N,消息第 N 次接收失败时 dispatch_retries
     从 N-1 ADD 到 N,此刻 SQS receiveCount=N=maxReceiveCount,消息转 DLQ,

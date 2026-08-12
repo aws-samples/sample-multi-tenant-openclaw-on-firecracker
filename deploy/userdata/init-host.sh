@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: MIT-0
 
 set -e
-# Mirror to serial console so get-console-output shows [oc:init] progress (#73)
 exec > >(tee /var/log/openclaw-init.log > /dev/console) 2>&1
 log() { echo "[oc:init] $(date +%H:%M:%S) $*"; }
 log "Starting host setup..."
@@ -10,7 +9,6 @@ log "Starting host setup..."
 # IMDSv2 token. TTL=300s covers L11-14 (取完立即用),但后面 _stack_output 必需项会
 # 等最多 20×15s=300s(每个,累计更久) → 到取 accountId 时这个 token 早过期 → 401 空 →
 # accountId 空 → bucket 名拼成 `openclaw-assets--<region>`(double-dash)→ 拉镜像 404 →
-# crashloop → ABANDON 换机器死循环(2026-07-17 新加坡实撞根因,pit#14)。
 # 修:凡在可能耗时的 _stack_output 之后再取 IMDS 的,一律现取 fresh token(_fresh_imds)。
 _fresh_imds() {  # $1=metadata-path(如 dynamic/instance-identity/document);现取 token,不复用过期的
   local _tok
@@ -23,11 +21,9 @@ AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest
 INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
 PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
 
-# IMDS values required to settle the hook; bail loudly if empty (#73).
 [ -n "${INSTANCE_ID}" ] && [ -n "${REGION}" ] || { echo "[oc:init] FATAL: empty INSTANCE_ID/REGION" > /dev/console; exit 1; }
 
 # Always settle the ASG hook on exit: CONTINUE on success, ABANDON on any
-# failure, so a broken init never hangs until hook timeout (#73).
 _complete_hook() {
   rc=$?; trap - EXIT
   result=$([ "$rc" -eq 0 ] && echo CONTINUE || echo ABANDON)
@@ -82,7 +78,6 @@ _s3_get() {
 }
 
 # Step 0: stop (not disable) the boot auto-upgrade run so a stale AMI's kernel
-# update can't reboot mid-init and orphan the lifecycle hook (#74).
 systemctl stop unattended-upgrades apt-daily-upgrade.service 2>/dev/null || true
 
 # Step 1: KVM
@@ -105,7 +100,6 @@ if [ -w /sys/devices/system/cpu/smt/control ]; then
   echo off > /sys/devices/system/cpu/smt/control 2>/dev/null || true
 fi
 # IPv6 forwarding:内核默认 0,显式关一遍防 AMI 漂移(与上面显式关 SMT 同理)。
-# 铁律 #6:默认满足 ≠ 部署代码保证。租户 tap 走 per-tap disable_ipv6=1(launch-vm.sh
 # 里做),host 侧 all.forwarding=0 是纵深防御:即便某台 tap 漏配了 disable_ipv6,
 # host 不转发也守住 IPv6 IMDS fd00:ec2::254。
 sysctl -q -w net.ipv6.conf.all.forwarding=0 2>/dev/null || true
@@ -127,7 +121,6 @@ _ctmax=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo n/a)
 log "step1b done: ksm=$(cat /sys/kernel/mm/ksm/run 2>/dev/null||echo n/a) swaps=$(grep -c partition /proc/swaps 2>/dev/null||echo 0) smt=$(cat /sys/devices/system/cpu/smt/control 2>/dev/null||echo n/a) ipv6fwd=${_ipv6fwd} conntrack_max=${_ctmax}"
 
 # Step 2: components (provision stage) + per-host identity
-# #389 v2 C2: every component install and every external download moved to
 # provision-host.sh, which EC2 Image Builder bakes into the host AMI. This file is
 # the configure stage: it runs on EVERY boot and only does work that needs per-host
 # identity or per-deployment config. The boundary is "does it reach the internet",
@@ -135,7 +128,6 @@ log "step1b done: ksm=$(cat /sys/kernel/mm/ksm/run 2>/dev/null||echo n/a) swaps=
 # awscli, firecracker tgz 404, aarch64 vmlinux 404 have each ABANDONed a metal).
 #
 # provision-host.sh is inlined here rather than fetched, so its bytes are part of
-# this file's sha256 — which is the LaunchTemplate-bound digest (#389 DoD 2/4).
 # A provision change therefore changes the LT, exactly like an init change does.
 log "step2: components + host identity"
 mkdir -p /etc/openclaw /opt/openclaw
@@ -154,7 +146,6 @@ fi
 # 1.5.0: per-host ed25519 key for host→guest SSH (private stays here, public
 # injected into each VM by launch-vm.sh).
 #
-# #389 v2 G2, configure side of the two-way defence. An AMI is shared by the whole
 # fleet, so a key baked into one would let ANY host's private key SSH into ANY
 # tenant's microVM on ANY host. provision never creates the key and its bake mode
 # refuses to snapshot one; this side proves the key on disk belongs to THIS instance.
@@ -195,7 +186,6 @@ chmod 600 /etc/openclaw/host_vm_key
 chmod 644 "${_OC_KEY_INSTANCE_FILE}"
 
 ARCH="$(uname -m)"
-# Pin Firecracker version — `latest` may not have CI guest-kernel yet, 404s step3b (#74).
 # Kept here (not only in provision) because step3b derives the guest-kernel path from it.
 FC_VER="${FC_VERSION:-v1.15.1}"
 command -v aws >/dev/null 2>&1 || { echo "[oc:init] FATAL: awscli absent after provision" > /dev/console; exit 1; }
@@ -226,7 +216,6 @@ log "tables: hosts=${HOSTS_TABLE} tenants=${TENANTS_TABLE}"
 # blowing the limit. Pulling them from outputs here keeps user-data a plain,
 # compressible string. ACCOUNT_ID from IMDS gives a deterministic fallback for
 # the chicken-and-egg window before outputs are visible (host launches mid-CREATE).
-# fresh token(上面 _stack_output 可能已烧掉 L10 那个 300s token,pit#14)。
 ACCOUNT_ID=$(_fresh_imds dynamic/instance-identity/document | sed -n 's/.*"accountId"[ ]*:[ ]*"\([0-9]*\)".*/\1/p')
 _RSFX=$([ "$REGION" = "ap-southeast-1" ] && echo "" || echo "-${REGION}")
 ASSETS_BUCKET=$(_stack_output AssetsBucket)
@@ -271,6 +260,9 @@ EGRESS_ALLOWLIST_CIDRS={{EGRESS_ALLOWLIST_CIDRS}}
 EGRESS_ALLOWLIST_DOMAINS={{EGRESS_ALLOWLIST_DOMAINS}}
 EGRESS_DNS_UPSTREAM={{EGRESS_DNS_UPSTREAM}}
 OC_HOST_LAUNCH_SLOTS={{OC_HOST_LAUNCH_SLOTS}}
+CPU_OVERCOMMIT_RATIO={{CPU_OVERCOMMIT_RATIO}}
+MEM_OVERCOMMIT_RATIO={{MEM_OVERCOMMIT_RATIO}}
+OVERCOMMIT_BY_FAMILY={{OVERCOMMIT_BY_FAMILY}}
 ENVEOF
 
 # CLOUDFRONT_ORIGIN:CloudFront 分发域在 CDK 里晚于 LaunchTemplate 创建(循环依赖),
@@ -292,7 +284,6 @@ LITELLM_HOST=$(aws ssm get-parameter --name /openclaw/litellm-host --region ${RE
 echo "LITELLM_HOST=${LITELLM_HOST}" >> /etc/platform.env
 log "LITELLM_HOST from SSM: ${LITELLM_HOST:-<empty, set /openclaw/litellm-host=bastion internal IP>}"
 
-# CLAWPOOL_RSA_CMK_ARN:#149 asymmetric-v1 注入用。cred-inject.sh 对 scheme=asymmetric-v1
 # 的 env 凭据调 `aws kms decrypt --key-id ${CLAWPOOL_RSA_CMK_ARN} --encryption-algorithm
 # RSAES_OAEP_SHA_256`(信封里的 key_id 是逻辑名,解密需真实 ARN)。栈建 RSA CMK 时写此 SSM。
 CLAWPOOL_RSA_CMK_ARN=$(aws ssm get-parameter --name /openclaw/clawpool-rsa-cmk-arn --region ${REGION} \
@@ -309,7 +300,6 @@ LITELLM_SHARED_VKEY=$(aws ssm get-parameter --name /openclaw/litellm-shared-vkey
 echo "LITELLM_SHARED_VKEY=${LITELLM_SHARED_VKEY}" >> /etc/platform.env
 log "LITELLM_SHARED_VKEY from SSM: ${LITELLM_SHARED_VKEY:+<set>}${LITELLM_SHARED_VKEY:-<empty, set /openclaw/litellm-shared-vkey>}"
 
-# ENGINE_REDIS_ENDPOINT/PORT:#187 两级路由的 host 侧对接(P3 未完的桥接,P7 补)。
 # host-agent.py:214 靠 ENGINE_REDIS_ENDPOINT 触发 RedisRouteWriter,promote 时把
 # route:{tid}→{host,port,guest_ip} 写进 Redis,edge OpenResty route.lua 查它转发。
 # 没这个 env → host-agent 不写 Redis → edge 查空 → /ws 404(P7 真机实撞根因)。
@@ -329,10 +319,8 @@ else
   log "ENGINE_REDIS_ENDPOINT: <empty, redis disabled or param missing — host-agent runs degraded, no Redis route>"
 fi
 
-# nginx removed (#215 R18 14.1): ALB target group now points directly to
 # host-agent :8899/health, no proxy layer needed.
 
-# ── #39 microVM 出网默认拒绝白名单 — host 侧基建(dnsmasq + ipset)──
 # 逻辑在独立脚本 setup-egress-allowlist.sh(S3 分发,不内联进 init-host 以免撑爆 user-data
 # 16KB 硬限;memory: uswest2-deploy-deadlock)。它读 /etc/platform.env 的 EGRESS_* + REGION,
 # config security.egress_allowlist_enabled 默认 false 时脚本自身直接跳过(host 零变化)。
@@ -364,16 +352,13 @@ systemctl start host-agent
 log "host agent started on :8899 (health + prom metrics)"
 
 # AWS Distro for OpenTelemetry (ADOT) collector — scrapes localhost:8899/metrics
-# and remote-writes to Amazon Managed Prometheus (issue #4). Skipped if
 # AMP_REMOTE_WRITE_URL is unset (metrics.enabled: false in config.yml).
 AMP_REMOTE_WRITE_URL="{{AMP_REMOTE_WRITE_URL}}"
 if [ -n "${AMP_REMOTE_WRITE_URL}" ] && [ "${AMP_REMOTE_WRITE_URL}" != "none" ]; then
   log "step2b: configuring aws-otel-collector"
-  # #389 v2: the .deb install moved to provision-host.sh (external download). Only the
   # per-deployment part stays here — the config carries the AMP remote-write URL, which
   # differs per deployment and must never be baked into a shared AMI.
   dpkg -s aws-otel-collector >/dev/null 2>&1 || { echo "[oc:init] FATAL: aws-otel-collector absent after provision" > /dev/console; exit 1; }
-  # Pull the templated config from S3. #229: 优先 deployment/observability/adot/
   # (S3 asset 化,可下发新版无需重烤镜像);拉失败回退老前缀 deployment/scripts/
   # 保兼容;两个都拉不到 fail-loud(镜像没烤兜底,静默继续 = ADOT 起不来还蒙在鼓里)。
   if ! aws s3 cp s3://${ASSETS_BUCKET}/deployment/observability/adot/adot-config.yaml \
@@ -410,7 +395,6 @@ if [ -z "$DATA_DEV" ]; then log "ERROR: data volume not found"; exit 1; fi
 log "step3: mounting data volume ${DATA_DEV}"
 if ! blkid ${DATA_DEV} | grep -q ext4; then mkfs.ext4 -q ${DATA_DEV}; fi
 mkdir -p /data
-# #389 v2 idempotency. Each of the three lines below used to assume a first-ever boot:
 #   mount        -> exit 32 "already mounted" on a re-run, and `set -e` turns that into
 #                   ABANDON, so a host that merely re-ran configure got replaced.
 #   >> /etc/fstab-> appended a duplicate UUID line on every run; enough reboots and the
@@ -449,11 +433,9 @@ if [ "$(readlink -f /home/ubuntu/firecracker-assets 2>/dev/null || echo "")" != 
   ln -sfn /data/firecracker-assets /home/ubuntu/firecracker-assets
 fi
 
-# Step 3a2: Fluent Bit host log shipper (#245). Runs after /data is mounted
 # so the vm pipeline can tail /data/firecracker-vms/*/fc.log. Shared installer
 # + host config pull from S3, same mechanism as edge. Config-gated: the shared
 # script no-ops when LOGGING_ENABLED=false. Host has no baked fallback (no
-# FB_LOCAL_DIR) — S3 miss is fail-loud inside the installer, matching #229.
 LOGGING_ENABLED="{{LOGGING_ENABLED}}"
 if [ "${LOGGING_ENABLED}" = "true" ]; then
   log "step3a2: installing host Fluent Bit (journald + fc.log → Firehose)"
@@ -544,7 +526,6 @@ FC_MAJOR=$(echo ${FC_VER} | grep -oP "v\d+\.\d+")
 # aarch64 该后缀的对象不存在(实测 404 → curl -f exit 22 → init ABANDON,metal 永远起不来),
 # arm64 用标准 vmlinux-5.10.245(实测 firecracker-ci/<ver>/aarch64/ 下真实存在)。
 if [ "${ARCH}" = "aarch64" ]; then VMLINUX_NAME="vmlinux-5.10.245"; else VMLINUX_NAME="vmlinux-5.10.245-no-acpi"; fi
-# #389 v2: prefer the copy provision baked into the AMI. /data is reformatted per host so
 # the kernel cannot be staged there at bake time; it lives on the root volume and is copied
 # across here. This is the download the aarch64 404 killed, so on a golden AMI it is the
 # single most valuable fetch to have already done.
@@ -605,13 +586,11 @@ log "step4: deploying scripts"
 aws s3 cp s3://${ASSETS_BUCKET}/deployment/scripts/launch-vm.sh /home/ubuntu/launch-vm.sh --region ${REGION} --no-progress 2>/dev/null || \
   _s3_get s3://${ASSETS_BUCKET}/deployment/scripts/launch-vm.sh /home/ubuntu/launch-vm.sh
 chmod +x /home/ubuntu/launch-vm.sh && chown ubuntu:ubuntu /home/ubuntu/launch-vm.sh
-# harden-config.sh(#41)— launch-vm.sh source 的 POSIX sh 幂等收敛库。必须在
 # launch-vm.sh 首次被调用前落地,否则 launch-vm 顶部 . lib/harden-config.sh 失败
 # → 每次启动 exit 1 → 一台 host 起不来任何租户。走同一 _s3_get 重试骨架。
 mkdir -p /home/ubuntu/lib
 aws s3 cp s3://${ASSETS_BUCKET}/deployment/scripts/lib/harden-config.sh /home/ubuntu/lib/harden-config.sh --region ${REGION} --no-progress 2>/dev/null || \
   _s3_get s3://${ASSETS_BUCKET}/deployment/scripts/lib/harden-config.sh /home/ubuntu/lib/harden-config.sh
-# cred-inject.sh(#118)— launch-vm.sh source 的凭据 KMS 解密库(只在租户有
 # injected_credentials 时才 source;缺失即 fail-loud 中止该 VM 启动,不静默注入空凭据)。
 aws s3 cp s3://${ASSETS_BUCKET}/deployment/scripts/lib/cred-inject.sh /home/ubuntu/lib/cred-inject.sh --region ${REGION} --no-progress 2>/dev/null || \
   _s3_get s3://${ASSETS_BUCKET}/deployment/scripts/lib/cred-inject.sh /home/ubuntu/lib/cred-inject.sh
@@ -619,12 +598,10 @@ chmod +x /home/ubuntu/lib/harden-config.sh /home/ubuntu/lib/cred-inject.sh && ch
 aws s3 cp s3://${ASSETS_BUCKET}/deployment/scripts/stop-vm.sh /home/ubuntu/stop-vm.sh --region ${REGION} --no-progress 2>/dev/null || \
   _s3_get s3://${ASSETS_BUCKET}/deployment/scripts/stop-vm.sh /home/ubuntu/stop-vm.sh
 chmod +x /home/ubuntu/stop-vm.sh && chown ubuntu:ubuntu /home/ubuntu/stop-vm.sh
-# clone(#12) / migrate(#64) / resize(#22) helpers — all must reach the host or
 # the matching API hits a missing /home/ubuntu/*.sh and fails exit 127.
 # start-all-vms / stop-all-vms — host-local fan-out for the 1-minute fleet
 # power goal: control plane sends ONE SSM per host, host starts/stops all its
 # VMs in bounded parallel (SSM concurrency = host count, not VM count).
-# #256 — launch-all-vms.sh 已内联进 launch-vm.sh 的 fan_out_main(唯一起 VM 脚本,已在
 # 上方单独下载),聚合 SSM 命令调 `launch-vm.sh --manifest|--from-ddb ...`,此处不再拉它。
 for _s in clone-data migrate-vm resize-disk start-all-vms stop-all-vms; do
   aws s3 cp s3://${ASSETS_BUCKET}/deployment/scripts/${_s}.sh /home/ubuntu/${_s}.sh --region ${REGION} --no-progress 2>/dev/null \
@@ -633,10 +610,8 @@ for _s in clone-data migrate-vm resize-disk start-all-vms stop-all-vms; do
 done
 {{BACKUP_DATA_SCRIPT}}
 
-# #187 转型:step4a2 claw-hub 本地安装已下线。数据面改两级路由直连 microVM
 # 原生 gateway(ALB LOR → OpenResty edge → Redis 查表 → host iptables DNAT →
 # microVM:18789)。install-hub.sh + deploy/hub/ 源已归档到
-# engineering/04-archive/p4-cutover-deprecated/。#187 P5:CLAW_HUB_URL/CLAW_HUB_WS
 # env 与 stack.py 模板替换、CloudFront /hub/* behavior、HubTargetGroup 已一并删除。
 
 # Step 4b: AgentCore config (if enabled)
@@ -647,13 +622,11 @@ if [ -n "${AGENTCORE_GW_URL}" ] && [ "${AGENTCORE_GW_URL}" != "none" ]; then
   log "AgentCore config written: gateway=${AGENTCORE_GW_URL}"
 fi
 
-# Optional customer-managed root hook (#390). CDK renders an empty string when
 # disabled; enabled hooks are private-S3 downloaded, SHA256 verified, atomically
 # installed and bounded by timeout before this host can register active.
 {{HOST_USER_HOOK}}
 
 # Step 5: register to DDB. Retry (concurrent launches throttle writes); on
-# total failure exit non-zero → trap ABANDONs (unregistered host is useless) (#73)
 #
 # Mixed-instance-type support: compute THIS host's real capacity from the host
 # itself (nproc + /proc/meminfo) minus the reserved headroom, instead of a
@@ -664,6 +637,16 @@ fi
 # register its TRUE size, so an ASG can mix equal-arch types of different sizes.
 # register_host() (the API-driven path) already resolves capacity via the EC2
 # API; this aligns the userdata direct-write path with it.
+#   ① 标称规格表按 instance_type 查(见下方 _NOMINAL_SPECS)
+#   ② 落 DDB 供调度侧四级机型亲和排序(r8g>r7g>m8g>m7g)
+# 用 _fresh_imds(现取 token,不复用上面可能已过期的 TOKEN —— 这里在耗时的
+# _stack_output 之后)。取不到不 fail:标称表查不到会回落自报容量,且调度侧对空
+# instance_type 有 fail-safe(affinity_tier 主键 mem_per_vcpu 由 total_* 算出,
+# 缺机型只丢失同档内代际次序,R/M 大类判定仍正确)。
+# DDB 的 S 类型不接受空字符串,故 IMDS 取不到时回落 "unknown"(而非空串)。
+INSTANCE_TYPE=$(_fresh_imds meta-data/instance-type || true)
+[ -n "${INSTANCE_TYPE}" ] || INSTANCE_TYPE="unknown"
+
 _RES_VCPU={{HOST_RESERVED_VCPU}}
 _RES_MEM={{HOST_RESERVED_MEM}}
 _HOST_VCPU=$(nproc)
@@ -671,18 +654,52 @@ _HOST_VCPU=$(nproc)
 # configured reserved_mem headroom, same as the old synth-time computation.
 _HOST_MEM_KB=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
 _HOST_MEM_MB=$(( _HOST_MEM_KB / 1024 ))
-AVAIL_VCPU=$(( _HOST_VCPU - _RES_VCPU ))
-AVAIL_MEM=$(( _HOST_MEM_MB - _RES_MEM ))
+
+#
+# 为什么不用 nproc + /proc/meminfo 的实测值:那是【真机可用】容量,比标称小
+# 1.8-1.9%(固件/硬件保留:r8g.metal-24xl 标称 768GiB 而 MemTotal 只有 754GiB),
+# 再扣 reserved_* 之后,调度侧算出的 allocatable 就达不到按标称定义的容量目标
+# (1c2G 口径:实测值只到 375,而标称理论值是 384)。若靠 per-family 补偿系数把这
+# 段差补回去,就要为每个机型手算一个魔数 —— 每上一款新机型都得重算,且极易算错。
+# 故改为查标称表:ratio 保持干净的 cpu=4.0 / mem=1.0,零系数。
+#
+# 代价(已知并接受):账本按标称记账,比机器真实可用多约 1.8%,故 host OS 与
+# Firecracker 驻留内存不再由账本预留保护,改由 scheduling.mem_safety_floor_ratio
+# 的物理水位门(读 host 自报的实测 MemAvailable)承担 —— 两者是一套,别单独关物理门。
+#
+# fail-safe:表里查不到本机机型(新机型未进 config 池 / size token 未知)时,回落
+# nproc + /proc/meminfo 自报,保留 Phase 7 的混池安全性(小机型绝不冒充大机型),
+# 绝不因表缺项就注册 0 或注册别人的容量。
+_NOMINAL_SPECS="{{NOMINAL_SPECS}}"
+_NOM_VCPU=""
+_NOM_MEM=""
+if [ -n "${INSTANCE_TYPE}" ] && [ "${INSTANCE_TYPE}" != "unknown" ]; then
+  # 表是每行 "<instance_type> <vcpu> <mem_mb>";精确匹配第一列。
+  _NOM_LINE=$(printf '%s\n' "${_NOMINAL_SPECS}" | awk -v t="${INSTANCE_TYPE}" '$1==t{print; exit}')
+  if [ -n "${_NOM_LINE}" ]; then
+    _NOM_VCPU=$(printf '%s' "${_NOM_LINE}" | awk '{print $2}')
+    _NOM_MEM=$(printf '%s' "${_NOM_LINE}" | awk '{print $3}')
+  fi
+fi
+if [ -n "${_NOM_VCPU}" ] && [ -n "${_NOM_MEM}" ] && [ "${_NOM_VCPU}" -gt 0 ] 2>/dev/null; then
+  AVAIL_VCPU=${_NOM_VCPU}
+  AVAIL_MEM=${_NOM_MEM}
+  log "capacity: nominal ${INSTANCE_TYPE} ${AVAIL_VCPU}vcpu/${AVAIL_MEM}MB (measured ${_HOST_VCPU}vcpu/${_HOST_MEM_MB}MB; reserved_* not deducted — physical water-mark gate covers host overhead)"
+else
+  AVAIL_VCPU=$(( _HOST_VCPU - _RES_VCPU ))
+  AVAIL_MEM=$(( _HOST_MEM_MB - _RES_MEM ))
+  log "capacity: FALLBACK self-reported ${AVAIL_VCPU}vcpu/${AVAIL_MEM}MB (type='${INSTANCE_TYPE}' not in nominal table; measured ${_HOST_VCPU}/${_HOST_MEM_MB} minus reserved ${_RES_VCPU}/${_RES_MEM})"
+fi
 # Defensive: never register a non-positive capacity (would silently make the
 # host unschedulable or, worse, wrap negative). Fail loud so the hook ABANDONs.
 { [ "${AVAIL_VCPU}" -gt 0 ] && [ "${AVAIL_MEM}" -gt 0 ]; } || {
   echo "[oc:init] FATAL: computed non-positive capacity vcpu=${AVAIL_VCPU} mem=${AVAIL_MEM} (host ${_HOST_VCPU}vcpu/${_HOST_MEM_MB}MB, reserved ${_RES_VCPU}/${_RES_MEM})" > /dev/console
   exit 1
 }
-log "step5: registering to DynamoDB (az=${AZ}, capacity ${AVAIL_VCPU}vcpu/${AVAIL_MEM}MB from ${_HOST_VCPU}vcpu/${_HOST_MEM_MB}MB host)"
+log "step5: registering to DynamoDB (az=${AZ}, type=${INSTANCE_TYPE:-unknown}, capacity ${AVAIL_VCPU}vcpu/${AVAIL_MEM}MB from ${_HOST_VCPU}vcpu/${_HOST_MEM_MB}MB host)"
 _registered=0
 for _r in $(seq 1 10); do
-  aws dynamodb put-item --table-name ${HOSTS_TABLE} --region ${REGION} --item '{"instance_id":{"S":"'${INSTANCE_ID}'"},"private_ip":{"S":"'${PRIVATE_IP}'"},"az":{"S":"'${AZ}'"},"total_vcpu":{"N":"'${AVAIL_VCPU}'"},"total_mem_mb":{"N":"'${AVAIL_MEM}'"},"used_vcpu":{"N":"0"},"used_mem_mb":{"N":"0"},"vm_count":{"N":"0"},"next_vm_num":{"N":"1"},"status":{"S":"active"},"rootfs_version":{"S":"'${ROOTFS_VER}'"},"snapshot_time":{"S":"'${ROOTFS_VER}'"}}' && { _registered=1; break; }
+  aws dynamodb put-item --table-name ${HOSTS_TABLE} --region ${REGION} --item '{"instance_id":{"S":"'${INSTANCE_ID}'"},"instance_type":{"S":"'${INSTANCE_TYPE}'"},"private_ip":{"S":"'${PRIVATE_IP}'"},"az":{"S":"'${AZ}'"},"total_vcpu":{"N":"'${AVAIL_VCPU}'"},"total_mem_mb":{"N":"'${AVAIL_MEM}'"},"used_vcpu":{"N":"0"},"used_mem_mb":{"N":"0"},"vm_count":{"N":"0"},"next_vm_num":{"N":"1"},"status":{"S":"active"},"rootfs_version":{"S":"'${ROOTFS_VER}'"},"snapshot_time":{"S":"'${ROOTFS_VER}'"}}' && { _registered=1; break; }
   log "register attempt $_r failed, retrying in 15s..."
   sleep 15
 done

@@ -277,6 +277,13 @@ resource "aws_lambda_function" "api" {
       CPU_OVERCOMMIT_RATIO = tostring(var.cpu_overcommit_ratio)
       MEM_OVERCOMMIT_RATIO = tostring(var.mem_overcommit_ratio)
       MAX_VMS_PER_HOST     = tostring(var.max_vms_per_host)
+      # Placement anti-herding. A deterministic least-loaded pick made every
+      # concurrent create collide on one host's conditional write, and a lost
+      # race was then treated as "fleet full" → a bare-metal scale-out. Left at
+      # the handler defaults these would still work, but the TF and CDK paths
+      # must agree on placement behaviour or the two deployments diverge.
+      HOST_PICK_TOP_K       = tostring(var.host_pick_top_k)
+      HOST_RESERVE_ATTEMPTS = tostring(var.host_reserve_attempts)
     }, var.api_env_overrides)
   }
 }

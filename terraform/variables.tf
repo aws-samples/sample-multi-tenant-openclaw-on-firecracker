@@ -43,6 +43,18 @@ variable "max_vms_per_host" {
   default     = 0
 }
 
+variable "host_pick_top_k" {
+  description = "How many of the least-loaded fitting hosts a create may pick between. 1 restores the old deterministic pick (and its thundering herd on one host's conditional write)."
+  type        = number
+  default     = 8
+}
+
+variable "host_reserve_attempts" {
+  description = "Slot-reservation attempts (each on a different host) before queueing the tenant as pending and scaling out."
+  type        = number
+  default     = 3
+}
+
 variable "backup_retention_days" {
   description = "Days to keep tenant backup archives"
   type        = number

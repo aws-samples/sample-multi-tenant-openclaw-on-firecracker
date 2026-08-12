@@ -88,3 +88,6 @@ docs/screenshots-tmp/
 # Terraform init artifacts (local validate runs)
 terraform/.terraform/
 terraform/.terraform.lock.hcl
+
+# Internal-only docs (briefings, capacity analyses) — never pushed
+docs/internal/

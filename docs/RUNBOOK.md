@@ -91,6 +91,56 @@ Data plane: rootfs versions are tracked in S3 `manifest.json`; re-run `./scripts
 ./scripts/destroy.sh --purge   # ⚠️ permanently deletes bucket + tenants/hosts tables — confirm prompt
 ```
 
+### 2.1 `routing.mode: host-tg` — cutover gate (read before flipping)
+
+`host-tg` replaces the per-tenant ALB listener rule (the ~499-tenant ceiling,
+and an AWS *default* quota of 100 rules per ALB) with one shared target group +
+a `/vm/*` catch-all + an nginx peer-map on every host. The data plane (P1) and
+the flag (P2) are deployed; **the flag default is still `per-tenant` and
+flipping it is not yet authorised.** Reasons, in order of severity:
+
+**a. Rollback is currently a one-way door.** There is no code path that
+rebuilds per-tenant rules for existing tenants — `_add_alb_rule` is only called
+from `create_tenant` / `process_pending`, and while `host-tg` is active
+`_ensure_host_tg` returns early so newly-registered hosts never get an
+`oc-<last8>` target group at all. Flipping the config back and redeploying
+restores the Lambda env var but **not** the ALB rule set, so the listener falls
+through to its default `fixed_response 404` — 100% of tenants down. Past ~100
+tenants (the default rule quota) per-tenant is not even a reachable state
+without an AWS quota increase, which takes hours to days.
+
+**b. The second hop had never carried a request.** The catch-all sits at
+priority 999 while per-tenant rules occupy 1-499, and ALB matches lowest-first
+— so the cross-host path was dead code in production despite being "deployed
+and verified". It was also broken: the peer conf stripped the `/vm/<tid>`
+prefix, which the owner host's `:8081` requires, so every cross-host request
+would have 404'd. Fixed, plus a semantic regression test, but **still never
+exercised against two real hosts.**
+
+**c. Do NOT move the catch-all to priority 1.** It buys nothing (once the
+per-tenant rules are gone, 999 and 1 are equivalent) and costs a lot: priority
+1 is inside `_add_alb_rule`'s random pool, so a live tenant may hold it and the
+deploy fails with `PriorityInUseException`; and the move is atomic and
+fleet-wide, with no per-tenant canary.
+
+**Gate — all of these before flipping the default:**
+
+1. A real two-host `curl` through the second hop, including a WebSocket
+   upgrade: `/vm/<tid>/` served by a host that does **not** own the tenant.
+2. `openclaw_peer_map_last_success_age_seconds` < 2× `OC_ROUTE_SYNC_INTERVAL`
+   on every host, and `openclaw_peer_map_reload_failures_total` flat at 0.
+3. An ASG scale-out drill with zero 4xx on `/vm/*` — the shared target group
+   health-checks `/ready` (not the always-200 `/health`) precisely so a host
+   without peer routes stays out of service, and that needs to be observed.
+4. A rebuild path for per-tenant rules exists and has been dry-run, so (a) is
+   no longer a one-way door.
+5. Gradual cutover instead of a flag flip: keep the catch-all at 999 and delete
+   per-tenant rules **one tenant at a time**. Each deletion moves exactly that
+   tenant onto the shared path, and rollback is recreating that one rule.
+
+Record the current ALB rule count and tenant count before starting — together
+they say whether the per-tenant fallback is still reachable at all.
+
 ---
 
 ## 3. Operator endpoints (T2-8)

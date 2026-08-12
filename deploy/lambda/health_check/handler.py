@@ -81,6 +81,16 @@ ALB_LISTENER_ARN = os.environ.get("ALB_LISTENER_ARN", "")
 # peer-map, driven by the DDB host_id flip). Default "per-tenant" = legacy ALB
 # rule repointing. Kept in sync with the api Lambda via one config.yml value.
 ROUTING_MODE = os.environ.get("ROUTING_MODE", "per-tenant")
+# How many CONSECUTIVE successful public-path probes count as "reachable".
+#
+# Under per-tenant routing the tenant's listener rule pins traffic to exactly
+# one target group, so one sample is conclusive — 1 keeps that path byte-for-
+# byte as before. Under host-tg the catch-all round-robins across every
+# in-service host, so a single sample only proves 1/N of the fleet can serve
+# the tenant; the gate would pass on a tenant that 404s for most users. See
+# _verify_dashboard_reachable_via_alb.
+VERIFY_CONSECUTIVE_OK = int(os.environ.get(
+    "VERIFY_CONSECUTIVE_OK", "3" if ROUTING_MODE == "host-tg" else "1"))
 # T3-3: the VPC to create a host target group in during failover. The API
 # Lambda always used its VPC_ID env; health_check used to clone VpcId from an
 # arbitrary existing target group (existing[0]), which breaks when none exist
@@ -1477,15 +1487,35 @@ def _verify_dashboard_reachable_via_alb(tenant_id, public_base_url, timeout_sec=
     deadline = _t.time() + timeout_sec
     last_status = None
     last_err = None
+    # T3-1: require CONSECUTIVE successes, not one.
+    #
+    # Under host-tg the /vm/* catch-all round-robins each new connection across
+    # every in-service host, and only the owner (or a host with a converged
+    # peer conf) can serve the tenant. A single-sample gate therefore passes as
+    # soon as ONE probe happens to land on a working host, even if the other
+    # (N-1)/N are 404-ing — it flips DDB to `running` and emits
+    # MIGRATION_COMPLETED for a tenant that works for 1/N of requests. That is
+    # the 1.4.2 "fake failover" bug reincarnated as fake convergence: 1.4.2
+    # fixed *what* counts as success, this fixes *how many samples* it takes.
+    #
+    # K consecutive successes, each on a fresh connection, gives roughly
+    # (1/N)^K odds of a false pass instead of 1/N. Any failure resets the
+    # streak, so an intermittent host cannot accumulate successes over time.
+    needed = max(1, VERIFY_CONSECUTIVE_OK)
+    streak = 0
     while _t.time() < deadline:
+        ok = False
         try:
             req = urllib.request.Request(url, method="GET")
             # Force IPv4-friendly behavior; ALB targets are usually private
             # IPv4 only. Don't follow redirects — a 302 is fine evidence.
+            # Connection: close so the next probe re-resolves and can land on a
+            # different target — reusing a keep-alive connection would sample
+            # the SAME host every time and defeat the whole point.
+            req.add_header("Connection", "close")
             with urllib.request.urlopen(req, timeout=5) as resp:
                 last_status = resp.status
-                if _reachable_status(last_status):
-                    return True
+                ok = _reachable_status(last_status)
         except urllib.error.HTTPError as e:
             # T3-1: only genuine "backend is alive" codes count as reachable.
             # A bare 404 used to pass (last_status < 500) — but under the
@@ -1495,15 +1525,28 @@ def _verify_dashboard_reachable_via_alb(tenant_id, public_base_url, timeout_sec=
             # fake-failover class). Treat 404/other 4xx (except auth 401/403)
             # as NOT-YET-reachable and keep polling until the deadline.
             last_status = e.code
-            if _reachable_status(e.code):
-                return True
+            ok = _reachable_status(e.code)
         except urllib.error.URLError as e:
             last_err = str(e.reason) if hasattr(e, "reason") else str(e)
         except Exception as e:
             last_err = str(e)
+
+        if ok:
+            streak += 1
+            if streak >= needed:
+                return True
+        elif streak:
+            # Report the reset — an alternating pass/fail pattern is the
+            # signature of a partially-converged fleet and is otherwise
+            # invisible in the logs.
+            print(f"cross-ALB verify for {tenant_id}: streak reset at "
+                  f"{streak}/{needed} (last_status={last_status}, "
+                  f"last_err={last_err}) — fleet not fully converged")
+            streak = 0
         _t.sleep(poll_sec)
     print(f"cross-ALB verify FAILED for {tenant_id}: "
-          f"last_status={last_status}, last_err={last_err}")
+          f"last_status={last_status}, last_err={last_err}, "
+          f"streak={streak}/{needed}")
     return False
 
 

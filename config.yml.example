@@ -71,7 +71,18 @@ routing:
   #   部署 T3-1 P1 数据平面 (shared TG + :8081 peer server)，且各 host 已经过
   #   instance refresh 拿到新的 init-host.sh。切到 host-tg 后新租户不再建
   #   per-tenant rule；已存在的 legacy rule 继续生效直到 Phase 3 清理。
+  #
+  # ⚠️ 切换前必读 docs/RUNBOOK.md §2.1。回滚依赖
+  #   POST /admin/routing/rebuild（重建 per-tenant 规则），推荐用
+  #   POST /admin/routing/purge-per-tenant 逐租户灰度，而不是直接翻 mode。
   mode: per-tenant
+
+  # 迁移/故障转移后，公网路径探针需要连续成功多少次才算"已收敛"。
+  # host-tg 下 catch-all 会把每个新连接 round-robin 到任意 host，单次成功
+  # 只证明 1/N 的机器能服务该租户 —— 会放行一个对多数用户 404 的租户。
+  # per-tenant 下流量被规则钉在一个 target group，1 次即确定。
+  # 留空则按 mode 自动取值（host-tg=3, per-tenant=1）。
+  # verify_consecutive_ok: 3
 
 scaler:
   interval_minutes: 3

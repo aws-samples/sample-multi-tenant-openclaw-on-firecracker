@@ -18,7 +18,6 @@ REGISTERED_STATUSES = (
     "migrating",
     "deleting",
     "deleted",
-    # #422 — 休眠/恢复三态。suspending/restoring 是过渡态,suspended 是冷备稳定态
     # (本地 VM 已删 + 数据盘备份 S3 + slot 已释放,记录与 tenant_id 保留)。均非异常。
     "suspending",
     "suspended",
@@ -37,7 +36,9 @@ ABNORMAL = {
     "failover_failed",
     "failover_failed_partial",
 }
-INTERNAL_PREFIXES = ("activename#", "inflight#", "__")
+# client_token 幂等记录与租户同表。不补的话统计会把这些内部记录计入租户总数/状态分布,
+# 把指标算错(而且随客户重试次数漂移)。
+INTERNAL_PREFIXES = ("activename#", "inflight#", "idem#", "__")
 SEGMENTS = int(os.environ.get("STATS_SCAN_SEGMENTS", "8"))
 ddb = boto3.resource("dynamodb")
 tenants = ddb.Table(os.environ["TENANTS_TABLE"])

@@ -1,7 +1,0 @@
-{
-  "app": "python3 stack.py",
-  "context": {
-    "region": "ap-northeast-1",
-    "platform_id": "demo-marketplace"
-  }
-}

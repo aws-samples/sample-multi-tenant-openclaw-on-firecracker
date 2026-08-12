@@ -28,7 +28,7 @@
 #                                     → 不读;当前会新建默认 valkey 参数组(不碰你现有的)
 #   · edge.data_volume_gb / root_volume_gb → edge 段无磁盘键,走 AMI 默认根盘
 #   · alb.certificate_arn            → 单 ALB 的 HTTPS 证书走 console_auth.bff_certificate_arn
-#   · console_auth.bff_in_vpc / bff_alb_subnet_ids → 不读;BFF 是否入 VPC 由是否 imported 自动派生
+#   · console_auth.bff_in_vpc       → 不读;BFF 是否入 VPC 由是否 imported 自动派生
 #   · asg.scale_in_enabled           → 不读;缩容开关是 scaler.idle_reclaim_enabled
 # ============================================================================
 
@@ -83,6 +83,10 @@ quotas:
 # ========== API Gateway — 纯私有 ==========
 api:
   mode: private # PRIVATE REST API + execute-api VPCE,机器流量走私有
+  # 留空(默认)= 自动用本 stack 创建的那个 VPCE,一键部署即可用。
+  # 只有当客户要额外放行【已存在且已核实】的其它 VPCE 时才填真实 id;
+  # 填错/填占位符会让所有请求被 Deny(403)。
+  vpce_ids: []
   throttle_rate_limit: 500 # account 级稳态 req/s(批量 lifecycle 的天花板)
   throttle_burst_limit: 1000 # 瞬时 burst 令牌桶容量
 
@@ -115,14 +119,14 @@ network:
       - <SUBNET_HOST_1B>
       - <SUBNET_HOST_1C>
 
-# ========== 控制面 / 边缘 ALB — 纯内网 ==========
-# 单 ALB(DashboardALB):edge(:80/8080)与 BFF(:443)共用它。BFF HTTPS 证书见 console_auth。
+# ========== 控制面 / 边缘 ALB — 公网白名单入口 ==========
+# DashboardALB 承载 edge;ConsoleBffALB 独立承载 BFF :443。
 alb:
-  internal: true # internal-only,不经公网;SG 入站仅 VPC CIDR
-  subnet_ids: # 这唯一一个 ALB 的子网。内网访问控制台 → 用 BFF/app 子网
-    - <SUBNET_HOST_1A>
-    - <SUBNET_HOST_1B>
-    - <SUBNET_HOST_1C>
+  internal: false # #423 — 公网 ALB;入站基线只放 VPC CIDR,公网访问者 CIDR 部署后按需追加(绝不 0.0.0.0/0)
+  subnet_ids: # internet-facing edge ALB 必须落公网子网
+    - <SUBNET_PUBLIC_1A>
+    - <SUBNET_PUBLIC_1B>
+    - <SUBNET_PUBLIC_1C>
 
 # ========== ElastiCache Valkey 路由表 ==========
 # OpenResty 边缘查 tenant_id→host:port 的准静态路由;host-agent 建/删/迁双写。
@@ -173,7 +177,7 @@ scaler:
   create_via_queue: false # ⚠️ 与 dispatch.enabled=true 互斥,必须 false
   idle_reclaim_enabled: false # 空闲缩容总开关;false = 不自动 terminate 空闲 host
 
-# ========== Console BFF — 纯内网登录门 ==========
+# ========== Console BFF — 公网白名单登录门 ==========
 console_auth:
   enabled: true # BFF Lambda + Lambda 目标组 + Cognito Hosted UI 登录门
   rbac_enabled: true # 角色鉴权(viewer/operator/admin),生产保持 true
@@ -182,6 +186,10 @@ console_auth:
   default_no_jwt_role: operator
   bff_certificate_arn: "<ACM_ARN_BFF>" # 本 region ACM 证书;配了才在 ALB 开 443 + authenticate-cognito
   bff_ingress_cidrs: "<OFFICE_OR_VPN_CIDR>" # 允许访问控制台的出口 CIDR,绝不填 0.0.0.0/0
+  bff_alb_subnet_ids:
+    - <SUBNET_PUBLIC_1A>
+    - <SUBNET_PUBLIC_1B>
+    - <SUBNET_PUBLIC_1C>
   # BFF Lambda 子网(imported 私有子网)。BFF 是否入 VPC 由是否 imported 自动派生,无需单独开关。
   bff_subnet_ids:
     - <SUBNET_HOST_1A>
@@ -225,7 +233,6 @@ flow_logs:
 
 # ========== 可观测性:数据面日志链(AOS / OpenSearch) ==========
 # AOS 是自建 OpenSearch 域,与 metrics 段的托管 AMG/AMP 无关(要 AOS 不代表要托管监控)。
-# ⚠️ 首次一把开 AOS 易撞 drift / AZ 整除坑(见新加坡 #258):稳妥做法是两步部署 ——
 #    首次 enabled=false 出栈,drift 清干净后增量部署再改 true 建 AOS/Firehose 全链。
 #    这里默认给 true(明确要 AOS);若首次部署卡在 AOS 就先降回 false 走两步。
 logging:

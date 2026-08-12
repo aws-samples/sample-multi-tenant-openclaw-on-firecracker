@@ -48,15 +48,39 @@ def normalize_spec(
     return _pos_int(p.get("vcpu"), default_vcpu), _pos_int(p.get("mem_mb"), default_mem)
 
 
+def _affinity_key(h: Dict[str, Any]) -> tuple:
+    """#430 四级亲和排序键 (mem_tier, -family_rank, balance) —— 降序取最大。
+
+    前两位由调用方(_snapshot_hosts)预先算好、以【扁平字段 affinity_tier】传入:
+    本模块是纯函数(零 boto3,被 tests 以 importlib 脱包加载),不能 import
+    clients/host_profile,也不读私有 "raw" 结构。
+
+    第三位 balance = min(free_vcpu_ratio, free_mem_ratio) 是木桶短板,只在【同机型
+    内】分散(避免热点);跨机型不分散 —— 业务要求 R 系先填满再用 M 系,所以 tier
+    优先于余量。这也是为什么 balance 排第三而不并入主键。
+
+    分母为 0 时该维比例取 0(不除零崩、也不当无限资源)。
+    """
+    tier = h.get("affinity_tier") or (0, 0)
+    av = int(h.get("allocatable_vcpu", 0) or 0)
+    am = int(h.get("allocatable_mem", 0) or 0)
+    fv = int(h.get("free_vcpu", 0) or 0)
+    fm = int(h.get("free_mem", 0) or 0)
+    balance = min(fv / av if av else 0.0, fm / am if am else 0.0)
+    return (int(tier[0]), int(tier[1]), balance)
+
+
 def _rank_hosts_by_capacity(
-    hosts: List[Dict[str, Any]], skip_simulated: bool
+    hosts: List[Dict[str, Any]], skip_simulated: bool, affinity: bool = False
 ) -> List[Dict[str, Any]]:
-    """按 free_vcpu 降序排;跳过 inflight_ok=False / simulated(push) / 无 vcpu 容量 /
-    内存未知(mem_known=False,fail-safe:缺 total_mem_mb 的 host 不参与,不当无限内存)。
+    """按 free_vcpu 降序排(affinity=True 时改按四级亲和);跳过 inflight_ok=False /
+    simulated(push) / 无 vcpu 容量 / 内存未知(mem_known=False,fail-safe:缺
+    total_mem_mb 的 host 不参与,不当无限内存)。
 
     #315 SPLIT_BY_MODE:inflight_ok 取值由调用方(_snapshot_hosts)按 dispatch 模式给。
     #330:排序键从 free_slots(VM_DEFAULT 折算的名额)改为 free_vcpu(真实剩余 vcpu),与
-    CAS 的真实记账同轴,避免"装箱按名额给、CAS 按真实拒"的整批拒绝饿死。"""
+    CAS 的真实记账同轴,避免"装箱按名额给、CAS 按真实拒"的整批拒绝饿死。
+    #430:affinity=False 时【严格保持】原 free_vcpu 排序键,逐字节等价旧行为(回退开关)。"""
     usable = []
     for h in hosts:
         if not h.get("inflight_ok", True):
@@ -69,8 +93,13 @@ def _rank_hosts_by_capacity(
             continue  # #330 fail-safe:内存容量未知的 host 不调度(待回填),不 fail-open 当无限
         if not h.get("disk_ok", True):
             continue  # #340 磁盘软门:/data 物理将满的 host 不接新租户(缺该键默认 True=旧行为)
+        if not h.get("mem_ok", True):
+            continue  # #430 物理内存软门:实测 MemAvailable 跌破水位的 host 不接(缺键 True=旧行为)
         usable.append(h)
-    usable.sort(key=lambda h: int(h.get("free_vcpu", 0) or 0), reverse=True)
+    if affinity:
+        usable.sort(key=_affinity_key, reverse=True)
+    else:
+        usable.sort(key=lambda h: int(h.get("free_vcpu", 0) or 0), reverse=True)
     return usable
 
 
@@ -82,6 +111,7 @@ def pack(
     skip_simulated: bool = False,
     default_vcpu: int = 2,
     default_mem: int = 4096,
+    affinity: bool = False,
 ) -> PackResult:
     """贪婪装箱:按【真实 vcpu+mem 预算】把租户塞进 host,预算或并行度上限用尽即下一 host。
 
@@ -90,12 +120,17 @@ def pack(
     且 1c:2G 租户能装到真实 vcpu 上限(r8g 564 而非 282 名额),达成 380 目标。
     per_host_cap:单批并行度上限(DISPATCH_MAX_PARALLEL,限 VM 数不限资源);None=不限。
     default_vcpu/default_mem:params 缺省时的回落规格(调用方传 clients.VM_DEFAULT_*)。
+    affinity:#430 四级机型亲和排序开关(调用方传 clients.AFFINITY_ENABLED)。走参数
+      而非在本模块读 clients —— 本模块必须保持零依赖(纯函数契约 + 脱包加载测试)。
+      False = 逐字节回落原 free_vcpu 排序。
     """
     result = PackResult()
     if not pending:
         return result
 
-    usable = _rank_hosts_by_capacity(hosts, skip_simulated=skip_simulated)
+    usable = _rank_hosts_by_capacity(
+        hosts, skip_simulated=skip_simulated, affinity=affinity
+    )
     if not usable:
         result.unplaced = list(pending)
         return result

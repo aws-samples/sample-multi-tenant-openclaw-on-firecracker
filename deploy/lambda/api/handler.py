@@ -586,6 +586,9 @@ def delete_skill(name):
 # T2-8: destructive fleet-wide actions require admin, not just operator.
 _ADMIN_ONLY = {
     ("POST", "/failover/{az}"),
+    # T3-1 P3: both rewrite the live data plane fleet-wide.
+    ("POST", "/admin/routing/rebuild"),
+    ("POST", "/admin/routing/purge-per-tenant"),
 }
 
 
@@ -655,6 +658,14 @@ def lambda_handler(event, context):
         ),
         ("POST", "/failover/{az}"): lambda: trigger_failover(
             path_params["az"], event.get("body")
+        ),
+        # T3-1 P3: routing cutover / rollback. rebuild makes the host-tg flip
+        # reversible; purge is the per-tenant cutover step (one canary at a time).
+        ("POST", "/admin/routing/rebuild"): lambda: rebuild_routing(
+            event.get("body")
+        ),
+        ("POST", "/admin/routing/purge-per-tenant"): lambda: purge_per_tenant_routing(
+            event.get("body")
         ),
         # 1.4.0 (#62) — per-tenant / per-group skill scoping
         ("GET", "/groups"): list_groups,
@@ -1646,6 +1657,194 @@ def trigger_failover(az, body=None):
                        "message": "health-check sweep invoked; poll tenants for recovery"})
 
 
+# Tenant states that must have a route. Mirrors host-agent._ROUTABLE_STATUSES:
+# a tenant mid-failover still serves traffic, so it still needs a rule.
+_ROUTE_REBUILD_STATUSES = ("running", "failover_queued", "failover_recovering")
+
+
+def rebuild_routing(body=None):
+    """Rebuild per-tenant ALB rules for every routable tenant (T3-1 rollback).
+
+    Why this exists
+    ---------------
+    The host-tg cutover was a ONE-WAY DOOR. `_add_alb_rule` is only reachable
+    from create_tenant / process_pending, so nothing re-created rules for
+    tenants that already existed; and `_ensure_host_tg` returns early under
+    host-tg, so hosts registered during host-tg operation have no
+    `oc-<last8>` target group to point a rule at. Flipping `routing.mode` back
+    therefore restored the Lambda env var but NOT the ALB rule set, leaving the
+    listener on its default action — a 404 for every tenant. This endpoint is
+    what makes the flip reversible, and therefore what makes it safe to attempt.
+
+    Idempotent: `_ensure_host_tg` reuses an existing target group and
+    `_add_alb_rule` re-checks for the tenant's rule on every attempt, so
+    running this twice is a no-op on the second pass.
+
+    `dry_run` (default TRUE) reports what would change without calling ELB.
+    Defaulting to a dry run is deliberate: this is a fleet-wide mutation of the
+    live data plane, and the ALB rule quota makes a partial application
+    ambiguous — an operator should always see the plan first.
+    """
+    body = json.loads(body) if isinstance(body, str) else (body or {})
+    dry_run = body.get("dry_run", True)
+    if not isinstance(dry_run, bool):
+        return _resp(400, {"error": "dry_run must be a boolean"})
+    mode = (body.get("mode") or "per-tenant").strip()
+    if mode != "per-tenant":
+        # host-tg needs no rebuild — its catch-all is static in the template.
+        return _resp(400, {
+            "error": f"unsupported mode {mode!r}; only 'per-tenant' can be "
+                     "rebuilt (host-tg routing is a static template rule)"})
+
+    listener = _get_listener_arn()
+    if not listener:
+        return _resp(501, {"error": "ALB listener not configured "
+                                    "(ALB_LISTENER_ARN unset)"})
+
+    tenants = _scan_all(
+        tenants_table,
+        FilterExpression="#s IN (:r, :q, :c)",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={
+            ":r": "running", ":q": "failover_queued", ":c": "failover_recovering"},
+    )
+    # Rules already present — so a rebuild reports "existing" rather than
+    # claiming credit for work it did not do.
+    try:
+        existing_rules = elbv2.describe_rules(ListenerArn=listener)["Rules"]
+    except ClientError as e:
+        return _resp(502, {"error": f"describe_rules failed: {e}"})
+    have = {
+        v.split("/vm/", 1)[1].split("/", 1)[0]
+        for r in existing_rules for c in r.get("Conditions", [])
+        for v in c.get("Values", []) if "/vm/" in v
+    }
+    # AWS default quota is 100 rules per ALB; 1-499 is only the code's range.
+    used_priorities = len([r for r in existing_rules if r["Priority"] != "default"])
+
+    hosts_seen = {}
+    results = []
+    for t in tenants:
+        tid, host_id = t.get("id"), t.get("host_id")
+        if not tid:
+            continue
+        if tid in have:
+            results.append({"tenant_id": tid, "action": "existing"})
+            continue
+        if not host_id:
+            results.append({"tenant_id": tid, "action": "skipped",
+                            "reason": "no host_id"})
+            continue
+        if dry_run:
+            results.append({"tenant_id": tid, "action": "would_create",
+                            "host_id": host_id})
+            continue
+        try:
+            if host_id not in hosts_seen:
+                host = hosts_table.get_item(
+                    Key={"instance_id": host_id}).get("Item") or {}
+                ip = host.get("private_ip")
+                if not ip:
+                    hosts_seen[host_id] = None
+                else:
+                    hosts_seen[host_id] = _ensure_host_tg(host_id, ip, force=True)
+            tg_arn = hosts_seen[host_id]
+            if not tg_arn:
+                results.append({"tenant_id": tid, "action": "failed",
+                                "reason": f"host {host_id} has no private_ip"})
+                continue
+            _add_alb_rule(tid, tg_arn, force=True)
+            results.append({"tenant_id": tid, "action": "created",
+                            "host_id": host_id})
+        except Exception as e:
+            # Keep going: a per-tenant failure must not abort the rebuild, or a
+            # single bad row leaves the fleet half-routed with no report.
+            results.append({"tenant_id": tid, "action": "failed",
+                            "reason": str(e)})
+
+    counts = {}
+    for r in results:
+        counts[r["action"]] = counts.get(r["action"], 0) + 1
+    if not dry_run:
+        _audit_system("routing.rebuilt", "routing:per-tenant", "per-tenant",
+                      actor="api")
+    return _resp(200, {
+        "mode": mode,
+        "dry_run": dry_run,
+        "routing_mode_env": ROUTING_MODE,
+        "tenants_considered": len(tenants),
+        "existing_listener_rules": used_priorities,
+        "counts": counts,
+        "results": results,
+    })
+
+
+def purge_per_tenant_routing(body=None):
+    """Delete per-tenant `/vm/<tid>` listener rules (host-tg cutover step).
+
+    The recommended cutover is NOT a flag flip: it is deleting these rules a
+    few at a time, because each deletion moves exactly those tenants onto the
+    shared catch-all and is independently reversible via rebuild_routing.
+
+    `tenant_ids` restricts the purge to specific tenants — that is what makes a
+    single-tenant canary possible. Omit it to purge everything.
+    """
+    body = json.loads(body) if isinstance(body, str) else (body or {})
+    dry_run = body.get("dry_run", True)
+    if not isinstance(dry_run, bool):
+        return _resp(400, {"error": "dry_run must be a boolean"})
+    only = body.get("tenant_ids")
+    if only is not None and not isinstance(only, list):
+        return _resp(400, {"error": "tenant_ids must be a list of tenant ids"})
+    only = set(only) if only else None
+
+    listener = _get_listener_arn()
+    if not listener:
+        return _resp(501, {"error": "ALB listener not configured "
+                                    "(ALB_LISTENER_ARN unset)"})
+    try:
+        rules = elbv2.describe_rules(ListenerArn=listener)["Rules"]
+    except ClientError as e:
+        return _resp(502, {"error": f"describe_rules failed: {e}"})
+
+    results = []
+    for r in rules:
+        if r["Priority"] == "default":
+            continue
+        tids = {v.split("/vm/", 1)[1].split("/", 1)[0]
+                for c in r.get("Conditions", []) for v in c.get("Values", [])
+                if "/vm/" in v and v != "/vm/*"}
+        if not tids:
+            continue  # the static catch-all (/vm/*) — never touch it
+        if only is not None and not (tids & only):
+            continue
+        tid = sorted(tids)[0]
+        if dry_run:
+            results.append({"tenant_id": tid, "priority": r["Priority"],
+                            "action": "would_delete"})
+            continue
+        try:
+            elbv2.delete_rule(RuleArn=r["RuleArn"])
+            results.append({"tenant_id": tid, "priority": r["Priority"],
+                            "action": "deleted"})
+        except Exception as e:
+            results.append({"tenant_id": tid, "priority": r["Priority"],
+                            "action": "failed", "reason": str(e)})
+
+    counts = {}
+    for r in results:
+        counts[r["action"]] = counts.get(r["action"], 0) + 1
+    if not dry_run and counts.get("deleted"):
+        _audit_system("routing.per_tenant_purged", "routing:per-tenant",
+                      f"{counts['deleted']} rules", actor="api")
+    return _resp(200, {
+        "dry_run": dry_run,
+        "routing_mode_env": ROUTING_MODE,
+        "counts": counts,
+        "results": results,
+    })
+
+
 def cleanup_terminated_host(event):
     """Called by termination lifecycle hook — cleanup DynamoDB then complete hook."""
     detail = event["detail"]
@@ -2189,9 +2388,16 @@ def _get_listener_arn():
     return ALB_LISTENER_ARN
 
 
-def _ensure_host_tg(instance_id, private_ip):
-    """Create or return target group ARN for a host."""
-    if ROUTING_MODE == "host-tg":
+def _ensure_host_tg(instance_id, private_ip, force=False):
+    """Create or return target group ARN for a host.
+
+    `force=True` bypasses the host-tg gate. Only the routing-rebuild admin
+    endpoint sets it: under host-tg this function returns early, so hosts
+    registered during host-tg operation never got an `oc-<last8>` target group
+    at all — which is precisely why falling back to per-tenant used to be
+    impossible (there was nothing left to point a listener rule at).
+    """
+    if ROUTING_MODE == "host-tg" and not force:
         return ""  # host-tg mode: no per-host TG; the shared CDK TG serves all
     tg_name = f"oc-{instance_id[-8:]}"
     try:
@@ -2209,7 +2415,7 @@ def _ensure_host_tg(instance_id, private_ip):
     return tg_arn
 
 
-def _add_alb_rule(tenant_id, tg_arn, max_attempts=6):
+def _add_alb_rule(tenant_id, tg_arn, max_attempts=6, force=False):
     """Add ALB listener rule for /vm/{tenant_id}*.
 
     Issue #77: the old code read the in-use priorities once, took the lowest
@@ -2220,8 +2426,12 @@ def _add_alb_rule(tenant_id, tg_arn, max_attempts=6):
     RANDOM free priority (so racers rarely collide), and retries on
     PriorityInUseException. A random slot plus a re-read on collision makes the
     race practically disappear instead of guaranteeing it.
+
+    `force=True` bypasses the host-tg gate — see _ensure_host_tg. Reserved for
+    the routing-rebuild admin endpoint, which exists so the host-tg cutover is
+    reversible.
     """
-    if ROUTING_MODE == "host-tg":
+    if ROUTING_MODE == "host-tg" and not force:
         return  # host-tg mode: the static /vm/* catch-all rule routes all tenants
     arn = _get_listener_arn()
     if not arn:

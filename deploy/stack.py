@@ -782,6 +782,20 @@ class OpenClawOrchestratorStack(cdk.Stack):
         audit_log_resource = api.root.add_resource("audit-log")
         audit_log_resource.add_method("GET", _li(), **key_required)
 
+        # /admin/routing/{rebuild,purge-per-tenant} — T3-1 P3 cutover controls.
+        # rebuild re-creates per-tenant listener rules for existing tenants,
+        # which is the ONLY way back from host-tg routing (nothing else
+        # re-creates them, and under host-tg new hosts get no target group at
+        # all). purge deletes those rules a canary at a time, which is the
+        # recommended cutover instead of an atomic flag flip. Both are
+        # admin-only and default to a dry run.
+        admin_resource = api.root.add_resource("admin")
+        admin_routing_resource = admin_resource.add_resource("routing")
+        admin_routing_resource.add_resource("rebuild").add_method(
+            "POST", _li(), **key_required)
+        admin_routing_resource.add_resource("purge-per-tenant").add_method(
+            "POST", _li(), **key_required)
+
         self.key_required = key_required
         self._li = _li
 
@@ -1804,6 +1818,17 @@ class OpenClawOrchestratorStack(cdk.Stack):
         _routing_mode = CFG.get("routing", {}).get("mode", "per-tenant")
         for _fn in (api_fn, health_fn, failover_worker_fn):
             _fn.add_environment("ROUTING_MODE", _routing_mode)
+        # T3-1: how many CONSECUTIVE public-path probes must succeed before a
+        # migration/failover is declared converged. Under host-tg the /vm/*
+        # catch-all round-robins across all in-service hosts, so a single
+        # sample only proves 1/N of the fleet can serve the tenant — the gate
+        # would flip DDB to `running` for a tenant that 404s for most users.
+        # per-tenant pins traffic to one target group, so 1 stays conclusive
+        # there and the legacy path keeps its current latency.
+        _verify_ok = (CFG.get("routing", {}) or {}).get(
+            "verify_consecutive_ok", 3 if _routing_mode == "host-tg" else 1)
+        for _fn in (health_fn, failover_worker_fn):
+            _fn.add_environment("VERIFY_CONSECUTIVE_OK", str(int(_verify_ok)))
         # T2-5: Describe* stays * (no resource-level support); the create/delete/
         # modify/register actions scope to this account+region's ELB ARN space.
         api_fn.add_to_role_policy(iam.PolicyStatement(

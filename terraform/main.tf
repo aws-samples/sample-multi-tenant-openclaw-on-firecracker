@@ -50,10 +50,14 @@ locals {
     VM_SUBNET_PREFIX   = "172.16"
     HOST_RESERVED_VCPU = "1"
     HOST_RESERVED_MEM  = "2048"
-    # T3-1: tenant routing model. per-tenant (default) = one ALB rule/tenant
-    # (~499 cap); host-tg = shared TG + nginx peer-map (no cap). Keep per-tenant
-    # on the TF path unless the host-tg data plane (shared TG + :8081) is also
-    # provisioned here (it is CDK-only today — see the host-tg blueprint).
+    # T3-1: tenant routing model. per-tenant (default) = one ALB listener rule
+    # per tenant, capped by the ALB rules-per-load-balancer QUOTA (default 100 —
+    # not the 1-499 priority window the code allocates from). host-tg = one
+    # shared TG + /vm/* catch-all + nginx peer-map, so tenants cost no ALB
+    # resource and the ceiling becomes hosts x VMs-per-host.
+    # Keep per-tenant on the TF path unless the host-tg data plane (shared TG +
+    # :8081 peer server) is also provisioned here — it is CDK-only today.
+    # GET /admin/routing/status reports the live headroom either way.
     ROUTING_MODE = "per-tenant"
     # Feature flags — default off, parity with config.yml.example.
     QUOTAS_ENABLED          = "false"
@@ -284,6 +288,15 @@ resource "aws_lambda_function" "api" {
       # must agree on placement behaviour or the two deployments diverge.
       HOST_PICK_TOP_K       = tostring(var.host_pick_top_k)
       HOST_RESERVE_ATTEMPTS = tostring(var.host_reserve_attempts)
+      # T3-1: per-tenant listener-rule priority window. The floor keeps low
+      # priorities reserved for static rules (a tenant holding priority 1 fails
+      # a later deploy with PriorityInUseException). The ceiling is NOT the real
+      # cap — ALB_RULES_QUOTA is, and it is what /admin/routing/status reports
+      # as remaining headroom. Raise ALB_RULES_QUOTA only after AWS grants the
+      # increase, or the endpoint will over-report capacity.
+      PER_TENANT_PRIORITY_MIN = tostring(var.per_tenant_priority_min)
+      PER_TENANT_PRIORITY_MAX = tostring(var.per_tenant_priority_max)
+      ALB_RULES_QUOTA         = tostring(var.alb_rules_quota)
     }, var.api_env_overrides)
   }
 }

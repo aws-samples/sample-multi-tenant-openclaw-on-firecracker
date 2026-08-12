@@ -91,6 +91,10 @@ ROUTING_MODE = os.environ.get("ROUTING_MODE", "per-tenant")
 # _verify_dashboard_reachable_via_alb.
 VERIFY_CONSECUTIVE_OK = int(os.environ.get(
     "VERIFY_CONSECUTIVE_OK", "3" if ROUTING_MODE == "host-tg" else "1"))
+# Per-tenant listener-rule priority window — must match the api Lambda's, or
+# failover could create a rule the api scheduler treats as out of range.
+PER_TENANT_PRIORITY_MIN = int(os.environ.get("PER_TENANT_PRIORITY_MIN", "10"))
+PER_TENANT_PRIORITY_MAX = int(os.environ.get("PER_TENANT_PRIORITY_MAX", "499"))
 # T3-3: the VPC to create a host target group in during failover. The API
 # Lambda always used its VPC_ID env; health_check used to clone VpcId from an
 # arbitrary existing target group (existing[0]), which breaks when none exist
@@ -1622,9 +1626,21 @@ def _repoint_alb_rule(tenant_id, target_host_id, target_private_ip):
                    for r in live for c in r.get("Conditions", []) for v in c.get("Values", [])):
                 break  # another actor created it meanwhile
             used = {int(r["Priority"]) for r in live if r["Priority"] != "default"}
-            free = sorted(set(range(1, 500)) - used)
+            # Same window (and same reasoning) as the api Lambda: the floor
+            # keeps low priorities reserved for static template rules, and the
+            # ceiling is NOT the real cap — the AWS default quota is 100 rules
+            # per ALB. Kept in sync deliberately; a divergence here would let
+            # failover create a rule the api Lambda considers illegal.
+            free = sorted(set(range(PER_TENANT_PRIORITY_MIN,
+                                    PER_TENANT_PRIORITY_MAX + 1)) - used)
             if not free:
-                raise RuntimeError("no free ALB listener rule priority (1-499 exhausted)")
+                raise RuntimeError(
+                    f"no free ALB listener rule priority "
+                    f"({PER_TENANT_PRIORITY_MIN}-{PER_TENANT_PRIORITY_MAX} "
+                    f"exhausted, {len(used)} in use). Per-tenant routing is "
+                    f"capped by the ALB rules-per-load-balancer quota "
+                    f"(default 100); host-tg uses one shared rule for all "
+                    f"tenants. See docs/RUNBOOK.md §2.1.")
             try:
                 elbv2.create_rule(
                     ListenerArn=ALB_LISTENER_ARN, Priority=random.choice(free),

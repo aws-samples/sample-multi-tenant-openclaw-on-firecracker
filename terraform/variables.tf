@@ -49,6 +49,24 @@ variable "host_pick_top_k" {
   default     = 8
 }
 
+variable "per_tenant_priority_min" {
+  description = "Lowest ALB listener-rule priority a per-tenant rule may take. Must stay above any static rule's priority — a tenant holding priority 1 makes a later deploy fail with PriorityInUseException."
+  type        = number
+  default     = 10
+}
+
+variable "per_tenant_priority_max" {
+  description = "Highest per-tenant listener-rule priority. Not the real ceiling — see alb_rules_quota."
+  type        = number
+  default     = 499
+}
+
+variable "alb_rules_quota" {
+  description = "AWS 'Rules per Application Load Balancer' quota (default 100). This — not the priority window — is what caps per-tenant routing; GET /admin/routing/status reports headroom against it. Only raise after AWS grants an increase."
+  type        = number
+  default     = 100
+}
+
 variable "host_reserve_attempts" {
   description = "Slot-reservation attempts (each on a different host) before queueing the tenant as pending and scaling out."
   type        = number

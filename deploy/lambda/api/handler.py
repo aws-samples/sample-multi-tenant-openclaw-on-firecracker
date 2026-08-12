@@ -233,6 +233,9 @@ _VIEWER_OK = {
     ("GET", "/hosts/rootfs-version"), ("GET", "/agentcore/status"),
     ("GET", "/agentcore/tools"), ("GET", "/system/info"),
     ("GET", "/audit-log"),
+    # T3-1: routing headroom is read-only and is what an operator checks before
+    # a cutover — gating it behind `operator` would just make people skip it.
+    ("GET", "/admin/routing/status"),
     # 1.4.0 (#62) — listing groups is read-only.
     ("GET", "/groups"),
     # 1.4.1 (#63) — read individual SKILL.md content (editor / viewer)
@@ -661,6 +664,7 @@ def lambda_handler(event, context):
         ),
         # T3-1 P3: routing cutover / rollback. rebuild makes the host-tg flip
         # reversible; purge is the per-tenant cutover step (one canary at a time).
+        ("GET", "/admin/routing/status"): routing_status,
         ("POST", "/admin/routing/rebuild"): lambda: rebuild_routing(
             event.get("body")
         ),
@@ -1779,6 +1783,70 @@ def rebuild_routing(body=None):
     })
 
 
+def routing_status():
+    """Report the routing model and how much headroom it has left.
+
+    "Can this deployment take another N tenants?" was previously unanswerable
+    without reading code: the visible number was `range(1, 500)`, but the
+    binding constraint is the ALB *quota* for rules per load balancer (default
+    100) — so per-tenant routing hits a wall roughly 5x sooner than the code
+    implies, and the failure surfaces as a create returning 500.
+
+    Also the preflight for the host-tg cutover: it reports how many per-tenant
+    rules still exist, which is exactly the number that must reach zero, and
+    whether the per-tenant fallback is still reachable (once tenant count
+    exceeds the quota, rolling back needs an AWS quota increase first).
+    """
+    listener = _get_listener_arn()
+    out = {
+        "mode": ROUTING_MODE,
+        "per_tenant_priority_window": [PER_TENANT_PRIORITY_MIN,
+                                       PER_TENANT_PRIORITY_MAX],
+    }
+    if not listener:
+        out["error"] = "ALB listener not configured (ALB_LISTENER_ARN unset)"
+        return _resp(200, out)
+    try:
+        rules = elbv2.describe_rules(ListenerArn=listener)["Rules"]
+    except ClientError as e:
+        return _resp(502, {"error": f"describe_rules failed: {e}"})
+
+    non_default = [r for r in rules if r["Priority"] != "default"]
+    per_tenant, static = [], []
+    for r in non_default:
+        vals = [v for c in r.get("Conditions", []) for v in c.get("Values", [])]
+        (static if any(v == "/vm/*" for v in vals) or not any(
+            "/vm/" in v for v in vals) else per_tenant).append(r)
+
+    quota = int(os.environ.get("ALB_RULES_QUOTA", "100"))
+    out.update({
+        "listener_rules_total": len(non_default),
+        "per_tenant_rules": len(per_tenant),
+        "static_rules": len(static),
+        "alb_rules_quota": quota,
+        "quota_headroom": max(0, quota - len(non_default)),
+        "has_shared_catch_all": any(
+            v == "/vm/*" for r in static for c in r.get("Conditions", [])
+            for v in c.get("Values", [])),
+    })
+    if ROUTING_MODE == "host-tg":
+        # The tenant ceiling under host-tg is host capacity, not an ALB limit.
+        out["tenant_ceiling"] = "hosts x vms_per_host (no ALB rule per tenant)"
+        out["cutover_complete"] = len(per_tenant) == 0
+        if per_tenant:
+            out["note"] = (
+                f"{len(per_tenant)} legacy per-tenant rule(s) remain and still "
+                f"win over the catch-all (lower priority matches first). Purge "
+                f"them with POST /admin/routing/purge-per-tenant.")
+    else:
+        out["tenant_ceiling"] = out["quota_headroom"]
+        out["note"] = (
+            "per-tenant routing consumes one ALB listener rule per tenant; the "
+            "ALB rules quota is the real ceiling, not the priority window. "
+            "Switch routing.mode to host-tg to remove it.")
+    return _resp(200, out)
+
+
 def purge_per_tenant_routing(body=None):
     """Delete per-tenant `/vm/<tid>` listener rules (host-tg cutover step).
 
@@ -2233,6 +2301,19 @@ def _find_host(vcpu_needed, mem_needed):
     return candidates[0][3]
 
 
+# Priority window for PER-TENANT listener rules (legacy routing only; host-tg
+# creates no per-tenant rule at all, so this window is unused there).
+#
+# The floor is 10, not 1: static template rules must have somewhere to live that
+# a tenant can never occupy. With the old range(1, 500) a live tenant could hold
+# priority 1, which (a) makes `cdk deploy` fail with PriorityInUseException if a
+# static rule ever wants that slot, and (b) means a tenant rule can shadow a
+# static one. The ceiling is NOT the real cap — the AWS default quota is 100
+# rules per ALB, so per-tenant routing runs out roughly 5x sooner than this
+# window implies. That is why host-tg exists.
+PER_TENANT_PRIORITY_MIN = int(os.environ.get("PER_TENANT_PRIORITY_MIN", "10"))
+PER_TENANT_PRIORITY_MAX = int(os.environ.get("PER_TENANT_PRIORITY_MAX", "499"))
+
 # How many of the least-loaded fitting hosts a create may choose between.
 # 1 reproduces the old deterministic behaviour (and the old herding).
 HOST_PICK_TOP_K = int(os.environ.get("HOST_PICK_TOP_K", "8"))
@@ -2444,9 +2525,28 @@ def _add_alb_rule(tenant_id, tg_arn, max_attempts=6, force=False):
                for r in rules for c in r.get("Conditions", []) for v in c.get("Values", [])):
             return
         used = {int(r["Priority"]) for r in rules if r["Priority"] != "default"}
-        free = sorted(set(range(1, 500)) - used)
+        # Start above PER_TENANT_PRIORITY_MIN so the low priorities stay
+        # reserved for STATIC rules (the /vm/* catch-all lives at 999 today, but
+        # a future static rule at a low priority must not be stealable by a
+        # tenant — a tenant holding priority 1 also makes `cdk deploy` fail with
+        # PriorityInUseException if a template rule ever wants it).
+        free = sorted(set(range(PER_TENANT_PRIORITY_MIN,
+                               PER_TENANT_PRIORITY_MAX + 1)) - used)
         if not free:
-            raise RuntimeError("no free ALB listener rule priority (1-499 exhausted)")
+            # Name the REAL constraint. The 1-499 window was never the binding
+            # limit: the AWS *default* quota is 100 rules per ALB, so
+            # per-tenant routing runs out ~5x sooner than this range suggests.
+            # host-tg routing has no per-tenant ALB resource at all and is the
+            # actual answer to "more tenants", so say so here — this exception
+            # is the one place an operator is guaranteed to be looking.
+            raise RuntimeError(
+                f"no free ALB listener rule priority "
+                f"({PER_TENANT_PRIORITY_MIN}-{PER_TENANT_PRIORITY_MAX} "
+                f"exhausted, {len(used)} rules in use). Per-tenant routing is "
+                f"capped by the ALB 'Rules per Application Load Balancer' "
+                f"quota (default 100). Switch routing.mode to host-tg — it "
+                f"uses ONE shared rule for every tenant. See docs/RUNBOOK.md "
+                f"§2.1 for the cutover procedure.")
         priority = random.choice(free)
         try:
             elbv2.create_rule(

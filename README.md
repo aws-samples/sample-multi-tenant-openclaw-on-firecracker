@@ -505,6 +505,21 @@ All requests require the `x-api-key` header.
 | `GET` · `PUT` · `DELETE` | `/templates/{name}` | CRUD for config templates (`default` is read-only). |
 | `GET` | `/system/info` | Feature flags + config snapshot (region, version, multi_az, metrics, …). |
 
+### Routing capacity & cutover (T3-1)
+
+Per-tenant routing spends one ALB listener rule per tenant, so its ceiling is the
+**"Rules per Application Load Balancer" quota — default 100**, not the `1-499`
+priority window the code allocates from. `routing.mode: host-tg` removes the
+ceiling entirely: one static `/vm/*` rule serves every tenant and each host's
+nginx peer-map resolves tenant → owning host, so the tenant limit becomes
+hosts × VMs-per-host. Cutover procedure and gate conditions: **[`docs/RUNBOOK.md` §2.1](docs/RUNBOOK.md)**.
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/admin/routing/status` | Current mode, per-tenant vs static rule counts, quota headroom, and the effective tenant ceiling. Under `host-tg` also reports `cutover_complete` (legacy rules still win over the catch-all until purged). Read-only — `viewer` role. |
+| `POST` | `/admin/routing/rebuild` | Re-create per-tenant listener rules + missing per-host target groups for every routable tenant. **This is the rollback path from `host-tg`** — nothing else re-creates them. Idempotent; **`dry_run` defaults to `true`**. `admin` role. |
+| `POST` | `/admin/routing/purge-per-tenant` | Delete `/vm/<tenant>` rules (never the `/vm/*` catch-all). Scope with `{"tenant_ids": [...]}` to move one tenant onto the shared path as a canary — the recommended cutover, since each step is independently reversible via `rebuild`. **`dry_run` defaults to `true`**. `admin` role. |
+
 ---
 
 ## 🌐 Advanced Topics

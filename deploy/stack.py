@@ -791,6 +791,8 @@ class OpenClawOrchestratorStack(cdk.Stack):
         # admin-only and default to a dry run.
         admin_resource = api.root.add_resource("admin")
         admin_routing_resource = admin_resource.add_resource("routing")
+        admin_routing_resource.add_resource("status").add_method(
+            "GET", _li(), **key_required)
         admin_routing_resource.add_resource("rebuild").add_method(
             "POST", _li(), **key_required)
         admin_routing_resource.add_resource("purge-per-tenant").add_method(

@@ -1,6 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
+import os
 import platform as _platform
 from pathlib import Path
 
@@ -89,7 +90,24 @@ from aws_cdk import (
 )
 from constructs import Construct
 
-CFG = yaml.safe_load((Path(__file__).parent.parent / "config.yml").read_text())
+
+def _config_path():
+    """Resolve the config file to synth from.
+
+    `OPENCLAW_CONFIG` overrides the default `<repo>/config.yml`. Tests use it to
+    synth against a throwaway config WITHOUT mutating the developer's real
+    config.yml — the old approach (write config.yml → synth → restore in
+    `finally`) corrupted the file whenever two pytest processes overlapped, and
+    silently made a dev's feature-enabled config the CI baseline. It is also
+    useful in production for deploying a variant config without copying files.
+    """
+    override = os.environ.get("OPENCLAW_CONFIG")
+    if override:
+        return Path(override)
+    return Path(__file__).parent.parent / "config.yml"
+
+
+CFG = yaml.safe_load(_config_path().read_text())
 
 
 def _normalize_config(cfg):
@@ -1362,6 +1380,8 @@ class OpenClawOrchestratorStack(cdk.Stack):
         init_sh = init_sh.replace("{{AVAIL_VCPU}}", str(_avail_vcpu))
         init_sh = init_sh.replace("{{AVAIL_MEM}}", str(_avail_mem))
         init_sh = init_sh.replace("{{SUBNET_PREFIX}}", CFG["vm"]["subnet_prefix"])
+        # launch-vm.sh denies guest→VPC east-west with this (see init-host.sh).
+        init_sh = init_sh.replace("{{VPC_CIDR}}", vpc.vpc_cidr_block)
         init_sh = init_sh.replace("{{ROOTFS_OVERLAY_MB}}", str(CFG["vm"].get("rootfs_overlay_mb", 8192)))
         init_sh = init_sh.replace("{{AGENTCORE_GATEWAY_URL}}", gateway_url if gateway_url else "none")
         init_sh = init_sh.replace("{{AMP_REMOTE_WRITE_URL}}", amp_remote_write_url)
@@ -1729,7 +1749,16 @@ class OpenClawOrchestratorStack(cdk.Stack):
             protocol=elbv2.ApplicationProtocol.HTTP,
             target_type=elbv2.TargetType.INSTANCE,
             health_check=elbv2.HealthCheck(
-                path="/health",
+                # /ready, NOT /health. /health is a constant 200 from the moment
+                # nginx starts, i.e. before the rootfs download and before
+                # host-agent's first peer-map sync — a brand-new host would be
+                # declared healthy and then 404 its whole 1/N share of /vm/*
+                # traffic, making every ASG scale-out a partial outage. /ready
+                # is backed by a file host-agent writes only after a peer-map
+                # generation is applied (see init-host.sh + _mark_ready).
+                # The per-tenant target groups keep using /health, so the
+                # legacy routing path is untouched.
+                path="/ready",
                 interval=Duration.seconds(10),
                 healthy_threshold_count=2,
             ),

@@ -24,6 +24,7 @@ by an e2e test that runs only when .env.deploy is present.
 """
 
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -31,6 +32,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from conftest import synth_stack
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -46,31 +48,11 @@ def _synth_template(metrics_enabled=True):
     We can't `import deploy.stack` directly because it expects to be loaded
     by `cdk synth`; mirror the pattern in tests/test_stack.py.
     """
-    import aws_cdk as cdk
-
-    # Toggle metrics in config without mutating the file on disk.
-    import yaml
-    from aws_cdk import assertions
-    cfg_path = ROOT / "config.yml"
-    original = cfg_path.read_text()
-    cfg = yaml.safe_load(original)
-    cfg.setdefault("metrics", {})["enabled"] = metrics_enabled
-    cfg_path.write_text(yaml.safe_dump(cfg))
-    try:
-        # Reimport stack module so it picks up the mutated config
-        sys.modules.pop("deploy.stack", None)
-        sys.modules.pop("deploy", None)
-        spec = importlib.util.spec_from_file_location(
-            "deploy.stack", ROOT / "deploy" / "stack.py")
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules["deploy.stack"] = mod
-        spec.loader.exec_module(mod)
-        app = cdk.App()
-        stack = mod.OpenClawOrchestratorStack(app, "Test",
-            env=cdk.Environment(account="123456789012", region="ap-northeast-1"))
-        return assertions.Template.from_stack(stack)
-    finally:
-        cfg_path.write_text(original)
+    # Toggles metrics.enabled genuinely without mutating the file on disk —
+    # the config is handed to stack.py via OPENCLAW_CONFIG (conftest.synth_stack).
+    return synth_stack(
+        lambda cfg: cfg.setdefault("metrics", {}).update(
+            {"enabled": metrics_enabled}))
 
 
 @pytest.mark.unit
@@ -231,18 +213,68 @@ class TestPromExporter:
         assert "metrics" not in recovering["t2"]
 
 
+def _get(path, status=None):
+    """Drive Handler.do_GET for `path` and return (status, headers, body).
+
+    Builds the handler without going through BaseHTTPRequestHandler.__init__
+    (which would try to read a real socket) and captures the response the same
+    way the real server would write it.
+
+    This used to assert `"/metrics" in inspect.getsource(do_GET)`, which
+    checked nothing about the response and broke whenever host-agent.py was
+    edited while the suite was running (getsource re-reads the file by line
+    number, so any shift above the class made it return the wrong lines).
+    """
+    h = agent.Handler.__new__(agent.Handler)
+    h.path = path
+    h.wfile = io.BytesIO()
+    captured = {"status": None, "headers": {}}
+
+    h.send_response = lambda code, *a: captured.__setitem__("status", code)
+    h.send_header = lambda k, v: captured["headers"].__setitem__(k, v)
+    h.end_headers = lambda: None
+    h.log_message = lambda *a, **k: None
+
+    h.do_GET()
+    return captured["status"], captured["headers"], h.wfile.getvalue()
+
+
 @pytest.mark.unit
 class TestPromHTTP:
-    def test_metrics_endpoint_returns_200(self):
-        """The HTTP handler responds 200 + text/plain for GET /metrics."""
-        # Simulate a request: build a minimal Handler and check do_GET routes
-        # to the metrics path.
-        handler_cls = agent.Handler
-        # The Handler class has do_GET that routes paths; assert the routing
-        # logic recognises /metrics by inspecting source.
-        import inspect
-        src = inspect.getsource(handler_cls.do_GET)
-        assert "/metrics" in src, "Handler must route /metrics"
+    def test_metrics_endpoint_returns_200_text_plain(self):
+        """GET /metrics → 200 with the Prometheus text-format content type."""
+        status, headers, body = _get("/metrics")
+        assert status == 200
+        assert headers["Content-Type"] == "text/plain; version=0.0.4"
+        assert headers["Content-Length"] == str(len(body))
+
+    def test_metrics_body_is_prometheus_exposition(self):
+        with agent._lock:
+            agent._status.clear()
+            agent._status["t1"] = {"vm_health": "up", "metrics": {
+                "memory_used_mb": 2048, "memory_balloon_mib": 0,
+                "disk_used_mb": 100, "disk_total_mb": 8192,
+                "disk_used_pct": 1, "cpu_pct": 5,
+            }}
+        try:
+            _, _, body = _get("/metrics")
+        finally:
+            with agent._lock:
+                agent._status.clear()
+        text = body.decode()
+        assert "# TYPE openclaw_vm_memory_used_mb gauge" in text
+        assert 'openclaw_vm_memory_used_mb{tenant="t1"} 2048' in text
+
+    def test_health_endpoint_returns_json(self):
+        status, headers, body = _get("/health")
+        assert status == 200
+        assert headers["Content-Type"] == "application/json"
+        json.loads(body)  # must be parseable
+
+    def test_unknown_path_returns_404(self):
+        status, _, body = _get("/nope")
+        assert status == 404
+        assert body == b""
 
 
 # ═══════════════════════════════════════════

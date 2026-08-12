@@ -397,30 +397,11 @@ class TestRbacDisabled:
 class TestCDKCognitoGroups:
     def test_three_user_pool_groups_when_auth_enabled(self):
         """When console_auth.enabled: true, CDK creates admin/operator/viewer groups."""
-        import yaml
-        cfg_path = ROOT / "config.yml"
-        original = cfg_path.read_text()
-        cfg = yaml.safe_load(original)
-        cfg.setdefault("console_auth", {})["enabled"] = True
-        cfg_path.write_text(yaml.safe_dump(cfg))
-        try:
-            sys.modules.pop("deploy.stack", None)
-            sys.modules.pop("deploy", None)
-            spec = importlib.util.spec_from_file_location(
-                "deploy.stack", ROOT / "deploy" / "stack.py")
-            mod = importlib.util.module_from_spec(spec)
-            sys.modules["deploy.stack"] = mod
-            spec.loader.exec_module(mod)
-            import aws_cdk as cdk
-            from aws_cdk import assertions
-            app = cdk.App()
-            stack = mod.OpenClawOrchestratorStack(app, "Test",
-                env=cdk.Environment(account="123456789012", region="ap-northeast-1"))
-            tpl = assertions.Template.from_stack(stack)
-            tpl.resource_count_is("AWS::Cognito::UserPoolGroup", 3)
-            for group_name in ("admin", "operator", "viewer"):
-                tpl.has_resource_properties("AWS::Cognito::UserPoolGroup", {
-                    "GroupName": group_name,
-                })
-        finally:
-            cfg_path.write_text(original)
+        from conftest import synth_stack
+        tpl = synth_stack(
+            lambda cfg: cfg.setdefault("console_auth", {}).update({"enabled": True}))
+        tpl.resource_count_is("AWS::Cognito::UserPoolGroup", 3)
+        for group_name in ("admin", "operator", "viewer"):
+            tpl.has_resource_properties("AWS::Cognito::UserPoolGroup", {
+                "GroupName": group_name,
+            })

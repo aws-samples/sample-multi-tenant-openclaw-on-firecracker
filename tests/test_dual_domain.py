@@ -31,6 +31,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from conftest import synth_stack
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -50,42 +51,28 @@ CERT_LEGACY = _fake_arn("legacy-test")
 def _synth(console_domain="", console_cert="", app_domain="", app_cert="",
            legacy_domain="", legacy_cert="", console_auth_enabled=True,
            clear_existing_pool=True):
-    """Synthesize the CDK stack with a tweaked cloudfront config."""
-    import yaml
-    cfg_path = ROOT / "config.yml"
-    original = cfg_path.read_text()
-    cfg = yaml.safe_load(original)
-    cfg.setdefault("cloudfront", {})
-    cfg["cloudfront"]["console_domain"] = console_domain
-    cfg["cloudfront"]["console_cert_arn"] = console_cert
-    cfg["cloudfront"]["app_domain"] = app_domain
-    cfg["cloudfront"]["app_cert_arn"] = app_cert
-    cfg["cloudfront"]["custom_domain"] = legacy_domain
-    cfg["cloudfront"]["acm_cert_arn"] = legacy_cert
-    cfg.setdefault("console_auth", {})
-    cfg["console_auth"]["enabled"] = console_auth_enabled
-    if clear_existing_pool:
-        # Force the "new pool" code path so CallbackURLs flows through
-        # cognito.OAuthSettings.callback_urls (CDK L2) — that's the path
-        # most users hit on first deploy.
-        cfg["console_auth"]["user_pool_id"] = ""
-    cfg_path.write_text(yaml.safe_dump(cfg))
-    try:
-        sys.modules.pop("deploy.stack", None)
-        sys.modules.pop("deploy", None)
-        spec = importlib.util.spec_from_file_location(
-            "deploy.stack", ROOT / "deploy" / "stack.py")
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules["deploy.stack"] = mod
-        spec.loader.exec_module(mod)
-        import aws_cdk as cdk
-        from aws_cdk import assertions
-        app = cdk.App()
-        stack = mod.OpenClawOrchestratorStack(app, "Test",
-            env=cdk.Environment(account="123456789012", region="ap-northeast-1"))
-        return assertions.Template.from_stack(stack)
-    finally:
-        cfg_path.write_text(original)
+    """Synthesize the CDK stack with a tweaked cloudfront config.
+
+    Config is handed to stack.py via OPENCLAW_CONFIG (conftest.synth_stack) so
+    the repo's own config.yml is never written to.
+    """
+    def mutate(cfg):
+        cf = cfg.setdefault("cloudfront", {})
+        cf["console_domain"] = console_domain
+        cf["console_cert_arn"] = console_cert
+        cf["app_domain"] = app_domain
+        cf["app_cert_arn"] = app_cert
+        cf["custom_domain"] = legacy_domain
+        cf["acm_cert_arn"] = legacy_cert
+        auth = cfg.setdefault("console_auth", {})
+        auth["enabled"] = console_auth_enabled
+        if clear_existing_pool:
+            # Force the "new pool" code path so CallbackURLs flows through
+            # cognito.OAuthSettings.callback_urls (CDK L2) — that's the path
+            # most users hit on first deploy.
+            auth["user_pool_id"] = ""
+
+    return synth_stack(mutate)
 
 
 # ---------------------------------------------------------------------------

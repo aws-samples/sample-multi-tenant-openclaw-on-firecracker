@@ -22,34 +22,21 @@ import sys
 from pathlib import Path
 
 import pytest
+from conftest import synth_stack
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def _synth(arch="x86_64", instance_type=None):
-    import yaml
-    cfg_path = ROOT / "config.yml"
-    original = cfg_path.read_text()
-    cfg = yaml.safe_load(original)
-    cfg.setdefault("host", {})["arch"] = arch
-    if instance_type is not None:
-        cfg["host"]["instance_type"] = instance_type
-    cfg_path.write_text(yaml.safe_dump(cfg))
-    try:
-        sys.modules.pop("deploy.stack", None)
-        spec = importlib.util.spec_from_file_location(
-            "deploy.stack", ROOT / "deploy" / "stack.py")
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules["deploy.stack"] = mod
-        spec.loader.exec_module(mod)
-        import aws_cdk as cdk
-        from aws_cdk import assertions
-        app = cdk.App()
-        stack = mod.OpenClawOrchestratorStack(app, "Test",
-            env=cdk.Environment(account="123456789012", region="ap-northeast-1"))
-        return assertions.Template.from_stack(stack)
-    finally:
-        cfg_path.write_text(original)
+def _synth(arch="x86_64", instance_type=None, drop_instance_type=False):
+    """Synth with host.arch overridden. Never touches the repo's config.yml —
+    see conftest.synth_stack for why that mattered."""
+    def mutate(cfg):
+        cfg.setdefault("host", {})["arch"] = arch
+        if instance_type is not None:
+            cfg["host"]["instance_type"] = instance_type
+        if drop_instance_type:
+            cfg["host"].pop("instance_type", None)
+    return synth_stack(mutate)
 
 
 @pytest.mark.unit
@@ -64,69 +51,25 @@ class TestConfigSchema:
 @pytest.mark.unit
 class TestInstanceTypeDefaulting:
     def test_arm64_picks_graviton_family(self):
-        """arch=arm64 with no explicit instance_type → m8g.xlarge."""
-        # Pop the explicit instance_type to test defaulting
-        import yaml
-        cfg_path = ROOT / "config.yml"
-        original = cfg_path.read_text()
-        cfg = yaml.safe_load(original)
-        cfg.setdefault("host", {})["arch"] = "arm64"
-        cfg["host"].pop("instance_type", None)
-        cfg_path.write_text(yaml.safe_dump(cfg))
-        try:
-            sys.modules.pop("deploy.stack", None)
-            spec = importlib.util.spec_from_file_location(
-                "deploy.stack", ROOT / "deploy" / "stack.py")
-            mod = importlib.util.module_from_spec(spec)
-            sys.modules["deploy.stack"] = mod
-            spec.loader.exec_module(mod)
-            import aws_cdk as cdk
-            from aws_cdk import assertions
-            app = cdk.App()
-            stack = mod.OpenClawOrchestratorStack(app, "Test",
-                env=cdk.Environment(account="123456789012", region="ap-northeast-1"))
-            tpl = assertions.Template.from_stack(stack)
-            lts = tpl.find_resources("AWS::EC2::LaunchTemplate")
-            assert lts
-            for _, res in lts.items():
-                itype = res["Properties"]["LaunchTemplateData"].get("InstanceType", "")
-                assert "g." in itype, \
-                    f"arm64 should pick a Graviton (g) family, got {itype}"
-        finally:
-            cfg_path.write_text(original)
+        """arch=arm64 with no explicit instance_type → a Graviton (g) family."""
+        tpl = _synth(arch="arm64", drop_instance_type=True)
+        lts = tpl.find_resources("AWS::EC2::LaunchTemplate")
+        assert lts
+        for _, res in lts.items():
+            itype = res["Properties"]["LaunchTemplateData"].get("InstanceType", "")
+            assert "g." in itype, \
+                f"arm64 should pick a Graviton (g) family, got {itype}"
 
     def test_x86_keeps_intel_family(self):
         """arch=x86_64 default keeps an Intel/AMD family."""
-        # Reset to default
-        import yaml
-        cfg_path = ROOT / "config.yml"
-        original = cfg_path.read_text()
-        cfg = yaml.safe_load(original)
-        cfg.setdefault("host", {})["arch"] = "x86_64"
-        cfg["host"].pop("instance_type", None)
-        cfg_path.write_text(yaml.safe_dump(cfg))
-        try:
-            sys.modules.pop("deploy.stack", None)
-            spec = importlib.util.spec_from_file_location(
-                "deploy.stack", ROOT / "deploy" / "stack.py")
-            mod = importlib.util.module_from_spec(spec)
-            sys.modules["deploy.stack"] = mod
-            spec.loader.exec_module(mod)
-            import aws_cdk as cdk
-            from aws_cdk import assertions
-            app = cdk.App()
-            stack = mod.OpenClawOrchestratorStack(app, "Test",
-                env=cdk.Environment(account="123456789012", region="ap-northeast-1"))
-            tpl = assertions.Template.from_stack(stack)
-            lts = tpl.find_resources("AWS::EC2::LaunchTemplate")
-            assert lts
-            for _, res in lts.items():
-                itype = res["Properties"]["LaunchTemplateData"].get("InstanceType", "")
-                # Intel families: m8i / c8i / r8i / m6i / m7i etc.
-                assert ("i." in itype or "n." in itype or "a." in itype), \
-                    f"x86_64 should pick an Intel/AMD family, got {itype}"
-        finally:
-            cfg_path.write_text(original)
+        tpl = _synth(arch="x86_64", drop_instance_type=True)
+        lts = tpl.find_resources("AWS::EC2::LaunchTemplate")
+        assert lts
+        for _, res in lts.items():
+            itype = res["Properties"]["LaunchTemplateData"].get("InstanceType", "")
+            # Intel families: m8i / c8i / r8i / m6i / m7i etc.
+            assert ("i." in itype or "n." in itype or "a." in itype), \
+                f"x86_64 should pick an Intel/AMD family, got {itype}"
 
 
 @pytest.mark.unit

@@ -5,6 +5,8 @@
 
 import json
 import os
+import pathlib
+import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -130,6 +132,71 @@ _DEFAULTS = {
 }
 for k, v in _DEFAULTS.items():
     os.environ.setdefault(k, v)
+
+
+def synth_stack(mutate=None, *, base="config.yml.example", stack_id="Test",
+                account="123456789012", region="ap-northeast-1"):
+    """Synth the CDK stack against a THROWAWAY config and return its Template.
+
+    `mutate(cfg)` may edit the parsed config dict in place before synth.
+
+    Why this exists
+    ---------------
+    Five test modules used to do: read repo `config.yml` → overwrite it →
+    synth → restore in `finally`. Three problems that bit us for real:
+
+    1. Two overlapping pytest processes clobbered each other's config.yml —
+       reproduced as 24 spurious failures.
+    2. The base was the DEVELOPER's config.yml, so a locally-enabled feature
+       silently became the assertion baseline (a feature-enabled config once
+       baked 206 CFN resources and broke CI on the logical-ID snapshot).
+    3. A hard kill between write and restore left the repo config corrupted.
+
+    Passing the config via `OPENCLAW_CONFIG` (see deploy/stack._config_path)
+    touches no repo file, so the suite is safe to run concurrently, and
+    `_normalize_config` still runs over the injected config — which the
+    alternative of assigning `stack_mod.CFG` after import would skip, silently
+    disabling the routing.mode/overcommit guardrails under test.
+    """
+    import importlib.util
+    import tempfile
+
+    import yaml
+
+    repo_root = pathlib.Path(__file__).resolve().parent.parent
+    cfg = yaml.safe_load((repo_root / base).read_text())
+    if mutate:
+        mutate(cfg)
+
+    with tempfile.TemporaryDirectory() as td:
+        cfg_file = pathlib.Path(td) / "config.yml"
+        cfg_file.write_text(yaml.safe_dump(cfg))
+        prev = os.environ.get("OPENCLAW_CONFIG")
+        os.environ["OPENCLAW_CONFIG"] = str(cfg_file)
+        try:
+            # Re-exec stack.py so its module-level CFG picks up our config.
+            for name in ("deploy.stack", "deploy", "stack"):
+                sys.modules.pop(name, None)
+            spec = importlib.util.spec_from_file_location(
+                "deploy.stack", repo_root / "deploy" / "stack.py")
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules["deploy.stack"] = mod
+            spec.loader.exec_module(mod)
+
+            import aws_cdk as cdk
+            from aws_cdk import assertions
+            app = cdk.App()
+            stack = mod.OpenClawOrchestratorStack(
+                app, stack_id,
+                env=cdk.Environment(account=account, region=region))
+            return assertions.Template.from_stack(stack)
+        finally:
+            if prev is None:
+                os.environ.pop("OPENCLAW_CONFIG", None)
+            else:
+                os.environ["OPENCLAW_CONFIG"] = prev
+            # Leave no half-initialised module behind for the next test.
+            sys.modules.pop("deploy.stack", None)
 
 
 def make_ddb_table():

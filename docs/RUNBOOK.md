@@ -10,7 +10,7 @@
 
 1. [Architecture at a glance](#1-architecture-at-a-glance)
 2. [Deploy & rollback](#2-deploy--rollback)
-3. [Operator endpoints (T2-8)](#3-operator-endpoints-t2-8)
+3. [Operator endpoints (T2-8, T3-1)](#3-operator-endpoints-t2-8)
 4. [Observability — alarms & DLQ](#4-observability--alarms--dlq)
 5. [Common failure modes & fixes](#5-common-failure-modes--fixes)
 6. [Escalation & data safety](#6-escalation--data-safety)
@@ -99,15 +99,37 @@ a `/vm/*` catch-all + an nginx peer-map on every host. The data plane (P1) and
 the flag (P2) are deployed; **the flag default is still `per-tenant` and
 flipping it is not yet authorised.** Reasons, in order of severity:
 
-**a. Rollback is currently a one-way door.** There is no code path that
-rebuilds per-tenant rules for existing tenants — `_add_alb_rule` is only called
-from `create_tenant` / `process_pending`, and while `host-tg` is active
-`_ensure_host_tg` returns early so newly-registered hosts never get an
-`oc-<last8>` target group at all. Flipping the config back and redeploying
-restores the Lambda env var but **not** the ALB rule set, so the listener falls
-through to its default `fixed_response 404` — 100% of tenants down. Past ~100
-tenants (the default rule quota) per-tenant is not even a reachable state
-without an AWS quota increase, which takes hours to days.
+**a. Rollback WAS a one-way door — now covered by an explicit rebuild.**
+`_add_alb_rule` is only called from `create_tenant` / `process_pending`, and
+while `host-tg` is active `_ensure_host_tg` returns early so newly-registered
+hosts never get an `oc-<last8>` target group at all. Flipping the config back
+therefore restored the Lambda env var but **not** the ALB rule set, leaving the
+listener on its default `fixed_response 404` — 100% of tenants down.
+
+`POST /admin/routing/rebuild` closes that gap: it walks the routable tenants,
+creates any missing per-host target group (bypassing the host-tg gate — that
+bypass is the entire point), and re-creates each tenant's listener rule. It is
+idempotent and **dry-run by default**:
+
+```bash
+# 1. See the plan. Always do this first.
+curl -sX POST "$API_URL/admin/routing/rebuild" -H "x-api-key: $API_KEY" \
+     -H 'content-type: application/json' -d '{}' | jq '.counts, .results[:5]'
+
+# 2. Apply.
+curl -sX POST "$API_URL/admin/routing/rebuild" -H "x-api-key: $API_KEY" \
+     -H 'content-type: application/json' -d '{"dry_run": false}' | jq '.counts'
+```
+
+`counts` buckets every tenant as `existing` / `created` / `would_create` /
+`skipped` / `failed`. A per-tenant failure never aborts the run, so one bad row
+cannot leave the fleet half-routed without a report.
+
+**Still binding:** the AWS *default* quota is **100 rules per ALB** — the code's
+`1-499` range was never the real limit. Past that tenant count per-tenant is not
+a reachable state without a quota increase that takes hours to days, so record
+the rule count and the tenant count before starting; together they say whether
+the fallback is still open at all.
 
 **b. The second hop had never carried a request.** The catch-all sits at
 priority 999 while per-tenant rules occupy 1-499, and ALB matches lowest-first
@@ -132,20 +154,50 @@ fleet-wide, with no per-tenant canary.
 3. An ASG scale-out drill with zero 4xx on `/vm/*` — the shared target group
    health-checks `/ready` (not the always-200 `/health`) precisely so a host
    without peer routes stays out of service, and that needs to be observed.
-4. A rebuild path for per-tenant rules exists and has been dry-run, so (a) is
-   no longer a one-way door.
-5. Gradual cutover instead of a flag flip: keep the catch-all at 999 and delete
-   per-tenant rules **one tenant at a time**. Each deletion moves exactly that
-   tenant onto the shared path, and rollback is recreating that one rule.
+4. ✅ **Done:** `POST /admin/routing/rebuild` exists, is idempotent, and has
+   been dry-run against this fleet — (a) is no longer a one-way door. Run the
+   dry run again immediately before the cutover, not just once.
+5. ✅ **Done:** the verify gate requires `VERIFY_CONSECUTIVE_OK` **consecutive**
+   public-path successes (3 under host-tg). A single sample only proves 1/N of
+   the fleet can serve the tenant, so the old gate would declare a tenant
+   `running` while it 404'd for most users — the 1.4.2 fake-failover defect one
+   level up.
+
+**Recommended cutover — per tenant, not a flag flip.** Keep the catch-all at
+999 and delete per-tenant rules a few at a time. Deleting a tenant's rule is
+exactly what moves that tenant onto the shared path, so each step is its own
+canary and its own rollback:
+
+```bash
+# Canary one tenant. Dry run first (the default).
+curl -sX POST "$API_URL/admin/routing/purge-per-tenant" -H "x-api-key: $API_KEY" \
+     -H 'content-type: application/json' \
+     -d '{"tenant_ids": ["my-agent-ab12"]}' | jq
+
+curl -sX POST "$API_URL/admin/routing/purge-per-tenant" -H "x-api-key: $API_KEY" \
+     -H 'content-type: application/json' \
+     -d '{"tenant_ids": ["my-agent-ab12"], "dry_run": false}' | jq
+
+# Verify through the public path, then widen. To undo, rebuild:
+curl -sX POST "$API_URL/admin/routing/rebuild" -H "x-api-key: $API_KEY" \
+     -H 'content-type: application/json' -d '{"dry_run": false}' | jq '.counts'
+```
+
+`purge-per-tenant` never touches the static `/vm/*` catch-all — that rule is
+the only thing serving traffic after the cutover. Omit `tenant_ids` to purge
+everything, but only once several canaries have held.
+
+Flip `routing.mode` to `host-tg` **after** the rules are gone, so the Lambdas
+stop creating new per-tenant rules. Do **not** move the catch-all's priority.
 
 Record the current ALB rule count and tenant count before starting — together
 they say whether the per-tenant fallback is still reachable at all.
 
 ---
 
-## 3. Operator endpoints (T2-8)
+## 3. Operator endpoints (T2-8, T3-1)
 
-All under `${API_URL}` with `-H "x-api-key: ${API_KEY}"`. With `console_auth.rbac_enabled: true`, writes additionally need a Cognito `Authorization: Bearer` token; **`POST /failover/{az}` requires the `admin` role** (the other two need `operator`).
+All under `${API_URL}` with `-H "x-api-key: ${API_KEY}"`. With `console_auth.rbac_enabled: true`, writes additionally need a Cognito `Authorization: Bearer` token; **`POST /failover/{az}` and both `POST /admin/routing/*` endpoints require the `admin` role** (the rest need `operator`).
 
 ### 3.1 Cancel an in-flight migration
 
@@ -192,6 +244,41 @@ curl -s -X POST "${API_URL}failover/us-east-1a" -H "x-api-key: ${API_KEY}" | jq 
   ```
 - **When to use** vs waiting: auto-failover triggers only after **all** hosts in an AZ have been stale ≥ `unhealthy_threshold_minutes` (default 10). Use the manual endpoint when you already know the AZ is gone (AWS Health event) and don't want to wait. Fallback if the queue path isn't deployed (`FAILOVER_QUEUE_URL` unset, e.g. the Terraform path — see T3-6): the detector runs the legacy synchronous loop instead; evacuate host-by-host with `POST /hosts/{id}/drain` if the source host is still SSM-reachable.
 - **Watch afterward**: affected tenants go `running → failover_queued → failover_recovering → running` with a new `host_id` and `restored_from` set to the backup key. Failure states: `failover_blocked` (no backup — see audit `AZ_FAILOVER_NO_BACKUP`; deliberate refusal to lose data), `failover_failed` (VM never verified on target, or the watchdog reaped a tenant stuck > `FAILOVER_WATCHDOG_MINUTES`=30), `failover_failed_partial` (VM up but ALB repoint/public probe failed — DDB still points at the source; fix ALB manually, see §5b). A job that exhausts its 2 retries lands in `openclaw-failover-dlq` (alarmed) — inspect like the EventsDLQ in §4.
+
+### 3.4 Routing cutover / rollback (T3-1 P3)
+
+Both are **admin-only** and **dry-run by default**. Full procedure and gate
+conditions in [§2.1](#21-routingmode-host-tg--cutover-gate-read-before-flipping)
+— read that first; these are the mechanics.
+
+```bash
+# Rebuild per-tenant listener rules (the way BACK from host-tg routing).
+curl -s -X POST "${API_URL}admin/routing/rebuild" -H "x-api-key: ${API_KEY}" \
+     -H 'content-type: application/json' -d '{"dry_run": false}' | jq '.counts'
+
+# Delete per-tenant rules — the cutover TOWARDS host-tg, one canary at a time.
+curl -s -X POST "${API_URL}admin/routing/purge-per-tenant" -H "x-api-key: ${API_KEY}" \
+     -H 'content-type: application/json' \
+     -d '{"tenant_ids": ["my-agent-ab12"], "dry_run": false}' | jq '.counts'
+```
+
+- **`rebuild`** walks tenants in `running` / `failover_queued` /
+  `failover_recovering`, creates any missing `oc-<last8>` target group
+  (deliberately bypassing the host-tg gate — hosts registered under host-tg
+  have no target group at all, which is what made rollback impossible), and
+  re-creates each tenant's rule. Idempotent: existing rules are reported as
+  `existing`, never duplicated. A per-tenant failure is recorded and the run
+  continues, so one bad row can't half-route the fleet silently.
+- **`purge-per-tenant`** deletes `/vm/<tid>` rules and **never** the static
+  `/vm/*` catch-all. Scope with `tenant_ids` for a canary; omit it to purge all.
+- **Read `counts` before believing either worked**: `existing` / `created` /
+  `would_create` / `skipped` / `failed`. `skipped` and `failed` carry a
+  `reason` per tenant.
+- **Order matters.** Purge rules first, verify through the public path, *then*
+  flip `routing.mode` so the Lambdas stop creating new per-tenant rules. Do
+  **not** change the catch-all's priority — `_add_alb_rule` picks randomly from
+  `1-499`, so a live tenant may be holding priority 1 and the deploy would fail
+  with `PriorityInUseException`, for no benefit.
 
 ---
 

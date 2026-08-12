@@ -52,6 +52,35 @@ def test_referenced_operator_endpoints_exist(runbook):
         assert "/hosts/{instance_id}/drain" in HANDLER
     if "failover/" in runbook:
         assert '"/failover/{az}"' in HANDLER
+    # T3-1 P3 cutover controls. The runbook's rollback procedure depends on
+    # these existing — a runbook that documents a rollback path the code does
+    # not have is worse than no runbook, because it gets trusted mid-incident.
+    if "/admin/routing/rebuild" in runbook:
+        assert '"/admin/routing/rebuild"' in HANDLER
+        assert "def rebuild_routing" in HANDLER
+    if "/admin/routing/purge-per-tenant" in runbook:
+        assert '"/admin/routing/purge-per-tenant"' in HANDLER
+        assert "def purge_per_tenant_routing" in HANDLER
+
+
+def test_cutover_rollback_is_documented_as_available():
+    """§2.1 must not still describe rollback as impossible now that it isn't.
+
+    The gate list is what an operator reads before a fleet-wide change, so a
+    stale "there is no way back" entry would either block a safe cutover or
+    train people to ignore the section.
+    """
+    runbook = (ROOT / "docs" / "RUNBOOK.md").read_text()
+    assert "/admin/routing/rebuild" in runbook, (
+        "the rebuild endpoint exists but the runbook does not tell anyone to "
+        "use it for rollback")
+    assert "dry-run by default" in runbook or "dry_run" in runbook, (
+        "the cutover procedure must show the dry run — this mutates the live "
+        "data plane fleet-wide")
+    # The recommendation NOT to move the catch-all priority is load-bearing:
+    # priority 1 is inside _add_alb_rule's random pool, so a live tenant can
+    # hold it and fail the deploy.
+    assert "priority" in runbook.lower()
 
 
 def test_referenced_alarm_names_exist_in_stack(runbook):

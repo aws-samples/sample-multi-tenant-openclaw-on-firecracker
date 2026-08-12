@@ -108,6 +108,30 @@ def backup_tenant(tenant):
 
     result = {"tenant_id": tid, "success": success, "timestamp": now}
     if success:
+        # 脚本把 key echo 到 stdout 最后一行(`${PREFIX}/${tid}/<ts>.gz[.enc]`,见
+        # backup-data.sh:92/100);上游 suspend 用它精确定位【本次】产物做 restore。
+        # 不能靠 Lambda 的 now(isoformat 微秒)去猜脚本用 `date +...Z`(秒精度)命名的对象
+        # ——两者独立生成、格式不同,精确匹配必落空。key 只能来自脚本真实输出。
+        # 提取不到 key(输出异常/被日志污染)→ 视作失败 fail-closed:宁可让 suspend 502
+        # 重试,也不回传空 key 让上游删盘后无从恢复(no-data-loss)。
+        backup_key = ""
+        for line in reversed((output or "").splitlines()):
+            cand = line.strip()
+            if cand.startswith(f"{PREFIX}/{tid}/") and (
+                cand.endswith(".gz") or cand.endswith(".gz.enc")
+            ):
+                backup_key = cand
+                break
+        if not backup_key:
+            result["success"] = False
+            result["error"] = (
+                "backup-data.sh returned Success but no S3 key found in output; "
+                "treating as failure to avoid data loss on suspend/delete. "
+                f"tail={(output or '')[-200:]!r}"
+            )
+            print(f"Backup key missing for {tid}: {result['error']}")
+            return result
+        result["backup_key"] = backup_key
         tenants_table.update_item(
             Key={"id": tid},
             UpdateExpression="SET last_backup_at = :t",

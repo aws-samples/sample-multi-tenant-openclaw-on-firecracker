@@ -162,11 +162,15 @@ upstream idempotency and reply-correlation key. Empty `text` returns `gw_error`.
 
 ### Version Boundary
 
-The current `bb` golden image remains pinned to OpenClaw `2026.2.26`. Configure
-the platform gateway protocol to match the target image rather than relying on
-the reference backend default. An OpenClaw upgrade must jointly verify the
-`build-rootfs.sh` pin, template schema gate, `paired.json` shape, and
-`GW_PROTOCOL_VERSION`, then run a remote-topology device handshake.
+The current `bb` golden image is pinned to OpenClaw `2026.7.1-2` (protocol v4,
+#476). Keep the `-2` suffix verbatim: under semver it is a prerelease of
+`2026.7.1`, so a bare `2026.7.1` resolves to a different published build. The
+platform gateway advertises a protocol **range**, `GW_PROTOCOL_MIN`..
+`GW_PROTOCOL_MAX` (default `3..4`), so new v4 tenants and existing `2026.2.26`
+(v3) tenants coexist during the transition. An OpenClaw upgrade must jointly
+verify the `build-rootfs.sh` pin, the `OPENCLAW_NODE_MIN` engine floor, the
+template schema gate, the `paired.json` shape, and the protocol range, then run
+a remote-topology device handshake.
 
 ## Capability Boundaries
 

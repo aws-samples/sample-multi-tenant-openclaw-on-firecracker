@@ -38,12 +38,9 @@ try:
 except Exception:  # noqa: BLE001 — botocore 恒在,兜底不改行为
     _asg_retry = None
 
-# Issue #15 — terminal statuses where TTL processing is a no-op
-# #107 — "deleting" is the transient gate set by delete_tenant's CAS while a
 # delete is in flight. TTL处置对它必须是 no-op:租户正在被显式删除,若 TTL 循环
 # 再对它下发 stop/delete,会把 "deleting" 逆转成活跃态(重开账本扣穿窗口)或抢在
 # delete 主流程完成副作用前误标终态(致 _abort_restore_status 回滚失败 + slot 泄漏)。
-# #422 — 休眠三态同理必须是 TTL no-op(no-data-loss):suspended 租户的 VM 已删、数据盘
 # 已备份 S3、slot 已释放——TTL 的"释放资源"目的已达成,若再对它下发 stop/delete 会把状态
 # 破坏(restore 找不到 suspended 态)、甚至走 delete 清理链删掉 S3 备份 = 数据丢失。
 # suspending/restoring 是在途态,更不能被 TTL 打断。三态全部 no-op。
@@ -57,7 +54,6 @@ _TTL_TERMINAL = {
     "restoring",
 }
 
-# ── Seamless image refresh (task #21) ───────────────────────────────────
 # Force-rotate every tenant onto the current golden image every N hours so
 # image/skill/guardrail changes propagate by rebuild (never hot-patch a live
 # VM). Because the host's read-only rootfs is fixed at host boot, a tenant is
@@ -77,7 +73,6 @@ BACKUP_PREFIX = os.environ.get("BACKUP_PREFIX", "backups")
 # gradually instead of stampeding every host at once.
 REFRESH_MAX_PER_TICK = int(os.environ.get("REFRESH_MAX_PER_TICK", "1"))
 
-# ── Reserve-capacity pool (proactive scale-out, 10h-goal #17) ───────────────
 # The base scaler only removes idle hosts; new tenants that find no room sit in
 # `pending` until a host happens to free up or ASG reacts. A production fleet
 # should keep a WARM BUFFER of free capacity so a burst of self-provisions lands
@@ -95,13 +90,10 @@ RESERVE_SCALE_STEP = int(os.environ.get("RESERVE_SCALE_STEP", "1"))  # hosts per
 
 
 def lambda_handler(event, context):
-    # Issue #15 — process expired tenants first (cheap, no SSM unless needed)
     _process_ttl_expirations()
 
-    # Issue #11 — reconcile scheduled tenants (start/stop based on window)
     _reconcile_schedules()
 
-    # task #21 — seamless rolling image refresh (gated, capped per tick)
     if IMAGE_REFRESH_ENABLED:
         _reconcile_image_refresh()
 
@@ -121,14 +113,12 @@ def lambda_handler(event, context):
         status = h.get("status")
         vm_count = int(h.get("vm_count", 0))
 
-        # #217 — 正在 pull-image 灰度升级的 host 由 pull 编排独占其 status(upgrading→
         # active/回滚),scaler 一律不碰:不标 idle、不复位 active、不 terminate。金丝雀
         # 租户会让 vm_count>0,若不在此跳过,下面的 idle→active 复位会拍脏正在验证的 host。
         if status == "upgrading":
             print(f"{instance_id}: upgrading (pull-image in progress) — scaler skips")
             continue
 
-        # #394 —— canary pull / promote / rollback / cleanup 【刻意不置 upgrading】(否则该
         # host 停接 live 租户,违背"存量零影响"),所以上面那道 status 门保护不到它们。
         # 改用镜像操作 lease 判断:持有有效 lease 的 host 正在被镜像操作独占,scaler 一律
         # 不碰(不标 idle、不复位 active、不 terminate),避免与 pull/promote 并发拍脏。
@@ -184,7 +174,6 @@ def lambda_handler(event, context):
             except Exception as e:  # noqa: BLE001 — standard retry 已在 client 层
                 print(f"terminate failed: {e}")
 
-    # 10h-goal #17 — keep a warm free-capacity buffer (proactive scale-out).
     # Runs after idle bookkeeping so it sees current host usage. Gated OFF default.
     if RESERVE_ENABLED:
         _ensure_reserve_capacity(hosts)
@@ -319,7 +308,6 @@ def _update_tenant_status(tenant_id, status):
 
 
 def _set_status(instance_id, status):
-    # #217 race fix — scaler 的 scan 是最终一致读,可能读到过期的 status(如 host 已被
     # pull-image 置 upgrading,但 scan 快照还是 idle)→ 盲写会把正在灰度升级的 host 拍回
     # active/idle,leave upgrading_at 残留 + 打断金丝雀验证(真机实测:active + 仍 poison
     # 的 live 窗口)。加 ConditionExpression 只在 host 仍是 active/idle 时才写:host 已进
@@ -405,7 +393,6 @@ def _lifecycle_terminating(instance_id):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Schedule reconciliation (#48 follow-up to #30 / issue #11).
 # Tenants with a `schedule` field auto-stop outside their window and
 # auto-start inside it. The check runs once per scaler tick.
 # ═══════════════════════════════════════════════════════════════════
@@ -466,7 +453,6 @@ def _reconcile_schedules():
             vm_num = int(it.get("vm_num", 1))
             vcpu = int(it.get("vcpu", 2))
             mem_mb = int(it.get("mem_mb", 4096))
-            # #41 — 穿透 chat_endpoint_enabled 到 launch-vm 幂等段(第 10 位)。
             # 老版本只填 4 位,CHAT_EP_ENABLED 恒空 → scheduler 唤醒后开关不生效。
             # 位 5-9/11 空占位(launch-vm 自 special-case ""),数据盘保留一次性字段。
             cee = bool(it.get("chat_endpoint_enabled", False))
@@ -508,7 +494,6 @@ def _reconcile_schedules():
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Seamless rolling image refresh (task #21).
 #
 # Goal: every running tenant lands on the current golden image within
 # REFRESH_INTERVAL_HOURS, by REBUILD (never hot-patch). A tenant carries its
@@ -530,7 +515,6 @@ def _reconcile_schedules():
 # stampede the fleet.
 # ═══════════════════════════════════════════════════════════════════
 
-# #107 — "deleting" 同终态语义:不给正在删除的租户滚镜像(否则对正被 rm 的 VM
 # 发 rebuild/refresh SSM,与 delete 抢 SSM)。
 _REFRESH_SKIP_STATUS = {
     "stopped",
@@ -539,7 +523,6 @@ _REFRESH_SKIP_STATUS = {
     "creating",
     "migrating",
     "deleting",
-    # #422 — 休眠三态跳过 image-refresh(与 TTL 同理):suspended 租户 VM 已删、盘在 S3,
     # refresh 链会强制 launch 它到新镜像 = 破坏 suspended 态 + 可能空盘启动。在途态更不能碰。
     "suspending",
     "suspended",
@@ -575,6 +558,12 @@ def _should_refresh_image(tenant, golden_version, now, interval_hours):
         return False
     # already mid-refresh? leave it to the in-flight advance
     if tenant.get("image_refresh_phase"):
+        return False
+    # 固定)不参与自动 image refresh。scaler 的 golden 来自 S3 manifest 活指针;活指针改写
+    # (发新镜像/运维回滚)会让这些固定租户被判"落后"→ 发起跨 host backup+relaunch 迁移 →
+    # 写 image_refresh_phase 后永久卡在该态(既没升也不再被处理)。显式固定的版本不该被自动
+    # 改写(与 launch-vm fail-closed 读租户 image_snapshot_time 一致)。
+    if (tenant.get("image_snapshot_time") or "").strip():
         return False
     cur = tenant.get("image_version") or tenant.get("rootfs_version") or ""
     if cur == golden_version:

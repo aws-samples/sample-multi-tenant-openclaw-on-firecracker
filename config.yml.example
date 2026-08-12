@@ -3,10 +3,8 @@
 
 # ========== 宿主机 (EC2) ==========
 host:
-  # CPU arch (issue #19). x86_64 = Intel/AMD (m8i默认); arm64 = Graviton (m8g默认).
   # 切换 arch 后必须用 ./build-rootfs.sh --arch <arch> 重建 rootfs.
   arch: arm64
-  # #272 — 可选,显式指定 openclaw host 机器(ASG)的子网 id(imported 私有子网
   # 场景);空=按 network.mode 自动选(self_managed/imported→私有,default_vpc→公有)。
   subnet_ids: []
   ssh_key_name: ""        # 开发期SSH keypair名(配了metal绑key,堡垒机可SSH);生产留空
@@ -17,15 +15,53 @@ host:
   # 启动时按 nproc + /proc/meminfo 自报每台真实容量注册 DDB,小机型注册自己的小
   # 容量不会被超卖。约束:所有成员须与 host.arch 同架构(AMI 是按架构的,x86 与
   # arm64 不能混)。留空=只用上面的单一 instance_type。
-  # instance_types: ["r8g.metal-48xl", "r8g.metal-24xl"]
+  # (MixedInstancesPolicy.InstancesDistribution.OnDemandAllocationStrategy=prioritized
+  # + 每个 Override 带显式 Priority),租户落哪台则由调度侧亲和排序决定
+  # (scheduling.family_order),两者必须同序。改本列表顺序即改扩容优先级。
+  # 注:列表首项同时是 LaunchTemplate 主类型与 scaler 容量估算基准,应填最高优先级机型。
+  instance_types:
+    - r8g.metal-24xl               # 96 vCPU / 768 GiB · 8.0 GB/vCPU
+    - r7g.metal                    # 64 vCPU / 512 GiB · 8.0 GB/vCPU
+    - m8g.metal-24xl               # 96 vCPU / 384 GiB · 4.0 GB/vCPU
+    - m7g.metal                    # 64 vCPU / 256 GiB · 4.0 GB/vCPU
   root_volume_gb: 20
   data_volume_gb: 900              # 380 VM/台的磁盘硬前提。真机对账(#37,2026-07-04 us-east-1 压 377 VM):/data 实占随负载走——轻载 377 VM 仅占 28G(sparse 单 VM ~84–187M),重载单 VM 实占可达 1.3G,380×1.3G≈494G。600G 够 380 稀疏稳态但重载几乎无冗余;提到 900G 给重载 + 未来密度(#51)余量,仍远低于 380×8G(vm.data_disk_mb 声明上限,靠 sparse 不全占)。改大后 host 重建即带大盘,不依赖运行态扩盘。
   keep_data_volume:  true          # 实例删除后是否保留EBS卷
   reserved_vcpu: 1
   reserved_mem_mb: 2048
-  cpu_overcommit_ratio: 6.0        # 1.0=不超配。设计 380/台、极限压 500 到 r8g.metal-24xl(96 vCPU):vCPU 是超卖维度(agent 多为 IO/等待型),真限制是内存。380÷95≈4x、500÷95≈5.3x,设 6.0 留余量。旧默认 2.0 只让 ~190 个=调度器把机器卡死在远低于设计容量,是上线阻塞 bug。
-  mem_overcommit_ratio: 1.5        # 内存才是硬限:r8g.metal-24xl 768GB,380×2GB=760GB,500×2GB=1000GB。配 balloon 回收时可 1.5(1129GB 可分配),无 balloon 应设 ~1.0 防 OOM。超卖维度看 balloon(见下)。
-  # ===== host golden AMI(#389 v2 块2)=====
+  # IO/等待型,4 个 1c 租户同时跑满的概率低、时间片可复用;内存不能这么做(占住
+  # 就不还,balloon 回收是 best-effort)。
+  # 1:4 不是拍的 —— 理想比 = 物理供给(GB/vCPU) ÷ 租户需求(GB/vCPU):
+  #   R 系 8.0/2.0 = 4.0 → 1:4 恰好匹配(r8g 95×4=380 槽,正是 380/台 目标的来源)
+  #   M 系 4.0/2.0 = 2.0 → 统一 1:4 时 M 系多出的 CPU 槽内存跟不上,会搁浅
+  #                        (m8g 189 vcpu / m7g 125 vcpu),这是【已接受的代价】,
+  #                        由 openclaw_host_stranded_vcpu 指标观测,阈值需相应放宽。
+  # 从 6.0 降到 4.0 是【收紧】放行条件:6.0 的 570 槽是虚容量(内存只够 383),
+  # 真实上限一直由内存决定。r8g 仍满足 380/台,不减容。
+  cpu_overcommit_ratio: 4.0
+  # 150%(374 个 1c2G 塞进 384GB),物理内存打满到 0G。
+  # 物理层防护改由 scheduling.mem_safety_floor_ratio 用 host 自报的实测
+  # MemAvailable 兜底(两维职责分离:账本防超卖,实测防 OOM),不再靠记账超卖赌 balloon。
+  mem_overcommit_ratio: 1.0
+  #
+  # 当前【留空】:四机型统一 cpu=4.0 / mem=1.0 就能达到按标称规格定义的容量目标,
+  # 不需要任何补偿系数。原因是 host 现在按【标称】规格注册容量(init-host.sh 查
+  # synth 时烤进的 {{NOMINAL_SPECS}} 表,表由 ha_edge.py 的 _sizes × _mem_ratio 生成):
+  #     r8g.metal-24xl  96vcpu/768GiB -> min(96×4, 768÷2) = 384
+  #     r7g.metal       64vcpu/512GiB -> min(64×4, 512÷2) = 256
+  #     m8g.metal-24xl  96vcpu/384GiB -> min(96×4, 384÷2) = 192  (内存先耗尽)
+  #     m7g.metal       64vcpu/256GiB -> min(64×4, 256÷2) = 128  (内存先耗尽)
+  #
+  # 早先曾给每个 family 配补偿系数(mem 1.022/1.023/1.025/1.028),因为那时 host 按
+  # nproc+/proc/meminfo 的【实测】值注册 —— 实测比标称小 1.8-1.9%(固件/硬件保留),
+  # 再扣 reserved_* 后只能到 375/250/187/124。但那是四个必须手算的魔数:每上一款
+  # 新机型都要重算,且极易算错(2026-08-11 就因用推算容量而非实测,让 r7g/m7g 少了
+  # 5 个和 3 个)。改为按标称注册后系数全部消失。
+  #
+  # 机制保留:若将来某类机型要单独调超卖比(如 M 系降 cpu 到 2.0 消除 CPU 搁浅),
+  # 在这里加一条即可。形如:
+  #   overcommit_by_family: {m8g: {cpu: 2.0, mem: 1.0}, m7g: {cpu: 2.0, mem: 1.0}}
+  overcommit_by_family: {}
   # 为什么要:开机时装组件不可靠——awscli 拿错架构 zip、aarch64 少 vmlinux 后缀、
   # Firecracker tarball 404,这三个都真实发生过,每次都让 host 超时丢掉 600s
   # lifecycle hook,ASG 进入 ABANDON-重建循环。烤进镜像后 golden 启动路径零外网下载。
@@ -51,7 +87,6 @@ balloon:
   free_page_reporting: true        # guest 主动报告空闲页
 
 # ========== microVM ==========
-# 选择 hypervisor runtime (issue #5).
 # 当前仅 firecracker 完整可用; cloud_hypervisor 与 qemu 是预留插槽,
 # 启用会抛 RuntimeNotImplementedError 直到对应驱动实现.
 runtime: firecracker  # firecracker | cloud_hypervisor | qemu
@@ -63,7 +98,6 @@ vm:
   data_disk_mb: 8192               # 每个 VM 数据盘 /home/agent 上限 (sparse)
   gateway_port_base: 18789
   subnet_prefix: "172.16"
-  # #331/#327 — 一台 host 同时【冷启动】的 microVM 数上限(跨进程 flock 槽信号量)。防批量 FC 死亡
   # recover / 多批 SSM fan-out 一轮 fire 几百个 launch-vm,瞬时 CPU/IO 二次洪峰压垮 host。超出的排队
   # 等(限速不丢租户)。默认 30(真机验证值);单一来源,同时注入 host(OC_HOST_LAUNCH_SLOTS)与
   # Lambda(DISPATCH_HOST_LAUNCH_CONCURRENCY,SSM 超时公式分母)。非正数回落 30。
@@ -77,6 +111,29 @@ quotas:
   max_vcpu_per_tenant: 0    # 0=不限
   max_mem_mb_per_tenant: 0
   max_data_disk_mb: 0
+
+# 4 机型混池的租户放置策略。机型池本身在 host.instance_types(那里决定 ASG 启动
+# 哪台机器),这里决定【租户落哪台】。两处顺序必须一致,否则池按一个序扩容、
+# 按另一个序填租户。
+scheduling:
+  # 四级机型亲和排序开关。false = 逐字节回落既有的 free_vcpu / min(两维ratio) 排序
+  # (回退开关:关掉即恢复现状,不需回滚代码)。
+  affinity_enabled: true
+  # 机型优先顺序(family 前缀)。业务要求:R 系优先填满、M 系少接留安全余量。
+  # 排序键是两级 —— 主键 mem_per_vcpu 分档(R 系 8.0 GB/vCPU vs M 系 4.0),次键本表
+  # 定同档内代际。为什么需要次键:4 机型的 GB/vCPU 只有 2 个不同值(r8g=r7g=8.0、
+  # m8g=m7g=4.0),纯靠资源比例分不出 r8g→r7g 与 m8g→m7g 的先后,那是代际决定的。
+  # 新机型上线只改本表,不改代码。
+  family_order: ["r8g", "r7g", "m8g", "m7g"]
+  # 物理内存安全水位:host 自报的实测 MemAvailable 低于 mem_total × 此比例时不接新
+  # 租户。0 = 关闭物理门(只留账本闸)。
+  # 为什么需要它:账本 used_mem_mb 只证明"声明内存没超卖",但租户真实占用可能超出
+  # 声明(balloon 回收是 best-effort)。与既有磁盘软门同款三段逻辑:门关/无信号/
+  # 信号陈旧一律 fail-open,只在【新鲜确认不足】时阻断,绝不用过期读数误摘健康 host。
+  mem_safety_floor_ratio: 0.10
+  # 物理内存信号新鲜度 TTL(秒)。超期即 fail-open —— host-agent 挂了是正交问题,
+  # 交 health_check + ASG 兜底,调度门不越权用过期读数永久封锁 host。0 = 不校验新鲜度。
+  mem_check_ttl_sec: 300
 
 # ========== S3 ==========
 s3:
@@ -103,7 +160,6 @@ asg:
   lifecycle_hook_timeout: 1200
   use_spot: false
 
-# ========== Optional customer root hooks (#390) ==========
 # Private S3 object only. Empty s3_uri disables the hook with zero behavior
 # change. When enabled, pin the exact object SHA256; scripts must be idempotent.
 # `fail` keeps a node out of service on install failure; `warn` is only for
@@ -129,12 +185,10 @@ multi_az:
   enabled: true
   az_count: 2
 
-# ========== 网络(P2b · #187,INTERFACE-CONTRACT §6/FR-10)==========
 # 默认 `default_vpc` 保存量兼容(host 裸公网,不推荐;仅早期 demo/dev)。
 # 生产走 `self_managed`:自建 /20 VPC + 3 公有子网(ALB/NAT GW)+ 3 NAT GW +
 # 3 私有子网(host/edge/Redis 全在私有)。客户已有 VPC 就走 `imported`,
 # 6 个 subnet id 必须齐——缺一 synth fail-loud(半配比隐性错更贵)。
-# 切模式=改部署代码→重建栈,不热改(铁律 #3)。
 network:
   mode: ""            # 留空=首次 setup.sh 时交互选择; 可选: default_vpc | self_managed | imported
   # self_managed 参数(mode=self_managed 时用):
@@ -147,13 +201,11 @@ network:
     public_subnet_ids: []      # 3 个公有子网 id(ALB/NAT GW),数量必须与 multi_az.az_count 对齐
     private_subnet_ids: []     # 3 个私有子网 id(host/edge/Redis),数量同上
 
-# ========== 控制面 ALB(#272)==========
 # 缺省全空/false:ALB 面向公网、子网按 network 模式自动选(向后兼容)。
 alb:
   internal: false           # true=internal ALB(纯私有,不对公网);缺省按 api.mode=private 派生 internal
   subnet_ids: []            # 可选,显式指定 ALB 子网 id(imported 私有子网);空=按 internal/public 自动选
 
-# ========== ElastiCache Redis 路由表(P2b · #187,§8)==========
 # OpenResty 边缘查 tenant_id→host:port 的准静态路由,host-agent 建/删/迁双写。
 # 默认 false=不建(存量环境无 route.lua,零变化)。P7 部署新数据面时开 true。
 # Multi-AZ replication group(automatic_failover + multi_az;跨 3 AZ 私有子网),
@@ -161,10 +213,8 @@ alb:
 # (VPC 内 SG 隔离即够;auth_token 加密需 transit_encryption,拉长部署链)。
 redis:
   enabled: true
-  # #271 引擎:valkey(默认,ElastiCache Valkey 7.2)| redis(存量兼容)。
   # Valkey = Redis OSS 的 BSD fork,协议/6379 端口与 Redis 客户端线级兼容,
   # 数据面 route.lua / host-agent redis-py 无需改。切引擎对存量路由集群是
-  # replacement(铁律 #3:改部署代码→重建,不热改);重建后 host-agent 重新双写 route 表。
   engine: "valkey"
   subnet_ids: []             # #272 — 可选,显式指定路由表 Redis/Valkey 子网 id;空=私有子网自动选(≥2 跨 AZ)。
   node_type: "cache.r7g.large"
@@ -172,14 +222,12 @@ redis:
   # valkey→"7.2";redis→"7.1"。参数组 family 自动取 <engine><major>(valkey7 / redis7)。
   engine_version: "7.2"
   num_replicas: 2             # 总节点数 = 1 primary + num_replicas replica
-  # #281 复用现网(imported 场景):填了就复用客户已有的子网组/参数组,不建新的、不改现有。
   #   传 ARN,代码取末段作 group name。空(默认)= 按上面 subnet_ids/engine 自建。
   #   ⚠️ 复用者自保:子网组须覆盖 ≥2 AZ(automatic_failover 要求);参数组 family 须匹配
   #      engine+major(valkey7 / redis7),不匹配 CreateReplicationGroup 400。
   existing_subnet_group_arn: ""     # 如 arn:aws:elasticache:<region>:<acct>:subnetgroup:<name>
   existing_parameter_group_arn: ""  # 如 arn:aws:elasticache:<region>:<acct>:parametergroup:<name>
 
-# ========== 数据面边缘 OpenResty ASG(P2b · #187,§6 HA 核心)==========
 # 独立 ASG(跨 3 AZ,不与 host ASG 混)。挂一台自动拉新——ELB health check
 # 触发 → ASG terminate + launch → install-edge.sh 自举 → /healthz 就绪(nginx
 # 起 + Lua route 缓存 warmup)。grace 覆盖冷启全程,防「起-杀循环」。
@@ -276,7 +324,6 @@ tenant_stats:
 dispatch:
   enabled: false      # 默认关,零新资源
   # push=聚合 SSM+ParamStore 分片(回退,受 ~3 TPS PutParameter + 24KB 参数区限);
-  # ddb=写 assignments 表 + 一条 --from-ddb SSM 叫醒 host 自查表(一期默认载体,#73,
   #     PutParameter 退出热路径);pull=host-agent 5s 轮询自取(二期,无 SSM 叫醒)。
   mode: push          # 一期部署显式设 ddb;默认 push 保持存量部署零变化
   esm_max_concurrency: 10   # SQS Lambda ESM ScalingConfig MaximumConcurrency(硬 range 2..1000)
@@ -303,24 +350,19 @@ health_check:
 api:
   throttle_rate_limit: 500          # 稳态 req/s(account 级 steady-state)
   throttle_burst_limit: 1000        # 瞬时 burst 上限(令牌桶容量)
-  # #212 R1 — API Gateway 暴露形态(network_vpc.py 读 api.mode)。缺省=派生自
   # 下面 private_api_enabled(true→both,false/未设→edge),保存量兼容。
   #   edge    = 只建 EDGE 公网 REST API(现状,浏览器/调试直连,不建 PRIVATE/VPCE)。
   #   private = 只走私有:建 PRIVATE API + 关联 execute-api Interface VPCE,机器流量
   #             全走 VPCE 内网;EDGE 仍建但挂 deny-public resource policy 断公网调用。
   #   both    = PRIVATE + VPCE + EDGE 并存(过渡态,与老 private_api_enabled=true 等价)。
-  # mode 与 private_api_enabled 同时显式设 → mode 优先 + 打警告。切模式=重建栈(铁律#3)。
   # mode: ""
-  # ── #122 私有 API Gateway(生产加固,默认关 = synth 字节不变)──
   # true = 在现有 EDGE API 之外,再建一个 PRIVATE REST API 指向同一批 Lambda:
   #   endpoint_configuration=PRIVATE + 关联 execute-api Interface VPCE + 只允许该
   #   VPCE 的 resource policy(grant_invoke_from_vpc_endpoints_only,私有 API 无
   #   resource policy 无法 deploy)+ method 走 AWS_IAM 授权(调用方须 SigV4 签名 +
   #   execute-api:Invoke 权限)。机器/生产流量走私有,浏览器/调试走原 EDGE。
-  #   VPCE 挂当前 VPC(默认 VPC;#119 自建私有 VPC 落地后迁私有子网),SG 只放 443
   #   from VPC CIDR。demo 见 docs/aws-guide 私有 API 加固附录 + SigV4 调用示例。
   private_api_enabled: false
-  # #108 第三方对接 per-platform scoped API key(默认关 = 单 key 部署字节不变)。
   # 配了下面这段,每个平台拿一把独立 key + 独立 usage plan(per-platform 限流),
   # REQUEST authorizer 解析 key→platform 注入 requestContext.authorizer.platform_id,
   # 控制面按平台命名空间隔离(平台 A 的 key 碰不到平台 B 的租户,跨平台 403)。
@@ -363,7 +405,6 @@ agentcore:
   #   enabled: true
 
 # ========== Console 认证 (可选) ==========
-# #187 P5:数据面转型后不依赖 Cognito 登录,控制面走 x-api-key + owner_id/RBAC。
 # console_auth.enabled 默认关(false),整个 Cognito 段随 gate 全体休眠,可回退。
 # 下一版将进一步删掉 Cognito 段本身;此处保留仅供 console 面 SSO 需求场景启用。
 console_auth:
@@ -375,7 +416,6 @@ console_auth:
   # 操作必须带 Cognito id_token。放宽到 operator/admin = 任何持 API key 者无需登录即可
   # 写/改,等于削掉一层门控,仅在受信内网自动化等明确场景才放宽,生产保持 viewer。
   default_no_jwt_role: viewer
-  # Task 9.2 (#149) — Console BFF(前端零 key)。console_auth.enabled=true 即部署
   # openclaw-console-bff Lambda + Lambda 目标组;再配下面的【区域内】ACM 证书 ARN
   # 才在 DashboardALB 上开 443 listener + authenticate-cognito 登录门
   # (/console/* 与 /capi/* 先过 Cognito Hosted UI 登录再转发 BFF)。不配证书则
@@ -384,11 +424,9 @@ console_auth:
   bff_certificate_arn: ""
   bff_domain: ""                   # BFF 对外域名(Cognito OAuth 回调);留空用 ALB DNS
   bff_subnet_ids: []               # 可选,显式指定 BFF Lambda 子网 id;空=PRIVATE_WITH_EGRESS
-  # #255 — 配了 bff_certificate_arn 开 443 后,必须在这里填放行 443 入站的 CIDR 白名单
   # (逗号分隔,如 "203.0.113.0/24,198.51.100.7/32")。默认空 = 不开 443 入站(fail-safe,
   # 门建了但墙上不开洞)。绝不填 0.0.0.0/0(synth 会炸,AWS 暴露红线);填自家办公/VPN 出口。
   bff_ingress_cidrs: ""
-  # WI-002 — channel 段 Cognito 鉴权(#187 P5 已随 channel/hub 数据面下线归档,
   # 保留字段防呆:openclaw-tenant-secrets 老残留字段清理 UpdateExpression 仍幂等
   # REMOVE)。历史 ADR 见 engineering/04-archive/p5-cognito-channel-deprecated/。
   channel_cognito_auth: false
@@ -417,7 +455,6 @@ audit:
   # replace 丢审计历史。开了会新建 alias/openclaw-audit-log CMK(自动轮换),Lambda
   # 的 grant_read_write_data 自动获得 kms 解密权限。
   cmk_encryption: false
-  # #32 WORM 归档:审计表 DDB 只留 90 天热窗(retention_days),冷数据归档到独立的
   # audit-archive S3 桶(Object Lock COMPLIANCE + Versioning + 独立 CMK)保留数年。
   # 归档链路:DDB Stream(NEW_IMAGE)→ 归档 Lambda → S3 按 owner/date/id.json 分区。
   # 同时给 audit 表加 gsi_audit_owner(actor_owner_id, ts)让按租户查审计走 GSI 不再
@@ -439,7 +476,6 @@ external_authz:
   # user_pool_id: ""              # 复用已有 User Pool（留空自动创建）
 
 # ========== 外部 IdP 联合 (可选, OIDC) ==========
-# 让外部平台用户用既有账号经 OIDC 联合登录到同一个 Cognito User Pool (task #13/#14)。
 # 依赖 console_auth.enabled=true (provider 挂在 console 的 User Pool 上)。
 # enabled=false (默认) 时不加任何 provider, User Pool 保持 COGNITO-only, 完全向后兼容。
 #
@@ -473,7 +509,6 @@ exchange_idp:
 #   单域名模式（legacy / dev-only）：
 #     ./setup.sh <region> <profile> --domain <domain> --cert <acm-arn>
 cloudfront:
-  # #270 — 是否建 CloudFront 分发。false=不建任何 CloudFront,纯内网 ALB 直连
   # 场景用(私有部署 / console 走内网 ALB);缺省 true 向后兼容。
   enabled: true
   # ----- 双域名模式（v1.3.4+ 推荐） -----
@@ -503,11 +538,9 @@ metrics:
   enabled: true
   use_managed: false               # false=自建Prom/Grafana(默认); true=AMP+AMG托管
 
-# ========== 安全监控聚合(10h-goal #20)==========
 # Wazuh 监控数据平台聚合三源:① in-guest auditd/FIM 告警(镜像已烤,见 build-rootfs)
 # ② GuardDuty 云层威胁检测 ③ openclaw 运行时 metrics(host-agent → AMP)。
 security:
-  # ── #152/#118 凭据注入通用 CMK(clawpool 级加解密底座)──
   # false(默认)= 不建 ClawPoolCMK,synth byte-identical(存量栈零变化)。
   # true = 建 alias/clawpool-general CMK(轮换开),key policy 权限分离:host role
   #   只 Decrypt(host 在 VM 启动时解密上游注入的凭据密文),API/上游各自另授。
@@ -524,7 +557,6 @@ security:
   dns_firewall_enabled: false  # true=CDK 建 Route53 Resolver DNS Firewall(domain list openclaw-egress-blocklist + rule group openclaw-egress-fw + BLOCK 规则 NXDOMAIN + 关联 VPC),在 DNS 解析层拦 C2/外泄域名(L4 出网防线)。默认 false。真实 C2 域名清单不入仓库(domain list 只放 demo 占位),运营用 route53resolver import-firewall-domains 从受控威胁情报源另灌。此前由 apply-hardening.sh 旁路建,现纳入 stack.py 随重建对账。注意:DNS FW 只拦经 VPC Route53 Resolver 的查询;microVM guest DNS 硬编码公网 8.8.8.8 不经 VPC Resolver,故 DNS FW 对 microVM 出网无效(定位=带外 C2 黑名单)。收 microVM 出网走下面的 egress_allowlist(#39,tap 级 iptables 白名单)。
   guardrail_managed_by_stack: false  # true=CDK 用 aws_bedrock.CfnGuardrail 从 deploy/runtime-config-export/bedrock-guardrail.json 建 Bedrock Guardrail,id 写 SSM /openclaw/bedrock-guardrail-id(LiteLLM userdata/apply-hardening.sh 都从 SSM 读、不硬编码)。默认 false 保存量兼容——存量账号已有 apply-hardening.sh 建过的 Guardrail 时保持 false,LiteLLM 在 SSM 缺失时按仓库 Guardrail 名精确发现 id。切 true 前必须先把带外那个 Guardrail 改名或删了,否则 CFN 建同名 Guardrail 冲突。#80。
 
-  # ── #39 microVM 出网默认拒绝白名单(L4 tap 级 iptables egress allowlist)──
   # false(默认)= 现状:launch-vm.sh 末尾 FORWARD ACCEPT 放行 guest→全部公网出网(零变化)。
   # true = 把末尾 ACCEPT 换成「静态 CIDR 放行 + FQDN 白名单放行 + 末尾 DROP」默认拒绝。机制:
   #   ① 静态 CIDR:自动放行 VPC CIDR(覆盖 host 本地 hub tap IP + 堡垒机 LiteLLM 私网 + EKS ALB
@@ -571,7 +603,6 @@ ai_gateway:
   # path(纯 host 输入时)用 host 侧 env LITELLM_PORT/LITELLM_PATH(harden-config 派生)。
   url: ""
   instance_type: "c7i.large"       # 自动起网关时的机型(仅 url 为空时用)。
-  # #187 P6: HA 模式开关。默认 false 走存量单机(1 台 EC2 + compose 内嵌 PG),
   # true 走 HA 路径 —— ASG min=2 跨 AZ + internal ALB 前置 4000 + 独立
   # RDS PostgreSQL Multi-AZ 共享 vkey/spend 表(compose 内嵌 PG 用 profile
   # 屏蔽,两台实例各存一份表会分裂,ALB 轮询命中不同实例时 vkey mint 一半失效)。
@@ -579,7 +610,6 @@ ai_gateway:
   ha_enabled: false
 
 # ========== 黄金镜像 ==========
-# 独立 OpenClawImage stack 用 CodeBuild 烤镜像(buildspec-golden-image.yml),#283
 # 拆出主 stack 且非阻塞:build 失败只回滚 OpenClawImage,不连累控制面/数据面。
 # 主 stack 不再依赖镜像就绪 —— 全新 region 首个 host 可能抢在镜像烤好前启动、
 # lifecycle-hook 超时 churn 几分钟(非部署失败),镜像烤完自愈。
@@ -588,7 +618,6 @@ image:
   build_in_stack: true             # true=部署 OpenClawImage stack 触发 CodeBuild 烤镜像(非阻塞,#283);
                                    # false=跳过(沿用桶里已有镜像,或自己跑 build-rootfs-on-ec2.sh)。
 
-# ========== 可观测性:数据面日志管道(issue #219 / #209 spec)==========
 # Fluent Bit(edge)→ Kinesis Data Firehose → Amazon OpenSearch Service
 # 与 Wazuh 告警域(deploy/monitoring/wazuh-two-ec2/)绝不共域(design decision
 # 硬红线):安全审计与运维日志故障+权限隔离。guest microVM 内零凭据零 agent,
@@ -600,7 +629,6 @@ image:
 # 门 logging.enabled=false 时整段零资源(synth 与不加载本模块等价)。
 logging:
   # true=建 AOS 域 + 三条 Firehose(edge/host/vm)+ Log_Archive_Bucket,并让
-  # edge/host 的 Fluent Bit 起来送日志;默认 false 保存量兼容(#245)。三条流对应
   # 三个索引 claw-logs-{edge,host,vm}-*:edge=nginx access log,host=journald
   # (host-agent + 生命周期脚本),vm=每租户 fc.log(带 tenant_id)。索引名/流名不
   # 可调(确定值),要调只调下面 sizing。

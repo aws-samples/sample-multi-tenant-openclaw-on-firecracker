@@ -21,7 +21,6 @@ def build_auth(self, ctx):
     """Build auth resources (mechanical transplant from stack.py, issue #87)."""
     # --- Unpack from ctx ---
     CFG = ctx.CFG
-    alb = getattr(ctx, "alb", None)
     api = getattr(ctx, "api", None)
     api_fn = getattr(ctx, "api_fn", None)
     cf_distribution = getattr(ctx, "cf_distribution", None)
@@ -36,7 +35,6 @@ def build_auth(self, ctx):
     auth_cfg = CFG.get("console_auth", {})
     cognito_outputs = {}
 
-    # ── Exchange IdP federation (task #13/#14) ───────────────────────────
     # Config-gated OIDC identity provider that lets external users sign in to
     # the same Cognito User Pool via their existing exchange account. The
     # exchange's real OIDC endpoints are NOT hardcoded — they come from
@@ -103,15 +101,8 @@ def build_auth(self, ctx):
         # scoped to console_domain and cannot be sent to per-tenant
         # dashboards on app_domain.
         #
-        # chat 小程序(终端用户自助登录)与 console 同 CloudFront 同域(同
-        # console_host,只是路径 /chat/index.html vs /console/index.html,见
-        # CloudFront /chat/* behavior),故把 chat 回调一并列入 —— 它与 console
-        # 共享同一 console_host 的 session cookie 域,不触动上面 app_domain 的
-        # 跨域隔离设计。缺这条则 chat 自助登录回调被 Cognito redirect_mismatch
-        # 拒(此前靠运行态手改 client 补,未随代码部署,现纳入 CDK 随重建继承)。
         callback_urls = [
             f"https://{console_host}/console/index.html",
-            f"https://{console_host}/chat/index.html",
         ]
         # In legacy single-mode, also add the *.cloudfront.net default
         # so direct CF URL access still works during DNS migration.
@@ -120,9 +111,6 @@ def build_auth(self, ctx):
         elif not dual_mode and custom_domain:
             callback_urls.append(
                 f"https://{cf_distribution.distribution_domain_name}/console/index.html"
-            )
-            callback_urls.append(
-                f"https://{cf_distribution.distribution_domain_name}/chat/index.html"
             )
 
         if existing_pool_id:
@@ -141,7 +129,6 @@ def build_auth(self, ctx):
                 user_pool_id=existing_pool_id,
                 domain=domain_prefix,
             )
-            # Exchange IdP federation on the imported pool (task #13/#14).
             # The imported pool's custom attribute `custom:tenant_user_id`
             # must already exist on it (an imported pool's schema is
             # immutable from CDK); a stack-owned pool gets it added below.
@@ -161,7 +148,6 @@ def build_auth(self, ctx):
                     attribute_mapping=_idp_attribute_mapping(),
                 )
                 _supported_idps.append(idp_provider_name)
-                # #144 — this branch never wired Pre-Token-Generation, so
                 # federated users' tokens carried custom:platform_id=None
                 # forever (platform reporting/filter dead on this deploy
                 # shape; NOT an authz face — auth.py:289 never uses
@@ -277,7 +263,6 @@ def build_auth(self, ctx):
                         min_len=1, max_len=256, mutable=True
                     )
                 }
-                # #97 档A — Pre-Token-Generation Lambda: on federated login,
                 # inject custom:tenant_user_id / custom:platform_id into the id_token
                 # so the broker (POST /tenants) and hub (POST /hub/token) get a stable
                 # tenant identity. Pure stdlib (no deps), fail-open (never blocks login).
@@ -305,7 +290,6 @@ def build_auth(self, ctx):
                     require_lowercase=True,
                 ),
                 custom_attributes=_custom_attrs,
-                # #97 档A — wire Pre-Token-Gen trigger (only set when federation on)
                 lambda_triggers=cognito.UserPoolTriggers(pre_token_generation=_ptg_fn)
                 if _ptg_fn is not None
                 else None,
@@ -320,7 +304,6 @@ def build_auth(self, ctx):
                     domain_prefix=f"openclaw-console-{self.account}{self._gsuffix}",
                 ),
             )
-            # Exchange IdP federation on the new pool (task #13/#14).
             _exchange_idp = None
             _supported_l2_idps = [cognito.UserPoolClientIdentityProvider.COGNITO]
             if idp_enabled:
@@ -366,7 +349,6 @@ def build_auth(self, ctx):
                 f"openclaw-console-{self.account}{self._gsuffix}.auth.{cdk.Stack.of(self).region}.amazoncognito.com"
             )
 
-        # RBAC groups (issue #14): admin / operator / viewer.
         # Created on both new and existing pools so an imported pool also
         # gets the role groups. The handler maps `cognito:groups` claim →
         # role hierarchy (admin > operator > viewer).
@@ -384,7 +366,6 @@ def build_auth(self, ctx):
                 precedence=precedence,
             )
 
-        # #187 P5 —  channel-plane machine-user app client 已随
         # channel/hub 数据面下线一并移除(ChannelMachineUserClient + cognito-idp
         # admin IAM + COGNITO_CHANNEL_CLIENT_ID env)。留下的 Cognito 段只服务
         # console RBAC(JWT 验签 + owner_id/RBAC 门),不再有 machine-user 铸造。
@@ -412,15 +393,12 @@ def build_auth(self, ctx):
                 "COGNITO_CLIENT_ID", cognito_outputs.get("CognitoClientId", "")
             )
 
-        # ── Task 9.2 (#149): Console BFF — 前端零 key ──────────────────
-        # PoC 已真机验证(an internal PoC):BFF Lambda
+        # PoC 已真机验证(engineering/security/clawconsole-bff-poc):BFF Lambda
         # 托管 console 静态文件 + /capi/* 后端代持 admin key(浏览器全程零真 key),
         # 登录门在 ALB authenticate-cognito(未登录 302 Cognito Hosted UI)。
-        # #217 — CTRL_API_KEY 部署时自动注入,根治"全量 deploy 后成占位符 → /capi 全 403"。
         # APIGW 随机生成的 admin key 明文 value 在 CFN 里 GetAtt 取不到(只有 id),故用
         # AwsCustomResource 部署时调 getApiKey(includeValue) 捞真值,再喂进 BFF env。
         # 全程在 cdk deploy 内闭环,不靠 setup.sh、不靠人手,裸 cdk deploy 也覆盖、幂等
-        # (#250 的 setup.sh 部署后注入是带外兜底,与此互补;此处让 CDK 自身也自洽)。
         # data_hidden("value"):真 key 不落 custom-resource 的 CloudWatch 日志。
         # IAM 限这一把 key 的 ARN(apigateway:GET,最小权限)。
         _admin_key = getattr(ctx, "api_key", None)
@@ -457,7 +435,6 @@ def build_auth(self, ctx):
             )
             _ctrl_key_cr.node.add_dependency(_admin_key)
             _ctrl_key_value = _ctrl_key_cr.get_response_field("value")
-        # #272 — BFF 默认进 VPC(只要 default_vpc 建了就进,不再要求 logging.enabled)。
         # 纯私有部署(api.mode=private)时 BFF 从 VPC 内经 execute-api VPCE 的 private
         # DNS 调私有控制面 API(resource policy 限 VPCE,x-api-key 照用,不需 SigV4);
         # 也够得着 VPC-only 的 AOS 域(observability.py 回填 AOS_ENDPOINT + SG 入站)。
@@ -507,17 +484,13 @@ def build_auth(self, ctx):
             **_bff_vpc_kwargs,
             environment={
                 "CTRL_API_BASE": f"https://{api.rest_api_id}.execute-api.{self.region}.amazonaws.com/v1",
-                # #217 — 部署时由 CtrlApiKeyValue custom resource 捞真值注入(见上)。
                 # api_key 不可用时(理论上不会)回落占位符,行为同旧。
                 "CTRL_API_KEY": _ctrl_key_value,
-                # #217 — BFF 用 token username 查 Cognito 组得真实角色(ALB x-amzn-oidc-data
                 # 不含 cognito:groups)。注入 pool id 供 AdminListGroupsForUser。空 → roleForUser
-                # 回落 viewer(canWrite 全 false → 写操作入口全隐藏)。rebase 曾丢过此行(#209
                 # docs 提交把 auth.py 回退掉),导致 console 全员降级 viewer、Pull 按钮消失。
                 "USER_POOL_ID": cognito_outputs.get("CognitoUserPoolId", ""),
             },
         )
-        # #217 — BFF 查用户组以判角色(canWrite 门控):ALB OIDC token 不带 groups,
         # 用 username 调 AdminListGroupsForUser。只读该动作,资源限本 user pool。
         console_bff_fn.add_to_role_policy(
             iam.PolicyStatement(
@@ -525,7 +498,6 @@ def build_auth(self, ctx):
                 resources=[user_pool.user_pool_arn],
             )
         )
-        # #264 — BFF 系统默认值面板(GET/POST /capi/system/defaults, handler.mjs:425/460)
         # 读写这 4 个 /openclaw/ SSM 参数;role 原来只有 cognito 一条 → 生产全 AccessDenied
         # (真机实测 /capi/system/defaults + /capi/traces 全挂,热补后 200)。资源限 /openclaw/
         # 前缀非整账户通配。
@@ -562,7 +534,6 @@ def build_auth(self, ctx):
                 resources=["*"],
             )
         )
-        # #266 — per-tenant Lambda log viewer(GET /capi/logs?source=lambda, logs.mjs)
         # 走 CloudWatch Logs Insights,按 tenant_id 过滤 /aws/lambda/openclaw-* 日志组。
         # StartQuery/GetQueryResults 是账户级异步查询 API(不支持资源级授权);
         # DescribeLogGroups 按前缀解析日志组名。Resource=* 是这类 API 的最小权限例外。
@@ -577,7 +548,6 @@ def build_auth(self, ctx):
                 resources=["*"],
             )
         )
-        # #266 — 把 BFF fn / SG / in-vpc 标记挂 ctx,build_observability 回填 AOS
         # (vm/host 日志)端点 + secret 读权限 + AOS SG 入站(auth 先于 observability
         # 运行,AOS 域此刻还没建,故 AOS 相关接线延到那边做)。
         ctx.console_bff_fn = console_bff_fn
@@ -591,11 +561,40 @@ def build_auth(self, ctx):
         )
         # authenticate-cognito 只能挂 HTTPS listener,且要求带 secret 的 app
         # client(现有 ConsoleClient 是 generate_secret=False,不能复用)。
-        # DashboardALB 目前只有 :80(TLS 在 CloudFront 终结),所以 HTTPS
-        # listener + 认证规则由 config 提供的【区域内】ACM 证书门控。
+        # 白名单进入,不再依赖 CloudFront/内网跳板;入站 = VPC CIDR +
+        # console_auth.bff_ingress_cidrs。HTTPS listener + 认证规则仍由 config
+        # 提供的【区域内】ACM 证书门控。
         _bff_cert_arn = auth_cfg.get("bff_certificate_arn", "")
         if _bff_cert_arn:
-            _bff_host = auth_cfg.get("bff_domain") or alb.load_balancer_dns_name
+            _bff_alb_subnet_ids = auth_cfg.get("bff_alb_subnet_ids") or []
+            if _bff_alb_subnet_ids:
+                _bff_alb_subnets = ec2.SubnetSelection(
+                    subnets=[
+                        ec2.Subnet.from_subnet_id(
+                            self, f"BffAlbSubnet{_i}", _sid
+                        )
+                        for _i, _sid in enumerate(_bff_alb_subnet_ids)
+                    ]
+                )
+            else:
+                _bff_alb_subnets = ec2.SubnetSelection(
+                    subnet_type=ec2.SubnetType.PUBLIC
+                )
+            _bff_alb = elbv2.ApplicationLoadBalancer(
+                self,
+                "ConsoleBffALB",
+                load_balancer_name="openclaw-console-bff",
+                vpc=vpc,
+                vpc_subnets=_bff_alb_subnets,
+                internet_facing=True,
+            )
+            _bff_alb.connections.allow_from(
+                ec2.Peer.ipv4(vpc.vpc_cidr_block),
+                ec2.Port.tcp(443),
+                "console BFF ALB: VPC CIDR (no 0.0.0.0/0, #423)",
+            )
+            ctx.console_bff_alb = _bff_alb
+            _bff_host = auth_cfg.get("bff_domain") or _bff_alb.load_balancer_dns_name
             _bff_client = user_pool.add_client(
                 "ConsoleBffClient",
                 generate_secret=True,  # ALB authenticate-cognito 硬要求
@@ -605,7 +604,7 @@ def build_auth(self, ctx):
                     callback_urls=[f"https://{_bff_host}/oauth2/idpresponse"],
                 ),
             )
-            _bff_https = alb.add_listener(
+            _bff_https = _bff_alb.add_listener(
                 "BffHTTPS",
                 port=443,
                 open=False,  # 同 :80 红线:绝不自动开 0.0.0.0/0
@@ -631,7 +630,6 @@ def build_auth(self, ctx):
                     next=elbv2.ListenerAction.forward([console_bff_tg]),
                 ),
             )
-            # #255 — 建了 443 门必须给 ALB SG 补 443 入站白名单,否则门建了墙上没开
             # 洞、443 全超时(真机实测:手工建 443 listener 后仍需手动加 SG 才通)。
             # 白名单从 config console_auth.bff_ingress_cidrs 读(逗号分隔 CIDR),默认空
             # = 不开 443 入站(fail-safe)。绝不放 0.0.0.0/0(AWS 暴露红线);运营员
@@ -642,7 +640,6 @@ def build_auth(self, ctx):
                     ec2.Peer.ipv4(_c),
                     "console BFF 443 ingress allowlist (no 0.0.0.0/0, #255)",
                 )
-        # TODO(#149): 未配 bff_certificate_arn 时无 HTTPS listener,BFF Lambda
         # + TG 已就位但不接流量;补一张区域内 ACM 证书(config console_auth.
         # bff_certificate_arn)即接通。别把认证规则挂 :80(明文回传 session
         # cookie + CFN 直接拒绝 authenticate-cognito on HTTP)。

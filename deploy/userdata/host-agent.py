@@ -31,7 +31,6 @@ PORT = int(os.environ.get("OC_AGENT_PORT", "8899"))
 # Health/control AND Prometheus /metrics are served by the SAME HTTPServer
 # on PORT (8899). The earlier OC_AGENT_PROM_PORT=9090 split-port design was
 # never wired into main(), causing the ADOT collector to fail every scrape
-# (issue #4 regression, fixed in 1.2.5).
 VM_DIR = "/data/firecracker-vms"
 GATEWAY_PORT = 18789
 TENANTS_TABLE = os.environ.get("TENANTS_TABLE", "")
@@ -40,7 +39,6 @@ TENANTS_TABLE = os.environ.get("TENANTS_TABLE", "")
 # are still alive at the host level, not just whether their tenants reported).
 HOSTS_TABLE = os.environ.get("HOSTS_TABLE", "")
 INSTANCE_ID = os.environ.get("INSTANCE_ID", "")
-# #394 — Host-local slot pointer is authoritative. Heartbeat mirrors it continuously so
 # global snapshot deletion can fail closed on a freshness timestamp instead of trusting a
 # one-shot best-effort write from the mutation that may have failed.
 IMAGE_SLOTS_FILE = os.environ.get("IMAGE_SLOTS_FILE", "/data/firecracker-assets/slots.json")
@@ -52,7 +50,6 @@ ENGINE_REDIS_PORT = int(os.environ.get("ENGINE_REDIS_PORT", "6379"))
 
 
 # ═══════════════════════════════════════════
-# Prometheus exporter (issue #4)
 # ═══════════════════════════════════════════
 #
 # Exposes a /metrics endpoint in Prom text-exposition format on the same
@@ -84,14 +81,15 @@ _PROM_GAUGES = (
 )
 
 
-def _render_metrics_text(snapshots, port_stats=None, agent_stats=None):
+def _render_metrics_text(
+    snapshots, port_stats=None, agent_stats=None, stranding=None
+):
     """Render the in-memory snapshots dict as Prometheus exposition text.
 
     Pure function — no I/O — so it is easy to assert against in unit tests.
     Always emits HELP/TYPE headers (even with zero samples) so that scrapers
     that validate metadata don't choke on a quiet host.
 
-    #387: port_stats/agent_stats are OPTIONAL dict snapshots taken by the
     caller (do_GET) from already-initialized singletons/state. This function
     MUST NOT touch _get_port_bitmap() or any lazy-init singleton — rendering
     a metrics page must never mutate global routing state. When port_stats
@@ -118,9 +116,7 @@ def _render_metrics_text(snapshots, port_stats=None, agent_stats=None):
             continue
         v = 1 if info.get("vm_health") == "up" else 0
         out.append(f'openclaw_vm_health{{tenant="{tid}"}} {v}')
-    # #387 (#197 病史): app_health as 0/1 — gateway HTTP liveness per tenant.
     # vm_health=1 + app_health=0 is exactly the "ping ok, gateway crashloop"
-    # blind spot (#197: gateway crashed 2715x while vm_health stayed green).
     out.append(
         "# HELP openclaw_app_health 1 if the tenant gateway answered HTTP, else 0"
     )
@@ -130,7 +126,6 @@ def _render_metrics_text(snapshots, port_stats=None, agent_stats=None):
             continue
         v = 1 if info.get("app_health") == "up" else 0
         out.append(f'openclaw_app_health{{tenant="{tid}"}} {v}')
-    # #387 容量红线: host DNAT port pool watermark. Port exhaustion means new
     # VMs can never be promoted (PortAllocationError → skip-promote forever).
     # HELP semantics: "used" INCLUDES stopped tenants — stop/start keeps the
     # route (and its port); only delete releases it. quarantined = ports in
@@ -157,7 +152,36 @@ def _render_metrics_text(snapshots, port_stats=None, agent_stats=None):
         out.append(
             f"openclaw_host_dnat_ports_quarantined {int(port_stats['quarantined'])}"
         )
-    # #387 v4: agent self-health/operational metrics (kata_agent_*/kubelet_
+    # Grafana 侧算比率,避免 agent 侧固化一个除法口径。stranding=None → 整组省略。
+    if isinstance(stranding, tuple) and len(stranding) == 4:
+        s_vcpu, s_mem, alloc_v, alloc_m = stranding
+        out.append(
+            "# HELP openclaw_host_stranded_vcpu allocatable vCPU that can never"
+            " be placed because the memory dimension can no longer fit the"
+            " smallest tenant spec (2D stranding; M-series strands CPU by design"
+            " under a uniform 1:4 ratio)"
+        )
+        out.append("# TYPE openclaw_host_stranded_vcpu gauge")
+        out.append(f"openclaw_host_stranded_vcpu {int(s_vcpu)}")
+        out.append(
+            "# HELP openclaw_host_stranded_mem_mb allocatable memory that can"
+            " never be placed because the vCPU dimension is exhausted"
+        )
+        out.append("# TYPE openclaw_host_stranded_mem_mb gauge")
+        out.append(f"openclaw_host_stranded_mem_mb {int(s_mem)}")
+        out.append(
+            "# HELP openclaw_host_allocatable_vcpu total allocatable vCPU"
+            " (total_vcpu x per-family cpu overcommit) — denominator for the"
+            " stranding ratio"
+        )
+        out.append("# TYPE openclaw_host_allocatable_vcpu gauge")
+        out.append(f"openclaw_host_allocatable_vcpu {int(alloc_v)}")
+        out.append(
+            "# HELP openclaw_host_allocatable_mem_mb total allocatable memory"
+            " (total_mem_mb x per-family mem overcommit)"
+        )
+        out.append("# TYPE openclaw_host_allocatable_mem_mb gauge")
+        out.append(f"openclaw_host_allocatable_mem_mb {int(alloc_m)}")
     # runtime_operations_* layer). All host-level; kept out of the tenant map.
     if isinstance(agent_stats, dict):
         ticks = agent_stats.get("loop_last_tick") or {}
@@ -222,7 +246,6 @@ _ddb = None
 _status = {}
 _lock = threading.Lock()
 
-# #387 v4: agent self-metrics live in their OWN dict — NOT in _status.
 # _status is a tenant map; a host-level key mixed in would be rendered as a
 # phantom tenant by the per-tenant gauge loops above. Guarded by _lock (same
 # lock as _status: all writers already hold it or write scalar values).
@@ -452,13 +475,11 @@ def _get_ddb():
 
 
 _recovering = set()  # Track VMs being recovered to avoid duplicate launches
-# #315 — recover 失败退避时刻表 tenant_id → earliest-retry-epoch。修 _recovering 泄漏后,
 # 失败的 recover 不再每 5s 紧密重试(thundering herd:同 tid 反复 fire launch-vm 抢 flock 空转),
 # 按 RECOVER_BACKOFF_SEC + jitter 退避;成功即清除。
 _recover_backoff = {}
 RECOVER_BACKOFF_SEC = float(os.environ.get("OC_RECOVER_BACKOFF", "15"))
 
-# #208 — 已回填过 phys_vm_num 的 tenant_id(每进程只写一次,避免每 tick 重复 update)。
 # if_not_exists 保证幂等且绝不覆盖已有值(迁移后 phys_vm_num 必须恒等原始 launch 号),
 # 这个 set 只是省掉重复的 no-op 写。
 _phys_backfilled = set()
@@ -500,7 +521,6 @@ def _launch_argv(*args):
 def _recover_vm(tenant_id, cfg):
     """Launch VM that has vm.json but no running Firecracker process.
 
-    #315 修 _recovering 永久泄漏(真机 28/300 卡 creating 根因):旧版只在 Popen 抛异常时
     discard,起 VM 子进程失败(flock-skip rc75 / START 后被杀 / 半成品)【不抛异常】→
     _recovering 永留 → 下个 probe `if tid in _recovering: return` 永久跳过 → recover 只试
     一次、失败即永久卡(host-agent.py 的 discard 只在 fc_running=True 才走到)。
@@ -582,6 +602,48 @@ def _force_relaunch_vm(tenant_id, cfg):
         _recovering.discard(tenant_id)
 
 
+def _host_btime():
+    """host 的开机 UNIX 时刻(/proc/stat 的 btime 行)。None 表示读不到。
+
+    /proc/<pid>/stat 的 starttime 是"自开机起的 clock ticks",要换成挂钟时间必须加上开机
+    时刻。缓存在模块级:host 的开机时刻在本进程生命周期内是常量。"""
+    if _btime_cache["v"] is not None:
+        return _btime_cache["v"]
+    try:
+        with open("/proc/stat", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("btime "):
+                    _btime_cache["v"] = int(line.split()[1])
+                    return _btime_cache["v"]
+    except Exception:  # noqa: BLE001 — 拿不到就退化成"无启动证据",不影响健康上报
+        pass
+    return None
+
+
+_btime_cache = {"v": None}
+
+
+def _fc_boot_iso(fc_pid):
+    """这个 Firecracker 进程的启动时刻,ISO-8601 UTC 串;拿不到返 ""。
+
+    ADR §5.4a 路 2 的证据强度补强(见 _read_proc_start_ticks 的说明):控制面用它判断
+    「这个 FC 进程是不是本次 rebuild 之后新起的」,以排掉"旧 FC 未被杀掉、vm.json 已改新
+    版本、VM 却还跑着旧 rootfs"这种版本相符的假成功。
+
+    返回空串(而不是抛)是刻意的:读不到 /proc 只意味着少一份证据,控制面据此拒绝单凭版本
+    判 done —— 保守方向,不会造成假成功。"""
+    ticks = _read_proc_start_ticks(fc_pid)
+    btime = _host_btime()
+    if ticks is None or btime is None or not _CLK_TCK:
+        return ""
+    try:
+        return time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(btime + (ticks / float(_CLK_TCK)))
+        )
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _probe_all():
     """Probe all local VMs."""
     results = {}
@@ -599,23 +661,30 @@ def _probe_all():
         try:
             with open(cfg_file, encoding="utf-8") as f:
                 cfg = json.load(f)
-            # #237 — the LOCAL vm.json's guest_ip is the data-plane truth of
             # what actually booted (launch-vm.sh writes it from the /30 scheme).
             # _write_ddb reconciles the DDB record's guest_ip to this so a
             # control-plane↔data-plane drift can't leave a ghost IP that edge
             # routes to a black hole. (vm_num is deliberately NOT reconciled —
-            # see _refresh_health: the logical↔physical split is #208's job.)
             guest_ip = cfg.get("guest_ip", "")
         except Exception:
             continue
         if not guest_ip:
             continue
 
-        # #208 — vm.json 的 vm_num 是这台 VM 物理挂的 tap-vm{N} 号(launch-vm.sh:172 写,
         # 迁移 restore 也不改写)。带回 results 供 _report 回填 DDB 的 phys_vm_num——历史
         # /迁移前建的租户 DDB 里没有 phys_vm_num,靠这里从物理真值补齐,补齐后撞号检查
         # (create+migrate)才对这些老租户也生效。
         phys_vm_num = cfg.get("vm_num")
+
+        # ADR-rebuild-idempotency-sync-contract §5.4a 路 2 —— 本次启动【实际使用】的
+        # 镜像版本。launch-vm.sh 每次起 VM 都把它写进这个 vm.json(见该脚本 §"记录本次
+        # 启动实际使用的版本"),而本函数本来就在读这个文件、下游 _refresh_health 本来就
+        # 在往同一张 tenants 表写字段 —— 真机上「我现在跑的是哪个版本」一直都有,只是
+        # 没被捎上去。带上它,控制面就能拿【期望版本】与【上报的实际版本】异步对账,
+        # 不再完全依赖那一次 SSM 回音的成败(回执丢失时最坏等一个心跳周期 15s)。
+        # 注:这是 best-effort 审计值,只用于【确认成功】,不可用于判定失败 —— 见
+        # _refresh_health 里的说明。
+        observed_image = cfg.get("image_snapshot_time") or ""
 
         # Skip intentionally stopped VMs
         stopped_marker = os.path.join(vm_path, ".stopped")
@@ -646,11 +715,14 @@ def _probe_all():
                 "app_health": "down",
                 "guest_ip": guest_ip,
                 "phys_vm_num": phys_vm_num,
+                # 不带 observed_image_snapshot_time:此刻 Firecracker 并未在跑(或 guest
+                # 不可达正在重建网络),vm.json 里的版本只是"上次启动打算用哪个版本",
+                # 不构成"这台 VM 现在真的跑着该版本"的证据。上报它会让控制面把一次
+                # 启动到一半就失败的 rebuild 判成成功(假成功)。
             }
             continue
 
         _recovering.discard(tenant_id)
-        # #315(codex review4 #4)—— FC 进程真活了才算 recover 成功 → 清 backoff。
         # recover 里对任何尝试(含 rc==0)都记了 backoff,只有这里(确认 fc_running=True)才清,
         # 避免"launch-vm 退 0 但 FC 随即死"被误判成功后每 probe 重启。
         _recover_backoff.pop(tenant_id, None)
@@ -710,6 +782,10 @@ def _probe_all():
                 "app_health": "down",
                 "guest_ip": guest_ip,
                 "phys_vm_num": phys_vm_num,
+                # 不带 observed_image_snapshot_time:此刻 Firecracker 并未在跑(或 guest
+                # 不可达正在重建网络),vm.json 里的版本只是"上次启动打算用哪个版本",
+                # 不构成"这台 VM 现在真的跑着该版本"的证据。上报它会让控制面把一次
+                # 启动到一半就失败的 rebuild 判成成功(假成功)。
             }
             continue
 
@@ -719,6 +795,26 @@ def _probe_all():
             "guest_ip": guest_ip,
             "fc_pid": fc_pid,
             "phys_vm_num": phys_vm_num,
+            # 只在【VM 真的起来了】时才上报版本(vm_health=="up" 即 guest ping 通),并连
+            # FC 进程的启动时刻一起上报。
+            #
+            # 为什么两者都必须有:launch-vm.sh 在起 firecracker 之前 800+ 行就把版本写进了
+            # vm.json(建盘/mkfs/解压/拉备份都在那之后),所以「vm.json 里有目标版本」只
+            # 证明启动流程走到了那一行。两种假成功由此而来:
+            #   ① 中途失败 → 版本==目标但 VM 根本没起(ping 不通挡掉);
+            #   ② 旧 FC 没被 stop-vm 杀掉 → VM ping 得通、vm.json 已改成新版本,但跑的还是
+            #      【旧】rootfs(ping 挡不住,只能靠进程启动时刻:它早于本次 rebuild 发起
+            #      时刻,说明这不是本次起来的进程)。
+            # 控制面据此把判据从「版本相符」升格为「版本相符 且 进程是本次 rebuild 之后
+            # 新起的」。缺失该时刻(读不到 /proc)时控制面不得单凭版本判 done。
+            **(
+                {
+                    "observed_image_snapshot_time": observed_image,
+                    "observed_boot_at": _fc_boot_iso(fc_pid),
+                }
+                if vm_health == "up"
+                else {}
+            ),
         }
 
     return results
@@ -735,11 +831,9 @@ def _probe_all():
 
 
 VM_DATA_MOUNT = "/data"
-# #340 磁盘上报独立线程节奏。默认 15s(= poll 默认),但走自己的线程不被 VM probe 拖累。
 # 消费侧 TTL(DISPATCH_DISK_REPORT_TTL_SEC,默认 90s)是它的数倍,容几次漏报不误判陈旧。
 _DISK_REPORT_INTERVAL_SEC = int(os.environ.get("OC_DISK_REPORT_INTERVAL_SEC", "15"))
 
-# #340 — 磁盘上报线程【专属】DDB resource。boto3 Session/Resource 非线程安全(AWS 官方),
 # 全局 _get_ddb() 的 _ddb 已被 poll/GC/dispatch 共享,故磁盘线程用【独立 Session】完全绕开它
 # (codex review:之前从 _get_ddb() 取 region 又碰了共享对象)。超时收紧到远小于消费侧 TTL:
 # 默认 connect/read 各 60s + 重试,最坏可远超 90s TTL → 写卡顿时报告陈旧、消费侧 fail-open,
@@ -864,6 +958,20 @@ def _write_host_heartbeat():
         if slots is not None:
             expression += ", image_slots = :slots, image_slots_synced_at_epoch = :se"
             values.update({":slots": slots, ":se": int(time.time())})
+        # 为什么需要它:账本 used_mem_mb 只证明"声明内存没超卖";租户真实占用可能超出
+        # 声明(balloon 回收是 best-effort)。调度器据此在物理内存跌破水位时停止向该
+        # host 派新租户。带 ts 让调度侧能判新鲜度、陈旧即 fail-open —— 与既有的
+        # avail_disk_mb / disk_check_ts_epoch 同一范式。
+        # total==0 说明 /proc/meminfo 读失败,此时【不写】任何字段:让调度侧走"无信号
+        # → fail-open",而不是写个 0 进去把整台 host 永久判成内存耗尽。
+        _mem_total, _mem_avail = _get_host_mem_info()
+        if _mem_total > 0:
+            expression += (
+                ", mem_total_mb = :mt, mem_avail_mb = :ma, mem_check_ts_epoch = :mts"
+            )
+            values.update(
+                {":mt": _mem_total, ":ma": _mem_avail, ":mts": int(time.time())}
+            )
         table.update_item(
             Key={"instance_id": INSTANCE_ID},
             UpdateExpression=expression,
@@ -878,7 +986,6 @@ def _refresh_health(table, tid, info, now, metrics):
     """Health-refresh write for a tenant NOT promoted this tick (already
     running, still creating with the gateway not up yet, or down).
 
-    #237 — beyond the health fields, reconcile `guest_ip` to the data-plane
     truth carried up from the local vm.json. A control-plane↔data-plane drift
     (DDB records a guest_ip the host never actually booted — e.g. DDB .30 while
     the host launched .26) otherwise festers as a ghost forever: the promote
@@ -920,6 +1027,30 @@ def _refresh_health(table, tid, info, now, metrics):
         ":gi": info.get("guest_ip", ""),
         ":self": INSTANCE_ID,
     }
+    # ADR-rebuild-idempotency-sync-contract §5.4a 路 2 —— 上报本机 vm.json 里记的
+    # 【实际运行版本】,供控制面与 rebuild_target_snapshot_time(期望值)异步对账。
+    # 这样一次回执丢失的 rebuild 不再只能停在 unconfirmed:期望 == 实际即可确认成功,
+    # 完全不依赖那次 SSM 调用的成败。
+    #
+    # 只在有值时写:空值不覆盖已有字段。vm.json 缺该字段的情况真实存在(legacy 扁平布局
+    # 下 launch-vm 不写、老租户的 vm.json 是加该字段之前生成的),写空串会把上一次的真值
+    # 抹成空 → 对账反而失去依据。
+    #
+    # **只能用于确认成功,不能用于判定失败**(ADR §5.4a 约束 2):launch-vm 写它是
+    # best-effort(jq 失败即跳过、注释明写"纯审计信息"),且它记的是"启动时打算用哪个
+    # 版本"而不是"当前进程真的挂着哪个 rootfs"。宽松方向(有证据就认成功)安全;严格
+    # 方向(没证据就判失败)会误杀。故控制面侧的对账逻辑必须只做 == 目标 → done,
+    # 绝不因该字段缺失或不等而标 failed。
+    _observed = (info.get("observed_image_snapshot_time") or "").strip()
+    if _observed:
+        expr += ", observed_image_snapshot_time = :ois"
+        vals[":ois"] = _observed
+        # 连 FC 进程启动时刻一起上报(见 _probe_all 里的理由):控制面要靠它区分"这是本次
+        # rebuild 新起的进程"与"旧 FC 没死、只是 vm.json 被改了"。空串照样写:让控制面能
+        # 分清"没有启动证据"(不得单凭版本判 done)与"上一轮的旧证据"(会误判)。两者必须
+        # 同进同退,否则会出现新版本配旧启动时刻的错配组合。
+        expr += ", observed_boot_at = :oba"
+        vals[":oba"] = info.get("observed_boot_at") or ""
     names = None
     if metrics is not None:
         expr += ", #m = :m"  # `metrics` is a DDB reserved keyword — alias via #m.
@@ -943,7 +1074,6 @@ def _write_ddb(results):
     table = _get_ddb().Table(TENANTS_TABLE)
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     for tid, info in results.items():
-        # #208 — phys_vm_num 回填(物理 tap 权威值)。历史/迁移前建的租户 DDB 无此字段,
         # 撞号检查(create + migrate)对它们会退回 vm_num,迁移过的会有短暂盲区。这里用 vm.json
         # 里的物理 vm_num 补齐,if_not_exists 保证只写一次、绝不覆盖(create 已写的、或先前
         # 回填的都不动)——迁移把 vm_num 翻成 target 槽时 phys_vm_num 恒定,靠的正是"绝不覆盖"。
@@ -962,7 +1092,6 @@ def _write_ddb(results):
             except Exception as e:
                 print(f"phys_vm_num backfill {tid} (non-fatal): {e}")
 
-        # Compute per-VM metrics for healthy VMs (issue #3).
         # Skipped for down/recovering VMs to keep their last-known metrics
         # rather than overwriting with zeros (which would mask the failure).
         metrics = None
@@ -996,7 +1125,6 @@ def _write_ddb(results):
                 info["metrics"] = metrics
 
         try:
-            # #197 — promotion gate 加 app_health:只 gate vm_health(ICMP ping)会让
             # gateway 崩溃重启(schema fail-closed 拒未知 key 等)的 VM 冒充 running——
             # ping 通但 gateway HTTP server 挂,租户对外全 502 却报 running(实测 gateway
             # 崩 2715 次仍 running)。promote 要 VM 活(ping)且 gateway 活(18789 端口有
@@ -1015,7 +1143,6 @@ def _write_ddb(results):
                     host_private_ip, host_port = _ensure_route(tid, info["guest_ip"])
                 except Exception as e:
                     print(f"ensure_route {tid} failed (skip promote this tick): {e}")
-                    # #387: count BOTH skip-promote branches — each leaves the
                     # tenant stuck at creating; counting only one under-reports.
                     with _lock:
                         _agent_metrics["route_ensure_failures"] += 1
@@ -1030,7 +1157,6 @@ def _write_ddb(results):
                 # Same for `status` (#s, already aliased). Without #m the
                 # update_item call returns ValidationException and the tenant
                 # never gets promoted to running.
-                # #237 — stamp host_id = :self on promote. The promoting host
                 # definitionally runs this VM (it read the local vm.json), so
                 # this self-heals a record that reached us with host_id
                 # unset/stale (e.g. a dispatch backfill that failed under
@@ -1040,8 +1166,6 @@ def _write_ddb(results):
                 # untouched (no cross-host clobber). We do NOT write vm_num here:
                 # this is the fresh creating→running promote, whose guest_ip is
                 # already correct; the logical(DDB)↔physical(vm.json) vm_num split
-                # after migration is #208's job (phys_vm_num), not host-agent's.
-                # #412(codex review2 #1)—— promote creating→running 时 REMOVE
                 # capacity_reservation_id:VM 已真起,容量归 running 租户合法持有,后续正常
                 # delete(按 item.vcpu 扣)回收。清掉令牌后,poller/rollback 的失败释放
                 # (条件 capacity_reservation_id=:rid)对已 running 租户落空(no-op)→ 绝不误删
@@ -1079,12 +1203,10 @@ def _write_ddb(results):
                     ":self": INSTANCE_ID,
                     ":m": metrics or {},
                 }
-                # #412(codex review5 #2)—— host_id 不是 ABA-safe 的 promote 闸:租户被释放后
                 # 重投【落回同一 host】拿【新】预留(新 vm_num N2,vm_num 单调不复用),此时本机
                 # 若残留【旧】vm.json(旧 vm_num N1)会把 N2 的租户按 N1 promote → DDB 放置与实跑
                 # VM 的 vm_num 分叉。加 vm_num=:phys 闸:只 promote 【DDB vm_num == 本机 vm.json
                 # vm_num】的租户,旧 vm.json 的 N1≠N2 → 条件失败跳过(等旧 VM 被 orphan-reap 清)。
-                # 只【条件】用 vm_num,不【写】它(#208:promote 不写 vm_num,迁移安全不变)。
                 # phys_vm_num 缺失(legacy vm.json 无 vm_num)→ 回落仅 host_id 闸(不比现状差)。
                 _phys = info.get("phys_vm_num")
                 if _phys is not None:
@@ -1098,12 +1220,9 @@ def _write_ddb(results):
                         "#s = :c AND host_id = :self "
                         "AND attribute_not_exists(dispatch_settle)"
                     )
-                # #412(codex review3 #1)—— promote 必须与令牌释放【互斥】,否则:poller/rollback
                 # 释放清了 host_id/token/容量但留 status=creating,本 promote 若只判 #s=:c 会把
                 # 已释放的租户"复活"成 running,而容量已扣 → 未记账的 running VM(超卖)。fence 加
                 # host_id=:self:promote 的租户来自本机 vm.json(reserve 时 host_id 已原子写成本机),
-                # 释放会 REMOVE host_id → host_id=:self 条件失败 → 不复活。#412 后 dispatch 租户在
-                # reserve 就落 host_id(不再有 host_id-less 的 creating 需要 #237 自愈),故 fence 安全;
                 # 队列等待的无 host_id 租户没有本机 vm.json、根本到不了 promote。
                 try:
                     table.update_item(
@@ -1120,7 +1239,6 @@ def _write_ddb(results):
                 except table.meta.client.exceptions.ConditionalCheckFailedException:
                     # promote's `#s = :c AND host_id = :self` lost: tenant is already
                     # running (normal — just refresh), deleted / migrated away, OR
-                    # #412 —— 其 dispatch 预留已被释放(host_id 被 REMOVE)→ 正在拆除,
                     # 【绝不复活】。回落 guarded refresh(attribute_exists(id) + host_id);
                     # 已释放租户 host_id 没了 → refresh 的 host_id 守卫也 CCF → 干净 no-op。
                     _refresh_health(table, tid, info, now, metrics)
@@ -1137,7 +1255,6 @@ def _write_ddb(results):
 
 
 # ═══════════════════════════════════════════
-# Per-VM resource metrics (issue #3)
 # ═══════════════════════════════════════════
 #
 # Sources:
@@ -1276,6 +1393,39 @@ def _read_proc_stat_cpu_jiffies(pid):
     # index 11, field 15 (stime) becomes index 12.
     try:
         return int(fields[11]) + int(fields[12])
+    except (IndexError, ValueError):
+        return None
+
+
+def _read_proc_start_ticks(pid):
+    """/proc/<pid>/stat 的 field 22(starttime,单位 clock ticks since boot)。None 表示读不到。
+
+    用途(ADR-rebuild-idempotency-sync-contract §5.4a 路 2 的证据强度):单看 vm.json 里的
+    版本不足以证明"这台 VM 现在真的跑着该版本"—— launch-vm.sh 在起 firecracker 之前 800+ 行
+    就写了那个字段,中途失败会留下「版本==目标但 VM 没起」;更隐蔽的是旧 FC 没被 stop-vm 杀掉
+    的情况:VM ping 得通、vm.json 已被改成新版本,但跑的还是【旧】rootfs。两种都会让只看
+    版本的对账判出假成功。
+
+    FC 进程的启动时刻能把这两种情形排掉:rebuild 必然 kill 旧 FC 再起新 FC,所以只有
+    「FC 的启动时刻晚于本次 rebuild 的发起时刻」才说明这是本次 rebuild 起来的那个进程。
+    控制面据此把「版本相符」升格为「版本相符 且 进程是本次新起的」。
+
+    与 _read_proc_stat_cpu_jiffies 同款解析:comm 字段(#2)可能含空格和括号,故从最后一个
+    `)` 之后再切分。切分后 field 22 落在 index 19。纯函数,测试用 tmpfs fixture 即可驱动。
+    """
+    if not pid:
+        return None
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+            line = f.read()
+    except (FileNotFoundError, PermissionError):
+        return None
+    rparen = line.rfind(")")
+    if rparen < 0:
+        return None
+    fields = line[rparen + 1 :].split()
+    try:
+        return int(fields[19])
     except (IndexError, ValueError):
         return None
 
@@ -1506,6 +1656,66 @@ def _adjust_balloons(probe_results):
                 )
 
 
+
+# 搁浅 = 本维还有余量,但【另一维】已装不下最小规格租户,导致本维余量永远用不出去。
+# 为什么要这个指标:统一 1:4 下 M 系(4 GB/vCPU,只有 1c2G 需求 2 GB/vCPU 的一半)
+# 必然 CPU 搁浅,这是已接受的代价 —— 但必须【可观测】,否则扩容决策会误判"还有 CPU"。
+# 口径按【资源量】不按个数:VM 个数随规格组合浮动,资源占用才是确定的。
+_STRAND_CPU_RATIO = float(os.environ.get("CPU_OVERCOMMIT_RATIO", "1.0") or "1.0")
+_STRAND_MEM_RATIO = float(os.environ.get("MEM_OVERCOMMIT_RATIO", "1.0") or "1.0")
+_STRAND_MIN_VCPU = int(os.environ.get("VM_DEFAULT_VCPU", "1") or "1")
+_STRAND_MIN_MEM_MB = int(os.environ.get("VM_DEFAULT_MEM", "2048") or "2048")
+
+
+def _overcommit_for_family(instance_type):
+    """per-family 超卖比(与控制面 core.host_profile.ratios 同口径)。
+
+    OVERCOMMIT_BY_FAMILY 是 JSON:{"m8g":{"cpu":4.0,"mem":1.025},...}。缺项/非法
+    回落全局 CPU/MEM_OVERCOMMIT_RATIO —— 与控制面 fail-safe 一致,不因一个畸形
+    环境变量让指标算错。"""
+    raw = os.environ.get("OVERCOMMIT_BY_FAMILY", "")
+    cpu_r, mem_r = _STRAND_CPU_RATIO, _STRAND_MEM_RATIO
+    if not raw or not instance_type:
+        return cpu_r, mem_r
+    try:
+        table = json.loads(raw)
+        entry = table.get(str(instance_type).split(".")[0]) or {}
+        if isinstance(entry, dict):
+            cpu_r = float(entry.get("cpu", cpu_r))
+            mem_r = float(entry.get("mem", mem_r))
+    except (ValueError, TypeError):
+        pass
+    return cpu_r, mem_r
+
+
+def _collect_stranding_stats():
+    """(stranded_vcpu, stranded_mem_mb, alloc_vcpu, alloc_mem_mb) 或 None。
+
+    读本机 host 行(强一致不必要:指标容忍一个 poll 周期的滞后)。任何缺字段/读失败
+    → 返 None,让 /metrics 整组省略该指标 —— 与 port_stats 同款"绝不吐假 0"。
+    """
+    if not HOSTS_TABLE or not INSTANCE_ID:
+        return None
+    try:
+        item = (
+            _get_ddb().Table(HOSTS_TABLE).get_item(Key={"instance_id": INSTANCE_ID})
+        ).get("Item")
+        if not item:
+            return None
+        tv, tm = int(item["total_vcpu"]), int(item["total_mem_mb"])
+        uv, um = int(item.get("used_vcpu", 0)), int(item.get("used_mem_mb", 0))
+        cpu_r, mem_r = _overcommit_for_family(item.get("instance_type"))
+        alloc_v, alloc_m = int(tv * cpu_r), int(tm * mem_r)
+        free_v, free_m = max(0, alloc_v - uv), max(0, alloc_m - um)
+        # 与控制面 core.capacity.stranded() 逐字同款判据(两处必须同口径,否则
+        # 指标说的搁浅与调度器判定的搁浅不是一回事)。
+        s_vcpu = free_v if free_m < _STRAND_MIN_MEM_MB else 0
+        s_mem = free_m if free_v < _STRAND_MIN_VCPU else 0
+        return s_vcpu, s_mem, alloc_v, alloc_m
+    except Exception as e:  # noqa: BLE001 — 指标采集失败绝不影响 /metrics 可用性
+        print(f"stranding stats collection failed (omitted): {e}")
+        return None
+
 # Orphan-firecracker overwatcher (Firecracker prod-host-setup.md:69-83 recommends
 # a host process that reaps unresponsive/leaked firecrackers). Our normal recovery
 # only iterates vm.json dirs, so a firecracker whose vm.json was already removed
@@ -1514,7 +1724,6 @@ def _adjust_balloons(probe_results):
 # This sweep finds firecrackers whose socket dir has no vm.json and SIGKILLs them.
 _ORPHAN_GRACE_SEC = int(os.environ.get("OC_ORPHAN_GRACE_SEC", "120"))
 
-# #321 — 已删租户的 VM 目录(data.ext4+overlay.ext4,~85M/个)磁盘回收兜底。delete 侧
 # tenant_service.py rm -rf 在高负载下 SSM 丢/超时会漏删,孤儿累积撑满 /data(真机实测:
 # host 82% 目录是漏删孤儿,/data 64~70% → 撑满后新 VM mkdir 失败转 intervention)。
 # 独立单例线程(不阻塞 poll heartbeat:50×rm 超时最坏会累计撑过 stale 门槛误判重启,
@@ -1706,7 +1915,6 @@ def _reap_orphan_firecrackers():
                     print(f"overwatcher: removed orphan nginx route {orphan_tid}")
                 except Exception:
                     pass
-            # #134 修:孤儿(含 delete 后残留)也要清 Redis route: 键——否则 edge 仍
             # 缓存指向已删 VM 的 host:port(DNAT 已被控制面摘,连接 refused/502)。
             # _release_route 无条件 del_route(tenant),port=None 时跳过 DNAT(delete 已摘)。
             try:
@@ -1966,7 +2174,6 @@ def _promote_tenant_running(tenant_id):
         return
     try:
         table = _get_ddb().Table(TENANTS_TABLE)
-        # #412(codex review2 #1)—— promote 时 REMOVE capacity_reservation_id(同 _write_ddb
         # 的对偶):running 租户容量归其合法持有,清令牌后失败释放对它落空、绝不误删活租户。
         table.update_item(
             Key={"id": tenant_id},
@@ -2007,7 +2214,6 @@ def _flag_requires_intervention(tenant_id):
     """Budget exhausted: tenants.status=requires_intervention (no reset). Only
     from creating/failed to avoid clobbering a subsequent recovery.
 
-    #315(codex review7 P2)返回 assignment 应写的终态字符串,让 assignment 与 tenant 状态一致:
     - 写成功 → "failed":tenant 刚翻 requires_intervention,assignment 标 failed 匹配。
     - CCF → 回读 tenant 真实状态定夺(不再一律当 failed,否则健康线程已 promote running 时会留下
       tenant=running / assignment=failed 矛盾):
@@ -2037,7 +2243,6 @@ def _flag_requires_intervention(tenant_id):
             print(f"requires_intervention {tenant_id} failed: {e}")
             return None  # 真异常:终态未确认,保持 assignment pending
         # CCF:tenant 已非 creating/failed → 回读真实状态,让 assignment 与之一致。
-        # #315(codex review8 P2)ConsistentRead=True:健康线程刚 promote running 触发本 CCF,
         # 默认最终一致的 get_item 可能仍读到旧 creating → 误返 "failed" 再成矛盾态。强一致读拿
         # 到刚写入的 running。
         try:
@@ -2086,14 +2291,12 @@ def _execute_launch(assignment):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        # #267 — rc 75 = launch-vm.sh per-tenant flock 抢锁失败(#256):另一进程
         # (push fan-out / ssm wake / _recover_vm)正在起同租户,是良性 skip,不是失败。
         # 返 "skip" 让调用点保持 assignment pending(不标 failed、不消耗 retry 预算),
         # 下一 tick 自然收敛或 winner 已起好后 vm.json 存在被跳过。systemd-cat 透传
         # 退出码(systemd 255 真机实测:exit 75→rc 75),故这里能拿到真实 75。
         if rc == 75:
             return "skip"
-        # #411/6.3 codex(round5) — launch-vm status 闸的两个新退出码,pull 路径也要按语义分开,
         # 不能落进 `rc == 0` 的 False 当普通失败(那会烧 retry 预算 + 把在途/回滚态误判终态):
         #   44 = 租户已 deleted(终态)→ "abort":调用点标 assignment done、不重投、不计失败。
         #   45 = deleting/状态未知/读失败(非终态,delete 可能回滚)→ "skip":保持 pending、
@@ -2157,12 +2360,10 @@ def _dispatch_tick(table):
         tid = step["tenant_id"]
         if step["action"] == "skip_done":
             _mark_assignment_done(table, INSTANCE_ID, tid)
-            # #315 — 不在此处直接 promote:_promote_tenant_running 无健康/路由检查,会把
             # 半成品 VM(vm.json 在但 FC 没起/gateway 没活)误标 running(真机 28/300 卡的
             # 反面:误 promote 更糟)。统一由健康探测路径 _write_ddb 在 vm_health+app_health
             # (gateway 18789 应答)+ _ensure_route 都成立后才 creating→running(codex 判:唯一 promote 写手)。
         elif step["action"] == "over_budget":
-            # #315(codex review7 P2)先写 tenant 终态,按返回的终态给 assignment 打一致标签:
             # "failed"→标 failed;"done"(tenant 已被健康线程 promote running)→标 done 避免
             # tenant=running/assignment=failed 矛盾;None(DDB 异常)→保持 pending 下轮重试不断链。
             _final = _flag_requires_intervention(tid)
@@ -2205,13 +2406,11 @@ def _dispatch_tick(table):
                 err_reason = str(e) or err_reason
                 print(f"dispatch future {tid} raised: {err_reason}")
                 ok = False
-            # #267 — flock skip 必须在 `if ok:` 之前判:"skip" 是 truthy 字符串,
             # 落 `if ok:` 会被当成功 _mark_assignment_done → 该租户其实没起(winner
             # 可能也失败),孤儿。skip = 良性(另一进程在起同租户),保持 pending 不动,
             # 不标 done/failed、不消耗 retry 预算、不重入队,下一 tick 由 DDB 行决定。
             if ok == "skip":
                 continue
-            # #411/6.3 codex(round5) — "abort" = launch-vm status 闸读到租户已 deleted(rc44,
             # 终态)。与 "skip"(rc45/75,保持 pending)不同:deleted 是终态,标 assignment done
             # 停止重投(否则每 tick 反复叫醒 host 起一个已删租户的 VM)。必须在 `if ok:` 之前判
             # ——"abort" 也是 truthy 字符串,落 `if ok:` 会被 _mark_assignment_done 但走的是
@@ -2221,7 +2420,6 @@ def _dispatch_tick(table):
                 continue
             if ok:
                 _mark_assignment_done(table, INSTANCE_ID, tid)
-                # #315 — 不在此处直接 promote(见 skip_done 分支同款理由):launch-vm 返回 0
                 # 只代表脚本退出 0,不代表 gateway 已活、路由已通。半成品 VM(START 后被杀/
                 # gateway 没起)会被误标 running。统一由 _write_ddb 健康门 promote(唯一写手)。
             else:
@@ -2234,7 +2432,6 @@ def _dispatch_tick(table):
                 _dispatch_enqueue(tid, delay)
                 if not is_transient:
                     new_retries = _bump_dispatch_retries(tid)
-                # #315(codex 点 5)真机 15/300 卡 creating 根因:旧版无条件
                 # _mark_assignment_failed(pending→failed),但 _query_pending_assignments
                 # 只查 pending → assignment 一旦 failed,dispatch_tick 下轮再也捞不到它,
                 # _dispatch_enqueue 的 backoff 成摆设(队列说"可起"但 DDB 捞不到 pending 就不起)
@@ -2246,7 +2443,6 @@ def _dispatch_tick(table):
                     and new_retries is not None
                     and (new_retries >= DISPATCH_RETRY_BUDGET)
                 ):
-                    # #315(codex review7 P2)先写 tenant 终态,按返回的终态给 assignment 一致标签:
                     # "failed"→failed;"done"(健康线程已 promote running)→done 避免矛盾态;
                     # None(DDB 异常)→保持 pending 下轮重捞重试,不断链(两写不原子的安全顺序)。
                     _final = _flag_requires_intervention(tid)
@@ -2466,7 +2662,6 @@ def _poll_loop():
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/metrics":
-            # Prometheus text exposition (issue #4). Scraped by sibling
             # ADOT collector that remote-writes to AMP.
             with _lock:
                 data = dict(_status)
@@ -2478,7 +2673,6 @@ class Handler(BaseHTTPRequestHandler):
                     "build_sha": _agent_metrics.get("build_sha"),
                     "ssm_agent_up": _agent_metrics.get("ssm_agent_up"),
                 }
-            # #387: read the port bitmap ONLY if already initialized — going
             # through _get_port_bitmap() here would lazily rebuild from
             # iptables (mutating global state) on a host that never allocated
             # a route. Uninitialized → port_stats=None → series absent.
@@ -2503,7 +2697,10 @@ class Handler(BaseHTTPRequestHandler):
                     # never crash /metrics).
                     print(f"port stats collection failed (omitted): {e}")
                     port_stats = None
-            body = _render_metrics_text(data, port_stats, agent_stats).encode()
+            stranding = _collect_stranding_stats()
+            body = _render_metrics_text(
+                data, port_stats, agent_stats, stranding
+            ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; version=0.0.4")
             self.send_header("Content-Length", str(len(body)))
@@ -2528,7 +2725,6 @@ def main():
     print(
         f"openclaw-agent starting on :{PORT}, poll every {POLL_INTERVAL}s, table={TENANTS_TABLE}"
     )
-    # #387 (#373 病史): freeze THIS process's own file sha256 at startup.
     # Hot-copying host-agent.py without restarting leaves disk-new/process-old
     # drift — a startup-frozen hash makes that drift observable in /metrics.
     try:
@@ -2541,7 +2737,6 @@ def main():
         print(f"agent build sha256: {_sha}")
     except Exception as e:  # noqa: BLE001
         print(f"build sha capture failed (metric absent): {e}")
-    # #387 (codex 评审): startup port-bitmap recovery. Without this, an agent
     # restart on a host whose VMs are ALL stopped/down leaves _port_bitmap None
     # forever (no promote → no lazy init) and the port gauges stay absent while
     # real DNAT allocations exist — exhaustion alerts go blind. Rebuild once at
@@ -2560,11 +2755,9 @@ def main():
         print(f"port_bitmap startup recovery failed (stays lazy): {e}")
     t = threading.Thread(target=_poll_loop, daemon=True)
     t.start()
-    # #321: disk GC on its own always-on thread (independent of dispatch/poll so a
     # stuck rm -rf never blocks heartbeat → no false stale-restart).
     g = threading.Thread(target=_disk_gc_loop, daemon=True)
     g.start()
-    # #340: /data free-space report on its own thread (independent of poll's slow VM
     # probes so a busy host's disk timestamp stays fresh → stale ⟺ agent actually down,
     # letting dispatch fail-open safely on stale reads instead of mis-blocking).
     dr = threading.Thread(target=_disk_report_loop, daemon=True)

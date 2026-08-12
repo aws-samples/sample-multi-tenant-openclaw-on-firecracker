@@ -6,7 +6,6 @@ window.ocTenants = {
   form: { name: '', vcpu: null, memory_mb: null, config_template: '', preferred_host_id: '', group: '', tags_text: '', image_channel: 'live' },
   statusFilter: 'all',   // filter for tenants list
   tagFilter: '',         // filter expression: "k1:v1,k2:v2" — AND across pairs
-  // #187 转型:reveal token + descriptor modal 状态。
   // reveal 显示的是 KMS 密文(base64 信封,§INTERFACE-CONTRACT §5),调用方
   // 拿 tenant_id 作 EncryptionContext 自解得明文;API 侧不 decrypt。
   revealState: { open: false, tenantId: '', ciphertext: '', error: '', descriptor: null, loading: false },
@@ -18,7 +17,6 @@ window.ocTenants = {
     catch { this.connected = false; }
     this.loadingTenants = false;
   },
-  // #217 — quiet poll variant: refresh tenants WITHOUT the loading flag so the
   // 5s background poll doesn't flash the spinner or empty-state on every beat.
   async pollTenants() {
     if (!this.apiUrl || !this.apiKey) return;
@@ -42,7 +40,6 @@ window.ocTenants = {
     if (this.form.memory_mb) body.mem_mb = this.form.memory_mb;
     if (this.form.config_template) body.config_template = this.form.config_template;
     if (this.form.preferred_host_id) body.preferred_host_id = this.form.preferred_host_id;
-    // #394 — canary tenant: boots the host's canary slot. Requires preferred_host_id
     // (the canary slot only exists on the host it was pulled to). Default 'live' →
     // omit the field so legacy create behavior is byte-identical.
     if (this.form.image_channel === 'canary') body.image_channel = 'canary';
@@ -107,7 +104,30 @@ window.ocTenants = {
     setTimeout(() => this.toast = '', 2000);
     this.loadTenants();
   },
-  // #187 转型:拉 gateway token 密文 + descriptor(host_private_ip/host_port/
+  // channel='live' 切回 live 语义(移除固定版本,启动解析 host 当前 live)。都【不接受
+  // 任意版本】——不传 expected_image_snapshot_time,后端 resolve_pinned_version 以该 host
+  // 当前槽为准;canary 时该 host 没有 READY canary 槽 → 后端返 409 CANARY_NOT_READY。
+  // 换版前后端强制备份 fail-closed(no-data-loss)。用 apiStatus(fail-loud)而非 api
+  // (吞 status),否则 409/5xx 会被静默当成功。
+  async rebuildTo(id, channel) {
+    const label = channel === 'canary' ? 'canary 候选版本' : 'live(当前 host live 版本)';
+    const extra = channel === 'canary' ? ';若本机无 canary 槽将报错' : '';
+    if (!confirm('把租户 ' + id + ' rebuild 到 ' + label + '?换版前会强制备份' + extra + '。')) return;
+    this.toast = 'rebuild→' + channel + '…';
+    const r = await this.apiStatus('POST', 'tenants/' + id + '/rebuild', { image_channel: channel });
+    if (r.ok) {
+      // rebuild_status 三值(ADR-rebuild-idempotency-sync-contract §5.4):done / failed /
+      // unconfirmed。unconfirmed = 没能确认(回执丢),真机很可能已升级成功 —— 此时【不要】
+      // 重试,重试会再丢一次 overlay、抹掉两次之间的写入,应轮询等对账收敛。
+      this.toast = '✓ 已 rebuild→' + channel + '(看 rebuild_status:done 成功 / failed 可重试 / unconfirmed 请勿重试,轮询等确认)';
+    } else {
+      const b = r.body || {};
+      const code = b.code ? ' [' + b.code + ']' : '';
+      this.toast = '✗ rebuild ' + channel + ' 失败' + code + ': ' + (b.error || ('HTTP ' + r.status));
+    }
+    setTimeout(() => this.toast = '', 4000);
+    this.loadTenants();
+  },
   // guest_ip/status)进 modal。轮询响应带 gateway_token 密文由 API Lambda 从
   // openclaw-tenant-secrets 表读出原样返回,不 decrypt。调用方拷回本地自解。
   async revealToken(id) {

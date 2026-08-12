@@ -774,7 +774,6 @@
                       <div class="canary-pipe-head" style="align-items: flex-start">
                         <span class="panel-title" style="font-size: 12px">🕯 Canary Pipeline</span>
                         <span style="display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0">
-                          <!-- #394 — 真机实读:点它 SSM 读 host 盘上真实 slots.json + versions/(DDB 镜像滞后时对照真相)。 -->
                           <button
                             class="btn-act"
                             style="font-size: 10px; padding: 1px 5px"
@@ -1185,6 +1184,24 @@
                       <template x-if="t.image_channel === 'live' || !t.image_channel">
                         <div style="opacity: 0.6" x-text="'live'"></div>
                       </template>
+                      <!-- #456 — rebuild 进度/终态。放 Rootfs 列是因为 rebuild 本质就是
+                           "换到哪个版本、到哪一步了",与本列语义同源;而 Status 列是租户
+                           生命周期(running/stopped/…),rebuild 期间它恒为 running,看不出
+                           任何进展。没有这一格,rebuild_phase / rebuild_status 只存在于
+                           API 响应里,运维在控制台仍然是全黑的 —— 那正是本轮要修的问题。
+                           in-flight(queued/running/verifying)显橙色 + 脉冲,终态显结论:
+                           done 绿、failed 红、unconfirmed 黄(黄=不知道,别急着重试)。 -->
+                      <template x-if="t.rebuild_phase || t.rebuild_status">
+                        <div
+                          style="margin-top: 2px"
+                          :title="rebuildHint(t)"
+                        >
+                          <span
+                            :style="rebuildStyle(t)"
+                            x-text="rebuildLabel(t)"
+                          ></span>
+                        </div>
+                      </template>
                     </td>
                     <td>
                       <span
@@ -1257,6 +1274,24 @@
                             >
                               <svg class="icon s13"><use href="#i-move" /></svg
                               ><span class="act-lbl">迁移</span>
+                            </button>
+                            <!-- #416 — 显式换版 rebuild(不接受任意版本:只切本机当前 canary
+                                 槽 / 切回 live)。换版前后端强制备份;canary 时本机无槽返 409。 -->
+                            <button
+                              class="btn-act"
+                              title="rebuild 到本机 canary 候选版本(无 canary 槽会报错;换版前强制备份)"
+                              @click="rebuildTo(t.id,'canary')"
+                            >
+                              <svg class="icon s13"><use href="#i-rotate-ccw" /></svg
+                              ><span class="act-lbl">rebuild→canary</span>
+                            </button>
+                            <button
+                              class="btn-act"
+                              title="rebuild 切回 live(移除固定版本,启动解析 host 当前 live;换版前强制备份)"
+                              @click="rebuildTo(t.id,'live')"
+                            >
+                              <svg class="icon s13"><use href="#i-rotate-ccw" /></svg
+                              ><span class="act-lbl">rebuild→live</span>
                             </button>
                           </span>
                         </template>
@@ -1513,7 +1548,6 @@
         </div>
       </div>
 
-      <!-- Groups (1.4.0 #62 / 1.4.1 #63) -->
       <div class="section-card">
         <h3 style="display: flex; align-items: center; gap: 8px">
           <svg class="icon s14" style="vertical-align: -2px">
@@ -1680,7 +1714,6 @@
         </div>
       </div>
 
-      <!-- Skills (1.4.1 #63 — full CRUD) -->
       <div class="section-card">
         <h3 style="display: flex; align-items: center; gap: 8px">
           <svg class="icon s14" style="vertical-align: -2px">
@@ -2351,7 +2384,6 @@ openclaw_vm_disk_used_pct &gt; 90</pre
       </p>
     </div>
 
-    <!-- Page: Edge — P4-③ (#187) OpenResty ASG + /metrics view -->
     <div x-show="page==='edge'" class="page-content">
       <h2>🌐 Edge (OpenResty ASG)</h2>
       <div
@@ -2495,8 +2527,6 @@ openclaw_vm_disk_used_pct &gt; 90</pre
       </section>
     </div>
 
-    <!-- Page: Audit & Ops (#236/#235 — audit-log / images / per-user fleet; via BFF /capi) -->
-    <!-- Page: Traces (#235 — X-Ray trace viewer via BFF /capi/traces) -->
     <div x-show="page==='traces'" class="page-content">
       <h2>🔎 Traces</h2>
 
@@ -2786,7 +2816,6 @@ openclaw_vm_disk_used_pct &gt; 90</pre
       </div>
     </div>
 
-    <!-- Page: Logs (#266 — 按租户查 VM firecracker 启动 / host / Lambda 日志) -->
     <div x-show="page==='logs'" class="page-content">
       <h2>📜 Logs</h2>
       <div class="section-card">
@@ -3746,7 +3775,6 @@ openclaw_vm_disk_used_pct &gt; 90</pre
     </div>
 
     <!-- Create / Restore Tenant Modal (global — not nested in any tab so it's visible from Tenants and Backups) -->
-    <!-- 1.4.1 (#63) — Skill upload modal -->
     <template x-if="showSkillUpload">
       <div class="overlay" @click.self="showSkillUpload=false">
         <div class="modal" style="width: 680px">
@@ -3806,7 +3834,6 @@ openclaw_vm_disk_used_pct &gt; 90</pre
       </div>
     </template>
 
-    <!-- 1.4.1 (#63) — Group create modal -->
     <template x-if="showGroupModal">
       <div class="overlay" @click.self="showGroupModal=false">
         <div class="modal">
@@ -3865,7 +3892,6 @@ openclaw_vm_disk_used_pct &gt; 90</pre
       </div>
     </template>
 
-    <!-- #309 — Copy file S3→EC2 modal (in-app, replaces native prompt). -->
     <!-- #333 — 太容易误关(填了 s3_uri/target 点偏就丢)。close 只留【明确动作】:右上角 X
          或 Cancel 按钮。①遮罩点击【不关】(去掉 @click.self,防点偏/拖选松手误关)②keydown.stop
          隔离按键、不加 Escape ③打开自动聚焦输入框、按钮 type=button(防误触发)。 -->

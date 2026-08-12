@@ -48,11 +48,9 @@ def _resolve_proxy_route(method, path, route_keys):
 
 
 # ============================================================
-# Groups CRUD (1.4.0 / #62)
 # ============================================================
 
 
-# ========== Skills CRUD (1.4.1 #63 — Console skills management) ==========
 #
 # Read/write SKILL.md content directly via API so the operator console
 # can offer in-browser edit/upload/delete without requiring an AWS
@@ -61,22 +59,17 @@ def _resolve_proxy_route(method, path, route_keys):
 # RBAC + audit-log infrastructure.
 
 
-# issue #59 (WI-E/M-1) — config_template is caller-controlled and flows into an
 # SSM root shell command; its ONLY legitimate use is as an S3 path slug
 # (launch-vm.sh: s3://$ASSETS_BUCKET/templates/openclaw/${CONFIG_TEMPLATE}/openclaw.json),
 # so it must be a plain DNS-label. Reject anything with shell metacharacters,
 # whitespace, or path separators at the edge (defense in depth still quotes it
 # in _launch_vm). Empty == "no custom template" and is validated separately.
 
-# #93 idempotency key / #95 adversarial C-003/C-005/C-006 — client_token is a
 # caller-supplied idempotency key that flows into an SSM command and log lines.
 # Restrict to 4-128 printable ASCII (codepoints 33-126): no spaces, no control
 # chars (\n \t \x00), no non-ASCII. .isascii() alone lets control chars through.
 
-# ── #106 下单/购买语义(商业闭环)──────────────────────────────────────────
 # 业务场景:用户在外部平台页面「下单购买一个 claw」。租户记录带三个购买维度字段
-# (全部 ADDITIVE + optional,不带 = 与 #106 前字节一致的行为,严格向后兼容):
-#   • order_id      外部平台订单号(计费/对账锚,#66/#68 spend 端点按它归集)。
 #   • plan_tier     套餐档(free/standard/pro/enterprise 之一,受控枚举防脏数据)。
 #   • purchase_status  两段式状态机:pending(下单意向已记,VM 未开通)→ provisioned
 #                   (已开通,业务可用)。对齐 AWS SaaS Factory 的下单→provisioning
@@ -89,7 +82,6 @@ def _resolve_proxy_route(method, path, route_keys):
 # (尾换行绕过校验,进日志/命令行做投毒)。\Z 只匹配字符串绝对末尾,堵掉这个注入面。
 
 
-# #187 转型:C 端聊天不再走 claw-channel + hub 中枢签名路径。
 # 前端直接 POST /ws/{tenant_id}/v1/chat/completions,SSE 流式,鉴权用租户 gateway
 # token(GET /tenants/{id}/token 拿密文,调用方自解)。旧 chat_sign 路由 + claw-
 # channel HMAC + hub relay 全部下线。参见 SPEC/11-ENGINE-TRANSFORM/02-DEV-PLAN.md G/D
@@ -97,7 +89,6 @@ def _resolve_proxy_route(method, path, route_keys):
 
 
 def lambda_handler(event, context):
-    # #209: structured logging. Deliberately NOT using
     # @logger.inject_lambda_context — that decorator hard-derefs
     # context.function_name and crashes when context is None (137 test call
     # sites pass None, and it adds no correlation value we need). We manually
@@ -124,13 +115,11 @@ def lambda_handler(event, context):
     if event.get("_batch_job"):
         return run_batch_job(event["_batch_job"])
 
-    # #309 — async pull-image worker: self-invoked with
     # {"_pull_image_async": {instance_id, snapshot_time, prev_status, job_id}}. pull_image
     # 已 CAS 置 upgrading + 回 202;这里在无客户端等待的 fire-and-forget 调用里跑
     # stage + 校验 + 备份 + copy/unzip 装 live 的数分钟长链(超 APIGW 29s,故必须异步)。
     _pia = event.get("_pull_image_async")
     if _pia:
-        # #333 — 异步 Lambda 调用(InvocationType=Event)对【函数抛错】自动重试 2 次(AWS 官方:
         # invocation-retries.html)→ 重试 = 同 job 第二个 worker。并发由 host 侧 flock + status/owner
         # fence 兜住(见 _snapshot_pull_script);这里【吞掉所有异常、永远正常 return】只是【额外】
         # 减少重投噪声,不是并发防线本身。失败信息由 _run_pull_pipeline 内部写进度文件/last_pull_error
@@ -141,12 +130,10 @@ def lambda_handler(event, context):
                 _pia["snapshot_time"],
                 _pia.get("prev_status"),
                 _pia.get("job_id"),
-                # #394 — 目标槽位(live/canary);旧 payload 无此键 → None = 兼容扁平路径。
                 _pia.get("slot"),
             )
         except Exception as e:
             print(f"[pull] worker unexpected error (swallowed to prevent async retry): {e}")
-            # #333(codex round7)绝不在此复位 active:异常可能发生在 SSM 已下发/phase2 已动 live 之后,
             # 复位 active = 谎报让租户落到半写坏的 live(踩 no-data-loss/no-cross-tenant)。status 由
             # 脚本 trap 按阶段自决(phase1 复位 prev / phase2 留 upgrading);_run_pull_pipeline 的
             # "SSM 未下发"路径已在内部显式复位。这里只 job-conditional 记错误供 progress 透出,保持
@@ -185,14 +172,12 @@ def lambda_handler(event, context):
     resource = event["resource"]
     path_params = event.get("pathParameters") or {}
 
-    # #209: structured logging — attach tenant_id to all subsequent log lines
     if path_params.get("id"):
         from core.logging import inject_tenant_id
 
         inject_tenant_id(path_params["id"])
 
     routes = {
-        # issue #80 — `event` is threaded into per-tenant routes so they can
         # resolve the caller's owner identity and enforce owner==caller.
         ("GET", "/tenants"): lambda: list_tenants(
             event.get("queryStringParameters") or {},
@@ -220,7 +205,6 @@ def lambda_handler(event, context):
         ("GET", "/batch/jobs/{job_id}"): lambda: get_batch_job(
             path_params["job_id"], event
         ),
-        # PRD #50-58 — control-plane scale-out: manage a tenant user's whole fleet
         # of openclaw nodes by tenant_user_id (indexed query, pagination, bulk
         # start/stop) without k8s and without full-table scans.
         ("GET", "/users/{tenant_user_id}/tenants"): lambda: list_user_tenants(
@@ -238,42 +222,32 @@ def lambda_handler(event, context):
         # Auth is HMAC (verified inside external_authz), NOT Cognito/RBAC — so it
         # must bypass the Cognito role gate (added to the RBAC skip list below).
         ("POST", "/external/authz"): lambda: external_authz(event.get("body"), event),
-        # #187 转型:POST /chat/sign 下线,前端改经 /ws/{tenant_id} 直连 gateway。
         ("GET", "/hosts"): lambda: list_hosts(
             event.get("queryStringParameters") or {}
         ),
         ("POST", "/hosts"): lambda: register_host(event.get("body")),
         ("POST", "/hosts/refresh-rootfs"): refresh_rootfs,
-        # #217 V2 — 照 DDB 快照按精确 VersionId 拉 host 相关文件(镜像+脚本),校验 etag
         # 后装到 live 原位置(launch-vm/service 直接读)。?snapshot_time=<ISO>,只作用一台
         # host。Admin op。旧 ?version=/version-verdict 已废弃(统一快照模型)。
         ("POST", "/hosts/{instance_id}/pull-image"): lambda: pull_image(
             path_params["instance_id"], event.get("queryStringParameters") or {},
             event.get("headers") or {},
         ),
-        # #309 — GET pull-image 长任务进度:tail host 上 /tmp/<job_id>.txt 最后一行当状态。
-        # #394 step1 — 透传 query:?job_id=<id> 精确查持久化 Job(不传=兼容取该 host 最近一条)。
         ("GET", "/hosts/{instance_id}/pull-image-progress"): lambda: pull_image_progress(
             path_params["instance_id"], event.get("queryStringParameters") or {}
         ),
-        # #394 step5 — 同步槽位操作(admin-only,只改 host 上 slots.json 一个小文件,不搬盘)。
         # promote:canary 槽升为 live(带 expected snapshot+generation 的 CAS,防"验证 A 提升 B")。
         ("POST", "/hosts/{instance_id}/promote-canary"): lambda: _image_slot_op(
             path_params["instance_id"], event, "promote-canary"
         ),
-        # #394 —— 无独立 rollback:回滚 = pull 老版到 live(本地已完整则快路径秒级翻指针)。
-        # #394 — GET the host's REAL on-disk image state (slots.json + versions/ dir),
         # the authoritative counterpart to the possibly-stale DDB image_slots mirror. viewer.
-        # #394 —— 无 DELETE image-slots/canary(cleanup-canary 已移除,精简 API):放弃未提升的
         # canary 无需显式清指针——下次 pull canary 覆盖该槽,promote 成功也会清空它。
         ("GET", "/hosts/{instance_id}/image-slots"): lambda: host_image_slots(
             path_params["instance_id"]
         ),
-        # #394 — 回收该 host 上无人引用的版本目录(手动 prune;保留 live/canary/prev + 租户固定引用)。
         ("POST", "/hosts/{instance_id}/reclaim-images"): lambda: _image_slot_op(
             path_params["instance_id"], event, "reclaim-images"
         ),
-        # #309 — 把单个文件从 S3 copy 到 EC2 指定位置(目标限 firecracker 资产目录白名单)。
         ("POST", "/hosts/{instance_id}/copy-file-from-s3"): lambda: copy_file_from_s3(
             path_params["instance_id"], event.get("body")
         ),
@@ -282,23 +256,19 @@ def lambda_handler(event, context):
         ("POST", "/hosts/fleet-power"): lambda: fleet_power(event.get("body"), event),
         ("GET", "/hosts/rootfs-version"): rootfs_version,
         ("GET", "/hosts/rootfs-drift"): rootfs_drift,
-        # 10h-goal #19 — golden-image inventory. Per-tenant data snapshot is served
         # via GET /tenants/{id}/{action} with action=data (tenant_get_action).
         ("GET", "/images"): lambda: list_images(
             event.get("queryStringParameters") or {}
         ),
-        # #217 V2 — list version snapshots (time+label+count) so the console can
         # let an operator pick which snapshot_time to pull onto a host.
         ("GET", "/list_image_versions"): lambda: list_image_versions(
             event.get("queryStringParameters") or {}
         ),
-        # #376 — take a version snapshot of the assets bucket (equivalent to
         # scripts/snapshot-version.sh): scan deployment/, record every current
         # object's {path, s3_version_id, etag} into the snapshots table. Operator+.
         ("POST", "/create-image-snapshot"): lambda: create_image_snapshot(
             event.get("body")
         ),
-        # #394 — soft-delete ONE snapshot record by snapshot_time (body {snapshot_time},
         # symmetric with /create-image-snapshot; avoids colons-in-path). Refuses (409
         # IMAGE_VERSION_IN_USE) if any host slot or tenant still pins it. Metadata only
         # — marks status=deleted, does not remove S3 image files. Operator+.
@@ -311,7 +281,6 @@ def lambda_handler(event, context):
         # R10.2 — 只读队列深度(主队列 + DLQ 的 ApproximateNumberOfMessages),
         # 供 console SQS 面板 + DLQ 非零告警。只 get_queue_attributes,不 receive。
         ("GET", "/system/queues"): system_queues,
-        # #97 档A — external-platform → Cognito upstream IdP routing lookup.
         ("GET", "/tenantmatch"): lambda: tenant_match(
             event.get("queryStringParameters") or {}
         ),
@@ -321,7 +290,6 @@ def lambda_handler(event, context):
         ("DELETE", "/hosts/{instance_id}"): lambda: deregister_host(
             path_params["instance_id"]
         ),
-        # 1.4.0 (#62) — per-tenant / per-group skill scoping
         ("GET", "/groups"): list_groups,
         ("POST", "/groups"): lambda: create_group(event.get("body")),
         ("POST", "/groups/{name}/skills"): lambda: add_skill_to_group(
@@ -330,10 +298,8 @@ def lambda_handler(event, context):
         ("DELETE", "/groups/{name}/skills/{skill}"): lambda: remove_skill_from_group(
             path_params["name"], path_params["skill"]
         ),
-        # P4-③ (#187) — edge admin read-only endpoints (operator+)
         ("GET", "/admin/edge/instances"): list_edge_instances,
         ("GET", "/admin/edge/metrics"): list_edge_metrics,
-        # 1.4.1 (#63) — Console skills CRUD
         ("GET", "/skills/{name}"): lambda: read_skill(path_params["name"]),
         ("PUT", "/skills/{name}"): lambda: update_skill(
             path_params["name"], event.get("body")
@@ -356,13 +322,11 @@ def lambda_handler(event, context):
         ("POST", "/recipient-key"): lambda: _register_recipient_key(event),
         ("POST", "/recipient-key/disable"): lambda: _disable_recipient_key(event),
         ("GET", "/clawpool-rsa-public-key"): lambda: _get_clawpool_rsa_public_key(),
-        # #389 v2 块5 — bootstrap 版本切换(admin-only,handler 内 identity 门)。只在【已存在】
         # 的 S3 bootstrap 版本间切换(传 sha256,不传脚本内容);切 host/edge 两套 LT+ASG。
         ("GET", "/bootstrap/versions"): lambda: _bootstrap_versions(event),
         ("POST", "/bootstrap/promote"): lambda: _bootstrap_promote(event),
     }
 
-    # #298 — 私有 API 用 `{proxy+}` 代理时 resource 恒为 `/{proxy+}`,不匹配任何真实模板。
     # 用 event["path"](已剥 stage 前缀的资源路径)按 routes.keys() 反解成真实 resource 模板 +
     # path_params,并原地更新(routes 里的 lambda 闭包引用同一个 path_params 字典,看得到更新)。
     # 只在 proxy 占位符时介入;EDGE API 的显式 resource 原样不动,零行为变化。
@@ -383,7 +347,6 @@ def lambda_handler(event, context):
         return forbidden
     try:
         result = handler() if callable(handler) else handler
-        # Issue #17 — audit-log mutating operations after they run so the
         # response_status is captured. GET requests skip auditing to avoid
         # noise; the audit-log route itself is read-only.
         if method in ("POST", "PUT", "DELETE"):
@@ -411,7 +374,6 @@ def list_tenants(query_params=None, multi_query_params=None, event=None):
     query_params = query_params or {}
     if any(field in query_params for field in _TENANT_QUERY_FIELDS):
         return list_tenants_by_condition(query_params, event or {})
-    # PRD #53 — optional pagination. Backward compatible: no ?limit → scan to the
     # end and return a bare array (legacy shape small deployments rely on). With
     # ?limit=N → one page of ≤N rows + an opaque next_token, wrapped in an object
     # so a 100k-row table never blows the 30s API-GW timeout or the client.
@@ -440,14 +402,11 @@ def list_tenants(query_params=None, multi_query_params=None, event=None):
         items = tenants_table.scan(**scan_kwargs).get("Items", [])
         next_token = None
 
-    # issue #80 — owner scoping: a non-admin Cognito user sees only the tenants
     # they own. Admins and the API-key caller see everything. Records without
     # an owner_id (legacy / API-key-created) stay hidden from non-admins.
-    # #60 — key off identity, not RBAC_ENABLED: when RBAC is off every caller is
     # the API_KEY_OWNER admin and is_admin skips the filter anyway, so scoping
     # can never be silently disabled by flipping the global flag.
     ident = _get_caller_identity(event or {})
-    # #108 — a platform-scoped API key sees ONLY its own platform's tenants,
     # even though the key path resolves is_admin. Checked first so a scoped
     # key never enumerates the whole fleet (god-key list IDOR).
     scope = ident.get("platform_scope")
@@ -472,12 +431,10 @@ def list_tenants(query_params=None, multi_query_params=None, event=None):
     for it in items:
         it.setdefault("tags", {})
 
-    # Issue #10 — optional ?tag=key:value filter (AND across multiple)
     tag_filters = _collect_tag_filters(query_params, multi_query_params)
     if tag_filters:
         items = [it for it in items if _matches_all_tags(it, tag_filters)]
 
-    # #106 — optional ?platform_id / ?purchase_status filters (exact match, AND
     # with owner scoping + tag filters). Lets a platform list only the tenants it
     # created ("按 platform_id + owner 筛租户"), or filter by purchase stage. Both
     # are validated so a bad query param is a 400, not a silent empty result.
@@ -517,19 +474,16 @@ def get_tenant(tenant_id, event=None):
     )
     if not item:
         return _resp(404, {"error": "tenant not found"})
-    # issue #80 — IDOR: only the owner (or admin / api-key) may read the record.
     denied = _assert_owner_or_admin(item, event or {})
     if denied is not None:
         return denied
     item.setdefault("tags", {})
-    # 1.4.0 (#62) — surface the resolved effective skill set to the caller.
     # None means "broadcast all" (legacy behavior); a list means scoping is
     # active and only those skills will be injected at next launch.
     eff = _resolve_effective_skills(item)
     item["effective_skills"] = eff if eff is not None else "*"
     # Strip server-side secrets before returning (see _redact_tenant).
     body = _redact_tenant(item)
-    # #187 P1 — fold the KMS **ciphertext** of the pre-minted gateway token into
     # the status-poll response once the tenant is `running` (INTERFACE-CONTRACT
     # §5, design decision 二次纠正). Poll semantics: control-plane callers loop
     # GET /tenants/{id}; on `creating` they keep polling; on `running` they read
@@ -541,7 +495,6 @@ def get_tenant(tenant_id, event=None):
         ct = _tenant_service.read_gateway_token_ct(tenant_id)
         if ct is not None:
             body["gateway_token"] = ct
-        # #10 — fold WSS 设备三件套进就绪响应:device_id/public_key 明文,
         # private_key 是 KMS 密文(EncryptionContext=owner_id,调用方本地解密后签
         # WSS 握手帧),scopes 预授权档。paired.json 已冷注入镜像 → gateway
         # getPairedDevice 命中免界面 approve。None 时不加(feature off / 未铸 / 过窗)。
@@ -627,11 +580,9 @@ def create_tenant_self(body=None, event=None):
     body = json.loads(body) if isinstance(body, str) else (body or {})
     body.pop("owner_id", None)
     body.pop("owner", None)
-    # #143 — the attribution override is api-key-only; create_tenant now rejects
     # a Bearer body carrying it (403), so strip it here like owner_id (a
     # self-service user's identity comes from the verified token, not the body).
     body.pop("tenant_user_id", None)
-    # #422 — 纵深防御:viewer 级自助创建的是「自己的全新节点」,绝不该从任意备份恢复/克隆
     # 他人数据。create_tenant 的 restore_from 分支现已补属主校验(no-cross-tenant),但自助
     # 路径根本不该触达恢复语义 → 在入口显式剥掉,把 IDOR 面从 viewer 入口彻底断开(双保险)。
     body.pop("restore_from", None)
@@ -737,7 +688,6 @@ def external_authz(body_str, event):
 
 
 def tenant_get_action(tenant_id, action, event=None):
-    # issue #80 — IDOR: this exposes a tenant's backup list; gate on ownership.
     item = tenants_table.get_item(Key={"id": tenant_id}, ConsistentRead=True).get(
         "Item"
     )
@@ -749,7 +699,6 @@ def tenant_get_action(tenant_id, action, event=None):
     if action == "backups":
         return list_backups(tenant_id)
     if action == "data":
-        # 10h-goal #19 — per-tenant data snapshot (metadata only, zero-credential).
         return get_tenant_data(tenant_id, event)
     if action == "access":
         # List the explicit grant list (owner is implicit, shown for clarity).
@@ -765,7 +714,6 @@ def tenant_get_action(tenant_id, action, event=None):
     return _resp(400, {"error": f"unknown GET action: {action}"})
 
 
-# ========== Host Operations — moved to services/host_service.py (#132 T1.7) ==========
 
 
 # ════════════════════════════════════════════════════════════
@@ -834,7 +782,6 @@ def system_info():
                 "enabled": os.environ.get("AGENTCORE_ENABLED", "false") == "true",
                 "gateway_url": os.environ.get("AGENTCORE_GATEWAY_URL", "") or None,
             },
-            # #234 — enabled reflects the config switch (METRICS_ENABLED), not
             # just the AMP path; backend tells the console which stack is live
             # (managed AMP/AMG vs self-hosted Prometheus/Grafana). grafana_url
             # is filled for whichever backend is deployed.
@@ -1026,8 +973,14 @@ def process_pending():
             if not cand:
                 break
             expected = int(cand.get("next_vm_num", 1))
-            cap_v = int(int(cand["total_vcpu"]) * CPU_OVERCOMMIT_RATIO) - vcpu
-            cap_m = int(int(cand["total_mem_mb"]) * MEM_OVERCOMMIT_RATIO) - mem_mb
+            # 会"选得中、订不上"(见 tenant_service.py:_reserve_slot 注释)。
+            _cpu_r, _mem_r = _host_profile.ratios(
+                cand,
+                (CPU_OVERCOMMIT_RATIO, MEM_OVERCOMMIT_RATIO),
+                _clients.OVERCOMMIT_BY_FAMILY,
+            )
+            cap_v = _capacity.allocatable(int(cand["total_vcpu"]), _cpu_r) - vcpu
+            cap_m = _capacity.allocatable(int(cand["total_mem_mb"]), _mem_r) - mem_mb
             try:
                 r = hosts_table.update_item(
                     Key={"instance_id": cand["instance_id"]},
@@ -1109,7 +1062,6 @@ def process_pending():
             # mint-up-front secret persisted at create time (kills handshake race)
             channel_secret=tenant.get("channel_secret", ""),
         )
-        # #187 转型:数据面走两级路由(ALB LOR → OpenResty edge → Redis 查表 → host
         # DNAT → microVM:18789);per-tenant ALB rule/TG 死路径已下线。
         assigned += 1
 
@@ -1119,7 +1071,6 @@ def process_pending():
     }
 
 
-# #93 / api-design-review F4 — per-tenant encryption/security config.
 # Named nested Map (S3 ServerSideEncryptionConfiguration pattern), NOT a flat
 # `env` blob: `env` is AWS-reserved for environment variables; these fields have
 # inter-dependencies (a KMS key only makes sense once encryption is on), so they
@@ -1134,7 +1085,6 @@ def process_pending():
 ## ── ALB path-based routing ──
 
 
-# ── Tag helpers (issue #10) ──
 
 # Limits chosen to keep DynamoDB items small and avoid colon-conflict with the
 # `?tag=k:v` query syntax. AWS resource tags use the same 50/256 model; we cap
@@ -1143,21 +1093,16 @@ def process_pending():
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Helpers restored after the v1.0.0-milestone-q2-2026 cross-PR merge.
-# Issue #48 tracks the rationale: each helper was added by an early PR but
 # lost when later PRs auto-resolved merge conflicts with `-X theirs`.
 # Sources noted alongside each block. — fix/post-merge-regression
 # ═══════════════════════════════════════════════════════════════════════════
 
-# ----- TTL (#28 / issue #15, original 47158d2) -----
 
 
-# ----- Schedule (#30 / issue #11, original af9434b). Validation only — the
 # scaler's _schedule_should_run lives in deploy/lambda/scaler/handler.py.
 
 
-# ----- Audit log (#32 / issue #17, original 96d7496) -----
 # audit_table is defined above (top of module). No re-binding needed here —
-# the post-merge regression repair (#48) accidentally re-declared it; the
 # top-of-module definition is authoritative.
 
 
@@ -1173,7 +1118,6 @@ def _audit_write(method, resource, path_params, event, result):
         api_key_id = (event.get("requestContext") or {}).get("identity", {}).get(
             "apiKeyId"
         ) or (event.get("headers") or {}).get("x-api-key", "")[:32]
-        # Issue #80 follow-up — record the *actor* (Cognito sub + role), not just
         # the api_key_id. Without this, a Bearer-token (Cognito user) mutation is
         # untraceable to a specific person: api_key_id is empty on that path. The
         # owner_id is the stable principal RBAC already authorizes on; logging it
@@ -1254,7 +1198,6 @@ def _list_audit_log(query_params, event=None):
     requested_owner = qp.get("owner") or None
     from boto3.dynamodb.conditions import Key, Attr
 
-    # ---- trust tier (#61): resolve owner_scope BEFORE consulting `?owner=` ---
     ident = _get_caller_identity(event or {})
     if ident["is_admin"] and not ident.get("api_key_only"):
         # verified Cognito admin: may target any owner, or (default) no filter.
@@ -1268,7 +1211,6 @@ def _list_audit_log(query_params, event=None):
         # else's trail even when it was in the query string.
         owner_scope = ident["owner_id"]
 
-    # ---- speed path (#32): GSI-direct query when owner_scope is known ----
     items = []
     try:
         if owner_scope is not None:
@@ -1308,7 +1250,6 @@ def _list_audit_log(query_params, event=None):
                     key_cond = key_cond & Key("ts").gte(since)
                 # Owner-scoped fallback: DynamoDB applies FilterExpression AFTER
                 # Limit, so single-page may return < limit of the caller's rows.
-                # Paginate up to 20 pages (matches #61's pattern) to fill limit.
                 query_kwargs = {
                     "KeyConditionExpression": key_cond,
                     "ScanIndexForward": False,  # newest first
@@ -1350,19 +1291,14 @@ def _list_audit_log(query_params, event=None):
     return _resp(200, items[:limit])
 
 
-# ----- Quota (#34 / issue #9, original 79000fa) -----
 # QUOTAS_ENABLED / QUOTAS_MAX_* are defined at the top of the module
 # (default disabled, matches README "enabled: false default — no checks").
-# The post-merge regression repair (#48) accidentally re-declared them with
 # a different default; that re-declaration has been removed.
 
 
-# ----- SNS lifecycle notifications (#33 / issue #13, original 1f1bffa) -----
-# _publish_event 已搬进 core/audit.py(#132 handler-split);facade 别名见文件底部。
 # NOTIFICATIONS_TOPIC_ARN / sns 仍在 core/clients.py 定义。
 
 
-# ===== Control-plane scale-out: per-user fleet management (PRD #50-58) =====
 # Manage thousands of openclaw microVMs by the tenant user that owns them,
 # without a k8s control plane and without full-table scans. The tenant record
 # already carries the user association (tenant_user_id / owner_id, written at
@@ -1383,7 +1319,6 @@ def list_user_tenants(tenant_user_id, query_params=None, event=None):
     _, err = _parse_next_token(next_token)  # reject tampered/garbage cursor loud
     if err is not None:
         return err
-    # #108 IDOR fix — platform-scoped key 只看自己 platform 的 fleet(_authorize_user_scope
     # 的 is_admin 分支不看 scope 就放行,这里在查询结果层补隔离)。
     _scope = _get_caller_identity(event or {}).get("platform_scope")
     items, new_token = _query_user_tenants(
@@ -1392,7 +1327,6 @@ def list_user_tenants(tenant_user_id, query_params=None, event=None):
     # Strip server-side secrets before returning — gsi_tenant_user is
     # ProjectionType.ALL so items carry channel_secret / litellm_vkey /
     # gateway_token / cognito_channel_password. GET /tenants (:398) and
-    # get_tenant (:424) both redact; this per-user fleet route was the #100
     # (gateway_token leak) sibling that got missed — one x-api-key / scoped
     # caller could batch-harvest every credential of the nodes it lists.
     redacted = [_redact_tenant(it) for it in items]
@@ -1499,7 +1433,6 @@ def user_action(tenant_user_id, body=None, event=None):
     )
 
 
-# ----- Batch tenant operations (#29 / issue #23, original d05e107) -----
 _BATCH_VALID_ACTIONS = {"stop", "start", "delete", "backup"}
 _BATCH_VALID_FILTER_KEYS = {"tag"}
 _BATCH_MAX_IDS = 100
@@ -1544,7 +1477,6 @@ def batch_tenants(body=None, event=None):
         unknown = set(flt.keys()) - _BATCH_VALID_FILTER_KEYS
         if unknown:
             return _resp(400, {"error": f"unknown filter key(s): {sorted(unknown)}"})
-        # issue #80 — scope filter resolution to the caller so a non-admin's
         # batch never even sees tenants they don't own.
         target_ids = _resolve_filter(flt, event)
 
@@ -1596,7 +1528,6 @@ def batch_tenants(body=None, event=None):
 # ───────────── 控制面重构阶段1:SQS lifecycle 队列(削峰 + consumer) ─────────────
 
 
-# enqueue_lifecycle 已搬进 services/lifecycle_dispatch.py(#132 阶段3 解依赖环);
 # facade 别名见文件底部。放 services 层是为断开 tenant_service→consumers 反向依赖环。
 
 
@@ -1614,9 +1545,13 @@ def _consume_lifecycle_sqs(records):
             action = msg.get("action")
             tid = msg.get("tenant_id")
             extra = msg.get("extra") or {}
-            # 重建最小 event 让下游 owner 检查(#56/#80)生效
             ident = msg.get("_ident") or {}
             ev = {"_consumer_ident": ident}
+            # SQS 重投同一条消息 body 不变 → 同一 op_id,给下游一个贯穿"同一逻辑操作所有
+            # 重投"的稳定标识(rebuild 失败事件/日志据此归并;fence 完整版的 claim/check
+            # 也挂这个钩)。缺失(老消息/非队列路径)时下游自行兜底,不阻断。
+            if msg.get("_op_id"):
+                ev["_op_id"] = msg["_op_id"]
             if action == "create":
                 # create:extra 带 create_tenant 所需 body(name/vcpu/owner 等)
                 result = create_tenant(extra, ev)
@@ -1636,7 +1571,6 @@ def _consume_lifecycle_sqs(records):
                 except Exception:  # noqa: BLE001
                     pass
             elif action == "delete":
-                # #263 — 透传 keep_data/skip_backup:producer 入队时把原始 query 值放进
                 # extra,这里重建成 query_params。恒传空 {} 会让 keep_data 默认 "true"
                 # (tenant_service 默认软删),该删的盘悄悄没删(no-data-loss 反向)。
                 # None(调用方没传该 query)不放进 dict,让 delete_tenant 的默认值生效。
@@ -1683,7 +1617,6 @@ def get_batch_job(job_id, event=None):
     )
 
 
-# #93 / api-design-review E1+E2 — structured error code. AWS Exceptions standard:
 # clients MUST be able to distinguish errors in code without parsing the free-text
 # message. `_err` attaches a stable machine-readable `code` alongside the existing
 # `error` string. ADDITIVE + backward-compatible: old callers that read only
@@ -1693,12 +1626,10 @@ def get_batch_job(job_id, event=None):
 
 
 # ────────────────────────────────────────────────────────────
-# Live VM resize (#35 / issue #16, original b3d48cf)
 # ────────────────────────────────────────────────────────────
 
 
 # ─────────────────────────────────────────────────────────────────────
-# handler-split #132 Phase1 — core 分层包 facade。
 # 上面这些符号已搬入 core/*.py(逐字不变)。此处 re-export 保持:
 #   ① 旧 import 路径(handler.<symbol>)全程有效
 #   ② 测试 patch.object(handler, "<symbol>") 仍命中(留在 handler 的调用方读 handler 全局)
@@ -1726,7 +1657,9 @@ for _m in [
     _sys_split.modules.pop(_m, None)
 
 # T1.0 — core/clients:共享 boto3 client / DDB 表句柄 / env 常量 / 条件建 sqs。
+from core import capacity as _capacity  # noqa: E402
 from core import clients as _clients  # noqa: E402
+from core import host_profile as _host_profile  # noqa: E402
 
 ssm = _clients.ssm
 s3 = _clients.s3
@@ -1756,7 +1689,6 @@ VM_SUBNET_PREFIX = _clients.VM_SUBNET_PREFIX
 ASG_NAME = _clients.ASG_NAME
 ALB_LISTENER_ARN = _clients.ALB_LISTENER_ARN
 VPC_ID = _clients.VPC_ID
-# #187 转型:ENABLE_PER_TENANT_ALB_RULE + legacy_alb 已下线;per-tenant ALB rule/TG 全删。
 LIFECYCLE_QUEUE_URL = _clients.LIFECYCLE_QUEUE_URL
 sqs = _clients.sqs
 CREATE_VIA_QUEUE = _clients.CREATE_VIA_QUEUE
@@ -1840,7 +1772,6 @@ from core import skills as _skills  # noqa: E402
 
 _resolve_effective_skills = _skills._resolve_effective_skills
 
-# #187 转型:T1.6 core/legacy_alb 全模块下线(数据面改两级路由,per-tenant ALB
 # rule/TG 死代码彻底不用;handler / tenant_service / host_service 调用点已删)。
 
 # T1.5 — core/scheduling:host 选择/容量预留回滚/ASG 扩容/配额检查(5 函数)。
@@ -1911,7 +1842,6 @@ delete_tenant = _tenant_service.delete_tenant
 tenant_action = _tenant_service.tenant_action
 tenant_access_grant = _tenant_service.tenant_access_grant
 tenant_resize = _tenant_service.tenant_resize
-# #187 P1 — gateway-token mint helper (tests) + read helper used by get_tenant
 # to fold the ciphertext into the GET /tenants/{id} poll response.
 mint_gateway_token = _tenant_service.mint_gateway_token
 read_gateway_token_ct = _tenant_service.read_gateway_token_ct
@@ -1930,7 +1860,6 @@ _TENANT_SECRET_FIELDS = _tenant_service._TENANT_SECRET_FIELDS
 # 依赖 tenant_service(_execute_batch 调 delete_tenant/tenant_action),放其后。
 from services import fleet_service as _fleet_service  # noqa: E402
 
-# P4-③ (#187) — edge admin read-only endpoints (list_edge_instances / list_edge_metrics)
 from services import edge_admin as _edge_admin  # noqa: E402
 
 list_edge_instances = _edge_admin.list_edge_instances
@@ -1952,7 +1881,6 @@ _FLEET_STOP_PARALLEL = _fleet_service._FLEET_STOP_PARALLEL
 # 其调用方在 handler 名字空间读裸名 → facade 别名仍命中,现有 patch(handler,"X") 无需改;
 # 只有 auth 内部互调(如 _assert_owner_or_admin 调 _get_caller_identity)那条路,测试若
 # 同时 patch 了该符号又走内部函数,才需改 patch(api._auth,"X")。
-# #187 P5 — Cognito 渠道机器用户 helper 随 channel/hub 一起下线,facade 同步移除。
 from core import auth as _auth  # noqa: E402
 
 _guest_ip = _auth._guest_ip
@@ -1971,7 +1899,6 @@ _ROLE_RANK = _auth._ROLE_RANK
 _VIEWER_OK = _auth._VIEWER_OK
 _RBAC_SKIP = _auth._RBAC_SKIP
 
-# handler-split #132 — routes/skills_groups facade
 from routes import skills_groups as _skills_groups  # noqa: E402
 
 _SKILL_NAME_RE = _skills_groups._SKILL_NAME_RE

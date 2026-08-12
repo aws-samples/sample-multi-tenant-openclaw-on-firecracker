@@ -1,1 +1,0 @@
-{"files":{"handler.py":{"artifact":"artifacts/repo/deploy/lambda/tenant_stats/handler.py","base":"6dab0f466663bcb7c5510abb5ed376172350260ed065e4be958763af2e5e6103","target":"d955e88f26689d02c0e047c600622666793f9460d8010f4c8ce4034e2a0b045a"}},"function":"replace-with-customer-stats-writer","id":"lambda-tenant-stats","mode":"overlay"}

@@ -255,7 +255,8 @@ curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" \
 | **Orphan-safe restore** | Source tenant can be deleted; backup remains restorable into a new tenant. |
 | **S3 lifecycle** | `backup_retention_days` controls automatic cleanup (default 7 days). |
 | **Trap-safe** | VM auto-resumes even if compress/upload fails — no stuck `paused` state. |
-| **Pause-compress-resume** | Atomic: pause → pigz compress → upload → resume — sub-second guest interruption. |
+| **Pause-compress-resume** | pause → pigz compress → resume → upload. The guest is paused only for the compress step; the S3 upload happens with the VM already running. |
+| **Control-plane PITR** | DynamoDB point-in-time recovery + deletion protection on the tenant/host/group/audit tables, so control-plane state can be rolled back to any point in the last 35 days (1.5.9). |
 
 </details>
 
@@ -445,6 +446,10 @@ sample-multi-tenant-openclaw-on-firecracker/
 | `asg` | `min_capacity` | `2` | Minimum host instances (default Multi-AZ). |
 | `asg` | `use_spot` | `false` | Spot instances (60–70% savings, may be reclaimed). |
 | `multi_az` | `enabled` | `true` | Multi-AZ HA — enables AZ failover. |
+| `routing` | `mode` | `per-tenant` | Tenant routing model — `per-tenant` (one ALB rule each, capped ~499 by ALB quota) or `host-tg` (one shared target group + nginx peer-map, cap becomes hosts × VMs). See [Tenant routing models](#tenant-routing-models) (1.5.9). |
+| `network` | `vpc_id` | `""` | Import an existing VPC instead of the account default (1.5.7). |
+| `network` | `subnet_ids` | `[]` | Pin the ASG and ALB to specific subnets — needs ≥2 AZs for the ALB (1.5.7). |
+| `cloudfront` | `enabled` | `true` | `false` skips CloudFront entirely and exposes the ALB DNS + S3 endpoint for your own CDN (1.5.7). |
 | `health_check` | `interval_minutes` | `5` | Lambda watchdog interval. |
 | `metrics` | `enabled` | `false` | Provision AMP + Grafana + ADOT. |
 | `agentcore` | `enabled` | `false` | Provision Gateway + Memory + CodeInterpreter + Browser + Identity. |
@@ -453,6 +458,25 @@ sample-multi-tenant-openclaw-on-firecracker/
 | `backup_cron` | — | `cron(0 19 * * ? *)` | UTC 19:00 daily backups. |
 
 > See [`config.yml.example`](config.yml.example) for the complete reference.
+
+### Tenant routing models
+
+`routing.mode` picks how a dashboard request reaches the host running that tenant. Default is `per-tenant`; switch only when you need to grow past the ALB rule quota.
+
+| | `per-tenant` (default) | `host-tg` |
+|---|---|---|
+| ALB rules | One per tenant (`/vm/{id}*` → that host's target group) | **One** catch-all (`/vm/*` → shared target group) |
+| Tenant ceiling | ~499, and AWS's default quota is ~100 rules/listener | hosts × VMs per host |
+| Where routing is decided | ALB, from the rule set | nginx on each host, from a peer-map synced by `host-agent` every ~60s |
+| Extra hop | None — ALB goes straight to the owning host | One, when the request lands on a host that isn't the owner |
+| Consistency | Immediate (rule repointed atomically) | Eventual (~60s to converge after a migration) |
+
+To switch to `host-tg`:
+
+1. Set `routing.mode: host-tg` and re-run `setup.sh`.
+2. Replace each host so it picks up the new `init-host.sh` — see [Roll fixes into existing hosts/tenants](#roll-fixes-into-existing-hoststenants).
+
+No AWS resources need to be created by hand. Existing tenants are unaffected, and setting the mode back to `per-tenant` reverts it.
 
 ### Tear down
 
@@ -483,6 +507,7 @@ All requests require the `x-api-key` header.
 | `POST` | `/tenants/{id}/resize` | Hot-add vCPU. Body: `{"vcpu":4}`. |
 | `POST` | `/tenants/{id}/resize-disk` | Offline grow data disk. Body: `{"new_size_mb":16384}`. |
 | `POST` | `/tenants/{id}/migrate` | Migrate to another host (async, returns `202`). Body: `{"target_host_id":"i-..."}`. Balloon tenants follow `balloon.migrate_mode` (1.5.9). |
+| `POST` | `/tenants/{id}/cancel-migration` | Abort an in-flight migration and revert to `running`. Only valid while `migrating` — once the sweep has flipped `host_id` the migration is done (1.5.9). |
 | `GET` | `/tenants/{id}/backups` | Backups for one tenant. |
 | `POST` | `/batch/tenants` | Batch op. Body: `{"action":"stop\|start\|delete\|backup", "ids":[...]\|"filter":{"tag":"k:v"}}`. |
 
@@ -492,8 +517,10 @@ All requests require the `x-api-key` header.
 |---|---|---|
 | `GET` | `/backups` | List all backups across tenants (marks orphan vs active). |
 | `GET` | `/hosts` | List all hosts. |
+| `POST` | `/hosts/{id}/drain` | Evacuate a host before decommissioning it — migrates each running tenant off, then marks the host `draining`. Migrations are async, so poll the tenants until they land, then terminate the empty host (1.5.9). |
 | `POST` | `/hosts/refresh-rootfs` | Push latest rootfs to all hosts. |
 | `GET` | `/hosts/rootfs-version` | Query current rootfs version. |
+| `POST` | `/failover/{az}` | Manually fail over every tenant out of an AZ, without waiting for the health-check watchdog to detect an outage (1.5.9). |
 | `GET` | `/agentcore/status` | AgentCore enable status + Gateway URL. |
 | `GET` | `/agentcore/tools` | List MCP tools registered with Gateway. |
 | `GET` | `/audit-log` | Query audit log. `?since=<ISO8601>&before=<ISO8601>&limit=<n>` — 90-day TTL. Rows carry `event` (e.g. `tenant.created`), typed `object` (`tenant:<id>`), `actor` (Cognito principal or `system:<source>`) + `actor_role`. Surfaced in the Console **Logs** tab. |
@@ -741,7 +768,7 @@ curl -s "${API_URL}hosts/rootfs-version" -H "x-api-key: ${API_KEY}" | jq .
 
 ## ⬆️ Upgrade Guide
 
-Upgrade from any version to latest in one pass — `setup.sh` carries the full control-plane delta in a single deploy. Per-version notes are in [CHANGELOG.md](CHANGELOG.md).
+Upgrade from any version to latest in one pass — `setup.sh` carries the full control-plane delta in a single deploy. Per-version notes are in [CHANGELOG.md](CHANGELOG.md); day-2 operations (rollback, operator endpoints, alarms/DLQ, failure playbooks) are in the [Operations Runbook](docs/RUNBOOK.md).
 
 ```bash
 git pull

@@ -254,7 +254,8 @@ curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" \
 | **孤儿可恢复** | 源 tenant 可删，备份仍可恢复进新 tenant。 |
 | **S3 lifecycle** | `backup_retention_days` 自动清理（默认 7 天）。 |
 | **Trap 安全** | 任何步失败也保证 VM 一定 resume — 不会卡 paused 状态。 |
-| **Pause-compress-resume** | 原子流程：暂停 → pigz 压缩 → 上传 → resume — guest 中断 < 1 秒。 |
+| **Pause-compress-resume** | 暂停 → pigz 压缩 → resume → 上传 S3。guest 只在压缩期间暂停，上传时 VM 已在运行。 |
+| **控制面 PITR** | tenant / host / group / audit 表开启 DynamoDB 时间点恢复 + 删除保护，控制面状态可回滚到过去 35 天内任一时刻（1.5.9）。 |
 
 </details>
 
@@ -435,12 +436,18 @@ sample-multi-tenant-openclaw-on-firecracker/
 | `host` | `instance_type` | `m8i.2xlarge` | 必须支持嵌套虚拟化（c8i / m8i / r8i / r8g）。 |
 | `host` | `cpu_overcommit_ratio` | `2.0` | CPU 超卖比例。 |
 | `host` | `mem_overcommit_ratio` | `1.0` | 内存超卖比例（需开 balloon）。 |
+| `host` | `max_vms_per_host` | `0` | 每 host microVM 绝对上限（0 = 只按超卖比例算 — 1.5.8）。 |
 | `vm` | `default_vcpu` | `2` | 每租户默认 vCPU。 |
 | `vm` | `default_mem_mb` | `4096` | 每租户默认内存（MB）。 |
 | `balloon` | `enabled` | `false` | Firecracker balloon 设备（用于内存超卖）。 |
+| `balloon` | `migrate_mode` | `cold` | balloon 租户如何迁移：`cold`（停机→搬数据→重启，始终安全）/ `live`（snapshot/restore，保留内存状态）/ `reject`（1.5.9）。 |
 | `asg` | `min_capacity` | `2` | 最小 host 实例数（默认 Multi-AZ）。 |
 | `asg` | `use_spot` | `false` | Spot 实例（省 60-70%，可能被回收）。 |
 | `multi_az` | `enabled` | `true` | Multi-AZ HA — 启用 AZ failover。 |
+| `routing` | `mode` | `per-tenant` | 租户路由模型 — `per-tenant`（每租户一条 ALB rule，受 ALB 配额约束约 499 上限）或 `host-tg`（一个共享 target group + nginx peer-map，上限变为 hosts × VMs）。见[租户路由模型](#租户路由模型)（1.5.9）。 |
+| `network` | `vpc_id` | `""` | 导入已有 VPC 而非账号默认 VPC（1.5.7）。 |
+| `network` | `subnet_ids` | `[]` | 把 ASG 和 ALB 固定到指定子网 — ALB 需要 ≥2 个 AZ（1.5.7）。 |
+| `cloudfront` | `enabled` | `true` | `false` 则完全跳过 CloudFront，输出 ALB DNS + S3 endpoint 供自有 CDN 回源（1.5.7）。 |
 | `health_check` | `interval_minutes` | `5` | Lambda watchdog 间隔。 |
 | `metrics` | `enabled` | `false` | 创建 AMP + Grafana + ADOT。 |
 | `agentcore` | `enabled` | `false` | 创建 Gateway + Memory + CodeInterpreter + Browser + Identity。 |
@@ -449,6 +456,25 @@ sample-multi-tenant-openclaw-on-firecracker/
 | `backup_cron` | — | `cron(0 19 * * ? *)` | UTC 19:00 每天备份。 |
 
 > 完整参考请见 [`config.yml.example`](../config.yml.example)。
+
+### 租户路由模型
+
+`routing.mode` 决定 dashboard 请求如何到达承载该租户的 host。默认 `per-tenant`；只有需要突破 ALB rule 配额时才切换。
+
+| | `per-tenant`（默认） | `host-tg` |
+|---|---|---|
+| ALB rule 数 | 每租户一条（`/vm/{id}*` → 该 host 的 target group） | **一条** catch-all（`/vm/*` → 共享 target group） |
+| 租户上限 | 约 499，且 AWS 默认配额只有 ~100 条/listener | hosts × 每 host VM 数 |
+| 路由决策位置 | ALB，按 rule 匹配 | 各 host 的 nginx，依据 `host-agent` 每 ~60s 同步的 peer-map |
+| 额外跳数 | 无 — ALB 直达 owner host | 一跳，当请求落到非 owner host 时 |
+| 一致性 | 即时（rule 原子改指向） | 最终一致（迁移后约 60s 收敛） |
+
+切换到 `host-tg`：
+
+1. 设 `routing.mode: host-tg`，重跑 `setup.sh`。
+2. 逐台替换 host 让它拿到新的 `init-host.sh` —— 见[把修复滚动到现有 host / 租户](#把修复滚动到现有-host--租户)。
+
+无需手工创建任何 AWS 资源。已有租户不受影响，把 mode 改回 `per-tenant` 即可回退。
 
 ### 销毁栈
 
@@ -478,7 +504,8 @@ sample-multi-tenant-openclaw-on-firecracker/
 | `POST` | `/tenants/{id}/backup` | 手动数据备份。|
 | `POST` | `/tenants/{id}/resize` | 热扩 vCPU。Body: `{"vcpu":4}`。|
 | `POST` | `/tenants/{id}/resize-disk` | 离线扩 data 卷。Body: `{"new_size_mb":16384}`。|
-| `POST` | `/tenants/{id}/migrate` | 实时迁移。Body: `{"target_host_id":"i-..."}`。|
+| `POST` | `/tenants/{id}/migrate` | 迁移到另一台 host（异步，返回 `202`）。Body: `{"target_host_id":"i-..."}`。balloon 租户按 `balloon.migrate_mode` 处理（1.5.9）。|
+| `POST` | `/tenants/{id}/cancel-migration` | 中止进行中的迁移并回到 `running`。仅在 `migrating` 状态下有效 —— 一旦 sweep 已翻转 `host_id`，迁移即已完成（1.5.9）。|
 | `GET` | `/tenants/{id}/backups` | 单租户的备份列表。|
 | `POST` | `/batch/tenants` | 批量操作。Body: `{"action":"stop\|start\|delete\|backup", "ids":[...]\|"filter":{"tag":"k:v"}}`。|
 
@@ -488,8 +515,10 @@ sample-multi-tenant-openclaw-on-firecracker/
 |---|---|---|
 | `GET` | `/backups` | 跨租户列出所有备份（标 active vs orphan）。|
 | `GET` | `/hosts` | 列出所有 host。|
+| `POST` | `/hosts/{id}/drain` | 下线前排空 host —— 把其上每个 running 租户迁走，然后标记 host 为 `draining`。迁移是异步的，轮询租户直到落地后再终止这台空 host（1.5.9）。|
 | `POST` | `/hosts/refresh-rootfs` | 推送最新 rootfs 到所有 host。|
 | `GET` | `/hosts/rootfs-version` | 查询当前 rootfs 版本。|
+| `POST` | `/failover/{az}` | 手动把某个 AZ 的所有租户 failover 出去，无需等健康检查 watchdog 发现故障（1.5.9）。|
 | `GET` | `/agentcore/status` | AgentCore 启用状态 + Gateway URL。|
 | `GET` | `/agentcore/tools` | 列出 Gateway 上注册的 MCP 工具。|
 | `GET` | `/audit-log` | 查 audit log。`?since=<ISO8601>&before=<ISO8601>&limit=<n>` — 90 天 TTL。记录含 `event`（如 `tenant.created`）、类型化 `object`（`tenant:<id>`）、`actor`（Cognito 用户或 `system:<source>`）+ `actor_role`。Console **Logs** 标签页可视化。|
@@ -718,7 +747,7 @@ curl -s "${API_URL}hosts/rootfs-version" -H "x-api-key: ${API_KEY}" | jq .
 
 ## ⬆️ 升级指南
 
-任意版本一次性升到最新 —— `setup.sh` 在单次部署里带上全部控制面增量。逐版本说明见 [CHANGELOG.md](../CHANGELOG.md)。
+任意版本一次性升到最新 —— `setup.sh` 在单次部署里带上全部控制面增量。逐版本说明见 [CHANGELOG.md](../CHANGELOG.md)；日常运维（回滚、operator 端点、告警/DLQ、故障处理）见 [运维手册](RUNBOOK.md)。
 
 ```bash
 git pull

@@ -92,10 +92,13 @@ api:
 
 # ========== Auto Scaling ==========
 asg:
-  min_capacity: 2 # 生产起步跨 AZ;按需抬高
+  # 首次部署必须 0:黄金镜像烤制是非阻塞的独立栈,min>=1 时 host 会抢在镜像就绪前启动、
+  # 镜像验收通过后再抬到生产容量(跨 AZ 起步 2,按需加)。
+  min_capacity: 0 # 首次部署 0;镜像就绪后改 2+ 再 deploy
   max_capacity: 100
   # metal 物理机 Nitro 初始化 + 下载黄金镜像 + 挂盘 + 注册,600s 偏紧会反复 Heartbeat Timeout。
-  lifecycle_hook_timeout: 1200 # 20min 留足冷启余量
+  # 本 sample 是 imported VPC + r8g.metal-24xl —— 这一组合真机实测 1200s 仍不够,
+  lifecycle_hook_timeout: 3600 # 1h;imported+metal 冷启实测 1200 不足
   use_spot: false # 生产控制面 host 不用 Spot
 
 # ========== Multi-AZ HA ==========

@@ -179,13 +179,14 @@ curl -s -X POST -H "x-api-key: $KEY" -H "content-type: application/json" \
 
 **`GET {BASE}/tenants/{id}`** — 单租户详情(owner/admin 门控)。基础记录先脱敏;当租户为 `running` 时,响应会额外附加 `gateway_token` 的 KMS 密文和 `device`(device id、公钥、私钥 KMS 密文、scopes),供受信平台后端按 encryption context 本地解密并完成 WSS device 握手。它们不是明文,但仍是敏感交付物,不得下发浏览器。`GET /tenants/{id}/credentials` 则把同一凭据重包为 recipient-key asymmetric-v1 形态。
 
-**`POST {BASE}/tenants/{id}/{action}`** — 生命周期动作(RBAC operator+ + owner 门控)。支持的 `action`:
+**`POST {BASE}/tenants/{id}/{action}`** — 生命周期动作。通常为 RBAC operator+ + owner 门控；`rebuild` 仅管理员可调用。支持的 `action`:
 
 | action                          | 语义                                                                                  | 返回                                                      |
 | ------------------------------- | ------------------------------------------------------------------------------------- | --------------------------------------------------------- |
 | `start`                         | 唤醒(~3.7s)                                                                           | 202 异步(配 LIFECYCLE_QUEUE 时入队)                       |
 | `stop`                          | 休眠(~6.0s)                                                                           | 202 异步                                                  |
-| `restart` / `reset` / `rebuild` | 重启 / 重置 / 用新镜像重建                                                            | 202 异步                                                  |
+| `restart` / `reset`             | 重启 / 重置                                                                          | 202 异步                                                  |
+| `rebuild`                       | 按 `image_channel` 用新镜像重建；缺省 `live`，先强制备份                             | 200 同步；无法确认采用时 503                              |
 | `pause` / `resume`              | 暂停 / 恢复                                                                           | 202 异步                                                  |
 | `backup`                        | 备份到 S3(~6.6s)                                                                      | 202,异步调 backup Lambda                                  |
 | `resize`                        | 热改 vCPU(需 body `vcpu`)                                                             | 200 `{old_vcpu,new_vcpu}`                                 |
@@ -405,7 +406,7 @@ curl -s -H "x-api-key: $KEY" "$BASE/tenants/t-<16hex>"
 | `/tenants/self`                                        | POST           | Bearer · viewer              | 自助注册(用户身份)                                                                               |
 | `/tenants/{id}`                                        | GET            | owner 门控                   | 单租户详情                                                                                       |
 | `/tenants/{id}/{action}`                               | GET            | owner 门控                   | backups / data / access(只读)                                                                    |
-| `/tenants/{id}/{action}`                               | POST           | operator + owner             | start/stop/restart/pause/resume/reset/rebuild/backup/resize/resize-disk/migrate/access/provision |
+| `/tenants/{id}/{action}`                               | POST           | operator + owner；rebuild 仅 admin | start/stop/restart/pause/resume/reset/rebuild/backup/resize/resize-disk/migrate/access/provision |
 | `/tenants/{id}`                                        | DELETE         | operator + owner             | 注销(keep_data 可选)                                                                             |
 | `/batch/tenants` `/batch/jobs/{id}`                    | POST/GET       | operator / viewer            | 批量与作业进度                                                                                   |
 | `/users/{uid}/tenants` `/summary` `/action`            | GET/POST       | viewer(仅自己)               | 按平台用户管理 fleet                                                                             |

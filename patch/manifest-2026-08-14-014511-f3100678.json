@@ -1,0 +1,218 @@
+{
+  "synced_at": "2026-08-14 01:45:11 UTC+08:00",
+  "base_sha": "71a0d9eb77a4ea9bebe59481f666e2140ad651fc",
+  "source_commit": "f3100678ac827cb8ef46563a0118129bd7b7dd87",
+  "commit_count": 28,
+  "file_count": 16,
+  "summary": "Sync the bb increment 71a0d9eb..f3100678 to the public gateway branch. Sync-LOG only (which customer-facing files reached gateway + the issues behind them); the applyable patch kit is NOT built yet (folded_into pending).",
+  "issues_synced_note": "Index back to the issue tracker for whoever builds the patch kit: before assembling the kit, walk each issue and confirm it's covered. `title` is a ≤20-char gist only — open the issue for the full problem/fix/test. Lists only issues that touched a released file this sync.",
+  "issues_synced": [
+    {
+      "id": "#26",
+      "type": "fix",
+      "title": "客户问题表 #26/#28"
+    },
+    {
+      "id": "#28",
+      "type": "fix",
+      "title": "客户问题表 #26/#28"
+    },
+    {
+      "id": "#416",
+      "type": "fix",
+      "title": "#416/!531 合并后 follow…"
+    },
+    {
+      "id": "#445",
+      "type": "fix",
+      "title": "openclaw-hosts 容量账本两…"
+    },
+    {
+      "id": "#449",
+      "type": "fix",
+      "title": "host-agent / oc-gues…"
+    },
+    {
+      "id": "#456",
+      "type": "fix",
+      "title": "#416/!531 合并后 follow…"
+    },
+    {
+      "id": "#470",
+      "type": "fix",
+      "title": "客户问题表 #26/#28"
+    },
+    {
+      "id": "#482",
+      "type": "fix",
+      "title": "rebuild 删除普通分支"
+    },
+    {
+      "id": "#485",
+      "type": "fix",
+      "title": "reset 的 client_token…"
+    },
+    {
+      "id": "#488",
+      "type": "fix",
+      "title": "0"
+    }
+  ],
+  "needs_config_on_apply": [
+    {
+      "file": "config.yml.example",
+      "param": "min_capacity",
+      "change": "changed",
+      "value": "0"
+    },
+    {
+      "file": "config.yml.example",
+      "param": "lifecycle_hook_timeout",
+      "change": "changed",
+      "value": "3600"
+    },
+    {
+      "file": "deploy/userdata/host-agent.service",
+      "param": "Environment",
+      "change": "systemd-directive",
+      "value": "PYTHONUNBUFFERED=1"
+    }
+  ],
+  "updated_files": {
+    "docs": [
+      {
+        "path": "docs/api/pull-image-api.md",
+        "status": "modified",
+        "issues": [
+          "#482"
+        ]
+      },
+      {
+        "path": "docs/api/rebuild-api.md",
+        "status": "added",
+        "issues": [
+          "#482"
+        ]
+      },
+      {
+        "path": "docs/aws-guide-en/09-api-integration.md",
+        "status": "modified",
+        "issues": [
+          "#482"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/09-api-integration.md",
+        "status": "modified",
+        "issues": [
+          "#482"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/openapi.yaml",
+        "status": "modified",
+        "issues": [
+          "#416",
+          "#456",
+          "#482",
+          "#485"
+        ]
+      }
+    ],
+    "host-scripts (S3-pulled / baked into rootfs)": [
+      {
+        "path": "deploy/userdata/host-agent.service",
+        "status": "modified",
+        "issues": [
+          "#449"
+        ]
+      },
+      {
+        "path": "deploy/userdata/init-host.sh",
+        "status": "modified",
+        "issues": [
+          "#445",
+          "#449",
+          "#485"
+        ]
+      },
+      {
+        "path": "deploy/userdata/reset-vm.sh",
+        "status": "added",
+        "issues": [
+          "#485"
+        ]
+      }
+    ],
+    "lambda (update-function-code only)": [
+      {
+        "path": "deploy/lambda/api/services/action_idem.py",
+        "status": "modified",
+        "issues": [
+          "#485"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/host_service.py",
+        "status": "modified",
+        "issues": [
+          "#26",
+          "#28",
+          "#470"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/tenant_query_service.py",
+        "status": "modified",
+        "issues": [
+          "#26",
+          "#28",
+          "#470"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/tenant_service.py",
+        "status": "modified",
+        "issues": [
+          "#416",
+          "#456",
+          "#482",
+          "#485"
+        ]
+      }
+    ],
+    "root / other": [
+      {
+        "path": "config.yml.example",
+        "status": "modified",
+        "issues": [
+          "#488"
+        ]
+      },
+      {
+        "path": "samples/config-sg-prod.yaml",
+        "status": "modified",
+        "issues": [
+          "#488"
+        ]
+      },
+      {
+        "path": "setup.sh",
+        "status": "modified",
+        "issues": [
+          "#485"
+        ]
+      }
+    ],
+    "scripts": [
+      {
+        "path": "scripts/preflight-check.sh",
+        "status": "modified",
+        "issues": [
+          "#488"
+        ]
+      }
+    ]
+  },
+  "folded_into": "(pending) — no patch kit built for this sync yet; a later kit should cite this manifest as source-of-record and set base_sha/patch_sha. cdk deploy is FORBIDDEN on hand-modified live deployments — the kit must ship *.patched host scripts + the full lambda tree + AWS CLI for stack changes, same shape as patch/315-concurrent-dispatch-rollup/."
+}

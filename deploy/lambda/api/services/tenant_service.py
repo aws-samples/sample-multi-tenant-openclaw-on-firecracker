@@ -122,6 +122,24 @@ _TENANT_SECRET_FIELDS = (
 )
 
 
+def _normalize_client_token(raw):
+    """Return the canonical token plus a validation error, if any."""
+    if raw is None:
+        return "", None
+    if not isinstance(raw, str):
+        return "", (
+            "client_token must be a string of 4-128 printable ASCII chars "
+            "(no spaces/control chars)"
+        )
+    token = raw.strip()
+    if token and not _CLIENT_TOKEN_RE.fullmatch(token):
+        return "", (
+            "client_token must be 4-128 printable ASCII chars "
+            "(no spaces/control chars)"
+        )
+    return token, None
+
+
 # ——deleted 租户不被 reaper 兜底 → 容量永漏。三态让 delete 在 retry 时留 deleting 返 5xx 重投)。
 _REL_CONSUMED = "consumed"  # 本次扣了账本、清了令牌
 _REL_ALREADY = "already"    # 令牌已不在(别人消费/从没有)或下溢守卫触发 → 安全幂等
@@ -1112,16 +1130,14 @@ def create_tenant(body=None, event=None):
                     "binding); pass body.owner_id (create-on-behalf). Not supported under "
                     "EXTERNAL_AUTHZ (owner_id is externalized).",
                 )
-    client_token = (body.get("client_token") or "").strip()
-    # .strip() only trims the edges, so an embedded control char used to slip
-    # through and land in the SSM command / log line (injection / log-poisoning).
-    # An idempotency key is a printable token — require ASCII 33-126 (no control
-    # chars, no spaces). Length 4-128 (C-003 short / C-005 over-128 rejected too).
-    if client_token and not _CLIENT_TOKEN_RE.match(client_token):
+    client_token, client_token_error = _normalize_client_token(
+        body.get("client_token")
+    )
+    if client_token_error:
         return utils._err(
             400,
             "VALIDATION",
-            "client_token must be 4-128 printable ASCII chars (no spaces/control chars)",
+            client_token_error,
         )
 
     # Validate up-front so we don't half-create a tenant with a malformed scope.
@@ -3298,11 +3314,11 @@ def _reserve_migration_slot(target, vcpu, mem_mb, attempts=8):
 
 
 def _rebuild_repin_resolve(item, repin_body):
-    """#416 — 解析 rebuild 换版目标(纯校验,不落库、不备份)。返回
+    """解析 rebuild 目标 channel(纯校验,不落库、不备份)。返回
     {"channel": str, "target_snap": str|None} 或 utils._resp(...) 错误响应。
 
-    复用 create_tenant 同一套字段名/CAS/错误码(image_channel_mod)。canary 失败绝不回落 live。
-    换版恒同步执行(不入队),故当场以 host 当前 canary 槽解析,无跨调用冻结/漂移问题。
+    缺省 channel 是 live。live/canary 都必须在当前 host 有对应槽位；任一槽位缺失都
+    fail-closed，且必须发生在强制备份、租户落库和 VM 变更之前。
     """
     channel, ch_err = image_channel_mod.normalize_channel(repin_body.get("image_channel"))
     if ch_err:
@@ -3338,8 +3354,6 @@ def _rebuild_repin_resolve(item, repin_body):
                 "id": item.get("id"),
             },
         )
-    if channel == "live":
-        return {"channel": "live", "target_snap": None}
     host = clients.hosts_table.get_item(
         Key={"instance_id": _hid}, ConsistentRead=True
     ).get("Item")
@@ -3348,8 +3362,21 @@ def _rebuild_repin_resolve(item, repin_body):
             404,
             {"error": f"tenant host {item.get('host_id')!r} not found", "code": "NOT_FOUND"},
         )
+    host_slots = host.get("image_slots") or {}
+    if channel == "live" and not host_slots.get("live"):
+        return utils._resp(
+            409,
+            {
+                "error": "target host has no READY live image version; pull or promote "
+                "a live image before rebuilding",
+                "code": "NO_LIVE_VERSION",
+                "id": item.get("id"),
+            },
+        )
+    if channel == "live":
+        return {"channel": "live", "target_snap": None}
     target_snap, code, msg = image_channel_mod.resolve_pinned_version(
-        channel, host.get("image_slots") or {},
+        channel, host_slots,
         repin_body.get("expected_image_snapshot_time"),
         repin_body.get("expected_image_generation"),
     )
@@ -3469,7 +3496,7 @@ def _rebuild_repin_apply(
 # 字段(新增枚举值属破坏性变更)。这几个字段是 ADDITIVE 的,现有消费方为零。
 # 注:host 侧 launch-vm.sh 的可起态白名单其实已含 "rebuilding"(控制面从未写过该值),
 # 但那只解决四个消费方里的一个,故仍不走扩 status 的路子。
-_REBUILD_PHASE_QUEUED = "queued"  # 已入队,consumer 尚未取
+_REBUILD_PHASE_QUEUED = "queued"  # 兼容历史异步 rebuild 记录
 _REBUILD_PHASE_RUNNING = "running"  # consumer 已下发 SSM
 _REBUILD_PHASE_VERIFYING = "verifying"  # 回执已收,正在验采用
 # 非终态集合:处于其中任一阶段就说明上一次 rebuild 还在飞,不该再放第二次进来(见
@@ -3557,6 +3584,59 @@ def _parse_host_rebuild_result(
     if tombstone and tombstone == result["overlay_dev_inode"]:
         return None
     return result
+
+
+def _parse_host_reset_result(
+    stdout,
+    tenant_id,
+    op_id,
+    attempt_id,
+    fence_epoch,
+    host_id,
+    vm_num,
+):
+    """Return only identity-bound fresh-overlay evidence from reset-vm.sh."""
+    result = None
+    for line in reversed((stdout or "").splitlines()):
+        try:
+            candidate = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(candidate, dict) and candidate.get("state"):
+            result = candidate
+            break
+    if not result:
+        return None
+    expected = {
+        "tenant_id": tenant_id,
+        "op_id": op_id,
+        "attempt_id": attempt_id,
+        "host_id": host_id,
+        "vm_num": int(vm_num),
+        "fence_epoch": int(fence_epoch),
+    }
+    if any(result.get(key) != value for key, value in expected.items()):
+        return None
+    if result.get("state") != "SUCCEEDED":
+        return result
+    inode = re.compile(r"^[0-9]+:[0-9]+$")
+    required_inodes = (
+        "firecracker_exe_dev_inode",
+        "overlay_dev_inode",
+        "overlay_fd_dev_inode",
+    )
+    if any(not inode.fullmatch(str(result.get(key) or "")) for key in required_inodes):
+        return None
+    if result["overlay_dev_inode"] != result["overlay_fd_dev_inode"]:
+        return None
+    if not str(result.get("firecracker_start_ticks") or "").isdigit():
+        return None
+    tombstone = str(result.get("tombstone_dev_inode") or "")
+    if tombstone and tombstone == result["overlay_dev_inode"]:
+        return None
+    return result
+
+
 # 终态三值。`unconfirmed` 是新增值,与 core/image_ops 的 STATE_UNKNOWN 同源同理:把
 # "没能确认" 从 "确认失败" 里摘出来。见 _REBUILD_STATUS_UNCONFIRMED 注释。
 _REBUILD_STATUS_DONE = "done"
@@ -3566,17 +3646,6 @@ _REBUILD_STATUS_DONE = "done"
 # (openapi 已声明三值),由 §5.4a 的对账 MR 在能确认失败时写入。
 _REBUILD_STATUS_FAILED = "failed"
 _REBUILD_STATUS_UNCONFIRMED = "unconfirmed"
-
-
-class _RebuildAnchorFailed(Exception):
-    """入队前的进度锚点写失败 —— 表示消息【肯定还没发出】(锚点在 send_message 之前写)。
-
-    单独一个类型是为了把两种 5xx 的**安全指引**分开,它们对客户的建议正好相反:
-      * 锚点失败 → 什么都没排队 → "重试是干净的"。
-      * send_message 失败 → SQS 可能已经收下了 → **绝不能说没排队**。若客户据此重试,
-        新一次会拿到新的 op_id 和新的 dedup id,于是两次破坏性 rebuild
-        (stop && rm overlay && launch)都可能真的执行,第二次抹掉第一次之后落盘的写入。
-    """
 
 
 # 一次 rebuild 操作【专属】的字段。开新操作时必须整组原子重置 —— 见
@@ -3709,6 +3778,20 @@ def tenant_action(tenant_id, action, body=None, event=None):
     (owner, token) 通过 _idem_ctx 回传给这层。
     """
     _ctx = {}
+    if (
+        action in action_idem.IDEMPOTENT_ACTIONS
+        and "_consumer_ident" in (event or {})
+        and isinstance(body, dict)
+    ):
+        # Restore the queue-owned intent before any tenant lookup or ownership
+        # guard. Early 404/4xx returns and lookup exceptions must also finalize
+        # the record instead of leaving it IN_PROGRESS forever.
+        _queued_token = body.get("client_token")
+        if isinstance(_queued_token, str) and _queued_token.strip():
+            _ctx["token"] = _queued_token.strip()
+            _ctx["owner"] = str(
+                ((event or {}).get("_consumer_ident") or {}).get("owner_id") or ""
+            )
     try:
         resp = _tenant_action_inner(tenant_id, action, body, event, _ctx)
     except Exception:
@@ -3724,18 +3807,28 @@ def tenant_action(tenant_id, action, body=None, event=None):
             _ctx["hold_lifecycle_fence"] = True
         _release_lifecycle_ctx(tenant_id, _ctx)
         raise
-    if _ctx.get("token"):
+    if _ctx.get("token") and not _ctx.get("defer_finish"):
         _code = int((resp or {}).get("statusCode") or 0)
         try:
             _body = json.loads((resp or {}).get("body") or "{}")
         except Exception:  # noqa: BLE001
             _body = {}
+        # LIFECYCLE_IN_FLIGHT is a pre-dispatch conflict: this operation did not
+        # reach the host or queue and the caller is expected to retry later.
+        # Do not poison that retry by storing the token as terminal FAILED.
+        if _body.get("code") == "LIFECYCLE_IN_FLIGHT":
+            _state = action_idem.STATE_NOT_STARTED
         # 2xx = 确定成功;4xx = 确定失败(客户端错误,重试同样会失败,可安全记 FAILED);
         # 5xx = **结果未知**(SSM 可能已下发) → UNKNOWN,允许同 token 重放去对账。
-        if 200 <= _code < 300:
+        elif 200 <= _code < 300:
             _state = action_idem.STATE_SUCCEEDED
         elif 400 <= _code < 500:
             _state = action_idem.STATE_FAILED
+        elif _body.get("code") == "ENQUEUE_ANCHOR_FAILED":
+            # The lifecycle fence was not persisted, so no queue message or
+            # host command could have been sent. Keep this distinct from the
+            # genuinely ambiguous post-send failure state.
+            _state = action_idem.STATE_NOT_STARTED
         else:
             _state = action_idem.STATE_UNKNOWN
         action_idem.finish(
@@ -3751,6 +3844,17 @@ def tenant_action(tenant_id, action, body=None, event=None):
 
 
 def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=None):
+    # Rebuild drops the VM's writable rootfs overlay and can change its image
+    # channel. It is an administrator-only operation. Check before tenant lookup
+    # so an unauthorized caller cannot probe whether a tenant id exists.
+    if action == "rebuild" and not auth._get_caller_identity(event or {}).get(
+        "is_admin"
+    ):
+        return utils._resp(
+            403,
+            {"error": "rebuild requires admin role", "code": "ACCESS_DENIED"},
+        )
+
     item = clients.tenants_table.get_item(
         Key={"id": tenant_id}, ConsistentRead=True
     ).get("Item")
@@ -3869,36 +3973,42 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
             },
         )
 
-    # 版本,或切回 live 语义)。字段名与 POST /tenants 逐字对齐。不带 body → 现有行为不变。
-    # 入队前先解析一次:既给下方 PINNED 门做"显式换版放行"判据,也作 extra 塞进队列消息。
-    # 非对象):坏 body 不能静默当空 → 否则对 live 租户会静默走 legacy rebuild 丢 overlay,
-    # 而调用方以为在换版。空/None 是合法无 body;非空但解析失败/非 dict → 400 VALIDATION。
-    # 安全(review2/3)—— 换版恒同步、目标版本只由 _rebuild_repin_resolve 以 host 当前 canary
-    # 槽解析,body 无"传版本"字段,调用方无法指定任意版本;故不需要"信任外部版本"路径。
+    # Destructive actions accept an optional object body. Rebuild additionally
+    # reads image selection fields; reset reads client_token only.
     _rebuild_body = {}
-    if action == "rebuild":
+    if action in action_idem.IDEMPOTENT_ACTIONS:
         _raw = body
         if isinstance(_raw, str):
             _raw_stripped = _raw.strip()
-            if _raw_stripped:  # 非空字符串才尝试解析;空串 = 无 body
+            if _raw_stripped:
                 try:
                     _parsed = json.loads(_raw_stripped)
                 except Exception:
                     return utils._resp(
                         400,
-                        {"error": "rebuild body is not valid JSON", "code": "VALIDATION"},
+                        {
+                            "error": f"{action} body is not valid JSON",
+                            "code": "VALIDATION",
+                        },
                     )
                 if not isinstance(_parsed, dict):
                     return utils._resp(
                         400,
-                        {"error": "rebuild body must be a JSON object", "code": "VALIDATION"},
+                        {
+                            "error": f"{action} body must be a JSON object",
+                            "code": "VALIDATION",
+                        },
                     )
                 _rebuild_body = _parsed
-        elif isinstance(_raw, dict):  # consumer replay 透传的 extra 已是 dict
+        elif isinstance(_raw, dict):
             _rebuild_body = _raw
-        elif _raw is not None:  # 既非 str 也非 dict 也非 None → 非法
+        elif _raw is not None:
             return utils._resp(
-                400, {"error": "rebuild body must be a JSON object", "code": "VALIDATION"}
+                400,
+                {
+                    "error": f"{action} body must be a JSON object",
+                    "code": "VALIDATION",
+                },
             )
     # image_channel 必须是字符串(非 string 如 123 会让 .strip() 抛 → 500);非法即 400。
     _ic = _rebuild_body.get("image_channel")
@@ -3906,30 +4016,6 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
         return utils._resp(
             400, {"error": "image_channel must be a string", "code": "VALIDATION"}
         )
-    _rebuild_has_repin = action == "rebuild" and bool((_ic or "").strip())
-
-    # 队列开启时 API 先返 202-queued、真正的 409 落在 consumer replay 的 rebuild 分支被
-    # ack-drop,调用方永远收不到 PINNED_NO_REBUILD。故在此(同步 API 路径,入队之前)先判。
-    # 语义见下方 rebuild 分支:不带 body 的 rebuild 是 live 租户升 host 当前 flat rootfs,
-    # 版本,ADR §4.3 修订注记),放行走下方 _rebuild_repin;不带 body 的 pinned rebuild 仍 409。
-    if (
-        action == "rebuild"
-        and (item.get("image_snapshot_time") or "").strip()
-        and not _rebuild_has_repin
-    ):
-        return utils._resp(
-            409,
-            {
-                "error": (
-                    "tenant is pinned to a fixed image snapshot; rebuild (rolling "
-                    "upgrade to host current rootfs) does not apply — re-pin via the "
-                    "canary flow instead"
-                ),
-                "code": "PINNED_NO_REBUILD",
-                "id": tenant_id,
-            },
-        )
-
     # 做幂等」,而控制面此前全文零命中该字段:承诺了却没实现。
     #
     # 为什么 REBUILD_IN_FLIGHT 闸不够:那道闸只拦「上一次还在飞」。而客户重试的典型时机是
@@ -3948,18 +4034,37 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
     # dict**,取值是 falsy。用真假判断会把 SQS 重投误判成"新的客户请求",于是重投去撞自己
     # 那条 intent、被 409 挡死 → 操作永远完不成。仓库其他地方的 `not ...get(...)` 都有同一
     # 隐患,只是它们的后果是"多入一次队"(既有幂等能兜),而这里的后果是"操作卡死"。
-    if action in action_idem.IDEMPOTENT_ACTIONS and "_consumer_ident" not in (event or {}):
-        _idem_token = str(_rebuild_body.get("client_token") or "").strip()
+    if action in action_idem.IDEMPOTENT_ACTIONS:
+        _raw_idem_token = _rebuild_body.get("client_token")
+        if "_consumer_ident" in (event or {}):
+            # The producer already validated this trusted queue field. Preserve
+            # compatibility with old queued messages that predate validation.
+            _idem_token = (
+                _raw_idem_token.strip()
+                if isinstance(_raw_idem_token, str)
+                else ""
+            )
+        else:
+            _idem_token, _token_error = _normalize_client_token(_raw_idem_token)
+            if _token_error:
+                return utils._err(400, "VALIDATION", _token_error)
     _idem_owner = ""
     if _idem_token:
         _idem_owner = str(
             (auth._get_caller_identity(event or {}) or {}).get("owner_id") or ""
         )
-        _idem_op_id, _idem_existing = action_idem.begin(
-            tenant_id, action, _idem_owner, _idem_token
-        )
-        # 回传给外层包装,让它在【任何】return / 异常路径上都能写终态 result。
-        # 只在真正 begin 成功占位后才回传:重放路径(existing 非空)不该覆盖别人的记录。
+        _consumer_replay = "_consumer_ident" in (event or {})
+        if _consumer_replay:
+            _idem_op_id = (event or {}).get("_op_id") or action_idem.derive_op_id(
+                _idem_owner, tenant_id, action, _idem_token
+            )
+            _idem_existing = None
+        else:
+            _idem_op_id, _idem_existing = action_idem.begin(
+                tenant_id, action, _idem_owner, _idem_token
+            )
+        # The consumer owns finalization for queued work. It skips begin(), but
+        # still restores this context from the signed queue envelope.
         if _idem_existing is None and _idem_ctx is not None:
             _idem_ctx["owner"] = _idem_owner
             _idem_ctx["token"] = _idem_token
@@ -3989,7 +4094,31 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
             # _kind == "rerun"(UNKNOWN):可能已执行也可能没 —— 放行去做对账。
             # 绝不在这里返回"失败":image_ops 已论证过,把未知落成失败会让同 token 重试
             # 被永久挡死,违背"重试可对账"。放行后仍受下方 REBUILD_IN_FLIGHT 闸约束。
-            print(f"action_idem replay {tenant_id}/{action}: UNKNOWN → re-running")
+            _retry_state = (_idem_existing or {}).get("state")
+            if not action_idem.claim_rerun(
+                tenant_id,
+                action,
+                _idem_owner,
+                _idem_token,
+                _retry_state,
+            ):
+                return utils._resp(
+                    409,
+                    {
+                        "error": "another retry already resumed this operation; "
+                        "wait for its terminal result",
+                        "code": "IDEMPOTENT_OPERATION_IN_PROGRESS",
+                        "id": tenant_id,
+                        "op_id": _payload,
+                    },
+                )
+            if _idem_ctx is not None:
+                _idem_ctx["owner"] = _idem_owner
+                _idem_ctx["token"] = _idem_token
+            print(
+                f"action_idem replay {tenant_id}/{action}: "
+                f"{(_idem_existing or {}).get('state')} → re-running"
+            )
 
     _lifecycle_op_id = (event or {}).get("_op_id")
     if action in _FENCED_LIFECYCLE_ACTIONS:
@@ -4012,15 +4141,12 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
         "pause",
         "resume",
         "reset",
-        "rebuild",
         "suspend",
         "restore",
     }
-    # monotonic fence 现也覆盖该路径；普通(无 body)rebuild 仍照常入队削峰。
     if (
         action in _async_actions
         and clients.LIFECYCLE_QUEUE_URL
-        and not _rebuild_has_repin
         and "_consumer_ident" not in (event or {})
     ):
         _queue_fence_epoch = None
@@ -4057,107 +4183,41 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
                         "hold_lifecycle_fence": True,
                     }
                 )
-        # ADR-rebuild-idempotency-sync-contract §5.3 — 入队即落进度锚点,让客户能通过
-        # 轮询 GET /tenants/{id} 分清"是哪一次、到哪一步"。此前 202 只回
-        # {"status":"queued"} 且 DDB 无任何本次操作痕迹:队列里的操作对客户完全不可见,
-        # 唯一的反馈是若干分钟后 rootfs_version 变了或没变。
-        # 仅 rebuild 落这些字段:其余异步 action(stop/start/…)的终态由 status 自身表达,
-        # 不需要独立进度载体,避免给无关 action 增加写放大。
-        #
-        # 【时序】锚点必须在消息发出【之前】落库(走 before_send),原因有两条,都会坏掉
-        # 刚刚承诺的轮询契约:
-        #   ① 消息一发出,consumer 可能立刻取走并把 phase 推进到 running/verifying;
-        #      生产者若之后才写初始锚点,就把 phase 覆盖回 queued —— 进度倒退。
-        #   ② 若那次写入失败而我们仍返 202,客户拿着 op_id 却在记录里找不到它,轮询无从
-        #      下手。故用 fail_loud=True:写不进去就不发消息、直接 5xx 让调用方重试,
-        #      绝不发出一条无法被轮询的操作。
-        # 【new_operation】同时原子清掉上一轮遗留的 operation-scoped 字段。不清的话,上一轮
-        # 成功后残留的 rebuild_status=done / 旧 CommandId / 旧 target 会与新 op_id 并存:
-        # 客户匹配到自己的 op_id 后立刻读到 done 误判成功,事后对账还会拿【上一轮的
-        # CommandId】去问 SSM 并把【这一轮】判成 done。
-        # 记下锚点实际落库的 op_id:若之后 send_message 抛异常(状态未知),要把这个 id
-        # 回给客户,让他们能【先轮询再决定】而不是盲目重试。
-        _anchored_op_id = {"v": None}
-
-        def _anchor(_oid):
-            if action != "rebuild":
-                return
-            try:
-                _stamp_rebuild_progress(
-                    tenant_id,
-                    op_id=_oid,
-                    phase=_REBUILD_PHASE_QUEUED,
-                    started_at=utils._now(),
-                    new_operation=True,
-                    fail_loud=True,
-                    fence_epoch=_queue_fence_epoch,
-                    source_host_id=item.get("host_id"),
-                    source_vm_num=int(item.get("vm_num", 1)),
-                )
-            except Exception as e:  # noqa: BLE001
-                # 包成专属类型,好让下面把"锚点失败(肯定没发)"与"发送失败(可能已发)"
-                # 分开处理 —— 两者对客户的安全指引完全相反。
-                raise _RebuildAnchorFailed(str(e)) from e
-            _anchored_op_id["v"] = _oid
-
         try:
             _enq_op_id = lifecycle_dispatch.enqueue_lifecycle(
                 action,
                 tenant_id,
                 event,
-                before_send=_anchor,
+                extra=(
+                    _rebuild_body
+                    if action in action_idem.IDEMPOTENT_ACTIONS
+                    else None
+                ),
                 operation_id=_lifecycle_op_id,
             )
-        except _RebuildAnchorFailed as e:
-            if _queue_fence_epoch is not None:
-                lifecycle_fence.release(
-                    tenant_id, _lifecycle_op_id, _queue_fence_epoch
-                )
-                if _idem_ctx is not None:
-                    _idem_ctx["hold_lifecycle_fence"] = False
-                    _idem_ctx["release_lifecycle_fence_on_error"] = True
-            # 锚点失败 = 消息【肯定没发出】(before_send 在 send_message 之前抛)。
-            # 只有这一类才能告诉客户"什么都没排队,重试是干净的"。
-            print(f"rebuild enqueue aborted (anchor) for {tenant_id}: {e}")
-            return utils._resp(
-                503,
-                {
-                    "error": "could not record the operation before queueing it; "
-                    "nothing was queued — safe to retry",
-                    "code": "ENQUEUE_ANCHOR_FAILED",
-                    "id": tenant_id,
-                },
-            )
         except Exception as e:  # noqa: BLE001
-            # send_message 本身抛(超时/网络/限流)—— **消息可能已经被 SQS 收下**。
-            # 绝不能说 "nothing was queued":客户据此重试会拿到新 op_id/新 dedup id,
-            # 于是两次破坏性 rebuild(stop && rm overlay && launch)都可能真的执行,
-            # 第二次会抹掉第一次之后落盘的写入(no-data-loss 红线)。
-            # 故如实报"状态未知",并把已落库的 op_id 指出来让客户先轮询再决定。
-            print(f"rebuild enqueue UNKNOWN state for {tenant_id}: {e}")
+            print(f"lifecycle enqueue failed for {tenant_id}/{action}: {e}")
             return utils._resp(
                 503,
                 {
-                    "error": "the queue did not acknowledge the request, but it may "
-                    "have been accepted. Do NOT blindly retry — poll this tenant's "
-                    "rebuild_phase/rebuild_status first; a duplicate rebuild drops "
-                    "the overlay again and discards writes made in between.",
+                    "error": "the lifecycle queue did not acknowledge the request; "
+                    "check tenant state before retrying",
                     "code": "ENQUEUE_STATE_UNKNOWN",
                     "id": tenant_id,
-                    # 锚点已在发送前落库,故这个 op_id 一定可轮询(即便消息最终没投递,
-                    # §5.5 的超时兜底会把它收成 failed)。
-                    "op_id": _anchored_op_id.get("v") or _lifecycle_op_id,
+                    "op_id": _lifecycle_op_id,
                 },
             )
         if _enq_op_id:
+            if _idem_token and _idem_ctx is not None:
+                # 202 means accepted, not completed. The queue consumer keeps
+                # the intent IN_PROGRESS and writes the real terminal result.
+                _idem_ctx["defer_finish"] = True
             return utils._resp(
                 202,
                 {
                     "id": tenant_id,
                     "action": action,
                     "status": "queued",
-                    # 客户拿这个 op_id 与轮询到的 rebuild_op_id 比对,确认读到的进度
-                    # 属于自己刚发的那次请求,而不是并发的另一次操作。
                     "op_id": _enq_op_id,
                 },
             )
@@ -4540,74 +4600,100 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
         vm_num = int(item.get("vm_num", 1))
         guest_ip = item.get("guest_ip", "")
         host_port = item.get("host_port", "")
-        # Stop, delete overlay (force fresh layer), then launch
-        stop_cmd = f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num}"
-        reset_cmd = f"rm -f /data/firecracker-vms/{tenant_id}/overlay.ext4"
-        # 到 launch-vm 幂等段;老版本只填 4 位、CHAT_EP_ENABLED 恒空致唤醒漂移。
         launch_cmd = ssm_dispatch._launch_vm_wake_cmd(tenant_id, item)
         dnat_cmd = (
             _dnat_add_idempotent_cmd(host_port, guest_ip)
             if guest_ip and host_port
             else ""
         )
-        full_cmd = (
-            f"{_lifecycle_host_guard} && {stop_cmd} && "
-            f"{_lifecycle_host_guard} && {reset_cmd} && sleep 2 && "
-            f"{_lifecycle_host_guard} && {launch_cmd}"
+        _reset_attempt_id = secrets.token_hex(16)
+        q = shlex.quote
+        reset_cmd = (
+            f"/home/ubuntu/reset-vm.sh {q(str(tenant_id))} {q(str(vm_num))} "
+            f"{q(str(_lifecycle_op_id))} {q(str(_lifecycle_fence_epoch))} "
+            f"{q(_reset_attempt_id)} {q(str(item['host_id']))} -- {launch_cmd}"
         )
+        full_cmd = f"{_lifecycle_host_guard} && {reset_cmd}"
         if dnat_cmd:
             full_cmd += f" && {dnat_cmd}"
         full_cmd += f" && {_lifecycle_host_guard}"
-        if not ssm_dispatch._ssm_run(item["host_id"], full_cmd, timeout=300):
+
+        _reset_rc = {"v": None}
+        _reset_output = {"stdout": "", "stderr": ""}
+        _reset_ssm_ok = ssm_dispatch._ssm_run(
+            item["host_id"],
+            full_cmd,
+            timeout=300,
+            on_result=lambda _st, rc: _reset_rc.__setitem__("v", rc),
+            on_output=lambda stdout, stderr: _reset_output.update(
+                {"stdout": stdout, "stderr": stderr}
+            ),
+        )
+        _reset_host_result = _parse_host_reset_result(
+            _reset_output["stdout"],
+            tenant_id,
+            _lifecycle_op_id,
+            _reset_attempt_id,
+            _lifecycle_fence_epoch,
+            item["host_id"],
+            vm_num,
+        )
+        if (
+            _reset_rc["v"] == 79
+            or (
+                _reset_host_result
+                and _reset_host_result.get("state") == "SUPERSEDED"
+            )
+        ):
+            return utils._resp(
+                409,
+                {
+                    "error": "the reset lost its lifecycle fence or source host",
+                    "code": "LIFECYCLE_SUPERSEDED",
+                    "id": tenant_id,
+                    "op_id": _lifecycle_op_id,
+                },
+            )
+        _reset_verified = bool(
+            _reset_ssm_ok
+            and _reset_host_result
+            and _reset_host_result.get("state") == "SUCCEEDED"
+        )
+        if not _reset_verified:
             return utils._resp(
                 502,
                 {
                     "error": "reset was not confirmed on the host; the same "
-                    "operation will be retried",
+                    "operation will be retried with its op-scoped evidence",
+                    "code": "RESET_RETRY_PENDING",
                     "id": tenant_id,
+                    "op_id": _lifecycle_op_id,
                 },
             )
         new_status = "running"
     elif action == "rebuild":
-        # Phase 4 — in-place UPGRADE this tenant's VM to the host's CURRENT rootfs
-        # (the version refresh_rootfs just staged in /data/firecracker-assets).
-        # The host's golden image is read-only and the per-VM overlay is the only
-        # writable rootfs layer, so dropping the overlay + relaunching boots the VM
-        # on the NEW rootfs. The user's data.ext4 (the data disk, separate from the
-        # overlay) is PRESERVED — identity/skills/config/channel_secret/vkey live
-        # there and survive. This is how a rolling upgrade lands: refresh_rootfs to
-        # stage the new image on hosts → rebuild each tenant to adopt it. Same
-        # mechanism as reset, but the intent is "upgrade", and we record the new
-        # rootfs_version on the tenant so GET /tenants shows the post-upgrade drift.
-        # 注:不带 body 的 pinned 租户 rebuild 已在上方【入队前】统一返回 409（codex harness
-        # blocker：队列开启时必须同步返回，否则 202 后 consumer 才判 409 被 ack-drop）。
-        # image_snapshot_time / live REMOVE)+ 换版前强制备份 fail-closed,再走下方破坏性
-        # relaunch；launch-vm 随后读租户 image_snapshot_time 起对目标版本。不带 body 的
-        # rebuild 仍是 live 租户升 host 当前 flat rootfs（image_snapshot_time 为空）。
-        # + 换版前强制备份 fail-closed + 落库,再走下方破坏性 relaunch;launch-vm 随后读租户
-        # image_snapshot_time 起对目标版本。不带 body 的 rebuild 仍是 live 租户升 host flat rootfs。
-        _repin_snapshot = None
-        _repin_channel = None
-        if _rebuild_has_repin:
-            _resolved = _rebuild_repin_resolve(item, _rebuild_body)
-            if not (isinstance(_resolved, dict) and "channel" in _resolved):
-                return _resolved  # VALIDATION/CANARY_*/404 错误响应
-            _repin_channel = _resolved["channel"]
-            _repin_snapshot = _resolved.get("target_snap")
-            _applied = _rebuild_repin_apply(
-                tenant_id,
-                item,
-                _repin_channel,
-                _repin_snapshot,
-                _lifecycle_op_id,
-                _lifecycle_fence_epoch,
-            )
-            if _applied is not None:
-                return _applied  # 备份失败 502,不 relaunch
-            # 落库后用新鲜 item 供下方 wake 命令读(image_snapshot_time 已改)。
-            item = clients.tenants_table.get_item(
-                Key={"id": tenant_id}, ConsistentRead=True
-            ).get("Item") or item
+        # All rebuilds use one synchronous channel flow. Missing image_channel is
+        # live; both channels are resolved before the mandatory backup and before
+        # any tenant/VM mutation.
+        _resolved = _rebuild_repin_resolve(item, _rebuild_body)
+        if not (isinstance(_resolved, dict) and "channel" in _resolved):
+            return _resolved
+        _repin_channel = _resolved["channel"]
+        _repin_snapshot = _resolved.get("target_snap")
+        _applied = _rebuild_repin_apply(
+            tenant_id,
+            item,
+            _repin_channel,
+            _repin_snapshot,
+            _lifecycle_op_id,
+            _lifecycle_fence_epoch,
+        )
+        if _applied is not None:
+            return _applied
+        # Re-read after channel persistence so launch uses the selected version.
+        item = clients.tenants_table.get_item(
+            Key={"id": tenant_id}, ConsistentRead=True
+        ).get("Item") or item
         vm_num = int(item.get("vm_num", 1))
         guest_ip = item.get("guest_ip", "")
         host_port = item.get("host_port", "")
@@ -4895,8 +4981,8 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
     if _stamp_rootfs:
         # canary 换版后租户跑的是 canary 槽的候选版本,host.rootfs_version 是该 host 的
         # live 版本;写 live 会把跑 candidate 的租户在 GET /hosts/rootfs-drift 误算成
-        # up_to_date(谎报)。换版解析出的 _repin_snapshot 才是真值;无换版(普通升级到
-        # host live)时仍写 host.rootfs_version(既有语义)。
+        # up_to_date(谎报)。换版解析出的 _repin_snapshot 才是真值；live channel
+        # 不固定 snapshot，采用后仍写 host.rootfs_version。
         _resolved_ver = (
             locals().get("_rb_evidence_snapshot")
             or locals().get("_repin_snapshot")
@@ -4930,7 +5016,7 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
     # 落盘的写入。**字段值本身在引导客户做危险操作**,故改名即止血。
     #   done        = 确认成功(采用校验通过)
     #   failed      = 确认失败,可安全重试(本轮无写入点,见下方 else 分支说明)
-    #   unconfirmed = 本 attempt 暂时不知道；P3 仅以同 op_id 自动重投，绝不新建操作
+    #   unconfirmed = 本 attempt 暂时不知道；调用方先查状态，并以同 client_token 重试
     # `unconfirmed` 与 core/image_ops 的 STATE_UNKNOWN 同源同理:那里已论证过"落
     # FAILED 会让同 key 重试被挡死,违背重试可对账"。
     if action == "rebuild":
@@ -4949,18 +5035,18 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
             _remove_attrs.append("rebuild_failed_reason")
         else:
             # 这里恒标 unconfirmed 而不是 failed：回执丢失、host 失败或 evidence 不完整
-            # 都只说明当前 attempt 没能确认。P2 的 op tombstone 使 P3 能安全地以同 op_id
-            # 重投；不同 op 仍会被 lifecycle owner/epoch 闸拒绝。
+            # 都只说明当前 attempt 没能确认。调用方必须保留 client_token，让幂等层
+            # 对账同一操作；不同 op 仍会被 lifecycle owner/epoch 闸拒绝。
             update_expr += ", rebuild_status = :rbs, rebuild_failed_reason = :rbr"
             update_expr += ", rebuild_phase = :rbp"
             expr_values[":rbs"] = _REBUILD_STATUS_UNCONFIRMED
             expr_values[":rbp"] = _REBUILD_STATUS_UNCONFIRMED
             expr_values[":rbr"] = (
                 "host adoption evidence was not confirmed for this attempt. The "
-                "same operation will be retried from its op-specific overlay "
-                "tombstone; retries do not drop the fresh overlay again."
+                "caller must check tenant status before retrying and reuse the same "
+                "client_token so the operation can be reconciled safely."
             )
-        # 本次操作标识:客户拿 202 里的 op_id 与这里比对,确认读到的终态属于自己那次。
+        # 本次操作标识：客户可与 tenant 记录里的 rebuild_op_id 对照。
         _rb_final_op_id = locals().get("_rb_op_id")
         if _rb_final_op_id:
             update_expr += ", rebuild_op_id = :rbo"
@@ -5006,9 +5092,8 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
     audit._publish_event(
         event_name, tenant_id, {"action": action, "status": new_status}
     )
-    # that retry safe:the host reuses this op's tombstone/result and never drops
-    # the fresh overlay a second time. Source-host + epoch checks prevent a late
-    # retry from following a migrated tenant.
+    # A synchronous 503 reports missing adoption evidence. Callers inspect tenant
+    # state and reuse client_token; source-host and epoch checks reject stale work.
     _response_code = (
         503
         if action == "rebuild" and not locals().get("_rebuild_verified", False)
@@ -5027,8 +5112,8 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
                     **(
                         {
                             "code": "REBUILD_RETRY_PENDING",
-                            "error": "host evidence not confirmed; the same operation "
-                            "will be retried automatically",
+                            "error": "host evidence not confirmed; check tenant status "
+                            "before retrying and reuse the same client_token",
                         }
                         if _response_code == 503
                         else {}

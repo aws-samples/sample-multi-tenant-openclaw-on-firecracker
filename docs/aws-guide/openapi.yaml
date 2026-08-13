@@ -164,15 +164,15 @@ components:
             - string
             - 'null'
           description: |
-            How far the current rebuild got: queued (accepted, not started) → running
-            (command dispatched to the host) → verifying (receipt in, checking adoption)
-            → a terminal value matching rebuild_status (done | failed | unconfirmed).
+            How far the current synchronous rebuild got: running (command dispatched
+            to the host) → verifying (receipt in, checking adoption) → a terminal
+            value matching rebuild_status (done | failed | unconfirmed).
             Additive field; absent on tenants that were never rebuilt.
         rebuild_started_at:
           type:
             - string
             - 'null'
-          description: When the current rebuild was accepted onto the queue (ISO-8601).
+          description: When the current rebuild started (ISO-8601).
         rebuild_status:
           type:
             - string
@@ -180,9 +180,7 @@ components:
           description: |
             Terminal verdict — done | failed | unconfirmed. On `unconfirmed` the control
             plane could not confirm this attempt's outcome (the rebuild may have
-            succeeded). A queued rebuild is automatically retried with the SAME op_id;
-            the host reuses its op-specific overlay tombstone and never drops the fresh
-            overlay twice. Do not submit a new rebuild operation while this one converges.
+            succeeded). Do not submit a new rebuild operation while this one converges.
         rebuild_failed_reason:
           type:
             - string
@@ -195,8 +193,8 @@ components:
           description: |
             The image snapshot this rebuild is upgrading to — the expected value that
             post-hoc reconciliation compares the host's actual running version against.
-            Set on an explicit re-pin; absent for a plain rebuild onto the host's
-            current live rootfs (where the version is not known up front).
+            Set when the selected channel resolves to a fixed canary version; absent
+            for live, which resolves the host's current live slot at launch time.
         observed_image_snapshot_time:
           type:
             - string
@@ -436,10 +434,14 @@ paths:
                       description: Full ARN required.
                 client_token:
                   type: string
-                  minLength: 4
-                  maxLength: 128
-                  pattern: ^[\x21-\x7e]{4,128}$
-                  description: Optional idempotency key (printable ASCII 33-126, no spaces/control chars). Same owner+token yields the same tenant id; replay returns 409.
+                  pattern: '^\s*([\x21-\x7e]{4,128})?\s*$'
+                  description: |
+                    Optional idempotency key. Non-string values return 400 VALIDATION and
+                    are never coerced. Leading/trailing whitespace is removed before
+                    validation, so " abc1 " and "abc1" address the same key; whitespace-only
+                    is treated as omitted. The normalized value must contain 4-128 printable
+                    ASCII characters with no embedded spaces or control characters. The same
+                    owner+token yields the same tenant id; replay returns 409.
                   x-source: deploy/lambda/api/services/tenant_service.py:354
                 chat_endpoint_enabled:
                   type: boolean
@@ -1025,7 +1027,11 @@ paths:
       operationId: tenantAction
       summary: 对租户执行生命周期/管理动作(start/stop/restart/resize…)
       description: |
-        Dispatches on {action}. When the lifecycle SQS queue is enabled (LIFECYCLE_QUEUE_URL), start/stop/restart/pause/resume/reset/rebuild are enqueued and return 202 {status:queued}; otherwise they run synchronously via SSM and return 200 {id,status}. resize / resize-disk / migrate / backup / access / provision always keep their own synchronous semantics. Every action is owner/admin gated (403).
+        Dispatches on {action}. When lifecycle queueing is enabled, start/stop/restart/
+        pause/resume/reset may return 202 {status:queued}. Rebuild is administrator-only
+        and always synchronous; it never enters the lifecycle queue. Other actions keep
+        their documented semantics. Tenant actions are owner/admin gated unless a
+        stricter action-specific rule is stated.
       x-source: deploy/lambda/api/services/tenant_service.py:1196
       x-rbac: operator
       parameters:
@@ -1058,6 +1064,9 @@ paths:
               oneOf:
                 - title: resize
                   type: object
+                  additionalProperties: false
+                  required:
+                    - vcpu
                   description: Hot-add vCPU on a RUNNING tenant. mem_mb live-resize is rejected (stop + recreate instead). vcpu must be an integer strictly greater than current (Firecracker cannot shrink).
                   x-source: deploy/lambda/api/services/tenant_service.py:1743
                   properties:
@@ -1069,6 +1078,7 @@ paths:
                       description: Always rejected with 400.
                 - title: resize-disk
                   type: object
+                  additionalProperties: false
                   required:
                     - new_size_mb
                   description: Offline grow of data.ext4. Runs synchronously on the host; DDB size persisted only on success.
@@ -1080,6 +1090,7 @@ paths:
                       description: Must be an integer, strictly larger than the current size (shrink not supported), and <= 1 TiB.
                 - title: migrate
                   type: object
+                  additionalProperties: false
                   required:
                     - target_host_id
                   description: Async snapshot/restore migration (202). Rejected 409 when memory-overcommit balloon is enabled. Target must exist, differ from source, not be draining/deleted, and have capacity.
@@ -1089,6 +1100,7 @@ paths:
                       type: string
                 - title: access
                   type: object
+                  additionalProperties: false
                   required:
                     - principal
                   description: Grant/revoke another Cognito sub's access. Owner access is implicit and cannot be modified here.
@@ -1110,24 +1122,45 @@ paths:
                     expire_at:
                       type: integer
                       description: Optional epoch seconds (> 0).
-                - title: rebuild
+                - title: rebuild-or-reset
                   type: object
+                  additionalProperties: false
+                  anyOf:
+                    - required:
+                        - image_channel
+                    - required:
+                        - client_token
+                    - required:
+                        - expected_image_snapshot_time
+                    - required:
+                        - expected_image_generation
                   description: |
-                    version (a one-time, CAS-guarded rewrite; not the version-drift rejected by
-                    ADR-per-vm-canary-image-channel §10 item 1). Omit the body entirely for the unchanged
-                    rolling-upgrade behavior (live tenant → host current rootfs). With a body:
-                    image_channel=canary pins the tenant to this host's current canary slot version;
-                    image_channel=live removes the fixed version (REMOVE image_snapshot_time) so launch
-                    re-resolves slots.live. A backup is forced (fail-closed) before re-pin. Same field
-                    names / CAS / error codes as POST /tenants; canary never falls back to live on failure.
+                    Request fields for destructive reset/rebuild operations. reset accepts
+                    client_token only. Rebuild also accepts image selection and TOCTOU
+                    guard fields. An empty reset/rebuild body is represented by the
+                    lifecycle-or-empty variant below.
                   x-source: deploy/lambda/api/services/tenant_service.py:_rebuild_repin
                   properties:
                     image_channel:
                       type: string
+                      default: live
                       enum:
                         - live
                         - canary
-                      description: Target channel. Presence of this field is what opts a pinned tenant past the PINNED_NO_REBUILD 409 gate.
+                      description: Target image channel. Omitted or empty means live.
+                    client_token:
+                      type: string
+                      pattern: '^\s*([\x21-\x7e]{4,128})?\s*$'
+                      description: |
+                        Caller-generated idempotency token. Use a new unique value for each new
+                        reset or rebuild and reuse the original value when retrying that same
+                        operation. This field is distinct from the server-generated op_id.
+                        Non-string values return 400 VALIDATION and are never coerced.
+                        Leading/trailing whitespace is removed before validation, so " abc1 "
+                        and "abc1" address the same idempotency record. A whitespace-only value
+                        is treated as omitted. The normalized value must contain 4-128 printable
+                        ASCII characters with no embedded spaces or control characters.
+                      x-source: deploy/lambda/api/services/tenant_service.py:_tenant_action_inner
                     expected_image_snapshot_time:
                       type: string
                       description: Optional TOCTOU guard — the canary snapshot the caller read; 409 CANARY_CHANGED if the host canary slot differs. Omit to accept whatever this host's canary slot currently is (no arbitrary version — always this host's slot).
@@ -1136,7 +1169,9 @@ paths:
                       description: Optional TOCTOU guard on the host slot generation.
                 - title: lifecycle-or-empty
                   type: object
-                  description: restart/stop/start/reset/pause/resume/backup/provision take no body fields (rebuild optionally takes the re-pin body above — #416).
+                  additionalProperties: false
+                  maxProperties: 0
+                  description: restart/stop/start/pause/resume/backup/provision take no body fields. An empty reset/rebuild body is also accepted; rebuild then selects live.
       responses:
         '200':
           description: |
@@ -1165,25 +1200,16 @@ paths:
                         type: string
                         enum:
                           - done
-                          - failed
-                          - unconfirmed
                         description: |
-                          Terminal verdict of a rebuild (present on rebuild responses).
-                          ADR-rebuild-idempotency-sync-contract §5.4:
-                            * done — adoption confirmed; the tenant is on the new rootfs.
-                            * failed — confirmed failure (the host ran the command and it failed).
-                              Safe to retry with the same operation identity.
-                            * unconfirmed — the receipt did not arrive in time, so the control plane
-                              does not know. The rebuild may well have SUCCEEDED on the host.
-                              The queue retries the same op_id; rebuild-vm.sh reuses the
-                              op-specific tombstone and does not drop the fresh overlay again.
-                              Poll GET /tenants/{id} until rebuild_status becomes done or failed.
+                          A successful synchronous rebuild returns done. If adoption
+                          cannot be confirmed, the endpoint returns 503 with
+                          rebuild_status=unconfirmed instead.
                       op_id:
                         type: string
                         description: |
-                          Identifier of this rebuild operation, for log/event correlation. Compare it
-                          with the tenant record's rebuild_op_id when polling to confirm the progress
-                          you are reading belongs to the operation you submitted.
+                          Server-generated identifier of this rebuild operation, for status
+                          correlation. Compare it with the tenant record's rebuild_op_id when
+                          polling. It is not a request parameter or a replacement for client_token.
                     x-source: deploy/lambda/api/services/tenant_service.py:1674
                   - type: object
                     title: resize
@@ -1242,10 +1268,8 @@ paths:
                     title: queued-lifecycle
                     description: |
                       The action was accepted onto the queue; it has NOT run yet. Poll
-                      GET /tenants/{id} to follow it. For rebuild specifically, the tenant record
-                      carries rebuild_op_id / rebuild_phase / rebuild_status (see the tenant schema),
-                      so a caller can tell which operation the progress belongs to and how far it
-                      got — ADR-rebuild-idempotency-sync-contract §5.3.
+                      GET /tenants/{id} to follow it. Rebuild never uses this response;
+                      it is always synchronous.
                     properties:
                       id:
                         type: string
@@ -1257,10 +1281,7 @@ paths:
                           - queued
                       op_id:
                         type: string
-                        description: |
-                          Identifier of the queued operation. Compare with the tenant record's
-                          rebuild_op_id while polling to confirm the progress you read belongs to
-                          the operation you just submitted (rather than a concurrent one).
+                        description: Identifier of the queued lifecycle operation.
                     x-source: deploy/lambda/api/services/tenant_service.py:1219
                   - type: object
                     title: backup-started
@@ -1311,7 +1332,7 @@ paths:
                   id:
                     type: string
         '403':
-          description: Not the owner / outside platform scope.
+          description: Not the owner / outside platform scope; rebuild also requires administrator role.
           content:
             application/json:
               schema:
@@ -1319,6 +1340,10 @@ paths:
                 properties:
                   error:
                     type: string
+                  code:
+                    type: string
+                    enum:
+                      - ACCESS_DENIED
         '404':
           description: Tenant not found; migrate target host not found.
           content:
@@ -1331,6 +1356,14 @@ paths:
         '409':
           description: |
             Migrate refused while balloon is enabled ({error,reason:balloon_enabled}), target host draining/deleted, or target lacks capacity.
+            Rebuild: NO_LIVE_VERSION when the selected/default live slot is absent;
+            CANARY_NOT_READY when the selected canary slot is absent; CANARY_CHANGED
+            when an optional expected canary version/generation no longer matches;
+            REBUILD_IN_FLIGHT when another rebuild is active for the tenant; and
+            IDEMPOTENT_OPERATION_IN_PROGRESS when the operation for the same
+            client_token is still active.
+            Slot failures occur before backup, channel update, or VM mutation and never
+            fall back to the other channel.
           content:
             application/json:
               schema:
@@ -1343,15 +1376,19 @@ paths:
                   code:
                     type: string
                     enum:
-                      - PINNED_NO_REBUILD
+                      - NO_LIVE_VERSION
                       - CANARY_NOT_READY
                       - CANARY_CHANGED
+                      - REBUILD_IN_FLIGHT
+                      - IDEMPOTENT_OPERATION_IN_PROGRESS
                       - LIFECYCLE_SUPERSEDED
                       - OPERATION_ID_REUSED
           x-source: deploy/lambda/api/services/tenant_service.py:1290
         '502':
           description: |
             Host-side SSM failure (resize-disk script, Firecracker machine-config PATCH, migration snapshot submit); state unchanged / rolled back.
+            Rebuild: REPIN_BACKUP_FAILED — the mandatory pre-rebuild backup did not
+            succeed, so the operation is aborted before channel or VM mutation.
           content:
             application/json:
               schema:
@@ -1373,12 +1410,10 @@ paths:
           description: |
             Temporary lifecycle failure. For rebuild convergence,
             REBUILD_RETRY_PENDING means this attempt lacked identity-bound host
-            adoption evidence; queued consumers return the SQS item to the queue and
-            retry the same op_id. REBUILD_ATTEMPT_BUSY means another leased attempt
-            still owns that op_id. Callers on the synchronous path must preserve the
-            same client_token when retrying; starting a new rebuild is a different
-            destructive operation. Queue anchor failures and migration capacity
-            contention can also return 503 with the fields applicable to that error.
+            adoption evidence. REBUILD_ATTEMPT_BUSY means another leased attempt still
+            owns that op_id. Preserve the same client_token when retrying; starting a
+            new rebuild is a different destructive operation. Other lifecycle queue
+            and migration failures can also return 503 with their applicable fields.
           content:
             application/json:
               schema:

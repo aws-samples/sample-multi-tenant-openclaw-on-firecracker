@@ -27,6 +27,7 @@ shell so it can be unit-tested without DDB/SSM/SNS access.
 import os
 import json
 import shlex
+import time
 import boto3
 from botocore.exceptions import ClientError
 from datetime import datetime, timezone
@@ -214,6 +215,9 @@ MIGRATION_WATCHDOG_MINUTES = int(os.environ.get("MIGRATION_WATCHDOG_MINUTES", "1
 # 多秒让在途老流量走完,下一轮 sweep 才拆源(不在单次 invocation sleep——Lambda
 # 时长贵且脆,drain 靠 migration_committed_at 时间戳跨 sweep 判定,天然可重入)。
 MIGRATION_DRAIN_SECONDS = int(os.environ.get("MIGRATION_DRAIN_SECONDS", "5"))
+LIFECYCLE_FENCE_LEASE_SECONDS = int(
+    os.environ.get("LIFECYCLE_FENCE_LEASE_SECONDS", "1800")
+)
 
 
 # stop-confirm 有上限。每条 stop-vm 阻塞至多 STOP_CONFIRM_TIMEOUT 秒;若不设上限,数台不可达
@@ -222,6 +226,145 @@ MIGRATION_DRAIN_SECONDS = int(os.environ.get("MIGRATION_DRAIN_SECONDS", "5"))
 _REAP_STOP_CONFIRM_MAX = int(os.environ.get("REAP_STOP_CONFIRM_MAX", "6"))
 STOP_CONFIRM_TIMEOUT = int(os.environ.get("STOP_CONFIRM_TIMEOUT", "20"))
 _stop_confirm_budget = {"n": 0}  # 每次 lambda_handler 顶部重置(warm invocation 复用模块态)
+
+
+def _is_conditional_failure(exc):
+    if type(exc).__name__ == "ConditionalCheckFailedException":
+        return True
+    ccf = tenants_table.meta.client.exceptions.ConditionalCheckFailedException
+    if isinstance(ccf, type) and isinstance(exc, ccf):
+        return True
+    response = getattr(exc, "response", None)
+    return (
+        isinstance(response, dict)
+        and (response.get("Error") or {}).get("Code")
+        == "ConditionalCheckFailedException"
+    )
+
+
+def _migration_fence(tenant):
+    op_id = tenant.get("migration_lifecycle_op_id")
+    epoch = tenant.get("migration_lifecycle_fence_epoch")
+    if not op_id or epoch is None:
+        return None
+    return str(op_id), int(epoch)
+
+
+def _migration_fence_condition(tenant, phase=None):
+    op_id, epoch = _migration_fence(tenant)
+    now_epoch = int(time.time())
+    condition = (
+        "#s = :migrating AND active_lifecycle_op_id = :lf_op AND "
+        "lifecycle_fence_epoch = :lf_epoch AND "
+        "migration_lifecycle_op_id = :lf_op AND "
+        "migration_lifecycle_fence_epoch = :lf_epoch AND "
+        "active_lifecycle_until > :lf_now"
+    )
+    values = {
+        ":migrating": "migrating",
+        ":lf_op": op_id,
+        ":lf_epoch": epoch,
+        ":lf_now": now_epoch,
+    }
+    if phase is not None:
+        condition += " AND migration_phase = :lf_phase"
+        values[":lf_phase"] = phase
+    return condition, values
+
+
+def _renew_migration_fence(tenant):
+    fence = _migration_fence(tenant)
+    if fence is None:
+        print(
+            f"migration {tenant.get('id')}: missing lifecycle fence; "
+            "refusing to advance legacy in-flight migration"
+        )
+        return False
+    condition, values = _migration_fence_condition(
+        tenant, tenant.get("migration_phase")
+    )
+    values[":lf_until"] = int(time.time()) + LIFECYCLE_FENCE_LEASE_SECONDS
+    values[":lf_updated"] = datetime.now(timezone.utc).isoformat()
+    try:
+        tenants_table.update_item(
+            Key={"id": tenant["id"]},
+            UpdateExpression=(
+                "SET active_lifecycle_until = :lf_until, "
+                "lifecycle_lease_updated_at = :lf_updated"
+            ),
+            ConditionExpression=condition,
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues=values,
+        )
+    except Exception as exc:
+        if not _is_conditional_failure(exc):
+            raise
+        print(
+            f"migration {tenant.get('id')}: lifecycle fence superseded or expired; "
+            "refusing to advance"
+        )
+        return False
+    tenant["active_lifecycle_until"] = values[":lf_until"]
+    return True
+
+
+def _release_migration_fence(tenant):
+    fence = _migration_fence(tenant)
+    if fence is None:
+        return False
+    op_id, epoch = fence
+    try:
+        tenants_table.update_item(
+            Key={"id": tenant["id"]},
+            UpdateExpression=(
+                "SET lifecycle_released_at = :lf_updated "
+                "REMOVE active_lifecycle_op_id, active_lifecycle_action, "
+                "active_lifecycle_until"
+            ),
+            ConditionExpression=(
+                "active_lifecycle_op_id = :lf_op AND "
+                "lifecycle_fence_epoch = :lf_epoch"
+            ),
+            ExpressionAttributeValues={
+                ":lf_op": op_id,
+                ":lf_epoch": epoch,
+                ":lf_updated": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+    except Exception as exc:
+        if not _is_conditional_failure(exc):
+            raise
+        return False
+    return True
+
+
+def _migration_host_guard(tenant):
+    op_id, epoch = _migration_fence(tenant)
+    table = os.environ["TENANTS_TABLE"]
+    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION", "")
+    key = shlex.quote(json.dumps({"id": {"S": tenant["id"]}}))
+    q = shlex.quote
+    read_cmd = (
+        f"aws dynamodb get-item --table-name {q(table)} --region {q(region)} "
+        f"--key {key} --consistent-read "
+        '--query "[Item.active_lifecycle_op_id.S,'
+        "Item.lifecycle_fence_epoch.N,Item.active_lifecycle_until.N]\" "
+        "--output text 2>/dev/null"
+    )
+    return (
+        f'_LF=$({read_cmd}) || _LF=""; '
+        f'if [ -z "$_LF" ]; then _LF=$({read_cmd}) || _LF=""; fi; '
+        '[ -n "$_LF" ] || { echo "LIFECYCLE_FENCE_READ_FAILED" >&2; exit 78; }; '
+        '_LF_OWNER=$(printf "%s" "$_LF" | cut -f1); '
+        '_LF_EPOCH=$(printf "%s" "$_LF" | cut -f2); '
+        '_LF_UNTIL=$(printf "%s" "$_LF" | cut -f3); '
+        f'[ "$_LF_OWNER" = {q(op_id)} ] || '
+        '{ echo "LIFECYCLE_SUPERSEDED owner=$_LF_OWNER" >&2; exit 79; }; '
+        f'[ "$_LF_EPOCH" = {q(str(epoch))} ] || '
+        '{ echo "LIFECYCLE_SUPERSEDED epoch=$_LF_EPOCH" >&2; exit 79; }; '
+        '[ -n "$_LF_UNTIL" ] && [ "$_LF_UNTIL" -gt "$(date +%s)" ] || '
+        '{ echo "LIFECYCLE_FENCE_EXPIRED" >&2; exit 79; }'
+    )
 
 
 def _confirm_vm_stopped(host_id, tenant_id, vm_num):
@@ -452,6 +595,21 @@ def _reconcile_unconfirmed_rebuilds(now):
         if op_id:
             cond += " AND rebuild_op_id = :o"
             vals[":o"] = op_id
+        fence_epoch = t.get("rebuild_lifecycle_fence_epoch")
+        if fence_epoch is not None:
+            # A released owner may be reconciled only while its monotonic epoch
+            # is still the latest tenant lifecycle epoch. Any later lifecycle
+            # claim increments the epoch and permanently invalidates this stale
+            # rebuild result, even after that newer owner releases its lease.
+            cond += " AND lifecycle_fence_epoch = :fe"
+            if op_id:
+                cond += (
+                    " AND (attribute_not_exists(active_lifecycle_op_id) OR "
+                    "active_lifecycle_op_id = :o)"
+                )
+            else:
+                cond += " AND attribute_not_exists(active_lifecycle_op_id)"
+            vals[":fe"] = int(fence_epoch)
         try:
             tenants_table.update_item(
                 Key={"id": tid},
@@ -779,6 +937,38 @@ def _rollback_migration(tenant, reason):
     rollback can't drive the ledger negative.
     """
     tid = tenant["id"]
+    condition, values = _migration_fence_condition(
+        tenant, tenant.get("migration_phase")
+    )
+    values.update(
+        {
+            ":r": "running",
+            ":reason": reason[:500],
+            ":t": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    try:
+        # Claim rollback first. Only the owner of this exact migration epoch may
+        # release the target reservation; stale sweep invocations do nothing.
+        tenants_table.update_item(
+            Key={"id": tid},
+            UpdateExpression=(
+                "SET #s = :r, migration_failed = :reason, updated_at = :t "
+                "REMOVE migration_target, migration_target_vm_num, migration_source, "
+                "migration_snap_cmd, migration_restore_cmd, migration_phase, "
+                "migration_started_at, migration_snapshot_uri, "
+                "migration_lifecycle_op_id, migration_lifecycle_fence_epoch"
+            ),
+            ConditionExpression=condition,
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues=values,
+        )
+    except Exception as exc:
+        if not _is_conditional_failure(exc):
+            raise
+        print(f"migration rollback {tid}: stale owner; skipped ({reason})")
+        return False
+
     target_host_id = tenant.get("migration_target")
     if target_host_id:
         try:
@@ -801,23 +991,10 @@ def _rollback_migration(tenant, reason):
             print(
                 f"migration rollback target slot release skipped/failed (non-fatal): {e}"
             )
-    tenants_table.update_item(
-        Key={"id": tid},
-        UpdateExpression=(
-            "SET #s = :r, migration_failed = :reason, updated_at = :t "
-            "REMOVE migration_target, migration_target_vm_num, migration_source, "
-            "migration_snap_cmd, migration_restore_cmd, migration_phase, "
-            "migration_started_at, migration_snapshot_uri"
-        ),
-        ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={
-            ":r": "running",
-            ":reason": reason[:500],
-            ":t": datetime.now(timezone.utc).isoformat(),
-        },
-    )
+    _release_migration_fence(tenant)
     _emit_audit("MIGRATION_FAILED", {"tenant_id": tid, "reason": reason[:200]})
     print(f"migration rollback {tid}: {reason}")
+    return True
 
 
 def _advance_migration(tenant, now):
@@ -839,10 +1016,13 @@ def _advance_migration(tenant, now):
     # untouched rather than force-rolled-back. Empty phase = nothing to advance.
     if not phase:
         return
+    if not _renew_migration_fence(tenant):
+        return
     source_host_id = tenant.get("migration_source", "")
     target_host_id = tenant.get("migration_target", "")
     target_vm_num = int(tenant.get("migration_target_vm_num", 1))
     snap_uri = tenant.get("migration_snapshot_uri", "")
+    host_guard = _migration_host_guard(tenant)
 
     # Watchdog — never let a tenant sit in `migrating` forever.
     # EXCEPTION: phase=draining is POST-commit — DDB/Redis/ALB already point at
@@ -881,22 +1061,30 @@ def _advance_migration(tenant, now):
         # Snapshot done — fire restore on the target host.
         restore_cmd = _ssm_send_hc(
             target_host_id,
-            f"/home/ubuntu/migrate-vm.sh restore {tid} {target_vm_num} {snap_uri}",
+            f"{host_guard} && "
+            f"/home/ubuntu/migrate-vm.sh restore {shlex.quote(tid)} "
+            f"{target_vm_num} {shlex.quote(snap_uri)} && {host_guard}",
             timeout=600,
         )
         if not restore_cmd:
             _rollback_migration(tenant, "failed to submit restore SSM command")
             return
+        condition, values = _migration_fence_condition(tenant, "snapshot")
+        values.update(
+            {
+                ":p": "restore",
+                ":rc": restore_cmd,
+                ":t": datetime.now(timezone.utc).isoformat(),
+            }
+        )
         tenants_table.update_item(
             Key={"id": tid},
             UpdateExpression=(
                 "SET migration_phase = :p, migration_restore_cmd = :rc, updated_at = :t"
             ),
-            ExpressionAttributeValues={
-                ":p": "restore",
-                ":rc": restore_cmd,
-                ":t": datetime.now(timezone.utc).isoformat(),
-            },
+            ConditionExpression=condition,
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues=values,
         )
         print(f"migration {tid}: snapshot done → restore fired ({restore_cmd})")
         return
@@ -928,7 +1116,8 @@ def _advance_migration(tenant, now):
             return
         ok, out = _ssm_run_capture(
             target_host_id,
-            f"python3 /opt/openclaw/route_ops.py ready-route {tid}",
+            f"{host_guard} && python3 /opt/openclaw/route_ops.py ready-route "
+            f"{shlex.quote(tid)} && {host_guard}",
         )
         # ready-route 打 `OK <host_port> <guest_ip>` 仅当 DNAT 建好且 guest 自检通过;
         # 未就绪打 `NOT_READY ...` 且 exit≠0 → ok=False。任一非就绪都不切流。
@@ -946,6 +1135,8 @@ def _advance_migration(tenant, now):
         # 顺序:repoint ALB → 经 ALB 探活确认 target 真可达 → commit-route 原子写
         # Redis(切流的临界点,edge 的权威路由源)。ALB/探活任一失败 → 回滚,此刻
         # Redis 仍未 commit、仍指源(源是 fallback)。Redis 是最后一步,切完才翻 DDB。
+        if not _renew_migration_fence(tenant):
+            return
         try:
             _repoint_alb_rule(tid, target_host_id, target_ip)
         except Exception as e:
@@ -958,8 +1149,9 @@ def _advance_migration(tenant, now):
             return
         ok, cout = _ssm_run_capture(
             target_host_id,
-            f"python3 /opt/openclaw/route_ops.py commit-route "
-            f"{tid} {target_ip} {new_host_port} {new_guest_ip}",
+            f"{host_guard} && python3 /opt/openclaw/route_ops.py commit-route "
+            f"{shlex.quote(tid)} {shlex.quote(target_ip)} {new_host_port} "
+            f"{shlex.quote(new_guest_ip)} && {host_guard}",
         )
         if not ok or not cout.startswith("OK "):
             _rollback_migration(tenant, f"commit-route (Redis) failed: {cout!r}")
@@ -973,16 +1165,9 @@ def _advance_migration(tenant, now):
         old_host_port = tenant.get("host_port")
         old_guest_ip = tenant.get("guest_ip", "")
         old_vm_num = int(tenant.get("vm_num", 1))
-        tenants_table.update_item(
-            Key={"id": tid},
-            UpdateExpression=(
-                "SET host_id = :h, vm_num = :n, updated_at = :t, "
-                "host_private_ip = :hpi, host_port = :hp, guest_ip = :gip, "
-                "migration_phase = :draining, migration_committed_at = :t, "
-                "migration_old_host_port = :ohp, migration_old_guest_ip = :ogip, "
-                "migration_old_vm_num = :ovn"
-            ),
-            ExpressionAttributeValues={
+        condition, values = _migration_fence_condition(tenant, "restore")
+        values.update(
+            {
                 ":h": target_host_id,
                 ":n": target_vm_num,
                 ":t": datetime.now(timezone.utc).isoformat(),
@@ -993,7 +1178,20 @@ def _advance_migration(tenant, now):
                 ":ohp": int(old_host_port) if old_host_port else 0,
                 ":ogip": old_guest_ip,
                 ":ovn": old_vm_num,
-            },
+            }
+        )
+        tenants_table.update_item(
+            Key={"id": tid},
+            UpdateExpression=(
+                "SET host_id = :h, vm_num = :n, updated_at = :t, "
+                "host_private_ip = :hpi, host_port = :hp, guest_ip = :gip, "
+                "migration_phase = :draining, migration_committed_at = :t, "
+                "migration_old_host_port = :ohp, migration_old_guest_ip = :ogip, "
+                "migration_old_vm_num = :ovn"
+            ),
+            ConditionExpression=condition,
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues=values,
         )
         _emit_audit(
             "MIGRATION_COMMITTED",
@@ -1022,6 +1220,14 @@ def _advance_migration(tenant, now):
         # 恰好一次收口:CAS 翻 running(条件 status=migrating AND phase=draining)。
         # 赢的 sweep 才做源清理,重入的 loser CCF → 跳过,杜绝双减/双删(Property 6)。
         try:
+            condition, values = _migration_fence_condition(tenant, "draining")
+            values.update(
+                {
+                    ":running": "running",
+                    ":draining": "draining",
+                    ":t": datetime.now(timezone.utc).isoformat(),
+                }
+            )
             tenants_table.update_item(
                 Key={"id": tid},
                 UpdateExpression=(
@@ -1030,18 +1236,16 @@ def _advance_migration(tenant, now):
                     "migration_snap_cmd, migration_restore_cmd, migration_phase, "
                     "migration_started_at, migration_snapshot_uri, migration_failed, "
                     "migration_committed_at, migration_old_host_port, "
-                    "migration_old_guest_ip, migration_old_vm_num"
+                    "migration_old_guest_ip, migration_old_vm_num, "
+                    "migration_lifecycle_op_id, migration_lifecycle_fence_epoch"
                 ),
-                ConditionExpression="#s = :migrating AND migration_phase = :draining",
+                ConditionExpression=condition,
                 ExpressionAttributeNames={"#s": "status"},
-                ExpressionAttributeValues={
-                    ":running": "running",
-                    ":migrating": "migrating",
-                    ":draining": "draining",
-                    ":t": datetime.now(timezone.utc).isoformat(),
-                },
+                ExpressionAttributeValues=values,
             )
-        except tenants_table.meta.client.exceptions.ConditionalCheckFailedException:
+        except Exception as exc:
+            if not _is_conditional_failure(exc):
+                raise
             print(f"migration {tid}: draining already finalized by concurrent sweep")
             return
 
@@ -1069,11 +1273,12 @@ def _advance_migration(tenant, now):
         old_vm_num = int(tenant.get("migration_old_vm_num", tenant.get("vm_num", 1)))
         if source_host_id:
             try:
-                _ssm_send_hc(
+                _ssm_run_capture(
                     source_host_id,
-                    f"/home/ubuntu/stop-vm.sh {tid} {old_vm_num} ; "
+                    f"{host_guard} && /home/ubuntu/stop-vm.sh "
+                    f"{shlex.quote(tid)} {old_vm_num} && {host_guard} && "
                     f"sudo rm -f /etc/nginx/conf.d/tenants/{tid}.conf "
-                    f"&& sudo nginx -s reload",
+                    f"&& sudo nginx -s reload && {host_guard}",
                     timeout=60,
                 )
             except Exception as e:
@@ -1092,10 +1297,11 @@ def _advance_migration(tenant, now):
         old_guest_ip = tenant.get("migration_old_guest_ip", "")
         if source_host_id and old_host_port and old_guest_ip:
             try:
-                _ssm_send_hc(
+                _ssm_run_capture(
                     source_host_id,
-                    f"python3 /opt/openclaw/route_ops.py release-route "
-                    f"{tid} {int(old_host_port)} {old_guest_ip}",
+                    f"{host_guard} && python3 /opt/openclaw/route_ops.py "
+                    f"release-route {shlex.quote(tid)} {int(old_host_port)} "
+                    f"{shlex.quote(old_guest_ip)} && {host_guard}",
                     timeout=60,
                 )
             except Exception as e:
@@ -1111,6 +1317,7 @@ def _advance_migration(tenant, now):
                 "target_host_id": target_host_id,
             },
         )
+        _release_migration_fence(tenant)
         print(f"migration {tid}: COMPLETE → {target_host_id}")
         return
 

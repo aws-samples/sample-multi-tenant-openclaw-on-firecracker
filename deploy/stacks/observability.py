@@ -118,7 +118,6 @@ def build_observability(self, ctx):
     # (master password auto-generated inside the domain into a Secrets Manager
     # secret, child construct id "MasterUser"). rolesmapping of the Firehose
     # delivery role into the security plugin is bootstrapped at deploy time by
-    # the AosRolesMapping custom resource below (#219 follow-up) — CDK L2 has
     # no property for AOS security-plugin role mappings, so a VPC Lambda calls
     # the _plugins/_security API directly. Replaces the old manual
     # scripts/observability/aos-bootstrap.sh step.
@@ -138,9 +137,7 @@ def build_observability(self, ctx):
         description="HTTPS from VPC (Firehose delivery ENIs, BFF, bootstrap script)",
     )
 
-    # #272 — logging.aos.subnet_ids 非空时显式选 OpenSearch 域子网(imported 私有
     # 子网场景);缺省回落 PRIVATE_WITH_EGRESS → private_subnets。
-    # #280 — 用 from_subnet_attributes 显式带 AZ:from_subnet_id 不带 AZ,CDK 拿到
     # dummy AZ token,OpenSearch Domain 的 zone_awareness 多 AZ 分布错乱、LogDomain
     # 部署失败。契约:subnet_ids 书写顺序须与 stack AZ 顺序(self.availability_zones)
     # 一致 —— 按 index 配对,乱序填会给子网标错 AZ。
@@ -338,7 +335,6 @@ def build_observability(self, ctx):
     # One delivery role + one rolesmapping back all three streams — the role's
     # es:ESHttp* is scoped to domain/* (covers every claw-logs* index) and the
     # index is set per-stream below, so no extra IAM principals are needed
-    # (#245: edge/host/vm streams, one role). Helper builds a CfnDeliveryStream
     # for a given index reusing the shared role/sg/bucket/domain.
     _fh_buf_interval = int(_fh_cfg.get("buffering_interval_seconds", 60))
     _fh_buf_size = int(_fh_cfg.get("buffering_size_mib", 5))
@@ -406,7 +402,6 @@ def build_observability(self, ctx):
     )
 
     # ────────────────────────────────────────────────────────────────
-    # AOS FGAC rolesmapping (#219 follow-up 真机修复):
     # FGAC 开启后,仅给 firehose_role 挂 IAM `es:ESHttp*` 权限**不够** —— AOS
     # security 插件还要求把该 role 的 ARN 映射进一个能写索引的插件角色,否则
     # Firehose→AOS 交付被 security 插件拒(真机现象:IncomingRecords>0 但
@@ -439,11 +434,9 @@ def build_observability(self, ctx):
     # Secrets Manager Interface VPCE:AosRolesMapFn 在 VPC 内,运行时 boto3 调 secretsmanager
     # 取 AOS master 口令。imported 客户 VPC 无法保证 private 子网真有 NAT 出网(from_vpc_attributes
     # 只按名字当 egress,不验路由)——2026-07-17 真机实撞:主栈部署到 AOS rolesmapping 时 Lambda
-    # `Connect timeout on secretsmanager.<region>.amazonaws.com` → 整栈 ROLLBACK(#295,codex 判根因)。
     # VPCE 走 VPC 内直达(private_dns 让标准域名自动导向,代码不改),不依赖 NAT,对 imported/self_managed
     # 都普适。SG 只放 rolesmapping Lambda SG 443。
     #
-    # #309 — 幂等门 `create_secretsmanager_vpce`(默认 true,保存量行为):AWS 硬规则同一
     # 服务在同一 VPC 只允许一个 Interface VPCE 开 private_dns_enabled。若 VPC 里已存在一个
     # secretsmanager VPCE(上轮 RETAIN 残留 / 客户自建),再建开 private DNS 的必冲突报
     # `private-dns-enabled ... conflicts` → 整栈 ROLLBACK(2026-07-17 真机撞)。已有 VPCE 的
@@ -456,13 +449,18 @@ def build_observability(self, ctx):
             self,
             "SecretsManagerVpceSg",
             vpc=vpc,
-            description="Secrets Manager VPCE - 443 from AOS rolesmapping Lambda SG only",
+            description="Secrets Manager VPCE - HTTPS access within the VPC",
             allow_all_outbound=False,
         )
         _sm_vpce_sg.add_ingress_rule(
             peer=ec2.Peer.security_group_id(_rmap_sg.security_group_id),
             connection=ec2.Port.tcp(443),
             description="HTTPS from AOS rolesmapping Lambda",
+        )
+        _sm_vpce_sg.add_ingress_rule(
+            peer=ec2.Peer.ipv4(vpc.vpc_cidr_block),
+            connection=ec2.Port.tcp(443),
+            description="HTTPS from VPC - private DNS makes this endpoint serve the whole VPC (#479)",
         )
         _sm_vpce = ec2.InterfaceVpcEndpoint(
             self,
@@ -587,7 +585,6 @@ def build_observability(self, ctx):
         "AosRolesMapProvider",
         on_event_handler=_rmap_fn,
     )
-    # #266 — BFF(console 日志查询)也要能读 AOS。它的 role 与 firehose role 一并
     # 映射进 all_access(读查询 + 写交付共用同一后端角色,用户已授权 all_access,
     # 不另建窄角色,与既有 firehose 映射决策一致)。BFF 不在 VPC(logging 关)时
     # ctx.console_bff_fn 为 None 或未进 VPC → 只映射 firehose role。
@@ -613,12 +610,10 @@ def build_observability(self, ctx):
     for _s in _all_streams:
         _rmap_cr.node.add_dependency(_s)
     # VPCE 必须先就绪:Lambda 运行时经它调 secretsmanager 取口令(否则 imported VPC 无 NAT 时超时)。
-    # #309 — 仅当本栈建了 VPCE 才钉依赖;复用现有 VPCE(create_secretsmanager_vpce=false)时
     # 它已存在、无需 add_dependency。
     if _sm_vpce is not None:
         _rmap_cr.node.add_dependency(_sm_vpce)
 
-    # #219 修复(真机 us-east-1 2026-07-14):edge 的 Fluent Bit 用 **edge instance
     # role** 调 firehose:PutRecordBatch 往 edge stream 送 nginx access log,但此前
     # 从没给 edge role 授过 Firehose 写权限 → 真机报 `PutRecordBatch API responded
     # with error='AccessDeniedException'`、日志送不进 AOS。build_ha_edge 先跑并把
@@ -633,7 +628,6 @@ def build_observability(self, ctx):
             )
         )
 
-    # #245: host 的 Fluent Bit 用 **host instance role** 送 journald(host stream)
     # + 每租户 fc.log(vm stream)。build_compute 把 host_role 挂到 ctx.host_role;
     # 只授这两条 stream(最小权限,不含 edge stream)。
     _host_role = getattr(ctx, "host_role", None)
@@ -646,7 +640,6 @@ def build_observability(self, ctx):
         )
 
     # ────────────────────────────────────────────────────────────────
-    # #266 — 回填 console BFF 的 AOS 查询接线(vm/host 日志):域端点 + master
     # secret 读权限 + AOS SG 入站放行 BFF SG。auth.py 已让 BFF 进 VPC(logging.
     # enabled 时)并挂 ctx.console_bff_fn/_sg/_in_vpc;此处只在真进 VPC 时接线。
     # aos-client.mjs 运行时按 AOS_SECRET_ARN 现取口令 basic-auth,口令绝不进 env。

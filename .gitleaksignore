@@ -1,0 +1,75 @@
+# Reviewed false positives from ProbeScan export 2026-08-12.
+# Entries are exact historical fingerprints so new findings remain actionable.
+
+# Public client IDs, placeholders, and generated identifiers in retired files.
+a5187272d942af0d0116299f38323179a72ac111:.claude/skills/api-design-review/SKILL.md:generic-api-key:168
+af718a62d6f710358df65b98a68eb4048cc53b24:.claude/skills/api-design-review/SKILL.md:generic-api-key:168
+b8268bd77e9f611a6afb6549cc36c7a8ce42aa2e:.claude/skills/api-design-review/SKILL.md:generic-api-key:168
+53a213435b1da5cf0f3a3d92edf3b9fcf6c1579b:.claude/skills/pooldev-openclaw/scripts/pooldev-user.sh:generic-api-key:15
+ccb81c9b1b32d302e3b8996204482fdb403a4417:.claude/skills/pooldev-openclaw/scripts/pooldev-user.sh:generic-api-key:15
+c4319b6da8af98564e124ad43e90c07a9a2c70c9:.localbin/tenants-resp.network-response:generic-api-key:1
+b9d8318d67eae760f3441fc9a0088275a322e668:console/chat/index.html:generic-api-key:667
+66a90a3edfcd413b636a49aaceea7b53a89a254f:design-explore/aipro-parity-loop.md:generic-api-key:481
+a2abb1ce1b98526930c26e32128c4bc3a77d4939:design-explore/aipro-parity-loop.md:generic-api-key:481
+ef3b7c986e59d98d9213ea07bb644a04949266a2:docs/backend/broker/README.md:generic-api-key:45
+36ecf8a6d390cd3cd07a30a4e8328a44f232e49f:docs/uidemo/js/app.js:hashicorp-tf-password:32
+d7229cd34e79cdf55eb8d38b69c4d117052641b5:engineering/00-knowledge-base/evidence/metal-experiments/spire-poc-2026-07-04.md:generic-api-key:41
+7afe73f00b96b7a00589885ea89df971d939de22:engineering/00-knowledge-base/evidence/outbound-credentials-sample-2026-07-11.jsonc:generic-api-key:20
+d1f0de330bdfa944cbee8a8d988faef9fe94c80e:engineering/security/clawconsole-bff-poc/RESOURCES.txt:generic-api-key:6
+d377e451b6206e939b03d74eed8d1e8e03bd3ae0:tests/e2e/authz/build-users.sh:generic-api-key:6
+d377e451b6206e939b03d74eed8d1e8e03bd3ae0:tests/e2e/authz/full-test.sh:generic-api-key:5
+97a7f57ecb6748c61fcbda55416ded8f2451a8a2:tests/e2e/runner/README.md:generic-api-key:155
+d377e451b6206e939b03d74eed8d1e8e03bd3ae0:tests/e2e/runner/README.md:generic-api-key:154
+3012227c1e7d7f31f5262785c6f5d32854313f1c:tools/api-demo/README-tenant-api-demo.md:generic-api-key:243
+7fd4ef680cc3b516493ff4cc71e42d098a0ab463:tools/factcheck-qa-agent/agent.py:jwt:831
+
+# Deliberate credential-shaped inputs used to verify secret redaction.
+2e6d35fabcd81ec6e4fbd8840b8330d6c9d59523:.claude/skills/bug-hunt/scripts/selfcheck.sh:aws-access-token:87
+2e6d35fabcd81ec6e4fbd8840b8330d6c9d59523:.claude/skills/bug-hunt/scripts/selfcheck.sh:generic-api-key:87
+344a65c803b937b394d7bfdf71570a271b1a957d:.claude/skills/bug-hunt/scripts/selfcheck.sh:aws-access-token:87
+344a65c803b937b394d7bfdf71570a271b1a957d:.claude/skills/bug-hunt/scripts/selfcheck.sh:generic-api-key:87
+379898231da2f987811116450b69dd88eee811b6:.claude/skills/bug-hunt/scripts/selfcheck.sh:aws-access-token:87
+
+# Fabricated API keys, KMS ciphertext, and public keys in documentation.
+042bdc2a08a7150666beea8a8e6cdf90def379aa:docs/aws-guide/API-接入手册.md:generic-api-key:1061
+042bdc2a08a7150666beea8a8e6cdf90def379aa:docs/aws-guide/API-接入手册.md:generic-api-key:568
+042bdc2a08a7150666beea8a8e6cdf90def379aa:docs/aws-guide/API-接入手册.md:generic-api-key:643
+042bdc2a08a7150666beea8a8e6cdf90def379aa:docs/aws-guide/API-接入手册.md:generic-api-key:693
+042bdc2a08a7150666beea8a8e6cdf90def379aa:docs/aws-guide/API-接入手册.md:generic-api-key:705
+042bdc2a08a7150666beea8a8e6cdf90def379aa:docs/aws-guide/API-接入手册.md:generic-api-key:912
+042bdc2a08a7150666beea8a8e6cdf90def379aa:docs/aws-guide/API-接入手册.md:generic-api-key:914
+042bdc2a08a7150666beea8a8e6cdf90def379aa:docs/aws-guide/API-接入手册.md:generic-api-key:996
+186bee1e7b38eea9357a712f3bd73bc4af4b813f:docs/aws-guide/API-接入手册.md:generic-api-key:1038
+186bee1e7b38eea9357a712f3bd73bc4af4b813f:docs/aws-guide/API-接入手册.md:generic-api-key:973
+a596415f3103550b42011127c84a5dcd6b7a6de0:docs/aws-guide/API-接入手册.md:generic-api-key:1038
+a596415f3103550b42011127c84a5dcd6b7a6de0:docs/aws-guide/API-接入手册.md:generic-api-key:973
+b49719abffa2017c9fd78423c95a36cf25f869de:docs/aws-guide/API-接入手册.md:generic-api-key:1038
+b49719abffa2017c9fd78423c95a36cf25f869de:docs/aws-guide/API-接入手册.md:generic-api-key:973
+d1f0de330bdfa944cbee8a8d988faef9fe94c80e:docs/aws-guide/API-接入手册.md:generic-api-key:1061
+d1f0de330bdfa944cbee8a8d988faef9fe94c80e:docs/aws-guide/API-接入手册.md:generic-api-key:568
+d1f0de330bdfa944cbee8a8d988faef9fe94c80e:docs/aws-guide/API-接入手册.md:generic-api-key:643
+d1f0de330bdfa944cbee8a8d988faef9fe94c80e:docs/aws-guide/API-接入手册.md:generic-api-key:687
+d1f0de330bdfa944cbee8a8d988faef9fe94c80e:docs/aws-guide/API-接入手册.md:generic-api-key:692
+d1f0de330bdfa944cbee8a8d988faef9fe94c80e:docs/aws-guide/API-接入手册.md:generic-api-key:693
+d1f0de330bdfa944cbee8a8d988faef9fe94c80e:docs/aws-guide/API-接入手册.md:generic-api-key:705
+d1f0de330bdfa944cbee8a8d988faef9fe94c80e:docs/aws-guide/API-接入手册.md:generic-api-key:712
+d1f0de330bdfa944cbee8a8d988faef9fe94c80e:docs/aws-guide/API-接入手册.md:generic-api-key:912
+d1f0de330bdfa944cbee8a8d988faef9fe94c80e:docs/aws-guide/API-接入手册.md:generic-api-key:914
+d1f0de330bdfa944cbee8a8d988faef9fe94c80e:docs/aws-guide/API-接入手册.md:generic-api-key:957
+d1f0de330bdfa944cbee8a8d988faef9fe94c80e:docs/aws-guide/API-接入手册.md:generic-api-key:996
+042bdc2a08a7150666beea8a8e6cdf90def379aa:docs/aws-guide/租户接入-创建查询与取Token.md:generic-api-key:79
+d1f0de330bdfa944cbee8a8d988faef9fe94c80e:docs/aws-guide/租户接入-创建查询与取Token.md:generic-api-key:79
+
+# Content-addressed CDK asset names, not credentials.
+259a4d85c0c4050bc43692075c8d8ad8d30cd86c:engineering/00-knowledge-base/evidence/handler-split-baseline/synth-base.json:generic-api-key:10216
+259a4d85c0c4050bc43692075c8d8ad8d30cd86c:engineering/00-knowledge-base/evidence/handler-split-baseline/synth-base.json:generic-api-key:10426
+259a4d85c0c4050bc43692075c8d8ad8d30cd86c:engineering/00-knowledge-base/evidence/handler-split-baseline/synth-base.json:generic-api-key:209
+259a4d85c0c4050bc43692075c8d8ad8d30cd86c:engineering/00-knowledge-base/evidence/handler-split-baseline/synth-base.json:generic-api-key:490
+259a4d85c0c4050bc43692075c8d8ad8d30cd86c:engineering/00-knowledge-base/evidence/handler-split-baseline/synth-base.json:generic-api-key:5727
+259a4d85c0c4050bc43692075c8d8ad8d30cd86c:engineering/00-knowledge-base/evidence/handler-split-baseline/synth-base.json:generic-api-key:6287
+259a4d85c0c4050bc43692075c8d8ad8d30cd86c:engineering/00-knowledge-base/evidence/handler-split-baseline/synth-base.json:generic-api-key:6686
+259a4d85c0c4050bc43692075c8d8ad8d30cd86c:engineering/00-knowledge-base/evidence/handler-split-baseline/synth-base.json:generic-api-key:6848
+259a4d85c0c4050bc43692075c8d8ad8d30cd86c:engineering/00-knowledge-base/evidence/handler-split-baseline/synth-base.json:generic-api-key:7020
+259a4d85c0c4050bc43692075c8d8ad8d30cd86c:engineering/00-knowledge-base/evidence/handler-split-baseline/synth-base.json:generic-api-key:7760
+259a4d85c0c4050bc43692075c8d8ad8d30cd86c:engineering/00-knowledge-base/evidence/handler-split-baseline/synth-base.json:generic-api-key:8757
+259a4d85c0c4050bc43692075c8d8ad8d30cd86c:engineering/00-knowledge-base/evidence/handler-split-baseline/synth-base.json:generic-api-key:9807

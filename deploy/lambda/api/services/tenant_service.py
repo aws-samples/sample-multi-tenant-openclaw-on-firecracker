@@ -49,6 +49,8 @@ import core.ssm_dispatch as ssm_dispatch
 import core.skills as skills
 import core.audit as audit
 import core.image_channel as image_channel_mod  # #394 — image_channel 准入 + 版本固定
+import core.image_ops as image_ops
+import core.lifecycle_fence as lifecycle_fence
 import services.action_idem as action_idem  # #456 — client_token 幂等(ADR §5.1)
 import services.lifecycle_dispatch as lifecycle_dispatch
 import services.registry_service as registry_service
@@ -79,6 +81,9 @@ _DNS_LABEL_RE = _CONFIG_TEMPLATE_RE
 # chars (\n \t \x00), no non-ASCII. .isascii() alone lets control chars through.
 _CLIENT_TOKEN_RE = re.compile(r"^[\x21-\x7e]{4,128}$")
 _DELETE_CLAIM_TTL_SECONDS = 900
+_FENCED_LIFECYCLE_ACTIONS = frozenset(
+    {"rebuild", "migrate", "reset", "delete", "restart"}
+)
 
 # 业务场景:用户在外部平台页面「下单购买一个 claw」。租户记录带三个购买维度字段
 #   • plan_tier     套餐档(free/standard/pro/enterprise 之一,受控枚举防脏数据)。
@@ -2109,6 +2114,23 @@ def _force_backup_sync(tenant_id):
 
 
 def delete_tenant(tenant_id, query_params, event=None):
+    """Delete wrapper that releases only the lifecycle lease it acquired."""
+    ctx = {}
+    try:
+        response = _delete_tenant_inner(tenant_id, query_params, event, ctx)
+        code = int((response or {}).get("statusCode") or 0)
+        if code >= 500 and not ctx.get("release_lifecycle_fence_on_error"):
+            ctx["hold_lifecycle_fence"] = True
+        return response
+    except Exception:
+        if not ctx.get("release_lifecycle_fence_on_error"):
+            ctx["hold_lifecycle_fence"] = True
+        raise
+    finally:
+        _release_lifecycle_ctx(tenant_id, ctx)
+
+
+def _delete_tenant_inner(tenant_id, query_params, event=None, _lifecycle_ctx=None):
     item = clients.tenants_table.get_item(
         Key={"id": tenant_id}, ConsistentRead=True
     ).get("Item")
@@ -2134,6 +2156,38 @@ def delete_tenant(tenant_id, query_params, event=None):
                 "id": tenant_id,
             },
         )
+
+    lifecycle_op_id = (event or {}).get("_op_id") or secrets.token_hex(16)
+    event = dict(event or {})
+    event["_op_id"] = lifecycle_op_id
+    lifecycle_epoch, fence_reason = lifecycle_fence.acquire(
+        tenant_id, lifecycle_op_id, "delete"
+    )
+    if lifecycle_epoch is None:
+        return utils._resp(
+            409,
+            {
+                "error": fence_reason,
+                "code": "LIFECYCLE_IN_FLIGHT",
+                "id": tenant_id,
+                "op_id": lifecycle_op_id,
+            },
+        )
+    if _lifecycle_ctx is not None:
+        _lifecycle_ctx.update(
+            {
+                "lifecycle_op_id": lifecycle_op_id,
+                "lifecycle_fence_epoch": lifecycle_epoch,
+                "hold_lifecycle_fence": False,
+            }
+        )
+    delete_host_guard = lifecycle_fence.host_guard(
+        tenant_id, lifecycle_op_id, lifecycle_epoch
+    )
+    delete_condition, delete_condition_values = lifecycle_fence.condition(
+        lifecycle_op_id, lifecycle_epoch
+    )
+
     if item.get("status") == "suspended":
         _keep = query_params.get("keep_data", "true").lower() == "true"
         _bk = item.get("restore_backup_key", "")
@@ -2158,9 +2212,12 @@ def delete_tenant(tenant_id, query_params, event=None):
             clients.tenants_table.update_item(
                 Key={"id": tenant_id},
                 UpdateExpression=f"{_set} REMOVE {_remove}",
-                ConditionExpression="#s = :cur",
+                ConditionExpression=f"#s = :cur AND {delete_condition}",
                 ExpressionAttributeNames={"#s": "status"},
-                ExpressionAttributeValues=_vals,
+                ExpressionAttributeValues={
+                    **_vals,
+                    **delete_condition_values,
+                },
             )
         except clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException:
             cur2 = (clients.tenants_table.get_item(Key={"id": tenant_id}, ConsistentRead=True).get("Item") or {})
@@ -2199,15 +2256,49 @@ def delete_tenant(tenant_id, query_params, event=None):
     # 与 tenant_action 的入队守卫同款:队列没配 → enqueue 返 False,回退下方同步路径
     # (向后兼容);_consumer_ident 存在说明本次已是 consumer 重放,不再二次入队(防
     # 无限入队)。字段 {id,status} 与同步路径一致,status 值 "queued" 与 tenant_action 对齐。
-    if clients.LIFECYCLE_QUEUE_URL and not (event or {}).get("_consumer_ident"):
+    if (
+        clients.LIFECYCLE_QUEUE_URL
+        and "_consumer_ident" not in (event or {})
+    ):
         _extra = {
             "keep_data": query_params.get("keep_data"),
             "skip_backup": query_params.get("skip_backup"),
         }
-        if lifecycle_dispatch.enqueue_lifecycle(
-            "delete", tenant_id, event, extra=_extra
-        ):
-            return utils._resp(202, {"id": tenant_id, "status": "queued"})
+        try:
+            enqueued_op_id = lifecycle_dispatch.enqueue_lifecycle(
+                "delete",
+                tenant_id,
+                event,
+                extra=_extra,
+                operation_id=lifecycle_op_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # SQS may have accepted the message before the acknowledgement was
+            # lost. Retain the lease so a blind retry cannot start a new delete.
+            if _lifecycle_ctx is not None:
+                _lifecycle_ctx["hold_lifecycle_fence"] = True
+            print(f"delete enqueue UNKNOWN state for {tenant_id}: {exc}")
+            return utils._resp(
+                503,
+                {
+                    "error": "the queue may have accepted this delete; poll the "
+                    "tenant before retrying",
+                    "code": "ENQUEUE_STATE_UNKNOWN",
+                    "id": tenant_id,
+                    "op_id": lifecycle_op_id,
+                },
+            )
+        if enqueued_op_id:
+            if _lifecycle_ctx is not None:
+                _lifecycle_ctx["hold_lifecycle_fence"] = True
+            return utils._resp(
+                202,
+                {
+                    "id": tenant_id,
+                    "status": "queued",
+                    "op_id": enqueued_op_id,
+                },
+            )
 
     # delete 的 host 计数回退(used_vcpu/vm_count -= …,下方 line ~2210)无
     # ConditionExpression,两个并发 DELETE 同一 tenant 会各扣一次 → 账本被扣穿变负,
@@ -2231,7 +2322,9 @@ def delete_tenant(tenant_id, query_params, event=None):
                 "delete_retryable = :false, delete_prev_status = :prev, "
                 "delete_claim_expires_at_epoch = :claim_exp"
             ),
-            ConditionExpression="#s <> :deleted AND #s <> :deleting",
+            ConditionExpression=(
+                f"#s <> :deleted AND #s <> :deleting AND {delete_condition}"
+            ),
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
                 ":deleting": "deleting",
@@ -2240,6 +2333,7 @@ def delete_tenant(tenant_id, query_params, event=None):
                 ":prev": prev_status,
                 ":claim_exp": claim_expires_at,
                 ":t": utils._now(),
+                **delete_condition_values,
             },
             ReturnValues="ALL_NEW",
         )
@@ -2290,7 +2384,8 @@ def delete_tenant(tenant_id, query_params, event=None):
                     ConditionExpression=(
                         "#s = :deleting AND (delete_retryable = :true OR "
                         "attribute_not_exists(delete_claim_expires_at_epoch) OR "
-                        "delete_claim_expires_at_epoch <= :now)"
+                        "delete_claim_expires_at_epoch <= :now) AND "
+                        f"{delete_condition}"
                     ),
                     ExpressionAttributeNames={"#s": "status"},
                     ExpressionAttributeValues={
@@ -2300,6 +2395,7 @@ def delete_tenant(tenant_id, query_params, event=None):
                         ":now": now_epoch,
                         ":claim_exp": next_claim_exp,
                         ":t": utils._now(),
+                        **delete_condition_values,
                     },
                 )
                 cur["delete_retryable"] = False
@@ -2340,12 +2436,13 @@ def delete_tenant(tenant_id, query_params, event=None):
                     "REMOVE predelete_backup_at, delete_retryable, "
                     "delete_prev_status, delete_claim_expires_at_epoch"
                 ),
-                ConditionExpression="#s = :deleting",
+                ConditionExpression=f"#s = :deleting AND {delete_condition}",
                 ExpressionAttributeNames={"#s": "status"},
                 ExpressionAttributeValues={
                     ":prev": prev_status,
                     ":deleting": "deleting",
                     ":t": utils._now(),
+                    **delete_condition_values,
                 },
             )
         except Exception:
@@ -2357,12 +2454,13 @@ def delete_tenant(tenant_id, query_params, event=None):
         clients.tenants_table.update_item(
             Key={"id": tenant_id},
             UpdateExpression="SET delete_retryable = :true, updated_at = :t",
-            ConditionExpression="#s = :deleting",
+            ConditionExpression=f"#s = :deleting AND {delete_condition}",
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
                 ":deleting": "deleting",
                 ":true": True,
                 ":t": utils._now(),
+                **delete_condition_values,
             },
         )
 
@@ -2417,7 +2515,9 @@ def delete_tenant(tenant_id, query_params, event=None):
         # 会 stop/摘 DNAT 到【别的租户】的 tap-vm<n>(no-cross-tenant 违规)。三者同源一致。
         vm_num = int(fresh.get("vm_num", 1))
         if not ssm_dispatch._ssm_run(
-            host_id, f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num}"
+            host_id,
+            f"{delete_host_guard} && /home/ubuntu/stop-vm.sh "
+            f"{shlex.quote(tenant_id)} {vm_num} && {delete_host_guard}",
         ):
             _abort_restore_status()
             return utils._resp(
@@ -2439,11 +2539,12 @@ def delete_tenant(tenant_id, query_params, event=None):
                 clients.tenants_table.update_item(
                     Key={"id": tenant_id},
                     UpdateExpression="SET predelete_backup_at = :t",
-                    ConditionExpression="#s = :deleting",
+                    ConditionExpression=f"#s = :deleting AND {delete_condition}",
                     ExpressionAttributeNames={"#s": "status"},
                     ExpressionAttributeValues={
                         ":t": marker_ts,
                         ":deleting": "deleting",
+                        **delete_condition_values,
                     },
                 )
                 fresh["predelete_backup_at"] = marker_ts
@@ -2462,7 +2563,10 @@ def delete_tenant(tenant_id, query_params, event=None):
         # running (worse: host-agent won't recover, VM stays orphaned untracked).
         # (幽灵复活),同样回滚重投。
         if not ssm_dispatch._ssm_run(
-            host_id, f"rm -f /data/firecracker-vms/{tenant_id}/vm.json"
+            host_id,
+            f"{delete_host_guard} && rm -f "
+            f"{shlex.quote(f'/data/firecracker-vms/{tenant_id}/vm.json')} "
+            f"&& {delete_host_guard}",
         ):
             _abort_restore_status()
             return utils._resp(
@@ -2483,10 +2587,12 @@ def delete_tenant(tenant_id, query_params, event=None):
         _gip = fresh.get("guest_ip", "")
         _legacy_hp = clients.VM_PORT_BASE + int(fresh.get("vm_num", 1)) - 1
         _route_cmd = (
-            "set -a; . /etc/environment 2>/dev/null; "
+            f"{delete_host_guard} && {{ set -a; "
+            ". /etc/environment 2>/dev/null; "
             ". /etc/platform.env 2>/dev/null; set +a; "
             "python3 /opt/openclaw/route_ops.py delete-route "
-            f"{shlex.quote(tenant_id)} {_hp} {shlex.quote(_gip)} {_legacy_hp}"
+            f"{shlex.quote(tenant_id)} {_hp} {shlex.quote(_gip)} {_legacy_hp} "
+            f"; }} && {delete_host_guard}"
         )
         if not ssm_dispatch._ssm_run(host_id, _route_cmd):
             _mark_delete_retryable()
@@ -2517,7 +2623,9 @@ def delete_tenant(tenant_id, query_params, event=None):
             _q_tomb = shlex.quote(f"{_root}/.purge-{tenant_id}")
             _q_vmd = shlex.quote(f"{_root}/{tenant_id}")
             if not ssm_dispatch._ssm_run(
-                host_id, f"touch {_q_tomb} && rm -rf {_q_vmd}"
+                host_id,
+                f"{delete_host_guard} && touch {_q_tomb} && "
+                f"{delete_host_guard} && rm -rf {_q_vmd} && {delete_host_guard}",
             ):
                 _mark_delete_retryable()
                 print(
@@ -2633,8 +2741,12 @@ def delete_tenant(tenant_id, query_params, event=None):
     clients.tenants_table.update_item(
         Key={"id": tenant_id},
         UpdateExpression=update_expr,
+        ConditionExpression=delete_condition,
         ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues=expr_vals,
+        ExpressionAttributeValues={
+            **expr_vals,
+            **delete_condition_values,
+        },
     )
     # (密文不再自动过期,活跃租户的凭据永久留存,让 1-2 年后 rebuild/recover 拿回原 token),
     # 但删租户属【终态】清理:已 deleted 的租户不能 rebuild(_async_actions 不含已删态),
@@ -3246,7 +3358,14 @@ def _rebuild_repin_resolve(item, repin_body):
     return {"channel": "canary", "target_snap": target_snap}
 
 
-def _rebuild_repin_apply(tenant_id, item, channel, target_snap):
+def _rebuild_repin_apply(
+    tenant_id,
+    item,
+    channel,
+    target_snap,
+    lifecycle_op_id=None,
+    lifecycle_fence_epoch=None,
+):
     """#416 — 落库换版目标(破坏性 relaunch 之前):换版前强制备份 fail-closed,再写租户
     image_channel/image_snapshot_time。返回 None(成功)或 utils._resp(...) 错误响应。
 
@@ -3285,6 +3404,21 @@ def _rebuild_repin_apply(tenant_id, item, channel, target_snap):
                 "code": "REPIN_BACKUP_FAILED",
             },
         )
+    if (
+        lifecycle_op_id is not None
+        and lifecycle_fence_epoch is not None
+        and not lifecycle_fence.renew_owned(
+            tenant_id, lifecycle_op_id, lifecycle_fence_epoch
+        )
+    ):
+        return utils._resp(
+            409,
+            {
+                "error": "rebuild was superseded while the mandatory backup ran",
+                "code": "LIFECYCLE_SUPERSEDED",
+                "id": tenant_id,
+            },
+        )
 
     cur_channel = item.get("image_channel") or image_channel_mod.DEFAULT_CHANNEL
     cur_snap = (item.get("image_snapshot_time") or "").strip() or None
@@ -3292,17 +3426,37 @@ def _rebuild_repin_apply(tenant_id, item, channel, target_snap):
         return None  # 已固定到目标 → 跳过冗余 DDB 写(备份已做,上层继续 relaunch)
 
     # 只动本租户自己的两个属性(no-cross-tenant)。
+    update_kwargs = {}
+    if lifecycle_op_id is not None and lifecycle_fence_epoch is not None:
+        condition, values = lifecycle_fence.condition(
+            lifecycle_op_id, lifecycle_fence_epoch
+        )
+        update_kwargs["ConditionExpression"] = condition
+        update_kwargs["ExpressionAttributeValues"] = values
     if channel == "live":
+        values = {
+            ":c": "live",
+            ":t": utils._now(),
+            **update_kwargs.pop("ExpressionAttributeValues", {}),
+        }
         clients.tenants_table.update_item(
             Key={"id": tenant_id},
             UpdateExpression="SET image_channel = :c, updated_at = :t REMOVE image_snapshot_time",
-            ExpressionAttributeValues={":c": "live", ":t": utils._now()},
+            ExpressionAttributeValues=values,
+            **update_kwargs,
         )
     else:
+        values = {
+            ":c": "canary",
+            ":s": target_snap,
+            ":t": utils._now(),
+            **update_kwargs.pop("ExpressionAttributeValues", {}),
+        }
         clients.tenants_table.update_item(
             Key={"id": tenant_id},
             UpdateExpression="SET image_channel = :c, image_snapshot_time = :s, updated_at = :t",
-            ExpressionAttributeValues={":c": "canary", ":s": target_snap, ":t": utils._now()},
+            ExpressionAttributeValues=values,
+            **update_kwargs,
         )
     return None
 
@@ -3351,6 +3505,58 @@ def _rebuild_inflight_is_stale(started_at):
     except Exception:  # noqa: BLE001
         return True
     return elapsed >= _REBUILD_INFLIGHT_TIMEOUT_SECONDS
+
+
+def _parse_host_rebuild_result(
+    stdout,
+    tenant_id,
+    op_id,
+    attempt_id,
+    fence_epoch,
+    host_id,
+    vm_num,
+):
+    """Return only an identity-bound host result from rebuild-vm.sh."""
+    result = None
+    for line in reversed((stdout or "").splitlines()):
+        try:
+            candidate = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(candidate, dict) and candidate.get("state"):
+            result = candidate
+            break
+    if not result:
+        return None
+    expected = {
+        "tenant_id": tenant_id,
+        "op_id": op_id,
+        "attempt_id": attempt_id,
+        "host_id": host_id,
+        "vm_num": int(vm_num),
+        "fence_epoch": int(fence_epoch),
+    }
+    if any(result.get(key) != value for key, value in expected.items()):
+        return None
+    if result.get("state") != "SUCCEEDED":
+        return result
+    inode = re.compile(r"^[0-9]+:[0-9]+$")
+    required_inodes = (
+        "target_rootfs_dev_inode",
+        "firecracker_exe_dev_inode",
+        "overlay_dev_inode",
+        "overlay_fd_dev_inode",
+    )
+    if any(not inode.fullmatch(str(result.get(key) or "")) for key in required_inodes):
+        return None
+    if result["overlay_dev_inode"] != result["overlay_fd_dev_inode"]:
+        return None
+    if not str(result.get("firecracker_start_ticks") or "").isdigit():
+        return None
+    tombstone = str(result.get("tombstone_dev_inode") or "")
+    if tombstone and tombstone == result["overlay_dev_inode"]:
+        return None
+    return result
 # 终态三值。`unconfirmed` 是新增值,与 core/image_ops 的 STATE_UNKNOWN 同源同理:把
 # "没能确认" 从 "确认失败" 里摘出来。见 _REBUILD_STATUS_UNCONFIRMED 注释。
 _REBUILD_STATUS_DONE = "done"
@@ -3383,6 +3589,9 @@ _REBUILD_OP_SCOPED_FIELDS = (
     "rebuild_failed_reason",
     "rebuild_target_snapshot_time",
     "rebuild_ssm_command_id",
+    "rebuild_lifecycle_fence_epoch",
+    "rebuild_source_host_id",
+    "rebuild_source_vm_num",
 )
 
 
@@ -3395,6 +3604,9 @@ def _stamp_rebuild_progress(
     ssm_command_id=None,
     new_operation=False,
     fail_loud=False,
+    fence_epoch=None,
+    source_host_id=None,
+    source_vm_num=None,
 ):
     """把 rebuild 的进度锚点写进本租户记录(ADR §5.3)。
 
@@ -3424,6 +3636,9 @@ def _stamp_rebuild_progress(
         ("rebuild_started_at", started_at),
         ("rebuild_target_snapshot_time", target_snapshot_time),
         ("rebuild_ssm_command_id", ssm_command_id),
+        ("rebuild_lifecycle_fence_epoch", fence_epoch),
+        ("rebuild_source_host_id", source_host_id),
+        ("rebuild_source_vm_num", source_vm_num),
     ):
         if value is None:
             continue
@@ -3439,6 +3654,9 @@ def _stamp_rebuild_progress(
             ("rebuild_started_at", started_at),
             ("rebuild_target_snapshot_time", target_snapshot_time),
             ("rebuild_ssm_command_id", ssm_command_id),
+            ("rebuild_lifecycle_fence_epoch", fence_epoch),
+            ("rebuild_source_host_id", source_host_id),
+            ("rebuild_source_vm_num", source_vm_num),
         ) if v is not None}
         removes = [a for a in _REBUILD_OP_SCOPED_FIELDS if a not in _setting]
     if not sets and not removes:
@@ -3456,11 +3674,27 @@ def _stamp_rebuild_progress(
         }
         if vals:
             kwargs["ExpressionAttributeValues"] = vals
+        if op_id is not None and fence_epoch is not None:
+            cond, fence_vals = lifecycle_fence.condition(op_id, fence_epoch)
+            kwargs["ConditionExpression"] = cond
+            kwargs.setdefault("ExpressionAttributeValues", {}).update(fence_vals)
         clients.tenants_table.update_item(**kwargs)
     except Exception as e:  # noqa: BLE001
         print(f"rebuild progress stamp failed for {tenant_id}: {e}")
         if fail_loud:
             raise
+
+
+def _release_lifecycle_ctx(tenant_id, ctx):
+    if not ctx or ctx.get("hold_lifecycle_fence"):
+        return
+    op_id = ctx.get("lifecycle_op_id")
+    epoch = ctx.get("lifecycle_fence_epoch")
+    if op_id is None or epoch is None:
+        return
+    lifecycle_fence.release(tenant_id, op_id, epoch)
+    ctx.pop("lifecycle_op_id", None)
+    ctx.pop("lifecycle_fence_epoch", None)
 
 
 def tenant_action(tenant_id, action, body=None, event=None):
@@ -3486,6 +3720,9 @@ def tenant_action(tenant_id, action, body=None, event=None):
                 action_idem.STATE_UNKNOWN,
                 {"error": "action raised before completing", "id": tenant_id},
             )
+        if not _ctx.get("release_lifecycle_fence_on_error"):
+            _ctx["hold_lifecycle_fence"] = True
+        _release_lifecycle_ctx(tenant_id, _ctx)
         raise
     if _ctx.get("token"):
         _code = int((resp or {}).get("statusCode") or 0)
@@ -3504,6 +3741,12 @@ def tenant_action(tenant_id, action, body=None, event=None):
         action_idem.finish(
             tenant_id, action, _ctx["owner"], _ctx["token"], _state, _body
         )
+    if (
+        int((resp or {}).get("statusCode") or 0) >= 500
+        and not _ctx.get("release_lifecycle_fence_on_error")
+    ):
+        _ctx["hold_lifecycle_fence"] = True
+    _release_lifecycle_ctx(tenant_id, _ctx)
     return resp
 
 
@@ -3552,8 +3795,8 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
     # `stop && rm overlay && sleep && launch && verify` 已经在 `&& launch` 之前把 **overlay
     # 删掉了** —— 破坏已经发生,verify 根本没跑到。
     #
-    # host 侧的 flock 挡得太晚:它只能阻止第二个 launch 真的起 VM,阻止不了第二次 rebuild 把
-    # overlay 删掉。所以闸必须前移到控制面,在下发任何 SSM 之前拒掉。
+    # P2 的 host transaction 现已让 same-op retry 不会重复 tombstone；此处仍拒绝不同 op
+    # 并发，避免两个独立 rebuild 依次提交各自的破坏点。
     #
     # 判据用 rebuild_phase 的非终态(queued/running/verifying)。**必须带超时兜底**:若上一次
     # rebuild 的进程崩在中途、没能写终态,没有超时的闸会把这个租户永久锁死在"无法 rebuild"。
@@ -3562,7 +3805,14 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
     if action == "rebuild":
         _inflight_phase = (item.get("rebuild_phase") or "").strip()
         if _inflight_phase in _REBUILD_INFLIGHT_PHASES:
-            if not _rebuild_inflight_is_stale(item.get("rebuild_started_at")):
+            _incoming_op = (event or {}).get("_op_id")
+            _same_op = bool(
+                _incoming_op and _incoming_op == item.get("rebuild_op_id")
+            )
+            if (
+                not _same_op
+                and not _rebuild_inflight_is_stale(item.get("rebuild_started_at"))
+            ):
                 return utils._resp(
                     409,
                     {
@@ -3577,6 +3827,32 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
                         "rebuild_op_id": item.get("rebuild_op_id"),
                     },
                 )
+        _incoming_op = (event or {}).get("_op_id")
+        _source_host = (item.get("rebuild_source_host_id") or "").strip()
+        _source_vm = item.get("rebuild_source_vm_num")
+        _source_identity_changed = (
+            bool(_source_host)
+            and _source_host != (item.get("host_id") or "").strip()
+        ) or (
+            _source_vm is not None
+            and int(_source_vm) != int(item.get("vm_num", 1))
+        )
+        if (
+            _incoming_op
+            and _incoming_op == item.get("rebuild_op_id")
+            and _source_identity_changed
+        ):
+            return utils._resp(
+                409,
+                {
+                    "error": "the tenant moved to another host or VM slot after this "
+                    "rebuild started; the old operation is superseded and will not "
+                    "run there",
+                    "code": "LIFECYCLE_SUPERSEDED",
+                    "id": tenant_id,
+                    "op_id": _incoming_op,
+                },
+            )
 
     _hibernate_states = ("suspending", "suspended", "restoring")
     if (
@@ -3666,6 +3942,7 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
     # consumer replay(带 _consumer_ident)不走这道闸:它是同一操作的继续执行,不是新请求;
     # 让它再撞一次自己的 intent 会把重投挡死。
     _idem_token = ""
+    _idem_op_id = None
     # 判【键是否存在】而不是取值真假:consumer 传的是 `{"_consumer_ident": ident}`,而
     # ident 来自 `msg.get("_ident") or {}`(handler.py:1626)—— api-key 路径下它就是**空
     # dict**,取值是 falsy。用真假判断会把 SQS 重投误判成"新的客户请求",于是重投去撞自己
@@ -3714,6 +3991,12 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
             # 被永久挡死,违背"重试可对账"。放行后仍受下方 REBUILD_IN_FLIGHT 闸约束。
             print(f"action_idem replay {tenant_id}/{action}: UNKNOWN → re-running")
 
+    _lifecycle_op_id = (event or {}).get("_op_id")
+    if action in _FENCED_LIFECYCLE_ACTIONS:
+        _lifecycle_op_id = _lifecycle_op_id or _idem_op_id or secrets.token_hex(16)
+        event = dict(event or {})
+        event["_op_id"] = _lifecycle_op_id
+
     # 控制面重构阶段1 — 产端入队:纯 lifecycle 动作(start/stop/restart/pause/resume)
     # 只是经 SSM 下发、无特殊同步返回值,队列开启时入 SQS 由 consumer 受控并发消费
     # (削峰 + 限流阀,治 1000/s 雪崩),立即返 202。resize/backup/migrate/access 等
@@ -3733,17 +4016,47 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
         "suspend",
         "restore",
     }
-    # 消息只冻结了目标【版本】却没绑【source host】,"塞队列→被消费"之间若发生 migrate,租户
-    # 已到新 host,消费时会在【新 host】用【旧 host 解析出】的版本跑 stop+drop-overlay+launch =
-    # 跨 host 用错版本丢 overlay(no-data-loss)。安全的异步换版需 source-host + 单调 fence(整
-    # "确定租户在 host A"到"在 host A 执行"之间无可被 migrate 插入的排队窗口 → 竞态窗口消失。
-    # 换版低频、运维手动,不需要队列削峰,同步代价可接受。普通(无 body)rebuild 仍照常可入队。
+    # monotonic fence 现也覆盖该路径；普通(无 body)rebuild 仍照常入队削峰。
     if (
         action in _async_actions
         and clients.LIFECYCLE_QUEUE_URL
         and not _rebuild_has_repin
-        and not (event or {}).get("_consumer_ident")
+        and "_consumer_ident" not in (event or {})
     ):
+        _queue_fence_epoch = None
+        if action in _FENCED_LIFECYCLE_ACTIONS:
+            try:
+                _queue_fence_epoch, _fence_reason = lifecycle_fence.acquire(
+                    tenant_id, _lifecycle_op_id, action
+                )
+            except Exception as e:  # noqa: BLE001
+                print(f"lifecycle fence anchor failed for {tenant_id}: {e}")
+                return utils._resp(
+                    503,
+                    {
+                        "error": "could not fence the operation before queueing it; "
+                        "nothing was queued - safe to retry",
+                        "code": "ENQUEUE_ANCHOR_FAILED",
+                        "id": tenant_id,
+                    },
+                )
+            if _queue_fence_epoch is None:
+                return utils._resp(
+                    409,
+                    {
+                        "error": _fence_reason,
+                        "code": "LIFECYCLE_IN_FLIGHT",
+                        "id": tenant_id,
+                    },
+                )
+            if _idem_ctx is not None:
+                _idem_ctx.update(
+                    {
+                        "lifecycle_op_id": _lifecycle_op_id,
+                        "lifecycle_fence_epoch": _queue_fence_epoch,
+                        "hold_lifecycle_fence": True,
+                    }
+                )
         # ADR-rebuild-idempotency-sync-contract §5.3 — 入队即落进度锚点,让客户能通过
         # 轮询 GET /tenants/{id} 分清"是哪一次、到哪一步"。此前 202 只回
         # {"status":"queued"} 且 DDB 无任何本次操作痕迹:队列里的操作对客户完全不可见,
@@ -3777,6 +4090,9 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
                     started_at=utils._now(),
                     new_operation=True,
                     fail_loud=True,
+                    fence_epoch=_queue_fence_epoch,
+                    source_host_id=item.get("host_id"),
+                    source_vm_num=int(item.get("vm_num", 1)),
                 )
             except Exception as e:  # noqa: BLE001
                 # 包成专属类型,好让下面把"锚点失败(肯定没发)"与"发送失败(可能已发)"
@@ -3786,9 +4102,20 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
 
         try:
             _enq_op_id = lifecycle_dispatch.enqueue_lifecycle(
-                action, tenant_id, event, before_send=_anchor
+                action,
+                tenant_id,
+                event,
+                before_send=_anchor,
+                operation_id=_lifecycle_op_id,
             )
         except _RebuildAnchorFailed as e:
+            if _queue_fence_epoch is not None:
+                lifecycle_fence.release(
+                    tenant_id, _lifecycle_op_id, _queue_fence_epoch
+                )
+                if _idem_ctx is not None:
+                    _idem_ctx["hold_lifecycle_fence"] = False
+                    _idem_ctx["release_lifecycle_fence_on_error"] = True
             # 锚点失败 = 消息【肯定没发出】(before_send 在 send_message 之前抛)。
             # 只有这一类才能告诉客户"什么都没排队,重试是干净的"。
             print(f"rebuild enqueue aborted (anchor) for {tenant_id}: {e}")
@@ -3819,7 +4146,7 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
                     "id": tenant_id,
                     # 锚点已在发送前落库,故这个 op_id 一定可轮询(即便消息最终没投递,
                     # §5.5 的超时兜底会把它收成 failed)。
-                    "op_id": _anchored_op_id.get("v") or None,
+                    "op_id": _anchored_op_id.get("v") or _lifecycle_op_id,
                 },
             )
         if _enq_op_id:
@@ -3834,6 +4161,38 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
                     "op_id": _enq_op_id,
                 },
             )
+        if _queue_fence_epoch is not None:
+            lifecycle_fence.release(tenant_id, _lifecycle_op_id, _queue_fence_epoch)
+            if _idem_ctx is not None:
+                _idem_ctx["hold_lifecycle_fence"] = False
+
+    _lifecycle_fence_epoch = None
+    _lifecycle_host_guard = ""
+    if action in _FENCED_LIFECYCLE_ACTIONS:
+        _lifecycle_fence_epoch, _fence_reason = lifecycle_fence.acquire(
+            tenant_id, _lifecycle_op_id, action
+        )
+        if _lifecycle_fence_epoch is None:
+            return utils._resp(
+                409,
+                {
+                    "error": _fence_reason,
+                    "code": "LIFECYCLE_IN_FLIGHT",
+                    "id": tenant_id,
+                    "op_id": _lifecycle_op_id,
+                },
+            )
+        if _idem_ctx is not None:
+            _idem_ctx.update(
+                {
+                    "lifecycle_op_id": _lifecycle_op_id,
+                    "lifecycle_fence_epoch": _lifecycle_fence_epoch,
+                    "hold_lifecycle_fence": False,
+                }
+            )
+        _lifecycle_host_guard = lifecycle_fence.host_guard(
+            tenant_id, _lifecycle_op_id, _lifecycle_fence_epoch
+        )
 
     if action == "resize":
         return tenant_resize(tenant_id, body)
@@ -4009,8 +4368,10 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
 
         snap_cmd = ssm_dispatch._ssm_send(
             source_host_id,
-            f"/home/ubuntu/migrate-vm.sh snapshot {tenant_id} {vm_num} "
-            f"s3://{bucket}/{snap_prefix}",
+            f"{_lifecycle_host_guard} && "
+            f"/home/ubuntu/migrate-vm.sh snapshot {shlex.quote(tenant_id)} {vm_num} "
+            f"{shlex.quote(f's3://{bucket}/{snap_prefix}')} && "
+            f"{_lifecycle_host_guard}",
             timeout=600,  # snapshot + multi-GB disk upload to S3
         )
         if not snap_cmd:
@@ -4032,28 +4393,54 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
         # Mark migrating + stash everything the sweep needs to finish the move.
         # No host_id / counter / routing change happens here — only after the
         # sweep proves snapshot+restore+dashboard all succeeded.
-        clients.tenants_table.update_item(
-            Key={"id": tenant_id},
-            UpdateExpression=(
-                "SET #s = :s, migration_target = :tgt, "
-                "migration_target_vm_num = :tvn, migration_source = :src, "
-                "migration_snap_cmd = :scmd, migration_phase = :ph, "
-                "migration_started_at = :st, migration_snapshot_uri = :uri, "
-                "updated_at = :t"
-            ),
-            ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={
-                ":s": "migrating",
-                ":tgt": target_host_id,
-                ":tvn": target_vm_num,
-                ":src": source_host_id,
-                ":scmd": snap_cmd,
-                ":ph": "snapshot",
-                ":st": now,
-                ":uri": f"s3://{bucket}/{snap_prefix}",
-                ":t": now,
-            },
-        )
+        try:
+            clients.tenants_table.update_item(
+                Key={"id": tenant_id},
+                UpdateExpression=(
+                    "SET #s = :s, migration_target = :tgt, "
+                    "migration_target_vm_num = :tvn, migration_source = :src, "
+                    "migration_snap_cmd = :scmd, migration_phase = :ph, "
+                    "migration_started_at = :st, migration_snapshot_uri = :uri, "
+                    "updated_at = :t, migration_lifecycle_op_id = :lf_op, "
+                    "migration_lifecycle_fence_epoch = :lf_epoch"
+                ),
+                ConditionExpression=(
+                    "active_lifecycle_op_id = :lf_op AND "
+                    "lifecycle_fence_epoch = :lf_epoch"
+                ),
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={
+                    ":s": "migrating",
+                    ":tgt": target_host_id,
+                    ":tvn": target_vm_num,
+                    ":src": source_host_id,
+                    ":scmd": snap_cmd,
+                    ":ph": "snapshot",
+                    ":st": now,
+                    ":uri": f"s3://{bucket}/{snap_prefix}",
+                    ":t": now,
+                    ":lf_op": _lifecycle_op_id,
+                    ":lf_epoch": _lifecycle_fence_epoch,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            # The target reservation is not discoverable by the migration sweep
+            # until this context write succeeds. Never leak it when the fence
+            # was superseded between SSM submission and persistence.
+            scheduling._release_slot(target_host_id, vcpu, mem_mb)
+            if lifecycle_fence._is_ccf(exc):
+                return utils._resp(
+                    409,
+                    {
+                        "error": "migration was superseded before its context "
+                        "could be persisted",
+                        "code": "LIFECYCLE_SUPERSEDED",
+                        "id": tenant_id,
+                    },
+                )
+            raise
+        if _idem_ctx is not None:
+            _idem_ctx["hold_lifecycle_fence"] = True
 
         # 202 Accepted: the move is in flight. Clients poll GET /tenants/{id}
         # until status is `running` (success) or back to its prior value with
@@ -4087,10 +4474,22 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
             if guest_ip and host_port
             else ""
         )
-        full_cmd = f"{stop_cmd} && sleep 2 && {launch_cmd}"
+        full_cmd = (
+            f"{_lifecycle_host_guard} && {stop_cmd} && sleep 2 && "
+            f"{_lifecycle_host_guard} && {launch_cmd}"
+        )
         if dnat_cmd:
             full_cmd += f" && {dnat_cmd}"
-        ssm_dispatch._ssm_run(item["host_id"], full_cmd, timeout=300)
+        full_cmd += f" && {_lifecycle_host_guard}"
+        if not ssm_dispatch._ssm_run(item["host_id"], full_cmd, timeout=300):
+            return utils._resp(
+                502,
+                {
+                    "error": "restart was not confirmed on the host; the same "
+                    "operation will be retried",
+                    "id": tenant_id,
+                },
+            )
         new_status = "running"
     elif action == "stop":
         vm_num = int(item.get("vm_num", 1))
@@ -4151,10 +4550,23 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
             if guest_ip and host_port
             else ""
         )
-        full_cmd = f"{stop_cmd} && {reset_cmd} && sleep 2 && {launch_cmd}"
+        full_cmd = (
+            f"{_lifecycle_host_guard} && {stop_cmd} && "
+            f"{_lifecycle_host_guard} && {reset_cmd} && sleep 2 && "
+            f"{_lifecycle_host_guard} && {launch_cmd}"
+        )
         if dnat_cmd:
             full_cmd += f" && {dnat_cmd}"
-        ssm_dispatch._ssm_run(item["host_id"], full_cmd, timeout=300)
+        full_cmd += f" && {_lifecycle_host_guard}"
+        if not ssm_dispatch._ssm_run(item["host_id"], full_cmd, timeout=300):
+            return utils._resp(
+                502,
+                {
+                    "error": "reset was not confirmed on the host; the same "
+                    "operation will be retried",
+                    "id": tenant_id,
+                },
+            )
         new_status = "running"
     elif action == "rebuild":
         # Phase 4 — in-place UPGRADE this tenant's VM to the host's CURRENT rootfs
@@ -4176,7 +4588,6 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
         # image_snapshot_time 起对目标版本。不带 body 的 rebuild 仍是 live 租户升 host flat rootfs。
         _repin_snapshot = None
         _repin_channel = None
-        _prev_pin = (item.get("image_snapshot_time") or "").strip() or None
         if _rebuild_has_repin:
             _resolved = _rebuild_repin_resolve(item, _rebuild_body)
             if not (isinstance(_resolved, dict) and "channel" in _resolved):
@@ -4184,7 +4595,12 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
             _repin_channel = _resolved["channel"]
             _repin_snapshot = _resolved.get("target_snap")
             _applied = _rebuild_repin_apply(
-                tenant_id, item, _repin_channel, _repin_snapshot
+                tenant_id,
+                item,
+                _repin_channel,
+                _repin_snapshot,
+                _lifecycle_op_id,
+                _lifecycle_fence_epoch,
             )
             if _applied is not None:
                 return _applied  # 备份失败 502,不 relaunch
@@ -4195,106 +4611,158 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
         vm_num = int(item.get("vm_num", 1))
         guest_ip = item.get("guest_ip", "")
         host_port = item.get("host_port", "")
-        stop_cmd = f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num}"
-        # Drop the overlay so the refreshed read-only rootfs layer takes effect;
-        # data.ext4 (user data) is untouched.
-        drop_overlay = f"rm -f /data/firecracker-vms/{tenant_id}/overlay.ext4"
-        # 到 launch-vm 幂等段;老版本只填 4 位、CHAT_EP_ENABLED 恒空致唤醒漂移。
         launch_cmd = ssm_dispatch._launch_vm_wake_cmd(tenant_id, item)
         dnat_cmd = (
             _dnat_add_idempotent_cmd(host_port, guest_ip)
             if guest_ip and host_port
             else ""
         )
-        # refresh_rootfs 用 mv 原子换 rootfs;若旧 FC 没被 stop-vm 真杀掉(cmdline 不匹配/race),
-        # 新旧并存时老进程抱 (deleted) 旧 inode → VM 跑旧代码,而下面却把 rootfs_version 标成新的
-        # = 谎报漂移。扫该租户 fc.sock 进程的 fd,指向 openclaw-rootfs.ext4 (deleted) 就 exit 1
-        # rebuild_status=failed + 发 rebuild_failed 事件,GET /tenants 可见,运维手动重试)。
-        # (那需要 host-local slot identity + 幂等 op_id,连续 8 轮 Codex 证明其表面积过大、
-        # 且引入过丢数据/shell 注入类缺陷),自动重投到收敛单独跟踪(见下方 rebuild_status 注释
-        # 指向的 follow-up issue)。这里保持"破坏性 relaunch 跑一次 + 采用校验"的既有语义不变。
-        _sock = f"/data/firecracker-vms/{tenant_id}/fc.sock"
-        verify_cmd = (
-            f"_fpid=$(pgrep -f 'api-sock {_sock}' | head -1); "
-            "[ -n \"$_fpid\" ] || { echo 'rebuild-verify: no firecracker after relaunch' >&2; exit 1; }; "
-            "if ls -l /proc/$_fpid/fd 2>/dev/null | grep -q 'openclaw-rootfs.ext4 (deleted)'; then "
-            "echo 'rebuild-verify: FC still on DELETED old rootfs inode — upgrade did NOT take' >&2; exit 1; fi; "
-            "echo rebuild-verify-ok"
+        # Queue consumers carry the operation-stable id in _op_id. Synchronous
+        # rebuilds still own the lifecycle fence under _lifecycle_op_id, so the
+        # host transaction and ledger must use that same identity rather than
+        # serializing a missing event id as the literal string "None".
+        _rb_op_id = (event or {}).get("_op_id") or _lifecycle_op_id
+        _rb_same_operation = bool(
+            _rb_op_id and item.get("rebuild_op_id") == _rb_op_id
         )
-        # 不足(旧 FC 抱着旧 canary 版本目录的 rootfs 不是 (deleted),会假通过)。故对换版额外校验
-        # launch-vm 写进 vm.json 的实际启动版本:
-        #   · canary 换版:vm.json.image_snapshot_time == 目标 snapshot(精确等)。
-        #   · live 换版(canary→live):目标版本运行期才由 slots.live 解析、控制面不预知,故校验
-        #     vm.json.image_snapshot_time【已不再是换版前那个旧 pin】(证明确实换离旧 canary 目录;
-        #     canary→live 若旧 FC 卡住,vm.json 仍是旧 pin → fail)。旧 pin 为空(本就是 live)则跳过。
-        _q_vmjson = shlex.quote(f"/data/firecracker-vms/{tenant_id}/vm.json")
-        if _repin_channel == "canary" and _repin_snapshot:
-            _q_snap = shlex.quote(str(_repin_snapshot))
-            verify_cmd += (
-                f"; _got=$(jq -r '.image_snapshot_time // \"\"' {_q_vmjson} 2>/dev/null); "
-                f"if [ \"$_got\" != {_q_snap} ]; then "
-                f"echo \"rebuild-verify: vm.json image_snapshot_time=$_got != target {_q_snap} — repin did NOT take\" >&2; exit 1; fi; "
-                "echo rebuild-verify-repin-ok"
-            )
-        elif _repin_channel == "live" and _prev_pin:
-            _q_old = shlex.quote(str(_prev_pin))
-            verify_cmd += (
-                f"; _got=$(jq -r '.image_snapshot_time // \"\"' {_q_vmjson} 2>/dev/null); "
-                f"if [ \"$_got\" = {_q_old} ]; then "
-                f"echo \"rebuild-verify: vm.json still on old pin {_q_old} — live repin did NOT take\" >&2; exit 1; fi; "
-                "echo rebuild-verify-repin-live-ok"
-            )
-        full_cmd = f"{stop_cmd} && {drop_overlay} && sleep 2 && {launch_cmd}"
-        if dnat_cmd:
-            full_cmd += f" && {dnat_cmd}"
-        full_cmd += f" && {verify_cmd}"
-        # ADR §5.3/§5.4a — 下发前落"本次要升到哪个版本"(对账基准)+ phase=running。
-        # 目标版本此前只存在于运行时局部变量:没有落库的【期望值】,后续就无法与 host
-        # 上报的【实际值】比对,一次回执丢失的 rebuild 就永远说不清到底升成没有。
-        # 换版(canary)时目标是解析出的 _repin_snapshot;普通 rebuild 升 host 当前 live
-        # flat rootfs、控制面此刻不预知版本号,故只落 phase,不编造目标值。
-        # new_operation:同步路径(队列未配 / 换版恒同步)也是一次【新】操作的开始 ——
-        # 它没经过上面的入队锚点,若不清理,上一轮遗留的 rebuild_status=done 会与本轮的
-        # 进度并存,客户读到 done 直接误判本次已成功。这里也整组重置。
-        # 传 started_at 是因为 §5.5 的超时兜底以它为判据:同步路径若不落,一次卡住的
-        # 同步 rebuild 会因为没有起始时间而永远不被兜底收拾。
-        _rb_op_id = (event or {}).get("_op_id")
         _stamp_rebuild_progress(
             tenant_id,
             op_id=_rb_op_id,
             phase=_REBUILD_PHASE_RUNNING,
-            started_at=utils._now(),
+            started_at=None if _rb_same_operation else utils._now(),
             target_snapshot_time=_repin_snapshot or None,
-            new_operation=True,
+            new_operation=not _rb_same_operation,
+            fence_epoch=_lifecycle_fence_epoch,
+            source_host_id=None if _rb_same_operation else item.get("host_id"),
+            source_vm_num=None if _rb_same_operation else vm_num,
         )
-        # 拿到 SSM CommandId 的那一刻就落库(ADR §5.4a 路 1)。此前这个 id 在
-        # _ssm_run 内部被拿到后即丢弃(超时分支只打日志),回执一丢就再没有句柄能事后
-        # 问 SSM"那条命令到底跑成没有"——而 SSM 服务端保留执行记录 30 天。
-        #
-        # on_result 收退出码,专为识别 flock-skip(rc=75)。真机 2026-08-12 实测:对同一租户
-        # 连发两次 rebuild,第二次跑到 launch-vm 时第一次仍持 per-tenant flock,launch-vm.sh
-        # 按设计 exit 75(良性:"另一次同租户 launch 在跑,我跳过,稍后重投")。但 rebuild 的
-        # 命令链是 `stop && rm overlay && sleep && launch && dnat && verify`,`&&` 在 rc=75
-        # 处短路 —— **overlay 已删、launch 被跳过、verify 根本没跑到**,整链退出码 1。
-        # 若把它当"确认失败"报给客户,客户会按"可安全重试"再发一次,再删一次 overlay。
-        # restore 路径早已正确区分该码(:3145 `if not launched and launch_rc == 75`),
-        # ssm_dispatch 的 docstring 也写明 rc==75 是并发/重投 launch 在接手 —— 只有 rebuild
-        # 漏了这个区分。用 on_result 而非 want_rc=True:后者把返回值从 bool 变成元组,
-        # 会波及全部既有调用点和约 70 个测试桩(MR1 里正因表面积过大而放弃)。
+
+        _rb_attempt_id = secrets.token_hex(16)
+        _rb_ledger_enabled = getattr(clients, "image_jobs_table", None) is not None
+        if _rb_ledger_enabled:
+            existing = image_ops.get(_rb_op_id)
+            if existing is None:
+                image_ops.record_intent(
+                    _rb_op_id,
+                    tenant_id,
+                    "tenant_rebuild",
+                    {
+                        "host_id": item["host_id"],
+                        "vm_num": vm_num,
+                        "fence_epoch": _lifecycle_fence_epoch,
+                        "target_snapshot_time": _repin_snapshot or "",
+                    },
+                )
+                existing = image_ops.get(_rb_op_id)
+            if existing and (
+                existing.get("instance_id") != tenant_id
+                or existing.get("operation") != "tenant_rebuild"
+            ):
+                return utils._resp(
+                    409,
+                    {
+                        "error": "operation id belongs to a different rebuild",
+                        "code": "OPERATION_ID_REUSED",
+                        "id": tenant_id,
+                    },
+                )
+            if not image_ops.claim_attempt(_rb_op_id, _rb_attempt_id):
+                return utils._resp(
+                    503,
+                    {
+                        "error": "another attempt still owns this rebuild; retry later",
+                        "code": "REBUILD_ATTEMPT_BUSY",
+                        "id": tenant_id,
+                        "op_id": _rb_op_id,
+                    },
+                )
+
+        q = shlex.quote
+        rebuild_cmd = (
+            f"/home/ubuntu/rebuild-vm.sh {q(str(tenant_id))} {q(str(vm_num))} "
+            f"{q(str(_rb_op_id))} {q(str(_lifecycle_fence_epoch))} "
+            f"{q(_rb_attempt_id)} {q(str(item['host_id']))} -- {launch_cmd}"
+        )
+        full_cmd = f"{_lifecycle_host_guard} && {rebuild_cmd}"
+        if dnat_cmd:
+            full_cmd += f" && {dnat_cmd}"
+        full_cmd += f" && {_lifecycle_host_guard}"
+
         _rb_rc = {"v": None}
-        _rebuild_verified = ssm_dispatch._ssm_run(
+        _rb_output = {"stdout": "", "stderr": ""}
+
+        def _record_rebuild_command(command_id):
+            _stamp_rebuild_progress(
+                tenant_id,
+                op_id=_rb_op_id,
+                ssm_command_id=command_id,
+                phase=_REBUILD_PHASE_VERIFYING,
+                fence_epoch=_lifecycle_fence_epoch,
+            )
+            if _rb_ledger_enabled:
+                image_ops.record_command(_rb_op_id, _rb_attempt_id, command_id)
+
+        _rb_ssm_ok = ssm_dispatch._ssm_run(
             item["host_id"],
             full_cmd,
             timeout=300,
-            on_command_id=lambda cid: _stamp_rebuild_progress(
-                tenant_id, ssm_command_id=cid, phase=_REBUILD_PHASE_VERIFYING
-            ),
+            on_command_id=_record_rebuild_command,
             on_result=lambda _st, rc: _rb_rc.__setitem__("v", rc),
+            on_output=lambda stdout, stderr: _rb_output.update(
+                {"stdout": stdout, "stderr": stderr}
+            ),
         )
-        # flock-skip:这次什么也没验证成,但它【不是】确认失败 —— 持锁的那次 launch 正在把
-        # VM 拉起来。保持 unconfirmed 并明说"别重试",交给 §5.4a 对账收敛(host-agent 会
-        # 报出实际版本;SSM 记录也留着)。绝不标 failed,因为 failed 的语义是"可安全重试"。
-        _rb_flock_skipped = (not _rebuild_verified) and _rb_rc["v"] == 75
+        _rb_host_result = _parse_host_rebuild_result(
+            _rb_output["stdout"],
+            tenant_id,
+            _rb_op_id,
+            _rb_attempt_id,
+            _lifecycle_fence_epoch,
+            item["host_id"],
+            vm_num,
+        )
+        _rebuild_superseded = bool(
+            _rb_rc["v"] == 79
+            or (
+                _rb_host_result
+                and _rb_host_result.get("state") == "SUPERSEDED"
+            )
+        )
+        _rebuild_verified = bool(
+            _rb_ssm_ok
+            and _rb_host_result
+            and _rb_host_result.get("state") == "SUCCEEDED"
+        )
+        _rb_evidence_snapshot = (
+            (_rb_host_result or {}).get("target_snapshot_time") or ""
+        )
+        if _rb_ledger_enabled:
+            if _rebuild_verified:
+                image_ops.record_result(
+                    _rb_op_id,
+                    True,
+                    result=_rb_host_result,
+                    attempt_id=_rb_attempt_id,
+                )
+            elif _rebuild_superseded:
+                image_ops.record_result(
+                    _rb_op_id,
+                    False,
+                    result=_rb_host_result,
+                    state=image_ops.STATE_SUPERSEDED,
+                    attempt_id=_rb_attempt_id,
+                )
+            else:
+                image_ops.record_result(
+                    _rb_op_id,
+                    False,
+                    error={
+                        "rc": _rb_rc["v"],
+                        "stderr": _rb_output["stderr"][-1000:],
+                    },
+                    state=image_ops.STATE_UNKNOWN,
+                    attempt_id=_rb_attempt_id,
+                )
         new_status = "running"
     elif action == "pause":
         vm_dir = f"/data/firecracker-vms/{tenant_id}"
@@ -4400,6 +4868,18 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
     else:
         return utils._resp(400, {"error": f"unknown action: {action}"})
 
+    if action == "rebuild" and locals().get("_rebuild_superseded", False):
+        return utils._resp(
+            409,
+            {
+                "error": "the rebuild lost its lifecycle fence or source host; "
+                "its host result was discarded",
+                "code": "LIFECYCLE_SUPERSEDED",
+                "id": tenant_id,
+                "op_id": (event or {}).get("_op_id"),
+            },
+        )
+
     update_expr = "SET #s = :s, updated_at = :t"
     expr_values = {":s": new_status, ":t": utils._now()}
     #   · reset:非升级语义(丢 overlay 回出厂),照旧无条件标 host 当前版本。
@@ -4417,7 +4897,11 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
         # live 版本;写 live 会把跑 candidate 的租户在 GET /hosts/rootfs-drift 误算成
         # up_to_date(谎报)。换版解析出的 _repin_snapshot 才是真值;无换版(普通升级到
         # host live)时仍写 host.rootfs_version(既有语义)。
-        _resolved_ver = locals().get("_repin_snapshot") or None
+        _resolved_ver = (
+            locals().get("_rb_evidence_snapshot")
+            or locals().get("_repin_snapshot")
+            or None
+        )
         if _resolved_ver:
             _stamp_ver = _resolved_ver
         else:
@@ -4446,10 +4930,14 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
     # 落盘的写入。**字段值本身在引导客户做危险操作**,故改名即止血。
     #   done        = 确认成功(采用校验通过)
     #   failed      = 确认失败,可安全重试(本轮无写入点,见下方 else 分支说明)
-    #   unconfirmed = 暂时不知道(回执未到),**不要自动重试**,等事后对账收敛
+    #   unconfirmed = 本 attempt 暂时不知道；P3 仅以同 op_id 自动重投，绝不新建操作
     # `unconfirmed` 与 core/image_ops 的 STATE_UNKNOWN 同源同理:那里已论证过"落
     # FAILED 会让同 key 重试被挡死,违背重试可对账"。
     if action == "rebuild":
+        _evidence_target = locals().get("_rb_evidence_snapshot") or ""
+        if _evidence_target:
+            update_expr += ", rebuild_target_snapshot_time = :rb_target"
+            expr_values[":rb_target"] = _evidence_target
         if locals().get("_rebuild_verified", False):
             # 确认成功:显式标 done(而非 REMOVE 掉标记)。REMOVE 会让"这次成功了"与
             # "从没 rebuild 过"在客户看来完全一样 —— 轮询方无法判断自己那次是否已收敛,
@@ -4460,50 +4948,40 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
             expr_values[":rbp"] = _REBUILD_STATUS_DONE
             _remove_attrs.append("rebuild_failed_reason")
         else:
-            # 这里恒标 unconfirmed 而不是 failed —— 两种成因都归到"没能确认":
-            #   ① 回执没到(超时/丢):控制面确实不知道结果。
-            #   ② flock-skip(rc=75):launch-vm 让位给另一次正在跑的同租户 launch,本次
-            #      命令链在 `&& launch` 处短路(overlay 已删、verify 没跑到)。这是**良性
-            #      让位**,持锁那次正在把 VM 拉起来,更不该报成失败。
-            # 无论哪种,报 failed 都是错的:failed 的语义是"可安全重试",而重试会再跑一遍
-            # stop && rm overlay && launch,抹掉两次之间落盘的写入。
-            # (真机 2026-08-12 对同一租户连发两次 rebuild 撞出了 ②,SSM stderr 明写
-            #  `launch already in progress (flock held) — skip`。)
+            # 这里恒标 unconfirmed 而不是 failed：回执丢失、host 失败或 evidence 不完整
+            # 都只说明当前 attempt 没能确认。P2 的 op tombstone 使 P3 能安全地以同 op_id
+            # 重投；不同 op 仍会被 lifecycle owner/epoch 闸拒绝。
             update_expr += ", rebuild_status = :rbs, rebuild_failed_reason = :rbr"
             update_expr += ", rebuild_phase = :rbp"
             expr_values[":rbs"] = _REBUILD_STATUS_UNCONFIRMED
             expr_values[":rbp"] = _REBUILD_STATUS_UNCONFIRMED
-            if locals().get("_rb_flock_skipped", False):
-                expr_values[":rbr"] = (
-                    "another launch of this same tenant was already running on the host "
-                    "(per-tenant flock held), so this rebuild's launch step was skipped "
-                    "and the adoption check never ran. The concurrent launch is bringing "
-                    "the VM up — do NOT retry: a repeat rebuild drops the overlay again "
-                    "and discards writes made in between. Poll this tenant until "
-                    "rebuild_status becomes done/failed."
-                )
-            else:
-                expr_values[":rbr"] = (
-                    "relaunch adoption not confirmed within timeout "
-                    "(SSM receipt lost, or old FC still on prior rootfs inode); "
-                    "rootfs_version not advanced. The rebuild may well have SUCCEEDED "
-                    "on the host — do NOT auto-retry: a repeat rebuild drops the "
-                    "overlay again and discards writes made in between. "
-                    "Poll this tenant until rebuild_status becomes done/failed."
-                )
+            expr_values[":rbr"] = (
+                "host adoption evidence was not confirmed for this attempt. The "
+                "same operation will be retried from its op-specific overlay "
+                "tombstone; retries do not drop the fresh overlay again."
+            )
         # 本次操作标识:客户拿 202 里的 op_id 与这里比对,确认读到的终态属于自己那次。
-        _rb_final_op_id = (event or {}).get("_op_id")
+        _rb_final_op_id = locals().get("_rb_op_id")
         if _rb_final_op_id:
             update_expr += ", rebuild_op_id = :rbo"
             expr_values[":rbo"] = _rb_final_op_id
 
     if _remove_attrs:
         update_expr += " REMOVE " + ", ".join(_remove_attrs)
+    _final_update = {
+        "Key": {"id": tenant_id},
+        "UpdateExpression": update_expr,
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": expr_values,
+    }
+    if action in _FENCED_LIFECYCLE_ACTIONS:
+        _cond, _fence_vals = lifecycle_fence.condition(
+            _lifecycle_op_id, _lifecycle_fence_epoch
+        )
+        _final_update["ConditionExpression"] = _cond
+        _final_update["ExpressionAttributeValues"].update(_fence_vals)
     clients.tenants_table.update_item(
-        Key={"id": tenant_id},
-        UpdateExpression=update_expr,
-        ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues=expr_values,
+        **_final_update
     )
     # Map action verbs to lifecycle event names so consumers can filter.
     _action_to_event = {
@@ -4528,21 +5006,16 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
     audit._publish_event(
         event_name, tenant_id, {"action": action, "status": new_status}
     )
-    # unconfirmed(+reason)并发 tenant.rebuild_unconfirmed 事件,GET /tenants 立即可见
-    # "这次没能确认"。返回 200(不是 503):不触发 consumer 自动重投 —— 而 unconfirmed 语义
-    # 下【客户也不该手动重投】(重投会再丢一次 overlay),应轮询等事后对账收敛(ADR §5.4a)。
-    #
-    # Failures 重投到收敛,codex 抓出:该重投【无 host fence】——rebuild 未采用后若发生 migrate,
-    # 租户已到新 host,重投的 rebuild 会在【新 host】用【旧 host 校验出】的 canary snapshot 跑
-    # stop+drop-overlay+launch = 跨 host 用错版本丢 overlay(no-data-loss 违规)。安全的自动
-    # 重投需绑 source-host + 单调 fence(op 消费前回读校验),这正是前序 8 轮 Codex + handoff
-    # 证明"无法在 rebuild 局部安全完成"、须走 ADR-lifecycle-fence-rebuild-convergence 的 P1-P3。
-    # op_id 透传/shlex/入队前校验/冻结版本/vm.json 采用校验等安全原语全部保留(为 fence 铺路)。
-    # 同步路径的响应也带终态:走同步(队列未配/换版路径)的调用方拿不到 202 的 op_id,
-    # 这里补上,并把 done 也回出去(此前只在未确认时回 rebuild_status,成功时静默,
-    # 调用方无法区分"成功"与"这个字段不存在")。
+    # that retry safe:the host reuses this op's tombstone/result and never drops
+    # the fresh overlay a second time. Source-host + epoch checks prevent a late
+    # retry from following a migrated tenant.
+    _response_code = (
+        503
+        if action == "rebuild" and not locals().get("_rebuild_verified", False)
+        else 200
+    )
     return utils._resp(
-        200,
+        _response_code,
         {
             "id": tenant_id,
             "status": new_status,
@@ -4550,7 +5023,16 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
                 {
                     # 与上面落库的值取同一来源,避免响应体和 DDB 说两套话。
                     "rebuild_status": expr_values.get(":rbs", _REBUILD_STATUS_DONE),
-                    "op_id": (event or {}).get("_op_id"),
+                    "op_id": locals().get("_rb_op_id"),
+                    **(
+                        {
+                            "code": "REBUILD_RETRY_PENDING",
+                            "error": "host evidence not confirmed; the same operation "
+                            "will be retried automatically",
+                        }
+                        if _response_code == 503
+                        else {}
+                    ),
                 }
                 if action == "rebuild"
                 else {}

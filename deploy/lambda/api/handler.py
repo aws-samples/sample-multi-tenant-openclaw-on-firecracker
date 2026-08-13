@@ -2086,7 +2086,7 @@ def _get_clawpool_rsa_public_key():
             "key_spec": resp.get("KeySpec", "RSA_4096"),
             "algorithm": "RSAES_OAEP_SHA_256",
             "public_key_pem": pem,
-            "envelope_hint": "enc:v1:1:RSA_4096_OAEP_SHA_256:<key_id>:0:<base64(ciphertext)>",
+            "envelope_hint": "enc:v1:<alg_code>:<key_id>:<hybrid_flag>:<base64(ciphertext)>",
         },
     )
 

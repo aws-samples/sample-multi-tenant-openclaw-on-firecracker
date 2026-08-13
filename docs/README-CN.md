@@ -444,7 +444,7 @@ sample-multi-tenant-openclaw-on-firecracker/
 | `asg` | `min_capacity` | `2` | 最小 host 实例数（默认 Multi-AZ）。 |
 | `asg` | `use_spot` | `false` | Spot 实例（省 60-70%，可能被回收）。 |
 | `multi_az` | `enabled` | `true` | Multi-AZ HA — 启用 AZ failover。 |
-| `routing` | `mode` | `per-tenant` | 租户路由模型 — `per-tenant`（每租户一条 ALB rule，受 ALB 配额约束约 499 上限）或 `host-tg`（一个共享 target group + nginx peer-map，上限变为 hosts × VMs）。见[租户路由模型](#租户路由模型)（1.5.9）。 |
+| `routing` | `mode` | `per-tenant` | 租户路由模型 — `per-tenant`（每租户一条 ALB rule；上限是 ALB rules-per-load-balancer 配额，**默认 100**）或 `host-tg`（一个共享 target group + nginx peer-map，上限变为 hosts × VMs）。见[租户路由模型](#租户路由模型)（1.5.9）。 |
 | `network` | `vpc_id` | `""` | 导入已有 VPC 而非账号默认 VPC（1.5.7）。 |
 | `network` | `subnet_ids` | `[]` | 把 ASG 和 ALB 固定到指定子网 — ALB 需要 ≥2 个 AZ（1.5.7）。 |
 | `cloudfront` | `enabled` | `true` | `false` 则完全跳过 CloudFront，输出 ALB DNS + S3 endpoint 供自有 CDN 回源（1.5.7）。 |
@@ -464,17 +464,29 @@ sample-multi-tenant-openclaw-on-firecracker/
 | | `per-tenant`（默认） | `host-tg` |
 |---|---|---|
 | ALB rule 数 | 每租户一条（`/vm/{id}*` → 该 host 的 target group） | **一条** catch-all（`/vm/*` → 共享 target group） |
-| 租户上限 | 约 499，且 AWS 默认配额只有 ~100 条/listener | hosts × 每 host VM 数 |
+| 租户上限 | ALB **"Rules per Application Load Balancer" 配额，默认 100**。代码分配用的 `10-499` 优先级窗口**不是**真实上限。 | hosts × 每 host VM 数 —— 租户不消耗任何 ALB 资源 |
 | 路由决策位置 | ALB，按 rule 匹配 | 各 host 的 nginx，依据 `host-agent` 每 ~60s 同步的 peer-map |
 | 额外跳数 | 无 — ALB 直达 owner host | 一跳，当请求落到非 owner host 时 |
 | 一致性 | 即时（rule 原子改指向） | 最终一致（迁移后约 60s 收敛） |
+| 余量查询 | `GET /admin/routing/status` | 同上 —— 另报 `cutover_complete` |
 
-切换到 `host-tg`：
+**切换是一套运维流程，不是改个配置。** 先读
+**[`docs/RUNBOOK.md` §2.1](RUNBOOK.md)**，简版：
 
-1. 设 `routing.mode: host-tg`，重跑 `setup.sh`。
-2. 逐台替换 host 让它拿到新的 `init-host.sh` —— 见[把修复滚动到现有 host / 租户](#把修复滚动到现有-host--租户)。
+1. 逐台替换 host 让它拿到新的 `init-host.sh`（`:8081` peer server 只在首次启动
+   写入）—— 见[把修复滚动到现有 host / 租户](#把修复滚动到现有-host--租户)。
+2. 用 `POST /admin/routing/purge-per-tenant`（`{"tenant_ids": [...]}`）**逐个**
+   把租户切过去。删掉某租户的 rule 就是把它放到共享路径上，所以每一步天然
+   是一个单租户 canary。
+3. 几个 canary 稳定之后，再设 `routing.mode: host-tg` 并重跑 `setup.sh`，让
+   Lambda 停止创建新的 per-tenant rule。
 
-无需手工创建任何 AWS 资源。已有租户不受影响，把 mode 改回 `per-tenant` 即可回退。
+> ⚠️ **把 mode 改回 `per-tenant` 并不会回滚数据平面。** 它只恢复 Lambda 环境
+> 变量，不恢复 ALB rule 集，而 listener 的默认动作是 404 —— 即全部租户下线。
+> 回滚必须调 `POST /admin/routing/rebuild`，它会重建 per-tenant rule 和缺失的
+> per-host target group（host-tg 期间注册的 host 从未创建过）。且租户数超过
+> ALB rule 配额后，`per-tenant` 根本不是可达状态（需先申请提配额），所以动手前
+> 先看 `GET /admin/routing/status`。
 
 ### 销毁栈
 

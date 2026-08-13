@@ -446,7 +446,7 @@ sample-multi-tenant-openclaw-on-firecracker/
 | `asg` | `min_capacity` | `2` | Minimum host instances (default Multi-AZ). |
 | `asg` | `use_spot` | `false` | Spot instances (60–70% savings, may be reclaimed). |
 | `multi_az` | `enabled` | `true` | Multi-AZ HA — enables AZ failover. |
-| `routing` | `mode` | `per-tenant` | Tenant routing model — `per-tenant` (one ALB rule each, capped ~499 by ALB quota) or `host-tg` (one shared target group + nginx peer-map, cap becomes hosts × VMs). See [Tenant routing models](#tenant-routing-models) (1.5.9). |
+| `routing` | `mode` | `per-tenant` | Tenant routing model — `per-tenant` (one ALB rule each; capped by the ALB rules-per-load-balancer quota, **default 100**) or `host-tg` (one shared target group + nginx peer-map, cap becomes hosts × VMs). See [Tenant routing models](#tenant-routing-models) (1.5.9). |
 | `network` | `vpc_id` | `""` | Import an existing VPC instead of the account default (1.5.7). |
 | `network` | `subnet_ids` | `[]` | Pin the ASG and ALB to specific subnets — needs ≥2 AZs for the ALB (1.5.7). |
 | `cloudfront` | `enabled` | `true` | `false` skips CloudFront entirely and exposes the ALB DNS + S3 endpoint for your own CDN (1.5.7). |
@@ -466,17 +466,31 @@ sample-multi-tenant-openclaw-on-firecracker/
 | | `per-tenant` (default) | `host-tg` |
 |---|---|---|
 | ALB rules | One per tenant (`/vm/{id}*` → that host's target group) | **One** catch-all (`/vm/*` → shared target group) |
-| Tenant ceiling | ~499, and AWS's default quota is ~100 rules/listener | hosts × VMs per host |
+| Tenant ceiling | The ALB **"Rules per Application Load Balancer" quota — default 100**. The `10-499` priority window the code allocates from is *not* the limit. | hosts × VMs per host — tenants consume no ALB resource |
 | Where routing is decided | ALB, from the rule set | nginx on each host, from a peer-map synced by `host-agent` every ~60s |
 | Extra hop | None — ALB goes straight to the owning host | One, when the request lands on a host that isn't the owner |
 | Consistency | Immediate (rule repointed atomically) | Eventual (~60s to converge after a migration) |
+| Headroom check | `GET /admin/routing/status` | same — also reports `cutover_complete` |
 
-To switch to `host-tg`:
+**Switching is an operational procedure, not a config change.** Read
+**[`docs/RUNBOOK.md` §2.1](docs/RUNBOOK.md)** first; the short version:
 
-1. Set `routing.mode: host-tg` and re-run `setup.sh`.
-2. Replace each host so it picks up the new `init-host.sh` — see [Roll fixes into existing hosts/tenants](#roll-fixes-into-existing-hoststenants).
+1. Replace each host so it picks up the new `init-host.sh` (the `:8081` peer
+   server is only written on first boot) — see [Roll fixes into existing hosts/tenants](#roll-fixes-into-existing-hoststenants).
+2. Move tenants across **one at a time** with `POST /admin/routing/purge-per-tenant`
+   (`{"tenant_ids": [...]}`). Deleting a tenant's rule *is* what puts it on the
+   shared path, so each step is its own canary.
+3. Only once several canaries hold, set `routing.mode: host-tg` and re-run
+   `setup.sh` so the Lambdas stop creating new per-tenant rules.
 
-No AWS resources need to be created by hand. Existing tenants are unaffected, and setting the mode back to `per-tenant` reverts it.
+> ⚠️ **Setting the mode back to `per-tenant` does not revert the data plane.**
+> It restores the Lambda env var but not the ALB rule set, and the listener's
+> default action is a 404 — i.e. every tenant down. Rollback requires
+> `POST /admin/routing/rebuild`, which re-creates the per-tenant rules and the
+> per-host target groups (hosts registered while `host-tg` was active never got
+> one). Past the ALB rule quota, `per-tenant` is not a reachable state at all
+> without an AWS quota increase, so check `GET /admin/routing/status` before
+> starting.
 
 ### Tear down
 
@@ -531,6 +545,21 @@ All requests require the `x-api-key` header.
 | `DELETE` | `/groups/{name}/skills/{skill}` | Remove a skill from a group. |
 | `GET` · `PUT` · `DELETE` | `/templates/{name}` | CRUD for config templates (`default` is read-only). |
 | `GET` | `/system/info` | Feature flags + config snapshot (region, version, multi_az, metrics, …). |
+
+### Routing capacity & cutover (T3-1)
+
+Per-tenant routing spends one ALB listener rule per tenant, so its ceiling is the
+**"Rules per Application Load Balancer" quota — default 100**, not the `1-499`
+priority window the code allocates from. `routing.mode: host-tg` removes the
+ceiling entirely: one static `/vm/*` rule serves every tenant and each host's
+nginx peer-map resolves tenant → owning host, so the tenant limit becomes
+hosts × VMs-per-host. Cutover procedure and gate conditions: **[`docs/RUNBOOK.md` §2.1](docs/RUNBOOK.md)**.
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/admin/routing/status` | Current mode, per-tenant vs static rule counts, quota headroom, and the effective tenant ceiling. Under `host-tg` also reports `cutover_complete` (legacy rules still win over the catch-all until purged). Read-only — `viewer` role. |
+| `POST` | `/admin/routing/rebuild` | Re-create per-tenant listener rules + missing per-host target groups for every routable tenant. **This is the rollback path from `host-tg`** — nothing else re-creates them. Idempotent; **`dry_run` defaults to `true`**. `admin` role. |
+| `POST` | `/admin/routing/purge-per-tenant` | Delete `/vm/<tenant>` rules (never the `/vm/*` catch-all). Scope with `{"tenant_ids": [...]}` to move one tenant onto the shared path as a canary — the recommended cutover, since each step is independently reversible via `rebuild`. **`dry_run` defaults to `true`**. `admin` role. |
 
 ---
 

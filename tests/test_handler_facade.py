@@ -76,6 +76,10 @@ EXPECTED_ROUTES = {
     ("GET", "/skills/{name}"),
     ("PUT", "/skills/{name}"),
     ("DELETE", "/skills/{name}"),
+    # T3-1 P3 routing cutover controls (admin-only, dry-run by default).
+    ("GET", "/admin/routing/status"),
+    ("POST", "/admin/routing/rebuild"),
+    ("POST", "/admin/routing/purge-per-tenant"),
 }
 
 

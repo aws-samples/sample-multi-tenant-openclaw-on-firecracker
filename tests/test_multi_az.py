@@ -19,35 +19,22 @@ import sys
 from pathlib import Path
 
 import pytest
+from conftest import synth_stack
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def _synth(multi_az_enabled, az_count=2):
-    import yaml
-    cfg_path = ROOT / "config.yml"
-    original = cfg_path.read_text()
-    cfg = yaml.safe_load(original)
-    cfg.setdefault("multi_az", {})
-    cfg["multi_az"]["enabled"] = multi_az_enabled
-    cfg["multi_az"]["az_count"] = az_count
-    cfg_path.write_text(yaml.safe_dump(cfg))
-    try:
-        sys.modules.pop("deploy.stack", None)
-        sys.modules.pop("deploy", None)
-        spec = importlib.util.spec_from_file_location(
-            "deploy.stack", ROOT / "deploy" / "stack.py")
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules["deploy.stack"] = mod
-        spec.loader.exec_module(mod)
-        import aws_cdk as cdk
-        from aws_cdk import assertions
-        app = cdk.App()
-        stack = mod.OpenClawOrchestratorStack(app, "Test",
-            env=cdk.Environment(account="123456789012", region="ap-northeast-1"))
-        return assertions.Template.from_stack(stack)
-    finally:
-        cfg_path.write_text(original)
+def _synth(multi_az_enabled, az_count=2, drop_section=False):
+    """Synth with multi_az overridden. Never touches the repo's config.yml —
+    see conftest.synth_stack for why that mattered."""
+    def mutate(cfg):
+        if drop_section:
+            cfg.pop("multi_az", None)
+            return
+        cfg.setdefault("multi_az", {})
+        cfg["multi_az"]["enabled"] = multi_az_enabled
+        cfg["multi_az"]["az_count"] = az_count
+    return synth_stack(mutate)
 
 
 @pytest.mark.unit
@@ -98,25 +85,7 @@ class TestALBMultiAZ:
 @pytest.mark.unit
 class TestDefault:
     def test_default_is_disabled_for_cost(self):
-        """If config.yml has no multi_az section at all, stack must still synthesize."""
-        # Synth without setting multi_az at all
-        import yaml
-        cfg_path = ROOT / "config.yml"
-        original = cfg_path.read_text()
-        cfg = yaml.safe_load(original)
-        cfg.pop("multi_az", None)
-        cfg_path.write_text(yaml.safe_dump(cfg))
-        try:
-            sys.modules.pop("deploy.stack", None)
-            spec = importlib.util.spec_from_file_location(
-                "deploy.stack", ROOT / "deploy" / "stack.py")
-            mod = importlib.util.module_from_spec(spec)
-            sys.modules["deploy.stack"] = mod
-            spec.loader.exec_module(mod)
-            import aws_cdk as cdk
-            app = cdk.App()
-            mod.OpenClawOrchestratorStack(app, "Test",
-                env=cdk.Environment(account="123456789012", region="ap-northeast-1"))
-            # If we got here without exception, default is fine
-        finally:
-            cfg_path.write_text(original)
+        """No multi_az section at all → stack must still synthesize."""
+        tpl = _synth(multi_az_enabled=False, drop_section=True)
+        # Synth succeeded; sanity-check it produced the ASG.
+        assert tpl.find_resources("AWS::AutoScaling::AutoScalingGroup")

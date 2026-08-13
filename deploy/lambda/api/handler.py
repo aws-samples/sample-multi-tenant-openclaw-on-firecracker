@@ -865,7 +865,10 @@ def create_tenant(body=None):
                          f"(vcpu={vcpu}, mem_mb={mem_mb})"
             })
     else:
-        host = _find_host(vcpu, mem_mb)
+        # Ranked candidates so a lost reservation race can retry on the next
+        # host instead of being misread as "the fleet is full" (see below).
+        candidates = _pick_hosts_for_create(vcpu, mem_mb)
+        host = candidates[0] if candidates else None
     if not host:
         # No capacity — save as pending and scale out.
         # Persist config_template and restore_backup_key so process_pending() can apply them.
@@ -901,10 +904,30 @@ def create_tenant(body=None):
     # reservation is a single conditional UpdateItem: it books capacity only if
     # the host still has room and returns a unique, atomically-incremented
     # vm_num. On contention it returns None and we fall back to pending+scale.
-    vm_num = _reserve_host_slot(host, vcpu, mem_mb)
+    #
+    # A lost race is NOT the same thing as an exhausted fleet. The old code
+    # treated any reservation failure as "no capacity": it parked the tenant in
+    # `pending` and called _scale_out(), so two users creating at the same
+    # instant could trigger a bare-metal scale-out (minutes of provisioning,
+    # ~$4k/month per host) purely because their conditional writes collided.
+    # Combined with the deterministic least-loaded pick, EVERY concurrent
+    # create aimed at the same host, so the collision was close to guaranteed.
+    # Now: try the next-best candidate a couple of times; scale out only when
+    # no candidate will take the tenant.
+    vm_num = None
+    if not clone_src and not preferred_host_id:
+        for cand in candidates[:max(1, HOST_RESERVE_ATTEMPTS)]:
+            vm_num = _reserve_host_slot(cand, vcpu, mem_mb)
+            if vm_num is not None:
+                host = cand
+                break
+    else:
+        # Pinned placement (clone / preferred_host_id) has exactly one legal
+        # host — retrying elsewhere would violate the caller's intent.
+        vm_num = _reserve_host_slot(host, vcpu, mem_mb)
     if vm_num is None:
-        # Lost the race / host filled up between selection and reservation.
-        # Treat like "no host": persist pending and scale out rather than 500.
+        # Every candidate refused — the fleet really is out of room (or is
+        # churning hard enough that queuing is the right answer anyway).
         item = {
             "id": tenant_id, "name": name,
             "vcpu": vcpu, "mem_mb": mem_mb,
@@ -2009,6 +2032,55 @@ def _find_host(vcpu_needed, mem_needed):
         return None
     candidates.sort(key=lambda c: (c[0], c[1], c[2]))
     return candidates[0][3]
+
+
+# How many of the least-loaded fitting hosts a create may choose between.
+# 1 reproduces the old deterministic behaviour (and the old herding).
+HOST_PICK_TOP_K = int(os.environ.get("HOST_PICK_TOP_K", "8"))
+# Reservation attempts (each on a different host) before giving up and queuing.
+HOST_RESERVE_ATTEMPTS = int(os.environ.get("HOST_RESERVE_ATTEMPTS", "3"))
+
+
+def _rank_candidate_hosts(vcpu_needed, mem_needed):
+    """All hosts that fit, least-loaded first (same ordering as _find_host).
+
+    Exists so a create can fall through to the NEXT-best host when the
+    conditional reservation loses a race, instead of treating a lost race as
+    "the fleet is full".
+    """
+    hosts = _scan_all(
+        hosts_table,
+        FilterExpression="#s IN (:a, :i)",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":a": "active", ":i": "idle"},
+    )
+    ranked = []
+    for h in hosts:
+        if not _host_fits(h, vcpu_needed, mem_needed):
+            continue
+        free_vcpu, free_mem = _host_free(h)
+        ranked.append((-free_vcpu, -free_mem, h["instance_id"], h))
+    ranked.sort(key=lambda c: (c[0], c[1], c[2]))
+    return [c[3] for c in ranked]
+
+
+def _pick_hosts_for_create(vcpu_needed, mem_needed):
+    """Ordered hosts to attempt a reservation on, herding removed.
+
+    `_find_host` is deliberately deterministic — "least-loaded first" is the
+    issue-#77 spread fix and is asserted by tests. But determinism means every
+    concurrent create picks the SAME host, so they all collide on that host's
+    conditional UpdateItem and all but one lose. Shuffling the top-K fitting
+    hosts drops the collision probability to about 1/K while keeping placement
+    inside the least-loaded band (with a single fitting host, K collapses to 1
+    and behaviour is identical to before).
+    """
+    ranked = _rank_candidate_hosts(vcpu_needed, mem_needed)
+    if not ranked:
+        return []
+    head = ranked[:max(1, HOST_PICK_TOP_K)]
+    random.shuffle(head)
+    return head + ranked[len(head):]
 
 
 def _reserve_host_slot(host, vcpu, mem_mb):

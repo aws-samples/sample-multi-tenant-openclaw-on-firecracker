@@ -108,6 +108,13 @@ TENANTS_TABLE=${TENANTS_TABLE}
 HOSTS_TABLE=${HOSTS_TABLE}
 INSTANCE_ID=${INSTANCE_ID}
 SUBNET_PREFIX={{SUBNET_PREFIX}}
+# Used by launch-vm.sh to deny guest→fleet east-west traffic. The host's own
+# :80 is open to the whole VPC CIDR (the ALB health check needs it), and a
+# guest's egress is MASQUERADEd to its host's private IP — so without an
+# explicit deny a tenant can curl any other host's nginx and read other
+# tenants' dashboards. In-VPC :80 is only ever our own hosts/ALB (interface
+# endpoints answer on 443), so denying it costs the guest nothing.
+OC_VPC_CIDR={{VPC_CIDR}}
 ROOTFS_OVERLAY_MB={{ROOTFS_OVERLAY_MB}}
 BALLOON_ENABLED={{BALLOON_ENABLED}}
 BALLOON_DEFLATE_ON_OOM={{BALLOON_DEFLATE_ON_OOM}}
@@ -132,10 +139,32 @@ map $http_upgrade $connection_upgrade {
 # other hosts to that host's internal :8081. `tenant-peers` sorts before
 # `tenants` in the glob, but a tenant is EITHER local or peered, never both
 # (host-agent skips local tids), so include order is immaterial.
+# NOTE: there is deliberately NO `/agent/health` proxy here. host-agent's
+# /health enumerates every tenant on this host (ids, health, metrics), and this
+# server block is reachable from the internet via the ALB — exposing it handed
+# out the fleet's tenant inventory to any unauthenticated caller. host-agent now
+# binds 127.0.0.1 only; reach it over SSM/SSH when debugging a host.
 server {
     listen 80 default_server;
     location /health { return 200 'ok'; add_header Content-Type text/plain; }
-    location /agent/health { proxy_pass http://127.0.0.1:8899/health; }
+    # Readiness, as opposed to liveness. `/health` is a constant 200 from the
+    # moment nginx starts — which is BEFORE the rootfs download (minutes) and
+    # before host-agent's first peer-map sync. Under host-tg routing the shared
+    # target group would therefore start sending a brand-new host its 1/N share
+    # of /vm/* traffic while it has no peer routes at all, and 404 all of it:
+    # every ASG scale-out became a planned partial outage.
+    #
+    # host-agent creates /run/openclaw/ready only after a peer-map generation
+    # is fully applied. /run is tmpfs, so a reboot or replacement correctly
+    # starts out NOT ready. This covers cold start; a host-agent that dies
+    # while running is covered by the openclaw_peer_map_last_success_age_seconds
+    # metric (flapping the host out of the TG on a transient DDB throttle would
+    # do more harm than the staleness it detects).
+    location = /ready {
+        root /run/openclaw;
+        try_files /ready =503;
+        add_header Content-Type text/plain;
+    }
     include /etc/nginx/conf.d/tenant-peers/*.conf;
     include /etc/nginx/conf.d/tenants/*.conf;
 }

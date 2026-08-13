@@ -18,6 +18,14 @@ from botocore.config import Config as BotoConfig
 
 POLL_INTERVAL = int(os.environ.get("OC_AGENT_POLL_INTERVAL", "15"))
 PORT = int(os.environ.get("OC_AGENT_PORT", "8899"))
+# Loopback-only by default. /health returns EVERY tenant's health detail on
+# this host, so it must not be reachable off-box: it used to bind 0.0.0.0 AND
+# be reverse-proxied at `/agent/health` on the public :80 server, which put the
+# whole fleet's tenant inventory one unauthenticated GET away. The only
+# legitimate consumer is the co-located ADOT collector, which scrapes
+# 127.0.0.1:8899/metrics (deploy/userdata/adot-config.yaml). Overridable for
+# operators who front it with their own authenticated listener.
+BIND_HOST = os.environ.get("OC_AGENT_BIND", "127.0.0.1")
 # Health/control AND Prometheus /metrics are served by the SAME HTTPServer
 # on PORT (8899). The earlier OC_AGENT_PROM_PORT=9090 split-port design was
 # never wired into main(), causing the ADOT collector to fail every scrape
@@ -93,8 +101,21 @@ _last_ddb_write = {}
 # hosts×VMs instead of the ~499 per-tenant-ALB-rule ceiling.
 OC_ROUTE_SYNC_INTERVAL = int(os.environ.get("OC_ROUTE_SYNC_INTERVAL", "60"))
 _PEER_DIR = "/etc/nginx/conf.d/tenant-peers"
+# Where launch-vm.sh writes (and stop-vm.sh removes) the LOCAL per-tenant
+# nginx block. Presence of <tid>.conf here is the only honest answer to "does
+# this host serve that tenant itself?" — see _sync_tenant_routes.
+_LOCAL_CONF_DIR = "/etc/nginx/conf.d/tenants"
+# tmpfs so readiness never survives a reboot — see _mark_ready.
+_READY_DIR = os.environ.get("OC_READY_DIR", "/run/openclaw")
 _last_route_sync = 0.0        # monotonic ts of last sync attempt (interval gate)
 _last_peer_hash = None        # content hash of last-applied peer set (reload gate)
+# Observability for the peer-map. A host whose peer-map has stopped converging
+# serves stale/absent cross-host routes and 404s a slice of the fleet's
+# tenants, so "how long since the last success" has to be measurable — a
+# silent-degradation path must never look identical to a healthy one.
+_peer_reload_failures = 0     # cumulative nginx -t / reload rejections
+_peer_last_success = 0.0      # wall-clock ts of last fully-applied sync
+_peer_entries = 0             # peer routes in the last applied generation
 # Tenant statuses whose dashboard should be routable via the peer-map. Include
 # failover_queued/recovering so a tenant keeps a route through the T3-2 failover
 # window (its host_id already points at the target once the sweep flips it).
@@ -126,12 +147,16 @@ _PROM_GAUGES = (
 )
 
 
-def _render_metrics_text(snapshots):
+def _render_metrics_text(snapshots, peer=None):
     """Render the in-memory snapshots dict as Prometheus exposition text.
 
     Pure function — no I/O — so it is easy to assert against in unit tests.
     Always emits HELP/TYPE headers (even with zero samples) so that scrapers
     that validate metadata don't choke on a quiet host.
+
+    `peer` carries the peer-map counters (passed in rather than read from
+    globals to keep this function pure). Shape:
+    {"reload_failures": int, "last_success": epoch_seconds, "entries": int}
     """
     out = []
     for metric_name, help_text, key in _PROM_GAUGES:
@@ -151,6 +176,31 @@ def _render_metrics_text(snapshots):
             continue
         v = 1 if info.get("vm_health") == "up" else 0
         out.append(f'openclaw_vm_health{{tenant="{tid}"}} {v}')
+
+    # ── peer-map (T3-1 host-tg routing) ──────────────────────────────────
+    # Host-level, not per-tenant. A host whose peer-map stopped converging
+    # keeps answering the TG health check with 200 while 404-ing every
+    # cross-host tenant, so these three are the only signal that the
+    # cross-host routing plane is actually healthy. Always emitted (zeros when
+    # the feature is idle) so an alert on "age too high" can't be defeated by
+    # the series simply disappearing.
+    p = peer or {}
+    out.append("# HELP openclaw_peer_map_reload_failures_total "
+               "nginx -t/reload rejections while applying the peer-map")
+    out.append("# TYPE openclaw_peer_map_reload_failures_total counter")
+    out.append("openclaw_peer_map_reload_failures_total "
+               f"{int(p.get('reload_failures', 0))}")
+    out.append("# HELP openclaw_peer_map_last_success_age_seconds "
+               "seconds since the peer-map was last fully applied "
+               "(-1 = never applied)")
+    out.append("# TYPE openclaw_peer_map_last_success_age_seconds gauge")
+    last = float(p.get("last_success", 0) or 0)
+    age = -1 if last <= 0 else int(max(0, time.time() - last))
+    out.append(f"openclaw_peer_map_last_success_age_seconds {age}")
+    out.append("# HELP openclaw_peer_map_entries "
+               "peer routes in the last applied generation")
+    out.append("# TYPE openclaw_peer_map_entries gauge")
+    out.append(f"openclaw_peer_map_entries {int(p.get('entries', 0))}")
     return "\n".join(out) + "\n"
 
 # Balloon config (from /etc/platform.env)
@@ -896,10 +946,23 @@ def _render_peer_conf(tid, owner_ip):
     that host's internal :8081 server. Mirrors the launch-vm.sh per-tenant block
     (proxy_http_version 1.1 + Upgrade/Connection + 86400s) so WebSocket
     dashboards survive the extra hop; only the upstream differs (:8081, not the
-    local guest :18789)."""
+    local guest :18789).
+
+    CRITICAL — the upstream URI must be passed through UNCHANGED, so
+    `proxy_pass` carries NO URI part. The local block in launch-vm.sh does
+    `proxy_pass http://<guest>:18789$1` because there the next hop is the
+    OpenClaw app, which serves from its own root and therefore needs the
+    `/vm/<tid>` prefix stripped. Here the next hop is ANOTHER HOST'S nginx
+    `:8081`, whose only locations are `^/vm/<tid>(/.*)?$` (it includes
+    conf.d/tenants/*.conf). Stripping the prefix would hand it `/foo` instead
+    of `/vm/<tid>/foo` — nothing matches and every cross-host request 404s.
+    That regressed silently for a while because the catch-all sits at ALB
+    priority 999, so per-tenant rules (1-499) always won and this second hop
+    never saw real traffic.
+    """
     return (
         f"location ~ ^/vm/{tid}(/.*)?$ {{\n"
-        f"    proxy_pass http://{owner_ip}:8081$1;\n"
+        f"    proxy_pass http://{owner_ip}:8081;\n"
         f"    proxy_http_version 1.1;\n"
         f"    proxy_set_header Upgrade $http_upgrade;\n"
         f"    proxy_set_header Connection $connection_upgrade;\n"
@@ -913,6 +976,28 @@ def _render_peer_conf(tid, owner_ip):
     )
 
 
+def _mark_ready():
+    """Publish host readiness for the shared target group's health check.
+
+    nginx serves /ready from this file (see init-host.sh) and answers 503 while
+    it is absent, so a host only starts taking its share of cross-host /vm/*
+    traffic once it can actually route it. /run is tmpfs, hence a reboot or an
+    ASG replacement starts out not-ready without any extra cleanup.
+
+    Best-effort by design: failing to publish readiness must never take down
+    the poll loop, but it does get logged — a host stuck at 503 with no
+    explanation is worse than a noisy log.
+    """
+    try:
+        os.makedirs(_READY_DIR, exist_ok=True)
+        tmp = os.path.join(_READY_DIR, "ready.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("ok\n")
+        os.replace(tmp, os.path.join(_READY_DIR, "ready"))
+    except OSError as e:
+        print(f"could not publish readiness marker ({_READY_DIR}/ready): {e}")
+
+
 def _sync_tenant_routes():
     """T3-1 peer-map: render nginx confs for tenants owned by OTHER hosts so
     this host can serve any /vm/<tid> the ALB catch-all sends it (≤2 hops).
@@ -922,6 +1007,7 @@ def _sync_tenant_routes():
     even if DDB host_id lags, so we never shadow a local route with a peer one.
     """
     global _last_route_sync, _last_peer_hash
+    global _peer_reload_failures, _peer_last_success, _peer_entries
     if not TENANTS_TABLE or not HOSTS_TABLE or not INSTANCE_ID:
         return  # can't distinguish local vs peer without our own instance id
     now = time.monotonic()
@@ -939,7 +1025,20 @@ def _sync_tenant_routes():
         # Tenants physically present on THIS host right now (vm.json on disk),
         # so a lagging host_id can't make us write a peer conf for a local VM.
         try:
-            local_tids = set(os.listdir(VM_DIR))
+            # Predicate is "nginx here has a LOCAL block for it", NOT "a data
+            # directory exists". stop-vm.sh deliberately keeps
+            # /data/firecracker-vms/<tid>/ ("data volume preserved") and
+            # delete_tenant defaults to keep_data=true, so listing VM_DIR
+            # reported migrated-away tenants as local FOREVER. That suppressed
+            # their peer conf permanently while the local conf was already
+            # gone — the tenant then 404s on this host for good (an
+            # intermittent 1/N failure, the hardest kind to diagnose).
+            # conf.d/tenants/ is written by launch-vm.sh and removed by
+            # stop-vm.sh, so it tracks reality.
+            local_tids = {
+                f[: -len(".conf")] for f in os.listdir(_LOCAL_CONF_DIR)
+                if f.endswith(".conf")
+            }
         except OSError:
             local_tids = set()
 
@@ -976,10 +1075,39 @@ def _sync_tenant_routes():
             path = os.path.join(_PEER_DIR, f"{tid}.conf")
             with open(path, "w", encoding="utf-8") as f:
                 f.write(conf)
-        subprocess.run(["nginx", "-s", "reload"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       timeout=10)
+
+        # Validate BEFORE reloading. A syntactically bad peer conf makes the
+        # whole nginx config invalid, and then EVERY later reload fails too —
+        # including the ones launch-vm.sh/stop-vm.sh issue, so no new local
+        # tenant can come up on this host either.
+        check = subprocess.run(["nginx", "-t"], capture_output=True,
+                               text=True, timeout=10)
+        if check.returncode != 0:
+            _peer_reload_failures += 1
+            # Leave _last_peer_hash alone so the next tick RETRIES instead of
+            # believing this generation was applied.
+            print("peer-map sync FAILED: nginx -t rejected the rendered config "
+                  f"(rc={check.returncode}); keeping previous hash so the next "
+                  f"tick retries. stderr={check.stderr.strip()[:500]}")
+            return
+
+        reload_proc = subprocess.run(["nginx", "-s", "reload"],
+                                     capture_output=True, text=True, timeout=10)
+        if reload_proc.returncode != 0:
+            _peer_reload_failures += 1
+            # Same reasoning: a failed reload means the running config still
+            # differs from disk. Recording the hash here would freeze that
+            # drift permanently (the desired set is unchanged next tick, so we
+            # would return early and never reload again).
+            print("peer-map sync FAILED: nginx reload returned "
+                  f"{reload_proc.returncode}; keeping previous hash so the next "
+                  f"tick retries. stderr={reload_proc.stderr.strip()[:500]}")
+            return
+
         _last_peer_hash = digest
+        _peer_last_success = time.time()
+        _peer_entries = len(desired)
+        _mark_ready()
         print(f"peer-map synced: {len(desired)} peer route(s)")
     except Exception as e:
         # Never let a DDB throttle / nginx hiccup starve the poll loop.
@@ -1020,7 +1148,11 @@ class Handler(BaseHTTPRequestHandler):
             # ADOT collector that remote-writes to AMP.
             with _lock:
                 data = dict(_status)
-            body = _render_metrics_text(data).encode()
+            body = _render_metrics_text(data, peer={
+                "reload_failures": _peer_reload_failures,
+                "last_success": _peer_last_success,
+                "entries": _peer_entries,
+            }).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; version=0.0.4")
             self.send_header("Content-Length", str(len(body)))
@@ -1042,10 +1174,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    print(f"openclaw-agent starting on :{PORT}, poll every {POLL_INTERVAL}s, table={TENANTS_TABLE}")
+    print(f"openclaw-agent starting on {BIND_HOST}:{PORT}, "
+          f"poll every {POLL_INTERVAL}s, table={TENANTS_TABLE}")
     t = threading.Thread(target=_poll_loop, daemon=True)
     t.start()
-    HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    HTTPServer((BIND_HOST, PORT), Handler).serve_forever()
 
 
 if __name__ == "__main__":

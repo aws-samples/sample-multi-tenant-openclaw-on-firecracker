@@ -272,7 +272,7 @@ curl -s -X POST "${API_URL}tenants" -H "x-api-key: ${API_KEY}" \
 | **RBAC** | Cognito Groups: `admin` / `operator` / `viewer`. Opt-in via `console_auth.rbac_enabled` (default off, independent of login — 1.5.4). When enabled, the id_token's **RS256 signature is verified** against the pool JWKS before any claim is trusted (1.5.0); a forged / `alg:none` / expired token is downgraded to `viewer`, and a request with no Bearer token fail-safes to `viewer` so writes 403 unless a genuine Cognito token is presented. |
 | **microVM SSH** | **Pubkey-only** (1.5.0). Each host self-generates an `ed25519` keypair at boot; the public key is injected per-VM at launch (one key per host). Root login and password auth are disabled in the rootfs and both accounts are locked — no shared password anywhere. |
 | **Audit log** | All `POST` / `PUT` / `DELETE` operations recorded with 90-day TTL. |
-| **Network isolation** | iptables `FORWARD DROP` between tenant subnets *and* to the host IMDS (`169.254.169.254`) — cross-tenant and credential-theft paths explicitly disabled. |
+| **Network isolation** | iptables DROP rules on all three east-west paths — VM↔VM on the same host (`-i tap-vmN -o tap-vm+`), guest→host listeners (INPUT on tcp 80/8081/8899), and guest→other hosts' listeners (same ports, scoped to the VPC CIDR so public egress is unaffected) — *and* to the host IMDS (`169.254.169.254`). Targeted DROPs rather than a `FORWARD` policy flip, so they can be rolled out under a live fleet without cutting running VMs. |
 
 </details>
 

@@ -1611,6 +1611,8 @@ def build_ha_edge(self, ctx):
                     ],
                 )
             )
+        # #479:挂到 ctx 供 observability.py 的 edge Firehose 最小补授点使用。
+        ctx.edge_role = _edge_role
         # 旧形态是 `aws s3 cp --recursive` 拉可变前缀 deployment/edge/,由 setup.sh
         # 手工上传,再 60×10s 轮询等 install-edge.sh 出现。两种真实故障出自这里:
         # 目录被当完整集消费,因为没有任何东西校验这一整套。

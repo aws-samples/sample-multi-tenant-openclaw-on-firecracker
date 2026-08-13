@@ -598,6 +598,10 @@ chmod +x /home/ubuntu/lib/harden-config.sh /home/ubuntu/lib/cred-inject.sh && ch
 aws s3 cp s3://${ASSETS_BUCKET}/deployment/scripts/stop-vm.sh /home/ubuntu/stop-vm.sh --region ${REGION} --no-progress 2>/dev/null || \
   _s3_get s3://${ASSETS_BUCKET}/deployment/scripts/stop-vm.sh /home/ubuntu/stop-vm.sh
 chmod +x /home/ubuntu/stop-vm.sh && chown ubuntu:ubuntu /home/ubuntu/stop-vm.sh
+# commands. This script owns the atomic overlay tombstone and op result.
+aws s3 cp s3://${ASSETS_BUCKET}/deployment/scripts/rebuild-vm.sh /home/ubuntu/rebuild-vm.sh --region ${REGION} --no-progress 2>/dev/null || \
+  _s3_get s3://${ASSETS_BUCKET}/deployment/scripts/rebuild-vm.sh /home/ubuntu/rebuild-vm.sh
+chmod +x /home/ubuntu/rebuild-vm.sh && chown ubuntu:ubuntu /home/ubuntu/rebuild-vm.sh
 # the matching API hits a missing /home/ubuntu/*.sh and fails exit 127.
 # start-all-vms / stop-all-vms — host-local fan-out for the 1-minute fleet
 # power goal: control plane sends ONE SSM per host, host starts/stops all its

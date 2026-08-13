@@ -28,7 +28,14 @@ import core.clients as clients
 from core.auth import _get_caller_identity
 
 
-def enqueue_lifecycle(action, tenant_id, event, extra=None, before_send=None):
+def enqueue_lifecycle(
+    action,
+    tenant_id,
+    event,
+    extra=None,
+    before_send=None,
+    operation_id=None,
+):
     """把一个 lifecycle 操作入 SQS,供 consumer 受控并发消费。返回本次操作的 op_id。
 
     返回值(ADR-rebuild-idempotency-sync-contract §5.3):**已入队 → 返 op_id 字符串**
@@ -79,7 +86,7 @@ def enqueue_lifecycle(action, tenant_id, event, extra=None, before_send=None):
             # already land it; this was the FIFO-replay gap.
             "tenant_user_id": ident.get("tenant_user_id"),
         },
-        "_op_id": uuid.uuid4().hex,
+        "_op_id": operation_id or uuid.uuid4().hex,
     }
     kwargs = {"QueueUrl": clients.LIFECYCLE_QUEUE_URL, "MessageBody": json.dumps(msg)}
     # FIFO 队列(.fifo 结尾)需要 group/dedup id;标准队列忽略这俩

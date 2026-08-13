@@ -3,6 +3,28 @@
 LiteLLM 是数据面 chat 推理的前提：guest microVM 的 OpenClaw 走 `http://<host>:4000/v1` →
 LiteLLM → Bedrock（ap-southeast-1）。本栈跑在堡垒机（docker），用受限 instance role 调 Bedrock。
 
+> ## #480 — 默认不再由 CDK 部署 LiteLLM
+>
+> `config.yml` 的 `ai_gateway` 决定 CDK 是否托管一个网关,**默认「不部署」**:
+>
+> | `ai_gateway` 配置 | CDK 行为 |
+> | --- | --- |
+> | `url` 填了(如 `https://gw.internal/v1`) | 只把它写进 SSM `/openclaw/litellm-host`,复用外部网关,不建计算资源 |
+> | `url` 空 + `managed_by_stack: true` | CDK 自建:`ha_enabled: false` 起单机 EC2,`true` 起 ASG+internal ALB+RDS Multi-AZ |
+> | `url` 空 + `managed_by_stack: false`(**默认**) | 什么都不建、不写 SSM |
+>
+> 改默认的原因:旧默认(`url` 空即自动起一台常驻 EC2,HA 还多一套 RDS+ALB)对已有自己
+> 网关的部署是净负担。要 CDK 托管一个,把 `managed_by_stack` 显式设 `true`;要复用已有
+> 网关,填 `url`;本文档下面这套「堡垒机手工 docker 部署」是第三条独立路径,与 CDK 托管
+> 无关(手工起完把私网 IP 写进 SSM `/openclaw/litellm-host` 即可)。
+>
+> **不部署对 host 引导无害**:`init-host.sh` 读 `/openclaw/litellm-host` 与
+> `/openclaw/litellm-shared-vkey` 都带 `|| echo ""` 兜底,参数缺失只让 env 为空,不会引导
+> 失败。可见后果是 guest agent 没有模型端点可调 —— 未配网关时这是预期,不是 bug。
+>
+> 存量已部署环境要保持现状:把 `managed_by_stack` 显式设 `true`,synth 资源集合与改动前
+> 的默认逐一致(见 `tests/test_p6_observability_synth.py::TestLiteLlmManagedSingle`)。
+
 - 账号：<AWS_ACCOUNT_ID>，region ap-southeast-1。
 - 堡垒机：`ssh -i ~/.ssh/openclaw-bastion-key.pem ubuntu@<bastion-ip>`，repo 在 `~/openclaw`。
 - 部署资产目录：`deploy/litellm/`（本目录）。

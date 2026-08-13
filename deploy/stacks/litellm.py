@@ -35,17 +35,30 @@ def build_litellm(self, ctx):
 
     # ========== AI Gateway (LiteLLM) toggle ==========
     # guest microVMs hold ZERO credentials; LLM calls go through an OpenAI-
-    # compatible gateway (LiteLLM) → Bedrock. Two modes:
-    #   ai_gateway.url filled  → write it straight to SSM /openclaw/litellm-host;
-    #                            host's launch-vm.sh injects it into each VM.
-    #   ai_gateway.url empty   → CDK stands up a LiteLLM EC2 (least-priv Bedrock
-    #                            instance role, no static keys; master_key from
-    #                            Secrets Manager) and writes its private IP:4000
-    #                            to SSM. This is what makes a fresh region
-    #                            one-click — no manual gateway step.
+    # compatible gateway (LiteLLM) → Bedrock. Three modes (#480):
+    #   ai_gateway.url filled             → write it straight to SSM
+    #                                       /openclaw/litellm-host; host's
+    #                                       launch-vm.sh injects it into each VM.
+    #   url empty + managed_by_stack=true → CDK stands up a LiteLLM EC2 (least-priv
+    #                                       Bedrock instance role, no static keys;
+    #                                       master_key from Secrets Manager), or the
+    #                                       HA set, and writes the address to SSM.
+    #   url empty + not managed (DEFAULT) → deploy nothing, write no SSM param.
+    #
+    # #480 — the default flipped from "self-host a gateway" to "deploy nothing".
+    # The old default silently added a permanent EC2 to every environment (plus an
+    # RDS Multi-AZ + internal ALB under ha_enabled), while most deployments already
+    # have their own OpenAI-compatible gateway. Opting in costs one config line.
+    #
+    # Deploying nothing is SAFE for host boot: init-host.sh reads
+    # /openclaw/litellm-host and /openclaw/litellm-shared-vkey with `|| echo ""`
+    # fallbacks, so a missing parameter leaves the env var empty rather than failing
+    # the bootstrap. The visible consequence is that a guest agent has no model
+    # endpoint to call — which is the intent when no gateway is configured.
     _aigw_cfg = CFG.get("ai_gateway", {}) or {}
     _aigw_url = (_aigw_cfg.get("url") or "").strip()
-    # #187 P6: ai_gateway.ha_enabled=true 走 HA 路径(ASG min=2 + internal ALB
+    # #480 — opt-in flag; naming mirrors security.guardrail_managed_by_stack.
+    _aigw_managed = bool(_aigw_cfg.get("managed_by_stack", False))
     # + RDS PostgreSQL Multi-AZ 共享 PG)。默认 false 保存量单机不变(HA-AUDIT
     # 记录 LiteLLM 单点是最后一个必修 CRITICAL)。HA 模式硬约束: 必须用外部
     # 共享 PG, 因为 compose 内嵌 postgres 只在容器本地存 vkey/spend, ASG 两台
@@ -59,8 +72,14 @@ def build_litellm(self, ctx):
             parameter_name="/openclaw/litellm-host",
             string_value=_aigw_url,
         )
+    elif not _aigw_managed:
+        # #480 DEFAULT — no gateway configured and none requested: build nothing.
+        # `pass`, NOT `return`: this function is a transplanted grab-bag that still
+        # owns four unrelated blocks below (DNS Firewall, Wazuh, self-hosted
+        # Prometheus/Grafana, and VPC Flow Logs — the last one defaults to ENABLED).
+        # Returning here would silently disable the audit-plane Flow Logs.
+        pass
     elif _ha_enabled:
-        # ---- HA 模式(#187 P6): ASG min=2 + internal ALB + RDS Multi-AZ ----
         # 共享 role(与单机一致, 少写一份)
         litellm_role = iam.Role(
             self,
@@ -172,7 +191,6 @@ def build_litellm(self, ctx):
             backup_retention=Duration.days(7),
         )
         _pg_secret.grant_read(litellm_role)
-        # SSM read: guardrail id(#80 同款)
         litellm_role.add_to_policy(
             iam.PolicyStatement(
                 actions=["ssm:GetParameter"],
@@ -184,7 +202,6 @@ def build_litellm(self, ctx):
         )
         # userdata: 与单机一致的 docker+compose 拉起, 但 DATABASE_URL 指向 RDS,
         # 且 compose 不激活 embedded-db profile。凭据(master_key + pg secret)
-        # 从 Secrets Manager 拉, #169 set +x 段照旧套。
         _pg_endpoint = _pg_instance.db_instance_endpoint_address
         _ha_ud = ec2.UserData.for_linux()
         _ha_ud.add_commands(
@@ -204,7 +221,6 @@ def build_litellm(self, ctx):
             f"[ -f docker-compose.litellm.yml ] && "
             f"[ -f litellm-config.yaml ] && break; "
             f'echo "waiting for litellm assets ($i)"; sleep 10; done',
-            # #169 纪律: 凭据段临时关 xtrace, 防 master_key + pg pw 明文进
             # EC2 console log。
             "set +x",
             f"MK=$(aws secretsmanager get-secret-value "
@@ -231,7 +247,6 @@ def build_litellm(self, ctx):
             f'--output text 2>/dev/null || echo "")',
             # SSM 有值 → 启用 guardrail;无值(默认) → 删 guardrails 段无 guardrail 跑。
             # 绝不 fallback 到账号特定硬编码(旧 id 只在建它的那个 region 存在,
-            # 跨账号 400,memory #167)。与单机路径对称。
             'if [ -n "$GR_ID" ]; then '
             'echo "[litellm-ha-userdata] guardrail enabled id: $GR_ID"; '
             'sed "s|__GUARDRAIL_ID__|${GR_ID}|g" litellm-config.yaml > config.runtime.yaml; '
@@ -398,7 +413,6 @@ def build_litellm(self, ctx):
                 ],
             )
         )
-        # #80 — LiteLLM userdata 从 SSM 读 guardrail id(去账号特定硬编码)。
         # 栈内建 Guardrail 时(security.guardrail_managed_by_stack=true)param 由本栈写;
         # 未开开关时 param 可能不存在,userdata 会走硬编码兜底(保存量兼容)+ 日志留痕。
         litellm_role.add_to_policy(
@@ -409,7 +423,6 @@ def build_litellm(self, ctx):
                 ],
             )
         )
-        # #17 — mint-shared-vkey.sh 在 LiteLLM 实例上(PROFILE=-,instance role)铸 shared
         # vkey 后写 SSM SecureString /openclaw/litellm-shared-vkey。写 SecureString 需两件事:
         #   (1) ssm:PutParameter 该参数;
         #   (2) 对加密用 CMK 的 kms:Encrypt/GenerateDataKey —— 必须用 host role 能 Decrypt 的
@@ -447,7 +460,6 @@ def build_litellm(self, ctx):
             f"aws s3 cp s3://{assets_bucket.bucket_name}/deployment/litellm/ . --recursive --region {self.region} 2>/dev/null; "
             f"[ -f docker-compose.litellm.yml ] && [ -f litellm-config.yaml ] && break; "
             f'echo "waiting for litellm assets in S3 ($i)"; sleep 10; done',
-            # #169 — disable xtrace around secret handling. The top-level `set -x`
             # would otherwise echo the resolved master key (also reused as the PG
             # password) into the EC2 console/system log, readable by anyone with
             # ec2:GetConsoleOutput. Re-enabled after the .env is written.
@@ -463,7 +475,6 @@ def build_litellm(self, ctx):
             'echo "POSTGRES_DB=litellm" >> .env',
             'echo "DATABASE_URL=postgresql://litellm:$MK@litellm-db:5432/litellm" >> .env',
             "chmod 600 .env",
-            # #169 — secret is now in the 0600 .env; safe to resume tracing.
             "set -x",
             # config.runtime.yaml 必须先于 compose up 生成,否则 compose 把不存在的挂载源
             # 当目录建 → 容器内 /etc/litellm/config.yaml 成空目录 → IsADirectoryError 崩溃重启(已踩坑)。
@@ -473,7 +484,6 @@ def build_litellm(self, ctx):
             #   • SSM 无值(默认;Bedrock guardrail 可能不在部署账号 / 客户不配) → 删掉整个
             #     guardrails 段,LiteLLM 无 guardrail 正常跑。绝不 fallback 到账号特定硬编码
             #     (旧 id 只在建它的 region 存在,换 region 就不存在 → ApplyGuardrail 400
-            #     每条对话被拒,memory #167 踩过)。想启用只需写 SSM param,不动部署代码。
             f'GR_ID=$(aws ssm get-parameter --name {_guardrail_ssm_param_name} --region {self.region} --query "Parameter.Value" --output text 2>/dev/null || echo "")',
             'if [ -n "$GR_ID" ]; then '
             'echo "[litellm-userdata] guardrail enabled id: $GR_ID"; '
@@ -496,15 +506,12 @@ def build_litellm(self, ctx):
             # 反而不带,因为 DATABASE_URL 指向外部 RDS,不需要 embedded-db。
             "docker compose --profile embedded-db -f docker-compose.litellm.yml up -d 2>&1 | tail -5",
             # IMDSv2: AL2023 强制 token,旧 IMDSv1 curl 取 IP 返回空→SSM 写成 http://:4000/v1(已踩坑)。先 PUT 拿 token。
-            # #169 旁枝 — IMDSv2 token 也是凭据(300s 内可换实例角色临时凭据),xtrace
             # 会把展开后的明文 token 回显进 EC2 console log(与 master key 同类,持
-            # ec2:GetConsoleOutput 可读回)。#169 secret 段修复只包了 master key,token
             # 段仍裸露。取/用 token 段临时关 xtrace;IP 是私网 IP(非凭据)顺带包进,put 后恢复。
             "set +x",
             'TOK=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")',
             'IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOK" http://169.254.169.254/latest/meta-data/local-ipv4)',
             f'aws ssm put-parameter --name /openclaw/litellm-host --type String --overwrite --value "http://$IP:4000/v1" --region {self.region}',
-            # #169 旁枝 — IMDS token 已用完,恢复 xtrace(与 secret 段同款配对)。
             "set -x",
         )
         ec2.Instance(
@@ -588,7 +595,6 @@ def build_litellm(self, ctx):
             name="openclaw-assoc",
         )
 
-    # ========== Wazuh 监控平台 EC2(10h-goal #20,CDK 一键部署)==========
     # config-gated(security.wazuh_enabled)。起一台专用监控 EC2,userdata 自动
     # 装 docker + compose,从 S3 assets 拉 docker-compose.wazuh.yml + 自定义
     # 规则,生成强随机凭据后 compose up,起 Wazuh manager+indexer+dashboard。
@@ -672,7 +678,6 @@ def build_litellm(self, ctx):
             "WazuhDashboardHint",
             value="https://<WazuhMonitor private IP>:443 (front with ALB+ACM; SG = VPC CIDR only)",
         )
-        # #187 P6: EC2 auto-recovery — 底层硬件挂了自动迁到健康 host, 保留
         # instance id / 私网 IP / EBS 卷; 与 docker compose restart=always 覆盖
         # "进程挂"和"系统挂"两层。集群化(2 manager + 共享 EFS + OpenSearch 集群)
         # 工作量大, 且 security.wazuh_enabled 默认关, 走 HA-AUDIT §13 认可的简版。
@@ -696,7 +701,6 @@ def build_litellm(self, ctx):
             cw_actions.Ec2Action(cw_actions.Ec2InstanceAction.RECOVER)
         )
 
-    # ========== Self-hosted Prometheus + Grafana EC2 (#187 P6) ==========
     # 走自建路径(metrics.enabled=true 且 use_managed=false, 默认档): CDK 直接
     # 起一台监控 EC2, docker-compose 拉 Prometheus + Grafana, 复用
     # deploy/monitoring/{docker-compose.prom-grafana.yml, prometheus.yml,
@@ -719,7 +723,6 @@ def build_litellm(self, ctx):
             allow_all_outbound=True,
         )
         # 硬红线: 9090/3000 入站只放 VPC CIDR(setup-monitoring-ec2.sh:37 同款),
-        # 绝不 0.0.0.0/0(#187 P7 已踩过 SG description 非 ASCII 400 拒的坑,
         # 描述文本一律 ASCII)。
         for _port, _desc in [(9090, "Prometheus"), (3000, "Grafana")]:
             prom_sg.add_ingress_rule(
@@ -780,7 +783,6 @@ def build_litellm(self, ctx):
             # 用 sed 就地改成本栈 region(随重建继承, 不靠手改运行态)。
             f"sed -i 's/region: ap-southeast-1/region: {self.region}/' "
             "/opt/monitoring/prometheus.yml || true",
-            # #169 同款纪律: Grafana admin 密码是凭据, 生成期临时关 xtrace 防
             # 明文进 EC2 console log (ec2:GetConsoleOutput 可读回)。写入 0600
             # .env 后恢复。
             "set +x",
@@ -933,7 +935,6 @@ def build_litellm(self, ctx):
                 "GrafanaAlbDns",
                 value=grafana_alb.load_balancer_dns_name,
             )
-            # #234 — surface the self-hosted Grafana ALB to the API Lambda so
             # /system/info can advertise a clickable link (parity with the AMG
             # workspace URL on the managed path). compute.py already set
             # METRICS_ENABLED/METRICS_BACKEND; this fills the URL for the
@@ -944,7 +945,6 @@ def build_litellm(self, ctx):
                     f"http://{grafana_alb.load_balancer_dns_name}",
                 )
 
-    # ========== VPC Flow Logs(安全加固 task #25)==========
     # 记录 VPC 内所有网络流量,用于检测跨租户东西向异常连接、验证 iptables
     # 隔离是否真生效、网络取证(CIS 3.8 Ensure VPC flow logging enabled)。
     # config-gated(flow_logs.enabled 默认 true);投递到受限保留期的

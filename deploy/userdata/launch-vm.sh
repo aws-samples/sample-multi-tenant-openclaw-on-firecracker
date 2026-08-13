@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: MIT-0
 
 set -euo pipefail
-# #256 — launch-vm.sh 是唯一起 VM 脚本。fan_out_main 内联了原 launch-all-vms.sh 的批量
 # fan-out 逻辑(SQS dispatch:一条 SSM 命令叫醒本 host → 读 manifest/DDB assignment →
 # 逐行 re-invoke `bash "$0" <单租户 13 位参数>` 起 VM)。函数后的 dispatcher case 据 $1
 # 是否为 --manifest(paramstore)/--from-ddb(DDB)决定走向:批量 → fan_out_main;否则
@@ -135,15 +134,10 @@ fan_out_main() {
       return 42  # sentinel: skipped
     fi
     # 13 positional args mirror the launch-vm.sh signature: config_template=$5,
-    # restore_backup_key=$6 (#199 — 缺则 launch 建空白盘=数据丢失,故必须透传),
-    # chat_ep=$10, position 11 (cognito, retired #187 P5) empty,
-    # gateway_token_ct=$12 (#187 P1), device_paired_b64=$13 (#188 wss 免 approve).
     # config_template($5) 走 DDB tenants 记录(host-agent/launch-vm 自取),此处
     # 空;restore_key($6) 从 assignment/manifest 透传。Empty 7-9 keep defaults.
     # Secrets like vkey/channel_secret are still pulled from DDB by launch-vm.
-    # #256 — re-invoke 本脚本自己(bash "$0"):单租户位置参不含 --manifest/--from-ddb,
     # 故落 dispatcher 后的单 VM 主体,不会递归回 fan_out_main。
-    # #266 — systemd-cat 包裹让每租户 launch 诊断进 journald(tag claw-launch)→
     # Fluent Bit host.platform → AOS claw-logs-host,不再被 /dev/null 吞掉。fan-out
     # 批量创建卡住时,console Logs viewer 才查得到某租户为何没起来。
     systemd-cat -t claw-launch \
@@ -169,8 +163,6 @@ fan_out_main() {
     # Parse ONE JSON-line: {"t":"t-xxx","n":42,"c":2,"m":2048,"e":0[,"g":"<ct>","d":"<b64>"]}
     # We use jq (present on host, same as start-all-vms.sh:59-61) — a stdlib
     # sed regex here would break on any future field addition.
-    # g = gateway_token_ct (base64 KMS 密文, #187 P1); d = device_paired_b64
-    # (base64 paired.json, #188). 缺省空串 → launch-vm fail-open。
     local line="$1" rfile="$2"
     local tid vm_num vcpu mem_mb chat_ep gw_token_ct device_paired restore_key
     local reservation_id
@@ -181,7 +173,6 @@ fan_out_main() {
     chat_ep=$(jq -r '.e // 0' <<<"${line}" 2>/dev/null)
     gw_token_ct=$(jq -r '.g // empty' <<<"${line}" 2>/dev/null)
     device_paired=$(jq -r '.d // empty' <<<"${line}" 2>/dev/null)
-    # #199 — restore 意图(r=S3 backup key);空 → 普通建盘,非空 → launch 恢复该备份
     restore_key=$(jq -r '.r // empty' <<<"${line}" 2>/dev/null)
     reservation_id=$(jq -r '.q // empty' <<<"${line}" 2>/dev/null)
     if [ -z "${tid}" ] || [ -z "${vm_num}" ]; then
@@ -200,14 +191,11 @@ fan_out_main() {
       echo "skipped" > "${rfile}"
       [ "${FROM_DDB}" -eq 1 ] && _mark_assignment "${tid}" "done"
     elif [ "${rc}" -eq 44 ]; then
-      # #411/6.3 — 租户 status=deleted(终态):删除已定,重投只会反复叫醒 host 起一个
       # 马上要删的 VM。标 assignment done 让它从 pending 过滤掉(停止重捞),写独立哨兵
-      # aborted → 不进 launched/failed 清单、不触发批回滚(codex#4)。
       echo "aborted" > "${rfile}"
       [ "${FROM_DDB}" -eq 1 ] && _mark_assignment "${tid}" "done"
       _fo_log "launch abort(deleted) tenant=${tid} rc=44 — 租户已删,拒起并停重投"
     elif [ "${rc}" -eq 45 ]; then
-      # #411/6.3(codex round3)— 租户 status=deleting(删除在途,【非】终态):delete 失败
       # 会把状态回滚到 creating/running。绝不标 assignment done —— 那会让回滚后的 creating
       # 租户永久无 VM 无 pending。写 inprogress 哨兵(同 flock-skip rc75 语义):不进
       # launched/skipped/failed 清单、不触发批回滚、保持 pending → 下轮重投重判(读到
@@ -215,8 +203,6 @@ fan_out_main() {
       echo "inprogress" > "${rfile}"
       _fo_log "launch defer(deleting) tenant=${tid} rc=45 — 删除在途,保持 pending 待重投重判"
     elif [ "${rc}" -eq 75 ]; then
-      # #256 — launch-vm.sh 抢 per-tenant flock 失败(另一进程正在起同租户)的 skip 哨兵。
-      # 关键:绝不 _mark_assignment done。持锁 winner 可能死在写 vm.json 之前(如 #199
       # DDB get-item fail-closed exit 1),若这里把 assignment 标 done,它就从 pending 过滤
       # 掉永不重投 + 无 vm.json 让 host-agent 本地恢复也没锚点 = 永久孤儿(no-data-loss)。
       # 写 inprogress → 不进 v2 JSON 的 launched/skipped/failed 三清单(_result_list 只精确
@@ -225,7 +211,6 @@ fan_out_main() {
       _fo_log "launch skip(flock held) tenant=${tid} rc=75 — 保持 pending 待重投"
     else
       echo "failed" > "${rfile}"
-      # #315(codex 8.4 HIGH)—— ddb 模式:普通非零退出【不】标 assignment failed,保持 pending。
       # 与 host-agent _dispatch_tick 点5 同源:assignment 一旦 failed,host-agent
       # _query_pending_assignments 只查 pending → 再也捞不到 → 永久卡 creating、不经预算、不进 DLQ
       # (SSM --from-ddb 执行器的"首败即终态",与 Python reconciler 是同一 bug 的 shell 副本)。
@@ -288,7 +273,6 @@ fan_out_main() {
         skipped)    skipped=$((skipped + 1)) ;;
         inprogress) ;;  # #256 flock skip:不计 launched/skipped/failed,不进 v2 清单,不触发批回滚(保持 pending 待重投)
         aborted)    ;;  # #411/6.3 status 闸拒起(deleted/deleting)= 终态且【非失败】。
-                        # codex#4:绝不落进下面 *) 失败计数——那会让整批 EXIT 1、健康
                         # 兄弟被 Poller 判 partial 回滚/重投。assignment 已由 caller 标 done。
         *)          failed=$((failed + 1)) ;;
       esac
@@ -383,7 +367,6 @@ _oc_cleanup_on_err() {
 trap _oc_cleanup_on_err ERR EXIT
 TENANT_ID="${1:?Usage: launch-vm.sh <tenant_id> <vm_num> [vcpu] [mem_mb] [config_template] [restore_backup_key] [scoped_skills]}"
 VM_NUM="${2:?Usage: launch-vm.sh <tenant_id> <vm_num> [vcpu] [mem_mb] [config_template] [restore_backup_key] [scoped_skills]}"
-# #256 — per-tenant 跨进程互斥(kubelet per-pod worker 的跨进程等价物)。
 # launch-vm.sh 有多类并发调用者:fan-out(bash 子进程)/host-agent recover(Popen)/
 # ssm wake/scaler/health failover(独立 SSM 进程)。Python 的 _recovering/_dispatch_inflight
 # 是进程内 set,跨不过 bash 和 SSM 那几类进程。flock 是 inode advisory 锁,跨语言/跨进程
@@ -398,7 +381,6 @@ VM_NUM="${2:?Usage: launch-vm.sh <tenant_id> <vm_num> [vcpu] [mem_mb] [config_te
 mkdir -p /run/lock 2>/dev/null || true
 exec 9>"/run/lock/oc-launch-${TENANT_ID}.lock"
 flock -n 9 || { trap - ERR EXIT; echo "[oc:launch] ${TENANT_ID} launch already in progress (flock held) — skip" >&2; exit 75; }
-# #331/#327 — host 级启动并发闸(跨进程):一个 host 同时冷启的 VM 数不超过 N 个,防批量 FC
 # 死亡 recover / 多批 SSM fan-out 各自 fire 几百个 launch-vm 造成二次 CPU/IO 洪峰压垮 host。
 # 所有起 VM 的路径(dispatch fan-out / host-agent recover/force-relaunch / ssm wake)都走本脚本,
 # 故在此单一咽喉口装一把跨进程信号量:N 把槽锁 fd10-fd(9+N),抢到任一把才继续,抢不到就阻塞等
@@ -442,11 +424,9 @@ VCPU="${3:-2}"
 MEM_MB="${4:-4096}"
 CONFIG_TEMPLATE="${5:-}"
 RESTORE_KEY="${6:-}"
-# 1.4.0 (#62) — comma-separated allow-list of skill names. Empty / "*"
 # preserves the legacy v1.3.x broadcast behavior so old SSM commands
 # without this 7th arg keep working unchanged.
 SCOPED_SKILLS="${7:-}"
-# task #15 — per-tenant LiteLLM vkey (8th arg). API Lambda mints it at
 # create_tenant and passes it here; we inject it into openclaw.json's
 # litellm.apiKey so this tenant's spend/budget bills to its own key. Empty
 # preserves the shared image key (backward compatible with old SSM commands).
@@ -470,11 +450,9 @@ INJECTED_CHANNEL_SECRET="${9:-}"
 # stay regardless: per-tenant gateway.auth.token + CloudFront/nginx reverse proxy +
 # Bedrock Guardrail + LiteLLM vkey limit. Empty (legacy SSM commands) → off.
 CHAT_EP_ENABLED="${10:-}"
-# #187 P5 — 11th arg 保留空占位(转型前是 INJECTED_COGNITO_B64 WI-002 端到端
 # Cognito 渠道机器用户 base64)。channel/hub 数据面已下线,数据面走两级路由直连
 # microVM:18789 gateway。参数位保留以维持 12 位对齐,取值不再使用。
 INJECTED_COGNITO_B64="${11:-}"
-# #187 P1 (SPEC/11-ENGINE-TRANSFORM D+B): 12th positional arg — base64 KMS
 # ciphertext of the pre-minted gateway token (tenant_id EncryptionContext, ClawPool
 # CMK). Empty (legacy SSM commands / feature off) → keep the openssl-generated
 # in-VM token. Non-empty → we `aws kms decrypt` here on the host (has kms:Decrypt
@@ -484,21 +462,22 @@ INJECTED_COGNITO_B64="${11:-}"
 # is enforced control-side (openclaw-tenant-secrets TTL 15min); this side is just
 # the injection step.
 INJECTED_GATEWAY_TOKEN_CT="${12:-}"
-# #188 — 13th positional arg — base64 of the paired.json entry (one Ed25519
 # device: deviceId + publicKey + roles + scopes, tokens:{} for 2026.2.26). The
 # control plane mints the device at create_tenant, base64-encodes the paired.json
 # object, and passes it here. We base64-decode it and write it to the data disk's
 # <stateDir>/devices/paired.json so a remote WSS client (JDWS) preloaded with the
 # matching device identity connects to the in-VM gateway with NO manual approve.
 # Empty (legacy SSM commands / feature off / owner unknown / CMK off) → skip the
-# write (byte-identical pre-#188 behavior; no paired.json = default pairing gate).
 INJECTED_DEVICE_PAIRED_B64="${13:-}"
-# #412 — DDB assignment generation token. Only pull/from-ddb paths provide it.
 # Before touching disks or Firecracker, the status gate below verifies that the
 # tenant still owns this exact reservation, host and vm_num. A stale assignment
 # whose reservation was rolled back therefore exits 45 instead of launching an
 # unaccounted VM.
 EXPECTED_RESERVATION_ID="${14:-}"
+# commit point and passes it here on retries. This prevents a live-slot advance
+# between drop and launch from silently changing the operation's target.
+# `__legacy_flat__` explicitly pins the pre-slots flat layout.
+REBUILD_IMAGE_SNAPSHOT="${15:-}"
 # Caller may pass literal "" (quoted) as placeholder when only restore_key is set.
 [ "${CONFIG_TEMPLATE}" = '""' ] && CONFIG_TEMPLATE=""
 [ "${RESTORE_KEY}" = '""' ] && RESTORE_KEY=""
@@ -510,9 +489,9 @@ EXPECTED_RESERVATION_ID="${14:-}"
 [ "${INJECTED_GATEWAY_TOKEN_CT}" = '""' ] && INJECTED_GATEWAY_TOKEN_CT=""
 [ "${INJECTED_DEVICE_PAIRED_B64}" = '""' ] && INJECTED_DEVICE_PAIRED_B64=""
 [ "${EXPECTED_RESERVATION_ID}" = '""' ] && EXPECTED_RESERVATION_ID=""
+[ "${REBUILD_IMAGE_SNAPSHOT}" = '""' ] && REBUILD_IMAGE_SNAPSHOT=""
 VM_DIR="/data/firecracker-vms/${TENANT_ID}"
 [ -f /etc/platform.env ] && source /etc/platform.env
-# #411/6.3 fix(控制面一致性级):launch 前强一致复查租户 status,拒起已删/删除中的租户。
 # 现实触发源(新加坡真机 5 轮坐实):dispatch 已认领 host(host_id 已写)但 VM 未 launch
 # 的窗口内 DELETE → tenant_service 把 status 改 deleting、_backfill_placement 的
 # ConditionExpression(#s=:creating)写 CCF 被跳过(赢家已推进,跳过本身是对的),但
@@ -570,7 +549,6 @@ fi
 unset _OC_TS_RAW
 case "${_OC_TSTATUS}" in
   creating|running|stopped|paused|stopping|starting|restarting|rebuilding|migrating|restoring)
-    # #422 — restoring 是休眠恢复的在途可起态(语义同 creating:控制面已 CAS 到 restoring
     # 并发起冷恢复 launch,此处正是要起 VM)。不加它会被下方 *) 分支 exit 45 DEFER 拒起 →
     # restore 永远起不来。它非终态(恢复失败控制面回滚 suspended),放行安全。
     :  # 明确可起态(白名单)→ 放行:把 EXIT trap 装回,后续建盘/起 FC 失败仍被兜底清理。
@@ -591,7 +569,6 @@ case "${_OC_TSTATUS}" in
     ;;
 esac
 unset _OC_TSTATUS
-# #199 fix(数据丢失级):pull 模式 dispatch(host-agent _execute_launch)把位置参数
 # 5/6 留空,让 launch-vm 自己从 DDB 读——但历史上只读了 injected_credentials,漏了
 # restore_backup_key/config_template。结果 restore-create 走队列时 RESTORE_KEY 为空,
 # 下面建盘分支静默用空白模板盘冒充恢复(备份数据丢失)。这里在建盘前补读:仅当位置参数
@@ -612,11 +589,9 @@ if [ -z "${RESTORE_KEY}" ] || [ -z "${CONFIG_TEMPLATE}" ]; then
     exit 1
   fi
 fi
-# #290 fix(token 漂移级):host-agent _recover_vm / _force_relaunch_vm 只传 4 位置参数,
 # 位置 12/13(gateway_token_ct / device_paired_b64)为空。若此时 NEW_DATA=true(首次
 # 建盘或数据盘被清),token 注入段会走 openssl rand 回退,产出的 token 跟 DDB 里控制
 # 面 mint 的不一致 → JDWS 拿到 DDB 的 A,VM 实际是 B → 连不上。
-# 修法同 #199 模式:位置参数空时从 tenant_secrets 表回退读取。fail-CLOSED:读失败即
 # 中止(throttle/IAM/network),绝不用随机 token 覆盖已 mint 的 token。
 if [ -z "${INJECTED_GATEWAY_TOKEN_CT}" ] || [ -z "${INJECTED_DEVICE_PAIRED_B64}" ]; then
   _SECRETS_TABLE="${TENANT_SECRETS_TABLE:-openclaw-tenant-secrets}"
@@ -630,7 +605,6 @@ if [ -z "${INJECTED_GATEWAY_TOKEN_CT}" ] || [ -z "${INJECTED_DEVICE_PAIRED_B64}"
     [ -z "${INJECTED_GATEWAY_TOKEN_CT}" ] && INJECTED_GATEWAY_TOKEN_CT="$(printf '%s' "${_SEC_RAW}" | jq -r '.Item.gateway_token_ct.S // ""' 2>/dev/null || true)"
     [ -z "${INJECTED_DEVICE_PAIRED_B64}" ] && INJECTED_DEVICE_PAIRED_B64="$(printf '%s' "${_SEC_RAW}" | jq -r '.Item.device_paired_b64.S // ""' 2>/dev/null || true)"
     # 不能用 log():它定义在本块之后(GUEST_MAC 段),set -e 下此处调用 rc=127
-    # 直接退出——恰在 fallback 读到 token 的成功路径上崩,#290 修复被自己废掉。
     # 与本块 else 分支同款,直接 echo。
     [ -n "${INJECTED_GATEWAY_TOKEN_CT}" ] && echo "[oc:launch] DDB fallback: got gateway_token_ct from ${_SECRETS_TABLE} (#290)"
     [ -n "${INJECTED_DEVICE_PAIRED_B64}" ] && echo "[oc:launch] DDB fallback: got device_paired_b64 from ${_SECRETS_TABLE} (#290)"
@@ -640,12 +614,9 @@ if [ -z "${INJECTED_GATEWAY_TOKEN_CT}" ] || [ -z "${INJECTED_DEVICE_PAIRED_B64}"
   fi
   unset _SEC_RAW _SECRETS_TABLE
 fi
-# #312 — device_paired_b64 二级回落到 tenants 表(长期,无 TTL)。存量租户(改动前建的)
-# 或 create 时持久化失败的租户,tenant_secrets 里可能没有 device_paired_b64,上面 #290
 # 一级回落(查 tenant_secrets)拿到空 → paired.json 无源重注入 → 网关读空盘配对 → 前端
 # NOT_PAIRED(真机复现)。paired.json 是公开信息(deviceId+publicKey+roles+scopes,无私钥),
 # create 时已长期存 tenants.device_paired_b64(无 TTL),这里作长期兜底。gateway_token 不做
-# 此回落:它是机密,只从 tenant_secrets 读(#353 起该表也无 TTL 长存,回读不会落空)。
 # fail-open:tenants 读失败不中止(paired 缺失只是回退到人工 approve,非 fail-closed 安全事件)。
 _PAIRED_FROM_TENANTS=0
 if [ -z "${INJECTED_DEVICE_PAIRED_B64}" ]; then
@@ -662,8 +633,6 @@ if [ -z "${INJECTED_DEVICE_PAIRED_B64}" ]; then
   fi
   unset _TEN_RAW _TENANTS_TABLE
 fi
-# #314(codex review 缺陷2 修复:存量租户 backfill)——若 device_paired_b64 来自位置参
-# (12/13,首建 dispatch)或 tenant_secrets 一级回落(#290),而【不是】从 tenants 表读来的,
 # 说明 tenants 表可能还没这条(存量租户:改动前建的;或 create 时持久化失败被兜底)。
 # 回写 tenants 表(无 TTL),让该租户下次 restart data 盘丢了也有长期源可重建。host_role
 # 有 tenants 表读写权(compute.py:57)。幂等 update 单字段;写失败 fail-open(不阻塞 launch)。
@@ -678,7 +647,6 @@ if [ -n "${INJECTED_DEVICE_PAIRED_B64}" ] && [ "${_PAIRED_FROM_TENANTS}" != "1" 
     || echo "[oc:launch] WARN(#314): backfill device_paired_b64 to tenants failed (non-fatal)"
 fi
 unset _PAIRED_FROM_TENANTS
-# #41 — harden-config.sh 提供 POSIX sh 幂等 openclaw.json 收敛函数
 # (oc_harden_config + oc_normalize_litellm_baseurl)。launch-vm.sh 每次启动都调
 # oc_harden_config,不管 fresh/wake,收敛部署相关值(CloudFront origin/LiteLLM
 # baseUrl/chatCompletions 三态/apiKey 显式非空)。缺文件 = 部署漂移 → fail-loud。
@@ -738,7 +706,6 @@ rm -f ${VM_DIR}/vsock.sock
 log "preparing disks..."
 T0=$SECONDS
 # ─────────────────────────────────────────────────────────────────────────
-# #394 —— 按 VM 选镜像版本(ADR §4.1/§4.3)。一次启动【只解析一个】版本目录,之后
 # 三块盘全部从这一个目录取,绝不混版。
 #
 # 解析顺序:
@@ -757,9 +724,18 @@ _FC_ASSETS="/data/firecracker-assets"
 _SLOTS_FILE="${_FC_ASSETS}/slots.json"
 IMAGE_SNAPSHOT_TIME=""   # 本次启动实际使用的版本(空=走扁平回落);写进 vm.json 供审计
 
+# destructive commit point. It has priority over a later DDB/live-pointer read.
+if [ -n "${REBUILD_IMAGE_SNAPSHOT}" ]; then
+  if [ "${REBUILD_IMAGE_SNAPSHOT}" = "__legacy_flat__" ]; then
+    IMAGE_SNAPSHOT_TIME=""
+  else
+    IMAGE_SNAPSHOT_TIME="${REBUILD_IMAGE_SNAPSHOT}"
+  fi
+fi
+
 # (1) 租户固定版本:位置参不传,统一从 DDB 读(与 :491-505 读 restore_backup_key 同款
 # fail-CLOSED 模式 —— get-item 调用失败即中止,绝不在读不到版本时盲目起 live)。
-if _IMG_RAW="$(aws dynamodb get-item \
+if [ -z "${REBUILD_IMAGE_SNAPSHOT}" ] && _IMG_RAW="$(aws dynamodb get-item \
   --table-name "${TENANTS_TABLE:-openclaw-tenants}" \
   --key "{\"id\":{\"S\":\"${TENANT_ID}\"}}" \
   --projection-expression 'image_snapshot_time' \
@@ -767,7 +743,7 @@ if _IMG_RAW="$(aws dynamodb get-item \
   --region "${OC_REGION:-ap-northeast-1}" \
   --output json 2>/dev/null)"; then
   IMAGE_SNAPSHOT_TIME="$(printf '%s' "${_IMG_RAW}" | jq -r '.Item.image_snapshot_time.S // ""' 2>/dev/null || true)"
-else
+elif [ -z "${REBUILD_IMAGE_SNAPSHOT}" ]; then
   log "FATAL(#394): DDB get-item for image_snapshot_time failed (throttle/IAM/network) — 拒起 fail-closed,绝不猜版本"
   exit 1
 fi
@@ -775,7 +751,7 @@ unset _IMG_RAW
 
 # (2) 没固定版本 → 读 slots.json 的 live 指针。解析失败(文件损坏)也 fail-loud:
 #     静默当空会回落到扁平盘 = 起了运维以为已经换掉的旧版本。
-if [ -z "${IMAGE_SNAPSHOT_TIME}" ] && [ -f "${_SLOTS_FILE}" ]; then
+if [ -z "${REBUILD_IMAGE_SNAPSHOT}" ] && [ -z "${IMAGE_SNAPSHOT_TIME}" ] && [ -f "${_SLOTS_FILE}" ]; then
   IMAGE_SNAPSHOT_TIME="$(jq -er '.live // ""' "${_SLOTS_FILE}" 2>/dev/null)" || {
     log "FATAL(#394): ${_SLOTS_FILE} 存在但无法解析(损坏?)— 拒起,不回落扁平盘冒充"
     exit 1
@@ -803,10 +779,12 @@ fi
 # 记录本次启动【实际使用】的版本到 vm.json(ADR §4.3 末句:每次启动记录实际 snapshot_time,
 # 供审计与迁移判断)。vm.json 在上面已写好,这里补一个字段;失败不阻断启动(纯审计信息)。
 if [ -n "${IMAGE_SNAPSHOT_TIME}" ] && command -v jq >/dev/null 2>&1; then
-  jq --arg v "${IMAGE_SNAPSHOT_TIME}" '.image_snapshot_time = $v' \
-    "${VM_DIR}/vm.json" > "${VM_DIR}/vm.json.tmp" 2>/dev/null \
-    && mv "${VM_DIR}/vm.json.tmp" "${VM_DIR}/vm.json" \
-    || rm -f "${VM_DIR}/vm.json.tmp"
+  if jq --arg v "${IMAGE_SNAPSHOT_TIME}" '.image_snapshot_time = $v' \
+    "${VM_DIR}/vm.json" > "${VM_DIR}/vm.json.tmp" 2>/dev/null; then
+    mv "${VM_DIR}/vm.json.tmp" "${VM_DIR}/vm.json"
+  else
+    rm -f "${VM_DIR}/vm.json.tmp"
+  fi
 fi
 DATA_SIZE=$(stat -c%s ${DATA_TPL})
 # Immutable authority disk (identity files + ops skills). Shared, read-only,
@@ -829,26 +807,22 @@ NEEDS_INIT=false
 if [ ! -f "${DATA_VOL}" ]; then
   NEEDS_INIT=true
 elif [ -z "${RESTORE_KEY}" ] && [ "$(stat -c%s ${DATA_VOL})" != "${DATA_SIZE}" ]; then
-  # #303 数据丢失级修复:一个**已存在**的 data.ext4 是该租户的真实数据盘
   # (identity/skills/config/channel_secret/vkey/用户数据全在里面)。升级镜像时
   # refresh_rootfs 会 mv 换新 data-template(host_service.py:377),其逻辑尺寸常
   # 与租户现有盘不同;而 rebuild/restart 的 wake 传空 RESTORE_KEY。原逻辑在此
   # 分支 NEEDS_INIT=true → 下面 `rm -f ${DATA_VOL}` 从模板重建 = **静默删光客户数据**
   # (真机复现:升级后 rebuild 数据全丢)。铁律 no-data-loss:存量盘遇模板尺寸漂移
   # **绝不重建**,保留原盘照常挂载启动(模板尺寸只是"新建时用多大",不是"存量盘必须
-  # 等于它")。真要扩盘走显式 resize-disk(#22,resize2fs 在线扩,不删数据);真要
   # 换盘走显式 RESTORE_KEY(下面恢复路径)。这里只对存量盘 fail-safe 保留 + 告警。
   log "WARN(#303): data.ext4 尺寸($(stat -c%s ${DATA_VOL}))≠ 模板(${DATA_SIZE}),但存量盘含客户数据 — 保留原盘不重建(扩盘用 resize-disk,换盘用 restore)"
 fi
 if [ "${NEEDS_INIT}" = "true" ]; then
   rm -f ${DATA_VOL}
   if [ -n "${RESTORE_KEY}" ]; then
-    # #199 fix — 备份写在 BACKUP_BUCKET(WORM+CMK 专用桶,见 backup-data.sh:16),
     # 不是 ASSETS_BUCKET。原来从 ASSETS_BUCKET 拉 → 永远下载失败 → restore 拒起。
     # 回退 ASSETS_BUCKET 兼容未配 BACKUP_BUCKET 的旧 host(与 _resolve_backup 同源)。
     _RESTORE_BUCKET="${BACKUP_BUCKET:-${ASSETS_BUCKET}}"
     log "restoring from s3://${_RESTORE_BUCKET}/${RESTORE_KEY}"
-    # #199 fail-loud(对标 restic checker:missing/truncated 绝不静默放行,
     # internal/repository/checker.go:232 用实际大小≠期望判 Truncated 报错)。
     # 现状:aws s3 cp --quiet 失败或拿到 0 字节 → pigz 出空盘 → e2fsck 在空盘上
     # 可能过 → VM 带空白盘 running = 数据丢失级。三道 fail-loud 守卫,任一不过
@@ -864,7 +838,6 @@ if [ "${NEEDS_INIT}" = "true" ]; then
       log "FATAL(#199): restore backup s3://${_RESTORE_BUCKET}/${RESTORE_KEY} 下载失败或为空 — 拒起,绝不用空白盘冒充恢复(数据丢失级)"
       exit 1
     fi
-    # #199 fix — 加密备份(.gz.enc + 同前缀 .gz.key)客户端 envelope 解密,对称
     # backup-data.sh 的加密段:KMS decrypt .gz.key 拿数据密钥 → openssl AES-256-CBC
     # 解 .gz.enc → 得明文 .gz。host restore 段原来完全没有解密逻辑(只会 pigz 明文
     # .gz),生产配了 BACKUP_CMK_KEY_ID 时备份是 .gz.enc → 直接 pigz 必失败 → 数据
@@ -946,7 +919,6 @@ log "disks ready ($((SECONDS-T0))s)"
 SHARED_SKILLS="/data/shared-skills"
 MOUNT_TMP="/tmp/data-mount-${TENANT_ID}"
 mkdir -p ${MOUNT_TMP}
-# #256 — 入口幂等预清理:上次 attempt 被强杀(SIGKILL/OOM/host 重启)在 trap 兜底跑之前
 # 就死了会泄漏这个挂载点,下次进来直接撞 "already mounted" 卡死。这里 mount 前先卸残留。
 # 用 plain umount(不用 -l 惰性):此刻已持有 per-tenant flock(见上,是本租户唯一 owner),
 # 残留必来自被 SIGKILL 的死进程(无活写者),plain umount 必成功;若 busy(有意外活写者)
@@ -954,7 +926,6 @@ mkdir -p ${MOUNT_TMP}
 # (那会让活写者继续写旧挂载 + remount 双挂同一 backing file → ext4 损坏,踩 no-data-loss)。
 mountpoint -q "${MOUNT_TMP}" && sudo umount "${MOUNT_TMP}"
 sudo mount ${DATA_VOL} ${MOUNT_TMP}
-# Skills (1.4.0 #62: optional per-tenant scope via $SCOPED_SKILLS comma-list)
 if [ -d "${SHARED_SKILLS}" ] && [ "$(ls -A ${SHARED_SKILLS} 2>/dev/null)" ]; then
   if [ -z "${SCOPED_SKILLS}" ] || [ "${SCOPED_SKILLS}" = "*" ]; then
     log "injecting all shared skills (broadcast mode)"
@@ -977,7 +948,6 @@ if [ -d "${SHARED_SKILLS}" ] && [ "$(ls -A ${SHARED_SKILLS} 2>/dev/null)" ]; the
   log "skills injected"
 fi
 # ─────────────────────────────────────────────────────────────────────────
-# #118/#116 + #149 — platform-injected credentials: read tenant record + decrypt.
 #
 # MOVED here (before the openclaw.json config block) from its old post-umount
 # position so that: (a) config-class injection (oc_inject_config_from_plan) can
@@ -990,7 +960,6 @@ fi
 # with kms:Decrypt on the ClawPool CMK(s) — decrypts each value:
 #   • kms-cmk (legacy/default): symmetric CMK + owner_id EncryptionContext
 #     (cross-tenant containment: a ciphertext minted for another tenant fails).
-#   • asymmetric-v1 (#149): RSA-4096 OAEP-SHA256 via the RSA CMK; KMS asymmetric
 #     Decrypt does NOT accept EncryptionContext (verified ValidationException),
 #     so tenant binding is the per-tenant frozen plan + envelope key_id (scheme-B).
 # env-class → dotenv on a per-VM ext4 attached READ-ONLY as /dev/vde; config-class
@@ -1023,7 +992,6 @@ else
   exit 1
 fi
 _IC_JSON="$(printf '%s' "${_IC_RAW}" | jq -c '.Item.injected_credentials.M // empty' 2>/dev/null || true)"
-# #149 Task 8.1: frozen_injection_plan 新契约(优先于旧 injected_credentials)
 _FP_JSON="$(printf '%s' "${_IC_RAW}" | jq -c '.Item.frozen_injection_plan.M // empty' 2>/dev/null || true)"
 _FP_SCHEME="$(printf '%s' "${_IC_RAW}" | jq -r '.Item.scheme.S // "kms-cmk"' 2>/dev/null || true)"
 if [ -n "${_FP_JSON}" ] && [ "${_FP_JSON}" != "null" ]; then
@@ -1099,7 +1067,6 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
   if [ "$NEW_DATA" = "true" ]; then
     # Download custom template from S3 (if specified). 幂等段跑之前先下,让
     # oc_harden_config 收敛新拉下来的模板;唤醒不重下(会冲掉用户配置)。
-    # #301 — "default" 是烤进 rootfs 的基线模板(OC_JSON 已是它),S3 无
     # templates/openclaw/default/openclaw.json。旧代码对字面 "default" 也 s3 cp →
     # 404 → set -e 在 token 注入前 die → 半盘 → 重投 token 漂移。跳过 default(与空
     # 模板同义:都用基线),只对真正的具名自定义模板拉 S3。
@@ -1114,7 +1081,6 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
     #       Cognito-verified `sub`). This is the user-message path; it does NOT
     #       touch gateway.auth.token.
     NEW_TOKEN=$(openssl rand -hex 24)
-    # #187 P1 — if the control plane pre-minted a gateway token (KMS envelope,
     # tenant_id EncryptionContext), decrypt it here on the host and use THAT as
     # NEW_TOKEN, overriding the openssl rand above. Rationale:
     #   • Control plane needs `GET /tenants/{id}/token` reveal for direct-gateway
@@ -1148,7 +1114,6 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
       unset _GW_TOKEN_PLAIN
       log "using control-plane pre-minted gateway token (reveal-capable, #187 P1)"
     fi
-    # #187 P5 — claw-channel HMAC/Cognito 注入整段随 channel/hub 数据面下线一并移除。
     # 镜像 v5 (P3) 已在 build-rootfs 阶段 del(.channels["claw-channel"]),launch-vm
     # 只需注入 gateway token(数据面走两级路由直连 microVM:18789)。
     jq --arg t "$NEW_TOKEN" \
@@ -1156,7 +1121,6 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
       "${OC_JSON}" > "${OC_JSON}.tmp" && mv "${OC_JSON}.tmp" "${OC_JSON}"
     log "gateway token injected (one-time; #187 P5: hub/Cognito channel 已下线)"
 
-    # #188 — cold-inject devices/paired.json so a remote WSS client (JDWS)
     # preloaded with the matching Ed25519 device connects to the gateway with NO
     # manual approve (INJECTION-SPEC-2026.2.26.md, protocol v3: pairing gate只看
     # roles + publicKey 匹配,tokens 可空). One-time (NEW_DATA-only): the file
@@ -1183,9 +1147,7 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
       fi
       _DEVICES_DIR="${MOUNT_TMP}/.openclaw/devices"
       mkdir -p "${_DEVICES_DIR}"
-      # #415(codex review 第7轮)——原子写:temp+mv,防中途被杀留半个损坏 paired.json
       # (配合 re-inject 的损坏 fail-closed,半文件会让后续重启永久拒起)。
-      # #415(第8轮)——owner 在 mv 前设到 temp 上,防 mv 后 chown 前被杀致永久 root:root。
       _TMP_CI="${_DEVICES_DIR}/.paired.json.tmp.$$"
       printf '%s' "${_PAIRED_JSON}" > "${_TMP_CI}"
       chmod 600 "${_TMP_CI}"
@@ -1200,7 +1162,6 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
   fi
 
   # ─────────────────────────────────────────────────────────────────────
-  # 幂等收敛(#41)—— 每次启动都跑(fresh + wake),把部署相关值收敛到当前:
   #   • dangerouslyDisableDeviceAuth 无条件 del(secure default)
   #   • allowedOrigins → 当前 CloudFront origin(SSM 拉最新)
   #   • baseUrl → 当前 LiteLLM host(堡垒机重建 IP 会变)
@@ -1212,10 +1173,8 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
   CF_ORIGIN="${CLOUDFRONT_ORIGIN:-}"
   LITELLM_BASEURL="$(oc_normalize_litellm_baseurl "${LITELLM_HOST:-}")"
 
-  # #312 — per-tenant vkey 二级回落(tenants 表,无 TTL)。gap:vkey 只在 create/push
   # 作位置参 8 传入;wake/restart(start-all-vms/自愈/fan-out)位置 8 传空 → 原逻辑落到
   # LITELLM_SHARED_VKEY → oc_harden_config 每次启动把盘上 per-tenant apiKey 覆盖成
-  # 共享 key → 每次 restart/镜像更新 per-tenant 计费拆分静默漂成 shared(task #15)。
   # 修:位置参空时,从 :767 已读的 tenants 表(_IC_RAW,投影含 litellm_vkey,无 TTL)回落。
   # 只在开了 per-tenant 计费的部署有 litellm_vkey 字段;没开则读空→行为不变(向后兼容)。
   if [ -z "${LITELLM_VKEY}" ]; then
@@ -1227,7 +1186,6 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
     unset _TEN_VKEY
   fi
 
-  # apiKey:优先 per-tenant LITELLM_VKEY 参数(SSM 传入 / #312 tenants 回落,per-tenant 计费拆分);
   # 参数为空时才 fall back 到 platform.env 的 LITELLM_SHARED_VKEY(shared)。
   # 关键 fail-safe:LITELLM_VKEY 参数空 + LITELLM_SHARED_VKEY 也空 → _APIKEY 空 →
   # oc_harden_config 不写 apiKey(不会拿 shared 覆盖数据盘上的 per-tenant vkey)。
@@ -1235,7 +1193,6 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
   # 现在只在有真 key 时改写,数据盘上首铸的 per-tenant vkey 会被幂等段保留。
   _APIKEY="${LITELLM_VKEY:-${LITELLM_SHARED_VKEY:-}}"
 
-  # #80 · host 侧自愈:init-host 只在首启从 SSM 读一次 vkey,读空就永远空
   # (setup.sh 铸 vkey 晚于 host 首启就撞这个)。这里加单次「vkey 为空→补读 SSM」的
   # 自愈,把「铸 vkey 晚于 host 首启」的时序窗口封了。有值直接用,零延迟。
   # 关键:只补 shared vkey(未提供 per-tenant LITELLM_VKEY 时才走到这里);
@@ -1294,14 +1251,11 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
   sudo chown 1000:1000 "${OC_JSON}"
 
   # ─────────────────────────────────────────────────────────────────────
-  # #312 幂等重注入 device 配对 + pre-minted gateway token —— 每次启动都跑
-  # (fresh + wake/restart/recovery),与上面 #41 apiKey/origin 幂等收敛同源思路。
   # 根因(新加坡真机 + openclaw 源码双证):镜像更新 → 在跑 FC 掉线 → 平台自愈
   # restart(fleet-power → start-all-vms.sh → launch-vm 只传 4 参 + 复用 data 盘
   # NEW_DATA=false)→ 上面 NEW_DATA-only 冷注入块整体跳过 → 若那次盘上 paired.json
   # 恰空(新盘/被清)→ gateway 读到空(message-handler.ts:786 getPairedDevice→
   # isPaired=false)→ 前端 NOT_PAIRED。修:每次都把控制面权威的 device_paired_b64
-  # + pre-minted token(脚本头 #290 DDB fallback 已从 openclaw-tenant-secrets 补齐,
   # 4 参调用也拿得到)幂等写回 data 盘,网关(重)启动永远读到 approved backend 条目。
   # 仅在 INJECTED_* 非空时写(老租户/无 pre-minted → 空 → 不动,保留盘上现值,零漂移;
   # gateway token 的 openssl rand 首铸仍只在 NEW_DATA 块,这里绝不用随机值覆盖)。
@@ -1348,16 +1302,10 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
     fi
     _DEVICES_DIR_RI="${MOUNT_TMP}/.openclaw/devices"
     mkdir -p "${_DEVICES_DIR_RI}"
-    # #314(codex review 缺陷1 修复):按 deviceId **merge**,不整体覆盖。
     # 盘上 paired.json 可能含网关运行时 approve 的【其它设备】+ 每设备运行时字段
     # (tokens/lastSeen*)。整体覆盖会删掉它们(丢运行时授权状态)。
-    # #415(codex review 缺陷:token 回退)——控制面自 7.1 起在 tokens.operator 预铸活
-    # token(不再是 #314 时的 tokens:{} 空对象)。若仍用朴素 `盘上 * 控制面`,jq 的 `*`
     # 深合并会让【控制面的非空 tokens 覆盖盘上 tokens】——盘上 openclaw 运行时若已轮换
     # operator token,重启 re-inject 就会被预铸值压回,使新 token 失效、旧 token 复活。
-    # #415(codex review 缺陷:撤销失效)——更严的一层:管理员 `openclaw devices remove`
-    # 后盘上是【有效文件但缺该 device】。#314 时代控制面下发 tokens:{},重加回来的 device
-    # 因 effective roles 为空在 7.1 上仍连不上(remove 事实生效);但 #415 起下发非空预铸
     # token,重加回来就带活 token → 撤销被复活(安全回归)。故 re-inject 必须区分:
     #   • 盘上 paired.json 文件【存在且是合法 JSON object,含空 {}】(_DISK_VALID=true):
     #     这是 gateway 维护的【权威已批准名单】。只更新盘上【已存在】的 device
@@ -1405,10 +1353,8 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
     fi
     # 幂等:merge 结果与盘上一致则不写(避免无谓写盘 + mtime 抖动)。
     if [ "${_CUR_PAIRED}" != "${_MERGED_RI}" ]; then
-      # #415(codex review 第7轮)——原子写:先写同目录临时文件再 mv(rename 原子)。
       # 否则 `printf > paired.json` 中途被杀会留半个损坏文件,配合上面的损坏 fail-closed
       # 会让后续每次重试都 exit 1、租户永久起不来。temp+mv 保证盘上要么旧内容、要么完整新内容。
-      # #415(codex review 第8轮)——owner 必须在 mv **之前**就设到 temp 文件上:否则
       # mv(root:root)后、chown 前被杀 → 下次重试因内容相同(幂等)跳过写入+chown →
       # paired.json 永久 root:root,uid 1000 读不了 → gateway 永久起不来。故先 chown temp。
       _TMP_RI="${_DEVICES_DIR_RI}/.paired.json.tmp.$$"
@@ -1464,7 +1410,6 @@ sudo umount ${MOUNT_TMP}
 rmdir ${MOUNT_TMP} 2>/dev/null || true
 
 # ─────────────────────────────────────────────────────────────────────────
-# #118/#116 + #149 — build the per-VM READ-ONLY credentials disk from the dotenv
 # decrypted above (env-class only). Unified for both the new frozen-plan contract
 # and the legacy injected_credentials path: whichever set _CREDS_ENV (a non-empty
 # temp dotenv) gets a creds.ext4. Empty _CREDS_ENV (no env creds / no injection)
@@ -1480,7 +1425,6 @@ if [ -n "${_CREDS_ENV:-}" ] && [ -s "${_CREDS_ENV}" ]; then
   mkfs.ext4 -q -L clawcreds "${CREDS_VOL}"
   _CREDS_MNT="/tmp/creds-mount-${TENANT_ID}"
   mkdir -p "${_CREDS_MNT}"
-  # #256 — 同 data 盘:入口幂等预清理上次强杀泄漏的挂载点。持锁后残留必是死进程,
   # plain umount(不用 -l)必成;busy 则 fail-loud 中止,绝不 lazy-detach 致双挂损坏。
   mountpoint -q "${_CREDS_MNT}" && sudo umount "${_CREDS_MNT}"
   sudo mount "${CREDS_VOL}" "${_CREDS_MNT}"
@@ -1518,7 +1462,6 @@ _tuntap_add_with_retry() {
 _tuntap_add_with_retry
 sudo ip addr add ${HOST_TAP_IP}/30 dev ${TAP}
 sudo ip link set dev ${TAP} up
-# ── SECURITY (#34: IMDSv6 拦截,per-tap disable_ipv6=1)──
 # 老版本注释声称 IPv6 IMDS(fd00:ec2::254)"defensively covered",但仅有下面的
 # IPv4 iptables DROP,ip6tables 全仓零命中,注释名实不符。真堵法:tap 上关掉
 # IPv6 协议栈,fd00:ec2::254 与 fe80 一并消失,不依赖 ip6tables 存在。
@@ -1564,7 +1507,6 @@ sudo iptables -C FORWARD -i ${TAP} -d ${TENANT_SUPERNET} -j DROP 2>/dev/null || 
 # (traffic to the host itself hits INPUT, not FORWARD). host-agent SSHes INTO
 # the guest (host→guest, a NEW outbound conn from the host), so blocking
 # guest→host:22 here does not affect host-agent's reverse management.
-# 9100 (#387 防御性): the platform does NOT install node_exporter, but the
 # Runbook guides users to self-install it on hosts at the standard :9100 —
 # pre-dropping guest→host:9100 protects users who install the exporter but
 # forget the isolation step. Keep this list in sync with migrate-vm.sh.
@@ -1582,7 +1524,6 @@ sudo iptables -t nat -C POSTROUTING -o ${HOST_IFACE} -j MASQUERADE 2>/dev/null |
   sudo iptables -t nat -A POSTROUTING -o ${HOST_IFACE} -j MASQUERADE
 sudo iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
   sudo iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-# ── SECURITY (#39: 出网默认拒绝白名单)──
 # EGRESS_ALLOWLIST_ENABLED 从 /etc/platform.env(:54 source)取,由 config
 # security.egress_allowlist_enabled 经 stack.py 渲染而来。默认 false → 保持历史
 # 行为:无条件放行 guest→公网口(现状零变化)。true → 切默认拒绝:只放行 ①VPC CIDR +
@@ -1641,7 +1582,6 @@ fi
 
 # Start Firecracker
 log "starting firecracker..."
-# #331/#327 — close both launcher-owned locks in the long-lived Firecracker
 # child. fd8 is the host launch slot; fd9 is the per-tenant lifecycle lock
 # shared with stop-vm.sh. The launcher parent keeps both until InstanceStart,
 # but Firecracker must not retain either for the VM lifetime.
@@ -1686,7 +1626,6 @@ else
   log "WARN: ${IMMUTABLE_TPL} absent — launching WITHOUT immutable authority disk"
 fi
 
-# Fifth drive — the per-VM READ-ONLY credentials disk (#118/#116). PUT after
 # immutable so the guest sees it as /dev/vde. is_read_only:true = hardware write
 # barrier (even guest root gets EROFS). Only attached when this tenant had
 # injected_credentials (CREDS_VOL set above); otherwise skipped so tenants
@@ -1777,7 +1716,6 @@ RESULT=$(curl -s --unix-socket ${SOCK} -X PUT http://localhost/actions \
   -H 'Content-Type: application/json' -d '{"action_type":"InstanceStart"}')
 [ -n "${RESULT}" ] && log "ERROR: ${RESULT}" && exit 1
 log "InstanceStart succeeded — VM is now booting"
-# #331/#327 — 冷启动重活(mkfs/cp/解压/firecracker boot)到此结束,VM 已自持运行 →
 # 立刻释放 host 级启动槽,让排队的下一个 launch 进来。之后的 nginx/ssh 收尾不占启动并发额度。
 _oc_release_launch_slot
 # 1.3.2: Past this point the VM is genuinely running. Any later step

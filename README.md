@@ -461,8 +461,9 @@ cp templates/openclaw.json.example templates/openclaw.json        # provider/mod
 #       • provisions VPC, ASG, ALB, Lambda, DynamoDB, CloudFront, Cognito, KMS, WAF
 #       • CodeBuild bakes the golden image IN-STACK and the ASG waits for it, so
 #         the first host boots with the image already in S3 (no chicken-and-egg)
-#       • stands up a LiteLLM gateway automatically (or set ai_gateway.url in
-#         config.yml to reuse an existing one)
+#       • LiteLLM gateway is NOT deployed by default (#480): set
+#         ai_gateway.url to reuse an existing gateway, or
+#         ai_gateway.managed_by_stack: true to have CDK stand one up
 ./setup.sh us-west-2 your-aws-profile
 
 # 3️⃣ Create your first tenant

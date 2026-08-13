@@ -133,6 +133,14 @@ fi
 EXISTING_POOL=$(aws cloudformation describe-stacks --stack-name OpenClawOrchestrator \
   --query 'Stacks[0].Outputs[?OutputKey==`CognitoUserPoolId`].OutputValue' \
   --output text "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" 2>/dev/null || true)
+EXISTING_DOMAIN=$(aws cloudformation describe-stacks --stack-name OpenClawOrchestrator \
+  --query 'Stacks[0].Outputs[?OutputKey==`CognitoDomain`].OutputValue' \
+  --output text "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" 2>/dev/null || true)
+if [[ "${EXISTING_DOMAIN:-}" == openclaw-console-* ]]; then
+  # #479:带账号后缀的是本栈自建域,不能误走 1.1.x 升级路径。
+  echo "✓ config.yml: skipped self-managed Cognito pool import (${EXISTING_DOMAIN})"
+  EXISTING_POOL=""
+fi
 if [ -n "${EXISTING_POOL:-}" ] && [ "$EXISTING_POOL" != "None" ]; then
   POOL="$EXISTING_POOL" python3 - <<'PYEOF'
 import os, re, pathlib
@@ -458,6 +466,9 @@ aws s3 cp "$SCRIPT_DIR/deploy/userdata/lib/cred-inject.sh" "s3://${BUCKET}/deplo
   "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/stop-vm.sh" "s3://${BUCKET}/deployment/scripts/stop-vm.sh" \
   "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
+# launch + runtime FD evidence. Referenced by the rebuild control path.
+aws s3 cp "$SCRIPT_DIR/deploy/userdata/rebuild-vm.sh" "s3://${BUCKET}/deployment/scripts/rebuild-vm.sh" \
+  "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/clone-data.sh" "s3://${BUCKET}/deployment/scripts/clone-data.sh" \
   "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 # missing file (exit 127) and live migration silently failed end-to-end.
@@ -481,7 +492,7 @@ aws s3 cp "$SCRIPT_DIR/deploy/userdata/stop-all-vms.sh" "s3://${BUCKET}/deployme
 #    保留逐个 cp(每条带 why),这里独立维护一份「host init 必需脚本」清单,传完直接查桶——
 #    缺任一个立即停,别把「某脚本静默没传」的软 bug 拖成「host 永远起不来」的硬 bug。
 #    也兜住上面 `|| true` 吞错、SSM 后台跑到一半被砍这类 set -e 抓不到的漏传。
-_REQUIRED_SCRIPTS="host-agent.py route_ops.py oc-guest-log-reader.py launch-vm.sh stop-vm.sh backup-data.sh clone-data.sh migrate-vm.sh resize-disk.sh start-all-vms.sh stop-all-vms.sh setup-egress-allowlist.sh adot-config.yaml lib/harden-config.sh lib/cred-inject.sh"
+_REQUIRED_SCRIPTS="host-agent.py route_ops.py oc-guest-log-reader.py launch-vm.sh stop-vm.sh rebuild-vm.sh backup-data.sh clone-data.sh migrate-vm.sh resize-disk.sh start-all-vms.sh stop-all-vms.sh setup-egress-allowlist.sh adot-config.yaml lib/harden-config.sh lib/cred-inject.sh"
 _UPLOADED=$(aws s3 ls "s3://${BUCKET}/deployment/scripts/" --recursive \
   "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" 2>/dev/null | awk '{print $NF}')
 _MISSING=""
@@ -529,7 +540,27 @@ aws s3 sync "$SCRIPT_DIR/deploy/monitoring/" "s3://${BUCKET}/deployment/monitori
 # 回滚更脆。这里等 LiteLLM /health/liveliness healthy 后 POST /key/generate → put SSM。
 # 幂等:SSM 已有值就跳过(轮换用 SKIP_MINT_SHARED_VKEY=1 手动 aws ssm put + LiteLLM /key/delete 老 key)。
 # 存量部署接过来时首次运行会自动铸,不需要人工先跑 curl。
-if [ "${SKIP_MINT_SHARED_VKEY:-0}" = "1" ]; then
+#
+# #480 — 没有配置任何 LiteLLM 网关时跳过铸造。判据必须与 CDK build_litellm 一致:
+# ai_gateway.url 空【且】managed_by_stack 非 true = 本栈不托管网关,SSM /openclaw/litellm-host
+# 不存在,mint-shared-vkey.sh 会去连一个不存在的网关,默认卡到 600s 超时后报错。
+# (url 填了 = 外部网关可达;managed_by_stack=true = CDK 起了网关 → 两种情况都仍要铸。)
+_OC_AIGW_DEPLOYED=$(python3 - <<'PY' 2>/dev/null || echo unknown
+import pathlib, yaml
+try:
+    c = yaml.safe_load(pathlib.Path("config.yml").read_text()) or {}
+    g = c.get("ai_gateway", {}) or {}
+    url = (g.get("url") or "").strip()
+    managed = bool(g.get("managed_by_stack", False))
+    print("yes" if (url or managed) else "no")
+except Exception:
+    print("unknown")
+PY
+)
+if [ "$_OC_AIGW_DEPLOYED" = "no" ]; then
+  echo "→ 跳过 shared vkey 铸造(#480:ai_gateway 未配置网关 —— url 空且 managed_by_stack=false)。"
+  echo "  数据面 chat 需要网关时,填 ai_gateway.url 复用外部网关,或设 managed_by_stack=true 让 CDK 自建,再重跑 setup.sh。"
+elif [ "${SKIP_MINT_SHARED_VKEY:-0}" = "1" ]; then
   echo "→ 跳过 shared vkey 铸造(SKIP_MINT_SHARED_VKEY=1)"
 else
   echo "→ 铸/校验 LiteLLM shared vkey → SSM /openclaw/litellm-shared-vkey ..."

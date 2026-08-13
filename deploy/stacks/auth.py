@@ -553,9 +553,26 @@ def build_auth(self, ctx):
         ctx.console_bff_fn = console_bff_fn
         ctx.console_bff_sg = _bff_sg
         ctx.console_bff_in_vpc = _bff_in_vpc
+        # "ConsoleBffAlbTG"。
+        #
+        # DashboardALB 的 BffHTTPS listener 挪到新建的 ConsoleBffALB。逻辑 id 不变 =
+        # CFN 视为【同一个物理 tg 换挂载点】,而 AWS 明确禁止一个 target group 同时关联
+        # 两个 load balancer。CFN 的依赖图里「建新规则」与「删旧 listener」之间没有依赖,
+        # 于是并行执行、新规则先跑,必然报:
+        #   The following target groups cannot be associated with more than one load
+        #   balancer: targetgroup/OpenCl-Conso-QEHYNXVBBR8U
+        # 真机事件时序坐实这是【确定性失败而非竞态】:13:16:08 新 listener CREATE_COMPLETE
+        # → 13:16:09 新规则 CREATE_IN_PROGRESS → 13:16:10 CREATE_FAILED,而旧
+        # DashboardALBBffHTTPS 全程没有任何 DELETE 事件(CFN 压根没打算先删它)。
+        # 每次部署都会在同一点失败,重试无用。
+        #
+        # 拿不到它的构造引用可依赖;且「等删除完成再创建」在 CFN 里并不总被保证。
+        # 换新逻辑 id 让两边各有自己的 tg —— 旧 tg 随旧 listener 一起被删,新 tg 与新
+        # listener 一起建,两条链互不干涉,顺序问题从根上消失。
+        # 代价:一次部署内 tg 会被替换(Lambda 目标类型,无预热/连接排空语义,替换无损)。
         console_bff_tg = elbv2.ApplicationTargetGroup(
             self,
-            "ConsoleBffTG",
+            "ConsoleBffAlbTG",
             target_type=elbv2.TargetType.LAMBDA,
             targets=[elbv2_targets.LambdaTarget(console_bff_fn)],
         )

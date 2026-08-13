@@ -616,6 +616,7 @@ def build_lambdas(self, ctx):
         groups_table.grant_read_write_data(lifecycle_consumer)
         audit_table.grant_read_write_data(lifecycle_consumer)
         batch_jobs_table.grant_read_write_data(lifecycle_consumer)
+        image_jobs_table.grant_read_write_data(lifecycle_consumer)
         # Same grants as api_fn (secrets table r/w + CMK encrypt + GenerateRandom).
         # **No kms:Decrypt** — API side never decrypts (INTERFACE-CONTRACT §5,
         # ciphertext is folded into GET responses verbatim; caller decrypts).

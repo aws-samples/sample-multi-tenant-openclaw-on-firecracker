@@ -185,6 +185,19 @@ def _notify_result(cb, status, rc):
         print(f"SSM on_result callback error: {e}")
 
 
+def _notify_output(cb, result):
+    """Expose terminal stdout/stderr without changing the bool return contract."""
+    if cb is None:
+        return
+    try:
+        cb(
+            result.get("StandardOutputContent", ""),
+            result.get("StandardErrorContent", ""),
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"SSM on_output callback error: {e}")
+
+
 def _ssm_run(
     instance_id,
     command,
@@ -192,6 +205,7 @@ def _ssm_run(
     want_rc=False,
     on_command_id=None,
     on_result=None,
+    on_output=None,
 ):
     """Execute command on host via SSM Run Command. Returns True on success.
 
@@ -224,7 +238,11 @@ def _ssm_run(
     per-tenant flock, I skipped — retry later", which is a BENIGN outcome, not a
     failure: reporting it as a confirmed failure tells the customer a retry is safe,
     and a repeated rebuild drops the per-VM overlay again. Callback errors are
-    swallowed for the same reason as above."""
+    swallowed for the same reason as above.
+
+    on_output: optional callable invoked with (stdout, stderr) for a terminal
+    invocation. #413 uses it to validate the host's op-specific rebuild evidence;
+    the normal bool return cannot carry that proof."""
     try:
         # SSM runs as root; set HOME so ~ resolves to /home/ubuntu
         wrapped = f"export HOME=/home/ubuntu && cd /home/ubuntu && {command}"
@@ -249,6 +267,7 @@ def _ssm_run(
                 )
                 status = result["Status"]
                 if status == "Success":
+                    _notify_output(on_output, result)
                     _notify_result(on_result, status, result.get("ResponseCode", 0))
                     return (True, result.get("ResponseCode", 0)) if want_rc else True
                 if status in ("Failed", "TimedOut", "Cancelled"):
@@ -257,6 +276,7 @@ def _ssm_run(
                         f"SSM failed: {status} (rc={rc}) - "
                         f"{result.get('StandardErrorContent', '')}"
                     )
+                    _notify_output(on_output, result)
                     _notify_result(on_result, status, rc)
                     return (False, rc) if want_rc else False
             except ssm.exceptions.InvocationDoesNotExist:

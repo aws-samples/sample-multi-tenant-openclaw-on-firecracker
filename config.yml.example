@@ -1,6 +1,25 @@
 # 部署配置 - 示例
 # 复制为 config.yml 后按需修改
 
+# ========== 部署机前置条件 ==========
+# 必须有可用 docker:API Lambda 资产走容器打包;docker 不可用时 cdk synth 会报
+# Failed to bundle asset ... docker exited with status 1。
+# PATH 里的 python3 必须 >= 3.12:cdk.json 直接执行 python3 deploy/app.py。
+# AL2023 默认 python3 是 3.9;即使另装了 python3.12,也要把 3.12 venv 放到 PATH 最前。
+
+# ========== ⚠️ 代码不读的键(从旧配置迁移时逐项删除)==========
+# | 死键 | 正确做法 |
+# | --- | --- |
+# | redis.instance_type | 改用 redis.node_type;代码只读 node_type |
+# | edge.data_volume_gb | edge 段没有磁盘键,使用 AMI 默认根盘 |
+# | alb.certificate_arn | 控制台 HTTPS 用 console_auth.bff_certificate_arn;数据面 TLS 开 CloudFront |
+# | console_auth.bff_in_vpc | BFF 是否入 VPC 由 imported 模式自动派生 |
+# | asg.scale_in_enabled | 无替代配置键;当前配置层没有自动缩容开关 |
+# | scaler.idle_reclaim_enabled | 同为死键,不要拿它替代 asg.scale_in_enabled |
+# | edge.migration_drain_seconds | 当前代码不读,不要写入配置 |
+# 自动缩容当前在 deploy/lambda/scaler/handler.py 以 IDLE_RECLAIM_ENABLED=False
+# 硬禁且不读 env;上述两个缩容键都不会生效。
+
 # ========== 宿主机 (EC2) ==========
 host:
   # 切换 arch 后必须用 ./build-rootfs.sh --arch <arch> 重建 rootfs.
@@ -152,11 +171,14 @@ s3:
 
 # ========== Auto Scaling ==========
 asg:
+  # 首次部署必须先设 0:镜像烤制是非阻塞独立栈;若 min>=1,host 会抢在镜像就绪前
+  # 启动并因拉不到镜像触发 lifecycle hook ABANDON,ASG 随后反复换机。
   min_capacity: 2
   max_capacity: 8
   # init-host 必须在此超时内完成(注册 DDB 后 CONTINUE),否则 ABANDON→ASG 替换。
   # r8g.metal-24xl 物理机:Nitro 硬件初始化慢 + 下载 842MB 黄金镜像(rootfs+data)+
   # 解压挂盘 + 注册,600s 偏紧会反复 Heartbeat Timeout 替换。设 1200s(20min)留足余量。
+  # imported VPC + metal 场景真机 1200s 不够,应设 3600s。
   lifecycle_hook_timeout: 1200
   use_spot: false
 
@@ -217,11 +239,12 @@ redis:
   # 数据面 route.lua / host-agent redis-py 无需改。切引擎对存量路由集群是
   engine: "valkey"
   subnet_ids: []             # #272 — 可选,显式指定路由表 Redis/Valkey 子网 id;空=私有子网自动选(≥2 跨 AZ)。
-  node_type: "cache.r7g.large"
+  node_type: "cache.r7g.large"  # 代码只读这个键,不要写 redis.instance_type(死键)。
   # engine_version 传 major.minor;补丁号(如 valkey 7.2.6)由 AWS 托管不显式指定。
   # valkey→"7.2";redis→"7.1"。参数组 family 自动取 <engine><major>(valkey7 / redis7)。
   engine_version: "7.2"
   num_replicas: 2             # 总节点数 = 1 primary + num_replicas replica
+  # 下面两个键代码确实读取,不要误标为死键。
   #   传 ARN,代码取末段作 group name。空(默认)= 按上面 subnet_ids/engine 自建。
   #   ⚠️ 复用者自保:子网组须覆盖 ≥2 AZ(automatic_failover 要求);参数组 family 须匹配
   #      engine+major(valkey7 / redis7),不匹配 CreateReplicationGroup 400。
@@ -234,6 +257,7 @@ redis:
 # 默认 false=不建(存量单 hub 路径继续跑)。开了必须 redis.enabled=true。
 edge:
   enabled: false
+  # 不要写 migration_drain_seconds:它是当前代码不读的死键,没有迁移 drain 配置开关。
   subnet_ids: []              # #272 — 可选,显式指定 OpenResty edge ASG 子网 id;空=PRIVATE_WITH_EGRESS 自动选。
   min_capacity: 3             # 一 AZ 一台起步,N-1 容灾
   max_capacity: 6
@@ -409,6 +433,8 @@ agentcore:
 # 下一版将进一步删掉 Cognito 段本身;此处保留仅供 console 面 SSO 需求场景启用。
 console_auth:
   enabled: false                   # 开启后 Console 需要 Cognito 登录(#187 P5 硬默认关)
+  # console_auth.user_pool_id 由 setup.sh 自动判定并写入,不要手填。它只应出现在
+  # 真正的 1.1.x→1.2.x legacy User Pool 升级路径,普通新部署/重跑不需要。
   self_sign_up: false              # 允许用户自注册
   rbac_enabled: true               # 角色鉴权(viewer/operator/admin)开关, 独立于登录; 安全默认 true(上线最小权限); 仅 demo/dev 想要全开放才显式设 false
   # 无 Bearer token 的纯 API-key 请求(不带 Cognito id_token)落到的兜底角色。
@@ -529,6 +555,8 @@ notifications:
 
 # ========== 运行时 metrics 后端 ==========
 # enabled=true 开 metrics 采集(host-agent :8899/metrics)。后端二选一:
+# edge 指标在 :9145,包含 edge_up、edge_connections{state=...}、
+# edge_worker_processes;旧地址 :8080/metrics 实测返回 404,不要配置 Prometheus 抓它。
 #   - 默认(use_managed 缺省 false)= 自建 EC2 Prometheus+Grafana(deploy/monitoring/,
 #     运维手册 §5.6),不建任何 AWS 托管 workspace。这是本项目既定架构(AMG 要 AWS_SSO,
 #     刻意规避)。实测 AMP workspace 为空,正是走自建。
@@ -592,22 +620,50 @@ hub:
 
 # ========== AI Gateway(LiteLLM)开关 ==========
 # guest microVM 零凭据,LLM 调用经一个 OpenAI 兼容网关(LiteLLM)→ Bedrock。
+# #480 三态语义(默认「不部署」):
+#   ① url 填了               = 复用已有网关,CDK 只把它写进 SSM /openclaw/litellm-host。
+#   ② url 空 + managed_by_stack=true = CDK 自己起一台 LiteLLM(单机;ha_enabled=true 时是
+#                                     ASG+ALB+RDS 那套),起来后把地址写 SSM。
+#   ③ url 空 + managed_by_stack=false(默认) = 什么都不建、不写 SSM。
+#   → 默认不部署:多数部署已有自己的 OpenAI 兼容网关,旧默认(url 空即自动起一台常驻 EC2,
+#     HA 还多一套 RDS Multi-AZ + internal ALB)对这些环境是净负担。要 CDK 托管一个,
+#     显式把 managed_by_stack 设 true;或直接填 url 复用外部网关。
+#   → 不部署对 host 引导无害(init-host.sh 读 SSM 带 || echo "" 兜底,参数缺失只是 env 为空,
+#     不会引导失败)。可见后果:guest agent 没有模型端点可调 —— 未配网关时这是预期,不是 bug。
 ai_gateway:
+  # #480 默认 false = 不由本栈托管 LiteLLM。true = CDK 起一台(见 ha_enabled 决定单机/HA)。
+  # 仅当 url 为空时此开关才起作用;url 非空时始终走「复用外部网关」,与本开关无关。
+  #
+  # ⚠ 存量升级必读:若你的现有部署此前靠「url 空即自动起 LiteLLM」跑着一台在役网关,
+  #   升级到本版后 config.yml 缺 managed_by_stack(视同 false)→ 下次 cdk deploy 会
+  #   删掉那台在役 LiteLLM。要保持现状,升级前把本项显式设 true。注意 host userdata
+  #   自写的 SSM /openclaw/litellm-host 不受 CFN 管理,网关被删后该值会残留并指向已
+  #   释放的私网 IP(guest 调用将连不上),需一并手工清理或改指新网关。
+  managed_by_stack: false
   # 已有网关就填它的 base URL(如 http://10.0.0.10:4000/v1),CDK 直接写进 SSM
-  # /openclaw/litellm-host 给 host 用。留空 = CDK 自动起一台 LiteLLM EC2(最小权限
-  # bedrock instance role,无静态 key),起来后把私网 IP 写 SSM。新 region 一键部署
-  # 默认留空即可;生产 ap-southeast-1 可填已有堡垒机网关复用。
+  # /openclaw/litellm-host 给 host 用。留空 + managed_by_stack=true = CDK 自动起一台
+  # LiteLLM EC2(最小权限 bedrock instance role,无静态 key),起来后把私网 IP 写 SSM。
+  # 生产 ap-southeast-1 可填已有堡垒机网关复用。
   # R15.1(N4):填全 URL 时协议按写的来 —— 纯 IP/host(如 10.0.0.10)会被
   # 规范化成 http://<host>:4000/v1;要 HTTPS/TLS 网关直接写完整 https URL
   # (如 https://gw.internal/v1),原样透传不再被硬拼成 http:4000。只改默认端口/
   # path(纯 host 输入时)用 host 侧 env LITELLM_PORT/LITELLM_PATH(harden-config 派生)。
   url: ""
-  instance_type: "c7i.large"       # 自动起网关时的机型(仅 url 为空时用)。
-  # true 走 HA 路径 —— ASG min=2 跨 AZ + internal ALB 前置 4000 + 独立
-  # RDS PostgreSQL Multi-AZ 共享 vkey/spend 表(compose 内嵌 PG 用 profile
+  instance_type: "c7i.large"       # 自动起网关时的机型(仅 url 空 + managed_by_stack=true 时用)。
+  # (1 台 EC2 + compose 内嵌 PG),true 走 HA 路径 —— ASG min=2 跨 AZ + internal ALB 前置
+  # 4000 + 独立 RDS PostgreSQL Multi-AZ 共享 vkey/spend 表(compose 内嵌 PG 用 profile
   # 屏蔽,两台实例各存一份表会分裂,ALB 轮询命中不同实例时 vkey mint 一半失效)。
   # SSM /openclaw/litellm-host 直接写 internal ALB DNS, userdata 不再自写 SSM。
   ha_enabled: false
+
+# ========== Per-tenant LLM billing / 限流 ==========
+billing:
+  # 代码确实读取此 Secrets Manager secret 名称/ARN,从中取得 LiteLLM master key,
+  # 再为每个租户调用 /key/generate 铸带 budget/rpm 的 vkey。留空=不铸 vkey,
+  # VM 仍可正常启动但租户共用上游 key,没有 per-tenant 预算/限流,也无法按租户
+  # 对账 LLM 花费。LiteLLM 必须连接 PostgreSQL 才能铸 key;未接 DB 时
+  # /key/generate 会返回 HTTP 500 DB not connected。
+  master_key_secret: ""
 
 # ========== 黄金镜像 ==========
 # 拆出主 stack 且非阻塞:build 失败只回滚 OpenClawImage,不连累控制面/数据面。
@@ -632,9 +688,19 @@ logging:
   # 三个索引 claw-logs-{edge,host,vm}-*:edge=nginx access log,host=journald
   # (host-agent + 生命周期脚本),vm=每租户 fc.log(带 tenant_id)。索引名/流名不
   # 可调(确定值),要调只调下面 sizing。
+  # 两步部署:先设 true 建日志资源,再替换 host/edge 实例(或做 instance refresh)。
+  # 实例只在启动时按当时资源是否存在决定是否安装 Fluent Bit;从 false 改 true
+  # 增量部署不会让存量实例追溯生效,不换机就不会真正送日志。
   enabled: false
   aos:
     subnet_ids: []                                # #272 — 可选,显式指定 OpenSearch 域子网 id;空=PRIVATE_WITH_EGRESS 自动选(数量须与 az_count 对齐)。
+    # aws ec2 describe-vpc-endpoints --region <R> --filters Name=vpc-id,Values=<VPC> \
+    #   --query 'VpcEndpoints[?contains(ServiceName,`secretsmanager`)].[VpcEndpointId,PrivateDnsEnabled]'
+    # 查到已有开 private DNS 的 secretsmanager VPCE → false 复用;查不到 → true 自建。
+    # 同 VPC 同服务只允许一个 endpoint 开 private DNS,重复建会让整栈 ROLLBACK。
+    # 开 private DNS 后,secretsmanager.<region>.amazonaws.com 在整个 VPC 都解析到
+    # 该私有端点;堡垒机、host、其它 Lambda 和客户负载都必须被 VPCE SG 放行,
+    # 否则它们访问 Secrets Manager 会静默中断。
     create_secretsmanager_vpce: true              # #309 — 建 secretsmanager Interface VPCE 供 AOS rolesmapping Lambda 取口令。VPC 里已有一个开 private DNS 的 secretsmanager VPCE(残留/客户自建)时设 false 复用它(AWS 同服务同 VPC 只许一个开 private DNS,否则整栈 ROLLBACK)。
     data_node_instance_type: "r6g.large.search"   # 日志型写多读少,内存型优于 m 系
     data_nodes: 2                                 # 与 AZ 数取整数倍;≥3 才达 HA 底线(Multi-AZ)

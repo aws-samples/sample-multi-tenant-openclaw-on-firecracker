@@ -86,6 +86,23 @@ while IFS= read -r f; do
   file="$CK_ROOT/$f"
   [ -f "$file" ] || continue
 
+  # patch-kits/ 整体豁免:它是【公开仓库自有】的客户补丁包(在公开侧作为 PR 合入),内部没有对应源文件,
+  # 因此永远不在 bb→gateway 的同步增量里 —— 扫它等于用本仓库规则评判一份本次并不改动的既有公开资产,
+  # 结果是每次发布都被同一批命中卡住。
+  #
+  # 独立 review 质疑「整体豁免会不会盖住真泄漏」,故先审计后豁免。实测该目录里:
+  #   · 本文件规则 ① 的两个已知真账号 —— 0 命中(此处不复述号码:写出来这份注释本身就成了泄漏)
+  #   · 内部域名 / 堡垒机 IP —— 0 命中
+  #   · 非全零的资源 id 只有 vpc-0abc123def456 与 scanner 旧副本注释里的示例形状
+  #   · 非全零 instance id 只有 i-0123456789abcdef0 / i-0abc123def4567890(标准占位)
+  #   · 看着像账号的 12 位数字(342485954688 等)实为 push-marker 表里的**内容哈希**列 ——
+  #     同列邻居是 9083b5f76194 / 9f1a458982a5,只是恰好全为数字,不是账号
+  # 即豁免不掩盖真实泄漏。真红线仍有人管:gate 1/4 的 redline-scan 扫整棵 staged 树,
+  # RELEASE-CHECKLIST 发布时复扫。
+  case "$f" in
+    patch-kits/*) continue;;
+  esac
+
   # 账号 ID 检查的豁免:tests/ 是内部不发布文件(RELEASE-CHECKLIST 明确排除 tests/engineering/
   # CLAUDE*.md 等内部资产,发布用 export-ignore/干净分支剔除)。硬编码零容忍红线是防真账号泄进
   # 【公开发布物】;对内部开发测试文件里的真账号(如坐标默认值、测试元数据)扫描是误伤,整体豁免
@@ -172,6 +189,23 @@ while IFS= read -r f; do
   [ -n "$f" ] || continue
   file="$CK_ROOT/$f"
   [ -f "$file" ] || continue
+
+  # patch-kits/ 整体豁免:它是【公开仓库自有】的客户补丁包(在公开侧作为 PR 合入),内部没有对应源文件,
+  # 因此永远不在 bb→gateway 的同步增量里 —— 扫它等于用本仓库规则评判一份本次并不改动的既有公开资产,
+  # 结果是每次发布都被同一批命中卡住。
+  #
+  # 独立 review 质疑「整体豁免会不会盖住真泄漏」,故先审计后豁免。实测该目录里:
+  #   · 本文件规则 ① 的两个已知真账号 —— 0 命中(此处不复述号码:写出来这份注释本身就成了泄漏)
+  #   · 内部域名 / 堡垒机 IP —— 0 命中
+  #   · 非全零的资源 id 只有 vpc-0abc123def456 与 scanner 旧副本注释里的示例形状
+  #   · 非全零 instance id 只有 i-0123456789abcdef0 / i-0abc123def4567890(标准占位)
+  #   · 看着像账号的 12 位数字(342485954688 等)实为 push-marker 表里的**内容哈希**列 ——
+  #     同列邻居是 9083b5f76194 / 9f1a458982a5,只是恰好全为数字,不是账号
+  # 即豁免不掩盖真实泄漏。真红线仍有人管:gate 1/4 的 redline-scan 扫整棵 staged 树,
+  # RELEASE-CHECKLIST 发布时复扫。
+  case "$f" in
+    patch-kits/*) continue;;
+  esac
 
   # 测试文件豁免(同 ①③⑤):tests/ 是内部不发布资产,里面的真 id 是 fixture/回归元数据,
   # 发布门(RELEASE-CHECKLIST)复扫,这里扫是误伤。

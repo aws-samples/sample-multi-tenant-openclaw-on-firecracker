@@ -15,6 +15,8 @@ API GW 29s 断开)。此时调用方只能重试。光靠 CAS 幂等能保证**�
 两者字段形状本来就一致(state/result/error/idempotency_key + TTL)。
 """
 
+import time
+
 import core.clients as clients
 from core import image_jobs
 from core.utils import _now
@@ -24,15 +26,117 @@ def _table():
     return getattr(clients, "image_jobs_table", None)
 
 
-# 同步操作的状态:在跑 + 两个终态 + 一个"结果未知"态(#394 P1-1)。
 STATE_IN_PROGRESS = "IN_PROGRESS"
 STATE_SUCCEEDED = "SUCCEEDED"
 STATE_FAILED = "FAILED"
-# #394 P1-1 —— UNKNOWN:host 命令超时/回执丢失,可能【已提交也可能没】。绝不能当 FAILED
 # (那样同 key 重试会被 409 OPERATION_FAILED_PREVIOUSLY 挡死,违背"503 后同 key 重试对账"承诺)。
 # 重放到 UNKNOWN 记录时【重新执行】对账:promote/cleanup/reclaim 都幂等,已提交则再跑收敛成
 # already_promoted / 已空 / no-op,未提交则真正做完。
 STATE_UNKNOWN = "UNKNOWN"
+STATE_SUPERSEDED = "SUPERSEDED"
+ATTEMPT_LEASE_SECONDS = 900
+
+
+def _is_ccf(exc):
+    if type(exc).__name__ == "ConditionalCheckFailedException":
+        return True
+    response = getattr(exc, "response", None)
+    return (
+        isinstance(response, dict)
+        and (response.get("Error") or {}).get("Code")
+        == "ConditionalCheckFailedException"
+    )
+
+
+def get(operation_id):
+    """Strongly read one operation before making replay/adoption decisions."""
+    table = _table()
+    if table is None or not operation_id:
+        return None
+    return table.get_item(
+        Key={"job_id": operation_id}, ConsistentRead=True
+    ).get("Item")
+
+
+def claim_attempt(
+    operation_id,
+    attempt_id,
+    command_id=None,
+    lease_seconds=ATTEMPT_LEASE_SECONDS,
+):
+    """Claim one execution attempt without stealing a live different attempt.
+
+    UNKNOWN may start a new attempt. IN_PROGRESS may install its first attempt
+    id or renew the same one. A completed operation and a different active
+    attempt reject the claim.
+    """
+    table = _table()
+    if table is None:
+        return False
+    now = int(time.time())
+    expr = [
+        "attempt_id = :attempt",
+        "#s = :in_progress",
+        "attempt_until = :attempt_until",
+        "attempt_started_at = :t",
+        "updated_at = :t",
+    ]
+    values = {
+        ":attempt": attempt_id,
+        ":in_progress": STATE_IN_PROGRESS,
+        ":unknown": STATE_UNKNOWN,
+        ":now": now,
+        ":attempt_until": now + int(lease_seconds),
+        ":t": _now(),
+    }
+    if command_id:
+        expr.append("command_id = :command")
+        values[":command"] = command_id
+    try:
+        table.update_item(
+            Key={"job_id": operation_id},
+            UpdateExpression="SET " + ", ".join(expr),
+            ConditionExpression=(
+                "attribute_exists(job_id) AND ("
+                "#s = :unknown OR (#s = :in_progress AND ("
+                "attribute_not_exists(attempt_id) OR attempt_id = :attempt OR "
+                "attribute_not_exists(attempt_until) OR attempt_until <= :now)))"
+            ),
+            ExpressionAttributeNames={"#s": "state"},
+            ExpressionAttributeValues=values,
+        )
+    except Exception as exc:  # noqa: BLE001
+        if not _is_ccf(exc):
+            raise
+        return False
+    return True
+
+
+def record_command(operation_id, attempt_id, command_id):
+    """Attach the SSM command only to the attempt that submitted it."""
+    table = _table()
+    if table is None:
+        return False
+    try:
+        table.update_item(
+            Key={"job_id": operation_id},
+            UpdateExpression="SET command_id = :command, updated_at = :t",
+            ConditionExpression=(
+                "attempt_id = :attempt AND #s = :in_progress"
+            ),
+            ExpressionAttributeNames={"#s": "state"},
+            ExpressionAttributeValues={
+                ":attempt": attempt_id,
+                ":command": command_id,
+                ":in_progress": STATE_IN_PROGRESS,
+                ":t": _now(),
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        if not _is_ccf(exc):
+            raise
+        return False
+    return True
 
 
 def find_by_idempotency_key(instance_id, idempotency_key, operation):
@@ -41,7 +145,6 @@ def find_by_idempotency_key(instance_id, idempotency_key, operation):
     校验 operation 一致:同一个 key 被用在不同操作上属调用方错误,返回记录让上层判成
     IDEMPOTENCY_KEY_REUSED(不能拿 promote 的结果去答别的操作)。
 
-    #394 P1-1 —— 同一 key 可能有多条记录(UNKNOWN 重试会各写一条新 op_id 行)。选取优先级:
     ① 同 operation 且 SUCCEEDED(一旦有一次成功,重放就返回那个确定答案);
     ② 否则同 operation 的最近一条(UNKNOWN/IN_PROGRESS/FAILED,决定重放该怎么走);
     ③ 没有同 operation 记录但有别 operation 记录 → 返回它(上层报 IDEMPOTENCY_KEY_REUSED)。
@@ -88,18 +191,25 @@ def record_intent(operation_id, instance_id, operation, expected, idempotency_ke
         item["idempotency_key"] = idempotency_key
     # 与 pull Job 同表同 TTL 属性(expires_at),保留 30 天供排障/幂等重放窗口。
     item["expires_at"] = image_jobs._ttl_epoch()
-    ccf = table.meta.client.exceptions.ConditionalCheckFailedException
     try:
         table.put_item(Item=item, ConditionExpression="attribute_not_exists(job_id)")
-    except ccf:
+    except Exception as exc:  # noqa: BLE001
+        if not _is_ccf(exc):
+            raise
         return False
     return True
 
 
-def record_result(operation_id, ok, result=None, error=None, state=None):
+def record_result(
+    operation_id,
+    ok,
+    result=None,
+    error=None,
+    state=None,
+    attempt_id=None,
+):
     """提交【后】落 result(重放时原样返回它)。best-effort:不因记账失败而否定已提交的事实。
 
-    #394 P1-1 —— 可显式传 state(如 STATE_UNKNOWN);不传时按 ok 落 SUCCEEDED/FAILED(旧语义)。
     UNKNOWN 用于"host 命令超时/回执丢失,可能已提交"——绝不落 FAILED(否则同 key 重试被挡死)。
     """
     table = _table()
@@ -117,13 +227,23 @@ def record_result(operation_id, ok, result=None, error=None, state=None):
         expr.append("#e = :err")
         names["#e"] = "error"
         values[":err"] = error
+    condition = "attribute_exists(job_id)"
+    if resolved_state != STATE_SUCCEEDED:
+        condition += " AND (attribute_not_exists(#s) OR #s <> :succeeded)"
+        values[":succeeded"] = STATE_SUCCEEDED
+    if attempt_id is not None:
+        condition += " AND attempt_id = :attempt"
+        values[":attempt"] = attempt_id
     try:
         table.update_item(
             Key={"job_id": operation_id},
-            UpdateExpression="SET " + ", ".join(expr),
+            UpdateExpression="SET " + ", ".join(expr) + " REMOVE attempt_until",
+            ConditionExpression=condition,
             ExpressionAttributeNames=names,
             ExpressionAttributeValues=values,
         )
-    except Exception:  # noqa: BLE001 — 见 docstring
+    except Exception as exc:  # noqa: BLE001 — 见 docstring
+        if not _is_ccf(exc):
+            return False
         return False
     return True

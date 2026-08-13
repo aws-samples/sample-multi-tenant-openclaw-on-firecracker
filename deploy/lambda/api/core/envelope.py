@@ -357,7 +357,6 @@ def _validate_injected_parameters_v2(params, configured_cmk_arn, registry_entrie
             except EnvelopeError as e:
                 return None, f"invalid enc:v1: envelope for {field}: {e}"
         else:
-            # #233 — 非 enc:v1: 值一律放行明文(尺寸门 + 控制字符拒绝),不再按
             # sensitive 强求 base64。原因:base64 不是加密(DDB 明文存、一眼可解),
             # 而 host 侧 plaintext 分支(harden-config.sh / cred-inject.sh)直接用原值、
             # 不做 base64 -d——强制 base64 只是让客户多编码一步却拿不到任何保密,反把
@@ -366,6 +365,12 @@ def _validate_injected_parameters_v2(params, configured_cmk_arn, registry_entrie
             # 一视同仁:明文透传的值本就只能承载自隔离的 opaque 值(per-tenant vkey /
             # 客户自持 key),需 owner 隔离的敏感值仍应走 enc:v1:。
             # fail-loud 不放松:超长拒(防塞爆)、控制字符拒(防 \r\n 注进 dotenv/JSON)。
+            # #479:显式 asymmetric-v1 不允许 sensitive 字段静默降级为明文。
+            if scheme == SCHEME_ASYMMETRIC and entry.get("sensitive"):
+                return None, (
+                    f"{field} declared under scheme=asymmetric-v1 must be an enc:v1: "
+                    "envelope (plaintext rejected for sensitive fields)"
+                )
             if len(value) > _MAX_CIPHERTEXT_LEN:
                 return (
                     None,

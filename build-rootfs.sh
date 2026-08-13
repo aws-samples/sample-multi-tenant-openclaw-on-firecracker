@@ -1233,8 +1233,9 @@ aws s3 cp ${IMMUTABLE_IMG}.gz s3://${BUCKET}/deployment/rootfs/${IMMUTABLE_KEY} 
 if [ "${SKIP_MANIFEST:-0}" = "1" ]; then
   echo "→ SKIP_MANIFEST=1 — leaving manifest.json untouched (live pointer preserved)"
 else
+  OPENCLAW_PIN_MANIFEST=$(grep -m1 '^OPENCLAW_PIN=' "${BASH_SOURCE[0]}" | cut -d'"' -f2)
   cat <<EOF | aws s3 cp - s3://${BUCKET}/deployment/rootfs/manifest.json ${PROFILE_FLAG} --content-type application/json
-{"version":"${VERSION}","rootfs":"${ROOTFS_KEY}","data_template":"${DATA_KEY}","immutable":"${IMMUTABLE_KEY}"}
+{"version":"${VERSION}","rootfs":"${ROOTFS_KEY}","data_template":"${DATA_KEY}","immutable":"${IMMUTABLE_KEY}","openclaw_version":"${OPENCLAW_PIN_MANIFEST}"}
 EOF
 fi
 

@@ -179,9 +179,10 @@ components:
             - 'null'
           description: |
             Terminal verdict — done | failed | unconfirmed. On `unconfirmed` the control
-            plane could not confirm the outcome (the rebuild may have succeeded); do NOT
-            auto-retry, since a repeat rebuild drops the per-VM overlay again and
-            discards writes made in between. Poll until done or failed.
+            plane could not confirm this attempt's outcome (the rebuild may have
+            succeeded). A queued rebuild is automatically retried with the SAME op_id;
+            the host reuses its op-specific overlay tombstone and never drops the fresh
+            overlay twice. Do not submit a new rebuild operation while this one converges.
         rebuild_failed_reason:
           type:
             - string
@@ -1147,11 +1148,10 @@ paths:
                   - type: object
                     title: lifecycle
                     description: |
-                      but carries rebuild_status=unconfirmed (+ op_id for correlation) and emits
-                      tenant.rebuild_unconfirmed, so GET /tenants/{id} shows the outcome was not
-                      confirmed. Do NOT auto-retry on `unconfirmed` — see the field description below.
-                      (No 503 auto-retry either: that needs a host fence — deferred, see
-                      ADR-lifecycle-fence-rebuild-convergence.)
+                      Successful synchronous lifecycle result. A rebuild appears here only
+                      after op-specific host evidence confirms the running Firecracker
+                      rootfs and fresh overlay under the current lifecycle fence. An
+                      unconfirmed attempt returns retryable 503 instead.
                     properties:
                       id:
                         type: string
@@ -1172,14 +1172,12 @@ paths:
                           ADR-rebuild-idempotency-sync-contract §5.4:
                             * done — adoption confirmed; the tenant is on the new rootfs.
                             * failed — confirmed failure (the host ran the command and it failed).
-                              Safe to retry. Not yet emitted by the rebuild path: it cannot
-                              currently tell a confirmed failure from a lost receipt, so it
-                              reports the honest `unconfirmed` instead.
+                              Safe to retry with the same operation identity.
                             * unconfirmed — the receipt did not arrive in time, so the control plane
                               does not know. The rebuild may well have SUCCEEDED on the host.
-                              **Do NOT auto-retry**: a repeat rebuild drops the per-VM overlay again
-                              and discards anything written between the two attempts. Poll
-                              GET /tenants/{id} until rebuild_status becomes done or failed.
+                              The queue retries the same op_id; rebuild-vm.sh reuses the
+                              op-specific tombstone and does not drop the fresh overlay again.
+                              Poll GET /tenants/{id} until rebuild_status becomes done or failed.
                       op_id:
                         type: string
                         description: |
@@ -1348,6 +1346,8 @@ paths:
                       - PINNED_NO_REBUILD
                       - CANARY_NOT_READY
                       - CANARY_CHANGED
+                      - LIFECYCLE_SUPERSEDED
+                      - OPERATION_ID_REUSED
           x-source: deploy/lambda/api/services/tenant_service.py:1290
         '502':
           description: |
@@ -1369,6 +1369,39 @@ paths:
                       - REPIN_BACKUP_FAILED
                   backup_error:
                     type: string
+        '503':
+          description: |
+            Temporary lifecycle failure. For rebuild convergence,
+            REBUILD_RETRY_PENDING means this attempt lacked identity-bound host
+            adoption evidence; queued consumers return the SQS item to the queue and
+            retry the same op_id. REBUILD_ATTEMPT_BUSY means another leased attempt
+            still owns that op_id. Callers on the synchronous path must preserve the
+            same client_token when retrying; starting a new rebuild is a different
+            destructive operation. Queue anchor failures and migration capacity
+            contention can also return 503 with the fields applicable to that error.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - error
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - REBUILD_RETRY_PENDING
+                      - REBUILD_ATTEMPT_BUSY
+                      - ENQUEUE_ANCHOR_FAILED
+                      - ENQUEUE_STATE_UNKNOWN
+                  id:
+                    type: string
+                  op_id:
+                    type: string
+                  rebuild_status:
+                    type: string
+                    const: unconfirmed
       tags:
         - 租户生命周期
     get:

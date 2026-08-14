@@ -195,30 +195,38 @@ def register_host(body):
     # advertised RAM; we fall back to a heuristic only if the API errors.
     mem_total = _resolve_instance_memory_mb(ec2, instance_type)
 
-    hosts_table.put_item(
-        Item={
-            "instance_id": instance_id,
-            # 上面已从 describe_instances 取到(只用于查内存),这里一并持久化;缺失回落
-            # "unknown"(DDB 的 S 不接受空串),排序侧对未知 family 落表尾。
-            "instance_type": instance_type or "unknown",
-            "private_ip": private_ip,
-            "az": az,
-            # 这两个值本来就是标称的:CoreCount×ThreadsPerCore 与
-            # describe_instance_types 的 MemoryInfo.SizeInMiB 都是广告值。此前又扣
-            # HOST_RESERVED_*,于是同一台机器走 API 注册比走 init-host.sh 少一截容量,
-            # 达不到标称理论上限(384/256/192/128),两条路径口径分叉。
-            # host OS/Firecracker 驻留内存的保护改由 scheduling.mem_safety_floor_ratio
-            # 物理水位门承担(读 host 自报实测 MemAvailable)—— 与标称注册是一套。
-            "total_vcpu": vcpu_total,
-            "total_mem_mb": mem_total,
-            "used_vcpu": 0,
-            "used_mem_mb": 0,
-            "vm_count": 0,
-            "next_vm_num": 1,
-            "status": "active",
-            "idle_since": _now(),
-        }
-    )
+    # init-host.sh, which self-registers via a direct DDB put and already stamps
+    # rootfs_version from the manifest it pulled. This API path left the field
+    # unset, so a host registered here carried no version for tenants to inherit.
+    # Stamp it from the live S3 manifest (same source as GET /hosts/rootfs-version)
+    # bb); this only covers hosts registered through the API. Omit on unknown/empty
+    # rather than writing "" — DDB rejects empty S and an empty value would falsely
+    host_item = {
+        "instance_id": instance_id,
+        # 上面已从 describe_instances 取到(只用于查内存),这里一并持久化;缺失回落
+        # "unknown"(DDB 的 S 不接受空串),排序侧对未知 family 落表尾。
+        "instance_type": instance_type or "unknown",
+        "private_ip": private_ip,
+        "az": az,
+        # 这两个值本来就是标称的:CoreCount×ThreadsPerCore 与
+        # describe_instance_types 的 MemoryInfo.SizeInMiB 都是广告值。此前又扣
+        # HOST_RESERVED_*,于是同一台机器走 API 注册比走 init-host.sh 少一截容量,
+        # 达不到标称理论上限(384/256/192/128),两条路径口径分叉。
+        # host OS/Firecracker 驻留内存的保护改由 scheduling.mem_safety_floor_ratio
+        # 物理水位门承担(读 host 自报实测 MemAvailable)—— 与标称注册是一套。
+        "total_vcpu": vcpu_total,
+        "total_mem_mb": mem_total,
+        "used_vcpu": 0,
+        "used_mem_mb": 0,
+        "vm_count": 0,
+        "next_vm_num": 1,
+        "status": "active",
+        "idle_since": _now(),
+    }
+    rootfs_version = _get_manifest().get("version", "")
+    if rootfs_version:
+        host_item["rootfs_version"] = rootfs_version
+    hosts_table.put_item(Item=host_item)
     return _resp(201, {"instance_id": instance_id, "status": "active", "az": az})
 
 

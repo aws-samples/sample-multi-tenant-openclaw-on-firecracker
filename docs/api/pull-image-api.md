@@ -77,16 +77,17 @@ promote 必须回传验证过的 canary `snapshot_time` —— **版本 CAS 以 
 
 `expected_image_generation` 只参与创建时的并发校验，不是租户后续生命周期的版本选择条件。创建成功后，即使 Host generation 因 promote 增加，也不会使该租户失效。
 
-**创建后如何改写固定版本(#416)**:`POST /tenants/{id}/rebuild` 现在接受可选 body,把一个【已存在】租户显式换到该 Host 当前 canary 槽的候选版本,或切回 live —— 无需删了重建。字段名与 `POST /tenants` 完全相同(`image_channel` / `expected_image_snapshot_time` / `expected_image_generation`),错误码复用同一套(400 `VALIDATION` / 409 `CANARY_NOT_READY` / 409 `CANARY_CHANGED`),canary 失败绝不回落 live。
+**创建后切换版本**：管理员可调用 `POST /tenants/{id}/rebuild`，将已有租户
+重建到该 Host 的 `live` 或 `canary` 槽位。
 
-- 这是 ADR-per-vm-canary-image-channel §4.3 允许的【一次带 CAS 的显式改写固定版本】,不是 §10 拒绝项 1 所禁的"版本漂移":换写后启动仍读租户记录里的固定值(`launch-vm` 一行不改),只是这个固定值可被一次显式 API 调用改写、且可审计。
-- `image_channel=canary`:以该 Host `image_slots` 的 canary 槽为准做 `snapshot_time` CAS,通过则把解析出的具体版本写进租户 `image_snapshot_time` 并置 `image_channel=canary`。**不接受任意版本**——不传 `expected_image_snapshot_time` 时以该 Host 当前 canary 槽为准;无 READY canary 槽 → 409 `CANARY_NOT_READY`。
-- `image_channel=live`:移除租户的 `image_snapshot_time`(DDB `REMOVE`)并置 `image_channel=live`,下次启动重新解析 `slots.live`。
-- **换版前强制备份 fail-closed**(no-data-loss):换到旧 rootfs 可能读不了 candidate 用新 schema 写过的 `data.ext4`,故任一方向换版前都先同步备份到 S3,备份不成功即拒绝执行(不 stop-vm、不丢 overlay)。**已知未覆盖**:旧 rootfs 对新 `data.ext4` 的 schema 兼容性【未】做只读挂载校验(旧 ADR G5 双保险第②条,不在 #416 范围),所以降级保护是"有备份兜底"而非"已证明兼容"。
-- 不带 body 的 `rebuild` 行为逐字节不变(live 租户升 Host 当前 rootfs);pinned 租户不带 body 的 rebuild 仍返 409 `PINNED_NO_REBUILD`。
-- **去重已知限制(#413/#364)**:同租户同目标版本 5 分钟内的重复 rebuild 仍可能被 SQS FIFO 去重吞掉(根治归 #364);不同目标版本的两条 rebuild 各自投递。
-- **换版恒同步、不入队(#416)**:带 `image_channel` body 的 rebuild 强制走同步路径(不塞 SQS),当场以该 host 当前 canary 槽解析并执行。这消除了"塞队列→被消费"之间被 migrate 插入、消费时在新 host 用旧 host 版本丢 overlay 的跨 host 竞态。普通(无 body)rebuild 仍可入队削峰。
-- **采用未校验 = 可观测,不自动重投(#413)**:换版 relaunch 后采用校验(canary:vm.json 实际启动版本 == 目标;canary→live:vm.json 已不再是旧 pin;并叠加 FC 不在 deleted 旧 inode)不过 → 标 `rebuild_status=failed` + 发 `tenant.rebuild_failed` 事件 + 返 **200**(GET /tenants 立即可见),由运维手动重试。**本轮【不】做 503 自动重投收敛**:无 host fence 的自动重投在 migrate 后会跨 host 用错版本丢 overlay(no-data-loss),安全自动收敛须绑 source-host + 单调 fence,整体延后待 `ADR-lifecycle-fence-rebuild-convergence`(#413 保持 open)。op_id 透传 / shlex / 入队前校验 / vm.json 采用校验等安全原语已就位,为 fence 铺路。
+- `image_channel` 可省略；省略与显式传 `live` 完全等价。
+- 只有一个 rebuild 流程，恒同步执行，不返回排队状态。
+- `live` 和 `canary` 都必须在当前 Host 上存在。缺 `live` 返回
+  `409 NO_LIVE_VERSION`；缺 `canary` 返回 `409 CANARY_NOT_READY`，不会回落到另一版本。
+- 槽位校验通过后，服务端会先完成强制备份。备份失败返回
+  `502 REPIN_BACKUP_FAILED`，不会切换版本或重建 VM。
+- `canary` 可带 `expected_image_snapshot_time` 和
+  `expected_image_generation` 作为并发保护；不匹配返回 `409 CANARY_CHANGED`。
 
 ### 2.5 pull-image 异步任务
 

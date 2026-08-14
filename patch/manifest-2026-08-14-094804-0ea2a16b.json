@@ -1,0 +1,115 @@
+{
+  "synced_at": "2026-08-14 09:48:04 UTC+08:00",
+  "base_sha": "f3100678ac827cb8ef46563a0118129bd7b7dd87",
+  "source_commit": "0ea2a16be86f951bbb694551716c3c24bb7e9f1f",
+  "commit_count": 10,
+  "file_count": 11,
+  "summary": "Sync the bb increment f3100678..0ea2a16b to the public gateway branch. Sync-LOG only (which customer-facing files reached gateway + the issues behind them); the applyable patch kit is NOT built yet (folded_into pending).",
+  "issues_synced_note": "Index back to the issue tracker for whoever builds the patch kit: before assembling the kit, walk each issue and confirm it's covered. `title` is a ≤20-char gist only — open the issue for the full problem/fix/test. Lists only issues that touched a released file this sync.",
+  "issues_synced": [
+    {
+      "id": "#440",
+      "type": "fix",
+      "title": "install-fluent-bit.s…"
+    },
+    {
+      "id": "#477",
+      "type": "feat",
+      "title": "host golden AMI 构建改用…"
+    },
+    {
+      "id": "#495",
+      "type": "fix",
+      "title": "tenant-query GSI 门误拦…"
+    }
+  ],
+  "needs_config_on_apply": "none detected (no config.yml key / systemd directive / DDB-TTL change in this sync)",
+  "updated_files": {
+    "cdk-stack (cdk deploy OR hand-apply)": [
+      {
+        "path": "deploy/stacks/tenant_query_rollout.py",
+        "status": "modified",
+        "issues": [
+          "#495"
+        ]
+      }
+    ],
+    "edge (OpenResty / Fluent Bit host config)": [
+      {
+        "path": "deploy/edge/fluent-bit/install-fluent-bit.sh",
+        "status": "modified",
+        "issues": [
+          "#440"
+        ]
+      }
+    ],
+    "root / other": [
+      {
+        "path": "deploy/packer/CUSTOMER-GUIDE.md",
+        "status": "added",
+        "issues": [
+          "#477"
+        ]
+      },
+      {
+        "path": "deploy/packer/README.md",
+        "status": "added",
+        "issues": [
+          "#477"
+        ]
+      },
+      {
+        "path": "deploy/packer/apse1.pkrvars.hcl",
+        "status": "added",
+        "issues": [
+          "#477"
+        ]
+      },
+      {
+        "path": "deploy/packer/assert-parity.sh",
+        "status": "added",
+        "issues": [
+          "#477"
+        ]
+      },
+      {
+        "path": "deploy/packer/build-guide-html.sh",
+        "status": "added",
+        "issues": [
+          "#477"
+        ]
+      },
+      {
+        "path": "deploy/packer/customize.sh.default",
+        "status": "added",
+        "issues": [
+          "#477"
+        ]
+      },
+      {
+        "path": "deploy/packer/customize.sh.example",
+        "status": "added",
+        "issues": [
+          "#477"
+        ]
+      },
+      {
+        "path": "deploy/packer/host-golden.pkr.hcl",
+        "status": "added",
+        "issues": [
+          "#477"
+        ]
+      }
+    ],
+    "scripts": [
+      {
+        "path": "scripts/checks/tenant-query-rollout.py",
+        "status": "modified",
+        "issues": [
+          "#495"
+        ]
+      }
+    ]
+  },
+  "folded_into": "(pending) — no patch kit built for this sync yet; a later kit should cite this manifest as source-of-record and set base_sha/patch_sha. cdk deploy is FORBIDDEN on hand-modified live deployments — the kit must ship *.patched host scripts + the full lambda tree + AWS CLI for stack changes, same shape as patch/315-concurrent-dispatch-rollup/."
+}

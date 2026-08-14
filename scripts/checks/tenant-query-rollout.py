@@ -27,12 +27,17 @@ def main():
         boto3.Session(profile_name=args.profile) if args.profile else boto3.Session()
     )
     ddb = session.client("dynamodb", region_name=args.region)
+    table_exists = True
     try:
         table = ddb.describe_table(TableName=args.table)["Table"]
     except ddb.exceptions.ResourceNotFoundException:
-        table = {"GlobalSecondaryIndexes": []}
-    missing = validate_live_rollout(cfg, table.get("GlobalSecondaryIndexes", []))
-    if missing:
+        table, table_exists = {}, False
+    missing = validate_live_rollout(
+        cfg, table.get("GlobalSecondaryIndexes", []), table_exists=table_exists
+    )
+    if not table_exists:
+        print(f"OK: {args.table} does not exist yet; CFN creates it with all GSIs at once")
+    elif missing:
         print(f"OK: this deployment creates {next(iter(missing))}")
     else:
         print("OK: no tenant-query GSI creation required")

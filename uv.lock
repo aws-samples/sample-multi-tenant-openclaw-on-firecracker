@@ -105,6 +105,19 @@ wheels = [
 ]
 
 [[package]]
+name = "aws-lambda-powertools"
+version = "3.34.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "jmespath" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/6b/d2/ead05769a42baf2c01e9e8909b5b7a0a42b0798ab2d0eccacdef3d1f009d/aws_lambda_powertools-3.34.0.tar.gz", hash = "sha256:75f2c65a5997630666c9c3c495002c1f9d1e9defd3cb6d5d9fc7272b7dc9ef54", size = 800151, upload-time = "2026-08-10T11:26:10.742Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b3/d1/9e9433f99d8c9084d3bc831900f1ce7a99b0a2c153d9223e46839d8cc665/aws_lambda_powertools-3.34.0-py3-none-any.whl", hash = "sha256:ab1354c58085ccecf92e9c548b1336ad5bae72c7ae23e61d2aa0ff15520d679c", size = 957321, upload-time = "2026-08-10T11:26:09.002Z" },
+]
+
+[[package]]
 name = "boto3"
 version = "1.42.89"
 source = { registry = "https://pypi.org/simple" }
@@ -878,6 +891,7 @@ dependencies = [
 
 [package.dev-dependencies]
 test = [
+    { name = "aws-lambda-powertools" },
     { name = "boto3" },
     { name = "cryptography" },
     { name = "hypothesis" },
@@ -898,6 +912,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 test = [
+    { name = "aws-lambda-powertools", specifier = ">=2.40.0" },
     { name = "boto3" },
     { name = "cryptography", specifier = ">=42.0.0" },
     { name = "hypothesis" },

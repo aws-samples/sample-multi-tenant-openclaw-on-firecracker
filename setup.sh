@@ -470,6 +470,9 @@ aws s3 cp "$SCRIPT_DIR/deploy/userdata/rebuild-vm.sh" "s3://${BUCKET}/deployment
   "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/reset-vm.sh" "s3://${BUCKET}/deployment/scripts/reset-vm.sh" \
   "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
+# 必须上传 + 进 _REQUIRED_SCRIPTS 门:否则 SSM 调它得到 exit 127 而 delete 静默失败
+aws s3 cp "$SCRIPT_DIR/deploy/userdata/delete-vm.sh" "s3://${BUCKET}/deployment/scripts/delete-vm.sh" \
+  "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/clone-data.sh" "s3://${BUCKET}/deployment/scripts/clone-data.sh" \
   "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 # missing file (exit 127) and live migration silently failed end-to-end.
@@ -493,7 +496,7 @@ aws s3 cp "$SCRIPT_DIR/deploy/userdata/stop-all-vms.sh" "s3://${BUCKET}/deployme
 #    保留逐个 cp(每条带 why),这里独立维护一份「host init 必需脚本」清单,传完直接查桶——
 #    缺任一个立即停,别把「某脚本静默没传」的软 bug 拖成「host 永远起不来」的硬 bug。
 #    也兜住上面 `|| true` 吞错、SSM 后台跑到一半被砍这类 set -e 抓不到的漏传。
-_REQUIRED_SCRIPTS="host-agent.py route_ops.py oc-guest-log-reader.py launch-vm.sh stop-vm.sh rebuild-vm.sh reset-vm.sh backup-data.sh clone-data.sh migrate-vm.sh resize-disk.sh start-all-vms.sh stop-all-vms.sh setup-egress-allowlist.sh adot-config.yaml lib/harden-config.sh lib/cred-inject.sh"
+_REQUIRED_SCRIPTS="host-agent.py route_ops.py oc-guest-log-reader.py launch-vm.sh stop-vm.sh rebuild-vm.sh reset-vm.sh delete-vm.sh backup-data.sh clone-data.sh migrate-vm.sh resize-disk.sh start-all-vms.sh stop-all-vms.sh setup-egress-allowlist.sh adot-config.yaml lib/harden-config.sh lib/cred-inject.sh"
 _UPLOADED=$(aws s3 ls "s3://${BUCKET}/deployment/scripts/" --recursive \
   "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" 2>/dev/null | awk '{print $NF}')
 _MISSING=""

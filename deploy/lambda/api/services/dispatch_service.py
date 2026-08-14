@@ -32,6 +32,8 @@ from botocore.exceptions import ClientError
 import core.capacity as capacity
 import core.clients as clients
 import core.host_profile as host_profile
+# 故此处无循环导入风险。
+import core.scheduling as scheduling
 from core.dispatch import (
     MANIFEST_PART_MAX_BYTES,
     encode_manifest_line,
@@ -428,14 +430,31 @@ def _reserve_batch_txn(
         return None  # fail-safe:任一维负(含 mem 未知 allocatable_mem<=0)→ 拒
 
     n = len(tenants)
+    atomic_claim = n <= scheduling.MAX_ATOMIC_SLOT_CLAIM
+    if not atomic_claim:
+        # 超阈值时保留既有扫描判定，不生成会撞 DDB 300-operator 上限的条件表达式。
+        print(
+            f"[dispatch] WARN atomic phys-slot claim disabled host={instance_id} "
+            f"cmd={command_id} n={n} limit={scheduling.MAX_ATOMIC_SLOT_CLAIM}; "
+            "falling back to scan-only guard"
+        )
+    batch_ids = {t["tenant_id"] for t in tenants}
     # 直接返 None 当 CAS-loss → 输家白烧 tenant retry 预算、最终误 requires_intervention(明明有
     # 容量)。这里对【纯 next_vm_num 冲突】(host 项 idx0 取消、租户项都没失败)做【有界 reread-retry】
     # (重读 next_vm_num 重算 base 再试,线性退避,同步 create CAS 同款 tenant_service.py:1788),
     # 【不】计租户预算;真容量不够/delete 抢赢(租户项失败)则照旧返 None 走重投。
     for _attempt in range(_RESERVE_MAX_ATTEMPTS):
+        base, occupied = scheduling.next_free_phys_run(
+            instance_id, expected_next, n, exclude_ids=batch_ids
+        )
+        if occupied is None:
+            return _RESERVE_TRANSIENT
+        if base is None:
+            return None
         r = _reserve_batch_txn_once(
             tenants, instance_id, command_id, now_epoch, expected_next,
             cap_v, cap_m, dv, dm, n, write_inflight, _guest_ip, rootfs_version,
+            base=base, atomic_claim=atomic_claim,
         )
         if r == _RESERVE_TXN_CONFLICT:
             # 明确的事务冲突/限流(TransactionConflict/throttle)→ 纯瞬时,重读重算重试。
@@ -454,6 +473,15 @@ def _reserve_batch_txn(
         if fresh_next is None:
             return _RESERVE_TRANSIENT  # 读不到 host → 瞬时
         if fresh_next == expected_next:
+            fresh_base, fresh_occupied = scheduling.next_free_phys_run(
+                instance_id, expected_next, n, exclude_ids=batch_ids
+            )
+            if fresh_occupied is None:
+                return _RESERVE_TRANSIENT
+            if fresh_base != base:
+                # next 未变但 ps_* 被并发者占走；重算同一游标后的新空段再试。
+                time.sleep(0.02 * (_attempt + 1))
+                continue
             # next_vm_num 没动 → host CCF 是容量/inflight 门(非乐观锁)→ 真容量类失败。
             return None
         expected_next = fresh_next  # next_vm_num 真被并发批推进了 → 重算 base 重试
@@ -489,13 +517,16 @@ def _read_next_vm_num(instance_id: str) -> Optional[int]:
 def _reserve_batch_txn_once(
     tenants, instance_id, command_id, now_epoch, expected_next,
     cap_v, cap_m, dv, dm, n, write_inflight, _guest_ip, rootfs_version="",
+    base=None, atomic_claim=True,
 ):
     """跑一次 reserve 事务。返回:base vm_num(成功)/ None(真失败:租户项 CCF=delete 抢赢)
     / _RESERVE_TXN_CONFLICT(明确瞬时冲突/限流)/ _RESERVE_HOST_CCF(host 项条件失败,调用方重读
     next_vm_num 判别是乐观锁竞争还是容量/inflight 门失败)。"""
+    # 保持旧调用签名兼容；正常入口总会显式传本轮扫描选出的 base。
+    base = expected_next if base is None else base
     # ---- host 项 ----
     host_set = (
-        "next_vm_num = if_not_exists(next_vm_num, :zero) + :n, "
+        "next_vm_num = :next_after, "
         "used_vcpu = if_not_exists(used_vcpu, :zero) + :dv, "
         "used_mem_mb = if_not_exists(used_mem_mb, :zero) + :dm, "
         "vm_count = if_not_exists(vm_count, :zero) + :n"
@@ -506,12 +537,22 @@ def _reserve_batch_txn_once(
         ":dm": dm,
         ":zero": 0,
         ":expected": expected_next,
+        ":next_after": base + n,
         ":cap_v": cap_v,
         ":cap_m": cap_m,
     }
     host_cond = (
         "next_vm_num = :expected AND used_vcpu <= :cap_v AND used_mem_mb <= :cap_m"
     )
+    host_names = {}
+    if atomic_claim:
+        claim_cond, claim_set, host_names, value_keys = scheduling.slot_claim_clause(
+            range(base, base + n)
+        )
+        host_set += ", " + claim_set
+        host_cond += " AND " + claim_cond
+        for value_key, tenant in zip(value_keys, tenants):
+            host_vals[value_key] = tenant["tenant_id"]
     host_update_expr = "SET " + host_set
     if write_inflight:
         host_update_expr = (
@@ -531,17 +572,16 @@ def _reserve_batch_txn_once(
                 ":expired": now_epoch - clients.DISPATCH_INFLIGHT_TTL_SEC,
             }
         )
-    txn_items: List[Dict[str, Any]] = [
-        {
-            "Update": {
-                "TableName": clients.hosts_table.table_name,
-                "Key": {"instance_id": instance_id},
-                "UpdateExpression": host_update_expr,
-                "ConditionExpression": host_cond,
-                "ExpressionAttributeValues": host_vals,
-            }
-        }
-    ]
+    host_update = {
+        "TableName": clients.hosts_table.table_name,
+        "Key": {"instance_id": instance_id},
+        "UpdateExpression": host_update_expr,
+        "ConditionExpression": host_cond,
+        "ExpressionAttributeValues": host_vals,
+    }
+    if host_names:
+        host_update["ExpressionAttributeNames"] = host_names
+    txn_items: List[Dict[str, Any]] = [{"Update": host_update}]
     # ---- 每租户项 ----
     now = _now()
     # version 非空 → SET rootfs_version(+ ≤256B 才建查询投影 q_rootfs_version,否则 REMOVE 投影);
@@ -557,7 +597,7 @@ def _reserve_batch_txn_once(
     else:
         _rv_remove = ["rootfs_version", "q_rootfs_version"]
     for offset, t in enumerate(tenants):
-        vm_num = expected_next + offset
+        vm_num = base + offset
         rid = _reservation_id(command_id, t["tenant_id"])
         # tenant_service.py:1866 同款)。否则 dispatch 路径 phys_vm_num 仅靠 host-agent if_not_exists
         # → 跨租户 tap 复用(红线)。plain SET 让 phys 随 vm_num 走(reserve 只作用于 creating 租户)。
@@ -597,7 +637,7 @@ def _reserve_batch_txn_once(
         )
     try:
         clients.hosts_table.meta.client.transact_write_items(TransactItems=txn_items)
-        return expected_next  # base vm_num of this batch
+        return base  # host 事务占号与租户放置使用同一个 base
     except ClientError as e:
         code = e.response.get("Error", {}).get("Code", "")
         if code == "TransactionCanceledException":
@@ -1125,12 +1165,16 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         sum_vcpu = sum(v for v, _ in specs)
         sum_mem = sum(m for _, m in specs)
         # 每租户放置写 + 唯一 capacity_reservation_id。取代旧的"_try_reserve_host 整批 CAS
+        # 最终由 _reserve_batch_txn_once 的同一个事务写 host 账本、占号和租户放置。
+        # 这样每次 CCF 重读 next_vm_num 后即使换 base,实际 reserve 与占号仍天然同段；
+        # 不再保留“先挪号/占号一次、事务重试可能换号”的双写窗口。
+        _snap_next = next_vm_by_host.get(instance_id, 1)
         base = _reserve_batch_txn(
             batch,
             instance_id,
             command_id,
             now_epoch,
-            next_vm_by_host.get(instance_id, 1),
+            _snap_next,
             alloc_by_host.get(instance_id, 0),
             sum_vcpu,
             sum_mem,
@@ -1173,11 +1217,82 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
                     # 下方 _release_claims 跳过它,保 claim + inflight,靠原消息重投或 reaper 兜底。
                     all_settled = False
                     reserve_retry_tids.add(t["tenant_id"])
+                else:
+                    # 只有容量令牌确认 consumed/already 才能还号；RETRY 时旧租户可能仍活着。
+                    scheduling.release_phys_slot(
+                        instance_id, base + offset, t["tenant_id"]
+                    )
             # inflight 是 host 级批状态(非 per-tenant),命令未真正发出。仅当本批令牌全部落定
             # (无 retry 悬空)才清,带 poller 同款 CAS(dispatch_inflight=:cid)防误清并发新命令。
             # push 才有 inflight;有 retry 悬空则留 inflight,靠 TTL 过期或下轮释放清。
             if push_mode and all_settled:
                 _clear_inflight_scalar(instance_id, command_id)
+
+        # 递增,不保证发出的号未被本 host 在役租户物理占用:发号器一旦被回退(init-host
+        # 整项覆写、host_service.register_host 无条件 put_item),CAS 会把已在用的号再发一遍
+        # 且每次都成功 → launch-vm.sh 随后 `ip link del`+`kill -KILL` 抢占先到者的 tap
+        # → 两个 running 租户共用同一 vm_num/guest_ip/DNAT/Redis route = 跨租户劫持。
+        # 已真机复现:同一 host、同一回退状态下,同步 create 返 503(它在
+        # tenant_service:1868 有这道门),队列 create 返 202 并撞号成功。
+        #
+        # 为什么整批释放而不是只剔除撞号那一个:offset→vm_num 的映射由 reserve 事务按
+        # `base+offset` 写死,_write_assignments/_put_manifest_parts 也按同一 offset 推算,
+        # 部分剔除会让剩余租户的号错位。整批 _release_batch + 重投在正确性上等价且必然收敛
+        # —— _release_reservation 不回退 next_vm_num,重投时 expected_next 已前移,迟早越过
+        # 被占号段(同步路径的 `for _skip in range(64)` 同样靠单调递增收敛)。撞号只在发号器
+        # 异常时才走到,不需要为它优化吞吐。
+        # 批量取一次占用集合,不逐租户调单号版 —— 一批最多 DISPATCH_MAX_PARALLEL(96)个租户,
+        # 逐个调就是 96×2 次 scan(FilterExpression 是全表扫后过滤);十万级租户下那是 192 次
+        # 全表扫描,会把装箱主路径拖垮。批量版压成 2 次。
+        # exclude_ids 必须是【本批全部租户】:reserve 事务上面已经写了它们的
+        # vm_num/phys_vm_num,不排除的话每个租户都会"撞自己" → 整批误判 → 释放重投 → 再撞,
+        # 活锁。单号版靠 exclude_id 排自己 + 同批号互不相同才不受影响,批量版没这层保护。
+        batch_ids = {t["tenant_id"] for t in batch}
+        occupied_nums = scheduling.phys_occupied_nums(instance_id, exclude_ids=batch_ids)
+        if occupied_nums is None:
+            # 扫描失败 = 占用情况未知 → fail-closed:此刻可能正撞着号,不能放行去起 VM。
+            # 归入 reserve_retry_tids(不计 dispatch_retries、不清 claim),与
+            # _RESERVE_TRANSIENT 同语义 —— 瞬时读失败不该把健康租户推向
+            # requires_intervention。
+            print(
+                f"[dispatch] PHYS OCCUPANCY UNKNOWN host={instance_id} "
+                f"cmd={command_id} — release batch + requeue (fail-closed)"
+            )
+            _release_batch()
+            for t in batch:
+                _fail(
+                    t["tenant_id"],
+                    "phys occupancy scan failed (fail-closed)",
+                    instance_id,
+                )
+                reserve_retry_tids.add(t["tenant_id"])
+            continue
+        occupied = [
+            (t["tenant_id"], base + off)
+            for off, t in enumerate(batch)
+            if (base + off) in occupied_nums
+        ]
+        if occupied:
+            for tid, vnum in occupied:
+                print(
+                    f"[dispatch] PHYS TAP OCCUPIED tenant={tid} host={instance_id} "
+                    f"vm_num={vnum} cmd={command_id} — release batch + requeue"
+                )
+            _release_batch()
+            for t in batch:
+                _fail(
+                    t["tenant_id"],
+                    "phys tap occupied on host (batch released)",
+                    instance_id,
+                )
+                # 后者会进 _release_claims 并 ADD dispatch_retries(:1424),
+                # DISPATCH_RETRY_BUDGET 默认 3,于是连撞三次就把租户推进
+                # requires_intervention(:1483 的收敛逻辑)。撞号是**环境异常**(发号器被
+                # 回退),不是这个租户的错,不该烧它的预算;而且号段被占多少个是未知的,
+                # 用有限预算去换号必然误伤。reserve_retry_tids 保 claim、不计 retry,
+                # 靠 SQS 重投继续换号(next_vm_num 单调推进,必然收敛)。
+                reserve_retry_tids.add(t["tenant_id"])
+            continue
 
         if push_mode:
             try:

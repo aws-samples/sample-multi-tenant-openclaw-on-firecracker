@@ -1,0 +1,23 @@
+[Unit]
+Description=Host Agent
+After=network.target
+
+[Service]
+EnvironmentFile=/etc/platform.env
+ExecStart=/usr/bin/python3 /opt/openclaw/host-agent.py
+Restart=always
+RestartSec=5
+# KillMode=process:只对主进程(host-agent.py)发信号,不按 cgroup 连坐杀。host-agent 是
+# 监工,租户 firecracker VM 通过 launch-vm.sh nohup&disown 起、reparent 到 PID1,设计上应
+# 独立于 agent 存活(restart 后 _probe_all 靠 pgrep 探到 FC 仍活即复用=reconcile-and-reuse)。
+# restart 掉 30 个 VM;改 process 后 restart VM 存活 67/68)。随 LT/镜像重建天然继承,新 host 也安全。
+KillMode=process
+# PYTHONUNBUFFERED=1:host-agent 是 Restart=always 的长驻监工,永不退出。CPython 对非 tty
+# 的 stdout(systemd 把它接到 journal socket)用 8KB 块缓冲 → 日志量小时缓冲区攒很久才 flush,
+# 每行即时进 journal。与上面两行 Environment= 同款,不碰被 ha_edge.py 内联的 ExecStart。
+Environment=PYTHONUNBUFFERED=1
+Environment=OC_AGENT_PORT=8899
+Environment=OC_AGENT_POLL_INTERVAL=5
+
+[Install]
+WantedBy=multi-user.target

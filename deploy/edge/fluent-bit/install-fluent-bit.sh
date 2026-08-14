@@ -7,12 +7,10 @@
 # *config* (what to tail, which stream) lives per-role in S3 under
 # deployment/observability/fluent-bit/<role>/ and is pulled at runtime — so
 # changing the collection target = edit S3 config + roll fresh instances,
-# no AMI rebake (铁律#3: cold-inject on boot, no hot patching).
 #
 # Contract (env set by caller):
 #   FB_ROLE               edge | host — selects S3 subprefix + local fallback dir
 #   LOGGING_ENABLED       true|false (default true); false = skip entirely
-#   FB_INSTALL_ONLY       1 = stop after the package install, write no config (#389 v2).
 #                         Golden-image bake needs the package but MUST NOT bake the
 #                         config: it carries per-deployment Firehose stream names, and
 #                         an AMI is shared by the whole fleet. Boot then renders the
@@ -56,15 +54,17 @@ fb_installed() {
 if ! fb_installed; then
     ARCH_DEB="amd64"; [[ "$(uname -m)" == "aarch64" || "$(uname -m)" == "arm64" ]] && ARCH_DEB="arm64"
     if grep -qi ubuntu /etc/os-release 2>/dev/null; then
+        # modules:final 无 /dev/tty → rc=2 → init-host 非零 → ASG ABANDON,且每次
+        # boot 复现不收敛。真机实测 --batch --no-tty 无效(仍 rc=2,错误变 "dearmoring
+        # failed: File exists"),只有 --yes 才覆盖既有 keyring。
         curl -fsSL https://packages.fluentbit.io/fluentbit.key \
-            | gpg --dearmor -o /usr/share/keyrings/fluentbit.gpg
+            | gpg --batch --yes --dearmor -o /usr/share/keyrings/fluentbit.gpg
         codename="$(lsb_release -sc)"
         echo "deb [arch=$ARCH_DEB signed-by=/usr/share/keyrings/fluentbit.gpg] https://packages.fluentbit.io/ubuntu/$codename $codename main" \
             > /etc/apt/sources.list.d/fluent-bit.list
         apt-get update -qq
         apt-get install -y -qq fluent-bit
     elif grep -qi 'amazon linux' /etc/os-release 2>/dev/null; then
-        # #219 (真机 AL2023 2026-07-14): baseurl 不带 /$basearch/ —— Fluent Bit
         # 的 AL repo 不按 basearch 分子目录, 带上会 404 装不上。
         cat > /etc/yum.repos.d/fluent-bit.repo <<'FBREPO'
 [fluent-bit]
@@ -81,7 +81,6 @@ FBREPO
 fi
 
 if [[ "${FB_INSTALL_ONLY:-0}" == "1" ]]; then
-    # #389 v2: package installed, nothing configured or started. Deliberately before the
     # config pull so a bake needs neither ASSETS_BUCKET nor network S3 access, and cannot
     # accidentally capture another deployment's stream names into a shared image.
     log "FB_INSTALL_ONLY=1; package installed, skipping config + enable (bake mode)"

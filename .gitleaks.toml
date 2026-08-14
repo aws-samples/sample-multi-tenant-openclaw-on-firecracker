@@ -18,6 +18,13 @@ paths = [
   '''.*/test/.*\.(test\.)?mjs$''',
   '''samples/.*/test/.*''',
   '''samples/.*/tests/.*''',
+  # Captured CloudFormation templates under a patch kit. These are synthesized
+  # output, not authored source: minified JSON whose CDK asset fragments and
+  # logical ids sit next to key names containing "key" (for example
+  # "S3Key":"<8 chars>" and "ApirecipientkeyPOST...","<8 chars>"), which the
+  # generic-api-key rule reads as a secret. Every match measured here was eight
+  # characters long - too short to be a credential for any real service.
+  '''patch/[^/]+/resources/cloudformation/.*\.json$''',
 ]
 regexes = [
   '''REDACTED''',

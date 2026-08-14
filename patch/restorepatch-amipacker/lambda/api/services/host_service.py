@@ -15,6 +15,7 @@ import ipaddress
 from datetime import datetime
 
 import boto3
+from botocore.exceptions import ClientError
 
 from core.clients import (
     CPU_OVERCOMMIT_RATIO,
@@ -168,6 +169,103 @@ def _resolve_instance_memory_mb(ec2_client, instance_type):
         return 16384
 
 
+def _upsert_host_row(
+    instance_id,
+    instance_type,
+    private_ip,
+    az,
+    vcpu_total,
+    mem_total,
+    rootfs_version="",
+):
+    """#491 —— 重入安全的 host 注册写入。
+
+    此前是无条件 put_item(整项覆盖)且把四个运行时记账字段写成首启常量 0/0/0/1:对一台
+    已有在役租户的 host 再调一次 POST /hosts,账本被抹回初值、发号器随之回退到 1,之后
+    dispatch 的 reserve CAS 会把已在用的号再发一遍且每次都成功 → launch-vm.sh 抢占先到者
+    的 tap = 跨租户劫持(#491 已真机复现)。这与 init-host.sh 的自注册是同一缺陷的两个副本,
+
+    账本四字段(used_vcpu/used_mem_mb/vm_count/next_vm_num)的权威是控制面的认领/释放 CAS,
+    注册路径只能【补】不能【改】—— 读回再写也不行:读与写之间落地的并发 create 会被抹掉。
+    故首启走条件 put(记账起点只由这一次写产生),已存在则只刷静态字段 + 用 if_not_exists
+    补齐缺失的记账字段(缺字段的行会让 reserve 的 CAS 条件恒假 → 每次分配 CCF → 503,
+    见 #445 在 apse1 的实测)。范式与 init-host.sh(#445)对齐。
+
+    与 #470 的合流:rootfs_version 是【静态字段】(每次 bootstrap 拉到的 manifest 版本可能
+    不同),首启写入、重入刷新。取不到版本时【不写】—— DDB 拒空 S,写空还会假称"无版本"
+    (遵 #343/#304 非空才写),更不能擦掉行上已有的版本。
+    """
+    item = {
+        "instance_id": instance_id,
+        # 上面已从 describe_instances 取到(只用于查内存),这里一并持久化;缺失回落
+        # "unknown"(DDB 的 S 不接受空串),排序侧对未知 family 落表尾。
+        "instance_type": instance_type or "unknown",
+        "private_ip": private_ip,
+        "az": az,
+        # 这两个值本来就是标称的:CoreCount×ThreadsPerCore 与
+        # describe_instance_types 的 MemoryInfo.SizeInMiB 都是广告值。此前又扣
+        # HOST_RESERVED_*,于是同一台机器走 API 注册比走 init-host.sh 少一截容量,
+        # 达不到标称理论上限(384/256/192/128),两条路径口径分叉。
+        # host OS/Firecracker 驻留内存的保护改由 scheduling.mem_safety_floor_ratio
+        # 物理水位门承担(读 host 自报实测 MemAvailable)—— 与标称注册是一套。
+        "total_vcpu": vcpu_total,
+        "total_mem_mb": mem_total,
+        "used_vcpu": 0,
+        "used_mem_mb": 0,
+        "vm_count": 0,
+        "next_vm_num": 1,
+        "status": "active",
+        # idle_since 只在首启写:重入覆盖它会把一台正在服务的 host 的空闲起点
+        # 刷新掉,scaler 的 idle 回收判定会跟着错。
+        "idle_since": _now(),
+    }
+    if rootfs_version:
+        item["rootfs_version"] = rootfs_version
+    try:
+        hosts_table.put_item(
+            Item=item,
+            ConditionExpression="attribute_not_exists(instance_id)",
+        )
+        return
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise  # 限流/权限/网络等真错误照原样上抛,不能与"已存在"混为一谈
+    # CCF = 本实例已注册过(重入)。status 仍写 active:重新注册的意图就是让 draining 的
+    # host 重新可调度。status 是 DDB 保留字,必须走 ExpressionAttributeNames 别名。
+    sets = [
+        "instance_type = :it",
+        "private_ip = :ip",
+        "az = :az",
+        "total_vcpu = :tv",
+        "total_mem_mb = :tm",
+        "#s = :st",
+        "used_vcpu = if_not_exists(used_vcpu, :zero)",
+        "used_mem_mb = if_not_exists(used_mem_mb, :zero)",
+        "vm_count = if_not_exists(vm_count, :zero)",
+        "next_vm_num = if_not_exists(next_vm_num, :one)",
+    ]
+    vals = {
+        ":it": instance_type or "unknown",
+        ":ip": private_ip,
+        ":az": az,
+        ":tv": vcpu_total,
+        ":tm": mem_total,
+        ":st": "active",
+        ":zero": 0,
+        ":one": 1,
+    }
+    if rootfs_version:
+        sets.append("rootfs_version = :rv")
+        vals[":rv"] = rootfs_version
+    hosts_table.update_item(
+        Key={"instance_id": instance_id},
+        UpdateExpression="SET " + ", ".join(sets),
+        ConditionExpression="attribute_exists(instance_id)",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues=vals,
+    )
+
+
 def register_host(body):
     if body is None:
         return _err(400, "VALIDATION", "missing body")
@@ -201,32 +299,16 @@ def register_host(body):
     # Stamp it from the live S3 manifest (same source as GET /hosts/rootfs-version)
     # bb); this only covers hosts registered through the API. Omit on unknown/empty
     # rather than writing "" — DDB rejects empty S and an empty value would falsely
-    host_item = {
-        "instance_id": instance_id,
-        # 上面已从 describe_instances 取到(只用于查内存),这里一并持久化;缺失回落
-        # "unknown"(DDB 的 S 不接受空串),排序侧对未知 family 落表尾。
-        "instance_type": instance_type or "unknown",
-        "private_ip": private_ip,
-        "az": az,
-        # 这两个值本来就是标称的:CoreCount×ThreadsPerCore 与
-        # describe_instance_types 的 MemoryInfo.SizeInMiB 都是广告值。此前又扣
-        # HOST_RESERVED_*,于是同一台机器走 API 注册比走 init-host.sh 少一截容量,
-        # 达不到标称理论上限(384/256/192/128),两条路径口径分叉。
-        # host OS/Firecracker 驻留内存的保护改由 scheduling.mem_safety_floor_ratio
-        # 物理水位门承担(读 host 自报实测 MemAvailable)—— 与标称注册是一套。
-        "total_vcpu": vcpu_total,
-        "total_mem_mb": mem_total,
-        "used_vcpu": 0,
-        "used_mem_mb": 0,
-        "vm_count": 0,
-        "next_vm_num": 1,
-        "status": "active",
-        "idle_since": _now(),
-    }
     rootfs_version = _get_manifest().get("version", "")
-    if rootfs_version:
-        host_item["rootfs_version"] = rootfs_version
-    hosts_table.put_item(Item=host_item)
+    _upsert_host_row(
+        instance_id,
+        instance_type,
+        private_ip,
+        az,
+        vcpu_total,
+        mem_total,
+        rootfs_version,
+    )
     return _resp(201, {"instance_id": instance_id, "status": "active", "az": az})
 
 

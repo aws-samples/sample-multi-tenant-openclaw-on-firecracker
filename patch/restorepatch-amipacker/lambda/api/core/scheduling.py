@@ -20,6 +20,8 @@ overcommit/quota 常量**全部**走 `clients.X` 属性访问,不用 from-import
 
 import time
 
+from botocore.exceptions import ClientError
+
 import core.capacity as capacity
 import core.clients as clients
 import core.host_profile as host_profile
@@ -119,8 +121,260 @@ def _registered_host_count():
 
 # ========== Helpers ==========
 
+PHYS_SLOT_PREFIX = "ps_"
+# DDB 表达式最多 300 个 operator。n 个号的不存在条件约占 2n+1 个,
+# 取 120 给容量、乐观锁和 inflight 条件留足余量。
+MAX_ATOMIC_SLOT_CLAIM = 120
 
-def _release_slot(instance_id, vcpu, mem_mb):
+
+def phys_slot_attr(num):
+    """物理号对应的 host 扁平占号属性。"""
+    return f"{PHYS_SLOT_PREFIX}{int(num)}"
+
+
+def slot_claim_clause(nums, alias_prefix="ps"):
+    """返回批量原子占号所需的 condition/set/name/value-key 片段。"""
+    conditions = []
+    assignments = []
+    names = {}
+    value_keys = []
+    for index, num in enumerate(nums):
+        name_key = f"#{alias_prefix}{index}"
+        value_key = f":{alias_prefix}v{index}"
+        names[name_key] = phys_slot_attr(num)
+        conditions.append(f"attribute_not_exists({name_key})")
+        assignments.append(f"{name_key} = {value_key}")
+        value_keys.append(value_key)
+    return " AND ".join(conditions), ", ".join(assignments), names, value_keys
+
+
+def _host_claimed_slots(host_item, exclude_ids=None):
+    """返回 host item 上未被排除 owner 占用的 {物理号: owner}。"""
+    skip = exclude_ids or frozenset()
+    claimed = {}
+    for key, owner in (host_item or {}).items():
+        if not key.startswith(PHYS_SLOT_PREFIX) or owner in skip:
+            continue
+        try:
+            claimed[int(key[len(PHYS_SLOT_PREFIX):])] = owner
+        except (TypeError, ValueError):
+            continue
+    return claimed
+
+
+def _occupied_union(host_id, exclude_ids=None):
+    """占用集合 = 租户表权威记录 ∪ host 上先写入的 ps_* 原子占号。"""
+    try:
+        occupied = set(_iter_phys_nums(host_id, exclude_ids=exclude_ids))
+        host_item = (
+            clients.hosts_table.get_item(
+                Key={"instance_id": host_id}, ConsistentRead=True
+            ).get("Item")
+            or {}
+        )
+        occupied.update(_host_claimed_slots(host_item, exclude_ids))
+        return occupied
+    except Exception as e:  # noqa: BLE001 — 未知必须 fail-closed
+        print(f"_occupied_union({host_id}) read failed → fail-closed: {e}")
+        return None
+
+
+def phys_tap_occupied(host_id, phys_num, exclude_id=None):
+    """#208 — target host 上物理 tap-vm{phys_num} 是否已被别的租户占用?
+
+    前导下划线)。原因:队列 dispatch 路径也必须过这道门,它此前零覆盖 —— 发号器一旦被
+    回退(init-host 整项覆写 / register_host 无条件 put_item),reserve 的 CAS 会把已在用
+    的号再发一遍且每次都成功,launch-vm.sh 随后 `ip link del`+`kill -KILL` 抢占先到者的
+    tap = 跨租户劫持(已真机复现)。依赖方向仍是 core → core.clients,不反向 import services。
+
+    "物理占用"= 某租户当前活在 host_id 上、且它 microVM 实际挂的 tap-vm 号 == phys_num。
+    物理 tap 号的权威是 **phys_vm_num**(创建时写,迁移不改;host-agent 从 vm.json 回填
+    历史/迁移前建的租户)。老租户可能还没回填 phys_vm_num → 回退到 vm_num:对**从未迁移**
+    的租户 vm_num == 物理 tap 号,判定正确;迁移过的租户在回填前是残余盲区(见 MR 描述
+    "已知残余"),host-agent 一个 tick 内即回填补齐。
+
+    覆盖两个来源(与原 #208 双 scan 同构,只把 key 从 vm_num 换成物理 tap 号):
+      ① 已驻留 host_id 的租户(host_id=:h, 非 deleted)
+      ② 正在迁入 host_id 的租户(migration_target=:h, status=migrating)——它一旦 restore
+         成功就会在本 host 挂 tap-vm{它的 phys_vm_num},必须提前算进占用。
+    任一命中即占用。fail-closed:scan 异常时当作"已占"(宁可让调用方重试/换号,不放行撞号)。
+    exclude_id:排除租户自身(重入/自迁移场景不算撞自己)。
+    """
+    try:
+        n = int(phys_num)
+    except (TypeError, ValueError):
+        return True  # 号非法 → fail-closed
+    occupied = _occupied_union(
+        host_id, exclude_ids={exclude_id} if exclude_id else None
+    )
+    return True if occupied is None else n in occupied
+
+
+def phys_occupied_nums(host_id, exclude_ids=None):
+    """#491 —— 一次扫描拿回 host_id 上【全部】已占用的物理 tap 号(批量版)。
+
+    为什么要批量版:队列 dispatch 一批最多 DISPATCH_MAX_PARALLEL(默认 96)个租户,逐个调
+    phys_tap_occupied 就是 96×2 次 scan(FilterExpression 是全表扫后过滤)。当前表几百行
+    还扛得住,但本项目的目标规模是十万级租户 —— 那会变成 192 次十万行全表扫描,把装箱
+    主路径拖垮。批量版把它压成 2 次(两个来源各一次,各自翻页)。
+
+    exclude_ids:**必须**把本批租户自己传进来。reserve 事务已经写了它们的
+    vm_num/phys_vm_num(dispatch_service:587-617),不排除的话每个租户都会"撞自己",
+    整批被误判撞号 → 释放重投 → 再撞 → 活锁。单号版靠 exclude_id 排自己且同批号互不相同
+    才不受影响,批量版没有这层保护,故这里把它写成硬要求。
+
+    返回:占用号集合;**扫描失败返回 None(= 未知)**。调用方看到 None 必须 fail-closed
+    (当作可能撞号处理),绝不能把它当空集合 —— 那等于 fail-open 放行撞号。
+    """
+    return _occupied_union(host_id, exclude_ids=exclude_ids)
+
+
+def release_phys_slot(host_id, phys_num, tenant_id):
+    """仅当 ps_<n> 仍属于 tenant_id 时释放；owner 不匹配视为已接手。"""
+    try:
+        clients.hosts_table.update_item(
+            Key={"instance_id": host_id},
+            UpdateExpression="REMOVE #ps",
+            ConditionExpression="#ps = :tid",
+            ExpressionAttributeNames={"#ps": phys_slot_attr(phys_num)},
+            ExpressionAttributeValues={":tid": tenant_id},
+        )
+        return True
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return False
+        print(f"release_phys_slot({host_id},{phys_num}) failed: {e}")
+        return False
+    except Exception as e:  # noqa: BLE001 — 对账会重试孤儿
+        print(f"release_phys_slot({host_id},{phys_num}) failed: {e}")
+        return False
+
+
+def reap_orphan_phys_slots(host_id, alive_tenant_ids, dry_run=True):
+    """清理 ps_<n> owner 已不在役的孤儿；租户表是 owner 存活性的权威。"""
+    item = (
+        clients.hosts_table.get_item(
+            Key={"instance_id": host_id}, ConsistentRead=True
+        ).get("Item")
+        or {}
+    )
+    claimed = _host_claimed_slots(item)
+    orphans = sorted(
+        (num, owner) for num, owner in claimed.items() if owner not in alive_tenant_ids
+    )
+    if not dry_run:
+        for num, owner in orphans:
+            release_phys_slot(host_id, num, owner)
+    if orphans:
+        print(
+            f"reap_orphan_phys_slots({host_id}) dry_run={dry_run} "
+            f"orphans={orphans[:20]}{'...' if len(orphans) > 20 else ''}"
+        )
+    return orphans
+
+
+def next_free_phys_num(host_id, start, exclude_ids=None, limit=4096):
+    """#491(review2)—— 从 start 起找第一个【未被物理占用】的号。
+
+    为什么不「试号→撞了归还→再试」:那个框架有三个补不掉的洞 ——
+      · "试几次就放弃"的上限任选都不对:发号器被回退到 1 而该 host 上有几百个在役租户时,
+        低位号段全被占,任何有限次数都会误报「无容量」;
+      · 每轮试号都要归还刚认领的记账,而这两条路径没有 capacity_reservation_id 令牌,
+        归还做不到既幂等又可确认(限流/超时/响应丢失时无法判断扣减是否提交);
+      · 靠 SQS 或下次事件重试换号又受 dlq_max_receive_count=3 与「事件才触发」限制。
+    先算出空号、再用跳号 CAS 一次认领它,三个洞一起消失:不试号、不回滚、不依赖重投。
+
+    返回 (num, occupied_set)。(None, None) = 占用集合读失败 → 调用方必须 fail-closed;
+    (None, occupied) = 搜索上界内无空号。limit 是防御性上界(单 host 物理槽位远小于它),
+    不是重试次数。
+    """
+    occupied = phys_occupied_nums(host_id, exclude_ids=exclude_ids)
+    if occupied is None:
+        return None, None
+    try:
+        n = int(start)
+    except (TypeError, ValueError):
+        return None, occupied
+    end = n + int(limit)
+    while n < end:
+        if n not in occupied:
+            return n, occupied
+        n += 1
+    return None, occupied
+
+
+def next_free_phys_run(host_id, start, count, exclude_ids=None, limit=4096):
+    """#491(review2)—— 从 start 起找第一个长度 >= count 的【连续】空号段起点。
+
+    dispatch 批量必须要连续段:reserve 事务按 base+offset 给批内每个租户定号,
+    _write_assignments / _put_manifest_parts 也按同一 offset 推算,非连续会让号错位。
+    语义与 next_free_phys_num 一致((None,None)=读失败→fail-closed)。
+    """
+    occupied = phys_occupied_nums(host_id, exclude_ids=exclude_ids)
+    if occupied is None:
+        return None, None
+    try:
+        n = int(start)
+        need = int(count)
+    except (TypeError, ValueError):
+        return None, occupied
+    if need <= 0:
+        return n, occupied
+    end = n + int(limit)
+    while n < end:
+        blocked_at = None
+        for k in range(need):
+            if (n + k) in occupied:
+                blocked_at = n + k
+                break
+        if blocked_at is None:
+            return n, occupied
+        n = blocked_at + 1  # 起点跳到冲突号之后,不必逐个回退
+    return None, occupied
+
+
+def _iter_phys_nums(host_id, exclude_ids=None):
+    """遍历 host_id 上(已驻留 + 迁入中)租户的物理 tap 号。异常向上抛,由调用方定 fail 策略。
+
+    scan(FilterExpression) **分页**:每页最多扫 1MB 就返回 + LastEvaluatedKey。命中的
+    迁入租户可能落在后页,不翻页会漏判 → fail-open 重开安全洞。故必须循环 ExclusiveStartKey
+    翻完(单号调用方可在命中时提前 break,不必扫全表)。
+    """
+    skip = exclude_ids or frozenset()
+    for expr, extra in (
+        ("host_id = :h AND #s <> :d", {":d": "deleted"}),
+        ("migration_target = :h AND #s = :mig", {":mig": "migrating"}),
+    ):
+        vals = {":h": host_id}
+        vals.update(extra)
+        start_key = None
+        while True:
+            kw = {
+                "FilterExpression": expr,
+                "ExpressionAttributeNames": {"#s": "status"},
+                "ExpressionAttributeValues": vals,
+                # 物理 tap 号 = phys_vm_num,回退 vm_num(未回填的非迁移租户二者相等)。
+                # ProjectionExpression 只取判定所需字段,少读带宽。
+                "ProjectionExpression": "id, vm_num, phys_vm_num",
+                "ConsistentRead": True,
+            }
+            if start_key:
+                kw["ExclusiveStartKey"] = start_key
+            resp = clients.tenants_table.scan(**kw)
+            for it in resp.get("Items", []):
+                if it.get("id") in skip:
+                    continue
+                phys = it.get("phys_vm_num", it.get("vm_num"))
+                try:
+                    yield int(phys)
+                except (TypeError, ValueError):
+                    continue
+            start_key = resp.get("LastEvaluatedKey")
+            if not start_key:
+                break
+
+
+def _release_slot(instance_id, vcpu, mem_mb, phys_num=None, tenant_id=None):
     """Roll back a capacity reservation made by the create/clone CAS when a
     later step (put_item / launch) fails. Decrements used_vcpu / used_mem_mb /
     vm_count but deliberately does NOT decrement next_vm_num — vm_num is a
@@ -128,17 +382,27 @@ def _release_slot(instance_id, vcpu, mem_mb):
     concurrent allocation that already claimed the next slot. Leaving a gap in
     the numbering is harmless; reusing a number is not. Best-effort; never
     raises (rollback failure must not mask the original error)."""
+    kwargs = {
+        "Key": {"instance_id": instance_id},
+        "UpdateExpression": (
+            "SET used_vcpu = used_vcpu - :v, used_mem_mb = used_mem_mb - :m, "
+            "vm_count = vm_count - :one"
+        ),
+        "ConditionExpression": (
+            "used_vcpu >= :v AND used_mem_mb >= :m AND vm_count >= :one"
+        ),
+        "ExpressionAttributeValues": {":v": vcpu, ":m": mem_mb, ":one": 1},
+    }
+    if phys_num is not None and tenant_id:
+        # 占号先还,且【独立于】容量释放的结果:存量租户没有 ps_*,容量释放不能依赖该属性;
+        # 反过来容量条件失败(重复回滚/字段缺失)也不能连带把号泄漏掉 —— 号还被占着时
+        # reaper 也救不了(owner 仍在役),故用 owner 条件单独删,不抛。
+        release_phys_slot(instance_id, phys_num, tenant_id)
     try:
-        clients.hosts_table.update_item(
-            Key={"instance_id": instance_id},
-            UpdateExpression=(
-                "SET used_vcpu = used_vcpu - :v, used_mem_mb = used_mem_mb - :m, "
-                "vm_count = vm_count - :one"
-            ),
-            ConditionExpression="used_vcpu >= :v AND used_mem_mb >= :m AND vm_count >= :one",
-            ExpressionAttributeValues={":v": vcpu, ":m": mem_mb, ":one": 1},
-        )
-    except Exception as e:
+        clients.hosts_table.update_item(**kwargs)
+    except ClientError as e:
+        print(f"_release_slot {instance_id} (non-fatal): {e}")
+    except Exception as e:  # noqa: BLE001
         print(f"_release_slot {instance_id} (non-fatal): {e}")
 
 

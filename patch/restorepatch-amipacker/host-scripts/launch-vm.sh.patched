@@ -876,12 +876,114 @@ if [ "${NEEDS_INIT}" = "true" ]; then
         mv "${_DL}" "${_GZ}"   # 明文备份:直接当 .gz
         ;;
     esac
-    if ! pigz -d -c "${_GZ}" > ${DATA_VOL}; then
-      rm -f "${_GZ}" ${DATA_VOL}
-      log "FATAL(#199): restore .gz 解压失败(截断/损坏)— 拒起,不留半个盘"
+    # ── 解压 data.ext4:双格式(新 tar -S / 旧裸 pigz),必须都能恢复 ──
+    #
+    # 为什么分两种:data.ext4 是 8G 声明的稀疏盘,真实数据仅 ~77M(实测 275 个盘稀疏率
+    # 99.66%)。旧格式(裸 pigz)读它时内核把洞展开成零 → 归档含 7.9G 零 → 恢复端 pigz
+    # 必须串行 inflate 出完整 8G。pigz 解压是【算法级串行】(DEFLATE 滑动窗口有前后依赖;
+    # 实测 -p 96 与默认同为 16.7s、%CPU 仅 135%,96 核用不上),这 16.5s 全在解无用的零。
+    # 新格式 tar -S 逐块判零、零块只进段表,恢复时 lseek 跳洞(实测 34 次 lseek 跳过 7.9G,
+    # 只 write 76.6M)。同一盘实测:旧 16.70s+0.92s 稀疏化 → 新 0.14s,且 md5 与源一致。
+    #
+    # 【双格式探测是硬要求,不是兼容性优化】:S3 里现存全部是旧格式,而 restore 是 5 条
+    # 链路的共同出口(POST /restore、POST /tenants{restore_from}、AZ failover、scaler
+    # image_refresh、queue 重投)。其中 health_check 的 failover 找不到可恢复备份就【拒绝
+    # 迁移】——若旧备份读不出,宿主机故障时全部租户无法容灾(no-data-loss 违规)。
+    #
+    # 探测用 `tar -tf` 试读归档目录:tar 头部有 magic("ustar")+校验和,裸 ext4 流几乎
+    # 不可能通过,误判风险极低;失败则回落旧路径,行为与改动前完全一致。
+    # 注意探测【隐含也校验了 gz 完整性】:损坏/截断/空/非 gzip 的输入都过不了这一步,
+    # 于是一律落到 legacy 分支,由那里的 `if ! pigz` 统一 FATAL。真机实测 T3/T4/T5
+    # (截断 tar+gz / 空 / 随机垃圾)全部 exit 1 且零残留——结果正确,只是日志会记成
+    # legacy 解压失败而非 tar 解包失败,归因略偏但不影响 fail-loud 语义。
+    _RAW="${DATA_VOL}.raw"
+    _IS_TAR=0
+    # ── 成员清单必须【精确】等于 data.ext4(codex 独立复审 blocker)────────────
+    # 只要 `tar -tf` 读得通就当新格式、然后 `tar -x -C ${VM_DIR}` 解【全部成员】,
+    # 等于把归档内容当可信输入:一个合法 tar 里若含 `overlay.ext4`(五盘契约的 rw 层)、
+    # `vm.json`(host-agent 的 recover 标记)或 `../<别的租户>/data.ext4`(路径遍历),
+    # 就能改写 VM 目录乃至越界;而下方的大小门只看 data.ext4,那些成员即使让整次 restore
+    # 失败也已经落地(FATAL 只 rm data.ext4)。
+    # 故先取清单严格比对:必须【恰好一行】且等于 `data.ext4`。不等 → 不认作新格式。
+    # 用 `tar -tf` 的输出而非 `--wildcards` 之类:清单比对是白名单,任何意外成员一律拒。
+    # ★ 必须 `set +e` 圈住这次探测(codex 独立复审)。顶层是 `set -euo pipefail`(:5),
+    #   而 legacy(裸 pigz)备份让 `tar -tf` 失败 = 命令替换非零 → **整个脚本在这一行
+    #   就退出**,`_MEMBERS` 为空的 legacy 分支永远不可达。S3 里现存全部是旧格式,
+    #   这会让 AZ failover / restore_from 全线恢复失败(真机实测:legacy 输入 rc=2,
+    #   探测行之后的语句一句都没执行)。pipefail 下 pigz 侧失败同样触发。
+    set +e
+    _MEMBERS="$(pigz -d -c "${_GZ}" 2>/dev/null | tar -tf - 2>/dev/null)"
+    set -e
+    if [ "${_MEMBERS}" = "data.ext4" ]; then
+      _IS_TAR=1
+    elif [ -n "${_MEMBERS}" ]; then
+      # 读得通 tar 但成员清单不对:这【不是】本仓 backup-data.sh 的产物。绝不落 legacy
+      # 分支拿裸 pigz 当 ext4 用(那会把 tar 头部当文件系统),直接 fail-loud 拒起。
+      rm -f "${_GZ}" "${_RAW}" ${DATA_VOL}
+      log "FATAL(#199): restore 归档成员清单非预期(期望恰好 data.ext4,实得:$(printf '%s' "${_MEMBERS}" | tr '\n' ',' | cut -c1-200))— 拒起,不解包"
       exit 1
     fi
-    rm -f "${_GZ}"
+    if [ "${_IS_TAR}" -eq 1 ]; then
+      # 新格式:tar -xS 直接产出稀疏文件,无需 .raw 中间文件、无需 cp --sparse。
+      # 顶层是 `set -euo pipefail`(:5):管道任一环失败会【立刻】触发 -e 退出,来不及
+      # 读 PIPESTATUS。必须 set +e 圈住,自己判两个码再决定清理+FATAL——否则数据盘
+      # 半成品会随 ERR trap 退出而残留(trap 只 kill FC,不删盘)。
+      #
+      # 纵深防御(即使清单已校验过):
+      #  · 解到【专用空目录】而非 ${VM_DIR},解成功后只 mv 出 data.ext4 —— 万一 tar 的
+      #    清单显示与实际解出内容不一致(GNU tar 的 sparse 成员由多个头部描述),落地面
+      #    也只有这个临时目录,VM_DIR 里的 overlay/vm.json 碰不到;
+      #  · `--no-same-owner` + 只解 `data.ext4` 这一个成员(而非整个归档)。
+      # 注:不用 `--no-absolute-names` —— GNU tar 1.35 【没有】这个选项(真机实测
+      # `unrecognized option`,rc=64,曾让本段正路直接失败)。它也不需要:GNU tar
+      # 提取时默认就剥掉前导 `/`(实测打印 "Removing leading '/' from member names",
+      # 归档里的 /etc/hostname 落到 -C 目标下而非真的 /etc)。`../` 由上面的清单
+      # 白名单挡住(清单必须恰好等于 data.ext4)。
+      _XD="${VM_DIR}/.restore-x"
+      rm -rf "${_XD}"; mkdir -p "${_XD}"
+      rm -f ${DATA_VOL}
+      set +e
+      pigz -d -c "${_GZ}" | tar -xSf - -C "${_XD}" --no-same-owner data.ext4
+      # 必须【同一行】一次性取两个码:任何中间命令(含赋值)都会覆盖 $? 和 PIPESTATUS。
+      _pipe_rc="${PIPESTATUS[0]}" _tar_rc="${PIPESTATUS[1]}"
+      set -e
+      # 解出的内容必须【只有】data.ext4 这一个普通文件,否则连临时目录一起丢掉。
+      _xtra="$(find "${_XD}" -mindepth 1 ! -name data.ext4 2>/dev/null | head -3)"
+      if [ "${_pipe_rc:-1}" -ne 0 ] || [ "${_tar_rc:-1}" -ne 0 ] ||
+         [ ! -f "${_XD}/data.ext4" ] || [ -n "${_xtra}" ]; then
+        rm -rf "${_XD}"
+        rm -f "${_GZ}" ${DATA_VOL}
+        log "FATAL(#199): restore tar 解包失败(pigz rc=${_pipe_rc} tar rc=${_tar_rc} extra='${_xtra}';截断/损坏/成员非预期)— 拒起,不留半个盘"
+        exit 1
+      fi
+      # 同一文件系统内 mv = rename,保留稀疏性(不会物化空洞)。
+      if ! mv -f "${_XD}/data.ext4" ${DATA_VOL}; then
+        rm -rf "${_XD}"; rm -f "${_GZ}" ${DATA_VOL}
+        log "FATAL(#199): restore 产物移入 VM 目录失败 — 拒起,不留半个盘"
+        exit 1
+      fi
+      rm -rf "${_XD}"
+      log "restore: sparse-aware tar 解包完成"
+    else
+      # 旧格式(裸 pigz 流):解到 .raw 再 cp --sparse=always 转稀疏——与下方新建路径
+      # (`cp --sparse=always ${DATA_TPL}`)同一写法。不用 `pigz | dd conv=sparse`:
+      # 本段无 pipefail,pigz 失败时 $? 取 dd 的退出码,dd 收不完整数据仍可能返 0。
+      # 临时文件保留 `if ! pigz` 直接捕获 pigz 自身退出码的 fail-loud 语义。
+      # .raw 落 ${VM_DIR}(/data,与 DATA_VOL 同盘)而非 /tmp:8G 放不进 20G 根卷。
+      if ! pigz -d -c "${_GZ}" > "${_RAW}"; then
+        rm -f "${_GZ}" "${_RAW}" ${DATA_VOL}
+        log "FATAL(#199): restore .gz 解压失败(截断/损坏)— 拒起,不留半个盘"
+        exit 1
+      fi
+      if ! cp --sparse=always "${_RAW}" ${DATA_VOL}; then
+        rm -f "${_GZ}" "${_RAW}" ${DATA_VOL}
+        log "FATAL: restore 稀疏化失败(磁盘空间/IO)— 拒起,不留半个盘"
+        exit 1
+      fi
+      rm -f "${_RAW}"
+      log "restore: legacy 裸 pigz 流 + 稀疏化完成"
+    fi
+    rm -f "${_RAW}" "${_GZ}"
     _restored_bytes="$(stat -c%s ${DATA_VOL} 2>/dev/null || echo 0)"
     if [ "${_restored_bytes}" -lt 65536 ]; then
       rm -f ${DATA_VOL}

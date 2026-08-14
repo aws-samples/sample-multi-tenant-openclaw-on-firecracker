@@ -43,6 +43,9 @@ STATE_IN_PROGRESS = "IN_PROGRESS"
 STATE_SUCCEEDED = "SUCCEEDED"
 STATE_FAILED = "FAILED"
 STATE_UNKNOWN = "UNKNOWN"
+# The operation definitely did not reach its destructive dispatch point. Unlike
+# UNKNOWN, replaying this state is unconditionally safe.
+STATE_NOT_STARTED = "NOT_STARTED"
 
 _TERMINAL_STATES = (STATE_SUCCEEDED, STATE_FAILED)
 
@@ -135,11 +138,13 @@ def _is_ccf(exc):
 
 
 def finish(tenant_id, action, owner_id, client_token, state, result=None):
-    """写终态 result。state 取 STATE_SUCCEEDED / FAILED / UNKNOWN。
+    """写结果。state 取 SUCCEEDED / FAILED / UNKNOWN / NOT_STARTED。
 
     绝不新建记录(`attribute_exists(id)`):若 begin 那步没落库(表缺失/写失败 fail-open),
     这里也不该凭空造一条 —— 否则会出现「没占位却有结果」的记录,让后续同 token 请求拿到
     一个从未真正占位过的答案。
+
+    SUCCEEDED 单调:迟到的失败/未知回执不得把已确认成功退回非终态。
 
     写失败只记日志:结果记录是给重放用的加固,拿不到它远好于让一次已经成功的操作报错。
     """
@@ -148,22 +153,64 @@ def finish(tenant_id, action, owner_id, client_token, state, result=None):
         return
     key = idem_id(tenant_id, action, owner_id, client_token)
     try:
+        condition = "attribute_exists(id)"
+        values = {
+            ":s": state,
+            ":r": result or {},
+            ":t": _now(),
+            ":ttl": _ttl_epoch(),
+        }
+        if state != STATE_SUCCEEDED:
+            condition += " AND #st <> :succeeded"
+            values[":succeeded"] = STATE_SUCCEEDED
         table.update_item(
             Key={"id": key},
             UpdateExpression=(
                 "SET #st = :s, #rs = :r, finished_at = :t, inflight_ttl = :ttl"
             ),
-            ConditionExpression="attribute_exists(id)",
+            ConditionExpression=condition,
+            ExpressionAttributeNames={"#st": "state", "#rs": "result"},
+            ExpressionAttributeValues=values,
+        )
+    except Exception as e:  # noqa: BLE001
+        if _is_ccf(e):
+            return
+        print(f"action_idem finish({state}) failed for {key}: {e}")
+
+
+def claim_rerun(tenant_id, action, owner_id, client_token, expected_state):
+    """Atomically move one retryable record back to IN_PROGRESS.
+
+    Multiple callers can read UNKNOWN/NOT_STARTED concurrently. Only the one
+    that wins this conditional update may dispatch the operation again.
+    """
+    if expected_state not in (STATE_UNKNOWN, STATE_NOT_STARTED):
+        return False
+    table = getattr(clients, "tenants_table", None)
+    if table is None:
+        return True
+    key = idem_id(tenant_id, action, owner_id, client_token)
+    try:
+        table.update_item(
+            Key={"id": key},
+            UpdateExpression=(
+                "SET #st = :in_progress, resumed_at = :t, inflight_ttl = :ttl "
+                "REMOVE #rs, finished_at"
+            ),
+            ConditionExpression="attribute_exists(id) AND #st = :expected",
             ExpressionAttributeNames={"#st": "state", "#rs": "result"},
             ExpressionAttributeValues={
-                ":s": state,
-                ":r": result or {},
+                ":in_progress": STATE_IN_PROGRESS,
+                ":expected": expected_state,
                 ":t": _now(),
                 ":ttl": _ttl_epoch(),
             },
         )
+        return True
     except Exception as e:  # noqa: BLE001
-        print(f"action_idem finish({state}) failed for {key}: {e}")
+        if not _is_ccf(e):
+            print(f"action_idem claim_rerun failed for {key}: {e}")
+        return False
 
 
 def replay_decision(existing):
@@ -172,6 +219,7 @@ def replay_decision(existing):
     · ("return", result)  —— 有确定答案,原样返回(同一 token 得到同一答案)。
     · ("poll", op_id)     —— 仍在跑,让调用方轮询,**不要重试**。
     · ("rerun", op_id)    —— UNKNOWN:可能已执行也可能没,重放去做对账。
+    · ("rerun", op_id)    —— NOT_STARTED:明确未下发,安全重试。
 
     UNKNOWN 走 rerun 而非 return,是 image_ops.py 已论证过的结论:落 FAILED/直接返回会
     让同 token 重试被挡死,而 UNKNOWN 本身就表示「需要再确认一次」。
@@ -181,6 +229,6 @@ def replay_decision(existing):
     op_id = (existing or {}).get("op_id") or ""
     if state in _TERMINAL_STATES:
         return "return", (existing or {}).get("result") or {}
-    if state == STATE_UNKNOWN:
+    if state in (STATE_UNKNOWN, STATE_NOT_STARTED):
         return "rerun", op_id
     return "poll", op_id

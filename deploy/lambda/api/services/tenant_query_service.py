@@ -11,6 +11,7 @@ from core.auth import _get_caller_identity
 from core.clients import tenants_table
 from core.pagination import decode_cursor, encode_cursor
 from core.utils import _TENANT_USER_ID_RE, _err, _resp
+from services.tenant_service import _redact_tenant
 
 
 QUERY_FIELDS = ("user_id", "host_id", "status", "rootfs_version")
@@ -20,30 +21,6 @@ INDEXES = {
     "status": ("gsi_status", "status"),
     "rootfs_version": ("gsi_rootfs_version", "q_rootfs_version"),
 }
-PUBLIC_FIELDS = frozenset(
-    {
-        "id",
-        "name",
-        "tenant_user_id",
-        "owner_id",
-        "platform_id",
-        "host_id",
-        "vm_num",
-        "status",
-        "rootfs_version",
-        "image_id",
-        "vcpu",
-        "mem_mb",
-        "tags",
-        "group",
-        "purchase_status",
-        "created_at",
-        "updated_at",
-        "deleted_at",
-        "health_failures",
-        "requires_intervention_ts",
-    }
-)
 _HOST_ID_RE = re.compile(r"^i-[0-9a-f]{8,17}\Z")
 _STATUS_RE = re.compile(r"^[a-z_]{1,64}\Z")
 # 与 activename#/inflight# 同款前缀隔离)。不补的话 GET /tenants 会把这些内部记录当成业务
@@ -55,12 +32,6 @@ _RESPONSE_ITEM_BUDGET = 4_800_000
 def is_tenant_record(item):
     item_id = str(item.get("id", ""))
     return bool(item_id) and not item_id.startswith(_INTERNAL_PREFIXES)
-
-
-def public_tenant(item):
-    result = {key: value for key, value in item.items() if key in PUBLIC_FIELDS}
-    result.setdefault("tags", {})
-    return result
 
 
 def _validate(field, value):
@@ -151,7 +122,13 @@ def list_tenants_by_condition(query, event):
             and raw_item.get("status") == "deleted"
         ):
             continue
-        item = public_tenant(raw_item)
+        # GET /tenants path (_redact_tenant = full row minus the secret blacklist),
+        # not a narrow allowlist. The allowlist silently dropped non-secret
+        # operational fields callers depend on (app_health, metrics, vm_health,
+        # ...). _redact_tenant is the shared secret choke point, so parity here
+        # never leaks a credential.
+        item = _redact_tenant(raw_item)
+        item.setdefault("tags", {})
         item_size = len(
             json.dumps(item, separators=(",", ":"), default=str).encode("utf-8")
         )

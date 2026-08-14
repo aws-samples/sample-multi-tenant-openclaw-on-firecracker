@@ -173,13 +173,13 @@ s3:
 asg:
   # 首次部署必须先设 0:镜像烤制是非阻塞独立栈;若 min>=1,host 会抢在镜像就绪前
   # 启动并因拉不到镜像触发 lifecycle hook ABANDON,ASG 随后反复换机。
-  min_capacity: 2
+  min_capacity: 0
   max_capacity: 8
   # init-host 必须在此超时内完成(注册 DDB 后 CONTINUE),否则 ABANDON→ASG 替换。
   # r8g.metal-24xl 物理机:Nitro 硬件初始化慢 + 下载 842MB 黄金镜像(rootfs+data)+
-  # 解压挂盘 + 注册,600s 偏紧会反复 Heartbeat Timeout 替换。设 1200s(20min)留足余量。
-  # imported VPC + metal 场景真机 1200s 不够,应设 3600s。
-  lifecycle_hook_timeout: 1200
+  # 解压挂盘 + 注册,600s 偏紧会反复 Heartbeat Timeout 替换。
+  # imported VPC + metal 场景真机 1200s 也不够,默认给 3600s(1h)留足余量;
+  lifecycle_hook_timeout: 3600
   use_spot: false
 
 # Private S3 object only. Empty s3_uri disables the hook with zero behavior
@@ -620,7 +620,6 @@ hub:
 
 # ========== AI Gateway(LiteLLM)开关 ==========
 # guest microVM 零凭据,LLM 调用经一个 OpenAI 兼容网关(LiteLLM)→ Bedrock。
-# #480 三态语义(默认「不部署」):
 #   ① url 填了               = 复用已有网关,CDK 只把它写进 SSM /openclaw/litellm-host。
 #   ② url 空 + managed_by_stack=true = CDK 自己起一台 LiteLLM(单机;ha_enabled=true 时是
 #                                     ASG+ALB+RDS 那套),起来后把地址写 SSM。
@@ -631,7 +630,6 @@ hub:
 #   → 不部署对 host 引导无害(init-host.sh 读 SSM 带 || echo "" 兜底,参数缺失只是 env 为空,
 #     不会引导失败)。可见后果:guest agent 没有模型端点可调 —— 未配网关时这是预期,不是 bug。
 ai_gateway:
-  # #480 默认 false = 不由本栈托管 LiteLLM。true = CDK 起一台(见 ha_enabled 决定单机/HA)。
   # 仅当 url 为空时此开关才起作用;url 非空时始终走「复用外部网关」,与本开关无关。
   #
   # ⚠ 存量升级必读:若你的现有部署此前靠「url 空即自动起 LiteLLM」跑着一台在役网关,

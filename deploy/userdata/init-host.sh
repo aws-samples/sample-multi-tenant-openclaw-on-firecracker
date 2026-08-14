@@ -477,6 +477,9 @@ Restart=always
 RestartSec=5
 KillMode=process
 Environment=OC_GUEST_LOG_VSOCK_PORT=9999
+# 非 tty → CPython 8KB 块缓冲 → 永不退出即永不 flush。reader 业务日志量更小,实测 4h43m 零业务
+# 输出。关缓冲让每行即时进 journal。只加 Environment=,不碰下面的 systemd 沙箱收紧项。
+Environment=PYTHONUNBUFFERED=1
 UMask=0077
 # systemd 沙箱:reader 以 root 处理不可信帧,收紧攻击面(codex)。只需读写
 # /data/firecracker-vms 下的 UDS + oc-guest.log,其余文件系统只读/隔离。
@@ -602,6 +605,10 @@ chmod +x /home/ubuntu/stop-vm.sh && chown ubuntu:ubuntu /home/ubuntu/stop-vm.sh
 aws s3 cp s3://${ASSETS_BUCKET}/deployment/scripts/rebuild-vm.sh /home/ubuntu/rebuild-vm.sh --region ${REGION} --no-progress 2>/dev/null || \
   _s3_get s3://${ASSETS_BUCKET}/deployment/scripts/rebuild-vm.sh /home/ubuntu/rebuild-vm.sh
 chmod +x /home/ubuntu/rebuild-vm.sh && chown ubuntu:ubuntu /home/ubuntu/rebuild-vm.sh
+# image repin semantics.
+aws s3 cp s3://${ASSETS_BUCKET}/deployment/scripts/reset-vm.sh /home/ubuntu/reset-vm.sh --region ${REGION} --no-progress 2>/dev/null || \
+  _s3_get s3://${ASSETS_BUCKET}/deployment/scripts/reset-vm.sh /home/ubuntu/reset-vm.sh
+chmod +x /home/ubuntu/reset-vm.sh && chown ubuntu:ubuntu /home/ubuntu/reset-vm.sh
 # the matching API hits a missing /home/ubuntu/*.sh and fails exit 127.
 # start-all-vms / stop-all-vms — host-local fan-out for the 1-minute fleet
 # power goal: control plane sends ONE SSM per host, host starts/stops all its
@@ -701,9 +708,49 @@ fi
   exit 1
 }
 log "step5: registering to DynamoDB (az=${AZ}, type=${INSTANCE_TYPE:-unknown}, capacity ${AVAIL_VCPU}vcpu/${AVAIL_MEM}MB from ${_HOST_VCPU}vcpu/${_HOST_MEM_MB}MB host)"
+# 写成首启常量 0/0/0/1,于是第二次执行就把已有租户的记账抹掉:apse1 一台
+# r8g.metal-24xl 实测,3 个租户 running、账本 3/6/12288/4,重跑同一份 asset(sha256
+# 校验通过、退出码 0)后账本变 0/0/0/1,而 3 个 microVM 仍在跑。next_vm_num 从 4 退回 1
+# 是同一次写:分配器会重新发出物理已占用的号,_phys_tap_occupied fail-closed 拒掉(每次
+# lifecycle hook 因 bootstrap 超时 ABANDON 后 ASG 重试、未来任何 host 自愈重跑 bootstrap。
+# 修法:首启走带 attribute_not_exists(instance_id) 的条件 put(整项创建,记账起点 0/0/0/1
+# 只由这一次写),CCF 说明行已存在 → 改 update-item 只 SET 静态字段。账本四个字段
+# (used_vcpu/used_mem_mb/vm_count/next_vm_num)在重跑路径上【不覆盖已有值】—— 它们的权威
+# 是控制面的认领/释放 CAS,host 侧读回再写都不行:读与写之间落地的并发 create 会被抹掉。
+# 静态字段仍要刷新(不能"行存在就跳过"):private_ip 跨 stop/start 会变、rootfs_version/
+# snapshot_time 每次 bootstrap 都可能换、total_* 在标称表新增机型后会变、status 要把
+# draining 的 host 拉回 active(重跑 bootstrap 正是为了让它重新可调度)。
+#
+# ★ 账本四字段必须用 if_not_exists 补,不能"一个字都不写"(2026-08-12 apse1 实测的真 bug):
+# host-agent 在 init 途中就被 systemd 拉起(实测 06:02:38,而 step5 在 06:05:19,早 2 分 41 秒),
+# 它的心跳是【无条件 update_item】(host-agent.py:895 SET last_seen=...),而 DDB 的
+# update_item 对不存在的 key 会【创建行】。于是 host-agent 先建出一行只有心跳字段的记录,
+# init 的条件 put 必然 CCF → 走这个 update 分支 → 若只写静态字段,四个记账字段就【永不创建】。
+# 后果:apse1 实测 status=active(调度器会选它)但 used_vcpu/vm_count/
+# next_vm_num 全不存在 → _reserve_slot 的 CAS 条件 `next_vm_num = :expected AND
+# used_vcpu <= :cap_v` 恒假 → 每次分配 CCF → exclude 排除 → 503。每台新 host 都会这样,
+# if_not_exists 的语义正是"有就不动、没有才补",同时满足"不覆盖已有记账"与"不留缺字段的行"。
+# 同款范式见 health_check/handler.py:426。
 _registered=0
 for _r in $(seq 1 10); do
-  aws dynamodb put-item --table-name ${HOSTS_TABLE} --region ${REGION} --item '{"instance_id":{"S":"'${INSTANCE_ID}'"},"instance_type":{"S":"'${INSTANCE_TYPE}'"},"private_ip":{"S":"'${PRIVATE_IP}'"},"az":{"S":"'${AZ}'"},"total_vcpu":{"N":"'${AVAIL_VCPU}'"},"total_mem_mb":{"N":"'${AVAIL_MEM}'"},"used_vcpu":{"N":"0"},"used_mem_mb":{"N":"0"},"vm_count":{"N":"0"},"next_vm_num":{"N":"1"},"status":{"S":"active"},"rootfs_version":{"S":"'${ROOTFS_VER}'"},"snapshot_time":{"S":"'${ROOTFS_VER}'"}}' && { _registered=1; break; }
+  # stderr 收进变量而不是临时文件:CCF 是本分支的正常信号,得判定;真错误得进日志。用固定
+  # 路径的 tmp 文件还要防符号链接和清理,变量没这些面。
+  _reg_err=$(aws dynamodb put-item --table-name ${HOSTS_TABLE} --region ${REGION} --condition-expression 'attribute_not_exists(instance_id)' --item '{"instance_id":{"S":"'${INSTANCE_ID}'"},"instance_type":{"S":"'${INSTANCE_TYPE}'"},"private_ip":{"S":"'${PRIVATE_IP}'"},"az":{"S":"'${AZ}'"},"total_vcpu":{"N":"'${AVAIL_VCPU}'"},"total_mem_mb":{"N":"'${AVAIL_MEM}'"},"used_vcpu":{"N":"0"},"used_mem_mb":{"N":"0"},"vm_count":{"N":"0"},"next_vm_num":{"N":"1"},"status":{"S":"active"},"rootfs_version":{"S":"'${ROOTFS_VER}'"},"snapshot_time":{"S":"'${ROOTFS_VER}'"}}' 2>&1) \
+    && { _registered=1; log "registered (first boot: ledger starts at 0/0/0/1)"; break; }
+  # CCF = 本实例已注册过(重跑)。只刷静态字段,账本原封不动。其它错误(限流/权限/网络)
+  # 落到下面的重试,不能与"已存在"混为一谈 —— 那会把真失败当成功。
+  case "${_reg_err}" in
+    *ConditionalCheckFailedException*)
+      aws dynamodb update-item --table-name ${HOSTS_TABLE} --region ${REGION} \
+        --key '{"instance_id":{"S":"'${INSTANCE_ID}'"}}' \
+        --condition-expression 'attribute_exists(instance_id)' \
+        --update-expression 'SET instance_type = :it, private_ip = :ip, az = :az, total_vcpu = :tv, total_mem_mb = :tm, #s = :st, rootfs_version = :rv, snapshot_time = :sv, used_vcpu = if_not_exists(used_vcpu, :zero), used_mem_mb = if_not_exists(used_mem_mb, :zero), vm_count = if_not_exists(vm_count, :zero), next_vm_num = if_not_exists(next_vm_num, :one)' \
+        --expression-attribute-names '{"#s":"status"}' \
+        --expression-attribute-values '{":it":{"S":"'${INSTANCE_TYPE}'"},":ip":{"S":"'${PRIVATE_IP}'"},":az":{"S":"'${AZ}'"},":tv":{"N":"'${AVAIL_VCPU}'"},":tm":{"N":"'${AVAIL_MEM}'"},":st":{"S":"active"},":rv":{"S":"'${ROOTFS_VER}'"},":sv":{"S":"'${ROOTFS_VER}'"},":zero":{"N":"0"},":one":{"N":"1"}}' \
+        && { _registered=1; log "re-run: refreshed static fields; ledger preserved (missing counters seeded)"; break; }
+      ;;
+    *) log "register attempt $_r error: ${_reg_err}" ;;
+  esac
   log "register attempt $_r failed, retrying in 15s..."
   sleep 15
 done

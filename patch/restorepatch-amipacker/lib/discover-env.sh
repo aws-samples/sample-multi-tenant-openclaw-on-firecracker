@@ -339,7 +339,11 @@ HOSTS_TABLE="$(printf '%s' "$API_FUNCTION_CONFIG" |
   jq -r '.Environment.Variables.HOSTS_TABLE // empty')"
 HOST_IDS="[]"
 if [ -n "$HOSTS_TABLE" ]; then
+  # Legacy rows may lack status, so retain them while excluding only explicit soft deletes.
   HOST_IDS="$(Q dynamodb scan --table-name "$HOSTS_TABLE" \
+    --filter-expression 'attribute_not_exists(#s) OR #s <> :deleted' \
+    --expression-attribute-names '{"#s":"status"}' \
+    --expression-attribute-values '{":deleted":{"S":"deleted"}}' \
     --projection-expression instance_id | jq -c '[.Items[].instance_id.S] | unique | sort')"
 else
   warn "HOSTS_TABLE is absent from the confirmed serving Lambda; host ASG will remain unresolved"

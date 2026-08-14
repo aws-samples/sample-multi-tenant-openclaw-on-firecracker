@@ -18,20 +18,23 @@
 #   * TrackDefaultLTVersion AsgShape digest and the OpenClawImage CodeBuild churn. Both are
 #     derived or content-hash projections with no independent action.
 #
-# usage: lib/apply-restorepatch.sh <precheck|backup|apply|verify|rollback|apply-api|verify-api|finalize-api|rollback-api> --env <environment.json> --kit <kit-dir> [--allow-base-drift]
+# usage: lib/apply-restorepatch.sh <precheck|backup|apply|apply-control|canary|refresh|verify|rollback|apply-api|verify-api|finalize-api|rollback-api> --env <environment.json> --kit <kit-dir> [--values <values.json>] [--allow-base-drift]
 set -uo pipefail
 
-PHASE="${1:?phase required: precheck|backup|apply|verify|rollback|apply-api|verify-api|finalize-api|rollback-api}"; shift || true
-ENVJSON=""; KITDIR="."; ALLOW_BASE_DRIFT=0
+PHASE="${1:?phase required: precheck|backup|apply|apply-control|canary|refresh|verify|rollback|apply-api|verify-api|finalize-api|rollback-api}"; shift || true
+ENVJSON=""; KITDIR="."; VALUESJSON=""; ALLOW_BASE_DRIFT=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --env) ENVJSON="${2:?}"; shift 2 ;;
     --kit) KITDIR="${2:?}"; shift 2 ;;
+    --values) VALUESJSON="${2:?}"; shift 2 ;;
     --allow-base-drift) ALLOW_BASE_DRIFT=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 [ -f "$ENVJSON" ] || { echo "FATAL: environment file not found: $ENVJSON" >&2; exit 2; }
+[ -z "$VALUESJSON" ] || [ -f "$VALUESJSON" ] \
+  || { echo "FATAL: values file not found: $VALUESJSON" >&2; exit 2; }
 
 # These values identify CDK asset bundles and therefore name S3 prefixes. They are
 # not hashes of init-host.sh, whose independent byte digest is checked separately.
@@ -61,7 +64,19 @@ BUCKET="$(jpath "$ENVJSON" assets.bucket)"
 FN="$(jpath "$ENVJSON" lambda_link.function)"
 AMI="$(jget "$ENVJSON" new_ami_id)"
 
-for v in REGION ASG LT_ID LT_VER BUCKET FN; do
+# Control-plane-only phases must remain usable before the dataplane AMI and ASG are ready.
+case "$PHASE" in
+  apply-control|verify-api|finalize-api|rollback-api)
+    REQUIRED_VARS="REGION FN"
+    ;;
+  apply-api)
+    REQUIRED_VARS="REGION FN"
+    ;;
+  *)
+    REQUIRED_VARS="REGION ASG LT_ID LT_VER BUCKET FN"
+    ;;
+esac
+for v in $REQUIRED_VARS; do
   [ -n "${!v}" ] || { echo "FATAL: $v missing from $ENVJSON; run lib/discover-env.sh first" >&2; exit 2; }
 done
 
@@ -113,6 +128,13 @@ overlay_function() {
   curl -fsS -o "${work}/live.zip" "$location" || die "cannot download $function_name package"
   (cd "$work" && unzip -oq live.zip) || die "cannot unpack $function_name package"
   while IFS= read -r rel; do
+    # Build caches and workstation metadata are not customer delivery artifacts.
+    case "$rel" in
+      __pycache__/*|*/__pycache__/*|*.pyc|*.pyo|.DS_Store|*/.DS_Store)
+        echo "   SKIP $rel (not a delivery artifact)"
+        continue
+        ;;
+    esac
     mkdir -p "${work}/$(dirname "$rel")"
     cp "${artifact_root}/${rel}" "${work}/${rel}" || die "cannot overlay $function_name:$rel"
   done < <(cd "$artifact_root" && find . -type f -print | sed 's|^\./||' | sort)
@@ -143,6 +165,380 @@ restore_function() {
     --zip-file "fileb://${zip}" >/dev/null || die "code restore failed for $function_name"
   aws_ lambda wait function-updated --function-name "$function_name" \
     || die "$function_name did not settle after restore"
+}
+
+render_bootstrap_artifact() {
+  local template="$1" live_rendered="$2" out="$3"
+  # Measured CDK output needs ordered live-object tiers before the JSON fallback.
+  python3 - "$template" "$live_rendered" "$out" "$VALUESJSON" \
+    "${KITDIR}/host-scripts/host-agent.service.patched" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+template_path, live_path, out_path, values_path, host_agent_unit_path = sys.argv[1:]
+names = [
+    "AGENTCORE_GATEWAY_URL", "AMP_REMOTE_WRITE_URL", "BACKUP_DATA_SCRIPT",
+    "BALLOON_DEFLATE_ON_OOM", "BALLOON_ENABLED", "BALLOON_FREE_PAGE_REPORTING",
+    "BALLOON_MAX_INFLATE_RATIO", "BALLOON_MIN_GUEST_AVAILABLE_MB",
+    "BALLOON_STATS_INTERVAL", "CPU_OVERCOMMIT_RATIO", "DNAT_PORT_HIGH",
+    "DNAT_PORT_LOW", "EGRESS_ALLOWLIST_CIDRS", "EGRESS_ALLOWLIST_DOMAINS",
+    "EGRESS_ALLOWLIST_ENABLED", "EGRESS_DNS_UPSTREAM", "EGRESS_INCLUDE_VPC_CIDR",
+    "EGRESS_VPC_CIDR", "FB_STREAM_HOST", "FB_STREAM_VM", "HOST_AGENT_SCRIPT",
+    "HOST_RESERVED_MEM", "HOST_RESERVED_VCPU", "HOST_USER_HOOK", "LOGGING_ENABLED",
+    "MEM_OVERCOMMIT_RATIO", "NOMINAL_SPECS", "OC_HOST_LAUNCH_SLOTS",
+    "OVERCOMMIT_BY_FAMILY", "PORT_QUARANTINE_SECONDS", "PROVISION_SCRIPT",
+    "ROOTFS_OVERLAY_MB", "ROOTFS_PREFIX", "SUBNET_PREFIX",
+]
+whole_line_names = {
+    "AGENTCORE_GATEWAY_URL", "FB_STREAM_HOST", "FB_STREAM_VM",
+    "HOST_RESERVED_MEM", "HOST_RESERVED_VCPU", "NOMINAL_SPECS", "ROOTFS_PREFIX",
+}
+block_names = {
+    "PROVISION_SCRIPT", "HOST_AGENT_SCRIPT", "BACKUP_DATA_SCRIPT", "HOST_USER_HOOK",
+}
+template_lines = pathlib.Path(template_path).read_text(
+    encoding="utf-8", errors="surrogateescape").splitlines(keepends=True)
+live_lines = pathlib.Path(live_path).read_text(
+    encoding="utf-8", errors="surrogateescape").splitlines(keepends=True)
+values = {}
+if values_path:
+    loaded = json.loads(pathlib.Path(values_path).read_text(encoding="utf-8"))
+    if not isinstance(loaded, dict):
+        raise SystemExit("FAIL: --values JSON must be an object keyed by placeholder name")
+    values = loaded
+
+def is_comment(line):
+    return re.match(r"^\s*#", line) is not None
+
+def without_newline(line):
+    return line.rstrip("\r\n")
+
+def has_placeholder(line):
+    return re.search(r"\{\{[A-Z_]+\}\}", line) is not None
+
+def assignment(line, name):
+    if is_comment(line):
+        return None
+    return re.match(
+        rf"^(?P<prefix>\s*(?:export\s+)?{re.escape(name)}\s*=)(?P<rhs>.*?)(?P<nl>\r?\n)?$",
+        line,
+    )
+
+def whole_line_value(name):
+    # These values are embedded in code lines, so same-name assignment lookup cannot find them.
+    token = "{{" + name + "}}"
+    captured = []
+    for template_line in template_lines:
+        if token not in template_line or is_comment(template_line):
+            continue
+        parts = without_newline(template_line).split(token)
+        pattern = re.escape(parts[0]) + r"(?P<value>.*?)"
+        for part in parts[1:-1]:
+            pattern += re.escape(part) + r"(?P=value)"
+        pattern += re.escape(parts[-1])
+        matcher = re.compile(pattern)
+        for live_line in live_lines:
+            if is_comment(live_line):
+                continue
+            match = matcher.fullmatch(without_newline(live_line))
+            if match:
+                captured.append(match.group("value"))
+    if not captured or len(set(captured)) != 1:
+        return False, ""
+    return True, captured[0]
+
+def find_subsequences(lines, needle):
+    width = len(needle)
+    return [
+        index for index in range(len(lines) - width + 1)
+        if lines[index:index + width] == needle
+    ]
+
+def unique_anchor(index, direction):
+    # Block extent needs increasingly specific literal anchors because one-line shells repeat.
+    eligible = []
+    cursor = index + direction
+    while 0 <= cursor < len(template_lines) and len(eligible) < 3:
+        line = template_lines[cursor]
+        if without_newline(line).strip() and not has_placeholder(line):
+            eligible.append(cursor)
+        cursor += direction
+    live_text = [without_newline(line) for line in live_lines]
+    for width in range(1, len(eligible) + 1):
+        selected = eligible[:width]
+        start, end = min(selected), max(selected)
+        window = template_lines[start:end + 1]
+        if any(has_placeholder(line) for line in window):
+            continue
+        matches = find_subsequences(
+            live_text, [without_newline(line) for line in window])
+        if len(matches) == 1:
+            live_start = matches[0]
+            return True, live_start, live_start + len(window)
+    return False, -1, -1
+
+def anchor_block_value(name):
+    token = "{{" + name + "}}"
+    indexes = [
+        index for index, line in enumerate(template_lines)
+        if without_newline(line).strip() == token
+    ]
+    if len(indexes) != 1:
+        return False, ""
+    index = indexes[0]
+    upper_ok, _, upper_end = unique_anchor(index, -1)
+    lower_ok, lower_start, _ = unique_anchor(index, 1)
+    if not upper_ok or not lower_ok or upper_end > lower_start:
+        return False, ""
+    return True, "".join(live_lines[upper_end:lower_start])
+
+def replace_block(rendered_lines, name, value):
+    token = "{{" + name + "}}"
+    indexes = [
+        index for index, line in enumerate(rendered_lines)
+        if not is_comment(line) and token in line
+    ]
+    if not indexes or any(without_newline(rendered_lines[index]).strip() != token
+                          for index in indexes):
+        return False
+    for index in indexes:
+        rendered_lines[index] = value
+    return True
+
+rendered = list(template_lines)
+for name in names:
+    token = "{{" + name + "}}"
+    template_indexes = [
+        index for index, line in enumerate(rendered)
+        if token in line and assignment(line, name)
+    ]
+    live_match = next((assignment(line, name) for line in live_lines if assignment(line, name)), None)
+    if template_indexes and live_match:
+        for index in template_indexes:
+            current = assignment(rendered[index], name)
+            rendered[index] = current.group("prefix") + live_match.group("rhs") + (current.group("nl") or "")
+        continue
+    if name in whole_line_names:
+        resolved, value = whole_line_value(name)
+        if resolved:
+            rendered = [
+                line if is_comment(line) else line.replace(token, value)
+                for line in rendered
+            ]
+            continue
+    if name in block_names:
+        if name == "HOST_AGENT_SCRIPT":
+            unit_text = pathlib.Path(host_agent_unit_path).read_bytes().decode(
+                "utf-8", errors="surrogateescape")
+            if "SVCEOF" in unit_text.splitlines():
+                raise SystemExit(
+                    "FAIL: host-agent.service.patched contains heredoc delimiter SVCEOF")
+            # Copying the live T3 block would drop the kit's PYTHONUNBUFFERED=1 unit change.
+            value = (
+                "cat > /etc/systemd/system/host-agent.service << 'SVCEOF'\n"
+                + unit_text
+                + ("" if unit_text.endswith(("\n", "\r")) else "\n")
+                + "SVCEOF\n"
+            )
+            resolved = True
+        else:
+            resolved, value = anchor_block_value(name)
+        if resolved and replace_block(rendered, name, value):
+            continue
+        if name == "HOST_AGENT_SCRIPT":
+            # This exception must never fall back to a value that bypasses the patched unit.
+            continue
+    if name not in values:
+        continue
+    value = values[name]
+    if not isinstance(value, str):
+        value = json.dumps(value, separators=(",", ":"))
+    rendered = [
+        line if is_comment(line) else line.replace(token, value)
+        for line in rendered
+    ]
+
+output_text = "".join(rendered)
+# Block tiers add multiple lines per list entry, so gates must inspect physical output lines.
+output_lines = output_text.splitlines(keepends=True)
+unresolved = sorted({
+    match.group(1)
+    for line in output_lines if not is_comment(line)
+    for match in re.finditer(r"\{\{([A-Z_]+)\}\}", line)
+})
+if unresolved:
+    raise SystemExit("FAIL: unresolved bootstrap placeholders: " + ", ".join(unresolved))
+comment_text = "".join(line for line in output_lines if is_comment(line))
+if "{{AVAIL_VCPU}}" not in comment_text or "{{AVAIL_MEM}}" not in comment_text:
+    raise SystemExit("FAIL: historical AVAIL_VCPU/AVAIL_MEM comment placeholders were altered")
+template_line_count = len("".join(template_lines).splitlines())
+output_line_count = len(output_text.splitlines())
+if output_line_count < template_line_count:
+    raise SystemExit(
+        "FAIL: rendered bootstrap was truncated: "
+        f"{output_line_count} lines < template {template_line_count} lines"
+    )
+pathlib.Path(out_path).write_text(
+    output_text, encoding="utf-8", errors="surrogateescape")
+print(
+    "   rendered bootstrap: %d lines; code placeholders resolved; historical comments preserved"
+    % output_line_count
+)
+PY
+  [ $? -eq 0 ] || die "bootstrap rendering refused"
+  # S3 consumers invoke or source these bytes after download, matching the kit's 0644 convention.
+  chmod 0644 "$out" || die "cannot set rendered bootstrap mode to 0644"
+}
+
+asset_state_key() {
+  # Stable key normalization keeps per-object rollback coordinates in the shared state file.
+  printf '%s' "$1" | tr '/.-' '___'
+}
+
+publish_s3_asset() {
+  local local_path="$1" key="$2" state_key old_info old_etag old_len old_ver
+  local local_len readback new_info new_len new_ver mode
+  [ -f "$local_path" ] || die "missing asset $local_path"
+  state_key="$(asset_state_key "$key")"
+  local_len="$(wc -c < "$local_path" | tr -d ' ')"
+  mode="$(stat -f '%Lp' "$local_path" 2>/dev/null || stat -c '%a' "$local_path")"
+  [ "$mode" = "644" ] || die "$local_path mode is $mode, expected 0644"
+
+  if old_info="$(aws_ s3api head-object --bucket "$BUCKET" --key "$key" \
+      --query '[ETag,ContentLength,VersionId]' --output text 2>/dev/null)"; then
+    read -r old_etag old_len old_ver <<< "$old_info"
+    [ -n "$(state_get "s3_old_version_${state_key}")" ] || {
+      state_put "s3_old_etag_${state_key}" "$old_etag"
+      state_put "s3_old_length_${state_key}" "$old_len"
+      state_put "s3_old_version_${state_key}" "${old_ver:-None}"
+    }
+    if [ "$old_len" = "$local_len" ]; then
+      readback="$(mktemp)"
+      if aws_ s3 cp "s3://${BUCKET}/${key}" "$readback" --no-progress >/dev/null 2>&1 \
+          && cmp -s "$local_path" "$readback"; then
+        rm -f "$readback"
+        echo "   SKIP s3://${BUCKET}/${key} (bytes already identical)"
+        return 0
+      fi
+      rm -f "$readback"
+    fi
+  else
+    [ -n "$(state_get "s3_old_version_${state_key}")" ] || {
+      state_put "s3_old_etag_${state_key}" ABSENT
+      state_put "s3_old_length_${state_key}" ABSENT
+      state_put "s3_old_version_${state_key}" ABSENT
+    }
+  fi
+
+  # Dependencies are published before callers so a concurrent boot never sees a partial set.
+  aws_ s3 cp "$local_path" "s3://${BUCKET}/${key}" --no-progress \
+    || die "asset upload failed: s3://${BUCKET}/${key}"
+  new_info="$(aws_ s3api head-object --bucket "$BUCKET" --key "$key" \
+    --query '[ContentLength,VersionId]' --output text)" \
+    || die "cannot read back uploaded asset metadata: s3://${BUCKET}/${key}"
+  read -r new_len new_ver <<< "$new_info"
+  [ "$new_len" = "$local_len" ] \
+    || die "asset length mismatch for $key: local=$local_len s3=$new_len"
+  state_put "s3_changed_${state_key}" true
+  state_put "s3_new_version_${state_key}" "${new_ver:-None}"
+  echo "   PASS s3://${BUCKET}/${key} ContentLength=$new_len"
+}
+
+publish_host_assets() {
+  local root="${KITDIR}/host-scripts" rel
+  # Publish callees first; a boot or agent restart must not expose a new caller to old/missing scripts.
+  publish_s3_asset "$root/launch-vm.sh.patched" "deployment/scripts/launch-vm.sh"
+  publish_s3_asset "$root/rebuild-vm.sh.patched" "deployment/scripts/rebuild-vm.sh"
+  publish_s3_asset "$root/reset-vm.sh.patched" "deployment/scripts/reset-vm.sh"
+  while IFS= read -r rel; do
+    # Same exclusion as overlay_function: this loop enumerates a directory, so a build
+    # cache or workstation metadata file left there would become a customer S3 object.
+    case "$rel" in
+      __pycache__/*|*/__pycache__/*|*.pyc|*.pyo|.DS_Store|*/.DS_Store)
+        echo "   SKIP $rel (not a delivery artifact)"
+        continue
+        ;;
+    esac
+    publish_s3_asset "$root/edge/fluent-bit/$rel" "deployment/observability/fluent-bit/$rel"
+  done < <(cd "$root/edge/fluent-bit" && find . -type f -print | sed 's|^\./||' | sort)
+  # The unit is embedded by HOST_AGENT_SCRIPT; no runtime consumes an S3 service key.
+  publish_s3_asset "$root/host-agent.py.patched" "deployment/scripts/host-agent.py"
+}
+
+restore_s3_asset() {
+  local key="$1" state_key old_ver old_len copy_source restored_len
+  state_key="$(asset_state_key "$key")"
+  [ "$(state_get "s3_changed_${state_key}")" = "true" ] || return 0
+  old_ver="$(state_get "s3_old_version_${state_key}")"
+  old_len="$(state_get "s3_old_length_${state_key}")"
+  if [ "$old_ver" = "ABSENT" ]; then
+    # A delete marker restores absence without destroying versioned recovery history.
+    aws_ s3api delete-object --bucket "$BUCKET" --key "$key" >/dev/null \
+      || die "cannot remove newly introduced asset $key"
+    echo "   RESTORE s3://${BUCKET}/${key} to ABSENT"
+    return 0
+  fi
+  [ -n "$old_ver" ] && [ "$old_ver" != "None" ] \
+    || die "missing versioned rollback coordinate for $key"
+  copy_source="$(python3 - "$BUCKET" "$key" "$old_ver" <<'PY'
+import sys
+import urllib.parse
+bucket, key, version = sys.argv[1:]
+print(urllib.parse.quote(f"{bucket}/{key}", safe="/") + "?versionId=" + urllib.parse.quote(version, safe=""))
+PY
+)"
+  aws_ s3api copy-object --bucket "$BUCKET" --key "$key" --copy-source "$copy_source" >/dev/null \
+    || die "cannot restore prior version of $key"
+  restored_len="$(aws_ s3api head-object --bucket "$BUCKET" --key "$key" \
+    --query ContentLength --output text)" || die "cannot verify restored asset $key"
+  [ "$restored_len" = "$old_len" ] \
+    || die "restored asset length mismatch for $key: expected=$old_len actual=$restored_len"
+  echo "   RESTORE s3://${BUCKET}/${key} VersionId=$old_ver"
+}
+
+restore_host_assets() {
+  local root="${KITDIR}/host-scripts" rel
+  # Restore every object this driver may have changed, including the rendered bootstrap.
+  restore_s3_asset "deployment/bootstrap/host/${ASSET_BUNDLE_PREFIX}/init-host.sh"
+  restore_s3_asset "deployment/scripts/host-agent.py"
+  # The inline unit rolls back with the bootstrap object, not a separate S3 key.
+  while IFS= read -r rel; do
+    restore_s3_asset "deployment/observability/fluent-bit/$rel"
+  done < <(cd "$root/edge/fluent-bit" && find . -type f -print | sed 's|^\./||' | sort -r)
+  restore_s3_asset "deployment/scripts/reset-vm.sh"
+  restore_s3_asset "deployment/scripts/rebuild-vm.sh"
+  restore_s3_asset "deployment/scripts/launch-vm.sh"
+}
+
+apply_control_overlay() {
+  # Keep the Lambda-only path independent from every dataplane coordinate.
+  overlay_function "$FN" "${KITDIR}/lambda/api"
+  overlay_function openclaw-backup "${KITDIR}/lambda/backup"
+  overlay_function openclaw-health-check "${KITDIR}/lambda/health_check"
+  overlay_function openclaw-scaler "${KITDIR}/lambda/scaler"
+  if aws_ lambda get-function --function-name openclaw-tenant-stats-writer >/dev/null 2>&1; then
+    overlay_function openclaw-tenant-stats-writer "${KITDIR}/lambda/tenant_stats"
+  else
+    echo "   ABSENT openclaw-tenant-stats-writer; no deployed target for its module"
+  fi
+  if aws_ lambda get-function --function-name openclaw-console-bff >/dev/null 2>&1; then
+    overlay_function openclaw-console-bff "${KITDIR}/lambda/console-bff"
+  else
+    echo "   ABSENT openclaw-console-bff; console delivery path is not deployed"
+  fi
+  new_api_version="$(aws_ lambda publish-version --function-name "$FN" \
+    --description restorepatch-amipacker --query Version --output text)" \
+    || die "cannot publish patched API version"
+  state_put api_applied_version "$new_api_version"
+  if an="$(alias_name)"; then
+    aws_ lambda update-alias --function-name "$FN" --name "$an" \
+      --function-version "$new_api_version" >/dev/null || die "cannot advance API alias $an"
+    state_put api_alias_name "$an"
+  else
+    echo "   API environment does not use an alias; the unqualified version is the serving path"
+  fi
 }
 
 resolve_bootstrap_state() {
@@ -404,6 +800,12 @@ backup)
   hook_to="$(aws_ autoscaling describe-lifecycle-hooks --auto-scaling-group-name "$ASG" \
     --query "LifecycleHooks[?LifecycleHookName=='${HOOK_NAME}'].HeartbeatTimeout|[0]" --output text)"
   state_put hook_backup_timeout "$hook_to"
+  # Verify and rollback need the exact pre-apply capacity values, including a legitimate zero minimum.
+  read -r asg_min asg_desired <<< "$(aws_ autoscaling describe-auto-scaling-groups \
+    --auto-scaling-group-names "$ASG" \
+    --query 'AutoScalingGroups[0].[MinSize,DesiredCapacity]' --output text)"
+  state_put asg_backup_min_size "$asg_min"
+  state_put asg_backup_desired "$asg_desired"
   lt_def="$(aws_ ec2 describe-launch-templates --launch-template-id "$LT_ID" \
     --query 'LaunchTemplates[0].DefaultVersionNumber' --output text)"
   state_put host_lt_backup_version "$lt_def"
@@ -437,12 +839,13 @@ backup)
     fi
   done
   echo "   hook=$hook_to lt_default=$lt_def ami=$lt_ami api_anchor=$ver env_keys=$env_n"
+  echo "   asg_min=$asg_min asg_desired=$asg_desired"
   say "backup OK"
   ;;
 
 apply)
   [ -f "$STATE" ] || die "no backup state; run backup first"
-  [ -n "$AMI" ] || die "new_ami_id missing from environment; bake the AMI per host-scripts/packer/CUSTOMER-GUIDE.md first"
+  [ -n "$AMI" ] || die "new_ami_id missing from environment; bake the AMI per host-scripts/packer/CUSTOMER-GUIDE.md first, or use apply-control for the control plane only"
 
   say "1/3 widen $HOOK_NAME heartbeat to ${NEW_TIMEOUT}s"
   aws_ autoscaling put-lifecycle-hook --auto-scaling-group-name "$ASG" \
@@ -451,6 +854,11 @@ apply)
     --heartbeat-timeout "$NEW_TIMEOUT" --default-result ABANDON || die "hook update failed"
 
   say "2/3 upload bootstrap script to its content-addressed key, then one new LT version"
+  art="${KITDIR}/host-scripts/init-host.sh.patched"
+  [ -f "$art" ] || die "missing artifact $art"
+  got="$(sha256_file "$art")"
+  [ "$got" = "$ARTIFACT_SHA256" ] \
+    || die "artifact sha256 $got does not match expected file digest $ARTIFACT_SHA256"
   # Recompute the state here rather than trusting precheck: the run directory is editable
   # and the live target may have moved between the two phases.
   live_prefix="$(aws_ ec2 describe-launch-template-versions --launch-template-id "$LT_ID" \
@@ -461,25 +869,36 @@ apply)
   if [ "$BOOTSTRAP_STATE" = "ALREADY" ]; then
     say "   SKIP bootstrap: target content already in service (idempotent no-op)"
   elif [ "$BOOTSTRAP_STATE" = "DRIFT" ] && [ "$ALLOW_BASE_DRIFT" -ne 1 ]; then
-    echo "   REFUSE bootstrap: DRIFT requires --allow-base-drift; continuing other concerns"
+    echo "   REFUSE bootstrap: DRIFT requires --allow-base-drift; no host assets were published in this run; continuing other concerns"
   else
-  art="${KITDIR}/host-scripts/init-host.sh.patched"
-  [ -f "$art" ] || die "missing artifact $art"
-  got="$(sha256_file "$art")"
-  [ "$got" = "$ARTIFACT_SHA256" ] \
-    || die "artifact sha256 $got does not match expected file digest $ARTIFACT_SHA256"
-  aws_ s3 cp "$art" "s3://${BUCKET}/deployment/bootstrap/host/${ASSET_BUNDLE_PREFIX}/init-host.sh" \
-    || die "asset upload failed"
+  [ -n "$live_prefix" ] || die "cannot render bootstrap without an in-service bootstrap prefix"
+  live_art="$(mktemp)"
+  rendered_art="$(mktemp)"
+  aws_ s3 cp "s3://${BUCKET}/deployment/bootstrap/host/${live_prefix}/init-host.sh" \
+    "$live_art" --no-progress >/dev/null \
+    || die "cannot download live rendered bootstrap for value recovery"
+  # Host assets must share the bootstrap gate: publishing only one lineage creates
+  # a mixed-lineage fleet and reintroduces the per-file drift this kit repairs.
+  # Publish every runtime dependency before any new host can consume the promoted template.
+  publish_host_assets
+  render_bootstrap_artifact "$art" "$live_art" "$rendered_art"
+  rendered_sha="$(sha256_file "$rendered_art")"
+  state_put rendered_bootstrap_sha256 "$rendered_sha"
+  state_put rendered_bootstrap_source_prefix "$live_prefix"
+  publish_s3_asset "$rendered_art" \
+    "deployment/bootstrap/host/${ASSET_BUNDLE_PREFIX}/init-host.sh"
+  rm -f "$live_art"
 
   aws_ ec2 describe-launch-template-versions --launch-template-id "$LT_ID" --versions "$LT_VER" \
     --query 'LaunchTemplateVersions[0].LaunchTemplateData.UserData' --output text \
     | base64 -d > /tmp/restorepatch-ud.txt || die "cannot read in-service UserData"
   # Replace every observed content-addressed bootstrap prefix. The assertions below
   # forbid a no-op rewrite from creating and promoting an ineffective LT version.
-  python3 - /tmp/restorepatch-ud.txt "$ASSET_BUNDLE_PREFIX" <<'PY'
+  python3 - /tmp/restorepatch-ud.txt "$ASSET_BUNDLE_PREFIX" \
+    "$rendered_art" <<'PY'
 import re
 import sys
-p, new = sys.argv[1], sys.argv[2]
+p, new, rendered_path = sys.argv[1], sys.argv[2], sys.argv[3]
 t = open(p, encoding="utf-8", errors="surrogateescape").read()
 pattern = re.compile(r"deployment/bootstrap/host/([0-9a-f]{64})")
 old = sorted({m.group(1) for m in pattern.finditer(t) if m.group(1) != new})
@@ -493,6 +912,14 @@ if "deployment/bootstrap/host/" + new not in t:
 remaining = sorted({m.group(1) for m in pattern.finditer(t) if m.group(1) != new})
 if remaining:
     raise SystemExit("FAIL: old bootstrap prefixes remain after substitution: " + ",".join(remaining))
+# The placeholder gate belongs to the rendered bootstrap, not the small downloader UserData.
+rendered = open(rendered_path, encoding="utf-8", errors="surrogateescape").read().splitlines()
+unresolved = [
+    line for line in rendered
+    if not re.match(r"^\s*#", line) and re.search(r"\{\{[A-Z_]+\}\}", line)
+]
+if unresolved:
+    raise SystemExit("FAIL: unrendered placeholder present in rendered bootstrap")
 if "{{" in t:
     raise SystemExit("FAIL: unrendered placeholder present after substitution")
 open(p, "w", encoding="utf-8", errors="surrogateescape").write(t)
@@ -508,40 +935,200 @@ PY
   aws_ ec2 modify-launch-template --launch-template-id "$LT_ID" --default-version "$newver" \
     || die "cannot flip default version"
   say "   LT version $newver created and set default"
+  rm -f "$rendered_art"
   fi
 
   say "3/3 overlay Lambda code, reusing each live package's dependencies"
-  overlay_function "$FN" "${KITDIR}/lambda/api"
-  overlay_function openclaw-backup "${KITDIR}/lambda/backup"
-  overlay_function openclaw-health-check "${KITDIR}/lambda/health_check"
-  overlay_function openclaw-scaler "${KITDIR}/lambda/scaler"
-  if aws_ lambda get-function --function-name openclaw-tenant-stats-writer >/dev/null 2>&1; then
-    overlay_function openclaw-tenant-stats-writer "${KITDIR}/lambda/tenant_stats"
-  else
-    echo "   ABSENT openclaw-tenant-stats-writer; no deployed target for its module"
+  apply_control_overlay
+
+  # A separate canary gate prevents an unverified bootstrap from reaching the whole fleet.
+  say "apply OK — HostASG MinSize was deliberately left untouched"
+  echo "   NEXT: bash lib/apply-restorepatch.sh canary --env \"$ENVJSON\" --kit \"$KITDIR\""
+  ;;
+
+apply-control)
+  # This phase intentionally has no dataplane reads or writes.
+  say "overlay Lambda code, reusing each live package's dependencies"
+  apply_control_overlay
+  say "apply-control OK"
+  ;;
+
+canary)
+  [ -f "$STATE" ] || die "no backup state; run backup first"
+  newver="$(state_get host_lt_new_version)"
+  [ -n "$newver" ] || die "no promoted LT version in state; run apply first"
+  state_put canary_pass false
+  original_desired="$(aws_ autoscaling describe-auto-scaling-groups \
+    --auto-scaling-group-names "$ASG" \
+    --query 'AutoScalingGroups[0].DesiredCapacity' --output text)" \
+    || die "cannot read current desired capacity"
+  state_put canary_original_desired "$original_desired"
+  existing_ids="$(aws_ autoscaling describe-auto-scaling-groups \
+    --auto-scaling-group-names "$ASG" \
+    --query 'AutoScalingGroups[0].Instances[].InstanceId' --output text | tr '\t' '\n')"
+  canary_desired=$((original_desired + 1))
+  max_size="$(aws_ autoscaling describe-auto-scaling-groups \
+    --auto-scaling-group-names "$ASG" \
+    --query 'AutoScalingGroups[0].MaxSize' --output text)" \
+    || die "cannot read current ASG MaxSize"
+  [ "$canary_desired" -le "$max_size" ] \
+    || die "canary requires one free ASG slot: current desired=$original_desired MaxSize=$max_size; temporarily raise MaxSize or pick another window"
+  # Desired capacity is temporary; MinSize is never written by this driver.
+  aws_ autoscaling set-desired-capacity --auto-scaling-group-name "$ASG" \
+    --desired-capacity "$canary_desired" --honor-cooldown \
+    || die "cannot raise desired capacity for canary"
+  echo "   desired capacity $original_desired -> $canary_desired; waiting for LT v$newver"
+
+  canary_id=""
+  for _ in $(seq 1 120); do
+    while IFS=$'\t' read -r iid lifecycle health version; do
+      [ -n "$iid" ] || continue
+      printf '%s\n' "$existing_ids" | grep -Fxq "$iid" && continue
+      if [ "$lifecycle" = "InService" ] && [ "$health" = "Healthy" ] \
+          && [ "$version" = "$newver" ]; then
+        canary_id="$iid"
+        break
+      fi
+    done < <(aws_ autoscaling describe-auto-scaling-groups \
+      --auto-scaling-group-names "$ASG" \
+      --query 'AutoScalingGroups[0].Instances[].[InstanceId,LifecycleState,HealthStatus,LaunchTemplate.Version]' \
+      --output text)
+    [ -n "$canary_id" ] && break
+    sleep 15
+  done
+  if [ -z "$canary_id" ]; then
+    aws_ autoscaling set-desired-capacity --auto-scaling-group-name "$ASG" \
+      --desired-capacity "$original_desired" --honor-cooldown >/dev/null 2>&1 || true
+    die "canary failed: no new Healthy/InService instance appeared on LT v$newver"
   fi
-  if aws_ lambda get-function --function-name openclaw-console-bff >/dev/null 2>&1; then
-    overlay_function openclaw-console-bff "${KITDIR}/lambda/console-bff"
-  else
-    echo "   ABSENT openclaw-console-bff; console delivery path is not deployed"
-  fi
-  new_api_version="$(aws_ lambda publish-version --function-name "$FN" \
-    --description restorepatch-amipacker --query Version --output text)" \
-    || die "cannot publish patched API version"
-  state_put api_applied_version "$new_api_version"
-  if an="$(alias_name)"; then
-    aws_ lambda update-alias --function-name "$FN" --name "$an" \
-      --function-version "$new_api_version" >/dev/null || die "cannot advance API alias $an"
-    state_put api_alias_name "$an"
-  else
-    echo "   API environment does not use an alias; the unqualified version is the serving path"
+  echo "   canary instance $canary_id is Healthy/InService on LT v$newver"
+
+  ping=""
+  for _ in $(seq 1 60); do
+    ping="$(aws_ ssm describe-instance-information \
+      --filters "Key=InstanceIds,Values=${canary_id}" \
+      --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null || true)"
+    [ "$ping" = "Online" ] && break
+    sleep 10
+  done
+  if [ "$ping" != "Online" ]; then
+    # AWS default termination policy can prefer hosts on older LT versions, so scale-in
+    # cannot safely remove a canary; terminate the named instance and decrement desired.
+    aws_ autoscaling terminate-instance-in-auto-scaling-group \
+      --instance-id "$canary_id" --should-decrement-desired-capacity >/dev/null \
+      || die "canary failed and instance $canary_id could not be terminated"
+    restored_desired="$(aws_ autoscaling describe-auto-scaling-groups \
+      --auto-scaling-group-names "$ASG" \
+      --query 'AutoScalingGroups[0].DesiredCapacity' --output text)" \
+      || die "canary instance $canary_id terminated but desired capacity could not be read"
+    [ "$restored_desired" = "$original_desired" ] \
+      || die "canary instance $canary_id terminated but desired capacity is $restored_desired, expected $original_desired"
+    die "canary failed: $canary_id did not become SSM Online"
   fi
 
-  say "controlled instance refresh, one host at a time"
-  aws_ autoscaling start-instance-refresh --auto-scaling-group-name "$ASG" \
-    --preferences '{"MinHealthyPercentage":90,"InstanceWarmup":900,"SkipMatching":false}' \
-    --query InstanceRefreshId --output text || die "cannot start instance refresh"
-  say "apply OK — run verify next; HostASG MinSize was deliberately left untouched"
+  # The remote script accumulates every failed gate so operators see the whole defect set.
+  canary_params="$(python3 - <<'PY'
+import json
+script = r'''set +e
+failed=0
+pass() { printf 'PASS %s\n' "$1"; }
+fail() { printf 'FAIL %s\n' "$1"; failed=1; }
+if cloud-init status --wait >/tmp/restorepatch-cloud-init.txt 2>&1; then
+  pass "cloud-init completed"
+elif [ -f /var/log/cloud-init-output.log ] && ! grep -Eqi 'fatal|traceback|bootstrap.*failed' /var/log/cloud-init-output.log; then
+  pass "bootstrap log has no fatal marker"
+else
+  fail "cloud-init failed or bootstrap log contains a fatal marker"
+fi
+if [ "$(systemctl is-active host-agent.service 2>/dev/null)" = active ]; then
+  pass "host-agent.service active"
+else
+  fail "host-agent.service not active"
+fi
+unit_env="$(systemctl show host-agent.service -p Environment --value 2>/dev/null)"
+case " $unit_env " in
+  *" PYTHONUNBUFFERED=1 "*) pass "host-agent.service has PYTHONUNBUFFERED=1" ;;
+  *) fail "host-agent.service missing PYTHONUNBUFFERED=1" ;;
+esac
+for script_path in launch-vm.sh rebuild-vm.sh reset-vm.sh stop-vm.sh; do
+  if [ -x "/home/ubuntu/$script_path" ]; then
+    pass "/home/ubuntu/$script_path exists and is executable"
+  else
+    fail "/home/ubuntu/$script_path missing or not executable"
+  fi
+done
+if [ -f /var/log/cloud-init-output.log ] && awk '!/^[[:space:]]*#/ && index($0, "{{") {found=1} END {exit found}' /var/log/cloud-init-output.log; then
+  pass "bootstrap log code lines contain no unresolved placeholder"
+else
+  fail "bootstrap log missing or contains an unresolved code placeholder"
+fi
+agent_port="$(printf '%s\n' "$unit_env" | tr ' ' '\n' | sed -n 's/^OC_AGENT_PORT=//p' | tail -1)"
+if [ -n "$agent_port" ] && ss -ltnH | awk -v port=":$agent_port" '$4 ~ port "$" {found=1} END {exit !found}'; then
+  pass "host-agent port $agent_port listening"
+else
+  fail "host-agent OC_AGENT_PORT is absent or not listening"
+fi
+exit "$failed"
+'''
+print(json.dumps({"commands": [script]}, separators=(",", ":")))
+PY
+)"
+  command_id="$(aws_ ssm send-command --instance-ids "$canary_id" \
+    --document-name AWS-RunShellScript --comment "restorepatch-amipacker canary gate" \
+    --parameters "$canary_params" --timeout-seconds 300 \
+    --query 'Command.CommandId' --output text)" || command_id=""
+  if [ -z "$command_id" ] || [ "$command_id" = "None" ]; then
+    aws_ autoscaling terminate-instance-in-auto-scaling-group \
+      --instance-id "$canary_id" --should-decrement-desired-capacity >/dev/null \
+      || die "canary failed and instance $canary_id could not be terminated"
+    restored_desired="$(aws_ autoscaling describe-auto-scaling-groups \
+      --auto-scaling-group-names "$ASG" \
+      --query 'AutoScalingGroups[0].DesiredCapacity' --output text)" \
+      || die "canary instance $canary_id terminated but desired capacity could not be read"
+    [ "$restored_desired" = "$original_desired" ] \
+      || die "canary instance $canary_id terminated but desired capacity is $restored_desired, expected $original_desired"
+    die "canary failed: SSM send-command returned no command id"
+  fi
+  aws_ ssm wait command-executed --command-id "$command_id" \
+    --instance-id "$canary_id" >/dev/null 2>&1 || true
+  canary_result="$(aws_ ssm get-command-invocation --command-id "$command_id" \
+    --instance-id "$canary_id" --output json)" || canary_result='{}'
+  printf '%s' "$canary_result" | python3 -c \
+    'import json,sys; d=json.load(sys.stdin); print(d.get("StandardOutputContent",""), end=""); print(d.get("StandardErrorContent",""), end="", file=sys.stderr)'
+  canary_status="$(printf '%s' "$canary_result" | python3 -c \
+    'import json,sys; print(json.load(sys.stdin).get("Status","Unknown"))')"
+  aws_ autoscaling terminate-instance-in-auto-scaling-group \
+    --instance-id "$canary_id" --should-decrement-desired-capacity >/dev/null \
+    || die "canary checks finished but instance $canary_id could not be terminated"
+  restored_desired="$(aws_ autoscaling describe-auto-scaling-groups \
+    --auto-scaling-group-names "$ASG" \
+    --query 'AutoScalingGroups[0].DesiredCapacity' --output text)" \
+    || die "canary instance $canary_id terminated but desired capacity could not be read"
+  [ "$restored_desired" = "$original_desired" ] \
+    || die "canary instance $canary_id terminated but desired capacity is $restored_desired, expected $original_desired"
+  echo "   desired capacity restored to $original_desired"
+  [ "$canary_status" = "Success" ] || die "canary failed: remote check status=$canary_status"
+  state_put canary_pass true
+  state_put canary_instance_id "$canary_id"
+  state_put canary_lt_version "$newver"
+  state_put canary_passed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  say "canary PASS on $canary_id"
+  echo "   NEXT: bash lib/apply-restorepatch.sh refresh --env \"$ENVJSON\" --kit \"$KITDIR\""
+  ;;
+
+refresh)
+  [ -f "$STATE" ] || die "no backup state; run backup first"
+  [ "$(state_get canary_pass)" = "true" ] \
+    || die "refresh refused: no canary PASS record in $STATE"
+  [ "$(state_get canary_lt_version)" = "$(state_get host_lt_new_version)" ] \
+    || die "refresh refused: canary PASS belongs to a different LT version"
+  # AWS documents min=max=100 as launch-before-terminate, one-at-a-time replacement.
+  refresh_id="$(aws_ autoscaling start-instance-refresh --auto-scaling-group-name "$ASG" \
+    --preferences '{"MinHealthyPercentage":100,"MaxHealthyPercentage":100,"InstanceWarmup":900,"SkipMatching":false}' \
+    --query InstanceRefreshId --output text)" || die "cannot start instance refresh"
+  state_put instance_refresh_id "$refresh_id"
+  say "controlled instance refresh started: $refresh_id"
+  echo "   NEXT: bash lib/apply-restorepatch.sh verify --env \"$ENVJSON\" --kit \"$KITDIR\""
   ;;
 
 verify)
@@ -554,8 +1141,15 @@ verify)
   say "MinSize must be unchanged (this tool never sets it to zero)"
   minsz="$(aws_ autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG" \
     --query 'AutoScalingGroups[0].MinSize' --output text)"
-  [ "$minsz" = "0" ] && { echo "   FAIL MinSize is 0 — a live fleet may scale to zero"; rc=1; } \
-                     || echo "   PASS MinSize=$minsz"
+  backup_minsz="$(state_get asg_backup_min_size)"
+  if [ -z "$backup_minsz" ]; then
+    echo "   SKIP no backup MinSize record; run backup before verify"
+  elif [ "$minsz" = "$backup_minsz" ]; then
+    echo "   PASS MinSize=$minsz unchanged from backup"
+  else
+    echo "   FAIL this tool changed MinSize: backup=$backup_minsz current=$minsz"
+    rc=1
+  fi
 
   say "default LT version carries the new bootstrap prefix and the new image"
   ud="$(aws_ ec2 describe-launch-template-versions --launch-template-id "$LT_ID" \
@@ -575,9 +1169,31 @@ verify)
   fi
 
   say "bootstrap object present at its content-addressed key"
-  aws_ s3api head-object --bucket "$BUCKET" \
-    --key "deployment/bootstrap/host/${ASSET_BUNDLE_PREFIX}/init-host.sh" >/dev/null 2>&1 \
-    && echo "   PASS object present" || { echo "   FAIL object missing"; rc=1; }
+  expected_bootstrap_sha="$(state_get rendered_bootstrap_sha256)"
+  bootstrap_readback="$(mktemp)"
+  if aws_ s3 cp "s3://${BUCKET}/deployment/bootstrap/host/${ASSET_BUNDLE_PREFIX}/init-host.sh" \
+      "$bootstrap_readback" --no-progress >/dev/null 2>&1; then
+    actual_bootstrap_sha="$(sha256_file "$bootstrap_readback")"
+    if [ -n "$expected_bootstrap_sha" ] && [ "$actual_bootstrap_sha" = "$expected_bootstrap_sha" ]; then
+      echo "   PASS object present sha256=$actual_bootstrap_sha"
+    elif [ -z "$expected_bootstrap_sha" ]; then
+      echo "   SKIP object present but no rendered digest is recorded"
+    else
+      echo "   FAIL bootstrap sha256=$actual_bootstrap_sha expected=$expected_bootstrap_sha"
+      rc=1
+    fi
+    # Comments retain historical placeholders, so only executable lines are gated.
+    if awk '!/^[[:space:]]*#/ && /\{\{[A-Z_]+\}\}/ {found=1} END {exit found}' "$bootstrap_readback"; then
+      echo "   PASS bootstrap code lines have no unresolved placeholder"
+    else
+      echo "   FAIL bootstrap code line contains an unresolved placeholder"
+      rc=1
+    fi
+  else
+    echo "   FAIL object missing"
+    rc=1
+  fi
+  rm -f "$bootstrap_readback"
 
   say "openclaw-api code changed and its environment was not overwritten"
   want="$(state_get api_env_key_count)"
@@ -639,6 +1255,23 @@ rollback)
   aws_ ec2 modify-launch-template --launch-template-id "$LT_ID" --default-version "$lv" \
     || die "LT default restore failed"
 
+  rendered_sha="$(state_get rendered_bootstrap_sha256)"
+  bootstrap_key="deployment/bootstrap/host/${ASSET_BUNDLE_PREFIX}/init-host.sh"
+  bootstrap_state_key="$(asset_state_key "$bootstrap_key")"
+  if [ -n "$rendered_sha" ] \
+      && [ "$(state_get "s3_changed_${bootstrap_state_key}")" = "true" ]; then
+    # Refuse to roll back over a bootstrap object changed after this apply.
+    rollback_readback="$(mktemp)"
+    aws_ s3 cp "s3://${BUCKET}/${bootstrap_key}" "$rollback_readback" --no-progress >/dev/null \
+      || die "cannot read current rendered bootstrap before rollback"
+    [ "$(sha256_file "$rollback_readback")" = "$rendered_sha" ] \
+      || die "rendered bootstrap drifted after apply; refusing S3 rollback"
+    rm -f "$rollback_readback"
+  fi
+  # Versioned S3 rollback restores every caller and dependency to its exact prior object.
+  say "restore published host assets"
+  restore_host_assets
+
   say "restore openclaw-api code and alias"
   restore_function "$FN"
   for extra_fn in openclaw-backup openclaw-health-check openclaw-scaler \
@@ -657,9 +1290,18 @@ rollback)
     echo "   API environment does not use an alias; unqualified code restore is sufficient"
   fi
 
+  backup_desired="$(state_get asg_backup_desired)"
+  if [ -n "$backup_desired" ]; then
+    # Canary capacity is temporary and rollback must converge to the pre-apply desired value.
+    aws_ autoscaling set-desired-capacity --auto-scaling-group-name "$ASG" \
+      --desired-capacity "$backup_desired" --honor-cooldown \
+      || die "cannot restore desired capacity to $backup_desired"
+  fi
+  state_put canary_pass false
   say "roll the fleet back onto the restored template"
   aws_ autoscaling start-instance-refresh --auto-scaling-group-name "$ASG" \
-    --preferences '{"MinHealthyPercentage":90}' --query InstanceRefreshId --output text \
+    --preferences '{"MinHealthyPercentage":100,"MaxHealthyPercentage":100,"InstanceWarmup":900,"SkipMatching":false}' \
+    --query InstanceRefreshId --output text \
     || die "cannot start rollback refresh"
   say "rollback OK — the previous bootstrap object is content-addressed and still present"
   ;;

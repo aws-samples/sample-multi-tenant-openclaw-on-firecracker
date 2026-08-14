@@ -75,10 +75,10 @@
       "sha256": "07b9633975bdc8e76803af83f9057c09a3fe28707f5284c727933e3050238df1"
     },
     "lib/apply-restorepatch.sh": {
-      "sha256": "1ba70df2e3d1f4bdd684863d244ca9e46765fab099ae0b67c06a0ae28151dc47"
+      "sha256": "44fecc92fc8fafda95a20834f77ad68c2a495c29d56870b075d64facd47f295c"
     },
     "lib/discover-env.sh": {
-      "sha256": "17db54ba52d6e45be964ef23cf6cb01f3f2cbc9bc4ef438d32f07efaf9410b50"
+      "sha256": "88c94e11354d372504b3c7f11434418a8b271599d15794438fe46d3f4730add5"
     },
     "lib/lt-userdata.py": {
       "sha256": "240c14d26aa6668567f6c2bbaf8ca2d884f27532735873382317317633402779"

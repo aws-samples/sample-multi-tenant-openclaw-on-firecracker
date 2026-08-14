@@ -5,7 +5,6 @@
 # No shebang, matching init-host.sh: both are fetched and run as `bash <file>` by the
 # bootstrap / Image Builder component, never exec'd directly.
 #
-# provision-host.sh — the PROVISION stage of host bring-up (#389 v2 block 3).
 #
 # Host bring-up is split in two stages, and the split line is exactly one question:
 # does this step reach the internet or install a package?
@@ -192,22 +191,7 @@ else
   log "WARN: fluent-bit installer not provided; boot path will install it (one network fetch)"
 fi
 
-# ── 7. Marker ──────────────────────────────────────────────────────────────────────────
-# Records WHICH provision ran, so a host can report its provenance (host-agent surfaces it
-# the same way #387 reports build_info) and so configure can tell a golden boot from a plain
-# one. Written last: a partial provision must not look complete.
-install -d -m 0755 /etc/openclaw
-cat > "${MARKER}" <<MARKEREOF
-recipe_version=${PROVISION_RECIPE_VERSION}
-provisioned_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-provisioned_arch=${ARCH}
-firecracker_version=${FC_VER}
-guest_kernel=${VMLINUX_NAME}
-baked_dir=${BAKED_DIR}
-MARKEREOF
-chmod 0644 "${MARKER}"
-
-# ── 8. Bake-only scrub ─────────────────────────────────────────────────────────────────
+# ── 7. Bake-only scrub ─────────────────────────────────────────────────────────────────
 # Everything below runs ONLY when baking an image. An AMI is shared by every host in the
 # fleet, so anything host-identifying left in it becomes fleet-wide shared state. The one
 # that matters most is /etc/openclaw/host_vm_key: it is a per-host ed25519 key whose public
@@ -244,5 +228,19 @@ if [ "${OC_PROVISION_BAKE:-0}" = "1" ]; then
   done
   log "scrub verified: no host key, no platform.env"
 fi
+
+# ── 8. Marker ──────────────────────────────────────────────────────────────────────────
+# Records WHICH provision ran, so a host can report its provenance (host-agent surfaces it
+# one. Written last: a partial provision must not look complete.
+install -d -m 0755 /etc/openclaw
+cat > "${MARKER}" <<MARKEREOF
+recipe_version=${PROVISION_RECIPE_VERSION}
+provisioned_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+provisioned_arch=${ARCH}
+firecracker_version=${FC_VER}
+guest_kernel=${VMLINUX_NAME}
+baked_dir=${BAKED_DIR}
+MARKEREOF
+chmod 0644 "${MARKER}"
 
 log "provision done: recipe=${PROVISION_RECIPE_VERSION} marker=${MARKER}"

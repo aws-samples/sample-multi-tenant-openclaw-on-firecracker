@@ -968,11 +968,41 @@ def process_pending():
         # (c)一次条件写自增 next_vm_num/used_*;竞争(CCF)则重选 host 重试。
         vm_num = None
         host = None
+        # 号,再用【跳号 CAS】一次认领它。这样同时消掉三个洞:没有"试几次放弃"的上限
+        # (被占号段可能有几百个,任何上限都会误报无容量);不需要回滚(本路径无
+        # capacity_reservation_id 令牌,归还做不到幂等可确认);不依赖事件重试换号
+        # (process_pending 只由 HostReady 触发,没有保证会来的下一 tick)。
+        _occ_fail = 0
         for _attempt in range(8):
             cand = _find_host(vcpu, mem_mb)
             if not cand:
                 break
             expected = int(cand.get("next_vm_num", 1))
+            target, _occ = _scheduling.next_free_phys_num(
+                cand["instance_id"], expected, exclude_ids={tenant["id"]}
+            )
+            if _occ is None:
+                # 占用集合读失败 = 未知 → fail-closed,不认领。
+                # 事件触发,没有保证会来的下一次,一次 DDB 抖动就放弃会让租户搁置。
+                # 8 次都失败才放弃该租户,并在下面打 WARN(可观测,不是静默丢失)。
+                _occ_fail += 1
+                print(
+                    f"[pending] PHYS OCCUPANCY READ FAILED tenant={tenant['id']} "
+                    f"host={cand['instance_id']} attempt={_attempt + 1}/8 — retrying"
+                )
+                continue
+            _occ_fail = 0  # 本轮读成功
+            if target is None:
+                print(
+                    f"[pending] NO FREE PHYS SLOT host={cand['instance_id']} "
+                    f"from={expected} — try another host"
+                )
+                continue
+            if target != expected:
+                print(
+                    f"[pending] SKIP OCCUPIED tenant={tenant['id']} "
+                    f"host={cand['instance_id']} expected={expected} target={target}"
+                )
             # 会"选得中、订不上"(见 tenant_service.py:_reserve_slot 注释)。
             _cpu_r, _mem_r = _host_profile.ratios(
                 cand,
@@ -984,29 +1014,41 @@ def process_pending():
             try:
                 r = hosts_table.update_item(
                     Key={"instance_id": cand["instance_id"]},
+                    # 条件仍是 next_vm_num = :expected —— 并发者改过就 CCF 重来,
+                    # 被跳过的号不会被别人同时认领。
                     UpdateExpression=(
                         "SET used_vcpu = used_vcpu + :v, used_mem_mb = used_mem_mb + :m, "
-                        "vm_count = vm_count + :one, next_vm_num = next_vm_num + :one, "
-                        "#s = :active REMOVE idle_since"
+                        "vm_count = vm_count + :one, next_vm_num = :next_after, "
+                        "#ps = :tid, #s = :active REMOVE idle_since"
                     ),
                     ConditionExpression=(
                         "next_vm_num = :expected AND used_vcpu <= :cap_v "
-                        "AND used_mem_mb <= :cap_m"
+                        "AND used_mem_mb <= :cap_m AND attribute_not_exists(#ps)"
                     ),
-                    ExpressionAttributeNames={"#s": "status"},
+                    ExpressionAttributeNames={
+                        "#s": "status",
+                        "#ps": _scheduling.phys_slot_attr(target),
+                    },
                     ExpressionAttributeValues={
                         ":v": vcpu,
                         ":m": mem_mb,
                         ":one": 1,
                         ":active": "active",
+                        ":tid": tenant["id"],
                         ":expected": expected,
+                        ":next_after": target + 1,
                         ":cap_v": cap_v,
                         ":cap_m": cap_m,
                     },
                     ReturnValues="UPDATED_NEW",
                 )
-                # 认领成功:claimed vm_num 是自增前的值。
-                vm_num = int(r["Attributes"]["next_vm_num"]) - 1
+                # 取号:优先用 CAS 返回值(与本函数原有契约一致),取不到回退 target。
+                # 两者恒等(CAS 成功 ⇒ next_vm_num == target+1);优先返回值是为了不改变
+                # 对外语义,回退是为了不依赖 DDB 一定回传 Attributes。
+                try:
+                    vm_num = int(r["Attributes"]["next_vm_num"]) - 1
+                except (KeyError, TypeError, ValueError):
+                    vm_num = target
                 host = cand
                 break
             except ClientError as e:
@@ -1014,10 +1056,21 @@ def process_pending():
                     e.response.get("Error", {}).get("Code")
                     == "ConditionalCheckFailedException"
                 ):
-                    continue  # 输了 CAS(容量满/next_vm_num 变了)→ 重选 host 重试
+                    # 输了 CAS(容量满/next_vm_num 变了/物理号被并发原子占了)→ 重选 host 重算
+                    continue
                 raise
         if host is None or vm_num is None:
-            break  # 无容量或持续竞争 → 停,剩余 pending 下次 tick 再处理
+            if _occ_fail:
+                # 占用始终读不出来:只跳过该租户,不停掉其余 pending(那是「无容量」的语义)。
+                # WARN 级日志便于巡检/人工重触发 —— 真正的持久重调度要把 pending 分配接到
+                # 队列上,属发号器设计变更,拆后续 issue。
+                print(
+                    f"[pending] WARN tenant={tenant['id']} left pending: physical "
+                    f"occupancy unknown after {_occ_fail} attempts "
+                    f"— needs retrigger or reconcile"
+                )
+                continue
+            break  # 无容量或持续竞争 → 停,剩余 pending 下次事件再处理
 
         guest_ip = _guest_ip(vm_num)
         host_port = VM_PORT_BASE + vm_num - 1
@@ -1040,28 +1093,40 @@ def process_pending():
             values[":qrv"] = rootfs_version
         else:
             update_expression += " REMOVE q_rootfs_version"
-        tenants_table.update_item(
-            Key={"id": tenant["id"]},
-            UpdateExpression=update_expression,
-            ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues=values,
-        )
+        try:
+            tenants_table.update_item(
+                Key={"id": tenant["id"]},
+                UpdateExpression=update_expression,
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues=values,
+            )
 
-        _launch_vm(
-            host["instance_id"],
-            tenant["id"],
-            vm_num,
-            vcpu,
-            mem_mb,
-            guest_ip,
-            host_port,
-            tenant.get("config_template", ""),
-            tenant.get("restore_backup_key", ""),
-            scoped_skills=_resolve_effective_skills(tenant),
-            litellm_vkey=tenant.get("litellm_vkey", ""),  # task #15
-            # mint-up-front secret persisted at create time (kills handshake race)
-            channel_secret=tenant.get("channel_secret", ""),
-        )
+            _launch_vm(
+                host["instance_id"],
+                tenant["id"],
+                vm_num,
+                vcpu,
+                mem_mb,
+                guest_ip,
+                host_port,
+                tenant.get("config_template", ""),
+                tenant.get("restore_backup_key", ""),
+                scoped_skills=_resolve_effective_skills(tenant),
+                litellm_vkey=tenant.get("litellm_vkey", ""),  # task #15
+                # mint-up-front secret persisted at create time (kills handshake race)
+                channel_secret=tenant.get("channel_secret", ""),
+            )
+        except Exception:
+            # 占号必须和容量分开归还:存量 host 没有 ps_*,不能让容量 floor guard 依赖它;
+            # 反过来容量回滚失败也不能连带泄漏仍属于本租户的物理号。
+            _release_slot(
+                host["instance_id"],
+                vcpu,
+                mem_mb,
+                phys_num=vm_num,
+                tenant_id=tenant["id"],
+            )
+            raise
         # DNAT → microVM:18789);per-tenant ALB rule/TG 死路径已下线。
         assigned += 1
 

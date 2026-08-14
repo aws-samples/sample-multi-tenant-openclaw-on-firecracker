@@ -4,6 +4,16 @@ This kit applies the control-plane source overlay and prepares the durable host
 replacement path without updating the existing stack. Run every AWS command with
 an explicit region.
 
+The driver subcommands are `precheck`, `backup`, `apply`, `apply-control`,
+`canary`, `refresh`, `verify`, `rollback`, `apply-api`, `verify-api`,
+`finalize-api`, and `rollback-api`. `--values <file>` optionally supplies a JSON
+object keyed by bootstrap placeholder name when a value cannot be recovered from
+the live rendered script.
+
+For a full rollout, use this order:
+`precheck → backup → apply → canary → refresh → verify`. A failed or missing
+canary gate forbids `refresh`.
+
 ## Step 0.0 Authenticity check
 
 Every shipped artifact must have the same SHA-256 value as its
@@ -76,6 +86,8 @@ bash lib/apply-restorepatch.sh backup \
 ```
 
 The recovery state is stored inside the kit. Rollback refuses to run without it.
+`backup` is not read-only: it calls Lambda `publish-version` to create the
+pre-restorepatch recovery anchor before recording that version.
 
 ## Step 2 Control-plane overlay
 
@@ -85,46 +97,18 @@ the live dependencies, updates the unqualified function, publishes a version, an
 advances the runtime-discovered alias when one exists.
 
 ```bash
-bash lib/apply-restorepatch.sh apply \
+bash lib/apply-restorepatch.sh apply-control \
   --env environment.json --kit .
 ```
 
-If bootstrap state is `DRIFT`, the command refuses only that bootstrap mutation and
-continues the other concerns. After reviewing the in-service content, the explicit
-override is:
-
-```bash
-bash lib/apply-restorepatch.sh apply \
-  --env environment.json --kit . --allow-base-drift
-```
-
-The override extracts every in-service
-`deployment/bootstrap/host/` 64-hex prefix, replaces all of them, and refuses to
-create an LT version unless the target is present, all old prefixes are absent,
-and no unresolved template marker remains.
+`apply-control` requires only the confirmed region and Lambda function. It does
+not read or mutate the ASG, launch template, assets bucket, or AMI, so the
+control-plane patch can be delivered before a replacement AMI is available.
 
 The API overlay is verified on both execution paths: the unqualified function and
 the alias-resolved published version must report the same `CodeSha256`.
 
-## Step 2b Optional stopgap
-
-Hosts are commonly in private subnets, so SSH may be unavailable. An urgent host
-file replacement can be sent through SSM, but it is only a stopgap and disappears
-when the instance is replaced.
-
-Use base64 as one line or provide `--cli-input-json`. Do not pass a multiline
-script through the `commands=[]` shorthand: line breaks can become literal `n`
-characters while SSM still reports `Success`.
-
-```bash
-B64="$(base64 < host-scripts/reset-vm.sh.patched | tr -d '\n')"
-PAYLOAD="$(printf '{"Parameters":{"commands":["echo %s | base64 -d > /home/ubuntu/reset-vm.sh && chmod 0644 /home/ubuntu/reset-vm.sh"]}}' "$B64")"
-aws ssm send-command --instance-ids "${CANARY_INSTANCE_ID}" \
-  --document-name AWS-RunShellScript --cli-input-json "$PAYLOAD" \
-  --region "${REGION}"
-```
-
-## Step 3 Packer AMI and controlled LT replacement
+## Step 3 Packer AMI and gated LT replacement
 
 Follow `host-scripts/packer/CUSTOMER-GUIDE.md`. In section 3, use option B, the
 manual upload procedure. The image synchronization script referenced by option A
@@ -141,10 +125,86 @@ packer build -var-file=host-scripts/packer/my.pkrvars.hcl \
 bash host-scripts/packer/assert-parity.sh
 ```
 
-Set `new_ami_id` in `environment.json`, rerun backup, then apply. The driver uploads
-`init-host.sh` under the CDK asset-bundle prefix, creates one LT version containing
-the new AMI and rewritten UserData, promotes it, and starts a controlled instance
-refresh.
+Set `new_ami_id` in `environment.json`, rerun backup, then apply. The driver
+recovers placeholders from assignments, matching whole code lines, and anchored
+script blocks in the live rendered bootstrap. `--values` may be omitted when
+those tiers resolve every value; otherwise provide the remaining values:
+
+```bash
+bash lib/apply-restorepatch.sh apply \
+  --env environment.json --kit . --values render-values.json
+```
+
+If bootstrap state is `DRIFT`, the command refuses that bootstrap mutation and
+publishes no host assets in that run, preventing a mixed-lineage fleet. It continues
+the other concerns. After reviewing the in-service content, the explicit override is:
+
+```bash
+bash lib/apply-restorepatch.sh apply \
+  --env environment.json --kit . --values render-values.json --allow-base-drift
+```
+
+The override extracts every in-service
+`deployment/bootstrap/host/` 64-hex prefix, replaces all of them, and refuses to
+create an LT version unless the target is present, all old prefixes are absent,
+and the rendered bootstrap has no unresolved template marker on a code line.
+Historical `{{AVAIL_VCPU}}/{{AVAIL_MEM}}` markers in comments are preserved.
+
+When the bootstrap gate permits publication, the driver also publishes
+`launch-vm.sh`, `rebuild-vm.sh`, `reset-vm.sh`, the Fluent Bit files, and finally
+`host-agent.py`. It records the prior S3 object versions and verifies each uploaded
+byte length. The host-agent unit is delivered inline: `{{HOST_AGENT_SCRIPT}}` is
+rendered as a `SVCEOF` heredoc containing the raw contents of
+`host-scripts/host-agent.service.patched`. `apply` creates and promotes the LT
+version but deliberately does not start a fleet refresh.
+
+Run the single-host canary next:
+
+```bash
+bash lib/apply-restorepatch.sh canary \
+  --env environment.json --kit .
+```
+
+The canary first confirms that `MaxSize` has one free slot, then temporarily raises
+desired capacity by one without changing `MinSize`. It waits for one new host on the
+promoted LT and checks cloud-init/bootstrap logs, the active host-agent service, all
+four host scripts, unresolved markers, `PYTHONUNBUFFERED=1`, and the unit's
+`OC_AGENT_PORT`. After PASS or any failure where the canary instance is known, the
+driver removes that exact instance with
+`terminate-instance-in-auto-scaling-group --should-decrement-desired-capacity`; it
+does not use termination-policy-controlled scale-in. Desired capacity is then
+asserted to equal its original value. Do not continue unless this phase prints
+`canary PASS`.
+
+Only after a passing canary, start the launch-before-terminate refresh:
+
+```bash
+bash lib/apply-restorepatch.sh refresh \
+  --env environment.json --kit .
+```
+
+The refresh uses both `MinHealthyPercentage=100` and
+`MaxHealthyPercentage=100`, which is the AWS-documented combination for replacing
+one instance at a time by launching the replacement before terminating the old
+instance.
+
+## Step 3b Optional stopgap
+
+Hosts are commonly in private subnets, so SSH may be unavailable. An urgent host
+file replacement can be sent through SSM, but it is only a stopgap and disappears
+when the instance is replaced.
+
+Use base64 as one line or provide `--cli-input-json`. Do not pass a multiline
+script through the `commands=[]` shorthand: line breaks can become literal `n`
+characters while SSM still reports `Success`.
+
+```bash
+B64="$(base64 < host-scripts/reset-vm.sh.patched | tr -d '\n')"
+PAYLOAD="$(printf '{"Parameters":{"commands":["echo %s | base64 -d > /home/ubuntu/reset-vm.sh && chmod 0644 /home/ubuntu/reset-vm.sh"]}}' "$B64")"
+aws ssm send-command --instance-ids "${CANARY_INSTANCE_ID}" \
+  --document-name AWS-RunShellScript --cli-input-json "$PAYLOAD" \
+  --region "${REGION}"
+```
 
 When inspecting a large Lambda archive under `set -o pipefail`, first store
 `unzip -l` output in a variable and then search it. A direct
@@ -181,7 +241,7 @@ deletion is required.
 
 ## Step 6 New-host verification
 
-Run:
+After the refresh has completed, run:
 
 ```bash
 bash lib/apply-restorepatch.sh verify \

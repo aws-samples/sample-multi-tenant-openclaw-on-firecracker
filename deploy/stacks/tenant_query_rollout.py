@@ -42,10 +42,14 @@ def validate_tenant_query_config(cfg):
         )
 
 
-def validate_live_rollout(cfg, indexes):
+def validate_live_rollout(cfg, indexes, table_exists=True):
     """Validate the desired config against DescribeTable GSI state."""
     validate_tenant_query_config(cfg)
     desired = set(desired_query_indexes(cfg))
+    if not table_exists:
+        # CloudFormation creates a brand-new table together with all of its GSIs in a
+        # single operation, so DynamoDB's "one GSI per update" limit — the reason the
+        return desired
     query_indexes = {index_name for _, index_name in GSI_GATES}
     actual = {
         item["IndexName"]: item["IndexStatus"]

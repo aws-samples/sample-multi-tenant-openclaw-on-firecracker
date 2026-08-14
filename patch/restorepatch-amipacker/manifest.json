@@ -1,9 +1,11 @@
 {
   "id": "restorepatch-amipacker",
   "base_sha": "50a410187e187c255272f2bc49e7ab83c72114df",
-  "patch_sha": "cd367925374a3645934592959a38a750054793d5",
+  "patch_sha": "347d08b3aade3c1de12edf0fc9966c898aeb879e",
   "status": "MANUAL_REVIEW",
-  "excludes": [],
+  "excludes": [
+    ".gitleaks.toml"
+  ],
   "cloudformation": {
     "status": "CAPTURED",
     "reason": null,
@@ -23,11 +25,11 @@
         }
       },
       "patch": {
-        "source_sha": "cd367925374a3645934592959a38a750054793d5",
-        "source_tree": "07c2ee5bf1c9c128dc5b45f09c1c0bf804225935",
+        "source_sha": "347d08b3aade3c1de12edf0fc9966c898aeb879e",
+        "source_tree": "9f85458e2d1a255d9d893e7047018fbcaa909c40",
         "assembly_index": {
           "artifact": "resources/cloudformation/patch.assembly-index.json",
-          "sha256": "f735e0127544eb7b0ffcc6870700378df1a091c63963ae889db3ab40362ba98c"
+          "sha256": "59a3764af009bfc6c11f2b51b6d87d41028e6db344353dd52992220b5d65bb7b"
         }
       }
     },
@@ -53,7 +55,7 @@
         },
         "patch_template": {
           "artifact": "resources/cloudformation/OpenClawImage.patch.json",
-          "sha256": "650b45b0b4181aefe03932569bf951f528c395c3331fbf60e40d16236a425b7c"
+          "sha256": "35efbe068bb2dd787662534e0235c0c04015cc0f44e1c26beeb28dcae0a1cc9d"
         }
       },
       {
@@ -65,7 +67,7 @@
         },
         "patch_template": {
           "artifact": "resources/cloudformation/OpenClawOrchestrator.patch.json",
-          "sha256": "1ca7ce000a64f7ac9cb9cc188cb0100a19d47a95be65204b12126bfbbc2dd020"
+          "sha256": "1c000b6a6b36e1872d6ba13c3fc070fadf999f5a42798b349d9e27321fdf53a3"
         }
       }
     ]
@@ -75,7 +77,7 @@
       "sha256": "07b9633975bdc8e76803af83f9057c09a3fe28707f5284c727933e3050238df1"
     },
     "lib/apply-restorepatch.sh": {
-      "sha256": "44fecc92fc8fafda95a20834f77ad68c2a495c29d56870b075d64facd47f295c"
+      "sha256": "7e0dbdfbcbc49bb6eb5efa60472c86c105639def485a30e182b39bb2cd20e084"
     },
     "lib/discover-env.sh": {
       "sha256": "88c94e11354d372504b3c7f11434418a8b271599d15794438fe46d3f4730add5"
@@ -1351,7 +1353,7 @@
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
       "base_sha256": "c411ca0d3126e49313bcd4dd737ecc8d068e3ef0ccb1bc16e540bda2ebada7dc",
-      "patch_sha256": "074ebd5fe9eee8767f6fc0698e019d9067bc019c310b9c7551a2f38d3b1b9f41",
+      "patch_sha256": "520162a0835aa850d78a05e10b070c1ecfb301b29f01be6e8d7070f7113f9f53",
       "operations": [
         {
           "resource": "repository file delivery",
@@ -1401,7 +1403,7 @@
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
       "base_sha256": "cb1b4801cca4ff445a1281bc07213f20eb46dbe5b902ff04a7b3670764bb6c2c",
-      "patch_sha256": "1d3e193bc0971e1571f0d1f5326ec4813f22cbda1dc2a39cdd3a80c537551e9f",
+      "patch_sha256": "a7639734b55a7aca4efc3819253ecba74b6a938ce792fcba909508b6fdb851c4",
       "operations": [
         {
           "resource": "repository file delivery",
@@ -1452,7 +1454,7 @@
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
       "base_sha256": "9d5183734f36bf9c092e55bcaece78bf79399cbd9bc36b69c93567d2bc745424",
-      "patch_sha256": "75d6a38550bca8af0a78cd451209f13c8bc2606bd70b00eb97239b1d2417ddbe",
+      "patch_sha256": "efb91a437a5312e6e490974aa0ae3af0645f52800e70860e1942efadb318a399",
       "operations": [
         {
           "resource": "repository file delivery",
@@ -1476,7 +1478,7 @@
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
       "base_sha256": "d40eb38fd7588ae17bfd2cc517e34cbf2caea1c44537fe5d014585ab48b38f8b",
-      "patch_sha256": "9320983fb8d25f91e5b2bd014944294441573b630bf12ebda395cb1fae1a272c",
+      "patch_sha256": "479e2e0fd2ae62b729d6577221f474a5516bcb094e31da04790a7ace578aff03",
       "operations": [
         {
           "resource": "repository file delivery",
@@ -1552,7 +1554,7 @@
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
       "base_sha256": "219778d8770a2886c58742f198e87b150f2f63de2ef13f5729724f83be95eb54",
-      "patch_sha256": "02be14ffb52ed84510b010ee43cf1cf493fc2c925670c8a4dd428a3c9aa80785",
+      "patch_sha256": "99f40251d9768c21a6ddafe3c5c5a4f1ea6db2e2fa55c457a67a408b6430707f",
       "operations": [
         {
           "resource": "repository file delivery",
@@ -1608,7 +1610,7 @@
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
       "base_sha256": "a3a8035e7cb8ff761237ab8ec2a52b981686be57ccb3cd1ad4656020a957a48c",
-      "patch_sha256": "165d5511b76fdf9f828ebd09616f63e79e5a2c67be4585e6cfcfb4eeaeb32bf8",
+      "patch_sha256": "3243215268c8c5422afcdf5d5672b1e34363c3582101e5ac5c49991acd693d20",
       "operations": [
         {
           "resource": "repository file delivery",
@@ -1732,7 +1734,7 @@
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
       "base_sha256": null,
-      "patch_sha256": "1f2401d71c9ae552139781dfdc7f341a0ce910d412caea2876e21c1cd0adae3f",
+      "patch_sha256": "9a60dbb028336be9bb26c55555efea93c9eade682b5e03e0ccd174b003569816",
       "operations": [
         {
           "resource": "repository file delivery",
@@ -1773,6 +1775,30 @@
         "fix-477"
       ]
     },
+    "deploy/packer/assert-image.sh": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/packer/assert-image.sh",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "aee433f6fd6b3fe1f8c203a0b2e10624204e0689baceb3aa1c00d0e073318589",
+      "operations": [
+        {
+          "resource": "repository file delivery",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RESTORE",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "install the listed artifact at its repository-relative destination",
+          "verify_cli": "compare the installed file SHA-256 with manifest patch_sha256",
+          "rollback_cli": "restore the recorded pre-apply file"
+        }
+      ],
+      "fix_ids": [
+        "fix-477-image"
+      ]
+    },
     "deploy/packer/assert-parity.sh": {
       "change": "A",
       "layer": "deploy-other",
@@ -1780,7 +1806,7 @@
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
       "base_sha256": null,
-      "patch_sha256": "223eb29beaccf499e58139c0cf47481ecc3b507da2fdc690a0934ec69d6f6d0b",
+      "patch_sha256": "77cdd2b97aa713c52ef3ce9ef0bc271bcc8f814a092427b2aa69fd0dcc01df3a",
       "operations": [
         {
           "resource": "repository file delivery",
@@ -1876,7 +1902,7 @@
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
       "base_sha256": null,
-      "patch_sha256": "157748ee9b59cef6d45ec4c1928f924ad7bec34f694289e469ab39f9d75e8260",
+      "patch_sha256": "69a580ebb88d8e995e7e14ef486e2701127028020e032465d3c6190c2273064d",
       "operations": [
         {
           "resource": "repository file delivery",
@@ -1958,7 +1984,7 @@
             {
               "change": "A",
               "stack": "OpenClawOrchestrator",
-              "logical_id": "ApiHandlerCurrentVersion5C7F0A604cb4a8a18868b63949116ec65522c4d5",
+              "logical_id": "ApiHandlerCurrentVersion5C7F0A60eb953484cde6f4b8bf5ba9d8a32e6195",
               "resource_type": "AWS::Lambda::Version"
             },
             {
@@ -2188,6 +2214,12 @@
               "stack": "OpenClawOrchestrator",
               "logical_id": "LiteLlmSecretA2C1C71D",
               "resource_type": "AWS::SecretsManager::Secret"
+            },
+            {
+              "change": "M",
+              "stack": "OpenClawOrchestrator",
+              "logical_id": "HealthCheckServiceRoleDefaultPolicyAE8FE253",
+              "resource_type": "AWS::IAM::Policy"
             }
           ],
           "artifact_refs": [
@@ -2212,7 +2244,7 @@
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
       "base_sha256": "b4093090ebb7ab3e37fe3b65866949b318b5be0d9d5666c53662058dd33e3c16",
-      "patch_sha256": "eed51d9619974610f2e18fcf02cfa9ef71f779e321290bd711052452c0f9f071",
+      "patch_sha256": "6a991e42547cc2a1e0a626f2d8a033d0d03b130382b5ac31a7b8733c4698965a",
       "operations": [
         {
           "resource": "repository file delivery",
@@ -2389,6 +2421,54 @@
         "fix-495"
       ]
     },
+    "deploy/userdata/backup-data.sh": {
+      "change": "M",
+      "layer": "B-s3",
+      "artifact": "host-scripts/backup-data.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "6792885af2d65a828be92cc5082a3e9be851a71c4d41a50babeb1c34426fc1c4",
+      "patch_sha256": "5165344d3440685d696fe933b297de8cf4f6188b9103b4c78e31948ba9071c50",
+      "operations": [
+        {
+          "resource": "repository file delivery",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RESTORE",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "install the listed artifact at its repository-relative destination",
+          "verify_cli": "compare the installed file SHA-256 with manifest patch_sha256",
+          "rollback_cli": "restore the recorded pre-apply file"
+        }
+      ],
+      "fix_ids": [
+        "fix-469"
+      ]
+    },
+    "deploy/userdata/delete-vm.sh": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/delete-vm.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "3c8fac4017d643fc1a35e4583cd789bdf129a629b124ee4a04bf5014337ebb6c",
+      "operations": [
+        {
+          "resource": "repository file delivery",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RESTORE",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "install the listed artifact at its repository-relative destination",
+          "verify_cli": "compare the installed file SHA-256 with manifest patch_sha256",
+          "rollback_cli": "restore the recorded pre-apply file"
+        }
+      ],
+      "fix_ids": [
+        "fix-469"
+      ]
+    },
     "deploy/userdata/host-agent.py": {
       "change": "M",
       "layer": "B-s3",
@@ -2445,7 +2525,7 @@
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
       "base_sha256": "1a68df6da1b3405fd32fbbf63addd4ec4fb6985623213f133a327d8ffb6022e8",
-      "patch_sha256": "744793b0fcb1d0e8df650aa747c22cc733939e16cce0f805e7a9f0022e761d17",
+      "patch_sha256": "ef0fbf78501b0bb07e7968146d987078c25baf850ea0f208fb877a45c5779cd2",
       "operations": [
         {
           "resource": "repository file delivery",
@@ -2473,7 +2553,7 @@
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
       "base_sha256": "bc2ba8a9fe76d80c5019b3433cbfecb1ba51c27aa2aae896b33509b1b2b72358",
-      "patch_sha256": "4977bd62797e1e9843f75484907b0ea376fc8139106a97bc69e5f007d8bbea9d",
+      "patch_sha256": "3e10ff2d202195fc49a9b7f3fe760197d9f0a83d48982e0463237234972d45b0",
       "operations": [
         {
           "resource": "repository file delivery",
@@ -2488,6 +2568,30 @@
       ],
       "fix_ids": [
         "fix-413"
+      ]
+    },
+    "deploy/userdata/provision-host.sh": {
+      "change": "M",
+      "layer": "B-s3",
+      "artifact": "host-scripts/provision-host.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "11a3cbb7e6fe0177e4319cce34e0f20643a6251920da583c3288530c83c2d6cc",
+      "patch_sha256": "2b2d1a59f514012719722a7689af30314babb0499ff424f802e792ca47049311",
+      "operations": [
+        {
+          "resource": "repository file delivery",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RESTORE",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "install the listed artifact at its repository-relative destination",
+          "verify_cli": "compare the installed file SHA-256 with manifest patch_sha256",
+          "rollback_cli": "restore the recorded pre-apply file"
+        }
+      ],
+      "fix_ids": [
+        "fix-451"
       ]
     },
     "deploy/userdata/rebuild-vm.sh": {
@@ -2536,6 +2640,30 @@
       ],
       "fix_ids": [
         "fix-485"
+      ]
+    },
+    "deploy/userdata/stop-vm.sh": {
+      "change": "M",
+      "layer": "B-s3",
+      "artifact": "host-scripts/stop-vm.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "5089f59039a7691ac93c973c620e8603898d3a1c721a38215b6514d30ec02a78",
+      "patch_sha256": "4fb9a715a0e57e929c20368352baa949586798083a5d1fcec5a272215575deba",
+      "operations": [
+        {
+          "resource": "repository file delivery",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RESTORE",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "install the listed artifact at its repository-relative destination",
+          "verify_cli": "compare the installed file SHA-256 with manifest patch_sha256",
+          "rollback_cli": "restore the recorded pre-apply file"
+        }
+      ],
+      "fix_ids": [
+        "fix-469"
       ]
     },
     "docs/api/pull-image-api.md": {
@@ -3091,31 +3219,6 @@
       ],
       "fix_ids": []
     },
-    "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/console-bff/web/index.html": {
-      "change": "D",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "DELETED",
-      "artifact_disposition": {
-        "kind": "SOURCE_DELETED",
-        "evidence": "git-diff-delete"
-      },
-      "base_sha256": "388a44c54dbb1d0312fb71c407ca63f12040a5e70aff49f68c2afcf7dba3d735",
-      "patch_sha256": null,
-      "operations": [
-        {
-          "resource": "repository cleanup only; no customer-side deletion",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this repository-only deletion has no customer action",
-          "verify_cli": "confirm no customer resource or deployed file was removed",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
     "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/console-bff/web/js/app.core.js": {
       "change": "D",
       "layer": "meta",
@@ -3141,31 +3244,6 @@
       ],
       "fix_ids": []
     },
-    "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/console-bff/web/js/app.format.js": {
-      "change": "D",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "DELETED",
-      "artifact_disposition": {
-        "kind": "SOURCE_DELETED",
-        "evidence": "git-diff-delete"
-      },
-      "base_sha256": "8f3e0ee18e2f01f16db13e0c9e28b14e93229c45000a95f64bfba09932bbe4af",
-      "patch_sha256": null,
-      "operations": [
-        {
-          "resource": "repository cleanup only; no customer-side deletion",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this repository-only deletion has no customer action",
-          "verify_cli": "confirm no customer resource or deployed file was removed",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
     "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/console-bff/web/js/app.hosts.js": {
       "change": "D",
       "layer": "meta",
@@ -3176,56 +3254,6 @@
         "evidence": "git-diff-delete"
       },
       "base_sha256": "63c60b90a24c78f7325f09fd0d072dc539bcd44a974fd7ca4495f9b1ff8c9721",
-      "patch_sha256": null,
-      "operations": [
-        {
-          "resource": "repository cleanup only; no customer-side deletion",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this repository-only deletion has no customer action",
-          "verify_cli": "confirm no customer resource or deployed file was removed",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/console-bff/web/js/app.tenants.js": {
-      "change": "D",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "DELETED",
-      "artifact_disposition": {
-        "kind": "SOURCE_DELETED",
-        "evidence": "git-diff-delete"
-      },
-      "base_sha256": "5a94ea798ee004b72e17b61025de76264790b867c1db69cee4941041539b0036",
-      "patch_sha256": null,
-      "operations": [
-        {
-          "resource": "repository cleanup only; no customer-side deletion",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this repository-only deletion has no customer action",
-          "verify_cli": "confirm no customer resource or deployed file was removed",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/console-bff/web/style.css": {
-      "change": "D",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "DELETED",
-      "artifact_disposition": {
-        "kind": "SOURCE_DELETED",
-        "evidence": "git-diff-delete"
-      },
-      "base_sha256": "98464b697055fe24600921a8d4ea8854e75a340f36075c0aadd60139efe0c7f0",
       "patch_sha256": null,
       "operations": [
         {
@@ -3316,31 +3344,6 @@
       ],
       "fix_ids": []
     },
-    "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/lambda/api/core/clients.py": {
-      "change": "D",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "DELETED",
-      "artifact_disposition": {
-        "kind": "SOURCE_DELETED",
-        "evidence": "git-diff-delete"
-      },
-      "base_sha256": "44ace929a420075838a725c06e5aae837591ad53d3fbca34d9ff139740a41270",
-      "patch_sha256": null,
-      "operations": [
-        {
-          "resource": "repository cleanup only; no customer-side deletion",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this repository-only deletion has no customer action",
-          "verify_cli": "confirm no customer resource or deployed file was removed",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
     "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/lambda/api/core/image_channel.py": {
       "change": "D",
       "layer": "meta",
@@ -3416,31 +3419,6 @@
       ],
       "fix_ids": []
     },
-    "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/lambda/api/core/image_ops.py": {
-      "change": "D",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "DELETED",
-      "artifact_disposition": {
-        "kind": "SOURCE_DELETED",
-        "evidence": "git-diff-delete"
-      },
-      "base_sha256": "a9106209d30b7977833300ad70c87e8a0c8988b5effcf5d8f0e6043861ff0f15",
-      "patch_sha256": null,
-      "operations": [
-        {
-          "resource": "repository cleanup only; no customer-side deletion",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this repository-only deletion has no customer action",
-          "verify_cli": "confirm no customer resource or deployed file was removed",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
     "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/lambda/api/core/image_slots.py": {
       "change": "D",
       "layer": "meta",
@@ -3451,81 +3429,6 @@
         "evidence": "git-diff-delete"
       },
       "base_sha256": "073751cc7b202f309c86fc3d1c09ca7db3962c30bba428edee737cd31f2b0d70",
-      "patch_sha256": null,
-      "operations": [
-        {
-          "resource": "repository cleanup only; no customer-side deletion",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this repository-only deletion has no customer action",
-          "verify_cli": "confirm no customer resource or deployed file was removed",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/lambda/api/core/scheduling.py": {
-      "change": "D",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "DELETED",
-      "artifact_disposition": {
-        "kind": "SOURCE_DELETED",
-        "evidence": "git-diff-delete"
-      },
-      "base_sha256": "c411ca0d3126e49313bcd4dd737ecc8d068e3ef0ccb1bc16e540bda2ebada7dc",
-      "patch_sha256": null,
-      "operations": [
-        {
-          "resource": "repository cleanup only; no customer-side deletion",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this repository-only deletion has no customer action",
-          "verify_cli": "confirm no customer resource or deployed file was removed",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/lambda/api/core/ssm_dispatch.py": {
-      "change": "D",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "DELETED",
-      "artifact_disposition": {
-        "kind": "SOURCE_DELETED",
-        "evidence": "git-diff-delete"
-      },
-      "base_sha256": "2838478dad3e60902062e6774336db6d9cb639da106ddf42c9bde4ed558dfe33",
-      "patch_sha256": null,
-      "operations": [
-        {
-          "resource": "repository cleanup only; no customer-side deletion",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this repository-only deletion has no customer action",
-          "verify_cli": "confirm no customer resource or deployed file was removed",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/lambda/api/handler.py": {
-      "change": "D",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "DELETED",
-      "artifact_disposition": {
-        "kind": "SOURCE_DELETED",
-        "evidence": "git-diff-delete"
-      },
-      "base_sha256": "cb1b4801cca4ff445a1281bc07213f20eb46dbe5b902ff04a7b3670764bb6c2c",
       "patch_sha256": null,
       "operations": [
         {
@@ -3591,31 +3494,6 @@
       ],
       "fix_ids": []
     },
-    "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/lambda/api/services/dispatch_service.py": {
-      "change": "D",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "DELETED",
-      "artifact_disposition": {
-        "kind": "SOURCE_DELETED",
-        "evidence": "git-diff-delete"
-      },
-      "base_sha256": "9d5183734f36bf9c092e55bcaece78bf79399cbd9bc36b69c93567d2bc745424",
-      "patch_sha256": null,
-      "operations": [
-        {
-          "resource": "repository cleanup only; no customer-side deletion",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this repository-only deletion has no customer action",
-          "verify_cli": "confirm no customer resource or deployed file was removed",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
     "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/lambda/api/services/image_slot_service.py": {
       "change": "D",
       "layer": "meta",
@@ -3641,31 +3519,6 @@
       ],
       "fix_ids": []
     },
-    "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/lambda/api/services/lifecycle_dispatch.py": {
-      "change": "D",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "DELETED",
-      "artifact_disposition": {
-        "kind": "SOURCE_DELETED",
-        "evidence": "git-diff-delete"
-      },
-      "base_sha256": "0514111b228578a525e0ec7820377c76fca3283ae0e589d81a3131bc63573be5",
-      "patch_sha256": null,
-      "operations": [
-        {
-          "resource": "repository cleanup only; no customer-side deletion",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this repository-only deletion has no customer action",
-          "verify_cli": "confirm no customer resource or deployed file was removed",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
     "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/lambda/api/services/tenant_stats_service.py": {
       "change": "D",
       "layer": "meta",
@@ -3676,81 +3529,6 @@
         "evidence": "git-diff-delete"
       },
       "base_sha256": "45e0b401450a03dc97ce568b4702c0374ee22f46693c409fb203164c931fe382",
-      "patch_sha256": null,
-      "operations": [
-        {
-          "resource": "repository cleanup only; no customer-side deletion",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this repository-only deletion has no customer action",
-          "verify_cli": "confirm no customer resource or deployed file was removed",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/lambda/health_check/handler.py": {
-      "change": "D",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "DELETED",
-      "artifact_disposition": {
-        "kind": "SOURCE_DELETED",
-        "evidence": "git-diff-delete"
-      },
-      "base_sha256": "a3a8035e7cb8ff761237ab8ec2a52b981686be57ccb3cd1ad4656020a957a48c",
-      "patch_sha256": null,
-      "operations": [
-        {
-          "resource": "repository cleanup only; no customer-side deletion",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this repository-only deletion has no customer action",
-          "verify_cli": "confirm no customer resource or deployed file was removed",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/lambda/scaler/handler.py": {
-      "change": "D",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "DELETED",
-      "artifact_disposition": {
-        "kind": "SOURCE_DELETED",
-        "evidence": "git-diff-delete"
-      },
-      "base_sha256": "5dc20f11757d58c70e0e0331b2e26de66a84cdcdfe43d8703109517332519b72",
-      "patch_sha256": null,
-      "operations": [
-        {
-          "resource": "repository cleanup only; no customer-side deletion",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this repository-only deletion has no customer action",
-          "verify_cli": "confirm no customer resource or deployed file was removed",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/lambda/tenant_stats/handler.py": {
-      "change": "D",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "DELETED",
-      "artifact_disposition": {
-        "kind": "SOURCE_DELETED",
-        "evidence": "git-diff-delete"
-      },
-      "base_sha256": "d955e88f26689d02c0e047c600622666793f9460d8010f4c8ce4034e2a0b045a",
       "patch_sha256": null,
       "operations": [
         {
@@ -4016,31 +3794,6 @@
       ],
       "fix_ids": []
     },
-    "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/stacks/ha_edge.py": {
-      "change": "D",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "DELETED",
-      "artifact_disposition": {
-        "kind": "SOURCE_DELETED",
-        "evidence": "git-diff-delete"
-      },
-      "base_sha256": "da546af5acc6cc579069d60d5cb74f5d13d73899fd18b46b27ac47f7c30eec97",
-      "patch_sha256": null,
-      "operations": [
-        {
-          "resource": "repository cleanup only; no customer-side deletion",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this repository-only deletion has no customer action",
-          "verify_cli": "confirm no customer resource or deployed file was removed",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
     "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/stacks/host_image.py": {
       "change": "D",
       "layer": "meta",
@@ -4051,31 +3804,6 @@
         "evidence": "git-diff-delete"
       },
       "base_sha256": "f2252d73c0e4897349328440394f93dc449b6afda670529e953b39a962acacbe",
-      "patch_sha256": null,
-      "operations": [
-        {
-          "resource": "repository cleanup only; no customer-side deletion",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this repository-only deletion has no customer action",
-          "verify_cli": "confirm no customer resource or deployed file was removed",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/stacks/lambdas.py": {
-      "change": "D",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "DELETED",
-      "artifact_disposition": {
-        "kind": "SOURCE_DELETED",
-        "evidence": "git-diff-delete"
-      },
-      "base_sha256": "b4093090ebb7ab3e37fe3b65866949b318b5be0d9d5666c53662058dd33e3c16",
       "patch_sha256": null,
       "operations": [
         {
@@ -4116,31 +3844,6 @@
       ],
       "fix_ids": []
     },
-    "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/stacks/observability.py": {
-      "change": "D",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "DELETED",
-      "artifact_disposition": {
-        "kind": "SOURCE_DELETED",
-        "evidence": "git-diff-delete"
-      },
-      "base_sha256": "d7a3ff7271cb3b5807aaf1e8cf2f7a6a6b93da0ee3827b8e93385b69bd684270",
-      "patch_sha256": null,
-      "operations": [
-        {
-          "resource": "repository cleanup only; no customer-side deletion",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this repository-only deletion has no customer action",
-          "verify_cli": "confirm no customer resource or deployed file was removed",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
     "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/stacks/storage.py": {
       "change": "D",
       "layer": "meta",
@@ -4151,56 +3854,6 @@
         "evidence": "git-diff-delete"
       },
       "base_sha256": "f77de59b86b0d0b1f3ad342d680223254efcedc16e9023db0aadef0a71df7232",
-      "patch_sha256": null,
-      "operations": [
-        {
-          "resource": "repository cleanup only; no customer-side deletion",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this repository-only deletion has no customer action",
-          "verify_cli": "confirm no customer resource or deployed file was removed",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/userdata/host-agent.py": {
-      "change": "D",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "DELETED",
-      "artifact_disposition": {
-        "kind": "SOURCE_DELETED",
-        "evidence": "git-diff-delete"
-      },
-      "base_sha256": "a6abd7e08557151719d46bf220b41dfa7faeeaffa605e3dadd85782c41ce9a1a",
-      "patch_sha256": null,
-      "operations": [
-        {
-          "resource": "repository cleanup only; no customer-side deletion",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this repository-only deletion has no customer action",
-          "verify_cli": "confirm no customer resource or deployed file was removed",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/userdata/launch-vm.sh": {
-      "change": "D",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "DELETED",
-      "artifact_disposition": {
-        "kind": "SOURCE_DELETED",
-        "evidence": "git-diff-delete"
-      },
-      "base_sha256": "bc2ba8a9fe76d80c5019b3433cbfecb1ba51c27aa2aae896b33509b1b2b72358",
       "patch_sha256": null,
       "operations": [
         {
@@ -5541,31 +5194,6 @@
       ],
       "fix_ids": []
     },
-    "patch-kits/428-v2-from-pr124/artifacts/repo/scripts/checks/hardcoded.sh": {
-      "change": "D",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "DELETED",
-      "artifact_disposition": {
-        "kind": "SOURCE_DELETED",
-        "evidence": "git-diff-delete"
-      },
-      "base_sha256": "ee4e979494b43c46c998e95b75a292a282d43edabaec7e8174ee889577335d36",
-      "patch_sha256": null,
-      "operations": [
-        {
-          "resource": "repository cleanup only; no customer-side deletion",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this repository-only deletion has no customer action",
-          "verify_cli": "confirm no customer resource or deployed file was removed",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
     "patch-kits/428-v2-from-pr124/artifacts/repo/scripts/checks/lib.sh": {
       "change": "D",
       "layer": "meta",
@@ -6241,918 +5869,6 @@
       ],
       "fix_ids": []
     },
-    "patch/amipatch/APPLY-INSTRUCTIONS.md": {
-      "change": "A",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": null,
-      "patch_sha256": "163db6824c437fbfcf138ea81da69b102d3f43e7ff399dd5f8f69ec9e4f51040",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch/amipatch/host-scripts/deploy-machine/config.yml.example": {
-      "change": "R",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": "802e382f52944a7135490c7d6713f766ac5257260db1c5185874ef5c03549a1a",
-      "patch_sha256": "5357fcc50d8e817e6af14626772f915b9f9d2557500047b2ab77c6f65d2b7454",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": [],
-      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/config.yml.example",
-      "new_path": "patch/amipatch/host-scripts/deploy-machine/config.yml.example"
-    },
-    "patch/amipatch/host-scripts/deploy-machine/deploy/stacks/tenant_query_rollout.py": {
-      "change": "A",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": null,
-      "patch_sha256": "1d554fc9fbb6c45325c1c14b966baca51e197a5faa466982e8ba62192ec9ee51",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch/amipatch/host-scripts/deploy-machine/samples/config-sg-prod.yaml": {
-      "change": "A",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": null,
-      "patch_sha256": "e997a480db7a95e0fa4c92ab65927252f083bdc0f33a74557796a8fbf7da66b8",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch/amipatch/host-scripts/deploy-machine/scripts/checks/tenant-query-rollout.py": {
-      "change": "A",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": null,
-      "patch_sha256": "d7d86e4ada122c07b3b24910ea480bdfa112ad397289c27be2b14a716abd6ab1",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch/amipatch/host-scripts/deploy-machine/scripts/preflight-check.sh": {
-      "change": "A",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": null,
-      "patch_sha256": "860693a5c77540bdf32b0812c50b969cee25f9248cec676938fb7a654c2d844c",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch/amipatch/host-scripts/deploy-machine/setup.sh": {
-      "change": "R",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": "f9980fb7a897b4b5c6367b800bf7bd428ff3a71799112241a15c18733613603e",
-      "patch_sha256": "f318bab8940c77d37a1daba7f4017dcef2426097eec743f05e50fe7d24ff5b48",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": [],
-      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/setup.sh",
-      "new_path": "patch/amipatch/host-scripts/deploy-machine/setup.sh"
-    },
-    "patch/amipatch/host-scripts/host-agent.service.patched": {
-      "change": "A",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": null,
-      "patch_sha256": "569060a0bbca6a6f67c57dcc3f9a3bd27aa1dc2aedf51d0f9894ef98bfc4b7d5",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch/amipatch/host-scripts/init-host.sh.patched": {
-      "change": "R",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": "1a68df6da1b3405fd32fbbf63addd4ec4fb6985623213f133a327d8ffb6022e8",
-      "patch_sha256": "744793b0fcb1d0e8df650aa747c22cc733939e16cce0f805e7a9f0022e761d17",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": [],
-      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/userdata/init-host.sh",
-      "new_path": "patch/amipatch/host-scripts/init-host.sh.patched"
-    },
-    "patch/amipatch/host-scripts/install-fluent-bit.sh.patched": {
-      "change": "R",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": "d07496e39710de1c05f32172c78bdc70c00cd18067093dc9ee2effef40044aa5",
-      "patch_sha256": "0dff5df771194c4c4b416bcd22506ff7475b744af445f746c7b7f76def1c85e0",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": [],
-      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/edge/fluent-bit/install-fluent-bit.sh",
-      "new_path": "patch/amipatch/host-scripts/install-fluent-bit.sh.patched"
-    },
-    "patch/amipatch/host-scripts/packer/CUSTOMER-GUIDE.md": {
-      "change": "A",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": null,
-      "patch_sha256": "833a94624efd48bc7febeab0be60299cc0172b8a76eedd5a85e300e29ecbe670",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch/amipatch/host-scripts/packer/README.md": {
-      "change": "A",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": null,
-      "patch_sha256": "1f2401d71c9ae552139781dfdc7f341a0ce910d412caea2876e21c1cd0adae3f",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch/amipatch/host-scripts/packer/apse1.pkrvars.hcl": {
-      "change": "A",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": null,
-      "patch_sha256": "ae855df3998ef5d148e53f066403bf8ae2fb72c07e0154e2e413c8df8cc58ef3",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch/amipatch/host-scripts/packer/assert-parity.sh": {
-      "change": "A",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": null,
-      "patch_sha256": "223eb29beaccf499e58139c0cf47481ecc3b507da2fdc690a0934ec69d6f6d0b",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch/amipatch/host-scripts/packer/build-guide-html.sh": {
-      "change": "A",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": null,
-      "patch_sha256": "2fd31745affd5ca89908bd57a96b20f47cdfb868c3094189be8a7f85d87290f7",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch/amipatch/host-scripts/packer/customize.sh.default": {
-      "change": "A",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": null,
-      "patch_sha256": "1689848c6f87ecfa6f66f58344e25f43bb8117d4e291af516c15c6d1f0d739b6",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch/amipatch/host-scripts/packer/customize.sh.example": {
-      "change": "A",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": null,
-      "patch_sha256": "74f8df4e38c38c1932fde71a8c6f8553915cb9d4d7a7373c331e1c65b7604463",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch/amipatch/host-scripts/packer/host-golden.pkr.hcl": {
-      "change": "A",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": null,
-      "patch_sha256": "157748ee9b59cef6d45ec4c1928f924ad7bec34f694289e469ab39f9d75e8260",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch/amipatch/host-scripts/reset-vm.sh.patched": {
-      "change": "A",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": null,
-      "patch_sha256": "43d60a73f12b3e215c95bc8b14c516486d741eb87ac8255414bd2c10afe50008",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch/amipatch/lambda/api/services/action_idem.py": {
-      "change": "A",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": null,
-      "patch_sha256": "f3c441d7c1262f2650269bdb1302a0c058ade496b2cbf31383f874ca605c8b42",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch/amipatch/lambda/api/services/host_service.py": {
-      "change": "R",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": "d40eb38fd7588ae17bfd2cc517e34cbf2caea1c44537fe5d014585ab48b38f8b",
-      "patch_sha256": "9320983fb8d25f91e5b2bd014944294441573b630bf12ebda395cb1fae1a272c",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": [],
-      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/lambda/api/services/host_service.py",
-      "new_path": "patch/amipatch/lambda/api/services/host_service.py"
-    },
-    "patch/amipatch/lambda/api/services/tenant_query_service.py": {
-      "change": "A",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": null,
-      "patch_sha256": "515817e8a8c9572d7b6d321b2064472da7023a3b116d12d0fc14040c9eff6826",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch/amipatch/lambda/api/services/tenant_service.py": {
-      "change": "R",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": "219778d8770a2886c58742f198e87b150f2f63de2ef13f5729724f83be95eb54",
-      "patch_sha256": "02be14ffb52ed84510b010ee43cf1cf493fc2c925670c8a4dd428a3c9aa80785",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": [],
-      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/lambda/api/services/tenant_service.py",
-      "new_path": "patch/amipatch/lambda/api/services/tenant_service.py"
-    },
-    "patch/amipatch/lib/apply-amipatch.sh": {
-      "change": "A",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": null,
-      "patch_sha256": "4e8f57b4120a1e507108a82e79fb86a18f9d715d5348bb95f0757453cd7e1861",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch/amipatch/lib/apply-lt.sh": {
-      "change": "A",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": null,
-      "patch_sha256": "07b9633975bdc8e76803af83f9057c09a3fe28707f5284c727933e3050238df1",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch/amipatch/lib/discover-env.sh": {
-      "change": "A",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": null,
-      "patch_sha256": "656889c0872df12a06ca5626902e2b0f1fdef12118d298c332216abf959f7ed9",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch/amipatch/lib/lt-userdata.py": {
-      "change": "A",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": null,
-      "patch_sha256": "240c14d26aa6668567f6c2bbaf8ca2d884f27532735873382317317633402779",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch/amipatch/manifest.json": {
-      "change": "A",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": null,
-      "patch_sha256": "9b3073505f6b32ea9e013febfb9993234cbf006289f9766a94f3eb7d144f5caa",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch/amipatch/resources/cloudformation/OpenClawHostImage.base.json": {
-      "change": "A",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": null,
-      "patch_sha256": "168a38e27dd6f21776b1ad49e527958b5dc37f9ab76a8465a5bbd3c275e37abc",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch/amipatch/resources/cloudformation/OpenClawHostImage.patch.json": {
-      "change": "A",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": null,
-      "patch_sha256": "168a38e27dd6f21776b1ad49e527958b5dc37f9ab76a8465a5bbd3c275e37abc",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch/amipatch/resources/cloudformation/OpenClawImage.base.json": {
-      "change": "A",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": null,
-      "patch_sha256": "b31a3d9cfe913fd72ea73d18c0f3d9332ebb831e6677bdd5ce86f07c56767b21",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch/amipatch/resources/cloudformation/OpenClawImage.patch.json": {
-      "change": "A",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": null,
-      "patch_sha256": "05a87ff805625add2a5323521ae735cdd225119b6751049f053b34549d3c2758",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch/amipatch/resources/cloudformation/OpenClawOrchestrator.base.json": {
-      "change": "A",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": null,
-      "patch_sha256": "0295dc1784f7d8c04bb4cc8f12332d56da3a0d3daff2cf0f5c40d77aa4b29a49",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch/amipatch/resources/cloudformation/OpenClawOrchestrator.patch.json": {
-      "change": "A",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": null,
-      "patch_sha256": "1ca7ce000a64f7ac9cb9cc188cb0100a19d47a95be65204b12126bfbbc2dd020",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch/amipatch/resources/cloudformation/base.assembly-index.json": {
-      "change": "A",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": null,
-      "patch_sha256": "744e801403c4f1f6c68e163fee7322f0a97d0c82a8351c7701b2ae15bf2d5b48",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
-    "patch/amipatch/resources/cloudformation/patch.assembly-index.json": {
-      "change": "A",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
-      "base_sha256": null,
-      "patch_sha256": "1bfc529373e3e54f85a21c907f554b9ffc77d7b3b1ecba405a8ea5262be695cd",
-      "operations": [
-        {
-          "resource": "inert documentation or release metadata",
-          "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
-          "resource_refs": [],
-          "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
-        }
-      ],
-      "fix_ids": []
-    },
     "patch/manifest-2026-08-12-200847-9174a912.json": {
       "change": "A",
       "layer": "meta",
@@ -7239,6 +5955,31 @@
       },
       "base_sha256": null,
       "patch_sha256": "2448ed9b58ac9ca721f5212d03ea1a69b15fa425084b7fede267080a992993cf",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/manifest-2026-08-15-021526-4166b320.json": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "31fb5c7d9706b13911f9ef3e7fd1b4e94cb2e34ef9c628a5d1f3bfcb2503f5f4",
       "operations": [
         {
           "resource": "inert documentation or release metadata",
@@ -7353,6 +6094,1883 @@
       ],
       "fix_ids": []
     },
+    "patch/push-marker-2026-08-15-021526-4166b320.md": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "fcbf000dcf34131e3811dffac7c79a595cdf2be5b19e898830840837252d287a",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/APPLY-INSTRUCTIONS.md": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "f01316d0163faa918a7fc0cb0491bf6890abc1b3ac7d68d0adf66cefb878c52e",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/deploy-machine/build-rootfs.sh": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "2a7400956a5c2c39cca7e51ca6a1b54d6f0c09298ed6e01b4673c2d127f36047",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/deploy-machine/config.yml.example": {
+      "change": "R",
+      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/config.yml.example",
+      "new_path": "patch/restorepatch-amipacker/host-scripts/deploy-machine/config.yml.example",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "802e382f52944a7135490c7d6713f766ac5257260db1c5185874ef5c03549a1a",
+      "patch_sha256": "5357fcc50d8e817e6af14626772f915b9f9d2557500047b2ab77c6f65d2b7454",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/deploy-machine/deploy/codebuild/buildspec-golden-image.yml": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "49e47f8a7d4d43092ce2c8fba71d9910e382366fa245eae364c2fc8834bf52ca",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/deploy-machine/deploy/stacks/_helpers.py": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "25720ea61b5ee5339bc96bf4c115a4cb41e36f044e8ef08595b1a1f86b90c4fe",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/deploy-machine/deploy/stacks/auth.py": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "7617a7ccb7056d14052ed1c8bdb25d9f58d9c8e4a7b790ac4b01ab053dc7f2b9",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/deploy-machine/deploy/stacks/ha_edge.py": {
+      "change": "R",
+      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/stacks/ha_edge.py",
+      "new_path": "patch/restorepatch-amipacker/host-scripts/deploy-machine/deploy/stacks/ha_edge.py",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "da546af5acc6cc579069d60d5cb74f5d13d73899fd18b46b27ac47f7c30eec97",
+      "patch_sha256": "67e540dae363ec08450be473be66451406c82140d53527da02bee1326f1a2084",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/deploy-machine/deploy/stacks/lambdas.py": {
+      "change": "R",
+      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/stacks/lambdas.py",
+      "new_path": "patch/restorepatch-amipacker/host-scripts/deploy-machine/deploy/stacks/lambdas.py",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "b4093090ebb7ab3e37fe3b65866949b318b5be0d9d5666c53662058dd33e3c16",
+      "patch_sha256": "eed51d9619974610f2e18fcf02cfa9ef71f779e321290bd711052452c0f9f071",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/deploy-machine/deploy/stacks/litellm.py": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "b68a307ac177d5746bc8cf9838d7901b7e0a1c53a21915f5fb602e0cc378ff41",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/deploy-machine/deploy/stacks/network_vpc.py": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "5cc7082e75e3411a5a790a4cc4852a2c0574a90564887af34e17ba305ac7e52c",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/deploy-machine/deploy/stacks/observability.py": {
+      "change": "R",
+      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/stacks/observability.py",
+      "new_path": "patch/restorepatch-amipacker/host-scripts/deploy-machine/deploy/stacks/observability.py",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "d7a3ff7271cb3b5807aaf1e8cf2f7a6a6b93da0ee3827b8e93385b69bd684270",
+      "patch_sha256": "fcc1a2cc3ac058e75cefa33b2c86f163fd778cb8a94fd2c9854a4d7a7c9cecb6",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/deploy-machine/deploy/stacks/outputs.py": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "cce38adcfdf6298422b2cfae2b0c30c9aa0b72c37d4cdeebceeed650b1435c45",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/deploy-machine/deploy/stacks/tenant_query_rollout.py": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "1d554fc9fbb6c45325c1c14b966baca51e197a5faa466982e8ba62192ec9ee51",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/deploy-machine/samples/config-sg-prod.yaml": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "e997a480db7a95e0fa4c92ab65927252f083bdc0f33a74557796a8fbf7da66b8",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/deploy-machine/scripts/checks/hardcoded.sh": {
+      "change": "R",
+      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/scripts/checks/hardcoded.sh",
+      "new_path": "patch/restorepatch-amipacker/host-scripts/deploy-machine/scripts/checks/hardcoded.sh",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "ee4e979494b43c46c998e95b75a292a282d43edabaec7e8174ee889577335d36",
+      "patch_sha256": "7c92d95212f614e0f30e0025fc7c2a4d45f4d7e4d825a1fe7d46146d168a9699",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/deploy-machine/scripts/checks/template-schema-gate.py": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "2d7f2e0bdbdf38d2c8340ca22e3f91706a6bc1e1ac1d7e905f0337d79e7090f5",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/deploy-machine/scripts/checks/tenant-query-rollout.py": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "d7d86e4ada122c07b3b24910ea480bdfa112ad397289c27be2b14a716abd6ab1",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/deploy-machine/scripts/preflight-check.sh": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "860693a5c77540bdf32b0812c50b969cee25f9248cec676938fb7a654c2d844c",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/deploy-machine/setup.sh": {
+      "change": "R",
+      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/setup.sh",
+      "new_path": "patch/restorepatch-amipacker/host-scripts/deploy-machine/setup.sh",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "f9980fb7a897b4b5c6367b800bf7bd428ff3a71799112241a15c18733613603e",
+      "patch_sha256": "f318bab8940c77d37a1daba7f4017dcef2426097eec743f05e50fe7d24ff5b48",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/edge/fluent-bit/host/fluent-bit.conf": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "e0899e4d82dd3468a33476f38a8a70e44901b978d2215c60f65d114f3d9655d8",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/edge/fluent-bit/install-fluent-bit.sh": {
+      "change": "R",
+      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/edge/fluent-bit/install-fluent-bit.sh",
+      "new_path": "patch/restorepatch-amipacker/host-scripts/edge/fluent-bit/install-fluent-bit.sh",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "d07496e39710de1c05f32172c78bdc70c00cd18067093dc9ee2effef40044aa5",
+      "patch_sha256": "0dff5df771194c4c4b416bcd22506ff7475b744af445f746c7b7f76def1c85e0",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/host-agent.py.patched": {
+      "change": "R",
+      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/userdata/host-agent.py",
+      "new_path": "patch/restorepatch-amipacker/host-scripts/host-agent.py.patched",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "a6abd7e08557151719d46bf220b41dfa7faeeaffa605e3dadd85782c41ce9a1a",
+      "patch_sha256": "a9691f0f57f2736571bbe85cab284f6914c0e98baaadf4740ee001c173517f35",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/host-agent.service.patched": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "569060a0bbca6a6f67c57dcc3f9a3bd27aa1dc2aedf51d0f9894ef98bfc4b7d5",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/init-host.sh.patched": {
+      "change": "R",
+      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/userdata/init-host.sh",
+      "new_path": "patch/restorepatch-amipacker/host-scripts/init-host.sh.patched",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "1a68df6da1b3405fd32fbbf63addd4ec4fb6985623213f133a327d8ffb6022e8",
+      "patch_sha256": "744793b0fcb1d0e8df650aa747c22cc733939e16cce0f805e7a9f0022e761d17",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/launch-vm.sh.patched": {
+      "change": "R",
+      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/userdata/launch-vm.sh",
+      "new_path": "patch/restorepatch-amipacker/host-scripts/launch-vm.sh.patched",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "bc2ba8a9fe76d80c5019b3433cbfecb1ba51c27aa2aae896b33509b1b2b72358",
+      "patch_sha256": "4977bd62797e1e9843f75484907b0ea376fc8139106a97bc69e5f007d8bbea9d",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/packer/CUSTOMER-GUIDE.md": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "833a94624efd48bc7febeab0be60299cc0172b8a76eedd5a85e300e29ecbe670",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/packer/README.md": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "1f2401d71c9ae552139781dfdc7f341a0ce910d412caea2876e21c1cd0adae3f",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/packer/apse1.pkrvars.hcl": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "ae855df3998ef5d148e53f066403bf8ae2fb72c07e0154e2e413c8df8cc58ef3",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/packer/assert-parity.sh": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "223eb29beaccf499e58139c0cf47481ecc3b507da2fdc690a0934ec69d6f6d0b",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/packer/build-guide-html.sh": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "2fd31745affd5ca89908bd57a96b20f47cdfb868c3094189be8a7f85d87290f7",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/packer/customize.sh.default": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "1689848c6f87ecfa6f66f58344e25f43bb8117d4e291af516c15c6d1f0d739b6",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/packer/customize.sh.example": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "74f8df4e38c38c1932fde71a8c6f8553915cb9d4d7a7373c331e1c65b7604463",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/packer/host-golden.pkr.hcl": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "157748ee9b59cef6d45ec4c1928f924ad7bec34f694289e469ab39f9d75e8260",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/rebuild-vm.sh.patched": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "7662f1d3392bcc8c962fa2dbc1a3c1b563af6d7c86a4036259127895404913e0",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/reset-vm.sh.patched": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "43d60a73f12b3e215c95bc8b14c516486d741eb87ac8255414bd2c10afe50008",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/api/core/capacity.py": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "cf8a71e8748e758276d2d8a10fdfc5457f4fb9d2aeae61a9834929ef6153e02d",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/api/core/clients.py": {
+      "change": "R",
+      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/lambda/api/core/clients.py",
+      "new_path": "patch/restorepatch-amipacker/lambda/api/core/clients.py",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "44ace929a420075838a725c06e5aae837591ad53d3fbca34d9ff139740a41270",
+      "patch_sha256": "5dfda69924818046fd899b2a64290eb20d6eaf8c3d36a6752b9c22d4fc70cc67",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/api/core/dispatch/binpack.py": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "b4dd8a9062c34d53078cfae1be532229dd21bc1436ffa8a07b20e588c649d469",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/api/core/envelope.py": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "5cf46e4518971cee6ea3e84066f0900da4136e5844e2b091a69b517b225fe5da",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/api/core/host_profile.py": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "b53ecd7a91ffe4143437aecb967cce4636c669cdc4518d58ad90962b49643dff",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/api/core/image_ops.py": {
+      "change": "R",
+      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/lambda/api/core/image_ops.py",
+      "new_path": "patch/restorepatch-amipacker/lambda/api/core/image_ops.py",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "a9106209d30b7977833300ad70c87e8a0c8988b5effcf5d8f0e6043861ff0f15",
+      "patch_sha256": "d2590cf8396b6bb20059cee10eb7b5c41891b30f168ceff889ccce7aeec59919",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/api/core/lifecycle_fence.py": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "d27801980a54daf4ea2dc6669828034da006b3a35be786f32b8e5b1795f1ccf0",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/api/core/scheduling.py": {
+      "change": "R",
+      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/lambda/api/core/scheduling.py",
+      "new_path": "patch/restorepatch-amipacker/lambda/api/core/scheduling.py",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "c411ca0d3126e49313bcd4dd737ecc8d068e3ef0ccb1bc16e540bda2ebada7dc",
+      "patch_sha256": "074ebd5fe9eee8767f6fc0698e019d9067bc019c310b9c7551a2f38d3b1b9f41",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/api/core/ssm_dispatch.py": {
+      "change": "R",
+      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/lambda/api/core/ssm_dispatch.py",
+      "new_path": "patch/restorepatch-amipacker/lambda/api/core/ssm_dispatch.py",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "2838478dad3e60902062e6774336db6d9cb639da106ddf42c9bde4ed558dfe33",
+      "patch_sha256": "792bcc88f389697498a5d58cc4e44bf933bdd11e860408fab7e3c43a8ade71a3",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/api/handler.py": {
+      "change": "R",
+      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/lambda/api/handler.py",
+      "new_path": "patch/restorepatch-amipacker/lambda/api/handler.py",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "cb1b4801cca4ff445a1281bc07213f20eb46dbe5b902ff04a7b3670764bb6c2c",
+      "patch_sha256": "1d3e193bc0971e1571f0d1f5326ec4813f22cbda1dc2a39cdd3a80c537551e9f",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/api/services/action_idem.py": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "f3c441d7c1262f2650269bdb1302a0c058ade496b2cbf31383f874ca605c8b42",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/api/services/dispatch_service.py": {
+      "change": "R",
+      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/lambda/api/services/dispatch_service.py",
+      "new_path": "patch/restorepatch-amipacker/lambda/api/services/dispatch_service.py",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "9d5183734f36bf9c092e55bcaece78bf79399cbd9bc36b69c93567d2bc745424",
+      "patch_sha256": "75d6a38550bca8af0a78cd451209f13c8bc2606bd70b00eb97239b1d2417ddbe",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/api/services/host_service.py": {
+      "change": "R",
+      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/lambda/api/services/host_service.py",
+      "new_path": "patch/restorepatch-amipacker/lambda/api/services/host_service.py",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "d40eb38fd7588ae17bfd2cc517e34cbf2caea1c44537fe5d014585ab48b38f8b",
+      "patch_sha256": "9320983fb8d25f91e5b2bd014944294441573b630bf12ebda395cb1fae1a272c",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/api/services/lifecycle_dispatch.py": {
+      "change": "R",
+      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/lambda/api/services/lifecycle_dispatch.py",
+      "new_path": "patch/restorepatch-amipacker/lambda/api/services/lifecycle_dispatch.py",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "0514111b228578a525e0ec7820377c76fca3283ae0e589d81a3131bc63573be5",
+      "patch_sha256": "6e173fd549f6bea6ee5745553677036e33ba4eb7c7246aa46f4cfc2eeddd1d69",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/api/services/tenant_query_service.py": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "515817e8a8c9572d7b6d321b2064472da7023a3b116d12d0fc14040c9eff6826",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/api/services/tenant_service.py": {
+      "change": "R",
+      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/lambda/api/services/tenant_service.py",
+      "new_path": "patch/restorepatch-amipacker/lambda/api/services/tenant_service.py",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "219778d8770a2886c58742f198e87b150f2f63de2ef13f5729724f83be95eb54",
+      "patch_sha256": "02be14ffb52ed84510b010ee43cf1cf493fc2c925670c8a4dd428a3c9aa80785",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/backup/handler.py": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "3b34e072b8e0941d3a7b76acaea8ee9af27fa7610788f94ca275fc54318c97e6",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/console-bff/web/index.html": {
+      "change": "R",
+      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/console-bff/web/index.html",
+      "new_path": "patch/restorepatch-amipacker/lambda/console-bff/web/index.html",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "388a44c54dbb1d0312fb71c407ca63f12040a5e70aff49f68c2afcf7dba3d735",
+      "patch_sha256": "4c17eaca231f6013b86a723b887c45392226b69e883a20396e55377ce2098c0c",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/console-bff/web/js/app.format.js": {
+      "change": "R",
+      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/console-bff/web/js/app.format.js",
+      "new_path": "patch/restorepatch-amipacker/lambda/console-bff/web/js/app.format.js",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "8f3e0ee18e2f01f16db13e0c9e28b14e93229c45000a95f64bfba09932bbe4af",
+      "patch_sha256": "02182bece185189de355e1c447f1f10721906f2920f4f26a02d4f154bc899359",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/console-bff/web/js/app.tenants.js": {
+      "change": "R",
+      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/console-bff/web/js/app.tenants.js",
+      "new_path": "patch/restorepatch-amipacker/lambda/console-bff/web/js/app.tenants.js",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "5a94ea798ee004b72e17b61025de76264790b867c1db69cee4941041539b0036",
+      "patch_sha256": "d5ee01cae52f67438ecf3f7f9585d78e3dbd4332bddc234728f94880c85dc932",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/console-bff/web/style.css": {
+      "change": "R",
+      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/console-bff/web/style.css",
+      "new_path": "patch/restorepatch-amipacker/lambda/console-bff/web/style.css",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "98464b697055fe24600921a8d4ea8854e75a340f36075c0aadd60139efe0c7f0",
+      "patch_sha256": "83725bb17a969c01bcfb1dd5f7222b280521f827aae2481fa42f7051d132e07d",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/health_check/handler.py": {
+      "change": "R",
+      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/lambda/health_check/handler.py",
+      "new_path": "patch/restorepatch-amipacker/lambda/health_check/handler.py",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "a3a8035e7cb8ff761237ab8ec2a52b981686be57ccb3cd1ad4656020a957a48c",
+      "patch_sha256": "165d5511b76fdf9f828ebd09616f63e79e5a2c67be4585e6cfcfb4eeaeb32bf8",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/scaler/handler.py": {
+      "change": "R",
+      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/lambda/scaler/handler.py",
+      "new_path": "patch/restorepatch-amipacker/lambda/scaler/handler.py",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "5dc20f11757d58c70e0e0331b2e26de66a84cdcdfe43d8703109517332519b72",
+      "patch_sha256": "3319374fe50486e87d535770f59b18e6bc66f68ce126a9c579aaa7ebb2bfdd64",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/tenant_stats/handler.py": {
+      "change": "R",
+      "old_path": "patch-kits/428-v2-from-pr124/artifacts/repo/deploy/lambda/tenant_stats/handler.py",
+      "new_path": "patch/restorepatch-amipacker/lambda/tenant_stats/handler.py",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "d955e88f26689d02c0e047c600622666793f9460d8010f4c8ce4034e2a0b045a",
+      "patch_sha256": "8f8e255199ad9c6439fb500baeaddb2ab9b968111c6c2319aa3445e6d3b24507",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lib/apply-lt.sh": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "07b9633975bdc8e76803af83f9057c09a3fe28707f5284c727933e3050238df1",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lib/apply-restorepatch.sh": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "44fecc92fc8fafda95a20834f77ad68c2a495c29d56870b075d64facd47f295c",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lib/discover-env.sh": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "88c94e11354d372504b3c7f11434418a8b271599d15794438fe46d3f4730add5",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lib/lt-userdata.py": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "240c14d26aa6668567f6c2bbaf8ca2d884f27532735873382317317633402779",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/manifest.json": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "59062fa64e5324d975407914d930e95efcf7964629a25ec02088715e2dc4c957",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/resources/cloudformation/OpenClawHostImage.base.json": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "168a38e27dd6f21776b1ad49e527958b5dc37f9ab76a8465a5bbd3c275e37abc",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/resources/cloudformation/OpenClawHostImage.patch.json": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "168a38e27dd6f21776b1ad49e527958b5dc37f9ab76a8465a5bbd3c275e37abc",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/resources/cloudformation/OpenClawImage.base.json": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "778d25153a7d2fdbfaab38e8c2fc94972d1e4e6f0c9f49838afcffdfe0cc31ca",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/resources/cloudformation/OpenClawImage.patch.json": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "650b45b0b4181aefe03932569bf951f528c395c3331fbf60e40d16236a425b7c",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/resources/cloudformation/OpenClawOrchestrator.base.json": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "c71a2cbcbffc617cb919d6e352a72e573d8c8aa5b8c2fd4dae015d1a5af05a61",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/resources/cloudformation/OpenClawOrchestrator.patch.json": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "1ca7ce000a64f7ac9cb9cc188cb0100a19d47a95be65204b12126bfbbc2dd020",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/resources/cloudformation/base.assembly-index.json": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "a0d8bd6ee39ce36059c6aa7f23d4d4d40db2c37778e92149055da64c727149e9",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/resources/cloudformation/patch.assembly-index.json": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "f735e0127544eb7b0ffcc6870700378df1a091c63963ae889db3ab40362ba98c",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
     "pyproject.toml": {
       "change": "M",
       "layer": "meta",
@@ -7363,7 +7981,7 @@
         "evidence": "path-derived-meta"
       },
       "base_sha256": "fbd2538f53aaeaefa8c0304df30095a51854630d8771aca56f345e18b8c322b3",
-      "patch_sha256": "235af01d334e63e0cfaaa4a6ec1c843b4000f0ecdbd78214d73f16f3bb9d5fdc",
+      "patch_sha256": "6433eea11139e62a397ec701cf29399843ca13abd415eb1ba04acf50d3354915",
       "operations": [
         {
           "resource": "inert documentation or release metadata",
@@ -7510,7 +8128,7 @@
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
       "base_sha256": "f9980fb7a897b4b5c6367b800bf7bd428ff3a71799112241a15c18733613603e",
-      "patch_sha256": "f318bab8940c77d37a1daba7f4017dcef2426097eec743f05e50fe7d24ff5b48",
+      "patch_sha256": "660386b87ba017eefd4f856353a8ef6964ee7e17148e124a1eb4de7126aa2f8f",
       "operations": [
         {
           "resource": "repository file delivery",
@@ -7541,7 +8159,7 @@
         "evidence": "path-derived-meta"
       },
       "base_sha256": "4b6d25e2da7766093cf5bdde7d65181c75833e39852f891ddc2741cbc80cab7f",
-      "patch_sha256": "e3da8c81a6e84d829d8b3f6798e1739d040e168cde0cfea4c84bc95ee18e53df",
+      "patch_sha256": "1c992e986e7ab8f8ef25d6500a8f778edb6e2a6d0e7e82f5831086a2f91ed4e1",
       "operations": [
         {
           "resource": "inert documentation or release metadata",
@@ -7995,6 +8613,45 @@
       "verification_ids": [
         "ver-495"
       ]
+    },
+    {
+      "id": "fix-469",
+      "summary": "Back up and restore the tenant data disk sparse-aware, and remove a tenant from its host in one operation instead of four.",
+      "paths": [
+        "deploy/userdata/backup-data.sh",
+        "deploy/userdata/delete-vm.sh",
+        "deploy/userdata/stop-vm.sh"
+      ],
+      "applies_when": "always",
+      "params_changed": [],
+      "verification_ids": [
+        "ver-469-sparse",
+        "ver-469-atomic"
+      ]
+    },
+    {
+      "id": "fix-451",
+      "summary": "Write the provisioning completion marker after the bake scrub, not before it.",
+      "paths": [
+        "deploy/userdata/provision-host.sh"
+      ],
+      "applies_when": "always",
+      "params_changed": [],
+      "verification_ids": [
+        "ver-451"
+      ]
+    },
+    {
+      "id": "fix-477-image",
+      "summary": "Assert what actually landed inside a baked host image before it is promoted.",
+      "paths": [
+        "deploy/packer/assert-image.sh"
+      ],
+      "applies_when": "always",
+      "params_changed": [],
+      "verification_ids": [
+        "ver-477-image"
+      ]
     }
   ],
   "verifications": [
@@ -8261,6 +8918,50 @@
       "fail_when": "The script raises the one-index-per-deployment error, prints a non-OK result, or exits nonzero for the absent table.",
       "timeout_s": 300,
       "cleanup": "Remove only the exact test tenant ids, operation ids, instance ids, S3 object keys, and temporary paths recorded by this verification; never use prefix or wildcard deletion."
+    },
+    {
+      "id": "ver-469-sparse",
+      "fix_id": "fix-469",
+      "phase": "B-lifecycle",
+      "action": "On a host carrying a stopped tenant, run the shipped backup script against that tenant's data disk, then record the archive byte size, the apparent size of the disk it came from, and the wall-clock time of a restore from that archive.",
+      "observable": "Archive byte size, source disk apparent size, restore wall-clock seconds, and the md5 of the restored disk against the md5 taken before the backup.",
+      "pass_when": "The archive is smaller than the disk it came from by roughly the proportion of the disk that holds no data, the restored disk md5 equals the md5 taken before the backup, and the restore completes in under two seconds for a disk whose real content is tens of megabytes.",
+      "fail_when": "The archive approaches the apparent size of the disk, the restored md5 differs, or the restore takes the tens of seconds that a non-sparse inflate costs.",
+      "timeout_s": 900,
+      "cleanup": "Remove only the archive and the restore target created by this check; leave the tenant's own data disk untouched."
+    },
+    {
+      "id": "ver-469-atomic",
+      "fix_id": "fix-469",
+      "phase": "B-lifecycle",
+      "action": "Delete one disposable tenant through the control plane and collect the commands the host was asked to run for that deletion.",
+      "observable": "The number of separate host commands issued for the deletion, and the state of the tenant's VM directory, tap device, port rule and ledger row afterwards.",
+      "pass_when": "Exactly one host command performs the deletion, and afterwards the VM directory, the tap device and the port rule are all gone while the ledger row reflects the deletion.",
+      "fail_when": "More than one host command is issued for the same deletion, or any of the VM directory, tap device or port rule survives while the ledger already reports the tenant deleted.",
+      "timeout_s": 900,
+      "cleanup": "The check deletes only the disposable tenant it created for this purpose."
+    },
+    {
+      "id": "ver-451",
+      "fix_id": "fix-451",
+      "phase": "B-lifecycle",
+      "action": "Bake an image with the scrub step forced to fail, then inspect the resulting filesystem for the provisioning completion marker.",
+      "observable": "Presence of the provisioning marker file and the exit status of the bake.",
+      "pass_when": "The bake fails and the marker is absent, so no image can claim provisioning finished when the scrub did not.",
+      "fail_when": "The bake fails but the marker is present, or the marker is written before the scrub step runs.",
+      "timeout_s": 1800,
+      "cleanup": "Deregister the image and delete the snapshot produced by this check; leave any image in service untouched."
+    },
+    {
+      "id": "ver-477-image",
+      "fix_id": "fix-477-image",
+      "phase": "A-readonly",
+      "action": "Run the shipped image assertion against a freshly baked image and against an image known to be missing one baked component.",
+      "observable": "The assertion exit status and the component it names.",
+      "pass_when": "The freshly baked image passes, and the deficient image fails while naming the missing component.",
+      "fail_when": "The deficient image passes, or the assertion fails on a complete image, or it reports a failure without naming which component is missing.",
+      "timeout_s": 600,
+      "cleanup": "None; the assertion only reads the image."
     }
   ]
 }

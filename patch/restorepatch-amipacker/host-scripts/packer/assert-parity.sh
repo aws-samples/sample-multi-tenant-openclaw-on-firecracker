@@ -23,9 +23,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PKR="$ROOT/deploy/packer/host-golden.pkr.hcl"
 VARS="$ROOT/deploy/packer/apse1.pkrvars.hcl"
 IB="$ROOT/deploy/stacks/host_image.py"
+# 镜像断言脚本。检查项从 HCL 内联搬到这里,是为了让 provision 之后与 provision 重跑
+# 之后共用同一份 —— 两处各维护一份内联必然漂移(实测 2026-08-13:幂等阶段只重查了 2 个
+# 命令和 2 个泄漏路径,漏掉 Fluent Bit / vmlinux / ADOT / SSH host key / cloud-init 态)。
+ASSERT_SH="$ROOT/deploy/packer/assert-image.sh"
 CFG="$ROOT/config.yml"
 
-for f in "$PKR" "$VARS" "$IB"; do
+for f in "$PKR" "$VARS" "$IB" "$ASSERT_SH"; do
   [ -f "$f" ] || { echo "GATE_FAIL: 缺少文件 $f" >&2; exit 2; }
 done
 
@@ -105,19 +109,27 @@ _chk "bake 模式打开 scrub"    'OC_PROVISION_BAKE=1'            'OC_PROVISION
 # ── 5. Packer 复刻了两条 validate 断言 ───────────────────────────────────────
 # Image Builder 的 validate 阶段是它原生提供的能力;Packer 没有对应概念,必须显式写。
 # 遗漏则产出的镜像未经过"零下载"和"身份已擦净"。
+# 断言主体在 assert-image.sh;HCL 只负责在两个时机各调一次。所以分开查:
+# 内容项查脚本,调用点查 HCL。
 for probe in \
   "零下载断言:golden AMI validated" \
-  "幂等断言:provision is idempotent" \
   "身份泄漏断言:LEAK" \
-  "cloud-init 态断言:cloud-init instance state"
+  "cloud-init 态断言:cloud-init instance state" \
+  "SSM agent 保留断言:amazon-ssm-agent" \
+  "SSH host key 断言:LEAK: SSH host keys"
 do
   what="${probe%%:*}"; needle="${probe#*:}"
-  if grep -q -- "$needle" "$PKR"; then
+  if grep -q -- "$needle" "$ASSERT_SH"; then
     _ok "$what 已复刻"
   else
     _bad "$what 缺失 —— Image Builder 的 validate 阶段有,packer 没有"
   fi
 done
+if grep -q 'provision is idempotent' "$PKR"; then
+  _ok "幂等断言 已复刻"
+else
+  _bad "幂等断言缺失 —— 重跑 provision 后没有证明组件集合不变"
+fi
 
 # ── 6. SSM 分发(Image Builder 原生提供、packer 必须自己做)────────────────────────
 if grep -q 'ssm put-parameter' "$PKR"; then
@@ -165,7 +177,8 @@ fi
 # 前部,拿它比行号会让门永远绿。实测:第一版取 'custom/customize.sh' 首次出现,
 # 命中的是 locals 的 custom_dst 定义,把整个 provisioner 块搬到断言之后也不报警。
 _custom_line="$(grep -n 'bash ${local.custom_dst}' "$PKR" | head -1 | cut -d: -f1)"
-_assert_line="$(grep -n 'golden AMI validated' "$PKR" | head -1 | cut -d: -f1)"
+# 断言主体已搬到 assert-image.sh,HCL 里剩的是调用行。定序要比的是【调用点】。
+_assert_line="$(grep -n 'assert_dst} post-provision' "$PKR" | head -1 | cut -d: -f1)"
 if [ -z "$_custom_line" ]; then
   _bad "找不到客户自定义阶段 —— host-golden.pkr.hcl 应包含 custom/customize.sh"
 elif [ -z "$_assert_line" ]; then
@@ -182,10 +195,33 @@ fi
 # 意味着任何能起一台 host 的人都能冒充其余每一台。
 # 匹配可执行的断言体,不能只 grep 'ssh_host_' —— 上面的注释里也有这串,
 # 断言被删掉后注释仍会命中,门就永远是绿的。实测:第一版这条门验红失败,原因正是此。
-if grep -q 'LEAK: SSH host keys' "$PKR"; then
+if grep -q 'LEAK: SSH host keys' "$ASSERT_SH"; then
   _ok "SSH host key 泄漏断言存在"
 else
   _bad "缺 SSH host key 断言 —— 自定义脚本重装 openssh-server 会让全机队共享同一把 host key"
+fi
+
+# ── 10b. provision 之后与重跑之后必须调【同一份】断言 ─────────────────────────
+# 实测 2026-08-13 的真缺陷:两个时机各维护一份内联断言,幂等阶段只重查了 2 个命令和
+# 2 个泄漏路径,漏掉 Fluent Bit / vmlinux / ADOT / SSM agent / SSH host key /
+# cloud-init 态。于是"重跑把这些重装了一遍"这类回归恰好落在盲区 —— 而幂等断言存在的
+# 意义就是发现它。现在两处都调 assert-image.sh,本项检查它没有被改回内联。
+_post_provision="$(grep -c 'assert_dst} post-provision' "$PKR")"
+_post_rerun="$(grep -c 'assert_dst} post-rerun' "$PKR")"
+if [ "$_post_provision" -ge 1 ] && [ "$_post_rerun" -ge 1 ]; then
+  _ok "两个时机都调共享断言脚本(post-provision + post-rerun)"
+else
+  _bad "断言未在两个时机都调 assert-image.sh(post-provision=$_post_provision post-rerun=$_post_rerun) —— 重跑后的覆盖会与首次不一致,幂等断言变成抽查"
+fi
+
+# ── 10c. SSM 发布后的回读必须限时轮询,不能只读一次 ────────────────────────────
+# aws:ec2:image 的校验是异步的(实测 2026-08-13:put-parameter 无论值好坏都返回 0)。
+# 只读一次会把"校验尚未完成"误判成发布失败 —— 假红;完全不读会把被丢弃的坏版本当成
+# 发布成功 —— 假绿。两个方向都要防,所以必须是【有上限的轮询】。
+if grep -q 'seq 1 30' "$PKR" && grep -q 'did not take effect within' "$PKR"; then
+  _ok "SSM 回读为限时轮询(而非单次读或不读)"
+else
+  _bad "SSM 回读不是限时轮询 —— aws:ec2:image 校验异步,单次立即回读会把合法发布误判为失败"
 fi
 
 # ── 11. customize.sh.{default,example} 也要过静态检查 ──────────────────────────

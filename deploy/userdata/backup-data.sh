@@ -39,7 +39,11 @@ cleanup() {
 trap cleanup EXIT
 
 if [ ! -f "$DATA_FILE" ]; then
-  log "ERROR: ${DATA_FILE} not found"
+  # delete 重投要区分两种备份失败:
+  #   · 盘还在但备份失败(权限/限流/压缩坏)→ 必须 fail-closed 拒删,数据还救得回;
+  #   · 盘【已经不在】(上一次尝试已跑完 rm -rf)→ 重跑备份必然失败,若也 fail-closed
+  # 靠 grep "not found" 判太脆(路径/locale/其它步骤也可能出现该词),故用固定哨兵。
+  log "ERROR: OC_BACKUP_SOURCE_ABSENT ${DATA_FILE} not found"
   exit 1
 fi
 
@@ -54,8 +58,19 @@ T0=$SECONDS
 # fail-loud:压缩失败必须非零退出。脚本用 set -uo pipefail 但无 set -e,单命令失败
 # 不会终止;删前备份(delete_tenant pre_delete)靠本脚本 exit code 判成败,任何一步
 # 静默失败都会让上游误判备份成功继而 rm -rf 数据盘 → 不可逆数据丢失(CRITICAL)。
-pigz -c "$DATA_FILE" > "$GZ_FILE" || { log "ERROR: pigz compress failed"; exit 1; }
-log "compressed ($((SECONDS-T0))s)"
+#
+# `tar -S` 而非裸 pigz:data.ext4 是 8G 声明的稀疏盘,真实数据仅 ~77M(实测 275 个
+# 盘稀疏率 99.66%)。裸 pigz 读它时内核把洞展开成零,于是"压缩 7.9G 零 → 解压 7.9G
+# 零 → cp --sparse 再扔掉"——恢复端 pigz 串行 inflate 是算法级串行(实测 -p 96 与
+# 默认同为 16.7s、%CPU 仅 135%),这 16.5s 全是无用功。tar -S 逐块 memcmp 判零,零块
+# 只记进 GNU sparse 头部的段表,归档里只放真实数据。实测同一盘:
+#   裸 pigz    备份 2.22s / 产物 14.07MB / 【恢复 16.70s】+ 稀疏化 0.92s
+#   tar -S     备份 0.08s / 产物  4.78MB / 【恢复  0.14s】  md5 与源一致
+# VM 冻结窗口(pause 期间)同时从 2.22s 降到 0.08s。
+# 归档内只放 basename,恢复端 `tar -xSf - -C ${VM_DIR}` 即落回 data.ext4。
+tar -cSf - -C "$(dirname "$DATA_FILE")" "$(basename "$DATA_FILE")" | pigz > "$GZ_FILE" \
+  || { log "ERROR: tar -S | pigz compress failed"; exit 1; }
+log "compressed ($((SECONDS-T0))s, sparse-aware tar)"
 
 if [ -S "$SOCK" ]; then
   curl -sf --unix-socket "$SOCK" -X PATCH http://localhost/vm \

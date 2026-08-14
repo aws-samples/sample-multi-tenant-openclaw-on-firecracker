@@ -1,0 +1,96 @@
+# CodeBuild buildspec — 烤黄金镜像(arm64)发版到 S3(用户指定:镜像构建必须走 CodeBuild)
+# 关键:CodeBuild ARM 标准镜像是 Amazon Linux 2023,装不了 debootstrap(Debian工具)。
+# 解法:docker-in-docker —— 在 AL2023 里 `docker run --privileged ubuntu:22.04` 跑
+# build-rootfs.sh,debootstrap 在 ubuntu 容器内执行,产物经挂载卷出来推 S3。
+# 项目环境:aws/codebuild/amazonlinux2-aarch64-standard:3.0 + privilegedMode:true + LARGE
+# 环境变量:ASSETS_BUCKET / IMAGE_VERSION / AWS_REGION / LITELLM_HOST
+# source:本地仓库打包传 s3://<bucket>/codebuild-src/(禁账号间拷数据)
+#
+# 加固完整性(用户要求"含之前所有加固"):build-rootfs.sh 内置 → EROFS只读盘
+# (is_read_only虚拟层)+ 关串口(8250.nr_uarts=0)+ auditd/FIM(golden-image.sha256基线)
+# + sentinel-guard/acl-guard plugin + seccomp默认 + IMMUTABLE_SKILLS(31 skill+persona烤只读盘)。
+# 跑同一个 build-rootfs.sh = 加固一字不差继承,无论 CodeBuild 还是 EC2 builder。
+version: 0.2
+phases:
+  pre_build:
+    commands:
+      # CodeBuild privileged 镜像已预启动 dockerd。先直接试;若没起再手动拉起并轮询。
+      - echo "=== docker 就绪检查 ==="
+      - |
+        if ! docker info >/dev/null 2>&1; then
+          echo "dockerd 未运行,手动启动"
+          nohup dockerd >/tmp/dockerd.log 2>&1 &
+          n=0; while ! docker info >/dev/null 2>&1; do n=$((n+1)); [ $n -gt 20 ] && { echo "dockerd 启动失败"; cat /tmp/dockerd.log; exit 1; }; sleep 2; done
+        fi
+      - docker version | head -6
+      - cd "$CODEBUILD_SRC_DIR"
+      - echo "ASSETS_BUCKET=${ASSETS_BUCKET}" > .env.deploy
+      - echo "AWS_REGION=${AWS_REGION}" >> .env.deploy
+      - echo "REGION=${AWS_REGION}" >> .env.deploy
+      # test -s(存在且非空)不是 test -f:v2.0 烤出 0 字节 openclaw.json 的根因就是
+      # 源 zip 带了个空 templates/openclaw.json,-f 判真跳过 cp example → 空文件进镜像
+      # → guest gateway 读空 config 崩溃循环(Restart=always)→ 18789 永不监听 → 2.26
+      # host 数据面全不通(evidence/v2-image-gateway-crashloop-2026-07-09.md)。空/缺都 cp example。
+      - test -s templates/openclaw.json || cp templates/openclaw.json.example templates/openclaw.json
+      - sed -i "s|__LITELLM_HOST__|${LITELLM_HOST:-127.0.0.1}|g" templates/openclaw.json || true
+      # fail-loud 防呆:空 config 绝不上架。非空 + 合法 JSON 才继续,否则中止烤制。
+      - test -s templates/openclaw.json || { echo "[FATAL] templates/openclaw.json 为空,拒绝烤制空 config"; exit 1; }
+      - jq empty templates/openclaw.json || { echo "[FATAL] templates/openclaw.json 非合法 JSON"; exit 1; }
+      - echo "镜像版本=${IMAGE_VERSION} 架构=arm64 桶=${ASSETS_BUCKET}"
+  build:
+    # on-failure ABORT:build 失败立即中止整个 build,不进 POST_BUILD。否则上一轮
+    # EC2 builder 早传的同名产物会让 `s3 ls|grep` 假通过,掩盖本次烤制失败(已踩坑)。
+    on-failure: ABORT
+    commands:
+      - echo "=== docker-in-docker 跑 build-rootfs.sh(ubuntu容器内 debootstrap)==="
+      # ubuntu:22.04 arm64 容器,privileged(mount/mkfs/debootstrap 需要),挂源码 + 共享网络。
+      # 容器内装依赖→跑 build-rootfs.sh→产物直接 aws s3 上传(容器继承 CodeBuild 的 task role 凭据)。
+      - chmod +x deploy/codebuild/bake-in-container.sh
+      - docker pull public.ecr.aws/ubuntu/ubuntu:22.04
+      # -e SAMPLE:让 build-image-demo.sh 的 --sample 能选样本目录。生产栈不设此
+      # 变量时 docker 不传入容器,build-rootfs.sh 回落默认 finance-agent,生产零影响。
+      # 指针」(见其 SKIP_MANIFEST 分支),但该变量原先【没有透传进容器】——在 CodeBuild
+      # 上设了也到不了 bake 脚本,那条 escape hatch 从这条链路完全不可达。补上才生效。
+      - docker run --privileged --rm --network host -v "$CODEBUILD_SRC_DIR":/work -w /work -e ASSETS_BUCKET -e IMAGE_VERSION -e AWS_REGION -e SAMPLE -e SKIP_MANIFEST -e AWS_CONTAINER_CREDENTIALS_RELATIVE_URI -e AWS_CONTAINER_CREDENTIALS_FULL_URI -e AWS_CONTAINER_AUTHORIZATION_TOKEN public.ecr.aws/ubuntu/ubuntu:22.04 bash /work/deploy/codebuild/bake-in-container.sh
+  post_build:
+    commands:
+      - echo "=== 验证产物新鲜度(防陈旧产物假通过)==="
+      # 与 build-rootfs.sh 自带的 SKIP_MANIFEST=1(并排烤、不动线上指针)**互斥** ——
+      # 那种模式下 manifest 仍指旧版,断言必失败,于是「并排烤」和「build 报绿」二者
+      # 不可兼得,烤成功也被判 FAILED。现按模式选判据,两种模式都能真验到本轮产物:
+      #   SKIP_MANIFEST=1 → 不看指针,直接校验【本次版本后缀】的三个对象都存在且新鲜;
+      #   否则(发版模式)  → 保留原来的指针断言(它正是防"上一轮残留假通过"的那道门)。
+      # 无论哪种模式,都断言 rootfs 对象的 LastModified 在 90 分钟内,把"陈旧产物"这个
+      # 原注释声明过、但此前【从未真正断言】的判据补成硬门(原代码只 echo 了时间)。
+      - |
+        set -e
+        ROOTFS_KEY="deployment/rootfs/openclaw-rootfs-${IMAGE_VERSION}.ext4.gz"
+        if [ "${SKIP_MANIFEST:-0}" = "1" ]; then
+          echo "SKIP_MANIFEST=1 — 并排烤模式:校验版本后缀产物,不校验 manifest 指针"
+          for k in "$ROOTFS_KEY" \
+                   "deployment/rootfs/openclaw-data-template-${IMAGE_VERSION}.ext4.gz" \
+                   "deployment/rootfs/openclaw-immutable-${IMAGE_VERSION}.ext4.gz"; do
+            aws s3api head-object --bucket "$ASSETS_BUCKET" --key "$k" >/dev/null \
+              || { echo "FAIL: 缺产物 s3://${ASSETS_BUCKET}/$k,本次烤制未落地"; exit 1; }
+            echo "  ✓ $k"
+          done
+        else
+          MV=$(aws s3 cp "s3://${ASSETS_BUCKET}/deployment/rootfs/manifest.json" - | python3 -c "import sys,json;print(json.load(sys.stdin)['version'])")
+          echo "manifest.version=$MV expected=$IMAGE_VERSION"
+          [ "$MV" = "$IMAGE_VERSION" ] || { echo "FAIL: manifest version 不匹配,本次烤制未生效"; exit 1; }
+        fi
+        LM=$(aws s3api head-object --bucket "$ASSETS_BUCKET" --key "$ROOTFS_KEY" --query LastModified --output text)
+        echo "rootfs LastModified=$LM"
+        # 单行 python:YAML 块里多行 `python3 -c "` 的缩进会进字符串 → IndentationError。
+        python3 -c "import datetime,sys;lm=datetime.datetime.fromisoformat('$LM'.replace('Z','+00:00'));age=(datetime.datetime.now(datetime.timezone.utc)-lm).total_seconds()/60;print('rootfs age = %.1f min'%age);sys.exit(0 if age<=90 else 1)" \
+          || { echo "FAIL: rootfs 对象超过 90 分钟未更新 —— 这是上一轮残留,不是本次产物"; exit 1; }
+      - |
+        if [ "${SKIP_MANIFEST:-0}" = "1" ]; then
+          printf '{"skipped":true,"image_version":"%s"}\n' "$IMAGE_VERSION" | tee /tmp/manifest.json
+        else
+          aws s3 cp "s3://${ASSETS_BUCKET}/deployment/rootfs/manifest.json" - | tee /tmp/manifest.json
+        fi
+      - echo "黄金镜像 ${IMAGE_VERSION} 烤制完成(加固随 build-rootfs.sh 继承;SKIP_MANIFEST=${SKIP_MANIFEST:-0})"
+artifacts:
+  files:
+    - /tmp/manifest.json

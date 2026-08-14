@@ -75,7 +75,7 @@
       "sha256": "07b9633975bdc8e76803af83f9057c09a3fe28707f5284c727933e3050238df1"
     },
     "lib/apply-restorepatch.sh": {
-      "sha256": "9c5850ff2033d8454d418786585ee772e8030f03a7f894fdd91bfbaeff73ac4b"
+      "sha256": "1ba70df2e3d1f4bdd684863d244ca9e46765fab099ae0b67c06a0ae28151dc47"
     },
     "lib/discover-env.sh": {
       "sha256": "17db54ba52d6e45be964ef23cf6cb01f3f2cbc9bc4ef438d32f07efaf9410b50"
@@ -1490,8 +1490,6 @@
         }
       ],
       "fix_ids": [
-        "fix-26",
-        "fix-28",
         "fix-430",
         "fix-470"
       ]
@@ -1543,8 +1541,6 @@
         }
       ],
       "fix_ids": [
-        "fix-26",
-        "fix-28",
         "fix-456",
         "fix-470"
       ]
@@ -1962,26 +1958,8 @@
             {
               "change": "A",
               "stack": "OpenClawOrchestrator",
-              "logical_id": "ApiDeploymentB17BE62Dd4d42ee55554b802e211fc2b438043a5",
-              "resource_type": "AWS::ApiGateway::Deployment"
-            },
-            {
-              "change": "A",
-              "stack": "OpenClawOrchestrator",
               "logical_id": "ApiHandlerCurrentVersion5C7F0A604cb4a8a18868b63949116ec65522c4d5",
               "resource_type": "AWS::Lambda::Version"
-            },
-            {
-              "change": "M",
-              "stack": "OpenClawOrchestrator",
-              "logical_id": "ApiDeploymentStagev102147F91",
-              "resource_type": "AWS::ApiGateway::Stage"
-            },
-            {
-              "change": "D",
-              "stack": "OpenClawOrchestrator",
-              "logical_id": "ApiDeploymentB17BE62Db94cab90afc7f8d182ff99035244cce3",
-              "resource_type": "AWS::ApiGateway::Deployment"
             },
             {
               "change": "D",
@@ -2130,12 +2108,6 @@
             {
               "change": "M",
               "stack": "OpenClawOrchestrator",
-              "logical_id": "Api9C0D1E2F",
-              "resource_type": "AWS::ApiGateway::RestApi"
-            },
-            {
-              "change": "M",
-              "stack": "OpenClawOrchestrator",
               "logical_id": "AssetsPolicy206C37E3",
               "resource_type": "AWS::S3::BucketPolicy"
             },
@@ -2251,6 +2223,44 @@
           "apply_cli": "install the listed artifact at its repository-relative destination",
           "verify_cli": "compare the installed file SHA-256 with manifest patch_sha256",
           "rollback_cli": "restore the recorded pre-apply file"
+        },
+        {
+          "resource": "private API endpoint attachment and deployment replacement",
+          "class": "MANUAL_CLI_REVIEW",
+          "rollback_policy": "RESTORE",
+          "resource_refs": [
+            {
+              "change": "A",
+              "stack": "OpenClawOrchestrator",
+              "logical_id": "ApiDeploymentB17BE62Dd4d42ee55554b802e211fc2b438043a5",
+              "resource_type": "AWS::ApiGateway::Deployment"
+            },
+            {
+              "change": "M",
+              "stack": "OpenClawOrchestrator",
+              "logical_id": "ApiDeploymentStagev102147F91",
+              "resource_type": "AWS::ApiGateway::Stage"
+            },
+            {
+              "change": "D",
+              "stack": "OpenClawOrchestrator",
+              "logical_id": "ApiDeploymentB17BE62Db94cab90afc7f8d182ff99035244cce3",
+              "resource_type": "AWS::ApiGateway::Deployment"
+            },
+            {
+              "change": "M",
+              "stack": "OpenClawOrchestrator",
+              "logical_id": "Api9C0D1E2F",
+              "resource_type": "AWS::ApiGateway::RestApi"
+            }
+          ],
+          "artifact_refs": [
+            "lib/apply-restorepatch.sh"
+          ],
+          "apply_cli": "lib/apply-restorepatch.sh apply-api --env environment.json --kit .",
+          "verify_cli": "lib/apply-restorepatch.sh verify-api --env environment.json --kit .",
+          "finalize_cli": "lib/apply-restorepatch.sh finalize-api --env environment.json --kit .",
+          "rollback_cli": "lib/apply-restorepatch.sh rollback-api --env environment.json --kit ."
         }
       ],
       "fix_ids": [
@@ -7397,7 +7407,7 @@
     },
     "scripts/checks/hardcoded.sh": {
       "change": "M",
-      "layer": "meta",
+      "layer": "deploy-other",
       "artifact": "host-scripts/deploy-machine/scripts/checks/hardcoded.sh",
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
@@ -7421,7 +7431,7 @@
     },
     "scripts/checks/template-schema-gate.py": {
       "change": "M",
-      "layer": "meta",
+      "layer": "deploy-other",
       "artifact": "host-scripts/deploy-machine/scripts/checks/template-schema-gate.py",
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
@@ -7447,7 +7457,7 @@
     },
     "scripts/checks/tenant-query-rollout.py": {
       "change": "M",
-      "layer": "meta",
+      "layer": "deploy-other",
       "artifact": "host-scripts/deploy-machine/scripts/checks/tenant-query-rollout.py",
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
@@ -7471,7 +7481,7 @@
     },
     "scripts/preflight-check.sh": {
       "change": "M",
-      "layer": "meta",
+      "layer": "deploy-other",
       "artifact": "host-scripts/deploy-machine/scripts/preflight-check.sh",
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
@@ -7550,32 +7560,6 @@
     }
   },
   "fixes": [
-    {
-      "id": "fix-26",
-      "summary": "Carry forward issue #26.",
-      "paths": [
-        "deploy/lambda/api/services/host_service.py",
-        "deploy/lambda/api/services/tenant_query_service.py"
-      ],
-      "applies_when": "always",
-      "params_changed": [],
-      "verification_ids": [
-        "ver-26"
-      ]
-    },
-    {
-      "id": "fix-28",
-      "summary": "Carry forward issue #28.",
-      "paths": [
-        "deploy/lambda/api/services/host_service.py",
-        "deploy/lambda/api/services/tenant_query_service.py"
-      ],
-      "applies_when": "always",
-      "params_changed": [],
-      "verification_ids": [
-        "ver-28"
-      ]
-    },
     {
       "id": "fix-389",
       "summary": "Move host bootstrap delivery to immutable content-addressed S3 assets.",
@@ -8015,290 +7999,268 @@
   ],
   "verifications": [
     {
-      "id": "ver-26",
-      "fix_id": "fix-26",
-      "phase": "A-readonly",
-      "action": "Exercise the exact behavior changed by issue #26 and capture the before/after service evidence.",
-      "observable": "API response, Lambda FunctionError, host service state, scheduler ledger, and lifecycle activity as applicable.",
-      "pass_when": "The issue-specific expected state is present and the pre-fix failure signal is absent.",
-      "fail_when": "The old failure signal remains, the probe is inconclusive, or any required service signal is absent.",
-      "timeout_s": 300,
-      "cleanup": "Delete each test tenant by the exact id recorded when it was created; never use a prefix glob."
-    },
-    {
-      "id": "ver-28",
-      "fix_id": "fix-28",
-      "phase": "A-readonly",
-      "action": "Exercise the exact behavior changed by issue #28 and capture the before/after service evidence.",
-      "observable": "API response, Lambda FunctionError, host service state, scheduler ledger, and lifecycle activity as applicable.",
-      "pass_when": "The issue-specific expected state is present and the pre-fix failure signal is absent.",
-      "fail_when": "The old failure signal remains, the probe is inconclusive, or any required service signal is absent.",
-      "timeout_s": 300,
-      "cleanup": "Delete each test tenant by the exact id recorded when it was created; never use a prefix glob."
-    },
-    {
       "id": "ver-389",
       "fix_id": "fix-389",
-      "phase": "B-lifecycle",
-      "action": "Exercise the exact behavior changed by issue #389 and capture the before/after service evidence.",
-      "observable": "API response, Lambda FunctionError, host service state, scheduler ledger, and lifecycle activity as applicable.",
-      "pass_when": "The issue-specific expected state is present and the pre-fix failure signal is absent.",
-      "fail_when": "The old failure signal remains, the probe is inconclusive, or any required service signal is absent.",
-      "timeout_s": 1800,
-      "cleanup": "Delete each test tenant by the exact id recorded when it was created; never use a prefix glob."
+      "phase": "A-readonly",
+      "action": "Decode LaunchTemplateVersions[0].LaunchTemplateData.UserData for the in-service host template and extract every deployment/bootstrap/host/<64-hex> prefix.",
+      "observable": "The decoded UserData bootstrap prefix and any remaining double-brace placeholder marker.",
+      "pass_when": "The only bootstrap prefix equals this kit's target asset prefix and the decoded UserData contains no unrendered placeholder marker.",
+      "fail_when": "The decoded template still names the prior bootstrap prefix, contains a second prefix, or includes an unrendered placeholder marker.",
+      "timeout_s": 300,
+      "cleanup": "Remove only the exact test tenant ids, operation ids, instance ids, S3 object keys, and temporary paths recorded by this verification; never use prefix or wildcard deletion."
     },
     {
       "id": "ver-393",
       "fix_id": "fix-393",
-      "phase": "A-readonly",
-      "action": "Exercise the exact behavior changed by issue #393 and capture the before/after service evidence.",
-      "observable": "API response, Lambda FunctionError, host service state, scheduler ledger, and lifecycle activity as applicable.",
-      "pass_when": "The issue-specific expected state is present and the pre-fix failure signal is absent.",
-      "fail_when": "The old failure signal remains, the probe is inconclusive, or any required service signal is absent.",
-      "timeout_s": 300,
-      "cleanup": "Delete each test tenant by the exact id recorded when it was created; never use a prefix glob."
+      "phase": "B-lifecycle",
+      "action": "Suspend one recorded test tenant, read its openclaw-tenants row, restore the same tenant id, and read the row again.",
+      "observable": "The action response status plus openclaw-tenants attributes status, restore_backup_key, host_id, and vm_num.",
+      "pass_when": "Suspend returns status=suspended with a nonempty restore_backup_key, then restore returns the same tenant id with status=running and a populated host_id and vm_num.",
+      "fail_when": "Suspend reaches suspended without a backup key, restore creates a different tenant identity, or the final row is not running on a recorded host slot.",
+      "timeout_s": 1800,
+      "cleanup": "Remove only the exact test tenant ids, operation ids, instance ids, S3 object keys, and temporary paths recorded by this verification; never use prefix or wildcard deletion."
     },
     {
       "id": "ver-402",
       "fix_id": "fix-402",
       "phase": "A-readonly",
-      "action": "Exercise the exact behavior changed by issue #402 and capture the before/after service evidence.",
-      "observable": "API response, Lambda FunctionError, host service state, scheduler ledger, and lifecycle activity as applicable.",
-      "pass_when": "The issue-specific expected state is present and the pre-fix failure signal is absent.",
-      "fail_when": "The old failure signal remains, the probe is inconclusive, or any required service signal is absent.",
+      "action": "Read project.requires-python from pyproject.toml and requires-python from uv.lock, then compare the root package version metadata.",
+      "observable": "pyproject.toml requires-python and version values alongside uv.lock requires-python and the root package version.",
+      "pass_when": "Both files declare requires-python >=3.12 and the locked root package version equals pyproject.toml version 1.5.5.",
+      "fail_when": "The Python constraints differ, the root package is absent from uv.lock, or its locked version is not 1.5.5.",
       "timeout_s": 300,
-      "cleanup": "Delete each test tenant by the exact id recorded when it was created; never use a prefix glob."
+      "cleanup": "Remove only the exact test tenant ids, operation ids, instance ids, S3 object keys, and temporary paths recorded by this verification; never use prefix or wildcard deletion."
     },
     {
       "id": "ver-411",
       "fix_id": "fix-411",
       "phase": "A-readonly",
-      "action": "Exercise the exact behavior changed by issue #411 and capture the before/after service evidence.",
-      "observable": "API response, Lambda FunctionError, host service state, scheduler ledger, and lifecycle activity as applicable.",
-      "pass_when": "The issue-specific expected state is present and the pre-fix failure signal is absent.",
-      "fail_when": "The old failure signal remains, the probe is inconclusive, or any required service signal is absent.",
+      "action": "Parse docs/aws-guide/openapi.yaml and inspect the tenant action operation request and response schemas for rebuild lifecycle reconciliation.",
+      "observable": "The tenant action schema properties client_token and image_channel plus documented 403, 409, 502, and 503 response codes.",
+      "pass_when": "The OpenAPI operation exposes client_token and image_channel and documents explicit 403, 409, 502, and 503 outcomes for lifecycle reconciliation.",
+      "fail_when": "Either request field is absent or a lifecycle conflict, host failure, or unavailable response is missing from the operation contract.",
       "timeout_s": 300,
-      "cleanup": "Delete each test tenant by the exact id recorded when it was created; never use a prefix glob."
+      "cleanup": "Remove only the exact test tenant ids, operation ids, instance ids, S3 object keys, and temporary paths recorded by this verification; never use prefix or wildcard deletion."
     },
     {
       "id": "ver-413",
       "fix_id": "fix-413",
-      "phase": "B-lifecycle",
-      "action": "Exercise the exact behavior changed by issue #413 and capture the before/after service evidence.",
-      "observable": "API response, Lambda FunctionError, host service state, scheduler ledger, and lifecycle activity as applicable.",
-      "pass_when": "The issue-specific expected state is present and the pre-fix failure signal is absent.",
-      "fail_when": "The old failure signal remains, the probe is inconclusive, or any required service signal is absent.",
-      "timeout_s": 1800,
-      "cleanup": "Delete each test tenant by the exact id recorded when it was created; never use a prefix glob."
+      "phase": "A-readonly",
+      "action": "Invoke one tenant rebuild as a non-administrator and repeat it as an administrator while recording HTTP status, code, op_id, and rebuild_status.",
+      "observable": "The tenant action HTTP status and JSON fields code, op_id, status, and rebuild_status.",
+      "pass_when": "The non-administrator receives 403 code=ACCESS_DENIED, while the administrator receives synchronous 200 with status=running and rebuild_status=done or explicit 503 code=REBUILD_RETRY_PENDING.",
+      "fail_when": "A non-administrator can start the rebuild, the administrator receives 202 Accepted, or a 503 response omits its retry code and operation identity.",
+      "timeout_s": 300,
+      "cleanup": "Remove only the exact test tenant ids, operation ids, instance ids, S3 object keys, and temporary paths recorded by this verification; never use prefix or wildcard deletion."
     },
     {
       "id": "ver-415",
       "fix_id": "fix-415",
       "phase": "A-readonly",
-      "action": "Exercise the exact behavior changed by issue #415 and capture the before/after service evidence.",
-      "observable": "API response, Lambda FunctionError, host service state, scheduler ledger, and lifecycle activity as applicable.",
-      "pass_when": "The issue-specific expected state is present and the pre-fix failure signal is absent.",
-      "fail_when": "The old failure signal remains, the probe is inconclusive, or any required service signal is absent.",
+      "action": "Read OPENCLAW_PIN and OPENCLAW_NODE_MIN from build-rootfs.sh and run the template schema gate against the baked openclaw.json input.",
+      "observable": "The pinned OpenClaw version, Node.js minimum, schema-gate exit code, and schema-gate success line.",
+      "pass_when": "OPENCLAW_PIN is 2026.7.1-2, the Node.js version meets OPENCLAW_NODE_MIN, and the schema gate exits 0 for the baked template.",
+      "fail_when": "The pin differs from 2026.7.1-2, Node.js is below the declared minimum, or the gate reports a forbidden template key.",
       "timeout_s": 300,
-      "cleanup": "Delete each test tenant by the exact id recorded when it was created; never use a prefix glob."
+      "cleanup": "Remove only the exact test tenant ids, operation ids, instance ids, S3 object keys, and temporary paths recorded by this verification; never use prefix or wildcard deletion."
     },
     {
       "id": "ver-416",
       "fix_id": "fix-416",
-      "phase": "A-readonly",
-      "action": "Exercise the exact behavior changed by issue #416 and capture the before/after service evidence.",
-      "observable": "API response, Lambda FunctionError, host service state, scheduler ledger, and lifecycle activity as applicable.",
-      "pass_when": "The issue-specific expected state is present and the pre-fix failure signal is absent.",
-      "fail_when": "The old failure signal remains, the probe is inconclusive, or any required service signal is absent.",
-      "timeout_s": 300,
-      "cleanup": "Delete each test tenant by the exact id recorded when it was created; never use a prefix glob."
+      "phase": "B-lifecycle",
+      "action": "Rebuild a recorded tenant onto a host whose openclaw-hosts image_slots.canary entry is READY, then read the tenant row and host slot metadata.",
+      "observable": "The rebuild response plus openclaw-tenants image_channel and image_snapshot_time matched to openclaw-hosts image_slots.canary.",
+      "pass_when": "The rebuild completes with image_channel=canary and image_snapshot_time exactly equal to the selected host's READY canary snapshot.",
+      "fail_when": "The tenant remains on live, records a snapshot other than the host canary value, or the action reports success before the canary adoption is recorded.",
+      "timeout_s": 1800,
+      "cleanup": "Remove only the exact test tenant ids, operation ids, instance ids, S3 object keys, and temporary paths recorded by this verification; never use prefix or wildcard deletion."
     },
     {
       "id": "ver-422",
       "fix_id": "fix-422",
-      "phase": "A-readonly",
-      "action": "Exercise the exact behavior changed by issue #422 and capture the before/after service evidence.",
-      "observable": "API response, Lambda FunctionError, host service state, scheduler ledger, and lifecycle activity as applicable.",
-      "pass_when": "The issue-specific expected state is present and the pre-fix failure signal is absent.",
-      "fail_when": "The old failure signal remains, the probe is inconclusive, or any required service signal is absent.",
-      "timeout_s": 300,
-      "cleanup": "Delete each test tenant by the exact id recorded when it was created; never use a prefix glob."
+      "phase": "B-lifecycle",
+      "action": "Send two concurrent suspend requests for one recorded tenant, wait for a terminal row, then send two concurrent restore requests and read host counters.",
+      "observable": "openclaw-tenants status transitions and openclaw-hosts used_vcpu, used_mem_mb, and vm_count before and after each concurrent pair.",
+      "pass_when": "Each concurrent pair converges to one terminal state, suspended then running, and host capacity is released and reacquired exactly once.",
+      "fail_when": "The tenant remains suspending or restoring, two slots are released or reserved, or any host counter becomes negative or double-incremented.",
+      "timeout_s": 1800,
+      "cleanup": "Remove only the exact test tenant ids, operation ids, instance ids, S3 object keys, and temporary paths recorded by this verification; never use prefix or wildcard deletion."
     },
     {
       "id": "ver-423",
       "fix_id": "fix-423",
-      "phase": "B-lifecycle",
-      "action": "Exercise the exact behavior changed by issue #423 and capture the before/after service evidence.",
-      "observable": "API response, Lambda FunctionError, host service state, scheduler ledger, and lifecycle activity as applicable.",
-      "pass_when": "The issue-specific expected state is present and the pre-fix failure signal is absent.",
-      "fail_when": "The old failure signal remains, the probe is inconclusive, or any required service signal is absent.",
-      "timeout_s": 1800,
-      "cleanup": "Delete each test tenant by the exact id recorded when it was created; never use a prefix glob."
+      "phase": "A-readonly",
+      "action": "Read the CloudFront distribution cache behaviors and the console's actual BFF URL, then query the private REST API endpoint configuration.",
+      "observable": "CloudFront CacheBehaviors path patterns and origins, the console HTTP status, and get-rest-api endpointConfiguration.types and vpcEndpointIds.",
+      "pass_when": "The console BFF path returns a successful response, no console or chat behavior targets the static origin, and the REST API is PRIVATE with a nonempty vpcEndpointIds list.",
+      "fail_when": "The console path returns 404, a console or chat behavior still selects the static origin, or the REST API endpoint configuration has no VPC endpoint id.",
+      "timeout_s": 300,
+      "cleanup": "Remove only the exact test tenant ids, operation ids, instance ids, S3 object keys, and temporary paths recorded by this verification; never use prefix or wildcard deletion."
     },
     {
       "id": "ver-430",
       "fix_id": "fix-430",
       "phase": "B-lifecycle",
-      "action": "Exercise the exact behavior changed by issue #430 and capture the before/after service evidence.",
-      "observable": "API response, Lambda FunctionError, host service state, scheduler ledger, and lifecycle activity as applicable.",
-      "pass_when": "The issue-specific expected state is present and the pre-fix failure signal is absent.",
-      "fail_when": "The old failure signal remains, the probe is inconclusive, or any required service signal is absent.",
+      "action": "Register two hosts with different EC2 instance types, compare their openclaw-hosts totals to describe-instance-types, and place a tenant with an affinity request.",
+      "observable": "openclaw-hosts instance_type, total_vcpu, total_mem_mb, used_vcpu, used_mem_mb, and the selected tenant host_id.",
+      "pass_when": "Each host total matches its own EC2 instance type and the affinity-constrained tenant is placed on the compatible host with only that host's used counters increased.",
+      "fail_when": "Both hosts receive one shared capacity shape, the tenant lands on an incompatible host, or capacity increments appear on more than one host row.",
       "timeout_s": 1800,
-      "cleanup": "Delete each test tenant by the exact id recorded when it was created; never use a prefix glob."
+      "cleanup": "Remove only the exact test tenant ids, operation ids, instance ids, S3 object keys, and temporary paths recorded by this verification; never use prefix or wildcard deletion."
     },
     {
       "id": "ver-440",
       "fix_id": "fix-440",
       "phase": "B-lifecycle",
-      "action": "Exercise the exact behavior changed by issue #440 and capture the before/after service evidence.",
-      "observable": "API response, Lambda FunctionError, host service state, scheduler ledger, and lifecycle activity as applicable.",
-      "pass_when": "The issue-specific expected state is present and the pre-fix failure signal is absent.",
-      "fail_when": "The old failure signal remains, the probe is inconclusive, or any required service signal is absent.",
+      "action": "Run the Fluent Bit installer on a newly baked host, then read systemctl is-active fluent-bit and stat /usr/share/keyrings/fluentbit.gpg.",
+      "observable": "Installer exit code, fluent-bit active state, and the keyring file type and presence.",
+      "pass_when": "The installer exits 0, fluent-bit is active, and /usr/share/keyrings/fluentbit.gpg exists as a regular file.",
+      "fail_when": "The installer exits 2 on overwrite confirmation, the service is not active, or the host reaches lifecycle timeout and is replaced.",
       "timeout_s": 1800,
-      "cleanup": "Delete each test tenant by the exact id recorded when it was created; never use a prefix glob."
+      "cleanup": "Remove only the exact test tenant ids, operation ids, instance ids, S3 object keys, and temporary paths recorded by this verification; never use prefix or wildcard deletion."
     },
     {
       "id": "ver-445",
       "fix_id": "fix-445",
-      "phase": "B-lifecycle",
-      "action": "Exercise the exact behavior changed by issue #445 and capture the before/after service evidence.",
-      "observable": "API response, Lambda FunctionError, host service state, scheduler ledger, and lifecycle activity as applicable.",
-      "pass_when": "The issue-specific expected state is present and the pre-fix failure signal is absent.",
-      "fail_when": "The old failure signal remains, the probe is inconclusive, or any required service signal is absent.",
-      "timeout_s": 1800,
-      "cleanup": "Delete each test tenant by the exact id recorded when it was created; never use a prefix glob."
+      "phase": "A-readonly",
+      "action": "Record used_vcpu, used_mem_mb, and vm_count from one openclaw-hosts row, rerun host initialization on that instance, and read the same attributes again.",
+      "observable": "The exact before and after numeric values of openclaw-hosts.used_vcpu, used_mem_mb, and vm_count.",
+      "pass_when": "All three runtime counters retain their recorded factual values after initialization completes.",
+      "fail_when": "Any of used_vcpu, used_mem_mb, or vm_count is reset to its seed value or disappears from the host row.",
+      "timeout_s": 300,
+      "cleanup": "Remove only the exact test tenant ids, operation ids, instance ids, S3 object keys, and temporary paths recorded by this verification; never use prefix or wildcard deletion."
     },
     {
       "id": "ver-449",
       "fix_id": "fix-449",
-      "phase": "B-lifecycle",
-      "action": "Exercise the exact behavior changed by issue #449 and capture the before/after service evidence.",
-      "observable": "API response, Lambda FunctionError, host service state, scheduler ledger, and lifecycle activity as applicable.",
-      "pass_when": "The issue-specific expected state is present and the pre-fix failure signal is absent.",
-      "fail_when": "The old failure signal remains, the probe is inconclusive, or any required service signal is absent.",
-      "timeout_s": 1800,
-      "cleanup": "Delete each test tenant by the exact id recorded when it was created; never use a prefix glob."
+      "phase": "A-readonly",
+      "action": "Read systemctl show host-agent --property=Environment on one host and compare the newest journalctl timestamp for host-agent with the current host time.",
+      "observable": "The systemd Environment property and the age in seconds of the newest host-agent journal record.",
+      "pass_when": "Environment contains PYTHONUNBUFFERED=1 and the newest host-agent journal record is only seconds behind the current time.",
+      "fail_when": "PYTHONUNBUFFERED=1 is absent or the newest host-agent journal record is minutes behind the current time.",
+      "timeout_s": 300,
+      "cleanup": "Remove only the exact test tenant ids, operation ids, instance ids, S3 object keys, and temporary paths recorded by this verification; never use prefix or wildcard deletion."
     },
     {
       "id": "ver-456",
       "fix_id": "fix-456",
       "phase": "A-readonly",
-      "action": "Exercise the exact behavior changed by issue #456 and capture the before/after service evidence.",
-      "observable": "API response, Lambda FunctionError, host service state, scheduler ledger, and lifecycle activity as applicable.",
-      "pass_when": "The issue-specific expected state is present and the pre-fix failure signal is absent.",
-      "fail_when": "The old failure signal remains, the probe is inconclusive, or any required service signal is absent.",
+      "action": "Call rebuild once with a non-admin identity and once with an admin identity, then read rebuild_op_id, rebuild_phase, rebuild_status, and app_health from the tenant detail response.",
+      "observable": "Authorization HTTP status plus tenant detail fields rebuild_op_id, rebuild_phase, rebuild_status, app_health, and metrics.",
+      "pass_when": "Authorization returns 403 code=ACCESS_DENIED for the non-admin call; the admin call returns 200 or 503 code=REBUILD_RETRY_PENDING and tenant detail exposes matching operation, health, and metrics fields.",
+      "fail_when": "Authorization returns anything other than 403 for the non-admin call, the admin call returns 202, or tenant detail omits rebuild_op_id, app_health, or metrics.",
       "timeout_s": 300,
-      "cleanup": "Delete each test tenant by the exact id recorded when it was created; never use a prefix glob."
+      "cleanup": "Remove only the exact test tenant ids, operation ids, instance ids, S3 object keys, and temporary paths recorded by this verification; never use prefix or wildcard deletion."
     },
     {
       "id": "ver-470",
       "fix_id": "fix-470",
       "phase": "A-readonly",
-      "action": "Exercise the exact behavior changed by issue #470 and capture the before/after service evidence.",
-      "observable": "API response, Lambda FunctionError, host service state, scheduler ledger, and lifecycle activity as applicable.",
-      "pass_when": "The issue-specific expected state is present and the pre-fix failure signal is absent.",
-      "fail_when": "The old failure signal remains, the probe is inconclusive, or any required service signal is absent.",
+      "action": "Create one recorded tenant, fetch its single-tenant detail, then query the same tenant through one enabled conditional tenant index.",
+      "observable": "The two API response objects and their rootfs_version, app_health, vm_health, and metrics fields.",
+      "pass_when": "The new tenant includes rootfs_version and the conditional query returns the same non-secret field set as detail, including application health and metrics fields.",
+      "fail_when": "rootfs_version is absent from the new tenant or the conditional query drops app_health, vm_health, or metrics.",
       "timeout_s": 300,
-      "cleanup": "Delete each test tenant by the exact id recorded when it was created; never use a prefix glob."
+      "cleanup": "Remove only the exact test tenant ids, operation ids, instance ids, S3 object keys, and temporary paths recorded by this verification; never use prefix or wildcard deletion."
     },
     {
       "id": "ver-476",
       "fix_id": "fix-476",
       "phase": "A-readonly",
-      "action": "Exercise the exact behavior changed by issue #476 and capture the before/after service evidence.",
-      "observable": "API response, Lambda FunctionError, host service state, scheduler ledger, and lifecycle activity as applicable.",
-      "pass_when": "The issue-specific expected state is present and the pre-fix failure signal is absent.",
-      "fail_when": "The old failure signal remains, the probe is inconclusive, or any required service signal is absent.",
+      "action": "Run scripts/checks/template-schema-gate.py against every published config template referenced by the image build and compare the documented pin with build-rootfs.sh.",
+      "observable": "The gate's per-file path count, exit code, reported pin, and the OpenClaw pin shown in both developer guides.",
+      "pass_when": "The gate exits 0 for every published template and all build and guide locations report pin 2026.7.1-2.",
+      "fail_when": "Any published template contains a key rejected by that pin or either guide advertises a different image version.",
       "timeout_s": 300,
-      "cleanup": "Delete each test tenant by the exact id recorded when it was created; never use a prefix glob."
+      "cleanup": "Remove only the exact test tenant ids, operation ids, instance ids, S3 object keys, and temporary paths recorded by this verification; never use prefix or wildcard deletion."
     },
     {
       "id": "ver-477",
       "fix_id": "fix-477",
       "phase": "B-lifecycle",
-      "action": "Exercise the exact behavior changed by issue #477 and capture the before/after service evidence.",
-      "observable": "API response, Lambda FunctionError, host service state, scheduler ledger, and lifecycle activity as applicable.",
-      "pass_when": "The issue-specific expected state is present and the pre-fix failure signal is absent.",
-      "fail_when": "The old failure signal remains, the probe is inconclusive, or any required service signal is absent.",
+      "action": "Bake one AMI by the Packer guide, run host-scripts/packer/assert-parity.sh, and launch one host from that AMI through the ASG lifecycle.",
+      "observable": "The parity assertion exit code, the new instance id in openclaw-hosts, and describe-lifecycle-hooks or ASG activity completion state.",
+      "pass_when": "The parity assertion exits 0, the new instance id is registered in openclaw-hosts, and its launch lifecycle action completes without timeout.",
+      "fail_when": "The parity assertion fails, the instance never appears in the host ledger, or the launch hook times out or is abandoned.",
       "timeout_s": 1800,
-      "cleanup": "Delete each test tenant by the exact id recorded when it was created; never use a prefix glob."
+      "cleanup": "Remove only the exact test tenant ids, operation ids, instance ids, S3 object keys, and temporary paths recorded by this verification; never use prefix or wildcard deletion."
     },
     {
       "id": "ver-478",
       "fix_id": "fix-478",
       "phase": "A-readonly",
-      "action": "Exercise the exact behavior changed by issue #478 and capture the before/after service evidence.",
-      "observable": "API response, Lambda FunctionError, host service state, scheduler ledger, and lifecycle activity as applicable.",
-      "pass_when": "The issue-specific expected state is present and the pre-fix failure signal is absent.",
-      "fail_when": "The old failure signal remains, the probe is inconclusive, or any required service signal is absent.",
+      "action": "Run scripts/checks/hardcoded.sh on the published source set with optional account, host, and brand patterns configured to valid test expressions.",
+      "observable": "The scanner exit code, any [hardcoded][ERR] line, and the reported file paths for resource-id findings.",
+      "pass_when": "The scanner exits 0, emits no [hardcoded][ERR] line, and does not report internal issue references from excluded patch artifacts.",
+      "fail_when": "The scanner exits 1 or 2, rejects a valid optional expression, or reports a published-check finding caused only by an internal issue reference.",
       "timeout_s": 300,
-      "cleanup": "Delete each test tenant by the exact id recorded when it was created; never use a prefix glob."
+      "cleanup": "Remove only the exact test tenant ids, operation ids, instance ids, S3 object keys, and temporary paths recorded by this verification; never use prefix or wildcard deletion."
     },
     {
       "id": "ver-479",
       "fix_id": "fix-479",
       "phase": "A-readonly",
-      "action": "Exercise the exact behavior changed by issue #479 and capture the before/after service evidence.",
-      "observable": "API response, Lambda FunctionError, host service state, scheduler ledger, and lifecycle activity as applicable.",
-      "pass_when": "The issue-specific expected state is present and the pre-fix failure signal is absent.",
-      "fail_when": "The old failure signal remains, the probe is inconclusive, or any required service signal is absent.",
+      "action": "Submit one sensitive field as plaintext under scheme=asymmetric-v1 and one valid enc:v1 envelope, then read the host log parser configuration.",
+      "observable": "API status and code for each envelope plus Fluent Bit parser fields that preserve tenant_id and trace_root.",
+      "pass_when": "Plaintext under asymmetric-v1 is rejected with HTTP 400 code=VALIDATION, the valid enc:v1 value is accepted, and logs retain tenant_id and trace_root fields.",
+      "fail_when": "Sensitive plaintext is silently accepted, a valid envelope is treated as plaintext, or either correlation field is removed from forwarded host logs.",
       "timeout_s": 300,
-      "cleanup": "Delete each test tenant by the exact id recorded when it was created; never use a prefix glob."
+      "cleanup": "Remove only the exact test tenant ids, operation ids, instance ids, S3 object keys, and temporary paths recorded by this verification; never use prefix or wildcard deletion."
     },
     {
       "id": "ver-480",
       "fix_id": "fix-480",
       "phase": "A-readonly",
-      "action": "Exercise the exact behavior changed by issue #480 and capture the before/after service evidence.",
-      "observable": "API response, Lambda FunctionError, host service state, scheduler ledger, and lifecycle activity as applicable.",
-      "pass_when": "The issue-specific expected state is present and the pre-fix failure signal is absent.",
-      "fail_when": "The old failure signal remains, the probe is inconclusive, or any required service signal is absent.",
+      "action": "Describe the target environment for stack-managed LiteLLM instances, IAM roles, security groups, and secrets, then read /openclaw/litellm-host from SSM.",
+      "observable": "The four resource query result sets and the SSM parameter value followed by an HTTP reachability probe.",
+      "pass_when": "No stack-managed instance, role, security group, or secret exists and /openclaw/litellm-host still names a reachable customer-managed endpoint.",
+      "fail_when": "Any stack-managed LiteLLM resource exists, indicating manual disposition is required, or the SSM gateway address is missing or unreachable.",
       "timeout_s": 300,
-      "cleanup": "Delete each test tenant by the exact id recorded when it was created; never use a prefix glob."
+      "cleanup": "Remove only the exact test tenant ids, operation ids, instance ids, S3 object keys, and temporary paths recorded by this verification; never use prefix or wildcard deletion."
     },
     {
       "id": "ver-482",
       "fix_id": "fix-482",
       "phase": "A-readonly",
-      "action": "Exercise the exact behavior changed by issue #482 and capture the before/after service evidence.",
-      "observable": "API response, Lambda FunctionError, host service state, scheduler ledger, and lifecycle activity as applicable.",
-      "pass_when": "The issue-specific expected state is present and the pre-fix failure signal is absent.",
-      "fail_when": "The old failure signal remains, the probe is inconclusive, or any required service signal is absent.",
+      "action": "Trigger one rebuild without image_channel, then trigger a canary rebuild for a host whose image_slots.canary value is empty.",
+      "observable": "The persisted openclaw-tenants image_channel for the first request and the HTTP status and code for the empty-canary request.",
+      "pass_when": "The omitted channel resolves to live and the empty canary slot returns an explicit non-success response with code=CANARY_NOT_READY.",
+      "fail_when": "The default channel is not live or the empty canary slot is silently accepted or downgraded to live.",
       "timeout_s": 300,
-      "cleanup": "Delete each test tenant by the exact id recorded when it was created; never use a prefix glob."
+      "cleanup": "Remove only the exact test tenant ids, operation ids, instance ids, S3 object keys, and temporary paths recorded by this verification; never use prefix or wildcard deletion."
     },
     {
       "id": "ver-485",
       "fix_id": "fix-485",
-      "phase": "B-lifecycle",
-      "action": "Exercise the exact behavior changed by issue #485 and capture the before/after service evidence.",
-      "observable": "API response, Lambda FunctionError, host service state, scheduler ledger, and lifecycle activity as applicable.",
-      "pass_when": "The issue-specific expected state is present and the pre-fix failure signal is absent.",
-      "fail_when": "The old failure signal remains, the probe is inconclusive, or any required service signal is absent.",
-      "timeout_s": 1800,
-      "cleanup": "Delete each test tenant by the exact id recorded when it was created; never use a prefix glob."
+      "phase": "A-readonly",
+      "action": "Invoke reset twice for the same tenant with one client_token and compare both responses, the idem# row in openclaw-tenants, and host reset evidence.",
+      "observable": "Both response operation identities, the idempotency row state and result, and the count of distinct host reset attempt records.",
+      "pass_when": "The second request replays the same operation identity and stored result while exactly one destructive reset attempt is recorded on the host.",
+      "fail_when": "The two requests produce different operation identities, create two reset attempts, or the second request executes host cleanup again.",
+      "timeout_s": 300,
+      "cleanup": "Remove only the exact test tenant ids, operation ids, instance ids, S3 object keys, and temporary paths recorded by this verification; never use prefix or wildcard deletion."
     },
     {
       "id": "ver-488",
       "fix_id": "fix-488",
       "phase": "A-readonly",
-      "action": "Exercise the exact behavior changed by issue #488 and capture the before/after service evidence.",
-      "observable": "API response, Lambda FunctionError, host service state, scheduler ledger, and lifecycle activity as applicable.",
-      "pass_when": "The issue-specific expected state is present and the pre-fix failure signal is absent.",
-      "fail_when": "The old failure signal remains, the probe is inconclusive, or any required service signal is absent.",
+      "action": "Read asg.min_capacity and asg.lifecycle_hook_timeout from both supplied configs, run scripts/preflight-check.sh for a first-deploy fixture, and describe the live InitHook.",
+      "observable": "Config values, preflight PASS or BLOCK lines, and LifecycleHooks[InitHook].HeartbeatTimeout from the live group.",
+      "pass_when": "Both examples use min_capacity=0 and lifecycle_hook_timeout=3600, first-deploy preflight accepts those values, and the live hook reports HeartbeatTimeout=3600 without changing live MinSize.",
+      "fail_when": "An example restores min_capacity=2 or timeout=1200, preflight blocks the corrected fixture, or live MinSize is changed while widening the hook.",
       "timeout_s": 300,
-      "cleanup": "Delete each test tenant by the exact id recorded when it was created; never use a prefix glob."
+      "cleanup": "Remove only the exact test tenant ids, operation ids, instance ids, S3 object keys, and temporary paths recorded by this verification; never use prefix or wildcard deletion."
     },
     {
       "id": "ver-495",
       "fix_id": "fix-495",
       "phase": "A-readonly",
-      "action": "Exercise the exact behavior changed by issue #495 and capture the before/after service evidence.",
-      "observable": "API response, Lambda FunctionError, host service state, scheduler ledger, and lifecycle activity as applicable.",
-      "pass_when": "The issue-specific expected state is present and the pre-fix failure signal is absent.",
-      "fail_when": "The old failure signal remains, the probe is inconclusive, or any required service signal is absent.",
+      "action": "Run scripts/checks/tenant-query-rollout.py --table openclaw-tenants in an account where that table does not yet exist.",
+      "observable": "The script exit code and its exact table-absence message.",
+      "pass_when": "The script exits 0 and prints 'OK: openclaw-tenants does not exist yet; CFN creates it with all GSIs at once'.",
+      "fail_when": "The script raises the one-index-per-deployment error, prints a non-OK result, or exits nonzero for the absent table.",
       "timeout_s": 300,
-      "cleanup": "Delete each test tenant by the exact id recorded when it was created; never use a prefix glob."
+      "cleanup": "Remove only the exact test tenant ids, operation ids, instance ids, S3 object keys, and temporary paths recorded by this verification; never use prefix or wildcard deletion."
     }
   ]
 }

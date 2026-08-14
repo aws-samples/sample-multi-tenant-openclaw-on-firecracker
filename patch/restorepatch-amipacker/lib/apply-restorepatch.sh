@@ -5,11 +5,12 @@
 # rolled back ONLY through this tool, so no operator hand-assembles a fleet-breaking
 # command sequence and every executor runs identical code.
 #
-# It covers exactly three concerns and refuses to do anything else:
+# It covers exactly four concerns and refuses to do anything else:
 #   1. host-init lifecycle hook heartbeat timeout 1200 -> 3600
 #   2. one new LaunchTemplate version carrying the Packer AMI id AND the new
 #      content-addressed bootstrap prefix, then default-version flip + controlled refresh
 #   3. openclaw-api function code overlay (reuses the live package's own dependencies)
+#   4. private REST API endpoint attachment followed by deployment and stage replacement
 #
 # Deliberately NOT done, and it will refuse if asked:
 #   * HostASG MinSize 2 -> 0. That value is first-deployment semantics; on a live fleet it
@@ -17,10 +18,10 @@
 #   * TrackDefaultLTVersion AsgShape digest and the OpenClawImage CodeBuild churn. Both are
 #     derived or content-hash projections with no independent action.
 #
-# usage: lib/apply-restorepatch.sh <precheck|backup|apply|verify|rollback> --env <environment.json> --kit <kit-dir> [--allow-base-drift]
+# usage: lib/apply-restorepatch.sh <precheck|backup|apply|verify|rollback|apply-api|verify-api|finalize-api|rollback-api> --env <environment.json> --kit <kit-dir> [--allow-base-drift]
 set -uo pipefail
 
-PHASE="${1:?phase required: precheck|backup|apply|verify|rollback}"; shift || true
+PHASE="${1:?phase required: precheck|backup|apply|verify|rollback|apply-api|verify-api|finalize-api|rollback-api}"; shift || true
 ENVJSON=""; KITDIR="."; ALLOW_BASE_DRIFT=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -144,43 +145,17 @@ restore_function() {
     || die "$function_name did not settle after restore"
 }
 
-case "$PHASE" in
-
-precheck)
-  say "identity"
-  aws_ sts get-caller-identity --query Account --output text || die "no usable credentials"
-  say "lifecycle hook current timeout"
-  cur="$(aws_ autoscaling describe-lifecycle-hooks --auto-scaling-group-name "$ASG" \
-        --query "LifecycleHooks[?LifecycleHookName=='${HOOK_NAME}'].HeartbeatTimeout|[0]" \
-        --output text)"
-  echo "   $HOOK_NAME heartbeat = $cur"
-  [ "$cur" = "None" ] && die "hook $HOOK_NAME not found on $ASG"
-  say "ASG shape and capacity"
-  aws_ autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG" \
-    --query 'AutoScalingGroups[0].[MinSize,MaxSize,DesiredCapacity,length(Instances)]' --output text
-  # A single "must equal the base prefix" test conflated three very different states and
-  # failed all of them. Worse, in two of them the substitution in apply silently finds
-  # nothing, publishes a version identical to the current one, flips the default and
-  # reports success — idempotent but silently ineffective, which is worse than refusing.
-  # So decide per state, and treat already-applied as a pass.
-  say "bootstrap asset state (per-concern, already-applied counts as a pass)"
-  live_ud="$(aws_ ec2 describe-launch-template-versions --launch-template-id "$LT_ID" \
-    --versions "$LT_VER" --query 'LaunchTemplateVersions[0].LaunchTemplateData.UserData' \
-    --output text | base64 -d)"
-  live_prefix="$(printf '%s' "$live_ud" \
-    | grep -oE 'deployment/bootstrap/host/[0-9a-f]{64}' | head -1 | sed 's|.*/||')"
-  [ -n "$live_prefix" ] \
-    || die "in-service UserData carries no content-addressed bootstrap prefix; this template predates the S3-asset form and needs the older re-bake path"
-  echo "   in-service prefix : $live_prefix"
-  echo "   expected base     : $BASE_ASSET_BUNDLE_PREFIX"
-  echo "   patch target      : $ASSET_BUNDLE_PREFIX"
-
+resolve_bootstrap_state() {
+  local live_prefix="$1" probe rc
   if [ "$live_prefix" = "$ASSET_BUNDLE_PREFIX" ]; then
     echo "   STATE bootstrap=ALREADY — the target prefix is already in service; apply will skip it"
     BOOTSTRAP_STATE=ALREADY
   elif [ "$live_prefix" = "$BASE_ASSET_BUNDLE_PREFIX" ]; then
     echo "   STATE bootstrap=READY — in service on the expected base form"
     BOOTSTRAP_STATE=READY
+  elif [ -z "$live_prefix" ]; then
+    echo "   STATE bootstrap=DRIFT — in-service UserData carries no content-addressed bootstrap prefix"
+    BOOTSTRAP_STATE=DRIFT
   else
     # A third value is NOT automatically a version conflict. The published tree and the
     # internal tree render init-host.sh differently (the publish scrub deletes comment
@@ -230,7 +205,86 @@ PY
       echo "         difference cannot be decided by content. NOT treated as absent."
       BOOTSTRAP_STATE=DRIFT
     fi
+    rm -rf "$probe"
   fi
+}
+
+resolve_api_context() {
+  API_ID="$(jpath "$ENVJSON" control_plane_api.id)"
+  API_CONFIRMED="$(jpath "$ENVJSON" control_plane_api.confirmed)"
+  API_STAGE=v1
+  [ -n "$API_ID" ] || die "control_plane_api.id missing from $ENVJSON"
+  case "$API_CONFIRMED" in True|true) ;; *) die "control_plane_api.confirmed is not true" ;; esac
+  aws_ apigateway get-stage --rest-api-id "$API_ID" --stage-name "$API_STAGE" >/dev/null \
+    || die "stage $API_STAGE not found on REST API $API_ID"
+}
+
+resolve_target_vpc() {
+  local subnet_csv vpcs first count
+  subnet_csv="$(aws_ autoscaling describe-auto-scaling-groups \
+    --auto-scaling-group-names "$ASG" \
+    --query 'AutoScalingGroups[0].VPCZoneIdentifier' --output text)"
+  [ -n "$subnet_csv" ] && [ "$subnet_csv" != "None" ] \
+    || die "cannot derive customer VPC: $ASG has no VPCZoneIdentifier"
+  IFS=',' read -r -a subnet_ids <<< "$subnet_csv"
+  vpcs="$(aws_ ec2 describe-subnets --subnet-ids "${subnet_ids[@]}" \
+    --query 'Subnets[].VpcId' --output text)"
+  first="$(printf '%s\n' "$vpcs" | tr '\t ' '\n' | awk 'NF && !seen[$0]++ {print; exit}')"
+  count="$(printf '%s\n' "$vpcs" | tr '\t ' '\n' | awk 'NF && !seen[$0]++ {n++} END {print n+0}')"
+  [ "$count" -eq 1 ] || die "ASG subnets span $count VPCs; refusing endpoint selection"
+  TARGET_VPC_ID="$first"
+}
+
+probe_private_api_endpoint() {
+  local service rows count endpoint_state
+  service="com.amazonaws.${REGION}.execute-api"
+  say "READ-ONLY endpoint collision probe in $TARGET_VPC_ID for $service"
+  rows="$(aws_ ec2 describe-vpc-endpoints \
+    --filters "Name=vpc-id,Values=${TARGET_VPC_ID}" \
+      "Name=service-name,Values=${service}" "Name=vpc-endpoint-type,Values=Interface" \
+    --query 'VpcEndpoints[?PrivateDnsEnabled==`true` && State!=`deleted`].[VpcEndpointId,State]' \
+    --output text)"
+  count="$(printf '%s\n' "$rows" | awk 'NF {n++} END {print n+0}')"
+  [ "$count" -le 1 ] \
+    || die "endpoint collision: found $count private-DNS endpoints for $service in $TARGET_VPC_ID"
+  [ "$count" -eq 1 ] \
+    || die "no reusable private-DNS endpoint for $service in $TARGET_VPC_ID; provision one before attaching the API"
+  VPC_ENDPOINT_ID="$(printf '%s\n' "$rows" | awk 'NF {print $1; exit}')"
+  endpoint_state="$(printf '%s\n' "$rows" | awk 'NF {print $2; exit}')"
+  [ "$endpoint_state" = "available" ] \
+    || die "reusable endpoint $VPC_ENDPOINT_ID is $endpoint_state, not available"
+  echo "   REUSE $VPC_ENDPOINT_ID; no endpoint create call will be made"
+}
+
+case "$PHASE" in
+
+precheck)
+  say "identity"
+  aws_ sts get-caller-identity --query Account --output text || die "no usable credentials"
+  say "lifecycle hook current timeout"
+  cur="$(aws_ autoscaling describe-lifecycle-hooks --auto-scaling-group-name "$ASG" \
+        --query "LifecycleHooks[?LifecycleHookName=='${HOOK_NAME}'].HeartbeatTimeout|[0]" \
+        --output text)"
+  echo "   $HOOK_NAME heartbeat = $cur"
+  [ "$cur" = "None" ] && die "hook $HOOK_NAME not found on $ASG"
+  say "ASG shape and capacity"
+  aws_ autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG" \
+    --query 'AutoScalingGroups[0].[MinSize,MaxSize,DesiredCapacity,length(Instances)]' --output text
+  # A single "must equal the base prefix" test conflated three very different states and
+  # failed all of them. Worse, in two of them the substitution in apply silently finds
+  # nothing, publishes a version identical to the current one, flips the default and
+  # reports success — idempotent but silently ineffective, which is worse than refusing.
+  # So decide per state, and treat already-applied as a pass.
+  say "bootstrap asset state (per-concern, already-applied counts as a pass)"
+  live_ud="$(aws_ ec2 describe-launch-template-versions --launch-template-id "$LT_ID" \
+    --versions "$LT_VER" --query 'LaunchTemplateVersions[0].LaunchTemplateData.UserData' \
+    --output text | base64 -d)"
+  live_prefix="$(printf '%s' "$live_ud" \
+    | grep -oE 'deployment/bootstrap/host/[0-9a-f]{64}' | head -1 | sed 's|.*/||')"
+  echo "   in-service prefix : $live_prefix"
+  echo "   expected base     : $BASE_ASSET_BUNDLE_PREFIX"
+  echo "   patch target      : $ASSET_BUNDLE_PREFIX"
+  resolve_bootstrap_state "$live_prefix"
   say "openclaw-api environment key count (must not change across apply)"
   aws_ lambda get-function-configuration --function-name "$FN" \
     --query 'length(Environment.Variables)' --output text
@@ -403,9 +457,10 @@ apply)
     --versions "$LT_VER" --query 'LaunchTemplateVersions[0].LaunchTemplateData.UserData' \
     --output text | base64 -d \
     | grep -oE 'deployment/bootstrap/host/[0-9a-f]{64}' | head -1 | sed 's|.*/||')"
-  if [ "$live_prefix" = "$ASSET_BUNDLE_PREFIX" ]; then
-    say "   SKIP bootstrap: target prefix already in service (idempotent no-op)"
-  elif [ "$live_prefix" != "$BASE_ASSET_BUNDLE_PREFIX" ] && [ "$ALLOW_BASE_DRIFT" -ne 1 ]; then
+  resolve_bootstrap_state "$live_prefix"
+  if [ "$BOOTSTRAP_STATE" = "ALREADY" ]; then
+    say "   SKIP bootstrap: target content already in service (idempotent no-op)"
+  elif [ "$BOOTSTRAP_STATE" = "DRIFT" ] && [ "$ALLOW_BASE_DRIFT" -ne 1 ]; then
     echo "   REFUSE bootstrap: DRIFT requires --allow-base-drift; continuing other concerns"
   else
   art="${KITDIR}/host-scripts/init-host.sh.patched"
@@ -607,6 +662,133 @@ rollback)
     --preferences '{"MinHealthyPercentage":90}' --query InstanceRefreshId --output text \
     || die "cannot start rollback refresh"
   say "rollback OK — the previous bootstrap object is content-addressed and still present"
+  ;;
+
+apply-api)
+  resolve_api_context
+  resolve_target_vpc
+  probe_private_api_endpoint
+
+  api_type="$(aws_ apigateway get-rest-api --rest-api-id "$API_ID" \
+    --query 'endpointConfiguration.types[0]' --output text)"
+  api_vpces="$(aws_ apigateway get-rest-api --rest-api-id "$API_ID" \
+    --query 'endpointConfiguration.vpcEndpointIds' --output text)"
+  case " $api_vpces " in *" $VPC_ENDPOINT_ID "*) vpce_attached=1 ;; *) vpce_attached=0 ;; esac
+  [ -n "$(state_get api_old_endpoint_type)" ] || state_put api_old_endpoint_type "$api_type"
+  [ -n "$(state_get api_vpce_was_attached)" ] || state_put api_vpce_was_attached "$vpce_attached"
+  state_put api_rest_api_id "$API_ID"
+  state_put api_stage_name "$API_STAGE"
+  state_put api_vpc_endpoint_id "$VPC_ENDPOINT_ID"
+
+  if [ "$vpce_attached" -eq 1 ] && [ "$api_type" = "PRIVATE" ]; then
+    say "endpoint configuration already contains $VPC_ENDPOINT_ID"
+  elif [ "$api_type" = "PRIVATE" ]; then
+    aws_ apigateway update-rest-api --rest-api-id "$API_ID" \
+      --patch-operations "op=add,path=/endpointConfiguration/vpcEndpointIds,value=${VPC_ENDPOINT_ID}" \
+      >/dev/null || die "cannot attach $VPC_ENDPOINT_ID to REST API $API_ID"
+  elif [ "$api_type" = "REGIONAL" ]; then
+    aws_ apigateway update-rest-api --rest-api-id "$API_ID" \
+      --patch-operations \
+        "op=replace,path=/endpointConfiguration/types/REGIONAL,value=PRIVATE" \
+        "op=add,path=/endpointConfiguration/vpcEndpointIds,value=${VPC_ENDPOINT_ID}" \
+      >/dev/null || die "cannot convert REST API $API_ID to the private endpoint"
+  else
+    die "REST API $API_ID endpoint type $api_type is not eligible for the private endpoint update"
+  fi
+
+  old_deployment="$(state_get api_old_deployment_id)"
+  if [ -z "$old_deployment" ]; then
+    old_deployment="$(aws_ apigateway get-stage --rest-api-id "$API_ID" \
+      --stage-name "$API_STAGE" --query deploymentId --output text)"
+    state_put api_old_deployment_id "$old_deployment"
+  fi
+  new_deployment="$(aws_ apigateway create-deployment --rest-api-id "$API_ID" \
+    --description restorepatch-amipacker --query id --output text)" \
+    || die "cannot create REST API deployment"
+  state_put api_new_deployment_id "$new_deployment"
+  aws_ apigateway update-stage --rest-api-id "$API_ID" --stage-name "$API_STAGE" \
+    --patch-operations "op=replace,path=/deploymentId,value=${new_deployment}" \
+    >/dev/null || die "cannot point stage $API_STAGE to deployment $new_deployment"
+  say "API apply OK: endpoint=$VPC_ENDPOINT_ID deployment=$new_deployment stage=$API_STAGE"
+  ;;
+
+verify-api)
+  resolve_api_context
+  rc=0
+  expected_vpce="$(state_get api_vpc_endpoint_id)"
+  expected_deployment="$(state_get api_new_deployment_id)"
+  [ -n "$expected_vpce" ] || { resolve_target_vpc; probe_private_api_endpoint; expected_vpce="$VPC_ENDPOINT_ID"; }
+  api_type="$(aws_ apigateway get-rest-api --rest-api-id "$API_ID" \
+    --query 'endpointConfiguration.types[0]' --output text)"
+  api_vpces="$(aws_ apigateway get-rest-api --rest-api-id "$API_ID" \
+    --query 'endpointConfiguration.vpcEndpointIds' --output text)"
+  stage_deployment="$(aws_ apigateway get-stage --rest-api-id "$API_ID" \
+    --stage-name "$API_STAGE" --query deploymentId --output text)"
+  [ "$api_type" = "PRIVATE" ] \
+    && echo "   PASS endpointConfiguration.types[0]=PRIVATE" \
+    || { echo "   FAIL endpointConfiguration.types[0]=$api_type"; rc=1; }
+  case " $api_vpces " in
+    *" $expected_vpce "*) echo "   PASS endpointConfiguration.vpcEndpointIds contains $expected_vpce" ;;
+    *) echo "   FAIL endpointConfiguration.vpcEndpointIds=$api_vpces"; rc=1 ;;
+  esac
+  [ -n "$expected_deployment" ] && [ "$stage_deployment" = "$expected_deployment" ] \
+    && echo "   PASS stage $API_STAGE deploymentId=$stage_deployment" \
+    || { echo "   FAIL stage $API_STAGE deploymentId=$stage_deployment expected=$expected_deployment"; rc=1; }
+  [ "$rc" -eq 0 ] && say "verify-api PASS" || say "verify-api FAIL"
+  exit "$rc"
+  ;;
+
+finalize-api)
+  resolve_api_context
+  old_deployment="$(state_get api_old_deployment_id)"
+  new_deployment="$(state_get api_new_deployment_id)"
+  [ -n "$old_deployment" ] && [ -n "$new_deployment" ] || die "API deployment state is incomplete"
+  stage_deployment="$(aws_ apigateway get-stage --rest-api-id "$API_ID" \
+    --stage-name "$API_STAGE" --query deploymentId --output text)"
+  [ "$stage_deployment" = "$new_deployment" ] \
+    || die "stage $API_STAGE points to $stage_deployment, not replacement $new_deployment"
+  if [ "$old_deployment" = "$new_deployment" ]; then
+    say "no replaced deployment to delete"
+  else
+    aws_ apigateway delete-deployment --rest-api-id "$API_ID" \
+      --deployment-id "$old_deployment" \
+      || die "cannot delete replaced deployment $old_deployment"
+    state_put api_old_deployment_deleted true
+    say "deleted replaced deployment $old_deployment"
+  fi
+  ;;
+
+rollback-api)
+  resolve_api_context
+  old_deployment="$(state_get api_old_deployment_id)"
+  new_deployment="$(state_get api_new_deployment_id)"
+  old_type="$(state_get api_old_endpoint_type)"
+  vpce_attached="$(state_get api_vpce_was_attached)"
+  vpce_id="$(state_get api_vpc_endpoint_id)"
+  [ -n "$old_deployment" ] && [ -n "$old_type" ] && [ -n "$vpce_id" ] \
+    || die "API rollback state is incomplete"
+  [ "$(state_get api_old_deployment_deleted)" != "true" ] \
+    || die "replaced deployment $old_deployment was finalized and cannot be restored"
+  aws_ apigateway update-stage --rest-api-id "$API_ID" --stage-name "$API_STAGE" \
+    --patch-operations "op=replace,path=/deploymentId,value=${old_deployment}" \
+    >/dev/null || die "cannot restore stage $API_STAGE to deployment $old_deployment"
+  if [ "$vpce_attached" = "0" ] && [ "$old_type" = "PRIVATE" ]; then
+    aws_ apigateway update-rest-api --rest-api-id "$API_ID" \
+      --patch-operations "op=remove,path=/endpointConfiguration/vpcEndpointIds,value=${vpce_id}" \
+      >/dev/null || die "cannot detach $vpce_id during rollback"
+  elif [ "$vpce_attached" = "0" ] && [ "$old_type" = "REGIONAL" ]; then
+    aws_ apigateway update-rest-api --rest-api-id "$API_ID" \
+      --patch-operations \
+        "op=remove,path=/endpointConfiguration/vpcEndpointIds,value=${vpce_id}" \
+        "op=replace,path=/endpointConfiguration/types/PRIVATE,value=REGIONAL" \
+      >/dev/null || die "cannot restore regional endpoint configuration"
+  fi
+  if [ -n "$new_deployment" ] && [ "$new_deployment" != "$old_deployment" ]; then
+    aws_ apigateway delete-deployment --rest-api-id "$API_ID" \
+      --deployment-id "$new_deployment" \
+      || die "cannot delete rolled-back deployment $new_deployment"
+  fi
+  say "API rollback OK: stage=$API_STAGE deployment=$old_deployment endpoint_type=$old_type"
   ;;
 
 *) echo "unknown phase: $PHASE" >&2; exit 2 ;;

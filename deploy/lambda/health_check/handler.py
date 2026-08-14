@@ -64,6 +64,12 @@ AZ_UNHEALTHY_THRESHOLD_MINUTES = int(
 )
 AZ_COOLDOWN_MINUTES = int(os.environ.get("AZ_COOLDOWN_MINUTES", "30"))
 ASSETS_BUCKET = os.environ.get("ASSETS_BUCKET", "")
+# backup-data.sh:16 `BUCKET="${2:-${BACKUP_BUCKET:-${ASSETS_BUCKET}}}"` —— host 上注入了
+# BACKUP_BUCKET(WORM+CMK 专用桶)时备份就写在那儿,只读 ASSETS_BUCKET 会永远 list 空,
+# 于是每个租户都命中 no-backup 拒绝 = AZ failover 实质不可用。回退 ASSETS_BUCKET 是为了
+# 兼容没注入 BACKUP_BUCKET 的旧部署。
+BACKUP_BUCKET = os.environ.get("BACKUP_BUCKET") or ASSETS_BUCKET
+BACKUP_PREFIX = os.environ.get("BACKUP_PREFIX", "backups")
 # 1.4.2 (#fake-failover fix): public URL of the ALB (or CloudFront domain
 # in single-domain mode, or app domain in dual-domain mode) used to
 # cross-verify that a tenant's dashboard is genuinely reachable through
@@ -165,6 +171,12 @@ def lambda_handler(event, context):
             print(f"reap: released {orphans} orphan reservation token(s)")
     except Exception as e:
         print(f"reap orphan-token error (non-fatal): {e}")
+
+    try:
+        cleaned = reap_orphan_phys_slots(dry_run=False)
+        print(f"reap-phys-slots: cleaned={cleaned}")
+    except Exception as e:
+        print(f"reap phys-slot error (non-fatal): {e}")
 
     # ------- AZ-level failover (1.3.0) -------
     if AZ_FAILOVER_ENABLED:
@@ -974,6 +986,11 @@ def _rollback_migration(tenant, reason):
         try:
             vcpu = int(tenant.get("vcpu", 0))
             mem_mb = int(tenant.get("mem_mb", 0))
+            target_vm_num = int(tenant.get("migration_target_vm_num", 1))
+            # 占号单独还,不并进下面的容量条件写:存量租户 host item 上没有 ps_*,一旦把
+            # `#ps = :tid` 加进容量的 floor guard,这些租户的容量就永远释放不掉(CCF);
+            # 反过来容量条件失败也不能连带泄漏号(租户回到 source 后仍在役,reaper 不清)。
+            _release_phys_slot(target_host_id, target_vm_num, tid)
             hosts_table.update_item(
                 Key={"instance_id": target_host_id},
                 UpdateExpression=(
@@ -1252,7 +1269,11 @@ def _advance_migration(tenant, now):
         # 赢家专属:减 SOURCE 计数 + stop 源 VM + release-route 源(硬伤③/R5)。
         vcpu = int(tenant.get("vcpu", 0))
         mem_mb = int(tenant.get("mem_mb", 0))
+        old_vm_num = int(tenant.get("migration_old_vm_num", tenant.get("vm_num", 1)))
         if source_host_id:
+            # 占号单独还(理由同 _rollback_migration):存量租户没有 ps_*,把 `#ps = :tid`
+            # 并进容量的 floor guard 会让它们的 source 容量永远释放不掉。
+            _release_phys_slot(source_host_id, old_vm_num, tid)
             try:
                 hosts_table.update_item(
                     Key={"instance_id": source_host_id},
@@ -1270,7 +1291,6 @@ def _advance_migration(tenant, now):
             except Exception as e:
                 print(f"source counter dec skipped/failed (non-fatal): {e}")
 
-        old_vm_num = int(tenant.get("migration_old_vm_num", tenant.get("vm_num", 1)))
         if source_host_id:
             try:
                 _ssm_run_capture(
@@ -1710,7 +1730,245 @@ def _check_and_handle_az_failover(now, tenants):
     return summary
 
 
-def _reserve_target_vm_num(target_host_id, vcpu, mem_mb, attempts=8):
+PHYS_SLOT_PREFIX = "ps_"
+
+
+def _phys_slot_attr(num):
+    return f"{PHYS_SLOT_PREFIX}{int(num)}"
+
+
+def _host_claimed_slots(host_item, exclude_ids=None):
+    skip = exclude_ids or frozenset()
+    claimed = {}
+    for key, owner in (host_item or {}).items():
+        if not key.startswith(PHYS_SLOT_PREFIX) or owner in skip:
+            continue
+        try:
+            claimed[int(key[len(PHYS_SLOT_PREFIX):])] = owner
+        except (TypeError, ValueError):
+            continue
+    return claimed
+
+
+def _release_phys_slot(host_id, num, owner):
+    """owner 条件释放 ps_<n>;owner 不匹配 = 已被别人接手,不动。回滚路径调用,不抛。"""
+    try:
+        hosts_table.update_item(
+            Key={"instance_id": host_id},
+            UpdateExpression="REMOVE #ps",
+            ConditionExpression="#ps = :tid",
+            ExpressionAttributeNames={"#ps": _phys_slot_attr(num)},
+            ExpressionAttributeValues={":tid": owner},
+        )
+        return True
+    except Exception as e:  # noqa: BLE001
+        if not _is_conditional_failure(e):
+            print(
+                f"release phys slot host={host_id} num={num} owner={owner} "
+                f"failed (non-fatal): {e}"
+            )
+        return False
+
+
+def reap_orphan_phys_slots(dry_run=True):
+    """与 core/scheduling.py 同款物理号对账。
+
+    health_check 独立打包，不能 import api/core，故两处各持一份；判据必须同步演进。
+    租户表中除 deleted/suspended 外的 owner 均保守视为在役，只清明确无主的 ps_*。
+    """
+    alive = set()
+    start_key = None
+    while True:
+        kwargs = {
+            "ProjectionExpression": "id, #s",
+            "ExpressionAttributeNames": {"#s": "status"},
+            "ConsistentRead": True,
+        }
+        if start_key:
+            kwargs["ExclusiveStartKey"] = start_key
+        page = tenants_table.scan(**kwargs)
+        for tenant in page.get("Items", []):
+            if tenant.get("status") not in ("deleted", "suspended"):
+                alive.add(tenant["id"])
+        start_key = page.get("LastEvaluatedKey")
+        if not start_key:
+            break
+
+    cleaned = []
+    start_key = None
+    while True:
+        kwargs = {
+            "FilterExpression": "#s = :active",
+            "ExpressionAttributeNames": {"#s": "status"},
+            "ExpressionAttributeValues": {":active": "active"},
+            "ConsistentRead": True,
+        }
+        if start_key:
+            kwargs["ExclusiveStartKey"] = start_key
+        page = hosts_table.scan(**kwargs)
+        for host in page.get("Items", []):
+            host_id = host["instance_id"]
+            for num, owner in _host_claimed_slots(host).items():
+                if owner in alive:
+                    continue
+                cleaned.append((host_id, num, owner))
+                if dry_run:
+                    continue
+                try:
+                    hosts_table.update_item(
+                        Key={"instance_id": host_id},
+                        UpdateExpression="REMOVE #ps",
+                        ConditionExpression="#ps = :tid",
+                        ExpressionAttributeNames={"#ps": _phys_slot_attr(num)},
+                        ExpressionAttributeValues={":tid": owner},
+                    )
+                except Exception as e:  # noqa: BLE001
+                    if not _is_conditional_failure(e):
+                        print(
+                            f"reap-phys-slot host={host_id} num={num} owner={owner} "
+                            f"failed (non-fatal): {e}"
+                        )
+        start_key = page.get("LastEvaluatedKey")
+        if not start_key:
+            break
+    return cleaned
+
+
+def _iter_phys_nums(host_id, exclude_ids=None):
+    """遍历 host_id 上(已驻留 + 迁入中)租户的物理 tap 号。异常向上抛,调用方定 fail 策略。
+
+    health_check 是独立打包的 Lambda(deploy/stacks/lambdas.py 用
+    Code.from_asset("deploy/lambda/health_check")),包里没有 api 侧的 core/ —— 本文件的
+    CAS 也正是同样原因各持一份。两份实现必须同步演进;判据由 #208 冻结(双来源 + 分页)。
+
+    scan(FilterExpression) 分页:每页最多扫 1MB 就返回 + LastEvaluatedKey。命中的迁入租户
+    可能落在后页,不翻页会漏判 → fail-open 重开安全洞,故必须翻完。
+    """
+    skip = exclude_ids or frozenset()
+    for expr, extra in (
+        ("host_id = :h AND #s <> :d", {":d": "deleted"}),
+        ("migration_target = :h AND #s = :mig", {":mig": "migrating"}),
+    ):
+        vals = {":h": host_id}
+        vals.update(extra)
+        start_key = None
+        while True:
+            kw = {
+                "FilterExpression": expr,
+                "ExpressionAttributeNames": {"#s": "status"},
+                "ExpressionAttributeValues": vals,
+                "ProjectionExpression": "id, vm_num, phys_vm_num",
+                "ConsistentRead": True,
+            }
+            if start_key:
+                kw["ExclusiveStartKey"] = start_key
+            resp = tenants_table.scan(**kw)
+            for it in resp.get("Items", []):
+                if it.get("id") in skip:
+                    continue
+                phys = it.get("phys_vm_num", it.get("vm_num"))
+                try:
+                    yield int(phys)
+                except (TypeError, ValueError):
+                    continue
+            start_key = resp.get("LastEvaluatedKey")
+            if not start_key:
+                break
+
+
+def _next_free_phys_num(host_id, start, exclude_ids=None, limit=4096):
+    """#491(review2)—— 从 start 起找第一个未被物理占用的号,供 failover 跳号认领。
+
+    为什么不试号:试号要一个"试几次放弃"的上限,而 target 上连续被占的号可能有几百个
+    (发号器被回退时),有限次试号会把「换个号就能迁」误报成「无容量」并终止 AZ 恢复;
+    而且每轮试号都要归还刚认领的记账,本路径没有 capacity_reservation_id 令牌,
+    归还做不到既幂等又可确认。先算空号、再一次跳号 CAS,两个问题都不存在。
+
+    返回 (num, occupied_set):(None, None) = 读失败 → 调用方 fail-closed;
+    (None, occupied) = 上界内无空号。limit 是防御性上界,不是重试次数。
+    """
+    try:
+        occupied = set(_iter_phys_nums(host_id, exclude_ids=exclude_ids))
+        host_item = (
+            hosts_table.get_item(
+                Key={"instance_id": host_id}, ConsistentRead=True
+            ).get("Item")
+            or {}
+        )
+        occupied.update(_host_claimed_slots(host_item, exclude_ids))
+    except Exception as e:  # noqa: BLE001 — 返回 None 让调用方 fail-closed
+        print(f"_next_free_phys_num({host_id}) scan failed → fail-closed: {e}")
+        return None, None
+    try:
+        n = int(start)
+    except (TypeError, ValueError):
+        return None, occupied
+    end_n = n + int(limit)
+    while n < end_n:
+        if n not in occupied:
+            return n, occupied
+        n += 1
+    return None, occupied
+
+
+def _release_failover_reservation(
+    tenant_id, target_host_id, vm_num, reservation_id, vcpu, mem_mb
+):
+    """用租户令牌作幂等锚，原子归还 failover 容量与物理号。"""
+    txn_items = [
+        {
+            "Update": {
+                "TableName": hosts_table.table_name,
+                "Key": {"instance_id": target_host_id},
+                "UpdateExpression": (
+                    "SET used_vcpu = used_vcpu - :v, "
+                    "used_mem_mb = used_mem_mb - :m, vm_count = vm_count - :one "
+                    "REMOVE #ps"
+                ),
+                "ConditionExpression": (
+                    "used_vcpu >= :v AND used_mem_mb >= :m AND vm_count >= :one "
+                    "AND #ps = :tid"
+                ),
+                "ExpressionAttributeNames": {"#ps": _phys_slot_attr(vm_num)},
+                "ExpressionAttributeValues": {
+                    ":v": int(vcpu),
+                    ":m": int(mem_mb),
+                    ":one": 1,
+                    ":tid": tenant_id,
+                },
+            }
+        },
+        {
+            "Update": {
+                "TableName": tenants_table.table_name,
+                "Key": {"id": tenant_id},
+                "UpdateExpression": "REMOVE failover_reservation_id",
+                "ConditionExpression": "failover_reservation_id = :rid",
+                "ExpressionAttributeValues": {":rid": reservation_id},
+            }
+        },
+    ]
+    try:
+        hosts_table.meta.client.transact_write_items(TransactItems=txn_items)
+        return True
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "TransactionCanceledException":
+            return False  # 令牌已消费/owner 已变化/重复释放：整个事务幂等 no-op
+        print(f"failover release {tenant_id} failed (non-fatal): {e}")
+        return False
+    except Exception as e:  # noqa: BLE001
+        print(f"failover release {tenant_id} failed (non-fatal): {e}")
+        return False
+
+
+def _reserve_target_vm_num(
+    target_host_id,
+    vcpu,
+    mem_mb,
+    attempts=8,
+    tenant_id=None,
+    reservation_id=None,
+):
     """#排雷 D2 — AZ failover 在 target host 上**原子**占一个 vm_num + 记账,替代旧的
     裸读 next_vm_num + 无条件 SET next_vm_num=target+1。与 create 路径 _reserve_slot、
     migrate 路径 _reserve_migration_slot 同款 CAS(#50/#172):一次条件写,只有 next_vm_num
@@ -1721,9 +1979,38 @@ def _reserve_target_vm_num(target_host_id, vcpu, mem_mb, attempts=8):
     `SET next_vm_num=target+1` 覆盖 → 两租户拿同一 vm_num → guest_ip/tap 重叠 → 跨租户
     网络串(数据安全轴①)。此 CAS 把分配收敛成单次原子条件写,消除该窗口。
     """
+    # 一次认领。返回值仍从 CAS 的 Attributes 取(「自增后 -1」),与本函数原有契约完全一致
+    # —— CAS 成功 ⇒ next_vm_num 已被设成 target+1,所以两者恒等。跳号是内部改进,
+    # 不改变「号从哪来」的对外语义。
     for _ in range(attempts):
-        h = hosts_table.get_item(Key={"instance_id": target_host_id}).get("Item") or {}
+        # 强一致读:本实现按读到的 next_vm_num 算空号,陈旧读只会白撞一次 CCF 再重来。
+        h = (
+            hosts_table.get_item(
+                Key={"instance_id": target_host_id}, ConsistentRead=True
+            ).get("Item")
+            or {}
+        )
         expected = int(h.get("next_vm_num", 1))
+        target, occ = _next_free_phys_num(
+            target_host_id, expected, exclude_ids={tenant_id} if tenant_id else None
+        )
+        if occ is None:
+            # 占用未知 → fail-closed 拒这次 failover(调用方据此 raise 并标 failed)。
+            print(
+                f"[failover] PHYS OCCUPANCY UNKNOWN host={target_host_id} "
+                f"tenant={tenant_id} — refusing failover (fail-closed)"
+            )
+            return None
+        if target is None:
+            print(
+                f"[failover] NO FREE PHYS SLOT host={target_host_id} from={expected}"
+            )
+            return None
+        if target != expected:
+            print(
+                f"[failover] SKIP OCCUPIED tenant={tenant_id} host={target_host_id} "
+                f"expected={expected} target={target}"
+            )
         total_v = int(
             h.get("total_vcpu") or h.get("vcpu_total") or h.get("max_vcpu") or 0
         )
@@ -1737,34 +2024,94 @@ def _reserve_target_vm_num(target_host_id, vcpu, mem_mb, attempts=8):
         try:
             r = hosts_table.update_item(
                 Key={"instance_id": target_host_id},
+                # 跳号:next_vm_num 直接推到 target+1(绝对值)。条件仍是
+                # next_vm_num = :expected,并发者改过就 CCF 重来,被跳过的号不会被同时认领。
                 UpdateExpression=(
                     "SET used_vcpu = if_not_exists(used_vcpu, :z) + :v, "
                     "used_mem_mb = if_not_exists(used_mem_mb, :z) + :m, "
                     "vm_count = if_not_exists(vm_count, :z) + :one, "
-                    "next_vm_num = next_vm_num + :one"
+                    "next_vm_num = :next_after, #ps = :tid"
                 ),
                 ConditionExpression=(
                     "next_vm_num = :expected AND used_vcpu <= :cap_v "
-                    "AND used_mem_mb <= :cap_m"
+                    "AND used_mem_mb <= :cap_m AND attribute_not_exists(#ps)"
                 ),
+                ExpressionAttributeNames={"#ps": _phys_slot_attr(target)},
                 ExpressionAttributeValues={
                     ":v": vcpu,
                     ":m": mem_mb,
                     ":one": 1,
                     ":z": 0,
                     ":expected": expected,
+                    ":next_after": target + 1,
                     ":cap_v": cap_v,
                     ":cap_m": cap_m,
+                    ":tid": tenant_id or "unknown",
                 },
                 ReturnValues="UPDATED_NEW",
             )
-            return int(r["Attributes"]["next_vm_num"]) - 1
+            # 取号:优先用 CAS 的返回值(与本函数原有契约一致),取不到则回退 target。
+            # 两者**恒等** —— CAS 成功意味着写入生效,next_vm_num 已被设成 target+1,
+            # 所以「自增后 -1」== target。优先用返回值是为了不改变对外语义;回退 target 是
+            # 为了不依赖 DDB 一定回传 Attributes(部分调用方/测试替身不提供它)。
+            try:
+                claimed = int(r["Attributes"]["next_vm_num"]) - 1
+            except (KeyError, TypeError, ValueError):
+                claimed = target
+            if reservation_id and tenant_id:
+                full_reservation_id = (
+                    f"{target_host_id}:{claimed}:{reservation_id}"
+                )
+                try:
+                    tenants_table.update_item(
+                        Key={"id": tenant_id},
+                        UpdateExpression="SET failover_reservation_id = :rid",
+                        ConditionExpression=(
+                            "#s = :recover AND "
+                            "(attribute_not_exists(failover_reservation_id) "
+                            "OR failover_reservation_id = :rid)"
+                        ),
+                        ExpressionAttributeNames={"#s": "status"},
+                        ExpressionAttributeValues={
+                            ":rid": full_reservation_id,
+                            ":recover": "failover_recovering",
+                        },
+                    )
+                except Exception:
+                    # 令牌未落库时不能走令牌事务；用刚写入的 owner 条件补偿本次占号。
+                    try:
+                        hosts_table.update_item(
+                            Key={"instance_id": target_host_id},
+                            UpdateExpression=(
+                                "SET used_vcpu = used_vcpu - :v, "
+                                "used_mem_mb = used_mem_mb - :m, "
+                                "vm_count = vm_count - :one REMOVE #ps"
+                            ),
+                            ConditionExpression=(
+                                "used_vcpu >= :v AND used_mem_mb >= :m "
+                                "AND vm_count >= :one AND #ps = :tid"
+                            ),
+                            ExpressionAttributeNames={"#ps": _phys_slot_attr(claimed)},
+                            ExpressionAttributeValues={
+                                ":v": vcpu,
+                                ":m": mem_mb,
+                                ":one": 1,
+                                ":tid": tenant_id,
+                            },
+                        )
+                    except Exception as rollback_error:  # noqa: BLE001
+                        print(
+                            f"failover token persist compensation failed tenant={tenant_id}: "
+                            f"{rollback_error}"
+                        )
+                    raise
+            return claimed
         except Exception as e:  # noqa: BLE001 — CCF 重试,其它异常传播(fail-loud)
             if "ConditionalCheckFailed" not in type(
                 e
             ).__name__ and "ConditionalCheckFailed" not in str(e):
                 raise
-            continue  # 竞争/超卖 → 重读 next_vm_num 重试
+            continue  # 竞争/超卖 → 重读 next_vm_num 重算
     return None
 
 
@@ -1802,11 +2149,15 @@ def _failover_tenant_to_host(tenant, target_host, source_az, now):
     # (无 backup / verify 失败)之后、真正 launch 之前,用 _reserve_target_vm_num 原子占槽
     # (见 :launch 段),避免早返回泄漏已占 slot。
     target_vm_num = None
+    failover_reservation_nonce = None
+    failover_reservation_id = None
     config_template = tenant.get("config_template") or ""
     source_host_id = tenant.get("host_id", "")
 
     # 1) Find latest backup (path A: refuse if missing).
-    backup_key = _find_latest_backup_key(tenant_id) if ASSETS_BUCKET else None
+    # 门看 BACKUP_BUCKET(它已回退到 ASSETS_BUCKET):只看 ASSETS_BUCKET 的话,只注入了
+    # BACKUP_BUCKET 的部署会连查都不查就判无备份。
+    backup_key = _find_latest_backup_key(tenant_id) if BACKUP_BUCKET else None
     if not backup_key:
         _emit_audit(
             "AZ_FAILOVER_NO_BACKUP",
@@ -1903,12 +2254,22 @@ def _failover_tenant_to_host(tenant, target_host, source_az, now):
         # #排雷 D2 — 所有早返回门已过,现在原子占 target host 的 vm_num + 记账(CAS)。
         # 占槽放在 launch 前:无 backup / verify 失败等早返回不会泄漏 slot。CAS None =
         # target 无容量或持续输竞争 → 拒绝 failover(标 failed_no_capacity,不裸分配串号)。
-        target_vm_num = _reserve_target_vm_num(target_host_id, vcpu, mem_mb)
+        failover_reservation_nonce = str(time.time_ns())
+        target_vm_num = _reserve_target_vm_num(
+            target_host_id,
+            vcpu,
+            mem_mb,
+            tenant_id=tenant_id,
+            reservation_id=failover_reservation_nonce,
+        )
         if target_vm_num is None:
             raise RuntimeError(
                 f"target {target_host_id} 无法原子占 vm_num(无容量/CAS 竞争耗尽);"
                 f"拒绝 failover 避免跨租户 vm_num 串号"
             )
+        failover_reservation_id = (
+            f"{target_host_id}:{target_vm_num}:{failover_reservation_nonce}"
+        )
         cee = bool(tenant.get("chat_endpoint_enabled", False))
         chat_ep_arg = "1" if cee else "0"
         launch_cmd = (
@@ -2031,15 +2392,24 @@ def _failover_tenant_to_host(tenant, target_host, source_az, now):
         #    绝不再无条件 SET next_vm_num=target+1(那会覆盖并发 create 的递增 → 串号,
         tenants_table.update_item(
             Key={"id": tenant_id},
+            # 按 `phys_vm_num`(缺失才回退 vm_num)判断某个号是否已被在役租户占用。
+            # failover 实际 launch 的是 target_vm_num,真实网卡就是 tap-vm{target_vm_num};
+            # 若只翻 vm_num 而留下迁移前的旧 phys_vm_num,守卫会以为这个号没人用 →
+            # 放行另一个租户认领它 → 跨租户 tap 接管。host-agent 的 if_not_exists 回填
+            # 也修不了它(字段已存在,只是值是旧的)。
             UpdateExpression=(
-                "SET host_id = :h, vm_num = :n, #s = :running, restored_from = :b"
+                "SET host_id = :h, vm_num = :n, phys_vm_num = :n, "
+                "#s = :running, restored_from = :b "
+                "REMOVE failover_reservation_id"
             ),
+            ConditionExpression="failover_reservation_id = :rid",
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
                 ":h": target_host_id,
                 ":n": target_vm_num,
                 ":running": "running",
                 ":b": backup_key,
+                ":rid": failover_reservation_id,
             },
         )
 
@@ -2056,6 +2426,27 @@ def _failover_tenant_to_host(tenant, target_host, source_az, now):
         return True
     except Exception as e:
         print(f"failover failed for {tenant_id}: {e}")
+        if target_vm_num is not None and failover_reservation_id:
+            # verify/ALB 等后置失败时目标 VM 可能已活；先同步停机，再原子还容量+占号。
+            stopped, _ = _ssm_run_capture(
+                target_host_id,
+                f"/home/ubuntu/stop-vm.sh {shlex.quote(tenant_id)} "
+                f"{shlex.quote(str(target_vm_num))}",
+                timeout=60,
+            )
+            if stopped:
+                _release_failover_reservation(
+                    tenant_id,
+                    target_host_id,
+                    target_vm_num,
+                    failover_reservation_id,
+                    vcpu,
+                    mem_mb,
+                )
+            else:
+                print(
+                    f"failover release retained tenant={tenant_id}: target stop unconfirmed"
+                )
         # 1.4.2: distinguish three failure shapes so operators / tests
         # can tell what was actually wrong:
         #   - failover_failed_partial: VM verified up on target, but ALB
@@ -2099,15 +2490,26 @@ def _find_latest_backup_key(tenant_id):
     """Return the most recent backup S3 key for a tenant, or None.
 
     Backups are uploaded by backup-data.sh as
-        s3://${ASSETS_BUCKET}/backups/<tenant_id>/<ISO timestamp>.gz
-    There is no 'latest.gz' alias — we list and sort by LastModified.
+        s3://${BACKUP_BUCKET:-${ASSETS_BUCKET}}/${BACKUP_PREFIX}/<tenant_id>/<ISO>.gz
+    加密模式(默认)产出 `<ISO>.gz.enc`,并**额外**上传一个 `<ISO>.gz.key`(信封加密的
+    数据密钥,不是数据本体)。没有 'latest' 别名 —— list 后按 LastModified 排序取最新。
+
+    `api/services/tenant_service.py` 的 `_resolve_backup`):
+      • **桶**:原来读 ASSETS_BUCKET,而备份写在 BACKUP_BUCKET → 永远 list 空 →
+        每个租户都被 no-backup 拒绝,AZ failover 实质不可用(真机实测
+        `tenants_blocked: 1` / `failover_error=no_backup_available`)。
+      • **`.key` 对象**:`.gz.enc` 和 `.gz.key` 只差一两秒上传,按 LastModified 倒序
+        可能把**数据密钥**当备份返回,交给 launch-vm.sh restore 就是拿错文件。必须排除。
     """
-    if not ASSETS_BUCKET or not tenant_id:
+    if not BACKUP_BUCKET or not tenant_id:
         return None
     try:
-        prefix = f"backups/{tenant_id}/"
-        resp = s3.list_objects_v2(Bucket=ASSETS_BUCKET, Prefix=prefix, MaxKeys=1000)
+        prefix = f"{BACKUP_PREFIX}/{tenant_id}/"
+        resp = s3.list_objects_v2(Bucket=BACKUP_BUCKET, Prefix=prefix, MaxKeys=1000)
         objs = resp.get("Contents") or []
+        # 先滤掉 .key(数据密钥不是数据本体),再排序 —— 顺序不能反,否则空列表判断会
+        # 把"只有 .key"误当成"有备份"。
+        objs = [o for o in objs if not str(o.get("Key", "")).endswith(".key")]
         if not objs:
             return None
         # Most recent first by LastModified, return key only (no s3:// prefix)

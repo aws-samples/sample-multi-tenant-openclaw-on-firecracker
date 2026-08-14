@@ -245,6 +245,7 @@ locals {
   # 自定义脚本落在 /opt/openclaw/custom/ 而不是 /tmp:留在镜像里可审计
   # (起一台 host 就能看到这批镜像装了什么客户内容),/tmp 在部分环境会被开机清空。
   custom_dst = "/opt/openclaw/custom/customize.sh"
+  assert_dst = "/opt/openclaw/assert-image.sh"
 
   # 空字符串在 packer 的 provisioner 里不能作为 "跳过" 的开关(file provisioner 会
   # 直接报 source 不存在),所以用 count 惯用法:only/except 无法表达条件,
@@ -340,11 +341,20 @@ build {
     source      = "${path.root}/../edge/fluent-bit/install-fluent-bit.sh"
     destination = "/tmp/install-fluent-bit.sh"
   }
+  # 镜像断言脚本。抽成一个文件而不是两段内联:同一套检查要在 provision 之后与
+  # provision 重跑之后各跑一次,两处各维护一份必然漂移。实测 2026-08-13 的真缺陷正是
+  # 如此 —— 幂等阶段只重查了 2 个命令和 2 个泄漏路径,漏掉 Fluent Bit / vmlinux /
+  # ADOT / SSH host key / cloud-init 态,而"重跑重装了这些"恰好是幂等断言该抓的东西。
+  provisioner "file" {
+    source      = "${path.root}/assert-image.sh"
+    destination = "/tmp/assert-image.sh"
+  }
   provisioner "shell" {
     inline = [
       "sudo install -o root -g root -m 0755 /tmp/provision-host.sh ${local.provision_dst}",
       "sudo install -o root -g root -m 0755 /tmp/install-fluent-bit.sh ${local.fb_dst}",
-      "rm -f /tmp/provision-host.sh /tmp/install-fluent-bit.sh",
+      "sudo install -o root -g root -m 0755 /tmp/assert-image.sh ${local.assert_dst}",
+      "rm -f /tmp/provision-host.sh /tmp/install-fluent-bit.sh /tmp/assert-image.sh",
     ]
   }
 
@@ -403,79 +413,24 @@ build {
     timeout = "30m"
   }
 
-  # 4) validate:复刻 Image Builder 的 AssertZeroDownloadBootPath。
-  #    Image Builder 的 validate 阶段是原生提供的;Packer 没有对应概念,所以显式写成
-  #    一个 provisioner。它必须在 scrub 之后跑 —— 既验组件齐全,也验身份已擦净。
+  # 4) validate:复刻 Image Builder 的 AssertZeroDownloadBootPath + 跨租户红线。
+  #    Image Builder 的 validate 阶段是原生提供的;Packer 没有对应概念,所以显式跑一次。
+  #    必须在 scrub 之后 —— 既验组件齐全,也验身份已擦净。检查项都在 assert-image.sh 里,
+  #    与下一步的重跑断言共用同一份:加一项检查,两个时机自动都有。
   provisioner "shell" {
-    # inline_shebang 必须显式给 bash。packer 的默认是 `/bin/sh -e`,而 Ubuntu 的
-    # /bin/sh 是 dash —— dash 没有 pipefail,下面第一行 `set -euo pipefail` 会直接
-    # 报 "Illegal option -o pipefail" 并让整个 provisioner 退出。实测 2026-08-12:
-    # 断言主体完全未执行到,build 却已经跑完了 provision,失败点看起来像在别处。
-    # `packer validate` 无法检出(它不执行脚本),只有实际执行构建才会暴露。
-    inline_shebang = "/usr/bin/env bash"
-    inline = [<<-ASSERT
-      set -euo pipefail
-      # 验收判据:golden host 必须能在【零下载】的前提下起到 running。
-      # 下面每个缺失项 = boot path 要补做的一次下载,所以在这里一次性断言,
-      # 而不是等 lifecycle hook 已经在计时的 host 上才发现。
-      fail=0
-      for b in aws firecracker jailer; do
-        command -v "$b" >/dev/null 2>&1 || { echo "MISSING binary: $b"; fail=1; }
-      done
-      # Fluent Bit 官方包装到 /opt/fluent-bit/bin,不在 PATH 上(真机 2026-08-05)。
-      # 按 PATH 探会在装好的镜像上误报缺失,而 installer 里同样的错探针会让每次
-      # golden boot 都重新联网装一遍。断言打包位置。
-      for f in /opt/fluent-bit/bin/fluent-bit \
-               /opt/openclaw/baked/vmlinux \
-               /etc/openclaw/.ami-provisioned; do
-        [ -s "$f" ] || { echo "MISSING file: $f"; fail=1; }
-      done
-      dpkg -s aws-otel-collector >/dev/null 2>&1 || { echo "MISSING pkg: aws-otel-collector"; fail=1; }
-      # SSM agent 必须留在镜像里。控制面靠 SSM 驱动 host(launch-vm/stop-vm 批量、
-      # host-agent 命令),没有 agent 的 host 从控制面看就是不可达 —— 它会注册成
-      # active 然后每条指令都超时。Image Builder 侧必须显式声明
-      # uninstall_after_build=False(host_image.py 的 AdditionalInstanceConfiguration),
-      # 因为它默认会卸载;Packer 走 SSH 不碰 agent,所以这里【断言】而不是配置,
-      # 免得"Packer 不会卸载"这个前提在换 communicator 或加清理步骤后静默失效。
-      systemctl list-unit-files 'snap.amazon-ssm-agent.*' 'amazon-ssm-agent.*' 2>/dev/null \
-        | grep -q 'ssm-agent' || { echo "MISSING: amazon-ssm-agent unit not present in image"; fail=1; }
-      # 跨租户红线。host_vm_key 是 per-host 的,公钥半边注进每个租户 microVM,
-      # 一把被预置于镜像的私钥 = 任意 host 能 SSH 进任意 host 上任意租户的 microVM。
-      # provision 的 scrub 已经查过;这里再查一遍,因为 validate 跑在所有 build 步骤
-      # 之后 —— 能抓到"后来新增的步骤又造了一把 key"。
-      for leak in /etc/openclaw/host_vm_key /etc/openclaw/host_vm_key.pub /etc/platform.env \
-                  /data/agentcore.env /etc/openclaw/host_vm_key.instance; do
-        [ ! -e "$leak" ] || { echo "LEAK: $leak present in image"; fail=1; }
-      done
-      # SSH host key。scrub 删了它们(`rm -f /etc/ssh/ssh_host_*`),但在自定义阶段
-      # 引入之前没有断言兜住 —— 而客户脚本重装 openssh-server、或跑
-      # `dpkg-reconfigure openssh-server`,都会重新生成一对。预置于镜像后整个机队共享
-      # 同一把 host key:任何能起一台 host 的人都能冒充其余每一台,MITM 检测失效。
-      # 正常路径下 cloud-init 在首次启动时按实例重新生成,所以镜像里应当一把都没有。
-      # 用 find 而不是 `ls ssh_host_*`:glob 无匹配时 ls 返回非零,叠加 set -e 与
-      # pipefail 会让整个断言脚本【在这一行就退出】—— 后面的检查全部不执行,而 packer
-      # 只报 "Script exited with non-zero exit status: 2",看不出是断言自己死了。
-      # 实测 2026-08-12:这行的第一版正是如此,把本该兜住自定义脚本的防线整条废掉。
-      # find 在无匹配时返回 0 且输出为空,是这里唯一安全的写法。
-      _sshkeys="$(find /etc/ssh -maxdepth 1 -name 'ssh_host_*' -print 2>/dev/null | tr '\n' ' ')"
-      [ -z "$_sshkeys" ] || { echo "LEAK: SSH host keys present in image: $_sshkeys"; fail=1; }
-      # cloud-init 实例态残留会让新实例复用旧 instance-id 的判定,首启逻辑被跳过。
-      [ ! -d /var/lib/cloud/instances ] || [ -z "$(ls -A /var/lib/cloud/instances 2>/dev/null)" ] \
-        || { echo "LEAK: cloud-init instance state present"; fail=1; }
-      # 自定义阶段的产物本身要可审计:镜像里必须留着实际执行过的那份脚本,
-      # 这样起一台 host 就能核对这批镜像装了什么客户内容。
-      [ -s /opt/openclaw/custom/customize.sh ] \
-        || { echo "MISSING file: /opt/openclaw/custom/customize.sh"; fail=1; }
-      [ "$fail" = 0 ] || { echo "golden AMI validation failed"; exit 1; }
-      echo "golden AMI validated: components present, no host identity"
-    ASSERT
-    ]
+    inline = ["sudo bash ${local.assert_dst} post-provision"]
   }
 
-  # 4) validate:复刻 AssertProvisionIsIdempotent。
-  #    golden host 只跑 configure,但 plain-AMI 路径会在可能已 provision 过的机器上
-  #    跑 provision,重新构建也会跑两次。在真镜像上重跑一次来证明幂等性,而不是在注释里
-  #    声称。刻意【不】带 OC_PROVISION_BAKE —— scrub 已经跑过且通过,再跑只是重删空气。
+
+  # 5) validate:复刻 AssertProvisionIsIdempotent。
+  #    golden host 只跑 configure,但 plain-AMI 路径会在可能已 provision 过的机器上跑
+  #    provision,重烤也会跑两次。在真镜像上重跑一次来证明幂等性,而不是在注释里声称。
+  #    刻意【不】带 OC_PROVISION_BAKE:scrub 已经跑过且通过,再跑只是重删空气。
+  #
+  #    ★ 重跑之后必须重跑【完整】断言,不能只抽查几项。实测 2026-08-13 的真缺陷:此前
+  #    这里只查 `command -v firecracker && command -v aws` 加两个泄漏路径,于是"重跑把
+  #    Fluent Bit / ADOT / vmlinux 重装了一遍"或"重跑重新生成了 SSH host key"都不会被
+  #    发现 —— 而那正是幂等断言存在的理由。现在调 assert-image.sh,与第 4 步同一份检查。
   provisioner "shell" {
     environment_vars = [
       "OC_PROVISION_RECIPE_VERSION=${var.recipe_version}",
@@ -483,27 +438,25 @@ build {
       "OC_ASSETS_BUCKET=${var.assets_bucket}",
       "AWS_REGION=${var.region}",
     ]
-    # 同上:dash 不认 pipefail,不显式给 bash 这段断言就跑不到。
+    # dash 不认 pipefail,不显式给 bash 这段就跑不到。
     inline_shebang = "/usr/bin/env bash"
     inline = [<<-IDEMPOTENT
       set -euo pipefail
       before="$(sudo sha256sum /etc/openclaw/.ami-provisioned | cut -d' ' -f1)"
       sudo -E bash ${local.provision_dst}
       after="$(sudo sha256sum /etc/openclaw/.ami-provisioned | cut -d' ' -f1)"
-      # provisioned_at 是时间戳,marker 合法地会变。不能变的是组件集合 ——
-      # 上一步已断言过,而"重跑重装了什么"会破坏它。
-      command -v firecracker >/dev/null && command -v aws >/dev/null
-      # 重跑不得重新引入身份文件(非 bake 模式不跑 scrub,所以这条是真检查)。
-      for leak in /etc/openclaw/host_vm_key /etc/platform.env; do
-        [ ! -e "$leak" ] || { echo "LEAK after re-run: $leak"; exit 1; }
-      done
+      # 重跑后跑完整断言:组件集合、SSM agent、跨租户红线、SSH host key、cloud-init 态
+      # 全部重验。第 4 步验的是"provision 装对了",这一步验的是"重跑没把它弄坏"。
+      sudo bash ${local.assert_dst} post-rerun
+      # provisioned_at 是时间戳,marker 合法地会变;组件集合不能变,上一行已断言。
       echo "provision is idempotent (marker before=$before after=$after; timestamp differs by design)"
     IDEMPOTENT
     ]
     timeout = "20m"
   }
 
-  # 5) 落 manifest:AMI id / region / 构建时间,供 CI 与 assert_parity 对账。
+
+  # 6) 落 manifest:AMI id / region / 构建时间,供 CI 与 assert_parity 对账。
   post-processor "manifest" {
     output     = "${path.root}/manifest.json"
     strip_path = true
@@ -518,7 +471,7 @@ build {
     }
   }
 
-  # 6) SSM 参数分发 —— Image Builder 的 distribution 原生提供该步骤,Packer 必须自己做。
+  # 7) SSM 参数分发 —— Image Builder 的 distribution 原生提供该步骤,Packer 必须自己做。
   #    ha_edge.py:661 的 resolve_ssm_parameter_at_launch 读这个参数,所以不写就等于
   #    产出了一个没人用的 AMI。--overwrite:参数是"当前 golden AMI"的指针,按定义要覆盖。
   post-processor "shell-local" {
@@ -549,12 +502,21 @@ build {
       # ★ 校验是【异步】的,put-parameter 无论值好坏都返回成功(实测 2026-08-13):
       #   已有好值 + 写坏值 → 坏版本静默丢弃,读回来还是旧的好值;
       #   全新参数 + 写坏值 → 参数根本不存在,GetParameter 报 ParameterNotFound。
-      # 两种情况下退出码都是 0,所以【不能靠 put 的退出码判断发布成功】。回读一次,
-      # 确认参数里就是我们刚发布的那个 AMI id,否则 fail-loud —— 否则构建会宣称
-      # "已发布",而 ASG 拉到的是上一版镜像(或拉不到),那是最难查的一类不一致。
-      "  _got=$(aws ssm get-parameter --name '${var.ssm_parameter}' --region '${var.region}' --query 'Parameter.Value' --output text 2>/dev/null || true)",
-      "  if [ \"$_got\" != \"$AMI_ID\" ]; then echo \"SSM publish did not take effect: parameter holds '$_got', expected '$AMI_ID' (data-type validation rejects values asynchronously)\" >&2; exit 1; fi",
-      "  echo \"verified: ${var.ssm_parameter} = $_got\"",
+      # 两种情况下退出码都是 0,所以【不能靠 put 的退出码判断发布成功】。必须回读。
+      #
+      # 但也【不能只读一次】:校验既然是异步的,一次立即回读可能落在校验完成之前,
+      # 于是一个合法的发布被误判成失败(假红,反过来的错)。限时轮询到新值出现为止:
+      # 30 次 × 2s = 60s 上限,足够覆盖 DescribeImages 的校验延迟,又不会在真失败时
+      # 挂住构建。轮询结束仍不匹配才 fail-loud —— 否则构建会宣称"已发布",而 ASG
+      # 拉到的是上一版镜像(或拉不到),那是最难查的一类不一致。
+      "  _got=\"\"",
+      "  for _i in $(seq 1 30); do",
+      "    _got=$(aws ssm get-parameter --name '${var.ssm_parameter}' --region '${var.region}' --query 'Parameter.Value' --output text 2>/dev/null || true)",
+      "    if [ \"$_got\" = \"$AMI_ID\" ]; then break; fi",
+      "    sleep 2",
+      "  done",
+      "  if [ \"$_got\" != \"$AMI_ID\" ]; then echo \"SSM publish did not take effect within 60s: parameter holds '$_got', expected '$AMI_ID'. aws:ec2:image validation is asynchronous and discards a rejected version silently; a non-existent or deregistered AMI id looks exactly like this.\" >&2; exit 1; fi",
+      "  echo \"verified after polling: ${var.ssm_parameter} = $_got\"",
       "else",
       "  echo 'ssm_parameter 未设 —— 只产出 AMI,不发布指针(ha_edge 的 resolve:ssm 读不到新镜像)'",
       "fi",

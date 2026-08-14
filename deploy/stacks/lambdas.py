@@ -1353,8 +1353,17 @@ def build_lambdas(self, ctx):
             "AZ_COOLDOWN_MINUTES": str(
                 int(az_failover_cfg.get("cooldown_minutes", 30))
             ),
+            "BACKUP_PREFIX": CFG["s3"]["backup_prefix"],
         },
     )
+    # (backup-data.sh:16 `${BACKUP_BUCKET:-${ASSETS_BUCKET}}`)。不注入 → handler 侧回退
+    # 到 assets 桶 → 永远 list 空 → 每个租户都被 no-backup 拒绝,AZ failover 实质不可用。
+    # 判空 fail-safe 与 api_fn(:331)同款:不建备份桶的部署不注入,读侧自然回退 assets。
+    if backup_bucket is not None:
+        health_fn.add_environment("BACKUP_BUCKET", backup_bucket.bucket_name)
+        # env 指对了 IAM 也得给 —— 否则 list_objects_v2 AccessDenied,现象和"没备份"
+        # 一样(见 :558 同一个坑)。只读:写备份是 backup Lambda 的事。
+        backup_bucket.grant_read(health_fn)
     tenants_table.grant_read_write_data(health_fn)
     hosts_table.grant_read_write_data(health_fn)
     # (creating→failed + 扣 hosts 账本 + 清令牌一个 TransactWriteItems)。

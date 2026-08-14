@@ -11,9 +11,29 @@ log "stopping ${TENANT_ID} vm${VM_NUM}..."
 # Serialize stop with every launch/recover path. launch-vm.sh holds this same
 # per-tenant lock, so a stop racing a cold launch waits for that launch and then
 # wins deterministically instead of killing a half-built VM.
+#
+# 把它持锁的 fd 号传进来,本脚本就复用那个 fd 而不再 `exec 9>` 重新 open。
+# 为什么必须这样而不是"让调用方先持锁、脚本照旧 exec 9>":flock 绑定在【打开文件
+# 描述】上,`exec 9>` 会对同一文件产生一个【新的】描述,继承来的锁保护不了它 →
+# 下面的 `flock -w 2 9` 拿不到 → 走 `flock -w 15` → 15s 后 FATAL exit 1,
+# 即每次都失败。复用调用方的 fd 才能让 flock 认出"这把锁本进程已持有"(flock 对
+# 同一打开文件描述重复加锁是 no-op 成功)。
+# 未设置该变量时行为与原来【完全一致】(delete 之外的所有调用点都不设它)。
 mkdir -p /run/lock 2>/dev/null || true
 LOCK_PATH="/run/lock/oc-launch-${TENANT_ID}.lock"
-exec 9>"${LOCK_PATH}"
+if [ -n "${OC_LIFECYCLE_LOCK_FD:-}" ]; then
+  # 校验:必须是纯数字且该 fd 真的开着,否则宁可自己抢锁也不裸奔(fail-safe)。
+  if printf '%s' "${OC_LIFECYCLE_LOCK_FD}" | grep -qE '^[0-9]+$' &&
+     [ -e "/proc/self/fd/${OC_LIFECYCLE_LOCK_FD}" ]; then
+    eval "exec 9<&${OC_LIFECYCLE_LOCK_FD}"
+    log "reusing caller-held lifecycle lock (fd ${OC_LIFECYCLE_LOCK_FD})"
+  else
+    log "WARN: OC_LIFECYCLE_LOCK_FD='${OC_LIFECYCLE_LOCK_FD}' 不可用,回落自持锁"
+    exec 9>"${LOCK_PATH}"
+  fi
+else
+  exec 9>"${LOCK_PATH}"
+fi
 STOP_INTENT_PUBLISHED=0
 LEGACY_FIRECRACKER_TERMINATED=0
 

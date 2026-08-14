@@ -1,0 +1,1205 @@
+{
+  "id": "amipatch",
+  "base_sha": "b1d4e4ddb1429f9d89bfb0114c47b99f72b7b327",
+  "patch_sha": "f7c477096b4adf900a331e1c87ba1711fd436877",
+  "status": "MANUAL_REVIEW",
+  "excludes": [],
+  "cloudformation": {
+    "status": "CAPTURED",
+    "reason": null,
+    "provenance": {
+      "synth_argv": [
+        "bash",
+        "/tmp/oc_synth_all.sh",
+        "--all",
+        "{output}"
+      ],
+      "base": {
+        "source_sha": "b1d4e4ddb1429f9d89bfb0114c47b99f72b7b327",
+        "source_tree": "fa9cdf187801b7be653e2c9f146ff932e928469c",
+        "assembly_index": {
+          "artifact": "resources/cloudformation/base.assembly-index.json",
+          "sha256": "744e801403c4f1f6c68e163fee7322f0a97d0c82a8351c7701b2ae15bf2d5b48"
+        }
+      },
+      "patch": {
+        "source_sha": "f7c477096b4adf900a331e1c87ba1711fd436877",
+        "source_tree": "0ede036254dffe05c14a1273011457668561c4e8",
+        "assembly_index": {
+          "artifact": "resources/cloudformation/patch.assembly-index.json",
+          "sha256": "1bfc529373e3e54f85a21c907f554b9ffc77d7b3b1ecba405a8ea5262be695cd"
+        }
+      }
+    },
+    "stacks": [
+      {
+        "artifact_id": "OpenClawHostImage",
+        "name": "OpenClawHostImage",
+        "base_template": {
+          "artifact": "resources/cloudformation/OpenClawHostImage.base.json",
+          "sha256": "168a38e27dd6f21776b1ad49e527958b5dc37f9ab76a8465a5bbd3c275e37abc"
+        },
+        "patch_template": {
+          "artifact": "resources/cloudformation/OpenClawHostImage.patch.json",
+          "sha256": "168a38e27dd6f21776b1ad49e527958b5dc37f9ab76a8465a5bbd3c275e37abc"
+        }
+      },
+      {
+        "artifact_id": "OpenClawImage",
+        "name": "OpenClawImage",
+        "base_template": {
+          "artifact": "resources/cloudformation/OpenClawImage.base.json",
+          "sha256": "b31a3d9cfe913fd72ea73d18c0f3d9332ebb831e6677bdd5ce86f07c56767b21"
+        },
+        "patch_template": {
+          "artifact": "resources/cloudformation/OpenClawImage.patch.json",
+          "sha256": "05a87ff805625add2a5323521ae735cdd225119b6751049f053b34549d3c2758"
+        }
+      },
+      {
+        "artifact_id": "OpenClawOrchestrator",
+        "name": "OpenClawOrchestrator",
+        "base_template": {
+          "artifact": "resources/cloudformation/OpenClawOrchestrator.base.json",
+          "sha256": "0295dc1784f7d8c04bb4cc8f12332d56da3a0d3daff2cf0f5c40d77aa4b29a49"
+        },
+        "patch_template": {
+          "artifact": "resources/cloudformation/OpenClawOrchestrator.patch.json",
+          "sha256": "1ca7ce000a64f7ac9cb9cc188cb0100a19d47a95be65204b12126bfbbc2dd020"
+        }
+      }
+    ]
+  },
+  "kit_files": {
+    "lib/apply-amipatch.sh": {
+      "sha256": "4e8f57b4120a1e507108a82e79fb86a18f9d715d5348bb95f0757453cd7e1861"
+    },
+    "lib/apply-lt.sh": {
+      "sha256": "07b9633975bdc8e76803af83f9057c09a3fe28707f5284c727933e3050238df1"
+    },
+    "lib/discover-env.sh": {
+      "sha256": "656889c0872df12a06ca5626902e2b0f1fdef12118d298c332216abf959f7ed9"
+    },
+    "lib/lt-userdata.py": {
+      "sha256": "240c14d26aa6668567f6c2bbaf8ca2d884f27532735873382317317633402779"
+    }
+  },
+  "paths": {
+    "config.yml.example": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/deploy-machine/config.yml.example",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "782da4cf6443d50775478e171b772bdbd42eab343dba5474a230457f39423357",
+      "patch_sha256": "5357fcc50d8e817e6af14626772f915b9f9d2557500047b2ab77c6f65d2b7454",
+      "operations": [
+        {
+          "resource": "CDK input consumed at synth time (no live write of its own)",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "# replace the target file with the kit artifact",
+          "verify_cli": "# sha256sum of the target file must equal manifest patch_sha256",
+          "rollback_cli": "# restore the base version of the file"
+        }
+      ],
+      "fix_ids": [
+        "fix-488"
+      ]
+    },
+    "deploy/edge/fluent-bit/install-fluent-bit.sh": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/install-fluent-bit.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "d07496e39710de1c05f32172c78bdc70c00cd18067093dc9ee2effef40044aa5",
+      "patch_sha256": "0dff5df771194c4c4b416bcd22506ff7475b744af445f746c7b7f76def1c85e0",
+      "operations": [
+        {
+          "resource": "host content delivered by the Packer golden AMI",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "# 用 kit 内对应 artifact 替换目标文件",
+          "verify_cli": "# sha256sum <目标文件> 必须等于 manifest 的 patch_sha256",
+          "rollback_cli": "# 还原为 base 版本文件"
+        }
+      ],
+      "fix_ids": [
+        "fix-440"
+      ]
+    },
+    "deploy/lambda/api/services/action_idem.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/services/action_idem.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "229d660eb069b98434f332841f24ef516b7a46e3c1c27a3fd64ebbed2c0d5432",
+      "patch_sha256": "f3c441d7c1262f2650269bdb1302a0c058ade496b2cbf31383f874ca605c8b42",
+      "operations": [
+        {
+          "resource": "openclaw-api source module (overlay payload)",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "# 用 kit 内对应 artifact 替换目标文件",
+          "verify_cli": "# sha256sum <目标文件> 必须等于 manifest 的 patch_sha256",
+          "rollback_cli": "# 还原为 base 版本文件"
+        }
+      ],
+      "fix_ids": [
+        "fix-485"
+      ]
+    },
+    "deploy/lambda/api/services/host_service.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/services/host_service.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "35150566ce22cfb96fbf133885d569f3963d7d251e889648ff4b604d97076afa",
+      "patch_sha256": "9320983fb8d25f91e5b2bd014944294441573b630bf12ebda395cb1fae1a272c",
+      "operations": [
+        {
+          "resource": "openclaw-api source module (overlay payload)",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "# 用 kit 内对应 artifact 替换目标文件",
+          "verify_cli": "# sha256sum <目标文件> 必须等于 manifest 的 patch_sha256",
+          "rollback_cli": "# 还原为 base 版本文件"
+        }
+      ],
+      "fix_ids": [
+        "fix-470"
+      ]
+    },
+    "deploy/lambda/api/services/tenant_query_service.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/services/tenant_query_service.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "0038b79ca88959e6e348a96934195391133ec5af665e1406aeb34ca20c03c83d",
+      "patch_sha256": "515817e8a8c9572d7b6d321b2064472da7023a3b116d12d0fc14040c9eff6826",
+      "operations": [
+        {
+          "resource": "openclaw-api source module (overlay payload)",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "# 用 kit 内对应 artifact 替换目标文件",
+          "verify_cli": "# sha256sum <目标文件> 必须等于 manifest 的 patch_sha256",
+          "rollback_cli": "# 还原为 base 版本文件"
+        }
+      ],
+      "fix_ids": [
+        "fix-470"
+      ]
+    },
+    "deploy/lambda/api/services/tenant_service.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/services/tenant_service.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "faa95a0ef4548d8c45ee8b6765d34e3a6fa70707f28a7dabe53e734a69e8b80f",
+      "patch_sha256": "02be14ffb52ed84510b010ee43cf1cf493fc2c925670c8a4dd428a3c9aa80785",
+      "operations": [
+        {
+          "resource": "openclaw-api source module (overlay payload)",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "# 用 kit 内对应 artifact 替换目标文件",
+          "verify_cli": "# sha256sum <目标文件> 必须等于 manifest 的 patch_sha256",
+          "rollback_cli": "# 还原为 base 版本文件"
+        }
+      ],
+      "fix_ids": [
+        "fix-456",
+        "fix-482",
+        "fix-485"
+      ]
+    },
+    "deploy/packer/CUSTOMER-GUIDE.md": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": "host-scripts/packer/CUSTOMER-GUIDE.md",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "833a94624efd48bc7febeab0be60299cc0172b8a76eedd5a85e300e29ecbe670",
+      "operations": [
+        {
+          "resource": "Packer build input for the golden AMI",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "# 用 kit 内对应 artifact 替换目标文件",
+          "verify_cli": "# sha256sum <目标文件> 必须等于 manifest 的 patch_sha256",
+          "rollback_cli": "# 还原为 base 版本文件"
+        }
+      ],
+      "fix_ids": [
+        "fix-477"
+      ]
+    },
+    "deploy/packer/README.md": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": "host-scripts/packer/README.md",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "1f2401d71c9ae552139781dfdc7f341a0ce910d412caea2876e21c1cd0adae3f",
+      "operations": [
+        {
+          "resource": "Packer build input for the golden AMI",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "# 用 kit 内对应 artifact 替换目标文件",
+          "verify_cli": "# sha256sum <目标文件> 必须等于 manifest 的 patch_sha256",
+          "rollback_cli": "# 还原为 base 版本文件"
+        }
+      ],
+      "fix_ids": [
+        "fix-477"
+      ]
+    },
+    "deploy/packer/apse1.pkrvars.hcl": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/packer/apse1.pkrvars.hcl",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "ae855df3998ef5d148e53f066403bf8ae2fb72c07e0154e2e413c8df8cc58ef3",
+      "operations": [
+        {
+          "resource": "Packer build input for the golden AMI",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "# 用 kit 内对应 artifact 替换目标文件",
+          "verify_cli": "# sha256sum <目标文件> 必须等于 manifest 的 patch_sha256",
+          "rollback_cli": "# 还原为 base 版本文件"
+        }
+      ],
+      "fix_ids": [
+        "fix-477"
+      ]
+    },
+    "deploy/packer/assert-parity.sh": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/packer/assert-parity.sh",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "223eb29beaccf499e58139c0cf47481ecc3b507da2fdc690a0934ec69d6f6d0b",
+      "operations": [
+        {
+          "resource": "Packer build input for the golden AMI",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "# 用 kit 内对应 artifact 替换目标文件",
+          "verify_cli": "# sha256sum <目标文件> 必须等于 manifest 的 patch_sha256",
+          "rollback_cli": "# 还原为 base 版本文件"
+        }
+      ],
+      "fix_ids": [
+        "fix-477"
+      ]
+    },
+    "deploy/packer/build-guide-html.sh": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/packer/build-guide-html.sh",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "2fd31745affd5ca89908bd57a96b20f47cdfb868c3094189be8a7f85d87290f7",
+      "operations": [
+        {
+          "resource": "Packer build input for the golden AMI",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "# 用 kit 内对应 artifact 替换目标文件",
+          "verify_cli": "# sha256sum <目标文件> 必须等于 manifest 的 patch_sha256",
+          "rollback_cli": "# 还原为 base 版本文件"
+        }
+      ],
+      "fix_ids": [
+        "fix-477"
+      ]
+    },
+    "deploy/packer/customize.sh.default": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/packer/customize.sh.default",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "1689848c6f87ecfa6f66f58344e25f43bb8117d4e291af516c15c6d1f0d739b6",
+      "operations": [
+        {
+          "resource": "Packer build input for the golden AMI",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "# 用 kit 内对应 artifact 替换目标文件",
+          "verify_cli": "# sha256sum <目标文件> 必须等于 manifest 的 patch_sha256",
+          "rollback_cli": "# 还原为 base 版本文件"
+        }
+      ],
+      "fix_ids": [
+        "fix-477"
+      ]
+    },
+    "deploy/packer/customize.sh.example": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/packer/customize.sh.example",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "74f8df4e38c38c1932fde71a8c6f8553915cb9d4d7a7373c331e1c65b7604463",
+      "operations": [
+        {
+          "resource": "Packer build input for the golden AMI",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "# 用 kit 内对应 artifact 替换目标文件",
+          "verify_cli": "# sha256sum <目标文件> 必须等于 manifest 的 patch_sha256",
+          "rollback_cli": "# 还原为 base 版本文件"
+        }
+      ],
+      "fix_ids": [
+        "fix-477"
+      ]
+    },
+    "deploy/packer/host-golden.pkr.hcl": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/packer/host-golden.pkr.hcl",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "157748ee9b59cef6d45ec4c1928f924ad7bec34f694289e469ab39f9d75e8260",
+      "operations": [
+        {
+          "resource": "Packer build input for the golden AMI",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "# 用 kit 内对应 artifact 替换目标文件",
+          "verify_cli": "# sha256sum <目标文件> 必须等于 manifest 的 patch_sha256",
+          "rollback_cli": "# 还原为 base 版本文件"
+        }
+      ],
+      "fix_ids": [
+        "fix-477"
+      ]
+    },
+    "deploy/stacks/tenant_query_rollout.py": {
+      "change": "M",
+      "layer": "D-cdk",
+      "artifact": "host-scripts/deploy-machine/deploy/stacks/tenant_query_rollout.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "ffc89f92676271e69969c72ba836958bdea780e9befd7d093fd39cdec79d8797",
+      "patch_sha256": "1d554fc9fbb6c45325c1c14b966baca51e197a5faa466982e8ba62192ec9ee51",
+      "operations": [
+        {
+          "resource": "本区间全部 12 条合成资源变更的唯一归属点",
+          "class": "MANUAL_CLI_REVIEW",
+          "rollback_policy": "RESTORE",
+          "resource_refs": [
+            {
+              "stack": "OpenClawOrchestrator",
+              "logical_id": "InitHook",
+              "resource_type": "AWS::AutoScaling::LifecycleHook",
+              "change": "M"
+            },
+            {
+              "stack": "OpenClawOrchestrator",
+              "logical_id": "HostASG3A4B5C6D",
+              "resource_type": "AWS::AutoScaling::AutoScalingGroup",
+              "change": "M"
+            },
+            {
+              "stack": "OpenClawOrchestrator",
+              "logical_id": "TrackDefaultLTVersion",
+              "resource_type": "AWS::CloudFormation::CustomResource",
+              "change": "M"
+            },
+            {
+              "stack": "OpenClawOrchestrator",
+              "logical_id": "HostLT7E8F9A0B",
+              "resource_type": "AWS::EC2::LaunchTemplate",
+              "change": "M"
+            },
+            {
+              "stack": "OpenClawOrchestrator",
+              "logical_id": "HostInitAssetDeploymentCustomResource96CEC015",
+              "resource_type": "Custom::CDKBucketDeployment",
+              "change": "M"
+            },
+            {
+              "stack": "OpenClawOrchestrator",
+              "logical_id": "Assets560B5C73",
+              "resource_type": "AWS::S3::Bucket",
+              "change": "M"
+            },
+            {
+              "stack": "OpenClawOrchestrator",
+              "logical_id": "ApiHandler5E7490E8",
+              "resource_type": "AWS::Lambda::Function",
+              "change": "M"
+            },
+            {
+              "stack": "OpenClawOrchestrator",
+              "logical_id": "ApiHandlerLive539BAFFE",
+              "resource_type": "AWS::Lambda::Alias",
+              "change": "M"
+            },
+            {
+              "stack": "OpenClawOrchestrator",
+              "logical_id": "ApiHandlerCurrentVersion5C7F0A604cb4a8a18868b63949116ec65522c4d5",
+              "resource_type": "AWS::Lambda::Version",
+              "change": "A"
+            },
+            {
+              "stack": "OpenClawOrchestrator",
+              "logical_id": "ApiHandlerCurrentVersion5C7F0A60e293df092b5352f0662ac6ab443dfc60",
+              "resource_type": "AWS::Lambda::Version",
+              "change": "D"
+            },
+            {
+              "stack": "OpenClawImage",
+              "logical_id": "GoldenImageBuilderCEF13562",
+              "resource_type": "AWS::CodeBuild::Project",
+              "change": "M"
+            },
+            {
+              "stack": "OpenClawImage",
+              "logical_id": "GoldenImageBuildRoleDefaultPolicy94E47D88",
+              "resource_type": "AWS::IAM::Policy",
+              "change": "M"
+            }
+          ],
+          "artifact_refs": [
+            "lib/apply-amipatch.sh"
+          ],
+          "apply_cli": "lib/apply-amipatch.sh apply --env {{environment.environment_json}} --kit {{environment.kit_dir}}",
+          "verify_cli": "lib/apply-amipatch.sh verify --env {{environment.environment_json}} --kit {{environment.kit_dir}}",
+          "rollback_cli": "lib/apply-amipatch.sh rollback --env {{environment.environment_json}} --kit {{environment.kit_dir}}"
+        }
+      ],
+      "fix_ids": [
+        "fix-495"
+      ]
+    },
+    "deploy/userdata/host-agent.service": {
+      "change": "M",
+      "layer": "B-s3",
+      "artifact": "host-scripts/host-agent.service.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "88214e096d411635cc256eaf011a9953eb0f3d5f0e0b01bc6ea806a8e0fbb4a4",
+      "patch_sha256": "569060a0bbca6a6f67c57dcc3f9a3bd27aa1dc2aedf51d0f9894ef98bfc4b7d5",
+      "operations": [
+        {
+          "resource": "host content delivered by the Packer golden AMI",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "# 用 kit 内对应 artifact 替换目标文件",
+          "verify_cli": "# sha256sum <目标文件> 必须等于 manifest 的 patch_sha256",
+          "rollback_cli": "# 还原为 base 版本文件"
+        }
+      ],
+      "fix_ids": [
+        "fix-449"
+      ]
+    },
+    "deploy/userdata/init-host.sh": {
+      "change": "M",
+      "layer": "B-s3",
+      "artifact": "host-scripts/init-host.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "2fd6113e8bc2a48082af2f283bbddc1336d237238c678090ecec75ac67110b7f",
+      "patch_sha256": "744793b0fcb1d0e8df650aa747c22cc733939e16cce0f805e7a9f0022e761d17",
+      "operations": [
+        {
+          "resource": "host content delivered by the Packer golden AMI",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "# 用 kit 内对应 artifact 替换目标文件",
+          "verify_cli": "# sha256sum <目标文件> 必须等于 manifest 的 patch_sha256",
+          "rollback_cli": "# 还原为 base 版本文件"
+        }
+      ],
+      "fix_ids": [
+        "fix-445",
+        "fix-449",
+        "fix-485"
+      ]
+    },
+    "deploy/userdata/reset-vm.sh": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/reset-vm.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "43d60a73f12b3e215c95bc8b14c516486d741eb87ac8255414bd2c10afe50008",
+      "operations": [
+        {
+          "resource": "host content delivered by the Packer golden AMI",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "# 用 kit 内对应 artifact 替换目标文件",
+          "verify_cli": "# sha256sum <目标文件> 必须等于 manifest 的 patch_sha256",
+          "rollback_cli": "# 还原为 base 版本文件"
+        }
+      ],
+      "fix_ids": [
+        "fix-485"
+      ]
+    },
+    "docs/api/pull-image-api.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "96cbf83223d250506abd0e2c11b6b7610493e396d99371fc5257b7df1a141e71",
+      "patch_sha256": "b173ca557491944123e009dd427a1f768be6f2a00238c22eca1d82830b6a5fb7",
+      "operations": [
+        {
+          "resource": "documentation / publish receipt",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "# 用 kit 内对应 artifact 替换目标文件",
+          "verify_cli": "# sha256sum <目标文件> 必须等于 manifest 的 patch_sha256",
+          "rollback_cli": "# 还原为 base 版本文件"
+        }
+      ],
+      "fix_ids": [
+        "fix-482"
+      ]
+    },
+    "docs/api/rebuild-api.md": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "dd0f7cb8ae26e0f1f5abcf66fba6e6db0e128d54470f4adc0c3cac745e53b803",
+      "operations": [
+        {
+          "resource": "documentation / publish receipt",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "# 用 kit 内对应 artifact 替换目标文件",
+          "verify_cli": "# sha256sum <目标文件> 必须等于 manifest 的 patch_sha256",
+          "rollback_cli": "# 还原为 base 版本文件"
+        }
+      ],
+      "fix_ids": [
+        "fix-482"
+      ]
+    },
+    "docs/aws-guide-en/09-api-integration.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "70319b1fa88c46b8163c80b8ec14326a1d07a114ef3ca2c3b961f610edb38477",
+      "patch_sha256": "773d77748bf64cbba02162fce58fd64f5e79036f9ec51a14c8f59517ab0ca22b",
+      "operations": [
+        {
+          "resource": "documentation / publish receipt",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "# 用 kit 内对应 artifact 替换目标文件",
+          "verify_cli": "# sha256sum <目标文件> 必须等于 manifest 的 patch_sha256",
+          "rollback_cli": "# 还原为 base 版本文件"
+        }
+      ],
+      "fix_ids": [
+        "fix-482"
+      ]
+    },
+    "docs/aws-guide/09-api-integration.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "d07ea2d2516d70a9c042f5f04fcba1034296d32cd20a00277a2d53cfba3495a5",
+      "patch_sha256": "ddd72851fa2fd98096d37b1be05321d1b021efee214cae0481dcc739bd9ec970",
+      "operations": [
+        {
+          "resource": "documentation / publish receipt",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "# 用 kit 内对应 artifact 替换目标文件",
+          "verify_cli": "# sha256sum <目标文件> 必须等于 manifest 的 patch_sha256",
+          "rollback_cli": "# 还原为 base 版本文件"
+        }
+      ],
+      "fix_ids": [
+        "fix-482"
+      ]
+    },
+    "docs/aws-guide/openapi.yaml": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "6f518856a5ff2b43eb24eb657f50e8a97f3102ff043df9467d3f2ea74b655546",
+      "patch_sha256": "47ad640655e4e1b108e3cea1304c4ddc71cb727f5bd11aee75657d1964648893",
+      "operations": [
+        {
+          "resource": "documentation / publish receipt",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "# 用 kit 内对应 artifact 替换目标文件",
+          "verify_cli": "# sha256sum <目标文件> 必须等于 manifest 的 patch_sha256",
+          "rollback_cli": "# 还原为 base 版本文件"
+        }
+      ],
+      "fix_ids": [
+        "fix-456",
+        "fix-482",
+        "fix-485"
+      ]
+    },
+    "patch/manifest-2026-08-14-014511-f3100678.json": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "7e001bdb59f186ea26bd07dbe9f234d6338a6f77bca658248976eee1661a8709",
+      "operations": [
+        {
+          "resource": "documentation / publish receipt",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "# 用 kit 内对应 artifact 替换目标文件",
+          "verify_cli": "# sha256sum <目标文件> 必须等于 manifest 的 patch_sha256",
+          "rollback_cli": "# 还原为 base 版本文件"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/manifest-2026-08-14-094804-0ea2a16b.json": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "2448ed9b58ac9ca721f5212d03ea1a69b15fa425084b7fede267080a992993cf",
+      "operations": [
+        {
+          "resource": "documentation / publish receipt",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "# 用 kit 内对应 artifact 替换目标文件",
+          "verify_cli": "# sha256sum <目标文件> 必须等于 manifest 的 patch_sha256",
+          "rollback_cli": "# 还原为 base 版本文件"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/push-marker-2026-08-14-014511-f3100678.md": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "1d357038f487988712487e24ea3c9e8b67265a28e0712acf721649aa656508e5",
+      "operations": [
+        {
+          "resource": "documentation / publish receipt",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "# 用 kit 内对应 artifact 替换目标文件",
+          "verify_cli": "# sha256sum <目标文件> 必须等于 manifest 的 patch_sha256",
+          "rollback_cli": "# 还原为 base 版本文件"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/push-marker-2026-08-14-094804-0ea2a16b.md": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "db682b08e7daa495f10a06b80c99ced4a1296a03c998ace883414eed0465efd5",
+      "operations": [
+        {
+          "resource": "documentation / publish receipt",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "# 用 kit 内对应 artifact 替换目标文件",
+          "verify_cli": "# sha256sum <目标文件> 必须等于 manifest 的 patch_sha256",
+          "rollback_cli": "# 还原为 base 版本文件"
+        }
+      ],
+      "fix_ids": []
+    },
+    "samples/config-sg-prod.yaml": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/deploy-machine/samples/config-sg-prod.yaml",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "40f95c506d46c9161d29835c0e377b4b5bb68b666a067ee273f2923a728fdcf6",
+      "patch_sha256": "e997a480db7a95e0fa4c92ab65927252f083bdc0f33a74557796a8fbf7da66b8",
+      "operations": [
+        {
+          "resource": "deploy-machine tooling / config template",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "# 用 kit 内对应 artifact 替换目标文件",
+          "verify_cli": "# sha256sum <目标文件> 必须等于 manifest 的 patch_sha256",
+          "rollback_cli": "# 还原为 base 版本文件"
+        }
+      ],
+      "fix_ids": [
+        "fix-488"
+      ]
+    },
+    "scripts/checks/tenant-query-rollout.py": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/deploy-machine/scripts/checks/tenant-query-rollout.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "63c7a3e96df17e8ca6e76c9e87b369dadffba94db8895d653c1350f288aef729",
+      "patch_sha256": "d7d86e4ada122c07b3b24910ea480bdfa112ad397289c27be2b14a716abd6ab1",
+      "operations": [
+        {
+          "resource": "deploy-machine tooling / config template",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "# 用 kit 内对应 artifact 替换目标文件",
+          "verify_cli": "# sha256sum <目标文件> 必须等于 manifest 的 patch_sha256",
+          "rollback_cli": "# 还原为 base 版本文件"
+        }
+      ],
+      "fix_ids": [
+        "fix-495"
+      ]
+    },
+    "scripts/preflight-check.sh": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/deploy-machine/scripts/preflight-check.sh",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "c611387f5879d7c43983a0a97ffdb83256daefb457e047ad10d7a8b516c0c40b",
+      "patch_sha256": "860693a5c77540bdf32b0812c50b969cee25f9248cec676938fb7a654c2d844c",
+      "operations": [
+        {
+          "resource": "deploy-machine tooling / config template",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "# 用 kit 内对应 artifact 替换目标文件",
+          "verify_cli": "# sha256sum <目标文件> 必须等于 manifest 的 patch_sha256",
+          "rollback_cli": "# 还原为 base 版本文件"
+        }
+      ],
+      "fix_ids": [
+        "fix-488"
+      ]
+    },
+    "setup.sh": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/deploy-machine/setup.sh",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "1d621ca6a45dca5a7cf2658db47c18451be35d64c86f0af35267de87c9891493",
+      "patch_sha256": "f318bab8940c77d37a1daba7f4017dcef2426097eec743f05e50fe7d24ff5b48",
+      "operations": [
+        {
+          "resource": "deploy-machine tooling / config template",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "# 用 kit 内对应 artifact 替换目标文件",
+          "verify_cli": "# sha256sum <目标文件> 必须等于 manifest 的 patch_sha256",
+          "rollback_cli": "# 还原为 base 版本文件"
+        }
+      ],
+      "fix_ids": [
+        "fix-485"
+      ]
+    }
+  },
+  "fixes": [
+    {
+      "id": "fix-440",
+      "summary": "install-fluent-bit.sh 给 gpg --dearmor 传 --yes:keyring 已存在时它会弹覆盖确认,host 启动阶段无终端故 rc=2,host 生命周期钩子失败被 ASG 替换,替换实例撞同一个提示,重试不收敛",
+      "paths": [
+        "deploy/edge/fluent-bit/install-fluent-bit.sh"
+      ],
+      "applies_when": "目标环境用 Packer 或 Image Builder 烤 host AMI(两者都装 fluent-bit)",
+      "params_changed": [],
+      "verification_ids": [
+        "ver-440"
+      ]
+    },
+    {
+      "id": "fix-445",
+      "summary": "openclaw-hosts 容量账本重跑安全:init-host 重跑不再无条件 put-item 抹掉四个运行时记账字段",
+      "paths": [
+        "deploy/userdata/init-host.sh"
+      ],
+      "applies_when": "always",
+      "params_changed": [],
+      "verification_ids": [
+        "ver-445"
+      ]
+    },
+    {
+      "id": "fix-449",
+      "summary": "host-agent 加 PYTHONUNBUFFERED=1:长驻 Restart=always 进程写 journal socket 时 CPython 块缓冲,disk-gc/探活/reconcile 日志滞后数分钟,事故现场不可用",
+      "paths": [
+        "deploy/userdata/host-agent.service",
+        "deploy/userdata/init-host.sh"
+      ],
+      "applies_when": "always",
+      "params_changed": [],
+      "verification_ids": [
+        "ver-449"
+      ]
+    },
+    {
+      "id": "fix-456",
+      "summary": "issue #456",
+      "paths": [
+        "deploy/lambda/api/services/tenant_service.py",
+        "docs/aws-guide/openapi.yaml"
+      ],
+      "applies_when": "always",
+      "params_changed": [],
+      "verification_ids": [
+        "ver-456"
+      ]
+    },
+    {
+      "id": "fix-470",
+      "summary": "GET /tenants 两处字段缺失:新建租户无 rootfs_version;条件查询裁掉 app_health/metrics",
+      "paths": [
+        "deploy/lambda/api/services/host_service.py",
+        "deploy/lambda/api/services/tenant_query_service.py"
+      ],
+      "applies_when": "always",
+      "params_changed": [],
+      "verification_ids": [
+        "ver-470"
+      ]
+    },
+    {
+      "id": "fix-477",
+      "summary": "host golden AMI 改用 Packer 构建:客户不跑 CDK 也能烤 AMI 并切 LaunchTemplate。本 patch 的数据面交付机制",
+      "paths": [
+        "deploy/packer/CUSTOMER-GUIDE.md",
+        "deploy/packer/README.md",
+        "deploy/packer/apse1.pkrvars.hcl",
+        "deploy/packer/assert-parity.sh",
+        "deploy/packer/build-guide-html.sh",
+        "deploy/packer/customize.sh.default",
+        "deploy/packer/customize.sh.example",
+        "deploy/packer/host-golden.pkr.hcl"
+      ],
+      "applies_when": "目标环境希望不跑 CDK 也能烤 AMI + 切 LT。本 patch 的数据面交付机制",
+      "params_changed": [],
+      "verification_ids": [
+        "ver-477"
+      ]
+    },
+    {
+      "id": "fix-482",
+      "summary": "rebuild 缺省 image_channel=live,空槽位 fail-closed",
+      "paths": [
+        "deploy/lambda/api/services/tenant_service.py",
+        "docs/api/pull-image-api.md",
+        "docs/api/rebuild-api.md",
+        "docs/aws-guide-en/09-api-integration.md",
+        "docs/aws-guide/09-api-integration.md",
+        "docs/aws-guide/openapi.yaml"
+      ],
+      "applies_when": "always",
+      "params_changed": [],
+      "verification_ids": [
+        "ver-482"
+      ]
+    },
+    {
+      "id": "fix-485",
+      "summary": "reset 的 client_token 从未被读到:补 op 专属幂等证据 + UNKNOWN 语义拆分 + 202 终态归类;新增 reset-vm.sh 用 rebuild 同款 op-scoped tombstone 事务,不重造裸 rm overlay",
+      "paths": [
+        "deploy/lambda/api/services/action_idem.py",
+        "deploy/lambda/api/services/tenant_service.py",
+        "deploy/userdata/init-host.sh",
+        "deploy/userdata/reset-vm.sh",
+        "docs/aws-guide/openapi.yaml",
+        "setup.sh"
+      ],
+      "applies_when": "always",
+      "params_changed": [],
+      "verification_ids": [
+        "ver-485"
+      ]
+    },
+    {
+      "id": "fix-488",
+      "summary": "0→1 部署前置门补齐 + 示例配置自相矛盾修正(min_capacity 首次部署必须 0;imported VPC + metal 实测 lifecycle_hook_timeout 1200s 不足,改 3600)",
+      "paths": [
+        "config.yml.example",
+        "samples/config-sg-prod.yaml",
+        "scripts/preflight-check.sh"
+      ],
+      "applies_when": "仅当目标环境要重新执行 0→1 部署;在役机队不应用 min_capacity=0",
+      "params_changed": [
+        {
+          "name": "asg.min_capacity -> HostASG.MinSize",
+          "layer": "D-cdk",
+          "old_default": "2",
+          "new_default": "0",
+          "runtime_impact": "示例配置里这是【首次部署】才对的值(黄金镜像烤制是非阻塞独立栈,min>=1 时 host 抢在镜像就绪前启动、拉不到镜像 → lifecycle ABANDON → ASG 反复换机)。对【在役】机队执行 --min-size 0 会允许缩到零台,承载真实租户的 host 可能被回收。本 patch 不生成强制操作,仅作可选建议。"
+        },
+        {
+          "name": "asg.lifecycle_hook_timeout -> InitHook.HeartbeatTimeout",
+          "layer": "D-cdk",
+          "old_default": "1200",
+          "new_default": "3600",
+          "runtime_impact": "放宽方向,安全。imported VPC + r8g.metal-24xl 真机实测 1200s 不足,会连续 lifecycle ABANDON 换机。改大只影响钩子等待上限,不影响在役实例。"
+        }
+      ],
+      "verification_ids": [
+        "ver-488"
+      ]
+    },
+    {
+      "id": "fix-495",
+      "summary": "tenant-query GSI 门误拦首次部署:表不存在时代入空索引,missing 变成全部 GSI,触发 at most one 报错,一键部署整条被堵。CFN 建新表时一次性连所有 GSI 一起建,故表不存在时直接放行",
+      "paths": [
+        "deploy/stacks/tenant_query_rollout.py",
+        "scripts/checks/tenant-query-rollout.py"
+      ],
+      "applies_when": "仅当目标环境的 tenant-query 表尚不存在(首次部署)",
+      "params_changed": [],
+      "verification_ids": [
+        "ver-495"
+      ]
+    }
+  ],
+  "verifications": [
+    {
+      "id": "ver-440",
+      "fix_id": "fix-440",
+      "phase": "B-lifecycle",
+      "action": "在新 AMI 起的 host 上确认 fluent-bit 装成功(keyring 已存在也不再卡覆盖确认) — systemctl is-active fluent-bit && ls -l /usr/share/keyrings/fluentbit*.gpg",
+      "observable": "systemctl is-active fluent-bit && ls -l /usr/share/keyrings/fluentbit*.gpg",
+      "pass_when": "fluent-bit active 且 keyring 存在",
+      "fail_when": "install-fluent-bit.sh 返回 rc=2,或 host 卡在 lifecycle 钩子直到 ABANDON",
+      "timeout_s": 1800,
+      "cleanup": "删除本检查创建的测试租户,按创建时记录的确切 id 逐个删,不用前缀 glob"
+    },
+    {
+      "id": "ver-445",
+      "fix_id": "fix-445",
+      "phase": "A-readonly",
+      "action": "重跑 init-host 后 openclaw-hosts 的四个运行时记账字段不被抹回初值 — 对同一 host 记录前后各读一次 used_vcpu/used_mem_mb/vm_count",
+      "observable": "对同一 host 记录前后各读一次 used_vcpu/used_mem_mb/vm_count",
+      "pass_when": "重跑后计数器保持事实值",
+      "fail_when": "计数器被打回初值(即无条件 put-item 仍在生效)",
+      "timeout_s": 300,
+      "cleanup": "删除本检查创建的测试租户,按创建时记录的确切 id 逐个删,不用前缀 glob"
+    },
+    {
+      "id": "ver-449",
+      "fix_id": "fix-449",
+      "phase": "A-readonly",
+      "action": "host-agent 以 PYTHONUNBUFFERED=1 运行,journal 不再滞后 — systemctl show host-agent -p Environment;journalctl -u host-agent -n 1 的时间戳与当前时间差",
+      "observable": "systemctl show host-agent -p Environment;journalctl -u host-agent -n 1 的时间戳与当前时间差",
+      "pass_when": "Environment 含 PYTHONUNBUFFERED=1 且最新日志时间差在秒级",
+      "fail_when": "缺该 env,或日志时间差达分钟级",
+      "timeout_s": 300,
+      "cleanup": "删除本检查创建的测试租户,按创建时记录的确切 id 逐个删,不用前缀 glob"
+    },
+    {
+      "id": "ver-456",
+      "fix_id": "fix-456",
+      "phase": "A-readonly",
+      "action": "rebuild 契约:管理员限定 + 同步 200 — 以 operator(非 admin)身份 POST /tenants/{id}/rebuild",
+      "observable": "以 operator(非 admin)身份 POST /tenants/{id}/rebuild",
+      "pass_when": "非 admin 被拒;admin 调用返 200(无法确认采用时 503),不再是 202",
+      "fail_when": "非 admin 也能调用,或仍返 202",
+      "timeout_s": 300,
+      "cleanup": "删除本检查创建的测试租户,按创建时记录的确切 id 逐个删,不用前缀 glob"
+    },
+    {
+      "id": "ver-470",
+      "fix_id": "fix-470",
+      "phase": "A-readonly",
+      "action": "GET /tenants 两处字段回归 — 新建一个租户后 GET /tenants/{id};再用条件查询取同一租户",
+      "observable": "新建一个租户后 GET /tenants/{id};再用条件查询取同一租户",
+      "pass_when": "新租户含 rootfs_version;条件查询与非条件查询返回同一字段集(含 app_health/metrics)",
+      "fail_when": "缺 rootfs_version,或条件查询裁掉了 app_health/metrics",
+      "timeout_s": 300,
+      "cleanup": "删除本检查创建的测试租户,按创建时记录的确切 id 逐个删,不用前缀 glob"
+    },
+    {
+      "id": "ver-477",
+      "fix_id": "fix-477",
+      "phase": "B-lifecycle",
+      "action": "Packer 烤出的 AMI 与 Image Builder 产物内容对等,且新 host 能正常启动 — bash deploy/packer/assert-parity.sh;并起一台新 host 走完 lifecycle",
+      "observable": "bash deploy/packer/assert-parity.sh;并起一台新 host 走完 lifecycle",
+      "pass_when": "对等性断言通过;新 host 注册进 openclaw-hosts 且 lifecycle CONTINUE",
+      "fail_when": "断言失败,或新 host 出现 Heartbeat Timeout / ABANDON",
+      "timeout_s": 1800,
+      "cleanup": "删除本检查创建的测试租户,按创建时记录的确切 id 逐个删,不用前缀 glob"
+    },
+    {
+      "id": "ver-482",
+      "fix_id": "fix-482",
+      "phase": "A-readonly",
+      "action": "rebuild 缺省 image_channel=live,空槽位 fail-closed — 不传 image_channel 调 rebuild;再对一个空 canary 槽的 host 调 canary",
+      "observable": "不传 image_channel 调 rebuild;再对一个空 canary 槽的 host 调 canary",
+      "pass_when": "缺省走 live;空槽位返回明确错误而非静默降级",
+      "fail_when": "缺省不是 live,或空槽位被静默接受",
+      "timeout_s": 300,
+      "cleanup": "删除本检查创建的测试租户,按创建时记录的确切 id 逐个删,不用前缀 glob"
+    },
+    {
+      "id": "ver-485",
+      "fix_id": "fix-485",
+      "phase": "A-readonly",
+      "action": "reset 的 client_token 真正被读到,重复提交收敛到同一 op — 用同一 client_token 连续两次 POST /tenants/{id}/reset",
+      "observable": "用同一 client_token 连续两次 POST /tenants/{id}/reset",
+      "pass_when": "第二次命中幂等记录,返回同一 op 身份,不产生第二次 reset 副作用",
+      "fail_when": "两次都执行了 reset(client_token 仍未被读)",
+      "timeout_s": 300,
+      "cleanup": "删除本检查创建的测试租户,按创建时记录的确切 id 逐个删,不用前缀 glob"
+    },
+    {
+      "id": "ver-488",
+      "fix_id": "fix-488",
+      "phase": "A-readonly",
+      "action": "preflight 门可被调用且示例配置不再自相矛盾 — bash scripts/preflight-check.sh <region>",
+      "observable": "bash scripts/preflight-check.sh <region>",
+      "pass_when": "退出码 0 或给出明确 _block 原因;min_capacity/lifecycle_hook_timeout 的门与示例值一致",
+      "fail_when": "脚本报示例配置自相矛盾,或门从未被调用",
+      "timeout_s": 300,
+      "cleanup": "删除本检查创建的测试租户,按创建时记录的确切 id 逐个删,不用前缀 glob"
+    },
+    {
+      "id": "ver-495",
+      "fix_id": "fix-495",
+      "phase": "A-readonly",
+      "action": "全新表场景下 tenant-query GSI 门不再误拦 — 在 tenant-query 表不存在的环境跑 scripts/checks/tenant-query-rollout.py",
+      "observable": "在 tenant-query 表不存在的环境跑 scripts/checks/tenant-query-rollout.py",
+      "pass_when": "输出 'does not exist yet; CFN creates it with all GSIs at once' 且退出 0",
+      "fail_when": "报 'at most one GSI' 并非零退出(即一键部署仍被堵)",
+      "timeout_s": 300,
+      "cleanup": "删除本检查创建的测试租户,按创建时记录的确切 id 逐个删,不用前缀 glob"
+    }
+  ]
+}

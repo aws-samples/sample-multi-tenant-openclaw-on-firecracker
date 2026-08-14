@@ -87,7 +87,7 @@ deploy/packer/assert-parity.sh
 不比对 AMI 块设备（其内容会因时间戳与日志而不同），而比对**决定镜像内容的输入**：
 两侧执行同一份脚本、`recipe_version` 取值一致、EBS/IMDS/parent-AMI 参数逐项对应、
 Packer 已复刻 Image Builder 的 validate 断言、SSM 分发已实现、pipefail 内联块均声明
-bash shebang、AMI 字段为纯 ASCII。共 22 项检查，任一项漂移则退出码 1。
+bash shebang、AMI 字段为纯 ASCII。共 26 项检查，任一项漂移则退出码 1。
 
 任一侧变更后均需执行。该脚本检查的正是双轨维护最易失效的位置。
 
@@ -176,7 +176,58 @@ skipping component install`，且 `host_vm_key` 生成于启动时刻而非构�
    `Script exited with non-zero exit status: 2`，无法看出是断言自身失败。修复：改用
    `find`（无匹配时返回 0 且输出为空）。已复核断言体内其余命令替换均无此风险。
 
-三项均已加入 `assert-parity.sh` 作为静态检查（当前共 22 项）。
+三项均已加入 `assert-parity.sh` 作为静态检查（当前共 26 项）。
+
+## 两阶段断言：存在性 vs 不变性
+
+`assert-image.sh` 在两个时机各跑一次，但**判据不同** —— 这是独立评审的核心 finding
+带来的设计：
+
+| 阶段 | 判据 |
+|---|---|
+| `post-provision` | 存在性（组件齐、身份已擦净），并把关键项指纹存档到 `/opt/openclaw/.image-fingerprint` |
+| `post-rerun` | 存在性 + **不变性**（与存档逐行 diff） |
+
+为什么必须比不变性：存在性检查通不过幂等这道题。重跑把 Fluent Bit 卸了重装、把 ADOT
+换个版本、把 baked vmlinux 替换掉，文件仍然"存在"，断言照样绿 —— 而幂等的定义是
+**最终状态不变**，不是"东西还在"。
+
+指纹用内容摘要而非"有没有执行动作"：重装同一个 deb 产出相同字节，那本身就是幂等的，
+不该报警；真换了版本或重新编译，摘要会变，必须报警。刻意排除 marker 的
+`provisioned_at`（时间戳每次 provision 合法地会变），其余 marker 字段全纳入。
+
+`post-rerun` 阶段找不到存档时 **fail loud** 而不是跳过比对 —— 静默跳过等于悄悄丢掉
+整条幂等断言。
+
+## 断言逻辑有可执行测试，不只是静态门
+
+`tests/test_477_assert_image_behavior.py`（31 项）真正**执行** `assert-image.sh`，
+喂它一个假的根文件系统（`dpkg`/`systemctl` 用 stub，`aws` 按真机布局造完整 symlink
+链 `PATH aws → <root>/bin/aws → ../dist/aws`，`dist` 下除入口外还有 `.so` 与数据
+文件）。这两处细节都是承重的：放普通文件会让解引用逻辑没被执行到，`dist` 里只有入口
+则"非入口文件变更"的用例无从构造。`assert-parity.sh` 是 grep 门 —— 它证明"某个字符串
+在文件里"，不证明"这段逻辑真会失败"；两者合起来才是完整覆盖。
+
+覆盖含 10 个参数化的非幂等变更（Fluent Bit 重装、guest kernel 替换、firecracker 换版、
+ADOT 升级、SSM unit 移除、marker recipe 变更、aws 升级、aws 入口同版本换字节、
+**bundle 里的 `.so` 或数据文件变更而入口与版本串都不变**），每个都必须报
+`NOT IDEMPOTENT` 并打印漂移项；外加只有时间戳变时必须仍过、失败聚合、顺序守卫、
+全部五条跨租户泄漏路径各一个用例，以及 `ls <glob>` 提前退出那个 bug 的回归。
+
+验红是分机制独立做的，不是笼统跑一遍：
+
+| 抽掉什么 | 转红 |
+|---|---|
+| `post-rerun` 的 diff（恒判 unchanged） | 10 项非幂等用例全红 |
+| `sha256tree.aws` 退化为只摘入口 | 两个非入口 bundle 用例（`.so` 与数据文件） |
+| `sha256tree.aws` 整条移除 | aws 入口同版本换字节用例 + 指纹内容断言 |
+| 任一条泄漏路径检查 | 该路径对应的那一个用例 |
+
+`aws` 的两个指纹信号分工不同：`sha256tree.aws` 是判非幂等的那一个 —— 摘整棵 bundle 树，
+因为 aws v2 是 PyInstaller bundle，入口只是 `dist` 下的一个文件，只摘入口时改动任一
+非入口文件仍是假绿。成本实测（awscli 2.34.37，173 MB / 9351 文件）完整树摘要 **2.7 秒**。
+布局不认识时退回只摘入口并把值标成 `ENTRYONLY:`，不静默降级。`version.aws` 对"抓到
+变化"是冗余的，留着是为了可诊断 —— diff 直接读出 `2.15.0 → 2.99.0`，纯哈希只能说"变了"。
 
 ## 未覆盖项（明确声明）
 

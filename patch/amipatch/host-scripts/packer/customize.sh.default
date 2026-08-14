@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# customize.sh.default — 未指定 custom_script 时使用的无操作占位脚本。
+#
+# 为什么需要它:packer 的 provisioner 不支持条件块(dynamic block 在 provisioner 上
+# 不可用,only/except 只能选 source),而 file provisioner 拿到空路径会直接报错。
+# 用一个无操作默认值,自定义阶段就永远是同一条代码路径 —— 有客户脚本时执行客户脚本,
+# 没有时执行本文件。这比在 HCL 里维护两套分支可靠。
+#
+# 客户不应修改本文件。要添加自定义步骤,复制 customize.sh.example 另存,
+# 并在 pkrvars 里设 custom_script 指向它。
+
+set -euo pipefail
+echo "[oc:customize] no custom_script configured; skipping the customization stage"

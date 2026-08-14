@@ -609,6 +609,11 @@ chmod +x /home/ubuntu/rebuild-vm.sh && chown ubuntu:ubuntu /home/ubuntu/rebuild-
 aws s3 cp s3://${ASSETS_BUCKET}/deployment/scripts/reset-vm.sh /home/ubuntu/reset-vm.sh --region ${REGION} --no-progress 2>/dev/null || \
   _s3_get s3://${ASSETS_BUCKET}/deployment/scripts/reset-vm.sh /home/ubuntu/reset-vm.sh
 chmod +x /home/ubuntu/reset-vm.sh && chown ubuntu:ubuntu /home/ubuntu/reset-vm.sh
+# 拉取(不带 `|| true`):拉不到就让 host 起不来,而不是悄悄少一个文件、等到 DELETE 时
+# live migration 端到端静默失效)。
+aws s3 cp s3://${ASSETS_BUCKET}/deployment/scripts/delete-vm.sh /home/ubuntu/delete-vm.sh --region ${REGION} --no-progress 2>/dev/null || \
+  _s3_get s3://${ASSETS_BUCKET}/deployment/scripts/delete-vm.sh /home/ubuntu/delete-vm.sh
+chmod +x /home/ubuntu/delete-vm.sh && chown ubuntu:ubuntu /home/ubuntu/delete-vm.sh
 # the matching API hits a missing /home/ubuntu/*.sh and fails exit 127.
 # start-all-vms / stop-all-vms — host-local fan-out for the 1-minute fleet
 # power goal: control plane sends ONE SSM per host, host starts/stops all its

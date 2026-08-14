@@ -39,8 +39,8 @@ done
 # These values identify CDK asset bundles and therefore name S3 prefixes. They are
 # not hashes of init-host.sh, whose independent byte digest is checked separately.
 BASE_ASSET_BUNDLE_PREFIX=dea0bd3d54ac88764319c07b1b546df952e8e828f7f3aba0d18866160ee2d046
-ASSET_BUNDLE_PREFIX=938e619b7c6e1b292733e9161d3f0b71603aa32f4930e15db9d551624bc72d90
-ARTIFACT_SHA256=744793b0fcb1d0e8df650aa747c22cc733939e16cce0f805e7a9f0022e761d17
+ASSET_BUNDLE_PREFIX=f6e72b08706d1e01503d4cd738f4a7af1840bdcfedb3878d38b10a3123d1c1f2
+ARTIFACT_SHA256=ef0fbf78501b0bb07e7968146d987078c25baf850ea0f208fb877a45c5779cd2
 HOOK_NAME=openclaw-host-init
 NEW_TIMEOUT=3600
 STATE="${KITDIR}/.restorepatch-state.json"

@@ -772,67 +772,13 @@ def _resolve_injection_plan(
 
 
 def _phys_tap_occupied(host_id, phys_num, exclude_id=None):
-    """#208 — target host 上物理 tap-vm{phys_num} 是否已被别的租户占用?
+    """#491 —— 实现已搬到 core.scheduling.phys_tap_occupied,供队列 dispatch 路径共用。
 
-    "物理占用"= 某租户当前活在 host_id 上、且它 microVM 实际挂的 tap-vm 号 == phys_num。
-    物理 tap 号的权威是 **phys_vm_num**(创建时写,迁移不改;host-agent 从 vm.json 回填
-    历史/迁移前建的租户)。老租户可能还没回填 phys_vm_num → 回退到 vm_num:对**从未迁移**
-    的租户 vm_num == 物理 tap 号,判定正确;迁移过的租户在回填前是残余盲区(见 MR 描述
-    "已知残余"),host-agent 一个 tick 内即回填补齐。
-
-    覆盖两个来源(与原 #208 双 scan 同构,只把 key 从 vm_num 换成物理 tap 号):
-      ① 已驻留 host_id 的租户(host_id=:h, 非 deleted)
-      ② 正在迁入 host_id 的租户(migration_target=:h, status=migrating)——它一旦 restore
-         成功就会在本 host 挂 tap-vm{它的 phys_vm_num},必须提前算进占用。
-    任一命中即占用。fail-closed:scan 异常时当作"已占"(宁可让调用方重试/换号,不放行撞号)。
-    exclude_id:排除租户自身(重入/自迁移场景不算撞自己)。
+    本名保留:同步 create(:1868)、另一放置路径(:3203)、migrate 目标(:4428)三处调用点
+    与既有测试(tests/test_208_tap_collision_adversarial.py)都按这个名字引用,
+    连带改名会把「机械搬迁」和「行为变更」混进同一个 diff。
     """
-    try:
-        n = int(phys_num)
-    except (TypeError, ValueError):
-        return True  # 号非法 → fail-closed
-    try:
-        for expr, extra in (
-            ("host_id = :h AND #s <> :d", {":d": "deleted"}),
-            ("migration_target = :h AND #s = :mig", {":mig": "migrating"}),
-        ):
-            vals = {":h": host_id}
-            vals.update(extra)
-            # scan(FilterExpression) **分页**:每页最多扫 1MB 就返回 + LastEvaluatedKey。
-            # 命中的迁入租户可能落在后页,不翻页会漏判 → fail-open 重开这个安全洞。故必须
-            # 循环 ExclusiveStartKey 翻完(找到即短路返回 True,不必扫全表)。
-            start_key = None
-            while True:
-                kw = {
-                    "FilterExpression": expr,
-                    "ExpressionAttributeNames": {"#s": "status"},
-                    "ExpressionAttributeValues": vals,
-                    # 物理 tap 号 = phys_vm_num,回退 vm_num(未回填的非迁移租户二者相等)。
-                    # ProjectionExpression 只取判定所需字段,少读带宽。
-                    "ProjectionExpression": "id, vm_num, phys_vm_num",
-                    "ConsistentRead": True,
-                }
-                if start_key:
-                    kw["ExclusiveStartKey"] = start_key
-                resp = clients.tenants_table.scan(**kw)
-                for it in resp.get("Items", []):
-                    if exclude_id and it.get("id") == exclude_id:
-                        continue
-                    phys = it.get("phys_vm_num", it.get("vm_num"))
-                    try:
-                        if int(phys) == n:
-                            return True
-                    except (TypeError, ValueError):
-                        continue
-                start_key = resp.get("LastEvaluatedKey")
-                if not start_key:
-                    break
-        return False
-    except Exception as e:  # noqa: BLE001 — fail-closed,不能因 scan 抖动放行撞号
-        print(
-            f"_phys_tap_occupied({host_id},{phys_num}) scan failed → fail-closed: {e}"
-        )
-        return True
+    return scheduling.phys_tap_occupied(host_id, phys_num, exclude_id=exclude_id)
 
 
 def _persist_tenant_record(item, tenant_id):
@@ -1709,6 +1655,11 @@ def create_tenant(body=None, event=None):
         """Atomically claim a vm_num + capacity on host h. Returns the claimed
         vm_num, or None if h no longer has capacity / lost the CAS race."""
         expected = int(h.get("next_vm_num", 1))
+        target, occupied = scheduling.next_free_phys_num(
+            h["instance_id"], expected, exclude_ids={tenant_id}
+        )
+        if occupied is None or target is None:
+            return None
         # 会让"选得中、订不上":_find_host 按 per-family 判定还有容量并选中该 host,
         # CAS 却按更小的全局 allocatable 恒拒 → 8 次重试全废在同一批 host 上 → 503
         # "slot allocation contended out",而低优先级 host 明明空着(apse1 2026-08-11 实撞:
@@ -1725,16 +1676,18 @@ def create_tenant(body=None, event=None):
         # _get_specific_host_with_capacity 就被挡),故只剩这一条正常路径。
         _set_expr = (
             "SET used_vcpu = used_vcpu + :v, used_mem_mb = used_mem_mb + :m, "
-            "vm_count = vm_count + :one, next_vm_num = next_vm_num + :one, "
+            "vm_count = vm_count + :one, next_vm_num = :next_after, #ps = :tid, "
             "#s = :a REMOVE idle_since"
         )
-        _names = {"#s": "status"}
+        _names = {"#s": "status", "#ps": scheduling.phys_slot_attr(target)}
         _vals = {
             ":v": vcpu,
             ":m": mem_mb,
             ":one": 1,
             ":a": "active",
+            ":tid": tenant_id,
             ":expected": expected,
+            ":next_after": target + 1,
             ":cap_v": cap_v,
             ":cap_m": cap_m,
         }
@@ -1744,7 +1697,7 @@ def create_tenant(body=None, event=None):
                 UpdateExpression=_set_expr,
                 ConditionExpression=(
                     "next_vm_num = :expected AND used_vcpu <= :cap_v "
-                    "AND used_mem_mb <= :cap_m"
+                    "AND used_mem_mb <= :cap_m AND attribute_not_exists(#ps)"
                 ),
                 ExpressionAttributeValues=_vals,
                 ReturnValues="UPDATED_NEW",
@@ -1752,8 +1705,11 @@ def create_tenant(body=None, event=None):
             if _names:
                 _kwargs["ExpressionAttributeNames"] = _names
             r = clients.hosts_table.update_item(**_kwargs)
-            # next_vm_num was incremented; the slot we claimed is the pre-increment value.
-            return int(r["Attributes"]["next_vm_num"]) - 1
+            # CAS 返回的 next_vm_num - 1 与预先算出的 target 恒等；缺 Attributes 时回退 target。
+            try:
+                return int(r["Attributes"]["next_vm_num"]) - 1
+            except (KeyError, TypeError, ValueError):
+                return target
         except ClientError as e:
             if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
                 return None
@@ -1804,7 +1760,9 @@ def create_tenant(body=None, event=None):
         if not _phys_tap_occupied(host["instance_id"], vm_num, exclude_id=tenant_id):
             break
         # 该号的物理 tap 已被某迁入租户占用 —— 归还容量记账、丢弃此号,认领下一个。
-        scheduling._release_slot(host["instance_id"], vcpu, mem_mb)
+        scheduling._release_slot(
+            host["instance_id"], vcpu, mem_mb, vm_num, tenant_id
+        )
         claimed = _reserve_slot(host)
         if claimed is None:
             inflight_dedup.release_inflight_lock(owner_id, tenant_user_id)
@@ -1815,7 +1773,9 @@ def create_tenant(body=None, event=None):
         vm_num = claimed
     else:
         # 连续 64 个号都撞物理 tap —— 极端异常(host 上迁入租户密集),fail-closed。
-        scheduling._release_slot(host["instance_id"], vcpu, mem_mb)
+        scheduling._release_slot(
+            host["instance_id"], vcpu, mem_mb, vm_num, tenant_id
+        )
         inflight_dedup.release_inflight_lock(owner_id, tenant_user_id)
         return utils._resp(
             503,
@@ -1840,7 +1800,9 @@ def create_tenant(body=None, event=None):
             )
         )
         if _pin_code:
-            scheduling._release_slot(host["instance_id"], vcpu, mem_mb)
+            scheduling._release_slot(
+                host["instance_id"], vcpu, mem_mb, vm_num, tenant_id
+            )
             inflight_dedup.release_inflight_lock(owner_id, tenant_user_id)
             return utils._resp(
                 400 if _pin_code == "VALIDATION" else 409,
@@ -1928,7 +1890,9 @@ def create_tenant(body=None, event=None):
     # (不预序列化;resource client 已挂序列化 transform,预序列化会二次包裹 → Type mismatch)。
     _persist_err = _persist_tenant_record(item, tenant_id)
     if _persist_err is not None:
-        scheduling._release_slot(host["instance_id"], vcpu, mem_mb)
+        scheduling._release_slot(
+            host["instance_id"], vcpu, mem_mb, vm_num, tenant_id
+        )
         return _persist_err
 
     # both deployed). Enables control-plane reveal (GET /tenants/{id}/token) and
@@ -1947,7 +1911,9 @@ def create_tenant(body=None, event=None):
         except Exception as e:  # noqa: BLE001 — rollback path, then propagate as 502
             print(f"[#187] mint_gateway_token failed: {type(e).__name__}: {e}")
             _cleanup_gateway_token_secret(tenant_id)  # in case partial write landed
-            scheduling._release_slot(host["instance_id"], vcpu, mem_mb)
+            scheduling._release_slot(
+                host["instance_id"], vcpu, mem_mb, vm_num, tenant_id
+            )
             clients.tenants_table.update_item(
                 Key={"id": tenant_id},
                 UpdateExpression="SET #s = :s, updated_at = :t",
@@ -1995,10 +1961,8 @@ def create_tenant(body=None, event=None):
         )
         if not ssm_dispatch._ssm_run(host["instance_id"], clone_cmd, timeout=180):
             # Roll back: undo the host counter increment + delete tenant row
-            clients.hosts_table.update_item(
-                Key={"instance_id": host["instance_id"]},
-                UpdateExpression="SET used_vcpu = used_vcpu - :v, used_mem_mb = used_mem_mb - :m, vm_count = vm_count - :one",
-                ExpressionAttributeValues={":v": vcpu, ":m": mem_mb, ":one": 1},
+            scheduling._release_slot(
+                host["instance_id"], vcpu, mem_mb, vm_num, tenant_id
             )
             clients.tenants_table.update_item(
                 Key={"id": tenant_id},
@@ -2038,7 +2002,9 @@ def create_tenant(body=None, event=None):
     # caller retries — and the SQS consumer re-queues the create with backoff
     # (see _consume_lifecycle_sqs: code>=500 → batchItemFailures → SQS redrive).
     if launch_cmd_id is None:
-        scheduling._release_slot(host["instance_id"], vcpu, mem_mb)
+        scheduling._release_slot(
+            host["instance_id"], vcpu, mem_mb, vm_num, tenant_id
+        )
         clients.tenants_table.update_item(
             Key={"id": tenant_id},
             UpdateExpression="SET #s = :s, updated_at = :t",
@@ -2494,20 +2460,42 @@ def _delete_tenant_inner(tenant_id, query_params, event=None, _lifecycle_ctx=Non
             },
         )
 
-    # 首次 delete 干净翻 running→deleting 后,若令牌释放/后续步骤遇瞬时错误留 deleting,
-    # consumer replay 会再进来:此时 rm 数据盘可能已跑、盘已没,再跑 pre-delete backup 必失败
-    # (backup 打已删目录)→ fail-closed 502 → 永远到不了令牌释放 → 令牌+容量永久搁浅。
-    # 但【绝不能】仅凭"状态是 deleting"就跳过 backup:CAS 翻 deleting 先于 backup,一个在 backup
-    # 数据丢失)。故用【持久标记】判据:backup 成功后写 predelete_backup_at;仅当该标记存在(证明
-    # backup 确已成功)才跳过。无标记 = 销毁前置未完成 = 盘还在 → 照常 backup(重跑幂等:同一
-    # tenant 覆盖同一 S3 key)。
-    _backup_done = bool(fresh.get("predelete_backup_at"))
-    _backup_performed = False
-    if host_id and not keep_data and not skip_backup and not _backup_done:
+    # 要同时关住的两个方向:
+    #  · 首次 delete 干净翻 running→deleting 后,若后续步骤遇瞬时错误留 deleting,consumer
+    #    replay 会再进来:此时 rm 数据盘可能已跑、盘已没,再跑 pre-delete backup 必失败
+    #    (backup 打已删目录)→ 若 fail-closed 就永远到不了令牌释放 → 容量永久搁浅。
+    #  · 反向也【绝不能】仅凭"状态是 deleting"就跳过 backup:CAS 翻 deleting 先于 backup,
+    #    一个在 backup【之前】崩溃的首次 delete 也留 deleting、盘仍在且从未备份——盲跳过
+    # 原判据是"marker 存在 ⇒ 跳过备份"。原来 marker 写在 stop-vm 成功【之后】,故它
+    # 蕴含"VM 已停 ⇒ 不可能有晚于备份的新写入",跳过是安全的。原子化把 stop 与 rm -rf
+    # 合进同一条 SSM,那个中间点没了(见下方 marker 段的说明),marker 只能提前到破坏性
+    # 动作【之前】写 —— 此时 VM 仍在跑。于是出现一个真实的丢数据窗口:
+    #   marker 落库 → VM 继续接受并 ack 新写入 → Lambda 崩溃 → 重投凭 marker 跳过备份
+    # 修正:重投【照常重跑】备份(同一 tenant 覆盖同一 S3 key,幂等),只在备份失败且
+    # 失败原因是【盘已经不在】时才放行继续删。盘不在 = 上一次尝试的 rm -rf 已跑完 =
+    # 已无数据可丢,此时若也 fail-closed 就成死局(令牌永不释放、容量永久搁浅)。
+    # 这样两个方向都关住:盘还在 → 一定重新备份(不丢增量);盘已没 → 放行(不死锁)。
+    # marker 从"跳过备份的凭据"降级为"仅供审计/排障的时间戳",不再参与控制流。
+    #
+    # ── 还有一个【上游既有】的窗口,本轮一并关掉(codex 独立复审)──────────────
+    # backup-data.sh 压缩完会把 VM 【resume】(:79 与 trap cleanup:36),而控制面随后还要
+    # 写 marker、发 SSM,这几秒里 VM 在跑、可以 ack 新写入 —— 那批写入进不了刚才那份
+    # 备份,却会随 rm -rf 一起消失。原子化前也是这样(上游注释即写明"backup-data.sh 在
+    # 压缩后会恢复 VM"),不是本改动引入,但既然 delete 收尾已经变成 host 侧一条脚本,
+    # 就有了干净的关法:让脚本在【停机之后】再补一次【静止盘】备份(参数 7)。
+    # 此刻盘不可能再被写,那份产物就是删盘前的最终状态。S3 key 按时间戳命名 = 追加而非
+    # 覆盖,前一份仍可用。只有真做了 pre-delete backup 的这条路径才要求它(下面这个标志)。
+    _want_quiesced_backup = False
+    if host_id and not keep_data and not skip_backup:
         # 强制备份 fail-closed(共用 _force_backup_sync,与 rebuild 降级同一份经验证的
         # 双层校验)。失败 → 回滚 status(_abort_restore_status,CAS 只回滚自己翻的
         _ok, _err = _force_backup_sync(tenant_id)
-        if not _ok:
+        # 哨兵由 backup-data.sh 在 `[ ! -f data.ext4 ]` 分支打出,经 backup Lambda 的
+        # result["error"] = <SSM 输出> 原样透传上来。用固定串而非 grep "not found":
+        # 后者太脆(路径本身、其它步骤的报错都可能含该词),误判会跳过一次【本该做】的
+        # 备份然后删盘。
+        _source_absent = bool(_err) and "OC_BACKUP_SOURCE_ABSENT" in _err
+        if not _ok and not _source_absent:
             _abort_restore_status()
             return utils._resp(
                 502,
@@ -2518,43 +2506,46 @@ def _delete_tenant_inner(tenant_id, query_params, event=None, _lifecycle_ctx=Non
                     "backup_error": _err,
                 },
             )
-        _backup_performed = True
-    if host_id:
-        # Stop VM via SSM.
-        # 占内存/vCPU)+ 若继续标 deleted 则账本回退但 VM 没停(容量统计失真)。真机实测
-        # CommandWorkersLimit=5,delete 的 stop-vm 排队 >30s → _ssm_run 返 False,旧代码
-        # 忽略返回值照常标 deleted → 236 残留目录 + 27 孤儿 fc。这里 fail-loud:stop-vm
-        # 失败则回滚 status 到删除前(复用 _abort_restore_status,CAS 保证只回滚自己翻的
-        # 是 running→CAS 重新翻 deleting→重试 stop(幂等:已停的 VM 再停无害)。best-effort
-        # 的 iptables/route(下方)失败仍容忍,有 host-agent orphan-reap 兜底。
-        # 不用 CAS 前的陈旧 item:reserve/delete 竞态下 host_id 从 fresh 拿了、vm_num 却用陈旧值,
-        # 会 stop/摘 DNAT 到【别的租户】的 tap-vm<n>(no-cross-tenant 违规)。三者同源一致。
-        vm_num = int(fresh.get("vm_num", 1))
-        if not ssm_dispatch._ssm_run(
-            host_id,
-            f"{delete_host_guard} && /home/ubuntu/stop-vm.sh "
-            f"{shlex.quote(tenant_id)} {vm_num} && {delete_host_guard}",
-        ):
-            _abort_restore_status()
-            return utils._resp(
-                502,
-                {
-                    "error": "stop-vm failed (SSM timeout/error); aborting delete to "
-                    "avoid a stranded VM + disk leak. Retry — delete via the lifecycle "
-                    "queue re-drives automatically.",
-                    "id": tenant_id,
-                },
+        if _source_absent:
+            # 盘已不在:上一次尝试已过 rm -rf。继续走完剩余收尾(路由/账本/状态),
+            # 让租户能收敛到 deleted、令牌得以释放。脚本每步对已完成都幂等。
+            # 也【不必】再要求静止盘补备份:没有盘可备,脚本那侧同样会跳过。
+            print(
+                f"delete_tenant #469: data disk already absent for {tenant_id} "
+                f"(a prior attempt completed rm -rf); skipping pre-delete backup "
+                f"and continuing cleanup so the capacity token is not stranded. "
+                f"backup_error={_err}"
             )
-        # 若先写 marker、随后进程在 stop 前崩溃，VM 仍可产生晚于备份的新数据，而重放会
-        # 因 marker 跳过备份并删盘。停机后再写可证明 marker 之后没有新写入。
-        # marker 是重放安全的必要状态，不是 best-effort 优化：写失败时盘仍在、VM 已停，
-        # 保留 deleting 并返回 502；重放会重新备份这个静止盘，再尝试落 marker。
-        if _backup_performed:
+        else:
+            # 备份真做成了 ⇒ 盘还在、且 backup-data.sh 已把 VM resume 回去。要求脚本在
+            # 停机后补一份静止盘备份,把这段 resume 窗口里的写入收进去(见上方说明)。
+            _want_quiesced_backup = True
+        # 历史:原来 marker 写在 "stop-vm 成功之后、rm -rf 之前",蕴含"VM 已停 ⇒ 备份后
+        # 无新写入",故可当"重投跳过备份"的凭据。原子化把 stop 与 rm -rf 合进同一条 SSM,
+        # 那个中间点消失;marker 只能提前到破坏性动作之前写,于是它【不再】蕴含 VM 已停,
+        # 拿它当跳过凭据会丢掉"marker 落库后 VM 又 ack 的增量"(codex blocker #1)。
+        # 现在跳过备份的判据改成上面那条"备份失败且 OC_BACKUP_SOURCE_ABSENT",marker
+        # 退化为排障用的时间戳:记录本次尝试何时完成了 pre-delete backup。
+        #
+        # 仍然保留它 + 保留写失败即中止,有两个理由:
+        #   · _abort_restore_status() 会一并 REMOVE 它(:2549),回滚后不留陈旧痕迹;
+        #   · 写不进通常意味着 fence 已易主或 DDB 异常,此时不该继续做破坏性动作。
+        #
+        # ★ 但【盘已经不在】的重投路径【不写】marker(codex 独立复审):
+        #   ① 语义上没意义 —— marker 记的是"本次尝试何时完成了 pre-delete backup",
+        #      而这条路径根本没做备份(盘都没了);
+        #   ② 更要紧的是失败处理会出错:写失败原本走 _abort_restore_status() 回滚到
+        #      running/stopped 等【活跃态】,前提是"盘与备份都完好"。盘已被上一次尝试
+        #      而且租户从 deleting 变回活跃后,容量令牌与账本也不再收敛。
+        #   故这条路径直接跳过 marker;它本来就只差"把剩余收尾做完 + 释放令牌"。
+        if not _source_absent:
             marker_ts = utils._now()
             try:
                 clients.tenants_table.update_item(
                     Key={"id": tenant_id},
                     UpdateExpression="SET predelete_backup_at = :t",
+                    # (租约易主/epoch 前进)不得写 marker,否则它会让【新】操作误判
+                    # "备份已做"而跳过 backup 直接删盘。
                     ConditionExpression=f"#s = :deleting AND {delete_condition}",
                     ExpressionAttributeNames={"#s": "status"},
                     ExpressionAttributeValues={
@@ -2565,98 +2556,124 @@ def _delete_tenant_inner(tenant_id, query_params, event=None, _lifecycle_ctx=Non
                 )
                 fresh["predelete_backup_at"] = marker_ts
             except Exception as e:  # noqa: BLE001
+                # marker 写不进 ⇒ 不敢做破坏性动作。此处盘【确实还在】(_source_absent
+                # 为假 ⇒ 备份刚刚成功 ⇒ 盘存在),故回滚到删除前状态是安全的:
+                # 盘与备份都完好,重投会重跑 backup 再试落 marker。
+                _abort_restore_status()
                 return utils._resp(
                     502,
                     {
-                        "error": "pre-delete backup marker persistence failed after "
-                        "VM stop; disk retained for safe retry",
+                        "error": "pre-delete backup marker persistence failed; aborting "
+                        "destroy while the disk is still intact. Retry.",
                         "detail": str(e),
                         "id": tenant_id,
                     },
                 )
-        # Remove vm.json so host-agent won't try to recover. Only after stop
-        # succeeded — else we'd delete the recovery marker while the VM is still
-        # running (worse: host-agent won't recover, VM stays orphaned untracked).
-        # (幽灵复活),同样回滚重投。
-        if not ssm_dispatch._ssm_run(
-            host_id,
-            f"{delete_host_guard} && rm -f "
-            f"{shlex.quote(f'/data/firecracker-vms/{tenant_id}/vm.json')} "
-            f"&& {delete_host_guard}",
-        ):
-            _abort_restore_status()
-            return utils._resp(
-                502,
-                {
-                    "error": "rm vm.json failed (SSM timeout/error); aborting delete so "
-                    "host-agent won't recover a half-deleted tenant. Retry.",
-                    "id": tenant_id,
-                },
-            )
-
     if host_id:
-        # 销毁租户 → 回收数据面路由(design decision:delete 可移除路由,stop 保留)。
-        # One host-side command owns bitmap DNAT, the historical DNAT family,
-        # quarantine, and Redis. Failure keeps the tenant retryable instead of
-        # finalizing a hidden route leak.
+        # 原来控制面逐条下发 stop-vm / rm vm.json / route_ops delete-route /
+        # touch+rm -rf 共 4 条阻塞 SSM。两个后果,均真机实证(2026-08-12 us-west-2,
+        # QPS20×10s 派发 200 个 DELETE):
+        #  ① 速率放大 4×:800 次 SendCommand / 27s ≈ 30 次/秒 → SSM 服务端
+        #     `ThrottlingException: Rate exceeded`(日志 89 次、已 reached max retries: 4),
+        #     HTTP 502 占 89.5%。把 host 的 CommandWorkersLimit 20→50 【无改善】
+        #     (89.5%→89.0%,throttle 反增到 99)——限的是控制面 API 提交速率,不是 host
+        #     执行并发。合并为 1 条把速率降到 1/4。
+        #  ② `deleting` 中间态:4 条里后 2 条落在【不可回滚区】(VM 已停,回滚成 running
+        #     会谎报已毁租户存活),任一条被限流打挂即卡住——实测 46/200 = 23% 卡 deleting。
+        #     合并后控制面只有【一个】判定点,"stop 成功但 rm 失败"对控制面不再可见。
+        # 同款"控制面一条、host 本地 fan-out"已在本仓验证(start-all-vms.sh /
+        # stop-all-vms.sh),内部标杆亦然(Lambda MicroManager,见 ADR-batch-delete-throttle §2.1)。
+        #
+        # 不用 CAS 前的陈旧 item:reserve/delete 竞态下 host_id 从 fresh 拿了、vm_num 却用陈旧值,
+        # 会 stop/摘 DNAT 到【别的租户】的 tap-vm<n>(no-cross-tenant 违规)。三者同源一致。
+        #   rc≠0 → 不推进 deleted。VM 是否已停无法从单个 rc 区分,故统一用
+        #   _mark_delete_retryable()【留 deleting】而不是 _abort_restore_status() 回 running:
+        #   回 running 的前提是"VM 确实还在跑",而原子脚本失败时 VM 可能已停(①成功②失败),
+        #   此时回 running 会谎报已停租户存活;留 deleting 则重投幂等补做剩余步骤(每步都
+        #   对已完成无害)。保守取舍:宁可多一个可重投的中间态,不要一个谎报的活跃态。
+        vm_num = int(fresh.get("vm_num", 1))
         _hp = int(fresh.get("host_port", 0) or 0)
         _gip = fresh.get("guest_ip", "")
-        _legacy_hp = clients.VM_PORT_BASE + int(fresh.get("vm_num", 1)) - 1
-        _route_cmd = (
-            f"{delete_host_guard} && {{ set -a; "
-            ". /etc/environment 2>/dev/null; "
-            ". /etc/platform.env 2>/dev/null; set +a; "
-            "python3 /opt/openclaw/route_ops.py delete-route "
-            f"{shlex.quote(tenant_id)} {_hp} {shlex.quote(_gip)} {_legacy_hp} "
-            f"; }} && {delete_host_guard}"
+        _legacy_hp = clients.VM_PORT_BASE + vm_num - 1
+        #   delete_host_guard。合并后从"4 条 × 前后 2 次 = 8 次 guard"降到 2 次,但保护
+        #   的窗口不变——前置 guard 确认本次操作仍持租约(否则 exit 79 被抢占 / exit 78
+        #   读不到 fence 时 fail-closed),后置 guard 确认整个破坏性序列期间没被抢占。
+        #   guard 里含 aws dynamodb get-item,是 shell 片段而非独立 SSM,不增加
+        #   SendCommand 次数,故不抵消本改动的限流收益。
+        # ── 部署顺序无关的自愈式装载(codex 独立复审)─────────────────────────────
+        # 问题:控制面一上线就【无条件】调 /home/ubuntu/delete-vm.sh,而这是本次【新增】
+        # 的脚本。init-host.sh 的硬失败拉取只覆盖【新起】的 host —— 已经在跑的 host 不会
+        # 重跑 init,于是"Lambda 先部署、host 脚本还没同步"这个窗口里,每次删除都 exit 127
+        # (或撞上旧版 stop-vm.sh 不认 OC_LIFECYCLE_LOCK_FD 而 15s 后锁超时 FATAL)。
+        # 光在文档里写"必须成对部署"不算保护 —— 那是把正确性寄托在人工步骤上。
+        #
+        # 解法:命令串前置一段自愈 —— 两个脚本【任一】缺失或过期就从 S3 的 deployment/
+        # scripts/ 重新拉,与 init-host.sh 同一来源、同一路径。host 本来就有该桶读权限
+        # (init-host.sh 就是这么装的),故不需要新 IAM。
+        # · 判据不只看"文件存在",还看 stop-vm.sh 是否认得 OC_LIFECYCLE_LOCK_FD ——
+        #   旧版存在但不认,那正是会 15s 锁超时的情况,必须一起换掉。
+        # · 拉取失败即 `exit 1`,让整条命令非零 → 控制面走 _mark_delete_retryable()
+        #   留 deleting 重投,绝不在"脚本可能过期"的状态下动手删盘。
+        # · 正常情况(脚本已是新版)这段只做两次 `[ -x ]` 与一次 grep,开销可忽略,
+        #   且不增加 SendCommand 次数(同一条命令内的 shell 片段)。
+        # 桶名与 region 都由 host 侧自己从 /etc/platform.env 读(init-host.sh 写的那份,
+        # launch-vm.sh / backup-data.sh 也都这么取),不从控制面拼进命令串 —— 否则
+        # Lambda 少注入一个环境变量就会拼出 `s3:///deployment/...` 这种坏 URI,
+        # 而这段代码位于删除主路径上,拼错的代价是所有删除都失败。
+        _self_heal = (
+            "if [ ! -x /home/ubuntu/delete-vm.sh ] || "
+            "! grep -q OC_LIFECYCLE_LOCK_FD /home/ubuntu/stop-vm.sh 2>/dev/null; then "
+            "echo '[oc:delete] host 脚本缺失/过期,从 S3 自愈装载'; "
+            # 不用 `. /etc/platform.env || true` —— 删除路径里【任何】`|| true` 都会被
+            # test_ADV_route_cleanup_is_not_best_effort 拦下(那条断言是对的:这条链上
+            # 静默容错等于把不可逆操作变成 best-effort)。改为先判文件存在再 source,
+            # source 失败就让整段非零退出、走重投。
+            'if [ -r /etc/platform.env ]; then set -a; . /etc/platform.env; set +a; fi; '
+            '_B="${ASSETS_BUCKET:-}"; '
+            '[ -n "$_B" ] || { echo \'[oc:delete] FATAL 读不到 ASSETS_BUCKET\'; exit 1; }; '
+            "for f in delete-vm.sh stop-vm.sh; do "
+            'aws s3 cp "s3://$_B/deployment/scripts/$f" "/tmp/oc-heal-$f" '
+            "--no-progress >/dev/null 2>&1 || "
+            "{ echo \"[oc:delete] FATAL 拉取 $f 失败\"; exit 1; }; "
+            'bash -n "/tmp/oc-heal-$f" || '
+            "{ echo \"[oc:delete] FATAL $f 语法错误,拒绝安装\"; exit 1; }; "
+            'install -o root -g root -m 755 "/tmp/oc-heal-$f" "/home/ubuntu/$f" || '
+            "{ echo \"[oc:delete] FATAL 安装 $f 失败\"; exit 1; }; "
+            "done; "
+            "echo '[oc:delete] 自愈装载完成'; "
+            "fi"
         )
-        if not ssm_dispatch._ssm_run(host_id, _route_cmd):
+        # 第 7 个参数 = 停机后补一份静止盘备份(仅当本次真做了 pre-delete backup;
+        # 见上方 `_want_quiesced_backup` 的说明)。脚本侧默认 false,少传即行为不变。
+        _del_cmd = (
+            f"{_self_heal} && {delete_host_guard} && /home/ubuntu/delete-vm.sh "
+            f"{shlex.quote(tenant_id)} {vm_num} {_hp} {shlex.quote(_gip)} "
+            f"{_legacy_hp} {'true' if keep_data else 'false'} "
+            f"{'true' if _want_quiesced_backup else 'false'} "
+            f"&& {delete_host_guard}"
+        )
+        if not ssm_dispatch._ssm_run(host_id, _del_cmd, timeout=300):
             _mark_delete_retryable()
+            print(
+                f"delete_tenant #469: atomic delete-vm.sh FAILED for {tenant_id} on "
+                f"host {host_id} (SSM timeout/throttle or script rc!=0) — keeping "
+                f"status=deleting for retry, NOT marking deleted."
+            )
             return utils._resp(
                 502,
                 {
-                    "error": "route cleanup failed (bitmap/DNAT/Redis); tenant "
-                    "remains deleting and may be retried safely.",
+                    "error": "host-side delete failed (SSM timeout/throttle or script "
+                    "error); tenant kept in deleting for safe re-drive. Retry — delete "
+                    "via the lifecycle queue re-drives automatically.",
                     "id": tenant_id,
                 },
             )
-
-        if not keep_data:
-            # 到这一步 VM 已停(stop-vm 成功),盘没删则留 deleting 中间态 + 502 fail-loud,
-            # 不推进到 deleted(避免"标 deleted 但盘还在"的静默泄漏)。delete 走队列时
-            # consumer 收 502 重投,重投时 CAS 撞 deleting → 上方 CCF 分支放行 consumer 重投
-            # 继续重试(VM 已停,补删盘幂等);账本回退在本步之后(:2020),此刻未扣,重投
-            # 成功那次才扣一次(guard 防负)。
-            # 已判定该数据盘应销毁(keep_data=false)"的 host 侧持久信号:若 rm -rf 被 SSM
-            # 中断/超时漏删,tombstone 仍在(放【VM 目录外】的平级路径 .purge-<tid>,不会被
-            # rm -rf <tid> 连带删掉,codex 复审:标记在被删目录内会随半删消失),host-agent
-            # 的 _gc_orphan_vm_dirs 下轮据此补删。keep_data=true 的软删走不到这里 → 无
-            # tombstone → GC 绝不碰其盘(no-data-loss)。
-            # 重投,杜绝"盘没写 tombstone 却已 rm"导致 GC 漏兜底;② tenant_id 经 shlex.quote 进
-            # root shell 防注入(纵深防御:tenant_id 虽已过 registry 正则,但可源自 body 的
-            # _assigned_tenant_id;正常 tid quote 后原样不变,不影响下游/测试子串匹配)。
-            _root = "/data/firecracker-vms"
-            _q_tomb = shlex.quote(f"{_root}/.purge-{tenant_id}")
-            _q_vmd = shlex.quote(f"{_root}/{tenant_id}")
-            if not ssm_dispatch._ssm_run(
-                host_id,
-                f"{delete_host_guard} && touch {_q_tomb} && "
-                f"{delete_host_guard} && rm -rf {_q_vmd} && {delete_host_guard}",
-            ):
-                _mark_delete_retryable()
-                print(
-                    f"delete_tenant #268: rm -rf data disk FAILED for {tenant_id} on "
-                    f"host {host_id} (SSM timeout/error) — VM stopped but disk leaked; "
-                    f"keeping status=deleting for retry, NOT marking deleted."
-                )
-                return utils._resp(
-                    502,
-                    {
-                        "error": "data disk rm failed (SSM timeout/error); VM is stopped "
-                        "but disk not reclaimed. Kept status=deleting for re-drive.",
-                        "id": tenant_id,
-                    },
-                )
+        #  · stop-vm.sh                          → delete-vm.sh ①
+        #  · rm -f <vmdir>/vm.json               → delete-vm.sh ②(仍在 stop 成功之后,
+        #    顺序不变:先删 vm.json 再 stop 会让 host-agent 不 recover 而 VM 仍跑 = 孤儿)
+        #  · route_ops.py delete-route           → delete-vm.sh ③
+        #    原样保留在脚本内;keep_data=true 不写 tombstone,GC 绝不碰其盘)
+        # 每步的 fail-loud 与幂等语义在脚本里逐条保留;控制面这里只判一个总 rc。
 
         # Update host counters.
         # host_id 是【一个事务】原子落库的(_reserve_batch_txn),释放也必须【令牌化】——
@@ -2726,6 +2743,10 @@ def _delete_tenant_inner(tenant_id, query_params, event=None, _lifecycle_ctx=Non
                     UpdateExpression="SET idle_since = :t",
                     ExpressionAttributeValues={":t": utils._now()},
                 )
+        # 容量令牌只有 consumed/already 才走到这里；RETRY 已提前返回并保留占号。
+        phys_num = fresh.get("phys_vm_num", fresh.get("vm_num"))
+        if phys_num is not None:
+            scheduling.release_phys_slot(host_id, phys_num, tenant_id)
 
     # Go-live C: reclaim the per-tenant LiteLLM vkey so it doesn't linger in
     # LiteLLM after the tenant is gone (credential + budget leak over churn).
@@ -2966,7 +2987,13 @@ def _tenant_suspend(tenant_id, item):
 
     # 4) 释放 host slot(归还容量记账,供新用户调度——休眠的核心目的)。
     # _release_slot 内部带 >= guard 防负、best-effort 不抛;next_vm_num 不回退(restore 重分配)。
-    scheduling._release_slot(host_id, int(item.get("vcpu", 0)), int(item.get("mem_mb", 0)))
+    scheduling._release_slot(
+        host_id,
+        int(item.get("vcpu", 0)),
+        int(item.get("mem_mb", 0)),
+        item.get("phys_vm_num", vm_num),
+        tenant_id,
+    )
 
     # 4) 终态:写 restore_backup_key + suspended_at,翻 suspended。此刻 status 仍是我们翻的
     # suspending(单赢家持有),用 CAS 收尾防中途被改。backup_key 在上方停 VM/删盘之前已
@@ -3004,7 +3031,7 @@ def _tenant_suspend(tenant_id, item):
     return utils._resp(200, {"id": tenant_id, "status": "suspended"})
 
 
-def _reserve_slot_on(host, vcpu, mem_mb):
+def _reserve_slot_on(host, vcpu, mem_mb, tenant_id):
     """#422 — 在 host 上原子认领 vm_num + 容量(CAS)。返回认领的 vm_num,或 None(容量不足/
     输 CAS 竞争)。与 create 路径的内层 `_reserve_slot`(:1642)、migrate 的
     `_reserve_migration_slot`(:2408)同款 CAS,为 restore 路径抽出模块级版本(本仓既有模式:
@@ -3020,6 +3047,11 @@ def _reserve_slot_on(host, vcpu, mem_mb):
     ):
         return None
     expected = int(host.get("next_vm_num", 1))
+    target, occupied = scheduling.next_free_phys_num(
+        host["instance_id"], expected, exclude_ids={tenant_id}
+    )
+    if occupied is None or target is None:
+        return None
     _cpu_r, _mem_r = host_profile.ratios(
         host,
         (clients.CPU_OVERCOMMIT_RATIO, clients.MEM_OVERCOMMIT_RATIO),
@@ -3032,20 +3064,28 @@ def _reserve_slot_on(host, vcpu, mem_mb):
             Key={"instance_id": host["instance_id"]},
             UpdateExpression=(
                 "SET used_vcpu = used_vcpu + :v, used_mem_mb = used_mem_mb + :m, "
-                "vm_count = vm_count + :one, next_vm_num = next_vm_num + :one, "
+                "vm_count = vm_count + :one, next_vm_num = :next_after, #ps = :tid, "
                 "#s = :a REMOVE idle_since"
             ),
             ConditionExpression=(
-                "next_vm_num = :expected AND used_vcpu <= :cap_v AND used_mem_mb <= :cap_m"
+                "next_vm_num = :expected AND used_vcpu <= :cap_v "
+                "AND used_mem_mb <= :cap_m AND attribute_not_exists(#ps)"
             ),
-            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeNames={
+                "#s": "status",
+                "#ps": scheduling.phys_slot_attr(target),
+            },
             ExpressionAttributeValues={
                 ":v": vcpu, ":m": mem_mb, ":one": 1, ":a": "active",
-                ":expected": expected, ":cap_v": cap_v, ":cap_m": cap_m,
+                ":tid": tenant_id, ":expected": expected,
+                ":next_after": target + 1, ":cap_v": cap_v, ":cap_m": cap_m,
             },
             ReturnValues="UPDATED_NEW",
         )
-        return int(r["Attributes"]["next_vm_num"]) - 1
+        try:
+            return int(r["Attributes"]["next_vm_num"]) - 1
+        except (KeyError, TypeError, ValueError):
+            return target
     except ClientError as e:
         if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
             return None
@@ -3062,7 +3102,7 @@ def _restore_reserve_slot(vcpu, mem_mb, tenant_id):
         return None, utils._resp(503, {"error": "no host capacity for restore", "id": tenant_id})
     vm_num = None
     for attempt in range(8):
-        claimed = _reserve_slot_on(host, vcpu, mem_mb)
+        claimed = _reserve_slot_on(host, vcpu, mem_mb, tenant_id)
         if claimed is not None:
             vm_num = claimed
             break
@@ -3076,13 +3116,17 @@ def _restore_reserve_slot(vcpu, mem_mb, tenant_id):
     for _skip in range(64):
         if not _phys_tap_occupied(host["instance_id"], vm_num, exclude_id=tenant_id):
             break
-        scheduling._release_slot(host["instance_id"], vcpu, mem_mb)
-        claimed = _reserve_slot_on(host, vcpu, mem_mb)
+        scheduling._release_slot(
+            host["instance_id"], vcpu, mem_mb, vm_num, tenant_id
+        )
+        claimed = _reserve_slot_on(host, vcpu, mem_mb, tenant_id)
         if claimed is None:
             return None, utils._resp(503, {"error": "no free vm slot (phys tap contended)", "id": tenant_id})
         vm_num = claimed
     else:
-        scheduling._release_slot(host["instance_id"], vcpu, mem_mb)
+        scheduling._release_slot(
+            host["instance_id"], vcpu, mem_mb, vm_num, tenant_id
+        )
         return None, utils._resp(503, {"error": "unable to find free physical vm slot", "id": tenant_id})
     return host, vm_num
 
@@ -3178,7 +3222,9 @@ def _tenant_restore(tenant_id, item):
         # 真失败(rc≠0 且≠75,或 SSM 超时 rc=None):launch-vm 可能已起 VM(超时≠没起)。
         # 直接释放 slot 会留孤儿 VM。回滚前先 stop-vm 清目标(幂等),再释放 slot、回 suspended。
         ssm_dispatch._ssm_run(host["instance_id"], f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num}")
-        scheduling._release_slot(host["instance_id"], vcpu, mem_mb)
+        scheduling._release_slot(
+            host["instance_id"], vcpu, mem_mb, vm_num, tenant_id
+        )
         _cas_status(tenant_id, "restoring", "suspended")
         return utils._resp(
             502,
@@ -3212,7 +3258,9 @@ def _tenant_restore(tenant_id, item):
             },
         )
     except clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException:
-        scheduling._release_slot(host["instance_id"], vcpu, mem_mb)
+        scheduling._release_slot(
+            host["instance_id"], vcpu, mem_mb, vm_num, tenant_id
+        )
         return utils._resp(
             409,
             {
@@ -3229,7 +3277,7 @@ def _tenant_restore(tenant_id, item):
     )
 
 
-def _reserve_migration_slot(target, vcpu, mem_mb, attempts=8):
+def _reserve_migration_slot(target, vcpu, mem_mb, attempts=8, tenant_id=None):
     """#50/#172 — atomically claim a vm_num + capacity on a migration TARGET host.
 
     与 create 路径 _reserve_slot 同款 CAS,为 migrate 路径抽出。修复前 migrate 用
@@ -3261,6 +3309,13 @@ def _reserve_migration_slot(target, vcpu, mem_mb, attempts=8):
         return None
     for attempt in range(attempts):
         expected = int(h.get("next_vm_num", 1))
+        claimed_target, occupied = scheduling.next_free_phys_num(
+            instance_id,
+            expected,
+            exclude_ids={tenant_id} if tenant_id else None,
+        )
+        if occupied is None or claimed_target is None:
+            return None
         _cpu_r, _mem_r = host_profile.ratios(
             h,
             (clients.CPU_OVERCOMMIT_RATIO, clients.MEM_OVERCOMMIT_RATIO),
@@ -3273,23 +3328,31 @@ def _reserve_migration_slot(target, vcpu, mem_mb, attempts=8):
                 Key={"instance_id": instance_id},
                 UpdateExpression=(
                     "SET used_vcpu = used_vcpu + :v, used_mem_mb = used_mem_mb + :m, "
-                    "vm_count = vm_count + :one, next_vm_num = next_vm_num + :one"
+                    "vm_count = vm_count + :one, next_vm_num = :next_after, #ps = :tid"
                 ),
                 ConditionExpression=(
                     "next_vm_num = :expected AND used_vcpu <= :cap_v "
-                    "AND used_mem_mb <= :cap_m"
+                    "AND used_mem_mb <= :cap_m AND attribute_not_exists(#ps)"
                 ),
+                ExpressionAttributeNames={
+                    "#ps": scheduling.phys_slot_attr(claimed_target)
+                },
                 ExpressionAttributeValues={
                     ":v": vcpu,
                     ":m": mem_mb,
                     ":one": 1,
+                    ":tid": tenant_id or "unknown",
                     ":expected": expected,
+                    ":next_after": claimed_target + 1,
                     ":cap_v": cap_v,
                     ":cap_m": cap_m,
                 },
                 ReturnValues="UPDATED_NEW",
             )
-            return int(r["Attributes"]["next_vm_num"]) - 1
+            try:
+                return int(r["Attributes"]["next_vm_num"]) - 1
+            except (KeyError, TypeError, ValueError):
+                return claimed_target
         except ClientError as e:
             if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
                 raise
@@ -4398,7 +4461,9 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
         snap_prefix = f"migrations/{tenant_id}"
         # 同一 target 抢同一 vm_num → guest_ip/host_port 串)。占不到(target 无容量/持续
         # 输 CAS)→ fail migrate,不落 migrating 态(否则租户卡 migrating 且没抢到 slot)。
-        target_vm_num = _reserve_migration_slot(target, vcpu, mem_mb)
+        target_vm_num = _reserve_migration_slot(
+            target, vcpu, mem_mb, tenant_id=tenant_id
+        )
         if target_vm_num is None:
             return utils._resp(
                 503,
@@ -4439,7 +4504,9 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
             # 它、_rollback_migration 不会触发 → target host 的 used_vcpu/used_mem_mb/vm_count
             # 永久泄漏(2026-07-01 SSM ThrottlingException 在 380 突发下的失败模式)。必须
             # 在 502 前释放预留,镜像 create 路径的 _release_slot-on-failure(本文件 :901/960)。
-            scheduling._release_slot(target_host_id, vcpu, mem_mb)
+            scheduling._release_slot(
+                target_host_id, vcpu, mem_mb, target_vm_num, tenant_id
+            )
             return utils._resp(
                 502,
                 {
@@ -4487,7 +4554,9 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
             # The target reservation is not discoverable by the migration sweep
             # until this context write succeeds. Never leak it when the fence
             # was superseded between SSM submission and persistence.
-            scheduling._release_slot(target_host_id, vcpu, mem_mb)
+            scheduling._release_slot(
+                target_host_id, vcpu, mem_mb, target_vm_num, tenant_id
+            )
             if lifecycle_fence._is_ccf(exc):
                 return utils._resp(
                     409,

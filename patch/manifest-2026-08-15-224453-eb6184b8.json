@@ -1,0 +1,35 @@
+{
+  "synced_at": "2026-08-15 22:44:53 UTC+08:00",
+  "base_sha": "4166b320efc249d7f5dbf80dfccac6096b904304",
+  "source_commit": "eb6184b88c61b45ec5a1f69c4557e4b807340e4c",
+  "commit_count": 6,
+  "file_count": 1,
+  "summary": "Sync the bb increment 4166b320..eb6184b8 to the public gateway branch. Sync-LOG only (which customer-facing files reached gateway + the issues behind them); the applyable patch kit is NOT built yet (folded_into pending).",
+  "issues_synced_note": "Index back to the issue tracker for whoever builds the patch kit: before assembling the kit, walk each issue and confirm it's covered. `title` is a ≤20-char gist only — open the issue for the full problem/fix/test. Lists only issues that touched a released file this sync.",
+  "issues_synced": [
+    {
+      "id": "#491",
+      "type": "feat",
+      "title": "test"
+    },
+    {
+      "id": "#500",
+      "type": "feat",
+      "title": "test"
+    }
+  ],
+  "needs_config_on_apply": "none detected (no config.yml key / systemd directive / DDB-TTL change in this sync)",
+  "updated_files": {
+    "lambda (update-function-code only)": [
+      {
+        "path": "deploy/lambda/health_check/handler.py",
+        "status": "modified",
+        "issues": [
+          "#491",
+          "#500"
+        ]
+      }
+    ]
+  },
+  "folded_into": "(pending) — no patch kit built for this sync yet; a later kit should cite this manifest as source-of-record and set base_sha/patch_sha. cdk deploy is FORBIDDEN on hand-modified live deployments — the kit must ship *.patched host scripts + the full lambda tree + AWS CLI for stack changes, same shape as patch/315-concurrent-dispatch-rollup/."
+}

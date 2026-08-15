@@ -63,6 +63,9 @@ AZ_UNHEALTHY_THRESHOLD_MINUTES = int(
     os.environ.get("AZ_UNHEALTHY_THRESHOLD_MINUTES", "10")
 )
 AZ_COOLDOWN_MINUTES = int(os.environ.get("AZ_COOLDOWN_MINUTES", "30"))
+# 正常 failover 自身也会处于 failover_recovering，且单次 Lambda 最长可跑到 180s。
+# 默认留 15 分钟的大余量，避免把仍在健康推进的迁移误判成悬挂并抽走它正在使用的号。
+FAILOVER_STUCK_MINUTES = int(os.environ.get("FAILOVER_STUCK_MINUTES", "15"))
 ASSETS_BUCKET = os.environ.get("ASSETS_BUCKET", "")
 # backup-data.sh:16 `BUCKET="${2:-${BACKUP_BUCKET:-${ASSETS_BUCKET}}}"` —— host 上注入了
 # BACKUP_BUCKET(WORM+CMK 专用桶)时备份就写在那儿,只读 ASSETS_BUCKET 会永远 list 空,
@@ -177,6 +180,12 @@ def lambda_handler(event, context):
         print(f"reap-phys-slots: cleaned={cleaned}")
     except Exception as e:
         print(f"reap phys-slot error (non-fatal): {e}")
+
+    try:
+        stuck_failovers = reap_stuck_failover_recovering(dry_run=False)
+        print(f"reap-failover-recovering: summary={stuck_failovers}")
+    except Exception as e:
+        print(f"reap failover-recovering error (non-fatal): {e}")
 
     # ------- AZ-level failover (1.3.0) -------
     if AZ_FAILOVER_ENABLED:
@@ -1832,6 +1841,204 @@ def reap_orphan_phys_slots(dry_run=True):
         if not start_key:
             break
     return cleaned
+
+
+def reap_stuck_failover_recovering(dry_run=True):
+    """接手超过 age-gate 仍停在 failover_recovering 的容量与物理号。"""
+    now = datetime.now(timezone.utc)
+    result = {"scanned": 0, "reaped": [], "skipped": [], "would_reap": []}
+    start_key = None
+
+    while True:
+        kwargs = {
+            "FilterExpression": "#s = :recovering",
+            "ExpressionAttributeNames": {"#s": "status"},
+            "ExpressionAttributeValues": {
+                ":recovering": "failover_recovering",
+            },
+            "ConsistentRead": True,
+        }
+        if start_key:
+            kwargs["ExclusiveStartKey"] = start_key
+        page = tenants_table.scan(**kwargs)
+        for tenant in page.get("Items", []):
+            result["scanned"] += 1
+            tenant_id = tenant.get("id", "")
+            failover_at = tenant.get("failover_at")
+            if not failover_at:
+                print(
+                    f"reap-failover-recovering skip tenant={tenant_id}: "
+                    "missing failover_at"
+                )
+                result["skipped"].append(
+                    {"tenant_id": tenant_id, "reason": "missing_failover_at"}
+                )
+                continue
+            try:
+                age_minutes = (
+                    now - datetime.fromisoformat(str(failover_at))
+                ).total_seconds() / 60
+            except (TypeError, ValueError) as e:
+                print(
+                    f"reap-failover-recovering skip tenant={tenant_id}: "
+                    f"invalid failover_at={failover_at!r} ({e})"
+                )
+                result["skipped"].append(
+                    {"tenant_id": tenant_id, "reason": "invalid_failover_at"}
+                )
+                continue
+
+            if age_minutes <= FAILOVER_STUCK_MINUTES:
+                result["skipped"].append(
+                    {"tenant_id": tenant_id, "reason": "below_age_gate"}
+                )
+                continue
+
+            reservation_id = tenant.get("failover_reservation_id")
+            if not reservation_id:
+                print(
+                    f"reap-failover-recovering skip tenant={tenant_id}: "
+                    "missing failover_reservation_id"
+                )
+                result["skipped"].append(
+                    {
+                        "tenant_id": tenant_id,
+                        "reason": "missing_failover_reservation_id",
+                    }
+                )
+                continue
+            try:
+                target_host_id, raw_vm_num, nonce = str(reservation_id).split(":")
+            except ValueError:
+                print(
+                    f"reap-failover-recovering skip tenant={tenant_id}: "
+                    f"invalid failover_reservation_id={reservation_id!r}"
+                )
+                result["skipped"].append(
+                    {
+                        "tenant_id": tenant_id,
+                        "reason": "invalid_failover_reservation_id",
+                    }
+                )
+                continue
+            if not target_host_id or not raw_vm_num or not nonce:
+                print(
+                    f"reap-failover-recovering skip tenant={tenant_id}: "
+                    f"invalid failover_reservation_id={reservation_id!r}"
+                )
+                result["skipped"].append(
+                    {
+                        "tenant_id": tenant_id,
+                        "reason": "invalid_failover_reservation_id",
+                    }
+                )
+                continue
+            try:
+                vm_num = int(raw_vm_num)
+            except ValueError:
+                print(
+                    f"reap-failover-recovering skip tenant={tenant_id}: "
+                    f"invalid vm_num={raw_vm_num!r}"
+                )
+                result["skipped"].append(
+                    {"tenant_id": tenant_id, "reason": "invalid_failover_vm_num"}
+                )
+                continue
+
+            entry = {
+                "tenant_id": tenant_id,
+                "target_host_id": target_host_id,
+                "vm_num": vm_num,
+                "age_minutes": round(age_minutes, 2),
+            }
+            if dry_run:
+                print(
+                    f"reap-failover-recovering dry-run tenant={tenant_id} "
+                    f"target={target_host_id} vm_num={vm_num} "
+                    f"age_minutes={entry['age_minutes']}"
+                )
+                result["would_reap"].append(entry)
+                continue
+
+            # 未确认 target VM 已停就归还号，下一租户可能拿到仍在运行的 VM 的 tap，
+            # 直接突破 no-cross-tenant 红线；因此必须先同步停机，确认后才释放。
+            stopped, _ = _ssm_run_capture(
+                target_host_id,
+                f"/home/ubuntu/stop-vm.sh {shlex.quote(tenant_id)} "
+                f"{shlex.quote(str(vm_num))}",
+                timeout=60,
+            )
+            if not stopped:
+                print(
+                    f"reap-failover-recovering retained tenant={tenant_id}: "
+                    "target stop unconfirmed"
+                )
+                result["skipped"].append(
+                    {"tenant_id": tenant_id, "reason": "target_stop_unconfirmed"}
+                )
+                continue
+
+            vcpu = int(tenant.get("vcpu") or 2)
+            mem_mb = int(tenant.get("mem_mb") or 4096)
+            released = _release_failover_reservation(
+                tenant_id,
+                target_host_id,
+                vm_num,
+                reservation_id,
+                vcpu,
+                mem_mb,
+            )
+            if not released:
+                print(
+                    f"reap-failover-recovering no-op tenant={tenant_id}: "
+                    "reservation already consumed or owner changed"
+                )
+                result["skipped"].append(
+                    {"tenant_id": tenant_id, "reason": "reservation_release_noop"}
+                )
+                continue
+
+            try:
+                tenants_table.update_item(
+                    Key={"id": tenant_id},
+                    UpdateExpression="SET #s = :failed, failover_error = :e",
+                    ConditionExpression="#s = :recovering",
+                    ExpressionAttributeNames={"#s": "status"},
+                    ExpressionAttributeValues={
+                        ":failed": "failover_failed",
+                        ":recovering": "failover_recovering",
+                        ":e": "stuck_in_failover_recovering_reaped",
+                    },
+                )
+            except ClientError as e:
+                code = (e.response.get("Error") or {}).get("Code")
+                if code == "ConditionalCheckFailedException":
+                    print(
+                        f"reap-failover-recovering tenant={tenant_id}: "
+                        "status advanced concurrently; not overwriting"
+                    )
+                else:
+                    print(
+                        f"reap-failover-recovering tenant={tenant_id}: "
+                        f"status update failed (non-fatal): {e}"
+                    )
+
+            result["reaped"].append(entry)
+            _emit_audit(
+                "AZ_FAILOVER_STUCK_REAPED",
+                {
+                    "tenant_id": tenant_id,
+                    "target_host_id": target_host_id,
+                    "vm_num": vm_num,
+                    "age_minutes": entry["age_minutes"],
+                },
+            )
+
+        start_key = page.get("LastEvaluatedKey")
+        if not start_key:
+            break
+
+    return result
 
 
 def _iter_phys_nums(host_id, exclude_ids=None):

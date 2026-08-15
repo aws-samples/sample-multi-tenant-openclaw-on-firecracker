@@ -1243,17 +1243,54 @@ PY
 
   say "bootstrap object present at its content-addressed key"
   expected_bootstrap_sha="$(state_get rendered_bootstrap_sha256)"
+  bootstrap_object_prefix="$(printf '%s' "$ud" \
+    | grep -oE 'deployment/bootstrap/host/[0-9a-f]{64}' | head -1 | sed 's|.*/||')"
   bootstrap_readback="$(mktemp)"
-  if aws_ s3 cp "s3://${BUCKET}/deployment/bootstrap/host/${ASSET_BUNDLE_PREFIX}/init-host.sh" \
+  bootstrap_rendered=""
+  if [ -z "$bootstrap_object_prefix" ]; then
+    echo "   FAIL cannot extract bootstrap object prefix from default LT UserData"
+    rc=1
+  elif aws_ s3 cp "s3://${BUCKET}/deployment/bootstrap/host/${bootstrap_object_prefix}/init-host.sh" \
       "$bootstrap_readback" --no-progress >/dev/null 2>&1; then
     actual_bootstrap_sha="$(sha256_file "$bootstrap_readback")"
     if [ -n "$expected_bootstrap_sha" ] && [ "$actual_bootstrap_sha" = "$expected_bootstrap_sha" ]; then
-      echo "   PASS object present sha256=$actual_bootstrap_sha"
-    elif [ -z "$expected_bootstrap_sha" ]; then
-      echo "   SKIP object present but no rendered digest is recorded"
-    else
+      echo "   PASS object present with this apply's rendered sha256=$actual_bootstrap_sha"
+    elif [ -n "$expected_bootstrap_sha" ]; then
       echo "   FAIL bootstrap sha256=$actual_bootstrap_sha expected=$expected_bootstrap_sha"
       rc=1
+    else
+      # ALREADY skips upload and digest state, so verify the live key by executable content.
+      bootstrap_rendered="$(mktemp)"
+      if ( render_bootstrap_artifact "${KITDIR}/host-scripts/init-host.sh.patched" \
+           "$bootstrap_readback" "$bootstrap_rendered" ); then
+        if python3 - "$bootstrap_readback" "$bootstrap_rendered" <<'PY'
+import pathlib
+import re
+import sys
+
+def code_only(p):
+    # compare executable content only: the publish scrub removes whole comment lines,
+    # so comments must not decide whether the environment is on a different version
+    out = []
+    for line in pathlib.Path(p).read_text(encoding="utf-8", errors="replace").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        out.append(re.sub(r"\s+", " ", s))
+    return out
+
+sys.exit(0 if code_only(sys.argv[1]) == code_only(sys.argv[2]) else 1)
+PY
+        then
+          echo "   PASS object content-equal to kit artifact at live prefix: $bootstrap_object_prefix"
+        else
+          echo "   FAIL bootstrap content differs from kit artifact at live prefix: $bootstrap_object_prefix"
+          rc=1
+        fi
+      else
+        echo "   FAIL cannot render kit bootstrap from live object at prefix: $bootstrap_object_prefix"
+        rc=1
+      fi
     fi
     # Comments retain historical placeholders, so only executable lines are gated.
     if awk '!/^[[:space:]]*#/ && /\{\{[A-Z_]+\}\}/ {found=1} END {exit found}' "$bootstrap_readback"; then
@@ -1267,6 +1304,7 @@ PY
     rc=1
   fi
   rm -f "$bootstrap_readback"
+  [ -z "$bootstrap_rendered" ] || rm -f "$bootstrap_rendered"
 
   say "openclaw-api code changed and its environment was not overwritten"
   want="$(state_get api_env_key_count)"

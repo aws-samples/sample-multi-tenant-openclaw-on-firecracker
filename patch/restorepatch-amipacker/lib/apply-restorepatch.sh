@@ -1150,6 +1150,25 @@ refresh)
     || die "refresh refused: no canary PASS record in $STATE"
   [ "$(state_get canary_lt_version)" = "$(state_get host_lt_new_version)" ] \
     || die "refresh refused: canary PASS belongs to a different LT version"
+  say "instance refresh suspended-process precheck"
+  # Suspension is intentional operator state, so refuse instead of auto-resuming it.
+  # AWS documents only Launch/Terminate/InstanceRefresh as blocking replacement;
+  # AZRebalance/ReplaceUnhealthy/HealthCheck do not, confirmed on a real ASG.
+  suspended_processes="$(aws_ autoscaling describe-auto-scaling-groups \
+    --auto-scaling-group-names "$ASG" \
+    --query 'AutoScalingGroups[0].SuspendedProcesses[].ProcessName' --output text)" \
+    || die "cannot read suspended processes for $ASG"
+  blocking_suspended=""
+  for process in $suspended_processes; do
+    case "$process" in
+      Launch|Terminate|InstanceRefresh)
+        blocking_suspended="${blocking_suspended:+${blocking_suspended} }${process}"
+        ;;
+    esac
+  done
+  [ -z "$blocking_suspended" ] \
+    || die "refresh refused: blocking suspended processes: $blocking_suspended; instance refresh would sit at Pending with 'Paused due to the following suspended processes: $blocking_suspended' and never replace an instance. Resume explicitly: aws autoscaling resume-processes --auto-scaling-group-name \"$ASG\" --scaling-processes $blocking_suspended --region \"$REGION\""
+  echo "   PASS no blocking suspended processes"
   # AWS documents min=max=100 as launch-before-terminate, one-at-a-time replacement.
   refresh_id="$(aws_ autoscaling start-instance-refresh --auto-scaling-group-name "$ASG" \
     --preferences '{"MinHealthyPercentage":100,"MaxHealthyPercentage":100,"InstanceWarmup":900,"SkipMatching":false}' \

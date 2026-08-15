@@ -562,7 +562,11 @@ resolve_bootstrap_state() {
     probe="$(mktemp -d)"
     if aws_ s3 cp "s3://${BUCKET}/deployment/bootstrap/host/${live_prefix}/init-host.sh" \
          "${probe}/live-init-host.sh" >/dev/null 2>&1; then
-      python3 - "${probe}/live-init-host.sh" "${KITDIR}/host-scripts/init-host.sh.patched" <<'PY'
+      # Compare the rendered form: {{PROVISION_SCRIPT}} is one template line but 251
+      # live lines, so raw template comparison diverges at line 69 and cannot reach ALREADY.
+      if ( render_bootstrap_artifact "${KITDIR}/host-scripts/init-host.sh.patched" \
+           "${probe}/live-init-host.sh" "${probe}/rendered-init-host.sh" ); then
+        python3 - "${probe}/live-init-host.sh" "${probe}/rendered-init-host.sh" <<'PY'
 import pathlib
 import re
 import sys
@@ -588,12 +592,20 @@ same = sum(1 for a, b in zip(live, kit) if a == b)
 print("   VERDICT content differs: %d/%d leading code lines match" % (same, max(len(live), len(kit))))
 sys.exit(11)
 PY
-      rc=$?
-      if [ "$rc" -eq 10 ]; then
-        echo "   STATE bootstrap=ALREADY (content-equal under a different hash)"
-        BOOTSTRAP_STATE=ALREADY
+        rc=$?
+        if [ "$rc" -eq 10 ]; then
+          echo "   STATE bootstrap=ALREADY (content-equal under a different hash)"
+          echo "         comparison used the rendered kit artifact"
+          BOOTSTRAP_STATE=ALREADY
+        else
+          echo "   STATE bootstrap=DRIFT — in-service content differs from the kit artifact"
+          BOOTSTRAP_STATE=DRIFT
+        fi
       else
-        echo "   STATE bootstrap=DRIFT — in-service content differs from the kit artifact"
+        # This read-only precheck decision must fail closed instead of letting a render
+        # failure turn "cannot decide" into a fatal tool error.
+        echo "   STATE bootstrap=DRIFT — cannot render the kit bootstrap artifact, so the"
+        echo "         difference cannot be decided by content. NOT treated as equal."
         BOOTSTRAP_STATE=DRIFT
       fi
     else

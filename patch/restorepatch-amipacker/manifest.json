@@ -77,7 +77,7 @@
       "sha256": "07b9633975bdc8e76803af83f9057c09a3fe28707f5284c727933e3050238df1"
     },
     "lib/apply-restorepatch.sh": {
-      "sha256": "ef5efb409070f73874aed74f2b2c2b2f195ffef636f28d3046ca7d469be385b1"
+      "sha256": "7ea6967608cd9993271cc8e81f03731d1694aa8ef78a03d5839e666eb7324b3b"
     },
     "lib/discover-env.sh": {
       "sha256": "88c94e11354d372504b3c7f11434418a8b271599d15794438fe46d3f4730add5"

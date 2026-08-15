@@ -873,15 +873,21 @@ apply)
     || die "artifact sha256 $got does not match expected file digest $ARTIFACT_SHA256"
   # Recompute the state here rather than trusting precheck: the run directory is editable
   # and the live target may have moved between the two phases.
-  live_prefix="$(aws_ ec2 describe-launch-template-versions --launch-template-id "$LT_ID" \
-    --versions "$LT_VER" --query 'LaunchTemplateVersions[0].LaunchTemplateData.UserData' \
-    --output text | base64 -d \
+  lt_default_data="$(aws_ ec2 describe-launch-template-versions --launch-template-id "$LT_ID" \
+    --versions '$Default' \
+    --query 'LaunchTemplateVersions[0].[VersionNumber,LaunchTemplateData.ImageId,LaunchTemplateData.UserData]' \
+    --output text)" || die "cannot read current default LT version"
+  read -r live_lt_version live_ami live_userdata <<< "$lt_default_data"
+  b64="$live_userdata"
+  bootstrap_uploaded=0
+  live_prefix="$(printf '%s' "$live_userdata" | base64 -d \
     | grep -oE 'deployment/bootstrap/host/[0-9a-f]{64}' | head -1 | sed 's|.*/||')"
   resolve_bootstrap_state "$live_prefix"
   if [ "$BOOTSTRAP_STATE" = "ALREADY" ]; then
     say "   SKIP bootstrap: target content already in service (idempotent no-op)"
   elif [ "$BOOTSTRAP_STATE" = "DRIFT" ] && [ "$ALLOW_BASE_DRIFT" -ne 1 ]; then
     echo "   REFUSE bootstrap: DRIFT requires --allow-base-drift; no host assets were published in this run; continuing other concerns"
+    # REFUSE blocks rewriting bootstrap content, not promoting a different ImageId below.
   else
   [ -n "$live_prefix" ] || die "cannot render bootstrap without an in-service bootstrap prefix"
   live_art="$(mktemp)"
@@ -901,8 +907,7 @@ apply)
     "deployment/bootstrap/host/${ASSET_BUNDLE_PREFIX}/init-host.sh"
   rm -f "$live_art"
 
-  aws_ ec2 describe-launch-template-versions --launch-template-id "$LT_ID" --versions "$LT_VER" \
-    --query 'LaunchTemplateVersions[0].LaunchTemplateData.UserData' --output text \
+  printf '%s' "$live_userdata" \
     | base64 -d > /tmp/restorepatch-ud.txt || die "cannot read in-service UserData"
   # Replace every observed content-addressed bootstrap prefix. The assertions below
   # forbid a no-op rewrite from creating and promoting an ineffective LT version.
@@ -939,16 +944,27 @@ print("   UserData rewritten, %d old prefix(es) replaced; target present; no old
 PY
   [ $? -eq 0 ] || die "UserData rewrite refused"
   b64="$(base64 -i /tmp/restorepatch-ud.txt 2>/dev/null || base64 -w0 /tmp/restorepatch-ud.txt)"
+  bootstrap_uploaded=1
+  rm -f "$rendered_art"
+  fi
+
+  if [ "$AMI" = "$live_ami" ] && [ "$bootstrap_uploaded" -eq 0 ]; then
+    newver="$live_lt_version"
+    if [ "$BOOTSTRAP_STATE" = "ALREADY" ]; then
+      say "   SKIP LT version: image and bootstrap already in service (idempotent no-op)"
+    else
+      say "   SKIP LT version: target ImageId already in service; in-service UserData retained"
+    fi
+  else
   newver="$(aws_ ec2 create-launch-template-version --launch-template-id "$LT_ID" \
-    --source-version "$LT_VER" \
+    --source-version "$live_lt_version" \
     --launch-template-data "{\"ImageId\":\"${AMI}\",\"UserData\":\"${b64}\"}" \
     --query 'LaunchTemplateVersion.VersionNumber' --output text)" || die "cannot create LT version"
-  state_put host_lt_new_version "$newver"
   aws_ ec2 modify-launch-template --launch-template-id "$LT_ID" --default-version "$newver" \
     || die "cannot flip default version"
   say "   LT version $newver created and set default"
-  rm -f "$rendered_art"
   fi
+  state_put host_lt_new_version "$newver"
 
   say "3/3 overlay Lambda code, reusing each live package's dependencies"
   apply_control_overlay
@@ -1167,8 +1183,53 @@ verify)
   ud="$(aws_ ec2 describe-launch-template-versions --launch-template-id "$LT_ID" \
     --versions '$Default' --query 'LaunchTemplateVersions[0].LaunchTemplateData.UserData' \
     --output text | base64 -d)"
-  printf '%s' "$ud" | grep -q "$ASSET_BUNDLE_PREFIX" && echo "   PASS bootstrap prefix" \
-    || { echo "   FAIL bootstrap prefix absent"; rc=1; }
+  if printf '%s' "$ud" | grep -q "$ASSET_BUNDLE_PREFIX"; then
+    echo "   PASS bootstrap prefix"
+  else
+    verify_prefix="$(printf '%s' "$ud" \
+      | grep -oE 'deployment/bootstrap/host/[0-9a-f]{64}' | head -1 | sed 's|.*/||')"
+    verify_probe=""
+    verify_content_equal=0
+    [ -z "$verify_prefix" ] || verify_probe="$(mktemp -d)"
+    if [ -n "$verify_probe" ] \
+      && aws_ s3 cp "s3://${BUCKET}/deployment/bootstrap/host/${verify_prefix}/init-host.sh" \
+        "${verify_probe}/live-init-host.sh" --no-progress >/dev/null 2>&1; then
+      if ( render_bootstrap_artifact "${KITDIR}/host-scripts/init-host.sh.patched" \
+           "${verify_probe}/live-init-host.sh" "${verify_probe}/rendered-init-host.sh" ); then
+        if python3 - "${verify_probe}/live-init-host.sh" \
+          "${verify_probe}/rendered-init-host.sh" <<'PY'
+import pathlib
+import re
+import sys
+
+def code_only(p):
+    # compare executable content only: the publish scrub removes whole comment lines,
+    # so comments must not decide whether the environment is on a different version
+    out = []
+    for line in pathlib.Path(p).read_text(encoding="utf-8", errors="replace").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        out.append(re.sub(r"\s+", " ", s))
+    return out
+
+sys.exit(0 if code_only(sys.argv[1]) == code_only(sys.argv[2]) else 1)
+PY
+        then
+          verify_content_equal=1
+        fi
+      fi
+    fi
+    if [ "$verify_content_equal" -eq 1 ]; then
+      echo "   PASS bootstrap content-equal under a different prefix: $verify_prefix"
+    else
+      # resolve_bootstrap_state can fail closed into DRIFT during precheck; verify is an
+      # acceptance path, so an undecidable download or render must count as a failure.
+      echo "   FAIL bootstrap prefix absent"
+      rc=1
+    fi
+    [ -z "$verify_probe" ] || rm -rf "$verify_probe"
+  fi
   printf '%s' "$ud" | grep -q '{{' && { echo "   FAIL unrendered placeholder in UserData"; rc=1; } \
     || echo "   PASS no unrendered placeholder"
   img="$(aws_ ec2 describe-launch-template-versions --launch-template-id "$LT_ID" \

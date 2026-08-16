@@ -968,6 +968,7 @@ def process_pending():
         # (c)一次条件写自增 next_vm_num/used_*;竞争(CCF)则重选 host 重试。
         vm_num = None
         host = None
+        # #491(review2)—— 不再「试号 → 撞了归还 → 再试」。改成:先算出第一个未被物理占用的
         # 号,再用【跳号 CAS】一次认领它。这样同时消掉三个洞:没有"试几次放弃"的上限
         # (被占号段可能有几百个,任何上限都会误报无容量);不需要回滚(本路径无
         # capacity_reservation_id 令牌,归还做不到幂等可确认);不依赖事件重试换号
@@ -983,6 +984,7 @@ def process_pending():
             )
             if _occ is None:
                 # 占用集合读失败 = 未知 → fail-closed,不认领。
+                # #491(review3)—— 先在【本次调用内】重试:process_pending 只由 HostReady
                 # 事件触发,没有保证会来的下一次,一次 DDB 抖动就放弃会让租户搁置。
                 # 8 次都失败才放弃该租户,并在下面打 WARN(可观测,不是静默丢失)。
                 _occ_fail += 1
@@ -1014,6 +1016,7 @@ def process_pending():
             try:
                 r = hosts_table.update_item(
                     Key={"instance_id": cand["instance_id"]},
+                    # #491 跳号:next_vm_num 直接推到 target+1(绝对值),不是 +1。
                     # 条件仍是 next_vm_num = :expected —— 并发者改过就 CCF 重来,
                     # 被跳过的号不会被别人同时认领。
                     UpdateExpression=(
@@ -1128,6 +1131,23 @@ def process_pending():
             )
             raise
         # DNAT → microVM:18789);per-tenant ALB rule/TG 死路径已下线。
+        #
+        # #509 —— 用完即清 restore_backup_key。它是「本次放置要从哪个备份恢复」的一次性指令,
+        # 不是租户的常驻属性;上面的 _launch_vm 已经把它按位置参传下去了,这次恢复不再需要它。
+        # 留着的危害是实的:launch-vm.sh:602-617 在位置参为空时会自己从 DDB 读这个字段,于是该租户
+        # 之后任何一次 launch(重启/换机)都会按【那个旧备份】重铺盘 → 丢掉此后写入的数据。
+        # 清空是安全的:消费方本就有回落(tenant_service.py:3297
+        # `item.get("restore_backup_key") or _resolve_backup(tenant_id)`),真需要时会从 S3 取最新的。
+        # 与既有 suspend/restore 的收尾同款(tenant_service.py:3396 也是 restore 成功后 REMOVE 掉)。
+        if tenant.get("restore_backup_key"):
+            try:
+                tenants_table.update_item(
+                    Key={"id": tenant["id"]},
+                    UpdateExpression="REMOVE restore_backup_key",
+                )
+            except Exception as e:  # noqa: BLE001 — 清不掉只是留个陈旧字段,不能反过来让放置失败
+                print(f"process_pending: failed to clear restore_backup_key for "
+                      f"{tenant['id']}: {e}")
         assigned += 1
 
     return {

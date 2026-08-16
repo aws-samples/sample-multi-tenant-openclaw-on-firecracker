@@ -85,6 +85,16 @@ _FENCED_LIFECYCLE_ACTIONS = frozenset(
     {"rebuild", "migrate", "reset", "delete", "restart"}
 )
 
+# #501 — 健康位只由 health_check sweep 写(health_check/handler.py 的 vm_health/app_health
+# update),而 sweep 跳过终态租户(`status not in ("deleted", "suspended")`)。于是删除后这三个
+# 字段冻在删除前的值,DDB 里留下 status=deleted + vm_health=up + app_health=up 的行;软删无 TTL,
+# 行永不消失,任何按健康位判「租户是否在役」的监控/巡检/排障都会把已删租户当成健康在役租户
+# (客户排障实测已发生)。每条把 status 写成 deleted 的路径都必须一并 REMOVE 这三个字段——
+# DDB 的 REMOVE 对不存在的属性是 no-op,所以 create 回滚路径带上它同样安全。
+_STALE_HEALTH_FIELDS = "vm_health, app_health, last_health_check"
+# create 回滚路径(mint token / clone-data / launch-vm 提交失败)共用的终态写法。
+_ROLLBACK_DELETED_EXPR = f"SET #s = :s, updated_at = :t REMOVE {_STALE_HEALTH_FIELDS}"
+
 # 业务场景:用户在外部平台页面「下单购买一个 claw」。租户记录带三个购买维度字段
 #   • plan_tier     套餐档(free/standard/pro/enterprise 之一,受控枚举防脏数据)。
 #   • purchase_status  两段式状态机:pending(下单意向已记,VM 未开通)→ provisioned
@@ -1916,7 +1926,7 @@ def create_tenant(body=None, event=None):
             )
             clients.tenants_table.update_item(
                 Key={"id": tenant_id},
-                UpdateExpression="SET #s = :s, updated_at = :t",
+                UpdateExpression=_ROLLBACK_DELETED_EXPR,
                 ExpressionAttributeNames={"#s": "status"},
                 ExpressionAttributeValues={":s": "deleted", ":t": utils._now()},
             )
@@ -1966,7 +1976,7 @@ def create_tenant(body=None, event=None):
             )
             clients.tenants_table.update_item(
                 Key={"id": tenant_id},
-                UpdateExpression="SET #s = :s, updated_at = :t",
+                UpdateExpression=_ROLLBACK_DELETED_EXPR,
                 ExpressionAttributeNames={"#s": "status"},
                 ExpressionAttributeValues={":s": "deleted", ":t": utils._now()},
             )
@@ -2007,7 +2017,7 @@ def create_tenant(body=None, event=None):
         )
         clients.tenants_table.update_item(
             Key={"id": tenant_id},
-            UpdateExpression="SET #s = :s, updated_at = :t",
+            UpdateExpression=_ROLLBACK_DELETED_EXPR,
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={":s": "deleted", ":t": utils._now()},
         )
@@ -2180,7 +2190,10 @@ def _delete_tenant_inner(tenant_id, query_params, event=None, _lifecycle_ctx=Non
         # 直接幂等返回,永不进普通删除路径。破坏性清理(S3/vkey)放 CAS 之后 best-effort——崩溃则
         # 泄漏可被对账清理(可恢复),而二次扣 slot 破坏账本正确性(不可接受),两害取轻。
         _vkey = item.get("litellm_vkey")
-        _remove = "restore_backup_key, suspended_at, suspended_from, cognito_channel_password"
+        _remove = (
+            "restore_backup_key, suspended_at, suspended_from, "
+            f"cognito_channel_password, {_STALE_HEALTH_FIELDS}"
+        )
         _set = "SET #s = :d, updated_at = :t"
         _vals = {":d": "deleted", ":cur": "suspended", ":t": utils._now()}
         # vkey 撤销在 CAS 前做(幂等,失败则保留字段+flag);其余破坏性清理在 CAS 赢后做。
@@ -2764,7 +2777,7 @@ def _delete_tenant_inner(tenant_id, query_params, event=None, _lifecycle_ctx=Non
         update_expr = (
             "SET #s = :s, updated_at = :t, vkey_revoke_failed = :vf "
             "REMOVE cognito_channel_password, delete_retryable, "
-            "delete_prev_status, delete_claim_expires_at_epoch"
+            f"delete_prev_status, delete_claim_expires_at_epoch, {_STALE_HEALTH_FIELDS}"
         )
         expr_vals = {":s": "deleted", ":t": utils._now(), ":vf": True}
     else:
@@ -2772,7 +2785,7 @@ def _delete_tenant_inner(tenant_id, query_params, event=None, _lifecycle_ctx=Non
             "SET #s = :s, updated_at = :t "
             "REMOVE litellm_vkey, cognito_channel_password, "
             "delete_retryable, delete_prev_status, "
-            "delete_claim_expires_at_epoch"
+            f"delete_claim_expires_at_epoch, {_STALE_HEALTH_FIELDS}"
         )
         expr_vals = {":s": "deleted", ":t": utils._now()}
     clients.tenants_table.update_item(

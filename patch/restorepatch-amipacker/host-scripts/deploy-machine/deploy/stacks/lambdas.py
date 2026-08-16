@@ -810,6 +810,13 @@ def build_lambdas(self, ctx):
                 "autoscaling:DescribeAutoScalingGroups",
                 "autoscaling:SetDesiredCapacity",
                 "autoscaling:CompleteLifecycleAction",
+                # #510 —— 终止钩子的 HeartbeatTimeout 是 120s,而 #509 的撤离对每个租户做一次
+                # 同步备份(实测 6.2s、最坏到 backup Lambda 的 SSM 上限 300s)。约 19 个租户就
+                # 把 120s 走完 → ASG 放行终止 → 剩下的租户连数据盘一起消失,而一台 host 容量是
+                # 几百个租户。cleanup_terminated_host 因此每撤一个租户前续一次心跳把窗口撑开。
+                # 少这一条权限,续心跳会 AccessDenied 被日志吞掉,修复静默失效(真机实测:该权限
+                # 原本不在本策略里,只有 CompleteLifecycleAction)。
+                "autoscaling:RecordLifecycleActionHeartbeat",
                 "autoscaling:TerminateInstanceInAutoScalingGroup",
             ],
             resources=["*"],

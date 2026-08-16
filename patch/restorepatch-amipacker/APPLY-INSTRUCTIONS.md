@@ -288,9 +288,11 @@ idempotency records, environment-key preservation, alias convergence, host count
 and deployment-machine preflight behavior.
 
 Phase B exercises a real lifecycle: Packer parity, a controlled host replacement
-including tenant evacuation and the one-shot restore key, backup source reporting,
-device pairing self-heal, Fluent Bit activity, host-agent logging, rebuild/reset
-fencing, capacity accounting, and private API routing. A tenant merely reaching `running` is not sufficient;
+including tenant evacuation, the one-shot restore key and the termination window
+held open across every tenant on the host, backup source reporting, device
+pairing self-heal, Fluent Bit activity, host-agent logging, rebuild/reset
+fencing, capacity accounting, and private API routing. Phase A additionally
+checks that a tenant reaching its deleted state carries no stale health fields. A tenant merely reaching `running` is not sufficient;
 capture the issue-specific observable and prove the old failure signal is absent.
 
 ## Step 8 Exact cleanup

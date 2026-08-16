@@ -694,13 +694,74 @@ aws ec2 describe-launch-template-versions --launch-template-name "$LT" \
 ```
 
 **仅新创建的 host 使用新 AMI。** 存量 host 不受影响，将持续运行至被替换为止。
-如需替换存量实例，可执行一次 ASG instance refresh，或逐台终止由 ASG 补充。
+替换存量实例的可执行步骤见下方 §6.1。
 
-⚠️ **存量 host 上承载租户。** 执行滚动替换前需确认相关租户可迁移或可接受停机。
+⚠️ **存量 host 上承载租户，替换会把租户搬到新机。** 控制面在 host 终止时会对该机上每个
+租户做一次同步备份、把它标回待放置并连同备份位置记下，再由调度侧在替换机上恢复
+（实测：老机开始终止到租户在新机上线约 17 秒）。这不是"无感"——租户会经历一次短暂重建。
+备份失败的租户会被明确标为已删除并在日志里喊出原因，而不是悄悄拿一块空盘冒充恢复。
 
 ⚠️ **若 LaunchTemplate 由 CDK 创建**，上述新建的版本会在下次 `cdk deploy` 时被覆盖，
 需在部署后重新执行本节。构建完成后请记录 AMI id（同时写入
 `deploy/packer/manifest.json`），以便重新应用。
+
+### §6.1 替换存量 host（滚动替换）
+
+换完 LaunchTemplate 只影响新开的机器。要让存量 host 也用上新 AMI，用 ASG instance refresh。
+
+**先做前置检查。** 若 ASG 挂起了 `Launch`、`Terminate` 或 `InstanceRefresh` 中任何一个，
+refresh 会卡住或不生效：
+
+```bash
+ASG=openclaw-hosts-asg
+
+aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG" \
+  --query 'AutoScalingGroups[0].SuspendedProcesses[].ProcessName' --output text
+# 输出里出现 Launch / Terminate / InstanceRefresh → 先恢复它们再继续：
+# aws autoscaling resume-processes --auto-scaling-group-name "$ASG" \
+#   --scaling-processes Launch Terminate InstanceRefresh
+```
+
+**发起滚动替换。** 一次换一台、先起新机再停老机：
+
+```bash
+aws autoscaling start-instance-refresh --auto-scaling-group-name "$ASG" \
+  --preferences '{
+    "MinHealthyPercentage": 100,
+    "MaxHealthyPercentage": 100,
+    "InstanceWarmup": 900,
+    "SkipMatching": false,
+    "AutoRollback": false
+  }'
+```
+
+`MinHealthyPercentage` 与 `MaxHealthyPercentage` 都取 100 = 容量不下探，替换机先进入服务
+再终止老机。查看进度：
+
+```bash
+aws autoscaling describe-instance-refreshes --auto-scaling-group-name "$ASG" \
+  --query 'InstanceRefreshes[0].[Status,PercentageComplete,StatusReason]' --output text
+```
+
+⚠️ **`InstanceWarmup` 必须大于一台 host 从启动到进入服务的时间。** 实测 bootstrap 需
+**3 分 22 秒**（新机 `Pending:Wait` → `InService`）。把它压到 60 秒会让 ASG 在替换机还没起完
+时就终止老机 → 健康实例数掉到 0 → **instance refresh 自行取消，并把刚起的替换机一起终止，
+`DesiredCapacity` 被带到 0，原本挂起的 `AZRebalance`/`ReplaceUnhealthy` 也被恢复**（以上均为
+实测发生过的后果）。安全下限 **≥240 秒**；上面用的 900 秒是留足余量的保守值。代价是单台替换
+约 23 分钟，其中绝大部分是这段等待。
+
+⚠️ **不要用「逐台终止让 ASG 补充」这种做法**，除非显式带上不减容量的参数。本 ASG 的
+`TerminationPolicies` 是 `Default`，AWS 默认策略**优先终止使用当前 LaunchTemplate 最旧版本的
+那台** —— 换完 AMI 之后，那恰好就是还承载着租户的存量机器。要手工换某一台时用：
+
+```bash
+aws autoscaling terminate-instance-in-auto-scaling-group \
+  --instance-id i-xxxxxxxxxxxx --should-decrement-desired-capacity
+```
+
+**机队较大时先做单机验证。** 先用上面的 `terminate-instance-in-auto-scaling-group` 换掉一台，
+按 §7 确认它确实走了预置镜像路径、且其上租户已恢复，再对整个机队发起 refresh。一次 refresh
+按一台一台换，N 台机队约需 N × 23 分钟。
 
 ---
 

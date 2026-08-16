@@ -1,7 +1,7 @@
 {
   "id": "restorepatch-amipacker",
   "base_sha": "50a410187e187c255272f2bc49e7ab83c72114df",
-  "patch_sha": "085c8ae422f501115092a46ae2927d5e1ebfd63d",
+  "patch_sha": "17a15de1e49dac0bf42abb0e1b023662afd5e143",
   "status": "MANUAL_REVIEW",
   "excludes": [
     ".gitleaks.toml"
@@ -25,11 +25,11 @@
         }
       },
       "patch": {
-        "source_sha": "085c8ae422f501115092a46ae2927d5e1ebfd63d",
-        "source_tree": "e2be4711795b559e5801bc8fa6f6d472795244e4",
+        "source_sha": "17a15de1e49dac0bf42abb0e1b023662afd5e143",
+        "source_tree": "e76448adc04cfc1f20655df56b2b2ea3e1eba3ac",
         "assembly_index": {
           "artifact": "resources/cloudformation/patch.assembly-index.json",
-          "sha256": "09335a4c5eedfbde822281d2766ce5fe251452c1e487e6ac8998b9ec33f15851"
+          "sha256": "2e91f842607845e92c6013ceaa5870c304b20815c37503ef4b4dc1ab9a41cc57"
         }
       }
     },
@@ -55,7 +55,7 @@
         },
         "patch_template": {
           "artifact": "resources/cloudformation/OpenClawImage.patch.json",
-          "sha256": "53ec1d1f08b22b5aac9fc0a56d86b6e811a5b8157e108142bfffadf144770179"
+          "sha256": "af4ab032a85f601e7af6a747a58a42b94f776bb485eadb5dca18596938c047d3"
         }
       },
       {
@@ -67,7 +67,7 @@
         },
         "patch_template": {
           "artifact": "resources/cloudformation/OpenClawOrchestrator.patch.json",
-          "sha256": "4795ebe4ab49b1556ea892b5e6bacb6ea1ccd6c0ebbbe6cc73c28fe8a98209a5"
+          "sha256": "b17cde39b49a26ba10b4b30e33675c5bcf1409daec929f4e8fc2ed03ebb8d218"
         }
       }
     ]
@@ -1479,7 +1479,7 @@
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
       "base_sha256": "d40eb38fd7588ae17bfd2cc517e34cbf2caea1c44537fe5d014585ab48b38f8b",
-      "patch_sha256": "60c7716ac96274280baf5b79ab0a28c8a370459d7a97fd8c416f7c1c2c7610da",
+      "patch_sha256": "aff9a0e8dbcdb2849e7aa4b654da8e70de764290e536be0b84d26395b90bdd75",
       "operations": [
         {
           "resource": "repository file delivery",
@@ -1495,7 +1495,9 @@
       "fix_ids": [
         "fix-430",
         "fix-470",
-        "fix-509"
+        "fix-509",
+        "fix-510",
+        "fix-501"
       ]
     },
     "deploy/lambda/api/services/lifecycle_dispatch.py": {
@@ -1556,7 +1558,7 @@
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
       "base_sha256": "219778d8770a2886c58742f198e87b150f2f63de2ef13f5729724f83be95eb54",
-      "patch_sha256": "99f40251d9768c21a6ddafe3c5c5a4f1ea6db2e2fa55c457a67a408b6430707f",
+      "patch_sha256": "278c8ca8221a65d29122ac9061d53fe1e3866c643b5c83c4722c389858db9ebe",
       "operations": [
         {
           "resource": "repository file delivery",
@@ -1577,7 +1579,8 @@
         "fix-430",
         "fix-456",
         "fix-482",
-        "fix-485"
+        "fix-485",
+        "fix-501"
       ]
     },
     "deploy/lambda/backup/handler.py": {
@@ -1638,7 +1641,7 @@
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
       "base_sha256": "5dc20f11757d58c70e0e0331b2e26de66a84cdcdfe43d8703109517332519b72",
-      "patch_sha256": "3319374fe50486e87d535770f59b18e6bc66f68ce126a9c579aaa7ebb2bfdd64",
+      "patch_sha256": "94d4c8b11df3aec1d1af2d78d2da77b5136bcfabe6c8396a228b6759b76bd41c",
       "operations": [
         {
           "resource": "repository file delivery",
@@ -1652,7 +1655,8 @@
         }
       ],
       "fix_ids": [
-        "fix-416"
+        "fix-416",
+        "fix-501"
       ]
     },
     "deploy/lambda/tenant_stats/handler.py": {
@@ -1713,7 +1717,7 @@
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
       "base_sha256": null,
-      "patch_sha256": "833a94624efd48bc7febeab0be60299cc0172b8a76eedd5a85e300e29ecbe670",
+      "patch_sha256": "712272936c0c314d5a7f81a3b613ad07cfe74a7c5e1133edf0c87f4ba68c1600",
       "operations": [
         {
           "resource": "repository file delivery",
@@ -1727,7 +1731,8 @@
         }
       ],
       "fix_ids": [
-        "fix-477"
+        "fix-477",
+        "fix-510"
       ]
     },
     "deploy/packer/README.md": {
@@ -1987,7 +1992,7 @@
             {
               "change": "A",
               "stack": "OpenClawOrchestrator",
-              "logical_id": "ApiHandlerCurrentVersion5C7F0A60cfef995b3af73a28ab73863b936cdca6",
+              "logical_id": "ApiHandlerCurrentVersion5C7F0A60e73299fbdbc78471f44fe392482b8693",
               "resource_type": "AWS::Lambda::Version"
             },
             {
@@ -2247,7 +2252,7 @@
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
       "base_sha256": "b4093090ebb7ab3e37fe3b65866949b318b5be0d9d5666c53662058dd33e3c16",
-      "patch_sha256": "6a991e42547cc2a1e0a626f2d8a033d0d03b130382b5ac31a7b8733c4698965a",
+      "patch_sha256": "502c9c1258eec71576e7c0e899b5a12e488cd482a5f80fb8c1c213ba1a67e666",
       "operations": [
         {
           "resource": "repository file delivery",
@@ -2301,7 +2306,8 @@
       "fix_ids": [
         "fix-413",
         "fix-423",
-        "fix-430"
+        "fix-430",
+        "fix-510"
       ]
     },
     "deploy/stacks/litellm.py": {
@@ -6183,7 +6189,7 @@
         "evidence": "path-derived-meta"
       },
       "base_sha256": null,
-      "patch_sha256": "5f597d4835c0f6bfbc3d79c8fa0d12987847def53ace668490830d191995a8d3",
+      "patch_sha256": "3745deca8c55094a7621827481857e4d3b24ac47c963a495fb9e86fd86008284",
       "operations": [
         {
           "resource": "inert documentation or release metadata",
@@ -6853,7 +6859,7 @@
         "evidence": "path-derived-meta"
       },
       "base_sha256": "bc2ba8a9fe76d80c5019b3433cbfecb1ba51c27aa2aae896b33509b1b2b72358",
-      "patch_sha256": "3e10ff2d202195fc49a9b7f3fe760197d9f0a83d48982e0463237234972d45b0",
+      "patch_sha256": "50a4a55c002c7d2e96bba81a21e2ebecfa9ea12d382dfd01db8e93d2ea4adc71",
       "operations": [
         {
           "resource": "inert documentation or release metadata",
@@ -7438,7 +7444,7 @@
         "evidence": "path-derived-meta"
       },
       "base_sha256": "cb1b4801cca4ff445a1281bc07213f20eb46dbe5b902ff04a7b3670764bb6c2c",
-      "patch_sha256": "a7639734b55a7aca4efc3819253ecba74b6a938ce792fcba909508b6fdb851c4",
+      "patch_sha256": "ca8b311401ffe4ae29ddb92f1f180cf191b5a818342cea901094f0e50f6a6961",
       "operations": [
         {
           "resource": "inert documentation or release metadata",
@@ -7517,7 +7523,7 @@
         "evidence": "path-derived-meta"
       },
       "base_sha256": "d40eb38fd7588ae17bfd2cc517e34cbf2caea1c44537fe5d014585ab48b38f8b",
-      "patch_sha256": "479e2e0fd2ae62b729d6577221f474a5516bcb094e31da04790a7ace578aff03",
+      "patch_sha256": "60c7716ac96274280baf5b79ab0a28c8a370459d7a97fd8c416f7c1c2c7610da",
       "operations": [
         {
           "resource": "inert documentation or release metadata",
@@ -7621,7 +7627,7 @@
         "evidence": "path-derived-meta"
       },
       "base_sha256": null,
-      "patch_sha256": "3b34e072b8e0941d3a7b76acaea8ee9af27fa7610788f94ca275fc54318c97e6",
+      "patch_sha256": "b72f4f064ebfb198bea2c2cee3c9e493151df22f349aebcea837c68d54c73c94",
       "operations": [
         {
           "resource": "inert documentation or release metadata",
@@ -7935,7 +7941,7 @@
         "evidence": "path-derived-meta"
       },
       "base_sha256": null,
-      "patch_sha256": "103cc94273668cd6fbe479f4ab4623bc5879a73aed6d9cb050561026f93c2a6a",
+      "patch_sha256": "e0e6f4e33224b29b5a7eceece8d50579d31a473dc6f5506963d03598ccc79c28",
       "operations": [
         {
           "resource": "inert documentation or release metadata",
@@ -8035,7 +8041,7 @@
         "evidence": "path-derived-meta"
       },
       "base_sha256": null,
-      "patch_sha256": "ee3f3e22817fb796af35aae85632ea2c98d65dd6ee6d423d99c8d38763870f08",
+      "patch_sha256": "53ec1d1f08b22b5aac9fc0a56d86b6e811a5b8157e108142bfffadf144770179",
       "operations": [
         {
           "resource": "inert documentation or release metadata",
@@ -8085,7 +8091,7 @@
         "evidence": "path-derived-meta"
       },
       "base_sha256": null,
-      "patch_sha256": "688dfa1778513e38b7143d8c97b08e1048638432d51092a03b702acb38dd5739",
+      "patch_sha256": "4795ebe4ab49b1556ea892b5e6bacb6ea1ccd6c0ebbbe6cc73c28fe8a98209a5",
       "operations": [
         {
           "resource": "inert documentation or release metadata",
@@ -8135,7 +8141,7 @@
         "evidence": "path-derived-meta"
       },
       "base_sha256": null,
-      "patch_sha256": "68d79a2c6a0736d6261240d8efdc8ff74a91bbabab20970123ceb5b20b47bfde",
+      "patch_sha256": "09335a4c5eedfbde822281d2766ce5fe251452c1e487e6ac8998b9ec33f15851",
       "operations": [
         {
           "resource": "inert documentation or release metadata",
@@ -8391,6 +8397,56 @@
       },
       "base_sha256": null,
       "patch_sha256": "d22156321b52a51514e2f2b7b1923566066574093c982be6cdad6063fbdeeaec",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/manifest-2026-08-17-055339-e627dbad.json": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "e0686a8a315bb97135cf382e601212e1572f7f9f309e07ea1df7722b3c8d7d65",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/push-marker-2026-08-17-055339-e627dbad.md": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "21cb0eecf5b90dcb40b06d7868ff1b7308c35325be982e1dc9f4c3d75f8f0b11",
       "operations": [
         {
           "resource": "inert documentation or release metadata",
@@ -8918,6 +8974,34 @@
       "verification_ids": [
         "ver-490"
       ]
+    },
+    {
+      "id": "fix-510",
+      "summary": "Keep the termination window open for the whole tenant evacuation.",
+      "paths": [
+        "deploy/lambda/api/services/host_service.py",
+        "deploy/stacks/lambdas.py",
+        "deploy/packer/CUSTOMER-GUIDE.md"
+      ],
+      "applies_when": "always",
+      "params_changed": [],
+      "verification_ids": [
+        "ver-510"
+      ]
+    },
+    {
+      "id": "fix-501",
+      "summary": "Clear the health fields when a tenant reaches its deleted state.",
+      "paths": [
+        "deploy/lambda/api/services/host_service.py",
+        "deploy/lambda/api/services/tenant_service.py",
+        "deploy/lambda/scaler/handler.py"
+      ],
+      "applies_when": "always",
+      "params_changed": [],
+      "verification_ids": [
+        "ver-501"
+      ]
     }
   ],
   "verifications": [
@@ -9261,6 +9345,28 @@
       "fail_when": "A revoked operator is re-minted, a device absent from the control-plane list is revived, a tenant with no valid pairing file gains a token, or the launch continues after a failed self-heal step.",
       "timeout_s": 900,
       "cleanup": "Delete the test tenants."
+    },
+    {
+      "id": "ver-510",
+      "fix_id": "fix-510",
+      "phase": "B-lifecycle",
+      "action": "Put more tenants on one disposable host than the hook heartbeat can cover at the measured per-tenant backup cost, terminate that host through the auto scaling group, and read the control-plane log plus every tenant row. Then repeat with the heartbeat permission removed from the control-plane role.",
+      "observable": "Whether a heartbeat renewal is recorded before each evacuation, whether the hook is still held when the last tenant is reached, the final state of every tenant on that host, and whether an over-budget run continues asynchronously instead of stopping.",
+      "pass_when": "Every tenant on the host is either queued with a restorable key or marked deleted with the reason logged; none is left running on a terminated host; an over-budget evacuation resumes and finishes; and the run without the heartbeat permission degrades to the plain window with the failure logged rather than aborting the evacuation.",
+      "fail_when": "The hook is released while tenants remain unprocessed, a tenant keeps a host id that no longer exists, the resumed run reprocesses an already evacuated tenant, or a denied heartbeat aborts the evacuation.",
+      "timeout_s": 2700,
+      "cleanup": "Delete the test tenants and restore the group's previous capacity."
+    },
+    {
+      "id": "ver-501",
+      "fix_id": "fix-501",
+      "phase": "A-readonly",
+      "action": "Delete one tenant through the API, let another expire through its time-to-live sweep, and evacuate a third from a terminating host whose backup is unusable. Then read all three rows and the tenant listing.",
+      "observable": "Presence of the virtual-machine health, application health and last health check fields on each row after it reaches its terminal state, and what the listing reports for those tenants.",
+      "pass_when": "All three deleted rows carry none of the three health fields, a stopped tenant still keeps its last observation, and no deleted tenant is reported as healthy.",
+      "fail_when": "Any deleted row still reports healthy, the time-to-live path leaves the fields behind, or a stopped tenant loses its last observation.",
+      "timeout_s": 900,
+      "cleanup": "None beyond deleting the test tenants."
     }
   ]
 }

@@ -300,6 +300,7 @@ def register_host(body):
     # bb); this only covers hosts registered through the API. Omit on unknown/empty
     # rather than writing "" — DDB rejects empty S and an empty value would falsely
     rootfs_version = _get_manifest().get("version", "")
+    # #491 — 写入走重入安全的 upsert(条件 put + CCF 分支只刷静态字段、if_not_exists 补账本)。
     _upsert_host_row(
         instance_id,
         instance_type,
@@ -339,25 +340,123 @@ def deregister_host(instance_id):
     return _resp(200, {"instance_id": instance_id, "status": "draining"})
 
 
+def _backup_tenant_for_evacuation(tenant):
+    """同步备份 terminating host 上的租户；双层校验失败一律 fail-closed。"""
+    tid = tenant["id"]
+    try:
+        lambda_client = boto3.client("lambda")
+        resp = lambda_client.invoke(
+            FunctionName=os.environ.get("BACKUP_FUNCTION", "openclaw-backup"),
+            InvocationType="RequestResponse",
+            Payload=json.dumps({"tenant_id": tid, "pre_delete": True}).encode("utf-8"),
+        )
+        invoke_ok = resp.get("StatusCode", 500) == 200 and "FunctionError" not in resp
+        if not invoke_ok:
+            return False, "", "backup invoke failed (StatusCode/FunctionError)"
+        try:
+            raw = resp["Payload"].read()
+            result = json.loads(raw) if raw else {}
+        except Exception as e:  # noqa: BLE001 — 解析失败不能假称租户可恢复
+            return False, "", f"backup response parse error: {e}"
+        if result.get("success") is not True:
+            return False, "", result.get("error") or "backup reported failure"
+        backup_key = result.get("backup_key") or result.get("key") or ""
+        if not backup_key:
+            return False, "", "backup reported success without a restorable key"
+        return True, backup_key, ""
+    except Exception as e:  # noqa: BLE001 — invoke 异常必须回落 deleted，不能启动空盘
+        return False, "", f"backup error ({e})"
+
+
+def _write_terminated_tenant_state(tenant, ok, backup_key, err):
+    tid = tenant["id"]
+    if ok:
+        # data.ext4 会随 host 销毁；只有本次备份 key 可用时才能交给 pending 恢复链。
+        tenants_table.update_item(
+            Key={"id": tid},
+            UpdateExpression=(
+                "SET #s = :s, restore_backup_key = :k, updated_at = :t "
+                "REMOVE host_id, vm_num, phys_vm_num, host_port, guest_ip, "
+                "host_private_ip"
+            ),
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":s": "pending",
+                ":k": backup_key,
+                ":t": _now(),
+            },
+        )
+        print(f"cleanup_terminated_host: tenant {tid} queued from {backup_key}")
+        return True
+    print(
+        f"CRITICAL cleanup_terminated_host: tenant {tid} backup unusable ({err}); "
+        "marking deleted to avoid a false recovery onto a blank disk"
+    )
+    tenants_table.update_item(
+        Key={"id": tid},
+        UpdateExpression="SET #s = :s, updated_at = :t",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":s": "deleted", ":t": _now()},
+    )
+    return False
+
+
+def _trigger_pending_placement(instance_id, evacuated):
+    """把刚撤下来的 pending 租户推给 process_pending() 重新放置。
+
+    为什么必须显式触发:process_pending() 全仓只有一个调用点(handler.py 的
+    aws.autoscaling 非 terminate 分支,即 HostReady),handler.py:1028/1040 自己也写着
+    "只由 HostReady 触发,没有保证会来的下一 tick"。而 refresh 是【先起后停】:
+    替换机 InService(HostReady 发生)时租户还是 running,没什么可放置;等老机终止、
+    本函数把租户翻成 pending 时,那个事件早过去了,不会再来第二次 → 租户永久悬挂在
+    pending(数据在 S3 安全,但再也回不来)。所以这里补发一个 HostReady 形状的事件,
+    顶层 dispatcher 原样路由到 process_pending(),handler.py 无需改动。
+
+    异步(Event)且放在 complete_lifecycle_action 之后:放置耗时不得挤占 120s 钩子窗口,
+    也不得让放置失败反过来拖住 ASG。失败只记日志不抛——租户已是 pending + 有可用
+    restore_backup_key,下一次 HostReady 仍能兜回来。
+    """
+    if not evacuated:
+        return
+    try:
+        boto3.client("lambda").invoke(
+            FunctionName=os.environ.get("AWS_LAMBDA_FUNCTION_NAME", ""),
+            InvocationType="Event",  # fire-and-forget(同上方 pull_image 自调用)
+            Payload=json.dumps(
+                {
+                    "source": "aws.autoscaling",
+                    "detail-type": "EC2 Instance Launch Successful",
+                    "detail": {
+                        "_reason": f"evacuated {evacuated} tenant(s) from {instance_id}"
+                    },
+                }
+            ).encode("utf-8"),
+        )
+        print(f"cleanup_terminated_host: placement triggered for {evacuated} tenant(s)")
+    except Exception as e:  # noqa: BLE001 — 触发失败不能反过来拖住 ASG 钩子
+        print(
+            f"CRITICAL cleanup_terminated_host: placement trigger failed ({e}); "
+            f"{evacuated} tenant(s) stay pending until the next HostReady"
+        )
+
+
 def cleanup_terminated_host(event):
     """Called by termination lifecycle hook — cleanup DynamoDB then complete hook."""
     detail = event["detail"]
     instance_id = detail["EC2InstanceId"]
     print(f"cleanup_terminated_host: {instance_id}")
 
-    # Delete all tenants on this host
+    # terminating host 的数据盘会随实例销毁；逐租户备份，避免例行 refresh 删除活租户。
     tenants = tenants_table.scan(
         FilterExpression="host_id = :h AND #s <> :d",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":h": instance_id, ":d": "deleted"},
     ).get("Items", [])
+    evacuated = 0
     for t in tenants:
-        tenants_table.update_item(
-            Key={"id": t["id"]},
-            UpdateExpression="SET #s = :s, updated_at = :t",
-            ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={":s": "deleted", ":t": _now()},
-        )
+        ok, backup_key, err = _backup_tenant_for_evacuation(t)
+        if _write_terminated_tenant_state(t, ok, backup_key, err):
+            evacuated += 1
 
 
     # Delete host
@@ -367,7 +466,7 @@ def cleanup_terminated_host(event):
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":s": "deleted", ":t": _now()},
     )
-    print(f"cleaned up host {instance_id}, {len(tenants)} tenants deleted")
+    print(f"cleaned up host {instance_id}, {len(tenants)} tenants processed")
 
     # Complete lifecycle hook
     try:
@@ -379,6 +478,9 @@ def cleanup_terminated_host(event):
         )
     except Exception as e:
         print(f"complete_lifecycle_action failed: {e}")
+
+    # 放在钩子放行【之后】:见 _trigger_pending_placement 的说明。
+    _trigger_pending_placement(instance_id, evacuated)
 
 
 def rootfs_version():

@@ -340,11 +340,18 @@ HOSTS_TABLE="$(printf '%s' "$API_FUNCTION_CONFIG" |
 HOST_IDS="[]"
 if [ -n "$HOSTS_TABLE" ]; then
   # Legacy rows may lack status, so retain them while excluding only explicit soft deletes.
+  # An instance_id starting with "__" is a synthetic control-plane record, not a host:
+  # health_check keeps per-AZ failover cooldown on "__az_failover_state__" and the
+  # bootstrap promote lock uses the same reserved prefix. Neither has a status
+  # attribute, so the soft-delete filter alone retains them and the ledger would
+  # never equal the ASG instance set. The product filters the same prefix in
+  # lambda/api/services/host_service.py.
   HOST_IDS="$(Q dynamodb scan --table-name "$HOSTS_TABLE" \
     --filter-expression 'attribute_not_exists(#s) OR #s <> :deleted' \
     --expression-attribute-names '{"#s":"status"}' \
     --expression-attribute-values '{":deleted":{"S":"deleted"}}' \
-    --projection-expression instance_id | jq -c '[.Items[].instance_id.S] | unique | sort')"
+    --projection-expression instance_id | jq -c '
+      [.Items[].instance_id.S | select(startswith("__") | not)] | unique | sort')"
 else
   warn "HOSTS_TABLE is absent from the confirmed serving Lambda; host ASG will remain unresolved"
 fi

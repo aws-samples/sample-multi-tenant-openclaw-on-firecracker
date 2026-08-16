@@ -45,7 +45,25 @@ PY
 
 ## Step 0 Read-only discovery
 
+Discovery confirms the control-plane API only from the configured client URL plus
+successful authenticated probes of every required route. A route or name match is
+never enough. Supply the client call site before running it:
+
+- `OC_CONTROL_PLANE_URL` is required. Without it the API stays unresolved and every
+  later concern that correlates through the serving Lambda stays unresolved too.
+- `OC_CONTROL_PLANE_PROBE_HEADERS_FILE` points at a JSON object of request headers
+  (for example an `x-api-key` entry) when the API requires authentication. Values
+  must be plain strings. Keep the file out of version control.
+- `OC_CONTROL_PLANE_API_ID` is required only for a custom domain, where the API id
+  cannot be derived from the host name.
+- `OC_CONTROL_PLANE_PROBE_PATHS` overrides the default `/tenants,/hosts` probe set.
+- Run discovery from a place that can actually reach that URL. On the private API
+  topology the probes only succeed from inside the VPC, so run the kit on a host in
+  the VPC; from a workstation the probes return `000` and the API stays unresolved.
+
 ```bash
+export OC_CONTROL_PLANE_URL="https://<api-id>.execute-api.${REGION}.amazonaws.com/<stage>"
+export OC_CONTROL_PLANE_PROBE_HEADERS_FILE=/path/to/headers.json
 bash lib/discover-env.sh "${REGION}" manifest.json
 ```
 

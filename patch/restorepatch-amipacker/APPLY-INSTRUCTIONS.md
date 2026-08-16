@@ -287,9 +287,10 @@ Phase A is read-only and checks authorization, response contracts, query fields,
 idempotency records, environment-key preservation, alias convergence, host counters,
 and deployment-machine preflight behavior.
 
-Phase B exercises a real lifecycle: Packer parity, a controlled host replacement,
-Fluent Bit activity, host-agent logging, rebuild/reset fencing, capacity accounting,
-and private API routing. A tenant merely reaching `running` is not sufficient;
+Phase B exercises a real lifecycle: Packer parity, a controlled host replacement
+including tenant evacuation and the one-shot restore key, backup source reporting,
+device pairing self-heal, Fluent Bit activity, host-agent logging, rebuild/reset
+fencing, capacity accounting, and private API routing. A tenant merely reaching `running` is not sufficient;
 capture the issue-specific observable and prove the old failure signal is absent.
 
 ## Step 8 Exact cleanup

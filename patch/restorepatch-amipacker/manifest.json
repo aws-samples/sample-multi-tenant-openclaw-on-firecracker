@@ -1,7 +1,7 @@
 {
   "id": "restorepatch-amipacker",
   "base_sha": "50a410187e187c255272f2bc49e7ab83c72114df",
-  "patch_sha": "2d3e846ecc6df13479d7d05f23cd4c1d6255109f",
+  "patch_sha": "085c8ae422f501115092a46ae2927d5e1ebfd63d",
   "status": "MANUAL_REVIEW",
   "excludes": [
     ".gitleaks.toml"
@@ -25,11 +25,11 @@
         }
       },
       "patch": {
-        "source_sha": "2d3e846ecc6df13479d7d05f23cd4c1d6255109f",
-        "source_tree": "a92a59af8a18cf5236c12f7f18acb89c43b34e3a",
+        "source_sha": "085c8ae422f501115092a46ae2927d5e1ebfd63d",
+        "source_tree": "e2be4711795b559e5801bc8fa6f6d472795244e4",
         "assembly_index": {
           "artifact": "resources/cloudformation/patch.assembly-index.json",
-          "sha256": "68d79a2c6a0736d6261240d8efdc8ff74a91bbabab20970123ceb5b20b47bfde"
+          "sha256": "09335a4c5eedfbde822281d2766ce5fe251452c1e487e6ac8998b9ec33f15851"
         }
       }
     },
@@ -55,7 +55,7 @@
         },
         "patch_template": {
           "artifact": "resources/cloudformation/OpenClawImage.patch.json",
-          "sha256": "ee3f3e22817fb796af35aae85632ea2c98d65dd6ee6d423d99c8d38763870f08"
+          "sha256": "53ec1d1f08b22b5aac9fc0a56d86b6e811a5b8157e108142bfffadf144770179"
         }
       },
       {
@@ -67,7 +67,7 @@
         },
         "patch_template": {
           "artifact": "resources/cloudformation/OpenClawOrchestrator.patch.json",
-          "sha256": "688dfa1778513e38b7143d8c97b08e1048638432d51092a03b702acb38dd5739"
+          "sha256": "4795ebe4ab49b1556ea892b5e6bacb6ea1ccd6c0ebbbe6cc73c28fe8a98209a5"
         }
       }
     ]
@@ -1403,7 +1403,7 @@
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
       "base_sha256": "cb1b4801cca4ff445a1281bc07213f20eb46dbe5b902ff04a7b3670764bb6c2c",
-      "patch_sha256": "a7639734b55a7aca4efc3819253ecba74b6a938ce792fcba909508b6fdb851c4",
+      "patch_sha256": "ca8b311401ffe4ae29ddb92f1f180cf191b5a818342cea901094f0e50f6a6961",
       "operations": [
         {
           "resource": "repository file delivery",
@@ -1419,7 +1419,8 @@
       "fix_ids": [
         "fix-416",
         "fix-430",
-        "fix-479"
+        "fix-479",
+        "fix-509"
       ]
     },
     "deploy/lambda/api/services/action_idem.py": {
@@ -1478,7 +1479,7 @@
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
       "base_sha256": "d40eb38fd7588ae17bfd2cc517e34cbf2caea1c44537fe5d014585ab48b38f8b",
-      "patch_sha256": "479e2e0fd2ae62b729d6577221f474a5516bcb094e31da04790a7ace578aff03",
+      "patch_sha256": "60c7716ac96274280baf5b79ab0a28c8a370459d7a97fd8c416f7c1c2c7610da",
       "operations": [
         {
           "resource": "repository file delivery",
@@ -1493,7 +1494,8 @@
       ],
       "fix_ids": [
         "fix-430",
-        "fix-470"
+        "fix-470",
+        "fix-509"
       ]
     },
     "deploy/lambda/api/services/lifecycle_dispatch.py": {
@@ -1585,7 +1587,7 @@
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
       "base_sha256": "b47c950747fc8254d309d0d4fcc468ddc69f43965ee4c9ecdd24e16061c72349",
-      "patch_sha256": "3b34e072b8e0941d3a7b76acaea8ee9af27fa7610788f94ca275fc54318c97e6",
+      "patch_sha256": "b72f4f064ebfb198bea2c2cee3c9e493151df22f349aebcea837c68d54c73c94",
       "operations": [
         {
           "resource": "repository file delivery",
@@ -1600,7 +1602,8 @@
       ],
       "fix_ids": [
         "fix-393",
-        "fix-422"
+        "fix-422",
+        "fix-503"
       ]
     },
     "deploy/lambda/health_check/handler.py": {
@@ -1984,7 +1987,7 @@
             {
               "change": "A",
               "stack": "OpenClawOrchestrator",
-              "logical_id": "ApiHandlerCurrentVersion5C7F0A60eb953484cde6f4b8bf5ba9d8a32e6195",
+              "logical_id": "ApiHandlerCurrentVersion5C7F0A60cfef995b3af73a28ab73863b936cdca6",
               "resource_type": "AWS::Lambda::Version"
             },
             {
@@ -2553,7 +2556,7 @@
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
       "base_sha256": "bc2ba8a9fe76d80c5019b3433cbfecb1ba51c27aa2aae896b33509b1b2b72358",
-      "patch_sha256": "3e10ff2d202195fc49a9b7f3fe760197d9f0a83d48982e0463237234972d45b0",
+      "patch_sha256": "50a4a55c002c7d2e96bba81a21e2ebecfa9ea12d382dfd01db8e93d2ea4adc71",
       "operations": [
         {
           "resource": "repository file delivery",
@@ -2567,7 +2570,8 @@
         }
       ],
       "fix_ids": [
-        "fix-413"
+        "fix-413",
+        "fix-490"
       ]
     },
     "deploy/userdata/provision-host.sh": {
@@ -6179,7 +6183,7 @@
         "evidence": "path-derived-meta"
       },
       "base_sha256": null,
-      "patch_sha256": "f01316d0163faa918a7fc0cb0491bf6890abc1b3ac7d68d0adf66cefb878c52e",
+      "patch_sha256": "5f597d4835c0f6bfbc3d79c8fa0d12987847def53ace668490830d191995a8d3",
       "operations": [
         {
           "resource": "inert documentation or release metadata",
@@ -7752,7 +7756,7 @@
         "evidence": "path-derived-meta"
       },
       "base_sha256": "a3a8035e7cb8ff761237ab8ec2a52b981686be57ccb3cd1ad4656020a957a48c",
-      "patch_sha256": "3243215268c8c5422afcdf5d5672b1e34363c3582101e5ac5c49991acd693d20",
+      "patch_sha256": "be449887c327fd71ffb12e81f642e5fc85d75e3e0dd11eb5165dfb77259ffbb6",
       "operations": [
         {
           "resource": "inert documentation or release metadata",
@@ -7856,7 +7860,7 @@
         "evidence": "path-derived-meta"
       },
       "base_sha256": null,
-      "patch_sha256": "7e0dbdfbcbc49bb6eb5efa60472c86c105639def485a30e182b39bb2cd20e084",
+      "patch_sha256": "193c3e0545596ba49676abdc8f8929c4cb022b6881cedf3f9b2c3c908c30c21f",
       "operations": [
         {
           "resource": "inert documentation or release metadata",
@@ -7881,7 +7885,7 @@
         "evidence": "path-derived-meta"
       },
       "base_sha256": null,
-      "patch_sha256": "88c94e11354d372504b3c7f11434418a8b271599d15794438fe46d3f4730add5",
+      "patch_sha256": "ae38387073abb673914fb4490410d505f1917e6b265fa20a61fbc643163085cc",
       "operations": [
         {
           "resource": "inert documentation or release metadata",
@@ -7931,7 +7935,7 @@
         "evidence": "path-derived-meta"
       },
       "base_sha256": null,
-      "patch_sha256": "21facf97936407764ff45c2bb27a44c8f5ef1e9e3d26590f6639c904634be250",
+      "patch_sha256": "103cc94273668cd6fbe479f4ab4623bc5879a73aed6d9cb050561026f93c2a6a",
       "operations": [
         {
           "resource": "inert documentation or release metadata",
@@ -8031,7 +8035,7 @@
         "evidence": "path-derived-meta"
       },
       "base_sha256": null,
-      "patch_sha256": "35efbe068bb2dd787662534e0235c0c04015cc0f44e1c26beeb28dcae0a1cc9d",
+      "patch_sha256": "ee3f3e22817fb796af35aae85632ea2c98d65dd6ee6d423d99c8d38763870f08",
       "operations": [
         {
           "resource": "inert documentation or release metadata",
@@ -8081,7 +8085,7 @@
         "evidence": "path-derived-meta"
       },
       "base_sha256": null,
-      "patch_sha256": "1c000b6a6b36e1872d6ba13c3fc070fadf999f5a42798b349d9e27321fdf53a3",
+      "patch_sha256": "688dfa1778513e38b7143d8c97b08e1048638432d51092a03b702acb38dd5739",
       "operations": [
         {
           "resource": "inert documentation or release metadata",
@@ -8131,7 +8135,7 @@
         "evidence": "path-derived-meta"
       },
       "base_sha256": null,
-      "patch_sha256": "59a3764af009bfc6c11f2b51b6d87d41028e6db344353dd52992220b5d65bb7b",
+      "patch_sha256": "68d79a2c6a0736d6261240d8efdc8ff74a91bbabab20970123ceb5b20b47bfde",
       "operations": [
         {
           "resource": "inert documentation or release metadata",
@@ -8350,6 +8354,56 @@
       "fix_ids": [
         "fix-402"
       ]
+    },
+    "patch/manifest-2026-08-17-034613-1d22134a.json": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "4beda3508879b52cbc6c72f284d70125dbcc755948a72fefeec248bdcdaeda9f",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/push-marker-2026-08-17-034613-1d22134a.md": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "d22156321b52a51514e2f2b7b1923566066574093c982be6cdad6063fbdeeaec",
+      "operations": [
+        {
+          "resource": "inert documentation or release metadata",
+          "class": "AUTO_CLI",
+          "rollback_policy": "RETAIN",
+          "resource_refs": [],
+          "artifact_refs": [],
+          "apply_cli": "record that this path has no customer-side action",
+          "verify_cli": "confirm the path is excluded from the customer payload",
+          "rollback_cli": "no customer rollback is required"
+        }
+      ],
+      "fix_ids": []
     }
   },
   "fixes": [
@@ -8827,6 +8881,43 @@
       "verification_ids": [
         "ver-477-image"
       ]
+    },
+    {
+      "id": "fix-509",
+      "summary": "Keep tenants and their data disks alive across a host replacement.",
+      "paths": [
+        "deploy/lambda/api/services/host_service.py",
+        "deploy/lambda/api/handler.py"
+      ],
+      "applies_when": "always",
+      "params_changed": [],
+      "verification_ids": [
+        "ver-509"
+      ]
+    },
+    {
+      "id": "fix-503",
+      "summary": "Report host command stdout so an absent-backup-source sentinel is not lost.",
+      "paths": [
+        "deploy/lambda/backup/handler.py"
+      ],
+      "applies_when": "always",
+      "params_changed": [],
+      "verification_ids": [
+        "ver-503"
+      ]
+    },
+    {
+      "id": "fix-490",
+      "summary": "Re-mint an operator token when a merged pairing entry keeps no effective role.",
+      "paths": [
+        "deploy/userdata/launch-vm.sh"
+      ],
+      "applies_when": "always",
+      "params_changed": [],
+      "verification_ids": [
+        "ver-490"
+      ]
     }
   ],
   "verifications": [
@@ -9137,6 +9228,39 @@
       "fail_when": "The deficient image passes, or the assertion fails on a complete image, or it reports a failure without naming which component is missing.",
       "timeout_s": 600,
       "cleanup": "None; the assertion only reads the image."
+    },
+    {
+      "id": "ver-509",
+      "fix_id": "fix-509",
+      "phase": "B-lifecycle",
+      "action": "With one tenant running on a disposable host, terminate that host through the auto scaling group so the termination lifecycle hook runs, then read the tenant row and the control-plane log for that host.",
+      "observable": "The tenant status after the hook, whether the row carries a restore key, whether a placement invocation follows the hook, and the key's presence after the tenant is placed again.",
+      "pass_when": "The tenant becomes pending with a restore key when its backup succeeded, a placement run follows without waiting for another host-ready event, the tenant returns to running on a surviving host, and the restore key is cleared once that placement consumed it.",
+      "fail_when": "The tenant is marked deleted although its backup succeeded, it stays pending with no placement attempt, it is announced as recoverable without a usable key, or the restore key survives the placement that consumed it.",
+      "timeout_s": 2700,
+      "cleanup": "Delete the test tenant and return the group to its previous capacity."
+    },
+    {
+      "id": "ver-503",
+      "fix_id": "fix-503",
+      "phase": "B-lifecycle",
+      "action": "Run a backup for a tenant on a host whose backup script predates the absent-source sentinel, then run one where the source disk is genuinely absent.",
+      "observable": "The reported command output for each run and the resulting decision.",
+      "pass_when": "The outdated script is refreshed from the assets bucket before the backup runs, and the absent-source sentinel written on standard output reaches the caller so the delete path converges instead of retrying forever.",
+      "fail_when": "The reported output drops the standard-output sentinel, or the stale script runs unrefreshed.",
+      "timeout_s": 900,
+      "cleanup": "None; the run only reads and re-installs a fleet script already published."
+    },
+    {
+      "id": "ver-490",
+      "fix_id": "fix-490",
+      "phase": "B-lifecycle",
+      "action": "Launch a tenant whose on-disk pairing file is valid but whose merged device entry has no unrevoked token for an approved role, then launch one whose operator token was revoked, then one whose pairing file is missing.",
+      "observable": "The pairing file after the launch and the launch log decisions.",
+      "pass_when": "Only the first case gains an operator token, the healed snapshot is written atomically and backed up to the tenant table, and the revoked and missing-file cases are skipped without minting anything.",
+      "fail_when": "A revoked operator is re-minted, a device absent from the control-plane list is revived, a tenant with no valid pairing file gains a token, or the launch continues after a failed self-heal step.",
+      "timeout_s": 900,
+      "cleanup": "Delete the test tenants."
     }
   ]
 }

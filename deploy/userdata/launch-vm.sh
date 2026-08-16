@@ -1453,6 +1453,160 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
       log "FATAL(#314): paired.json merge(jq \$cur * \$ctl)失败 — aborting fail-closed"
       exit 1
     fi
+    # #490 PAIRING_SELF_HEAL_BEGIN
+    # 只在盘上 paired.json 合法(_DISK_VALID=true)且 merge 后仍有该 device 时补 token:
+    # 两者合起来证明该 device 仍在 gateway 维护的权威名单中,不会复活 remove 的 device。
+    # _DISK_VALID=false 表示盘丢失/重建/全新盘,无从知道磁盘侧撤销状态,绝对不补;
+    # 保持原有全量注入行为,不扩大任何授权暴露面。
+    # effective roles 按「未撤销 token role ∩ (roles ∪ role)」计算,只有空集才处理。
+    # 7.1 是否真的使用 revokedAtMs 未经核实;若使用则这里正确排除已撤销 token,
+    # 若不使用则该判断为 no-op、无副作用。已撤销 operator 绝不重铸覆盖。
+    _PAIRING_HEALED_RI=0
+    _PAIRING_SELF_HEAL_JQ_RI='
+      # #490 SELF_HEAL_JQ_BEGIN
+      def approved_roles($entry):
+        ([
+          (if (($entry.roles // null) | type) == "array"
+           then $entry.roles[]
+           else empty
+           end),
+          ($entry.role // empty)
+        ] | map(select((type == "string") and (length > 0))) | unique);
+      def active_roles($entry):
+        ([
+          ($entry.tokens // {}
+           | if type == "object" then to_entries[] else empty end
+           | .value
+           | select(type == "object")
+           | select((((.role // "") | type) == "string")
+                    and (((.role // "") | length) > 0))
+           | select((.revokedAtMs // false) | not)
+           | .role)
+        ] | unique);
+      def effective_roles($entry):
+        (approved_roles($entry)) as $approved
+        | (active_roles($entry)
+           | map(. as $role | select(($approved | index($role)) != null)));
+      def has_revoked_operator($entry):
+        ([
+          ($entry.tokens // {}
+           | if type == "object" then to_entries[] else empty end
+           | .value
+           | select(type == "object")
+           | select(.role == "operator")
+           | select(.revokedAtMs // false))
+        ] | length) > 0;
+      def action_for($entry):
+        if ((effective_roles($entry) | length) > 0) then "skip"
+        elif ((approved_roles($entry) | index("operator")) == null) then "unsupported"
+        elif has_revoked_operator($entry) then "revoked"
+        else "heal"
+        end;
+      reduce ($ctl | keys[]) as $k (
+        {"result": $merged, "actions": []};
+        if (($valid | not) or (.result[$k] == null)) then .
+        else .result[$k] as $entry
+          | (action_for($entry)) as $action
+          | if $action == "skip" then .
+            else .actions += [{"deviceId": $k, "action": $action}]
+              | if (($action == "heal") and (($minted[$k] // "") != "")) then
+                  .result[$k].tokens = (($entry.tokens // {}) + {
+                    "operator": {
+                      "token": $minted[$k],
+                      "role": "operator",
+                      "scopes": (if $entry.scopes == null
+                                 then ["operator.write", "operator.read"]
+                                 else $entry.scopes
+                                 end),
+                      "createdAtMs": $now,
+                      "lastUsedAtMs": $now
+                    }
+                  })
+                else .
+                end
+            end
+        end)
+      # #490 SELF_HEAL_JQ_END
+    '
+    if ! _HEAL_EVAL_RI="$(jq -cn \
+      --argjson merged "${_MERGED_RI}" \
+      --argjson ctl "${_PAIRED_RI}" \
+      --argjson valid "${_DISK_VALID}" \
+      --argjson minted '{}' \
+      --argjson now 0 \
+      "${_PAIRING_SELF_HEAL_JQ_RI}" 2>/dev/null)"; then
+      log "FATAL(#490): paired.json empty-effective-roles self-heal planning failed — aborting fail-closed"
+      exit 1
+    fi
+    if ! _HEAL_ROWS_RI="$(printf '%s' "${_HEAL_EVAL_RI}" \
+      | jq -r '.actions[] | [.deviceId, .action] | @tsv' 2>/dev/null)"; then
+      log "FATAL(#490): paired.json self-heal action decode failed — aborting fail-closed"
+      exit 1
+    fi
+    _HEAL_TOKENS_RI='{}'
+    while IFS=$'\t' read -r _HEAL_DID_RI _HEAL_ACTION_RI; do
+      [ -n "${_HEAL_DID_RI}" ] || continue
+      _HEAL_DID16_RI="$(printf '%s' "${_HEAL_DID_RI}" | cut -c1-16)"
+      case "${_HEAL_ACTION_RI}" in
+        unsupported)
+          log "WARN(#490): device=${_HEAL_DID16_RI}… empty effective roles but operator is not approved; skipped"
+          ;;
+        revoked)
+          log "WARN(#490): device=${_HEAL_DID16_RI}… revoked operator token present; skipped without remint"
+          ;;
+        heal)
+          if ! _HEAL_TOKEN_RI="$(openssl rand -base64 32 2>/dev/null \
+            | tr -d '[:space:]=' | tr '+/' '-_')" \
+             || [ "${#_HEAL_TOKEN_RI}" -ne 43 ]; then
+            log "FATAL(#490): operator token generation failed — aborting fail-closed"
+            exit 1
+          fi
+          if ! _HEAL_TOKENS_NEXT_RI="$(jq -cn \
+            --argjson minted "${_HEAL_TOKENS_RI}" \
+            --arg did "${_HEAL_DID_RI}" \
+            --arg token "${_HEAL_TOKEN_RI}" \
+            '$minted + {($did): $token}' 2>/dev/null)"; then
+            log "FATAL(#490): operator token map construction failed — aborting fail-closed"
+            exit 1
+          fi
+          _HEAL_TOKENS_RI="${_HEAL_TOKENS_NEXT_RI}"
+          unset _HEAL_TOKEN_RI _HEAL_TOKENS_NEXT_RI
+          ;;
+      esac
+      unset _HEAL_DID16_RI
+    done <<< "${_HEAL_ROWS_RI}"
+    if [ "${_HEAL_TOKENS_RI}" != "{}" ]; then
+      if ! _HEAL_NOW_MS_RI="$(date +%s%3N)" \
+         || ! [[ "${_HEAL_NOW_MS_RI}" =~ ^[0-9]+$ ]]; then
+        log "FATAL(#490): self-heal timestamp generation failed — aborting fail-closed"
+        exit 1
+      fi
+      if ! _HEALED_RI="$(jq -cn \
+        --argjson merged "${_MERGED_RI}" \
+        --argjson ctl "${_PAIRED_RI}" \
+        --argjson valid "${_DISK_VALID}" \
+        --argjson minted "${_HEAL_TOKENS_RI}" \
+        --argjson now "${_HEAL_NOW_MS_RI}" \
+        "${_PAIRING_SELF_HEAL_JQ_RI} | .result" 2>/dev/null)"; then
+        log "FATAL(#490): paired.json empty-effective-roles self-heal failed — aborting fail-closed"
+        exit 1
+      fi
+      if [ "${_HEALED_RI}" = "${_MERGED_RI}" ]; then
+        log "FATAL(#490): paired.json self-heal planned tokens but produced no change — aborting fail-closed"
+        exit 1
+      fi
+      _MERGED_RI="${_HEALED_RI}"
+      _PAIRING_HEALED_RI=1
+      while IFS=$'\t' read -r _HEAL_DID_RI _HEAL_ACTION_RI; do
+        [ "${_HEAL_ACTION_RI}" = "heal" ] || continue
+        _HEAL_DID16_RI="$(printf '%s' "${_HEAL_DID_RI}" | cut -c1-16)"
+        log "device=${_HEAL_DID16_RI}… self-healed empty effective roles (#490)"
+      done <<< "${_HEAL_ROWS_RI}"
+    fi
+    unset _HEAL_ACTION_RI _HEAL_DID_RI _HEAL_DID16_RI _HEALED_RI
+    unset _HEAL_EVAL_RI _HEAL_NOW_MS_RI _HEAL_ROWS_RI _HEAL_TOKENS_RI
+    unset _PAIRING_SELF_HEAL_JQ_RI
+    # #490 PAIRING_SELF_HEAL_END
     # 幂等:merge 结果与盘上一致则不写(避免无谓写盘 + mtime 抖动)。
     if [ "${_CUR_PAIRED}" != "${_MERGED_RI}" ]; then
       # 否则 `printf > paired.json` 中途被杀会留半个损坏文件,配合上面的损坏 fail-closed
@@ -1468,7 +1622,27 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
       _DID16_RI="$(printf '%s' "${_PAIRED_RI}" | jq -r 'keys[0] // "?"' 2>/dev/null | cut -c1-16)"
       log "paired.json re-injected (#312/#314 merge; device=${_DID16_RI}… 控制面这条已 merge,盘上其它设备+运行时字段保留)"
       unset _DID16_RI _TMP_RI
+      # #490 PAIRING_SELF_HEAL_DDB_BEGIN
+      # 盘上原子写已成功后才回写完整快照。DDB 失败 fail-open:盘上已经可用,下次 launch 再试。
+      if [ "${_PAIRING_HEALED_RI}" = "1" ]; then
+        if _HEALED_PAIRED_B64_RI="$(printf '%s' "${_MERGED_RI}" | base64 | tr -d '\n')" \
+           && [ -n "${_HEALED_PAIRED_B64_RI}" ]; then
+          aws dynamodb update-item \
+            --table-name "${TENANTS_TABLE:-openclaw-tenants}" \
+            --key "{\"id\":{\"S\":\"${TENANT_ID}\"}}" \
+            --update-expression "SET device_paired_b64 = :dpb" \
+            --expression-attribute-values "{\":dpb\":{\"S\":\"${_HEALED_PAIRED_B64_RI}\"}}" \
+            --region "${OC_REGION:-ap-northeast-1}" >/dev/null 2>&1 \
+            && log "backfilled self-healed device_paired_b64 to tenants table (#490)" \
+            || log "WARN(#490): backfill self-healed device_paired_b64 to tenants failed (non-fatal)"
+        else
+          log "WARN(#490): base64 encode for self-healed device_paired_b64 failed (non-fatal)"
+        fi
+        unset _HEALED_PAIRED_B64_RI
+      fi
+      # #490 PAIRING_SELF_HEAL_DDB_END
     fi
+    unset _PAIRING_HEALED_RI
     unset _PAIRED_RI _DEVICES_DIR_RI _CUR_PAIRED _MERGED_RI _DISK_VALID
   fi
 

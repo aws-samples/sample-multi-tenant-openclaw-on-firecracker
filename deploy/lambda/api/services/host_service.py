@@ -392,9 +392,14 @@ def _write_terminated_tenant_state(tenant, ok, backup_key, err):
         f"CRITICAL cleanup_terminated_host: tenant {tid} backup unusable ({err}); "
         "marking deleted to avoid a false recovery onto a blank disk"
     )
+    # #501 — host 终止撤租户也是终态写入点:健康位由 health_check sweep 写而 sweep 只扫
+    # running,不清就永久停在删除前的 up,已删租户伪装成健康在役租户误导排障。
     tenants_table.update_item(
         Key={"id": tid},
-        UpdateExpression="SET #s = :s, updated_at = :t",
+        UpdateExpression=(
+            "SET #s = :s, updated_at = :t "
+            "REMOVE vm_health, app_health, last_health_check"
+        ),
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":s": "deleted", ":t": _now()},
     )
@@ -440,6 +445,58 @@ def _trigger_pending_placement(instance_id, evacuated):
         )
 
 
+def _extend_terminate_hook(detail):
+    """每撤离一个租户前给终止钩子续一次心跳。
+
+    #510 —— 钩子的 HeartbeatTimeout 是 120s(真机 describe-lifecycle-hooks 实读),而每个
+    租户的同步备份实测 6.2s、最坏可达 backup Lambda 的 SSM 上限 300s。也就是说约 19 个
+    租户就会把 120s 走完,ASG 于此放行终止 → 剩下的租户连着数据盘一起消失,而一台 host 的
+    容量是几百个租户。续心跳是唯一能把窗口撑开的手段:每次调用把 120s 重新计时,总上限由
+    钩子的 GlobalTimeout 兜住(真机实读 12000s,足够几百个租户串行备份)。
+
+    失败只记日志:心跳续不上最坏是回到修复前的 120s 窗口,不能反过来让撤离中断。
+    """
+    try:
+        asg_client.record_lifecycle_action_heartbeat(
+            LifecycleHookName=detail["LifecycleHookName"],
+            AutoScalingGroupName=detail["AutoScalingGroupName"],
+            InstanceId=detail["EC2InstanceId"],
+        )
+        return True
+    except Exception as e:  # noqa: BLE001 — 续期失败不能中断撤离
+        print(f"cleanup_terminated_host: heartbeat failed ({e}); 窗口回落到 120s")
+        return False
+
+
+# 单次 Lambda 调用留给撤离的墙钟预算。api Lambda 超时 900s;留 300s 余量给收尾
+# (host 行更新、complete_lifecycle_action、放置触发),超出就自调用续跑。
+_EVACUATE_BUDGET_SEC = 600
+
+
+def _continue_evacuation(event, remaining):
+    """预算用尽但还有租户没撤 → 异步自调用同一个事件接着撤。
+
+    为什么可以直接重投同一个事件:已撤离的租户在 _write_terminated_tenant_state 里被
+    REMOVE 掉了 host_id,备份失败的被标 deleted,两者都不再匹配下一轮的
+    `host_id = :h AND status <> deleted` —— 续跑天然只会捡到还没碰过的,幂等由数据形状
+    保证,不需要额外游标。
+    """
+    try:
+        boto3.client("lambda").invoke(
+            FunctionName=os.environ.get("AWS_LAMBDA_FUNCTION_NAME", ""),
+            InvocationType="Event",
+            Payload=json.dumps(event).encode("utf-8"),
+        )
+        print(f"cleanup_terminated_host: budget 用尽,已自调用续撤 {remaining} 个租户")
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(
+            f"CRITICAL cleanup_terminated_host: 续跑自调用失败 ({e});"
+            f" 仍有 {remaining} 个租户未撤离,它们会停在 running 且 host_id 指向已销毁实例"
+        )
+        return False
+
+
 def cleanup_terminated_host(event):
     """Called by termination lifecycle hook — cleanup DynamoDB then complete hook."""
     detail = event["detail"]
@@ -453,7 +510,16 @@ def cleanup_terminated_host(event):
         ExpressionAttributeValues={":h": instance_id, ":d": "deleted"},
     ).get("Items", [])
     evacuated = 0
-    for t in tenants:
+    started = time.monotonic()
+    for idx, t in enumerate(tenants):
+        # #510 —— 预算检查放在【动手之前】:宁可把剩下的交给续跑,也不要开始一个注定被
+        # Lambda 超时打断的备份(那会留下既没备份完、状态也没落定的租户)。
+        if idx and time.monotonic() - started > _EVACUATE_BUDGET_SEC:
+            _continue_evacuation(event, len(tenants) - idx)
+            # 不放行钩子:心跳已经把窗口撑开,让续跑那一轮撤完再放行。
+            _trigger_pending_placement(instance_id, evacuated)
+            return
+        _extend_terminate_hook(detail)
         ok, backup_key, err = _backup_tenant_for_evacuation(t)
         if _write_terminated_tenant_state(t, ok, backup_key, err):
             evacuated += 1

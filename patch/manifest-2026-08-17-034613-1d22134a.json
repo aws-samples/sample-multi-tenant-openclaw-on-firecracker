@@ -1,0 +1,74 @@
+{
+  "synced_at": "2026-08-17 03:46:13 UTC+08:00",
+  "base_sha": "eb6184b88c61b45ec5a1f69c4557e4b807340e4c",
+  "source_commit": "1d22134a5bfc3ef0bb4f259ec93c6c95a0440023",
+  "commit_count": 34,
+  "file_count": 4,
+  "summary": "Sync the bb increment eb6184b8..1d22134a to the public gateway branch. Sync-LOG only (which customer-facing files reached gateway + the issues behind them); the applyable patch kit is NOT built yet (folded_into pending).",
+  "issues_synced_note": "Index back to the issue tracker for whoever builds the patch kit: before assembling the kit, walk each issue and confirm it's covered. `title` is a ≤20-char gist only — open the issue for the full problem/fix/test. Lists only issues that touched a released file this sync.",
+  "issues_synced": [
+    {
+      "id": "#415",
+      "type": "feat",
+      "title": "存量租户 device_paired_b…"
+    },
+    {
+      "id": "#469",
+      "type": "fix",
+      "title": "fix"
+    },
+    {
+      "id": "#490",
+      "type": "feat",
+      "title": "存量租户 device_paired_b…"
+    },
+    {
+      "id": "#503",
+      "type": "fix",
+      "title": "fix"
+    },
+    {
+      "id": "#509",
+      "type": "fix",
+      "title": "例行 golden AMI 升级"
+    }
+  ],
+  "needs_config_on_apply": "none detected (no config.yml key / systemd directive / DDB-TTL change in this sync)",
+  "updated_files": {
+    "host-scripts (S3-pulled / baked into rootfs)": [
+      {
+        "path": "deploy/userdata/launch-vm.sh",
+        "status": "modified",
+        "issues": [
+          "#415",
+          "#490"
+        ]
+      }
+    ],
+    "lambda (update-function-code only)": [
+      {
+        "path": "deploy/lambda/api/handler.py",
+        "status": "modified",
+        "issues": [
+          "#509"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/host_service.py",
+        "status": "modified",
+        "issues": [
+          "#509"
+        ]
+      },
+      {
+        "path": "deploy/lambda/backup/handler.py",
+        "status": "modified",
+        "issues": [
+          "#469",
+          "#503"
+        ]
+      }
+    ]
+  },
+  "folded_into": "(pending) — no patch kit built for this sync yet; a later kit should cite this manifest as source-of-record and set base_sha/patch_sha. cdk deploy is FORBIDDEN on hand-modified live deployments — the kit must ship *.patched host scripts + the full lambda tree + AWS CLI for stack changes, same shape as patch/315-concurrent-dispatch-rollup/."
+}

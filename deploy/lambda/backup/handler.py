@@ -101,9 +101,19 @@ def backup_tenant(tenant):
     host_id = tenant["host_id"]
     now = _now()
 
-    # 4th arg = CMK key id → backup-data.sh does client-side envelope encryption
-    # before upload, so even the S3 service / bucket admin never sees plaintext.
-    cmd = f"/home/ubuntu/backup-data.sh {tid} {BUCKET} {PREFIX} {CMK_KEY_ID}"
+    # Existing hosts do not rerun init-host.sh after a control-plane deploy.
+    cmd = (
+        "if ! grep -q OC_BACKUP_SOURCE_ABSENT /home/ubuntu/backup-data.sh 2>/dev/null; then "
+        "[ -r /etc/platform.env ] && { set -a; . /etc/platform.env; set +a; }; "
+        'aws s3 cp "s3://${ASSETS_BUCKET:?}/deployment/scripts/backup-data.sh" '
+        "/tmp/oc-heal-backup-data.sh --no-progress >/dev/null 2>&1 && "
+        "bash -n /tmp/oc-heal-backup-data.sh && "
+        "grep -q OC_BACKUP_SOURCE_ABSENT /tmp/oc-heal-backup-data.sh && "
+        "install -o root -g root -m 755 /tmp/oc-heal-backup-data.sh "
+        "/home/ubuntu/backup-data.sh || exit 1; "
+        "fi && "
+        f"/home/ubuntu/backup-data.sh {tid} {BUCKET} {PREFIX} {CMK_KEY_ID}"
+    )
     success, output = _ssm_run(host_id, cmd, timeout=300)
 
     result = {"tenant_id": tid, "success": success, "timestamp": now}
@@ -162,7 +172,9 @@ def _ssm_run(instance_id, command, timeout=300):
             if result["Status"] == "Success":
                 return True, result.get("StandardOutputContent", "")
             if result["Status"] in ("Failed", "TimedOut", "Cancelled"):
-                return False, result.get("StandardErrorContent", "")
+                output = result.get("StandardOutputContent", "")
+                error = result.get("StandardErrorContent", "")
+                return False, "\n".join(part.rstrip() for part in (output, error) if part)
             time.sleep(3)
         return False, "timeout"
     except Exception as e:

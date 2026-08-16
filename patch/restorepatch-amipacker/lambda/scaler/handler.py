@@ -293,10 +293,16 @@ def _process_ttl_expirations():
 
 
 def _update_tenant_status(tenant_id, status):
+    # #501 — TTL delete 也是「把 status 写成 deleted」的路径,同样必须清健康位:health_check
+    # sweep 跳过终态租户,不清就永久停在删除前的 up,把已删租户伪装成健康在役租户。只在 deleted
+    # 时清(stopped 仍是可恢复态,保留最后一次观测)。
+    expr = "SET #s = :s, updated_at = :t"
+    if status == "deleted":
+        expr += " REMOVE vm_health, app_health, last_health_check"
     try:
         tenants_table.update_item(
             Key={"id": tenant_id},
-            UpdateExpression="SET #s = :s, updated_at = :t",
+            UpdateExpression=expr,
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
                 ":s": status,

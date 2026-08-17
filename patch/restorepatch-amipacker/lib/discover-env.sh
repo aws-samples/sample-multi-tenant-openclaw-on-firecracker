@@ -367,8 +367,12 @@ fi
 # The same API package can be deployed behind more than one function. The
 # asynchronous lifecycle consumer is one measured example: updating only the API
 # function left the dispatch path on old code while a one-function precheck said
-# the overlay was already delivered. Runtime/config/size are only a cheap
-# prefilter; package membership is the verdict because repacking changes CodeSha256.
+# the overlay was already delivered. The prefilter must never decide a peer OUT
+# from information changed by the apply. Runtime, handler, and tenant table are
+# stable contracts; the fixed 1 MiB CodeSize floor only rejects packages far too
+# small to be this multi-megabyte API package (single-module functions here are
+# kilobytes). Package membership is the only verdict.
+MIN_API_PACKAGE_CODE_SIZE=1048576
 PEER_PROBE_PATHS="$(jq -c '
   [
     .paths[]?
@@ -411,9 +415,6 @@ if [ -n "$API_FUNCTION" ]; then
     api_handler="$(printf '%s' "$api_peer_config" | jq -r '.Handler // ""')"
     api_tenants_table="$(printf '%s' "$api_peer_config" |
       jq -r '.Environment.Variables.TENANTS_TABLE // ""')"
-    api_code_size="$(printf '%s' "$api_peer_config" | jq -r '.CodeSize // 0')"
-    min_code_size=$((api_code_size * 75 / 100))
-    max_code_size=$((api_code_size * 125 / 100))
 
     all_functions="$(Q lambda list-functions 2>/dev/null)" || all_functions=""
     if [ -z "$all_functions" ]; then
@@ -491,14 +492,13 @@ if [ -n "$API_FUNCTION" ]; then
         printf '%s' "$all_functions" | jq -r \
           --arg function "$API_FUNCTION" --arg runtime "$api_runtime" \
           --arg handler "$api_handler" \
-          --argjson min_size "$min_code_size" --argjson max_size "$max_code_size" '
+          --argjson min_size "$MIN_API_PACKAGE_CODE_SIZE" '
             .Functions[]?
             | select(
                 .FunctionName != $function
                 and (.Runtime // "") == $runtime
                 and (.Handler // "") == $handler
                 and (.CodeSize // 0) >= $min_size
-                and (.CodeSize // 0) <= $max_size
               )
             | [.FunctionName, (.CodeSize | tostring)]
             | @tsv

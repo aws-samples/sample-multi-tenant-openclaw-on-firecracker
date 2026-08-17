@@ -96,8 +96,11 @@ Every human decision is recorded before the first target write. After the plan
 echo, the driver proceeds through the selected phases without another prompt and
 stops only on a machine gate or failed command. It passes and records the scope
 applied for each verify step, so a control-plane-only run does not report skipped
-data-plane concerns as failures. The numbered per-phase steps below remain the
-supported manual path for operators who want to drive each phase separately.
+data-plane concerns as failures. When the auth answer is
+`resolve-from-usage-plan`, the key value is written only to a mode-0600 temporary
+headers file that is removed when the run exits; it is never written to
+`DECISION.json`, the receipt, or logs. The numbered per-phase steps below remain
+the supported manual path for operators who want to drive each phase separately.
 
 ## Step 1 Evidence and impact assessment
 

@@ -162,13 +162,15 @@ print_rollback() {
 
 on_exit() {
   local code=$?
-  if [ "$code" -ne 0 ] && [ "$FINALIZED" -eq 0 ]; then
-    [ -z "$RECEIPT" ] || set_verdict "FAILED" || true
-    if [ "$FIRST_WRITE" -eq 1 ]; then
-      print_rollback || true
+  if [ "$code" -ne 0 ]; then
+    if [ -n "$RECEIPT" ] && ! set_verdict "FAILED"; then
+      warn "could not mark the receipt FAILED; the receipt is incomplete"
+    fi
+    if [ "$FINALIZED" -eq 0 ] && [ "$FIRST_WRITE" -eq 1 ]; then
+      print_rollback || warn "could not record or print the rollback commands"
     fi
   fi
-  cleanup_temps
+  cleanup_temps || warn "could not remove one or more temporary files"
 }
 trap on_exit EXIT
 
@@ -206,6 +208,22 @@ stop_on_failure() {
   exit "$code"
 }
 
+stop_on_verification_failure() {
+  local name="$1" code="$2" reason
+  if [ "$ROUTES_IN_SCOPE" -eq 1 ]; then
+    if [ "$ROUTE_STARTED" -eq 1 ]; then
+      reason="withheld because $name failed with exit code $code; rollback-api remains available"
+    else
+      reason="withheld because $name failed with exit code $code before route apply started"
+    fi
+    record_skip "finalize-api" \
+      "$(shell_command bash "$APPLY" finalize-api --env "$ENVJSON" --kit "$KITDIR")" \
+      "$reason" \
+      || die "cannot record that finalize-api was withheld"
+  fi
+  stop_on_failure "$name" "$code"
+}
+
 say "preflight (read-only)"
 for tool in aws jq python3 curl unzip zip; do
   command -v "$tool" >/dev/null || die "need '$tool' on PATH"
@@ -226,18 +244,23 @@ ACCOUNT="$(printf '%s' "$IDENTITY" | jq -r '.Account // empty')"
 echo "   account=$ACCOUNT"
 echo "   region=$REGION"
 
-if ! python3 "$INTERVIEW" check "$KITDIR" >/dev/null 2>&1; then
+record_args=(record "$KITDIR")
+if [ -n "$ANSWERS_FILE" ]; then
+  record_args+=("$ANSWERS_FILE")
+fi
+[ ! -f "$ENVJSON" ] || record_args+=(--env "$ENVJSON")
+record_command="$(shell_command python3 "$INTERVIEW" "${record_args[@]}")"
+if [ -f "$DECISION" ]; then
+  python3 "$INTERVIEW" check "$KITDIR" \
+    || die "DECISION.json does not match the current manifest; re-run the interview explicitly: $record_command"
+else
   say "interview (one-time, before target writes)"
-  record_args=(record "$KITDIR")
-  if [ -n "$ANSWERS_FILE" ]; then
-    record_args+=("$ANSWERS_FILE")
-  elif [ ! -t 0 ]; then
+  if [ -z "$ANSWERS_FILE" ] && [ ! -t 0 ]; then
     die "no valid decision and stdin is not a TTY; pass --answers"
   fi
-  [ ! -f "$ENVJSON" ] || record_args+=(--env "$ENVJSON")
   python3 "$INTERVIEW" "${record_args[@]}" || die "answers were not recorded"
+  python3 "$INTERVIEW" check "$KITDIR" || die "decision check failed"
 fi
-python3 "$INTERVIEW" check "$KITDIR" || die "decision check failed"
 
 KIT_FINGERPRINT="$(jq -r '.kit_fingerprint // empty' "$DECISION")"
 ANSWERS_FINGERPRINT="$(jq -r '.answers_fingerprint // empty' "$DECISION")"
@@ -404,6 +427,9 @@ resolve_probe_headers() {
     return 1
   }
   key_value="$(printf '%s' "$keys" | jq -r '.items[] | select(.type == "API_KEY" and (.value // "") != "") | .value')"
+  # Discovery requires a headers file. Keep the key only in this mode-0600
+  # temporary file, remove it on exit, and never put it in DECISION.json, the
+  # receipt, or a log line.
   PROBE_HEADERS_FILE="$(mktemp "${TMPDIR:-/tmp}/autopatch-headers.XXXXXX.json")"
   remember_temp "$PROBE_HEADERS_FILE"
   chmod 0600 "$PROBE_HEADERS_FILE" || return 1
@@ -412,6 +438,7 @@ resolve_probe_headers() {
 }
 
 if [ "$AUTH_CHOICE" = "resolve-from-usage-plan" ]; then
+  echo "   API key value: mode-0600 temporary headers file only; removed on exit; not written to DECISION.json, the receipt, or logs"
   run_step "resolve-probe-auth" "resolve probe headers from the API usage plan" resolve_probe_headers
   code=$?
   [ "$code" -eq 0 ] || stop_on_failure "resolve-probe-auth" "$code"
@@ -472,7 +499,7 @@ OVERLAY_FUNCTIONS="$(jq -c '
   ]
   | map(select(. != null and . != ""))
   | unique
-' "$ENVJSON")"
+' "$ENVJSON")" || die "cannot derive the overlay function list"
 
 PRECHECK_DISPLAY="$(shell_command bash "$APPLY" precheck --env "$ENVJSON" --kit "$KITDIR")"
 run_step "precheck" "$PRECHECK_DISPLAY" \
@@ -534,11 +561,11 @@ elif [ "$OVERLAY_ALREADY" -eq 0 ]; then
 fi
 if [ "$ROUTES_IN_SCOPE" -eq 1 ]; then
   [ "$NEEDS_WRITE" -eq 1 ] || PHASES+=(backup)
-  PHASES+=(apply-api verify-api finalize-api)
+  PHASES+=(apply-api verify-api)
   NEEDS_WRITE=1
 fi
 PHASES+=(verify)
-[ "$ROUTES_IN_SCOPE" -eq 0 ] || PHASES+=(verify-api)
+[ "$ROUTES_IN_SCOPE" -eq 0 ] || PHASES+=(verify-api finalize-api)
 printf '   phases='
 printf '%s ' "${PHASES[@]}"
 printf '\n'
@@ -559,13 +586,15 @@ if [ "$NEEDS_WRITE" -eq 1 ]; then
   [ "$code" -eq 0 ] || stop_on_failure "backup" "$code"
 else
   record_skip "backup" "$(shell_command bash "$APPLY" backup --env "$ENVJSON" --kit "$KITDIR")" \
-    "every selected apply concern was already in service"
+    "every selected apply concern was already in service" \
+    || die "cannot record skipped backup"
 fi
 
 if [ "$DATA_IN_SCOPE" -eq 1 ]; then
   if [ "$DATA_ALREADY" -eq 1 ] && [ "$OVERLAY_ALREADY" -eq 1 ]; then
     record_skip "apply" "$(shell_command bash "$APPLY" apply --env "$ENVJSON" --kit "$KITDIR")" \
-      "hook, bootstrap, and overlay were ALREADY"
+      "hook, bootstrap, and overlay were ALREADY" \
+      || die "cannot record skipped apply"
   else
     apply_args=(apply --env "$ENVJSON" --kit "$KITDIR")
     [ "$ALLOW_DRIFT" != "true" ] || apply_args+=(--allow-base-drift)
@@ -573,7 +602,9 @@ if [ "$DATA_IN_SCOPE" -eq 1 ]; then
       bash "$APPLY" "${apply_args[@]}"
     code=$?
     [ "$code" -eq 0 ] || stop_on_failure "apply" "$code"
-    [ "$OVERLAY_ALREADY" -eq 1 ] || annotate_overlay "apply" "$OVERLAY_FUNCTIONS"
+    [ "$OVERLAY_ALREADY" -eq 1 ] \
+      || annotate_overlay "apply" "$OVERLAY_FUNCTIONS" \
+      || die "cannot record the apply overlay scope"
   fi
   if [ "$DATA_ALREADY" -eq 0 ]; then
     run_step "canary" "$(shell_command bash "$APPLY" canary --env "$ENVJSON" --kit "$KITDIR")" \
@@ -587,29 +618,33 @@ if [ "$DATA_IN_SCOPE" -eq 1 ]; then
     fi
     run_scoped_verify_step "verify-before-refresh" verify data
     code=$?
-    [ "$code" -eq 0 ] || stop_on_failure "verify-before-refresh" "$code"
+    [ "$code" -eq 0 ] || stop_on_verification_failure "verify-before-refresh" "$code"
     run_step "refresh" "$(shell_command bash "$APPLY" refresh --env "$ENVJSON" --kit "$KITDIR")" \
       bash "$APPLY" refresh --env "$ENVJSON" --kit "$KITDIR"
     code=$?
     [ "$code" -eq 0 ] || stop_on_failure "refresh" "$code"
   else
     record_skip "canary" "$(shell_command bash "$APPLY" canary --env "$ENVJSON" --kit "$KITDIR")" \
-      "data-plane concerns were ALREADY"
+      "data-plane concerns were ALREADY" \
+      || die "cannot record skipped canary"
     record_skip "refresh" "$(shell_command bash "$APPLY" refresh --env "$ENVJSON" --kit "$KITDIR")" \
-      "data-plane concerns were ALREADY"
+      "data-plane concerns were ALREADY" \
+      || die "cannot record skipped refresh"
   fi
 else
   if [ "$OVERLAY_ALREADY" -eq 1 ]; then
     record_skip "apply-control" \
       "$(shell_command bash "$APPLY" apply-control --env "$ENVJSON" --kit "$KITDIR")" \
-      "overlay was ALREADY"
+      "overlay was ALREADY" \
+      || die "cannot record skipped apply-control"
   else
     run_step "apply-control" \
       "$(shell_command bash "$APPLY" apply-control --env "$ENVJSON" --kit "$KITDIR")" \
       bash "$APPLY" apply-control --env "$ENVJSON" --kit "$KITDIR"
     code=$?
     [ "$code" -eq 0 ] || stop_on_failure "apply-control" "$code"
-    annotate_overlay "apply-control" "$OVERLAY_FUNCTIONS"
+    annotate_overlay "apply-control" "$OVERLAY_FUNCTIONS" \
+      || die "cannot record the apply-control overlay scope"
   fi
 fi
 
@@ -621,20 +656,23 @@ if [ "$ROUTES_IN_SCOPE" -eq 1 ]; then
   [ "$code" -eq 0 ] || stop_on_failure "apply-api" "$code"
   run_scoped_verify_step "verify-api" verify-api routes
   code=$?
-  [ "$code" -eq 0 ] || stop_on_failure "verify-api" "$code"
-  run_step "finalize-api" "$(shell_command bash "$APPLY" finalize-api --env "$ENVJSON" --kit "$KITDIR")" \
-    bash "$APPLY" finalize-api --env "$ENVJSON" --kit "$KITDIR"
-  code=$?
-  [ "$code" -eq 0 ] || stop_on_failure "finalize-api" "$code"
+  [ "$code" -eq 0 ] || stop_on_verification_failure "verify-api" "$code"
 fi
 
 run_scoped_verify_step "final-verify" verify "$FINAL_VERIFY_SCOPE"
 code=$?
-[ "$code" -eq 0 ] || stop_on_failure "final-verify" "$code"
+[ "$code" -eq 0 ] || stop_on_verification_failure "final-verify" "$code"
 if [ "$ROUTES_IN_SCOPE" -eq 1 ]; then
   run_scoped_verify_step "final-verify-api" verify-api routes
   code=$?
-  [ "$code" -eq 0 ] || stop_on_failure "final-verify-api" "$code"
+  [ "$code" -eq 0 ] || stop_on_verification_failure "final-verify-api" "$code"
+  # Starting finalization can destroy the route rollback window even if the
+  # finalization command or its receipt update later fails.
+  FINALIZED=1
+  run_step "finalize-api" "$(shell_command bash "$APPLY" finalize-api --env "$ENVJSON" --kit "$KITDIR")" \
+    bash "$APPLY" finalize-api --env "$ENVJSON" --kit "$KITDIR"
+  code=$?
+  [ "$code" -eq 0 ] || stop_on_failure "finalize-api" "$code"
 fi
 
 set_verdict "PASS" || die "cannot finalize receipt"

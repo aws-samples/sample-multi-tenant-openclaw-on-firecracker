@@ -80,13 +80,13 @@
       "sha256": "2ad4c941357e546e2c85baa037a675d6c41f426ef8ea93b3ff40073e54128702"
     },
     "lib/autopatch.sh": {
-      "sha256": "00177759163d23b0e95bed5f5d77572b9a9302075e01fe4076d37737e2f700ab"
+      "sha256": "50fe9df9de6d1c5dd45cc4b014ca587fe0a1722c113bf8e7936123508d9e5124"
     },
     "lib/discover-env.sh": {
-      "sha256": "bbd4b392eb6d79a369a25b0e63fcea9340f1cb2e52e594b3ec0479f404885fb2"
+      "sha256": "cd026927f2b1fac2e6254e09f0513a65f8e9a9bac2df3562f4e0e905cf3569a5"
     },
     "lib/interview-once.py": {
-      "sha256": "3058bf0255ae385011d5440de885a56f331f9b408fc9a1ccc8ceda542a5f93d5"
+      "sha256": "993392e6c8e6d6036bbea8a94e516e8d9bbbc16fea2b5071ce2a922b6911fd26"
     },
     "lib/lt-userdata.py": {
       "sha256": "240c14d26aa6668567f6c2bbaf8ca2d884f27532735873382317317633402779"

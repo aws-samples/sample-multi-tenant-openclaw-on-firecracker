@@ -250,7 +250,9 @@ def derive_questions(kit, manifest, env_path=None):
             "environment.probe-auth",
             "How should discovery authenticate its probes?",
             f"A path to a JSON headers file, or {RESOLVE_USAGE_PLAN!r}.",
-            "Only a file path or a usage-plan lookup is recorded; credential values are never recorded.",
+            "A usage-plan key is written only to a mode-0600 temporary headers file "
+            "that is removed when the run exits; it is never written to DECISION.json, "
+            "the receipt, or logs.",
             "auth",
             defaults.get("headers"),
         ),

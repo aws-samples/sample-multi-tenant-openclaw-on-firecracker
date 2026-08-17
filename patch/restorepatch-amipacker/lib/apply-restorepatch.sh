@@ -9,7 +9,7 @@
 #   1. host-init lifecycle hook heartbeat timeout 1200 -> 3600
 #   2. one new LaunchTemplate version carrying the Packer AMI id AND the new
 #      content-addressed bootstrap prefix, then default-version flip + controlled refresh
-#   3. openclaw-api function code overlay (reuses the live package's own dependencies)
+#   3. API-package function code overlay (reuses each live package's own dependencies)
 #   4. private REST API endpoint attachment followed by deployment and stage replacement
 #
 # Deliberately NOT done, and it will refuse if asked:
@@ -18,20 +18,29 @@
 #   * TrackDefaultLTVersion AsgShape digest and the OpenClawImage CodeBuild churn. Both are
 #     derived or content-hash projections with no independent action.
 #
-# usage: lib/apply-restorepatch.sh <precheck|backup|apply|apply-control|canary|refresh|verify|rollback|apply-api|verify-api|finalize-api|rollback-api> --env <environment.json> --kit <kit-dir> [--values <values.json>] [--allow-base-drift]
+# usage: lib/apply-restorepatch.sh <precheck|backup|apply|apply-control|canary|refresh|verify|rollback|apply-api|verify-api|finalize-api|rollback-api> --env <environment.json> --kit <kit-dir> [--values <values.json>] [--allow-base-drift] [--scope <control|data|routes|all>]
 set -uo pipefail
 
 PHASE="${1:?phase required: precheck|backup|apply|apply-control|canary|refresh|verify|rollback|apply-api|verify-api|finalize-api|rollback-api}"; shift || true
-ENVJSON=""; KITDIR="."; VALUESJSON=""; ALLOW_BASE_DRIFT=0
+ENVJSON=""; KITDIR="."; VALUESJSON=""; ALLOW_BASE_DRIFT=0; VERIFY_SCOPE="all"; VERIFY_SCOPE_SET=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --env) ENVJSON="${2:?}"; shift 2 ;;
     --kit) KITDIR="${2:?}"; shift 2 ;;
     --values) VALUESJSON="${2:?}"; shift 2 ;;
     --allow-base-drift) ALLOW_BASE_DRIFT=1; shift ;;
+    --scope) VERIFY_SCOPE="${2:?}"; VERIFY_SCOPE_SET=1; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+case "$VERIFY_SCOPE" in
+  control|data|routes|all) ;;
+  *) echo "unknown verify scope: $VERIFY_SCOPE" >&2; exit 2 ;;
+esac
+case "$PHASE" in
+  verify|verify-api) ;;
+  *) [ "$VERIFY_SCOPE_SET" -eq 0 ] || { echo "--scope is only valid for verify and verify-api" >&2; exit 2; } ;;
+esac
 [ -f "$ENVJSON" ] || { echo "FATAL: environment file not found: $ENVJSON" >&2; exit 2; }
 [ -z "$VALUESJSON" ] || [ -f "$VALUESJSON" ] \
   || { echo "FATAL: values file not found: $VALUESJSON" >&2; exit 2; }
@@ -52,7 +61,7 @@ import json, sys
 value = json.load(open(sys.argv[1]))
 for key in sys.argv[2].split("."):
     value = value.get(key, "") if isinstance(value, dict) else ""
-print(value if not isinstance(value, (dict, list)) else json.dumps(value))
+print("" if value is None else value if not isinstance(value, (dict, list)) else json.dumps(value))
 PY
 }
 
@@ -63,6 +72,25 @@ LT_VER="$(jpath "$ENVJSON" asg.lt_version_pinned)"
 BUCKET="$(jpath "$ENVJSON" assets.bucket)"
 FN="$(jpath "$ENVJSON" lambda_link.function)"
 AMI="$(jget "$ENVJSON" new_ami_id)"
+PEER_RECORDS="$(jpath "$ENVJSON" lambda_link.peers)"
+[ -n "$PEER_RECORDS" ] || PEER_RECORDS="[]"
+PEER_DISCOVERY_CONFIRMED="$(jpath "$ENVJSON" lambda_link.peer_discovery_confirmed)"
+FN_ESM_QUALIFIER="$(jpath "$ENVJSON" lambda_link.esm_qualifier)"
+PEER_FNS="$(printf '%s' "$PEER_RECORDS" | python3 -c '
+import json, sys
+for record in json.load(sys.stdin):
+    if record.get("probe_paths_present") is True:
+        print(record.get("function", ""))
+')"
+PEER_ESM_QUALIFIERS="$(printf '%s' "$PEER_RECORDS" | python3 -c '
+import json, sys
+for record in json.load(sys.stdin):
+    if record.get("probe_paths_present") is True:
+        print("%s\t%s" % (
+            record.get("function", ""),
+            record.get("esm_qualifier", ""),
+        ))
+')"
 
 # Control-plane-only phases must remain usable before the dataplane AMI and ASG are ready.
 case "$PHASE" in
@@ -71,6 +99,14 @@ case "$PHASE" in
     ;;
   apply-api)
     REQUIRED_VARS="REGION FN"
+    ;;
+  verify)
+    case "$VERIFY_SCOPE" in
+      control) REQUIRED_VARS="REGION FN" ;;
+      data) REQUIRED_VARS="REGION ASG LT_ID BUCKET" ;;
+      routes) REQUIRED_VARS="REGION" ;;
+      all) REQUIRED_VARS="REGION ASG LT_ID LT_VER BUCKET FN" ;;
+    esac
     ;;
   *)
     REQUIRED_VARS="REGION ASG LT_ID LT_VER BUCKET FN"
@@ -86,6 +122,13 @@ aws_() { aws "$@" --region "$REGION"; }
 
 die() { echo "FAIL: $*" >&2; exit 1; }
 say() { echo "== $*"; }
+
+scope_includes() {
+  case "${VERIFY_SCOPE}:$1" in
+    all:*|control:control|data:data|routes:routes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 state_put() {
   python3 - "$STATE" "$1" "$2" <<'PY'
@@ -512,19 +555,47 @@ restore_host_assets() {
   restore_s3_asset "deployment/scripts/launch-vm.sh"
 }
 
+validate_control_overlay_scope() {
+  local peer_fn peer_qualifier
+  case "$PEER_DISCOVERY_CONFIRMED" in
+    True|true) ;;
+    *)
+      die "API-package peer discovery is unconfirmed; rerun discover-env.sh from a host that can enumerate Lambda"
+      ;;
+  esac
+  [ -z "$FN_ESM_QUALIFIER" ] \
+    || die "$FN event source consumes pinned qualifier '$FN_ESM_QUALIFIER'; the \$LATEST overlay would not reach it"
+  while IFS=$'\t' read -r peer_fn peer_qualifier; do
+    [ -n "$peer_fn" ] || continue
+    [ -z "$peer_qualifier" ] \
+      || die "$peer_fn event source consumes pinned qualifier '$peer_qualifier'; the \$LATEST overlay would not reach it"
+  done <<< "$PEER_ESM_QUALIFIERS"
+}
+
 apply_control_overlay() {
   # Keep the Lambda-only path independent from every dataplane coordinate.
+  validate_control_overlay_scope
   overlay_function "$FN" "${KITDIR}/lambda/api"
+  echo "   OVERLAID $FN (API package)"
+  for peer_fn in $PEER_FNS; do
+    overlay_function "$peer_fn" "${KITDIR}/lambda/api"
+    echo "   OVERLAID $peer_fn (discovered API-package peer)"
+  done
   overlay_function openclaw-backup "${KITDIR}/lambda/backup"
+  echo "   OVERLAID openclaw-backup"
   overlay_function openclaw-health-check "${KITDIR}/lambda/health_check"
+  echo "   OVERLAID openclaw-health-check"
   overlay_function openclaw-scaler "${KITDIR}/lambda/scaler"
+  echo "   OVERLAID openclaw-scaler"
   if aws_ lambda get-function --function-name openclaw-tenant-stats-writer >/dev/null 2>&1; then
     overlay_function openclaw-tenant-stats-writer "${KITDIR}/lambda/tenant_stats"
+    echo "   OVERLAID openclaw-tenant-stats-writer"
   else
     echo "   ABSENT openclaw-tenant-stats-writer; no deployed target for its module"
   fi
   if aws_ lambda get-function --function-name openclaw-console-bff >/dev/null 2>&1; then
     overlay_function openclaw-console-bff "${KITDIR}/lambda/console-bff"
+    echo "   OVERLAID openclaw-console-bff"
   else
     echo "   ABSENT openclaw-console-bff; console delivery path is not deployed"
   fi
@@ -781,7 +852,65 @@ PY
       ov_ready=$((ov_ready + 1))
     fi
   done < <(cd "${KITDIR}/lambda/api" && find . -type f -print | sed 's|^\./||' | sort)
-  if [ "$ov_ready" -eq 0 ]; then
+  echo "   function=$FN ready=$ov_ready already=$ov_already"
+  overlay_scope_blocked=0
+  case "$PEER_DISCOVERY_CONFIRMED" in
+    True|true) ;;
+    *)
+      echo "   peer discovery: BLOCKED (rerun discover-env.sh from a host that can enumerate Lambda)"
+      overlay_scope_blocked=1
+      ;;
+  esac
+  if [ -n "$FN_ESM_QUALIFIER" ]; then
+    echo "   function=$FN BLOCKED pinned ESM qualifier=$FN_ESM_QUALIFIER"
+    overlay_scope_blocked=1
+  fi
+  for peer_fn in $PEER_FNS; do
+    peer_ready=0; peer_already=0
+    peer_work="$(mktemp -d)"
+    peer_loc="$(aws_ lambda get-function --function-name "$peer_fn" \
+      --query 'Code.Location' --output text)" \
+      || die "cannot locate peer package for $peer_fn"
+    curl -fsS -o "${peer_work}/live.zip" "$peer_loc" \
+      || die "cannot download peer package for $peer_fn"
+    (cd "$peer_work" && unzip -oq live.zip) \
+      || die "cannot unpack peer package for $peer_fn"
+    while IFS= read -r rel; do
+      case "$rel" in
+        __pycache__/*|*/__pycache__/*|*.pyc|*.pyo|.DS_Store|*/.DS_Store)
+          continue
+          ;;
+      esac
+      kf="${KITDIR}/lambda/api/${rel}"
+      lf="${peer_work}/${rel}"
+      if [ ! -f "$lf" ]; then
+        peer_ready=$((peer_ready + 1))
+        continue
+      fi
+      a="$(sha256_file "$kf")"
+      b="$(sha256_file "$lf")"
+      if [ "$a" = "$b" ]; then
+        peer_already=$((peer_already + 1))
+      else
+        peer_ready=$((peer_ready + 1))
+      fi
+    done < <(cd "${KITDIR}/lambda/api" && find . -type f -print | sed 's|^\./||' | sort)
+    echo "   function=$peer_fn ready=$peer_ready already=$peer_already"
+    ov_ready=$((ov_ready + peer_ready))
+    ov_already=$((ov_already + peer_already))
+    rm -rf "$peer_work"
+  done
+  while IFS=$'\t' read -r peer_fn peer_qualifier; do
+    [ -n "$peer_fn" ] || continue
+    if [ -n "$peer_qualifier" ]; then
+      echo "   function=$peer_fn BLOCKED pinned ESM qualifier=$peer_qualifier"
+      overlay_scope_blocked=1
+    fi
+  done <<< "$PEER_ESM_QUALIFIERS"
+  if [ "$overlay_scope_blocked" -ne 0 ]; then
+    echo "   STATE overlay=BLOCKED the complete serving scope is not safe to overlay"
+    OVERLAY_STATE=BLOCKED
+  elif [ "$ov_ready" -eq 0 ]; then
     echo "   STATE overlay=ALREADY all API modules already in service"
     OVERLAY_STATE=ALREADY
   else
@@ -793,6 +922,10 @@ PY
   say "per-concern verdict"
   printf '   hook=%s  bootstrap=%s  overlay=%s\n' \
     "${HOOK_STATE:-?}" "${BOOTSTRAP_STATE:-?}" "${OVERLAY_STATE:-?}"
+  if [ "${OVERLAY_STATE:-BLOCKED}" = "BLOCKED" ]; then
+    echo "   RESULT BLOCKED — the API-package serving scope is not safe to overlay."
+    exit 1
+  fi
   if [ "${BOOTSTRAP_STATE:-DRIFT}" = "DRIFT" ]; then
     echo "   RESULT DRIFT — apply will refuse the bootstrap step unless"
     echo "          --allow-base-drift is supplied; other concerns remain actionable."
@@ -808,6 +941,7 @@ PY
   ;;
 
 backup)
+  validate_control_overlay_scope
   say "recording restore points into $STATE"
   hook_to="$(aws_ autoscaling describe-lifecycle-hooks --auto-scaling-group-name "$ASG" \
     --query "LifecycleHooks[?LifecycleHookName=='${HOOK_NAME}'].HeartbeatTimeout|[0]" --output text)"
@@ -842,6 +976,9 @@ backup)
   sha="$(sha256_file /tmp/openclaw-api-backup.zip)"
   state_put api_backup_zip_sha256 "$sha"
   state_put "backup_${FN}" /tmp/openclaw-api-backup.zip
+  for peer_fn in $PEER_FNS; do
+    backup_function "$peer_fn"
+  done
   for extra_fn in openclaw-backup openclaw-health-check openclaw-scaler \
     openclaw-tenant-stats-writer openclaw-console-bff; do
     if aws_ lambda get-function --function-name "$extra_fn" >/dev/null 2>&1; then
@@ -858,6 +995,9 @@ backup)
 apply)
   [ -f "$STATE" ] || die "no backup state; run backup first"
   [ -n "$AMI" ] || die "new_ami_id missing from environment; bake the AMI per host-scripts/packer/CUSTOMER-GUIDE.md first, or use apply-control for the control plane only"
+  # Refuse before any concern writes when the complete API-package serving scope
+  # is unknown or a mapping would stay pinned to an old published version.
+  validate_control_overlay_scope
 
   say "1/3 widen $HOOK_NAME heartbeat to ${NEW_TIMEOUT}s"
   aws_ autoscaling put-lifecycle-hook --auto-scaling-group-name "$ASG" \
@@ -1180,190 +1320,321 @@ refresh)
 
 verify)
   rc=0
-  say "hook heartbeat"
-  cur="$(aws_ autoscaling describe-lifecycle-hooks --auto-scaling-group-name "$ASG" \
-    --query "LifecycleHooks[?LifecycleHookName=='${HOOK_NAME}'].HeartbeatTimeout|[0]" --output text)"
-  [ "$cur" = "$NEW_TIMEOUT" ] && echo "   PASS heartbeat=$cur" || { echo "   FAIL heartbeat=$cur"; rc=1; }
+  verify_pass_count=0
+  verify_fail_count=0
+  verify_skip_count=0
+  verify_status() {
+    local kind="$1" message="$2"
+    echo "   $kind $message"
+    case "$kind" in
+      PASS) verify_pass_count=$((verify_pass_count + 1)) ;;
+      FAIL|INCONCLUSIVE) verify_fail_count=$((verify_fail_count + 1)) ;;
+      SKIP|ABSENT) verify_skip_count=$((verify_skip_count + 1)) ;;
+    esac
+  }
+  verify_out_of_scope() {
+    verify_status SKIP "$1 (out of scope: $VERIFY_SCOPE)"
+  }
+  print_optional_verify_value() {
+    case "$1" in
+      ""|None) echo "   <absent>" ;;
+      *) printf '%s\n' "$1" ;;
+    esac
+  }
 
-  say "MinSize must be unchanged (this tool never sets it to zero)"
-  minsz="$(aws_ autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG" \
-    --query 'AutoScalingGroups[0].MinSize' --output text)"
-  backup_minsz="$(state_get asg_backup_min_size)"
-  if [ -z "$backup_minsz" ]; then
-    echo "   SKIP no backup MinSize record; run backup before verify"
-  elif [ "$minsz" = "$backup_minsz" ]; then
-    echo "   PASS MinSize=$minsz unchanged from backup"
-  else
-    echo "   FAIL this tool changed MinSize: backup=$backup_minsz current=$minsz"
-    rc=1
-  fi
-
-  say "default LT version carries the new bootstrap prefix and the new image"
-  ud="$(aws_ ec2 describe-launch-template-versions --launch-template-id "$LT_ID" \
-    --versions '$Default' --query 'LaunchTemplateVersions[0].LaunchTemplateData.UserData' \
-    --output text | base64 -d)"
-  if printf '%s' "$ud" | grep -q "$ASSET_BUNDLE_PREFIX"; then
-    echo "   PASS bootstrap prefix"
-  else
-    verify_prefix="$(printf '%s' "$ud" \
-      | grep -oE 'deployment/bootstrap/host/[0-9a-f]{64}' | head -1 | sed 's|.*/||')"
-    verify_probe=""
-    verify_content_equal=0
-    [ -z "$verify_prefix" ] || verify_probe="$(mktemp -d)"
-    if [ -n "$verify_probe" ] \
-      && aws_ s3 cp "s3://${BUCKET}/deployment/bootstrap/host/${verify_prefix}/init-host.sh" \
-        "${verify_probe}/live-init-host.sh" --no-progress >/dev/null 2>&1; then
-      if ( render_bootstrap_artifact "${KITDIR}/host-scripts/init-host.sh.patched" \
-           "${verify_probe}/live-init-host.sh" "${verify_probe}/rendered-init-host.sh" ); then
-        if python3 - "${verify_probe}/live-init-host.sh" \
-          "${verify_probe}/rendered-init-host.sh" <<'PY'
-import pathlib
-import re
-import sys
-
-def code_only(p):
-    # compare executable content only: the publish scrub removes whole comment lines,
-    # so comments must not decide whether the environment is on a different version
-    out = []
-    for line in pathlib.Path(p).read_text(encoding="utf-8", errors="replace").splitlines():
-        s = line.strip()
-        if not s or s.startswith("#"):
-            continue
-        out.append(re.sub(r"\s+", " ", s))
-    return out
-
-sys.exit(0 if code_only(sys.argv[1]) == code_only(sys.argv[2]) else 1)
-PY
-        then
-          verify_content_equal=1
-        fi
-      fi
-    fi
-    if [ "$verify_content_equal" -eq 1 ]; then
-      echo "   PASS bootstrap content-equal under a different prefix: $verify_prefix"
+  if scope_includes data; then
+    say "hook heartbeat"
+    hook_backup_timeout="$(state_get hook_backup_timeout)"
+    if [ -z "$hook_backup_timeout" ]; then
+      verify_status SKIP "heartbeat assertion: this run did not apply the hook concern"
     else
-      # resolve_bootstrap_state can fail closed into DRIFT during precheck; verify is an
-      # acceptance path, so an undecidable download or render must count as a failure.
-      echo "   FAIL bootstrap prefix absent"
-      rc=1
-    fi
-    [ -z "$verify_probe" ] || rm -rf "$verify_probe"
-  fi
-  printf '%s' "$ud" | grep -q '{{' && { echo "   FAIL unrendered placeholder in UserData"; rc=1; } \
-    || echo "   PASS no unrendered placeholder"
-  img="$(aws_ ec2 describe-launch-template-versions --launch-template-id "$LT_ID" \
-    --versions '$Default' --query 'LaunchTemplateVersions[0].LaunchTemplateData.ImageId' --output text)"
-  if [ -n "$AMI" ]; then
-    [ "$img" = "$AMI" ] && echo "   PASS ImageId=$img" || { echo "   FAIL ImageId=$img"; rc=1; }
-  else
-    echo "   INCONCLUSIVE new_ami_id absent from environment; ImageId=$img"
-    rc=1
-  fi
-
-  say "bootstrap object present at its content-addressed key"
-  expected_bootstrap_sha="$(state_get rendered_bootstrap_sha256)"
-  bootstrap_object_prefix="$(printf '%s' "$ud" \
-    | grep -oE 'deployment/bootstrap/host/[0-9a-f]{64}' | head -1 | sed 's|.*/||')"
-  bootstrap_readback="$(mktemp)"
-  bootstrap_rendered=""
-  if [ -z "$bootstrap_object_prefix" ]; then
-    echo "   FAIL cannot extract bootstrap object prefix from default LT UserData"
-    rc=1
-  elif aws_ s3 cp "s3://${BUCKET}/deployment/bootstrap/host/${bootstrap_object_prefix}/init-host.sh" \
-      "$bootstrap_readback" --no-progress >/dev/null 2>&1; then
-    actual_bootstrap_sha="$(sha256_file "$bootstrap_readback")"
-    if [ -n "$expected_bootstrap_sha" ] && [ "$actual_bootstrap_sha" = "$expected_bootstrap_sha" ]; then
-      echo "   PASS object present with this apply's rendered sha256=$actual_bootstrap_sha"
-    elif [ -n "$expected_bootstrap_sha" ]; then
-      echo "   FAIL bootstrap sha256=$actual_bootstrap_sha expected=$expected_bootstrap_sha"
-      rc=1
-    else
-      # ALREADY skips upload and digest state, so verify the live key by executable content.
-      bootstrap_rendered="$(mktemp)"
-      if ( render_bootstrap_artifact "${KITDIR}/host-scripts/init-host.sh.patched" \
-           "$bootstrap_readback" "$bootstrap_rendered" ); then
-        if python3 - "$bootstrap_readback" "$bootstrap_rendered" <<'PY'
-import pathlib
-import re
-import sys
-
-def code_only(p):
-    # compare executable content only: the publish scrub removes whole comment lines,
-    # so comments must not decide whether the environment is on a different version
-    out = []
-    for line in pathlib.Path(p).read_text(encoding="utf-8", errors="replace").splitlines():
-        s = line.strip()
-        if not s or s.startswith("#"):
-            continue
-        out.append(re.sub(r"\s+", " ", s))
-    return out
-
-sys.exit(0 if code_only(sys.argv[1]) == code_only(sys.argv[2]) else 1)
-PY
-        then
-          echo "   PASS object content-equal to kit artifact at live prefix: $bootstrap_object_prefix"
-        else
-          echo "   FAIL bootstrap content differs from kit artifact at live prefix: $bootstrap_object_prefix"
-          rc=1
-        fi
+      cur="$(aws_ autoscaling describe-lifecycle-hooks --auto-scaling-group-name "$ASG" \
+        --query "LifecycleHooks[?LifecycleHookName=='${HOOK_NAME}'].HeartbeatTimeout|[0]" --output text)"
+      if [ "$cur" = "$NEW_TIMEOUT" ]; then
+        verify_status PASS "heartbeat=$cur"
       else
-        echo "   FAIL cannot render kit bootstrap from live object at prefix: $bootstrap_object_prefix"
+        verify_status FAIL "heartbeat=$cur"
         rc=1
       fi
     fi
-    # Comments retain historical placeholders, so only executable lines are gated.
-    if awk '!/^[[:space:]]*#/ && /\{\{[A-Z_]+\}\}/ {found=1} END {exit found}' "$bootstrap_readback"; then
-      echo "   PASS bootstrap code lines have no unresolved placeholder"
+
+    say "MinSize must be unchanged (this tool never sets it to zero)"
+    minsz="$(aws_ autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG" \
+      --query 'AutoScalingGroups[0].MinSize' --output text)"
+    backup_minsz="$(state_get asg_backup_min_size)"
+    if [ -z "$backup_minsz" ]; then
+      verify_status SKIP "no backup MinSize record; run backup before verify"
+    elif [ "$minsz" = "$backup_minsz" ]; then
+      verify_status PASS "MinSize=$minsz unchanged from backup"
     else
-      echo "   FAIL bootstrap code line contains an unresolved placeholder"
+      verify_status FAIL "this tool changed MinSize: backup=$backup_minsz current=$minsz"
       rc=1
     fi
+
+    say "default LT version carries the new bootstrap prefix and the new image"
+    ud="$(aws_ ec2 describe-launch-template-versions --launch-template-id "$LT_ID" \
+      --versions '$Default' --query 'LaunchTemplateVersions[0].LaunchTemplateData.UserData' \
+      --output text | base64 -d)"
+    if printf '%s' "$ud" | grep -q "$ASSET_BUNDLE_PREFIX"; then
+      verify_status PASS "bootstrap prefix"
+    else
+      verify_prefix="$(printf '%s' "$ud" \
+        | grep -oE 'deployment/bootstrap/host/[0-9a-f]{64}' | head -1 | sed 's|.*/||')"
+      verify_probe=""
+      verify_content_equal=0
+      [ -z "$verify_prefix" ] || verify_probe="$(mktemp -d)"
+      if [ -n "$verify_probe" ] \
+        && aws_ s3 cp "s3://${BUCKET}/deployment/bootstrap/host/${verify_prefix}/init-host.sh" \
+          "${verify_probe}/live-init-host.sh" --no-progress >/dev/null 2>&1; then
+        if ( render_bootstrap_artifact "${KITDIR}/host-scripts/init-host.sh.patched" \
+             "${verify_probe}/live-init-host.sh" "${verify_probe}/rendered-init-host.sh" ); then
+          if python3 - "${verify_probe}/live-init-host.sh" \
+            "${verify_probe}/rendered-init-host.sh" <<'PY'
+import pathlib
+import re
+import sys
+
+def code_only(p):
+    # compare executable content only: the publish scrub removes whole comment lines,
+    # so comments must not decide whether the environment is on a different version
+    out = []
+    for line in pathlib.Path(p).read_text(encoding="utf-8", errors="replace").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        out.append(re.sub(r"\s+", " ", s))
+    return out
+
+sys.exit(0 if code_only(sys.argv[1]) == code_only(sys.argv[2]) else 1)
+PY
+          then
+            verify_content_equal=1
+          fi
+        fi
+      fi
+      if [ "$verify_content_equal" -eq 1 ]; then
+        verify_status PASS "bootstrap content-equal under a different prefix: $verify_prefix"
+      else
+        # resolve_bootstrap_state can fail closed into DRIFT during precheck; verify is an
+        # acceptance path, so an undecidable download or render must count as a failure.
+        verify_status FAIL "bootstrap prefix absent"
+        rc=1
+      fi
+      [ -z "$verify_probe" ] || rm -rf "$verify_probe"
+    fi
+    if printf '%s' "$ud" | grep -q '{{'; then
+      verify_status FAIL "unrendered placeholder in UserData"
+      rc=1
+    else
+      verify_status PASS "no unrendered placeholder"
+    fi
+    img="$(aws_ ec2 describe-launch-template-versions --launch-template-id "$LT_ID" \
+      --versions '$Default' --query 'LaunchTemplateVersions[0].LaunchTemplateData.ImageId' --output text)"
+    if [ -n "$AMI" ]; then
+      if [ "$img" = "$AMI" ]; then
+        verify_status PASS "ImageId=$img"
+      else
+        verify_status FAIL "ImageId=$img"
+        rc=1
+      fi
+    else
+      verify_status INCONCLUSIVE "new_ami_id absent from environment; ImageId=$img"
+      rc=1
+    fi
+
+    say "bootstrap object present at its content-addressed key"
+    expected_bootstrap_sha="$(state_get rendered_bootstrap_sha256)"
+    bootstrap_object_prefix="$(printf '%s' "$ud" \
+      | grep -oE 'deployment/bootstrap/host/[0-9a-f]{64}' | head -1 | sed 's|.*/||')"
+    bootstrap_readback="$(mktemp)"
+    bootstrap_rendered=""
+    if [ -z "$bootstrap_object_prefix" ]; then
+      verify_status FAIL "cannot extract bootstrap object prefix from default LT UserData"
+      rc=1
+    elif aws_ s3 cp "s3://${BUCKET}/deployment/bootstrap/host/${bootstrap_object_prefix}/init-host.sh" \
+        "$bootstrap_readback" --no-progress >/dev/null 2>&1; then
+      actual_bootstrap_sha="$(sha256_file "$bootstrap_readback")"
+      if [ -n "$expected_bootstrap_sha" ] && [ "$actual_bootstrap_sha" = "$expected_bootstrap_sha" ]; then
+        verify_status PASS "object present with this apply's rendered sha256=$actual_bootstrap_sha"
+      elif [ -n "$expected_bootstrap_sha" ]; then
+        verify_status FAIL "bootstrap sha256=$actual_bootstrap_sha expected=$expected_bootstrap_sha"
+        rc=1
+      else
+        # ALREADY skips upload and digest state, so verify the live key by executable content.
+        bootstrap_rendered="$(mktemp)"
+        if ( render_bootstrap_artifact "${KITDIR}/host-scripts/init-host.sh.patched" \
+             "$bootstrap_readback" "$bootstrap_rendered" ); then
+          if python3 - "$bootstrap_readback" "$bootstrap_rendered" <<'PY'
+import pathlib
+import re
+import sys
+
+def code_only(p):
+    # compare executable content only: the publish scrub removes whole comment lines,
+    # so comments must not decide whether the environment is on a different version
+    out = []
+    for line in pathlib.Path(p).read_text(encoding="utf-8", errors="replace").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        out.append(re.sub(r"\s+", " ", s))
+    return out
+
+sys.exit(0 if code_only(sys.argv[1]) == code_only(sys.argv[2]) else 1)
+PY
+        then
+            verify_status PASS "object content-equal to kit artifact at live prefix: $bootstrap_object_prefix"
+          else
+            verify_status FAIL "bootstrap content differs from kit artifact at live prefix: $bootstrap_object_prefix"
+            rc=1
+          fi
+        else
+          verify_status FAIL "cannot render kit bootstrap from live object at prefix: $bootstrap_object_prefix"
+          rc=1
+        fi
+      fi
+      # Comments retain historical placeholders, so only executable lines are gated.
+      if awk '!/^[[:space:]]*#/ && /\{\{[A-Z_]+\}\}/ {found=1} END {exit found}' "$bootstrap_readback"; then
+        verify_status PASS "bootstrap code lines have no unresolved placeholder"
+      else
+        verify_status FAIL "bootstrap code line contains an unresolved placeholder"
+        rc=1
+      fi
+    else
+      verify_status FAIL "object missing"
+      rc=1
+    fi
+    rm -f "$bootstrap_readback"
+    [ -z "$bootstrap_rendered" ] || rm -f "$bootstrap_rendered"
+
+    say "instance refresh progress"
+    refresh_progress="$(aws_ autoscaling describe-instance-refreshes --auto-scaling-group-name "$ASG" \
+      --query 'InstanceRefreshes[0].[Status,PercentageComplete]' --output text)"
+    print_optional_verify_value "$refresh_progress"
+
+    say "CodeBuild functional config unchanged (content-hash churn only)"
+    functional_config="$(aws_ codebuild batch-get-projects --names openclaw-golden-image-builder \
+      --query 'projects[0].[environment.type,environment.computeType,timeoutInMinutes]' --output text)"
+    print_optional_verify_value "$functional_config"
   else
-    echo "   FAIL object missing"
-    rc=1
+    say "hook heartbeat"
+    verify_out_of_scope "heartbeat assertion"
+    say "MinSize must be unchanged (this tool never sets it to zero)"
+    verify_out_of_scope "MinSize assertion"
+    say "default LT version carries the new bootstrap prefix and the new image"
+    verify_out_of_scope "default LT bootstrap prefix assertion"
+    verify_out_of_scope "default LT UserData placeholder assertion"
+    verify_out_of_scope "default LT ImageId assertion"
+    say "bootstrap object present at its content-addressed key"
+    verify_out_of_scope "bootstrap object content assertion"
+    verify_out_of_scope "bootstrap object placeholder assertion"
+    say "instance refresh progress"
+    verify_out_of_scope "instance refresh assertion"
+    say "CodeBuild functional config unchanged (content-hash churn only)"
+    verify_out_of_scope "image-build functional-config assertion"
   fi
-  rm -f "$bootstrap_readback"
-  [ -z "$bootstrap_rendered" ] || rm -f "$bootstrap_rendered"
 
-  say "openclaw-api code changed and its environment was not overwritten"
-  want="$(state_get api_env_key_count)"
-  now="$(aws_ lambda get-function-configuration --function-name "$FN" \
-    --query 'length(Environment.Variables)' --output text)"
-  [ -n "$want" ] && { [ "$want" = "$now" ] && echo "   PASS env keys=$now" \
-    || { echo "   FAIL env keys $want -> $now"; rc=1; }; }
-  aws_ lambda invoke --function-name "$FN" --payload eyJwYXRoIjoiL3BpbmcifQ== \
-    /tmp/restorepatch-invoke.json --query FunctionError --output text | grep -qi none \
-    && echo "   PASS invoke has no FunctionError" \
-    || { echo "   NOTE inspect /tmp/restorepatch-invoke.json; a 404 body on a private API is expected"; }
+  if scope_includes control; then
+    say "openclaw-api code changed and its environment was not overwritten"
+    want="$(state_get api_env_key_count)"
+    now="$(aws_ lambda get-function-configuration --function-name "$FN" \
+      --query 'length(Environment.Variables)' --output text)"
+    if [ -n "$want" ]; then
+      if [ "$want" = "$now" ]; then
+        verify_status PASS "env keys=$now"
+      else
+        verify_status FAIL "env keys $want -> $now"
+        rc=1
+      fi
+    fi
+    if aws_ lambda invoke --function-name "$FN" --payload eyJwYXRoIjoiL3BpbmcifQ== \
+        /tmp/restorepatch-invoke.json --query FunctionError --output text | grep -qi none; then
+      verify_status PASS "invoke has no FunctionError"
+    else
+      verify_status NOTE "inspect /tmp/restorepatch-invoke.json; a 404 body on a private API is expected"
+    fi
 
-  say "API unqualified and alias-resolved code paths have converged"
-  applied_version="$(state_get api_applied_version)"
-  applied_alias="$(state_get api_alias_name)"
-  if [ -n "$applied_alias" ]; then
-    alias_version="$(aws_ lambda get-alias --function-name "$FN" --name "$applied_alias" \
-      --query FunctionVersion --output text)"
-    [ "$alias_version" = "$applied_version" ] \
-      && echo "   PASS alias $applied_alias points to version $applied_version" \
-      || { echo "   FAIL alias $applied_alias points to $alias_version, expected $applied_version"; rc=1; }
-    latest_sha="$(aws_ lambda get-function-configuration --function-name "$FN" \
-      --query CodeSha256 --output text)"
-    alias_sha="$(aws_ lambda get-function-configuration --function-name "$FN" \
-      --qualifier "$alias_version" --query CodeSha256 --output text)"
-    [ "$latest_sha" = "$alias_sha" ] \
-      && echo "   PASS unqualified and alias-resolved CodeSha256 match" \
-      || { echo "   FAIL CodeSha256 differs between unqualified and alias-resolved paths"; rc=1; }
+    say "discovered API-package peers carry the overlay byte for byte"
+    if [ "$PEER_DISCOVERY_CONFIRMED" != "True" ] \
+        && [ "$PEER_DISCOVERY_CONFIRMED" != "true" ]; then
+      verify_status FAIL "API-package peer discovery is unconfirmed"
+      rc=1
+    elif [ -z "$PEER_FNS" ]; then
+      verify_status PASS "no additional API-package peers were discovered"
+    else
+      for peer_fn in $PEER_FNS; do
+        peer_verify_work="$(mktemp -d)"
+        peer_verify_loc="$(aws_ lambda get-function --function-name "$peer_fn" \
+          --query 'Code.Location' --output text)" || peer_verify_loc=""
+        if [ -z "$peer_verify_loc" ] \
+            || ! curl -fsS -o "${peer_verify_work}/live.zip" "$peer_verify_loc" \
+            || ! (cd "$peer_verify_work" && unzip -oq live.zip); then
+          verify_status FAIL "function=$peer_fn package could not be inspected"
+          rc=1
+          rm -rf "$peer_verify_work"
+          break
+        fi
+        peer_mismatch=""
+        while IFS= read -r rel; do
+          case "$rel" in
+            __pycache__/*|*/__pycache__/*|*.pyc|*.pyo|.DS_Store|*/.DS_Store)
+              continue
+              ;;
+          esac
+          if [ ! -f "${peer_verify_work}/${rel}" ] \
+              || ! cmp -s "${KITDIR}/lambda/api/${rel}" "${peer_verify_work}/${rel}"; then
+            peer_mismatch="$rel"
+            break
+          fi
+        done < <(cd "${KITDIR}/lambda/api" && find . -type f -print | sed 's|^\./||' | sort)
+        if [ -n "$peer_mismatch" ]; then
+          verify_status FAIL "function=$peer_fn module=$peer_mismatch differs from the kit"
+          rc=1
+          rm -rf "$peer_verify_work"
+          break
+        fi
+        verify_status PASS "function=$peer_fn every overlaid module matches the kit byte for byte"
+        rm -rf "$peer_verify_work"
+      done
+    fi
+
+    say "API unqualified and alias-resolved code paths have converged"
+    applied_version="$(state_get api_applied_version)"
+    applied_alias="$(state_get api_alias_name)"
+    if [ -n "$applied_alias" ]; then
+      alias_version="$(aws_ lambda get-alias --function-name "$FN" --name "$applied_alias" \
+        --query FunctionVersion --output text)"
+      if [ "$alias_version" = "$applied_version" ]; then
+        verify_status PASS "alias $applied_alias points to version $applied_version"
+      else
+        verify_status FAIL "alias $applied_alias points to $alias_version, expected $applied_version"
+        rc=1
+      fi
+      latest_sha="$(aws_ lambda get-function-configuration --function-name "$FN" \
+        --query CodeSha256 --output text)"
+      alias_sha="$(aws_ lambda get-function-configuration --function-name "$FN" \
+        --qualifier "$alias_version" --query CodeSha256 --output text)"
+      if [ "$latest_sha" = "$alias_sha" ]; then
+        verify_status PASS "unqualified and alias-resolved CodeSha256 match"
+      else
+        verify_status FAIL "CodeSha256 differs between unqualified and alias-resolved paths"
+        rc=1
+      fi
+    else
+      verify_status ABSENT "alias path; unqualified version is the serving path"
+    fi
   else
-    echo "   ABSENT alias path; unqualified version is the serving path"
+    say "openclaw-api code changed and its environment was not overwritten"
+    verify_out_of_scope "API environment-key preservation assertion"
+    verify_out_of_scope "API invocation assertion"
+    say "discovered API-package peers carry the overlay byte for byte"
+    verify_out_of_scope "API-package peer overlay assertion"
+    say "API unqualified and alias-resolved code paths have converged"
+    verify_out_of_scope "API alias-version assertion"
+    verify_out_of_scope "API unqualified/alias CodeSha256 assertion"
   fi
 
-  say "instance refresh progress"
-  aws_ autoscaling describe-instance-refreshes --auto-scaling-group-name "$ASG" \
-    --query 'InstanceRefreshes[0].[Status,PercentageComplete]' --output text
-
-  say "CodeBuild functional config unchanged (content-hash churn only)"
-  aws_ codebuild batch-get-projects --names openclaw-golden-image-builder \
-    --query 'projects[0].[environment.type,environment.computeType,timeoutInMinutes]' --output text
-
+  echo "verify scope=$VERIFY_SCOPE pass=$verify_pass_count fail=$verify_fail_count skip=$verify_skip_count"
   [ "$rc" -eq 0 ] && say "verify PASS" || say "verify FAIL"
   exit "$rc"
   ;;
@@ -1404,6 +1675,9 @@ rollback)
 
   say "restore openclaw-api code and alias"
   restore_function "$FN"
+  for peer_fn in $PEER_FNS; do
+    [ -n "$(state_get "backup_${peer_fn}")" ] && restore_function "$peer_fn"
+  done
   for extra_fn in openclaw-backup openclaw-health-check openclaw-scaler \
     openclaw-tenant-stats-writer openclaw-console-bff; do
     [ -n "$(state_get "backup_${extra_fn}")" ] && restore_function "$extra_fn"
@@ -1503,9 +1777,14 @@ verify-api)
     *" $expected_vpce "*) echo "   PASS endpointConfiguration.vpcEndpointIds contains $expected_vpce" ;;
     *) echo "   FAIL endpointConfiguration.vpcEndpointIds=$api_vpces"; rc=1 ;;
   esac
-  [ -n "$expected_deployment" ] && [ "$stage_deployment" = "$expected_deployment" ] \
-    && echo "   PASS stage $API_STAGE deploymentId=$stage_deployment" \
-    || { echo "   FAIL stage $API_STAGE deploymentId=$stage_deployment expected=$expected_deployment"; rc=1; }
+  if [ -z "$expected_deployment" ]; then
+    echo "   SKIP stage deployment assertion: apply-api has not recorded a replacement deployment"
+  elif [ "$stage_deployment" = "$expected_deployment" ]; then
+    echo "   PASS stage $API_STAGE deploymentId=$stage_deployment"
+  else
+    echo "   FAIL stage $API_STAGE deploymentId=$stage_deployment expected=$expected_deployment"
+    rc=1
+  fi
   [ "$rc" -eq 0 ] && say "verify-api PASS" || say "verify-api FAIL"
   exit "$rc"
   ;;

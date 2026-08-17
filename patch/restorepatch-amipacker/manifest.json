@@ -77,10 +77,16 @@
       "sha256": "07b9633975bdc8e76803af83f9057c09a3fe28707f5284c727933e3050238df1"
     },
     "lib/apply-restorepatch.sh": {
-      "sha256": "193c3e0545596ba49676abdc8f8929c4cb022b6881cedf3f9b2c3c908c30c21f"
+      "sha256": "2ad4c941357e546e2c85baa037a675d6c41f426ef8ea93b3ff40073e54128702"
+    },
+    "lib/autopatch.sh": {
+      "sha256": "00177759163d23b0e95bed5f5d77572b9a9302075e01fe4076d37737e2f700ab"
     },
     "lib/discover-env.sh": {
-      "sha256": "ae38387073abb673914fb4490410d505f1917e6b265fa20a61fbc643163085cc"
+      "sha256": "bbd4b392eb6d79a369a25b0e63fcea9340f1cb2e52e594b3ec0479f404885fb2"
+    },
+    "lib/interview-once.py": {
+      "sha256": "3058bf0255ae385011d5440de885a56f331f9b408fc9a1ccc8ceda542a5f93d5"
     },
     "lib/lt-userdata.py": {
       "sha256": "240c14d26aa6668567f6c2bbaf8ca2d884f27532735873382317317633402779"

@@ -8,7 +8,9 @@ The driver subcommands are `precheck`, `backup`, `apply`, `apply-control`,
 `canary`, `refresh`, `verify`, `rollback`, `apply-api`, `verify-api`,
 `finalize-api`, and `rollback-api`. `--values <file>` optionally supplies a JSON
 object keyed by bootstrap placeholder name when a value cannot be recovered from
-the live rendered script.
+the live rendered script. `verify` accepts an optional
+`--scope <control|data|routes|all>`; omitting it keeps the existing `all`
+behavior.
 
 For a full rollout, use this order:
 `precheck → backup → apply → canary → refresh → verify`. A failed or missing
@@ -79,6 +81,24 @@ bash lib/apply-restorepatch.sh precheck \
 hook, bootstrap, and Lambda overlay. A fully applied environment exits successfully
 because a rerun is a no-op.
 
+## Unattended path (answer once, then apply)
+
+Print the complete derived interview, then fill one JSON answers file from the
+skeleton at the end of the output:
+
+```bash
+python3 lib/interview-once.py ask .
+${EDITOR:-vi} answers.json
+bash lib/autopatch.sh . --answers answers.json --region "${REGION}" --yes
+```
+
+Every human decision is recorded before the first target write. After the plan
+echo, the driver proceeds through the selected phases without another prompt and
+stops only on a machine gate or failed command. It passes and records the scope
+applied for each verify step, so a control-plane-only run does not report skipped
+data-plane concerns as failures. The numbered per-phase steps below remain the
+supported manual path for operators who want to drive each phase separately.
+
 ## Step 1 Evidence and impact assessment
 
 Record the current Lambda digest, environment-key count, ASG capacity, lifecycle
@@ -113,6 +133,26 @@ This is the patch's only immediate hot repair. The driver downloads each live
 Lambda package, overlays every shipped module including newly added modules, keeps
 the live dependencies, updates the unqualified function, publishes a version, and
 advances the runtime-discovered alias when one exists.
+
+The API overlay scope is every deployed function that carries the API package:
+the API function plus every peer confirmed by discovery. This includes
+`openclaw-lifecycle-consumer`, whose asynchronous lifecycle actions would
+otherwise continue running the original package after the API function was
+updated. Confirm the complete read-only scope from `environment.json` before
+applying:
+
+```bash
+jq -r '
+  .lambda_link
+  | "confirmed=\(.peer_discovery_confirmed)",
+    "function=\(.function) esm_qualifier=\(.esm_qualifier // "")",
+    ((.peers // [])[] | select(.probe_paths_present == true)
+      | "peer=\(.function) esm_qualifier=\(.esm_qualifier)")
+' environment.json
+```
+
+Version publication and alias advancement remain scoped to the API function;
+discovered peers consume the unqualified `$LATEST` code.
 
 ```bash
 bash lib/apply-restorepatch.sh apply-control \
@@ -265,6 +305,10 @@ After the refresh has completed, run:
 bash lib/apply-restorepatch.sh verify \
   --env environment.json --kit .
 ```
+
+The command above keeps the default `all` scope. Use `--scope control` or `data`
+when manually verifying only that concern. Route assertions remain under
+`verify-api`, which also accepts `--scope routes`.
 
 A replacement host passes only when all three signals are present:
 

@@ -301,6 +301,37 @@ if [ -n "${OC_API_FUNCTION_NAME:-}" ]; then
   API_QUALIFIER="${OC_API_FUNCTION_QUALIFIER:-}"
 fi
 
+sqs_esm_qualifier() {
+  local function_name="$1" mappings
+  mappings="$(Q lambda list-event-source-mappings \
+    --function-name "$function_name" 2>/dev/null)" || return 1
+  printf '%s' "$mappings" | jq -r '
+    [
+      .EventSourceMappings[]?
+      | select((.EventSourceArn // "") | test("^arn:[^:]+:sqs:"))
+      | ((.FunctionArn // "") | split(":")) as $parts
+      | if ($parts | length) > 7 then ($parts[7:] | join(":")) else "" end
+    ]
+    | unique
+    | map(select(. != ""))
+    | join(",")
+  '
+}
+
+add_peer_record() {
+  local function_name="$1" why="$2" code_size="$3" esm_qualifier="$4" probes_present="$5"
+  PEER_RECORDS="$(printf '%s' "$PEER_RECORDS" | jq -c \
+    --arg function "$function_name" --arg why "$why" \
+    --argjson code_size "$code_size" --arg esm_qualifier "$esm_qualifier" \
+    --argjson probe_paths_present "$probes_present" '
+      . + [{
+        function:$function, why:$why, code_size:$code_size,
+        esm_qualifier:$esm_qualifier,
+        probe_paths_present:$probe_paths_present
+      }]
+    ')"
+}
+
 API_ALIASES="[]"
 API_LATEST_SHA=""
 DISPATCH_ESM_TARGET=""
@@ -331,6 +362,151 @@ if [ -n "$API_FUNCTION" ]; then
   fi
 else
   warn "serving Lambda unresolved; API must be confirmed before ASG correlation"
+fi
+
+# The same API package can be deployed behind more than one function. The
+# asynchronous lifecycle consumer is one measured example: updating only the API
+# function left the dispatch path on old code while a one-function precheck said
+# the overlay was already delivered. The prefilter must never decide a peer OUT
+# from information changed by the apply. Runtime, handler, and tenant table are
+# stable contracts; the fixed 1 MiB CodeSize floor only rejects packages far too
+# small to be this multi-megabyte API package (single-module functions here are
+# kilobytes). Package membership is the only verdict.
+MIN_API_PACKAGE_CODE_SIZE=1048576
+PEER_PROBE_PATHS="$(jq -c '
+  [
+    .paths[]?
+    | .artifact // empty
+    | select(startswith("lambda/api/"))
+    | ltrimstr("lambda/api/")
+  ]
+  | unique
+  | sort
+  | . as $all
+  | if ($all | index("handler.py")) != null
+    then ((["handler.py"] + [$all[] | select(. != "handler.py")][0:4]) | sort)
+    else $all[0:5]
+    end
+' "$MANIFEST" 2>/dev/null)" || PEER_PROBE_PATHS="[]"
+PEER_RECORDS="[]"
+PEER_DISCOVERY_CONFIRMED=false
+API_ESM_QUALIFIER=""
+if [ -n "$API_FUNCTION" ]; then
+  peer_discovery_ok=true
+  if ! API_ESM_QUALIFIER="$(sqs_esm_qualifier "$API_FUNCTION")"; then
+    warn "cannot inspect SQS event source mappings for $API_FUNCTION"
+    peer_discovery_ok=false
+    API_ESM_QUALIFIER=""
+  fi
+
+  api_peer_config="$(Q lambda get-function-configuration \
+    --function-name "$API_FUNCTION" 2>/dev/null)" || api_peer_config=""
+  if [ -z "$api_peer_config" ]; then
+    warn "cannot read $API_FUNCTION configuration for API-package peer discovery"
+    peer_discovery_ok=false
+  elif [ "$(printf '%s' "$PEER_PROBE_PATHS" | jq 'length')" -eq 0 ]; then
+    warn "manifest contains no lambda/api artifacts for API-package peer probes"
+    peer_discovery_ok=false
+  elif ! command -v curl >/dev/null || ! command -v unzip >/dev/null; then
+    warn "curl and unzip are required to inspect API-package peer candidates"
+    peer_discovery_ok=false
+  else
+    api_runtime="$(printf '%s' "$api_peer_config" | jq -r '.Runtime // ""')"
+    api_handler="$(printf '%s' "$api_peer_config" | jq -r '.Handler // ""')"
+    api_tenants_table="$(printf '%s' "$api_peer_config" |
+      jq -r '.Environment.Variables.TENANTS_TABLE // ""')"
+
+    all_functions="$(Q lambda list-functions 2>/dev/null)" || all_functions=""
+    if [ -z "$all_functions" ]; then
+      warn "cannot enumerate Lambda functions for API-package peer discovery"
+      peer_discovery_ok=false
+    else
+      while IFS=$'\t' read -r candidate candidate_size; do
+        [ -n "$candidate" ] || continue
+        candidate_config="$(Q lambda get-function-configuration \
+          --function-name "$candidate" 2>/dev/null)" || candidate_config=""
+        if [ -z "$candidate_config" ]; then
+          warn "cannot inspect configuration for API-package peer candidate $candidate"
+          add_peer_record "$candidate" \
+            "configuration unavailable; package membership was not inspected" \
+            "$candidate_size" "" false
+          peer_discovery_ok=false
+          continue
+        fi
+        candidate_tenants_table="$(printf '%s' "$candidate_config" |
+          jq -r '.Environment.Variables.TENANTS_TABLE // ""')"
+        [ "$candidate_tenants_table" = "$api_tenants_table" ] || continue
+
+        candidate_esm_qualifier=""
+        qualifier_ok=true
+        if ! candidate_esm_qualifier="$(sqs_esm_qualifier "$candidate")"; then
+          warn "cannot inspect SQS event source mappings for peer candidate $candidate"
+          peer_discovery_ok=false
+          qualifier_ok=false
+          candidate_esm_qualifier=""
+        fi
+
+        candidate_work="$(mktemp -d)"
+        package_location="$(Q lambda get-function --function-name "$candidate" \
+          2>/dev/null | jq -r '.Code.Location // empty')" || package_location=""
+        inspection_error=""
+        package_entries=""
+        if [ -z "$package_location" ]; then
+          inspection_error="deployment package location unavailable"
+        elif ! curl -fsS -o "${candidate_work}/package.zip" "$package_location"; then
+          inspection_error="deployment package download failed"
+        elif ! package_entries="$(unzip -Z1 "${candidate_work}/package.zip" 2>/dev/null)"; then
+          inspection_error="deployment package listing failed"
+        fi
+
+        if [ -n "$inspection_error" ]; then
+          warn "cannot inspect API-package peer candidate $candidate: $inspection_error"
+          add_peer_record "$candidate" \
+            "$inspection_error; package membership was not confirmed" \
+            "$candidate_size" "$candidate_esm_qualifier" false
+          peer_discovery_ok=false
+          rm -rf "$candidate_work"
+          continue
+        fi
+
+        missing_probes=""
+        while IFS= read -r probe_path; do
+          if ! grep -Fx -- "$probe_path" <<< "$package_entries" >/dev/null \
+              && ! grep -Fx -- "./$probe_path" <<< "$package_entries" >/dev/null; then
+            missing_probes="${missing_probes:+${missing_probes},}${probe_path}"
+          fi
+        done < <(printf '%s' "$PEER_PROBE_PATHS" | jq -r '.[]')
+        if [ -z "$missing_probes" ]; then
+          peer_why="package inspected; all manifest-derived API probe paths are present"
+          [ "$qualifier_ok" = true ] \
+            || peer_why="$peer_why; SQS event source qualifier could not be read"
+          add_peer_record "$candidate" "$peer_why" \
+            "$candidate_size" "$candidate_esm_qualifier" true
+        else
+          add_peer_record "$candidate" \
+            "package inspected; missing probe path(s): $missing_probes" \
+            "$candidate_size" "$candidate_esm_qualifier" false
+        fi
+        rm -rf "$candidate_work"
+      done < <(
+        printf '%s' "$all_functions" | jq -r \
+          --arg function "$API_FUNCTION" --arg runtime "$api_runtime" \
+          --arg handler "$api_handler" \
+          --argjson min_size "$MIN_API_PACKAGE_CODE_SIZE" '
+            .Functions[]?
+            | select(
+                .FunctionName != $function
+                and (.Runtime // "") == $runtime
+                and (.Handler // "") == $handler
+                and (.CodeSize // 0) >= $min_size
+              )
+            | [.FunctionName, (.CodeSize | tostring)]
+            | @tsv
+          '
+      )
+    fi
+  fi
+  PEER_DISCOVERY_CONFIRMED="$peer_discovery_ok"
 fi
 
 # Resolve the hosts table from the serving Lambda contract, then use its live
@@ -513,6 +689,9 @@ jq -n \
   --argjson stages "$API_DEPLOYED_STAGES" --arg api_target "$API_INTEGRATION_TARGET" \
   --argjson aliases "$API_ALIASES" --arg latest_sha "$API_LATEST_SHA" \
   --arg esm "$DISPATCH_ESM_TARGET" --arg asg "$ASG_NAME" \
+  --arg api_esm_qualifier "$API_ESM_QUALIFIER" \
+  --argjson peers "$PEER_RECORDS" --argjson peer_probe_paths "$PEER_PROBE_PATHS" \
+  --argjson peer_confirmed "$PEER_DISCOVERY_CONFIRMED" \
   --arg lt_id "$ASG_LT_ID" --arg lt_name "$ASG_LT_NAME" \
   --arg lt_version "$ASG_LT_VER" --arg asg_type "$ASG_TYPE" \
   --arg asg_candidates "$ASG_CANDIDATE_N" --arg api_candidates_n "$API_PLAUSIBLE_N" \
@@ -535,7 +714,9 @@ jq -n \
     lambda_link:{
       function:$api_function, api_invokes:$api_target, aliases:$aliases,
       serving_qualifier:$api_qualifier, latest_code_sha256:$latest_sha,
-      dispatch_sqs_esm_binds:$esm
+      dispatch_sqs_esm_binds:$esm, esm_qualifier:$api_esm_qualifier,
+      peers:$peers, peer_probe_paths:$peer_probe_paths,
+      peer_discovery_confirmed:$peer_confirmed
     },
     asg:{
       name:$asg, why:$asg_why, lt_id:$lt_id, lt_name:$lt_name,
@@ -563,7 +744,20 @@ jq -n \
     .[] | "  API \(.id) \(.name): tenants=\(.has_tenants) hosts=\(.has_hosts) " +
     "proxy=\(.proxy) auth=\(.method_auth) key=\(.api_key_required) policy=\(.resource_policy)"'
   echo "API integration: ${API_INTEGRATION_TARGET:-<unresolved>}"
+  echo "Lambda function : ${API_FUNCTION:-<unresolved>} ESM qualifier=${API_ESM_QUALIFIER:-<bare>}"
   echo "Lambda aliases : $(printf '%s' "$API_ALIASES" | jq -c '.')"
+  echo "Lambda peers   : confirmed=$PEER_DISCOVERY_CONFIRMED probes=$(printf '%s' "$PEER_PROBE_PATHS" | jq -c '.')"
+  if [ "$(printf '%s' "$PEER_RECORDS" | jq 'length')" -eq 0 ]; then
+    echo "  <none>"
+  else
+    printf '%s' "$PEER_RECORDS" | jq -r '
+      .[]
+      | "  " + (if .probe_paths_present then "PEER " else "NOT-PEER " end)
+        + "\(.function) size=\(.code_size) esm_qualifier="
+        + (if .esm_qualifier == "" then "<bare>" else .esm_qualifier end)
+        + " (\(.why))"
+    '
+  fi
   echo "dispatch ESM   : ${DISPATCH_ESM_TARGET:-<unresolved>}"
   echo "HOST ASG       : ${ASG_NAME:-<unresolved>} type=$ASG_TYPE LT=${ASG_LT_NAME:-$ASG_LT_ID} v=$ASG_LT_VER candidates=$ASG_CANDIDATE_N"
   echo "LT bootstrap   : $(printf '%s' "$BOOTSTRAP_INFO" | jq -r '.form // "<unclassified>"')"

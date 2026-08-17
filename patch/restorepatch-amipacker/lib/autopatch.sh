@@ -12,7 +12,7 @@ warn() { echo "  [!] $*" >&2; }
 die() { echo "FAIL: $*" >&2; exit 1; }
 
 usage() {
-  echo "usage: autopatch.sh <kit-dir> [--answers <answers.json>] [--region <region>] [--env <environment.json>] [--yes]" >&2
+  echo "usage: autopatch.sh <kit-dir> [--answers <answers.json>] [--region <region>] [--env <environment.json>] [--post-verify-cmd <command>] [--yes]" >&2
   exit 2
 }
 
@@ -22,12 +22,14 @@ shift
 ANSWERS_FILE=""
 REGION=""
 ENV_INPUT=""
+POST_VERIFY_CMD=""
 ASSUME_YES=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --answers) [ $# -ge 2 ] || usage; ANSWERS_FILE="$2"; shift 2 ;;
     --region) [ $# -ge 2 ] || usage; REGION="$2"; shift 2 ;;
     --env) [ $# -ge 2 ] || usage; ENV_INPUT="$2"; shift 2 ;;
+    --post-verify-cmd) [ $# -ge 2 ] || usage; POST_VERIFY_CMD="$2"; shift 2 ;;
     --yes) ASSUME_YES=1; shift ;;
     *) usage ;;
   esac
@@ -56,6 +58,7 @@ FINALIZED=0
 FIRST_WRITE=0
 ROUTE_STARTED=0
 LAST_LOG=""
+PRECHECK_LOG=""
 CURRENT_STEP=""
 
 remember_temp() {
@@ -134,6 +137,59 @@ annotate_verify_scope() {
     --arg name "$name" --arg scope "$scope"
 }
 
+annotate_reconcile() {
+  local name="$1" observed="$2" summary
+  summary="$(python3 - "$LAST_LOG" <<'PY'
+import json
+import sys
+
+found = None
+with open(sys.argv[1], encoding="utf-8", errors="replace") as handle:
+    for line in handle:
+        if not line.startswith("reconcile verdict="):
+            continue
+        values = {}
+        for field in line.strip().split()[1:]:
+            key, value = field.split("=", 1)
+            values[key] = value
+        found = {
+            "verdict": values["verdict"],
+            "patch": int(values["patch"]),
+            "base": int(values["base"]),
+            "unknown": int(values["unknown"]),
+            "absent": int(values["absent"]),
+            "split": int(values["split"]),
+            "unreadable": int(values["unreadable"]),
+        }
+if found is None:
+    raise SystemExit("reconcile output did not contain a final verdict")
+print(json.dumps(found, separators=(",", ":")))
+PY
+)" || return 1
+  receipt_update \
+    '(.steps | map(select(.name == $name)) | last) as $target
+     | if $target == null then .
+       else (.steps |= map(
+         if . == $target
+         then . + {reconcile:$summary}
+           + (if $observed then {status:"OBSERVED"} else {} end)
+         else .
+         end))
+       end' \
+    --arg name "$name" --argjson summary "$summary" --argjson observed "$observed"
+}
+
+annotate_post_verify() {
+  local name="$1" assertions="$2"
+  receipt_update \
+    '(.steps | map(select(.name == $name)) | last) as $target
+     | if $target == null then .
+       else (.steps |= map(
+         if . == $target then . + {assertions:$assertions} else . end))
+       end' \
+    --arg name "$name" --argjson assertions "$assertions"
+}
+
 set_verdict() {
   local verdict="$1"
   receipt_update \
@@ -199,6 +255,250 @@ run_scoped_verify_step() {
     bash "$APPLY" "$phase" --scope "$scope" --env "$ENVJSON" --kit "$KITDIR"
   code=$?
   annotate_verify_scope "$name" "$scope" || return 1
+  return "$code"
+}
+
+run_scoped_reconcile_step() {
+  local name="$1" scope="$2" display code
+  display="$(shell_command bash "$APPLY" reconcile --scope "$scope" --env "$ENVJSON" --kit "$KITDIR")"
+  run_step "$name" "$display" \
+    bash "$APPLY" reconcile --scope "$scope" --env "$ENVJSON" --kit "$KITDIR"
+  code=$?
+  annotate_verify_scope "$name" "$scope" || return 1
+  return "$code"
+}
+
+post_verify_assert() {
+  local name="$1" outcome="$2" detail="$3"
+  POST_VERIFY_ASSERTIONS="$(printf '%s' "$POST_VERIFY_ASSERTIONS" | jq -c \
+    --arg name "$name" --arg outcome "$outcome" --arg detail "$detail" \
+    --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '. + [{name:$name,outcome:$outcome,detail:$detail,timestamp:$timestamp}]')" \
+    || return 1
+  echo "   $outcome $name: $detail"
+}
+
+post_verify_request() {
+  local method="$1" path="$2" payload="${3:-}" url
+  local -a curl_args
+  url="${CONTROL_URL%/}${path}"
+  curl_args=(-sS --max-time 35 -X "$method" -o "$POST_VERIFY_BODY_FILE" -w '%{http_code}')
+  if [ "$POST_VERIFY_HEADER_COUNT" -gt 0 ]; then
+    curl_args+=("${POST_VERIFY_HEADERS[@]}")
+  fi
+  if [ -n "$payload" ]; then
+    curl_args+=(-H "Content-Type: application/json" --data "$payload")
+  fi
+  if ! PV_STATUS="$(curl "${curl_args[@]}" "$url")"; then
+    PV_STATUS=000
+    return 1
+  fi
+}
+
+post_verify_read_assert() {
+  local name="$1" path="$2" shape="$3"
+  post_verify_request GET "$path" || true
+  case "$PV_STATUS" in
+    2??)
+      if jq -e "$shape" "$POST_VERIFY_BODY_FILE" >/dev/null 2>&1; then
+        post_verify_assert "$name" PASS "http=$PV_STATUS documented JSON shape"
+        return 0
+      fi
+      post_verify_assert "$name" FAIL "http=$PV_STATUS but JSON shape is invalid"
+      ;;
+    *)
+      post_verify_assert "$name" FAIL "http=$PV_STATUS"
+      ;;
+  esac
+  return 1
+}
+
+post_verify_round_trip() {
+  local test_name payload tenant_id tenant_status create_ok=0 running_ok=0
+  local delete_ok=0 gone_ok=0 rc=0
+  test_name="pv-$(date -u +%Y%m%d%H%M%S)-$$"
+  payload="$(jq -nc --arg name "$test_name" '{name:$name}')"
+  post_verify_request POST "/tenants" "$payload" || true
+  tenant_id="$(jq -r 'if type == "object" then .id // "" else "" end' \
+    "$POST_VERIFY_BODY_FILE" 2>/dev/null || true)"
+  case "$PV_STATUS" in
+    2??)
+      if jq -e '
+        type == "object"
+        and (.id | type == "string" and length > 0)
+        and (.status | type == "string" and length > 0)
+      ' "$POST_VERIFY_BODY_FILE" >/dev/null 2>&1; then
+        post_verify_assert "live lifecycle create" PASS \
+          "http=$PV_STATUS id=$tenant_id"
+        create_ok=1
+      else
+        post_verify_assert "live lifecycle create" FAIL \
+          "http=$PV_STATUS but response lacks string id/status"
+        rc=1
+      fi
+      ;;
+    *)
+      post_verify_assert "live lifecycle create" FAIL "http=$PV_STATUS"
+      rc=1
+      ;;
+  esac
+
+  if [ -z "$tenant_id" ]; then
+    post_verify_assert "live lifecycle running" SKIP "create returned no tenant id"
+    post_verify_assert "live lifecycle delete" SKIP "create returned no tenant id"
+    post_verify_assert "live lifecycle gone" SKIP "create returned no tenant id"
+    return 1
+  fi
+
+  for _ in $(seq 1 90); do
+    post_verify_request GET "/tenants/${tenant_id}" || true
+    if [ "$PV_STATUS" = "200" ] && jq -e '
+        type == "object"
+        and (.id | type == "string" and length > 0)
+        and (.status | type == "string" and length > 0)
+      ' "$POST_VERIFY_BODY_FILE" >/dev/null 2>&1; then
+      tenant_status="$(jq -r '.status' "$POST_VERIFY_BODY_FILE")"
+      if [ "$tenant_status" = "running" ]; then
+        running_ok=1
+        break
+      fi
+    fi
+    sleep 10
+  done
+  if [ "$running_ok" -eq 1 ]; then
+    post_verify_assert "live lifecycle running" PASS \
+      "tenant=$tenant_id reached status=running"
+  else
+    post_verify_assert "live lifecycle running" FAIL \
+      "tenant=$tenant_id did not reach status=running within 900 seconds"
+    rc=1
+  fi
+
+  post_verify_request DELETE \
+    "/tenants/${tenant_id}?keep_data=false&skip_backup=true" || true
+  case "$PV_STATUS" in
+    2??)
+      if jq -e --arg id "$tenant_id" '
+        type == "object"
+        and .id == $id
+        and (.status | type == "string" and length > 0)
+      ' "$POST_VERIFY_BODY_FILE" >/dev/null 2>&1; then
+        post_verify_assert "live lifecycle delete" PASS \
+          "http=$PV_STATUS tenant=$tenant_id"
+        delete_ok=1
+      else
+        post_verify_assert "live lifecycle delete" FAIL \
+          "http=$PV_STATUS but response lacks matching id/status"
+        rc=1
+      fi
+      ;;
+    *)
+      post_verify_assert "live lifecycle delete" FAIL \
+        "http=$PV_STATUS tenant=$tenant_id"
+      rc=1
+      ;;
+  esac
+
+  for _ in $(seq 1 90); do
+    post_verify_request GET "/tenants/${tenant_id}" || true
+    if [ "$PV_STATUS" = "404" ]; then
+      gone_ok=1
+      break
+    fi
+    if [ "$PV_STATUS" = "200" ] \
+        && jq -e '.status == "deleted"' "$POST_VERIFY_BODY_FILE" >/dev/null 2>&1; then
+      gone_ok=1
+      break
+    fi
+    sleep 10
+  done
+  if [ "$gone_ok" -eq 1 ]; then
+    post_verify_assert "live lifecycle gone" PASS \
+      "tenant=$tenant_id is absent or in the documented deleted terminal state"
+  else
+    post_verify_assert "live lifecycle gone" FAIL \
+      "tenant=$tenant_id did not reach the deleted terminal state within 900 seconds"
+    rc=1
+  fi
+
+  [ "$create_ok" -eq 1 ] && [ "$delete_ok" -eq 1 ] || rc=1
+  return "$rc"
+}
+
+post_verify() {
+  local rc=0 header_name header_value
+  POST_VERIFY_ASSERTIONS="[]"
+  POST_VERIFY_HEADERS=()
+  POST_VERIFY_HEADER_COUNT=0
+  POST_VERIFY_BODY_FILE="$(mktemp "${TMPDIR:-/tmp}/autopatch-post-verify.XXXXXX")"
+  remember_temp "$POST_VERIFY_BODY_FILE"
+  jq -e '
+    type == "object"
+    and all(to_entries[];
+      (.key | test("^[A-Za-z0-9-]+$"))
+      and (.value | type) == "string"
+      and (.value | test("[\r\n\t]") | not)
+    )
+  ' "$PROBE_HEADERS_FILE" >/dev/null || {
+    post_verify_assert "authenticated header contract" FAIL \
+      "answered headers file is not a safe string-valued JSON object"
+    return 1
+  }
+  while IFS=$'\t' read -r header_name header_value; do
+    POST_VERIFY_HEADERS+=(-H "$header_name: $header_value")
+    POST_VERIFY_HEADER_COUNT=$((POST_VERIFY_HEADER_COUNT + 1))
+  done < <(jq -r 'to_entries[] | [.key,.value] | @tsv' "$PROBE_HEADERS_FILE")
+
+  post_verify_read_assert "GET /tenants" "/tenants" '
+    (type == "array" and all(.[]; type == "object"))
+    or (
+      type == "object"
+      and (.tenants | type == "array")
+      and (.count | type == "number")
+      and has("next_token")
+    )
+  ' || rc=1
+  post_verify_read_assert "GET /hosts" "/hosts" '
+    (type == "array" and all(.[]; type == "object"))
+    or (
+      type == "object"
+      and (.hosts | type == "array")
+      and (.count | type == "number")
+      and has("next_token")
+    )
+  ' || rc=1
+  post_verify_read_assert "GET /hosts/rootfs-version" "/hosts/rootfs-version" '
+    type == "object" and (.version | type == "string" and length > 0)
+  ' || rc=1
+
+  if [ "$LIVE_LIFECYCLE" = "true" ]; then
+    post_verify_round_trip || rc=1
+  else
+    echo "   SKIP post-verify round trip: not authorized — a total create-path outage would not be detected by this run"
+    post_verify_assert "live lifecycle round trip" SKIP \
+      "not authorized; a total create-path outage is outside this run's coverage"
+  fi
+
+  if [ -n "$POST_VERIFY_CMD" ]; then
+    if bash -c "$POST_VERIFY_CMD"; then
+      post_verify_assert "external post-verify hook" PASS "command exited 0"
+    else
+      post_verify_assert "external post-verify hook" FAIL "command exited non-zero"
+      rc=1
+    fi
+  fi
+  return "$rc"
+}
+
+run_post_verify_step() {
+  local display code
+  display="authenticated control-plane contract checks"
+  if [ -n "$POST_VERIFY_CMD" ]; then
+    display="$display; $(shell_command bash -c "$POST_VERIFY_CMD")"
+  fi
+  run_step "post-verify" "$display" post_verify
+  code=$?
+  annotate_post_verify "post-verify" "$POST_VERIFY_ASSERTIONS" || return 1
   return "$code"
 }
 
@@ -296,6 +596,7 @@ AUTH_CHOICE="$(jq -r '.answers["environment.probe-auth"] // empty' "$DECISION")"
 AMI_ID="$(jq -r '.answers["data-plane.ami-id"] // empty' "$DECISION")"
 CANARY_ID="$(jq -r '.answers["data-plane.canary-instance-id"] // empty' "$DECISION")"
 ALLOW_DRIFT="$(jq -r '.answers["data-plane.allow-base-drift"] // false' "$DECISION")"
+LIVE_LIFECYCLE="$(jq -r '.answers["verification.live-lifecycle"] // false' "$DECISION")"
 case "$SCOPE" in
   control-plane-only)
     DATA_IN_SCOPE=0
@@ -506,9 +807,23 @@ run_step "precheck" "$PRECHECK_DISPLAY" \
   bash "$APPLY" precheck --env "$ENVJSON" --kit "$KITDIR"
 code=$?
 [ "$code" -eq 0 ] || stop_on_failure "precheck" "$code"
+# Pin the precheck log before any later step reassigns LAST_LOG. The per-concern
+# verdicts are parsed out of this log further down, and the pre-apply reconcile that
+# runs next would otherwise leave LAST_LOG pointing at reconcile output — which
+# reports no hook state, so the run aborted with "precheck did not report the hook
+# state" even though precheck had succeeded.
+PRECHECK_LOG="$LAST_LOG"
+
+run_scoped_reconcile_step "pre-reconcile" "$FINAL_VERIFY_SCOPE"
+code=$?
+annotate_reconcile "pre-reconcile" true \
+  || die "cannot record the pre-apply reconcile verdict"
+if [ "$code" -ne 0 ]; then
+  warn "pre-reconcile observed manifest drift; continuing because this is pre-apply evidence"
+fi
 
 read_precheck_state() {
-  python3 - "$LAST_LOG" "$1" <<'PY'
+  python3 - "$PRECHECK_LOG" "$1" <<'PY'
 import re
 import sys
 
@@ -565,7 +880,9 @@ if [ "$ROUTES_IN_SCOPE" -eq 1 ]; then
   NEEDS_WRITE=1
 fi
 PHASES+=(verify)
-[ "$ROUTES_IN_SCOPE" -eq 0 ] || PHASES+=(verify-api finalize-api)
+[ "$ROUTES_IN_SCOPE" -eq 0 ] || PHASES+=(verify-api)
+PHASES+=(reconcile post-verify)
+[ "$ROUTES_IN_SCOPE" -eq 0 ] || PHASES+=(finalize-api)
 printf '   phases='
 printf '%s ' "${PHASES[@]}"
 printf '\n'
@@ -666,6 +983,19 @@ if [ "$ROUTES_IN_SCOPE" -eq 1 ]; then
   run_scoped_verify_step "final-verify-api" verify-api routes
   code=$?
   [ "$code" -eq 0 ] || stop_on_verification_failure "final-verify-api" "$code"
+fi
+
+run_scoped_reconcile_step "final-reconcile" "$FINAL_VERIFY_SCOPE"
+code=$?
+annotate_reconcile "final-reconcile" false \
+  || die "cannot record the final reconcile verdict"
+[ "$code" -eq 0 ] || stop_on_verification_failure "final-reconcile" "$code"
+
+run_post_verify_step
+code=$?
+[ "$code" -eq 0 ] || stop_on_verification_failure "post-verify" "$code"
+
+if [ "$ROUTES_IN_SCOPE" -eq 1 ]; then
   # Starting finalization can destroy the route rollback window even if the
   # finalization command or its receipt update later fails.
   FINALIZED=1

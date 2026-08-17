@@ -576,8 +576,14 @@ PY
 }
 
 restore_host_assets() {
-  local root="${KITDIR}/host-scripts" rel
+  local root="${KITDIR}/host-scripts" rel eff
   # Restore every object this driver may have changed, including the rendered bootstrap.
+  # The bootstrap this run published is keyed on THIS environment's rendering (see the
+  # content-addressing note in the apply path), so restore that key too. restore_s3_asset
+  # already no-ops for any key this run did not change, which keeps the manifest-prefix
+  # call below correct for state files written before that change.
+  eff="$(state_get rendered_bootstrap_sha256)"
+  [ -n "$eff" ] && restore_s3_asset "deployment/bootstrap/host/${eff}/init-host.sh"
   restore_s3_asset "deployment/bootstrap/host/${ASSET_BUNDLE_PREFIX}/init-host.sh"
   restore_s3_asset "deployment/scripts/host-agent.py"
   # The inline unit rolls back with the bootstrap object, not a separate S3 key.
@@ -648,7 +654,13 @@ apply_control_overlay() {
 
 resolve_bootstrap_state() {
   local live_prefix="$1" probe rc
-  if [ "$live_prefix" = "$ASSET_BUNDLE_PREFIX" ]; then
+  # An already-applied environment carries the hash of ITS OWN rendering, which is only
+  # equal to ASSET_BUNDLE_PREFIX when this environment renders byte-identically to the
+  # author's. Treat the recorded rendered hash as the effective target so a rerun is still
+  # the documented no-op.
+  if [ "$live_prefix" = "$ASSET_BUNDLE_PREFIX" ] \
+     || { [ -n "$(state_get rendered_bootstrap_sha256)" ] \
+          && [ "$live_prefix" = "$(state_get rendered_bootstrap_sha256)" ]; }; then
     echo "   STATE bootstrap=ALREADY — the target prefix is already in service; apply will skip it"
     BOOTSTRAP_STATE=ALREADY
   elif [ "$live_prefix" = "$BASE_ASSET_BUNDLE_PREFIX" ]; then
@@ -1077,32 +1089,45 @@ apply)
   rendered_sha="$(sha256_file "$rendered_art")"
   state_put rendered_bootstrap_sha256 "$rendered_sha"
   state_put rendered_bootstrap_source_prefix "$live_prefix"
+  # The bootstrap key is CONTENT-ADDRESSED, and the boot path proves it: the rendered
+  # UserData verifies the downloaded object with `sha256sum -c` against the same 64-hex it
+  # took from the key. ASSET_BUNDLE_PREFIX is the hash of the AUTHOR's rendering, so any
+  # environment that renders different values (i.e. anyone supplying --values, or any
+  # deployment with different subnets/ratios) would publish content whose sha256 does NOT
+  # equal its key, and every new host would fail verification and ABANDON. Use the hash of
+  # what we actually rendered; it is already computed on the line above.
   publish_s3_asset "$rendered_art" \
-    "deployment/bootstrap/host/${ASSET_BUNDLE_PREFIX}/init-host.sh"
+    "deployment/bootstrap/host/${rendered_sha}/init-host.sh"
   rm -f "$live_art"
 
   printf '%s' "$live_userdata" \
     | base64 -d > /tmp/restorepatch-ud.txt || die "cannot read in-service UserData"
   # Replace every observed content-addressed bootstrap prefix. The assertions below
   # forbid a no-op rewrite from creating and promoting an ineffective LT version.
-  python3 - /tmp/restorepatch-ud.txt "$ASSET_BUNDLE_PREFIX" \
+  python3 - /tmp/restorepatch-ud.txt "$rendered_sha" \
     "$rendered_art" <<'PY'
 import re
 import sys
 p, new, rendered_path = sys.argv[1], sys.argv[2], sys.argv[3]
 t = open(p, encoding="utf-8", errors="surrogateescape").read()
-pattern = re.compile(r"deployment/bootstrap/host/([0-9a-f]{64})")
-old = sorted({m.group(1) for m in pattern.finditer(t) if m.group(1) != new})
+# The prefix appears in the UserData in more than one ROLE: as the S3 key path, as the
+# expected digest fed to `sha256sum -c`, and inside the confirmation echo. Rewriting only
+# the path-shaped occurrences leaves the downloader fetching the NEW object while verifying
+# the OLD digest, so `set -euo pipefail` aborts the bootstrap and the lifecycle hook
+# ABANDONs every new host. Because the scheme is content-addressed, path == digest, so
+# substituting every 64-hex occurrence is correct and keeps the roles consistent.
+bare = re.compile(r"\b[0-9a-f]{64}\b")
+old = sorted({m.group(0) for m in bare.finditer(t) if m.group(0) != new})
 if not old:
     raise SystemExit("FAIL: no old bootstrap prefix was found for substitution")
-for value in old:
-    t = t.replace("deployment/bootstrap/host/" + value,
-                  "deployment/bootstrap/host/" + new)
+t = bare.sub(lambda m: new if m.group(0) != new else m.group(0), t)
 if "deployment/bootstrap/host/" + new not in t:
     raise SystemExit("FAIL: target bootstrap prefix absent after substitution")
-remaining = sorted({m.group(1) for m in pattern.finditer(t) if m.group(1) != new})
+# Whole-text check, not path-scoped: a stale digest outside a path is exactly the failure
+# the path-scoped check used to wave through.
+remaining = sorted({m.group(0) for m in bare.finditer(t) if m.group(0) != new})
 if remaining:
-    raise SystemExit("FAIL: old bootstrap prefixes remain after substitution: " + ",".join(remaining))
+    raise SystemExit("FAIL: old bootstrap digests remain after substitution: " + ",".join(remaining))
 # The placeholder gate belongs to the rendered bootstrap, not the small downloader UserData.
 rendered = open(rendered_path, encoding="utf-8", errors="surrogateescape").read().splitlines()
 unresolved = [

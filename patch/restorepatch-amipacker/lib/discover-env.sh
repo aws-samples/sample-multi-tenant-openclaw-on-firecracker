@@ -373,9 +373,11 @@ fi
 # small to be this multi-megabyte API package (single-module functions here are
 # kilobytes). Package membership is the only verdict.
 MIN_API_PACKAGE_CODE_SIZE=1048576
+PEER_PROBE_RULE="Only manifest lambda/api artifacts with change=M are identity probes; added, renamed, and deleted paths are excluded."
 PEER_PROBE_PATHS="$(jq -c '
   [
     .paths[]?
+    | select(.change == "M")
     | .artifact // empty
     | select(startswith("lambda/api/"))
     | ltrimstr("lambda/api/")
@@ -390,9 +392,11 @@ PEER_PROBE_PATHS="$(jq -c '
 ' "$MANIFEST" 2>/dev/null)" || PEER_PROBE_PATHS="[]"
 PEER_RECORDS="[]"
 PEER_DISCOVERY_CONFIRMED=false
+PEER_DISCOVERY_WHY="unresolved: serving API function is unavailable"
 API_ESM_QUALIFIER=""
 if [ -n "$API_FUNCTION" ]; then
   peer_discovery_ok=true
+  PEER_DISCOVERY_WHY="unconfirmed: one or more API-package peer candidates could not be inspected"
   if ! API_ESM_QUALIFIER="$(sqs_esm_qualifier "$API_FUNCTION")"; then
     warn "cannot inspect SQS event source mappings for $API_FUNCTION"
     peer_discovery_ok=false
@@ -405,8 +409,11 @@ if [ -n "$API_FUNCTION" ]; then
     warn "cannot read $API_FUNCTION configuration for API-package peer discovery"
     peer_discovery_ok=false
   elif [ "$(printf '%s' "$PEER_PROBE_PATHS" | jq 'length')" -eq 0 ]; then
-    warn "manifest contains no lambda/api artifacts for API-package peer probes"
+    # A stale pre-patch package can never contain a file this patch adds, so an
+    # added path is a guaranteed false NOT-PEER rather than an identity signal.
+    warn "manifest contains no change=M lambda/api artifacts safe for API-package peer probes"
     peer_discovery_ok=false
+    PEER_DISCOVERY_WHY="unconfirmed: manifest contains no change=M lambda/api artifacts that exist in both the base and patched packages"
   elif ! command -v curl >/dev/null || ! command -v unzip >/dev/null; then
     warn "curl and unzip are required to inspect API-package peer candidates"
     peer_discovery_ok=false
@@ -507,6 +514,9 @@ if [ -n "$API_FUNCTION" ]; then
     fi
   fi
   PEER_DISCOVERY_CONFIRMED="$peer_discovery_ok"
+  if [ "$PEER_DISCOVERY_CONFIRMED" = true ]; then
+    PEER_DISCOVERY_WHY="confirmed: every eligible candidate was classified using only change=M package paths"
+  fi
 fi
 
 # Resolve the hosts table from the serving Lambda contract, then use its live
@@ -691,6 +701,7 @@ jq -n \
   --arg esm "$DISPATCH_ESM_TARGET" --arg asg "$ASG_NAME" \
   --arg api_esm_qualifier "$API_ESM_QUALIFIER" \
   --argjson peers "$PEER_RECORDS" --argjson peer_probe_paths "$PEER_PROBE_PATHS" \
+  --arg peer_probe_rule "$PEER_PROBE_RULE" --arg peer_why "$PEER_DISCOVERY_WHY" \
   --argjson peer_confirmed "$PEER_DISCOVERY_CONFIRMED" \
   --arg lt_id "$ASG_LT_ID" --arg lt_name "$ASG_LT_NAME" \
   --arg lt_version "$ASG_LT_VER" --arg asg_type "$ASG_TYPE" \
@@ -715,8 +726,10 @@ jq -n \
       function:$api_function, api_invokes:$api_target, aliases:$aliases,
       serving_qualifier:$api_qualifier, latest_code_sha256:$latest_sha,
       dispatch_sqs_esm_binds:$esm, esm_qualifier:$api_esm_qualifier,
-      peers:$peers, peer_probe_paths:$peer_probe_paths,
-      peer_discovery_confirmed:$peer_confirmed
+      peers:$peers,
+      peer_probe_paths:{rule:$peer_probe_rule, paths:$peer_probe_paths},
+      peer_discovery_confirmed:$peer_confirmed,
+      peer_discovery_why:$peer_why
     },
     asg:{
       name:$asg, why:$asg_why, lt_id:$lt_id, lt_name:$lt_name,

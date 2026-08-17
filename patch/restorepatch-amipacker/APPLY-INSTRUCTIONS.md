@@ -4,13 +4,14 @@ This kit applies the control-plane source overlay and prepares the durable host
 replacement path without updating the existing stack. Run every AWS command with
 an explicit region.
 
-The driver subcommands are `precheck`, `backup`, `apply`, `apply-control`,
-`canary`, `refresh`, `verify`, `rollback`, `apply-api`, `verify-api`,
+The driver subcommands are `precheck`, `reconcile`, `backup`, `apply`,
+`apply-control`, `canary`, `refresh`, `verify`, `rollback`, `apply-api`, `verify-api`,
 `finalize-api`, and `rollback-api`. `--values <file>` optionally supplies a JSON
 object keyed by bootstrap placeholder name when a value cannot be recovered from
 the live rendered script. `verify` accepts an optional
 `--scope <control|data|routes|all>`; omitting it keeps the existing `all`
-behavior.
+behavior. `reconcile` accepts `--scope <control|data|all>` and also defaults to
+`all`.
 
 For a full rollout, use this order:
 `precheck → backup → apply → canary → refresh → verify`. A failed or missing
@@ -81,6 +82,54 @@ bash lib/apply-restorepatch.sh precheck \
 hook, bootstrap, and Lambda overlay. A fully applied environment exits successfully
 because a rerun is a no-op.
 
+Discovery records `lambda_link.peer_probe_paths` as a rule plus the selected
+paths. Only manifest `change=M` API files are eligible because they exist in both
+the base and patched packages. A file added by the patch cannot identify a stale
+peer: the stale package cannot contain it, so using it would force a false
+NOT-PEER result.
+
+## Read-only manifest reconciliation
+
+`reconcile` answers what is actually deployed versus the hashes declared by this
+kit. It writes nothing and can be run before or after apply:
+
+```bash
+bash lib/apply-restorepatch.sh reconcile \
+  --env environment.json --kit . --scope all
+```
+
+For the control scope, it reads every `C-lambda` artifact from the current
+deployment package of the API function, every discovered API-package peer, and
+the fixed single-module functions. For the data scope, every `B-s3` artifact uses
+an explicit place map for its published S3 key and installed host path. Applicable
+host paths are checked on every current host-ASG instance through
+`AWS-RunShellScript` and `sha256sum`; places that do not exist by design are not
+probed.
+
+Each place has one manifest state:
+
+- `PATCH`: the bytes equal `patch_sha256`.
+- `BASE`: the bytes equal `base_sha256`; the file exists but is still pre-patch.
+- `UNKNOWN`: the bytes match neither declared hash.
+- `ABSENT`: the object is missing. For `change=A`, this means it has not been
+  delivered yet.
+- `NOT_APPLICABLE`: this artifact is deliberately not published or not installed
+  at that place. It is counted separately and does not contribute to drift.
+- `UNMAPPED`: a `B-s3` manifest artifact has no explicit place-map entry. This is
+  unknown coverage and always makes the command exit non-zero.
+
+`UNREADABLE` is reported separately when permissions, SSM availability, instance
+state, or another read failure prevents classification. It is named, counted, and
+always makes the verdict non-converged.
+
+For a `B-s3` object whose S3 and host places are both applicable, the S3 source
+and every running instance must also have the same state. Different readable
+states produce a `SPLIT` finding. In particular, a running fleet on `PATCH` while
+S3 remains on `BASE` means a reboot or replacement will revert the fix. The
+command exits zero only when every applicable in-scope place is `PATCH`, every
+artifact is mapped, and there is no `SPLIT`; otherwise it prints
+`reconcile verdict=DRIFTED` and exits non-zero.
+
 ## Unattended path (answer once, then apply)
 
 Print the complete derived interview, then fill one JSON answers file from the
@@ -101,6 +150,36 @@ data-plane concerns as failures. When the auth answer is
 headers file that is removed when the run exits; it is never written to
 `DECISION.json`, the receipt, or logs. The numbered per-phase steps below remain
 the supported manual path for operators who want to drive each phase separately.
+
+## Post-verify real-entrypoint gate
+
+The unattended driver runs `post-verify` after the final `verify` and final
+`reconcile`, before `finalize-api`. It uses the confirmed control-plane URL and
+the answered headers file to call the real authenticated entrypoint. The run
+requires a 2xx response and the documented JSON shape for all three read-only
+contracts:
+
+- `GET /tenants`: a tenant list, or the documented paginated tenant envelope.
+- `GET /hosts`: a host list, or the documented paginated host envelope.
+- `GET /hosts/rootfs-version`: an object with a non-empty string `version`.
+
+When `verification.live-lifecycle` is true, `post-verify` also creates one
+throwaway tenant with the minimal documented body, polls it to `status=running`,
+deletes that exact tenant, and polls it to the deleted terminal state. When the
+answer is false, the driver prints an explicit warning that a total create-path
+outage is not covered by that run.
+
+An operator with a fuller contract-regression suite can add it as the final
+post-verify action:
+
+```bash
+bash lib/autopatch.sh . --answers answers.json --region "${REGION}" --yes \
+  --post-verify-cmd './path/to/contract-regression.sh'
+```
+
+Every post-verify assertion and outcome is stored in the receipt. A failed
+assertion or a non-zero external hook fails the unattended run and follows the
+same rollback-command reporting path as the other final verification failures.
 
 ## Step 1 Evidence and impact assessment
 
@@ -127,8 +206,18 @@ bash lib/apply-restorepatch.sh backup \
 ```
 
 The recovery state is stored inside the kit. Rollback refuses to run without it.
-`backup` is not read-only: it calls Lambda `publish-version` to create the
-pre-restorepatch recovery anchor before recording that version.
+`backup` is not read-only: a fresh backup calls Lambda `publish-version` to create
+the pre-restorepatch recovery anchor before recording that version. Restore
+anchors are write-once: rerunning `backup` preserves and names every existing
+hook, ASG, launch-template, AMI, function-package, API-version, and alias anchor.
+Downloaded packages are kept under `.restorepatch-backups` inside the kit so a
+reboot does not remove them. To deliberately replace the baseline, use the
+explicit re-anchor operation:
+
+```bash
+bash lib/apply-restorepatch.sh backup \
+  --env environment.json --kit . --reanchor
+```
 
 ## Step 2 Control-plane overlay
 
@@ -358,7 +447,9 @@ bash lib/apply-restorepatch.sh rollback \
 
 Rollback restores the unqualified API code and the discovered alias path because
 lifecycle dispatch uses the unqualified function while API methods may use the
-alias.
+alias. It starts a fleet refresh only when the state records that the data-plane
+launch-template/AMI/bootstrap concern was applied. A control-plane-only
+application still restores Lambda and API state but skips the fleet refresh.
 
 ## Known limitations
 

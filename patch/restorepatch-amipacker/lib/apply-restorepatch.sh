@@ -18,11 +18,11 @@
 #   * TrackDefaultLTVersion AsgShape digest and the OpenClawImage CodeBuild churn. Both are
 #     derived or content-hash projections with no independent action.
 #
-# usage: lib/apply-restorepatch.sh <precheck|backup|apply|apply-control|canary|refresh|verify|rollback|apply-api|verify-api|finalize-api|rollback-api> --env <environment.json> --kit <kit-dir> [--values <values.json>] [--allow-base-drift] [--scope <control|data|routes|all>]
+# usage: lib/apply-restorepatch.sh <precheck|reconcile|backup|apply|apply-control|canary|refresh|verify|rollback|apply-api|verify-api|finalize-api|rollback-api> --env <environment.json> --kit <kit-dir> [--values <values.json>] [--allow-base-drift] [--scope <control|data|routes|all>] [--reanchor]
 set -uo pipefail
 
-PHASE="${1:?phase required: precheck|backup|apply|apply-control|canary|refresh|verify|rollback|apply-api|verify-api|finalize-api|rollback-api}"; shift || true
-ENVJSON=""; KITDIR="."; VALUESJSON=""; ALLOW_BASE_DRIFT=0; VERIFY_SCOPE="all"; VERIFY_SCOPE_SET=0
+PHASE="${1:?phase required: precheck|reconcile|backup|apply|apply-control|canary|refresh|verify|rollback|apply-api|verify-api|finalize-api|rollback-api}"; shift || true
+ENVJSON=""; KITDIR="."; VALUESJSON=""; ALLOW_BASE_DRIFT=0; VERIFY_SCOPE="all"; VERIFY_SCOPE_SET=0; REANCHOR=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --env) ENVJSON="${2:?}"; shift 2 ;;
@@ -30,6 +30,7 @@ while [ $# -gt 0 ]; do
     --values) VALUESJSON="${2:?}"; shift 2 ;;
     --allow-base-drift) ALLOW_BASE_DRIFT=1; shift ;;
     --scope) VERIFY_SCOPE="${2:?}"; VERIFY_SCOPE_SET=1; shift 2 ;;
+    --reanchor) REANCHOR=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -39,8 +40,16 @@ case "$VERIFY_SCOPE" in
 esac
 case "$PHASE" in
   verify|verify-api) ;;
-  *) [ "$VERIFY_SCOPE_SET" -eq 0 ] || { echo "--scope is only valid for verify and verify-api" >&2; exit 2; } ;;
+  reconcile)
+    case "$VERIFY_SCOPE" in
+      control|data|all) ;;
+      *) echo "reconcile scope must be control, data, or all" >&2; exit 2 ;;
+    esac
+    ;;
+  *) [ "$VERIFY_SCOPE_SET" -eq 0 ] || { echo "--scope is only valid for reconcile, verify, and verify-api" >&2; exit 2; } ;;
 esac
+[ "$REANCHOR" -eq 0 ] || [ "$PHASE" = "backup" ] \
+  || { echo "--reanchor is only valid for backup" >&2; exit 2; }
 [ -f "$ENVJSON" ] || { echo "FATAL: environment file not found: $ENVJSON" >&2; exit 2; }
 [ -z "$VALUESJSON" ] || [ -f "$VALUESJSON" ] \
   || { echo "FATAL: values file not found: $VALUESJSON" >&2; exit 2; }
@@ -53,6 +62,9 @@ ARTIFACT_SHA256=ef0fbf78501b0bb07e7968146d987078c25baf850ea0f208fb877a45c5779cd2
 HOOK_NAME=openclaw-host-init
 NEW_TIMEOUT=3600
 STATE="${KITDIR}/.restorepatch-state.json"
+KITDIR_ABS="$(cd "$KITDIR" 2>/dev/null && pwd -P)" \
+  || { echo "FATAL: kit directory not found: $KITDIR" >&2; exit 2; }
+BACKUP_DIR="${KITDIR_ABS}/.restorepatch-backups"
 
 jget() { python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get(sys.argv[2]) or "")' "$1" "$2"; }
 jpath() {
@@ -100,6 +112,13 @@ case "$PHASE" in
   apply-api)
     REQUIRED_VARS="REGION FN"
     ;;
+  reconcile)
+    case "$VERIFY_SCOPE" in
+      control) REQUIRED_VARS="REGION FN" ;;
+      data) REQUIRED_VARS="REGION ASG BUCKET" ;;
+      all) REQUIRED_VARS="REGION FN ASG BUCKET" ;;
+    esac
+    ;;
   verify)
     case "$VERIFY_SCOPE" in
       control) REQUIRED_VARS="REGION FN" ;;
@@ -140,6 +159,19 @@ json.dump(d, open(p, "w"), indent=2)
 PY
 }
 state_get() { [ -f "$STATE" ] && jget "$STATE" "$1" || echo ""; }
+
+backup_anchor_put() {
+  local key="$1" value="$2" existing
+  existing="$(state_get "$key")"
+  if [ -n "$existing" ] && [ "$REANCHOR" -eq 0 ]; then
+    echo "   PRESERVE existing anchor $key"
+    return 0
+  fi
+  if [ -n "$existing" ]; then
+    echo "   REANCHOR $key"
+  fi
+  state_put "$key" "$value"
+}
 
 sha256_file() {
   local path="$1" value
@@ -191,13 +223,32 @@ overlay_function() {
 }
 
 backup_function() {
-  local function_name="$1" location zip
+  local function_name="$1" sha_key path_key
+  local existing_path existing_sha location zip
+  sha_key="${2:-backup_sha_${function_name}}"
+  path_key="backup_${function_name}"
+  existing_path="$(state_get "$path_key")"
+  existing_sha="$(state_get "$sha_key")"
+  if [ "$REANCHOR" -eq 0 ] && [ -n "$existing_path" ]; then
+    [ -f "$existing_path" ] \
+      || die "existing anchor $path_key points to a missing package; use --reanchor to replace it"
+    backup_anchor_put "$path_key" "$existing_path"
+    if [ -n "$existing_sha" ]; then
+      backup_anchor_put "$sha_key" "$existing_sha"
+    else
+      backup_anchor_put "$sha_key" "$(sha256_file "$existing_path")"
+    fi
+    return
+  fi
+  [ "$REANCHOR" -eq 1 ] || [ -z "$existing_sha" ] \
+    || die "existing anchor $sha_key has no package path; use --reanchor to replace it"
+  mkdir -p "$BACKUP_DIR" || die "cannot create backup directory $BACKUP_DIR"
   location="$(aws_ lambda get-function --function-name "$function_name" \
     --query 'Code.Location' --output text)" || die "cannot locate $function_name package"
-  zip="/tmp/${function_name}-restorepatch-backup.zip"
+  zip="${BACKUP_DIR}/${function_name}-restorepatch-backup.zip"
   curl -fsS -o "$zip" "$location" || die "cannot back up $function_name"
-  state_put "backup_${function_name}" "$zip"
-  state_put "backup_sha_${function_name}" "$(sha256_file "$zip")"
+  backup_anchor_put "$path_key" "$zip"
+  backup_anchor_put "$sha_key" "$(sha256_file "$zip")"
 }
 
 restore_function() {
@@ -781,7 +832,518 @@ probe_private_api_endpoint() {
   echo "   REUSE $VPC_ENDPOINT_ID; no endpoint create call will be made"
 }
 
+reconcile_reset_counts() {
+  RECON_PATCH=0
+  RECON_BASE=0
+  RECON_UNKNOWN=0
+  RECON_ABSENT=0
+  RECON_NOT_APPLICABLE=0
+  RECON_UNMAPPED=0
+  RECON_UNREADABLE=0
+  RECON_SPLIT=0
+  RECON_C_PATCH=0
+  RECON_C_BASE=0
+  RECON_C_UNKNOWN=0
+  RECON_C_ABSENT=0
+  RECON_C_NOT_APPLICABLE=0
+  RECON_C_UNMAPPED=0
+  RECON_C_UNREADABLE=0
+  RECON_B_PATCH=0
+  RECON_B_BASE=0
+  RECON_B_UNKNOWN=0
+  RECON_B_ABSENT=0
+  RECON_B_NOT_APPLICABLE=0
+  RECON_B_UNMAPPED=0
+  RECON_B_UNREADABLE=0
+}
+
+reconcile_count_state() {
+  local layer="$1" state="$2"
+  case "$state" in
+    PATCH) RECON_PATCH=$((RECON_PATCH + 1)) ;;
+    BASE) RECON_BASE=$((RECON_BASE + 1)) ;;
+    UNKNOWN) RECON_UNKNOWN=$((RECON_UNKNOWN + 1)) ;;
+    ABSENT) RECON_ABSENT=$((RECON_ABSENT + 1)) ;;
+    NOT_APPLICABLE) RECON_NOT_APPLICABLE=$((RECON_NOT_APPLICABLE + 1)) ;;
+    UNMAPPED) RECON_UNMAPPED=$((RECON_UNMAPPED + 1)) ;;
+    UNREADABLE) RECON_UNREADABLE=$((RECON_UNREADABLE + 1)) ;;
+    *) die "internal reconcile state is invalid: $state" ;;
+  esac
+  case "${layer}:${state}" in
+    C-lambda:PATCH) RECON_C_PATCH=$((RECON_C_PATCH + 1)) ;;
+    C-lambda:BASE) RECON_C_BASE=$((RECON_C_BASE + 1)) ;;
+    C-lambda:UNKNOWN) RECON_C_UNKNOWN=$((RECON_C_UNKNOWN + 1)) ;;
+    C-lambda:ABSENT) RECON_C_ABSENT=$((RECON_C_ABSENT + 1)) ;;
+    C-lambda:NOT_APPLICABLE) RECON_C_NOT_APPLICABLE=$((RECON_C_NOT_APPLICABLE + 1)) ;;
+    C-lambda:UNMAPPED) RECON_C_UNMAPPED=$((RECON_C_UNMAPPED + 1)) ;;
+    C-lambda:UNREADABLE) RECON_C_UNREADABLE=$((RECON_C_UNREADABLE + 1)) ;;
+    B-s3:PATCH) RECON_B_PATCH=$((RECON_B_PATCH + 1)) ;;
+    B-s3:BASE) RECON_B_BASE=$((RECON_B_BASE + 1)) ;;
+    B-s3:UNKNOWN) RECON_B_UNKNOWN=$((RECON_B_UNKNOWN + 1)) ;;
+    B-s3:ABSENT) RECON_B_ABSENT=$((RECON_B_ABSENT + 1)) ;;
+    B-s3:NOT_APPLICABLE) RECON_B_NOT_APPLICABLE=$((RECON_B_NOT_APPLICABLE + 1)) ;;
+    B-s3:UNMAPPED) RECON_B_UNMAPPED=$((RECON_B_UNMAPPED + 1)) ;;
+    B-s3:UNREADABLE) RECON_B_UNREADABLE=$((RECON_B_UNREADABLE + 1)) ;;
+  esac
+}
+
+reconcile_record() {
+  local layer="$1" source="$2" artifact="$3" change="$4" place="$5" state="$6"
+  local digest="${7:--}"
+  printf 'reconcile row layer=%s source=%s artifact=%s change=%s place=%s state=%s sha256=%s\n' \
+    "$layer" "$source" "$artifact" "$change" "$place" "$state" "$digest"
+  reconcile_count_state "$layer" "$state"
+  if [ "$layer" = "B-s3" ] && [ -n "${RECON_STATE_FILE:-}" ]; then
+    printf '%s\t%s\t%s\t%s\n' "$source" "$artifact" "$place" "$state" \
+      >> "$RECON_STATE_FILE"
+  fi
+}
+
+reconcile_classify_hash() {
+  local actual="$1" base="$2" patch="$3"
+  if [ -n "$patch" ] && [ "$actual" = "$patch" ]; then
+    echo PATCH
+  elif [ -n "$base" ] && [ "$actual" = "$base" ]; then
+    echo BASE
+  else
+    echo UNKNOWN
+  fi
+}
+
+reconcile_lambda_mark_package() {
+  local function_name="$1" prefix="$2" state="$3"
+  local source artifact change base patch rel
+  while IFS=$'\x1f' read -r source artifact change base patch; do
+    [ -n "$source" ] || continue
+    rel="${artifact#"$prefix"}"
+    reconcile_record C-lambda "$source" "$artifact" "$change" \
+      "lambda:${function_name}:${rel}" "$state" -
+  done < <(
+    jq -r --arg prefix "$prefix" '
+      .paths | to_entries[]
+      | select(.value.layer == "C-lambda" and .value.artifact != null)
+      | select(.value.artifact | startswith($prefix))
+      | [
+          .key, .value.artifact, .value.change,
+          (.value.base_sha256 // ""), (.value.patch_sha256 // "")
+        ]
+      | join("\u001f")
+    ' "${KITDIR}/manifest.json"
+  )
+}
+
+reconcile_lambda_function() {
+  local function_name="$1" prefix="$2" work location package_entries
+  local source artifact change base patch rel entry member digest state
+  work="$(mktemp -d)"
+  if ! location="$(aws_ lambda get-function --function-name "$function_name" \
+      --query 'Code.Location' --output text 2>"${work}/error")"; then
+    if grep -Eq 'ResourceNotFoundException|Function not found' "${work}/error"; then
+      # A function that is not deployed in this environment is NOT_APPLICABLE, matching
+      # what apply_control_overlay already does with it ("no deployed target for its
+      # module" — it skips and continues). Calling it ABSENT made reconcile report drift
+      # for a module that has nowhere to be delivered, which failed an otherwise fully
+      # converged run.
+      reconcile_lambda_mark_package "$function_name" "$prefix" NOT_APPLICABLE
+    else
+      reconcile_lambda_mark_package "$function_name" "$prefix" UNREADABLE
+    fi
+    rm -f "${work}/error"
+    rmdir "$work" 2>/dev/null || true
+    return
+  fi
+  if [ -z "$location" ] || [ "$location" = "None" ] \
+      || ! curl -fsS -o "${work}/package.zip" "$location" \
+      || ! unzip -Z1 "${work}/package.zip" > "${work}/entries" 2>/dev/null; then
+    reconcile_lambda_mark_package "$function_name" "$prefix" UNREADABLE
+    rm -f "${work}/error" "${work}/package.zip" "${work}/entries"
+    rmdir "$work" 2>/dev/null || true
+    return
+  fi
+  package_entries="${work}/entries"
+  while IFS=$'\x1f' read -r source artifact change base patch; do
+    [ -n "$source" ] || continue
+    rel="${artifact#"$prefix"}"
+    entry="$rel"
+    if ! grep -Fx -- "$entry" "$package_entries" >/dev/null; then
+      entry="./$rel"
+    fi
+    if ! grep -Fx -- "$entry" "$package_entries" >/dev/null; then
+      reconcile_record C-lambda "$source" "$artifact" "$change" \
+        "lambda:${function_name}:${rel}" ABSENT -
+      continue
+    fi
+    member="${work}/member"
+    if ! unzip -p "${work}/package.zip" "$entry" > "$member" 2>/dev/null; then
+      reconcile_record C-lambda "$source" "$artifact" "$change" \
+        "lambda:${function_name}:${rel}" UNREADABLE -
+      continue
+    fi
+    digest="$(sha256_file "$member")"
+    state="$(reconcile_classify_hash "$digest" "$base" "$patch")"
+    reconcile_record C-lambda "$source" "$artifact" "$change" \
+      "lambda:${function_name}:${rel}" "$state" "$digest"
+  done < <(
+    jq -r --arg prefix "$prefix" '
+      .paths | to_entries[]
+      | select(.value.layer == "C-lambda" and .value.artifact != null)
+      | select(.value.artifact | startswith($prefix))
+      | [
+          .key, .value.artifact, .value.change,
+          (.value.base_sha256 // ""), (.value.patch_sha256 // "")
+        ]
+      | join("\u001f")
+    ' "${KITDIR}/manifest.json"
+  )
+  rm -f "${work}/error" "${work}/package.zip" "${work}/entries" "${work}/member"
+  rmdir "$work" 2>/dev/null || true
+}
+
+reconcile_b_place_map() {
+  local kit_artifact="$1"
+  RECON_B_S3_KEY=""
+  RECON_B_HOST_PATH=""
+  # A name-derived guess produced false ABSENT rows on a real fleet. Keep this
+  # measured place map explicit:
+  # kit artifact                  S3 key under <assets bucket>                                      host path
+  # launch-vm.sh.patched          deployment/scripts/launch-vm.sh                                  /home/ubuntu/launch-vm.sh
+  # stop-vm.sh.patched            deployment/scripts/stop-vm.sh                                    /home/ubuntu/stop-vm.sh
+  # backup-data.sh.patched        deployment/scripts/backup-data.sh                                /home/ubuntu/backup-data.sh
+  # reset-vm.sh.patched           deployment/scripts/reset-vm.sh                                  /home/ubuntu/reset-vm.sh
+  # rebuild-vm.sh.patched         deployment/scripts/rebuild-vm.sh                                /home/ubuntu/rebuild-vm.sh
+  # delete-vm.sh.patched          deployment/scripts/delete-vm.sh                                  /home/ubuntu/delete-vm.sh
+  # host-agent.py.patched         deployment/scripts/host-agent.py                                 /opt/openclaw/host-agent.py
+  # host-agent.service.patched    NOT_PUBLISHED                                                     /etc/systemd/system/host-agent.service
+  # init-host.sh.patched          deployment/bootstrap/host/<patched asset prefix>/init-host.sh    NOT_INSTALLED_ON_DISK
+  # provision-host.sh.patched     NOT_PUBLISHED                                                     /opt/openclaw/provision-host.sh
+  case "$kit_artifact" in
+    launch-vm.sh.patched)
+      RECON_B_S3_KEY="deployment/scripts/launch-vm.sh"
+      RECON_B_HOST_PATH="/home/ubuntu/launch-vm.sh"
+      ;;
+    stop-vm.sh.patched)
+      RECON_B_S3_KEY="deployment/scripts/stop-vm.sh"
+      RECON_B_HOST_PATH="/home/ubuntu/stop-vm.sh"
+      ;;
+    backup-data.sh.patched)
+      RECON_B_S3_KEY="deployment/scripts/backup-data.sh"
+      RECON_B_HOST_PATH="/home/ubuntu/backup-data.sh"
+      ;;
+    reset-vm.sh.patched)
+      RECON_B_S3_KEY="deployment/scripts/reset-vm.sh"
+      RECON_B_HOST_PATH="/home/ubuntu/reset-vm.sh"
+      ;;
+    rebuild-vm.sh.patched)
+      RECON_B_S3_KEY="deployment/scripts/rebuild-vm.sh"
+      RECON_B_HOST_PATH="/home/ubuntu/rebuild-vm.sh"
+      ;;
+    delete-vm.sh.patched)
+      RECON_B_S3_KEY="deployment/scripts/delete-vm.sh"
+      RECON_B_HOST_PATH="/home/ubuntu/delete-vm.sh"
+      ;;
+    host-agent.py.patched)
+      RECON_B_S3_KEY="deployment/scripts/host-agent.py"
+      RECON_B_HOST_PATH="/opt/openclaw/host-agent.py"
+      ;;
+    host-agent.service.patched)
+      RECON_B_S3_KEY="NOT_PUBLISHED"
+      RECON_B_HOST_PATH="/etc/systemd/system/host-agent.service"
+      ;;
+    init-host.sh.patched)
+      RECON_B_S3_KEY="deployment/bootstrap/host/${ASSET_BUNDLE_PREFIX}/init-host.sh"
+      RECON_B_HOST_PATH="NOT_INSTALLED_ON_DISK"
+      ;;
+    provision-host.sh.patched)
+      RECON_B_S3_KEY="NOT_PUBLISHED"
+      RECON_B_HOST_PATH="/opt/openclaw/provision-host.sh"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+reconcile_b_mark_instance() {
+  local records_file="$1" instance_id="$2" state="$3"
+  local source artifact change base patch key host_path
+  while IFS=$'\x1f' read -r source artifact change base patch key host_path; do
+    [ -n "$source" ] || continue
+    reconcile_record B-s3 "$source" "$artifact" "$change" \
+      "instance:${instance_id}:${host_path}" "$state" -
+  done < "$records_file"
+}
+
+reconcile_b_instance() {
+  local records_file="$1" instance_id="$2" ssm_params="$3"
+  local command_id result status output source artifact change base patch key host_path value state detail
+  command_id="$(aws_ ssm send-command --instance-ids "$instance_id" \
+    --document-name AWS-RunShellScript --comment "restorepatch manifest reconcile" \
+    --parameters "$ssm_params" --timeout-seconds 120 \
+    --query 'Command.CommandId' --output text 2>/dev/null)" || command_id=""
+  if [ -z "$command_id" ] || [ "$command_id" = "None" ]; then
+    reconcile_b_mark_instance "$records_file" "$instance_id" UNREADABLE
+    return
+  fi
+  aws_ ssm wait command-executed --command-id "$command_id" \
+    --instance-id "$instance_id" >/dev/null 2>&1 || true
+  result="$(aws_ ssm get-command-invocation --command-id "$command_id" \
+    --instance-id "$instance_id" --output json 2>/dev/null)" || result=""
+  if [ -z "$result" ]; then
+    reconcile_b_mark_instance "$records_file" "$instance_id" UNREADABLE
+    return
+  fi
+  status="$(printf '%s' "$result" | jq -r '.Status // "Unknown"')"
+  if [ "$status" != "Success" ]; then
+    reconcile_b_mark_instance "$records_file" "$instance_id" UNREADABLE
+    return
+  fi
+  output="$(printf '%s' "$result" | jq -r '.StandardOutputContent // ""')"
+  while IFS=$'\x1f' read -r source artifact change base patch key host_path; do
+    [ -n "$source" ] || continue
+    if ! value="$(printf '%s\n' "$output" | awk -F '\t' -v wanted="$artifact" '
+        $1 == wanted {gsub(/\r/, "", $2); print $2; found=1; exit}
+        END {if (!found) exit 1}
+      ')"; then
+      reconcile_record B-s3 "$source" "$artifact" "$change" \
+        "instance:${instance_id}:${host_path}" UNREADABLE -
+      continue
+    fi
+    case "$value" in
+      ABSENT|UNREADABLE) state="$value" ;;
+      *)
+        if printf '%s' "$value" | grep -Eq '^[0-9a-f]{64}$'; then
+          state="$(reconcile_classify_hash "$value" "$base" "$patch")"
+        else
+          state=UNREADABLE
+          value=-
+        fi
+        ;;
+    esac
+    # A `case` cannot live inside `$( )`: the first pattern's closing paren ends the
+    # command substitution, so the rest of the branch leaks out as a bare `;;` — which
+    # `bash -n` accepts and only fails at run time, in the middle of a fleet sweep.
+    case "$state" in
+      PATCH|BASE|UNKNOWN) detail="$value" ;;
+      *) detail=- ;;
+    esac
+    reconcile_record B-s3 "$source" "$artifact" "$change" \
+      "instance:${instance_id}:${host_path}" "$state" "$detail"
+  done < "$records_file"
+}
+
+reconcile_b_s3() {
+  local manifest_records_file records_file host_records_file work
+  local source artifact change base patch name key host_path digest state detail
+  local asg_json instance_ids ssm_params instance_id readable_states state_count details
+  work="$(mktemp -d)"
+  manifest_records_file="${work}/manifest-records.usv"
+  records_file="${work}/records.usv"
+  host_records_file="${work}/host-records.usv"
+  jq -r '
+    .paths | to_entries[]
+    | select(.value.layer == "B-s3" and .value.artifact != null)
+    | [
+        .key, .value.artifact, .value.change,
+        (.value.base_sha256 // ""), (.value.patch_sha256 // "")
+      ]
+    | join("\u001f")
+  ' "${KITDIR}/manifest.json" > "$manifest_records_file" \
+    || die "cannot read B-s3 records from manifest"
+
+  : > "$records_file"
+  : > "$host_records_file"
+  while IFS=$'\x1f' read -r source artifact change base patch; do
+    [ -n "$source" ] || continue
+    name="${artifact#host-scripts/}"
+    if ! reconcile_b_place_map "$name"; then
+      reconcile_record B-s3 "$source" "$artifact" "$change" \
+        "place-map:${name}" UNMAPPED -
+      continue
+    fi
+    key="$RECON_B_S3_KEY"
+    host_path="$RECON_B_HOST_PATH"
+    printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\n' \
+      "$source" "$artifact" "$change" "$base" "$patch" "$key" "$host_path" \
+      >> "$records_file"
+    if [ "$key" = "NOT_PUBLISHED" ]; then
+      reconcile_record B-s3 "$source" "$artifact" "$change" \
+        "s3:not-published" NOT_APPLICABLE -
+    fi
+    if [ "$host_path" = "NOT_INSTALLED_ON_DISK" ]; then
+      reconcile_record B-s3 "$source" "$artifact" "$change" \
+        "host:not-installed-on-disk" NOT_APPLICABLE -
+    else
+      printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\n' \
+        "$source" "$artifact" "$change" "$base" "$patch" "$key" "$host_path" \
+        >> "$host_records_file"
+    fi
+  done < "$manifest_records_file"
+
+  while IFS=$'\x1f' read -r source artifact change base patch key host_path; do
+    [ -n "$source" ] || continue
+    [ "$key" != "NOT_PUBLISHED" ] || continue
+    if aws_ s3api head-object --bucket "$BUCKET" --key "$key" \
+        >/dev/null 2>"${work}/s3-error"; then
+      if aws_ s3 cp "s3://${BUCKET}/${key}" "${work}/s3-object" \
+          --no-progress >/dev/null 2>"${work}/s3-error"; then
+        digest="$(sha256_file "${work}/s3-object")"
+        state="$(reconcile_classify_hash "$digest" "$base" "$patch")"
+        reconcile_record B-s3 "$source" "$artifact" "$change" \
+          "s3:${BUCKET}/${key}" "$state" "$digest"
+      else
+        reconcile_record B-s3 "$source" "$artifact" "$change" \
+          "s3:${BUCKET}/${key}" UNREADABLE -
+      fi
+    elif grep -Eq '(\(404\)|NoSuchKey|NotFound|Not Found)' "${work}/s3-error"; then
+      reconcile_record B-s3 "$source" "$artifact" "$change" \
+        "s3:${BUCKET}/${key}" ABSENT -
+    else
+      reconcile_record B-s3 "$source" "$artifact" "$change" \
+        "s3:${BUCKET}/${key}" UNREADABLE -
+    fi
+  done < "$records_file"
+
+  if ! asg_json="$(aws_ autoscaling describe-auto-scaling-groups \
+      --auto-scaling-group-names "$ASG" --output json 2>"${work}/asg-error")" \
+      || ! printf '%s' "$asg_json" |
+        jq -e '.AutoScalingGroups | length == 1' >/dev/null; then
+    while IFS=$'\x1f' read -r source artifact change base patch key host_path; do
+      [ -n "$source" ] || continue
+      reconcile_record B-s3 "$source" "$artifact" "$change" \
+        "asg:${ASG}" UNREADABLE -
+    done < "$host_records_file"
+  else
+    instance_ids="$(printf '%s' "$asg_json" |
+      jq -r '.AutoScalingGroups[0].Instances[]?.InstanceId')"
+    # The generator runs as a plain command with its output redirected, NOT inside
+    # `$( )`. A heredoc whose body carries shell-significant characters inside a
+    # command substitution does not parse here: bash reports `unexpected EOF while
+    # looking for matching ')'` at the substitution line, and `bash -n` blames a line
+    # ~100 lines later, which makes it look like an unrelated defect.
+    python3 - "$host_records_file" > "${work}/ssm-params.json" 2>/dev/null <<'PY'
+import json
+import shlex
+import sys
+
+lines = ["set +e"]
+with open(sys.argv[1], encoding="utf-8") as handle:
+    for raw in handle:
+        fields = raw.rstrip("\n").split("\x1f")
+        if len(fields) < 7:
+            continue
+        artifact = fields[1]
+        path = fields[6]
+        lines.extend([
+            f"artifact={shlex.quote(artifact)}",
+            f"path={shlex.quote(path)}",
+            'if [ ! -e "$path" ]; then',
+            '  printf "%s\\tABSENT\\n" "$artifact"',
+            'elif [ ! -f "$path" ]; then',
+            '  printf "%s\\tUNREADABLE\\n" "$artifact"',
+            "else",
+            '  digest="$(sha256sum -- "$path" 2>/dev/null | awk \'{print $1}\')"',
+            '  if printf "%s" "$digest" | grep -Eq "^[0-9a-f]{64}$"; then',
+            '    printf "%s\\t%s\\n" "$artifact" "$digest"',
+            "  else",
+            '    printf "%s\\tUNREADABLE\\n" "$artifact"',
+            "  fi",
+            "fi",
+        ])
+print(json.dumps({"commands": ["\n".join(lines)]}, separators=(",", ":")))
+PY
+    # An empty file (generator failed, or produced nothing) keeps the existing
+    # "no params" branch below, which marks every instance UNREADABLE rather than
+    # reporting a converged sweep it never performed.
+    ssm_params="$(cat "${work}/ssm-params.json" 2>/dev/null || true)"
+    if [ -z "$ssm_params" ]; then
+      for instance_id in $instance_ids; do
+        reconcile_b_mark_instance "$host_records_file" "$instance_id" UNREADABLE
+      done
+    else
+      for instance_id in $instance_ids; do
+        reconcile_b_instance "$host_records_file" "$instance_id" "$ssm_params"
+      done
+    fi
+  fi
+
+  while IFS=$'\x1f' read -r source artifact change base patch key host_path; do
+    [ -n "$source" ] || continue
+    [ "$key" != "NOT_PUBLISHED" ] || continue
+    [ "$host_path" != "NOT_INSTALLED_ON_DISK" ] || continue
+    readable_states="$(awk -F '\t' -v wanted="$artifact" '
+      $2 == wanted && $4 != "UNREADABLE" && $4 != "NOT_APPLICABLE" &&
+        $4 != "UNMAPPED" {print $4}
+    ' "$RECON_STATE_FILE" | sort -u)"
+    state_count="$(printf '%s\n' "$readable_states" |
+      awk 'NF {count++} END {print count+0}')"
+    if [ "$state_count" -gt 1 ]; then
+      details="$(awk -F '\t' -v wanted="$artifact" '
+        $2 == wanted {printf "%s%s=%s", (seen++ ? "," : ""), $3, $4}
+      ' "$RECON_STATE_FILE")"
+      echo "reconcile SPLIT source=$source artifact=$artifact states=$details"
+      RECON_SPLIT=$((RECON_SPLIT + 1))
+    fi
+  done < "$records_file"
+
+  rm -f "$manifest_records_file" "$records_file" "$host_records_file" \
+    "${work}/s3-error" "${work}/s3-object" "${work}/asg-error" \
+    "${work}/ssm-params.json"
+  rmdir "$work" 2>/dev/null || true
+}
+
+reconcile_run() {
+  local manifest="${KITDIR}/manifest.json" peer_fn nonpatch verdict
+  [ -f "$manifest" ] || die "manifest not found: $manifest"
+  jq -e '.paths | type == "object"' "$manifest" >/dev/null \
+    || die "manifest paths must be an object"
+  reconcile_reset_counts
+  RECON_STATE_FILE="$(mktemp)"
+  say "reconcile scope=$VERIFY_SCOPE (READ-ONLY)"
+
+  if scope_includes control; then
+    case "$PEER_DISCOVERY_CONFIRMED" in
+      True|true) ;;
+      *)
+        # If discovery could not enumerate the complete API-package serving set,
+        # checking only the known function would make unknown coverage look converged.
+        reconcile_record C-lambda discovery "lambda/api/*" - \
+          "lambda:peer-discovery" UNREADABLE -
+        ;;
+    esac
+    reconcile_lambda_function "$FN" "lambda/api/"
+    for peer_fn in $PEER_FNS; do
+      reconcile_lambda_function "$peer_fn" "lambda/api/"
+    done
+    reconcile_lambda_function openclaw-backup "lambda/backup/"
+    reconcile_lambda_function openclaw-health-check "lambda/health_check/"
+    reconcile_lambda_function openclaw-scaler "lambda/scaler/"
+    reconcile_lambda_function openclaw-tenant-stats-writer "lambda/tenant_stats/"
+    echo "reconcile summary layer=C-lambda patch=$RECON_C_PATCH base=$RECON_C_BASE unknown=$RECON_C_UNKNOWN absent=$RECON_C_ABSENT not_applicable=$RECON_C_NOT_APPLICABLE unmapped=$RECON_C_UNMAPPED unreadable=$RECON_C_UNREADABLE"
+  fi
+  if scope_includes data; then
+    reconcile_b_s3
+    echo "reconcile summary layer=B-s3 patch=$RECON_B_PATCH base=$RECON_B_BASE unknown=$RECON_B_UNKNOWN absent=$RECON_B_ABSENT not_applicable=$RECON_B_NOT_APPLICABLE unmapped=$RECON_B_UNMAPPED unreadable=$RECON_B_UNREADABLE"
+  fi
+
+  nonpatch=$((RECON_BASE + RECON_UNKNOWN + RECON_ABSENT + RECON_UNMAPPED + RECON_UNREADABLE))
+  if [ "$nonpatch" -eq 0 ] && [ "$RECON_SPLIT" -eq 0 ] \
+      && [ "$RECON_PATCH" -gt 0 ]; then
+    verdict=CONVERGED
+  else
+    verdict=DRIFTED
+  fi
+  echo "reconcile verdict=$verdict patch=$RECON_PATCH base=$RECON_BASE unknown=$RECON_UNKNOWN absent=$RECON_ABSENT not_applicable=$RECON_NOT_APPLICABLE unmapped=$RECON_UNMAPPED split=$RECON_SPLIT unreadable=$RECON_UNREADABLE"
+  rm -f "$RECON_STATE_FILE"
+  RECON_STATE_FILE=""
+  [ "$verdict" = "CONVERGED" ]
+}
+
 case "$PHASE" in
+
+reconcile)
+  reconcile_run
+  exit $?
+  ;;
 
 precheck)
   say "identity"
@@ -989,50 +1551,69 @@ PY
 backup)
   validate_control_overlay_scope
   say "recording restore points into $STATE"
+  mkdir -p "$BACKUP_DIR" || die "cannot create backup directory $BACKUP_DIR"
   hook_to="$(aws_ autoscaling describe-lifecycle-hooks --auto-scaling-group-name "$ASG" \
     --query "LifecycleHooks[?LifecycleHookName=='${HOOK_NAME}'].HeartbeatTimeout|[0]" --output text)"
-  state_put hook_backup_timeout "$hook_to"
+  backup_anchor_put hook_backup_timeout "$hook_to"
   # Verify and rollback need the exact pre-apply capacity values, including a legitimate zero minimum.
   read -r asg_min asg_desired <<< "$(aws_ autoscaling describe-auto-scaling-groups \
     --auto-scaling-group-names "$ASG" \
     --query 'AutoScalingGroups[0].[MinSize,DesiredCapacity]' --output text)"
-  state_put asg_backup_min_size "$asg_min"
-  state_put asg_backup_desired "$asg_desired"
+  backup_anchor_put asg_backup_min_size "$asg_min"
+  backup_anchor_put asg_backup_desired "$asg_desired"
   lt_def="$(aws_ ec2 describe-launch-templates --launch-template-id "$LT_ID" \
     --query 'LaunchTemplates[0].DefaultVersionNumber' --output text)"
-  state_put host_lt_backup_version "$lt_def"
+  backup_anchor_put host_lt_backup_version "$lt_def"
   lt_ami="$(aws_ ec2 describe-launch-template-versions --launch-template-id "$LT_ID" \
     --versions "$LT_VER" --query 'LaunchTemplateVersions[0].LaunchTemplateData.ImageId' --output text)"
-  state_put host_lt_backup_ami "$lt_ami"
+  backup_anchor_put host_lt_backup_ami "$lt_ami"
   env_n="$(aws_ lambda get-function-configuration --function-name "$FN" \
     --query 'length(Environment.Variables)' --output text)"
-  state_put api_env_key_count "$env_n"
-  ver="$(aws_ lambda publish-version --function-name "$FN" \
-    --description pre-restorepatch-anchor --query Version --output text)" || die "cannot publish anchor version"
-  state_put api_backup_version "$ver"
-  if an="$(alias_name)"; then
-    state_put api_alias_name "$an"
-    state_put api_alias_backup_version "$(aws_ lambda get-alias --function-name "$FN" \
+  backup_anchor_put api_env_key_count "$env_n"
+  ver="$(state_get api_backup_version)"
+  if [ -n "$ver" ] && [ "$REANCHOR" -eq 0 ]; then
+    backup_anchor_put api_backup_version "$ver"
+  else
+    ver="$(aws_ lambda publish-version --function-name "$FN" \
+      --description pre-restorepatch-anchor --query Version --output text)" \
+      || die "cannot publish anchor version"
+    backup_anchor_put api_backup_version "$ver"
+  fi
+  alias_anchor="$(state_get api_alias_name)"
+  alias_version_anchor="$(state_get api_alias_backup_version)"
+  if [ "$REANCHOR" -eq 0 ] && { [ -n "$alias_anchor" ] || [ -n "$alias_version_anchor" ]; }; then
+    [ -n "$alias_anchor" ] && [ -n "$alias_version_anchor" ] \
+      || die "API alias backup anchor is incomplete; use --reanchor to replace it"
+    backup_anchor_put api_alias_name "$alias_anchor"
+    backup_anchor_put api_alias_backup_version "$alias_version_anchor"
+  elif an="$(alias_name)"; then
+    backup_anchor_put api_alias_name "$an"
+    backup_anchor_put api_alias_backup_version "$(aws_ lambda get-alias --function-name "$FN" \
       --name "$an" --query FunctionVersion --output text)"
   else
     echo "   API environment does not use an alias; the unqualified version is the serving path"
   fi
-  loc="$(aws_ lambda get-function --function-name "$FN" --query 'Code.Location' --output text)"
-  curl -fsS -o /tmp/openclaw-api-backup.zip "$loc" || die "cannot download live package"
-  sha="$(sha256_file /tmp/openclaw-api-backup.zip)"
-  state_put api_backup_zip_sha256 "$sha"
-  state_put "backup_${FN}" /tmp/openclaw-api-backup.zip
+  backup_function "$FN" api_backup_zip_sha256
   for peer_fn in $PEER_FNS; do
     backup_function "$peer_fn"
   done
   for extra_fn in openclaw-backup openclaw-health-check openclaw-scaler \
     openclaw-tenant-stats-writer openclaw-console-bff; do
-    if aws_ lambda get-function --function-name "$extra_fn" >/dev/null 2>&1; then
+    if [ "$REANCHOR" -eq 0 ] && [ -n "$(state_get "backup_${extra_fn}")" ]; then
+      backup_function "$extra_fn"
+    elif aws_ lambda get-function --function-name "$extra_fn" >/dev/null 2>&1; then
       backup_function "$extra_fn"
     else
       echo "   ABSENT $extra_fn; no recovery package required"
     fi
   done
+  hook_to="$(state_get hook_backup_timeout)"
+  asg_min="$(state_get asg_backup_min_size)"
+  asg_desired="$(state_get asg_backup_desired)"
+  lt_def="$(state_get host_lt_backup_version)"
+  lt_ami="$(state_get host_lt_backup_ami)"
+  env_n="$(state_get api_env_key_count)"
+  ver="$(state_get api_backup_version)"
   echo "   hook=$hook_to lt_default=$lt_def ami=$lt_ami api_anchor=$ver env_keys=$env_n"
   echo "   asg_min=$asg_min asg_desired=$asg_desired"
   say "backup OK"
@@ -1766,11 +2347,15 @@ rollback)
       || die "cannot restore desired capacity to $backup_desired"
   fi
   state_put canary_pass false
-  say "roll the fleet back onto the restored template"
-  aws_ autoscaling start-instance-refresh --auto-scaling-group-name "$ASG" \
-    --preferences '{"MinHealthyPercentage":100,"MaxHealthyPercentage":100,"InstanceWarmup":900,"SkipMatching":false}' \
-    --query InstanceRefreshId --output text \
-    || die "cannot start rollback refresh"
+  if [ -n "$(state_get host_lt_new_version)" ]; then
+    say "roll the fleet back onto the restored template"
+    aws_ autoscaling start-instance-refresh --auto-scaling-group-name "$ASG" \
+      --preferences '{"MinHealthyPercentage":100,"MaxHealthyPercentage":100,"InstanceWarmup":900,"SkipMatching":false}' \
+      --query InstanceRefreshId --output text \
+      || die "cannot start rollback refresh"
+  else
+    echo "   SKIP fleet refresh: no data-plane concern was applied"
+  fi
   say "rollback OK — the previous bootstrap object is content-addressed and still present"
   ;;
 

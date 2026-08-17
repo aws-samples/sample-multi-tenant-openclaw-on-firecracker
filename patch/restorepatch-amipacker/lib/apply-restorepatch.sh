@@ -497,7 +497,11 @@ publish_s3_asset() {
   [ -f "$local_path" ] || die "missing asset $local_path"
   state_key="$(asset_state_key "$key")"
   local_len="$(wc -c < "$local_path" | tr -d ' ')"
-  mode="$(stat -f '%Lp' "$local_path" 2>/dev/null || stat -c '%a' "$local_path")"
+  # GNU coreutils `stat -f` means "show FILESYSTEM status", not "format". It prints the
+  # filesystem block to stdout and then exits non-zero, so with BSD-first probing the
+  # command substitution captures that block AND the fallback's output, yielding a
+  # multi-line $mode that can never equal "644". Probe GNU first; keep BSD as fallback.
+  mode="$(stat -c '%a' "$local_path" 2>/dev/null || stat -f '%Lp' "$local_path")"
   [ "$mode" = "644" ] || die "$local_path mode is $mode, expected 0644"
 
   if old_info="$(aws_ s3api head-object --bucket "$BUCKET" --key "$key" \
@@ -546,6 +550,15 @@ publish_host_assets() {
   publish_s3_asset "$root/launch-vm.sh.patched" "deployment/scripts/launch-vm.sh"
   publish_s3_asset "$root/rebuild-vm.sh.patched" "deployment/scripts/rebuild-vm.sh"
   publish_s3_asset "$root/reset-vm.sh.patched" "deployment/scripts/reset-vm.sh"
+  # delete-vm.sh is a NEW hard dependency of the patched bootstrap: the patched
+  # init-host.sh fetches it WITHOUT `|| true`, so an absent object makes every new host
+  # burn the 20x15s retry budget and then exit 1 -> lifecycle ABANDON -> the ASG relaunches
+  # -> unbounded churn, and `canary` can never pass. stop-vm.sh and backup-data.sh are
+  # shipped patched too; publishing only some of them is exactly the mixed-lineage fleet
+  # this function's own comment sets out to prevent.
+  publish_s3_asset "$root/delete-vm.sh.patched" "deployment/scripts/delete-vm.sh"
+  publish_s3_asset "$root/stop-vm.sh.patched" "deployment/scripts/stop-vm.sh"
+  publish_s3_asset "$root/backup-data.sh.patched" "deployment/scripts/backup-data.sh"
   while IFS= read -r rel; do
     # Same exclusion as overlay_function: this loop enumerates a directory, so a build
     # cache or workstation metadata file left there would become a customer S3 object.
@@ -559,6 +572,27 @@ publish_host_assets() {
   done < <(cd "$root/edge/fluent-bit" && find . -type f -print | sed 's|^\./||' | sort)
   # The unit is embedded by HOST_AGENT_SCRIPT; no runtime consumes an S3 service key.
   publish_s3_asset "$root/host-agent.py.patched" "deployment/scripts/host-agent.py"
+  assert_bootstrap_script_deps "$root"
+}
+
+# Every `deployment/scripts/*` object the patched bootstrap fetches must exist in the bucket
+# before a new host can consume the promoted template. Hand-maintaining the publish list
+# above is what let delete-vm.sh slip through, so derive the requirement from the artifact
+# that actually consumes it and fail loudly on any gap instead of discovering it as an
+# ABANDON loop on real hardware.
+assert_bootstrap_script_deps() {
+  local root="$1" rel missing=0
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    if ! aws_ s3api head-object --bucket "$BUCKET" --key "deployment/scripts/$rel" >/dev/null 2>&1; then
+      echo "   MISSING s3://${BUCKET}/deployment/scripts/${rel}" >&2
+      missing=1
+    fi
+  done < <(grep -oE 'deployment/scripts/[A-Za-z0-9._/-]+' "$root/init-host.sh.patched" \
+             | sed 's|deployment/scripts/||' | sort -u)
+  [ "$missing" -eq 0 ] \
+    || die "the patched bootstrap fetches objects that are absent from the bucket (see MISSING above); publishing the promoted template now would ABANDON every new host"
+  echo "   PASS every deployment/scripts object the patched bootstrap fetches is present"
 }
 
 restore_s3_asset() {
@@ -593,8 +627,14 @@ PY
 }
 
 restore_host_assets() {
-  local root="${KITDIR}/host-scripts" rel
+  local root="${KITDIR}/host-scripts" rel eff
   # Restore every object this driver may have changed, including the rendered bootstrap.
+  # The bootstrap this run published is keyed on THIS environment's rendering (see the
+  # content-addressing note in the apply path), so restore that key too. restore_s3_asset
+  # already no-ops for any key this run did not change, which keeps the manifest-prefix
+  # call below correct for state files written before that change.
+  eff="$(state_get rendered_bootstrap_sha256)"
+  [ -n "$eff" ] && restore_s3_asset "deployment/bootstrap/host/${eff}/init-host.sh"
   restore_s3_asset "deployment/bootstrap/host/${ASSET_BUNDLE_PREFIX}/init-host.sh"
   restore_s3_asset "deployment/scripts/host-agent.py"
   # The inline unit rolls back with the bootstrap object, not a separate S3 key.
@@ -665,7 +705,13 @@ apply_control_overlay() {
 
 resolve_bootstrap_state() {
   local live_prefix="$1" probe rc
-  if [ "$live_prefix" = "$ASSET_BUNDLE_PREFIX" ]; then
+  # An already-applied environment carries the hash of ITS OWN rendering, which is only
+  # equal to ASSET_BUNDLE_PREFIX when this environment renders byte-identically to the
+  # author's. Treat the recorded rendered hash as the effective target so a rerun is still
+  # the documented no-op.
+  if [ "$live_prefix" = "$ASSET_BUNDLE_PREFIX" ] \
+     || { [ -n "$(state_get rendered_bootstrap_sha256)" ] \
+          && [ "$live_prefix" = "$(state_get rendered_bootstrap_sha256)" ]; }; then
     echo "   STATE bootstrap=ALREADY — the target prefix is already in service; apply will skip it"
     BOOTSTRAP_STATE=ALREADY
   elif [ "$live_prefix" = "$BASE_ASSET_BUNDLE_PREFIX" ]; then
@@ -1624,32 +1670,45 @@ apply)
   rendered_sha="$(sha256_file "$rendered_art")"
   state_put rendered_bootstrap_sha256 "$rendered_sha"
   state_put rendered_bootstrap_source_prefix "$live_prefix"
+  # The bootstrap key is CONTENT-ADDRESSED, and the boot path proves it: the rendered
+  # UserData verifies the downloaded object with `sha256sum -c` against the same 64-hex it
+  # took from the key. ASSET_BUNDLE_PREFIX is the hash of the AUTHOR's rendering, so any
+  # environment that renders different values (i.e. anyone supplying --values, or any
+  # deployment with different subnets/ratios) would publish content whose sha256 does NOT
+  # equal its key, and every new host would fail verification and ABANDON. Use the hash of
+  # what we actually rendered; it is already computed on the line above.
   publish_s3_asset "$rendered_art" \
-    "deployment/bootstrap/host/${ASSET_BUNDLE_PREFIX}/init-host.sh"
+    "deployment/bootstrap/host/${rendered_sha}/init-host.sh"
   rm -f "$live_art"
 
   printf '%s' "$live_userdata" \
     | base64 -d > /tmp/restorepatch-ud.txt || die "cannot read in-service UserData"
   # Replace every observed content-addressed bootstrap prefix. The assertions below
   # forbid a no-op rewrite from creating and promoting an ineffective LT version.
-  python3 - /tmp/restorepatch-ud.txt "$ASSET_BUNDLE_PREFIX" \
+  python3 - /tmp/restorepatch-ud.txt "$rendered_sha" \
     "$rendered_art" <<'PY'
 import re
 import sys
 p, new, rendered_path = sys.argv[1], sys.argv[2], sys.argv[3]
 t = open(p, encoding="utf-8", errors="surrogateescape").read()
-pattern = re.compile(r"deployment/bootstrap/host/([0-9a-f]{64})")
-old = sorted({m.group(1) for m in pattern.finditer(t) if m.group(1) != new})
+# The prefix appears in the UserData in more than one ROLE: as the S3 key path, as the
+# expected digest fed to `sha256sum -c`, and inside the confirmation echo. Rewriting only
+# the path-shaped occurrences leaves the downloader fetching the NEW object while verifying
+# the OLD digest, so `set -euo pipefail` aborts the bootstrap and the lifecycle hook
+# ABANDONs every new host. Because the scheme is content-addressed, path == digest, so
+# substituting every 64-hex occurrence is correct and keeps the roles consistent.
+bare = re.compile(r"\b[0-9a-f]{64}\b")
+old = sorted({m.group(0) for m in bare.finditer(t) if m.group(0) != new})
 if not old:
     raise SystemExit("FAIL: no old bootstrap prefix was found for substitution")
-for value in old:
-    t = t.replace("deployment/bootstrap/host/" + value,
-                  "deployment/bootstrap/host/" + new)
+t = bare.sub(lambda m: new if m.group(0) != new else m.group(0), t)
 if "deployment/bootstrap/host/" + new not in t:
     raise SystemExit("FAIL: target bootstrap prefix absent after substitution")
-remaining = sorted({m.group(1) for m in pattern.finditer(t) if m.group(1) != new})
+# Whole-text check, not path-scoped: a stale digest outside a path is exactly the failure
+# the path-scoped check used to wave through.
+remaining = sorted({m.group(0) for m in bare.finditer(t) if m.group(0) != new})
 if remaining:
-    raise SystemExit("FAIL: old bootstrap prefixes remain after substitution: " + ",".join(remaining))
+    raise SystemExit("FAIL: old bootstrap digests remain after substitution: " + ",".join(remaining))
 # The placeholder gate belongs to the rendered bootstrap, not the small downloader UserData.
 rendered = open(rendered_path, encoding="utf-8", errors="surrogateescape").read().splitlines()
 unresolved = [
@@ -1664,7 +1723,12 @@ open(p, "w", encoding="utf-8", errors="surrogateescape").write(t)
 print("   UserData rewritten, %d old prefix(es) replaced; target present; no old prefix or placeholder remains" % len(old))
 PY
   [ $? -eq 0 ] || die "UserData rewrite refused"
-  b64="$(base64 -i /tmp/restorepatch-ud.txt 2>/dev/null || base64 -w0 /tmp/restorepatch-ud.txt)"
+  # GNU coreutils `base64 -i` is --ignore-garbage (not BSD's "input file"), so BSD-first
+  # probing SUCCEEDS on GNU while still wrapping at 76 columns. Those newlines land inside
+  # the --launch-template-data JSON string and abort the call with
+  # "Invalid control character at: line 1 column ...". Use the portable form already used
+  # by lib/apply-lt.sh.
+  b64="$(base64 < /tmp/restorepatch-ud.txt | tr -d '\n')"
   bootstrap_uploaded=1
   rm -f "$rendered_art"
   fi

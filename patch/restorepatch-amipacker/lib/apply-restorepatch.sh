@@ -1611,11 +1611,27 @@ PY
         rc=1
       fi
     fi
-    if aws_ lambda invoke --function-name "$FN" --payload eyJwYXRoIjoiL3BpbmcifQ== \
+    # The handler routes on an API Gateway proxy event: it special-cases SQS and the
+    # EventBridge poller, then reads event["httpMethod"] unconditionally (no .get, no
+    # fallback). A payload of {"path":"/ping"} matches none of those shapes, so this probe
+    # returns a hard KeyError('httpMethod') for every caller instead of an executed
+    # function:
+    #   {"errorType": "KeyError", "errorMessage": "'httpMethod'",
+    #    "stackTrace": ["... handler.py, line 171, in lambda_handler\n  method = event[\"httpMethod\"]"]}
+    # The old else-branch then reported that unhandled exception as "a 404 body ... is
+    # expected", so a probe that never executed the function passed as if it had — while
+    # APPLY-INSTRUCTIONS states the opposite rule: "For Lambda invocation, absence of
+    # FunctionError is the hard signal", and "never turn missing evidence into a pass".
+    # Send a proxy-shaped event so /ping reaches the router and yields its genuine 404
+    # (the response this check always claimed to expect), and treat FunctionError as the
+    # failure the documented rule says it is.
+    if aws_ lambda invoke --function-name "$FN" \
+        --payload eyJodHRwTWV0aG9kIjoiR0VUIiwicmVzb3VyY2UiOiIvcGluZyIsInBhdGgiOiIvcGluZyJ9 \
         /tmp/restorepatch-invoke.json --query FunctionError --output text | grep -qi none; then
-      verify_status PASS "invoke has no FunctionError"
+      verify_status PASS "invoke executed with no FunctionError"
     else
-      verify_status NOTE "inspect /tmp/restorepatch-invoke.json; a 404 body on a private API is expected"
+      verify_status FAIL "invoke returned FunctionError; see /tmp/restorepatch-invoke.json"
+      rc=1
     fi
 
     say "discovered API-package peers carry the overlay byte for byte"

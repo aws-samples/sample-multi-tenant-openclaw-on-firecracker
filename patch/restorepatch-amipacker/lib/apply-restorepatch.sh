@@ -2255,7 +2255,15 @@ PY
     if [ -n "$applied_alias" ]; then
       alias_version="$(aws_ lambda get-alias --function-name "$FN" --name "$applied_alias" \
         --query FunctionVersion --output text)"
-      if [ "$alias_version" = "$applied_version" ]; then
+      if [ -z "$applied_version" ]; then
+        # No version published by a run that is still in force — either this run skipped
+        # apply because the overlay was already in service, or a rollback cleared the
+        # record. Comparing the live alias against an empty expectation reported FAIL for
+        # a healthy environment (measured: apply → rollback → verify). Skip only the
+        # version comparison; the CodeSha256 convergence check below still runs and is
+        # what actually proves both serving paths agree.
+        verify_status SKIP "alias version comparison: this run published no version (live alias -> $alias_version)"
+      elif [ "$alias_version" = "$applied_version" ]; then
         verify_status PASS "alias $applied_alias points to version $applied_version"
       else
         verify_status FAIL "alias $applied_alias points to $alias_version, expected $applied_version"
@@ -2344,6 +2352,15 @@ rollback)
   else
     echo "   API environment does not use an alias; unqualified code restore is sufficient"
   fi
+
+  # The applied-version record describes what THIS apply published. After a rollback it
+  # is no longer true, and `verify` compares the live alias against it — so leaving it
+  # behind makes the next verify fail with "alias live points to <old>, expected <rolled
+  # back>" while the code itself is fine (the CodeSha256 assertion right after it
+  # passes). Clear it so a post-rollback verify judges the restored state, not a version
+  # this tool just undid. Measured on a live environment: apply → rollback → verify.
+  state_put api_applied_version ""
+  echo "   cleared the applied-version record (it described the rolled-back apply)"
 
   backup_desired="$(state_get asg_backup_desired)"
   if [ -n "$backup_desired" ]; then

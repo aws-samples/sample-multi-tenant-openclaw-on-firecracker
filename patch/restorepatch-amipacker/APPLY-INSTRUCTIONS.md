@@ -15,7 +15,9 @@ behavior. `reconcile` accepts `--scope <control|data|all>` and also defaults to
 
 For a full rollout, use this order:
 `precheck → backup → apply → canary → refresh → verify`. A failed or missing
-canary gate forbids `refresh`.
+canary gate forbids `refresh`. When this kit adds control-plane API routes (see
+Step 4b), also run `apply-api-routes` (routes) alongside the `apply-api` endpoint
+step, and `verify-api`/`finalize-api` after `verify`.
 
 ## Step 0.0 Authenticity check
 
@@ -412,6 +414,35 @@ VPC. Stop on a conflict instead of attempting the topology change.
 The six LiteLLM removals are guarded by describe calls. This customer configuration
 uses an external gateway, so those resources are expected to be absent. If any are
 present, stop and investigate.
+
+## Step 4b Control-plane API routes (host taint endpoints)
+
+This kit's target adds the host-taint control-plane routes `POST` and `DELETE`
+`/hosts/{instance_id}/taint` (plus the `OPTIONS` CORS preflight) and redeploys the
+stage. The overlaid `openclaw-api` code (`core/host_taint.py`, `handler.py`,
+`services/host_service.py`) serves these, but the API Gateway resource, methods, and
+CORS must be created explicitly — the control-plane code overlay alone does not add
+routes.
+
+The route change is a `MANUAL_CLI_REVIEW` operation on `deploy/stacks/lambdas.py`.
+Apply it with the shipped route helper against the confirmed REST API id and stage
+from `environment.json` (`v1`), and set `$API_ID`/`$REGION` from that file:
+
+```bash
+API_ID="$(python3 -c 'import json;print(json.load(open("environment.json"))["api_id"])')"
+REGION="$(python3 -c 'import json;print(json.load(open("environment.json"))["region"])')"
+bash lib/apply-api-routes.sh apply    lib/taint-routes.spec.json "$API_ID" v1 "$REGION"
+bash lib/apply-api-routes.sh verify   lib/taint-routes.spec.json "$API_ID" v1 "$REGION"
+# after the whole rollout verifies, release the replaced deployment:
+bash lib/apply-api-routes.sh finalize lib/taint-routes.spec.json "$API_ID" v1 "$REGION"
+# rollback (only before finalize):
+# bash lib/apply-api-routes.sh rollback lib/taint-routes.spec.json "$API_ID" v1 "$REGION"
+```
+
+The helper adds each method only when absent and repoints the stage to a fresh
+deployment, so a re-run is a no-op once the routes exist — idempotent, matching the
+rest of this kit. Run it on an environment whose REST API is the one your deployed
+client actually calls; a route created on the wrong API is invisible to clients.
 
 ## Step 5 Deployment-machine file replacement
 

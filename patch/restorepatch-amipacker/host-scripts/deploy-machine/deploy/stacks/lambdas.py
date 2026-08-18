@@ -1210,6 +1210,9 @@ def build_lambdas(self, ctx):
 
     host_resource = hosts_resource.add_resource("{instance_id}")
     host_resource.add_method("DELETE", _li(), **key_required)
+    taint_resource = host_resource.add_resource("taint")
+    taint_resource.add_method("POST", _li(), **key_required)
+    taint_resource.add_method("DELETE", _li(), **key_required)
     # 精确 VersionId 拉 deployment/rootfs/(镜像三盘+manifest),校验 etag 后 copy+unzip 装 live。
     # 只作用一台 host。Admin op (x-api-key)。
     pull_image_resource = host_resource.add_resource("pull-image")

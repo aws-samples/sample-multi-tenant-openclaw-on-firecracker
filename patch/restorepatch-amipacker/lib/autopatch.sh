@@ -57,6 +57,54 @@ RECEIPT=""
 FINALIZED=0
 FIRST_WRITE=0
 ROUTE_STARTED=0
+
+# Structurally discover a route-creation operation (one whose apply_cli runs apply-api-routes.sh)
+# from the manifest, rather than from a text label -- a text-marker scope check does not recognize
+# one, which is how an unattended run could install the control-plane code, never create the
+# routes, and still print PASS.
+#
+# This driver does NOT execute the route operation. Route creation and this driver's own apply-api
+# each create an API Gateway deployment and repoint the stage, so running both in one pass leaves
+# the stage on the route helper's deployment while verify-api/finalize-api still expect this
+# driver's -- a deterministic failure after the routes are already installed. Until the two share
+# one deployment transaction, the route operation stays operator-driven (APPLY-INSTRUCTIONS Step
+# 4b) and this driver only refuses to claim success without it. The check below is READ-ONLY.
+ROUTE_HELPER="$HERE/apply-api-routes.sh"
+ROUTE_SPEC=""
+ROUTE_STAGE=""
+route_apply_cli="$(jq -r '[.paths[].operations[]? | select((.apply_cli // "") | test("apply-api-routes\\.sh"))][0].apply_cli // empty' "$MANIFEST" 2>/dev/null || true)"
+if [ -n "$route_apply_cli" ]; then
+  spec_rel="$(printf '%s\n' "$route_apply_cli" | awk '{print $3}')"
+  ROUTE_STAGE="$(printf '%s\n' "$route_apply_cli" | awk '{print $5}')"
+  case "$spec_rel" in
+    lib/*.json) ROUTE_SPEC="$KITDIR/$spec_rel" ;;
+    *) die "route operation apply_cli names an unexpected spec path: $spec_rel" ;;
+  esac
+  [ -f "$ROUTE_SPEC" ] || die "route spec named by the manifest is missing: $ROUTE_SPEC"
+  [ -n "$ROUTE_STAGE" ] || die "route operation apply_cli names no stage"
+fi
+
+# Read-only gate: the kit declares API routes, so the run may not report PASS unless those routes
+# are actually present on the API this environment resolved. Uses the helper's own verify, which
+# fails closed when the routes are absent and prints the Step 4b command to run.
+assert_routes_present() {
+  local api rc
+  [ -n "$ROUTE_SPEC" ] || return 0
+  [ -x "$ROUTE_HELPER" ] || die "route helper not found or not executable: $ROUTE_HELPER"
+  api="$(jq -r '.control_plane_api.id // empty' "$ENVJSON" 2>/dev/null || true)"
+  [ -n "$api" ] \
+    || die "kit declares API routes but environment.json resolved no control-plane API id"
+  run_step "assert-routes-present" \
+    "$(shell_command bash "$ROUTE_HELPER" verify "$ROUTE_SPEC" "$api" "$ROUTE_STAGE" "$REGION")" \
+    bash "$ROUTE_HELPER" verify "$ROUTE_SPEC" "$api" "$ROUTE_STAGE" "$REGION"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    warn "this kit adds control-plane API routes that are NOT present on API $api."
+    warn "run APPLY-INSTRUCTIONS Step 4b, then re-run this driver:"
+    warn "  bash lib/apply-api-routes.sh apply $ROUTE_SPEC $api $ROUTE_STAGE $REGION"
+  fi
+  return "$rc"
+}
 LAST_LOG=""
 PRECHECK_LOG=""
 CURRENT_STEP=""
@@ -1004,6 +1052,12 @@ if [ "$ROUTES_IN_SCOPE" -eq 1 ]; then
   code=$?
   [ "$code" -eq 0 ] || stop_on_failure "finalize-api" "$code"
 fi
+
+# A kit that declares API routes cannot pass without them, even though this driver does not create
+# them (see the ROUTE_SPEC comment above). Read-only, and it runs before the PASS verdict.
+assert_routes_present
+code=$?
+[ "$code" -eq 0 ] || stop_on_verification_failure "assert-routes-present" "$code"
 
 set_verdict "PASS" || die "cannot finalize receipt"
 FINALIZED=1

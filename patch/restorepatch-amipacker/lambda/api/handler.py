@@ -115,6 +115,48 @@ def lambda_handler(event, context):
     if event.get("_batch_job"):
         return run_batch_job(event["_batch_job"])
 
+    # Rebuild worker: the HTTP request has already validated and fenced the
+    # operation, then self-invoked this Lambda with InvocationType=Event.
+    # Re-enter the one rebuild business flow with the same op_id and actor.
+    _async_rebuild = event.get("_async_rebuild")
+    if _async_rebuild:
+        worker_event = {
+            "_consumer_ident": _async_rebuild.get("_ident") or {},
+            "_op_id": _async_rebuild.get("_op_id"),
+        }
+        result = tenant_action(
+            _async_rebuild.get("tenant_id"),
+            "rebuild",
+            _async_rebuild.get("body") or None,
+            worker_event,
+        )
+        code = result.get("statusCode", 500) if isinstance(result, dict) else 500
+        try:
+            result_body = json.loads((result or {}).get("body") or "{}")
+        except Exception:  # noqa: BLE001
+            result_body = {}
+        if code < 500 or result_body.get("code") == "REPIN_BACKUP_FAILED":
+            if code >= 400:
+                _tenant_service.finalize_async_rebuild_failure(
+                    _async_rebuild.get("tenant_id"),
+                    _async_rebuild.get("_op_id"),
+                    _async_rebuild.get("_fence_epoch"),
+                    result_body.get("error") or f"worker returned HTTP {code}",
+                )
+            return result
+        if result_body.get("rebuild_status") == "unconfirmed":
+            # Host work may have happened. The rebuild branch already stamped
+            # unconfirmed and the health-check reconciler owns convergence.
+            return result
+        if code >= 500:
+            # Async Lambda invocations retry unhandled errors with the same
+            # payload. The operation-stable op_id, lifecycle fence, and host
+            # ledger make that retry resume the same rebuild.
+            raise RuntimeError(
+                f"async rebuild worker returned retryable status {code}"
+            )
+        return result
+
     # {"_pull_image_async": {instance_id, snapshot_time, prev_status, job_id}}. pull_image
     # 已 CAS 置 upgrading + 回 202;这里在无客户端等待的 fire-and-forget 调用里跑
     # stage + 校验 + 备份 + copy/unzip 装 live 的数分钟长链(超 APIGW 29s,故必须异步)。
@@ -288,6 +330,14 @@ def lambda_handler(event, context):
             event.get("queryStringParameters") or {}, event
         ),
         ("DELETE", "/hosts/{instance_id}"): lambda: deregister_host(
+            path_params["instance_id"]
+        ),
+        ("POST", "/hosts/{instance_id}/taint"): lambda: taint_host(
+            path_params["instance_id"],
+            event.get("body"),
+            _get_caller_identity(event).get("owner_id") or "",
+        ),
+        ("DELETE", "/hosts/{instance_id}/taint"): lambda: untaint_host(
             path_params["instance_id"]
         ),
         ("GET", "/groups"): list_groups,
@@ -1885,6 +1935,8 @@ _FAMILY_LETTER_TO_MEM_PER_VCPU = _host_service._FAMILY_LETTER_TO_MEM_PER_VCPU
 _resolve_instance_memory_mb = _host_service._resolve_instance_memory_mb
 register_host = _host_service.register_host
 deregister_host = _host_service.deregister_host
+taint_host = _host_service.taint_host
+untaint_host = _host_service.untaint_host
 cleanup_terminated_host = _host_service.cleanup_terminated_host
 rootfs_version = _host_service.rootfs_version
 _run_pull_pipeline = _host_service._run_pull_pipeline  # #217 fix(504) async pull worker

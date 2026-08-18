@@ -46,6 +46,60 @@ def _valid_s3_bucket_name(bucket):
     )
 
 
+def _parse_subnet_refs(raw, field):
+    """#530 — 把 `*.subnet_ids` 归一成 (subnet_id, az_or_None) 列表。
+
+    两种写法都收:
+      subnet_ids: ["subnet-aaa", "subnet-bbb"]                       # 不带 AZ
+      subnet_ids: [{id: "subnet-aaa", az: "ap-southeast-1a"}, ...]   # 带 AZ
+
+    带 AZ 才能用 from_subnet_attributes 导入,进而在 synth 期真的比较 AZ ——
+    from_subnet_id 的 availability_zone 是 token,永远比不出来。ALB target
+    eligibility 按 AZ 判定,所以这个映射是 #530 那条不变量能否被校验的前提。
+    """
+    refs = []
+    for _i, item in enumerate(raw):
+        if isinstance(item, str):
+            refs.append((item, None))
+        elif isinstance(item, Mapping):
+            sid = item.get("id")
+            az = item.get("az")
+            if not isinstance(sid, str) or not sid:
+                raise ValueError(
+                    f"config `{field}[{_i}]` 是 mapping 但缺 `id`(须为非空字符串)"
+                )
+            if az is not None and not isinstance(az, str):
+                raise ValueError(
+                    f"config `{field}[{_i}].az` 须为字符串,实得 {type(az).__name__}"
+                )
+            refs.append((sid, az or None))
+        else:
+            raise ValueError(
+                f"config `{field}[{_i}]` 须是 subnet id 字符串或 {{id, az}} mapping,"
+                f"实得 {type(item).__name__}"
+            )
+    return refs
+
+
+def _import_subnets(scope, refs, id_prefix):
+    """按 _parse_subnet_refs 的输出导入子网。
+
+    给了 az 就走 from_subnet_attributes(AZ 在 synth 期是具体值,可比较);
+    没给就退回 from_subnet_id(AZ 是 token,#530 的校验会因此 fail closed)。
+    """
+    subnets = []
+    for _i, (sid, az) in enumerate(refs):
+        if az:
+            subnets.append(
+                ec2.Subnet.from_subnet_attributes(
+                    scope, f"{id_prefix}{_i}", subnet_id=sid, availability_zone=az
+                )
+            )
+        else:
+            subnets.append(ec2.Subnet.from_subnet_id(scope, f"{id_prefix}{_i}", sid))
+    return subnets
+
+
 def _parse_user_hook(cfg, role):
     """Validate one optional root hook without accepting shell-shaped input."""
     user_hooks = cfg.get("user_hooks")
@@ -453,6 +507,12 @@ def build_ha_edge(self, ctx):
     init_sh = init_sh.replace(
         "{{EGRESS_ALLOWLIST_ENABLED}}",
         str(sec_cfg.get("egress_allowlist_enabled", False)).lower(),
+    )
+    # #517 阶段3(G1 fail-closed)—— 只读身份盘缺失时是否拒绝启动。默认 false=既有兼容行为
+    # (launch-vm.sh WARN 后照常起,回落 data 盘烤制当天的旧 md 副本);true 时盘缺失 exit 1。
+    init_sh = init_sh.replace(
+        "{{IMMUTABLE_DISK_REQUIRED}}",
+        str(sec_cfg.get("immutable_disk_required", False)).lower(),
     )
     init_sh = init_sh.replace(
         "{{EGRESS_INCLUDE_VPC_CIDR}}",
@@ -1219,12 +1279,13 @@ def build_ha_edge(self, ctx):
             "隐式派生会让 api.mode 的改动静默翻转 ALB 的公网/内网形态。"
         )
     _alb_internal = bool(_alb_cfg["internal"])
-    _alb_subnet_ids = _alb_cfg.get("subnet_ids") or []
-    if _alb_subnet_ids:
-        _alb_subnets = [
-            ec2.Subnet.from_subnet_id(self, f"AlbSubnet{_i}", _sid)
-            for _i, _sid in enumerate(_alb_subnet_ids)
-        ]
+    # #530 — 接受 {id, az} 形式:带 az 才能在 synth 期与 edge 侧比对 AZ。
+    _alb_subnet_refs = _parse_subnet_refs(
+        _alb_cfg.get("subnet_ids") or [], "alb.subnet_ids"
+    )
+    _alb_subnet_ids = [_sid for _sid, _ in _alb_subnet_refs]
+    if _alb_subnet_refs:
+        _alb_subnets = _import_subnets(self, _alb_subnet_refs, "AlbSubnet")
     elif _alb_internal:
         _alb_subnets = vpc.private_subnets[:_alb_az_count]
     else:
@@ -1785,12 +1846,13 @@ def build_ha_edge(self, ctx):
         )
         _edge_set_default.node.add_dependency(_edge_lt)
         # PRIVATE_WITH_EGRESS(带 NAT 出网的私有子网)。
-        _edge_subnet_ids = _edge_cfg.get("subnet_ids") or []
-        if _edge_subnet_ids:
-            _edge_subnets = [
-                ec2.Subnet.from_subnet_id(self, f"EdgeSubnet{_i}", _sid)
-                for _i, _sid in enumerate(_edge_subnet_ids)
-            ]
+        # #530 — 同 alb.subnet_ids:接受 {id, az},带 az 才能校验 AZ 包含关系。
+        _edge_subnet_refs = _parse_subnet_refs(
+            _edge_cfg.get("subnet_ids") or [], "edge.subnet_ids"
+        )
+        _edge_subnet_ids = [_sid for _sid, _ in _edge_subnet_refs]
+        if _edge_subnet_refs:
+            _edge_subnets = _import_subnets(self, _edge_subnet_refs, "EdgeSubnet")
         else:
             _edge_subnets = (
                 vpc.select_subnets(
@@ -1798,6 +1860,90 @@ def build_ha_edge(self, ctx):
                 ).subnets
                 or vpc.private_subnets
             )
+
+        # #530 — AZ 是 ALB target eligibility 的唯一正确判定依据(不是 subnet id:
+        # 面向公网的 ALB 用公有子网、edge 用同 AZ 的私有子网,两者 id 必然不同)。
+        # edge 落到 ALB 未启用的 AZ 后会永久 Target.NotInUse,健康检查不会替换它,
+        # 那部分机队就是死重 —— 所以这条不变量必须在 synth 期强制,而不是事后靠人查。
+        # bare subnet id 的 AZ 是 token、无法在 synth 解析:此时既不猜也不放行,
+        # 而是 fail closed 并告诉运维改用 {id, az} 写法把 AZ 声明出来。
+        _alb_az_values = [subnet.availability_zone for subnet in _alb_subnets]
+        _alb_azs_resolved = all(
+            not Token.is_unresolved(az) for az in _alb_az_values
+        )
+        _alb_azs = (
+            {str(az) for az in _alb_az_values} if _alb_azs_resolved else set()
+        )
+        if _edge_subnet_ids:
+            _edge_az_by_id = {
+                subnet_id: subnet.availability_zone
+                for subnet_id, subnet in zip(_edge_subnet_ids, _edge_subnets)
+            }
+            _edge_azs_resolved = all(
+                not Token.is_unresolved(az) for az in _edge_az_by_id.values()
+            )
+            if _alb_azs_resolved and _edge_azs_resolved:
+                _offending_edge_subnets = [
+                    f"{subnet_id} ({az})"
+                    for subnet_id, az in _edge_az_by_id.items()
+                    if str(az) not in _alb_azs
+                ]
+                if _offending_edge_subnets:
+                    raise ValueError(
+                        "edge.subnet_ids 包含 ALB 未启用 AZ 的子网: "
+                        f"{_offending_edge_subnets}; ALB AZ set={sorted(_alb_azs)}。"
+                        "合法修复:缩小 edge.subnet_ids,或通过 alb.subnet_ids "
+                        "扩大 ALB 的启用 AZ。"
+                    )
+            else:
+                _edge_az_details = [
+                    (
+                        f"{subnet_id} (<unresolved>)"
+                        if Token.is_unresolved(az)
+                        else f"{subnet_id} ({az})"
+                    )
+                    for subnet_id, az in _edge_az_by_id.items()
+                ]
+                _alb_az_details = (
+                    sorted(_alb_azs) if _alb_azs_resolved else ["<unresolved>"]
+                )
+                raise ValueError(
+                    "无法在 synth 期证明 edge target AZs ⊆ ALB enabled AZs,"
+                    "因此拒绝部署(fail closed)。违反这条不变量的 target 会永久报告 "
+                    "Target.NotInUse,健康检查不会替换它,对应比例的 edge 机队成为死重 "
+                    "—— 这种缺陷不能靠部署后人工巡检兜住。"
+                    f" edge subnets={_edge_az_details}; ALB AZ set={_alb_az_details}。"
+                    "根因:裸 subnet id 用 ec2.Subnet.from_subnet_id 导入,其 "
+                    "availability_zone 是 token,synth 期取不到具体值。"
+                    "修法:把两侧都写成带 AZ 的形式,例如 "
+                    "alb.subnet_ids: [{id: subnet-aaa, az: ap-southeast-1a}] 与 "
+                    "edge.subnet_ids: [{id: subnet-bbb, az: ap-southeast-1a}];"
+                    "或把 edge.subnet_ids 留空,由 ALB 的 AZ 集合自动派生。"
+                )
+        else:
+            _edge_az_values = [
+                subnet.availability_zone for subnet in _edge_subnets
+            ]
+            if not _alb_azs_resolved or any(
+                Token.is_unresolved(az) for az in _edge_az_values
+            ):
+                raise ValueError(
+                    "默认 edge 子网与 ALB 子网的 AZ 在 synth 时不可解析,无法证明 "
+                    "edge target AZs ⊆ ALB enabled AZs;请显式设置 "
+                    "edge.subnet_ids 与 alb.subnet_ids。"
+                )
+            _edge_azs_before_filter = {str(az) for az in _edge_az_values}
+            _edge_subnets = [
+                subnet
+                for subnet in _edge_subnets
+                if str(subnet.availability_zone) in _alb_azs
+            ]
+            if not _edge_subnets:
+                raise ValueError(
+                    "edge 子网按 ALB enabled AZs 过滤后为空: "
+                    f"edge AZ set={sorted(_edge_azs_before_filter)}; "
+                    f"ALB AZ set={sorted(_alb_azs)}"
+                )
         _edge_asg = autoscaling.AutoScalingGroup(
             self,
             "EdgeASG",

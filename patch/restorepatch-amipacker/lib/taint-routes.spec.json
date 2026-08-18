@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "target": {
+    "stack": "OpenClawOrchestrator",
+    "rest_api_logical_id": "Api9C0D1E2F",
+    "template_method_logical_id": "ApibackupsGETE8951245",
+    "stage": "v1"
+  },
+  "template": {
+    "path": "/backups",
+    "method": "GET"
+  },
+  "routes": [
+    {
+      "path": "/hosts/{instance_id}/taint",
+      "resource_change": "A",
+      "methods": [
+        { "method": "POST", "change": "A" },
+        { "method": "DELETE", "change": "A" }
+      ],
+      "cors": {
+        "change": "A",
+        "allow_origin": "*",
+        "allow_headers": ["Content-Type", "x-api-key", "Authorization", "If-Match", "Idempotency-Key"],
+        "allow_methods": ["OPTIONS", "GET", "PUT", "POST", "DELETE", "PATCH", "HEAD"]
+      }
+    }
+  ]
+}

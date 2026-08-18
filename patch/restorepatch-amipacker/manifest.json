@@ -77,7 +77,7 @@
       "sha256": "07b9633975bdc8e76803af83f9057c09a3fe28707f5284c727933e3050238df1"
     },
     "lib/apply-restorepatch.sh": {
-      "sha256": "4506256e471a00b731b4b9eec1ad335c89f4381ba70f607f6dab951dd0fe24e4"
+      "sha256": "949cb016e65487a2bc8daac3b4f24d207481ce4c58165f509b879d1f1564ffd8"
     },
     "lib/autopatch.sh": {
       "sha256": "b543f166255a718e6e0f96e0f148e01ae2f578af686110437ee779785d41319c"
@@ -9506,7 +9506,7 @@
     {
       "id": "ver-413",
       "fix_id": "fix-413",
-      "phase": "A-readonly",
+      "phase": "B-lifecycle",
       "action": "Invoke one tenant rebuild as a non-administrator and repeat it as an administrator while recording HTTP status, code, op_id, and rebuild_status.",
       "observable": "The tenant action HTTP status and JSON fields code, op_id, status, and rebuild_status.",
       "pass_when": "The non-administrator receives 403 code=ACCESS_DENIED, while the administrator receives synchronous 200 with status=running and rebuild_status=done or explicit 503 code=REBUILD_RETRY_PENDING.",
@@ -9583,7 +9583,7 @@
     {
       "id": "ver-445",
       "fix_id": "fix-445",
-      "phase": "A-readonly",
+      "phase": "B-lifecycle",
       "action": "Record used_vcpu, used_mem_mb, and vm_count from one openclaw-hosts row, rerun host initialization on that instance, and read the same attributes again.",
       "observable": "The exact before and after numeric values of openclaw-hosts.used_vcpu, used_mem_mb, and vm_count.",
       "pass_when": "All three runtime counters retain their recorded factual values after initialization completes.",
@@ -9605,7 +9605,7 @@
     {
       "id": "ver-456",
       "fix_id": "fix-456",
-      "phase": "A-readonly",
+      "phase": "B-lifecycle",
       "action": "Call rebuild once with a non-admin identity and once with an admin identity, then read rebuild_op_id, rebuild_phase, rebuild_status, and app_health from the tenant detail response.",
       "observable": "Authorization HTTP status plus tenant detail fields rebuild_op_id, rebuild_phase, rebuild_status, app_health, and metrics.",
       "pass_when": "Authorization returns 403 code=ACCESS_DENIED for the non-admin call; the admin call returns 200 or 503 code=REBUILD_RETRY_PENDING and tenant detail exposes matching operation, health, and metrics fields.",
@@ -9616,7 +9616,7 @@
     {
       "id": "ver-470",
       "fix_id": "fix-470",
-      "phase": "A-readonly",
+      "phase": "B-lifecycle",
       "action": "Create one recorded tenant, fetch its single-tenant detail, then query the same tenant through one enabled conditional tenant index.",
       "observable": "The two API response objects and their rootfs_version, app_health, vm_health, and metrics fields.",
       "pass_when": "The new tenant includes rootfs_version and the conditional query returns the same non-secret field set as detail, including application health and metrics fields.",
@@ -9660,7 +9660,7 @@
     {
       "id": "ver-479",
       "fix_id": "fix-479",
-      "phase": "A-readonly",
+      "phase": "B-lifecycle",
       "action": "Submit one sensitive field as plaintext under scheme=asymmetric-v1 and one valid enc:v1 envelope, then read the host log parser configuration.",
       "observable": "API status and code for each envelope plus Fluent Bit parser fields that preserve tenant_id and trace_root.",
       "pass_when": "Plaintext under asymmetric-v1 is rejected with HTTP 400 code=VALIDATION, the valid enc:v1 value is accepted, and logs retain tenant_id and trace_root fields.",
@@ -9682,7 +9682,7 @@
     {
       "id": "ver-482",
       "fix_id": "fix-482",
-      "phase": "A-readonly",
+      "phase": "B-lifecycle",
       "action": "Trigger one rebuild without image_channel, then trigger a canary rebuild for a host whose image_slots.canary value is empty.",
       "observable": "The persisted openclaw-tenants image_channel for the first request and the HTTP status and code for the empty-canary request.",
       "pass_when": "The omitted channel resolves to live and the empty canary slot returns an explicit non-success response with code=CANARY_NOT_READY.",
@@ -9693,7 +9693,7 @@
     {
       "id": "ver-485",
       "fix_id": "fix-485",
-      "phase": "A-readonly",
+      "phase": "B-lifecycle",
       "action": "Invoke reset twice for the same tenant with one client_token and compare both responses, the idem# row in openclaw-tenants, and host reset evidence.",
       "observable": "Both response operation identities, the idempotency row state and result, and the count of distinct host reset attempt records.",
       "pass_when": "The second request replays the same operation identity and stored result while exactly one destructive reset attempt is recorded on the host.",
@@ -9814,7 +9814,7 @@
     {
       "id": "ver-501",
       "fix_id": "fix-501",
-      "phase": "A-readonly",
+      "phase": "B-lifecycle",
       "action": "Delete one tenant through the API, let another expire through its time-to-live sweep, and evacuate a third from a terminating host whose backup is unusable. Then read all three rows and the tenant listing.",
       "observable": "Presence of the virtual-machine health, application health and last health check fields on each row after it reaches its terminal state, and what the listing reports for those tenants.",
       "pass_when": "All three deleted rows carry none of the three health fields, a stopped tenant still keeps its last observation, and no deleted tenant is reported as healthy.",

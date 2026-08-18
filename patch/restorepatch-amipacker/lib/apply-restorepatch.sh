@@ -202,39 +202,39 @@ overlay_imports_resolve_against() {
     (cd "$w" && unzip -oq live.zip) || { echo "   CANNOT unpack the package of $fn"; rm -rf "$w"; return 1; }
     dir="$w"
   fi
-  python3 - "$KITDIR" "$dir" <<'PY'
-  import pathlib
-  import re
-  import sys
-  
-  kit, live = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
-  imp = re.compile(r"^\s*(?:import|from)\s+((?:core|services|consumers|routes)(?:\.[A-Za-z_][\w]*)*)")
-  missing, checked = {}, 0
-  kit_api = kit / "lambda" / "api"
-  for mod in sorted(kit_api.rglob("*.py")):
-      for line in mod.read_text(encoding="utf-8", errors="replace").splitlines():
-          m = imp.match(line)
-          if not m:
-              continue
-          checked += 1
-          rel = m.group(1).replace(".", "/")
-          if ((live / f"{rel}.py").is_file()
-                  or (live / rel / "__init__.py").is_file()
-                  or (kit_api / f"{rel}.py").is_file()
-                  or (kit_api / rel / "__init__.py").is_file()):
-              continue
-          missing.setdefault(m.group(1), set()).add(mod.name)
-  print("   inspected %d import statement(s) across the overlay modules" % checked)
-  if missing:
-      for name, users in sorted(missing.items()):
-          print("   MISSING in live package: %s  (imported by %s)"
-                % (name, ", ".join(sorted(users))))
-      raise SystemExit(
-          "FAIL: the overlay imports modules the live package does not contain; applying it "
-          "would fail at import time and take the control plane down"
-      )
-  print("   PASS every module the overlay imports exists in the live package")
-  PY
+python3 - "$KITDIR" "$dir" <<'PY'
+import pathlib
+import re
+import sys
+
+kit, live = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+imp = re.compile(r"^\s*(?:import|from)\s+((?:core|services|consumers|routes)(?:\.[A-Za-z_][\w]*)*)")
+missing, checked = {}, 0
+kit_api = kit / "lambda" / "api"
+for mod in sorted(kit_api.rglob("*.py")):
+    for line in mod.read_text(encoding="utf-8", errors="replace").splitlines():
+        m = imp.match(line)
+        if not m:
+            continue
+        checked += 1
+        rel = m.group(1).replace(".", "/")
+        if ((live / f"{rel}.py").is_file()
+                or (live / rel / "__init__.py").is_file()
+                or (kit_api / f"{rel}.py").is_file()
+                or (kit_api / rel / "__init__.py").is_file()):
+            continue
+        missing.setdefault(m.group(1), set()).add(mod.name)
+print("   inspected %d import statement(s) across the overlay modules" % checked)
+if missing:
+    for name, users in sorted(missing.items()):
+        print("   MISSING in live package: %s  (imported by %s)"
+              % (name, ", ".join(sorted(users))))
+    raise SystemExit(
+        "FAIL: the overlay imports modules the live package does not contain; applying it "
+        "would fail at import time and take the control plane down"
+    )
+print("   PASS every module the overlay imports exists in the live package")
+PY
   rc=$?
   [ "$own" -eq 1 ] && rm -rf "$w"
   return $rc

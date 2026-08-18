@@ -123,6 +123,21 @@ if grep -Eq '^[[:space:]]*delivery_stream[[:space:]]*$' "$FB_CONF_DIR/fluent-bit
     die "delivery_stream rendered empty"
 fi
 
+# Every Lua script the config references must be on disk before we start.
+# A stale S3 role prefix that still ships fluent-bit.conf but not its filters is
+# without naming the file — the class of message that sent past investigations
+# to Firehose and the host instead of to the asset prefix. Relative script paths
+# resolve against the config dir (host style); absolute ones are used as-is
+# (edge style).
+while read -r _script; do
+    [[ -n "$_script" ]] || continue
+    case "$_script" in
+        /*) _script_path="$_script" ;;
+        *)  _script_path="$FB_CONF_DIR/$_script" ;;
+    esac
+    [[ -f "$_script_path" ]] || die "fluent-bit.conf references a missing Lua script: ${_script} (expected ${_script_path}; stale ${_s3_prefix}/ in S3?)"
+done < <(sed -nE 's/^[[:space:]]*script[[:space:]]+([^[:space:]]+)[[:space:]]*$/\1/p' "$FB_CONF_DIR/fluent-bit.conf")
+
 FB_BIN="$(command -v fluent-bit || true)"
 [[ -n "$FB_BIN" ]] || FB_BIN=/opt/fluent-bit/bin/fluent-bit
 [[ -x "$FB_BIN" ]] || die "fluent-bit binary not found after installation"

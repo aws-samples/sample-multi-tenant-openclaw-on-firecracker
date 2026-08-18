@@ -712,9 +712,7 @@
                       :title="'Current live snapshot (installed by pull-image): '+(h.snapshot_time||'')"
                     ></span>
                   </div>
-                  <!-- #217 — 每台 host 各自选快照版本 + Pull(独占一行,不挤顶部;inline
-                       下拉非弹窗)。默认最新快照(hostSnapFor),各台独立;canWrite() 门控,
-                       viewer 不渲染。@click.stop 防触发卡片选中。 -->
+                  <!-- #524 — 每台 host 共用一个快照选择器，显式选择 Pull to live/canary。 -->
                   <template x-if="canWrite()">
                     <div
                       class="host-row"
@@ -756,13 +754,28 @@
                           flex-shrink: 0;
                         "
                         :disabled="h.status === 'upgrading'"
-                        :title="h.status === 'upgrading' ? 'host is upgrading (pull in progress)' : ('Pull '+hostSnapFor(h.instance_id)+' to this host (pull-image)')"
+                        :title="h.status === 'upgrading' ? 'host is upgrading (pull in progress)' : ('Pull '+hostSnapFor(h.instance_id)+' to this host live slot')"
                         @click.stop="pullSnapshotToHost(h.instance_id)"
                       >
                         <svg class="icon s13"><use href="#i-download" /></svg>
-                        <span
-                          x-text="h.status === 'upgrading' ? 'Upgrading…' : 'Pull'"
-                        ></span>
+                        <span>Live</span>
+                      </button>
+                      <button
+                        class="btn-act"
+                        style="
+                          display: inline-flex;
+                          align-items: center;
+                          gap: 4px;
+                          font-size: 11px;
+                          white-space: nowrap;
+                          flex-shrink: 0;
+                        "
+                        :disabled="h.status === 'upgrading'"
+                        :title="h.status === 'upgrading' ? 'host is upgrading (pull in progress)' : ('Pull '+hostSnapFor(h.instance_id)+' to this host canary slot')"
+                        @click.stop="pullCanaryToHost(h.instance_id)"
+                      >
+                        <svg class="icon s13"><use href="#i-download" /></svg>
+                        <span>Canary</span>
                       </button>
                     </div>
                   </template>
@@ -819,29 +832,11 @@
                         </template>
                       </div>
 
-                      <!-- Step 1 — Pull canary (装候选版本到 canary 槽) -->
+                      <!-- Step 1 — Canary slot state; pull action is in the host row above. -->
                       <div class="canary-step" :class="canaryStage(h) === 1 && 'canary-step-active'">
                         <span class="canary-num" :class="hostCanary(h) && 'canary-num-done'" x-text="hostCanary(h) ? '✓' : '1'"></span>
                         <div class="canary-step-body">
-                          <div class="canary-step-title">Pull canary <span style="color: var(--gray); font-weight: 400">— 装候选镜像到 canary 槽(不影响 live 租户)</span></div>
-                          <div style="display: flex; gap: 6px; margin-top: 3px">
-                            <select
-                              :value="canarySnapFor(h.instance_id)"
-                              @change="canarySnapChoice[h.instance_id] = $event.target.value"
-                              style="flex: 1; min-width: 0; font-size: 11px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 3px 6px"
-                              title="Pick a snapshot to install into this host's canary slot"
-                            >
-                              <template x-for="s in pullableSnapshots" :key="s.snapshot_time">
-                                <option :value="s.snapshot_time" x-text="s.snapshot_time + (s.label ? ' ('+s.label+')' : '')"></option>
-                              </template>
-                            </select>
-                            <button
-                              class="btn-act"
-                              style="display: inline-flex; align-items: center; gap: 4px; font-size: 11px; white-space: nowrap; flex-shrink: 0"
-                              :title="'Install '+canarySnapFor(h.instance_id)+' into this host\'s canary slot (live tenants unaffected)'"
-                              @click.stop="pullCanaryToHost(h.instance_id)"
-                            ><svg class="icon s13"><use href="#i-download" /></svg><span>Pull</span></button>
-                          </div>
+                          <div class="canary-step-title">Canary slot <span style="color: var(--gray); font-weight: 400" x-text="hostCanary(h) ? snapshotLabel(hostCanary(h)) : '—'"></span></div>
                         </div>
                       </div>
 

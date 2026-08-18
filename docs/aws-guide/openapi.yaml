@@ -164,8 +164,9 @@ components:
             - string
             - 'null'
           description: |
-            How far the current synchronous rebuild got: running (command dispatched
-            to the host) → verifying (receipt in, checking adoption) → a terminal
+            How far the current asynchronous rebuild got: queued (worker accepted) →
+            running (command dispatched to the host) → verifying (receipt in,
+            checking adoption) → a terminal
             value matching rebuild_status (done | failed | unconfirmed).
             Additive field; absent on tenants that were never rebuilt.
         rebuild_started_at:
@@ -541,6 +542,7 @@ paths:
                   enum: [live, canary]
                   default: live
                   description: >-
+                    #394 — which image slot this tenant boots from. Absent/`live` (default) =
                     byte-identical legacy behavior (boots the host''s live slot; version is NOT
                     pinned — restart re-resolves the current live pointer). `canary` boots the
                     host''s canary slot to validate a candidate; it REQUIRES preferred_host_id
@@ -553,11 +555,13 @@ paths:
                 expected_image_snapshot_time:
                   type: string
                   description: >-
+                    #394 — for image_channel=canary: the candidate version the caller read from
                     the pull job result. Admission verifies the host canary still matches this
                     (TOCTOU guard); mismatch → 409 CANARY_CHANGED.
                 expected_image_generation:
                   type: integer
                   description: >-
+                    #394 — optional slots generation guard for canary admission. Only used at
                     create time; the tenant is pinned to a concrete version, so later host
                     generation changes (e.g. promote) do not invalidate it.
                 platform_id:
@@ -1029,7 +1033,8 @@ paths:
       description: |
         Dispatches on {action}. When lifecycle queueing is enabled, start/stop/restart/
         pause/resume/reset may return 202 {status:queued}. Rebuild is administrator-only
-        and always synchronous; it never enters the lifecycle queue. Other actions keep
+        and always returns 202 after synchronous admission; one asynchronously
+        self-invoked worker performs both live and canary rebuilds. Other actions keep
         their documented semantics. Tenant actions are owner/admin gated unless a
         stricter action-specific rule is stated.
       x-source: deploy/lambda/api/services/tenant_service.py:1196
@@ -1183,10 +1188,8 @@ paths:
                   - type: object
                     title: lifecycle
                     description: |
-                      Successful synchronous lifecycle result. A rebuild appears here only
-                      after op-specific host evidence confirms the running Firecracker
-                      rootfs and fresh overlay under the current lifecycle fence. An
-                      unconfirmed attempt returns retryable 503 instead.
+                      Successful synchronous lifecycle result. Rebuild is asynchronous
+                      and does not use this response.
                     properties:
                       id:
                         type: string
@@ -1196,20 +1199,6 @@ paths:
                           - running
                           - stopped
                           - paused
-                      rebuild_status:
-                        type: string
-                        enum:
-                          - done
-                        description: |
-                          A successful synchronous rebuild returns done. If adoption
-                          cannot be confirmed, the endpoint returns 503 with
-                          rebuild_status=unconfirmed instead.
-                      op_id:
-                        type: string
-                        description: |
-                          Server-generated identifier of this rebuild operation, for status
-                          correlation. Compare it with the tenant record's rebuild_op_id when
-                          polling. It is not a request parameter or a replacement for client_token.
                     x-source: deploy/lambda/api/services/tenant_service.py:1674
                   - type: object
                     title: resize
@@ -1259,7 +1248,7 @@ paths:
                     x-source: deploy/lambda/api/services/tenant_service.py:1630
         '202':
           description: |
-            Queued lifecycle action ({id,action,status:queued,op_id}); backup started ({id,action:backup,status:started}); or migration in flight ({id,status:migrating,source_host_id,target_host_id,snapshot_uri,poll}).
+            Queued lifecycle/rebuild action ({id,action,status:queued,op_id}); backup started ({id,action:backup,status:started}); or migration in flight ({id,status:migrating,source_host_id,target_host_id,snapshot_uri,poll}).
           content:
             application/json:
               schema:
@@ -1267,9 +1256,9 @@ paths:
                   - type: object
                     title: queued-lifecycle
                     description: |
-                      The action was accepted onto the queue; it has NOT run yet. Poll
-                      GET /tenants/{id} to follow it. Rebuild never uses this response;
-                      it is always synchronous.
+                      The action was accepted for asynchronous execution; it has NOT
+                      completed. For rebuild, compare op_id with rebuild_op_id and poll
+                      rebuild_phase/rebuild_status via GET /tenants/{id}.
                     properties:
                       id:
                         type: string
@@ -1364,6 +1353,7 @@ paths:
             client_token is still active.
             Slot failures occur before backup, channel update, or VM mutation and never
             fall back to the other channel.
+            #413 lifecycle fence: LIFECYCLE_SUPERSEDED when the operation no longer owns the tenant epoch/source host; OPERATION_ID_REUSED when the op_id ledger belongs to another operation.
           content:
             application/json:
               schema:
@@ -2271,6 +2261,7 @@ paths:
                     image_slots:
                       type: object
                       description: >-
+                        #394 — control-plane mirror of the host''s slots.json (source of truth is
                         the file on the host). Present once a canary has been pulled to this host;
                         absent on hosts still on the legacy flat layout. Ops/console read it to see
                         which candidate is staged.
@@ -2420,6 +2411,7 @@ paths:
       operationId: pullImage
       summary: 把指定版本快照装到单台宿主机(异步)
       description: >-
+        #309/#333 — Install a specific version snapshot onto ONE host. Reads the snapshot from the
         version-snapshots DDB table, selects exactly the disks named by that snapshot's manifest.json
         (rootfs / data-template / immutable) plus manifest.json itself (ignores other versions' disks
         in the snapshot — deterministic), fetches each by its exact S3 VersionId, verifies ETag, then
@@ -2489,6 +2481,7 @@ paths:
                   status:
                     type: string
                     description: >-
+                      #394 — for slot=live this is `upgrading`; for slot=canary the host status
                       is NOT changed, so this echoes the host''s current real status (e.g.
                       active/idle).
                   job_id:
@@ -2580,6 +2573,7 @@ paths:
       operationId: promoteCanary
       summary: 把该 host 的 canary 槽提升为 live(同步,#394)
       description: >-
+        #394 — Synchronously promote the host''s canary slot to live. Only rewrites the small
         slots.json pointer (no disk move), so it returns 200 in seconds — no async job. CAS is on
         snapshot_time only: the caller must pass the expected_canary_snapshot_time it verified; if
         the current canary snapshot_time differs, returns 409 CANARY_CHANGED and writes nothing
@@ -2656,6 +2650,7 @@ paths:
       operationId: hostImageSlots
       summary: 读该 host 磁盘上真实的镜像状态(#394 debug 视图)
       description: >-
+        #394 — Read the REAL on-disk image state of one EC2 host via SSM: its actual
         slots.json (live/canary/previous_live/generation) plus the installed version dirs
         under /data/firecracker-assets/versions/. This is the authoritative counterpart to
         the possibly-stale DDB image_slots mirror returned by GET /hosts — the response also
@@ -2707,6 +2702,7 @@ paths:
       operationId: reclaimImages
       summary: 回收该 host 上无人引用的版本目录(手动 prune,释放盘,#394)
       description: >-
+        #394 — Manual disk prune. Deletes every versions/<snapshot>/ directory on the host that is
         NOT in the protected keep-set. The keep-set is computed server-side (the host cannot see DDB
         tenant pins) as {live, canary, previous_live} ∪ {every snapshot_time still pinned by a
         non-deleted tenant on this host}, and passed to the host as an explicit allowlist — the host
@@ -2767,6 +2763,7 @@ paths:
       operationId: pullImageProgress
       summary: 查询单台宿主机 pull-image 进度(SageMaker ProcessingJob 风格)
       description: >-
+        #309/#333 — Poll the progress of a pull-image job on ONE host. Reads the host's pull_command_id
         from DDB, then SSM-tails /tmp/<job_id>.txt on the host: the last line decides the tri-state, and
         the most recent ERROR:<CODE> line becomes the failure detail. Returns SageMaker ProcessingJob-style
         JSON. If a terminal error was persisted to DDB (last_pull_error) but the progress file can't be
@@ -2786,6 +2783,7 @@ paths:
           schema:
             type: string
           description: >-
+            #394 — exact pull-job lookup. New clients SHOULD always pass it. Unknown job_id or a
             job that belongs to a different host → 404 JOB_NOT_FOUND (never silently falls back
             to "this host''s latest"). Absent (compat window) → the host''s most recent job, else
             the legacy host.pull_command_id path. When the persisted job is already terminal, the
@@ -2943,6 +2941,7 @@ paths:
       operationId: copyFileFromS3
       summary: 从 S3 拷贝单个文件到宿主机指定位置(同步)
       description: >-
+        #309/#334 — Copy ONE file from S3 to a specific path on ONE host (synchronous; single-file copy is
         seconds). For updating host scripts only — the target must be under /opt/openclaw/ (.py host-agent
         service) or /home/ubuntu/ (.sh + lib/*); the image-disk dir /data/firecracker-assets/ is off-limits
         (that's pull-image's job). Landed file is chown ubuntu:ubuntu + chmod 755 (host-agent runs as
@@ -3401,6 +3400,7 @@ paths:
       operationId: deleteImageSnapshot
       summary: 软删除一条镜像快照记录(#394,引用保护)
       description: >-
+        #394 — Soft-delete a global image snapshot record. Symmetric with
         POST /create-image-snapshot: takes snapshot_time in the JSON body (not a colon-bearing
         ISO timestamp in the path). Marks the version-snapshots row status=deleted + deleted_at
         (does NOT physically remove the DDB row, S3 deployment/ objects, or hosts' local version
@@ -3464,6 +3464,7 @@ paths:
       operationId: createImageSnapshot
       summary: 给 assets 桶打一个版本快照(等价 snapshot-version.sh)
       description: >-
+        #376. Take a version snapshot of the assets bucket: scans the S3 `deployment/` prefix for ALL
         current-version objects (rootfs image + scripts + edge + litellm + monitoring), records each
         object's {path, s3_version_id, etag}, and writes one row to DynamoDB openclaw-version-snapshots
         (primary key snapshot_time, format %Y-%m-%dT%H:%M:%SZ — matches the regex pull-image enforces, so
@@ -3565,6 +3566,7 @@ paths:
       operationId: listImageVersions
       summary: 列出黄金镜像的各版本快照(供选择时间点 pull)
       description: >-
+        #337(原 #217 GET /snapshots,改名避免与 /images 列镜像文件混淆)。Read-only listing of the
         version-snapshots table metadata (snapshot_time + label + file_count) so the console can let an
         operator pick which point-in-time snapshot to pull onto a host (pairs with
         POST /hosts/{id}/pull-image?snapshot_time=). Sorted by snapshot_time descending (newest first).

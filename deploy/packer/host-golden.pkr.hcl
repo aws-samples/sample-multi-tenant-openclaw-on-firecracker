@@ -17,12 +17,15 @@
 # 用法:
 #   packer init  deploy/packer
 #   packer validate -var-file=deploy/packer/apse1.pkrvars.hcl deploy/packer
-#   packer build    -var-file=deploy/packer/apse1.pkrvars.hcl deploy/packer
+#   packer build    -var-file="$PWD/deploy/packer/apse1.pkrvars.hcl" "$PWD/deploy/packer"
+#   (模板目录必须是绝对路径:相对路径下 file() 会二次拼接,validate/build 都直接失败。)
 #
 # 前置:
 #   - 调用者身份需能 RunInstances / CreateImage / CreateTags / PutParameter
-#   - assets_bucket 里要有 deployment/binaries/firecracker/<ver>/(#435 的镜像前缀);
-#     没有时 provision-host.sh 会回落公网源,产出的镜像仍然可用但违反 #435 的验收
+#   - assets_bucket 目前【只是变量】:模板把 OC_ASSETS_BUCKET 注进 provisioner 环境,
+#     但 provision-host.sh 从不读它。FC 二进制无条件从 github.com 拉(该脚本 :132),
+#     既没有 S3 优先路径也没有"回落" —— 公网源是唯一的源(#435 未落地)。
+#     deployment/binaries/firecracker/<ver>/ 前缀要等 #435 落地才有人读。
 
 packer {
   required_version = ">= 1.9.0"
@@ -67,14 +70,17 @@ variable "recipe_version" {
 variable "assets_bucket" {
   type        = string
   description = <<-EOT
-    openclaw-assets-<account><gsuffix>。provision-host.sh 从
-    deployment/binaries/firecracker/ 拉 FC 二进制(#435),构建实例的 instance profile
-    需有该前缀的 s3:GetObject。
+    openclaw-assets-<account><gsuffix>。
+    #435 未落地:本变量【当前没有消费者】。模板把它注进 provisioner 环境
+    (OC_ASSETS_BUCKET),但 provision-host.sh 从不读它,FC 二进制无条件从 github.com 拉。
+    #435 落地后,脚本才会从 deployment/binaries/firecracker/ 取件,那时构建实例的
+    instance profile 需有该前缀的 s3:GetObject。
   EOT
-  # 模板里 assets_bucket 是占位符 openclaw-assets-<ACCOUNT_ID>。不加这条校验的话
-  # packer validate 会放过它(它只是个字符串),客户带着占位符直接 build,要等到
-  # provision 第 3 步从 S3 拉 Firecracker 时才失败 —— 那时已经起了一台构建实例、
-  # 跑了两分钟 apt。在 validate 阶段就拦住,反馈立刻可得。
+  # 模板里 assets_bucket 是占位符 openclaw-assets-<ACCOUNT_ID>。这条校验仍然要留:
+  # 占位符是"客户没配完"的信号,在 validate 阶段拦住比起了构建实例再说更省事。
+  # 但别照旧注释理解失败时机 —— 原注释写"要等到 provision 第 3 步从 S3 拉 Firecracker
+  # 时才失败",而当前脚本压根不从 S3 取件(#435 未落地),带着占位符 build
+  # 会一路成功并产出镜像。也就是说这条 validation 现在拦的是配置卫生,不是构建必然失败。
   validation {
     condition     = !can(regex("<[A-Z_]+>", var.assets_bucket))
     error_message = "The assets_bucket variable still contains a placeholder. Replace <ACCOUNT_ID> with the 12-digit deployment account id."
@@ -97,9 +103,12 @@ variable "iam_instance_profile" {
   type        = string
   default     = ""
   description = <<-EOT
-    构建实例的 instance profile 名。需要:S3 读 assets_bucket 的 firecracker 前缀 +
-    SSM(可选,便于排障)。留空则 packer 用调用者凭据但机器上没有角色 ——
-    provision-host.sh 从 S3 拉 FC 会失败并回落公网,违反 #435,故生产构建必须给。
+    构建实例的 instance profile 名。留空则构建实例上没有角色。
+    #435 未落地:FC 取件当前【不需要】这个角色 —— provision-host.sh 无条件从
+    github.com 拉,不读 assets_bucket。实跑证据:留空在 us-west-2 构建退出 0,
+    第 3 步 `firecracker v1.15.1 installed`。
+    等 #435 落地(脚本改成读 deployment/binaries/firecracker/ 前缀)之后,
+    生产构建才必须给这个角色。给 SSM 权限仍便于排障。
   EOT
 }
 

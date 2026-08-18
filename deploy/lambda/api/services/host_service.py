@@ -1,6 +1,7 @@
 """core/services 层 · host_service:host 注册/注销/清理 + rootfs 镜像清单/刷新/漂移。
 
 handler-split #132 T1.7 —— 从 handler.py 逐字搬迁,行为零改动。
+#187 转型:core.legacy_alb 已下线(数据面两级路由不再用 per-tenant ALB rule/TG),
 调用点(_remove_alb_rule/_remove_host_tg)在 cleanup_terminated_host 中一并删。
 依赖方向:services → core(clients/utils),不反向 import handler。
 """
@@ -32,6 +33,7 @@ from core.pagination import decode_cursor, encode_cursor
 from core import image_jobs
 from core import image_slots
 from core import image_lease
+from core import host_taint
 
 
 def _public_hosts(items):
@@ -43,6 +45,12 @@ def _public_hosts(items):
     for item in items:
         item["cpu_overcommit_ratio"] = CPU_OVERCOMMIT_RATIO
         item["mem_overcommit_ratio"] = MEM_OVERCOMMIT_RATIO
+        # #539 分层规则:存储层不写 false，消除“false/缺属性”两种可调度表示；
+        # 响应层显式补 false，让消费方无需判断字段是否存在。审计字段不出列表。
+        taint_view = host_taint.public_view(item)
+        for attr in host_taint.TAINT_ATTRS:
+            item.pop(attr, None)
+        item.update(taint_view)
     return items
 
 
@@ -177,6 +185,7 @@ def _upsert_host_row(
     vcpu_total,
     mem_total,
     rootfs_version="",
+    immutable_version="",
 ):
     """#491 —— 重入安全的 host 注册写入。
 
@@ -184,6 +193,7 @@ def _upsert_host_row(
     已有在役租户的 host 再调一次 POST /hosts,账本被抹回初值、发号器随之回退到 1,之后
     dispatch 的 reserve CAS 会把已在用的号再发一遍且每次都成功 → launch-vm.sh 抢占先到者
     的 tap = 跨租户劫持(#491 已真机复现)。这与 init-host.sh 的自注册是同一缺陷的两个副本,
+    #445 只修了 host 脚本那一份。
 
     账本四字段(used_vcpu/used_mem_mb/vm_count/next_vm_num)的权威是控制面的认领/释放 CAS,
     注册路径只能【补】不能【改】—— 读回再写也不行:读与写之间落地的并发 create 会被抹掉。
@@ -221,6 +231,10 @@ def _upsert_host_row(
     }
     if rootfs_version:
         item["rootfs_version"] = rootfs_version
+    # #517 阶段1 —— immutable_version 与 rootfs_version 对称:非空才写(DDB 拒空 S,
+    # 空值不覆盖行上已有版本)。独立于 rootfs_version:只换 immutable 盘时它单独盖戳。
+    if immutable_version:
+        item["immutable_version"] = immutable_version
     try:
         hosts_table.put_item(
             Item=item,
@@ -257,6 +271,10 @@ def _upsert_host_row(
     if rootfs_version:
         sets.append("rootfs_version = :rv")
         vals[":rv"] = rootfs_version
+    # #517 阶段1 —— 重入刷新 immutable_version(与 rootfs_version 同范式:非空才刷)。
+    if immutable_version:
+        sets.append("immutable_version = :iv")
+        vals[":iv"] = immutable_version
     hosts_table.update_item(
         Key={"instance_id": instance_id},
         UpdateExpression="SET " + ", ".join(sets),
@@ -299,7 +317,14 @@ def register_host(body):
     # Stamp it from the live S3 manifest (same source as GET /hosts/rootfs-version)
     # bb); this only covers hosts registered through the API. Omit on unknown/empty
     # rather than writing "" — DDB rejects empty S and an empty value would falsely
-    rootfs_version = _get_manifest().get("version", "")
+    _boot_manifest = _get_manifest() or {}
+    rootfs_version = _boot_manifest.get("version", "")
+    # #517 阶段1 —— 同源(manifest.version)派生 immutable_version,但只在 manifest 点名了
+    # immutable 盘时才带值:host 装了这块盘,值才有意义。与 rootfs_version 独立字段,租户侧
+    # restart 盖 immutable、rebuild 才盖 rootfs,两者可各自漂移(rootfs-drift 分维度可见)。
+    immutable_version = (
+        rootfs_version if _boot_manifest.get("immutable") else ""
+    )
     # #491 — 写入走重入安全的 upsert(条件 put + CCF 分支只刷静态字段、if_not_exists 补账本)。
     _upsert_host_row(
         instance_id,
@@ -309,6 +334,7 @@ def register_host(body):
         vcpu_total,
         mem_total,
         rootfs_version,
+        immutable_version,
     )
     return _resp(201, {"instance_id": instance_id, "status": "active", "az": az})
 
@@ -338,6 +364,78 @@ def deregister_host(instance_id):
     except Exception as e:
         print(f"Failed to terminate {instance_id}: {e}")
     return _resp(200, {"instance_id": instance_id, "status": "draining"})
+
+
+def taint_host(instance_id, body, caller=""):
+    """POST /hosts/{instance_id}/taint —— 幂等记录 cordon 意图，不动实例与存量。"""
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except (ValueError, TypeError):
+            return _err(400, "VALIDATION", "body must be valid JSON")
+    if not isinstance(body, dict):
+        return _err(400, "VALIDATION", "body must be a JSON object")
+    reason = body.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        return _err(400, "VALIDATION", "reason must be a non-empty string")
+    reason = reason.strip()
+    actor = (caller.strip() or "unknown") if isinstance(caller, str) else "unknown"
+    item = hosts_table.get_item(
+        Key={"instance_id": instance_id}, ConsistentRead=True
+    ).get("Item")
+    if not item:
+        return _err(404, "NOT_FOUND", f"host {instance_id} not found")
+    if host_taint.is_tainted(item):
+        result = {
+            "instance_id": instance_id,
+            **host_taint.public_view(item),
+            "already_tainted": True,
+        }
+        if host_taint.ATTR_TAINTED_BY in item:
+            result[host_taint.ATTR_TAINTED_BY] = item[host_taint.ATTR_TAINTED_BY]
+        print(f"taint_host: already_tainted instance_id={instance_id} "
+              f"caller={actor} reason={reason}")
+        return _resp(200, result)
+    tainted_at = int(time.time())
+    hosts_table.update_item(
+        Key={"instance_id": instance_id},
+        UpdateExpression=(
+            "SET is_tainted = :tainted, tainted_at = :at, "
+            "tainted_reason = :reason, tainted_by = :by"
+        ),
+        ConditionExpression="attribute_exists(instance_id)",
+        ExpressionAttributeValues={
+            ":tainted": True, ":at": tainted_at, ":reason": reason, ":by": actor,
+        },
+    )
+    print(f"taint_host: instance_id={instance_id} caller={actor} reason={reason}")
+    return _resp(200, {
+        "instance_id": instance_id, "is_tainted": True,
+        "tainted_at": tainted_at, "tainted_reason": reason,
+    })
+
+
+def untaint_host(instance_id):
+    """DELETE /hosts/{instance_id}/taint —— 只 REMOVE，绝不持久化 false。"""
+    item = hosts_table.get_item(
+        Key={"instance_id": instance_id}, ConsistentRead=True
+    ).get("Item")
+    if not item:
+        return _err(404, "NOT_FOUND", f"host {instance_id} not found")
+    if not host_taint.is_tainted(item):
+        print(f"untaint_host: already_untainted instance_id={instance_id}")
+        return _resp(200, {
+            "instance_id": instance_id,
+            "is_tainted": False,
+            "already_untainted": True,
+        })
+    hosts_table.update_item(
+        Key={"instance_id": instance_id},
+        UpdateExpression="REMOVE " + ", ".join(host_taint.TAINT_ATTRS),
+        ConditionExpression="attribute_exists(instance_id)",
+    )
+    print(f"untaint_host: instance_id={instance_id}")
+    return _resp(200, {"instance_id": instance_id, "is_tainted": False})
 
 
 def _backup_tenant_for_evacuation(tenant):
@@ -562,13 +660,26 @@ def rootfs_drift():
     per-tenant; this endpoint shows WHO still needs rebuilding (their
     rootfs_version != the manifest's current version), so an operator can drive
     a rolling upgrade to completion instead of guessing. Pure read.
+
+    #517 阶段2 —— 加 immutable(只读身份盘)维度:同一次 scan 里并列算出哪些租户的
+    immutable_version 未到当前镜像版本,给「换 md → refresh-rootfs → 滚动 restart/reset」
+    这条身份更新链一个可判定的完成度视图(解锁 §5.4 G3 滚动编排)。加法式,rootfs 字段不变。
     """
     manifest = _get_manifest()
     current = manifest.get("version", "unknown")
-    # Page the tenants table; only non-deleted tenants matter for upgrade drift.
+    # #517 阶段2 —— 当前黄金镜像点名了 immutable 盘时,其目标版本同源 manifest.version
+    # (与阶段1 _select_pull_files 的 immutable_version 派生一致);未点名(可选盘)则当前镜像
+    # 无只读盘 → imm_current="",该维度整体 N/A(不把租户空/旧值误报成 stale)。
+    imm_current = current if manifest.get("immutable") else ""
+    # Page the tenants table; only non-deleted tenant rows matter for upgrade
+    # drift. The table also stores idem# rows without status and activename#
+    # rows with status but without tenant capacity fields.
     stale, up_to_date, unknown = [], 0, 0
+    unknown_tenants = []
+    imm_stale, imm_up_to_date, imm_unknown = [], 0, 0
+    imm_unknown_tenants = []
     scan_kwargs = {
-        "FilterExpression": "#s <> :d",
+        "FilterExpression": "attribute_exists(vcpu) AND attribute_exists(#s) AND #s <> :d",
         "ExpressionAttributeNames": {"#s": "status"},
         "ExpressionAttributeValues": {":d": "deleted"},
     }
@@ -581,12 +692,28 @@ def rootfs_drift():
             v = t.get("rootfs_version", "")
             if not v:
                 unknown += 1
+                unknown_tenants.append({"id": t["id"], "host_id": t.get("host_id")})
             elif v == current:
                 up_to_date += 1
             else:
                 stale.append(
                     {"id": t["id"], "rootfs_version": v, "host_id": t.get("host_id")}
                 )
+            # #517 阶段2 —— immutable 维度只在当前镜像确实带只读盘(imm_current 非空)时分类,
+            # 否则整批不计(N/A),避免把「本就没只读盘」误报成需要升级。
+            if imm_current:
+                iv = t.get("immutable_version", "")
+                if not iv:
+                    imm_unknown += 1
+                    imm_unknown_tenants.append(
+                        {"id": t["id"], "host_id": t.get("host_id")}
+                    )
+                elif iv == imm_current:
+                    imm_up_to_date += 1
+                else:
+                    imm_stale.append(
+                        {"id": t["id"], "immutable_version": iv, "host_id": t.get("host_id")}
+                    )
         start_key = out.get("LastEvaluatedKey")
         if not start_key:
             break
@@ -596,8 +723,17 @@ def rootfs_drift():
             "current_version": current,
             "up_to_date": up_to_date,
             "unknown": unknown,
+            "unknown_tenants": unknown_tenants,
             "stale_count": len(stale),
             "stale": stale,
+            # #517 阶段2 —— immutable 维度(加法式,与 rootfs 字段并列不互斥)。
+            # immutable_current_version="" 表示当前镜像无只读盘 → 该维度 N/A,计数恒 0、列表空。
+            "immutable_current_version": imm_current,
+            "immutable_up_to_date": imm_up_to_date,
+            "immutable_unknown": imm_unknown,
+            "immutable_unknown_tenants": imm_unknown_tenants,
+            "immutable_stale_count": len(imm_stale),
+            "immutable_stale": imm_stale,
         },
     )
 
@@ -619,7 +755,10 @@ def _select_pull_files(bucket, files):
     openclaw-<kind>.ext4,后覆盖先、装哪版非确定。修:manifest.json 是唯一版本选择器,
     只装它点名的 3 个盘 + manifest 本身,忽略其它版本。
 
-    返回 (host_files, err_msg, version)。host_files = manifest 条目 + basename ∈ manifest
+    返回 (host_files, err_msg, version, immutable_version)。#517 阶段1 加末位
+    immutable_version:与 version(rootfs)独立,manifest 点名 immutable 盘时取同源
+    manifest.version,不受「未点名 rootfs → version 返空」规则影响。
+    host_files = manifest 条目 + basename ∈ manifest
     点名集的盘条目;err_msg 非 None 表示选择失败(调用方 fail-loud,不装 live)。
     version = 这份快照 manifest 的 version 字段(#343:pull 成功后写进 host.rootfs_version,
     本函数是读 manifest 的唯一处、故由它返回权威版本;读不到 version 时返 "" 不谎报)。
@@ -630,7 +769,7 @@ def _select_pull_files(bucket, files):
         (f for f in rootfs_files if f["path"].endswith("rootfs/manifest.json")), None
     )
     if manifest_entry is None:
-        return [], "snapshot has no manifest.json under deployment/rootfs/", ""
+        return [], "snapshot has no manifest.json under deployment/rootfs/", "", ""
     # 读快照的 manifest(精确 VersionId),拿它点名的 3 个盘文件名。
     # 上传的对象,其 VersionId 字面就是 "null",要拿【那一版】必须显式传 VersionId="null";省略
     # 会读【最新版】(可能是后来 re-upload 的新版)→ manifest(版本选择器)与盘下载路径(line 885
@@ -643,7 +782,7 @@ def _select_pull_files(bucket, files):
             get_kw["VersionId"] = vid
         manifest = json.loads(s3.get_object(**get_kw)["Body"].read().decode())
     except Exception as e:
-        return [], f"cannot read snapshot manifest.json: {e}", ""
+        return [], f"cannot read snapshot manifest.json: {e}", "", ""
     # manifest 每个 field(rootfs/data_template/immutable)→ value(该盘的源文件名)。
     # 给选中的盘打 f["disk_kind"],下游装/备份/进度全读它,文件名不再被强制 openclaw-<kind>- 格式。
     # 但文件名会被插进下发到 host 的 shell(日志/_perr),故必须校验安全字符集(防 codex review
@@ -654,16 +793,16 @@ def _select_pull_files(bucket, files):
         if not val:
             continue
         if not isinstance(val, str):
-            return [], f"manifest field {field} must be a string, got {type(val).__name__}", ""
+            return [], f"manifest field {field} must be a string, got {type(val).__name__}", "", ""
         if not _SAFE_DISK_NAME_RE.match(val):
             # 字符集白名单(纵深防御,叠加下游 shell-quote):挡 $()/反引号/引号/空格/斜杠等。
-            return [], f"manifest field {field} filename {val!r} has unsafe chars (only [A-Za-z0-9._-])", ""
+            return [], f"manifest field {field} filename {val!r} has unsafe chars (only [A-Za-z0-9._-])", "", ""
         if val in named:
             # 多个 field 指向同一文件 → 只会装其中一种盘,其它盘保留旧版却校验通过(codex review)。
-            return [], f"manifest points two disk fields at the same file {val!r} (must be distinct)", ""
+            return [], f"manifest points two disk fields at the same file {val!r} (must be distinct)", "", ""
         named[val] = kind
     if not named:
-        return [], "manifest.json names no disks (rootfs/data_template/immutable)", ""
+        return [], "manifest.json names no disks (rootfs/data_template/immutable)", "", ""
     # 只留 manifest 点名的盘(按 basename 匹配 manifest value);给每个打 disk_kind。
     selected = [manifest_entry]
     picked = set()
@@ -677,7 +816,7 @@ def _select_pull_files(bucket, files):
             picked.add(base)
     missing = set(named) - picked
     if missing:
-        return [], f"manifest names disks absent from snapshot: {sorted(missing)}", ""
+        return [], f"manifest names disks absent from snapshot: {sorted(missing)}", "", ""
     # 写进 host.rootfs_version。rootfs_version 语义 = 这台 host 装的 rootfs 盘版本,故:
     #   · manifest 点名了 rootfs 盘 → 本次装了新 rootfs,【必须】有合法非空版本号才写(codex
     #     review:缺失/null/非字符串则装了新 rootfs 却谎报旧版本 = 原 bug,fail-loud 拒装,
@@ -688,10 +827,22 @@ def _select_pull_files(bucket, files):
     version = mver if isinstance(mver, str) and mver else ""
     rootfs_installed = "rootfs" in named.values()
     if rootfs_installed and not version:
-        return [], "manifest names a rootfs disk but has no valid version string", ""
+        return [], "manifest names a rootfs disk but has no valid version string", "", ""
+    # #517 阶段1 —— immutable_version 独立于 rootfs 的返空规则:只换 immutable(不点名
+    # rootfs)是最省的身份文件更新路径,若沿用下面 `rootfs 未换→version=""` 会把 immutable
+    # 版本一并抹成空,这次更新对控制面永远不可见(v2 §5 的核心事实)。故在 rootfs 归零【之前】
+    # 用同源 manifest.version 独立算出:manifest 点名了 immutable 盘 + 有合法版本号才返值。
+    immutable_installed = "immutable" in named.values()
+    # #517 阶段1(F3/F2 修正,codex 交叉审)—— 与 rootfs 对称 fail-loud:装了新 immutable 盘却
+    # 无合法版本号 → 拒装,不静默沿用旧 immutable_version(否则盘换了、控制面版本坐标停旧 =
+    # 谎报,正是本 issue 要消除的不可见)。仅点名 immutable(不点名 rootfs)时上面 rootfs 的
+    # 检查不触发,故这里补一道;两盘都点名且缺 version 时 rootfs 检查已先行拦。
+    if immutable_installed and not version:
+        return [], "manifest names an immutable disk but has no valid version string", "", ""
+    immutable_version = version if immutable_installed else ""
     if not rootfs_installed:
         version = ""  # rootfs 未换 → 不写 host.rootfs_version(旧值即真实)
-    return selected, None, version
+    return selected, None, version, immutable_version
 
 
 def list_images(query_params=None):
@@ -778,30 +929,49 @@ def refresh_rootfs():
 
     ids = [h["instance_id"] for h in hosts]
     assets = "/data/firecracker-assets"
-    # Decompress to .tmp then rename — `pigz -dc src > dst` truncates dst at
-    # redirect time, so a mid-pipe failure leaves a 0-byte rootfs that boots
-    # silently into a kernel panic (issue surfaced 2026-05-22 on a v3.5 push).
+    q = shlex.quote
+    # The host command owns the disk + coordinate commit. It shares pull.lock
+    # with snapshot pulls, stages through .tmp files, and writes DDB only after
+    # every requested disk operation has succeeded.
     script = f"""
 set -eu
-ASSETS={assets}
-BUCKET={bucket}
-PREFIX={prefix}
-REGION={region}
-ROOTFS_GZ={manifest["rootfs"]}
-DATA_GZ={manifest["data_template"]}
-IMMUTABLE_GZ={manifest.get("immutable", "")}
-aws s3 cp "s3://$BUCKET/$PREFIX/manifest.json" "$ASSETS/manifest.json" --region "$REGION"
+ASSETS={q(assets)}
+BUCKET={q(bucket)}
+PREFIX={q(prefix)}
+REGION={q(region)}
+VERSION={q(version)}
+ROOTFS_GZ={q(manifest["rootfs"])}
+DATA_GZ={q(manifest["data_template"])}
+IMMUTABLE_GZ={q(manifest.get("immutable", ""))}
+[ -r /etc/platform.env ] || {{ echo "[refresh-rootfs] /etc/platform.env missing" >&2; exit 1; }}
+. /etc/platform.env
+[ -n "${{HOSTS_TABLE:-}}" ] || {{ echo "[refresh-rootfs] HOSTS_TABLE missing" >&2; exit 1; }}
+[ -n "${{INSTANCE_ID:-}}" ] || {{ echo "[refresh-rootfs] INSTANCE_ID missing" >&2; exit 1; }}
+exec 9>"$ASSETS/pull.lock"
+flock -w 120 9 || {{ echo "[refresh-rootfs] image pull lock held >120s" >&2; exit 1; }}
+[ ! -e "$ASSETS/slots.json" ] || {{
+  echo "[refresh-rootfs] slots.json exists; legacy flat refresh cannot update the active version directory" >&2
+  exit 1
+}}
+aws s3 cp "s3://$BUCKET/$PREFIX/manifest.json" "$ASSETS/manifest.json.tmp" --region "$REGION"
+ACTUAL_VERSION=$(jq -er '.version' "$ASSETS/manifest.json.tmp")
+ACTUAL_ROOTFS=$(jq -er '.rootfs' "$ASSETS/manifest.json.tmp")
+ACTUAL_DATA=$(jq -er '.data_template' "$ASSETS/manifest.json.tmp")
+ACTUAL_IMMUTABLE=$(jq -er '.immutable // ""' "$ASSETS/manifest.json.tmp")
+[ "$ACTUAL_VERSION" = "$VERSION" ] &&
+  [ "$ACTUAL_ROOTFS" = "$ROOTFS_GZ" ] &&
+  [ "$ACTUAL_DATA" = "$DATA_GZ" ] &&
+  [ "$ACTUAL_IMMUTABLE" = "$IMMUTABLE_GZ" ] || {{
+    echo "[refresh-rootfs] manifest changed after dispatch; refusing stale refresh" >&2
+    exit 1
+  }}
 aws s3 cp "s3://$BUCKET/$PREFIX/$ROOTFS_GZ" "$ASSETS/rootfs.gz" --region "$REGION"
 aws s3 cp "s3://$BUCKET/$PREFIX/$DATA_GZ" "$ASSETS/data.gz" --region "$REGION"
 pigz -dc "$ASSETS/rootfs.gz" > "$ASSETS/openclaw-rootfs.ext4.tmp"
 [ -s "$ASSETS/openclaw-rootfs.ext4.tmp" ]
-mv "$ASSETS/openclaw-rootfs.ext4.tmp" "$ASSETS/openclaw-rootfs.ext4"
-rm -f "$ASSETS/rootfs.gz"
 pigz -dc "$ASSETS/data.gz" > "$ASSETS/openclaw-data-template.ext4.tmp"
 [ -s "$ASSETS/openclaw-data-template.ext4.tmp" ]
-mv "$ASSETS/openclaw-data-template.ext4.tmp" "$ASSETS/openclaw-data-template.ext4"
-rm -f "$ASSETS/data.gz"
-fallocate --dig-holes "$ASSETS/openclaw-data-template.ext4"
+fallocate --dig-holes "$ASSETS/openclaw-data-template.ext4.tmp"
 # Immutable authority disk (identity + ops skills, read-only). MUST be refreshed
 # too — new skills + the routing AGENTS.md live ONLY here, so skipping it means a
 # rolling rebuild silently ships stale skills. Same .tmp→mv anti-truncation guard.
@@ -809,8 +979,31 @@ if [ -n "$IMMUTABLE_GZ" ]; then
   aws s3 cp "s3://$BUCKET/$PREFIX/$IMMUTABLE_GZ" "$ASSETS/immutable.gz" --region "$REGION"
   pigz -dc "$ASSETS/immutable.gz" > "$ASSETS/openclaw-immutable.ext4.tmp"
   [ -s "$ASSETS/openclaw-immutable.ext4.tmp" ]
+fi
+mv "$ASSETS/openclaw-rootfs.ext4.tmp" "$ASSETS/openclaw-rootfs.ext4"
+mv "$ASSETS/openclaw-data-template.ext4.tmp" "$ASSETS/openclaw-data-template.ext4"
+if [ -n "$IMMUTABLE_GZ" ]; then
   mv "$ASSETS/openclaw-immutable.ext4.tmp" "$ASSETS/openclaw-immutable.ext4"
-  rm -f "$ASSETS/immutable.gz"
+else
+  rm -f "$ASSETS/openclaw-immutable.ext4" "$ASSETS/openclaw-immutable.ext4.tmp"
+fi
+mv "$ASSETS/manifest.json.tmp" "$ASSETS/manifest.json"
+rm -f "$ASSETS/rootfs.gz" "$ASSETS/data.gz" "$ASSETS/immutable.gz"
+HOST_KEY=$(jq -cn --arg id "$INSTANCE_ID" '{{instance_id:{{S:$id}}}}')
+if [ -n "$IMMUTABLE_GZ" ]; then
+  VERSION_VALUES=$(jq -cn --arg v "$VERSION" '{{":v":{{S:$v}},":iv":{{S:$v}}}}')
+  aws dynamodb update-item --table-name "$HOSTS_TABLE" --region "$REGION" \
+    --key "$HOST_KEY" \
+    --condition-expression "attribute_exists(instance_id)" \
+    --update-expression "SET rootfs_version = :v, immutable_version = :iv" \
+    --expression-attribute-values "$VERSION_VALUES"
+else
+  VERSION_VALUES=$(jq -cn --arg v "$VERSION" '{{":v":{{S:$v}}}}')
+  aws dynamodb update-item --table-name "$HOSTS_TABLE" --region "$REGION" \
+    --key "$HOST_KEY" \
+    --condition-expression "attribute_exists(instance_id)" \
+    --update-expression "SET rootfs_version = :v REMOVE immutable_version" \
+    --expression-attribute-values "$VERSION_VALUES"
 fi
 """.strip()
     try:
@@ -822,20 +1015,16 @@ fi
     except Exception as e:
         return _resp(500, {"error": str(e)})
 
-    # 租户(tenant_service.py:1536)和 rebuild 采用(:2705)都读它。注意这是异步
-    # send_command,此刻文件可能还没在盘上换完(set -eu + .tmp→mv 保证要么换成功
-    # 要么整段失败,不会半成品;但本函数不等它跑完)。**关键的防谎报在采用侧**:
-    # 租户,校验不过就不标 → 即便这里 host 版本先行,租户级 GET /tenants 也不会谎报
-    # "已升级"。原注释宣称"host-agent confirms after files are on disk"是不实的
-    # (host-agent 健康检查不验版本),已删除该说法。
-    for host_id in ids:
-        hosts_table.update_item(
-            Key={"instance_id": host_id},
-            UpdateExpression="SET rootfs_version = :v",
-            ExpressionAttributeValues={":v": version},
-        )
-
-    return _resp(200, {"message": "refresh started", "version": version, "hosts": ids})
+    _imm_ver = version if manifest.get("immutable") else ""
+    return _resp(
+        200,
+        {
+            "message": "refresh started",
+            "version": version,
+            "immutable_version": _imm_ver,
+            "hosts": ids,
+        },
+    )
 
 
 # (openclaw-{rootfs,data-template,immutable}-<VER>.ext4.gz)+ manifest.json 版本指针。
@@ -1276,13 +1465,16 @@ def _slots_selfheal_lines(flat_snapshot_time):
 
 def _reset_status_cmd(
     hosts_table, region, instance_id, status, snapshot_time=None, job_id=None, rootfs_version="",
+    immutable_version="",
 ):
     """host 侧写 hosts 表的一条 aws dynamodb update-item(host 实例角色已有 UpdateItem
     权限,host-agent 心跳在用)。失败时只复位 status→prev;成功时复位 + 写 snapshot_time
     (仅成功才记版本,不谎报)。`|| true`:DDB 写失败不该让整条 SSM 判失败(状态字段是
     旁路,主功能是装 live)。各值 shell-quote 防注入。
+    #333(codex round9)owner-conditional:传 job_id 时加 ConditionExpression pull_command_id==job_id
     —— DynamoDB 模糊失败重试(客户端超时但服务端已写)可能在新 job CAS 后把状态覆盖回旧值;
     条件写关死:非当前 owner 的复位 CCF 失败(被 `|| true` 吞,无害)。
+    #343 成功路径同步 rootfs_version:pull 装 live 换了 rootfs,却漏更新 host.rootfs_version
     (scaler/rebuild 采用逻辑、rootfs-drift 视图都读它,不同步 = 误判 host 未升级 + rebuild
     后谎报旧版)。故成功且拿到非空版本号时,连 rootfs_version 一起写(值来自 _select_pull_files
     读到的 manifest version)。失败路径【不】写(不谎报升级成功)。空版本号也不写(读不到时不覆盖)。"""
@@ -1302,6 +1494,11 @@ def _reset_status_cmd(
         if rootfs_version:
             expr += ", rootfs_version = :rv"
             vals_map[":rv"] = {"S": rootfs_version}
+        # #517 阶段1 —— 同理补写 immutable_version(rootfs-drift 的 immutable 维度读它)。
+        # 值经 json.dumps(vals_map) 序列化后再 shlex.quote,与 rootfs_version 同一注入防线。
+        if immutable_version:
+            expr += ", immutable_version = :iv"
+            vals_map[":iv"] = {"S": immutable_version}
         expr += " REMOVE upgrading_at"
     names = json.dumps({"#s": "status"})
     cond = ""
@@ -1319,6 +1516,7 @@ def _reset_status_cmd(
 def _snapshot_pull_script(
     bucket, region, host_files, snapshot_time, hosts_table, instance_id, prev_status,
     job_id, rootfs_version="", slot=None, flat_live_snapshot_time=None,
+    immutable_version="",
 ):
     """#309 V1 — SSM shell:照【已选好的】host_files(#317:_select_pull_files 已按 manifest
     点名的盘 + manifest 本身选好,不含多余版本),按【精确 VersionId】拉。两段式:
@@ -1360,7 +1558,8 @@ def _snapshot_pull_script(
     else:
         reset_fail = _reset_status_cmd(hosts_table, region, instance_id, prev_status, None, job_id)
         reset_ok = _reset_status_cmd(
-            hosts_table, region, instance_id, prev_status, snapshot_time, job_id, rootfs_version
+            hosts_table, region, instance_id, prev_status, snapshot_time, job_id, rootfs_version,
+            immutable_version=immutable_version,
         )
 
     # _p():进度写手,把【UTC 时间 + 消息】追加到 /tmp/<job_id>.txt(pull_image_progress tail 它)。
@@ -1580,6 +1779,7 @@ def list_image_versions(query_params=None):
     时间点去 pull。按 snapshot_time 倒序(最新在前)。不回 files 大 JSON(那是 pull 时才逐文件读);
     表未配置 → 503 fail-loud。
 
+    #394 — `?show_deleted=true`(默认 false):默认过滤软删条目(status=deleted),因为可拉取
     面绝不该列出已下架版本(pull 也会拒);Image Snapshot 面板传 true 看全量,这样"某 host 槽位
     仍引用、但快照记录被误软删"的版本仍会出现(带 deleted 标记),不会因过滤而在 UI 里凭空消失
     (那会导致 live 版本没有徽标——本次修复的 bug)。每条带 `status`,前端据此标记 + 过滤。"""
@@ -1621,6 +1821,7 @@ def _snapshot_still_referenced(snapshot_time):
         解析不到自己的版本目录。
     只读扫描,不改任何东西。任一命中即拒删(fail-closed)。
 
+    #394 P1-5 —— 两处 scan 都【翻页到底】(处理 LastEvaluatedKey)。DynamoDB 单页上限 1MB,
     只读第一页会漏掉后续页的引用 → 把仍被引用的版本误判"无人用"而软删 → host 丢失/恢复时
     拉不回在运行的版本(no-data-loss)。删除保护必须 fail-closed:宁可多扫几页,不可漏判。
     """
@@ -1966,6 +2167,7 @@ def _set_host_upgrading(instance_id, job_id):
     新建。捕获 prev_status:host 复位时还原精确原态(idle host 别误报 active)。upgrading_at:
     host 宕机 trap 不触发卡 upgrading 时(★G)供运维判断。ConditionalCheckFailed(已
     upgrading/并发/host 不存在)→ 返回 409。成功 → (prev_status, None)。
+    #333(codex round8)【原子】写:status→upgrading + pull_command_id=job_id + 清 last_pull_error
     全在【同一条】条件 UpdateItem(gate on active/idle)。此前 CAS 与写 pull_command_id 分两步,
     留一个"已 upgrading 但 pull_command_id 还是旧值"的窗口 —— 旧 worker 可在此窗口按旧 owner 条件
     finalize/reset 把新任务置回 active,新 worker 随后 STALE_JOB 静默退,调用方却已收到 202。合成一条
@@ -2014,7 +2216,7 @@ def _pull_by_snapshot(instance_id, snapshot_time, slot=None, idempotency_key=Non
     except (ValueError, TypeError):
         files = []
     # 不灌 microVM host。选择失败(无 manifest/点名盘缺失)→ fail-loud,不装。
-    host_files, sel_err, _ = _select_pull_files(bucket, files)
+    host_files, sel_err, _, _ = _select_pull_files(bucket, files)
     if sel_err:
         return _err(409, "CONFLICT", f"snapshot {snapshot_time}: {sel_err}")
 
@@ -2149,6 +2351,7 @@ def _run_pull_pipeline(instance_id, snapshot_time, prev_status, job_id, slot=Non
     (未配置/快照不存在/选盘失败/拼脚本异常/下发失败/fence 失败/脚本失败/成功),漏掉任一条
     都会把该 host 的镜像操作占死到 lease 自然过期(期间 promote/cleanup/reclaim 全被 409 挡)。
 
+    #394 P1-2 —— live 与 canary 现在都持 lease(统一互斥,ADR §4.8 规则 1),故【两者都】要
     在此归还。释放是 owner-conditional(release 内部条件写校验 owner==job_id),超时重投的旧
     worker 不会误释放接管者的 lease。live 的 status 复位另在 _finalize_success/失败路径处理,
     与 lease 释放正交(lease 管镜像操作互斥,status 管是否接新租户)。
@@ -2204,7 +2407,9 @@ def _run_pull_pipeline_impl(instance_id, snapshot_time, prev_status, job_id, slo
             files = json.loads(item.get("files", "[]"))
         except (ValueError, TypeError):
             files = []
-        host_files, sel_err, rootfs_version = _select_pull_files(bucket, files)
+        host_files, sel_err, rootfs_version, immutable_version = _select_pull_files(
+            bucket, files
+        )
         if sel_err:
             _fail_before_dispatch(f"snapshot {snapshot_time}: {sel_err}")
             return {"statusCode": 409, "body": f"snapshot {snapshot_time}: {sel_err}"}
@@ -2224,6 +2429,7 @@ def _run_pull_pipeline_impl(instance_id, snapshot_time, prev_status, job_id, slo
             bucket, region, host_files, snapshot_time,
             hosts_table_name, instance_id, prev_status, job_id, rootfs_version,
             slot=slot, flat_live_snapshot_time=flat_live_snap,
+            immutable_version=immutable_version,
         )
     except Exception as e:
         _fail_before_dispatch(f"pre-dispatch error: {e}")
@@ -2288,7 +2494,10 @@ def _run_pull_pipeline_impl(instance_id, snapshot_time, prev_status, job_id, slo
              "snapshot_time": snapshot_time, "instance_id": instance_id,
              "slot": image_slots.SLOT_CANARY, "install_command_id": cmd_id},
         )
-    _finalize_success(instance_id, snapshot_time, prev_status, job_id, rootfs_version)
+    _finalize_success(
+        instance_id, snapshot_time, prev_status, job_id, rootfs_version,
+        immutable_version=immutable_version,
+    )
     return _resp(
         200,
         {"message": "pull-image installed to live, promoted",
@@ -2300,6 +2509,7 @@ def _run_pull_pipeline_impl(instance_id, snapshot_time, prev_status, job_id, slo
 def _reset_host_status(instance_id, status, job_id=None):
     """★B 兜底:Lambda 侧把 host status 复位到 prev(下发失败/worker 前置失败时用)。best-effort,
     复位失败不掩盖原始错误(但打日志,便于查卡 upgrading 的 host)。
+    #333(codex round4):传了 job_id 时条件写(pull_command_id == job_id)——只有当前 owner 才复位,
     防 at-least-once/超时重投的旧 worker 复位掉新任务的 upgrading。入口 dispatch 失败复位不传
     job_id(那时本 job 仍是 owner,无条件复位即可)。非 owner → CCF 静默跳过。"""
     ccf = hosts_table.meta.client.exceptions.ConditionalCheckFailedException
@@ -2364,9 +2574,11 @@ def _record_pull_error(instance_id, reason, job_id=None):
     """#309 — 装 live 失败时把简短原因记到 host DDB 项(last_pull_error),供
     pull_image_progress 透出。best-effort,不抛(别掩盖原始失败)。绝不在这里改 status
     (status 由脚本 trap 按阶段自决:phase1 已复位 prev / phase2 留 upgrading)。
+    #334(codex round6)job-conditional:传 job_id 时条件写 pull_command_id==job_id。否则
     at-least-once/超时重投的【旧 worker】失败后,新 pull 已写入新 job,旧 Lambda 会把旧错误写到
     新 job 的槽 → pull_image_progress 的 DDB 终态优先逻辑据此把新任务误报 Failed。非 owner → CCF 跳过。
 
+    #394 P1-3 —— host 行的 last_pull_error 写是 owner-gated(共享行,防旧 worker 污染);但
     持久化 Job 行是【按 job_id 主键】的,天生 owner-safe(每个 job 只有自己那条)。canary pull
     从不写 pull_command_id,故 host 行 CCF 必然失败——但那【不该】连累 Job 终态。原来 CCF 后
     直接 return,导致 canary 失败永远停在 QUEUED(host 重启/进度文件丢后 progress 永报
@@ -2395,11 +2607,14 @@ def _record_pull_error(instance_id, reason, job_id=None):
     )
 
 
-def _finalize_success(instance_id, snapshot_time, prev_status, job_id, rootfs_version=""):
+def _finalize_success(
+    instance_id, snapshot_time, prev_status, job_id, rootfs_version="", immutable_version=""
+):
     """装 live 成功 —— host status→prev + 写 snapshot_time(仅成功才记版本,不谎报),
     清 last_pull_error(本轮无错)。**保留 pull_command_id**:progress 据它 tail 进度文件才能
     读到末行 SUCCESS → 返回 Completed(codex review:删了 pull_command_id → progress 拿不到
     job_id → 永远 InProgress/no-job,观察不到成功)。下一轮 pull 的 _set_host_upgrading 覆盖它。
+    #333(codex round4/12)条件写:pull_command_id == 本 job_id 【且 status == upgrading】—— 只有
     当前 owner 且 host 仍在本轮 upgrading 才能更新 Host 投影。防两类:① at-least-once/超时重投
     的【旧 worker】finalize 掉新任务(脚本侧 flock 挡不住 Lambda 侧 DDB 写);② pull_command_id
     成功后【保留】,若 host 已被移到 draining/deleted,延迟 worker 光凭 owner 匹配会把它错误
@@ -2407,6 +2622,8 @@ def _finalize_success(instance_id, snapshot_time, prev_status, job_id, rootfs_ve
     但 SSM 已返回成功时,该 Job 自身的 SUCCEEDED 终态仍必须写入:正常路径中 host 脚本会先执行
     _reset_ok 把 status 复位,使 Lambda 的幂等兜底 CAS 触发 CCF。若因此提前 return,成功 Job
     会永久停在 QUEUED。
+    #309:脚本内 _reset_ok 已自管复位(survives Lambda 死);本函数是 Lambda 侧再兜一次。
+    #343(codex review):脚本侧 _reset_ok 写 rootfs_version 的 aws cli 若 `|| true` 静默失败,
     Lambda 兜底也必须写 rootfs_version,否则 status/snapshot 恢复了、版本字段仍停旧值(原 bug 重现)。
     故成功且版本号非空时,这条兜底 update 也补 rootfs_version(与脚本侧同值,幂等)。"""
     ccf = hosts_table.meta.client.exceptions.ConditionalCheckFailedException
@@ -2415,6 +2632,11 @@ def _finalize_success(instance_id, snapshot_time, prev_status, job_id, rootfs_ve
     if rootfs_version:
         expr += ", rootfs_version = :rv"
         vals[":rv"] = rootfs_version
+    # #517 阶段1 —— 兜底同写 immutable_version(与脚本侧 _reset_ok 同值、幂等),
+    # 否则脚本侧 aws cli `|| true` 静默失败时 immutable_version 停旧值。
+    if immutable_version:
+        expr += ", immutable_version = :iv"
+        vals[":iv"] = immutable_version
     expr += " REMOVE upgrading_at, last_pull_error"
     try:
         hosts_table.update_item(
@@ -2509,6 +2731,7 @@ def pull_image(instance_id, query_params, headers=None):
     (launch-vm 直接读的地方)。只作用一台 host。异步跑,立即回 202 + job_id;进度走
     pull_image_progress。金丝雀已移除,失败只报错不自动 restore(留 V2)。
 
+    #394 P2-1 —— 支持 Idempotency-Key:响应丢失后带同 key 重试 → 返回原 job,不再新起一次真
     pull(与 promote/cleanup 幂等语义一致,兑现文档承诺)。"""
     if not instance_id:
         return _err(400, "VALIDATION", "missing instance_id")
@@ -2548,6 +2771,7 @@ _COPY_FILE_ALLOWED_ROOTS = ("/opt/openclaw/", "/home/ubuntu/")
 def _validate_copy_target(target):
     """#309 — 校验 copy-file 的目标 EC2 路径:必须落在 _COPY_FILE_ALLOWED_ROOTS 任一根下的
     绝对路径,禁 .. 穿越。返回 (ok, err_msg)。纯函数、易测。
+    #334(codex round8)必须是【完整文件路径】,拒目录/尾斜杠:aws s3 cp 到目录会把文件放进去,
     但随后 chown "$DST" 改的是目录、真文件仍 root:root(属主修复在默认流程失效)。故要求含文件名。"""
     if not target or not target.startswith("/"):
         return False, "target must be an absolute path"
@@ -2744,6 +2968,7 @@ def pull_image_progress(instance_id, query_params=None):
       last_status:进度文件最后一行原文(带时间戳+做了什么,供 UI 展示细节)
     无 job_id → 从没 pull 过(state='NONE',ProcessingJobStatus=null,last_status=None)。
 
+    #333 真实响应样例(InProgress,phase2 正解压第 2/4 个盘,真机 2026-07-20 取):
       {
         "instance_id": "i-0abc123def4567890",
         "host_status": "upgrading",

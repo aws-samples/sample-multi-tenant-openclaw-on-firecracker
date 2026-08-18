@@ -17,6 +17,8 @@
 #   <VPC_ID>              导入的客户 VPC id
 #   <VPC_CIDR>            该 VPC 的 CIDR,用于 SG rule 引用
 #   <SUBNET_*>            各用途子网 id(见每段就近注释,数量须与 az_count 对齐)
+#   <AZ_A>/<AZ_B>/<AZ_C>  上述子网各自所在 AZ,如 ap-southeast-1a(#530:ALB 与 edge
+#                         的 AZ 集合必须能在 synth 期比对,裸 subnet id 取不到 AZ)
 #   <ACM_ARN_BFF>        本 region ACM 证书 ARN(控制台 BFF 443 listener)
 #   <LITELLM_BASE_URL>    已有 LiteLLM 网关 base URL,如 http://10.x.x.x:4000/v1
 #   <OFFICE_OR_VPN_CIDR>  允许访问控制台的办公/VPN 出口 CIDR,绝不填 0.0.0.0/0
@@ -93,11 +95,13 @@ api:
 # ========== Auto Scaling ==========
 asg:
   # 首次部署必须 0:黄金镜像烤制是非阻塞的独立栈,min>=1 时 host 会抢在镜像就绪前启动、
+  # 拉不到镜像 → lifecycle ABANDON → ASG 反复换机(#488 preflight 会拦)。
   # 镜像验收通过后再抬到生产容量(跨 AZ 起步 2,按需加)。
   min_capacity: 0 # 首次部署 0;镜像就绪后改 2+ 再 deploy
   max_capacity: 100
   # metal 物理机 Nitro 初始化 + 下载黄金镜像 + 挂盘 + 注册,600s 偏紧会反复 Heartbeat Timeout。
   # 本 sample 是 imported VPC + r8g.metal-24xl —— 这一组合真机实测 1200s 仍不够,
+  # 会连续 lifecycle ABANDON 换机(#488 台账)。用 3600;preflight 的门也是 >=2700。
   lifecycle_hook_timeout: 3600 # 1h;imported+metal 冷启实测 1200 不足
   use_spot: false # 生产控制面 host 不用 Spot
 
@@ -126,10 +130,14 @@ network:
 # DashboardALB 承载 edge;ConsoleBffALB 独立承载 BFF :443。
 alb:
   internal: false # #423 — 公网 ALB;入站基线只放 VPC CIDR,公网访问者 CIDR 部署后按需追加(绝不 0.0.0.0/0)
+  # #530 — 必须带 az。ALB target eligibility 按 AZ 判定:edge 实例落到 ALB 未启用的
+  # AZ 后会永久 Target.NotInUse、健康检查也不会替换它,那部分机队就是死重。裸 subnet id
+  # 在 synth 期取不到 AZ(CDK 给的是 token),写成 {id, az} 才能让 synth 真的校验
+  # edge target AZs ⊆ ALB enabled AZs;不带 az 会被 fail-closed 拒绝部署。
   subnet_ids: # internet-facing edge ALB 必须落公网子网
-    - <SUBNET_PUBLIC_1A>
-    - <SUBNET_PUBLIC_1B>
-    - <SUBNET_PUBLIC_1C>
+    - { id: <SUBNET_PUBLIC_1A>, az: <AZ_A> }
+    - { id: <SUBNET_PUBLIC_1B>, az: <AZ_B> }
+    - { id: <SUBNET_PUBLIC_1C>, az: <AZ_C> }
 
 # ========== ElastiCache Valkey 路由表 ==========
 # OpenResty 边缘查 tenant_id→host:port 的准静态路由;host-agent 建/删/迁双写。
@@ -156,10 +164,14 @@ edge:
   dnat_port_low: 10000 # host 数据面 DNAT 端口段下界(改动须重建栈)
   dnat_port_high: 15000 # 上界;5001 槽,消除端口先于内存耗尽
   migration_drain_seconds: 5 # R6 迁移切流后源旧 DNAT 保留秒数(只重部署 health_check Lambda)
+  # #530 — 必须带 az,且这三个 AZ 必须落在 alb.subnet_ids 声明的 AZ 集合内。
+  # ALB 只把 target 派到自己已启用的 AZ:edge 落在 ALB 未启用的 AZ 上,target 永久
+  # Target.NotInUse、健康检查不替换,那台就是死重。synth 会强制这条包含关系,
+  # 裸 subnet id(AZ 取不到)会被 fail-closed 拒绝。留空则由 ALB 的 AZ 集合自动派生。
   subnet_ids:
-    - <SUBNET_HOST_1A> # edge ASG 实例子网(私有)
-    - <SUBNET_HOST_1B>
-    - <SUBNET_HOST_1C>
+    - { id: <SUBNET_HOST_1A>, az: <AZ_A> } # edge ASG 实例子网(私有)
+    - { id: <SUBNET_HOST_1B>, az: <AZ_B> }
+    - { id: <SUBNET_HOST_1C>, az: <AZ_C> }
   # ⚠️ edge 段无磁盘容量键:走 AMI 默认根盘。需大根盘要先补 edge.root_volume_gb + LaunchTemplate。
 
 # ========== 调度 — 大规模装箱(SQS Dispatch) ==========

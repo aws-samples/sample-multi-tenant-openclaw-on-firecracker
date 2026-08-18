@@ -35,7 +35,7 @@ Builder）产出**同一份镜像内容**。两套实现并存，不是二选一
 |---|---|---|
 | #440 | `gpg --batch --yes` 使 keyring 覆盖操作幂等 | HCL 中遗漏 `--yes` → 构建阶段弹出确认提示并阻塞 |
 | #451 | marker 移至 §7 scrub **之后** | 顺序写反 → scrub 失败的镜像仍标记为构建完成 |
-| #435 | Firecracker 二进制改为从自有 S3 获取 | HCL 中仍指向 GitHub → 违反"零 github 请求"验收 |
+| #435 | **尚未落地**（#435 未落地）：`provision-host.sh:132` 目前无条件从 github.com 拉 Firecracker + jailer，仓库里没有任何 S3 取件路径 | 该 issue 落地时若只改 HCL 不改脚本 → 仍走 GitHub，"零 github 请求"验收不成立 |
 
 一致性优先于可读性。如需了解安装内容，阅读 `provision-host.sh` 的 8 节小节标题。
 
@@ -56,24 +56,36 @@ AWSTOE YAML、`packer validate` 可在提交前校验配置。
 ## 使用方式
 
 ```bash
-packer init deploy/packer
-packer fmt deploy/packer
+packer init "$PWD/deploy/packer"
+packer fmt  "$PWD/deploy/packer"
 
 # validate 阶段会实际读取 SSM 解析 parent AMI，因此同时验证了
 # 执行者具备 ssm:GetParameter 权限且 Canonical 的指针路径存在
-packer validate -var-file=deploy/packer/apse1.pkrvars.hcl deploy/packer
+packer validate -var-file="$PWD/deploy/packer/apse1.pkrvars.hcl" "$PWD/deploy/packer"
 
 # 执行构建（实测约 14 分钟，创建一台一次性 c7g.large）
-packer build -var-file=deploy/packer/apse1.pkrvars.hcl deploy/packer
+packer build -var-file="$PWD/deploy/packer/apse1.pkrvars.hcl" "$PWD/deploy/packer"
 ```
+
+**模板目录必须传绝对路径。** 传相对路径（`deploy/packer`）时 `validate` 和 `build` 都会直接失败：
+
+    Call to function "file" failed: no file exists at
+    deploy/packer/deploy/userdata/provision-host.sh
+
+`file()` 把**已经归一化过的**相对路径再按模板目录拼一次 —— `${path.root}/../userdata/…`
+先归一成 `deploy/userdata/…`，又被前缀成 `deploy/packer/deploy/userdata/…`。
+传绝对目录后 `path.root` 是绝对路径，不再二次拼接。
 
 ### 生产构建的两个必填参数
 
 `apse1.pkrvars.hcl` 中以下两项留空仅适用于 `packer validate`：
 
-- **`iam_instance_profile`** — 构建实例需读取 `assets_bucket` 的
-  `deployment/binaries/firecracker/` 前缀（#435）。未指定角色时
-  `provision-host.sh` 无法获取制品，构建将在第 3 步失败（脚本有意未实现公网回落）。
+- **`iam_instance_profile`** — **当前对 Firecracker 取件不是必填**（#435 未落地）。
+  本节此前写的是"未指定角色时 `provision-host.sh` 无法获取制品，构建将在第 3 步失败
+  （脚本有意未实现公网回落）" —— **实跑否证**：留空构建于 `us-west-2` 退出 0，第 3 步打出
+  `[oc:provision] firecracker v1.15.1 installed`，来源是 github.com。
+  `deployment/binaries/firecracker/` 前缀与对应 IAM 授权要等 #435 落地后才有人读；
+  在那之前给这个角色不会改变镜像内容。
 - **`ssm_parameter`** — 未指定时仅产出 AMI 而不发布指针，`ha_edge.py:661` 的
   `resolve_ssm_parameter_at_launch` 无法读取到新镜像。首次构建建议留空，确认镜像无
   问题后再发布。

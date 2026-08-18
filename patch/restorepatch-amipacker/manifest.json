@@ -73,8 +73,11 @@
     ]
   },
   "kit_files": {
+    "lib/__pycache__/apply-api-routes.cpython-314.pyc": {
+      "sha256": "430cad5d794a94d8ce3cb13dc0c6ffa7f34ac871ade94dbfc36518ca2d640f12"
+    },
     "lib/apply-api-routes.py": {
-      "sha256": "40e8c5dee998f3543f3dfa41378448a3608080803ab9f96a792be23136092e42"
+      "sha256": "cafe3482c3de3cf802e0b1b2edf642afbb16bfe0bbd6a13e597a314024c10651"
     },
     "lib/apply-api-routes.sh": {
       "sha256": "d2e782d53feb2eeac23118ee3f27854508a1e98342ae9a58eae4d92169194d8b"
@@ -86,7 +89,7 @@
       "sha256": "2e5ff01c20bb50d11c7b3a51142857f2b2777a834a4b879f4f8bb6db5ae7b146"
     },
     "lib/autopatch.sh": {
-      "sha256": "b2ae06e1b5ae22375a4fb713cd0bad1bf1ebf7b0b940529f61c5a0eab4e04b19"
+      "sha256": "0dd3fee608f4d07724770d79bdba497930c1c0ac1ccc84cbb496ab17ec44f6ae"
     },
     "lib/discover-env.sh": {
       "sha256": "ed2a393611617864ce55fa3ad6b7db68cb03634c4fc3682b586cbe4a04317592"

@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Any
@@ -312,6 +313,56 @@ class Gateway:
             return json.loads(result.stdout)
         except json.JSONDecodeError as exc:
             fail(f"aws apigateway {action} returned invalid JSON: {exc}")
+
+    def deployed_operations(self) -> dict[str, dict[str, dict[str, Any]]]:
+        """Path -> METHOD -> the operation the stage's ACTIVE deployment actually serves.
+
+        A Resource/Method exists on the REST API the moment it is created, but a stage serves the
+        snapshot its deployment captured. So the resource tree alone cannot answer "is this route
+        live" -- an operator can create every method and still serve 403/404 until a deployment
+        happens, and a state file that finalize deleted cannot answer it either. `get-export` is
+        stage-scoped, so it reads exactly what the active deployment serves.
+
+        Exported WITH `extensions=integrations`, so the answer is not just the method NAMES: it
+        carries the deployed `security` (api-key requirement), the integration type/uri, and the
+        CORS response parameters. Comparing only names would let a newer deployment serve the right
+        verbs with the wrong auth or integration and still pass.
+        """
+        with tempfile.TemporaryDirectory(prefix="oc-oas-") as tmp:
+            out = Path(tmp) / "stage.oas.json"
+            result = subprocess.run(
+                [
+                    "aws", "apigateway", "get-export",
+                    "--rest-api-id", self.api,
+                    "--stage-name", self.stage,
+                    "--export-type", "oas30",
+                    "--parameters", "extensions=integrations",
+                    "--region", self.region,
+                    str(out),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                fail(
+                    "aws apigateway get-export failed (cannot prove what the active deployment "
+                    f"serves): {result.stderr.strip() or result.stdout.strip()}"
+                )
+            try:
+                document = json.loads(out.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                fail(f"stage export is not readable JSON: {exc}")
+        served: dict[str, dict[str, dict[str, Any]]] = {}
+        for path_value, operations in (document.get("paths") or {}).items():
+            if not isinstance(path_value, str) or not isinstance(operations, dict):
+                continue
+            served[path_value] = {
+                method.upper(): operation
+                for method, operation in operations.items()
+                if isinstance(method, str) and isinstance(operation, dict)
+            }
+        return served
 
     def resources(self) -> list[dict[str, Any]]:
         result = self.call("get-resources", "--limit", "500")
@@ -999,6 +1050,484 @@ def verify_route_resources(
             print(f"PASS: OPTIONS {route['path']} exact CORS headers")
 
 
+def _deployed_auth(operation: dict[str, Any]) -> bool:
+    """Does the deployed operation require an API key? Mirrors ApiKeyRequired."""
+    for requirement in operation.get("security") or []:
+        if isinstance(requirement, dict) and "api_key" in requirement:
+            return True
+    return False
+
+
+def _deployed_authorizers(operation: dict[str, Any]) -> list[str]:
+    """Security scheme names the deployed operation requires beyond the plain API key.
+
+    A stage export represents an authorizer as an extra security requirement (and an
+    `x-amazon-apigateway-authorizer` scheme). Ignoring them would let a deployment that puts a
+    Cognito/IAM/Lambda authorizer in front of these routes pass as equivalent to the template.
+    """
+    names: list[str] = []
+    for requirement in operation.get("security") or []:
+        if not isinstance(requirement, dict):
+            continue
+        names.extend(name for name in requirement if name != "api_key")
+    auth = operation.get("x-amazon-apigateway-auth")
+    if isinstance(auth, dict):
+        # AWS documents `type: NONE` as a valid explicit value, so presence alone is not an
+        # authorizer -- compare the type.
+        if str(auth.get("type", "")).upper() not in {"", "NONE"}:
+            names.append(f"x-amazon-apigateway-auth:{auth.get('type')}")
+    elif auth:
+        names.append("x-amazon-apigateway-auth")
+    return sorted(set(names))
+
+
+# `responses` is the integration response mapping; the CORS preflight comparison handles it
+# explicitly (status codes and the Access-Control-Allow-* values), so it is excluded from the
+# generic field diff rather than compared twice in a shape the two sides express differently.
+# `responseTransferMode` is deliberately NOT excluded: both `get-integration` and the stage
+# export report it, and BUFFERED vs STREAM is a materially different runtime behaviour.
+_EXPORT_ONLY_INTEGRATION_FIELDS = frozenset({"responses"})
+def _integration_view(integration: dict[str, Any] | None) -> dict[str, Any]:
+    """Normalize an integration for comparison, whichever side it came from.
+
+    The export lower-cases `type` and `passthroughBehavior` (`aws_proxy`, `when_no_match`) where the
+    REST API reports them upper-case, and upper-cases nothing else, so those enums are folded.
+    Export-only annotations are dropped because neither side can agree on them.
+    """
+    view = {
+        key: value
+        for key, value in (integration or {}).items()
+        if key not in _EXPORT_ONLY_INTEGRATION_FIELDS
+    }
+    if "type" in view:
+        view["type"] = str(view["type"]).lower()
+    if "passthroughBehavior" in view:
+        view["passthroughBehavior"] = str(view["passthroughBehavior"]).lower()
+    if "httpMethod" in view:
+        view["httpMethod"] = str(view["httpMethod"]).upper()
+    # cacheKeyParameters is semantically a set; the two sources may order it differently, so
+    # ordering alone must not read as a difference.
+    if isinstance(view.get("cacheKeyParameters"), list):
+        view["cacheKeyParameters"] = sorted(view["cacheKeyParameters"])
+    return view
+
+
+def _deployed_integration(operation: dict[str, Any]) -> dict[str, Any]:
+    return _integration_view(operation.get("x-amazon-apigateway-integration"))
+
+
+def _desired_integration(bundle: dict[str, Any]) -> dict[str, Any]:
+    return _integration_view((bundle or {}).get("integration"))
+
+
+def _integration_differences(deployed: dict[str, Any], desired: dict[str, Any]) -> list[str]:
+    """Field names where the ACTIVE deployment's integration disagrees with the template.
+
+    Compares every field BOTH sides carry -- so a whitelist cannot leave a field unchecked -- and
+    additionally flags a sensitive field the deployment carries but the template does not. Fields
+    only the template has are not compared, because a stage export legitimately omits optional
+    settings and requiring them would false-fail every time.
+    """
+    # An operation the export reports with NO integration at all yields an empty view; comparing
+    # only common fields would then find nothing and accept it. Treat presence mismatch first.
+    if bool(deployed) != bool(desired):
+        return [
+            "integration absent from the active deployment"
+            if desired
+            else "integration present on the active deployment but not in the template"
+        ]
+    differing = [
+        field
+        for field in sorted(set(deployed) & set(desired))
+        if deployed[field] != desired[field]
+    ]
+    # Any field the DEPLOYED integration carries that the template does not is extra behaviour the
+    # template never asked for (a request-parameter mapping, credentials, a VPC link, ...). Flag all
+    # of them, not just a sensitive subset: a whitelist is exactly what let deployed-only settings
+    # through. Empty/false values are ignored because they carry no behaviour, and export-only
+    # annotations were already dropped by _integration_view.
+    differing.extend(
+        f"{field} (present only on the deployed integration)"
+        for field in sorted(set(deployed) - set(desired))
+        if deployed.get(field)
+    )
+    return differing
+
+
+def _cors_response_list(
+    responses: dict[str, Any] | None, *, key_is_selector: bool
+) -> list[str]:
+    """One canonical entry per integration response: (selector, statusCode, ACAO headers).
+
+    A LIST, not a dict keyed by status: keying by statusCode silently overwrites a duplicate status,
+    so a preflight mapping the same status twice with different headers compared equal.
+
+    The SELECTOR differs by source and must be read from the right place:
+      * in the OpenAPI export, `x-amazon-apigateway-integration.responses` is keyed BY the selection
+        pattern (`default`, or a regex) -- so the key is the selector;
+      * in this kit's desired bundle, `integrationResponses` is keyed by status and an explicit
+        `selectionPattern` is optional, defaulting to `default`.
+    Reading `.selectionPattern` off the export (which never carries it there) discarded the selector
+    entirely, so swapping `default` for a narrow regex compared equal.
+    """
+    entries: list[str] = []
+    for key, response in (responses or {}).items():
+        if not isinstance(response, dict):
+            continue
+        selector = key if key_is_selector else (response.get("selectionPattern") or "default")
+        # Compare the WHOLE response, not only the Access-Control-Allow-* values: a response
+        # template, contentHandling, or any other field on the deployed preflight is behaviour the
+        # spec never asked for. `responseParameters` header names are reduced to the header itself
+        # so the two sources' `method.response.header.` prefixes do not read as a difference, and
+        # empty/None fields are dropped so `{}` on one side and absent on the other are equal.
+        body = {
+            field: value
+            for field, value in response.items()
+            if field not in ("selectionPattern", "responseParameters", "statusCode") and value
+        }
+        headers = {
+            name.rsplit(".", 1)[-1]: value
+            for name, value in (response.get("responseParameters") or {}).items()
+        }
+        entries.append(
+            canonical(
+                {
+                    "selector": str(selector),
+                    "statusCode": str(response.get("statusCode")),
+                    "responseParameters": headers,
+                    "rest": body,
+                }
+            )
+        )
+    return sorted(entries)
+
+
+def _deployed_cors_responses(operation: dict[str, Any]) -> list[str]:
+    integration = operation.get("x-amazon-apigateway-integration") or {}
+    return _cors_response_list(integration.get("responses"), key_is_selector=True)
+
+
+def _desired_cors_responses(bundle: dict[str, Any]) -> list[str]:
+    integration = (bundle or {}).get("integration") or {}
+    return _cors_response_list(
+        integration.get("integrationResponses"), key_is_selector=False
+    )
+
+
+
+
+def _absolute_request_differences(
+    operation: dict[str, Any], template_bundle: dict[str, Any] | None
+) -> list[str]:
+    """Compare a deployed operation against the APPLY-TIME template bundle, not the deployed one.
+
+    The clone-vs-deployed-template comparison is RELATIVE: if the deployed template method and the
+    new routes drifted together (both carrying the same request validator, say), they still match
+    each other and the check passes. The bundle this kit captured at apply time is the absolute
+    reference, so the request-gating parts are compared against it as well.
+
+    Only gating properties are compared, because the two shapes differ: the bundle is
+    `get-method`-shaped (`method.requestValidatorId`, `method.requestParameters`) while the export is
+    OpenAPI-shaped (`x-amazon-apigateway-request-validator`, `parameters`).
+    """
+    problems: list[str] = []
+    method = (template_bundle or {}).get("method") or {}
+    if not method:
+        return problems
+    wants_validator = bool(method.get("requestValidatorId"))
+    has_validator = bool(operation.get("x-amazon-apigateway-request-validator"))
+    if wants_validator != has_validator:
+        problems.append(
+            "request-validator presence differs from the apply-time template "
+            f"(deployed={has_validator} template={wants_validator})"
+        )
+    # Compare LOCATION-QUALIFIED names ("header:X-Tenant", "query:X-Tenant"), not bare names: a
+    # required header replaced by a same-named query parameter is a different contract, and bare
+    # names made the two indistinguishable.
+    #
+    # `method.request.path.*` is excluded on BOTH sides. Path parameters follow from the path
+    # template, not from this spec, and the deployed side already excludes `in: path` -- including
+    # them on the template side alone false-failed every target operation whenever the template
+    # method had a required path parameter.
+    location_of = {"header": "header", "querystring": "query"}
+    # Split only the fixed `method.request.<location>.` prefix: API Gateway allows a parameter name
+    # to contain periods (e.g. `method.request.header.X.Tenant`), so splitting on every period and
+    # keeping one segment truncated the name and made distinct parameters compare equal.
+    wanted = sorted(
+        f"{location_of[parts[2]]}:{parts[3]}"
+        for parts, required in (
+            (name.split(".", 3), required)
+            for name, required in (method.get("requestParameters") or {}).items()
+        )
+        if required and len(parts) == 4 and parts[0] == "method" and parts[1] == "request"
+        and parts[2] in location_of
+    )
+    deployed_location = {"header": "header", "query": "query"}
+    got = sorted(
+        f"{deployed_location[str(parameter.get('in'))]}:{parameter.get('name')}"
+        for parameter in (operation.get("parameters") or [])
+        if isinstance(parameter, dict)
+        and str(parameter.get("in")) in deployed_location
+        and parameter.get("required")
+    )
+    if wanted != got:
+        problems.append(
+            "required header/query request parameters differ from the apply-time template "
+            f"(deployed={got} template={wanted})"
+        )
+    return problems
+
+
+def _request_contract(operation: dict[str, Any]) -> str:
+    """The request contract a deployed operation enforces, ignoring path parameters.
+
+    Path parameters legitimately differ between the template method and a new route (different path
+    templates), so they are excluded; a header/query parameter, a request body, or a model is NOT
+    allowed to differ, because that would make the new route stricter or looser than the template it
+    claims to clone.
+    """
+    parameters = sorted(
+        canonical(
+            {
+                key: value
+                for key, value in parameter.items()
+                # `in` is kept, so a required header swapped for a same-named query parameter is a
+                # different contract rather than an identical one.
+                if key in ("name", "in", "required", "schema")
+            }
+        )
+        for parameter in (operation.get("parameters") or [])
+        if isinstance(parameter, dict) and parameter.get("in") != "path"
+    )
+    return canonical(
+        {
+            "parameters": parameters,
+            "requestBody": operation.get("requestBody"),
+            "security": operation.get("security"),
+            # A request validator rejects calls before they reach the integration, so it is part of
+            # the contract the route claims to clone.
+            "requestValidator": operation.get("x-amazon-apigateway-request-validator"),
+            # The response contract is part of what a caller sees, so a new route that declares
+            # different responses than the template it clones is a difference too.
+            "responses": operation.get("responses"),
+        }
+    )
+
+
+def unserved_routes(
+    gateway: Gateway, spec: dict[str, Any], template: dict[str, Any] | None = None
+) -> list[str]:
+    """What the stage's ACTIVE deployment gets wrong about this spec. Empty list == correct.
+
+    Checks required PRESENCE (additive/modified routes) and required ABSENCE (a deleted route, a
+    deleted method, and the source path of a rename). Absence matters: a destructive spec whose
+    delete was never deployed would otherwise "verify" while the stage still serves the old route.
+
+    When the apply-time template bundle is supplied, also compares the DEPLOYED configuration --
+    api-key requirement and integration type/uri -- not just the method name, so a newer deployment
+    serving the right verbs with the wrong auth or integration is caught.
+    """
+    served = gateway.deployed_operations()
+    # The template method AS DEPLOYED is the reference the spec says these routes clone. Comparing
+    # against it (rather than only the live REST API bundle) catches a deployment whose new routes
+    # enforce a different request contract than the template.
+    template_target = (spec.get("template") or {}) if isinstance(spec, dict) else {}
+    template_operation = served.get(str(template_target.get("path")), {}).get(
+        str(template_target.get("method", "")).upper()
+    )
+    problems: list[str] = []
+    for route in spec["routes"]:
+        path_value = route["path"]
+        change = route["resource_change"]
+        operations = served.get(path_value, {})
+
+        if change == "D":
+            still = sorted(operations)
+            if still:
+                problems.append(
+                    f"{path_value} (deleted route STILL served: {', '.join(still)})"
+                )
+            continue
+
+        if change == "M" and route.get("source_path"):
+            stale = sorted(served.get(route["source_path"], {}))
+            if stale:
+                problems.append(
+                    f"{route['source_path']} (renamed source STILL served: {', '.join(stale)})"
+                )
+
+        required = {
+            method["method"].upper()
+            for method in route["methods"]
+            if method["change"] != "D"
+        }
+        removed = {
+            method["method"].upper()
+            for method in route["methods"]
+            if method["change"] == "D"
+        }
+        cors_change = route.get("cors", {}).get("change")
+        if cors_change in {"A", "M"}:
+            required.add("OPTIONS")
+        elif cors_change == "D":
+            removed.add("OPTIONS")
+
+        absent = sorted(required - set(operations))
+        if absent:
+            problems.append(f"{path_value} (not served: {', '.join(absent)})")
+        if change == "A":
+            # The kit created this resource, so the active deployment must serve exactly what the
+            # spec declared. An extra method here is a route nobody asked for, reachable by callers.
+            extra = sorted(set(operations) - required)
+            if extra:
+                problems.append(
+                    f"{path_value} (active deployment serves undeclared method(s): "
+                    f"{', '.join(extra)})"
+                )
+        lingering = sorted(removed & set(operations))
+        if lingering:
+            problems.append(
+                f"{path_value} (deleted method STILL served: {', '.join(lingering)})"
+            )
+
+        if template is None:
+            continue
+        for method in route["methods"]:
+            name = method["method"].upper()
+            if method["change"] == "D" or name not in operations:
+                continue
+            desired = desired_method_bundle(template, name)
+            want_key = bool((desired.get("method") or {}).get("apiKeyRequired"))
+            if _deployed_auth(operations[name]) != want_key:
+                problems.append(
+                    f"{path_value} {name} (deployed api-key requirement differs from template)"
+                )
+            # An authorizer in front of these routes is a behaviour change the template does not
+            # ask for. The template method is authorizationType NONE + api key; anything else the
+            # export reports is flagged rather than ignored.
+            extra_auth = _deployed_authorizers(operations[name])
+            wants_none = str((desired.get("method") or {}).get("authorizationType", "")).upper() in {
+                "",
+                "NONE",
+            }
+            if extra_auth and wants_none:
+                problems.append(
+                    f"{path_value} {name} (deployed operation requires unexpected authorizer(s): "
+                    f"{', '.join(extra_auth)})"
+                )
+            elif not wants_none and not extra_auth:
+                problems.append(
+                    f"{path_value} {name} (template requires an authorizer but the deployed "
+                    "operation has none)"
+                )
+            if template_operation is None:
+                # Without the template operation in the SAME export there is nothing to clone
+                # against, so the clone claim is unprovable. Fail closed rather than skip.
+                problems.append(
+                    f"{path_value} {name} (the spec's template method "
+                    f"{template_target.get('method')} {template_target.get('path')} is not served "
+                    "by the active deployment, so the request contract cannot be proven)"
+                )
+            elif _request_contract(operations[name]) != _request_contract(template_operation):
+                problems.append(
+                    f"{path_value} {name} (deployed request contract differs from the template "
+                    "method's: header/query parameters, request body, security, or responses)"
+                )
+            # Absolute check: coordinated drift of BOTH the deployed template and its clones would
+            # satisfy the relative comparison above, so also compare against the bundle captured at
+            # apply time.
+            for issue in _absolute_request_differences(operations[name], template):
+                problems.append(f"{path_value} {name} ({issue})")
+            differing = _integration_differences(
+                _deployed_integration(operations[name]), _desired_integration(desired)
+            )
+            if differing:
+                problems.append(
+                    f"{path_value} {name} (deployed integration differs from template: "
+                    f"{', '.join(differing)})"
+                )
+        if cors_change in {"A", "M"} and "OPTIONS" in operations:
+            deployed_options = operations["OPTIONS"]
+            expected = desired_cors_bundle(route["cors"])
+            if _deployed_auth(deployed_options):
+                problems.append(f"{path_value} OPTIONS (deployed preflight requires an api key)")
+            if _deployed_authorizers(deployed_options):
+                problems.append(
+                    f"{path_value} OPTIONS (deployed preflight requires an authorizer)"
+                )
+            preflight_differences = _integration_differences(
+                _deployed_integration(deployed_options), _desired_integration(expected)
+            )
+            if preflight_differences:
+                problems.append(
+                    f"{path_value} OPTIONS (deployed preflight integration differs from spec: "
+                    f"{', '.join(preflight_differences)})"
+                )
+            # The spec's preflight declares no request parameters, no request body and no request
+            # validator. A deployed preflight that adds any of them can REJECT the browser's
+            # preflight, so require them to be absent.
+            preflight_params = [
+                parameter
+                for parameter in (deployed_options.get("parameters") or [])
+                if isinstance(parameter, dict) and parameter.get("in") != "path"
+            ]
+            if preflight_params:
+                problems.append(
+                    f"{path_value} OPTIONS (deployed preflight requires undeclared request "
+                    f"parameter(s): {sorted(str(item.get('name')) for item in preflight_params)})"
+                )
+            if deployed_options.get("requestBody"):
+                problems.append(
+                    f"{path_value} OPTIONS (deployed preflight declares an undeclared request body)"
+                )
+            if deployed_options.get("x-amazon-apigateway-request-validator"):
+                problems.append(
+                    f"{path_value} OPTIONS (deployed preflight has an undeclared request validator)"
+                )
+            # The preflight's METHOD response contract (which statuses it declares, which headers
+            # each may return, and any response content/model) is what a browser actually sees
+            # alongside the integration mapping. `description` is AWS-generated boilerplate and
+            # empty `content` is the no-model case, so both are normalized away.
+            def _method_response_view(body: Any) -> dict[str, Any]:
+                body = body or {}
+                view: dict[str, Any] = {"headers": sorted(body.get("headers") or {})}
+                content = body.get("content") or {}
+                if content:
+                    view["content"] = content
+                return view
+
+            deployed_method_responses = {
+                str(status): _method_response_view(body)
+                for status, body in (deployed_options.get("responses") or {}).items()
+            }
+            expected_method_responses = {
+                str((body or {}).get("statusCode")): {
+                    "headers": sorted(
+                        name.rsplit(".", 1)[-1]
+                        for name in ((body or {}).get("responseParameters") or {})
+                    )
+                }
+                for body in ((expected.get("method") or {}).get("methodResponses") or {}).values()
+            }
+            if deployed_method_responses != expected_method_responses:
+                problems.append(
+                    f"{path_value} OPTIONS (deployed preflight method responses differ from spec: "
+                    f"deployed={deployed_method_responses} spec={expected_method_responses})"
+                )
+            # Per-status CORS comparison: which status the preflight answers AND the exact
+            # Access-Control-Allow-* values it returns for it.
+            deployed_cors = _deployed_cors_responses(deployed_options)
+            wanted_cors = _desired_cors_responses(expected)
+            if deployed_cors != wanted_cors:
+                only_deployed = [item for item in deployed_cors if item not in wanted_cors]
+                only_wanted = [item for item in wanted_cors if item not in deployed_cors]
+                problems.append(
+                    f"{path_value} OPTIONS (deployed CORS responses differ from spec; "
+                    f"deployed-only={only_deployed or '[]'} spec-only={only_wanted or '[]'})"
+                )
+    return problems
+
+
 def routes_already_satisfied(gateway: Gateway, spec: dict[str, Any]) -> bool:
     """Read-only: is every declared route already present in its exact desired end state?
 
@@ -1037,7 +1566,27 @@ def routes_already_satisfied(gateway: Gateway, spec: dict[str, Any]) -> bool:
             desired_cors_bundle(route["cors"])
         ):
             return False
+    # The resource tree matching is not enough: the stage serves its deployment's snapshot, so a
+    # correct-looking tree can still be unserved, or served with the wrong auth/integration.
+    # Require the ACTIVE deployment to carry them, configuration included.
+    if unserved_routes(gateway, spec, template):
+        return False
     return True
+
+
+def assert_routes_served(
+    gateway: Gateway, spec: dict[str, Any], template: dict[str, Any] | None = None
+) -> None:
+    missing = unserved_routes(gateway, spec, template)
+    if missing:
+        fail(
+            "the stage's ACTIVE deployment does not serve: "
+            + "; ".join(missing)
+            + " -- create a deployment for this stage, then re-verify"
+        )
+    print(
+        f"PASS: stage {gateway.stage!r} active deployment serves every declared route"
+    )
 
 
 def verify_routes(
@@ -1047,16 +1596,71 @@ def verify_routes(
     state: dict[str, Any],
 ) -> None:
     verify_route_resources(gateway, spec, template)
+    if state.get("deployment_deferred"):
+        # This run deliberately did not create a deployment: the caller's own apply-api owns the
+        # single deployment for this stage (one transaction, one repoint). So the binding to prove
+        # is not "the stage uses MY deployment" but "whatever deployment the stage uses serves
+        # these routes" -- which is the stronger statement anyway.
+        print(
+            f"NOTE: deployment deferred to the caller; asserting the stage's active "
+            f"deployment serves the routes instead of a deployment id"
+        )
+        assert_routes_served(gateway, spec, template)
+        return
     expected_deployment = state.get("new_deployment")
     current_deployment = gateway.stage_deployment()
-    if not expected_deployment or current_deployment != expected_deployment:
-        fail(f"stage deployment={current_deployment} expected={expected_deployment}")
-    print(f"PASS: stage {gateway.stage!r} uses deployment {current_deployment}")
+    if not expected_deployment:
+        fail("state records no deployment for this apply")
+    if current_deployment == expected_deployment:
+        print(f"PASS: stage {gateway.stage!r} uses deployment {current_deployment}")
+    else:
+        # A later deployment superseded ours. That is normal (an operator redeployed, or another
+        # tool in the same rollout owns the stage) and it is NOT a failure by itself -- what must
+        # hold is that whatever the stage serves still carries these routes. Requiring id equality
+        # made a second verify of an already-correct environment fail, which is not idempotent.
+        print(
+            f"NOTE: stage {gateway.stage!r} now uses deployment {current_deployment}, not the "
+            f"{expected_deployment} this run created; asserting the routes are still served"
+        )
+    assert_routes_served(gateway, spec, template)
 
 
-def finalize_routes(gateway: Gateway, state: dict[str, Any], state_file: Path) -> None:
+def finalize_routes(
+    gateway: Gateway,
+    state: dict[str, Any],
+    state_file: Path,
+    spec: dict[str, Any] | None = None,
+) -> None:
     if state.get("rolled_back"):
         fail("cannot finalize a rolled-back route apply")
+    if state.get("deployment_deferred"):
+        # This run created no deployment, so it has no replaced deployment to release. The caller
+        # that owns the single deployment finalizes it. Still prove the routes are served before
+        # dropping the state, so finalize can never be the step that hides an unserved route.
+        verify_route_resources(
+            gateway,
+            {
+                "routes": [item["route"] for item in state["routes"]],
+                "template": (spec or {}).get("template"),
+            },
+            state["template"],
+        )
+        assert_routes_served(
+            gateway,
+            {
+                "routes": [item["route"] for item in state["routes"]],
+                "template": (spec or {}).get("template"),
+            },
+            state["template"],
+        )
+        state["finalized"] = True
+        write_state(state_file, state)
+        state_file.unlink()
+        print(
+            "PASS: nothing to finalize (deployment was deferred to the caller); "
+            "routes verified as served"
+        )
+        return
     deployment = state.get("new_deployment")
     previous = state.get("previous_deployment")
     if (
@@ -1067,11 +1671,29 @@ def finalize_routes(gateway: Gateway, state: dict[str, Any], state_file: Path) -
         or deployment == previous
     ):
         fail("state has no distinct previous/new deployment to finalize")
-    verify_routes(
+    # Finalize's job is to release the REPLACED deployment. Deleting the one the stage is actually
+    # using would break the stage, so that is the hard refusal; a stage that has since moved to a
+    # newer deployment is fine as long as the routes are still served.
+    if gateway.stage_deployment() == previous:
+        fail(
+            f"stage {gateway.stage!r} still uses {previous}, the deployment finalize would "
+            "delete; re-point the stage first"
+        )
+    verify_route_resources(
         gateway,
-        {"routes": [item["route"] for item in state["routes"]]},
+        {
+                "routes": [item["route"] for item in state["routes"]],
+                "template": (spec or {}).get("template"),
+            },
         state["template"],
-        state,
+    )
+    assert_routes_served(
+        gateway,
+        {
+                "routes": [item["route"] for item in state["routes"]],
+                "template": (spec or {}).get("template"),
+            },
+        state["template"],
     )
 
     state["finalize_pending"] = True
@@ -1149,6 +1771,7 @@ def rollback_routes(gateway: Gateway, state: dict[str, Any], state_file: Path) -
         state["deployment_pending"] = False
         persist()
     if state.get("routes_applied") and not state.get("rollback_started"):
+        # rollback has no spec in scope; verify_route_resources needs only the routes.
         verify_route_resources(
             gateway,
             {"routes": [item["route"] for item in state["routes"]]},
@@ -1404,21 +2027,43 @@ def main() -> None:
     verify_target_binding(spec["target"], api, stage, region)
     gateway = Gateway(api, stage, region)
     state_file = state_path(api, stage)
+    # Single deployment transaction: when the restorepatch driver's apply-api is going to create
+    # the one deployment for this stage, this tool must NOT create a competing one.
+    defer_deployment = os.environ.get("OC_ROUTE_DEFER_DEPLOYMENT") == "1"
 
     if command == "plan":
         template, snapshots = preflight(gateway, spec)
         print_plan(gateway, spec, template, snapshots)
         return
     if command == "apply":
-        # Idempotent no-op: if the routes are already in their exact desired end state and no
-        # apply is mid-flight, a re-run (or an environment already carrying them from an earlier
-        # revision) converges without touching AWS. Drift still falls through to preflight, which
-        # fails loud rather than silently overwriting.
-        if not state_file.exists() and routes_already_satisfied(gateway, spec):
-            print("ALREADY: declared routes already present in their exact desired state")
-            return
+        # Idempotent no-op: if the routes are already in their exact desired end state AND served
+        # by the stage's active deployment, a re-run converges without touching AWS. Drift falls
+        # through to preflight, which fails loud rather than silently overwriting.
+        #
+        # This must hold whether or not a state file survives. A leftover state file means an
+        # earlier run of THIS spec is still awaiting finalize (or was interrupted) -- it does not
+        # mean the routes need applying again, and refusing here is exactly the non-idempotent
+        # behaviour that made a repeat apply fail on an already-correct environment. So report
+        # ALREADY and point at the step that is actually outstanding.
+        # Hold the per-API/stage lease BEFORE the ALREADY decision. Reading live state outside the
+        # lease lets a concurrent finalize or rollback change it between the read and this exit.
         lease = acquire_lease(state_file)
         try:
+            if routes_already_satisfied(gateway, spec):
+                print(
+                    "ALREADY: declared routes already present, and served by the active deployment"
+                )
+                if state_file.exists():
+                    # A surviving state file means an earlier run of THIS spec is awaiting finalize
+                    # (or was interrupted); it does not mean route work is outstanding. Refusing
+                    # here is exactly the non-idempotent behaviour a repeat apply hit. Load it so a
+                    # corrupt/foreign state still fails closed rather than being ignored.
+                    load_state(state_file, api, stage, region, spec_sha)
+                    print(
+                        f"NOTE: an unfinalized apply state remains at {state_file}; "
+                        "run finalize (or rollback) to close it -- no route work is outstanding"
+                    )
+                return
             if state_file.exists():
                 fail(f"state already exists at {state_file}")
             template, snapshots = preflight(gateway, spec)
@@ -1445,6 +2090,19 @@ def main() -> None:
             apply_routes(gateway, spec, template, state, state_file)
             state["routes_applied"] = True
             write_state(state_file, state)
+            if defer_deployment:
+                # Single deployment transaction: the caller (the restorepatch driver's apply-api)
+                # creates ONE deployment for this stage and repoints it once. If this tool also
+                # created one, the stage would end on ours while the caller's verify/finalize
+                # still expected theirs -- a guaranteed failure AFTER the routes were installed.
+                state["deployment_deferred"] = True
+                write_state(state_file, state)
+                print(
+                    "routes applied; deployment deferred to the caller "
+                    "(OC_ROUTE_DEFER_DEPLOYMENT=1). The routes are NOT served until that "
+                    "deployment happens; run verify afterwards."
+                )
+                return
             # Journal the create-deployment intent BEFORE the call: a crash
             # between the call and the id back-fill would otherwise leave an
             # orphan deployment that rollback cannot see (new_deployment stays
@@ -1491,7 +2149,9 @@ def main() -> None:
         # routes are still the thing to prove, so verify their live presence/shape directly.
         if not state_file.exists():
             if routes_already_satisfied(gateway, spec):
-                verify_route_resources(gateway, spec, template_bundle(gateway, spec))
+                live_template = template_bundle(gateway, spec)
+                verify_route_resources(gateway, spec, live_template)
+                assert_routes_served(gateway, spec, live_template)
                 print("PASS: declared routes already present (no pending apply state)")
                 return
             fail(f"apply state is missing and routes are not present: {state_file}")
@@ -1515,7 +2175,7 @@ def main() -> None:
                 f"finalize API {api!r} stage {stage!r} and delete its "
                 "previous deployment"
             )
-            finalize_routes(gateway, state, state_file)
+            finalize_routes(gateway, state, state_file, spec)
             return
         if state.get("finalize_pending"):
             fail(

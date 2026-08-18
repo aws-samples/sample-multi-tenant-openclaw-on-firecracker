@@ -101,6 +101,7 @@ GET /hosts/{instance_id}/pull-image-progress?job_id=<job_id>
 
 | `state` | 是否终态 | 说明 |
 |---|---:|---|
+| `NONE` | 是 | 该 Host 没有任何 pull Job；仅用于 progress 空态，不是持久 Job 状态 |
 | `QUEUED` | 否 | 已受理，等待执行 |
 | `STAGING` | 否 | 正在下载和准备镜像文件 |
 | `VALIDATING` | 否 | 正在校验镜像完整性 |
@@ -372,7 +373,10 @@ Authorization: Bearer <operator-token>
 | `snapshot_time` | 是 | `GET /list_image_versions` 返回的快照标识 |
 | `slot` | 否（见下文） | `live` 或 `canary` |
 
-为兼容旧客户端，缺省 `slot` 暂时等同 `live`。新的集成代码应始终显式传递 `slot`，canary 流程必须传 `slot=canary`。
+缺省或空 `slot` 会在 API 边界规范化为 `live`；Job、异步 payload、响应和 Host
+安装脚本都使用规范化后的值。新的集成代码仍应显式传递 `slot`，避免运维意图不清：
+正式安装用 `slot=live`，候选验证用 `slot=canary`。两者都安装到不可变版本目录并更新
+`slots.json`，不会再因省略参数进入旧扁平布局。
 
 #### "目标版本与当前槽位相同"时的行为矩阵(重要)
 
@@ -424,7 +428,9 @@ pull 成功后，progress 响应的 `result` 提供创建 canary 租户或 promo
 
 常见错误：
 
-- `400 VALIDATION`
+- `400 VALIDATION`：`snapshot_time` 必须放在 query 中，取值来自
+  `GET /list_image_versions`；示例
+  `?snapshot_time=2026-07-24T02%3A15%3A30Z&slot=live`
 - `404 HOST_NOT_FOUND`
 - `404 SNAPSHOT_NOT_FOUND`
 - `409 IMAGE_OPERATION_IN_PROGRESS`
@@ -509,10 +515,26 @@ x-api-key: <api-key>
 }
 ```
 
+无任务空态：
+
+```json
+{
+  "instance_id": "i-0123456789abcdef0",
+  "host_status": "active",
+  "job_id": null,
+  "snapshot_time": null,
+  "state": "NONE",
+  "ProcessingJobStatus": null,
+  "last_status": null,
+  "message": "no pull-image job for this host"
+}
+```
+
 `state` 是新客户端使用的规范字段。`ProcessingJobStatus` 为兼容既有客户端保留，映射如下：
 
 | `state` | `ProcessingJobStatus` |
 |---|---|
+| `NONE` | `null` |
 | `QUEUED` / `STAGING` / `VALIDATING` / `COMMITTING` | `InProgress` |
 | `SUCCEEDED` | `Completed` |
 | `FAILED` / `RECOVERY_REQUIRED` | `Failed` |
@@ -520,7 +542,9 @@ x-api-key: <api-key>
 兼容行为：
 
 - 传入 `job_id`：精确查询该 Host 的指定 pull 任务；任务不存在或不属于该 Host 时返回 `404 JOB_NOT_FOUND`；
-- 未传 `job_id`：返回该 Host 最近一次 pull 任务；如果该 Host 从未执行过 pull，继续返回既有的“无任务”响应；
+- 未传 `job_id`：返回该 Host 最近一次 pull 任务；如果该 Host 从未执行过 pull，返回
+  `state=NONE`、`ProcessingJobStatus=null`，且不回填 Host 当前镜像版本到
+  `snapshot_time`；
 - 新客户端不应依赖“未传 job_id”的行为。
 
 轮询建议：优先使用响应中的 `Retry-After`；未返回时从 5 秒开始，并采用指数退避和抖动。

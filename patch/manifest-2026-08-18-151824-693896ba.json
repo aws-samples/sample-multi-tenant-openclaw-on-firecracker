@@ -1,0 +1,286 @@
+{
+  "synced_at": "2026-08-18 15:18:24 UTC+08:00",
+  "base_sha": "e627dbad0f2e69ec8c63e03e923f57c58ae31c21",
+  "source_commit": "693896bab59f8edf4ab18ee3969c8a15a7487651",
+  "commit_count": 42,
+  "file_count": 27,
+  "summary": "Sync the bb increment e627dbad..693896ba to the public gateway branch. Sync-LOG only (which customer-facing files reached gateway + the issues behind them); the applyable patch kit is NOT built yet (folded_into pending).",
+  "issues_synced_note": "Index back to the issue tracker for whoever builds the patch kit: before assembling the kit, walk each issue and confirm it's covered. `title` is a ≤20-char gist only — open the issue for the full problem/fix/test. Lists only issues that touched a released file this sync.",
+  "issues_synced": [
+    {
+      "id": "#265",
+      "type": "fix",
+      "title": "observability/script…"
+    },
+    {
+      "id": "#441",
+      "type": "fix",
+      "title": "fix"
+    },
+    {
+      "id": "#475",
+      "type": "fix",
+      "title": "抢输槽位号不再被当成「这台满了」"
+    },
+    {
+      "id": "#479",
+      "type": "feat",
+      "title": "#479 B8 用 400 拒绝收紧已交…"
+    },
+    {
+      "id": "#497",
+      "type": "fix",
+      "title": "edge 路由 L2 缓存在 Redis…"
+    },
+    {
+      "id": "#499",
+      "type": "fix",
+      "title": "增量部署最新 bb 到在役环境的 4 个…"
+    },
+    {
+      "id": "#517",
+      "type": "fix",
+      "title": "workspace 核心身份 md"
+    },
+    {
+      "id": "#519",
+      "type": "feat",
+      "title": "#479 B8 用 400 拒绝收紧已交…"
+    },
+    {
+      "id": "#520",
+      "type": "feat",
+      "title": "restorepatch 客户应用全过程…"
+    },
+    {
+      "id": "#524",
+      "type": "fix",
+      "title": "align pull-image slo…"
+    }
+  ],
+  "needs_config_on_apply": [
+    {
+      "file": "config.yml.example",
+      "param": "internal",
+      "change": "changed",
+      "value": "false           # true=internal ALB(纯私有,不对公网);false=面向公网"
+    },
+    {
+      "file": "config.yml.example",
+      "param": "subnet_ids",
+      "change": "changed",
+      "value": "[]"
+    }
+  ],
+  "updated_files": {
+    "cdk-stack (cdk deploy OR hand-apply)": [
+      {
+        "path": "deploy/stacks/ha_edge.py",
+        "status": "modified",
+        "issues": [
+          "#499"
+        ]
+      },
+      {
+        "path": "deploy/stacks/tenant_query_rollout.py",
+        "status": "modified",
+        "issues": [
+          "#499"
+        ]
+      }
+    ],
+    "console (static assets, S3 sync)": [
+      {
+        "path": "deploy/console-bff/logs-crosstenant.test.mjs",
+        "status": "modified",
+        "issues": [
+          "#265"
+        ]
+      },
+      {
+        "path": "deploy/console-bff/logs.mjs",
+        "status": "modified",
+        "issues": [
+          "#265"
+        ]
+      },
+      {
+        "path": "deploy/console-bff/web/index.html",
+        "status": "modified",
+        "issues": [
+          "#524"
+        ]
+      },
+      {
+        "path": "deploy/console-bff/web/js/app.hosts.js",
+        "status": "modified",
+        "issues": [
+          "#524"
+        ]
+      }
+    ],
+    "docs": [
+      {
+        "path": "docs/api/pull-image-api.md",
+        "status": "modified",
+        "issues": [
+          "#524"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/openapi.yaml",
+        "status": "modified",
+        "issues": [
+          "#524"
+        ]
+      }
+    ],
+    "edge (OpenResty / Fluent Bit host config)": [
+      {
+        "path": "deploy/edge/.luacheckrc",
+        "status": "modified",
+        "issues": [
+          "#265"
+        ]
+      },
+      {
+        "path": "deploy/edge/fluent-bit/edge/add_timestamp.lua",
+        "status": "added",
+        "issues": [
+          "#265"
+        ]
+      },
+      {
+        "path": "deploy/edge/fluent-bit/edge/fluent-bit.conf",
+        "status": "modified",
+        "issues": [
+          "#265"
+        ]
+      },
+      {
+        "path": "deploy/edge/fluent-bit/host/add_timestamp.lua",
+        "status": "added",
+        "issues": [
+          "#265"
+        ]
+      },
+      {
+        "path": "deploy/edge/fluent-bit/host/fluent-bit.conf",
+        "status": "modified",
+        "issues": [
+          "#265"
+        ]
+      },
+      {
+        "path": "deploy/edge/fluent-bit/install-fluent-bit.sh",
+        "status": "modified",
+        "issues": [
+          "#265"
+        ]
+      },
+      {
+        "path": "deploy/edge/lib/backend.lua",
+        "status": "modified",
+        "issues": [
+          "#497"
+        ]
+      },
+      {
+        "path": "deploy/edge/lib/redis_client.lua",
+        "status": "modified",
+        "issues": [
+          "#497"
+        ]
+      },
+      {
+        "path": "deploy/edge/test/add_timestamp_spec.lua",
+        "status": "added",
+        "issues": [
+          "#265"
+        ]
+      },
+      {
+        "path": "deploy/edge/test/backend_freshness_crosstenant_spec.lua",
+        "status": "added",
+        "issues": [
+          "#497"
+        ]
+      },
+      {
+        "path": "deploy/edge/test/spec_helper.lua",
+        "status": "modified",
+        "issues": [
+          "#497"
+        ]
+      }
+    ],
+    "host-scripts (S3-pulled / baked into rootfs)": [
+      {
+        "path": "deploy/userdata/init-host.sh",
+        "status": "modified",
+        "issues": [
+          "#441"
+        ]
+      }
+    ],
+    "lambda (update-function-code only)": [
+      {
+        "path": "deploy/lambda/api/core/envelope.py",
+        "status": "modified",
+        "issues": [
+          "#479",
+          "#519"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/ssm_dispatch.py",
+        "status": "modified",
+        "issues": [
+          "#517",
+          "#520"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/host_service.py",
+        "status": "modified",
+        "issues": [
+          "#524"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/tenant_service.py",
+        "status": "modified",
+        "issues": [
+          "#475",
+          "#520"
+        ]
+      }
+    ],
+    "root / other": [
+      {
+        "path": "config.yml.example",
+        "status": "modified",
+        "issues": [
+          "#499"
+        ]
+      },
+      {
+        "path": "setup.sh",
+        "status": "modified",
+        "issues": [
+          "#265"
+        ]
+      }
+    ],
+    "scripts": [
+      {
+        "path": "scripts/preflight-check.sh",
+        "status": "modified",
+        "issues": [
+          "#499"
+        ]
+      }
+    ]
+  },
+  "folded_into": "(pending) — no patch kit built for this sync yet; a later kit should cite this manifest as source-of-record and set base_sha/patch_sha. cdk deploy is FORBIDDEN on hand-modified live deployments — the kit must ship *.patched host scripts + the full lambda tree + AWS CLI for stack changes, same shape as patch/315-concurrent-dispatch-rollup/."
+}

@@ -18,8 +18,11 @@
 后续任务(1.3)在同文件补 `decrypt_inbound`/`encrypt_outbound`,复用这里的 parse/serialize。
 """
 
+import logging
 import re
 from dataclasses import dataclass
+
+_LOG = logging.getLogger(__name__)
 
 # ── 信封版本与前缀 ──────────────────────────────────────────────────────────
 ENVELOPE_VERSION = "v1"
@@ -45,6 +48,24 @@ SCHEME_KMS_CMK = "kms-cmk"
 SCHEME_ASYMMETRIC = "asymmetric-v1"
 #: 受支持 scheme 全集(缺省等价 kms-cmk)。resolve_scheme 之外的值一律拒绝。
 SUPPORTED_SCHEMES = (SCHEME_KMS_CMK, SCHEME_ASYMMETRIC)
+
+#: #519 —— 已交付 API 接受契约的【窄范围】兼容名单。在役客户端长期发
+#: scheme=asymmetric-v1 + 明文 llm_key 且不可修改,#479 B8 用 400 拒绝收紧该契约,
+#: 造成客户 create-tenant 全量中断。只对实测受影响的字段开豁免,其余 sensitive
+#: 字段仍按 B8 拒绝 —— 不把兼容性扩大成对所有 sensitive 字段放开明文。
+#: 见 ADR-delivered-api-acceptance-contract。收口方向:服务端代加密落地后清空本名单。
+#:
+#: 光按字段名匹配不够:registry 是可变的,把 `llm_key` 重指到
+#: `EXCHANGE_API_SECRET_KEY` 就能借这条豁免让平台密钥明文落库(独立评审提出)。
+#: 故豁免要求 `param_class == "config"` —— 平台凭据全是 env-class
+#: (registry_service.SHIPPED_DEFAULT_ENTRIES:62-85),重指到 env-class 目标后豁免
+#: 不再命中、仍按 B8 拒绝。不进一步锁死 injection_target 的确切 dot-path 的原因:
+#: registry 按模板存,硬编码一个与客户模板不符的路径会让豁免失效、直接造成在役客户端
+#: 再次中断,而 config-class 值只写本租户自己的 openclaw.json、不构成跨租户暴露面。
+#: 告警仍带 param_class 与 injection_target,使指向变化可被审计发现。
+_PLAINTEXT_COMPAT_FIELDS = frozenset({"llm_key"})
+#: 豁免只在这一类 param_class 下成立(见上)。
+_PLAINTEXT_COMPAT_PARAM_CLASS = "config"
 
 # ── 校验常量(与 core/utils 保持同源语义,此处自带以维持叶子自足)───────────────
 #: base64 体尺寸上限:一个小密钥的 KMS/RSA 密文的 base64,宽松上限(design R13.3)。
@@ -365,8 +386,19 @@ def _validate_injected_parameters_v2(params, configured_cmk_arn, registry_entrie
             # 一视同仁:明文透传的值本就只能承载自隔离的 opaque 值(per-tenant vkey /
             # 客户自持 key),需 owner 隔离的敏感值仍应走 enc:v1:。
             # fail-loud 不放松:超长拒(防塞爆)、控制字符拒(防 \r\n 注进 dotenv/JSON)。
-            # #479:显式 asymmetric-v1 不允许 sensitive 字段静默降级为明文。
-            if scheme == SCHEME_ASYMMETRIC and entry.get("sensitive"):
+            # #479 B8:显式 asymmetric-v1 不允许 sensitive 字段静默降级为明文。
+            # #519:该拒绝收紧了已交付 API 的接受契约、打断在役客户端,故对
+            # _PLAINTEXT_COMPAT_FIELDS 内的字段豁免;名单外仍然拒绝,不把兼容性
+            # 扩大成对所有 sensitive 字段放开明文。见 ADR-delivered-api-acceptance-contract。
+            # `scheme` 也是豁免的成立条件之一:B8 的拒绝只作用于 asymmetric-v1,缺省与
+            # 条件,下面那条 WARNING 会对每个 legacy 明文请求都刷一条"契约已放松"、
+            # 且把 scheme 印成 asymmetric-v1(与事实不符),真正的豁免信号被噪音淹没。
+            compat_exempt = (
+                scheme == SCHEME_ASYMMETRIC
+                and field in _PLAINTEXT_COMPAT_FIELDS
+                and entry.get("param_class") == _PLAINTEXT_COMPAT_PARAM_CLASS
+            )
+            if scheme == SCHEME_ASYMMETRIC and entry.get("sensitive") and not compat_exempt:
                 return None, (
                     f"{field} declared under scheme=asymmetric-v1 must be an enc:v1: "
                     "envelope (plaintext rejected for sensitive fields)"
@@ -380,6 +412,24 @@ def _validate_injected_parameters_v2(params, configured_cmk_arn, registry_entrie
                 return (
                     None,
                     f"value for {field} must not contain control characters",
+                )
+            # 豁免不等于静默。位置要在【本字段的全部门之后】:若放在超长/控制字符门
+            # 之前,一个会被拒的值也会先产生一条已接受的告警,审计信号即失真(独立评审
+            # 指出)。措辞也不能声称"已持久化"—— 本函数是校验叶子,它之后还有后续字段
+            # 校验、required 检查、owner 校验和 DDB 写入,任何一步失败请求都不会落库;
+            # 这条只断言"校验层接受了明文",不替持久化层作证(独立评审指出)。
+            # 只记字段名、scheme 与注入坐标,绝不记值。
+            if compat_exempt:
+                _LOG.warning(
+                    "sensitive field %s accepted as plaintext by validation under "
+                    "scheme=%s via compatibility allowlist (param_class=%s "
+                    "injection_target=%s); if the request completes, the value is "
+                    "stored unencrypted with no owner binding "
+                    "(tracked degradation, not a silent one)",
+                    field,
+                    SCHEME_ASYMMETRIC,
+                    entry.get("param_class"),
+                    entry.get("injection_target"),
                 )
         clean[field] = value
     for field, entry in entries.items():

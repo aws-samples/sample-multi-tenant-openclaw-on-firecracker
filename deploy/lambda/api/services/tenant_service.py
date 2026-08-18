@@ -65,6 +65,75 @@ from core.envelope import (
     resolve_scheme,
 )
 
+# 分辨它们是承重的:调用方只在 _CLAIM_FULL 时把 host 拉出候选池。把"抢输槽位号"也当成
+# "这台满了",等于把一台仍有余量的 host 从池子里删掉 —— 池里只剩一台有空间时就是立刻
+# 503。模块级常量而非局部字面量,是为了让测试能引用同一个符号,不靠字符串巧合对齐。
+_CLAIM_CONTENDED = "contended"
+_CLAIM_FULL = "full"
+# 无法归因(ALL_OLD 没捎回 Item,或值不可解析)。不能并进 CONTENDED —— 见
+# _classify_claim_failure 的说明:那会让调用方既不换机也不刷新,空转掉整个重试预算。
+_CLAIM_UNKNOWN = "unknown"
+
+
+def _classify_claim_failure(err_response, cap_v, cap_m):
+    """CCF 响应 → _CLAIM_FULL / _CLAIM_CONTENDED / _CLAIM_UNKNOWN。
+
+    条件表达式混了四个子条件(next_vm_num 竞态 / vCPU 满 / 内存满 / 物理槽被占),而 CCF
+    不说是哪个失败。带 ReturnValuesOnConditionCheckFailure=ALL_OLD 时 DDB 会把该 item 的
+    旧值放进异常响应,据此判定(AWS 文档 WorkingWithItems「Returning the item attributes
+    of a failed conditional write」)。
+
+    走 boto3 **resource** 层时 err_response["Item"] 是【未反序列化】的类型化 JSON
+    ({'N': '5'}),不是 python 值 —— moto 5.2.2 与真 DDB 一致(实测),故直接读 "N"。
+
+    【为什么"读不到旧值"要单独成一档,而不是并进 CONTENDED】
+    第三轮评审抓到的:并进 CONTENDED 会让调用方既不换机也不刷新(没有 Item 就没有新的
+    next_vm_num),于是用同一个 stale expected 空转 8 次 —— 即便别的 host 有空间也 503。
+    那正是本 issue 要修的故障形态在"无 Item"这条路上重现。典型触发是 host 行在读与 CAS
+    之间被删掉(实例终止/回收),ALL_OLD 无东西可回。所以它必须是 UNKNOWN:调用方拿它去做
+    一次强一致读再定夺,而不是盲目原地重试。
+    """
+    old = (err_response or {}).get("Item") or {}
+
+    def _num(name):
+        try:
+            return int(old[name]["N"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    used_v, used_m = _num("used_vcpu"), _num("used_mem_mb")
+    # 先归因能归的:任一可读字段已证明装不下 → FULL(能判就判,不多付一次读)。
+    if (used_v is not None and used_v > cap_v) or (used_m is not None and used_m > cap_m):
+        return _CLAIM_FULL
+    # 【任一】字段读不出来就是 UNKNOWN,不能因为另一个"还有余量"就判 CONTENDED。
+    # 依据是 DDB 语义:条件里 used_vcpu <= :cap_v AND used_mem_mb <= :cap_m 对【缺失
+    # 属性】求值为假,缺一个就整条 AND 为假 —— 实测确认(moto:半行缺 used_vcpu 时该条件
+    # 抛 CCF,而存在的 used_mem_mb 照常比较)。所以缺任一用量字段的 host,它的 CAS 会
+    # 心跳的无条件 update_item 会建出只有心跳字段的行。第四轮评审抓到这条。
+    if used_v is None or used_m is None:
+        return _CLAIM_UNKNOWN
+    return _CLAIM_CONTENDED
+
+
+def _fresh_host_state(err_response):
+    """从 CCF 捎回的旧值里取出【赢家写完后的当前状态】,供重试刷新本地 host 字典。
+
+    而里面 `expected = h["next_vm_num"]` 读的是同一个 stale 字典,于是 CAS 条件
+    `next_vm_num = :expected` 必然再次不满足 —— 8 次重试确定性全废。真机实测(apse1
+    2026-08-14,6 路并发单 host):只改分类时 6 路里 4 路拿到
+    "slot allocation contended out after retries",一次都没成功过。
+
+    数据是白来的:ALL_OLD 已经把当前 item 放进异常响应,不必再读一次 DDB。
+    """
+    old = (err_response or {}).get("Item") or {}
+    fresh = {}
+    for name in ("next_vm_num", "used_vcpu", "used_mem_mb", "vm_count"):
+        try:
+            fresh[name] = int(old[name]["N"])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return fresh
+
 # ── tenant 域私有常量(逐字搬自 handler.py 顶部;仅本域使用)──────────────────
 # SSM root shell command; its ONLY legitimate use is as an S3 path slug
 # (launch-vm.sh: s3://$ASSETS_BUCKET/templates/openclaw/${CONFIG_TEMPLATE}/openclaw.json),
@@ -1662,14 +1731,23 @@ def create_tenant(body=None, event=None):
     # oversell, and (c) increments next_vm_num / used_* in one conditional update.
     # On contention (ConditionalCheckFailedException) we re-pick a host and retry.
     def _reserve_slot(h):
-        """Atomically claim a vm_num + capacity on host h. Returns the claimed
-        vm_num, or None if h no longer has capacity / lost the CAS race."""
+        """Atomically claim a vm_num + capacity on host h.
+
+        Returns `(vm_num, None)` on success, else `(None, reason)` where reason is
+        one of `_CLAIM_CONTENDED` / `_CLAIM_FULL`.
+
+        (见下方 tried_hosts 的注释,那是 2026-08-11 实测事故的修复),但在"只是抢输了
+        槽位号"时把它拉黑,等于把一台【仍有余量】的 host 从池子里删掉。池里只剩一台有
+        空间时,拉黑它就没有下一台 → 8 次重试只用掉 1 次就直接 503。而"池子接近装满"
+        正是 #430 追求的稳态,所以这不是异常路径,是日常。
+        """
         expected = int(h.get("next_vm_num", 1))
         target, occupied = scheduling.next_free_phys_num(
             h["instance_id"], expected, exclude_ids={tenant_id}
         )
         if occupied is None or target is None:
-            return None
+            # 本 host 上找不到空闲物理号 —— 这是"这台装不下了",不是抢输,走 host 轮换。
+            return None, _CLAIM_FULL
         # 会让"选得中、订不上":_find_host 按 per-family 判定还有容量并选中该 host,
         # CAS 却按更小的全局 allocatable 恒拒 → 8 次重试全废在同一批 host 上 → 503
         # "slot allocation contended out",而低优先级 host 明明空着(apse1 2026-08-11 实撞:
@@ -1711,19 +1789,88 @@ def create_tenant(body=None, event=None):
                 ),
                 ExpressionAttributeValues=_vals,
                 ReturnValues="UPDATED_NEW",
+                # (next_vm_num 竞态 / vCPU 满 / 内存满 / 物理槽被占)。ALL_OLD 让 DDB 在
+                # 条件失败时把该 item 的旧值捎回异常里,免去一次额外读(AWS 文档
+                # WorkingWithItems「Returning the item attributes of a failed
+                # conditional write」)。原子取值,无 TOCTOU。
+                ReturnValuesOnConditionCheckFailure="ALL_OLD",
             )
             if _names:
                 _kwargs["ExpressionAttributeNames"] = _names
             r = clients.hosts_table.update_item(**_kwargs)
             # CAS 返回的 next_vm_num - 1 与预先算出的 target 恒等；缺 Attributes 时回退 target。
             try:
-                return int(r["Attributes"]["next_vm_num"]) - 1
+                return int(r["Attributes"]["next_vm_num"]) - 1, None
             except (KeyError, TypeError, ValueError):
-                return target
+                return target, None
         except ClientError as e:
-            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-                return None
-            raise
+            if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                # 非 CCF(限流 / 权限 / DDB 故障)照旧原样重抛 —— 但抛之前要释放 inflight 锁。
+                # 这个漏锁是【先存在】的(本 issue 之前就在),不是本次引入;修在这里是因为它与
+                # 上面那个读失败是同一个缺陷、只隔三行,且无法单独测(要复用同一套 harness)。
+                inflight_dedup.release_inflight_lock(owner_id, tenant_user_id)
+                raise
+            # 用赢家写完后的当前状态刷新本地 host 字典 —— 否则下一轮 expected 还是旧的
+            # next_vm_num,CAS 必然再次失败(见 _fresh_host_state 的真机实测记录)。
+            # cap_v / cap_m 是按【本次请求规格】算的余量,所以"满"= 满足不了这一笔。
+            _fresh = _fresh_host_state(e.response)
+            why = _classify_claim_failure(e.response, cap_v, cap_m)
+            if why == _CLAIM_CONTENDED and "next_vm_num" not in _fresh:
+                # 判了抢输,却没能从 ALL_OLD 里取到可解析的 next_vm_num —— 原地重试仍会用
+                # 旧值,CAS 注定再次失败。降级到 UNKNOWN 走强一致读定夺,而不是拿这台耗预算。
+                # (第五轮评审指的是强一致读那一侧的同类洞;这一侧是顺着它查出来的。)
+                why = _CLAIM_UNKNOWN
+            if why != _CLAIM_UNKNOWN:
+                h.update(_fresh)
+                return None, why
+            # 无法归因 —— 原地重试注定失败(没有新的 next_vm_num),盲目换机又会把可能仍有
+            # 余量的 host 拉出池子。所以做【一次】强一致读定夺,这条路很少走,读一次不心疼。
+            # 读失败【不吞】。限流 / 权限不足 / DDB 故障不是"这台满了" —— 把它伪装成换机
+            # 会把系统性故障说成容量不足:表级限流时每台 host 都"满",客户拿到 503
+            # "no host capacity",而日志里看不到真因。既误导排查,也违反"只 catch 你能处理
+            # 的、绝不静默吞异常"。让它抛出去,handler.py 顶层 except 会打 traceback 并回
+            # 500,客户可重试而真因留在日志里。第七轮评审抓到这条 —— 与第五轮吞掉 int()
+            # 失败是同一类违规。
+            # 唯一要收尾的是 inflight 锁:其余失败路径都先释放再返回,直接抛会把它漏掉
+            # (有 30min TTL 兜底不至死锁,但该用户 30 分钟内建不了新租户)。所以先释放再抛。
+            try:
+                _cur = (
+                    clients.hosts_table.get_item(
+                        Key={"instance_id": h["instance_id"]}, ConsistentRead=True
+                    ).get("Item")
+                    or {}
+                )
+            except Exception:
+                # 捕 Exception 而不只是 ClientError:传输层错误(EndpointConnectionError /
+                # ConnectTimeoutError / ReadTimeoutError)是 BotoCoreError 子类,【不是】
+                # ClientError,只捕后者会让它们绕过这里、把 inflight 锁漏掉 30 分钟 ——
+                # 正是本次要避免的那个后果(第八轮评审抓到)。
+                # 不捕 BaseException:SystemExit / KeyboardInterrupt 在 Lambda 里不会走
+                # 正常栈展开(超时是直接杀进程),捕它买不到真实收益,只会让意图更含糊。
+                # 这里只做"释放锁"这一件能处理的事,异常【原样重抛】,不改类型也不吞。
+                inflight_dedup.release_inflight_lock(owner_id, tenant_user_id)
+                raise
+            if not _cur:
+                # host 行已不在(实例被终止/回收)。它永远不会成功,必须换机。
+                return None, _CLAIM_FULL
+            # 三个 CAS 必需字段必须【原子地】全部可解析。存在性不等于可用:
+            #   缺字段     → 条件对缺失属性恒假(已实测,见测试里的 DDB 语义那条)
+            #   值非数值   → int() 抛错;把它吞掉再原地重试,等于拿一台必败的 host 耗完
+            #                预算,还可能在下一轮 CAS 上撞 DynamoDB 类型错误
+            # 两种都让这台永远认领不到,所以一律当不可用换机。原子性是关键 —— 逐字段
+            # try/except 会留下"改了一半"的本地状态,而且吞异常本身违反项目铁律
+            # (第五轮评审抓到的正是那个被吞掉的 int() 失败)。
+            try:
+                _parsed = {
+                    _k: int(_cur[_k])
+                    for _k in ("next_vm_num", "used_vcpu", "used_mem_mb")
+                }
+            except (KeyError, TypeError, ValueError):
+                return None, _CLAIM_FULL
+            # 只刷 CAS 参与的三个字段。vm_count 由 CAS 自增、本地值不参与判定,不必带上 ——
+            # 少刷一个字段就少一处需要吞异常的地方。
+            h.update(_parsed)
+            return None, _CLAIM_CONTENDED
 
     vm_num = None
     # re-picks the SAME host: _find_host ranks by (affinity_tier, balance), and a
@@ -1734,7 +1881,7 @@ def create_tenant(body=None, event=None):
     # `exclude` makes the next pick walk down the priority order instead.
     tried_hosts = set()
     for attempt in range(8):
-        claimed = _reserve_slot(host)
+        claimed, why = _reserve_slot(host)
         if claimed is not None:
             vm_num = claimed
             break
@@ -1746,9 +1893,26 @@ def create_tenant(body=None, event=None):
                 409,
                 {"error": "host slot contended or filled during allocation; retry"},
             )
+        # 让它们下一轮仍然对齐、继续互撞;抖动把重试打散开。真机实测(apse1 6 路并发):
+        # 无抖动时输家整批同时重试,连撞到重试预算用尽。
+        time.sleep(0.05 * (attempt + 1) * (0.5 + secrets.randbelow(1000) / 1000.0))
+        # 只有"这台真装不下了"才把它拉出候选池并换机;纯粹抢输槽位号时
+        # 留在本 host 上重试(它仍有余量,退避后赢家已写完)。此前两者不分,导致池子接近
+        # 装满时一次抢输就把最后一台有空间的 host 拉黑 → 立刻 503,8 次重试只用掉 1 次。
+        if why != _CLAIM_FULL:
+            continue
         tried_hosts.add(host["instance_id"])
-        time.sleep(0.05 * (attempt + 1))
-        host = scheduling._find_host(vcpu, mem_mb, exclude=tried_hosts)
+        # 换机重挑也要防漏锁。_find_host 内部【没有】任何 except(实测:0 处),所以 DDB
+        # 限流 / 权限错误会从这里抛出去,绕过下面所有显式 release —— 与第七/八轮那两条是
+        # 同一族缺陷,只是站点不同。主动补上,不等评审再指一次。
+        # 说明范围:create_tenant 整体上"任何异常都会把 inflight 锁留到 30min TTL"这个性质
+        # 是【先存在】的,彻底解决要给整个函数加一层 finally 归属,属独立 issue;这里只收
+        # 槽位认领这一段里可确证的逃逸点。
+        try:
+            host = scheduling._find_host(vcpu, mem_mb, exclude=tried_hosts)
+        except Exception:
+            inflight_dedup.release_inflight_lock(owner_id, tenant_user_id)
+            raise
         if not host:
             inflight_dedup.release_inflight_lock(owner_id, tenant_user_id)
             return utils._resp(503, {"error": "no host capacity (contended out)"})
@@ -1773,7 +1937,7 @@ def create_tenant(body=None, event=None):
         scheduling._release_slot(
             host["instance_id"], vcpu, mem_mb, vm_num, tenant_id
         )
-        claimed = _reserve_slot(host)
+        claimed, _why = _reserve_slot(host)
         if claimed is None:
             inflight_dedup.release_inflight_lock(owner_id, tenant_user_id)
             return utils._resp(
@@ -2627,34 +2791,16 @@ def _delete_tenant_inner(tenant_id, query_params, event=None, _lifecycle_ctx=Non
         #   旧版存在但不认,那正是会 15s 锁超时的情况,必须一起换掉。
         # · 拉取失败即 `exit 1`,让整条命令非零 → 控制面走 _mark_delete_retryable()
         #   留 deleting 重投,绝不在"脚本可能过期"的状态下动手删盘。
-        # · 正常情况(脚本已是新版)这段只做两次 `[ -x ]` 与一次 grep,开销可忽略,
-        #   且不增加 SendCommand 次数(同一条命令内的 shell 片段)。
-        # 桶名与 region 都由 host 侧自己从 /etc/platform.env 读(init-host.sh 写的那份,
-        # launch-vm.sh / backup-data.sh 也都这么取),不从控制面拼进命令串 —— 否则
-        # Lambda 少注入一个环境变量就会拼出 `s3:///deployment/...` 这种坏 URI,
-        # 而这段代码位于删除主路径上,拼错的代价是所有删除都失败。
-        _self_heal = (
-            "if [ ! -x /home/ubuntu/delete-vm.sh ] || "
-            "! grep -q OC_LIFECYCLE_LOCK_FD /home/ubuntu/stop-vm.sh 2>/dev/null; then "
-            "echo '[oc:delete] host 脚本缺失/过期,从 S3 自愈装载'; "
-            # 不用 `. /etc/platform.env || true` —— 删除路径里【任何】`|| true` 都会被
-            # test_ADV_route_cleanup_is_not_best_effort 拦下(那条断言是对的:这条链上
-            # 静默容错等于把不可逆操作变成 best-effort)。改为先判文件存在再 source,
-            # source 失败就让整段非零退出、走重投。
-            'if [ -r /etc/platform.env ]; then set -a; . /etc/platform.env; set +a; fi; '
-            '_B="${ASSETS_BUCKET:-}"; '
-            '[ -n "$_B" ] || { echo \'[oc:delete] FATAL 读不到 ASSETS_BUCKET\'; exit 1; }; '
-            "for f in delete-vm.sh stop-vm.sh; do "
-            'aws s3 cp "s3://$_B/deployment/scripts/$f" "/tmp/oc-heal-$f" '
-            "--no-progress >/dev/null 2>&1 || "
-            "{ echo \"[oc:delete] FATAL 拉取 $f 失败\"; exit 1; }; "
-            'bash -n "/tmp/oc-heal-$f" || '
-            "{ echo \"[oc:delete] FATAL $f 语法错误,拒绝安装\"; exit 1; }; "
-            'install -o root -g root -m 755 "/tmp/oc-heal-$f" "/home/ubuntu/$f" || '
-            "{ echo \"[oc:delete] FATAL 安装 $f 失败\"; exit 1; }; "
-            "done; "
-            "echo '[oc:delete] 自愈装载完成'; "
-            "fi"
+        # #520 C2:这段实现搬到 core.ssm_dispatch.host_script_self_heal,因为 suspend /
+        # restore / reset / rebuild 有同一个病(那几条路径此前完全没有兜底),重复四份
+        # 会各自漂移。行为不变:同样两个脚本成对装、同样以 stop-vm.sh 认不认
+        # OC_LIFECYCLE_LOCK_FD 作"存在但过期"的判据、同样任何一步失败即 exit 1。
+        # 其余理由(为什么桶名由 host 自己从 /etc/platform.env 读、为什么不许 `|| true`)
+        # 都写在那个函数的 docstring 里。
+        _self_heal = ssm_dispatch.host_script_self_heal(
+            ("delete-vm.sh", "stop-vm.sh"),
+            "oc:delete",
+            freshness=("stop-vm.sh", "OC_LIFECYCLE_LOCK_FD"),
         )
         # 第 7 个参数 = 停机后补一份静止盘备份(仅当本次真做了 pre-delete backup;
         # 见上方 `_want_quiesced_backup` 的说明)。脚本侧默认 false,少传即行为不变。
@@ -2962,9 +3108,16 @@ def _tenant_suspend(tenant_id, item):
             },
         )
 
+    # #520 C2:前置 S3 自愈 —— 既有 host 上的 stop-vm.sh 可能缺失或是不认
+    # OC_LIFECYCLE_LOCK_FD 的旧版(后者会 15s 锁超时)。这里的失败路径与 stop-vm 本身
+    # 失败一致(回滚 + 502 + 不释放 slot),所以自愈失败 exit 1 即可,语义不变。
     vm_num = int(item.get("vm_num", 1))
+    _suspend_heal = ssm_dispatch.host_script_self_heal(
+        ("stop-vm.sh",), "oc:suspend", freshness=("stop-vm.sh", "OC_LIFECYCLE_LOCK_FD")
+    )
     if not ssm_dispatch._ssm_run(
-        host_id, f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num}"
+        host_id,
+        f"{_suspend_heal} && /home/ubuntu/stop-vm.sh {tenant_id} {vm_num}",
     ):
         _rollback()
         return utils._resp(
@@ -3234,7 +3387,18 @@ def _tenant_restore(tenant_id, item):
     if not launched:
         # 真失败(rc≠0 且≠75,或 SSM 超时 rc=None):launch-vm 可能已起 VM(超时≠没起)。
         # 直接释放 slot 会留孤儿 VM。回滚前先 stop-vm 清目标(幂等),再释放 slot、回 suspended。
-        ssm_dispatch._ssm_run(host["instance_id"], f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num}")
+        # #520 C2:这条清理是"释放 slot 之前必须把 VM 停掉",stop-vm.sh 缺失/过期会让它
+        # 静默无效(本调用的返回值本来就不看)→ 孤儿 VM 留在 host 上而 slot 已释放,
+        # 下一个租户可能被排到同一个物理号。故同样前置 S3 自愈。
+        _restore_heal = ssm_dispatch.host_script_self_heal(
+            ("stop-vm.sh",),
+            "oc:restore",
+            freshness=("stop-vm.sh", "OC_LIFECYCLE_LOCK_FD"),
+        )
+        ssm_dispatch._ssm_run(
+            host["instance_id"],
+            f"{_restore_heal} && /home/ubuntu/stop-vm.sh {tenant_id} {vm_num}",
+        )
         scheduling._release_slot(
             host["instance_id"], vcpu, mem_mb, vm_num, tenant_id
         )
@@ -4359,8 +4523,12 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
         # data_disk_mb in DDB before the host had even run the script, so DDB
         # claimed the new size whether or not the ext4 grow actually happened.
         # Now: run synchronously, and only persist the new size on Success.
+        _resize_heal = ssm_dispatch.host_script_self_heal(
+            ("resize-disk.sh",), "oc:resize"
+        )
         if not ssm_dispatch._ssm_run(
             host_id,
+            f"{_resize_heal} && "
             f"/home/ubuntu/resize-disk.sh {tenant_id} {vm_num} {new_size}",
             timeout=120,
         ):
@@ -4504,9 +4672,13 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
         # only mutated after the whole move is proven — same fail-safe contract
         # as before, just driven out-of-band instead of in the request path.
 
+        _migrate_heal = ssm_dispatch.host_script_self_heal(
+            ("migrate-vm.sh",), "oc:migrate"
+        )
         snap_cmd = ssm_dispatch._ssm_send(
             source_host_id,
             f"{_lifecycle_host_guard} && "
+            f"{_migrate_heal} && "
             f"/home/ubuntu/migrate-vm.sh snapshot {shlex.quote(tenant_id)} {vm_num} "
             f"{shlex.quote(f's3://{bucket}/{snap_prefix}')} && "
             f"{_lifecycle_host_guard}",
@@ -4616,7 +4788,14 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
             if guest_ip and host_port
             else ""
         )
+        # restart 同时用 stop-vm.sh 与(经 wake helper 的) launch-vm.sh,两者都要在位。
+        _restart_heal = ssm_dispatch.host_script_self_heal(
+            ("stop-vm.sh", "launch-vm.sh"),
+            "oc:restart",
+            freshness=("stop-vm.sh", "OC_LIFECYCLE_LOCK_FD"),
+        )
         full_cmd = (
+            f"{_restart_heal} && "
             f"{_lifecycle_host_guard} && {stop_cmd} && sleep 2 && "
             f"{_lifecycle_host_guard} && {launch_cmd}"
         )
@@ -4644,7 +4823,12 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
             if guest_ip and host_port
             else ""
         )
-        full_cmd = stop_cmd
+        _stop_heal = ssm_dispatch.host_script_self_heal(
+            ("stop-vm.sh",),
+            "oc:stop",
+            freshness=("stop-vm.sh", "OC_LIFECYCLE_LOCK_FD"),
+        )
+        full_cmd = f"{_stop_heal} && {stop_cmd}"
         if dnat_del:
             # Keep cleanup best-effort without letting it mask stop-vm failure.
             full_cmd += f" && ({dnat_del} || true)"
@@ -4667,7 +4851,10 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
             if guest_ip and host_port
             else ""
         )
-        full_cmd = launch_cmd
+        _start_heal = ssm_dispatch.host_script_self_heal(
+            ("launch-vm.sh",), "oc:start"
+        )
+        full_cmd = f"{_start_heal} && {launch_cmd}"
         if dnat_cmd:
             full_cmd += f" && {dnat_cmd}"
         if not ssm_dispatch._ssm_run(item["host_id"], full_cmd, timeout=300):
@@ -4695,7 +4882,18 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
             f"{q(str(_lifecycle_op_id))} {q(str(_lifecycle_fence_epoch))} "
             f"{q(_reset_attempt_id)} {q(str(item['host_id']))} -- {launch_cmd}"
         )
-        full_cmd = f"{_lifecycle_host_guard} && {reset_cmd}"
+        # #520 C2:reset-vm.sh 是后加的 host 侧事务脚本,既有 host(开机时那版
+        # init-host.sh 还没有拉它的那几行)上根本不存在 → 无条件调用 exit 127。
+        # 自愈段放在 fence host_guard 之【前】:守卫本身不依赖这些脚本,而脚本缺失时
+        # 先跑守卫只是把 127 往后挪一步;失败即整条非零,与 reset 自身失败同路径。
+        # 成对自愈 stop-vm.sh:reset-vm.sh 自己会调它(deploy/userdata/reset-vm.sh:228),
+        # 只装顶层脚本的话,旧 host 上那个依赖仍可能缺失或过期(独立评审指出)。
+        _reset_heal = ssm_dispatch.host_script_self_heal(
+            ("reset-vm.sh", "stop-vm.sh", "launch-vm.sh"),
+            "oc:reset",
+            freshness=("stop-vm.sh", "OC_LIFECYCLE_LOCK_FD"),
+        )
+        full_cmd = f"{_reset_heal} && {_lifecycle_host_guard} && {reset_cmd}"
         if dnat_cmd:
             full_cmd += f" && {dnat_cmd}"
         full_cmd += f" && {_lifecycle_host_guard}"
@@ -4851,7 +5049,17 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
             f"{q(str(_rb_op_id))} {q(str(_lifecycle_fence_epoch))} "
             f"{q(_rb_attempt_id)} {q(str(item['host_id']))} -- {launch_cmd}"
         )
-        full_cmd = f"{_lifecycle_host_guard} && {rebuild_cmd}"
+        # #520 C2:同 reset —— rebuild-vm.sh 在既有 host 上可能不存在。客户 apse1 打
+        # restorepatch 时正是靠人工 scp 补装到在役 3 台才让 rebuild 可用,那是把正确性
+        # 寄托在人工步骤上;这里改成控制面自己兜底。同 reset 成对自愈 stop-vm.sh:
+        # rebuild-vm.sh 自己会调它(deploy/userdata/rebuild-vm.sh:284),只装顶层脚本的话
+        # 旧 host 上那个依赖仍可能缺失或过期(独立评审指出)。
+        _rebuild_heal = ssm_dispatch.host_script_self_heal(
+            ("rebuild-vm.sh", "stop-vm.sh", "launch-vm.sh"),
+            "oc:rebuild",
+            freshness=("stop-vm.sh", "OC_LIFECYCLE_LOCK_FD"),
+        )
+        full_cmd = f"{_rebuild_heal} && {_lifecycle_host_guard} && {rebuild_cmd}"
         if dnat_cmd:
             full_cmd += f" && {dnat_cmd}"
         full_cmd += f" && {_lifecycle_host_guard}"

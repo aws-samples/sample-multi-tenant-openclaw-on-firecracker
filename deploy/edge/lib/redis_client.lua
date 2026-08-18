@@ -1,7 +1,7 @@
 -- deploy/edge/lib/redis_client.lua
 --
 -- Thin, single-purpose wrapper around lua-resty-redis. The only op we need
--- is GET on the "route:{tenant_id}" key (the data-plane contract). Kept
+-- is GET on the "route:{tenant_id}" key (INTERFACE-CONTRACT §1). Kept
 -- separate so unit tests can inject a stub for the "redis" table without
 -- touching lookup_backend.
 --
@@ -25,6 +25,19 @@ local _M = { _VERSION = "0.01" }
 local DEFAULT_CONNECT_MS = 100
 local DEFAULT_SEND_MS    = 100
 local DEFAULT_READ_MS    = 100
+-- #497 — budget for one get_route() on a WARM connection, published as a contract
+-- because backend.lua's single-flight lock must wait at least this long: a waiter that
+-- gives up earlier than the holder can possibly finish never learns the outcome.
+--
+-- Deliberately EXCLUDES DNS. The endpoint is an ElastiCache/Valkey DNS name, and a
+-- cold connect resolves it through nginx's `resolver` (see nginx.conf: `resolver_timeout
+-- 3s`, `valid=30s`), whose budget is separate from set_timeouts() — so a cold, unlucky
+-- call can take seconds, not 300ms. Callers must size a *lock lease* against that
+-- larger figure but must NOT make a request wait for it; see backend.lua.
+_M.WARM_BUDGET_MS = DEFAULT_CONNECT_MS + DEFAULT_SEND_MS + DEFAULT_READ_MS
+-- Ceiling including a cold DNS resolution (resolver_timeout 3s in nginx.conf). Only
+-- for sizing leases/timeouts that must not expire while a holder is still working.
+_M.COLD_CEILING_MS = 3000 + _M.WARM_BUDGET_MS
 -- Keepalive: 60s idle, 100 conns per worker. Matches lua-resty-redis
 -- recommended values for a hot-path lookup service.
 local KEEPALIVE_IDLE_MS = 60 * 1000

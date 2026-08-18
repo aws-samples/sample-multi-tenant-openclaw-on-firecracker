@@ -2121,7 +2121,12 @@ def _pull_by_snapshot(instance_id, snapshot_time, slot=None, idempotency_key=Non
                                        "slot": slot}}
             ).encode("utf-8"),
         )
-    except Exception as e:  # 自调用都没发出去 → 收尾,别卡 upgrading / 别占死 lease
+    except Exception as e:  # 自调用都没发出去 → 落失败终态并收尾,别卡 QUEUED/upgrading/lease
+        _record_pull_error(
+            instance_id,
+            f"pull-image worker dispatch failed: {e}",
+            job_id,
+        )
         # 自然过期,期间 promote/cleanup/reclaim 全被 409 挡)。live 额外复位 status。
         if slot != image_slots.SLOT_CANARY:
             _reset_host_status(instance_id, prev_status)
@@ -2153,7 +2158,16 @@ def _run_pull_pipeline(instance_id, snapshot_time, prev_status, job_id, slot=Non
             instance_id, snapshot_time, prev_status, job_id, slot
         )
     finally:
-        image_lease.release(instance_id, job_id)
+        try:
+            image_lease.release(instance_id, job_id)
+        except Exception as e:
+            # Lease cleanup is best-effort after the pipeline has already committed its
+            # terminal Job state. Let the bounded lease expire instead of replacing a
+            # successful result with an exception that the handler would mark FAILED.
+            print(
+                f"[pull] WARN release image lease failed for {instance_id} "
+                f"(job={job_id}): {e}"
+            )
 
 
 def _run_pull_pipeline_impl(instance_id, snapshot_time, prev_status, job_id, slot=None):
@@ -2386,10 +2400,13 @@ def _finalize_success(instance_id, snapshot_time, prev_status, job_id, rootfs_ve
     清 last_pull_error(本轮无错)。**保留 pull_command_id**:progress 据它 tail 进度文件才能
     读到末行 SUCCESS → 返回 Completed(codex review:删了 pull_command_id → progress 拿不到
     job_id → 永远 InProgress/no-job,观察不到成功)。下一轮 pull 的 _set_host_upgrading 覆盖它。
-    当前 owner 且 host 仍在本轮 upgrading 才能 finalize。防两类:① at-least-once/超时重投的【旧
-    worker】finalize 掉新任务(脚本侧 flock 挡不住 Lambda 侧 DDB 写);② pull_command_id 成功后
-    【保留】,若 host 已被移到 draining/deleted,延迟 worker 光凭 owner 匹配会把它错误复位回
-    active(round12)。加 #s = :upg 关死:非 upgrading 一律 CCF 跳过。非 owner/非 upgrading → 静默跳过。
+    当前 owner 且 host 仍在本轮 upgrading 才能更新 Host 投影。防两类:① at-least-once/超时重投
+    的【旧 worker】finalize 掉新任务(脚本侧 flock 挡不住 Lambda 侧 DDB 写);② pull_command_id
+    成功后【保留】,若 host 已被移到 draining/deleted,延迟 worker 光凭 owner 匹配会把它错误
+    复位回 active(round12)。加 #s = :upg 关死:非 upgrading 一律 CCF 跳过 Host 更新。
+    但 SSM 已返回成功时,该 Job 自身的 SUCCEEDED 终态仍必须写入:正常路径中 host 脚本会先执行
+    _reset_ok 把 status 复位,使 Lambda 的幂等兜底 CAS 触发 CCF。若因此提前 return,成功 Job
+    会永久停在 QUEUED。
     Lambda 兜底也必须写 rootfs_version,否则 status/snapshot 恢复了、版本字段仍停旧值(原 bug 重现)。
     故成功且版本号非空时,这条兜底 update 也补 rootfs_version(与脚本侧同值,幂等)。"""
     ccf = hosts_table.meta.client.exceptions.ConditionalCheckFailedException
@@ -2409,9 +2426,12 @@ def _finalize_success(instance_id, snapshot_time, prev_status, job_id, rootfs_ve
         )
     except ccf:
         # 非当前 owner(pull_command_id 被新 pull 覆盖)或 host 已非 upgrading(被移去
-        # draining/deleted)→ 本就不该 finalize,静默跳过。
-        print(f"[pull] finalize {instance_id} skipped: not current owner or not upgrading (job={job_id})")
-        return  # 非 owner/非 upgrading:同样不该把 Job 标成功(见 _record_pull_error 同源理由)
+        # draining/deleted),以及正常的 host 脚本已先 _reset_ok → 都不再写 Host 行。
+        # 此处只保护 Host 投影；SSM 成功已证明本 Job 完成，下面仍写它自己的终态。
+        print(
+            f"[pull] host finalize {instance_id} skipped: already finalized or no longer "
+            f"current owner (job={job_id}); recording successful job"
+        )
     except Exception as e:
         print(f"[pull] WARN finalize {instance_id} failed: {e}")
     # (ADR §4.4 "pull 成功后 result 提供版本信息")。本步 target_slot 恒 live。
@@ -2494,16 +2514,21 @@ def pull_image(instance_id, query_params, headers=None):
         return _err(400, "VALIDATION", "missing instance_id")
     snapshot_time = ((query_params or {}).get("snapshot_time") or "").strip()
     if not snapshot_time:
-        return _err(400, "VALIDATION", "snapshot_time required (version mode removed)")
-    # 取值非法一律 400,绝不"猜"成 live(猜错会把候选版本装成正式版)。
-    slot = ((query_params or {}).get("slot") or "").strip()
-    if slot and not image_slots.is_valid_slot(slot):
+        return _err(
+            400,
+            "VALIDATION",
+            "snapshot_time query parameter required; use a snapshot_time from "
+            "GET /list_image_versions",
+        )
+    # #524 —— 在 API 边界规范化缺省值，确保 Job、异步 payload 与安装脚本看到同一个 live。
+    slot = ((query_params or {}).get("slot") or "").strip() or image_slots.SLOT_LIVE
+    if not image_slots.is_valid_slot(slot):
         return _err(
             400, "VALIDATION",
             f"slot must be 'live' or 'canary'; got {slot!r}",
         )
     idem_key = _idempotency_key_from_headers(headers)
-    return _pull_by_snapshot(instance_id, snapshot_time, slot or None, idem_key)
+    return _pull_by_snapshot(instance_id, snapshot_time, slot, idem_key)
 
 
 def _idempotency_key_from_headers(headers):
@@ -2717,7 +2742,7 @@ def pull_image_progress(instance_id, query_params=None):
                   MANIFEST_MISMATCH/UNZIP_FAILED/INSTALL_MV_FAILED/OWNERSHIP_CHECK_FAILED/UNKNOWN)
                   + FailureReason(详情)
       last_status:进度文件最后一行原文(带时间戳+做了什么,供 UI 展示细节)
-    无 job_id → 从没 pull 过(ProcessingJobStatus='InProgress',last_status=None)。
+    无 job_id → 从没 pull 过(state='NONE',ProcessingJobStatus=null,last_status=None)。
 
       {
         "instance_id": "i-0abc123def4567890",
@@ -2758,8 +2783,23 @@ def pull_image_progress(instance_id, query_params=None):
             "error": job.get("error"),
         })
     if not job_id:
-        return _resp(200, {**base, "ProcessingJobStatus": "InProgress", "last_status": None,
-                           "message": "no pull-image job for this host"})
+        return _resp(
+            200,
+            {
+                **base,
+                "snapshot_time": None,
+                "last_pull_error": None,
+                "state": "NONE",
+                "phase": None,
+                "target_slot": None,
+                "requested_snapshot_time": None,
+                "result": None,
+                "error": None,
+                "ProcessingJobStatus": None,
+                "last_status": None,
+                "message": "no pull-image job for this host",
+            },
+        )
     # 也能给出正确终态(ADR §7 "Host 重启导致 /tmp 丢失"),同时省一次 SSM 往返。
     if job and job.get("state") in image_jobs.TERMINAL_STATES:
         return _resp(200, _progress_from_job(base, job))

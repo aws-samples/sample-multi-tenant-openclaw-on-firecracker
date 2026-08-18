@@ -2423,7 +2423,8 @@ paths:
         version-snapshots DDB table, selects exactly the disks named by that snapshot's manifest.json
         (rootfs / data-template / immutable) plus manifest.json itself (ignores other versions' disks
         in the snapshot — deterministic), fetches each by its exact S3 VersionId, verifies ETag, then
-        installs to live under /data/firecracker-assets. CAS-flips the host active/idle→upgrading (and
+        installs into an immutable per-host version directory and atomically updates slots.json.
+        Live pulls CAS-flip the host active/idle→upgrading (and
         atomically stamps pull_command_id) so the control plane places no new tenants during the pull,
         then self-invokes asynchronously (InvocationType=Event) and returns 202 immediately — the long
         stage+unzip+commit chain runs in the fire-and-forget worker (can take minutes; the poller is
@@ -2448,7 +2449,7 @@ paths:
           schema:
             type: string
             pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$'
-          description: 'ISO8601 UTC snapshot key (YYYY-MM-DDTHH:MM:SSZ), from GET /snapshots.'
+          description: 'ISO8601 UTC snapshot key (YYYY-MM-DDTHH:MM:SSZ), from GET /list_image_versions.'
         - name: slot
           in: query
           required: false
@@ -2457,9 +2458,10 @@ paths:
             enum: [live, canary]
             default: live
           description: >-
-            (installs the flat live disks, CAS-flips the host to `upgrading` for the duration).
-            `canary` installs into an immutable per-host version dir
-            (versions/<snapshot_time>/) and updates only the canary pointer in slots.json —
+            #524 — target image slot. Absent or empty is normalized to `live` at the API boundary.
+            Both slots install into an immutable per-host version dir
+            (versions/<snapshot_time>/) and atomically update slots.json. `live` CAS-flips the
+            host to `upgrading` for the duration. `canary` updates only the canary pointer —
             it does NOT change host.status, so live tenants keep being created/scheduled on
             the host. Mutual exclusion for canary is provided by the host-level image lease,
             not the status gate. Any other value → 400 VALIDATION.
@@ -2494,7 +2496,9 @@ paths:
                     description: Self-generated pull job id (pull-<hex>). Names /tmp/<job_id>.txt on the host; pull-image-progress tails it.
               x-source: deploy/lambda/api/services/host_service.py:1053
         '400':
-          description: Missing/invalid snapshot_time (ISO8601 UTC), or invalid slot value.
+          description: >-
+            Missing snapshot_time query parameter (values come from GET /list_image_versions),
+            or invalid slot value.
           content:
             application/json:
               schema:
@@ -2767,7 +2771,7 @@ paths:
         the most recent ERROR:<CODE> line becomes the failure detail. Returns SageMaker ProcessingJob-style
         JSON. If a terminal error was persisted to DDB (last_pull_error) but the progress file can't be
         read (worker exited early), the status is forced to Failed so the host never appears stuck
-        InProgress. No pull_command_id → the host was never pulled (InProgress, last_status=null).
+        InProgress. No pull job → state=NONE, ProcessingJobStatus=null, snapshot_time=null.
       x-source: deploy/lambda/api/services/host_service.py:1441
       x-rbac: viewer
       parameters:
@@ -2819,13 +2823,30 @@ paths:
                       - string
                       - 'null'
                     description: Last persisted failure reason (DDB), if any.
-                  ProcessingJobStatus:
+                  state:
                     type: string
+                    enum:
+                      - NONE
+                      - QUEUED
+                      - STAGING
+                      - VALIDATING
+                      - COMMITTING
+                      - SUCCEEDED
+                      - FAILED
+                      - RECOVERY_REQUIRED
+                    description: NONE means this host has no pull job; it is not a persisted Job state.
+                  ProcessingJobStatus:
+                    type:
+                      - string
+                      - 'null'
                     enum:
                       - Completed
                       - Failed
                       - InProgress
-                    description: Completed=last line SUCCESS; Failed=last line FAIL or DDB last_pull_error set; else InProgress.
+                      - null
+                    description: >-
+                      null when state=NONE; Completed=last line SUCCESS; Failed=last line FAIL
+                      or DDB last_pull_error set; otherwise InProgress.
                   last_status:
                     type:
                       - string
@@ -2872,6 +2893,17 @@ paths:
                     ProcessingJobStatus: Completed
                     ExitCode: 0
                     last_status: '2026-07-21T03:00:40Z SUCCESS'
+                noJob:
+                  summary: host has no pull-image job
+                  value:
+                    instance_id: i-0123456789abcdef0
+                    host_status: active
+                    job_id: null
+                    snapshot_time: null
+                    state: NONE
+                    ProcessingJobStatus: null
+                    last_status: null
+                    message: no pull-image job for this host
         '400':
           description: Missing instance_id.
           content:

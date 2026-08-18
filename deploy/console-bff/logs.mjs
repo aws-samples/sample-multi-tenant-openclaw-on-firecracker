@@ -1,4 +1,3 @@
-// #266 — Console BFF per-tenant log viewer. Read-only. Two backends:
 //   source=lambda        → CloudWatch Logs Insights over /aws/lambda/openclaw-*
 //   source=vm | host     → Amazon OpenSearch (VPC-only) claw-logs-vm / claw-logs-host
 //
@@ -67,7 +66,13 @@ export function buildAosQuery(source, tenantId, startMs, endMs) {
       : { match_phrase: { log: tenantId } };
   return {
     size: MAX_HITS,
-    sort: [{ "@timestamp": { order: "desc" } }],
+    // AOS_INDEX is a wildcard over daily indices, so this query also hits every
+    // those have no mapping for it at all. Sorting on an unmapped field is a hard
+    // error (query_shard_exception → the BFF answers 502), so the whole page stays
+    // broken until the last unstamped index ages out of ISM retention. Declaring
+    // the type makes those indices sort as empty instead of throwing; a range on
+    // an unmapped field already matches nothing, so no extra guard is needed there.
+    sort: [{ "@timestamp": { order: "desc", unmapped_type: "date" } }],
     query: { bool: { filter: [range], must: [tenantClause] } },
   };
 }

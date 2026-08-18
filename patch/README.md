@@ -3,14 +3,72 @@
 ## Getting started
 
 1. **Clone the gateway branch** (this branch has the kits):
-   `git clone --branch gateway --single-branch <this-repo-url> && cd sample-multi-tenant-openclaw-on-firecracker`
-2. **Open Claude Code** in that directory (with credentials for the TARGET environment).
+
+   ```bash
+   git clone --branch gateway --single-branch \
+     https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker.git
+   cd sample-multi-tenant-openclaw-on-firecracker
+   git rev-parse HEAD          # record this SHA; every piece of evidence binds to it
+   ```
+
+2. **Start Claude Code** in that directory, with credentials for the TARGET environment:
+
+   ```bash
+   claude                      # Manual mode (the default): every mutating command asks you first
+   ```
+
+   **Do not use `--permission-mode auto` (or `bypassPermissions`) against a production
+   environment.** In `auto` mode a classifier approves tool calls instead of you. The executor
+   prompt below tells Claude to stop at every side-effecting command, but permission rules are
+   enforced by Claude Code, not by the model — an instruction in a prompt does not change what
+   Claude Code allows. Manual mode is the only thing that actually holds an irreversible AWS
+   write until a human looks at it. Being idempotent does not remove the need for that gate:
+   idempotency protects you from running the *same correct* command twice, not from running one
+   command against the wrong account, region, or REST API id — and delete operations are
+   idempotent too. Admins can hard-disable the mode with `permissions.disableAutoMode` in
+   managed settings.
+
+   Two mode choices that are safe and useful:
+
+   - **Read-only discovery first:** `claude --permission-mode plan` while you run Step 0 probes
+     and read `manifest.json` / `APPLY-INSTRUCTIONS.md`, then switch to Manual mode to apply.
+   - **A disposable/test environment** (not the customer's live one) is the place for
+     `--permission-mode auto`.
+
+   If the Step 0 read-only probes are too chatty, do **not** reach for `auto` — `aws` is not in
+   Claude Code's built-in read-only command set, so it prompts by default. Instead add narrow
+   allow rules with `/permissions` (or `.claude/settings.local.json`) for read verbs only, and
+   leave everything that mutates on Manual:
+
+   ```json
+   { "permissions": { "allow": [
+       "Bash(aws sts get-caller-identity:*)",
+       "Bash(aws cloudformation describe-stacks:*)",
+       "Bash(aws apigateway get-*:*)",
+       "Bash(aws lambda get-*:*)",
+       "Bash(aws lambda list-*:*)",
+       "Bash(aws autoscaling describe-*:*)",
+       "Bash(aws ec2 describe-*:*)",
+       "Bash(aws s3api head-object:*)",
+       "Bash(aws s3api list-object-versions:*)",
+       "Bash(aws ssm describe-instance-information:*)",
+       "Bash(aws dynamodb describe-table:*)"
+   ] } }
+   ```
+
+   Deny rules beat allow rules, so a blanket `Bash(aws *)` deny would also block these — scope
+   any deny you add to the exact mutating verbs you want blocked.
+
 3. **Switch to max reasoning: `/effort xhigh`** — applying a patch to production is high-stakes;
    run at the highest reasoning effort so nothing is skimmed.
 4. **Paste the executor prompt below** (fill in `<id>`, e.g. `353-secret-ttl-plus-post315-rollup`).
 
 > **Executor prompt (copy verbatim, fill `<id>`):**
-> _"Start applying the OpenClaw patch kit `patch/<id>/`. First read `manifest.json` and
+> _"Clone `https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker`, switch to
+> the `gateway` branch, and record the HEAD SHA. Then start applying the OpenClaw patch kit
+> `patch/<id>/` (browse it at
+> `https://github.com/aws-samples/sample-multi-tenant-openclaw-on-firecracker/tree/gateway/patch/<id>`).
+> First read `manifest.json` and
 > `APPLY-INSTRUCTIONS.md` fully, then execute it top to bottom. This is a PRODUCTION environment,
 > so: before touching any file or resource, BACK IT UP (record the live host script / S3
 > object-version / Lambda code + config / DDB item, so every step is reversible). Run Step 0
@@ -20,7 +78,12 @@
 > sources. NEVER run `cdk deploy` / `setup.sh` / any CloudFormation redeploy — use the manual CLI
 > the kit gives. If `status != READY`, stop and surface the manual-review ops first. Run every
 > falsifiable verification in the manifest before any teardown, and never delete with a wildcard —
-> only the exact ids you created."_
+> only the exact ids you created. Prove every fix with FRESH evidence from the real entry point:
+> run the actual `curl` / CLI call and show the business output (status code plus the response
+> field the fix is about). A green log line, `systemctl is-active`, a running process, a
+> successful build, or a zero metric is NOT proof. If a probe cannot run, report it as FAIL or
+> INCONCLUSIVE — never turn missing evidence into a pass, and tell me which verifications you
+> skipped and why."_
 
 Each `patch/<id>/` fixes a **live** deployment in place (it was CDK-provisioned once then
 hand-modified — a redeploy would wipe that). Two files are all you read:

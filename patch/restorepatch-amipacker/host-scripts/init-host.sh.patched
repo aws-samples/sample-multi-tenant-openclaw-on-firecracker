@@ -232,6 +232,11 @@ BACKUP_CMK_KEY_ID=$(_stack_output BackupCmkKeyId)
 log "buckets: assets=${ASSETS_BUCKET} backup=${BACKUP_BUCKET}"
 
 # Write env for launch-vm.sh and host-agent
+# LITELLM_SHARED_VKEY in plaintext (launch-vm needs it), and `cat >` on a fresh host creates the
+# file with the caller's umask — root's default 022 yields 0644, i.e. any local account can read the
+# shared vkey until launch-vm.sh:1273 later tightens it. `install` sets the mode at creation, so
+# there is no readable window. Nothing depends on 0644: launch-vm already makes 0600 the steady state.
+install -m 0600 /dev/null /etc/platform.env
 cat > /etc/platform.env << ENVEOF
 OC_REGION=${REGION}
 ASSETS_BUCKET=${ASSETS_BUCKET}
@@ -289,7 +294,12 @@ log "LITELLM_HOST from SSM: ${LITELLM_HOST:-<empty, set /openclaw/litellm-host=b
 CLAWPOOL_RSA_CMK_ARN=$(aws ssm get-parameter --name /openclaw/clawpool-rsa-cmk-arn --region ${REGION} \
   --query "Parameter.Value" --output text 2>/dev/null || echo "")
 echo "CLAWPOOL_RSA_CMK_ARN=${CLAWPOOL_RSA_CMK_ARN}" >> /etc/platform.env
-log "CLAWPOOL_RSA_CMK_ARN from SSM: ${CLAWPOOL_RSA_CMK_ARN:+<set>}${CLAWPOOL_RSA_CMK_ARN:-<empty>}"
+# 坏写法是「掩码标记紧跟同一变量的 `:-` 默认值」:`:-` 的语义是「变量非空 → 展开成【值本身】」
+# (这是定义,不是 bug),所以那种写法在有值时输出 "掩码标记+明文"。实测 V=sk-CANARY 会打出明文。
+# 两步纯参数展开:先把"有值"折成掩码标记,再对【标记】取默认值 —— 值不进日志的任何一条路径。
+# (注意:本行安全,但上面那句 SSM 取值赋值在 `set -x` 下仍会 trace 出明文;本脚本未开 xtrace。)
+_cmk_mask=${CLAWPOOL_RSA_CMK_ARN:+<set>}
+log "CLAWPOOL_RSA_CMK_ARN from SSM: ${_cmk_mask:-<empty>}"
 
 # LITELLM_SHARED_VKEY:无专属 vkey 的租户共用的 LiteLLM virtual key(有预算上限)。镜像里
 # openclaw.json 的 apiKey 是 __INJECT_AT_DEPLOY__ 占位(CodeBuild 烤时不知道真实 key,不该
@@ -298,7 +308,10 @@ log "CLAWPOOL_RSA_CMK_ARN from SSM: ${CLAWPOOL_RSA_CMK_ARN:+<set>}${CLAWPOOL_RSA
 LITELLM_SHARED_VKEY=$(aws ssm get-parameter --name /openclaw/litellm-shared-vkey --with-decryption --region ${REGION} \
   --query "Parameter.Value" --output text 2>/dev/null || echo "")
 echo "LITELLM_SHARED_VKEY=${LITELLM_SHARED_VKEY}" >> /etc/platform.env
-log "LITELLM_SHARED_VKEY from SSM: ${LITELLM_SHARED_VKEY:+<set>}${LITELLM_SHARED_VKEY:-<empty, set /openclaw/litellm-shared-vkey>}"
+# 旧写法把它明文打进 EC2 console output,而 console output 只需只读 IAM 即可读取,
+# 且每台新 ASG host 启动必现(issue 里 3 台实例全复现)。
+_vkey_mask=${LITELLM_SHARED_VKEY:+<set>}
+log "LITELLM_SHARED_VKEY from SSM: ${_vkey_mask:-<empty, set /openclaw/litellm-shared-vkey>}"
 
 # host-agent.py:214 靠 ENGINE_REDIS_ENDPOINT 触发 RedisRouteWriter,promote 时把
 # route:{tid}→{host,port,guest_ip} 写进 Redis,edge OpenResty route.lua 查它转发。
@@ -605,6 +618,7 @@ chmod +x /home/ubuntu/stop-vm.sh && chown ubuntu:ubuntu /home/ubuntu/stop-vm.sh
 aws s3 cp s3://${ASSETS_BUCKET}/deployment/scripts/rebuild-vm.sh /home/ubuntu/rebuild-vm.sh --region ${REGION} --no-progress 2>/dev/null || \
   _s3_get s3://${ASSETS_BUCKET}/deployment/scripts/rebuild-vm.sh /home/ubuntu/rebuild-vm.sh
 chmod +x /home/ubuntu/rebuild-vm.sh && chown ubuntu:ubuntu /home/ubuntu/rebuild-vm.sh
+# #485 — reset uses the same op-scoped tombstone contract without rebuild's
 # image repin semantics.
 aws s3 cp s3://${ASSETS_BUCKET}/deployment/scripts/reset-vm.sh /home/ubuntu/reset-vm.sh --region ${REGION} --no-progress 2>/dev/null || \
   _s3_get s3://${ASSETS_BUCKET}/deployment/scripts/reset-vm.sh /home/ubuntu/reset-vm.sh

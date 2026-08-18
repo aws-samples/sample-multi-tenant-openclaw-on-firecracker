@@ -1374,6 +1374,15 @@ def build_ha_edge(self, ctx):
             "host-agent writes route:{tenant_id}",
         )
         # 私有子网场景);缺省回落 PRIVATE_WITH_EGRESS → private_subnets。
+        #
+        # #499 A2 — 这里【故意】没有 PRIVATE_ISOLATED 分支,记录现行契约免得再被问:
+        #   · `_helpers.py` 那层 Database(PRIVATE_ISOLATED)子网仍然会建,只是不会被自动选中。
+        #     所以今天要让 Redis/Valkey 落隔离层 = 显式写 `redis.subnet_ids`。
+        #   · 不在本处恢复默认,是因为改默认对【在役】环境是破坏性的:部署态子网组一旦与
+        #     synth 算出的集合不同,CFN 下发 ModifyCacheSubnetGroup 会被 ElastiCache 拒绝
+        #     (不允许改被在役 replication group 占用的子网组)→ UPDATE_FAILED → 整栈回滚
+        #     (2026-08-13 真机,#499 A1)。恢复默认属迁移动作,另立 issue 走。
+        #   · 漂移已由 `scripts/preflight-check.sh` 的 Redis 子网组判据在部署前 BLOCK。
         _redis_subnet_ids_cfg = _redis_cfg.get("subnet_ids") or []
         if _redis_subnet_ids_cfg:
             _redis_subnets = list(_redis_subnet_ids_cfg)

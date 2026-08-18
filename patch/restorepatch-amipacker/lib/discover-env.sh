@@ -119,6 +119,22 @@ if [ -n "${OC_CONTROL_PLANE_URL:-}" ]; then
   configured_url="${OC_CONTROL_PLANE_URL%/}"
   configured_host="${configured_url#*://}"
   configured_host="${configured_host%%/*}"
+  # Strip an explicit port before any host matching. A URL such as
+  # "https://<id>.execute-api.<region>.amazonaws.com:8443/v1" otherwise keeps ":8443"
+  # on the host, so the execute-api pattern below cannot match, discovery falls through
+  # to the custom-domain branch, and the API ends up unresolved — silently, because the
+  # script still exits 0 having written confirmed:false. Only a trailing colon followed
+  # by digits is a port; an IPv6 literal keeps its brackets and its inner colons.
+  case "$configured_host" in
+    \[*\]) : ;;
+    \[*\]:*) configured_host="${configured_host%:*}" ;;
+    *:*)
+      case "${configured_host##*:}" in
+        ''|*[!0-9]*) : ;;
+        *) configured_host="${configured_host%:*}" ;;
+      esac
+      ;;
+  esac
   # Base path as API Gateway stores it: no scheme, no host, no leading slash.
   # "https://api.example.com/prod" -> "prod"; a bare host -> "".
   configured_base_path="${configured_url#*://}"

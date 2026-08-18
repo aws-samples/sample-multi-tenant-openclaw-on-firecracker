@@ -61,8 +61,33 @@ never enough. Supply the client call site before running it:
   cannot be derived from the host name.
 - `OC_CONTROL_PLANE_PROBE_PATHS` overrides the default `/tenants,/hosts` probe set.
 - Run discovery from a place that can actually reach that URL. On the private API
-  topology the probes only succeed from inside the VPC, so run the kit on a host in
-  the VPC; from a workstation the probes return `000` and the API stays unresolved.
+  topology the probes only succeed from inside the VPC; from a workstation they return
+  `000` and the API stays unresolved.
+
+  What needs to be inside the VPC is only the HTTP probe, not the whole kit. Everything
+  else is AWS control-plane API calls that work from anywhere with credentials. Picking a
+  host in the VPC and running the kit under the host's instance role usually fails for the
+  opposite reason: that role is scoped to what a host needs at boot, and this kit also
+  reads and writes API Gateway, Lambda, Auto Scaling, EC2 launch templates, CodeBuild,
+  SSM, S3 and DynamoDB. Two workable shapes:
+
+  - Run `lib/discover-env.sh` on a VPC host that can reach the endpoint, copy the
+    resulting `environment.json` out, and run the remaining phases from wherever the
+    operator credentials live.
+  - Or run everything on the VPC host, but under credentials that carry the kit's full
+    read/write surface rather than the host instance role.
+
+  The kit's own calls, so the surface can be checked before starting: `apigateway`
+  get/update rest-api + stage, create/delete deployment, get-usage-plans,
+  get-usage-plan-keys, get-base-path-mappings; `lambda` get-function,
+  get-function-configuration, get-alias, list-aliases, update-function-code,
+  publish-version, update-alias, invoke; `autoscaling` describe-auto-scaling-groups,
+  describe-lifecycle-hooks, put-lifecycle-hook, update-auto-scaling-group,
+  set-desired-capacity, start/describe/cancel-instance-refresh, resume-processes,
+  terminate-instance-in-auto-scaling-group; `ec2` describe/create/modify launch template
+  versions, describe-subnets, describe-vpc-endpoints; `codebuild` batch-get-projects;
+  `ssm` send-command, get-command-invocation, describe-instance-information; `s3` cp and
+  `s3api` head/copy/delete-object; `dynamodb` get-item; `sts` get-caller-identity.
 
 ```bash
 export OC_CONTROL_PLANE_URL="https://<api-id>.execute-api.${REGION}.amazonaws.com/<stage>"
@@ -230,8 +255,18 @@ The API overlay scope is every deployed function that carries the API package:
 the API function plus every peer confirmed by discovery. This includes
 `openclaw-lifecycle-consumer`, whose asynchronous lifecycle actions would
 otherwise continue running the original package after the API function was
-updated. Confirm the complete read-only scope from `environment.json` before
-applying:
+updated.
+
+Do not shortcut this to "just refresh the API function". Measured on a live
+single-host environment: with only the API function updated, a queued `stop`
+still returned `202`, the tenant still converged to `stopped`, and the host
+script the fix was supposed to repair was still the stale copy — the SSM output
+carried no self-heal line at all. Every signal an operator normally reads said
+success. The same call after the consumer was updated printed the self-heal load
+and completion lines and restored the script. A partial overlay of this kit is
+therefore not a partial fix; it is an invisible no-op.
+
+Confirm the complete read-only scope from `environment.json` before applying:
 
 ```bash
 jq -r '

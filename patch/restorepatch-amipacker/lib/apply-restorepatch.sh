@@ -128,7 +128,7 @@ case "$PHASE" in
   verify)
     case "$VERIFY_SCOPE" in
       control) REQUIRED_VARS="REGION FN" ;;
-      data) REQUIRED_VARS="REGION ASG LT_ID BUCKET" ;;
+      data) REQUIRED_VARS="REGION ASG LT_ID LT_VER BUCKET" ;;
       routes) REQUIRED_VARS="REGION" ;;
       all) REQUIRED_VARS="REGION ASG LT_ID LT_VER BUCKET FN" ;;
     esac
@@ -147,6 +147,98 @@ aws_() { aws "$@" --region "$REGION"; }
 
 die() { echo "FAIL: $*" >&2; exit 1; }
 say() { echo "== $*"; }
+
+OC_ALLOW_PINNED_ASG="${OC_ALLOW_PINNED_ASG:-0}"
+# ASG_LT_REF is whatever the ASG literally references: the alias '$Default' / '$Latest', or a pinned
+# version number. That distinction decides whether this tool's promote reaches the fleet at
+# all. apply builds a new LT version and points '$Default' at it, so an ASG pinned to a number
+# keeps launching the old version while every '$Default'-based check passes -- which is exactly how
+# a data-plane run reports success without changing a single host.
+ASG_LT_REF="$LT_VER"
+asg_lt_is_pinned() {
+  case "$ASG_LT_REF" in
+    ''|'$Default'|'$Latest') return 1 ;;
+    *[!0-9]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+# Called by every phase that promotes or judges launch-template content. It refuses instead of
+# guessing: the two safe resolutions have different blast radius, and repointing a fleet's ASG
+# is the operator's call, not this script's.
+assert_asg_lt_promotable() {
+  asg_lt_is_pinned || return 0
+  local dflt
+  dflt="$(aws_ ec2 describe-launch-templates --launch-template-ids "$LT_ID" \
+    --query 'LaunchTemplates[0].DefaultVersionNumber' --output text 2>/dev/null)" || dflt="?"
+  if [ "$OC_ALLOW_PINNED_ASG" -eq 1 ]; then
+    echo "   NOTE ASG $ASG is pinned to LT version $ASG_LT_REF (default=$dflt);"
+    echo "        continuing because OC_ALLOW_PINNED_ASG=1 -- this run judges version $ASG_LT_REF,"
+    echo "        and promoting the default alias will NOT reach this ASG until you repoint it."
+    return 0
+  fi
+  die "ASG $ASG references launch-template version $ASG_LT_REF, not an alias (default=$dflt).
+  This tool promotes by pointing the default alias at a new version, which does not reach a
+  pinned ASG: new hosts would keep launching version $ASG_LT_REF while every default-based
+  check passes, so the data-plane concern would report success without changing the fleet.
+  Resolve explicitly, then re-run:
+    (a) repoint the ASG at the alias, or
+    (b) set OC_ALLOW_PINNED_ASG=1 to judge version $ASG_LT_REF in place and repoint the ASG
+        yourself afterwards -- the promote will not take effect on its own."
+}
+
+# Resolve every module the overlay imports against ONE live package. Factored out of the
+# precheck because the overlay is applied to the primary function AND to every peer that
+# shares the package: a peer whose live package lacks an imported module fails at import
+# time on every invocation, and the queued lifecycle path runs in a peer. Checking only the
+# primary function reports PASS while a peer would be dead on arrival.
+# usage: overlay_imports_resolve_against <function-name> [already-unpacked-dir]
+overlay_imports_resolve_against() {
+  local fn="$1" dir="${2:-}" loc w own=0 rc
+  if [ -z "$dir" ]; then
+    loc="$(aws_ lambda get-function --function-name "$fn" --query 'Code.Location' --output text)" \
+      || { echo "   CANNOT read the package location of $fn"; return 1; }
+    w="$(mktemp -d)"; own=1
+    curl -fsS -o "${w}/live.zip" "$loc" || { echo "   CANNOT download the package of $fn"; rm -rf "$w"; return 1; }
+    (cd "$w" && unzip -oq live.zip) || { echo "   CANNOT unpack the package of $fn"; rm -rf "$w"; return 1; }
+    dir="$w"
+  fi
+  python3 - "$KITDIR" "$dir" <<'PY'
+  import pathlib
+  import re
+  import sys
+  
+  kit, live = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+  imp = re.compile(r"^\s*(?:import|from)\s+((?:core|services|consumers|routes)(?:\.[A-Za-z_][\w]*)*)")
+  missing, checked = {}, 0
+  kit_api = kit / "lambda" / "api"
+  for mod in sorted(kit_api.rglob("*.py")):
+      for line in mod.read_text(encoding="utf-8", errors="replace").splitlines():
+          m = imp.match(line)
+          if not m:
+              continue
+          checked += 1
+          rel = m.group(1).replace(".", "/")
+          if ((live / f"{rel}.py").is_file()
+                  or (live / rel / "__init__.py").is_file()
+                  or (kit_api / f"{rel}.py").is_file()
+                  or (kit_api / rel / "__init__.py").is_file()):
+              continue
+          missing.setdefault(m.group(1), set()).add(mod.name)
+  print("   inspected %d import statement(s) across the overlay modules" % checked)
+  if missing:
+      for name, users in sorted(missing.items()):
+          print("   MISSING in live package: %s  (imported by %s)"
+                % (name, ", ".join(sorted(users))))
+      raise SystemExit(
+          "FAIL: the overlay imports modules the live package does not contain; applying it "
+          "would fail at import time and take the control plane down"
+      )
+  print("   PASS every module the overlay imports exists in the live package")
+  PY
+  rc=$?
+  [ "$own" -eq 1 ] && rm -rf "$w"
+  return $rc
+}
 
 scope_includes() {
   case "${VERIFY_SCOPE}:$1" in
@@ -1392,39 +1484,7 @@ precheck)
   work="$(mktemp -d)"
   curl -fsS -o "${work}/live.zip" "$loc" || die "cannot download the live package"
   (cd "$work" && unzip -oq live.zip) || die "cannot unpack the live package"
-  python3 - "$KITDIR" "$work" <<'PY'
-import pathlib
-import re
-import sys
-
-kit, live = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
-imp = re.compile(r"^\s*(?:import|from)\s+((?:core|services|consumers|routes)(?:\.[A-Za-z_][\w]*)*)")
-missing, checked = {}, 0
-kit_api = kit / "lambda" / "api"
-for mod in sorted(kit_api.rglob("*.py")):
-    for line in mod.read_text(encoding="utf-8", errors="replace").splitlines():
-        m = imp.match(line)
-        if not m:
-            continue
-        checked += 1
-        rel = m.group(1).replace(".", "/")
-        if ((live / f"{rel}.py").is_file()
-                or (live / rel / "__init__.py").is_file()
-                or (kit_api / f"{rel}.py").is_file()
-                or (kit_api / rel / "__init__.py").is_file()):
-            continue
-        missing.setdefault(m.group(1), set()).add(mod.name)
-print("   inspected %d import statement(s) across the overlay modules" % checked)
-if missing:
-    for name, users in sorted(missing.items()):
-        print("   MISSING in live package: %s  (imported by %s)"
-              % (name, ", ".join(sorted(users))))
-    raise SystemExit(
-        "FAIL: the overlay imports modules the live package does not contain; applying it "
-        "would fail at import time and take the control plane down"
-    )
-print("   PASS every module the overlay imports exists in the live package")
-PY
+  overlay_imports_resolve_against "$FN" "$work"
   # One concern failing must not deny the others a verdict, so record it instead of dying.
   # apply re-checks this independently and refuses the overlay step on its own.
   if [ $? -ne 0 ]; then
@@ -1432,6 +1492,14 @@ PY
   else
     IMPORT_STATE=OK
   fi
+  # The overlay is applied to the peers too (see the apply-api overlay loop), so the same
+  # question has to be asked of each peer's own live package. A peer can legitimately carry
+  # a different module set than the primary function, which is why counting modules is not
+  # enough -- the imports have to resolve against that peer's package.
+  for peer_fn in $PEER_FNS; do
+    say "overlay import resolution against the LIVE package of peer $peer_fn"
+    overlay_imports_resolve_against "$peer_fn" || IMPORT_STATE=BLOCKED
+  done
   say "OpenClawImage CodeBuild functional config (content-hash churn must not alter it)"
   aws_ codebuild batch-get-projects --names openclaw-golden-image-builder \
     --query 'projects[0].[environment.type,environment.computeType,timeoutInMinutes]' --output text
@@ -1561,6 +1629,11 @@ backup)
   hook_to="$(aws_ autoscaling describe-lifecycle-hooks --auto-scaling-group-name "$ASG" \
     --query "LifecycleHooks[?LifecycleHookName=='${HOOK_NAME}'].HeartbeatTimeout|[0]" --output text)"
   backup_anchor_put hook_backup_timeout "$hook_to"
+  hook_dr="$(aws_ autoscaling describe-lifecycle-hooks --auto-scaling-group-name "$ASG" \
+    --query "LifecycleHooks[?LifecycleHookName=='${HOOK_NAME}'].DefaultResult|[0]" --output text)"
+  [ -n "$hook_dr" ] && [ "$hook_dr" != "None" ] \
+    || die "cannot read the current DefaultResult of hook $HOOK_NAME; refusing to overwrite a setting we could not record"
+  backup_anchor_put hook_backup_default_result "$hook_dr"
   # Verify and rollback need the exact pre-apply capacity values, including a legitimate zero minimum.
   read -r asg_min asg_desired <<< "$(aws_ autoscaling describe-auto-scaling-groups \
     --auto-scaling-group-names "$ASG" \
@@ -1632,12 +1705,18 @@ apply)
   # is unknown or a mapping would stay pinned to an old published version.
   validate_control_overlay_scope
 
-  say "1/3 widen $HOOK_NAME heartbeat to ${NEW_TIMEOUT}s"
+  # put-lifecycle-hook replaces the whole hook, so every field this call omits reverts to the
+  # API default. Carrying the recorded DefaultResult through is what keeps widening the
+  # heartbeat from silently also changing what happens when the heartbeat expires.
+  hook_dr="$(state_get hook_backup_default_result)"
+  [ -n "$hook_dr" ] || die "backup state has no hook_backup_default_result; re-run backup"
+  say "1/3 widen $HOOK_NAME heartbeat to ${NEW_TIMEOUT}s (DefaultResult stays $hook_dr)"
   aws_ autoscaling put-lifecycle-hook --auto-scaling-group-name "$ASG" \
     --lifecycle-hook-name "$HOOK_NAME" \
     --lifecycle-transition autoscaling:EC2_INSTANCE_LAUNCHING \
-    --heartbeat-timeout "$NEW_TIMEOUT" --default-result ABANDON || die "hook update failed"
+    --heartbeat-timeout "$NEW_TIMEOUT" --default-result "$hook_dr" || die "hook update failed"
 
+  assert_asg_lt_promotable
   say "2/3 upload bootstrap script to its content-addressed key, then one new LT version"
   art="${KITDIR}/host-scripts/init-host.sh.patched"
   [ -f "$art" ] || die "missing artifact $art"
@@ -1647,7 +1726,7 @@ apply)
   # Recompute the state here rather than trusting precheck: the run directory is editable
   # and the live target may have moved between the two phases.
   lt_default_data="$(aws_ ec2 describe-launch-template-versions --launch-template-id "$LT_ID" \
-    --versions '$Default' \
+    --versions "$ASG_LT_REF" \
     --query 'LaunchTemplateVersions[0].[VersionNumber,LaunchTemplateData.ImageId,LaunchTemplateData.UserData]' \
     --output text)" || die "cannot read current default LT version"
   read -r live_lt_version live_ami live_userdata <<< "$lt_default_data"
@@ -2022,9 +2101,15 @@ verify)
       rc=1
     fi
 
-    say "default LT version carries the new bootstrap prefix and the new image"
+    if asg_lt_is_pinned; then
+      say "ASG-referenced LT version $ASG_LT_REF carries the new bootstrap prefix and the new image"
+      echo "   NOTE this ASG is pinned to version $ASG_LT_REF; the checks below judge that version,"
+      echo "        not whatever the default alias points at"
+    else
+      say "default LT version carries the new bootstrap prefix and the new image"
+    fi
     ud="$(aws_ ec2 describe-launch-template-versions --launch-template-id "$LT_ID" \
-      --versions '$Default' --query 'LaunchTemplateVersions[0].LaunchTemplateData.UserData' \
+      --versions "$ASG_LT_REF" --query 'LaunchTemplateVersions[0].LaunchTemplateData.UserData' \
       --output text | base64 -d)"
     if printf '%s' "$ud" | grep -q "$ASSET_BUNDLE_PREFIX"; then
       verify_status PASS "bootstrap prefix"
@@ -2080,7 +2165,7 @@ PY
       verify_status PASS "no unrendered placeholder"
     fi
     img="$(aws_ ec2 describe-launch-template-versions --launch-template-id "$LT_ID" \
-      --versions '$Default' --query 'LaunchTemplateVersions[0].LaunchTemplateData.ImageId' --output text)"
+      --versions "$ASG_LT_REF" --query 'LaunchTemplateVersions[0].LaunchTemplateData.ImageId' --output text)"
     if [ -n "$AMI" ]; then
       if [ "$img" = "$AMI" ]; then
         verify_status PASS "ImageId=$img"
@@ -2304,12 +2389,16 @@ rollback)
   lv="$(state_get host_lt_backup_version)"
   av="$(state_get api_backup_version)"
   [ -n "$hb" ] && [ -n "$lv" ] && [ -n "$av" ] || die "backup state incomplete"
+  [ -n "$(state_get hook_backup_default_result)" ] \
+    || die "backup state predates DefaultResult capture; re-run backup before rolling back"
 
-  say "restore hook heartbeat to $hb"
+  hook_dr="$(state_get hook_backup_default_result)"
+  [ -n "$hook_dr" ] || die "backup state has no hook_backup_default_result; cannot restore the hook faithfully"
+  say "restore hook heartbeat to $hb and DefaultResult to $hook_dr"
   aws_ autoscaling put-lifecycle-hook --auto-scaling-group-name "$ASG" \
     --lifecycle-hook-name "$HOOK_NAME" \
     --lifecycle-transition autoscaling:EC2_INSTANCE_LAUNCHING \
-    --heartbeat-timeout "$hb" --default-result ABANDON || die "hook restore failed"
+    --heartbeat-timeout "$hb" --default-result "$hook_dr" || die "hook restore failed"
 
   say "flip LaunchTemplate default back to version $lv"
   aws_ ec2 modify-launch-template --launch-template-id "$LT_ID" --default-version "$lv" \

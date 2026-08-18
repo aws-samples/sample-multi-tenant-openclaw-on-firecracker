@@ -29,9 +29,10 @@ _sec(){   echo; echo "── $1 ──"; }
 
 # ── 用 python 把 config 解析成 shell 可读的 KEY=VAL(点分路径),存临时文件 ──
 CFGDUMP=$(mktemp)
-RSG_ERRF=""   # Cat 10 用,提前声明好让下面这一条 trap 一起收(set -u)
-trap 'rm -f "$CFGDUMP" "$RSG_ERRF"' EXIT
-python3 - "$CONFIG" > "$CFGDUMP" <<'PY'
+RSG_ERRF=""   # Cat 10 用,提前声明好让下面那条 trap 一起收(set -u)
+_CFGERR=$(mktemp)
+trap 'rm -f "$CFGDUMP" "$RSG_ERRF" "$_CFGERR"' EXIT
+python3 - "$CONFIG" > "$CFGDUMP" 2>"$_CFGERR" <<'PY'
 import sys, yaml
 d = yaml.safe_load(open(sys.argv[1])) or {}
 def walk(p, o):
@@ -44,6 +45,20 @@ def walk(p, o):
         print(f"{p}={o}")
 walk("", d)
 PY
+_CFGRC=$?
+# 解析失败必须 fail-loud,不能拿空 dump 继续判(#489)。实测过一次:本机 python3 缺 PyYAML →
+# ImportError 只落在 stderr、dump 为空 → 后面每个 cfg 查询都返回空 → 门对着一份【空配置】判出
+# 4 条「键缺失」BLOCK(alb.internal / asg.min_capacity / asg.lifecycle_hook_timeout /
+# redis.enabled),而真正原因是缺依赖。这比漏判更坏:门焊进 setup.sh 之后,一台没装 PyYAML 的机器
+# 会永远部署不了,还被 4 条指错方向的报错带着去改一份其实没问题的 config。
+if [ "$_CFGRC" -ne 0 ] || [ ! -s "$CFGDUMP" ]; then
+  echo "🔴 无法把 $CONFIG 解析成键值(python3 退出码 $_CFGRC)。" >&2
+  echo "   本门后面每一条判据都要读这份 dump —— 拿空 dump 继续判会把「缺依赖」报成一串「config 缺键」," >&2
+  echo "   所以这里直接停下,不给出任何结论。原因原文:" >&2
+  sed 's/^/     /' "$_CFGERR" >&2
+  echo "   最常见是 python3 缺 PyYAML:python3 -m pip install pyyaml(或换用装了它的解释器)。" >&2
+  exit 2
+fi
 cfg(){ grep -m1 "^$1=" "$CFGDUMP" 2>/dev/null | cut -d= -f2-; }
 cfglen(){ grep -m1 "^$1.__len__=" "$CFGDUMP" 2>/dev/null | cut -d= -f2-; }
 

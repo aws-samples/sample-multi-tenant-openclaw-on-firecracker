@@ -264,6 +264,7 @@ EGRESS_VPC_CIDR={{EGRESS_VPC_CIDR}}
 EGRESS_ALLOWLIST_CIDRS={{EGRESS_ALLOWLIST_CIDRS}}
 EGRESS_ALLOWLIST_DOMAINS={{EGRESS_ALLOWLIST_DOMAINS}}
 EGRESS_DNS_UPSTREAM={{EGRESS_DNS_UPSTREAM}}
+IMMUTABLE_DISK_REQUIRED={{IMMUTABLE_DISK_REQUIRED}}
 OC_HOST_LAUNCH_SLOTS={{OC_HOST_LAUNCH_SLOTS}}
 CPU_OVERCOMMIT_RATIO={{CPU_OVERCOMMIT_RATIO}}
 MEM_OVERCOMMIT_RATIO={{MEM_OVERCOMMIT_RATIO}}
@@ -750,11 +751,20 @@ log "step5: registering to DynamoDB (az=${AZ}, type=${INSTANCE_TYPE:-unknown}, c
 # used_vcpu <= :cap_v` 恒假 → 每次分配 CCF → exclude 排除 → 503。每台新 host 都会这样,
 # if_not_exists 的语义正是"有就不动、没有才补",同时满足"不覆盖已有记账"与"不留缺字段的行"。
 # 同款范式见 health_check/handler.py:426。
+# rootfs_version,漏 immutable_version → 经它注册的 host 及其新建租户的 immutable 坐标恒空、
+# stage2 rootfs-drift 的 immutable 维度把它们误报成 unknown。manifest 点名了 immutable 盘
+# (IMMUTABLE_KEY 非空)时,用同源 ROOTFS_VER(= manifest.version)一并盖上;镜像无只读盘则不写。
+_IMM_ITEM=""; _IMM_SET=""; _IMM_VAL=""
+if [ -n "${IMMUTABLE_KEY}" ]; then
+  _IMM_ITEM=',"immutable_version":{"S":"'${ROOTFS_VER}'"}'
+  _IMM_SET=', immutable_version = :iv'
+  _IMM_VAL=',":iv":{"S":"'${ROOTFS_VER}'"}'
+fi
 _registered=0
 for _r in $(seq 1 10); do
   # stderr 收进变量而不是临时文件:CCF 是本分支的正常信号,得判定;真错误得进日志。用固定
   # 路径的 tmp 文件还要防符号链接和清理,变量没这些面。
-  _reg_err=$(aws dynamodb put-item --table-name ${HOSTS_TABLE} --region ${REGION} --condition-expression 'attribute_not_exists(instance_id)' --item '{"instance_id":{"S":"'${INSTANCE_ID}'"},"instance_type":{"S":"'${INSTANCE_TYPE}'"},"private_ip":{"S":"'${PRIVATE_IP}'"},"az":{"S":"'${AZ}'"},"total_vcpu":{"N":"'${AVAIL_VCPU}'"},"total_mem_mb":{"N":"'${AVAIL_MEM}'"},"used_vcpu":{"N":"0"},"used_mem_mb":{"N":"0"},"vm_count":{"N":"0"},"next_vm_num":{"N":"1"},"status":{"S":"active"},"rootfs_version":{"S":"'${ROOTFS_VER}'"},"snapshot_time":{"S":"'${ROOTFS_VER}'"}}' 2>&1) \
+  _reg_err=$(aws dynamodb put-item --table-name ${HOSTS_TABLE} --region ${REGION} --condition-expression 'attribute_not_exists(instance_id)' --item '{"instance_id":{"S":"'${INSTANCE_ID}'"},"instance_type":{"S":"'${INSTANCE_TYPE}'"},"private_ip":{"S":"'${PRIVATE_IP}'"},"az":{"S":"'${AZ}'"},"total_vcpu":{"N":"'${AVAIL_VCPU}'"},"total_mem_mb":{"N":"'${AVAIL_MEM}'"},"used_vcpu":{"N":"0"},"used_mem_mb":{"N":"0"},"vm_count":{"N":"0"},"next_vm_num":{"N":"1"},"status":{"S":"active"},"rootfs_version":{"S":"'${ROOTFS_VER}'"},"snapshot_time":{"S":"'${ROOTFS_VER}'"}'"${_IMM_ITEM}"'}' 2>&1) \
     && { _registered=1; log "registered (first boot: ledger starts at 0/0/0/1)"; break; }
   # CCF = 本实例已注册过(重跑)。只刷静态字段,账本原封不动。其它错误(限流/权限/网络)
   # 落到下面的重试,不能与"已存在"混为一谈 —— 那会把真失败当成功。
@@ -763,9 +773,9 @@ for _r in $(seq 1 10); do
       aws dynamodb update-item --table-name ${HOSTS_TABLE} --region ${REGION} \
         --key '{"instance_id":{"S":"'${INSTANCE_ID}'"}}' \
         --condition-expression 'attribute_exists(instance_id)' \
-        --update-expression 'SET instance_type = :it, private_ip = :ip, az = :az, total_vcpu = :tv, total_mem_mb = :tm, #s = :st, rootfs_version = :rv, snapshot_time = :sv, used_vcpu = if_not_exists(used_vcpu, :zero), used_mem_mb = if_not_exists(used_mem_mb, :zero), vm_count = if_not_exists(vm_count, :zero), next_vm_num = if_not_exists(next_vm_num, :one)' \
+        --update-expression 'SET instance_type = :it, private_ip = :ip, az = :az, total_vcpu = :tv, total_mem_mb = :tm, #s = :st, rootfs_version = :rv, snapshot_time = :sv, used_vcpu = if_not_exists(used_vcpu, :zero), used_mem_mb = if_not_exists(used_mem_mb, :zero), vm_count = if_not_exists(vm_count, :zero), next_vm_num = if_not_exists(next_vm_num, :one)'"${_IMM_SET}"'' \
         --expression-attribute-names '{"#s":"status"}' \
-        --expression-attribute-values '{":it":{"S":"'${INSTANCE_TYPE}'"},":ip":{"S":"'${PRIVATE_IP}'"},":az":{"S":"'${AZ}'"},":tv":{"N":"'${AVAIL_VCPU}'"},":tm":{"N":"'${AVAIL_MEM}'"},":st":{"S":"active"},":rv":{"S":"'${ROOTFS_VER}'"},":sv":{"S":"'${ROOTFS_VER}'"},":zero":{"N":"0"},":one":{"N":"1"}}' \
+        --expression-attribute-values '{":it":{"S":"'${INSTANCE_TYPE}'"},":ip":{"S":"'${PRIVATE_IP}'"},":az":{"S":"'${AZ}'"},":tv":{"N":"'${AVAIL_VCPU}'"},":tm":{"N":"'${AVAIL_MEM}'"},":st":{"S":"active"},":rv":{"S":"'${ROOTFS_VER}'"},":sv":{"S":"'${ROOTFS_VER}'"},":zero":{"N":"0"},":one":{"N":"1"}'"${_IMM_VAL}"'}' \
         && { _registered=1; log "re-run: refreshed static fields; ledger preserved (missing counters seeded)"; break; }
       ;;
     *) log "register attempt $_r error: ${_reg_err}" ;;

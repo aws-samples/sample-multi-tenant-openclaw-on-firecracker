@@ -380,13 +380,18 @@ Packer 将在等待 SSH 阶段持续阻塞直至超时。
 `AmazonSSMManagedInstanceCore` 策略，且子网需能访问 SSM 端点（通过 NAT 或
 VPC Endpoint）。
 
-### §2.2 构建实例的 IAM instance profile（**必填项**）
+### §2.2 构建实例的 IAM instance profile（**当前非必填**，#435 未落地）
 
 ```hcl
 iam_instance_profile = "openclaw-packer-builder"
 ```
 
-构建实例需读取客户 assets 存储桶内的 Firecracker 二进制（见 §3）。创建最小权限角色：
+> **当前版本留空即可**：FC 取件不读 assets 存储桶（见 §3 的状态说明）。
+> 留空构建实测退出 0；现在授予这条策略不会改变镜像内容，只会多一份用不上的权限。
+> #435 落地后本项才成为必填。
+
+#435 落地后构建实例需读取客户 assets 存储桶内的 Firecracker 二进制（见 §3）。
+届时创建最小权限角色：
 
 ```bash
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
@@ -442,19 +447,29 @@ grep assets_bucket deploy/packer/my.pkrvars.hcl
 
 ---
 
-## §3 预置 Firecracker 二进制（**首次构建前必须执行一次**）
+## §3 预置 Firecracker 二进制（**本节描述目标状态，当前尚未生效**）
 
-`provision-host.sh` 仅从**客户自有 S3 存储桶**获取 Firecracker，不访问 GitHub。
+> **本节当前不需要执行，执行了也不会改变镜像内容（#435 未落地）。**
+> 本仓当前版本的 `provision-host.sh:132` **无条件从 github.com** 拉取 Firecracker + jailer，
+> 脚本里没有任何读取 S3 的代码路径（全文不出现 `ASSETS_BUCKET`）。
+> 实跑证据：`iam_instance_profile` 留空在 `us-west-2` 构建**退出 0**，
+> 第 3 步打出 `[oc:provision] firecracker v1.15.1 installed`。
+> 也就是说 **当前每一次构建产出的镜像都请求过 github.com**。
+> 本节保留下来是因为它描述的是 #435 的目标状态；该 issue 落地后再按本节执行。
 
-设计原因：10 万规模的 scale-out 会导致所有 host 同时访问 GitHub releases CDN 并触发
-其速率限制，tarball 返回 429，host 无法安装 Firecracker，lifecycle hook 超时后
-ASG 判定 ABANDON 并替换实例，而替换实例访问同一受限源 —— 该循环不收敛。因此启动路径
-上不保留任何第三方源，且**有意未实现 GitHub 回落机制**：若存在回落，"GitHub 不可达时
-host 仍可正常启动"这项验收将永远通过、无法暴露真实依赖。
+设计原因（#435 的立项理由，仍然成立）：10 万规模的 scale-out 会导致所有 host 同时访问
+GitHub releases CDN 并触发其速率限制，tarball 返回 429，host 无法安装 Firecracker，
+lifecycle hook 超时后 ASG 判定 ABANDON 并替换实例，而替换实例访问同一受限源 ——
+该循环不收敛。因此目标状态是启动路径上不保留任何第三方源，且**不实现 GitHub 回落**：
+若存在回落，"GitHub 不可达时 host 仍可正常启动"这项验收将永远通过、无法暴露真实依赖。
 
-构建阶段执行的是同一个脚本，因此构建前该 S3 前缀必须已包含所需制品。两种方式：
+#435 落地后，构建阶段执行的是同一个脚本，届时构建前该 S3 前缀必须已包含所需制品。两种方式：
 
 ### 方案 A：执行镜像同步脚本（推荐）
+
+> **该脚本在本仓当前版本中不存在**（#435 未落地）：
+> `engineering/tooling/operations/deployment/mirror-firecracker.sh` 未随本版本发布，
+> 照抄会得到 `No such file or directory`。#435 落地时随其一并提供。
 
 ```bash
 engineering/tooling/operations/deployment/mirror-firecracker.sh <region> [aws-profile]
@@ -499,11 +514,14 @@ aws s3 cp /tmp/fc.tgz \
   "s3://openclaw-assets-${ACCOUNT}/deployment/binaries/firecracker/$V/firecracker-$V-$A.tgz"
 ```
 
-版本号与摘要必须与 `deploy/userdata/provision-host.sh` 顶部的 `FC_VER` 及
-`FC_SHA256_*` 一致。摘要不匹配时构建将在第 3 步失败并拒绝安装 —— 这是预期行为。
+版本号必须与 `deploy/userdata/provision-host.sh` 顶部的 `FC_VER` 一致。
 
-**构建两个架构时需分别上传对应制品。** 仅上传 aarch64 而构建 `arch = "amd64"` 将在
-第 3 步报告 S3 miss，不会静默回落至公网源（见上文说明）。
+> **以下两点是 #435 的目标行为，当前版本不成立**（#435 未落地）：
+> · "摘要不匹配时构建将在第 3 步失败并拒绝安装" —— 当前脚本**对 FC tarball 不做任何摘要
+>   校验**，且 `provision-host.sh` 里**没有 `FC_SHA256_*` 这个变量**（只有 `FC_VER`）。
+> · "报告 S3 miss，不会静默回落至公网源" —— 当前公网源是**唯一**的源，不存在 S3 取件，
+>   也就无所谓回落。
+> 上传制品不会被读取；架构不匹配也不会在第 3 步报 S3 miss。
 
 **注意**：存储桶名必须与 `assets_bucket` 参数一致。脚本内的对象前缀
 `deployment/binaries/firecracker` 为硬编码值，仅存储桶名可配置。

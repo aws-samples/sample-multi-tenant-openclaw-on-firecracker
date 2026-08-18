@@ -128,9 +128,13 @@ fan_out_main() {
     local gw_token_ct="${6:-}" device_paired="${7:-}" restore_key="${8:-}"
     local reservation_id="${9:-}"
     local vm_path="${FAN_VM_DIR}/${tid}"
-    # Idempotent check: if vm.json already exists we treat this as an at-least-once
-    # duplicate delivery. host-agent's poll loop will still recover it if FC died.
-    if [ -f "${vm_path}/vm.json" ]; then
+    # Idempotent completion requires both discovery metadata and a live Firecracker
+    # process for this exact socket. vm.json is written before restore/config/network
+    # setup finishes, so the file alone can describe a launch that later failed.
+    # In that case re-enter launch-vm.sh; its per-tenant flock serializes us with any
+    # launch still in progress and host-agent uses the same process-level truth.
+    if [ -f "${vm_path}/vm.json" ] &&
+       pgrep -f "api-sock ${vm_path}/fc.sock" >/dev/null 2>&1; then
       return 42  # sentinel: skipped
     fi
     # 13 positional args mirror the launch-vm.sh signature: config_template=$5,
@@ -203,8 +207,9 @@ fan_out_main() {
       echo "inprogress" > "${rfile}"
       _fo_log "launch defer(deleting) tenant=${tid} rc=45 — 删除在途,保持 pending 待重投重判"
     elif [ "${rc}" -eq 75 ]; then
-      # DDB get-item fail-closed exit 1),若这里把 assignment 标 done,它就从 pending 过滤
-      # 掉永不重投 + 无 vm.json 让 host-agent 本地恢复也没锚点 = 永久孤儿(no-data-loss)。
+      # 关键:绝不 _mark_assignment done。持锁 winner 可能在 Firecracker 真正启动前失败;
+      # 即使 vm.json 已写也不构成完成证据。若这里标 done,assignment 会从 pending 过滤掉,
+      # 只能依赖 host-agent 的较慢本地恢复,控制面则已错误声称创建完成。
       # 写 inprogress → 不进 v2 JSON 的 launched/skipped/failed 三清单(_result_list 只精确
       # 匹配那三个)→ Poller 看不到 → assignment 保持 pending → 下一轮 dispatch 重新 pick。
       echo "inprogress" > "${rfile}"
@@ -683,11 +688,6 @@ GUEST_IP="${SUBNET_PREFIX}.${_O3}.$(( _O4 + 2 ))"
 GUEST_MAC="AA:FC:00:00:$(printf '%02x:%02x' $(( VM_NUM / 256 )) $(( VM_NUM % 256 )))"
 log() { echo "[oc:launch] $(date +%H:%M:%S) $*"; }
 
-# Write VM metadata for host-agent discovery
-cat > "${VM_DIR}/vm.json" << VMEOF
-{"tenant_id":"${TENANT_ID}","vm_num":${VM_NUM},"guest_ip":"${GUEST_IP}","vcpu":${VCPU},"mem_mb":${MEM_MB},"config_template":"${CONFIG_TEMPLATE}"}
-VMEOF
-
 log "START ${TENANT_ID} vm${VM_NUM} ${VCPU}vCPU/${MEM_MB}MB"
 
 # Cleanup previous instance
@@ -776,8 +776,23 @@ else
   IMMUTABLE_TPL="${_FC_ASSETS}/openclaw-immutable.ext4"
   log "image version: legacy flat layout (no slots.json on this host)"
 fi
+# #517 阶段3(G1 fail-closed)—— 只读身份盘缺失 + 开关开 → 在【起 FC / 写 vm.json 之前】拒起,
+# 与上面 rootfs 缺失 FATAL 同款早退(codex 交叉审 C1:放到 attach 处再退时 vm.json 已写、FC 已起,
+# EXIT trap 留下空跑 FC + retry 见 vm.json 误判 done)。默认关=既有兼容(盘缺走后面 WARN 照常起),
+# 消除 §4 G1 的静默旧副本:开 true 后宁可这台起不来也不静默跑 data 盘烤制当天的旧身份。
+if [ "${IMMUTABLE_DISK_REQUIRED:-false}" = "true" ] && [ ! -f "${IMMUTABLE_TPL}" ]; then
+  log "FATAL(#517): ${IMMUTABLE_TPL} absent but IMMUTABLE_DISK_REQUIRED=true — refusing to launch on a stale identity fallback"
+  exit 1
+fi
+# Write VM metadata only after all image-selection fail-closed gates pass.
+# DDB fan-out retries pair this discovery file with a matching live Firecracker
+# process. Keep it after image fail-closed gates so host-agent does not discover
+# and repeatedly recover a launch that can never pass those gates.
+cat > "${VM_DIR}/vm.json" << VMEOF
+{"tenant_id":"${TENANT_ID}","vm_num":${VM_NUM},"guest_ip":"${GUEST_IP}","vcpu":${VCPU},"mem_mb":${MEM_MB},"config_template":"${CONFIG_TEMPLATE}"}
+VMEOF
 # 记录本次启动【实际使用】的版本到 vm.json(ADR §4.3 末句:每次启动记录实际 snapshot_time,
-# 供审计与迁移判断)。vm.json 在上面已写好,这里补一个字段;失败不阻断启动(纯审计信息)。
+# 供审计与迁移判断)。失败不阻断启动(纯审计信息)。
 if [ -n "${IMAGE_SNAPSHOT_TIME}" ] && command -v jq >/dev/null 2>&1; then
   if jq --arg v "${IMAGE_SNAPSHOT_TIME}" '.image_snapshot_time = $v' \
     "${VM_DIR}/vm.json" > "${VM_DIR}/vm.json.tmp" 2>/dev/null; then
@@ -1899,6 +1914,8 @@ if [ -f "${IMMUTABLE_TPL}" ]; then
     -d '{"drive_id":"immutable","path_on_host":"'${IMMUTABLE_TPL}'","is_root_device":false,"is_read_only":true}'
   log "attached read-only immutable disk /dev/vdd (${IMMUTABLE_TPL})"
 else
+  # #517 阶段3(G1 fail-closed):required 情况已在上方版本解析处(起 FC / 写 vm.json 之前)
+  # 早退拦掉,到这里必然是 IMMUTABLE_DISK_REQUIRED!=true → 保持既有兼容:WARN 后照常起。
   log "WARN: ${IMMUTABLE_TPL} absent — launching WITHOUT immutable authority disk"
 fi
 

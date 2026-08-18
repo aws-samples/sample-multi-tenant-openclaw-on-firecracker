@@ -186,7 +186,7 @@ curl -s -X POST -H "x-api-key: $KEY" -H "content-type: application/json" \
 | `start`                         | 唤醒(~3.7s)                                                                           | 202 异步(配 LIFECYCLE_QUEUE 时入队)                       |
 | `stop`                          | 休眠(~6.0s)                                                                           | 202 异步                                                  |
 | `restart` / `reset`             | 重启 / 重置                                                                          | 202 异步                                                  |
-| `rebuild`                       | 按 `image_channel` 用新镜像重建；缺省 `live`，先强制备份                             | 200 同步；无法确认采用时 503                              |
+| `rebuild`                       | 按 `image_channel` 用新镜像重建；缺省 `live`，worker 先强制备份                      | 202 异步；轮询 `GET /tenants/{id}`                       |
 | `pause` / `resume`              | 暂停 / 恢复                                                                           | 202 异步                                                  |
 | `backup`                        | 备份到 S3(~6.6s)                                                                      | 202,异步调 backup Lambda                                  |
 | `resize`                        | 热改 vCPU(需 body `vcpu`)                                                             | 200 `{old_vcpu,new_vcpu}`                                 |

@@ -228,7 +228,17 @@ network:
 alb:
   # #499 D — 本键【必须显式声明】,缺失即 fail-loud(ha_edge.py:1241 raise ValueError)。
   internal: false           # true=internal ALB(纯私有,不对公网);false=面向公网
-  subnet_ids: []            # 可选,显式指定 ALB 子网 id(imported 私有子网);空=按 internal/public 自动选
+  # 可选,显式指定 ALB 子网;空=按 internal/public 自动选。
+  # #530 — 显式指定时【必须带 az】,写成 mapping:
+  #   subnet_ids:
+  #     - { id: subnet-aaa, az: ap-southeast-1a }
+  #     - { id: subnet-bbb, az: ap-southeast-1b }
+  # 理由:ALB 判 target 是否可用看的是 target 所在 AZ 有没有为该 ALB 启用,不是子网 id。
+  # edge 实例落到 ALB 未启用的 AZ 后 target 永久 Target.NotInUse,健康检查也不会替换它
+  # —— 那部分机队是死重,且不会自愈。裸 subnet id 经 CDK from_subnet_id 导入后 AZ 是
+  # token,synth 期取不到具体值,于是这条不变量无法校验;因此裸 id 会被 fail-closed 拒绝。
+  # edge.subnet_ids 同理。留空则由 ALB 的 AZ 集合自动派生 edge 子网,无需手写。
+  subnet_ids: []
 
 # OpenResty 边缘查 tenant_id→host:port 的准静态路由,host-agent 建/删/迁双写。
 # 默认 false=不建(存量环境无 route.lua,零变化)。P7 部署新数据面时开 true。
@@ -622,6 +632,12 @@ security:
   egress_allowlist_domains: ""
   # host dnsmasq 的上游解析器。默认沿用 guest 原硬编码 8.8.8.8 便于对齐;可改 VPC Resolver 169.254.169.253。
   egress_dns_upstream: "8.8.8.8"
+  # #517 阶段3(G1 fail-closed)—— 只读身份盘(openclaw-immutable.ext4:7 个身份 md + ops skills)
+  #   缺失时是否【拒绝启动】该 microVM。默认 false = 既有兼容行为:launch-vm.sh 打 WARN 后照常
+  #   起,guest 回落到 data 盘里【烤制当天】的旧 md 副本 + 开机 bind-mount 遮盖失效 → agent 读到
+  #   旧身份而控制面无任何告警(§4 G1 的静默旧副本)。开 true 后盘缺失 → launch-vm.sh exit 1,
+  #   宁可这台起不来也不静默跑错身份。改部署代码→重建生效,非热改。
+  immutable_disk_required: false
 
 # ========== claw-hub 端点(microVM channel dial-out 目标)==========
 # 每个 microVM 的 claw-channel 拨出到 hub 注册(jarvis 同款 outbound WS)。

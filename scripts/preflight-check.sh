@@ -29,7 +29,8 @@ _sec(){   echo; echo "── $1 ──"; }
 
 # ── 用 python 把 config 解析成 shell 可读的 KEY=VAL(点分路径),存临时文件 ──
 CFGDUMP=$(mktemp)
-trap 'rm -f "$CFGDUMP"' EXIT
+RSG_ERRF=""   # Cat 10 用,提前声明好让下面这一条 trap 一起收(set -u)
+trap 'rm -f "$CFGDUMP" "$RSG_ERRF"' EXIT
 python3 - "$CONFIG" > "$CFGDUMP" <<'PY'
 import sys, yaml
 d = yaml.safe_load(open(sys.argv[1])) or {}
@@ -127,6 +128,7 @@ case "$HOOK_TO" in
   ''|*[!0-9]*) _block "asg.lifecycle_hook_timeout 缺失或非整数(${HOOK_TO:-空})— CDK 直接下标 CFG[\"asg\"][\"lifecycle_hook_timeout\"](ha_edge.py:1041),缺键 synth 就 KeyError;imported VPC + metal 用 3600";;
   *) if [ "$HOOK_TO" -ge 2700 ]; then
        _pass "asg.lifecycle_hook_timeout=$HOOK_TO ≥2700"
+     # 实测证据只覆盖 imported VPC + metal 机型这一组合(#488 台账);其余形态没有证据,
      # 只提醒不拦,免得把没证据的结论当硬门拦掉合法部署。
      elif [ "$MODE" = "imported" ] && echo "$HOST_IT_EARLY" | grep -q metal; then
        _block "asg.lifecycle_hook_timeout=$HOOK_TO <2700,且形态是 imported VPC + metal($HOST_IT_EARLY)— 这一组合实测 1200s 不够,会连续 ABANDON churn(preflight-region.sh:42 同一道门)"
@@ -136,12 +138,14 @@ case "$HOOK_TO" in
 esac
 
 # console_auth.user_pool_id 不能手填:auth.py 会走 legacy 分支建【不带账号后缀】的裸前缀
+# Cognito 域 → 域前缀全局唯一撞名 → 整栈 UPDATE_ROLLBACK(#479 B10 真机复现)。
 UPI=$(cfg console_auth.user_pool_id); CA_EN=$(cfg console_auth.enabled)
 if [ -z "$UPI" ]; then
   :   # 未填 = 正常路径,由 setup.sh 自行判定
 elif [ "$CA_EN" != "True" ]; then
   _warn "console_auth.user_pool_id 有值但 console_auth.enabled 非 true — auth.py:96 整段不生效(auth_cfg.get(\"enabled\")),这个键是死配置,建议删掉"
 else
+  # 判据同 #479 B10 的修法:本栈输出的 CognitoUserPoolId 与 config 里填的相同,
   # 说明填进去的是【本栈自己建的】池 → 走 legacy 分支建裸前缀域 → 全局撞名 → 整栈回滚。
   SELF_POOL=$(${AWSQ} cloudformation describe-stacks --stack-name OpenClawOrchestrator --query 'Stacks[0].Outputs[?OutputKey==`CognitoUserPoolId`].OutputValue' 2>/dev/null)
   if [ -n "$SELF_POOL" ] && [ "$SELF_POOL" = "$UPI" ]; then
@@ -152,6 +156,7 @@ else
 fi
 
 # bff_alb_subnet_ids:ConsoleBffALB 硬编码 internet_facing=True(auth.py:629),没有配置开关。
+# 注意真机验过:填私有子网 ALB **建得出来**,失效方式是"建好了公网到不了"→ 控制台打不开(#488)。
 BFF_N=$(cfglen console_auth.bff_alb_subnet_ids); PUB_N=$(cfglen network.imported.public_subnet_ids)
 if [ -n "$BFF_N" ] && [ -n "$PUB_N" ]; then
   bffs=""; i=0; while [ "$i" -lt "$BFF_N" ]; do bffs="$bffs $(cfg console_auth.bff_alb_subnet_ids.$i)"; i=$((i+1)); done
@@ -166,6 +171,7 @@ if [ -n "$BFF_N" ] && [ -n "$PUB_N" ]; then
 fi
 
 # 代码不读的键(写了静默不生效)。redis.instance_type 已在上面 redis 段单独提示,这里补其余 6 个。
+# 逐条 grep 过 deploy/ 读取次数为 0(#488)。自动缩容当前由 scaler/handler.py:22-30 的
 # IDLE_RECLAIM_ENABLED=False 硬关闭且不读 env,所以两个缩容键都是死键,别互相指认。
 for dk in edge.data_volume_gb edge.migration_drain_seconds alb.certificate_arn \
           console_auth.bff_in_vpc asg.scale_in_enabled scaler.idle_reclaim_enabled; do
@@ -200,6 +206,132 @@ if [ "$MODE" = "imported" ]; then
   fi
 else
   _pass "network.mode=$MODE(非 imported,跳过子网契约)"
+fi
+
+# ========== Cat 10 · Redis/Valkey 子网组漂移(#499 A1) ==========
+# 为什么是 BLOCK 而不是 WARN:ElastiCache 不允许改动被在役 replication group 占用的
+# 子网组。部署态子网组的 SubnetIds 与本次 synth 算出的集合只要不同,CFN 就会下发
+# ModifyCacheSubnetGroup → 400 GeneralServiceException → RedisSubnetGroup UPDATE_FAILED
+# → 整栈回滚;回滚期间若 AOS 域正在 Modifying 还会进 UPDATE_ROLLBACK_FAILED 自己出不来
+# (2026-08-13 真机 apse1)。这道判据把「整栈回滚 + 人工救栈」提前成部署前一行报错。
+_sec "Redis/Valkey 子网组漂移(在役集合 ≠ 本次会算出的集合 → ElastiCache 拒改 → 整栈回滚)"
+RSG_NAME="openclaw-redis-subnets${GS}"
+if [ "$R_ENABLED" != "True" ]; then
+  # 关掉 redis 不是"没这道判据"那么简单:若在役真有 Redis,这次部署会把路由面连同
+  # replication group 一起删掉(edge 靠它查路由),那是不可逆的数据面拆除,不是漂移。
+  # 所以这里仍要看一眼在役状态 —— 用 config 里的一个 false 静默拆掉在役路由面,是这道
+  # 门最该拦的那类事。
+  RD_ERRF=$(mktemp)
+  RD_LIVE=$(${AWSQ} elasticache describe-cache-subnet-groups --cache-subnet-group-name "$RSG_NAME" \
+              --query 'CacheSubnetGroups[0].CacheSubnetGroupName' 2>"$RD_ERRF")
+  RD_RC=$?
+  if [ "$RD_RC" -ne 0 ] && ! grep -q 'CacheSubnetGroupNotFoundFault' "$RD_ERRF"; then
+    _block "redis.enabled≠true,且查不动在役子网组 ${RSG_NAME}(退出码 $RD_RC):$(tr -d '\n' < "$RD_ERRF" | cut -c1-160)。无法确认这次部署会不会把在役 Redis 路由面(replication group + 子网组)一起删掉 —— 那是不可逆的数据面拆除,查不到就不能放行。与本文件其它判据同一条口径:状态未知 ≠ 安全。先修权限/网络再跑"
+  elif [ -n "$RD_LIVE" ] && [ "$RD_LIVE" != "None" ]; then
+    _block "config 里 redis.enabled≠true,但在役存在 Redis 子网组 ${RSG_NAME} —— 这次部署会把 Redis/Valkey 路由面(replication group + 子网组)一起删掉,edge 靠它查路由,属不可逆的数据面拆除。若本意不是下线 Redis,说明这份 config 落后于在役环境,把 redis.enabled 补成 true;确实要下线,请单独走退役流程并先备份路由数据"
+  else
+    _pass "redis.enabled≠true 且在役也没有 Redis 子网组,无子网组判据"
+  fi
+  rm -f "$RD_ERRF"
+# existing_subnet_group_arn 在【发起查询之前】就短路:该路径根本不下发
+# 一个本来零风险的部署拦下来。
+elif [ -n "$(cfg redis.existing_subnet_group_arn)" ]; then
+  # 配了 ARN 时栈就【不再声明】RedisSubnetGroup 资源(ha_edge.py:1438 → _redis_subnet_group=None)。
+  # 若这个 ARN 指向的正是【本栈自己建的】那个组,增量部署时 CFN 会看到资源被移除 →
+  # 下发 DeleteCacheSubnetGroup → 组仍被 replication group 占用 → 删不掉 → 整栈回滚。
+  # 也就是说这条「补救手段」用错对象时,会造出这道门本来要防的那个故障。必须拦。
+  # 与 ha_edge.py:1437 一致先 strip:前后空白会让下面的同名判定被绕过(配 " ...:openclaw-
+  # redis-subnets " 时名字比不上,保护就失效了),而栈那边 strip 后照样把它当同一个组。
+  ARN_GRP=$(cfg redis.existing_subnet_group_arn)
+  ARN_GRP=$(printf '%s' "$ARN_GRP" | tr -d '[:space:]'); ARN_GRP="${ARN_GRP##*:}"
+  # 同名只是【疑似】本栈的组:客户完全可能自己建了一个同名组而本栈从未管过它,那种情况
+  # 模板里本来就没有这个资源、没什么可删,拦下来是误报。所以再问一次 CloudFormation:
+  # 本栈当前是否真的在管一个 AWS::ElastiCache::SubnetGroup 且物理 id 就是这个名字。
+  ARN_OWNED=no
+  if [ "$ARN_GRP" = "$RSG_NAME" ]; then
+    ARN_ERRF=$(mktemp)
+    ARN_OWNED_RAW=$(${AWSQ} cloudformation describe-stack-resources --stack-name OpenClawOrchestrator \
+                      --query "StackResources[?ResourceType=='AWS::ElastiCache::SubnetGroup'].PhysicalResourceId" 2>"$ARN_ERRF")
+    ARN_RC=$?
+    if [ "$ARN_RC" -ne 0 ]; then
+      # 查不动归属:不确定就按【保守】走(可能真会删掉在役组 → 整栈回滚)。
+      ARN_OWNED=unknown
+    else
+      printf '%s' "$ARN_OWNED_RAW" | tr '\t' '\n' | grep -qx "$RSG_NAME" && ARN_OWNED=yes
+    fi
+    rm -f "$ARN_ERRF"
+  fi
+  if [ "$ARN_OWNED" = yes ] || [ "$ARN_OWNED" = unknown ]; then
+    _block "redis.existing_subnet_group_arn 指向的子网组 ${RSG_NAME} 由【本栈】管理(CFN 归属核实结果:$ARN_OWNED;unknown=查不动归属,按保守处理)。配了它之后栈不再声明该资源(ha_edge.py:1438),增量部署时 CFN 会去删这个仍被 replication group 占用的组 → 删不掉 → 整栈回滚,正是本判据要防的故障。这条手段只适用于【栈外部管理】的子网组;要固定本栈这个组请改用 redis.subnet_ids 写成在役那几个 id。确实要交给外部管理的话,得走 retain→import 的分步迁移(单独规划,别混在一次增量部署里)"
+  else
+    _pass "redis.existing_subnet_group_arn 指向栈外部管理的子网组 $ARN_GRP(≠本栈的 $RSG_NAME)— 不建也不改,不下发 ModifyCacheSubnetGroup(#281),漂移已钉死(本判据无需查在役组)"
+  fi
+else
+  # 不能把报错吞成「组不存在」:IAM 拒绝 / 限流 / 网络不通都会让输出为空,一律当首次部署
+  # 就会在这道**专门防整栈回滚**的门上给出假绿。所以分开拿 stderr 与退出码,只认
+  # CacheSubnetGroupNotFoundFault 为「真的没有」,其余查不动一律 BLOCK(状态未知 ≠ 安全)。
+  RSG_ERRF=$(mktemp)   # 由顶部那条 EXIT trap 统一清理,别在这里再设 trap(会覆盖掉它)
+  RSG_RAW=$(${AWSQ} elasticache describe-cache-subnet-groups --cache-subnet-group-name "$RSG_NAME" \
+              --query 'CacheSubnetGroups[0].Subnets[].SubnetIdentifier' 2>"$RSG_ERRF")
+  RSG_RC=$?
+  RSG_LIVE=$(printf '%s' "$RSG_RAW" | tr '\t' '\n' | grep -v '^$' | sort | tr '\n' ' ')
+  if [ "$RSG_RC" -ne 0 ] && ! grep -q 'CacheSubnetGroupNotFoundFault' "$RSG_ERRF"; then
+    _block "查不动在役子网组 $RSG_NAME(aws 退出码 $RSG_RC):$(tr -d '\n' < "$RSG_ERRF" | cut -c1-160)。这道门是为防「子网组漂移 → ElastiCache 拒改 → 整栈回滚」而存在的,查不到就等于不知道有没有漂移 —— 不当无风险放过。先修权限/网络再跑,或配 redis.existing_subnet_group_arn 把漂移钉死"
+  elif [ -z "$RSG_LIVE" ]; then
+    # rc=0 且为空,或 rc≠0 且报 NotFound:两者都是真的没有这个组(在役组必有 ≥1 个子网)。
+    _pass "在役子网组 $RSG_NAME 不存在(首次部署),无漂移风险"
+  else
+    # 复算本次会用的集合。显式 redis.subnet_ids 最准;留空时按 ha_edge.py 的回落顺序推。
+    RSG_WANT=""; RSG_SRC=""
+    NRSUB=$(cfglen redis.subnet_ids)
+    if [ -n "$NRSUB" ] && [ "$NRSUB" -gt 0 ] 2>/dev/null; then
+      RSG_WANT=$(i=0; while [ "$i" -lt "$NRSUB" ]; do cfg "redis.subnet_ids.$i"; i=$((i+1)); done | sort | tr '\n' ' ')
+      RSG_SRC="redis.subnet_ids(显式钉死)"
+    elif [ "$MODE" = "imported" ]; then
+      NP=$(cfglen network.imported.private_subnet_ids)
+      [ -n "$NP" ] && RSG_WANT=$(i=0; while [ "$i" -lt "$NP" ]; do cfg "network.imported.private_subnet_ids.$i"; i=$((i+1)); done | sort | tr '\n' ' ')
+      RSG_SRC="network.imported.private_subnet_ids(留空→回落 PRIVATE_WITH_EGRESS)"
+    else
+      # self_managed/default_vpc:CDK 建的私有子网带 aws-cdk:subnet-name=Private 标签。
+      # VPC 从【栈资源】里取而不是按 tag:Name=openclaw-vpc 找 —— Name 标签不保证唯一
+      # (同账号同 region 可能有多个同名 VPC / 上一代残骸),取错 VPC 就会算出一组毫不
+      # 相干的子网,然后拿它去和在役集合比 —— 结论必错。
+      # 两处查询都取退出码:查【失败】(权限/限流/网络)与查【成功但结果为空】必须分开 ——
+      # 前者是状态未知,不能降级成 WARN 放过(那就是假绿);后者才是「本判据算不出」。
+      SMV_ERRF=$(mktemp)
+      SMVPC=$(${AWSQ} cloudformation describe-stack-resources --stack-name OpenClawOrchestrator \
+                --query "StackResources[?ResourceType=='AWS::EC2::VPC'].PhysicalResourceId" 2>"$SMV_ERRF")
+      SMV_RC=$?
+      SMVPC=$(printf '%s' "$SMVPC" | tr '\t' '\n' | grep -v '^$' | head -1)
+      if [ "$SMV_RC" -ne 0 ]; then
+        _block "查不动本栈的 VPC(describe-stack-resources 退出码 $SMV_RC):$(tr -d '\n' < "$SMV_ERRF" | cut -c1-160)。算不出本次 Redis 子网组的目标集合就无法判漂移 —— 状态未知不当无风险放过。先修权限/网络再跑,或把 redis.subnet_ids 写成在役那几个 id 钉死"
+        rm -f "$SMV_ERRF"
+      elif [ -z "$SMVPC" ] || [ "$SMVPC" = "None" ]; then
+        rm -f "$SMV_ERRF"   # 查得动但栈里没 VPC 资源 → 下面按「算不出」走 WARN
+      else
+        rm -f "$SMV_ERRF"
+        SMS_ERRF=$(mktemp)
+        RSG_WANT=$(${AWSQ} ec2 describe-subnets --filters "Name=vpc-id,Values=$SMVPC" \
+                     "Name=tag:aws-cdk:subnet-name,Values=Private" --query 'Subnets[].SubnetId' 2>"$SMS_ERRF")
+        SMS_RC=$?
+        if [ "$SMS_RC" -ne 0 ]; then
+          _block "查不动 VPC $SMVPC 的 Private 子网(describe-subnets 退出码 $SMS_RC):$(tr -d '\n' < "$SMS_ERRF" | cut -c1-160)。同上:算不出目标集合就判不了漂移,不当无风险放过"
+          RSG_WANT=""
+        else
+          RSG_WANT=$(printf '%s' "$RSG_WANT" | tr '\t' '\n' | grep -v '^$' | sort | tr '\n' ' ')
+        fi
+        rm -f "$SMS_ERRF"
+        RSG_SRC="栈资源里的 VPC $SMVPC 中 aws-cdk:subnet-name=Private 的子网(留空→回落 PRIVATE_WITH_EGRESS)"
+      fi
+    fi
+    if [ -z "$RSG_WANT" ]; then
+      _warn "在役子网组 $RSG_NAME=[$RSG_LIVE],但本次目标集合在预检期算不出($RSG_SRC)。若与本次 synth 结果不同 → ElastiCache 拒改 → 整栈回滚(#499 A1)。稳妥做法:把在役这几个 id 写进 redis.subnet_ids 钉死,或配 redis.existing_subnet_group_arn"
+    elif [ "$RSG_WANT" = "$RSG_LIVE" ]; then
+      _pass "Redis 子网组无漂移(在役 == 本次目标;来源 $RSG_SRC)"
+    else
+      _block "Redis 子网组漂移!在役 $RSG_NAME=[$RSG_LIVE] 本次会算出=[$RSG_WANT](来源 $RSG_SRC)。ElastiCache 不允许改被在役 replication group 占用的子网组 → RedisSubnetGroup UPDATE_FAILED → 整栈回滚(#499 A1)。钉死办法:把 redis.subnet_ids 写成在役那几个 id。**不要**改用 existing_subnet_group_arn 指向这个组 —— 配了它栈就不再声明该资源,CFN 会去删这个仍在使用的组、同样整栈回滚;那个键只适用于栈外部管理的子网组"
+    fi
+  fi
 fi
 
 # ========== Cat 9a + 1 + 3 · 残骸撞名(ROLLBACK 空壳栈 / S3 / DDB) ==========
@@ -243,6 +375,7 @@ if [ -n "$VPCID" ]; then
   # 只有【栈这次真的会自建】同服务端点时,已有端点才构成冲突。
   #   · secretsmanager:由 logging.enabled + logging.aos.create_secretsmanager_vpce 决定。
   #     配置写明复用(false)时,已有端点正是想要的结果 —— 报 BLOCK 会让文档里的复用路径走不通,
+  #     还可能诱导删掉客户自有端点(#488 三轮 Codex 复核)。
   #   · execute-api:上游【没有】复用开关(lambdas.py 无条件自建),所以已有端点确实是冲突,
   #     除非它就是本套栈自己建的(按 CFN 标签判归属)。
   _SM_WANT=0
@@ -306,6 +439,7 @@ _sec "OpenSearch 服务关联角色(logging.enabled 时必需)"
 #   role to give Amazon OpenSearch Service permissions to access your VPC.
 # 账号里若已有 legacy 的 AWSServiceRoleForAmazonElasticsearchService,则继续用那个,也算过。
 #
+# 证据等级(#488):本条判据来自 AWS 官方文档 + 一次真实部署的栈事件,**未能安全自证复现**——
 # 两个可用测试账号都已有该角色且都有依赖它的在役域,复现需删在役 SLR 会打断在役域。
 # 本检查只做一次 iam get-role(只读),误报代价为零;判据若有偏差表现为"该 BLOCK 时没 BLOCK",
 # 即回落到当前行为(部署到 LogDomain 才失败),不引入新失败模式。
@@ -329,6 +463,7 @@ _sec "SSM 参数残留(/openclaw/* 不随栈销毁)"
 # /openclaw/litellm-host 在模板里是 CFN 资源,同时又被 userdata / setup.sh 带外写入,
 # 所以它【不随栈销毁】。重建时会在 changeset 阶段就挂:
 #   Early validation failed: ... AWS::SSM::Parameter ... already exists
+# 那时还没有任何资源被创建,日志里只有一行 already exists,极易看不出根因(#479 B2)。
 # 先单独拿 aws 的退出码 —— 塞进管道会把"权限不足/限流/网络故障"变成空输出,
 # grep -c 得 0,门就假绿放行了(门宁可红也不能假绿)。
 SSMRAW=$(${AWSQ} ssm describe-parameters --parameter-filters "Key=Name,Option=BeginsWith,Values=/openclaw" --query 'Parameters[].Name' 2>/dev/null)
@@ -355,6 +490,7 @@ else _pass "无 /openclaw/* SSM 参数残留"; fi
 
 # ========== Cat 5b · 公有子网的 IGW 默认路由(WARN:证伪过不是 CREATE 失败) ==========
 _sec "公有子网 IGW 默认路由(影响控制台可达性)"
+# 真机证伪(2026-08-13 apse1,#488):internet-facing ALB 放在【无】IGW 默认路由的子网里
 # **建得出来**(Scheme=internet-facing、State=provisioning 都正常),所以这【不是】
 # CREATE 失败,而是"建好了公网到不了"。因此只能 WARN —— 记 BLOCK 会拦掉合法部署。
 if [ "$MODE" = "imported" ] && [ -n "${PUB_N:-}" ]; then
@@ -389,6 +525,7 @@ HOST_IT=$(cfg host.instance_type); MINCAP=$(cfg asg.min_capacity)
 if echo "$HOST_IT" | grep -q metal; then
   q=$(${AWSQ} service-quotas get-service-quota --service-code ec2 --quota-code L-1216C47A --query 'Quota.Value' 2>/dev/null)
   # 首次部署 min 必须是 0(等镜像),但步骤 7 一定会拉起至少 1 台 —— 用 max(min,1) 算需求,
+  # 否则 min=0 时 need=0,任何配额都假绿,要等真起实例才撞墙(#488 四轮 Codex 复核)。
   _need_hosts=${MINCAP:-2}; [ "${_need_hosts:-0}" -lt 1 ] && _need_hosts=1
   need=$(( _need_hosts * 96 ))
   if [ -n "$q" ]; then

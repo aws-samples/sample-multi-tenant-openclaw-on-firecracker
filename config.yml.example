@@ -179,6 +179,7 @@ asg:
   # r8g.metal-24xl 物理机:Nitro 硬件初始化慢 + 下载 842MB 黄金镜像(rootfs+data)+
   # 解压挂盘 + 注册,600s 偏紧会反复 Heartbeat Timeout 替换。
   # imported VPC + metal 场景真机 1200s 也不够,默认给 3600s(1h)留足余量;
+  # preflight-region.sh 的门是 >=2700,低于它先红灯(#488)。
   lifecycle_hook_timeout: 3600
   use_spot: false
 
@@ -225,7 +226,8 @@ network:
 
 # 缺省全空/false:ALB 面向公网、子网按 network 模式自动选(向后兼容)。
 alb:
-  internal: false           # true=internal ALB(纯私有,不对公网);缺省按 api.mode=private 派生 internal
+  # #499 D — 本键【必须显式声明】,缺失即 fail-loud(ha_edge.py:1241 raise ValueError)。
+  internal: false           # true=internal ALB(纯私有,不对公网);false=面向公网
   subnet_ids: []            # 可选,显式指定 ALB 子网 id(imported 私有子网);空=按 internal/public 自动选
 
 # OpenResty 边缘查 tenant_id→host:port 的准静态路由,host-agent 建/删/迁双写。
@@ -238,7 +240,21 @@ redis:
   # Valkey = Redis OSS 的 BSD fork,协议/6379 端口与 Redis 客户端线级兼容,
   # 数据面 route.lua / host-agent redis-py 无需改。切引擎对存量路由集群是
   engine: "valkey"
-  subnet_ids: []             # #272 — 可选,显式指定路由表 Redis/Valkey 子网 id;空=私有子网自动选(≥2 跨 AZ)。
+  #
+  #   `PRIVATE_ISOLATED` 分支;它在 4341c496 合入、当天被 e09245c2 误删,至今未补回)。
+  #   `_helpers.py` 那层 Database(PRIVATE_ISOLATED)子网**仍然会建**,只是 Redis 不会自动选它。
+  #   → 想让 Valkey/Redis 落隔离 DB 层,**必须在这里显式写那 3 个 DB 子网 id**
+  #     (imported 模式另需 network.imported.database_subnet_ids 也传)。
+  #   → 留空 = 回落 Private 层(PRIVATE_WITH_EGRESS),这是当前默认,为向后兼容刻意不改。
+  #
+  # ⚠️ 存量环境升级前务必钉死【本键】:若在役子网组的 SubnetIds
+  #   与本次 synth 算出的集合不同,CFN 会下发 ModifyCacheSubnetGroup,而 ElastiCache
+  #   **不允许改被在役 replication group 占用的子网组** → UPDATE_FAILED → 整栈回滚
+  #   (2026-08-13 真机,#499 A1)。`scripts/preflight-check.sh` 已有该漂移判据会提前 BLOCK。
+  #   ⚠️ 别用 existing_subnet_group_arn 指向【本栈自己建的】那个组来"钉死":配了它之后栈
+  #   就不再声明 RedisSubnetGroup 资源,CFN 会去删这个仍被 replication group 占用的组 →
+  #   删不掉 → 同样整栈回滚。那个键只适用于【栈外部管理】的子网组。
+  subnet_ids: []
   node_type: "cache.r7g.large"  # 代码只读这个键,不要写 redis.instance_type(死键)。
   # engine_version 传 major.minor;补丁号(如 valkey 7.2.6)由 AWS 托管不显式指定。
   # valkey→"7.2";redis→"7.1"。参数组 family 自动取 <engine><major>(valkey7 / redis7)。
@@ -620,6 +636,7 @@ hub:
 
 # ========== AI Gateway(LiteLLM)开关 ==========
 # guest microVM 零凭据,LLM 调用经一个 OpenAI 兼容网关(LiteLLM)→ Bedrock。
+# #480 三态语义(默认「不部署」):
 #   ① url 填了               = 复用已有网关,CDK 只把它写进 SSM /openclaw/litellm-host。
 #   ② url 空 + managed_by_stack=true = CDK 自己起一台 LiteLLM(单机;ha_enabled=true 时是
 #                                     ASG+ALB+RDS 那套),起来后把地址写 SSM。
@@ -630,6 +647,7 @@ hub:
 #   → 不部署对 host 引导无害(init-host.sh 读 SSM 带 || echo "" 兜底,参数缺失只是 env 为空,
 #     不会引导失败)。可见后果:guest agent 没有模型端点可调 —— 未配网关时这是预期,不是 bug。
 ai_gateway:
+  # #480 默认 false = 不由本栈托管 LiteLLM。true = CDK 起一台(见 ha_enabled 决定单机/HA)。
   # 仅当 url 为空时此开关才起作用;url 非空时始终走「复用外部网关」,与本开关无关。
   #
   # ⚠ 存量升级必读:若你的现有部署此前靠「url 空即自动起 LiteLLM」跑着一台在役网关,

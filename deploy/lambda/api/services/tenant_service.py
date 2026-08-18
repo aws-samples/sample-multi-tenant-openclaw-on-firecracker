@@ -118,6 +118,7 @@ def _classify_claim_failure(err_response, cap_v, cap_m):
 def _fresh_host_state(err_response):
     """从 CCF 捎回的旧值里取出【赢家写完后的当前状态】,供重试刷新本地 host 字典。
 
+    #475 必修1 —— 只把"抢输"改成原地重试是【不够】的:重试仍然调 _reserve_slot(host),
     而里面 `expected = h["next_vm_num"]` 读的是同一个 stale 字典,于是 CAS 条件
     `next_vm_num = :expected` 必然再次不满足 —— 8 次重试确定性全废。真机实测(apse1
     2026-08-14,6 路并发单 host):只改分类时 6 路里 4 路拿到
@@ -574,6 +575,7 @@ def build_paired_json_b64(device):
     paired.json base64。paired.json 是 gateway 侧"已批准设备名单",首连命中即免人工
     approve(INJECTION-SPEC-2026.2.26.md,真机验证)。
 
+    #415(2.26→7.1 升级,真机实测):预铸一枚 `tokens.operator` 活跃 token。
     - 7.1(协议 v4)配对门 `listEffectivePairedDeviceRoles = 活跃tokens的role ∩ 批准role`,
       空 `tokens:{}` → effective roles 为空 → operator 被判 role-upgrade → 远程连接
       被拒(NOT_PAIRED,us-west-2 真机远程拓扑实测)。故必须在 tokens 里放一枚带
@@ -669,6 +671,7 @@ def read_gateway_token_ct(tenant_id):
 
     Returns None on: feature-off / no row. Never raises.
 
+    #353 — no TTL expiry check: the ciphertext persists for the tenant's whole
     life so rebuild/recover/restore months or years later can still read back
     the original token (an expired read → openssl fallback → token mismatch →
     JDWS can't connect). The `expires_at` field is no longer written/read; the
@@ -696,6 +699,7 @@ def read_device_identity(tenant_id):
 
     返回 dict {device_id, public_key(明文), private_key(KMS 密文), scopes} 或 None。
 
+    #353 — 去掉 device_expires_at 软过期检查:device 私钥密文随租户生命周期长存,
     让 1-2 年后 rebuild/recover 仍能回读原始设备身份,不因 TTL 过期读空 →
     paired.json 无源重注入 → NOT_PAIRED / token 不一致连不上。
     """
@@ -863,8 +867,10 @@ def _phys_tap_occupied(host_id, phys_num, exclude_id=None):
 def _persist_tenant_record(item, tenant_id):
     """把租户记录落库。成功返回 None;可预期冲突返回错误响应;意外异常向上抛(调用方回滚 slot)。
 
+    #93 —— 条件写 attribute_not_exists(id):同 id 重放(重试/双提交/队列重复消费)不覆盖已存在
     租户,冲突回 409 CONFLICT。
 
+    #394 codex NB2 —— canary 租户固定了具体版本(image_snapshot_time)时,其持久化必须与全局删
     快照【线性化】:否则 delete 扫描完租户表(即使强一致,也只是时间点)之后、deleting→deleted
     之前这条 put 才落库 → 版本被删但租户已固定它 → restart 拉不回(no-data-loss)。故 canary 走
     TransactWriteItems:租户 Put + 快照 status==active 的 ConditionCheck 同一事务。delete 先把 status
@@ -918,6 +924,11 @@ def _persist_tenant_record(item, tenant_id):
                 extra={"id": tenant_id},
             )
         raise
+
+
+def _initial_immutable_version(host, pinned_image_snapshot_time=None):
+    """Return the immutable coordinate for the disk a new tenant will attach."""
+    return pinned_image_snapshot_time or host.get("immutable_version", "")
 
 
 def create_tenant(body=None, event=None):
@@ -1736,6 +1747,7 @@ def create_tenant(body=None, event=None):
         Returns `(vm_num, None)` on success, else `(None, reason)` where reason is
         one of `_CLAIM_CONTENDED` / `_CLAIM_FULL`.
 
+        #475 必修1 —— 为什么必须分辨这两种失败:调用方在"真满了"时把 host 拉出候选池
         (见下方 tried_hosts 的注释,那是 2026-08-11 实测事故的修复),但在"只是抢输了
         槽位号"时把它拉黑,等于把一台【仍有余量】的 host 从池子里删掉。池里只剩一台有
         空间时,拉黑它就没有下一台 → 8 次重试只用掉 1 次就直接 503。而"池子接近装满"
@@ -2000,6 +2012,12 @@ def create_tenant(body=None, event=None):
         "status": "creating",
         "health_failures": 0,
         "rootfs_version": host.get("rootfs_version", ""),
+        # #517 阶段1 —— 新租户继承 host 当前的 immutable_version(只读身份盘版本坐标)。
+        # Canary 租户实际从固定的 versions/<snapshot>/ 挂盘,必须记录 candidate 坐标;
+        # live 租户才继承 host 当前坐标。否则 canary 一出生就被误标成 live。
+        "immutable_version": _initial_immutable_version(
+            host, pinned_image_snapshot_time
+        ),
         "config_template": config_template,
         "restore_backup_key": restore_backup_key,
         "tags": tags,
@@ -3225,6 +3243,8 @@ def _reserve_slot_on(host, vcpu, mem_mb, tenant_id):
     )
     cap_v = capacity.allocatable(int(host["total_vcpu"]), _cpu_r) - vcpu
     cap_m = capacity.allocatable(int(host["total_mem_mb"]), _mem_r) - mem_mb
+    # CAS 后都必须把 caller 持有的 host 字典推进到最新 next_vm_num。否则成功认领已
+    # 推进 DDB、本地 expected 却停在旧值,下一轮必然 CCF；而 _release_slot 刻意不回退
     try:
         r = clients.hosts_table.update_item(
             Key={"instance_id": host["instance_id"]},
@@ -3247,13 +3267,18 @@ def _reserve_slot_on(host, vcpu, mem_mb, tenant_id):
                 ":next_after": target + 1, ":cap_v": cap_v, ":cap_m": cap_m,
             },
             ReturnValues="UPDATED_NEW",
+            ReturnValuesOnConditionCheckFailure="ALL_OLD",
         )
         try:
-            return int(r["Attributes"]["next_vm_num"]) - 1
+            next_after = int(r["Attributes"]["next_vm_num"])
+            host["next_vm_num"] = next_after
+            return next_after - 1
         except (KeyError, TypeError, ValueError):
+            host["next_vm_num"] = target + 1
             return target
     except ClientError as e:
         if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            host.update(_fresh_host_state(e.response))
             return None
         raise
 
@@ -4006,9 +4031,44 @@ def _release_lifecycle_ctx(tenant_id, ctx):
     ctx.pop("lifecycle_fence_epoch", None)
 
 
+def finalize_async_rebuild_failure(
+    tenant_id,
+    op_id,
+    fence_epoch,
+    reason,
+):
+    """Close an admitted rebuild that failed before destructive host work."""
+    if not tenant_id or not op_id or fence_epoch is None:
+        print("async rebuild terminal stamp skipped: incomplete worker identity")
+        return
+    try:
+        clients.tenants_table.update_item(
+            Key={"id": tenant_id},
+            UpdateExpression=(
+                "SET rebuild_phase = :failed, rebuild_status = :failed, "
+                "rebuild_failed_reason = :reason, updated_at = :t"
+            ),
+            ConditionExpression=(
+                "rebuild_op_id = :op AND rebuild_lifecycle_fence_epoch = :epoch"
+            ),
+            ExpressionAttributeValues={
+                ":failed": _REBUILD_STATUS_FAILED,
+                ":reason": str(reason)[:1000],
+                ":t": utils._now(),
+                ":op": op_id,
+                ":epoch": int(fence_epoch),
+            },
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"async rebuild terminal stamp skipped for {tenant_id}/{op_id}: {e}")
+    finally:
+        lifecycle_fence.release(tenant_id, op_id, fence_epoch)
+
+
 def tenant_action(tenant_id, action, body=None, event=None):
     """POST /tenants/{id}/{action} 的入口。
 
+    #456 / ADR §5.1 —— 这层薄包装只负责 client_token 幂等记录的**收尾**:把内层不论从哪个
     return 退出(tenant_action 内部有 36 个 return)的结果统一写成 result。
     为什么用包装而不是在每个 return 前加 finish():36 处逐一插入,漏一处就会让那条 idem
     记录永久停在 IN_PROGRESS —— 该客户带同一 token 的后续请求会被 409 挡死,再也发不出这个
@@ -4365,6 +4425,175 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
         _lifecycle_op_id = _lifecycle_op_id or _idem_op_id or secrets.token_hex(16)
         event = dict(event or {})
         event["_op_id"] = _lifecycle_op_id
+
+    # Rebuild has one business flow for both live and canary. The HTTP request
+    # performs only admission, fencing, and pollable progress anchoring, then
+    # asynchronously self-invokes this Lambda. The worker re-enters the single
+    # rebuild branch below with the same op_id and caller identity.
+    if action == "rebuild" and "_consumer_ident" not in (event or {}):
+        try:
+            _dispatch_fence_epoch, _fence_reason = lifecycle_fence.acquire(
+                tenant_id, _lifecycle_op_id, action
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"rebuild fence anchor failed for {tenant_id}: {e}")
+            return utils._resp(
+                503,
+                {
+                    "error": "could not fence the rebuild before dispatch; "
+                    "nothing was started - safe to retry",
+                    "code": "ENQUEUE_ANCHOR_FAILED",
+                    "id": tenant_id,
+                },
+            )
+        if _dispatch_fence_epoch is None:
+            return utils._resp(
+                409,
+                {
+                    "error": _fence_reason,
+                    "code": "LIFECYCLE_IN_FLIGHT",
+                    "id": tenant_id,
+                    "op_id": _lifecycle_op_id,
+                },
+            )
+        if _idem_ctx is not None:
+            _idem_ctx.update(
+                {
+                    "lifecycle_op_id": _lifecycle_op_id,
+                    "lifecycle_fence_epoch": _dispatch_fence_epoch,
+                    "hold_lifecycle_fence": True,
+                }
+            )
+
+        # The first read may have raced with a migration that released its
+        # fence just before this rebuild acquired it. Re-read under our fence
+        # so validation and the source identity anchor describe one placement.
+        try:
+            item = clients.tenants_table.get_item(
+                Key={"id": tenant_id}, ConsistentRead=True
+            ).get("Item")
+            _resolved = (
+                _rebuild_repin_resolve(item, _rebuild_body) if item else None
+            )
+        except Exception as e:  # noqa: BLE001
+            lifecycle_fence.release(
+                tenant_id, _lifecycle_op_id, _dispatch_fence_epoch
+            )
+            if _idem_ctx is not None:
+                _idem_ctx["hold_lifecycle_fence"] = False
+                _idem_ctx["release_lifecycle_fence_on_error"] = True
+            print(f"rebuild admission failed before invoke for {tenant_id}: {e}")
+            return utils._resp(
+                503,
+                {
+                    "error": "could not validate the rebuild before dispatch; "
+                    "nothing was started - safe to retry",
+                    "code": "ENQUEUE_ANCHOR_FAILED",
+                    "id": tenant_id,
+                },
+            )
+        if not item:
+            lifecycle_fence.release(
+                tenant_id, _lifecycle_op_id, _dispatch_fence_epoch
+            )
+            if _idem_ctx is not None:
+                _idem_ctx["hold_lifecycle_fence"] = False
+            return utils._resp(404, {"error": "tenant not found"})
+        if not (isinstance(_resolved, dict) and "channel" in _resolved):
+            lifecycle_fence.release(
+                tenant_id, _lifecycle_op_id, _dispatch_fence_epoch
+            )
+            if _idem_ctx is not None:
+                _idem_ctx["hold_lifecycle_fence"] = False
+            return _resolved
+
+        try:
+            _stamp_rebuild_progress(
+                tenant_id,
+                op_id=_lifecycle_op_id,
+                phase=_REBUILD_PHASE_QUEUED,
+                started_at=utils._now(),
+                target_snapshot_time=_resolved.get("target_snap") or None,
+                new_operation=True,
+                fail_loud=True,
+                fence_epoch=_dispatch_fence_epoch,
+                source_host_id=item.get("host_id"),
+                source_vm_num=int(item.get("vm_num", 1)),
+            )
+        except Exception as e:  # noqa: BLE001
+            lifecycle_fence.release(
+                tenant_id, _lifecycle_op_id, _dispatch_fence_epoch
+            )
+            if _idem_ctx is not None:
+                _idem_ctx["hold_lifecycle_fence"] = False
+                _idem_ctx["release_lifecycle_fence_on_error"] = True
+            print(f"rebuild dispatch aborted before invoke for {tenant_id}: {e}")
+            return utils._resp(
+                503,
+                {
+                    "error": "could not record the rebuild before dispatch; "
+                    "nothing was started - safe to retry",
+                    "code": "ENQUEUE_ANCHOR_FAILED",
+                    "id": tenant_id,
+                },
+            )
+
+        ident = auth._get_caller_identity(event or {})
+        worker_body = dict(_rebuild_body)
+        if _resolved["channel"] == "canary" and _resolved.get("target_snap"):
+            # Freeze the canary selected during admission. A promotion or pull
+            # between HTTP 202 and worker start must fail the existing expected-
+            # snapshot guard, not silently rebuild onto a different candidate.
+            worker_body.setdefault(
+                "expected_image_snapshot_time", _resolved["target_snap"]
+            )
+        worker_payload = {
+            "_async_rebuild": {
+                "tenant_id": tenant_id,
+                "body": worker_body,
+                "_op_id": _lifecycle_op_id,
+                "_fence_epoch": _dispatch_fence_epoch,
+                "_ident": {
+                    "owner_id": ident.get("owner_id"),
+                    "is_admin": ident.get("is_admin"),
+                    "platform_scope": ident.get("platform_scope"),
+                    "tenant_user_id": ident.get("tenant_user_id"),
+                },
+            }
+        }
+        try:
+            boto3.client("lambda").invoke(
+                FunctionName=os.environ.get("AWS_LAMBDA_FUNCTION_NAME", ""),
+                InvocationType="Event",
+                Payload=json.dumps(worker_payload).encode("utf-8"),
+            )
+        except Exception as e:  # noqa: BLE001
+            # A transport timeout can happen after Lambda accepted the event.
+            # Keep the fence and queued anchor so callers can poll this exact
+            # operation instead of starting a second destructive rebuild.
+            print(f"rebuild async dispatch state unknown for {tenant_id}: {e}")
+            return utils._resp(
+                503,
+                {
+                    "error": "the async worker did not acknowledge the rebuild, but "
+                    "it may have been accepted. Do NOT blindly retry; poll this "
+                    "tenant's rebuild_phase/rebuild_status first.",
+                    "code": "ENQUEUE_STATE_UNKNOWN",
+                    "id": tenant_id,
+                    "op_id": _lifecycle_op_id,
+                },
+            )
+        if _idem_token and _idem_ctx is not None:
+            _idem_ctx["defer_finish"] = True
+        return utils._resp(
+            202,
+            {
+                "id": tenant_id,
+                "action": "rebuild",
+                "status": "queued",
+                "op_id": _lifecycle_op_id,
+            },
+        )
 
     # 控制面重构阶段1 — 产端入队:纯 lifecycle 动作(start/stop/restart/pause/resume)
     # 只是经 SSM 下发、无特殊同步返回值,队列开启时入 SQS 由 consumer 受控并发消费
@@ -4952,7 +5181,7 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
             )
         new_status = "running"
     elif action == "rebuild":
-        # All rebuilds use one synchronous channel flow. Missing image_channel is
+        # All rebuild workers use one channel flow. Missing image_channel is
         # live; both channels are resolved before the mandatory backup and before
         # any tenant/VM mutation.
         _resolved = _rebuild_repin_resolve(item, _rebuild_body)
@@ -5293,6 +5522,38 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
         else:
             _remove_attrs.append("q_rootfs_version")
 
+    # #517 immutable_version 盖戳(F3 + codex 交叉审 C4 后的最终口径)。
+    #   背景:launch-vm.sh:801-816 —— 钉版/canary 租户从 versions/<snapshot>/ 取只读盘(与 rootfs
+    #   同快照目录、同源 manifest.version);未钉版(live channel)租户则解析 live、重挂 host 当前
+    #   只读盘。故正确盖戳分两类:
+    #   · 采用事件(reset / 校验通过 rebuild):取 _stamp_rootfs 解出的 _resolved_ver(canary 候选/
+    #     rebuild 真实快照),回落 host.immutable_version。
+    #   · 唤醒事件(restart / start)且【未钉版】:重挂 host 当前只读盘 → 取 host.immutable_version
+    #     使坐标收敛(C4:issue §6 的「restart 后 md 翻新」正是这条;F3 只让钉版租户别被误标 live,
+    #     不是让 live 租户永不收敛)。【钉版/canary 租户 restart/start 不盖】——它们重挂的是自己
+    #     钉的旧快照,盖 host live 会谎报(F3)。resume 排除(解冻非重挂,仍持旧 inode)。
+    #   取值为空即照「非空才写」不覆盖(不谎报;旧 host / 无 immutable 盘的快照同此)。
+    _is_pinned = bool(item.get("image_snapshot_time"))
+    _stamp_immutable = _stamp_rootfs or (
+        action in ("restart", "start") and not _is_pinned
+    )
+    if _stamp_immutable:
+        _resolved_ver_i = locals().get("_resolved_ver") or None
+        if _resolved_ver_i:
+            _imm_ver = _resolved_ver_i  # 采用事件解析出的真实快照(canary/rebuild)
+        else:
+            # 未钉版唤醒 / 无 resolved 的 reset:取 host 当前 immutable_version。
+            # _stamp_rootfs 的 else 分支可能已按同 key 强一致读过 host;复用避免二次读。
+            _imm_host = locals().get("host")
+            if _imm_host is None:
+                _imm_host = clients.hosts_table.get_item(
+                    Key={"instance_id": item["host_id"]}, ConsistentRead=True
+                ).get("Item", {})
+            _imm_ver = _imm_host.get("immutable_version", "")
+        if _imm_ver:
+            update_expr += ", immutable_version = :iv"
+            expr_values[":iv"] = _imm_ver
+
     # 长轮询 x3)坐实约 1/3 的 rebuild:VM 真重启了(FC pid 变),但 _ssm_run 在 300s 内
     # 没拿到 Success 回执(SSM lag / consumer 180s 先超时)→ _rebuild_verified=False →
     # 上面不标 rootfs_version,而 API 仍返 200-running → 客户看不出"没升成",误判卡住。
@@ -5467,6 +5728,7 @@ def _resolve_backup(src_tenant_id, timestamp=None):
     """Return the S3 key of a backup, or empty string if not found.
     If timestamp is given, look up that exact backup. Otherwise return the most recent.
 
+    #199 fix — 两处桶/后缀 bug 导致备份存在却 resolve 不到(客户 restore/迁移拿不到
     数据):
       • bucket: backups 写在 BACKUP_BUCKET(WORM+CMK 专用桶,见 backup-data.sh:16
         `${BACKUP_BUCKET:-${ASSETS_BUCKET}}`),但这里原读 ASSETS_BUCKET → 永远 list

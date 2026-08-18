@@ -678,19 +678,63 @@ publish_host_assets() {
 # above is what let delete-vm.sh slip through, so derive the requirement from the artifact
 # that actually consumes it and fail loudly on any gap instead of discovering it as an
 # ABANDON loop on real hardware.
+# Recorded digests for one bare object name. Matching is by basename: the S3 key is
+# `deployment/scripts/<name>` while the kit artifact is `host-scripts/<name>.patched`.
+_dep_digests() {
+  python3 - "${KITDIR}/manifest.json" "$1" <<'PY'
+import json, sys
+paths = json.load(open(sys.argv[1], encoding="utf-8")).get("paths") or {}
+for r in paths.values():
+    art = r.get("artifact") or ""
+    if art.rsplit("/", 1)[-1] in (sys.argv[2], sys.argv[2] + ".patched"):
+        print(r.get("base_sha256") or "-", r.get("patch_sha256") or "-")
+        break
+PY
+}
+
 assert_bootstrap_script_deps() {
-  local root="$1" rel missing=0
+  local root="$1" rel missing=0 stale=0 undecided=0 ok_n=0 presence_only=0 work base_sha patch_sha got
+  work="$(mktemp -d)"
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
     if ! aws_ s3api head-object --bucket "$BUCKET" --key "deployment/scripts/$rel" >/dev/null 2>&1; then
       echo "   MISSING s3://${BUCKET}/deployment/scripts/${rel}" >&2
       missing=1
+      continue
+    fi
+    read -r base_sha patch_sha <<< "$(_dep_digests "${rel##*/}")"
+    if [ "${patch_sha:--}" = "-" ]; then
+      presence_only=$((presence_only + 1))
+      continue
+    fi
+    if ! aws_ s3 cp "s3://${BUCKET}/deployment/scripts/${rel}" "${work}/${rel##*/}" \
+         --no-progress >/dev/null 2>&1; then
+      echo "   UNREADABLE s3://${BUCKET}/deployment/scripts/${rel}" >&2
+      undecided=$((undecided + 1))
+      continue
+    fi
+    got="$(sha256_file "${work}/${rel##*/}")"
+    if [ "$got" = "$patch_sha" ]; then
+      ok_n=$((ok_n + 1))
+    elif [ "$got" = "$base_sha" ]; then
+      echo "   STALE ${rel} is still the pre-patch version — present but incompatible" >&2
+      stale=$((stale + 1))
+    else
+      echo "   UNDECIDED ${rel} matches neither recorded digest (sha=${got})" >&2
+      undecided=$((undecided + 1))
     fi
   done < <(grep -oE 'deployment/scripts/[A-Za-z0-9._/-]+' "$root/init-host.sh.patched" \
              | sed 's|deployment/scripts/||' | sort -u)
+  rm -rf "$work"
   [ "$missing" -eq 0 ] \
     || die "the patched bootstrap fetches objects that are absent from the bucket (see MISSING above); publishing the promoted template now would ABANDON every new host"
-  echo "   PASS every deployment/scripts object the patched bootstrap fetches is present"
+  # Presence was never the question: all three canary ABANDONs on the customer run were
+  # present-but-incompatible objects, which a head-object can never see.
+  [ "$stale" -eq 0 ] \
+    || die "$stale object(s) are still the pre-patch version (see STALE above); promoting now would ABANDON every new host for a reason a presence check cannot see"
+  [ "$undecided" -eq 0 ] \
+    || die "$undecided object(s) match neither recorded digest (see UNDECIDED/UNREADABLE above); refusing to promote against an undecided bucket"
+  echo "   PASS ${ok_n} object(s) match patch_sha256; ${presence_only} present-only (no digest recorded)"
 }
 
 restore_s3_asset() {

@@ -57,6 +57,153 @@ RECEIPT=""
 FINALIZED=0
 FIRST_WRITE=0
 ROUTE_STARTED=0
+ROUTE_FINALIZE_CONFIRM=""
+
+# Structurally discover a route-creation operation (one whose apply_cli runs apply-api-routes.sh)
+# from the manifest, rather than from a text label -- a text-marker scope check does not recognize
+# one, which is how an unattended run could install the control-plane code, never create the
+# routes, and still print PASS.
+#
+# This driver does NOT write route resources: doing so would mutate outside the operator's selected
+# scope, leave the helper's own transaction open, and need its own rollback bookkeeping. Route
+# application stays operator-driven (APPLY-INSTRUCTIONS Step 4b, Path A keeps ONE deployment by
+# deferring to apply-api). The driver's only route duty is the READ-ONLY gate below: it may not
+# report PASS unless the stage's active deployment actually serves them.
+ROUTE_HELPER="$HERE/apply-api-routes.sh"
+ROUTE_SPEC=""
+ROUTE_STAGE=""
+route_apply_cli="$(jq -r '[.paths[].operations[]? | select((.apply_cli // "") | test("apply-api-routes\\.sh"))][0].apply_cli // empty' "$MANIFEST" 2>/dev/null || true)"
+if [ -n "$route_apply_cli" ]; then
+  spec_rel="$(printf '%s\n' "$route_apply_cli" | awk '{print $3}')"
+  ROUTE_STAGE="$(printf '%s\n' "$route_apply_cli" | awk '{print $5}')"
+  case "$spec_rel" in
+    lib/*.json) ROUTE_SPEC="$KITDIR/$spec_rel" ;;
+    *) die "route operation apply_cli names an unexpected spec path: $spec_rel" ;;
+  esac
+  [ -f "$ROUTE_SPEC" ] || die "route spec named by the manifest is missing: $ROUTE_SPEC"
+  [ -n "$ROUTE_STAGE" ] || die "route operation apply_cli names no stage"
+fi
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+route_api_id() {
+  local api
+  api="$(jq -r '.control_plane_api.id // empty' "$ENVJSON" 2>/dev/null || true)"
+  [ -n "$api" ] \
+    || die "kit declares API routes but environment.json resolved no control-plane API id"
+  printf '%s' "$api"
+}
+
+# Is the route-helper state at $1 a DEFERRED transaction belonging to THIS rollout? Prints
+# "true"/"false". It computes the api itself: an earlier version expanded $api here while that name
+# was only ever local to route_state_file, so under `set -u` the check printed nothing and every
+# valid Path-A state was rejected (reproduced as "api: unbound variable").
+route_state_is_ours() {
+  local state_file="$1" api sha
+  api="$(route_api_id)"
+  sha="$(sha256_of "$ROUTE_SPEC")"
+  jq -r --arg api "$api" --arg stage "$ROUTE_STAGE" --arg region "$REGION" --arg sha "$sha" '
+      if (.deployment_deferred == true)
+         and (.api == $api) and (.stage == $stage) and (.region == $region)
+         and (.spec_sha256 == $sha)
+         and ((.rolled_back // false) == false)
+         and ((.finalized // false) == false)
+      then "true" else "false" end' "$state_file" 2>/dev/null || echo false
+}
+
+# Close an open route-helper transaction (Path A leaves a deferred state file that only the helper's
+# own finalize verifies and removes). No-op when the kit ships no route op or nothing is open.
+finalize_route_state() {
+  local api state_dir state_file deferred
+  [ -n "$ROUTE_SPEC" ] || return 0
+  # Only a transaction THIS rollout's Path A left behind is ours to close. A Path-B transaction
+  # (helper-owned deployment) still holds a replaced deployment that only its operator should
+  # release, and a run whose scope excluded routes must not touch it at all.
+  [ "$ROUTES_IN_SCOPE" -eq 1 ] || return 0
+  api="$(route_api_id)"
+  # Expand exactly the way the helper does (pathlib expanduser), so a tilde in
+  # OC_APPLY_API_STATE_DIR cannot make this look at a different file than the helper wrote.
+  # `${VAR-default}` (single dash) defaults only when UNSET, matching the helper's
+  # os.environ.get(): an explicitly EMPTY value must stay empty on both sides.
+  state_dir="$(OC_DIR="${OC_APPLY_API_STATE_DIR-~/.oc-apply-api-routes}" python3 -c 'import os,pathlib;print(pathlib.Path(os.environ["OC_DIR"]).expanduser())')"
+  state_file="$state_dir/$api.$ROUTE_STAGE.json"
+  [ -f "$state_file" ] || return 0
+  deferred="$(route_state_is_ours "$state_file")"
+  if [ "$deferred" != "true" ]; then
+    record_skip "finalize-routes" \
+      "$(shell_command bash "$ROUTE_HELPER" finalize "$ROUTE_SPEC" "$api" "$ROUTE_STAGE" "$REGION")" \
+      "route state at $state_file is not a deferred transaction of this rollout; its owner must finalize it" \
+      || die "cannot record that finalize-routes was withheld"
+    return 0
+  fi
+  printf '%s\n' APPLY > "$ROUTE_FINALIZE_CONFIRM"
+  run_step "finalize-routes" \
+    "$(shell_command bash "$ROUTE_HELPER" finalize "$ROUTE_SPEC" "$api" "$ROUTE_STAGE" "$REGION")" \
+    bash -c 'exec "$1" finalize "$2" "$3" "$4" "$5" < "$6"' _ \
+      "$ROUTE_HELPER" "$ROUTE_SPEC" "$api" "$ROUTE_STAGE" "$REGION" "$ROUTE_FINALIZE_CONFIRM"
+  return $?
+}
+
+# A helper-owned (Path B) route transaction that is still open holds a replaced deployment that only
+# its operator may release. If this driver ran apply-api on top of it, apply-api would record the
+# helper's deployment as its own and its finalize could delete the wrong one. Detect that BEFORE any
+# API write and stop, rather than discovering it after finalize-api already ran.
+route_state_file() {
+  local api state_dir
+  [ -n "$ROUTE_SPEC" ] || return 1
+  api="$(route_api_id)"
+  # `${VAR-default}` (single dash) defaults only when UNSET, matching the helper's os.environ.get().
+  state_dir="$(OC_DIR="${OC_APPLY_API_STATE_DIR-~/.oc-apply-api-routes}" python3 -c 'import os,pathlib;print(pathlib.Path(os.environ["OC_DIR"]).expanduser())')"
+  printf '%s' "$state_dir/$api.$ROUTE_STAGE.json"
+}
+
+refuse_open_route_transaction() {
+  local state_file deferred
+  [ -n "$ROUTE_SPEC" ] || return 0
+  [ "$ROUTES_IN_SCOPE" -eq 1 ] || return 0
+  state_file="$(route_state_file)" || return 0
+  [ -f "$state_file" ] || return 0
+  # Trusting only .deployment_deferred would let a foreign or half-written state wave the driver
+  # through, so route_state_is_ours also matches api/stage/region/spec-sha and rejects a terminal
+  # transaction. It computes the api itself -- expanding $api here was the unbound-variable bug.
+  [ "$(route_state_is_ours "$state_file")" = "true" ] && return 0
+  die "an open or unrecognised route-helper transaction exists for this stage ($state_file).
+  Finish it first -- 'apply-api-routes.sh finalize' to keep it, or 'rollback' to undo it --
+  then re-run this driver. Continuing would let apply-api record the helper's deployment as its
+  own and finalize the wrong one."
+}
+
+# Read-only gate: the kit declares API routes, so the run may not report PASS unless those routes
+# are actually SERVED by the stage's active deployment. Uses the helper's own verify, which fails
+# closed and names what is unserved.
+assert_routes_present() {
+  local api rc
+  [ -n "$ROUTE_SPEC" ] || return 0
+  api="$(route_api_id)"
+  run_step "assert-routes-present" \
+    "$(shell_command bash "$ROUTE_HELPER" verify "$ROUTE_SPEC" "$api" "$ROUTE_STAGE" "$REGION")" \
+    bash "$ROUTE_HELPER" verify "$ROUTE_SPEC" "$api" "$ROUTE_STAGE" "$REGION"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    warn "this kit's control-plane API routes are not served by API $api's active deployment."
+    warn "the routes were never applied, so recover by applying them and then RE-RUNNING THIS"
+    warn "DRIVER, which keeps one tool owning the stage's deployment and its own state:"
+    warn "  OC_ROUTE_DEFER_DEPLOYMENT=1 bash lib/apply-api-routes.sh apply $ROUTE_SPEC $api $ROUTE_STAGE $REGION"
+    warn "  bash lib/autopatch.sh $KITDIR --env $ENVJSON --region $REGION --yes"
+    warn "Do NOT drive the deployment from the route helper here: this run already activated its"
+    warn "own deployment, and letting the helper replace+delete it would desynchronise the"
+    warn "driver's recorded deployment. Re-running the driver leaves the earlier deployment as an"
+    warn "unreferenced snapshot, which is harmless; delete it with"
+    warn "  aws apigateway delete-deployment --rest-api-id $api --deployment-id <old-id> --region $REGION"
+  fi
+  return "$rc"
+}
 LAST_LOG=""
 PRECHECK_LOG=""
 CURRENT_STEP=""
@@ -569,6 +716,13 @@ ANSWERS_FINGERPRINT="$(jq -r '.answers_fingerprint // empty' "$DECISION")"
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RECEIPT="$KITDIR/autopatch-receipt-${STAMP}-$$.json"
+if [ -n "$ROUTE_SPEC" ]; then
+  # The helper's finalize is interactively gated; this driver already confirmed the recorded plan,
+  # so hand it the token from a 0600 temp file instead of adding an env bypass to the helper.
+  ROUTE_FINALIZE_CONFIRM="$(mktemp "${TMPDIR:-/tmp}/autopatch-route-finalize.XXXXXX")"
+  chmod 600 "$ROUTE_FINALIZE_CONFIRM"
+  remember_temp "$ROUTE_FINALIZE_CONFIRM"
+fi
 jq -n \
   --arg kit "$KIT_FINGERPRINT" --arg answers "$ANSWERS_FINGERPRINT" \
   --arg account "$ACCOUNT" --arg region "$REGION" \
@@ -882,7 +1036,9 @@ fi
 PHASES+=(verify)
 [ "$ROUTES_IN_SCOPE" -eq 0 ] || PHASES+=(verify-api)
 PHASES+=(reconcile post-verify)
+[ -z "$ROUTE_SPEC" ] || PHASES+=(assert-routes-present)
 [ "$ROUTES_IN_SCOPE" -eq 0 ] || PHASES+=(finalize-api)
+{ [ -z "$ROUTE_SPEC" ] || [ "$ROUTES_IN_SCOPE" -eq 0 ]; } || PHASES+=(finalize-routes)
 printf '   phases='
 printf '%s ' "${PHASES[@]}"
 printf '\n'
@@ -965,6 +1121,8 @@ else
   fi
 fi
 
+refuse_open_route_transaction
+
 if [ "$ROUTES_IN_SCOPE" -eq 1 ]; then
   ROUTE_STARTED=1
   run_step "apply-api" "$(shell_command bash "$APPLY" apply-api --env "$ENVJSON" --kit "$KITDIR")" \
@@ -995,6 +1153,14 @@ run_post_verify_step
 code=$?
 [ "$code" -eq 0 ] || stop_on_verification_failure "post-verify" "$code"
 
+# A kit that declares API routes cannot pass without them, even though this driver does not create
+# them (see the ROUTE_SPEC comment above). Read-only, and it runs BEFORE finalize-api on purpose:
+# finalize deletes the replaced deployment and closes the rollback window, so discovering a missing
+# route after it would leave no way back.
+assert_routes_present
+code=$?
+[ "$code" -eq 0 ] || stop_on_verification_failure "assert-routes-present" "$code"
+
 if [ "$ROUTES_IN_SCOPE" -eq 1 ]; then
   # Starting finalization can destroy the route rollback window even if the
   # finalization command or its receipt update later fails.
@@ -1004,6 +1170,17 @@ if [ "$ROUTES_IN_SCOPE" -eq 1 ]; then
   code=$?
   [ "$code" -eq 0 ] || stop_on_failure "finalize-api" "$code"
 fi
+
+# Close the route helper's transaction if one is still open. When the operator applied the routes
+# with the deployment deferred (Path A), the helper left a state file recording that; only its own
+# finalize verifies and removes it. Leaving it behind would make a later run think an apply is still
+# in flight. On a deferred state this deletes no deployment -- it re-proves the routes are served,
+# then drops the state -- and it is skipped when there is nothing open.
+finalize_route_state
+code=$?
+# finalize-api has already run at this point, so use the plain failure path: routing this through
+# stop_on_verification_failure would append a SKIPPED finalize-api record contradicting the RAN one.
+[ "$code" -eq 0 ] || stop_on_failure "finalize-routes" "$code"
 
 set_verdict "PASS" || die "cannot finalize receipt"
 FINALIZED=1

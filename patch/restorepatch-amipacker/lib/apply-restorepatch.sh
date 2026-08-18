@@ -1705,9 +1705,14 @@ apply)
   # is unknown or a mapping would stay pinned to an old published version.
   validate_control_overlay_scope
 
-  # put-lifecycle-hook replaces the whole hook, so every field this call omits reverts to the
-  # API default. Carrying the recorded DefaultResult through is what keeps widening the
-  # heartbeat from silently also changing what happens when the heartbeat expires.
+  # This call used to pass `--default-result ABANDON` as a literal, so widening the heartbeat
+  # also overwrote whatever the environment had chosen for the expiry behaviour -- and the
+  # rollback path restored that same literal rather than the original value. (Omitting the
+  # flag is not the issue: a probe on a throwaway ASG confirmed the API preserves an existing
+  # DefaultResult when the field is absent, CONTINUE stayed CONTINUE and ABANDON stayed
+  # ABANDON. The problem was writing a constant, not leaving the field out.) Passing the
+  # recorded value keeps this phase from deciding the expiry behaviour on the operator's
+  # behalf, and lets rollback put back what was actually there.
   hook_dr="$(state_get hook_backup_default_result)"
   [ -n "$hook_dr" ] || die "backup state has no hook_backup_default_result; re-run backup"
   say "1/3 widen $HOOK_NAME heartbeat to ${NEW_TIMEOUT}s (DefaultResult stays $hook_dr)"

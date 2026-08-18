@@ -32,6 +32,7 @@ from botocore.exceptions import ClientError
 import core.capacity as capacity
 import core.clients as clients
 import core.host_profile as host_profile
+# #491 — 物理 tap 占用守卫。core.scheduling 只依赖 core.*(不 import services),
 # 故此处无循环导入风险。
 import core.scheduling as scheduling
 from core.dispatch import (
@@ -243,6 +244,7 @@ def _snapshot_hosts(now_epoch: int, gate_inflight: bool = True) -> List[Dict[str
     """扫 active/idle host,算 free_slots + inflight_ok + simulated。ConsistentRead 强一致
     (与 core.scheduling._find_host 同款,防跨实例装满同一 host)。
 
+    #315 SPLIT_BY_MODE:gate_inflight 控制是否按"host 有未过期在途命令"算 inflight_ok。
     - push 模式(gate_inflight=True):保留旧逻辑——host 有未过期 inflight → inflight_ok=False,
       binpack 跳过它(host 级串行,poller 靠 inflight 标量追踪 SSM 终态需要这个串行)。
     - ddb 模式(gate_inflight=False):inflight_ok 恒 True,不因在途命令挡装箱(host-agent 每 5s
@@ -397,6 +399,7 @@ def _reserve_batch_txn(
     specs: List[Tuple[int, int]],
     write_inflight: bool = True,
     rootfs_version: str = "",
+    immutable_version: str = "",
 ) -> Optional[int]:
     """#412 —— 每 host 一批【一个 TransactWriteItems】:host 账本增量 + 每租户放置写
     + 唯一 capacity_reservation_id,全有或全无。返回该批 base vm_num;取消(容量/乐观锁
@@ -454,7 +457,7 @@ def _reserve_batch_txn(
         r = _reserve_batch_txn_once(
             tenants, instance_id, command_id, now_epoch, expected_next,
             cap_v, cap_m, dv, dm, n, write_inflight, _guest_ip, rootfs_version,
-            base=base, atomic_claim=atomic_claim,
+            base=base, atomic_claim=atomic_claim, immutable_version=immutable_version,
         )
         if r == _RESERVE_TXN_CONFLICT:
             # 明确的事务冲突/限流(TransactionConflict/throttle)→ 纯瞬时,重读重算重试。
@@ -517,7 +520,7 @@ def _read_next_vm_num(instance_id: str) -> Optional[int]:
 def _reserve_batch_txn_once(
     tenants, instance_id, command_id, now_epoch, expected_next,
     cap_v, cap_m, dv, dm, n, write_inflight, _guest_ip, rootfs_version="",
-    base=None, atomic_claim=True,
+    base=None, atomic_claim=True, immutable_version="",
 ):
     """跑一次 reserve 事务。返回:base vm_num(成功)/ None(真失败:租户项 CCF=delete 抢赢)
     / _RESERVE_TXN_CONFLICT(明确瞬时冲突/限流)/ _RESERVE_HOST_CCF(host 项条件失败,调用方重读
@@ -596,6 +599,13 @@ def _reserve_batch_txn_once(
             _rv_remove = ["q_rootfs_version"]
     else:
         _rv_remove = ["rootfs_version", "q_rootfs_version"]
+    # #517 阶段1(F4)—— immutable_version 与 rootfs_version 同范式随 reserve 回写:非空 SET、
+    # 空则 REMOVE 陈旧值(重投可能落到别版本写过的行,不清则与真实盘版本不一致)。无 GSI 投影
+    # (免 q_immutable_version;阶段2 探测口另议),故不含 ≤256B 投影分支。
+    if immutable_version:
+        _rv_set += ", immutable_version = :iv"
+    else:
+        _rv_remove.append("immutable_version")
     for offset, t in enumerate(tenants):
         vm_num = base + offset
         rid = _reservation_id(command_id, t["tenant_id"])
@@ -620,6 +630,8 @@ def _reserve_batch_txn_once(
         }
         if rootfs_version:
             _vals[":rv"] = rootfs_version
+        if immutable_version:
+            _vals[":iv"] = immutable_version
         txn_items.append(
             {
                 "Update": {
@@ -857,6 +869,7 @@ def _derive_exec_timeout(batch_size: int) -> int:
     """SSM executionTimeout = ceil(batch × per-vm-budget / 有效并发) + 120s 余量,
     并 ≤ visibility_timeout - 60s(防假超时→回滚活 VM→账本分叉)。
 
+    #331/#327:有效并发 = host 级槽闸数(DISPATCH_HOST_LAUNCH_CONCURRENCY,~30)不是装箱密度
     DISPATCH_MAX_PARALLEL(96)。VM 经跨进程 flock 槽【排队限速】起:batch 个 VM 分 ceil(batch/slots)
     【轮】跑,每轮并行 slots 个、耗时约 per_vm 秒。故公式 = ceil(batch/slots)×per_vm + 120 余量
     (codex #327:不是 batch×per_vm/slots——后者在不整除时少算一整轮尾巴)。"""
@@ -1135,6 +1148,12 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     rootfs_by_host = {
         h["instance_id"]: (h.get("raw") or {}).get("rootfs_version", "") for h in hosts
     }
+    # #517 阶段1(F4 修正,codex 交叉审)—— 队列化(生产)create 路径同步回写只读身份盘版本坐标
+    # immutable_version,与 rootfs_version 对称。此前仅同步 create_tenant 写它、reserve 事务只带
+    # rootfs → 队列化创建的租户建户即缺 immutable 坐标(阶段2 rootfs-drift 会误报)。
+    immutable_by_host = {
+        h["instance_id"]: (h.get("raw") or {}).get("immutable_version", "") for h in hosts
+    }
     failures: List[str] = []
     # 但 reserve 时被并发抢输)的租户 tid,稍后对其【原消息】缩短 visibility(960→15s)快速
     # 重投——高并发接近满容量时 CAS loser 是最常见的溢出类型,漏了它容量竞争输家仍卡 960s。
@@ -1165,6 +1184,7 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         sum_vcpu = sum(v for v, _ in specs)
         sum_mem = sum(m for _, m in specs)
         # 每租户放置写 + 唯一 capacity_reservation_id。取代旧的"_try_reserve_host 整批 CAS
+        # #491(R3-1)选择方案(a):空段重算和 ps_* 占号都在 _reserve_batch_txn 内完成,
         # 最终由 _reserve_batch_txn_once 的同一个事务写 host 账本、占号和租户放置。
         # 这样每次 CCF 重读 next_vm_num 后即使换 base,实际 reserve 与占号仍天然同段；
         # 不再保留“先挪号/占号一次、事务重试可能换号”的双写窗口。
@@ -1182,6 +1202,7 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             specs,
             write_inflight=gate_inflight,
             rootfs_version=rootfs_by_host.get(instance_id, ""),
+            immutable_version=immutable_by_host.get(instance_id, ""),
         )
         if base == _RESERVE_TRANSIENT:
             # 未生效。整批进 batchItemFailures 让原消息重投,但【不计 dispatch_retries、不清 claim】
@@ -1228,6 +1249,7 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             if push_mode and all_settled:
                 _clear_inflight_scalar(instance_id, command_id)
 
+        # #491 —— 队列路径撞号守卫(此前零覆盖)。reserve 的 CAS 只保证 next_vm_num 原子
         # 递增,不保证发出的号未被本 host 在役租户物理占用:发号器一旦被回退(init-host
         # 整项覆写、host_service.register_host 无条件 put_item),CAS 会把已在用的号再发一遍
         # 且每次都成功 → launch-vm.sh 随后 `ip link del`+`kill -KILL` 抢占先到者的 tap
@@ -1285,6 +1307,7 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
                     "phys tap occupied on host (batch released)",
                     instance_id,
                 )
+                # #491(codex review)—— 记 reserve_retry_tids 而不是 capacity_retry_tids:
                 # 后者会进 _release_claims 并 ADD dispatch_retries(:1424),
                 # DISPATCH_RETRY_BUDGET 默认 3,于是连撞三次就把租户推进
                 # requires_intervention(:1483 的收敛逻辑)。撞号是**环境异常**(发号器被
@@ -1458,6 +1481,7 @@ def _release_claims(tenant_ids: List[str], claim_id: str) -> set:
     claim 被静默 ack 删 → 丢消息;释放失败的保留队列默认 960s visibility(或到 maxReceiveCount
     进 DLQ,由 DLQ 告警/redrive 恢复)兜底重投,不静默丢)。
 
+    #141 收敛主修:ADD dispatch_retries 后,若新值达到重试预算,立刻转
     requires_intervention。为什么在这里而非只靠认领闸的 over-budget 分支——
     时序:SQS dlq_max_receive_count=N,消息第 N 次接收失败时 dispatch_retries
     从 N-1 ADD 到 N,此刻 SQS receiveCount=N=maxReceiveCount,消息转 DLQ,

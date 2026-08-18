@@ -375,6 +375,37 @@ PYEOF
   echo ""
 fi
 
+# ── 部署前配置门(#489)────────────────────────────────────────────────────────
+# scripts/preflight-check.sh 一直存在却【从未被任何部署路径调用】,于是 2026-08-13 的真机
+# 0→1 把它本来能挡的坑踩了一遍(VPCE 冲突、残骸撞名、死键)。门不跑等于不存在,所以焊在这里:
+# cdk deploy 之前无条件跑一次,有 🔴 BLOCK 就不进 deploy。
+# 只读:该脚本全程只 describe/list/get,不会改任何资源(它自己的头注释也这么写)。
+# 逃生开关 PREFLIGHT_SKIP=1 默认关;用了会打醒目告警并把「你跳过了什么」说清楚 ——
+# 留开关是因为这是部署入口的新中止点,任何误报都会直接挡住部署;但默认必须是拦。
+if [ "${PREFLIGHT_SKIP:-0}" = "1" ]; then
+  echo ""
+  echo "⚠️  PREFLIGHT_SKIP=1 —— 跳过部署前配置门(#489)。"
+  echo "    被跳过的判据包括:在役资源误判、VPCE private-dns 冲突、残骸撞名、config 死键、"
+  echo "    Redis 子网组漂移(会致整栈回滚)。出问题时请先不带这个开关重跑一次再报。"
+elif [ -x scripts/preflight-check.sh ]; then
+  echo ""
+  echo "── 部署前配置门(scripts/preflight-check.sh,只读)──"
+  # 主动传 config.yml/region/profile:门自己不猜这三样。PROFILE 为空时传 "-"(它的约定)。
+  if bash scripts/preflight-check.sh config.yml "$REGION" "${PROFILE:--}"; then
+    echo "✓ 部署前配置门通过,继续 cdk deploy"
+  else
+    echo "" >&2
+    echo "⛔ 部署前配置门有 🔴 BLOCK 项,已在 cdk deploy 之前中止(#489)。" >&2
+    echo "   逐条修掉上面的 BLOCK 再重跑 ./setup.sh。" >&2
+    echo "   确认是误报、必须先部署时:PREFLIGHT_SKIP=1 ./setup.sh $REGION $PROFILE ..." >&2
+    echo "   —— 但请顺手开一条 issue 记下那条误报,否则这道门会被逐渐绕成摆设。" >&2
+    exit 1
+  fi
+  echo ""
+else
+  echo "⚠️  scripts/preflight-check.sh 不可执行或不存在,跳过部署前配置门(#489)" >&2
+fi
+
 # stack 选择符的裸 cdk deploy 会报 "specify which stacks ... or --all" 并退出。
 # --all 按 add_dependency 拓扑序先 Orchestrator(建桶)后 OpenClawImage(烤镜像)。
 PATH=".venv/bin:$PATH" scripts/deploy-cdk.sh "$REGION" "$PROFILE" \

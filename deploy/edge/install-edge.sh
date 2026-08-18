@@ -15,8 +15,9 @@
 #     $edge_self_ip (drives local vs remote branch in balancer_pick).
 #
 # Everything below the "install" section is kernel/network tuning called
-# out in the test plan "压测前环境核对". If any check fails we exit
-# non-zero so ASG lifecycle hooks catch it — no silent success.
+# out in 03-TEST-PLAN §8 "压测前环境核对". If any check fails we exit
+# non-zero so cloud-init records the failure; /healthz stays unhealthy, the
+# ELB health check rejects the target, and the ASG replaces the instance.
 
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -24,9 +25,54 @@ export DEBIAN_FRONTEND=noninteractive
 log() { printf '[install-edge] %s\n' "$*" >&2; }
 die() { log "FATAL: $*"; exit 1; }
 
+# rpm 锁竞争的总预算 = 90s 墙钟,给 edge.health_check_grace_period_seconds=300 留足
+# 正常自举时间(拉包、编译无关的解压、nginx 起来、warmup 探测)。
+#
+# 关键:预算是【跨所有调用点共享的墙钟 deadline】,不是每次调用各算一遍的 sleep 累加。
+# 早先按"每个调用点 18×5s sleep"计,漏了两件事 —— ① dnf 本身跑多久不计入
+# ② rpm --import / 两次 dnf install 三个调用点各自重置预算。最坏情况下总耗时能远超
+# 300s grace,于是"修好了锁竞争"反而变成"超时被 ASG 换机",故障形态换了但没修好。
+# 现在 deadline 在脚本启动时一次性定下,任何调用点耗尽它就 die。
+RPM_LOCK_RETRY_BUDGET_SECONDS=90
+RPM_LOCK_RETRY_INTERVAL_SECONDS=5
+RPM_LOCK_DEADLINE_EPOCH=$(( $(date +%s) + RPM_LOCK_RETRY_BUDGET_SECONDS ))
+OPENRESTY_PUBKEY_SHA256=fc40f82ba62260bd4a7837fb9c38d7997d57f17797d4cb5d9e40f28226aa7b14
+
+run_with_rpm_lock_retry() {
+    local attempt=0 output rc now remaining
+    while :; do
+        attempt=$((attempt + 1))
+        if output="$("$@" 2>&1)"; then
+            [[ -z "$output" ]] || printf '%s\n' "$output" >&2
+            return 0
+        else
+            rc=$?
+        fi
+        [[ -z "$output" ]] || printf '%s\n' "$output" >&2
+
+        # "Resource temporarily unavailable" 单独出现不是重试依据;只有同时出现
+        # rpm 锁签名,或 dnf 自己的 yum-lock 等待签名,才判定为锁竞争。
+        if ! grep -Eqi \
+            "can't create transaction lock|/var/lib/rpm/\\.rpm\\.lock|Waiting for process with pid|another app is currently holding the yum lock" \
+            <<<"$output"; then
+            die "command failed without rpm lock contention (rc=$rc): $*"
+        fi
+
+        # 墙钟判定:命令自身耗时也吃预算,所以这里用 date 而不是数 sleep 次数。
+        now="$(date +%s)"
+        remaining=$(( RPM_LOCK_DEADLINE_EPOCH - now ))
+        if (( remaining <= RPM_LOCK_RETRY_INTERVAL_SECONDS )); then
+            die "rpm lock contention exhausted the shared ${RPM_LOCK_RETRY_BUDGET_SECONDS}s wall-clock budget at /var/lib/rpm/.rpm.lock (attempt $attempt, ${remaining}s left): $*"
+        fi
+        log "rpm lock busy; retrying in ${RPM_LOCK_RETRY_INTERVAL_SECONDS}s (attempt $attempt, ${remaining}s of shared budget left)"
+        sleep "$RPM_LOCK_RETRY_INTERVAL_SECONDS"
+    done
+}
+
 # ── 0. Preflight: env + tools ────────────────────────────────────────────
 [[ -n "${ENGINE_REDIS_ENDPOINT:-}" ]] || die "ENGINE_REDIS_ENDPOINT must be set"
 LISTEN_PORT="${EDGE_LISTEN_PORT:-8080}"
+SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Split "host:port" for the nginx template.
 REDIS_HOST="${ENGINE_REDIS_ENDPOINT%:*}"
@@ -72,7 +118,16 @@ install_openresty_ubuntu() {
 }
 install_openresty_al2023() {
     # gettext 提供 envsubst(下方渲染 nginx.conf 模板用);AL2023 最小镜像不带。
-    dnf install -y -q ca-certificates gettext
+    run_with_rpm_lock_retry dnf install -y -q ca-certificates gettext
+    local pubkey="$SRC_DIR/openresty-pubkey.gpg"
+    local pubkey_sha256
+    [[ -f "$pubkey" ]] || die "bundled OpenResty public key missing: $pubkey"
+    pubkey_sha256="$(sha256sum "$pubkey" 2>&1)" || \
+        die "failed to compute OpenResty public key SHA-256: $pubkey_sha256"
+    pubkey_sha256="${pubkey_sha256%% *}"
+    [[ "$pubkey_sha256" == "$OPENRESTY_PUBKEY_SHA256" ]] || \
+        die "OpenResty public key SHA-256 mismatch: expected=$OPENRESTY_PUBKEY_SHA256 actual=$pubkey_sha256"
+    run_with_rpm_lock_retry rpm --import "$pubkey"
     # OpenResty dnf/yum repo.
     cat > /etc/yum.repos.d/openresty.repo <<'REPO'
 [openresty]
@@ -80,9 +135,8 @@ name=Official OpenResty Repository
 baseurl=https://openresty.org/package/amazon/2023/$basearch
 gpgcheck=1
 enabled=1
-gpgkey=https://openresty.org/package/pubkey.gpg
 REPO
-    dnf install -y -q openresty
+    run_with_rpm_lock_retry dnf install -y -q openresty
 }
 
 if [[ -x /usr/local/openresty/nginx/sbin/nginx ]]; then
@@ -97,7 +151,6 @@ fi
 
 # ── 3. Deploy route.lua + lib/ under lualib/edge ─────────────────────────
 LUALIB=/usr/local/openresty/lualib/edge
-SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$LUALIB/lib"
 install -m 0644 "$SRC_DIR/route.lua" "$LUALIB/route.lua"
 install -m 0644 "$SRC_DIR"/lib/*.lua "$LUALIB/lib/"
@@ -113,7 +166,7 @@ export EDGE_SELF_IP="$SELF_IP"
 envsubst '$ENGINE_REDIS_HOST $ENGINE_REDIS_PORT $EDGE_SELF_IP' \
     < "$SRC_DIR/nginx.conf" > "$CONF_DIR/nginx.conf"
 
-# ── 5. Kernel / socket tuning (the test plan) ──────────────────────────
+# ── 5. Kernel / socket tuning (03-TEST-PLAN §8) ──────────────────────────
 cat > /etc/sysctl.d/99-openclaw-edge.conf <<'SYSCTL'
 # --- OpenClaw Pool edge tuning ---------------------------------
 # Ephemeral port pool: needs to be wide open for upstream fan-out
@@ -205,12 +258,13 @@ AWS_REGION="$FB_AWS_REGION" \
 FB_LOCAL_DIR="$SRC_DIR/fluent-bit/edge" \
     bash "$SRC_DIR/fluent-bit/install-fluent-bit.sh"
 
-# ── 9. Warmup wait on /healthz (the data-plane contract) ───────────────────
+# ── 9. Warmup wait on /healthz (INTERFACE-CONTRACT §6) ───────────────────
 # nginx accepts on :8080 in ~200ms but route.lua's warmup gate returns 503
 # until the async Redis PING succeeds (up to 30s + a bit of slack). We
 # poll /healthz here so the userdata script only returns success once the
-# instance is truly ready to serve — ASG lifecycle hook then signals
-# CONTINUE. Cap at 90s to still fail-fast on genuinely broken Redis.
+# instance is truly ready to serve; the ELB /healthz check is the gate, and
+# an unhealthy target is replaced by the ASG. Cap at 90s to still fail-fast
+# on genuinely broken Redis.
 if command -v curl >/dev/null 2>&1; then
     for i in $(seq 1 45); do
         code="$(curl -o /dev/null -s -w '%{http_code}' \

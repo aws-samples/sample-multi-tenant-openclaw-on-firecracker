@@ -81,7 +81,7 @@ promote 必须回传验证过的 canary `snapshot_time` —— **版本 CAS 以 
 重建到该 Host 的 `live` 或 `canary` 槽位。
 
 - `image_channel` 可省略；省略与显式传 `live` 完全等价。
-- 只有一个 rebuild 流程，恒同步执行，不返回排队状态。
+- 只有一个 rebuild 流程；API 返回 `202` 后由异步 worker 执行，不按 channel 拆分入口。
 - `live` 和 `canary` 都必须在当前 Host 上存在。缺 `live` 返回
   `409 NO_LIVE_VERSION`；缺 `canary` 返回 `409 CANARY_NOT_READY`，不会回落到另一版本。
 - 槽位校验通过后，服务端会先完成强制备份。备份失败返回

@@ -30,10 +30,12 @@ recipe_version = "1.0.0"
 # 与 config.yml host.root_volume_gb 同值。
 root_volume_gb = 20
 
-# ★ 生产构建必须给 —— provision-host.sh 从 assets_bucket 的
-# deployment/binaries/firecracker/ 拉 FC 二进制(#435)。没有角色就拉不到,
-# 脚本会回落公网 GitHub,产出的镜像仍可用但违反 #435 的"零 github 请求"验收。
-# 留空是为了让 `packer validate` 在没建角色时也能跑通语法检查。
+# #435 未落地 —— 当前留空即可,FC 取件不需要角色:provision-host.sh 无条件从
+# github.com 拉 FC 二进制(该脚本 :132),不读 assets_bucket。实跑证据:留空在
+# us-west-2 构建退出 0,第 3 步 `firecracker v1.15.1 installed`。
+# 也就是说【当前任何一次构建产出的镜像都请求过 github.com】,#435 的"零 github 请求"
+# 验收现在不成立 —— 这是 #435 未落地,不是本次构建配错。
+# 等 #435 落地后,这里要填一个能读 deployment/binaries/firecracker/ 前缀的角色。
 iam_instance_profile = ""
 
 # 【内部选项,客户流程留空】构建完成后把 AMI id 写到该 SSM 参数,

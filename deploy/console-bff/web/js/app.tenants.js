@@ -119,7 +119,7 @@ window.ocTenants = {
       // rebuild_status 三值(ADR-rebuild-idempotency-sync-contract §5.4):done / failed /
       // unconfirmed。unconfirmed = 没能确认(回执丢),真机很可能已升级成功 —— 此时【不要】
       // 重试,重试会再丢一次 overlay、抹掉两次之间的写入,应轮询等对账收敛。
-      this.toast = '✓ 已 rebuild→' + channel + '(看 rebuild_status:done 成功 / failed 可重试 / unconfirmed 请勿重试,轮询等确认)';
+      this.toast = '✓ rebuild→' + channel + ' 已提交，正在异步执行';
     } else {
       const b = r.body || {};
       const code = b.code ? ' [' + b.code + ']' : '';

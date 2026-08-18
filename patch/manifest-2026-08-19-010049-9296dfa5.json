@@ -1,0 +1,277 @@
+{
+  "synced_at": "2026-08-19 01:00:49 UTC+08:00",
+  "base_sha": "693896bab59f8edf4ab18ee3969c8a15a7487651",
+  "source_commit": "9296dfa55a2ce6977a186aa53ced5db049fb84fb",
+  "commit_count": 59,
+  "file_count": 25,
+  "summary": "Sync the bb increment 693896ba..9296dfa5 to the public gateway branch. Sync-LOG only (which customer-facing files reached gateway + the issues behind them); the applyable patch kit is NOT built yet (folded_into pending).",
+  "issues_synced_note": "Index back to the issue tracker for whoever builds the patch kit: before assembling the kit, walk each issue and confirm it's covered. `title` is a ≤20-char gist only — open the issue for the full problem/fix/test. Lists only issues that touched a released file this sync.",
+  "issues_synced": [
+    {
+      "id": "#435",
+      "type": "fix",
+      "title": "Packer 文档把 #435 目标状态…"
+    },
+    {
+      "id": "#446",
+      "type": "feat",
+      "title": "租户分配撞号时走 _skip in ra…"
+    },
+    {
+      "id": "#459",
+      "type": "feat",
+      "title": "rebuild 异步执行并立即返回 20…"
+    },
+    {
+      "id": "#489",
+      "type": "fix",
+      "title": "preflight 门焊进 setup.…"
+    },
+    {
+      "id": "#517",
+      "type": "feat",
+      "title": "workspace 核心身份 md"
+    },
+    {
+      "id": "#520",
+      "type": "fix",
+      "title": "Packer 文档把 #435 目标状态…"
+    },
+    {
+      "id": "#530",
+      "type": "feat",
+      "title": "edge 机队开机即不可服务"
+    },
+    {
+      "id": "#533",
+      "type": "fix",
+      "title": "fix"
+    },
+    {
+      "id": "#539",
+      "type": "feat",
+      "title": "host 污点写侧"
+    }
+  ],
+  "needs_config_on_apply": [
+    {
+      "file": "config.yml.example",
+      "param": "subnet_ids",
+      "change": "changed",
+      "value": "[]"
+    },
+    {
+      "file": "config.yml.example",
+      "param": "immutable_disk_required",
+      "change": "new",
+      "value": "false"
+    }
+  ],
+  "updated_files": {
+    "cdk-stack (cdk deploy OR hand-apply)": [
+      {
+        "path": "deploy/stacks/ha_edge.py",
+        "status": "modified",
+        "issues": [
+          "#517",
+          "#530"
+        ]
+      },
+      {
+        "path": "deploy/stacks/lambdas.py",
+        "status": "modified",
+        "issues": [
+          "#539"
+        ]
+      }
+    ],
+    "console (static assets, S3 sync)": [
+      {
+        "path": "deploy/console-bff/web/js/app.tenants.js",
+        "status": "modified",
+        "issues": [
+          "#459"
+        ]
+      }
+    ],
+    "docs": [
+      {
+        "path": "docs/api/pull-image-api.md",
+        "status": "modified",
+        "issues": [
+          "#459"
+        ]
+      },
+      {
+        "path": "docs/api/rebuild-api.md",
+        "status": "modified",
+        "issues": [
+          "#459"
+        ]
+      },
+      {
+        "path": "docs/aws-guide-en/09-api-integration.md",
+        "status": "modified",
+        "issues": [
+          "#459"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/09-api-integration.md",
+        "status": "modified",
+        "issues": [
+          "#459"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/openapi.yaml",
+        "status": "modified",
+        "issues": [
+          "#459"
+        ]
+      }
+    ],
+    "edge (OpenResty / Fluent Bit host config)": [
+      {
+        "path": "deploy/edge/install-edge.sh",
+        "status": "modified",
+        "issues": [
+          "#530"
+        ]
+      },
+      {
+        "path": "deploy/edge/openresty-pubkey.gpg",
+        "status": "added",
+        "issues": [
+          "#530"
+        ]
+      }
+    ],
+    "host-scripts (S3-pulled / baked into rootfs)": [
+      {
+        "path": "deploy/userdata/init-host.sh",
+        "status": "modified",
+        "issues": [
+          "#517"
+        ]
+      },
+      {
+        "path": "deploy/userdata/launch-vm.sh",
+        "status": "modified",
+        "issues": [
+          "#517",
+          "#533"
+        ]
+      }
+    ],
+    "lambda (update-function-code only)": [
+      {
+        "path": "deploy/lambda/api/core/host_taint.py",
+        "status": "added",
+        "issues": [
+          "#539"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/handler.py",
+        "status": "modified",
+        "issues": [
+          "#459",
+          "#539"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/dispatch_service.py",
+        "status": "modified",
+        "issues": [
+          "#517"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/host_service.py",
+        "status": "modified",
+        "issues": [
+          "#517",
+          "#533",
+          "#539"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/tenant_service.py",
+        "status": "modified",
+        "issues": [
+          "#446",
+          "#459",
+          "#517",
+          "#533"
+        ]
+      }
+    ],
+    "root / other": [
+      {
+        "path": "config.yml.example",
+        "status": "modified",
+        "issues": [
+          "#517",
+          "#530"
+        ]
+      },
+      {
+        "path": "deploy/packer/CUSTOMER-GUIDE.md",
+        "status": "modified",
+        "issues": [
+          "#435",
+          "#520"
+        ]
+      },
+      {
+        "path": "deploy/packer/README.md",
+        "status": "modified",
+        "issues": [
+          "#435",
+          "#520"
+        ]
+      },
+      {
+        "path": "deploy/packer/apse1.pkrvars.hcl",
+        "status": "modified",
+        "issues": [
+          "#435",
+          "#520"
+        ]
+      },
+      {
+        "path": "deploy/packer/host-golden.pkr.hcl",
+        "status": "modified",
+        "issues": [
+          "#435",
+          "#520"
+        ]
+      },
+      {
+        "path": "samples/config-sg-prod.yaml",
+        "status": "modified",
+        "issues": [
+          "#530"
+        ]
+      },
+      {
+        "path": "setup.sh",
+        "status": "modified",
+        "issues": [
+          "#489"
+        ]
+      }
+    ],
+    "scripts": [
+      {
+        "path": "scripts/preflight-check.sh",
+        "status": "modified",
+        "issues": [
+          "#489"
+        ]
+      }
+    ]
+  },
+  "folded_into": "(pending) — no patch kit built for this sync yet; a later kit should cite this manifest as source-of-record and set base_sha/patch_sha. cdk deploy is FORBIDDEN on hand-modified live deployments — the kit must ship *.patched host scripts + the full lambda tree + AWS CLI for stack changes, same shape as patch/315-concurrent-dispatch-rollup/."
+}

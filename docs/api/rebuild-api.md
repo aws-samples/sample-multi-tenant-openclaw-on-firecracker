@@ -8,7 +8,8 @@
 POST /tenants/{tenant_id}/rebuild
 ```
 
-该接口仅允许管理员调用，并且始终同步执行。接口不会返回 `202 Accepted`。
+该接口仅允许管理员调用。通过同步权限、参数、目标槽位和并发校验后，接口会返回
+`202 Accepted`；备份、镜像切换、VM rebuild 和采用验证由异步 worker 继续执行。
 
 ## Authentication
 
@@ -107,9 +108,9 @@ canary 信息后，宿主机槽位已被其他操作替换。若不匹配，服�
 1. 验证管理员权限和请求参数。
 2. 确认租户位于可执行 rebuild 的宿主机。
 3. 确认所选 `live` 或 `canary` 槽位存在。
-4. 完成强制备份。
-5. 切换租户镜像 channel 并重建 VM。
-6. 验证 VM 已采用目标镜像后返回成功。
+4. 获取租户 lifecycle fence，写入 `rebuild_phase=queued`，异步投递统一 rebuild worker。
+5. 返回 `202 Accepted` 和 `op_id`，不等待 rebuild 完成。
+6. Worker 完成强制备份、切换镜像 channel、重建 VM 并验证采用结果。
 
 如果所选槽位不存在，操作会在备份、channel 切换和 VM 重建前失败。服务端不会
 自动回落到另一个 channel。
@@ -126,13 +127,14 @@ flowchart TD
     C -->|"是，不同 token"| C1["409 REBUILD_IN_FLIGHT<br/>查询已有 rebuild 状态"]
     C -->|"否"| D{"权限、参数、宿主机<br/>和目标槽位有效？"}
     D -->|"否"| D1["返回 4xx<br/>不执行备份或 VM 重建"]
-    D -->|"是"| E{"强制备份成功？"}
+    D -->|"是"| QUEUED["queued<br/>HTTP 202 + op_id"]
+    QUEUED --> E{"异步 worker<br/>强制备份成功？"}
     E -->|"否"| E1["502 REPIN_BACKUP_FAILED<br/>不执行 VM 重建"]
     E -->|"是"| R["running<br/>rebuild_phase = running"]
     R --> V["verifying<br/>等待并校验宿主机采用证据"]
 
-    V -->|"确认采用目标镜像"| DONE["done<br/>HTTP 200"]
-    V -->|"当前无法确认"| U["unconfirmed<br/>HTTP 503 REBUILD_RETRY_PENDING"]
+    V -->|"确认采用目标镜像"| DONE["done"]
+    V -->|"当前无法确认"| U["unconfirmed"]
 
     U --> P["GET /tenants/{id}<br/>核对 rebuild_op_id"]
     P --> Q{"后续状态核对"}
@@ -152,7 +154,7 @@ flowchart TD
     classDef uncertain fill:#e8f1fb,stroke:#2f6f9f,color:#173a54
     classDef success fill:#e6f4ea,stroke:#31824a,color:#173f24
     classDef failure fill:#fdecec,stroke:#b84a4a,color:#5e2020
-    class R,V active
+    class QUEUED,R,V active
     class U,WAIT,P,Q uncertain
     class DONE,B1 success
     class FAILED,D1,E1,B2,C1 failure
@@ -161,22 +163,23 @@ flowchart TD
 `status` 在 rebuild 期间可能一直是 `running`，不要用它判断 rebuild 进度。
 `rebuild_status` 在 `running` 和 `verifying` 阶段可能不存在：
 
+- `queued`：请求已被接受，异步 worker 尚未开始执行。
 - `running`：服务端已开始执行 rebuild。
 - `verifying`：宿主机命令已提交，服务端正在等待或校验采用证据。
-- `unconfirmed`：本次同步请求未能确认结果；不要使用新 token 自动重试，先等待状态核对。
+- `unconfirmed`：异步 worker 未能确认结果；不要使用新 token 自动重试，先等待状态核对。
 - `done`：已确认采用目标镜像，操作完成。
 - `failed`：收到明确失败结果，或状态核对在规定时间内仍无法确认。重试前应查看
   `rebuild_failed_reason` 并确认租户的实际版本。
 
-## Success
+## Accepted
 
-采用验证成功后返回 `200 OK`：
+请求被接受后立即返回 `202 Accepted`：
 
 ```json
 {
   "id": "tenant-123",
-  "status": "running",
-  "rebuild_status": "done",
+  "action": "rebuild",
+  "status": "queued",
   "op_id": "6a2c..."
 }
 ```
@@ -196,7 +199,7 @@ curl -s "$BASE_URL/tenants/$TENANT_ID" \
 | Field | Meaning |
 | --- | --- |
 | `rebuild_op_id` | 最近一次 rebuild 的操作标识 |
-| `rebuild_phase` | 当前阶段：`running`、`verifying`、`unconfirmed`、`done` 或 `failed` |
+| `rebuild_phase` | 当前阶段：`queued`、`running`、`verifying`、`unconfirmed`、`done` 或 `failed` |
 | `rebuild_status` | 当前结果：`done`、`unconfirmed` 或 `failed`；执行中可能不存在 |
 | `rebuild_started_at` | 本次 rebuild 的开始时间 |
 | `rebuild_failed_reason` | 未确认或失败原因；成功时不存在 |
@@ -210,8 +213,8 @@ curl -s "$BASE_URL/tenants/$TENANT_ID" \
 - `failed`：Host 返回明确失败，或后续状态核对超时；具体原因见
   `rebuild_failed_reason`。
 
-同步请求返回 `503 REBUILD_RETRY_PENDING` 时，应先查询上述字段，并确认
-`rebuild_op_id` 对应本次请求。需要重试时必须复用原请求的 `client_token`。
+若状态为 `unconfirmed`，应继续查询上述字段，并确认 `rebuild_op_id` 对应本次请求。
+需要重试时必须复用原请求的 `client_token`。
 
 ## Errors
 
@@ -227,7 +230,8 @@ curl -s "$BASE_URL/tenants/$TENANT_ID" \
 | `409` | `IDEMPOTENT_OPERATION_IN_PROGRESS` | 相同 `client_token` 对应的 rebuild 仍在执行 |
 | `409` | `LIFECYCLE_SUPERSEDED` | 操作期间租户位置或生命周期所有权已变化 |
 | `502` | `REPIN_BACKUP_FAILED` | 强制备份失败；未执行镜像切换或 VM 重建 |
-| `503` | `REBUILD_RETRY_PENDING` | 未能确认本次采用结果 |
+| `503` | `ENQUEUE_ANCHOR_FAILED` | 无法写入异步操作锚点；worker 未启动，可安全重试 |
+| `503` | `ENQUEUE_STATE_UNKNOWN` | 异步投递结果未知；先按 `op_id` 查询，不能盲目重试 |
 
 ### Concurrent rebuild
 

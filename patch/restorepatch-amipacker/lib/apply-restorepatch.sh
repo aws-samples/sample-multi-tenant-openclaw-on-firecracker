@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # apply-restorepatch.sh — deterministic driver for restorepatch-amipacker.
 #
-# The kit's twelve synthesized CloudFormation resource changes are applied, verified and
-# rolled back ONLY through this tool, so no operator hand-assembles a fleet-breaking
-# command sequence and every executor runs identical code.
+# The kit's synthesized CloudFormation resource changes are applied, verified and rolled
+# back ONLY through this tool, so no operator hand-assembles a fleet-breaking command
+# sequence and every executor runs identical code. The count is not repeated here: it is
+# whatever `manifest.json` binds (44 at the time of writing, not the twelve this line
+# used to claim), and a hardcoded number in a comment goes stale the first time the
+# closure is re-captured.
 #
 # It covers exactly four concerns and refuses to do anything else:
 #   1. host-init lifecycle hook heartbeat timeout 1200 -> 3600
@@ -106,11 +109,14 @@ for record in json.load(sys.stdin):
 
 # Control-plane-only phases must remain usable before the dataplane AMI and ASG are ready.
 case "$PHASE" in
-  apply-control|verify-api|finalize-api|rollback-api)
+  apply-control|finalize-api|rollback-api)
     REQUIRED_VARS="REGION FN"
     ;;
-  apply-api)
-    REQUIRED_VARS="REGION FN"
+  apply-api|verify-api)
+    # These two resolve the target VPC from the host ASG before their first API Gateway
+    # call, so an empty ASG cannot be caught later — it surfaces mid-phase, after the
+    # endpoint work has already started. Require it up front instead.
+    REQUIRED_VARS="REGION FN ASG"
     ;;
   reconcile)
     case "$VERIFY_SCOPE" in

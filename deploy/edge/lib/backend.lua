@@ -1,6 +1,6 @@
 -- deploy/edge/lib/backend.lua
 --
--- Three-tier route cache + fail-static (the data-plane contract).
+-- Three-tier route cache + fail-static (INTERFACE-CONTRACT §2).
 --
 -- Layers (top-down):
 --   L1  worker-local lrucache (resty.lrucache)   — nanosecond hits
@@ -31,6 +31,15 @@
 --     Freshness comes from L1 (5s) invalidating first; L2 only feeds
 --     stale reads during Redis brownouts / failover, so a longer TTL
 --     does NOT slow down route updates on the happy path.
+--     #497 — that last sentence was NOT true before #497: every L2 read served
+--     any entry within L2_TTL, so on the happy path L1 kept being refilled from
+--     a value up to 60s old and a legit tenant move took up to 60s to reach the
+--     edge. Worse, if the stale host:port had meanwhile been reused by ANOTHER
+--     tenant's VM the upstream connected fine, the balancer never errored and
+--     invalidate() never fired, so traffic kept landing on the wrong microVM
+--     for the whole window. Enforcement now lives in l2_get's allow_stale
+--     argument (fresh-only by default, stale only for fail-static); the window
+--     is pinned by deploy/edge/test/backend_freshness_crosstenant_spec.lua.
 --   * Negative: 2s — unknown ids for scanners, don't cache long enough to
 --     make later legitimate creation feel slow. Deliberately short.
 
@@ -54,15 +63,53 @@ _M.SOURCE_STATIC = "static"-- fail-static (Redis error, L2 stale)
 local POS_TTL_SEC     = 5
 -- L2 (shared_dict) stale TTL — long enough to cover an ElastiCache
 -- Multi-AZ failover window while Redis is unreachable. See §8 of
--- the data-plane contract and the header comment above.
+-- INTERFACE-CONTRACT and the header comment above.
 local L2_TTL_SEC      = 60
 local NEG_TTL_SEC     = 2
--- Small ±0.5s jitter on positive TTL avoids herd expiry across workers.
+-- #497 — how long an observed Redis failure for ONE tenant's key counts as evidence
+-- that its route cannot be re-read. It does two jobs: authorise a lock-timeout waiter
+-- to fall back to that tenant's aged entry (answer_without_redis), and back the lock
+-- holder off the doomed connection (try_redis).
+--
+-- Deliberately much SHORTER than POS_TTL_SEC. The evidence suppresses re-reads, so
+-- after Redis recovers we keep serving an aged blob — which may be up to L2_TTL_SEC
+-- old and whose host:port may already belong to another tenant's VM — for as long as
+-- this window lasts. Keeping it well inside the freshness budget bounds that exposure;
+-- a persistent outage is unaffected because every holder attempt re-observes the error
+-- and refreshes the marker, so it stays present for the whole outage regardless of how
+-- short the TTL is. The trade was reviewed both ways across four cross-model rounds
+-- (add the backoff / drop it); this bounds it instead of picking a side.
+local ERR_TTL_SEC     = 0.5
+-- Small jitter on positive TTL avoids herd expiry across workers.
+-- #497 — DOWNWARD only. It used to be ±0.5s, so an L1 entry could live 5.5s while the
+-- L2 freshness marker expired at exactly POS_TTL_SEC — making the switch window this
+-- issue pins actually 5.5s, not 5s. Subtracting only keeps the herd spread out while
+-- making POS_TTL_SEC a true ceiling.
 local function pos_ttl_jitter()
-    return POS_TTL_SEC + (math.random() - 0.5)
+    return POS_TTL_SEC - math.random() * 0.5
 end
 
-local LOCK_TIMEOUT_SEC = 0.2  -- max time waiting behind another worker
+-- Max time waiting behind another worker. #497 — must EXCEED the holder's WARM Redis
+-- budget (300ms) plus scheduling margin. It used to be a flat 0.2s, i.e. shorter than
+-- the holder could possibly take to fail: at the start of an outage every waiter gave
+-- up before the holder published its failure evidence, so they all 503'd instead of
+-- falling back to fail-static. A waiter has nothing useful to do on its own now
+-- (answer_without_redis never touches Redis), so waiting out the holder is strictly
+-- better than giving up early. Derived, not hardcoded, so retuning the Redis timeouts
+-- cannot silently reintroduce the gap.
+--
+-- It deliberately does NOT cover a cold DNS resolution (redis_client.COLD_CEILING_MS,
+-- seconds). Blocking a request for that long to spare it a 503 would trade a bounded
+-- blip for worker starvation across the fleet — the wrong direction. Residual: when a
+-- holder is stuck in DNS, this tenant's waiters get the bounded 503 window described in
+-- answer_without_redis until the holder finally publishes its outcome.
+local LOCK_TIMEOUT_SEC = (redis_client.WARM_BUDGET_MS + 100) / 1000  -- 0.4s
+-- Lease, NOT a wait: sized against the COLD ceiling so the lock cannot expire while its
+-- holder is still legitimately working. With a shorter lease a DNS-stalled holder loses
+-- the lock, a second worker enters, and the two writes can land out of order — the
+-- stale/cross-tenant routing this issue removes. Nobody blocks for this long: waiters
+-- give up after LOCK_TIMEOUT_SEC and answer from the cache.
+local LOCK_EXPTIME_SEC = (redis_client.COLD_CEILING_MS + 700) / 1000  -- 4s
 
 -- Worker-local cache created at init_worker time via _M.init_worker().
 -- Capacity 4000 handles a hot subset of ~10w tenants per worker generously.
@@ -73,7 +120,7 @@ local NEG_SENTINEL = { __neg__ = true }
 
 --[[
     parse_value: decode the JSON string written by host-agent (see
-    the data-plane contract). Returns descriptor table, or nil on bad JSON.
+    INTERFACE-CONTRACT §1). Returns descriptor table, or nil on bad JSON.
     Rejects entries missing any required field so the caller can 404
     instead of routing to a black hole.
 --]]
@@ -99,6 +146,28 @@ end
 
 local function l2_key(tid) return "r:" .. tid end
 local function neg_key(tid) return "n:" .. tid end
+-- #497 — "this L2 entry was written within the L1 freshness window". Same value
+-- lives in L2 under two lifetimes: fresh (POS_TTL_SEC, servable on the happy
+-- path) and stale (L2_TTL_SEC, fail-static only). One extra shdict key is what
+-- lets l2_get tell the two apart; without it a 60s-old entry is indistinguishable
+-- from one the winning worker just filled.
+local function fresh_key(tid) return "f:" .. tid end
+-- #497 — per-tenant FAILURE GENERATION: a counter bumped every time reading this
+-- tenant's route from Redis fails, deleted as soon as a read succeeds. A waiter samples
+-- it before waiting and re-reads it after a lock timeout; a CHANGED value means "a
+-- failure completed during MY wait", which is the only thing that authorises serving an
+-- aged route.
+--
+-- A counter, not a timestamp: ngx.now() is cached per worker and only refreshed at
+-- yields, so events in one event-loop iteration share an instant. Comparing timestamps
+-- therefore misclassifies same-tick cases in BOTH directions — authorising an older
+-- failure, or refusing a genuine one and 503-ing mid-outage. incr() is atomic and
+-- changes on every failure regardless of the clock.
+--
+-- Per tenant, not endpoint-wide: a failure on tenant A must not authorise serving
+-- tenant B's aged route, because B's aged host:port may already belong to a third
+-- tenant's VM and no-cross-tenant outranks availability.
+local function err_key(tid) return "e:" .. tid end
 
 --[[
     init_worker: called from init_worker_by_lua_file. Creates the per-worker
@@ -137,15 +206,41 @@ local function put_positive(shared, tid, desc)
         local ok, err, forcible = shared:set(l2_key(tid), blob, L2_TTL_SEC)
         if not ok then
             ngx.log(ngx.WARN, "route_cache set positive failed: ", tostring(err))
-        elseif forcible then
-            ngx.log(ngx.INFO, "route_cache LRU evicted an entry (dict full)")
+            -- #497 — drop the entry entirely, marker included. Redis just handed us a
+            -- newer value, so whatever survived the failed write is proven obsolete:
+            -- keeping the marker would stamp it "fresh" and route traffic to the
+            -- previous endpoint, and keeping the blob alone would still let a later
+            -- Redis outage serve it through fail-static, where the old host:port may
+            -- by then belong to ANOTHER tenant's VM. Cost: this tenant loses its
+            -- fail-static material until the next successful write (a later outage
+            -- 503s instead) — the right side of no-cross-tenant over availability.
+            shared:delete(fresh_key(tid))
+            shared:delete(l2_key(tid))
+        else
+            if forcible then
+                ngx.log(ngx.INFO, "route_cache LRU evicted an entry (dict full)")
+            end
+            -- #497 — freshness marker, expires with the L1 window. Its absence does
+            -- not drop the route: the blob above still backs fail-static.
+            shared:set(fresh_key(tid), "1", POS_TTL_SEC)
         end
     end
 end
 
 local function put_negative(shared, tid)
     if L1_CACHE then L1_CACHE:set(tid, NEG_SENTINEL, NEG_TTL_SEC) end
-    if shared then shared:set(neg_key(tid), "1", NEG_TTL_SEC) end
+    if shared then
+        shared:set(neg_key(tid), "1", NEG_TTL_SEC)
+        -- #497 — Redis authoritatively has no route for this tenant, so any cached
+        -- positive is known-invalid and must not survive as fail-static material.
+        -- Without this, the sequence [positive cached] → [tenant deleted, Redis says
+        -- miss] → [2s negative expires] → [Redis unreachable] makes _finish_lookup
+        -- serve the deleted tenant's old host:port, which by then may belong to
+        -- ANOTHER tenant's VM. The negative's own 2s TTL is not a substitute: the
+        -- blob outlives it by up to L2_TTL_SEC.
+        shared:delete(l2_key(tid))
+        shared:delete(fresh_key(tid))
+    end
 end
 
 -- l1_get returns desc, is_neg (or nil,nil for miss)
@@ -158,11 +253,30 @@ local function l1_get(tid)
 end
 
 -- l2_get: hit → (desc, false); neg hit → (nil, true); miss → (nil, nil)
-local function l2_get(shared, tid)
+--
+-- #497 — allow_stale splits the two jobs L2 does:
+--   * nil/false (default, happy path): serve only entries still inside the L1
+--     freshness window. A route that changed in Redis therefore reaches the edge
+--     in POS_TTL_SEC, not L2_TTL_SEC.
+--   * true (fail-static, _finish_lookup only): Redis is unreachable, so an old
+--     entry is the best available answer and is served as SOURCE_STATIC.
+local function l2_get(shared, tid, allow_stale)
     if not shared then return nil, nil end
     if shared:get(neg_key(tid)) then return nil, true end
+    -- #497 — marker BEFORE blob, deliberately. These are two separate shdict gets,
+    -- so a concurrent put_positive can land between them. Reading the blob first
+    -- would let an OLD blob (already past its window) be paired with the NEW marker
+    -- written moments later, sending traffic to the previous endpoint. In this order
+    -- the worst interleaving pairs an older marker with a NEWER blob — harmless,
+    -- because a blob is only ever replaced by a fresher one, never reverted.
+    local is_fresh = allow_stale or shared:get(fresh_key(tid)) ~= nil
     local blob = shared:get(l2_key(tid))
     if utils.is_blank(blob) then return nil, nil end
+    if not is_fresh then
+        -- Present but past its freshness window: treat as a miss so the caller
+        -- goes to Redis. Deliberately NOT deleted — fail-static still needs it.
+        return nil, nil
+    end
     local desc = parse_value(blob)
     if not desc then return nil, nil end
     return desc, false
@@ -171,12 +285,52 @@ end
 -- try_redis: single-flighted L3 read + parse. Returns (desc, source, err).
 -- source is SOURCE_L3 (fresh from Redis), SOURCE_NEG (Redis said miss),
 -- SOURCE_STATIC (transport error, caller must serve L2 stale).
+--
+-- Writes the cache, so it must only ever run under the per-tenant lock (or in the
+-- degraded no-lock-available mode). #497 — two lookups racing outside the lock can
+-- complete out of order, and the later write may carry the OLDER Redis value:
+-- that would overwrite a newer route and re-arm its freshness marker, i.e. exactly
+-- the stale/cross-tenant routing this issue removes. The lock-timeout path
+-- therefore never reaches here; it answers from the cache alone.
 local function try_redis(shared, tid, redis_host, redis_port)
+    -- #497 — the lock holder ALWAYS probes Redis, never backs off on the failure
+    -- evidence. A backoff would suppress re-reads, so for as long as the evidence lived
+    -- we would keep serving an aged blob (up to L2_TTL_SEC old, its host:port possibly
+    -- reused by another tenant's VM) even after Redis recovered — introducing a
+    -- cross-tenant window bb does not have today, to fix a load problem it already has.
+    -- no-cross-tenant is non-negotiable and outranks load, so the trade is refused here
+    -- and the connection-storm gap is recorded as a separate follow-up instead.
     local key = "route:" .. tid
     local raw, err = redis_client.get_route(redis_host, redis_port, key)
     if err then
+        -- #497 — record that this tenant's route really could not be re-read, so a
+        -- lock-timeout waiter on the same tenant may fall back to its aged entry.
+        -- Without this, "Redis is down" and "we merely lost a 0.2s lock race" are
+        -- indistinguishable.
+        -- Bump the generation so a waiter can tell "this failed while I was waiting"
+        -- from "this failed some time ago and may well be fixed by now".
+        -- Two ops on purpose: incr() atomically guarantees the value CHANGES, but its
+        -- init_ttl applies only when the key is created — later increments would not
+        -- refresh the TTL, so during a sustained outage the evidence would expire mid
+        -- outage and strand every waiter. The following set() refreshes it. A concurrent
+        -- interleaving can only write back an equal-or-lower value, which makes a waiter
+        -- see "unchanged" and fail closed — the safe direction.
+        if shared then
+            local gen = shared:incr(err_key(tid), 1, 0) or 1
+            shared:set(err_key(tid), gen, ERR_TTL_SEC)
+        end
         return nil, _M.SOURCE_STATIC, err
     end
+    -- Redis answered, so retract the evidence — but only NOW, after a completed
+    -- response. Clearing it before the probe instead would strand every waiter queued
+    -- behind this holder during a real outage: they would time out mid-probe, find no
+    -- evidence and 503 even though L2 holds a usable entry. Retracting on success keeps
+    -- fail-static working while still making recovery visible immediately (the next
+    -- waiter finds nothing and fails closed). The remaining case — a waiter timing out
+    -- while a successor's probe is still in flight, authorised by a failure that
+    -- happened inside its own wait — is bounded by one lock wait and is the honest
+    -- state: the last completed information said Redis was failing.
+    if shared then shared:delete(err_key(tid)) end
     if raw == nil then
         -- Clean miss: unknown tenant.
         put_negative(shared, tid)
@@ -192,6 +346,43 @@ local function try_redis(shared, tid, redis_host, redis_port)
     end
     put_positive(shared, tid, desc)
     return desc, _M.SOURCE_L3, nil
+end
+
+-- answer_without_redis: the lock-timeout waiter's answer. Returns (desc, source, err).
+--
+-- #497 — this path runs OUTSIDE the per-tenant lock, so it deliberately touches
+-- neither Redis nor the cache:
+--   * no Redis connection — otherwise every timed-out waiter would open one and
+--     contention (or a slow Redis) would turn into a connection stampede, defeating
+--     the single-flight this lock exists for;
+--   * no cache write — two unlocked lookups can complete out of order and the later
+--     write may carry the OLDER value, overwriting a newer route and re-arming its
+--     freshness marker, which is exactly the stale routing this issue removes.
+--
+-- It serves the aged entry only when reading THIS tenant's route from Redis failed
+-- DURING THIS WAIT: `gen_before` is the failure generation sampled before the wait began,
+-- and the current one must DIFFER. Weaker gates were rejected — losing a lock race is not
+-- evidence Redis is broken at all, and merely "there was a failure recently" lets one that
+-- has since been fixed authorise serving a route up to L2_TTL_SEC old, whose host:port may
+-- by then belong to ANOTHER tenant's VM. Tying the answer to the very attempt we waited on
+-- is what makes it honest. The four cases:
+--   nil → nil : no failure at all                     → fail closed
+--   5   → 5   : the failure predates our wait          → fail closed
+--   5   → nil : a success during our wait retracted it → fail closed
+--   5   → 6   : a failure completed during our wait    → serve the aged entry
+-- (`~=`, not `>`: a success deletes the key, so the counter legitimately restarts at 1.)
+--
+-- Failing closed means the same 503 the pre-#497 code returned when L2 held nothing, and
+-- the next request will find whatever the holder is about to write.
+local function answer_without_redis(shared, tid, gen_before)
+    if shared then
+        local gen_now = shared:get(err_key(tid))
+        if gen_now ~= nil and gen_now ~= gen_before then
+            local stale_desc = l2_get(shared, tid, true)
+            if stale_desc ~= nil then return stale_desc, _M.SOURCE_STATIC, nil end
+        end
+    end
+    return nil, _M.SOURCE_STATIC, 503
 end
 
 --[[
@@ -213,24 +404,40 @@ function _M.lookup_backend(shared, tid, redis_host, redis_port)
     if desc ~= nil then return desc, _M.SOURCE_L1, nil end
     if is_neg then return nil, _M.SOURCE_NEG, 404 end
 
-    -- L2: cross-worker cache.
+    -- L2: cross-worker cache. #497 — fresh entries only (see l2_get): an entry
+    -- older than the L1 freshness window is reachable solely through the
+    -- fail-static path in _finish_lookup, never here.
     desc, is_neg = l2_get(shared, tid)
     if desc ~= nil then
-        if L1_CACHE then L1_CACHE:set(tid, desc, pos_ttl_jitter()) end
+        -- #497 — deliberately NOT promoted into L1. Re-arming a full POS_TTL_SEC
+        -- L1 entry from a marker that may have milliseconds left would stack the
+        -- two windows: an L2 hit at t=4.9s would keep serving until t≈9.9s, so the
+        -- worst case becomes ~2×POS_TTL_SEC instead of POS_TTL_SEC. The marker is
+        -- the single budget for this value; a shdict get per request on this path
+        -- is in-process and cheap, so paying it keeps the window provably bounded.
         return desc, _M.SOURCE_L2, nil
     end
     if is_neg then return nil, _M.SOURCE_NEG, 404 end
 
     -- L3: single-flight to Redis.
     local lock, lerr = get_lock_module():new("route_locks",
-        { timeout = LOCK_TIMEOUT_SEC, exptime = 1 })
+        { timeout = LOCK_TIMEOUT_SEC, exptime = LOCK_EXPTIME_SEC })
     if not lock then
         ngx.log(ngx.WARN, "resty.lock new failed: ", tostring(lerr))
         -- Skip the lock and go direct — losing the stampede shield is
         -- better than dropping the request.
+        -- #497 — this is the one unlocked path that still WRITES the cache.
+        -- `resty.lock:new()` only fails when the `route_locks` dict itself is broken,
+        -- i.e. NO request can be locked; if these lookups also refused to write, the
+        -- cache would never fill and the whole fleet would sit on Redis. In that
+        -- degraded mode a filled cache is worth more than write ordering.
         return _M._finish_lookup(shared, tid, redis_host, redis_port)
     end
 
+    -- #497 — sampled BEFORE the wait: answer_without_redis only accepts a failure
+    -- generation that CHANGED since this point, i.e. one produced by the attempt we are
+    -- actually waiting on.
+    local fail_gen_before = shared and shared:get(err_key(tid)) or nil
     local elapsed, wait_err = lock:lock(tid)
     if not elapsed then
         -- Waited past LOCK_TIMEOUT_SEC. Retry cache (winner may have filled).
@@ -239,7 +446,12 @@ function _M.lookup_backend(shared, tid, redis_host, redis_port)
         if is_neg then return nil, _M.SOURCE_NEG, 404 end
         ngx.log(ngx.WARN, "route_locks lock timeout for ", tid, ": ",
             tostring(wait_err))
-        return nil, _M.SOURCE_STATIC, 503
+        -- #497 — before the freshness gate this branch was reached with an "any entry
+        -- within L2_TTL" read, so a stale entry served the request. The gate would turn
+        -- that into a 503 exactly when Redis is slow and contention is high, so the
+        -- fallback moved into answer_without_redis (see its header for the two
+        -- properties it holds and why the staleness needs evidence).
+        return answer_without_redis(shared, tid, fail_gen_before)
     end
 
     -- We hold the lock. Re-check cache first (another worker may have
@@ -275,7 +487,9 @@ function _M._finish_lookup(shared, tid, redis_host, redis_port)
     -- evicted by unrelated churn; the second read is nearly free.
     ngx.log(ngx.WARN, "redis transport err, fail-static for ", tid, ": ",
         tostring(rerr))
-    local stale_desc, stale_neg = l2_get(shared, tid)
+    -- #497 — allow_stale=true: this is the one path where an entry past its
+    -- freshness window is the right answer (Redis cannot be reached at all).
+    local stale_desc, stale_neg = l2_get(shared, tid, true)
     if stale_desc ~= nil then return stale_desc, _M.SOURCE_STATIC, nil end
     if stale_neg then return nil, _M.SOURCE_NEG, 404 end
     return nil, _M.SOURCE_STATIC, 503
@@ -297,6 +511,7 @@ function _M.invalidate(shared, tid)
     if shared then
         shared:delete(l2_key(tid))
         shared:delete(neg_key(tid))
+        shared:delete(fresh_key(tid))  -- #497 — 别留下指向已删 blob 的新鲜标记
     end
 end
 
@@ -304,7 +519,10 @@ end
 _M._parse_value = parse_value
 _M._pos_ttl_jitter = pos_ttl_jitter
 _M._POS_TTL_SEC = POS_TTL_SEC
+_M._LOCK_TIMEOUT_SEC = LOCK_TIMEOUT_SEC
+_M._LOCK_EXPTIME_SEC = LOCK_EXPTIME_SEC
 _M._L2_TTL_SEC  = L2_TTL_SEC
 _M._NEG_TTL_SEC = NEG_TTL_SEC
+_M._ERR_TTL_SEC = ERR_TTL_SEC
 
 return _M

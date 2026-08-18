@@ -1,4 +1,3 @@
-// node --test logs.test.mjs — #266 Console BFF per-tenant log viewer.
 // Covers: tenant_id validation (no-cross-tenant: blank/injection rejected),
 // CWL Insights query build, AOS query body (vm term vs host match_phrase),
 // result shaping, source routing, 400/502/504 error mapping, adapter injection.
@@ -57,6 +56,13 @@ describe("buildAosQuery", () => {
   it("host source falls back to free-text match_phrase (no structured field)", () => {
     const b = buildAosQuery("host", "acme-1a2b", 1000, 2000);
     assert.deepEqual(b.query.bool.must[0], { match_phrase: { log: "acme-1a2b" } });
+  });
+  // indices written before the shipper stamped @timestamp. Without unmapped_type
+  // the sort raises query_shard_exception on those and the page 502s regardless of
+  // what the shipper does now — keep this assertion so the flag cannot be dropped.
+  it("sorts with unmapped_type so pre-@timestamp indices cannot 502 the query", () => {
+    const b = buildAosQuery("vm", "acme-1a2b", 1000, 2000);
+    assert.deepEqual(b.sort, [{ "@timestamp": { order: "desc", unmapped_type: "date" } }]);
   });
 });
 

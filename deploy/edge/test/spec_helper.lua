@@ -69,6 +69,19 @@ local function new_fake_shared_dict()
         return true, nil, false
     end
     function dict:delete(k) store[k] = nil end
+    -- incr(key, value, init) —— 真 ngx.shared 的原子递增。key 不存在且未给 init 时返回
+    -- nil,"not found";给了 init 则初始化为 init+value。#497 的失败代数靠它。
+    function dict:incr(k, value, init)
+        local cur = dict.get(self, k)
+        if cur == nil then
+            if init == nil then return nil, "not found" end
+            cur = init
+        end
+        if type(cur) ~= "number" then return nil, "not a number" end
+        local newval = cur + value
+        store[k] = { value = newval, expires = store[k] and store[k].expires or nil }
+        return newval, nil, false
+    end
     return dict
 end
 
@@ -108,7 +121,7 @@ end
 
 -- --- Fake resty.lock stub --------------------------------------------------
 -- Non-blocking: lock always succeeds instantly. Enough for correctness
--- tests; stampede timing is covered separately at L4 (the test plan).
+-- tests; stampede timing is covered separately at L4 (03-TEST-PLAN §5).
 local function new_fake_lock_module()
     local mod = {}
     function mod:new(_name, _opts)

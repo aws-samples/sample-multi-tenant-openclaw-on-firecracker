@@ -137,6 +137,7 @@ EXISTING_DOMAIN=$(aws cloudformation describe-stacks --stack-name OpenClawOrches
   --query 'Stacks[0].Outputs[?OutputKey==`CognitoDomain`].OutputValue' \
   --output text "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" 2>/dev/null || true)
 if [[ "${EXISTING_DOMAIN:-}" == openclaw-console-* ]]; then
+  # #479:带账号后缀的是本栈自建域,不能误走 1.1.x 升级路径。
   echo "✓ config.yml: skipped self-managed Cognito pool import (${EXISTING_DOMAIN})"
   EXISTING_POOL=""
 fi
@@ -437,13 +438,18 @@ _obs_upload() {
 _obs_upload "$SCRIPT_DIR/deploy/userdata/adot-config.yaml"                  "deployment/observability/adot/adot-config.yaml"
 # Shared installer (edge + host pull this same script).
 _obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/install-fluent-bit.sh"      "deployment/observability/fluent-bit/install-fluent-bit.sh"
+# 每个角色:先传 fluent-bit.conf 依赖的 parsers/lua,最后才传 conf 自己。一台 host 在
+# 两次上传之间开机会拉到「conf 已是新版、它引用的 filter 脚本还没上去」的组合 →
+# install-fluent-bit.sh 校验缺脚本直接 die → ASG ABANDON。conf 放最后,这个窗口里
 # edge role config.
-_obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/edge/fluent-bit.conf"        "deployment/observability/fluent-bit/edge/fluent-bit.conf"
 _obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/edge/parsers.conf"           "deployment/observability/fluent-bit/edge/parsers.conf"
 _obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/edge/extract_trace_root.lua" "deployment/observability/fluent-bit/edge/extract_trace_root.lua"
-_obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/host/fluent-bit.conf"        "deployment/observability/fluent-bit/host/fluent-bit.conf"
+_obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/edge/add_timestamp.lua"      "deployment/observability/fluent-bit/edge/add_timestamp.lua"
+_obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/edge/fluent-bit.conf"        "deployment/observability/fluent-bit/edge/fluent-bit.conf"
 _obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/host/parsers.conf"           "deployment/observability/fluent-bit/host/parsers.conf"
 _obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/host/extract_tenant_id.lua"  "deployment/observability/fluent-bit/host/extract_tenant_id.lua"
+_obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/host/add_timestamp.lua"       "deployment/observability/fluent-bit/host/add_timestamp.lua"
+_obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/host/fluent-bit.conf"        "deployment/observability/fluent-bit/host/fluent-bit.conf"
 echo "✓ Observability configs uploaded to s3://${BUCKET}/deployment/observability/ (commit=${_OBS_COMMIT})"
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/backup-data.sh" "s3://${BUCKET}/deployment/scripts/backup-data.sh" \
   "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
@@ -468,6 +474,7 @@ aws s3 cp "$SCRIPT_DIR/deploy/userdata/stop-vm.sh" "s3://${BUCKET}/deployment/sc
 # launch + runtime FD evidence. Referenced by the rebuild control path.
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/rebuild-vm.sh" "s3://${BUCKET}/deployment/scripts/rebuild-vm.sh" \
   "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
+# #485 — op-scoped reset transaction; never reconstruct as bare rm overlay.
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/reset-vm.sh" "s3://${BUCKET}/deployment/scripts/reset-vm.sh" \
   "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 # 必须上传 + 进 _REQUIRED_SCRIPTS 门:否则 SSM 调它得到 exit 127 而 delete 静默失败
@@ -545,6 +552,7 @@ aws s3 sync "$SCRIPT_DIR/deploy/monitoring/" "s3://${BUCKET}/deployment/monitori
 # 幂等:SSM 已有值就跳过(轮换用 SKIP_MINT_SHARED_VKEY=1 手动 aws ssm put + LiteLLM /key/delete 老 key)。
 # 存量部署接过来时首次运行会自动铸,不需要人工先跑 curl。
 #
+# #480 — 没有配置任何 LiteLLM 网关时跳过铸造。判据必须与 CDK build_litellm 一致:
 # ai_gateway.url 空【且】managed_by_stack 非 true = 本栈不托管网关,SSM /openclaw/litellm-host
 # 不存在,mint-shared-vkey.sh 会去连一个不存在的网关,默认卡到 600s 超时后报错。
 # (url 填了 = 外部网关可达;managed_by_stack=true = CDK 起了网关 → 两种情况都仍要铸。)

@@ -15,7 +15,9 @@ behavior. `reconcile` accepts `--scope <control|data|all>` and also defaults to
 
 For a full rollout, use this order:
 `precheck → backup → apply → canary → refresh → verify`. A failed or missing
-canary gate forbids `refresh`.
+canary gate forbids `refresh`. When this kit adds control-plane API routes (see
+Step 4b), also run `apply-api-routes` (routes) alongside the `apply-api` endpoint
+step, and `verify-api`/`finalize-api` after `verify`.
 
 ## Step 0.0 Authenticity check
 
@@ -413,6 +415,73 @@ The six LiteLLM removals are guarded by describe calls. This customer configurat
 uses an external gateway, so those resources are expected to be absent. If any are
 present, stop and investigate.
 
+## Step 4b Control-plane API routes (host taint endpoints)
+
+This kit's target adds the host-taint control-plane routes `POST` and `DELETE`
+`/hosts/{instance_id}/taint` (plus the `OPTIONS` CORS preflight) and redeploys the
+stage. The overlaid `openclaw-api` code (`core/host_taint.py`, `handler.py`,
+`services/host_service.py`) serves these, but the API Gateway resource, methods, and
+CORS must be created explicitly — the control-plane code overlay alone does not add
+routes.
+
+The route change is a `MANUAL_CLI_REVIEW` operation on `deploy/stacks/lambdas.py`.
+Apply it with the shipped route helper against the confirmed REST API id and stage
+from `environment.json`, and set `$API_ID`/`$REGION` from that file:
+
+```bash
+API_ID="$(python3 -c 'import json;print(json.load(open("environment.json"))["control_plane_api"]["id"])')"
+REGION="$(python3 -c 'import json;print(json.load(open("environment.json"))["region"])')"
+```
+
+**One deployment, one owner.** A stage serves the snapshot its deployment captured, so the
+routes are live only once a deployment happens. Both this helper and the driver's `apply-api`
+can create that deployment — but only ONE of them may, or the stage ends on one while the
+other's `verify`/`finalize` still expects the other. Pick by which path you are on:
+
+*Path A — full driver rollout (`apply-api` runs).* Let the driver own the single deployment:
+apply the routes with the deployment deferred, run the driver's `apply-api`, then verify.
+
+```bash
+OC_ROUTE_DEFER_DEPLOYMENT=1 \
+  bash lib/apply-api-routes.sh apply lib/taint-routes.spec.json "$API_ID" v1 "$REGION"
+bash lib/apply-restorepatch.sh apply-api --env environment.json --kit .   # creates THE deployment
+bash lib/apply-api-routes.sh verify    lib/taint-routes.spec.json "$API_ID" v1 "$REGION"
+bash lib/apply-api-routes.sh finalize  lib/taint-routes.spec.json "$API_ID" v1 "$REGION"
+```
+
+*Path B — routes only (no driver `apply-api` in this run).* The helper owns the deployment:
+
+```bash
+bash lib/apply-api-routes.sh apply    lib/taint-routes.spec.json "$API_ID" v1 "$REGION"
+bash lib/apply-api-routes.sh verify   lib/taint-routes.spec.json "$API_ID" v1 "$REGION"
+bash lib/apply-api-routes.sh finalize lib/taint-routes.spec.json "$API_ID" v1 "$REGION"
+# rollback is available only before finalize:
+# bash lib/apply-api-routes.sh rollback lib/taint-routes.spec.json "$API_ID" v1 "$REGION"
+```
+
+`apply` adds each method only when absent, and when every declared route is already present in
+its exact desired state **and served by the stage's active deployment** it prints `ALREADY` and
+exits 0 without calling AWS — so a re-run, or an environment that already carries these routes,
+converges. Anything else (a method that exists but differs) still fails loud rather than
+overwriting. `verify` proves the routes against the stage's active deployment via a stage-scoped
+export, not just the resource tree, so it cannot pass on routes that exist but are unserved.
+
+Run this against the REST API your deployed client actually calls; a route created on the wrong
+API is invisible to clients — the helper refuses when the spec's stack target resolves to a
+different API id than the one you pass.
+
+The unattended driver (`lib/autopatch.sh`) deliberately does **not** apply these routes: writing
+them would mutate outside the scope the operator selected, leave this helper's transaction open,
+and require its own rollback bookkeeping. Route application stays yours (Path A above). What the
+driver does do is refuse to report PASS unless the stage's active deployment actually serves them —
+that check is read-only, names exactly what is unserved, and runs BEFORE `finalize-api` closes the
+rollback window. If it fails, the routes were never applied: apply them with the deployment
+deferred and then **re-run the driver**, so one tool keeps owning the stage's deployment and its own
+state. Do not drive the deployment from the helper at that point — the failed run already activated
+its own, and letting the helper replace and delete it would desynchronise the driver's recorded
+deployment. Re-running the driver leaves the earlier deployment as an unreferenced snapshot, which
+is harmless and can be deleted with `aws apigateway delete-deployment`.
+
 ## Step 5 Deployment-machine file replacement
 
 Copy the contents of `host-scripts/deploy-machine/` over the matching
@@ -487,6 +556,34 @@ launch-template/AMI/bootstrap concern was applied. A control-plane-only
 application still restores Lambda and API state but skips the fleet refresh.
 
 ## Known limitations
+
+### What the route verification does and does not prove
+
+`lib/apply-api-routes.sh verify` proves the stage's ACTIVE deployment (read through a stage-scoped
+OpenAPI export, so it reflects what is really served, not just the mutable resource tree) carries:
+each declared route and method; no declared deletion; no undeclared method on a route this kit
+created; the api-key requirement and absence of unexpected authorizers; every integration field both
+sides report, including a field the deployment carries that the template does not; the preflight's
+integration, its per-selector CORS responses with their exact `Access-Control-Allow-*` values, its
+method responses and any response model; and each method's request contract compared both against
+the deployed template method and, for request-gating properties (validator presence and required
+header/query parameters), against the template bundle captured at apply time.
+
+Three limits are known and deliberate:
+
+- **After `finalize`, verification is relative to the LIVE template method.** Finalize removes the
+  apply-time state by design, so a later `verify` re-reads the template from the current API. An
+  environment where the template method ITSELF drifted, together with these routes, satisfies that
+  comparison. Run `verify` before `finalize` (the driver does) for the absolute check.
+- **API-level and inherited request validators are not resolved.** The comparison uses validator
+  PRESENCE on the operation; a root-level `x-amazon-apigateway-request-validators` definition or an
+  API-level default is not expanded, so a validator whose *behaviour* changed while presence stayed
+  the same is not detected.
+- **The check is not atomic with the stage.** The driver takes no lock on the API, so a second
+  operator mutating the same stage concurrently can invalidate a verdict between the read and the
+  next step. The documented flow is one operator on one target.
+
+### Manifest schema
 
 The upstream manifest schema currently restricts `resource_type` to `^AWS::`.
 The captured closure legitimately includes `Custom::CDKBucketDeployment` and

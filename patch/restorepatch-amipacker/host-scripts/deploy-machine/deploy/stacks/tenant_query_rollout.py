@@ -49,6 +49,7 @@ def validate_live_rollout(cfg, indexes, table_exists=True):
     if not table_exists:
         # CloudFormation creates a brand-new table together with all of its GSIs in a
         # single operation, so DynamoDB's "one GSI per update" limit — the reason the
+        # checks below exist — does not apply to a first deployment (#495).
         return desired
     query_indexes = {index_name for _, index_name in GSI_GATES}
     actual = {
@@ -59,9 +60,20 @@ def validate_live_rollout(cfg, indexes, table_exists=True):
 
     removed = set(actual) - desired
     if removed:
+        # #499 B — 报错必须说出「补哪个 config 键」。真机上这条只说了「会删掉这四个 GSI」,
+        # 运营看不出根因是部署机那份 config 的 scaler 段落后于在役表(缺三个 add_gsi_* 键),
+        # 为定位多花两轮部署。GSI_GATES 本来就是 (gate_key, index_name),信息现成。
+        _gate_of = {index_name: gate for gate, index_name in GSI_GATES}
+        _keys = sorted(f"scaler.{_gate_of[i]}" for i in removed if i in _gate_of)
         raise ValueError(
             "config would remove existing tenant-query GSIs: "
             + ", ".join(sorted(removed))
+            + (
+                "; 若本意不是删除,说明 config 落后于在役表,把这些键补成 true: "
+                + ", ".join(_keys)
+                if _keys
+                else ""
+            )
         )
 
     missing = desired - set(actual)

@@ -1,0 +1,4 @@
+# ProbeScan Semgrep scope. Keep application and deployment code in scope while
+# excluding agent assets and engineering research/evidence.
+.claude/
+engineering/

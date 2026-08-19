@@ -1,0 +1,5 @@
+jobs:
+  bandit:
+    config: pyproject.toml
+  checkov:
+    config: .checkov.yml

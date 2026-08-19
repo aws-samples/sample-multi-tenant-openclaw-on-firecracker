@@ -226,6 +226,25 @@ and it looks it up under the prefix the launch template actually references. If 
   running a kit revision from before that fix, delete `/tmp/openclaw-*-restorepatch.zip` before you
   start. This matters most when one workstation patches two environments: the archive path does not
   carry the environment, and the function names are the same everywhere.
+- **Hand-publishing part of `deployment/observability/fluent-bit/`.** This is the one that took a
+  fleet down on 2026-08-19. The patched bootstrap fetches `install-fluent-bit.sh` from that prefix
+  with no `|| true` and, for `role=host`, no baked fallback, then runs it. A pre-patch installer
+  left in place fails at `gpg --dearmor` — that revision has no `--batch`, so on a boot with no
+  terminal it cannot open `/dev/tty` — the bootstrap exits `rc=2`, and the lifecycle hook ABANDONs
+  the instance. Every new host, in a loop, with the log line
+  `gpg: cannot open '/dev/tty': No such device or address` in `/var/log/openclaw-init.log`. The
+  installer then pulls the whole role prefix and refuses a config whose Lua filters are absent, so
+  the `.conf` and `.lua` objects are boot-critical too: publishing the new `host/fluent-bit.conf`
+  without `host/add_timestamp.lua` fails the same way, for a different reason. Publish the prefix as
+  a set — the five objects under `host-scripts/edge/fluent-bit/` — or just let `apply` do it. The
+  driver now refuses to promote a bootstrap while any object this template actually consumes is
+  absent, pre-patch, or unrecognised, and prints which; before that check existed, this state passed
+  every gate and only the fleet reported it. Three details of that check are worth knowing:
+  the required set is the installer plus `host/**`, because the `edge/**` objects are consumed by
+  edge instances and are only reported; the whole check is skipped when the in-service bootstrap
+  resolved `LOGGING_ENABLED=false`, since step3a2 then never runs; and it also requires the
+  `parsers.conf` and `extract_tenant_id.lua` the config references, which this kit does not carry —
+  publishing does not touch them, so they stay as they are, but the installer dies if they are gone.
 - **Skipping `backup` because "nothing will change".** A re-run still publishes Lambda code if any
   module differs, and the alias still moves.
 - **Trusting the anchor a SECOND `backup` recorded.** `backup` records what is live *now*, so

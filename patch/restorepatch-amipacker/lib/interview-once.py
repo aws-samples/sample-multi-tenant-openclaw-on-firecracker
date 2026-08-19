@@ -117,6 +117,7 @@ def is_route_operation(path, operation):
         for marker in (
             "api gateway",
             "apigateway",
+            "apigw",
             "execute-api",
             "private api",
             "rest api",

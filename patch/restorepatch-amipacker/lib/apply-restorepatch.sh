@@ -2208,23 +2208,33 @@ refresh)
   recorded_refresh_lt="$(state_get refresh_pending_lt_version)"
   if [ -n "$target_refresh_lt" ] && [ -n "$recorded_refresh_id" ] \
      && [ "$recorded_refresh_lt" = "$target_refresh_lt" ]; then
-    recorded_refresh_status="$(aws_ autoscaling describe-instance-refreshes \
+    # Fail closed when the CALL fails. Treating an API/network/auth error as "unknown, decide from
+    # the fleet" would let a run start a second refresh while a rollback is still in flight, and the
+    # fleet check cannot see that. Only a successful call with an empty answer falls through.
+    if ! recorded_refresh_status="$(aws_ autoscaling describe-instance-refreshes \
       --auto-scaling-group-name "$ASG" --instance-refresh-ids "$recorded_refresh_id" \
-      --query 'InstanceRefreshes[0].Status' --output text 2>/dev/null)" || recorded_refresh_status=""
+      --query 'InstanceRefreshes[0].Status' --output text)"; then
+      die "refresh refused: cannot read the status of recorded refresh $recorded_refresh_id; resolve that before starting another one"
+    fi
+    # Terminal-and-retryable is an ALLOWLIST, and anything else is treated as still running. The
+    # documented statuses are Pending, InProgress, Successful, Failed, Cancelling, Cancelled,
+    # RollbackInProgress, RollbackFailed, RollbackSuccessful and Baking -- Baking is the post-update
+    # bake wait, i.e. NOT finished. A catch-all keeps a status added later from being read as done.
     case "$recorded_refresh_status" in
-      Successful)
-        say "SKIP refresh: $recorded_refresh_id already completed onto LT v${target_refresh_lt}"
-        echo "   NEXT: bash lib/apply-restorepatch.sh verify --env \"$ENVJSON\" --kit \"$KITDIR\""
-        exit 0
-        ;;
-      Pending|InProgress|Cancelling|RollbackInProgress)
-        die "refresh refused: $recorded_refresh_id is still $recorded_refresh_status for this LT version; wait for it to finish instead of starting a second one"
-        ;;
       Failed|Cancelled|RollbackFailed|RollbackSuccessful)
         say "previous refresh $recorded_refresh_id ended $recorded_refresh_status; a retry is allowed"
         ;;
       ""|None)
         say "previous refresh $recorded_refresh_id is no longer queryable; deciding from the fleet instead"
+        ;;
+      Successful)
+        # Do NOT skip on this alone. A concurrent launch-template repoint means that refresh may have
+        # replaced the fleet onto a DIFFERENT version than the one this run targets. Let the
+        # fleet-version check below be the thing that decides.
+        say "previous refresh $recorded_refresh_id reports Successful; confirming against the fleet"
+        ;;
+      *)
+        die "refresh refused: $recorded_refresh_id is $recorded_refresh_status for this LT version; wait for it to reach a terminal state instead of starting a second one"
         ;;
     esac
   fi

@@ -86,7 +86,7 @@
       "sha256": "07b9633975bdc8e76803af83f9057c09a3fe28707f5284c727933e3050238df1"
     },
     "lib/apply-restorepatch.sh": {
-      "sha256": "5738081e43070cb912f76589a1d2e025d35779fb4dec182bd8418822c59f3e82"
+      "sha256": "b7c834d393f3840fbe5acb5d766f437cc5fa27833f19868b63b6ed64fcd7749f"
     },
     "lib/autopatch.sh": {
       "sha256": "09b261e1d8f5ede80ec8f1800914dc8b4e4fc08807b35f04b3fa9a95ccec8161"

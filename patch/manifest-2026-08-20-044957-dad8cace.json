@@ -1,0 +1,158 @@
+{
+  "synced_at": "2026-08-20 04:49:57 UTC+08:00",
+  "base_sha": "c5db0a05c24972770e1d56d2f60ddd1561787e4d",
+  "source_commit": "dad8cace0c22b699c8ac9dc1ec6d0e10cef1195e",
+  "commit_count": 51,
+  "file_count": 12,
+  "summary": "Sync the bb increment c5db0a05..dad8cace to the public gateway branch. Sync-LOG only (which customer-facing files reached gateway + the issues behind them); the applyable patch kit is NOT built yet (folded_into pending).",
+  "issues_synced_note": "Index back to the issue tracker for whoever builds the patch kit: before assembling the kit, walk each issue and confirm it's covered. `title` is a ≤20-char gist only — open the issue for the full problem/fix/test. Lists only issues that touched a released file this sync.",
+  "issues_synced": [
+    {
+      "id": "#458",
+      "type": "fix",
+      "title": "install-fluent-bit.s…"
+    },
+    {
+      "id": "#518",
+      "type": "feat",
+      "title": "打完 patch 后的一致性抽查"
+    },
+    {
+      "id": "#521",
+      "type": "feat",
+      "title": "打完 patch 后的一致性抽查"
+    },
+    {
+      "id": "#531",
+      "type": "fix",
+      "title": "install-fluent-bit.s…"
+    },
+    {
+      "id": "#536",
+      "type": "docs",
+      "title": "host 污点"
+    },
+    {
+      "id": "#546",
+      "type": "fix",
+      "title": "taint 幂等响应 tainted_a…"
+    },
+    {
+      "id": "#550",
+      "type": "chore",
+      "title": "scope Bandit/Semgrep…"
+    },
+    {
+      "id": "#555",
+      "type": "docs",
+      "title": "控制面/数据面参数最佳实践对照表"
+    },
+    {
+      "id": "#556",
+      "type": "fix",
+      "title": "发布评审两处缺陷"
+    }
+  ],
+  "needs_config_on_apply": "none detected (no config.yml key / systemd directive / DDB-TTL change in this sync)",
+  "updated_files": {
+    "docs": [
+      {
+        "path": "docs/aws-guide-en/09-api-integration.md",
+        "status": "modified",
+        "issues": [
+          "#536"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/09-api-integration.md",
+        "status": "modified",
+        "issues": [
+          "#536"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/19-config-parameter-baseline.md",
+        "status": "added",
+        "issues": [
+          "#555",
+          "#556"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/README.md",
+        "status": "modified",
+        "issues": [
+          "#555"
+        ]
+      }
+    ],
+    "edge (OpenResty / Fluent Bit host config)": [
+      {
+        "path": "deploy/edge/fluent-bit/install-fluent-bit.sh",
+        "status": "modified",
+        "issues": [
+          "#458",
+          "#531"
+        ]
+      }
+    ],
+    "lambda (update-function-code only)": [
+      {
+        "path": "deploy/lambda/api/core/host_taint.py",
+        "status": "modified",
+        "issues": [
+          "#546"
+        ]
+      }
+    ],
+    "root / other": [
+      {
+        "path": ".checkov.yml",
+        "status": "added",
+        "issues": [
+          "#550"
+        ]
+      },
+      {
+        "path": ".semgrepignore",
+        "status": "added",
+        "issues": [
+          "#550"
+        ]
+      },
+      {
+        "path": "cli/oc-consistency.py",
+        "status": "added",
+        "issues": [
+          "#518",
+          "#521",
+          "#556"
+        ]
+      },
+      {
+        "path": "probe.yaml",
+        "status": "added",
+        "issues": [
+          "#550"
+        ]
+      },
+      {
+        "path": "pyproject.toml",
+        "status": "modified",
+        "issues": [
+          "#550"
+        ]
+      }
+    ],
+    "scripts": [
+      {
+        "path": "scripts/checks/python.sh",
+        "status": "modified",
+        "issues": [
+          "#550"
+        ]
+      }
+    ]
+  },
+  "folded_into": "(pending) — no patch kit built for this sync yet; a later kit should cite this manifest as source-of-record and set base_sha/patch_sha. cdk deploy is FORBIDDEN on hand-modified live deployments — the kit must ship *.patched host scripts + the full lambda tree + AWS CLI for stack changes, same shape as patch/315-concurrent-dispatch-rollup/."
+}

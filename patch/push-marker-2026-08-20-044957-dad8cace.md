@@ -1,0 +1,30 @@
+# opensource-publish push marker
+
+Auto-generated per push. One file per push, never overwritten. Not code — a push-audit trace
+under `patch/`, paired with `patch/manifest-2026-08-20-044957-dad8cace.json` of the same run: the
+manifest records WHICH features/issues synced (for whoever builds the next patch kit); this
+marker records the exact file COVERAGE of the push (not one more, not one less). Scrub
+*correctness* of a `sanitized` row is release-gate.sh + the reviewer's job, not this marker's.
+
+- pushed-at: 2026-08-20 04:49:59 CST
+- bb-head (this push): dad8cace0c22b699c8ac9dc1ec6d0e10cef1195e
+- prev-baseline: c5db0a05c24972770e1d56d2f60ddd1561787e4d
+- files pushed: 13   (bb increment: 12, publish-unique: 1)
+
+## Files pushed this run — derived from the staged set, reconciled by git object vs bb@head
+
+| status | path | bb@head blob | gateway blob | reconcile |
+| ------ | ---- | ------------ | ------------ | --------- |
+| A | .checkov.yml | ee4b2eca6112 | ee4b2eca6112 | cp-verbatim |
+| A | .semgrepignore | 66e2a3bc376a | 66e2a3bc376a | cp-verbatim |
+| A | cli/oc-consistency.py | d0c33f21161d | d0c33f21161d | cp-verbatim |
+| M | deploy/edge/fluent-bit/install-fluent-bit.sh | 3975f00d151e | ae6dc3f3031d | sanitized |
+| M | deploy/lambda/api/core/host_taint.py | 10fd8af30942 | 10fd8af30942 | cp-verbatim |
+| M | docs/aws-guide-en/09-api-integration.md | 00e0084094c8 | 00e0084094c8 | cp-verbatim |
+| M | docs/aws-guide/09-api-integration.md | 7e262f3bbd65 | 7e262f3bbd65 | cp-verbatim |
+| A | docs/aws-guide/19-config-parameter-baseline.md | ce2f7d06a93c | ce2f7d06a93c | cp-verbatim |
+| M | docs/aws-guide/README.md | 8b97f6cb0e9e | 8b97f6cb0e9e | cp-verbatim |
+| A | patch/manifest-2026-08-20-044957-dad8cace.json | — | 90dfaa85a6df | gw-only |
+| A | probe.yaml | a949b1dfb01a | a949b1dfb01a | cp-verbatim |
+| M | pyproject.toml | ecb2c7f22574 | 06eb1164e729 | sanitized |
+| M | scripts/checks/python.sh | ee42f3b4f85b | ee42f3b4f85b | cp-verbatim |

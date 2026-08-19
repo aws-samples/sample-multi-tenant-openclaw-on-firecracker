@@ -2305,6 +2305,23 @@ FLEET_PAIRS
     || die "cannot read the launch-template version currently configured on $ASG"
   [ -n "$asg_lt_id_now" ] && [ -n "$asg_lt_ref_now" ] \
     || die "refresh refused: $ASG does not report a launch template to replace onto"
+  # Under a mixed-instances policy each override may carry its OWN LaunchTemplateSpecification, and
+  # when such an override is selected the base template does not apply to those instances at all. So
+  # a base-template match would be a false green: part of the fleet could be replaced onto a different
+  # template or version while this run reports the target. The control plane already refuses this
+  # exact shape (services/bootstrap_version_service.py::_asg_lt_spec, added after a review found the
+  # same false green there); refuse it here rather than guess which override wins.
+  mip_override_lt_count="$(aws_ autoscaling describe-auto-scaling-groups \
+    --auto-scaling-group-names "$ASG" \
+    --query 'length(AutoScalingGroups[0].MixedInstancesPolicy.LaunchTemplate.Overrides[?LaunchTemplateSpecification!=null] || `[]`)' \
+    --output text)" \
+    || die "cannot read the mixed-instances overrides of $ASG"
+  case "$mip_override_lt_count" in
+    ''|None|0) ;;
+    *)
+      die "refresh refused: $ASG has $mip_override_lt_count mixed-instances override(s) carrying their own launch template, so matching the base template proves nothing about what those instances would be replaced onto; resolve the overrides before refreshing"
+      ;;
+  esac
   # The group may reference a floating alias. Resolve it to the concrete number the replacement would
   # actually use, because "$Default" can be repointed by anyone at any time.
   case "$asg_lt_ref_now" in
@@ -2349,12 +2366,20 @@ REFRESH_RECHECK
   case "$refresh_id" in
     ''|None) die "start-instance-refresh returned no refresh id for $ASG; treat the refresh state as unknown and inspect it before retrying" ;;
   esac
-  state_put instance_refresh_id "$refresh_id"
+  state_put instance_refresh_id "$refresh_id" \
+    || die "refresh $refresh_id started on $ASG but recording its id failed; the run is NOT idempotent from here -- inspect the group's refresh history before retrying"
   # Recorded for the operator's benefit only. The guard above deliberately does NOT read it: it asks
   # the ASG for every recent refresh and for the fleet's actual launch-template identity, so a
   # refresh started outside this kit is caught too and a stale record cannot make a run skip.
-  state_put refresh_pending_lt_version "$target_refresh_lt"
+  state_put refresh_pending_lt_version "$target_refresh_lt" \
+    || die "refresh $refresh_id started on $ASG but recording its target version failed; inspect the group's refresh history before retrying"
   say "controlled instance refresh started: $refresh_id"
+  # Deliberately NOT pinned with --desired-configuration: that would rewrite the group's configuration
+  # on success and could clobber a concurrent repoint. The consequence is a real, remaining window --
+  # instances replaced later in this refresh follow the group's configuration AS IT IS THEN, so
+  # repointing the group or moving $Default while this runs can converge part of the fleet elsewhere.
+  echo "   NOTE do not repoint $ASG or move the launch template's \$Default while this refresh runs;"
+  echo "        later replacements follow the group's configuration at that moment, not this target"
   echo "   NEXT: bash lib/apply-restorepatch.sh verify --env \"$ENVJSON\" --kit \"$KITDIR\""
   ;;
 

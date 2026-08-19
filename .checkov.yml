@@ -1,0 +1,3 @@
+# Engineering contains archived examples and runtime evidence, not deployable IaC.
+skip-path:
+  - (^|/)engineering/

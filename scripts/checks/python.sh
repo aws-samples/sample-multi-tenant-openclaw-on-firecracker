@@ -35,10 +35,10 @@ if have bandit; then
   # -lll 只把 HIGH severity 当挡门(照 severity 契约:只 Error 挡);-ii 只报 high 置信度,减噪。
   # medium/low(如 B310 受控 urlopen)作提示单独打印、不挡门,避免噪音让人关掉。
   # shellcheck disable=SC2086
-  if (cd "$CK_ROOT" && printf '%s\n' $files | xargs bandit -lll -ii --quiet >/tmp/ck-bandit.log 2>&1); then
+  if (cd "$CK_ROOT" && printf '%s\n' $files | xargs bandit -c pyproject.toml -lll -ii --quiet >/tmp/ck-bandit.log 2>&1); then
     ck_ok "bandit:无 HIGH 安全问题"
     # medium 提示(不挡门):统计 medium 条数,>0 才提示
-    (cd "$CK_ROOT" && printf '%s\n' $files | xargs bandit -ll -ii --quiet >/tmp/ck-bandit-med.log 2>&1) || true
+    (cd "$CK_ROOT" && printf '%s\n' $files | xargs bandit -c pyproject.toml -ll -ii --quiet >/tmp/ck-bandit-med.log 2>&1) || true
     # 用 tr 保证单行整数(grep -c 找不到时 exit1,叠加 || echo 0 会产生多行值致整数比较崩)
     med="$(grep -c 'Severity: Medium' /tmp/ck-bandit-med.log 2>/dev/null | head -1 | tr -dc '0-9')"
     [ -n "${med:-}" ] && [ "${med}" -gt 0 ] 2>/dev/null && ck_warn "bandit 有 ${med} 处 medium 提示(不挡门,建议看一眼 /tmp/ck-bandit-med.log)"

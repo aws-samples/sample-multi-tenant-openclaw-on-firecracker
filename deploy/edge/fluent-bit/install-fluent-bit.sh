@@ -112,23 +112,33 @@ if [[ -n "${ASSETS_BUCKET:-}" ]]; then
     # stderr is where the zero-match notice lands, so it is kept, not sent to /dev/null.
     if aws s3 cp "s3://${ASSETS_BUCKET}/${_s3_prefix}/" "$_fb_stage/" \
          --recursive --region "$FB_REGION" --no-progress 2>"$_fb_cp_err"; then
-        _fb_pulled="$(find "$_fb_stage" -type f | wc -l | tr -d '[:space:]')"
+        _fb_pulled="$(find "$_fb_stage" -type f -print0 | tr -dc '\0' | wc -c | tr -d '[:space:]')"
+        # The zero-match case is the reported failure and it exits 0, so its notice only
+        # reaches the log from here. Keeping stderr but printing it only in the non-zero
+        # branch left the one message that explains this run invisible.
+        if [[ "$_fb_pulled" -eq 0 ]]; then
+            log "WARN: ${_s3_prefix}/ matched no objects: $(tr '\n' ' ' < "$_fb_cp_err" | tail -c 300)"
+        fi
     else
         log "WARN: s3 cp of ${_s3_prefix}/ failed: $(tr '\n' ' ' < "$_fb_cp_err" | tail -c 300)"
     fi
 fi
 if [[ "$_fb_pulled" -gt 0 && -f "$_fb_stage/fluent-bit.conf" ]]; then
-    while IFS= read -r _abs; do
+    # -print0 / read -d '': an object name containing a newline would otherwise be split
+    # into two paths and install a file under a truncated name.
+    while IFS= read -r -d '' _abs; do
         # Keep the prefix's relative layout: a flat install would break a config that
         # references a script by a subdirectory path.
         _rel="${_abs#"$_fb_stage"/}"
         mkdir -p "$FB_CONF_DIR/$(dirname "$_rel")"
         install -m 0644 "$_abs" "$FB_CONF_DIR/$_rel"
-    done < <(find "$_fb_stage" -type f)
+    done < <(find "$_fb_stage" -type f -print0)
+    _fb_source_dir="$_fb_stage"
     log "pulled ${_fb_pulled} object(s) for role=${FB_ROLE} from s3://${ASSETS_BUCKET}/${_s3_prefix}/"
 elif [[ -n "${FB_LOCAL_DIR:-}" && -f "${FB_LOCAL_DIR}/fluent-bit.conf" ]]; then
     log "WARN: S3 staged ${_fb_pulled} object(s) and no fluent-bit.conf among them; falling back to baked ${FB_LOCAL_DIR}"
     install -m 0644 "${FB_LOCAL_DIR}"/* "$FB_CONF_DIR/"
+    _fb_source_dir="$FB_LOCAL_DIR"
 else
     die "no Fluent Bit config for role=${FB_ROLE}: s3://${ASSETS_BUCKET:-<unset>}/${_s3_prefix}/ staged ${_fb_pulled} object(s) with no fluent-bit.conf, and no FB_LOCAL_DIR fallback"
 fi
@@ -153,15 +163,27 @@ fi
 # #531 — every check above is an ABSENCE check: it can only fail on a config that
 # already contains the thing being checked, so a config from the wrong source passes
 # them all. Assert positively that this config forwards somewhere.
-# Scope: this catches "no firehose output at all" — the distro package default, whether
+# Scope: two independent greps, so they do not prove the delivery_stream belongs to the
+# firehose output (a config parser would; the dry-run below covers malformed combinations).
+# What they do catch: "no firehose output at all" — the distro package default, whether
 # it came from the package install or from a stale S3 prefix. It does NOT catch the
 # OTHER role's config: an edge config on a host has a firehose output too and passes
 # here. Detecting role confusion needs a role-specific marker and is not done here.
-if ! grep -Eqi '^[[:space:]]*Name[[:space:]]+kinesis_firehose[[:space:]]*$' "$FB_CONF_DIR/fluent-bit.conf"; then
-    die "fluent-bit.conf has no kinesis_firehose output; refusing to start a collector that forwards nowhere (role=${FB_ROLE}, source ${_s3_prefix}/)"
-fi
-if ! grep -Eq '^[[:space:]]*delivery_stream[[:space:]]+[^[:space:]]' "$FB_CONF_DIR/fluent-bit.conf"; then
-    die "fluent-bit.conf has a kinesis_firehose output but no delivery_stream carrying a value (role=${FB_ROLE})"
+# An @INCLUDE can legitimately put the [OUTPUT] in another file, and this assertion only
+# reads the main config -- asserting anyway would ABANDON a host over a config Fluent Bit
+# itself accepts. No config in this repo uses @INCLUDE today; if one starts, say so and
+# skip rather than resolving includes here.
+if grep -Eq '^[[:space:]]*@INCLUDE[[:space:]]' "$FB_CONF_DIR/fluent-bit.conf"; then
+    log "NOTE fluent-bit.conf uses @INCLUDE; skipping the firehose-output assertion (it only reads the main file)"
+else
+    # Both assertions read only the main file, so both belong behind the @INCLUDE guard.
+    # Guarding just the first one still abandoned an include-based config on the second.
+    if ! grep -Eqi '^[[:space:]]*Name[[:space:]]+kinesis_firehose[[:space:]]*$' "$FB_CONF_DIR/fluent-bit.conf"; then
+        die "fluent-bit.conf has no kinesis_firehose output; refusing to start a collector that forwards nowhere (role=${FB_ROLE}, source ${_s3_prefix}/)"
+    fi
+    if ! grep -Eq '^[[:space:]]*delivery_stream[[:space:]]+[^[:space:]]' "$FB_CONF_DIR/fluent-bit.conf"; then
+        die "fluent-bit.conf has a kinesis_firehose output but no delivery_stream carrying a value (role=${FB_ROLE})"
+    fi
 fi
 
 # Every Lua script the config references must be on disk before we start.
@@ -170,13 +192,23 @@ fi
 # to Firehose and the host instead of to the asset prefix. Relative script paths
 # resolve against the config dir (host style); absolute ones are used as-is
 # (edge style).
+# #531 — when the config came from S3, resolve referenced scripts against what THIS run
+# staged, not against $FB_CONF_DIR. The directory also holds the package's own files and
+# whatever a previous boot installed, so a script the current prefix does not ship can be
+# answered by a stale copy and the check passes on a collection that was never fetched
+# whole. An absolute path INSIDE $FB_CONF_DIR gets the same treatment: the edge config names its
+# filters as /etc/fluent-bit/*.lua, so "absolute" there does not mean "outside the managed
+# directory" — it points straight at the place a previous boot's copy lives, which would let a
+# stale file answer for one this run never fetched. Only a path outside the managed directory is
+# genuinely external and checked where it points.
 while read -r _script; do
     [[ -n "$_script" ]] || continue
     case "$_script" in
-        /*) _script_path="$_script" ;;
-        *)  _script_path="$FB_CONF_DIR/$_script" ;;
+        "$FB_CONF_DIR"/*) _script_path="${_fb_source_dir}/${_script##*/}" ;;
+        /*)               _script_path="$_script" ;;
+        *)                _script_path="${_fb_source_dir}/$_script" ;;
     esac
-    [[ -f "$_script_path" ]] || die "fluent-bit.conf references a missing Lua script: ${_script} (expected ${_script_path}; stale ${_s3_prefix}/ in S3?)"
+    [[ -f "$_script_path" ]] || die "fluent-bit.conf references a Lua script this run did not provide: ${_script} (looked in ${_fb_source_dir}; incomplete ${_s3_prefix}/ in S3?)"
 done < <(sed -nE 's/^[[:space:]]*script[[:space:]]+([^[:space:]]+)[[:space:]]*$/\1/p' "$FB_CONF_DIR/fluent-bit.conf")
 
 FB_BIN="$(command -v fluent-bit || true)"

@@ -12,7 +12,7 @@
     "provenance": {
       "synth_argv": [
         "bash",
-        "/Users/baizhenx/Downloads/Bybit-acct/openclaw/sample-multi-tenant-openclaw-on-firecracker/engineering/progress/kit-advance-2026-08-19/oc_synth_all.sh",
+        "<redacted-build-host-path>/oc_synth_all.sh",
         "--all",
         "{output}"
       ],
@@ -21,7 +21,7 @@
         "source_tree": "e8b86112ce422f201b8f6c75e6577721fdb7d5dd",
         "assembly_index": {
           "artifact": "resources/cloudformation/base.assembly-index.json",
-          "sha256": "8b0bf10093e12101a063bd1fa36328b6205168ebe1d15cf5ee7643fef458f189"
+          "sha256": "ca1d06db0db6f3a592c47e97f7483b840df581aabe3eadc6315527b8514a0c95"
         }
       },
       "patch": {
@@ -29,7 +29,7 @@
         "source_tree": "db91aca1bf24e05b59efdc78f3c0ea266cd199a4",
         "assembly_index": {
           "artifact": "resources/cloudformation/patch.assembly-index.json",
-          "sha256": "a5096fb7f4ded4d70b4a1d20647d3fb51c8cc94c495a83936a2403bc5c07a508"
+          "sha256": "95ccb06acd06f11ddae22fbf800fc93009c4f19ed007107215da276ace3b6ff7"
         }
       }
     },

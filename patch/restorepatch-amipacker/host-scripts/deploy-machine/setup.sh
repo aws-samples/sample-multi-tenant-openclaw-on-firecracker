@@ -387,7 +387,11 @@ if [ "${PREFLIGHT_SKIP:-0}" = "1" ]; then
   echo "⚠️  PREFLIGHT_SKIP=1 —— 跳过部署前配置门(#489)。"
   echo "    被跳过的判据包括:在役资源误判、VPCE private-dns 冲突、残骸撞名、config 死键、"
   echo "    Redis 子网组漂移(会致整栈回滚)。出问题时请先不带这个开关重跑一次再报。"
-elif [ -x scripts/preflight-check.sh ]; then
+# 判据是 -f 不是 -x:这个脚本在 git 里是 100644(没有执行位,与 scripts/deploy-cdk.sh
+# 的 100755 不同),而下面本来就是用 `bash <path>` 调它 —— 执行位跟这里的行为无关。写
+# `-x` 会让门在【每一个新 clone 上都被静默跳过】,恰好就是 #489 要治的「门不跑等于没门」,
+# 真机跑 setup.sh 撞到过。zip/tar 分发丢执行位的场景同理,所以 -f 也是更稳的判据。
+elif [ -f scripts/preflight-check.sh ]; then
   echo ""
   echo "── 部署前配置门(scripts/preflight-check.sh,只读)──"
   # 主动传 config.yml/region/profile:门自己不猜这三样。PROFILE 为空时传 "-"(它的约定)。
@@ -403,7 +407,7 @@ elif [ -x scripts/preflight-check.sh ]; then
   fi
   echo ""
 else
-  echo "⚠️  scripts/preflight-check.sh 不可执行或不存在,跳过部署前配置门(#489)" >&2
+  echo "⚠️  scripts/preflight-check.sh 不存在,跳过部署前配置门(#489)—— checkout 不完整?" >&2
 fi
 
 # stack 选择符的裸 cdk deploy 会报 "specify which stacks ... or --all" 并退出。

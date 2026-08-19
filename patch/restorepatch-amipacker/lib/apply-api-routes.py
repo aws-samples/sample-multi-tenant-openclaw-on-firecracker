@@ -602,9 +602,18 @@ def normalize_bundle(bundle: dict[str, Any] | None) -> Any:
         if isinstance(integration_value, dict)
         else None
     )
+    if integration is not None:
+        # cacheNamespace defaults to the resource's OWN id, for every integration type -- not
+        # just MOCK. A method cloned from the template therefore never carries the template
+        # resource's namespace, so comparing it reported drift on every already-present route
+        # and the idempotent ALREADY path could never trigger on a real API.
+        integration.pop("cacheNamespace", None)
     if integration is not None and integration.get("type") == "MOCK":
-        # API Gateway materializes these service-owned defaults on every MOCK.
-        for key in ("cacheNamespace", "cacheKeyParameters", "timeoutInMillis"):
+        # API Gateway materializes these service-owned defaults on every MOCK. requestTemplates
+        # is CDK construct boilerplate ({ statusCode: 200 } vs {"statusCode": 204}) that never
+        # reaches the client; the browser-visible Access-Control-Allow-* values live in
+        # integrationResponses/methodResponses and are still compared.
+        for key in ("cacheKeyParameters", "timeoutInMillis", "requestTemplates"):
             integration.pop(key, None)
     return {"method": method, "integration": integration}
 
@@ -796,6 +805,13 @@ def preflight(
         )
         change = route["resource_change"]
         if change == "A" and destination is not None:
+            # An environment that applied an earlier revision of this kit already carries that
+            # revision's routes. Converge instead of failing the whole run, but only when this
+            # route is in its exact declared end state AND already served; any drift still
+            # falls through to the failure below rather than being silently overwritten.
+            if route_already_satisfied(gateway, spec, route, template):
+                print(f"ALREADY: {path} is present in its declared end state; skipping")
+                continue
             fail(f"{path}: resource A requires an absent target")
         if change in {"M", "D", "NONE"} and resource is None:
             fail(f"{lookup}: resource {change} requires an existing target")
@@ -1136,6 +1152,16 @@ def _integration_differences(deployed: dict[str, Any], desired: dict[str, Any]) 
             if desired
             else "integration present on the active deployment but not in the template"
         ]
+    # A MOCK preflight's request template body is CDK construct boilerplate that never reaches
+    # the client, so it is not part of the CORS contract (same ruling the kit validator applies).
+    # Only drop it when BOTH sides are MOCK; on a proxy integration requestTemplates is real
+    # configuration and stays compared.
+    if (
+        str(deployed.get("type") or "").upper() == "MOCK"
+        and str(desired.get("type") or "").upper() == "MOCK"
+    ):
+        deployed = {k: v for k, v in deployed.items() if k != "requestTemplates"}
+        desired = {k: v for k, v in desired.items() if k != "requestTemplates"}
     differing = [
         field
         for field in sorted(set(deployed) & set(desired))
@@ -1528,6 +1554,54 @@ def unserved_routes(
     return problems
 
 
+def route_already_satisfied(
+    gateway: Gateway,
+    spec: dict[str, Any],
+    route: dict[str, Any],
+    template: dict[str, Any],
+) -> bool:
+    """Read-only: is this ONE declared route already in its exact desired end state?
+
+    Split out of routes_already_satisfied so a PARTIALLY applied environment converges. A
+    customer who applied an earlier revision of this kit already carries that revision's
+    routes; a later revision declares those plus new ones. A whole-spec decision cannot
+    express that, so the per-route preflight used to die on the first already-present route
+    and the new routes never landed.
+
+    Same strictness as the whole-spec check: purely additive, the resource exists with
+    exactly the declared methods, every method bundle equals the template, the OPTIONS CORS
+    equals the spec, and the stage's ACTIVE deployment already serves it. Any drift returns
+    False, so the caller still fails loud instead of silently overwriting it.
+    """
+    if route["resource_change"] != "A" or route["cors"]["change"] != "A":
+        return False
+    if any(method["change"] != "A" for method in route["methods"]):
+        return False
+    resource = gateway.resource(route["path"])
+    if resource is None:
+        return False
+    expected_methods = {method["method"] for method in route["methods"]}
+    expected_methods.add("OPTIONS")
+    if set(resource.get("resourceMethods", {})) != expected_methods:
+        return False
+    for method in route["methods"]:
+        actual = gateway.method_bundle(resource["id"], method["method"])
+        if normalize_bundle(actual) != normalize_bundle(
+            desired_method_bundle(template, method["method"])
+        ):
+            return False
+    cors_actual = gateway.method_bundle(resource["id"], "OPTIONS")
+    if normalize_bundle(cors_actual) != normalize_bundle(
+        desired_cors_bundle(route["cors"])
+    ):
+        return False
+    # The stage serves its deployment's snapshot, so a correct-looking resource tree can still
+    # be unserved. Scope the served check to this one route.
+    single = dict(spec)
+    single["routes"] = [route]
+    return not unserved_routes(gateway, single, template)
+
+
 def routes_already_satisfied(gateway: Gateway, spec: dict[str, Any]) -> bool:
     """Read-only: is every declared route already present in its exact desired end state?
 
@@ -1547,31 +1621,12 @@ def routes_already_satisfied(gateway: Gateway, spec: dict[str, Any]) -> bool:
         if any(method["change"] != "A" for method in route["methods"]):
             return False
     template = template_bundle(gateway, spec)
-    for route in spec["routes"]:
-        resource = gateway.resource(route["path"])
-        if resource is None:
-            return False
-        expected_methods = {method["method"] for method in route["methods"]}
-        expected_methods.add("OPTIONS")
-        if set(resource.get("resourceMethods", {})) != expected_methods:
-            return False
-        for method in route["methods"]:
-            actual = gateway.method_bundle(resource["id"], method["method"])
-            if normalize_bundle(actual) != normalize_bundle(
-                desired_method_bundle(template, method["method"])
-            ):
-                return False
-        cors_actual = gateway.method_bundle(resource["id"], "OPTIONS")
-        if normalize_bundle(cors_actual) != normalize_bundle(
-            desired_cors_bundle(route["cors"])
-        ):
-            return False
-    # The resource tree matching is not enough: the stage serves its deployment's snapshot, so a
-    # correct-looking tree can still be unserved, or served with the wrong auth/integration.
-    # Require the ACTIVE deployment to carry them, configuration included.
-    if unserved_routes(gateway, spec, template):
-        return False
-    return True
+    # Per-route, same strictness. Each check already requires the ACTIVE deployment to serve
+    # that route, so a correct-looking resource tree that is unserved still returns False.
+    return all(
+        route_already_satisfied(gateway, spec, route, template)
+        for route in spec["routes"]
+    )
 
 
 def assert_routes_served(

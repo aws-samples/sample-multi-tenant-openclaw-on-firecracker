@@ -44,7 +44,18 @@ host:
     - m8g.metal-24xl               # 96 vCPU / 384 GiB · 4.0 GB/vCPU
     - m7g.metal                    # 64 vCPU / 256 GiB · 4.0 GB/vCPU
   root_volume_gb: 20
+  # (OS 盘足够,零额外成本)。需要时显式抬高(取消注释):
+  # root_volume_iops: 3000         # gp3 3000–16000
+  # root_volume_throughput: 125    # gp3 125–1000 MiB/s
   data_volume_gb: 900              # 380 VM/台的磁盘硬前提。真机对账(#37,2026-07-04 us-east-1 压 377 VM):/data 实占随负载走——轻载 377 VM 仅占 28G(sparse 单 VM ~84–187M),重载单 VM 实占可达 1.3G,380×1.3G≈494G。600G 够 380 稀疏稳态但重载几乎无冗余;提到 900G 给重载 + 未来密度(#51)余量,仍远低于 380×8G(vm.data_disk_mb 声明上限,靠 sparse 不全占)。改大后 host 重建即带大盘,不依赖运行态扩盘。
+  # 默认 8000 IOPS / 500 MiB/s,来自 us-west-2 真机 fio 扫档 + apse1 14 租户实测 + 成本边际分析:
+  #   · IOPS 8000:apse1 写 IOPS 峰值 276(14 租户)线性外推 380 VM ≈7500,8000 覆盖突发;
+  #     饱和下读 p99 延迟 36ms(3000 档 100ms)。gp3 硬配额、买多少给多少,3 轮方差 0%。
+  #   · 吞吐 500:边际效益拐点。125→500 每 $1 省 1.7min 全量搬运,过 500 后每 $1 仅省
+  #     0.6min(→750)/0.3min(→1000)。500=4× 基线,覆盖真实并发 backup/restore/suspend。
+  # 成本 ≈ +$40/卷·月(IOPS $0.005/个·月 + 吞吐 $0.04/MiB·月)。要更快备份可调高吞吐(≤1000)。
+  data_volume_iops: 8000           # gp3 3000–16000(本项目上限锁 8000);每 +1000 = +$5/卷·月
+  data_volume_throughput: 500      # gp3 125–1000 MiB/s;每 +125 = +$5/卷·月;约束 iops ≥ throughput/0.25
   keep_data_volume:  true          # 实例删除后是否保留EBS卷
   reserved_vcpu: 1
   reserved_mem_mb: 2048

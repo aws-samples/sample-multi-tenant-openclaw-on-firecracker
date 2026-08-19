@@ -872,7 +872,7 @@ resolve_probe_headers() {
   }
   plan_id="$(printf '%s\n' "$plan_ids" | awk 'NF {print; exit}')"
   keys="$(aws apigateway get-usage-plan-keys --usage-plan-id "$plan_id" \
-    --include-values --region "$REGION" --output json)" || {
+    --region "$REGION" --output json)" || {
     warn "cannot read usage-plan keys"
     return 1
   }

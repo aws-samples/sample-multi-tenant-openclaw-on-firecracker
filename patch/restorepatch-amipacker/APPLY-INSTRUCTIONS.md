@@ -530,6 +530,16 @@ A replacement host passes only when all three signals are present:
 3. SSM is online, cloud-init completed, `host-agent` is active, the staged script
    has no unresolved marker, and its SHA-256 matches the published object.
 
+`--scope data` also replays the boot-dependency gate read-only and prints
+`N deployment/scripts object(s) match patch_sha256; ... ; M host observability
+object(s) match the kit copy; K edge object(s) reported only`. The middle count
+covers `deployment/observability/fluent-bit/install-fluent-bit.sh` and `host/**`,
+which the bootstrap fetches at boot with no fallback, so a stale or partially
+published object there is invisible to every other check here and surfaces only as
+the next instance being ABANDONed. The line also states which source decided
+whether logging is enabled at all; on `LOGGING_ENABLED=false` those objects are
+reported as skipped rather than required.
+
 For Lambda invocation, absence of `FunctionError` is the hard signal. A private
 API `/ping` body may be 404 and is not by itself a failure.
 

@@ -2201,58 +2201,73 @@ refresh)
   # fleet replaced every tenant-carrying host again for zero configuration change. Decide from the
   # fleet's real state, not from a record that cannot expire.
   target_refresh_lt="$(state_get host_lt_new_version)"
-  # Ask AWS for the recorded refresh's REAL terminal state. Treating "started" as "done" would make
-  # a failed or cancelled refresh unretryable: the re-run would exit 0 and leave a fleet split
-  # across two launch-template versions, which is worse than replacing it twice.
-  recorded_refresh_id="$(state_get instance_refresh_id)"
-  recorded_refresh_lt="$(state_get refresh_pending_lt_version)"
-  if [ -n "$target_refresh_lt" ] && [ -n "$recorded_refresh_id" ] \
-     && [ "$recorded_refresh_lt" = "$target_refresh_lt" ]; then
-    # Fail closed when the CALL fails. Treating an API/network/auth error as "unknown, decide from
-    # the fleet" would let a run start a second refresh while a rollback is still in flight, and the
-    # fleet check cannot see that. Only a successful call with an empty answer falls through.
-    if ! recorded_refresh_status="$(aws_ autoscaling describe-instance-refreshes \
-      --auto-scaling-group-name "$ASG" --instance-refresh-ids "$recorded_refresh_id" \
-      --query 'InstanceRefreshes[0].Status' --output text)"; then
-      die "refresh refused: cannot read the status of recorded refresh $recorded_refresh_id; resolve that before starting another one"
-    fi
-    # Terminal-and-retryable is an ALLOWLIST, and anything else is treated as still running. The
-    # documented statuses are Pending, InProgress, Successful, Failed, Cancelling, Cancelled,
-    # RollbackInProgress, RollbackFailed, RollbackSuccessful and Baking -- Baking is the post-update
-    # bake wait, i.e. NOT finished. A catch-all keeps a status added later from being read as done.
-    case "$recorded_refresh_status" in
-      Failed|Cancelled|RollbackFailed|RollbackSuccessful)
-        say "previous refresh $recorded_refresh_id ended $recorded_refresh_status; a retry is allowed"
-        ;;
-      ""|None)
-        say "previous refresh $recorded_refresh_id is no longer queryable; deciding from the fleet instead"
-        ;;
-      Successful)
-        # Do NOT skip on this alone. A concurrent launch-template repoint means that refresh may have
-        # replaced the fleet onto a DIFFERENT version than the one this run targets. Let the
-        # fleet-version check below be the thing that decides.
-        say "previous refresh $recorded_refresh_id reports Successful; confirming against the fleet"
-        ;;
-      *)
-        die "refresh refused: $recorded_refresh_id is $recorded_refresh_status for this LT version; wait for it to reach a terminal state instead of starting a second one"
-        ;;
-    esac
+  [ -n "$target_refresh_lt" ] || die "refresh refused: no target launch-template version in $STATE"
+  # Refuse while ANY refresh on this group is unfinished, whoever started it. Keying this off our own
+  # recorded id would miss one started from the console or by another operator, leaving
+  # start-instance-refresh as the only thing between us and two concurrent replacements of a
+  # tenant-carrying fleet. A failed read is fatal: an unreadable history cannot prove quiescence.
+  if ! refresh_history="$(aws_ autoscaling describe-instance-refreshes \
+    --auto-scaling-group-name "$ASG" \
+    --query 'InstanceRefreshes[].[InstanceRefreshId,Status]' --output text)"; then
+    die "refresh refused: cannot read the instance-refresh history of $ASG; resolve that before starting one"
   fi
-  # The recorded verdict can be absent (older state, or a run that died after the refresh finished),
-  # so also ask the ASG: is every instance already on the target launch-template version?
-  fleet_lt_versions="$(aws_ autoscaling describe-auto-scaling-groups \
+  # Terminal is an ALLOWLIST. Everything else counts as unfinished -- including Baking, which is the
+  # post-update bake wait and therefore not done, and any status AWS adds later. Documented values:
+  # Pending, InProgress, Successful, Failed, Cancelling, Cancelled, RollbackInProgress,
+  # RollbackFailed, RollbackSuccessful, Baking.
+  unfinished_refreshes=""
+  while IFS="$(printf '\t')" read -r history_id history_status; do
+    [ -n "$history_id" ] || continue
+    case "$history_status" in
+      Successful|Failed|Cancelled|RollbackFailed|RollbackSuccessful) ;;
+      *) unfinished_refreshes="${unfinished_refreshes:+${unfinished_refreshes} }${history_id}=${history_status}" ;;
+    esac
+  done <<REFRESH_HISTORY
+$refresh_history
+REFRESH_HISTORY
+  [ -z "$unfinished_refreshes" ] \
+    || die "refresh refused: $ASG has an unfinished instance refresh ($unfinished_refreshes); wait for it to reach a terminal state instead of starting a second one"
+  # Whether a refresh is NEEDED is answered by the fleet, never by a stored verdict. A recorded
+  # Successful proves only that some refresh finished -- a concurrent launch-template repoint means it
+  # may have converged the fleet onto a different version than this run targets.
+  if ! fleet_pairs="$(aws_ autoscaling describe-auto-scaling-groups \
     --auto-scaling-group-names "$ASG" \
-    --query 'AutoScalingGroups[0].Instances[].LaunchTemplate.Version' --output text)" \
-    || die "cannot read the fleet's launch-template versions for $ASG"
+    --query 'AutoScalingGroups[0].Instances[].[LaunchTemplate.LaunchTemplateId,LaunchTemplate.Version]' \
+    --output text)"; then
+    die "cannot read the launch-template identity of the instances in $ASG"
+  fi
+  fleet_desired="$(aws_ autoscaling describe-auto-scaling-groups \
+    --auto-scaling-group-names "$ASG" \
+    --query 'AutoScalingGroups[0].DesiredCapacity' --output text)" \
+    || die "cannot read the desired capacity of $ASG"
+  # Compare the template IDENTITY as well as the version: version N of a different launch template is
+  # a different thing, and version alone would read it as converged.
+  fleet_size=0
   fleet_off_target=0
-  for instance_lt in $fleet_lt_versions; do
-    [ "$instance_lt" = "$target_refresh_lt" ] || fleet_off_target=1
-  done
-  if [ -n "$fleet_lt_versions" ] && [ "$fleet_off_target" -eq 0 ]; then
-    say "SKIP refresh: every instance in $ASG already runs LT v${target_refresh_lt}"
+  while IFS="$(printf '\t')" read -r instance_lt_id instance_lt_version; do
+    [ -n "$instance_lt_id" ] || continue
+    fleet_size=$((fleet_size + 1))
+    if [ "$instance_lt_id" != "$LT_ID" ] || [ "$instance_lt_version" != "$target_refresh_lt" ]; then
+      fleet_off_target=1
+    fi
+  done <<FLEET_PAIRS
+$fleet_pairs
+FLEET_PAIRS
+  if [ "$fleet_size" -eq 0 ]; then
+    # Nothing to replace. That is a real no-op only when the group is meant to be empty; an empty
+    # group that wants capacity is a problem to resolve, not a refresh to skip.
+    [ "$fleet_desired" = "0" ] \
+      || die "refresh refused: $ASG wants $fleet_desired instance(s) but reports none; resolve that before refreshing"
+    say "SKIP refresh: $ASG is scaled to zero, so there is nothing to replace"
     echo "   NEXT: bash lib/apply-restorepatch.sh verify --env \"$ENVJSON\" --kit \"$KITDIR\""
     exit 0
   fi
+  if [ "$fleet_off_target" -eq 0 ]; then
+    say "SKIP refresh: all $fleet_size instance(s) in $ASG already run $LT_ID version $target_refresh_lt"
+    echo "   NEXT: bash lib/apply-restorepatch.sh verify --env \"$ENVJSON\" --kit \"$KITDIR\""
+    exit 0
+  fi
+  say "fleet has $fleet_size instance(s), not all on $LT_ID version $target_refresh_lt; a refresh is needed"
   say "instance refresh suspended-process precheck"
   # Suspension is intentional operator state, so refuse instead of auto-resuming it.
   # AWS documents only Launch/Terminate/InstanceRefresh as blocking replacement;
@@ -2277,9 +2292,9 @@ refresh)
     --preferences '{"MinHealthyPercentage":100,"MaxHealthyPercentage":100,"InstanceWarmup":900,"SkipMatching":false}' \
     --query InstanceRefreshId --output text)" || die "cannot start instance refresh"
   state_put instance_refresh_id "$refresh_id"
-  # Record the ATTEMPT, not a completion. The next run resolves this id's real status through
-  # describe-instance-refreshes, so an in-flight refresh blocks a second one while a failed or
-  # cancelled one stays retryable.
+  # Recorded for the operator's benefit only. The guard above deliberately does NOT read it: it asks
+  # the ASG for every recent refresh and for the fleet's actual launch-template identity, so a
+  # refresh started outside this kit is caught too and a stale record cannot make a run skip.
   state_put refresh_pending_lt_version "$target_refresh_lt"
   say "controlled instance refresh started: $refresh_id"
   echo "   NEXT: bash lib/apply-restorepatch.sh verify --env \"$ENVJSON\" --kit \"$KITDIR\""

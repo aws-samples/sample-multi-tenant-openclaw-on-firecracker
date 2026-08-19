@@ -24,6 +24,8 @@ host:
   arch: arm64                      # arm64=Graviton metal 原生 KVM(生产基线)
   instance_type: r8g.metal-24xl    # 96 vCPU / 768GB,380 租户/台
   data_volume_gb: 900              # 380 VM/台的磁盘硬前提
+  data_volume_iops: 8000           # #424 gp3 IOPS(上限锁 8000);缺省即 8000
+  data_volume_throughput: 500      # #424 gp3 吞吐 MiB/s(实测最优,边际拐点);缺省即 500
   cpu_overcommit_ratio: 6.0        # vCPU 超卖(agent 多为 IO/等待型)
   mem_overcommit_ratio: 1.5        # 内存才是硬限;配 balloon 回收时可 1.5
   subnet_ids: []                   # openclaw host 机器子网;空=按 network 私有子网自动选

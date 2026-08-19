@@ -791,6 +791,10 @@ def build_ha_edge(self, ctx):
                     CFG["host"]["root_volume_gb"],
                     volume_type=ec2.EbsDeviceVolumeType.GP3,
                     encrypted=True,
+                    # 键缺省 → get() 返 None → CDK 省略该字段 → 走 gp3 基线,零额外成本。
+                    # 需要时在 config.yml host.root_volume_iops/throughput 显式抬高。
+                    iops=CFG["host"].get("root_volume_iops"),
+                    throughput=CFG["host"].get("root_volume_throughput"),
                 ),
             ),
             ec2.BlockDevice(
@@ -804,6 +808,18 @@ def build_ha_edge(self, ctx):
                     delete_on_termination=not CFG["host"].get(
                         "keep_data_volume", False
                     ),
+                    # 这一块卷。默认 8000 IOPS / 500 MiB/s,取值来自 us-west-2 真机
+                    # fio 扫档(3 轮方差 0%,gp3 硬配额、买多少给多少、无性能拐点)+
+                    # apse1 14 租户 3 天实测 + 成本边际分析:
+                    #   · IOPS 8000:apse1 写 IOPS 峰值 276(14 租户),线性外推 380 VM
+                    #     ≈7500,8000 刚好覆盖突发;饱和下读 p99 延迟 36ms(3000 档 100ms)。
+                    #   · 吞吐 500:边际效益拐点。125→500 每 $1 省 1.7min 全量搬运,过 500
+                    #     后 500→750 每 $1 仅省 0.6min、750→1000 仅 0.3min。500=4× 基线,
+                    #     覆盖真实并发 backup/restore/suspend,比 750 每卷每月省 $10。
+                    # 成本(gp3 超基线:IOPS $0.005/个·月 + 吞吐 $0.04/MiB·月)≈ +$40/卷·月。
+                    # 要更快备份可调高 data_volume_throughput(≤1000);两参数 config 可调。
+                    iops=CFG["host"].get("data_volume_iops", 8000),
+                    throughput=CFG["host"].get("data_volume_throughput", 500),
                 ),
             ),
         ],

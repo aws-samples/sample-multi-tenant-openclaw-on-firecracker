@@ -97,16 +97,20 @@ Live response (excerpt):
     "total_mem_mb": "770018",
     "used_mem_mb": "21504",
     "rootfs_version": "v1.0",
+    "immutable_version": "v1.0",
     "az": "<az>",
     "private_ip": "<ip>",
     "next_vm_num": "36",
-    "last_seen": "<ISO8601>"
+    "last_seen": "<ISO8601>",
+    "is_tainted": false
   }
 ]
 ```
 
+> `immutable_version` (#517) is the host's read-only identity-disk version, independent of `rootfs_version` and present only when the current image names an immutable disk. `is_tainted` (#539) is always present: the store never persists `false` (only REMOVE), so the response layer normalizes the "attribute-absent / false" pair to an explicit `false`; when `true` it also carries `tainted_at` and `tainted_reason` (the `tainted_by` audit field is not surfaced on the list).
+
 **`GET {BASE}/hosts/rootfs-version`** — returns `{"version":"v1.0"}` (the current live image version, i.e. the image a newly booted host starts with).
-**`GET {BASE}/hosts/rootfs-drift`** — a reconciliation of each host's image version `{"current_version","up_to_date","unknown","stale_count","stale":[...]}`, showing which hosts have not yet rolled to the latest image (rolling-upgrade tracking).
+**`GET {BASE}/hosts/rootfs-drift`** — a reconciliation of each tenant's image version `{"current_version","up_to_date","unknown","unknown_tenants":[...],"stale_count","stale":[...]}`, showing which tenants have not yet rolled to the latest image (rolling-upgrade tracking). Since #517 the same scan also returns an independent **immutable (read-only identity disk) dimension**: `immutable_current_version`, `immutable_up_to_date`, `immutable_unknown`, `immutable_unknown_tenants`, `immutable_stale_count`, `immutable_stale`. When the current image has no immutable disk, `immutable_current_version` is `""` and the whole dimension is N/A (all counts 0, lists empty), so tenants without an immutable disk are not misreported as needing an upgrade.
 
 The distinction among the three: `/images` (see §3.4) shows which artifacts are baked in Amazon S3 and which version is live; `/hosts/rootfs-version` only returns the live version number; `/hosts/rootfs-drift` shows whether the image version actually running on each host is aligned.
 
@@ -267,7 +271,11 @@ Image snapshot and canary-slot endpoints:
 
 **`POST {BASE}/hosts`** — register an EC2 instance as a Firecracker host (RBAC operator+). body `{instance_id:"i-..."}`. The platform runs DescribeInstances to obtain vCPU/memory/AZ, accounts for it after deducting `HOST_RESERVED_*`, and returns `201 {instance_id,status:"active",az}`.
 **`DELETE {BASE}/hosts/{instance_id}`** — take a host offline (RBAC operator+). It is not deleted directly; the host is marked `status:draining` and an ASG lifecycle hook is triggered, which cleans up all tenants on it (mark-deleted) before terminating the instance. Returns `200 {instance_id,status:"draining"}`.
-**`POST {BASE}/hosts/refresh-rootfs`** — from `manifest.json`, push the latest rootfs + data template + read-only disk via SSM to all active/idle hosts (RBAC operator+), asynchronously updating each host's `rootfs_version`. No body. Returns `{message:"refresh started",version,hosts:[...]}`.
+**`POST {BASE}/hosts/{instance_id}/taint`** — cordon a host (RBAC operator+). Since #539, `is_tainted` is **orthogonal** to the lifecycle `status` and only expresses a NoSchedule operations intent: it does not touch the running instance or its tenants, it only marks the host so later placement can avoid it. body `{reason:"<non-empty reason>"}`. Idempotent: an already-tainted host returns `200 {..., already_tainted:true}` without overwriting the original `tainted_at/reason`. Returns `200 {instance_id,is_tainted:true,tainted_at,tainted_reason}`; a missing/empty `reason` returns `400 VALIDATION`, an unknown host returns `404`. The `tainted_by` audit field records the caller identity but is not surfaced on `GET /hosts`.
+**`DELETE {BASE}/hosts/{instance_id}/taint`** — clear the taint (RBAC operator+). Only REMOVEs the taint attributes; it **never** persists `is_tainted:false` — the `GET /hosts` `is_tainted` is filled in as `false` by the response layer. Idempotent: an untainted host returns `200 {..., already_untainted:true}`. Returns `200 {instance_id,is_tainted:false}`.
+
+> **The taint is a marker only; it does not yet affect placement.** The scheduler exclusion is the read side (#540). Until that lands, the taint API returning 200 does **not** mean cordon is in effect — new tenants can still be placed on a tainted host. Do not present it to operators or customers as "cordon works".
+**`POST {BASE}/hosts/refresh-rootfs`** — from `manifest.json`, push the latest rootfs + data template + read-only disk via SSM to all active/idle hosts (RBAC operator+), asynchronously updating each host's `rootfs_version` (and, since #517, `immutable_version`; the host commits both coordinates under `pull.lock` after the `.tmp→mv` staging, with the Lambda writing them as a backstop). No body. Returns `{message:"refresh started",version,immutable_version,hosts:[...]}`.
 **`POST {BASE}/hosts/fleet-power`** — **fleet-wide power on/off**: across all active hosts, via a host-local fan-out, start/stop every microVM on them at once (targeting a 1-minute fleet power on/off). body `{action:"start|stop"}`. **admin only** (operator required at the route layer, with an additional admin check inside the function, defense in depth). Returns `202 {action,hosts,command_id,reconciled,status:"dispatched"}`, and automatically reconciles the state of steady-state tenants (start: stopped→running; stop: running→stopped), without touching transitional states.
 
 ### 3.6 Groups and Skills (console operations)
@@ -398,6 +406,7 @@ Steps 1–3 are control-plane calls. With the default configuration, writes need
 | `/hosts` `/hosts/rootfs-version` `/hosts/rootfs-drift` | GET            | api-key · viewer           | host and image reconciliation                                                                    |
 | `/hosts`                                               | POST           | operator                   | register a host                                                                                  |
 | `/hosts/{instance_id}`                                 | DELETE         | operator                   | take a host offline (draining)                                                                   |
+| `/hosts/{instance_id}/taint`                           | POST/DELETE    | operator                   | set/clear cordon taint (NoSchedule, orthogonal to status)                                        |
 | `/hosts/refresh-rootfs`                                | POST           | operator                   | push the latest image to hosts                                                                   |
 | `/hosts/fleet-power`                                   | POST           | **admin**                  | fleet-wide power on/off                                                                          |
 | `/images`                                              | GET            | viewer                     | image artifact list                                                                              |

@@ -90,6 +90,7 @@ def _render_metrics_text(
     Always emits HELP/TYPE headers (even with zero samples) so that scrapers
     that validate metadata don't choke on a quiet host.
 
+    #387: port_stats/agent_stats are OPTIONAL dict snapshots taken by the
     caller (do_GET) from already-initialized singletons/state. This function
     MUST NOT touch _get_port_bitmap() or any lazy-init singleton — rendering
     a metrics page must never mutate global routing state. When port_stats
@@ -521,6 +522,7 @@ def _launch_argv(*args):
 def _recover_vm(tenant_id, cfg):
     """Launch VM that has vm.json but no running Firecracker process.
 
+    #315 修 _recovering 永久泄漏(真机 28/300 卡 creating 根因):旧版只在 Popen 抛异常时
     discard,起 VM 子进程失败(flock-skip rc75 / START 后被杀 / 半成品)【不抛异常】→
     _recovering 永留 → 下个 probe `if tid in _recovering: return` 永久跳过 → recover 只试
     一次、失败即永久卡(host-agent.py 的 discard 只在 fc_running=True 才走到)。
@@ -644,6 +646,37 @@ def _fc_boot_iso(fc_pid):
         return ""
 
 
+def _probe_app_health(guest_ip, chat_ep):
+    """探 guest gateway 的 app_health,返回 "up"/"down"。
+
+    #526 — 对开了 chatCompletions 的租户(chat_ep 为真)收紧判据:探真实数据面入口
+    /v1/chat/completions,返回 404 = 端点缺失(本 bug:restore/wake 传第10位 0 →
+    harden-config del(chatCompletions),客户拿 404 而 app_health 却 up 静默)= down;
+    401/200 等真实码 = 端点在 = up。
+    chat_ep 假的租户维持既有宽松判据:探 `/` 任意非 000 码即 up —— openclaw 2026.2.26 的
+    gateway 任何路径都 404,不能拿"具体路由 404"当 down(病史:全 fleet 误报 down、卡 creating)。
+    curl 退出码 7(拒连)/28(超时)或 http_code 000 = 端口不通 = down。
+    """
+    try:
+        base = ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                "--connect-timeout", "3"]
+        if chat_ep:
+            args = base + ["-X", "POST", "-H", "content-type: application/json",
+                           "-d", "{}",
+                           f"http://{guest_ip}:{GATEWAY_PORT}/v1/chat/completions"]
+        else:
+            args = base + [f"http://{guest_ip}:{GATEWAY_PORT}/"]
+        r = subprocess.run(args, capture_output=True, timeout=8)
+        code = (r.stdout or b"").decode(errors="replace").strip()
+        if r.returncode != 0 or not code.isdigit() or code == "000":
+            return "down"  # 端口不通/无 HTTP 应答
+        if chat_ep and code == "404":
+            return "down"  # chatCompletions 端点缺失(#526)
+        return "up"
+    except Exception:
+        return "down"
+
+
 def _probe_all():
     """Probe all local VMs."""
     results = {}
@@ -741,39 +774,9 @@ def _probe_all():
 
         if vm_health == "up":
             _register_net_poll(tenant_id, guest_reachable=True)
-            try:
-                # app_health = gateway 的 HTTP server 是否在应答(不是某个具体路由存不存在)。
-                # 病史:老版探 `/` 用 `curl -f`,404 被当失败误报 down;改探 `/healthz` 期望
-                # 200——但 openclaw 2026.2.26 的 gateway **没有 /healthz 端点,任何路径都 404**
-                # (实测 18789 上 / /healthz /health /ping 全 404,gateway 进程却正常在跑),
-                # 于是全 fleet app_health=down、promotion gate 卡在 creating。根因是"探一个
-                # 版本相关的具体路由"这个思路本身脆——不同 openclaw 版本 health 路由不一样。
-                # 改判据:**端口有 HTTP 应答即 gateway 活**(连得上并返回任意 HTTP 状态码,
-                # 含 404/401/200),而 curl 退出码 7(拒连)/28(超时)/000 才是真 down。
-                # 这样既不误报 2.26 的 404,又保留"gateway 没起/端口不通=down"的判活能力。
-                # 不再用 -f;用 -w %{http_code} 拿状态码,非 000 = HTTP server 在应答。
-                r = subprocess.run(
-                    [
-                        "curl",
-                        "-s",
-                        "-o",
-                        "/dev/null",
-                        "-w",
-                        "%{http_code}",
-                        "--connect-timeout",
-                        "3",
-                        f"http://{guest_ip}:{GATEWAY_PORT}/",
-                    ],
-                    capture_output=True,
-                    timeout=8,
-                )
-                code = (r.stdout or b"").decode(errors="replace").strip()
-                # 000 = 没连上/无 HTTP 响应(curl 连接失败时 http_code 为 000);
-                # 任何真实 HTTP 码(2xx/4xx/401/404…)= gateway HTTP server 活着在应答。
-                if r.returncode == 0 and code.isdigit() and code != "000":
-                    app_health = "up"
-            except Exception:
-                pass
+            # #526 — chat_ep=1 的租户探真实数据面入口(chatCompletions),404=端点缺失=down;
+            # chat_ep 假的维持"端口任意码即 up"的 2.26 兼容判据。详见 _probe_app_health。
+            app_health = _probe_app_health(guest_ip, cfg.get("chat_ep", 0))
         elif _register_net_poll(tenant_id, guest_reachable=False):
             # FC alive but guest unreachable past the threshold — rebuild network.
             _force_relaunch_vm(tenant_id, cfg)
@@ -986,6 +989,7 @@ def _refresh_health(table, tid, info, now, metrics):
     """Health-refresh write for a tenant NOT promoted this tick (already
     running, still creating with the gateway not up yet, or down).
 
+    #237 — beyond the health fields, reconcile `guest_ip` to the data-plane
     truth carried up from the local vm.json. A control-plane↔data-plane drift
     (DDB records a guest_ip the host never actually booted — e.g. DDB .30 while
     the host launched .26) otherwise festers as a ghost forever: the promote
@@ -2214,6 +2218,7 @@ def _flag_requires_intervention(tenant_id):
     """Budget exhausted: tenants.status=requires_intervention (no reset). Only
     from creating/failed to avoid clobbering a subsequent recovery.
 
+    #315(codex review7 P2)返回 assignment 应写的终态字符串,让 assignment 与 tenant 状态一致:
     - 写成功 → "failed":tenant 刚翻 requires_intervention,assignment 标 failed 匹配。
     - CCF → 回读 tenant 真实状态定夺(不再一律当 failed,否则健康线程已 promote running 时会留下
       tenant=running / assignment=failed 矛盾):

@@ -97,16 +97,20 @@ curl -s -H "x-api-key: $KEY" "{BASE}/system/info"
     "total_mem_mb": "770018",
     "used_mem_mb": "21504",
     "rootfs_version": "v1.0",
+    "immutable_version": "v1.0",
     "az": "<az>",
     "private_ip": "<ip>",
     "next_vm_num": "36",
-    "last_seen": "<ISO8601>"
+    "last_seen": "<ISO8601>",
+    "is_tainted": false
   }
 ]
 ```
 
+> `immutable_version`(#517)为该宿主只读身份盘版本,与 `rootfs_version` 独立,仅当当前镜像含 immutable 盘时才出现。`is_tainted`(#539)恒出现:存储层从不写 `false`(只 REMOVE),响应层把「缺属性/false」归一成显式 `false`;为 `true` 时附带 `tainted_at`、`tainted_reason`(审计字段 `tainted_by` 不出列表)。
+
 **`GET {BASE}/hosts/rootfs-version`** — 返 `{"version":"v1.0"}`(当前 live 镜像版本号,即新宿主开机启动的镜像)。
-**`GET {BASE}/hosts/rootfs-drift`** — 各宿主镜像版本对账 `{"current_version","up_to_date","unknown","stale_count","stale":[...]}`,看哪些宿主还没滚到最新镜像(滚动升级追踪)。
+**`GET {BASE}/hosts/rootfs-drift`** — 各租户镜像版本对账 `{"current_version","up_to_date","unknown","unknown_tenants":[...],"stale_count","stale":[...]}`,看哪些租户还没滚到最新镜像(滚动升级追踪)。#517 起同一次扫描还并列返回**只读身份盘(immutable)维度**:`immutable_current_version`、`immutable_up_to_date`、`immutable_unknown`、`immutable_unknown_tenants`、`immutable_stale_count`、`immutable_stale`。当前镜像不含 immutable 盘时 `immutable_current_version` 为 `""`,该维度整体 N/A(计数恒 0、列表空),不会把无只读盘的租户误报成待升级。
 
 三者区别:`/images`(见 §3.4)看 S3 里烤了哪些制品、哪个版本 live;`/hosts/rootfs-version` 只回 live 版本号;`/hosts/rootfs-drift` 看宿主机实际运行的镜像版本是否对齐。
 
@@ -263,7 +267,11 @@ curl -s -H "x-api-key: $KEY" "{BASE}/images"
 
 **`POST {BASE}/hosts`** — 把一台 EC2 实例注册为 Firecracker 宿主(RBAC operator+)。body `{instance_id:"i-..."}`。平台侧 DescribeInstances 拿 vCPU/内存/AZ,扣除 `HOST_RESERVED_*` 后记账,返 `201 {instance_id,status:"active",az}`。
 **`DELETE {BASE}/hosts/{instance_id}`** — 宿主下线(RBAC operator+)。不直接删,标 `status:draining` 并触发 ASG 生命周期钩子,由钩子清理其上所有租户(mark-deleted)后终止实例。返 `200 {instance_id,status:"draining"}`。
-**`POST {BASE}/hosts/refresh-rootfs`** — 从 `manifest.json` 把最新 rootfs + 数据模板 + 只读盘经 SSM 下发到所有活跃/空闲宿主(RBAC operator+),异步更新各宿主 `rootfs_version`。无 body。返 `{message:"refresh started",version,hosts:[...]}`。
+**`POST {BASE}/hosts/{instance_id}/taint`** — 给宿主打 cordon 污点(RBAC operator+)。#539 起,`is_tainted` 与生命周期 `status` **正交**,只表达 NoSchedule 运维意图:不动运行中的实例与其上租户,只标记该宿主以便后续调度避让。body `{reason:"<非空原因>"}`。幂等:已污点时返 `200 {..., already_tainted:true}` 且不覆盖原 `tainted_at/reason`。返 `200 {instance_id,is_tainted:true,tainted_at,tainted_reason}`;`reason` 缺失/为空返 `400 VALIDATION`,宿主不存在返 `404`。审计字段 `tainted_by` 记录调用方身份,但不出现在 `GET /hosts` 列表里。
+**`DELETE {BASE}/hosts/{instance_id}/taint`** — 清除污点(RBAC operator+)。只 REMOVE 污点属性,**绝不持久化** `is_tainted:false`;`GET /hosts` 的 `is_tainted` 由响应层显式补 `false`。幂等:未污点时返 `200 {..., already_untainted:true}`。返 `200 {instance_id,is_tainted:false}`。
+
+> **污点当前只是标记,尚不影响放置。** 调度器排除逻辑属读侧(#540),未合入前标记 API 返 200 也**不代表** cordon 已生效——新租户仍可能落到已打污点的宿主上。请勿据此对运维或客户宣告"污点可用"。
+**`POST {BASE}/hosts/refresh-rootfs`** — 从 `manifest.json` 把最新 rootfs + 数据模板 + 只读盘经 SSM 下发到所有活跃/空闲宿主(RBAC operator+),异步更新各宿主 `rootfs_version`(#517 起同时提交 `immutable_version`,宿主侧经 `pull.lock` 串行、`.tmp→mv` 后才写坐标,Lambda 侧兜底同写)。无 body。返 `{message:"refresh started",version,immutable_version,hosts:[...]}`。
 **`POST {BASE}/hosts/fleet-power`** — **全舰队启停**:跨所有活跃宿主经宿主本地 fan-out 一次性启/停其上每个 microVM(1 分钟舰队启停目标)。body `{action:"start|stop"}`。**admin 专属**(路由层要 operator,函数内再校验 admin,双层防御)。返 `202 {action,hosts,command_id,reconciled,status:"dispatched"}`,并自动对稳态租户做状态对账(start:stopped→running;stop:running→stopped),不触及过渡态。
 
 ### 3.6 分组与技能(控制台运维)
@@ -398,6 +406,7 @@ curl -s -H "x-api-key: $KEY" "$BASE/tenants/t-<16hex>"
 | `/hosts` `/hosts/rootfs-version` `/hosts/rootfs-drift` | GET            | api-key · viewer             | 宿主与镜像对账                                                                                   |
 | `/hosts`                                               | POST           | operator                     | 注册宿主                                                                                         |
 | `/hosts/{instance_id}`                                 | DELETE         | operator                     | 宿主下线(draining)                                                                               |
+| `/hosts/{instance_id}/taint`                           | POST/DELETE    | operator                     | 打/清 cordon 污点(NoSchedule,与 status 正交)                                                    |
 | `/hosts/refresh-rootfs`                                | POST           | operator                     | 下发最新镜像到宿主                                                                               |
 | `/hosts/fleet-power`                                   | POST           | **admin**                    | 全舰队启停                                                                                       |
 | `/images`                                              | GET            | viewer                       | 镜像制品清单                                                                                     |

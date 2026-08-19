@@ -143,7 +143,6 @@ class DispatchInfra(Construct):
 
         # 校验:mode 只允许 push|pull|ddb(spec 契约)。fail-loud 优于 synth 出错误资源。
         # push=聚合 SSM+ParamStore 分片(回退);pull=host-agent 轮询自取(二期);
-        # ddb=写 assignments 表 + --from-ddb SSM 叫醒(一期默认载体,#73)。
         mode = str(merged.get("mode", "push")).lower()
         if mode not in ("push", "pull", "ddb"):
             raise ValueError(
@@ -152,9 +151,7 @@ class DispatchInfra(Construct):
             )
         self.mode = mode
 
-        # #331/#327 — host 级冷启动并发槽数,注入 Lambda 的 DISPATCH_HOST_LAUNCH_CONCURRENCY
         # (SSM 超时公式分母)。【单一来源】= 调用方(compute.py)从 vm.host_launch_slots 读入传进来,
-        # 与 ha_edge.py 注入 host 侧 OC_HOST_LAUNCH_SLOTS 同读一处,不再各读各的(codex #4)。
         # 校验正整数,非法(0/负/非数)fail-safe 回落 30,防两侧漂移或 migrate 抢锁死循环。
         try:
             self._launch_slots = int(host_launch_slots)
@@ -164,7 +161,6 @@ class DispatchInfra(Construct):
             self._launch_slots = 30
 
         # dev 环境 assignments 表用 DESTROY,生产由调用方覆盖为 RETAIN。默认 DESTROY 跟
-        # SPEC L105(RemovalPolicy DESTROY(dev))对齐。删表算不可逆(铁律#4),生产
         # 覆盖前必须先备份 → 我们保留调用方权限,不在这里锁死。
         removal = (
             removal_policy if removal_policy is not None else RemovalPolicy.DESTROY
@@ -177,7 +173,6 @@ class DispatchInfra(Construct):
         #
         # visibility_timeout 必须 ≥ 消费 Lambda 的 timeout(AWS SQS→Lambda 硬约束,否则
         # CFN CreateQueue/ESM 报 "visibility less than function timeout" 400)。ESM 挂在
-        # api_fn 上(见下 add_event_source_mapping),api_fn timeout=900s(#217 pull-image
         # 金丝雀链)。取 960 = 900 + 60s buffer:AWS 硬约束是 ≥(900 恰好合法),但官方
         # 最佳实践建议 visibility 大于 function timeout 留边界余量,避免 function 跑满
         # 900s 时消息在同一刻可见性到期被重投的竞态。消费侧 env 未显式下发:
@@ -186,6 +181,9 @@ class DispatchInfra(Construct):
         # (消费侧假设的 visibility 比真实值小,只会更保守不会撞重投)。旧值
         # 300 < 900 是 bug(基础设施与消费侧不同源,dispatch.enabled=true 首次部署即 CFN 400)。
         dlq_max_receive = int(merged.get("dlq_max_receive_count", 3))
+        # #522 P1-2 —— 存到 self,供 dispatch_env 注入消费端(收敛 backstop 须与队列真实
+        # maxReceiveCount 同源:分两处各写死会漂 → backstop 提前误终态 / 静默 DLQ)。
+        self._dlq_max_receive = dlq_max_receive
         self.dlq = sqs.Queue(
             self,
             "DispatchDLQ",
@@ -446,18 +444,18 @@ class DispatchInfra(Construct):
             "DISPATCH_MODE": self.mode,
             "ASSIGNMENTS_TABLE": self.assignments_table.table_name,
             "DISPATCH_PARAM_PREFIX": _PARAM_PREFIX,
-            # 下面几个是默认值,写在 Lambda 环境变量里。⚠️(codex #327 Error4)当前【只有 andon
             # 字段】从 SSM /openclaw/dispatch/config 热读(见 dispatch_service._check_andon);
             # 下面这些旋钮只能改 Lambda env(update-function-configuration)后生效,不是改 SSM config。
             # 之前注释误称"改 SSM config 不重 deploy"——已更正:改这些要动 Lambda env,不重 cdk deploy 即可。
             "DISPATCH_MAX_PARALLEL": "96",  # 装箱密度(per_host_cap),一批往一台塞几个 VM
-            # #331/#327 — host 级冷启动并发(SSM 超时公式分母 + launch-vm MAX_PARALLEL),
             # 须与 host 侧 OC_HOST_LAUNCH_SLOTS 同值(默认 30)。要调改这里 + ha_edge 的
             # vm.host_launch_slots 两处一起改(两侧同一物理含义,分别注入 Lambda / host)。
             "DISPATCH_HOST_LAUNCH_CONCURRENCY": str(self._launch_slots),
             "DISPATCH_INFLIGHT_TTL_SEC": "180",
             "DISPATCH_RETRY_BUDGET": "3",
-            # #340 — dispatch 磁盘软门:host /data 物理剩余低于此(MB)不接新租户;上报超此
+            # #522 P1-2 —— 收敛 backstop 阈值,与队列 max_receive_count 同源(上面同一 cfg)。
+            # 消费端到最后一次投递仍 unplaced → loud 转 requires_intervention,不静默进 DLQ。
+            "DISPATCH_MAX_RECEIVE_COUNT": str(self._dlq_max_receive),
             # 秒数视为陈旧、跳过该门(fail-open)。改这两个同样是动 Lambda env(不重 cdk deploy)。
             # 0 关门。默认留一个默认 data 盘余量给新租户初始写入。
             "DISPATCH_HOST_DISK_MIN_FREE_MB": "2048",

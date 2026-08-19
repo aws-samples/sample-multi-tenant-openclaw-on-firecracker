@@ -64,7 +64,7 @@ Firecracker microVM 挂载四到五块盘，按 Firecracker PUT 顺序分配 `/d
 - **rootfs（vda）**：`is_read_only:true` + `is_root_device:true`，只读根。
 - **overlay（vdb）**：`is_read_only:false`，per-VM 写时复制层。
 - **data（vdc）**：`is_read_only:false`，承载租户配置与 skill。
-- **immutable（vdd）**：`is_read_only:true`，身份与 skill 权威盘，承载身份文件与运维 skill；缺失则告警跳过（降级态）。immutable 盘必须在 data 之后 PUT，以确保 guest 看到的是 `/dev/vdd`（Firecracker 的盘符顺序约束）。
+- **immutable（vdd）**：`is_read_only:true`，身份与 skill 权威盘，承载身份文件与运维 skill；默认缺失则告警跳过（降级态：guest 回落到 data 盘里烤制当天的旧身份副本，控制面无告警）。#517 起可置 `security.immutable_disk_required: true` 改为 fail-closed——盘缺失时 `launch-vm.sh` 直接 `exit 1`，宁可这台起不来也不静默跑错身份（改部署代码后重建生效，非热改）。immutable 盘必须在 data 之后 PUT，以确保 guest 看到的是 `/dev/vdd`（Firecracker 的盘符顺序约束）。
 - **creds（vde，条件挂载）**：`is_read_only:true`，仅当租户带注入凭据（`injected_credentials`）时挂载，存放解密后的 dotenv（`.env`），ro-bind 进 `~/.openclaw/.env`。无注入凭据的租户仍是四块盘。
 
 只读语义不依赖特殊的只读文件系统，而由三层叠加保证：① Firecracker 在 virtio-block 层以 `is_read_only:true` 设置写屏障，guest 内即便以 root 写入也会被底层挡住；② guest 启动后以 `mount -o ro /dev/vdd` 挂载；③ `openclaw-ro-harden` 把身份文件与护栏代码 bind 覆盖为只读。三层叠加后，以 root 写入身份文件或运维 skill 会被拒绝（Read-only file system）。

@@ -94,16 +94,43 @@ FB_CONF_DIR="${FB_CONF_DIR:-/etc/fluent-bit}"
 FB_STORAGE_DIR="${FB_STORAGE_DIR:-/var/lib/fluent-bit/storage}"
 mkdir -p "$FB_CONF_DIR" "$FB_STORAGE_DIR"
 _s3_prefix="deployment/observability/fluent-bit/${FB_ROLE}"
-if [[ -n "${ASSETS_BUCKET:-}" ]] && \
-   aws s3 cp "s3://${ASSETS_BUCKET}/${_s3_prefix}/" "$FB_CONF_DIR/" \
-     --recursive --region "$FB_REGION" --no-progress 2>/dev/null && \
-   [[ -f "$FB_CONF_DIR/fluent-bit.conf" ]]; then
-    log "pulled ${FB_ROLE} config from s3://${ASSETS_BUCKET}/${_s3_prefix}/"
+# #531 — stage the pull, then judge what THIS run fetched. The guard used to be
+# `[[ -f "$FB_CONF_DIR/fluent-bit.conf" ]]` right after an in-place recursive cp,
+# and two facts made it unable to fail: (a) `aws s3 cp <prefix>/ <dst>/ --recursive`
+# exits 0 when the prefix matches ZERO objects (unlike single-file cp), and (b) step 1
+# already let the distro package write its own default config into $FB_CONF_DIR. So an
+# empty prefix logged "pulled <role> config", skipped the FB_LOCAL_DIR fallback, and
+# every later check passed against the package default: no ${FB_*} left unresolved, no
+# delivery_stream line to be empty, no script line to be missing, and a dry-run that is
+# valid because the package ships valid config. Measured 2026-08-18 on three in-service
+# edges: input cpu.local → stdout, zero firehose hits, service active, installer exit 0.
+_fb_stage="$(mktemp -d)"
+_fb_cp_err="$(mktemp)"
+trap 'rm -rf -- "$_fb_stage" "$_fb_cp_err"' EXIT
+_fb_pulled=0
+if [[ -n "${ASSETS_BUCKET:-}" ]]; then
+    # stderr is where the zero-match notice lands, so it is kept, not sent to /dev/null.
+    if aws s3 cp "s3://${ASSETS_BUCKET}/${_s3_prefix}/" "$_fb_stage/" \
+         --recursive --region "$FB_REGION" --no-progress 2>"$_fb_cp_err"; then
+        _fb_pulled="$(find "$_fb_stage" -type f | wc -l | tr -d '[:space:]')"
+    else
+        log "WARN: s3 cp of ${_s3_prefix}/ failed: $(tr '\n' ' ' < "$_fb_cp_err" | tail -c 300)"
+    fi
+fi
+if [[ "$_fb_pulled" -gt 0 && -f "$_fb_stage/fluent-bit.conf" ]]; then
+    while IFS= read -r _abs; do
+        # Keep the prefix's relative layout: a flat install would break a config that
+        # references a script by a subdirectory path.
+        _rel="${_abs#"$_fb_stage"/}"
+        mkdir -p "$FB_CONF_DIR/$(dirname "$_rel")"
+        install -m 0644 "$_abs" "$FB_CONF_DIR/$_rel"
+    done < <(find "$_fb_stage" -type f)
+    log "pulled ${_fb_pulled} object(s) for role=${FB_ROLE} from s3://${ASSETS_BUCKET}/${_s3_prefix}/"
 elif [[ -n "${FB_LOCAL_DIR:-}" && -f "${FB_LOCAL_DIR}/fluent-bit.conf" ]]; then
-    log "WARN: S3 config unavailable; falling back to baked ${FB_LOCAL_DIR}"
+    log "WARN: S3 staged ${_fb_pulled} object(s) and no fluent-bit.conf among them; falling back to baked ${FB_LOCAL_DIR}"
     install -m 0644 "${FB_LOCAL_DIR}"/* "$FB_CONF_DIR/"
 else
-    die "no Fluent Bit config for role=${FB_ROLE} (S3 miss + no local fallback)"
+    die "no Fluent Bit config for role=${FB_ROLE}: s3://${ASSETS_BUCKET:-<unset>}/${_s3_prefix}/ staged ${_fb_pulled} object(s) with no fluent-bit.conf, and no FB_LOCAL_DIR fallback"
 fi
 
 # ── 3. Render ${FB_*} placeholders from the environment ──────────────────
@@ -121,6 +148,20 @@ if grep -Eq '\$\{FB_[A-Z0-9_]+\}' "$FB_CONF_DIR/fluent-bit.conf"; then
 fi
 if grep -Eq '^[[:space:]]*delivery_stream[[:space:]]*$' "$FB_CONF_DIR/fluent-bit.conf"; then
     die "delivery_stream rendered empty"
+fi
+
+# #531 — every check above is an ABSENCE check: it can only fail on a config that
+# already contains the thing being checked, so a config from the wrong source passes
+# them all. Assert positively that this config forwards somewhere.
+# Scope: this catches "no firehose output at all" — the distro package default, whether
+# it came from the package install or from a stale S3 prefix. It does NOT catch the
+# OTHER role's config: an edge config on a host has a firehose output too and passes
+# here. Detecting role confusion needs a role-specific marker and is not done here.
+if ! grep -Eqi '^[[:space:]]*Name[[:space:]]+kinesis_firehose[[:space:]]*$' "$FB_CONF_DIR/fluent-bit.conf"; then
+    die "fluent-bit.conf has no kinesis_firehose output; refusing to start a collector that forwards nowhere (role=${FB_ROLE}, source ${_s3_prefix}/)"
+fi
+if ! grep -Eq '^[[:space:]]*delivery_stream[[:space:]]+[^[:space:]]' "$FB_CONF_DIR/fluent-bit.conf"; then
+    die "fluent-bit.conf has a kinesis_firehose output but no delivery_stream carrying a value (role=${FB_ROLE})"
 fi
 
 # Every Lua script the config references must be on disk before we start.

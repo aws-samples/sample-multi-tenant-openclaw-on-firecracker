@@ -1305,6 +1305,13 @@ def build_lambdas(self, ctx):
     fleet_power_resource = hosts_resource.add_resource("fleet-power")
     fleet_power_resource.add_method("POST", _li(), **key_required)
 
+    # #517 stage 4 — submit a bounded rolling upgrade and poll its progress.
+    rolling_upgrade_resource = hosts_resource.add_resource("rolling-upgrade")
+    rolling_upgrade_resource.add_method("POST", _li(), **key_required)
+    rolling_jobs_resource = hosts_resource.add_resource("rolling-jobs")
+    rolling_job_resource = rolling_jobs_resource.add_resource("{job_id}")
+    rolling_job_resource.add_method("GET", _li(), **key_required)
+
     # Phase 4 — rootfs drift (which tenants are NOT on the current version).
     rootfs_drift_resource = hosts_resource.add_resource("rootfs-drift")
     rootfs_drift_resource.add_method("GET", _li(), **key_required)

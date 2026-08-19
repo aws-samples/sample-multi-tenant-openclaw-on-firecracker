@@ -1,0 +1,342 @@
+{
+  "synced_at": "2026-08-19 12:05:52 UTC+08:00",
+  "base_sha": "9296dfa55a2ce6977a186aa53ced5db049fb84fb",
+  "source_commit": "c5db0a05c24972770e1d56d2f60ddd1561787e4d",
+  "commit_count": 53,
+  "file_count": 30,
+  "summary": "Sync the bb increment 9296dfa5..c5db0a05 to the public gateway branch. Sync-LOG only (which customer-facing files reached gateway + the issues behind them); the applyable patch kit is NOT built yet (folded_into pending).",
+  "issues_synced_note": "Index back to the issue tracker for whoever builds the patch kit: before assembling the kit, walk each issue and confirm it's covered. `title` is a ≤20-char gist only — open the issue for the full problem/fix/test. Lists only issues that touched a released file this sync.",
+  "issues_synced": [
+    {
+      "id": "#400",
+      "type": "feat",
+      "title": "fix"
+    },
+    {
+      "id": "#424",
+      "type": "feat",
+      "title": "提高 host EBS gp3 默认 I…"
+    },
+    {
+      "id": "#447",
+      "type": "feat",
+      "title": "dispatch 批量预留 base v…"
+    },
+    {
+      "id": "#458",
+      "type": "fix",
+      "title": "install-fluent-bit.s…"
+    },
+    {
+      "id": "#489",
+      "type": "feat",
+      "title": "preflight-check.sh 焊…"
+    },
+    {
+      "id": "#517",
+      "type": "feat",
+      "title": "add drift-gated roll…"
+    },
+    {
+      "id": "#522",
+      "type": "fix",
+      "title": "rootfs_version 统一为 l…"
+    },
+    {
+      "id": "#526",
+      "type": "fix",
+      "title": "dispatch create 落库 c…"
+    },
+    {
+      "id": "#531",
+      "type": "fix",
+      "title": "install-fluent-bit.s…"
+    },
+    {
+      "id": "#534",
+      "type": "fix",
+      "title": "rootfs_version 统一为 l…"
+    },
+    {
+      "id": "#536",
+      "type": "fix",
+      "title": "host 污点写侧"
+    },
+    {
+      "id": "#539",
+      "type": "fix",
+      "title": "host 污点写侧"
+    },
+    {
+      "id": "#544",
+      "type": "fix",
+      "title": "preflight-check.sh 报…"
+    },
+    {
+      "id": "#545",
+      "type": "fix",
+      "title": "备份前刷 guest page cach…"
+    }
+  ],
+  "needs_config_on_apply": [
+    {
+      "file": "config.yml.example",
+      "param": "data_volume_iops",
+      "change": "new",
+      "value": "8000           # gp3 3000–16000(本项目上限锁 8000);每 +1000 = +$5/卷·月"
+    },
+    {
+      "file": "config.yml.example",
+      "param": "data_volume_throughput",
+      "change": "new",
+      "value": "500      # gp3 125–1000 MiB/s;每 +125 = +$5/卷·月;约束 iops ≥ throughput/0.25"
+    }
+  ],
+  "updated_files": {
+    "cdk-stack (cdk deploy OR hand-apply)": [
+      {
+        "path": "deploy/stacks/ha_edge.py",
+        "status": "modified",
+        "issues": [
+          "#424"
+        ]
+      },
+      {
+        "path": "deploy/stacks/lambdas.py",
+        "status": "modified",
+        "issues": [
+          "#517"
+        ]
+      }
+    ],
+    "docs": [
+      {
+        "path": "docs/aws-guide-en/03-architecture-details.md",
+        "status": "modified",
+        "issues": [
+          "#536",
+          "#539"
+        ]
+      },
+      {
+        "path": "docs/aws-guide-en/09-api-integration.md",
+        "status": "modified",
+        "issues": [
+          "#536",
+          "#539"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/03-architecture-details.md",
+        "status": "modified",
+        "issues": [
+          "#536",
+          "#539"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/09-api-integration.md",
+        "status": "modified",
+        "issues": [
+          "#536",
+          "#539"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/openapi.yaml",
+        "status": "modified",
+        "issues": [
+          "#517",
+          "#536",
+          "#539"
+        ]
+      }
+    ],
+    "edge (OpenResty / Fluent Bit host config)": [
+      {
+        "path": "deploy/edge/fluent-bit/install-fluent-bit.sh",
+        "status": "modified",
+        "issues": [
+          "#458",
+          "#531"
+        ]
+      }
+    ],
+    "host-scripts (S3-pulled / baked into rootfs)": [
+      {
+        "path": "deploy/userdata/backup-data.sh",
+        "status": "modified",
+        "issues": [
+          "#545"
+        ]
+      },
+      {
+        "path": "deploy/userdata/host-agent.py",
+        "status": "modified",
+        "issues": [
+          "#526"
+        ]
+      },
+      {
+        "path": "deploy/userdata/launch-vm.sh",
+        "status": "modified",
+        "issues": [
+          "#526"
+        ]
+      }
+    ],
+    "lambda (update-function-code only)": [
+      {
+        "path": "deploy/lambda/api/core/auth.py",
+        "status": "modified",
+        "issues": [
+          "#517",
+          "#536",
+          "#539"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/clients.py",
+        "status": "modified",
+        "issues": [
+          "#522",
+          "#534"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/version_labels.py",
+        "status": "added",
+        "issues": [
+          "#522",
+          "#534"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/handler.py",
+        "status": "modified",
+        "issues": [
+          "#517",
+          "#536",
+          "#539"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/dispatch_service.py",
+        "status": "modified",
+        "issues": [
+          "#522",
+          "#534"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/host_service.py",
+        "status": "modified",
+        "issues": [
+          "#447",
+          "#522",
+          "#534"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/image_slot_service.py",
+        "status": "modified",
+        "issues": [
+          "#522",
+          "#534"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/rolling_upgrade_service.py",
+        "status": "added",
+        "issues": [
+          "#517"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/tenant_service.py",
+        "status": "modified",
+        "issues": [
+          "#522",
+          "#526",
+          "#534"
+        ]
+      },
+      {
+        "path": "deploy/lambda/backup/handler.py",
+        "status": "modified",
+        "issues": [
+          "#545"
+        ]
+      },
+      {
+        "path": "deploy/lib/dispatch_infra.py",
+        "status": "modified",
+        "issues": [
+          "#522",
+          "#534"
+        ]
+      }
+    ],
+    "root / other": [
+      {
+        "path": "config.yml.example",
+        "status": "modified",
+        "issues": [
+          "#424"
+        ]
+      },
+      {
+        "path": "deploy/monitoring/MONITORING-RUNBOOK.md",
+        "status": "modified",
+        "issues": [
+          "#400"
+        ]
+      },
+      {
+        "path": "deploy/monitoring/grafana/dashboards/openclaw-fleet.json",
+        "status": "modified",
+        "issues": [
+          "#400"
+        ]
+      },
+      {
+        "path": "samples/config-sg-prod.yaml",
+        "status": "modified",
+        "issues": [
+          "#424"
+        ]
+      },
+      {
+        "path": "samples/ent-config.template",
+        "status": "modified",
+        "issues": [
+          "#424"
+        ]
+      },
+      {
+        "path": "samples/ent_config_template_sample.yaml",
+        "status": "modified",
+        "issues": [
+          "#424"
+        ]
+      },
+      {
+        "path": "setup.sh",
+        "status": "modified",
+        "issues": [
+          "#489"
+        ]
+      }
+    ],
+    "scripts": [
+      {
+        "path": "scripts/preflight-check.sh",
+        "status": "modified",
+        "issues": [
+          "#544"
+        ]
+      }
+    ]
+  },
+  "folded_into": "(pending) — no patch kit built for this sync yet; a later kit should cite this manifest as source-of-record and set base_sha/patch_sha. cdk deploy is FORBIDDEN on hand-modified live deployments — the kit must ship *.patched host scripts + the full lambda tree + AWS CLI for stack changes, same shape as patch/315-concurrent-dispatch-rollup/."
+}

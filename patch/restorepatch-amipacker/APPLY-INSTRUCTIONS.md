@@ -486,8 +486,25 @@ is harmless and can be deleted with `aws apigateway delete-deployment`.
 
 Copy the contents of `host-scripts/deploy-machine/` over the matching
 repository-relative paths on the deployment machine. This includes stack source,
-configuration, build, preflight, and CodeBuild inputs. It does not mutate running
-AWS resources.
+configuration, build, preflight, CodeBuild inputs, and the Python dependency
+declaration. It does not mutate running AWS resources.
+
+`pyproject.toml` and `uv.lock` are part of that copy because the dependency list is
+deploy-time, not documentation: `scripts/deploy-cdk.sh` refuses to run unless the
+interpreter can import `boto3` and `yaml`, and the virtual environment installs only
+what `pyproject.toml` declares. Copying the file is not enough — rebuild the
+environment so the declaration takes effect, then confirm the import the deploy
+wrapper gates on:
+
+```bash
+uv sync --frozen
+.venv/bin/python -c "import boto3, yaml"
+```
+
+The import must exit 0. This touches only the local virtual environment; it does not
+deploy anything and does not read or write any AWS resource. If you skip it, the next
+deployment attempt stops before CDK with
+`ERROR: no Python interpreter can import boto3 and yaml`.
 
 The static `console/` deletion is repository convergence only. Customer console
 delivery has moved to the `openclaw-console-bff` Lambda, so no customer-side file

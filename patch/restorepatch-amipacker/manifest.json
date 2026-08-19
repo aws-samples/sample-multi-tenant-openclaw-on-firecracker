@@ -77,7 +77,7 @@
       "sha256": "2a0620dcff0911680691ab7dca5aede60f379a27a87e550711445fd1a3d52c2d"
     },
     "lib/apply-api-routes.py": {
-      "sha256": "8c9ccdbb8b217530527a15c5420897499bb94760ea925f3923306e2fcb90c5c4"
+      "sha256": "9a7f1a4e48aa8d8eeae7133617f1e99355f9432896f7d0f31a38e4a07e66c5a4"
     },
     "lib/apply-api-routes.sh": {
       "sha256": "d2e782d53feb2eeac23118ee3f27854508a1e98342ae9a58eae4d92169194d8b"
@@ -86,16 +86,16 @@
       "sha256": "07b9633975bdc8e76803af83f9057c09a3fe28707f5284c727933e3050238df1"
     },
     "lib/apply-restorepatch.sh": {
-      "sha256": "2e5ff01c20bb50d11c7b3a51142857f2b2777a834a4b879f4f8bb6db5ae7b146"
+      "sha256": "99079aa074747ea9aeccf947be9cb884e3cbeaaae314e402d8709f38425bc4be"
     },
     "lib/autopatch.sh": {
-      "sha256": "0dd3fee608f4d07724770d79bdba497930c1c0ac1ccc84cbb496ab17ec44f6ae"
+      "sha256": "09b261e1d8f5ede80ec8f1800914dc8b4e4fc08807b35f04b3fa9a95ccec8161"
     },
     "lib/discover-env.sh": {
       "sha256": "ed2a393611617864ce55fa3ad6b7db68cb03634c4fc3682b586cbe4a04317592"
     },
     "lib/interview-once.py": {
-      "sha256": "993392e6c8e6d6036bbea8a94e516e8d9bbbc16fea2b5071ce2a922b6911fd26"
+      "sha256": "dbe2e1829abd25fb03d916f35e67fcaa41817fdc0cb727badf17cd27a4692491"
     },
     "lib/lt-userdata.py": {
       "sha256": "240c14d26aa6668567f6c2bbaf8ca2d884f27532735873382317317633402779"

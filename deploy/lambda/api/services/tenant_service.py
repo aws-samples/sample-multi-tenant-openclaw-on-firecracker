@@ -1408,6 +1408,13 @@ def create_tenant(body=None, event=None):
                 item["tenant_user_id"] = tenant_user_id
             if platform_id:
                 item["platform_id"] = platform_id
+            # #526 — 与同步路径(:2137)/pending 路径(:1751)同宽:必须把 chat_endpoint_enabled
+            # 落库。此前 dispatch 占位行漏写 → wake/restore/restart/reset/rebuild/health_check/
+            # scaler 用 item.get("chat_endpoint_enabled", False) 反读一律拿 False → 传 launch-vm.sh
+            # 第 10 位 "0" → harden-config.sh del(chatCompletions) → guest 数据面永久 404。
+            # 删端点,stop/start 亦不自愈。secure default 不变:只在 True 时写字段。
+            if chat_endpoint_enabled:  # per-tenant chatCompletions switch (default off)
+                item["chat_endpoint_enabled"] = True
             clients.tenants_table.put_item(
                 Item=item,
                 ConditionExpression="attribute_not_exists(id)",
@@ -5508,7 +5515,11 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
             or None
         )
         if _resolved_ver:
-            _stamp_ver = _resolved_ver
+            # #534 —— _resolved_ver 是本次采用的 snapshot_time;反解成版本 label 再写,让
+            # rootfs_version 统一为 label 坐标(host 侧本就是 label)。精确快照仍活在
+            # image_snapshot_time,不动。查不到 label → 原样透传(fail-safe,不谎报)。
+            from core.version_labels import label_for_snapshot
+            _stamp_ver = label_for_snapshot(_resolved_ver)
         else:
             host = clients.hosts_table.get_item(
                 Key={"instance_id": item["host_id"]}, ConsistentRead=True
@@ -5540,7 +5551,9 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
     if _stamp_immutable:
         _resolved_ver_i = locals().get("_resolved_ver") or None
         if _resolved_ver_i:
-            _imm_ver = _resolved_ver_i  # 采用事件解析出的真实快照(canary/rebuild)
+            # #534 —— 同 rootfs:采用的 snapshot_time 反解成 label 再写,统一 immutable_version 坐标。
+            from core.version_labels import label_for_snapshot
+            _imm_ver = label_for_snapshot(_resolved_ver_i)
         else:
             # 未钉版唤醒 / 无 resolved 的 reset:取 host 当前 immutable_version。
             # _stamp_rootfs 的 else 分支可能已按同 key 强一致读过 host;复用避免二次读。

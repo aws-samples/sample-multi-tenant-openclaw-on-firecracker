@@ -216,7 +216,6 @@ def _platform_id_from_claims(claims):
 
 
 # ════════════════════════════════════════════════════════════
-# RBAC (issue #14)
 # ════════════════════════════════════════════════════════════
 #
 # Cognito User Pool Groups carry the role assignment as a
@@ -241,12 +240,10 @@ _VIEWER_OK = {
     ("GET", "/tenants/{id}"),
     ("GET", "/tenants/{id}/{action}"),
     # Task 7.3 — credentials 子资源与 GET /tenants/{id} 同级(那里今天就折 token/device):
-    # viewer 过 RBAC 门,owner==caller/admin 检查在 get_tenant_credentials 内(#80 IDOR 模式)。
     ("GET", "/tenants/{id}/credentials"),
     # self-service node provisioning is viewer-level at the RBAC gate; the
     # create_tenant_self handler then enforces self-only + per-user cap.
     ("POST", "/tenants/self"),
-    # PRD #50-58 — per-user fleet reads are viewer-level; the per-user-scope
     # check inside the handler still restricts a non-admin to their own fleet.
     ("GET", "/users/{tenant_user_id}/tenants"),
     ("GET", "/users/{tenant_user_id}/summary"),
@@ -256,10 +253,11 @@ _VIEWER_OK = {
     ("GET", "/hosts"),
     ("GET", "/hosts/rootfs-version"),
     ("GET", "/hosts/rootfs-drift"),
+    # #517 stage 4 — progress is read-only; handler still enforces job
+    # owner/platform scope so a guessed job id cannot cross namespaces.
+    ("GET", "/hosts/rolling-jobs/{job_id}"),
     ("GET", "/images"),
-    # #337(原#217 /snapshots)— 列镜像版本快照(time+label+count),只读,供 console 选。同 /images 级。
     ("GET", "/list_image_versions"),
-    # #394 P2-4 —— 这两个是只读镜像视图,契约(doc/OpenAPI)声明 viewer;不列入则默认 operator,
     # 按公开契约实现的 viewer 客户端会吃 403。pull 进度轮询 + host 盘上真实镜像状态,纯读。
     ("GET", "/hosts/{instance_id}/pull-image-progress"),
     ("GET", "/hosts/{instance_id}/image-slots"),
@@ -267,11 +265,8 @@ _VIEWER_OK = {
     ("GET", "/agentcore/tools"),
     ("GET", "/system/info"),
     ("GET", "/audit-log"),
-    # 1.4.0 (#62) — listing groups is read-only.
     ("GET", "/groups"),
-    # 1.4.1 (#63) — read individual SKILL.md content (editor / viewer)
     ("GET", "/skills/{name}"),
-    # #187 转型:POST /chat/sign 路由已下线,前端直连 /ws/{tenant_id} gateway。
 }
 
 
@@ -319,10 +314,8 @@ def _role_satisfies(actual, required):
 
 
 # ════════════════════════════════════════════════════════════
-# Identity ownership / IDOR hardening (issue #80)
 # ════════════════════════════════════════════════════════════
 #
-# Pre-#80 every authenticated caller could list/read/mutate ANY tenant by id
 # (broken-object-level-authorization). We now stamp the creator's identity into
 # `owner_id` at create time and enforce owner==caller on every per-tenant route.
 #
@@ -337,7 +330,6 @@ def _role_satisfies(actual, required):
 #                                   operate on api-key-owned + legacy records).
 #   • Token present but unverified → owner_id = None, role viewer (denied).
 #
-# Records created before #80 (or via the API-key path) have no `owner_id`; to
 # avoid leaking them to arbitrary Cognito users they are visible/operable only
 # by admins and the API-key caller.
 
@@ -375,10 +367,8 @@ def _get_caller_identity(event):
             "role": "admin" if ci.get("is_admin") else "operator",
             "is_admin": bool(ci.get("is_admin")),
             "api_key_only": ci.get("owner_id") in (None, API_KEY_OWNER),
-            # #108 — carry the platform scope forward from the original (already
             # authorized) request so async lifecycle replay stays in-namespace.
             "platform_scope": ci.get("platform_scope"),
-            # #143 sibling — carry the federated caller's stable id so a
             # CREATE_VIA_QUEUE replay of create_tenant lands tenant_user_id
             # (create_tenant reads it off this identity). None for native /
             # api-key callers (unchanged). enqueue_lifecycle now stamps it.
@@ -421,17 +411,14 @@ def _get_caller_identity(event):
                 "role": role,
                 "is_admin": role == "admin",
                 "api_key_only": False,
-                # task #13/#14 — external stable id for OIDC-federated users
                 # (None for native Cognito users); used to attribute the tenant
                 # back to the external user across the identity chain.
                 "tenant_user_id": _tenant_user_id_from_claims(claims),
-                # #106 — external-platform id from custom:platform_id claim
                 # (None for native / API-key callers). Resolved off the same
                 # single verify as tenant_user_id (no extra RS256 verify).
                 "platform_id": _platform_id_from_claims(claims),
             }
 
-    # #108 — per-platform scoped API key. A REQUEST Lambda authorizer resolves
     # which platform the presented API key belongs to and injects it at
     # requestContext.authorizer.platform_id (the ONLY trusted source — AWS docs:
     # requestContext.authorizer.* is populated by a CUSTOM authorizer; a caller
@@ -477,7 +464,6 @@ def _assert_owner_or_admin(item, event):
     matter how the flag is set.
     """
     ident = _get_caller_identity(event)
-    # #108 — a platform-scoped API key may ONLY touch tenants inside its own
     # platform namespace, checked BEFORE the is_admin bypass (else a scoped key
     # that also resolves is_admin would reach every platform's tenants — the very
     # god-key IDOR this issue closes). Cross-platform / no-platform tenants → 403.
@@ -503,7 +489,6 @@ def _assert_owner_or_admin(item, event):
 # Routes authenticated by their OWN mechanism (not Cognito/RBAC) — skip the role
 # gate. /external/authz verifies an HMAC signature inside its handler (go-live A1).
 # /external/authz is HMAC-authed inside its handler; /tenantmatch is a pre-login
-# read-only IdP-routing lookup (#97 档A) — the browser calls it BEFORE any Cognito
 # login to learn which upstream IdP to federate to, so it can't require a JWT. It
 # leaks no tenant data (only platform_id→idp_provider_name), and the API-key gate
 # at API Gateway still fronts it.
@@ -521,11 +506,17 @@ _RBAC_SKIP = {
     ("GET", "/recipient-key"),
     ("POST", "/recipient-key"),
     ("POST", "/recipient-key/disable"),
-    # #389 v2 块5 — admin 门在 handler 内(identity-based is_admin)。前置 RBAC 门按 role 判定,
     # 而 api-key 路径 role 解析成 viewer(is_admin=True),不 skip 会在门口被 viewer<operator 挡掉,
     # 持 key 的运维脚本永远进不来。故与 registry/recipient-key 同样列入 skip。
     ("GET", "/bootstrap/versions"),
     ("POST", "/bootstrap/promote"),
+    # #539 followup — taint 是运维动作(会议定 operator+),持 API key 的运维自动化脚本也必须
+    # 能调。前置 role 门用 _get_user_role:api-key 路径(无 Bearer)role 解析成 viewer 而
+    # is_admin=True,不 skip 会在门口被 viewer<operator 挡掉,持 key 的脚本永远进不来(真机
+    # 已复现)。故 skip 前置门,授权改由 handler 的 _taint_host_route/_untaint_host_route 判
+    # (is_admin OR role>=operator) —— 同 registry/bootstrap 的 identity-based 模式。
+    ("POST", "/hosts/{instance_id}/taint"),
+    ("DELETE", "/hosts/{instance_id}/taint"),
 }
 
 

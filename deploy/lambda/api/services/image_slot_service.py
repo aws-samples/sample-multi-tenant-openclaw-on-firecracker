@@ -84,7 +84,6 @@ def _write_slots(instance_id, new_slots, ssm_wait, op_id=None, fence_epoch=None)
             f"slots.json update on host {instance_id} did not confirm; retry with the "
             f"same Idempotency-Key to reconcile. detail={(out or '')[:200]}",
         )
-    # #394 —— host slots.json 写成后,把控制面镜像 hosts.image_slots 同步成同一份(消除漂移:
     # promote/rollback/cleanup 改了 host 真值,镜像不跟就会让下次 promote 误报 CANARY_CHANGED、
     # UI 显示旧值)。sync 操作里 Lambda 手握 new_slots 权威值,直接写 DDB 即可(不必绕 host)。
     # best-effort:镜像写失败不推翻已确认的 host 提交(host 是真值,下次操作会再纠)。
@@ -124,7 +123,6 @@ def _idempotent_replay(instance_id, idempotency_key, operation, expected=None):
             f"Idempotency-Key was already used for {prior.get('operation')!r}; "
             f"use a fresh key per business operation",
         )
-    # #394 P2-1 —— 同操作也要比请求体指纹(expected CAS 参数):同 key 换了 expected
     # snapshot/generation = 不同请求,报 KEY_REUSED,绝不拿旧请求的结果冒充。
     if expected is not None and (prior.get("expected") or {}) != expected:
         return None, _err(
@@ -134,7 +132,6 @@ def _idempotent_replay(instance_id, idempotency_key, operation, expected=None):
         )
     state = prior.get("state")
     if state == image_ops.STATE_IN_PROGRESS:
-        # #394 P1-1(第三轮)—— 区分"真在跑"与"已结束但 result 写失败卡在 IN_PROGRESS":
         # 看这条 op 是否仍持 image lease。_with_lease 在 finally 里【一定】归还 lease,所以
         # 如果 intent 是 IN_PROGRESS 但该 op 已不再是 lease 持有者 → 它其实已经跑完(record_result
         # 遇 DDB 瞬时故障没落终态)。此时【重跑对账】而不是永久 409(promote/cleanup/reclaim 幂等,
@@ -158,7 +155,6 @@ def _idempotent_replay(instance_id, idempotency_key, operation, expected=None):
     if state == image_ops.STATE_SUCCEEDED:
         return _resp(200, dict(prior.get("result") or {}, replayed=True)), None
     if state == image_ops.STATE_UNKNOWN:
-        # #394 P1-1 —— 上次 host 命令超时/回执丢失,结果未知(可能已提交)。绝不当失败挡死:
         # 返回 (None, None) 让上层【重新执行】对账。promote/cleanup/reclaim 都幂等,已提交则
         # 再跑收敛(already_promoted / 已空 / no-op),未提交则真正做完。这才兑现"503 后同
         # Idempotency-Key 安全重试对账"的文档承诺。
@@ -202,7 +198,6 @@ def _with_lease(instance_id, ssm_wait, fn, operation=None,
             body = json.loads(resp.get("body") or "{}")
         except (ValueError, TypeError):
             body = {}
-        # #394 P1-1 —— 结果分三态记账,不是简单 ok/FAILED:
         #  · 200 → SUCCEEDED(重放返回该 result);
         #  · 503 OPERATION_STATUS_UNKNOWN(host 命令超时/回执丢,可能已提交)→ UNKNOWN,
         #    绝不落 FAILED(否则同 key 重试被 409 挡死,违背"503 后重试对账"承诺);重放会重跑对账;
@@ -256,6 +251,58 @@ def _pinned_versions_on_host(instance_id):
         kwargs["ExclusiveStartKey"] = lek
 
 
+def _immutable_present_in_snapshot(snapshot_time):
+    """#534 F2 —— promoted 快照是否带只读盘。读 version-snapshots 存的 files,复用
+    host_service._select_pull_files 读该快照 manifest 判定(其第 4 返回值 immutable_version
+    非空 ⟺ manifest 点名了 immutable 盘)。返回 True/False;判不了(表未配 / 无 files /
+    manifest 读失败)返 None → 调用方保守:不动 immutable_version(既不谎报存在、也不误清)。"""
+    try:
+        from core.clients import version_snapshots_table
+        if version_snapshots_table is None:
+            return None
+        item = version_snapshots_table.get_item(
+            Key={"snapshot_time": snapshot_time}, ConsistentRead=True
+        ).get("Item")
+        if not item or not item.get("files"):
+            return None
+        files = json.loads(item["files"])
+        import services.host_service as _hs  # 惰性 import,避免模块级环
+        _, err, _, imm_ver = _hs._select_pull_files(os.environ.get("ASSETS_BUCKET", ""), files)
+        if err:
+            return None
+        return bool(imm_ver)
+    except Exception:  # noqa: BLE001 —— 判不了就返 None(保守),不让它把 promote 带崩
+        return None
+
+
+def _sync_host_version_coordinate(instance_id, live_snapshot):
+    """#534 —— promote 翻 live 后把 host 版本坐标同步成 live 快照的 label(B2:host.rootfs_version /
+    immutable_version 恒等于其 image_slots.live 的 label)。
+    - rootfs_version:总盖(rootfs 盘必存)。
+    - immutable_version(F2):仅当该快照【确带只读盘】才盖;确认【不带】→ REMOVE(别谎报);
+      判不了(None)→ 不动(保守)。
+    成功返 None;写失败返错误串(F3:调用方据此返回可重试 unknown/error,绝不吞错仍返 200 ——
+    否则 host 坐标永久停旧且无人知)。反解 snapshot_time→label(查不到透传,fail-safe)。"""
+    from core.version_labels import label_for_snapshot
+    label = label_for_snapshot(live_snapshot)
+    has_imm = _immutable_present_in_snapshot(live_snapshot)
+    expr = "SET rootfs_version = :v"
+    if has_imm is True:
+        expr += ", immutable_version = :v"
+    elif has_imm is False:
+        expr += " REMOVE immutable_version"
+    try:
+        hosts_table.update_item(
+            Key={"instance_id": instance_id},
+            UpdateExpression=expr,
+            ExpressionAttributeValues={":v": label},
+            ConditionExpression="attribute_exists(instance_id)",
+        )
+        return None
+    except Exception as e:  # noqa: BLE001
+        return str(e)
+
+
 def promote_canary(instance_id, body, ssm_wait, headers=None):
     """POST /hosts/{id}/promote-canary —— canary 槽升为 live(同步,ADR §4.5)。"""
     if not instance_id:
@@ -285,6 +332,14 @@ def promote_canary(instance_id, body, ssm_wait, headers=None):
                 f"re-read and retry (never promote a version you did not verify)",
             )
         if already:
+            # #534 F3 —— already_promoted 路径【也】同步 host 坐标(重试补偿:第一次 promote 翻了
+            # live 但坐标那步失败,重试会走到这里补齐)。同步失败返回可重试,不谎报成功。
+            _serr = _sync_host_version_coordinate(instance_id, new_slots.get("live"))
+            if _serr:
+                return _err(
+                    503, "COORDINATE_SYNC_FAILED",
+                    f"canary already live but host version-coordinate sync failed ({_serr}); retry to reconcile",
+                )
             return _resp(200, {
                 "message": "canary already promoted to live",
                 "instance_id": instance_id, "already_promoted": True,
@@ -294,6 +349,17 @@ def promote_canary(instance_id, body, ssm_wait, headers=None):
         werr = _write_slots(instance_id, new_slots, ssm_wait, _op_id, _epoch)
         if werr:
             return werr
+        # #534 §9 + F2/F3 —— 翻 live 后同步 host 版本坐标 = 新 live 的 label(B2:host.rootfs_version /
+        # immutable_version 恒等于其 image_slots.live 的 label);此前 promote 只翻 slots 指针、不动坐标
+        # → promote 后 host 已跑新版但坐标停旧、新建租户继承旧值、drift/stats 看不见。
+        # F3:同步失败【返回可重试】,不吞错仍返 200(否则坐标永久停旧且无人知);重试走上面
+        # already_promoted 分支会再同步一次(幂等收敛)。F2:immutable_version 仅当快照确带只读盘才盖。
+        _serr = _sync_host_version_coordinate(instance_id, new_slots["live"])
+        if _serr:
+            return _err(
+                503, "COORDINATE_SYNC_FAILED",
+                f"canary promoted to live but host version-coordinate sync failed ({_serr}); retry to reconcile",
+            )
         return _resp(200, {
             "message": "canary promoted to live",
             "instance_id": instance_id, "already_promoted": False,
@@ -310,12 +376,10 @@ def promote_canary(instance_id, body, ssm_wait, headers=None):
     )
 
 
-# #394 —— rollback_image 已移除:回滚 = pull 老版到 live(pull-image,本地已完整则快路径秒级
 # 翻指针,零下载)。不再需要独立的 live↔previous_live swap 操作(它的 swap 语义反直觉、且与
 # "选定版本重指"的行业模型不一致)。previous_live 槽仍作纯展示信息保留(不再有 swap 动作)。
 
 
-# #394 —— cleanup_canary(DELETE image-slots/canary)已移除,精简 API:放弃未提升的 canary
 # 无需显式清指针——下次 `pull-image?slot=canary` 覆盖该槽,promote 成功也会清空它;磁盘回收由
 # `reclaim-images` 承担(它保护 {live,canary,previous_live}∪租户固定版本,其余版本目录才删)。
 
@@ -349,7 +413,6 @@ def reclaim_images(instance_id, headers, ssm_wait):
             )
         keep = image_slots.referenced_versions(slots) | _pinned_versions_on_host(instance_id)
         lines = ["set -eu", '_perr() { echo "ERROR:$*" >&2; }']
-        # #394 P1-1 —— reclaim 也删盘,同样过 host 侧 fence 门(flock + 强一致 owner/epoch 校验),
         # 挡超时旧命令晚到、按过期 keep-set 误删新 pull 刚装的版本目录。
         lines += image_slots.slots_fence_guard_lines(
             _HOSTS_TABLE_NAME, _REGION, instance_id, _op_id, _epoch
@@ -400,5 +463,4 @@ def _parse_body(body):
     return parsed if isinstance(parsed, dict) else None
 
 
-# #394 —— _parse_if_match 已移除:它只服务于已删除的 cleanup-canary(If-Match CAS)。
 # promote 的 CAS 走 body 的 expected_canary_snapshot_time,reclaim 无 CAS,均不需要 If-Match。

@@ -33,8 +33,13 @@ host-agent 在每台 metal host 的**私网 IP:8899**(与 `/health` 同端口,�
 | `openclaw_vm_disk_used_pct`      | 单 VM 数据盘已用 (%)           | tenant |
 | `openclaw_vm_cpu_pct`            | 单 VM CPU 占用 (% of vcpus)    | tenant |
 | `openclaw_vm_health`             | VM ping 通=1 否则=0            | tenant |
+| `openclaw_app_health`            | 租户 gateway 应答 HTTP=1 否则=0（#526 起对 chat_ep=1 的租户探 /v1/chat/completions，404=端点缺失=0） | tenant |
 
 > 注意:host-agent **没有**导出 "VM 总数" / "健康节点数" 这类标量指标。dashboard 里这两个数是 PromQL 在每 VM 一条 `tenant` 序列上 `count()`/`sum()` 聚合出来的(VM 数 = `count(openclaw_vm_health)`,健康数 = `sum(openclaw_vm_health)`)。"各 host" 维度靠 `instance` label(ec2_sd 注入)分组。
+
+### VM 与 Gateway 必须分开看
+
+`openclaw_vm_health` 只表达 ICMP 可达，`openclaw_app_health` 只表达 gateway 是否应答 HTTP；两者是独立事实源，不能用 ping 推导 gateway 健康。Gateway 异常数用 `count(openclaw_app_health) - sum(openclaw_app_health)`；定位「VM 可达但 Gateway 不健康」盲区用 `openclaw_vm_health == 1 and on(job, instance, tenant) openclaw_app_health == 0`，完整匹配 `job`/`instance`/`tenant` 避免多 host 或迁移残留跨实例误配。
 
 ## 1. 起一台监控 EC2
 
@@ -115,7 +120,7 @@ ssh -i ~/.ssh/<key>.pem -L 3000:<monitoring-private-ip>:3000 \
 # 浏览器开 http://localhost:3000  用户 admin / 上面的密码
 ```
 
-datasource(Prometheus)与 dashboard(`OpenClaw microVM Fleet (host-agent)`,uid `openclaw-fleet`)已 provisioning,登录即见,无需手建。看板含:VM 总数/健康数/不健康数/内存合计(stat)、每 host VM 数与健康数与内存与 balloon(时序)、Top20 VM CPU/磁盘占用、per-VM 明细表。顶部 `Host (instance)` 变量可按 host 过滤。
+datasource(Prometheus)与 dashboard(`OpenClaw microVM Fleet (host-agent)`,uid `openclaw-fleet`)已 provisioning,登录即见,无需手建。看板含:VM 总数/健康数/不健康数/内存合计(stat)、Gateway 健康数/不健康数(stat)、每 host VM 数与健康数与内存与 balloon、每 host 不健康 Gateway 数(时序)、Top20 VM CPU/磁盘占用、per-VM 明细表(含 `vm_health` 与 `app_health`)。顶部 `Host (instance)` 变量可按 host 过滤。
 
 > 验证:dashboard 各面板有数据(非 No data)。No data 时回 §4 确认 Prometheus 真抓到 series。
 

@@ -28,10 +28,18 @@ S3_KEY="${PREFIX}/${TENANT_ID}/${TIMESTAMP}.gz"
 
 log() { echo "[oc:backup] $(date +%H:%M:%S) $*"; }
 
+# #545(codex 评审 #1)—— 只有【本脚本真的 pause 过】才在 cleanup 里 resume。新增的
+# oc_flush_guest 会在 pause 之前 fail-closed exit,那时 VM 从没被本脚本 pause,无脑发
+# Resumed 会把一个本该 running(甚至本该 paused)的租户状态弄乱。用标志把 resume 收敛到
+# "我 pause 的我才 resume"。
+__OC_PAUSED=0
+# 该 fail-closed 还是降级;pause 段也读它,而不是裸 `[ -S "$SOCK" ]`——否则死 VM 残留的
+# fc.sock 会让 pause 对一个没进程的 socket 永久失败、被 fail-closed 卡住 delete 重试
+__OC_VM_ALIVE=0
+
 cleanup() {
   rm -f "$GZ_FILE"
-  # Ensure VM is resumed even on error
-  if [ -S "$SOCK" ]; then
+  if [ "${__OC_PAUSED}" = "1" ] && [ -S "$SOCK" ]; then
     curl -sf --unix-socket "$SOCK" -X PATCH http://localhost/vm \
       -H 'Content-Type: application/json' -d '{"state":"Resumed"}' >/dev/null 2>&1 || true
   fi
@@ -47,11 +55,65 @@ if [ ! -f "$DATA_FILE" ]; then
   exit 1
 fi
 
-# Pause VM → compress → Resume
-if [ -S "$SOCK" ]; then
-  curl -sf --unix-socket "$SOCK" -X PATCH http://localhost/vm \
-    -H 'Content-Type: application/json' -d '{"state":"Paused"}' >/dev/null 2>&1 || true
-  log "VM paused"
+# oc_flush_guest <vm_dir> —— 让 guest 把 page cache 落到 data.ext4,必须在 pause 之前跑。
+#
+# 为什么:Firecracker `Paused` 只冻 vCPU,**不驱动 guest 落盘**。客户刚写、字节还在
+# guest page cache 里时,data.ext4 里根本没有它们,tar 出来的备份就是缺的。真机实测
+# (usw2,同一镜像文件):guest 写文件不 sync → host 侧 `grep -c <marker> data.ext4` = 0;
+# guest 执行 sync 后 = 1。客户可见后果:suspend→restore 后文件还在但变成 0 字节
+# 备份路径这条一直没修。
+#
+# 顺序不可换:pause 之后 guest 再也执行不了任何指令,那时 sync 已经没有意义。
+#
+# 失败语义按【VM 是否还活着】分两支(codex 独立评审 #1,no-data-loss 核心):
+#   · VM 活着(fc.sock 是 socket + firecracker 进程在)但 sync 没成功(不可达/缺 key/无 ip)
+#     → 脏页还在 guest 里、数据救得回 → **fail-closed exit 1**。上游 suspend/delete 拿到
+#     失败会回滚、不删盘,运维重试即可救数据。绝不能降级成 crash-inconsistent 备份后继续
+#     删盘——那会把【本可挽救】的客户数据永久丢掉。
+#   · VM 已停/不存在(无 socket 或无进程)→ 未落盘字节本来就随 VM 一起没了,再拦着不备份
+#     crash-consistent 继续,return 0。
+oc_flush_guest() {
+  __fg_dir="$1"
+  __fg_sock="${__fg_dir}/fc.sock"
+  # VM 存活判据:socket 存在 + api-sock <sock> 的 firecracker 进程在(与 host-agent 同款)。
+  # 结果落全局 __OC_VM_ALIVE,pause 段复用同一判据(见变量区注释)。
+  __OC_VM_ALIVE=0
+  if [ -S "$__fg_sock" ] && pgrep -f "api-sock ${__fg_sock}" >/dev/null 2>&1; then
+    __OC_VM_ALIVE=1
+  fi
+  __fg_ip="$(python3 -c "import json;print(json.load(open('${__fg_dir}/vm.json')).get('guest_ip',''))" 2>/dev/null || true)"
+  if [ -n "${__fg_ip}" ] && [ -f /etc/openclaw/host_vm_key ] \
+      && timeout 20 ssh -i /etc/openclaw/host_vm_key -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o LogLevel=ERROR \
+        -o BatchMode=yes "agent@${__fg_ip}" 'sync' >/dev/null 2>&1; then
+    log "guest filesystem synced before pause (${__fg_ip})"
+    return 0
+  fi
+  # flush 没成功:VM 活着就 fail-closed(数据可救,不许降级删盘),VM 已停才降级。
+  if [ "$__OC_VM_ALIVE" = "1" ]; then
+    log "ERROR: OC_BACKUP_GUEST_FLUSH_FAILED VM alive but guest sync failed (${__fg_ip:-no-ip}) — refusing crash-inconsistent backup to avoid data loss"
+    exit 1
+  fi
+  log "WARN: OC_BACKUP_GUEST_FLUSH_SKIPPED VM not running — backup is crash-consistent only"
+  return 0
+}
+
+# Flush guest → Pause VM → compress → Resume
+oc_flush_guest "$VM_DIR"
+# 到这一步:要么 VM 已停(oc_flush_guest 降级放行,无 socket → 跳过 pause,tar 静态盘);
+# 要么 VM 活且已 sync。VM 活时 pause 必须成功——pause 失败却继续 tar 运行中的盘 = 归档
+# 故:pause 失败 fail-closed exit 1,让 suspend/delete 回滚不删盘。
+# 判据用 __OC_VM_ALIVE(oc_flush_guest 已算,socket+进程),不用裸 `[ -S "$SOCK" ]`:
+# 死 VM 残留的 fc.sock 不该触发 pause(会永久失败卡死 delete)——那种情况直接 tar 静态盘。
+if [ "${__OC_VM_ALIVE}" = "1" ]; then
+  if curl -sf --unix-socket "$SOCK" -X PATCH http://localhost/vm \
+      -H 'Content-Type: application/json' -d '{"state":"Paused"}' >/dev/null 2>&1; then
+    __OC_PAUSED=1
+    log "VM paused"
+  else
+    log "ERROR: OC_BACKUP_PAUSE_FAILED could not pause live VM — refusing to archive a changing disk to avoid data loss"
+    exit 1
+  fi
 fi
 
 T0=$SECONDS
@@ -72,10 +134,16 @@ tar -cSf - -C "$(dirname "$DATA_FILE")" "$(basename "$DATA_FILE")" | pigz > "$GZ
   || { log "ERROR: tar -S | pigz compress failed"; exit 1; }
 log "compressed ($((SECONDS-T0))s, sparse-aware tar)"
 
-if [ -S "$SOCK" ]; then
-  curl -sf --unix-socket "$SOCK" -X PATCH http://localhost/vm \
-    -H 'Content-Type: application/json' -d '{"state":"Resumed"}' >/dev/null 2>&1 || true
-  log "VM resumed"
+# 只在本脚本 pause 过时才 resume;成功后清 __OC_PAUSED,避免 EXIT trap 再 resume 一次
+# 也避免覆盖上传期间其它操作可能设的状态)。resume 失败保留标志,交给 cleanup 兜底重试。
+if [ "${__OC_PAUSED}" = "1" ] && [ -S "$SOCK" ]; then
+  if curl -sf --unix-socket "$SOCK" -X PATCH http://localhost/vm \
+      -H 'Content-Type: application/json' -d '{"state":"Resumed"}' >/dev/null 2>&1; then
+    __OC_PAUSED=0
+    log "VM resumed"
+  else
+    log "WARN: resume failed, leaving __OC_PAUSED set for cleanup to retry"
+  fi
 fi
 
 # Upload (VM already running)

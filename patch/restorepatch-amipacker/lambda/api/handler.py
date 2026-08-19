@@ -110,6 +110,10 @@ def lambda_handler(event, context):
             return cleanup_terminated_host(event)
         return process_pending()
 
+    # #517 stage 4 — drift-gated rolling worker. Handle before HTTP routing.
+    if event.get("_rolling_job"):
+        return run_rolling_job(event["_rolling_job"])
+
     # PRD #54 — async batch worker: self-invoked with {"_batch_job": job_id}.
     # Not an HTTP request (no httpMethod) — handle before route dispatch.
     if event.get("_batch_job"):
@@ -296,6 +300,12 @@ def lambda_handler(event, context):
         # Fleet power: start/stop EVERY VM across all hosts via host-local fan-out
         # (1-minute fleet power goal). Admin-only (gated inside fleet_power).
         ("POST", "/hosts/fleet-power"): lambda: fleet_power(event.get("body"), event),
+        ("POST", "/hosts/rolling-upgrade"): lambda: submit_rolling_upgrade(
+            event.get("body"), event
+        ),
+        ("GET", "/hosts/rolling-jobs/{job_id}"): lambda: get_rolling_job(
+            path_params["job_id"], event
+        ),
         ("GET", "/hosts/rootfs-version"): rootfs_version,
         ("GET", "/hosts/rootfs-drift"): rootfs_drift,
         # via GET /tenants/{id}/{action} with action=data (tenant_get_action).
@@ -332,13 +342,11 @@ def lambda_handler(event, context):
         ("DELETE", "/hosts/{instance_id}"): lambda: deregister_host(
             path_params["instance_id"]
         ),
-        ("POST", "/hosts/{instance_id}/taint"): lambda: taint_host(
-            path_params["instance_id"],
-            event.get("body"),
-            _get_caller_identity(event).get("owner_id") or "",
+        ("POST", "/hosts/{instance_id}/taint"): lambda: _taint_host_route(
+            path_params["instance_id"], event.get("body"), event
         ),
-        ("DELETE", "/hosts/{instance_id}/taint"): lambda: untaint_host(
-            path_params["instance_id"]
+        ("DELETE", "/hosts/{instance_id}/taint"): lambda: _untaint_host_route(
+            path_params["instance_id"], event
         ),
         ("GET", "/groups"): list_groups,
         ("POST", "/groups"): lambda: create_group(event.get("body")),
@@ -1937,6 +1945,42 @@ register_host = _host_service.register_host
 deregister_host = _host_service.deregister_host
 taint_host = _host_service.taint_host
 untaint_host = _host_service.untaint_host
+
+
+def _taint_authz_denied(ident):
+    """#539 followup —— taint 授权门:api-key(is_admin) 或 Cognito operator+ 放行,
+    viewer / 未验证 token 返 403。taint 路由已从前置 _rbac_check skip(见 auth._RBAC_SKIP),
+    这是唯一的授权门 —— 与 registry/bootstrap 的 handler 内 identity-based 门同款,只是把 admin
+    放宽到 operator(会议定 taint 为 operator+ 运维动作)。返回 None=放行,否则 403 响应。
+
+    #108 —— platform-scoped API key 只能碰自己 platform 的 tenant,不是整个机队的 blanket
+    admin(auth._get_caller_identity 明载"NOT a blanket admin over the whole fleet even if
+    role/api-key would otherwise say so")。taint 作用于 host(跨 platform 的基础设施),故 scoped
+    key 一律无权,即使其 api-key 路径 is_admin=True。此检查放在 is_admin 放行【之前】,与
+    _assert_owner_or_admin 的 scope-before-admin 顺序一致(否则 scoped key 会绕过隔离标污任意 host)。"""
+    if ident.get("platform_scope") is not None:
+        return _resp(403, {"error": "forbidden: platform-scoped key cannot taint fleet hosts"})
+    role = ident.get("role", "viewer")
+    if ident.get("is_admin") or _auth._role_satisfies(role, "operator"):
+        return None
+    return _resp(403, {"error": "forbidden", "rbac": {"role": role, "required": "operator"}})
+
+
+def _taint_host_route(instance_id, body, event):
+    """POST /hosts/{instance_id}/taint —— 授权后调 service。owner_id 作 tainted_by 审计。"""
+    ident = _get_caller_identity(event or {})
+    denied = _taint_authz_denied(ident)
+    if denied:
+        return denied
+    return taint_host(instance_id, body, ident.get("owner_id") or "")
+
+
+def _untaint_host_route(instance_id, event):
+    """DELETE /hosts/{instance_id}/taint —— 授权门同 _taint_host_route。"""
+    denied = _taint_authz_denied(_get_caller_identity(event or {}))
+    if denied:
+        return denied
+    return untaint_host(instance_id)
 cleanup_terminated_host = _host_service.cleanup_terminated_host
 rootfs_version = _host_service.rootfs_version
 _run_pull_pipeline = _host_service._run_pull_pipeline  # #217 fix(504) async pull worker
@@ -2012,6 +2056,13 @@ _resolve_filter = _fleet_service._resolve_filter
 _FLEET_VALID_ACTIONS = _fleet_service._FLEET_VALID_ACTIONS
 _FLEET_START_PARALLEL = _fleet_service._FLEET_START_PARALLEL
 _FLEET_STOP_PARALLEL = _fleet_service._FLEET_STOP_PARALLEL
+
+# #517 stage 4 — bounded, drift-gated rolling identity/image adoption.
+from services import rolling_upgrade_service as _rolling_upgrade_service  # noqa: E402
+
+submit_rolling_upgrade = _rolling_upgrade_service.submit_rolling_upgrade
+run_rolling_job = _rolling_upgrade_service.run_rolling_job
+get_rolling_job = _rolling_upgrade_service.get_rolling_job
 
 # T1.1 — core/auth:身份验证 / RBAC / IDOR 所有权(13 函数)。
 # auth 域试点(design.md):被 handler 域函数调用的 auth 符号(_get_caller_identity 等),

@@ -311,7 +311,15 @@ overlay_function() {
     cp "${artifact_root}/${rel}" "${work}/${rel}" || die "cannot overlay $function_name:$rel"
   done < <(cd "$artifact_root" && find . -type f -print | sed 's|^\./||' | sort)
   rm -f "${work}/live.zip"
-  (cd "$work" && zip -qr "$zip" .) || die "cannot repack $function_name"
+  # Normalize mtimes before packing. Lambda derives CodeSha256 from the zip BYTES, and the
+  # cp above stamps every overlaid file with the current time, so re-applying byte-identical
+  # code still produced a different package: measured on a real function, two consecutive
+  # apply-control runs yielded zips of the same size with zero content differences and 21
+  # differing mtimes, yet CodeSha256 changed, a new version was published and the alias
+  # advanced. That is what silently invalidated the recorded rollback anchor between runs.
+  # 1980-01-01 is the zip epoch floor and is what CDK normalizes to for the same reason.
+  find "$work" -exec touch -t 198001010000 {} + 2>/dev/null || true
+  (cd "$work" && zip -qrX "$zip" .) || die "cannot repack $function_name"
   aws_ lambda update-function-code --function-name "$function_name" \
     --zip-file "fileb://${zip}" >/dev/null || die "update-function-code failed for $function_name"
   aws_ lambda wait function-updated --function-name "$function_name" \

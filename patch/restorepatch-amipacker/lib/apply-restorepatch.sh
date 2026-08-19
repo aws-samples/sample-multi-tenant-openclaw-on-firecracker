@@ -61,7 +61,6 @@ esac
 # not hashes of init-host.sh, whose independent byte digest is checked separately.
 BASE_ASSET_BUNDLE_PREFIX=dea0bd3d54ac88764319c07b1b546df952e8e828f7f3aba0d18866160ee2d046
 ASSET_BUNDLE_PREFIX=f6e72b08706d1e01503d4cd738f4a7af1840bdcfedb3878d38b10a3123d1c1f2
-ARTIFACT_SHA256=ef0fbf78501b0bb07e7968146d987078c25baf850ea0f208fb877a45c5779cd2
 HOOK_NAME=openclaw-host-init
 NEW_TIMEOUT=3600
 STATE="${KITDIR}/.restorepatch-state.json"
@@ -370,19 +369,8 @@ import re
 import sys
 
 template_path, live_path, out_path, values_path, host_agent_unit_path = sys.argv[1:]
-names = [
-    "AGENTCORE_GATEWAY_URL", "AMP_REMOTE_WRITE_URL", "BACKUP_DATA_SCRIPT",
-    "BALLOON_DEFLATE_ON_OOM", "BALLOON_ENABLED", "BALLOON_FREE_PAGE_REPORTING",
-    "BALLOON_MAX_INFLATE_RATIO", "BALLOON_MIN_GUEST_AVAILABLE_MB",
-    "BALLOON_STATS_INTERVAL", "CPU_OVERCOMMIT_RATIO", "DNAT_PORT_HIGH",
-    "DNAT_PORT_LOW", "EGRESS_ALLOWLIST_CIDRS", "EGRESS_ALLOWLIST_DOMAINS",
-    "EGRESS_ALLOWLIST_ENABLED", "EGRESS_DNS_UPSTREAM", "EGRESS_INCLUDE_VPC_CIDR",
-    "EGRESS_VPC_CIDR", "FB_STREAM_HOST", "FB_STREAM_VM", "HOST_AGENT_SCRIPT",
-    "HOST_RESERVED_MEM", "HOST_RESERVED_VCPU", "HOST_USER_HOOK", "LOGGING_ENABLED",
-    "MEM_OVERCOMMIT_RATIO", "NOMINAL_SPECS", "OC_HOST_LAUNCH_SLOTS",
-    "OVERCOMMIT_BY_FAMILY", "PORT_QUARANTINE_SECONDS", "PROVISION_SCRIPT",
-    "ROOTFS_OVERLAY_MB", "ROOTFS_PREFIX", "SUBNET_PREFIX",
-]
+template_text = pathlib.Path(template_path).read_text(
+    encoding="utf-8", errors="surrogateescape")
 whole_line_names = {
     "AGENTCORE_GATEWAY_URL", "FB_STREAM_HOST", "FB_STREAM_VM",
     "HOST_RESERVED_MEM", "HOST_RESERVED_VCPU", "NOMINAL_SPECS", "ROOTFS_PREFIX",
@@ -390,8 +378,7 @@ whole_line_names = {
 block_names = {
     "PROVISION_SCRIPT", "HOST_AGENT_SCRIPT", "BACKUP_DATA_SCRIPT", "HOST_USER_HOOK",
 }
-template_lines = pathlib.Path(template_path).read_text(
-    encoding="utf-8", errors="surrogateescape").splitlines(keepends=True)
+template_lines = template_text.splitlines(keepends=True)
 live_lines = pathlib.Path(live_path).read_text(
     encoding="utf-8", errors="surrogateescape").splitlines(keepends=True)
 values = {}
@@ -404,11 +391,17 @@ if values_path:
 def is_comment(line):
     return re.match(r"^\s*#", line) is not None
 
+names = sorted({
+    match.group(1)
+    for line in template_lines if not is_comment(line)
+    for match in re.finditer(r"\{\{([A-Z0-9_]+)\}\}", line)
+})
+
 def without_newline(line):
     return line.rstrip("\r\n")
 
 def has_placeholder(line):
-    return re.search(r"\{\{[A-Z_]+\}\}", line) is not None
+    return re.search(r"\{\{[A-Z0-9_]+\}\}", line) is not None
 
 def assignment(line, name):
     if is_comment(line):
@@ -543,6 +536,15 @@ for name in names:
             # This exception must never fall back to a value that bypasses the patched unit.
             continue
     if name not in values:
+        if name == "IMMUTABLE_DISK_REQUIRED":
+            rendered = [
+                line if is_comment(line) else line.replace(token, "false")
+                for line in rendered
+            ]
+            print(
+                "   bootstrap fallback: IMMUTABLE_DISK_REQUIRED=false "
+                "(CDK/config compatibility default; no live recovery or --values entry)"
+            )
         continue
     value = values[name]
     if not isinstance(value, str):
@@ -558,7 +560,7 @@ output_lines = output_text.splitlines(keepends=True)
 unresolved = sorted({
     match.group(1)
     for line in output_lines if not is_comment(line)
-    for match in re.finditer(r"\{\{([A-Z_]+)\}\}", line)
+    for match in re.finditer(r"\{\{([A-Z0-9_]+)\}\}", line)
 })
 if unresolved:
     raise SystemExit("FAIL: unresolved bootstrap placeholders: " + ", ".join(unresolved))
@@ -882,6 +884,9 @@ import re
 import sys
 
 def code_only(p):
+    # NOTE: this same judgement is implemented at four sites in this file
+    # (resolve_bootstrap_state, reconcile_b_s3, and twice in verify). Change them
+    # together — a divergent copy makes two gates disagree about one environment.
     # compare executable content only: the publish scrub removes whole comment lines,
     # so comments must not decide whether the environment is on a different version
     out = []
@@ -1192,7 +1197,7 @@ reconcile_b_place_map() {
       RECON_B_HOST_PATH="/etc/systemd/system/host-agent.service"
       ;;
     init-host.sh.patched)
-      RECON_B_S3_KEY="deployment/bootstrap/host/${ASSET_BUNDLE_PREFIX}/init-host.sh"
+      RECON_B_S3_KEY="${RECON_B_BOOTSTRAP_KEY:-UNREADABLE}"
       RECON_B_HOST_PATH="NOT_INSTALLED_ON_DISK"
       ;;
     provision-host.sh.patched)
@@ -1277,10 +1282,21 @@ reconcile_b_s3() {
   local manifest_records_file records_file host_records_file work
   local source artifact change base patch name key host_path digest state detail
   local asg_json instance_ids ssm_params instance_id readable_states state_count details
+  local bootstrap_userdata bootstrap_prefix
   work="$(mktemp -d)"
   manifest_records_file="${work}/manifest-records.usv"
   records_file="${work}/records.usv"
   host_records_file="${work}/host-records.usv"
+  RECON_B_BOOTSTRAP_KEY=""
+  if bootstrap_userdata="$(aws_ ec2 describe-launch-template-versions \
+      --launch-template-id "$LT_ID" --versions "$ASG_LT_REF" \
+      --query 'LaunchTemplateVersions[0].LaunchTemplateData.UserData' \
+      --output text 2>/dev/null | base64 -d 2>/dev/null)"; then
+    bootstrap_prefix="$(printf '%s' "$bootstrap_userdata" \
+      | grep -oE 'deployment/bootstrap/host/[0-9a-f]{64}' | head -1 | sed 's|.*/||')"
+    [ -z "$bootstrap_prefix" ] \
+      || RECON_B_BOOTSTRAP_KEY="deployment/bootstrap/host/${bootstrap_prefix}/init-host.sh"
+  fi
   jq -r '
     .paths | to_entries[]
     | select(.value.layer == "B-s3" and .value.artifact != null)
@@ -1324,12 +1340,52 @@ reconcile_b_s3() {
   while IFS=$'\x1f' read -r source artifact change base patch key host_path; do
     [ -n "$source" ] || continue
     [ "$key" != "NOT_PUBLISHED" ] || continue
+    if [ "$key" = "UNREADABLE" ]; then
+      reconcile_record B-s3 "$source" "$artifact" "$change" \
+        "launch-template:${LT_ID}:${ASG_LT_REF}" UNREADABLE -
+      continue
+    fi
     if aws_ s3api head-object --bucket "$BUCKET" --key "$key" \
         >/dev/null 2>"${work}/s3-error"; then
       if aws_ s3 cp "s3://${BUCKET}/${key}" "${work}/s3-object" \
           --no-progress >/dev/null 2>"${work}/s3-error"; then
         digest="$(sha256_file "${work}/s3-object")"
-        state="$(reconcile_classify_hash "$digest" "$base" "$patch")"
+        if [ "$artifact" = "host-scripts/init-host.sh.patched" ]; then
+          if ( render_bootstrap_artifact "${KITDIR}/host-scripts/init-host.sh.patched" \
+               "${work}/s3-object" "${work}/rendered-init-host.sh" ); then
+            if python3 - "${work}/s3-object" "${work}/rendered-init-host.sh" <<'PY'
+import pathlib
+import re
+import sys
+
+# Same judgement as verify's bootstrap-prefix fallback below; change both together.
+def code_only(p):
+    # NOTE: this same judgement is implemented at four sites in this file
+    # (resolve_bootstrap_state, reconcile_b_s3, and twice in verify). Change them
+    # together — a divergent copy makes two gates disagree about one environment.
+    # compare executable content only: the publish scrub removes whole comment lines,
+    # so comments must not decide whether the environment is on a different version
+    out = []
+    for line in pathlib.Path(p).read_text(encoding="utf-8", errors="replace").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        out.append(re.sub(r"\s+", " ", s))
+    return out
+
+sys.exit(0 if code_only(sys.argv[1]) == code_only(sys.argv[2]) else 1)
+PY
+            then
+              state=PATCH
+            else
+              state=UNKNOWN
+            fi
+          else
+            state=UNREADABLE
+          fi
+        else
+          state="$(reconcile_classify_hash "$digest" "$base" "$patch")"
+        fi
         reconcile_record B-s3 "$source" "$artifact" "$change" \
           "s3:${BUCKET}/${key}" "$state" "$digest"
       else
@@ -1429,7 +1485,7 @@ PY
 
   rm -f "$manifest_records_file" "$records_file" "$host_records_file" \
     "${work}/s3-error" "${work}/s3-object" "${work}/asg-error" \
-    "${work}/ssm-params.json"
+    "${work}/ssm-params.json" "${work}/rendered-init-host.sh"
   rmdir "$work" 2>/dev/null || true
 }
 
@@ -1769,9 +1825,20 @@ apply)
   say "2/3 upload bootstrap script to its content-addressed key, then one new LT version"
   art="${KITDIR}/host-scripts/init-host.sh.patched"
   [ -f "$art" ] || die "missing artifact $art"
+  expected_artifact_sha="$(
+    python3 - "${KITDIR}/manifest.json" 2>/dev/null <<'PY'
+import json
+import sys
+
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+print(manifest["paths"]["deploy/userdata/init-host.sh"]["patch_sha256"])
+PY
+  )" || die "cannot read init-host artifact digest from manifest"
+  printf '%s' "$expected_artifact_sha" | grep -Eq '^[0-9a-f]{64}$' \
+    || die "manifest has no valid patch_sha256 for deploy/userdata/init-host.sh"
   got="$(sha256_file "$art")"
-  [ "$got" = "$ARTIFACT_SHA256" ] \
-    || die "artifact sha256 $got does not match expected file digest $ARTIFACT_SHA256"
+  [ "$got" = "$expected_artifact_sha" ] \
+    || die "artifact sha256 $got does not match expected file digest $expected_artifact_sha"
   # Recompute the state here rather than trusting precheck: the run directory is editable
   # and the live target may have moved between the two phases.
   lt_default_data="$(aws_ ec2 describe-launch-template-versions --launch-template-id "$LT_ID" \
@@ -2179,7 +2246,11 @@ import pathlib
 import re
 import sys
 
+# Same judgement as reconcile's B-s3 bootstrap classification above; change both together.
 def code_only(p):
+    # NOTE: this same judgement is implemented at four sites in this file
+    # (resolve_bootstrap_state, reconcile_b_s3, and twice in verify). Change them
+    # together — a divergent copy makes two gates disagree about one environment.
     # compare executable content only: the publish scrub removes whole comment lines,
     # so comments must not decide whether the environment is on a different version
     out = []
@@ -2255,6 +2326,9 @@ import re
 import sys
 
 def code_only(p):
+    # NOTE: this same judgement is implemented at four sites in this file
+    # (resolve_bootstrap_state, reconcile_b_s3, and twice in verify). Change them
+    # together — a divergent copy makes two gates disagree about one environment.
     # compare executable content only: the publish scrub removes whole comment lines,
     # so comments must not decide whether the environment is on a different version
     out = []
@@ -2332,11 +2406,39 @@ PY
         rc=1
       fi
     fi
-    if aws_ lambda invoke --function-name "$FN" --payload eyJwYXRoIjoiL3BpbmcifQ== \
-        /tmp/restorepatch-invoke.json --query FunctionError --output text | grep -qi none; then
-      verify_status PASS "invoke has no FunctionError"
+    invoke_event="$(mktemp)"
+    cat > "$invoke_event" <<'JSON'
+{
+  "httpMethod": "GET",
+  "resource": "/hosts",
+  "path": "/hosts",
+  "pathParameters": null,
+  "queryStringParameters": null,
+  "headers": {},
+  "body": null
+}
+JSON
+    if invoke_function_error="$(aws_ lambda invoke --function-name "$FN" \
+        --payload "fileb://${invoke_event}" /tmp/restorepatch-invoke.json \
+        --query FunctionError --output text)"; then
+      if printf '%s\n' "$invoke_function_error" | grep -qi '^none$'; then
+        verify_status PASS "invoke has no FunctionError; inspect /tmp/restorepatch-invoke.json"
+      else
+        verify_status FAIL "invoke FunctionError=${invoke_function_error:-unknown}; inspect /tmp/restorepatch-invoke.json"
+        rc=1
+      fi
     else
-      verify_status NOTE "inspect /tmp/restorepatch-invoke.json; a 404 body on a private API is expected"
+      verify_status FAIL "invoke command failed; inspect /tmp/restorepatch-invoke.json"
+      rc=1
+    fi
+    rm -f "$invoke_event"
+    if [ -f /tmp/restorepatch-invoke.json ] \
+        && ! grep -Eqi '"(errorType|errorMessage)"[[:space:]]*:|Traceback' \
+          /tmp/restorepatch-invoke.json; then
+      verify_status PASS "invoke response has no errorType/errorMessage/Traceback; inspect /tmp/restorepatch-invoke.json"
+    else
+      verify_status FAIL "invoke response contains an unhandled-exception envelope or is missing; inspect /tmp/restorepatch-invoke.json"
+      rc=1
     fi
 
     say "discovered API-package peers carry the overlay byte for byte"

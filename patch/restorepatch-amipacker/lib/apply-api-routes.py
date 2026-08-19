@@ -664,9 +664,15 @@ def desired_cors_bundle(cors: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def gate(message: str) -> None:
+def gate(message: str, assume_yes: bool = False) -> None:
     print(f"\n>>> {message}")
-    answer = input(f"    type '{CONFIRM}' to proceed (else abort): ")
+    if assume_yes:
+        print("    gate approved non-interactively via --yes")
+        return
+    try:
+        answer = input(f"    type '{CONFIRM}' to proceed (else abort): ")
+    except EOFError:
+        answer = ""
     if answer != CONFIRM:
         print("aborted")
         raise SystemExit(3)
@@ -2055,20 +2061,26 @@ def rollback_routes(gateway: Gateway, state: dict[str, Any], state_file: Path) -
 
 
 def main() -> None:
-    if len(sys.argv) == 3 and sys.argv[1] == "validate-spec":
-        spec_path = Path(sys.argv[2])
+    arguments = sys.argv[1:]
+    if arguments.count("--yes") > 1:
+        fail("--yes may be specified only once")
+    assume_yes = "--yes" in arguments
+    if assume_yes:
+        arguments.remove("--yes")
+    if len(arguments) == 2 and arguments[0] == "validate-spec":
+        spec_path = Path(arguments[1])
         if not spec_path.is_file():
             fail(f"spec not found: {spec_path}")
         validate_spec(json.loads(spec_path.read_bytes()))
         print(f"PASS: valid API route spec {spec_path}")
         return
-    if len(sys.argv) != 6:
+    if len(arguments) != 5:
         fail(
             "usage: apply-api-routes.sh validate-spec <spec.json>\n"
             "       apply-api-routes.sh plan|apply|verify|finalize|rollback "
-            "<spec.json> <rest-api-id> <stage> <region>"
+            "<spec.json> <rest-api-id> <stage> <region> [--yes]"
         )
-    command, spec_name, api, stage, region = sys.argv[1:]
+    command, spec_name, api, stage, region = arguments
     if command not in {"plan", "apply", "verify", "finalize", "rollback"}:
         fail(f"unknown command {command!r}")
     if not SAFE_ID.fullmatch(api) or not SAFE_ID.fullmatch(stage):
@@ -2124,7 +2136,8 @@ def main() -> None:
             template, snapshots = preflight(gateway, spec)
             print_plan(gateway, spec, template, snapshots)
             gate(
-                f"apply exact route lifecycle to API {api!r} and deploy stage {stage!r}"
+                f"apply exact route lifecycle to API {api!r} and deploy stage {stage!r}",
+                assume_yes,
             )
             template, snapshots = preflight(gateway, spec)
             state = {
@@ -2228,7 +2241,8 @@ def main() -> None:
         if command == "finalize":
             gate(
                 f"finalize API {api!r} stage {stage!r} and delete its "
-                "previous deployment"
+                "previous deployment",
+                assume_yes,
             )
             finalize_routes(gateway, state, state_file, spec)
             return
@@ -2241,7 +2255,10 @@ def main() -> None:
             fail("state is already finalized; rollback is no longer available")
         if state.get("rolled_back"):
             fail("state is already rolled back")
-        gate(f"restore stage {stage!r} and every state-captured route resource")
+        gate(
+            f"restore stage {stage!r} and every state-captured route resource",
+            assume_yes,
+        )
         rollback_routes(gateway, state, state_file)
     finally:
         release_lease(state_file, lease)

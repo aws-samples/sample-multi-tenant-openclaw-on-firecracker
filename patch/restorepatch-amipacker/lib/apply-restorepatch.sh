@@ -274,6 +274,13 @@ sha256_file() {
   local path="$1" value
   value="$(shasum -a 256 "$path" 2>/dev/null | awk '{print $1}')"
   [ -n "$value" ] || value="$(sha256sum "$path" | awk '{print $1}')"
+  # Both tools failing used to still return 0 with an empty value. Two unhashable files then
+  # compared equal, which is a match verdict manufactured out of a tooling failure. Callers that
+  # compare digests must be able to tell that apart, so refuse anything that is not a digest.
+  case "$value" in
+    *[!0-9a-f]*|'') return 1 ;;
+  esac
+  [ "${#value}" -eq 64 ] || return 1
   printf '%s\n' "$value"
 }
 
@@ -702,7 +709,9 @@ publish_host_assets() {
   done < <(cd "$root/edge/fluent-bit" && find . -type f -print | sed 's|^\./||' | sort)
   # The unit is embedded by HOST_AGENT_SCRIPT; no runtime consumes an S3 service key.
   publish_s3_asset "$root/host-agent.py.patched" "deployment/scripts/host-agent.py"
-  assert_bootstrap_script_deps "$root"
+  # The caller already downloaded the in-service bootstrap for value recovery; pass it so the gate
+  # reads this environment's resolved LOGGING_ENABLED instead of re-fetching or assuming.
+  assert_bootstrap_script_deps "$root" "${1:-}"
 }
 
 # Every `deployment/scripts/*` object the patched bootstrap fetches must exist in the bucket
@@ -713,6 +722,9 @@ publish_host_assets() {
 # Recorded digests for one bare object name. Matching is by basename: the S3 key is
 # `deployment/scripts/<name>` while the kit artifact is `host-scripts/<name>.patched`.
 _dep_digests() {
+  # Always two tokens, and a non-zero exit if the manifest cannot be read. Printing nothing on a
+  # failure was indistinguishable from "no digest recorded", which downgraded the object to a
+  # presence check -- so a pre-patch object passed the gate because a JSON read had failed.
   python3 - "${KITDIR}/manifest.json" "$1" <<'PY'
 import json, sys
 paths = json.load(open(sys.argv[1], encoding="utf-8")).get("paths") or {}
@@ -721,12 +733,97 @@ for r in paths.values():
     if art.rsplit("/", 1)[-1] in (sys.argv[2], sys.argv[2] + ".patched"):
         print(r.get("base_sha256") or "-", r.get("patch_sha256") or "-")
         break
+else:
+    print("-", "-")
 PY
 }
 
+# Digests recorded for one exact manifest path. `jpath` splits its key on '.', so it silently
+# returns empty for any key containing a dot -- the shape of every file path -- which is why this
+# reads the literal key instead.
+_path_digests() {
+  python3 - "${KITDIR}/manifest.json" "$1" <<'PY'
+import json, sys
+paths = json.load(open(sys.argv[1], encoding="utf-8")).get("paths") or {}
+record = paths.get(sys.argv[2]) or {}
+print(record.get("base_sha256") or "-", record.get("patch_sha256") or "-")
+PY
+}
+
+# The in-service rendered bootstrap, which is the only authority on what this fleet actually boots
+# with -- notably whether the Fluent Bit step runs at all. Callers that already hold a copy pass it
+# in; the rest resolve it from the launch template the ASG references, and ONLY from there. This run's
+# own recorded rendering was an obvious-looking fallback and a wrong one: it is not bound to this
+# ASG, it can predate a repoint, and an older copy that said LOGGING_ENABLED=false would talk the
+# gate out of checking a fleet that has logging on. Returning non-zero makes the caller assume
+# logging is enabled, which is the safe direction.
+_live_bootstrap_copy() {
+  local out="$1" userdata prefix=""
+  userdata="$(aws_ ec2 describe-launch-template-versions --launch-template-id "$LT_ID" \
+    --versions "$ASG_LT_REF" --query 'LaunchTemplateVersions[0].LaunchTemplateData.UserData' \
+    --output text 2>/dev/null)" || return 1
+  case "${userdata:-}" in ''|None) return 1 ;; esac
+  prefix="$(printf '%s' "$userdata" | base64 -d 2>/dev/null \
+    | grep -oE 'deployment/bootstrap/host/[0-9a-f]{64}' | head -1 | sed 's|.*/||')"
+  [ -n "$prefix" ] || return 1
+  aws_ s3 cp "s3://${BUCKET}/deployment/bootstrap/host/${prefix}/init-host.sh" "$out" \
+    --no-progress >/dev/null 2>&1 || return 1
+  [ -s "$out" ] || return 1
+}
+
+# Names under deployment/scripts/ that the patched bootstrap fetches, including the ones it builds
+# from a loop variable. Fail closed if a variable-built key cannot be resolved: an unenumerable
+# dependency is the same blind spot as an unchecked prefix.
+_bootstrap_script_names() {
+  local root="$1" out="$2" src="$1/init-host.sh.patched" words word rc
+  # Writes to a file instead of stdout, and checks every producer. Behind a pipeline a grep that
+  # dies after partial output, or a grep that cannot read the file at all, is indistinguishable from
+  # "nothing to report" -- which would hand the caller a truncated requirement list and a PASS.
+  # grep exits 1 for "no match" and >1 for a real error; only the first is an answer.
+  [ -r "$src" ] || return 1
+  : > "$out" || return 1
+  grep -oE 'deployment/scripts/[A-Za-z0-9._/-]+' "$src" > "${out}.raw"
+  rc=$?
+  [ "$rc" -le 1 ] || return 1
+  sed 's|deployment/scripts/||' "${out}.raw" >> "$out" || return 1
+  grep -q 'deployment/scripts/\${' "$src"
+  rc=$?
+  case "$rc" in
+    0) ;;
+    1) return 0 ;;
+    *) return 1 ;;
+  esac
+  words="$(sed -nE 's/^[[:space:]]*for[[:space:]]+_s[[:space:]]+in[[:space:]]+([^;]+);.*/\1/p' \
+    "$src")" || return 1
+  [ -n "$words" ] \
+    || die "the patched bootstrap builds deployment/scripts keys from a variable this gate cannot resolve; extend _bootstrap_script_names before shipping, because an unenumerable boot dependency is how a missing object reaches real hardware as an ABANDON loop"
+  for word in $words; do
+    # A word list that is itself built from a variable resolves to nothing usable. Say that, rather
+    # than emitting a nonsense key whose MISSING line would send an operator looking for an object
+    # that was never meant to exist.
+    case "$word" in
+      *[\$\{\*\'\"]*)
+        die "the patched bootstrap builds deployment/scripts keys from '$word', which this gate cannot resolve to object names; extend _bootstrap_script_names before shipping"
+        ;;
+    esac
+    printf '%s.sh\n' "$word" >> "$out" || return 1
+  done
+}
+
 assert_bootstrap_script_deps() {
-  local root="$1" rel missing=0 stale=0 undecided=0 ok_n=0 presence_only=0 work base_sha patch_sha got
+  local root="$1" live_bootstrap="${2:-}" rel missing=0 stale=0 undecided=0 ok_n=0 presence_only=0
+  local work base_sha patch_sha got dep_line
+  local obs_ok=0 obs_note=0 obs_key obs_kit obs_want obs_copy obs_ref _obs_verdict
+  local uncovered="" asset_key
+  local names_file logging_enabled=true logging_source logging_count logging_value
   work="$(mktemp -d)"
+  names_file="${work}/bootstrap-script-names"
+  _bootstrap_script_names "$root" "$names_file" \
+    || die "cannot enumerate the deployment/scripts objects the patched bootstrap fetches"
+  [ -s "$names_file" ] \
+    || die "the patched bootstrap names no deployment/scripts object; that cannot be right, so treat it as a broken derivation rather than an empty requirement"
+  sort -u "$names_file" > "${names_file}.sorted" \
+    || die "cannot sort the bootstrap script requirement list"
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
     if ! aws_ s3api head-object --bucket "$BUCKET" --key "deployment/scripts/$rel" >/dev/null 2>&1; then
@@ -734,7 +831,19 @@ assert_bootstrap_script_deps() {
       missing=1
       continue
     fi
-    read -r base_sha patch_sha <<< "$(_dep_digests "${rel##*/}")"
+    if ! dep_line="$(_dep_digests "${rel##*/}")"; then
+      echo "   UNDECIDED ${rel} — the manifest digests could not be read, so nothing about this object is decided" >&2
+      undecided=$((undecided + 1))
+      continue
+    fi
+    case "$dep_line" in
+      *' '*) base_sha="${dep_line%% *}"; patch_sha="${dep_line##* }" ;;
+      *)
+        echo "   UNDECIDED ${rel} — the manifest digest lookup returned '${dep_line}', not two digests" >&2
+        undecided=$((undecided + 1))
+        continue
+        ;;
+    esac
     if [ "${patch_sha:--}" = "-" ]; then
       presence_only=$((presence_only + 1))
       continue
@@ -755,9 +864,193 @@ assert_bootstrap_script_deps() {
       echo "   UNDECIDED ${rel} matches neither recorded digest (sha=${got})" >&2
       undecided=$((undecided + 1))
     fi
-  done < <(grep -oE 'deployment/scripts/[A-Za-z0-9._/-]+' "$root/init-host.sh.patched" \
-             | sed 's|deployment/scripts/||' | sort -u)
+  done < "${names_file}.sorted"
+
+  # The observability prefix is the SECOND set of objects this bootstrap consumes, and it was
+  # outside the loop above. step3a2 fetches deployment/observability/fluent-bit/install-fluent-bit.sh
+  # with no `|| true` and no baked fallback for role=host, then runs it; a pre-patch installer dies
+  # there (its `gpg --dearmor` has no --batch, so on a boot with no terminal it fails to open
+  # /dev/tty), init exits rc=2 and the lifecycle hook ABANDONs the instance. The installer then
+  # pulls the whole role prefix and dies on a config whose Lua filters are absent, so the conf and
+  # the .lua files are boot-critical too. A fleet lost every new host to exactly this on
+  # 2026-08-19 after a partial publish left the pre-patch installer in place -- and the gate above
+  # reported PASS, because it can only see deployment/scripts/.
+  #
+  # Scope: this bootstrap fetches the installer and, through it, the host role prefix -- and only
+  # when the rendered LOGGING_ENABLED is true. The edge role is consumed by edge instances, not by
+  # this template, so it is reported and not required; demanding it would refuse an environment
+  # whose edge is managed by a deployment.
+  if [ -n "$live_bootstrap" ] && [ -s "$live_bootstrap" ]; then
+    logging_source="the in-service bootstrap"
+  else
+    live_bootstrap="${work}/live-init-host.sh"
+    if _live_bootstrap_copy "$live_bootstrap"; then
+      logging_source="the in-service bootstrap"
+    else
+      live_bootstrap=""
+      logging_source="assumed enabled: no in-service bootstrap was reachable to read it from"
+    fi
+  fi
+  if [ -n "$live_bootstrap" ]; then
+    # Exactly one top-level assignment decides this, and anything else assumes enabled. Matching any
+    # line meant a second assignment -- a later edit, or a line inside a heredoc that happens to
+    # start at column 0 -- could override the effective value and skip every check below. A switch
+    # that can be talked down by an unrelated line is not a switch.
+    logging_count="$(grep -cE '^LOGGING_ENABLED=' "$live_bootstrap")" || logging_count=0
+    if [ "$logging_count" = "1" ]; then
+      logging_value="$(sed -nE 's/^LOGGING_ENABLED="?([A-Za-z]+)"?[[:space:]]*$/\1/p' "$live_bootstrap")"
+      case "$logging_value" in
+        false) logging_enabled=false ;;
+        true) ;;
+        *) logging_source="assumed enabled: the in-service bootstrap sets LOGGING_ENABLED to '${logging_value}', which is not a boolean" ;;
+      esac
+    else
+      logging_source="assumed enabled: the in-service bootstrap carries ${logging_count} top-level LOGGING_ENABLED assignments, so none of them is authoritative"
+    fi
+  fi
+  if [ "$logging_enabled" != true ]; then
+    echo "   SKIP the Fluent Bit objects: ${logging_source} sets LOGGING_ENABLED=false, so step3a2 never runs"
+  else
+    echo "   logging is enabled according to ${logging_source}; the Fluent Bit objects are boot-critical"
+    # Every derived list goes to a file whose producer status is checked. Behind a process
+    # substitution a failing find/sed/grep is indistinguishable from an empty result, and an empty
+    # result here would print PASS over zero objects -- a green light produced by a broken pipe.
+    ( cd "$root/edge/fluent-bit" && find . -type f -print ) 2>/dev/null \
+      | sed 's|^\./||' | sort > "${work}/obs-files" \
+      || die "cannot enumerate the kit's Fluent Bit artifacts"
+    [ -s "${work}/obs-files" ] \
+      || die "the kit ships no Fluent Bit artifacts under host-scripts/edge/fluent-bit; refusing to report a converged observability prefix from an empty list"
+    while IFS= read -r rel; do
+      [ -n "$rel" ] || continue
+      case "$rel" in
+        __pycache__/*|*/__pycache__/*|*.pyc|*.pyo|.DS_Store|*/.DS_Store) continue ;;
+      esac
+      obs_kit="$root/edge/fluent-bit/$rel"
+      obs_key="deployment/observability/fluent-bit/$rel"
+      if ! obs_want="$(sha256_file "$obs_kit")"; then
+        die "cannot hash the kit's own $obs_kit; refusing to compare against a digest this run could not compute"
+      fi
+      obs_copy="${work}/obs-$(printf '%s' "$rel" | tr '/' '_')"
+      if ! aws_ s3 cp "s3://${BUCKET}/${obs_key}" "$obs_copy" --no-progress >/dev/null 2>&1; then
+        # Absent, forbidden and unreadable are three different verdicts, and only the first is a gap
+        # this driver can close by publishing. HeadObject's failure text is the only thing that
+        # separates them, so read it instead of assuming absence.
+        if aws_ s3api head-object --bucket "$BUCKET" --key "$obs_key" >"${work}/head-out" 2>"${work}/head-err"; then
+          _obs_verdict="UNREADABLE (present, but this run could not download it)"
+        elif grep -qE '\(404\)|Not Found|NoSuchKey' "${work}/head-err"; then
+          _obs_verdict="MISSING"
+        else
+          _obs_verdict="UNDECIDED ($(tr '\n' ' ' < "${work}/head-err" | tail -c 160))"
+        fi
+        case "$rel" in
+          edge/*)
+            echo "   NOTE s3://${BUCKET}/${obs_key}: ${_obs_verdict} — edge role, not consumed by this bootstrap"
+            obs_note=$((obs_note + 1))
+            ;;
+          *)
+            echo "   ${_obs_verdict} s3://${BUCKET}/${obs_key}" >&2
+            case "$_obs_verdict" in
+              MISSING) missing=1 ;;
+              *) undecided=$((undecided + 1)) ;;
+            esac
+            ;;
+        esac
+        continue
+      fi
+      if ! got="$(sha256_file "$obs_copy")"; then
+        echo "   UNDECIDED ${obs_key} — the downloaded object could not be hashed" >&2
+        undecided=$((undecided + 1))
+        continue
+      fi
+      if [ "$got" = "$obs_want" ]; then
+        case "$rel" in
+          edge/*) obs_note=$((obs_note + 1)) ;;
+          *) obs_ok=$((obs_ok + 1)) ;;
+        esac
+        continue
+      fi
+      if ! dep_line="$(_path_digests "deploy/edge/fluent-bit/${rel}")"; then
+        dep_line="- -"
+      fi
+      base_sha="${dep_line%% *}"
+      case "$rel" in
+        edge/*)
+          echo "   NOTE s3://${BUCKET}/${obs_key} differs from the kit copy (sha=${got}) — edge role, not consumed by this bootstrap"
+          obs_note=$((obs_note + 1))
+          ;;
+        *)
+          if [ "$got" = "$base_sha" ]; then
+            echo "   STALE ${obs_key} is still the pre-patch version — present but incompatible" >&2
+            stale=$((stale + 1))
+          else
+            echo "   UNDECIDED ${obs_key} matches neither the kit copy nor the recorded pre-patch digest (sha=${got})" >&2
+            undecided=$((undecided + 1))
+          fi
+          ;;
+      esac
+    done < "${work}/obs-files"
+
+    # Support files the shipped host config references but this kit does not carry. Presence is all
+    # that can be judged (no digest exists for them), and presence is what the installer needs: it
+    # dies on a missing Lua filter by name, and `fluent-bit --dry-run` dies on a missing
+    # Parsers_File.
+    if [ -f "$root/edge/fluent-bit/host/fluent-bit.conf" ]; then
+      sed -nE \
+        -e 's/^[[:space:]]*script[[:space:]]+([^[:space:]/][^[:space:]]*)[[:space:]]*$/\1/p' \
+        -e 's/^[[:space:]]*Parsers_File[[:space:]]+([^[:space:]]+)[[:space:]]*$/\1/p' \
+        "$root/edge/fluent-bit/host/fluent-bit.conf" | sort -u > "${work}/obs-refs" \
+        || die "cannot read the support files the host Fluent Bit config references"
+      [ -s "${work}/obs-refs" ] \
+        || die "the host Fluent Bit config this kit publishes names no parser or Lua filter; that contradicts the config itself, so treat it as a broken derivation"
+      while IFS= read -r obs_ref; do
+        [ -n "$obs_ref" ] || continue
+        # Anything the kit ships was already compared by digest in the loop above.
+        [ -f "$root/edge/fluent-bit/host/$obs_ref" ] && continue
+        if aws_ s3api head-object --bucket "$BUCKET" \
+             --key "deployment/observability/fluent-bit/host/${obs_ref}" >/dev/null 2>"${work}/head-err"; then
+          presence_only=$((presence_only + 1))
+        elif grep -qE '\(404\)|Not Found|NoSuchKey' "${work}/head-err"; then
+          echo "   MISSING s3://${BUCKET}/deployment/observability/fluent-bit/host/${obs_ref} (referenced by the host config this kit publishes; the installer dies on it)" >&2
+          missing=1
+        else
+          echo "   UNDECIDED s3://${BUCKET}/deployment/observability/fluent-bit/host/${obs_ref} — cannot tell whether it exists ($(tr '\n' ' ' < "${work}/head-err" | tail -c 160))" >&2
+          undecided=$((undecided + 1))
+        fi
+      done < "${work}/obs-refs"
+    fi
+  fi
+
+  # Coverage, so this gate cannot go blind again. Every literal assets-bucket key the patched
+  # bootstrap fetches must be claimed by one of the checks above; anything else stops the run and
+  # names itself, instead of being quietly unchecked the way the observability prefix was. Keys
+  # built from shell variables or {{placeholders}} do not survive the character class below, and
+  # the two that are environment data rather than patch artifacts are exempt by name.
+  grep -oE 's3://\$\{ASSETS_BUCKET\}/[A-Za-z0-9._/-]+' "$root/init-host.sh.patched" \
+    | sed 's|^s3://\${ASSETS_BUCKET}/||' | sort -u > "${work}/asset-keys" \
+    || die "cannot read the assets-bucket keys the patched bootstrap fetches"
+  [ -s "${work}/asset-keys" ] \
+    || die "the patched bootstrap appears to fetch nothing from the assets bucket; that contradicts the artifact, so treat it as a broken derivation rather than full coverage"
+  while IFS= read -r asset_key; do
+    [ -n "$asset_key" ] || continue
+    case "$asset_key" in
+      deployment/scripts/*) continue ;;
+      deployment/observability/fluent-bit/*) continue ;;
+      # The ADOT config is exempt for a specific reason, not by convenience: the kit ships no ADOT
+      # bytes to compare against, and the bootstrap treats a failed fetch of this key as
+      # recoverable -- it falls back to deployment/scripts/adot-config.yaml, which the loop above
+      # does check, and only the fallback failing ends the boot. A present-but-stale config here
+      # degrades metrics rather than the boot, so it is out of this gate's remit; verifying it
+      # would need a content source this kit does not have.
+      deployment/observability/adot/adot-config.yaml) continue ;;
+      # Tenant skill content, synced with `|| true` and owned by nothing in this kit.
+      skills/) continue ;;
+      *) uncovered="${uncovered:+${uncovered} }${asset_key}" ;;
+    esac
+  done < "${work}/asset-keys"
+
   rm -rf "$work"
+  [ -z "$uncovered" ] \
+    || die "the patched bootstrap fetches assets-bucket object(s) no check in this gate covers: ${uncovered}; extend assert_bootstrap_script_deps before shipping, because an unchecked boot dependency is how a stale object reaches real hardware as an ABANDON loop"
   [ "$missing" -eq 0 ] \
     || die "the patched bootstrap fetches objects that are absent from the bucket (see MISSING above); publishing the promoted template now would ABANDON every new host"
   # Presence was never the question: all three canary ABANDONs on the customer run were
@@ -766,7 +1059,7 @@ assert_bootstrap_script_deps() {
     || die "$stale object(s) are still the pre-patch version (see STALE above); promoting now would ABANDON every new host for a reason a presence check cannot see"
   [ "$undecided" -eq 0 ] \
     || die "$undecided object(s) match neither recorded digest (see UNDECIDED/UNREADABLE above); refusing to promote against an undecided bucket"
-  echo "   PASS ${ok_n} object(s) match patch_sha256; ${presence_only} present-only (no digest recorded)"
+  echo "   PASS ${ok_n} deployment/scripts object(s) match patch_sha256; ${presence_only} present-only (no digest recorded); ${obs_ok} host observability object(s) match the kit copy; ${obs_note} edge object(s) reported only"
 }
 
 restore_s3_asset() {
@@ -1924,7 +2217,7 @@ PY
   # Host assets must share the bootstrap gate: publishing only one lineage creates
   # a mixed-lineage fleet and reintroduces the per-file drift this kit repairs.
   # Publish every runtime dependency before any new host can consume the promoted template.
-  publish_host_assets
+  publish_host_assets "$live_art"
   render_bootstrap_artifact "$art" "$live_art" "$rendered_art"
   rendered_sha="$(sha256_file "$rendered_art")"
   state_put rendered_bootstrap_sha256 "$rendered_sha"
@@ -2435,6 +2728,20 @@ verify)
       verify_status FAIL "this tool changed MinSize: backup=$backup_minsz current=$minsz"
       rc=1
     fi
+
+    say "every S3 object the promoted bootstrap consumes still matches the kit"
+    # Read-only replay of the gate the publish path runs, in a subshell so its die() ends the check
+    # rather than verify. Nothing else in verify can see a partial or reverted publish: the objects
+    # are fetched at boot, so the fleet reports it as the next instance ABANDONing, hours later.
+    dep_report="$(mktemp)"
+    if ( assert_bootstrap_script_deps "${KITDIR}/host-scripts" ) >"$dep_report" 2>&1; then
+      verify_status PASS "$(grep -m1 'PASS ' "$dep_report" | sed 's/^ *//')"
+    else
+      verify_status FAIL "a boot dependency does not match the kit; a new host would ABANDON"
+      sed 's/^/   /' "$dep_report"
+      rc=1
+    fi
+    rm -f "$dep_report"
 
     if asg_lt_is_pinned; then
       say "ASG-referenced LT version $ASG_LT_REF carries the new bootstrap prefix and the new image"

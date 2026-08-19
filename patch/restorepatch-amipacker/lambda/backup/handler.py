@@ -102,12 +102,18 @@ def backup_tenant(tenant):
     now = _now()
 
     # Existing hosts do not rerun init-host.sh after a control-plane deploy.
+    # #545 —— freshness 判据必须是【本次新增】的标记,不能用旧哨兵。存量 host 的
+    # 自愈分支永远跳过 → 带 guest flush 的新版永不被拉取 → 线上修复静默不生效(memory
+    # host-script-s3-asset-drift 反复踩)。改判 oc_flush_guest:缺它 = 旧版无 flush =
+    # 备份丢未落盘客户数据,必须先从 S3 权威前缀装新版再跑。bash -n + 双 grep 守住
+    # "只装语法合法且确含新语义的脚本",装不上就 exit 1 fail-closed(不拿旧版静默备份)。
     cmd = (
-        "if ! grep -q OC_BACKUP_SOURCE_ABSENT /home/ubuntu/backup-data.sh 2>/dev/null; then "
+        "if ! grep -q oc_flush_guest /home/ubuntu/backup-data.sh 2>/dev/null; then "
         "[ -r /etc/platform.env ] && { set -a; . /etc/platform.env; set +a; }; "
         'aws s3 cp "s3://${ASSETS_BUCKET:?}/deployment/scripts/backup-data.sh" '
         "/tmp/oc-heal-backup-data.sh --no-progress >/dev/null 2>&1 && "
         "bash -n /tmp/oc-heal-backup-data.sh && "
+        "grep -q oc_flush_guest /tmp/oc-heal-backup-data.sh && "
         "grep -q OC_BACKUP_SOURCE_ABSENT /tmp/oc-heal-backup-data.sh && "
         "install -o root -g root -m 755 /tmp/oc-heal-backup-data.sh "
         "/home/ubuntu/backup-data.sh || exit 1; "

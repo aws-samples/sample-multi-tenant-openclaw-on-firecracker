@@ -81,8 +81,8 @@ API_MODE=$(cfg api.mode)
 
 R_ENGINE=$(cfg redis.engine); R_VER=$(cfg redis.engine_version); R_ENABLED=$(cfg redis.enabled)
 if [ "$R_ENABLED" = "True" ]; then
-  case "$R_ENGINE" in redis|valkey) _pass "redis.engine=$R_ENGINE 合法";; *) _block "redis.engine=$R_ENGINE 非法(只能 redis|valkey,ha_edge.py:1040)";; esac
-  [ "$R_ENGINE" = "valkey" ] && case "$R_VER" in 7.1*|"") _block "redis.engine=valkey 但 engine_version=$R_VER;valkey 无 7.1,必须 ≥7.2(ha_edge.py:1044)";; esac
+  case "$R_ENGINE" in redis|valkey) _pass "redis.engine=$R_ENGINE 合法";; *) _block "redis.engine=$R_ENGINE 非法(只能 redis|valkey,ha_edge.py:_redis_engine 白名单校验)";; esac
+  [ "$R_ENGINE" = "valkey" ] && case "$R_VER" in 7.1*|"") _block "redis.engine=valkey 但 engine_version=$R_VER;valkey 无 7.1,必须 ≥7.2(ha_edge.py:valkey engine_version 兜底校验)";; esac
   [ -n "$(cfg redis.instance_type)" ] && _warn "redis.instance_type 是栈不读的键(应为 node_type),会静默回落默认值(用户实撞)"
 fi
 
@@ -96,7 +96,7 @@ if [ -n "$BFF_CIDR" ]; then
 fi
 
 EDGE_EN=$(cfg edge.enabled)
-[ "$EDGE_EN" = "True" ] && [ "$R_ENABLED" != "True" ] && _block "edge.enabled=true 但 redis.enabled≠true(edge 靠 redis 查路由,ha_edge.py:1120)"
+[ "$EDGE_EN" = "True" ] && [ "$R_ENABLED" != "True" ] && _block "edge.enabled=true 但 redis.enabled≠true(edge 靠 redis 查路由,ha_edge.py:edge.enabled requires redis.enabled)"
 
 DISP_EN=$(cfg dispatch.enabled); CVQ=$(cfg scaler.create_via_queue)
 [ "$DISP_EN" = "True" ] && [ "$CVQ" = "True" ] && _block "dispatch.enabled 与 scaler.create_via_queue 不能同为 true(双入队,stack.py synth raise)"
@@ -106,7 +106,7 @@ CF_EN=$(cfg cloudfront.enabled)
 [ "$APIMODE_PRIV" = 1 ] && [ "$CF_EN" = "True" ] && _warn "api.mode=$API_MODE(私有)但 cloudfront.enabled=true — 私有 ALB CloudFront 回源不通,通常应 false"
 
 grep -q '^alb\.internal=' "$CFGDUMP" && _pass "alb.internal 已显式声明" \
-  || _block "config 缺 alb.internal(#423 起必须显式写,缺键 synth 直接 raise,ha_edge.py:1241)"
+  || _block "config 缺 alb.internal(#423 起必须显式写,缺键 synth 直接 raise,ha_edge.py:alb.internal 缺键 raise ValueError)"
 
 # 启动 → 拉不到镜像 → lifecycle hook ABANDON → ASG 反复换机。栈已存在时是增量,不判。
 # 主栈状态:必须区分「确实不存在」与「查不出来」。后者若被当成"不存在",会让下面的
@@ -122,12 +122,12 @@ if [ "$ORCH_STATE" = unknown ]; then
 fi
 rm -f "$ORCH_ERR"
 
-# CDK 是直接下标 CFG["asg"]["min_capacity"](ha_edge.py:943)与
+# CDK 是直接下标 CFG["asg"]["min_capacity"](ha_edge.py:asg.min_capacity 下标处)与
 # CFG["asg"]["lifecycle_hook_timeout"](:1041)—— 缺键必 KeyError。门不能放它过去,
 # 否则「预检全绿 → synth 崩」正是这道门要防的事。
 MINCAP_RAW=$(cfg asg.min_capacity)
 case "$MINCAP_RAW" in
-  ''|*[!0-9]*) _block "asg.min_capacity 缺失或非整数(${MINCAP_RAW:-空})— CDK 直接下标 CFG[\"asg\"][\"min_capacity\"](ha_edge.py:943),缺键 synth 就 KeyError";;
+  ''|*[!0-9]*) _block "asg.min_capacity 缺失或非整数(${MINCAP_RAW:-空})— CDK 直接下标 CFG[\"asg\"][\"min_capacity\"](ha_edge.py:asg.min_capacity 下标处),缺键 synth 就 KeyError";;
   0) [ "$ORCH_STATE" = present ] \
        && _pass "asg.min_capacity=0(栈已存在=增量部署,本条不按首次判)" \
        || _pass "asg.min_capacity=0(首次部署正确:等镜像就绪再扩)";;
@@ -140,7 +140,7 @@ esac
 HOST_IT_EARLY=$(cfg host.instance_type)
 HOOK_TO=$(cfg asg.lifecycle_hook_timeout)
 case "$HOOK_TO" in
-  ''|*[!0-9]*) _block "asg.lifecycle_hook_timeout 缺失或非整数(${HOOK_TO:-空})— CDK 直接下标 CFG[\"asg\"][\"lifecycle_hook_timeout\"](ha_edge.py:1041),缺键 synth 就 KeyError;imported VPC + metal 用 3600";;
+  ''|*[!0-9]*) _block "asg.lifecycle_hook_timeout 缺失或非整数(${HOOK_TO:-空})— CDK 直接下标 CFG[\"asg\"][\"lifecycle_hook_timeout\"](ha_edge.py:asg.lifecycle_hook_timeout 下标处),缺键 synth 就 KeyError;imported VPC + metal 用 3600";;
   *) if [ "$HOOK_TO" -ge 2700 ]; then
        _pass "asg.lifecycle_hook_timeout=$HOOK_TO ≥2700"
      # 实测证据只覆盖 imported VPC + metal 机型这一组合(#488 台账);其余形态没有证据,
@@ -193,18 +193,18 @@ for dk in edge.data_volume_gb edge.migration_drain_seconds alb.certificate_arn \
   grep -q "^${dk}=" "$CFGDUMP" && _warn "$dk 是栈不读的键,写了静默不生效(deploy/ 下读取次数 0,#488);删掉避免误以为已生效"
 done
 grep -q '^redis\.existing_parameter_group_arn=\|^redis\.existing_subnet_group_arn=' "$CFGDUMP" \
-  && _pass "redis.existing_*_group_arn 已配置 — 这两个键代码【确实读】(ha_edge.py:1422/1466,#281 复用现网),不是死键,别误删"
+  && _pass "redis.existing_*_group_arn 已配置 — 这两个键代码【确实读】(ha_edge.py:existing_subnet_group_arn/existing_parameter_group_arn 读取处,#281 复用现网),不是死键,别误删"
 
 # ========== Cat 5 · imported 子网契约 ==========
 _sec "imported 网络子网契约"
 if [ "$MODE" = "imported" ]; then
   VPCID=$(cfg network.imported.vpc_id); ICIDR=$(cfg network.imported.cidr)
   NPUB=$(cfglen network.imported.public_subnet_ids); NPRIV=$(cfglen network.imported.private_subnet_ids); NDB=$(cfglen network.imported.database_subnet_ids)
-  [ -z "$VPCID" ] && _block "imported 缺 vpc_id(_helpers.py:89)"
-  [ -z "$ICIDR" ] && _block "imported 缺 cidr(必填,否则 CannotPerformOperationVpcCidr,_helpers.py:108)"
-  [ "${NPUB:-0}" = 3 ] || _block "imported public_subnet_ids 必须恰好 3 个,当前 ${NPUB:-0}(_helpers.py:89)"
-  [ "${NPRIV:-0}" = 3 ] || _block "imported private_subnet_ids 必须恰好 3 个,当前 ${NPRIV:-0}(_helpers.py:89)"
-  [ -n "$NDB" ] && [ "$NDB" != 3 ] && _block "imported database_subnet_ids 要么空要么恰好 3,当前 $NDB(半配 fail-loud,_helpers.py:96)"
+  [ -z "$VPCID" ] && _block "imported 缺 vpc_id(_helpers.py:imported vpc_id+3公+3私 subnet 校验)"
+  [ -z "$ICIDR" ] && _block "imported 缺 cidr(必填,否则 CannotPerformOperationVpcCidr,_helpers.py:imported cidr 必填(CannotPerformOperationVpcCidr))"
+  [ "${NPUB:-0}" = 3 ] || _block "imported public_subnet_ids 必须恰好 3 个,当前 ${NPUB:-0}(_helpers.py:imported vpc_id+3公+3私 subnet 校验)"
+  [ "${NPRIV:-0}" = 3 ] || _block "imported private_subnet_ids 必须恰好 3 个,当前 ${NPRIV:-0}(_helpers.py:imported vpc_id+3公+3私 subnet 校验)"
+  [ -n "$NDB" ] && [ "$NDB" != 3 ] && _block "imported database_subnet_ids 要么空要么恰好 3,当前 $NDB(半配 fail-loud,_helpers.py:database_subnet_ids 半配 fail-loud)"
   # 实查:子网归属 + AZ
   if [ -n "$VPCID" ] && [ "${NPUB:-0}" = 3 ]; then
     ALLSUB=""
@@ -251,11 +251,11 @@ if [ "$R_ENABLED" != "True" ]; then
 # existing_subnet_group_arn 在【发起查询之前】就短路:该路径根本不下发
 # 一个本来零风险的部署拦下来。
 elif [ -n "$(cfg redis.existing_subnet_group_arn)" ]; then
-  # 配了 ARN 时栈就【不再声明】RedisSubnetGroup 资源(ha_edge.py:1438 → _redis_subnet_group=None)。
+  # 配了 ARN 时栈就【不再声明】RedisSubnetGroup 资源(ha_edge.py:_redis_subnet_group=None 分支 → _redis_subnet_group=None)。
   # 若这个 ARN 指向的正是【本栈自己建的】那个组,增量部署时 CFN 会看到资源被移除 →
   # 下发 DeleteCacheSubnetGroup → 组仍被 replication group 占用 → 删不掉 → 整栈回滚。
   # 也就是说这条「补救手段」用错对象时,会造出这道门本来要防的那个故障。必须拦。
-  # 与 ha_edge.py:1437 一致先 strip:前后空白会让下面的同名判定被绕过(配 " ...:openclaw-
+  # 与 ha_edge.py:existing_subnet_group_arn.strip() 一致先 strip:前后空白会让下面的同名判定被绕过(配 " ...:openclaw-
   # redis-subnets " 时名字比不上,保护就失效了),而栈那边 strip 后照样把它当同一个组。
   ARN_GRP=$(cfg redis.existing_subnet_group_arn)
   ARN_GRP=$(printf '%s' "$ARN_GRP" | tr -d '[:space:]'); ARN_GRP="${ARN_GRP##*:}"
@@ -277,7 +277,7 @@ elif [ -n "$(cfg redis.existing_subnet_group_arn)" ]; then
     rm -f "$ARN_ERRF"
   fi
   if [ "$ARN_OWNED" = yes ] || [ "$ARN_OWNED" = unknown ]; then
-    _block "redis.existing_subnet_group_arn 指向的子网组 ${RSG_NAME} 由【本栈】管理(CFN 归属核实结果:$ARN_OWNED;unknown=查不动归属,按保守处理)。配了它之后栈不再声明该资源(ha_edge.py:1438),增量部署时 CFN 会去删这个仍被 replication group 占用的组 → 删不掉 → 整栈回滚,正是本判据要防的故障。这条手段只适用于【栈外部管理】的子网组;要固定本栈这个组请改用 redis.subnet_ids 写成在役那几个 id。确实要交给外部管理的话,得走 retain→import 的分步迁移(单独规划,别混在一次增量部署里)"
+    _block "redis.existing_subnet_group_arn 指向的子网组 ${RSG_NAME} 由【本栈】管理(CFN 归属核实结果:$ARN_OWNED;unknown=查不动归属,按保守处理)。配了它之后栈不再声明该资源(ha_edge.py:_redis_subnet_group=None 分支),增量部署时 CFN 会去删这个仍被 replication group 占用的组 → 删不掉 → 整栈回滚,正是本判据要防的故障。这条手段只适用于【栈外部管理】的子网组;要固定本栈这个组请改用 redis.subnet_ids 写成在役那几个 id。确实要交给外部管理的话,得走 retain→import 的分步迁移(单独规划,别混在一次增量部署里)"
   else
     _pass "redis.existing_subnet_group_arn 指向栈外部管理的子网组 $ARN_GRP(≠本栈的 $RSG_NAME)— 不建也不改,不下发 ModifyCacheSubnetGroup(#281),漂移已钉死(本判据无需查在役组)"
   fi

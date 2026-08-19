@@ -296,7 +296,13 @@ overlay_function() {
   location="$(aws_ lambda get-function --function-name "$function_name" \
     --query 'Code.Location' --output text)" || die "cannot locate $function_name package"
   work="$(mktemp -d)"
-  zip="/tmp/${function_name}-restorepatch.zip"
+  # Unique archive per invocation. A fixed /tmp path keyed only on the function name is shared by
+  # every concurrent run and by every environment patched from this workstation: one process could
+  # replace the archive between another's entry assertion and its upload, publishing one
+  # environment's package into another's function. A private directory closes that window and also
+  # means the archive can never be a stale one from an earlier run.
+  zip_dir="$(mktemp -d)"
+  zip="${zip_dir}/${function_name}-restorepatch.zip"
   curl -fsS -o "${work}/live.zip" "$location" || die "cannot download $function_name package"
   (cd "$work" && unzip -oq live.zip) || die "cannot unpack $function_name package"
   while IFS= read -r rel; do
@@ -338,6 +344,9 @@ overlay_function() {
   aws_ lambda wait function-updated --function-name "$function_name" \
     || die "$function_name did not settle"
   state_put "zip_${function_name}" "$zip"
+  # The package is on Lambda now; the local archive has no further use and must not linger where a
+  # later run could find it.
+  rm -rf "$zip_dir"
 }
 
 backup_function() {
@@ -2192,11 +2201,32 @@ refresh)
   # fleet replaced every tenant-carrying host again for zero configuration change. Decide from the
   # fleet's real state, not from a record that cannot expire.
   target_refresh_lt="$(state_get host_lt_new_version)"
-  if [ -n "$target_refresh_lt" ] \
-     && [ "$(state_get refresh_completed_lt_version)" = "$target_refresh_lt" ]; then
-    say "SKIP refresh: this state already records a completed refresh onto LT v${target_refresh_lt}"
-    echo "   NEXT: bash lib/apply-restorepatch.sh verify --env \"$ENVJSON\" --kit \"$KITDIR\""
-    exit 0
+  # Ask AWS for the recorded refresh's REAL terminal state. Treating "started" as "done" would make
+  # a failed or cancelled refresh unretryable: the re-run would exit 0 and leave a fleet split
+  # across two launch-template versions, which is worse than replacing it twice.
+  recorded_refresh_id="$(state_get instance_refresh_id)"
+  recorded_refresh_lt="$(state_get refresh_pending_lt_version)"
+  if [ -n "$target_refresh_lt" ] && [ -n "$recorded_refresh_id" ] \
+     && [ "$recorded_refresh_lt" = "$target_refresh_lt" ]; then
+    recorded_refresh_status="$(aws_ autoscaling describe-instance-refreshes \
+      --auto-scaling-group-name "$ASG" --instance-refresh-ids "$recorded_refresh_id" \
+      --query 'InstanceRefreshes[0].Status' --output text 2>/dev/null)" || recorded_refresh_status=""
+    case "$recorded_refresh_status" in
+      Successful)
+        say "SKIP refresh: $recorded_refresh_id already completed onto LT v${target_refresh_lt}"
+        echo "   NEXT: bash lib/apply-restorepatch.sh verify --env \"$ENVJSON\" --kit \"$KITDIR\""
+        exit 0
+        ;;
+      Pending|InProgress|Cancelling|RollbackInProgress)
+        die "refresh refused: $recorded_refresh_id is still $recorded_refresh_status for this LT version; wait for it to finish instead of starting a second one"
+        ;;
+      Failed|Cancelled|RollbackFailed|RollbackSuccessful)
+        say "previous refresh $recorded_refresh_id ended $recorded_refresh_status; a retry is allowed"
+        ;;
+      ""|None)
+        say "previous refresh $recorded_refresh_id is no longer queryable; deciding from the fleet instead"
+        ;;
+    esac
   fi
   # The recorded verdict can be absent (older state, or a run that died after the refresh finished),
   # so also ask the ASG: is every instance already on the target launch-template version?
@@ -2210,7 +2240,6 @@ refresh)
   done
   if [ -n "$fleet_lt_versions" ] && [ "$fleet_off_target" -eq 0 ]; then
     say "SKIP refresh: every instance in $ASG already runs LT v${target_refresh_lt}"
-    state_put refresh_completed_lt_version "$target_refresh_lt"
     echo "   NEXT: bash lib/apply-restorepatch.sh verify --env \"$ENVJSON\" --kit \"$KITDIR\""
     exit 0
   fi
@@ -2238,10 +2267,10 @@ refresh)
     --preferences '{"MinHealthyPercentage":100,"MaxHealthyPercentage":100,"InstanceWarmup":900,"SkipMatching":false}' \
     --query InstanceRefreshId --output text)" || die "cannot start instance refresh"
   state_put instance_refresh_id "$refresh_id"
-  # Record the intent now: if this run dies while the refresh is still in flight, the next run must
-  # not start a second one. verify reads the live progress, so a partially-done refresh is still
-  # visible there rather than being hidden by this record.
-  state_put refresh_completed_lt_version "$target_refresh_lt"
+  # Record the ATTEMPT, not a completion. The next run resolves this id's real status through
+  # describe-instance-refreshes, so an in-flight refresh blocks a second one while a failed or
+  # cancelled one stays retryable.
+  state_put refresh_pending_lt_version "$target_refresh_lt"
   say "controlled instance refresh started: $refresh_id"
   echo "   NEXT: bash lib/apply-restorepatch.sh verify --env \"$ENVJSON\" --kit \"$KITDIR\""
   ;;

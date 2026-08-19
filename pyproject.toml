@@ -31,6 +31,7 @@ packages = []
 
 [tool.pytest.ini_options]
 # pytest>=7 内置;裸 `pytest` 不会把 rootdir 放进 sys.path,而 tests/conftest.py 走
+# `import tests._realclock` 这种包导入,不加这行整批测试会在 setup 阶段全 ERROR(#498)。
 # CI 用 `python3 -m pytest`(自带 cwd 在 sys.path)所以一直没暴露;这行对 CI 是 no-op。
 pythonpath = ["."]
 testpaths = ["tests", ".claude/skills/claw-patch-skill/test"]
@@ -39,3 +40,8 @@ markers = [
     "e2e: End-to-end tests (real AWS resources, slow)",
     "regression: Regression tests (verify existing features)",
 ]
+
+[tool.bandit]
+# Agent tooling and engineering evidence are reviewed by their own workflows;
+# Probe and the repository mechanical gate scan shipped application code.
+exclude_dirs = [".claude", "engineering"]

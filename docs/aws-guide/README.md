@@ -30,6 +30,7 @@
 | [Host 脚本、镜像与配置边界](16-hot-swap-vs-baked-and-host-rebuild.md)          | 生效矩阵、host 重建与诊断性热补                                |
 | [17 可观测性运维手册](17-observability-ops.md)                                | 部署后维护：三层可观测性巡检、容量、告警、排查路径             |
 | [18 Host/Edge S3 user-hook](18-s3-user-hooks.md)                             | 客户扩展脚本契约、安全边界、发布与排障                         |
+| [19 配置参数基线对照表](19-config-parameter-baseline.md)                      | 控制面/数据面每参数：意义·当前默认·曾经默认·生产实际·10 万推荐值 |
 
 `00-quickstart-and-runbook.md`、`06-customer-deploy-and-teardown.md` 与
 `API-接入手册.md` 是独立 source-only 手册，不重复装订进 PDF。PDF 按
@@ -41,6 +42,7 @@
 - **新手快速上手**：[00 快速上手](00-quickstart-and-runbook.md) → [15 镜像构建入门](15-image-build-getting-started.md) → [05 部署解决方案](05-deploy-use-troubleshoot.md)
 - **API 对接方**：[01 解决方案概述](01-overview.md) → [09 控制面 API 对接](09-api-integration.md) → [06 开发人员指南](06-developer-guide.md)
 - **生产运维**：[11 组件运维手册](11-ops-maintenance.md) → [17 可观测性运维手册](17-observability-ops.md) → [12 API Gateway 加固](12-private-api-hardening.md) → [13 数据面两级路由](13-data-plane-redesign.md) → [14 十万级规模化](14-scale-100k.md)
+- **规模化配置定值**：[19 配置参数基线对照表](19-config-parameter-baseline.md) → [14 十万级规模化](14-scale-100k.md) → [16 生效矩阵](16-hot-swap-vs-baked-and-host-rebuild.md)
 
 ## 权威数字与工程知识源
 

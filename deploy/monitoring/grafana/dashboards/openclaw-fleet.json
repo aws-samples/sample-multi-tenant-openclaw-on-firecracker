@@ -1,7 +1,7 @@
 {
   "annotations": { "list": [] },
   "editable": true,
-  "description": "OpenClaw-on-Firecracker microVM fleet runtime metrics. All panels use the 7 gauges host-agent.py actually exports on :8899/metrics (openclaw_vm_*). 'VM count' / 'healthy nodes' are derived by count()/sum() over the per-tenant series since host-agent emits no standalone count metric. Per-host grouping uses the 'instance' label injected by Prometheus ec2_sd relabel (host-agent itself emits only a 'tenant' label).",
+  "description": "OpenClaw-on-Firecracker microVM fleet runtime metrics. VM ping and gateway HTTP are independent truth sources: openclaw_vm_health records ICMP reachability, while openclaw_app_health records whether the gateway answered HTTP. They are counted separately, and gateway health is never derived from ping. Per-host grouping uses the 'instance' label injected by Prometheus ec2_sd relabel (host-agent itself emits only a 'tenant' label).",
   "graphTooltip": 1,
   "panels": [
     {
@@ -358,6 +358,13 @@
           "refId": "HEALTH",
           "format": "table",
           "instant": true
+        },
+        {
+          "expr": "openclaw_app_health{instance=~\"$instance\"}",
+          "legendFormat": "",
+          "refId": "APP",
+          "format": "table",
+          "instant": true
         }
       ],
       "transformations": [
@@ -376,9 +383,111 @@
               "Value #MEM": "mem_used_mb",
               "Value #DISK": "disk_used_pct",
               "Value #CPU": "cpu_pct",
-              "Value #HEALTH": "health"
+              "Value #HEALTH": "health",
+              "Value #APP": "app_health"
             }
           }
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "title": "健康 Gateway 数 (app_health=1)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 39 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "sum(openclaw_app_health{instance=~\"$instance\"})",
+          "legendFormat": "healthy",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "title": "不健康 Gateway 数 (app_health=0)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 39 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "count(openclaw_app_health{instance=~\"$instance\"}) - sum(openclaw_app_health{instance=~\"$instance\"})",
+          "legendFormat": "unhealthy",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "title": "每台 host 不健康 Gateway 数",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 39 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "fillOpacity": 10 },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": ["lastNotNull"]
+        },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "expr": "count(openclaw_app_health{instance=~\"$instance\"}) by (instance) - sum(openclaw_app_health{instance=~\"$instance\"}) by (instance)",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
         }
       ]
     }

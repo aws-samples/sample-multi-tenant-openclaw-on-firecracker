@@ -624,11 +624,20 @@ def cleanup_terminated_host(event):
 
 
     # Delete host
+    # 且第二次写可独立失败。next_vm_num 刻意保留单调值,它是物理 tap 防复用的权威,
+    # 清零会让仍可能被引用的 tap 号重新发出。
     hosts_table.update_item(
         Key={"instance_id": instance_id},
-        UpdateExpression="SET #s = :s, updated_at = :t",
+        UpdateExpression=(
+            "SET #s = :s, updated_at = :t, used_vcpu = :zero, "
+            "used_mem_mb = :zero, vm_count = :zero"
+        ),
         ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":s": "deleted", ":t": _now()},
+        ExpressionAttributeValues={
+            ":s": "deleted",
+            ":t": _now(),
+            ":zero": 0,
+        },
     )
     print(f"cleaned up host {instance_id}, {len(tenants)} tenants processed")
 
@@ -656,21 +665,43 @@ def rootfs_drift():
     """GET /hosts/rootfs-drift — which tenants are NOT on the current rootfs.
 
     Phase 4: the rolling-upgrade companion to refresh_rootfs + the `rebuild`
-    action. refresh_rootfs stages the new image on hosts; `rebuild` adopts it
-    per-tenant; this endpoint shows WHO still needs rebuilding (their
-    rootfs_version != the manifest's current version), so an operator can drive
-    a rolling upgrade to completion instead of guessing. Pure read.
+    action. Shows WHO still needs converging, so an operator can drive a rolling
+    upgrade to completion instead of guessing. Pure read.
 
-    #517 阶段2 —— 加 immutable(只读身份盘)维度:同一次 scan 里并列算出哪些租户的
-    immutable_version 未到当前镜像版本,给「换 md → refresh-rootfs → 滚动 restart/reset」
-    这条身份更新链一个可判定的完成度视图(解锁 §5.4 G3 滚动编排)。加法式,rootfs 字段不变。
+    #534 —— 基线改为 PER-HOST:一个租户是否 up_to_date = 它的 rootfs_version 是否等于【它所在
+    host 的 rootfs_version】(host 侧该值恒等于其 image_slots.live 的 label)。不再与全局
+    manifest.version 比 —— canary promote 是单 host、不动全局 manifest,用全局比会把已在跑
+    promoted 新版的 host 误判。current_version 仍在响应里返全局 manifest.version 供参考。
+
+    #517 阶段2 —— immutable(只读身份盘)维度并列判定,同样 per-host(比该租户 host 的
+    immutable_version);host 无只读盘版本则该租户此维度 N/A。rootfs 字段加法式不破坏。
     """
     manifest = _get_manifest()
-    current = manifest.get("version", "unknown")
-    # #517 阶段2 —— 当前黄金镜像点名了 immutable 盘时,其目标版本同源 manifest.version
-    # (与阶段1 _select_pull_files 的 immutable_version 派生一致);未点名(可选盘)则当前镜像
-    # 无只读盘 → imm_current="",该维度整体 N/A(不把租户空/旧值误报成 stale)。
+    current = manifest.get("version", "unknown")  # 全局 manifest 版本,仅作参考展示(#534:基线改 per-host)
     imm_current = current if manifest.get("immutable") else ""
+    # #534 —— 基线改为【每 host 的 live 版本】:租户是否 up_to_date = 它的 rootfs_version 是否等于
+    # 【它所在 host 的 rootfs_version】(该值恒等于 host image_slots.live 的 label);不再与全局
+    # manifest.version 比(canary promote 是单 host、不动全局 manifest,用全局比会误判)。
+    # 先建 host 版本映射(翻页,跳过 deleted / __ 内部行),租户循环按 host_id 查各自基线。
+    host_rootfs, host_immutable = {}, {}
+    _hkw = {
+        "ProjectionExpression": "instance_id, rootfs_version, immutable_version, #s",
+        "ExpressionAttributeNames": {"#s": "status"},
+    }
+    _hstart = None
+    while True:
+        if _hstart:
+            _hkw["ExclusiveStartKey"] = _hstart
+        _hout = hosts_table.scan(**_hkw)
+        for h in _hout.get("Items", []):
+            hid = h.get("instance_id")
+            if not hid or str(hid).startswith("__") or h.get("status") == "deleted":
+                continue
+            host_rootfs[hid] = h.get("rootfs_version", "")
+            host_immutable[hid] = h.get("immutable_version", "")
+        _hstart = _hout.get("LastEvaluatedKey")
+        if not _hstart:
+            break
     # Page the tenants table; only non-deleted tenant rows matter for upgrade
     # drift. The table also stores idem# rows without status and activename#
     # rows with status but without tenant capacity fields.
@@ -689,30 +720,37 @@ def rootfs_drift():
             scan_kwargs["ExclusiveStartKey"] = start_key
         out = tenants_table.scan(**scan_kwargs)
         for t in out.get("Items", []):
+            hid = t.get("host_id")
+            base = host_rootfs.get(hid, "")  # #534 —— 该租户 host 的 live label(per-host 基线)
             v = t.get("rootfs_version", "")
-            if not v:
+            # 租户或其 host 基线缺失 → unknown(判不了);两者齐备且相等 → up_to_date;否则 stale。
+            if not v or not base:
                 unknown += 1
-                unknown_tenants.append({"id": t["id"], "host_id": t.get("host_id")})
-            elif v == current:
+                unknown_tenants.append(
+                    {"id": t["id"], "host_id": hid, "rootfs_version": v,
+                     "host_rootfs_version": base}
+                )
+            elif v == base:
                 up_to_date += 1
             else:
                 stale.append(
-                    {"id": t["id"], "rootfs_version": v, "host_id": t.get("host_id")}
+                    {"id": t["id"], "rootfs_version": v, "host_id": hid,
+                     "host_rootfs_version": base}
                 )
-            # #517 阶段2 —— immutable 维度只在当前镜像确实带只读盘(imm_current 非空)时分类,
-            # 否则整批不计(N/A),避免把「本就没只读盘」误报成需要升级。
-            if imm_current:
+            # #534 —— immutable 维度也按 per-host:N/A 与否看【该租户 host 的 immutable_version】
+            # 是否非空(host 无只读盘版本 → 该租户此维度 N/A,不计),而非全局 manifest.immutable。
+            ibase = host_immutable.get(hid, "")
+            if ibase:
                 iv = t.get("immutable_version", "")
                 if not iv:
                     imm_unknown += 1
-                    imm_unknown_tenants.append(
-                        {"id": t["id"], "host_id": t.get("host_id")}
-                    )
-                elif iv == imm_current:
+                    imm_unknown_tenants.append({"id": t["id"], "host_id": hid})
+                elif iv == ibase:
                     imm_up_to_date += 1
                 else:
                     imm_stale.append(
-                        {"id": t["id"], "immutable_version": iv, "host_id": t.get("host_id")}
+                        {"id": t["id"], "immutable_version": iv, "host_id": hid,
+                         "host_immutable_version": ibase}
                     )
         start_key = out.get("LastEvaluatedKey")
         if not start_key:
@@ -720,14 +758,14 @@ def rootfs_drift():
     return _resp(
         200,
         {
-            "current_version": current,
+            "current_version": current,  # 全局 manifest.version,仅供参考(基线是 per-host)
+            "baseline": "per-host-live",  # #534 —— 口径标注:每租户比其 host 的 live label
             "up_to_date": up_to_date,
             "unknown": unknown,
             "unknown_tenants": unknown_tenants,
             "stale_count": len(stale),
             "stale": stale,
-            # #517 阶段2 —— immutable 维度(加法式,与 rootfs 字段并列不互斥)。
-            # immutable_current_version="" 表示当前镜像无只读盘 → 该维度 N/A,计数恒 0、列表空。
+            # immutable 维度(加法式,per-host);immutable_current_version 仅参考(全局)。
             "immutable_current_version": imm_current,
             "immutable_up_to_date": imm_up_to_date,
             "immutable_unknown": imm_unknown,
@@ -2132,6 +2170,15 @@ def create_image_snapshot(body):
                         "label must match [A-Za-z0-9._-]{1,128}")
     else:
         label = _get_manifest().get("version", "")  # 缺省派生 rootfs 版本(读不到 → "")
+        # #534 —— 保证每个快照都有一个版本 label(label 作版本坐标的前提)。既没传 label、又从
+        # manifest.version 派生不出 → fail-loud 拒建,不再静默造一个无 label 的快照(否则它进不了
+        # rootfs_version 坐标体系、drift/展示都看不到版本)。调用方可显式传 label 绕过。
+        if not label:
+            return _err(
+                400, "NO_SNAPSHOT_LABEL",
+                "cannot derive snapshot label: manifest.json has no 'version' and no label was "
+                "provided — pass an explicit label or fix manifest.json",
+            )
 
     files = _scan_deployment_files(bucket)
     if not files:

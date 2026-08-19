@@ -39,6 +39,8 @@ host:
   arch: arm64 # 生产基线 = arm64(Graviton metal 原生 KVM)
   instance_type: r8g.metal-24xl # 96 vCPU / 768GB,承载数百租户/台
   data_volume_gb: 900 # 380 VM/台的磁盘硬前提(重载余量,靠 sparse 不全占)
+  data_volume_iops: 8000 # #424 apse1 实测突发外推 380VM≈7500,8000 覆盖;每 +1000=+$5/卷·月
+  data_volume_throughput: 500 # #424 边际效益拐点(4× 基线),覆盖真实并发 backup/restore;每 +125=+$5/卷·月
   root_volume_gb: 20
   reserved_vcpu: 2 # 预留给 host-agent/系统的 vCPU
   reserved_mem_mb: 2048 # 预留给 host-agent/系统的内存

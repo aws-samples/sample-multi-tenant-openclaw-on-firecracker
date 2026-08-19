@@ -13,6 +13,8 @@ host:
   arch: arm64
   instance_type: r8g.metal-24xl
   data_volume_gb: 900
+  data_volume_iops: 8000 # #424 gp3 IOPS(上限锁 8000);缺省即 8000
+  data_volume_throughput: 500 # #424 gp3 吞吐 MiB/s(实测最优,边际拐点);缺省即 500
   cpu_overcommit_ratio: 6.0
   mem_overcommit_ratio: 1.5
   subnet_ids: ["subnet-0aaa1111hostaz1", "subnet-0bbb2222hostaz2"]

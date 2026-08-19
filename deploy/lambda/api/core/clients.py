@@ -297,6 +297,25 @@ DISPATCH_UNPLACED_DELAY_BASE_SEC = int(
     os.environ.get("DISPATCH_UNPLACED_DELAY_BASE_SEC", "15") or "15"
 )
 
+# #522 P1-2 —— host 升级(refresh-rootfs/pull-image)期间被排除出装箱候选(_snapshot_hosts
+# 只扫 active/idle)。此时新建租户找不到位子=unplaced,旧逻辑无差别烧 dispatch_retries →
+# 超预算转终态 requires_intervention,host 升级完回 active/idle 后不自愈。此宽限秒数内(以
+# host.upgrading_at 距今计),若 fleet 存在【新鲜】升级中的 host,则本轮 unplaced 视作瞬态,
+# 走 no-budget 重投(不计预算、不缩 visibility),等升级完成再落位。升级卡死超过此值 → 退回
+# 计预算行为,最终 requires_intervention(fail-loud,卡死升级是运维问题)。<=0 关此宽限。
+DISPATCH_UPGRADE_GRACE_SEC = int(
+    os.environ.get("DISPATCH_UPGRADE_GRACE_SEC", "900") or "900"
+)
+
+# #522 P1-2 收敛 backstop —— 必须与 dispatch 队列的 dlq_max_receive_count(dispatch_infra.py,
+# 默认 3)保持一致。升级宽限走 no-budget 重投(不计 dispatch_retries),会让 SQS receiveCount 与
+# dispatch_retries 脱钩:到消息进 DLQ 时 retries 可能 < DISPATCH_RETRY_BUDGET → 认领闸/release 的
+# `>= budget` 终态标记打不出 → 租户永久卡 creating(消息静默进 DLQ)。故按【SQS 投递耗尽】
+# (ApproximateReceiveCount >= 此值)直接收敛 requires_intervention(loud),不让宽限掩盖卡死。
+DISPATCH_MAX_RECEIVE_COUNT = int(
+    os.environ.get("DISPATCH_MAX_RECEIVE_COUNT", "3") or "3"
+)
+
 # 认领标记的死锁回收阈值:claim 打上后消费中途炸批,消息重投时旧 claim 超过
 # 该秒数即视为残留可接管(Powertools INPROGRESS 超时释放同款语义)。必须明显
 # 大于单次消费 Lambda 的最长执行时间,防止把"还在干活的赢家"的 claim 抢走。

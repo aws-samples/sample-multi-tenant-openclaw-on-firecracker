@@ -33,6 +33,17 @@ components:
       bearerFormat: JWT
       description: Cognito id_token (RS256, JWKS-verified in Lambda).
   schemas:
+    ErrorResponse:
+      type: object
+      required:
+        - error
+        - code
+      properties:
+        error:
+          type: string
+        code:
+          type: string
+      additionalProperties: true
     TenantRecord:
       type: object
       description: |
@@ -238,6 +249,18 @@ components:
           type: string
         rootfs_version:
           type: string
+        immutable_version:
+          type: string
+          description: '#517/#533 — read-only identity/authority-disk version staged on this host. POST /hosts/refresh-rootfs writes it from the host only after all requested disk operations succeed; absent when the manifest has no immutable disk or on older unknown rows.'
+        is_tainted:
+          type: boolean
+          description: '#539 — cordon (NoSchedule) intent, orthogonal to status. Always present on the list response: the store only ever writes true and REMOVEs on untaint, so the response layer normalizes the "false / attribute-absent" pair to an explicit false. Only a real DynamoDB BOOL true counts as tainted (any other value fails open). Placement policy, not a cross-tenant security boundary. Owned exclusively by the taint API — self-register, POST /hosts, host-agent heartbeat, scaler and health_check must never create, overwrite or delete it.'
+        tainted_at:
+          type: integer
+          description: '#539 — epoch seconds when the taint was recorded. Present only when is_tainted is true.'
+        tainted_reason:
+          type: string
+          description: '#539 — operator-supplied non-empty reason. Present only when is_tainted is true. The tainted_by audit field is intentionally NOT surfaced on the list response.'
         cpu_overcommit_ratio:
           type:
             - string
@@ -829,6 +852,9 @@ paths:
                     type: string
                   rootfs_version:
                     type: string
+                  immutable_version:
+                    type: string
+                    description: '#517 — read-only identity-disk version this tenant is running. Stamped at creation; on reset / verified-rebuild (from the resolved snapshot); and on restart/start for UNPINNED (live-channel) tenants (from the host current value, so the coordinate converges after refresh-rootfs + restart). Pinned/canary tenants keep their pinned coordinate on restart/start (their disk comes from the pinned snapshot, not host live). Empty until the first such event after the field existed.'
                   config_template:
                     type: string
                   tags:
@@ -1494,6 +1520,9 @@ paths:
                         description: Null unless a resize-disk action persisted it (create never writes it).
                       rootfs_version:
                         type: string
+                      immutable_version:
+                        type: string
+                        description: '#517 — read-only identity-disk version this tenant is running. Stamped at creation; on reset / verified-rebuild (resolved snapshot); and on restart/start for UNPINNED (live-channel) tenants (host current value, so it converges after refresh-rootfs + restart). Pinned/canary tenants keep their pinned coordinate on restart/start. Independent of rootfs_version.'
                       effective_skills:
                         oneOf:
                           - type: string
@@ -2258,6 +2287,10 @@ paths:
                       type: string
                       description: Rootfs manifest version staged on this host (set by POST /hosts/refresh-rootfs).
                       x-source: deploy/lambda/api/services/host_service.py:391
+                    immutable_version:
+                      type: string
+                      description: '#517/#533 — read-only identity/authority-disk version staged on this host. POST /hosts/refresh-rootfs writes it from the host only after all requested disk operations succeed; absent when the manifest has no immutable disk or on older unknown rows.'
+                      x-source: deploy/lambda/api/services/host_service.py:refresh_rootfs
                     image_slots:
                       type: object
                       description: >-
@@ -2291,6 +2324,27 @@ paths:
                         - 'null'
                       format: date-time
                       description: ISO-8601 UTC of the last control-plane health probe against this host. Verified present in live ap-southeast-1 response 2026-07-07.
+                    is_tainted:
+                      type: boolean
+                      description: >-
+                        #539 — cordon (NoSchedule) intent, orthogonal to the lifecycle status (a tainted
+                        host can still be active). ALWAYS present on this response: the store only ever
+                        writes true and REMOVEs the attributes on untaint, so the response layer
+                        normalizes the "false / attribute-absent" pair to an explicit false. Only a real
+                        DynamoDB BOOL true counts as tainted; any other value fails open so an illegal
+                        write cannot take a whole host out of service. Placement policy, not a
+                        cross-tenant security boundary.
+                      x-source: deploy/lambda/api/core/host_taint.py:public_view
+                    tainted_at:
+                      type: integer
+                      description: Epoch seconds when the taint was recorded. Present only when is_tainted is true.
+                      x-source: deploy/lambda/api/services/host_service.py:taint_host
+                    tainted_reason:
+                      type: string
+                      description: >-
+                        Operator-supplied non-empty reason. Present only when is_tainted is true. The
+                        tainted_by audit field is intentionally NOT surfaced on this response.
+                      x-source: deploy/lambda/api/core/host_taint.py:public_view
         '403':
           description: RBAC denied (viewer role required when RBAC_ENABLED).
           content:
@@ -2404,6 +2458,146 @@ paths:
                 x-source: deploy/lambda/api/services/host_service.py:153
         '403':
           description: RBAC denied (operator+ required when RBAC_ENABLED).
+      tags:
+        - 主机与镜像
+  /hosts/{instance_id}/taint:
+    post:
+      operationId: taintHost
+      summary: 给宿主机打 cordon 污点(NoSchedule 运维意图)
+      description: >-
+        #539 写侧 — Idempotently records a cordon (NoSchedule) intent on the host row. Does NOT touch the
+        running instance, its existing tenants, or the lifecycle status; it only marks the host. Reads the
+        row with a consistent read; when already tainted it returns 200 with already_tainted=true and does
+        NOT overwrite the original tainted_at / tainted_reason / tainted_by. reason is required and must be
+        a non-empty string. The caller identity (x-api-key owner or Cognito owner_id, else "unknown") is
+        recorded as tainted_by for audit only.
+        NOTE — the taint does not yet affect placement: the scheduler exclusion is the read side (#540).
+        Until that lands, this endpoint returning 200 must NOT be presented to operators or customers as
+        "cordon works" — new tenants can still be placed on a tainted host.
+      x-source: deploy/lambda/api/services/host_service.py:taint_host
+      x-rbac: operator
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - reason
+              properties:
+                reason:
+                  type: string
+                  description: Non-empty operator reason for cordoning this host. Missing/blank returns 400.
+      responses:
+        '200':
+          description: Taint recorded, or already tainted (idempotent replay).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  instance_id:
+                    type: string
+                  is_tainted:
+                    type: boolean
+                    enum:
+                      - true
+                  tainted_at:
+                    type: integer
+                    description: Epoch seconds. On an already_tainted replay this is the ORIGINAL taint time, not now.
+                  tainted_reason:
+                    type: string
+                  tainted_by:
+                    type: string
+                    description: Present only on the already_tainted replay (echoes the original actor).
+                  already_tainted:
+                    type: boolean
+                    description: Present and true when the host was already tainted.
+                x-source: deploy/lambda/api/services/host_service.py:taint_host
+        '400':
+          description: Body is not valid JSON / not an object, or reason is missing or blank.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - VALIDATION
+        '403':
+          description: RBAC denied (operator+ required when RBAC_ENABLED).
+        '404':
+          description: No host row for this instance_id.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - NOT_FOUND
+      tags:
+        - 主机与镜像
+    delete:
+      operationId: untaintHost
+      summary: 清除宿主机的 cordon 污点
+      description: >-
+        #539 写侧 — Removes the cordon intent. Only ever REMOVEs the taint attributes; it never persists
+        is_tainted=false, so "schedulable" has exactly one stored representation (attribute absent).
+        Idempotent: an already-untainted host returns 200 with already_untainted=true.
+      x-source: deploy/lambda/api/services/host_service.py:untaint_host
+      x-rbac: operator
+      parameters:
+        - name: instance_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Taint removed, or already untainted (idempotent replay).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  instance_id:
+                    type: string
+                  is_tainted:
+                    type: boolean
+                    enum:
+                      - false
+                  already_untainted:
+                    type: boolean
+                    description: Present and true when the host was not tainted.
+                x-source: deploy/lambda/api/services/host_service.py:untaint_host
+        '403':
+          description: RBAC denied (operator+ required when RBAC_ENABLED).
+        '404':
+          description: No host row for this instance_id.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum:
+                      - NOT_FOUND
       tags:
         - 主机与镜像
   /hosts/{instance_id}/pull-image:
@@ -3093,7 +3287,7 @@ paths:
     post:
       operationId: refreshRootfs
       summary: 把当前黄金镜像预热到所有活跃/空闲宿主机
-      description: 'Reads manifest.json from S3, then dispatches ONE SSM RunShellScript command to every active/idle host to download and decompress the rootfs, data-template and (if present) immutable images. Fire-and-forget: returns as soon as the SSM command is sent, and optimistically stamps rootfs_version on each host row. No request body.'
+      description: 'Reads manifest.json from S3, then dispatches ONE SSM RunShellScript command to every active/idle host. Fire-and-forget: the API returns as soon as SSM accepts the command. On each host the command serializes with image pulls, verifies the manifest is still the dispatched version, stages rootfs/data-template/optional immutable through temporary files, then writes rootfs_version and immutable_version to the host row only after disk completion. If the manifest omits immutable, the successful host commit removes both the stale flat disk and immutable_version. No request body.'
       x-source: deploy/lambda/api/services/host_service.py:321
       x-rbac: operator
       responses:
@@ -3113,6 +3307,9 @@ paths:
                       version:
                         type: string
                         description: Manifest version being staged.
+                      immutable_version:
+                        type: string
+                        description: Target immutable version (same as version), or an empty string when the manifest omits the immutable disk. This reports dispatch intent, not per-host completion.
                       hosts:
                         type: array
                         items:
@@ -3167,12 +3364,220 @@ paths:
           description: RBAC denied (viewer required when RBAC_ENABLED).
       tags:
         - 主机与镜像
+  /hosts/rolling-upgrade:
+    post:
+      operationId: submitRollingUpgrade
+      summary: 提交有界、漂移门控的滚动镜像/身份升级
+      description: |
+        Creates an asynchronous rolling job. The target rootfs/immutable
+        coordinates are frozen from each selected tenant's host live
+        coordinates at submission time. The worker acts only on still-drifted
+        tenants through the existing restart/rebuild action, waits for both
+        coordinates after each batch, and stops when batch failures exceed
+        max_batch_failures. Overlapping active scopes are rejected.
+      x-source: deploy/lambda/api/services/rolling_upgrade_service.py:submit_rolling_upgrade
+      x-rbac: operator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - scope
+                - action
+                - client_token
+              properties:
+                scope:
+                  description: |
+                    "fleet", {"host_id":"i-..."}, or
+                    {"tenant_ids":["tenant-a","tenant-b"]}.
+                  oneOf:
+                    - type: string
+                      enum: [fleet]
+                    - type: object
+                      additionalProperties: false
+                      required: [host_id]
+                      properties:
+                        host_id:
+                          type: string
+                          minLength: 1
+                    - type: object
+                      additionalProperties: false
+                      required: [tenant_ids]
+                      properties:
+                        tenant_ids:
+                          type: array
+                          minItems: 1
+                          maxItems: 2000
+                          uniqueItems: true
+                          items:
+                            type: string
+                            minLength: 1
+                action:
+                  type: string
+                  enum: [restart, rebuild]
+                  description: |
+                    restart preserves overlay.ext4 and is only suitable for
+                    immutable identity-disk adoption when rootfs is already at
+                    the target; use rebuild for rootfs adoption. rebuild retains
+                    its existing admin-only admission and forced backup.
+                batch_size:
+                  type: integer
+                  minimum: 1
+                  maximum: 25
+                  default: 1
+                max_batch_failures:
+                  type: integer
+                  minimum: 0
+                  default: 0
+                  description: Must be less than batch_size.
+                target_version:
+                  type: string
+                  description: Optional precondition requiring every selected host live rootfs label to match.
+                client_token:
+                  type: string
+                  minLength: 4
+                  maxLength: 128
+                  pattern: '^[!-~]{4,128}$'
+                  description: Required idempotency token scoped to caller identity/platform.
+      responses:
+        '202':
+          description: Job accepted, or an idempotent replay found the same job.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [job_id, status, total]
+                properties:
+                  job_id:
+                    type: string
+                  status:
+                    type: string
+                    enum: [queued, running, dispatch_unknown, dispatch_failed, done, stopped]
+                  total:
+                    type: integer
+                  idempotent_replay:
+                    type: boolean
+        '400':
+          description: Invalid action, scope, bounds, or empty/oversized selection.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Non-admin requested rebuild or RBAC denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: An explicitly selected tenant does not exist or is outside caller scope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Missing host version coordinate, target mismatch, submit contention, or overlapping active job.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Ledger/dependency unavailable, or async dispatch acknowledgement is unknown. Retry with the same client_token.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ErrorResponse'
+                  - type: object
+                    properties:
+                      job_id:
+                        type: string
+      tags:
+        - 主机与镜像
+  /hosts/rolling-jobs/{job_id}:
+    get:
+      operationId: getRollingUpgradeJob
+      summary: 查询滚动升级任务进度
+      description: |
+        Returns bounded rolling progress without the raw target list. A viewer
+        must still match the job's captured owner/platform scope; an unscoped
+        admin may inspect all jobs.
+      x-source: deploy/lambda/api/services/rolling_upgrade_service.py:get_rolling_job
+      x-rbac: viewer
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Rolling job progress.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id:
+                    type: string
+                  action:
+                    type: string
+                    enum: [restart, rebuild]
+                  scope:
+                    type: string
+                    enum: [fleet, host_id, tenant_ids]
+                  status:
+                    type: string
+                    enum: [queued, running, dispatch_unknown, dispatch_failed, done, stopped]
+                  total:
+                    type: integer
+                  done:
+                    type: integer
+                  current_batch:
+                    type: array
+                    items:
+                      type: string
+                  succeeded:
+                    type: array
+                    items:
+                      type: object
+                  failed:
+                    type: array
+                    items:
+                      type: object
+                  created_at:
+                    type: string
+                  updated_at:
+                    type: string
+        '403':
+          description: Job belongs to another owner/platform scope.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Rolling job not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Rolling-job ledger is not configured or temporarily unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      tags:
+        - 主机与镜像
   /hosts/rootfs-drift:
     get:
       operationId: getRootfsDrift
       summary: 哪些租户还没升到当前镜像版本
-      description: Rolling-upgrade companion. Pages the whole tenants table (non-deleted) and buckets each tenant by comparing its rootfs_version to the current manifest version. Pure read.
-      x-source: deploy/lambda/api/services/host_service.py:203
+      description: 'Rolling-upgrade companion. Pages the whole tenants table (non-deleted) and buckets each tenant by comparing its rootfs_version to the current manifest version. #517 stage 2 adds a parallel immutable (read-only identity disk) dimension in the same scan. Pure read.'
+      x-source: deploy/lambda/api/services/host_service.py:587
       x-rbac: viewer
       responses:
         '200':
@@ -3189,6 +3594,18 @@ paths:
                   unknown:
                     type: integer
                     description: Tenants with no rootfs_version attribute.
+                  unknown_tenants:
+                    type: array
+                    description: '#533 — tenants counted by unknown, exposed so rolling orchestration can target existing rows with no rootfs coordinate.'
+                    items:
+                      type: object
+                      required:
+                        - id
+                      properties:
+                        id:
+                          type: string
+                        host_id:
+                          type: string
                   stale_count:
                     type: integer
                   stale:
@@ -3202,7 +3619,42 @@ paths:
                           type: string
                         host_id:
                           type: string
-                x-source: deploy/lambda/api/services/host_service.py:239
+                  immutable_current_version:
+                    type: string
+                    description: '#517 stage 2 — target immutable (read-only identity disk) version = manifest.version when the current golden image names an immutable disk; empty string when the current image has no immutable disk, in which case the immutable dimension is N/A (counts 0, list empty).'
+                  immutable_up_to_date:
+                    type: integer
+                    description: '#517 stage 2 — tenants whose immutable_version == immutable_current_version.'
+                  immutable_unknown:
+                    type: integer
+                    description: '#517 stage 2 — tenants with no immutable_version attribute (only counted when immutable_current_version is non-empty).'
+                  immutable_unknown_tenants:
+                    type: array
+                    description: '#533 — tenants counted by immutable_unknown, exposed so rolling orchestration can target and converge them. Empty when the immutable dimension is N/A.'
+                    items:
+                      type: object
+                      required:
+                        - id
+                      properties:
+                        id:
+                          type: string
+                        host_id:
+                          type: string
+                  immutable_stale_count:
+                    type: integer
+                  immutable_stale:
+                    type: array
+                    description: '#517 stage 2 — tenants whose immutable_version differs from the current immutable version.'
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        immutable_version:
+                          type: string
+                        host_id:
+                          type: string
+                x-source: deploy/lambda/api/services/host_service.py:623
         '403':
           description: RBAC denied (viewer required when RBAC_ENABLED).
       tags:

@@ -1,0 +1,41 @@
+[project]
+name = "sample-multi-tenant-openclaw-on-firecracker"
+version = "1.5.5"
+requires-python = ">=3.12"
+dependencies = [
+    "aws-cdk-lib>=2.253.0",
+    "aws-cdk.aws-bedrock-agentcore-alpha==2.251.0a0",
+    "constructs>=10.0.0",
+    "pyyaml>=6.0",
+    # deploy-time (NOT test): scripts/deploy-cdk.sh runs an unconditional preflight
+    # (import boto3, yaml) before CDK; the setup.sh .venv only installs [project]
+    # dependencies, so boto3 must live here or one-click deploy dies before CDK.
+    "boto3>=1.34.0",
+]
+
+[dependency-groups]
+# 1.5.0: pyjwt + cryptography let the offline RBAC tests import the same
+# JWT verification path the Lambda uses (sign a test RS256 token, assert the
+# handler verifies/rejects it). The Lambda gets these via CDK bundling
+# (deploy/lambda/api/requirements.txt), not from this group.
+# pytest-highrisk.sh's dependency self-check is fail-closed, so a missing
+# aws_lambda_powertools import fails the high-risk gate instead of silently skipping it.
+test = ["pytest", "moto", "boto3", "hypothesis", "jsonschema>=4.23.0", "pyjwt>=2.8.0", "cryptography>=42.0.0", "aws-lambda-powertools>=2.40.0"]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = []
+
+[tool.pytest.ini_options]
+# pytest>=7 内置;裸 `pytest` 不会把 rootdir 放进 sys.path,而 tests/conftest.py 走
+# CI 用 `python3 -m pytest`(自带 cwd 在 sys.path)所以一直没暴露;这行对 CI 是 no-op。
+pythonpath = ["."]
+testpaths = ["tests", ".claude/skills/claw-patch-skill/test"]
+markers = [
+    "unit: Unit tests (mock AWS, fast)",
+    "e2e: End-to-end tests (real AWS resources, slow)",
+    "regression: Regression tests (verify existing features)",
+]

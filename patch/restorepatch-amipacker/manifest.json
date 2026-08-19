@@ -9069,25 +9069,22 @@
     },
     "pyproject.toml": {
       "change": "M",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
+      "layer": "deploy-other",
+      "artifact": "host-scripts/deploy-machine/pyproject.toml",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
       "base_sha256": "fbd2538f53aaeaefa8c0304df30095a51854630d8771aca56f345e18b8c322b3",
       "patch_sha256": "6433eea11139e62a397ec701cf29399843ca13abd415eb1ba04acf50d3354915",
       "operations": [
         {
-          "resource": "inert documentation or release metadata",
+          "resource": "repository file delivery",
           "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
+          "rollback_policy": "RESTORE",
           "resource_refs": [],
           "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
+          "apply_cli": "install the listed artifact at its repository-relative destination, then rebuild the deployment-machine virtual environment so the declared dependencies are actually present",
+          "verify_cli": "compare the installed file SHA-256 with manifest patch_sha256, then confirm the rebuilt interpreter imports boto3 and yaml",
+          "rollback_cli": "restore the recorded pre-apply file"
         }
       ],
       "fix_ids": [
@@ -9247,25 +9244,22 @@
     },
     "uv.lock": {
       "change": "M",
-      "layer": "meta",
-      "artifact": null,
-      "artifact_status": "NOT_APPLICABLE",
-      "artifact_disposition": {
-        "kind": "INERT_METADATA",
-        "evidence": "path-derived-meta"
-      },
+      "layer": "deploy-other",
+      "artifact": "host-scripts/deploy-machine/uv.lock",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
       "base_sha256": "4b6d25e2da7766093cf5bdde7d65181c75833e39852f891ddc2741cbc80cab7f",
       "patch_sha256": "1c992e986e7ab8f8ef25d6500a8f778edb6e2a6d0e7e82f5831086a2f91ed4e1",
       "operations": [
         {
-          "resource": "inert documentation or release metadata",
+          "resource": "repository file delivery",
           "class": "AUTO_CLI",
-          "rollback_policy": "RETAIN",
+          "rollback_policy": "RESTORE",
           "resource_refs": [],
           "artifact_refs": [],
-          "apply_cli": "record that this path has no customer-side action",
-          "verify_cli": "confirm the path is excluded from the customer payload",
-          "rollback_cli": "no customer rollback is required"
+          "apply_cli": "install the listed artifact at its repository-relative destination, then rebuild the deployment-machine virtual environment so the declared dependencies are actually present",
+          "verify_cli": "compare the installed file SHA-256 with manifest patch_sha256, then confirm the rebuilt interpreter imports boto3 and yaml",
+          "rollback_cli": "restore the recorded pre-apply file"
         }
       ],
       "fix_ids": [
@@ -9302,7 +9296,7 @@
     },
     {
       "id": "fix-402",
-      "summary": "Keep published Python dependency metadata internally consistent.",
+      "summary": "Deliver the deployment-machine Python dependency declaration, so the deploy wrapper's boto3 preflight can pass.",
       "paths": [
         "pyproject.toml",
         "uv.lock"
@@ -9929,10 +9923,10 @@
       "id": "ver-402",
       "fix_id": "fix-402",
       "phase": "A-readonly",
-      "action": "Read project.requires-python from pyproject.toml and requires-python from uv.lock, then compare the root package version metadata.",
-      "observable": "pyproject.toml requires-python and version values alongside uv.lock requires-python and the root package version.",
-      "pass_when": "Both files declare requires-python >=3.12 and the locked root package version equals pyproject.toml version 1.5.5.",
-      "fail_when": "The Python constraints differ, the root package is absent from uv.lock, or its locked version is not 1.5.5.",
+      "action": "On the deployment machine, read the installed pyproject.toml and uv.lock: compare project.requires-python and the root package version across both files, and read the project.dependencies list. Then rebuild the virtual environment and run the same import the deploy wrapper gates on.",
+      "observable": "The installed pyproject.toml requires-python, version, and project.dependencies values, the uv.lock requires-python and root package version, and the exit status of importing boto3 and yaml with the rebuilt interpreter.",
+      "pass_when": "Both files declare requires-python >=3.12, the locked root package version equals the pyproject.toml version, project.dependencies contains boto3, and the rebuilt interpreter imports boto3 and yaml with exit status 0.",
+      "fail_when": "The Python constraints differ, the root package is absent from uv.lock, its locked version disagrees with pyproject.toml, boto3 is missing from project.dependencies, or the rebuilt interpreter cannot import boto3 and yaml.",
       "timeout_s": 300,
       "cleanup": "Remove only the exact test tenant ids, operation ids, instance ids, S3 object keys, and temporary paths recorded by this verification; never use prefix or wildcard deletion."
     },

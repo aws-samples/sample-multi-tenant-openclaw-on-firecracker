@@ -296,7 +296,13 @@ overlay_function() {
   location="$(aws_ lambda get-function --function-name "$function_name" \
     --query 'Code.Location' --output text)" || die "cannot locate $function_name package"
   work="$(mktemp -d)"
-  zip="/tmp/${function_name}-restorepatch.zip"
+  # Unique archive per invocation. A fixed /tmp path keyed only on the function name is shared by
+  # every concurrent run and by every environment patched from this workstation: one process could
+  # replace the archive between another's entry assertion and its upload, publishing one
+  # environment's package into another's function. A private directory closes that window and also
+  # means the archive can never be a stale one from an earlier run.
+  zip_dir="$(mktemp -d)"
+  zip="${zip_dir}/${function_name}-restorepatch.zip"
   curl -fsS -o "${work}/live.zip" "$location" || die "cannot download $function_name package"
   (cd "$work" && unzip -oq live.zip) || die "cannot unpack $function_name package"
   while IFS= read -r rel; do
@@ -338,6 +344,9 @@ overlay_function() {
   aws_ lambda wait function-updated --function-name "$function_name" \
     || die "$function_name did not settle"
   state_put "zip_${function_name}" "$zip"
+  # The package is on Lambda now; the local archive has no further use and must not linger where a
+  # later run could find it.
+  rm -rf "$zip_dir"
 }
 
 backup_function() {
@@ -2192,28 +2201,73 @@ refresh)
   # fleet replaced every tenant-carrying host again for zero configuration change. Decide from the
   # fleet's real state, not from a record that cannot expire.
   target_refresh_lt="$(state_get host_lt_new_version)"
-  if [ -n "$target_refresh_lt" ] \
-     && [ "$(state_get refresh_completed_lt_version)" = "$target_refresh_lt" ]; then
-    say "SKIP refresh: this state already records a completed refresh onto LT v${target_refresh_lt}"
-    echo "   NEXT: bash lib/apply-restorepatch.sh verify --env \"$ENVJSON\" --kit \"$KITDIR\""
-    exit 0
+  [ -n "$target_refresh_lt" ] || die "refresh refused: no target launch-template version in $STATE"
+  # Refuse while ANY refresh on this group is unfinished, whoever started it. Keying this off our own
+  # recorded id would miss one started from the console or by another operator, leaving
+  # start-instance-refresh as the only thing between us and two concurrent replacements of a
+  # tenant-carrying fleet. A failed read is fatal: an unreadable history cannot prove quiescence.
+  if ! refresh_history="$(aws_ autoscaling describe-instance-refreshes \
+    --auto-scaling-group-name "$ASG" \
+    --query 'InstanceRefreshes[].[InstanceRefreshId,Status]' --output text)"; then
+    die "refresh refused: cannot read the instance-refresh history of $ASG; resolve that before starting one"
   fi
-  # The recorded verdict can be absent (older state, or a run that died after the refresh finished),
-  # so also ask the ASG: is every instance already on the target launch-template version?
-  fleet_lt_versions="$(aws_ autoscaling describe-auto-scaling-groups \
+  # Terminal is an ALLOWLIST. Everything else counts as unfinished -- including Baking, which is the
+  # post-update bake wait and therefore not done, and any status AWS adds later. Documented values:
+  # Pending, InProgress, Successful, Failed, Cancelling, Cancelled, RollbackInProgress,
+  # RollbackFailed, RollbackSuccessful, Baking.
+  unfinished_refreshes=""
+  while IFS="$(printf '\t')" read -r history_id history_status; do
+    [ -n "$history_id" ] || continue
+    case "$history_status" in
+      Successful|Failed|Cancelled|RollbackFailed|RollbackSuccessful) ;;
+      *) unfinished_refreshes="${unfinished_refreshes:+${unfinished_refreshes} }${history_id}=${history_status}" ;;
+    esac
+  done <<REFRESH_HISTORY
+$refresh_history
+REFRESH_HISTORY
+  [ -z "$unfinished_refreshes" ] \
+    || die "refresh refused: $ASG has an unfinished instance refresh ($unfinished_refreshes); wait for it to reach a terminal state instead of starting a second one"
+  # Whether a refresh is NEEDED is answered by the fleet, never by a stored verdict. A recorded
+  # Successful proves only that some refresh finished -- a concurrent launch-template repoint means it
+  # may have converged the fleet onto a different version than this run targets.
+  if ! fleet_pairs="$(aws_ autoscaling describe-auto-scaling-groups \
     --auto-scaling-group-names "$ASG" \
-    --query 'AutoScalingGroups[0].Instances[].LaunchTemplate.Version' --output text)" \
-    || die "cannot read the fleet's launch-template versions for $ASG"
+    --query 'AutoScalingGroups[0].Instances[].[LaunchTemplate.LaunchTemplateId,LaunchTemplate.Version]' \
+    --output text)"; then
+    die "cannot read the launch-template identity of the instances in $ASG"
+  fi
+  fleet_desired="$(aws_ autoscaling describe-auto-scaling-groups \
+    --auto-scaling-group-names "$ASG" \
+    --query 'AutoScalingGroups[0].DesiredCapacity' --output text)" \
+    || die "cannot read the desired capacity of $ASG"
+  # Compare the template IDENTITY as well as the version: version N of a different launch template is
+  # a different thing, and version alone would read it as converged.
+  fleet_size=0
   fleet_off_target=0
-  for instance_lt in $fleet_lt_versions; do
-    [ "$instance_lt" = "$target_refresh_lt" ] || fleet_off_target=1
-  done
-  if [ -n "$fleet_lt_versions" ] && [ "$fleet_off_target" -eq 0 ]; then
-    say "SKIP refresh: every instance in $ASG already runs LT v${target_refresh_lt}"
-    state_put refresh_completed_lt_version "$target_refresh_lt"
+  while IFS="$(printf '\t')" read -r instance_lt_id instance_lt_version; do
+    [ -n "$instance_lt_id" ] || continue
+    fleet_size=$((fleet_size + 1))
+    if [ "$instance_lt_id" != "$LT_ID" ] || [ "$instance_lt_version" != "$target_refresh_lt" ]; then
+      fleet_off_target=1
+    fi
+  done <<FLEET_PAIRS
+$fleet_pairs
+FLEET_PAIRS
+  if [ "$fleet_size" -eq 0 ]; then
+    # Nothing to replace. That is a real no-op only when the group is meant to be empty; an empty
+    # group that wants capacity is a problem to resolve, not a refresh to skip.
+    [ "$fleet_desired" = "0" ] \
+      || die "refresh refused: $ASG wants $fleet_desired instance(s) but reports none; resolve that before refreshing"
+    say "SKIP refresh: $ASG is scaled to zero, so there is nothing to replace"
     echo "   NEXT: bash lib/apply-restorepatch.sh verify --env \"$ENVJSON\" --kit \"$KITDIR\""
     exit 0
   fi
+  if [ "$fleet_off_target" -eq 0 ]; then
+    say "SKIP refresh: all $fleet_size instance(s) in $ASG already run $LT_ID version $target_refresh_lt"
+    echo "   NEXT: bash lib/apply-restorepatch.sh verify --env \"$ENVJSON\" --kit \"$KITDIR\""
+    exit 0
+  fi
+  say "fleet has $fleet_size instance(s), not all on $LT_ID version $target_refresh_lt; a refresh is needed"
   say "instance refresh suspended-process precheck"
   # Suspension is intentional operator state, so refuse instead of auto-resuming it.
   # AWS documents only Launch/Terminate/InstanceRefresh as blocking replacement;
@@ -2233,16 +2287,99 @@ refresh)
   [ -z "$blocking_suspended" ] \
     || die "refresh refused: blocking suspended processes: $blocking_suspended; instance refresh would sit at Pending with 'Paused due to the following suspended processes: $blocking_suspended' and never replace an instance. Resume explicitly: aws autoscaling resume-processes --auto-scaling-group-name \"$ASG\" --scaling-processes $blocking_suspended --region \"$REGION\""
   echo "   PASS no blocking suspended processes"
+  # A refresh replaces instances using the ASG's CURRENT configuration, not the version this run
+  # decided to converge on. So confirm, immediately before starting, that the group actually resolves
+  # to the target launch template -- otherwise a concurrent repoint would make this run replace the
+  # whole fleet onto someone else's version while reporting success for ours. Passing
+  # --desired-configuration would pin it, but it also REWRITES the group's configuration on success,
+  # which would silently clobber that concurrent repoint; refusing is the honest option.
+  asg_lt_id_now="$(aws_ autoscaling describe-auto-scaling-groups \
+    --auto-scaling-group-names "$ASG" \
+    --query 'AutoScalingGroups[0].[LaunchTemplate.LaunchTemplateId,MixedInstancesPolicy.LaunchTemplate.LaunchTemplateSpecification.LaunchTemplateId]' \
+    --output text | tr '\t' '\n' | grep -v '^None$' | head -1)" \
+    || die "cannot read the launch template currently configured on $ASG"
+  asg_lt_ref_now="$(aws_ autoscaling describe-auto-scaling-groups \
+    --auto-scaling-group-names "$ASG" \
+    --query 'AutoScalingGroups[0].[LaunchTemplate.Version,MixedInstancesPolicy.LaunchTemplate.LaunchTemplateSpecification.Version]' \
+    --output text | tr '\t' '\n' | grep -v '^None$' | head -1)" \
+    || die "cannot read the launch-template version currently configured on $ASG"
+  [ -n "$asg_lt_id_now" ] && [ -n "$asg_lt_ref_now" ] \
+    || die "refresh refused: $ASG does not report a launch template to replace onto"
+  # Under a mixed-instances policy each override may carry its OWN LaunchTemplateSpecification, and
+  # when such an override is selected the base template does not apply to those instances at all. So
+  # a base-template match would be a false green: part of the fleet could be replaced onto a different
+  # template or version while this run reports the target. The control plane already refuses this
+  # exact shape (services/bootstrap_version_service.py::_asg_lt_spec, added after a review found the
+  # same false green there); refuse it here rather than guess which override wins.
+  mip_override_lt_count="$(aws_ autoscaling describe-auto-scaling-groups \
+    --auto-scaling-group-names "$ASG" \
+    --query 'length(AutoScalingGroups[0].MixedInstancesPolicy.LaunchTemplate.Overrides[?LaunchTemplateSpecification!=null] || `[]`)' \
+    --output text)" \
+    || die "cannot read the mixed-instances overrides of $ASG"
+  case "$mip_override_lt_count" in
+    ''|None|0) ;;
+    *)
+      die "refresh refused: $ASG has $mip_override_lt_count mixed-instances override(s) carrying their own launch template, so matching the base template proves nothing about what those instances would be replaced onto; resolve the overrides before refreshing"
+      ;;
+  esac
+  # The group may reference a floating alias. Resolve it to the concrete number the replacement would
+  # actually use, because "$Default" can be repointed by anyone at any time.
+  case "$asg_lt_ref_now" in
+    '$Default')
+      asg_lt_version_now="$(aws_ ec2 describe-launch-templates --launch-template-ids "$asg_lt_id_now" \
+        --query 'LaunchTemplates[0].DefaultVersionNumber' --output text)" \
+        || die "cannot resolve \$Default for $asg_lt_id_now"
+      ;;
+    '$Latest')
+      asg_lt_version_now="$(aws_ ec2 describe-launch-templates --launch-template-ids "$asg_lt_id_now" \
+        --query 'LaunchTemplates[0].LatestVersionNumber' --output text)" \
+        || die "cannot resolve \$Latest for $asg_lt_id_now"
+      ;;
+    *) asg_lt_version_now="$asg_lt_ref_now" ;;
+  esac
+  { [ "$asg_lt_id_now" = "$LT_ID" ] && [ "$asg_lt_version_now" = "$target_refresh_lt" ]; } \
+    || die "refresh refused: $ASG is configured for $asg_lt_id_now version $asg_lt_version_now (reference $asg_lt_ref_now) but this run targets $LT_ID version $target_refresh_lt; point the group at the target before refreshing"
+  echo "   PASS group resolves to $LT_ID version $asg_lt_version_now (reference $asg_lt_ref_now)"
+  # Re-check quiescence right before starting. This does not close the race -- only a shared lease
+  # would -- but it shrinks the window between the history read above and the start below.
+  if ! refresh_history_recheck="$(aws_ autoscaling describe-instance-refreshes \
+    --auto-scaling-group-name "$ASG" \
+    --query 'InstanceRefreshes[].[InstanceRefreshId,Status]' --output text)"; then
+    die "refresh refused: cannot re-read the instance-refresh history of $ASG immediately before starting"
+  fi
+  unfinished_recheck=""
+  while IFS="$(printf '\t')" read -r recheck_id recheck_status; do
+    [ -n "$recheck_id" ] || continue
+    case "$recheck_status" in
+      Successful|Failed|Cancelled|RollbackFailed|RollbackSuccessful) ;;
+      *) unfinished_recheck="${unfinished_recheck:+${unfinished_recheck} }${recheck_id}=${recheck_status}" ;;
+    esac
+  done <<REFRESH_RECHECK
+$refresh_history_recheck
+REFRESH_RECHECK
+  [ -z "$unfinished_recheck" ] \
+    || die "refresh refused: a refresh started on $ASG while this run was checking ($unfinished_recheck)"
   # AWS documents min=max=100 as launch-before-terminate, one-at-a-time replacement.
   refresh_id="$(aws_ autoscaling start-instance-refresh --auto-scaling-group-name "$ASG" \
     --preferences '{"MinHealthyPercentage":100,"MaxHealthyPercentage":100,"InstanceWarmup":900,"SkipMatching":false}' \
     --query InstanceRefreshId --output text)" || die "cannot start instance refresh"
-  state_put instance_refresh_id "$refresh_id"
-  # Record the intent now: if this run dies while the refresh is still in flight, the next run must
-  # not start a second one. verify reads the live progress, so a partially-done refresh is still
-  # visible there rather than being hidden by this record.
-  state_put refresh_completed_lt_version "$target_refresh_lt"
+  case "$refresh_id" in
+    ''|None) die "start-instance-refresh returned no refresh id for $ASG; treat the refresh state as unknown and inspect it before retrying" ;;
+  esac
+  state_put instance_refresh_id "$refresh_id" \
+    || die "refresh $refresh_id started on $ASG but recording its id failed; the run is NOT idempotent from here -- inspect the group's refresh history before retrying"
+  # Recorded for the operator's benefit only. The guard above deliberately does NOT read it: it asks
+  # the ASG for every recent refresh and for the fleet's actual launch-template identity, so a
+  # refresh started outside this kit is caught too and a stale record cannot make a run skip.
+  state_put refresh_pending_lt_version "$target_refresh_lt" \
+    || die "refresh $refresh_id started on $ASG but recording its target version failed; inspect the group's refresh history before retrying"
   say "controlled instance refresh started: $refresh_id"
+  # Deliberately NOT pinned with --desired-configuration: that would rewrite the group's configuration
+  # on success and could clobber a concurrent repoint. The consequence is a real, remaining window --
+  # instances replaced later in this refresh follow the group's configuration AS IT IS THEN, so
+  # repointing the group or moving $Default while this runs can converge part of the fleet elsewhere.
+  echo "   NOTE do not repoint $ASG or move the launch template's \$Default while this refresh runs;"
+  echo "        later replacements follow the group's configuration at that moment, not this target"
   echo "   NEXT: bash lib/apply-restorepatch.sh verify --env \"$ENVJSON\" --kit \"$KITDIR\""
   ;;
 

@@ -2287,10 +2287,68 @@ FLEET_PAIRS
   [ -z "$blocking_suspended" ] \
     || die "refresh refused: blocking suspended processes: $blocking_suspended; instance refresh would sit at Pending with 'Paused due to the following suspended processes: $blocking_suspended' and never replace an instance. Resume explicitly: aws autoscaling resume-processes --auto-scaling-group-name \"$ASG\" --scaling-processes $blocking_suspended --region \"$REGION\""
   echo "   PASS no blocking suspended processes"
+  # A refresh replaces instances using the ASG's CURRENT configuration, not the version this run
+  # decided to converge on. So confirm, immediately before starting, that the group actually resolves
+  # to the target launch template -- otherwise a concurrent repoint would make this run replace the
+  # whole fleet onto someone else's version while reporting success for ours. Passing
+  # --desired-configuration would pin it, but it also REWRITES the group's configuration on success,
+  # which would silently clobber that concurrent repoint; refusing is the honest option.
+  asg_lt_id_now="$(aws_ autoscaling describe-auto-scaling-groups \
+    --auto-scaling-group-names "$ASG" \
+    --query 'AutoScalingGroups[0].[LaunchTemplate.LaunchTemplateId,MixedInstancesPolicy.LaunchTemplate.LaunchTemplateSpecification.LaunchTemplateId]' \
+    --output text | tr '\t' '\n' | grep -v '^None$' | head -1)" \
+    || die "cannot read the launch template currently configured on $ASG"
+  asg_lt_ref_now="$(aws_ autoscaling describe-auto-scaling-groups \
+    --auto-scaling-group-names "$ASG" \
+    --query 'AutoScalingGroups[0].[LaunchTemplate.Version,MixedInstancesPolicy.LaunchTemplate.LaunchTemplateSpecification.Version]' \
+    --output text | tr '\t' '\n' | grep -v '^None$' | head -1)" \
+    || die "cannot read the launch-template version currently configured on $ASG"
+  [ -n "$asg_lt_id_now" ] && [ -n "$asg_lt_ref_now" ] \
+    || die "refresh refused: $ASG does not report a launch template to replace onto"
+  # The group may reference a floating alias. Resolve it to the concrete number the replacement would
+  # actually use, because "$Default" can be repointed by anyone at any time.
+  case "$asg_lt_ref_now" in
+    '$Default')
+      asg_lt_version_now="$(aws_ ec2 describe-launch-templates --launch-template-ids "$asg_lt_id_now" \
+        --query 'LaunchTemplates[0].DefaultVersionNumber' --output text)" \
+        || die "cannot resolve \$Default for $asg_lt_id_now"
+      ;;
+    '$Latest')
+      asg_lt_version_now="$(aws_ ec2 describe-launch-templates --launch-template-ids "$asg_lt_id_now" \
+        --query 'LaunchTemplates[0].LatestVersionNumber' --output text)" \
+        || die "cannot resolve \$Latest for $asg_lt_id_now"
+      ;;
+    *) asg_lt_version_now="$asg_lt_ref_now" ;;
+  esac
+  { [ "$asg_lt_id_now" = "$LT_ID" ] && [ "$asg_lt_version_now" = "$target_refresh_lt" ]; } \
+    || die "refresh refused: $ASG is configured for $asg_lt_id_now version $asg_lt_version_now (reference $asg_lt_ref_now) but this run targets $LT_ID version $target_refresh_lt; point the group at the target before refreshing"
+  echo "   PASS group resolves to $LT_ID version $asg_lt_version_now (reference $asg_lt_ref_now)"
+  # Re-check quiescence right before starting. This does not close the race -- only a shared lease
+  # would -- but it shrinks the window between the history read above and the start below.
+  if ! refresh_history_recheck="$(aws_ autoscaling describe-instance-refreshes \
+    --auto-scaling-group-name "$ASG" \
+    --query 'InstanceRefreshes[].[InstanceRefreshId,Status]' --output text)"; then
+    die "refresh refused: cannot re-read the instance-refresh history of $ASG immediately before starting"
+  fi
+  unfinished_recheck=""
+  while IFS="$(printf '\t')" read -r recheck_id recheck_status; do
+    [ -n "$recheck_id" ] || continue
+    case "$recheck_status" in
+      Successful|Failed|Cancelled|RollbackFailed|RollbackSuccessful) ;;
+      *) unfinished_recheck="${unfinished_recheck:+${unfinished_recheck} }${recheck_id}=${recheck_status}" ;;
+    esac
+  done <<REFRESH_RECHECK
+$refresh_history_recheck
+REFRESH_RECHECK
+  [ -z "$unfinished_recheck" ] \
+    || die "refresh refused: a refresh started on $ASG while this run was checking ($unfinished_recheck)"
   # AWS documents min=max=100 as launch-before-terminate, one-at-a-time replacement.
   refresh_id="$(aws_ autoscaling start-instance-refresh --auto-scaling-group-name "$ASG" \
     --preferences '{"MinHealthyPercentage":100,"MaxHealthyPercentage":100,"InstanceWarmup":900,"SkipMatching":false}' \
     --query InstanceRefreshId --output text)" || die "cannot start instance refresh"
+  case "$refresh_id" in
+    ''|None) die "start-instance-refresh returned no refresh id for $ASG; treat the refresh state as unknown and inspect it before retrying" ;;
+  esac
   state_put instance_refresh_id "$refresh_id"
   # Recorded for the operator's benefit only. The guard above deliberately does NOT read it: it asks
   # the ASG for every recent refresh and for the fleet's actual launch-template identity, so a

@@ -117,6 +117,13 @@ def _parse_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         mid = rec.get("messageId")
         # 缩短可见性(960→15s),不必等默认 visibility 才重投。SQS 事件每条 record 原生带。
         rh = rec.get("receiptHandle")
+        # #522 P1-2 —— SQS 原生把 ApproximateReceiveCount 放在 record.attributes(字符串)。
+        # 供升级宽限的收敛 backstop:到最后一次投递(rc >= maxReceive,下次即 DLQ)仍无处可放 →
+        # 直接标 requires_intervention,杜绝 no-budget 宽限把消息静默送进 DLQ 却让租户卡 creating。
+        try:
+            rc = int((rec.get("attributes") or {}).get("ApproximateReceiveCount", 1) or 1)
+        except (TypeError, ValueError):
+            rc = 1
         body = rec.get("body") or "{}"
         try:
             msg = json.loads(body)
@@ -130,6 +137,7 @@ def _parse_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             {
                 "msg_id": mid,
                 "receipt_handle": rh,
+                "receive_count": rc,
                 "action": msg.get("action"),
                 "tenant_id": msg.get("tenant_id"),
                 "request_token": msg.get("request_token"),
@@ -331,6 +339,105 @@ def _snapshot_hosts(now_epoch: int, gate_inflight: bool = True) -> List[Dict[str
             }
         )
     return out
+
+
+def _iso_to_epoch(s: Any) -> Optional[int]:
+    """容忍 'Z' 与 '+00:00' 两种 ISO8601 UTC 渲染(host.upgrading_at 来自 utils._now() 的
+    isoformat = 带微秒 +00:00;历史记录可能是 …Z)。解析失败回 None(调用方按 fail-safe 处理)。"""
+    if not s:
+        return None
+    try:
+        from datetime import datetime
+
+        return int(datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _fleet_has_fresh_upgrade(grace_sec: int, now_epoch: int) -> bool:
+    """#522 P1-2 —— fleet 是否有 host 正处在【新鲜】的 upgrading 窗口(upgrading_at 距今
+    < grace_sec)。有 → dispatch 把本轮 unplaced 视作瞬态(host 升级完会回 active/idle),
+    按 no-budget 重投处理(记 reserve_retry_tids:claim 保留、不计 dispatch_retries、不缩
+    visibility),避免升级窗口内新建租户被误推终态 requires_intervention。无(或升级卡死超
+    grace)→ unplaced 仍按容量不足计预算,最终收敛 requires_intervention(fail-loud,卡死
+    升级是运维问题)。grace<=0 关此宽限(退回旧行为)。
+
+    为什么 host 在 upgrading 时会导致 unplaced:_snapshot_hosts 只扫 active/idle,升级中的
+    host 被排除出候选。全 fleet 都在升级(或活跃 host 都满)时,binpack 无处可放 → unplaced。
+
+    fail-safe:扫描/解析异常一律当【无新鲜升级】(不授予宽限)—— 宁可退回旧的计预算路径,
+    也不因异常把新建租户无限 park 在队列里。只在有 unplaced 时才调用(见 dispatch_batch),
+    正常无容量压力路径零额外扫描开销。"""
+    if grace_sec <= 0:
+        return False
+    # 分页扫(codex F2):单次 Scan 只读 ≤1MB 原始数据后才 apply FilterExpression;大 fleet 的
+    # upgrading host 可能落在后页,单次扫会漏 → 误判无升级 → 租户白烧预算(bug 复现)。故 follow
+    # LastEvaluatedKey 直到扫完或【提前命中】首个新鲜升级(命中即返,不必扫全表)。
+    start_key = None
+    # 页数上限护栏:hosts 表体量有界(~千台,每页 1MB),正常 1-2 页即扫完。上限纯属防御——
+    # 真实 DDB 终会返回空 LastEvaluatedKey;万一遇到异常(或测试 mock 恒返同一 key)也不至于死循环。
+    _MAX_PAGES = 100
+    try:
+        for _ in range(_MAX_PAGES):
+            kw = {
+                "FilterExpression": "#s = :upg",
+                "ExpressionAttributeNames": {"#s": "status"},
+                "ExpressionAttributeValues": {":upg": "upgrading"},
+                "ProjectionExpression": "upgrading_at",
+                "ConsistentRead": True,
+            }
+            if start_key:
+                kw["ExclusiveStartKey"] = start_key
+            resp = clients.hosts_table.scan(**kw)
+            for h in resp.get("Items", []):
+                started = _iso_to_epoch(h.get("upgrading_at"))
+                # 未来/刚起(delta<0)也算新鲜:安全方向(授予宽限=no-budget,不会误终态)。
+                if started is not None and (now_epoch - started) < grace_sec:
+                    return True
+            start_key = resp.get("LastEvaluatedKey")
+            if not start_key:
+                return False
+        # 到达页数上限仍没扫完(异常大表 / 异常 key)→ 保守当【无新鲜升级】(退回计预算,收敛)。
+        print(f"[dispatch] upgrade-grace scan hit page cap {_MAX_PAGES} → no grace")
+        return False
+    except Exception as e:  # noqa: BLE001
+        print(f"[dispatch] upgrade-grace scan failed → no grace: {e}")
+        return False
+
+
+def _mark_stuck_creating_intervention(tenant_id: str, claim_id: str) -> None:
+    """#522 P1-2(codex F1)收敛 backstop —— SQS 投递预算耗尽(下次即 DLQ)仍 unplaced → 标
+    requires_intervention。为什么不能只靠 _release_claims 的 `dispatch_retries >= budget`:升级
+    宽限走 no-budget 重投(不计 dispatch_retries),receiveCount 与 dispatch_retries 脱钩,到 DLQ
+    时 retries 可能 < budget → 那道终态标记打不出 → 消息静默进 DLQ、租户永久卡 creating。故按
+    【SQS 投递耗尽】直接收敛,失败要响(loud)而非 silent strand。
+
+    幂等 + 认领归属(codex F2 复审):条件 `#s=creating AND dispatch_claim=本 claim_id`——
+    ① 仅 creating 才转,不误标已 running/终态;② **只在仍持本 invocation 的 claim 时转**,防
+    本 invocation 已跑成陈旧(claim 过期被新一轮接管、新 invocation 正在放置该租户)时把它误
+    推终态、覆盖新认领(与 _release_claims 的 `dispatch_claim=:cid` 同款归属守卫)。"""
+    ccf = clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException
+    try:
+        clients.tenants_table.update_item(
+            Key={"id": tenant_id},
+            UpdateExpression="SET #s = :ri, requires_intervention_ts = :now",
+            ConditionExpression="#s = :creating AND dispatch_claim = :cid",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":ri": "requires_intervention",
+                ":creating": "creating",
+                ":cid": claim_id,
+                ":now": _now(),
+            },
+        )
+        print(
+            f"[dispatch] {tenant_id} unplaced through SQS receive budget "
+            f"→ requires_intervention"
+        )
+    except ccf:
+        pass  # 已非 creating / claim 已被接管——幂等跳过(交持有者)
+    except Exception as e:  # noqa: BLE001
+        print(f"[dispatch] stuck-creating mark {tenant_id} non-fatal: {e}")
 
 
 def _host_disk_ok(h: Dict[str, Any], now_epoch: int) -> bool:
@@ -1139,6 +1246,8 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     # msg_id 反查:tenant_id → msg_id(唯一,认领已保证)
     tid_to_msg = {w["tenant_id"]: w["msg_id"] for w in winners}
     tid_to_rh = {w["tenant_id"]: w.get("receipt_handle") for w in winners}
+    # #522 P1-2 tenant_id → SQS ApproximateReceiveCount(升级宽限的收敛 backstop 用)
+    recv_by_tid = {w["tenant_id"]: int(w.get("receive_count", 1) or 1) for w in winners}
     alloc_by_host = {h["instance_id"]: h["allocatable_vcpu"] for h in hosts}
     alloc_mem_by_host = {h["instance_id"]: h.get("allocatable_mem", 0) for h in hosts}
     # 从它派连续 vm_num 段(事务不返回 Attributes,不能读回 → 用乐观锁把 base 钉死)。
@@ -1406,9 +1515,36 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     # 消息"状态机):unplaced 就是普通失败(进 batchItemFailures + 下面 _release_claims 释放
     # claim/计预算,与 CAS/SSM 失败同一条久经考验的路)。缩短原消息 visibility 挪到释放 claim
     # 会在释放慢于 15s/失败时丢消息。
+    # #522 P1-2 —— unplaced 归因分流:若 fleet 有 host 正在【新鲜】升级(upgrading_at 距今
+    # < DISPATCH_UPGRADE_GRACE_SEC),本轮没位子多半是升级临时把 host 挪出候选(升级完回
+    # active/idle),按【no-budget】重投(记 reserve_retry_tids:保 claim、不计 dispatch_retries、
+    # 不缩 visibility),避免升级窗口内新建租户被误推终态 requires_intervention 且不自愈。无新鲜
+    # 升级 → 仍按容量不足计预算(capacity_retry_tids),真·满容量的新建照旧收敛到 requires_
+    # intervention。只在确有 unplaced 时才扫一次(升级卡死超 grace 也自动退回计预算,fail-loud)。
+    _upgrade_grace = (
+        _fleet_has_fresh_upgrade(clients.DISPATCH_UPGRADE_GRACE_SEC, now_epoch)
+        if result.unplaced
+        else False
+    )
+    _max_recv = clients.DISPATCH_MAX_RECEIVE_COUNT
     for t in result.unplaced:
-        _fail(t["tenant_id"], "unplaced: no host capacity this round")
-        capacity_retry_tids.add(t["tenant_id"])
+        _tid = t["tenant_id"]
+        _rc = recv_by_tid.get(_tid, 1)
+        if _rc >= _max_recv:
+            # ★收敛 backstop(codex F1):到 SQS 最后一次投递(下次即 DLQ)仍无处可放 → 直接标
+            # requires_intervention(loud 终态),杜绝 no-budget 宽限把消息静默送进 DLQ 却让租户
+            # >~一个 visibility 周期、或真·满容量耗尽全部投递,属运维异常,失败要响。消息仍进
+            # batchItemFailures(rc 已达上限 → SQS 转 DLQ),租户已 loud 终态。
+            _fail(_tid, "unplaced: exhausted SQS receive budget → requires_intervention")
+            _mark_stuck_creating_intervention(_tid, command_id)
+        elif _upgrade_grace:
+            # 新鲜升级窗口 + 尚有投递余量 → no-budget 重投(保 claim、不计 dispatch_retries、
+            # 不缩 visibility),等升级完 host 回 active/idle 再落位。
+            _fail(_tid, "unplaced during host upgrade window (no-budget retry)")
+            reserve_retry_tids.add(_tid)
+        else:
+            _fail(_tid, "unplaced: no host capacity this round")
+            capacity_retry_tids.add(_tid)
 
     # 但记入 reserve_retry_tids(下方 _release_claims 跳过它)保 claim 不计 retry,下轮重投再结算。
     for _msg in stale_unsettled_msgs:

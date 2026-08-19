@@ -2185,6 +2185,35 @@ refresh)
     || die "refresh refused: no canary PASS record in $STATE"
   [ "$(state_get canary_lt_version)" = "$(state_get host_lt_new_version)" ] \
     || die "refresh refused: canary PASS belongs to a different LT version"
+  # Both gates above stay TRUE forever after one success -- neither key is ever cleared, and the
+  # state file lives in the kit directory, so it survives across sessions. Nothing else consulted
+  # the ASG's actual refresh history, and the call below passes SkipMatching:false, which is AWS's
+  # explicit "replace instances even when they already match". So a second `refresh` on a converged
+  # fleet replaced every tenant-carrying host again for zero configuration change. Decide from the
+  # fleet's real state, not from a record that cannot expire.
+  target_refresh_lt="$(state_get host_lt_new_version)"
+  if [ -n "$target_refresh_lt" ] \
+     && [ "$(state_get refresh_completed_lt_version)" = "$target_refresh_lt" ]; then
+    say "SKIP refresh: this state already records a completed refresh onto LT v${target_refresh_lt}"
+    echo "   NEXT: bash lib/apply-restorepatch.sh verify --env \"$ENVJSON\" --kit \"$KITDIR\""
+    exit 0
+  fi
+  # The recorded verdict can be absent (older state, or a run that died after the refresh finished),
+  # so also ask the ASG: is every instance already on the target launch-template version?
+  fleet_lt_versions="$(aws_ autoscaling describe-auto-scaling-groups \
+    --auto-scaling-group-names "$ASG" \
+    --query 'AutoScalingGroups[0].Instances[].LaunchTemplate.Version' --output text)" \
+    || die "cannot read the fleet's launch-template versions for $ASG"
+  fleet_off_target=0
+  for instance_lt in $fleet_lt_versions; do
+    [ "$instance_lt" = "$target_refresh_lt" ] || fleet_off_target=1
+  done
+  if [ -n "$fleet_lt_versions" ] && [ "$fleet_off_target" -eq 0 ]; then
+    say "SKIP refresh: every instance in $ASG already runs LT v${target_refresh_lt}"
+    state_put refresh_completed_lt_version "$target_refresh_lt"
+    echo "   NEXT: bash lib/apply-restorepatch.sh verify --env \"$ENVJSON\" --kit \"$KITDIR\""
+    exit 0
+  fi
   say "instance refresh suspended-process precheck"
   # Suspension is intentional operator state, so refuse instead of auto-resuming it.
   # AWS documents only Launch/Terminate/InstanceRefresh as blocking replacement;
@@ -2209,6 +2238,10 @@ refresh)
     --preferences '{"MinHealthyPercentage":100,"MaxHealthyPercentage":100,"InstanceWarmup":900,"SkipMatching":false}' \
     --query InstanceRefreshId --output text)" || die "cannot start instance refresh"
   state_put instance_refresh_id "$refresh_id"
+  # Record the intent now: if this run dies while the refresh is still in flight, the next run must
+  # not start a second one. verify reads the live progress, so a partially-done refresh is still
+  # visible there rather than being hidden by this record.
+  state_put refresh_completed_lt_version "$target_refresh_lt"
   say "controlled instance refresh started: $refresh_id"
   echo "   NEXT: bash lib/apply-restorepatch.sh verify --env \"$ENVJSON\" --kit \"$KITDIR\""
   ;;

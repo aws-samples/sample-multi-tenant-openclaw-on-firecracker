@@ -319,7 +319,20 @@ overlay_function() {
   # advanced. That is what silently invalidated the recorded rollback anchor between runs.
   # 1980-01-01 is the zip epoch floor and is what CDK normalizes to for the same reason.
   find "$work" -exec touch -t 198001010000 {} + 2>/dev/null || true
+  # Delete the target archive first. $zip is a FIXED path keyed only on the function name, and
+  # `zip` without -FS never removes members, so a reused archive silently keeps entries whose
+  # files are gone from $work. That defeats the guarantee the mtime normalization above exists to
+  # establish, and across two environments patched from one workstation it would upload the first
+  # environment's modules into the second one's function.
+  rm -f "$zip"
   (cd "$work" && zip -qrX "$zip" .) || die "cannot repack $function_name"
+  # Nothing else in the kit ever compares the PUBLISHED package's entry list to what was
+  # assembled: verify and reconcile only check kit-declared paths, so a stray entry would ship
+  # unnoticed. Assert the archive contains exactly the work tree.
+  if ! diff -q <(cd "$work" && find . -type f -print | sed 's|^\./||' | LC_ALL=C sort) \
+               <(unzip -Z1 "$zip" | grep -v '/$' | LC_ALL=C sort) >/dev/null; then
+    die "$function_name package entries do not match the assembled tree; refusing to publish"
+  fi
   aws_ lambda update-function-code --function-name "$function_name" \
     --zip-file "fileb://${zip}" >/dev/null || die "update-function-code failed for $function_name"
   aws_ lambda wait function-updated --function-name "$function_name" \

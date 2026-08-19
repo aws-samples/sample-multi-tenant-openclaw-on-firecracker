@@ -125,9 +125,43 @@ copying scripts onto live hosts by hand. So either do both, or do neither. If yo
 the data plane in this session (no AMI, no S3 write access — see §5), do **not** run 3a as a
 consolation prize; leave the environment alone and come back when you can do both.
 
-`canary` and `refresh` are only needed when the bootstrap/launch-template actually changed. If
-`apply` reports `bootstrap=ALREADY`, the fleet is already on the target launch template and
-replacing instances buys you nothing — skip both and go straight to acceptance.
+### When the bootstrap DID change, you must canary — and the order is not what it looks like
+
+If `apply` reports `bootstrap=ALREADY`, the fleet is already booting the target content: there is
+nothing new to validate, so skip `canary` and `refresh` and go to acceptance. **If it published a new
+bootstrap object, do NOT skip `canary`.** That object has never been executed by a booting host; the
+first host to try it is the one that finds out. A bad render or a failing script makes the lifecycle
+hook time out, the ASG marks the instance ABANDON and replaces it, the replacement reads the same
+object and fails the same way — a loop that does not converge. Three consecutive ABANDONs on a real
+environment were caught exactly this way.
+
+But `canary` launches through **the ASG's configured launch-template version**, so on an ASG pinned
+to an older version it will launch an instance on that OLD version, never match the new one, time
+out after ~30 minutes, and report a failure that says nothing about the new bootstrap — while
+burning one metal instance. "Canary first, then repoint" is therefore not achievable with this tool
+on a pinned ASG.
+
+The working order is **repoint → canary → revert on failure**:
+
+1. Repoint the ASG to the new LT version. This changes only what the NEXT host boots; it does not
+   touch running hosts. Running hosts are frequently on an even older version than the ASG's pinned
+   one, so this does not make the current state worse.
+2. Run the driver's own `canary`. It adds one instance on the new version, applies its checks,
+   terminates it and restores the desired count.
+3. If it fails, repoint the ASG back immediately. No running host was replaced, so the cost of
+   reverting is zero.
+
+Do **not** substitute an instance launched outside the ASG: an off-ASG instance has no lifecycle
+hook, and the hook timeout is the one failure mode that actually bites. It would also mean
+re-implementing the canary checks, which is how a check gets missed.
+
+`refresh` is a separate decision and is usually **not** needed on a re-run: the new bootstrap only
+affects hosts that boot after it, and the running fleet converges as instances are naturally
+replaced. Replacing a tenant-carrying metal fleet to move a counter is not worth it. Note also that
+the driver does not currently detect an already-completed refresh: its only preconditions are a
+canary PASS record and a matching LT version, both of which stay true afterwards, and it passes
+`SkipMatching:false`. So re-running `refresh` on a converged fleet will replace every host a second
+time for no configuration change. Decide deliberately; do not follow the `NEXT:` chain into it.
 
 ## 4. Why an already-patched environment still shows `UNKNOWN`
 
@@ -185,6 +219,13 @@ and it looks it up under the prefix the launch template actually references. If 
   `--values`; only `IMMUTABLE_DISK_REQUIRED` has a declared compatibility default (`false`,
   matching the deployment default) and the run prints when it falls back.
 - **Reading `verdict=DRIFTED` as failure.** See §1.
+- **Leaving a previous run's packaging temporaries in place.** The overlay packs each function into
+  `/tmp/<function-name>-restorepatch.zip`, a path keyed only on the function name. The driver now
+  deletes that archive before packing and asserts the archive's entries equal the assembled tree, so
+  a stale archive can no longer leak a removed module into a published package — but if you are
+  running a kit revision from before that fix, delete `/tmp/openclaw-*-restorepatch.zip` before you
+  start. This matters most when one workstation patches two environments: the archive path does not
+  carry the environment, and the function names are the same everywhere.
 - **Skipping `backup` because "nothing will change".** A re-run still publishes Lambda code if any
   module differs, and the alias still moves.
 - **Trusting the anchor a SECOND `backup` recorded.** `backup` records what is live *now*, so

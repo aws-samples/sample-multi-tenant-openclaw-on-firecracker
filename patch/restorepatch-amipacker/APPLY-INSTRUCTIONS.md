@@ -443,20 +443,20 @@ apply the routes with the deployment deferred, run the driver's `apply-api`, the
 
 ```bash
 OC_ROUTE_DEFER_DEPLOYMENT=1 \
-  bash lib/apply-api-routes.sh apply lib/taint-routes.spec.json "$API_ID" v1 "$REGION"
+  bash lib/apply-api-routes.sh apply lib/api-routes.spec.json "$API_ID" v1 "$REGION"
 bash lib/apply-restorepatch.sh apply-api --env environment.json --kit .   # creates THE deployment
-bash lib/apply-api-routes.sh verify    lib/taint-routes.spec.json "$API_ID" v1 "$REGION"
-bash lib/apply-api-routes.sh finalize  lib/taint-routes.spec.json "$API_ID" v1 "$REGION"
+bash lib/apply-api-routes.sh verify    lib/api-routes.spec.json "$API_ID" v1 "$REGION"
+bash lib/apply-api-routes.sh finalize  lib/api-routes.spec.json "$API_ID" v1 "$REGION"
 ```
 
 *Path B — routes only (no driver `apply-api` in this run).* The helper owns the deployment:
 
 ```bash
-bash lib/apply-api-routes.sh apply    lib/taint-routes.spec.json "$API_ID" v1 "$REGION"
-bash lib/apply-api-routes.sh verify   lib/taint-routes.spec.json "$API_ID" v1 "$REGION"
-bash lib/apply-api-routes.sh finalize lib/taint-routes.spec.json "$API_ID" v1 "$REGION"
+bash lib/apply-api-routes.sh apply    lib/api-routes.spec.json "$API_ID" v1 "$REGION"
+bash lib/apply-api-routes.sh verify   lib/api-routes.spec.json "$API_ID" v1 "$REGION"
+bash lib/apply-api-routes.sh finalize lib/api-routes.spec.json "$API_ID" v1 "$REGION"
 # rollback is available only before finalize:
-# bash lib/apply-api-routes.sh rollback lib/taint-routes.spec.json "$API_ID" v1 "$REGION"
+# bash lib/apply-api-routes.sh rollback lib/api-routes.spec.json "$API_ID" v1 "$REGION"
 ```
 
 `apply` adds each method only when absent, and when every declared route is already present in

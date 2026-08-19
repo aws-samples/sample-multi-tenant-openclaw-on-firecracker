@@ -784,12 +784,20 @@ if [ "${IMMUTABLE_DISK_REQUIRED:-false}" = "true" ] && [ ! -f "${IMMUTABLE_TPL}"
   log "FATAL(#517): ${IMMUTABLE_TPL} absent but IMMUTABLE_DISK_REQUIRED=true — refusing to launch on a stale identity fallback"
   exit 1
 fi
+# #526 — 归一化本次启动的 chatCompletions 意图,随 vm.json 落盘供 host-agent 差异化探测
+# app_health(chat_ep=1 的租户探 /v1/chat/completions,404=端点缺失=down)。CHAT_EP_ENABLED
+# 已在上方把 '""' 归一为空;1/true/yes/on→1,其余(含 0/false/空/未知)→0(保守:健康检查只对
+# 明确开 chat 的租户收紧,不误报 chat=0 的租户)。#526 落库后 wake/restore 传对的 1 → 记 1。
+case "$(printf '%s' "${CHAT_EP_ENABLED}" | tr '[:upper:]' '[:lower:]')" in
+  1|true|yes|on) VM_JSON_CHAT_EP=1 ;;
+  *) VM_JSON_CHAT_EP=0 ;;
+esac
 # Write VM metadata only after all image-selection fail-closed gates pass.
 # DDB fan-out retries pair this discovery file with a matching live Firecracker
 # process. Keep it after image fail-closed gates so host-agent does not discover
 # and repeatedly recover a launch that can never pass those gates.
 cat > "${VM_DIR}/vm.json" << VMEOF
-{"tenant_id":"${TENANT_ID}","vm_num":${VM_NUM},"guest_ip":"${GUEST_IP}","vcpu":${VCPU},"mem_mb":${MEM_MB},"config_template":"${CONFIG_TEMPLATE}"}
+{"tenant_id":"${TENANT_ID}","vm_num":${VM_NUM},"guest_ip":"${GUEST_IP}","vcpu":${VCPU},"mem_mb":${MEM_MB},"config_template":"${CONFIG_TEMPLATE}","chat_ep":${VM_JSON_CHAT_EP}}
 VMEOF
 # 记录本次启动【实际使用】的版本到 vm.json(ADR §4.3 末句:每次启动记录实际 snapshot_time,
 # 供审计与迁移判断)。失败不阻断启动(纯审计信息)。

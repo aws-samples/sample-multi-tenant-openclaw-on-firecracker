@@ -73,9 +73,6 @@
     ]
   },
   "kit_files": {
-    "lib/__pycache__/apply-api-routes.cpython-314.pyc": {
-      "sha256": "430cad5d794a94d8ce3cb13dc0c6ffa7f34ac871ade94dbfc36518ca2d640f12"
-    },
     "lib/apply-api-routes.py": {
       "sha256": "cafe3482c3de3cf802e0b1b2edf642afbb16bfe0bbd6a13e597a314024c10651"
     },

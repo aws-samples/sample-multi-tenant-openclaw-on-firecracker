@@ -855,6 +855,34 @@ apply_control_overlay() {
   else
     echo "   ABSENT openclaw-console-bff; console delivery path is not deployed"
   fi
+  # A re-run that changed nothing must not publish a version or move the alias -- that is exactly
+  # what invalidated the recorded rollback anchor between runs, because a later `backup` then
+  # captured the already-patched version as the rollback target. The package is now byte-
+  # reproducible, so $LATEST hashes identically across runs; compare the code the alias actually
+  # serves to $LATEST and skip when they already match. This check cannot be delegated to AWS:
+  # PublishVersion mints a new version number even when the code is unchanged.
+  latest_code_sha="$(aws_ lambda get-function-configuration --function-name "$FN" \
+    --query CodeSha256 --output text)" || die "cannot read \$LATEST CodeSha256 for $FN"
+  served_code_sha=""
+  served_version=""
+  if alias_for_skip="$(alias_name)"; then
+    served_version="$(aws_ lambda get-alias --function-name "$FN" --name "$alias_for_skip" \
+      --query FunctionVersion --output text 2>/dev/null)" || served_version=""
+    case "$served_version" in
+      ''|'$LATEST'|None) served_version="" ;;
+      *)
+        served_code_sha="$(aws_ lambda get-function-configuration --function-name "$FN" \
+          --qualifier "$served_version" --query CodeSha256 --output text 2>/dev/null)" \
+          || served_code_sha=""
+        ;;
+    esac
+  fi
+  if [ -n "$served_code_sha" ] && [ "$served_code_sha" = "$latest_code_sha" ]; then
+    echo "   SKIP publish: alias $alias_for_skip already serves this exact code (version $served_version)"
+    state_put api_applied_version "$served_version"
+    state_put api_alias_name "$alias_for_skip"
+    return 0
+  fi
   new_api_version="$(aws_ lambda publish-version --function-name "$FN" \
     --description restorepatch-amipacker --query Version --output text)" \
     || die "cannot publish patched API version"

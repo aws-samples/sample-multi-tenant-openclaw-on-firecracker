@@ -491,7 +491,6 @@ Restart=always
 RestartSec=5
 KillMode=process
 Environment=OC_GUEST_LOG_VSOCK_PORT=9999
-# PYTHONUNBUFFERED=1:同 host-agent(#449)—— Restart=always 长驻、stdout 接 journal socket
 # 非 tty → CPython 8KB 块缓冲 → 永不退出即永不 flush。reader 业务日志量更小,实测 4h43m 零业务
 # 输出。关缓冲让每行即时进 journal。只加 Environment=,不碰下面的 systemd 沙箱收紧项。
 Environment=PYTHONUNBUFFERED=1
@@ -652,6 +651,40 @@ if [ -n "${AGENTCORE_GW_URL}" ] && [ "${AGENTCORE_GW_URL}" != "none" ]; then
   echo "AGENTCORE_GATEWAY_URL=${AGENTCORE_GW_URL}" > /data/agentcore.env
   chown ubuntu:ubuntu /data/agentcore.env
   log "AgentCore config written: gateway=${AGENTCORE_GW_URL}"
+fi
+
+# Step 4c: SPIRE join-broker auto-install (#516 二期). 平台标准通道版:文件随
+# clawpool-deploy.sh 的 userdata sync 进 assets 桶,这里逐文件拉取后跑 setup。
+# 三个要点:
+#   1. SSM 总开关前置:/openclaw/spire-kit/enabled != "true" → 整段跳过,零下载
+#      零副作用 —— 没配置过 SPIRE 的环境行为与本段加入前完全一致。
+#   2. fail-open(客户明确要求):装失败【不】ABANDON host,host 照常注册接租户。
+#      失败时落两样东西作为告警接口,告警系统后续接入(不在本期范围):
+#        · marker 文件 /var/lib/openclaw/spire-kit.install-failed(内容=UTC 时间戳)
+#        · 日志令牌 "SPIRE-KIT-INSTALL-FAILED"(进 /var/log/openclaw-init.log + 串口)
+#      人工介入 = 上这台 host 重跑 setup(命令见 deploy/userdata/spire-kit/README.md)。
+#   3. 成功(含"开关没开"的干跑)会清掉 marker,保证 marker 语义 = 最近一次尝试失败。
+_spire_enabled=$(aws ssm get-parameter --region ${REGION} \
+  --name /openclaw/spire-kit/enabled --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+if [ "$(printf '%s' "${_spire_enabled}" | tr '[:upper:]' '[:lower:]')" = "true" ]; then
+  log "step4c: spire-kit enabled — installing join-broker"
+  SPIRE_KIT_DIR=/opt/openclaw/spire-kit
+  install -d -m 0755 "${SPIRE_KIT_DIR}"
+  _spire_kit_ok=1
+  for _f in spire-kit-setup.sh install.sh spire-join-broker.py spire-join-broker.service; do
+    aws s3 cp s3://${ASSETS_BUCKET}/deployment/scripts/spire-kit/${_f} ${SPIRE_KIT_DIR}/${_f} --region ${REGION} --no-progress 2>/dev/null \
+      || _s3_get s3://${ASSETS_BUCKET}/deployment/scripts/spire-kit/${_f} ${SPIRE_KIT_DIR}/${_f} || _spire_kit_ok=0
+  done
+  if [ "${_spire_kit_ok}" = "1" ] && OC_REGION="${REGION}" bash "${SPIRE_KIT_DIR}/spire-kit-setup.sh"; then
+    rm -f /var/lib/openclaw/spire-kit.install-failed
+    log "step4c: spire-kit broker installed + enabled"
+  else
+    install -d -m 0755 /var/lib/openclaw
+    date -u +%FT%TZ > /var/lib/openclaw/spire-kit.install-failed
+    log "step4c: SPIRE-KIT-INSTALL-FAILED (fail-open) — host continues serving; manual fix required, see deploy/userdata/spire-kit/README.md"
+  fi
+else
+  log "step4c: spire-kit disabled (SSM /openclaw/spire-kit/enabled='${_spire_enabled:-<unset>}') — skipped"
 fi
 
 # disabled; enabled hooks are private-S3 downloaded, SHA256 verified, atomically

@@ -1,0 +1,25 @@
+[Unit]
+# systemd **user** unit(uid 1000)—— 与数据盘形态的 spire-agent.service 配套。
+# 默认惰性:没有 ~/.spire-kit/shim.env(里面写 SPIRE_SHIM_UPSTREAM=…)就不启动,
+# 与 build-rootfs.sh 里 openclaw-creds.service 用 ConditionPathExists 的做法一致。
+Description=SPIRE header shim (spire-kit, inject JWT-SVID into egress)
+Documentation=file:///home/agent/.spire-kit/README
+After=network-online.target spire-agent.service
+Wants=network-online.target
+ConditionPathExists=%h/.spire-kit/shim.env
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.spire-kit/shim.env
+Environment=SPIRE_SHIM_SOCKET=%h/.spire-kit/run/agent.sock
+Environment=SPIRE_SHIM_AGENT_BIN=%h/.spire-kit/bin/spire-agent
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/bin/python3 %h/.spire-kit/header-shim.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

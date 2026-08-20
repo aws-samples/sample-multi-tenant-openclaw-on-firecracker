@@ -1,0 +1,30 @@
+[Unit]
+# systemd **user** unit(uid 1000 / agent)。装在数据盘上的
+# ~/.config/systemd/user/default.target.wants/ 里,和既有的 openclaw-gateway.service
+# 同级并列 —— 不改 rootfs、不改任何既有 unit、不需要 root。
+Description=SPIRE Agent (spire-kit, per-microVM identity)
+Documentation=file:///home/agent/.spire-kit/README
+After=network-online.target
+Wants=network-online.target
+# 故意【不】写 Before=/RequiredBy= openclaw-gateway.service:
+# 身份层起不来时 OpenClaw 必须照常服务(不因加固动作制造新的可用性悬崖)。
+# 总开关:标记文件不在就整个 unit 不跑(装了 kit 也能一键关)
+ConditionPathExists=%h/.spire-kit/enabled
+StartLimitIntervalSec=300
+StartLimitBurst=12
+
+[Service]
+Type=simple
+ExecStart=%h/.spire-kit/bootstrap.sh
+Restart=on-failure
+RestartSec=10
+# exit 3 = broker 判定"本次开机已发过 token"(正常状态,不是故障),不要无限重启。
+SuccessExitStatus=3
+Environment=HOME=%h
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+NoNewPrivileges=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

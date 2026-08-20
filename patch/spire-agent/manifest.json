@@ -1,0 +1,2189 @@
+{
+  "id": "spire-agent",
+  "base_sha": "8ca280d4f8a616a6f7e1ef3a48fc8981304942dc",
+  "patch_sha": "d3ee0c6593596639df9652609015c4c251d4630d",
+  "status": "MANUAL_REVIEW",
+  "excludes": [],
+  "cloudformation": {
+    "status": "NOT_APPLICABLE",
+    "reason": "本 range 内 deploy/stacks/*.py 零改动(git diff --name-only 8ca280d4..d3ee0c6 -- 'deploy/stacks/*.py' 为空),无 CDK 资源闭包可捕获",
+    "provenance": null,
+    "stacks": []
+  },
+  "kit_files": {
+    "lib/apply-lt.sh": {
+      "sha256": "07b9633975bdc8e76803af83f9057c09a3fe28707f5284c727933e3050238df1"
+    },
+    "lib/discover-env.sh": {
+      "sha256": "656889c0872df12a06ca5626902e2b0f1fdef12118d298c332216abf959f7ed9"
+    },
+    "lib/lt-userdata.py": {
+      "sha256": "240c14d26aa6668567f6c2bbaf8ca2d884f27532735873382317317633402779"
+    }
+  },
+  "paths": {
+    ".checkov.yml": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "6868f259156bdb2e470a8f0b3b02746add71d7b85c50781ebfc0bf7941e84973",
+      "operations": [
+        {
+          "resource": "inert-metadata:.checkov.yml (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:.checkov.yml >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    ".semgrepignore": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "efcc63b389dbf0b4134ed37a0fa4d574eee5daeba1ca375ae2865481ca5b0d47",
+      "operations": [
+        {
+          "resource": "inert-metadata:.semgrepignore (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:.semgrepignore >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "cli/oc-consistency.py": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/deploy-machine/oc-consistency.py.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "e09bc12332752aa722b62ec35bf5cb25976c4568ef3c2c53ca5b65444856c80b",
+      "operations": [
+        {
+          "resource": "operator-tool:cli/oc-consistency.py",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum host-scripts/deploy-machine/oc-consistency.py.patched  # 必须等于 patch_sha256;该文件由运维在部署机上使用,不驻留客户运行时",
+          "rollback_cli": null,
+          "artifact_refs": [
+            "host-scripts/deploy-machine/oc-consistency.py.patched"
+          ],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "fix-521-esm-compare"
+      ]
+    },
+    "deploy/edge/fluent-bit/install-fluent-bit.sh": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/deploy-machine/install-fluent-bit.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "19e7e3fd4e7e6871dbb6ec1c7cf1e8ac13dc22763d342ec2f7d89898d903a151",
+      "patch_sha256": "e730cc265aa2f775adf0364e0fb4a8b5bb5b39142d591481dae93995f0e84016",
+      "operations": [
+        {
+          "resource": "s3:deployment/observability/fluent-bit/install-fluent-bit.sh",
+          "class": "AUTO_CLI",
+          "apply_cli": "aws s3 cp host-scripts/deploy-machine/install-fluent-bit.sh.patched s3://$ASSETS_BUCKET/deployment/observability/fluent-bit/install-fluent-bit.sh.new --region $REGION && aws s3api head-object --bucket $ASSETS_BUCKET --key deployment/observability/fluent-bit/install-fluent-bit.sh.new --query ChecksumSHA256 --output text && aws s3 cp s3://$ASSETS_BUCKET/deployment/observability/fluent-bit/install-fluent-bit.sh.new s3://$ASSETS_BUCKET/deployment/observability/fluent-bit/install-fluent-bit.sh --region $REGION",
+          "verify_cli": "aws s3 cp s3://$ASSETS_BUCKET/deployment/observability/fluent-bit/install-fluent-bit.sh - --region $REGION | sha256sum  # 必须等于 patch_sha256",
+          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/observability/fluent-bit/install-fluent-bit.sh --copy-source $ASSETS_BUCKET/deployment/observability/fluent-bit/install-fluent-bit.sh?versionId=$OLD_VERSION_ID",
+          "artifact_refs": [
+            "host-scripts/deploy-machine/install-fluent-bit.sh.patched"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "fix-245-fb-enum"
+      ]
+    },
+    "deploy/lambda/api/core/host_taint.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/core/host_taint.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "f3c3c78be9acece29d4f0843e62706565f6773ddb081f4d72c0d10ca9afb1c5e",
+      "patch_sha256": "140befb1f0b56033698673730b9136793faadf638f8e1e68bd156d47bf49fc69",
+      "operations": [
+        {
+          "resource": "lambda:openclaw-api code (overlay: reuse live package deps)",
+          "class": "AUTO_CLI",
+          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -fsS -o live.zip && unzip -q live.zip -d pkg && cp lambda/api/core/host_taint.py pkg/core/host_taint.py && (cd pkg && zip -qr ../new.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://new.zip && aws lambda wait function-updated --function-name openclaw-api",
+          "verify_cli": "aws lambda get-function-configuration --function-name openclaw-api --query CodeSha256 --output text  # 必须 != 备份锚点的 CodeSha256",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-api --zip-file fileb://backup.zip && aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION",
+          "artifact_refs": [
+            "lambda/api/core/host_taint.py"
+          ],
+          "rollback_policy": "ALIAS_FLIP",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "fix-546-taint-timestamp"
+      ]
+    },
+    "deploy/userdata/init-host.sh": {
+      "change": "M",
+      "layer": "A-lt",
+      "artifact": "launch-template/init-host.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "b45d82fa7aa3a16b05a6ec6739b17b07d7bd5297341e98d4c008cacd3e20ec6d",
+      "patch_sha256": "51bdda6295c192c466cd13086601c8959b5d82e3249228c53d0cc3c9e441c2f9",
+      "operations": [
+        {
+          "resource": "ec2:launch-template $LT_ID (host) UserData — Step 4c hunk only",
+          "class": "MANUAL_CLI_REVIEW",
+          "apply_cli": "bash lib/apply-lt.sh pull && python3 lib/lt-userdata.py graft --rendered ./lt-current.userdata --artifact launch-template/init-host.sh.patched --hunk step4c --out ./lt-next.userdata && bash lib/apply-lt.sh push && bash lib/apply-lt.sh promote",
+          "verify_cli": "python3 lib/lt-userdata.py decode --version $NEW_LT_VERSION | grep -c 'step4c' && python3 lib/lt-userdata.py decode --version $NEW_LT_VERSION | grep -c '{{' # 必须为 0",
+          "rollback_cli": "bash lib/apply-lt.sh rollback --to $OLD_DEFAULT_VERSION",
+          "artifact_refs": [
+            "launch-template/init-host.sh.patched"
+          ],
+          "rollback_policy": "LT_REVERT",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "fix-516-spire-broker"
+      ]
+    },
+    "deploy/userdata/spire-kit/README.md": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "0818a09079ca283f6fec3922f623a06f907168df57ed516f41d2cd16d29645c1",
+      "operations": [
+        {
+          "resource": "inert-metadata:deploy/userdata/spire-kit/README.md (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:deploy/userdata/spire-kit/README.md >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "deploy/userdata/spire-kit/acceptance/logic_probe.py": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/spire-kit/acceptance/logic_probe.py.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "a2b7044b326b836168fb0b8bfa52c9d53c99fa24efb5a32f7a453a3f292cd469",
+      "operations": [
+        {
+          "resource": "kit-local tooling:logic_probe.py (not applied to any live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum host-scripts/spire-kit/acceptance/logic_probe.py.patched  # 必须等于 patch_sha256(仅证明产物完整)",
+          "rollback_cli": null,
+          "artifact_refs": [
+            "host-scripts/spire-kit/acceptance/logic_probe.py.patched"
+          ],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "fix-516-acceptance-tools"
+      ]
+    },
+    "deploy/userdata/spire-kit/acceptance/spire-kit-acceptance.sh": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/spire-kit/acceptance/spire-kit-acceptance.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "53769991693a8bf04325925e3d0e4f43efa4983b32a9589e2a200a53fc0ff7d9",
+      "operations": [
+        {
+          "resource": "kit-local tooling:spire-kit-acceptance.sh (not applied to any live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum host-scripts/spire-kit/acceptance/spire-kit-acceptance.sh.patched  # 必须等于 patch_sha256(仅证明产物完整)",
+          "rollback_cli": null,
+          "artifact_refs": [
+            "host-scripts/spire-kit/acceptance/spire-kit-acceptance.sh.patched"
+          ],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "fix-516-acceptance-tools"
+      ]
+    },
+    "deploy/userdata/spire-kit/guest/agent.conf.tmpl": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/spire-kit/guest/agent.conf.tmpl.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "122d07d126b31cf7501ca86dd9bf8544253a9fb7734812d6cd2ec4c113250779",
+      "operations": [
+        {
+          "resource": "rootfs-golden-image:guest/agent.conf.tmpl (bake, no automated channel)",
+          "class": "MANUAL_CLI_REVIEW",
+          "apply_cli": "aws s3 cp host-scripts/spire-kit/guest/agent.conf.tmpl.patched s3://$ASSETS_BUCKET/deployment/scripts/spire-kit/guest/agent.conf.tmpl --region $REGION # 然后在【金镜像构建机】上取回并运行 install-guest-kit.sh 重烤 rootfs",
+          "verify_cli": "在新起的 microVM 内: systemctl is-active spire-agent  (期望 active)",
+          "rollback_cli": "回滚 = 用上一版 rootfs 快照重建镜像;S3 对象按 OLD_VERSION_ID 还原",
+          "artifact_refs": [
+            "host-scripts/spire-kit/guest/agent.conf.tmpl.patched"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "fix-516-guest-kit"
+      ]
+    },
+    "deploy/userdata/spire-kit/guest/install-guest-kit.sh": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/spire-kit/guest/install-guest-kit.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "834a01339668c1b65ea11829d6e275657d5d986629d3ba057be9c2c9321709a4",
+      "operations": [
+        {
+          "resource": "rootfs-golden-image:guest/install-guest-kit.sh (bake, no automated channel)",
+          "class": "MANUAL_CLI_REVIEW",
+          "apply_cli": "aws s3 cp host-scripts/spire-kit/guest/install-guest-kit.sh.patched s3://$ASSETS_BUCKET/deployment/scripts/spire-kit/guest/install-guest-kit.sh --region $REGION # 然后在【金镜像构建机】上取回并运行 install-guest-kit.sh 重烤 rootfs",
+          "verify_cli": "在新起的 microVM 内: systemctl is-active spire-agent  (期望 active)",
+          "rollback_cli": "回滚 = 用上一版 rootfs 快照重建镜像;S3 对象按 OLD_VERSION_ID 还原",
+          "artifact_refs": [
+            "host-scripts/spire-kit/guest/install-guest-kit.sh.patched"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "fix-516-guest-kit"
+      ]
+    },
+    "deploy/userdata/spire-kit/guest/shim.env.example": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/spire-kit/guest/shim.env.example.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "d0391ac39b2520eed528dff68f099a9fdc79094be3e15dda79b01e9c42064990",
+      "operations": [
+        {
+          "resource": "rootfs-golden-image:guest/shim.env.example (bake, no automated channel)",
+          "class": "MANUAL_CLI_REVIEW",
+          "apply_cli": "aws s3 cp host-scripts/spire-kit/guest/shim.env.example.patched s3://$ASSETS_BUCKET/deployment/scripts/spire-kit/guest/shim.env.example --region $REGION # 然后在【金镜像构建机】上取回并运行 install-guest-kit.sh 重烤 rootfs",
+          "verify_cli": "在新起的 microVM 内: systemctl is-active spire-agent  (期望 active)",
+          "rollback_cli": "回滚 = 用上一版 rootfs 快照重建镜像;S3 对象按 OLD_VERSION_ID 还原",
+          "artifact_refs": [
+            "host-scripts/spire-kit/guest/shim.env.example.patched"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "fix-516-guest-kit"
+      ]
+    },
+    "deploy/userdata/spire-kit/guest/spire-agent-system.service": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/spire-kit/guest/spire-agent-system.service.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "df8bc4b08ebd6fbb7efa3fa886f89936d63484f3025baf2bd94eeeacf03c5c15",
+      "operations": [
+        {
+          "resource": "rootfs-golden-image:guest/spire-agent-system.service (bake, no automated channel)",
+          "class": "MANUAL_CLI_REVIEW",
+          "apply_cli": "aws s3 cp host-scripts/spire-kit/guest/spire-agent-system.service.patched s3://$ASSETS_BUCKET/deployment/scripts/spire-kit/guest/spire-agent-system.service --region $REGION # 然后在【金镜像构建机】上取回并运行 install-guest-kit.sh 重烤 rootfs",
+          "verify_cli": "在新起的 microVM 内: systemctl is-active spire-agent  (期望 active)",
+          "rollback_cli": "回滚 = 用上一版 rootfs 快照重建镜像;S3 对象按 OLD_VERSION_ID 还原",
+          "artifact_refs": [
+            "host-scripts/spire-kit/guest/spire-agent-system.service.patched"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "fix-516-guest-kit"
+      ]
+    },
+    "deploy/userdata/spire-kit/guest/spire-agent.service": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/spire-kit/guest/spire-agent.service.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "44a731a0af277dd63495f6698cdecc58f6e827987efcdd20ab6fab474cee8b64",
+      "operations": [
+        {
+          "resource": "rootfs-golden-image:guest/spire-agent.service (bake, no automated channel)",
+          "class": "MANUAL_CLI_REVIEW",
+          "apply_cli": "aws s3 cp host-scripts/spire-kit/guest/spire-agent.service.patched s3://$ASSETS_BUCKET/deployment/scripts/spire-kit/guest/spire-agent.service --region $REGION # 然后在【金镜像构建机】上取回并运行 install-guest-kit.sh 重烤 rootfs",
+          "verify_cli": "在新起的 microVM 内: systemctl is-active spire-agent  (期望 active)",
+          "rollback_cli": "回滚 = 用上一版 rootfs 快照重建镜像;S3 对象按 OLD_VERSION_ID 还原",
+          "artifact_refs": [
+            "host-scripts/spire-kit/guest/spire-agent.service.patched"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "fix-516-guest-kit"
+      ]
+    },
+    "deploy/userdata/spire-kit/guest/spire-bootstrap.sh": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/spire-kit/guest/spire-bootstrap.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "6803dffa4a842ebe5a25959fee270da5c239b89367799588918cf995cee08c45",
+      "operations": [
+        {
+          "resource": "rootfs-golden-image:guest/spire-bootstrap.sh (bake, no automated channel)",
+          "class": "MANUAL_CLI_REVIEW",
+          "apply_cli": "aws s3 cp host-scripts/spire-kit/guest/spire-bootstrap.sh.patched s3://$ASSETS_BUCKET/deployment/scripts/spire-kit/guest/spire-bootstrap.sh --region $REGION # 然后在【金镜像构建机】上取回并运行 install-guest-kit.sh 重烤 rootfs",
+          "verify_cli": "在新起的 microVM 内: systemctl is-active spire-agent  (期望 active)",
+          "rollback_cli": "回滚 = 用上一版 rootfs 快照重建镜像;S3 对象按 OLD_VERSION_ID 还原",
+          "artifact_refs": [
+            "host-scripts/spire-kit/guest/spire-bootstrap.sh.patched"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "fix-516-guest-kit"
+      ]
+    },
+    "deploy/userdata/spire-kit/guest/spire-header-shim-system.service": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/spire-kit/guest/spire-header-shim-system.service.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "5b3573409a0aba968d197f4e7e06a137c50d0627f2ff11ed8e52e4c33193504c",
+      "operations": [
+        {
+          "resource": "rootfs-golden-image:guest/spire-header-shim-system.service (bake, no automated channel)",
+          "class": "MANUAL_CLI_REVIEW",
+          "apply_cli": "aws s3 cp host-scripts/spire-kit/guest/spire-header-shim-system.service.patched s3://$ASSETS_BUCKET/deployment/scripts/spire-kit/guest/spire-header-shim-system.service --region $REGION # 然后在【金镜像构建机】上取回并运行 install-guest-kit.sh 重烤 rootfs",
+          "verify_cli": "在新起的 microVM 内: systemctl is-active spire-agent  (期望 active)",
+          "rollback_cli": "回滚 = 用上一版 rootfs 快照重建镜像;S3 对象按 OLD_VERSION_ID 还原",
+          "artifact_refs": [
+            "host-scripts/spire-kit/guest/spire-header-shim-system.service.patched"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "fix-516-guest-kit"
+      ]
+    },
+    "deploy/userdata/spire-kit/guest/spire-header-shim.py": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/spire-kit/guest/spire-header-shim.py.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "fc2fea8f6710f0376dd7186107dcb0de2d45c9f4d325eecd25ae7f2d80818494",
+      "operations": [
+        {
+          "resource": "rootfs-golden-image:guest/spire-header-shim.py (bake, no automated channel)",
+          "class": "MANUAL_CLI_REVIEW",
+          "apply_cli": "aws s3 cp host-scripts/spire-kit/guest/spire-header-shim.py.patched s3://$ASSETS_BUCKET/deployment/scripts/spire-kit/guest/spire-header-shim.py --region $REGION # 然后在【金镜像构建机】上取回并运行 install-guest-kit.sh 重烤 rootfs",
+          "verify_cli": "在新起的 microVM 内: systemctl is-active spire-agent  (期望 active)",
+          "rollback_cli": "回滚 = 用上一版 rootfs 快照重建镜像;S3 对象按 OLD_VERSION_ID 还原",
+          "artifact_refs": [
+            "host-scripts/spire-kit/guest/spire-header-shim.py.patched"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "fix-516-guest-kit"
+      ]
+    },
+    "deploy/userdata/spire-kit/guest/spire-header-shim.service": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/spire-kit/guest/spire-header-shim.service.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "9db21430c41eb2ea4423dad4d622b72483e46594e73ed7dffb953222411e2835",
+      "operations": [
+        {
+          "resource": "rootfs-golden-image:guest/spire-header-shim.service (bake, no automated channel)",
+          "class": "MANUAL_CLI_REVIEW",
+          "apply_cli": "aws s3 cp host-scripts/spire-kit/guest/spire-header-shim.service.patched s3://$ASSETS_BUCKET/deployment/scripts/spire-kit/guest/spire-header-shim.service --region $REGION # 然后在【金镜像构建机】上取回并运行 install-guest-kit.sh 重烤 rootfs",
+          "verify_cli": "在新起的 microVM 内: systemctl is-active spire-agent  (期望 active)",
+          "rollback_cli": "回滚 = 用上一版 rootfs 快照重建镜像;S3 对象按 OLD_VERSION_ID 还原",
+          "artifact_refs": [
+            "host-scripts/spire-kit/guest/spire-header-shim.service.patched"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "fix-516-guest-kit"
+      ]
+    },
+    "deploy/userdata/spire-kit/hooks/README.md": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "e005138e36b08a800d270866efe42eb4aa3f8263681ba66c20a36f70f7f018d3",
+      "operations": [
+        {
+          "resource": "inert-metadata:deploy/userdata/spire-kit/hooks/README.md (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:deploy/userdata/spire-kit/hooks/README.md >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "deploy/userdata/spire-kit/hooks/host-user-hook.sh": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/spire-kit/hooks/host-user-hook.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "a8886a92d72df48b7632be5bda02e8d678ee447522f2a190d5534ed4b50427e6",
+      "operations": [
+        {
+          "resource": "kit-local tooling:host-user-hook.sh (not applied to any live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum host-scripts/spire-kit/hooks/host-user-hook.sh.patched  # 必须等于 patch_sha256(仅证明产物完整)",
+          "rollback_cli": null,
+          "artifact_refs": [
+            "host-scripts/spire-kit/hooks/host-user-hook.sh.patched"
+          ],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "fix-516-acceptance-tools"
+      ]
+    },
+    "deploy/userdata/spire-kit/install.sh": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/spire-kit/install.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "13d3ea3b773f6b33f67833687327f74edde623557fb5c232d0fcef45c928b457",
+      "operations": [
+        {
+          "resource": "s3:deployment/scripts/spire-kit/install.sh",
+          "class": "AUTO_CLI",
+          "apply_cli": "aws s3 cp host-scripts/spire-kit/install.sh.patched s3://$ASSETS_BUCKET/deployment/scripts/spire-kit/install.sh.new --region $REGION && aws s3api head-object --bucket $ASSETS_BUCKET --key deployment/scripts/spire-kit/install.sh.new --query ChecksumSHA256 --output text && aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/spire-kit/install.sh.new s3://$ASSETS_BUCKET/deployment/scripts/spire-kit/install.sh --region $REGION",
+          "verify_cli": "aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/spire-kit/install.sh - --region $REGION | sha256sum  # 必须等于 patch_sha256",
+          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/spire-kit/install.sh --copy-source $ASSETS_BUCKET/deployment/scripts/spire-kit/install.sh?versionId=$OLD_VERSION_ID",
+          "artifact_refs": [
+            "host-scripts/spire-kit/install.sh.patched"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "fix-516-spire-broker"
+      ]
+    },
+    "deploy/userdata/spire-kit/registrar-mock-customer.py": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/spire-kit/registrar-mock-customer.py.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "7da996c5d2f755893986394c9ab1182221d8833e25f9a1fdc0ac4c84201b7597",
+      "operations": [
+        {
+          "resource": "kit-local tooling:registrar-mock-customer.py (not applied to any live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum host-scripts/spire-kit/registrar-mock-customer.py.patched  # 必须等于 patch_sha256(仅证明产物完整)",
+          "rollback_cli": null,
+          "artifact_refs": [
+            "host-scripts/spire-kit/registrar-mock-customer.py.patched"
+          ],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "fix-516-acceptance-tools"
+      ]
+    },
+    "deploy/userdata/spire-kit/registrar-stub.py": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/spire-kit/registrar-stub.py.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "6917358c677381ba431b42b7e47f9fc3debd72253b84857f18917525d66e03dd",
+      "operations": [
+        {
+          "resource": "kit-local tooling:registrar-stub.py (not applied to any live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum host-scripts/spire-kit/registrar-stub.py.patched  # 必须等于 patch_sha256(仅证明产物完整)",
+          "rollback_cli": null,
+          "artifact_refs": [
+            "host-scripts/spire-kit/registrar-stub.py.patched"
+          ],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "fix-516-acceptance-tools"
+      ]
+    },
+    "deploy/userdata/spire-kit/spire-join-broker.py": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/spire-kit/spire-join-broker.py.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "c3e9c8cf144e42c369939c8d851a2778f9a7e53c5b4afcf59f972ab57ae0319f",
+      "operations": [
+        {
+          "resource": "s3:deployment/scripts/spire-kit/spire-join-broker.py",
+          "class": "AUTO_CLI",
+          "apply_cli": "aws s3 cp host-scripts/spire-kit/spire-join-broker.py.patched s3://$ASSETS_BUCKET/deployment/scripts/spire-kit/spire-join-broker.py.new --region $REGION && aws s3api head-object --bucket $ASSETS_BUCKET --key deployment/scripts/spire-kit/spire-join-broker.py.new --query ChecksumSHA256 --output text && aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/spire-kit/spire-join-broker.py.new s3://$ASSETS_BUCKET/deployment/scripts/spire-kit/spire-join-broker.py --region $REGION",
+          "verify_cli": "aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/spire-kit/spire-join-broker.py - --region $REGION | sha256sum  # 必须等于 patch_sha256",
+          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/spire-kit/spire-join-broker.py --copy-source $ASSETS_BUCKET/deployment/scripts/spire-kit/spire-join-broker.py?versionId=$OLD_VERSION_ID",
+          "artifact_refs": [
+            "host-scripts/spire-kit/spire-join-broker.py.patched"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "fix-516-spire-broker"
+      ]
+    },
+    "deploy/userdata/spire-kit/spire-join-broker.service": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/spire-kit/spire-join-broker.service.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "14ba6bd4819a8ecdfc9e77d96af9eed9232ab746f9cc6b5b0c9176efb75f3787",
+      "operations": [
+        {
+          "resource": "s3:deployment/scripts/spire-kit/spire-join-broker.service",
+          "class": "AUTO_CLI",
+          "apply_cli": "aws s3 cp host-scripts/spire-kit/spire-join-broker.service.patched s3://$ASSETS_BUCKET/deployment/scripts/spire-kit/spire-join-broker.service.new --region $REGION && aws s3api head-object --bucket $ASSETS_BUCKET --key deployment/scripts/spire-kit/spire-join-broker.service.new --query ChecksumSHA256 --output text && aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/spire-kit/spire-join-broker.service.new s3://$ASSETS_BUCKET/deployment/scripts/spire-kit/spire-join-broker.service --region $REGION",
+          "verify_cli": "aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/spire-kit/spire-join-broker.service - --region $REGION | sha256sum  # 必须等于 patch_sha256",
+          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/spire-kit/spire-join-broker.service --copy-source $ASSETS_BUCKET/deployment/scripts/spire-kit/spire-join-broker.service?versionId=$OLD_VERSION_ID",
+          "artifact_refs": [
+            "host-scripts/spire-kit/spire-join-broker.service.patched"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "fix-516-spire-broker"
+      ]
+    },
+    "deploy/userdata/spire-kit/spire-kit-setup.sh": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/spire-kit/spire-kit-setup.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "c677d3eeb3320a3b309509aa58b250ff3034c8c52f3682a26981bd4c7f3d7d89",
+      "operations": [
+        {
+          "resource": "s3:deployment/scripts/spire-kit/spire-kit-setup.sh",
+          "class": "AUTO_CLI",
+          "apply_cli": "aws s3 cp host-scripts/spire-kit/spire-kit-setup.sh.patched s3://$ASSETS_BUCKET/deployment/scripts/spire-kit/spire-kit-setup.sh.new --region $REGION && aws s3api head-object --bucket $ASSETS_BUCKET --key deployment/scripts/spire-kit/spire-kit-setup.sh.new --query ChecksumSHA256 --output text && aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/spire-kit/spire-kit-setup.sh.new s3://$ASSETS_BUCKET/deployment/scripts/spire-kit/spire-kit-setup.sh --region $REGION",
+          "verify_cli": "aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/spire-kit/spire-kit-setup.sh - --region $REGION | sha256sum  # 必须等于 patch_sha256",
+          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/spire-kit/spire-kit-setup.sh --copy-source $ASSETS_BUCKET/deployment/scripts/spire-kit/spire-kit-setup.sh?versionId=$OLD_VERSION_ID",
+          "artifact_refs": [
+            "host-scripts/spire-kit/spire-kit-setup.sh.patched"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "fix-516-spire-broker"
+      ]
+    },
+    "docs/aws-guide-en/09-api-integration.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "08b4ba56dc44dba17d0a104e433491d361242264178b4b7aed7fa3bec18e5090",
+      "patch_sha256": "e0104acc4827582a12ba414c303ca319954ec26df7d09e7bcc239c21920757d0",
+      "operations": [
+        {
+          "resource": "inert-metadata:docs/aws-guide-en/09-api-integration.md (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:docs/aws-guide-en/09-api-integration.md >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide/09-api-integration.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "ed4bca68862f9072e3f3f46664e1818f49d258efacdff8d30340ba9c1d44d554",
+      "patch_sha256": "8817415d5cd3855db34adfeacef38badf13ff893d91465b63c53bb385f68ab0a",
+      "operations": [
+        {
+          "resource": "inert-metadata:docs/aws-guide/09-api-integration.md (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:docs/aws-guide/09-api-integration.md >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide/19-config-parameter-baseline.md": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "258f7dab5d3bcd8f4ef9a2a72330ee9a6f48b1ecf20f73824a8df56f844edbe5",
+      "operations": [
+        {
+          "resource": "inert-metadata:docs/aws-guide/19-config-parameter-baseline.md (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:docs/aws-guide/19-config-parameter-baseline.md >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "docs/aws-guide/README.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "58e6c56425cb01a30d85ec1ed418d076da0e7561537d82e9a5fe37362cd1efb6",
+      "patch_sha256": "e1cb520ac5ebd87ff916b3d4037e2d010ca62004a259bd7eec000db0c1219403",
+      "operations": [
+        {
+          "resource": "inert-metadata:docs/aws-guide/README.md (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:docs/aws-guide/README.md >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/manifest-2026-08-20-062714-8cda33b2.json": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "f8dbc7a7d6cea8595486185409c36f9f51a432dd2cca18dbe7cd12450062e298",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/manifest-2026-08-20-062714-8cda33b2.json (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/manifest-2026-08-20-062714-8cda33b2.json >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/manifest-2026-08-20-150034-29680abb.json": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "5f7f759d0d240e4c5008e0834e4fecd847808506b29607b53c719d9058c132ef",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/manifest-2026-08-20-150034-29680abb.json (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/manifest-2026-08-20-150034-29680abb.json >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/push-marker-2026-08-20-062714-8cda33b2.md": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "ffc1b897f6997c6fff19435385733014c7f59832120dd33d343cfc6f654cbe9f",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/push-marker-2026-08-20-062714-8cda33b2.md (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/push-marker-2026-08-20-062714-8cda33b2.md >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/push-marker-2026-08-20-150034-29680abb.md": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "5538c194aa18791125db787063b9b0f6b811b5817c0e07832266f1a9eb3e2a21",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/push-marker-2026-08-20-150034-29680abb.md (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/push-marker-2026-08-20-150034-29680abb.md >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/APPLY-INSTRUCTIONS.md": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "108e61af0539c82dec21a2ebe7d9118f7c5d9804c9c5dc2ce7520f8646ea3a60",
+      "patch_sha256": "e5166dcde55bdc6ac288a550a5d94e4a54e3bd3447c45435ef518a7ca6cf768e",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/APPLY-INSTRUCTIONS.md (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/APPLY-INSTRUCTIONS.md >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/RE-RUN-GUIDE.md": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "49ff182d1495eb11be080de225f15df4d2d1cb57265858f69213d1a69b2eeb13",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/RE-RUN-GUIDE.md (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/RE-RUN-GUIDE.md >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/backup-data.sh.patched": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "5165344d3440685d696fe933b297de8cf4f6188b9103b4c78e31948ba9071c50",
+      "patch_sha256": "cf25e8f220cbf3d221a2333c4edaa7826adfecd047da9ed0dc3d39ca4addd433",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/host-scripts/backup-data.sh.patched (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/host-scripts/backup-data.sh.patched >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/deploy-machine/config.yml.example": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "c11a818512d9854ea2b13519655705e5b1ba62fa4ebcf3970bc786ccde069089",
+      "patch_sha256": "43771e9c0069f9b0e8b6b19aad540cd0e73e26ce0b3e5125965e5735de1460ab",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/host-scripts/deploy-machine/config.yml.example (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/host-scripts/deploy-machine/config.yml.example >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/deploy-machine/deploy/lib/dispatch_infra.py": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "af63e40f13d04c004a26c97b19e7d503a7c0c30b778fbc5460c41efceb51ca06",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/host-scripts/deploy-machine/deploy/lib/dispatch_infra.py (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/host-scripts/deploy-machine/deploy/lib/dispatch_infra.py >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/deploy-machine/deploy/monitoring/grafana/dashboards/openclaw-fleet.json": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "9af672e1008d36c2d5946a3e45585f8e74f190f7e307e1c48694daa99a2475c3",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/host-scripts/deploy-machine/deploy/monitoring/grafana/dashboards/openclaw-fleet.json (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/host-scripts/deploy-machine/deploy/monitoring/grafana/dashboards/openclaw-fleet.json >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/deploy-machine/deploy/stacks/ha_edge.py": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "26adca55181e710fb09c6d659dbbecd4d7d0733e1e6fb49cf293cf7dd931bf51",
+      "patch_sha256": "16b2e3ca53fdaff713b22e3d249f8b0aee876e5bc2f98891a0811c8d7e2adb1e",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/host-scripts/deploy-machine/deploy/stacks/ha_edge.py (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/host-scripts/deploy-machine/deploy/stacks/ha_edge.py >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/deploy-machine/deploy/stacks/lambdas.py": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "1325333ad16be09088e17139f214725c2e0264d06f3d1a8a3de79dc12833cee5",
+      "patch_sha256": "388e2926786e7bb103c7a7090c6cc877831af8b820094f0180120f0320226f0e",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/host-scripts/deploy-machine/deploy/stacks/lambdas.py (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/host-scripts/deploy-machine/deploy/stacks/lambdas.py >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/deploy-machine/samples/config-sg-prod.yaml": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "2737ca4a93b580cefcdefeed719e534f6c417b2ad238da2fdf237f80e62d9419",
+      "patch_sha256": "57c5ccd3972c8716cbaf63e7d1b027b40dfa9ebc97301d0707d7c26c9d9f30f7",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/host-scripts/deploy-machine/samples/config-sg-prod.yaml (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/host-scripts/deploy-machine/samples/config-sg-prod.yaml >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/deploy-machine/samples/ent-config.template": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "8186a12b7b3ba78754495411944d187ab29e8db072cdabc4f2e55796b5595c5f",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/host-scripts/deploy-machine/samples/ent-config.template (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/host-scripts/deploy-machine/samples/ent-config.template >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/deploy-machine/samples/ent_config_template_sample.yaml": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "ad4c7d2ab6ca8031dbd4dedf989eb694723276f3b0741dd52e286fc73bc36d2d",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/host-scripts/deploy-machine/samples/ent_config_template_sample.yaml (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/host-scripts/deploy-machine/samples/ent_config_template_sample.yaml >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/deploy-machine/scripts/preflight-check.sh": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "0b4bdbdcf7692a9b58b26b24b4e2a8f54419bfdada7131afac015861ddc9e97d",
+      "patch_sha256": "e92131abad4e5aabd93c313ec29f820418f154907f8660272c7b488997aabb1f",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/host-scripts/deploy-machine/scripts/preflight-check.sh (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/host-scripts/deploy-machine/scripts/preflight-check.sh >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/deploy-machine/setup.sh": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "9556b1d782d22c625530c89ad9d95757786ea065c9a5fa8896b6841216e57ec4",
+      "patch_sha256": "6909db3165c4966dd47c344d68363bf47e54b310b47be8e1829b8c08b6d87798",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/host-scripts/deploy-machine/setup.sh (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/host-scripts/deploy-machine/setup.sh >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/edge/fluent-bit/install-fluent-bit.sh": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "57fc2b3bc3b210d1fac03008bfcb486398044947637102e0f881390be5c2dff8",
+      "patch_sha256": "19e7e3fd4e7e6871dbb6ec1c7cf1e8ac13dc22763d342ec2f7d89898d903a151",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/host-scripts/edge/fluent-bit/install-fluent-bit.sh (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/host-scripts/edge/fluent-bit/install-fluent-bit.sh >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/host-agent.py.patched": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "a9691f0f57f2736571bbe85cab284f6914c0e98baaadf4740ee001c173517f35",
+      "patch_sha256": "70a002e58c7b36e4ae03ec715873411fce174880932507f06126963eeb375c25",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/host-scripts/host-agent.py.patched (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/host-scripts/host-agent.py.patched >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/host-scripts/launch-vm.sh.patched": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "69218606831d44f08f0547ab3824266cddb2d3e52b4bacfead9041ffd22912bb",
+      "patch_sha256": "7d9f7c6e76dfab2f79e948125b07c525ea61b3ddb78dcf3830a39ff9fde12e0a",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/host-scripts/launch-vm.sh.patched (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/host-scripts/launch-vm.sh.patched >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/api/core/auth.py": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "e595d6cc28916fda68e7f7c8b8ac2d1835dca8215c8f9c7e8d845b128fc4ba7e",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/lambda/api/core/auth.py (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/lambda/api/core/auth.py >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/api/core/clients.py": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "5dfda69924818046fd899b2a64290eb20d6eaf8c3d36a6752b9c22d4fc70cc67",
+      "patch_sha256": "e9f7c41796db3963cead246350e343d4bf8d0fb6164f020ac8c57449f3253dc7",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/lambda/api/core/clients.py (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/lambda/api/core/clients.py >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/api/core/version_labels.py": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "42edd99cd23f583ca0b9d8cd480d96f0056051a5e9047e00e6403f3b36c15f44",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/lambda/api/core/version_labels.py (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/lambda/api/core/version_labels.py >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/api/handler.py": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "50fc23a86ef62e4a26e86b2c396f1f5189396a7ccef11e7f3e65d50bc40e18fe",
+      "patch_sha256": "c25c33697b9a0334013884b4ddf9a1d6e29592053cd2a4a60d8c712d45b658e2",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/lambda/api/handler.py (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/lambda/api/handler.py >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/api/services/dispatch_service.py": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "f4c373445381e312e7e6d3e5cabdea8ca8af08a05913e2f7a67934fd638330dd",
+      "patch_sha256": "07a2b273799979a205e1fa42af9efbb89f8897afa1ab1140d41bfa418b48814b",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/lambda/api/services/dispatch_service.py (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/lambda/api/services/dispatch_service.py >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/api/services/host_service.py": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "df6c5a96f5f38931dd77beec9e4f6aa380e15f4bc148a2f110d3f997ccb72097",
+      "patch_sha256": "26bbf6ac8577a4e76285b7160c9ee055f507d32a5894e0034d208d5535d0ced5",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/lambda/api/services/host_service.py (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/lambda/api/services/host_service.py >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/api/services/image_slot_service.py": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "bf9b1df0feda76ee776ba7b54682f704ef3cb5a9eb8f3433f001ce1c3b445ea3",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/lambda/api/services/image_slot_service.py (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/lambda/api/services/image_slot_service.py >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/api/services/rolling_upgrade_service.py": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "456fff98677a9689c405a032de6e3caf7fb51c8afb3932896ed19c02398b8ebc",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/lambda/api/services/rolling_upgrade_service.py (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/lambda/api/services/rolling_upgrade_service.py >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/api/services/tenant_service.py": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "2ad290ab37f73a763c6e6a761ea120cc27268bc5e4b73d9d15593eb004177592",
+      "patch_sha256": "00603cf40f7ce03192c5a6f1cee0b0cd9548991fb48330eb88c66c2585efaf0f",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/lambda/api/services/tenant_service.py (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/lambda/api/services/tenant_service.py >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lambda/backup/handler.py": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "b72f4f064ebfb198bea2c2cee3c9e493151df22f349aebcea837c68d54c73c94",
+      "patch_sha256": "474e5e7c434081235fb1a21d86cf541a4cc1bb9b81ba1394c2b7a42965706e53",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/lambda/backup/handler.py (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/lambda/backup/handler.py >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lib/api-routes.spec.json": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "2a0620dcff0911680691ab7dca5aede60f379a27a87e550711445fd1a3d52c2d",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/lib/api-routes.spec.json (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/lib/api-routes.spec.json >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lib/apply-api-routes.py": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "cafe3482c3de3cf802e0b1b2edf642afbb16bfe0bbd6a13e597a314024c10651",
+      "patch_sha256": "9a7f1a4e48aa8d8eeae7133617f1e99355f9432896f7d0f31a38e4a07e66c5a4",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/lib/apply-api-routes.py (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/lib/apply-api-routes.py >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lib/apply-restorepatch.sh": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "2e5ff01c20bb50d11c7b3a51142857f2b2777a834a4b879f4f8bb6db5ae7b146",
+      "patch_sha256": "e01f1c43fd44ce54945146ae65ab278f5eff15417ad07ca919e39eaa951daa9d",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/lib/apply-restorepatch.sh (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/lib/apply-restorepatch.sh >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lib/autopatch.sh": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "0dd3fee608f4d07724770d79bdba497930c1c0ac1ccc84cbb496ab17ec44f6ae",
+      "patch_sha256": "09b261e1d8f5ede80ec8f1800914dc8b4e4fc08807b35f04b3fa9a95ccec8161",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/lib/autopatch.sh (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/lib/autopatch.sh >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lib/interview-once.py": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "993392e6c8e6d6036bbea8a94e516e8d9bbbc16fea2b5071ce2a922b6911fd26",
+      "patch_sha256": "dbe2e1829abd25fb03d916f35e67fcaa41817fdc0cb727badf17cd27a4692491",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/lib/interview-once.py (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/lib/interview-once.py >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/lib/taint-routes.spec.json": {
+      "change": "D",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "DELETED",
+      "artifact_disposition": {
+        "kind": "SOURCE_DELETED",
+        "evidence": "git-diff-delete"
+      },
+      "base_sha256": "925b39e80ba0d3e7bb4e46d4d2224e3e255afa78569221fc58cb2574a9fd8690",
+      "patch_sha256": null,
+      "operations": [
+        {
+          "resource": "source-tree:patch/restorepatch-amipacker/lib/taint-routes.spec.json removed upstream (kit tooling of the预置 patch, not a customer resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "test ! -e patch/restorepatch-amipacker/lib/taint-routes.spec.json  # 客户环境不含本仓 patch/ 目录,此删除对其无副作用",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/manifest.json": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "41aad9ec11216d07f5e4d542ea4bda57000133d3b9ce37918240808d5b15df4e",
+      "patch_sha256": "6199ae4ecca4bb3e538e3611d27fb7e3b84e503ca9999074163109a97f7b1689",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/manifest.json (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/manifest.json >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/resources/cloudformation/OpenClawImage.patch.json": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "1aff5dc11baa930fc7317472d522e6d2c407373ea55924478a1fcb6f740eb319",
+      "patch_sha256": "9250a8038858a253aebf96f6c986ac8842abeb28202c48088099c0dc8dc3cb8a",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/resources/cloudformation/OpenClawImage.patch.json (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/resources/cloudformation/OpenClawImage.patch.json >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/resources/cloudformation/OpenClawOrchestrator.patch.json": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "c08eb63f666b7333b244373565c3c7647b3a12edefc460a3fd3cac20656b7cc6",
+      "patch_sha256": "685999f63f6be58eec6139a91a7494ae428a9571a4e60273c3f287e27ca95a63",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/resources/cloudformation/OpenClawOrchestrator.patch.json (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/resources/cloudformation/OpenClawOrchestrator.patch.json >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/resources/cloudformation/base.assembly-index.json": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "a0d8bd6ee39ce36059c6aa7f23d4d4d40db2c37778e92149055da64c727149e9",
+      "patch_sha256": "ca1d06db0db6f3a592c47e97f7483b840df581aabe3eadc6315527b8514a0c95",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/resources/cloudformation/base.assembly-index.json (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/resources/cloudformation/base.assembly-index.json >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/restorepatch-amipacker/resources/cloudformation/patch.assembly-index.json": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "b385501df9d8302f406973b93e8388ac8aca3d81e73472c8698d95a23b120165",
+      "patch_sha256": "95ccb06acd06f11ddae22fbf800fc93009c4f19ed007107215da276ace3b6ff7",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/restorepatch-amipacker/resources/cloudformation/patch.assembly-index.json (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/restorepatch-amipacker/resources/cloudformation/patch.assembly-index.json >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "probe.yaml": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "559e48ca31bb9876d6d580fe6b39605b9f22795c27168d873f168afed41ddfb9",
+      "operations": [
+        {
+          "resource": "inert-metadata:probe.yaml (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:probe.yaml >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "pyproject.toml": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "6433eea11139e62a397ec701cf29399843ca13abd415eb1ba04acf50d3354915",
+      "patch_sha256": "19fc757caf7a4ee74ebbbe0cf3f90c9ba84a71b919952cb2d8c9440167816bc7",
+      "operations": [
+        {
+          "resource": "inert-metadata:pyproject.toml (carried by the public tree, applied to no live resource)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:pyproject.toml >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "scripts/checks/python.sh": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/deploy-machine/python.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "c675ad516e061f5ef3d8ef76ea512b4ba5e0145d7e286a3753211eb6089e6a89",
+      "patch_sha256": "a9c71873e16db21543e7b878b3535ef7a9be086d7c4587084ed2dfae84526d66",
+      "operations": [
+        {
+          "resource": "operator-tool:scripts/checks/python.sh",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum host-scripts/deploy-machine/python.sh.patched  # 必须等于 patch_sha256;该文件由运维在部署机上使用,不驻留客户运行时",
+          "rollback_cli": null,
+          "artifact_refs": [
+            "host-scripts/deploy-machine/python.sh.patched"
+          ],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "fix-checks-python"
+      ]
+    },
+    "scripts/preflight-check.sh": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/deploy-machine/preflight-check.sh.patched",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "e92131abad4e5aabd93c313ec29f820418f154907f8660272c7b488997aabb1f",
+      "patch_sha256": "1c82c8a58f10edc44aaa40c76caebd5df6e80c958ca261261817256cacb47a7b",
+      "operations": [
+        {
+          "resource": "operator-tool:scripts/preflight-check.sh",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum host-scripts/deploy-machine/preflight-check.sh.patched  # 必须等于 patch_sha256;该文件由运维在部署机上使用,不驻留客户运行时",
+          "rollback_cli": null,
+          "artifact_refs": [
+            "host-scripts/deploy-machine/preflight-check.sh.patched"
+          ],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "fix-489-redis-engine-key"
+      ]
+    }
+  },
+  "fixes": [
+    {
+      "id": "fix-516-spire-broker",
+      "summary": "host 侧 SPIRE join-broker 落地:broker 只监听 host loopback(源与目的都必须是 127.0.0.1,从 tap 打健康端点一律 404),每台 microVM 每次开机铸一枚短时 join token,带每租户速率上限与签发台账,源地址伪造防护缺失时按策略停发。install.sh 另装一个 开机 netguard unit,把支撑该防护的包过滤规则在重启后重建。配置只来自 SSM /openclaw/spire-kit/*,安装时抄进 /etc/spire-kit/broker.env,不热加载。init-host.sh 增加首 boot 的 Step 4c:读 SSM 总开关,仅在其为 true 时安装;开关未设时整段零下载零副作用,安装失败走 fail-open(落告警 marker 与日志令牌,host 照常注册接租户)。",
+      "paths": [
+        "deploy/userdata/init-host.sh",
+        "deploy/userdata/spire-kit/spire-kit-setup.sh",
+        "deploy/userdata/spire-kit/install.sh",
+        "deploy/userdata/spire-kit/spire-join-broker.py",
+        "deploy/userdata/spire-kit/spire-join-broker.service"
+      ],
+      "applies_when": "运维已在目标 region 写好 SSM /openclaw/spire-kit/{enabled,trust-domain,spire-server-address,registrar-url};enabled 不为 true 时本 fix 的代码在位但不动作",
+      "params_changed": [],
+      "verification_ids": [
+        "v-516-s3-objects",
+        "v-516-lt-rendered",
+        "v-516-new-host-boot"
+      ]
+    },
+    {
+      "id": "fix-516-guest-kit",
+      "summary": "guest 侧 SPIRE agent 交付物:agent 配置模板、bootstrap 脚本、header shim,以及烤进镜像(系统级 unit)与装在家目录(user unit)两种形态的 systemd 单元。本仓的 build-rootfs.sh 没有引用这些文件,因此没有自动交付通道 —— 交付方式是运维在金镜像构建机上取回这些产物、运行 install-guest-kit.sh 重烤 rootfs。该半边不落地则只有 host 发得出 token、guest 无法 attest,端到端不成立。",
+      "paths": [
+        "deploy/userdata/spire-kit/guest/agent.conf.tmpl",
+        "deploy/userdata/spire-kit/guest/install-guest-kit.sh",
+        "deploy/userdata/spire-kit/guest/shim.env.example",
+        "deploy/userdata/spire-kit/guest/spire-agent-system.service",
+        "deploy/userdata/spire-kit/guest/spire-agent.service",
+        "deploy/userdata/spire-kit/guest/spire-bootstrap.sh",
+        "deploy/userdata/spire-kit/guest/spire-header-shim-system.service",
+        "deploy/userdata/spire-kit/guest/spire-header-shim.py",
+        "deploy/userdata/spire-kit/guest/spire-header-shim.service"
+      ],
+      "applies_when": "运维有金镜像构建流程且愿意重烤一次 rootfs;仅打 host 侧时本 fix 不适用,此时必须在交底中写明 guest 侧缺失",
+      "params_changed": [],
+      "verification_ids": [
+        "v-516-guest-attest"
+      ]
+    },
+    {
+      "id": "fix-516-acceptance-tools",
+      "summary": "随 kit 交付的验收与联调件:acceptance 断言脚本与逻辑探针,以及两个 registrar 服务端模拟器(一个按客户接口逐字实现、带拒绝与缺头两个开关)。它们不施加到客户任何运行资源,用途是让客户在自己环境里独立跑出 broker↔registrar 契约结论。同目录还含一期 user-hook 通道的参考实现,已被 Step 4c 取代,保留供无部署流水线的环境参考。",
+      "paths": [
+        "deploy/userdata/spire-kit/acceptance/logic_probe.py",
+        "deploy/userdata/spire-kit/acceptance/spire-kit-acceptance.sh",
+        "deploy/userdata/spire-kit/registrar-stub.py",
+        "deploy/userdata/spire-kit/registrar-mock-customer.py",
+        "deploy/userdata/spire-kit/hooks/host-user-hook.sh"
+      ],
+      "applies_when": "客户希望在自己环境独立复核 broker 与 registrar 的契约行为时使用",
+      "params_changed": [],
+      "verification_ids": [
+        "v-516-tools-integrity"
+      ]
+    },
+    {
+      "id": "fix-546-taint-timestamp",
+      "summary": "host taint 读路径把 DDB 取回的 tainted_at 收敛成 JSON 数字:只接受非布尔整数与整值 Decimal,其余一律省略该键。刻意不用裸 int() —— 它会把带小数的 Decimal 静默截断、把数字字符串与布尔 True 也照收(True 会变成 1,即 1970-01-01),那等于把一个看似合法却编造的审计时刻返回给调用方,比缺这个字段更糟:前者会被当真实标记时间写进运维记录,后者只是缺失、可查可补。审计字段宁缺勿伪。",
+      "paths": [
+        "deploy/lambda/api/core/host_taint.py"
+      ],
+      "applies_when": "控制面 openclaw-api 已部署且 host taint 路由在役",
+      "params_changed": [],
+      "verification_ids": [
+        "v-546-code-changed",
+        "v-546-taint-roundtrip"
+      ]
+    },
+    {
+      "id": "fix-245-fb-enum",
+      "summary": "edge/host 的 Fluent Bit 安装脚本:文件枚举改为 NUL 分隔(find -print0 与 read -r -d ''),避免文件名含换行时计数与遍历都错位;S3 前缀匹配到零个对象时打出带错误尾巴的 WARN,而不是静默当成拉到了;并把配置来源在 S3 暂存目录与本地目录之间显式分流。同时移除了「fluent-bit.conf 里没有 kinesis_firehose 输出就中止安装」这道 fail-closed 检查 —— 这一条是放宽安全网,判据见对应 verification。",
+      "paths": [
+        "deploy/edge/fluent-bit/install-fluent-bit.sh"
+      ],
+      "applies_when": "环境启用了可观测性采集(logging 相关配置为真),host 首 boot 会拉取本脚本",
+      "params_changed": [
+        {
+          "name": "install-fluent-bit.sh 对 fluent-bit.conf 缺少 kinesis_firehose 输出的处理",
+          "layer": "deploy-other",
+          "old_default": "fail-closed:检出缺失即 die,拒绝启动一个不往任何地方转发的采集器",
+          "new_default": "不再中止;S3 前缀匹配到零对象时打 WARN 并带上错误尾巴继续",
+          "runtime_impact": "运行中的机器:已装好的采集器不受影响。未来机器:host 首 boot 由 init-host.sh 拉取本脚本,该处是 || exit 1 —— 脚本本身取不到会让整个 init 失败、lifecycle hook 超时被判 ABANDON,因此上传一个坏版本的爆炸半径大于 spire 那段。放宽这道检查后,一个转发目标缺失的采集器会安静地起来,后果是日志静默丢失而非启动失败,所以必须由 verification 用「真的有数据到达下游」这个硬信号兜住,不能只看 unit 是否 active。"
+        }
+      ],
+      "verification_ids": [
+        "v-245-fb-forwarding"
+      ]
+    },
+    {
+      "id": "fix-489-redis-engine-key",
+      "summary": "部署前配置门区分「键缺失」与「键在但取值非法」:代码侧 ha_edge.py 读 redis 配置时对 engine 取默认 redis,存量 config.yml 无该键时仍起 Redis,属向后兼容而非缺配置,故门对缺键改判 PASS;键存在但取值不在白名单时仍判 BLOCK,因为那会让代码侧的白名单校验抛错。此前把缺键报成 BLOCK 会拦掉每一份早于 valkey 选项的存量配置,而这道门已经焊进部署入口,拦错即拦停部署。",
+      "paths": [
+        "scripts/preflight-check.sh"
+      ],
+      "applies_when": "运维在部署或升级前运行该配置门",
+      "params_changed": [
+        {
+          "name": "preflight 门对 config 缺少 redis.engine 键的裁决",
+          "layer": "deploy-other",
+          "old_default": "BLOCK(缺键即判非法,拦停部署)",
+          "new_default": "PASS(缺键视为使用代码默认 redis,向后兼容)",
+          "runtime_impact": "只改变门的裁决,不改变任何在役资源。对运行中的系统零影响;对未来部署的影响是:早于 valkey 选项的存量配置不再被误拦。风险面是「键在但取值为空」这类仍需拦住的情形,判据必须双向证明 —— 缺键放行、空值仍拦。"
+        }
+      ],
+      "verification_ids": [
+        "v-489-gate-both-directions"
+      ]
+    },
+    {
+      "id": "fix-checks-python",
+      "summary": "仓库机械门的 Python 检查把 bandit 的配置来源显式指向 pyproject.toml,使代理工具目录与工程材料目录不再被扫描 —— 它们由各自的流程复核,这道门只扫会交付的应用代码。注意本 fix 依赖 pyproject.toml 里的 bandit 配置段,而该文件按路径判定属仓库元数据、不作为产物交付,依赖关系见 applies_when。",
+      "paths": [
+        "scripts/checks/python.sh"
+      ],
+      "applies_when": "运维在自己的仓库 checkout 上运行机械门,且该 checkout 的 pyproject.toml 已含 bandit 配置段;只把本产物覆盖到旧 checkout 而不同步该配置段时,bandit 会因读不到配置而行为不同",
+      "params_changed": [
+        {
+          "name": "bandit 的扫描范围(配置来源改为 pyproject.toml)",
+          "layer": "deploy-other",
+          "old_default": "bandit 不带 -c:按传入文件清单扫描,不读仓库配置段,.claude 与 engineering 两个目录一并计入扫描面",
+          "new_default": "bandit -c pyproject.toml:读 [tool.bandit] 的 exclude_dirs = [\".claude\", \"engineering\"],这两个目录不再扫描",
+          "runtime_impact": "只影响仓库检查门的扫描面,不触碰任何在役资源与客户运行时。风险是排除范围过宽会让真实问题不再被这道门看见,所以判据要证明:交付代码仍被扫描、且门仍能对 HIGH 级问题变红。"
+        }
+      ],
+      "verification_ids": [
+        "v-checks-python-scope"
+      ]
+    },
+    {
+      "id": "fix-521-esm-compare",
+      "summary": "新增一致性核对 CLI:此前事件源映射与函数配置只被打印、随后丢弃,一次运行会显示某个批大小却不与任何基线比较,于是批处理相关的漂移既不报错也不被发现。现在把这些字段纳入基线并逐字段比对,并把「同一函数多条映射」这种情形的语义分清,避免把一条映射的取值归因到另一条。",
+      "paths": [
+        "cli/oc-consistency.py"
+      ],
+      "applies_when": "运维需要核对控制面各函数与其事件源映射是否偏离已记录基线时运行",
+      "params_changed": [],
+      "verification_ids": [
+        "v-521-field-compare"
+      ]
+    }
+  ],
+  "verifications": [
+    {
+      "id": "v-516-s3-objects",
+      "fix_id": "fix-516-spire-broker",
+      "phase": "A-readonly",
+      "action": "对 4 个 spire-kit host 对象各取回一次并算 sha256:aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/spire-kit/<名> - | sha256sum",
+      "observable": "每个对象的 sha256 与 manifest.paths 里对应条目的 patch_sha256",
+      "pass_when": "4 个对象都存在,且 4 个 sha256 与各自 patch_sha256 逐一相等",
+      "fail_when": "任一对象缺失(Step 4c 会拉不到、落 fail-open marker、broker 等于没装),或任一 sha256 与 patch_sha256 不等(桶里是别的版本)",
+      "timeout_s": 120,
+      "cleanup": "只读,无需清理;上传时产生的 .new 临时键在提升后删除"
+    },
+    {
+      "id": "v-516-lt-rendered",
+      "fix_id": "fix-516-spire-broker",
+      "phase": "A-readonly",
+      "action": "解码新 LT 版本的 UserData:python3 lib/lt-userdata.py decode --version $NEW_LT_VERSION",
+      "observable": "解码文本里 step4c 段的出现次数,以及未被替换的双花括号记号数量",
+      "pass_when": "step4c 段出现且计数为 1,未替换记号计数为 0",
+      "fail_when": "未替换记号计数大于 0(说明把模板而非已渲染 UserData 烤进了 LT,新 host 会带着字面记号启动并失败),或 step4c 段缺失(嫁接没生效)",
+      "timeout_s": 120,
+      "cleanup": "只读,无需清理"
+    },
+    {
+      "id": "v-516-new-host-boot",
+      "fix_id": "fix-516-spire-broker",
+      "phase": "B-lifecycle",
+      "action": "按受控方式起一台新 host(新 LT 版本),不做任何手工热修,然后在该机上依次看 init 日志、两个 unit 的状态、以及 broker 的健康端点",
+      "observable": "/var/log/openclaw-init.log 里的 step4c 日志行;spire-join-broker 与 spire-kit-netguard 的 is-active;curl 127.0.0.1:8877/healthz 的响应体;openclaw-hosts 表里该实例的注册记录;ASG 生命周期动作结果",
+      "pass_when": "init 日志出现安装成功那一行;两个 unit 都是 active;健康端点响应体里总判定为真、伪造防护在位为真;该实例注册进 openclaw-hosts;生命周期动作是 CONTINUE",
+      "fail_when": "出现安装失败日志令牌或 /var/lib/openclaw/spire-kit.install-failed 存在;任一 unit 非 active;健康端点总判定为假;生命周期动作是心跳超时(说明这段拖垮了 host 上线)",
+      "timeout_s": 1800,
+      "cleanup": "验完把该测试 host 按受控方式退掉,并确认真实租户数前后一致"
+    },
+    {
+      "id": "v-516-guest-attest",
+      "fix_id": "fix-516-guest-kit",
+      "phase": "B-lifecycle",
+      "action": "在金镜像构建机上用本 kit 的 guest 产物重烤 rootfs,再用该镜像起一台 microVM,在 guest 内看 agent 状态与其日志,并在 host 上核对该 VM 的领证台账",
+      "observable": "guest 内 spire-agent 的 is-active 与其日志里的节点 attestation 结果行;host 上 install.sh --check-attest 对这台新 VM 的判定",
+      "pass_when": "guest 内 agent 为 active 且日志出现节点 attestation 成功;host 侧对这台刚起的 VM 判定为新领证",
+      "fail_when": "agent 非 active,或日志无 attestation 成功记录,或 host 侧判定为从未领证(说明 kit 没进镜像)",
+      "timeout_s": 2400,
+      "cleanup": "删除该测试 microVM 的确切 id,不使用任何前缀通配"
+    },
+    {
+      "id": "v-516-tools-integrity",
+      "fix_id": "fix-516-acceptance-tools",
+      "phase": "A-readonly",
+      "action": "对 kit 内 5 个验收与联调产物各算一次 sha256",
+      "observable": "5 个产物的 sha256 与 manifest 里各自的 patch_sha256",
+      "pass_when": "5 个 sha256 与各自 patch_sha256 逐一相等",
+      "fail_when": "任一不等(kit 打包过程改动了产物)",
+      "timeout_s": 60,
+      "cleanup": "只读,无需清理"
+    },
+    {
+      "id": "v-546-code-changed",
+      "fix_id": "fix-546-taint-timestamp",
+      "phase": "A-readonly",
+      "action": "比对 openclaw-api 的 CodeSha256 与备份锚点记录的值,并确认函数环境变量键数量未变",
+      "observable": "get-function-configuration 的 CodeSha256 与环境变量键数量",
+      "pass_when": "CodeSha256 与备份锚点不同,且环境变量键数量与备份一致",
+      "fail_when": "CodeSha256 未变(overlay 没生效),或环境变量键数量变化(overlay 误伤了客户配置)",
+      "timeout_s": 120,
+      "cleanup": "只读,无需清理"
+    },
+    {
+      "id": "v-546-taint-roundtrip",
+      "fix_id": "fix-546-taint-timestamp",
+      "phase": "B-lifecycle",
+      "action": "通过真实控制面路由标记一台 host 为 taint,再读回该 host 的 taint 信息;随后把该记录的时间字段人为改成一个带小数的数值,再读一次",
+      "observable": "两次读回响应里 tainted_at 字段的存在性与 JSON 类型",
+      "pass_when": "第一次读回 tainted_at 是整数型 JSON 数字;第二次(小数值)读回该键被整体省略而不是被截断成整数",
+      "fail_when": "第一次返回字符串或布尔换算出的 1;第二次把小数静默截断后照样返回(等于返回了一个编造的审计时刻)",
+      "timeout_s": 600,
+      "cleanup": "解除该 host 的 taint 标记,并把被改过的记录字段还原成原值"
+    },
+    {
+      "id": "v-245-fb-forwarding",
+      "fix_id": "fix-245-fb-enum",
+      "phase": "B-lifecycle",
+      "action": "在一台按新脚本装过采集器的机器上,产生一条可识别的测试日志行,然后在下游接收端按该标记检索",
+      "observable": "下游接收端在检索窗口内是否出现该标记行;采集器 unit 状态",
+      "pass_when": "下游检索到该标记行,且采集器 unit 为 active",
+      "fail_when": "unit 为 active 但下游检索不到该标记行 —— 这正是被移除的那道 fail-closed 检查原本要拦的状态:采集器起着却不往任何地方转发",
+      "timeout_s": 900,
+      "cleanup": "测试日志行自然过期,无需删除;不改动任何采集配置"
+    },
+    {
+      "id": "v-489-gate-both-directions",
+      "fix_id": "fix-489-redis-engine-key",
+      "phase": "A-readonly",
+      "action": "对两份配置各跑一次该门:一份完全不含 redis.engine 键,一份含该键但取值为空",
+      "observable": "两次运行的裁决行与退出码",
+      "pass_when": "缺键那份出现放行行且门不因此拦停;空值那份仍出现拦停行",
+      "fail_when": "缺键那份仍被拦停(存量配置会被误拦、部署被拦死),或空值那份被放行(代码侧白名单随后会抛错,门失去意义)",
+      "timeout_s": 300,
+      "cleanup": "两份配置都是临时副本,跑完删除这两个确切文件"
+    },
+    {
+      "id": "v-checks-python-scope",
+      "fix_id": "fix-checks-python",
+      "phase": "A-readonly",
+      "action": "在含 bandit 配置段的 checkout 上运行该检查;另在一份故意植入一处 HIGH 级问题的交付代码副本上再运行一次",
+      "observable": "两次运行的输出行与退出码,以及被扫描的文件范围",
+      "pass_when": "正常运行时门通过且不再扫描代理工具与工程材料目录;植入 HIGH 级问题的那次门变红",
+      "fail_when": "门因读不到配置而报错(说明 checkout 缺配置段,前置依赖未满足),或植入 HIGH 级问题后门仍通过(排除范围过宽,门已失效)",
+      "timeout_s": 600,
+      "cleanup": "删除植入问题的那份确切副本文件"
+    },
+    {
+      "id": "v-521-field-compare",
+      "fix_id": "fix-521-esm-compare",
+      "phase": "A-readonly",
+      "action": "在目标环境记录一次基线,随后把某个函数的事件源映射批大小临时改成另一个值,再运行该 CLI 比对",
+      "observable": "CLI 输出里该字段的比对结果行与退出码",
+      "pass_when": "CLI 明确指出该字段与基线不一致并以非零退出",
+      "fail_when": "CLI 只打印当前取值却判为一致(退回到了改动前只打印不比对的行为)",
+      "timeout_s": 600,
+      "cleanup": "把该事件源映射的批大小改回原值,并确认 CLI 重新判为一致"
+    }
+  ]
+}

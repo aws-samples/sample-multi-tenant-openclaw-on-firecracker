@@ -81,8 +81,22 @@ API_MODE=$(cfg api.mode)
 
 R_ENGINE=$(cfg redis.engine); R_VER=$(cfg redis.engine_version); R_ENABLED=$(cfg redis.enabled)
 if [ "$R_ENABLED" = "True" ]; then
-  case "$R_ENGINE" in redis|valkey) _pass "redis.engine=$R_ENGINE 合法";; *) _block "redis.engine=$R_ENGINE 非法(只能 redis|valkey,ha_edge.py:_redis_engine 白名单校验)";; esac
-  [ "$R_ENGINE" = "valkey" ] && case "$R_VER" in 7.1*|"") _block "redis.engine=valkey 但 engine_version=$R_VER;valkey 无 7.1,必须 ≥7.2(ha_edge.py:valkey engine_version 兜底校验)";; esac
+  # 键【缺失】与键【存在但取值非法】不是一回事,而这道门已经焊进 setup.sh(#489):把前者报成
+  # BLOCK 会拦掉每一份早于 valkey 选项的存量 config。代码侧口径写得很明确 ——
+  # ha_edge.py:1539 `_redis_cfg.get("engine", "redis")`,注释原文「默认 redis 向后兼容:
+  # 存量 config.yml 无 engine 键 → 仍起 Redis」。所以缺键放行;而 `engine:`(空值/null)仍 BLOCK,
+  # 那时 `str(...).lower()` 落到 ""/"none",ha_edge.py:1540 白名单会 raise,门必须先说出来。
+  if ! grep -q '^redis\.engine=' "$CFGDUMP"; then
+    _pass "config 无 redis.engine 键 — 代码默认 redis(ha_edge.py:1539 get(\"engine\",\"redis\"),存量 config 向后兼容),不是缺配置"
+  else
+    case "$R_ENGINE" in redis|valkey) _pass "redis.engine=$R_ENGINE 合法";; *) _block "redis.engine=$R_ENGINE 非法(键在但取值不在白名单;只能 redis|valkey,ha_edge.py:1540 会 raise。本意是用默认 Redis 就把这行整键删掉)";; esac
+  fi
+  # 同理:valkey 漏 engine_version 时代码兜底 7.2(ha_edge.py:1548-1550 `or _redis_default_ver`,
+  # valkey 分支即 7.2),是合法组合;只有显式写成 7.1* 才非法(ElastiCache valkey 无 7.1)。
+  [ "$R_ENGINE" = "valkey" ] && case "$R_VER" in
+    7.1*) _block "redis.engine=valkey 但 engine_version=$R_VER;valkey 无 7.1,必须 ≥7.2(ha_edge.py:1548 valkey 默认 7.2)";;
+    "") _pass "redis.engine=valkey 未写 engine_version — 代码兜底 7.2(ha_edge.py:1548-1550),合法";;
+  esac
   [ -n "$(cfg redis.instance_type)" ] && _warn "redis.instance_type 是栈不读的键(应为 node_type),会静默回落默认值(用户实撞)"
 fi
 

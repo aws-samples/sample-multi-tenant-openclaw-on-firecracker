@@ -1,0 +1,24 @@
+[Unit]
+# 系统级 unit —— 与 rootfs 形态的 spire-agent.service 配套(root 跑)。
+# 默认惰性:没有 /etc/spire-kit/shim.env 就不启动,装了 kit 也不会改变现有出网行为。
+Description=SPIRE header shim (spire-kit, inject JWT-SVID into egress)
+Documentation=file:///etc/spire-kit/README
+After=network-online.target spire-agent.service
+Wants=network-online.target
+ConditionPathExists=/etc/spire-kit/shim.env
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/spire-kit/shim.env
+Environment=SPIRE_SHIM_SOCKET=/run/spire/agent.sock
+Environment=SPIRE_SHIM_AGENT_BIN=/usr/local/bin/spire-agent
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/bin/python3 /etc/spire-kit/header-shim.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

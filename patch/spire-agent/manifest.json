@@ -12,10 +12,10 @@
   },
   "kit_files": {
     "lib/apply-lt.sh": {
-      "sha256": "07b9633975bdc8e76803af83f9057c09a3fe28707f5284c727933e3050238df1"
+      "sha256": "5e78605dab728afe1c7a6cfad96a410cd24c8bf76da4c869f61387f2661a6799"
     },
     "lib/discover-env.sh": {
-      "sha256": "656889c0872df12a06ca5626902e2b0f1fdef12118d298c332216abf959f7ed9"
+      "sha256": "ed2a393611617864ce55fa3ad6b7db68cb03634c4fc3682b586cbe4a04317592"
     },
     "lib/lt-userdata.py": {
       "sha256": "240c14d26aa6668567f6c2bbaf8ca2d884f27532735873382317317633402779"
@@ -143,6 +143,18 @@
             "lambda/api/core/host_taint.py"
           ],
           "rollback_policy": "ALIAS_FLIP",
+          "resource_refs": []
+        },
+        {
+          "resource": "lambda:openclaw-lifecycle-consumer code (peer carrying the same module; overlay)",
+          "class": "AUTO_CLI",
+          "apply_cli": "aws lambda get-function --function-name openclaw-lifecycle-consumer --query Code.Location --output text | xargs curl -fsS -o live-lc.zip && mkdir -p pkg-lc && (cd pkg-lc && unzip -q ../live-lc.zip) && cp lambda/api/core/host_taint.py pkg-lc/core/host_taint.py && (cd pkg-lc && zip -qr ../new-lc.zip .) && aws lambda update-function-code --function-name openclaw-lifecycle-consumer --zip-file fileb://new-lc.zip && aws lambda wait function-updated --function-name openclaw-lifecycle-consumer",
+          "verify_cli": "aws lambda get-function --function-name openclaw-lifecycle-consumer --query Code.Location --output text | xargs curl -fsS -o check-lc.zip && unzip -p check-lc.zip core/host_taint.py | shasum -a 256  # 必须等于本 path 的 patch_sha256(证明两个函数的同名模块已收敛到同一版本)",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-lifecycle-consumer --zip-file fileb://backup/backup-lc.zip  # 该函数无别名,ESM 绑未限定版本,故只能重新部署备份 zip",
+          "artifact_refs": [
+            "lambda/api/core/host_taint.py"
+          ],
+          "rollback_policy": "REDEPLOY_ZIP",
           "resource_refs": []
         }
       ],
@@ -1979,7 +1991,7 @@
     },
     {
       "id": "fix-546-taint-timestamp",
-      "summary": "host taint 读路径把 DDB 取回的 tainted_at 收敛成 JSON 数字:只接受非布尔整数与整值 Decimal,其余一律省略该键。刻意不用裸 int() —— 它会把带小数的 Decimal 静默截断、把数字字符串与布尔 True 也照收(True 会变成 1,即 1970-01-01),那等于把一个看似合法却编造的审计时刻返回给调用方,比缺这个字段更糟:前者会被当真实标记时间写进运维记录,后者只是缺失、可查可补。审计字段宁缺勿伪。",
+      "summary": "host taint 读路径把 DDB 取回的 tainted_at 收敛成 JSON 数字:只接受非布尔整数与整值 Decimal,其余一律省略该键。刻意不用裸 int() —— 它会把带小数的 Decimal 静默截断、把数字字符串与布尔 True 也照收(True 会变成 1,即 1970-01-01),那等于把一个看似合法却编造的审计时刻返回给调用方,比缺这个字段更糟:前者会被当真实标记时间写进运维记录,后者只是缺失、可查可补。审计字段宁缺勿伪。 DISCOVER 实测发现 openclaw-lifecycle-consumer 的活包里也含同一模块,因此 overlay 必须同时覆盖这两个函数 —— 只打其中一个会让同名模块版本分裂;该 peer 无别名(ESM 绑未限定版本),故其回滚是重新部署备份 zip 而非翻别名。",
       "paths": [
         "deploy/lambda/api/core/host_taint.py"
       ],
@@ -1987,12 +1999,13 @@
       "params_changed": [],
       "verification_ids": [
         "v-546-code-changed",
-        "v-546-taint-roundtrip"
+        "v-546-taint-roundtrip",
+        "v-546-peer-converged"
       ]
     },
     {
       "id": "fix-245-fb-enum",
-      "summary": "edge/host 的 Fluent Bit 安装脚本:文件枚举改为 NUL 分隔(find -print0 与 read -r -d ''),避免文件名含换行时计数与遍历都错位;S3 前缀匹配到零个对象时打出带错误尾巴的 WARN,而不是静默当成拉到了;并把配置来源在 S3 暂存目录与本地目录之间显式分流。同时移除了「fluent-bit.conf 里没有 kinesis_firehose 输出就中止安装」这道 fail-closed 检查 —— 这一条是放宽安全网,判据见对应 verification。",
+      "summary": "edge/host 的 Fluent Bit 安装脚本:文件枚举改为 NUL 分隔(find -print0 与 read -r -d ''),避免文件名含换行时计数与遍历都错位;S3 前缀匹配到零个对象时打出带错误尾巴的 WARN,而不是静默当成拉到了;并把配置来源在 S3 暂存目录与本地目录之间显式分流。两条 kinesis_firehose 断言【不是被移除】,而是整体挪到一个 @INCLUDE 探测之后:配置里出现 @INCLUDE 时跳过并打 NOTE(该断言只读主配置文件,而 @INCLUDE 可以合法地把 [OUTPUT] 放在别的文件里,硬判会因为一份 Fluent Bit 自己接受的配置而把主机判 ABANDON);没有 @INCLUDE 时两条照旧全额生效。另有一处【变严】:配置引用的 Lua 脚本改为对着本次从 S3 暂存下来的目录解析,而不是对着 $FB_CONF_DIR —— 后者还混着发行包自带文件与上一次启动装下的副本,会让一个本次并未完整取到的脚本集合被陈旧副本蒙过检查。",
       "paths": [
         "deploy/edge/fluent-bit/install-fluent-bit.sh"
       ],
@@ -2001,13 +2014,21 @@
         {
           "name": "install-fluent-bit.sh 对 fluent-bit.conf 缺少 kinesis_firehose 输出的处理",
           "layer": "deploy-other",
-          "old_default": "fail-closed:检出缺失即 die,拒绝启动一个不往任何地方转发的采集器",
-          "new_default": "不再中止;S3 前缀匹配到零对象时打 WARN 并带上错误尾巴继续",
-          "runtime_impact": "运行中的机器:已装好的采集器不受影响。未来机器:host 首 boot 由 init-host.sh 拉取本脚本,该处是 || exit 1 —— 脚本本身取不到会让整个 init 失败、lifecycle hook 超时被判 ABANDON,因此上传一个坏版本的爆炸半径大于 spire 那段。放宽这道检查后,一个转发目标缺失的采集器会安静地起来,后果是日志静默丢失而非启动失败,所以必须由 verification 用「真的有数据到达下游」这个硬信号兜住,不能只看 unit 是否 active。"
+          "old_default": "fail-closed 且无条件:只要主配置里没有 kinesis_firehose 输出(或有输出而 delivery_stream 空)就 die,拒绝启动一个不往任何地方转发的采集器",
+          "new_default": "同样两条断言,但只在主配置【不含 @INCLUDE】时执行;含 @INCLUDE 时跳过并打 NOTE。本仓库当前两份配置(edge/host)的 @INCLUDE 行数都是 0,所以实际仍然全额生效",
+          "runtime_impact": "运行中的机器:已装好的采集器不受影响。未来机器:host 首 boot 由 init-host.sh 拉取本脚本,该处是 || exit 1 —— 脚本本身取不到会让整个 init 失败、lifecycle hook 超时被判 ABANDON,因此上传一个坏版本的爆炸半径大于 spire 那段。放宽面比原先记述的窄:仅当有人给配置加了 @INCLUDE 时这道网才失效,那时一个转发目标缺失的采集器会安静地起来、日志静默丢失,所以判据仍必须是「真的有数据到达下游」而不是「unit 是否 active」。"
+        },
+        {
+          "name": "install-fluent-bit.sh 对 fluent-bit.conf 引用的 Lua 脚本的解析基准目录",
+          "layer": "deploy-other",
+          "old_default": "对着 $FB_CONF_DIR(/etc/fluent-bit)解析;绝对路径按原样使用",
+          "new_default": "对着本次从 S3 暂存下来的目录解析;落在 $FB_CONF_DIR 之内的绝对路径也改按暂存目录解析,只有真正在受管目录之外的绝对路径才按原样使用",
+          "runtime_impact": "这是变严,不是放宽:一台今天能正常启动的主机,若它引用的某个 .lua 并非本次 S3 前缀所提供、而只是上一次启动或发行包遗留在 /etc/fluent-bit 里,改动后会 die → init 中止 → lifecycle hook 超时 → ASG 判 ABANDON。上传前必须逐一确认前缀自带全部被引用的 Lua(判据 v-245-lua-in-prefix)。us-east-1 实测:edge 前缀自带 extract_trace_root.lua 与 add_timestamp.lua,host 前缀自带 extract_tenant_id.lua 与 add_timestamp.lua,均满足。"
         }
       ],
       "verification_ids": [
-        "v-245-fb-forwarding"
+        "v-245-fb-forwarding",
+        "v-245-lua-in-prefix"
       ]
     },
     {
@@ -2184,6 +2205,28 @@
       "fail_when": "CLI 只打印当前取值却判为一致(退回到了改动前只打印不比对的行为)",
       "timeout_s": 600,
       "cleanup": "把该事件源映射的批大小改回原值,并确认 CLI 重新判为一致"
+    },
+    {
+      "id": "v-546-peer-converged",
+      "fix_id": "fix-546-taint-timestamp",
+      "phase": "A-readonly",
+      "action": "分别取回 openclaw-api 与 openclaw-lifecycle-consumer 的活包,各解出 core/host_taint.py 算 sha256",
+      "observable": "两个包里 core/host_taint.py 的 sha256,以及本 path 的 patch_sha256",
+      "pass_when": "两个 sha256 相等,且都等于 patch_sha256",
+      "fail_when": "两者不等(同名模块版本分裂,一个函数带新逻辑另一个带旧逻辑),或任一不等于 patch_sha256(overlay 没生效)",
+      "timeout_s": 300,
+      "cleanup": "只读,删除取回的临时 zip"
+    },
+    {
+      "id": "v-245-lua-in-prefix",
+      "fix_id": "fix-245-fb-enum",
+      "phase": "A-readonly",
+      "action": "对每个角色的 S3 前缀,取出该前缀下的 fluent-bit.conf,抽出所有 script 行引用的路径,去掉受管目录前缀后按剩余相对路径在【同一前缀】内查找",
+      "observable": "每个被引用路径在同前缀内是否存在对应对象",
+      "pass_when": "每个角色前缀下,其配置引用的全部 Lua 都能在同一前缀内找到",
+      "fail_when": "有任一被引用的 Lua 不在同前缀内 —— 上传新脚本后这类主机会在首 boot die 并被判 ABANDON;此时必须先把缺失的对象补进前缀,再上传本脚本",
+      "timeout_s": 300,
+      "cleanup": "只读,无需清理"
     }
   ]
 }

@@ -475,7 +475,7 @@ case "$cmd" in
       # MIP-safe (#1/#2): take the FULL live policy, swap ONLY the version via --arg (env.NEWVER was a
       # bug — the var wasn't in jq's env yet, producing Version:null). Never --launch-template (flattens MIP).
       MIP="$(printf '%s' "$ASGNOW" | jq -c --arg nv "$NEWVER" \
-        '.MixedInstancesPolicy | .LaunchTemplate.LaunchTemplateSpecification.Version=$nv')"
+        '.MixedInstancesPolicy | .LaunchTemplate.LaunchTemplateSpecification.Version=$nv | if .LaunchTemplate.LaunchTemplateSpecification.LaunchTemplateId then del(.LaunchTemplate.LaunchTemplateSpecification.LaunchTemplateName) else . end')"
       [ -n "$MIP" ] && [ "$MIP" != "null" ] || { echo "FATAL: could not build MIP update JSON" >&2; exit 2; }
       aws autoscaling update-auto-scaling-group --auto-scaling-group-name "$ASG" \
         --mixed-instances-policy "$MIP" --region "$REGION"
@@ -660,11 +660,11 @@ case "$cmd" in
     fi
     PARAMS="$(jq -cn --arg p "$SCRIPT_PATH" --arg want "$WANT_SHA" '{
       commands: ([
-        "set -euo pipefail",
+        "set -eu",
         "cloud-init status --wait",
         "test \"$(systemctl is-active host-agent.service)\" = active",
         ("test -f " + $p),
-        ("! grep -Eq \"\\{\\{[A-Z][A-Z0-9_]*\\}\\}\" " + $p)
+        ("! grep -v \"^[[:space:]]*#\" " + $p + " | grep -Eq \"\\{\\{[A-Z][A-Z0-9_]*\\}\\}\"")
       ] + (if $want == "" then [] else
         ["test \"$(sha256sum " + $p + " | cut -d\" \" -f1)\" = \"" + $want + "\""]
       end))
@@ -770,7 +770,7 @@ case "$cmd" in
     if [ "$ISMIP" = "mip" ]; then
       # Build from the drift-checked live policy, changing only the LT version.
       MIP="$(printf '%s' "$ASG_NOW" | jq -c --arg pv "$PREV" \
-        '.MixedInstancesPolicy | .LaunchTemplate.LaunchTemplateSpecification.Version=$pv')"
+        '.MixedInstancesPolicy | .LaunchTemplate.LaunchTemplateSpecification.Version=$pv | if .LaunchTemplate.LaunchTemplateSpecification.LaunchTemplateId then del(.LaunchTemplate.LaunchTemplateSpecification.LaunchTemplateName) else . end')"
       aws autoscaling update-auto-scaling-group --auto-scaling-group-name "$ASG" --mixed-instances-policy "$MIP" --region "$REGION"
     else
       LIVE_LTID="$(printf '%s' "$ASG_NOW" | jq -r '.LaunchTemplate.LaunchTemplateId // empty')"

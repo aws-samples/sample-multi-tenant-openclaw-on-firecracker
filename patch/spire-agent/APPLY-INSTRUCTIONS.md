@@ -153,7 +153,10 @@ aws ec2 describe-launch-template-versions --region "$REGION" --launch-template-i
   --versions "$OLD_DEFAULT_VERSION" \
   --query 'LaunchTemplateVersions[0].LaunchTemplateData.UserData' --output text \
   | base64 -d > lt-pinned.userdata
-grep -c '{{' lt-pinned.userdata      # expect 0 — the in-service form is already rendered
+# Count placeholders on NON-COMMENT lines only: the rendered script legitimately mentions
+# the retired {{AVAIL_VCPU}}/{{AVAIL_MEM}} tokens in a comment, so a bare count reads 1
+# even when the render is perfect.
+grep -v '^[[:space:]]*#' lt-pinned.userdata | grep -c '{{'   # expect 0 — already rendered
 cd ..
 ```
 
@@ -221,17 +224,61 @@ copy-source carries the recorded `versionId`.
 A NEW Launch-Template version does **not** update the running ASG: the group pins a specific
 version and only new instances use a new one. The controlled path is below.
 
+`pull` REFUSES an ASG that pins `$Latest` or `$Default`, because a freshly created version
+becomes the default and natural scaling could launch it before you promote. Pin a concrete
+version first. On a MixedInstancesPolicy ASG, resubmit the WHOLE live policy with only
+`Version` changed, and **drop `LaunchTemplateName`** — `UpdateAutoScalingGroup` rejects a
+request carrying both the id and the name, which is exactly what `describe` hands you:
+
 ```bash
-bash lib/apply-lt.sh pull            # decodes the pinned version's RENDERED UserData
-python3 lib/lt-userdata.py graft \
-  --rendered ./lt-current.userdata \
-  --artifact launch-template/init-host.sh.patched \
-  --hunk step4c --out ./lt-next.userdata
-grep -c '{{' ./lt-next.userdata      # MUST be 0 before you push
-grep -c 'step4c' ./lt-next.userdata  # MUST be 1
-bash lib/apply-lt.sh push            # creates a new version from lt-next.userdata
-bash lib/apply-lt.sh promote         # points the ASG at it; does NOT touch MinSize
+aws autoscaling describe-auto-scaling-groups --region "$REGION" \
+  --auto-scaling-group-names "$ASG" \
+  --query 'AutoScalingGroups[0].MixedInstancesPolicy' > backup/MIP_ORIGINAL.json
+# Edit that JSON: drop LaunchTemplateName, set Version to the concrete number it resolves to
+# today, keep Overrides and InstancesDistribution byte-for-byte. Then:
+aws autoscaling update-auto-scaling-group --region "$REGION" \
+  --auto-scaling-group-name "$ASG" --mixed-instances-policy file://mip-pinned.json
+# Read back and confirm ONLY Version moved.
 ```
+
+Then run the tool's own flow. `pull` writes the RENDERED script as plaintext into its state
+directory; for an `s3-bootstrap` launch template the script body lives in a content-addressed
+S3 object and `pull` verifies that object hashes to exactly what the launch template will
+demand at boot. You edit THAT plaintext, and `push` republishes it under a new
+content-addressed key and rewrites the bootstrap's key+sha:
+
+```bash
+bash lib/apply-lt.sh pull "$ASG" "$REGION"
+# -> "OK: rendered plaintext -> <state>/<asg>.init-host.sh"
+```
+
+Apply ONLY this patch's step4c block to that plaintext. Insert it immediately before the
+single line `# disabled; enabled hooks are private-S3 downloaded, SHA256 verified, atomically`
+(assert that anchor appears exactly once and that the two lines above it are `fi` and blank).
+Then gate on all three of these before pushing:
+
+```bash
+P="<state>/<asg>.init-host.sh"
+# 1. No template placeholder NAME may survive on a non-comment line. Do NOT grep for a bare
+#    '{{': the rendered script legitimately mentions the retired {{AVAIL_VCPU}}/{{AVAIL_MEM}}
+#    tokens inside a comment, so a blanket count is 1 on a perfectly rendered script.
+grep -v '^[[:space:]]*#' "$P" | grep -c '{{'
+# 2. The block must appear exactly once. Count the block's unique line, NOT 'step4c' — the
+#    marker legitimately appears on 4 lines (one comment plus three log calls).
+grep -c '_spire_enabled=' "$P"
+# 3. The whole script must still parse.
+bash -n "$P"
+```
+
+Expect `0` from the first, `1` from the second, and a clean parse from the third.
+
+```bash
+bash lib/apply-lt.sh push "$ASG" "$REGION"      # new S3 object + new LT version; ASG untouched
+bash lib/apply-lt.sh promote "$ASG" "$REGION"   # points the ASG at it; does NOT touch MinSize
+```
+
+Both subcommands stop at a typed confirmation gate for every side effect: `push` has two
+(publish the object, create the version), `promote` has one.
 
 Then validate by launching **one** host and watching three signals — never trust a re-bake
 blind: no placeholder tokens in the decoded UserData of the new version, the instance registers
@@ -341,10 +388,17 @@ PY
 loaded. Two checks here deserve extra attention because a green-looking system hides their
 failure:
 
-- **`v-245-fb-forwarding`** — this patch REMOVED the guard that refused to start a collector
-  with no forwarding output configured. "The unit is active" therefore no longer implies "logs
-  leave the machine". The check requires a marked test line to arrive downstream. An active
-  unit with nothing arriving downstream is exactly the state the removed guard used to block.
+- **`v-245-fb-forwarding`** — this patch did NOT remove the guard that refuses to start a
+  collector with no forwarding output. It moved both firehose assertions behind an `@INCLUDE`
+  probe: a config using `@INCLUDE` skips them with a NOTE (the assertions read only the main
+  file, and `@INCLUDE` may legitimately hold the `[OUTPUT]` elsewhere), and a config without one
+  still gets both. Every config in this repository has zero `@INCLUDE` lines, so in practice
+  both still fire. The check still requires a marked line to arrive downstream, because on an
+  `@INCLUDE` config "the unit is active" would no longer imply "logs leave the machine".
+- **`v-245-lua-in-prefix`** — the same patch made the Lua-reference check STRICTER: referenced
+  scripts now resolve against what THIS run staged from S3, not against `$FB_CONF_DIR`. A host
+  that boots today will `die` after this upload if its config references a `.lua` the S3 prefix
+  does not ship and only a leftover copy answered for it. Run this one BEFORE uploading.
 - **`v-546-taint-roundtrip`** — the point of the fix is that a non-integral stored value must
   make the field **absent**, not silently truncated. Testing only the happy path passes on the
   old code too, so the check deliberately includes the non-integral case.

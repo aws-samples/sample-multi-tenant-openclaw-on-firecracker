@@ -928,7 +928,11 @@ def report_controlplane(fn_rows, pkg, esm, oas, compared, findings, not_judged,
         for field, sides in (got or {}).get("diffs", {}).items():
             print(f"      {field}: live={sides['live']!r} baseline={sides['baseline']!r}")
     for row in (esm_compared or []):
-        if row["verdict"] == "DRIFT" and row["diffs"].get("mapping", {}).get("live") is None:
+        # 判「mapping 键是否存在」,不能靠 .get("mapping", {}) 的默认空 dict:那样任何没有
+        # mapping 键的 DRIFT 行(例如只有 batch_size 漂移)也会取到 live=None,于是同一对
+        # ESM 既报 DRIFT 又被谎报成「基线里有、线上没有」。us-east-1 实测复现过。
+        mapping_diff = row["diffs"].get("mapping")
+        if row["verdict"] == "DRIFT" and mapping_diff is not None and mapping_diff.get("live") is None:
             print(f"  MISSING {row['pair'][0].split(':')[-1]} <- {row['pair'][1].split(':')[-1]}  "
                   "recorded in the baseline, absent live")
     if oas:

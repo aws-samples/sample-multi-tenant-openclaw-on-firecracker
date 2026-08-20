@@ -17,9 +17,12 @@ Deliberately a separate file from cli/oc.py: that one is a zero-dependency REST 
 customer can run with an endpoint and an api-key, and mixing boto3/SSM/git into it would
 destroy that property (issue #521 implementation contract, item 16).
 
-Scope: `--scope dataplane`. The control-plane half of the contract (items 12-14) needs a
-`cdk synth` of the gateway tree for its expected baseline and is NOT implemented here;
-asking for it exits 3 rather than reporting a comparison this tool did not make.
+Scope: `--scope dataplane` (the three-point check above) and `--scope controlplane`
+(contract items 12-14): every lambda field with no sampling, out-of-band overwrite
+detection from package entry timestamps, event-source mappings located by both ends, and
+the OAS30 export digested per path+method. The expected baseline for the field comparison
+is a JSON artifact from `--write-baseline` on an accepted deployment, not a `cdk synth`;
+whatever a run could not judge is listed as not judged instead of counted as passing.
 
 Exit codes (contract item 15), deliberately four:
     0  every checked place matches the gateway release
@@ -46,6 +49,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
+import zipfile
 
 EXIT_OK, EXIT_DRIFT, EXIT_INCONCLUSIVE, EXIT_TOOL = 0, 1, 2, 3
 SAMPLE_CAP = 5
@@ -60,7 +65,12 @@ def aws(profile: str | None, region: str, *args: str) -> dict | list:
     cmd = ["aws", *args, "--region", region, "--output", "json"]
     if profile:
         cmd += ["--profile", profile]
-    done = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        done = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as exc:
+        # No `aws` on PATH raises here. Letting it propagate would leave Python to exit 1, and 1
+        # means DRIFT in this tool's contract -- a missing CLI would read as a broken fleet.
+        raise ToolError(f"could not run the aws CLI ({exc}); is it installed and on PATH?")
     if done.returncode != 0:
         raise ToolError(f"aws {' '.join(args[:2])} failed: {done.stderr.strip()[:300]}")
     return json.loads(done.stdout or "null")
@@ -574,8 +584,487 @@ def report(rows, sample, sampling_note, findings) -> None:
             print(f"  {f}")
 
 
+# ── control plane (contract items 12-14) ─────────────────────────────────────
+#
+# Three of the four judgements here need no expected baseline at all, which is why they
+# exist: each one is a property of the live object that is either true or false on its own
+# terms. A `cdk synth` baseline was the blocker that kept this half unimplemented, and
+# waiting for it meant shipping nothing -- while the two accidents this is meant to catch
+# both a dispatch and a lifecycle ESM) are both self-evident from the live state.
+#
+# The fourth judgement -- every field equal to what it should be -- does need a baseline.
+# It takes one as a JSON artifact (`--baseline`), written by `--write-baseline` against a
+# deployment that has been accepted. Without it the run says which items it did not judge
+# and exits 2; it never prints a comparison it did not make.
+
+CDK_ZERO_YMD = (1980, 1, 1)
+# Vendored single modules keep their upstream mtime through CDK packaging, so they carry a
+# real timestamp without anybody having pushed code out of band. Named, not pattern-matched:
+# an accidental broad pattern here would hide the very entries this looks for.
+OOB_TIMESTAMP_WHITELIST = ("typing_extensions.py",)
+# How much of a package has to be zeroed before a real mtime is evidence of a push rather than of a
+# 576/578 zeroed, and the live apse1 packages are ~0.5.
+CDK_ZEROED_FRACTION_MIN = 0.9
+LAMBDA_FIELDS = ("CodeSha256", "Runtime", "Handler", "Timeout", "MemorySize",
+                 "Layers", "EnvKeys")
+
+
+def package_shape(zip_path) -> tuple[int, int]:
+    """(file entries, of which normalised to 1980). Printed with every verdict: "OVERWRITTEN" and
+    "MIXED" are conclusions about a ratio, and a reader cannot check the conclusion without it."""
+    with zipfile.ZipFile(zip_path) as zf:
+        infos = [i for i in zf.infolist() if not i.filename.endswith("/")]
+    return len(infos), sum(1 for i in infos if i.date_time[:3] == CDK_ZERO_YMD)
+
+
+def package_overwrite_scan(zip_path, whitelist=OOB_TIMESTAMP_WHITELIST) -> tuple[str, list[str]]:
+    """Which entries were pushed after the CDK deploy, from the timestamps alone.
+
+    CDK zeroes every entry to 1980-01-01 for reproducible builds, so an entry with a real
+    mtime in an otherwise-zeroed package was written by `update-function-code` or by hand.
+    That is a binary discriminator; #444 established it on the live `openclaw-api`, where
+    exactly two of 578 entries carried real times. Counting lines or diffing against the
+    repo cannot do this -- both need a baseline, and the baseline is what was in doubt.
+
+    Returns ("CDK", offenders) or ("NOT_CDK", []) when no entry is zeroed at all: a package
+    built some other way carries no signal, and calling that clean would be a false OK.
+    """
+    with zipfile.ZipFile(zip_path) as zf:
+        # Directory entries are not code and can never be the target of a push, and pip leaves its
+        # own mtimes on them. Counting them was measured (apse1, `openclaw-api`) to turn the report
+        # into a list of `aws_lambda_powertools/` directories.
+        infos = [i for i in zf.infolist() if not i.filename.endswith("/")]
+    if not infos:
+        return "NOT_CDK", []
+    zeroed = [i for i in infos if i.date_time[:3] == CDK_ZERO_YMD]
+    if not zeroed:
+        return "NOT_CDK", []
+    # Measured on the live apse1 deployment: `openclaw-api` and `openclaw-lifecycle-consumer` carry
+    # ~50% real mtimes because their dependencies are pip-installed into the asset directory, which
+    # So the discriminator only speaks when zeroing dominates; a mixed package means "this build does
+    # not normalise timestamps", which is a reason to say the check does not apply, not a reason to
+    # name hundreds of files as pushed by hand.
+    if len(zeroed) / len(infos) < CDK_ZEROED_FRACTION_MIN:
+        return "MIXED", []
+    return "CDK", sorted(
+        i.filename for i in infos
+        if i.date_time[:3] != CDK_ZERO_YMD
+        and pathlib.PurePosixPath(i.filename).name not in whitelist
+    )
+
+
+def vendored_real_mtime_entries(zip_path,
+                                whitelist=OOB_TIMESTAMP_WHITELIST) -> list[str]:
+    """Entries excused by the whitelist that still carry a real mtime.
+
+    The whitelist exists so a vendored module does not read as an out-of-band push. Left silent it
+    becomes a hiding place: an actual overwrite of `typing_extensions.py` would be excused with no
+    trace (cross-model review finding). Reported separately -- visible, and not a verdict by itself.
+    """
+    with zipfile.ZipFile(zip_path) as zf:
+        return sorted(i.filename for i in zf.infolist()
+                      if not i.filename.endswith("/")
+                      and i.date_time[:3] != CDK_ZERO_YMD
+                      and pathlib.PurePosixPath(i.filename).name in whitelist)
+
+
+def esm_rows(mappings: list[dict]) -> tuple[list[dict], list[str]]:
+    """One row per (function ARN, source ARN) pair, and a finding when a pair is not unique.
+
+    Located by BOTH ends on purpose. A stack can hold a dispatch ESM and a lifecycle ESM at
+    once, so "the first event-source mapping in the stack" compares whichever one the API
+    happened to return first -- a wrong answer that reads like a checked one (this is also
+    how a batch_size of 10 -> 1 got attributed to dispatch when it was lifecycle's).
+    """
+    by_pair: dict[tuple[str, str], list[dict]] = {}
+    for m in mappings:
+        key = (m.get("FunctionArn") or "", m.get("EventSourceArn") or "")
+        by_pair.setdefault(key, []).append(m)
+    rows, findings = [], []
+    for (fn, src), group in sorted(by_pair.items()):
+        row = {"function_arn": fn, "source_arn": src,
+               "batch_size": group[0].get("BatchSize"),
+               "batching_window": group[0].get("MaximumBatchingWindowInSeconds"),
+               "state": group[0].get("State"),
+               "unique": len(group) == 1}
+        if len(group) > 1:
+            findings.append(
+                f"{len(group)} event-source mappings share function {fn.split(':')[-1]!r} and "
+                f"source {src.split(':')[-1]!r} (uuids {[m.get('UUID') for m in group]}); "
+                "not judged — picking one would compare an arbitrary object")
+        rows.append(row)
+    return rows, findings
+
+
+def normalise_oas(doc: dict, rest_api_id: str, account: str | None,
+                  region: str | None) -> dict:
+    """Strip what changes between two exports of the same API, keep what changes with the API.
+
+    `info.version` is the export timestamp and `servers[].url` embeds the api id and stage,
+    so leaving them in makes every export differ from every other and the digest says
+    nothing. Account/region/api-id are rewritten to placeholders instead of dropped: the
+    integration URIs are part of the contract, and a changed target must still show up.
+    """
+    body = json.dumps(doc, sort_keys=True, separators=(",", ":"))
+    for real, placeholder in ((rest_api_id, "<api>"), (account, "<account>"),
+                              (region, "<region>")):
+        if real:
+            body = body.replace(real, placeholder)
+    out = json.loads(body)
+    (out.get("info") or {}).pop("version", None)
+    out.pop("servers", None)
+    return out
+
+
+def oas_digests(doc: dict, rest_api_id: str, account=None, region=None) -> tuple[str, dict]:
+    """Whole-document digest plus one per path+method, so a diff lands on an operation.
+
+    "the summary is not equal" is not actionable; #521 asks for path/method level.
+    """
+    norm = normalise_oas(doc, rest_api_id, account, region)
+    whole = sha256_bytes(json.dumps(norm, sort_keys=True, separators=(",", ":")).encode())
+    per_op = {}
+    for path, ops in sorted((norm.get("paths") or {}).items()):
+        for method, body in sorted(ops.items()):
+            blob = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+            per_op[f"{method.upper()} {path}"] = sha256_bytes(blob)
+    return whole, per_op
+
+
+def lambda_row(cfg: dict, aliases: dict[str, str]) -> dict:
+    """Every field #521 names, per function -- no sampling on the control plane."""
+    env_keys = sorted((cfg.get("Environment") or {}).get("Variables", {}) or {})
+    return {
+        "name": cfg.get("FunctionName"),
+        "CodeSha256": cfg.get("CodeSha256"),
+        "Runtime": cfg.get("Runtime"),
+        "Handler": cfg.get("Handler"),
+        "Timeout": cfg.get("Timeout"),
+        "MemorySize": cfg.get("MemorySize"),
+        "Layers": sorted(layer.get("Arn", "") for layer in cfg.get("Layers") or []),
+        "EnvKeys": env_keys,
+        "Aliases": dict(sorted(aliases.items())),
+    }
+
+
+def compare_to_baseline(current: list[dict], baseline: dict) -> tuple[list[dict], list[str]]:
+    """Per-field verdicts against an accepted deployment, plus set differences.
+
+    Env vars are compared as a KEY SET, never as values: values hold endpoints and secret
+    names that legitimately differ, while a missing key is the shape of a feature whose code
+    shipped and whose switch did not (measured on apse1: five keys short, the fix-430 code
+    present and dark, and the verify of the day asserted "key count unchanged" and passed).
+    """
+    want = {f["name"]: f for f in baseline.get("functions", [])}
+    rows, findings = [], []
+    for cur in current:
+        expected = want.get(cur["name"])
+        if expected is None:
+            findings.append(f"{cur['name']}: live but not in the baseline; not judged")
+            continue
+        diffs = {}
+        for field in LAMBDA_FIELDS:
+            live, want_v = cur.get(field), expected.get(field)
+            # Set-valued fields are compared as sets: env vars and layers have no meaningful
+            # order, and reporting a reordering as drift would send someone to look for a
+            # change that did not happen.
+            if isinstance(live, list) or isinstance(want_v, list):
+                same = sorted(live or []) == sorted(want_v or [])
+            else:
+                same = live == want_v
+            if not same:
+                diffs[field] = {"live": live, "baseline": want_v}
+        live_aliases = cur.get("Aliases") or {}
+        want_aliases = expected.get("Aliases") or {}
+        # Both directions: an alias the baseline does not have is as much a difference as one it has
+        # and the live function does not. Iterating the baseline alone let an extra alias pass.
+        for alias in sorted(set(live_aliases) | set(want_aliases)):
+            if live_aliases.get(alias) != want_aliases.get(alias):
+                diffs[f"alias:{alias}"] = {"live": live_aliases.get(alias),
+                                           "baseline": want_aliases.get(alias)}
+        rows.append({"name": cur["name"], "verdict": "DRIFT" if diffs else "OK",
+                     "diffs": diffs})
+    live_names = {f["name"] for f in current}
+    for gone in sorted(set(want) - live_names):
+        rows.append({"name": gone, "verdict": "DRIFT",
+                     "diffs": {"function": {"live": None, "baseline": "present"}}})
+    return rows, findings
+
+
+def compare_esm(current: list[dict], baseline: dict) -> tuple[list[dict], list[str]]:
+    """Per-mapping verdicts against the recorded set, keyed by both ends.
+
+    Without this the rows were printed and then dropped: the run showed `batch_size=1` and compared
+    it to nothing. A batching change is exactly the kind of drift that produces no error and a
+    different failure mode under load (the 10 -> 1 row in the patch audit is one of these).
+    """
+    want = {(r.get("function_arn"), r.get("source_arn")): r
+            for r in baseline.get("event_source_mappings", [])}
+    rows, findings = [], []
+    for cur in current:
+        key = (cur["function_arn"], cur["source_arn"])
+        expected = want.get(key)
+        if expected is None:
+            rows.append({"pair": key, "verdict": "DRIFT",
+                         "diffs": {"mapping": {"live": "present", "baseline": None}}})
+            continue
+        if not cur.get("unique"):
+            # Two facts at once: a second mapping on this pair definitely appeared (DRIFT), and which
+            # one's fields to compare is unknowable (so they are not compared). Reporting only the
+            # first would compare an arbitrary object; reporting only INCONCLUSIVE would bury the fact.
+            rows.append({"pair": key, "verdict": "DRIFT",
+                         "diffs": {"unique": {"live": False, "baseline": expected.get("unique")}},
+                         "fields_not_compared": True})
+            continue
+        diffs = {}
+        for field in ("batch_size", "batching_window", "state", "unique"):
+            if cur.get(field) != expected.get(field):
+                diffs[field] = {"live": cur.get(field), "baseline": expected.get(field)}
+        rows.append({"pair": key, "verdict": "DRIFT" if diffs else "OK", "diffs": diffs})
+    live_keys = {(r["function_arn"], r["source_arn"]) for r in current}
+    for gone in sorted(set(want) - live_keys):
+        rows.append({"pair": gone, "verdict": "DRIFT",
+                     "diffs": {"mapping": {"live": None, "baseline": "present"}}})
+    return rows, findings
+
+
+def fetch_lambdas(profile, region, prefix: str) -> list[dict]:
+    out = aws(profile, region, "lambda", "list-functions")
+    fns = [f for f in out.get("Functions", [])
+           if str(f.get("FunctionName", "")).startswith(prefix)]
+    rows = []
+    for f in fns:
+        got = aws(profile, region, "lambda", "list-aliases",
+                  "--function-name", f["FunctionName"])
+        aliases = {a["Name"]: a.get("FunctionVersion")
+                   for a in (got.get("Aliases") or [])}
+        rows.append(lambda_row(f, aliases))
+    return sorted(rows, key=lambda r: r["name"])
+
+
+def scan_packages(profile, region, names: list[str]) -> tuple[dict, list[str]]:
+    """Download each deployment package and read its entry timestamps."""
+    verdicts, findings, excused, shapes = {}, [], {}, {}
+    for name in names:
+        got = aws(profile, region, "lambda", "get-function", "--function-name", name)
+        url = ((got.get("Code") or {}).get("Location") or "")
+        if not url:
+            findings.append(f"{name}: no code location returned; package not scanned")
+            verdicts[name] = ("UNREADABLE", [])
+            continue
+        with tempfile.TemporaryDirectory(prefix="occ-cp-") as staging:
+            local = pathlib.Path(staging) / "fn.zip"
+            try:
+                with urllib.request.urlopen(url) as resp:  # nosec B310 — Lambda-signed URL
+                    local.write_bytes(resp.read())
+                verdicts[name] = package_overwrite_scan(local)
+                excused[name] = vendored_real_mtime_entries(local)
+                shapes[name] = package_shape(local)
+            except (OSError, zipfile.BadZipFile) as exc:
+                findings.append(f"{name}: package could not be read ({exc}); not scanned")
+                verdicts[name] = ("UNREADABLE", [])
+    return verdicts, findings, excused, shapes
+
+
+def fetch_oas(profile, region, rest_api_id: str, stage: str) -> dict:
+    with tempfile.TemporaryDirectory(prefix="occ-oas-") as staging:
+        out = pathlib.Path(staging) / "oas.json"
+        done = subprocess.run(
+            ["aws", "apigateway", "get-export", "--rest-api-id", rest_api_id,
+             "--stage-name", stage, "--export-type", "oas30",
+             "--parameters", "extensions=integrations", "--accepts", "application/json",
+             str(out), "--region", region] + (["--profile", profile] if profile else []),
+            capture_output=True, text=True)
+        if done.returncode != 0:
+            raise ToolError(f"apigateway get-export failed: {done.stderr.strip()[:300]}")
+        return json.loads(out.read_text())
+
+
+def report_controlplane(fn_rows, pkg, esm, oas, compared, findings, not_judged,
+                        vendored=None, shapes=None, esm_compared=None) -> None:
+    print(f"\n== lambda functions ({len(fn_rows)}) — every field, no sampling ==")
+    verdict_by_name = {r["name"]: r for r in compared}
+    for row in fn_rows:
+        got = verdict_by_name.get(row["name"])
+        mark = got["verdict"] if got else "NOT_JUDGED"
+        print(f"  {row['name']}  {mark}  code={str(row['CodeSha256'])[:16]} "
+              f"runtime={row['Runtime']} handler={row['Handler']} "
+              f"timeout={row['Timeout']} mem={row['MemorySize']} "
+              f"layers={len(row['Layers'])} env_keys={len(row['EnvKeys'])} "
+              f"aliases={row['Aliases']}")
+        for field, sides in (got or {}).get("diffs", {}).items():
+            print(f"      {field}: live={sides['live']!r} baseline={sides['baseline']!r}")
+    vendored, shapes = vendored or {}, shapes or {}
+
+    def _shape(name):
+        total, zeroed = shapes.get(name, (0, 0))
+        return f" [{zeroed}/{total} entries normalised]" if total else ""
+
+    print("\n== out-of-band overwrites (entry timestamps; needs no baseline) ==")
+    for name, (state, offenders) in sorted(pkg.items()):
+        if state == "CDK" and not offenders:
+            print(f"  {name}  CLEAN{_shape(name)} (every entry zeroed to 1980-01-01 by CDK)")
+        elif state == "CDK":
+            shown = ", ".join(offenders[:10])
+            more = f" (+{len(offenders) - 10} more)" if len(offenders) > 10 else ""
+            print(f"  {name}  OVERWRITTEN{_shape(name)}: {shown}{more}")
+        elif state == "MIXED":
+            print(f"  {name}  MIXED{_shape(name)} (the build does not normalise entry timestamps, so a real mtime "
+                  "is not evidence of a push; this package cannot be judged this way)")
+        else:
+            print(f"  {name}  {state}{_shape(name)} (no zeroed entry: the discriminator does not apply)")
+    for name, excused in sorted(vendored.items()):
+        if excused:
+            print(f"  {name}  note: {len(excused)} entry(ies) excused by the vendored-module "
+                  f"whitelist while carrying a real mtime: {', '.join(excused)}")
+    print("\n== event-source mappings (located by both ends) ==")
+    esm_verdict = {r["pair"]: r for r in (esm_compared or [])}
+    for row in esm:
+        got = esm_verdict.get((row["function_arn"], row["source_arn"]))
+        mark = got["verdict"] if got else "NOT_JUDGED"
+        print(f"  {row['function_arn'].split(':')[-1]} <- {row['source_arn'].split(':')[-1]}  "
+              f"{mark}  batch_size={row['batch_size']} window={row['batching_window']} "
+              f"state={row['state']} unique={row['unique']}")
+        for field, sides in (got or {}).get("diffs", {}).items():
+            print(f"      {field}: live={sides['live']!r} baseline={sides['baseline']!r}")
+    for row in (esm_compared or []):
+        if row["verdict"] == "DRIFT" and row["diffs"].get("mapping", {}).get("live") is None:
+            print(f"  MISSING {row['pair'][0].split(':')[-1]} <- {row['pair'][1].split(':')[-1]}  "
+                  "recorded in the baseline, absent live")
+    if oas:
+        whole, per_op, drifted = oas
+        print(f"\n== api gateway schema ==\n  document={whole[:16]} operations={len(per_op)}")
+        for op in drifted:
+            print(f"  DRIFT {op}")
+    if findings:
+        print("\n== findings ==")
+        for f in findings:
+            print(f"  {f}")
+    if not_judged:
+        print("\n== NOT judged in this run ==")
+        for n in not_judged:
+            print(f"  {n}")
+
+
+def run_controlplane(args) -> int:
+    findings: list[str] = []
+    not_judged: list[str] = []
+    fn_rows = fetch_lambdas(args.profile, args.region, args.fn_prefix)
+    if not fn_rows:
+        print(f"no lambda function name starts with {args.fn_prefix!r}", file=sys.stderr)
+        return EXIT_INCONCLUSIVE
+
+    pkg: dict[str, tuple[str, list[str]]] = {}
+    vendored: dict[str, list[str]] = {}
+    shapes: dict[str, tuple[int, int]] = {}
+    if args.scan_packages:
+        pkg, pkg_findings, vendored, shapes = scan_packages(args.profile, args.region,
+                                                            [r["name"] for r in fn_rows])
+        findings += pkg_findings
+    else:
+        not_judged.append("out-of-band overwrite scan (--no-scan-packages)")
+
+    esm, esm_findings = esm_rows(
+        (aws(args.profile, args.region, "lambda", "list-event-source-mappings")
+         or {}).get("EventSourceMappings", []))
+    findings += esm_findings
+
+    oas = None
+    if args.rest_api_id:
+        whole, per_op = oas_digests(
+            fetch_oas(args.profile, args.region, args.rest_api_id, args.stage),
+            args.rest_api_id, args.account, args.region)
+        expected = (json.loads(pathlib.Path(args.baseline).read_text())
+                    if args.baseline else {}).get("api", {})
+        drifted = sorted(
+            op for op in set(per_op) | set(expected.get("operations", {}))
+            if per_op.get(op) != expected.get("operations", {}).get(op)
+        ) if expected else []
+        if not expected:
+            not_judged.append("api gateway schema vs an expected baseline "
+                              "(exported and digested, but nothing to compare to)")
+        oas = (whole, per_op, drifted)
+    else:
+        not_judged.append("api gateway schema (--rest-api-id not given)")
+
+    compared: list[dict] = []
+    esm_compared: list[dict] = []
+    if args.baseline:
+        baseline = json.loads(pathlib.Path(args.baseline).read_text())
+        compared, cmp_findings = compare_to_baseline(fn_rows, baseline)
+        findings += cmp_findings
+        if "event_source_mappings" in baseline:
+            esm_compared, esm_cmp_findings = compare_esm(esm, baseline)
+            findings += esm_cmp_findings
+        else:
+            not_judged.append("event-source mappings vs an expected baseline (this baseline was "
+                              "written before they were recorded; re-run --write-baseline)")
+        unbaselined = sorted({r["name"] for r in fn_rows}
+                             - {r["name"] for r in compared})
+        if unbaselined:
+            not_judged.append(
+                "per-field comparison of " + ", ".join(unbaselined)
+                + " (live but absent from the baseline; a finding alone does not move the exit "
+                  "code, so it is counted as not judged)")
+    else:
+        not_judged.append("per-field comparison of every lambda (--baseline not given; "
+                          "the inventory below is reported, not judged)")
+
+    report_controlplane(fn_rows, pkg, esm, oas, compared, findings, not_judged,
+                        vendored, shapes, esm_compared)
+
+    if args.write_baseline:
+        pathlib.Path(args.write_baseline).write_text(json.dumps(
+            {"functions": fn_rows,
+             "event_source_mappings": esm,
+             "api": ({"rest_api_id": args.rest_api_id, "stage": args.stage,
+                      "document": oas[0], "operations": oas[1]} if oas else {})},
+            indent=2, sort_keys=True))
+        print(f"\nbaseline written: {args.write_baseline}")
+
+    overwritten = [n for n, (state, bad) in pkg.items() if state == "CDK" and bad]
+    # NOT_CDK / MIXED / UNREADABLE all mean the same thing for the exit code: this package was not
+    # judged. Lumping them under "unreadable" is the honest reading -- none of them is a clean bill.
+    unreadable = [n for n, (state, _b) in pkg.items() if state != "CDK"]
+    field_drift = [r["name"] for r in compared if r["verdict"] == "DRIFT"]
+    esm_drift = [r["pair"] for r in esm_compared if r["verdict"] == "DRIFT"]
+    api_drift = list(oas[2]) if oas else []
+    ambiguous = [r for r in esm if not r["unique"]]
+
+    # A positive finding outranks an unjudged item: DRIFT means "this is wrong", and
+    # downgrading it to INCONCLUSIVE because some *other* item had no baseline would bury a
+    # fact that was established. INCONCLUSIVE keeps its meaning -- nothing definite found,
+    # and something could not be told.
+    if overwritten or field_drift or api_drift or esm_drift:
+        print(f"\nverdict=DRIFT out_of_band={len(overwritten)} fields={len(field_drift)} "
+              f"api_operations={len(api_drift)} event_source_mappings={len(esm_drift)} "
+              f"functions={len(fn_rows)}")
+        return EXIT_DRIFT
+    if unreadable or ambiguous or not_judged:
+        print(f"\nverdict=INCONCLUSIVE functions={len(fn_rows)} "
+              f"unreadable_packages={len(unreadable)} ambiguous_esm={len(ambiguous)} "
+              f"not_judged={len(not_judged)}", file=sys.stderr)
+        return EXIT_INCONCLUSIVE
+    print(f"\nverdict=CONSISTENT functions={len(fn_rows)} esm={len(esm)} "
+          f"api_operations={len(oas[1]) if oas else 0}")
+    return EXIT_OK
+
+
+class _Parser(argparse.ArgumentParser):
+    """A usage error is a tool error (3), not INCONCLUSIVE (2).
+
+    argparse exits 2 by default, and 2 is this tool's "a machine or a point could not be read".
+    A typo in a flag would then be indistinguishable from an unreadable fleet.
+    """
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: usage error: {message}", file=sys.stderr)
+        raise SystemExit(EXIT_TOOL)
+
+
 def parse_args(argv):
-    p = argparse.ArgumentParser(description="Compare the data plane against a gateway release.")
+    p = _Parser(description="Compare the data plane against a gateway release.")
     p.add_argument("--region", required=True)
     p.add_argument("--gateway-dir", required=True, help="local checkout of the gateway branch")
     p.add_argument("--scope", default="dataplane", choices=["dataplane", "controlplane"])
@@ -586,16 +1075,39 @@ def parse_args(argv):
                         "guess reads another deployment's objects without erroring")
     p.add_argument("--host-asg", default="openclaw-hosts-asg")
     p.add_argument("--seed", help="reproducible sampling; defaults to the instance-id list")
-    return p.parse_args(argv)
+    # control plane (items 12-14). The data-plane run does not read these.
+    p.add_argument("--fn-prefix", default="openclaw",
+                   help="control plane: which functions belong to this deployment")
+    p.add_argument("--rest-api-id", help="control plane: the API whose OAS30 export is checked")
+    p.add_argument("--stage", default="v1")
+    p.add_argument("--account", help="control plane: rewritten to a placeholder before digesting")
+    p.add_argument("--baseline", help="control plane: JSON from a --write-baseline run on an "
+                                     "accepted deployment; without it the per-field comparison "
+                                     "is reported as not judged, never as passing")
+    p.add_argument("--write-baseline", help="control plane: record the live state as the baseline")
+    p.add_argument("--no-scan-packages", dest="scan_packages", action="store_false",
+                   help="control plane: skip downloading the deployment packages")
+    p.set_defaults(scan_packages=True)
+    args = p.parse_args(argv)
+    if args.scope == "controlplane" and args.baseline and args.write_baseline:
+        p.error("--baseline and --write-baseline are opposite directions; pick one")
+    return args
 
 
 def main(argv=None) -> int:
     args = parse_args(argv or sys.argv[1:])
     if args.scope == "controlplane":
-        print("controlplane scope is not implemented: its expected baseline needs a cdk synth "
-              "of the gateway tree (issue #521 items 12-14). Refusing rather than reporting a "
-              "comparison this tool did not make.", file=sys.stderr)
-        return EXIT_TOOL
+        try:
+            return run_controlplane(args)
+        except ToolError as exc:
+            print(f"tool error: {exc}", file=sys.stderr)
+            return EXIT_TOOL
+        except Exception as exc:  # noqa: BLE001 — same reason as the data-plane path below
+            import traceback
+            traceback.print_exc()
+            print(f"tool error (unexpected {type(exc).__name__}); exiting {EXIT_TOOL}, not 1: "
+                  "a broken tool must never read as a broken control plane.", file=sys.stderr)
+            return EXIT_TOOL
     try:
         gateway = pathlib.Path(args.gateway_dir).expanduser().resolve()
         files, unresolved = managed_files(gateway)

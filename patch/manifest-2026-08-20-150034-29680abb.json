@@ -1,0 +1,732 @@
+{
+  "synced_at": "2026-08-20 15:00:34 UTC+08:00",
+  "base_sha": "8cda33b2a7bfcef6fdd2b84ac84c8fe60dbcb324",
+  "source_commit": "29680abb570bba7b1e241616b534ba21de2c3e07",
+  "commit_count": 26,
+  "file_count": 23,
+  "summary": "Sync the bb increment 8cda33b2..29680abb to the public gateway branch. Sync-LOG only (which customer-facing files reached gateway + the issues behind them); the applyable patch kit is NOT built yet (folded_into pending).",
+  "issues_synced_note": "Index back to the issue tracker for whoever builds the patch kit: before assembling the kit, walk each issue and confirm it's covered. `title` is a ≤20-char gist only — open the issue for the full problem/fix/test. Lists only issues that touched a released file this sync.",
+  "issues_synced": [
+    {
+      "id": "#489",
+      "type": "fix",
+      "title": "门不再把「存量 config 无 red…"
+    },
+    {
+      "id": "#516",
+      "type": "feat",
+      "title": "broker 自动安装改走平台标准通道"
+    },
+    {
+      "id": "#521",
+      "type": "fix",
+      "title": "ESM 原来只打印不比对 —— 补进基线…"
+    }
+  ],
+  "needs_config_on_apply": [
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent-system.service",
+      "param": "Description",
+      "change": "systemd-directive",
+      "value": "SPIRE Agent (spire-kit, per-microVM identity)"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent-system.service",
+      "param": "Documentation",
+      "change": "systemd-directive",
+      "value": "file:///etc/spire-kit/README"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent-system.service",
+      "param": "After",
+      "change": "systemd-directive",
+      "value": "network-online.target"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent-system.service",
+      "param": "Wants",
+      "change": "systemd-directive",
+      "value": "network-online.target"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent-system.service",
+      "param": "ConditionPathExists",
+      "change": "systemd-directive",
+      "value": "/etc/spire-kit/enabled"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent-system.service",
+      "param": "StartLimitIntervalSec",
+      "change": "systemd-directive",
+      "value": "300"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent-system.service",
+      "param": "StartLimitBurst",
+      "change": "systemd-directive",
+      "value": "12"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent-system.service",
+      "param": "Type",
+      "change": "systemd-directive",
+      "value": "simple"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent-system.service",
+      "param": "Environment",
+      "change": "systemd-directive",
+      "value": "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent-system.service",
+      "param": "RuntimeDirectory",
+      "change": "systemd-directive",
+      "value": "spire"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent-system.service",
+      "param": "RuntimeDirectoryMode",
+      "change": "systemd-directive",
+      "value": "0755"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent-system.service",
+      "param": "StateDirectory",
+      "change": "systemd-directive",
+      "value": "spire-kit"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent-system.service",
+      "param": "ExecStart",
+      "change": "systemd-directive",
+      "value": "/etc/spire-kit/bootstrap.sh"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent-system.service",
+      "param": "Restart",
+      "change": "systemd-directive",
+      "value": "on-failure"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent-system.service",
+      "param": "RestartSec",
+      "change": "systemd-directive",
+      "value": "10"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent-system.service",
+      "param": "SuccessExitStatus",
+      "change": "systemd-directive",
+      "value": "3"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent-system.service",
+      "param": "NoNewPrivileges",
+      "change": "systemd-directive",
+      "value": "yes"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent-system.service",
+      "param": "StandardOutput",
+      "change": "systemd-directive",
+      "value": "journal"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent-system.service",
+      "param": "StandardError",
+      "change": "systemd-directive",
+      "value": "journal"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent-system.service",
+      "param": "WantedBy",
+      "change": "systemd-directive",
+      "value": "multi-user.target"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent.service",
+      "param": "Description",
+      "change": "systemd-directive",
+      "value": "SPIRE Agent (spire-kit, per-microVM identity)"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent.service",
+      "param": "Documentation",
+      "change": "systemd-directive",
+      "value": "file:///home/agent/.spire-kit/README"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent.service",
+      "param": "After",
+      "change": "systemd-directive",
+      "value": "network-online.target"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent.service",
+      "param": "Wants",
+      "change": "systemd-directive",
+      "value": "network-online.target"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent.service",
+      "param": "ConditionPathExists",
+      "change": "systemd-directive",
+      "value": "%h/.spire-kit/enabled"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent.service",
+      "param": "StartLimitIntervalSec",
+      "change": "systemd-directive",
+      "value": "300"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent.service",
+      "param": "StartLimitBurst",
+      "change": "systemd-directive",
+      "value": "12"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent.service",
+      "param": "Type",
+      "change": "systemd-directive",
+      "value": "simple"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent.service",
+      "param": "ExecStart",
+      "change": "systemd-directive",
+      "value": "%h/.spire-kit/bootstrap.sh"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent.service",
+      "param": "Restart",
+      "change": "systemd-directive",
+      "value": "on-failure"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent.service",
+      "param": "RestartSec",
+      "change": "systemd-directive",
+      "value": "10"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent.service",
+      "param": "SuccessExitStatus",
+      "change": "systemd-directive",
+      "value": "3"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent.service",
+      "param": "Environment",
+      "change": "systemd-directive",
+      "value": "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent.service",
+      "param": "NoNewPrivileges",
+      "change": "systemd-directive",
+      "value": "yes"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent.service",
+      "param": "StandardOutput",
+      "change": "systemd-directive",
+      "value": "journal"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent.service",
+      "param": "StandardError",
+      "change": "systemd-directive",
+      "value": "journal"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-agent.service",
+      "param": "WantedBy",
+      "change": "systemd-directive",
+      "value": "default.target"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-header-shim-system.service",
+      "param": "Description",
+      "change": "systemd-directive",
+      "value": "SPIRE header shim (spire-kit, inject JWT-SVID into egress)"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-header-shim-system.service",
+      "param": "Documentation",
+      "change": "systemd-directive",
+      "value": "file:///etc/spire-kit/README"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-header-shim-system.service",
+      "param": "After",
+      "change": "systemd-directive",
+      "value": "network-online.target spire-agent.service"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-header-shim-system.service",
+      "param": "Wants",
+      "change": "systemd-directive",
+      "value": "network-online.target"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-header-shim-system.service",
+      "param": "ConditionPathExists",
+      "change": "systemd-directive",
+      "value": "/etc/spire-kit/shim.env"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-header-shim-system.service",
+      "param": "Type",
+      "change": "systemd-directive",
+      "value": "simple"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-header-shim-system.service",
+      "param": "EnvironmentFile",
+      "change": "systemd-directive",
+      "value": "/etc/spire-kit/shim.env"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-header-shim-system.service",
+      "param": "Environment",
+      "change": "systemd-directive",
+      "value": "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-header-shim-system.service",
+      "param": "ExecStart",
+      "change": "systemd-directive",
+      "value": "/usr/bin/python3 /etc/spire-kit/header-shim.py"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-header-shim-system.service",
+      "param": "Restart",
+      "change": "systemd-directive",
+      "value": "always"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-header-shim-system.service",
+      "param": "RestartSec",
+      "change": "systemd-directive",
+      "value": "5"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-header-shim-system.service",
+      "param": "NoNewPrivileges",
+      "change": "systemd-directive",
+      "value": "yes"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-header-shim-system.service",
+      "param": "StandardOutput",
+      "change": "systemd-directive",
+      "value": "journal"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-header-shim-system.service",
+      "param": "StandardError",
+      "change": "systemd-directive",
+      "value": "journal"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-header-shim-system.service",
+      "param": "WantedBy",
+      "change": "systemd-directive",
+      "value": "multi-user.target"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-header-shim.service",
+      "param": "Description",
+      "change": "systemd-directive",
+      "value": "SPIRE header shim (spire-kit, inject JWT-SVID into egress)"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-header-shim.service",
+      "param": "Documentation",
+      "change": "systemd-directive",
+      "value": "file:///home/agent/.spire-kit/README"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-header-shim.service",
+      "param": "After",
+      "change": "systemd-directive",
+      "value": "network-online.target spire-agent.service"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-header-shim.service",
+      "param": "Wants",
+      "change": "systemd-directive",
+      "value": "network-online.target"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-header-shim.service",
+      "param": "ConditionPathExists",
+      "change": "systemd-directive",
+      "value": "%h/.spire-kit/shim.env"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-header-shim.service",
+      "param": "Type",
+      "change": "systemd-directive",
+      "value": "simple"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-header-shim.service",
+      "param": "EnvironmentFile",
+      "change": "systemd-directive",
+      "value": "%h/.spire-kit/shim.env"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-header-shim.service",
+      "param": "Environment",
+      "change": "systemd-directive",
+      "value": "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-header-shim.service",
+      "param": "ExecStart",
+      "change": "systemd-directive",
+      "value": "/usr/bin/python3 %h/.spire-kit/header-shim.py"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-header-shim.service",
+      "param": "Restart",
+      "change": "systemd-directive",
+      "value": "always"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-header-shim.service",
+      "param": "RestartSec",
+      "change": "systemd-directive",
+      "value": "5"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-header-shim.service",
+      "param": "NoNewPrivileges",
+      "change": "systemd-directive",
+      "value": "yes"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-header-shim.service",
+      "param": "StandardOutput",
+      "change": "systemd-directive",
+      "value": "journal"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-header-shim.service",
+      "param": "StandardError",
+      "change": "systemd-directive",
+      "value": "journal"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/guest/spire-header-shim.service",
+      "param": "WantedBy",
+      "change": "systemd-directive",
+      "value": "default.target"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/spire-join-broker.service",
+      "param": "Description",
+      "change": "systemd-directive",
+      "value": "SPIRE join-token broker (spire-kit, per-microVM identity over the /30 tap link)"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/spire-join-broker.service",
+      "param": "Documentation",
+      "change": "systemd-directive",
+      "value": "file:///opt/spire-kit/README.md"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/spire-join-broker.service",
+      "param": "After",
+      "change": "systemd-directive",
+      "value": "network-online.target spire-kit-netguard.service"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/spire-join-broker.service",
+      "param": "Wants",
+      "change": "systemd-directive",
+      "value": "network-online.target spire-kit-netguard.service"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/spire-join-broker.service",
+      "param": "Type",
+      "change": "systemd-directive",
+      "value": "simple"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/spire-join-broker.service",
+      "param": "EnvironmentFile",
+      "change": "systemd-directive",
+      "value": "-/etc/spire-kit/broker.env"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/spire-join-broker.service",
+      "param": "ExecStart",
+      "change": "systemd-directive",
+      "value": "/usr/bin/python3 /usr/local/bin/spire-join-broker.py"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/spire-join-broker.service",
+      "param": "Restart",
+      "change": "systemd-directive",
+      "value": "always"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/spire-join-broker.service",
+      "param": "RestartSec",
+      "change": "systemd-directive",
+      "value": "5"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/spire-join-broker.service",
+      "param": "User",
+      "change": "systemd-directive",
+      "value": "root"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/spire-join-broker.service",
+      "param": "StateDirectory",
+      "change": "systemd-directive",
+      "value": "spire-kit"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/spire-join-broker.service",
+      "param": "ProtectSystem",
+      "change": "systemd-directive",
+      "value": "strict"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/spire-join-broker.service",
+      "param": "ReadWritePaths",
+      "change": "systemd-directive",
+      "value": "/var/lib/spire-kit"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/spire-join-broker.service",
+      "param": "ProtectHome",
+      "change": "systemd-directive",
+      "value": "read-only"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/spire-join-broker.service",
+      "param": "PrivateTmp",
+      "change": "systemd-directive",
+      "value": "yes"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/spire-join-broker.service",
+      "param": "NoNewPrivileges",
+      "change": "systemd-directive",
+      "value": "yes"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/spire-join-broker.service",
+      "param": "ProtectKernelModules",
+      "change": "systemd-directive",
+      "value": "yes"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/spire-join-broker.service",
+      "param": "ProtectControlGroups",
+      "change": "systemd-directive",
+      "value": "yes"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/spire-join-broker.service",
+      "param": "RestrictSUIDSGID",
+      "change": "systemd-directive",
+      "value": "yes"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/spire-join-broker.service",
+      "param": "StandardOutput",
+      "change": "systemd-directive",
+      "value": "journal"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/spire-join-broker.service",
+      "param": "StandardError",
+      "change": "systemd-directive",
+      "value": "journal"
+    },
+    {
+      "file": "deploy/userdata/spire-kit/spire-join-broker.service",
+      "param": "WantedBy",
+      "change": "systemd-directive",
+      "value": "multi-user.target"
+    }
+  ],
+  "updated_files": {
+    "host-scripts (S3-pulled / baked into rootfs)": [
+      {
+        "path": "deploy/userdata/init-host.sh",
+        "status": "modified",
+        "issues": [
+          "#516"
+        ]
+      },
+      {
+        "path": "deploy/userdata/spire-kit/README.md",
+        "status": "added",
+        "issues": [
+          "#516"
+        ]
+      },
+      {
+        "path": "deploy/userdata/spire-kit/acceptance/logic_probe.py",
+        "status": "added",
+        "issues": [
+          "#516"
+        ]
+      },
+      {
+        "path": "deploy/userdata/spire-kit/acceptance/spire-kit-acceptance.sh",
+        "status": "added",
+        "issues": [
+          "#516"
+        ]
+      },
+      {
+        "path": "deploy/userdata/spire-kit/guest/agent.conf.tmpl",
+        "status": "added",
+        "issues": [
+          "#516"
+        ]
+      },
+      {
+        "path": "deploy/userdata/spire-kit/guest/install-guest-kit.sh",
+        "status": "added",
+        "issues": [
+          "#516"
+        ]
+      },
+      {
+        "path": "deploy/userdata/spire-kit/guest/shim.env.example",
+        "status": "added",
+        "issues": [
+          "#516"
+        ]
+      },
+      {
+        "path": "deploy/userdata/spire-kit/guest/spire-agent-system.service",
+        "status": "added",
+        "issues": [
+          "#516"
+        ]
+      },
+      {
+        "path": "deploy/userdata/spire-kit/guest/spire-agent.service",
+        "status": "added",
+        "issues": [
+          "#516"
+        ]
+      },
+      {
+        "path": "deploy/userdata/spire-kit/guest/spire-bootstrap.sh",
+        "status": "added",
+        "issues": [
+          "#516"
+        ]
+      },
+      {
+        "path": "deploy/userdata/spire-kit/guest/spire-header-shim-system.service",
+        "status": "added",
+        "issues": [
+          "#516"
+        ]
+      },
+      {
+        "path": "deploy/userdata/spire-kit/guest/spire-header-shim.py",
+        "status": "added",
+        "issues": [
+          "#516"
+        ]
+      },
+      {
+        "path": "deploy/userdata/spire-kit/guest/spire-header-shim.service",
+        "status": "added",
+        "issues": [
+          "#516"
+        ]
+      },
+      {
+        "path": "deploy/userdata/spire-kit/hooks/README.md",
+        "status": "added",
+        "issues": [
+          "#516"
+        ]
+      },
+      {
+        "path": "deploy/userdata/spire-kit/hooks/host-user-hook.sh",
+        "status": "added",
+        "issues": [
+          "#516"
+        ]
+      },
+      {
+        "path": "deploy/userdata/spire-kit/install.sh",
+        "status": "added",
+        "issues": [
+          "#516"
+        ]
+      },
+      {
+        "path": "deploy/userdata/spire-kit/registrar-mock-customer.py",
+        "status": "added",
+        "issues": [
+          "#516"
+        ]
+      },
+      {
+        "path": "deploy/userdata/spire-kit/registrar-stub.py",
+        "status": "added",
+        "issues": [
+          "#516"
+        ]
+      },
+      {
+        "path": "deploy/userdata/spire-kit/spire-join-broker.py",
+        "status": "added",
+        "issues": [
+          "#516"
+        ]
+      },
+      {
+        "path": "deploy/userdata/spire-kit/spire-join-broker.service",
+        "status": "added",
+        "issues": [
+          "#516"
+        ]
+      },
+      {
+        "path": "deploy/userdata/spire-kit/spire-kit-setup.sh",
+        "status": "added",
+        "issues": [
+          "#516"
+        ]
+      }
+    ],
+    "root / other": [
+      {
+        "path": "cli/oc-consistency.py",
+        "status": "modified",
+        "issues": [
+          "#521"
+        ]
+      }
+    ],
+    "scripts": [
+      {
+        "path": "scripts/preflight-check.sh",
+        "status": "modified",
+        "issues": [
+          "#489"
+        ]
+      }
+    ]
+  },
+  "folded_into": "(pending) — no patch kit built for this sync yet; a later kit should cite this manifest as source-of-record and set base_sha/patch_sha. cdk deploy is FORBIDDEN on hand-modified live deployments — the kit must ship *.patched host scripts + the full lambda tree + AWS CLI for stack changes, same shape as patch/315-concurrent-dispatch-rollup/."
+}

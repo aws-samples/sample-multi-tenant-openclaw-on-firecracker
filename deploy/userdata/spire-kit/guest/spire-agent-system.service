@@ -1,0 +1,40 @@
+[Unit]
+# 系统级 unit —— 烤进 rootfs 时用(客户文档里的形态)。
+# 与数据盘 user unit 版(spire-agent.service)二选一,不要同时装:
+#   · rootfs 版:root 跑,socket 在 /run/spire/agent.sock,每台 VM 一装到底,存量租户
+#     换镜像即生效;代价是要出新镜像版本。
+#   · 数据盘 user unit 版:uid 1000 跑,零镜像改动;代价是每个数据盘都要装一次。
+Description=SPIRE Agent (spire-kit, per-microVM identity)
+Documentation=file:///etc/spire-kit/README
+After=network-online.target
+Wants=network-online.target
+# 故意【不】写 Before=/RequiredBy= 任何 openclaw unit:身份层起不来时 OpenClaw 照常服务。
+# 总开关:标记文件不在就整个 unit 不跑(装了 kit 也能一键关)
+ConditionPathExists=/etc/spire-kit/enabled
+StartLimitIntervalSec=300
+StartLimitBurst=12
+
+[Service]
+Type=simple
+Environment=SPIRE_KIT_DIR=/etc/spire-kit
+Environment=SPIRE_KIT_AGENT_BIN=/usr/local/bin/spire-agent
+Environment=SPIRE_KIT_CONF_TMPL=/etc/spire-kit/agent.conf.tmpl
+Environment=SPIRE_KIT_CONF_OUT=/run/spire/agent.conf
+Environment=SPIRE_KIT_STATE_DIR=/var/lib/spire-kit/state
+Environment=SPIRE_KIT_RUN_DIR=/run/spire
+Environment=SPIRE_KIT_LOG_DIR=/var/log
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+RuntimeDirectory=spire
+RuntimeDirectoryMode=0755
+StateDirectory=spire-kit
+ExecStart=/etc/spire-kit/bootstrap.sh
+Restart=on-failure
+RestartSec=10
+# exit 3 = broker 判定"本次开机已发过 token"(正常状态,不是故障)
+SuccessExitStatus=3
+NoNewPrivileges=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

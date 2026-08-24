@@ -44,9 +44,11 @@ bash lib/discover-env.sh "$REGION"
 
 ```bash
 python3 - <<'PY'
-import json, hashlib, subprocess, sys
+import json, hashlib, subprocess, sys, pathlib
 m = json.load(open("manifest.json"))
 bad = 0
+
+# ① 每个 shipped 制品:kit 内文件 == manifest 记录 == 锚定树上的内容,三者必须一致
 for path, pv in m["paths"].items():
     art = pv.get("artifact")
     if not art:
@@ -56,14 +58,47 @@ for path, pv in m["paths"].items():
     src = subprocess.run(["git", "show", f"{m['patch_sha']}:{path}"], capture_output=True)
     ref = hashlib.sha256(src.stdout).hexdigest() if src.returncode == 0 else "unreadable"
     if not (want == got == ref):
-        print("MISMATCH", path, want[:12], got[:12], ref[:12])
-        bad += 1
-print("artifacts checked:", sum(1 for v in m["paths"].values() if v.get("artifact")), "mismatched:", bad)
+        print("ARTIFACT MISMATCH", path, want[:12], got[:12], ref[:12]); bad += 1
+
+# ② lib/ 下每个工具的哈希(它们直接驱动生产变更,被改过一定要看得见)
+for rel, want in (m.get("kit_files") or {}).items():
+    want = want if isinstance(want, str) else want.get("sha256")
+    f = pathlib.Path(rel)
+    got = hashlib.sha256(f.read_bytes()).hexdigest() if f.is_file() else "missing"
+    if got != want:
+        print("KIT FILE MISMATCH", rel, str(want)[:12], got[:12]); bad += 1
+
+# ③ CloudFormation 闭包快照的哈希(第 4 步逐资源决策全靠它)
+for st in (m.get("cloudformation") or {}).get("stacks", []):
+    for side in ("base_template", "patch_template"):
+        decl = st.get(side) or {}
+        rel, want = decl.get("artifact"), decl.get("sha256")
+        if not rel:
+            continue
+        f = pathlib.Path(rel)
+        got = hashlib.sha256(f.read_bytes()).hexdigest() if f.is_file() else "missing"
+        if got != want:
+            print("CLOSURE MISMATCH", rel, str(want)[:12], got[:12]); bad += 1
+
+# ④ IAM 策略必须存在且能解析(第 2 步 fail-closed 前置就靠它)
+pol = pathlib.Path("iam/lifecycle-deadline-read.json")
+if not pol.is_file():
+    print("IAM POLICY MISSING", pol); bad += 1
+else:
+    try:
+        json.loads(pol.read_text())
+    except Exception as exc:
+        print("IAM POLICY UNPARSEABLE", exc); bad += 1
+
+print("mismatched:", bad)
 sys.exit(1 if bad else 0)
 PY
 ```
 
-摘要是 SHA-256。任何一条不等就停下,不要继续 —— 那说明 kit 被重新打包过或下载不完整。
+摘要是 SHA-256。**四类都要过**:shipped 制品、`lib/` 工具、CloudFormation 闭包快照、IAM 策略 ——
+只核制品是不够的,后三类同样直接驱动生产变更(`lib/` 里的脚本会改机队,闭包快照决定第 4 步逐资源
+怎么决策,IAM 策略是第 2 步的 fail-closed 前置)。任何一条不等就停下,不要继续 —— 那说明 kit 被
+重新打包过或下载不完整。
 
 ## Step 1 — 备份(每个操作的 backup 必须先成功)
 

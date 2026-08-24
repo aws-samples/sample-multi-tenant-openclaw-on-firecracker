@@ -31,10 +31,17 @@ from botocore.exceptions import ClientError
 
 import core.capacity as capacity
 import core.clients as clients
+import core.ddb_scan as ddb_scan  # #432 —— Scan 必须翻页
+import core.create_deadline as create_deadline  # #562 — 死线口径,与 tenant_service 同一份
 import core.host_profile as host_profile
+import core.host_taint as host_taint  # #540 — 队列路径读污点,判定复用写侧纯函数
 # #491 — 物理 tap 占用守卫。core.scheduling 只依赖 core.*(不 import services),
 # 故此处无循环导入风险。
 import core.scheduling as scheduling
+# #562 形态第 4 条 —— 复用死线执行者的【同一份】围栏与扩容实现,不在这里另写一份。
+# 变异 M7 已经证过一次「同一判定写两份就会漂」的代价(归因在两处各判一次,结论能互相矛盾)。
+# 分层允许 services→services(import-layers.sh:25 只禁 routes/consumers/router)。
+import services.deadline_executor as deadline_executor
 from core.dispatch import (
     MANIFEST_PART_MAX_BYTES,
     encode_manifest_line,
@@ -142,6 +149,12 @@ def _parse_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "tenant_id": msg.get("tenant_id"),
                 "request_token": msg.get("request_token"),
                 "params": msg.get("params") or {},
+                # #562 G7 —— 死线随消息走。这里只【带出来】,不在解析阶段判定:解析是纯函数
+                # (被多处以脱包方式加载测试),判定要读时钟,分开才好测。
+                # 老消息(本改动部署【之前】入队的)没有这个字段 → None → 下游按「未知」处理
+                # = 不丢弃、走正常链路,由死线执行者兜底。这是升级期的必然形态:队列里会同时
+                # 有带死线与不带死线的消息,不许因为缺字段就丢掉客户已受理的创建。
+                "deadline": msg.get(create_deadline.MSG_DEADLINE_KEY),
             }
         )
     return out
@@ -252,18 +265,22 @@ def _snapshot_hosts(now_epoch: int, gate_inflight: bool = True) -> List[Dict[str
     """扫 active/idle host,算 free_slots + inflight_ok + simulated。ConsistentRead 强一致
     (与 core.scheduling._find_host 同款,防跨实例装满同一 host)。
 
-    #315 SPLIT_BY_MODE:gate_inflight 控制是否按"host 有未过期在途命令"算 inflight_ok。
     - push 模式(gate_inflight=True):保留旧逻辑——host 有未过期 inflight → inflight_ok=False,
       binpack 跳过它(host 级串行,poller 靠 inflight 标量追踪 SSM 终态需要这个串行)。
     - ddb 模式(gate_inflight=False):inflight_ok 恒 True,不因在途命令挡装箱(host-agent 每 5s
       从 assignment 表兜底,允许一台 host 并发多批,可扩 1000 host;容量安全由 slot 级 CAS 保证)。
     """
-    hosts = clients.hosts_table.scan(
+    # 隐藏一部分机队:装箱把它们当不存在 → unplaced → 而 #562 之后 unplaced 会在死线时
+    # 被判 failed(capacity_unavailable)。也就是说客户拿到「容量不足」,而那些机器正空着。
+    # 判据不是「命中数小」而是「全表字节数」:filter 在 1MB 读之后才过滤,openclaw-hosts
+    # 又累积 deleted 死行(实测 39 行里 33 行 deleted)。
+    hosts = ddb_scan.scan_all(
+        clients.hosts_table,
         FilterExpression="#s IN (:a, :i)",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":a": "active", ":i": "idle"},
         ConsistentRead=True,
-    ).get("Items", [])
+    )
 
     # 长批次认领可能已耗时 > TTL,此时刚上报的满盘记录(ts≈real-now)相对 now_epoch 会落进"离谱
     # 未来"被误判 fail-open。用 scan 时刻做基准,ts 与它的差恒是真实新鲜度。inflight 判定仍用
@@ -319,6 +336,17 @@ def _snapshot_hosts(now_epoch: int, gate_inflight: bool = True) -> List[Dict[str
             )
         else:
             inflight_ok = True  # ddb:不设门,并发多批
+        # #540 — 污点(cordon)软门。与 disk_ok / mem_ok / inflight_ok 同款:在这里算好一个
+        # 扁平布尔传给 binpack,binpack 保持零依赖纯函数(它被 importlib 脱包加载,不能
+        # import core.host_taint,也不该读私有 "raw")。
+        # 这里【不 fail-open】,与磁盘/内存两个软门相反:那两个门的信号来自 host 自报,
+        # 字段缺失或陈旧就意味着"读数不可信",误杀整台机器的代价大于放行。污点不一样 ——
+        # 它是运维在控制面显式写下的意图,`is_tainted` 只在写侧写 true、取消用 REMOVE,
+        # 不存在"陈旧读数"这回事;字段不存在就是没被标,判 taint_ok=True 本身就是正确答案。
+        taint_ok = not host_taint.is_tainted(h)
+        # #549 — 心跳陈旧闸(与选点侧 _find_host 同口径):last_seen 超阈值的 host 不接新租户。
+        # 基准用 disk_now(扫描此刻),与 disk/mem 软门一致。缺信号/未来时间戳 fail-open。
+        seen_ok = capacity.seen_fresh(h, clients.HOST_SEEN_STALE_SEC, disk_now)
         out.append(
             {
                 "instance_id": h["instance_id"],
@@ -331,6 +359,8 @@ def _snapshot_hosts(now_epoch: int, gate_inflight: bool = True) -> List[Dict[str
                 "inflight_ok": bool(inflight_ok),
                 "disk_ok": bool(disk_ok),
                 "mem_ok": bool(mem_ok),
+                "taint_ok": bool(taint_ok),  # #540
+                "seen_ok": bool(seen_ok),  # #549
                 # (零 boto3、被 tests/test_dispatch_binpack.py 用 importlib 脱包加载),
                 # 所以它不能 import clients/host_profile、也不该读私有 "raw" —— tier
                 # 在这里算好传下去。
@@ -654,6 +684,11 @@ def _reserve_batch_txn_once(
     host_cond = (
         "next_vm_num = :expected AND used_vcpu <= :cap_v AND used_mem_mb <= :cap_m"
     )
+    # #540 — 污点原子门。队列路径的窗口比同步 create 更宽:_snapshot_hosts 扫一次、binpack
+    # 装【整批】、然后才逐 host 写,期间运维完全可能标记其中一台。快照里的 taint_ok 是软门
+    # (装箱时不选它),这条条件写才是原子的那一层。
+    host_cond += " AND " + host_taint.NOT_TAINTED_CONDITION
+    host_vals.update(host_taint.NOT_TAINTED_VALUES)
     host_names = {}
     if atomic_claim:
         claim_cond, claim_set, host_names, value_keys = scheduling.slot_claim_clause(
@@ -976,7 +1011,6 @@ def _derive_exec_timeout(batch_size: int) -> int:
     """SSM executionTimeout = ceil(batch × per-vm-budget / 有效并发) + 120s 余量,
     并 ≤ visibility_timeout - 60s(防假超时→回滚活 VM→账本分叉)。
 
-    #331/#327:有效并发 = host 级槽闸数(DISPATCH_HOST_LAUNCH_CONCURRENCY,~30)不是装箱密度
     DISPATCH_MAX_PARALLEL(96)。VM 经跨进程 flock 槽【排队限速】起:batch 个 VM 分 ceil(batch/slots)
     【轮】跑,每轮并行 slots 个、耗时约 per_vm 秒。故公式 = ceil(batch/slots)×per_vm + 120 余量
     (codex #327:不是 batch×per_vm/slots——后者在不整除时少算一整轮尾巴)。"""
@@ -1179,6 +1213,40 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not parsed:
         return {"batchItemFailures": []}
 
+    # 0.5) #562 G7 —— 过期消息不起 VM。在【认领之前】丢弃,所以不占号、不写账本、不发 SSM。
+    #
+    # 为什么必须有这一步:消费者停 10 分钟再恢复,会一次性领到一大批客户【早已放弃】的创建。
+    # 若照常起 VM,后果是最糟的一种组合 —— 客户端收到 failed 并且已经重试过了,而我方悄悄给
+    # 它起了一台 VM:占容量、计费、没人认领、也不会被任何自愈流程收走(它 status 已是 failed,
+    # 不在 creating 扫描面里)。
+    #
+    # 丢弃是【安全】的,因为独立死线执行者(G6,dispatch_poller 侧)已经把这些租户判成终态了。
+    # 这里 ack 删除而不进 batchItemFailures:业务判死是一次【成功处理】,进 DLQ 会污染
+    # 「DLQ 非空 = 100% 是 bug」这条语义(形态第 7 条)。
+    #
+    # 缺死线字段(老消息)→ is_expired 返 False → 不丢弃,走正常链路。升级期队列里两种消息并存,
+    # 不许因为缺字段就丢掉客户已受理的创建。
+    _fresh, _expired_ids = [], []
+    for _p in parsed:
+        if _p.get("invalid"):
+            _fresh.append(_p)  # 非法消息的处置归下游既有逻辑,不在这里抢
+            continue
+        if create_deadline.is_expired(_p.get("deadline"), now_epoch):
+            _expired_ids.append(_p.get("msg_id"))
+            continue
+        _fresh.append(_p)
+    if _expired_ids:
+        # fail-loud 到日志:这批被丢弃的必须可数、可归因。若这个数长期非零,说明消费能力
+        # 或死线预算有问题,而不是"正常丢弃"。
+        print(
+            f"[dispatch] #562 dropped {len(_expired_ids)} expired message(s) "
+            f"(deadline passed, tenants already terminal via deadline executor); "
+            f"msg_ids={_expired_ids[:10]}"
+        )
+    parsed = _fresh
+    if not parsed:
+        return {"batchItemFailures": []}
+
     # 1) 认领闸
     winners, _ack_drop = _claim_tenants(parsed, command_id, _now())
     # 认领输家(重复/竞争)静默 ack,不进 batchItemFailures
@@ -1248,6 +1316,9 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     tid_to_rh = {w["tenant_id"]: w.get("receipt_handle") for w in winners}
     # #522 P1-2 tenant_id → SQS ApproximateReceiveCount(升级宽限的收敛 backstop 用)
     recv_by_tid = {w["tenant_id"]: int(w.get("receive_count", 1) or 1) for w in winners}
+    # #562 —— tid → 死线。binpack 产出的 unplaced 元素不一定带 deadline 字段,
+    # 所以在这里从 winners 建一次映射(与 recv_by_tid 同款),下面判「注定超不过」时查。
+    deadline_by_tid = {w["tenant_id"]: w.get("deadline") for w in winners}
     alloc_by_host = {h["instance_id"]: h["allocatable_vcpu"] for h in hosts}
     alloc_mem_by_host = {h["instance_id"]: h.get("allocatable_mem", 0) for h in hosts}
     # 从它派连续 vm_num 段(事务不返回 Attributes,不能读回 → 用乐观锁把 base 钉死)。
@@ -1527,9 +1598,46 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         else False
     )
     _max_recv = clients.DISPATCH_MAX_RECEIVE_COUNT
+    _doomed_capacity_deaths = 0
     for t in result.unplaced:
         _tid = t["tenant_id"]
         _rc = recv_by_tid.get(_tid, 1)
+        _dl = deadline_by_tid.get(_tid)
+        if create_deadline.doomed_by_deadline(_dl, now_epoch):
+            # ★#562 形态第 4 条 ——「注定超不过死线」:剩余时间已装不下执行段,现在【同步判死】。
+            #
+            # 为什么这条必须排在最前面(压过投递预算与升级宽限):没时间了就不该再重投。
+            # 重投的两个结局都更差 —— 要么烧完投递预算进 DLQ(污染「DLQ 非空 = 100% 是 bug」),
+            # 要么一路等到 1 分钟节拍的兜底执行者才被判死。
+            #
+            # 【这条缺失被真机压测抓出来】2026-08-21 一次 12 个创建的实测:5 个容量类失败全部
+            # 由兜底执行者判死,其中 5 个都晚于 180s 死线 —— 因为本判定当时只有函数、没有调用点。
+            # G1 的「180s 内进终态」靠的就是这里的同步判定,兜底只能保证「分钟内必然终态」。
+            #
+            # 围栏复用 deadline_executor._fence_failed:同一份实现、同样双锚 status+deadline、
+            # 同样【保留】容量令牌交给带 stop-confirm 的释放者。此处租户未装箱(unplaced)故无令牌,
+            # 但走同一函数保证语义不漂。
+            _outcome, _reason = deadline_executor._fence_failed(
+                {"id": _tid, "status": "creating",
+                 create_deadline.ATTR_DEADLINE: _dl},
+                now_epoch,
+            )
+            # 【不能用 _fail()】—— 它的第 3 行是 `failures.append(tid_to_msg[tid])`,即把消息
+            # 塞进 batchItemFailures 重投。对已判死的租户那是最坏组合:租户是 failed 终态,
+            # 消息还要被重投到耗尽预算进 DLQ,或者更糟 —— 重投成功后对一个 failed 租户起了 VM。
+            # 我第一版就是调了 _fail(),被本文件的
+            # test_doomed_tenant_is_failed_synchronously_not_requeued 当场打红。
+            # 这里只打日志、不进 failures,消息随本批 ack 删除。
+            print(
+                f"[dispatch] #562 doomed tenant={_tid} cmd={command_id} "
+                f"reason={_reason} outcome={_outcome} deadline={_dl} now={now_epoch} "
+                f"— fenced terminal, message ACKed (no requeue)"
+            )
+            if _outcome == "fenced" and _reason == create_deadline.REASON_CAPACITY:
+                _doomed_capacity_deaths += 1
+            # 【不进 batchItemFailures】:租户已是终态,消息再没有用途。进 DLQ 会污染那条运维判据;
+            # 重投则会对一个已 failed 的租户起 VM —— 那正是「没人认领的孤儿 VM」。
+            continue
         if _rc >= _max_recv:
             # ★收敛 backstop(codex F1):到 SQS 最后一次投递(下次即 DLQ)仍无处可放 → 直接标
             # requires_intervention(loud 终态),杜绝 no-budget 宽限把消息静默送进 DLQ 却让租户
@@ -1545,6 +1653,14 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         else:
             _fail(_tid, "unplaced: no host capacity this round")
             capacity_retry_tids.add(_tid)
+
+    # #562 G14 —— 判死的那一刻触发扩容,但【一轮只做一次决策】。
+    # issue 原文:「判死的同时自动触发扩容。这是必须项:不触发扩容,客户端重试也一样失败,
+    # 形成永久失败循环。」同时它也要求「幂等且有上限:1800 个请求同时判死不能触发 1800 次扩容」。
+    # 所以这里传【本批的容量类死亡数】给同一个带上限的实现,而不是在上面的循环里逐个调用 ——
+    # G15 的结论是「扩容风暴的成因是调用频率,不是 _scale_out 的 fail-safe 本身」。
+    if _doomed_capacity_deaths:
+        deadline_executor._scale_out_for_deaths(_doomed_capacity_deaths)
 
     # 但记入 reserve_retry_tids(下方 _release_claims 跳过它)保 claim 不计 retry,下轮重投再结算。
     for _msg in stale_unsettled_msgs:
@@ -1582,13 +1698,31 @@ def dispatch_batch(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     # 释放成功的 → 消除 codex simple review P1(先缩后释放会在释放慢/失败时 15s 内撞新鲜 claim
     # 丢消息)。释放失败/被接管/已终态的不缩,保留队列默认 960s(或到 maxReceiveCount 进 DLQ)兜底,
     # 多是 host 级 inflight 串行的正常等待(合法 SSM 可跑 840s),15s 就催会误伤——push 走原 960s。
-    if ddb_mode:
-        capacity_rh = [
-            tid_to_rh[tid]
-            for tid in capacity_retry_tids
-            if tid in released and tid_to_rh.get(tid)
-        ]
-        _shorten_visibility_best_effort(capacity_rh)
+    # #562 —— 带死线的容量重投:按死线安排下一次投递(不分模式,理由见
+    _dl_pairs, _legacy_rh = [], []
+    for _tid in capacity_retry_tids:
+        if _tid not in released or not tid_to_rh.get(_tid):
+            continue
+        _dl = deadline_by_tid.get(_tid)
+        _left = create_deadline.remaining_sec(_dl, now_epoch)
+        if _left is None:
+            _legacy_rh.append(tid_to_rh[_tid])
+            continue
+        # 目标:下一次投递落在判定窗口【刚打开之后】。窗口在「剩余 < 执行段」时打开,
+        # 所以等 (剩余 - 执行段) 秒窗口正好打开,再加 5s 余量确保严格小于。
+        # 下限 5s:不要因为算出 0/负数就变成"立刻重投"打转。
+        # 上限压在剩余时间之内:超过死线再回来就没意义了(那时执行者已判死,认领闸会静默 ack)。
+        _wait = max(5, min(_left, _left - create_deadline.EXEC_BUDGET_SEC + 5))
+        _dl_pairs.append((tid_to_rh[_tid], _wait))
+    if _dl_pairs:
+        print(
+            f"[dispatch] #562 deadline-aware requeue: {len(_dl_pairs)} msg(s), "
+            f"waits={[w for _, w in _dl_pairs[:10]]}s "
+            f"(下一次投递落进判定窗口,保证死线前有一次同步判定)"
+        )
+        _deadline_aware_visibility_best_effort(_dl_pairs)
+    if ddb_mode and _legacy_rh:
+        _shorten_visibility_best_effort(_legacy_rh)
     # 不用 grep per-tenant 行。dedup 非空 = 有租户回队列重投(超预算才最终进 DLQ)。
     # grep 一键追全链路"成立(原来只记 command_id,tid→command_id 关联断在 dispatch 段,追踪
     # 要中转 SSM/assignments)。**分批写入**:每 50 个 tid 一条日志行(带 [i/n] 序号),既不丢
@@ -1617,7 +1751,6 @@ def _release_claims(tenant_ids: List[str], claim_id: str) -> set:
     claim 被静默 ack 删 → 丢消息;释放失败的保留队列默认 960s visibility(或到 maxReceiveCount
     进 DLQ,由 DLQ 告警/redrive 恢复)兜底重投,不静默丢)。
 
-    #141 收敛主修:ADD dispatch_retries 后,若新值达到重试预算,立刻转
     requires_intervention。为什么在这里而非只靠认领闸的 over-budget 分支——
     时序:SQS dlq_max_receive_count=N,消息第 N 次接收失败时 dispatch_retries
     从 N-1 ADD 到 N,此刻 SQS receiveCount=N=maxReceiveCount,消息转 DLQ,
@@ -1656,6 +1789,38 @@ def _release_claims(tenant_ids: List[str], claim_id: str) -> set:
             # 否则 15s 回可见时 claim 还在会被静默 ack 删 → 丢消息,codex simple review P1)。
             print(f"[dispatch] release claim {tid} failed (non-fatal): {e}")
     return released_needs_retry
+
+
+def _deadline_aware_visibility_best_effort(pairs):
+    """#562 —— 按【死线】给 unplaced 消息安排下一次投递,让最后一次消费必然落进判定窗口。
+
+    为什么必须有这个:原来的短退避 `_shorten_visibility_best_effort` 被 `if ddb_mode:` 门住
+    (#315:push 模式的 unplaced 多是 host 级 inflight 串行的正常等待,15s 就催会误伤)。
+    我们这套部署是 **push** 模式,所以容量不足的 unplaced 消息按队列默认 **960s** 重投 ——
+    16 分钟后才回来,远在 180s 死线之后。后果:「注定超不过死线」的同步判定【结构上永不触发】,
+    每个容量不足的创建都只能等 1 分钟节拍的兜底执行者,必然晚于死线。
+    2026-08-21 真机压测(20 个创建 / 14 个容量失败)实测到这个形态:14 个全部 enforced_by_executor
+    且全部 late,同步判死日志一条都没有。
+
+    这里不复用那个 15s 常量,而是按剩余时间算:把下一次投递安排到【判定窗口刚打开之后】。
+    这样既不"提前放弃"(issue 明确要求「期间可能有 slot 释放,不提前放弃」),又保证在死线之前
+    一定有一次消费能做出同步判定(issue 同样明确「但也绝不超过 3 分钟」)。
+    因为判据是死线而不是一个拍脑袋的秒数,所以它对 push / ddb 两种模式都成立,不需要模式门。
+
+    best-effort:改可见性失败不影响正确性 —— 消息仍按默认 visibility 兜底重投,只是那时
+    只能靠死线执行者判死(晚,但仍是终态)。不发新消息,无 send/write 原子性问题。
+    """
+    if not pairs or not clients.DISPATCH_QUEUE_URL:
+        return
+    for rh, seconds in pairs:
+        try:
+            _sqs().change_message_visibility(
+                QueueUrl=clients.DISPATCH_QUEUE_URL,
+                ReceiptHandle=rh,
+                VisibilityTimeout=int(seconds),
+            )
+        except Exception as e:  # noqa: BLE001 —— 见 docstring:失败只是退化,不炸 invocation
+            print(f"[dispatch] #562 deadline-aware visibility non-fatal: {e}")
 
 
 def _shorten_visibility_best_effort(receipt_handles):

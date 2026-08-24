@@ -1,15 +1,33 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 
+import sys
 import os
 import json
 import boto3
+from botocore.config import Config
 from datetime import datetime, timezone
+
+#
+# Lambda 运行时:本包目录(deploy/lambda/health_check/ 或 scaler/)就是部署根,`import ddb_scan`
+# 天然可解析。但测试用 `importlib.util.spec_from_file_location(name, ".../handler.py")` 按
+# 【文件路径】加载时,Python **不会**把该文件所在目录放进 sys.path —— 于是裸导入 ModuleNotFound。
+# 实测代价:不加这两行,43 个既有用例(6 个文件)集体 ModuleNotFoundError。
+#
+# 为什么改生产侧而不是给那 6 个测试文件各加一行 sys.path:那是一笔【持续的税】——
+# 以后每一个加载这两个 handler 的新测试都得记得加,而"忘记加"的表现是整文件 collection error,
+# 与本 issue 要消灭的静默失效同族。这里两行、就近、有注释,一次付清。
+_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+if _PKG_DIR not in sys.path:
+    sys.path.insert(0, _PKG_DIR)
+import ddb_scan  # #432 —— Scan 必须翻页(本包独立打包,故各带一份)
 
 ddb = boto3.resource("dynamodb")
 # autoscaling client 的 standard retry config 在下方 _asg_retry 定义后重建
 autoscaling = boto3.client("autoscaling")
-ssm = boto3.client("ssm")
+ssm = boto3.client(
+    "ssm", config=Config(retries={"max_attempts": 8, "mode": "adaptive"})
+)
 s3 = boto3.client("s3")
 hosts_table = ddb.Table(os.environ["HOSTS_TABLE"])
 tenants_table = (
@@ -98,11 +116,14 @@ def lambda_handler(event, context):
         _reconcile_image_refresh()
 
     now = datetime.now(timezone.utc)
-    hosts = hosts_table.scan(
+    # 规模判断错位 —— 少看见在役机器就多扩一台(白花钱),少看见 idle 机器就不回收(也白花钱)。
+    # 注意 filter 是 `status <> deleted`,命中集合几乎等于全表 —— 恰恰最容易撞 1MB。
+    hosts = ddb_scan.scan_all(
+        hosts_table,
         FilterExpression="#s <> :d",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":d": "deleted"},
-    ).get("Items", [])
+    )
 
     # R8 缩容总门:仅当开关开 且 全局无在途租户时才允许 terminate。算一次给整个 loop
     # 用(别每 host 重扫)。idle 标记/恢复无条件做,不受此门影响。
@@ -251,9 +272,10 @@ def _process_ttl_expirations():
     if tenants_table is None:
         return  # backward compat: if env var missing, no-op
     try:
-        items = tenants_table.scan(
-            FilterExpression="attribute_exists(expires_at)",
-        ).get("Items", [])
+        # 对客户来说这是「说了会到期但不会到期」,比报错严重得多。
+        items = ddb_scan.scan_all(
+            tenants_table, FilterExpression="attribute_exists(expires_at)"
+        )
     except Exception as e:
         print(f"ttl scan failed: {e}")
         return
@@ -285,29 +307,50 @@ def _process_ttl_expirations():
                     )
                 except Exception as e:
                     print(f"ttl stop SSM failed for {tid}: {e}")
-            _update_tenant_status(tid, "stopped")
+            _update_tenant_status(tid, "stopped", expected_prev=status)
             print(f"ttl: stopped {tid} (expired at {t['expires_at']})")
         elif action == "delete":
-            _update_tenant_status(tid, "deleted")
+            _update_tenant_status(tid, "deleted", expected_prev=status)
             print(f"ttl: deleted {tid} (expired at {t['expires_at']})")
 
 
-def _update_tenant_status(tenant_id, status):
+def _update_tenant_status(tenant_id, status, expected_prev=None):
     # #501 — TTL delete 也是「把 status 写成 deleted」的路径,同样必须清健康位:health_check
     # sweep 跳过终态租户,不清就永久停在删除前的 up,把已删租户伪装成健康在役租户。只在 deleted
     # 时清(stopped 仍是可恢复态,保留最后一次观测)。
+    #
+    # 为什么必须有:上游 `_process_ttl_expirations` 的 `status in _TTL_TERMINAL` 闸(:70 起,
+    # 含 `deleting`)读的是 `ddb_scan.scan_all` 的**最终一致**结果 —— scan 读到 running
+    # (旧副本)而租户此刻其实已是 deleting,那道闸就放行了,随后这里零条件把 status 写成
+    # stopped/deleted,把一次进行中的 delete 覆盖掉。CAS 让那道最终一致的闸变得可靠:
+    # 读到的值只要不再成立,写就失败。
+    #
+    # 这也是**不把 scan 改成强一致读**的理由 —— DDB 的 Scan 根本没有跨分区强一致语义,
+    # 逐项 ConsistentRead 复查又要给全表加一轮 GetItem。CAS 把"读到旧值"从一个正确性
+    # 问题降级成一次无副作用的空转,下一轮 sweep 自然收敛。
     expr = "SET #s = :s, updated_at = :t"
     if status == "deleted":
         expr += " REMOVE vm_health, app_health, last_health_check"
+    kwargs = {
+        "Key": {"id": tenant_id},
+        "UpdateExpression": expr,
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {
+            ":s": status,
+            ":t": datetime.now(timezone.utc).isoformat(),
+        },
+    }
+    if expected_prev is not None:
+        kwargs["ConditionExpression"] = "#s = :expected_prev"
+        kwargs["ExpressionAttributeValues"][":expected_prev"] = expected_prev
     try:
-        tenants_table.update_item(
-            Key={"id": tenant_id},
-            UpdateExpression=expr,
-            ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={
-                ":s": status,
-                ":t": datetime.now(timezone.utc).isoformat(),
-            },
+        tenants_table.update_item(**kwargs)
+    except tenants_table.meta.client.exceptions.ConditionalCheckFailedException:
+        # 操作改了(delete/suspend/API action…)。跳过,不覆盖;下一轮 sweep 用新状态重判。
+        # 与下面的 `failed` 分开打印:混在一起会让一条正常的并发让路看起来像故障。
+        print(
+            f"ttl status update skipped for {tenant_id}: "
+            f"status changed since scan (expected {expected_prev!r})"
         )
     except Exception as e:
         print(f"ttl status update failed for {tenant_id}: {e}")
@@ -443,7 +486,7 @@ def _reconcile_schedules():
     """Walk scheduled tenants and start/stop to match window."""
     if tenants_table is None:
         return
-    items = tenants_table.scan().get("Items", []) or []
+    items = ddb_scan.scan_all(tenants_table) or []
     now = _now_utc()
     for it in items:
         sched = it.get("schedule")
@@ -474,12 +517,30 @@ def _reconcile_schedules():
                     "commands": [launch_cmd],
                 },
             )
-            tenants_table.update_item(
-                Key={"id": tid},
-                UpdateExpression="SET #s = :s",
-                ExpressionAttributeNames={"#s": "status"},
-                ExpressionAttributeValues={":s": "running"},
-            )
+            # 上面 `status == "stopped"` 那道闸读的是 `ddb_scan.scan_all` 的**最终一致**
+            # 副本;而这个 sweep 与 `_process_ttl_expirations` 不同,它连 `_TTL_TERMINAL`
+            # 那种终态排除都没有 —— 一个正在 deleting 的租户只要 scan 还看到旧的 stopped,
+            # 就会被发一次 launch-vm 并把 status 零条件写回 running,把删除覆盖掉。
+            # CAS 落空 = 状态已变,跳过;下一轮 sweep 用新状态重判(scheduler 是周期巡检,
+            # 不需要在本轮把事做完)。
+            try:
+                tenants_table.update_item(
+                    Key={"id": tid},
+                    UpdateExpression="SET #s = :s",
+                    ConditionExpression="#s = :expected_prev",
+                    ExpressionAttributeNames={"#s": "status"},
+                    ExpressionAttributeValues={
+                        ":s": "running",
+                        ":expected_prev": "stopped",
+                    },
+                )
+            except (
+                tenants_table.meta.client.exceptions.ConditionalCheckFailedException
+            ):
+                print(
+                    f"schedule: wake {tid} skipped — status changed since scan "
+                    "(expected 'stopped')"
+                )
         elif (not should_run) and status == "running":
             vm_num = int(it.get("vm_num", 1))
             ssm.send_command(
@@ -491,12 +552,24 @@ def _reconcile_schedules():
                     ]
                 },
             )
-            tenants_table.update_item(
-                Key={"id": tid},
-                UpdateExpression="SET #s = :s",
-                ExpressionAttributeNames={"#s": "status"},
-                ExpressionAttributeValues={":s": "stopped"},
-            )
+            try:
+                tenants_table.update_item(
+                    Key={"id": tid},
+                    UpdateExpression="SET #s = :s",
+                    ConditionExpression="#s = :expected_prev",
+                    ExpressionAttributeNames={"#s": "status"},
+                    ExpressionAttributeValues={
+                        ":s": "stopped",
+                        ":expected_prev": "running",
+                    },
+                )
+            except (
+                tenants_table.meta.client.exceptions.ConditionalCheckFailedException
+            ):
+                print(
+                    f"schedule: sleep {tid} skipped — status changed since scan "
+                    "(expected 'running')"
+                )
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -590,11 +663,12 @@ def _find_new_image_host(golden_version, vcpu, mem_mb, exclude_host_id):
     """Pick an active host already running golden_version with capacity for
     (vcpu, mem_mb). Returns the host item or None. Same allocatable formula as
     the API's _find_host (reserved headroom already baked into total_*)."""
-    hosts = hosts_table.scan(
+    hosts = ddb_scan.scan_all(
+        hosts_table,
         FilterExpression="#s = :a",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":a": "active"},
-    ).get("Items", [])
+    )
     best = None
     for h in hosts:
         if h["instance_id"] == exclude_host_id:
@@ -621,7 +695,7 @@ def _reconcile_image_refresh():
     if not golden:
         return  # fail safe — no manifest, no refresh
     now = _now_utc()
-    items = tenants_table.scan().get("Items", []) or []
+    items = ddb_scan.scan_all(tenants_table) or []
     started = 0
     for t in items:
         if started >= REFRESH_MAX_PER_TICK:
@@ -665,24 +739,48 @@ def _reconcile_image_refresh():
         # destroy the source VM here — that only happens after the new VM is
         # verified reachable (handled by the migration/refresh advancer).
         restore_key = f"{BACKUP_PREFIX}/{tid}/data.ext4.gz"
-        tenants_table.update_item(
-            Key={"id": tid},
-            UpdateExpression=(
-                "SET image_refresh_phase = :p, image_refresh_target = :th, "
-                "image_refresh_target_ip = :tip, image_refresh_to = :ver, "
-                "image_refresh_restore_key = :rk, image_refresh_src = :sh, "
-                "image_refresh_started_at = :t, updated_at = :t"
-            ),
-            ExpressionAttributeValues={
-                ":p": "backup",
-                ":th": target_host,
-                ":tip": target_ip,
-                ":ver": golden,
-                ":rk": restore_key,
-                ":sh": src_host,
-                ":t": now.isoformat(),
-            },
-        )
+        # backup→restore→repoint→drop-old 那条多跳链),同样不能零条件。两个预期旧值:
+        #   · `#s = :expected_prev` —— status 仍是本轮 scan 读到的那个。
+        #     `_should_refresh_image` 的 `_REFRESH_SKIP_STATUS` 闸(:619,含 deleting/deleted)
+        #     读的是最终一致副本;读到旧的 running 而租户已在 deleting,就会给一个正在被删的
+        #     租户打上 refresh 标记 —— 而 health_check 的 refresh advancer 随后会照标记去
+        #     restore+repoint,在另一台 host 上把它重新拉起来 = issue 说的「删除后被复活」。
+        #   · `attribute_not_exists(image_refresh_phase)` —— 相位版的"预期旧状态":
+        #     上面 `:661` 那道 `if tenant.get("image_refresh_phase"): return False` 也是
+        #     最终一致读,两个 tick 并发时都会读到空,于是各写一次相位、各挑一个 target host,
+        #     后写的覆盖先写的 → 先挑的那台 host 上留一份没人推进的 restore。
+        # CAS 落空 = 跳过本轮(那次 backup SSM 是幂等的,backup-data.sh 自持 per-tenant
+        # flock),下一轮用新状态重判。
+        try:
+            tenants_table.update_item(
+                Key={"id": tid},
+                UpdateExpression=(
+                    "SET image_refresh_phase = :p, image_refresh_target = :th, "
+                    "image_refresh_target_ip = :tip, image_refresh_to = :ver, "
+                    "image_refresh_restore_key = :rk, image_refresh_src = :sh, "
+                    "image_refresh_started_at = :t, updated_at = :t"
+                ),
+                ConditionExpression=(
+                    "#s = :expected_prev AND attribute_not_exists(image_refresh_phase)"
+                ),
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={
+                    ":p": "backup",
+                    ":th": target_host,
+                    ":tip": target_ip,
+                    ":ver": golden,
+                    ":rk": restore_key,
+                    ":sh": src_host,
+                    ":t": now.isoformat(),
+                    ":expected_prev": t.get("status"),
+                },
+            )
+        except tenants_table.meta.client.exceptions.ConditionalCheckFailedException:
+            print(
+                f"image_refresh: {tid} skipped — status or refresh phase changed "
+                f"since scan (expected status {t.get('status')!r}, no phase)"
+            )
+            continue
         started += 1
         print(
             f"image_refresh: initiated {tid} {src_host}→{target_host} "

@@ -75,7 +75,7 @@ def _rank_hosts_by_capacity(
 ) -> List[Dict[str, Any]]:
     """按 free_vcpu 降序排(affinity=True 时改按四级亲和);跳过 inflight_ok=False /
     simulated(push) / 无 vcpu 容量 / 内存未知(mem_known=False,fail-safe:缺
-    total_mem_mb 的 host 不参与,不当无限内存)。
+    total_mem_mb 的 host 不参与,不当无限内存)/ taint_ok=False(#540 污点机器)。
 
     #315 SPLIT_BY_MODE:inflight_ok 取值由调用方(_snapshot_hosts)按 dispatch 模式给。
     #330:排序键从 free_slots(VM_DEFAULT 折算的名额)改为 free_vcpu(真实剩余 vcpu),与
@@ -95,6 +95,10 @@ def _rank_hosts_by_capacity(
             continue  # #340 磁盘软门:/data 物理将满的 host 不接新租户(缺该键默认 True=旧行为)
         if not h.get("mem_ok", True):
             continue  # #430 物理内存软门:实测 MemAvailable 跌破水位的 host 不接(缺键 True=旧行为)
+        if not h.get("taint_ok", True):
+            continue  # #540 污点(cordon):运维显式标记不收新租户(缺键 True=未标记,旧行为)
+        if not h.get("seen_ok", True):
+            continue  # #549 心跳陈旧闸:last_seen 超阈值的 host 不接新租户(缺键 True=无信号/旧快照,fail-open)
         usable.append(h)
     if affinity:
         usable.sort(key=_affinity_key, reverse=True)

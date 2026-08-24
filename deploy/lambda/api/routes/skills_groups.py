@@ -8,6 +8,7 @@ core.utils(_resp/_NAME_RE)。专属常量 _SKILL_NAME_RE/_SKILL_MAX_BYTES 随迁
 import json
 import re
 import os
+import core.ddb_scan as ddb_scan  # #432 —— Scan 必须翻页
 from core.clients import groups_table, s3
 from core.utils import _resp, _NAME_RE
 
@@ -16,8 +17,8 @@ def list_groups():
     if groups_table is None:
         return _resp(503, {"error": "groups table not configured (1.3.x deployment?)"})
     try:
-        resp = groups_table.scan()
-        return _resp(200, {"groups": resp.get("Items", [])})
+        # 全表字节数算,表一长这里就静默只返第一页。
+        return _resp(200, {"groups": ddb_scan.scan_all(groups_table)})
     except Exception as e:
         return _resp(500, {"error": str(e)})
 def create_group(body_str):

@@ -25,6 +25,8 @@ from botocore.exceptions import ClientError
 import core.capacity as capacity
 import core.clients as clients
 import core.host_profile as host_profile
+import core.ddb_scan as ddb_scan  # #432 —— Scan 必须翻页
+import core.host_taint as host_taint
 
 
 def _scale_out():
@@ -101,8 +103,20 @@ def _registered_host_count():
     stranding pending tenants. The FilterExpression is applied server-side AFTER
     the 1MB read, so pagination is required even though the match set is small.
     Same discipline as scaler/handler.py _has_pending_tenants."""
+    # #540 — 污点机器【不算】"已注册可服务"。它不接新租户,若仍被计入,desired - registered
+    # 就把在途容量算大,_scale_out 于是判定"还有机器在路上"而跳过扩容 —— 现场表现是
+    # "标完一批 1:6 机器,新机器起不来,租户无处可迁",正是污点功能要支持的那个操作被自己
+    # 堵死。代价是可能多扩一台(标记取消后它又被算回来),比租户饿死好。
+    #
+    # 用服务端 FilterExpression 而不是取回来在 Python 里过滤:本函数只要一个计数,已经用
+    # ProjectionExpression 把负载压到只剩 instance_id;加进 filter 既不用改投影,也不多传数据。
+    # 这里可以用裸的 attribute_not_exists —— 与四处 CAS 不同,计数【偏保守是安全的】:
+    # 脏值 is_tainted="false" 会让这台不被计入,于是可能多扩一台;而 CAS 那边偏保守会变成
+    # "选得中、订不上"(见 host_taint.NOT_TAINTED_CONDITION 的说明),两处的失败代价不对称。
     kwargs = {
-        "FilterExpression": "#s IN (:a, :i)",
+        "FilterExpression": (
+            f"#s IN (:a, :i) AND attribute_not_exists({host_taint.ATTR_IS_TAINTED})"
+        ),
         "ExpressionAttributeNames": {"#s": "status"},
         "ExpressionAttributeValues": {":a": "active", ":i": "idle"},
         "ConsistentRead": True,
@@ -182,6 +196,7 @@ def _occupied_union(host_id, exclude_ids=None):
 def phys_tap_occupied(host_id, phys_num, exclude_id=None):
     """#208 — target host 上物理 tap-vm{phys_num} 是否已被别的租户占用?
 
+    #491 —— 从 services/tenant_service.py 机械搬迁到 core(函数体逐字不变,只改名去掉
     前导下划线)。原因:队列 dispatch 路径也必须过这道门,它此前零覆盖 —— 发号器一旦被
     回退(init-host 整项覆写 / register_host 无条件 put_item),reserve 的 CAS 会把已在用
     的号再发一遍且每次都成功,launch-vm.sh 随后 `ip link del`+`kill -KILL` 抢占先到者的
@@ -430,12 +445,16 @@ def _find_host(vcpu_needed, mem_needed, exclude=None):
     # pile onto it — exactly the PriorityInUse / "all packed on one host" failure
     # mode. _reserve_slot's CAS still prevents oversell; this makes the spread
     # correct instead of merely safe.
-    hosts = clients.hosts_table.scan(
+    # FilterExpression 在那 1MB 读之后才过滤,而 openclaw-hosts 累积 deleted 死行
+    # (实测 39 行里 33 行是 deleted,403 字节/行 → 1MB ≈ 2601 行)。看不见后页的 host
+    # 就等于「明明有容量却选不出来」→ 租户拿到容量不足,而机器空着。
+    hosts = ddb_scan.scan_all(
+        clients.hosts_table,
         FilterExpression="#s IN (:a, :i)",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":a": "active", ":i": "idle"},
         ConsistentRead=True,
-    ).get("Items", [])
+    )
 
     # Rank by the host's *tightest* remaining resource, not vCPU alone.
     # Ranking on free_vcpu only mis-orders hosts when vCPU is loose but memory
@@ -448,8 +467,29 @@ def _find_host(vcpu_needed, mem_needed, exclude=None):
     best = None
     best_key = None
     now_epoch = int(time.time())
+    tainted_skipped = 0
+    stale_skipped = 0
     for h in hosts:
         if exclude and h["instance_id"] in exclude:
+            continue
+        # #540 — 污点(cordon)机器不接新租户。判定走写侧的纯函数,不在这里各写一遍 filter。
+        #
+        # 放在循环里而不是上面 scan 的 FilterExpression 里,是刻意的:服务端过滤会让污点机
+        # 彻底隐形,于是"机队里根本没机器"和"有机器但全被标了"在日志上长得一模一样 ——
+        # 后者是运维刚标完一批、正等新机的正常中间态,前者是故障。分不开就没法排障。
+        # 计数在下面 return 前打进日志,代价是多扫几行内存里的 dict(scan 本来就已经取回)。
+        #
+        # 这里只管【选点】。已在该机器上跑的租户不受影响(不驱逐/不停机/不迁移),
+        # 运维广播(fleet action / refresh-rootfs)也仍然覆盖污点机器 —— 它们各自独立 scan,
+        # 不经本函数;那台机器上还有租户在跑,脚本与配置更新不能漏。
+        if host_taint.is_tainted(h):
+            tainted_skipped += 1
+            continue
+        # #549 — 心跳陈旧闸:last_seen 超阈值的 host 不接新租户(独立于 SSM/租户状态)。
+        # 放循环里而非 scan 的 FilterExpression 里,与污点门同理:服务端过滤会让"没机器"和
+        # "有机器但心跳都陈旧"在日志上分不开。缺信号/未来时间戳 fail-open,只挡有据可查的陈旧。
+        if not capacity.seen_fresh(h, clients.HOST_SEEN_STALE_SEC, now_epoch):
+            stale_skipped += 1
             continue
         # family carries no override; today all four types run the uniform 1:4).
         cpu_ratio, mem_ratio_cfg = host_profile.ratios(
@@ -487,6 +527,13 @@ def _find_host(vcpu_needed, mem_needed, exclude=None):
             if best_key is None or key > best_key:
                 best = h
                 best_key = key
+    # #540 — 只在真的跳过了污点机时才打,免得给每次 create 加一行噪音。
+    # 选不到机器时尤其要打:那一刻最需要知道"是没机器,还是机器都被标了"。
+    if tainted_skipped or stale_skipped:
+        print(
+            f"_find_host: skipped {tainted_skipped} tainted + {stale_skipped} stale "
+            f"host(s); picked={(best or {}).get('instance_id', 'none')}"
+        )
     return best
 
 
@@ -500,15 +547,31 @@ def _get_specific_host_with_capacity(instance_id, vcpu_needed, mem_needed):
     """
     # Phase 6: strong read so the capacity gate for a pinned/clone host sees the
     # freshest used_* a concurrent create may have just reserved.
-    hosts = clients.hosts_table.scan(
-        FilterExpression="#s IN (:a, :i)",
-        ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":a": "active", ":i": "idle"},
-        ConsistentRead=True,
-    ).get("Items", [])
+    #
+    #   ① `instance_id` 就是本表的 HASH 主键,拿主键找一行本该 get_item(O(1)),
+    #      扫全表只为了丢掉除一行以外的所有行;
+    #   ② 更要紧的是它不翻页 —— 目标 host 若落在 1MB 之后的页里就【找不到】,
+    #      于是对一个显式指定的 host 返 None,调用方读成「这台没容量」。
+    #      对同机 clone / 钉死放置来说,那是一个用户可见的错答案。
+    # status 门(active/idle)原来靠 FilterExpression 表达,现在读回来自己判 —— 语义不变,
+    _item = clients.hosts_table.get_item(
+        Key={"instance_id": instance_id}, ConsistentRead=True
+    ).get("Item")
+    hosts = [_item] if _item and _item.get("status") in ("active", "idle") else []
+    now_epoch = int(time.time())
     for h in hosts:
         if h["instance_id"] != instance_id:
             continue
+        # #540 — 污点机器即使被显式指定也不接新租户,返 None。
+        # 豁免(注释原话 no-cross-tenant 无例外),这里同款处理。代价(AMI 验证机的测试租户
+        # 须走 out-of-band)已在 #536 明确接受。
+        # 调用方靠它自己那次诊断性 get_item 区分原因 → 污点返 409(与 draining 的 404、
+        # 容量不足的 400 三者分开),见 tenant_service.py 的 preferred_host_id 分支。
+        if host_taint.is_tainted(h):
+            return None
+        # #549 — pinned 路径同门:显式指定的 host 若心跳陈旧也不给(不提供逃生口)。
+        if not capacity.seen_fresh(h, clients.HOST_SEEN_STALE_SEC, now_epoch):
+            return None
         # single source of truth; per-family overcommit applies here too, or a
         # pinned/clone target would be judged by a different yardstick).
         cpu_ratio, mem_ratio = host_profile.ratios(

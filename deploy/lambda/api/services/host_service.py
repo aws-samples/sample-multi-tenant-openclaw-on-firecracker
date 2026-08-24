@@ -1,7 +1,6 @@
 """core/services 层 · host_service:host 注册/注销/清理 + rootfs 镜像清单/刷新/漂移。
 
 handler-split #132 T1.7 —— 从 handler.py 逐字搬迁,行为零改动。
-#187 转型:core.legacy_alb 已下线(数据面两级路由不再用 per-tenant ALB rule/TG),
 调用点(_remove_alb_rule/_remove_host_tg)在 cleanup_terminated_host 中一并删。
 依赖方向:services → core(clients/utils),不反向 import handler。
 """
@@ -19,8 +18,10 @@ import boto3
 from botocore.exceptions import ClientError
 
 from core.clients import (
+    BACKUP_SYNC_INVOKE_CONFIG,  # #565 G1-a — 同步 invoke backup 的 botocore 配置
     CPU_OVERCOMMIT_RATIO,
     MEM_OVERCOMMIT_RATIO,
+    OVERCOMMIT_BY_FAMILY,
     asg_client,
     hosts_table,
     tenants_table,
@@ -28,8 +29,11 @@ from core.clients import (
     s3,
     ssm,
 )
+import core.ddb_scan as ddb_scan  # #432 —— Scan 必须翻页
 from core.utils import _now, _resp, _err, _parse_limit
 from core.pagination import decode_cursor, encode_cursor
+from core import copy_file_helper  # #335 — 只读它的源码内联进 SSM,不在 Lambda 里执行
+from core import host_profile
 from core import image_jobs
 from core import image_slots
 from core import image_lease
@@ -43,8 +47,19 @@ def _public_hosts(items):
     # must not appear in user-facing host lists.
     items = [h for h in items if not str(h.get("instance_id", "")).startswith("__")]
     for item in items:
-        item["cpu_overcommit_ratio"] = CPU_OVERCOMMIT_RATIO
-        item["mem_overcommit_ratio"] = MEM_OVERCOMMIT_RATIO
+        # 一旦某个 family 有覆盖(overcommit_by_family),GET /hosts(无参 / 分页 /
+        # ip 过滤三种形态都经这里)就对那批机器报【错的数】,而调度侧的放置调用点早已走
+        # host_profile.ratios。运维拿 API 的读数去核对"这台还能放多少",算出来的与调度器
+        # 的实际口径不一致 —— 而这是唯一能查 host 容量的端点(本仓没有 GET /hosts/{id},
+        # 只有它的子资源)。BFF console 的 app.hosts.js 也是逐 host 读这两个字段算密度的。
+        # 用与放置侧【同一个纯函数】,不另写一遍 filter。
+        cpu_ratio, mem_ratio = host_profile.ratios(
+            item,
+            (CPU_OVERCOMMIT_RATIO, MEM_OVERCOMMIT_RATIO),
+            OVERCOMMIT_BY_FAMILY,
+        )
+        item["cpu_overcommit_ratio"] = cpu_ratio
+        item["mem_overcommit_ratio"] = mem_ratio
         # #539 分层规则:存储层不写 false，消除“false/缺属性”两种可调度表示；
         # 响应层显式补 false，让消费方无需判断字段是否存在。审计字段不出列表。
         taint_view = host_taint.public_view(item)
@@ -66,7 +81,7 @@ def list_hosts(query_params=None):
     # Preserve the legacy endpoint byte-for-byte: no parameters means one scan
     # and a bare array, including its existing 1 MB scan-page behavior.
     if not parameterized:
-        items = hosts_table.scan(**scan_kwargs).get("Items", [])
+        items = hosts_table.scan(**scan_kwargs).get("Items", [])  # scan-single-page-ok: legacy parameterless /hosts contract returns one page
         return _resp(200, _public_hosts(items))
 
     ip = query_params.get("ip")
@@ -193,7 +208,6 @@ def _upsert_host_row(
     已有在役租户的 host 再调一次 POST /hosts,账本被抹回初值、发号器随之回退到 1,之后
     dispatch 的 reserve CAS 会把已在用的号再发一遍且每次都成功 → launch-vm.sh 抢占先到者
     的 tap = 跨租户劫持(#491 已真机复现)。这与 init-host.sh 的自注册是同一缺陷的两个副本,
-    #445 只修了 host 脚本那一份。
 
     账本四字段(used_vcpu/used_mem_mb/vm_count/next_vm_num)的权威是控制面的认领/释放 CAS,
     注册路径只能【补】不能【改】—— 读回再写也不行:读与写之间落地的并发 create 会被抹掉。
@@ -442,7 +456,12 @@ def _backup_tenant_for_evacuation(tenant):
     """同步备份 terminating host 上的租户；双层校验失败一律 fail-closed。"""
     tid = tenant["id"]
     try:
-        lambda_client = boto3.client("lambda")
+        # #565 G1-a —— 第三处同步备份站点。issue 的分析表只点了 delete 与 suspend 两处,
+        # invoke」),所以这里同样要显式给 Config。取值与"不重试"的理由见
+        # core/clients.BACKUP_SYNC_INVOKE_CONFIG。
+        lambda_client = boto3.client(
+            "lambda", config=BACKUP_SYNC_INVOKE_CONFIG
+        )
         resp = lambda_client.invoke(
             FunctionName=os.environ.get("BACKUP_FUNCTION", "openclaw-backup"),
             InvocationType="RequestResponse",
@@ -602,11 +621,16 @@ def cleanup_terminated_host(event):
     print(f"cleanup_terminated_host: {instance_id}")
 
     # terminating host 的数据盘会随实例销毁；逐租户备份，避免例行 refresh 删除活租户。
-    tenants = tenants_table.scan(
+    # 还在那台上的租户去疏散。漏掉 1MB 之后的页 = 那些租户被【静默留在一台已终止的机器上】
+    # —— 账本里它们还指着 host_id,而机器没了。这属于 no-data-loss 面,不是性能问题。
+    # openclaw-tenants 实测 6790 行 / 2.83MB,已经【超过】1MB 近三倍 —— 也就是说这一处
+    # 现在就在漏,不是将来才漏。
+    tenants = ddb_scan.scan_all(
+        tenants_table,
         FilterExpression="host_id = :h AND #s <> :d",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":h": instance_id, ":d": "deleted"},
-    ).get("Items", [])
+    )
     evacuated = 0
     started = time.monotonic()
     for idx, t in enumerate(tenants):
@@ -956,11 +980,15 @@ def refresh_rootfs():
     region = os.environ.get("AWS_REGION", "ap-northeast-1")
     version = manifest["version"]
 
-    hosts = hosts_table.scan(
+    # 计数照样是成功的样子 —— 静默漏刷比报错更难查。
+    # 注:这里刻意保持返回 list(而不是生成器),因为下一行就是 `if not hosts:` ——
+    # 生成器恒为真,那条「没有 active host」的分支会永远进不去(见 core/ddb_scan.py 的说明)。
+    hosts = ddb_scan.scan_all(
+        hosts_table,
         FilterExpression="#s IN (:a, :i)",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":a": "active", ":i": "idle"},
-    ).get("Items", [])
+    )
 
     if not hosts:
         return _resp(200, {"message": "no active hosts", "updated": 0})
@@ -1509,10 +1537,8 @@ def _reset_status_cmd(
     权限,host-agent 心跳在用)。失败时只复位 status→prev;成功时复位 + 写 snapshot_time
     (仅成功才记版本,不谎报)。`|| true`:DDB 写失败不该让整条 SSM 判失败(状态字段是
     旁路,主功能是装 live)。各值 shell-quote 防注入。
-    #333(codex round9)owner-conditional:传 job_id 时加 ConditionExpression pull_command_id==job_id
     —— DynamoDB 模糊失败重试(客户端超时但服务端已写)可能在新 job CAS 后把状态覆盖回旧值;
     条件写关死:非当前 owner 的复位 CCF 失败(被 `|| true` 吞,无害)。
-    #343 成功路径同步 rootfs_version:pull 装 live 换了 rootfs,却漏更新 host.rootfs_version
     (scaler/rebuild 采用逻辑、rootfs-drift 视图都读它,不同步 = 误判 host 未升级 + rebuild
     后谎报旧版)。故成功且拿到非空版本号时,连 rootfs_version 一起写(值来自 _select_pull_files
     读到的 manifest version)。失败路径【不】写(不谎报升级成功)。空版本号也不写(读不到时不覆盖)。"""
@@ -1817,7 +1843,6 @@ def list_image_versions(query_params=None):
     时间点去 pull。按 snapshot_time 倒序(最新在前)。不回 files 大 JSON(那是 pull 时才逐文件读);
     表未配置 → 503 fail-loud。
 
-    #394 — `?show_deleted=true`(默认 false):默认过滤软删条目(status=deleted),因为可拉取
     面绝不该列出已下架版本(pull 也会拒);Image Snapshot 面板传 true 看全量,这样"某 host 槽位
     仍引用、但快照记录被误软删"的版本仍会出现(带 deleted 标记),不会因过滤而在 UI 里凭空消失
     (那会导致 live 版本没有徽标——本次修复的 bug)。每条带 `status`,前端据此标记 + 过滤。"""
@@ -1859,7 +1884,6 @@ def _snapshot_still_referenced(snapshot_time):
         解析不到自己的版本目录。
     只读扫描,不改任何东西。任一命中即拒删(fail-closed)。
 
-    #394 P1-5 —— 两处 scan 都【翻页到底】(处理 LastEvaluatedKey)。DynamoDB 单页上限 1MB,
     只读第一页会漏掉后续页的引用 → 把仍被引用的版本误判"无人用"而软删 → host 丢失/恢复时
     拉不回在运行的版本(no-data-loss)。删除保护必须 fail-closed:宁可多扫几页,不可漏判。
     """
@@ -2214,7 +2238,6 @@ def _set_host_upgrading(instance_id, job_id):
     新建。捕获 prev_status:host 复位时还原精确原态(idle host 别误报 active)。upgrading_at:
     host 宕机 trap 不触发卡 upgrading 时(★G)供运维判断。ConditionalCheckFailed(已
     upgrading/并发/host 不存在)→ 返回 409。成功 → (prev_status, None)。
-    #333(codex round8)【原子】写:status→upgrading + pull_command_id=job_id + 清 last_pull_error
     全在【同一条】条件 UpdateItem(gate on active/idle)。此前 CAS 与写 pull_command_id 分两步,
     留一个"已 upgrading 但 pull_command_id 还是旧值"的窗口 —— 旧 worker 可在此窗口按旧 owner 条件
     finalize/reset 把新任务置回 active,新 worker 随后 STALE_JOB 静默退,调用方却已收到 202。合成一条
@@ -2398,7 +2421,6 @@ def _run_pull_pipeline(instance_id, snapshot_time, prev_status, job_id, slot=Non
     (未配置/快照不存在/选盘失败/拼脚本异常/下发失败/fence 失败/脚本失败/成功),漏掉任一条
     都会把该 host 的镜像操作占死到 lease 自然过期(期间 promote/cleanup/reclaim 全被 409 挡)。
 
-    #394 P1-2 —— live 与 canary 现在都持 lease(统一互斥,ADR §4.8 规则 1),故【两者都】要
     在此归还。释放是 owner-conditional(release 内部条件写校验 owner==job_id),超时重投的旧
     worker 不会误释放接管者的 lease。live 的 status 复位另在 _finalize_success/失败路径处理,
     与 lease 释放正交(lease 管镜像操作互斥,status 管是否接新租户)。
@@ -2556,7 +2578,6 @@ def _run_pull_pipeline_impl(instance_id, snapshot_time, prev_status, job_id, slo
 def _reset_host_status(instance_id, status, job_id=None):
     """★B 兜底:Lambda 侧把 host status 复位到 prev(下发失败/worker 前置失败时用)。best-effort,
     复位失败不掩盖原始错误(但打日志,便于查卡 upgrading 的 host)。
-    #333(codex round4):传了 job_id 时条件写(pull_command_id == job_id)——只有当前 owner 才复位,
     防 at-least-once/超时重投的旧 worker 复位掉新任务的 upgrading。入口 dispatch 失败复位不传
     job_id(那时本 job 仍是 owner,无条件复位即可)。非 owner → CCF 静默跳过。"""
     ccf = hosts_table.meta.client.exceptions.ConditionalCheckFailedException
@@ -2621,11 +2642,9 @@ def _record_pull_error(instance_id, reason, job_id=None):
     """#309 — 装 live 失败时把简短原因记到 host DDB 项(last_pull_error),供
     pull_image_progress 透出。best-effort,不抛(别掩盖原始失败)。绝不在这里改 status
     (status 由脚本 trap 按阶段自决:phase1 已复位 prev / phase2 留 upgrading)。
-    #334(codex round6)job-conditional:传 job_id 时条件写 pull_command_id==job_id。否则
     at-least-once/超时重投的【旧 worker】失败后,新 pull 已写入新 job,旧 Lambda 会把旧错误写到
     新 job 的槽 → pull_image_progress 的 DDB 终态优先逻辑据此把新任务误报 Failed。非 owner → CCF 跳过。
 
-    #394 P1-3 —— host 行的 last_pull_error 写是 owner-gated(共享行,防旧 worker 污染);但
     持久化 Job 行是【按 job_id 主键】的,天生 owner-safe(每个 job 只有自己那条)。canary pull
     从不写 pull_command_id,故 host 行 CCF 必然失败——但那【不该】连累 Job 终态。原来 CCF 后
     直接 return,导致 canary 失败永远停在 QUEUED(host 重启/进度文件丢后 progress 永报
@@ -2661,7 +2680,6 @@ def _finalize_success(
     清 last_pull_error(本轮无错)。**保留 pull_command_id**:progress 据它 tail 进度文件才能
     读到末行 SUCCESS → 返回 Completed(codex review:删了 pull_command_id → progress 拿不到
     job_id → 永远 InProgress/no-job,观察不到成功)。下一轮 pull 的 _set_host_upgrading 覆盖它。
-    #333(codex round4/12)条件写:pull_command_id == 本 job_id 【且 status == upgrading】—— 只有
     当前 owner 且 host 仍在本轮 upgrading 才能更新 Host 投影。防两类:① at-least-once/超时重投
     的【旧 worker】finalize 掉新任务(脚本侧 flock 挡不住 Lambda 侧 DDB 写);② pull_command_id
     成功后【保留】,若 host 已被移到 draining/deleted,延迟 worker 光凭 owner 匹配会把它错误
@@ -2669,8 +2687,6 @@ def _finalize_success(
     但 SSM 已返回成功时,该 Job 自身的 SUCCEEDED 终态仍必须写入:正常路径中 host 脚本会先执行
     _reset_ok 把 status 复位,使 Lambda 的幂等兜底 CAS 触发 CCF。若因此提前 return,成功 Job
     会永久停在 QUEUED。
-    #309:脚本内 _reset_ok 已自管复位(survives Lambda 死);本函数是 Lambda 侧再兜一次。
-    #343(codex review):脚本侧 _reset_ok 写 rootfs_version 的 aws cli 若 `|| true` 静默失败,
     Lambda 兜底也必须写 rootfs_version,否则 status/snapshot 恢复了、版本字段仍停旧值(原 bug 重现)。
     故成功且版本号非空时,这条兜底 update 也补 rootfs_version(与脚本侧同值,幂等)。"""
     ccf = hosts_table.meta.client.exceptions.ConditionalCheckFailedException
@@ -2778,7 +2794,6 @@ def pull_image(instance_id, query_params, headers=None):
     (launch-vm 直接读的地方)。只作用一台 host。异步跑,立即回 202 + job_id;进度走
     pull_image_progress。金丝雀已移除,失败只报错不自动 restore(留 V2)。
 
-    #394 P2-1 —— 支持 Idempotency-Key:响应丢失后带同 key 重试 → 返回原 job,不再新起一次真
     pull(与 promote/cleanup 幂等语义一致,兑现文档承诺)。"""
     if not instance_id:
         return _err(400, "VALIDATION", "missing instance_id")
@@ -2814,25 +2829,43 @@ def _idempotency_key_from_headers(headers):
 # 镜像盘目录 /data/firecracker-assets/ 不在此列(那是 pull_image 的活,不给手动 copy 覆盖)。
 _COPY_FILE_ALLOWED_ROOTS = ("/opt/openclaw/", "/home/ubuntu/")
 
+_COPY_FILE_OWNER = "ubuntu:ubuntu"
+# heredoc 定界符:不能出现在 helper 源码的任何一行里(tests/test_335_* 有断言守着)。
+_COPY_FILE_HELPER_EOF = "OC_COPY_HELPER_EOF"
+
+
+def _copy_file_helper_source():
+    """#335 — 读 core/copy_file_helper.py 的源码原文,原样内联进 SSM 脚本。
+
+    每次调用都下发【本次部署包里的字节】(Lambda 资产 = deploy/lambda/api),host 磁盘上
+    不留副本 —— 所以 helper 自身也没有"被 host 上的人换掉"的窗口。测试导入的是同一个
+    模块,跑的就是这里下发的源码。
+    """
+    with open(copy_file_helper.__file__, encoding="utf-8") as fh:
+        return fh.read()
+
 
 def _validate_copy_target(target):
     """#309 — 校验 copy-file 的目标 EC2 路径:必须落在 _COPY_FILE_ALLOWED_ROOTS 任一根下的
-    绝对路径,禁 .. 穿越。返回 (ok, err_msg)。纯函数、易测。
-    #334(codex round8)必须是【完整文件路径】,拒目录/尾斜杠:aws s3 cp 到目录会把文件放进去,
-    但随后 chown "$DST" 改的是目录、真文件仍 root:root(属主修复在默认流程失效)。故要求含文件名。"""
+    绝对路径,禁 .. 穿越。返回 (ok, err_msg, matched_root)。纯函数、易测。
+    但随后 chown "$DST" 改的是目录、真文件仍 root:root(属主修复在默认流程失效)。故要求含文件名。
+    O_NOFOLLOW 下钻,所以必须知道哪个根是信任锚点(失败时 matched_root 为 "")。"""
     if not target or not target.startswith("/"):
-        return False, "target must be an absolute path"
+        return False, "target must be an absolute path", ""
     if ".." in target.split("/"):
-        return False, "target must not contain '..'"
+        return False, "target must not contain '..'", ""
     if target.endswith("/"):
-        return False, "target must be a full file path (no trailing slash / directory)"
-    if not any((target + "/").startswith(root) for root in _COPY_FILE_ALLOWED_ROOTS):
+        return False, "target must be a full file path (no trailing slash / directory)", ""
+    matched = next(
+        (root for root in _COPY_FILE_ALLOWED_ROOTS if (target + "/").startswith(root)), ""
+    )
+    if not matched:
         allowed = " or ".join(_COPY_FILE_ALLOWED_ROOTS)
-        return False, f"target must be under {allowed}"
+        return False, f"target must be under {allowed}", ""
     # target 必须【严格深于】某个根(即根下还有文件名),不能就是根本身(那是目录)。
     if any(target.rstrip("/") == root.rstrip("/") for root in _COPY_FILE_ALLOWED_ROOTS):
-        return False, "target must include a filename under the allowed root (not the dir itself)"
-    return True, ""
+        return False, "target must include a filename under the allowed root (not the dir itself)", ""
+    return True, "", matched
 
 
 def copy_file_from_s3(instance_id, body):
@@ -2859,63 +2892,36 @@ def copy_file_from_s3(instance_id, body):
     s3_uri = (body.get("s3_uri") or "").strip()
     if not s3_uri.startswith("s3://") or len(s3_uri) <= len("s3://"):
         return _err(400, "VALIDATION", "s3_uri must be s3://<bucket>/<key>")
-    ok, msg = _validate_copy_target(target)
+    ok, msg, root = _validate_copy_target(target)
     if not ok:
         return _err(400, "VALIDATION", msg)
+    rel = target[len(root):]  # root 带尾 /,所以 rel 是根下的纯相对路径
     region = os.environ.get("AWS_REGION", "ap-northeast-1")
     q = shlex.quote
-    # /home/ubuntu)都属 ubuntu:ubuntu,host-agent(以 ubuntu 跑)要读改这些文件。故 cp 后
-    # chown ubuntu:ubuntu(与 pull-image _install_lines 对 .sh 的 chown 一致,补齐这条路径)。
-    # 是纯数据。绝不把用户原文直接插进双引号 echo —— 否则含 $()/反引号的值会在 root SSM 里被执行。
-    # 允许根的真实路径(host 侧规范化父目录后,必须仍落在这些根下)。空格分隔喂给 POSIX for。
-    allowed_roots_sh = " ".join(q(r.rstrip("/")) for r in _COPY_FILE_ALLOWED_ROOTS)
+    # readlink -f 产出的是【路径字符串】,mkdir/cp/chown/mv 每一步都重新解析一遍,check 与
+    # use 之间没有东西把二者钉在同一个 inode 上(最宽的窗口跨越 aws s3 cp 的整个 S3 往返)。
+    # helper 的机制与理由见该文件的模块 docstring;它不落 host 磁盘,每次由本函数现下发。
+    #
+    # (与 pull-image _install_lines 对 .sh 的 chown 一致)。注意这【不是】因为 host-agent
+    # /opt/openclaw 也是 root:root(init-host.sh:428 只 mkdir 不 chown)。chown 的真实理由
+    # 是与 /home/ubuntu/*.sh 既有属主一致(init-host.sh:685-739),让 ubuntu 能自查/替换脚本。
+    #
+    # 绝不把用户原文插进双引号 echo —— 否则含 $()/反引号的值会在 root SSM 里被执行。
+    # 参数走 env 而不是 argv:host 上任何人 `ps` 都看不到 s3_uri/目标。
     script = "\n".join([
-        # 不支持 bash 数组。全程用 POSIX 语法(for/case,无数组)。
+        # 全程 POSIX 语法(export VAR=value + quoted heredoc,无数组、无 bashism)。
         "set -eu",
-        f"SRC={q(s3_uri)}",
-        f"DST={q(target)}",
-        f"ALLOWED_ROOTS={q(allowed_roots_sh)}",
-        # TOCTOU:host 上 ubuntu(host-agent 身份)可在检查后换软链,借 root SSM 越权。彻底封需
-        # openat2(RESOLVE_NO_SYMLINKS)/O_NOFOLLOW helper 或只写 root-owned 根。不触及三条不可退底线,
-        # 且需 host ubuntu 已陷才可利用(租户 microVM 不可达),按当前阶段排后为 follow-up。
-        # ① 目标自身是已存在目录 → 拒(cp 会把文件放进去,chown 改的是目录、真文件仍 root:root)。
-        # ② 目标自身是软链 → 拒(cp 会跟随软链写到别处)。
-        # ③ 【父目录组件含软链】→ 拒:API 白名单只按字面前缀校验,挡不住 host 上
-        #    /home/ubuntu/outside -> /etc 这类父级软链逃逸(写 .../outside/x 实际落 /etc/x,root 越权)。
-        # round11:必须【先解析校验、后 mkdir】—— 若先 mkdir -p 一个软链祖先,会在白名单外先建目录。
-        #    故先对【已存在的最深祖先】做 readlink -f 校验,通过了再 mkdir 剩余层级;再拼回 basename
-        #    成真实写入路径 RDST(cp/检查/chown 全用 RDST,同一路径防 TOCTOU)。
-        'if [ -d "$DST" ]; then echo "[copy-file] target is an existing directory: $DST" >&2; exit 1; fi',
-        'if [ -L "$DST" ]; then echo "[copy-file] target is a symlink (refused): $DST" >&2; exit 1; fi',
-        'DPARENT=$(dirname "$DST")',
-        # 找【已存在的最深祖先】(逐级上溯),对它 readlink -f 拿真实路径 —— 未建的层级不含软链风险,
-        # 已存在的祖先若是软链会在这里被解析出真身。校验祖先真身落在允许根下(先校验,后 mkdir:
-        # 否则先 mkdir -p 一个软链祖先会在白名单外建目录)。
-        'ANC="$DPARENT"; while [ ! -e "$ANC" ] && [ "$ANC" != / ]; do ANC=$(dirname "$ANC"); done',
-        'RANC=$(readlink -f "$ANC") || { echo "[copy-file] cannot resolve ancestor: $ANC" >&2; exit 1; }',
-        'INROOT=0; for r in $ALLOWED_ROOTS; do case "$RANC/" in "$r"/*) INROOT=1 ;; esac; done',
-        'if [ "$INROOT" != 1 ]; then echo "[copy-file] existing ancestor escapes allowed roots (ancestor=$RANC; symlink escape?)" >&2; exit 1; fi',
-        'mkdir -p "$DPARENT"',  # 校验通过后才建;此时已存在祖先已确认非越权软链
-        # 建完对父目录整体 readlink -f 复核(挡校验后竞态 + 未建层级里可能新出现的软链),拼真实
-        # 写入路径 RDST。cp/检查/chown 全用 RDST(同一路径,防 TOCTOU)。
-        'RPARENT=$(readlink -f "$DPARENT") || { echo "[copy-file] cannot resolve parent: $DPARENT" >&2; exit 1; }',
-        'INROOT2=0; for r in $ALLOWED_ROOTS; do case "$RPARENT/" in "$r"/*) INROOT2=1 ;; esac; done',
-        'if [ "$INROOT2" != 1 ]; then echo "[copy-file] resolved parent escapes allowed roots: $RPARENT (symlink escape?)" >&2; exit 1; fi',
-        'RDST="$RPARENT/$(basename "$DST")"',
-        'if [ -d "$RDST" ] || [ -L "$RDST" ]; then echo "[copy-file] resolved target is dir/symlink: $RDST" >&2; exit 1; fi',
-        # (同 FS 原子 rename)。直接 cp 到 live 目标,传输中断/失败会留半截损坏文件 —— host-agent.py
-        # / 启动脚本被截断就坏了。失败清理 RTMP、保留旧文件。RTMP 用 basename 前缀 + $$(PID)避免撞名。
-        'RTMP="$RPARENT/.copy-file.$(basename "$DST").$$.tmp"',
-        'rm -f "$RTMP"',
-        # 失败时清理临时文件(EXIT trap 兜底,不残留 .tmp)
-        'trap \'rm -f "$RTMP"\' EXIT',
-        f'aws s3 cp "$SRC" "$RTMP" --region {q(region)} --no-progress',
-        # 校验临时文件确实落成普通文件(非目录/软链),再设属主+权限,最后原子 mv 到 live 目标。
-        'if [ ! -f "$RTMP" ] || [ -L "$RTMP" ]; then echo "[copy-file] downloaded temp not a regular file: $RTMP" >&2; exit 1; fi',
-        'chown ubuntu:ubuntu "$RTMP"',  # #334 属主纠正:root:root → ubuntu:ubuntu
-        'chmod 755 "$RTMP"',  # #334 落地权限 -rwxr-xr-x(可执行:host 脚本/二进制拷过去要能跑)
-        'mv -f "$RTMP" "$RDST"',  # 同 FS 原子 rename → live(传输已完整,不留半截)
-        'echo "[copy-file] $SRC -> $RDST OK (atomic, chown ubuntu:ubuntu, chmod 755)"',
+        f"export OC_COPY_ROOT={q(root.rstrip('/'))}",
+        f"export OC_COPY_REL={q(rel)}",
+        f"export OC_COPY_S3_URI={q(s3_uri)}",
+        f"export OC_COPY_REGION={q(region)}",
+        f"export OC_COPY_OWNER={q(_COPY_FILE_OWNER)}",
+        # quoted heredoc(定界符带引号)= 整段 Python 源码零展开地喂给 python3 的 stdin。
+        # 不写到 host 磁盘:省掉"helper 文件本身也可能被换"这一类新的 TOCTOU 面,
+        # 也不需要挑一个安全的落地目录(/tmp 是 world-writable,本身就是新攻击面)。
+        f"python3 - <<'{_COPY_FILE_HELPER_EOF}'",
+        _copy_file_helper_source().rstrip("\n"),
+        _COPY_FILE_HELPER_EOF,
     ])
     cmd_id, ok2, tail = _ssm_wait(instance_id, script, timeout=300)
     # pull_image 入口一致),同时 body 额外带 ProcessingJobStatus 让调用方【只看 JSON】就能 parse
@@ -3015,7 +3021,6 @@ def pull_image_progress(instance_id, query_params=None):
       last_status:进度文件最后一行原文(带时间戳+做了什么,供 UI 展示细节)
     无 job_id → 从没 pull 过(state='NONE',ProcessingJobStatus=null,last_status=None)。
 
-    #333 真实响应样例(InProgress,phase2 正解压第 2/4 个盘,真机 2026-07-20 取):
       {
         "instance_id": "i-0abc123def4567890",
         "host_status": "upgrading",

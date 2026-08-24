@@ -1,0 +1,91 @@
+# 场景 profile:public-demo —— 公网 CloudFront + EDGE API + 最小组件(快速演示)
+#
+# 用法:
+#   cp samples/profiles/public-demo.yml config.yml
+#   ./setup.sh <region> <aws-profile>        # 无客户坐标要填,cp 完即可部署
+#
+# 本 profile 只写【场景决定项 + CDK 硬必填键】。没写的键回落 deploy/ 的代码默认值
+# (deploy/stack.py 不做默认值合并,被直接下标的键必须显式写,已全部写出)。
+# 调优值请对照 config.yml.example 的同名段,那里的注释带实测依据。
+#
+# 安全姿态说明:公网可达 ≠ 放宽鉴权。本 profile 保持 rbac_enabled=true、
+# default_no_jwt_role=viewer、flow_logs=true、PITR=true;bff_ingress_cidrs 留空且
+# 不配 bff_certificate_arn(即不开 443 listener),避免在公网 demo 上开出一个宽入站面。
+
+# self_managed = CDK 自建 /20 VPC(3 公有 + 3 NAT GW + 3 私有),不需要客户坐标。
+network:
+  mode: self_managed
+  self_managed:
+    cidr: "10.20.0.0/20"
+
+multi_az:
+  enabled: true
+  az_count: 2
+
+# 公网形态:EDGE API + 面向公网 ALB + CloudFront。
+api:
+  mode: edge
+alb:
+  internal: false
+cloudfront:
+  enabled: true
+  # 自定义域名可选。填了 *_cert_arn 必须是 us-east-1 的证书(CloudFront 硬要求),
+  # 否则 preflight-check.sh 直接 BLOCK。
+  console_domain: ""
+  console_cert_arn: ""
+  app_domain: ""
+  app_cert_arn: ""
+
+# 最小组件:不建 OpenResty edge ASG、不建 AOS 日志栈。
+# redis 保持 true —— 它承载路由表,是数据面前提;edge 关掉只是不建反代层。
+redis:
+  enabled: true
+  engine: "valkey"
+edge:
+  enabled: false
+logging:
+  enabled: false
+
+host:
+  arch: arm64
+  instance_type: m8g.xlarge       # demo 规格,不用 metal
+  root_volume_gb: 20
+  data_volume_gb: 100
+  reserved_vcpu: 1
+  reserved_mem_mb: 2048
+vm:
+  default_vcpu: 2
+  default_mem_mb: 4096
+  data_disk_mb: 8192
+  gateway_port_base: 18789
+  subnet_prefix: "172.16"         # 点分字符串,不是整数
+asg:
+  min_capacity: 0                 # 首次部署必须 0:等镜像就绪再扩
+  max_capacity: 2
+  lifecycle_hook_timeout: 3600
+scaler:
+  interval_minutes: 3
+  idle_timeout_minutes: 10
+health_check:
+  interval_minutes: 5
+  az_failover:
+    enabled: true                 # 需 multi_az.enabled=true(上面已 true)
+
+console_auth:
+  enabled: true
+  self_sign_up: false
+  rbac_enabled: true
+  default_no_jwt_role: viewer
+  bff_certificate_arn: ""         # 留空 = 不开 443 listener
+  bff_ingress_cidrs: ""           # 与上面成对:配了证书才需要填
+flow_logs:
+  enabled: true
+dynamodb:
+  point_in_time_recovery: true
+deploy:
+  # demo 环境要能反复 destroy + rebuild,所以 false(DESTROY + auto-delete)。
+  # 生产必须改成 true —— preflight-check.sh 会为此给一条 WARN,那是预期的,不是错。
+  protect_stateful_resources: false
+audit:
+  cmk_encryption: false           # 不可逆,只能全新 account 首次部署开
+  worm_archive_enabled: false

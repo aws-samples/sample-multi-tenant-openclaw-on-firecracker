@@ -7,6 +7,7 @@ handler-split #132 T1.8 —— 从 handler.py 逐字搬迁,行为零改动。
 
 import os
 
+import core.ddb_scan as ddb_scan  # #432 —— Scan 必须翻页
 from core.clients import s3, tenants_table
 from core.utils import _resp
 
@@ -38,7 +39,7 @@ def list_all_backups():
     prefix = os.environ.get("BACKUP_PREFIX", "backups")
 
     # Build tenant_id → (name, exists) map from DDB (include soft-deleted for name resolution)
-    tenants = tenants_table.scan().get("Items", [])
+    tenants = ddb_scan.scan_all(tenants_table)
     tenant_info = {
         t["id"]: {"name": t.get("name", ""), "exists": t.get("status") != "deleted"}
         for t in tenants

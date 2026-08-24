@@ -8,6 +8,8 @@ import time
 from boto3.dynamodb.conditions import Attr, Key
 from botocore.exceptions import ClientError  # process_pending CAS 认领(#9 跨租户串修复)
 
+from core.event_shape import unsupported_event_response as _unsupported_event_response
+import core.ddb_scan as ddb_scan  # #432 —— Scan 必须翻页
 from core.logging import logger, inject_trace_root, reset_invocation_keys
 from services.tenant_query_service import (
     QUERY_FIELDS as _TENANT_QUERY_FIELDS,
@@ -124,14 +126,64 @@ def lambda_handler(event, context):
     # Re-enter the one rebuild business flow with the same op_id and actor.
     _async_rebuild = event.get("_async_rebuild")
     if _async_rebuild:
+        worker_body = _async_rebuild.get("body") or None
+        reapply_binding = (
+            worker_body.get("_config_reapply")
+            if isinstance(worker_body, dict)
+            else None
+        )
         worker_event = {
             "_consumer_ident": _async_rebuild.get("_ident") or {},
             "_op_id": _async_rebuild.get("_op_id"),
+            "_fence_epoch": _async_rebuild.get("_fence_epoch"),
         }
+        # ── #564 G3(通道 C)—— 执行前判过期,与通道 B 同一条口径 ─────────────────
+        # 位置:上面只是组一个 dict,零副作用;下一行的 tenant_action 才是第一个动作。
+        # 异步 Lambda 调用对未处理异常会**用同一 payload 重投**(见下方 :166 的注释),
+        # 所以没有这道闸时,一次卡死的 rebuild 会带着一个早就过期的死线反复重跑。
+        # 缺死线字段(升级期的在飞 payload)→ `is_expired` 返 False → 照旧执行。
+        _rb_dl = _async_rebuild.get(_create_deadline.MSG_DEADLINE_KEY)
+        if _create_deadline.is_expired(_rb_dl, int(time.time())):
+            _rb_tid = _async_rebuild.get("tenant_id")
+            # 先围栏再返回:`fence_expired_tenant` 走 rebuild 那条分支(锚 `rebuild_phase`、
+            # 写 `rebuild_phase/rebuild_status=failed` + `rebuild_fail_reason`),与每分钟
+            # 一拍的扫描共用同一份归因与写法。
+            # 传 payload 里的死线与 op_id 做双锚:异步 Lambda 对未处理异常会**用同一 payload
+            # 重投**,一条陈旧重投带着早就过期的死线到达时,行上可能已经是另一次 rebuild ——
+            # 不锚就会把那次活操作判死(Codex 独立复审第 1 轮抓出)。
+            _rb_outcome = _dl_executor.fence_expired_tenant(
+                _rb_tid,
+                _create_deadline.ACTION_REBUILD,
+                _rb_dl,
+                observed_op_id=_async_rebuild.get("_op_id"),
+            )
+            # 围栏之后必须放掉租约,否则这个租户 1800s 内做不了任何生命周期操作,而它
+            # 已经是终态了 —— 那会把"超时"变成"卡死更久"。用 payload 里的 fence_epoch
+            # 做条件,放的是自己那一把。
+            _tenant_service.finalize_async_rebuild_failure(
+                _rb_tid,
+                _async_rebuild.get("_op_id"),
+                _async_rebuild.get("_fence_epoch"),
+                f"deadline exceeded before the rebuild worker started "
+                f"(deadline={_rb_dl})",
+            )
+            # 围栏结果打出来但**不**据此让本次调用失败:终态性由上面那次
+            # `finalize_async_rebuild_failure` 兜住(它写 rebuild_phase/rebuild_status=failed
+            # 并在 finally 里放围栏),围栏这一步失败只会少一个**封闭取值**的
+            # `rebuild_fail_reason`,不会让租户留在在飞态。让本次调用失败反而更糟:异步重投
+            # 会带着同一个过期 payload 反复走这条路。
+            print(
+                f"[#564] async rebuild {_rb_tid} 已过死线 {_rb_dl},不执行;"
+                f"已围成终态(fence={_rb_outcome})并放掉租约"
+            )
+            return {"statusCode": 200, "body": '{"status":"deadline_exceeded"}'}
+        # 上面那支已过期的会直接 return、不进执行,也就不需要这个标志位。
+        if isinstance(reapply_binding, dict):
+            worker_event["_defer_async_rebuild_success_finalize"] = True
         result = tenant_action(
             _async_rebuild.get("tenant_id"),
             "rebuild",
-            _async_rebuild.get("body") or None,
+            worker_body,
             worker_event,
         )
         code = result.get("statusCode", 500) if isinstance(result, dict) else 500
@@ -146,6 +198,17 @@ def lambda_handler(event, context):
                     _async_rebuild.get("_op_id"),
                     _async_rebuild.get("_fence_epoch"),
                     result_body.get("error") or f"worker returned HTTP {code}",
+                )
+            elif (
+                code < 300
+                and isinstance(reapply_binding, dict)
+                and result_body.get("config_reapply") != "already_applied"
+            ):
+                _tenant_service.finalize_async_rebuild_success(
+                    _async_rebuild.get("tenant_id"),
+                    _async_rebuild.get("_op_id"),
+                    _async_rebuild.get("_fence_epoch"),
+                    reapply_binding,
                 )
             return result
         if result_body.get("rebuild_status") == "unconfirmed":
@@ -211,8 +274,72 @@ def lambda_handler(event, context):
     # in-flight SSM command polling loop (rate(1 minute)).
     if event.get("source") == "dispatch.poller":
         from services.dispatch_poller import poll_inflight as _poll  # noqa: E402
+        from services.deadline_executor import enforce_deadlines as _deadlines  # noqa: E402
 
-        return _poll()
+        # #562 G6 —— 独立死线执行者,与 poll_inflight【并列】而不是塞进它里面:
+        #
+        # ① 为什么不塞进 poll_inflight:那个函数在 ddb 模式(客户生产样例 config-sg-prod.yaml:185 用的就是它)
+        #    被并发命令占用的槽位)。塞进去等于在生产上永不执行 —— 最坏的一种「实现了但没生效」。
+        # ② 为什么不新建 Lambda:G6 要的是「与 SQS 消费者解耦,消费者故障时死线仍被执行」,而
+        #    EventBridge rate(1 minute) 这个触发源本身就与 SQS 消费者无关 —— 消费者挂了它照跑,
+        #    这正是 G6 要的性质。issue 把「拆独立消费者 Lambda」明确列为【单独一个 MR】,
+        # ③ 为什么它的异常不阻断 poll_inflight:两者职责独立,死线执行失败不该让 push 模式的
+        #    promote/回滚也停摆。这里 catch 是因为【本层能处理】——处理方式是记录后继续跑另一半,
+        #    不是吞掉:错误既进日志也进返回值,指标上看得见。
+        from services import poller_heartbeat as _hb  # noqa: E402
+
+        # 判据是「这一拍到底跑完没有」:只包一半的话,另一半卡住/抛异常时心跳照发,
+        # 陈旧告警就永远不响 —— 那正是本 issue 要消灭的「没人知道它没跑」。
+        with _hb.timer() as _t:
+            try:
+                _dl_stats = _deadlines()
+            except Exception as e:  # noqa: BLE001 —— 见 ③:fail-loud 到日志+指标,不阻断 poller
+                print(f"[#562] deadline executor failed: {type(e).__name__}: {e}")
+                _dl_stats = {"error": f"{type(e).__name__}: {e}"}
+            _poll_stats = _poll()
+        # 心跳在【两半都跑完之后】发。发送失败不抛(可观测性不许阻断业务),而且发不出去
+        # 本身就等于数据点缺席 → 陈旧告警会响,所以这条路径的失败不会变成静默失效。
+        _hb_stats = _hb.emit(
+            _t.seconds, errors=_hb.errors_in(_poll_stats, _dl_stats)
+        )
+        return {**_poll_stats, "deadlines": _dl_stats, "heartbeat": _hb_stats}
+
+    # 标记,重试撤销 LiteLLM vkey。落在 **api Lambda** 而不是 health_check:实测只有
+    # `openclaw-api` 的 env 带 `LITELLM_MASTER_KEY_SECRET`,放在 health_check 里它连
+    # master key 都读不到,是一个注定空转的 reconciler。
+    # 与 dispatch.poller 并列成独立 source(而不是塞进 poll_inflight):poll_inflight 在
+    # ddb 模式第一行就空转返回,塞进去等于在生产上永不执行 —— #562 G6 已踩过这一条。
+    if event.get("source") == "credential.reconciler":
+        from services.credential_reconciler import (  # noqa: E402
+            reconcile_credentials as _reconcile,
+        )
+
+        return _reconcile()
+
+    # #532 —— 卡在 `deleting` 的删除对账(EventBridge rate)。消费「host 侧删除失败后保留的
+    # `delete_retryable=true` + claim 已过期」这组行,按落库的 `delete_intent` 重新入队,
+    # 让那条完整的删除路径再跑一次。进了 DLQ 的消息不会自己回主队列,所以没有这一拍,租户就
+    # 永久停在 `deleting`(issue 真机实例:根因修好后两个租户仍卡着)。
+    # 落在 **api Lambda** 而不是 health_check:只有它带 `LIFECYCLE_QUEUE_URL` env 并拿到
+    # 该队列的 send 权限(`deploy/stacks/lambdas.py` 的 grant_send_messages),放 health_check
+    # 里它连消息都发不出去 —— 与上面 credential.reconciler 同一条理由。
+    # 与 dispatch.poller / credential.reconciler 并列成独立 source(不塞进 poll_inflight:
+    # 那条在 ddb 模式第一行就空转返回,塞进去等于在生产上永不执行,#562 G6 已踩过)。
+    if event.get("source") == "delete.reconciler":
+        from services.delete_reconciler import (  # noqa: E402
+            reconcile_deletes as _reconcile_deletes,
+        )
+
+        return _reconcile_deletes()
+
+    # `event["httpMethod"]`,于是任何**直接 invoke**(没有 API Gateway 信封)都确定性抛
+    # KeyError,函数根本走不到路由 —— restorepatch 的存活探针发 `{"path":"/ping"}` 正是这条,
+    # 而 kit 把随之置位的 FunctionError 误分类成「private API 上的 404 body 属预期」,verify 报
+    # 11 pass / 0 fail,「函数能否执行」从未被验证。判据放在 core/event_shape.py(不碰 boto3,
+    # 可单测),用返回而不是抛错:返回本身就是「函数执行到了」的证据。
+    _unsupported = _unsupported_event_response(event)
+    if _unsupported is not None:
+        return _unsupported
 
     method = event["httpMethod"]
     resource = event["resource"]
@@ -300,6 +427,9 @@ def lambda_handler(event, context):
         # Fleet power: start/stop EVERY VM across all hosts via host-local fan-out
         # (1-minute fleet power goal). Admin-only (gated inside fleet_power).
         ("POST", "/hosts/fleet-power"): lambda: fleet_power(event.get("body"), event),
+        # #566 拆分② — fleet guest 出网防火墙运维:一次改全部(或指定)host 的
+        # OPENCLAW-EGRESS default-deny 链。Admin-only(gated inside fleet_egress)。
+        ("POST", "/hosts/egress"): lambda: fleet_egress(event.get("body"), event),
         ("POST", "/hosts/rolling-upgrade"): lambda: submit_rolling_upgrade(
             event.get("body"), event
         ),
@@ -457,7 +587,7 @@ def list_tenants(query_params=None, multi_query_params=None, event=None):
         items = out.get("Items", []) or []
         next_token = _encode_next_token(out.get("LastEvaluatedKey"))
     else:
-        items = tenants_table.scan(**scan_kwargs).get("Items", [])
+        items = ddb_scan.scan_all(tenants_table, **scan_kwargs)
         next_token = None
 
     # they own. Admins and the API-key caller see everything. Records without
@@ -885,8 +1015,41 @@ def system_info():
                 "vm_default_vcpu": VM_DEFAULT_VCPU,
                 "vm_default_mem_mb": VM_DEFAULT_MEM,
             },
+            # #564 G5 — 七档生命周期死线的**生效值与来源**。
+            #
+            # 为什么放在这个端点:它的职责就是 config snapshot(见本函数 docstring),而验收
+            # 第 4 条要的是「改配置后死线值随之变化,**读取值要在日志或响应里可验证**」——
+            # 没有一个可读处,那条就无从验证,而且"建了参数没人读"正是 G1 在 env 名上专门
+            # 防的形态。
+            #
+            # `source` 是这里的关键,不是冗余:`ssm` = 参数里的值;`ssm-stale` = SSM 读失败、
+            # 用的是上次读到的旧值;`env-or-default` = 参数里没有这一档,回落 env 或代码默认。
+            # 运维改完参数刷这个端点,看的就是 source 有没有变成 `ssm`、值有没有跟着变。
+            "lifecycle": _lifecycle_deadline_snapshot(),
         },
     )
+
+
+def _lifecycle_deadline_snapshot():
+    """七档死线的生效值 + 来源;顺带打一行日志(验收既可看响应也可看日志)。
+
+    **fail-soft**:这个端点是只读诊断面,不能因为死线配置读不出来就整个 500 —— 那会把一次
+    "看看配置"变成一次故障。非法参数值该炸的地方是**真正用死线的那条路**(写租户/入队),
+    不是这里;所以这里把异常收成一个可见的 `error` 字段。
+    """
+    try:
+        snap = _deadline_config.all_effective_deadline_sec()
+    except Exception as e:  # noqa: BLE001 — 见 docstring:诊断面不因配置问题变 500
+        logger.warning(f"system_info: 死线快照读取失败({type(e).__name__}): {e}")
+        return {"deadline_sec": None, "error": f"{type(e).__name__}: {e}"}
+    logger.info(
+        "system_info lifecycle deadline snapshot: "
+        + ", ".join(f"{a}={v}({src})" for a, (v, src) in sorted(snap.items()))
+    )
+    return {
+        "deadline_sec": {a: {"value": v, "source": src} for a, (v, src) in snap.items()},
+        "param_prefix": _deadline_config.PARAM_PREFIX,
+    }
 
 
 def _queue_depth(url):
@@ -999,11 +1162,15 @@ def get_tenant_data(tenant_id, event=None):
 
 def process_pending():
     """Called when a new host becomes InService. Assign pending tenants to available hosts."""
-    pending = tenants_table.scan(
+    # 所以这一处现在就在漏:落在后页的 pending 租户永远轮不到 promote。
+    # 而 #562 之后它们会在死线时被判 failed(capacity_unavailable)—— 客户看到的是
+    # 「没容量」,真实原因却是「我们没看见你」。
+    pending = ddb_scan.scan_all(
+        tenants_table,
         FilterExpression="#s = :p",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":p": "pending"},
-    ).get("Items", [])
+    )
 
     if not pending:
         return {"statusCode": 200, "body": "no pending tenants"}
@@ -1645,8 +1812,12 @@ def batch_tenants(body=None, event=None):
         return _resp(
             400, {"error": f"too many ids (max {_BATCH_MAX_IDS}); use async:true"}
         )
-    succeeded, failed = _execute_batch(action, target_ids, event)
-    return _resp(200, {"succeeded": succeeded, "failed": failed})
+    # delete/stop/start 在 _execute_batch 里返 202,旧代码按 "<400 即成功" 上报,
+    # 而 consumer 之后可能 5 次重投进 DLQ —— 调用方看到 succeeded 会以为做完了。
+    succeeded, failed, enqueued = _execute_batch(action, target_ids, event)
+    return _resp(
+        200, {"succeeded": succeeded, "failed": failed, "enqueued": enqueued}
+    )
 
 
 # ───────────── Fleet power: start/stop EVERY VM within 1 minute ─────────────
@@ -1674,6 +1845,101 @@ def batch_tenants(body=None, event=None):
 # facade 别名见文件底部。放 services 层是为断开 tenant_service→consumers 反向依赖环。
 
 
+def _receive_count(rec):
+    """SQS 的 `ApproximateReceiveCount`。**它是字符串**,而且可能整个缺失。
+
+    形态与 `dispatch_service` 那处(#522 P1-2)逐字相同:`rec["attributes"]` 里的值是
+    字符串;缺失/不可解析时返 **0** 而不是 1 —— 0 会让下面「已是最后一次投递」的判定
+    **不成立**,也就是"看不出来就不回写终态"。方向刻意保守:误判"是最后一次"会把一个
+    仍会被重投并可能成功的操作提前标成失败(而 `system_error` 的已发布语义是"重试无益"),
+    那比晚一点回写更糟。
+    """
+    try:
+        return int((rec.get("attributes") or {}).get("ApproximateReceiveCount") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _terminal_before_dlq(rec, action, tenant_id, msg, why):
+    """#564 G6 —— **消息即将进 DLQ 之前**把租户回写成终态 + 落机器可读原因。
+
+    判据是 `ApproximateReceiveCount >= LIFECYCLE_MAX_RECEIVE_COUNT`:到这一次,本次失败
+    之后 SQS 就把消息转进 DLQ,**不会再有下一次消费**。所以这是最后一个能写终态的时机。
+
+    **为什么不建 DLQ 消费者**(考虑过,放弃了):客户表格明文「DLQ 只负责兜底告警」,而
+    #562 §3.1 把「DLQ 非空 = 100% 是 bug」当运维判据。建一个消费者会把 DLQ 变成**正常
+    失败通道**,那条最有用的告警信号就废了。在进 DLQ 之前写,两件事都保住:租户有终态,
+    DLQ 仍然只在真出缺陷时非空。
+
+    **不写的后果**(#532 的真机证据,ap-southeast-1 2026-08-18):两个租户 running→deleting
+    之后永久卡住,SSM 回执 `[oc:delete] FATAL 拉取 delete-vm.sh 失败`,那两条消息耗尽重投
+    (`ReceiveCount=6`)进了 DLQ,**再无人接管**。客户侧看到的就是一个永不终结的 `deleting`。
+
+    归因用 `system_error`(由 `fence_delivery_exhausted` 给定):它的已发布语义是"出现即
+    缺陷、报障、重试无益",与「DLQ 非空 = 100% 是 bug」逐字对齐。**不用**
+    `deadline_exceeded_in_flight` —— 投递耗尽时死线可能压根没到,拿它描述会撒谎。
+
+    `delete` 仍走它自己的例外(`_fence_failed` 里那一支):只写
+    `delete_fail_reason` + `delete_reported_failed_at`,**不动 `status`** —— 600s 只约束
+    答复,删除不得丢弃。消息照旧进 DLQ 当告警,但删除链条上的状态锚没被破坏。
+
+    「回写前先读租户当前状态再决定」这条要求是**结构性**满足的:`_fence_failed` 的 CAS 锚
+    住它读到的那个中间态,租户若已被别的路径推成终态就什么都不写(#532:盲目重写一个已
+    failed 的租户会制造孤儿 VM)。
+    """
+    rc = _receive_count(rec)
+    _max = _clients.LIFECYCLE_MAX_RECEIVE_COUNT
+    if rc < _max:
+        return  # 还会有下一次消费,现在写终态就是提前判死
+    if action not in _create_deadline.DEADLINE_ACTIONS:
+        # start/stop/pause/resume/reset 不在死线词汇表里,没有 `<action>_fail_reason`
+        # 字段可落 —— 对它们调 `fail_reason_attr()` 会 raise。它们进 DLQ 仍有告警。
+        print(
+            f"[lifecycle-consumer] #564 {action} {tenant_id} 投递耗尽"
+            f"(rc={rc}/{_max}),但该动作不在死线词汇表里,只靠 DLQ 告警"
+        )
+        return
+    outcome = _dl_executor.fence_delivery_exhausted(
+        tenant_id,
+        action,
+        msg.get(_create_deadline.MSG_DEADLINE_KEY),
+        observed_op_id=msg.get("_op_id"),
+    )
+    print(
+        f"[lifecycle-consumer] #564 {action} {tenant_id} 投递耗尽(rc={rc}/{_max}),"
+        f"进 DLQ 前已回写终态(fence={outcome});最后一次失败: {why}"
+    )
+
+
+def _release_lifecycle_lease_if_mine(tenant_id, op_id):
+    """#564 G3 —— 丢弃一条过期消息之后,放掉它入队时占的生命周期租约。
+
+    **不放会把"超时"变成"卡死更久"**(Codex 独立复审第 1 轮抓出的真缺陷):
+    `_FENCED_LIFECYCLE_ACTIONS`(rebuild/migrate/reset/delete/restart/suspend)在**入队时**
+    就取了租约,原本由 consumer 执行完那次操作的正常路径放掉。我加的丢弃分支跳过了执行,
+    于是没人放 —— 租户被锁在"做不了任何生命周期操作"的状态里直到租约自然过期(**1800s**),
+    而它明明已经是终态了。客户看到的是"操作没了、而且我还改不了它"。
+
+    **为什么读一次再放,而不是把 fence_epoch 塞进消息体**:`lifecycle_fence.release()` 的条件
+    是 `op_id` 与 `epoch` **双锚**,所以拿读到的 epoch 去放是安全的 —— 期间若换了别的操作,
+    双锚不成立、CCF、返 False、什么都不动。而读一次能同时覆盖**升级期那批发出时还没有
+    fence_epoch 字段的在飞消息**;改消息格式则要维护两条路径。
+
+    只在 `active_lifecycle_op_id` 确实是本条消息的 `_op_id` 时才放 —— 否则那把租约属于
+    另一次操作,放掉它就是替别人解锁。
+    """
+    if not tenant_id or not op_id:
+        return
+    try:
+        cur = _lifecycle_fence.read(tenant_id)
+        if (cur or {}).get("active_lifecycle_op_id") != op_id:
+            return
+        _lifecycle_fence.release(tenant_id, op_id, cur.get("lifecycle_fence_epoch"))
+    except Exception as e:  # noqa: BLE001 —— 放锁失败不该让一条已判过期的消息回队列绕圈:
+        # 租约本身有 1800s 自然过期兜底,而重投会让同一条过期消息反复走这条路。
+        print(f"[#564] release-lease {tenant_id}/{op_id} 失败(不阻断): {e}")
+
+
 def _consume_lifecycle_sqs(records):
     """SQS consumer:逐条消费 lifecycle 消息,复用现有 create/tenant_action/delete。
 
@@ -1695,6 +1961,57 @@ def _consume_lifecycle_sqs(records):
             # 也挂这个钩)。缺失(老消息/非队列路径)时下游自行兜底,不阻断。
             if msg.get("_op_id"):
                 ev["_op_id"] = msg["_op_id"]
+            # ── #564 G3 —— 消费前判过期,在【任何动作之前】 ──────────────────────
+            # 位置的正当性:上面全是纯解析(json.loads + dict.get + 组 ev),零副作用,
+            # 所以在这里放弃是"一步未动"。往下一行就开始真实动作了。
+            _dl = msg.get(_create_deadline.MSG_DEADLINE_KEY)
+            if _dl is not None:
+                # create 重放时**继承**这个死线而不是重算 —— 走 event 而不是 body,
+                # 因为 body 是客户可控的 POST 内容(见 tenant_service 那段说明)。
+                ev["_deadline_epoch"] = _dl
+            # 缺死线字段(升级期的在飞消息)→ `is_expired` 返 False → 不丢弃,走正常链路。
+            # 那是刻意的 fail-safe:不许因为缺字段就丢掉客户已受理的操作。
+            if _create_deadline.is_expired(_dl, int(time.time())):
+                if action == "delete":
+                    # **delete 是例外**(客户 2026-08-21):600s 只约束【给上层的答复】,
+                    # 而**删除不得丢弃**。到点只回报失败(由 deadline_executor 落
+                    # `delete_reported_failed_at`,它不动 status),这里**继续执行删除** ——
+                    # 丢掉这条消息等于让盘和 VM 就地搁浅。
+                    # 回报是 best-effort:删除本身继续走,不因回报失败而中止;真漏了的话
+                    # 每分钟一拍的行扫描还会补报一次。租约由删除的正常路径放。
+                    print(
+                        f"[lifecycle-consumer] #564 delete {tid} 已过死线 {_dl},"
+                        "按契约【继续执行】,只回报失败"
+                    )
+                    _dl_executor.fence_expired_tenant(tid, "delete", _dl)
+                else:
+                    # 其余动作:不执行、置终态、放围栏租约、ack 删除。**顺序不能变。**
+                    _outcome = "raced"
+                    if action in _create_deadline.DEADLINE_ACTIONS:
+                        _outcome = _dl_executor.fence_expired_tenant(
+                            tid, action, _dl, observed_op_id=msg.get("_op_id")
+                        )
+                    if _outcome == "error":
+                        # **围栏没成功就绝不 ack**(Codex 独立复审第 1 轮抓出的真缺陷):
+                        # 那会让消息永久消失【而且】租户还卡在中间态 —— 「过期即终态」这条
+                        # 承诺直接落空,而且是静默落空。留队列重投;若持续失败最终进 DLQ,
+                        # 而「DLQ 非空 = 100% 是 bug」正是这种情形该发出的信号。
+                        print(
+                            f"[lifecycle-consumer] #564 {action} {tid} 已过死线但围栏失败,"
+                            "不 ack,留队列重投"
+                        )
+                        failures.append({"itemIdentifier": mid})
+                        continue
+                    # 围栏落地(或确认这行已不是我那次)之后才放租约、才 ack。
+                    # ack 而不是进 batchItemFailures —— 业务判死是一次【成功处理】,
+                    # 进 DLQ 会污染「DLQ 非空 = 100% 是 bug」这条语义(与通道 A 同一条口径)。
+                    _release_lifecycle_lease_if_mine(tid, msg.get("_op_id"))
+                    print(
+                        f"[lifecycle-consumer] #564 dropped expired {action} for {tid}"
+                        f" (deadline={_dl}, late_by={int(time.time()) - int(_dl)}s,"
+                        f" fence={_outcome});租户已围成终态、租约已放,消息 ack"
+                    )
+                    continue
             if action == "create":
                 # create:extra 带 create_tenant 所需 body(name/vcpu/owner 等)
                 result = create_tenant(extra, ev)
@@ -1717,9 +2034,12 @@ def _consume_lifecycle_sqs(records):
                 # extra,这里重建成 query_params。恒传空 {} 会让 keep_data 默认 "true"
                 # (tenant_service 默认软删),该删的盘悄悄没删(no-data-loss 反向)。
                 # None(调用方没传该 query)不放进 dict,让 delete_tenant 的默认值生效。
+                # 中间态准入检查跑在入队【之前】,重放时缺 force 就被挡成 409,而 409 是
+                # 4xx → 下面明确不重投 → 消息消费掉、删除永不发生。P2 的强制删除出口
+                # 会在队列开启时整条失效,而调用方只看到 202。
                 _q = {
                     k: str(extra[k])
-                    for k in ("keep_data", "skip_backup")
+                    for k in ("keep_data", "skip_backup", "force")
                     if extra.get(k) is not None
                 }
                 result = delete_tenant(tid, _q, ev)
@@ -1728,10 +2048,19 @@ def _consume_lifecycle_sqs(records):
             code = result.get("statusCode", 500) if isinstance(result, dict) else 200
             if code >= 500:
                 # 5xx(SSM throttle / 容量争用)→ 留队列退避重试
+                _terminal_before_dlq(rec, action, tid, msg, f"HTTP {code}")
                 failures.append({"itemIdentifier": mid})
             # 4xx(owner/参数错)不重试:消息消费掉,避免毒消息无限重投
         except Exception as e:  # noqa: BLE001
             print(f"[lifecycle-consumer] msg {mid} error: {type(e).__name__}: {e}")
+            # 异常这一支同样可能是**最后一次**投递 —— 漏了它,毒消息那一类(每次都抛)
+            # 就正好绕过整道门:它从来走不到上面那个 5xx 分支。
+            try:
+                _terminal_before_dlq(
+                    rec, action, tid, msg, f"{type(e).__name__}: {e}"
+                )
+            except Exception as e2:  # noqa: BLE001 —— 回写失败不该盖掉原始失败
+                print(f"[lifecycle-consumer] #564 terminal-before-dlq 失败: {e2}")
             failures.append({"itemIdentifier": mid})
     return {"batchItemFailures": failures}
 
@@ -1754,6 +2083,11 @@ def get_batch_job(job_id, event=None):
             "done": job.get("done", 0),
             "succeeded": job.get("succeeded", []),
             "failed": job.get("failed", []),
+            # (fleet_service.run_batch_job),但这个查询端点没返回它 —— 而它是调用方
+            # 唯一的进度来源。漏掉的后果不是少个字段,而是"仅入队"与"真做完"在对外
+            # 视图里仍然分不开:succeeded 不含它们、failed 也不含,调用方只能看到
+            # total 与 done 对不上却无从知道差在哪。P5 的"不谎报"到这里才算闭合。
+            "enqueued": job.get("enqueued", []),
             "created_at": job.get("created_at"),
             "updated_at": job.get("updated_at"),
         },
@@ -1803,6 +2137,16 @@ for _m in [
 from core import capacity as _capacity  # noqa: E402
 from core import clients as _clients  # noqa: E402
 from core import host_profile as _host_profile  # noqa: E402
+
+# #564 G5 — 七档死线的生效值(SSM Parameter → 缓存 → 回落 env/默认)。放这里而不是底部:
+# 底部那批是"阶段化搬迁解依赖环"的产物,而本模块只依赖 core.*、不反向依赖 handler,无环。
+from core import deadline_config as _deadline_config  # noqa: E402
+
+# #564 G3 — 消费前判过期要用的两样:死线字段/键名与 `is_expired` 的 fail-safe 口径,
+# 以及把过期操作立刻围成终态的那一个入口(与每分钟一拍的扫描共用同一份归因与写法)。
+from core import create_deadline as _create_deadline  # noqa: E402
+from core import lifecycle_fence as _lifecycle_fence  # noqa: E402
+from services import deadline_executor as _dl_executor  # noqa: E402
 
 ssm = _clients.ssm
 s3 = _clients.s3
@@ -1953,7 +2297,6 @@ def _taint_authz_denied(ident):
     这是唯一的授权门 —— 与 registry/bootstrap 的 handler 内 identity-based 门同款,只是把 admin
     放宽到 operator(会议定 taint 为 operator+ 运维动作)。返回 None=放行,否则 403 响应。
 
-    #108 —— platform-scoped API key 只能碰自己 platform 的 tenant,不是整个机队的 blanket
     admin(auth._get_caller_identity 明载"NOT a blanket admin over the whole fleet even if
     role/api-key would otherwise say so")。taint 作用于 host(跨 platform 的基础设施),故 scoped
     key 一律无权,即使其 api-key 路径 is_admin=True。此检查放在 is_admin 放行【之前】,与
@@ -2049,6 +2392,11 @@ list_edge_metrics = _edge_admin.list_edge_metrics
 _authorize_user_scope = _fleet_service._authorize_user_scope
 _query_user_tenants = _fleet_service._query_user_tenants
 fleet_power = _fleet_service.fleet_power
+
+# #566 拆分② — fleet guest 出网防火墙运维 API(POST /hosts/egress)。
+from services import egress_admin_service as _egress_admin_service  # noqa: E402
+
+fleet_egress = _egress_admin_service.fleet_egress
 _execute_batch = _fleet_service._execute_batch
 _enqueue_batch_job = _fleet_service._enqueue_batch_job
 run_batch_job = _fleet_service.run_batch_job

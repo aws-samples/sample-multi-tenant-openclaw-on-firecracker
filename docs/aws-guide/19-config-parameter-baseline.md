@@ -39,7 +39,7 @@
 ### ① `vm.default_mem_mb` 决定 host 台数翻倍
 
 380/台**不是**默认配置能达到的值。仓库默认 `default_mem_mb: 4096`,而一手实测是
-**187 个全健康节点/台且受磁盘瓶颈约束**(见 14 章 § 14.1)。380/台是 **2048 MB/VM** 的目标容量档。
+**187 个全健康节点/台且受磁盘瓶颈约束**(见 14 章 § 14.1)。380/台是 **2048 MB/VM** 的目标容量档。这个目标同时要求 `vm.default_vcpu: 1`:调度器(`deploy/lambda/api/core/dispatch/binpack.py`)按每租户**真实 vcpu** 扣减 host 预算,而 host 可分配 vcpu = `capacity.py` 的 `allocatable(95, 4.0)` = **380**。1 vCPU/VM 时 CPU 闸恰好 380(与内存维度 768÷2≈384 同量级);若沿用 `default_vcpu: 2`,CPU 闸落到 **190/台**,264 台与 `asg.max_capacity` 全部不够(见 § 19.3 与文末机械断言)。
 
 | `vm.default_mem_mb` | 每台可承载 | 10 万所需台数 | 依据 |
 | --- | --- | --- | --- |
@@ -91,7 +91,7 @@
 | 参数 | 意义 | 当前默认 | 曾经默认(commit) | 生产实际 | 10 万推荐值 | 推荐依据 |
 | --- | --- | --- | --- | --- | --- | --- |
 | `vm.default_mem_mb` | 每 VM 声明内存 | `4096` | 同 | `4096` | **`2048`** | `SPEC` 300–400/台只在 2 GB/VM 成立;`实测` 4096 下每台仅 187(见 § 19.1 ①) |
-| `vm.default_vcpu` | 每 VM vCPU | `2` | 同 | `2` | `2` | 与 `cpu_overcommit_ratio=4.0` 联动得 380 槽 |
+| `vm.default_vcpu` | 每 VM vCPU | `2` | 同 | `2` | **`1`** | `capacity.py` `allocatable(95,4.0)`=380 vCPU;装箱按真实 vcpu 扣减,1 vCPU/VM 才 CPU 闸 380,`2` 则闸在 190(见 § 19.1 ①) |
 | `vm.rootfs_overlay_mb` | 每 VM 可写层上限(sparse) | `8192` | 同 | 未设 | `8192` | sparse 不预占,声明上限不等于实占 |
 | `vm.data_disk_mb` | 每 VM 数据盘上限(sparse) | `8192` | 同 | 未设 | `8192` | 同上;380×8G 远超 900G 靠 sparse 不全占 |
 | `vm.host_launch_slots` | 单 host 同时冷启 microVM 数上限(flock 信号量) | `30` | 无此键(`3493f152` #331 · 07-20 新增) | 未设 | `30` | `实测` #331 真机验证值;防批量 recover 二次洪峰压垮 host |
@@ -254,7 +254,7 @@ host:
 
 vm:
   default_mem_mb: 2048             # ← 决定 300 台还是 535 台
-  default_vcpu: 2
+  default_vcpu: 1                # 1 vCPU/VM 才达 380/台(CPU 闸);2 则每台仅 190,见 § 19.3
   host_launch_slots: 30
 
 scheduling:
@@ -324,7 +324,94 @@ logging:
 `s3.backup_cron` + `backup_batch_limit`(见 § 19.8 ②)、`logging.aos.ebs_volume_size_gib`、
 `edge.instance_type` 是否需要从 `c6in.xlarge` 升配。
 
-## 19.10 与其他章节的关系
+## 19.10 按场景一键部署(profile 预设 + 部署前跨字段门)
+
+上面每一节都在回答「**这一个**参数填什么」。本节回答另一个问题:**39 个顶层段、192 个生效
+叶子键、58 个布尔开关,客户第一次部署要不要一个个手对?** 不用 —— 选一个场景 profile,只填
+该场景的少量坐标,剩下交给代码默认值,部署前由一道门把开关之间的依赖/互斥/不可逆一次性查完。
+
+### ① 选 profile
+
+```bash
+cp samples/profiles/<name>.yml config.yml     # 三选一,见下表
+# 补齐该场景标 <必填> 的坐标
+./setup.sh <region> <aws-profile>             # 它会在 cdk deploy 前自动跑那道门
+```
+
+| profile | 网络 | API / ALB | 组件 | 有状态资源 | 需要客户坐标 |
+| --- | --- | --- | --- | --- | --- |
+| `private-enterprise` | `imported` | `private` + internal ALB,无 CloudFront | edge + redis 全开 | RETAIN + WORM | **是,8 个** |
+| `public-demo` | `self_managed` | `edge` + 公网 ALB + CloudFront | 最小 | DESTROY | 否 |
+| `minimal-test` | `default_vpc` | `edge` + 公网 ALB | 最小 + 单 AZ | DESTROY | 否 |
+
+profile 只写「场景决定项 + CDK 硬必填键」,不复制本章的调优值 —— 同一个数字抄进四个文件
+只会各自漂移。口径与边界见 `samples/profiles/README.md`。
+
+**诚实边界**:`private-enterprise` 走导入 VPC,`vpc_id` / `cidr` / 3 公有 + 3 私有 subnet id
+是客户环境坐标,预设不出来。`cp` 之后仍会有 4 条 BLOCK,且**只有**这 4 条(被测试断言锁住)。
+另两个 profile 零坐标,`cp` 完即零 BLOCK。
+
+### ② 部署前跨字段门
+
+单一实现是 `scripts/preflight-check.sh`(只读:只 `describe`/`list`/`get` + 解析 config,
+绝不建/删/改资源),已焊进唯一部署入口 `setup.sh`;`PREFLIGHT_SKIP=1` 是显式逃生开关,默认关。
+分级口径写在该文件头部:
+
+- 🔴 **BLOCK** = 会 `CREATE_FAILED` / `ROLLBACK` / `cdk synth` raise,必须先解决。
+- 🟡 **WARN** = 可能有问题 / 静默失效 / 需人工确认,逐条确认后可部署。
+
+这个分级不是修辞。门拦错了(假阳)会挡住合法部署,所以「受限测试账号为省成本关掉
+`flow_logs`」这类**合法意图**一律 WARN;而「缺一个被代码直接下标的键」必然 `synth` KeyError,
+那才是 BLOCK。
+
+#### 硬必填键(缺一个 = synth KeyError)
+
+`deploy/stack.py` 是 `CFG = yaml.safe_load(config.yml)`,**不做默认值合并**。所以被代码
+直接下标(`CFG["a"]["b"]`)的键缺一个,`cdk synth` 就 `KeyError`——而这类判据是纯 config
+解析、零 AWS 调用,完全可以提前到部署前一行报错:
+
+| 段 | 键 |
+| --- | --- |
+| `host` | `root_volume_gb` `data_volume_gb` `reserved_vcpu` `reserved_mem_mb` |
+| `vm` | `default_vcpu` `default_mem_mb` `data_disk_mb` `gateway_port_base` `subnet_prefix` |
+| `asg` | `min_capacity` `max_capacity` `lifecycle_hook_timeout` |
+| `scaler` | `interval_minutes` `idle_timeout_minutes` |
+| `health_check` | `interval_minutes` |
+| `alb` | `internal` |
+
+`vm.subnet_prefix` 是**点分字符串**(`"172.16"`),不是整数 —— 拿整数判据去查它会把每一份
+合法 config 报成 BLOCK。
+
+#### 跨字段规则(schema 表达不了,只能代码判)
+
+| 关系 | 规则 | 级别 |
+| --- | --- | --- |
+| 依赖 | `edge.enabled=true` 必须 `redis.enabled=true` | BLOCK |
+| 依赖 | `health_check.az_failover` 生效中但 `multi_az.enabled≠true`(**缺键即默认开**) | WARN |
+| 依赖 | 配了 `console_auth.bff_certificate_arn` 但 `bff_ingress_cidrs` 为空 | WARN |
+| 互斥 | `dispatch.enabled` 与 `scaler.create_via_queue` 同为 true | BLOCK |
+| 一致性 | `api.mode=private/both` 但 `alb.internal=false` | WARN |
+| 一致性 | `api.mode=private/both` 但 `cloudfront.enabled=true` | WARN |
+| 不可逆 | `audit.cmk_encryption` / `audit.worm_archive_enabled` 开,且主栈**已存在** | BLOCK |
+| 安全默认 | `flow_logs.enabled` / `dynamodb.point_in_time_recovery` / `deploy.protect_stateful_resources` 被关 | WARN |
+
+两条容易踩反的地方:
+
+- **`alb.internal` 不会从 `api.mode` 派生。** #423 起有意废除了这个派生 —— 隐式派生会让
+  `api.mode` 的一次改动**静默翻转** ALB 的公网/内网形态。现在缺 `alb.internal` 键即
+  `synth` raise;门只给一致性 WARN,不替你改值。
+- **`health_check.az_failover` 缺键 = 开着。** 代码是
+  `hc_cfg.get("az_failover", {}).get("enabled", True)`,整段不写也落到 `True`。单 AZ
+  部署必须显式写 `enabled: false`(`samples/profiles/minimal-test.yml` 就是这么写的)。
+
+### ③ CI 侧
+
+`scripts/checks/config-gate.sh`(已注册进 `scripts/checks/run-all.sh`,CI 的 mechanical-gate
+天然继承)校验 `config.yml.example` 与 `samples/profiles/*.yml` 都带齐上面 16 个硬必填键 ——
+纯静态,零 AWS 调用。行为回归在 `tests/test_274_config_cross_field_gate.py`
+与 `tests/test_488_preflight_check_gaps.py`。
+
+## 19.11 与其他章节的关系
 
 | 想解决 | 去哪 |
 | --- | --- |
@@ -333,3 +420,4 @@ logging:
 | 参数改了要不要重建 host | [16 生效矩阵](16-hot-swap-vs-baked-and-host-rebuild.md) |
 | 已有环境的 EBS 性能收敛 | `engineering/runbooks/HOST-EBS-GP3-PERF-CONVERGE.md` |
 | 部署后必配项与责任划分 | [15 交付边界](15-delivery-boundary-and-responsibility.md) |
+| 场景 profile 的口径与边界 | `samples/profiles/README.md` |

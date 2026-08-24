@@ -3,25 +3,22 @@
 Packer 版 host golden AMI 构建模板，与 `deploy/stacks/host_image.py`（EC2 Image
 Builder）产出**同一份镜像内容**。两套实现并存，不是二选一。
 
-## ⚠️ 前置依赖：#435 尚未合并
+## 前置依赖：三项必做，缺任一项构建会失败
 
-本模板的 S3 相关能力**依赖 #435（Firecracker 二进制迁自家 S3）落地后才生效**。在
-#435 合并前的 `gitlab/bb` 基线上：
+`provision-host.sh` 从自家 S3 取 Firecracker/jailer（#435），bake 阶段本模板固定注入
+`OC_FC_REQUIRE_S3=1`，所以 S3 取不到就**中止构建**、不回落 github.com。构建前必须齐备：
 
-| 本模板提供的 | 在当前基线上的实际行为 |
+| 必做项 | 缺失时的表现 |
 |---|---|
-| `assets_bucket` 参数 | 传入但不被读取 —— `provision-host.sh` 尚无 `OC_ASSETS_BUCKET` |
-| `OC_ASSETS_BUCKET` 环境变量 | 同上，`provision-host.sh` 引用次数为 0 |
-| `iam_instance_profile` 的 `s3:GetObject` 要求 | 不必需（无 S3 拉取） |
-| `CUSTOMER-GUIDE.md` §3 预置 Firecracker 二进制 | 该步骤当前无效，可跳过 |
-| 「init 日志 `grep -c github.com` 为 0」这条验收 | **不成立** —— 当前仍从 GitHub 拉 |
+| `assets_bucket` 填成真实桶名（模板里是占位符） | `packer validate` 直接拒绝 |
+| S3 前缀 `deployment/binaries/firecracker/<ver>/` 已有制品（`CUSTOMER-GUIDE.md` §3） | provision 第 3 节 `die`，构建红 |
+| `iam_instance_profile` 能读该前缀（`s3:GetObject`） | AccessDenied → 同上，构建红 |
 
-模板保留这些接口是因为它们与 #435 的实现同源（同一个 `provision-host.sh`），#435
-合并后无需改动本目录即自动生效。**在 #435 合并前不要把 `CUSTOMER-GUIDE.md` 交付给
-客户** —— §3 与 §1.8 的 S3 权限会让客户配置一批当前不起作用的东西，而 §6 之后的
-「零第三方依赖」承诺在那时并不成立。
+取回的 tarball 还要过一道**摘要校验**（`_fc_expected_sha()`），不匹配同样拒绝安装；
+想升 `FC_VER` 必须先在那里补上新版本的摘要，否则 fail-closed。
 
-下方「实测记录」中的真机证据取自带 #435 改动的工作树，**不是本分支的提交状态**。
+走对了的判据是构建日志里这两行：
+`firecracker <ver> tarball from S3: s3://…` 与 `tarball sha256 verified: …`。
 
 ## 为什么复用 provision-host.sh，而不在 HCL 中重写安装步骤
 
@@ -35,7 +32,7 @@ Builder）产出**同一份镜像内容**。两套实现并存，不是二选一
 |---|---|---|
 | #440 | `gpg --batch --yes` 使 keyring 覆盖操作幂等 | HCL 中遗漏 `--yes` → 构建阶段弹出确认提示并阻塞 |
 | #451 | marker 移至 §7 scrub **之后** | 顺序写反 → scrub 失败的镜像仍标记为构建完成 |
-| #435 | **尚未落地**（#435 未落地）：`provision-host.sh:132` 目前无条件从 github.com 拉 Firecracker + jailer，仓库里没有任何 S3 取件路径 | 该 issue 落地时若只改 HCL 不改脚本 → 仍走 GitHub，"零 github 请求"验收不成立 |
+| #435 | Firecracker + jailer 取源改为 **S3 优先、github 大声回落**（`_fc_s3_uri()`，并消费模板注入的 `OC_ASSETS_BUCKET`） | 在 HCL 中重写取源 → 漏掉 S3 优先分支，仍走 GitHub，「零 github 请求」验收不成立；且回落变静默，排障时看不出这台走了旧路 |
 
 一致性优先于可读性。如需了解安装内容，阅读 `provision-host.sh` 的 8 节小节标题。
 
@@ -47,7 +44,7 @@ Image Builder 原生提供两项能力，Packer 需自行实现（均已在 HCL 
 |---|---|---|
 | 将 AMI id 写入 SSM 参数 | `CfnDistributionConfiguration.ssm_parameter_configurations` | `post-processor "shell-local"` 调用 `aws ssm put-parameter` |
 | AMI 产出后自动启动验证 | `image_tests_enabled=True` | ❌ **未实现** —— 见下方「未覆盖项」 |
-| validate 阶段断言 | component 的 `validate` phase | 两个 `provisioner "shell"`（零下载检查 + 幂等检查） |
+| validate 阶段断言 | component 的 `validate` phase | 两个 `provisioner "shell"`（组件零安装检查 + 幂等检查） |
 | CFN 依赖顺序 | recipe 与 component 均为 CFN 资源，与 ASG 处于同一依赖图 | ❌ Packer 位于 CFN 之外，依赖流程保证执行顺序 |
 
 Packer 相对提供的能力：本地可执行（无需 AWS 编排即可 `packer build`）、HCL 可读性优于
@@ -80,12 +77,14 @@ packer build -var-file="$PWD/deploy/packer/apse1.pkrvars.hcl" "$PWD/deploy/packe
 
 `apse1.pkrvars.hcl` 中以下两项留空仅适用于 `packer validate`：
 
-- **`iam_instance_profile`** — **当前对 Firecracker 取件不是必填**（#435 未落地）。
-  本节此前写的是"未指定角色时 `provision-host.sh` 无法获取制品，构建将在第 3 步失败
-  （脚本有意未实现公网回落）" —— **实跑否证**：留空构建于 `us-west-2` 退出 0，第 3 步打出
-  `[oc:provision] firecracker v1.15.1 installed`，来源是 github.com。
-  `deployment/binaries/firecracker/` 前缀与对应 IAM 授权要等 #435 落地后才有人读；
-  在那之前给这个角色不会改变镜像内容。
+- **`iam_instance_profile`** — **必填，留空构建会失败**（#435 已落地）。
+  `provision-host.sh` 的 `_fc_s3_uri()` 先试 `deployment/binaries/firecracker/` 前缀，
+  所以这个角色需要该前缀的 `s3:GetObject`。模板给 bake 阶段固定注入
+  `OC_FC_REQUIRE_S3=1`，因此 S3 取不到时 provision **直接 die**，不回落 github.com。
+  留空 = 构建实例无角色 = AccessDenied = **构建红**。
+  这是刻意选的：回落会让「零 github 请求」这项验收永远通过、掩盖真实依赖，把假绿换成
+  明确失败更有用。走对了的判据是构建日志里的
+  `firecracker <ver> tarball from S3: s3://…` 与 `tarball sha256 verified: …`。
 - **`ssm_parameter`** — 未指定时仅产出 AMI 而不发布指针，`ha_edge.py:661` 的
   `resolve_ssm_parameter_at_launch` 无法读取到新镜像。首次构建建议留空，确认镜像无
   问题后再发布。

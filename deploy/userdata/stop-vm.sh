@@ -48,19 +48,56 @@ publish_stop_intent() {
   STOP_INTENT_PUBLISHED=1
 }
 
+# ⑰ codex 独立复审第十轮 —— 判"这个进程是不是 Firecracker"必须用 /proc/<pid>/comm,
+# 不能用 exe 的 basename。
+#
+# 实测(Linux 容器):二进制被替换或删除后,`readlink /proc/<pid>/exe` 返回
+# `/path/firecracker (deleted)`,于是 `${exe##*/}` 变成 `firecracker (deleted)` ——
+# 与 "firecracker" 不等,判据漏判。而滚动升级换镜像正是这个场景:进程还在跑,它的
+# 二进制已经被换掉。
+# 漏判的后果按调用点分两种,都很硬:
+#   · 本脚本的孤儿扫描漏掉一个【活着的】孤儿 → 报告"已停" → 调用方释放 ps_<n> →
+#     下一个租户被排到活 VM 上(跨租户);
+#   · 探测函数漏判 fc_alive → 强制删除以为"VM 已停"而放行。
+# comm 恒为进程名本身(不含路径、不带 deleted 后缀),截断到 15 字符 ——
+# "firecracker" 11 字符,安全。
+# 判据仍然是【两条】:comm + 完整的 `--api-sock <本租户目录>/fc.sock`。单靠 comm 会命中
+# 别的租户的 Firecracker。
+_oc_is_firecracker() {
+  [ "$(cat "/proc/$1/comm" 2>/dev/null)" = "firecracker" ]
+}
+
+# 本批次新加的孤儿扫描路径,发信号前要逐个复验身份 —— pid 空间会绕回,而 TERM 与 KILL
+# 之间还有 sleep,复用之后 kill 打中的可能是另一个租户的 VM(no-cross-tenant)。
+# 判据必须与扫描时【完全相同】:comm 是 firecracker + cmdline 精确含本租户的 api-sock。
+# 抽成顶层而不是内嵌一份副本:两份副本就有两处会漂,而"复验判据与扫描判据一致"恰恰是
+# 它唯一要紧的性质。
+#
+# 只服务【孤儿路径】。legacy 锁那条路刻意保持 bb 基线原样(见下方 kill 处的说明)——
+_oc_is_our_fc() {
+  local _p="/proc/$1" _cmd
+  [ -d "${_p}" ] || return 1
+  _oc_is_firecracker "$1" || return 1
+  [ -r "${_p}/cmdline" ] || return 1
+  _cmd="$(tr '\0' ' ' < "${_p}/cmdline" 2>/dev/null)" || return 1
+  case "${_cmd}" in
+    *"--api-sock ${VM_DIR}/fc.sock"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Before this MR, Firecracker inherited fd9 from launch-vm.sh and retained the
 # lifecycle flock for its entire lifetime. A script-only rollout therefore
 # deadlocks every stop of an already-running VM. Identify that legacy state by
 # both the exact tenant API socket and the lock inode; a command-line match alone
 # is not enough to authorize killing a process.
 find_legacy_firecracker_lock_holders() {
-  local lock_identity proc pid executable cmdline fd fd_identity
+  local lock_identity proc pid cmdline fd fd_identity
   lock_identity="$(stat -Lc '%d:%i' "${LOCK_PATH}" 2>/dev/null)" || return 1
   LEGACY_FIRECRACKER_PIDS=()
 
   for proc in /proc/[0-9]*; do
-    executable="$(readlink -f "${proc}/exe" 2>/dev/null)" || continue
-    [ "${executable##*/}" = "firecracker" ] || continue
+    _oc_is_firecracker "${proc##*/}" || continue
     [ -r "${proc}/cmdline" ] || continue
     cmdline="$(tr '\0' ' ' < "${proc}/cmdline" 2>/dev/null)" || continue
     case "${cmdline}" in
@@ -93,6 +130,19 @@ if ! flock -w 2 9; then
     curl -sf --max-time 2 --unix-socket "${VM_DIR}/fc.sock" -X PUT http://localhost/actions \
       -H 'Content-Type: application/json' -d '{"action_type":"SendCtrlAltDel"}' 2>/dev/null || true
     sleep 2
+    # ⚠ 这里【故意保持 bb 基线原样】,不加发信号前的身份复验。
+    #
+    # codex 第二十五轮在这条 legacy 路径上抓出一个真缺陷:上面那次 SendCtrlAltDel 的目的
+    # 就是让 Firecracker 退出,所以"pid 在这 3 秒里已经不是它了"是预期路径而不是边缘情况;
+    # 而 `kill -0` 只查"存在"、查不出"还是不是同一个进程",pid 复用时会打中别人的 VM
+    # (no-cross-tenant)。
+    #
+    # bb 基线(aa18bd8f)上就已存在,是 fd9 继承那次滚动升级的兼容机制,本批次从未改动它的
+    # 逻辑。按项目规则 2「只改必须改的,只清理自己的烂摊子」,它该单独开 issue 修,而不是
+    # 顺手混进一个 P0 + 命中 IaC 安全红线的分支里 —— 那会让最后签 merge 的人分不清哪些是
+    #
+    # 已修的是【本批次自己引入】的那条孤儿路径(下方 ORPHAN_PIDS 那段),它有完整复验。
+    # 判据不是"缺陷有多严重",而是"这段代码是不是本批次引入或改动的"。
     kill -TERM "${LEGACY_FIRECRACKER_PIDS[@]}" 2>/dev/null || true
     sleep 1
     for _pid in "${LEGACY_FIRECRACKER_PIDS[@]}"; do
@@ -117,7 +167,74 @@ fi
 if [ -d "${VM_DIR}" ]; then
   [ "${STOP_INTENT_PUBLISHED}" -eq 1 ] || publish_stop_intent
 else
-  log "VM directory absent; nothing to stop"
+  #
+  # 这里原先是 `log "VM directory absent; nothing to stop"; exit 0` —— 目录没了就
+  # 报告"已停"。那是错的:Linux 上 `rm -rf` 掉目录【不会】杀死持有那些文件描述符的
+  # Firecracker,所以"目录不在"与"进程已停"是两件事。而本脚本的返回值被两个地方当作
+  # 【权威停机证明】用:
+  #   · tenant_service 的强制删除快路径(第五轮加的,CAS 前的确认)。
+  # 两处拿到的都是"确认已停",随后释放 ps_<n> / 扣账本 —— 而 VM 还在跑。第五轮那次修复
+  # 因此对它要针对的那一格(盘已删 + FC 还活着)是**空转**:上面那段 legacy kill 只在
+  # `! flock -w 2 9`(锁被别人持着)时才走,而孤儿 FC 并不持有生命周期锁。
+  #
+  # 能杀:Firecracker 的 cmdline 里那串 `--api-sock ${VM_DIR}/fc.sock` 在目录被删后
+  # 【仍然存在】(cmdline 是进程自己的内存,不随文件系统变),所以按它扫 /proc 就能精确
+  # 定位。判据用完整的 `--api-sock <本租户目录>/fc.sock` 而不是租户名子串 —— 后者会被
+  # 前缀相同的另一个租户名匹配上(t-1 匹配 t-10),那就是跨租户误杀。
+  log "VM directory absent; scanning for an orphaned Firecracker before declaring it stopped"
+  ORPHAN_PIDS=()
+  for proc in /proc/[0-9]*; do
+    _oc_is_firecracker "${proc##*/}" || continue
+    [ -r "${proc}/cmdline" ] || continue
+    cmdline="$(tr '\0' ' ' < "${proc}/cmdline" 2>/dev/null)" || continue
+    case "${cmdline}" in
+      *"--api-sock ${VM_DIR}/fc.sock"*) ORPHAN_PIDS+=("${proc##*/}") ;;
+      *) continue ;;
+    esac
+  done
+  if [ "${#ORPHAN_PIDS[@]}" -eq 0 ]; then
+    log "no orphaned Firecracker for ${TENANT_ID}; nothing to stop"
+    exit 0
+  fi
+  log "orphaned Firecracker still running for ${TENANT_ID} (disk already reclaimed); pid(s): ${ORPHAN_PIDS[*]}"
+  # 每次发信号【之前】重验身份(codex 独立复审第七轮)。`kill -0` 只证明"某个进程还在",
+  # 不证明【还是同一个】—— 从扫描到 TERM、再到 2 秒后的 KILL,原进程可能已退出而它的
+  # pid 被系统回收给了另一个进程。那时 KILL 打的是一个无关进程(可能是同 host 上别的
+  # 租户的 Firecracker,甚至是 host 自己的守护进程)。pid 空间会绕回,这不是理论风险。
+  # 判据用与扫描时【完全相同】的两条:exe 名为 firecracker + cmdline 含本租户的
+  # `--api-sock <VM_DIR>/fc.sock`。身份变了就跳过,不发信号。
+  # ㉚ 判据已抽到顶层 _oc_is_our_fc(与 legacy 路径共用同一份代码)。
+  # 原来这里是一个内嵌的同名函数副本 —— 两份副本就有两处会漂,而"复验判据必须与扫描
+  # 判据完全相同"恰恰是它唯一要紧的性质。
+  for _pid in "${ORPHAN_PIDS[@]}"; do
+    if _oc_is_our_fc "${_pid}"; then
+      kill -TERM "${_pid}" 2>/dev/null || true
+    else
+      log "pid ${_pid} is no longer our orphan (exited / pid reused) — not signalling"
+    fi
+  done
+  sleep 2
+  for _pid in "${ORPHAN_PIDS[@]}"; do
+    if _oc_is_our_fc "${_pid}"; then
+      kill -KILL "${_pid}" 2>/dev/null || true
+    fi
+  done
+  sleep 1
+  # 复检:必须**再扫一遍**确认没有匹配的进程活着,而不是"发过 KILL 就算完"。
+  # 发信号成功 ≠ 进程已消失(D 状态、正在落盘的 KILL 都可能还在),而调用方拿这个
+  # 返回码去释放槽位/扣账本,fail-closed 才安全:还剩就非零退出,调用方不释放、可重试。
+  for proc in /proc/[0-9]*; do
+    _oc_is_firecracker "${proc##*/}" || continue
+    [ -r "${proc}/cmdline" ] || continue
+    cmdline="$(tr '\0' ' ' < "${proc}/cmdline" 2>/dev/null)" || continue
+    case "${cmdline}" in
+      *"--api-sock ${VM_DIR}/fc.sock"*)
+        log "FATAL: orphaned Firecracker ${proc##*/} survived TERM+KILL — NOT reporting stopped"
+        exit 1
+        ;;
+    esac
+  done
+  log "orphaned Firecracker terminated and confirmed gone for ${TENANT_ID}"
   exit 0
 fi
 

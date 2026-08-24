@@ -130,3 +130,52 @@ def mem_ok(
         return True
     floor_mb = int(total_mb * float(floor_ratio))
     return (avail_mb - max(0, int(needed_mb))) >= floor_mb
+
+
+def _iso_epoch(s: Any) -> Optional[int]:
+    """把 ISO8601 UTC 时间戳解析成 epoch 秒;容忍 'Z' 与 '+00:00' 两种渲染;
+    无 tz 视为 UTC;解析失败或空 → None。"""
+    if not s:
+        return None
+    try:
+        from datetime import datetime, timezone
+
+        dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _seen_epoch(h: Dict[str, Any]) -> Optional[int]:
+    """host 最新一次被听到的时刻:取 last_seen / last_health_check 里最新(freshest)的那个;
+    两者都缺或都不可解析 → None。"""
+    best = None
+    for key in ("last_seen", "last_health_check"):
+        e = _iso_epoch(h.get(key))
+        if e is not None and (best is None or e > best):
+            best = e
+    return best
+
+
+def seen_fresh(h: Dict[str, Any], stale_sec: int, now_epoch: int) -> bool:
+    """host 心跳新鲜度门(#549):True=可放置(含所有 fail-open 情形);False=【有据可查地】
+    陈旧,不接新租户。只挡放置、不改 status,心跳恢复即自动放行(纯选点过滤,可逆)。
+
+    三段(与 disk/mem 软门同族,但阻断方向相反——这里陈旧就是要抓的目标):
+      - 门关(stale_sec<=0)                                      -> True
+      - 无信号(last_seen/last_health_check 缺失或不可解析)        -> True  刚注册未心跳/未知格式,
+                                                                   绝不因缺信号把机队整批挡出调度
+      - 有信号且 now - seen > stale_sec                          -> False 唯一阻断分支
+    未来时间戳(seen>now → age 为负)天然落进 True,防时钟抖动误判。
+
+    独立于 SSM:#52 的 demote_stale_hosts 需 SSM 也不在线才降级,而"进程活着、SSM Online、
+    boto3 绑死 None"的黑洞机命中 skipped_ssm_ok 永不降级(#549)。本门只看 host 自己的心跳
+    时间,不依赖 SSM / 租户状态 / watchdog。"""
+    if stale_sec <= 0:
+        return True
+    seen = _seen_epoch(h)
+    if seen is None:
+        return True
+    return (now_epoch - seen) <= stale_sec

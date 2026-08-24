@@ -2,7 +2,6 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 #
-# harden-config.sh — POSIX sh 幂等 openclaw.json 收敛函数(#41 的抽取)。
 #
 # 问题:launch-vm.sh 老版本把 controlUi.allowedOrigins / dangerouslyDisableDeviceAuth /
 # chatCompletions / LiteLLM baseUrl / apiKey 收敛写进 `NEW_DATA=true` 分支——
@@ -39,7 +38,7 @@
 #     shared key 兜底覆盖数据盘上的 per-tenant vkey——那会坏计费拆分)
 #
 # fail-loud:jq exit 非零、或输出空,一律不 clobber 原 openclaw.json,return 1。
-# 静默吞过一次异常就是事故(踩过——见 the ops guide 血泪教训)。
+# 静默吞过一次异常就是事故(踩过——见 CLAUDE.md 血泪教训)。
 oc_harden_config() {
   __hc_oc="$1"
   __hc_origin="$2"
@@ -56,7 +55,7 @@ oc_harden_config() {
   # 起手 `.` 是 identity(拿到原 JSON 不变),后面每个 `|` 是纯变换。
   __hc_prog='.'
   __hc_prog="${__hc_prog} | del(.gateway.controlUi.dangerouslyDisableDeviceAuth)"
-  # the data-plane design(the data-plane design doc §A):
+  # 11-ENGINE-TRANSFORM(SPEC/11-ENGINE-TRANSFORM/02-DEV-PLAN.md §A):
   # 数据面转两级路由后 controlUi 必须关。无条件设 false,防有人在数据盘塞回 true,
   # 与 dangerouslyDisableDeviceAuth 同段(每次唤醒都收敛,不假设 NEW_DATA 时清过就够)。
   __hc_prog="${__hc_prog} | .gateway.controlUi.enabled = false"
@@ -110,7 +109,6 @@ oc_harden_config() {
 # R15.1(N4 病根):旧版无 scheme 一律硬拼 `http://%s:4000/v1`,HTTPS 网关(如客户
 # 自建 TLS LiteLLM,443/无端口)被拼成 http://gw:4000/v1 必失败、"调试很久"。改为从
 # 可配 env 派生:LITELLM_SCHEME(默认 http)、LITELLM_PORT(默认 4000,空=不带端口)、
-# LITELLM_PATH(默认 /v1)。这些 env 走 platform.env 冷注入、随重建继承(铁律#3)。
 # 防双拼(http://http://IP...)语义保留:输入已含 scheme 原样返回,绝不二次拼。
 oc_normalize_litellm_baseurl() {
   __hc_h="$1"
@@ -181,7 +179,6 @@ oc_inject_config_from_plan() {
           return 1
         fi
       elif [ "${__ic_scheme}" = "asymmetric-v1" ]; then
-        # #149 方案B — RSA-4096 OAEP-SHA256 via KMS asymmetric CMK(与 cred-inject 同源)。
         # 无 EncryptionContext(KMS 非对称 Decrypt 不支持,verified ValidationException);
         # 租户绑定 = frozen plan(field↔target)+ 信封 key_id。value_ref 是完整 enc:v1:
         # 信封,取末段(base64 密文体)KMS-decrypt。
@@ -238,9 +235,12 @@ oc_inject_config_from_plan() {
       fi
     fi
 
-    # jq 幂等写入 dot-path
+    # jq 幂等写入 dot-path。target 只作为 --arg 数据传入,split 后得到 key array,
+    # setpath 不把连字符/数字段当 jq 源码(`claw-channel` 不再被解析成减法)。
     __ic_tmp="${__ic_oc}.inject.$$"
-    if ! jq --arg val "${__ic_plain}" ".${__ic_target} = \$val" "${__ic_oc}" > "${__ic_tmp}" 2>/dev/null; then
+    if ! jq --arg target "${__ic_target}" --arg val "${__ic_plain}" \
+        'setpath(($target | split(".")); $val)' \
+        "${__ic_oc}" > "${__ic_tmp}" 2>/dev/null; then
       echo "[oc:harden] FATAL: jq failed setting .${__ic_target}" >&2
       rm -f "${__ic_tmp}"
       return 1
@@ -267,5 +267,111 @@ IC_EOF
          "(未注入的 apiKey/baseUrl 占位仍在 → 该租户 LLM 调用会 401/连不上,补 llm_key/" \
          "llm_base_url 或平台 shared vkey 后即恢复;VM 照常起,不 abort)" >&2
   fi
+  return 0
+}
+
+# oc_assemble_config <current_json> <template_json> <output_json>
+#                    <frozen_plan_json> <credentials_json>
+#                    <scheme> <owner_id> <region>
+#                    <cf_origin> <litellm_baseurl> <shared_vkey> <chat_enabled>
+#                    [rsa_key_id]
+#
+# One implementation serves both callers:
+#   · pre-rebuild probe:current={} + placeholder disk credentials;
+#   · launch commit:current=mounted data-disk config + real disk credentials.
+#
+# The target template may only replace platform-managed top-level bodies. Unknown
+# customer-owned top-level keys survive. Injection and hardening then run in the
+# same order for probe and boot. Finally non-empty disk credentials are restored,
+# so target body/fallbacks can never overwrite gateway.auth.token or a tenant vkey.
+oc_assemble_config() {
+  __ac_current="$1"
+  __ac_template="$2"
+  __ac_output="$3"
+  __ac_plan="$4"
+  __ac_creds="$5"
+  __ac_scheme="$6"
+  __ac_owner="$7"
+  __ac_region="$8"
+  __ac_origin="$9"
+  shift 9
+  __ac_baseurl="$1"
+  __ac_shared_vkey="$2"
+  __ac_chat="$3"
+  __ac_rsa="${4:-}"
+
+  [ -f "${__ac_current}" ] || return 1
+  [ -f "${__ac_template}" ] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+
+  __ac_tmp="${__ac_output}.assemble.$$"
+  __ac_final="${__ac_output}.final.$$"
+  rm -f "${__ac_tmp}" "${__ac_final}"
+  if ! jq -s '
+      def managed:
+        ["agents", "gateway", "models", "plugins", "tools", "mcp",
+         "channels", "commands", "messages", "session", "browser",
+         "hooks", "skills"];
+      .[0] as $current
+      | .[1] as $template
+      | if ($current | type) != "object" or ($template | type) != "object"
+        then error("openclaw config/template must be objects")
+        else reduce managed[] as $key
+          ($current; if ($template | has($key))
+                     then setpath(
+                       [$key];
+                       if (($current[$key] | type) == "object"
+                           and ($template[$key] | type) == "object")
+                       then ($current[$key] * $template[$key])
+                       else $template[$key]
+                       end)
+                     else . end)
+        end
+    ' "${__ac_current}" "${__ac_template}" > "${__ac_tmp}" 2>/dev/null; then
+    echo "[oc:harden] FATAL: template whitelist merge failed" >&2
+    rm -f "${__ac_tmp}" "${__ac_final}"
+    return 1
+  fi
+  [ -s "${__ac_tmp}" ] || {
+    rm -f "${__ac_tmp}" "${__ac_final}"
+    return 1
+  }
+
+  if [ -n "${__ac_plan}" ]; then
+    if ! oc_inject_config_from_plan \
+        "${__ac_tmp}" "${__ac_plan}" "${__ac_scheme}" "${__ac_owner}" \
+        "${__ac_region}" "${__ac_shared_vkey}" "${__ac_rsa}"; then
+      rm -f "${__ac_tmp}" "${__ac_final}"
+      return 1
+    fi
+  fi
+
+  __ac_vkey="$(printf '%s' "${__ac_creds}" | jq -r '.litellm_vkey // ""' 2>/dev/null || true)"
+  __ac_token="$(printf '%s' "${__ac_creds}" | jq -r '.gateway_token // ""' 2>/dev/null || true)"
+  if ! oc_harden_config \
+      "${__ac_tmp}" "${__ac_origin}" "${__ac_baseurl}" "${__ac_vkey}" \
+      "${__ac_chat}"; then
+    rm -f "${__ac_tmp}" "${__ac_final}"
+    return 1
+  fi
+
+  if ! jq --arg token "${__ac_token}" --arg vkey "${__ac_vkey}" '
+      (if $token != ""
+       then setpath(["gateway", "auth", "token"]; $token)
+       else . end)
+      | (if $vkey != ""
+         then setpath(["models", "providers", "litellm", "apiKey"]; $vkey)
+         else . end)
+    ' "${__ac_tmp}" > "${__ac_final}" 2>/dev/null; then
+    echo "[oc:harden] FATAL: credential preservation failed" >&2
+    rm -f "${__ac_tmp}" "${__ac_final}"
+    return 1
+  fi
+  [ -s "${__ac_final}" ] || {
+    rm -f "${__ac_tmp}" "${__ac_final}"
+    return 1
+  }
+  mv -f "${__ac_final}" "${__ac_output}"
+  rm -f "${__ac_tmp}"
   return 0
 }

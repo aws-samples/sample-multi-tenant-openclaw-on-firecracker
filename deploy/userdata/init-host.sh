@@ -188,6 +188,48 @@ chmod 644 "${_OC_KEY_INSTANCE_FILE}"
 ARCH="$(uname -m)"
 # Kept here (not only in provision) because step3b derives the guest-kernel path from it.
 FC_VER="${FC_VERSION:-v1.15.1}"
+# guest kernel 文件名按架构区分:x86_64 用 -no-acpi 变体(无 ACPI,x86 microVM 启动更快);
+# aarch64 该后缀的对象不存在(实测 404 → curl -f exit 22 → init ABANDON,metal 永远起不来),
+# arm64 用标准 vmlinux-5.10.245(实测 firecracker-ci/<ver>/aarch64/ 下真实存在)。
+# 解析在这里而不在 step3b:下面那条 parity 断言要用它,而 step3b 太晚 —— 到那时
+# host key 已生成、platform.env 已写、数据盘已挂,带着不确定的内核走完这些没有意义。
+# 全脚本【只有这一处】定义 VMLINUX_NAME,scripts/checks/host-pin-parity.py 依赖这一点
+# (它要求该写法在本文件里恰好命中一次,出现第二份直接拒过)。
+if [ "${ARCH}" = "aarch64" ]; then VMLINUX_NAME="vmlinux-5.10.245"; else VMLINUX_NAME="vmlinux-5.10.245-no-acpi"; fi
+# #523 判据 1 — boot-time parity 断言。
+#
+# marker 记的是【烤这张 AMI 时】装进去的版本,上面两个常量是【本次开机】要用的版本。
+# 两者不符时的表现不是报错:step3b 有 baked 副本就优先用它(见下方
+# /opt/openclaw/baked/vmlinux 分支),于是**静默采用镜像里那个**。后果是机队混着两个
+# 内核 / 两个 Firecracker 在跑,而 create / rebuild / restart 全部经 launch-vm.sh 使用
+# 同一个 ${ASSETS}/vmlinux —— 同一租户在不同 host 上被重建,拿到的内核可能不同。
+# 数据一直都在 marker 里(provision-host.sh §8 自第一版就写 firecracker_version /
+# guest_kernel),之前只是从没有人比过:旧代码只把 marker 整行打进日志。
+#
+# 为什么 fail-loud 而不是 WARN:这台 host 起来就会承载租户。ABANDON 一台机器的代价是
+# ASG 换机 + console 里一行明确原因;带着不确定的内核跑租户的代价是跨 host 行为不一致
+# 缺字段同样拒:字段缺失等于"无法证明",与"证明为不符"在风险上同档。marker 从未有过
+# 不带这两个字段的版本(git f890b0f7 起就有),所以这一档在真实 AMI 上没有代价。
+#
+# 与 merge 期那道 CI 门(scripts/checks/host-pin-parity.py)是两个不同时刻,不互相替代:
+# CI 门抓"只改了一处 pin",本断言抓"两处都改了但没重烤 AMI"—— 后者代码自洽,只有真机
+# 上 marker 与常量不符,唯有开机时能发现。
+# plain-AMI 路径也走这条断言:那条路 provision 刚在上面 inline 跑过并写了 marker,
+# 正常情况恒等成立;不成立就说明这台机器上跑的 init-host.sh 与它内联的 provision 已经
+# 漂了(例如 S3 上的对象被手改过),那同样必须停下。
+if [ -f /etc/openclaw/.ami-provisioned ]; then
+  _oc_mk_fc="$(sed -n 's/^firecracker_version=//p' /etc/openclaw/.ami-provisioned | head -1)"
+  _oc_mk_kernel="$(sed -n 's/^guest_kernel=//p' /etc/openclaw/.ami-provisioned | head -1)"
+  if [ -z "${_oc_mk_fc}" ] || [ -z "${_oc_mk_kernel}" ]; then
+    echo "[oc:init] FATAL: provision marker 缺版本字段(firecracker_version='${_oc_mk_fc}' guest_kernel='${_oc_mk_kernel}')— 无法证明本机内核/FC 与 pin 一致,拒绝承载租户" > /dev/console
+    exit 1
+  fi
+  if [ "${_oc_mk_fc}" != "${FC_VER}" ] || [ "${_oc_mk_kernel}" != "${VMLINUX_NAME}" ]; then
+    echo "[oc:init] FATAL: AMI/pin 版本分叉 — marker(烤制时)firecracker=${_oc_mk_fc} guest_kernel=${_oc_mk_kernel};本次开机 pin firecracker=${FC_VER} guest_kernel=${VMLINUX_NAME}。改 pin 后必须重烤 golden AMI,否则 golden 机队静默继续跑旧版本(混版机队)。拒绝启动。" > /dev/console
+    exit 1
+  fi
+  log "boot parity ok: marker firecracker=${_oc_mk_fc} guest_kernel=${_oc_mk_kernel} 与本次开机 pin 一致"
+fi
 command -v aws >/dev/null 2>&1 || { echo "[oc:init] FATAL: awscli absent after provision" > /dev/console; exit 1; }
 [ -x /usr/local/bin/firecracker ] || { echo "[oc:init] FATAL: firecracker absent after provision" > /dev/console; exit 1; }
 log "components ready: $(aws --version 2>&1 | head -1) / $(/usr/local/bin/firecracker --version 2>/dev/null | head -1)"
@@ -237,11 +279,23 @@ log "buckets: assets=${ASSETS_BUCKET} backup=${BACKUP_BUCKET}"
 # shared vkey until launch-vm.sh:1273 later tightens it. `install` sets the mode at creation, so
 # there is no readable window. Nothing depends on 0644: launch-vm already makes 0600 the steady state.
 install -m 0600 /dev/null /etc/platform.env
+
+#
+# 个参数是 S3 前缀,不传时它 source 本文件取默认。此前这个变量从没写进来过 —— CDK 只
+# 把它注入了各 Lambda,host 侧无从得知;默认值恰好也是 backups 所以一直没暴露。config
+# 一改成非默认前缀,host 本地备份就传到 backups/ 下,而恢复 / AZ failover 去【配置的】
+# 前缀找:备份明明存在却找不到,且 last_backup_at 照样推进 → 静默的不可恢复。
+# R7 让 host 成为定时备份的唯一执行者,这个洞从"偶发错位"变成常态。
+#
+# 注意本 heredoc 【不带引号】,内容会被 shell 做参数替换 —— 所以说明文字放在这里而不是
+# 块内:块内写 ${...} 之类会被真的展开掉(我第一版就这么踩过)。
 cat > /etc/platform.env << ENVEOF
 OC_REGION=${REGION}
 ASSETS_BUCKET=${ASSETS_BUCKET}
 BACKUP_BUCKET=${BACKUP_BUCKET}
 BACKUP_CMK_KEY_ID=${BACKUP_CMK_KEY_ID}
+BACKUP_PREFIX={{BACKUP_PREFIX}}
+OC_BACKUP_INTERVAL_HOURS={{OC_BACKUP_INTERVAL_HOURS}}
 TENANTS_TABLE=${TENANTS_TABLE}
 TENANT_SECRETS_TABLE=openclaw-tenant-secrets
 HOSTS_TABLE=${HOSTS_TABLE}
@@ -259,6 +313,8 @@ BALLOON_FREE_PAGE_REPORTING={{BALLOON_FREE_PAGE_REPORTING}}
 BALLOON_MAX_INFLATE_RATIO={{BALLOON_MAX_INFLATE_RATIO}}
 BALLOON_MIN_GUEST_AVAILABLE_MB={{BALLOON_MIN_GUEST_AVAILABLE_MB}}
 EGRESS_ALLOWLIST_ENABLED={{EGRESS_ALLOWLIST_ENABLED}}
+EGRESS_MODE={{EGRESS_MODE}}
+EGRESS_DENY_RFC1918={{EGRESS_DENY_RFC1918}}
 EGRESS_INCLUDE_VPC_CIDR={{EGRESS_INCLUDE_VPC_CIDR}}
 EGRESS_VPC_CIDR={{EGRESS_VPC_CIDR}}
 EGRESS_ALLOWLIST_CIDRS={{EGRESS_ALLOWLIST_CIDRS}}
@@ -347,6 +403,73 @@ if [ -f /home/ubuntu/setup-egress-allowlist.sh ]; then
   bash /home/ubuntu/setup-egress-allowlist.sh || log "WARN: setup-egress-allowlist.sh returned non-zero (egress allowlist degraded)"
 else
   log "WARN: setup-egress-allowlist.sh not downloaded — egress allowlist skipped (host-agent still starts)"
+fi
+
+# ── #566 guest 出网 default-deny 白名单基线(host 级 tap 共享链 OPENCLAW-EGRESS)──
+# EGRESS_MODE=off(默认)→ 整段跳过,host 零变化。deny → 拉 oc-egress-chain.sh +
+# oc-egress-sim.py 到 /home/ubuntu,派生 allow 洞输入,apply 一条 host 级共享链。
+# 决策/规则序见 ADR guest-egress-default-deny-whitelist;永不触碰租户数据面 DNAT。
+if [ "${EGRESS_MODE:-off}" = "deny" ]; then
+  log "step: #566 egress default-deny 开启,准备 host 级 tap 共享链"
+  for _f in oc-egress-chain.sh oc-egress-sim.py; do
+    aws s3 cp "s3://${ASSETS_BUCKET}/deployment/scripts/${_f}" "/home/ubuntu/${_f}" --region ${REGION} --no-progress 2>/dev/null \
+      || _s3_get "s3://${ASSETS_BUCKET}/deployment/scripts/${_f}" "/home/ubuntu/${_f}" || true
+  done
+  chmod +x /home/ubuntu/oc-egress-chain.sh 2>/dev/null || true
+  if [ ! -s /home/ubuntu/oc-egress-chain.sh ] || [ ! -s /home/ubuntu/oc-egress-sim.py ]; then
+    # fail-open:拉不到脚本不阻断 host(host-agent 仍起),但出网退回现状放行 → 告警落痕。
+    log "WARN(#566): oc-egress-chain.sh/oc-egress-sim.py 未下全,egress default-deny 跳过(退回放行);host 视作 degraded"
+  else
+    # 派生 allow 洞:LITELLM_HOST 是 URL(https://host/v1 或 http://ip:4000),egress-sim 需要
+    # 【裸 IP + 端口】。解析:scheme→默认端口(https 443 / http 80),显式 :port 覆盖;host 解析成
+    # IP;若该 IP 不在本环境 VPC CIDR(= 公网网关,如外部 CloudFront)→ 不开内网洞,靠末尾 RETURN
+    # 走公网放行即可(避免给公网 IP 开一条无意义的内网 allow)。解析失败 → 留空(egress-sim 会
+    # 因缺 LITELLM_HOST 而不加该洞,canary 会抓到 LLM 不通,不静默)。绝不写死网段。
+    _LLM_IP=""; _LLM_PORT="4000"
+    if [ -n "${LITELLM_HOST:-}" ] && [ -n "${EGRESS_VPC_CIDR:-}" ]; then
+      _LLM_DERIVED=$(LITELLM_HOST="${LITELLM_HOST}" EGRESS_VPC_CIDR="${EGRESS_VPC_CIDR}" python3 - <<'PYEOF'
+import ipaddress, os, socket, sys
+from urllib.parse import urlparse
+raw = os.environ.get("LITELLM_HOST", "").strip()
+cidr = os.environ.get("EGRESS_VPC_CIDR", "").strip()
+if not raw:
+    sys.exit(0)
+# 允许「host」「host:port」「scheme://host[:port]/path」三种写法
+u = urlparse(raw if "://" in raw else "//" + raw, scheme="")
+host = u.hostname or ""
+port = u.port
+scheme = (u.scheme or "").lower()
+if not port:
+    port = 443 if scheme == "https" else (80 if scheme == "http" else 4000)
+if not host:
+    sys.exit(0)
+try:
+    ip = socket.gethostbyname(host)          # DNS 名或 IP 都能解析
+except Exception:
+    sys.exit(0)
+try:
+    in_vpc = ipaddress.ip_address(ip) in ipaddress.ip_network(cidr, strict=False)
+except Exception:
+    in_vpc = False
+# 公网网关(不在 VPC)→ 不开内网洞(公网走 RETURN)。内网 → 开 IP:port 洞。
+print(f"{ip if in_vpc else ''}|{port}")
+PYEOF
+) || true
+      _LLM_IP="${_LLM_DERIVED%%|*}"
+      _LLM_PORT="${_LLM_DERIVED##*|}"; [ -n "${_LLM_PORT}" ] || _LLM_PORT="4000"
+    fi
+    # SPIRE server allow 洞:仅 spire-kit 开启且是内网 server 时;缺省留空(sim 不加该洞)。
+    _SPIRE_IP="${SPIRE_SERVER_IP:-}"
+    log "step: #566 egress apply — VPC=${EGRESS_VPC_CIDR:-<empty>} LLM_hole=${_LLM_IP:-<none:public>}:${_LLM_PORT} spire=${_SPIRE_IP:-<none>} deny_rfc1918=${EGRESS_DENY_RFC1918:-false}"
+    if VPC_CIDR="${EGRESS_VPC_CIDR}" LITELLM_HOST="${_LLM_IP}" LITELLM_PORT="${_LLM_PORT}" \
+       SPIRE_SERVER="${_SPIRE_IP}" TAP_IFACE="tap+" DENY_RFC1918="${EGRESS_DENY_RFC1918:-false}" \
+       bash /home/ubuntu/oc-egress-chain.sh apply; then
+      log "step: #566 egress default-deny 已装(OPENCLAW-EGRESS)"
+    else
+      # fail-open:apply 失败不阻断 host（退回放行）；canary/巡检据此判 degraded。
+      log "WARN(#566): oc-egress-chain.sh apply 非零退出,egress default-deny 未生效(退回放行);排查 VPC_CIDR/LLM 洞派生"
+    fi
+  fi
 fi
 
 # Host agent — probes all local VMs, writes health to DynamoDB
@@ -539,10 +662,8 @@ log "step3b: waiting for rootfs in S3..."
 T0=$SECONDS
 ASSETS=/home/ubuntu/firecracker-assets
 FC_MAJOR=$(echo ${FC_VER} | grep -oP "v\d+\.\d+")
-# guest kernel 文件名按架构区分:x86_64 用 -no-acpi 变体(无 ACPI,x86 microVM 启动更快);
-# aarch64 该后缀的对象不存在(实测 404 → curl -f exit 22 → init ABANDON,metal 永远起不来),
-# arm64 用标准 vmlinux-5.10.245(实测 firecracker-ci/<ver>/aarch64/ 下真实存在)。
-if [ "${ARCH}" = "aarch64" ]; then VMLINUX_NAME="vmlinux-5.10.245"; else VMLINUX_NAME="vmlinux-5.10.245-no-acpi"; fi
+# VMLINUX_NAME 在 step2 就解析好了(见那里的 arch 说明 + #523 parity 断言);不在这里
+# 重算,否则同一文件里两份 pin 又会各自漂移 —— 那正是本 issue 要消掉的形状。
 # the kernel cannot be staged there at bake time; it lives on the root volume and is copied
 # across here. This is the download the aarch64 404 killed, so on a golden AMI it is the
 # single most valuable fetch to have already done.
@@ -629,6 +750,28 @@ chmod +x /home/ubuntu/reset-vm.sh && chown ubuntu:ubuntu /home/ubuntu/reset-vm.s
 aws s3 cp s3://${ASSETS_BUCKET}/deployment/scripts/delete-vm.sh /home/ubuntu/delete-vm.sh --region ${REGION} --no-progress 2>/dev/null || \
   _s3_get s3://${ASSETS_BUCKET}/deployment/scripts/delete-vm.sh /home/ubuntu/delete-vm.sh
 chmod +x /home/ubuntu/delete-vm.sh && chown ubuntu:ubuntu /home/ubuntu/delete-vm.sh
+# (控制面每 host 一条聚合 SSM)与它逐租户调用的生命周期围栏。
+# 与上面 delete-vm.sh 同款【硬失败】拉取(不带 `|| true`),而且这两个的缺失后果比
+# delete-vm.sh 更重:
+#   · 缺 delete-all-vms.sh → 聚合命令 exit 127,该 host 上【整批】租户全卡 deleting;
+#   · 缺 lib/lifecycle-guard.sh → 围栏调用非零 → 每个租户判 78 defer 什么都不做。
+#     这个方向是对的(fail-closed,绝不无围栏删盘),但一台缺文件的 host 会让批删永远
+#     (源码有、从未上传 → SSM exit 127 静默失效)对这两个一样成立。
+aws s3 cp s3://${ASSETS_BUCKET}/deployment/scripts/delete-all-vms.sh /home/ubuntu/delete-all-vms.sh --region ${REGION} --no-progress 2>/dev/null || \
+  _s3_get s3://${ASSETS_BUCKET}/deployment/scripts/delete-all-vms.sh /home/ubuntu/delete-all-vms.sh
+chmod +x /home/ubuntu/delete-all-vms.sh && chown ubuntu:ubuntu /home/ubuntu/delete-all-vms.sh
+aws s3 cp s3://${ASSETS_BUCKET}/deployment/scripts/lib/lifecycle-guard.sh /home/ubuntu/lib/lifecycle-guard.sh --region ${REGION} --no-progress 2>/dev/null || \
+  _s3_get s3://${ASSETS_BUCKET}/deployment/scripts/lib/lifecycle-guard.sh /home/ubuntu/lib/lifecycle-guard.sh
+chmod +x /home/ubuntu/lib/lifecycle-guard.sh && chown ubuntu:ubuntu /home/ubuntu/lib/lifecycle-guard.sh
+# 执行者。此前 setup.sh 会把它上传到 S3,但【没有任何一处】把它下载到 host ——
+# tests/test_script_manifest.py::test_script_delivered_to_host[backup-data.sh] 一直在
+# 红,而 R7 让这个缺口从"手动备份偶发 exit 127"升级成功能阻塞:agent 侧的新鲜度检查
+# 是【只读】的(不自装),脚本不在就整轮 fail-closed 拒绝执行;叠上 config.yml.example
+# 默认关掉中心调度(上线顺序要求置 false),一台新 host 就是两侧都不备份。
+# 与 delete-vm.sh 同款【硬失败】拉取:拉不到就让 host 起不来,而不是悄悄少一个文件
+aws s3 cp s3://${ASSETS_BUCKET}/deployment/scripts/backup-data.sh /home/ubuntu/backup-data.sh --region ${REGION} --no-progress 2>/dev/null || \
+  _s3_get s3://${ASSETS_BUCKET}/deployment/scripts/backup-data.sh /home/ubuntu/backup-data.sh
+chmod +x /home/ubuntu/backup-data.sh && chown ubuntu:ubuntu /home/ubuntu/backup-data.sh
 # the matching API hits a missing /home/ubuntu/*.sh and fails exit 127.
 # start-all-vms / stop-all-vms — host-local fan-out for the 1-minute fleet
 # power goal: control plane sends ONE SSM per host, host starts/stops all its

@@ -25,6 +25,7 @@ import json
 import uuid
 
 import core.clients as clients
+import core.create_deadline as create_deadline
 from core.auth import _get_caller_identity
 
 
@@ -35,6 +36,7 @@ def enqueue_lifecycle(
     extra=None,
     before_send=None,
     operation_id=None,
+    deadline_epoch=None,
 ):
     """把一个 lifecycle 操作入 SQS,供 consumer 受控并发消费。返回本次操作的 op_id。
 
@@ -50,6 +52,20 @@ def enqueue_lifecycle(
     queued(进度倒退);更糟的是若那次写入失败,客户已经拿到 202 和 op_id,却在记录里
     找不到这个 op,轮询无从下手。回调抛异常则**不发消息**并向上抛:宁可让调用方收到
     5xx 去重试,也不要发出一条无法被轮询的操作(202 承诺了可轮询)。
+
+    deadline_epoch: 本次操作的**绝对死线**(epoch 秒),#564 G2。带上它,consumer 才能在
+    执行任何动作**之前**判过期(G3)。值必须由调用方用
+    `core.deadline_config.deadline_epoch_for(action, 受理时刻)` 算出,并与它写进**租户行**
+    `<action>_deadline` 的**同一个值** —— 两边各算一次就会出现「消息说 T1、行上写 T2」,
+    而消费侧按消息判、死线执行者按行判,同一次操作会被两个判据分别裁决。create 那条通道
+    (`tenant_service` 的 dispatch 消息)从一开始就是这么做的,注释在那边写着。
+
+    **为什么是可选参数而不是必填**:升级期队列里必然有一批**发出时还没有这个字段**的在飞
+    消息,而 `create_deadline.is_expired()` 的 fail-safe 对缺字段一律返「未过期」——那是刻意
+    的,不许因为缺字段就丢掉客户已受理的操作。所以缺失是一个**合法的过渡态**,不该在这里炸。
+    生产调用点漏传这一条由 `tests/test_564_g2_deadline_chain.py` 的 AST 断言机械兜住
+    (扫本仓所有 `enqueue_lifecycle(` 调用,非测试文件必须带 `deadline_epoch=`)——
+    那比运行时 raise 更早、且不会误伤过渡期的旧消息。
 
     LIFECYCLE_QUEUE_URL 未配 → 返 False,调用方回退同步路径(向后兼容)。
     捎带调用者身份(#56:异步消费不绕过 RBAC),与 _enqueue_batch_job 同款。
@@ -88,6 +104,12 @@ def enqueue_lifecycle(
         },
         "_op_id": operation_id or uuid.uuid4().hex,
     }
+    # #564 G2 — 绝对死线进消息体,供 consumer 消费前判过期(G3)。
+    # 只在拿到值时写这个键:写成 `None` 会让 `is_expired(None, now)` 与"字段不存在"走同一支,
+    # 但**读消息的人分不清**"这条消息没死线"和"这条消息死线是 null" —— 前者是过渡态、
+    # 后者是 bug。不写这个键,缺失就只有一种形态。
+    if deadline_epoch is not None:
+        msg[create_deadline.MSG_DEADLINE_KEY] = int(deadline_epoch)
     kwargs = {"QueueUrl": clients.LIFECYCLE_QUEUE_URL, "MessageBody": json.dumps(msg)}
     # FIFO 队列(.fifo 结尾)需要 group/dedup id;标准队列忽略这俩
     if clients.LIFECYCLE_QUEUE_URL.endswith(".fifo"):

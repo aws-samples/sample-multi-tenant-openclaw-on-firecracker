@@ -239,9 +239,18 @@ def host_script_self_heal(scripts, tag, freshness=None):
             raise ValueError(
                 f"host_script_self_heal: 非法 freshness {freshness!r}"
             )
-        # 这一条刻意写成字面路径:它是"存在但过期"的判据,而不是调用点。
+        # 脚本名经一个 shell 变量转一手,拼出的完整路径不以字面量出现在片段里。
+        # #523:此前这里写的是字面 `{_HOST_SCRIPT_DIR}/{probe_script}`,注释说"它是判据
+        # 不是调用点"所以无妨 —— 那个前提只在【被探的脚本不是被调的脚本】时成立。给
+        # rebuild-vm.sh 自己加过期判据时前提就破了:多处测试用
+        # `argv.index("/home/ubuntu/rebuild-vm.sh")` 定位真实调用点并按位取参
+        # (test_413_lifecycle_fence / test_416_rebuild_repin / test_rebuild_upgrade /
+        # test_456 的 P0 注入面断言),字面量会让它们命中判据、错位取到 `||`。
+        # 存在性判据早就为此走 `"$_HOST_SCRIPT_DIR/$f"` 的变量形式,这里对齐同一写法。
+        # host 侧行为逐字不变:同一个 grep、同一个路径、同一个结果。
         need += (
-            f"grep -q {sentinel} {_HOST_SCRIPT_DIR}/{probe_script} 2>/dev/null "
+            f"_oc_probe={probe_script}; "
+            f'grep -q {sentinel} "{_HOST_SCRIPT_DIR}/$_oc_probe" 2>/dev/null '
             "|| _oc_heal=1; "
         )
     return (
@@ -311,6 +320,32 @@ def _notify_output(cb, result):
         print(f"SSM on_output callback error: {e}")
 
 
+_OUTPUT_PROPAGATION_RETRIES = 6
+_OUTPUT_PROPAGATION_SLEEP_SECONDS = 1.0
+
+
+def _await_command_output(cmd_id, instance_id, last_result):
+    """Status=Success 后 stdout 仍为空时,有界重读 invocation 直到 stdout 非空。
+
+    返回最后一次(或首个非空的)invocation 结果。刻意有界(最多
+    _OUTPUT_PROPAGATION_RETRIES 次):命令【已经】终态成功,这里只等服务端把输出
+    传播上来,绝不无限阻塞、绝不把成功翻成失败。填不满就返回最后一次结果(stdout
+    仍空)—— 上游据此回落 unconfirmed,由 health-check reconciler 事后重取回执收敛。"""
+    result = last_result
+    for _ in range(_OUTPUT_PROPAGATION_RETRIES):
+        time.sleep(_OUTPUT_PROPAGATION_SLEEP_SECONDS)
+        try:
+            result = ssm.get_command_invocation(
+                CommandId=cmd_id, InstanceId=instance_id
+            )
+        except Exception as e:  # noqa: BLE001 — 重读失败就用上一次结果,不改成败判定
+            print(f"SSM output re-read error {cmd_id}: {e}")
+            break
+        if (result.get("StandardOutputContent") or "").strip():
+            break
+    return result
+
+
 def _ssm_run(
     instance_id,
     command,
@@ -371,8 +406,26 @@ def _ssm_run(
                 on_command_id(cmd_id)
             except Exception as e:  # noqa: BLE001 — never fail the run for telemetry
                 print(f"SSM on_command_id callback error: {e}")
+        # #565 G1 —— `timeout` 必须是**墙钟预算**,不是轮数。
+        #
+        # 原来是 `for _ in range(timeout // 2)`,即轮数上限;它等于墙钟上界只在「每轮恰好
+        # 2s」这个隐含假设下成立。**#573 打破了那个假设**:它给 `core/clients.ssm` 加了
+        # `retries={"max_attempts": 8, "mode": "adaptive"}`(防 SendCommand 节流毒 DLQ,
+        # 那件事本身是对的)。于是单次 `get_command_invocation` 被节流时最坏要等 7 次重试的
+        # 指数退避 —— botocore `ExponentialBackoff` 的 `_MAX_BACKOFF=20`、基数 2,实测退避
+        # 总和上界 `1+2+4+8+16+20+20 = 71s`,adaptive 的客户端 token-bucket 限速还在这之上。
+        # 一轮就可能 73s,`timeout=300` 的 150 轮理论上界约 11000s。
+        #
+        # 这条对 #565 G1 是前提性的:G1 要求「执行段必须 ≥ 该操作最坏 SSM 耗时」,而**没有
+        # 真实墙钟上界就没有可算的执行段**。对调用方则是正确性问题 —— 谁按 `timeout` 当上界
+        # 排预算,都会在它超出时留下「上层已判死、host 侧还在跑」的孤儿(#562 §2.2 那条)。
+        #
+        # deadline 检查放在**发下一次 API 调用之前**:超预算就不再发新请求。净上界 =
+        # `timeout` + 最后那次调用自身耗时(最坏 ~71s 退避)。
+        # `time.monotonic()` 而非 `time.time()`:后者会被 NTP 校正拖动。
+        deadline = time.monotonic() + timeout
         time.sleep(3)  # Wait for invocation to register
-        for _ in range(timeout // 2):
+        while time.monotonic() < deadline:
             try:
                 result = ssm.get_command_invocation(
                     CommandId=cmd_id,
@@ -380,6 +433,16 @@ def _ssm_run(
                 )
                 status = result["Status"]
                 if status == "Success":
+                    # Success(服务端输出传播延迟)。用 on_output 解析 host 带内证据的调用方
+                    # 已吐出完整 identity+inode 的 SUCCEEDED JSON,但 Success 当刻第一次
+                    # get-command-invocation 的 StandardOutputContent 仍为空 → _rb_host_result
+                    # =None → 假 unconfirmed + lease 泄漏。仅当【调用方消费 output 且 stdout
+                    # 仍为空】时有界重读,补齐传播缺口;其余调用方路径逐字节不变。填不满也不阻塞、
+                    # 不把成功翻成失败 —— 回落 unconfirmed 由 health-check reconciler 兜底收敛。
+                    if on_output is not None and not (
+                        result.get("StandardOutputContent") or ""
+                    ).strip():
+                        result = _await_command_output(cmd_id, instance_id, result)
                     _notify_output(on_output, result)
                     _notify_result(on_result, status, result.get("ResponseCode", 0))
                     return (True, result.get("ResponseCode", 0)) if want_rc else True

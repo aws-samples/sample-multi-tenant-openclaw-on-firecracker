@@ -4,8 +4,11 @@
 import os
 import time
 import boto3
+from botocore.config import Config
 
-ssm = boto3.client("ssm")
+ssm = boto3.client(
+    "ssm", config=Config(retries={"max_attempts": 8, "mode": "adaptive"})
+)
 ddb = boto3.resource("dynamodb")
 tenants_table = ddb.Table(os.environ["TENANTS_TABLE"])
 # Prefer the WORM + CMK backup bucket; fall back to assets bucket only if unset
@@ -13,6 +16,108 @@ tenants_table = ddb.Table(os.environ["TENANTS_TABLE"])
 BUCKET = os.environ.get("BACKUP_BUCKET") or os.environ["ASSETS_BUCKET"]
 PREFIX = os.environ.get("BACKUP_PREFIX", "backups")
 CMK_KEY_ID = os.environ.get("BACKUP_CMK_KEY_ID", "")
+
+# ── #564 G7 —— 手动备份的相位取值 ────────────────────────────────────────────
+#
+# **这些字面值的权威定义在 `deploy/lambda/api/services/tenant_service.py` 的
+# `_BACKUP_PHASE_*`**,不在这里。本 Lambda 的 asset 只含 `handler.py` 一个文件
+# (`deploy/stacks/lambdas.py` 的 `Code.from_asset("deploy/lambda/backup")`),所以
+# import 不到那边 —— 只能抄一份字面值。**一致性不靠"记得同步改"**:
+# `tests/test_564_g6g7_dlq_backup.py` 有一条断言把两处逐值比对,漂了就红。
+# 同样的处置在 `deadline_executor._REBUILD_INFLIGHT_PHASES` 上已经用过一次。
+_PHASE_QUEUED = "queued"      # 生产端受理时写的初始相位;起跑的来源相位锚要用它
+_PHASE_RUNNING = "running"
+_PHASE_SUCCEEDED = "succeeded"
+_PHASE_FAILED = "failed"
+
+# 失败原因的封闭取值(#565 G3 的对外契约,`backup` 那一档的子集)。同上:权威在
+# `deploy/lambda/api/core/create_deadline.py` 的 `REASONS_FOR["backup"]`,这里是抄本,
+# 由同一条断言比对。**只用得到这两个** —— 备份失败要么是备份本身没成(`backup_failed`),
+# 要么是 host 侧没回执(`host_unreachable`);到点没跑完那一档由死线执行者写,不在本文件。
+_REASON_BACKUP_FAILED = "backup_failed"
+_REASON_HOST_UNREACHABLE = "host_unreachable"
+
+# `_ssm_run` 在「压根没拿到裁决」时(预算用完仍无终态 / SSM API 本身失败)输出里带的哨兵。
+# 归因靠它,不靠匹配散文 —— 措辞与异常类名都会变,哨兵不会。这个文件已有同款惯例
+# (`OC_BACKUP_VM_LEFT_PAUSED` / `OC_BACKUP_SOURCE_ABSENT`)。
+_SSM_NO_VERDICT = "OC_SSM_NO_VERDICT"
+
+
+def _mark_backup_phase(tenant_id, op_id, phase, reason=None, expect_phase=None,
+                       require_unexpired=False, attempts=1):
+    """把手动备份的相位写回租户行。返回 **True = 真的写进去了**。
+
+    **三道锚(Codex 独立复审第 1 轮把只锚 op_id 的版本判成缺陷,核实为真):**
+
+    1. `backup_op_id = :op` —— 世代锚。异步 Lambda 对未处理异常会**用同一 payload 重投**,
+       客户也可能在上一次还没结束时又发起一次备份。没有它,一次陈旧的重投会覆盖一次**全新**
+       备份的相位。
+    2. `expect_phase` —— **来源相位**锚。光有世代锚不够:同一个 op_id 的**延迟重投**能把一个
+       **已经被死线执行者判死的 `failed`** 翻回 `running`,然后在死线之后执行,最后再用
+       `succeeded` 覆盖掉 `failed` —— 客户先被告知失败、后被告知成功,而它确实超了死线。
+       所以起跑要求"当前仍是在飞相位",收尾要求"当前仍是 `running`"。
+    3. `require_unexpired` —— **死线**锚(仅起跑用)。G3 给通道 B/C 都加了消费前的过期检查,
+       通道 D(异步 invoke backup)之前没有 —— 这就是它。死线已过就不起跑,把执行也挡住,
+       而不只是不写相位。
+
+    **写失败不再被静默吞掉。** 原来那版一律 `print` 就算了,理由是"别让 DDB 抖动把一次已成功
+    的备份变成异常触发重跑"。那个顾虑本身对,但漏了更糟的后果:备份**成功**而 `succeeded`
+    这次写失败 → 行停在 `running` → 600s 后死线执行者把一次**成功的备份**报成失败,客户被
+    告知了一个谎。所以改成:**有界重试**(瞬时抖动是常见情形,原地重试最便宜),并把最终
+    结果返回给调用方去决定 —— 起跑写不进就**不备份**(不许跑一次没人跟踪的备份),收尾写不进
+    就上抛(让它进 DLQ 告警;`backup_fn` 这次刚配上 DLQ)。
+    """
+    if not op_id:
+        return True  # 不是手动备份(删前 / suspend / 定时批量)—— 它们没有句柄,也不该有相位
+    expr = "SET backup_phase = :ph, backup_phase_at = :t"
+    vals = {":ph": phase, ":t": _now_iso(), ":op": op_id}
+    cond = ["backup_op_id = :op"]
+    if expect_phase is not None:
+        cond.append("backup_phase IN (" + ", ".join(
+            f":e{i}" for i in range(len(expect_phase))
+        ) + ")")
+        for i, p in enumerate(expect_phase):
+            vals[f":e{i}"] = p
+    if require_unexpired:
+        # 缺死线字段的行(升级期那批)照旧放行 —— 与 `create_deadline.is_expired()` 的
+        # fail-safe 方向一致:不许因为缺字段就拒掉一次客户已受理的操作。
+        cond.append("(attribute_not_exists(backup_deadline) OR backup_deadline > :now)")
+        vals[":now"] = int(time.time())
+    if reason is not None:
+        expr += ", backup_fail_reason = :r, backup_fail_at = :t"
+        vals[":r"] = reason
+    last = None
+    for i in range(max(1, attempts)):
+        try:
+            tenants_table.update_item(
+                Key={"id": tenant_id},
+                UpdateExpression=expr,
+                ConditionExpression=" AND ".join(cond),
+                ExpressionAttributeValues=vals,
+            )
+            return True
+        except Exception as e:  # noqa: BLE001 —— 条件不成立与瞬时故障在这里都返 False
+            last = e
+            if "ConditionalCheckFailed" in type(e).__name__ or (
+                "ConditionalCheckFailed" in str(e)
+            ):
+                # 条件不成立 = **这次操作不是我的**(或已被判死)。重试不会让它变成立,
+                # 直接放弃 —— 我无权改别人的状态。
+                print(
+                    f"[#564] backup phase {tenant_id} {op_id} -> {phase} 放弃:"
+                    "条件不成立(已被判死 / 已是另一次操作)"
+                )
+                return False
+            if i + 1 < max(1, attempts):
+                time.sleep(1 + i)
+    print(f"[#564] backup phase {tenant_id} {op_id} -> {phase} 写入失败: {last}")
+    return False
+
+
+def _now_iso():
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
 
 
 def lambda_handler(event, context):
@@ -29,12 +134,76 @@ def lambda_handler(event, context):
         # 删前备份必须能备份 deleting/stopped 态:只要盘还在(host_id/vm_num 有)就能备。
         # 仍拒 already-deleted(盘已 rm,无可备)。非 pre_delete 的手动/定时备份保持
         # 只备 running 的原契约(停机态盘可能不一致,非删除场景不强备)。
+        # #564 G7 —— 手动备份的句柄。只有它带 `backup_op_id`,所以它是"这是手动备份"的
+        # 判别符;删前备份 / suspend 备份 / 定时批量都不带,相位写入对它们整体是 no-op
+        # (客户表格明文只要"网关手动备份",定时备份的错峰语义不许被顺手改)。
+        _op_id = event.get("backup_op_id")
         if event.get("pre_delete"):
             if item.get("status") == "deleted":
                 return {"error": "tenant already deleted", "success": False}
         elif item.get("status") != "running":
+            # 准入被拒也要落终态:客户手里已经有一个 202 和句柄,不写的话那个句柄永远查不到
+            # 结果 —— 而 600s 后死线执行者会把它判成"到点没跑完",归因就错了(真实原因是
+            # 租户不在 running)。
+            _mark_backup_phase(
+                tenant_id, _op_id, _PHASE_FAILED, _REASON_BACKUP_FAILED
+            )
             return {"error": "tenant not running", "success": False}
-        return backup_tenant(item)
+        # **起跑的 CAS 决定要不要执行**,不只是"写个相位"。三道锚(世代 / 来源相位在飞 /
+        # 死线未过)任一不成立就**不备份**:
+        #   · 世代不对 → 这次投递属于一次已经被取代的操作;
+        #   · 相位已是终态 → 它已经被死线执行者判死了,再跑一遍会在死线之后执行,而且最后
+        #     还会用 succeeded 覆盖掉那个 failed(客户先被告知失败、后被告知成功);
+        #   · 死线已过 → 通道 D 的"消费前过期检查"(G3 给通道 B/C 都做了,这里补齐)。
+        # 写不进去也不备份:一次**没人跟踪**的备份比不备份更糟 —— 它会占 host、写 S3,而
+        # 客户手里那个句柄永远查不到结果。
+        if _op_id and not _mark_backup_phase(
+            tenant_id, _op_id, _PHASE_RUNNING,
+            expect_phase=(_PHASE_QUEUED, _PHASE_RUNNING),
+            require_unexpired=True,
+            attempts=3,
+        ):
+            return {
+                "error": "backup not started: the operation was superseded, already "
+                "finalized, or past its deadline",
+                "success": False,
+                "skipped": True,
+            }
+        _result = backup_tenant(item)
+        # `backup_tenant` 返 `{"tenant_id","success",...}`;success 才算成。
+        if isinstance(_result, dict) and _result.get("success"):
+            # 收尾锚在 `running` 上:期间若已被死线执行者判死,这次写不进去 —— 那是**对的**,
+            # 它确实超了死线。写不进去且不是"条件不成立"(即真的写库故障)时**上抛**:
+            # 备份成功而相位停在 `running`,600s 后执行者会把一次成功的备份报成失败 ——
+            # 客户被告知一个谎。让它进 DLQ 告警(`backup_fn` 这次刚配上),代价是最坏多跑
+            # 两次备份(AWS 异步重试 2 次),而起跑那道死线锚会把重跑限制在死线之内。
+            if _op_id and not _mark_backup_phase(
+                tenant_id, _op_id, _PHASE_SUCCEEDED,
+                expect_phase=(_PHASE_RUNNING,), attempts=3,
+            ):
+                _cur = (
+                    tenants_table.get_item(Key={"id": tenant_id}).get("Item") or {}
+                ).get("backup_phase")
+                if _cur == _PHASE_RUNNING:
+                    # 相位还是 running → 不是"被判死",是真的没写进去。fail-loud。
+                    raise RuntimeError(
+                        f"backup for {tenant_id} succeeded but phase stayed "
+                        f"{_cur!r} (op={_op_id}); the deadline executor would report "
+                        "this successful backup as failed"
+                    )
+        else:
+            # 归因二选一,判据是**哨兵**不是散文(见 `_SSM_NO_VERDICT` 的说明):
+            #   · 压根没拿到裁决(预算耗尽无终态 / SSM API 失败)→ `host_unreachable`
+            #   · 命令跑了但失败(打包/上传/校验)→ `backup_failed`
+            # 两个值都在 `backup` 那一档的封闭子集里(#565 G3 已发布)。
+            _err = str((_result or {}).get("error") or "")
+            _reason = (
+                _REASON_HOST_UNREACHABLE
+                if _SSM_NO_VERDICT in _err
+                else _REASON_BACKUP_FAILED
+            )
+            _mark_backup_phase(tenant_id, _op_id, _PHASE_FAILED, _reason)
+        return _result
 
     # Scheduled run. PRD 2.6 要求"每用户错峰备份(非开源版写死统一时间)+ 队列限并发,
     # 避免大量用户/机器同刻备份"。实现:EventBridge 高频触发(如每 30min),每次只挑
@@ -107,14 +276,31 @@ def backup_tenant(tenant):
     # host-script-s3-asset-drift 反复踩)。改判 oc_flush_guest:缺它 = 旧版无 flush =
     # 备份丢未落盘客户数据,必须先从 S3 权威前缀装新版再跑。bash -n + 双 grep 守住
     # "只装语法合法且确含新语义的脚本",装不上就 exit 1 fail-closed(不拿旧版静默备份)。
+    #
+    # 上面那段说明为什么不能用旧哨兵当判据,而它自己现在也成了旧哨兵:存量 host 的
+    # backup-data.sh 早就有 oc_flush_guest(#545),却可能缺 R7 这一批语义 ——
+    # per-tenant flock(与 launch/stop/delete/migrate/备份互斥)、S3 key 带 run id
+    # (同秒两次备份不撞 key)、以及本轮改的"`.key` 先传、`.enc` 最后传"。
+    # 只判 oc_flush_guest 会让自愈分支对这些 host 永远跳过,而**滚动升级期间中心调度
+    # 仍是开着的**(config 要求先铺完 host-agent 再置 false),于是那段时间里中心侧会
+    # 拿旧脚本持续产出撕裂或解不开的恢复点 —— 正是这条判据要防的那件事本身。
+    #
+    # 三个哨兵与 host-agent 的 _BACKUP_SCRIPT_SENTINELS 【同源】(deploy/userdata/
+    # host-agent.py),两处各写一套必然漂移。有测试钉住同源:一处改,两处都红。
+    _sentinels = ("oc_flush_guest", "OC_BACKUP_SOURCE_ABSENT", "_RUN_ID")
+    _installed_gate = " || ".join(
+        f"! grep -q {s} /home/ubuntu/backup-data.sh 2>/dev/null" for s in _sentinels
+    )
+    _download_gate = "".join(
+        f"grep -q {s} /tmp/oc-heal-backup-data.sh && " for s in _sentinels
+    )
     cmd = (
-        "if ! grep -q oc_flush_guest /home/ubuntu/backup-data.sh 2>/dev/null; then "
+        f"if {_installed_gate}; then "
         "[ -r /etc/platform.env ] && { set -a; . /etc/platform.env; set +a; }; "
         'aws s3 cp "s3://${ASSETS_BUCKET:?}/deployment/scripts/backup-data.sh" '
         "/tmp/oc-heal-backup-data.sh --no-progress >/dev/null 2>&1 && "
         "bash -n /tmp/oc-heal-backup-data.sh && "
-        "grep -q oc_flush_guest /tmp/oc-heal-backup-data.sh && "
-        "grep -q OC_BACKUP_SOURCE_ABSENT /tmp/oc-heal-backup-data.sh && "
+        f"{_download_gate}"
         "install -o root -g root -m 755 /tmp/oc-heal-backup-data.sh "
         "/home/ubuntu/backup-data.sh || exit 1; "
         "fi && "
@@ -123,6 +309,20 @@ def backup_tenant(tenant):
     success, output = _ssm_run(host_id, cmd, timeout=300)
 
     result = {"tenant_id": tid, "success": success, "timestamp": now}
+    #
+    # 为什么必须回传:备份失败时 suspend 会把 status 回滚成 running/stopped。但如果失败的原因
+    # 而 reaper 救不了它:reaper 的 fc_alive 是进程存活检查,一个 Paused 的 Firecracker 进程
+    # 照样活着,它会得出同样的错误结论。所以这个事实只有 backup-data.sh 知道,必须由它上报。
+    #
+    # 判据是稳定哨兵而不是措辞:backup-data.sh 的 EXIT trap 在【最终仍未恢复】时打
+    # OC_BACKUP_VM_LEFT_PAUSED(主路径失败但 trap 补救成功时【不】打 —— 那时 VM 已经回来了)。
+    # 通道复用现成的 stdout(下面抽 S3 key 用的是同一份 output),不新增接口。
+    if "OC_BACKUP_VM_LEFT_PAUSED" in (output or ""):
+        result["vm_left_paused"] = True
+        print(
+            f"Backup left {tid} PAUSED (sentinel OC_BACKUP_VM_LEFT_PAUSED in host output);"
+            " the caller must NOT roll the tenant back to an active status"
+        )
     if success:
         # 脚本把 key echo 到 stdout 最后一行(`${PREFIX}/${tid}/<ts>.gz[.enc]`,见
         # backup-data.sh:92/100);上游 suspend 用它精确定位【本次】产物做 restore。
@@ -148,11 +348,49 @@ def backup_tenant(tenant):
             print(f"Backup key missing for {tid}: {result['error']}")
             return result
         result["backup_key"] = backup_key
-        tenants_table.update_item(
-            Key={"id": tid},
-            UpdateExpression="SET last_backup_at = :t",
-            ExpressionAttributeValues={":t": now},
-        )
+        # ㉜ last_backup_at 必须条件写:租户仍在【我们派发的那台 host】上
+        #
+        # 本函数在开头读租户拿到 host_id,然后同步跑一条 300s 超时的 SSM。迁移就发生在
+        # 这几十秒到几分钟里。若租户已经搬到别的 host,这次备的是【旧 host 上的旧盘】,
+        # 而无条件写 last_backup_at 会让新 owner 机以为"刚备过"而跳过它 —— 于是那个租户
+        # 在新 host 上迟迟不被备份,而系统显示一切正常。
+        #
+        # 判据取的是【备份开始时】读到的 host_id:条件不成立说明期间搬过家,这次结果不作数。
+        # 与 R7 侧的写完全同源(host-agent.py 那处的三重条件里也有 host_id = :self)——
+        # 那边已经这么做了,而这边漏了。**同一件事的两条路,只加固一条等于没加固。**
+        #
+        # attribute_exists(id) 同理:租户可能在这几分钟里被删掉,无条件写会 upsert 出一个
+        # 只有 id + last_backup_at 的僵尸行。
+        # 用函数开头已经取好的 host_id(:101)——【备份开始时】读到的那个,正是条件要锚的值。
+        # ⚠ 我第一版写的是 `item.get("host_id")`,而本函数的参数叫 `tenant`,没有 item。
+        # 那会抛 NameError,而它恰好落在下面这个 `except Exception` 里 → 被当成"条件不成立"
+        # → **条件写永远不执行、永远打"没推进"**,整个修复静默失效,而外部看不出区别。
+        # 是新加的那两条测试立刻抓到的 —— 这就是"新行为必须有测试"的用处。
+        _bk_host = host_id
+        try:
+            _kw = {
+                "Key": {"id": tid},
+                "UpdateExpression": "SET last_backup_at = :t",
+                "ExpressionAttributeValues": {":t": now},
+                "ConditionExpression": "attribute_exists(id)",
+            }
+            if _bk_host:
+                _kw["ConditionExpression"] = (
+                    "attribute_exists(id) AND host_id = :bkhost"
+                )
+                _kw["ExpressionAttributeValues"][":bkhost"] = _bk_host
+            tenants_table.update_item(**_kw)
+        except Exception as _ce:  # noqa: BLE001 — CCF 不是错误,是"期间搬家/被删了"
+            # 备份本身是成功的(S3 对象已落地),所以不把 success 翻成 False —— 上游
+            # (suspend/delete 的删前备份)靠 backup_key 决定能不能删盘,谎报失败会让它
+            # 白白重试甚至拒绝删除。这里只是"不推进时间戳",并 fail-loud 说清原因。
+            result["last_backup_at_not_advanced"] = True
+            print(
+                f"Backup {tid}: object uploaded ({backup_key}) but last_backup_at was NOT "
+                f"advanced — the tenant no longer matches host_id={_bk_host!r} or was "
+                f"deleted during the backup ({type(_ce).__name__}). This backup captured "
+                "the OLD host's disk; the new owner must back it up again."
+            )
     else:
         result["error"] = output
         print(f"Backup failed for {tid}: {output}")
@@ -161,6 +399,29 @@ def backup_tenant(tenant):
 
 
 def _ssm_run(instance_id, command, timeout=300):
+    """等一条 SSM 命令跑完;`timeout` 是**墙钟预算**,不是轮数。
+
+    #565 G1-a 第二条要求「backup 侧 300s SSM 上界与死线预算**对齐**」—— 对齐的前提是
+    这个数**真的是**上界。原来的循环是 `for _ in range(timeout // 3)`,即
+    **轮数上限**;它等于上界只在「每轮恰好 3s」这个隐含假设下成立。
+
+    **#573 把那个假设打破了**:它给上面的 `ssm` client 加了
+    `retries={"max_attempts": 8, "mode": "adaptive"}`(为了防 SendCommand 节流毒 DLQ,
+    那件事本身是对的)。于是单次 `get_command_invocation` 在被节流时最坏要等 7 次重试的
+    指数退避 —— botocore `ExponentialBackoff` 的 `_MAX_BACKOFF=20`、基数 2,实测退避总和
+    上界 `1+2+4+8+16+20+20 = 71s`,adaptive 的客户端 token-bucket 限速还在这之上。
+    一轮就可能 74s,100 轮的理论上界约 7400s —— 实际是被本 Lambda 自己的 900s 外壳杀掉。
+
+    后果链(正是 #565 G1-a 修掉的那个病回归):调用侧 `_force_backup_sync` 的
+    `read_timeout` 按「305s 上界」设的,于是**调用侧先放弃、而本函数还在跑并会写 S3** →
+    上层看到失败、底层其实备成功了。
+
+    所以改成真实 deadline,且**检查放在发下一次 API 调用之前** —— 超预算就不再发新请求。
+    净上界 = `timeout` + 最后那次调用自己的耗时(最坏 ~71s 退避),这个数是可算的,
+    调用侧的 `read_timeout` 按它取(见 `core/clients.BACKUP_SYNC_INVOKE_CONFIG`)。
+
+    `time.monotonic()` 而不是 `time.time()`:后者会被 NTP 校正拖动,预算判定不能受它影响。
+    """
     try:
         resp = ssm.send_command(
             InstanceIds=[instance_id],
@@ -169,8 +430,9 @@ def _ssm_run(instance_id, command, timeout=300):
             TimeoutSeconds=timeout,
         )
         cmd_id = resp["Command"]["CommandId"]
+        deadline = time.monotonic() + timeout
         time.sleep(5)
-        for _ in range(timeout // 3):
+        while time.monotonic() < deadline:
             result = ssm.get_command_invocation(
                 CommandId=cmd_id,
                 InstanceId=instance_id,
@@ -182,9 +444,17 @@ def _ssm_run(instance_id, command, timeout=300):
                 error = result.get("StandardErrorContent", "")
                 return False, "\n".join(part.rstrip() for part in (output, error) if part)
             time.sleep(3)
-        return False, "timeout"
+        # #564 G7 —— 这两支是「**压根没拿到裁决**」:预算用完仍无终态,或连 SendCommand /
+        # GetCommandInvocation 都没成功。与「命令跑了但失败」(上面那个 Failed/TimedOut/
+        # Cancelled 分支)在归因上是**不同的值**:前者是 `host_unreachable`,后者是
+        # `backup_failed`。
+        #
+        # 用**稳定哨兵**而不是让调用方去匹配散文("timeout"/"no ssm"/异常类名):
+        # 措辞会变、异常类名更是随 botocore 版本变,而这个文件本身已经建立了哨兵惯例
+        # (`OC_BACKUP_VM_LEFT_PAUSED` / `OC_BACKUP_SOURCE_ABSENT`)。照它办。
+        return False, f"{_SSM_NO_VERDICT}: budget {timeout}s exhausted with no terminal status"
     except Exception as e:
-        return False, str(e)
+        return False, f"{_SSM_NO_VERDICT}: {type(e).__name__}: {e}"
 
 
 def _now():

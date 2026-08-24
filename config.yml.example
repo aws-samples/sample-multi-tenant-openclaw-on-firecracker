@@ -170,11 +170,79 @@ s3:
   rootfs_prefix: "deployment/rootfs"
   backup_prefix: "backups"
   backup_retention_days: 7
+  #
+  # 背景:这条规则此前三处都打在 assets 桶(见 storage.py 的 BackupLifecycle),真机实证
+  # 是双重空转 —— 备份桶返 NoSuchLifecycleConfiguration,而 assets 桶上那条规则的
+  # 「一部署就生效」。
+  #
+  # 保留天数已定:**backup_retention_days = 7**(决策人 chochen,2026-08-23;
+  # 原 ADR §8 待确认 #1 已结案)。
+  #
+  # 生效后的后果(**这就是为什么本开关缺省 false**):桶开 versioning 时
+  # Expiration.Days 不是删数据,而是给 current 版本插一个 delete marker;而
+  # _resolve_backup 与 list_all_backups 都走 list_objects_v2(只返 current、跳过
+  # delete marker)⇒ **所有超过 7 天的恢复点当天就对应用不可见,restore 直接 404**。
+  # Object Lock 挡不住这一步(创建 delete marker 不是删除被锁版本),生产同样不可见,
+  # 只是数据还在;之后再过 NoncurrentDays 天就真删。
+  # ⚠ **桶还没开 versioning 时更严重一级**:那时 Expiration.Days 会**直接真删对象**,
+  # _is_prod_region 分支外,所以环境追平 bb 时 versioning 必然开;但**如果有人先手工给
+  # 备份桶加 lifecycle 规则、再追平 bb,那个顺序会真删数据**。顺序不可颠倒。
+  #
+  # ⚠⚠ 最容易被这条打中的,恰是最需要恢复的租户:**_backup_loop 只备份 status=running
+  # 的租户**。所以一个租户被 suspend / stop 之后就不再产生新备份,其最新备份会一路变老
+  # 并在第 7 天被 lifecycle 清掉 —— 也就是说「挂起一个 sandbox 放一周」= 悄悄失去它的
+  # 全部恢复点。开启本开关前必须先想清楚这个形态,或先给长期挂起的租户另做冷备。
+  #
+  # 打开的前置(缺一不可):
+  # ① ✅ 已满足 —— backup_retention_days 已定为 7(chochen,2026-08-23)。
+  # ② ✅ 已满足(实测数据日期 2026-08-23,us-west-2)—— 该环境无"最新备份已老于 7 天"
+  #    的在役租户:全桶 1436 个对象 / 718 个 .gz.enc 恢复点 / 202 个租户前缀;最旧对象
+  #    2026-08-21T20:28:50Z(龄 1.54 天)、最新 2026-08-22T19:36:12Z(龄 0.58 天);
+  #    **龄 > 7 天的对象 0 个,龄 > 7 天的 .gz.enc 0 个**。唯一在役租户 sbx-chochen-0a5b
+  #    (running,vm_num 99)有 2 份备份,last_backup_at 2026-08-22T19:36:11Z(龄约 0.6 天),
+  #    且 _backup_loop 每 OC_BACKUP_INTERVAL_HOURS=24 刷新 ⇒ 只要它保持 running,其最新
+  #    备份永不越过 7 天。**但它一旦被 suspend/stop 就落入上面那条 running-only 风险。**
+  #    ⚠ 这组数字有时效性:隔一段时间再开启前必须重新实测,不要照抄。
+  # ③ ⬜ 人工放行 —— 打开本开关需要一次 stack-wide `cdk deploy`,而 change set
+  #    (--no-execute)实测该动作会连带 InitHook/TerminateHook(RequiresRecreation=Always,
+  #    causing HostASG)与 HostASG(Conditionally)⇒ 会终止在役 host 上的租户 VM。
+  #    该部署要单独决策 + 单独做安全前置,不能顺手做。
+  # ④ ⬜ **此后若要改 backup_bucket_suffix,必须先手工摘掉旧桶的 lifecycle 配置**
+  #    (aws s3api delete-bucket-lifecycle --bucket <旧桶>)。原因:管这条规则的
+  #    CustomResource 的 physical id 是常量、不含桶名,改 suffix 时它收到的是 Update
+  #    而非 replace ⇒ 规则被写到新桶,而 prod 下 RETAIN 留存的旧桶上那份规则不会被摘掉、
+  #    之后也再没人管(关掉本开关也只清新桶)。详见 storage.py 里 on_delete 旁的注释。
+  backup_lifecycle_enabled: false
   # PRD 2.6 每用户错峰备份:backup_cron 是"扫描节拍"非统一时间。每次只备到期
   # (距上次 > backup_interval_hours)的一批、最多 backup_batch_limit 个 → 错峰+削并发。
   backup_cron: "rate(30 minutes)"
   backup_interval_hours: 24   # 每租户至少每 24h 备一次
   backup_batch_limit: 20      # 单次触发最多备 20 个(削并发,避免同刻全量)
+  # 中心 EventBridge 调度在 10 万租户量级追不上:每 30min 备 20 个 = 24h 上限 960 个。
+  # 两侧【不应长期并存】。但请注意实际后果被兜住了:两侧都通过 backup-data.sh 跑,
+  # 而它自己会抢 per-tenant 锁(backup-data.sh:93,抢不到 30s 就非零退出、绝不硬闯),
+  # 所以并存不会备到运行中的盘 —— 只会有一侧抢不到锁而失败、下轮重试。
+  # 也就是说:并存的代价是【浪费与噪声】,而默认关掉的代价是【既有机队静默零备份】。
+  # 后者严重得多,所以默认站在 true 这一侧。
+  # ⑲ 默认必须是 true(codex 独立复审第十三轮)。
+  #
+  # 上一版默认 false,而紧邻的注释又写着"上线顺序:先铺完 host-agent → 再置 false"——
+  # **默认值与它自己声明的顺序矛盾**。矛盾的后果不是"配置不优雅",而是:
+  # `cdk deploy` 换的是 userdata 与 Lambda,它【不会】重启或升级既有 host 上正在跑的
+  # host-agent 进程。所以按默认部署时,既有 host 上仍是没有 `_backup_loop` 的旧 agent,
+  # 而中心调度已被关掉 → 那些 host 上的租户【两侧都不备份】,且备份循环的心跳依然健康
+  # (openclaw_backup_script_stale 只在新 agent 里才有)。
+  #
+  # 故默认改为 true(= 保持既有中心调度,行为与 R7 之前一致),关掉它必须是一次
+  # 【已验证 host-agent 铺完】之后的显式动作。两侧不可并存的约束不变 —— 只是把"先铺完"
+  # 从一句注释变成默认值本身就安全。
+  #
+  # 上线顺序(不变,但现在默认值站在安全的一侧):
+  #   1) 铺完 host-agent(确认每台 host 的 /metrics 有 openclaw_backup_script_stale=0)
+  #   2) 再把本项置 false
+  #   3) cdk deploy
+  # 回滚:置回 true。
+  backup_central_schedule_enabled: true
   # 备份桶名后缀,默认空。仅当上一次部署留下 WORM(Object Lock COMPLIANCE)备份桶、
   # 在保留期内连 root 都删不掉、又要立刻用同名重建时,填一个短后缀(如 -v2)让
   # 新桶避开撞名;旧锁定桶等 backup_retention_days 过期后再单独清。
@@ -392,6 +460,48 @@ dispatch:
   max_batch_size: 500   # 单次 invoke 里的最大装箱租户数;1..10000(推导 executionTimeout 也受制于此)
   dlq_max_receive_count: 3   # DLQ maxReceiveCount;一进 DLQ 就告警(alarm openclaw-dispatch-dlq-not-empty)
 
+# ========== 生命周期操作死线(#564 G5,客户压测第 1 项)==========
+# 客户明文要求「需要可以参数化,改 Lambda env 即可修改每个 lifecycle 配置」。这一段是
+# **CDK 侧的同源来源** —— 它派生 api / lifecycle-consumer 两个 Lambda 上的
+# `LIFECYCLE_DEADLINE_SEC_<ACTION>` env。env 名由 `core/create_deadline.env_name_for()`
+# 算出,**不在 CDK 里另拼一遍字符串** —— 那种"CDK 注入了 A、代码读 B"是查不出来的静默失效。
+#
+# **这一段目前是改死线的【唯一】有效途径**(2026-08-23 真机核实,更正本注释的第一版):
+#
+# 客户要的是「改 Lambda env 即可修改每个 lifecycle 配置」,但 **api Lambda 的流量走
+# `live` alias → published version**(实测 API Gateway 集成 URI 是
+# `function:openclaw-api:live`,alias 指向 version 18),而 **published version 的环境变量
+# 是冻结的** —— `aws lambda update-function-configuration --environment` 只改 `$LATEST`。
+# 真机实测:把 `$LATEST` 的 `DEFAULT_NO_JWT_ROLE` 改成 operator 并等足 75s,请求依然按
+# version 18 的 `viewer` 判权。同理改死线 env 也不会生效。
+#
+# 所以「改 env 秒级生效、不跑 cdk deploy」在当前架构下**不成立**;要它成立需要一个决策
+# (三条路,归 #564 G5 的未完成部分):
+#   ① 让 API Gateway 打 `$LATEST` 而不是 alias —— 代价是丢掉 version/alias 的灰度与回滚;
+#   ② 死线值换载体(SSM Parameter Store / DDB),运行时读 → 真正可热改;
+#   ③ 接受「改 env + publish 新 version + 移 alias」并写进 runbook —— 但那等于一次部署,
+#      不是客户要的那件事。
+# 在决策落地之前:**改这一段 + `cdk deploy` 是改死线的唯一有效途径**,
+# `scripts/checks/create-deadline-config.py --live` 的漂移复检仍然有用(它比对的是
+# `$LATEST`,所以还能看出有人手改过 env —— 那种手改现在不生效,更需要被看见)。
+#
+# **方向性约束(fail-closed,见 `create_deadline.assert_deadline_config_sane`)**:
+# 往大调安全;**往小调可能小于该操作单次最坏执行 → 判死之后 SSM 还在跑 → 留下没人认的 VM
+# (占容量且计费)**。目前只有 create 有权威的最坏执行值(128s,来自 SSM executionTimeout
+# 的算术),另外六个的预算分解归 #565 —— 所以那六档现在**没有下界守护**,校验器会把这件事
+# 显式报出来,不要当成"已经验过了"。
+#
+# 缺这一段不会 synth 失败:回落到 `create_deadline` 里那份同样的客户表格值。
+lifecycle:
+  deadline_sec:
+    create: 180     # #562 已落地;本轮把它从 Python 常量迁到 env(客户要求"每个"都能改)
+    suspend: 180
+    restore: 180
+    restart: 180    # 客户 2026-08-21 追加
+    rebuild: 180    # 客户 2026-08-21 追加
+    backup: 600     # **网关手动备份**;系统定时备份有自己的错峰语义,不受此约束
+    delete: 600     # 只约束「给上层的答复」;实际删除不得丢弃,必须继续重试到成功
+
 # ========== 健康检查 ==========
 health_check:
   interval_minutes: 5
@@ -411,6 +521,19 @@ health_check:
 api:
   throttle_rate_limit: 500          # 稳态 req/s(account 级 steady-state)
   throttle_burst_limit: 1000        # 瞬时 burst 上限(令牌桶容量)
+  # ── #496 复用已有 execute-api Interface VPCE ──────────────────────────────────
+  # 默认 true = 本栈自建(存量行为,synth 字节不变)。AWS 硬规则:同一 VPC 同一服务只许一个
+  # 开 private DNS 的 Interface VPCE。导入客户已有 VPC 时那里常常已经有一个(别的系统在用),
+  # 此时必须设 false 复用,否则 CreateVpcEndpoint 被拒(private-dns-enabled cannot be set
+  # because there is already a conflicting DNS domain)→ 整栈回滚。
+  # 设 false 时**必须**同时给 execute_api_vpce_id,否则 synth 直接 raise —— PRIVATE RestApi
+  # 必须绑定一个端点,漏了会得到一个「建成了但谁都调不到」的 API。被复用的 id 会自动并进
+  # resource policy 的 aws:SourceVpce 放行名单(否则请求从它进来会被判 403)。
+  # create_execute_api_vpce: true
+  # execute_api_vpce_id: ""     # vpce-xxxx。查法:
+  #   aws ec2 describe-vpc-endpoints --filters Name=vpc-id,Values=<VPC> \
+  #     Name=service-name,Values=com.amazonaws.<REGION>.execute-api \
+  #     --query 'VpcEndpoints[?PrivateDnsEnabled==`true`].VpcEndpointId'
   # 下面 private_api_enabled(true→both,false/未设→edge),保存量兼容。
   #   edge    = 只建 EDGE 公网 REST API(现状,浏览器/调试直连,不建 PRIVATE/VPCE)。
   #   private = 只走私有:建 PRIVATE API + 关联 execute-api Interface VPCE,机器流量
@@ -643,6 +766,18 @@ security:
   egress_allowlist_domains: ""
   # host dnsmasq 的上游解析器。默认沿用 guest 原硬编码 8.8.8.8 便于对齐;可改 VPC Resolver 169.254.169.253。
   egress_dns_upstream: "8.8.8.8"
+  # #566 —— guest 出网 default-deny 白名单基线(取代 #542 黑名单模型;完整决策见 ADR
+  #   engineering/00-knowledge-base/decisions/ADR-guest-egress-default-deny-whitelist.md)。
+  #     off  (默认)= 现状:guest 出网默认放行,仅链首 IMDS/东西向/管理端口 DROP 例外。
+  #     deny = host 级 tap 共享链 OPENCLAW-EGRESS(-i tap+,一台一份,锚在 conntrack
+  #            RELATED,ESTABLISHED ACCEPT 之后 + --ctstate NEW):内网 default-deny(REJECT
+  #            EGRESS_VPC_CIDR),放行 config 派生的 allow 洞(LiteLLM/DNS :53/SPIRE :8081)+ 公网。
+  #            永不触碰租户数据面 DNAT;策略从本环境 config 派生绝不写死网段;可秒级回退。
+  #   ⚠ 默认 off:开启前须逐环境 canary 断言 LLM 真出词 + Redis 被拒 + DNS 通(漏 allow 洞会静默 brick)。
+  egress_mode: "off"                         # off | deny
+  # egress_mode=deny 时:除 EGRESS_VPC_CIDR 外是否额外 REJECT 全部 RFC1918(10/8+172.16/12+192.168/16)。
+  #   默认 false(只堵本 VPC);多 VPC/对等网需要更严时设 true,但注意勿误伤同段合法私网目的地。
+  egress_deny_rfc1918: false
   # #517 阶段3(G1 fail-closed)—— 只读身份盘(openclaw-immutable.ext4:7 个身份 md + ops skills)
   #   缺失时是否【拒绝启动】该 microVM。默认 false = 既有兼容行为:launch-vm.sh 打 WARN 后照常
   #   起,guest 回落到 data 盘里【烤制当天】的旧 md 副本 + 开机 bind-mount 遮盖失效 → agent 读到

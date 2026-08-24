@@ -102,6 +102,14 @@ aws iam put-role-policy --role-name "$LIFECYCLE_CONSUMER_ROLE" --policy-name oc-
 里那些 `aws s3 cp … <目标路径>` 行,每条 `apply_cli` 已按它逐个生成。
 **`host-agent.py` 改完必须 `systemctl restart host-agent.service`** —— 服务跑的是
 `/opt/openclaw/host-agent.py`(见其 unit 的 `ExecStart`),只换文件不重启,在役进程仍跑旧代码。
+
+两个执行细节写进了每条 `apply_cli`,照抄就行:
+- `AWS-RunShellScript` 的 shell 是 **`/bin/sh`**,**不能用 bash 进程替换**(`< <(...)`);
+  下发内容要么先 `aws s3 cp` 到 `/tmp` 再 `install`,要么走纯 POSIX 写法。
+- **install 与 restart 必须在同一条 `send-command` 里**,分两条是异步的,restart 可能先于 install 落地。
+  下发后用 `ssm wait command-executed` + `get-command-invocation` 逐机核 `Status`,不要发完就算完。
+- 每机在覆盖前先留 `<dest>.pre-patch`:**新增文件在桶里没有旧版本**,回滚只能靠这份每机备份
+  (原本不存在的则直接移除),否则会留下混版机队。
 每个路径的 `operations[0].apply_cli` 就是该文件的确切命令,`verify_cli` 是它的校验命令。
 主机通常在私有子网:命令写成 `ssh/scp` 便于阅读,实际走 SSM(`send-command`;传文件用 base64)。
 
@@ -111,15 +119,31 @@ Lambda 走 **overlay**(复用在役包里的依赖,不要预打包 zip —— �
 目录 `api` / `backup` / `health_check` / `scaler` 各自的根里都有 `handler.py`。逐个函数:
 
 ```bash
-fn=api   # 四个函数各跑一次:api / backup / health_check / scaler
-aws lambda get-function --function-name "openclaw-$fn" --query Code.Location --output text | xargs curl -s -o "live-$fn.zip"
-rm -rf "work-$fn" && mkdir "work-$fn" && (cd "work-$fn" && unzip -q "../live-$fn.zip")
-cp -a "lambda/$fn/." "work-$fn/"
-(cd "work-$fn" && zip -qr "../overlay-$fn.zip" .)
-unzip -p "overlay-$fn.zip" handler.py | head -1   # 必须能读到,证明入口在归档根
-aws lambda update-function-code --function-name "openclaw-$fn" --zip-file "fileb://overlay-$fn.zip" --region "$REGION"
-aws lambda wait function-updated --function-name "openclaw-$fn" --region "$REGION"
+# 目录 → 真实函数名(从合成模板取,注意 health_check 目录对应的是连字符名):
+#   api → openclaw-api   backup → openclaw-backup
+#   health_check → openclaw-health-check   scaler → openclaw-scaler
+d=api; fn=openclaw-api          # 四组各跑一次
+aws lambda get-function --function-name "$fn" --region "$REGION" --query Code.Location --output text | xargs curl -s -o "live-$d.zip"
+aws lambda get-function --function-name "$fn" --region "$REGION" --query Configuration.RevisionId --output text > "rev-$d.txt"
+rm -rf "work-$d" && mkdir "work-$d" && (cd "work-$d" && unzip -q "../live-$d.zip")
+cp -a "lambda/$d/." "work-$d/"
+(cd "work-$d" && zip -qr "../overlay-$d.zip" .)
+unzip -p "overlay-$d.zip" handler.py | head -1        # 必须能读到,证明入口在归档根
+aws lambda update-function-code --function-name "$fn" --region "$REGION" --zip-file "fileb://overlay-$d.zip"
+aws lambda wait function-updated --function-name "$fn" --region "$REGION"
+NEWV=$(aws lambda publish-version --function-name "$fn" --region "$REGION" --revision-id "$(cat "rev-$d.txt")" --query Version --output text)
+aws lambda invoke --function-name "$fn:$NEWV" --region "$REGION" --payload '{}' "out-$d.json" --query FunctionError
+aws lambda update-alias --function-name "$fn" --name live --region "$REGION" --function-version "$NEWV"
 ```
+
+**只 `update-function-code` 是不够的** —— 那只改 `$LATEST`,而 API Gateway 打的是 `live` 别名,
+会出现「异步/事件源已跑新代码、同步 API 仍跑旧代码」的分裂。必须 `publish-version`(用取到的
+`RevisionId` 做 CAS,防中途被别人改)→ 对该版本 `invoke` 验 `FunctionError` 为空 → 再把 `live`
+指过去。回滚要**两条都回**:别名指回备份版本,`$LATEST` 用 `live-$d.zip` 覆盖(SQS 事件源绑 `$LATEST`)。
+
+若该环境还部署了共用同一份 api 包的消费者(例如生命周期消费者),按 `environment.json` 里的 Lambda
+清单对它做**同样的** overlay —— 不要照抄一份写死的函数名列表。
+
 
 先解在役包再覆盖,未改动的模块与依赖因此原样保留;`update-function-code` 之后 `invoke` 验
 `FunctionError` 为空,再翻 `live` 别名。
@@ -206,10 +230,12 @@ instance-refresh 路径滚。验证只起**一台**新 host,盯三个信号:解�
 `manifest.json` 的 `verifications[]` 有 11 条,每条都写了 `action` / `observable` / `pass_when` /
 `fail_when` / `timeout_s` / `cleanup`,按 `phase` 分两批:
 
-- **Phase A(只读,零副作用,始终先跑)**:`verify-egress-allowlist`(对新路由发一次真实带 api-key
-  的请求,**200 而不是 404** 才算路由建成)、`verify-ddb-scan-pagination`、`verify-config-profile-gate`、
+- **Phase A(只读,零副作用,始终先跑)**:`verify-ddb-scan-pagination`、`verify-config-profile-gate`、
   `verify-consistency-cli`、`verify-copyfile-toctou`、`verify-backup-lifecycle`。
-- **Phase B(走真实产品入口的完整生命周期,核心,跑一次)**:`verify-lifecycle-deadline`、
+- **Phase B(走真实产品入口的完整生命周期,核心,跑一次)**:`verify-egress-allowlist`
+  (`POST /hosts/egress` 是**改机队**的写操作,不是只读:`mode` 必填且只接受 `off|deny`,机队非空时
+  正常返 **202 + command_id**,只有 0 台活跃 host 才返 200。用 `{"mode":"off"}` 做空操作式验证,
+  并先用 `GET /hosts` 记下原 `egress_mode` 以便恢复)、`verify-lifecycle-deadline`、
   `verify-lifecycle-converge`、`verify-lifecycle-lease-port`、`verify-lifecycle-host-fanout`、
   `verify-observability-boot`。
 

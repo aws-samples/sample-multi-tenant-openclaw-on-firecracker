@@ -160,10 +160,11 @@ aws lambda update-alias --function-name "$fn" --name live --region "$REGION" --f
 
 ```bash
 aws lambda list-functions --region "$REGION" --query 'Functions[?starts_with(FunctionName,`openclaw-`)].FunctionName' --output text
-aws lambda get-function-configuration --function-name openclaw-api --region "$REGION" --query Role --output text
+aws lambda get-function-configuration --function-name openclaw-api --region "$REGION" --query Role --output text | awk -F/ '{print $NF}'
 ```
 
-第二条同时给出 Step 2 要授权的角色名;若列表里出现别的消费者,对它各跑一次同样的 `Role` 查询,
+第二条同时给出 Step 2 要授权的角色名 —— **注意 `--query Role` 返回的是 ARN**,`put-role-policy --role-name` 要的是**名字**,所以要取 ARN 的最后一段(上面的 `awk -F/` 就是干这个的);
+若列表里出现别的消费者,对它各跑一次同样的 `Role` 查询,
 两个角色都要授。列不出来或拿不准就**停下问**,不要猜函数名。
 
 
@@ -264,7 +265,8 @@ else aws s3 rm "s3://$ASSETS_BUCKET/$KEY" --region "$REGION"; fi
 lib/apply-lt.sh pull "$ASG" "$REGION"
 # —— 人工闸:pull 把【已渲染】那份写到下面这个文件,就在这份上改本次变更的几段 ——
 #    $HOME/.oc-apply-lt/$ASG.init-host.sh          <-- push 读的就是它
-grep -c '{{' "$HOME/.oc-apply-lt/$ASG.init-host.sh"     # 改完必须为 0
+! grep -q '{{' "$HOME/.oc-apply-lt/$ASG.init-host.sh"   # 必须为真(用 ! grep -q,不要用 grep -c:计数 0 时 grep 退出 1)
+touch lt-edit-done.txt                                  # 人工闸的回执,apply 会检查它
 # 确认无误后再继续:
 lib/apply-lt.sh push "$ASG" "$REGION"
 lib/apply-lt.sh promote "$ASG" "$REGION"
@@ -272,7 +274,9 @@ lib/apply-lt.sh refresh "$ASG" "$REGION"
 lib/apply-lt.sh verify "$ASG" "$REGION"
 ```
 
-**`pull` 与 `push` 之间必须停下来人工改**,不能串成一条命令:`push` 只读
+**`pull` 与 `push` 之间必须停下来人工改**,而且这个闸落在 `lt-edit-done.txt` 这个回执文件上,
+**不要把闸写成 shell 注释** —— `#` 之后的内容会被整条吃掉,`push`/`promote`/`refresh` 一条都不会跑。
+`push` 只读 `push` 只读
 `$HOME/.oc-apply-lt/$ASG.init-host.sh`,不读任何别的临时文件。对照
 `launch-template/init-host.sh.patched` 与已渲染那份的差异,**只改本次变更的那几段**,
 不要整文件替换(整替会把 CDK 已替换好的约 31 个值换回占位符)。

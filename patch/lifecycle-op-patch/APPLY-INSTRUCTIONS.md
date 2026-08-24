@@ -80,22 +80,27 @@ for st in (m.get("cloudformation") or {}).get("stacks", []):
         if got != want:
             print("CLOSURE MISMATCH", rel, str(want)[:12], got[:12]); bad += 1
 
-# ④ IAM 策略必须存在且能解析(第 2 步 fail-closed 前置就靠它)
+# ④ IAM 策略:钉住摘要(它会被 put-role-policy 装进生产,只解析不够 —— 改过的策略照样能解析)
+IAM_SHA = "4633b1a0cea733f83db92bc9bbb679af90c7cff06d82f82141f6942321b021e8"
 pol = pathlib.Path("iam/lifecycle-deadline-read.json")
 if not pol.is_file():
     print("IAM POLICY MISSING", pol); bad += 1
 else:
-    try:
-        json.loads(pol.read_text())
-    except Exception as exc:
-        print("IAM POLICY UNPARSEABLE", exc); bad += 1
+    got = hashlib.sha256(pol.read_bytes()).hexdigest()
+    if got != IAM_SHA:
+        print("IAM POLICY MISMATCH", got[:12], IAM_SHA[:12]); bad += 1
+    else:
+        try:
+            json.loads(pol.read_text())
+        except Exception as exc:
+            print("IAM POLICY UNPARSEABLE", exc); bad += 1
 
 print("mismatched:", bad)
 sys.exit(1 if bad else 0)
 PY
 ```
 
-摘要是 SHA-256。**四类都要过**:shipped 制品、`lib/` 工具、CloudFormation 闭包快照、IAM 策略 ——
+摘要是 SHA-256。**四类都要过**:shipped 制品、`lib/` 工具、CloudFormation 闭包快照、IAM 策略(摘要钉死在脚本里)——
 只核制品是不够的,后三类同样直接驱动生产变更(`lib/` 里的脚本会改机队,闭包快照决定第 4 步逐资源
 怎么决策,IAM 策略是第 2 步的 fail-closed 前置)。任何一条不等就停下,不要继续 —— 那说明 kit 被
 重新打包过或下载不完整。
@@ -105,13 +110,15 @@ PY
 ```bash
 for pair in "api openclaw-api" "backup openclaw-backup" "health_check openclaw-health-check" "scaler openclaw-scaler"; do
   set -- $pair; d=$1; fn=$2
-  aws lambda get-alias --function-name "$fn" --name live --region "$REGION" --query FunctionVersion --output text > "backup-version-$d.txt"
-  aws lambda get-function --function-name "$fn" --region "$REGION" --query Code.Location --output text | xargs curl -s -o "live-$d.zip"
+  # 锚点只建一次:重跑这一步若覆盖,备份就变成【已打补丁】的内容,回滚从此无效
+  [ -f "backup-version-$d.txt" ] || aws lambda get-alias --function-name "$fn" --name live --region "$REGION" --query FunctionVersion --output text > "backup-version-$d.txt" 2>/dev/null || true
+  [ -f "live-$d.zip" ] || aws lambda get-function --function-name "$fn" --region "$REGION" --query Code.Location --output text | xargs curl -s -o "live-$d.zip"
 done
 aws ec2 describe-launch-template-versions --launch-template-id "$LT_ID" --region "$REGION" --query 'LaunchTemplateVersions[?DefaultVersion==`true`].VersionNumber' --output text
 ```
 
-**四个函数都要单独备份** —— 本 kit 替换的是 `openclaw-api` / `openclaw-backup` /
+**锚点一律只建一次**(上面每条都带 `[ -f … ] ||`):重跑备份步骤若覆盖锚点,备份就成了已打补丁的
+内容,回滚从此无效 —— 这是最容易在「重试一下」时悄悄毁掉的东西。**四个函数都要单独备份** —— 本 kit 替换的是 `openclaw-api` / `openclaw-backup` /
 `openclaw-health-check` / `openclaw-scaler` 四个。**只有 `openclaw-api` 有 `live` 别名**,
 所以只有它需要备份别名版本号(回滚要回到别名当时真正在服务的那个版本);另外三个只需备份在役包。
 上面的循环对无别名的函数会在 `get-alias` 处报错,那是预期的,忽略即可。
@@ -274,7 +281,8 @@ lib/apply-api-routes.sh finalize lib/api-routes.spec.json "$API_ID" v1 "$REGION"
 ```bash
 KEY=deployment/observability/fluent-bit/install-fluent-bit.sh
 # 覆盖前先记该对象自己的前置版本(区分 404 与其他错误,瞬时错误不能被记成 ABSENT)
-if OUT=$(aws s3api head-object --bucket "$ASSETS_BUCKET" --key "$KEY" --region "$REGION" --query VersionId --output text 2>err.txt); then echo "$OUT" > prev-obs-version.txt
+if [ -f prev-obs-version.txt ]; then echo "anchor already recorded: $(cat prev-obs-version.txt)"
+elif OUT=$(aws s3api head-object --bucket "$ASSETS_BUCKET" --key "$KEY" --region "$REGION" --query VersionId --output text 2>err.txt); then echo "$OUT" > prev-obs-version.txt
 elif grep -q "Not Found\|404" err.txt; then echo ABSENT > prev-obs-version.txt
 else echo "head-object failed — refusing to guess the anchor" >&2; cat err.txt >&2; exit 1; fi
 aws s3 cp host-scripts/edge/fluent-bit/install-fluent-bit.sh "s3://$ASSETS_BUCKET/$KEY" --region "$REGION"

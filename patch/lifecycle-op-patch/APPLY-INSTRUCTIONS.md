@@ -77,8 +77,9 @@ aws ec2 describe-launch-template-versions --launch-template-id "$LT_ID" --region
 ```
 
 **四个函数都要单独备份** —— 本 kit 替换的是 `openclaw-api` / `openclaw-backup` /
-`openclaw-health-check` / `openclaw-scaler` 四个。备份的是**当前 `live` 别名指向的版本号**
-(不是 `$LATEST`:回滚要回到别名当时真正在服务的那个版本)以及在役包本体。
+`openclaw-health-check` / `openclaw-scaler` 四个。**只有 `openclaw-api` 有 `live` 别名**,
+所以只有它需要备份别名版本号(回滚要回到别名当时真正在服务的那个版本);另外三个只需备份在役包。
+上面的循环对无别名的函数会在 `get-alias` 处报错,那是预期的,忽略即可。
 机队会有版本漂移,**按 host 分别备份**,让每台各自回到自己的版本。
 
 ## Step 2 — 先补授权(fail-closed 前置,不能放到后面)
@@ -123,13 +124,13 @@ Lambda 走 **overlay**(复用在役包里的依赖,不要预打包 zip —— �
 目录 `api` / `backup` / `health_check` / `scaler` 各自的根里都有 `handler.py`。逐个函数:
 
 ```bash
-# 目录 → 真实函数名(注意 health_check 目录对应的是连字符名)
-d=api; fn=openclaw-api          # 四组各跑一次
+# 目录 → 真实函数名(health_check 目录对应连字符名)。**只有 openclaw-api 有 live 别名**
+d=api; fn=openclaw-api
 OLDREV=$(aws lambda get-function --function-name "$fn" --region "$REGION" --query Configuration.RevisionId --output text)
+aws lambda get-alias --function-name "$fn" --name live --region "$REGION" --query "[FunctionVersion,RevisionId]" --output text > "backup-alias-$d.txt"
 rm -rf "work-$d" && mkdir "work-$d" && (cd "work-$d" && unzip -q "../live-$d.zip")
-cp -a "lambda/$d/." "work-$d/"
-(cd "work-$d" && zip -qr "../overlay-$d.zip" .)
-unzip -p "overlay-$d.zip" handler.py > /dev/null    # 必须成功,证明入口在归档根
+cp -a "lambda/$d/." "work-$d/" && (cd "work-$d" && zip -qr "../overlay-$d.zip" .)
+unzip -p "overlay-$d.zip" handler.py > /dev/null
 aws lambda update-function-code --function-name "$fn" --region "$REGION" --zip-file "fileb://overlay-$d.zip" --revision-id "$OLDREV"
 aws lambda wait function-updated --function-name "$fn" --region "$REGION"
 NEWREV=$(aws lambda get-function --function-name "$fn" --region "$REGION" --query Configuration.RevisionId --output text)
@@ -137,25 +138,33 @@ NEWV=$(aws lambda publish-version --function-name "$fn" --region "$REGION" --rev
 WANT=$(openssl dgst -sha256 -binary "overlay-$d.zip" | base64)
 GOT=$(aws lambda get-function --function-name "$fn:$NEWV" --region "$REGION" --query Configuration.CodeSha256 --output text)
 [ "$WANT" = "$GOT" ] || { echo "CodeSha256 mismatch — do not flip the alias" >&2; exit 1; }
-aws lambda update-alias --function-name "$fn" --name live --region "$REGION" --function-version "$NEWV"
+aws lambda update-alias --function-name "$fn" --name live --region "$REGION" --function-version "$NEWV" --revision-id "$(cut -f2 "backup-alias-$d.txt")"
 ```
 
-三条顺序上的讲究,错一条就会半途失败:
+**另外三个函数没有 `live` 别名**(实测该栈里只有 `ApiHandler` 有 Alias 资源),所以
+`openclaw-backup` / `openclaw-health-check` / `openclaw-scaler` **直接更新 `$LATEST` 即可,
+不要发版、也没有别名可翻**;校验同样用 `CodeSha256`(对不带限定符的函数查),回滚就是把
+`live-$d.zip` 重新覆盖回去。给它们套别名流程会直接失败或只改了一半。
 
-- **`update-function-code` 本身会改 `RevisionId`**,所以旧 revision 只能给它自己做 CAS;
-  `publish-version` 必须**重新取**新 revision,否则会在 `$LATEST` 已被改之后才失败。
-- **只 `update-function-code` 是不够的**:那只改 `$LATEST`,而 API Gateway 打的是 `live` 别名,
-  会出现「事件源已跑新代码、同步 API 仍跑旧代码」的分裂。必须发版并把别名指过去。
-- **不要用 `invoke` 做校验**:`openclaw-backup` / `-health-check` / `-scaler` 被 `{}` 唤起会
-  真的跑它们的生产工作流(scaler 会动机队)。这里用 **`CodeSha256`** 比对 —— Lambda 就是按
-  `base64(sha256(zip))` 算的,是零副作用的等价判据,而且用 `[ "$WANT" = "$GOT" ]` 显式失败
-  (`--query FunctionError` 即使 handler 报错也退出 0,不能当门)。
+顺序上的三条讲究:
 
-回滚**两条都回**:别名指回 `backup-version-$d.txt` 里的版本,`$LATEST` 用 `live-$d.zip` 覆盖
-(SQS 事件源绑 `$LATEST`)。
+- **`update-function-code` 会改 `RevisionId`**,旧 revision 只能给它自己做 CAS;`publish-version`
+  必须**重新取**新 revision,否则会在 `$LATEST` 已改之后才失败。
+- **别名翻转也要 CAS**:带上翻转前读到的别名 `RevisionId`,否则会覆盖掉并发的另一次部署。
+- **不要用 `invoke` 做校验**:`backup` / `health-check` / `scaler` 被 `{}` 唤起会真的跑它们的
+  生产工作流(scaler 会动机队)。用 `CodeSha256` 比对 —— Lambda 就是按 `base64(sha256(zip))`
+  算的,零副作用且显式失败(`--query FunctionError` 即使 handler 报错也退出 0,不能当门)。
 
-若该环境还部署了共用同一份 api 包的消费者(例如生命周期消费者),按 `environment.json` 里的 Lambda
-清单对它做**同样的** overlay —— 不要照抄一份写死的函数名列表。
+若该环境还部署了共用同一份 api 包的消费者(例如生命周期消费者),对它做**同样的** overlay。
+`discover-env.sh` 只报控制面 API 那一条链,**不出通用 Lambda 清单**,所以自己列:
+
+```bash
+aws lambda list-functions --region "$REGION" --query 'Functions[?starts_with(FunctionName,`openclaw-`)].FunctionName' --output text
+aws lambda get-function-configuration --function-name openclaw-api --region "$REGION" --query Role --output text
+```
+
+第二条同时给出 Step 2 要授权的角色名;若列表里出现别的消费者,对它各跑一次同样的 `Role` 查询,
+两个角色都要授。列不出来或拿不准就**停下问**,不要猜函数名。
 
 
 先解在役包再覆盖,未改动的模块与依赖因此原样保留;`update-function-code` 之后 `invoke` 验
@@ -182,13 +191,20 @@ lib/apply-cfn-resources.sh plan resources/cloudformation "$REGION"
 ```bash
 for a in create suspend restore restart rebuild backup delete; do
   case "$a" in backup|delete) v=600 ;; *) v=180 ;; esac
-  aws ssm get-parameter --name "/openclaw/lifecycle/deadline-sec/$a" --region "$REGION" >/dev/null 2>&1 && echo "adopt existing: $a" || echo "will create: $a"
-  aws ssm put-parameter --name "/openclaw/lifecycle/deadline-sec/$a" --type String --value "$v" --overwrite --region "$REGION"
+  if CUR=$(aws ssm get-parameter --name "/openclaw/lifecycle/deadline-sec/$a" --region "$REGION" --query Parameter.Value --output text 2>/dev/null); then
+    echo "already set: $a = $CUR (left untouched)"
+  else
+    aws ssm put-parameter --name "/openclaw/lifecycle/deadline-sec/$a" --type String --value "$v" --region "$REGION"
+    echo "created: $a = $v"
+  fi
 done
 ```
 
-**每条区域性命令都要带 `--region "$REGION"`** —— 省掉它会落到 CLI 的默认区域,
-于是参数写到了别的区,而目标 Lambda 仍在用回落默认值,且没有任何报错。
+**只创建缺失的,不要盲目 `--overwrite`** —— 这一步会被重跑,而客户可能已经按自己的口径调过某几档;
+无条件覆盖会把他们的取值悄悄改回默认。要改已有值就单独做,并先记下原值。
+
+**每条区域性命令都要带 `--region "$REGION"`** —— 省掉它会落到 CLI 的默认区域,于是参数写到了别的区,
+而目标 Lambda 仍在用回落默认值,且没有任何报错。
 
 **4.2 API 路由 `POST /hosts/egress`** —— 用 spec 驱动,精确增删:
 

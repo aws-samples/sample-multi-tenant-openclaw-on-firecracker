@@ -105,11 +105,11 @@
       "patch_sha256": "da8020a02abe602515e2da0d76c5ebf2f342cbb6a5946d4a90c7ca651c478c22",
       "operations": [
         {
-          "resource": "运维/部署机侧文件 cli/oc-consistency.py(change=M;回滚方式随之不同)",
+          "resource": "运维/部署机侧文件 cli/oc-consistency.py(change=M,mode 0755)。回滚还的是**施加前的实际内容**(.pre-patch),不是 git checkout base —— 客户可能在 base 之后自己改过,checkout base 会把那些改动一起抹掉",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 host-scripts/deploy-machine/cli/oc-consistency.py $REPO_ROOT/cli/oc-consistency.py",
-          "verify_cli": "sha256sum host-scripts/deploy-machine/cli/oc-consistency.py $REPO_ROOT/cli/oc-consistency.py  # 两个摘要必须一致",
-          "rollback_cli": "git -C \"$REPO_ROOT\" checkout 81f3b884ca1226afdb107e7f8392d9334fd33493 -- \"cli/oc-consistency.py\"",
+          "apply_cli": "[ -f \"$REPO_ROOT/cli/oc-consistency.py.pre-patch\" ] || cp -p \"$REPO_ROOT/cli/oc-consistency.py\" \"$REPO_ROOT/cli/oc-consistency.py.pre-patch\" ; install -m 0755 -D host-scripts/deploy-machine/cli/oc-consistency.py \"$REPO_ROOT/cli/oc-consistency.py\"",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/cli/oc-consistency.py\" | cut -c1-64)\" = \"da8020a02abe602515e2da0d76c5ebf2f342cbb6a5946d4a90c7ca651c478c22\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/cli/oc-consistency.py\" | cut -c1-64)\" = \"da8020a02abe602515e2da0d76c5ebf2f342cbb6a5946d4a90c7ca651c478c22\" && cp -p \"$REPO_ROOT/cli/oc-consistency.py.pre-patch\" \"$REPO_ROOT/cli/oc-consistency.py\"  # 先证当前仍是本 patch(漂了就中止),再还施加前的实际内容",
           "artifact_refs": [
             "host-scripts/deploy-machine/cli/oc-consistency.py"
           ],
@@ -131,11 +131,11 @@
       "patch_sha256": "c7226f898247dd2fd7010a0b269b4bfa938dae5228e2abc1f91ed2fa093adade",
       "operations": [
         {
-          "resource": "运维/部署机侧文件 config.yml.example(change=M;回滚方式随之不同)",
+          "resource": "运维/部署机侧文件 config.yml.example(change=M,mode 0644)。回滚还的是**施加前的实际内容**(.pre-patch),不是 git checkout base —— 客户可能在 base 之后自己改过,checkout base 会把那些改动一起抹掉",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 host-scripts/deploy-machine/config.yml.example $REPO_ROOT/config.yml.example",
-          "verify_cli": "sha256sum host-scripts/deploy-machine/config.yml.example $REPO_ROOT/config.yml.example  # 两个摘要必须一致",
-          "rollback_cli": "git -C \"$REPO_ROOT\" checkout 81f3b884ca1226afdb107e7f8392d9334fd33493 -- \"config.yml.example\"",
+          "apply_cli": "[ -f \"$REPO_ROOT/config.yml.example.pre-patch\" ] || cp -p \"$REPO_ROOT/config.yml.example\" \"$REPO_ROOT/config.yml.example.pre-patch\" ; install -m 0644 -D host-scripts/deploy-machine/config.yml.example \"$REPO_ROOT/config.yml.example\"",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/config.yml.example\" | cut -c1-64)\" = \"c7226f898247dd2fd7010a0b269b4bfa938dae5228e2abc1f91ed2fa093adade\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/config.yml.example\" | cut -c1-64)\" = \"c7226f898247dd2fd7010a0b269b4bfa938dae5228e2abc1f91ed2fa093adade\" && cp -p \"$REPO_ROOT/config.yml.example.pre-patch\" \"$REPO_ROOT/config.yml.example\"  # 先证当前仍是本 patch(漂了就中止),再还施加前的实际内容",
           "artifact_refs": [
             "host-scripts/deploy-machine/config.yml.example"
           ],
@@ -160,11 +160,11 @@
       "patch_sha256": "d3ceafee0050acf67316991165f294d541edc3728870f1224b94772ba6745948",
       "operations": [
         {
-          "resource": "运维/部署机侧文件 deploy/console-bff/handler.mjs(change=M;回滚方式随之不同)",
+          "resource": "运维/部署机侧文件 deploy/console-bff/handler.mjs(change=M,mode 0644)。回滚还的是**施加前的实际内容**(.pre-patch),不是 git checkout base —— 客户可能在 base 之后自己改过,checkout base 会把那些改动一起抹掉",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 host-scripts/deploy-machine/deploy/console-bff/handler.mjs $REPO_ROOT/deploy/console-bff/handler.mjs",
-          "verify_cli": "sha256sum host-scripts/deploy-machine/deploy/console-bff/handler.mjs $REPO_ROOT/deploy/console-bff/handler.mjs  # 两个摘要必须一致",
-          "rollback_cli": "git -C \"$REPO_ROOT\" checkout 81f3b884ca1226afdb107e7f8392d9334fd33493 -- \"deploy/console-bff/handler.mjs\"",
+          "apply_cli": "[ -f \"$REPO_ROOT/deploy/console-bff/handler.mjs.pre-patch\" ] || cp -p \"$REPO_ROOT/deploy/console-bff/handler.mjs\" \"$REPO_ROOT/deploy/console-bff/handler.mjs.pre-patch\" ; install -m 0644 -D host-scripts/deploy-machine/deploy/console-bff/handler.mjs \"$REPO_ROOT/deploy/console-bff/handler.mjs\"",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/console-bff/handler.mjs\" | cut -c1-64)\" = \"d3ceafee0050acf67316991165f294d541edc3728870f1224b94772ba6745948\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/console-bff/handler.mjs\" | cut -c1-64)\" = \"d3ceafee0050acf67316991165f294d541edc3728870f1224b94772ba6745948\" && cp -p \"$REPO_ROOT/deploy/console-bff/handler.mjs.pre-patch\" \"$REPO_ROOT/deploy/console-bff/handler.mjs\"  # 先证当前仍是本 patch(漂了就中止),再还施加前的实际内容",
           "artifact_refs": [
             "host-scripts/deploy-machine/deploy/console-bff/handler.mjs"
           ],
@@ -186,11 +186,11 @@
       "patch_sha256": "02c954c87a5363c27662b2dfc7a6b7ec74be32e1b1359e2a66f1472b61a93d1a",
       "operations": [
         {
-          "resource": "运维/部署机侧文件 deploy/console-bff/sigv4-client.mjs(change=A;回滚方式随之不同)",
+          "resource": "运维/部署机侧新增文件 deploy/console-bff/sigv4-client.mjs(change=A,mode 0644)",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 host-scripts/deploy-machine/deploy/console-bff/sigv4-client.mjs $REPO_ROOT/deploy/console-bff/sigv4-client.mjs",
-          "verify_cli": "sha256sum host-scripts/deploy-machine/deploy/console-bff/sigv4-client.mjs $REPO_ROOT/deploy/console-bff/sigv4-client.mjs  # 两个摘要必须一致",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/console-bff/sigv4-client.mjs\" | cut -c1-64)\" = \"02c954c87a5363c27662b2dfc7a6b7ec74be32e1b1359e2a66f1472b61a93d1a\" && rm -f \"$REPO_ROOT/deploy/console-bff/sigv4-client.mjs\"  # 本次新增的路径在 base 上不存在,回滚是【移除】而不是 git checkout;先证内容仍是本 patch,漂了就中止",
+          "apply_cli": "install -m 0644 -D host-scripts/deploy-machine/deploy/console-bff/sigv4-client.mjs \"$REPO_ROOT/deploy/console-bff/sigv4-client.mjs\"",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/console-bff/sigv4-client.mjs\" | cut -c1-64)\" = \"02c954c87a5363c27662b2dfc7a6b7ec74be32e1b1359e2a66f1472b61a93d1a\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/console-bff/sigv4-client.mjs\" | cut -c1-64)\" = \"02c954c87a5363c27662b2dfc7a6b7ec74be32e1b1359e2a66f1472b61a93d1a\" && rm -f \"$REPO_ROOT/deploy/console-bff/sigv4-client.mjs\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
           "artifact_refs": [
             "host-scripts/deploy-machine/deploy/console-bff/sigv4-client.mjs"
           ],
@@ -212,11 +212,11 @@
       "patch_sha256": "cd3f113a3378a8b37a61e3802e28571b7f26ec71ab030236358b33985ef99356",
       "operations": [
         {
-          "resource": "运维/部署机侧文件 deploy/console-bff/sigv4.test.mjs(change=A;回滚方式随之不同)",
+          "resource": "运维/部署机侧新增文件 deploy/console-bff/sigv4.test.mjs(change=A,mode 0644)",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 host-scripts/deploy-machine/deploy/console-bff/sigv4.test.mjs $REPO_ROOT/deploy/console-bff/sigv4.test.mjs",
-          "verify_cli": "sha256sum host-scripts/deploy-machine/deploy/console-bff/sigv4.test.mjs $REPO_ROOT/deploy/console-bff/sigv4.test.mjs  # 两个摘要必须一致",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/console-bff/sigv4.test.mjs\" | cut -c1-64)\" = \"cd3f113a3378a8b37a61e3802e28571b7f26ec71ab030236358b33985ef99356\" && rm -f \"$REPO_ROOT/deploy/console-bff/sigv4.test.mjs\"  # 本次新增的路径在 base 上不存在,回滚是【移除】而不是 git checkout;先证内容仍是本 patch,漂了就中止",
+          "apply_cli": "install -m 0644 -D host-scripts/deploy-machine/deploy/console-bff/sigv4.test.mjs \"$REPO_ROOT/deploy/console-bff/sigv4.test.mjs\"",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/console-bff/sigv4.test.mjs\" | cut -c1-64)\" = \"cd3f113a3378a8b37a61e3802e28571b7f26ec71ab030236358b33985ef99356\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/console-bff/sigv4.test.mjs\" | cut -c1-64)\" = \"cd3f113a3378a8b37a61e3802e28571b7f26ec71ab030236358b33985ef99356\" && rm -f \"$REPO_ROOT/deploy/console-bff/sigv4.test.mjs\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
           "artifact_refs": [
             "host-scripts/deploy-machine/deploy/console-bff/sigv4.test.mjs"
           ],
@@ -238,11 +238,11 @@
       "patch_sha256": "9a5f680fa911e29fd826d7bf54cc2a5e93cf56ad5ea1d81f45f52f605f8ce431",
       "operations": [
         {
-          "resource": "运维/部署机侧文件 deploy/edge/fluent-bit/install-fluent-bit.sh(change=M;回滚方式随之不同)",
+          "resource": "运维/部署机侧文件 deploy/edge/fluent-bit/install-fluent-bit.sh(change=M,mode 0644)。回滚还的是**施加前的实际内容**(.pre-patch),不是 git checkout base —— 客户可能在 base 之后自己改过,checkout base 会把那些改动一起抹掉",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 host-scripts/edge/fluent-bit/install-fluent-bit.sh $REPO_ROOT/deploy/edge/fluent-bit/install-fluent-bit.sh",
-          "verify_cli": "sha256sum host-scripts/edge/fluent-bit/install-fluent-bit.sh $REPO_ROOT/deploy/edge/fluent-bit/install-fluent-bit.sh  # 两个摘要必须一致",
-          "rollback_cli": "git -C \"$REPO_ROOT\" checkout 81f3b884ca1226afdb107e7f8392d9334fd33493 -- \"deploy/edge/fluent-bit/install-fluent-bit.sh\"",
+          "apply_cli": "[ -f \"$REPO_ROOT/deploy/edge/fluent-bit/install-fluent-bit.sh.pre-patch\" ] || cp -p \"$REPO_ROOT/deploy/edge/fluent-bit/install-fluent-bit.sh\" \"$REPO_ROOT/deploy/edge/fluent-bit/install-fluent-bit.sh.pre-patch\" ; install -m 0644 -D host-scripts/edge/fluent-bit/install-fluent-bit.sh \"$REPO_ROOT/deploy/edge/fluent-bit/install-fluent-bit.sh\"",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/edge/fluent-bit/install-fluent-bit.sh\" | cut -c1-64)\" = \"9a5f680fa911e29fd826d7bf54cc2a5e93cf56ad5ea1d81f45f52f605f8ce431\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/edge/fluent-bit/install-fluent-bit.sh\" | cut -c1-64)\" = \"9a5f680fa911e29fd826d7bf54cc2a5e93cf56ad5ea1d81f45f52f605f8ce431\" && cp -p \"$REPO_ROOT/deploy/edge/fluent-bit/install-fluent-bit.sh.pre-patch\" \"$REPO_ROOT/deploy/edge/fluent-bit/install-fluent-bit.sh\"  # 先证当前仍是本 patch(漂了就中止),再还施加前的实际内容",
           "artifact_refs": [
             "host-scripts/edge/fluent-bit/install-fluent-bit.sh"
           ],
@@ -1260,11 +1260,11 @@
       "patch_sha256": "6e09d2e0a871f9d98a27e342803946f4ce4b4054f75ed4ef4e0905fe87272ed0",
       "operations": [
         {
-          "resource": "运维/部署机侧文件 deploy/packer/apse1.pkrvars.hcl(change=M;回滚方式随之不同)",
+          "resource": "运维/部署机侧文件 deploy/packer/apse1.pkrvars.hcl(change=M,mode 0644)。回滚还的是**施加前的实际内容**(.pre-patch),不是 git checkout base —— 客户可能在 base 之后自己改过,checkout base 会把那些改动一起抹掉",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 host-scripts/deploy-machine/deploy/packer/apse1.pkrvars.hcl $REPO_ROOT/deploy/packer/apse1.pkrvars.hcl",
-          "verify_cli": "sha256sum host-scripts/deploy-machine/deploy/packer/apse1.pkrvars.hcl $REPO_ROOT/deploy/packer/apse1.pkrvars.hcl  # 两个摘要必须一致",
-          "rollback_cli": "git -C \"$REPO_ROOT\" checkout 81f3b884ca1226afdb107e7f8392d9334fd33493 -- \"deploy/packer/apse1.pkrvars.hcl\"",
+          "apply_cli": "[ -f \"$REPO_ROOT/deploy/packer/apse1.pkrvars.hcl.pre-patch\" ] || cp -p \"$REPO_ROOT/deploy/packer/apse1.pkrvars.hcl\" \"$REPO_ROOT/deploy/packer/apse1.pkrvars.hcl.pre-patch\" ; install -m 0644 -D host-scripts/deploy-machine/deploy/packer/apse1.pkrvars.hcl \"$REPO_ROOT/deploy/packer/apse1.pkrvars.hcl\"",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/packer/apse1.pkrvars.hcl\" | cut -c1-64)\" = \"6e09d2e0a871f9d98a27e342803946f4ce4b4054f75ed4ef4e0905fe87272ed0\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/packer/apse1.pkrvars.hcl\" | cut -c1-64)\" = \"6e09d2e0a871f9d98a27e342803946f4ce4b4054f75ed4ef4e0905fe87272ed0\" && cp -p \"$REPO_ROOT/deploy/packer/apse1.pkrvars.hcl.pre-patch\" \"$REPO_ROOT/deploy/packer/apse1.pkrvars.hcl\"  # 先证当前仍是本 patch(漂了就中止),再还施加前的实际内容",
           "artifact_refs": [
             "host-scripts/deploy-machine/deploy/packer/apse1.pkrvars.hcl"
           ],
@@ -1287,11 +1287,11 @@
       "patch_sha256": "fecfdc30e060d1dcb67b6da038ced68f75b810aebc13eaea8ebf9ec40b2dd38f",
       "operations": [
         {
-          "resource": "运维/部署机侧文件 deploy/packer/assert-image.sh(change=M;回滚方式随之不同)",
+          "resource": "运维/部署机侧文件 deploy/packer/assert-image.sh(change=M,mode 0644)。回滚还的是**施加前的实际内容**(.pre-patch),不是 git checkout base —— 客户可能在 base 之后自己改过,checkout base 会把那些改动一起抹掉",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 host-scripts/deploy-machine/deploy/packer/assert-image.sh $REPO_ROOT/deploy/packer/assert-image.sh",
-          "verify_cli": "sha256sum host-scripts/deploy-machine/deploy/packer/assert-image.sh $REPO_ROOT/deploy/packer/assert-image.sh  # 两个摘要必须一致",
-          "rollback_cli": "git -C \"$REPO_ROOT\" checkout 81f3b884ca1226afdb107e7f8392d9334fd33493 -- \"deploy/packer/assert-image.sh\"",
+          "apply_cli": "[ -f \"$REPO_ROOT/deploy/packer/assert-image.sh.pre-patch\" ] || cp -p \"$REPO_ROOT/deploy/packer/assert-image.sh\" \"$REPO_ROOT/deploy/packer/assert-image.sh.pre-patch\" ; install -m 0644 -D host-scripts/deploy-machine/deploy/packer/assert-image.sh \"$REPO_ROOT/deploy/packer/assert-image.sh\"",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/packer/assert-image.sh\" | cut -c1-64)\" = \"fecfdc30e060d1dcb67b6da038ced68f75b810aebc13eaea8ebf9ec40b2dd38f\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/packer/assert-image.sh\" | cut -c1-64)\" = \"fecfdc30e060d1dcb67b6da038ced68f75b810aebc13eaea8ebf9ec40b2dd38f\" && cp -p \"$REPO_ROOT/deploy/packer/assert-image.sh.pre-patch\" \"$REPO_ROOT/deploy/packer/assert-image.sh\"  # 先证当前仍是本 patch(漂了就中止),再还施加前的实际内容",
           "artifact_refs": [
             "host-scripts/deploy-machine/deploy/packer/assert-image.sh"
           ],
@@ -1313,11 +1313,11 @@
       "patch_sha256": "dbd201fd9f516505b32d40eba94c2db6126560b94618afe65ee517f055d714e7",
       "operations": [
         {
-          "resource": "运维/部署机侧文件 deploy/packer/assert-parity.sh(change=M;回滚方式随之不同)",
+          "resource": "运维/部署机侧文件 deploy/packer/assert-parity.sh(change=M,mode 0755)。回滚还的是**施加前的实际内容**(.pre-patch),不是 git checkout base —— 客户可能在 base 之后自己改过,checkout base 会把那些改动一起抹掉",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 host-scripts/deploy-machine/deploy/packer/assert-parity.sh $REPO_ROOT/deploy/packer/assert-parity.sh",
-          "verify_cli": "sha256sum host-scripts/deploy-machine/deploy/packer/assert-parity.sh $REPO_ROOT/deploy/packer/assert-parity.sh  # 两个摘要必须一致",
-          "rollback_cli": "git -C \"$REPO_ROOT\" checkout 81f3b884ca1226afdb107e7f8392d9334fd33493 -- \"deploy/packer/assert-parity.sh\"",
+          "apply_cli": "[ -f \"$REPO_ROOT/deploy/packer/assert-parity.sh.pre-patch\" ] || cp -p \"$REPO_ROOT/deploy/packer/assert-parity.sh\" \"$REPO_ROOT/deploy/packer/assert-parity.sh.pre-patch\" ; install -m 0755 -D host-scripts/deploy-machine/deploy/packer/assert-parity.sh \"$REPO_ROOT/deploy/packer/assert-parity.sh\"",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/packer/assert-parity.sh\" | cut -c1-64)\" = \"dbd201fd9f516505b32d40eba94c2db6126560b94618afe65ee517f055d714e7\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/packer/assert-parity.sh\" | cut -c1-64)\" = \"dbd201fd9f516505b32d40eba94c2db6126560b94618afe65ee517f055d714e7\" && cp -p \"$REPO_ROOT/deploy/packer/assert-parity.sh.pre-patch\" \"$REPO_ROOT/deploy/packer/assert-parity.sh\"  # 先证当前仍是本 patch(漂了就中止),再还施加前的实际内容",
           "artifact_refs": [
             "host-scripts/deploy-machine/deploy/packer/assert-parity.sh"
           ],
@@ -1339,11 +1339,11 @@
       "patch_sha256": "2943af23759e8ee9519e169f9d15b104f5734ae71f289633dbdb77c355f183cc",
       "operations": [
         {
-          "resource": "运维/部署机侧文件 deploy/packer/build-golden-ami.sh(change=A;回滚方式随之不同)",
+          "resource": "运维/部署机侧新增文件 deploy/packer/build-golden-ami.sh(change=A,mode 0644)",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 host-scripts/deploy-machine/deploy/packer/build-golden-ami.sh $REPO_ROOT/deploy/packer/build-golden-ami.sh",
-          "verify_cli": "sha256sum host-scripts/deploy-machine/deploy/packer/build-golden-ami.sh $REPO_ROOT/deploy/packer/build-golden-ami.sh  # 两个摘要必须一致",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/packer/build-golden-ami.sh\" | cut -c1-64)\" = \"2943af23759e8ee9519e169f9d15b104f5734ae71f289633dbdb77c355f183cc\" && rm -f \"$REPO_ROOT/deploy/packer/build-golden-ami.sh\"  # 本次新增的路径在 base 上不存在,回滚是【移除】而不是 git checkout;先证内容仍是本 patch,漂了就中止",
+          "apply_cli": "install -m 0644 -D host-scripts/deploy-machine/deploy/packer/build-golden-ami.sh \"$REPO_ROOT/deploy/packer/build-golden-ami.sh\"",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/packer/build-golden-ami.sh\" | cut -c1-64)\" = \"2943af23759e8ee9519e169f9d15b104f5734ae71f289633dbdb77c355f183cc\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/packer/build-golden-ami.sh\" | cut -c1-64)\" = \"2943af23759e8ee9519e169f9d15b104f5734ae71f289633dbdb77c355f183cc\" && rm -f \"$REPO_ROOT/deploy/packer/build-golden-ami.sh\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
           "artifact_refs": [
             "host-scripts/deploy-machine/deploy/packer/build-golden-ami.sh"
           ],
@@ -1368,11 +1368,11 @@
       "patch_sha256": null,
       "operations": [
         {
-          "resource": "已删除来源:deploy/packer/customize.sh.default —— 在役 host 与桶里的同名残留必须主动移除,不是「不再复制」就够(change=D;回滚方式随之不同)",
+          "resource": "运维/部署机侧文件 deploy/packer/customize.sh.default 的**删除**(change=D)。它只存在于仓库树里 —— 不要去删 S3 对象或 host 上的同名文件,那是别的分发面",
           "class": "MANUAL_CLI_REVIEW",
-          "apply_cli": "aws s3 rm s3://$ASSETS_BUCKET/deployment/scripts/customize.sh.default && aws ssm send-command --document-name AWS-RunShellScript --parameters commands='rm -f /home/ubuntu/customize.sh.default' --instance-ids $HOST_IDS",
-          "verify_cli": "aws s3 ls s3://$ASSETS_BUCKET/deployment/scripts/customize.sh.default  # 必须无输出",
-          "rollback_cli": "git -C \"$REPO_ROOT\" checkout 81f3b884ca1226afdb107e7f8392d9334fd33493 -- \"deploy/packer/customize.sh.default\"",
+          "apply_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/packer/customize.sh.default\" | cut -c1-64)\" = \"1689848c6f87ecfa6f66f58344e25f43bb8117d4e291af516c15c6d1f0d739b6\" && cp -p \"$REPO_ROOT/deploy/packer/customize.sh.default\" \"$REPO_ROOT/deploy/packer/customize.sh.default.pre-patch\" && rm -f \"$REPO_ROOT/deploy/packer/customize.sh.default\"  # 先证仓库里那份仍是 base 内容,并留一份 .pre-patch 供回滚",
+          "verify_cli": "test ! -e \"$REPO_ROOT/deploy/packer/customize.sh.default\"",
+          "rollback_cli": "cp -p \"$REPO_ROOT/deploy/packer/customize.sh.default.pre-patch\" \"$REPO_ROOT/deploy/packer/customize.sh.default\"",
           "artifact_refs": [],
           "rollback_policy": "RESTORE",
           "resource_refs": []
@@ -1392,11 +1392,11 @@
       "patch_sha256": "2f716cfe54d1e3c0658564a9fb5129d3f5963327c0ba930bdeb838465faecb26",
       "operations": [
         {
-          "resource": "运维/部署机侧文件 deploy/packer/hooks/50-example.sh.example(change=R;回滚方式随之不同)",
+          "resource": "运维/部署机侧文件重命名 deploy/packer/customize.sh.example → deploy/packer/hooks/50-example.sh.example(change=R,mode 0644)。新父目录可能不存在,必须 install -D;旧路径也要清掉,否则两份并存",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 host-scripts/deploy-machine/deploy/packer/hooks/50-example.sh.example $REPO_ROOT/deploy/packer/hooks/50-example.sh.example",
-          "verify_cli": "sha256sum host-scripts/deploy-machine/deploy/packer/hooks/50-example.sh.example $REPO_ROOT/deploy/packer/hooks/50-example.sh.example  # 两个摘要必须一致",
-          "rollback_cli": "git -C \"$REPO_ROOT\" checkout 81f3b884ca1226afdb107e7f8392d9334fd33493 -- \"deploy/packer/customize.sh.example\" && rm -f \"$REPO_ROOT/deploy/packer/hooks/50-example.sh.example\"  # 重命名要两边都还:恢复旧路径 + 移除新路径",
+          "apply_cli": "install -m 0644 -D host-scripts/deploy-machine/deploy/packer/hooks/50-example.sh.example \"$REPO_ROOT/deploy/packer/hooks/50-example.sh.example\" && test \"$(sha256sum \"$REPO_ROOT/deploy/packer/customize.sh.example\" | cut -c1-64)\" = \"74f8df4e38c38c1932fde71a8c6f8553915cb9d4d7a7373c331e1c65b7604463\" && rm -f \"$REPO_ROOT/deploy/packer/customize.sh.example\"  # 先落新路径(带 -D 建父目录),证旧路径仍是 base 内容再清掉",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/packer/hooks/50-example.sh.example\" | cut -c1-64)\" = \"2f716cfe54d1e3c0658564a9fb5129d3f5963327c0ba930bdeb838465faecb26\" && test ! -e \"$REPO_ROOT/deploy/packer/customize.sh.example\"",
+          "rollback_cli": "git -C \"$REPO_ROOT\" checkout 81f3b884ca1226afdb107e7f8392d9334fd33493 -- \"deploy/packer/customize.sh.example\" && rm -f \"$REPO_ROOT/deploy/packer/hooks/50-example.sh.example\"  # 两边都还:恢复旧路径 + 移除新路径",
           "artifact_refs": [
             "host-scripts/deploy-machine/deploy/packer/hooks/50-example.sh.example"
           ],
@@ -1447,11 +1447,11 @@
       "patch_sha256": "b2976f425f8c99d0689f6fc876f02dc3dfb8af463242d224e9ee6b6836895b79",
       "operations": [
         {
-          "resource": "运维/部署机侧文件 deploy/packer/host-golden.pkr.hcl(change=M;回滚方式随之不同)",
+          "resource": "运维/部署机侧文件 deploy/packer/host-golden.pkr.hcl(change=M,mode 0644)。回滚还的是**施加前的实际内容**(.pre-patch),不是 git checkout base —— 客户可能在 base 之后自己改过,checkout base 会把那些改动一起抹掉",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 host-scripts/deploy-machine/deploy/packer/host-golden.pkr.hcl $REPO_ROOT/deploy/packer/host-golden.pkr.hcl",
-          "verify_cli": "sha256sum host-scripts/deploy-machine/deploy/packer/host-golden.pkr.hcl $REPO_ROOT/deploy/packer/host-golden.pkr.hcl  # 两个摘要必须一致",
-          "rollback_cli": "git -C \"$REPO_ROOT\" checkout 81f3b884ca1226afdb107e7f8392d9334fd33493 -- \"deploy/packer/host-golden.pkr.hcl\"",
+          "apply_cli": "[ -f \"$REPO_ROOT/deploy/packer/host-golden.pkr.hcl.pre-patch\" ] || cp -p \"$REPO_ROOT/deploy/packer/host-golden.pkr.hcl\" \"$REPO_ROOT/deploy/packer/host-golden.pkr.hcl.pre-patch\" ; install -m 0644 -D host-scripts/deploy-machine/deploy/packer/host-golden.pkr.hcl \"$REPO_ROOT/deploy/packer/host-golden.pkr.hcl\"",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/packer/host-golden.pkr.hcl\" | cut -c1-64)\" = \"b2976f425f8c99d0689f6fc876f02dc3dfb8af463242d224e9ee6b6836895b79\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/packer/host-golden.pkr.hcl\" | cut -c1-64)\" = \"b2976f425f8c99d0689f6fc876f02dc3dfb8af463242d224e9ee6b6836895b79\" && cp -p \"$REPO_ROOT/deploy/packer/host-golden.pkr.hcl.pre-patch\" \"$REPO_ROOT/deploy/packer/host-golden.pkr.hcl\"  # 先证当前仍是本 patch(漂了就中止),再还施加前的实际内容",
           "artifact_refs": [
             "host-scripts/deploy-machine/deploy/packer/host-golden.pkr.hcl"
           ],
@@ -1474,11 +1474,11 @@
       "patch_sha256": "2a52310c7ce8c03a8dbca8c0edcae9dc28364505762c14768a676492632d040d",
       "operations": [
         {
-          "resource": "运维/部署机侧文件 deploy/packer/run-hooks.sh(change=A;回滚方式随之不同)",
+          "resource": "运维/部署机侧新增文件 deploy/packer/run-hooks.sh(change=A,mode 0644)",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 host-scripts/deploy-machine/deploy/packer/run-hooks.sh $REPO_ROOT/deploy/packer/run-hooks.sh",
-          "verify_cli": "sha256sum host-scripts/deploy-machine/deploy/packer/run-hooks.sh $REPO_ROOT/deploy/packer/run-hooks.sh  # 两个摘要必须一致",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/packer/run-hooks.sh\" | cut -c1-64)\" = \"2a52310c7ce8c03a8dbca8c0edcae9dc28364505762c14768a676492632d040d\" && rm -f \"$REPO_ROOT/deploy/packer/run-hooks.sh\"  # 本次新增的路径在 base 上不存在,回滚是【移除】而不是 git checkout;先证内容仍是本 patch,漂了就中止",
+          "apply_cli": "install -m 0644 -D host-scripts/deploy-machine/deploy/packer/run-hooks.sh \"$REPO_ROOT/deploy/packer/run-hooks.sh\"",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/packer/run-hooks.sh\" | cut -c1-64)\" = \"2a52310c7ce8c03a8dbca8c0edcae9dc28364505762c14768a676492632d040d\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/packer/run-hooks.sh\" | cut -c1-64)\" = \"2a52310c7ce8c03a8dbca8c0edcae9dc28364505762c14768a676492632d040d\" && rm -f \"$REPO_ROOT/deploy/packer/run-hooks.sh\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
           "artifact_refs": [
             "host-scripts/deploy-machine/deploy/packer/run-hooks.sh"
           ],
@@ -3602,11 +3602,11 @@
       "patch_sha256": "34a587fd744f2b77cac87d89ed9b443b713403373182b2511f6753c727b63398",
       "operations": [
         {
-          "resource": "运维/部署机侧文件 samples/config-sg-prod.yaml(change=M;回滚方式随之不同)",
+          "resource": "运维/部署机侧文件 samples/config-sg-prod.yaml(change=M,mode 0644)。回滚还的是**施加前的实际内容**(.pre-patch),不是 git checkout base —— 客户可能在 base 之后自己改过,checkout base 会把那些改动一起抹掉",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 host-scripts/deploy-machine/samples/config-sg-prod.yaml $REPO_ROOT/samples/config-sg-prod.yaml",
-          "verify_cli": "sha256sum host-scripts/deploy-machine/samples/config-sg-prod.yaml $REPO_ROOT/samples/config-sg-prod.yaml  # 两个摘要必须一致",
-          "rollback_cli": "git -C \"$REPO_ROOT\" checkout 81f3b884ca1226afdb107e7f8392d9334fd33493 -- \"samples/config-sg-prod.yaml\"",
+          "apply_cli": "[ -f \"$REPO_ROOT/samples/config-sg-prod.yaml.pre-patch\" ] || cp -p \"$REPO_ROOT/samples/config-sg-prod.yaml\" \"$REPO_ROOT/samples/config-sg-prod.yaml.pre-patch\" ; install -m 0644 -D host-scripts/deploy-machine/samples/config-sg-prod.yaml \"$REPO_ROOT/samples/config-sg-prod.yaml\"",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/samples/config-sg-prod.yaml\" | cut -c1-64)\" = \"34a587fd744f2b77cac87d89ed9b443b713403373182b2511f6753c727b63398\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/samples/config-sg-prod.yaml\" | cut -c1-64)\" = \"34a587fd744f2b77cac87d89ed9b443b713403373182b2511f6753c727b63398\" && cp -p \"$REPO_ROOT/samples/config-sg-prod.yaml.pre-patch\" \"$REPO_ROOT/samples/config-sg-prod.yaml\"  # 先证当前仍是本 patch(漂了就中止),再还施加前的实际内容",
           "artifact_refs": [
             "host-scripts/deploy-machine/samples/config-sg-prod.yaml"
           ],
@@ -3655,11 +3655,11 @@
       "patch_sha256": "171ba91d63b0456c766730fd3fc501e6cb82500974e52447995d9bf4fd5a7c97",
       "operations": [
         {
-          "resource": "运维/部署机侧文件 samples/profiles/minimal-test.yml(change=A;回滚方式随之不同)",
+          "resource": "运维/部署机侧新增文件 samples/profiles/minimal-test.yml(change=A,mode 0644)",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 host-scripts/deploy-machine/samples/profiles/minimal-test.yml $REPO_ROOT/samples/profiles/minimal-test.yml",
-          "verify_cli": "sha256sum host-scripts/deploy-machine/samples/profiles/minimal-test.yml $REPO_ROOT/samples/profiles/minimal-test.yml  # 两个摘要必须一致",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/samples/profiles/minimal-test.yml\" | cut -c1-64)\" = \"171ba91d63b0456c766730fd3fc501e6cb82500974e52447995d9bf4fd5a7c97\" && rm -f \"$REPO_ROOT/samples/profiles/minimal-test.yml\"  # 本次新增的路径在 base 上不存在,回滚是【移除】而不是 git checkout;先证内容仍是本 patch,漂了就中止",
+          "apply_cli": "install -m 0644 -D host-scripts/deploy-machine/samples/profiles/minimal-test.yml \"$REPO_ROOT/samples/profiles/minimal-test.yml\"",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/samples/profiles/minimal-test.yml\" | cut -c1-64)\" = \"171ba91d63b0456c766730fd3fc501e6cb82500974e52447995d9bf4fd5a7c97\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/samples/profiles/minimal-test.yml\" | cut -c1-64)\" = \"171ba91d63b0456c766730fd3fc501e6cb82500974e52447995d9bf4fd5a7c97\" && rm -f \"$REPO_ROOT/samples/profiles/minimal-test.yml\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
           "artifact_refs": [
             "host-scripts/deploy-machine/samples/profiles/minimal-test.yml"
           ],
@@ -3681,11 +3681,11 @@
       "patch_sha256": "c536596d6bfc8a5202d97fcdd2ace80f27c43e262ebe5272adcfd59624890093",
       "operations": [
         {
-          "resource": "运维/部署机侧文件 samples/profiles/private-enterprise.yml(change=A;回滚方式随之不同)",
+          "resource": "运维/部署机侧新增文件 samples/profiles/private-enterprise.yml(change=A,mode 0644)",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 host-scripts/deploy-machine/samples/profiles/private-enterprise.yml $REPO_ROOT/samples/profiles/private-enterprise.yml",
-          "verify_cli": "sha256sum host-scripts/deploy-machine/samples/profiles/private-enterprise.yml $REPO_ROOT/samples/profiles/private-enterprise.yml  # 两个摘要必须一致",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/samples/profiles/private-enterprise.yml\" | cut -c1-64)\" = \"c536596d6bfc8a5202d97fcdd2ace80f27c43e262ebe5272adcfd59624890093\" && rm -f \"$REPO_ROOT/samples/profiles/private-enterprise.yml\"  # 本次新增的路径在 base 上不存在,回滚是【移除】而不是 git checkout;先证内容仍是本 patch,漂了就中止",
+          "apply_cli": "install -m 0644 -D host-scripts/deploy-machine/samples/profiles/private-enterprise.yml \"$REPO_ROOT/samples/profiles/private-enterprise.yml\"",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/samples/profiles/private-enterprise.yml\" | cut -c1-64)\" = \"c536596d6bfc8a5202d97fcdd2ace80f27c43e262ebe5272adcfd59624890093\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/samples/profiles/private-enterprise.yml\" | cut -c1-64)\" = \"c536596d6bfc8a5202d97fcdd2ace80f27c43e262ebe5272adcfd59624890093\" && rm -f \"$REPO_ROOT/samples/profiles/private-enterprise.yml\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
           "artifact_refs": [
             "host-scripts/deploy-machine/samples/profiles/private-enterprise.yml"
           ],
@@ -3707,11 +3707,11 @@
       "patch_sha256": "2f9d94f824ee446fcb82c63832a4f2a3a6d7f0cc9b01b4bba2fcf8f2043ea86d",
       "operations": [
         {
-          "resource": "运维/部署机侧文件 samples/profiles/public-demo.yml(change=A;回滚方式随之不同)",
+          "resource": "运维/部署机侧新增文件 samples/profiles/public-demo.yml(change=A,mode 0644)",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 host-scripts/deploy-machine/samples/profiles/public-demo.yml $REPO_ROOT/samples/profiles/public-demo.yml",
-          "verify_cli": "sha256sum host-scripts/deploy-machine/samples/profiles/public-demo.yml $REPO_ROOT/samples/profiles/public-demo.yml  # 两个摘要必须一致",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/samples/profiles/public-demo.yml\" | cut -c1-64)\" = \"2f9d94f824ee446fcb82c63832a4f2a3a6d7f0cc9b01b4bba2fcf8f2043ea86d\" && rm -f \"$REPO_ROOT/samples/profiles/public-demo.yml\"  # 本次新增的路径在 base 上不存在,回滚是【移除】而不是 git checkout;先证内容仍是本 patch,漂了就中止",
+          "apply_cli": "install -m 0644 -D host-scripts/deploy-machine/samples/profiles/public-demo.yml \"$REPO_ROOT/samples/profiles/public-demo.yml\"",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/samples/profiles/public-demo.yml\" | cut -c1-64)\" = \"2f9d94f824ee446fcb82c63832a4f2a3a6d7f0cc9b01b4bba2fcf8f2043ea86d\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/samples/profiles/public-demo.yml\" | cut -c1-64)\" = \"2f9d94f824ee446fcb82c63832a4f2a3a6d7f0cc9b01b4bba2fcf8f2043ea86d\" && rm -f \"$REPO_ROOT/samples/profiles/public-demo.yml\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
           "artifact_refs": [
             "host-scripts/deploy-machine/samples/profiles/public-demo.yml"
           ],
@@ -3733,11 +3733,11 @@
       "patch_sha256": "126da373939ea91208d770ab4b4872f8c891ba40c816797eb44b9ee97ef5c37f",
       "operations": [
         {
-          "resource": "运维/部署机侧文件 scripts/checks/config-gate.sh(change=A;回滚方式随之不同)",
+          "resource": "运维/部署机侧新增文件 scripts/checks/config-gate.sh(change=A,mode 0755)",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 host-scripts/deploy-machine/scripts/checks/config-gate.sh $REPO_ROOT/scripts/checks/config-gate.sh",
-          "verify_cli": "sha256sum host-scripts/deploy-machine/scripts/checks/config-gate.sh $REPO_ROOT/scripts/checks/config-gate.sh  # 两个摘要必须一致",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/config-gate.sh\" | cut -c1-64)\" = \"126da373939ea91208d770ab4b4872f8c891ba40c816797eb44b9ee97ef5c37f\" && rm -f \"$REPO_ROOT/scripts/checks/config-gate.sh\"  # 本次新增的路径在 base 上不存在,回滚是【移除】而不是 git checkout;先证内容仍是本 patch,漂了就中止",
+          "apply_cli": "install -m 0755 -D host-scripts/deploy-machine/scripts/checks/config-gate.sh \"$REPO_ROOT/scripts/checks/config-gate.sh\"",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/config-gate.sh\" | cut -c1-64)\" = \"126da373939ea91208d770ab4b4872f8c891ba40c816797eb44b9ee97ef5c37f\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/config-gate.sh\" | cut -c1-64)\" = \"126da373939ea91208d770ab4b4872f8c891ba40c816797eb44b9ee97ef5c37f\" && rm -f \"$REPO_ROOT/scripts/checks/config-gate.sh\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
           "artifact_refs": [
             "host-scripts/deploy-machine/scripts/checks/config-gate.sh"
           ],
@@ -3759,11 +3759,11 @@
       "patch_sha256": "5aa7a3244a9a4217cbbbcbb1f09f9ae8497c9c32a10d90402cd01d2629a242a1",
       "operations": [
         {
-          "resource": "运维/部署机侧文件 scripts/checks/create-deadline-config.py(change=A;回滚方式随之不同)",
+          "resource": "运维/部署机侧新增文件 scripts/checks/create-deadline-config.py(change=A,mode 0755)",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 host-scripts/deploy-machine/scripts/checks/create-deadline-config.py $REPO_ROOT/scripts/checks/create-deadline-config.py",
-          "verify_cli": "sha256sum host-scripts/deploy-machine/scripts/checks/create-deadline-config.py $REPO_ROOT/scripts/checks/create-deadline-config.py  # 两个摘要必须一致",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/create-deadline-config.py\" | cut -c1-64)\" = \"5aa7a3244a9a4217cbbbcbb1f09f9ae8497c9c32a10d90402cd01d2629a242a1\" && rm -f \"$REPO_ROOT/scripts/checks/create-deadline-config.py\"  # 本次新增的路径在 base 上不存在,回滚是【移除】而不是 git checkout;先证内容仍是本 patch,漂了就中止",
+          "apply_cli": "install -m 0755 -D host-scripts/deploy-machine/scripts/checks/create-deadline-config.py \"$REPO_ROOT/scripts/checks/create-deadline-config.py\"",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/create-deadline-config.py\" | cut -c1-64)\" = \"5aa7a3244a9a4217cbbbcbb1f09f9ae8497c9c32a10d90402cd01d2629a242a1\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/create-deadline-config.py\" | cut -c1-64)\" = \"5aa7a3244a9a4217cbbbcbb1f09f9ae8497c9c32a10d90402cd01d2629a242a1\" && rm -f \"$REPO_ROOT/scripts/checks/create-deadline-config.py\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
           "artifact_refs": [
             "host-scripts/deploy-machine/scripts/checks/create-deadline-config.py"
           ],
@@ -3785,11 +3785,11 @@
       "patch_sha256": "bc9ca37c369b034d5688b5eb53d59e0e57e14d60f684956ec7ae85ad975ffc06",
       "operations": [
         {
-          "resource": "运维/部署机侧文件 scripts/checks/create-deadline-config.sh(change=A;回滚方式随之不同)",
+          "resource": "运维/部署机侧新增文件 scripts/checks/create-deadline-config.sh(change=A,mode 0755)",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 host-scripts/deploy-machine/scripts/checks/create-deadline-config.sh $REPO_ROOT/scripts/checks/create-deadline-config.sh",
-          "verify_cli": "sha256sum host-scripts/deploy-machine/scripts/checks/create-deadline-config.sh $REPO_ROOT/scripts/checks/create-deadline-config.sh  # 两个摘要必须一致",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/create-deadline-config.sh\" | cut -c1-64)\" = \"bc9ca37c369b034d5688b5eb53d59e0e57e14d60f684956ec7ae85ad975ffc06\" && rm -f \"$REPO_ROOT/scripts/checks/create-deadline-config.sh\"  # 本次新增的路径在 base 上不存在,回滚是【移除】而不是 git checkout;先证内容仍是本 patch,漂了就中止",
+          "apply_cli": "install -m 0755 -D host-scripts/deploy-machine/scripts/checks/create-deadline-config.sh \"$REPO_ROOT/scripts/checks/create-deadline-config.sh\"",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/create-deadline-config.sh\" | cut -c1-64)\" = \"bc9ca37c369b034d5688b5eb53d59e0e57e14d60f684956ec7ae85ad975ffc06\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/create-deadline-config.sh\" | cut -c1-64)\" = \"bc9ca37c369b034d5688b5eb53d59e0e57e14d60f684956ec7ae85ad975ffc06\" && rm -f \"$REPO_ROOT/scripts/checks/create-deadline-config.sh\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
           "artifact_refs": [
             "host-scripts/deploy-machine/scripts/checks/create-deadline-config.sh"
           ],
@@ -3811,11 +3811,11 @@
       "patch_sha256": "14c5b5c874cd78a225fb6409d9872321c818cb6556f6bfc213d06d93a014ec1f",
       "operations": [
         {
-          "resource": "运维/部署机侧文件 scripts/checks/ddb-scan-pagination.py(change=A;回滚方式随之不同)",
+          "resource": "运维/部署机侧新增文件 scripts/checks/ddb-scan-pagination.py(change=A,mode 0755)",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 host-scripts/deploy-machine/scripts/checks/ddb-scan-pagination.py $REPO_ROOT/scripts/checks/ddb-scan-pagination.py",
-          "verify_cli": "sha256sum host-scripts/deploy-machine/scripts/checks/ddb-scan-pagination.py $REPO_ROOT/scripts/checks/ddb-scan-pagination.py  # 两个摘要必须一致",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.py\" | cut -c1-64)\" = \"14c5b5c874cd78a225fb6409d9872321c818cb6556f6bfc213d06d93a014ec1f\" && rm -f \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.py\"  # 本次新增的路径在 base 上不存在,回滚是【移除】而不是 git checkout;先证内容仍是本 patch,漂了就中止",
+          "apply_cli": "install -m 0755 -D host-scripts/deploy-machine/scripts/checks/ddb-scan-pagination.py \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.py\"",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.py\" | cut -c1-64)\" = \"14c5b5c874cd78a225fb6409d9872321c818cb6556f6bfc213d06d93a014ec1f\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.py\" | cut -c1-64)\" = \"14c5b5c874cd78a225fb6409d9872321c818cb6556f6bfc213d06d93a014ec1f\" && rm -f \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.py\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
           "artifact_refs": [
             "host-scripts/deploy-machine/scripts/checks/ddb-scan-pagination.py"
           ],
@@ -3838,11 +3838,11 @@
       "patch_sha256": "0da4c4dd766d025a9fbdb74c98c14cadaae64d5922200d1408d19c9e7f85accd",
       "operations": [
         {
-          "resource": "运维/部署机侧文件 scripts/checks/ddb-scan-pagination.sh(change=A;回滚方式随之不同)",
+          "resource": "运维/部署机侧新增文件 scripts/checks/ddb-scan-pagination.sh(change=A,mode 0755)",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 host-scripts/deploy-machine/scripts/checks/ddb-scan-pagination.sh $REPO_ROOT/scripts/checks/ddb-scan-pagination.sh",
-          "verify_cli": "sha256sum host-scripts/deploy-machine/scripts/checks/ddb-scan-pagination.sh $REPO_ROOT/scripts/checks/ddb-scan-pagination.sh  # 两个摘要必须一致",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.sh\" | cut -c1-64)\" = \"0da4c4dd766d025a9fbdb74c98c14cadaae64d5922200d1408d19c9e7f85accd\" && rm -f \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.sh\"  # 本次新增的路径在 base 上不存在,回滚是【移除】而不是 git checkout;先证内容仍是本 patch,漂了就中止",
+          "apply_cli": "install -m 0755 -D host-scripts/deploy-machine/scripts/checks/ddb-scan-pagination.sh \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.sh\"",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.sh\" | cut -c1-64)\" = \"0da4c4dd766d025a9fbdb74c98c14cadaae64d5922200d1408d19c9e7f85accd\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.sh\" | cut -c1-64)\" = \"0da4c4dd766d025a9fbdb74c98c14cadaae64d5922200d1408d19c9e7f85accd\" && rm -f \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.sh\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
           "artifact_refs": [
             "host-scripts/deploy-machine/scripts/checks/ddb-scan-pagination.sh"
           ],
@@ -3864,11 +3864,11 @@
       "patch_sha256": "973ba934a07698531a168115dd977c000410341c767c2a9ce04aa6978f7541a2",
       "operations": [
         {
-          "resource": "运维/部署机侧文件 scripts/checks/host-pin-parity.py(change=A;回滚方式随之不同)",
+          "resource": "运维/部署机侧新增文件 scripts/checks/host-pin-parity.py(change=A,mode 0755)",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 host-scripts/deploy-machine/scripts/checks/host-pin-parity.py $REPO_ROOT/scripts/checks/host-pin-parity.py",
-          "verify_cli": "sha256sum host-scripts/deploy-machine/scripts/checks/host-pin-parity.py $REPO_ROOT/scripts/checks/host-pin-parity.py  # 两个摘要必须一致",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/host-pin-parity.py\" | cut -c1-64)\" = \"973ba934a07698531a168115dd977c000410341c767c2a9ce04aa6978f7541a2\" && rm -f \"$REPO_ROOT/scripts/checks/host-pin-parity.py\"  # 本次新增的路径在 base 上不存在,回滚是【移除】而不是 git checkout;先证内容仍是本 patch,漂了就中止",
+          "apply_cli": "install -m 0755 -D host-scripts/deploy-machine/scripts/checks/host-pin-parity.py \"$REPO_ROOT/scripts/checks/host-pin-parity.py\"",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/host-pin-parity.py\" | cut -c1-64)\" = \"973ba934a07698531a168115dd977c000410341c767c2a9ce04aa6978f7541a2\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/host-pin-parity.py\" | cut -c1-64)\" = \"973ba934a07698531a168115dd977c000410341c767c2a9ce04aa6978f7541a2\" && rm -f \"$REPO_ROOT/scripts/checks/host-pin-parity.py\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
           "artifact_refs": [
             "host-scripts/deploy-machine/scripts/checks/host-pin-parity.py"
           ],
@@ -3890,11 +3890,11 @@
       "patch_sha256": "c39eeb72472b4893e4e90a3533ea68e159e69e41d4dc83b25cd1eaf6f6e6edd0",
       "operations": [
         {
-          "resource": "运维/部署机侧文件 scripts/checks/host-pin-parity.sh(change=A;回滚方式随之不同)",
+          "resource": "运维/部署机侧新增文件 scripts/checks/host-pin-parity.sh(change=A,mode 0755)",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 host-scripts/deploy-machine/scripts/checks/host-pin-parity.sh $REPO_ROOT/scripts/checks/host-pin-parity.sh",
-          "verify_cli": "sha256sum host-scripts/deploy-machine/scripts/checks/host-pin-parity.sh $REPO_ROOT/scripts/checks/host-pin-parity.sh  # 两个摘要必须一致",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/host-pin-parity.sh\" | cut -c1-64)\" = \"c39eeb72472b4893e4e90a3533ea68e159e69e41d4dc83b25cd1eaf6f6e6edd0\" && rm -f \"$REPO_ROOT/scripts/checks/host-pin-parity.sh\"  # 本次新增的路径在 base 上不存在,回滚是【移除】而不是 git checkout;先证内容仍是本 patch,漂了就中止",
+          "apply_cli": "install -m 0755 -D host-scripts/deploy-machine/scripts/checks/host-pin-parity.sh \"$REPO_ROOT/scripts/checks/host-pin-parity.sh\"",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/host-pin-parity.sh\" | cut -c1-64)\" = \"c39eeb72472b4893e4e90a3533ea68e159e69e41d4dc83b25cd1eaf6f6e6edd0\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/host-pin-parity.sh\" | cut -c1-64)\" = \"c39eeb72472b4893e4e90a3533ea68e159e69e41d4dc83b25cd1eaf6f6e6edd0\" && rm -f \"$REPO_ROOT/scripts/checks/host-pin-parity.sh\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
           "artifact_refs": [
             "host-scripts/deploy-machine/scripts/checks/host-pin-parity.sh"
           ],
@@ -3916,11 +3916,11 @@
       "patch_sha256": "8ac3092f3d9dc04bbe5fb5aad76d1c2afe8576b42378bf7e9b60aa78860d169c",
       "operations": [
         {
-          "resource": "运维/部署机侧文件 scripts/checks/run-all.sh(change=M;回滚方式随之不同)",
+          "resource": "运维/部署机侧文件 scripts/checks/run-all.sh(change=M,mode 0755)。回滚还的是**施加前的实际内容**(.pre-patch),不是 git checkout base —— 客户可能在 base 之后自己改过,checkout base 会把那些改动一起抹掉",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 host-scripts/deploy-machine/scripts/checks/run-all.sh $REPO_ROOT/scripts/checks/run-all.sh",
-          "verify_cli": "sha256sum host-scripts/deploy-machine/scripts/checks/run-all.sh $REPO_ROOT/scripts/checks/run-all.sh  # 两个摘要必须一致",
-          "rollback_cli": "git -C \"$REPO_ROOT\" checkout 81f3b884ca1226afdb107e7f8392d9334fd33493 -- \"scripts/checks/run-all.sh\"",
+          "apply_cli": "[ -f \"$REPO_ROOT/scripts/checks/run-all.sh.pre-patch\" ] || cp -p \"$REPO_ROOT/scripts/checks/run-all.sh\" \"$REPO_ROOT/scripts/checks/run-all.sh.pre-patch\" ; install -m 0755 -D host-scripts/deploy-machine/scripts/checks/run-all.sh \"$REPO_ROOT/scripts/checks/run-all.sh\"",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/run-all.sh\" | cut -c1-64)\" = \"8ac3092f3d9dc04bbe5fb5aad76d1c2afe8576b42378bf7e9b60aa78860d169c\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/run-all.sh\" | cut -c1-64)\" = \"8ac3092f3d9dc04bbe5fb5aad76d1c2afe8576b42378bf7e9b60aa78860d169c\" && cp -p \"$REPO_ROOT/scripts/checks/run-all.sh.pre-patch\" \"$REPO_ROOT/scripts/checks/run-all.sh\"  # 先证当前仍是本 patch(漂了就中止),再还施加前的实际内容",
           "artifact_refs": [
             "host-scripts/deploy-machine/scripts/checks/run-all.sh"
           ],
@@ -3945,11 +3945,11 @@
       "patch_sha256": "7b5bda0e84b728930ae7a126f2467ab8c4c5149a0a9913b49a7911e20eaf142a",
       "operations": [
         {
-          "resource": "运维/部署机侧文件 scripts/checks/s3-at-boot-parity.py(change=A;回滚方式随之不同)",
+          "resource": "运维/部署机侧新增文件 scripts/checks/s3-at-boot-parity.py(change=A,mode 0644)",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 host-scripts/deploy-machine/scripts/checks/s3-at-boot-parity.py $REPO_ROOT/scripts/checks/s3-at-boot-parity.py",
-          "verify_cli": "sha256sum host-scripts/deploy-machine/scripts/checks/s3-at-boot-parity.py $REPO_ROOT/scripts/checks/s3-at-boot-parity.py  # 两个摘要必须一致",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.py\" | cut -c1-64)\" = \"7b5bda0e84b728930ae7a126f2467ab8c4c5149a0a9913b49a7911e20eaf142a\" && rm -f \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.py\"  # 本次新增的路径在 base 上不存在,回滚是【移除】而不是 git checkout;先证内容仍是本 patch,漂了就中止",
+          "apply_cli": "install -m 0644 -D host-scripts/deploy-machine/scripts/checks/s3-at-boot-parity.py \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.py\"",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.py\" | cut -c1-64)\" = \"7b5bda0e84b728930ae7a126f2467ab8c4c5149a0a9913b49a7911e20eaf142a\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.py\" | cut -c1-64)\" = \"7b5bda0e84b728930ae7a126f2467ab8c4c5149a0a9913b49a7911e20eaf142a\" && rm -f \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.py\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
           "artifact_refs": [
             "host-scripts/deploy-machine/scripts/checks/s3-at-boot-parity.py"
           ],
@@ -3971,11 +3971,11 @@
       "patch_sha256": "498bdcc94391178cd04c3ccbe0ea9305e40b218749287f50b53c27552bb98dd3",
       "operations": [
         {
-          "resource": "运维/部署机侧文件 scripts/checks/s3-at-boot-parity.sh(change=A;回滚方式随之不同)",
+          "resource": "运维/部署机侧新增文件 scripts/checks/s3-at-boot-parity.sh(change=A,mode 0644)",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 host-scripts/deploy-machine/scripts/checks/s3-at-boot-parity.sh $REPO_ROOT/scripts/checks/s3-at-boot-parity.sh",
-          "verify_cli": "sha256sum host-scripts/deploy-machine/scripts/checks/s3-at-boot-parity.sh $REPO_ROOT/scripts/checks/s3-at-boot-parity.sh  # 两个摘要必须一致",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.sh\" | cut -c1-64)\" = \"498bdcc94391178cd04c3ccbe0ea9305e40b218749287f50b53c27552bb98dd3\" && rm -f \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.sh\"  # 本次新增的路径在 base 上不存在,回滚是【移除】而不是 git checkout;先证内容仍是本 patch,漂了就中止",
+          "apply_cli": "install -m 0644 -D host-scripts/deploy-machine/scripts/checks/s3-at-boot-parity.sh \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.sh\"",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.sh\" | cut -c1-64)\" = \"498bdcc94391178cd04c3ccbe0ea9305e40b218749287f50b53c27552bb98dd3\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.sh\" | cut -c1-64)\" = \"498bdcc94391178cd04c3ccbe0ea9305e40b218749287f50b53c27552bb98dd3\" && rm -f \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.sh\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
           "artifact_refs": [
             "host-scripts/deploy-machine/scripts/checks/s3-at-boot-parity.sh"
           ],
@@ -3997,11 +3997,11 @@
       "patch_sha256": "bb94ed7f031c04214e75dd6cb1ca9d615aed5dd5a9ab21114d5d233fac397dbf",
       "operations": [
         {
-          "resource": "运维/部署机侧文件 scripts/preflight-check.sh(change=M;回滚方式随之不同)",
+          "resource": "运维/部署机侧文件 scripts/preflight-check.sh(change=M,mode 0644)。回滚还的是**施加前的实际内容**(.pre-patch),不是 git checkout base —— 客户可能在 base 之后自己改过,checkout base 会把那些改动一起抹掉",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 host-scripts/deploy-machine/scripts/preflight-check.sh $REPO_ROOT/scripts/preflight-check.sh",
-          "verify_cli": "sha256sum host-scripts/deploy-machine/scripts/preflight-check.sh $REPO_ROOT/scripts/preflight-check.sh  # 两个摘要必须一致",
-          "rollback_cli": "git -C \"$REPO_ROOT\" checkout 81f3b884ca1226afdb107e7f8392d9334fd33493 -- \"scripts/preflight-check.sh\"",
+          "apply_cli": "[ -f \"$REPO_ROOT/scripts/preflight-check.sh.pre-patch\" ] || cp -p \"$REPO_ROOT/scripts/preflight-check.sh\" \"$REPO_ROOT/scripts/preflight-check.sh.pre-patch\" ; install -m 0644 -D host-scripts/deploy-machine/scripts/preflight-check.sh \"$REPO_ROOT/scripts/preflight-check.sh\"",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/preflight-check.sh\" | cut -c1-64)\" = \"bb94ed7f031c04214e75dd6cb1ca9d615aed5dd5a9ab21114d5d233fac397dbf\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/preflight-check.sh\" | cut -c1-64)\" = \"bb94ed7f031c04214e75dd6cb1ca9d615aed5dd5a9ab21114d5d233fac397dbf\" && cp -p \"$REPO_ROOT/scripts/preflight-check.sh.pre-patch\" \"$REPO_ROOT/scripts/preflight-check.sh\"  # 先证当前仍是本 patch(漂了就中止),再还施加前的实际内容",
           "artifact_refs": [
             "host-scripts/deploy-machine/scripts/preflight-check.sh"
           ],
@@ -4023,11 +4023,11 @@
       "patch_sha256": "52d7958c3c1e75918c6a6da672796e8895eaa60134a42782b01b59d6b5e3187c",
       "operations": [
         {
-          "resource": "运维/部署机侧文件 setup.sh(change=M;回滚方式随之不同)",
+          "resource": "运维/部署机侧文件 setup.sh(change=M,mode 0755)。回滚还的是**施加前的实际内容**(.pre-patch),不是 git checkout base —— 客户可能在 base 之后自己改过,checkout base 会把那些改动一起抹掉",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 host-scripts/deploy-machine/setup.sh $REPO_ROOT/setup.sh",
-          "verify_cli": "sha256sum host-scripts/deploy-machine/setup.sh $REPO_ROOT/setup.sh  # 两个摘要必须一致",
-          "rollback_cli": "git -C \"$REPO_ROOT\" checkout 81f3b884ca1226afdb107e7f8392d9334fd33493 -- \"setup.sh\"",
+          "apply_cli": "[ -f \"$REPO_ROOT/setup.sh.pre-patch\" ] || cp -p \"$REPO_ROOT/setup.sh\" \"$REPO_ROOT/setup.sh.pre-patch\" ; install -m 0755 -D host-scripts/deploy-machine/setup.sh \"$REPO_ROOT/setup.sh\"",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/setup.sh\" | cut -c1-64)\" = \"52d7958c3c1e75918c6a6da672796e8895eaa60134a42782b01b59d6b5e3187c\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/setup.sh\" | cut -c1-64)\" = \"52d7958c3c1e75918c6a6da672796e8895eaa60134a42782b01b59d6b5e3187c\" && cp -p \"$REPO_ROOT/setup.sh.pre-patch\" \"$REPO_ROOT/setup.sh\"  # 先证当前仍是本 patch(漂了就中止),再还施加前的实际内容",
           "artifact_refs": [
             "host-scripts/deploy-machine/setup.sh"
           ],

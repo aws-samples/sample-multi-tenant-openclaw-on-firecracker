@@ -148,8 +148,16 @@ aws iam put-role-policy --role-name "$LIFECYCLE_CONSUMER_ROLE" --policy-name oc-
   下发内容要么先 `aws s3 cp` 到 `/tmp` 再 `install`,要么走纯 POSIX 写法。
 - **install 与 restart 必须在同一条 `send-command` 里**,分两条是异步的,restart 可能先于 install 落地。
   下发后用 `ssm wait command-executed` + `get-command-invocation` 逐机核 `Status`,不要发完就算完。
-- 每机在覆盖前先留 `<dest>.pre-patch`:**新增文件在桶里没有旧版本**,回滚只能靠这份每机备份
-  (原本不存在的则直接移除),否则会留下混版机队。
+- 每机在覆盖前先留 `<dest>.pre-patch`(用 `cp -p`,连权限位一起留):**新增文件在桶里没有旧版本**,
+  回滚只能靠这份每机备份(原本不存在的则直接移除),否则会留下混版机队。
+- **权限位沿用源码,不一律写 0644**:源码里 `delete-vm.sh` / `rebuild-vm.sh` / `reset-vm.sh` /
+  `migrate-vm.sh` / `delete-all-vms.sh` / `oc-egress-chain.sh` / `oc-egress-sim.py` 是 `0755`,
+  `backup-data.sh` / `launch-vm.sh` / `host-agent.py` 等是 `0644`。init-host.sh 的调用点全是
+  `sh …` / `bash …`(所以 0644 对那些够用),但把 0755 的那批降成 0644 会打断任何**直接执行**的
+  调用点。每条 `apply_cli` 里的 `install -m` 已按源码取值。
+- **校验要断言,不能只打印**:每条 `verify_cli` 用 `echo "<manifest 里的 patch_sha256>  <dest>" |
+  sha256sum -c -`,摘要不符即非零退出;只 `sha256sum` 打印一行等于没验。
+- **回滚前先证在役内容仍是本 patch**:不是就 fail-closed 停下 —— 否则会把之后更新的部署覆盖掉。
 每个路径的 `operations[0].apply_cli` 就是该文件的确切命令,`verify_cli` 是它的校验命令。
 主机通常在私有子网:命令写成 `ssh/scp` 便于阅读,实际走 SSM(`send-command`;传文件用 base64)。
 
@@ -301,7 +309,7 @@ lib/apply-lt.sh pull "$ASG" "$REGION"
 # —— 人工闸:pull 把【已渲染】那份写到下面这个文件,就在这份上改本次变更的几段 ——
 #    $HOME/.oc-apply-lt/$ASG.init-host.sh          <-- push 读的就是它
 ! grep -q '{{' "$HOME/.oc-apply-lt/$ASG.init-host.sh"   # 必须为真(用 ! grep -q,不要用 grep -c:计数 0 时 grep 退出 1)
-touch lt-edit-done.txt                                  # 人工闸的回执,apply 会检查它
+sha256sum "$HOME/.oc-apply-lt/$ASG.init-host.sh" | cut -c1-64 > lt-edit-done.txt   # 回执存【编辑后的摘要】
 # 确认无误后再继续:
 lib/apply-lt.sh push "$ASG" "$REGION"
 lib/apply-lt.sh promote "$ASG" "$REGION"
@@ -309,7 +317,9 @@ lib/apply-lt.sh refresh "$ASG" "$REGION"
 lib/apply-lt.sh verify "$ASG" "$REGION"
 ```
 
-**`pull` 与 `push` 之间必须停下来人工改**,而且这个闸落在 `lt-edit-done.txt` 这个回执文件上,
+**`pull` 与 `push` 之间必须停下来人工改**,而且这个闸落在 `lt-edit-done.txt` 里存的**编辑后摘要**上:
+重跑 `apply_cli` 时摘要相符就跳过 `pull`(可恢复续跑),不符或缺失就只做 `pull` 并以退出码 10 停下 ——
+**这样重跑绝不会用 `pull` 覆盖掉已经做好的人工编辑**。
 **不要把闸写成 shell 注释** —— `#` 之后的内容会被整条吃掉,`push`/`promote`/`refresh` 一条都不会跑。
 `push` 只读 `push` 只读
 `$HOME/.oc-apply-lt/$ASG.init-host.sh`,不读任何别的临时文件。对照
@@ -333,7 +343,8 @@ instance-refresh 路径滚。验证只起**一台**新 host,盯三个信号:解�
   `verify-consistency-cli`、`verify-copyfile-toctou`、`verify-backup-lifecycle`。
 - **Phase B(走真实产品入口的完整生命周期,核心,跑一次)**:`verify-egress-allowlist`
   (`POST /hosts/egress` 是**改机队**的写操作,而且按设计是 **admin-only**(动全机队网络隔离,
-  爆炸半径最大),`operator` 不够。用 **admin 身份的 Bearer JWT**,body 用
+  爆炸半径最大),`operator` 不够。**同时**带 `x-api-key` 与 **admin 身份的 Bearer JWT** —— 这条方法在模板里是 `ApiKeyRequired=true`,
+  API Gateway 会在 RBAC 之前就因缺 key 拒掉;而 admin 身份来自 Bearer。两者各管一段,缺一不可。body 用
   `{"mode":"off","wait":true}`:`wait=true` 会返回**逐机 `apply_exit` / `rules_sha256` /
   `consistent`**,那才是可证伪的观测量,比只拿 `command_id` 强。先用 `GET /hosts` 记下原
   `egress_mode` 以便恢复。**不要用 api-key 调这条** —— 它会在 RBAC 前置门被挡成 403,

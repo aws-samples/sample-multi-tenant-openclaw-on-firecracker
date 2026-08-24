@@ -68,13 +68,17 @@ PY
 ## Step 1 — 备份(每个操作的 backup 必须先成功)
 
 ```bash
-aws lambda get-function --function-name openclaw-api --query Configuration.RevisionId --output text
-aws lambda publish-version --function-name openclaw-api --description "pre lifecycle-op-patch"
-aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live-api.zip
-aws ec2 describe-launch-template-versions --launch-template-id "$LT_ID" --query 'LaunchTemplateVersions[?DefaultVersion==`true`].VersionNumber' --output text
+for pair in "api openclaw-api" "backup openclaw-backup" "health_check openclaw-health-check" "scaler openclaw-scaler"; do
+  set -- $pair; d=$1; fn=$2
+  aws lambda get-alias --function-name "$fn" --name live --region "$REGION" --query FunctionVersion --output text > "backup-version-$d.txt"
+  aws lambda get-function --function-name "$fn" --region "$REGION" --query Code.Location --output text | xargs curl -s -o "live-$d.zip"
+done
+aws ec2 describe-launch-template-versions --launch-template-id "$LT_ID" --region "$REGION" --query 'LaunchTemplateVersions[?DefaultVersion==`true`].VersionNumber' --output text
 ```
 
-记下 `publish-version` 返回的版本号与 LT 的当前默认版本号 —— 回滚只认这两个数。
+**四个函数都要单独备份** —— 本 kit 替换的是 `openclaw-api` / `openclaw-backup` /
+`openclaw-health-check` / `openclaw-scaler` 四个。备份的是**当前 `live` 别名指向的版本号**
+(不是 `$LATEST`:回滚要回到别名当时真正在服务的那个版本)以及在役包本体。
 机队会有版本漂移,**按 host 分别备份**,让每台各自回到自己的版本。
 
 ## Step 2 — 先补授权(fail-closed 前置,不能放到后面)
@@ -119,27 +123,36 @@ Lambda 走 **overlay**(复用在役包里的依赖,不要预打包 zip —— �
 目录 `api` / `backup` / `health_check` / `scaler` 各自的根里都有 `handler.py`。逐个函数:
 
 ```bash
-# 目录 → 真实函数名(从合成模板取,注意 health_check 目录对应的是连字符名):
-#   api → openclaw-api   backup → openclaw-backup
-#   health_check → openclaw-health-check   scaler → openclaw-scaler
+# 目录 → 真实函数名(注意 health_check 目录对应的是连字符名)
 d=api; fn=openclaw-api          # 四组各跑一次
-aws lambda get-function --function-name "$fn" --region "$REGION" --query Code.Location --output text | xargs curl -s -o "live-$d.zip"
-aws lambda get-function --function-name "$fn" --region "$REGION" --query Configuration.RevisionId --output text > "rev-$d.txt"
+OLDREV=$(aws lambda get-function --function-name "$fn" --region "$REGION" --query Configuration.RevisionId --output text)
 rm -rf "work-$d" && mkdir "work-$d" && (cd "work-$d" && unzip -q "../live-$d.zip")
 cp -a "lambda/$d/." "work-$d/"
 (cd "work-$d" && zip -qr "../overlay-$d.zip" .)
-unzip -p "overlay-$d.zip" handler.py | head -1        # 必须能读到,证明入口在归档根
-aws lambda update-function-code --function-name "$fn" --region "$REGION" --zip-file "fileb://overlay-$d.zip"
+unzip -p "overlay-$d.zip" handler.py > /dev/null    # 必须成功,证明入口在归档根
+aws lambda update-function-code --function-name "$fn" --region "$REGION" --zip-file "fileb://overlay-$d.zip" --revision-id "$OLDREV"
 aws lambda wait function-updated --function-name "$fn" --region "$REGION"
-NEWV=$(aws lambda publish-version --function-name "$fn" --region "$REGION" --revision-id "$(cat "rev-$d.txt")" --query Version --output text)
-aws lambda invoke --function-name "$fn:$NEWV" --region "$REGION" --payload '{}' "out-$d.json" --query FunctionError
+NEWREV=$(aws lambda get-function --function-name "$fn" --region "$REGION" --query Configuration.RevisionId --output text)
+NEWV=$(aws lambda publish-version --function-name "$fn" --region "$REGION" --revision-id "$NEWREV" --query Version --output text)
+WANT=$(openssl dgst -sha256 -binary "overlay-$d.zip" | base64)
+GOT=$(aws lambda get-function --function-name "$fn:$NEWV" --region "$REGION" --query Configuration.CodeSha256 --output text)
+[ "$WANT" = "$GOT" ] || { echo "CodeSha256 mismatch — do not flip the alias" >&2; exit 1; }
 aws lambda update-alias --function-name "$fn" --name live --region "$REGION" --function-version "$NEWV"
 ```
 
-**只 `update-function-code` 是不够的** —— 那只改 `$LATEST`,而 API Gateway 打的是 `live` 别名,
-会出现「异步/事件源已跑新代码、同步 API 仍跑旧代码」的分裂。必须 `publish-version`(用取到的
-`RevisionId` 做 CAS,防中途被别人改)→ 对该版本 `invoke` 验 `FunctionError` 为空 → 再把 `live`
-指过去。回滚要**两条都回**:别名指回备份版本,`$LATEST` 用 `live-$d.zip` 覆盖(SQS 事件源绑 `$LATEST`)。
+三条顺序上的讲究,错一条就会半途失败:
+
+- **`update-function-code` 本身会改 `RevisionId`**,所以旧 revision 只能给它自己做 CAS;
+  `publish-version` 必须**重新取**新 revision,否则会在 `$LATEST` 已被改之后才失败。
+- **只 `update-function-code` 是不够的**:那只改 `$LATEST`,而 API Gateway 打的是 `live` 别名,
+  会出现「事件源已跑新代码、同步 API 仍跑旧代码」的分裂。必须发版并把别名指过去。
+- **不要用 `invoke` 做校验**:`openclaw-backup` / `-health-check` / `-scaler` 被 `{}` 唤起会
+  真的跑它们的生产工作流(scaler 会动机队)。这里用 **`CodeSha256`** 比对 —— Lambda 就是按
+  `base64(sha256(zip))` 算的,是零副作用的等价判据,而且用 `[ "$WANT" = "$GOT" ]` 显式失败
+  (`--query FunctionError` 即使 handler 报错也退出 0,不能当门)。
+
+回滚**两条都回**:别名指回 `backup-version-$d.txt` 里的版本,`$LATEST` 用 `live-$d.zip` 覆盖
+(SQS 事件源绑 `$LATEST`)。
 
 若该环境还部署了共用同一份 api 包的消费者(例如生命周期消费者),按 `environment.json` 里的 Lambda
 清单对它做**同样的** overlay —— 不要照抄一份写死的函数名列表。
@@ -169,10 +182,13 @@ lib/apply-cfn-resources.sh plan resources/cloudformation "$REGION"
 ```bash
 for a in create suspend restore restart rebuild backup delete; do
   case "$a" in backup|delete) v=600 ;; *) v=180 ;; esac
-  aws ssm get-parameter --name "/openclaw/lifecycle/deadline-sec/$a" >/dev/null 2>&1 && echo "adopt existing: $a" || echo "will create: $a"
-  aws ssm put-parameter --name "/openclaw/lifecycle/deadline-sec/$a" --type String --value "$v" --overwrite
+  aws ssm get-parameter --name "/openclaw/lifecycle/deadline-sec/$a" --region "$REGION" >/dev/null 2>&1 && echo "adopt existing: $a" || echo "will create: $a"
+  aws ssm put-parameter --name "/openclaw/lifecycle/deadline-sec/$a" --type String --value "$v" --overwrite --region "$REGION"
 done
 ```
+
+**每条区域性命令都要带 `--region "$REGION"`** —— 省掉它会落到 CLI 的默认区域,
+于是参数写到了别的区,而目标 Lambda 仍在用回落默认值,且没有任何报错。
 
 **4.2 API 路由 `POST /hosts/egress`** —— 用 spec 驱动,精确增删:
 
@@ -207,17 +223,22 @@ aws s3 ls "s3://$ASSETS_BUCKET/deployment/observability/" --recursive
 
 ```bash
 lib/apply-lt.sh pull "$ASG" "$REGION"
-python3 lib/lt-userdata.py inspect .oc-lt-state/userdata.b64
-python3 lib/lt-userdata.py decode .oc-lt-state/userdata.b64 > ./lt-current.userdata
-python3 lib/lt-userdata.py decode .oc-lt-state/userdata.b64 | grep -c '{{'
+# —— 人工闸:pull 把【已渲染】那份写到下面这个文件,就在这份上改本次变更的几段 ——
+#    $HOME/.oc-apply-lt/$ASG.init-host.sh          <-- push 读的就是它
+grep -c '{{' "$HOME/.oc-apply-lt/$ASG.init-host.sh"     # 改完必须为 0
+# 确认无误后再继续:
 lib/apply-lt.sh push "$ASG" "$REGION"
 lib/apply-lt.sh promote "$ASG" "$REGION"
+lib/apply-lt.sh refresh "$ASG" "$REGION"
 lib/apply-lt.sh verify "$ASG" "$REGION"
 ```
 
-把本次改动嫁接进 `lt-current.userdata` 是**人工步骤**:对照 `launch-template/init-host.sh.patched`
-与已渲染那份的差异,只改本次变更的那几段,不要整文件替换(整替会把 CDK 已替换好的约 31 个值
-换回占位符)。
+**`pull` 与 `push` 之间必须停下来人工改**,不能串成一条命令:`push` 只读
+`$HOME/.oc-apply-lt/$ASG.init-host.sh`,不读任何别的临时文件。对照
+`launch-template/init-host.sh.patched` 与已渲染那份的差异,**只改本次变更的那几段**,
+不要整文件替换(整替会把 CDK 已替换好的约 31 个值换回占位符)。
+`promote` 之后还要 **`refresh`** 才会滚在役机队,`verify` 是最后的读回确认。
+**`pull` 会覆盖唯一的回滚锚点** —— 在 `refresh` 成功且 `verify` 通过之前不要重复 `pull`。
 
 上面那条 `grep -c` **必须为 0**。`init-host.sh` 是 `ha_edge.py` 在 synth 时读入、替换约 31 个占位符后
 烤进 UserData 的,所以**必须在【已渲染】的那份上改,不能拿仓库里的模板直接烤** —— 直接烤会让新
@@ -233,9 +254,10 @@ instance-refresh 路径滚。验证只起**一台**新 host,盯三个信号:解�
 - **Phase A(只读,零副作用,始终先跑)**:`verify-ddb-scan-pagination`、`verify-config-profile-gate`、
   `verify-consistency-cli`、`verify-copyfile-toctou`、`verify-backup-lifecycle`。
 - **Phase B(走真实产品入口的完整生命周期,核心,跑一次)**:`verify-egress-allowlist`
-  (`POST /hosts/egress` 是**改机队**的写操作,不是只读:`mode` 必填且只接受 `off|deny`,机队非空时
-  正常返 **202 + command_id**,只有 0 台活跃 host 才返 200。用 `{"mode":"off"}` 做空操作式验证,
-  并先用 `GET /hosts` 记下原 `egress_mode` 以便恢复)、`verify-lifecycle-deadline`、
+  (`POST /hosts/egress` 是**改机队**的写操作:`mode` 必填且只接受 `off|deny`,机队非空时正常返
+  **202 + command_id**,只有 0 台活跃 host 才返 200。用 **operator 身份的 Bearer JWT** 调,
+  body 用 `{"mode":"off"}` 做空操作式验证,并先用 `GET /hosts` 记下原 `egress_mode` 以便恢复。
+  **不要用 api-key 调这条** —— 会 403,原因见开头第 ②b 条,那是上游缺口不是本 patch 没打对)、`verify-lifecycle-deadline`、
   `verify-lifecycle-converge`、`verify-lifecycle-lease-port`、`verify-lifecycle-host-fanout`、
   `verify-observability-boot`。
 

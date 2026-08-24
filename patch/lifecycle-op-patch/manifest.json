@@ -264,11 +264,11 @@
       "patch_sha256": "cf3788c406caeedfb490d4f035fb7602d324b0bf49c9cec2b8fb94fa981e69a5",
       "operations": [
         {
-          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖在役包,归档根 = lambda/api/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-api --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live-api.zip && rm -rf work-api && mkdir work-api && (cd work-api && unzip -q ../live-api.zip) && cp -a lambda/api/. work-api/ && (cd work-api && zip -qr ../overlay-api.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay-api.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-api --region $REGION",
+          "verify_cli": "unzip -p overlay-api.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-api --payload '{}' out-api.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live-api.zip --region $REGION && aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/api/core/capacity.py"
           ],
@@ -290,11 +290,11 @@
       "patch_sha256": "51700ed4f6829e794a0e7e34169b3a0d2b42db25718e10f9a8f8643adab291b5",
       "operations": [
         {
-          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖在役包,归档根 = lambda/api/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-api --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live-api.zip && rm -rf work-api && mkdir work-api && (cd work-api && unzip -q ../live-api.zip) && cp -a lambda/api/. work-api/ && (cd work-api && zip -qr ../overlay-api.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay-api.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-api --region $REGION",
+          "verify_cli": "unzip -p overlay-api.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-api --payload '{}' out-api.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live-api.zip --region $REGION && aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/api/core/clients.py"
           ],
@@ -318,11 +318,11 @@
       "patch_sha256": "58e5989ded7869e397b39c641828040c31908035e9cef148a07f346c97906e0e",
       "operations": [
         {
-          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖在役包,归档根 = lambda/api/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-api --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live-api.zip && rm -rf work-api && mkdir work-api && (cd work-api && unzip -q ../live-api.zip) && cp -a lambda/api/. work-api/ && (cd work-api && zip -qr ../overlay-api.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay-api.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-api --region $REGION",
+          "verify_cli": "unzip -p overlay-api.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-api --payload '{}' out-api.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live-api.zip --region $REGION && aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/api/core/copy_file_helper.py"
           ],
@@ -344,11 +344,11 @@
       "patch_sha256": "8cae8bc956aa755b53ec5ff504852bc6ca86a0c3153a78d8275a3664346ba9b8",
       "operations": [
         {
-          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖在役包,归档根 = lambda/api/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-api --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live-api.zip && rm -rf work-api && mkdir work-api && (cd work-api && unzip -q ../live-api.zip) && cp -a lambda/api/. work-api/ && (cd work-api && zip -qr ../overlay-api.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay-api.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-api --region $REGION",
+          "verify_cli": "unzip -p overlay-api.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-api --payload '{}' out-api.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live-api.zip --region $REGION && aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/api/core/create_deadline.py"
           ],
@@ -370,11 +370,11 @@
       "patch_sha256": "b0afd8c36fb434e5b1083959198e7d6b70af765e9b2e5df93bbee6d43be9223e",
       "operations": [
         {
-          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖在役包,归档根 = lambda/api/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-api --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live-api.zip && rm -rf work-api && mkdir work-api && (cd work-api && unzip -q ../live-api.zip) && cp -a lambda/api/. work-api/ && (cd work-api && zip -qr ../overlay-api.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay-api.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-api --region $REGION",
+          "verify_cli": "unzip -p overlay-api.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-api --payload '{}' out-api.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live-api.zip --region $REGION && aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/api/core/ddb_scan.py"
           ],
@@ -396,11 +396,11 @@
       "patch_sha256": "27fc36ec09c00c6cd99b14a1e670ad2b2a94791459a353ac201773f6d5adbdb6",
       "operations": [
         {
-          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖在役包,归档根 = lambda/api/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-api --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live-api.zip && rm -rf work-api && mkdir work-api && (cd work-api && unzip -q ../live-api.zip) && cp -a lambda/api/. work-api/ && (cd work-api && zip -qr ../overlay-api.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay-api.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-api --region $REGION",
+          "verify_cli": "unzip -p overlay-api.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-api --payload '{}' out-api.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live-api.zip --region $REGION && aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/api/core/deadline_config.py"
           ],
@@ -422,11 +422,11 @@
       "patch_sha256": "e72c58ce90364fe513f585a9b9214e81532960ab3247ffdf0fd46bd93b21ff98",
       "operations": [
         {
-          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖在役包,归档根 = lambda/api/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-api --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live-api.zip && rm -rf work-api && mkdir work-api && (cd work-api && unzip -q ../live-api.zip) && cp -a lambda/api/. work-api/ && (cd work-api && zip -qr ../overlay-api.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay-api.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-api --region $REGION",
+          "verify_cli": "unzip -p overlay-api.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-api --payload '{}' out-api.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live-api.zip --region $REGION && aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/api/core/dispatch/binpack.py"
           ],
@@ -448,11 +448,11 @@
       "patch_sha256": "cf82dc599a1add8f0a7565cae367cad6fbc6f6bcc30a079f201e6ecd7137667b",
       "operations": [
         {
-          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖在役包,归档根 = lambda/api/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-api --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live-api.zip && rm -rf work-api && mkdir work-api && (cd work-api && unzip -q ../live-api.zip) && cp -a lambda/api/. work-api/ && (cd work-api && zip -qr ../overlay-api.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay-api.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-api --region $REGION",
+          "verify_cli": "unzip -p overlay-api.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-api --payload '{}' out-api.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live-api.zip --region $REGION && aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/api/core/event_shape.py"
           ],
@@ -474,11 +474,11 @@
       "patch_sha256": "bc84a623d7a285ce12b97b23df719347020644c7fc704306191d9c6f83534646",
       "operations": [
         {
-          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖在役包,归档根 = lambda/api/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-api --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live-api.zip && rm -rf work-api && mkdir work-api && (cd work-api && unzip -q ../live-api.zip) && cp -a lambda/api/. work-api/ && (cd work-api && zip -qr ../overlay-api.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay-api.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-api --region $REGION",
+          "verify_cli": "unzip -p overlay-api.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-api --payload '{}' out-api.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live-api.zip --region $REGION && aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/api/core/host_taint.py"
           ],
@@ -500,11 +500,11 @@
       "patch_sha256": "b42058b1039e20675a9ec6c868789515b43311898856b5265108ececa991a1f1",
       "operations": [
         {
-          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖在役包,归档根 = lambda/api/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-api --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live-api.zip && rm -rf work-api && mkdir work-api && (cd work-api && unzip -q ../live-api.zip) && cp -a lambda/api/. work-api/ && (cd work-api && zip -qr ../overlay-api.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay-api.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-api --region $REGION",
+          "verify_cli": "unzip -p overlay-api.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-api --payload '{}' out-api.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live-api.zip --region $REGION && aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/api/core/lifecycle_fence.py"
           ],
@@ -526,11 +526,11 @@
       "patch_sha256": "1b2078ce116bd7dc2941b3532fe5ecea28a55df2dc9c70fcf5b235cc14f796d9",
       "operations": [
         {
-          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖在役包,归档根 = lambda/api/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-api --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live-api.zip && rm -rf work-api && mkdir work-api && (cd work-api && unzip -q ../live-api.zip) && cp -a lambda/api/. work-api/ && (cd work-api && zip -qr ../overlay-api.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay-api.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-api --region $REGION",
+          "verify_cli": "unzip -p overlay-api.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-api --payload '{}' out-api.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live-api.zip --region $REGION && aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/api/core/scheduling.py"
           ],
@@ -553,11 +553,11 @@
       "patch_sha256": "e9ee313921261ae79341e8c58226ad021d6ac0d2c59b67809b017018790205d6",
       "operations": [
         {
-          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖在役包,归档根 = lambda/api/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-api --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live-api.zip && rm -rf work-api && mkdir work-api && (cd work-api && unzip -q ../live-api.zip) && cp -a lambda/api/. work-api/ && (cd work-api && zip -qr ../overlay-api.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay-api.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-api --region $REGION",
+          "verify_cli": "unzip -p overlay-api.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-api --payload '{}' out-api.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live-api.zip --region $REGION && aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/api/core/ssm_dispatch.py"
           ],
@@ -581,11 +581,11 @@
       "patch_sha256": "038116fac3ba2cfd03915f8a7209c18be5ee0fa6a48762732ad286f4ac2a0569",
       "operations": [
         {
-          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖在役包,归档根 = lambda/api/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-api --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live-api.zip && rm -rf work-api && mkdir work-api && (cd work-api && unzip -q ../live-api.zip) && cp -a lambda/api/. work-api/ && (cd work-api && zip -qr ../overlay-api.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay-api.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-api --region $REGION",
+          "verify_cli": "unzip -p overlay-api.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-api --payload '{}' out-api.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live-api.zip --region $REGION && aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/api/core/vkey.py"
           ],
@@ -607,11 +607,11 @@
       "patch_sha256": "da225eafda3029b9adb58f6772f683b132d2378023dce991e26913a2bec066b4",
       "operations": [
         {
-          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖在役包,归档根 = lambda/api/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-api --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live-api.zip && rm -rf work-api && mkdir work-api && (cd work-api && unzip -q ../live-api.zip) && cp -a lambda/api/. work-api/ && (cd work-api && zip -qr ../overlay-api.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay-api.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-api --region $REGION",
+          "verify_cli": "unzip -p overlay-api.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-api --payload '{}' out-api.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live-api.zip --region $REGION && aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/api/handler.py"
           ],
@@ -638,11 +638,11 @@
       "patch_sha256": "754df6fe03571532175e92c1c955a27d6c1a8b2f7a76df7f155af2f5308dfdbf",
       "operations": [
         {
-          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖在役包,归档根 = lambda/api/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-api --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live-api.zip && rm -rf work-api && mkdir work-api && (cd work-api && unzip -q ../live-api.zip) && cp -a lambda/api/. work-api/ && (cd work-api && zip -qr ../overlay-api.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay-api.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-api --region $REGION",
+          "verify_cli": "unzip -p overlay-api.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-api --payload '{}' out-api.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live-api.zip --region $REGION && aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/api/routes/skills_groups.py"
           ],
@@ -664,11 +664,11 @@
       "patch_sha256": "2de28efd530901c87d6d749044f60cf7eff41e7ef40ecec9dc802fcb781c5707",
       "operations": [
         {
-          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖在役包,归档根 = lambda/api/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-api --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live-api.zip && rm -rf work-api && mkdir work-api && (cd work-api && unzip -q ../live-api.zip) && cp -a lambda/api/. work-api/ && (cd work-api && zip -qr ../overlay-api.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay-api.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-api --region $REGION",
+          "verify_cli": "unzip -p overlay-api.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-api --payload '{}' out-api.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live-api.zip --region $REGION && aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/api/services/console_info.py"
           ],
@@ -690,11 +690,11 @@
       "patch_sha256": "c7f8eff460fd526caff07c6cdc6735a4eb8bf91c0d5af9ee7d259bf31e48745a",
       "operations": [
         {
-          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖在役包,归档根 = lambda/api/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-api --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live-api.zip && rm -rf work-api && mkdir work-api && (cd work-api && unzip -q ../live-api.zip) && cp -a lambda/api/. work-api/ && (cd work-api && zip -qr ../overlay-api.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay-api.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-api --region $REGION",
+          "verify_cli": "unzip -p overlay-api.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-api --payload '{}' out-api.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live-api.zip --region $REGION && aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/api/services/credential_reconciler.py"
           ],
@@ -716,11 +716,11 @@
       "patch_sha256": "e3b93e23a59bfb09206567b4d7f549a5c97617e770f90e5fc1dce5491e0115ce",
       "operations": [
         {
-          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖在役包,归档根 = lambda/api/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-api --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live-api.zip && rm -rf work-api && mkdir work-api && (cd work-api && unzip -q ../live-api.zip) && cp -a lambda/api/. work-api/ && (cd work-api && zip -qr ../overlay-api.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay-api.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-api --region $REGION",
+          "verify_cli": "unzip -p overlay-api.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-api --payload '{}' out-api.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live-api.zip --region $REGION && aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/api/services/deadline_executor.py"
           ],
@@ -742,11 +742,11 @@
       "patch_sha256": "ce007beb4ea36b17d70de06f9ba11e68a9f56b23cd8187760bc785c233ae4eab",
       "operations": [
         {
-          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖在役包,归档根 = lambda/api/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-api --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live-api.zip && rm -rf work-api && mkdir work-api && (cd work-api && unzip -q ../live-api.zip) && cp -a lambda/api/. work-api/ && (cd work-api && zip -qr ../overlay-api.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay-api.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-api --region $REGION",
+          "verify_cli": "unzip -p overlay-api.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-api --payload '{}' out-api.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live-api.zip --region $REGION && aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/api/services/delete_reconciler.py"
           ],
@@ -768,11 +768,11 @@
       "patch_sha256": "626498cdd7f2efd804220ace64887f00bd4c98d9395e9e0e0a21266df72a62ec",
       "operations": [
         {
-          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖在役包,归档根 = lambda/api/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-api --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live-api.zip && rm -rf work-api && mkdir work-api && (cd work-api && unzip -q ../live-api.zip) && cp -a lambda/api/. work-api/ && (cd work-api && zip -qr ../overlay-api.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay-api.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-api --region $REGION",
+          "verify_cli": "unzip -p overlay-api.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-api --payload '{}' out-api.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live-api.zip --region $REGION && aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/api/services/dispatch_poller.py"
           ],
@@ -794,11 +794,11 @@
       "patch_sha256": "58d26b714c325f4f25107659991787cbc8d7a489a9b01d2a806e8a3c2a06ff07",
       "operations": [
         {
-          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖在役包,归档根 = lambda/api/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-api --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live-api.zip && rm -rf work-api && mkdir work-api && (cd work-api && unzip -q ../live-api.zip) && cp -a lambda/api/. work-api/ && (cd work-api && zip -qr ../overlay-api.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay-api.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-api --region $REGION",
+          "verify_cli": "unzip -p overlay-api.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-api --payload '{}' out-api.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live-api.zip --region $REGION && aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/api/services/dispatch_service.py"
           ],
@@ -822,11 +822,11 @@
       "patch_sha256": "72c923f0bc5dbecdb4e3406c97a13751811650cdc829d011c629d9578091f254",
       "operations": [
         {
-          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖在役包,归档根 = lambda/api/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-api --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live-api.zip && rm -rf work-api && mkdir work-api && (cd work-api && unzip -q ../live-api.zip) && cp -a lambda/api/. work-api/ && (cd work-api && zip -qr ../overlay-api.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay-api.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-api --region $REGION",
+          "verify_cli": "unzip -p overlay-api.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-api --payload '{}' out-api.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live-api.zip --region $REGION && aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/api/services/egress_admin_service.py"
           ],
@@ -848,11 +848,11 @@
       "patch_sha256": "9c2966ca8ed875b0b53e2e7f2b311da5f5deff1e3481abd19c47e310ddecc1e1",
       "operations": [
         {
-          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖在役包,归档根 = lambda/api/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-api --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live-api.zip && rm -rf work-api && mkdir work-api && (cd work-api && unzip -q ../live-api.zip) && cp -a lambda/api/. work-api/ && (cd work-api && zip -qr ../overlay-api.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay-api.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-api --region $REGION",
+          "verify_cli": "unzip -p overlay-api.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-api --payload '{}' out-api.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live-api.zip --region $REGION && aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/api/services/fleet_service.py"
           ],
@@ -876,11 +876,11 @@
       "patch_sha256": "a2bf25c3d738bf0b068fcb7623f17de289594d57845d7e9d449394250df66d01",
       "operations": [
         {
-          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖在役包,归档根 = lambda/api/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-api --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live-api.zip && rm -rf work-api && mkdir work-api && (cd work-api && unzip -q ../live-api.zip) && cp -a lambda/api/. work-api/ && (cd work-api && zip -qr ../overlay-api.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay-api.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-api --region $REGION",
+          "verify_cli": "unzip -p overlay-api.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-api --payload '{}' out-api.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live-api.zip --region $REGION && aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/api/services/host_service.py"
           ],
@@ -905,11 +905,11 @@
       "patch_sha256": "e0d2d34d175a96987b31398b3b3b8e2eec934d40e5e5949871d3fe962948daf4",
       "operations": [
         {
-          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖在役包,归档根 = lambda/api/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-api --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live-api.zip && rm -rf work-api && mkdir work-api && (cd work-api && unzip -q ../live-api.zip) && cp -a lambda/api/. work-api/ && (cd work-api && zip -qr ../overlay-api.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay-api.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-api --region $REGION",
+          "verify_cli": "unzip -p overlay-api.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-api --payload '{}' out-api.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live-api.zip --region $REGION && aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/api/services/lifecycle_dispatch.py"
           ],
@@ -931,11 +931,11 @@
       "patch_sha256": "8ad96885269a3247b0ae33d3b3ff0f4f8dfb41022e4011d276d9e3c96f6a1621",
       "operations": [
         {
-          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖在役包,归档根 = lambda/api/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-api --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live-api.zip && rm -rf work-api && mkdir work-api && (cd work-api && unzip -q ../live-api.zip) && cp -a lambda/api/. work-api/ && (cd work-api && zip -qr ../overlay-api.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay-api.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-api --region $REGION",
+          "verify_cli": "unzip -p overlay-api.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-api --payload '{}' out-api.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live-api.zip --region $REGION && aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/api/services/poller_heartbeat.py"
           ],
@@ -957,11 +957,11 @@
       "patch_sha256": "2572dcb0ced5385ac9256e44e0cb4b0e853eee8aa4543e948a8701df4b835ec1",
       "operations": [
         {
-          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖在役包,归档根 = lambda/api/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-api --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live-api.zip && rm -rf work-api && mkdir work-api && (cd work-api && unzip -q ../live-api.zip) && cp -a lambda/api/. work-api/ && (cd work-api && zip -qr ../overlay-api.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay-api.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-api --region $REGION",
+          "verify_cli": "unzip -p overlay-api.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-api --payload '{}' out-api.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live-api.zip --region $REGION && aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/api/services/registry_service.py"
           ],
@@ -983,11 +983,11 @@
       "patch_sha256": "ca9cdc56b04dccbf94c9f7f935f06088c452504f7fc268a55000be4daf06e048",
       "operations": [
         {
-          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖在役包,归档根 = lambda/api/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-api --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live-api.zip && rm -rf work-api && mkdir work-api && (cd work-api && unzip -q ../live-api.zip) && cp -a lambda/api/. work-api/ && (cd work-api && zip -qr ../overlay-api.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay-api.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-api --region $REGION",
+          "verify_cli": "unzip -p overlay-api.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-api --payload '{}' out-api.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live-api.zip --region $REGION && aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/api/services/tenant_service.py"
           ],
@@ -1013,11 +1013,11 @@
       "patch_sha256": "2af9d12bd577686e638f29392a36c95bbb89fc7ca8728e871bff66c8740bc84f",
       "operations": [
         {
-          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-api 的第一方源码(overlay 覆盖在役包,归档根 = lambda/api/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-api --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-api --query Code.Location --output text | xargs curl -s -o live-api.zip && rm -rf work-api && mkdir work-api && (cd work-api && unzip -q ../live-api.zip) && cp -a lambda/api/. work-api/ && (cd work-api && zip -qr ../overlay-api.zip .) && aws lambda update-function-code --function-name openclaw-api --zip-file fileb://overlay-api.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-api --region $REGION",
+          "verify_cli": "unzip -p overlay-api.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-api --payload '{}' out-api.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-api --zip-file fileb://live-api.zip --region $REGION && aws lambda update-alias --function-name openclaw-api --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/api/test_lifecycle_stop_contract.py"
           ],
@@ -1039,11 +1039,11 @@
       "patch_sha256": "7c0f089671add1dae32b2d8f6c540178d5190eb6858cef8a738f1807dec9a075",
       "operations": [
         {
-          "resource": "lambda:openclaw-backup 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-backup 的第一方源码(overlay 覆盖在役包,归档根 = lambda/backup/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-backup --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-backup --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-backup --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-backup --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-backup --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-backup --query Code.Location --output text | xargs curl -s -o live-backup.zip && rm -rf work-backup && mkdir work-backup && (cd work-backup && unzip -q ../live-backup.zip) && cp -a lambda/backup/. work-backup/ && (cd work-backup && zip -qr ../overlay-backup.zip .) && aws lambda update-function-code --function-name openclaw-backup --zip-file fileb://overlay-backup.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-backup --region $REGION",
+          "verify_cli": "unzip -p overlay-backup.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-backup --payload '{}' out-backup.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-backup --zip-file fileb://live-backup.zip --region $REGION && aws lambda update-alias --function-name openclaw-backup --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/backup/handler.py"
           ],
@@ -1067,11 +1067,11 @@
       "patch_sha256": "b0afd8c36fb434e5b1083959198e7d6b70af765e9b2e5df93bbee6d43be9223e",
       "operations": [
         {
-          "resource": "lambda:openclaw-health_check 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-health_check 的第一方源码(overlay 覆盖在役包,归档根 = lambda/health_check/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-health_check --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-health_check --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-health_check --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-health_check --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-health_check --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-health_check --query Code.Location --output text | xargs curl -s -o live-health_check.zip && rm -rf work-health_check && mkdir work-health_check && (cd work-health_check && unzip -q ../live-health_check.zip) && cp -a lambda/health_check/. work-health_check/ && (cd work-health_check && zip -qr ../overlay-health_check.zip .) && aws lambda update-function-code --function-name openclaw-health_check --zip-file fileb://overlay-health_check.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-health_check --region $REGION",
+          "verify_cli": "unzip -p overlay-health_check.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-health_check --payload '{}' out-health_check.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-health_check --zip-file fileb://live-health_check.zip --region $REGION && aws lambda update-alias --function-name openclaw-health_check --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/health_check/ddb_scan.py"
           ],
@@ -1093,11 +1093,11 @@
       "patch_sha256": "a4ac1a6dad1ec5275ddd8fcbcdf6aa8405fd977686d45b9f9d9ca78492825845",
       "operations": [
         {
-          "resource": "lambda:openclaw-health_check 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-health_check 的第一方源码(overlay 覆盖在役包,归档根 = lambda/health_check/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-health_check --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-health_check --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-health_check --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-health_check --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-health_check --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-health_check --query Code.Location --output text | xargs curl -s -o live-health_check.zip && rm -rf work-health_check && mkdir work-health_check && (cd work-health_check && unzip -q ../live-health_check.zip) && cp -a lambda/health_check/. work-health_check/ && (cd work-health_check && zip -qr ../overlay-health_check.zip .) && aws lambda update-function-code --function-name openclaw-health_check --zip-file fileb://overlay-health_check.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-health_check --region $REGION",
+          "verify_cli": "unzip -p overlay-health_check.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-health_check --payload '{}' out-health_check.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-health_check --zip-file fileb://live-health_check.zip --region $REGION && aws lambda update-alias --function-name openclaw-health_check --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/health_check/handler.py"
           ],
@@ -1123,11 +1123,11 @@
       "patch_sha256": "b0afd8c36fb434e5b1083959198e7d6b70af765e9b2e5df93bbee6d43be9223e",
       "operations": [
         {
-          "resource": "lambda:openclaw-scaler 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-scaler 的第一方源码(overlay 覆盖在役包,归档根 = lambda/scaler/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-scaler --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-scaler --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-scaler --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-scaler --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-scaler --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-scaler --query Code.Location --output text | xargs curl -s -o live-scaler.zip && rm -rf work-scaler && mkdir work-scaler && (cd work-scaler && unzip -q ../live-scaler.zip) && cp -a lambda/scaler/. work-scaler/ && (cd work-scaler && zip -qr ../overlay-scaler.zip .) && aws lambda update-function-code --function-name openclaw-scaler --zip-file fileb://overlay-scaler.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-scaler --region $REGION",
+          "verify_cli": "unzip -p overlay-scaler.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-scaler --payload '{}' out-scaler.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-scaler --zip-file fileb://live-scaler.zip --region $REGION && aws lambda update-alias --function-name openclaw-scaler --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/scaler/ddb_scan.py"
           ],
@@ -1149,11 +1149,11 @@
       "patch_sha256": "ac7d337cdf3b111315cba4a28d565368f13cbdecd4388dc3ce7fb85247204c0b",
       "operations": [
         {
-          "resource": "lambda:openclaw-scaler 的第一方源码(overlay 覆盖,复用在役包里的依赖)",
+          "resource": "lambda:openclaw-scaler 的第一方源码(overlay 覆盖在役包,归档根 = lambda/scaler/)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws lambda get-function --function-name openclaw-scaler --query Code.Location --output text | xargs curl -s -o live.zip && python3 -c \"import zipfile,os\" && (cd lambda && zip -qr ../overlay.zip .) && aws lambda update-function-code --function-name openclaw-scaler --zip-file fileb://overlay.zip",
-          "verify_cli": "aws lambda invoke --function-name openclaw-scaler --payload '{}' out.json --query FunctionError  # 必须为空;私有 API 上 /ping 返回 404 是预期而非失败",
-          "rollback_cli": "aws lambda update-alias --function-name openclaw-scaler --name live --function-version $BACKUP_VERSION && aws lambda update-function-code --function-name openclaw-scaler --zip-file fileb://live.zip  # 别名与 $LATEST 两条都要回",
+          "apply_cli": "aws lambda get-function --function-name openclaw-scaler --query Code.Location --output text | xargs curl -s -o live-scaler.zip && rm -rf work-scaler && mkdir work-scaler && (cd work-scaler && unzip -q ../live-scaler.zip) && cp -a lambda/scaler/. work-scaler/ && (cd work-scaler && zip -qr ../overlay-scaler.zip .) && aws lambda update-function-code --function-name openclaw-scaler --zip-file fileb://overlay-scaler.zip --region $REGION && aws lambda wait function-updated --function-name openclaw-scaler --region $REGION",
+          "verify_cli": "unzip -p overlay-scaler.zip handler.py | head -1 && aws lambda invoke --function-name openclaw-scaler --payload '{}' out-scaler.json --region $REGION --query FunctionError",
+          "rollback_cli": "aws lambda update-function-code --function-name openclaw-scaler --zip-file fileb://live-scaler.zip --region $REGION && aws lambda update-alias --function-name openclaw-scaler --name live --function-version $BACKUP_VERSION --region $REGION",
           "artifact_refs": [
             "lambda/scaler/handler.py"
           ],
@@ -2108,9 +2108,9 @@
         {
           "resource": "s3://$ASSETS_BUCKET/deployment/scripts/backup-data.sh + 在役 host 上的 /home/ubuntu/backup-data.sh",
           "class": "AUTO_CLI",
-          "apply_cli": "aws s3 cp host-scripts/backup-data.sh.patched s3://$ASSETS_BUCKET/deployment/scripts/backup-data.sh && aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --parameters commands='aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/backup-data.sh /home/ubuntu/backup-data.sh'",
-          "verify_cli": "aws s3api head-object --bucket $ASSETS_BUCKET --key deployment/scripts/backup-data.sh --query ChecksumSHA256 && sha256sum host-scripts/backup-data.sh.patched  # 两者必须对应同一内容",
-          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/backup-data.sh --copy-source \"$ASSETS_BUCKET/deployment/scripts/backup-data.sh?versionId=$PREV_VERSION_ID\"",
+          "apply_cli": "aws s3 cp host-scripts/backup-data.sh.patched s3://$ASSETS_BUCKET/deployment/scripts/backup-data.sh --region $REGION && aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --region $REGION --parameters commands='install -m 0644 -D /dev/stdin /home/ubuntu/backup-data.sh < <(aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/backup-data.sh -)'",
+          "verify_cli": "aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --region $REGION --parameters commands='sha256sum /home/ubuntu/backup-data.sh'",
+          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/backup-data.sh --copy-source \"$ASSETS_BUCKET/deployment/scripts/backup-data.sh?versionId=$PREV_VERSION_ID\" --region $REGION",
           "artifact_refs": [
             "host-scripts/backup-data.sh.patched"
           ],
@@ -2134,9 +2134,9 @@
         {
           "resource": "s3://$ASSETS_BUCKET/deployment/scripts/delete-all-vms.sh + 在役 host 上的 /home/ubuntu/delete-all-vms.sh",
           "class": "AUTO_CLI",
-          "apply_cli": "aws s3 cp host-scripts/delete-all-vms.sh.patched s3://$ASSETS_BUCKET/deployment/scripts/delete-all-vms.sh && aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --parameters commands='aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/delete-all-vms.sh /home/ubuntu/delete-all-vms.sh'",
-          "verify_cli": "aws s3api head-object --bucket $ASSETS_BUCKET --key deployment/scripts/delete-all-vms.sh --query ChecksumSHA256 && sha256sum host-scripts/delete-all-vms.sh.patched  # 两者必须对应同一内容",
-          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/delete-all-vms.sh --copy-source \"$ASSETS_BUCKET/deployment/scripts/delete-all-vms.sh?versionId=$PREV_VERSION_ID\"",
+          "apply_cli": "aws s3 cp host-scripts/delete-all-vms.sh.patched s3://$ASSETS_BUCKET/deployment/scripts/delete-all-vms.sh --region $REGION && aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --region $REGION --parameters commands='install -m 0644 -D /dev/stdin /home/ubuntu/delete-all-vms.sh < <(aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/delete-all-vms.sh -)'",
+          "verify_cli": "aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --region $REGION --parameters commands='sha256sum /home/ubuntu/delete-all-vms.sh'",
+          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/delete-all-vms.sh --copy-source \"$ASSETS_BUCKET/deployment/scripts/delete-all-vms.sh?versionId=$PREV_VERSION_ID\" --region $REGION",
           "artifact_refs": [
             "host-scripts/delete-all-vms.sh.patched"
           ],
@@ -2158,11 +2158,11 @@
       "patch_sha256": "86f35bce0bd89bb577fda194f0e7a4ae514226f4d5c7a6337343a226dcf3288c",
       "operations": [
         {
-          "resource": "s3://$ASSETS_BUCKET/deployment/scripts/host-agent.py + 在役 host 上的 /home/ubuntu/host-agent.py",
+          "resource": "s3://$ASSETS_BUCKET/deployment/scripts/host-agent.py + 在役 host 上的 /opt/openclaw/host-agent.py(改完必须 restart host-agent.service,否则在役进程仍跑旧代码)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws s3 cp host-scripts/host-agent.py.patched s3://$ASSETS_BUCKET/deployment/scripts/host-agent.py && aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --parameters commands='aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/host-agent.py /home/ubuntu/host-agent.py'",
-          "verify_cli": "aws s3api head-object --bucket $ASSETS_BUCKET --key deployment/scripts/host-agent.py --query ChecksumSHA256 && sha256sum host-scripts/host-agent.py.patched  # 两者必须对应同一内容",
-          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/host-agent.py --copy-source \"$ASSETS_BUCKET/deployment/scripts/host-agent.py?versionId=$PREV_VERSION_ID\"",
+          "apply_cli": "aws s3 cp host-scripts/host-agent.py.patched s3://$ASSETS_BUCKET/deployment/scripts/host-agent.py --region $REGION && aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --region $REGION --parameters commands='install -m 0644 -D /dev/stdin /opt/openclaw/host-agent.py < <(aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/host-agent.py -)' && aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --region $REGION --parameters commands='systemctl restart host-agent.service'",
+          "verify_cli": "aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --region $REGION --parameters commands='sha256sum /opt/openclaw/host-agent.py' && aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --region $REGION --parameters commands='systemctl show -p ActiveEnterTimestamp host-agent.service'",
+          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/host-agent.py --copy-source \"$ASSETS_BUCKET/deployment/scripts/host-agent.py?versionId=$PREV_VERSION_ID\" --region $REGION",
           "artifact_refs": [
             "host-scripts/host-agent.py.patched"
           ],
@@ -2178,23 +2178,25 @@
     },
     "deploy/userdata/init-host.sh": {
       "change": "M",
-      "layer": "B-s3",
-      "artifact": "host-scripts/init-host.sh.patched",
+      "layer": "A-lt",
+      "artifact": "launch-template/init-host.sh.patched",
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
       "base_sha256": "51bdda6295c192c466cd13086601c8959b5d82e3249228c53d0cc3c9e441c2f9",
       "patch_sha256": "f2a97f3261ae8f2ecd13b93035e5c7c966e03c37e449a9bbb5334fb26afc8cce",
       "operations": [
         {
-          "resource": "s3://$ASSETS_BUCKET/deployment/scripts/init-host.sh + 在役 host 上的 /home/ubuntu/init-host.sh",
-          "class": "AUTO_CLI",
-          "apply_cli": "aws s3 cp host-scripts/init-host.sh.patched s3://$ASSETS_BUCKET/deployment/scripts/init-host.sh && aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --parameters commands='aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/init-host.sh /home/ubuntu/init-host.sh'",
-          "verify_cli": "aws s3api head-object --bucket $ASSETS_BUCKET --key deployment/scripts/init-host.sh --query ChecksumSHA256 && sha256sum host-scripts/init-host.sh.patched  # 两者必须对应同一内容",
-          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/init-host.sh --copy-source \"$ASSETS_BUCKET/deployment/scripts/init-host.sh?versionId=$PREV_VERSION_ID\"",
+          "resource": "ec2:launch-template(host)的 UserData —— init-host.sh 由 ha_edge.py 在 synth 时读入并替换约 31 个占位符后烤进 UserData,所以只能嫁接到【已渲染】的那份上",
+          "class": "MANUAL_CLI_REVIEW",
+          "apply_cli": "lib/apply-lt.sh pull $ASG $REGION && python3 lib/lt-userdata.py inspect .oc-lt-state/userdata.b64 && python3 lib/lt-userdata.py decode .oc-lt-state/userdata.b64 > ./lt-current.userdata && lib/apply-lt.sh push $ASG $REGION && lib/apply-lt.sh promote $ASG $REGION",
+          "verify_cli": "lib/apply-lt.sh verify $ASG $REGION && python3 lib/lt-userdata.py decode .oc-lt-state/userdata.b64 | grep -c '{{'",
+          "rollback_cli": "lib/apply-lt.sh rollback $ASG $REGION",
           "artifact_refs": [
-            "host-scripts/init-host.sh.patched"
+            "launch-template/init-host.sh.patched",
+            "lib/apply-lt.sh",
+            "lib/lt-userdata.py"
           ],
-          "rollback_policy": "RESTORE",
+          "rollback_policy": "LT_REVERT",
           "resource_refs": []
         }
       ],
@@ -2216,9 +2218,9 @@
         {
           "resource": "s3://$ASSETS_BUCKET/deployment/scripts/launch-vm.sh + 在役 host 上的 /home/ubuntu/launch-vm.sh",
           "class": "AUTO_CLI",
-          "apply_cli": "aws s3 cp host-scripts/launch-vm.sh.patched s3://$ASSETS_BUCKET/deployment/scripts/launch-vm.sh && aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --parameters commands='aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/launch-vm.sh /home/ubuntu/launch-vm.sh'",
-          "verify_cli": "aws s3api head-object --bucket $ASSETS_BUCKET --key deployment/scripts/launch-vm.sh --query ChecksumSHA256 && sha256sum host-scripts/launch-vm.sh.patched  # 两者必须对应同一内容",
-          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/launch-vm.sh --copy-source \"$ASSETS_BUCKET/deployment/scripts/launch-vm.sh?versionId=$PREV_VERSION_ID\"",
+          "apply_cli": "aws s3 cp host-scripts/launch-vm.sh.patched s3://$ASSETS_BUCKET/deployment/scripts/launch-vm.sh --region $REGION && aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --region $REGION --parameters commands='install -m 0644 -D /dev/stdin /home/ubuntu/launch-vm.sh < <(aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/launch-vm.sh -)'",
+          "verify_cli": "aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --region $REGION --parameters commands='sha256sum /home/ubuntu/launch-vm.sh'",
+          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/launch-vm.sh --copy-source \"$ASSETS_BUCKET/deployment/scripts/launch-vm.sh?versionId=$PREV_VERSION_ID\" --region $REGION",
           "artifact_refs": [
             "host-scripts/launch-vm.sh.patched"
           ],
@@ -2243,9 +2245,9 @@
         {
           "resource": "s3://$ASSETS_BUCKET/deployment/scripts/lib/harden-config.sh + 在役 host 上的 /home/ubuntu/lib/harden-config.sh",
           "class": "AUTO_CLI",
-          "apply_cli": "aws s3 cp host-scripts/lib/harden-config.sh.patched s3://$ASSETS_BUCKET/deployment/scripts/lib/harden-config.sh && aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --parameters commands='aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/lib/harden-config.sh /home/ubuntu/lib/harden-config.sh'",
-          "verify_cli": "aws s3api head-object --bucket $ASSETS_BUCKET --key deployment/scripts/lib/harden-config.sh --query ChecksumSHA256 && sha256sum host-scripts/lib/harden-config.sh.patched  # 两者必须对应同一内容",
-          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/lib/harden-config.sh --copy-source \"$ASSETS_BUCKET/deployment/scripts/lib/harden-config.sh?versionId=$PREV_VERSION_ID\"",
+          "apply_cli": "aws s3 cp host-scripts/lib/harden-config.sh.patched s3://$ASSETS_BUCKET/deployment/scripts/lib/harden-config.sh --region $REGION && aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --region $REGION --parameters commands='install -m 0644 -D /dev/stdin /home/ubuntu/lib/harden-config.sh < <(aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/lib/harden-config.sh -)'",
+          "verify_cli": "aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --region $REGION --parameters commands='sha256sum /home/ubuntu/lib/harden-config.sh'",
+          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/lib/harden-config.sh --copy-source \"$ASSETS_BUCKET/deployment/scripts/lib/harden-config.sh?versionId=$PREV_VERSION_ID\" --region $REGION",
           "artifact_refs": [
             "host-scripts/lib/harden-config.sh.patched"
           ],
@@ -2269,9 +2271,9 @@
         {
           "resource": "s3://$ASSETS_BUCKET/deployment/scripts/lib/lifecycle-guard.sh + 在役 host 上的 /home/ubuntu/lib/lifecycle-guard.sh",
           "class": "AUTO_CLI",
-          "apply_cli": "aws s3 cp host-scripts/lib/lifecycle-guard.sh.patched s3://$ASSETS_BUCKET/deployment/scripts/lib/lifecycle-guard.sh && aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --parameters commands='aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/lib/lifecycle-guard.sh /home/ubuntu/lib/lifecycle-guard.sh'",
-          "verify_cli": "aws s3api head-object --bucket $ASSETS_BUCKET --key deployment/scripts/lib/lifecycle-guard.sh --query ChecksumSHA256 && sha256sum host-scripts/lib/lifecycle-guard.sh.patched  # 两者必须对应同一内容",
-          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/lib/lifecycle-guard.sh --copy-source \"$ASSETS_BUCKET/deployment/scripts/lib/lifecycle-guard.sh?versionId=$PREV_VERSION_ID\"",
+          "apply_cli": "aws s3 cp host-scripts/lib/lifecycle-guard.sh.patched s3://$ASSETS_BUCKET/deployment/scripts/lib/lifecycle-guard.sh --region $REGION && aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --region $REGION --parameters commands='install -m 0644 -D /dev/stdin /home/ubuntu/lib/lifecycle-guard.sh < <(aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/lib/lifecycle-guard.sh -)'",
+          "verify_cli": "aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --region $REGION --parameters commands='sha256sum /home/ubuntu/lib/lifecycle-guard.sh'",
+          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/lib/lifecycle-guard.sh --copy-source \"$ASSETS_BUCKET/deployment/scripts/lib/lifecycle-guard.sh?versionId=$PREV_VERSION_ID\" --region $REGION",
           "artifact_refs": [
             "host-scripts/lib/lifecycle-guard.sh.patched"
           ],
@@ -2293,11 +2295,11 @@
       "patch_sha256": "79acd8a3a865418bbd1826ed7daf1113ce8767bd0d80a70b3531955b7b1c510e",
       "operations": [
         {
-          "resource": "s3://$ASSETS_BUCKET/deployment/scripts/migrate-vm.sh + 在役 host 上的 /home/ubuntu/migrate-vm.sh",
+          "resource": "s3://$ASSETS_BUCKET/deployment/scripts/migrate-vm.sh —— init-host.sh 不在开机时拉它,消费方另有其人(先按 required-scripts.list 与 init-host.sh 确认再决定是否需要落到 host)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws s3 cp host-scripts/migrate-vm.sh.patched s3://$ASSETS_BUCKET/deployment/scripts/migrate-vm.sh && aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --parameters commands='aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/migrate-vm.sh /home/ubuntu/migrate-vm.sh'",
-          "verify_cli": "aws s3api head-object --bucket $ASSETS_BUCKET --key deployment/scripts/migrate-vm.sh --query ChecksumSHA256 && sha256sum host-scripts/migrate-vm.sh.patched  # 两者必须对应同一内容",
-          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/migrate-vm.sh --copy-source \"$ASSETS_BUCKET/deployment/scripts/migrate-vm.sh?versionId=$PREV_VERSION_ID\"",
+          "apply_cli": "aws s3 cp host-scripts/migrate-vm.sh.patched s3://$ASSETS_BUCKET/deployment/scripts/migrate-vm.sh --region $REGION",
+          "verify_cli": "aws s3api head-object --bucket $ASSETS_BUCKET --key deployment/scripts/migrate-vm.sh --region $REGION",
+          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/migrate-vm.sh --copy-source \"$ASSETS_BUCKET/deployment/scripts/migrate-vm.sh?versionId=$PREV_VERSION_ID\" --region $REGION",
           "artifact_refs": [
             "host-scripts/migrate-vm.sh.patched"
           ],
@@ -2319,11 +2321,11 @@
       "patch_sha256": "6416947d6ba3ca886a47fbe16602e14de9840e05311b8af2d0296e82ca76f7f3",
       "operations": [
         {
-          "resource": "s3://$ASSETS_BUCKET/deployment/scripts/oc-egress-chain.sh + 在役 host 上的 /home/ubuntu/oc-egress-chain.sh",
+          "resource": "s3://$ASSETS_BUCKET/deployment/scripts/oc-egress-chain.sh —— init-host.sh 不在开机时拉它,消费方另有其人(先按 required-scripts.list 与 init-host.sh 确认再决定是否需要落到 host)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws s3 cp host-scripts/oc-egress-chain.sh.patched s3://$ASSETS_BUCKET/deployment/scripts/oc-egress-chain.sh && aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --parameters commands='aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/oc-egress-chain.sh /home/ubuntu/oc-egress-chain.sh'",
-          "verify_cli": "aws s3api head-object --bucket $ASSETS_BUCKET --key deployment/scripts/oc-egress-chain.sh --query ChecksumSHA256 && sha256sum host-scripts/oc-egress-chain.sh.patched  # 两者必须对应同一内容",
-          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/oc-egress-chain.sh --copy-source \"$ASSETS_BUCKET/deployment/scripts/oc-egress-chain.sh?versionId=$PREV_VERSION_ID\"",
+          "apply_cli": "aws s3 cp host-scripts/oc-egress-chain.sh.patched s3://$ASSETS_BUCKET/deployment/scripts/oc-egress-chain.sh --region $REGION",
+          "verify_cli": "aws s3api head-object --bucket $ASSETS_BUCKET --key deployment/scripts/oc-egress-chain.sh --region $REGION",
+          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/oc-egress-chain.sh --copy-source \"$ASSETS_BUCKET/deployment/scripts/oc-egress-chain.sh?versionId=$PREV_VERSION_ID\" --region $REGION",
           "artifact_refs": [
             "host-scripts/oc-egress-chain.sh.patched"
           ],
@@ -2345,11 +2347,11 @@
       "patch_sha256": "068f126e77fdfa962c1812582b213315414d42106314fbe64edd35a76aa32d99",
       "operations": [
         {
-          "resource": "s3://$ASSETS_BUCKET/deployment/scripts/oc-egress-sim.py + 在役 host 上的 /home/ubuntu/oc-egress-sim.py",
+          "resource": "s3://$ASSETS_BUCKET/deployment/scripts/oc-egress-sim.py —— init-host.sh 不在开机时拉它,消费方另有其人(先按 required-scripts.list 与 init-host.sh 确认再决定是否需要落到 host)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws s3 cp host-scripts/oc-egress-sim.py.patched s3://$ASSETS_BUCKET/deployment/scripts/oc-egress-sim.py && aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --parameters commands='aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/oc-egress-sim.py /home/ubuntu/oc-egress-sim.py'",
-          "verify_cli": "aws s3api head-object --bucket $ASSETS_BUCKET --key deployment/scripts/oc-egress-sim.py --query ChecksumSHA256 && sha256sum host-scripts/oc-egress-sim.py.patched  # 两者必须对应同一内容",
-          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/oc-egress-sim.py --copy-source \"$ASSETS_BUCKET/deployment/scripts/oc-egress-sim.py?versionId=$PREV_VERSION_ID\"",
+          "apply_cli": "aws s3 cp host-scripts/oc-egress-sim.py.patched s3://$ASSETS_BUCKET/deployment/scripts/oc-egress-sim.py --region $REGION",
+          "verify_cli": "aws s3api head-object --bucket $ASSETS_BUCKET --key deployment/scripts/oc-egress-sim.py --region $REGION",
+          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/oc-egress-sim.py --copy-source \"$ASSETS_BUCKET/deployment/scripts/oc-egress-sim.py?versionId=$PREV_VERSION_ID\" --region $REGION",
           "artifact_refs": [
             "host-scripts/oc-egress-sim.py.patched"
           ],
@@ -2371,11 +2373,11 @@
       "patch_sha256": "a9a60edae7d1c0a47b83e4943f38451fae45a3ce985b7c7256b2f28a603ddc9e",
       "operations": [
         {
-          "resource": "s3://$ASSETS_BUCKET/deployment/scripts/provision-host.sh + 在役 host 上的 /home/ubuntu/provision-host.sh",
+          "resource": "s3://$ASSETS_BUCKET/deployment/scripts/provision-host.sh —— init-host.sh 不在开机时拉它,消费方另有其人(先按 required-scripts.list 与 init-host.sh 确认再决定是否需要落到 host)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws s3 cp host-scripts/provision-host.sh.patched s3://$ASSETS_BUCKET/deployment/scripts/provision-host.sh && aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --parameters commands='aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/provision-host.sh /home/ubuntu/provision-host.sh'",
-          "verify_cli": "aws s3api head-object --bucket $ASSETS_BUCKET --key deployment/scripts/provision-host.sh --query ChecksumSHA256 && sha256sum host-scripts/provision-host.sh.patched  # 两者必须对应同一内容",
-          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/provision-host.sh --copy-source \"$ASSETS_BUCKET/deployment/scripts/provision-host.sh?versionId=$PREV_VERSION_ID\"",
+          "apply_cli": "aws s3 cp host-scripts/provision-host.sh.patched s3://$ASSETS_BUCKET/deployment/scripts/provision-host.sh --region $REGION",
+          "verify_cli": "aws s3api head-object --bucket $ASSETS_BUCKET --key deployment/scripts/provision-host.sh --region $REGION",
+          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/provision-host.sh --copy-source \"$ASSETS_BUCKET/deployment/scripts/provision-host.sh?versionId=$PREV_VERSION_ID\" --region $REGION",
           "artifact_refs": [
             "host-scripts/provision-host.sh.patched"
           ],
@@ -2400,9 +2402,9 @@
         {
           "resource": "s3://$ASSETS_BUCKET/deployment/scripts/rebuild-vm.sh + 在役 host 上的 /home/ubuntu/rebuild-vm.sh",
           "class": "AUTO_CLI",
-          "apply_cli": "aws s3 cp host-scripts/rebuild-vm.sh.patched s3://$ASSETS_BUCKET/deployment/scripts/rebuild-vm.sh && aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --parameters commands='aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/rebuild-vm.sh /home/ubuntu/rebuild-vm.sh'",
-          "verify_cli": "aws s3api head-object --bucket $ASSETS_BUCKET --key deployment/scripts/rebuild-vm.sh --query ChecksumSHA256 && sha256sum host-scripts/rebuild-vm.sh.patched  # 两者必须对应同一内容",
-          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/rebuild-vm.sh --copy-source \"$ASSETS_BUCKET/deployment/scripts/rebuild-vm.sh?versionId=$PREV_VERSION_ID\"",
+          "apply_cli": "aws s3 cp host-scripts/rebuild-vm.sh.patched s3://$ASSETS_BUCKET/deployment/scripts/rebuild-vm.sh --region $REGION && aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --region $REGION --parameters commands='install -m 0644 -D /dev/stdin /home/ubuntu/rebuild-vm.sh < <(aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/rebuild-vm.sh -)'",
+          "verify_cli": "aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --region $REGION --parameters commands='sha256sum /home/ubuntu/rebuild-vm.sh'",
+          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/rebuild-vm.sh --copy-source \"$ASSETS_BUCKET/deployment/scripts/rebuild-vm.sh?versionId=$PREV_VERSION_ID\" --region $REGION",
           "artifact_refs": [
             "host-scripts/rebuild-vm.sh.patched"
           ],
@@ -2424,11 +2426,11 @@
       "patch_sha256": "65bef84d6fd7c14856014167a205215ff0536e945794a1354c5c80a7714772fd",
       "operations": [
         {
-          "resource": "s3://$ASSETS_BUCKET/deployment/scripts/required-scripts.list + 在役 host 上的 /home/ubuntu/required-scripts.list",
+          "resource": "s3://$ASSETS_BUCKET/deployment/scripts/required-scripts.list —— init-host.sh 不在开机时拉它,消费方另有其人(先按 required-scripts.list 与 init-host.sh 确认再决定是否需要落到 host)",
           "class": "AUTO_CLI",
-          "apply_cli": "aws s3 cp host-scripts/required-scripts.list.patched s3://$ASSETS_BUCKET/deployment/scripts/required-scripts.list && aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --parameters commands='aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/required-scripts.list /home/ubuntu/required-scripts.list'",
-          "verify_cli": "aws s3api head-object --bucket $ASSETS_BUCKET --key deployment/scripts/required-scripts.list --query ChecksumSHA256 && sha256sum host-scripts/required-scripts.list.patched  # 两者必须对应同一内容",
-          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/required-scripts.list --copy-source \"$ASSETS_BUCKET/deployment/scripts/required-scripts.list?versionId=$PREV_VERSION_ID\"",
+          "apply_cli": "aws s3 cp host-scripts/required-scripts.list.patched s3://$ASSETS_BUCKET/deployment/scripts/required-scripts.list --region $REGION",
+          "verify_cli": "aws s3api head-object --bucket $ASSETS_BUCKET --key deployment/scripts/required-scripts.list --region $REGION",
+          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/required-scripts.list --copy-source \"$ASSETS_BUCKET/deployment/scripts/required-scripts.list?versionId=$PREV_VERSION_ID\" --region $REGION",
           "artifact_refs": [
             "host-scripts/required-scripts.list.patched"
           ],
@@ -2452,9 +2454,9 @@
         {
           "resource": "s3://$ASSETS_BUCKET/deployment/scripts/stop-vm.sh + 在役 host 上的 /home/ubuntu/stop-vm.sh",
           "class": "AUTO_CLI",
-          "apply_cli": "aws s3 cp host-scripts/stop-vm.sh.patched s3://$ASSETS_BUCKET/deployment/scripts/stop-vm.sh && aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --parameters commands='aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/stop-vm.sh /home/ubuntu/stop-vm.sh'",
-          "verify_cli": "aws s3api head-object --bucket $ASSETS_BUCKET --key deployment/scripts/stop-vm.sh --query ChecksumSHA256 && sha256sum host-scripts/stop-vm.sh.patched  # 两者必须对应同一内容",
-          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/stop-vm.sh --copy-source \"$ASSETS_BUCKET/deployment/scripts/stop-vm.sh?versionId=$PREV_VERSION_ID\"",
+          "apply_cli": "aws s3 cp host-scripts/stop-vm.sh.patched s3://$ASSETS_BUCKET/deployment/scripts/stop-vm.sh --region $REGION && aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --region $REGION --parameters commands='install -m 0644 -D /dev/stdin /home/ubuntu/stop-vm.sh < <(aws s3 cp s3://$ASSETS_BUCKET/deployment/scripts/stop-vm.sh -)'",
+          "verify_cli": "aws ssm send-command --document-name AWS-RunShellScript --instance-ids $HOST_IDS --region $REGION --parameters commands='sha256sum /home/ubuntu/stop-vm.sh'",
+          "rollback_cli": "aws s3api copy-object --bucket $ASSETS_BUCKET --key deployment/scripts/stop-vm.sh --copy-source \"$ASSETS_BUCKET/deployment/scripts/stop-vm.sh?versionId=$PREV_VERSION_ID\" --region $REGION",
           "artifact_refs": [
             "host-scripts/stop-vm.sh.patched"
           ],
@@ -4426,7 +4428,7 @@
       "action": "对新增的 POST /hosts/egress 路由发一次真实带 api-key 的请求读取当前放行集合",
       "observable": "HTTP 状态码与返回的放行端口集合、host 上 OPENCLAW-EGRESS 链的规则序",
       "pass_when": "返回 200 且放行集合与配置派生结果一致(不是 404,证明路由与方法都已建成)",
-      "fail_when": "返回 404(路由没建成)或 403(api-key/资源策略不对)",
+      "fail_when": "返回 404 说明路由没建成;返回 403 大概率不是本 patch 没打对 —— core/auth.py 的 _RBAC_SKIP 里没有 (POST, /hosts/egress),api-key 路径的 role 解析成 viewer 会在前置门被挡(该文件同一处注释记着 taint 路由踩过同一个坑且真机复现),而 core/auth.py 在本区间未变更、无法随本 kit 交付,属上游缺口",
       "timeout_s": 300,
       "cleanup": null
     },

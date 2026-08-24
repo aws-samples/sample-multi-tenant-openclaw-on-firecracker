@@ -17,6 +17,12 @@
 `/openclaw/lifecycle/deadline-sec/<action>` 这七个 SSM 参数上(进程内缓存 60 秒);
 `create-deadline-config.py --live` 比对的是 `$LATEST` 的环境变量,**它的绿不能证明死线生效**。
 
+**②b `POST /hosts/egress` 目前会被上游的 RBAC 前置门挡成 403。**
+`core/auth.py` 的 `_RBAC_SKIP` 里没有这条路由,而 api-key 路径的 role 会被解析成 `viewer`,在门口
+就被 `viewer < operator` 挡掉 —— 该文件同一处注释记着 `/hosts/{instance_id}/taint` 踩过一模一样的坑
+且真机复现过。`core/auth.py` 在本次区间**没有变更**,所以修不进本 kit,属上游缺口。验证时若拿到 403,
+先按这条排查,不要当成 patch 没打对。
+
 **② 七档里只有 `create` 有权威的最坏执行值(128 秒)。**
 `suspend/restore/restart/rebuild/backup/delete` 目前**没有下界守护**。往小调可能小于该操作单次最坏
 执行,于是判死之后 SSM 还在跑,留下没人认领的 microVM(占容量且计费)。不要为了"更快收敛"下调。
@@ -29,8 +35,10 @@
 ## Step 0 — DISCOVER(只读)与制品真伪
 
 ```bash
-bash lib/discover-env.sh > environment.json
+bash lib/discover-env.sh "$REGION"
 ```
+
+`region` 是必填参数,而且这个脚本**自己**写 `environment.json`(写在 kit 根)——**不要重定向它的 stdout**,那会把它要写的文件清空。
 
 `environment.json` 落地后,后面每一步都从它取坐标,不要手打。然后逐个证明制品 == 锚定树:
 
@@ -88,13 +96,33 @@ aws iam put-role-policy --role-name "$LIFECYCLE_CONSUMER_ROLE" --policy-name oc-
 
 ## Step 3 — 热修在役机器(先恢复服务,后管未来机器)
 
-按 `manifest.json` 里 `layer: B-s3` 的 14 个路径,把 `host-scripts/<rel>.patched` 推到桶再拉到 host。
+按 `manifest.json` 里 `layer: B-s3` 的 13 个路径,把 `host-scripts/<rel>.patched` 推到桶再拉到 host。
+**落地路径不是一律 `/home/ubuntu`**:`host-agent.py` / `route_ops.py` / `oc-guest-log-reader.py` 落
+`/opt/openclaw/`,其余落 `/home/ubuntu/`(`lib/*` 落 `/home/ubuntu/lib/`)。权威来源是 `init-host.sh`
+里那些 `aws s3 cp … <目标路径>` 行,每条 `apply_cli` 已按它逐个生成。
+**`host-agent.py` 改完必须 `systemctl restart host-agent.service`** —— 服务跑的是
+`/opt/openclaw/host-agent.py`(见其 unit 的 `ExecStart`),只换文件不重启,在役进程仍跑旧代码。
 每个路径的 `operations[0].apply_cli` 就是该文件的确切命令,`verify_cli` 是它的校验命令。
 主机通常在私有子网:命令写成 `ssh/scp` 便于阅读,实际走 SSM(`send-command`;传文件用 base64)。
 
-Lambda 走 **overlay**(复用在役包里的依赖,不要预打包 zip —— 那会把构建机的依赖版本焊到客户函数上):
-下载在役包 → 只删第一方源码目录 → 覆盖 `lambda/` 下的源码树 → 重新打包 → `update-function-code`
-→ `aws lambda wait function-updated` → `invoke` 验 `FunctionError` 为空 → 再翻 `live` 别名。
+Lambda 走 **overlay**(复用在役包里的依赖,不要预打包 zip —— 那会把构建机的依赖版本焊到客户函数上)。
+**归档根必须是函数目录本身**:`lambda/api/handler.py` 里那个 `handler.py` 就是函数入口,打包时
+**不能把 `api/` 这一层带进归档**,否则入口变成 `api/handler.py`,函数一上线就 import 失败。四个函数
+目录 `api` / `backup` / `health_check` / `scaler` 各自的根里都有 `handler.py`。逐个函数:
+
+```bash
+fn=api   # 四个函数各跑一次:api / backup / health_check / scaler
+aws lambda get-function --function-name "openclaw-$fn" --query Code.Location --output text | xargs curl -s -o "live-$fn.zip"
+rm -rf "work-$fn" && mkdir "work-$fn" && (cd "work-$fn" && unzip -q "../live-$fn.zip")
+cp -a "lambda/$fn/." "work-$fn/"
+(cd "work-$fn" && zip -qr "../overlay-$fn.zip" .)
+unzip -p "overlay-$fn.zip" handler.py | head -1   # 必须能读到,证明入口在归档根
+aws lambda update-function-code --function-name "openclaw-$fn" --zip-file "fileb://overlay-$fn.zip" --region "$REGION"
+aws lambda wait function-updated --function-name "openclaw-$fn" --region "$REGION"
+```
+
+先解在役包再覆盖,未改动的模块与依赖因此原样保留;`update-function-code` 之后 `invoke` 验
+`FunctionError` 为空,再翻 `live` 别名。
 
 `invoke` 的判据是 `FunctionError` 为空,**不是 200 响应体**:私有 API 上合成的 `/ping` 返回 404 是
 预期的(按路径路由),不是失败。
@@ -149,17 +177,27 @@ aws s3 ls "s3://$ASSETS_BUCKET/deployment/observability/" --recursive
 先把 `host-scripts/` 推到 `deployment/scripts/`(临时键 → 校验 → 提升;留旧 version id 备回滚)。
 `init-host.sh` 是**烤进启动模板**的,单独处理:
 
+`apply-lt.sh` 的子命令是 `pull|push|promote|refresh|rollback <asg> <region>`,以及
+`verify <asg> <region> [instance-id]` —— **两个参数都必填**。`lt-userdata.py` 的动词只有
+`decode|repack|inspect|rekey`(**没有 graft**)。
+
 ```bash
-bash lib/apply-lt.sh pull
-python3 lib/lt-userdata.py graft --rendered ./lt-current.userdata --artifact launch-template/init-host.sh.patched --out ./lt-next.userdata
-python3 lib/lt-userdata.py decode --version next | grep -c '{{'
-bash lib/apply-lt.sh push
-bash lib/apply-lt.sh promote
+lib/apply-lt.sh pull "$ASG" "$REGION"
+python3 lib/lt-userdata.py inspect .oc-lt-state/userdata.b64
+python3 lib/lt-userdata.py decode .oc-lt-state/userdata.b64 > ./lt-current.userdata
+python3 lib/lt-userdata.py decode .oc-lt-state/userdata.b64 | grep -c '{{'
+lib/apply-lt.sh push "$ASG" "$REGION"
+lib/apply-lt.sh promote "$ASG" "$REGION"
+lib/apply-lt.sh verify "$ASG" "$REGION"
 ```
 
-上面那条 `grep -c` **必须为 0**。**必须在【已渲染】的 UserData 上嫁接,不能拿仓库里的模板直接烤** ——
-那份文件带约 31 个 `{{PLACEHOLDER}}`,CDK 在 synth 时才替换;直接烤会让新 host 带着字面 `{{...}}`
-起不来。新的启动模板版本**不会**自动更新在役 ASG(它钉的是具体版本),要按 `apply-lt.sh` 的受控
+把本次改动嫁接进 `lt-current.userdata` 是**人工步骤**:对照 `launch-template/init-host.sh.patched`
+与已渲染那份的差异,只改本次变更的那几段,不要整文件替换(整替会把 CDK 已替换好的约 31 个值
+换回占位符)。
+
+上面那条 `grep -c` **必须为 0**。`init-host.sh` 是 `ha_edge.py` 在 synth 时读入、替换约 31 个占位符后
+烤进 UserData 的,所以**必须在【已渲染】的那份上改,不能拿仓库里的模板直接烤** —— 直接烤会让新
+host 带着字面 `{{...}}` 起不来。新的启动模板版本**不会**自动更新在役 ASG(它钉的是具体版本),要按 `apply-lt.sh` 的受控
 instance-refresh 路径滚。验证只起**一台**新 host,盯三个信号:解码后的 UserData 没有 `{{`、
 它注册进 hosts 表、ASG 生命周期是 CONTINUE 而不是 Heartbeat-Timeout。
 

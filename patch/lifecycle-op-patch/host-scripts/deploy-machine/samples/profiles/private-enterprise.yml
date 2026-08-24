@@ -1,0 +1,102 @@
+# 场景 profile:private-enterprise —— 纯私有 API + 内网 console + 企业安全全开
+#
+# 用法:
+#   cp samples/profiles/private-enterprise.yml config.yml
+#   # 填下面标 <必填> 的客户坐标(共 8 个)
+#   ./setup.sh <region> <aws-profile>        # setup.sh 会先跑 scripts/preflight-check.sh
+#
+# 本 profile 只写【场景决定项 + CDK 硬必填键】,不复制 config.yml.example 的全部 202 个键。
+# 没写的键一律回落 deploy/ 里的代码默认值 —— deploy/stack.py 直接 yaml.safe_load(config.yml)
+# 且【不做默认值合并】,所以只有代码里写成 .get(key, default) 的键才可以省略;被直接下标
+# (CFG["a"]["b"])的键缺一个就是 cdk synth KeyError,那些键在本文件里全部显式写出。
+#
+# 性能/容量调优值(host.data_volume_iops / overcommit 比 / api 限流 / logging sizing …)
+# 请对照 config.yml.example 的同名段再按需补进来 —— 那里的注释带实测依据,是单一真相源;
+# 本文件刻意不复制它们,免得同一个数字在仓库里出现四份然后各自漂移。
+
+# ============================== <必填> 客户坐标 ==============================
+# imported = 导入客户已有 VPC。这 8 个值是客户环境坐标,无法预设。
+# 子网必须【恰好 3 个公有 + 3 个私有】(deploy/stacks/_helpers.py:550 fail-loud),
+# 并按 AZ a/b/c 顺序排(CDK 靠 index 对应 AZ)。
+# 注意 multi_az.az_count 只决定实际用前几个,不减少这里的必填数量。
+network:
+  mode: imported
+  imported:
+    vpc_id: ""                 # <必填> 客户已有 VPC id
+    cidr: ""                   # <必填> 客户 VPC CIDR,如 "10.0.0.0/16"(SG rule 引用它)
+    public_subnet_ids: []      # <必填> 恰好 3 个公有子网 id(ALB / NAT GW)
+    private_subnet_ids: []     # <必填> 恰好 3 个私有子网 id(host / edge / Redis)
+
+multi_az:
+  enabled: true
+  az_count: 2
+
+# ============================== 纯私有形态 ==============================
+# PRIVATE API + internal ALB + 不建 CloudFront。
+# 翻转 ALB 的公网/内网形态),缺键 synth 直接 raise(deploy/stacks/ha_edge.py:1350)。
+# 纯私有场景这里必须 true,否则就是「私有 API 却挂公网 ALB」。
+api:
+  mode: private
+alb:
+  internal: true
+cloudfront:
+  enabled: false               # 私有 ALB 回源不通,私有形态必须 false
+
+# ============================== 路由面 ==============================
+# edge.enabled=true 硬依赖 redis.enabled=true(edge 靠 redis 查路由)。
+redis:
+  enabled: true
+  engine: "valkey"
+edge:
+  enabled: true
+
+# ============================== 容量 / 必填键 ==============================
+host:
+  arch: arm64
+  instance_type: r8g.metal-24xl   # 生产基线:96 vCPU / 768 GiB
+  root_volume_gb: 20
+  data_volume_gb: 900
+  reserved_vcpu: 1
+  reserved_mem_mb: 2048
+vm:
+  default_vcpu: 2
+  default_mem_mb: 4096
+  data_disk_mb: 8192
+  gateway_port_base: 18789
+  subnet_prefix: "172.16"         # 点分字符串,不是整数
+asg:
+  min_capacity: 0                 # 首次部署必须 0:镜像烤制是非阻塞独立栈,min>=1 时 host
+                                  # 抢在镜像就绪前启动 → ABANDON → ASG 反复换机
+  max_capacity: 8
+  lifecycle_hook_timeout: 3600    # imported VPC + metal 实测 1200s 不够
+scaler:
+  interval_minutes: 3
+  idle_timeout_minutes: 10
+health_check:
+  interval_minutes: 5
+  az_failover:
+    enabled: true                 # 需 multi_az.enabled=true(上面已 true)
+
+# ============================== 企业安全 ==============================
+console_auth:
+  enabled: true
+  self_sign_up: false
+  rbac_enabled: true              # 角色鉴权(viewer/operator/admin),独立于登录
+  default_no_jwt_role: viewer     # 无 Cognito id_token 的纯 API-key 请求只读兜底
+  # 内网 console 走 443 时填【部署区域内】的 ACM 证书 ARN。
+  # 填了证书就【必须】同时给 bff_ingress_cidrs —— 只配证书不配 CIDR = 443 listener 起来
+  # 但 SG 一条入站规则都没有,控制台打不开(建了墙不开洞)。禁 0.0.0.0/0(synth 会 raise)。
+  bff_certificate_arn: ""         # 可选:如 arn:aws:acm:<region>:<acct>:certificate/<id>
+  bff_ingress_cidrs: ""           # 配了证书则必填,逗号分隔 CIDR(如 "10.0.0.0/16")
+flow_logs:
+  enabled: true                   # CIS 3.8 网络层审计轨迹
+dynamodb:
+  point_in_time_recovery: true    # 控制面表 PITR
+deploy:
+  protect_stateful_resources: true  # 生产:DDB / backup / audit 归档桶 RETAIN + WORM
+audit:
+  # ⚠ 不可逆:下面两项只能在【全新 account 首次部署】时开。存量审计表是 RETAIN,
+  # 在线切 CMK 加密 / 加 Stream+GSI 会强制 replace,丢审计历史。
+  # 主栈 OpenClawOrchestrator 已存在时把它们设 true,preflight-check.sh 会 BLOCK。
+  cmk_encryption: false
+  worm_archive_enabled: false

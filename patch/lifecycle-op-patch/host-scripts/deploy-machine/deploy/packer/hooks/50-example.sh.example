@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+#
+# 用法:复制本文件到本目录、去掉 .example 后缀、加执行位,然后正常构建:
+#   cp deploy/packer/hooks/50-example.sh.example deploy/packer/hooks/50-install-agent.sh
+#   chmod +x deploy/packer/hooks/50-install-agent.sh
+#
+# 本目录的 *.sh 按【文件名字典序】逐个执行。用两位数字前缀控制顺序,中间留空档
+# (10- / 50- / 80-)。参数从 pkrvars 的 hook_env 传进来,不要硬编码进脚本。
+# 完整规则见 hooks/README.md。
+#
+# 执行时机:provision-host.sh 之后、两条 validate 断言之前,以 root 执行。
+# 此时 firecracker / jailer / awscli / ADOT collector / Fluent Bit 均已装好。
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# 允许做什么(与具体机器无关的内容,可安全地被整个机队共享)
+# ─────────────────────────────────────────────────────────────────────────────
+#   - 安装企业软件包:安全 agent、合规采集器、监控 exporter
+#   - 写入配置模板、CA 证书、内核参数(sysctl)、systemd unit 文件
+#   - 预置容器镜像、二进制、字体、语言包等静态资产
+#   - 创建目录结构与不含实例身份的系统用户
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# 禁止做什么(会成为机队级共享状态,构建会在下一阶段失败)
+# ─────────────────────────────────────────────────────────────────────────────
+#   ✗ 生成或写入主机密钥、SSH host key、客户端证书
+#   ✗ 写入 /etc/platform.env 或任何 per-host / per-deployment 配置
+#   ✗ 硬编码密码、API key、token(镜像可被任何能启动实例的人读取)
+#   ✗ 触发 cloud-init 重新初始化,或在 /var/lib/cloud/instances 下留内容
+#   ✗ 启动会在构建阶段注册到外部系统的服务(该注册记录会被整个机队复用)
+#
+# scrub 阶段(provision-host.sh §7)在 hook 之前已执行完毕,因此 hook 写入的内容
+# 不会再被清理,会原样进入镜像。上述任一项都会被随后的 validate 断言检出并使构建
+# 失败 —— 这是有意的 fail-closed 设计,不会产出携带泄漏的 AMI。
+#
+# 运行期才需要的密钥:交由 host 的 instance profile 在启动时从 Secrets Manager 或
+# SSM Parameter Store(SecureString)获取,不要预置于镜像。
+
+set -euo pipefail
+
+log() { echo "[oc:hook:50-example] $*"; }
+
+# shellcheck disable=SC1091  # /etc/os-release 只在构建实例上存在,静态检查看不到它
+log "start: $(uname -m) / $(. /etc/os-release && echo "$PRETTY_NAME")"
+
+# ── 示例 1:安装企业软件包 ───────────────────────────────────────────────────
+# 使用 DEBIAN_FRONTEND=noninteractive:构建阶段无终端,任何交互式提示都会阻塞
+# 直至 packer 超时。同理,涉及覆盖确认的命令需显式传 --yes / --force
+#
+# export DEBIAN_FRONTEND=noninteractive
+# apt-get update -qq
+# apt-get install -y -qq your-security-agent
+# log "security agent installed: $(your-security-agent --version)"
+
+# ── 示例 2:写入配置文件 ─────────────────────────────────────────────────────
+# 仅写入与机器无关的模板。含实例信息的部分留占位符,由 init-host.sh 在启动时渲染。
+#
+# install -d -m 0755 /etc/your-company
+# cat > /etc/your-company/agent.conf <<'CONF'
+# endpoint = https://collector.example.internal:4318
+# # instance_id 由启动阶段填充,不在此处写入
+# CONF
+
+# ── 示例 3:内核参数 ─────────────────────────────────────────────────────────
+# host 承载大量 microVM,可能需要提高文件描述符与网络相关上限。
+# 注意:provision-host.sh 已配置 KSM / swap / SMT 等多租户相关项,不要在此重复设置。
+#
+# cat > /etc/sysctl.d/90-your-company.conf <<'CONF'
+# fs.file-max = 2097152
+# CONF
+
+# ── 示例 4:使用 hook_env 传入的参数 ─────────────────────────────────────────
+# if [ -n "${COMPANY_APT_MIRROR:-}" ]; then
+#   log "using apt mirror: ${COMPANY_APT_MIRROR}"
+#   echo "deb ${COMPANY_APT_MIRROR} noble main" > /etc/apt/sources.list.d/company.list
+# fi
+
+log "done"

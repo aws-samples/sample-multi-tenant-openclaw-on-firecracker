@@ -1,0 +1,79 @@
+# 场景 profile:minimal-test —— default_vpc + 单 AZ + 可销毁重建(开发测试)
+#
+# 用法:
+#   cp samples/profiles/minimal-test.yml config.yml
+#   ./setup.sh <region> <aws-profile>        # 无客户坐标要填,cp 完即可部署
+#
+# 本 profile 只写【场景决定项 + CDK 硬必填键】。没写的键回落 deploy/ 的代码默认值
+# (deploy/stack.py 不做默认值合并,被直接下标的键必须显式写,已全部写出)。
+#
+# ⚠ 这份配置【不是生产姿态】:default_vpc 让 host 落在裸公网子网,单 AZ 无容灾,
+# 有状态资源走 DESTROY。只用于开发/测试环境的反复销毁重建。
+
+network:
+  mode: default_vpc
+
+# 单 AZ。
+multi_az:
+  enabled: false
+  az_count: 1
+
+api:
+  mode: edge
+alb:
+  internal: false                 # #423 起必须显式写,不再从 api.mode 派生
+cloudfront:
+  enabled: false
+
+# 最小组件。redis 保持 true —— 它承载路由表,是数据面前提。
+redis:
+  enabled: true
+  engine: "valkey"
+edge:
+  enabled: false
+logging:
+  enabled: false
+
+host:
+  arch: arm64
+  instance_type: m8g.xlarge
+  root_volume_gb: 20
+  data_volume_gb: 100
+  reserved_vcpu: 1
+  reserved_mem_mb: 2048
+vm:
+  default_vcpu: 2
+  default_mem_mb: 4096
+  data_disk_mb: 8192
+  gateway_port_base: 18789
+  subnet_prefix: "172.16"         # 点分字符串,不是整数
+asg:
+  min_capacity: 0
+  max_capacity: 1
+  lifecycle_hook_timeout: 3600
+scaler:
+  interval_minutes: 3
+  idle_timeout_minutes: 10
+health_check:
+  interval_minutes: 5
+  az_failover:
+    # 单 AZ 必须显式关。代码默认是【开】(deploy/stacks/lambdas.py:1565
+    # az_failover_cfg.get("enabled", True)),整段不写就等于开着 —— 那样在
+    # multi_az.enabled=false 下会去找「其他健康 AZ」迁移租户,而根本没有其他 AZ。
+    enabled: false
+
+console_auth:
+  enabled: false                  # 开发测试不挂 Cognito 登录门
+  rbac_enabled: true              # 角色鉴权独立于登录,保持安全默认
+  default_no_jwt_role: viewer
+flow_logs:
+  enabled: true                   # 网络审计轨迹;成本极低,不建议为省钱关掉
+dynamodb:
+  point_in_time_recovery: true
+deploy:
+  # 测试环境要能反复 destroy + rebuild,所以 false(DESTROY + auto-delete)。
+  # preflight-check.sh 会为此给一条 WARN,那是预期的,不是错。
+  protect_stateful_resources: false
+audit:
+  cmk_encryption: false           # 不可逆,只能全新 account 首次部署开
+  worm_archive_enabled: false

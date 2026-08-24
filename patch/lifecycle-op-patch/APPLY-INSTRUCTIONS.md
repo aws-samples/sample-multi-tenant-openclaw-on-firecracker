@@ -183,7 +183,14 @@ lib/apply-cfn-resources.sh plan resources/cloudformation "$REGION"
 ```
 
 它逐个资源打印 before/after 与所需的人工决策,然后**停下**等你判断 —— 它不会替 `AWS::IAM::Policy`
-和 `AWS::CodeBuild::Project` 编一条通用命令。三类必须单独说明。
+和 `AWS::CodeBuild::Project` 编一条通用命令。
+
+**它的 `verify` 按设计只打印「该核对什么」并退出 0,不读任何在役资源**(源码注释原话:reporting is
+its whole job)。所以**不能把它单独当验证门** —— 自动化会把「没核过」读成「已核过」。这些操作的
+`verify_cli` 因此额外要求一份人工核验回执:你按它列出的每个资源真去 `describe` 过之后,把资源名与
+结论写进 `cfn-verify-receipt.txt`,验证命令会检查该文件里有对应条目。
+
+三类必须单独说明。
 
 **4.1 七个死线 SSM 参数** —— 平时由 CDK 创建,这里自己建;`put-parameter` 幂等,先 `get-parameter`
 区分"新建"还是"接管已有"(决定回滚是删除还是保留):
@@ -221,11 +228,27 @@ lib/apply-api-routes.sh finalize lib/api-routes.spec.json "$API_ID" v1 "$REGION"
 `install-fluent-bit.sh` 变了**,其余 9 个是"确认在位"而非"新建":
 
 ```bash
-aws s3 cp host-scripts/edge/fluent-bit/install-fluent-bit.sh "s3://$ASSETS_BUCKET/deployment/observability/fluent-bit/install-fluent-bit.sh"
-aws s3 ls "s3://$ASSETS_BUCKET/deployment/observability/" --recursive
+KEY=deployment/observability/fluent-bit/install-fluent-bit.sh
+# 覆盖前先记该对象自己的前置版本(区分 404 与其他错误,瞬时错误不能被记成 ABSENT)
+if OUT=$(aws s3api head-object --bucket "$ASSETS_BUCKET" --key "$KEY" --region "$REGION" --query VersionId --output text 2>err.txt); then echo "$OUT" > prev-obs-version.txt
+elif grep -q "Not Found\|404" err.txt; then echo ABSENT > prev-obs-version.txt
+else echo "head-object failed — refusing to guess the anchor" >&2; cat err.txt >&2; exit 1; fi
+aws s3 cp host-scripts/edge/fluent-bit/install-fluent-bit.sh "s3://$ASSETS_BUCKET/$KEY" --region "$REGION"
+# 读回并比对摘要,确认上传的就是 kit 里那份
+aws s3 cp "s3://$ASSETS_BUCKET/$KEY" - --region "$REGION" | sha256sum
+sha256sum host-scripts/edge/fluent-bit/install-fluent-bit.sh
+aws s3 ls "s3://$ASSETS_BUCKET/deployment/observability/" --recursive --region "$REGION"
 ```
 
-期望 10 个键都在。配套的 10 个 `LayerVersion` 是仅为跑自定义资源存在的 CDK 管道,手工路径不需要,
+**S3 侧回滚**(manifest 里那条只管仓库文件,不管桶):
+
+```bash
+PV=$(cat prev-obs-version.txt)
+if [ "$PV" != ABSENT ]; then aws s3api copy-object --bucket "$ASSETS_BUCKET" --key "$KEY" --copy-source "$ASSETS_BUCKET/$KEY?versionId=$PV" --region "$REGION"
+else aws s3 rm "s3://$ASSETS_BUCKET/$KEY" --region "$REGION"; fi
+```
+
+不记前置版本就没法回滚 —— 那会让未来起的 host 一直拿到打过补丁的那份。期望 10 个键都在。配套的 10 个 `LayerVersion` 是仅为跑自定义资源存在的 CDK 管道,手工路径不需要,
 **故意不创建**;将来若真跑一次 CDK 部署,它会把这些补齐 —— 这是一条已知且已披露的偏离。
 
 ## Step 5 — 未来机器的源与启动模板
@@ -270,10 +293,12 @@ instance-refresh 路径滚。验证只起**一台**新 host,盯三个信号:解�
 - **Phase A(只读,零副作用,始终先跑)**:`verify-ddb-scan-pagination`、`verify-config-profile-gate`、
   `verify-consistency-cli`、`verify-copyfile-toctou`、`verify-backup-lifecycle`。
 - **Phase B(走真实产品入口的完整生命周期,核心,跑一次)**:`verify-egress-allowlist`
-  (`POST /hosts/egress` 是**改机队**的写操作:`mode` 必填且只接受 `off|deny`,机队非空时正常返
-  **202 + command_id**,只有 0 台活跃 host 才返 200。用 **operator 身份的 Bearer JWT** 调,
-  body 用 `{"mode":"off"}` 做空操作式验证,并先用 `GET /hosts` 记下原 `egress_mode` 以便恢复。
-  **不要用 api-key 调这条** —— 会 403,原因见开头第 ②b 条,那是上游缺口不是本 patch 没打对)、`verify-lifecycle-deadline`、
+  (`POST /hosts/egress` 是**改机队**的写操作,而且按设计是 **admin-only**(动全机队网络隔离,
+  爆炸半径最大),`operator` 不够。用 **admin 身份的 Bearer JWT**,body 用
+  `{"mode":"off","wait":true}`:`wait=true` 会返回**逐机 `apply_exit` / `rules_sha256` /
+  `consistent`**,那才是可证伪的观测量,比只拿 `command_id` 强。先用 `GET /hosts` 记下原
+  `egress_mode` 以便恢复。**不要用 api-key 调这条** —— 它会在 RBAC 前置门被挡成 403,
+  原因见开头第 ②b 条,那是上游缺口不是本 patch 没打对)、`verify-lifecycle-deadline`、
   `verify-lifecycle-converge`、`verify-lifecycle-lease-port`、`verify-lifecycle-host-fanout`、
   `verify-observability-boot`。
 

@@ -218,11 +218,8 @@ aws lambda get-function-configuration --function-name openclaw-api --region "$RE
 两个角色都要授。列不出来或拿不准就**停下问**,不要猜函数名。
 
 
-先解在役包再覆盖,未改动的模块与依赖因此原样保留;`update-function-code` 之后 `invoke` 验
-`FunctionError` 为空,再翻 `live` 别名。
-
-`invoke` 的判据是 `FunctionError` 为空,**不是 200 响应体**:私有 API 上合成的 `/ping` 返回 404 是
-预期的(按路径路由),不是失败。
+先解在役包再覆盖,未改动的模块与依赖因此原样保留。**校验一律用 `CodeSha256` 比对,不要 `invoke`** ——
+理由见下面那条:`backup` / `health-check` / `scaler` 被唤起会真的跑生产工作流。
 
 ## Step 4 — CDK 变更改走手工 CLI(逐个复核,绝不 stack update)
 
@@ -286,15 +283,21 @@ elif OUT=$(aws s3api head-object --bucket "$ASSETS_BUCKET" --key "$KEY" --region
 elif grep -q "Not Found\|404" err.txt; then echo ABSENT > prev-obs-version.txt
 else echo "head-object failed — refusing to guess the anchor" >&2; cat err.txt >&2; exit 1; fi
 aws s3 cp host-scripts/edge/fluent-bit/install-fluent-bit.sh "s3://$ASSETS_BUCKET/$KEY" --region "$REGION"
-# 读回并比对摘要,确认上传的就是 kit 里那份
-aws s3 cp "s3://$ASSETS_BUCKET/$KEY" - --region "$REGION" | sha256sum
-sha256sum host-scripts/edge/fluent-bit/install-fluent-bit.sh
+# 读回并【断言】摘要一致,不是打印两行让人肉眼比
+WANT=$(sha256sum host-scripts/edge/fluent-bit/install-fluent-bit.sh | cut -c1-64)
+GOT=$(aws s3 cp "s3://$ASSETS_BUCKET/$KEY" - --region "$REGION" | sha256sum | cut -c1-64)
+[ "$WANT" = "$GOT" ] || { echo "readback digest mismatch" >&2; exit 1; }
+# 记下本次写出的版本,回滚前要用它做 CAS
+aws s3api head-object --bucket "$ASSETS_BUCKET" --key "$KEY" --region "$REGION" --query VersionId --output text > post-obs-version.txt
 aws s3 ls "s3://$ASSETS_BUCKET/deployment/observability/" --recursive --region "$REGION"
 ```
 
 **S3 侧回滚**(manifest 里那条只管仓库文件,不管桶):
 
 ```bash
+# 先 CAS:桶里还必须是本次写出的那个版本,否则说明之后有人又发过,不能盖回去
+CURV=$(aws s3api head-object --bucket "$ASSETS_BUCKET" --key "$KEY" --region "$REGION" --query VersionId --output text)
+[ "$CURV" = "$(cat post-obs-version.txt)" ] || { echo "object moved past this patch — refusing to roll back" >&2; exit 1; }
 PV=$(cat prev-obs-version.txt)
 if [ "$PV" != ABSENT ]; then aws s3api copy-object --bucket "$ASSETS_BUCKET" --key "$KEY" --copy-source "$ASSETS_BUCKET/$KEY?versionId=$PV" --region "$REGION"
 else aws s3 rm "s3://$ASSETS_BUCKET/$KEY" --region "$REGION"; fi

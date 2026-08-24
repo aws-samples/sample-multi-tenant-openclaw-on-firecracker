@@ -186,11 +186,11 @@
       "patch_sha256": "02c954c87a5363c27662b2dfc7a6b7ec74be32e1b1359e2a66f1472b61a93d1a",
       "operations": [
         {
-          "resource": "运维/部署机侧新增文件 deploy/console-bff/sigv4-client.mjs(change=A,mode 0644)",
+          "resource": "运维/部署机侧新增文件 deploy/console-bff/sigv4-client.mjs(change=A,mode 0644)。目标路径**可能已被客户自己建过** ——覆盖前先留 .pre-patch(不存在则记 .absent),回滚据此还原或移除,不一律删",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 -D host-scripts/deploy-machine/deploy/console-bff/sigv4-client.mjs \"$REPO_ROOT/deploy/console-bff/sigv4-client.mjs\"",
+          "apply_cli": "if [ ! -f \"$REPO_ROOT/deploy/console-bff/sigv4-client.mjs.pre-patch\" ] && [ ! -f \"$REPO_ROOT/deploy/console-bff/sigv4-client.mjs.pre-patch.absent\" ]; then if [ -f \"$REPO_ROOT/deploy/console-bff/sigv4-client.mjs\" ]; then cp -p \"$REPO_ROOT/deploy/console-bff/sigv4-client.mjs\" \"$REPO_ROOT/deploy/console-bff/sigv4-client.mjs.pre-patch\"; else mkdir -p \"$(dirname \"$REPO_ROOT/deploy/console-bff/sigv4-client.mjs\")\" && : > \"$REPO_ROOT/deploy/console-bff/sigv4-client.mjs.pre-patch.absent\"; fi; fi ; install -m 0644 -D host-scripts/deploy-machine/deploy/console-bff/sigv4-client.mjs \"$REPO_ROOT/deploy/console-bff/sigv4-client.mjs\"",
           "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/console-bff/sigv4-client.mjs\" | cut -c1-64)\" = \"02c954c87a5363c27662b2dfc7a6b7ec74be32e1b1359e2a66f1472b61a93d1a\"",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/console-bff/sigv4-client.mjs\" | cut -c1-64)\" = \"02c954c87a5363c27662b2dfc7a6b7ec74be32e1b1359e2a66f1472b61a93d1a\" && rm -f \"$REPO_ROOT/deploy/console-bff/sigv4-client.mjs\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/console-bff/sigv4-client.mjs\" | cut -c1-64)\" = \"02c954c87a5363c27662b2dfc7a6b7ec74be32e1b1359e2a66f1472b61a93d1a\" && if [ -f \"$REPO_ROOT/deploy/console-bff/sigv4-client.mjs.pre-patch\" ]; then cp -p \"$REPO_ROOT/deploy/console-bff/sigv4-client.mjs.pre-patch\" \"$REPO_ROOT/deploy/console-bff/sigv4-client.mjs\"; else rm -f \"$REPO_ROOT/deploy/console-bff/sigv4-client.mjs\"; fi  # 先证当前仍是本 patch;原本存在就还原原件,原本不存在才移除",
           "artifact_refs": [
             "host-scripts/deploy-machine/deploy/console-bff/sigv4-client.mjs"
           ],
@@ -212,11 +212,11 @@
       "patch_sha256": "cd3f113a3378a8b37a61e3802e28571b7f26ec71ab030236358b33985ef99356",
       "operations": [
         {
-          "resource": "运维/部署机侧新增文件 deploy/console-bff/sigv4.test.mjs(change=A,mode 0644)",
+          "resource": "运维/部署机侧新增文件 deploy/console-bff/sigv4.test.mjs(change=A,mode 0644)。目标路径**可能已被客户自己建过** ——覆盖前先留 .pre-patch(不存在则记 .absent),回滚据此还原或移除,不一律删",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 -D host-scripts/deploy-machine/deploy/console-bff/sigv4.test.mjs \"$REPO_ROOT/deploy/console-bff/sigv4.test.mjs\"",
+          "apply_cli": "if [ ! -f \"$REPO_ROOT/deploy/console-bff/sigv4.test.mjs.pre-patch\" ] && [ ! -f \"$REPO_ROOT/deploy/console-bff/sigv4.test.mjs.pre-patch.absent\" ]; then if [ -f \"$REPO_ROOT/deploy/console-bff/sigv4.test.mjs\" ]; then cp -p \"$REPO_ROOT/deploy/console-bff/sigv4.test.mjs\" \"$REPO_ROOT/deploy/console-bff/sigv4.test.mjs.pre-patch\"; else mkdir -p \"$(dirname \"$REPO_ROOT/deploy/console-bff/sigv4.test.mjs\")\" && : > \"$REPO_ROOT/deploy/console-bff/sigv4.test.mjs.pre-patch.absent\"; fi; fi ; install -m 0644 -D host-scripts/deploy-machine/deploy/console-bff/sigv4.test.mjs \"$REPO_ROOT/deploy/console-bff/sigv4.test.mjs\"",
           "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/console-bff/sigv4.test.mjs\" | cut -c1-64)\" = \"cd3f113a3378a8b37a61e3802e28571b7f26ec71ab030236358b33985ef99356\"",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/console-bff/sigv4.test.mjs\" | cut -c1-64)\" = \"cd3f113a3378a8b37a61e3802e28571b7f26ec71ab030236358b33985ef99356\" && rm -f \"$REPO_ROOT/deploy/console-bff/sigv4.test.mjs\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/console-bff/sigv4.test.mjs\" | cut -c1-64)\" = \"cd3f113a3378a8b37a61e3802e28571b7f26ec71ab030236358b33985ef99356\" && if [ -f \"$REPO_ROOT/deploy/console-bff/sigv4.test.mjs.pre-patch\" ]; then cp -p \"$REPO_ROOT/deploy/console-bff/sigv4.test.mjs.pre-patch\" \"$REPO_ROOT/deploy/console-bff/sigv4.test.mjs\"; else rm -f \"$REPO_ROOT/deploy/console-bff/sigv4.test.mjs\"; fi  # 先证当前仍是本 patch;原本存在就还原原件,原本不存在才移除",
           "artifact_refs": [
             "host-scripts/deploy-machine/deploy/console-bff/sigv4.test.mjs"
           ],
@@ -1339,11 +1339,11 @@
       "patch_sha256": "2943af23759e8ee9519e169f9d15b104f5734ae71f289633dbdb77c355f183cc",
       "operations": [
         {
-          "resource": "运维/部署机侧新增文件 deploy/packer/build-golden-ami.sh(change=A,mode 0644)",
+          "resource": "运维/部署机侧新增文件 deploy/packer/build-golden-ami.sh(change=A,mode 0644)。目标路径**可能已被客户自己建过** ——覆盖前先留 .pre-patch(不存在则记 .absent),回滚据此还原或移除,不一律删",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 -D host-scripts/deploy-machine/deploy/packer/build-golden-ami.sh \"$REPO_ROOT/deploy/packer/build-golden-ami.sh\"",
+          "apply_cli": "if [ ! -f \"$REPO_ROOT/deploy/packer/build-golden-ami.sh.pre-patch\" ] && [ ! -f \"$REPO_ROOT/deploy/packer/build-golden-ami.sh.pre-patch.absent\" ]; then if [ -f \"$REPO_ROOT/deploy/packer/build-golden-ami.sh\" ]; then cp -p \"$REPO_ROOT/deploy/packer/build-golden-ami.sh\" \"$REPO_ROOT/deploy/packer/build-golden-ami.sh.pre-patch\"; else mkdir -p \"$(dirname \"$REPO_ROOT/deploy/packer/build-golden-ami.sh\")\" && : > \"$REPO_ROOT/deploy/packer/build-golden-ami.sh.pre-patch.absent\"; fi; fi ; install -m 0644 -D host-scripts/deploy-machine/deploy/packer/build-golden-ami.sh \"$REPO_ROOT/deploy/packer/build-golden-ami.sh\"",
           "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/packer/build-golden-ami.sh\" | cut -c1-64)\" = \"2943af23759e8ee9519e169f9d15b104f5734ae71f289633dbdb77c355f183cc\"",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/packer/build-golden-ami.sh\" | cut -c1-64)\" = \"2943af23759e8ee9519e169f9d15b104f5734ae71f289633dbdb77c355f183cc\" && rm -f \"$REPO_ROOT/deploy/packer/build-golden-ami.sh\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/packer/build-golden-ami.sh\" | cut -c1-64)\" = \"2943af23759e8ee9519e169f9d15b104f5734ae71f289633dbdb77c355f183cc\" && if [ -f \"$REPO_ROOT/deploy/packer/build-golden-ami.sh.pre-patch\" ]; then cp -p \"$REPO_ROOT/deploy/packer/build-golden-ami.sh.pre-patch\" \"$REPO_ROOT/deploy/packer/build-golden-ami.sh\"; else rm -f \"$REPO_ROOT/deploy/packer/build-golden-ami.sh\"; fi  # 先证当前仍是本 patch;原本存在就还原原件,原本不存在才移除",
           "artifact_refs": [
             "host-scripts/deploy-machine/deploy/packer/build-golden-ami.sh"
           ],
@@ -1474,11 +1474,11 @@
       "patch_sha256": "2a52310c7ce8c03a8dbca8c0edcae9dc28364505762c14768a676492632d040d",
       "operations": [
         {
-          "resource": "运维/部署机侧新增文件 deploy/packer/run-hooks.sh(change=A,mode 0644)",
+          "resource": "运维/部署机侧新增文件 deploy/packer/run-hooks.sh(change=A,mode 0644)。目标路径**可能已被客户自己建过** ——覆盖前先留 .pre-patch(不存在则记 .absent),回滚据此还原或移除,不一律删",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 -D host-scripts/deploy-machine/deploy/packer/run-hooks.sh \"$REPO_ROOT/deploy/packer/run-hooks.sh\"",
+          "apply_cli": "if [ ! -f \"$REPO_ROOT/deploy/packer/run-hooks.sh.pre-patch\" ] && [ ! -f \"$REPO_ROOT/deploy/packer/run-hooks.sh.pre-patch.absent\" ]; then if [ -f \"$REPO_ROOT/deploy/packer/run-hooks.sh\" ]; then cp -p \"$REPO_ROOT/deploy/packer/run-hooks.sh\" \"$REPO_ROOT/deploy/packer/run-hooks.sh.pre-patch\"; else mkdir -p \"$(dirname \"$REPO_ROOT/deploy/packer/run-hooks.sh\")\" && : > \"$REPO_ROOT/deploy/packer/run-hooks.sh.pre-patch.absent\"; fi; fi ; install -m 0644 -D host-scripts/deploy-machine/deploy/packer/run-hooks.sh \"$REPO_ROOT/deploy/packer/run-hooks.sh\"",
           "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/packer/run-hooks.sh\" | cut -c1-64)\" = \"2a52310c7ce8c03a8dbca8c0edcae9dc28364505762c14768a676492632d040d\"",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/packer/run-hooks.sh\" | cut -c1-64)\" = \"2a52310c7ce8c03a8dbca8c0edcae9dc28364505762c14768a676492632d040d\" && rm -f \"$REPO_ROOT/deploy/packer/run-hooks.sh\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/deploy/packer/run-hooks.sh\" | cut -c1-64)\" = \"2a52310c7ce8c03a8dbca8c0edcae9dc28364505762c14768a676492632d040d\" && if [ -f \"$REPO_ROOT/deploy/packer/run-hooks.sh.pre-patch\" ]; then cp -p \"$REPO_ROOT/deploy/packer/run-hooks.sh.pre-patch\" \"$REPO_ROOT/deploy/packer/run-hooks.sh\"; else rm -f \"$REPO_ROOT/deploy/packer/run-hooks.sh\"; fi  # 先证当前仍是本 patch;原本存在就还原原件,原本不存在才移除",
           "artifact_refs": [
             "host-scripts/deploy-machine/deploy/packer/run-hooks.sh"
           ],
@@ -1503,10 +1503,10 @@
       "patch_sha256": "5e0eed7e9febd2a07c6743124005461214fc45723d7e0b61db4ba37bfb745bcc",
       "operations": [
         {
-          "resource": "三条新增 CloudWatch 告警(死线兜底与 DLQ 可观测)。注意 apply-cfn-resources.sh 的 verify 按设计【只打印该核对什么】并退出 0,不读任何在役资源 —— 所以这里要求同时存在写明本文件的人工核验回执 cfn-verify-receipt.txt,否则自动化会把「没核过」读成「已核过」",
+          "resource": "三条新增 CloudWatch 告警(死线兜底与 DLQ 可观测)。注意 apply-cfn-resources.sh 的 verify 按设计只打印该核对什么并退出 0,不读在役资源 —— 所以这里要求人工回执 cfn-verify-receipt.txt 里**逐个点名**本操作拥有的 3 个 logical id(只写文件名会让一个条目替 3 个资源背书)",
           "class": "MANUAL_CLI_REVIEW",
           "apply_cli": "lib/apply-cfn-resources.sh plan resources/cloudformation $REGION",
-          "verify_cli": "lib/apply-cfn-resources.sh verify resources/cloudformation $REGION && test -s cfn-verify-receipt.txt && grep -q \"$(basename deploy/stacks/alarms.py)\" cfn-verify-receipt.txt",
+          "verify_cli": "lib/apply-cfn-resources.sh verify resources/cloudformation $REGION && test -s cfn-verify-receipt.txt && grep -q \"LifecycleReaperHeartbeatAlarm5D115F88\" cfn-verify-receipt.txt && grep -q \"LifecycleStuckMarkedAlarmCDA045A6\" cfn-verify-receipt.txt && grep -q \"LifecycleStuckUnconfirmedAlarmE908EC5A\" cfn-verify-receipt.txt",
           "rollback_cli": "lib/apply-cfn-resources.sh rollback resources/cloudformation $REGION",
           "artifact_refs": [
             "lib/apply-cfn-resources.sh"
@@ -1578,10 +1578,10 @@
       "patch_sha256": "423d7805328d909f7d7d54422a6f0df98b871cdd43c92324cb20f2c081094d1b",
       "operations": [
         {
-          "resource": "host 启动模板与 ASG + host role 策略(topology 触及,必须人工复核)。注意 apply-cfn-resources.sh 的 verify 按设计【只打印该核对什么】并退出 0,不读任何在役资源 —— 所以这里要求同时存在写明本文件的人工核验回执 cfn-verify-receipt.txt,否则自动化会把「没核过」读成「已核过」",
+          "resource": "host 启动模板与 ASG + host role 策略(topology 触及,必须人工复核)。注意 apply-cfn-resources.sh 的 verify 按设计只打印该核对什么并退出 0,不读在役资源 —— 所以这里要求人工回执 cfn-verify-receipt.txt 里**逐个点名**本操作拥有的 4 个 logical id(只写文件名会让一个条目替 4 个资源背书)",
           "class": "MANUAL_CLI_REVIEW",
           "apply_cli": "lib/apply-cfn-resources.sh plan resources/cloudformation $REGION",
-          "verify_cli": "lib/apply-cfn-resources.sh verify resources/cloudformation $REGION && test -s cfn-verify-receipt.txt && grep -q \"$(basename deploy/stacks/compute.py)\" cfn-verify-receipt.txt",
+          "verify_cli": "lib/apply-cfn-resources.sh verify resources/cloudformation $REGION && test -s cfn-verify-receipt.txt && grep -q \"HostASG3A4B5C6D\" cfn-verify-receipt.txt && grep -q \"HostInitAssetDeploymentCustomResource96CEC015\" cfn-verify-receipt.txt && grep -q \"HostLT7E8F9A0B\" cfn-verify-receipt.txt && grep -q \"HostRoleDefaultPolicy61397894\" cfn-verify-receipt.txt",
           "rollback_cli": "lib/apply-cfn-resources.sh rollback resources/cloudformation $REGION",
           "artifact_refs": [
             "lib/apply-cfn-resources.sh"
@@ -1703,10 +1703,10 @@
       "patch_sha256": "d25f47cf81f82b4bd824a330be86ff0f2314216fa8e4beca7b09964683568c16",
       "operations": [
         {
-          "resource": "golden image 构建角色策略与 CodeBuild 项目(仅在开启镜像流水线时有效)。注意 apply-cfn-resources.sh 的 verify 按设计【只打印该核对什么】并退出 0,不读任何在役资源 —— 所以这里要求同时存在写明本文件的人工核验回执 cfn-verify-receipt.txt,否则自动化会把「没核过」读成「已核过」",
+          "resource": "golden image 构建角色策略与 CodeBuild 项目(仅在开启镜像流水线时有效)。注意 apply-cfn-resources.sh 的 verify 按设计只打印该核对什么并退出 0,不读在役资源 —— 所以这里要求人工回执 cfn-verify-receipt.txt 里**逐个点名**本操作拥有的 2 个 logical id(只写文件名会让一个条目替 2 个资源背书)",
           "class": "MANUAL_CLI_REVIEW",
           "apply_cli": "lib/apply-cfn-resources.sh plan resources/cloudformation $REGION",
-          "verify_cli": "lib/apply-cfn-resources.sh verify resources/cloudformation $REGION && test -s cfn-verify-receipt.txt && grep -q \"$(basename deploy/stacks/host_image.py)\" cfn-verify-receipt.txt",
+          "verify_cli": "lib/apply-cfn-resources.sh verify resources/cloudformation $REGION && test -s cfn-verify-receipt.txt && grep -q \"GoldenImageBuildRoleDefaultPolicy94E47D88\" cfn-verify-receipt.txt && grep -q \"GoldenImageBuilderCEF13562\" cfn-verify-receipt.txt",
           "rollback_cli": "lib/apply-cfn-resources.sh rollback resources/cloudformation $REGION",
           "artifact_refs": [
             "lib/apply-cfn-resources.sh"
@@ -1745,10 +1745,10 @@
       "patch_sha256": "3803ec1f95d941328b23fddd2b06f538cc31035220dcb8d47c39e4d590269d3a",
       "operations": [
         {
-          "resource": "七档死线 SSM 参数 + api/backup 的 DLQ + 函数与别名 + 读参数的 IAM(逐资源人工复核,绝不 stack update)。注意 apply-cfn-resources.sh 的 verify 按设计【只打印该核对什么】并退出 0,不读任何在役资源 —— 所以这里要求同时存在写明本文件的人工核验回执 cfn-verify-receipt.txt,否则自动化会把「没核过」读成「已核过」",
+          "resource": "七档死线 SSM 参数 + api/backup 的 DLQ + 函数与别名 + 读参数的 IAM(逐资源人工复核,绝不 stack update)。注意 apply-cfn-resources.sh 的 verify 按设计只打印该核对什么并退出 0,不读在役资源 —— 所以这里要求人工回执 cfn-verify-receipt.txt 里**逐个点名**本操作拥有的 20 个 logical id(只写文件名会让一个条目替 20 个资源背书)",
           "class": "MANUAL_CLI_REVIEW",
           "apply_cli": "lib/apply-cfn-resources.sh plan resources/cloudformation $REGION",
-          "verify_cli": "lib/apply-cfn-resources.sh verify resources/cloudformation $REGION && test -s cfn-verify-receipt.txt && grep -q \"$(basename deploy/stacks/lambdas.py)\" cfn-verify-receipt.txt",
+          "verify_cli": "lib/apply-cfn-resources.sh verify resources/cloudformation $REGION && test -s cfn-verify-receipt.txt && grep -q \"ApiHandlerCurrentVersion5C7F0A607781e75811aabc607a4b9a0b0fd04314\" cfn-verify-receipt.txt && grep -q \"ApiHandlerDeadLetterQueue32F3456D\" cfn-verify-receipt.txt && grep -q \"BackupDeadLetterQueue1E66940C\" cfn-verify-receipt.txt && grep -q \"LifecycleDeadlineSecBackup6E3E1CE9\" cfn-verify-receipt.txt && grep -q \"LifecycleDeadlineSecCreateFAA70938\" cfn-verify-receipt.txt && grep -q \"LifecycleDeadlineSecDeleteD66A7841\" cfn-verify-receipt.txt && grep -q \"LifecycleDeadlineSecRebuild0C391006\" cfn-verify-receipt.txt && grep -q \"LifecycleDeadlineSecRestartDB75F38A\" cfn-verify-receipt.txt && grep -q \"LifecycleDeadlineSecRestore50B33693\" cfn-verify-receipt.txt && grep -q \"LifecycleDeadlineSecSuspend00FFD99A\" cfn-verify-receipt.txt && grep -q \"ApiHandlerCurrentVersion5C7F0A60f5c87ca61b7095c0c49042c47128bf5e\" cfn-verify-receipt.txt && grep -q \"ApiHandler5E7490E8\" cfn-verify-receipt.txt && grep -q \"ApiHandlerLive539BAFFE\" cfn-verify-receipt.txt && grep -q \"ApiHandlerServiceRoleDefaultPolicy10321D87\" cfn-verify-receipt.txt && grep -q \"ApiHandlerServiceRoleOverflowPolicy147BA3B1F\" cfn-verify-receipt.txt && grep -q \"BackupDA3807AC\" cfn-verify-receipt.txt && grep -q \"BackupServiceRoleDefaultPolicyC2A810A2\" cfn-verify-receipt.txt && grep -q \"HealthCheckA1C381C7\" cfn-verify-receipt.txt && grep -q \"HealthCheckServiceRoleDefaultPolicyAE8FE253\" cfn-verify-receipt.txt && grep -q \"Scaler769179EA\" cfn-verify-receipt.txt",
           "rollback_cli": "lib/apply-cfn-resources.sh rollback resources/cloudformation $REGION",
           "artifact_refs": [
             "lib/apply-cfn-resources.sh"
@@ -1899,10 +1899,10 @@
       "patch_sha256": "aba603ca422369acdfe450030edacc94f56bdc4d24715631d0a926addc46b8c4",
       "operations": [
         {
-          "resource": "可观测性资产分发:10 个 BucketDeployment 自定义资源与其配套 LayerVersion —— 手工路径直接按 OBS_ASSETS 清单 s3 cp,自定义资源本体故意不创建。注意 apply-cfn-resources.sh 的 verify 按设计【只打印该核对什么】并退出 0,不读任何在役资源 —— 所以这里要求同时存在写明本文件的人工核验回执 cfn-verify-receipt.txt,否则自动化会把「没核过」读成「已核过」",
+          "resource": "可观测性资产分发:10 个 BucketDeployment 自定义资源与其配套 LayerVersion —— 手工路径直接按 OBS_ASSETS 清单 s3 cp,自定义资源本体故意不创建。注意 apply-cfn-resources.sh 的 verify 按设计只打印该核对什么并退出 0,不读在役资源 —— 所以这里要求人工回执 cfn-verify-receipt.txt 里**逐个点名**本操作拥有的 21 个 logical id(只写文件名会让一个条目替 21 个资源背书)",
           "class": "MANUAL_CLI_REVIEW",
           "apply_cli": "lib/apply-cfn-resources.sh plan resources/cloudformation $REGION",
-          "verify_cli": "lib/apply-cfn-resources.sh verify resources/cloudformation $REGION && test -s cfn-verify-receipt.txt && grep -q \"$(basename deploy/stacks/obs_assets.py)\" cfn-verify-receipt.txt",
+          "verify_cli": "lib/apply-cfn-resources.sh verify resources/cloudformation $REGION && test -s cfn-verify-receipt.txt && grep -q \"ObsAdotConfigAwsCliLayer5E433809\" cfn-verify-receipt.txt && grep -q \"ObsAdotConfigCustomResource232C322E\" cfn-verify-receipt.txt && grep -q \"ObsFbEdgeConfAwsCliLayerBBC2D5AF\" cfn-verify-receipt.txt && grep -q \"ObsFbEdgeConfCustomResourceA22C09AC\" cfn-verify-receipt.txt && grep -q \"ObsFbEdgeParsersAwsCliLayer63391CEE\" cfn-verify-receipt.txt && grep -q \"ObsFbEdgeParsersCustomResource20E4D36C\" cfn-verify-receipt.txt && grep -q \"ObsFbEdgeTimestampAwsCliLayer55BF7B60\" cfn-verify-receipt.txt && grep -q \"ObsFbEdgeTimestampCustomResourceBAD14874\" cfn-verify-receipt.txt && grep -q \"ObsFbEdgeTraceRootAwsCliLayer24674A83\" cfn-verify-receipt.txt && grep -q \"ObsFbEdgeTraceRootCustomResource91AC9A9D\" cfn-verify-receipt.txt && grep -q \"ObsFbHostConfAwsCliLayerB215AAD9\" cfn-verify-receipt.txt && grep -q \"ObsFbHostConfCustomResource27F6488F\" cfn-verify-receipt.txt && grep -q \"ObsFbHostParsersAwsCliLayerBD1CF625\" cfn-verify-receipt.txt && grep -q \"ObsFbHostParsersCustomResource30A3B56A\" cfn-verify-receipt.txt && grep -q \"ObsFbHostTenantIdAwsCliLayerF711CB79\" cfn-verify-receipt.txt && grep -q \"ObsFbHostTenantIdCustomResource775AEA00\" cfn-verify-receipt.txt && grep -q \"ObsFbHostTimestampAwsCliLayerD8F7A001\" cfn-verify-receipt.txt && grep -q \"ObsFbHostTimestampCustomResource469BA0E4\" cfn-verify-receipt.txt && grep -q \"ObsFbInstallerAwsCliLayerD5540E06\" cfn-verify-receipt.txt && grep -q \"ObsFbInstallerCustomResourceB2298A62\" cfn-verify-receipt.txt && grep -q \"AWS679f53fac002430cb0da5b7982bd22872D164C4C\" cfn-verify-receipt.txt",
           "rollback_cli": "lib/apply-cfn-resources.sh rollback resources/cloudformation $REGION",
           "artifact_refs": [
             "lib/apply-cfn-resources.sh"
@@ -2055,10 +2055,10 @@
       "patch_sha256": "d3b817d756a793f6898dc8a085ec3998c6363aca3427b237204f1b50e75a6ce2",
       "operations": [
         {
-          "resource": "资产桶/备份桶属性 + 被移除的备份生命周期自定义资源(逐资源人工复核)。注意 apply-cfn-resources.sh 的 verify 按设计【只打印该核对什么】并退出 0,不读任何在役资源 —— 所以这里要求同时存在写明本文件的人工核验回执 cfn-verify-receipt.txt,否则自动化会把「没核过」读成「已核过」",
+          "resource": "资产桶/备份桶属性 + 被移除的备份生命周期自定义资源(逐资源人工复核)。注意 apply-cfn-resources.sh 的 verify 按设计只打印该核对什么并退出 0,不读在役资源 —— 所以这里要求人工回执 cfn-verify-receipt.txt 里**逐个点名**本操作拥有的 4 个 logical id(只写文件名会让一个条目替 4 个资源背书)",
           "class": "MANUAL_CLI_REVIEW",
           "apply_cli": "lib/apply-cfn-resources.sh plan resources/cloudformation $REGION",
-          "verify_cli": "lib/apply-cfn-resources.sh verify resources/cloudformation $REGION && test -s cfn-verify-receipt.txt && grep -q \"$(basename deploy/stacks/storage.py)\" cfn-verify-receipt.txt",
+          "verify_cli": "lib/apply-cfn-resources.sh verify resources/cloudformation $REGION && test -s cfn-verify-receipt.txt && grep -q \"BackupLifecycleB8F6A42B\" cfn-verify-receipt.txt && grep -q \"BackupLifecycleCustomResourcePolicyB5043EF1\" cfn-verify-receipt.txt && grep -q \"Assets560B5C73\" cfn-verify-receipt.txt && grep -q \"TenantBackups7A8B9C0D\" cfn-verify-receipt.txt",
           "rollback_cli": "lib/apply-cfn-resources.sh rollback resources/cloudformation $REGION",
           "artifact_refs": [
             "lib/apply-cfn-resources.sh"
@@ -3655,11 +3655,11 @@
       "patch_sha256": "171ba91d63b0456c766730fd3fc501e6cb82500974e52447995d9bf4fd5a7c97",
       "operations": [
         {
-          "resource": "运维/部署机侧新增文件 samples/profiles/minimal-test.yml(change=A,mode 0644)",
+          "resource": "运维/部署机侧新增文件 samples/profiles/minimal-test.yml(change=A,mode 0644)。目标路径**可能已被客户自己建过** ——覆盖前先留 .pre-patch(不存在则记 .absent),回滚据此还原或移除,不一律删",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 -D host-scripts/deploy-machine/samples/profiles/minimal-test.yml \"$REPO_ROOT/samples/profiles/minimal-test.yml\"",
+          "apply_cli": "if [ ! -f \"$REPO_ROOT/samples/profiles/minimal-test.yml.pre-patch\" ] && [ ! -f \"$REPO_ROOT/samples/profiles/minimal-test.yml.pre-patch.absent\" ]; then if [ -f \"$REPO_ROOT/samples/profiles/minimal-test.yml\" ]; then cp -p \"$REPO_ROOT/samples/profiles/minimal-test.yml\" \"$REPO_ROOT/samples/profiles/minimal-test.yml.pre-patch\"; else mkdir -p \"$(dirname \"$REPO_ROOT/samples/profiles/minimal-test.yml\")\" && : > \"$REPO_ROOT/samples/profiles/minimal-test.yml.pre-patch.absent\"; fi; fi ; install -m 0644 -D host-scripts/deploy-machine/samples/profiles/minimal-test.yml \"$REPO_ROOT/samples/profiles/minimal-test.yml\"",
           "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/samples/profiles/minimal-test.yml\" | cut -c1-64)\" = \"171ba91d63b0456c766730fd3fc501e6cb82500974e52447995d9bf4fd5a7c97\"",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/samples/profiles/minimal-test.yml\" | cut -c1-64)\" = \"171ba91d63b0456c766730fd3fc501e6cb82500974e52447995d9bf4fd5a7c97\" && rm -f \"$REPO_ROOT/samples/profiles/minimal-test.yml\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/samples/profiles/minimal-test.yml\" | cut -c1-64)\" = \"171ba91d63b0456c766730fd3fc501e6cb82500974e52447995d9bf4fd5a7c97\" && if [ -f \"$REPO_ROOT/samples/profiles/minimal-test.yml.pre-patch\" ]; then cp -p \"$REPO_ROOT/samples/profiles/minimal-test.yml.pre-patch\" \"$REPO_ROOT/samples/profiles/minimal-test.yml\"; else rm -f \"$REPO_ROOT/samples/profiles/minimal-test.yml\"; fi  # 先证当前仍是本 patch;原本存在就还原原件,原本不存在才移除",
           "artifact_refs": [
             "host-scripts/deploy-machine/samples/profiles/minimal-test.yml"
           ],
@@ -3681,11 +3681,11 @@
       "patch_sha256": "c536596d6bfc8a5202d97fcdd2ace80f27c43e262ebe5272adcfd59624890093",
       "operations": [
         {
-          "resource": "运维/部署机侧新增文件 samples/profiles/private-enterprise.yml(change=A,mode 0644)",
+          "resource": "运维/部署机侧新增文件 samples/profiles/private-enterprise.yml(change=A,mode 0644)。目标路径**可能已被客户自己建过** ——覆盖前先留 .pre-patch(不存在则记 .absent),回滚据此还原或移除,不一律删",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 -D host-scripts/deploy-machine/samples/profiles/private-enterprise.yml \"$REPO_ROOT/samples/profiles/private-enterprise.yml\"",
+          "apply_cli": "if [ ! -f \"$REPO_ROOT/samples/profiles/private-enterprise.yml.pre-patch\" ] && [ ! -f \"$REPO_ROOT/samples/profiles/private-enterprise.yml.pre-patch.absent\" ]; then if [ -f \"$REPO_ROOT/samples/profiles/private-enterprise.yml\" ]; then cp -p \"$REPO_ROOT/samples/profiles/private-enterprise.yml\" \"$REPO_ROOT/samples/profiles/private-enterprise.yml.pre-patch\"; else mkdir -p \"$(dirname \"$REPO_ROOT/samples/profiles/private-enterprise.yml\")\" && : > \"$REPO_ROOT/samples/profiles/private-enterprise.yml.pre-patch.absent\"; fi; fi ; install -m 0644 -D host-scripts/deploy-machine/samples/profiles/private-enterprise.yml \"$REPO_ROOT/samples/profiles/private-enterprise.yml\"",
           "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/samples/profiles/private-enterprise.yml\" | cut -c1-64)\" = \"c536596d6bfc8a5202d97fcdd2ace80f27c43e262ebe5272adcfd59624890093\"",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/samples/profiles/private-enterprise.yml\" | cut -c1-64)\" = \"c536596d6bfc8a5202d97fcdd2ace80f27c43e262ebe5272adcfd59624890093\" && rm -f \"$REPO_ROOT/samples/profiles/private-enterprise.yml\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/samples/profiles/private-enterprise.yml\" | cut -c1-64)\" = \"c536596d6bfc8a5202d97fcdd2ace80f27c43e262ebe5272adcfd59624890093\" && if [ -f \"$REPO_ROOT/samples/profiles/private-enterprise.yml.pre-patch\" ]; then cp -p \"$REPO_ROOT/samples/profiles/private-enterprise.yml.pre-patch\" \"$REPO_ROOT/samples/profiles/private-enterprise.yml\"; else rm -f \"$REPO_ROOT/samples/profiles/private-enterprise.yml\"; fi  # 先证当前仍是本 patch;原本存在就还原原件,原本不存在才移除",
           "artifact_refs": [
             "host-scripts/deploy-machine/samples/profiles/private-enterprise.yml"
           ],
@@ -3707,11 +3707,11 @@
       "patch_sha256": "2f9d94f824ee446fcb82c63832a4f2a3a6d7f0cc9b01b4bba2fcf8f2043ea86d",
       "operations": [
         {
-          "resource": "运维/部署机侧新增文件 samples/profiles/public-demo.yml(change=A,mode 0644)",
+          "resource": "运维/部署机侧新增文件 samples/profiles/public-demo.yml(change=A,mode 0644)。目标路径**可能已被客户自己建过** ——覆盖前先留 .pre-patch(不存在则记 .absent),回滚据此还原或移除,不一律删",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 -D host-scripts/deploy-machine/samples/profiles/public-demo.yml \"$REPO_ROOT/samples/profiles/public-demo.yml\"",
+          "apply_cli": "if [ ! -f \"$REPO_ROOT/samples/profiles/public-demo.yml.pre-patch\" ] && [ ! -f \"$REPO_ROOT/samples/profiles/public-demo.yml.pre-patch.absent\" ]; then if [ -f \"$REPO_ROOT/samples/profiles/public-demo.yml\" ]; then cp -p \"$REPO_ROOT/samples/profiles/public-demo.yml\" \"$REPO_ROOT/samples/profiles/public-demo.yml.pre-patch\"; else mkdir -p \"$(dirname \"$REPO_ROOT/samples/profiles/public-demo.yml\")\" && : > \"$REPO_ROOT/samples/profiles/public-demo.yml.pre-patch.absent\"; fi; fi ; install -m 0644 -D host-scripts/deploy-machine/samples/profiles/public-demo.yml \"$REPO_ROOT/samples/profiles/public-demo.yml\"",
           "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/samples/profiles/public-demo.yml\" | cut -c1-64)\" = \"2f9d94f824ee446fcb82c63832a4f2a3a6d7f0cc9b01b4bba2fcf8f2043ea86d\"",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/samples/profiles/public-demo.yml\" | cut -c1-64)\" = \"2f9d94f824ee446fcb82c63832a4f2a3a6d7f0cc9b01b4bba2fcf8f2043ea86d\" && rm -f \"$REPO_ROOT/samples/profiles/public-demo.yml\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/samples/profiles/public-demo.yml\" | cut -c1-64)\" = \"2f9d94f824ee446fcb82c63832a4f2a3a6d7f0cc9b01b4bba2fcf8f2043ea86d\" && if [ -f \"$REPO_ROOT/samples/profiles/public-demo.yml.pre-patch\" ]; then cp -p \"$REPO_ROOT/samples/profiles/public-demo.yml.pre-patch\" \"$REPO_ROOT/samples/profiles/public-demo.yml\"; else rm -f \"$REPO_ROOT/samples/profiles/public-demo.yml\"; fi  # 先证当前仍是本 patch;原本存在就还原原件,原本不存在才移除",
           "artifact_refs": [
             "host-scripts/deploy-machine/samples/profiles/public-demo.yml"
           ],
@@ -3733,11 +3733,11 @@
       "patch_sha256": "126da373939ea91208d770ab4b4872f8c891ba40c816797eb44b9ee97ef5c37f",
       "operations": [
         {
-          "resource": "运维/部署机侧新增文件 scripts/checks/config-gate.sh(change=A,mode 0755)",
+          "resource": "运维/部署机侧新增文件 scripts/checks/config-gate.sh(change=A,mode 0755)。目标路径**可能已被客户自己建过** ——覆盖前先留 .pre-patch(不存在则记 .absent),回滚据此还原或移除,不一律删",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0755 -D host-scripts/deploy-machine/scripts/checks/config-gate.sh \"$REPO_ROOT/scripts/checks/config-gate.sh\"",
+          "apply_cli": "if [ ! -f \"$REPO_ROOT/scripts/checks/config-gate.sh.pre-patch\" ] && [ ! -f \"$REPO_ROOT/scripts/checks/config-gate.sh.pre-patch.absent\" ]; then if [ -f \"$REPO_ROOT/scripts/checks/config-gate.sh\" ]; then cp -p \"$REPO_ROOT/scripts/checks/config-gate.sh\" \"$REPO_ROOT/scripts/checks/config-gate.sh.pre-patch\"; else mkdir -p \"$(dirname \"$REPO_ROOT/scripts/checks/config-gate.sh\")\" && : > \"$REPO_ROOT/scripts/checks/config-gate.sh.pre-patch.absent\"; fi; fi ; install -m 0755 -D host-scripts/deploy-machine/scripts/checks/config-gate.sh \"$REPO_ROOT/scripts/checks/config-gate.sh\"",
           "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/config-gate.sh\" | cut -c1-64)\" = \"126da373939ea91208d770ab4b4872f8c891ba40c816797eb44b9ee97ef5c37f\"",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/config-gate.sh\" | cut -c1-64)\" = \"126da373939ea91208d770ab4b4872f8c891ba40c816797eb44b9ee97ef5c37f\" && rm -f \"$REPO_ROOT/scripts/checks/config-gate.sh\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/config-gate.sh\" | cut -c1-64)\" = \"126da373939ea91208d770ab4b4872f8c891ba40c816797eb44b9ee97ef5c37f\" && if [ -f \"$REPO_ROOT/scripts/checks/config-gate.sh.pre-patch\" ]; then cp -p \"$REPO_ROOT/scripts/checks/config-gate.sh.pre-patch\" \"$REPO_ROOT/scripts/checks/config-gate.sh\"; else rm -f \"$REPO_ROOT/scripts/checks/config-gate.sh\"; fi  # 先证当前仍是本 patch;原本存在就还原原件,原本不存在才移除",
           "artifact_refs": [
             "host-scripts/deploy-machine/scripts/checks/config-gate.sh"
           ],
@@ -3759,11 +3759,11 @@
       "patch_sha256": "5aa7a3244a9a4217cbbbcbb1f09f9ae8497c9c32a10d90402cd01d2629a242a1",
       "operations": [
         {
-          "resource": "运维/部署机侧新增文件 scripts/checks/create-deadline-config.py(change=A,mode 0755)",
+          "resource": "运维/部署机侧新增文件 scripts/checks/create-deadline-config.py(change=A,mode 0755)。目标路径**可能已被客户自己建过** ——覆盖前先留 .pre-patch(不存在则记 .absent),回滚据此还原或移除,不一律删",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0755 -D host-scripts/deploy-machine/scripts/checks/create-deadline-config.py \"$REPO_ROOT/scripts/checks/create-deadline-config.py\"",
+          "apply_cli": "if [ ! -f \"$REPO_ROOT/scripts/checks/create-deadline-config.py.pre-patch\" ] && [ ! -f \"$REPO_ROOT/scripts/checks/create-deadline-config.py.pre-patch.absent\" ]; then if [ -f \"$REPO_ROOT/scripts/checks/create-deadline-config.py\" ]; then cp -p \"$REPO_ROOT/scripts/checks/create-deadline-config.py\" \"$REPO_ROOT/scripts/checks/create-deadline-config.py.pre-patch\"; else mkdir -p \"$(dirname \"$REPO_ROOT/scripts/checks/create-deadline-config.py\")\" && : > \"$REPO_ROOT/scripts/checks/create-deadline-config.py.pre-patch.absent\"; fi; fi ; install -m 0755 -D host-scripts/deploy-machine/scripts/checks/create-deadline-config.py \"$REPO_ROOT/scripts/checks/create-deadline-config.py\"",
           "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/create-deadline-config.py\" | cut -c1-64)\" = \"5aa7a3244a9a4217cbbbcbb1f09f9ae8497c9c32a10d90402cd01d2629a242a1\"",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/create-deadline-config.py\" | cut -c1-64)\" = \"5aa7a3244a9a4217cbbbcbb1f09f9ae8497c9c32a10d90402cd01d2629a242a1\" && rm -f \"$REPO_ROOT/scripts/checks/create-deadline-config.py\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/create-deadline-config.py\" | cut -c1-64)\" = \"5aa7a3244a9a4217cbbbcbb1f09f9ae8497c9c32a10d90402cd01d2629a242a1\" && if [ -f \"$REPO_ROOT/scripts/checks/create-deadline-config.py.pre-patch\" ]; then cp -p \"$REPO_ROOT/scripts/checks/create-deadline-config.py.pre-patch\" \"$REPO_ROOT/scripts/checks/create-deadline-config.py\"; else rm -f \"$REPO_ROOT/scripts/checks/create-deadline-config.py\"; fi  # 先证当前仍是本 patch;原本存在就还原原件,原本不存在才移除",
           "artifact_refs": [
             "host-scripts/deploy-machine/scripts/checks/create-deadline-config.py"
           ],
@@ -3785,11 +3785,11 @@
       "patch_sha256": "bc9ca37c369b034d5688b5eb53d59e0e57e14d60f684956ec7ae85ad975ffc06",
       "operations": [
         {
-          "resource": "运维/部署机侧新增文件 scripts/checks/create-deadline-config.sh(change=A,mode 0755)",
+          "resource": "运维/部署机侧新增文件 scripts/checks/create-deadline-config.sh(change=A,mode 0755)。目标路径**可能已被客户自己建过** ——覆盖前先留 .pre-patch(不存在则记 .absent),回滚据此还原或移除,不一律删",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0755 -D host-scripts/deploy-machine/scripts/checks/create-deadline-config.sh \"$REPO_ROOT/scripts/checks/create-deadline-config.sh\"",
+          "apply_cli": "if [ ! -f \"$REPO_ROOT/scripts/checks/create-deadline-config.sh.pre-patch\" ] && [ ! -f \"$REPO_ROOT/scripts/checks/create-deadline-config.sh.pre-patch.absent\" ]; then if [ -f \"$REPO_ROOT/scripts/checks/create-deadline-config.sh\" ]; then cp -p \"$REPO_ROOT/scripts/checks/create-deadline-config.sh\" \"$REPO_ROOT/scripts/checks/create-deadline-config.sh.pre-patch\"; else mkdir -p \"$(dirname \"$REPO_ROOT/scripts/checks/create-deadline-config.sh\")\" && : > \"$REPO_ROOT/scripts/checks/create-deadline-config.sh.pre-patch.absent\"; fi; fi ; install -m 0755 -D host-scripts/deploy-machine/scripts/checks/create-deadline-config.sh \"$REPO_ROOT/scripts/checks/create-deadline-config.sh\"",
           "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/create-deadline-config.sh\" | cut -c1-64)\" = \"bc9ca37c369b034d5688b5eb53d59e0e57e14d60f684956ec7ae85ad975ffc06\"",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/create-deadline-config.sh\" | cut -c1-64)\" = \"bc9ca37c369b034d5688b5eb53d59e0e57e14d60f684956ec7ae85ad975ffc06\" && rm -f \"$REPO_ROOT/scripts/checks/create-deadline-config.sh\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/create-deadline-config.sh\" | cut -c1-64)\" = \"bc9ca37c369b034d5688b5eb53d59e0e57e14d60f684956ec7ae85ad975ffc06\" && if [ -f \"$REPO_ROOT/scripts/checks/create-deadline-config.sh.pre-patch\" ]; then cp -p \"$REPO_ROOT/scripts/checks/create-deadline-config.sh.pre-patch\" \"$REPO_ROOT/scripts/checks/create-deadline-config.sh\"; else rm -f \"$REPO_ROOT/scripts/checks/create-deadline-config.sh\"; fi  # 先证当前仍是本 patch;原本存在就还原原件,原本不存在才移除",
           "artifact_refs": [
             "host-scripts/deploy-machine/scripts/checks/create-deadline-config.sh"
           ],
@@ -3811,11 +3811,11 @@
       "patch_sha256": "14c5b5c874cd78a225fb6409d9872321c818cb6556f6bfc213d06d93a014ec1f",
       "operations": [
         {
-          "resource": "运维/部署机侧新增文件 scripts/checks/ddb-scan-pagination.py(change=A,mode 0755)",
+          "resource": "运维/部署机侧新增文件 scripts/checks/ddb-scan-pagination.py(change=A,mode 0755)。目标路径**可能已被客户自己建过** ——覆盖前先留 .pre-patch(不存在则记 .absent),回滚据此还原或移除,不一律删",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0755 -D host-scripts/deploy-machine/scripts/checks/ddb-scan-pagination.py \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.py\"",
+          "apply_cli": "if [ ! -f \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.py.pre-patch\" ] && [ ! -f \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.py.pre-patch.absent\" ]; then if [ -f \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.py\" ]; then cp -p \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.py\" \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.py.pre-patch\"; else mkdir -p \"$(dirname \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.py\")\" && : > \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.py.pre-patch.absent\"; fi; fi ; install -m 0755 -D host-scripts/deploy-machine/scripts/checks/ddb-scan-pagination.py \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.py\"",
           "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.py\" | cut -c1-64)\" = \"14c5b5c874cd78a225fb6409d9872321c818cb6556f6bfc213d06d93a014ec1f\"",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.py\" | cut -c1-64)\" = \"14c5b5c874cd78a225fb6409d9872321c818cb6556f6bfc213d06d93a014ec1f\" && rm -f \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.py\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.py\" | cut -c1-64)\" = \"14c5b5c874cd78a225fb6409d9872321c818cb6556f6bfc213d06d93a014ec1f\" && if [ -f \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.py.pre-patch\" ]; then cp -p \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.py.pre-patch\" \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.py\"; else rm -f \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.py\"; fi  # 先证当前仍是本 patch;原本存在就还原原件,原本不存在才移除",
           "artifact_refs": [
             "host-scripts/deploy-machine/scripts/checks/ddb-scan-pagination.py"
           ],
@@ -3838,11 +3838,11 @@
       "patch_sha256": "0da4c4dd766d025a9fbdb74c98c14cadaae64d5922200d1408d19c9e7f85accd",
       "operations": [
         {
-          "resource": "运维/部署机侧新增文件 scripts/checks/ddb-scan-pagination.sh(change=A,mode 0755)",
+          "resource": "运维/部署机侧新增文件 scripts/checks/ddb-scan-pagination.sh(change=A,mode 0755)。目标路径**可能已被客户自己建过** ——覆盖前先留 .pre-patch(不存在则记 .absent),回滚据此还原或移除,不一律删",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0755 -D host-scripts/deploy-machine/scripts/checks/ddb-scan-pagination.sh \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.sh\"",
+          "apply_cli": "if [ ! -f \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.sh.pre-patch\" ] && [ ! -f \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.sh.pre-patch.absent\" ]; then if [ -f \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.sh\" ]; then cp -p \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.sh\" \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.sh.pre-patch\"; else mkdir -p \"$(dirname \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.sh\")\" && : > \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.sh.pre-patch.absent\"; fi; fi ; install -m 0755 -D host-scripts/deploy-machine/scripts/checks/ddb-scan-pagination.sh \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.sh\"",
           "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.sh\" | cut -c1-64)\" = \"0da4c4dd766d025a9fbdb74c98c14cadaae64d5922200d1408d19c9e7f85accd\"",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.sh\" | cut -c1-64)\" = \"0da4c4dd766d025a9fbdb74c98c14cadaae64d5922200d1408d19c9e7f85accd\" && rm -f \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.sh\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.sh\" | cut -c1-64)\" = \"0da4c4dd766d025a9fbdb74c98c14cadaae64d5922200d1408d19c9e7f85accd\" && if [ -f \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.sh.pre-patch\" ]; then cp -p \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.sh.pre-patch\" \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.sh\"; else rm -f \"$REPO_ROOT/scripts/checks/ddb-scan-pagination.sh\"; fi  # 先证当前仍是本 patch;原本存在就还原原件,原本不存在才移除",
           "artifact_refs": [
             "host-scripts/deploy-machine/scripts/checks/ddb-scan-pagination.sh"
           ],
@@ -3864,11 +3864,11 @@
       "patch_sha256": "973ba934a07698531a168115dd977c000410341c767c2a9ce04aa6978f7541a2",
       "operations": [
         {
-          "resource": "运维/部署机侧新增文件 scripts/checks/host-pin-parity.py(change=A,mode 0755)",
+          "resource": "运维/部署机侧新增文件 scripts/checks/host-pin-parity.py(change=A,mode 0755)。目标路径**可能已被客户自己建过** ——覆盖前先留 .pre-patch(不存在则记 .absent),回滚据此还原或移除,不一律删",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0755 -D host-scripts/deploy-machine/scripts/checks/host-pin-parity.py \"$REPO_ROOT/scripts/checks/host-pin-parity.py\"",
+          "apply_cli": "if [ ! -f \"$REPO_ROOT/scripts/checks/host-pin-parity.py.pre-patch\" ] && [ ! -f \"$REPO_ROOT/scripts/checks/host-pin-parity.py.pre-patch.absent\" ]; then if [ -f \"$REPO_ROOT/scripts/checks/host-pin-parity.py\" ]; then cp -p \"$REPO_ROOT/scripts/checks/host-pin-parity.py\" \"$REPO_ROOT/scripts/checks/host-pin-parity.py.pre-patch\"; else mkdir -p \"$(dirname \"$REPO_ROOT/scripts/checks/host-pin-parity.py\")\" && : > \"$REPO_ROOT/scripts/checks/host-pin-parity.py.pre-patch.absent\"; fi; fi ; install -m 0755 -D host-scripts/deploy-machine/scripts/checks/host-pin-parity.py \"$REPO_ROOT/scripts/checks/host-pin-parity.py\"",
           "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/host-pin-parity.py\" | cut -c1-64)\" = \"973ba934a07698531a168115dd977c000410341c767c2a9ce04aa6978f7541a2\"",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/host-pin-parity.py\" | cut -c1-64)\" = \"973ba934a07698531a168115dd977c000410341c767c2a9ce04aa6978f7541a2\" && rm -f \"$REPO_ROOT/scripts/checks/host-pin-parity.py\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/host-pin-parity.py\" | cut -c1-64)\" = \"973ba934a07698531a168115dd977c000410341c767c2a9ce04aa6978f7541a2\" && if [ -f \"$REPO_ROOT/scripts/checks/host-pin-parity.py.pre-patch\" ]; then cp -p \"$REPO_ROOT/scripts/checks/host-pin-parity.py.pre-patch\" \"$REPO_ROOT/scripts/checks/host-pin-parity.py\"; else rm -f \"$REPO_ROOT/scripts/checks/host-pin-parity.py\"; fi  # 先证当前仍是本 patch;原本存在就还原原件,原本不存在才移除",
           "artifact_refs": [
             "host-scripts/deploy-machine/scripts/checks/host-pin-parity.py"
           ],
@@ -3890,11 +3890,11 @@
       "patch_sha256": "c39eeb72472b4893e4e90a3533ea68e159e69e41d4dc83b25cd1eaf6f6e6edd0",
       "operations": [
         {
-          "resource": "运维/部署机侧新增文件 scripts/checks/host-pin-parity.sh(change=A,mode 0755)",
+          "resource": "运维/部署机侧新增文件 scripts/checks/host-pin-parity.sh(change=A,mode 0755)。目标路径**可能已被客户自己建过** ——覆盖前先留 .pre-patch(不存在则记 .absent),回滚据此还原或移除,不一律删",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0755 -D host-scripts/deploy-machine/scripts/checks/host-pin-parity.sh \"$REPO_ROOT/scripts/checks/host-pin-parity.sh\"",
+          "apply_cli": "if [ ! -f \"$REPO_ROOT/scripts/checks/host-pin-parity.sh.pre-patch\" ] && [ ! -f \"$REPO_ROOT/scripts/checks/host-pin-parity.sh.pre-patch.absent\" ]; then if [ -f \"$REPO_ROOT/scripts/checks/host-pin-parity.sh\" ]; then cp -p \"$REPO_ROOT/scripts/checks/host-pin-parity.sh\" \"$REPO_ROOT/scripts/checks/host-pin-parity.sh.pre-patch\"; else mkdir -p \"$(dirname \"$REPO_ROOT/scripts/checks/host-pin-parity.sh\")\" && : > \"$REPO_ROOT/scripts/checks/host-pin-parity.sh.pre-patch.absent\"; fi; fi ; install -m 0755 -D host-scripts/deploy-machine/scripts/checks/host-pin-parity.sh \"$REPO_ROOT/scripts/checks/host-pin-parity.sh\"",
           "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/host-pin-parity.sh\" | cut -c1-64)\" = \"c39eeb72472b4893e4e90a3533ea68e159e69e41d4dc83b25cd1eaf6f6e6edd0\"",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/host-pin-parity.sh\" | cut -c1-64)\" = \"c39eeb72472b4893e4e90a3533ea68e159e69e41d4dc83b25cd1eaf6f6e6edd0\" && rm -f \"$REPO_ROOT/scripts/checks/host-pin-parity.sh\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/host-pin-parity.sh\" | cut -c1-64)\" = \"c39eeb72472b4893e4e90a3533ea68e159e69e41d4dc83b25cd1eaf6f6e6edd0\" && if [ -f \"$REPO_ROOT/scripts/checks/host-pin-parity.sh.pre-patch\" ]; then cp -p \"$REPO_ROOT/scripts/checks/host-pin-parity.sh.pre-patch\" \"$REPO_ROOT/scripts/checks/host-pin-parity.sh\"; else rm -f \"$REPO_ROOT/scripts/checks/host-pin-parity.sh\"; fi  # 先证当前仍是本 patch;原本存在就还原原件,原本不存在才移除",
           "artifact_refs": [
             "host-scripts/deploy-machine/scripts/checks/host-pin-parity.sh"
           ],
@@ -3945,11 +3945,11 @@
       "patch_sha256": "7b5bda0e84b728930ae7a126f2467ab8c4c5149a0a9913b49a7911e20eaf142a",
       "operations": [
         {
-          "resource": "运维/部署机侧新增文件 scripts/checks/s3-at-boot-parity.py(change=A,mode 0644)",
+          "resource": "运维/部署机侧新增文件 scripts/checks/s3-at-boot-parity.py(change=A,mode 0644)。目标路径**可能已被客户自己建过** ——覆盖前先留 .pre-patch(不存在则记 .absent),回滚据此还原或移除,不一律删",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 -D host-scripts/deploy-machine/scripts/checks/s3-at-boot-parity.py \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.py\"",
+          "apply_cli": "if [ ! -f \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.py.pre-patch\" ] && [ ! -f \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.py.pre-patch.absent\" ]; then if [ -f \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.py\" ]; then cp -p \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.py\" \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.py.pre-patch\"; else mkdir -p \"$(dirname \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.py\")\" && : > \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.py.pre-patch.absent\"; fi; fi ; install -m 0644 -D host-scripts/deploy-machine/scripts/checks/s3-at-boot-parity.py \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.py\"",
           "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.py\" | cut -c1-64)\" = \"7b5bda0e84b728930ae7a126f2467ab8c4c5149a0a9913b49a7911e20eaf142a\"",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.py\" | cut -c1-64)\" = \"7b5bda0e84b728930ae7a126f2467ab8c4c5149a0a9913b49a7911e20eaf142a\" && rm -f \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.py\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.py\" | cut -c1-64)\" = \"7b5bda0e84b728930ae7a126f2467ab8c4c5149a0a9913b49a7911e20eaf142a\" && if [ -f \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.py.pre-patch\" ]; then cp -p \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.py.pre-patch\" \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.py\"; else rm -f \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.py\"; fi  # 先证当前仍是本 patch;原本存在就还原原件,原本不存在才移除",
           "artifact_refs": [
             "host-scripts/deploy-machine/scripts/checks/s3-at-boot-parity.py"
           ],
@@ -3971,11 +3971,11 @@
       "patch_sha256": "498bdcc94391178cd04c3ccbe0ea9305e40b218749287f50b53c27552bb98dd3",
       "operations": [
         {
-          "resource": "运维/部署机侧新增文件 scripts/checks/s3-at-boot-parity.sh(change=A,mode 0644)",
+          "resource": "运维/部署机侧新增文件 scripts/checks/s3-at-boot-parity.sh(change=A,mode 0644)。目标路径**可能已被客户自己建过** ——覆盖前先留 .pre-patch(不存在则记 .absent),回滚据此还原或移除,不一律删",
           "class": "AUTO_CLI",
-          "apply_cli": "install -m 0644 -D host-scripts/deploy-machine/scripts/checks/s3-at-boot-parity.sh \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.sh\"",
+          "apply_cli": "if [ ! -f \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.sh.pre-patch\" ] && [ ! -f \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.sh.pre-patch.absent\" ]; then if [ -f \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.sh\" ]; then cp -p \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.sh\" \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.sh.pre-patch\"; else mkdir -p \"$(dirname \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.sh\")\" && : > \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.sh.pre-patch.absent\"; fi; fi ; install -m 0644 -D host-scripts/deploy-machine/scripts/checks/s3-at-boot-parity.sh \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.sh\"",
           "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.sh\" | cut -c1-64)\" = \"498bdcc94391178cd04c3ccbe0ea9305e40b218749287f50b53c27552bb98dd3\"",
-          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.sh\" | cut -c1-64)\" = \"498bdcc94391178cd04c3ccbe0ea9305e40b218749287f50b53c27552bb98dd3\" && rm -f \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.sh\"  # base 上没有这个路径,回滚是移除;先证内容仍是本 patch",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.sh\" | cut -c1-64)\" = \"498bdcc94391178cd04c3ccbe0ea9305e40b218749287f50b53c27552bb98dd3\" && if [ -f \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.sh.pre-patch\" ]; then cp -p \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.sh.pre-patch\" \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.sh\"; else rm -f \"$REPO_ROOT/scripts/checks/s3-at-boot-parity.sh\"; fi  # 先证当前仍是本 patch;原本存在就还原原件,原本不存在才移除",
           "artifact_refs": [
             "host-scripts/deploy-machine/scripts/checks/s3-at-boot-parity.sh"
           ],

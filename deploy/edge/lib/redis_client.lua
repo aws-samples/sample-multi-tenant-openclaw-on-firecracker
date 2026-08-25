@@ -38,6 +38,9 @@ _M.WARM_BUDGET_MS = DEFAULT_CONNECT_MS + DEFAULT_SEND_MS + DEFAULT_READ_MS
 -- Ceiling including a cold DNS resolution (resolver_timeout 3s in nginx.conf). Only
 -- for sizing leases/timeouts that must not expire while a holder is still working.
 _M.COLD_CEILING_MS = 3000 + _M.WARM_BUDGET_MS
+-- #625 — 一次 lookup 最多顺序读取两次 Redis：先读 reader；仅当 clean miss
+-- 与存活 L2 blob 矛盾时，再向 primary 复核一次。锁预算必须覆盖这两次读取。
+_M.MAX_SEQUENTIAL_READS = 2
 -- Keepalive: 60s idle, 100 conns per worker. Matches lua-resty-redis
 -- recommended values for a hot-path lookup service.
 local KEEPALIVE_IDLE_MS = 60 * 1000

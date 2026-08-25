@@ -27,7 +27,6 @@ from aws_cdk import (
     custom_resources as cr,
     Duration,
     Fn,
-    ResolutionTypeHint,
     Token,
 )
 from pathlib import Path
@@ -1535,7 +1534,7 @@ def build_ha_edge(self, ctx):
     _edge_cfg = CFG.get("edge", {}) or {}
     redis_endpoint: str | None = None
     _redis_reader_endpoint_param = None
-    _redis_replica_cluster_ids = []
+    _redis_node_cluster_ids = []
     if _redis_cfg.get("enabled", False):
         # ── ElastiCache Multi-AZ Redis(§8)──
         # cluster mode disabled 单 shard:1 primary + N replica 跨 3 AZ;
@@ -1671,25 +1670,17 @@ def build_ha_edge(self, ctx):
             f"{_redis_rg.attr_primary_end_point_address}:"
             f"{_redis_rg.attr_primary_end_point_port}"
         )
-        if _replicas > 0:
-            # ReplicationLag 只按 CacheClusterId 出数。CFN 返回每个只读副本
-            # endpoint，这里取 DNS 首段得到对应 cluster id，交给 alarms.py
-            # 逐节点建告警；不能用 ReplicationGroupId 维度替代。
-            _redis_read_endpoints = Token.as_list(
-                _redis_rg.get_att(
-                    "ReadEndPoint.AddressesList",
-                    type_hint=ResolutionTypeHint.STRING_LIST,
-                )
-            )
-            _redis_replica_cluster_ids = [
-                Fn.select(
-                    0,
-                    Fn.split(
-                        ".",
-                        Fn.select(_index, _redis_read_endpoints),
-                    ),
-                )
-                for _index in range(_replicas)
+        _edge_read_replica = bool(
+            _redis_cfg.get("edge_read_from_replica", False)
+        )
+        if _edge_read_replica and _replicas > 0:
+            # ReplicationGroup Ref 返回 group id，节点 id 形状为
+            # <group-id>-001..-00N；按 1 + replica 数构造全部节点 id。
+            # 残余风险：缩容再扩容可能分配不连续节点号（如 -004），该节点不会被
+            # 当前静态序号覆盖；该残余风险比现状窄，但并非零。
+            _redis_node_cluster_ids = [
+                f"{_redis_rg.ref}-{_index:03d}"
+                for _index in range(1, 1 + _replicas + 1)
             ]
         # host_asg 环境变量(占位符 replace 已过,只能走 SSM Parameter Store 让
         # init-host 从 SSM 读)。存量 init-host.sh 尚未读它,是 P3 阶段的对接;
@@ -1701,9 +1692,6 @@ def build_ha_edge(self, ctx):
             parameter_name="/openclaw/engine/redis/primary-endpoint",
             string_value=redis_endpoint,
             description="ElastiCache primary endpoint (read by host-agent and edge ASG)",
-        )
-        _edge_read_replica = bool(
-            _redis_cfg.get("edge_read_from_replica", False)
         )
         if _edge_read_replica and _replicas > 0:
             redis_reader_endpoint = (
@@ -2316,5 +2304,5 @@ def build_ha_edge(self, ctx):
     ctx.launch_template = locals().get("launch_template")
     ctx.listener = locals().get("listener")
     ctx.m = locals().get("m")
-    ctx.redis_replica_cluster_ids = _redis_replica_cluster_ids
+    ctx.redis_node_cluster_ids = _redis_node_cluster_ids
     ctx.sg = locals().get("sg")

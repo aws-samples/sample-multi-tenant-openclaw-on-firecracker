@@ -360,17 +360,23 @@ instance-refresh 路径滚。验证只起**一台**新 host,盯三个信号:解�
 
 ## Step 6 — 逐个 fix 的可证伪验证
 
-`manifest.json` 的 `verifications[]` 有 17 条,每条都写了 `action` / `observable` / `pass_when` /
+`manifest.json` 的 `verifications[]` 有 20 条,每条都写了 `action` / `observable` / `pass_when` /
 `fail_when` / `timeout_s` / `cleanup`,按 `phase` 分三批:
 
-- **Phase A-readonly(只读,零副作用,始终先跑,7 条)**:`verify-config-preflight`、
-  `verify-consistency-cli`、`verify-image-provenance`、`verify-observability-boot`、
-  `verify-pagination-scan`、`verify-prior-kit-artifacts`、`verify-release-tooling`。
+- **Phase A-readonly(只读,零副作用,始终先跑,9 条)**:`verify-config-preflight`、
+  `verify-consistency-cli`、`verify-host-manifest-fanout`、`verify-hosts-reporting`、
+  `verify-image-provenance`、`verify-observability-boot`、`verify-pagination-query`、
+  `verify-prior-kit-artifacts`、`verify-release-tooling`。
 - **Phase B-optional(只在客户决定启用该开关时才跑,2 条)**:`verify-backup-lifecycle`、
   `verify-egress-fleet`。
-- **Phase B-lifecycle(走真实产品入口,8 条)**:`verify-copyfile-toctou`、`verify-create-capacity`、
-  `verify-edge-availability`、`verify-lifecycle-converge`、`verify-lifecycle-deadline`、
-  `verify-lifecycle-lease-port`、`verify-rolling-upgrade`、`verify-workspace-identity`。
+- **Phase B-lifecycle(走真实产品入口,9 条)**:`verify-config-reapply`、`verify-copyfile-toctou`、
+  `verify-edge-availability`、`verify-host-taint`、`verify-lifecycle-converge`、
+  `verify-lifecycle-deadline`、`verify-lifecycle-lease-port`、`verify-rolling-upgrade`、
+  `verify-tenant-isolation`。
+
+每条 `fix` 的分组是按 bb 的提交标题逐条核实的,不是按主题猜的 —— 所以 `fixes[].summary` 描述的就是该组
+路径真正改了什么。有三条客户更新说明里提到、但**本 patch 区间内没有对应提交**的条目(创建接口参数校验
+过严、编号冲突消耗 503、有空闲容量却被误判已满):它们不由本 patch 交付,请按现网实际表现单独确认。
 跑 `verify-egress-fleet` 时有几个调用要点,单独说明:`POST /hosts/egress` 是**改机队**的写操作,
 按设计是 **admin-only**(动全机队网络隔离,爆炸半径最大),`operator` 不够。**同时**带 `x-api-key` 与
 **admin 身份的 Bearer JWT** —— 这条方法在模板里是 `ApiKeyRequired=true`,API Gateway 会在 RBAC 之前

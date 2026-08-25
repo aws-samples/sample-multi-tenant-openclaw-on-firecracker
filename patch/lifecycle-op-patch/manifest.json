@@ -116,7 +116,7 @@
         }
       ],
       "fix_ids": [
-        "fix-release-tooling"
+        "fix-image-provenance"
       ]
     },
     "cli/oc-consistency.py": {
@@ -140,7 +140,8 @@
         }
       ],
       "fix_ids": [
-        "fix-consistency-cli"
+        "fix-consistency-cli",
+        "fix-observability-boot"
       ]
     },
     "config.yml.example": {
@@ -166,10 +167,10 @@
       "fix_ids": [
         "fix-backup-lifecycle",
         "fix-config-preflight",
+        "fix-edge-availability",
         "fix-egress-fleet",
         "fix-lifecycle-deadline",
-        "fix-release-tooling",
-        "fix-workspace-identity"
+        "fix-rolling-upgrade"
       ]
     },
     "deploy/console-bff/handler.mjs": {
@@ -386,7 +387,7 @@
         }
       ],
       "fix_ids": [
-        "fix-release-tooling"
+        "fix-edge-availability"
       ]
     },
     "deploy/edge/lib/backend.lua": {
@@ -410,7 +411,7 @@
         }
       ],
       "fix_ids": [
-        "fix-release-tooling"
+        "fix-edge-availability"
       ]
     },
     "deploy/edge/lib/balancer.lua": {
@@ -434,8 +435,7 @@
         }
       ],
       "fix_ids": [
-        "fix-edge-availability",
-        "fix-release-tooling"
+        "fix-edge-availability"
       ]
     },
     "deploy/edge/nginx.conf": {
@@ -459,7 +459,7 @@
         }
       ],
       "fix_ids": [
-        "fix-release-tooling"
+        "fix-edge-availability"
       ]
     },
     "deploy/edge/route.lua": {
@@ -483,7 +483,7 @@
         }
       ],
       "fix_ids": [
-        "fix-release-tooling"
+        "fix-edge-availability"
       ]
     },
     "deploy/edge/test/balancer_failover_adversarial_spec.lua": {
@@ -507,7 +507,7 @@
         }
       ],
       "fix_ids": [
-        "fix-release-tooling"
+        "fix-edge-availability"
       ]
     },
     "deploy/edge/test/balancer_spec.lua": {
@@ -531,8 +531,7 @@
         }
       ],
       "fix_ids": [
-        "fix-edge-availability",
-        "fix-release-tooling"
+        "fix-edge-availability"
       ]
     },
     "deploy/edge/test/route_reader_isolation_spec.lua": {
@@ -556,7 +555,7 @@
         }
       ],
       "fix_ids": [
-        "fix-release-tooling"
+        "fix-edge-availability"
       ]
     },
     "deploy/edge/test/spec_helper.lua": {
@@ -580,8 +579,7 @@
         }
       ],
       "fix_ids": [
-        "fix-edge-availability",
-        "fix-release-tooling"
+        "fix-edge-availability"
       ]
     },
     "deploy/lambda/api/core/capacity.py": {
@@ -605,7 +603,7 @@
         }
       ],
       "fix_ids": [
-        "fix-create-capacity"
+        "fix-lifecycle-converge"
       ]
     },
     "deploy/lambda/api/core/clients.py": {
@@ -630,7 +628,7 @@
       ],
       "fix_ids": [
         "fix-consistency-cli",
-        "fix-create-capacity",
+        "fix-lifecycle-converge",
         "fix-lifecycle-deadline"
       ]
     },
@@ -703,7 +701,7 @@
         }
       ],
       "fix_ids": [
-        "fix-pagination-scan"
+        "fix-lifecycle-converge"
       ]
     },
     "deploy/lambda/api/core/deadline_config.py": {
@@ -751,7 +749,8 @@
         }
       ],
       "fix_ids": [
-        "fix-create-capacity"
+        "fix-host-taint",
+        "fix-lifecycle-converge"
       ]
     },
     "deploy/lambda/api/core/event_shape.py": {
@@ -775,7 +774,7 @@
         }
       ],
       "fix_ids": [
-        "fix-lifecycle-deadline"
+        "fix-lifecycle-converge"
       ]
     },
     "deploy/lambda/api/core/host_taint.py": {
@@ -799,7 +798,7 @@
         }
       ],
       "fix_ids": [
-        "fix-create-capacity"
+        "fix-host-taint"
       ]
     },
     "deploy/lambda/api/core/lifecycle_fence.py": {
@@ -823,8 +822,8 @@
         }
       ],
       "fix_ids": [
-        "fix-lifecycle-converge",
-        "fix-workspace-identity"
+        "fix-host-manifest-fanout",
+        "fix-rolling-upgrade"
       ]
     },
     "deploy/lambda/api/core/scheduling.py": {
@@ -848,8 +847,8 @@
         }
       ],
       "fix_ids": [
-        "fix-create-capacity",
-        "fix-pagination-scan"
+        "fix-host-taint",
+        "fix-lifecycle-converge"
       ]
     },
     "deploy/lambda/api/core/ssm_dispatch.py": {
@@ -873,8 +872,9 @@
         }
       ],
       "fix_ids": [
-        "fix-config-preflight",
-        "fix-lifecycle-converge",
+        "fix-config-reapply",
+        "fix-host-manifest-fanout",
+        "fix-image-provenance",
         "fix-lifecycle-deadline"
       ]
     },
@@ -899,7 +899,7 @@
         }
       ],
       "fix_ids": [
-        "fix-lifecycle-deadline"
+        "fix-lifecycle-converge"
       ]
     },
     "deploy/lambda/api/handler.py": {
@@ -923,13 +923,14 @@
         }
       ],
       "fix_ids": [
+        "fix-config-reapply",
         "fix-edge-availability",
         "fix-egress-fleet",
         "fix-lifecycle-converge",
         "fix-lifecycle-deadline",
-        "fix-pagination-scan",
+        "fix-pagination-query",
         "fix-rolling-upgrade",
-        "fix-workspace-identity"
+        "fix-tenant-isolation"
       ]
     },
     "deploy/lambda/api/routes/skills_groups.py": {
@@ -953,8 +954,8 @@
         }
       ],
       "fix_ids": [
-        "fix-pagination-scan",
-        "fix-rolling-upgrade"
+        "fix-config-reapply",
+        "fix-lifecycle-converge"
       ]
     },
     "deploy/lambda/api/services/console_info.py": {
@@ -978,7 +979,7 @@
         }
       ],
       "fix_ids": [
-        "fix-pagination-scan"
+        "fix-lifecycle-converge"
       ]
     },
     "deploy/lambda/api/services/credential_reconciler.py": {
@@ -1002,7 +1003,7 @@
         }
       ],
       "fix_ids": [
-        "fix-lifecycle-deadline"
+        "fix-lifecycle-converge"
       ]
     },
     "deploy/lambda/api/services/deadline_executor.py": {
@@ -1074,7 +1075,7 @@
         }
       ],
       "fix_ids": [
-        "fix-pagination-scan"
+        "fix-lifecycle-converge"
       ]
     },
     "deploy/lambda/api/services/dispatch_service.py": {
@@ -1098,9 +1099,9 @@
         }
       ],
       "fix_ids": [
-        "fix-create-capacity",
-        "fix-lifecycle-deadline",
-        "fix-pagination-scan"
+        "fix-host-taint",
+        "fix-lifecycle-converge",
+        "fix-lifecycle-deadline"
       ]
     },
     "deploy/lambda/api/services/egress_admin_service.py": {
@@ -1124,8 +1125,7 @@
         }
       ],
       "fix_ids": [
-        "fix-egress-fleet",
-        "fix-workspace-identity"
+        "fix-egress-fleet"
       ]
     },
     "deploy/lambda/api/services/fleet_service.py": {
@@ -1149,9 +1149,9 @@
         }
       ],
       "fix_ids": [
-        "fix-pagination-scan",
-        "fix-rolling-upgrade",
-        "fix-workspace-identity"
+        "fix-lifecycle-converge",
+        "fix-pagination-query",
+        "fix-rolling-upgrade"
       ]
     },
     "deploy/lambda/api/services/host_service.py": {
@@ -1175,12 +1175,14 @@
         }
       ],
       "fix_ids": [
+        "fix-config-reapply",
         "fix-copyfile-toctou",
-        "fix-create-capacity",
+        "fix-hosts-reporting",
+        "fix-image-provenance",
+        "fix-lifecycle-converge",
         "fix-lifecycle-deadline",
-        "fix-pagination-scan",
-        "fix-release-tooling",
-        "fix-rolling-upgrade"
+        "fix-pagination-query",
+        "fix-tenant-isolation"
       ]
     },
     "deploy/lambda/api/services/image_slot_service.py": {
@@ -1204,7 +1206,7 @@
         }
       ],
       "fix_ids": [
-        "fix-release-tooling"
+        "fix-image-provenance"
       ]
     },
     "deploy/lambda/api/services/lifecycle_dispatch.py": {
@@ -1252,7 +1254,7 @@
         }
       ],
       "fix_ids": [
-        "fix-pagination-scan"
+        "fix-lifecycle-converge"
       ]
     },
     "deploy/lambda/api/services/registry_service.py": {
@@ -1276,7 +1278,7 @@
         }
       ],
       "fix_ids": [
-        "fix-lifecycle-converge"
+        "fix-config-reapply"
       ]
     },
     "deploy/lambda/api/services/rolling_upgrade_service.py": {
@@ -1300,7 +1302,7 @@
         }
       ],
       "fix_ids": [
-        "fix-rolling-upgrade"
+        "fix-config-reapply"
       ]
     },
     "deploy/lambda/api/services/tenant_query_service.py": {
@@ -1324,7 +1326,7 @@
         }
       ],
       "fix_ids": [
-        "fix-workspace-identity"
+        "fix-pagination-query"
       ]
     },
     "deploy/lambda/api/services/tenant_service.py": {
@@ -1348,14 +1350,16 @@
         }
       ],
       "fix_ids": [
-        "fix-config-preflight",
-        "fix-create-capacity",
+        "fix-config-reapply",
+        "fix-edge-availability",
+        "fix-host-taint",
+        "fix-image-provenance",
         "fix-lifecycle-converge",
         "fix-lifecycle-deadline",
         "fix-lifecycle-lease-port",
-        "fix-release-tooling",
+        "fix-pagination-query",
         "fix-rolling-upgrade",
-        "fix-workspace-identity"
+        "fix-tenant-isolation"
       ]
     },
     "deploy/lambda/api/test_lifecycle_stop_contract.py": {
@@ -1405,7 +1409,7 @@
       "fix_ids": [
         "fix-consistency-cli",
         "fix-lifecycle-deadline",
-        "fix-workspace-identity"
+        "fix-rolling-upgrade"
       ]
     },
     "deploy/lambda/health_check/ddb_scan.py": {
@@ -1429,7 +1433,7 @@
         }
       ],
       "fix_ids": [
-        "fix-pagination-scan"
+        "fix-lifecycle-converge"
       ]
     },
     "deploy/lambda/health_check/handler.py": {
@@ -1453,14 +1457,14 @@
         }
       ],
       "fix_ids": [
+        "fix-config-reapply",
         "fix-consistency-cli",
         "fix-edge-availability",
+        "fix-image-provenance",
         "fix-lifecycle-converge",
         "fix-lifecycle-deadline",
-        "fix-pagination-scan",
-        "fix-release-tooling",
-        "fix-rolling-upgrade",
-        "fix-workspace-identity"
+        "fix-pagination-query",
+        "fix-rolling-upgrade"
       ]
     },
     "deploy/lambda/scaler/ddb_scan.py": {
@@ -1484,7 +1488,7 @@
         }
       ],
       "fix_ids": [
-        "fix-pagination-scan"
+        "fix-lifecycle-converge"
       ]
     },
     "deploy/lambda/scaler/handler.py": {
@@ -1509,9 +1513,8 @@
       ],
       "fix_ids": [
         "fix-consistency-cli",
-        "fix-create-capacity",
-        "fix-pagination-scan",
-        "fix-rolling-upgrade"
+        "fix-lifecycle-converge",
+        "fix-pagination-query"
       ]
     },
     "deploy/lib/dispatch_infra.py": {
@@ -1538,8 +1541,7 @@
         }
       ],
       "fix_ids": [
-        "fix-lifecycle-deadline",
-        "fix-pagination-scan"
+        "fix-lifecycle-converge"
       ]
     },
     "deploy/packer/CUSTOMER-GUIDE.md": {
@@ -1566,8 +1568,7 @@
         }
       ],
       "fix_ids": [
-        "fix-config-preflight",
-        "fix-observability-boot"
+        "fix-image-provenance"
       ]
     },
     "deploy/packer/README.md": {
@@ -1594,8 +1595,7 @@
         }
       ],
       "fix_ids": [
-        "fix-config-preflight",
-        "fix-observability-boot"
+        "fix-image-provenance"
       ]
     },
     "deploy/packer/apse1.pkrvars.hcl": {
@@ -1619,8 +1619,7 @@
         }
       ],
       "fix_ids": [
-        "fix-config-preflight",
-        "fix-observability-boot"
+        "fix-image-provenance"
       ]
     },
     "deploy/packer/assert-image.sh": {
@@ -1644,7 +1643,7 @@
         }
       ],
       "fix_ids": [
-        "fix-config-preflight"
+        "fix-image-provenance"
       ]
     },
     "deploy/packer/assert-parity.sh": {
@@ -1668,7 +1667,7 @@
         }
       ],
       "fix_ids": [
-        "fix-config-preflight"
+        "fix-image-provenance"
       ]
     },
     "deploy/packer/build-golden-ami.sh": {
@@ -1692,7 +1691,7 @@
         }
       ],
       "fix_ids": [
-        "fix-config-preflight"
+        "fix-image-provenance"
       ]
     },
     "deploy/packer/customize.sh.default": {
@@ -1719,7 +1718,7 @@
         }
       ],
       "fix_ids": [
-        "fix-config-preflight"
+        "fix-image-provenance"
       ]
     },
     "deploy/packer/hooks/50-example.sh.example": {
@@ -1743,7 +1742,7 @@
         }
       ],
       "fix_ids": [
-        "fix-config-preflight"
+        "fix-image-provenance"
       ],
       "old_path": "deploy/packer/customize.sh.example",
       "new_path": "deploy/packer/hooks/50-example.sh.example"
@@ -1772,7 +1771,7 @@
         }
       ],
       "fix_ids": [
-        "fix-config-preflight"
+        "fix-image-provenance"
       ]
     },
     "deploy/packer/host-golden.pkr.hcl": {
@@ -1796,8 +1795,7 @@
         }
       ],
       "fix_ids": [
-        "fix-config-preflight",
-        "fix-observability-boot"
+        "fix-image-provenance"
       ]
     },
     "deploy/packer/run-hooks.sh": {
@@ -1821,7 +1819,7 @@
         }
       ],
       "fix_ids": [
-        "fix-config-preflight"
+        "fix-image-provenance"
       ]
     },
     "deploy/stacks/alarms.py": {
@@ -1881,8 +1879,8 @@
         }
       ],
       "fix_ids": [
-        "fix-release-tooling",
-        "fix-workspace-identity"
+        "fix-edge-availability",
+        "fix-rolling-upgrade"
       ]
     },
     "deploy/stacks/auth.py": {
@@ -1964,7 +1962,7 @@
       ],
       "fix_ids": [
         "fix-egress-fleet",
-        "fix-observability-boot"
+        "fix-image-provenance"
       ]
     },
     "deploy/stacks/ha_edge.py": {
@@ -2135,10 +2133,10 @@
         }
       ],
       "fix_ids": [
+        "fix-edge-availability",
         "fix-egress-fleet",
         "fix-observability-boot",
-        "fix-release-tooling",
-        "fix-workspace-identity"
+        "fix-rolling-upgrade"
       ]
     },
     "deploy/stacks/host_image.py": {
@@ -2180,8 +2178,7 @@
         }
       ],
       "fix_ids": [
-        "fix-image-provenance",
-        "fix-observability-boot"
+        "fix-image-provenance"
       ]
     },
     "deploy/stacks/lambdas.py": {
@@ -2356,12 +2353,12 @@
       ],
       "fix_ids": [
         "fix-config-preflight",
+        "fix-config-reapply",
         "fix-edge-availability",
         "fix-egress-fleet",
         "fix-lifecycle-converge",
         "fix-lifecycle-deadline",
-        "fix-pagination-scan",
-        "fix-workspace-identity"
+        "fix-rolling-upgrade"
       ]
     },
     "deploy/stacks/obs_assets.py": {
@@ -2595,7 +2592,7 @@
         }
       ],
       "fix_ids": [
-        "fix-workspace-identity"
+        "fix-rolling-upgrade"
       ]
     },
     "deploy/userdata/delete-all-vms.sh": {
@@ -2619,7 +2616,7 @@
         }
       ],
       "fix_ids": [
-        "fix-lifecycle-converge"
+        "fix-host-manifest-fanout"
       ]
     },
     "deploy/userdata/host-agent.py": {
@@ -2643,11 +2640,12 @@
         }
       ],
       "fix_ids": [
-        "fix-create-capacity",
+        "fix-config-reapply",
         "fix-edge-availability",
         "fix-egress-fleet",
-        "fix-rolling-upgrade",
-        "fix-workspace-identity"
+        "fix-lifecycle-converge",
+        "fix-lifecycle-lease-port",
+        "fix-rolling-upgrade"
       ]
     },
     "deploy/userdata/init-host.sh": {
@@ -2674,12 +2672,12 @@
         }
       ],
       "fix_ids": [
-        "fix-config-preflight",
+        "fix-config-reapply",
         "fix-egress-fleet",
-        "fix-lifecycle-converge",
+        "fix-host-manifest-fanout",
+        "fix-image-provenance",
         "fix-lifecycle-deadline",
-        "fix-rolling-upgrade",
-        "fix-workspace-identity"
+        "fix-rolling-upgrade"
       ]
     },
     "deploy/userdata/launch-vm.sh": {
@@ -2703,9 +2701,10 @@
         }
       ],
       "fix_ids": [
+        "fix-config-reapply",
         "fix-egress-fleet",
-        "fix-lifecycle-converge",
-        "fix-workspace-identity"
+        "fix-rolling-upgrade",
+        "fix-tenant-isolation"
       ]
     },
     "deploy/userdata/lib/harden-config.sh": {
@@ -2729,8 +2728,8 @@
         }
       ],
       "fix_ids": [
-        "fix-edge-availability",
-        "fix-lifecycle-converge"
+        "fix-config-reapply",
+        "fix-edge-availability"
       ]
     },
     "deploy/userdata/lib/lifecycle-guard.sh": {
@@ -2754,7 +2753,7 @@
         }
       ],
       "fix_ids": [
-        "fix-lifecycle-converge"
+        "fix-host-manifest-fanout"
       ]
     },
     "deploy/userdata/migrate-vm.sh": {
@@ -2779,7 +2778,8 @@
       ],
       "fix_ids": [
         "fix-egress-fleet",
-        "fix-workspace-identity"
+        "fix-rolling-upgrade",
+        "fix-tenant-isolation"
       ]
     },
     "deploy/userdata/oc-egress-chain.sh": {
@@ -2803,8 +2803,7 @@
         }
       ],
       "fix_ids": [
-        "fix-egress-fleet",
-        "fix-workspace-identity"
+        "fix-egress-fleet"
       ]
     },
     "deploy/userdata/oc-egress-sim.py": {
@@ -2828,8 +2827,7 @@
         }
       ],
       "fix_ids": [
-        "fix-egress-fleet",
-        "fix-workspace-identity"
+        "fix-egress-fleet"
       ]
     },
     "deploy/userdata/provision-host.sh": {
@@ -2853,8 +2851,7 @@
         }
       ],
       "fix_ids": [
-        "fix-config-preflight",
-        "fix-observability-boot"
+        "fix-image-provenance"
       ]
     },
     "deploy/userdata/rebuild-vm.sh": {
@@ -2878,7 +2875,7 @@
         }
       ],
       "fix_ids": [
-        "fix-config-preflight"
+        "fix-image-provenance"
       ]
     },
     "deploy/userdata/required-scripts.list": {
@@ -2902,8 +2899,8 @@
         }
       ],
       "fix_ids": [
-        "fix-lifecycle-converge",
-        "fix-rolling-upgrade"
+        "fix-config-reapply",
+        "fix-lifecycle-converge"
       ]
     },
     "deploy/userdata/route_ops.py": {
@@ -2951,7 +2948,7 @@
         }
       ],
       "fix_ids": [
-        "fix-image-provenance"
+        "fix-release-tooling"
       ]
     },
     "deploy/userdata/spire-kit/spire-join-broker.py": {
@@ -2975,7 +2972,7 @@
         }
       ],
       "fix_ids": [
-        "fix-image-provenance"
+        "fix-release-tooling"
       ]
     },
     "deploy/userdata/stop-vm.sh": {
@@ -2999,9 +2996,9 @@
         }
       ],
       "fix_ids": [
+        "fix-image-provenance",
         "fix-lifecycle-converge",
-        "fix-release-tooling",
-        "fix-workspace-identity"
+        "fix-rolling-upgrade"
       ]
     },
     "deploy/userdata/sync-shared-skills.py": {
@@ -3025,7 +3022,7 @@
         }
       ],
       "fix_ids": [
-        "fix-rolling-upgrade"
+        "fix-config-reapply"
       ]
     },
     "docs/README-CN.md": {
@@ -3105,7 +3102,7 @@
         }
       ],
       "fix_ids": [
-        "fix-observability-boot"
+        "fix-image-provenance"
       ]
     },
     "docs/aws-guide-en/09-api-integration.md": {
@@ -3132,9 +3129,8 @@
         }
       ],
       "fix_ids": [
-        "fix-create-capacity",
-        "fix-image-provenance",
-        "fix-rolling-upgrade"
+        "fix-config-reapply",
+        "fix-host-taint"
       ]
     },
     "docs/aws-guide-en/11-ops-maintenance.md": {
@@ -3161,7 +3157,7 @@
         }
       ],
       "fix_ids": [
-        "fix-release-tooling"
+        "fix-edge-availability"
       ]
     },
     "docs/aws-guide-en/13-data-plane-redesign.md": {
@@ -3188,7 +3184,7 @@
         }
       ],
       "fix_ids": [
-        "fix-release-tooling"
+        "fix-edge-availability"
       ]
     },
     "docs/aws-guide/05-deploy-use-troubleshoot.md": {
@@ -3215,7 +3211,7 @@
         }
       ],
       "fix_ids": [
-        "fix-observability-boot"
+        "fix-image-provenance"
       ]
     },
     "docs/aws-guide/09-api-integration.md": {
@@ -3242,9 +3238,8 @@
         }
       ],
       "fix_ids": [
-        "fix-create-capacity",
-        "fix-image-provenance",
-        "fix-rolling-upgrade"
+        "fix-config-reapply",
+        "fix-host-taint"
       ]
     },
     "docs/aws-guide/11-ops-maintenance.md": {
@@ -3271,7 +3266,7 @@
         }
       ],
       "fix_ids": [
-        "fix-release-tooling"
+        "fix-edge-availability"
       ]
     },
     "docs/aws-guide/19-config-parameter-baseline.md": {
@@ -3300,7 +3295,8 @@
       "fix_ids": [
         "fix-config-preflight",
         "fix-consistency-cli",
-        "fix-rolling-upgrade"
+        "fix-observability-boot",
+        "fix-pagination-query"
       ]
     },
     "docs/aws-guide/openapi.yaml": {
@@ -3327,8 +3323,8 @@
         }
       ],
       "fix_ids": [
-        "fix-release-tooling",
-        "fix-rolling-upgrade"
+        "fix-config-reapply",
+        "fix-image-provenance"
       ]
     },
     "openclaw-assets-test/add_timestamp.lua": {
@@ -3355,7 +3351,7 @@
         }
       ],
       "fix_ids": [
-        "fix-rolling-upgrade"
+        "fix-pagination-query"
       ]
     },
     "openclaw-assets-test/extract_trace_root.lua": {
@@ -3382,7 +3378,7 @@
         }
       ],
       "fix_ids": [
-        "fix-rolling-upgrade"
+        "fix-pagination-query"
       ]
     },
     "openclaw-assets-test/fluent-bit.conf": {
@@ -3409,7 +3405,7 @@
         }
       ],
       "fix_ids": [
-        "fix-rolling-upgrade"
+        "fix-pagination-query"
       ]
     },
     "openclaw-assets-test/lua/extract_trace_root.lua": {
@@ -3436,7 +3432,7 @@
         }
       ],
       "fix_ids": [
-        "fix-rolling-upgrade"
+        "fix-pagination-query"
       ]
     },
     "openclaw-assets-test/lua/helper.lua": {
@@ -3463,7 +3459,7 @@
         }
       ],
       "fix_ids": [
-        "fix-rolling-upgrade"
+        "fix-pagination-query"
       ]
     },
     "openclaw-assets-test/outputs.conf": {
@@ -3490,7 +3486,7 @@
         }
       ],
       "fix_ids": [
-        "fix-rolling-upgrade"
+        "fix-pagination-query"
       ]
     },
     "openclaw-assets-test/parsers.conf": {
@@ -3517,7 +3513,7 @@
         }
       ],
       "fix_ids": [
-        "fix-rolling-upgrade"
+        "fix-pagination-query"
       ]
     },
     "patch/manifest-2026-08-24-161851-8628cac9.json": {
@@ -4465,7 +4461,7 @@
         }
       ],
       "fix_ids": [
-        "fix-rolling-upgrade"
+        "fix-config-reapply"
       ]
     },
     "scripts/checks/config-gate.sh": {
@@ -4561,8 +4557,8 @@
         }
       ],
       "fix_ids": [
-        "fix-pagination-scan",
-        "fix-rolling-upgrade"
+        "fix-lifecycle-converge",
+        "fix-pagination-query"
       ]
     },
     "scripts/checks/ddb-scan-pagination.sh": {
@@ -4586,7 +4582,7 @@
         }
       ],
       "fix_ids": [
-        "fix-pagination-scan"
+        "fix-lifecycle-converge"
       ]
     },
     "scripts/checks/host-pin-parity.py": {
@@ -4610,7 +4606,7 @@
         }
       ],
       "fix_ids": [
-        "fix-config-preflight"
+        "fix-image-provenance"
       ]
     },
     "scripts/checks/host-pin-parity.sh": {
@@ -4634,7 +4630,7 @@
         }
       ],
       "fix_ids": [
-        "fix-config-preflight"
+        "fix-image-provenance"
       ]
     },
     "scripts/checks/oc-version-compat-sim.sh": {
@@ -4658,7 +4654,7 @@
         }
       ],
       "fix_ids": [
-        "fix-lifecycle-converge"
+        "fix-config-reapply"
       ]
     },
     "scripts/checks/run-all.sh": {
@@ -4683,9 +4679,10 @@
       ],
       "fix_ids": [
         "fix-config-preflight",
+        "fix-image-provenance",
+        "fix-lifecycle-converge",
         "fix-lifecycle-deadline",
-        "fix-observability-boot",
-        "fix-pagination-scan"
+        "fix-observability-boot"
       ]
     },
     "scripts/checks/s3-at-boot-parity.py": {
@@ -4757,7 +4754,7 @@
         }
       ],
       "fix_ids": [
-        "fix-release-tooling"
+        "fix-image-provenance"
       ]
     },
     "scripts/preflight-check.sh": {
@@ -4805,7 +4802,7 @@
         }
       ],
       "fix_ids": [
-        "fix-rolling-upgrade"
+        "fix-pagination-query"
       ]
     },
     "setup.sh": {
@@ -4829,10 +4826,12 @@
         }
       ],
       "fix_ids": [
+        "fix-config-reapply",
         "fix-egress-fleet",
+        "fix-host-manifest-fanout",
+        "fix-image-provenance",
         "fix-lifecycle-converge",
-        "fix-observability-boot",
-        "fix-rolling-upgrade"
+        "fix-observability-boot"
       ]
     }
   },
@@ -4882,6 +4881,129 @@
       ]
     },
     {
+      "id": "fix-host-taint",
+      "summary": "host 污点:POST /hosts/{instance_id}/taint 把机器标记为不再接收新租户(已有租户、实例运行状态与存量数据都不受影响),DELETE 同路径取消标记;读侧四条放置路径都排除已标记的机器,四处用 CAS 原子门保证并发下不漏判,重复调用返回 already_tainted / already_untainted",
+      "paths": [
+        "deploy/lambda/api/core/dispatch/binpack.py",
+        "deploy/lambda/api/core/host_taint.py",
+        "deploy/lambda/api/core/scheduling.py",
+        "deploy/lambda/api/services/dispatch_service.py",
+        "deploy/lambda/api/services/tenant_service.py",
+        "docs/aws-guide-en/09-api-integration.md",
+        "docs/aws-guide/09-api-integration.md"
+      ],
+      "applies_when": "任何环境都生效,无开关",
+      "params_changed": [],
+      "verification_ids": [
+        "verify-host-taint"
+      ]
+    },
+    {
+      "id": "fix-config-reapply",
+      "summary": "rebuild 可选重新下发已注册的 openclaw.json 配置模板:新增 config_template / config_template_version / force_reapply 三个可选字段,任一出现即触发重下发,平台先做版本感知兼容预检,受理响应带 reapply_requested: true;GET /system/info 暴露 capabilities.config_reapply 作为「本环境是否支持该能力」的准确判据(旧版本部署不含该字段)",
+      "paths": [
+        "deploy/lambda/api/core/ssm_dispatch.py",
+        "deploy/lambda/api/handler.py",
+        "deploy/lambda/api/routes/skills_groups.py",
+        "deploy/lambda/api/services/host_service.py",
+        "deploy/lambda/api/services/registry_service.py",
+        "deploy/lambda/api/services/rolling_upgrade_service.py",
+        "deploy/lambda/api/services/tenant_service.py",
+        "deploy/lambda/health_check/handler.py",
+        "deploy/stacks/lambdas.py",
+        "deploy/userdata/host-agent.py",
+        "deploy/userdata/init-host.sh",
+        "deploy/userdata/launch-vm.sh",
+        "deploy/userdata/lib/harden-config.sh",
+        "deploy/userdata/required-scripts.list",
+        "deploy/userdata/sync-shared-skills.py",
+        "docs/aws-guide-en/09-api-integration.md",
+        "docs/aws-guide/09-api-integration.md",
+        "docs/aws-guide/openapi.yaml",
+        "scripts/build-rootfs-on-ec2.sh",
+        "scripts/checks/oc-version-compat-sim.sh",
+        "setup.sh"
+      ],
+      "applies_when": "任何环境都生效,无开关;但请先用 GET /system/info 确认 capabilities.config_reapply 为 true",
+      "params_changed": [],
+      "verification_ids": [
+        "verify-config-reapply"
+      ]
+    },
+    {
+      "id": "fix-tenant-isolation",
+      "summary": "租户视角安全审计收敛的隔离缺口:配置了 skill 作用域的受限租户,在 restart / 先 stop 再 start / reset / rebuild 四条唤醒路径上会拿到所在 host 上的全部共享 skill(create 与 restore 本来就是对的),已按作用域收窄;控制面之外删除的租户不会被未完成操作重新创建;DELETE /hosts/{instance_id} 对不存在的 host 不再返 200 并凭空建出 host 行",
+      "paths": [
+        "deploy/lambda/api/handler.py",
+        "deploy/lambda/api/services/host_service.py",
+        "deploy/lambda/api/services/tenant_service.py",
+        "deploy/userdata/launch-vm.sh",
+        "deploy/userdata/migrate-vm.sh"
+      ],
+      "applies_when": "随更新生效,无开关。**但越权拿到的 skill 是复制到租户数据盘上的,不会随修复自动回收** —— 历史上被唤醒过的受限租户,盘上已有的多余 skill 需要单独清理",
+      "params_changed": [],
+      "verification_ids": [
+        "verify-tenant-isolation"
+      ]
+    },
+    {
+      "id": "fix-pagination-query",
+      "summary": "列表查询的翻页收紧:GET /tenants?limit=N 只在确实存在下一页时返回 next_token,GSI 查询路径补页扫描不再返回空页却发有效 token,软删租户从镜像版本索引里剔除 —— 修掉按镜像版本查询返回空结果、与统计数字对不上的问题",
+      "paths": [
+        "deploy/lambda/api/handler.py",
+        "deploy/lambda/api/services/fleet_service.py",
+        "deploy/lambda/api/services/host_service.py",
+        "deploy/lambda/api/services/tenant_query_service.py",
+        "deploy/lambda/api/services/tenant_service.py",
+        "deploy/lambda/health_check/handler.py",
+        "deploy/lambda/scaler/handler.py",
+        "docs/aws-guide/19-config-parameter-baseline.md",
+        "openclaw-assets-test/add_timestamp.lua",
+        "openclaw-assets-test/extract_trace_root.lua",
+        "openclaw-assets-test/fluent-bit.conf",
+        "openclaw-assets-test/lua/extract_trace_root.lua",
+        "openclaw-assets-test/lua/helper.lua",
+        "openclaw-assets-test/outputs.conf",
+        "openclaw-assets-test/parsers.conf",
+        "scripts/checks/ddb-scan-pagination.py",
+        "scripts/tenant-rootfs-query-backfill.py"
+      ],
+      "applies_when": "任何环境都生效,无开关",
+      "params_changed": [],
+      "verification_ids": [
+        "verify-pagination-query"
+      ]
+    },
+    {
+      "id": "fix-hosts-reporting",
+      "summary": "GET /hosts 报告的超卖比改为【这台机器自身机型】的生效值,不再报告全局值",
+      "paths": [
+        "deploy/lambda/api/services/host_service.py"
+      ],
+      "applies_when": "任何环境都生效,无开关",
+      "params_changed": [],
+      "verification_ids": [
+        "verify-hosts-reporting"
+      ]
+    },
+    {
+      "id": "fix-host-manifest-fanout",
+      "summary": "host 侧的 manifest 契约与批量能力:每台 host 按 manifest 校验自己该有哪些脚本,lib/ 围栏可独立自愈并在装载后复验新鲜度哨兵(S3 也过期时 fail-loud 而不是静默用旧的);同时新增一次清空单台机器上全部 microVM 的批量能力(由平台运维侧执行,不对外暴露 API)",
+      "paths": [
+        "deploy/lambda/api/core/lifecycle_fence.py",
+        "deploy/lambda/api/core/ssm_dispatch.py",
+        "deploy/userdata/delete-all-vms.sh",
+        "deploy/userdata/init-host.sh",
+        "deploy/userdata/lib/lifecycle-guard.sh",
+        "setup.sh"
+      ],
+      "applies_when": "任何环境都生效,无开关;批量清空是运维侧动作,不是客户 API",
+      "params_changed": [],
+      "verification_ids": [
+        "verify-host-manifest-fanout"
+      ]
+    },
+    {
       "id": "fix-lifecycle-deadline",
       "summary": "生命周期死线:八个动作(create/suspend/restore/restart/start/rebuild 180s,backup/delete 600s)都有明确上限,超时写终态与取值封闭的 <action>_fail_reason;运行时载体是 SSM Parameter Store,60 秒缓存,改完即生效不必重新部署",
       "paths": [
@@ -4889,11 +5011,8 @@
         "deploy/lambda/api/core/clients.py",
         "deploy/lambda/api/core/create_deadline.py",
         "deploy/lambda/api/core/deadline_config.py",
-        "deploy/lambda/api/core/event_shape.py",
         "deploy/lambda/api/core/ssm_dispatch.py",
-        "deploy/lambda/api/core/vkey.py",
         "deploy/lambda/api/handler.py",
-        "deploy/lambda/api/services/credential_reconciler.py",
         "deploy/lambda/api/services/deadline_executor.py",
         "deploy/lambda/api/services/dispatch_service.py",
         "deploy/lambda/api/services/host_service.py",
@@ -4901,7 +5020,6 @@
         "deploy/lambda/api/services/tenant_service.py",
         "deploy/lambda/backup/handler.py",
         "deploy/lambda/health_check/handler.py",
-        "deploy/lib/dispatch_infra.py",
         "deploy/stacks/lambdas.py",
         "deploy/userdata/init-host.sh",
         "samples/config-sg-prod.yaml",
@@ -4927,22 +5045,36 @@
       "id": "fix-lifecycle-converge",
       "summary": "同租户连续下发不再互相阻塞(此前后续操作可能被前一个挡住约 16 分钟);跳过锁的 start 不再把自己的租户排在队尾;delete 应答后继续删完;长期异常的租户会被明确标记为需人工介入而不是一直悬挂",
       "paths": [
-        "deploy/lambda/api/core/lifecycle_fence.py",
-        "deploy/lambda/api/core/ssm_dispatch.py",
+        "deploy/lambda/api/core/capacity.py",
+        "deploy/lambda/api/core/clients.py",
+        "deploy/lambda/api/core/ddb_scan.py",
+        "deploy/lambda/api/core/dispatch/binpack.py",
+        "deploy/lambda/api/core/event_shape.py",
+        "deploy/lambda/api/core/scheduling.py",
+        "deploy/lambda/api/core/vkey.py",
         "deploy/lambda/api/handler.py",
+        "deploy/lambda/api/routes/skills_groups.py",
+        "deploy/lambda/api/services/console_info.py",
+        "deploy/lambda/api/services/credential_reconciler.py",
         "deploy/lambda/api/services/delete_reconciler.py",
-        "deploy/lambda/api/services/registry_service.py",
+        "deploy/lambda/api/services/dispatch_poller.py",
+        "deploy/lambda/api/services/dispatch_service.py",
+        "deploy/lambda/api/services/fleet_service.py",
+        "deploy/lambda/api/services/host_service.py",
+        "deploy/lambda/api/services/poller_heartbeat.py",
         "deploy/lambda/api/services/tenant_service.py",
+        "deploy/lambda/health_check/ddb_scan.py",
         "deploy/lambda/health_check/handler.py",
+        "deploy/lambda/scaler/ddb_scan.py",
+        "deploy/lambda/scaler/handler.py",
+        "deploy/lib/dispatch_infra.py",
         "deploy/stacks/lambdas.py",
-        "deploy/userdata/delete-all-vms.sh",
-        "deploy/userdata/init-host.sh",
-        "deploy/userdata/launch-vm.sh",
-        "deploy/userdata/lib/harden-config.sh",
-        "deploy/userdata/lib/lifecycle-guard.sh",
+        "deploy/userdata/host-agent.py",
         "deploy/userdata/required-scripts.list",
         "deploy/userdata/stop-vm.sh",
-        "scripts/checks/oc-version-compat-sim.sh",
+        "scripts/checks/ddb-scan-pagination.py",
+        "scripts/checks/ddb-scan-pagination.sh",
+        "scripts/checks/run-all.sh",
         "setup.sh"
       ],
       "applies_when": "任何环境都生效,无开关",
@@ -4956,35 +5088,13 @@
       "summary": "租户 stop 后端口不再分配给其他租户,避免请求被投递到别人的 VM;租约与端口的归属在停机期间保持",
       "paths": [
         "deploy/lambda/api/services/tenant_service.py",
-        "deploy/lambda/api/test_lifecycle_stop_contract.py"
+        "deploy/lambda/api/test_lifecycle_stop_contract.py",
+        "deploy/userdata/host-agent.py"
       ],
       "applies_when": "任何环境都生效,无开关",
       "params_changed": [],
       "verification_ids": [
         "verify-lifecycle-lease-port"
-      ]
-    },
-    {
-      "id": "fix-create-capacity",
-      "summary": "创建接口的参数校验不再过严导致全量失败;有空闲容量的机器不再被误判为已满;编号冲突不再每次都消耗一次 503",
-      "paths": [
-        "deploy/lambda/api/core/capacity.py",
-        "deploy/lambda/api/core/clients.py",
-        "deploy/lambda/api/core/dispatch/binpack.py",
-        "deploy/lambda/api/core/host_taint.py",
-        "deploy/lambda/api/core/scheduling.py",
-        "deploy/lambda/api/services/dispatch_service.py",
-        "deploy/lambda/api/services/host_service.py",
-        "deploy/lambda/api/services/tenant_service.py",
-        "deploy/lambda/scaler/handler.py",
-        "deploy/userdata/host-agent.py",
-        "docs/aws-guide-en/09-api-integration.md",
-        "docs/aws-guide/09-api-integration.md"
-      ],
-      "applies_when": "任何环境都生效,无开关",
-      "params_changed": [],
-      "verification_ids": [
-        "verify-create-capacity"
       ]
     },
     {
@@ -5027,33 +5137,22 @@
       "id": "fix-rolling-upgrade",
       "summary": "新增分批滚动升级作业(POST /hosts/rolling-upgrade + GET /hosts/rolling-jobs/{job_id}):用于向全部租户铺新的 workspace 身份文件或 microVM 镜像;同一时刻只允许一个作业,中断可续跑不重复处理,client_token 作幂等键,rebuild 需管理员权限",
       "paths": [
+        "config.yml.example",
+        "deploy/lambda/api/core/lifecycle_fence.py",
         "deploy/lambda/api/handler.py",
-        "deploy/lambda/api/routes/skills_groups.py",
         "deploy/lambda/api/services/fleet_service.py",
-        "deploy/lambda/api/services/host_service.py",
-        "deploy/lambda/api/services/rolling_upgrade_service.py",
         "deploy/lambda/api/services/tenant_service.py",
+        "deploy/lambda/backup/handler.py",
         "deploy/lambda/health_check/handler.py",
-        "deploy/lambda/scaler/handler.py",
+        "deploy/stacks/alarms.py",
+        "deploy/stacks/ha_edge.py",
+        "deploy/stacks/lambdas.py",
+        "deploy/userdata/backup-data.sh",
         "deploy/userdata/host-agent.py",
         "deploy/userdata/init-host.sh",
-        "deploy/userdata/required-scripts.list",
-        "deploy/userdata/sync-shared-skills.py",
-        "docs/aws-guide-en/09-api-integration.md",
-        "docs/aws-guide/09-api-integration.md",
-        "docs/aws-guide/19-config-parameter-baseline.md",
-        "docs/aws-guide/openapi.yaml",
-        "openclaw-assets-test/add_timestamp.lua",
-        "openclaw-assets-test/extract_trace_root.lua",
-        "openclaw-assets-test/fluent-bit.conf",
-        "openclaw-assets-test/lua/extract_trace_root.lua",
-        "openclaw-assets-test/lua/helper.lua",
-        "openclaw-assets-test/outputs.conf",
-        "openclaw-assets-test/parsers.conf",
-        "scripts/build-rootfs-on-ec2.sh",
-        "scripts/checks/ddb-scan-pagination.py",
-        "scripts/tenant-rootfs-query-backfill.py",
-        "setup.sh"
+        "deploy/userdata/launch-vm.sh",
+        "deploy/userdata/migrate-vm.sh",
+        "deploy/userdata/stop-vm.sh"
       ],
       "applies_when": "任何环境都生效。铺身份文件用 action=restart 即可,不需要 rebuild",
       "params_changed": [
@@ -5070,96 +5169,17 @@
       ]
     },
     {
-      "id": "fix-workspace-identity",
-      "summary": "workspace 的 7 个身份文件与平台运维类 skill 烤进只读镜像盘并以只读方式挂载,microVM 内即使 root 写入也会拿到 EROFS;同时修掉受限租户在 restart / 先 stop 再 start / reset / rebuild 四条唤醒路径上会拿到 host 上全部共享 skill 的越权(create 与 restore 本来就是对的)",
-      "paths": [
-        "config.yml.example",
-        "deploy/lambda/api/core/lifecycle_fence.py",
-        "deploy/lambda/api/handler.py",
-        "deploy/lambda/api/services/egress_admin_service.py",
-        "deploy/lambda/api/services/fleet_service.py",
-        "deploy/lambda/api/services/tenant_query_service.py",
-        "deploy/lambda/api/services/tenant_service.py",
-        "deploy/lambda/backup/handler.py",
-        "deploy/lambda/health_check/handler.py",
-        "deploy/stacks/alarms.py",
-        "deploy/stacks/ha_edge.py",
-        "deploy/stacks/lambdas.py",
-        "deploy/userdata/backup-data.sh",
-        "deploy/userdata/host-agent.py",
-        "deploy/userdata/init-host.sh",
-        "deploy/userdata/launch-vm.sh",
-        "deploy/userdata/migrate-vm.sh",
-        "deploy/userdata/oc-egress-chain.sh",
-        "deploy/userdata/oc-egress-sim.py",
-        "deploy/userdata/stop-vm.sh"
-      ],
-      "applies_when": "防篡改随镜像生效,无开关。skill 越权修复随更新生效;但历史上被唤醒过的受限租户,盘上已复制的多余 skill 不会自动回收,需要单独清理",
-      "params_changed": [],
-      "verification_ids": [
-        "verify-workspace-identity"
-      ]
-    },
-    {
-      "id": "fix-pagination-scan",
-      "summary": "GET /tenants?limit=N 只在确实存在下一页时返回 next_token,消除持续返回 token 但结果 0 条的无限翻页",
-      "paths": [
-        "deploy/lambda/api/core/ddb_scan.py",
-        "deploy/lambda/api/core/scheduling.py",
-        "deploy/lambda/api/handler.py",
-        "deploy/lambda/api/routes/skills_groups.py",
-        "deploy/lambda/api/services/console_info.py",
-        "deploy/lambda/api/services/dispatch_poller.py",
-        "deploy/lambda/api/services/dispatch_service.py",
-        "deploy/lambda/api/services/fleet_service.py",
-        "deploy/lambda/api/services/host_service.py",
-        "deploy/lambda/api/services/poller_heartbeat.py",
-        "deploy/lambda/health_check/ddb_scan.py",
-        "deploy/lambda/health_check/handler.py",
-        "deploy/lambda/scaler/ddb_scan.py",
-        "deploy/lambda/scaler/handler.py",
-        "deploy/lib/dispatch_infra.py",
-        "deploy/stacks/lambdas.py",
-        "scripts/checks/ddb-scan-pagination.py",
-        "scripts/checks/ddb-scan-pagination.sh",
-        "scripts/checks/run-all.sh"
-      ],
-      "applies_when": "任何环境都生效,无开关",
-      "params_changed": [],
-      "verification_ids": [
-        "verify-pagination-scan"
-      ]
-    },
-    {
       "id": "fix-config-preflight",
       "summary": "部署前先校验必填配置键与跨字段约束,配置不完整或相互冲突时在部署前失败,而不是部署到一半才报错;同时提供三份场景配置预设(最小测试 / 私有企业 / 公开演示)在 samples/profiles/",
       "paths": [
         "config.yml.example",
-        "deploy/lambda/api/core/ssm_dispatch.py",
-        "deploy/lambda/api/services/tenant_service.py",
-        "deploy/packer/CUSTOMER-GUIDE.md",
-        "deploy/packer/README.md",
-        "deploy/packer/apse1.pkrvars.hcl",
-        "deploy/packer/assert-image.sh",
-        "deploy/packer/assert-parity.sh",
-        "deploy/packer/build-golden-ami.sh",
-        "deploy/packer/customize.sh.default",
-        "deploy/packer/hooks/50-example.sh.example",
-        "deploy/packer/hooks/README.md",
-        "deploy/packer/host-golden.pkr.hcl",
-        "deploy/packer/run-hooks.sh",
         "deploy/stacks/lambdas.py",
-        "deploy/userdata/init-host.sh",
-        "deploy/userdata/provision-host.sh",
-        "deploy/userdata/rebuild-vm.sh",
         "docs/aws-guide/19-config-parameter-baseline.md",
         "samples/profiles/README.md",
         "samples/profiles/minimal-test.yml",
         "samples/profiles/private-enterprise.yml",
         "samples/profiles/public-demo.yml",
         "scripts/checks/config-gate.sh",
-        "scripts/checks/host-pin-parity.py",
-        "scripts/checks/host-pin-parity.sh",
         "scripts/checks/run-all.sh",
         "scripts/preflight-check.sh"
       ],
@@ -5173,18 +5193,11 @@
       "id": "fix-observability-boot",
       "summary": "可观测性资产的开机分发与 edge 日志投递:修掉日志实际没投递但监控显示正常的问题,并让开机拉取的脚本集合与部署侧分发的集合保持一致",
       "paths": [
+        "cli/oc-consistency.py",
         "deploy/edge/fluent-bit/install-fluent-bit.sh",
-        "deploy/packer/CUSTOMER-GUIDE.md",
-        "deploy/packer/README.md",
-        "deploy/packer/apse1.pkrvars.hcl",
-        "deploy/packer/host-golden.pkr.hcl",
-        "deploy/stacks/compute.py",
         "deploy/stacks/ha_edge.py",
-        "deploy/stacks/host_image.py",
         "deploy/stacks/obs_assets.py",
-        "deploy/userdata/provision-host.sh",
-        "docs/aws-guide-en/05-deploy-use-troubleshoot.md",
-        "docs/aws-guide/05-deploy-use-troubleshoot.md",
+        "docs/aws-guide/19-config-parameter-baseline.md",
         "scripts/checks/run-all.sh",
         "scripts/checks/s3-at-boot-parity.py",
         "scripts/checks/s3-at-boot-parity.sh",
@@ -5222,15 +5235,28 @@
       "id": "fix-edge-availability",
       "summary": "edge 机队开机后不再整批不可服务;路由切换不再最长 60 秒仍返回旧路由;读路径跟随集群 reader 端点;host terminate 后遗留的数据面路由会被回收",
       "paths": [
+        "config.yml.example",
+        "deploy/edge/install-edge.sh",
+        "deploy/edge/lib/backend.lua",
         "deploy/edge/lib/balancer.lua",
+        "deploy/edge/nginx.conf",
+        "deploy/edge/route.lua",
+        "deploy/edge/test/balancer_failover_adversarial_spec.lua",
         "deploy/edge/test/balancer_spec.lua",
+        "deploy/edge/test/route_reader_isolation_spec.lua",
         "deploy/edge/test/spec_helper.lua",
         "deploy/lambda/api/handler.py",
+        "deploy/lambda/api/services/tenant_service.py",
         "deploy/lambda/health_check/handler.py",
+        "deploy/stacks/alarms.py",
+        "deploy/stacks/ha_edge.py",
         "deploy/stacks/lambdas.py",
         "deploy/userdata/host-agent.py",
         "deploy/userdata/lib/harden-config.sh",
-        "deploy/userdata/route_ops.py"
+        "deploy/userdata/route_ops.py",
+        "docs/aws-guide-en/11-ops-maintenance.md",
+        "docs/aws-guide-en/13-data-plane-redesign.md",
+        "docs/aws-guide/11-ops-maintenance.md"
       ],
       "applies_when": "任何环境都生效,无开关",
       "params_changed": [],
@@ -5276,12 +5302,38 @@
       "id": "fix-image-provenance",
       "summary": "凭据与二进制来源:修掉密钥明文写入 EC2 console output;Firecracker 与 jailer 改为从客户自己的 S3 assets 桶拉取并强制校验摘要;内核与 Firecracker 版本固定的两条启动路径都加校验,版本不一致不静默通过",
       "paths": [
+        "build-rootfs.sh",
+        "deploy/lambda/api/core/ssm_dispatch.py",
+        "deploy/lambda/api/services/host_service.py",
+        "deploy/lambda/api/services/image_slot_service.py",
+        "deploy/lambda/api/services/tenant_service.py",
+        "deploy/lambda/health_check/handler.py",
+        "deploy/packer/CUSTOMER-GUIDE.md",
+        "deploy/packer/README.md",
+        "deploy/packer/apse1.pkrvars.hcl",
+        "deploy/packer/assert-image.sh",
+        "deploy/packer/assert-parity.sh",
+        "deploy/packer/build-golden-ami.sh",
+        "deploy/packer/customize.sh.default",
+        "deploy/packer/hooks/50-example.sh.example",
+        "deploy/packer/hooks/README.md",
+        "deploy/packer/host-golden.pkr.hcl",
+        "deploy/packer/run-hooks.sh",
+        "deploy/stacks/compute.py",
         "deploy/stacks/host_image.py",
-        "deploy/userdata/spire-kit/guest/agent.conf.tmpl",
-        "deploy/userdata/spire-kit/spire-join-broker.py",
+        "deploy/userdata/init-host.sh",
+        "deploy/userdata/provision-host.sh",
+        "deploy/userdata/rebuild-vm.sh",
+        "deploy/userdata/stop-vm.sh",
         "docs/api/pull-image-api.md",
-        "docs/aws-guide-en/09-api-integration.md",
-        "docs/aws-guide/09-api-integration.md"
+        "docs/aws-guide-en/05-deploy-use-troubleshoot.md",
+        "docs/aws-guide/05-deploy-use-troubleshoot.md",
+        "docs/aws-guide/openapi.yaml",
+        "scripts/checks/host-pin-parity.py",
+        "scripts/checks/host-pin-parity.sh",
+        "scripts/checks/run-all.sh",
+        "scripts/lib/patch-openclaw-transcript-durability.mjs",
+        "setup.sh"
       ],
       "applies_when": "无开关,但需要一次性前置准备:先把 Firecracker 二进制上传到自己的 assets 桶",
       "params_changed": [],
@@ -5293,30 +5345,9 @@
       "id": "fix-release-tooling",
       "summary": "发布与门禁侧的工具链变化(随公开树携带,不落到任何在役资源)",
       "paths": [
-        "build-rootfs.sh",
-        "config.yml.example",
-        "deploy/edge/install-edge.sh",
-        "deploy/edge/lib/backend.lua",
-        "deploy/edge/lib/balancer.lua",
-        "deploy/edge/nginx.conf",
-        "deploy/edge/route.lua",
-        "deploy/edge/test/balancer_failover_adversarial_spec.lua",
-        "deploy/edge/test/balancer_spec.lua",
-        "deploy/edge/test/route_reader_isolation_spec.lua",
-        "deploy/edge/test/spec_helper.lua",
-        "deploy/lambda/api/services/host_service.py",
-        "deploy/lambda/api/services/image_slot_service.py",
-        "deploy/lambda/api/services/tenant_service.py",
-        "deploy/lambda/health_check/handler.py",
-        "deploy/stacks/alarms.py",
-        "deploy/stacks/ha_edge.py",
-        "deploy/userdata/stop-vm.sh",
-        "docs/api/pull-image-api.md",
-        "docs/aws-guide-en/11-ops-maintenance.md",
-        "docs/aws-guide-en/13-data-plane-redesign.md",
-        "docs/aws-guide/11-ops-maintenance.md",
-        "docs/aws-guide/openapi.yaml",
-        "scripts/lib/patch-openclaw-transcript-durability.mjs"
+        "deploy/userdata/spire-kit/guest/agent.conf.tmpl",
+        "deploy/userdata/spire-kit/spire-join-broker.py",
+        "docs/api/pull-image-api.md"
       ],
       "applies_when": "仅影响仓库内的工具与门禁,对在役环境无行为影响",
       "params_changed": [],
@@ -5335,6 +5366,72 @@
       "pass_when": "全部相符,且 spire-agent 的 manifest 记录的摘要与它的制品一致",
       "fail_when": "有任一文件摘要不符,或 spire-agent 套件的 manifest 与其制品不自洽",
       "timeout_s": 300,
+      "cleanup": "只读,无需清理"
+    },
+    {
+      "id": "verify-host-taint",
+      "fix_id": "fix-host-taint",
+      "phase": "B-lifecycle",
+      "action": "标记一台 host 后调 POST /tenants 创建租户;再重复标记一次;最后取消标记并再创建一次",
+      "observable": "新租户落到的 instance_id,以及两次重复调用的响应体字段",
+      "pass_when": "标记期间新租户不落到该 host;重复标记返回 already_tainted: true;取消后 GET /hosts 里 is_tainted 为 false 且新租户可再次落入",
+      "fail_when": "标记后仍有新租户落到该 host,或重复调用报错而不是幂等返回 200",
+      "timeout_s": 900,
+      "cleanup": "取消标记,删除测试租户"
+    },
+    {
+      "id": "verify-config-reapply",
+      "fix_id": "fix-config-reapply",
+      "phase": "B-lifecycle",
+      "action": "先调 GET /system/info 看 capabilities.config_reapply;再带 force_reapply 调 POST /tenants/{id}/rebuild;重建完成后进 microVM 看 openclaw.json",
+      "observable": "capabilities.config_reapply 的取值、受理响应里的 reapply_requested、以及 VM 内 openclaw.json 的内容",
+      "pass_when": "capabilities.config_reapply 为 true,受理响应含 reapply_requested: true,重建后配置与目标模板一致",
+      "fail_when": "字段缺失,或受理了却没有重新下发(VM 内配置仍是旧的)",
+      "timeout_s": 1200,
+      "cleanup": "无需清理,租户回到 running"
+    },
+    {
+      "id": "verify-tenant-isolation",
+      "fix_id": "fix-tenant-isolation",
+      "phase": "B-lifecycle",
+      "action": "对一个配置了 skill 作用域的受限租户执行一次 restart,比对前后它持有的 skill;再对一个不存在的 instance_id 调 DELETE /hosts/{instance_id}",
+      "observable": "restart 前后该租户 ~/.openclaw/skills/ 下的 skill 数量与名字,以及 DELETE 的状态码",
+      "pass_when": "restart 前后 skill 数量不增加且没有作用域外的 skill;对不存在的 host 返回 404 而不是 200",
+      "fail_when": "restart 后多出作用域外的共享 skill,或 DELETE 不存在的 host 返回 200 并建出记录",
+      "timeout_s": 900,
+      "cleanup": "无需清理。历史残留的多余 skill 需单独清理,不在本验证范围"
+    },
+    {
+      "id": "verify-pagination-query",
+      "fix_id": "fix-pagination-query",
+      "phase": "A-readonly",
+      "action": "用小 limit(例如 2)把 GET /tenants 从头翻到尾;再按镜像版本查一次租户列表并与统计数字比对",
+      "observable": "每页的条数与 next_token 是否存在,以及按版本查询的条数 vs 统计数字",
+      "pass_when": "最后一页不带 next_token,过程中没有 0 条却带 token 的页;按版本查询的条数与统计一致",
+      "fail_when": "出现 0 条仍带 next_token、翻页不终止,或按版本查询返回空但统计非零",
+      "timeout_s": 600,
+      "cleanup": "只读,无需清理"
+    },
+    {
+      "id": "verify-hosts-reporting",
+      "fix_id": "fix-hosts-reporting",
+      "phase": "A-readonly",
+      "action": "在一个含至少两种机型的机队上调 GET /hosts,逐台读 cpu_overcommit_ratio 与 mem_overcommit_ratio",
+      "observable": "不同机型的 host 报出的超卖比取值",
+      "pass_when": "不同机型报出各自机型的生效值,而不是所有机器报同一个全局值",
+      "fail_when": "所有机器报同一个值,或与该机型的实际配置不符",
+      "timeout_s": 300,
+      "cleanup": "只读,无需清理"
+    },
+    {
+      "id": "verify-host-manifest-fanout",
+      "fix_id": "fix-host-manifest-fanout",
+      "phase": "A-readonly",
+      "action": "在一台 host 上按 manifest 逐个核对脚本的 sha256,并确认新鲜度哨兵存在且未过期",
+      "observable": "逐个脚本的摘要比对结果与哨兵的时间戳",
+      "pass_when": "全部相符;哨兵未过期。若哨兵过期,自愈应报错退出而不是静默继续",
+      "fail_when": "有脚本缺失或摘要不符,或哨兵过期却仍然静默用旧文件",
+      "timeout_s": 600,
       "cleanup": "只读,无需清理"
     },
     {
@@ -5371,17 +5468,6 @@
       "cleanup": "删除测试租户 B,按需 start 回 A"
     },
     {
-      "id": "verify-create-capacity",
-      "fix_id": "fix-create-capacity",
-      "phase": "B-lifecycle",
-      "action": "用最小合法请求体连续创建 3 个租户,并观察落点分布",
-      "observable": "每次 POST /tenants 的 HTTP 状态码与落到的 host",
-      "pass_when": "3 次都受理(202),没有 503,并且能落到仍有空闲容量的机器上",
-      "fail_when": "出现参数校验 400 全量失败,或有空闲容量却返回容量不足,或出现 503",
-      "timeout_s": 900,
-      "cleanup": "删除这 3 个测试租户"
-    },
-    {
       "id": "verify-egress-fleet",
       "fix_id": "fix-egress-fleet",
       "phase": "B-optional",
@@ -5402,28 +5488,6 @@
       "fail_when": "done 永远追不上 total,或失败台数超过 max_batch_failures,或同一台被处理两次",
       "timeout_s": 3600,
       "cleanup": "无需清理;若作业中断,用同一个 client_token 续跑"
-    },
-    {
-      "id": "verify-workspace-identity",
-      "fix_id": "fix-workspace-identity",
-      "phase": "B-lifecycle",
-      "action": "进入任一租户 microVM,尝试写 ~/.openclaw/workspace/SOUL.md;再对一个配置了 skill 作用域的受限租户执行一次 restart,比对前后它持有的 skill 数量",
-      "observable": "写入的错误码,以及 restart 前后该租户 ~/.openclaw/skills/ 下的 skill 数量",
-      "pass_when": "写入失败并返回 EROFS(只读文件系统);restart 前后 skill 数量不增加",
-      "fail_when": "身份文件能被写入,或 restart 后该租户多出了作用域外的共享 skill",
-      "timeout_s": 900,
-      "cleanup": "无需清理。历史残留的多余 skill 需要单独清理,不在本验证范围"
-    },
-    {
-      "id": "verify-pagination-scan",
-      "fix_id": "fix-pagination-scan",
-      "phase": "A-readonly",
-      "action": "用小 limit(例如 2)从头翻到尾,记录每页的条数与 next_token",
-      "observable": "每页返回的条数和 next_token 是否存在",
-      "pass_when": "最后一页不带 next_token,过程中不出现结果 0 条却带 token 的页",
-      "fail_when": "出现结果 0 条仍带 next_token,或翻页不终止",
-      "timeout_s": 300,
-      "cleanup": "只读,无需清理"
     },
     {
       "id": "verify-config-preflight",

@@ -1,0 +1,246 @@
+{
+  "id": "edge-balancer-cosocket-606",
+  "title": "edge balancer_by_lua* 阶段禁用 cosocket：上游重投由构造决定不可用，触发 retry 的租户 WSS 全部 502",
+  "base_sha": "e57e9eaea1154caa6020dca6735af92af2fe9185",
+  "patch_sha": "58bd07de4f603cb803fbc72dade14bde6921e811",
+  "status": "MANUAL_REVIEW",
+  "severity": "P0",
+  "upstream_issue": "#606（fail-closed 语义见 #628，坐标回收风险见 #605）",
+  "layer_summary": {
+    "E-edge": 4
+  },
+  "delivery_contract": "edge 是独立数据面 ASG，bundle 由 LaunchTemplate 钉 sha。本 kit 的 apply_cli 【真的下发到在役 edge】：S3 放制品 → SSM 写 lualib 与 /opt 两处落点 → reload。这与 lifecycle-op-patch 的 deploy-other 层不同 —— 那一层只 cp 到 $REPO_ROOT，打完在役不生效。施加本 kit 前请先读 APPLY-INSTRUCTIONS.md 的「交付层」一节。",
+  "atomicity": "四个文件必须整套下发后再 reload 一次，不要逐文件 reload。balancer.lua 调用 backend.peek_cached / mark_retry_stale / SOURCE_L2（本次在 backend.lua 新增），route.lua 提供 on_header_filter，nginx.conf 提供 header_filter_by_lua_block。缺任一文件即 attempt to call a nil value，或 fail-closed 的 503 被 nginx 显示为 500。",
+  "kit_files": {
+    "APPLY-INSTRUCTIONS.md": "da89a2c9aa0f412c05f613fdf502f329725760bbeb55c7394443859543978854",
+    "artifacts/balancer.lua": "847f8210c73fc6ca7b01ee9def4fbe8b01f7fad06af022ea7ff565b39fecc76f",
+    "artifacts/route.lua": "591ef0b6d9c4175fb3bc162e36cc26940e1d558656258bad5bb4059a57836ca8",
+    "artifacts/nginx.conf": "d5b5eac1d78058b7d454a53da26984e0ad13b10e3b7b822d098167c73b727ce0",
+    "artifacts/backend.lua": "830e73aa3a491d93bfee169d40b18ef76a84ea0d366e597670c37345107fe396"
+  },
+  "paths": {
+    "deploy/edge/lib/balancer.lua": {
+      "layer": "E-edge",
+      "artifact": "artifacts/balancer.lua",
+      "patch_sha256": "847f8210c73fc6ca7b01ee9def4fbe8b01f7fad06af022ea7ff565b39fecc76f",
+      "live_target": "/usr/local/openresty/lualib/edge/lib/balancer.lua",
+      "bootstrap_source": "/opt/openclaw-edge/lib/balancer.lua",
+      "operations": [
+        {
+          "class": "AUTO_CLI",
+          "order": 10,
+          "stage": "1-upload",
+          "apply_cli": "aws s3 cp artifacts/balancer.lua \"s3://$ASSETS_BUCKET/deployment/edge-606/balancer.lua\" --region \"$REGION\" --only-show-errors",
+          "verify_cli": "test \"$(aws s3api head-object --bucket \"$ASSETS_BUCKET\" --key deployment/edge-606/balancer.lua --region \"$REGION\" --query ContentLength --output text)\" -gt 0",
+          "rollback_cli": "aws s3api delete-object --bucket \"$ASSETS_BUCKET\" --key deployment/edge-606/balancer.lua --region \"$REGION\"",
+          "note": "只把制品放到 S3 新前缀 deployment/edge-606/，不覆盖任何现有 bundle 对象。零在役影响、完全可逆。"
+        },
+        {
+          "class": "AUTO_CLI",
+          "order": 20,
+          "stage": "2-deploy-live",
+          "apply_steps": [
+            "[ -f /usr/local/openresty/lualib/edge/lib/balancer.lua.pre-606 ] || cp -p /usr/local/openresty/lualib/edge/lib/balancer.lua /usr/local/openresty/lualib/edge/lib/balancer.lua.pre-606",
+            "[ -f /opt/openclaw-edge/lib/balancer.lua.pre-606 ] || cp -p /opt/openclaw-edge/lib/balancer.lua /opt/openclaw-edge/lib/balancer.lua.pre-606",
+            "aws s3 cp s3://$B/deployment/edge-606/balancer.lua /tmp/balancer.lua.new --region $R --quiet",
+            "echo '847f8210c73fc6ca7b01ee9def4fbe8b01f7fad06af022ea7ff565b39fecc76f  /tmp/balancer.lua.new' | sha256sum -c -",
+            "install -m 0644 /tmp/balancer.lua.new /usr/local/openresty/lualib/edge/lib/balancer.lua",
+            "[ -d /opt/openclaw-edge/lib ] && install -m 0644 /tmp/balancer.lua.new /opt/openclaw-edge/lib/balancer.lua || true",
+            "rm -f /tmp/balancer.lua.new"
+          ],
+          "verify_cli": "sha256sum /usr/local/openresty/lualib/edge/lib/balancer.lua /opt/openclaw-edge/lib/balancer.lua",
+          "verify_expect": "两处均为 847f8210c73fc6ca7b01ee9def4fbe8b01f7fad06af022ea7ff565b39fecc76f",
+          "rollback_steps": [
+            "cp -p /usr/local/openresty/lualib/edge/lib/balancer.lua.pre-606 /usr/local/openresty/lualib/edge/lib/balancer.lua",
+            "cp -p /opt/openclaw-edge/lib/balancer.lua.pre-606 /opt/openclaw-edge/lib/balancer.lua",
+            "openresty -s reload"
+          ],
+          "note": "lualib 是 openresty 运行时加载路径，/opt/openclaw-edge 是 bootstrap 源。只改前者会在实例重启或重新 bootstrap 后丢失修复，所以两处都必须写。备份锚点 .pre-606 只建一次。"
+        }
+      ]
+    },
+    "deploy/edge/lib/backend.lua": {
+      "layer": "E-edge",
+      "artifact": "artifacts/backend.lua",
+      "patch_sha256": "830e73aa3a491d93bfee169d40b18ef76a84ea0d366e597670c37345107fe396",
+      "live_target": "/usr/local/openresty/lualib/edge/lib/backend.lua",
+      "bootstrap_source": "/opt/openclaw-edge/lib/backend.lua",
+      "operations": [
+        {
+          "class": "AUTO_CLI",
+          "order": 10,
+          "stage": "1-upload",
+          "apply_cli": "aws s3 cp artifacts/backend.lua \"s3://$ASSETS_BUCKET/deployment/edge-606/backend.lua\" --region \"$REGION\" --only-show-errors",
+          "verify_cli": "test \"$(aws s3api head-object --bucket \"$ASSETS_BUCKET\" --key deployment/edge-606/backend.lua --region \"$REGION\" --query ContentLength --output text)\" -gt 0",
+          "rollback_cli": "aws s3api delete-object --bucket \"$ASSETS_BUCKET\" --key deployment/edge-606/backend.lua --region \"$REGION\"",
+          "note": "只把制品放到 S3 新前缀 deployment/edge-606/，不覆盖任何现有 bundle 对象。零在役影响、完全可逆。"
+        },
+        {
+          "class": "AUTO_CLI",
+          "order": 20,
+          "stage": "2-deploy-live",
+          "apply_steps": [
+            "[ -f /usr/local/openresty/lualib/edge/lib/backend.lua.pre-606 ] || cp -p /usr/local/openresty/lualib/edge/lib/backend.lua /usr/local/openresty/lualib/edge/lib/backend.lua.pre-606",
+            "[ -f /opt/openclaw-edge/lib/backend.lua.pre-606 ] || cp -p /opt/openclaw-edge/lib/backend.lua /opt/openclaw-edge/lib/backend.lua.pre-606",
+            "aws s3 cp s3://$B/deployment/edge-606/backend.lua /tmp/backend.lua.new --region $R --quiet",
+            "echo '830e73aa3a491d93bfee169d40b18ef76a84ea0d366e597670c37345107fe396  /tmp/backend.lua.new' | sha256sum -c -",
+            "install -m 0644 /tmp/backend.lua.new /usr/local/openresty/lualib/edge/lib/backend.lua",
+            "[ -d /opt/openclaw-edge/lib ] && install -m 0644 /tmp/backend.lua.new /opt/openclaw-edge/lib/backend.lua || true",
+            "rm -f /tmp/backend.lua.new"
+          ],
+          "verify_cli": "sha256sum /usr/local/openresty/lualib/edge/lib/backend.lua /opt/openclaw-edge/lib/backend.lua",
+          "verify_expect": "两处均为 830e73aa3a491d93bfee169d40b18ef76a84ea0d366e597670c37345107fe396",
+          "rollback_steps": [
+            "cp -p /usr/local/openresty/lualib/edge/lib/backend.lua.pre-606 /usr/local/openresty/lualib/edge/lib/backend.lua",
+            "cp -p /opt/openclaw-edge/lib/backend.lua.pre-606 /opt/openclaw-edge/lib/backend.lua",
+            "openresty -s reload"
+          ],
+          "note": "lualib 是 openresty 运行时加载路径，/opt/openclaw-edge 是 bootstrap 源。只改前者会在实例重启或重新 bootstrap 后丢失修复，所以两处都必须写。备份锚点 .pre-606 只建一次。"
+        }
+      ]
+    },
+    "deploy/edge/route.lua": {
+      "layer": "E-edge",
+      "artifact": "artifacts/route.lua",
+      "patch_sha256": "591ef0b6d9c4175fb3bc162e36cc26940e1d558656258bad5bb4059a57836ca8",
+      "live_target": "/usr/local/openresty/lualib/edge/route.lua",
+      "bootstrap_source": "/opt/openclaw-edge/route.lua",
+      "operations": [
+        {
+          "class": "AUTO_CLI",
+          "order": 10,
+          "stage": "1-upload",
+          "apply_cli": "aws s3 cp artifacts/route.lua \"s3://$ASSETS_BUCKET/deployment/edge-606/route.lua\" --region \"$REGION\" --only-show-errors",
+          "verify_cli": "test \"$(aws s3api head-object --bucket \"$ASSETS_BUCKET\" --key deployment/edge-606/route.lua --region \"$REGION\" --query ContentLength --output text)\" -gt 0",
+          "rollback_cli": "aws s3api delete-object --bucket \"$ASSETS_BUCKET\" --key deployment/edge-606/route.lua --region \"$REGION\"",
+          "note": "只把制品放到 S3 新前缀 deployment/edge-606/，不覆盖任何现有 bundle 对象。零在役影响、完全可逆。"
+        },
+        {
+          "class": "AUTO_CLI",
+          "order": 20,
+          "stage": "2-deploy-live",
+          "apply_steps": [
+            "[ -f /usr/local/openresty/lualib/edge/route.lua.pre-606 ] || cp -p /usr/local/openresty/lualib/edge/route.lua /usr/local/openresty/lualib/edge/route.lua.pre-606",
+            "[ -f /opt/openclaw-edge/route.lua.pre-606 ] || cp -p /opt/openclaw-edge/route.lua /opt/openclaw-edge/route.lua.pre-606",
+            "aws s3 cp s3://$B/deployment/edge-606/route.lua /tmp/route.lua.new --region $R --quiet",
+            "echo '591ef0b6d9c4175fb3bc162e36cc26940e1d558656258bad5bb4059a57836ca8  /tmp/route.lua.new' | sha256sum -c -",
+            "install -m 0644 /tmp/route.lua.new /usr/local/openresty/lualib/edge/route.lua",
+            "[ -d /opt/openclaw-edge ] && install -m 0644 /tmp/route.lua.new /opt/openclaw-edge/route.lua || true",
+            "rm -f /tmp/route.lua.new"
+          ],
+          "verify_cli": "sha256sum /usr/local/openresty/lualib/edge/route.lua /opt/openclaw-edge/route.lua",
+          "verify_expect": "两处均为 591ef0b6d9c4175fb3bc162e36cc26940e1d558656258bad5bb4059a57836ca8",
+          "rollback_steps": [
+            "cp -p /usr/local/openresty/lualib/edge/route.lua.pre-606 /usr/local/openresty/lualib/edge/route.lua",
+            "cp -p /opt/openclaw-edge/route.lua.pre-606 /opt/openclaw-edge/route.lua",
+            "openresty -s reload"
+          ],
+          "note": "lualib 是 openresty 运行时加载路径，/opt/openclaw-edge 是 bootstrap 源。只改前者会在实例重启或重新 bootstrap 后丢失修复，所以两处都必须写。备份锚点 .pre-606 只建一次。"
+        }
+      ]
+    },
+    "deploy/edge/nginx.conf": {
+      "layer": "E-edge",
+      "artifact": "artifacts/nginx.conf",
+      "patch_sha256": "d5b5eac1d78058b7d454a53da26984e0ad13b10e3b7b822d098167c73b727ce0",
+      "live_target": "/usr/local/openresty/nginx/conf/nginx.conf",
+      "bootstrap_source": "/opt/openclaw-edge/nginx.conf",
+      "operations": [
+        {
+          "class": "AUTO_CLI",
+          "order": 10,
+          "stage": "1-upload",
+          "apply_cli": "aws s3 cp artifacts/nginx.conf \"s3://$ASSETS_BUCKET/deployment/edge-606/nginx.conf\" --region \"$REGION\" --only-show-errors",
+          "verify_cli": "test \"$(aws s3api head-object --bucket \"$ASSETS_BUCKET\" --key deployment/edge-606/nginx.conf --region \"$REGION\" --query ContentLength --output text)\" -gt 0",
+          "rollback_cli": "aws s3api delete-object --bucket \"$ASSETS_BUCKET\" --key deployment/edge-606/nginx.conf --region \"$REGION\"",
+          "note": "只把制品放到 S3 新前缀 deployment/edge-606/，不覆盖任何现有 bundle 对象。零在役影响、完全可逆。"
+        },
+        {
+          "class": "AUTO_CLI",
+          "order": 20,
+          "stage": "2-deploy-live",
+          "apply_steps": [
+            "[ -f /usr/local/openresty/nginx/conf/nginx.conf.pre-606 ] || cp -p /usr/local/openresty/nginx/conf/nginx.conf /usr/local/openresty/nginx/conf/nginx.conf.pre-606",
+            "[ -f /opt/openclaw-edge/nginx.conf.pre-606 ] || cp -p /opt/openclaw-edge/nginx.conf /opt/openclaw-edge/nginx.conf.pre-606",
+            "aws s3 cp s3://$B/deployment/edge-606/nginx.conf /tmp/nginx.conf.new --region $R --quiet",
+            "echo 'd5b5eac1d78058b7d454a53da26984e0ad13b10e3b7b822d098167c73b727ce0  /tmp/nginx.conf.new' | sha256sum -c -",
+            "install -m 0644 /tmp/nginx.conf.new /usr/local/openresty/nginx/conf/nginx.conf",
+            "[ -d /opt/openclaw-edge ] && install -m 0644 /tmp/nginx.conf.new /opt/openclaw-edge/nginx.conf || true",
+            "rm -f /tmp/nginx.conf.new"
+          ],
+          "verify_cli": "sha256sum /usr/local/openresty/nginx/conf/nginx.conf /opt/openclaw-edge/nginx.conf",
+          "verify_expect": "两处均为 d5b5eac1d78058b7d454a53da26984e0ad13b10e3b7b822d098167c73b727ce0",
+          "rollback_steps": [
+            "cp -p /usr/local/openresty/nginx/conf/nginx.conf.pre-606 /usr/local/openresty/nginx/conf/nginx.conf",
+            "cp -p /opt/openclaw-edge/nginx.conf.pre-606 /opt/openclaw-edge/nginx.conf",
+            "openresty -s reload"
+          ],
+          "note": "lualib 是 openresty 运行时加载路径，/opt/openclaw-edge 是 bootstrap 源。只改前者会在实例重启或重新 bootstrap 后丢失修复，所以两处都必须写。备份锚点 .pre-606 只建一次。"
+        }
+      ]
+    }
+  },
+  "fixes": [
+    {
+      "id": "fix-606-balancer-no-cosocket",
+      "summary": "balancer_by_lua* 阶段不再重读 Redis：改为只读 shared_dict 找一个与失败 peer 不同的 desc；找不到则撤销 fresh 标记并 fail closed 返 503，绝不重用已知失败的旧 desc",
+      "root_cause": "OpenResty 在 balancer_by_lua* 上下文中禁用 cosocket API（shared_dict 允许，cosocket 不允许）。原实现经 route.on_balancer → balancer.balancer_pick → backend.lookup_backend → redis_client.get_route → resty.redis:new() 在该阶段重查 Redis，每次 retry 必抛 'API disabled in the context of balancer_by_lua*'，upstream 选取失败。",
+      "trigger": "租户被重建、恢复或迁移后，Redis 中 route 已更新为新 host:port，但 edge 的 L1 缓存仍持有指向旧 host 的 descriptor。首次连接打到旧 host 得 RST → 触发 balancer retry → 撞 API disabled → 502。首连即命中有效 desc 的租户不进 retry 分支，所以故障表现为「部分租户断」而不是全量断，容易被误判成租户个体问题。",
+      "security_note": "不重用失败 desc 是硬要求，不是优化：那个 host:port 坐标可能已被回收并重新分配给另一个在役租户，重投会成功连上别人的 VM，造成跨租户误路由。",
+      "self_healing": "去掉 balancer 阶段的非法重查后，route 变更由 L1 缓存 TTL 自然过期驱动 —— 下一次请求在 rewrite 阶段（cosocket 合法）读 Redis 拿到新 desc，收敛窗口等于 L1 TTL。不需要在 balancer 内做任何补偿。",
+      "artifacts": [
+        "backend.lua",
+        "balancer.lua",
+        "nginx.conf",
+        "route.lua"
+      ],
+      "live_effect": true
+    }
+  ],
+  "verifications": [
+    {
+      "id": "verify-no-api-disabled",
+      "class": "AUTO",
+      "cmd": "journalctl -u openresty --no-pager --since '-10min' | grep -c 'API disabled in the context of balancer_by_lua' || true",
+      "expect": "0",
+      "note": "nginx -t 不加载 lua 模块 —— -t 通过不代表 lua 能载入。lua 的加载与运行失败只出现在 journald 与 error.log。"
+    },
+    {
+      "id": "verify-two-targets-sha",
+      "class": "AUTO",
+      "cmd": "sha256sum <live_target> <bootstrap_source>",
+      "expect": "两处均等于该文件的 patch_sha256",
+      "note": "只改 lualib 会在实例重启或重新 bootstrap 后丢失修复"
+    },
+    {
+      "id": "verify-retry-path-selfheal",
+      "class": "MANUAL_CLI_REVIEW",
+      "cmd": "让某个租户的 route desc 指向不可达 host（例如先记录其 host:port，再让该 VM 停止），从外部发起 WSS，断言 L1 TTL 内的下一次请求连到新 peer，且 error.log 无 API disabled",
+      "expect": "自愈成功，无 API disabled",
+      "note": "【必做】正常请求不进 retry 分支 —— 只验正常请求等于完全没验这个 fix。这是唯一能证明修复生效的探针。"
+    },
+    {
+      "id": "verify-fail-closed-503",
+      "class": "MANUAL_CLI_REVIEW",
+      "cmd": "构造共享缓存中不存在任何不同 peer 的场景，断言客户端拿 503 而非 500，且日志中无重用失败 peer 的痕迹",
+      "expect": "503，且未重用失败 peer",
+      "note": "503 而非 500 依赖 nginx.conf 的 header_filter_by_lua_block —— 拿到 500 说明 nginx.conf 没有下发成功。"
+    }
+  ],
+  "manual_review_items": [
+    {
+      "id": "s3-bundle-sha-gate",
+      "question": "LaunchTemplate userdata 拉 edge bundle 时有没有 sha256 校验？",
+      "how_to_check": "aws ec2 describe-launch-template-versions 取 userdata，base64 解码后查找 sha256sum -c 之类的断言",
+      "why": "无校验 → 可直接更新现有 bundle 对象让新实例也继承修复（先记下旧 VersionId 作回滚锚点，S3 versioning 使字节替换可逆）；有校验 → 改 bundle 内容后 sha 不匹配、新实例起不来，必须 S3 与 LaunchTemplate 同步改，属换机级操作，单独排期",
+      "blocking": "决定新实例是否继承修复。不解决则本 kit 只止血在役实例，任何扩容、健康检查替换或 AZ 重平衡起来的新 edge 都会带回原缺陷"
+    },
+    {
+      "id": "live-version-drift",
+      "question": "在役 edge lua 与本 kit 的 base 版本偏离多少？",
+      "how_to_check": "对比在役文件与 kit 制品的 sha256；另可从 error.log 报出的行号反推",
+      "why": "整文件替换会带入 base 与在役之间的全部差异。若在役文件被手工改过，替换会覆盖那些改动",
+      "blocking": "替换前需确认这 4 个文件在役版本没有本 kit 之外的人为修改"
+    }
+  ]
+}

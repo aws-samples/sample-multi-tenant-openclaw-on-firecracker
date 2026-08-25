@@ -863,18 +863,6 @@ case "${_OC_TSTATUS}" in
     echo "[oc:launch] ABORT(#411/6.3): tenant ${TENANT_ID} status=deleted — 已删,拒起 VM 并停重投" >&2
     exit 44
     ;;
-  failed|requires_intervention)
-    # #624 — 这里必须 exit 44 而不是 45。45 的语义是“状态会变,等它变”:deleting 若
-    # delete 失败会回滚 creating/running,所以该重投;但 failed 是 API 明确定义的墓碑
-    # (只能换 client_token 重建),requires_intervention 是 host-agent 的 no-reset 状态,
-    # 二者都不会自行回可起态。用 45 只会让同租户 FIFO 每轮占住一个可见性窗口,直到
-    # #564/#565 死线闸终结。44 让 caller 标 assignment done、不重投、不计失败;abort
-    # 路径只 mark done,不释放容量、不删盘、不改 tenant status,容量由 health_check 的
-    # requires_intervention/failed orphan reaper 回收。客户仍可 stop requires_intervention
-    # 回 stopped(#619 真机实测)后重新 start;failed 可换 client_token 重建。这里只终结当前消息。
-    echo "[oc:launch] ABORT(#624): tenant ${TENANT_ID} status='${_OC_TSTATUS}' — 当前状态不可起 VM,标 assignment done 并停重投这条消息" >&2
-    exit 44
-    ;;
   *)
     # deleting / 空 / 未知状态:非终态、非明确可起 → fail-closed 暂拒起,保持 pending。
     # deleting 尤其【不是】终态(delete 失败会回滚到 creating/running),若标 done 会让回滚后

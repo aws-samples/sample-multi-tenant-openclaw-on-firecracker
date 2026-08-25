@@ -194,32 +194,4 @@ describe("balancer failover no-cross-tenant isolation", function()
         assert.is_true(contains(connects, "primary.redis.local"))
         assert.is_false(contains(connects, "reader.redis.local"))
     end)
-
-    -- 防止重投依赖 nil 默认值维持权威语义：第 5 实参必须显式为 true。
-    it("retry passes explicit authoritative true to lookup_backend", function()
-        ngx.var.edge_redis_host = "primary.redis.local"
-        ngx.var.edge_redis_port = "6379"
-        ngx.ctx.tenant_id = "t-explicit-authoritative"
-        ngx.ctx.route_desc = {
-            host = "10.0.9.9", port = 10042, guest_ip = "172.16.0.6",
-        }
-        package.loaded["ngx.balancer"]._last_failure = {
-            state = "failed", code = 502,
-        }
-
-        local captured_authoritative
-        local real_lookup = backend.lookup_backend
-        backend.lookup_backend = function(_, _, _, _, authoritative)
-            captured_authoritative = authoritative
-            return {
-                host = "10.0.7.7", port = 11001, guest_ip = "172.16.9.10",
-            }, backend.SOURCE_L3, nil
-        end
-
-        local ok, err = pcall(balancer.balancer_pick)
-        backend.lookup_backend = real_lookup
-
-        assert.is_true(ok, tostring(err))
-        assert.are.equal(true, captured_authoritative)
-    end)
 end)

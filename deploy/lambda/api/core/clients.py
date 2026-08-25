@@ -41,8 +41,21 @@ from botocore.config import Config as _BotoConfig
 # 不再是上界。本轮把两处 `_ssm_run`(`backup/handler.py` 与 `core/ssm_dispatch.py`)改成
 # 真实墙钟 deadline,`timeout` 才重新成为可算的预算,这个 420 才有意义。
 #
-# 注:这个数只保证「不比 backup 侧先放弃」,**不代表业务死线** —— 客户给 suspend/restore 的
-# 180s 档比它还小,那个矛盾归 #565 G1/G2 判决(本轮把它量成数、写进文档,不擅自改死线)。
+# 注:这个数只保证「不比 backup 侧先放弃」,**不代表业务死线**。
+#
+# **#565 G1 之后这条注解要重读一遍(值没变,依据变了)。** 业务死线现在真的落地了:同步备份
+# 在 backup 侧的墙钟预算由**调用方按自己的死线档给定** —— delete 90s / suspend 90s /
+# rebuild 55s(见 `create_deadline._EXEC_STEPS`),而撤离路径(`host_service`)不带预算、
+# 回落 backup 侧默认 300s(它是运维动作,没有客户死线)。
+#
+# 于是 `read_timeout` 的角色变得更清楚:**它必须永远不是先放弃的那一个。** backup 侧到预算
+# 就返回一个真实裁决(`success=False` + `OC_SSM_NO_VERDICT` 哨兵),而 ReadTimeout 只会给出
+# 「不确定」——G1-a 的整个教训就是「不确定」被 fail-closed 读成「确定失败」的代价。所以下界是
+# **最大可能的 backup 侧墙钟**(那条不带预算的撤离路径,300s)+ 最后一次
+# `get_command_invocation` 最坏 71s = 371s。420 > 371 ✓,继续成立,不必改。
+# 反过来说:**将来谁把 backup 侧的默认预算调大到 > 349s,这个 420 就不够了** —— 那条绑定
+# 由 `tests/test_565_backup_sync_timeout_adversarial.py` 的取值层守着(它从源码算 backup 侧
+# 上界再比这个数,改坏即红,已实测)。
 #
 # **retries 刻意取 0(只试一次)**,理由是重试比白等更坏:第二次 invoke 会撞
 # `backup-data.sh` 的 per-tenant flock(`flock -w 30` → `exit 1`),于是 SSM Failed →

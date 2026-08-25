@@ -102,11 +102,11 @@ ALL_REASONS = (REASON_CAPACITY, REASON_DEADLINE_EXCEEDED, REASON_SYSTEM)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# #564 G1 —— per-action 死线口径:七个操作的单一真相
+# #564 G1 —— per-action 死线口径:八个操作的单一真相
 # ═══════════════════════════════════════════════════════════════════════════
 #
-# 七个操作 × 四条通道,散开写就是 28 个漂移点。本模块已经是 create 那条通道的口径来源、
-# 且已有四个消费者;把另外六个操作接到同一份里,`rg` 才能证明"无第二处硬写秒数"
+# 八个操作 × 四条通道,散开写就是 32 个漂移点。本模块已经是 create 那条通道的口径来源、
+# 且已有四个消费者;把另外七个操作接到同一份里,`rg` 才能证明"无第二处硬写秒数"
 # (issue 验收第 1 条)。
 #
 # **本段全部是加法**:上面 create 专用的 `DEADLINE_TOTAL_SEC` / `ATTR_*` / `MSG_*` /
@@ -118,6 +118,7 @@ ACTION_CREATE = "create"
 ACTION_SUSPEND = "suspend"
 ACTION_RESTORE = "restore"
 ACTION_RESTART = "restart"
+ACTION_START = "start"
 ACTION_REBUILD = "rebuild"
 ACTION_BACKUP = "backup"
 """**网关手动备份**,不是系统定时备份。
@@ -133,19 +134,21 @@ DEADLINE_ACTIONS = (
     ACTION_SUSPEND,
     ACTION_RESTORE,
     ACTION_RESTART,
+    ACTION_START,
     ACTION_REBUILD,
     ACTION_BACKUP,
     ACTION_DELETE,
 )
-"""七个操作。客户表格最终版给了五档(create/suspend/restore/手动备份/delete),
-客户 2026-08-21 追加 `rebuild` 与 `restart` 按 180s 档 —— 理由:走的通道同样零死线,
-而 rebuild 是唯一已知会常态化产出「不确定」这种非终态的操作。"""
+"""八个操作。客户表格最终版给了五档(create/suspend/restore/手动备份/delete),
+客户 2026-08-21 追加 `rebuild` 与 `restart` 按 180s 档;#604 后续把 `start` 加入
+`restart` 同档 —— 理由:同一条通道、同为不含数据步骤的动作。"""
 
 _DEFAULT_DEADLINE_SEC = {
     ACTION_CREATE: DEADLINE_TOTAL_SEC,  # 180,#562 已落地的那条
     ACTION_SUSPEND: 180,
     ACTION_RESTORE: 180,
     ACTION_RESTART: 180,
+    ACTION_START: 180,  # 与 restart 同档:同一条通道、同为不含数据步骤的动作
     ACTION_REBUILD: 180,
     ACTION_BACKUP: 600,
     ACTION_DELETE: 600,
@@ -155,31 +158,268 @@ _DEFAULT_DEADLINE_SEC = {
 
 _ENV_PREFIX = "LIFECYCLE_DEADLINE_SEC_"
 
+# ══════════════════════════════════════════════════════════════════════════
+# #565 G1 —— 八档的三段预算分解
+# ══════════════════════════════════════════════════════════════════════════
+#
+# ## 为什么要有这一段
+#
+# #564 交付了死线**机制**,但机制拦不住已经在飞的 SSM 命令 —— 没有任何办法撤回一条
+# `SendCommand`。所以「到点给上层终态」与「底层别再动」是两件事,只有让**执行段本身装进
+# 死线**才对齐。本轮实查发现的矛盾(bb=1cedf334):
+#
+#   suspend 的同步备份 300s、restore 的 launch 300s、restart 300s、rebuild 300s
+#   —— 四个 180s 档的执行段**各自单项就超死线 120s**;delete 的 300+300 正好等于 600s,
+#   排队段零余量。
+#
+# 而实测典型值只有 休眠 6.0s / 唤醒 3.7s / 注销 12.2s / 备份 6.6s / 恢复 16s
+# (`FACT-BASELINE.md:35-36`)。那个 300 **没有任何出处** —— 它是 `_ssm_run` 的默认参数值被
+# 复制开的结果,约为实测的 50 倍。后果不是变慢:suspend 在 t=180 被判 `failed`,而 SSM 在
+# t=252 真的成功了 → **上层看到失败、底层其实成功**,正是客户压测投诉的那个现象。
+#
+# 这个矛盾此前被另一个更大的 bug 盖着:`770a26df` 把 `_ssm_run` 从「轮数上限」改成真实墙钟
+# deadline 之后,`timeout=300` 才**真的**是 300s,矛盾才露出来。
+#
+# ## 处置(用户 2026-08-24 定):按实测重设各段预算,让三段之和真的等于死线
+#
+# 代价已知并接受:大盘 / host 忙时 suspend 会在预算内**失败**(fail-closed、不丢数据、
+# 可重试)而不是慢慢成功。**不抬客户定的死线数字** —— 路 A 的整个意义就在这里。
+#
+# ## 三段的通道语义不同,别当成一套
+#
+# | 段 | 通道 A(create) | 通道 B(suspend/restore/restart/start/delete) | 通道 C/D(rebuild/手动备份) |
+# | --- | --- | --- | --- |
+# | `intake` | ESM 攒批窗口 2s | **0** —— 生命周期 ESM **根本没设** `max_batching_window`(`lambdas.py:1049-1061`),默认 0 | 0,直接 `invoke` |
+# | `queue`  | 等容量 | 排队等消费槽,由消费能力反推(见 `tolerable_queue_depth`) | 留给 AWS 异步重试的余量(无排队概念) |
+# | `exec`   | SSM executionTimeout | 该动作真实传给 `_ssm_run` 的墙钟预算 | 同 |
+#
+# ## 执行段的分步预算 —— 这是本段的单一真相源
+#
+# 每一步的数都从 `FACT-BASELINE` 的实测值起算,系数写在行内。**`_WORST_EXEC_SEC` 与各处
+# `_ssm_run(timeout=…)` 都从这里取,不另写数字** —— 那正是本仓反复处置的「同一公式散在 8 处」。
+BACKUP_TERM_GRACE_SEC = 60
+"""同步备份被 `timeout` TERM 掉之后,留给 `backup-data.sh` 的 EXIT trap 把 VM 从 Paused
+恢复回 running 的宽限期。
+
+**这个 60 不是本模块拍的**:它是 host-agent 的 `_BACKUP_TERM_GRACE_SEC`
+(`deploy/userdata/host-agent.py:1104`,env `OC_BACKUP_TERM_GRACE_SEC` 可覆盖),按
+`backup-data.sh` 里 resume 的最坏耗时算出来的 ——「5 次 × 5s max-time + (1+2+3+4) = 35s」
+再加 25s 余量,并有 `test_469_r7_host_backup_loop_adversarial.py::TestResumeBudgetFitsInTheTermGrace`
+把两个数锁在一起。这里抄一份是因为控制面与 host-agent 分处 Python 与 Python 但不同 asset,
+共享不了常量;`tests/test_565_g1_budget_breakdown.py` 有一条断言把两处逐值比对,漂了就红。
+
+**为什么它必须进预算**:不留这段宽限就只能 SIGKILL,而那会掐断 EXIT trap 里的 resume →
+客户 VM 永久留在 Paused,且 reaper 救不了它(判 `fc_alive` 是进程存活,Paused 进程是活的)。
+`backup-data.sh` 自己把这个后果评为「比丢一次备份严重:丢备份下轮会重来,而 Paused 不会
+自己好」。所以任何含同步备份的档,它的 backup 步预算都必须 **> 60**。
+"""
+
+_EXEC_STEPS: Dict[str, Any] = {
+    # create 不动:128s 已由 `EXEC_BUDGET_SEC` 从 batch/slots/per-vm 论证过(#562)。
+    ACTION_CREATE: (("dispatch-ssm", EXEC_BUDGET_SEC),),
+    # suspend = 无条件同步备份 + stop-vm。备份实测 6.6s/9.5MB → 90s(13.6×,给大盘留量);
+    # stop-vm 实测 6.0s → 30s(5×,也正是它现在的默认值,不必改)。
+    ACTION_SUSPEND: (("backup", 90), ("stop-vm", 30)),
+    # restore = 冷恢复 launch(sync=True)。实测恢复 16s → 120s(7.5×);它含 S3 下载+解密+
+    # 解压+e2fsck,是八档里单步最重的一个,所以系数比 stop-vm 那种纯本地操作低。
+    ACTION_RESTORE: (("launch-vm", 120),),
+    # restart = 一条组命令 `stop-vm && sleep 2 && launch-vm`(:7386-7392),**没有备份**。
+    # 从已测分量推导:stop 6.0s + 2s + launch 6.48s ≈ 14.5s → 75s(5.2×)。
+    # 它与 start 都不含数据相关步骤;restart 还多了 stop+sleep,所以执行段是 75s、排队段
+    # 105s。**不给它 120s 是刻意的**:多给执行段就是少给排队段,而它本来就不需要那么多。
+    ACTION_RESTART: (("stop+launch", 75),),
+    # start 只跑 launch,基准 6.48s;组命令还含 host_script_self_heal(可能从 S3 拉脚本,
+    # 一次网络往返)与幂等 DNAT,所以给 60s(9.3×)。比 restart 的系数更宽是刻意的,
+    # 不是抄漏。
+    ACTION_START: (("launch-vm", 60),),
+    # ⚠ **含同步备份的三档(suspend/rebuild/delete)的 backup 步一律 90s,不是"按需分配"。**
+    # 那 90 = `BACKUP_TERM_GRACE_SEC`(60)+ 脚本自己的墙钟额度(30)。60 不是我拍的:它是
+    # host-agent 的 `_BACKUP_TERM_GRACE_SEC`(`deploy/userdata/host-agent.py:1104`),按
+    # `backup-data.sh` 的 EXIT trap 里 resume 的最坏耗时 35s 抬上来的,并有 parity 测试锁着。
+    # backup 侧把脚本包成 `timeout --signal=TERM --kill-after=60 30`,于是这一步的真实墙钟
+    # 上界就是 90 —— **预算第一次真的界住了 host,而不只是界住控制面的轮询。**
+    # 详见 `deploy/lambda/backup/handler.py` 那处 `timeout` 包装旁边的说明。
+    # rebuild = **强制同步备份** + `rebuild-vm.sh`。
+    #
+    # ⚠ **那次备份是 issue 分析表漏掉的一项。** issue 只写了 rebuild 有一个 300s 的
+    # `_ssm_run`,但 `_rebuild_repin_apply`(:5661)在**每次** rebuild 都先做一次
+    # `_force_backup_sync` —— 注释原文「both channels are resolved before the **mandatory**
+    # backup」,且「任一方向、含 no-op 写路径都备」(codex review2 #1:短路不能跳过备份,
+    # 否则丢 overlay 前无兜底)。所以 rebuild 的执行段是**两步**,不是一步。
+    #
+    # `rebuild-vm.sh` = stop-vm + overlay 提交 + launch-vm;overlay 提交是
+    # `mv "${OVERLAY}" "${TOMBSTONE}"`(`deploy/userdata/rebuild-vm.sh:319`)—— 同文件系统
+    # **重命名,O(1)**,不随盘大小涨。可从已测分量推:6.0 + ~0 + 6.48 ≈ 12.5s → 30s(2.4×)。
+    # 备份必须先拿够 90(它装不下比 90 更小的数,见上面那段:60 宽限是硬的),
+    # 剩下的 30 才是 rebuild-vm 的。**第一版分成 55+65 是错的** —— 55 装不下 60s 宽限,
+    # 于是那一步的墙钟上界压根界不住,预算又变回纸面的。
+    #
+    # **rebuild 是八档里最紧的一个**:同一个备份在 suspend 那档有 90s,在这里只有 55s ——
+    # 因为备份之后还有一整个 relaunch 要做,而死线是同一个 180s。后果如实写进契约文档:
+    # 一个能 suspend 成功的大盘租户,可能 rebuild 失败。**这不是取舍失误,是 180s 装不下
+    # 两个数据相关步骤这件事本身**;要它更宽只能抬死线或把备份异步化(都不在本轮范围)。
+    ACTION_REBUILD: (("backup", 90), ("rebuild-vm", 30)),
+    # delete = 同步备份 + host 原子删除。备份同 suspend 取 90;host 删除实测注销 12.2s →
+    # 120s(10×)。600s 档给了排队段 390s 的余量,是八档里最宽裕的。
+    ACTION_DELETE: (("backup", 90), ("host-delete", 120)),
+    # 手动备份走通道 D:**异步**,不受调用侧 `read_timeout` 约束(那条只管同步 invoke)。
+    # 600s 死线下可以给大盘留足预算 —— 这是同一个 backup Lambda 在不同调用方式下**必须拿到
+    # 不同预算**的原因,所以 `backup/handler.py` 的预算改成由调用方传入。
+    ACTION_BACKUP: (("backup", 300),),
+}
+"""执行段的分步预算。键是 `_ssm_run` 的调用点标识,值是该步的墙钟秒数。"""
+
+
+def exec_steps(action: str) -> Any:
+    """该动作执行段的分步预算元组。取值必须过 `assert_reason_valid` 同款的已知性检查。"""
+    key = str(action).strip().lower()
+    if key not in _EXEC_STEPS:
+        raise ValueError(f"未知的预算操作 {action!r}")
+    return _EXEC_STEPS[key]
+
+
+def exec_step_sec(action: str, step: str) -> int:
+    """取某一步的墙钟预算 —— 各处 `_ssm_run(timeout=…)` 从这里取,不写字面量。"""
+    for name, sec in exec_steps(action):
+        if name == step:
+            return int(sec)
+    raise ValueError(f"{action!r} 的执行段里没有 {step!r} 这一步")
+
+
+def exec_sec(action: str) -> int:
+    """执行段总额 = 各步之和。"""
+    return sum(int(s) for _n, s in exec_steps(action))
+
+
+_INTAKE_SEC: Dict[str, int] = {
+    ACTION_CREATE: BATCH_WINDOW_SEC,   # 通道 A 的 ESM 攒批窗口,客户定不可动
+    ACTION_SUSPEND: 0,
+    ACTION_RESTORE: 0,
+    ACTION_RESTART: 0,
+    ACTION_START: 0,                   # 通道 B:生命周期 ESM 没设 max_batching_window
+    ACTION_DELETE: 0,                  # ↑ 通道 B:ESM 没设攒批窗口 → 0(设计,非漂移)
+    ACTION_REBUILD: 0,
+    ACTION_BACKUP: 0,                  # ↑ 通道 C/D:直接 invoke,无攒批
+}
+"""受理段。通道 B/C/D 都是 0,理由见上表 —— **不是没算,是算出来就是 0。**"""
+
+
+def intake_sec(action: str) -> int:
+    key = str(action).strip().lower()
+    if key not in _INTAKE_SEC:
+        raise ValueError(f"未知的预算操作 {action!r}")
+    return _INTAKE_SEC[key]
+
+
+_QUEUE_SEC: Dict[str, int] = {
+    ACTION_CREATE: QUEUE_BUDGET_SEC,   # 50,#562 已论证
+    ACTION_SUSPEND: 60,
+    ACTION_RESTORE: 60,
+    ACTION_RESTART: 105,               # stop+launch 75s,剩余 105s 给排队
+    ACTION_START: 120,                 # 恒等式约束:0 + 120 + 60 = 180,必须显式写值
+    ACTION_REBUILD: 60,                # 通道 C:这一段是「留给 AWS 异步重试的余量」
+    ACTION_BACKUP: 300,                # 通道 D:同上
+    ACTION_DELETE: 390,                # 600s 档,八档里最宽裕
+}
+"""排队段(通道 C/D 是「留给 AWS 异步重试的余量」)。
+
+**为什么写成显式的表而不是 `死线 - 受理 - 执行`。** 第一版是算出来的,结果那让
+`assert_all_budgets_consistent()` 里「三段之和 = 死线」这条检查变成**空操作** —— 改坏执行段
+时排队段自动补偿,和永远等于死线,断言永远绿。写这条测试时实测到了(它「DID NOT RAISE」)。
+
+issue 要的是「各段之和必须恰好等于死线值,**并有一条导入期断言守住**」;要守得住,三个数就
+必须各自独立可读,恒等式才是一个真的约束。取值本身仍由消费能力反推(见
+`tolerable_queue_depth` 的公式),写下来只是让它可被检查。
+"""
+
+
+def queue_sec(action: str) -> int:
+    key = str(action).strip().lower()
+    if key not in _QUEUE_SEC:
+        raise ValueError(f"未知的预算操作 {action!r}")
+    return _QUEUE_SEC[key]
+
+
+def budget_breakdown_for(action: str) -> Dict[str, Any]:
+    """某一档的三段预算,机器可读 —— 给校验器、`/system/info` 与证据用。"""
+    key = str(action).strip().lower()
+    return {
+        "action": key,
+        "total_sec": _DEFAULT_DEADLINE_SEC[key],
+        "intake_sec": intake_sec(key),
+        "queue_sec": queue_sec(key),
+        "exec_sec": exec_sec(key),
+        "exec_steps": [{"step": n, "sec": int(s)} for n, s in exec_steps(key)],
+    }
+
+
+def tolerable_queue_depth(action: str, batch_size: int, max_concurrency: int) -> int:
+    """排队段能容忍多深的队列 —— **由消费能力反推,不是拍的**(G1 明文要求)。
+
+        消费速率 = batch_size × maxConcurrency / 执行段        (条/秒)
+        可容忍深度 D = 排队段 × 消费速率
+
+    按**最坏执行**算而不是典型值:排队段若按典型值定,一旦负载让每条都跑满执行段,死线就破。
+    `batch_size` / `maxConcurrency` 由调用方从 `config.yml` 的 `scaler.*` 传进来(与
+    `deploy/stacks/lambdas.py:1034` 同源),**本模块不读配置** —— 它必须保持零 boto3、零 IO。
+
+    只对通道 B 有意义;通道 C/D 没有排队,调用方不该问它们。
+    """
+    if int(batch_size) <= 0 or int(max_concurrency) <= 0:
+        raise ValueError("batch_size 与 max_concurrency 必须为正")
+    _exec = exec_sec(action)
+    if _exec <= 0:
+        raise ValueError(f"{action!r} 的执行段非正,预算表写坏了")
+    return int(queue_sec(action) * int(batch_size) * int(max_concurrency) / _exec)
+
+
+def assert_all_budgets_consistent() -> None:
+    """导入期断言:**每一档**三段之和恰好等于该档死线,且执行段为正、排队段非负。
+
+    照 `assert_budget_consistent()` 的理由(那条只管 create):三个数是联动的,谁单独调一个都会
+    静默破坏死线口径 —— 配置写坏了要在部署时炸,不要等压测才发现。本条把它扩到八档,并额外
+    守住两件事:
+      · **覆盖面**:`_EXEC_STEPS` / `_INTAKE_SEC` 的键必须与 `DEADLINE_ACTIONS` 逐一对应 ——
+        八档词汇表加一档而这里没跟上,就是一个没有预算的死线,而那正是本 issue 要消灭的形态;
+      · **排队段不得为负**:负数意味着执行段已经吃掉了整个死线,到点必然「判死了还在跑」。
+    """
+    missing = set(DEADLINE_ACTIONS) - set(_EXEC_STEPS)
+    extra = set(_EXEC_STEPS) - set(DEADLINE_ACTIONS)
+    if missing or extra:
+        raise AssertionError(
+            f"预算表与八档词汇表不一致:缺 {sorted(missing)}、多 {sorted(extra)}"
+        )
+    if set(_INTAKE_SEC) != set(DEADLINE_ACTIONS):
+        raise AssertionError("`_INTAKE_SEC` 的键与八档词汇表不一致")
+    if set(_QUEUE_SEC) != set(DEADLINE_ACTIONS):
+        raise AssertionError("`_QUEUE_SEC` 的键与八档词汇表不一致")
+    for action in DEADLINE_ACTIONS:
+        total = _DEFAULT_DEADLINE_SEC[action]
+        e, i, q = exec_sec(action), intake_sec(action), queue_sec(action)
+        if e <= 0:
+            raise AssertionError(f"{action}:执行段 {e} 必须为正")
+        if q < 0:
+            raise AssertionError(
+                f"{action}:排队段 {q} 为负 —— 执行段 {e} 已吃掉整个死线 {total},"
+                "到点必然「判死了、SSM 还在跑」→ 孤儿资源"
+            )
+        if i + q + e != total:
+            raise AssertionError(
+                f"{action}:三段之和 {i}+{q}+{e}={i + q + e} != 死线 {total}"
+            )
+
+
 # ── 「单次最坏执行耗时」:死线的下界(G5 第 2 条 / G8 第 1 行)────────────────
 # 「死线小于单次最坏执行 → 判死了、SSM 还在跑 → 孤儿资源」。所以这是**唯一一个
 # 往小调必须被挡住**的约束。
 #
-# 只有 create 有权威值:128s,来自 `dispatch_service._derive_exec_timeout(30)`,
-# 即上面 `EXEC_BUDGET_SEC` 那条已经论证过的算术。
-#
-# 另外六个**刻意留 None = 未落地**,不填猜测值。issue 自己划了界:
-# 「#565 —— 各操作的**预算分解**…本 issue 出**机制**,#565 出**达标与契约**」。
-# 填一个我算不出来源的数,就等于把"未验证"伪装成"已验证"——而这个数偏小的后果是孤儿 VM。
-#
-# 已知它不会是小数:`suspend`/`restore`/`delete`/`rebuild`/`backup` 都含一次同步备份,
-# 而 backup 侧的真实墙钟上界是 **~305s**(#565 G1-a 实测:`backup/handler.py` 的
-# `_ssm_run(timeout=300)` 等待形状 = `sleep(5)` + `(300//3)` 轮 × `sleep(3)`)。
-# **305 > 180** —— 也就是说客户给 suspend/restore/rebuild 的 180s 档,在当前实现下
-# 装不下最坏一次备份。这是本模块能提供的**机制**所暴露的事实,**判定与达标归 #565**;
-# 本模块不擅自把 180 改大,也不假装它够。
+# **#565 G1 之后八档都有权威值,且全部从 `_EXEC_STEPS` 推导** —— 不在这里重抄数字。
+# 推导成立的前提是本轮同时把各处 `_ssm_run(timeout=…)` 也改成从 `exec_step_sec()` 取:
+# 那之后「最坏执行」不再是一个估计,而是**代码里那个墙钟预算本身**。校验器另有一条断言
+# 守住这个前提(执行段必须 ≥ 该动作真实传给 `_ssm_run` 的 timeout),防「预算写小了但代码
+# 还在用大 timeout」这种纸面达标。
 _WORST_EXEC_SEC: Dict[str, Optional[int]] = {
-    ACTION_CREATE: EXEC_BUDGET_SEC,
-    ACTION_SUSPEND: None,
-    ACTION_RESTORE: None,
-    ACTION_RESTART: None,
-    ACTION_REBUILD: None,
-    ACTION_BACKUP: None,
-    ACTION_DELETE: None,
+    action: exec_sec(action) for action in DEADLINE_ACTIONS
 }
 
 
@@ -232,7 +472,7 @@ def env_name_for(action: str) -> str:
 
 
 PARAM_PREFIX = "/openclaw/lifecycle/deadline-sec/"
-"""七档死线在 SSM Parameter Store 里的公共前缀(#564 G5 的运行时载体)。
+"""八档死线在 SSM Parameter Store 里的公共前缀(#564 G5 的运行时载体)。
 
 路径形态照仓内惯例(`/openclaw/dispatch/config`、`/openclaw/litellm-host`),末尾带 `/`
 以便 `GetParametersByPath` 直接用。
@@ -264,14 +504,14 @@ def deadline_attr(action: str) -> str:
 
     `create` 返回已发布的 `create_deadline`(`ATTR_DEADLINE`);其余按同一模式
     `<action>_deadline`。**这里不存在"改已发布字段名"的问题** —— `create_deadline` 本来就是
-    `<action>_deadline` 这个形状,七档统一到同一模式是纯加法。
+    `<action>_deadline` 这个形状,八档统一到同一模式是纯加法。
 
     那为什么 create 还要显式返回 `ATTR_DEADLINE` 而不是让它自然拼出来:已发布字段必须能被
     `rg ATTR_DEADLINE` 找到**唯一定义点**。靠"拼出来正好一样"的话,将来谁改了这里的拼法
     (比如加个前缀),已发布契约就会跟着静默改名,而 grep 那个常量的人什么都看不到。
     `fail_reason_attr()` 为同一条理由做了同样的事。
 
-    与 `MSG_DEADLINE_KEY` 的分工:那个是**消息体/事件 payload** 里的键名(七档共用一个键,
+    与 `MSG_DEADLINE_KEY` 的分工:那个是**消息体/事件 payload** 里的键名(八档共用一个键,
     因为消息里已经带了 `action`,再把 action 拼进键名只会让消费侧多一次拼接);本函数是
     **租户行**上的列名,那里没有 action 上下文,必须带上。
     """
@@ -377,7 +617,7 @@ def deadline_at_for(action: str, accepted_epoch: int) -> int:
 
 
 def all_deadline_sec() -> Dict[str, int]:
-    """七个操作的死线现值 —— 给 G8 校验器、证据、以及日志自证用。
+    """八个操作的死线现值 —— 给 G8 校验器、证据、以及日志自证用。
 
     验收第 4 条要求「改 Lambda env 后…死线值随之变化(**读取值要在日志或响应里可验证**)」,
     这个函数就是那个可验证点。
@@ -386,14 +626,14 @@ def all_deadline_sec() -> Dict[str, int]:
 
 
 def assert_deadline_config_sane() -> None:
-    """七档死线的算术约束 —— 模块导入时跑一次,配置写坏了在启动期炸。
+    """八档死线的算术约束 —— 模块导入时跑一次,配置写坏了在启动期炸。
 
     形态沿用 `assert_budget_consistent()`(G5 原文点名要求),但校验对象不同:
       · 那条管 create 内部三段是否加满 180;
       · 这条管**每个操作的死线不得小于它单次最坏执行** —— 唯一一条防往小调的约束。
         「超出的后果不是变慢,是孤儿 VM」(#562 §2.2 原话)。
 
-    最坏执行未落地(None)的六个操作**跳过**下界校验,并且**不静默** —— G8 的校验器会把
+    最坏执行未落地(None)的操作**跳过**下界校验,并且**不静默** —— G8 的校验器会把
     它们列成显式的未覆盖项。这里不填猜测值的理由见 `_WORST_EXEC_SEC`。
     """
     for action in DEADLINE_ACTIONS:
@@ -431,7 +671,7 @@ def deadline_at(accepted_epoch: int) -> int:
     return deadline_at_for(ACTION_CREATE, accepted_epoch)
 
 
-# ── #565 G3 —— 另外五个根因类型,把词汇表补齐到覆盖七个操作 ────────────────────
+# ── #565 G3 —— 另外五个根因类型,把词汇表补齐到覆盖八个操作 ────────────────────
 #
 # **上面 create 那三个一个字节没动。** 它们已经作为 `create_fail_reason` 的封闭取值发布过
 # (`create-3min-deadline-contract.md` §1.2),而 `create` 的子集恰好就是 {那三个} —— 所以这里
@@ -463,7 +703,8 @@ REASON_HOST_UNREACHABLE = "host_unreachable"
 """host 侧状态探测不到,或 SSM 超时/节流/脚本非零退出。
 
 出口:delete `:2812/:2872/:2907/:3527`、suspend `:4033/:4082`、restore `:4373`、
-restart `:6098`。**值得重试**,隔 1–2 分钟 —— 但连续出现说明那台 host 有问题,该报障。
+restart `:6098`、start 的 502。**值得重试**,隔 1–2 分钟 —— 但连续出现说明那台 host
+有问题,该报障。
 
 它覆盖两种表象不同、对客户动作相同的情形:①"探测不到 host 侧真实状态"(所以 fail-closed
 拒绝继续,如 force-delete 的三个 502);②"命令下发了但没拿到成功回执"。刻意不细分:
@@ -503,7 +744,7 @@ REASON_CAPACITY_RELEASE_PENDING = "capacity_release_pending"
 所以它不是"系统坏了",而是"删除生效了、账本还差最后一步,再推一次就收敛"。连续出现才是
 账本缺陷,那时报障。"""
 
-# 七个操作的封闭子集。**客户据此收窄分支** —— 一个操作只会返回它子集内的值。
+# 八个操作的封闭子集。**客户据此收窄分支** —— 一个操作只会返回它子集内的值。
 #
 # 为什么是「共享词汇表 + 每操作子集」而不是「每操作各定一套」:同一个根因(备份失败)在
 # suspend/delete/rebuild 三处如果叫三个名字,客户就要写三套 if/else,而它们该做的动作完全相同。
@@ -535,6 +776,12 @@ REASONS_FOR = {
         REASON_DEADLINE_EXCEEDED,
         REASON_SYSTEM,
     ),
+    ACTION_START: (
+        REASON_HOST_UNREACHABLE,   # start 分支的 502 出口
+        REASON_PREEMPTED,          # rc==75 的 flock-skip(#604)
+        REASON_DEADLINE_EXCEEDED,  # 到点被 #564 兜底判死
+        REASON_SYSTEM,
+    ),
     ACTION_REBUILD: (
         REASON_BACKUP_FAILED,
         REASON_HOST_UNREACHABLE,
@@ -560,7 +807,7 @@ REASONS_FOR = {
 }
 """`REASONS_FOR[action]` = 该操作**可能**落库的失败原因,封闭。
 
-`ACTION_CREATE` 那一档就是已发布的 `ALL_REASONS`,列在这里是为了让「七档」完整可枚举
+`ACTION_CREATE` 那一档就是已发布的 `ALL_REASONS`,列在这里是为了让「八档」完整可枚举
 (校验器与测试要遍历它),**不代表 create 侧有任何行为变化**。
 
 `ACTION_RESTORE` 含 `capacity_unavailable`:`_restore_reserve_slot` 有五个容量类 503
@@ -599,7 +846,7 @@ ALL_FAIL_REASONS = (
 
 
 def _assert_vocabulary_consistent() -> None:
-    """全集与七档子集的并集必须**严格相等** —— 两个独立声明互为对账。
+    """全集与八档子集的并集必须**严格相等** —— 两个独立声明互为对账。
 
     少了(子集里有全集外的词)= 契约漏了一个值,它会漏到客户那里而没有文档;
     多了(全集里有没人产出的词)= 客户白写一条永远走不到的重试分支。两个方向都当错。
@@ -808,4 +1055,5 @@ def assert_budget_consistent() -> None:
 
 
 assert_budget_consistent()
-assert_deadline_config_sane()  # #564 G5 —— 七档死线的下界约束,同款导入期 fail-closed
+assert_deadline_config_sane()  # #564 G5 —— 八档死线的下界约束,同款导入期 fail-closed
+assert_all_budgets_consistent()  # #565 G1 —— 八档的三段预算之和必须恰好等于各自死线

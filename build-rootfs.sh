@@ -181,6 +181,8 @@ sudo mount --bind /dev ${ROOTFS_DIR}/dev
 
 # Copy openclaw config template into chroot
 sudo cp "$OC_TEMPLATE" ${ROOTFS_DIR}/tmp/openclaw.json
+sudo cp "${SCRIPT_DIR}/scripts/lib/patch-openclaw-transcript-durability.mjs" \
+  "${ROOTFS_DIR}/tmp/patch-openclaw-transcript-durability.mjs"
 
 # --- Golden image content: stage the chosen sample into the chroot ---
 # ClawPool ships sample agent images under samples/<name>/. Pick one with the
@@ -802,6 +804,8 @@ echo "✓ node ${_node_ver} ≥ ${OPENCLAW_NODE_MIN}(openclaw@${OPENCLAW_PIN} �
 unset _node_ver
 echo "[7/8] OpenClaw CLI (npm install -g openclaw@${OPENCLAW_PIN} — peak ~1GB RAM)"
 npm install -g "openclaw@${OPENCLAW_PIN}"
+node /tmp/patch-openclaw-transcript-durability.mjs "$(npm root -g)/openclaw"
+rm -f /tmp/patch-openclaw-transcript-durability.mjs
 chown -R agent:agent /usr/lib/node_modules
 
 echo "[8/8] OpenClaw onboard (bootstrap files)"

@@ -107,3 +107,91 @@ describe("balancer R6.3 edge failover", function()
         assert.are.equal("10.0.9.9", last.host)
     end)
 end)
+
+describe("balancer failover no-cross-tenant isolation", function()
+    local redis_client = require "edge.lib.redis_client"
+
+    local function contains(values, expected)
+        for _, value in ipairs(values) do
+            if value == expected then return true end
+        end
+        return false
+    end
+
+    before_each(function()
+        helper.reset_ngx()
+        backend.init_worker()
+        redis_client._set_redis_module(helper.new_fake_redis_module())
+        backend._set_lock_module(helper.new_fake_lock_module())
+    end)
+
+    it("retry reads primary and never adopts a stale reader route from a victim slot", function()
+        ngx.var.edge_redis_host = "primary.redis.local"
+        ngx.var.edge_redis_port = "6379"
+        ngx.var.edge_redis_reader_host = "reader.redis.local"
+        ngx.var.edge_redis_reader_port = "6379"
+        ngx.ctx.tenant_id = "t-migrating"
+        -- reader 上的旧坐标代表已回收并重分配给另一租户的在役槽位(victim slot)。
+        local victim_desc = {
+            host = "10.0.9.9", port = 10042, guest_ip = "172.16.0.6",
+        }
+        ngx.ctx.route_desc = victim_desc
+        ngx._fake_redis = {
+            mode = "hit",
+            by_host = {
+                ["reader.redis.local"] =
+                    '{"host":"10.0.9.9","port":10042,"guest_ip":"172.16.0.6"}',
+                ["primary.redis.local"] =
+                    '{"host":"10.0.7.7","port":11001,"guest_ip":"172.16.9.10"}',
+            },
+        }
+        -- 读副本可能因复制延迟拿到旧路由；旧 host:port 若已分配给别的租户，
+        -- 重投就会进入其 microVM，形成跨租户误路由。
+        package.loaded["ngx.balancer"]._last_failure = {
+            state = "failed", code = 502,
+        }
+
+        balancer.balancer_pick()
+
+        local last = package.loaded["ngx.balancer"]._last_peer
+        assert.are.equal("10.0.7.7", last.host)
+        assert.are.equal(11001, last.port)
+        assert.are_not.equal(victim_desc.host, last.host)
+        local connects = helper.fake_redis_connects()
+        assert.is_true(contains(connects, "primary.redis.local"))
+        assert.is_false(contains(connects, "reader.redis.local"))
+    end)
+
+    it("retry touches only primary when the configured reader has a clean miss", function()
+        ngx.var.edge_redis_host = "primary.redis.local"
+        ngx.var.edge_redis_port = "6379"
+        ngx.var.edge_redis_reader_host = "reader.redis.local"
+        ngx.var.edge_redis_reader_port = "6379"
+        ngx.ctx.tenant_id = "t-reader-miss"
+        ngx.ctx.route_desc = {
+            host = "10.0.9.9", port = 10042, guest_ip = "172.16.0.6",
+        }
+        ngx._fake_redis = {
+            mode = "hit",
+            by_host = {
+                ["reader.redis.local"] = ngx.null,
+                ["primary.redis.local"] =
+                    '{"host":"10.0.7.7","port":11001,"guest_ip":"172.16.9.10"}',
+            },
+        }
+        -- 即使 reader 恰好 clean miss，也不能先读副本：复制延迟可能让旧路由
+        -- 指向已回收并重分配给别的租户的 host:port，导致跨租户误路由。
+        package.loaded["ngx.balancer"]._last_failure = {
+            state = "failed", code = 502,
+        }
+
+        balancer.balancer_pick()
+
+        local last = package.loaded["ngx.balancer"]._last_peer
+        assert.are.equal("10.0.7.7", last.host)
+        assert.are.equal(11001, last.port)
+        local connects = helper.fake_redis_connects()
+        assert.is_true(contains(connects, "primary.redis.local"))
+        assert.is_false(contains(connects, "reader.redis.local"))
+    end)
+end)

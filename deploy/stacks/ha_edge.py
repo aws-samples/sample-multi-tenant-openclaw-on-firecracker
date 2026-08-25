@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT-0
 
 import hashlib
+import ipaddress
 import json
 import re
 import shlex
@@ -26,6 +27,7 @@ from aws_cdk import (
     custom_resources as cr,
     Duration,
     Fn,
+    ResolutionTypeHint,
     Token,
 )
 from pathlib import Path
@@ -537,6 +539,57 @@ def build_ha_edge(self, ctx):
         "{{EGRESS_DENY_RFC1918}}",
         str(sec_cfg.get("egress_deny_rfc1918", False)).lower(),
     )
+    # #575 Fix A — LiteLLM ALB/NLB 子网 CIDR+派生端口洞。synth 期与 host 侧双重
+    # fail-closed:只收 IPv4,拒全网/IMDS/tenant 超网重叠/过宽前缀,防错误配置烤进整批 host。
+    #
+    # 与 deploy/userdata/oc-egress-sim.py::_ABSOLUTE_MIN_PREFIX 同值。两份独立复制,
+    # 靠 tests/test_594_... 的同源断言绑住(三份 IMDS 常量已有过各自漂移的先例)。
+    _EGRESS_ALLOW_MIN_PREFIX = 24
+    _egress_llm_cidr = str(sec_cfg.get("egress_llm_cidr", "") or "").strip()
+    _tenant_supernet = ipaddress.ip_network(
+        f"{CFG['vm']['subnet_prefix']}.0.0/16", strict=False
+    )
+    _normalized_llm_cidrs = []
+    for _raw_llm_cidr in [
+        value.strip() for value in _egress_llm_cidr.split(",") if value.strip()
+    ]:
+        try:
+            _llm_network = ipaddress.ip_network(_raw_llm_cidr, strict=False)
+        except ValueError as error:
+            raise ValueError(
+                f"security.egress_llm_cidr 含非法 CIDR {_raw_llm_cidr!r}:"
+                "只允许逗号分隔的 IPv4 CIDR(#575)"
+            ) from error
+        if _llm_network.version != 4:
+            raise ValueError(
+                f"security.egress_llm_cidr 含 IPv6 {_raw_llm_cidr!r}:"
+                "OPENCLAW-EGRESS 是 IPv4-only(#575)"
+            )
+        if _llm_network == ipaddress.ip_network("0.0.0.0/0"):
+            raise ValueError("security.egress_llm_cidr 不允许 0.0.0.0/0(#575)")
+        if ipaddress.ip_address("169.254.169.254") in _llm_network:
+            raise ValueError(
+                f"security.egress_llm_cidr {_llm_network} 包含 IMDS 169.254.169.254(#575)"
+            )
+        if _llm_network.overlaps(_tenant_supernet):
+            raise ValueError(
+                f"security.egress_llm_cidr {_llm_network} 与 tenant 超网 "
+                f"{_tenant_supernet} 重叠(#575)"
+            )
+        # 前缀下限,与 oc-egress-sim.py 的 _ABSOLUTE_MIN_PREFIX 同值(那边是 host 侧最终
+        # 裁决者,这里是 synth 期早失败)。缺这条时把它配成整个 VPC 的 /16 且端口 80,会让
+        # 行位断言、语义探针、scratch 回读、真机红线探针【全部通过】,而整个 VPC 的 :80
+        # 对所有 guest 敞开。多 AZ 的 ALB 子网各配一条 /24 即可,不需要 /16。
+        if _llm_network.prefixlen < _EGRESS_ALLOW_MIN_PREFIX:
+            raise ValueError(
+                f"security.egress_llm_cidr {_llm_network} 比允许的最小前缀 "
+                f"/{_EGRESS_ALLOW_MIN_PREFIX} 更宽(#575):放行洞越宽,内网该端口对每个 "
+                "guest 敞开的面越大,且下游没有任何门会把它收窄回来"
+            )
+        _normalized_llm_cidrs.append(str(_llm_network))
+    init_sh = init_sh.replace(
+        "{{EGRESS_LLM_CIDR}}", ",".join(_normalized_llm_cidrs)
+    )
     # #517 阶段3(G1 fail-closed)—— 只读身份盘缺失时是否拒绝启动。默认 false=既有兼容行为
     # (launch-vm.sh WARN 后照常起,回落 data 盘烤制当天的旧 md 副本);true 时盘缺失 exit 1。
     init_sh = init_sh.replace(
@@ -555,9 +608,18 @@ def build_ha_edge(self, ctx):
     _net_cfg_for_cidr = CFG.get("network", {}) or {}
     _net_mode_for_cidr = _net_cfg_for_cidr.get("mode", "default_vpc")
     if _net_mode_for_cidr == "self_managed":
-        _egress_vpc_cidr = (_net_cfg_for_cidr.get("self_managed") or {}).get(
-            "cidr"
-        ) or "10.20.0.0/20"
+        # fail-closed:缺 cidr 时绝不静默取一个默认网段。这个值会渲染进
+        # {{EGRESS_VPC_CIDR}} → 成为 guest 出网链里内网 REJECT 规则的作用域,
+        # 取错网段就等于 default-deny 对真实 VPC 失效,而链装上了、逐机指纹一致、
+        # IMDS 仍不可达(那是独立的 link-local DROP)→ 每一道静态门都是绿的。
+        # 与下面 imported 分支的 ["cidr"] 同语义,只是给出可读的失败原因。
+        _egress_vpc_cidr = (_net_cfg_for_cidr.get("self_managed") or {}).get("cidr")
+        if not _egress_vpc_cidr:
+            raise ValueError(
+                "network.self_managed.cidr is required: it becomes the guest egress "
+                "chain's intra-VPC REJECT scope, and a defaulted value silently "
+                "disables default-deny while every static gate stays green"
+            )
     elif _net_mode_for_cidr == "imported":
         _egress_vpc_cidr = (_net_cfg_for_cidr.get("imported") or {})["cidr"]
     else:
@@ -1472,6 +1534,8 @@ def build_ha_edge(self, ctx):
     _redis_cfg = CFG.get("redis", {}) or {}
     _edge_cfg = CFG.get("edge", {}) or {}
     redis_endpoint: str | None = None
+    _redis_reader_endpoint_param = None
+    _redis_replica_cluster_ids = []
     if _redis_cfg.get("enabled", False):
         # ── ElastiCache Multi-AZ Redis(§8)──
         # cluster mode disabled 单 shard:1 primary + N replica 跨 3 AZ;
@@ -1607,6 +1671,26 @@ def build_ha_edge(self, ctx):
             f"{_redis_rg.attr_primary_end_point_address}:"
             f"{_redis_rg.attr_primary_end_point_port}"
         )
+        if _replicas > 0:
+            # ReplicationLag 只按 CacheClusterId 出数。CFN 返回每个只读副本
+            # endpoint，这里取 DNS 首段得到对应 cluster id，交给 alarms.py
+            # 逐节点建告警；不能用 ReplicationGroupId 维度替代。
+            _redis_read_endpoints = Token.as_list(
+                _redis_rg.get_att(
+                    "ReadEndPoint.AddressesList",
+                    type_hint=ResolutionTypeHint.STRING_LIST,
+                )
+            )
+            _redis_replica_cluster_ids = [
+                Fn.select(
+                    0,
+                    Fn.split(
+                        ".",
+                        Fn.select(_index, _redis_read_endpoints),
+                    ),
+                )
+                for _index in range(_replicas)
+            ]
         # host_asg 环境变量(占位符 replace 已过,只能走 SSM Parameter Store 让
         # init-host 从 SSM 读)。存量 init-host.sh 尚未读它,是 P3 阶段的对接;
         # 这里先把 endpoint 写 SSM,与 host-agent.py 读取端(ENGINE_REDIS_ENDPOINT
@@ -1617,6 +1701,28 @@ def build_ha_edge(self, ctx):
             parameter_name="/openclaw/engine/redis/primary-endpoint",
             string_value=redis_endpoint,
             description="ElastiCache primary endpoint (read by host-agent and edge ASG)",
+        )
+        _edge_read_replica = bool(
+            _redis_cfg.get("edge_read_from_replica", False)
+        )
+        if _edge_read_replica and _replicas > 0:
+            redis_reader_endpoint = (
+                f"{_redis_rg.attr_reader_end_point_address}:"
+                f"{_redis_rg.attr_reader_end_point_port}"
+            )
+        else:
+            redis_reader_endpoint = redis_endpoint
+        # 单独下发 edge reader 参数:现有 primary-endpoint 同时喂 edge 与 host,
+        # host 必须继续写 primary,不能为切 edge 读路径而改它的值。
+        _redis_reader_endpoint_param = ssm.StringParameter(
+            self,
+            "RedisReaderEndpointParam",
+            parameter_name="/openclaw/engine/redis/reader-endpoint",
+            string_value=redis_reader_endpoint,
+            description=(
+                "Endpoint for edge hot-path reads; equals primary when "
+                "replica reads are disabled or no replicas exist"
+            ),
         )
 
     if _edge_cfg.get("enabled", False):
@@ -1829,6 +1935,9 @@ def build_ha_edge(self, ctx):
             role=_edge_role,  # S3 拉 edge 资产 + SSM 运维通道
             associate_public_ip_address=False,  # 私有子网 + NAT 出网
         )
+        # install-edge.sh 启动时立即读 reader SSM 参数；若 LT/ASG 抢先创建，
+        # 首批实例会遇到 ParameterNotFound 并静默回落 primary，之后不会自愈。
+        _edge_lt.node.add_dependency(_redis_reader_endpoint_param)
         # 照抄 host LT 的做法(上方 _host_tags 段):CDK LaunchTemplate 默认只给
         # 实例打 Name,不打 Project/Role → prometheus.yml 的 openclaw-edge-nginx
         # ec2_sd job 发现 0 target。必须打在 LaunchTemplateData.TagSpecifications
@@ -2207,4 +2316,5 @@ def build_ha_edge(self, ctx):
     ctx.launch_template = locals().get("launch_template")
     ctx.listener = locals().get("listener")
     ctx.m = locals().get("m")
+    ctx.redis_replica_cluster_ids = _redis_replica_cluster_ids
     ctx.sg = locals().get("sg")

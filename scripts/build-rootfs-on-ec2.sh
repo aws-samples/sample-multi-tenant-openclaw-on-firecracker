@@ -216,10 +216,11 @@ cat > .env.deploy <<ENVEOF
 REGION=${REGION}
 PROFILE=
 ASSETS_BUCKET=${BUCKET}
+SKIP_MANIFEST=${SKIP_MANIFEST:-0}
 ENVEOF
 
 chmod +x build-rootfs.sh
-ARCH=${ARCH} ./build-rootfs.sh ${VERSION}
+SKIP_MANIFEST=${SKIP_MANIFEST:-0} ARCH=${ARCH} ./build-rootfs.sh ${VERSION}
 
 echo "=== runner.sh end (\$(date -Iseconds)) ==="
 EOF

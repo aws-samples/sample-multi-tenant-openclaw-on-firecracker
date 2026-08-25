@@ -134,7 +134,10 @@ CloudWatch Agent tails journald for the `claw-edge` unit — grep `WARN` or
 - Some tenants 404, others 200: three-tier cache inconsistency. SSH the
   edge and `curl 127.0.0.1:8080/healthz`; grep the `route.lua` log for the
   tenant id; check Redis directly with
-  `redis-cli -h <primary-endpoint> get route:<tid>`.
+  `redis-cli -h <primary-endpoint> get route:<tid>`. When
+  `redis.edge_read_from_replica` is enabled, also query the reader endpoint
+  to reproduce the edge view, then query the primary for the authoritative
+  value; a mismatch is itself a replication-lag signal.
 - Burst of 503: usually a Redis brownout — `route.lua` entered fail-static.
   Check the ElastiCache event log for a failover.
 
@@ -266,7 +269,9 @@ host-agent double-write). App-side: edge log matches on
   resolution (`dig +short <primary-endpoint>` — see whether the AZ moved).
 - Single tenant 404: host-agent didn't write to Redis. SSH the host,
   grep the host-agent log for that tenant id, and check the key with
-  `redis-cli`.
+  `redis-cli`. When `redis.edge_read_from_replica` is enabled, query the
+  reader endpoint to reproduce the edge view and the primary endpoint for
+  the authoritative value; a mismatch is itself a replication-lag signal.
 
 ---
 

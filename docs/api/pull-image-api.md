@@ -114,6 +114,11 @@ GET /hosts/{instance_id}/pull-image-progress?job_id=<job_id>
 
 进度文件 `/tmp/<job_id>.txt` 仅是实时信号，不是唯一终态来源。文件丢失或 Job 终态写回失败时，reconciler 会对 live 使用 Host `status + snapshot_time`，对 canary 使用已结束的 lease + host-agent 新鲜同步的 `slots.json` mirror。成功收敛后 `ProcessingJobStatus` 与 `state/phase/result/error` 来自同一终态；终态无法持久化时返回 `503 JOB_RECORD_UNAVAILABLE`，不会返回字段互相矛盾的 `200`。
 
+worker 在 slots rename 落盘后发现 lease 已被接管时，Job 进入
+`RECOVERY_REQUIRED`，`error.code=POST_COMMIT_FENCED`。`error.reason` 与 SSM detail
+说明本地旧指针是否恢复成功；无论本地恢复结果如何，都由当前 lease owner 权威覆盖收敛。
+兼容字段 `ProcessingJobStatus` 仍返回 `Failed`，旧客户端无需识别新 Job state 或错误码。
+
 ### 2.6 同步槽位操作
 
 promote 和 reclaim-images 在确认 Host 更新成功后返回 `200 OK`，不需要轮询 progress。
@@ -835,3 +840,9 @@ GET /list_image_versions，选出要回到的老 snapshot_time
 | 500 | `SLOTS_CORRUPT` | Host 的 slots.json 无法解析(fail-loud,不按空处理);需人工介入修复该 Host |
 | 503 | `DEPENDENCY_UNAVAILABLE` | 按退避策略重试并告警 |
 | 503 | `OPERATION_STATUS_UNKNOWN` | 使用相同 Idempotency-Key 重试同步操作 |
+
+### 11.1 Job 级错误码
+
+`POST_COMMIT_FENCED` 是 **Job 级错误码（不是 HTTP 状态码）**，出现在异步 pull-image Job
+的 `error.code` 中。兼容字段 `ProcessingJobStatus` 对它仍返回 `Failed`，旧客户端无需识别
+该错误码。当前 image-lease owner 必须权威覆盖收敛；本地恢复结果见 Job reason / SSM detail。

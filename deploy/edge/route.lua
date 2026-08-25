@@ -5,7 +5,7 @@
 -- Each phase is a thin dispatcher — logic lives in edge.lib.*.
 --
 -- Data contract with host-agent + iac-dev:
---   internal-docs/00-knowledge-base/the data-plane design/the data-plane interface contract
+--   engineering/00-knowledge-base/SPEC/11-ENGINE-TRANSFORM/INTERFACE-CONTRACT.md
 --
 -- Do not add business logic here. Keep this file the "entry only, routes to
 -- domain" boundary per .claude/rules/code-craft-discipline.md.
@@ -19,40 +19,74 @@ local _M = { _VERSION = "0.02" }
 
 -- Warmup gate: /healthz reads this and returns 503 until the async probe
 -- below succeeds. Prevents ASG rotating traffic into a cold instance
--- whose Redis connection has not yet been proven (the data-plane contract).
+-- whose Redis connection has not yet been proven (INTERFACE-CONTRACT §6).
 local function mark_ready()
     local flag = ngx.shared.edge_ready
     if flag then flag:set("ready", 1) end
+end
+
+local function probe_primary_if_distinct(hot_host, hot_port)
+    local host = os.getenv("ENGINE_REDIS_HOST_HINT")
+    local port_str = os.getenv("ENGINE_REDIS_PORT_HINT")
+    if not host or host == "" then
+        ngx.log(ngx.ERR, "edge warmup: ENGINE_REDIS_HOST_HINT/",
+            "ENGINE_REDIS_PORT_HINT unavailable; primary probe skipped; ",
+            "failover retry will fail")
+        return
+    end
+    local port = tonumber(port_str) or 6379
+    if host == hot_host and port == hot_port then return end
+    local _, err = redis_client.get_route(host, port, "route:__warmup__")
+    if err then
+        ngx.log(ngx.ERR, "edge warmup primary probe via ENGINE_REDIS_HOST_HINT/",
+            "ENGINE_REDIS_PORT_HINT failed: ", tostring(err),
+            "; failover retry will fail")
+    end
 end
 
 -- warmup_probe: run once (on worker 0) to verify Redis reachability.
 -- We deliberately keep this cheap — a single successful GET against a
 -- known-empty key confirms TCP + Redis protocol + endpoint DNS resolves.
 -- Any failure keeps the box out of ELB rotation; a later probe retries.
+-- #618：这里的 failure 只指热路径 endpoint；primary 探测失败仅报错，
+-- 不撤销 reader 已经建立的 readiness。
 local function warmup_probe()
-    local host = os.getenv("ENGINE_REDIS_HOST_HINT")
-    -- Read the same variables nginx.conf sets on the server block. We do
-    -- this via ngx.var when a request runs; at init_worker phase we have
-    -- to fall back to the env var install-edge.sh exports.
-    local port_str = os.getenv("ENGINE_REDIS_PORT_HINT")
+    local reader_host = os.getenv("ENGINE_REDIS_READER_HOST_HINT")
+    local reader_port_str = os.getenv("ENGINE_REDIS_READER_PORT_HINT")
+    local host = reader_host
+    local port_str = reader_port_str
+    local hint_names =
+        "ENGINE_REDIS_READER_HOST_HINT/ENGINE_REDIS_READER_PORT_HINT"
+    -- init_worker 阶段拿不到 ngx.var,优先读 reader hint;旧 unit 或 reader
+    -- hint 缺失时回落 primary hint,保持滚动升级兼容。
+    if not host or host == "" or not port_str or port_str == "" then
+        host = os.getenv("ENGINE_REDIS_HOST_HINT")
+        port_str = os.getenv("ENGINE_REDIS_PORT_HINT")
+        hint_names = "ENGINE_REDIS_HOST_HINT/ENGINE_REDIS_PORT_HINT"
+    end
     local port = tonumber(port_str) or 6379
     if not host or host == "" then
         -- Best-effort: without endpoint info we still must eventually flip
         -- ready so that /healthz doesn't stay 503 forever in tests or
         -- misconfigured deploys. Log loudly.
-        ngx.log(ngx.WARN, "edge warmup: no ENGINE_REDIS_HOST_HINT; ",
+        ngx.log(ngx.WARN, "edge warmup: ENGINE_REDIS_READER_HOST_HINT/",
+            "ENGINE_REDIS_READER_PORT_HINT and ENGINE_REDIS_HOST_HINT/",
+            "ENGINE_REDIS_PORT_HINT unavailable; ",
             "marking ready without probe (misconfig?)")
         mark_ready()
         return
     end
     local _, err = redis_client.get_route(host, port, "route:__warmup__")
     if err then
-        ngx.log(ngx.WARN, "edge warmup probe failed: ", tostring(err),
+        ngx.log(ngx.WARN, "edge warmup probe via ", hint_names,
+            " failed: ", tostring(err),
             "; will retry")
-        return
+    else
+        mark_ready()
+        ngx.log(ngx.NOTICE, "edge warmup ok; healthz now 200")
     end
-    mark_ready()
-    ngx.log(ngx.NOTICE, "edge warmup ok; healthz now 200")
+
+    probe_primary_if_distinct(host, port)
 end
 
 --[[
@@ -128,15 +162,23 @@ function _M.on_rewrite()
     local shared = get_shared()
     if not shared then return ngx.exit(503) end
 
-    local redis_host = ngx.var.edge_redis_host
-    local redis_port = tonumber(ngx.var.edge_redis_port) or 6379
+    local redis_host = ngx.var.edge_redis_reader_host
+    local redis_port_str = ngx.var.edge_redis_reader_port
+    if not redis_host or redis_host == ""
+        or not redis_port_str or redis_port_str == "" then
+        redis_host = ngx.var.edge_redis_host
+        redis_port_str = ngx.var.edge_redis_port
+    end
+    local redis_port = tonumber(redis_port_str) or 6379
     if not redis_host or redis_host == "" then
-        ngx.log(ngx.ERR, "edge_redis_host not set in nginx.conf")
+        ngx.log(ngx.ERR, "edge_redis_reader_host and fallback ",
+            "edge_redis_host are not set in nginx.conf")
         return ngx.exit(503)
     end
+    local authoritative = redis_host == ngx.var.edge_redis_host
 
     local desc, source, err_status = backend_mod.lookup_backend(
-        shared, tid, redis_host, redis_port)
+        shared, tid, redis_host, redis_port, authoritative)
     if err_status then
         return ngx.exit(err_status)
     end

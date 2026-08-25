@@ -6409,6 +6409,34 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
             {"error": f"tenant is {item['status']}; cannot {action}", "id": tenant_id},
         )
 
+    # #624 —— failed 是墓碑,requires_intervention 明确不会自行 reset;start/restart
+    # 在这两种状态上从受理时就注定失败。API 路径在入队前拒绝,consumer 路径则覆盖
+    # 「受理后、真正执行前状态恶化」的窗口并落 fail_reason。这里必须返 4xx:consumer
+    # 会 ack 4xx,只有 >=500 才留在 batchItemFailures;用 409 可避免注定失败的消息占住
+    # per-tenant FIFO 组头、继续阻塞客户唯一的 stop/delete/rebuild 出路。
+    if action in ("start", "restart") and item.get("status") in (
+        "failed",
+        "requires_intervention",
+    ):
+        _mark_fail_reason(
+            tenant_id, action, create_deadline.REASON_TENANT_NOT_STARTABLE
+        )
+        _status = item.get("status")
+        _guidance = (
+            "rebuild the tenant with a different client_token"
+            if _status == "failed"
+            else "stop the tenant first to return it to stopped, then start it"
+        )
+        return utils._resp(
+            409,
+            {
+                "error": f"tenant is {_status}; cannot {action}. To recover, {_guidance}.",
+                "code": "TENANT_NOT_STARTABLE",
+                "id": tenant_id,
+                "status": _status,
+            },
+        )
+
     # (start/stop/restart/pause/resume/reset/rebuild/migrate/resize/resize-disk)必须拒绝:
     # suspended 租户本地无 VM(已删)、host_id 可能指向已释放的旧 slot,对它 restart/pause 会
     # 走底部通用块无条件覆盖 status(留"无 VM 却 running"或抢占别人 slot 的活 VM=未记账孤儿)。

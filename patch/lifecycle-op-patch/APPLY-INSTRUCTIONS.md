@@ -12,19 +12,153 @@
 
 ## 先读四条会静默毁掉本次交付的事实
 
-**① 死线的运行时载体是 SSM 参数,改 Lambda 环境变量【完全不生效】。**
-流量走 `live` 别名 → 已发布 version,而已发布 version 的环境变量是冻结的。所以八档死线必须写到
-`/openclaw/lifecycle/deadline-sec/<action>` 这八个 SSM 参数上(进程内缓存 60 秒);
-`create-deadline-config.py --live` 比对的是 `$LATEST` 的环境变量,**它的绿不能证明死线生效**。
+**① 死线有【两个】载体,两个都必须落,漏掉 env 会让租户写路径全 5xx。**
+
+上一版这里写的是「改 Lambda 环境变量完全不生效」——**那句话是错的,照它执行会打断业务**。
+真实分工(源码为准):
+
+- **env `LIFECYCLE_DEADLINE_SEC_<ACTION>` 决定进程能不能活**。
+  `core/create_deadline.py` 的 `deadline_sec_for()` 只读 env:`raw = os.environ.get(_ENV_PREFIX
+  + key.upper())`;当 `raw is None` 且 `_require_env()` 为真(判据是 `AWS_LAMBDA_FUNCTION_NAME`
+  存在,即「跑在 Lambda 里」)就 **raise**,消息是「死线 env … 未注入而本进程跑在 Lambda 里 ——
+  fail-closed 拒绝用默认值继续」。该模块**零 boto3**,所以它**看不见 SSM 参数里的值**
+  (函数自己的注释写明了这一点)。**建完八个 SSM 参数并不能救它。**
+- **SSM 参数 `/openclaw/lifecycle/deadline-sec/<action>` 决定运行时生效值**,由
+  `core/deadline_config.py` 读(进程内缓存 60 秒)。
+
+所以顺序是:**先注入八个 env,再建八个 SSM 参数,然后才做 Lambda overlay**。CDK 平时两边一起
+建(`deploy/stacks/lambdas.py` 从 `config.yml` 的 `lifecycle.deadline_sec` 同源注入 env、并创建
+同名 SSM 参数;该段注释写明「缺段/缺项时两个载体都不建/不注入」)。客户的 `config.yml` 里没有
+`lifecycle.deadline_sec` 段时,在役 Lambda 上**一个 env 都没有** —— overlay 一落地就踩这个坑。
+
+**故障形态:冷启动就挂,每一条路由都 502 —— 不是「只有写路径炸」。** 真机捕获的是模块导入链,
+不是懒加载:`handler.py:14` import `tenant_query_service` → `tenant_service:43` import
+`core.create_deadline` → `create_deadline.py:1058` 在**模块作用域**跑 `assert_deadline_config_sane()`
+→ `:640` 调 `deadline_sec_for(action)` → `:593` `raise ValueError`。所以 handler 根本装不起来,
+实测 `GET /system/info` 与 `POST /tenants/{id}/rebuild` **同时 502**。源码里那句「懒加载,读路径仍 200」
+是**过时注释**,一手运行时输出优先。
+
+**受影响的是 5 个函数,不止 openclaw-api**(真机实测各 +8 个 env):`openclaw-api` 73→81、
+`openclaw-lifecycle-consumer` 68→76、`openclaw-backup` 7→15、`openclaw-health-check` 12→20、
+`openclaw-scaler` 15→23。其中 `openclaw-lifecycle-consumer` 与 `openclaw-api` 是**同一个包**
+(实测 CodeSha256 完全相同),必须一起注入、一起 overlay;而**只有 `openclaw-api` 有 `live` 别名**,
+另三个没有 —— 给无别名函数套别名流程会失败或只改一半。
+
+**决定性依据:这 8 个 env 本来就写在本 kit 自带的 CFN 闭包里。** `resources/cloudformation/` 两侧
+按函数逐 env 比对,`ApiHandler5E7490E8` 的八个 `LIFECYCLE_DEADLINE_SEC_*` 在 base 侧全 `null`、
+patch 侧全有值 —— 是 kit 把 CDK 变更改写成手工 CLI 时漏掉了这一项。
+
+注入命令(八档一次写完;`start` 与 `restart` 同 180 档,只列七个的清单是不完整的):
+
+```bash
+# 逐个动作按权威默认值拼 env(create/suspend/restore/restart/start/rebuild=180,backup/delete=600)
+ENVJSON=$(python3 - <<'PY'
+import json
+d={"create":180,"suspend":180,"restore":180,"restart":180,"start":180,"rebuild":180,
+   "backup":600,"delete":600}
+print(json.dumps({f"LIFECYCLE_DEADLINE_SEC_{k.upper()}":str(v) for k,v in d.items()}))
+PY
+)
+# 与现有 env 合并,绝不整体覆盖 —— update-function-configuration 的 Variables 是全量替换语义,
+# 直接传这八个会把在役的其余 env 全部删掉(那会让函数彻底起不来)。
+CUR=$(aws lambda get-function-configuration --function-name openclaw-api --region "$REGION"         --query 'Environment.Variables' --output json)
+echo "$CUR" > prev-api-env.json          # 回滚锚点:改之前的完整 env
+MERGED=$(python3 -c 'import json,sys;a=json.load(open("prev-api-env.json"));a.update(json.loads(sys.argv[1]));print(json.dumps({"Variables":a}))' "$ENVJSON")
+aws lambda update-function-configuration --function-name openclaw-api --region "$REGION" --environment "$MERGED"
+aws lambda wait function-updated --function-name openclaw-api --region "$REGION"
+# 断言八个都在【且值正确】—— 只查键存在是假绿(codex review 指出);逐键比对期望值,任一不符退 1
+aws lambda get-function-configuration --function-name openclaw-api --region "$REGION" --query 'Environment.Variables' --output json | python3 -c '
+import json,sys
+v=json.load(sys.stdin)
+want={"CREATE":"180","SUSPEND":"180","RESTORE":"180","RESTART":"180","START":"180","REBUILD":"180","BACKUP":"600","DELETE":"600"}
+bad=[f"LIFECYCLE_DEADLINE_SEC_{k}({v.get(\"LIFECYCLE_DEADLINE_SEC_\"+k)!r}!={val!r})" for k,val in want.items() if v.get("LIFECYCLE_DEADLINE_SEC_"+k)!=val]
+print("BAD:",bad); sys.exit(1 if bad else 0)'
+```
+
+> **回滚锚点要连别名一起存,不只 env。** `update-function-configuration` 的 `Variables` 是全量替换,
+> 上面已用 `prev-api-env.json` 存了改前的完整 env;但真正会被别名流量看到的是 Step 3 publish 出的
+> 那个 version。Step 3 的 overlay 操作用 `RevisionId` CAS 绑定 publish 与别名翻转(见该步 `apply_cli`),
+> 回滚必须同时还原 `$LATEST` 与 `live` 别名指向 —— 只还 env 不还别名,别名流量仍停在坏 version 上。
+> **权威的「env 真的进了在役 version」判据不是查 `$LATEST`,而是 Step 3 翻转别名前对新 published
+> version 直接 `invoke` 一次,断言 `FunctionError` 为空、响应里的八档值正确**(见 Step 3 verify)。
+
+**env 改的是 `$LATEST`,而流量走 `live` 别名 → 已发布 version(其 env 是冻结的)。** 所以注入
+env 之后**必须重新发版并翻转别名**,新 version 才带上这八个 env —— 这正好与第 3 步的 overlay
+发版是同一次动作,把 env 注入放在 overlay **之前**就能一次发版同时带上代码和 env。顺序颠倒
+(先 overlay 发版、后注入 env)会让新 version 缺 env,租户写路径立刻开始 5xx。
+
+`create-deadline-config.py --live` 比对的是 `$LATEST` 的环境变量,**它的绿既不能证明死线生效
+(生效值在 SSM),也不能证明在役 version 带了 env(在役是别名指向的那个 version)**。
 八个动作是 `create` / `suspend` / `restore` / `restart` / `start` / `rebuild`(各 180 秒)与
 `backup` / `delete`(各 600 秒)。**`start` 容易被漏** —— 它与 `restart` 同档(同一条通道、同为不含
 数据步骤的动作),只列七个的清单是不完整的。
 
-**②b `POST /hosts/egress` 目前会被上游的 RBAC 前置门挡成 403。**
-`core/auth.py` 的 `_RBAC_SKIP` 里没有这条路由,而 api-key 路径的 role 会被解析成 `viewer`,在门口
-就被 `viewer < operator` 挡掉 —— 该文件同一处注释记着 `/hosts/{instance_id}/taint` 踩过一模一样的坑
-且真机复现过。`core/auth.py` 在本次区间**没有变更**,所以修不进本 kit,属上游缺口。验证时若拿到 403,
-先按这条排查,不要当成 patch 没打对。
+**①c `backup-data.sh` 必须装成 0755,照 manifest 的 `install -m 0644` 会让这台 host 完全没有备份。**
+本 kit 内部有一处自相矛盾:manifest 的 `apply_cli` 是 `install -m 0644`(忠实沿用源码 git mode),
+但同 kit 下发的 `host-agent.py` 在 `:2552` 有 `os.access(_BACKUP_SCRIPT, os.X_OK)` 检查,**要求执行位**
+—— 两者必然冲突。真机后果(每分钟一条持续 8 分钟):`backup: REFUSING to run … NO local backups are
+happening on this host`,并把所有 `suspend` 打成 `suspend_fail_reason: "backup_failed"`。
+
+**这条错误消息是误导的**:它说「does not contain all required sentinels」,但三个哨兵
+(`oc_flush_guest`/`OC_BACKUP_SOURCE_ABSENT`/`_RUN_ID`)在 host 上那份文件里全部存在,文件摘要也正
+等于 manifest 的 `patch_sha256`(Step 3 的 `sha256sum -c -` 断言 17/17 过)。所以「脚本旧了」的结论
+是错的,照消息去重推没用 —— 重推出来还是 0644。真正的变量只有权限位:
+
+```
+before: -rw-r--r--  os.access(X_OK)=False  → NO local backups are happening on this host
+chmod 0755 → after: -rwxr-xr-x  os.access(X_OK)=True  → backup: 2/2 tenant(s) backed up
+```
+
+**所以施加 `backup-data.sh` 用 0755,不要用 manifest 里那条 0644**(HOST_IDS 取法见 Step 0b):
+
+```bash
+for h in $HOST_IDS; do
+  aws ssm send-command --region "$REGION" --instance-ids "$h" \
+    --document-name AWS-RunShellScript \
+    --parameters commands='["chmod 0755 /home/ubuntu/backup-data.sh","ls -l /home/ubuntu/backup-data.sh"]' \
+    --query Command.CommandId --output text
+done
+# 验证:逐 host 读 ResponseCode=0,并在下一个备份轮次(~60s)后确认 journal 里不再有 REFUSING
+```
+
+这是**绕过不是修复** —— 换机或重跑 patch 会回到 0644 再踩。durable 修法要落进 patch 本身(把
+`install -m` 改 0755 并同步源码 git mode,或把 host-agent 的检查从 `os.access(X_OK)` 改成「可读即可」,
+因为它自己调用时用的是 `sh`/`bash` 前缀)。命中时 `GET /hosts`、`status` 全正常,只有 host 侧 journal
+与 `openclaw_backup_script_stale` 指标能看出来。
+
+**①b 这个 fail-closed 的报错会把自己藏起来,不要按 502 的字面去查。**
+真机捕获到:`awslambdaric` 回传 init error 时按 latin-1 编码 HTTP body,中文 `raise` 消息触发
+`UnicodeEncodeError: 'latin-1' codec can't encode characters … Body ('死线') is not valid Latin-1`,
+真因被掩盖成 `Runtime.ExitError` / HTTP 502 —— 日志里看不到「死线 env 未注入」这句话。**所以判据
+不是读 502 的错误文本,而是直接查在役 version 上八个 env 的值**(逐值比,不是数个数 —— `grep -c`
+无论多少都退 0,是假绿):
+
+```bash
+# 在役 version(别名指向的那个)上查,不是查 $LATEST
+LIVEV=$(aws lambda get-alias --function-name openclaw-api --name live --region "$REGION" --query FunctionVersion --output text)
+aws lambda get-function-configuration --function-name "openclaw-api:$LIVEV" --region "$REGION" --query 'Environment.Variables' --output json | python3 -c '
+import json,sys
+v=json.load(sys.stdin)
+want={"CREATE":"180","SUSPEND":"180","RESTORE":"180","RESTART":"180","START":"180","REBUILD":"180","BACKUP":"600","DELETE":"600"}
+bad=[k for k,val in want.items() if v.get("LIFECYCLE_DEADLINE_SEC_"+k)!=val]
+print("missing/wrong:",bad); sys.exit(1 if bad else 0)'
+```
+
+拿到 `Runtime.ExitError` / 502 且这条计数不是 8,就是本条,不是别的故障。
+
+**②b `POST /hosts/egress` 的 403 预警是错的,真机实测返 202;真问题是反过来的 —— 那个 202
+证明不了 RBAC 通过。**
+
+上一版这里写「api-key 路径的 role 会被解析成 `viewer`,门口就被挡成 403」。**这句说反了。**
+api-key **本身不携带角色**:无 Bearer 时角色取自 `default_no_jwt_role`,有 Bearer 时取自
+`cognito:groups`。所以在 `default_no_jwt_role: operator` 的环境里,**任何** api-key 都已经是
+operator,`POST /hosts/egress` 实测返 **202**。
+
+反过来这带出一个真问题:既然不带 token 也能过门,那 **202 就不构成「RBAC 验证过了」的判据**。
+kit 自己的 `lib/discover-env.sh` 会把 `role_identity` 报成 `BLOCKED`,正是这个意思。所以
+`verify-egress-fleet` 在这种环境**仍记 `MANUAL_CLI_REVIEW`,但理由是「门太松,202 不构成判据」,
+不是「被 403 挡住测不了」**。要真验 RBAC,得在 `default_no_jwt_role` 不是 operator 的环境里、
+用一个明确低于 operator 的身份打同一条路由,看它是否被拒。
 
 **② 八档里只有 `create` 有权威的最坏执行值(128 秒)。**
 `suspend/restore/restart/start/rebuild/backup/delete` 这七个目前**没有下界守护**。往小调可能小于该
@@ -112,6 +246,88 @@ sys.exit(1 if bad else 0)
 PY
 ```
 
+### Step 0b — `$HOST_IDS` 的取法(manifest 的命令里用了 27 次,此前哪儿都没给)
+
+**不要裸 `dynamodb scan openclaw-hosts` 取 id。** 这张表里除了真实 host 行,还存着几行
+**singleton 伪行**作为机队级期望态:`__fleet_egress_policy__`、`__route_reclaim_state__`、
+以及 `__egress_rev__` 前缀的多条修订行(`services/egress_admin_service.py:603`
+`_REV_PREFIX = "__egress_rev__"`)。裸 scan 会把这些伪行当成 instance-id 喂给
+`ssm send-command`,那一整条命令会失败,或者更糟 —— 部分成功后你以为全机队都下发了。
+
+按 tag 取,不从表里取(机队枚举的权威是 tag,不是 ASG 也不是这张表):
+
+```bash
+HOST_IDS=$(aws ec2 describe-instances --region "$REGION" \
+  --filters "Name=tag:Role,Values=metal-host" "Name=instance-state-name,Values=running" \
+  --query 'Reservations[].Instances[].InstanceId' --output text)
+echo "HOST_IDS=$HOST_IDS"
+test -n "$HOST_IDS" || { echo "no running metal host found — stop, do not proceed" >&2; exit 1; }
+# 与账本对账:排掉 __ 前缀伪行【也排掉非在役状态行】(仅比 status/state=active 的),
+# 否则历史 deleted/terminated 行会混进来让对账假报不一致
+aws dynamodb scan --table-name openclaw-hosts --region "$REGION" --output json \
+  | python3 -c 'import json,sys
+rows=json.load(sys.stdin)["Items"]
+def alive(r):
+    s=(r.get("status") or r.get("state") or {}).get("S","")
+    return s in ("active","running","ready","") 
+ids=[r["instance_id"]["S"] for r in rows if not r["instance_id"]["S"].startswith("__") and alive(r)]
+print(" ".join(sorted(ids)))'
+# 两边不一致就先查清楚(可能有 host 失联或刚扩容),不要带着差异往下发命令
+```
+
+**每条 `ssm send-command` 之后都要逐个校验结果**,不能只看 `send-command` 自己返回成功 ——
+它只表示「命令已投递」。manifest 里的 `verify_cli` 用的是 `ssm wait command-executed` 加逐 instance
+读 `get-command-invocation` 的 `ResponseCode`,照那个走。下发前先 `ssm describe-instance-information`
+确认每台 `PingStatus=Online`;机队 **> 50 台**时 `--instance-ids` 有上限,要么分批 50 台,要么改用
+`--targets Key=tag:Role,Values=metal-host`。
+
+### Step 0c — `deploy-other` 层只改仓库副本,不下发在役(78 个文件)
+
+这一层(含 `console-bff` 与 `deploy/edge/*.lua`)的 `apply_cli` 形态是
+`s3cp=False send-command=False install=False` —— 它们只把文件装到**部署机的仓库副本**
+(`$REPO_ROOT/...`),**不碰任何在役资源**。对照 `B-s3` 那 9 条是
+`s3cp=True send-command=True install=True`(进桶 + 下发 host + 落盘)。这 8 条只进桶的
+(`migrate-vm.sh` / `oc-egress-chain.sh` / `oc-egress-sim.py` / `provision-host.sh` /
+`required-scripts.list` / `spire-kit/guest/agent.conf.tmpl` / `spire-join-broker.py` /
+`sync-shared-skills.py`)形态是 `s3cp=True send-command=False install=False`:**它们的
+`apply_cli` 不触在役 host,但不是「零风险」** —— `aws s3 cp` 会改 assets 桶里的对象,而这些对象会被
+**下一次开机 / reconcile / 新机** 取用(例如 `oc-egress-*` 在实际下发时会重新从 S3 下载),所以属于
+**延迟生效**而非无副作用。覆盖前记 `VersionId` 作回滚锚点、先传临时 key 复验再 promote(与 Step 4.3
+的 obs 资产同一套做法)。要复核的是「要不要额外手工落 host + 何时会被自动取用」,不是「这条命令敢不敢跑」。
+
+后果说清楚:**文档里那几条 edge 修复,只做完 `deploy-other` 是不会在役生效的。** edge 是独立
+ASG,它的 lua bundle 由自己的启动模板钉住 bundle 摘要,不走 `deployment/scripts/` 那条 host 分发面。
+要让 edge 侧真生效,得走 edge 自己的 bundle 发布 + LT 版本 + 实例替换那条路,**本 kit 不含那条路**。
+所以这一层的正确期望是:**把仓库副本对齐,让下一次正常的 edge 发布带上它们**;需要立刻在役生效
+的,单独走 edge 发布流程并另行验证。这条不是缺陷,是交付面边界 —— 但上一版没写明,容易被读成
+「照文档做完 edge 就修好了」。
+
+### Step 0c-2 — `apply-api-routes.sh verify` 的 CORS FATAL 是假红,不要据此回滚
+
+Step 4.2 的 `verify` 会报 `FATAL: OPTIONS /hosts/egress CORS config differs from spec`,而 `GET`/`POST`
+同时 PASS。差异全部是同一组 4 个键,且它们都是 **API Gateway 服务端补的默认值**、spec 里没写:
+`cacheKeyParameters` / `cacheNamespace` / `passthroughBehavior` / `timeoutInMillis`。
+
+**决定性判据**:把同一比较逻辑用在**从未被本 kit 触碰的 CDK 原生路由**(`/hosts`、`/tenants`)上,
+同样报 differs、命中同一组 4 个键;而本 kit 建出来的 OPTIONS 与 CDK 原生形态逐字一致(都是
+`methodResponses=['204']` + `MOCK` + `integrationResponses=['204']`)。**独立复现**:对 6 条新路由各发一次
+真实 `OPTIONS` 预检,6/6 返 204 且三个 `Access-Control-*` 响应头逐字节等于 spec 声明。所以 CORS 行为
+是对的,错的是校验器的字段比较。
+
+**处置**:拿到这条 FATAL **不要回滚**(会回滚掉一个其实正确的变更)。自证之后在回执里记「CORS FATAL
+判定为校验器缺陷,已用真实预检反验 6/6 204」,并**保留不跑 `finalize`**以留住回滚能力,直到校验器修好。
+
+### Step 0d — `lib/apply-cfn-resources.sh` 是只读评审器,不是写工具
+
+它对**整个闭包**做一次逐资源评审输出,所以 6 条 D-cdk 路径的 `apply_cli` 是**同一条命令** ——
+跑一次即可,不要按路径跑 6 遍(结果完全相同,只是刷屏 6 遍)。它**不发任何 AWS 写调用**
+(全脚本里 `aws` 只出现在第 34 行的 `command -v aws` 存在性检查)。`plan` 与 `rollback`
+**故意退 25**(脚本注释:nothing was applied, so a driver must not read this as done),
+`verify` 退 0 但**不读任何在役资源**。所以它的绿不能当验证门;真正的施加命令在 Step 4.1/4.2/4.3。
+
+它需要 **bash 4+**(用了 `mapfile`)。macOS 自带 bash 3.2 会 `exit 3` 并打印
+`FATAL: bash ... is too old` —— 那不是 kit 坏了,换 `brew` 装的 bash 或在 Linux 上跑。
+
 摘要是 SHA-256。**四类都要过**:shipped 制品、`lib/` 工具、CloudFormation 闭包快照、IAM 策略(摘要钉死在脚本里)——
 只核制品是不够的,后三类同样直接驱动生产变更(`lib/` 里的脚本会改机队,闭包快照决定第 4 步逐资源
 怎么决策,IAM 策略是第 2 步的 fail-closed 前置)。任何一条不等就停下,不要继续 —— 那说明 kit 被
@@ -140,6 +356,23 @@ aws ec2 describe-launch-template-versions --launch-template-id "$LT_ID" --region
 
 `api` 与 `lifecycle-consumer` 两个角色都要能读死线参数前缀;现有的 dispatch 前缀授权**不覆盖**它。
 漏了这一步会把一个软问题变成"读不到参数一路回落默认值,而日志上看不出来"。
+
+> **⚠ 本步给的授权不完整 —— 本 kit 的 CFN 闭包要求的其余授权在役全部缺失。** 真机逐条对比
+> (探针先用两条已在役的语句自证不是假 0)的结果:除下面这条 `deadline-sec` 读权限,其余 patch 期望
+> 的授权全是 ABSENT —— `api cloudwatch:PutMetricData(OpenClaw/Dispatch)`、
+> `api/backup/health/scaler ssm:ListCommandInvocations`、`health ssm:DescribeInstanceInformation`、
+> `health cloudwatch:PutMetricData`、`api/backup sqs:SendMessage(DeadLetter)`,以及两条 **Deny**:
+> `host dynamodb:UpdateItem` 对 `egress_pinned` 与 `__fleet_egress_policy__`。
+>
+> 失效形态是**不报错不告警**:调未授权的 API 拿 `AccessDenied` 落进「本轮跳过」分支,日志不红指标不动。
+> 真机已取到因果证据:补齐授权后 `openclaw-health-check` 的指标**首次流出**,此前一直静默为空。
+> 那两条 `Deny` 更要紧 —— 本 kit 把机队出网期望态放进 `openclaw-hosts` 的 singleton 行(见 Step 0b),
+> 这两条 Deny 就是防被管机器反向篡改整个机队期望态的闸;只装代码不装 Deny = 新增高价值写入目标却没装保护。
+>
+> **比对时必须连 `Resource` 与 `Condition` 一起比**:`api cloudwatch:PutMetricData` 有一条 PRESENT,
+> 但其 Condition 限定 `cloudwatch:namespace = OpenClaw/ControlPlane`,与 patch 要的 `OpenClaw/Dispatch`
+> 不是同一条 —— 只比 action 名会判成「已授权」。处置:按 `resources/cloudformation/` 两侧闭包把每条语句
+> 逐一 `put-role-policy` 再 `get-role-policy` 回读,结论写进 `cfn-verify-receipt.txt`。
 
 ```bash
 aws iam put-role-policy --role-name "$API_ROLE" --policy-name oc-lifecycle-deadline-read --policy-document file://iam/lifecycle-deadline-read.json

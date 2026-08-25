@@ -1,7 +1,7 @@
 -- deploy/edge/lib/balancer.lua
 --
 -- balancer_pick — pick the upstream peer for the current request.
--- Two branches per the data-plane contract:
+-- Two branches per INTERFACE-CONTRACT §2:
 --   local  descriptor.host == self_ip  → connect guest_ip:18789 directly
 --   remote                             → connect host:port (peer's DNAT)
 --
@@ -15,11 +15,13 @@
 -- from the host's private IP at systemd unit start).
 
 local balancer = require "ngx.balancer"
-local _M = { _VERSION = "0.02" }
+local _M = { _VERSION = "0.03" }
 
 -- Guest gateway listens on a fixed port inside the microVM
 -- (launch-vm.sh:747, deploy/userdata/launch-vm.sh — grep shows 18789).
 local GUEST_GATEWAY_PORT = 18789
+local CHAT_COMPLETIONS_URI = "/v1/chat/completions"
+local CHAT_COMPLETIONS_READ_TIMEOUT_SECONDS = 60
 
 --[[
     pick_peer: pure function, decides (peer_host, peer_port) from
@@ -87,6 +89,21 @@ function _M.balancer_pick()
         return ngx.exit(503)
     end
 
+    -- The location-level 3600s timeout is intentional for native WebSockets.
+    -- OpenAI-compatible chat is HTTP/SSE and must fail within a bounded budget
+    -- when the model backend accepts a connection but never returns bytes.
+    -- route.lua has already stripped /ws/<tenant>, so ngx.var.uri is the guest
+    -- path here. nil preserves the configured connect/send timeout values.
+    if ngx.var.uri == CHAT_COMPLETIONS_URI then
+        local ok_timeout, timeout_err = balancer.set_timeouts(
+            nil, nil, CHAT_COMPLETIONS_READ_TIMEOUT_SECONDS)
+        if not ok_timeout then
+            ngx.log(ngx.ERR, "balancer.set_timeouts for chat failed: ",
+                tostring(timeout_err))
+            return ngx.exit(503)
+        end
+    end
+
     local self_ip = ngx.var.edge_self_ip or ""
     local peer_host, peer_port = _M.pick_peer(self_ip, desc)
     if not peer_host or not peer_port then
@@ -105,7 +122,7 @@ function _M.balancer_pick()
 end
 
 -- Retry seam split out so tests can stub backend/redis without ngx.balancer.
--- Reads shared dict + Redis host from ngx.var, mirrors on_rewrite.
+-- Reads shared dict + primary Redis host from ngx.var.
 function _M._retry_refresh_desc(ctx, state, code)
     local tid = ctx.tenant_id
     if not tid then return end
@@ -117,17 +134,18 @@ function _M._retry_refresh_desc(ctx, state, code)
     local shared = ngx.shared.route_cache
     backend.invalidate(shared, tid)
 
-    -- 重查 Redis 拿最新 desc。redis host/port 在 nginx.conf server 块的
-    -- ngx.var 上 (edge_redis_host/port)——rewrite 阶段已读过一次,这里
-    -- 二次读同一变量。
-    local redis_host = ngx.var.edge_redis_host
-    local redis_port = tonumber(ngx.var.edge_redis_port) or 6379
-    if not redis_host or redis_host == "" then
+    -- 这里故意读 primary 而不是 reader:重投依赖 read-after-write;若副本尚未
+    -- 同步新路由,会拿回旧 desc 并再次打向同一个死 peer。将来改这里前必须先
+    -- 保住这条一致性要求。
+    local primary_host = ngx.var.edge_redis_host
+    local primary_port = tonumber(ngx.var.edge_redis_port) or 6379
+    if not primary_host or primary_host == "" then
         ngx.log(ngx.ERR, "balancer retry: edge_redis_host unset")
         return
     end
+    -- primary clean miss 才是权威“不存在”，这里显式传 true 自证重投语义。
     local new_desc, source, err_status = backend.lookup_backend(
-        shared, tid, redis_host, redis_port)
+        shared, tid, primary_host, primary_port, true)
     if err_status or not new_desc then
         ngx.log(ngx.WARN, "balancer retry: re-lookup failed for ", tid,
             " status=", tostring(err_status))

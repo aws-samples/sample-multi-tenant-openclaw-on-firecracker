@@ -42,6 +42,22 @@ _REASON_HOST_UNREACHABLE = "host_unreachable"
 # (`OC_BACKUP_VM_LEFT_PAUSED` / `OC_BACKUP_SOURCE_ABSENT`)。
 _SSM_NO_VERDICT = "OC_SSM_NO_VERDICT"
 
+_BACKUP_TERM_GRACE_SEC = 60
+"""#565 G1 —— 同步备份被 `timeout` TERM 掉之后,留给 `backup-data.sh` 的 EXIT trap 把 VM
+从 Paused 恢复回 running 的宽限期。
+
+**这个 60 有两个既有出处,本文件是第三处抄本**(同 `_PHASE_*` / `_REASON_*` 的处置理由:
+本 Lambda 的 asset 只含 `handler.py`,import 不到那两处):
+  · `deploy/userdata/host-agent.py:1104` 的 `_BACKUP_TERM_GRACE_SEC`(env 可覆盖)——
+    本机定时备份那条路径已经在用它;
+  · `deploy/lambda/api/core/create_deadline.py` 的 `BACKUP_TERM_GRACE_SEC` ——
+    预算表按它给 backup 步留量。
+
+推导:`backup-data.sh` 里 resume 的最坏耗时「5 次 × 5s max-time + (1+2+3+4) = 35s」+ 25s 余量。
+`test_469_r7_host_backup_loop_adversarial.py::TestResumeBudgetFitsInTheTermGrace` 锁住脚本侧,
+`tests/test_565_g1_budget_breakdown.py` 锁住这三处逐值一致 —— 谁改一处不改其余就红。
+"""
+
 
 def _mark_backup_phase(tenant_id, op_id, phase, reason=None, expect_phase=None,
                        require_unexpired=False, attempts=1):
@@ -169,7 +185,9 @@ def lambda_handler(event, context):
                 "success": False,
                 "skipped": True,
             }
-        _result = backup_tenant(item)
+        # #565 G1 —— 单租户路径(删前备份 / suspend 同步备份 / 网关手动备份)的预算随事件来。
+        # 缺失时 `backup_tenant` 回落默认 300s(升级期的在飞事件、以及不带预算的旧调用方)。
+        _result = backup_tenant(item, ssm_budget_sec=event.get("ssm_budget_sec"))
         # `backup_tenant` 返 `{"tenant_id","success",...}`;success 才算成。
         if isinstance(_result, dict) and _result.get("success"):
             # 收尾锚在 `running` 上:期间若已被死线执行者判死,这次写不进去 —— 那是**对的**,
@@ -265,10 +283,52 @@ def _now_dt():
     return datetime.now(timezone.utc)
 
 
-def backup_tenant(tenant):
+_DEFAULT_SSM_BUDGET_SEC = 300
+"""备份的 SSM 墙钟预算**默认值** —— 只给系统定时备份用。
+
+#565 G1 —— **同一个 backup Lambda 被四种方式调用,它们处在不同的死线档下**,所以一个数管不了
+四种:
+
+| 调用方式 | 死线 | 该给的预算 | 为什么不同 |
+| --- | --- | --- | --- |
+| suspend 的同步删前备份 | 180s | **90s** | 挤在 180s 里,还要给 stop-vm 留 30s |
+| delete 的同步删前备份 | 600s | **90s** | 与 suspend 同源(同一段内联逻辑),口径一致 |
+| 网关手动备份(异步) | 600s | **300s** | 异步、不受调用侧 `read_timeout` 约束,大盘友好 |
+| 系统定时备份(EventBridge) | 无 | 300s(本默认值) | 客户表格明文不在本轮范围,不动 |
+
+**预算走事件传入,不 import 口径模块** —— 本 Lambda 的 asset 只含自己的 `handler.py`,
+`core/create_deadline.py` 在这里 import 不到(#564 已确认的跨 Lambda 边界)。复制一份常量
+就等于第二个真相源,所以改成由调用方把数带过来;两侧不漂移由机械断言守(见
+`tests/test_565_g1_budget_breakdown.py`)。
+"""
+
+
+def backup_tenant(tenant, ssm_budget_sec=None):
     tid = tenant["id"]
     host_id = tenant["host_id"]
     now = _now()
+
+    # #565 G1 —— 预算由调用方给定(见 `_DEFAULT_SSM_BUDGET_SEC` 的四种调用方式表)。
+    # **不可解析或非正一律回落默认值**:一个坏预算若被当 0 用,备份会立刻放弃并报失败,
+    # 而 fail-closed 会据此回滚一次本可成功的 suspend/delete —— 那比用一个偏大的默认值更糟。
+    try:
+        _budget = int(ssm_budget_sec)
+        if _budget <= 0:
+            _budget = _DEFAULT_SSM_BUDGET_SEC
+    except (TypeError, ValueError):
+        _budget = _DEFAULT_SSM_BUDGET_SEC
+    # 这一步的墙钟上界 = `_budget`,拆成「脚本额度 + TERM 宽限」两段(理由见下面 `timeout` 处)。
+    # **宽限必须真的留出来**:装不下就说明调用方给的预算比宽限还小,那时给脚本留 1s 也没有
+    # 意义 —— 退回默认预算并 fail-loud 到日志,由 G8 校验器/压测去暴露那个坏配置,
+    # 而不是在这里静默造一个必然 SIGKILL 的窗口。
+    _grace = _BACKUP_TERM_GRACE_SEC
+    if _budget <= _grace:
+        print(
+            f"[#565] backup 预算 {_budget}s <= TERM 宽限 {_grace}s,留不出让 VM 从 Paused "
+            f"恢复的时间;回落默认 {_DEFAULT_SSM_BUDGET_SEC}s"
+        )
+        _budget = _DEFAULT_SSM_BUDGET_SEC
+    _script_budget = _budget - _grace
 
     # Existing hosts do not rerun init-host.sh after a control-plane deploy.
     # #545 —— freshness 判据必须是【本次新增】的标记,不能用旧哨兵。存量 host 的
@@ -304,9 +364,35 @@ def backup_tenant(tenant):
         "install -o root -g root -m 755 /tmp/oc-heal-backup-data.sh "
         "/home/ubuntu/backup-data.sh || exit 1; "
         "fi && "
+        # #565 G1 —— **host 侧的墙钟界限,TERM 优先。**
+        #
+        # Codex 独立复审正确地指出:此前只有控制面的轮询被界住,`backup-data.sh` 在 host 上
+        # 仍跑在 SSM 的 `executionTimeout` 缺省 **3600s** 下。于是把预算从 300 降到 90 反而
+        # 制造了一个**新的假失败带**:一次耗时 90–300s 的备份,改前控制面会等到它成功,
+        # 改后 90s 就报失败 → fail-closed 回滚 suspend/delete → 备份随后成功 →
+        # **上层失败、底层成功**,正是本 issue 要消灭的形态。
+        #
+        # **为什么不用 SSM 的 `executionTimeout`**:本脚本的形态是 Pause VM → 压缩 → Resume,
+        # Pause 窗口包住整个压缩;而 SSM 终止命令**没有文档化的宽限期**。脚本自己
+        # (`deploy/userdata/backup-data.sh:69-70/83-84/133`)已经把后果写死:
+        # 「EXIT trap 里的 Resume 会被 SIGKILL 掐断,客户 VM 永久留在 Paused」
+        # 「这比丢一次备份严重:丢备份下轮会重来,而 Paused 不会自己好」,且「reaper 救不了它」
+        # (判 `fc_alive` 是进程存活,一个 Paused 的 Firecracker 进程是活的)。
+        #
+        # **所以对齐 host-agent 那条已被评审过的机制**:先 SIGTERM,给 EXIT trap
+        # `BACKUP_TERM_GRACE_SEC` 秒把 VM 恢复回 running,仍不退出才 SIGKILL。
+        # `timeout --signal=TERM --kill-after=<grace> <T>`,其中
+        # **T = 本步预算 - grace**,于是这一步的墙钟上界恰好是本步预算 —— 预算第一次真的
+        # 界住了 host,而不只是界住控制面的轮询。
+        #
+        # 已知残余(如实记下,不假装消灭):bash 把信号**延迟到当前前台命令返回之后**才跑
+        # trap,所以一次卡住的 `aws s3 cp` 仍可能耗尽宽限而被 SIGKILL。这与 host-agent 那条
+        # 路径的风险画像**逐字相同**(同一个脚本、同一套 SIGTERM+60s),所以不是新增风险面;
+        # 要彻底消灭得让脚本自己限时,归后续。
+        f"timeout --signal=TERM --kill-after={_grace} {_script_budget} "
         f"/home/ubuntu/backup-data.sh {tid} {BUCKET} {PREFIX} {CMK_KEY_ID}"
     )
-    success, output = _ssm_run(host_id, cmd, timeout=300)
+    success, output = _ssm_run(host_id, cmd, timeout=_budget)
 
     result = {"tenant_id": tid, "success": success, "timestamp": now}
     #
@@ -423,16 +509,50 @@ def _ssm_run(instance_id, command, timeout=300):
     `time.monotonic()` 而不是 `time.time()`:后者会被 NTP 校正拖动,预算判定不能受它影响。
     """
     try:
+        # #565 G1(Codex 独立复审第 2 轮)—— **计时必须从 `send_command` 之前开始。**
+        # 原来起在它之后,于是 `timeout` 只界住轮询、**不界住 send 本身** —— 而 #573 给 ssm
+        # client 加了 adaptive 重试之后,一次被节流的 `SendCommand` 最坏也要 ~71s 退避。
+        # 那 71s 白白落在预算之外,于是「执行段」不是真实上界,调用方按它排的死线就会破。
+        # `time.monotonic()` 而非 `time.time()`:后者会被 NTP 校正拖动。
+        _deadline = time.monotonic() + timeout
         resp = ssm.send_command(
             InstanceIds=[instance_id],
             DocumentName="AWS-RunShellScript",
+            # **⚠ 这里刻意【不】设 `executionTimeout`,理由见下 —— 这不是遗漏。**
+            #
+            # Codex 独立复审第 1 轮正确地指出:`TimeoutSeconds` 只是**投递**超时,命令一旦开始
+            # 跑就与它无关;`executionTimeout` 才是执行超时,而 `AWS-RunShellScript` 的缺省是
+            # **3600s**。所以 #565 G1 把这里的预算从 300 降到 90/55 只约束了**控制面的轮询**,
+            # host 上的 `backup-data.sh` 仍可跑到一小时 —— 那确实是一个真缺陷。
+            #
+            # **但直接加 `executionTimeout` 会引入一个更糟的后果,所以本 MR 不加。**
+            # `backup-data.sh` 的形态是 **Pause VM → 压缩 → Resume**(该脚本 :146-148),
+            # Pause 窗口包住整个压缩。而 SSM 在 executionTimeout 到点时如何终止命令
+            # **没有文档化的宽限期**;脚本自己 :83-84 已经把这个后果写死了:
+            #   「EXIT trap 里的 Resume **会被 SIGKILL 掐断**,客户 VM 永久留在 Paused」
+            #   「这比丢一次备份严重:丢备份下轮会重来,而 Paused 不会自己好」
+            # 而且 :133 记着 **reaper 救不了它** —— reaper 判 `fc_alive` 是进程存活检查,
+            # 一个 Paused 的 Firecracker 进程是活的。也就是说加了它会造出一个**没有任何
+            # 自动收敛机制**的永久 Paused VM。
+            #
+            # **正确的机制仓库里已经有了,但只装在另一条调用路径上。** host-agent 驱动的
+            # 本机定时备份是「先 SIGTERM、等 `_BACKUP_TERM_GRACE_SEC`=60s、再 SIGKILL」,
+            # 那 60s 是按 EXIT trap 里 resume 的最坏耗时 35s 算出来的(该脚本 :77-91,
+            # 并有 `test_469_r7...::TestResumeBudgetFitsInTheTermGrace` 把两个数锁在一起)。
+            # SSM 这条路径要对齐,得把命令包成
+            # `timeout --signal=TERM --kill-after=60 <budget> bash backup-data.sh …`,
+            # 而那会让这一步对执行段的占用变成 `budget + 60` —— 60s 的宽限在 180s 档里装不下
+            # (suspend 的执行段只有 120s,还要给 stop-vm 30s)。**那是一个死线口径问题,
+            # 不是一行代码问题**,已连同 Codex 第 2 条一起记进 MR 与 changelog 交由 owner 判决。
+            #
+            # host 侧的界限**已经用下面那个 `timeout --signal=TERM` 包装做到了**,
+            # 所以这里不设 `executionTimeout` 不再留下"host 无上界"的缺口。
             Parameters={"commands": [command]},
-            TimeoutSeconds=timeout,
+            TimeoutSeconds=int(timeout) + 10,
         )
         cmd_id = resp["Command"]["CommandId"]
-        deadline = time.monotonic() + timeout
         time.sleep(5)
-        while time.monotonic() < deadline:
+        while time.monotonic() < _deadline:
             result = ssm.get_command_invocation(
                 CommandId=cmd_id,
                 InstanceId=instance_id,

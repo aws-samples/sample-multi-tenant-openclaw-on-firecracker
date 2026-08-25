@@ -163,7 +163,7 @@
 | --- | --- | --- | --- | --- | --- | --- |
 | `scaler.add_gsi_tenant_user` 等 4 个 GSI 门 | 规模化查询索引 | 全 `false` | 同 | `false` | **全 `true`(逐个部署)** | 10 万租户下无 GSI = 全表扫;`AWS` DynamoDB **一次 update 只能加 1 个 GSI**,必须一次开一个、等 ACTIVE 再开下一个 |
 | `tenant_query.enabled` | 规模化查询总开关 | `false` | 无此键(`adbb68c9` #388 · 07-27 新增) | `false` | `true`(**四个 GSI 全 ACTIVE 后**) | 顺序门:提前开会查不到索引 |
-| `tenant_query.rootfs_backfill_complete` | rootfs 回填完成标记 | `false` | 无此键(#388) | `false` | `true`(回填脚本 apply 完成后) | 须先跑 `tenant_rootfs_query_backfill.py --dry-run` |
+| `tenant_query.rootfs_backfill_complete` | rootfs 回填完成标记 | `false` | 无此键(#388) | `false` | `true`(回填脚本 apply 完成后) | 须先跑 `scripts/tenant-rootfs-query-backfill.py`(dry-run) |
 | `tenant_stats.enabled` | 统计写入器 + 分钟调度 | `false` | 无此键(#388) | `false` | `true` | 10 万规模需要容量可观测;显式 scan-cost 门,开启前算成本 |
 | `health_check.interval_minutes` | 健康检查间隔 | `5` | 同 | 未设 | `5` | 约 300 台/5 min 无压力 |
 | `health_check.max_failures` | 连续失败判死 | `3` | 同 | 未设 | `3` | 无争议 |

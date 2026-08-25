@@ -65,7 +65,6 @@ def _read_slots(instance_id, ssm_wait):
 def _write_slots(instance_id, new_slots, ssm_wait, op_id=None, fence_epoch=None):
     """把新 slots 原子写回 host(同 core.image_slots 的提交协议)+ 回写 DDB 镜像。返回 err|None。
 
-    #394 P1-1 —— 传了 op_id/fence_epoch 时,host 脚本在原子 rename【前】先过 fence 门
     (flock + 强一致读 DDB 校验 owner==op_id 且 epoch 未被接管递增),挡"超时旧 SSM 命令晚到
     覆盖新操作"。这道门必须在 host 侧(Lambda 侧 fence_valid 拦不住已下发的命令)。
     """
@@ -238,6 +237,9 @@ def _pinned_versions_on_host(instance_id):
         "ExpressionAttributeNames": {"#st": "status"},
         "ExpressionAttributeValues": {":h": instance_id, ":deleted": "deleted"},
         "ProjectionExpression": "image_snapshot_time",
+        # Reclaim is destructive. An eventually consistent page may omit a
+        # just-pinned tenant and incorrectly classify its image as orphaned.
+        "ConsistentRead": True,
     }
     while True:
         resp = tenants_table.scan(**kwargs)

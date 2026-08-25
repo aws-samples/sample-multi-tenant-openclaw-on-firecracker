@@ -21,6 +21,7 @@
     <script src="js/app.core.js"></script>
     <script src="js/app.tenants.js"></script>
     <script src="js/app.hosts.js"></script>
+    <script src="js/app.egress.js"></script>
     <script src="js/app.migrations.js"></script>
     <script src="js/app.backups.js"></script>
     <script src="js/app.templates.js"></script>
@@ -432,6 +433,13 @@
         @click="page='backups'; loadBackups()"
       >
         Backups
+      </button>
+      <button
+        class="nav-tab"
+        :class="page==='egress' && 'active'"
+        @click="page='egress'; loadEgress()"
+      >
+        Egress
       </button>
       <button
         class="nav-tab"
@@ -2377,6 +2385,325 @@ openclaw_vm_disk_used_pct &gt; 90</pre
         tenants that have been deleted — restoring creates a new tenant with the
         backup's data volume.
       </p>
+    </div>
+
+    <!-- ===== #577/#594 Egress whitelist ===== -->
+    <div x-show="page==='egress'" class="page-content">
+      <div class="eg-head">
+        <h2>Guest 出网白名单</h2>
+        <button class="btn" @click="loadEgress(); egLoadRevisions()" :disabled="egLoading">刷新</button>
+        <span x-show="egPolling" class="eg-polling">等待收敛中(异步,上界约一个 poll)…</span>
+      </div>
+
+      <div x-show="egError" class="eg-alert eg-bad" x-text="egError"></div>
+
+      <!-- 必须上屏的告警 -->
+      <template x-for="a in egAlerts()" :key="a.text">
+        <div class="eg-alert" :class="a.level==='bad' ? 'eg-bad' : (a.level==='warn' ? 'eg-warnbox' : 'eg-info')"
+             x-text="a.text"></div>
+      </template>
+
+      <!-- ① 白名单总开关:改期望态,影响全机队 -->
+      <div class="eg-panel">
+        <div class="eg-panel-title">① 白名单总开关(改期望态 · 全机队影响)</div>
+        <template x-if="egStatus">
+          <div class="eg-grid">
+            <div><span class="eg-k">当前模式</span><span class="eg-v" x-text="(egStatus.desired && egStatus.desired.mode) || '(从未设置)'"></span></div>
+            <div><span class="eg-k">收敛</span>
+              <span class="eg-v" :class="egStatus.fully_converged ? 'eg-ok' : 'eg-warn'"
+                    x-text="(egStatus.converged ?? 0) + ' / ' + (egStatus.total ?? 0) + (egStatus.fully_converged ? ' ✓ 各听各的都到位' : ' ✗ 有机器没到位')"></span></div>
+            <div><span class="eg-k">全队同一份策略</span>
+              <span class="eg-v" :class="egStatus.fleet_uniform ? 'eg-ok' : 'eg-warn'"
+                    x-text="egStatus.fleet_uniform ? '✓ 是' : '✗ 机队跑着多份策略'"></span></div>
+            <div><span class="eg-k">豁免(pinned)</span><span class="eg-v" x-text="egStatus.pinned_count ?? 0"></span></div>
+            <div><span class="eg-k">pin 类型不对</span>
+              <span class="eg-v" :class="(egStatus.pinned_malformed_count||0) > 0 ? 'eg-bad-t' : ''"
+                    x-text="egStatus.pinned_malformed_count ?? 0"></span></div>
+          </div>
+        </template>
+        <div class="eg-note">
+          「收敛」与「全队同一份策略」是<b>正交</b>的两个判据:只看前者会让「机队跑着两份策略」报成全绿。
+        </div>
+        <div class="eg-row" x-show="canWrite()">
+          <label><input type="checkbox" name="eg-deny-rfc1918" x-model="egForm.denyRfc1918"> 连 RFC1918 全段一起拒</label>
+          <button class="btn btn-primary" @click="egForm.mode='deny'; egSetTargets('all'); egAskConfirm('fleet-enable')"
+                  :disabled="!egLocalCheck().ok">全机队开启/更新白名单</button>
+          <button class="btn btn-danger" @click="egForm.mode='off'; egSetTargets('all'); egAskConfirm('fleet-off')">
+            全机队熔断(拆链)</button>
+          <button class="btn" @click="egAskConfirm('unpin-all')">批量解除豁免</button>
+        </div>
+        <div class="eg-note eg-danger-note" x-show="canWrite()">
+          熔断在<b>写入时刻</b>赢,连豁免机器的链也拆;但它不是永久钉死 —— 之后一次定向下发会按时间戳把那台机器拉回它自己的模式。
+        </div>
+      </div>
+
+      <!-- ② 放行规则:增删查改,可指定机器,下发就在这一节 -->
+      <div class="eg-panel">
+        <div class="eg-panel-title">② 放行规则(允许 guest 访问的目标 · 可指定机器)</div>
+
+        <div class="eg-row">
+          <label><input type="radio" name="eg-targets" value="all" x-model="egForm.targets"
+                        @change="egSetTargets('all')"> 作用域:全机队</label>
+          <label><input type="radio" name="eg-targets" value="picked" x-model="egForm.targets"
+                        @change="egSetTargets('picked')"> 只发指定机器(≤50 台/批)</label>
+          <button class="btn btn-sm" @click="egResetHoles()">恢复成当前生效值</button>
+        </div>
+
+        <div class="eg-row" x-show="!egTargetsAll()">
+          <input type="text" name="eg-pick-text" x-model="egPickText" class="eg-in-dst"
+                 placeholder="i-0abc... 直接粘贴 instance_id,逗号或空格分隔">
+          <button class="btn btn-sm" @click="egApplyPickText()">加入作用域</button>
+          <span class="eg-note" x-text="'已选 ' + egPickedIds().length + ' 台'+(egPickedIds().length ? ':'+egPickedIds().join(', ') : '(也可在下面③里勾选)')"></span>
+        </div>
+
+        <div class="eg-note eg-danger-note">
+          ⚠ 期望态是<b>全量替换</b>。下面这张表已按作用域<b>加载当前生效值</b>,它就是提交后的最终状态;删掉一行再提交 = 那条规则被删除。
+        </div>
+
+        <table class="eg-table">
+          <thead><tr><th>协议</th><th>目标端口</th><th>目标地址 (IP/CIDR)</th><th>本地检查</th><th></th></tr></thead>
+          <tbody>
+            <template x-for="(h, i) in egForm.allow" :key="i">
+              <tr>
+                <td><select name="eg-proto" x-model="h.proto" :disabled="!canWrite()">
+                  <option value="tcp">tcp</option><option value="udp">udp</option></select></td>
+                <td><input type="number" name="eg-dport" x-model="h.dport" :disabled="!canWrite()" class="eg-in-port"></td>
+                <td><input type="text" name="eg-dst" x-model="h.dst" :disabled="!canWrite()" class="eg-in-dst"
+                           placeholder="192.0.2.0/24"></td>
+                <td><span class="eg-hole-check" :class="egCheckHole(h) ? 'eg-bad-t' : 'eg-ok'"
+                          x-text="egCheckHole(h) || 'ok'"></span></td>
+                <td><button class="btn btn-sm" x-show="canWrite()" @click="egDelHole(i)">删</button></td>
+              </tr>
+            </template>
+            <template x-if="egForm.allow.length === 0">
+              <tr><td colspan="5" class="empty">当前作用域没有任何放行规则(只剩白名单基线)</td></tr>
+            </template>
+          </tbody>
+        </table>
+        <button class="btn btn-sm" x-show="canWrite()" @click="egAddHole()">+ 新增一条放行规则</button>
+        <div class="eg-note" x-text="egLocalCheckLabel()"></div>
+
+        <!-- 发送前 diff -->
+        <div class="eg-diff">
+          <div class="eg-diff-title" x-text="'发送前 diff(作用域:' + egHoleDiff().scope + ' · ' + egHoleDiff().beforeCount + ' 条 → ' + egHoleDiff().afterCount + ' 条)'"></div>
+          <template x-for="t in egHoleDiff().removed" :key="'d'+t">
+            <div class="eg-diff-del" x-text="'− 删除  ' + t"></div>
+          </template>
+          <template x-for="t in egHoleDiff().added" :key="'a'+t">
+            <div class="eg-diff-add" x-text="'+ 新增  ' + t"></div>
+          </template>
+          <template x-for="t in egHoleDiff().kept" :key="'k'+t">
+            <div class="eg-diff-keep" x-text="'  保留  ' + t"></div>
+          </template>
+          <div class="eg-note" x-show="!egHasHoleChange()">与当前生效值一致 —— 这次提交不改放行规则。</div>
+        </div>
+
+        <template x-if="egScopeDivergent()">
+          <div class="eg-alert eg-warnbox">
+            选中的机器当前放行规则<b>彼此不一致</b>,提交会把它们统一成上面这一份:
+            <template x-for="d in egScopeDivergent()" :key="d.id">
+              <div class="eg-modal-line" x-text="d.id + ' → ' + (d.holes.join(' / ') || '(无)')"></div>
+            </template>
+          </div>
+        </template>
+
+        <div class="eg-row" x-show="canWrite()">
+          <label>版本名
+            <input type="text" name="eg-rev-name" x-model="egForm.revisionName" class="eg-in-dst"
+                   :placeholder="'留空自动用 ' + egNextAutoName()">
+          </label>
+          <label x-show="!egTargetsAll()" :title="egPinAllBlockedWhy()">
+            <input type="checkbox" name="eg-pinned" x-model="egForm.pinned"> 同时钉住这几台(豁免后续全量)
+          </label>
+          <button class="btn btn-primary" @click="egForm.mode='deny'; egAskConfirm('fleet-enable')"
+                  :disabled="!egLocalCheck().ok || (!egTargetsAll() && egPickedIds().length===0)">
+            下发到这个作用域</button>
+          <span class="eg-note">下发前会先记录改动前的期望态,之后可按机器逐台回滚。</span>
+        </div>
+      </div>
+
+      <!-- ③ 逐机:默认 10 台 + 定点查询 -->
+      <div class="eg-panel">
+        <div class="eg-panel-title">③ 逐机状态</div>
+        <div class="eg-row">
+          <input type="text" name="eg-host-query" x-model="egHostQuery" class="eg-in-dst"
+                 placeholder="定点查询:i-0abc..., i-0def...(留空则按下面条数显示)">
+          <button class="btn btn-sm" @click="egApplyHostQuery()">查询</button>
+          <button class="btn btn-sm" x-show="egHostFilterActive" @click="egClearHostQuery()">清除</button>
+          <label>显示条数
+            <select name="eg-host-limit" x-model.number="egHostLimit" @change="loadEgress()">
+              <option :value="10">10</option><option :value="25">25</option>
+              <option :value="50">50</option><option :value="500">500</option>
+            </select>
+          </label>
+        </div>
+        <table class="eg-table">
+          <thead><tr><th>instance_id</th><th>听谁</th><th>已生效模式</th><th>状态</th><th>reason</th><th>链</th></tr></thead>
+          <tbody>
+            <template x-for="h in egHosts()" :key="h.instance_id">
+              <tr>
+                <td>
+                  <label x-show="!egTargetsAll() && canWrite()">
+                    <input type="checkbox" name="eg-pick" :checked="!!egForm.picked[h.instance_id]"
+                           @change="egTogglePick(h.instance_id)">
+                  </label>
+                  <span x-text="h.instance_id"></span>
+                </td>
+                <td x-text="h.policy_source || '-'"></td>
+                <td x-text="h.applied_mode || '-'"></td>
+                <td><span class="eg-state" :class="egHostState(h).cls"
+                          :title="egHostState(h).hint || ''" x-text="egHostState(h).label"></span></td>
+                <td class="eg-reason" x-text="egReason(h)"></td>
+                <td><button class="btn btn-sm" @click="egLoadChain(h.instance_id)">回读</button></td>
+              </tr>
+            </template>
+            <template x-if="egHosts().length === 0">
+              <tr><td colspan="6" class="empty">No hosts</td></tr>
+            </template>
+          </tbody>
+        </table>
+        <div class="eg-note" x-show="egTruncatedNote()" x-text="egTruncatedNote()"></div>
+        <div class="eg-note">
+          「豁免中」不是故障 —— 是有人做过定向豁免,它<b>不受机队策略管辖</b>;
+          但机队熔断仍会<b>在写入时刻</b>拆掉它的链。
+        </div>
+      </div>
+
+      <!-- ④ 当前生效的链规则:从内核回读 -->
+      <div class="eg-panel">
+        <div class="eg-panel-title">④ 当前生效的链规则(从内核回读)</div>
+        <div class="eg-row">
+          <input type="text" name="eg-chain-target" x-model="egChainTarget" class="eg-in-dst"
+                 placeholder="i-0abc...">
+          <button class="btn btn-sm" @click="egLoadChain()" :disabled="egChainLoading">回读这台</button>
+          <span x-show="egChainLoading" class="eg-polling">正在读该机内核…</span>
+        </div>
+        <div x-show="egChainError" class="eg-alert eg-bad" x-text="egChainError"></div>
+        <template x-if="egChainVerdict()">
+          <div>
+            <div class="eg-grid">
+              <div><span class="eg-k">生效判据</span>
+                <span class="eg-v" :class="egChainVerdict().verdict==='EFFECTIVE' ? 'eg-ok' : 'eg-bad-t'"
+                      x-text="egChainVerdict().verdict"></span></div>
+              <div><span class="eg-k">链存在</span><span class="eg-v" x-text="egChainVerdict().present ? '是' : '否'"></span></div>
+              <div><span class="eg-k">FORWARD 跳转数</span>
+                <span class="eg-v" :class="(egChainVerdict().jumps||0) > 0 ? '' : 'eg-bad-t'"
+                      x-text="egChainVerdict().jumps ?? '(读不到)'"></span></div>
+              <div><span class="eg-k">规则 sha256</span><span class="eg-v eg-mono" x-text="(egChainVerdict().sha || '(空)').slice(0,16)"></span></div>
+              <div><span class="eg-k">回读时刻</span><span class="eg-v" x-text="egChainVerdict().readAt || '-'"></span></div>
+            </div>
+            <div class="eg-note eg-danger-note" x-show="egChainVerdict().jumps === 0">
+              链在、但 FORWARD 里<b>没有跳转指向它</b> —— 这条链一个包都收不到。只看「链存在」会把这种失效判成正常。
+            </div>
+            <div class="eg-note eg-danger-note" x-show="egChainVerdict().error" x-text="'读不到(INCONCLUSIVE):' + egChainVerdict().error"></div>
+            <table class="eg-table eg-preview">
+              <thead><tr><th>#</th><th>内核里的规则(iptables -S OPENCLAW-EGRESS)</th></tr></thead>
+              <tbody>
+                <template x-for="(r, i) in egChainRules()" :key="'r'+i">
+                  <tr><td x-text="i+1"></td><td class="eg-mono" x-text="r"></td></tr>
+                </template>
+                <template x-if="egChainRules().length === 0">
+                  <tr><td colspan="2" class="empty">该机内核里没有这条链</td></tr>
+                </template>
+              </tbody>
+            </table>
+            <details x-show="egChainPerTap().length">
+              <summary>per-tap 黑名单层(前 40 条)</summary>
+              <template x-for="(r, i) in egChainPerTap()" :key="'p'+i">
+                <div class="eg-mono eg-modal-line" x-text="r"></div>
+              </template>
+            </details>
+          </div>
+        </template>
+        <div class="eg-note eg-danger-note" x-text="egChainCaveat()"></div>
+      </div>
+
+      <!-- ⑤ 版本与逐台回滚 -->
+      <div class="eg-panel">
+        <div class="eg-panel-title">⑤ 版本与逐台回滚</div>
+        <div class="eg-row">
+          <button class="btn btn-sm" @click="egLoadRevisions()" :disabled="egRevLoading">刷新版本列表</button>
+          <span class="eg-note" x-text="'下一个自动名:' + egNextAutoName()"></span>
+        </div>
+        <div x-show="egRevError" class="eg-alert eg-bad" x-text="egRevError"></div>
+        <table class="eg-table">
+          <thead><tr><th>版本</th><th>时间</th><th>作用域</th><th>这次改成了什么</th><th>记录了几台</th><th></th></tr></thead>
+          <tbody>
+            <template x-for="rev in egRevList()" :key="rev.name">
+              <tr>
+                <td class="eg-mono">
+                  <span x-text="rev.name"></span>
+                  <span x-show="!egRevUsable(rev)" class="eg-state eg-state-bad"
+                        :title="egRevUnusableWhy()">不可回滚</span>
+                </td>
+                <td x-text="rev.created_at || '-'"></td>
+                <td x-text="(rev.scope==='all' ? '全机队' : '指定 '+(rev.targets||[]).length+' 台') + (rev.spec && rev.spec.kind==='rollback' ? ' · 回滚' : '')"></td>
+                <td class="eg-mono" x-text="rev.spec ? ('mode='+(rev.spec.mode||'-')+' · '+(rev.spec.extra_allow || '(无放行规则)')) : '-'"></td>
+                <td x-text="egRevHosts(rev).length"></td>
+                <td>
+                  <button class="btn btn-sm" @click="egRevExpanded = (egRevExpanded===rev.name ? '' : rev.name)"
+                          x-text="egRevExpanded===rev.name ? '收起' : '展开逐台'"></button>
+                </td>
+              </tr>
+            </template>
+            <template x-if="egRevList().length === 0">
+              <tr><td colspan="6" class="empty">还没有任何版本记录 —— 下一次下发会自动记一条</td></tr>
+            </template>
+          </tbody>
+        </table>
+
+        <template x-for="rev in egRevList()" :key="'x'+rev.name">
+          <div x-show="egRevExpanded===rev.name" class="eg-diff">
+            <div class="eg-diff-title" x-text="'版本 ' + rev.name + ' 记录的【改动前】期望态(回滚就是把它写回去)'"></div>
+            <template x-for="id in egRevHosts(rev)" :key="rev.name+id">
+              <div class="eg-row">
+                <label x-show="canWrite()">
+                  <input type="checkbox" name="eg-rev-pick" :checked="!!(egRevPicked[rev.name]||{})[id]"
+                         @change="egRevToggle(rev.name, id)">
+                </label>
+                <span class="eg-mono" x-text="id"></span>
+                <span class="eg-note" x-text="egRevBeforeText(rev, id)"></span>
+              </div>
+            </template>
+            <div class="eg-row" x-show="canWrite()">
+              <button class="btn btn-sm" @click="egRevPickAll(rev)">全选</button>
+              <button class="btn btn-danger" @click="egAskRollback(rev, false)"
+                      :disabled="!egRevUsable(rev)" :title="egRevUsable(rev) ? '' : egRevUnusableWhy()"
+                      x-text="'回滚勾选的 ' + egRevPickedIds(rev.name).length + ' 台'"></button>
+              <button class="btn btn-danger" @click="egAskRollback(rev, true)"
+                      :disabled="!egRevUsable(rev)" :title="egRevUsable(rev) ? '' : egRevUnusableWhy()"
+                      x-text="'回滚这个版本的全部 ' + egRevHosts(rev).length + ' 台'"></button>
+              <span class="eg-note" x-show="!egRevUsable(rev)" x-text="egRevUnusableWhy()"></span>
+            </div>
+          </div>
+        </template>
+        <div class="eg-note">
+          每台的「改动前」是<b>各自</b>记的 —— 作用域里的机器改之前可能各不相同(有豁免的、有做过定向灰度的),
+          只存一份机队快照的话回滚会把它们全拉成同一份,那是又一次全量下发而不是回滚。
+        </div>
+      </div>
+
+      <!-- 确认弹窗:含最终发出去的请求 -->
+      <div x-show="egConfirm.show" class="eg-modal-bg">
+        <div class="eg-modal">
+          <div class="eg-modal-title" x-text="egConfirm.kind==='rollback' ? '确认这次回滚' : '确认这次下发'"></div>
+          <template x-for="l in egConfirm.lines" :key="l">
+            <div class="eg-modal-line" x-text="l"></div>
+          </template>
+          <div class="eg-diff-title">实际会发出去的请求</div>
+          <pre class="eg-payload" x-text="egPlanJson(egConfirm.plan)"></pre>
+          <div x-show="egConfirm.expect" class="eg-typed">
+            要继续,请输入 <code x-text="egConfirm.expect"></code>:
+            <input type="text" name="eg-typed" x-model="egConfirm.typed" class="eg-in-typed">
+          </div>
+          <div class="eg-modal-btns">
+            <button class="btn" @click="egConfirm.show=false" :disabled="egConfirm.busy">取消</button>
+            <button class="btn btn-danger" :disabled="!egConfirmReady() || egConfirm.busy"
+                    @click="egSubmitConfirmed()"
+                    x-text="egConfirm.kind==='rollback' ? '确认回滚' : '确认下发'"></button>
+          </div>
+        </div>
+      </div>
     </div>
 
     <div x-show="page==='edge'" class="page-content">

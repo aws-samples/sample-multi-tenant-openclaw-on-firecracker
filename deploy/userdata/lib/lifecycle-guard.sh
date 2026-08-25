@@ -3,10 +3,15 @@
 # SPDX-License-Identifier: MIT-0
 #
 #
-# 用法: lifecycle-guard.sh <tenant_id> <op_id> <fence_epoch>
+# 用法: lifecycle-guard.sh <tenant_id> <op_id> <fence_epoch> [expected_host_id]
 # 退出: 0=本操作仍持有该租户的生命周期租约(可以动手)
-#       78=fence 读不出来(fail-closed,留 deleting 等重投)
+#       78=fence 读不出来,【或权威坐标缺失】(fail-closed,留 deleting 等重投)
 #       79=已被抢占 / epoch 前进 / 租约过期(本 op 已失效)
+#       81=该租户按 DDB 不在本机(仅四参形态;控制面分组错或迁移竞态)
+#
+# 四参形态额外在 **stdout** 打印一行权威坐标:`vm_num<TAB>host_port<TAB>guest_ip`。
+# 三参形态 stdout 恒空 —— 那是与 `lifecycle_fence.host_guard()` 逐档等价的形态。
+# 见文件末尾"为什么坐标由这里返回"。
 #
 # ── 为什么需要一个 host 侧的可执行 guard ────────────────────────────────────
 # 控制面原本用 `core/lifecycle_fence.py:host_guard()` 为【单个】租户生成一段 shell
@@ -67,7 +72,7 @@ _read_fence() {
     --region "${REGION}" \
     --key "${_KEY}" \
     --consistent-read \
-    --query "[Item.active_lifecycle_op_id.S,Item.lifecycle_fence_epoch.N,Item.active_lifecycle_until.N,Item.host_id.S]" \
+    --query "[Item.active_lifecycle_op_id.S,Item.lifecycle_fence_epoch.N,Item.active_lifecycle_until.N,Item.host_id.S,Item.vm_num.N,Item.host_port.N,Item.guest_ip.S]" \
     --output text 2>/dev/null
 }
 
@@ -85,6 +90,9 @@ _LF_OWNER="$(printf "%s" "${_LF}" | cut -f1)"
 _LF_EPOCH="$(printf "%s" "${_LF}" | cut -f2)"
 _LF_UNTIL="$(printf "%s" "${_LF}" | cut -f3)"
 _LF_HOST="$(printf "%s" "${_LF}" | cut -f4)"
+_LF_VMNUM="$(printf "%s" "${_LF}" | cut -f5)"
+_LF_HPORT="$(printf "%s" "${_LF}" | cut -f6)"
+_LF_GIP="$(printf "%s" "${_LF}" | cut -f7)"
 
 # ── 判定顺序:【过期先判】,再判 owner/epoch(Codex 独立复审第二轮)────────────
 # 三种情形都退 79,但调用方的重投语义相反:owner/epoch 不符 = 另一个【活着的】op 持有
@@ -122,5 +130,31 @@ _LF_HOST="$(printf "%s" "${_LF}" | cut -f4)"
 if [ -n "${EXPECT_HOST}" ] && [ "${_LF_HOST}" != "${EXPECT_HOST}" ]; then
   echo "LIFECYCLE_HOST_MISMATCH ddb_host=${_LF_HOST} this_host=${EXPECT_HOST}" >&2
   exit 81
+fi
+
+# 为什么坐标由这里返回,而不是由 manifest 传:
+#   围栏绑的是 tenant + 租约 + host,【不绑坐标】。manifest 里的 vm_num 一旦陈旧或错装,
+#   同一台 host 上就会 `stop-vm.sh <tid> <别人的 vm_num>` —— 停掉同机另一个租户的 VM、
+#   整类"manifest 说 X、DDB 说 Y"就在设计上不存在,而不是靠逐字段比对去发现。
+#   代价为零:上面那次 get-item --consistent-read 本来就要做,坐标只是多投影三列 ——
+#   同一次往返,没有新增请求;manifest 反而更短(每 part 装更多租户,摊薄 PutParameter 的 3 TPS)。
+#   所以 DDB 的这两个字段是权威的;而控制面用 legacy 公式推算的端口"从未落到 iptables"
+#   (host-agent.py:1391-1404 的病史)—— 这本身就是"别信推算值、要信权威值"的直接证据。
+#
+# vm_num 缺失即 fail-closed 78:它是 tap-vm<n> 与 VM 目录的唯一定位依据,取不到就无法
+# 安全地动手。绝不当 0 或空处理 —— 那会让 stop-vm.sh 去停一个错的 tap。
+# host_port / guest_ip 缺失是【合法】的(没有 bitmap 路由的租户),按 delete-vm.sh 的
+# 缺省方向归一成 0 / 空串;`--output text` 对缺失属性返回字面 "None",要显式抹掉。
+if [ -n "${EXPECT_HOST}" ]; then
+  case "${_LF_VMNUM}" in
+    ''|None|*[!0-9]*)
+      echo "LIFECYCLE_COORDS_MISSING vm_num=${_LF_VMNUM}" >&2
+      exit 78
+      ;;
+  esac
+  [ "${_LF_HPORT}" = "None" ] && _LF_HPORT=0
+  [ -z "${_LF_HPORT}" ] && _LF_HPORT=0
+  [ "${_LF_GIP}" = "None" ] && _LF_GIP=""
+  printf '%s\t%s\t%s\n' "${_LF_VMNUM}" "${_LF_HPORT}" "${_LF_GIP}"
 fi
 exit 0

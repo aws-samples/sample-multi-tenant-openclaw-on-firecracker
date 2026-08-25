@@ -102,7 +102,7 @@
 
 **故障排查**:
 
-- 客户报"部分租户 404 部分 200":routes 缓存不一致——三层缓存 L1/L2/L3 有一层写坏。先 SSH edge 跑 `curl 127.0.0.1:8080/healthz` 确认 warmup ok;再看 route.lua log grep tenant_id 查是不是 L3 miss;再直连 Redis `redis-cli -h <primary-endpoint> get route:<tid>` 看数据在不在。
+- 客户报"部分租户 404 部分 200":routes 缓存不一致——三层缓存 L1/L2/L3 有一层写坏。先 SSH edge 跑 `curl 127.0.0.1:8080/healthz` 确认 warmup ok;再看 route.lua log grep tenant_id 查是不是 L3 miss;再直连 Redis `redis-cli -h <primary-endpoint> get route:<tid>` 看数据在不在。`redis.edge_read_from_replica` 打开后,还要用 reader endpoint 复现 edge 视角,再用 primary endpoint 查看权威值;两者不一致本身就是复制延迟信号。
 - 一波 503:大概率 Redis brownout,route.lua 进 fail-static;检查 ElastiCache event log 是否有 failover。
 
 ---
@@ -186,7 +186,7 @@
 **故障排查**:
 
 - edge 大量 fail-static(503) + 5xx:先看 Redis 连接性——从 edge 实例 `redis-cli -h <primary-endpoint> ping`;再看 primary endpoint DNS 是不是解析到活节点(`dig +short <primary-endpoint>`;看 AZ 有没有偏移)。
-- 一段时间内某租户 404:host-agent 没写 Redis。SSH 上对应 host 看 host-agent log grep tenant_id;直接 `redis-cli -h <endpoint> get route:<tid>` 看空不空。
+- 一段时间内某租户 404:host-agent 没写 Redis。SSH 上对应 host 看 host-agent log grep tenant_id;直接 `redis-cli -h <endpoint> get route:<tid>` 看空不空。`redis.edge_read_from_replica` 打开后,先用 reader endpoint 复现 edge 视角,再用 primary endpoint 查权威值;两者不一致本身就是复制延迟信号。
 
 ---
 

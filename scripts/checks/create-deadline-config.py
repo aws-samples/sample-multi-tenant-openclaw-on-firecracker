@@ -399,6 +399,78 @@ def _check_per_action_deadline_floor() -> List[str]:
     return []
 
 
+def _check_exec_budget_covers_the_real_ssm_timeout() -> List[str]:
+    """#565 G1 —— **预算不能只是纸面。**
+
+    预算表写「执行段 120s」而代码还给 `_ssm_run` 传 300s:三段之和照样等于死线、
+    `assert_all_budgets_consistent()` 照样绿,而线上照旧「判死了、SSM 还在跑」→ 孤儿资源。
+    所以必须有一条检查把**预算表**与**代码里真实传的那个 timeout** 绑在一起。
+
+    判据:扫 `tenant_service.py` 与 `core/ssm_dispatch.py` 里每个 `_ssm_run(...)` 的
+    `timeout=` 实参,凡是**字面整数**且大于八档里最大的执行段的,都报告出来 —— 那说明有一条
+    生命周期路径上的等待上界超过了任何一档的预算。走 **AST**:这两个文件的注释里逐字出现过
+    `timeout=300`(本轮解释预算的注释自己就写了它),文本匹配必然假红。
+
+    **为什么是"报告"而不是"判错"**:`_ssm_run` 还有一批与死线词汇表无关的调用方
+    (`reset`/`resize`/探针),它们没有客户死线,大 timeout 是正当的。判错会把它们一起打红,
+    而那不是本约束要管的事。但它们占的是**同一个 consumer 槽**,所以一条 300s 的 `reset`
+    会挤占词汇表内各档的排队段 —— 这条耦合必须被看见,故打印而不静默。
+
+    #604 —— **`start` 从这批"无死线调用方"里毕业了**:它进了死线词汇表(七档变八档),
+    `_ssm_run` 那条也从字面 `300` 换成 `exec_step_sec(start, "launch-vm")`=60,所以它不再
+    出现在下面的可疑清单里(本条检查的输出因此从 5 处降到 4 处 —— 那正是这次改动落地的
+    一个旁证)。上面那段举例随之改用 `reset`,它仍传字面 300。
+    """
+    # 判据取词汇表里**最小**的执行段,不是最大的。取最大(backup 的 300)会让这条检查几乎
+    # 无牙:`reset` 恰好也传 300,`300 > 300` 为假,一条都报不出来。
+    # 取最小才对得上要看见的那件事:**通道 B 的消费槽是共享的** —— 一条 300s 的 `reset` 占住
+    # 一个槽 300 秒,而 restart 的排队段只有 105s,期间任何排在它后面的 restart 都必然超死线。
+    #
+    # **档位名必须跟着数据算,不能写死**(#604 抓的):原文把标签硬写成「= restart」,而
+    # `start` 进词汇表后最小值变成它的 60s,于是那行报告会指着 60 说"这是 restart 的" ——
+    # 一个把读者引向错误档位的输出,比不打印更糟。
+    _by_exec = {a: cdl.exec_sec(a) for a in cdl.DEADLINE_ACTIONS}
+    smallest_action = min(_by_exec, key=lambda a: (_by_exec[a], a))
+    smallest = _by_exec[smallest_action]
+    suspicious = []
+    for rel in (
+        "deploy/lambda/api/services/tenant_service.py",
+        "deploy/lambda/api/core/ssm_dispatch.py",
+        "deploy/lambda/backup/handler.py",
+    ):
+        path = _REPO / rel
+        try:
+            src = path.read_text(encoding="utf-8")
+            tree = ast.parse(src)
+        except (OSError, SyntaxError) as e:
+            return [f"[repo] 读不到/解析不了 {rel}: {type(e).__name__}: {e}"]
+        for n in ast.walk(tree):
+            if not isinstance(n, ast.Call):
+                continue
+            fn = n.func
+            name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")
+            if name != "_ssm_run":
+                continue
+            for kw in n.keywords:
+                if kw.arg != "timeout":
+                    continue
+                if isinstance(kw.value, ast.Constant) and isinstance(
+                    kw.value.value, int
+                ):
+                    if kw.value.value > smallest:
+                        suspicious.append(f"{rel}:{n.lineno} timeout={kw.value.value}")
+    if suspicious:
+        print(
+            f"  ! 有 {len(suspicious)} 处 `_ssm_run` 的字面 timeout 超过死线词汇表里"
+            f"最小的执行段({smallest}s = {smallest_action})。若其中任何一处在词汇表路径上,"
+            f"那一档的预算就是纸面的;若在非死线动作上(reset/resize/探针),它们仍占同一个"
+            f"通道 B 消费槽 —— 一条 300s 的 reset 能把 restart 的 105s 排队段整段吃掉"
+            f"(#565 G4/G5 的耦合): "
+            + ", ".join(suspicious)
+        )
+    return []
+
+
 def _check_deadline_config_parity(cfg: Dict[str, Any]) -> List[str]:
     """`config.yml` 的 `lifecycle.deadline_sec` 与代码里那份客户表格值必须**同源**。
 
@@ -574,6 +646,7 @@ def run(live: bool, cfg_path: Optional[Path] = None) -> Tuple[List[str], Dict[st
     problems += _check_scaler_cannot_save_this_request(cfg)
     # #564 G8 —— 七档 per-action 死线。前两条判错,后两条只报告(理由见各自 docstring)。
     problems += _check_per_action_deadline_floor()
+    problems += _check_exec_budget_covers_the_real_ssm_timeout()
     problems += _check_deadline_config_parity(cfg)
     problems += _report_deadline_floors_not_covered()
     problems += _check_async_failure_exits_iac()

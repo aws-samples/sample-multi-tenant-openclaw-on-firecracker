@@ -266,6 +266,58 @@ def _render_metrics_text(
             )
             out.append("# TYPE openclaw_host_ssm_agent_up gauge")
             out.append(f"openclaw_host_ssm_agent_up {1 if ssm else 0}")
+        egress = agent_stats.get("egress_reconcile")
+        if isinstance(egress, dict) and egress:
+            desired = str(egress.get("desired") or "").replace("\\", "\\\\").replace('"', '\\"')
+            applied_version = (
+                str(egress.get("applied_version") or "")
+                .replace("\\", "\\\\")
+                .replace('"', '\\"')
+            )
+            applied_sha256 = (
+                str(egress.get("applied_sha256") or "")
+                .replace("\\", "\\\\")
+                .replace('"', '\\"')
+            )
+            out.append(
+                "# HELP openclaw_host_egress_reconcile_info selected desired"
+                " egress mode and last successfully applied policy version"
+            )
+            out.append("# TYPE openclaw_host_egress_reconcile_info gauge")
+            out.append(
+                "openclaw_host_egress_reconcile_info"
+                f'{{desired="{desired}",applied_version="{applied_version}",'
+                f'applied_sha256="{applied_sha256}"}} 1'
+            )
+            out.append(
+                "# HELP openclaw_host_egress_reconcile_fail_streak consecutive"
+                " failed egress reconcile attempts"
+            )
+            out.append("# TYPE openclaw_host_egress_reconcile_fail_streak gauge")
+            out.append(
+                "openclaw_host_egress_reconcile_fail_streak"
+                f" {int(egress.get('fail_streak') or 0)}"
+            )
+            out.append(
+                "# HELP openclaw_host_egress_reconcile_error 1 if the latest"
+                " egress reconcile attempt failed open and needs retry"
+            )
+            out.append("# TYPE openclaw_host_egress_reconcile_error gauge")
+            out.append(
+                "openclaw_host_egress_reconcile_error"
+                f" {1 if egress.get('error') else 0}"
+            )
+        drift_reapply = agent_stats.get("egress_drift_reapply_total")
+        if drift_reapply is not None:
+            out.append(
+                "# HELP openclaw_host_egress_drift_reapply_total egress chain"
+                " reapplies triggered by measured sha256 drift"
+            )
+            out.append("# TYPE openclaw_host_egress_drift_reapply_total counter")
+            out.append(
+                "openclaw_host_egress_drift_reapply_total"
+                f" {int(drift_reapply)}"
+            )
         # 这条答"它在但收不动命令"。判据锚点见 _probe_ssm_buffer_full 的注释。
         buf = agent_stats.get("ssm_buffer_full")
         if buf is not None:
@@ -477,17 +529,75 @@ def _ensure_route(tenant_id: str, guest_ip: str) -> tuple[str, int | None]:
     return host_ip, port
 
 
-def _release_route(tenant_id: str, host_port: int | None, guest_ip: str) -> None:
-    """Symmetric release. Best-effort: any single component failing must
-    not block the others (crash recovery calls this)."""
+def _release_route(tenant_id: str, host_port: int | None, guest_ip: str) -> bool:
+    """Best-effort release; return whether the Redis route was confirmed gone.
+
+    #605 —— 这里刻意放弃了旧 docstring 的「any single component failing must not
+    block the others」对称语义,改成【Redis 先行,失败即隔离端口】。理由和代价都写在
+    这里,因为这是一个用可用性换红线的取舍,不是顺手改的顺序:
+
+      · 为什么 Redis 必须先删:槽位复用是【立即】发生的(真机实测:删掉一个租户后,
+        第一个新建租户就落回同一个 host:port)。port 先回池 → 新租户拿到该端口 →
+        而旧 route 还指向那个 (host,port) → 请求被转到别人的 VM。那是「不得跨租户」
+        这条不可协商红线的直接违反。
+      · 为什么 Redis 删不掉时【不】释放端口:此时 route 仍指向 (host,port)。把端口
+        放回池里等于主动把上面那条红线的窗口打开。保留占用 = fail-closed:端口不会
+        被重新分配,那条残留 route 指向一个没人接管的槽位,请求失败而不是串到别人。
+      · 代价(必须知情):被隔离的端口和 DNAT 规则【不会自动回收】。
+        route_ops.reconcile_drift 明写只报 orphan_dnat 不自动修复,而端口位图是从
+        iptables 重建的,所以留下的 DNAT 规则会让该端口永久算作已占用。端口池是
+        DNAT_PORT_LOW..HIGH(缺省 10000-15000,5001 槽),单台 host 上 Redis 长时间
+        降级期间的批量删除会持续消耗它。日志里带上被隔离的端口号就是为了让这件事
+        可追、可人工回收;自动回收端口留给后续 issue,不在 #605 范围内。
+
+    _cli_delete_route(同文件契约的另一条路径)仍然是 DNAT 优先 —— 它在
+    delete-vm.sh 的在役同步删除链上,改它波及面超出本 issue。
+    """
+
+    def _quarantined() -> str:
+        if host_port is None or not guest_ip:
+            return "no port state to quarantine"
+        return (
+            f"port {host_port} -> {guest_ip} left QUARANTINED "
+            "(DNAT kept so the stale route cannot reach a new tenant; "
+            "not auto-reclaimed)"
+        )
+
+    try:
+        writer = _get_redis_writer()
+    except Exception as e:
+        print(
+            f"CRITICAL release-route {tenant_id}: Redis writer lookup failed ({e}) "
+            f"- route left behind, reconciler must reclaim; {_quarantined()}"
+        )
+        return False
+    if writer is None:
+        print(
+            f"CRITICAL release-route {tenant_id}: no Redis writer "
+            f"- route left behind, reconciler must reclaim; {_quarantined()}"
+        )
+        return False
+    try:
+        deleted = writer.del_route(tenant_id)
+    except Exception as e:
+        print(
+            f"CRITICAL release-route {tenant_id}: Redis DEL raised ({e}) "
+            f"- route left behind, reconciler must reclaim; {_quarantined()}"
+        )
+        return False
+    if not deleted:
+        print(
+            f"CRITICAL release-route {tenant_id}: Redis DEL failed "
+            f"- route left behind, reconciler must reclaim; {_quarantined()}"
+        )
+        return False
+
     if host_port is not None and guest_ip:
         try:
             route_ops.release_port_and_dnat(_get_port_bitmap(), host_port, guest_ip)
         except Exception as e:
             print(f"release_port_and_dnat({host_port},{guest_ip}) failed: {e}")
-    writer = _get_redis_writer()
-    if writer is not None:
-        writer.del_route(tenant_id)
+    return True
 
 
 def _resolve_region():
@@ -773,6 +883,37 @@ def _fc_boot_iso(fc_pid):
         return ""
 
 
+def _mounted_image_snapshots(fc_pid, proc_root="/proc"):
+    """Return snapshot ids proven by the running Firecracker's open disk FDs."""
+    evidence = {"rootfs": "", "immutable": ""}
+    if fc_pid is None:
+        return evidence
+    fd_dir = os.path.join(proc_root, str(fc_pid), "fd")
+    try:
+        names = os.listdir(fd_dir)
+    except OSError:
+        return evidence
+    marker = "/data/firecracker-assets/versions/"
+    for name in names:
+        try:
+            target = os.readlink(os.path.join(fd_dir, name))
+        except OSError:
+            continue
+        if target.endswith(" (deleted)"):
+            target = target[: -len(" (deleted)")]
+        if marker not in target:
+            continue
+        suffix = target.split(marker, 1)[1]
+        parts = suffix.split("/")
+        if len(parts) != 2 or not parts[0]:
+            continue
+        if parts[1] == "openclaw-rootfs.ext4":
+            evidence["rootfs"] = parts[0]
+        elif parts[1] == "openclaw-immutable.ext4":
+            evidence["immutable"] = parts[0]
+    return evidence
+
+
 def _probe_app_health(guest_ip, chat_ep):
     """探 guest gateway 的 app_health,返回 "up"/"down"。
 
@@ -919,6 +1060,9 @@ def _probe_all():
             }
             continue
 
+        mounted_evidence = (
+            _mounted_image_snapshots(fc_pid) if vm_health == "up" else {}
+        )
         results[tenant_id] = {
             "vm_health": vm_health,
             "app_health": app_health,
@@ -941,6 +1085,12 @@ def _probe_all():
                 {
                     "observed_image_snapshot_time": observed_image,
                     "observed_boot_at": _fc_boot_iso(fc_pid),
+                    "observed_mounted_rootfs_snapshot_time": (
+                        mounted_evidence.get("rootfs", "")
+                    ),
+                    "observed_mounted_immutable_snapshot_time": (
+                        mounted_evidence.get("immutable", "")
+                    ),
                 }
                 if vm_health == "up"
                 else {}
@@ -1357,6 +1507,13 @@ def _refresh_health(table, tid, info, now, metrics, host_port=None):
         # 同进同退,否则会出现新版本配旧启动时刻的错配组合。
         expr += ", observed_boot_at = :oba"
         vals[":oba"] = info.get("observed_boot_at") or ""
+        # Unlike vm.json, these values come from the running Firecracker process's
+        # open file descriptors. Write empty values too so a new report cannot be
+        # accidentally paired with stale mount evidence from an earlier boot.
+        expr += ", observed_mounted_rootfs_snapshot_time = :omr"
+        expr += ", observed_mounted_immutable_snapshot_time = :omi"
+        vals[":omr"] = info.get("observed_mounted_rootfs_snapshot_time") or ""
+        vals[":omi"] = info.get("observed_mounted_immutable_snapshot_time") or ""
     # 病史:restore 由控制面用 legacy 公式 VM_PORT_BASE + vm_num - 1 算 host_port 并直接
     # 翻 running,而那个端口族【从未落到 iptables】(ssm_dispatch 的 "never consumed by
     # Edge" 注释,同段还明确 "Keep host_port in the record for the live bitmap route")。
@@ -2862,8 +3019,13 @@ def _reap_orphan_firecrackers():
             # 缓存指向已删 VM 的 host:port(DNAT 已被控制面摘,连接 refused/502)。
             # _release_route 无条件 del_route(tenant),port=None 时跳过 DNAT(delete 已摘)。
             try:
-                _release_route(orphan_tid, None, "")
-                print(f"overwatcher: released redis route {orphan_tid}")
+                if _release_route(orphan_tid, None, ""):
+                    print(f"overwatcher: released redis route {orphan_tid}")
+                else:
+                    print(
+                        f"CRITICAL overwatcher: redis route {orphan_tid} "
+                        "not released; reconciler must reclaim"
+                    )
             except Exception as e:
                 print(f"overwatcher: release route {orphan_tid} failed: {e}")
             reaped += 1
@@ -3634,12 +3796,18 @@ def _housekeeping_loop():
         time.sleep(DISPATCH_HOUSEKEEPING_SEC)
 
 
-# #566 拆分② — egress_mode reconcile:控制面 API(POST /hosts/egress)把期望态写进本机
-# host 行的 egress_mode 字段;host-agent 每轮 poll 读它并把 OPENCLAW-EGRESS 链收敛到期望态。
-# 这是「扛 host 重建/重启」的持久化支点:纯 SSM live-apply 在重启后丢失,靠这里从 DDB 收敛回来。
-# 只在 mode 变化时动 iptables(幂等 scratch-swap);apply 派生 LLM 洞与 init-host/API 同口径。
+# #566/#577 — egress reconcile:控制面把 fleet 单例与定向 host 期望态写进 hosts 表;
+# host-agent 每轮 poll 选较新的策略,把 OPENCLAW-EGRESS 链收敛到该版本。纯 SSM live-apply
+# 在重建后会丢失,新 host 还可能没有链脚本,所以 deny 首次收敛会从 assets 桶自取脚本。
 _egress_applied_mode = None
+_egress_applied_version = None
+_egress_applied_sha = None
+_egress_fail_streak = 0
+_egress_reconcile_error = ""
+_egress_drift_reapply_total = 0
 _EGRESS_CHAIN_SH = "/home/ubuntu/oc-egress-chain.sh"
+_EGRESS_SHA_CMD = "iptables -S OPENCLAW-EGRESS 2>/dev/null | sha256sum | cut -d' ' -f1"
+_FLEET_EGRESS_POLICY_ID = "__fleet_egress_policy__"
 
 
 def _derive_egress_env():
@@ -3661,6 +3829,9 @@ def _derive_egress_env():
     vpc = env.get("EGRESS_VPC_CIDR", "")
     if not vpc:
         return None
+    llm_cidr = env.get("EGRESS_LLM_CIDR", "")
+    subnet_prefix = env.get("SUBNET_PREFIX", "")
+    tenant_supernet = f"{subnet_prefix}.0.0/16" if subnet_prefix else ""
     raw = env.get("LITELLM_HOST", "")
     u = urlparse(raw if "://" in raw else "//" + raw, scheme="")
     host = u.hostname or ""
@@ -3669,10 +3840,11 @@ def _derive_egress_env():
     if not port:
         port = 443 if scheme == "https" else (80 if scheme == "http" else 4000)
     ip = ""
-    try:
-        ip = socket.gethostbyname(host) if host else ""
-    except OSError:
-        ip = ""
+    if not llm_cidr:
+        try:
+            ip = socket.gethostbyname(host) if host else ""
+        except OSError:
+            ip = ""
     in_vpc = False
     try:
         in_vpc = bool(ip) and ipaddress.ip_address(ip) in ipaddress.ip_network(vpc, strict=False)
@@ -3680,8 +3852,12 @@ def _derive_egress_env():
         in_vpc = False
     return {
         "VPC_CIDR": vpc,
-        "LITELLM_HOST": ip if in_vpc else "",  # 公网网关不开内网洞,靠公网 RETURN
+        # 公网网关不开内网洞,靠公网 RETURN
+        "LITELLM_HOST": ip if in_vpc and not llm_cidr else "",
+        # CIDR 模式不冻结 DNS 单 IP。
+        "LITELLM_CIDR": llm_cidr,
         "LITELLM_PORT": str(port),
+        "TENANT_SUPERNET": tenant_supernet,
         "SPIRE_SERVER": env.get("SPIRE_SERVER_IP", ""),
         "TAP_IFACE": "tap+",
         "DENY_RFC1918": "false",
@@ -3693,7 +3869,8 @@ def _egress_chain_present():
     try:
         return (
             subprocess.run(
-                ["iptables", "-S", "OPENCLAW-EGRESS"],
+                # 读取与 apply 共用 xtables 锁;等待短暂持锁,避免把已收敛误报成失败。
+                ["iptables", "-w", "5", "-S", "OPENCLAW-EGRESS"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=10,
@@ -3704,54 +3881,536 @@ def _egress_chain_present():
         return False
 
 
-def _reconcile_egress():
-    """state-based reconcile:把 OPENCLAW-EGRESS 的【实际】状态收敛到 DDB 期望态。
+def _egress_chain_sha():
+    """Return the measured OPENCLAW-EGRESS rules fingerprint, fail-soft."""
+    try:
+        result = subprocess.run(
+            ["bash", "-c", _EGRESS_SHA_CMD],
+            capture_output=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return ""
+        return result.stdout.strip().decode()
+    except Exception:  # noqa: BLE001
+        return ""
 
-    自愈 reboot(链随机器丢)与带外移除:desired=deny 但链缺→装;desired=off 但链在→拆;
-    已收敛则不动内核(不每轮重复 apply)。这是「扛 host 重建」的持久化支点。
+
+# 这四条判据逐条照抄 oc-egress-chain.sh 的 verify_forward_precedence:
+# 只看 FORWARD、jump 锚定行尾、只豁免严格 RELATED+ESTABLISHED 锚点,
+# 并对白名单 target 之外的 guest 前置规则 fail-closed。改任一处时必须同步两处。
+def _egress_chain_forward_precedence(target="OPENCLAW-EGRESS"):
+    """返回 (jump_pos, preceding_accepts);-1 表示读不到,0 表示确认缺失。"""
+    try:
+        result = subprocess.run(
+            # 与 apply 侧共享 xtables 锁;等待 5 秒,不把并发写锁当成内核未收敛。
+            ["iptables", "-w", "5", "-S", "FORWARD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:  # noqa: BLE001
+        return -1, -1
+    if result.returncode != 0:
+        return -1, -1
+    if not result.stdout:
+        # `iptables -S FORWARD` 至少应有策略行;全空不是“确认无 jump”的证据。
+        return -1, -1
+
+    number = 0
+    offenders = 0
+    for line in result.stdout.splitlines():
+        if not line.startswith("-A FORWARD "):
+            continue
+        number += 1
+        if line.endswith(f" -j {target}"):
+            return number, offenders
+
+        fields = line.split()
+        target_flag = ""
+        rule_target = ""
+        for index, field in enumerate(fields):
+            if field in ("-j", "-g"):
+                target_flag = field
+                if index + 1 < len(fields):
+                    rule_target = fields[index + 1]
+                break
+
+        ctstate_values = []
+        ctstates = set()
+        if "--ctstate" in fields:
+            state_index = fields.index("--ctstate")
+            if state_index + 1 < len(fields):
+                ctstate_values = fields[state_index + 1].split(",")
+                ctstates = set(ctstate_values)
+        is_conntrack_anchor = (
+            target_flag == "-j"
+            and rule_target == "ACCEPT"
+            and "-m conntrack" in line
+            and "--ctstate" in fields
+            and "RELATED" in ctstates
+            and "ESTABLISHED" in ctstates
+            and "NEW" not in ctstates
+            and len(ctstate_values) == 2
+            and ctstates == {"RELATED", "ESTABLISHED"}
+        )
+        if is_conntrack_anchor:
+            continue
+        may_hit_guest = " -i " not in line or " -i tap" in line
+        if not may_hit_guest:
+            continue
+        if (
+            target_flag == "-j"
+            and rule_target in {"DROP", "REJECT", "LOG"}
+        ):
+            continue
+        # RETURN、自定义链、goto 与无法解析 target 都可能绕过在役链,统一 fail-closed。
+        offenders += 1
+    return 0, -1
+
+
+def _egress_decision(
+    desired_mode,
+    chain_present,
+    applied_version,
+    desired_version,
+    forward_precedence=(1, 0),
+):
+    """Return the level-triggered action required to converge egress."""
+    if desired_mode not in ("off", "deny"):
+        return "noop"
+    if desired_mode == "deny":
+        jump_pos, preceding_accepts = forward_precedence
+        if (
+            not chain_present
+            or jump_pos <= 0
+            or preceding_accepts != 0
+            or applied_version != desired_version
+        ):
+            return "apply"
+        return "noop"
+    return "teardown" if chain_present else "noop"
+
+
+def _egress_convergence_gap(chain_present, forward_precedence):
+    """把内核未收敛原因分成链缺失、FORWARD 读不到、jump 缺失与被短路。"""
+    if not chain_present:
+        return "OPENCLAW-EGRESS chain is not installed"
+    jump_pos, preceding_accepts = forward_precedence
+    if jump_pos < 0:
+        return (
+            "OPENCLAW-EGRESS chain is installed but FORWARD rules are unreadable"
+        )
+    if jump_pos == 0:
+        return (
+            "OPENCLAW-EGRESS chain is installed but its FORWARD jump is missing"
+        )
+    if preceding_accepts < 0:
+        return (
+            "OPENCLAW-EGRESS chain is installed but FORWARD precedence "
+            "could not be evaluated"
+        )
+    if preceding_accepts > 0:
+        return (
+            "OPENCLAW-EGRESS chain is installed but its FORWARD jump at "
+            f"position {jump_pos} is short-circuited by {preceding_accepts} "
+            "preceding unsafe guest rule(s)"
+        )
+    return ""
+
+
+def _coerce_pinned(raw):
+    """把 DDB 里的 egress_pinned 归一成 (pinned: bool, invalid: bool)。
+
+    只有真正的 DDB BOOL true 算 pin。host-agent 走 boto3 resource,{"S":"false"} 会
+    还原成 Python 字符串 "false",而 bool("false") 是 True —— 与 _ON_HOST 的 shell
+    判据方向相反,机器会在 SSM apply(装链)与 poll reconcile(拆链)之间每个 poll
+    翻一次,两边日志各自都"正常"。§2.1.1 有五种写法的 apse1 真机读数。
     """
-    global _egress_applied_mode
+    if raw is None:
+        return False, False
+    if raw is True:
+        return True, False
+    if raw is False:
+        return False, False
+    return False, True
+
+
+def _egress_policy_source(fleet_item, host_item):
+    """选出这台 host 该听哪份期望态。返回 (source, policy) —— 纯函数,便于单测直接调。
+
+    source ∈ {"fleet", "host", "none"}。
+    """
+    fleet_policy = fleet_item if fleet_item.get("egress_mode") else None
+    host_policy = host_item if host_item.get("egress_mode") else None
+    pinned, _invalid = _coerce_pinned(host_item.get("egress_pinned"))
+    # 单向语义(§2.3):pin 只挡"变得更严",机队熔断 off 在【写入时刻】赢。
+    # 准确口径:fleet 单例是 off 时 pin 让位,链被拆掉。但这不是永久钉死 —— 之后
+    # 若有人再对这台机器做一次定向写(egress_desired_at 变新),下面的时间戳分支
+    # 会让它回到 host 行的 mode。那是既有的时间戳语义,不是 pin 引入的。
+    # 少了 not fleet_is_off 这个合取项,pinned+deny 的机器会挡住客户的全量 off,
+    # 那是本次改动【新造】的一种中断,恰好废掉唯一的 break-glass 路径。
+    fleet_is_off = (
+        bool(fleet_policy) and fleet_policy.get("egress_mode") == "off"
+    )
+    if pinned and host_policy and not fleet_is_off:
+        return "host", host_policy
+    if fleet_policy and host_policy:
+        fleet_updated_at = str(fleet_policy.get("updated_at") or "")
+        host_desired_at = str(host_policy.get("egress_desired_at") or "")
+        if fleet_updated_at >= host_desired_at:
+            return "fleet", fleet_policy
+        return "host", host_policy
+    if fleet_policy:
+        return "fleet", fleet_policy
+    if host_policy:
+        return "host", host_policy
+    return "none", {}
+
+
+# #577 increment-2 —— 链【内容】漂移判定刻意留在 _egress_decision 之外。两个理由:
+#   ① _egress_decision 保持纯真值表;第五参补 FORWARD precedence,默认值只为兼容既有
+#      四参调用,reconcile 对 deny/noop 候选一定会再传内核实测值;
+#   ② 计数器语义必须是"真的重装成功过几次"。若在决策处 +1,deny apply 失败会 fail-open
+#      每个 poll 重试一次、计数无界上涨,指标从"重装次数"退化成"检测次数"。
+def _egress_sha_drifted(applied_sha, current_sha):
+    """True when a measured chain fingerprint differs from the applied one.
+
+    An empty applied_sha (agent restart, or never applied) must NOT count as
+    drift: that case is already covered by the policy-version comparison, and
+    treating it as drift would reapply on every restart for no reason.
+    """
+    return bool(applied_sha) and bool(current_sha) and current_sha != applied_sha
+
+
+def _bump_egress_drift_reapply():
+    """Count one drift-triggered reinstall that actually succeeded."""
+    global _egress_drift_reapply_total
+    _egress_drift_reapply_total += 1
+
+
+def _fetch_egress_scripts():
+    """Fetch chain assets for a new host before its first deny reconcile."""
+    script_dir = os.path.dirname(_EGRESS_CHAIN_SH)
+    fetch_env = dict(os.environ)
+    fetch_env["EGRESS_SCRIPT_DIR"] = script_dir
+    # 桶名优先取 platform.env 的 ASSETS_BUCKET 整行值(与 launch-vm.sh:438/1592、
+    # backup-data.sh:16 等十余处同源读法)。原来的 'openclaw-assets-[0-9]+' 正则会把带
+    # 区域后缀的桶名截断:真机 us-west-2 上 ASSETS_BUCKET=openclaw-assets-<acct>-us-west-2,
+    # 正则只抽出 openclaw-assets-<acct> → aws s3 cp 打到另一个区的桶 → 新 host 的 deny
+    # 首次收敛恒失败(fail-open + fail_streak 上涨,链永远装不上)。保留正则做兜底,兼容
+    # 没有 ASSETS_BUCKET 键的旧 host。
+    fetch_script = r"""
+set -e
+B=$(grep -E '^ASSETS_BUCKET=' /etc/platform.env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"')
+[ -n "$B" ] || B=$(grep -oE 'openclaw-assets-[0-9]+' /etc/platform.env 2>/dev/null | head -1)
+[ -n "$B" ]
+CHAIN_TMP="$EGRESS_SCRIPT_DIR/.oc-egress-chain.sh.$$"
+SIM_TMP="$EGRESS_SCRIPT_DIR/.oc-egress-sim.py.$$"
+trap 'rm -f "$CHAIN_TMP" "$SIM_TMP"' EXIT
+aws s3 cp "s3://$B/deployment/scripts/oc-egress-chain.sh" "$CHAIN_TMP" --quiet
+aws s3 cp "s3://$B/deployment/scripts/oc-egress-sim.py" "$SIM_TMP" --quiet
+chmod +x "$CHAIN_TMP" "$SIM_TMP"
+mv "$CHAIN_TMP" "$EGRESS_SCRIPT_DIR/oc-egress-chain.sh"
+mv "$SIM_TMP" "$EGRESS_SCRIPT_DIR/oc-egress-sim.py"
+"""
+    result = subprocess.run(
+        ["bash", "-c", fetch_script],
+        env=fetch_env,
+        timeout=60,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def _write_egress_reconcile_status(
+    table, desired, policy_source, pinned_invalid, publish_applied=True
+):
+    """Publish the latest local convergence state to metrics and this host row."""
+    applied_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    with _lock:
+        _agent_metrics["egress_reconcile"] = {
+            "desired": desired,
+            "applied_version": _egress_applied_version,
+            "applied_sha256": _egress_applied_sha,
+            "fail_streak": _egress_fail_streak,
+            "error": _egress_reconcile_error,
+            "policy_source": policy_source,
+            "pinned_invalid": pinned_invalid,
+        }
+    try:
+        diagnostic_values = {
+            ":e": _egress_reconcile_error,
+            ":ps": policy_source,
+            ":pi": pinned_invalid,
+        }
+        if publish_applied:
+            update_expression = (
+                "SET egress_applied_mode = :m, egress_applied_version = :v, "
+                "egress_applied_sha256 = :s, egress_applied_at = :ts, "
+                "egress_reconcile_error = :e, egress_policy_source = :ps, "
+                "egress_pinned_invalid = :pi"
+            )
+            expression_values = {
+                ":m": _egress_applied_mode or "",
+                ":v": (
+                    _egress_applied_version
+                    if _egress_applied_version is not None
+                    else ""
+                ),
+                ":s": _egress_applied_sha or "",
+                ":ts": applied_at,
+                **diagnostic_values,
+            }
+        else:
+            # 失败态只发布诊断,不能把内存里的旧 mode/version/sha 再写成“本轮已收敛”。
+            update_expression = (
+                "SET egress_reconcile_error = :e, egress_policy_source = :ps, "
+                "egress_pinned_invalid = :pi"
+            )
+            expression_values = diagnostic_values
+        table.update_item(
+            Key={"instance_id": INSTANCE_ID},
+            UpdateExpression=update_expression,
+            ConditionExpression="attribute_exists(instance_id)",
+            ExpressionAttributeValues=expression_values,
+        )
+        _note_ddb_ok()
+    except Exception as e:  # noqa: BLE001 — status visibility must not stop poll
+        _handle_ddb_exc(e, "egress reconcile status write failed")
+
+
+def _egress_reconcile_success(
+    table,
+    desired,
+    desired_version,
+    applied_sha,
+    policy_source,
+    pinned_invalid,
+):
+    global _egress_applied_mode, _egress_applied_version
+    global _egress_applied_sha
+    global _egress_fail_streak, _egress_reconcile_error
+    _egress_applied_mode = desired
+    _egress_applied_version = desired_version
+    _egress_applied_sha = applied_sha
+    _egress_fail_streak = 0
+    _egress_reconcile_error = ""
+    _write_egress_reconcile_status(
+        table, desired, policy_source, pinned_invalid
+    )
+
+
+def _egress_reconcile_failure(
+    table, desired, error, policy_source, pinned_invalid
+):
+    global _egress_fail_streak, _egress_reconcile_error
+    _egress_fail_streak += 1
+    _egress_reconcile_error = error
+    _write_egress_reconcile_status(
+        table,
+        desired,
+        policy_source,
+        pinned_invalid,
+        publish_applied=False,
+    )
+
+
+def _reconcile_egress():
+    """Level-triggered reconcile of OPENCLAW-EGRESS to the newest DDB policy.
+
+    Agent restart clears the in-memory applied version, causing one extra harmless,
+    idempotent re-apply. Version comparison intentionally uses != so clock rollback
+    cannot suppress convergence.
+    """
     if not HOSTS_TABLE or not INSTANCE_ID:
         return
-    if not os.path.exists(_EGRESS_CHAIN_SH):
-        return  # 脚本未下发(egress 从未开过)→ 无需 reconcile
     try:
-        item = (
-            _get_ddb().Table(HOSTS_TABLE).get_item(Key={"instance_id": INSTANCE_ID})
-        ).get("Item")
+        table = _get_ddb().Table(HOSTS_TABLE)
+        fleet_item = table.get_item(
+            Key={"instance_id": _FLEET_EGRESS_POLICY_ID},
+            ConsistentRead=True,
+        ).get("Item") or {}
+        host_item = table.get_item(
+            Key={"instance_id": INSTANCE_ID},
+            ConsistentRead=True,
+        ).get("Item") or {}
     except Exception as e:  # noqa: BLE001 — reconcile 失败绝不影响 poll
         print(f"egress reconcile read failed (non-fatal): {e}")
         return
-    desired = (item or {}).get("egress_mode", "off")
+
+    policy_source, policy = _egress_policy_source(fleet_item, host_item)
+    _pinned, pinned_invalid = _coerce_pinned(
+        host_item.get("egress_pinned")
+    )
+
+    desired = policy.get("egress_mode", "off")
+    desired_version = policy.get("policy_version")
+    if desired_version is None:
+        desired_version = policy.get("egress_desired_at") or desired
     if desired not in ("off", "deny"):
+        _write_egress_reconcile_status(
+            table, desired, policy_source, pinned_invalid
+        )
         return
+
+    if not os.path.exists(_EGRESS_CHAIN_SH):
+        if desired == "off":
+            _egress_reconcile_success(
+                table,
+                desired,
+                desired_version,
+                "",
+                policy_source,
+                pinned_invalid,
+            )
+            return
+        try:
+            fetched = _fetch_egress_scripts()
+        except Exception as e:  # noqa: BLE001 — fail open and retry next poll
+            fetched = False
+            fetch_error = str(e)
+        else:
+            fetch_error = "script fetch exited non-zero"
+        if not fetched:
+            error = f"script fetch failed: {fetch_error}"
+            print(f"egress reconcile fetch failed (fail-open: retry): {error}")
+            _egress_reconcile_failure(
+                table, desired, error, policy_source, pinned_invalid
+            )
+            return
+
     present = _egress_chain_present()
-    need_apply = desired == "deny" and not present
-    need_teardown = desired == "off" and present
-    if not need_apply and not need_teardown:
-        _egress_applied_mode = desired  # 已收敛
+    current_sha = _egress_chain_sha()
+    forward_precedence = _egress_chain_forward_precedence()
+    action = _egress_decision(desired, present, _egress_applied_version, desired_version)
+    # 先保留既有四参 presence/version 基线;只有它准备 noop 时,才用 FORWARD 实测
+    # 否决“链在但 jump 缺失/被短路/读不到”的假收敛。
+    if desired == "deny" and action == "noop":
+        action = _egress_decision(
+            desired,
+            present,
+            _egress_applied_version,
+            desired_version,
+            forward_precedence,
+        )
+    # 链存在且 policy_version 未变时 presence/version 判 noop,但链【内容】可能已被带外改写
+    # (人工 -F、别的脚本插规则、上次 apply 半成品)。指纹比对是唯一能看见这类漂移的判据。
+    drifted = (
+        desired == "deny"
+        and action == "noop"
+        and _egress_sha_drifted(_egress_applied_sha, current_sha)
+    )
+    if drifted:
+        action = "apply"
+    if action == "noop":
+        _egress_reconcile_success(
+            table,
+            desired,
+            desired_version,
+            current_sha,
+            policy_source,
+            pinned_invalid,
+        )
         return
+    apply_gap = (
+        _egress_convergence_gap(present, forward_precedence)
+        if action == "apply"
+        else ""
+    )
     try:
-        if need_apply:
+        if action == "apply":
             extra = _derive_egress_env()
             if not extra:
-                print("egress reconcile: cannot derive env (missing platform.env/VPC) — skip")
+                detail = "cannot derive env (missing platform.env/VPC)"
+                error = f"{apply_gap}; {detail}" if apply_gap else detail
+                print(f"egress reconcile APPLY FAILED (fail-open: retry): {error}")
+                _egress_reconcile_failure(
+                    table, desired, error, policy_source, pinned_invalid
+                )
                 return
             run_env = dict(os.environ)
             run_env.update(extra)
-            if (item or {}).get("egress_deny_rfc1918") is True:
+            if policy.get("egress_deny_rfc1918") is True:
                 run_env["DENY_RFC1918"] = "true"
             # #566 follow-up — 连同运维经 API 加的额外放行洞一起收敛(重启/重建后不丢端口)。
-            run_env["EGRESS_EXTRA_ALLOW"] = str((item or {}).get("egress_extra_allow", "") or "")
-            subprocess.run(["bash", _EGRESS_CHAIN_SH, "apply"], env=run_env, timeout=60, check=False)
+            run_env["EGRESS_EXTRA_ALLOW"] = str(
+                policy.get("egress_extra_allow", "") or ""
+            )
+            apply_result = subprocess.run(
+                ["bash", _EGRESS_CHAIN_SH, "apply"],
+                env=run_env,
+                timeout=60,
+                check=False,
+            )
+            if apply_result.returncode != 0:
+                detail = f"apply exited {apply_result.returncode}"
+                error = f"{apply_gap}; {detail}" if apply_gap else detail
+                print(f"egress reconcile APPLY FAILED (fail-open: retry): {error}")
+                _egress_reconcile_failure(
+                    table, desired, error, policy_source, pinned_invalid
+                )
+                return
+            # chain.sh 自己会验 precedence,但 host-agent 必须用同一口径回读一次;
+            # 脚本误返 0、并发改写或 iptables 读失败都不能被写成“已收敛”。
+            measured_present = _egress_chain_present()
+            measured_forward = _egress_chain_forward_precedence()
+            measured_gap = _egress_convergence_gap(
+                measured_present, measured_forward
+            )
+            if measured_gap:
+                error = f"apply returned success but {measured_gap}"
+                print(f"egress reconcile APPLY FAILED (fail-open: retry): {error}")
+                _egress_reconcile_failure(
+                    table, desired, error, policy_source, pinned_invalid
+                )
+                return
         else:
             run_env = dict(os.environ)
-            run_env.update({"VPC_CIDR": "10.0.0.0/8", "TAP_IFACE": "tap+"})
-            subprocess.run(["bash", _EGRESS_CHAIN_SH, "teardown"], env=run_env, timeout=60, check=False)
-        _egress_applied_mode = desired
-        print(f"egress reconcile: converged to egress_mode={desired} (was drift: apply={need_apply} teardown={need_teardown})")
+            # teardown 只删链,不构建规则 → chain.sh 的 require_apply_config 不参与,
+            # 无需(也不该)喂 VPC_CIDR:写死一个网段假值会掩盖入参校验并误导后续读者。
+            run_env.update({"TAP_IFACE": "tap+"})
+            teardown_result = subprocess.run(
+                ["bash", _EGRESS_CHAIN_SH, "teardown"],
+                env=run_env,
+                timeout=60,
+                check=False,
+            )
+            if teardown_result.returncode != 0:
+                error = f"teardown exited {teardown_result.returncode}"
+                print(f"egress reconcile TEARDOWN FAILED (retry): {error}")
+                _egress_reconcile_failure(
+                    table, desired, error, policy_source, pinned_invalid
+                )
+                return
+        measured_sha = _egress_chain_sha()
+        applied_sha = measured_sha if action == "apply" else ""
+        if drifted:
+            # 只有【真的重装成功】才计数。放在决策处会把 fail-open 重试算成多次重装。
+            _bump_egress_drift_reapply()
+        _egress_reconcile_success(
+            table,
+            desired,
+            desired_version,
+            applied_sha,
+            policy_source,
+            pinned_invalid,
+        )
+        print(
+            f"egress reconcile: converged to egress_mode={desired} "
+            f"policy_version={desired_version} action={action}"
+        )
     except Exception as e:  # noqa: BLE001
-        print(f"egress reconcile apply failed (non-fatal): {e}")
+        error = str(e)
+        if action == "apply":
+            if apply_gap:
+                error = f"{apply_gap}; {error}"
+            print(f"egress reconcile APPLY FAILED (fail-open: retry): {error}")
+        else:
+            print(f"egress reconcile TEARDOWN FAILED (retry): {error}")
+        _egress_reconcile_failure(
+            table, desired, error, policy_source, pinned_invalid
+        )
 
 
 def _poll_loop():
@@ -3799,6 +4458,10 @@ class Handler(BaseHTTPRequestHandler):
                     # 而不是谎报 0;发生过就一直是 1(**刻意不自动清零**:一个冻住的客户 VM
                     # 不会自己好,清零等于让告警自己消失,而问题还在)。
                     "backup_vm_left_paused": _agent_metrics.get("backup_vm_left_paused"),
+                    "egress_reconcile": dict(
+                        _agent_metrics.get("egress_reconcile") or {}
+                    ),
+                    "egress_drift_reapply_total": _egress_drift_reapply_total,
                 }
             # through _get_port_bitmap() here would lazily rebuild from
             # iptables (mutating global state) on a host that never allocated

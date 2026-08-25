@@ -24,9 +24,13 @@ The AZ failover path is implemented as pure functions plus a thin AWS
 shell so it can be unit-tested without DDB/SSM/SNS access.
 """
 
+import base64
+import binascii
+import ipaddress
 import sys
 import os
 import json
+import re
 import shlex
 import time
 import boto3
@@ -67,6 +71,21 @@ _SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
 
 STALE_SECONDS = 120  # No health update for 2 min → agent may be down
 RESTART_COOLDOWN_SECONDS = 600  # Don't restart agent more than once per 10 min
+# #605 Redis route reclaim uses fixed code constants so targeted Lambda promotion
+# needs no IAM/environment/infrastructure changes.
+ROUTE_RECLAIM_GRACE_SEC = 900
+MAX_DELETE_PER_ROUND = 100
+STATE_STALE_SEC = 600
+ROUTE_RECLAIM_SENTINEL = "__route_reclaim_state__"
+ROUTE_RECLAIM_INVENTORY_COUNT = 200
+ROUTE_RECLAIM_PASS_WATCHDOG_SEC = 3600
+ROUTE_RECLAIM_MAX_PAGES_PER_PASS = 1000
+ROUTE_RECLAIM_CURSOR_HISTORY_LIMIT = 128
+_ROUTE_RECLAIM_CURSOR_MAX = (1 << 64) - 1
+_ROUTE_OPS_ENV_PREFIX = "set -a; . /etc/platform.env; set +a; "
+# 与 route_ops.py 的 _TENANT_ID_SHAPE 同一条形状约定。两侧都做:host 侧是纵深防御,
+# 控制面侧是为了不把无法回读结果的 tid 反复投进删除批次(见 _route_reclaim_candidates)。
+_ROUTE_TENANT_ID_SHAPE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 # A tenant stuck in `creating` past this never became healthy (launch failed /
 # channel never registered / killed mid-boot). It still holds its host capacity
 # reservation (used_vcpu/used_mem_mb/vm_count), so leaked creating rows silently
@@ -76,6 +95,16 @@ RESTART_COOLDOWN_SECONDS = 600  # Don't restart agent more than once per 10 min
 # slot so the ledger reflects reality. 15 min is comfortably past the ~6s p50
 # creating→running so a genuinely-slow boot is never reaped prematurely.
 CREATING_TIMEOUT_SECONDS = int(os.environ.get("CREATING_TIMEOUT_SECONDS", "900"))
+# A guest whose kernel is healthy while the gateway has already restarted
+# repeatedly is not a slow boot. Detect that specific first-boot config failure
+# before the generic 15-minute creating timeout, but only with direct systemd
+# evidence from the guest (never infer a crash loop from app_health alone).
+CREATING_GATEWAY_CRASH_TIMEOUT_SECONDS = int(
+    os.environ.get("CREATING_GATEWAY_CRASH_TIMEOUT_SECONDS", "180")
+)
+CREATING_GATEWAY_CRASH_RESTARTS = int(
+    os.environ.get("CREATING_GATEWAY_CRASH_RESTARTS", "3")
+)
 
 #
 # 为什么需要:suspend/restore 用 CAS 抢单赢家中间态(tenant_service.py:3023 / :3301),
@@ -117,6 +146,43 @@ STALE_HOST_DEMOTE_MINUTES = int(
 STALE_HOST_DEMOTE_ENABLED = (
     os.environ.get("STALE_HOST_DEMOTE_ENABLED", "true").lower() == "true"
 )
+# running 的租户一个都不动;而主扫描对 stale 租户只写 vm_health/app_health,status 全程不碰;
+# 唯一自愈 _restart_host_agent 要求该 host【全部】租户同时 stale(原文 "Some tenants still
+# healthy → agent is alive, individual VM issue");_ORPHAN_REAP_STATUSES 又只含
+# requires_intervention/failed。四条合起来:status=running + vm_health=stale 是个没有任何
+# reaper 覆盖的终态。2026-08-24 usw2 真机复现:单 VM 被 orphan reaper 清掉后,租户连续
+# 14 tick(11m20s)恒 running/stale,last_health_check 一次没前进。
+# 杀手开关的取舍同 STALE_HOST_DEMOTE_ENABLED:改 status 影响面大所以留一键停,但默认开——
+# 默认关等于没修。
+TENANT_STALE_RECLAIM_ENABLED = (
+    os.environ.get("TENANT_STALE_RECLAIM_ENABLED", "true").lower() == "true"
+)
+# 阈值必须显著大于 RESTART_COOLDOWN_SECONDS(600s,_restart_host_agent 的补救窗口)与
+# STALE_HOST_DEMOTE_MINUTES,否则会把"正在被 host-agent restart 救活"的租户误降级。
+# 留 3 倍余量。
+TENANT_STALE_RECLAIM_MINUTES = int(os.environ.get("TENANT_STALE_RECLAIM_MINUTES", "30"))
+# 与 _REAP_STOP_CONFIRM_MAX 同款意图:host 仍健康那条分支每个判定要发一条同步 SSM 只读探针,
+# 不设上限则一片 stale 租户会串行耗光 invocation,把后面的 AZ failover / 迁移 sweep 饿死。
+# 默认值与 _REAP_STOP_CONFIRM_MAX 对齐(6),不取更大值:每条探针阻塞至多
+# STOP_CONFIRM_TIMEOUT(20s),而本 Lambda 自己的 timeout 只有 180s(lambdas.py HealthCheck
+# Duration.seconds(180))—— 10 条就是 200s,单靠这一个 sweep 就能烧穿整个 invocation。
+_STALE_PROBE_MAX = int(os.environ.get("TENANT_STALE_PROBE_MAX", "6"))
+# 条数门挡不住【耗时】:条数 × 单条超时是上界,而 stop-confirm(_REAP_STOP_CONFIRM_MAX × 20s
+# = 120s)和 AZ failover(60-90s 同步 SSM 等待)会先吃掉同一个 180s 预算的一部分,只按条数算
+# 必然超发。所以再设一道挂钟门:本 invocation 累计探针耗时到顶就停止再探,剩下的留下一 tick
+# (收敛阈值是 30 分钟 = 数十 tick,推迟一轮无影响)。
+_STALE_PROBE_BUDGET_SEC = int(os.environ.get("TENANT_STALE_PROBE_BUDGET_SEC", "45"))
+# 前两道门都只统计【本 sweep 自己】花掉的时间,管不到前序工作已经烧掉多少 invocation。
+# 本 sweep 排在 lambda_handler 最末,极端情况下进来时只剩几秒,却仍会启动一条阻塞至多
+# STOP_CONFIRM_TIMEOUT 的探针 ⇒ 整个 invocation 超时被杀(reserved_concurrency=1,
+# 下一 tick 排队)。所以再叠一道由 context 剩余时间驱动的硬门:剩余时间不足"一条探针 +
+# 收尾余量"就不再探。余量留给探针返回后的 CAS 写入与审计。
+_STALE_PROBE_DEADLINE_MARGIN_SEC = int(
+    os.environ.get("TENANT_STALE_PROBE_DEADLINE_MARGIN_SEC", "10")
+)
+# n=条数,spent=累计挂钟秒。每次 lambda_handler 顶部重置(warm invocation 复用模块态)
+# n=条数,spent=累计挂钟秒,ctx=本次 invocation 的 Lambda context(用于读剩余时间)
+_stale_probe_budget = {"n": 0, "spent": 0.0, "ctx": None}
 # 正常 failover 自身也会处于 failover_recovering，且单次 Lambda 最长可跑到 180s。
 # 默认留 15 分钟的大余量，避免把仍在健康推进的迁移误判成悬挂并抽走它正在使用的号。
 FAILOVER_STUCK_MINUTES = int(os.environ.get("FAILOVER_STUCK_MINUTES", "15"))
@@ -140,6 +206,10 @@ ALB_LISTENER_ARN = os.environ.get("ALB_LISTENER_ARN", "")
 def lambda_handler(event, context):
     """Scan running tenants, recover host-agent if needed, then check AZ-level health."""
     _stop_confirm_budget["n"] = 0  # #412 blocker-B:每次 invocation 重置 stop-confirm 预算
+    # #592:同上,重置租户级 stale 收敛的只读探针预算(条数 + 累计挂钟 + context)
+    _stale_probe_budget["n"] = 0
+    _stale_probe_budget["spent"] = 0.0
+    _stale_probe_budget["ctx"] = context
     # 永远不被健康检查,坏了也没人发现。openclaw-tenants 实测 6790 行 / 2.83MB,
     # 已超 1MB 近三倍 —— 这一处现在就在漏。
     tenants = ddb_scan.scan_all(
@@ -247,6 +317,12 @@ def lambda_handler(event, context):
     except Exception as e:
         print(f"reap orphan-token error (non-fatal): {e}")
 
+    # ------- #605 Redis route orphan reconciliation -------
+    try:
+        _reclaim_orphan_routes(now)
+    except Exception as e:
+        print(f"route-reclaim error (non-fatal): {e}")
+
     # ------- #491 物理号孤儿对账 -------
     try:
         cleaned = reap_orphan_phys_slots(dry_run=False)
@@ -287,6 +363,7 @@ def lambda_handler(event, context):
             # AZ failover failures must NEVER take down the watchdog.
             print(f"az_failover error (non-fatal): {e}")
 
+
     # POST /tenants/{id}/migrate is async: it fires the snapshot SSM command,
     # marks the tenant `migrating` with the async context, and returns 202
     # (API Gateway caps a synchronous request at 29s, far less than a multi-GB
@@ -317,6 +394,25 @@ def lambda_handler(event, context):
                 print(f"_advance_migration error for {tenant.get('id')}: {e}")
     except Exception as e:
         print(f"migration sweep scan error (non-fatal): {e}")
+
+    # ------- #592 租户级 stale 收敛(本 handler 的最后一步)-------
+    # 位置有两个约束,放在末尾同时满足:
+    #  ① 必须在 demote_stale_hosts 之后 —— host 的 draining 已落表,才能当失联判据用。
+    #  ② 必须在所有会发同步 SSM 的既有 sweep 之后。本 sweep 的 probe 分支每个判定要阻塞
+    #     至多 STOP_CONFIRM_TIMEOUT,而整个 invocation 只有 180s,前面的 stop-confirm
+    #     (6 × 20s)和 AZ failover(60-90s)已经在抢这份预算。排在任何既有 sweep 前面,
+    #     都可能把整机房级容灾或在途迁移挤出预算 —— 迁移被挤掉的后果是永久不推进。
+    #     排在最后,时间不够时饿死的只有本 sweep 自己(阈值 30 分钟 = 数十 tick,
+    #     推迟一轮无影响)。
+    # tenants 是 scan 快照,期间被迁走或拿到 lifecycle 围栏的租户由 _flip 的四锚 CAS
+    # (status/vm_health/host_id/租约)挡掉,不会误降。
+    # 非致命 —— 收敛失败不该让整个 watchdog 停摆。
+    try:
+        stale_reclaimed = reclaim_stale_tenants(tenants, now, dry_run=False)
+        if stale_reclaimed["reclaimed"]:
+            print(f"tenant-stale-reclaim: summary={json.dumps(stale_reclaimed)}")
+    except Exception as e:
+        print(f"tenant-stale-reclaim error (non-fatal): {e}")
 
 
 # Watchdog: a migration that hasn't reached a terminal state within this many
@@ -521,17 +617,16 @@ def _confirm_vm_stopped(host_id, tenant_id, vm_num):
     _stop_confirm_budget["n"] += 1
     _q_tid = shlex.quote(str(tenant_id))
     _q_vm = shlex.quote(str(int(vm_num)))
-    # 新鲜度前置门(codex 独立复审第六轮)—— 旧版 stop-vm.sh 在【VM 目录已被回收】时
-    # 直接 `exit 0` 报"已停",而 rm -rf 掉目录不会杀死持有那些 fd 的 Firecracker。
-    # 于是本函数会对一个还在跑的 VM 返回"已确认停机",调用方据此释放容量 —— 正是
+    # 新鲜度前置门—— stop confirmation now also promises that a live guest
+    # acknowledged sync before Firecracker termination. Accepting the older
+    # orphan-only sentinel would reopen #494's dirty-page loss window.
     # 本 Lambda 没有 host_script_self_heal(那是 api 包的),所以不自装,改为按本函数
     # 自己的原则 fail-closed:脚本缺失/过期(grep 不到新语义哨兵)→ 命令非零 →
     # ok=False → 本轮【不释放】,下轮再试。宁可慢,不可释放可能仍在跑的容量。
-    # 哨兵与 tenant_service 强制删除那条路同源(OC_STOP_ORPHAN_NO_VMDIR),一处改、
-    # 两处一起红。
+    # 哨兵与 tenant_service 的 destructive stop paths 同源,一处改、两处一起红。
     ok, _out = _ssm_run_capture(
         host_id,
-        f"grep -q OC_STOP_ORPHAN_NO_VMDIR /home/ubuntu/stop-vm.sh && "
+        f"grep -q OC_STOP_GUEST_FLUSH_REQUIRED /home/ubuntu/stop-vm.sh && "
         f"/home/ubuntu/stop-vm.sh {_q_tid} {_q_vm}",
         timeout=STOP_CONFIRM_TIMEOUT,
     )
@@ -681,8 +776,14 @@ def _reconcile_unconfirmed_rebuilds(now):
     lek = None
     while True:
         kw = {
-            "FilterExpression": "rebuild_status = :u",
-            "ExpressionAttributeValues": {":u": "unconfirmed"},
+            # #593(codex 复审 r4)—— scan 就滤掉软删租户:它们可能仍残留 rebuild_status=unconfirmed
+            # (删除不清该字段),而下面的写 CAS(#s <> :deleted,r3)对它们必然落空。不在 scan 滤掉,
+            # 每轮 sweep 都会把它们捞回、白问一次 SSM、再撞一次 CCF —— 软删无 TTL,越积越多会拖垮对账
+            # /耗尽 health-check Lambda。写侧 CAS 仍保留(挡 scan 与 write 之间才被删的竞态);scan 滤
+            # 只省掉稳态无用功,两者各管一个窗口。
+            "FilterExpression": "rebuild_status = :u AND #s <> :deleted",
+            "ExpressionAttributeNames": {"#s": "status"},
+            "ExpressionAttributeValues": {":u": "unconfirmed", ":deleted": "deleted"},
         }
         if lek:
             kw["ExclusiveStartKey"] = lek
@@ -732,9 +833,14 @@ def _reconcile_unconfirmed_rebuilds(now):
                 expr += ", q_rootfs_version = :qrv"
                 vals[":qrv"] = target
 
-        # 约束 3 —— 绑当次 op_id + 仍是 unconfirmed。op_id 缺失(老记录)时退化为只绑
-        # status,仍能防"已被别的路径改成 done/failed 后又被本轮覆盖"。
-        cond = "rebuild_status = :u"
+        # #593 —— 已软删的租户绝不重标版本:本对账 done 分支会写 rootfs_version + q_rootfs_version
+        # (gsi_rootfs_version 投影键),而删除路径刚把 q_rootfs_version REMOVE 掉让死行离开该 GSI。
+        # 若不挡 deleted,一次迟到的 rebuild 确认会把投影键写回、把已删租户复活进查询 GSI(与 #593
+        # 修复正相反)。带 fence 的现代路径本可被 delete 抬高的 lifecycle_fence_epoch 拦住,但无
+        # op_id/fence 的老记录会退化到只剩 rebuild_status 判据 → 漏。显式挡 status<>deleted 覆盖两者。
+        # 对已删租户跳过整条 update(含版本回标与 fence 释放)是正确的:租户已终结,这些都无意义。
+        cond = "#s <> :deleted AND rebuild_status = :u"
+        vals[":deleted"] = "deleted"
         op_id = (t.get("rebuild_op_id") or "").strip()
         if op_id:
             cond += " AND rebuild_op_id = :o"
@@ -773,6 +879,7 @@ def _reconcile_unconfirmed_rebuilds(now):
                 Key={"id": tid},
                 UpdateExpression=expr,
                 ConditionExpression=cond,
+                ExpressionAttributeNames={"#s": "status"},
                 ExpressionAttributeValues=vals,
             )
             if status == "done":
@@ -794,6 +901,52 @@ def _reconcile_unconfirmed_rebuilds(now):
             print(f"rebuild-reconcile {tid} (non-fatal): {e}")
 
     return n_done, n_failed, n_left
+
+
+def _probe_gateway_crashloop(tenant):
+    """Return a bounded, sanitized gateway crash-loop reason, or ``None``.
+
+    This probe is only a classifier. It does not mutate the guest. Failure to
+    read the unit is unknown and therefore leaves the tenant on the existing
+    creating timeout path.
+    """
+    host_id = tenant.get("host_id")
+    guest_ip = (tenant.get("guest_ip") or "").strip()
+    if not host_id or not guest_ip:
+        return None
+    target = shlex.quote(f"agent@{guest_ip}")
+    cmd = (
+        "timeout 20 ssh -i /etc/openclaw/host_vm_key "
+        "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+        "-o ConnectTimeout=5 -o LogLevel=ERROR -o BatchMode=yes "
+        f"{target} "
+        "'systemctl --user show openclaw-gateway.service --no-pager "
+        "--property=NRestarts --property=ActiveState --property=SubState "
+        "--property=Result --property=ExecMainStatus'"
+    )
+    ok, out = _ssm_run_capture(host_id, cmd, timeout=30)
+    if not ok:
+        return None
+    fields = {}
+    for line in (out or "").splitlines():
+        key, sep, value = line.strip().partition("=")
+        if sep and key in {
+            "NRestarts", "ActiveState", "SubState", "Result", "ExecMainStatus"
+        }:
+            fields[key] = value[:80]
+    try:
+        restarts = int(fields.get("NRestarts", "0"))
+    except ValueError:
+        return None
+    if restarts < CREATING_GATEWAY_CRASH_RESTARTS:
+        return None
+    return (
+        "first-boot gateway crash loop: "
+        f"NRestarts={restarts}, ActiveState={fields.get('ActiveState', 'unknown')}, "
+        f"SubState={fields.get('SubState', 'unknown')}, "
+        f"Result={fields.get('Result', 'unknown')}, "
+        f"ExecMainStatus={fields.get('ExecMainStatus', 'unknown')}"
+    )
 
 
 def _reap_stuck_creating(now):
@@ -846,10 +999,18 @@ def _reap_stuck_creating(now):
         except Exception as e:
             print(f"reap-skip {t.get('id')}: bad timestamp {started!r}: {e}")
             continue
-        if elapsed < CREATING_TIMEOUT_SECONDS:
+        crash_reason = None
+        if (
+            elapsed >= CREATING_GATEWAY_CRASH_TIMEOUT_SECONDS
+            and t.get("vm_health") == "up"
+            and t.get("app_health") == "down"
+        ):
+            crash_reason = _probe_gateway_crashloop(t)
+        if elapsed < CREATING_TIMEOUT_SECONDS and not crash_reason:
             continue  # genuinely still booting — leave it alone
         print(
-            f"reap-hit {t.get('id')}: elapsed={int(elapsed)}s > {CREATING_TIMEOUT_SECONDS}s"
+            f"reap-hit {t.get('id')}: elapsed={int(elapsed)}s "
+            f"reason={'gateway-crashloop' if crash_reason else 'creating-timeout'}"
         )
 
         tid = t["id"]
@@ -860,7 +1021,17 @@ def _reap_stuck_creating(now):
         # 回滚的互斥锚(防 ABA 双扣):谁先消费令牌谁扣一次,其余幂等。释放事务条件双锚:tenant 侧
         # status=failed AND capacity_reservation_id=:rid,host 侧下溢守卫。令牌缺失(同步 create
         # fence 保留令牌,release 前崩溃 → failed+令牌由 _reap_orphan_reservations 兜底,故不留无主增量)。
-        _reaped_reason = f"reaped: stuck in creating > {CREATING_TIMEOUT_SECONDS}s"
+        _terminal_status = "requires_intervention" if crash_reason else "failed"
+        _reaped_reason = (
+            crash_reason
+            or f"reaped: stuck in creating > {CREATING_TIMEOUT_SECONDS}s"
+        )
+        _extra_expr = ""
+        if crash_reason:
+            _extra_expr = (
+                ", requires_intervention_ts = :t, "
+                "requires_intervention_reason = :r"
+            )
         if rid and host_id:
             # ① 原子把 creating→failed(条件 status=creating AND token=rid),【保留】令牌+放置。
             #    一个并发 promote(creating→running,条件也锁 creating)与本 flip 互斥:promote
@@ -873,11 +1044,15 @@ def _reap_stuck_creating(now):
             try:
                 tenants_table.update_item(
                     Key={"id": tid},
-                    UpdateExpression="SET #s = :f, updated_at = :t, reaped_reason = :r",
+                    UpdateExpression=(
+                        "SET #s = :terminal, updated_at = :t, reaped_reason = :r"
+                        + _extra_expr
+                    ),
                     ConditionExpression="#s = :c AND capacity_reservation_id = :rid",
                     ExpressionAttributeNames={"#s": "status"},
                     ExpressionAttributeValues={
-                        ":f": "failed", ":c": "creating", ":rid": rid,
+                        ":terminal": _terminal_status,
+                        ":c": "creating", ":rid": rid,
                         ":t": now.isoformat(), ":r": _reaped_reason,
                     },
                 )
@@ -903,10 +1078,12 @@ def _reap_stuck_creating(now):
                                     "host_id, vm_num, guest_ip, host_port"
                                 ),
                                 "ConditionExpression": (
-                                    "#s = :f AND capacity_reservation_id = :rid"
+                                    "#s = :terminal AND capacity_reservation_id = :rid"
                                 ),
                                 "ExpressionAttributeNames": {"#s": "status"},
-                                "ExpressionAttributeValues": {":f": "failed", ":rid": rid},
+                                "ExpressionAttributeValues": {
+                                    ":terminal": _terminal_status, ":rid": rid
+                                },
                             }
                         },
                         {
@@ -943,6 +1120,37 @@ def _reap_stuck_creating(now):
 
         # (条件 creating,promote 赢则 CCF 跳过)后 guarded 释放 slot,不 stop-confirm。这条路
         # 仅存在于上面令牌分支,已改为 fence→stop→release)。
+        # A crash-loop tenant is known to have a live VM. Without a reservation
+        # token there is no idempotent release anchor, so preserve placement and
+        # capacity for intervention instead of decrementing under a live VM.
+        if crash_reason:
+            try:
+                tenants_table.update_item(
+                    Key={"id": tid},
+                    UpdateExpression=(
+                        "SET #s = :terminal, updated_at = :t, reaped_reason = :r, "
+                        "requires_intervention_ts = :t, "
+                        "requires_intervention_reason = :r"
+                    ),
+                    ConditionExpression="#s = :c",
+                    ExpressionAttributeNames={"#s": "status"},
+                    ExpressionAttributeValues={
+                        ":terminal": "requires_intervention",
+                        ":c": "creating",
+                        ":t": now.isoformat(),
+                        ":r": _reaped_reason,
+                    },
+                )
+            except Exception as e:
+                print(f"reap-skip {tid}: crash-loop mark failed ({e})")
+                continue
+            reaped += 1
+            print(
+                f"reap: {tid} on {host_id} marked requires_intervention; "
+                "legacy placement retained (no release token)"
+            )
+            continue
+
         try:
             tenants_table.update_item(
                 Key={"id": tid},
@@ -1929,6 +2137,952 @@ def _reap_orphan_reservations(now=None):
     return released
 
 
+def _route_reclaim_cursor_text(value):
+    if isinstance(value, bytes):
+        value = value.decode("ascii")
+    text = str(value)
+    if not text or not text.isdigit():
+        raise ValueError(f"invalid route cursor {text!r}")
+    number = int(text)
+    if number > _ROUTE_RECLAIM_CURSOR_MAX:
+        raise ValueError(f"route cursor out of range {text!r}")
+    return str(number)
+
+
+def _route_reclaim_live_hosts(rows):
+    """Return host statuses by IPv4 plus active/idle SSM proxy rows."""
+    statuses_by_ip = {}
+    proxy_hosts = []
+    real_count = 0
+    for row in rows:
+        instance_id = str(row.get("instance_id") or "")
+        if not instance_id or instance_id.startswith("__"):
+            continue
+        real_count += 1
+        private_ip = row.get("private_ip")
+        if not isinstance(private_ip, str) or not private_ip:
+            continue
+        try:
+            private_ip = str(ipaddress.IPv4Address(private_ip))
+        except ipaddress.AddressValueError:
+            continue
+        statuses_by_ip.setdefault(private_ip, []).append(
+            row.get("status") if "status" in row else None
+        )
+        if row.get("status") in {"active", "idle"}:
+            proxy_hosts.append(row)
+    proxy_hosts.sort(key=lambda row: str(row.get("instance_id") or ""))
+    return statuses_by_ip, proxy_hosts, real_count
+
+
+_ROUTE_RECLAIM_IN_FLIGHT_STATUSES = {
+    "creating",
+    "deleting",
+    "migrating",
+    "pending",
+    "restoring",
+    "suspending",
+    "failover_recovering",
+}
+_ROUTE_RECLAIM_STABLE_STATUSES = {
+    "running",
+    "stopped",
+    "suspended",
+    "failed",
+    "requires_intervention",
+    "failover_blocked",
+    "failover_failed",
+    "failover_failed_partial",
+}
+
+
+def _route_reclaim_candidates(routes, statuses_by_ip, tenants_by_id, now):
+    """Return candidate records carrying the exact inventoried value token."""
+    if isinstance(now, (int, float)):
+        now = datetime.fromtimestamp(now, timezone.utc)
+    now_epoch = int(now.timestamp())
+    candidates = []
+    seen = set()
+    for route in routes:
+        tenant_id = str(route.get("tenant") or "")
+        if not _ROUTE_TENANT_ID_SHAPE.fullmatch(tenant_id):
+            print(
+                "CRITICAL route-reclaim: refusing tenant id with unsupported shape "
+                f"{tenant_id!r}; it will never be reclaimed automatically"
+            )
+            continue
+        expected_b64 = str(route.get("expected_b64") or "")
+        try:
+            expected_bytes = base64.b64decode(
+                expected_b64.encode("ascii"), validate=True
+            )
+        except (UnicodeEncodeError, binascii.Error, ValueError):
+            expected_bytes = b""
+        if not expected_bytes:
+            print(
+                f"CRITICAL route-reclaim: keep tenant={tenant_id} "
+                "reason=invalid_expected_value_token"
+            )
+            continue
+        try:
+            updated_at = int(route.get("updated_at"))
+        except (TypeError, ValueError):
+            print(
+                f"CRITICAL route-reclaim: keep tenant={tenant_id} "
+                "reason=invalid_updated_at"
+            )
+            continue
+        if tenant_id in seen:
+            print(
+                f"route-reclaim decision=keep tenant={tenant_id} "
+                "reason=duplicate_inventory_record"
+            )
+            continue
+        if now_epoch - updated_at < ROUTE_RECLAIM_GRACE_SEC:
+            continue
+
+        tenant = tenants_by_id.get(tenant_id)
+        tenant_status = tenant.get("status") if tenant else None
+        if tenant_status == "deleted":
+            candidate = dict(route)
+            candidate["reason"] = "tenant_deleted"
+            candidates.append(candidate)
+            seen.add(tenant_id)
+            print(
+                f"route-reclaim decision=delete tenant={tenant_id} "
+                "reason=tenant_deleted"
+            )
+            continue
+        if tenant:
+            if tenant_status in _ROUTE_RECLAIM_IN_FLIGHT_STATUSES:
+                print(
+                    f"route-reclaim decision=keep tenant={tenant_id} "
+                    f"reason=tenant_in_flight status={tenant_status}"
+                )
+                continue
+            if _lifecycle_lease_active(tenant, now):
+                print(
+                    f"route-reclaim decision=keep tenant={tenant_id} "
+                    "reason=active_lifecycle_lease"
+                )
+                continue
+            if tenant_status not in _ROUTE_RECLAIM_STABLE_STATUSES:
+                print(
+                    f"route-reclaim decision=keep tenant={tenant_id} "
+                    f"reason=unknown_tenant_status status={tenant_status!r}"
+                )
+                continue
+
+        host = str(route.get("host") or "")
+        statuses = statuses_by_ip.get(host)
+        if not statuses:
+            print(
+                f"route-reclaim decision=keep tenant={tenant_id} "
+                "reason=ip_absent_from_host_table"
+            )
+            continue
+        if all(status == "deleted" for status in statuses):
+            candidate = dict(route)
+            candidate["reason"] = "host_rows_all_deleted"
+            candidates.append(candidate)
+            seen.add(tenant_id)
+            print(
+                f"route-reclaim decision=delete tenant={tenant_id} "
+                "reason=host_rows_all_deleted"
+            )
+            continue
+        print(
+            f"route-reclaim decision=keep tenant={tenant_id} "
+            f"reason=host_row_not_deleted statuses={statuses!r}"
+        )
+    return candidates
+
+
+def _parse_route_inventory(stdout):
+    """Parse one sealed list-routes page and retain expected_b64 verbatim."""
+    routes = []
+    page_headers = []
+    totals = []
+    parsed_skipped = 0
+    for raw_line in (stdout or "").splitlines():
+        line = raw_line.strip()
+        if line.startswith("OC_ROUTE_ERROR "):
+            raise ValueError(line)
+        if line.startswith("OC_ROUTE_PAGE "):
+            page_headers.append(
+                _route_reclaim_fields(line[len("OC_ROUTE_PAGE ") :])
+            )
+            continue
+        if line.startswith("OC_ROUTE_SKIPPED_BATCH "):
+            fields = _route_reclaim_fields(
+                line[len("OC_ROUTE_SKIPPED_BATCH ") :]
+            )
+            count = int(fields["n"])
+            if count < 0:
+                raise ValueError("negative OC_ROUTE_SKIPPED_BATCH count")
+            parsed_skipped += count
+            print(
+                "CRITICAL route-reclaim: host skipped a byte-oversized "
+                f"SCAN batch: {line}"
+            )
+            continue
+        if line.startswith("OC_ROUTE_SKIPPED "):
+            parsed_skipped += 1
+            print(f"CRITICAL route-reclaim: host skipped a malformed route: {line}")
+            continue
+        if line.startswith("OC_ROUTE_TOTAL "):
+            totals.append(
+                _route_reclaim_fields(line[len("OC_ROUTE_TOTAL ") :])
+            )
+            continue
+        if not line.startswith("OC_ROUTE_ITEM "):
+            continue
+        fields = _route_reclaim_fields(line[len("OC_ROUTE_ITEM ") :])
+        required = {
+            "tenant",
+            "host",
+            "port",
+            "guest_ip",
+            "updated_at",
+            "expected_b64",
+        }
+        if not required.issubset(fields):
+            raise ValueError("OC_ROUTE_ITEM missing required field")
+        try:
+            expected = base64.b64decode(
+                fields["expected_b64"].encode("ascii"), validate=True
+            )
+        except (UnicodeEncodeError, binascii.Error, ValueError) as exc:
+            raise ValueError("OC_ROUTE_ITEM bad expected_b64") from exc
+        if not expected:
+            raise ValueError("OC_ROUTE_ITEM empty expected_b64")
+        routes.append(
+            {
+                "tenant": fields["tenant"],
+                "host": fields["host"],
+                "port": int(fields["port"]),
+                "guest_ip": fields["guest_ip"],
+                "updated_at": int(fields["updated_at"]),
+                "expected_b64": fields["expected_b64"],
+            }
+        )
+    if len(page_headers) != 1:
+        raise ValueError("missing or duplicate OC_ROUTE_PAGE")
+    if len(totals) != 1:
+        raise ValueError("missing or duplicate OC_ROUTE_TOTAL")
+    page = page_headers[0]
+    total = totals[0]
+    cursor = _route_reclaim_cursor_text(page["cursor"])
+    next_cursor = _route_reclaim_cursor_text(page["next_cursor"])
+    count = int(page["count"])
+    if count < 1 or count > 500:
+        raise ValueError(f"invalid inventory count {count}")
+    total_items = int(total["n"])
+    total_skipped = int(total.get("skipped", 0))
+    scanned = int(total["scanned"])
+    if min(total_items, total_skipped, scanned) < 0:
+        raise ValueError("negative inventory total")
+    if total_items != len(routes):
+        raise ValueError(
+            f"OC_ROUTE_TOTAL mismatch: total={total_items} parsed={len(routes)}"
+        )
+    if total_skipped != parsed_skipped:
+        raise ValueError(
+            "OC_ROUTE_TOTAL skipped mismatch: "
+            f"total={total_skipped} parsed={parsed_skipped}"
+        )
+    if total_items + total_skipped != scanned:
+        raise ValueError(
+            "OC_ROUTE_TOTAL scanned mismatch: "
+            f"items={total_items} skipped={total_skipped} scanned={scanned}"
+        )
+    if total_skipped:
+        print(
+            f"CRITICAL route-reclaim: inventory skipped={total_skipped} "
+            "route(s); they were explicitly accounted but not reclaimed"
+        )
+    return {
+        "cursor": cursor,
+        "next_cursor": next_cursor,
+        "count": count,
+        "scanned": scanned,
+        "skipped": total_skipped,
+        "routes": routes,
+    }
+
+
+def _route_reclaim_fields(text):
+    fields = {}
+    for token in text.split():
+        key, sep, value = token.partition("=")
+        if sep and key:
+            fields[key] = value
+    return fields
+
+
+def _parse_route_delete_results(stdout):
+    results = {}
+    for raw_line in (stdout or "").splitlines():
+        line = raw_line.strip()
+        if not line.startswith("OC_ROUTE_OP "):
+            continue
+        fields = _route_reclaim_fields(line[len("OC_ROUTE_OP ") :])
+        if fields.get("op") != "del" or not fields.get("tenant"):
+            continue
+        results.setdefault(fields["tenant"], []).append(fields.get("result", ""))
+    return results
+
+
+def _route_reclaim_sent_at(state):
+    raw = state.get("sent_at")
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        pass
+    try:
+        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _route_reclaim_summary(
+    scanned=0,
+    candidates=0,
+    dispatched=0,
+    confirmed=0,
+    changed=0,
+    failed=0,
+    skip_reason="",
+):
+    reason = skip_reason or "none"
+    print(
+        "route-reclaim "
+        f"scanned={scanned} candidates={candidates} dispatched={dispatched} "
+        f"confirmed={confirmed} changed={changed} failed={failed} skip={reason}"
+    )
+
+
+def _route_reclaim_generation(state):
+    if "reclaim_generation" not in state:
+        return None
+    try:
+        generation = int(state["reclaim_generation"])
+    except (TypeError, ValueError):
+        return None
+    return generation if generation >= 0 else None
+
+
+def _route_reclaim_transition(
+    now,
+    current,
+    new_state,
+    scanned=0,
+    candidates=0,
+    dispatched=0,
+    confirmed=0,
+    changed=0,
+    failed=0,
+    skip_reason="",
+    advance_generation=True,
+    emit_summary=True,
+):
+    current_generation = _route_reclaim_generation(current)
+    if "reclaim_generation" in current and current_generation is None:
+        print("CRITICAL route-reclaim: malformed reclaim_generation")
+        if emit_summary:
+            _route_reclaim_summary(skip_reason="malformed_generation")
+        return None
+    next_generation = current_generation or 0
+    if advance_generation:
+        next_generation += 1
+    item = {
+        "instance_id": ROUTE_RECLAIM_SENTINEL,
+        "reclaim_generation": next_generation,
+        "last_run_at": now.isoformat(),
+        "last_scanned": int(scanned),
+        "last_deleted": int(confirmed),
+        "last_changed": int(changed),
+        "last_failed": int(failed),
+        "last_skip_reason": skip_reason,
+    }
+    item.update(new_state or {})
+    condition = ["attribute_not_exists(private_ip)"]
+    values = {}
+    if current_generation is None:
+        condition.append("attribute_not_exists(reclaim_generation)")
+    else:
+        condition.append("reclaim_generation = :expected_generation")
+        values[":expected_generation"] = current_generation
+    if current.get("phase"):
+        condition.append("phase = :expected_phase")
+        values[":expected_phase"] = current["phase"]
+    else:
+        condition.append("attribute_not_exists(phase)")
+    if current.get("command_id"):
+        condition.append("command_id = :expected_command_id")
+        values[":expected_command_id"] = current["command_id"]
+    if current.get("dispatch_owner"):
+        condition.append("dispatch_owner = :expected_dispatch_owner")
+        values[":expected_dispatch_owner"] = current["dispatch_owner"]
+    try:
+        # #539-R12 守卫按【调用点之后 600 字符内是否出现 ConditionExpression】扫源码。
+        # 条件必须写在调用点上、而不是藏在 **kwargs 里:一是让那道门真的能拦住这类写法,
+        # 二是让读代码的人一眼看出这个 put 是条件化的 —— put_item(**kwargs) 看不出来。
+        if values:
+            hosts_table.put_item(
+                Item=item,
+                ConditionExpression=" AND ".join(condition),
+                ExpressionAttributeValues=values,
+            )
+        else:
+            hosts_table.put_item(
+                Item=item,
+                ConditionExpression=" AND ".join(condition),
+            )
+    except Exception as e:
+        if _is_conditional_failure(e):
+            print(
+                "route-reclaim: state transition lost CAS ownership "
+                f"phase={current.get('phase')!r} "
+                f"generation={current_generation!r}"
+            )
+        else:
+            print(f"CRITICAL route-reclaim: cannot persist sentinel state: {e}")
+        if emit_summary:
+            _route_reclaim_summary(
+                scanned=scanned,
+                candidates=candidates,
+                dispatched=dispatched,
+                confirmed=confirmed,
+                changed=changed,
+                failed=failed,
+                skip_reason=skip_reason or "state_write_failed",
+            )
+        return None
+    if emit_summary:
+        _route_reclaim_summary(
+            scanned=scanned,
+            candidates=candidates,
+            dispatched=dispatched,
+            confirmed=confirmed,
+            changed=changed,
+            failed=failed,
+            skip_reason=skip_reason,
+        )
+    return item
+
+
+def _route_reclaim_reset(now, current, reason):
+    print(f"CRITICAL route-reclaim: resetting cursor to 0 reason={reason}")
+    return _route_reclaim_transition(
+        now,
+        current,
+        {
+            "cursor": "0",
+            "pass_started_at": int(now.timestamp()),
+            "page_count": 0,
+            "cursor_history": [],
+        },
+        skip_reason=reason,
+    )
+
+
+def _route_reclaim_stale_abandonable(state):
+    if str(state.get("phase") or "").endswith("_dispatching"):
+        return True
+    command_id = str(state.get("command_id") or "")
+    instance_id = str(state.get("command_instance_id") or "")
+    if not command_id or not instance_id:
+        return True
+    try:
+        invocation = ssm.get_command_invocation(
+            CommandId=command_id,
+            InstanceId=instance_id,
+        )
+    except ssm.exceptions.InvocationDoesNotExist:
+        return True
+    except Exception as e:
+        print(
+            "CRITICAL route-reclaim: cannot inspect stale command "
+            f"{command_id}/{instance_id}: {e}; retaining ownership"
+        )
+        return False
+    status = invocation.get("Status", "Pending")
+    if status in {"Success", "Failed", "TimedOut", "Cancelled"}:
+        return True
+    print(
+        f"route-reclaim: stale-age command {command_id} is still {status}; "
+        "retaining ownership"
+    )
+    return False
+
+
+def _route_reclaim_pass_state(state, now_epoch):
+    try:
+        cursor = _route_reclaim_cursor_text(state.get("cursor", "0"))
+        page_count = int(state.get("page_count", 0) or 0)
+        pass_started_at = int(state.get("pass_started_at", now_epoch))
+        history = [
+            _route_reclaim_cursor_text(value)
+            for value in (state.get("cursor_history") or [])
+        ]
+    except (TypeError, ValueError, UnicodeDecodeError):
+        return None, "malformed_cursor_state"
+    if page_count < 0:
+        return None, "malformed_page_count"
+    if cursor == "0":
+        return {
+            "cursor": "0",
+            "pass_started_at": now_epoch,
+            "page_count": 0,
+            "cursor_history": [],
+        }, ""
+    if now_epoch - pass_started_at > ROUTE_RECLAIM_PASS_WATCHDOG_SEC:
+        return None, "pass_watchdog_exceeded"
+    if page_count >= ROUTE_RECLAIM_MAX_PAGES_PER_PASS:
+        return None, "page_watchdog_exceeded"
+    return {
+        "cursor": cursor,
+        "pass_started_at": pass_started_at,
+        "page_count": page_count,
+        "cursor_history": history[-ROUTE_RECLAIM_CURSOR_HISTORY_LIMIT:],
+        **(
+            {"full_pass_at": state["full_pass_at"]}
+            if state.get("full_pass_at")
+            else {}
+        ),
+    }, ""
+
+
+def _route_reclaim_continuation(state, page, now):
+    input_cursor = _route_reclaim_cursor_text(state.get("cursor", "0"))
+    if page["cursor"] != input_cursor:
+        raise ValueError(
+            f"inventory cursor mismatch expected={input_cursor} got={page['cursor']}"
+        )
+    next_cursor = page["next_cursor"]
+    history = [
+        _route_reclaim_cursor_text(value)
+        for value in (state.get("cursor_history") or [])
+    ]
+    reset_reason = ""
+    if next_cursor != "0" and (
+        next_cursor == input_cursor or next_cursor in history
+    ):
+        reset_reason = "cursor_repeated_without_progress"
+    page_count = int(state.get("page_count", 0) or 0) + 1
+    pass_started_at = int(
+        state.get("pass_started_at", int(now.timestamp()))
+    )
+    if page_count > ROUTE_RECLAIM_MAX_PAGES_PER_PASS:
+        reset_reason = "page_watchdog_exceeded"
+    if int(now.timestamp()) - pass_started_at > ROUTE_RECLAIM_PASS_WATCHDOG_SEC:
+        reset_reason = "pass_watchdog_exceeded"
+    if reset_reason:
+        print(
+            f"CRITICAL route-reclaim: page cursor reset input={input_cursor} "
+            f"next={next_cursor} reason={reset_reason}"
+        )
+        return {
+            "cursor": "0",
+            "pass_started_at": int(now.timestamp()),
+            "page_count": 0,
+            "cursor_history": [],
+        }, reset_reason
+    if next_cursor == "0":
+        return {
+            "cursor": "0",
+            "pass_started_at": int(now.timestamp()),
+            "page_count": 0,
+            "cursor_history": [],
+            "full_pass_at": now.isoformat(),
+        }, ""
+    history.append(input_cursor)
+    return {
+        "cursor": next_cursor,
+        "pass_started_at": pass_started_at,
+        "page_count": page_count,
+        "cursor_history": history[-ROUTE_RECLAIM_CURSOR_HISTORY_LIMIT:],
+        **(
+            {"full_pass_at": state["full_pass_at"]}
+            if state.get("full_pass_at")
+            else {}
+        ),
+    }, ""
+
+
+def _reclaim_orphan_routes(now):
+    """#605 three-round Redis route inventory, adjudication, and confirmation."""
+    now = now or datetime.now(timezone.utc)
+    now_epoch = int(now.timestamp())
+    try:
+        state = (
+            hosts_table.get_item(
+                Key={"instance_id": ROUTE_RECLAIM_SENTINEL},
+                ConsistentRead=True,
+            ).get("Item")
+            or {}
+        )
+    except Exception as e:
+        print(f"CRITICAL route-reclaim: cannot read sentinel state: {e}")
+        _route_reclaim_summary(skip_reason="state_read_failed")
+        return
+
+    phase = str(state.get("phase") or "")
+    if phase:
+        sent_at = _route_reclaim_sent_at(state)
+        if sent_at is None or now_epoch - sent_at > STATE_STALE_SEC:
+            if not _route_reclaim_stale_abandonable(state):
+                _route_reclaim_summary(skip_reason="stale_command_still_running")
+                return
+            _route_reclaim_reset(now, state, "stale_command_abandoned")
+            return
+        if phase not in {
+            "inventory_dispatching",
+            "inventory",
+            "delete_dispatching",
+            "delete",
+        }:
+            _route_reclaim_reset(now, state, "unknown_phase_abandoned")
+            return
+        if phase.endswith("_dispatching"):
+            _route_reclaim_summary(skip_reason=f"{phase}_owned")
+            return
+
+    if phase == "delete":
+        command_id = str(state.get("command_id") or "")
+        instance_id = str(state.get("command_instance_id") or "")
+        expected_routes = state.get("expected_routes") or []
+        expected = [
+            str(route.get("tenant") or "")
+            for route in expected_routes
+            if isinstance(route, dict) and route.get("tenant")
+        ]
+        scanned = int(state.get("scanned_count") or 0)
+        candidate_count = int(state.get("candidate_count") or len(expected))
+        continuation = state.get("continuation")
+        retry_state = state.get("retry_state")
+        deferred_count = int(state.get("deferred_count") or 0)
+        if (
+            not command_id
+            or not instance_id
+            or not expected
+            or len(expected) != len(expected_routes)
+            or not isinstance(continuation, dict)
+            or not isinstance(retry_state, dict)
+        ):
+            print("CRITICAL route-reclaim: malformed delete sentinel state")
+            _route_reclaim_reset(now, state, "malformed_delete_state")
+            return
+        done, ok = _poll_ssm(command_id, instance_id)
+        if not done:
+            _route_reclaim_summary(
+                scanned=scanned,
+                candidates=candidate_count,
+                skip_reason="delete_in_progress",
+            )
+            return
+        try:
+            invocation = ssm.get_command_invocation(
+                CommandId=command_id,
+                InstanceId=instance_id,
+            )
+            parsed = _parse_route_delete_results(
+                invocation.get("StandardOutputContent") or ""
+            )
+        except Exception as e:
+            print(f"CRITICAL route-reclaim: cannot read delete results: {e}")
+            parsed = {}
+        confirmed = []
+        changed = []
+        failed_tids = []
+        for tenant_id in expected:
+            values = parsed.get(tenant_id, [])
+            if len(values) == 1 and values[0] in {"deleted", "absent"}:
+                confirmed.append(tenant_id)
+            elif len(values) == 1 and values[0] == "changed":
+                changed.append(tenant_id)
+            else:
+                failed_tids.append(tenant_id)
+        if not ok:
+            failed_tids = list(expected)
+            confirmed = []
+            changed = []
+        if failed_tids:
+            print(
+                "CRITICAL route-reclaim: delete confirmation failed tenants="
+                + ",".join(failed_tids)
+            )
+        if changed:
+            print(
+                "route-reclaim: compare-and-delete preserved rewritten tenants="
+                + ",".join(changed)
+            )
+        next_state = (
+            retry_state if failed_tids or deferred_count else continuation
+        )
+        _route_reclaim_transition(
+            now,
+            state,
+            next_state,
+            scanned=scanned,
+            candidates=candidate_count,
+            confirmed=len(confirmed),
+            changed=len(changed),
+            failed=len(failed_tids),
+            skip_reason=(
+                "delete_failures"
+                if failed_tids
+                else "delete_cap_deferred"
+                if deferred_count
+                else ""
+            ),
+        )
+        return
+
+    try:
+        host_rows = ddb_scan.scan_all(hosts_table, ConsistentRead=True)
+    except Exception as e:
+        print(f"CRITICAL route-reclaim: host scan failed: {e}")
+        _route_reclaim_summary(skip_reason="host_scan_failed")
+        return
+    statuses_by_ip, proxy_hosts, real_host_count = _route_reclaim_live_hosts(
+        host_rows
+    )
+    if real_host_count == 0:
+        _route_reclaim_summary(skip_reason="zero_non_sentinel_hosts")
+        return
+    if not proxy_hosts:
+        _route_reclaim_summary(skip_reason="no_active_idle_ssm_proxy")
+        return
+
+    if phase == "inventory":
+        command_id = str(state.get("command_id") or "")
+        instance_id = str(state.get("command_instance_id") or "")
+        if not command_id or not instance_id:
+            print("CRITICAL route-reclaim: malformed inventory sentinel state")
+            _route_reclaim_reset(now, state, "malformed_inventory_state")
+            return
+        done, ok = _poll_ssm(command_id, instance_id)
+        if not done:
+            _route_reclaim_summary(skip_reason="inventory_in_progress")
+            return
+        if not ok:
+            _route_reclaim_reset(now, state, "inventory_command_failed")
+            return
+        try:
+            invocation = ssm.get_command_invocation(
+                CommandId=command_id,
+                InstanceId=instance_id,
+            )
+            page = _parse_route_inventory(
+                invocation.get("StandardOutputContent") or ""
+            )
+            continuation, cursor_reset_reason = _route_reclaim_continuation(
+                state, page, now
+            )
+        except Exception as e:
+            print(f"route-reclaim: invalid inventory, skipping round: {e}")
+            _route_reclaim_reset(now, state, "invalid_inventory")
+            return
+        retry_state, retry_state_error = _route_reclaim_pass_state(
+            state, now_epoch
+        )
+        if retry_state is None:
+            _route_reclaim_reset(now, state, retry_state_error)
+            return
+
+        try:
+            # This is the most dangerous guard in the reclaimer: a one-page
+            # tenant scan can miss a live row and classify it as nonexistent,
+            # which deletes a live tenant's route. Never replace scan_all here.
+            tenant_rows = ddb_scan.scan_all(tenants_table, ConsistentRead=True)
+        except Exception as e:
+            print(f"CRITICAL route-reclaim: tenant scan failed: {e}")
+            _route_reclaim_summary(
+                scanned=page["scanned"], skip_reason="tenant_scan_failed"
+            )
+            return
+        tenants_by_id = {
+            str(row.get("id")): row for row in tenant_rows if row.get("id")
+        }
+        candidates = _route_reclaim_candidates(
+            page["routes"], statuses_by_ip, tenants_by_id, now
+        )
+        if not candidates:
+            _route_reclaim_transition(
+                now,
+                state,
+                continuation,
+                scanned=page["scanned"],
+                skip_reason=cursor_reset_reason or "no_candidates",
+            )
+            return
+        selected = candidates[:MAX_DELETE_PER_ROUND]
+        deferred = len(candidates) - len(selected)
+        if deferred:
+            print(
+                f"route-reclaim: delete cap={MAX_DELETE_PER_ROUND}, "
+                f"deferred={deferred} route(s) to a later round"
+            )
+        proxy_ids = {
+            str(row.get("instance_id") or "") for row in proxy_hosts
+        }
+        delete_host = (
+            instance_id
+            if instance_id in proxy_ids
+            else str(proxy_hosts[0]["instance_id"])
+        )
+        owner = f"{now_epoch}-{time.time_ns()}"
+        claim = _route_reclaim_transition(
+            now,
+            state,
+            {
+                "phase": "delete_dispatching",
+                "dispatch_owner": owner,
+                "sent_at": now_epoch,
+                "command_instance_id": delete_host,
+                "expected_routes": [
+                    {
+                        "tenant": route["tenant"],
+                        "expected_b64": route["expected_b64"],
+                    }
+                    for route in selected
+                ],
+                "continuation": continuation,
+                "retry_state": retry_state,
+                "deferred_count": deferred,
+                "scanned_count": page["scanned"],
+                "candidate_count": len(candidates),
+            },
+            scanned=page["scanned"],
+            candidates=len(candidates),
+            emit_summary=False,
+        )
+        if claim is None:
+            _route_reclaim_summary(
+                scanned=page["scanned"],
+                candidates=len(candidates),
+                skip_reason="delete_dispatch_claim_lost",
+            )
+            return
+        command = (
+            _ROUTE_OPS_ENV_PREFIX
+            + "python3 /opt/openclaw/route_ops.py del-route "
+            + " ".join(
+                f"{shlex.quote(route['tenant'])} "
+                f"{shlex.quote(route['expected_b64'])}"
+                for route in selected
+            )
+        )
+        delete_command_id = _ssm_send_hc(delete_host, command, timeout=120)
+        if not delete_command_id:
+            _route_reclaim_transition(
+                now,
+                claim,
+                retry_state,
+                scanned=page["scanned"],
+                candidates=len(candidates),
+                skip_reason="delete_dispatch_failed",
+            )
+            return
+        pending = dict(claim)
+        pending.update(
+            {
+                "phase": "delete",
+                "command_id": delete_command_id,
+                "command_instance_id": delete_host,
+            }
+        )
+        pending.pop("instance_id", None)
+        pending.pop("last_run_at", None)
+        pending.pop("last_scanned", None)
+        pending.pop("last_deleted", None)
+        pending.pop("last_changed", None)
+        pending.pop("last_failed", None)
+        pending.pop("last_skip_reason", None)
+        pending.pop("reclaim_generation", None)
+        finalized = _route_reclaim_transition(
+            now,
+            claim,
+            pending,
+            scanned=page["scanned"],
+            candidates=len(candidates),
+            dispatched=len(selected),
+            skip_reason=cursor_reset_reason,
+            advance_generation=False,
+        )
+        if finalized is None:
+            print(
+                "CRITICAL route-reclaim: delete command dispatched but ownership "
+                f"could not be finalized command_id={delete_command_id}"
+            )
+        return
+
+    pass_state, malformed_reason = _route_reclaim_pass_state(state, now_epoch)
+    if pass_state is None:
+        _route_reclaim_reset(now, state, malformed_reason)
+        return
+    inventory_host = str(proxy_hosts[0]["instance_id"])
+    owner = f"{now_epoch}-{time.time_ns()}"
+    claim = _route_reclaim_transition(
+        now,
+        state,
+        {
+            **pass_state,
+            "phase": "inventory_dispatching",
+            "dispatch_owner": owner,
+            "sent_at": now_epoch,
+            "command_instance_id": inventory_host,
+        },
+        emit_summary=False,
+    )
+    if claim is None:
+        _route_reclaim_summary(skip_reason="inventory_dispatch_claim_lost")
+        return
+    inventory_command = (
+        _ROUTE_OPS_ENV_PREFIX
+        + "python3 /opt/openclaw/route_ops.py list-routes "
+        + f"{shlex.quote(pass_state['cursor'])} "
+        + str(ROUTE_RECLAIM_INVENTORY_COUNT)
+    )
+    inventory_command_id = _ssm_send_hc(
+        inventory_host, inventory_command, timeout=120
+    )
+    if not inventory_command_id:
+        _route_reclaim_transition(
+            now,
+            claim,
+            pass_state,
+            skip_reason="inventory_dispatch_failed",
+        )
+        return
+    pending = dict(pass_state)
+    pending.update(
+        {
+            "phase": "inventory",
+            "command_id": inventory_command_id,
+            "command_instance_id": inventory_host,
+            "dispatch_owner": owner,
+            "sent_at": now_epoch,
+        }
+    )
+    finalized = _route_reclaim_transition(
+        now,
+        claim,
+        pending,
+        advance_generation=False,
+    )
+    if finalized is None:
+        print(
+            "CRITICAL route-reclaim: inventory command dispatched but ownership "
+            f"could not be finalized command_id={inventory_command_id}"
+        )
+
+
 def _rollback_migration(tenant, reason):
     """Roll a failed/stuck migration back to `running` and clear the async
     context. The source VM was only briefly paused for the snapshot and then
@@ -2600,6 +3754,388 @@ def demote_stale_hosts(dry_run=True, now=None, ping_map=None):
         start_key = page.get("LastEvaluatedKey")
         if not start_key:
             return result
+
+
+def _stale_reclaim_lease_cutoff(now):
+    """#592 lifecycle 租约的收敛截止线,返回 **epoch 秒整数**。
+
+    类型很要紧:active_lifecycle_until 是 epoch 整数 —— lifecycle_fence.py 全程 int() 存取
+    并与 int(time.time()) 比。按 ISO 字符串处理会同时坏两处:判据侧解析失败走 fail-safe
+    分支 ⇒ 每个做过 lifecycle 操作的租户被永久判成持锁,#592 对它们完全失效;CAS 侧拿
+    String 去比 DDB 里的 Number,类型不同、条件永不成立。
+    复用 reaper 的 LIFECYCLE_ROLLBACK_LEASE_GRACE_SECONDS,不新开旋钮 —— 它那条注释里的
+    教训对本路径同样成立:租约过期不证明没有在途命令(一条命令可能在过期前一瞬通过 guard,
+    随后才真正执行),多等一段宽限期才让判断基于事实而不是竞态。
+    """
+    return int(now.timestamp()) - LIFECYCLE_ROLLBACK_LEASE_GRACE_SECONDS
+
+
+def _lifecycle_lease_active(tenant, now):
+    """#592 该租户是否持有(或刚释放不久)lifecycle 围栏。
+
+    为什么必须查:rebuild/restart/suspend 期间租户的 `status` 刻意仍是 `running`
+    (tenant_service.py 明写"用独立字段而不是给 status 加 rebuilding",因为 status 有四个
+    既有消费方),而 VM 在这期间会真的不存在 —— 探针此时会如实报"不在"。不查租约就会把一个
+    正在 rebuild 的租户降级成 requires_intervention,而且 CAS 的 status/vm_health/host_id
+    三个锚一个都挡不住它。
+    fail-safe:租约值读不成整数 → 当作持锁(返 True),宁可漏收敛。
+    值是 epoch 整数(见 _stale_reclaim_lease_cutoff 的类型说明),DDB 取回来是 Decimal,
+    int() 能直接吃;字符串脏值会抛 ValueError,而不是像字符串比较那样静默给出一个方向
+    随首字符而定的答案。
+    """
+    until = tenant.get("active_lifecycle_until")
+    if until is None or until == "":
+        return False
+    try:
+        return int(until) > _stale_reclaim_lease_cutoff(now)
+    except (ValueError, TypeError) as e:
+        print(f"stale-reclaim: bad active_lifecycle_until for {tenant.get('id')}: "
+              f"{until!r} ({e}) — treating as held")
+        return True
+
+
+def _host_heartbeat_stale(host, now):
+    """#592 host 自己的心跳是否陈旧。阈值与 #52 的 demote_stale_hosts 用同一个。
+
+    字段回退按本仓惯例:`last_health_check` 缺失时读 `last_seen`(demote_stale_hosts 自己就是
+    `host.get("last_health_check") or host.get("last_seen")`,host-agent 两个字段一起写)。
+    只读前者会让"只有 last_seen 的 host"被判成不陈旧 ⇒ 明明已被 demote 却退回 probe ⇒
+    SSM 本来就探不通 ⇒ 其上租户永远收敛不了。
+    fail-safe:读不出来 → 当作【不陈旧】(返 False),于是上层退回 probe 而不是直接降级。
+    """
+    last = host.get("last_health_check") or host.get("last_seen") or ""
+    if not last:
+        return False
+    try:
+        elapsed = (
+            now - datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+        ).total_seconds()
+    except (ValueError, TypeError):
+        return False
+    return elapsed >= STALE_HOST_DEMOTE_MINUTES * 60
+
+
+def should_reclaim_stale_tenant(tenant, host, now, threshold_sec):
+    """#592 纯函数判据:一个 running 租户该不该被收敛。零 boto3、零 IO,可脱包单测。
+
+    返回三态而不是 bool,因为"host 已确失联"与"host 还健康"要走完全不同的后续动作:
+      "reclaim" —— host 已确认失联,可直接 CAS 降级
+      "probe"   —— host 仍在册且健康,必须先用只读探针核实 VM 真的不在才能动
+      "skip"    —— 不动
+    "host 行不存在 / deleted / 带 stale_demoted_at 的 draining"算已确认失联(见下方注释)。
+    fail-safe 方向:时间戳缺失或畸形一律 skip(宁可漏收敛,不误降级)。
+    """
+    if tenant.get("status") != "running":
+        return "skip"  # 其余中间态各有专门 reaper,不在本范围
+    if tenant.get("vm_health") != "stale":
+        return "skip"
+    if _lifecycle_lease_active(tenant, now):
+        return "skip"
+    last = tenant.get("last_health_check", "")
+    if not last:
+        return "skip"
+    try:
+        elapsed = (now - datetime.fromisoformat(str(last).replace("Z", "+00:00"))).total_seconds()
+    except (ValueError, TypeError) as e:
+        print(f"stale-reclaim: bad last_health_check for {tenant.get('id')}: {last!r} ({e})")
+        return "skip"
+    if elapsed < threshold_sec:
+        return "skip"
+    if not host:
+        return "reclaim"  # host 行都没了 = 确失联
+    if host.get("status") == "deleted":
+        return "reclaim"
+    # `draining` 有两条来源,只有一条算失联证据,所以不能只看 status:
+    #   · POST /hosts/{id}/drain(host_service.py)运维主动回收 —— 只写 status,
+    #     机器和其上的 VM 此刻都还活着(terminate 是随后异步发生的)
+    # 把后者也当失联就会跳过探针、直接降级一个 VM 还在跑的租户。
+    # 光看 stale_demoted_at 还不够:【没有任何路径清除这个 marker】(全仓只有 demote 写它),
+    # 所以一台曾被 demote、后来恢复 active 的 host,再被运维 drain 时会带着历史 marker 进来。
+    # 因此再叠一条【当前状态】判据:host 自己的心跳也确实陈旧。运维 drain 的 host 心跳是
+    # 新鲜的,于是走 probe;实例真被回收后由上面 not host / deleted 两支接管,不会永久卡住。
+    if (
+        host.get("status") == "draining"
+        and host.get("stale_demoted_at")
+        and _host_heartbeat_stale(host, now)
+    ):
+        return "reclaim"
+    return "probe"  # host 仍 active/idle/upgrading/主动 draining —— 不能据 DDB 单方面下结论
+
+
+def _invocation_remaining_sec():
+    """#592 本次 Lambda invocation 还剩几秒。拿不到就返 None(不拦)。
+
+    context 只有在 lambda_handler 里才有,单测和本地直调 sweep 时是 None;这时靠条数门与
+    挂钟门兜底,不因为读不到 context 就把整个收敛关掉。
+    """
+    ctx = _stale_probe_budget.get("ctx")
+    if ctx is None:
+        return None
+    try:
+        return float(ctx.get_remaining_time_in_millis()) / 1000.0
+    except Exception as e:  # context 形状不符/被打桩成别的东西 → 不拦
+        print(f"stale-reclaim: cannot read remaining invocation time ({e}) — not gating")
+        return None
+
+
+def _confirm_vm_absent(host_id, tenant_id):
+    """#592 只读探针:确认该租户的 VM 在这台 host 上【确实不存在】。
+
+    刻意不复用 _confirm_vm_stopped —— 那个函数会真的跑 stop-vm.sh(它的 docstring 明写
+    "调用前必须已围栏该行……否则会 stop 掉一个刚起来的活 VM")。本路径面对的是 status=running
+    的租户,不能对它做任何破坏性动作,所以这里只 test -e 和 pgrep,不 rm、不 kill、不改任何东西。
+
+    fail-closed:SSM 失败/超时、输出里没有 VM_ABSENT 哨兵、或同时出现 VM_PRESENT → 一律 False
+    (本轮不收敛,下轮再试)。宁可漏收敛,不可误降一个还活着的 VM。
+    """
+    if not host_id:
+        return False
+    if _stale_probe_budget["n"] >= _STALE_PROBE_MAX:
+        print(f"stale-reclaim: probe budget ({_STALE_PROBE_MAX}) exhausted — deferring "
+              f"{tenant_id} to next sweep (avoid starving failover/migration work)")
+        return False
+    # 挂钟门:条数还没用完但时间已经用完 —— 同样 defer。放在条数门之后、发 SSM 之前,
+    # 保证"预算耗尽"路径永远不发 SSM(与条数门同一契约)。
+    if _stale_probe_budget["spent"] >= _STALE_PROBE_BUDGET_SEC:
+        print(f"stale-reclaim: probe wall-clock budget ({_STALE_PROBE_BUDGET_SEC}s) spent "
+              f"{_stale_probe_budget['spent']:.1f}s — deferring {tenant_id} to next sweep")
+        return False
+    # invocation 截止线门:前两道门管不到前序工作已烧掉的时间。context 读不到时不拦
+    # (本地/单测无 context),因为前两道门仍在兜底。
+    _remaining = _invocation_remaining_sec()
+    if _remaining is not None and _remaining < (
+        STOP_CONFIRM_TIMEOUT + _STALE_PROBE_DEADLINE_MARGIN_SEC
+    ):
+        print(f"stale-reclaim: only {_remaining:.1f}s left in this invocation "
+              f"(need {STOP_CONFIRM_TIMEOUT + _STALE_PROBE_DEADLINE_MARGIN_SEC}s) — "
+              f"deferring {tenant_id} to next sweep")
+        return False
+    _stale_probe_budget["n"] += 1
+    _probe_started = time.monotonic()
+    _q_tid = shlex.quote(str(tenant_id))
+    # 两条判据都必须成立才算"不在":vm.json 不在 且 没有该租户的 firecracker 进程。
+    # 只查其中一条会误判 —— 目录被回收但 FC 仍持有 fd 在跑(见 _confirm_vm_stopped 的
+    # 同类教训),或 FC 已死但目录还没被 GC。
+    # 进程判据必须【精确】匹配 api-sock 路径,不能拿 tenant_id 做子串:grep -F t-1 会命中
+    # t-10 的进程 ⇒ 对 t-1 恒报 VM_PRESENT ⇒ 它永远无法收敛。这里用本仓既有写法
+    # (start-all-vms.sh 与 host-agent.py 都是 pgrep -f 匹配 api-sock 后面的完整 sock 路径)。
+    _vm_dir = f"/data/firecracker-vms/{_q_tid}"
+    ok, out = _ssm_run_capture(
+        host_id,
+        f"[ -e {_vm_dir}/vm.json ] && {{ echo VM_PRESENT; exit 0; }}; "
+        f"pgrep -f 'api-sock {_vm_dir}/fc.sock' >/dev/null 2>&1 && "
+        f"{{ echo VM_PRESENT; exit 0; }}; echo VM_ABSENT",
+        timeout=STOP_CONFIRM_TIMEOUT,
+    )
+    # 记真实耗时而不是按 STOP_CONFIRM_TIMEOUT 记账:命令通常几百毫秒就回,按上界记账会
+    # 把预算浪费在没花掉的时间上,让本该收敛的租户白等一 tick。
+    _stale_probe_budget["spent"] += time.monotonic() - _probe_started
+    absent = ok and "VM_ABSENT" in out and "VM_PRESENT" not in out
+    if not absent:
+        print(f"stale-reclaim: {tenant_id} on {host_id} VM-absence unconfirmed "
+              f"(ok={ok} out={out[:80]!r}) — NOT reclaiming this cycle")
+    return absent
+
+
+def _flip_tenant_to_intervention(tid, hid, now, reason, snap_fence_epoch=None):
+    """#592 CAS 降级一个租户到 requires_intervention。返回是否真的写成功。
+
+    目标状态刻意选 requires_intervention 而不是 deleted/failed:host-agent 的
+    _gc_orphan_vm_dirs 删数据盘的双门是【.purge 墓碑 + 强一致读 status == "deleted"】,
+    写 deleted 就会删掉客户数据盘 —— 这是本改动唯一的不可逆风险面,绝不能碰。
+    条件写四个锚缺一不可:host-agent 在这期间恢复(vm_health→up)、状态已被别的路径流转、
+    租户已被迁到别的 host、或者它在探针与写入之间拿到了 lifecycle 围栏(rebuild/restart 期间
+    status 仍是 running,VM 会真的不存在)时,CCF 出局、绝不降级。租约那一锚必须同时出现在
+    判据和这里:判据读的是 scan 快照,而围栏可能在快照之后才被拿到。
+    """
+    try:
+        tenants_table.update_item(
+            Key={"id": tid},
+            UpdateExpression=(
+                "SET #s = :ri, updated_at = :t, stale_reclaimed_at = :t, "
+                "stale_reclaim_reason = :r, stale_reclaimed_from_host = :h, "
+                # 与 #494 的 crash-loop reaper 同名,运维查"谁要人工介入、为什么"只用一套字段
+                "requires_intervention_ts = :t, requires_intervention_reason = :r"
+            ),
+            ConditionExpression=(
+                "#s = :run AND vm_health = :stale AND "
+                # host_id 缺失的行:`host_id = :h` 对不存在的属性【永不成立】,于是这类
+                # stale 租户会永久悬挂 —— 而收敛悬挂租户正是本改动的目的。判据那边
+                # `not host` 已经放行它们了,CAS 这边也要放行。属性存在但不等于 :h
+                # (租户已被迁到别的 host)仍然出局。
+                "(attribute_not_exists(host_id) OR host_id = :h) AND "
+                "(attribute_not_exists(active_lifecycle_until) OR "
+                "active_lifecycle_until <= :lease_cutoff) AND "
+                # 第五锚:围栏代次。租约可以在探针之后被拿到【又释放】,那时上面那条
+                # active_lifecycle_until 的比较会重新成立,而 VM 已经被 rebuild 起回来了 ——
+                # 只有 epoch 变了这件事留得下来。epoch 与扫描快照不一致就出局。
+                "(attribute_not_exists(lifecycle_fence_epoch) OR "
+                "lifecycle_fence_epoch = :snap_epoch)"
+            ),
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":ri": "requires_intervention",
+                ":run": "running",
+                ":stale": "stale",
+                ":h": hid,
+                ":t": now.isoformat(),
+                ":r": reason,
+                ":lease_cutoff": _stale_reclaim_lease_cutoff(now),
+                ":snap_epoch": int(snap_fence_epoch or 0),
+            },
+        )
+    except Exception as e:  # 含 ConditionalCheckFailed:host-agent 恢复/状态已变,不是错误
+        print(f"stale-reclaim: {tid} 未收敛({e})")
+        return False
+    print(f"stale-reclaim: {tid} running->requires_intervention ({reason})")
+    _emit_audit(
+        "TENANT_RECLAIMED_STALE",
+        {
+            "tenant_id": tid,
+            "host_id": hid,
+            "reason": reason,
+            "threshold_minutes": TENANT_STALE_RECLAIM_MINUTES,
+        },
+    )
+    return True
+
+
+def _stale_host_row(hid, cache):
+    """#592 sweep 内的 host 行缓存:同一台 host 上多个 stale 租户只查一次 DDB。
+
+    强一致读 —— 判据要用 demote_stale_hosts 本轮刚写下的 draining,最终一致会读到旧值。
+    """
+    if hid not in cache:
+        cache[hid] = (
+            hosts_table.get_item(Key={"instance_id": hid}, ConsistentRead=True).get("Item")
+            if hid
+            else None
+        )
+    return cache[hid]
+
+
+# 轮转游标存在 hosts 表的一个合成行上,沿用 __az_failover_state__ 那套模式;
+# demote_stale_hosts 等机队遍历都按 instance_id.startswith("__") 跳过合成行,
+# 且本行【不写 status 字段】,所以也不会被"只降 active/idle"的条件写命中。
+_STALE_CURSOR_ROW = "__stale_reclaim_cursor__"
+
+
+def _read_stale_cursor():
+    """#592 读轮转游标。读不到就从 0 开始(退化成不轮转的老行为,不是致命错)。"""
+    try:
+        item = hosts_table.get_item(
+            Key={"instance_id": _STALE_CURSOR_ROW}, ConsistentRead=True
+        ).get("Item") or {}
+        return int(item.get("stale_reclaim_cursor") or 0)
+    except Exception as e:
+        print(f"stale-reclaim: cannot read rotation cursor ({e}) — starting at 0")
+        return 0
+
+
+def _write_stale_cursor(value):
+    """#592 写回轮转游标。写失败不影响本轮结果,只是下轮起点不前进。"""
+    try:
+        hosts_table.update_item(
+            Key={"instance_id": _STALE_CURSOR_ROW},
+            UpdateExpression="SET stale_reclaim_cursor = :c, updated_at = :t",
+            ExpressionAttributeValues={
+                ":c": int(value),
+                ":t": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+    except Exception as e:
+        print(f"stale-reclaim: cannot persist rotation cursor ({e}) — next sweep repeats")
+
+
+def reclaim_stale_tenants(tenants, now=None, dry_run=False):
+    """#592 sweep:把 VM 已消失但 status 还挂在 running 的租户收敛到 requires_intervention。
+
+    输入直接用 lambda_handler 已 scan 出来的 running 租户列表,不再扫一遍表。只翻 status
+    与追溯字段 —— 不删 DDB 行、不动数据盘、不回收物理号、不清 nat 表(都是独立路径)。
+    """
+    result = {
+        "scanned": 0,
+        "reclaimed": [],
+        "probed": 0,
+        "skipped_probe_unconfirmed": 0,
+        "skipped_host_recovered": 0,
+        "would_reclaim": [],
+    }
+    if not TENANT_STALE_RECLAIM_ENABLED:
+        return result
+    now = now or datetime.now(timezone.utc)
+    threshold_sec = TENANT_STALE_RECLAIM_MINUTES * 60
+    host_cache = {}
+    # 快筛,省掉绝大多数 host 查询(实测该表 6790 行)。注意这里读的是【扫描那一刻】的
+    # vm_health —— 主循环把 stale 只写进 DDB、没同步回内存 dict,所以刚转 stale 的那一
+    # tick 会被这里筛掉,下一 tick 才进来。阈值是 30 分钟(数十 tick),差一 tick 无影响;
+    # 刻意不去改主循环,避免为了省一 tick 动既有写路径。
+    candidates = [t for t in tenants if t.get("vm_health") == "stale"]
+    # 起点用【持久游标】轮转。探针预算每次 invocation 都从 0 开始,而候选顺序来自 scan ——
+    # 不轮转的话,前几个【持续探不通】的租户会每轮都吃光预算,排在后面的永远轮不到,
+    # 表现为"一部分租户永久不收敛"。
+    # 刻意不用 now 派生偏移:EventBridge 每 interval_minutes 触发一次,相邻两轮的偏移会固定
+    # 相差 interval,一旦候选数与该步长有公因子(例如 5 分钟节拍、候选数是 5 的倍数),
+    # 可达起点就只有 N/gcd 个,剩下的租户仍然永久饥饿。游标按【本轮实际消耗的判定数】前进,
+    # 与触发节拍无关,不存在病态候选数。
+    _cursor = _read_stale_cursor()
+    if candidates:
+        _offset = _cursor % len(candidates)
+        candidates = candidates[_offset:] + candidates[:_offset]
+    for tenant in candidates:
+        result["scanned"] += 1
+        tid, hid = tenant.get("id"), tenant.get("host_id", "")
+        try:
+            host = _stale_host_row(hid, host_cache)
+            verdict = should_reclaim_stale_tenant(tenant, host, now, threshold_sec)
+            if verdict == "skip":
+                continue
+            if verdict == "probe":
+                result["probed"] += 1
+                if not _confirm_vm_absent(hid, tid):
+                    result["skipped_probe_unconfirmed"] += 1
+                    continue
+                reason = f"vm_absent_on_healthy_host:{hid}"
+            else:
+                # host 判据(读)与 tenant 降级(写)之间有窗口:这一支不做探针,完全依赖
+                # DDB 上的 host 状态,而 host 可能在此期间恢复(host-agent 重新上报 →
+                # status/心跳都变新)。写之前用【绕过缓存的强一致读】复核一次,把窗口从
+                # "整个 sweep"收窄到"一次读 + 一次写"。
+                # 没有做成 TransactWriteItems 的 ConditionCheck:那要把 host 的 status、
+                # marker、心跳三个值都编码进事务条件,而心跳是时间比较、DDB 条件表达式
+                # 表达不了"陈旧超过 N 分钟";复核读已经拿掉了绝大部分窗口,剩下的残余
+                # 窗口记在 changelog 里。
+                fresh_host = _stale_host_row(hid, {})
+                if (
+                    should_reclaim_stale_tenant(tenant, fresh_host, now, threshold_sec)
+                    != "reclaim"
+                ):
+                    print(f"stale-reclaim: {tid} host {hid or '(absent)'} 复核后不再判失联 "
+                          f"— 本轮不收敛")
+                    result["skipped_host_recovered"] += 1
+                    continue
+                hstatus = (fresh_host or {}).get("status", "absent")
+                reason = f"host_unreachable:{hid or '(absent)'}:{hstatus}"
+            if dry_run:
+                result["would_reclaim"].append({"tenant": tid, "host": hid, "reason": reason})
+                continue
+            if _flip_tenant_to_intervention(
+                tid, hid, now, reason,
+                snap_fence_epoch=tenant.get("lifecycle_fence_epoch"),
+            ):
+                result["reclaimed"].append({"tenant": tid, "host": hid, "reason": reason})
+        except Exception as e:  # 一个租户炸掉不能让整轮 sweep 停摆
+            print(f"stale-reclaim: {tid} 处理失败(non-fatal): {e}")
+            continue
+    # 游标按本轮实际做出判定(探过 + 直接收敛)的条数前进,下一轮就从没轮到的那个开始。
+    # dry_run 不前进:它不消耗预算,前进会让真实 sweep 跳过租户。
+    if candidates and not dry_run:
+        # 按【本轮实际发出的探针条数】前进,不是 result["probed"] —— probed 在预算门之前
+        # 就 +1 了(被 defer 的也算探过),用它会让游标一次前进整个候选长度、offset 原地不动。
+        _advanced = _stale_probe_budget["n"] + len(result["reclaimed"])
+        if _advanced:
+            _write_stale_cursor(_cursor + _advanced)
+    return result
 
 
 def classify_agent_restart(host):

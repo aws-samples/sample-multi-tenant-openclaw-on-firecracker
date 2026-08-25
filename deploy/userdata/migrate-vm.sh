@@ -94,6 +94,12 @@ _harden_restored_tap() {
     sudo iptables -C INPUT -i "${tap}" -p tcp --dport "${_port}" -j DROP 2>/dev/null || \
       sudo iptables -I INPUT 1 -i "${tap}" -p tcp --dport "${_port}" -j DROP
   done
+  # 同上,但在 FORWARD:INPUT 只保护本机,打别的 host 走 FORWARD。迁移路径必须与 launch
+  # 一样严,否则一次 migrate 就静默降级这台租户的隔离。见 ADR-603-guest-redline-ports-forward-drop.md。
+  for _port in 8899 9090 22 9100; do
+    sudo iptables -C FORWARD -i "${tap}" -p tcp --dport "${_port}" -j DROP 2>/dev/null || \
+      sudo iptables -I FORWARD 1 -i "${tap}" -p tcp --dport "${_port}" -j DROP
+  done
   # MASQUERADE(出网)+ conntrack ACCEPT:与 launch-vm 一致,公网出口正常。
   sudo iptables -t nat -C POSTROUTING -o "${host_iface}" -j MASQUERADE 2>/dev/null || \
     sudo iptables -t nat -A POSTROUTING -o "${host_iface}" -j MASQUERADE

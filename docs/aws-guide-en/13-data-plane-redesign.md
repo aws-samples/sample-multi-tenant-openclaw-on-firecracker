@@ -42,11 +42,11 @@ The OpenClaw gateway requires both the per-tenant gateway token and an Ed25519 d
 | ---- | ----------------------------------------- | ----------- | --------------------------------------------------------- |
 | L1   | worker-local `resty.lrucache` (cap 4000)  | 5s ± jitter | per-worker hot path (ns hits)                             |
 | L2   | `lua_shared_dict route_cache 128m`        | 60s         | cross-worker + fail-static cover for ElastiCache failover |
-| L3   | ElastiCache Valkey/Redis `GET route:{tenant_id}` | —           | authoritative (host-agent double-writes)                  |
+| L3   | ElastiCache Valkey/Redis `GET route:{tenant_id}` | —           | reader hot path; primary is authoritative for retry       |
 
 On L3 miss, `resty.lock` single-flights the origin fetch (stampede shield). When Redis is unreachable, L2 serves stale (fail-static). **The 60s L2 TTL is a quantified lower bound** — INTERFACE-CONTRACT §8 requires "≥ the longest expected failover window (recommended ≥30-60s)" and ElastiCache Multi-AZ automatic failover typically takes 15-30s.
 
-**DNS + connection layer**: `resolver 169.254.169.253 valid=30s ipv6=off;`; `lua-resty-redis set_keepalive(60000ms, 100)`. Never hard-code Redis node IPs — always use the primary-endpoint DNS name, which AWS updates on failover.
+**DNS + connection layer**: `resolver 169.254.169.253 valid=30s ipv6=off;`; `lua-resty-redis set_keepalive(60000ms, 100)`. The edge hot path reads the cluster-level reader endpoint (`ReaderEndPoint.Address`, the `-ro` DNS name), failover retry reads the primary endpoint for read-after-write consistency, and host-side route writes use the primary endpoint. Never hard-code individual node IPs or node endpoint names; AWS maintains the cluster-level DNS names as topology changes.
 
 ## 13.4 Host DNAT + port bitmap
 

@@ -345,6 +345,10 @@ redis:
   #   删不掉 → 同样整栈回滚。那个键只适用于【栈外部管理】的子网组。
   subnet_ids: []
   node_type: "cache.r7g.large"  # 代码只读这个键,不要写 redis.instance_type(死键)。
+  # #618 edge 读路由开关。默认 false = 存量行为;true 时正常热路径读集群级
+  # reader endpoint,num_replicas=0 自动回落 primary;failover 重投始终读 primary。
+  # 本键只分离读流量,不解决 Valkey/Redis 的传输加密与认证。
+  edge_read_from_replica: false
   # engine_version 传 major.minor;补丁号(如 valkey 7.2.6)由 AWS 托管不显式指定。
   # valkey→"7.2";redis→"7.1"。参数组 family 自动取 <engine><major>(valkey7 / redis7)。
   engine_version: "7.2"
@@ -399,6 +403,42 @@ scaler:
   # 40 并发就触发 SSM TimedOut,故单 metal 场景应设到约 5-10(实测 SSM 单实例承受区间),
   # 不是 50;多 host 可按 host 数线性放大。瞬时千级入队、consumer 按此速率平稳消费。
   lifecycle_consumer_concurrency: 50
+  # ── #565 G5:控制面并发与 host 侧 SSM worker 上限**必须成对**改 ─────────────────
+  # 上面那句「单 metal 应设 5-10」写在 host 侧 worker 上限还是 agent 内置默认 **5** 的
+  # 时代 —— 它没错,但**不完整**:那个 5-10 是被 host 侧的 5 个 worker 倒推出来的,
+  # 而 host 侧那个数**是可以调的**。所以真正的规则不是"控制面并发要小",而是**两侧成对**。
+  #
+  # 两个数:
+  #   · 本文件的 `lifecycle_max_concurrency` → ESM `ScalingConfig.MaximumConcurrency`,
+  #     最多几个 consumer 同时在飞。不填 = `deploy/stacks/lambdas.py` 里的代码默认。
+  #   · `deploy/userdata/init-host.sh` 的 `Mds.CommandWorkersLimit`(现为 **20**,
+  #     buffer 10)→ 写进 host 的 `/etc/amazon/ssm/amazon-ssm-agent.json`,
+  #     单台 host 同时能跑几条 SSM 命令。
+  #
+  # **只提一侧都是白费,而且失败方式不同**:只提本文件这个 → 请求被送出来但堆在 agent 的
+  # worker 前面排队,而排队时间算在客户死线里(#565 的三段预算),于是表现成「到点判失败」
+  # 而不是「变慢」;只提 agent 那个 → ESM 压根不会送那么多进来。
+  # 这条耦合两头都有闸,**你在本文件里配的值也逃不掉**:
+  #   · `tests/test_565_g5_agent_worker_parity.py` 钉住代码默认值 ≤ `CommandWorkersLimit`,
+  #     并钉住 `lambdas.py::_HOST_SSM_COMMAND_WORKERS` 与那个 shell 里的数逐字相等;
+  #   · `lambdas.py` 在 **synth 期** fail-loud:本文件配的值一旦超过 host worker 上限就
+  #     `raise`,部署压根起不来。
+  # 先前只有前一条,于是在这里写 30 既不红也不拦(Codex 独立复审 2026-08-25 指出)——
+  # 部署会静默成功,然后表现成「到点判失败」,而日志上看不出是排队造成的。
+  #
+  # host 侧 20/10 是真机实测的(us-west-2,2026-08-25,每档有 agent 重启时间戳):
+  # 默认 5 下发 12 条命令严格分 3 批每批 5;`20/10` 下发 24 条得 20 同时 + 4 排队;
+  # `50/25` 得 50 同时 + 10 排队 —— 线性生效,buffer 取 worker 的一半即够。
+  #
+  # **第三道墙在这两个之上,别越过**:SSM `SendCommand` 的服务端限流实测约 **6.6 rps**
+  # 502 占 89.5%。它**不能自助提额**(160 个服务配额里没有它的 TPS 项)。提并发到某个点
+  # 之后就会撞它,那时失败只是从「agent 排队」换成「控制面被限流」,没有变好。
+  #
+  # 还有一条 AWS 硬约束:`lifecycle_max_concurrency ≤ lifecycle_consumer_concurrency`
+  # (且前者硬范围 2..1000),`lambdas.py` 里有两个 `raise ValueError` 在 synth 期挡住,
+  # 所以**要提就三个数一起看**。留注释态:出厂默认不动,因为 20 对 host 侧仍是 5 worker
+  # 的环境是错的 —— 那种环境该先滚一批带新 `init-host.sh` 的 host。
+  # lifecycle_max_concurrency: 20
   # per-user 舰队反查索引 gsi_tenant_user(按 tenant_user_id 分区,供
   # GET/POST /users/{tenant_user_id}/* 反查该用户名下所有节点,见 stack.py:121 读取点、
   # handler.py:128 GSI_TENANT_USER 常量、handler.py:3800 反查 Query)。
@@ -498,6 +538,7 @@ lifecycle:
     suspend: 180
     restore: 180
     restart: 180    # 客户 2026-08-21 追加
+    start: 180      # #604 后续项;与 restart 同档
     rebuild: 180    # 客户 2026-08-21 追加
     backup: 600     # **网关手动备份**;系统定时备份有自己的错峰语义,不受此约束
     delete: 600     # 只约束「给上层的答复」;实际删除不得丢弃,必须继续重试到成功
@@ -778,6 +819,9 @@ security:
   # egress_mode=deny 时:除 EGRESS_VPC_CIDR 外是否额外 REJECT 全部 RFC1918(10/8+172.16/12+192.168/16)。
   #   默认 false(只堵本 VPC);多 VPC/对等网需要更严时设 true,但注意勿误伤同段合法私网目的地。
   egress_deny_rfc1918: false
+  # 内部 LiteLLM ALB/NLB 所在子网 CIDR(逗号分隔)。设置后取代 LITELLM_HOST 的单 IP DNS 派生,
+  # 覆盖负载均衡 IP 轮换;留空则保持 legacy 单 IP 派生。
+  egress_llm_cidr: ""
   # #517 阶段3(G1 fail-closed)—— 只读身份盘(openclaw-immutable.ext4:7 个身份 md + ops skills)
   #   缺失时是否【拒绝启动】该 microVM。默认 false = 既有兼容行为:launch-vm.sh 打 WARN 后照常
   #   起,guest 回落到 data 盘里【烤制当天】的旧 md 副本 + 开机 bind-mount 遮盖失效 → agent 读到

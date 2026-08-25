@@ -36,6 +36,9 @@
 #     每次唤醒都要收敛到 platform.env 的当前值)
 #   • apiKey:仅在参数显式非空才写(唤醒路径 LITELLM_VKEY 参数为空时绝不拿
 #     shared key 兜底覆盖数据盘上的 per-tenant vkey——那会坏计费拆分)
+#   • LiteLLM provider request timeout:每次固定收敛到 55s。OpenClaw v2026.7.1
+#     原生支持 models.providers.<id>.timeoutSeconds,覆盖 connect/headers/body/stream
+#     watchdog；edge 的 chat-only idle timeout 是 60s,留 5s 把错误 SSE 刷给客户端。
 #
 # fail-loud:jq exit 非零、或输出空,一律不 clobber 原 openclaw.json,return 1。
 # 静默吞过一次异常就是事故(踩过——见 CLAUDE.md 血泪教训)。
@@ -45,6 +48,7 @@ oc_harden_config() {
   __hc_baseurl="$3"
   __hc_vkey="$4"
   __hc_chat="$5"
+  __hc_llm_timeout=55
 
   # 文件不存在或没 jq:跳过。openclaw.json 缺席时启动路径本就已经跑不到这里
   # (调用点先 [ -f OC_JSON ] 判过),这里保护性 return 只是给测试用。
@@ -82,12 +86,14 @@ oc_harden_config() {
   if [ -n "${__hc_vkey}" ]; then
     __hc_prog="${__hc_prog} | .models.providers.litellm.apiKey = \$vkey"
   fi
+  __hc_prog="${__hc_prog} | .models.providers.litellm.timeoutSeconds = \$llm_timeout"
 
   __hc_tmp="${__hc_oc}.harden.$$"
   # jq 失败 / 输出空:不 clobber,报错返 1。绝不静默把好文件覆盖成空。
   if ! jq --arg origin "${__hc_origin}" \
           --arg baseurl "${__hc_baseurl}" \
           --arg vkey "${__hc_vkey}" \
+          --argjson llm_timeout "${__hc_llm_timeout}" \
           "${__hc_prog}" "${__hc_oc}" > "${__hc_tmp}" 2>/dev/null; then
     echo "[oc:harden] jq failed on ${__hc_oc} — leaving original untouched" >&2
     rm -f "${__hc_tmp}"
@@ -320,11 +326,7 @@ oc_assemble_config() {
           ($current; if ($template | has($key))
                      then setpath(
                        [$key];
-                       if (($current[$key] | type) == "object"
-                           and ($template[$key] | type) == "object")
-                       then ($current[$key] * $template[$key])
-                       else $template[$key]
-                       end)
+                       $template[$key])
                      else . end)
         end
     ' "${__ac_current}" "${__ac_template}" > "${__ac_tmp}" 2>/dev/null; then

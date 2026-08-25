@@ -109,22 +109,12 @@ before: -rw-r--r--  os.access(X_OK)=False  → NO local backups are happening on
 chmod 0755 → after: -rwxr-xr-x  os.access(X_OK)=True  → backup: 2/2 tenant(s) backed up
 ```
 
-**所以施加 `backup-data.sh` 用 0755,不要用 manifest 里那条 0644**(HOST_IDS 取法见 Step 0b):
-
-```bash
-for h in $HOST_IDS; do
-  aws ssm send-command --region "$REGION" --instance-ids "$h" \
-    --document-name AWS-RunShellScript \
-    --parameters commands='["chmod 0755 /home/ubuntu/backup-data.sh","ls -l /home/ubuntu/backup-data.sh"]' \
-    --query Command.CommandId --output text
-done
-# 验证:逐 host 读 ResponseCode=0,并在下一个备份轮次(~60s)后确认 journal 里不再有 REFUSING
-```
-
-这是**绕过不是修复** —— 换机或重跑 patch 会回到 0644 再踩。durable 修法要落进 patch 本身(把
-`install -m` 改 0755 并同步源码 git mode,或把 host-agent 的检查从 `os.access(X_OK)` 改成「可读即可」,
-因为它自己调用时用的是 `sh`/`bash` 前缀)。命中时 `GET /hosts`、`status` 全正常,只有 host 侧 journal
-与 `openclaw_backup_script_stale` 指标能看出来。
+**本 kit 的 manifest 已把这一条的 `install -m` 修成 `0755`(durable,不再是事后 chmod 绕过)**,
+`backup-data.sh` 的 `verify_cli` 也加了 `test -x` 逐 host 断言。照 manifest 的 `apply_cli`/`verify_cli`
+正常走即可,施加后确认下一个备份轮次(~60s)journal 里不再有 `REFUSING`。这是本文件里唯一一条**故意
+不沿用源码 git mode(0644)**的安装位——因为 host-agent 用 `os.X_OK` 检查它;其余 host 脚本
+(`launch-vm.sh`/`host-agent.py`)仍是 0644,那些经 `bash`/`python3` 调用不需要执行位。命中时
+`GET /hosts`、`status` 全正常,只有 host 侧 journal 与 `openclaw_backup_script_stale` 指标能看出来。
 
 **①b 这个 fail-closed 的报错会把自己藏起来,不要按 502 的字面去查。**
 真机捕获到:`awslambdaric` 回传 init error 时按 latin-1 编码 HTTP body,中文 `raise` 消息触发

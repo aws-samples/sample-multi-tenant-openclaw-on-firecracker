@@ -121,7 +121,16 @@ _REBUILD_STATUS_FAILED = "failed"
 # `backup` 在 #564 G7 之前也在这一列(它压根没有状态字段);G7 给了它 `backup_phase`,
 # 所以它移到下面 `_PHASE_ACTIONS` 那张表里 —— 有自己的状态字段就该翻自己那个,而不是
 # 只留一条原因。
-_NO_INTERMEDIATE_STATUS = (create_deadline.ACTION_RESTART,)
+_NO_INTERMEDIATE_STATUS = (
+    create_deadline.ACTION_RESTART,
+    # #604 —— `start` 与 restart 同类,**必须一起在这里**。它在执行期间不动 `status`
+    # (真机实测:发 start 之后租户行仍是 `stopped`,成功才翻 running),所以它没有"卡住的
+    # 中间态"可翻。漏掉它的后果是实的:走下面常规分支就会把一个**健康的 stopped 租户**
+    # 在死线到点时标成 `failed` —— 那比不判死更糟,客户看到的是一个凭空坏掉的租户,而
+    # `status` 有四个消费方(scaler 的跳过集合、`gsi_status` 查询、客户契约字段)会一起
+    # 跟着误判。
+    create_deadline.ACTION_START,
+)
 
 # **有自己的"相位"状态字段、但不进 `status` 中间态**的两档。表的形态:
 #   动作 → (当做 CAS 锚的字段, 判死时要翻成 failed 的字段们)

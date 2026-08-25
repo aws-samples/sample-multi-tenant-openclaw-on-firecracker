@@ -13,6 +13,8 @@ import core.ddb_scan as ddb_scan  # #432 —— Scan 必须翻页
 from core.logging import logger, inject_trace_root, reset_invocation_keys
 from services.tenant_query_service import (
     QUERY_FIELDS as _TENANT_QUERY_FIELDS,
+    # #601 —— 响应字节预算的来源。见下面 `_RESPONSE_BYTE_BUDGET` 的说明:本路径取它的一半。
+    _RESPONSE_ITEM_BUDGET as _GSI_ITEM_BUDGET,
     list_tenants_by_condition,
 )
 from services.tenant_stats_service import get_tenant_stats
@@ -85,7 +87,7 @@ def _resolve_proxy_route(method, path, route_keys):
 
 
 # 前端直接 POST /ws/{tenant_id}/v1/chat/completions,SSE 流式,鉴权用租户 gateway
-# token(GET /tenants/{id}/token 拿密文,调用方自解)。旧 chat_sign 路由 + claw-
+# token(GET /tenants/{id}/credentials 拿密文,调用方自解)。旧 chat_sign 路由 + claw-
 # channel HMAC + hub relay 全部下线。参见 SPEC/11-ENGINE-TRANSFORM/02-DEV-PLAN.md G/D
 # 与 04-API-SPEC.md 一、二节。
 
@@ -199,17 +201,20 @@ def lambda_handler(event, context):
                     _async_rebuild.get("_fence_epoch"),
                     result_body.get("error") or f"worker returned HTTP {code}",
                 )
-            elif (
-                code < 300
-                and isinstance(reapply_binding, dict)
-                and result_body.get("config_reapply") != "already_applied"
-            ):
-                _tenant_service.finalize_async_rebuild_success(
-                    _async_rebuild.get("tenant_id"),
-                    _async_rebuild.get("_op_id"),
-                    _async_rebuild.get("_fence_epoch"),
-                    reapply_binding,
-                )
+            elif code < 300 and isinstance(reapply_binding, dict):
+                if result_body.get("config_reapply") == "already_applied":
+                    _tenant_service.finalize_async_rebuild_already_applied(
+                        _async_rebuild.get("tenant_id"),
+                        _async_rebuild.get("_op_id"),
+                        _async_rebuild.get("_fence_epoch"),
+                    )
+                else:
+                    _tenant_service.finalize_async_rebuild_success(
+                        _async_rebuild.get("tenant_id"),
+                        _async_rebuild.get("_op_id"),
+                        _async_rebuild.get("_fence_epoch"),
+                        reapply_binding,
+                    )
             return result
         if result_body.get("rebuild_status") == "unconfirmed":
             # Host work may have happened. The rebuild branch already stamped
@@ -391,6 +396,9 @@ def lambda_handler(event, context):
         ("POST", "/users/{tenant_user_id}/action"): lambda: user_action(
             path_params["tenant_user_id"], event.get("body"), event
         ),
+        ("POST", "/users/{tenant_user_id}/upgrade"): lambda: tenant_action(
+            path_params["tenant_user_id"], "upgrade", event.get("body"), event
+        ),
         # Go-live A1: external backend pushes the authoritative user↔tenant mapping.
         # Auth is HMAC (verified inside external_authz), NOT Cognito/RBAC — so it
         # must bypass the Cognito role gate (added to the RBAC skip list below).
@@ -430,6 +438,15 @@ def lambda_handler(event, context):
         # #566 拆分② — fleet guest 出网防火墙运维:一次改全部(或指定)host 的
         # OPENCLAW-EGRESS default-deny 链。Admin-only(gated inside fleet_egress)。
         ("POST", "/hosts/egress"): lambda: fleet_egress(event.get("body"), event),
+        ("GET", "/hosts/egress"): lambda: fleet_egress_status(event),
+        ("GET", "/hosts/egress/revisions"): lambda: fleet_egress_revisions(event),
+        ("DELETE", "/hosts/egress/revisions"): lambda: fleet_egress_revisions_delete(
+            event.get("body"), event
+        ),
+        ("GET", "/hosts/egress/chain"): lambda: fleet_egress_chain(event),
+        ("POST", "/hosts/egress/rollback"): lambda: fleet_egress_rollback(
+            event.get("body"), event
+        ),
         ("POST", "/hosts/rolling-upgrade"): lambda: submit_rolling_upgrade(
             event.get("body"), event
         ),
@@ -558,43 +575,66 @@ def lambda_handler(event, context):
 # is the per-tenant LLM billing key. Strip them from every outbound tenant record.
 
 
-def list_tenants(query_params=None, multi_query_params=None, event=None):
-    query_params = query_params or {}
-    if any(field in query_params for field in _TENANT_QUERY_FIELDS):
-        return list_tenants_by_condition(query_params, event or {})
-    # end and return a bare array (legacy shape small deployments rely on). With
-    # ?limit=N → one page of ≤N rows + an opaque next_token, wrapped in an object
-    # so a 100k-row table never blows the 30s API-GW timeout or the client.
-    paginate = bool(query_params.get("limit")) or bool(
-        query_params.get("next_token")
-    )
-    scan_kwargs = {
-        "FilterExpression": "#s <> :d",
-        "ExpressionAttributeNames": {"#s": "status"},
-        "ExpressionAttributeValues": {":d": "deleted"},
-    }
-    if paginate:
-        limit, err = _parse_limit(query_params)
-        if err is not None:
-            return err
-        start_key, err = _parse_next_token((query_params or {}).get("next_token"))
-        if err is not None:
-            return err
-        scan_kwargs["Limit"] = limit
-        if start_key:
-            scan_kwargs["ExclusiveStartKey"] = start_key
-        out = tenants_table.scan(**scan_kwargs)
-        items = out.get("Items", []) or []
-        next_token = _encode_next_token(out.get("LastEvaluatedKey"))
-    else:
-        items = ddb_scan.scan_all(tenants_table, **scan_kwargs)
-        next_token = None
+#: #601 补页扫描的每批扫描条数下限与页数上限。批 = max(limit * 4, 下限),让高软删率的
+#: 表不必为 limit=2 这种小页发几百次 scan。
+_SCAN_BATCH_MIN = 200
+_SCAN_MAX_PAGES = 10
 
+#: 单次请求的补页扫描**时间**预算(秒)。页数上限只限调用次数、不限耗时 —— 慢 Scan 或 SDK
+#: 重试(botocore 的指数退避)时,10 次串行调用照样能吃掉 API-GW 的 30s,那时客户连续页的
+#: token 都拿不到(Codex 独立复审指出)。用 `time.monotonic()` 而不是 `time.time()`:后者
+#: 会被 NTP 校正拖动。
+_SCAN_TIME_BUDGET_SEC = 10.0
+
+#: 本路径的响应字节预算,取 GSI 分页路径(`tenant_query_service._RESPONSE_ITEM_BUDGET`)的
+#: **一半**。
+#:
+#: 为什么不直接用那个数:`_resp` 把 body 序列化成 JSON 字符串之后,**Lambda runtime 还会把
+#: 整个响应对象再序列化一次** —— body 里的每个 `"` 都变成 `\"`,转义密集的数据最坏翻倍。
+#: 4.8 MB 的内层 JSON 能撑到约 9.6 MB 外层,越过 Lambda 同步响应的 6 MiB 硬限(Codex 独立
+#: 复审指出)。本路径会把多批 scan 聚合进一个响应,放大了这个风险,所以取一半:最坏翻倍后
+#: 约 4.8 MB,仍在 6 MiB 之内。派生而不是另写一个数,那边调整时这边跟着走。
+_RESPONSE_BYTE_BUDGET = _GSI_ITEM_BUDGET // 2
+
+
+def _validate_tenant_list_filters(query_params):
+    """#106 的 ?platform_id / ?purchase_status 格式校验。返回 err 或 None。
+
+    #601 —— 从过滤流程里提到补页循环【之前】做一次:它只看 query、不看数据,放在循环里
+    每批重复校验一遍是白做,而且会让"非法参数"的 400 取决于扫到了几条数据。
+    """
+    qp = query_params or {}
+    pid_filter = qp.get("platform_id")
+    if pid_filter is not None and not _PLATFORM_ID_RE.match(pid_filter):
+        return _err(
+            400, "VALIDATION", "platform_id must be 1-128 chars [a-zA-Z0-9._-]"
+        )
+    ps_filter = qp.get("purchase_status")
+    if ps_filter is not None and ps_filter not in (
+        _PURCHASE_PENDING,
+        _PURCHASE_PROVISIONED,
+    ):
+        return _err(
+            400,
+            "VALIDATION",
+            f"purchase_status filter must be one of "
+            f"['{_PURCHASE_PENDING}', '{_PURCHASE_PROVISIONED}']",
+        )
+    return None
+
+
+def _apply_tenant_list_filters(items, ident, query_params, multi_query_params):
+    """把 scan 出来的原始行过滤成"对本调用方可见"的行。纯函数,无 I/O。
+
+    #601 —— 抽成函数是补页的前提:这些过滤全部发生在 scan 之后(DynamoDB 只帮我们挡了
+    status=deleted 这一条,而且是在 Limit 之后),所以补页循环必须能对【每一批】施加同一套
+    过滤,否则"凑满 limit 条"数的是未过滤的行。校验类 400 由
+    `_validate_tenant_list_filters` 在循环外先做。
+    """
     # they own. Admins and the API-key caller see everything. Records without
     # an owner_id (legacy / API-key-created) stay hidden from non-admins.
     # the API_KEY_OWNER admin and is_admin skips the filter anyway, so scoping
     # can never be silently disabled by flipping the global flag.
-    ident = _get_caller_identity(event or {})
     # even though the key path resolves is_admin. Checked first so a scoped
     # key never enumerates the whole fleet (god-key list IDOR).
     scope = ident.get("platform_scope")
@@ -624,35 +664,132 @@ def list_tenants(query_params=None, multi_query_params=None, event=None):
         items = [it for it in items if _matches_all_tags(it, tag_filters)]
 
     # with owner scoping + tag filters). Lets a platform list only the tenants it
-    # created ("按 platform_id + owner 筛租户"), or filter by purchase stage. Both
-    # are validated so a bad query param is a 400, not a silent empty result.
+    # created ("按 platform_id + owner 筛租户"), or filter by purchase stage.
     qp = query_params or {}
     pid_filter = qp.get("platform_id")
     if pid_filter is not None:
-        if not _PLATFORM_ID_RE.match(pid_filter):
-            return _err(
-                400, "VALIDATION", "platform_id must be 1-128 chars [a-zA-Z0-9._-]"
-            )
         items = [it for it in items if it.get("platform_id") == pid_filter]
     ps_filter = qp.get("purchase_status")
     if ps_filter is not None:
-        if ps_filter not in (_PURCHASE_PENDING, _PURCHASE_PROVISIONED):
-            return _err(
-                400,
-                "VALIDATION",
-                f"purchase_status filter must be one of "
-                f"['{_PURCHASE_PENDING}', '{_PURCHASE_PROVISIONED}']",
-            )
         items = [it for it in items if it.get("purchase_status") == ps_filter]
 
     # Strip server-side secrets (channel_secret / litellm_vkey) before returning —
     # the chat UI calls this with a Cognito Bearer; secrets must stay server-side.
-    items = [_redact_tenant(it) for it in items]
+    return [_redact_tenant(it) for it in items]
 
+
+def _scan_tenant_page(
+    scan_kwargs, limit, start_key, ident, query_params, multi_query_params
+):
+    """#601 —— 补页扫描,直到凑满 limit 条【可见】行或确认扫到表尾。返回 (items, next_key)。
+
+    为什么必须补页:DynamoDB Scan 的 `Limit` 限的是【扫描条数】,`FilterExpression` 在数据
+    读出之后才应用(AWS 文档:filter 不影响 ScannedCount、不省读容量),所以 `Limit=N` 从来
+    不等于"返回 N 条"。真机实测 openclaw-tenants 669 行里 667 行会被丢掉(563 软删 + 104
+    无 status/无 host_id),过滤率 99.7%:`Limit=2` 的首页实测 `ScannedCount=2 Count=0` 且
+    带有效 `LastEvaluatedKey`。旧实现把这一页原样返回,于是客户拿到"0 条 + 有效 token",
+    按 token 无限翻页(要凑到那 2 条存活租户需连翻约 335 页)——分页接口事实不可用。
+
+    `next_key` 的语义同时收紧为【确实还有下一页】:判据是多凑一条(> limit),游标停在第
+    limit 条自己的主键,而不是 DynamoDB 的 `LastEvaluatedKey` —— 后者已经扫过那些"扫到但
+    没返回"的行,拿它当游标会把它们跳过去(漏数据)。因此"返回 0 条却带 token"这个组合在
+    结构上不再可能:不足 limit 条只发生在扫到表尾或撞页数上限。
+    """
+    batch = max(int(limit) * 4, _SCAN_BATCH_MIN)
+    items, key, pages, encoded = [], start_key, 0, 0
+    byte_truncated = False
+    out_of_budget = False
+    deadline = time.monotonic() + _SCAN_TIME_BUDGET_SEC
+    while True:
+        kwargs = dict(scan_kwargs, Limit=batch)
+        if key:
+            kwargs["ExclusiveStartKey"] = key
+        out = tenants_table.scan(**kwargs)
+        for item in _apply_tenant_list_filters(
+            out.get("Items") or [], ident, query_params, multi_query_params
+        ):
+            # 字节预算与 GSI 分页路径同源(见文件头的 import 说明):`limit` 上限是 1000,
+            # 1000 条完整租户行可以轻松越过 Lambda 同步响应的 6 MiB 硬限 → 502。
+            # `items and` 保证至少返回一条,不会因为单行超预算而返回空页。
+            size = len(
+                json.dumps(item, separators=(",", ":"), default=str).encode("utf-8")
+            )
+            if items and encoded + size > _RESPONSE_BYTE_BUDGET:
+                byte_truncated = True
+                break
+            items.append(item)
+            encoded += size
+        key = out.get("LastEvaluatedKey")
+        pages += 1
+        # 次数与耗时**两个**护栏:前者防单请求发出无限多次 scan,后者防 10 次慢 scan
+        # (SDK 重试退避)吃掉 API-GW 的 30s。
+        out_of_budget = pages >= _SCAN_MAX_PAGES or time.monotonic() >= deadline
+        if byte_truncated or len(items) > limit or not key or out_of_budget:
+            break
+    if byte_truncated or len(items) > limit:
+        # 两种截断合并处理:多凑的那条(或超预算的那条)只用来证明"还有下一页",不返回;
+        # 游标停在**最后一条已返回的行**。用 LastEvaluatedKey 会跳过这些已扫但未返回的行。
+        keep = items[:limit]
+        return keep, {"id": keep[-1]["id"]}, False
+    if key and out_of_budget:
+        # 扫描预算(次数或耗时)耗尽而 DynamoDB 还有更多。游标是 LastEvaluatedKey(已扫过的都被过滤掉了,
+        # 没有"漏返回"的行)且必然已推进,所以客户翻页有进展、不会原地打转。
+        #
+        # 第三个返回值是 `True`:这一档**必须让调用方显式标注**。否则在极端稀疏的表上
+        # 仍会出现"0 条 + 有 token",而客户无法区分它与"真的没有租户"—— 那正是本 issue
+        # 的核心伤害,只是从"必然发生"退化成"极端情况下发生"仍然不够(Codex 独立复审指出)。
+        return items, key, True
+    return items, None, False
+
+
+def list_tenants(query_params=None, multi_query_params=None, event=None):
+    query_params = query_params or {}
+    if any(field in query_params for field in _TENANT_QUERY_FIELDS):
+        return list_tenants_by_condition(query_params, event or {})
+    # end and return a bare array (legacy shape small deployments rely on). With
+    # ?limit=N → one page of ≤N rows + an opaque next_token, wrapped in an object
+    # so a 100k-row table never blows the 30s API-GW timeout or the client.
+    paginate = bool(query_params.get("limit")) or bool(
+        query_params.get("next_token")
+    )
+    scan_kwargs = {
+        "FilterExpression": "#s <> :d",
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {":d": "deleted"},
+    }
+    # 校验先于扫描:非法 ?platform_id/?purchase_status 是 400,不该先花掉一轮 scan。
+    err = _validate_tenant_list_filters(query_params)
+    if err is not None:
+        return err
+    ident = _get_caller_identity(event or {})
     if paginate:
-        return _resp(
-            200, {"tenants": items, "next_token": next_token, "count": len(items)}
+        limit, err = _parse_limit(query_params)
+        if err is not None:
+            return err
+        start_key, err = _parse_next_token((query_params or {}).get("next_token"))
+        if err is not None:
+            return err
+        items, next_key, budget_exhausted = _scan_tenant_page(
+            scan_kwargs, limit, start_key, ident, query_params, multi_query_params
         )
+        body = {
+            "tenants": items,
+            "next_token": _encode_next_token(next_key),
+            "count": len(items),
+        }
+        if budget_exhausted:
+            # #601 —— 单次请求的扫描预算耗尽,匹配行可能在已扫范围之后。**必须显式标注**:
+            # 否则这一档的"少于 limit 条(可能 0 条)+ 有 token"与"真的只有这么多租户"在
+            # 响应上完全一样,而"分不清哪种"正是本 issue 的核心伤害。带上这个字段,客户就
+            # 知道"继续翻是有意义的",而不是把空页当成结论。
+            body["scan_budget_exhausted"] = True
+        return _resp(200, body)
+    items = _apply_tenant_list_filters(
+        ddb_scan.scan_all(tenants_table, **scan_kwargs),
+        ident,
+        query_params,
+        multi_query_params,
+    )
     return _resp(200, items)
 
 
@@ -1026,6 +1163,17 @@ def system_info():
             # 用的是上次读到的旧值;`env-or-default` = 参数里没有这一档,回落 env 或代码默认。
             # 运维改完参数刷这个端点,看的就是 source 有没有变成 `ssm`、值有没有跟着变。
             "lifecycle": _lifecycle_deadline_snapshot(),
+            # #579 Bug3 —— 部署能力/身份,供客户与部署门检测「控制面版本漂移致高影响
+            # ._reapply_requested / _prepare_config_reapply),故 config_reapply=true;
+            # 旧部署(如 apse1 deployed version 91)不含本 build → 此块缺失或 config_reapply
+            # 非 true,客户据此判定不该发 reapply 字段,而非靠试调用返回 done 后再猜是否真应用。
+            # function_version 来自 Lambda runtime,供 deployment gate 核 live alias 与 bb 期望。
+            "capabilities": {
+                "config_reapply": True,
+                "function_version": os.environ.get("AWS_LAMBDA_FUNCTION_VERSION", "")
+                or None,
+                "deploy_sha": os.environ.get("DEPLOY_SHA", "") or None,
+            },
         },
     )
 
@@ -1321,14 +1469,40 @@ def process_pending():
             values[":qrv"] = rootfs_version
         else:
             update_expression += " REMOVE q_rootfs_version"
+        # #595 —— CAS 到 pending:scan 与本写之间租户可能被【带外删除】(scaler TTL / host 终止,
+        # 不经 lifecycle fence)。原来是零条件写,会把 deleted 覆盖成 creating、回写 q_rootfs_version、
+        # 并起一台 VM(删除后仍起 = host 上无主 microVM + 容量账本泄漏 + 复活进 gsi_rootfs_version)。
+        # 条件落空 = 已非 pending → 释放刚 CAS 占好的 host slot 并跳过 launch,绝不覆盖新状态。
+        values[":pending"] = "pending"
         try:
             tenants_table.update_item(
                 Key={"id": tenant["id"]},
                 UpdateExpression=update_expression,
+                ConditionExpression="#s = :pending",
                 ExpressionAttributeNames={"#s": "status"},
                 ExpressionAttributeValues=values,
             )
-
+        except tenants_table.meta.client.exceptions.ConditionalCheckFailedException:
+            # 租户在放置窗口内被并发删除/认领 → 归还占号,跳过本租户(不 launch、不覆盖 deleted)。
+            _release_slot(
+                host["instance_id"], vcpu, mem_mb,
+                phys_num=vm_num, tenant_id=tenant["id"],
+            )
+            print(
+                f"[pending] tenant {tenant['id']} 已非 pending(并发删除/认领)"
+                "— 释放 slot,跳过 launch"
+            )
+            continue
+        except Exception:
+            # codex #595 复审:非 CCF 的写失败(限流/网络/校验)必须沿用原语义 —— 释放刚占的
+            # 容量/ps_* 再抛出。拆 try 后若只接 CCF,这条路径会泄漏占号(原来 update+launch 同一
+            # try 的 generic except 覆盖了它)。
+            _release_slot(
+                host["instance_id"], vcpu, mem_mb,
+                phys_num=vm_num, tenant_id=tenant["id"],
+            )
+            raise
+        try:
             _launch_vm(
                 host["instance_id"],
                 tenant["id"],
@@ -1860,6 +2034,146 @@ def _receive_count(rec):
         return 0
 
 
+#: 队列默认可见性(`lambdas.py:337` `visibility_timeout=Duration.seconds(960)`)。它既是
+#: "什么都不做"时一条未 ack 消息的重投间隔,也是本退避必须对齐的**总预算基准**。
+_LIFECYCLE_DEFAULT_VISIBILITY_SEC = 960
+
+#: #604 —— 头几次投递的短退避,让 per-tenant FIFO 组头尽快让开。**只缩短,永不加长。**
+#:
+#: 收益在这里:`MessageGroupId=tenant_id`,组头没 ack 就不投同租户后面的消息,所以一条占着
+#: 960s 的消息 = 该租户 16 分钟内任何生命周期操作都撞 409(#604 的现象)。三次覆盖了 flock
+#: 持锁的常见量级(launch-vm.sh:705 到 :2570 DONE:prepare disks / tap / firecracker boot)。
+#:
+#: **为什么不"补足总窗口"**(Codex 独立复审三轮各否掉一个版本,记在这里免得再走回去):
+#:   · v1 写死 `(30,60,120,240,480)` 并声称"累计 930s ≈ 960s 所以预算不缩水" —— 那是把
+#:     **单次等待**当成了**总窗口**。`maxReceiveCount=5` 有 4 次等待,原总窗口 4×960=3840s,
+#:     前四项只有 450s,缩了 8.5 倍。
+#:   · v2 改成尾项补足(`…,3630`)确实把总窗口补回了 3840s,但**它让那一次的组头阻塞变成
+#:     1 小时**,比本 issue 要修的 960s 更糟 —— 而 `launch-vm.sh` 持锁时会等 host launch
+#:     slot,这条路径真的可达。
+#:   · v3(即本版之前)只缩头部、之后回落默认,总窗口 1170s。但它建立在"死线兜底才是终态的
+#:     真正保证者"这个前提上,而当时那个前提**对 start 不成立**:`DEADLINE_ACTIONS` 那时是
+#:     七档(create/suspend/restore/restart/rebuild/backup/delete),**没有 start**,也没有
+#:     `ACTION_START` 常量。一条 `action=start` 的消息没有死线、没有兜底,把它的重试窗口
+#:     从 3840s 缩到 1170s 就是实打实地提高"已受理的 start 提前进 DLQ 而永久丢失"的概率。
+#:
+#: 所以判据再收一层:**只对有终态兜底的 action 缩短**(`_deadline_backstopped_action`)。
+#: 这治好了 #604 现象的大部分 —— 真机那条卡 960s 的消息 action 就是 `restart`(见
+#: `[#564] deadline-enforced ... action=restart`),而 restart/rebuild/delete/suspend/restore
+#: 都在词汇表里。
+#:
+#: **#604 后续项已落地(2026-08-25):`start` 补进死线词汇表,七档变八档。** 上面那条"start
+#: 保持原样"的取舍是**当时**的正确判断,但它同时意味着短退避这半边在实践中永远不触发 ——
+#: 唯一会单独跑 launch、因而能拿到 `rc=75` 的动作恰恰就是 `start`(`restart` 走
+#: `stop-vm && sleep 2 && launch-vm`,撞锁时先死在 stop 上,`stop-vm.sh:207` 是 exit 1
+#: 不是 75)。所以真机上 `start` 路径的组头阻塞一点没改善。现在 `start` 有 180s 死线
+#: (`ACTION_START`,预算 0+60+120)与 `deadline_executor` 的终态兜底,本判据对它**自动**
+#: 成立 —— 这里不需要任何改动,因为判据读的是 `DEADLINE_ACTIONS` 本身而不是抄一份清单。
+_LIFECYCLE_RETRY_BACKOFF_SEC = (30, 60, 120)
+
+
+def _deadline_backstopped_action(action):
+    """这个 action **这一类**是否有 #564 死线兜底。只是必要条件,见下面那个函数。"""
+    return str(action or "") in set(_create_deadline.DEADLINE_ACTIONS)
+
+
+def _lifecycle_shortening_is_safe(action, msg):
+    """缩短**这条消息**的重投退避是否安全。
+
+    判据不是「action 属于死线词汇表」而是「**这条消息**真带一个会在缩短后的总窗口内到点的死线」——
+    Codex 独立复审第 5 轮指出前者不够(它是我上一版的判据):
+
+      · action 只说明**这类操作**有兜底,不保证**手上这条消息**带得上。升级期在飞的老消息
+        没有死线字段,consumer 对它走 `is_expired` 的 fail-safe(返 False、不丢弃),于是
+        #564 的兜底对它根本不生效;
+      · 死线是可配的(`deadline_config`)。配得比缩短后的总窗口还长时,兜底会**晚于** DLQ
+        到点 —— 那等于没有兜底。
+
+    两种情况下缩短窗口都是在没有兜底的前提下提高「已受理的操作永久丢失」的概率,所以一律
+    不缩、退回队列默认的 960s。方向与本文件其它 fail-safe 一致:看不出来就按没有兜底算。
+    """
+    if not _deadline_backstopped_action(action):
+        return False
+    try:
+        deadline = int((msg or {}).get(_create_deadline.MSG_DEADLINE_KEY))
+    except (TypeError, ValueError):
+        return False
+    # 缩短后的总窗口 = 头部之和 + 之后回落的那一次默认可见性。
+    window = sum(_LIFECYCLE_RETRY_BACKOFF_SEC) + _LIFECYCLE_DEFAULT_VISIBILITY_SEC
+    return deadline - int(time.time()) <= window
+
+
+def _lifecycle_retry_backoff_sec(rec):
+    """本次重投前等多久。返回 `None` = **不动可见性**,用队列默认的 960s。
+
+    两处刻意的 `None`:
+      · **最后一次投递**(`receiveCount >= LIFECYCLE_MAX_RECEIVE_COUNT`)不改可见性 ——
+        这一次失败后消息就进 DLQ,改它只会推迟 DLQ 的发现,而"DLQ 非空 = 100% 是 bug"
+        是运维赖以判障的信号。
+      · **超出头部长度**之后回落默认,把剩余的重试预算留给队列自己的节奏。
+
+    `_receive_count` 缺失/不可解析时返 0,这里当第一次、取最短退避。方向与
+    `_terminal_before_dlq` 相反是刻意的:那里"看不出来就不回写终态"(误判代价是把还会
+    成功的操作提前判死),这里"看不出来就早点重投"(误判代价只是多消费一次,消费幂等)。
+    """
+    n = _receive_count(rec)
+    if n >= _clients.LIFECYCLE_MAX_RECEIVE_COUNT:
+        return None
+    if n < 1:
+        n = 1
+    if n > len(_LIFECYCLE_RETRY_BACKOFF_SEC):
+        return None
+    return _LIFECYCLE_RETRY_BACKOFF_SEC[n - 1]
+
+
+def _shorten_lifecycle_visibility_best_effort(rec, result, action, msg):
+    """#604 —— 良性 flock-skip 的留队列重投不必等满队列默认的 960s。
+
+    判据严格:必须是响应 body 里**显式声明**的 `LAUNCH_IN_PROGRESS`
+    (`core.ssm_dispatch.LAUNCH_IN_PROGRESS_CODE`)。其余 5xx 的重投节奏一个字不动 ——
+    它们可能是真失败,早重投只会更快耗尽 DLQ 预算,而 DLQ 非空是「100% 是 bug」的告警信号。
+
+    best-effort:改可见性失败不影响正确性(消息仍按默认 960s 兜底重投,只是慢),所以异常
+    只打日志、绝不炸 invocation —— 与 `dispatch_service` 的两处同款先例
+    (`_shorten_visibility_best_effort` / `_deadline_aware_visibility_best_effort`)一致。
+    不发新消息,故没有 send/write 原子性问题。
+    """
+    if not isinstance(result, dict):
+        return
+    if not _lifecycle_shortening_is_safe(action, msg):
+        # 没有可依赖的死线兜底(action 不在死线词汇表 / 这条消息没带死线 / 死线晚于缩短后的
+        # 总窗口):重试窗口是这条操作唯一的收敛机会,不缩。
+        return
+    try:
+        body = json.loads(result.get("body") or "{}")
+    except (TypeError, ValueError):
+        return
+    if (
+        not isinstance(body, dict)
+        or body.get("code") != _ssm_dispatch.LAUNCH_IN_PROGRESS_CODE
+    ):
+        return
+    rh = rec.get("receiptHandle")
+    if not rh or not sqs or not LIFECYCLE_QUEUE_URL:
+        return
+    delay = _lifecycle_retry_backoff_sec(rec)
+    if delay is None:
+        # 最后一次投递 / 已超出头部:不动可见性,用队列默认的 960s。见该函数的 docstring。
+        return
+    try:
+        sqs.change_message_visibility(
+            QueueUrl=LIFECYCLE_QUEUE_URL,
+            ReceiptHandle=rh,
+            VisibilityTimeout=delay,
+        )
+        print(
+            f"[#604] flock-skip {rec.get('messageId')} 重投退避 {delay}s"
+            f"(原队列默认 960s),不再占住 FIFO 组头"
+        )
+    except Exception as e:  # noqa: BLE001 —— 见 docstring:失败只是退化,不炸 invocation
+        print(f"[#604] shorten lifecycle visibility non-fatal: {e}")
+
+
 def _terminal_before_dlq(rec, action, tenant_id, msg, why):
     """#564 G6 —— **消息即将进 DLQ 之前**把租户回写成终态 + 落机器可读原因。
 
@@ -2012,6 +2326,50 @@ def _consume_lifecycle_sqs(records):
                         f" fence={_outcome});租户已围成终态、租约已放,消息 ack"
                     )
                     continue
+            # ── #565:还没过期,但**剩余时间已装不下执行段** ──────────────────────
+            # 上面那档拦的是「已经过期」。这一档拦的是「还有 20 秒,而这个动作最坏要跑
+            # 120 秒」—— 不拦就是**白干**:host 侧真的去起 VM / 做备份,跑到一半死线到点,
+            # 死线执行者把租户判 failed,而那条 SSM 命令**没有任何机制能撤回**,它仍会
+            # 跑完并留下副作用(#565 G1-a 记的「上层失败、底层成功」就是这个形状)。
+            #
+            # 复用 create 侧那个已被评审过的原语(`core/create_deadline.doomed_by_deadline`,
+            # 形态第 4 条),第三个参数就是执行段 —— `exec_sec(action)` 是 #565 G1 落的
+            # 三段预算里的执行段,每档各自的最坏值,不是一个共用常量。
+            #
+            # **位置必须在这里**:与过期闸同一段(往下一行就开始真实动作),所以放弃时是
+            # 「一步未动」。处置也刻意与过期闸**逐字同一套**(围栏 → 放租约 → ack),
+            # 免得两档的失败面貌不一致让运维分不清。
+            #
+            # **delete 同样例外**,理由与上面那档一样(客户 2026-08-21:600s 只约束答复、
+            # 删除不得丢弃)。判据是「delete 一律不拒」,所以这里连判都不判 —— 省一次
+            # 计算不是目的,把「delete 不会走进任何拒绝分支」写成结构性事实才是。
+            _doomed_action_ok = (
+                action != "delete"
+                and action in _create_deadline.DEADLINE_ACTIONS
+            )
+            if _doomed_action_ok and _create_deadline.doomed_by_deadline(
+                _dl, int(time.time()), _create_deadline.exec_sec(action)
+            ):
+                _outcome = _dl_executor.fence_expired_tenant(
+                    tid, action, _dl, observed_op_id=msg.get("_op_id")
+                )
+                if _outcome == "error":
+                    # 与过期闸同款:围栏没成功就绝不 ack(否则消息消失而租户卡中间态)。
+                    print(
+                        f"[lifecycle-consumer] #565 {action} {tid} 剩余装不下执行段但围栏失败,"
+                        "不 ack,留队列重投"
+                    )
+                    failures.append({"itemIdentifier": mid})
+                    continue
+                _release_lifecycle_lease_if_mine(tid, msg.get("_op_id"))
+                print(
+                    f"[lifecycle-consumer] #565 refused doomed {action} for {tid}"
+                    f" (deadline={_dl}, remaining="
+                    f"{_create_deadline.remaining_sec(_dl, int(time.time()))}s,"
+                    f" exec_budget={_create_deadline.exec_sec(action)}s,"
+                    f" fence={_outcome});一步未动,租户已围成终态、租约已放,消息 ack"
+                )
+                continue
             if action == "create":
                 # create:extra 带 create_tenant 所需 body(name/vcpu/owner 等)
                 result = create_tenant(extra, ev)
@@ -2049,6 +2407,9 @@ def _consume_lifecycle_sqs(records):
             if code >= 500:
                 # 5xx(SSM throttle / 容量争用)→ 留队列退避重试
                 _terminal_before_dlq(rec, action, tid, msg, f"HTTP {code}")
+                # #604 —— 良性的 flock-skip 不该等满 960s:那会占住 per-tenant FIFO 组头,
+                # 把同租户后续操作全堵掉 16 分钟。只缩这一种,判据是 body 里的 code。
+                _shorten_lifecycle_visibility_best_effort(rec, result, action, msg)
                 failures.append({"itemIdentifier": mid})
             # 4xx(owner/参数错)不重试:消息消费掉,避免毒消息无限重投
         except Exception as e:  # noqa: BLE001
@@ -2397,6 +2758,11 @@ fleet_power = _fleet_service.fleet_power
 from services import egress_admin_service as _egress_admin_service  # noqa: E402
 
 fleet_egress = _egress_admin_service.fleet_egress
+fleet_egress_status = _egress_admin_service.fleet_egress_status
+fleet_egress_revisions = _egress_admin_service.fleet_egress_revisions
+fleet_egress_revisions_delete = _egress_admin_service.fleet_egress_revisions_delete
+fleet_egress_chain = _egress_admin_service.fleet_egress_chain
+fleet_egress_rollback = _egress_admin_service.fleet_egress_rollback
 _execute_batch = _fleet_service._execute_batch
 _enqueue_batch_job = _fleet_service._enqueue_batch_job
 run_batch_job = _fleet_service.run_batch_job

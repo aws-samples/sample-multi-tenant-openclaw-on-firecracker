@@ -363,12 +363,19 @@ def deregister_host(instance_id):
             f"host {instance_id} has an image operation in progress "
             f"({lease.get('active_image_operation_id')}); wait for it to finish or expire",
         )
-    hosts_table.update_item(
-        Key={"instance_id": instance_id},
-        UpdateExpression="SET #s = :s",
-        ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":s": "draining"},
-    )
+    # update_item 不加条件时是 upsert，会为不存在的 id 建出幽灵行并返 200，让调用方以为一台机器在下线；
+    # 幽灵行还会进入 GET /hosts 和任何按 hosts 表推导机队状态的路径。
+    ccf = hosts_table.meta.client.exceptions.ConditionalCheckFailedException
+    try:
+        hosts_table.update_item(
+            Key={"instance_id": instance_id},
+            UpdateExpression="SET #s = :s",
+            ConditionExpression="attribute_exists(instance_id)",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":s": "draining"},
+        )
+    except ccf:
+        return _err(404, "NOT_FOUND", f"host {instance_id} not found")
     # Terminate via ASG API to trigger termination lifecycle hook
     try:
         asg_client.terminate_instance_in_auto_scaling_group(
@@ -511,11 +518,13 @@ def _write_terminated_tenant_state(tenant, ok, backup_key, err):
     )
     # #501 — host 终止撤租户也是终态写入点:健康位由 health_check sweep 写而 sweep 只扫
     # running,不清就永久停在删除前的 up,已删租户伪装成健康在役租户误导排障。
+    # #593 —— 同理清 q_rootfs_version(gsi_rootfs_version 投影键):不清则该软删租户永久留在
+    # rootfs 查询 GSI,污染 GET /tenants?rootfs_version=(与 tenant-stats 对不上)。
     tenants_table.update_item(
         Key={"id": tid},
         UpdateExpression=(
             "SET #s = :s, updated_at = :t "
-            "REMOVE vm_health, app_health, last_health_check"
+            "REMOVE vm_health, app_health, last_health_check, q_rootfs_version"
         ),
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":s": "deleted", ":t": _now()},
@@ -994,6 +1003,18 @@ def refresh_rootfs():
         return _resp(200, {"message": "no active hosts", "updated": 0})
 
     ids = [h["instance_id"] for h in hosts]
+    slotted_ids = [
+        h["instance_id"] for h in hosts if isinstance(h.get("image_slots"), dict)
+    ]
+    if slotted_ids:
+        return _err(
+            409,
+            "INCOMPATIBLE_HOST_LAYOUT",
+            "refresh-rootfs only supports legacy flat-layout hosts; slotted hosts "
+            "must use snapshot pull/promote so the active version directory and "
+            "slots.json commit stay atomic",
+            {"hosts": slotted_ids},
+        )
     assets = "/data/firecracker-assets"
     q = shlex.quote
     # The host command owns the disk + coordinate commit. It shares pull.lock
@@ -1071,21 +1092,30 @@ else
     --update-expression "SET rootfs_version = :v REMOVE immutable_version" \
     --expression-attribute-values "$VERSION_VALUES"
 fi
-""".strip()
+    """.strip()
     try:
-        ssm.send_command(
+        dispatch = ssm.send_command(
             InstanceIds=ids,
             DocumentName="AWS-RunShellScript",
             Parameters={"commands": [script], "executionTimeout": ["600"]},
         )
     except Exception as e:
         return _resp(500, {"error": str(e)})
+    command_id = (dispatch.get("Command") or {}).get("CommandId")
+    if not command_id:
+        return _err(
+            502,
+            "DISPATCH_UNCONFIRMED",
+            "SSM did not return a command id; refresh acceptance cannot be confirmed",
+        )
 
     _imm_ver = version if manifest.get("immutable") else ""
     return _resp(
-        200,
+        202,
         {
-            "message": "refresh started",
+            "message": "refresh accepted",
+            "status": "accepted",
+            "command_id": command_id,
             "version": version,
             "immutable_version": _imm_ver,
             "hosts": ids,
@@ -1381,8 +1411,9 @@ def _mirror_canary_slot(instance_id, snapshot_time, live_snapshot_time=None):
 
 
 # 提交点 fence 的有界续租窗口(秒):conditional renew 成功后,该窗口内无人能接管 lease
-# 的 python 进程里、紧贴 os.rename 的前一条语句(无 shell 级调度缝),该常量作为续租秒数传入。
-# 60s 远大于 rename 耗时,又远小于 lease TTL(1200s),不影响正常接管时序。
+# (acquire 要求 image_lease_until<=now 才能抢)。续租只缩短 rename 前窗口;worker 仍可能
+# 在续租后被冻结超过 60s。因此提交还必须在 durable rename 后强一致复核 ownership,
+# 失权则在 pull.lock 内恢复旧指针或留下 RECOVERY_REQUIRED 让当前 owner 覆盖收敛。
 _COMMIT_FENCE_RENEW_S = 60
 
 
@@ -1400,11 +1431,9 @@ def _slots_commit_lines(slot, snapshot_time, hosts_table, region, instance_id, j
     写坏/失败一律 _perr + exit 1,绝不留半个指针。
     """
     q = shlex.quote
-    # 先备好 tmp 文件,再做条件续租(boto3 conditional update-item:owner==本 job 且 until>now →
-    # 同写续租到 now+窗口),【紧接着】os.rename。fence 与 rename 是相邻 python 语句,无 shell 级
-    # 调度缝;续租成功后接管者的 acquire(要求 until<=now)在窗口内必失败,且 worker 全程持
-    # pull.lock 使并发 worker 无法同时进 commit 段。job_id/region 为空(扁平兼容路径)→ 跳过 fence,
-    # 保持既有行为(那些路径不走版本-lease 模型)。
+    # 续租后冻结超过窗口仍可能被接管,所以 rename 后复核是 correctness gate;worker 全程
+    # 持 pull.lock,失权时优先恢复旧指针,随后让当前 owner 继续提交。job_id/region 为空
+    # (扁平兼容路径)时不走版本 lease,保持既有行为。
     _fenced = bool(job_id and region and hosts_table)
     fence_py = ""
     if _fenced:
@@ -1421,15 +1450,58 @@ def _slots_commit_lines(slot, snapshot_time, hosts_table, region, instance_id, j
             "except Exception as e:\n"
             "    raise SystemExit('COMMIT_FENCED lease not held/renewable at commit (superseded/expired): %s' % e)\n"
         )
+    post_fence_py = ""
+    if _fenced:
+        post_fence_py = (
+            "# The process can be frozen after renew and resume after takeover. Rename is\n"
+            "# already durable at that point, so detect lost ownership and restore the\n"
+            "# pre-commit pointer while pull.lock still excludes the new owner.\n"
+            "_post_reason=''\n"
+            "try:\n"
+            "    _item=_c.get_item(TableName=sys.argv[5],\n"
+            "        Key={'instance_id':{'S':sys.argv[7]}},ConsistentRead=True).get('Item',{})\n"
+            "    _owner=_item.get('active_image_operation_id',{}).get('S','')\n"
+            "    _until=int(_item.get('image_lease_until',{}).get('N','0') or 0)\n"
+            "    if _owner != sys.argv[8]:\n"
+            "        _post_reason='owner changed to %s' % (_owner or '<none>')\n"
+            "    elif _until <= int(_t.time()):\n"
+            "        _post_reason='lease expired after rename'\n"
+            "except Exception as e:\n"
+            "    _post_reason='ownership recheck failed: %s' % e\n"
+            "if _post_reason:\n"
+            "    _recovery_error=''\n"
+            "    try:\n"
+            "        if existed:\n"
+            "            recovery=p+'.recovery.'+str(os.getpid())\n"
+            "            with open(recovery,'w') as fh:\n"
+            "                json.dump(before,fh,sort_keys=True,separators=(',',':')); fh.flush(); os.fsync(fh.fileno())\n"
+            "            os.rename(recovery,p)\n"
+            "        else:\n"
+            "            try: os.unlink(p)\n"
+            "            except FileNotFoundError: pass\n"
+            "        d=os.open(os.path.dirname(p),os.O_RDONLY)\n"
+            "        try: os.fsync(d)\n"
+            "        finally: os.close(d)\n"
+            "    except Exception as e:\n"
+            "        _recovery_error=str(e)\n"
+            "    if _recovery_error:\n"
+            "        raise SystemExit('POST_COMMIT_FENCED stale rename detected; local pointer restore failed; '\n"
+            "                         'current owner must overwrite authoritatively: %s; recovery_error=%s' % "\
+            "(_post_reason,_recovery_error))\n"
+            "    raise SystemExit('POST_COMMIT_FENCED stale rename detected and previous slots restored; '\n"
+            "                     'current owner must reconcile: %s' % _post_reason)\n"
+        )
     py = (
         "import json,os,sys\n"
         "p=sys.argv[1]; slot=sys.argv[2]; snap=sys.argv[3]\n"
         "s={'generation':0,'live':None,'canary':None,'previous_live':None}\n"
+        "existed=os.path.exists(p)\n"
         "if os.path.exists(p):\n"
         "    with open(p) as fh: cur=json.load(fh)\n"
         "    if not isinstance(cur,dict): raise SystemExit('slots.json not an object')\n"
         "    s['generation']=int(cur.get('generation') or 0)\n"
         "    for k in ('live','canary','previous_live'): s[k]=cur.get(k) or None\n"
+        "before=dict(s)\n"
         "if slot=='canary':\n"
         "    s['canary']=snap\n"
         "else:\n"
@@ -1443,6 +1515,7 @@ def _slots_commit_lines(slot, snapshot_time, hosts_table, region, instance_id, j
         + fence_py +
         "os.rename(tmp,p)\n"
         "d=os.open(os.path.dirname(p),os.O_RDONLY); os.fsync(d); os.close(d)\n"
+        + post_fence_py +
         "print(json.dumps(s))\n"
     )
     # fence 需要的额外 argv:region, hosts_table, renew_seconds, instance_id, job_id。
@@ -2529,6 +2602,41 @@ def _run_pull_pipeline_impl(instance_id, snapshot_time, prev_status, job_id, slo
                 _reset_host_status(instance_id, prev_status, job_id)  # live 未碰,安全复位
             return _resp(502, {"error": "pull-image fence DDB read failed (live untouched, reset)",
                                "command_id": cmd_id, "detail": reason})
+        if "POST_COMMIT_FENCED" in (tail or ""):
+            print(
+                f"[pull] ALERT POST_COMMIT_FENCED instance={instance_id} "
+                f"job={job_id}; current image-lease owner must reconcile"
+            )
+            persisted = image_jobs.record_transition(
+                job_id,
+                "RECOVERY_REQUIRED",
+                phase="recovery",
+                error={
+                    "code": "POST_COMMIT_FENCED",
+                    "reason": (
+                        "the worker lost image-lease ownership after a durable rename; "
+                        "the local restore outcome is recorded in the SSM detail and "
+                        "the current owner must reconcile authoritatively"
+                    ),
+                },
+            )
+            if not persisted:
+                print(
+                    f"[pull] WARN could not persist RECOVERY_REQUIRED for "
+                    f"{instance_id}/{job_id}"
+                )
+            return _resp(
+                409,
+                {
+                    "code": "POST_COMMIT_FENCED",
+                    "error": (
+                        "stale slots rename detected; current image-lease owner "
+                        "must reconcile"
+                    ),
+                    "command_id": cmd_id,
+                    "detail": reason,
+                },
+            )
         #   · phase1 拉/校验 阶段失败(INSTALLING=0)→ 脚本 trap rm 暂存 + 复位 status→prev;
         #   · phase2 装 live 失败(INSTALLING=1,unzip 坏)→ 脚本 trap 不复位,host 留 upgrading。
         # 故 Lambda【绝不】兜底复位 active:phase2 坏了复位 = 谎报 active 盖住半写坏的 live,让
@@ -3225,6 +3333,7 @@ _PULL_ERROR_CODES = {
     "UNZIP_FAILED": "pigz 解压失败或产物为空(.gz 损坏 / 磁盘满)",
     "INSTALL_MV_FAILED": "解压后 mv 到 live 失败(盘满/权限不足/目标占用)",
     "OWNERSHIP_CHECK_FAILED": "持锁后无法从 DDB 读回 pull_command_id 确认所有权(DDB 读失败),fail-loud 不静默退",
+    "POST_COMMIT_FENCED": "slots rename 后发现 lease 已被接管;本地恢复结果见失败详情,由当前 owner 权威收敛",
     "UNKNOWN": "未标注的意外退出(见 SSM stderr)",
 }
 

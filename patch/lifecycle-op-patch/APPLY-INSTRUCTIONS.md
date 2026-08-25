@@ -1,21 +1,24 @@
 # lifecycle-op-patch — apply by reading, no CloudFormation redeploy
 
-`status: MANUAL_REVIEW`。本 kit 有 8 个 `MANUAL_CLI_REVIEW` 操作,必须逐个人工复核后才动手。
+`status: MANUAL_REVIEW`。本 kit 有 17 个 `MANUAL_CLI_REVIEW` 操作,必须逐个人工复核后才动手。
 **任何步骤都不要运行 CDK 的部署子命令,也不要运行任何触发 CloudFormation 栈更新的命令** —— 这套环境是一次 CDK
 部署之后又手工改过很多次的,栈更新会覆盖那些手工改动。
 
 - `base_sha` = `81f3b884ca1226afdb107e7f8392d9334fd33493`
-- `patch_sha` = `25afc511ccfd319d4e7ae37e973c55f12081ed79`
+- `patch_sha` = `c9fd494ff4a76929f205f52464047a9185c7c49a`
 
-两端都在公开仓可解析,所以下面每条校验命令你都能自己跑通(上一版 kit 记的两个 SHA 只存在于构建机
-本地,客户跑不了 —— 这一版修掉了)。
+两端都在公开仓可解析,所以下面每条校验命令你都能自己跑通(spire-agent 那版 kit 记的两个 SHA 只存在于
+构建机本地,客户跑不了 —— 从这一版起修掉了)。
 
-## 先读三条会静默毁掉本次交付的事实
+## 先读四条会静默毁掉本次交付的事实
 
 **① 死线的运行时载体是 SSM 参数,改 Lambda 环境变量【完全不生效】。**
-流量走 `live` 别名 → 已发布 version,而已发布 version 的环境变量是冻结的。所以七档死线必须写到
-`/openclaw/lifecycle/deadline-sec/<action>` 这七个 SSM 参数上(进程内缓存 60 秒);
+流量走 `live` 别名 → 已发布 version,而已发布 version 的环境变量是冻结的。所以八档死线必须写到
+`/openclaw/lifecycle/deadline-sec/<action>` 这八个 SSM 参数上(进程内缓存 60 秒);
 `create-deadline-config.py --live` 比对的是 `$LATEST` 的环境变量,**它的绿不能证明死线生效**。
+八个动作是 `create` / `suspend` / `restore` / `restart` / `start` / `rebuild`(各 180 秒)与
+`backup` / `delete`(各 600 秒)。**`start` 容易被漏** —— 它与 `restart` 同档(同一条通道、同为不含
+数据步骤的动作),只列七个的清单是不完整的。
 
 **②b `POST /hosts/egress` 目前会被上游的 RBAC 前置门挡成 403。**
 `core/auth.py` 的 `_RBAC_SKIP` 里没有这条路由,而 api-key 路径的 role 会被解析成 `viewer`,在门口
@@ -23,14 +26,23 @@
 且真机复现过。`core/auth.py` 在本次区间**没有变更**,所以修不进本 kit,属上游缺口。验证时若拿到 403,
 先按这条排查,不要当成 patch 没打对。
 
-**② 七档里只有 `create` 有权威的最坏执行值(128 秒)。**
-`suspend/restore/restart/rebuild/backup/delete` 目前**没有下界守护**。往小调可能小于该操作单次最坏
-执行,于是判死之后 SSM 还在跑,留下没人认领的 microVM(占容量且计费)。不要为了"更快收敛"下调。
+**② 八档里只有 `create` 有权威的最坏执行值(128 秒)。**
+`suspend/restore/restart/start/rebuild/backup/delete` 这七个目前**没有下界守护**。往小调可能小于该
+操作单次最坏执行,于是判死之后 SSM 还在跑,留下没人认领的 microVM(占容量且计费)。不要为了
+"更快收敛"下调。
 
 **③ 本次把可观测性资产的分发从部署脚本搬到了 CDK,而 kit 不允许跑 CDK 部署。**
 部署脚本里 12 处 `_obs_upload` 在 `patch_sha` 上归零,替代它的 10 个 BucketDeployment 自定义资源
 **建不出来**。桶里现有对象还在(旧部署脚本传过),所以 host 照常起 —— 这是**潜伏**缺陷:
 **以后这批资产再变,就没有任何自动分发路径了**。第 4.3 步给了手工等价物,请记进运维手册。
+
+**④ workspace 的 7 个身份文件与运维类 skill 现在烤在只读镜像盘上,【下发文件的方式更新不了它们】。**
+`SOUL.md` / `AGENTS.md` / `IDENTITY.md` / `HEARTBEAT.md` / `COMMUNICATION_STYLE.md` / `TOOLS.md` /
+`USER.md` 与 `~/.openclaw/skills/` 一起以只读方式挂载覆盖到 workspace 上,microVM 内即使 root 写入
+也会拿到 `EROFS` —— 写请求在到达文件之前就被虚拟设备拒了,这是防篡改设计,不是配置问题。
+所以要换身份文件只有一条路:**重建镜像 → 让机队拿到新镜像 → 用 `action: "restart"` 的滚动升级让新盘
+生效**。用 `rebuild` 换身份文件是不必要的重操作(它重建整个 microVM 且需要管理员权限)。
+如果按"推一份新文件上去"的老习惯操作,会静默地什么都没变。
 
 ## Step 0 — DISCOVER(只读)与制品真伪
 
@@ -240,11 +252,12 @@ its whole job)。所以**不能把它单独当验证门** —— 自动化会把
 
 三类必须单独说明。
 
-**4.1 七个死线 SSM 参数** —— 平时由 CDK 创建,这里自己建;`put-parameter` 幂等,先 `get-parameter`
-区分"新建"还是"接管已有"(决定回滚是删除还是保留):
+**4.1 八个死线 SSM 参数** —— 平时由 CDK 创建,这里自己建;`put-parameter` 幂等,先 `get-parameter`
+区分"新建"还是"接管已有"(决定回滚是删除还是保留)。注意动作清单里**必须包含 `start`**(与 `restart`
+同 180 秒档),漏掉它会留下一个没有死线的动作:
 
 ```bash
-for a in create suspend restore restart rebuild backup delete; do
+for a in create suspend restore restart start rebuild backup delete; do
   case "$a" in backup|delete) v=600 ;; *) v=180 ;; esac
   if CUR=$(aws ssm get-parameter --name "/openclaw/lifecycle/deadline-sec/$a" --region "$REGION" --query Parameter.Value --output text 2>/dev/null); then
     echo "already set: $a = $CUR (left untouched)"
@@ -347,21 +360,29 @@ instance-refresh 路径滚。验证只起**一台**新 host,盯三个信号:解�
 
 ## Step 6 — 逐个 fix 的可证伪验证
 
-`manifest.json` 的 `verifications[]` 有 11 条,每条都写了 `action` / `observable` / `pass_when` /
-`fail_when` / `timeout_s` / `cleanup`,按 `phase` 分两批:
+`manifest.json` 的 `verifications[]` 有 17 条,每条都写了 `action` / `observable` / `pass_when` /
+`fail_when` / `timeout_s` / `cleanup`,按 `phase` 分三批:
 
-- **Phase A(只读,零副作用,始终先跑)**:`verify-ddb-scan-pagination`、`verify-config-profile-gate`、
-  `verify-consistency-cli`、`verify-copyfile-toctou`、`verify-backup-lifecycle`。
-- **Phase B(走真实产品入口的完整生命周期,核心,跑一次)**:`verify-egress-allowlist`
-  (`POST /hosts/egress` 是**改机队**的写操作,而且按设计是 **admin-only**(动全机队网络隔离,
-  爆炸半径最大),`operator` 不够。**同时**带 `x-api-key` 与 **admin 身份的 Bearer JWT** —— 这条方法在模板里是 `ApiKeyRequired=true`,
-  API Gateway 会在 RBAC 之前就因缺 key 拒掉;而 admin 身份来自 Bearer。两者各管一段,缺一不可。body 用
-  `{"mode":"off","wait":true}`:`wait=true` 会返回**逐机 `apply_exit` / `rules_sha256` /
-  `consistent`**,那才是可证伪的观测量,比只拿 `command_id` 强。先用 `GET /hosts` 记下原
-  `egress_mode` 以便恢复。**不要用 api-key 调这条** —— 它会在 RBAC 前置门被挡成 403,
-  原因见开头第 ②b 条,那是上游缺口不是本 patch 没打对)、`verify-lifecycle-deadline`、
-  `verify-lifecycle-converge`、`verify-lifecycle-lease-port`、`verify-lifecycle-host-fanout`、
-  `verify-observability-boot`。
+- **Phase A-readonly(只读,零副作用,始终先跑,7 条)**:`verify-config-preflight`、
+  `verify-consistency-cli`、`verify-image-provenance`、`verify-observability-boot`、
+  `verify-pagination-scan`、`verify-prior-kit-artifacts`、`verify-release-tooling`。
+- **Phase B-optional(只在客户决定启用该开关时才跑,2 条)**:`verify-backup-lifecycle`、
+  `verify-egress-fleet`。
+- **Phase B-lifecycle(走真实产品入口,8 条)**:`verify-copyfile-toctou`、`verify-create-capacity`、
+  `verify-edge-availability`、`verify-lifecycle-converge`、`verify-lifecycle-deadline`、
+  `verify-lifecycle-lease-port`、`verify-rolling-upgrade`、`verify-workspace-identity`。
+跑 `verify-egress-fleet` 时有几个调用要点,单独说明:`POST /hosts/egress` 是**改机队**的写操作,
+按设计是 **admin-only**(动全机队网络隔离,爆炸半径最大),`operator` 不够。**同时**带 `x-api-key` 与
+**admin 身份的 Bearer JWT** —— 这条方法在模板里是 `ApiKeyRequired=true`,API Gateway 会在 RBAC 之前
+就因缺 key 拒掉;而 admin 身份来自 Bearer。两者各管一段,缺一不可。body 用
+`{"mode":"off","wait":true}`:`wait=true` 会返回**逐机 `apply_exit` / `rules_sha256` / `consistent`**,
+那才是可证伪的观测量,比只拿 `command_id` 强。先用 `GET /hosts` 记下原 `egress_mode` 以便恢复。
+**不要用 api-key 调这条** —— 它会在 RBAC 前置门被挡成 403,原因见开头第 ②b 条,那是上游缺口不是本
+patch 没打对。
+
+同理,`verify-rolling-upgrade` 的 `action: "rebuild"` 也需要管理员权限,`"restart"` 没有这个限制;
+`client_token` 是**必填**的幂等键(4 至 128 个可打印非空格 ASCII 字符),作业中断后用同一个
+`client_token` 续跑不会重复处理已完成的机器。请求体不接受未列出的字段,多传会返回 400 并列出字段名。
 
 "创建了一个租户,它 running 了"**不算**验证 —— 那只证明代码加载了。三条必须落到不变量上:
 没有租户卡在 `creating`;不存在 `tenant=running` 而 `assignment=failed` 的跨表指纹;

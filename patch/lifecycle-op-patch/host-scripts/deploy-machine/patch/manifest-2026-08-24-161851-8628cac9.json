@@ -1,0 +1,1255 @@
+{
+  "synced_at": "2026-08-24 16:18:51 UTC+08:00",
+  "base_sha": "29680abb570bba7b1e241616b534ba21de2c3e07",
+  "source_commit": "8628cac93dff750c6d1f5f8d0bb8791e99696005",
+  "commit_count": 183,
+  "file_count": 108,
+  "summary": "Sync the bb increment 29680abb..8628cac9 to the public gateway branch. Sync-LOG only (which customer-facing files reached gateway + the issues behind them); the applyable patch kit is NOT built yet (folded_into pending).",
+  "issues_synced_note": "Index back to the issue tracker for whoever builds the patch kit: before assembling the kit, walk each issue and confirm it's covered. `title` is a ≤20-char gist only — open the issue for the full problem/fix/test. Lists only issues that touched a released file this sync.",
+  "issues_synced": [
+    {
+      "id": "#21",
+      "type": "fix",
+      "title": "直接 invoke 不再确定性抛 Key…"
+    },
+    {
+      "id": "#52",
+      "type": "fix",
+      "title": "host-agent 健康判定加深"
+    },
+    {
+      "id": "#241",
+      "type": "feat",
+      "title": "host 侧批量删除 fan-out —…"
+    },
+    {
+      "id": "#265",
+      "type": "fix",
+      "title": "observability 资产迁 CD…"
+    },
+    {
+      "id": "#274",
+      "type": "feat",
+      "title": "场景 profile 预设"
+    },
+    {
+      "id": "#335",
+      "type": "fix",
+      "title": "copy-file-from-s3 路径…"
+    },
+    {
+      "id": "#339",
+      "type": "fix",
+      "title": "delete/action/scaler…"
+    },
+    {
+      "id": "#377",
+      "type": "docs",
+      "title": "backup_retention_day…"
+    },
+    {
+      "id": "#412",
+      "type": "feat",
+      "title": "#422 follow-up"
+    },
+    {
+      "id": "#422",
+      "type": "feat",
+      "title": "#422 follow-up"
+    },
+    {
+      "id": "#429",
+      "type": "fix",
+      "title": "根治 reapply unconfirm…"
+    },
+    {
+      "id": "#432",
+      "type": "fix",
+      "title": "调度器可扩展性"
+    },
+    {
+      "id": "#435",
+      "type": "fix",
+      "title": "Firecracker/jailer 取…"
+    },
+    {
+      "id": "#438",
+      "type": "feat",
+      "title": "#422 follow-up"
+    },
+    {
+      "id": "#458",
+      "type": "fix",
+      "title": "开机 S3 分发面机械化 —— 每个拉取…"
+    },
+    {
+      "id": "#462",
+      "type": "fix",
+      "title": "GET /hosts 报的超卖比改为【这…"
+    },
+    {
+      "id": "#469",
+      "type": "feat",
+      "title": "10 万规模并发支持"
+    },
+    {
+      "id": "#496",
+      "type": "feat",
+      "title": "execute-api Interfac…"
+    },
+    {
+      "id": "#515",
+      "type": "fix",
+      "title": "直接 invoke 不再确定性抛 Key…"
+    },
+    {
+      "id": "#521",
+      "type": "fix",
+      "title": "ESM 字段漂移不再被额外谎报成「映射已…"
+    },
+    {
+      "id": "#523",
+      "type": "fix",
+      "title": "内核/FC pin 两条启动路径加双门,…"
+    },
+    {
+      "id": "#526",
+      "type": "fix",
+      "title": "restore 端口漂移改在 host-…"
+    },
+    {
+      "id": "#528",
+      "type": "fix",
+      "title": "租户视角安全审计"
+    },
+    {
+      "id": "#532",
+      "type": "feat",
+      "title": "delete 失败进入 DLQ 后 te…"
+    },
+    {
+      "id": "#537",
+      "type": "feat",
+      "title": "使用 Packer 标准化数据面更新"
+    },
+    {
+      "id": "#540",
+      "type": "feat",
+      "title": "host 污点读侧 —— 四条放置路径排…"
+    },
+    {
+      "id": "#542",
+      "type": "feat",
+      "title": "[FEATURE] guest 出网 d…"
+    },
+    {
+      "id": "#547",
+      "type": "fix",
+      "title": "中止的生命周期操作不释放租约 —— re…"
+    },
+    {
+      "id": "#548",
+      "type": "fix",
+      "title": "stop 违反\"绝不回收端口\"契约"
+    },
+    {
+      "id": "#549",
+      "type": "fix",
+      "title": "host-agent 凭据自愈"
+    },
+    {
+      "id": "#557",
+      "type": "fix",
+      "title": "fluent-bit 原子替换"
+    },
+    {
+      "id": "#558",
+      "type": "fix",
+      "title": "fluent-bit 原子替换"
+    },
+    {
+      "id": "#559",
+      "type": "fix",
+      "title": "fluent-bit 原子替换"
+    },
+    {
+      "id": "#560",
+      "type": "fix",
+      "title": "fluent-bit 原子替换"
+    },
+    {
+      "id": "#561",
+      "type": "fix",
+      "title": "fluent-bit 原子替换"
+    },
+    {
+      "id": "#562",
+      "type": "feat",
+      "title": "feat"
+    },
+    {
+      "id": "#564",
+      "type": "docs",
+      "title": "更正两处说法 —— 真机核实出 G5 的…"
+    },
+    {
+      "id": "#565",
+      "type": "fix",
+      "title": "G1 前提 —— 两处 _ssm_run…"
+    },
+    {
+      "id": "#566",
+      "type": "feat",
+      "title": "[FEATURE] guest 出网 d…"
+    },
+    {
+      "id": "#567",
+      "type": "fix",
+      "title": "【评审 follow-up】!772/!…"
+    },
+    {
+      "id": "#568",
+      "type": "feat",
+      "title": "chore"
+    },
+    {
+      "id": "#570",
+      "type": "docs",
+      "title": "污点文档刷新"
+    },
+    {
+      "id": "#571",
+      "type": "feat",
+      "title": "restore 收尾留 stale ap…"
+    },
+    {
+      "id": "#572",
+      "type": "feat",
+      "title": "feat"
+    },
+    {
+      "id": "#573",
+      "type": "fix",
+      "title": "控制面 4 处 SSM client 加…"
+    },
+    {
+      "id": "#574",
+      "type": "fix",
+      "title": "[FEATURE] #566 egres…"
+    },
+    {
+      "id": "#578",
+      "type": "fix",
+      "title": "host_image.py 摘掉写进公开…"
+    },
+    {
+      "id": "#580",
+      "type": "fix",
+      "title": "setup.sh 补 spire-kit…"
+    },
+    {
+      "id": "#585",
+      "type": "fix",
+      "title": "config.yml.example 被…"
+    }
+  ],
+  "needs_config_on_apply": [
+    {
+      "file": "config.yml.example",
+      "param": "backup_lifecycle_enabled",
+      "change": "new",
+      "value": "false"
+    },
+    {
+      "file": "config.yml.example",
+      "param": "backup_central_schedule_enabled",
+      "change": "new",
+      "value": "true"
+    },
+    {
+      "file": "config.yml.example",
+      "param": "deadline_sec",
+      "change": "new",
+      "value": ""
+    },
+    {
+      "file": "config.yml.example",
+      "param": "create",
+      "change": "new",
+      "value": "180     # #562 已落地;本轮把它从 Python 常量迁到 env(客户要求\"每个\"都能改)"
+    },
+    {
+      "file": "config.yml.example",
+      "param": "suspend",
+      "change": "new",
+      "value": "180"
+    },
+    {
+      "file": "config.yml.example",
+      "param": "restore",
+      "change": "new",
+      "value": "180"
+    },
+    {
+      "file": "config.yml.example",
+      "param": "restart",
+      "change": "new",
+      "value": "180    # 客户 2026-08-21 追加"
+    },
+    {
+      "file": "config.yml.example",
+      "param": "rebuild",
+      "change": "new",
+      "value": "180    # 客户 2026-08-21 追加"
+    },
+    {
+      "file": "config.yml.example",
+      "param": "backup",
+      "change": "new",
+      "value": "600     # **网关手动备份**;系统定时备份有自己的错峰语义,不受此约束"
+    },
+    {
+      "file": "config.yml.example",
+      "param": "delete",
+      "change": "new",
+      "value": "600     # 只约束「给上层的答复」;实际删除不得丢弃,必须继续重试到成功"
+    },
+    {
+      "file": "config.yml.example",
+      "param": "egress_mode",
+      "change": "new",
+      "value": "\"off\"                         # off | deny"
+    },
+    {
+      "file": "config.yml.example",
+      "param": "egress_deny_rfc1918",
+      "change": "new",
+      "value": "false"
+    }
+  ],
+  "updated_files": {
+    "cdk-stack (cdk deploy OR hand-apply)": [
+      {
+        "path": "deploy/stacks/alarms.py",
+        "status": "modified",
+        "issues": [
+          "#469"
+        ]
+      },
+      {
+        "path": "deploy/stacks/auth.py",
+        "status": "modified",
+        "issues": [
+          "#572"
+        ]
+      },
+      {
+        "path": "deploy/stacks/compute.py",
+        "status": "modified",
+        "issues": [
+          "#435"
+        ]
+      },
+      {
+        "path": "deploy/stacks/ha_edge.py",
+        "status": "modified",
+        "issues": [
+          "#265",
+          "#469",
+          "#542",
+          "#566"
+        ]
+      },
+      {
+        "path": "deploy/stacks/host_image.py",
+        "status": "modified",
+        "issues": [
+          "#435",
+          "#578"
+        ]
+      },
+      {
+        "path": "deploy/stacks/lambdas.py",
+        "status": "modified",
+        "issues": [
+          "#52",
+          "#432",
+          "#469",
+          "#496",
+          "#532",
+          "#542",
+          "#564",
+          "#565",
+          "#566"
+        ]
+      },
+      {
+        "path": "deploy/stacks/obs_assets.py",
+        "status": "added",
+        "issues": [
+          "#265"
+        ]
+      },
+      {
+        "path": "deploy/stacks/storage.py",
+        "status": "modified",
+        "issues": [
+          "#377"
+        ]
+      }
+    ],
+    "console (static assets, S3 sync)": [
+      {
+        "path": "deploy/console-bff/handler.mjs",
+        "status": "modified",
+        "issues": [
+          "#572"
+        ]
+      },
+      {
+        "path": "deploy/console-bff/sigv4-client.mjs",
+        "status": "added",
+        "issues": [
+          "#572"
+        ]
+      },
+      {
+        "path": "deploy/console-bff/sigv4.test.mjs",
+        "status": "added",
+        "issues": [
+          "#572"
+        ]
+      }
+    ],
+    "docs": [
+      {
+        "path": "docs/aws-guide-en/05-deploy-use-troubleshoot.md",
+        "status": "modified",
+        "issues": [
+          "#435"
+        ]
+      },
+      {
+        "path": "docs/aws-guide-en/09-api-integration.md",
+        "status": "modified",
+        "issues": [
+          "#540",
+          "#570"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/05-deploy-use-troubleshoot.md",
+        "status": "modified",
+        "issues": [
+          "#435"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/09-api-integration.md",
+        "status": "modified",
+        "issues": [
+          "#540",
+          "#570"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/19-config-parameter-baseline.md",
+        "status": "modified",
+        "issues": [
+          "#274",
+          "#557",
+          "#558",
+          "#559",
+          "#560",
+          "#561"
+        ]
+      }
+    ],
+    "edge (OpenResty / Fluent Bit host config)": [
+      {
+        "path": "deploy/edge/fluent-bit/install-fluent-bit.sh",
+        "status": "modified",
+        "issues": [
+          "#458",
+          "#557",
+          "#558",
+          "#559",
+          "#560",
+          "#561"
+        ]
+      }
+    ],
+    "host-scripts (S3-pulled / baked into rootfs)": [
+      {
+        "path": "deploy/userdata/backup-data.sh",
+        "status": "modified",
+        "issues": [
+          "#469"
+        ]
+      },
+      {
+        "path": "deploy/userdata/delete-all-vms.sh",
+        "status": "added",
+        "issues": [
+          "#241"
+        ]
+      },
+      {
+        "path": "deploy/userdata/host-agent.py",
+        "status": "modified",
+        "issues": [
+          "#52",
+          "#339",
+          "#469",
+          "#526",
+          "#542",
+          "#549",
+          "#566",
+          "#574"
+        ]
+      },
+      {
+        "path": "deploy/userdata/init-host.sh",
+        "status": "modified",
+        "issues": [
+          "#241",
+          "#469",
+          "#523",
+          "#542",
+          "#566"
+        ]
+      },
+      {
+        "path": "deploy/userdata/launch-vm.sh",
+        "status": "modified",
+        "issues": [
+          "#429",
+          "#469",
+          "#528"
+        ]
+      },
+      {
+        "path": "deploy/userdata/lib/harden-config.sh",
+        "status": "modified",
+        "issues": [
+          "#429"
+        ]
+      },
+      {
+        "path": "deploy/userdata/lib/lifecycle-guard.sh",
+        "status": "added",
+        "issues": [
+          "#241"
+        ]
+      },
+      {
+        "path": "deploy/userdata/migrate-vm.sh",
+        "status": "modified",
+        "issues": [
+          "#469",
+          "#528"
+        ]
+      },
+      {
+        "path": "deploy/userdata/oc-egress-chain.sh",
+        "status": "added",
+        "issues": [
+          "#542",
+          "#566",
+          "#574"
+        ]
+      },
+      {
+        "path": "deploy/userdata/oc-egress-sim.py",
+        "status": "added",
+        "issues": [
+          "#542",
+          "#566",
+          "#574"
+        ]
+      },
+      {
+        "path": "deploy/userdata/provision-host.sh",
+        "status": "modified",
+        "issues": [
+          "#435",
+          "#523"
+        ]
+      },
+      {
+        "path": "deploy/userdata/rebuild-vm.sh",
+        "status": "modified",
+        "issues": [
+          "#523"
+        ]
+      },
+      {
+        "path": "deploy/userdata/required-scripts.list",
+        "status": "added",
+        "issues": [
+          "#532"
+        ]
+      },
+      {
+        "path": "deploy/userdata/spire-kit/install.sh",
+        "status": "modified",
+        "issues": [
+          "#568"
+        ]
+      },
+      {
+        "path": "deploy/userdata/spire-kit/registrar-mock-customer.py",
+        "status": "modified",
+        "issues": [
+          "#568"
+        ]
+      },
+      {
+        "path": "deploy/userdata/spire-kit/registrar-stub.py",
+        "status": "modified",
+        "issues": [
+          "#568"
+        ]
+      },
+      {
+        "path": "deploy/userdata/spire-kit/spire-join-broker.py",
+        "status": "modified",
+        "issues": [
+          "#568"
+        ]
+      },
+      {
+        "path": "deploy/userdata/stop-vm.sh",
+        "status": "modified",
+        "issues": [
+          "#469"
+        ]
+      }
+    ],
+    "lambda (update-function-code only)": [
+      {
+        "path": "deploy/lambda/api/core/capacity.py",
+        "status": "modified",
+        "issues": [
+          "#549"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/clients.py",
+        "status": "modified",
+        "issues": [
+          "#549",
+          "#564",
+          "#565",
+          "#573"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/copy_file_helper.py",
+        "status": "added",
+        "issues": [
+          "#335"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/create_deadline.py",
+        "status": "added",
+        "issues": [
+          "#562",
+          "#564",
+          "#565"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/ddb_scan.py",
+        "status": "added",
+        "issues": [
+          "#432"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/deadline_config.py",
+        "status": "added",
+        "issues": [
+          "#564"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/dispatch/binpack.py",
+        "status": "modified",
+        "issues": [
+          "#540",
+          "#549"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/event_shape.py",
+        "status": "added",
+        "issues": [
+          "#21",
+          "#412",
+          "#422",
+          "#438",
+          "#515"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/host_taint.py",
+        "status": "modified",
+        "issues": [
+          "#540"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/lifecycle_fence.py",
+        "status": "modified",
+        "issues": [
+          "#241",
+          "#469"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/scheduling.py",
+        "status": "modified",
+        "issues": [
+          "#432",
+          "#540",
+          "#549"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/ssm_dispatch.py",
+        "status": "modified",
+        "issues": [
+          "#429",
+          "#523",
+          "#565"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/vkey.py",
+        "status": "modified",
+        "issues": [
+          "#412",
+          "#422",
+          "#438"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/handler.py",
+        "status": "modified",
+        "issues": [
+          "#21",
+          "#412",
+          "#422",
+          "#429",
+          "#432",
+          "#438",
+          "#469",
+          "#515",
+          "#532",
+          "#542",
+          "#562",
+          "#564",
+          "#566",
+          "#567"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/routes/skills_groups.py",
+        "status": "modified",
+        "issues": [
+          "#432"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/console_info.py",
+        "status": "modified",
+        "issues": [
+          "#432"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/credential_reconciler.py",
+        "status": "added",
+        "issues": [
+          "#412",
+          "#422",
+          "#438"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/deadline_executor.py",
+        "status": "added",
+        "issues": [
+          "#562",
+          "#564"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/delete_reconciler.py",
+        "status": "added",
+        "issues": [
+          "#532"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/dispatch_poller.py",
+        "status": "modified",
+        "issues": [
+          "#432"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/dispatch_service.py",
+        "status": "modified",
+        "issues": [
+          "#432",
+          "#540",
+          "#549",
+          "#562"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/egress_admin_service.py",
+        "status": "added",
+        "issues": [
+          "#542",
+          "#566",
+          "#574"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/fleet_service.py",
+        "status": "modified",
+        "issues": [
+          "#432",
+          "#469",
+          "#567"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/host_service.py",
+        "status": "modified",
+        "issues": [
+          "#335",
+          "#432",
+          "#462",
+          "#565",
+          "#567"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/lifecycle_dispatch.py",
+        "status": "modified",
+        "issues": [
+          "#564"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/poller_heartbeat.py",
+        "status": "added",
+        "issues": [
+          "#432"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/registry_service.py",
+        "status": "modified",
+        "issues": [
+          "#429"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/tenant_service.py",
+        "status": "modified",
+        "issues": [
+          "#339",
+          "#412",
+          "#422",
+          "#429",
+          "#438",
+          "#469",
+          "#523",
+          "#532",
+          "#540",
+          "#547",
+          "#548",
+          "#562",
+          "#564",
+          "#565",
+          "#571"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/test_lifecycle_stop_contract.py",
+        "status": "added",
+        "issues": [
+          "#547",
+          "#548"
+        ]
+      },
+      {
+        "path": "deploy/lambda/backup/handler.py",
+        "status": "modified",
+        "issues": [
+          "#469",
+          "#564",
+          "#565",
+          "#573"
+        ]
+      },
+      {
+        "path": "deploy/lambda/health_check/ddb_scan.py",
+        "status": "added",
+        "issues": [
+          "#432"
+        ]
+      },
+      {
+        "path": "deploy/lambda/health_check/handler.py",
+        "status": "modified",
+        "issues": [
+          "#52",
+          "#412",
+          "#422",
+          "#429",
+          "#432",
+          "#438",
+          "#469",
+          "#562",
+          "#567",
+          "#573"
+        ]
+      },
+      {
+        "path": "deploy/lambda/scaler/ddb_scan.py",
+        "status": "added",
+        "issues": [
+          "#432"
+        ]
+      },
+      {
+        "path": "deploy/lambda/scaler/handler.py",
+        "status": "modified",
+        "issues": [
+          "#339",
+          "#432",
+          "#573"
+        ]
+      },
+      {
+        "path": "deploy/lib/dispatch_infra.py",
+        "status": "modified",
+        "issues": [
+          "#412",
+          "#422",
+          "#432",
+          "#438"
+        ]
+      }
+    ],
+    "root / other": [
+      {
+        "path": "cli/oc-consistency.py",
+        "status": "modified",
+        "issues": [
+          "#521",
+          "#557",
+          "#558",
+          "#559",
+          "#560",
+          "#561"
+        ]
+      },
+      {
+        "path": "config.yml.example",
+        "status": "modified",
+        "issues": [
+          "#377",
+          "#469",
+          "#496",
+          "#542",
+          "#564",
+          "#566",
+          "#585"
+        ]
+      },
+      {
+        "path": "deploy/packer/CUSTOMER-GUIDE.md",
+        "status": "modified",
+        "issues": [
+          "#435",
+          "#523"
+        ]
+      },
+      {
+        "path": "deploy/packer/README.md",
+        "status": "modified",
+        "issues": [
+          "#435",
+          "#523"
+        ]
+      },
+      {
+        "path": "deploy/packer/apse1.pkrvars.hcl",
+        "status": "modified",
+        "issues": [
+          "#435",
+          "#537"
+        ]
+      },
+      {
+        "path": "deploy/packer/assert-image.sh",
+        "status": "modified",
+        "issues": [
+          "#523",
+          "#537"
+        ]
+      },
+      {
+        "path": "deploy/packer/assert-parity.sh",
+        "status": "modified",
+        "issues": [
+          "#537"
+        ]
+      },
+      {
+        "path": "deploy/packer/build-golden-ami.sh",
+        "status": "added",
+        "issues": [
+          "#537"
+        ]
+      },
+      {
+        "path": "deploy/packer/customize.sh.default",
+        "status": "deleted",
+        "issues": [
+          "#537"
+        ]
+      },
+      {
+        "path": "deploy/packer/customize.sh.example",
+        "status": "deleted",
+        "issues": [
+          "#537"
+        ]
+      },
+      {
+        "path": "deploy/packer/hooks/50-example.sh.example",
+        "status": "added",
+        "issues": [
+          "#537"
+        ]
+      },
+      {
+        "path": "deploy/packer/hooks/README.md",
+        "status": "added",
+        "issues": [
+          "#537"
+        ]
+      },
+      {
+        "path": "deploy/packer/host-golden.pkr.hcl",
+        "status": "modified",
+        "issues": [
+          "#435",
+          "#523",
+          "#537"
+        ]
+      },
+      {
+        "path": "deploy/packer/run-hooks.sh",
+        "status": "added",
+        "issues": [
+          "#537"
+        ]
+      },
+      {
+        "path": "openclaw-assets-test/add_timestamp.lua",
+        "status": "added",
+        "issues": [
+          "#567"
+        ]
+      },
+      {
+        "path": "openclaw-assets-test/extract_trace_root.lua",
+        "status": "added",
+        "issues": [
+          "#567"
+        ]
+      },
+      {
+        "path": "openclaw-assets-test/fluent-bit.conf",
+        "status": "added",
+        "issues": [
+          "#567"
+        ]
+      },
+      {
+        "path": "openclaw-assets-test/lua/extract_trace_root.lua",
+        "status": "added",
+        "issues": [
+          "#567"
+        ]
+      },
+      {
+        "path": "openclaw-assets-test/lua/helper.lua",
+        "status": "added",
+        "issues": [
+          "#567"
+        ]
+      },
+      {
+        "path": "openclaw-assets-test/outputs.conf",
+        "status": "added",
+        "issues": [
+          "#567"
+        ]
+      },
+      {
+        "path": "openclaw-assets-test/parsers.conf",
+        "status": "added",
+        "issues": [
+          "#567"
+        ]
+      },
+      {
+        "path": "samples/config-sg-prod.yaml",
+        "status": "modified",
+        "issues": [
+          "#562"
+        ]
+      },
+      {
+        "path": "samples/profiles/README.md",
+        "status": "added",
+        "issues": [
+          "#274"
+        ]
+      },
+      {
+        "path": "samples/profiles/minimal-test.yml",
+        "status": "added",
+        "issues": [
+          "#274"
+        ]
+      },
+      {
+        "path": "samples/profiles/private-enterprise.yml",
+        "status": "added",
+        "issues": [
+          "#274"
+        ]
+      },
+      {
+        "path": "samples/profiles/public-demo.yml",
+        "status": "added",
+        "issues": [
+          "#274"
+        ]
+      },
+      {
+        "path": "setup.sh",
+        "status": "modified",
+        "issues": [
+          "#241",
+          "#265",
+          "#435",
+          "#532",
+          "#542",
+          "#566",
+          "#580"
+        ]
+      }
+    ],
+    "scripts": [
+      {
+        "path": "scripts/checks/config-gate.sh",
+        "status": "added",
+        "issues": [
+          "#274"
+        ]
+      },
+      {
+        "path": "scripts/checks/create-deadline-config.py",
+        "status": "added",
+        "issues": [
+          "#562",
+          "#564"
+        ]
+      },
+      {
+        "path": "scripts/checks/create-deadline-config.sh",
+        "status": "added",
+        "issues": [
+          "#562"
+        ]
+      },
+      {
+        "path": "scripts/checks/ddb-scan-pagination.py",
+        "status": "added",
+        "issues": [
+          "#432",
+          "#567"
+        ]
+      },
+      {
+        "path": "scripts/checks/ddb-scan-pagination.sh",
+        "status": "added",
+        "issues": [
+          "#432"
+        ]
+      },
+      {
+        "path": "scripts/checks/host-pin-parity.py",
+        "status": "added",
+        "issues": [
+          "#523"
+        ]
+      },
+      {
+        "path": "scripts/checks/host-pin-parity.sh",
+        "status": "added",
+        "issues": [
+          "#523"
+        ]
+      },
+      {
+        "path": "scripts/checks/run-all.sh",
+        "status": "modified",
+        "issues": [
+          "#274",
+          "#432",
+          "#458",
+          "#523",
+          "#562"
+        ]
+      },
+      {
+        "path": "scripts/checks/s3-at-boot-parity.py",
+        "status": "added",
+        "issues": [
+          "#265",
+          "#458",
+          "#580"
+        ]
+      },
+      {
+        "path": "scripts/checks/s3-at-boot-parity.sh",
+        "status": "added",
+        "issues": [
+          "#458"
+        ]
+      },
+      {
+        "path": "scripts/preflight-check.sh",
+        "status": "modified",
+        "issues": [
+          "#274"
+        ]
+      }
+    ]
+  },
+  "folded_into": "(pending) — no patch kit built for this sync yet; a later kit should cite this manifest as source-of-record and set base_sha/patch_sha. cdk deploy is FORBIDDEN on hand-modified live deployments — the kit must ship *.patched host scripts + the full lambda tree + AWS CLI for stack changes, same shape as patch/315-concurrent-dispatch-rollup/."
+}

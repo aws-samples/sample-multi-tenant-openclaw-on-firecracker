@@ -22,6 +22,7 @@
 host-agent.py
 route_ops.py
 oc-guest-log-reader.py
+sync-shared-skills.py
 launch-vm.sh
 stop-vm.sh
 rebuild-vm.sh

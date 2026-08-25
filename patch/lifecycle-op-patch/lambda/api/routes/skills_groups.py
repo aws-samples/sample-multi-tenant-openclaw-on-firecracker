@@ -5,11 +5,14 @@
 路由层:参数解析+调数据源+响应包装。函数体逐字搬。依赖 core.clients(groups_table/s3)+
 core.utils(_resp/_NAME_RE)。专属常量 _SKILL_NAME_RE/_SKILL_MAX_BYTES 随迁。
 """
+import base64
+import hashlib
 import json
 import re
 import os
+import shlex
 import core.ddb_scan as ddb_scan  # #432 —— Scan 必须翻页
-from core.clients import groups_table, s3
+from core.clients import groups_table, hosts_table, s3, ssm
 from core.utils import _resp, _NAME_RE
 
 def list_groups():
@@ -109,6 +112,88 @@ def remove_skill_from_group(name, skill):
         return _resp(500, {"error": str(e)})
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$")
 _SKILL_MAX_BYTES = 256 * 1024  # 256 KiB — generous, an SKILL.md should be tiny
+
+
+def _dispatch_shared_skill_sync(bucket):
+    """Install the version-aware syncer on existing hosts and run it once."""
+    region = os.environ.get("AWS_REGION", "ap-northeast-1")
+    try:
+        hosts = ddb_scan.scan_all(
+            hosts_table,
+            FilterExpression="#s IN (:a, :i)",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":a": "active", ":i": "idle"},
+        )
+    except Exception as exc:
+        print(f"[skills] could not enumerate hosts for shared-skill sync: {exc}")
+        return {"status": "dispatch_failed", "hosts": 0}
+    instance_ids = [
+        host.get("instance_id")
+        for host in hosts
+        if host.get("instance_id") and not str(host["instance_id"]).startswith("__")
+    ]
+    if not instance_ids:
+        return {"status": "no_active_hosts", "hosts": 0}
+    q = shlex.quote
+    sync_command = (
+        "/usr/bin/python3 /opt/openclaw/sync-shared-skills.py "
+        f"--bucket {q(bucket)} --region {q(region)}"
+    )
+    script = "\n".join(
+        [
+            "set -eu",
+            "tmp=$(mktemp /opt/openclaw/.sync-shared-skills.py.XXXXXX)",
+            (
+                f"aws s3 cp s3://{q(bucket)}/deployment/scripts/"
+                f"sync-shared-skills.py \"$tmp\" --region {q(region)} --no-progress"
+            ),
+            'install -o root -g root -m 0755 "$tmp" /opt/openclaw/sync-shared-skills.py',
+            'rm -f "$tmp"',
+            "mkdir -p /data/shared-skills /var/lib/openclaw",
+            (
+                "printf '%s\\n' "
+                + q(
+                    f"*/5 * * * * root {sync_command} "
+                    ">>/var/log/openclaw-skills-sync.log 2>&1"
+                )
+                + " > /etc/cron.d/openclaw-skills-sync"
+            ),
+            "chmod 0644 /etc/cron.d/openclaw-skills-sync",
+            sync_command,
+            "chown -R ubuntu:ubuntu /data/shared-skills",
+        ]
+    )
+    command_ids = []
+    accepted_hosts = 0
+    for offset in range(0, len(instance_ids), 50):
+        batch = instance_ids[offset : offset + 50]
+        try:
+            response = ssm.send_command(
+                InstanceIds=batch,
+                DocumentName="AWS-RunShellScript",
+                Parameters={"commands": [script], "executionTimeout": ["300"]},
+            )
+            command_id = (response.get("Command") or {}).get("CommandId")
+            if not command_id:
+                raise RuntimeError("SSM response had no command id")
+            command_ids.append(command_id)
+            accepted_hosts += len(batch)
+        except Exception as exc:
+            print(f"[skills] shared-skill sync dispatch failed: {exc}")
+    status = "accepted" if accepted_hosts == len(instance_ids) else "partial"
+    if not command_ids:
+        status = "dispatch_failed"
+    result = {
+        "status": status,
+        "hosts": len(instance_ids),
+        "accepted_hosts": accepted_hosts,
+        "command_ids": command_ids,
+    }
+    if len(command_ids) == 1:
+        result["command_id"] = command_ids[0]
+    return result
+
+
 def read_skill(name):
     """GET /skills/{name} — return the SKILL.md content for the editor.
 
@@ -190,18 +275,29 @@ def update_skill(name, body_str):
             existed = True
         except Exception:
             existed = False
-        s3.put_object(
+        content_bytes = content.encode("utf-8")
+        sha256 = hashlib.sha256(content_bytes).hexdigest()
+        put_result = s3.put_object(
             Bucket=bucket,
             Key=key,
-            Body=content.encode("utf-8"),
+            Body=content_bytes,
             ContentType="text/markdown; charset=utf-8",
+            Metadata={"sha256": sha256},
+            ChecksumSHA256=base64.b64encode(bytes.fromhex(sha256)).decode("ascii"),
         )
+        if not isinstance(put_result, dict):
+            put_result = {}
+        sync = _dispatch_shared_skill_sync(bucket)
         return _resp(
             200 if existed else 201,
             {
                 "name": name,
-                "size": len(content.encode("utf-8")),
+                "size": len(content_bytes),
                 "created": not existed,
+                "version_id": put_result.get("VersionId"),
+                "etag": str(put_result.get("ETag") or "").strip('"') or None,
+                "sha256": sha256,
+                "sync": sync,
             },
         )
     except Exception as e:
@@ -232,6 +328,13 @@ def delete_skill(name):
         # in a single skill prefix, but loop defensively anyway.
         for i in range(0, len(keys), 1000):
             s3.delete_objects(Bucket=bucket, Delete={"Objects": keys[i : i + 1000]})
-        return _resp(200, {"name": name, "deleted": len(keys)})
+        return _resp(
+            200,
+            {
+                "name": name,
+                "deleted": len(keys),
+                "sync": _dispatch_shared_skill_sync(bucket),
+            },
+        )
     except Exception as e:
         return _resp(500, {"error": str(e)})

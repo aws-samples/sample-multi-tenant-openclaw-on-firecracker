@@ -90,6 +90,7 @@ def _launch_vm(
     gateway_token_ct=None,
     device_paired_b64="",
     sync=False,
+    sync_timeout=300,
 ):
     """Fire-and-forget: launch VM + set up DNAT.
 
@@ -159,8 +160,14 @@ def _launch_vm(
     # 三分:ok=True→翻 running;ok=False 且 rc==75→flock-skip(另一次同租户 launch 在跑,VM
     # 正被拉起)→保持 restoring 等重投收敛,【不回滚不释放 slot】;ok=False 且 rc!=75→真失败回滚。
     # `cmd` 只运行 launch-vm.sh;flock-skip 时脚本 exit 75,SSM ResponseCode 如实反映。
+    # #565 G1 —— 墙钟预算由**调用点**传入,不在这里写死 300。
+    # 分层理由:本模块是**机制**(怎么下发、怎么等),而"这个动作允许等多久"是**策略**,
+    # 它取决于调用方处在哪个死线档下(restore 是 180s 档,执行段 120s)。写死 300 的后果不是
+    # 变慢:restore 在 t=180 被死线执行者判 failed,而 launch-vm.sh 还能合法再跑 120s 并把 VM
+    # 拉起来 —— 上层看到失败、底层其实成功,正是 #565 要消灭的那个状态不一致。
+    # 默认值保留 300 是为了不改动其它(将来可能出现的)同步调用方的行为。
     if sync:
-        return _ssm_run(instance_id, cmd, timeout=300, want_rc=True)
+        return _ssm_run(instance_id, cmd, timeout=int(sync_timeout), want_rc=True)
     # Return the SSM CommandId (or None if submission failed — notably an SSM
     # SendCommand ThrottlingException under concurrent consumer fan-out, loop
     # 2026-07-01 real-machine bug). Callers on the create path check this: a
@@ -171,6 +178,18 @@ def _launch_vm(
 
 #: 生命周期脚本在 host 上的安装目录(init-host.sh 装到这里,自愈也只写这里)。
 _HOST_SCRIPT_DIR = "/home/ubuntu"
+
+#: launch-vm.sh 抢不到 per-tenant flock 时的退出码(launch-vm.sh:705 的 skip 专用哨兵)。
+#: 语义是「另一次**同租户** launch 正在把 VM 拉起」——良性,不是失败。
+RC_FLOCK_SKIP = 75
+
+#: flock-skip 走 5xx 出口时响应 body 里的机器可读 code(#604)。
+#:
+#: 为什么需要一个 code 而不是只靠 HTTP 状态:503 在这条链上有多个成因(容量、下游不可达),
+#: 而只有 flock-skip 这一种是「良性且短暂」的 —— consumer 据此把重投退避从队列默认的
+#: 960s 缩到秒级(handler.py `_shorten_lifecycle_visibility_best_effort`),其余 5xx 的重投
+#: 节奏一个字不改。判据放在 body 的 code 上,让"该缩谁"是显式声明而不是靠状态码猜。
+LAUNCH_IN_PROGRESS_CODE = "LAUNCH_IN_PROGRESS"
 
 
 def host_script_self_heal(scripts, tag, freshness=None):
@@ -188,6 +207,8 @@ def host_script_self_heal(scripts, tag, freshness=None):
     · 判据不只看文件存在。`freshness=(script, sentinel)` 会额外要求该脚本里能 grep 到
       `sentinel`——旧版存在但不认新语义,正是最难查的一档(如旧 `stop-vm.sh` 不认
       `OC_LIFECYCLE_LOCK_FD` → 15s 锁超时),必须一起换掉。
+    · 触发 freshness 自愈后必须用同一判据复验;只有哨兵在位才算装载完成。若 S3 上
+      那份脚本也过期、装完仍缺哨兵,必须 fail-loud 报部署不完整,不能放行后续命令。
     · **任何一步失败都 `exit 1`**,让整条 SSM 命令非零 → 调用方按各自的失败路径回滚或
       保留可重投状态。这条链上**不允许 `|| true`**:静默容错等于把不可逆操作变成
       best-effort(`test_ADV_route_cleanup_is_not_best_effort` 就是拦这个的)。
@@ -226,6 +247,7 @@ def host_script_self_heal(scripts, tag, freshness=None):
         f'[ -x "{_HOST_SCRIPT_DIR}/$f" ] || _oc_heal=1; '
         "done; "
     )
+    post_install_verify = ""
     if freshness is not None:
         probe_script, sentinel = freshness
         if probe_script not in names:
@@ -253,6 +275,19 @@ def host_script_self_heal(scripts, tag, freshness=None):
             f'grep -q {sentinel} "{_HOST_SCRIPT_DIR}/$_oc_probe" 2>/dev/null '
             "|| _oc_heal=1; "
         )
+        # install 成功只证明文件落盘,不能证明 S3 上那份已含控制面要求的新语义。
+        # 复用同一个探针与同一个 grep 判据;S3 也过期时必须在放行日志之前 fail-loud。
+        # 诊断必须【同时】写 stderr:控制面的失败分支只取 StandardErrorContent
+        # (host 侧 log() 是裸 echo 到 stdout),只 echo 到 stdout 时 Lambda 日志里只剩
+        # 一句 "SSM failed (rc=1)",运维拿不到原因 —— #503 就是这个坑造成的 P0 回归。
+        # 2026-08-24 usw2 真机实测确认:复验失败时 StandardOutputContent 有完整诊断而
+        # StandardErrorContent 为空,consumer 日志因此只有 rc=1。
+        post_install_verify = (
+            f'grep -q {sentinel} "{_HOST_SCRIPT_DIR}/$_oc_probe" 2>/dev/null || '
+            f'{{ _oc_msg="[{tag}] FATAL 自愈后复验失败: $_oc_probe 缺失哨兵 {sentinel}; '
+            'S3 上那份也缺该哨兵 = 部署不完整"; '
+            'echo "$_oc_msg"; echo "$_oc_msg" >&2; exit 1; }; '
+        )
     return (
         f"{need}"
         'if [ -n "$_oc_heal" ]; then '
@@ -272,6 +307,7 @@ def host_script_self_heal(scripts, tag, freshness=None):
         f'install -o root -g root -m 755 "/tmp/oc-heal-$f" "{_HOST_SCRIPT_DIR}/$f" || '
         f'{{ echo "[{tag}] FATAL 安装 $f 失败"; exit 1; }}; '
         "done; "
+        f"{post_install_verify}"
         f"echo '[{tag}] 自愈装载完成'; "
         "fi"
     )
@@ -394,6 +430,12 @@ def _ssm_run(
     try:
         # SSM runs as root; set HOME so ~ resolves to /home/ubuntu
         wrapped = f"export HOME=/home/ubuntu && cd /home/ubuntu && {command}"
+        # #565 G1(Codex 独立复审第 2 轮)—— **计时必须从 `send_command` 之前开始。**
+        # 原来起在它之后,于是 `timeout` 只界住轮询、**不界住 send 本身** —— 而 #573 给 ssm
+        # client 加了 adaptive 重试之后,一次被节流的 `SendCommand` 最坏也要 ~71s 退避。
+        # 那 71s 白白落在预算之外,于是「执行段」不是真实上界,调用方按它排的死线就会破。
+        # `time.monotonic()` 而非 `time.time()`:后者会被 NTP 校正拖动。
+        _deadline = time.monotonic() + timeout
         resp = ssm.send_command(
             InstanceIds=[instance_id],
             DocumentName="AWS-RunShellScript",
@@ -423,9 +465,8 @@ def _ssm_run(
         # deadline 检查放在**发下一次 API 调用之前**:超预算就不再发新请求。净上界 =
         # `timeout` + 最后那次调用自身耗时(最坏 ~71s 退避)。
         # `time.monotonic()` 而非 `time.time()`:后者会被 NTP 校正拖动。
-        deadline = time.monotonic() + timeout
         time.sleep(3)  # Wait for invocation to register
-        while time.monotonic() < deadline:
+        while time.monotonic() < _deadline:
             try:
                 result = ssm.get_command_invocation(
                     CommandId=cmd_id,

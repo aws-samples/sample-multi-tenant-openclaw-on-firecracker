@@ -120,6 +120,71 @@ _ipv6fwd=$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || echo n/a)
 _ctmax=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo n/a)
 log "step1b done: ksm=$(cat /sys/kernel/mm/ksm/run 2>/dev/null||echo n/a) swaps=$(grep -c partition /proc/swaps 2>/dev/null||echo 0) smt=$(cat /sys/devices/system/cpu/smt/control 2>/dev/null||echo n/a) ipv6fwd=${_ipv6fwd} conntrack_max=${_ctmax}"
 
+# Step 1c: SSM agent 的单机命令并发上限。与 step1b 同一个形状(host 级系统配置、
+# 「默认满足 ≠ 部署代码保证」),所以紧挨着它,并且**在 Step 2 之前** —— 越早重启 agent,
+# 越不可能撞上一条正在送达的租户命令(此时本 host 还没注册进调度池,见 Step 5)。
+#
+# **为什么必须调**:agent 内置默认是 `CommandWorkersLimit=5` + `CommandWorkerBufferLimit=5`
+# (源码 `agent/appconfig/constants.go`),超出的命令每 10s 重试等 slot。控制面侧的
+# `scaler.lifecycle_max_concurrency` 再高也没用 —— 请求会堆在这 5 个 worker 前面排队,
+# 而排队时间算在客户死线里(#565 的三段预算:排队段 + 执行段 + 受理段 = 死线)。
+# **两侧必须成对提**,只提一侧都是白费:见 `deploy/stacks/lambdas.py` 那段注释与
+# `tests/test_565_g5_agent_worker_parity.py` 的机械断言。
+#
+# **20/10 不是拍的**:真机实测(us-west-2 的 metal host,2026-08-25,每档有 agent
+# 重启时间戳为证)—— 无配置(默认 5)下发 12 条命令严格分 3 批每批 5;`20/10` 下发 24 条得
+# 20 同时执行 + 4 排队;`50/25` 下发 60 条得 50 同时 + 10 排队。**线性生效,且 buffer 取
+# worker 的一半就够拿到满额并发**。取 20 而不是 50:1 QPS 量级下 host 侧需求约 14 并发
+# (`(1×2 条/s) × ~7s/条`),20 留余量;再往上会先撞 SSM `SendCommand` 的服务端限流
+#
+# **schema 从 host 上的模板实测得来,不照记忆写**:agent 3.3.4793.0(snap 装,classic),
+# 模板在 `/snap/amazon-ssm-agent/current/amazon-ssm-agent.json.template`,`Mds` 段是
+# `{CommandWorkersLimit, CommandWorkerBufferLimit, StopTimeoutMillis, Endpoint,
+# CommandRetryLimit}`。**只写 `Mds` 这一段**(部分配置):解析器把文件反序列化到一个已填好
+# 默认值的结构上,没写的键保持默认 —— 抄整份模板会把 `SessionWorkersLimit`、
+# `CommandRetryLimit` 这些今天的值**冻结**成第二个真相源,agent 升级带来的新默认就进不来了。
+#
+# **`/etc/amazon/` 默认不存在**(实测线上是空目录 = 有人手工创建过又清空),所以要 `mkdir -p`。
+# 服务名是 `snap.amazon-ssm-agent.amazon-ssm-agent.service`,**不是** `amazon-ssm-agent`
+# (snap 装的单元名带前缀);两个名字都试一次,deb 装的机器也能覆盖。
+#
+# **为什么写文件在这里而不在 provision-host.sh**:#523 判据 3 把二者的界划在「开机后是否
+# 残留」—— 写文件是落盘动作、本可进 provision,但 `systemctl restart` **不残留**,provision
+# 里明文禁止(golden 机队会整段跳过 provision,那样配置写了却没重启、并发仍是 5,而且没有
+# 任何日志会说这一步没做)。两个动作必须在同一处才有意义,所以整块放 configure 阶段。
+# 幂等:内容未变则不重启(避免每次开机白重启一次 agent)。
+log "step1c: SSM agent command worker limit (20/10)"
+_SSM_AGENT_CFG=/etc/amazon/ssm/amazon-ssm-agent.json
+mkdir -p "$(dirname "${_SSM_AGENT_CFG}")"
+_ssm_agent_cfg_new="$(cat <<'SSMAGENTCFG'
+{
+    "Mds": {
+        "CommandWorkersLimit": 20,
+        "CommandWorkerBufferLimit": 10
+    }
+}
+SSMAGENTCFG
+)"
+if [ -f "${_SSM_AGENT_CFG}" ] && \
+   [ "$(cat "${_SSM_AGENT_CFG}")" = "${_ssm_agent_cfg_new}" ]; then
+  log "step1c: agent config already current, no restart"
+else
+  printf '%s\n' "${_ssm_agent_cfg_new}" > "${_SSM_AGENT_CFG}"
+  chmod 644 "${_SSM_AGENT_CFG}"
+  _ssm_restarted=0
+  for _svc in snap.amazon-ssm-agent.amazon-ssm-agent.service amazon-ssm-agent; do
+    if systemctl restart "${_svc}" 2>/dev/null; then
+      log "step1c: restarted ${_svc}"
+      _ssm_restarted=1
+      break
+    fi
+  done
+  # 重启失败不 fail-loud:配置已落盘,下次开机自然生效,而此刻把整个 init 打死会让这台 host
+  # 连不进机队 —— 那比"并发仍是 5"严重得多。打 WARN 让它可被发现。
+  [ "${_ssm_restarted}" = "1" ] || \
+    log "WARN: step1c 写了 ${_SSM_AGENT_CFG} 但 agent 重启失败;本次开机并发仍是内置默认 5"
+fi
+
 # Step 2: components (provision stage) + per-host identity
 # provision-host.sh, which EC2 Image Builder bakes into the host AMI. This file is
 # the configure stage: it runs on EVERY boot and only does work that needs per-host
@@ -315,6 +380,7 @@ BALLOON_MIN_GUEST_AVAILABLE_MB={{BALLOON_MIN_GUEST_AVAILABLE_MB}}
 EGRESS_ALLOWLIST_ENABLED={{EGRESS_ALLOWLIST_ENABLED}}
 EGRESS_MODE={{EGRESS_MODE}}
 EGRESS_DENY_RFC1918={{EGRESS_DENY_RFC1918}}
+EGRESS_LLM_CIDR={{EGRESS_LLM_CIDR}}
 EGRESS_INCLUDE_VPC_CIDR={{EGRESS_INCLUDE_VPC_CIDR}}
 EGRESS_VPC_CIDR={{EGRESS_VPC_CIDR}}
 EGRESS_ALLOWLIST_CIDRS={{EGRESS_ALLOWLIST_CIDRS}}
@@ -425,15 +491,14 @@ if [ "${EGRESS_MODE:-off}" = "deny" ]; then
     # IP;若该 IP 不在本环境 VPC CIDR(= 公网网关,如外部 CloudFront)→ 不开内网洞,靠末尾 RETURN
     # 走公网放行即可(避免给公网 IP 开一条无意义的内网 allow)。解析失败 → 留空(egress-sim 会
     # 因缺 LITELLM_HOST 而不加该洞,canary 会抓到 LLM 不通,不静默)。绝不写死网段。
-    _LLM_IP=""; _LLM_PORT="4000"
-    if [ -n "${LITELLM_HOST:-}" ] && [ -n "${EGRESS_VPC_CIDR:-}" ]; then
-      _LLM_DERIVED=$(LITELLM_HOST="${LITELLM_HOST}" EGRESS_VPC_CIDR="${EGRESS_VPC_CIDR}" python3 - <<'PYEOF'
+    _LLM_IP=""; _LLM_PORT="4000"; _LLM_CIDR="${EGRESS_LLM_CIDR:-}"
+    if [ -n "${EGRESS_VPC_CIDR:-}" ] && { [ -n "${LITELLM_HOST:-}" ] || [ -n "${_LLM_CIDR}" ]; }; then
+      _LLM_DERIVED=$(LITELLM_HOST="${LITELLM_HOST:-}" EGRESS_VPC_CIDR="${EGRESS_VPC_CIDR}" EGRESS_LLM_CIDR="${_LLM_CIDR}" python3 - <<'PYEOF'
 import ipaddress, os, socket, sys
 from urllib.parse import urlparse
 raw = os.environ.get("LITELLM_HOST", "").strip()
 cidr = os.environ.get("EGRESS_VPC_CIDR", "").strip()
-if not raw:
-    sys.exit(0)
+cidr_mode = bool(os.environ.get("EGRESS_LLM_CIDR", "").strip())
 # 允许「host」「host:port」「scheme://host[:port]/path」三种写法
 u = urlparse(raw if "://" in raw else "//" + raw, scheme="")
 host = u.hostname or ""
@@ -441,6 +506,9 @@ port = u.port
 scheme = (u.scheme or "").lower()
 if not port:
     port = 443 if scheme == "https" else (80 if scheme == "http" else 4000)
+if cidr_mode:
+    print(f"|{port}")
+    sys.exit(0)
 if not host:
     sys.exit(0)
 try:
@@ -460,9 +528,14 @@ PYEOF
     fi
     # SPIRE server allow 洞:仅 spire-kit 开启且是内网 server 时;缺省留空(sim 不加该洞)。
     _SPIRE_IP="${SPIRE_SERVER_IP:-}"
-    log "step: #566 egress apply — VPC=${EGRESS_VPC_CIDR:-<empty>} LLM_hole=${_LLM_IP:-<none:public>}:${_LLM_PORT} spire=${_SPIRE_IP:-<none>} deny_rfc1918=${EGRESS_DENY_RFC1918:-false}"
-    if VPC_CIDR="${EGRESS_VPC_CIDR}" LITELLM_HOST="${_LLM_IP}" LITELLM_PORT="${_LLM_PORT}" \
-       SPIRE_SERVER="${_SPIRE_IP}" TAP_IFACE="tap+" DENY_RFC1918="${EGRESS_DENY_RFC1918:-false}" \
+    _TENANT_SUPERNET=""
+    if [ -n "${SUBNET_PREFIX:-}" ]; then
+      _TENANT_SUPERNET="${SUBNET_PREFIX}.0.0/16"
+    fi
+    log "step: #566 egress apply — VPC=${EGRESS_VPC_CIDR:-<empty>} LLM_hole=${_LLM_CIDR:-${_LLM_IP:-<none:public>}}:${_LLM_PORT} tenant=${_TENANT_SUPERNET:-<none>} spire=${_SPIRE_IP:-<none>} deny_rfc1918=${EGRESS_DENY_RFC1918:-false}"
+    if VPC_CIDR="${EGRESS_VPC_CIDR}" LITELLM_HOST="${_LLM_IP}" LITELLM_CIDR="${_LLM_CIDR}" \
+       LITELLM_PORT="${_LLM_PORT}" TENANT_SUPERNET="${_TENANT_SUPERNET}" SPIRE_SERVER="${_SPIRE_IP}" \
+       TAP_IFACE="tap+" DENY_RFC1918="${EGRESS_DENY_RFC1918:-false}" \
        bash /home/ubuntu/oc-egress-chain.sh apply; then
       log "step: #566 egress default-deny 已装(OPENCLAW-EGRESS)"
     else
@@ -710,14 +783,24 @@ fi
 chown -R ubuntu:ubuntu ${ASSETS}
 log "assets downloaded: rootfs=${ROOTFS_VER} ($((SECONDS-T0))s)"
 
-# Step 3c: Sync shared skills from S3
+# Step 3c: Sync shared skills from S3 by exact VersionId.
 log "step3c: syncing shared skills"
-mkdir -p /data/shared-skills
-aws s3 sync s3://${ASSETS_BUCKET}/skills/ /data/shared-skills/ --region ${REGION} 2>/dev/null || true
+aws s3 cp s3://${ASSETS_BUCKET}/deployment/scripts/sync-shared-skills.py \
+  /opt/openclaw/sync-shared-skills.py --region ${REGION} --no-progress 2>/dev/null || \
+  _s3_get s3://${ASSETS_BUCKET}/deployment/scripts/sync-shared-skills.py \
+    /opt/openclaw/sync-shared-skills.py
+chmod 0755 /opt/openclaw/sync-shared-skills.py
+mkdir -p /data/shared-skills /var/lib/openclaw
+_SKILL_SYNC="/usr/bin/python3 /opt/openclaw/sync-shared-skills.py --bucket ${ASSETS_BUCKET} --region ${REGION}"
+${_SKILL_SYNC} || log "WARN: initial shared skill sync failed; cron will retry"
 chown -R ubuntu:ubuntu /data/shared-skills
-# Cron job to sync skills every 5 minutes
-echo "*/5 * * * * root aws s3 sync s3://${ASSETS_BUCKET}/skills/ /data/shared-skills/ --region ${REGION} 2>/dev/null" > /etc/cron.d/openclaw-skills-sync
-log "shared skills ready ($(ls /data/shared-skills/ 2>/dev/null | wc -l) skills)"
+# The synchronizer compares exact S3 VersionIds/ETags, validates checksums, atomically
+# replaces files, and mirrors delete markers. aws s3 sync is size/time based and can
+# silently skip a same-size replacement.
+printf '*/5 * * * * root %s >>/var/log/openclaw-skills-sync.log 2>&1\n' \
+  "${_SKILL_SYNC}" > /etc/cron.d/openclaw-skills-sync
+chmod 0644 /etc/cron.d/openclaw-skills-sync
+log "shared skills ready ($(find /data/shared-skills -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l) skills)"
 
 # Step 4: Deploy launch/stop scripts
 log "step4: deploying scripts"

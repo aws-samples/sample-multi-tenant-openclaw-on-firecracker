@@ -11,7 +11,7 @@ agent {
     trust_domain = "{{TRUST_DOMAIN}}"
 
     # insecure_bootstrap:agent 不预置 server 的 CA bundle,首次连接信任 server 提供的
-    # bundle。本底座下这是**已知的退化点**(与上游 ByAI agent.conf 一致):真正的收紧办法
+    # bundle。本底座下这是**已知的退化点**(与上游参考 agent.conf 一致):真正的收紧办法
     # 是把 trust bundle 一起烤进 kit(bundle 是公开材料,不是密钥),届时改成
     # `trust_bundle_path = <kit>/bundle.crt` 并删掉本行(别在模板注释里写占位符语法:
     # bootstrap 的"残留占位符"门会把注释里的也算成未渲染)。

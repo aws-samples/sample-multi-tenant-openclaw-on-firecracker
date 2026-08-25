@@ -272,7 +272,7 @@
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
       "base_sha256": null,
-      "patch_sha256": "122d07d126b31cf7501ca86dd9bf8544253a9fb7734812d6cd2ec4c113250779",
+      "patch_sha256": "cfbe835e97acf264c6297791201f0ffde4922a27d84679933c13458fc0285807",
       "operations": [
         {
           "resource": "rootfs-golden-image:guest/agent.conf.tmpl (bake, no automated channel)",
@@ -635,7 +635,7 @@
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
       "base_sha256": null,
-      "patch_sha256": "c4b5bd281ffe386fb249ffa8916704c54be3fcce73a80064bfca64de0635eda1",
+      "patch_sha256": "24fec9c4ed8f2eeca02cbea37b3d264ddfade14d62eebe0844bc5ade6ac7e997",
       "operations": [
         {
           "resource": "s3:deployment/scripts/spire-kit/spire-join-broker.py",

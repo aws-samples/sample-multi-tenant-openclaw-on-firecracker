@@ -184,7 +184,14 @@ dispatch:
   mode: ddb # 写 assignments 表 + 一条 SSM 叫醒 host 自查(PutParameter 退热路径)
   esm_max_concurrency: 10 # SQS Lambda ESM 最大并发(2..1000)
   batching_window_seconds: 2 # 攒批降冷启开销(0..300)
-  max_batch_size: 30 # 单次 invoke 装箱租户数(1..10000)
+  # #562 硬约束(不是调优项):max_batch_size 必须 <= DISPATCH_HOST_LAUNCH_CONCURRENCY(默认 30)。
+  # 理由是算术的:SSM executionTimeout = min(ceil(batch/slots) x per_vm + 120, visibility - 60)。
+  # batch 一超过 slots 就跳一整轮 —— 31 个就变 136s,500 个变 256s,而创建死线总共只有 180s。
+  # 超出的后果不是变慢,是【孤儿 VM】:租户已被判死为 failed,host 侧 SSM 还在起 VM,
+  # 那台 VM 占容量、计费、没人认领,且 status 已是 failed 不在任何 creating 自愈扫描面里。
+  # 吞吐不用担心:30 x esm_max_concurrency(10) / 2s 窗口 ~= 150 TPS 消费能力。
+  # 由 scripts/checks/create-deadline-config.py --live 把这条变成会红的门。
+  max_batch_size: 30 # 单次 invoke 装箱租户数(1..10000);受上面硬约束限制
   dlq_max_receive_count: 3 # 进 DLQ 即告警(openclaw-dispatch-dlq-not-empty)
 
 scaler:

@@ -489,6 +489,10 @@ def build_auth(self, ctx):
                 # 不含 cognito:groups)。注入 pool id 供 AdminListGroupsForUser。空 → roleForUser
                 # docs 提交把 auth.py 回退掉),导致 console 全员降级 viewer、Pull 按钮消失。
                 "USER_POOL_ID": cognito_outputs.get("CognitoUserPoolId", ""),
+                # #572 — 控制面调用授权模式。默认 "apikey"(x-api-key,现状零回归);
+                # 设 "iam" 时 BFF 用自身 role 走 execute-api SigV4,供控制面 API Gateway
+                # 开启 IAM 鉴权后无缝适配(见下方 execute-api:Invoke 授权)。
+                "CTRL_API_AUTH_MODE": (auth_cfg.get("ctrl_api_auth_mode") or "apikey"),
             },
         )
         # 用 username 调 AdminListGroupsForUser。只读该动作,资源限本 user pool。
@@ -546,6 +550,17 @@ def build_auth(self, ctx):
                     "logs:DescribeLogGroups",
                 ],
                 resources=["*"],
+            )
+        )
+        # #572 — 控制面调用改走 execute-api SigV4(IAM 鉴权)时需要的最小权限。限本控制面
+        # REST API + v1 stage 任意 method/path。默认 apikey 模式下 BFF 不签名、此权限不生效;
+        # 开 CTRL_API_AUTH_MODE=iam 且控制面 method 设为 AuthorizationType.IAM 后 BFF 凭此调通。
+        console_bff_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["execute-api:Invoke"],
+                resources=[
+                    f"arn:{self.partition}:execute-api:{self.region}:{self.account}:{api.rest_api_id}/v1/*/*"
+                ],
             )
         )
         # (vm/host 日志)端点 + secret 读权限 + AOS SG 入站(auth 先于 observability

@@ -327,7 +327,13 @@ EC2 user-data 有 16 KB 上限，因此 `init-host.sh` 不再内联。CDK 把渲
 
 host 自举的几个要点：
 
-- **Firecracker 版本钉死 v1.15.1**（可经环境变量 `FC_VERSION` 覆盖），因为 latest 可能缺少 CI 验证过的 guest 内核。
+- **Firecracker 版本钉死 v1.15.1**，因为 latest 可能缺少 CI 验证过的 guest 内核。
+  #435 起**光设 `FC_VERSION` 环境变量已不足以换版本**：二进制取源改到自家 S3 后，安装前会对
+  tarball 强制校验钉死的 sha256，查不到该版本的摘要就 `die`（fail-closed，宁可卡住也不装
+  没核对过的二进制）。换版本的正确做法是编辑 `deploy/userdata/provision-host.sh`：同时改
+  `FC_VER` 与 `_fc_expected_sha()` 里对应架构的摘要，再重跑 `setup.sh` 把新版本镜像到 S3
+  （`setup.sh` 从该脚本解析版本号；传一个与之不一致的 `FC_VERSION` 会被直接拒绝，
+  以免镜像一个机队不要的版本却报成功）。
 - **shared skills 每 5 分钟 cron 同步**：`*/5 * * * * root aws s3 sync s3://<bucket>/skills/ /data/shared-skills/`。
 - **per-host SSH 密钥**：每台 host 生成一次 ed25519 密钥对，私钥留在 `/etc/openclaw/host_vm_key`，公钥注入每个 microVM 数据盘的 `.ssh/authorized_keys`。每个 microVM 只信任自己宿主的这把密钥。
 - **生命周期 hook 保护**：`init-host.sh` 绑定 EXIT trap，成功返回 CONTINUE、失败返回 ABANDON，防止破损 host 挂住 ASG；DDB 注册重试 10 次仍失败则 ABANDON 退出。

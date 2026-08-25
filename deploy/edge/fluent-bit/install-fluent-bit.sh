@@ -126,22 +126,49 @@ fi
 if [[ "$_fb_pulled" -gt 0 && -f "$_fb_stage/fluent-bit.conf" ]]; then
     # -print0 / read -d '': an object name containing a newline would otherwise be split
     # into two paths and install a file under a truncated name.
-    while IFS= read -r -d '' _abs; do
-        # Keep the prefix's relative layout: a flat install would break a config that
-        # references a script by a subdirectory path.
-        _rel="${_abs#"$_fb_stage"/}"
-        mkdir -p "$FB_CONF_DIR/$(dirname "$_rel")"
-        install -m 0644 "$_abs" "$FB_CONF_DIR/$_rel"
-    done < <(find "$_fb_stage" -type f -print0)
     _fb_source_dir="$_fb_stage"
     log "pulled ${_fb_pulled} object(s) for role=${FB_ROLE} from s3://${ASSETS_BUCKET}/${_s3_prefix}/"
+    #
+    # 为什么不是加 FB_LOCAL_DIR:下面那个 elif 只在【拉到 0 个对象】或【拉到的里面没有
+    # 成功 → 装上旧配置 → 本地兜底【永远不会触发】。baked fallback 只覆盖"缺失",不覆盖
+    #
+    # setup.sh 的 _obs_upload 本来就给每个对象打了 sha256= 与 git-commit= 元数据,所以
+    # "这台机器开机时装的是哪个 commit 的配置"一直是可知的,只是从没被记下来。记下来之后:
+    #   · 开机日志里直接可见:grep fb-config-version /var/log/openclaw-init.log
+    #   · 与 oc-consistency 的机队对账口径一致,能把"S3 stale"归因到具体 commit
+    #
+    # head-object 失败(权限/旧对象无元数据/网络)一律不影响安装:这是可观测性,不是准入门。
+    # 故 `|| echo` 兜底而不是 die —— 与本函数其余部分"S3 miss 才 fail-loud"的分工一致。
+    _fb_ver="$(aws s3api head-object --bucket "${ASSETS_BUCKET}" \
+        --key "${_s3_prefix}/fluent-bit.conf" --region "$FB_REGION" \
+        --query 'join(`|`, [Metadata."git-commit" || `no-git-commit`, Metadata."uploaded-at" || `no-uploaded-at`])' \
+        --output text 2>/dev/null || echo "head-object-failed|unknown")"
+    log "fb-config-version role=${FB_ROLE} ${_fb_ver} s3://${ASSETS_BUCKET}/${_s3_prefix}/"
 elif [[ -n "${FB_LOCAL_DIR:-}" && -f "${FB_LOCAL_DIR}/fluent-bit.conf" ]]; then
     log "WARN: S3 staged ${_fb_pulled} object(s) and no fluent-bit.conf among them; falling back to baked ${FB_LOCAL_DIR}"
-    install -m 0644 "${FB_LOCAL_DIR}"/* "$FB_CONF_DIR/"
     _fb_source_dir="$FB_LOCAL_DIR"
 else
     die "no Fluent Bit config for role=${FB_ROLE}: s3://${ASSETS_BUCKET:-<unset>}/${_s3_prefix}/ staged ${_fb_pulled} object(s) with no fluent-bit.conf, and no FB_LOCAL_DIR fallback"
 fi
+
+# ── 2b. Atomically replace the managed dir (#559) ────────────────────────
+# Build THIS run's set in a same-filesystem sibling and rename it into place, instead of
+# installing file-by-file over whatever a previous boot left. A per-file install let a stale
+# parsers.conf, an @INCLUDE target, or any name-referenced companion from the last boot
+# survive and answer for a file this run never fetched, so an incomplete S3 pull could pass
+# every check and start Fluent Bit on a mix of two generations (承 #531, which only closed the
+# `script` reference class). The rename is atomic on one filesystem, and on any failure below
+# (integrity checks or the dry-run) the trap restores the previous dir, so a bad pull never
+# leaves a half-set running.
+_fb_build="${FB_CONF_DIR}.new.$$"
+_fb_prev="${FB_CONF_DIR}.prev.$$"
+rm -rf -- "$_fb_build"
+mkdir -p "$_fb_build"
+cp -a "$_fb_source_dir/." "$_fb_build/"
+if [[ -e "$FB_CONF_DIR" ]]; then mv -- "$FB_CONF_DIR" "$_fb_prev"; fi
+mv -- "$_fb_build" "$FB_CONF_DIR"
+trap 'rm -rf -- "$_fb_stage" "$_fb_cp_err" "$_fb_build"; \
+      if [[ -n "${_fb_prev:-}" && -d "$_fb_prev" ]]; then rm -rf -- "$FB_CONF_DIR"; mv -- "$_fb_prev" "$FB_CONF_DIR"; fi' EXIT
 
 # ── 3. Render ${FB_*} placeholders from the environment ──────────────────
 # Generic: every FB_* env var replaces its ${FB_*} placeholder in the config.
@@ -215,11 +242,32 @@ while read -r _script; do
     [[ -f "$_script_path" ]] || die "fluent-bit.conf references a Lua script this run did not provide: ${_script} (looked in ${_fb_source_dir}; incomplete ${_s3_prefix}/ in S3?)"
 done < <(sed -nE 's/^[[:space:]]*script[[:space:]]+([^[:space:]]+)[[:space:]]*$/\1/p' "$FB_CONF_DIR/fluent-bit.conf")
 
+# #559 — parsers_file and @INCLUDE reference companion files by name too, and a stale one from
+# a previous boot must not answer for a file this run did not ship. Resolve them against the
+# managed set exactly like script refs above; naming the file beats the dry-run's bare "failed".
+# Fluent Bit config keys are case-insensitive (real host config uses `Parsers_File`), so match
+# the key case-insensitively; missing it would silently skip the check on a real config.
+while read -r _ref; do
+    [[ -n "$_ref" ]] || continue
+    case "$_ref" in
+        "$FB_CONF_DIR"/*) _ref_path="${_fb_source_dir}/${_ref#"$FB_CONF_DIR"/}" ;;
+        /*)               _ref_path="$_ref" ;;
+        *)                _ref_path="${_fb_source_dir}/$_ref" ;;
+    esac
+    [[ -f "$_ref_path" ]] || die "fluent-bit.conf references a file this run did not provide: ${_ref} (looked in ${_fb_source_dir}; incomplete ${_s3_prefix}/ in S3?)"
+done < <(sed -nE 's/^[[:space:]]*([Pp][Aa][Rr][Ss][Ee][Rr][Ss]_[Ff][Ii][Ll][Ee]|@[Ii][Nn][Cc][Ll][Uu][Dd][Ee])[[:space:]]+([^[:space:]]+)[[:space:]]*$/\2/p' "$FB_CONF_DIR/fluent-bit.conf")
+
 FB_BIN="$(command -v fluent-bit || true)"
 [[ -n "$FB_BIN" ]] || FB_BIN=/opt/fluent-bit/bin/fluent-bit
 [[ -x "$FB_BIN" ]] || die "fluent-bit binary not found after installation"
 "$FB_BIN" --dry-run -c "$FB_CONF_DIR/fluent-bit.conf" \
     || die "fluent-bit config dry-run failed"
+
+# #559 — checks and dry-run passed against the freshly-swapped dir: commit the replacement
+# by dropping the previous copy and disarming the restore.
+if [[ -n "${_fb_prev:-}" && -d "$_fb_prev" ]]; then rm -rf -- "$_fb_prev"; fi
+_fb_prev=""
+trap 'rm -rf -- "$_fb_stage" "$_fb_cp_err" "${_fb_build:-}"' EXIT
 
 # ── 4. Enable + (re)start ────────────────────────────────────────────────
 systemctl enable fluent-bit

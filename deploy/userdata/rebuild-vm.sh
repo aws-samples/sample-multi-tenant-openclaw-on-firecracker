@@ -47,6 +47,10 @@ RESULT="${OP_DIR}/result.json"
 DROP_MARKER="${OP_DIR}/overlay-dropped"
 TOMBSTONE="${OP_DIR}/overlay.ext4.tombstone"
 OVERLAY="${VM_DIR}/overlay.ext4"
+# #523 判据 4 — guest kernel 的实际字节。launch-vm.sh 把 kernel_image_path 指到
+# /home/ubuntu/firecracker-assets/vmlinux,那是 ${ASSET_ROOT}/vmlinux 的 symlink
+# (init-host.sh step3 建的),所以这里与 VM 真正引导的那个文件同一个 inode。
+GUEST_KERNEL="${OC_GUEST_KERNEL:-${ASSET_ROOT}/vmlinux}"
 TENANTS_TABLE="${TENANTS_TABLE:-openclaw-tenants}"
 REGION="${OC_REGION:-${AWS_REGION:-ap-northeast-1}}"
 
@@ -96,6 +100,8 @@ TARGET_ROOTFS_ID=""
 FC_PID=""
 FC_EXE_ID=""
 FC_START_TICKS=""
+FC_VERSION=""
+GUEST_KERNEL_SHA256=""
 OVERLAY_ID=""
 OVERLAY_FD_ID=""
 
@@ -117,6 +123,8 @@ write_result() {
     --arg firecracker_pid "${FC_PID}" \
     --arg firecracker_exe_dev_inode "${FC_EXE_ID}" \
     --arg firecracker_start_ticks "${FC_START_TICKS}" \
+    --arg firecracker_version "${FC_VERSION}" \
+    --arg guest_kernel_sha256 "${GUEST_KERNEL_SHA256}" \
     --arg overlay_dev_inode "${OVERLAY_ID}" \
     --arg overlay_fd_dev_inode "${OVERLAY_FD_ID}" \
     --arg tombstone_dev_inode "$(stat -Lc '%d:%i' "${TOMBSTONE}" 2>/dev/null || true)" \
@@ -136,6 +144,8 @@ write_result() {
         firecracker_pid: $firecracker_pid,
         firecracker_exe_dev_inode: $firecracker_exe_dev_inode,
         firecracker_start_ticks: $firecracker_start_ticks,
+        firecracker_version: $firecracker_version,
+        guest_kernel_sha256: $guest_kernel_sha256,
         overlay_dev_inode: $overlay_dev_inode,
         overlay_fd_dev_inode: $overlay_fd_dev_inode,
         tombstone_dev_inode: $tombstone_dev_inode,
@@ -257,7 +267,25 @@ collect_evidence() {
   FC_EXE_ID="$(stat -Lc '%d:%i' "${proc}/exe" 2>/dev/null || true)"
   FC_START_TICKS="$(awk '{print $22}' "${proc}/stat" 2>/dev/null || true)"
   OVERLAY_ID="$(stat -Lc '%d:%i' "${OVERLAY}" 2>/dev/null || true)"
+  # #523 判据 4 —— 采用证据的【版本维度】。
+  #
+  # 此前这里只记 dev+inode:那是 per-host 身份(证明"跑的就是这台机器上这个文件"),
+  # 跨 host 不可比。于是"两台 host 跑着两个不同的 Firecracker / 两个不同的 guest
+  # kernel"这件事在 rebuild 证据里【完全不可见】—— 证据照样齐全、照样 PASS。
+  # 而 create / rebuild / restart 三条路径全部经 launch-vm.sh 用同一个
+  # ${ASSETS}/vmlinux,所以同一租户在不同 host 上被重建,拿到的内核可能不同。
+  #
+  # 取值口径都取【正在跑的那个东西】,不取声称:
+  #   · 版本走 ${proc}/exe 而不是 /usr/local/bin/firecracker —— 前者是这个 VM 真正
+  #     在用的二进制(即便磁盘上那份已经被换掉/删掉),与上面 FC_EXE_ID 同一来源。
+  #   · 内核走 sha256 而不是 marker 里的 guest_kernel 名字。三个理由:名字只是
+  #     provision 写下的声称;`.ami-provisioned` 在 #389v2 之前的老 host 上根本不存在
+  #     (客户环境里正是这批机器最可能混版);而摘要还能抓到"同名不同字节"(CI 桶重新
+  #     发布过同名对象)这一档,名字抓不到。
+  FC_VERSION="$("${proc}/exe" --version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9._-]*' | head -1 || true)"
+  GUEST_KERNEL_SHA256="$(sha256sum "${GUEST_KERNEL}" 2>/dev/null | cut -d' ' -f1 || true)"
   [ -n "${FC_EXE_ID}" ] && [ -n "${FC_START_TICKS}" ] && [ -n "${OVERLAY_ID}" ] \
+    && [ -n "${FC_VERSION}" ] && [ -n "${GUEST_KERNEL_SHA256}" ] \
     || return 1
 
   local rootfs_seen=0
@@ -313,7 +341,7 @@ if [ "${launch_rc}" -ne 0 ]; then
 fi
 
 collect_evidence || {
-  write_result "FAILED" "Firecracker rootfs/overlay FD evidence did not match the pinned target"
+  write_result "FAILED" "Firecracker rootfs/overlay FD evidence did not match the pinned target, or the version evidence (firecracker_version / guest_kernel_sha256) could not be read"
   exit 72
 }
 assert_fence || finish_superseded

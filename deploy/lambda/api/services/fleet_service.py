@@ -24,6 +24,7 @@ import boto3
 from botocore.exceptions import ClientError
 from boto3.dynamodb.conditions import Attr, Key
 
+import core.ddb_scan as ddb_scan  # #432 —— Scan 必须翻页
 import core.clients as clients
 from core.clients import API_KEY_OWNER, GSI_TENANT_USER
 from core.utils import _resp, _now, _gen_id, _decode_next_token, _encode_next_token
@@ -42,7 +43,6 @@ def _authorize_user_scope(tenant_user_id, event):
                                         to when RBAC is disabled → single-tenant plane)
       • federated user, own id       → allowed (a user manages only their own nodes)
       • otherwise                    → denied (no cross-user fleet access)
-    #60 — key the cross-user guard off identity, not the RBAC_ENABLED flag, so
     disabling RBAC can never silently open one user's fleet to another.
     """
     if not tenant_user_id:
@@ -66,7 +66,6 @@ def _query_user_tenants(
     Returns (items, next_token). Soft-deleted tenants are filtered out. Paginates
     via the gsi_tenant_user index; the cursor is opaque to callers.
 
-    #108 IDOR fix: platform_scope(caller 的 platform 命名空间,None=未限定 admin)非空时
     只保留同 platform 的 tenant——与 list_tenants(handler.py:272)、_resolve_filter
     (fleet_service:456)同款 scope-first 结果过滤。否则 platform-scoped API key(解析成
     is_admin=True)能读任意其它 platform 用户的 fleet(_authorize_user_scope 的 is_admin
@@ -127,8 +126,6 @@ def fleet_power(body=None, event=None):
     host-agent reconcile loop + GET /hosts reflect the resulting state; we don't
     block the 29s API-GW window waiting for 380 VMs to settle.
     """
-    # Admin gate (#60 companion) — same decoupling as `_assert_owner_or_admin`:
-    # gate on identity only, not `RBAC_ENABLED`. Pre-#60 companion this read
     # `if RBAC_ENABLED and not ident.get("is_admin")`, so flipping RBAC off would
     # let any authenticated non-admin Cognito user POST /hosts/fleet-power and
     # stop EVERY microVM on every host (whole-fleet availability wipe — highest
@@ -154,12 +151,13 @@ def fleet_power(body=None, event=None):
 
     # All hosts that can hold VMs (active or idle). Strong read so a host that
     # JUST registered isn't missed (control-plane consistency, Phase 6).
-    hosts = clients.hosts_table.scan(
+    hosts = ddb_scan.scan_all(
+        clients.hosts_table,
         FilterExpression="#s IN (:a, :i)",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":a": "active", ":i": "idle"},
         ConsistentRead=True,
-    ).get("Items", [])
+    )
     host_ids = [h["instance_id"] for h in hosts if h.get("instance_id")]
     if not host_ids:
         return _resp(200, {"action": action, "hosts": 0, "message": "no active hosts"})
@@ -287,13 +285,22 @@ def fleet_power(body=None, event=None):
 
 
 def _execute_batch(action, target_ids, event):
-    """Run one action over a list of tenant ids; return (succeeded, failed).
+    """Run one action over a list of tenant ids; return (succeeded, failed, enqueued).
 
     Shared by the synchronous batch path and the async worker so both enforce
     the SAME per-id ownership (#80, via the threaded event) and failure
     isolation. delete routes to delete_tenant; everything else to tenant_action.
+
+    原因(issue #469 2026-08-12 评论实查):队列开启时 delete/stop/start 在这里返 202,
+    旧代码按 "<400 即成功" 把它计入 succeeded;之后 consumer 5 次重投失败进 DLQ,
+    而 job 记录【永远停在 succeeded】。于是 `GET /batch/jobs/{job_id}` 这个查询入口
+    本身会谎报 —— 它是 P5「380 个里有多少成功、多少卡住,事后无法从任何单一数据源查清」
+    的一个具体可修根因,也直接违反本 issue 验收第 6 条「部分失败注入:最终状态可查且收敛」。
+
+    本次只做到【不谎报】:把"已受理待执行"与"已完成"分开。让 job 记录随 consumer 的最终
+    结果更新,需要 consumer 侧回写 job_id(与 R2 批量编排耦合),留待 R2 一起做。
     """
-    succeeded, failed = [], []
+    succeeded, failed, enqueued = [], [], []
     for tid in target_ids:
         try:
             tenant = clients.tenants_table.get_item(
@@ -303,22 +310,25 @@ def _execute_batch(action, target_ids, event):
                 failed.append({"id": tid, "error": "tenant not found"})
                 continue
             if action == "delete":
-                # #263 — 批删削峰不在这里做:delete_tenant 入口已有入队短路(队列开+
                 # 非 consumer 重放 → 入队返 202)。同步批删与 async worker(run_batch_job
                 # 传 _caller_identity_memo,非 _consumer_ident)都命中它,逐 tid 秒入队,
-                # consumer 受控并发消费。202<400 计入 succeeded,{succeeded,failed} 结构不变。
+                # consumer 受控并发消费。
                 # 空 query 保持批删现状语义(软删保盘);真删盘走单删 ?keep_data=false。
                 result = tenant_service.delete_tenant(tid, {}, event)
             else:
                 result = tenant_service.tenant_action(tid, action, None, event)
-            if result.get("statusCode", 500) >= 400:
+            _code = result.get("statusCode", 500)
+            if _code >= 400:
                 err = json.loads(result.get("body", "{}")).get("error", "unknown error")
                 failed.append({"id": tid, "error": err})
+            elif _code == 202:
+                # 只表示"已入队",执行结果未知 —— 绝不能当成功报。
+                enqueued.append({"id": tid, "action": action})
             else:
                 succeeded.append({"id": tid, "action": action})
         except Exception as e:
             failed.append({"id": tid, "error": str(e)})
-    return succeeded, failed
+    return succeeded, failed, enqueued
 
 
 def _enqueue_batch_job(action, target_ids, event):
@@ -341,6 +351,8 @@ def _enqueue_batch_job(action, target_ids, event):
         "done": 0,
         "succeeded": [],
         "failed": [],
+        # 免得查询方在 worker 还没跑第一个 chunk 时遇到缺字段。
+        "enqueued": [],
         "status": "queued",
         "created_at": now,
         "updated_at": now,
@@ -349,7 +361,6 @@ def _enqueue_batch_job(action, target_ids, event):
         "actor_owner_id": ident.get("owner_id"),
         "actor_is_admin": bool(ident.get("is_admin")),
         "actor_tenant_user_id": ident.get("tenant_user_id"),
-        # #108 — carry the platform scope so the async worker enforces the SAME
         # per-platform namespace as the synchronous path. Without this a scoped
         # key's `async:true` batch replays with scope=None + is_admin=True and
         # deletes/stops ANY platform's tenants (cross-platform IDOR + privilege
@@ -397,7 +408,11 @@ def run_batch_job(job_id):
     job = clients.batch_jobs_table.get_item(Key={"job_id": job_id}).get("Item")
     if not job:
         return {"statusCode": 404, "body": "job not found"}
-    if job.get("status") in ("done", "running"):
+    # 但这条重投守卫只认 done/running —— 于是 Lambda 异步重投(它本身就会重试)会把
+    # 一个已经派发完的 job 从头再跑一遍,把每个 id 重新入队,消息量翻倍。
+    # dispatched 与 done 一样是【本函数已经做完自己那部分】的终态:区别只在于
+    # "同步做完" vs "已交给 consumer",两者都不该再被重投触发一次全量执行。
+    if job.get("status") in ("done", "dispatched", "running"):
         return {"statusCode": 200, "body": f"job {job_id} already {job['status']}"}
     action = job["action"]
     target_ids = list(job.get("ids", []))
@@ -411,58 +426,84 @@ def run_batch_job(job_id):
             "is_admin": bool(job.get("actor_is_admin")),
             "api_key_only": job.get("actor_owner_id") == API_KEY_OWNER,
             "tenant_user_id": job.get("actor_tenant_user_id"),
-            # #108 — restore the platform scope so the worker's per-tenant
             # _assert_owner_or_admin enforces the same namespace as the sync path.
             "platform_scope": job.get("actor_platform_scope"),
         }
     }
-    clients.batch_jobs_table.update_item(
-        Key={"job_id": job_id},
-        UpdateExpression="SET #s = :s, updated_at = :t",
-        ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":s": "running", ":t": _now()},
-    )
-    succeeded, failed = [], []
+    # 用 CAS 抢 claim,而不是"读到 queued 就无条件写 running"(codex 独立复审第二轮
+    # 抓出)。上面那个 status 检查是 check-then-act:两个并发的 Lambda 异步重投都能读到
+    # queued、都通过检查、都写 running,然后【每个操作执行两次】—— 对 delete 这类不可逆
+    # 动作,重复执行的后果不是"多做一遍"而是第二遍打在已删的租户上。
+    # 我上一轮加的 dispatched 守卫只挡【后到】的重投,挡不住【同时】的两个。
+    # 条件:status 必须仍是本函数读到的那个值。CCF = 别人已经抢到,直接返回不再执行。
+    _claim_from = job.get("status")
+    try:
+        clients.batch_jobs_table.update_item(
+            Key={"job_id": job_id},
+            UpdateExpression="SET #s = :s, updated_at = :t",
+            ConditionExpression="#s = :from",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":s": "running",
+                ":t": _now(),
+                ":from": _claim_from,
+            },
+        )
+    except clients.batch_jobs_table.meta.client.exceptions.ConditionalCheckFailedException:
+        return {
+            "statusCode": 200,
+            "body": f"job {job_id} already claimed by another worker (was {_claim_from})",
+        }
+    succeeded, failed, enqueued = [], [], []
     CHUNK = 25  # flush progress every CHUNK ids so the status endpoint is live
     for i in range(0, len(target_ids), CHUNK):
         chunk = target_ids[i : i + CHUNK]
-        s, f = _execute_batch(action, chunk, synthetic_event)
+        s, f, q = _execute_batch(action, chunk, synthetic_event)
         succeeded.extend(s)
         failed.extend(f)
+        enqueued.extend(q)
+        # 但查询方现在能区分【真做完了】与【只是收下了】。
         clients.batch_jobs_table.update_item(
             Key={"job_id": job_id},
-            UpdateExpression="SET done = :d, succeeded = :s, failed = :f, updated_at = :t",
+            UpdateExpression=(
+                "SET done = :d, succeeded = :s, failed = :f, enqueued = :q, "
+                "updated_at = :t"
+            ),
             ExpressionAttributeValues={
-                ":d": len(succeeded) + len(failed),
+                ":d": len(succeeded) + len(failed) + len(enqueued),
                 ":s": succeeded,
                 ":f": failed,
+                ":q": enqueued,
                 ":t": _now(),
             },
         )
+    # ("我把活派出去了",不等于活干完了)。旧代码一律标 done,那就是 P5 说的"事后无法
+    # 从任何单一数据源查清有多少卡住" —— 查询方看到 done 会以为收敛了。
+    # 让 dispatched 自己进一步收敛到 done/partial,需 consumer 回写 job_id,属 R2 范围。
+    _final = "dispatched" if enqueued else "done"
     clients.batch_jobs_table.update_item(
         Key={"job_id": job_id},
         UpdateExpression="SET #s = :s, updated_at = :t",
         ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":s": "done", ":t": _now()},
+        ExpressionAttributeValues={":s": _final, ":t": _now()},
     )
-    return {"statusCode": 200, "body": f"job {job_id} done"}
+    return {"statusCode": 200, "body": f"job {job_id} {_final}"}
 
 
 def _resolve_filter(flt, event=None):
     """Convert filter dict → list of matching tenant ids (excludes soft-deleted)."""
     items = (
-        clients.tenants_table.scan(
+        # 计数看着是成功的。filter 是 `status <> deleted`,命中集合几乎等于全表。
+        ddb_scan.scan_all(
+            clients.tenants_table,
             FilterExpression="#s <> :d",
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={":d": "deleted"},
-        ).get("Items", [])
+        )
         or []
     )
     items = [it for it in items if it.get("status") != "deleted"]
-    # issue #80 — owner scoping for non-admin batch callers.
-    # #60 — key off identity, not RBAC_ENABLED (RBAC off → API_KEY_OWNER admin →
     # is_admin skips the filter; a real non-admin stays scoped regardless).
-    # #108 — platform-scoped keys resolve is_admin=True but must NOT match the
     # whole fleet by filter (a scoped key would otherwise enumerate every
     # platform's tenant ids — they surface in the batch failed[] list — and, on
     # the async path, act on them). Filter to the caller's platform first, mirror

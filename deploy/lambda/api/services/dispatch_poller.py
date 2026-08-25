@@ -20,6 +20,7 @@ import shlex
 import time
 from typing import Any, Dict, List, Tuple
 
+import core.ddb_scan as ddb_scan  # #432 —— Scan 必须翻页
 import core.clients as clients
 import core.ssm_dispatch as ssm_dispatch
 from core.dispatch import normalize_spec
@@ -29,10 +30,12 @@ from services import dispatch_service as ds
 
 def _list_inflight_hosts() -> List[Dict[str, Any]]:
     """扫 hosts 有 dispatch_inflight 的记录。ConsistentRead 让下游 CAS 用最新值。"""
-    return clients.hosts_table.scan(
+    # 租户卡 creating 直到 900s reaper 兜底(push 模式下 poller 是唯一驱动)。
+    return ddb_scan.scan_all(
+        clients.hosts_table,
         FilterExpression="attribute_exists(dispatch_inflight)",
         ConsistentRead=True,
-    ).get("Items", [])
+    )
 
 
 def _query_assignments(instance_id: str, command_id: str) -> List[Dict[str, Any]]:
@@ -55,7 +58,6 @@ def _query_assignments(instance_id: str, command_id: str) -> List[Dict[str, Any]
 def _query_batch_tenants(command_id: str) -> List[Dict[str, Any]]:
     """按 dispatch_claim 反查一批租户(用于 push 模式清算+回滚)。GSI 未建时退化为 scan。
 
-    #412(codex review2 #6)—— 【全量翻页】(LastEvaluatedKey)且【读失败向上抛】,不再单页
     + 吞异常返 []:单页会漏掉 >1MB 或 FilterExpression 命中在后页的租户,吞异常返 [] 会让
     失败分支误判"batch 空 → 全落定 → 清 inflight",而残留预留仍占容量卡死。调用方对异常
     的处置(保留 inflight/不推进 retry)比"当空"安全。"""
@@ -115,12 +117,9 @@ def _get_ssm_status(command_id: str, instance_id: str) -> Tuple[str, Dict[str, A
 def _mark_running(tenant_id: str, instance_id: str, command_id: str) -> bool:
     """条件写 tenants: status creating→running,清 dispatch_claim/inflight 标记。
 
-    #412(codex review2 #1)—— 转 running 时【一并 REMOVE capacity_reservation_id】:
     VM 已真起,容量归 running 租户合法持有,后续由正常 delete 路径(按 item.vcpu 扣)回收。
 
-    #412(codex review3 #1)—— fence host_id=:self:promote 与令牌释放【互斥】,防复活已释放租户。
 
-    #412(codex review9 #2)—— ABA 闸【改用 capacity_reservation_id=:rid】(rid=command_id:tenant_id):
     host_id 单独不够——租户被释放后重投【落回同一 host】拿【新】预留(新 command_id、新 rid),本
     (旧 command)poller 迟到 promote 会 host_id=:self 命中 → 把【新预留】的租户按旧命令 promote、
     清掉新令牌 → VM/放置漂移 + 未记账容量。改锚 capacity_reservation_id=本命令的 rid:只 promote
@@ -162,7 +161,6 @@ def _mark_running(tenant_id: str, instance_id: str, command_id: str) -> bool:
 def _bump_retry(tenant_id: str, command_id: str) -> int:
     """dispatch_retries+=1 且清 dispatch_claim,返回新值。超预算调用方转 requires_intervention。
 
-    #412(codex review9 #3)—— fence dispatch_claim=:cid:只清【本命令】打的 claim。否则一个
     迟到的旧 poller 会清掉【新一轮 dispatch 刚打的 claim】,让新预留的活租户被后续误当 stale
     释放。CCF(claim 已被新命令接管)→ 返 -1,调用方跳过本租户的 retry/requeue(不误动新命令)。"""
     ccf = clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException
@@ -299,14 +297,12 @@ def _params_from_tenant(item: Dict[str, Any]) -> Dict[str, Any]:
 def poll_inflight() -> Dict[str, Any]:
     """扫在途命令,推进终态或回滚。返回统计 dict(供指标/日志)。
 
-    #315 SPLIT_BY_MODE(codex 判):**ddb 模式直接空转返回**。ddb 下 host-agent reconciler
     (每 5s 查 assignment 表)是 promote/重投的主驱动,dispatch 不写 inflight 标量;poller 若在
     ddb 下动容量(_rollback_host 按 batch 盲扣)会错扣被其他并发命令占用的槽位(codex 上轮 Error),
     900s reaper 只能事后修、中间过度装箱。故 ddb 模式 poller 不碰租户状态/assignment/host 容量。
     push 模式(无 assignment 表 + 无 host-agent reconciler)poller 仍是唯一 promote/回滚驱动,照常跑。
     """
     if clients.DISPATCH_MODE.lower() == "ddb":
-        # #315(codex review6)—— ddb 模式 poller 纯空转:host-agent reconciler(每 5s 查
         # assignment 表)是 promote/重投的唯一驱动;dispatch 不写 inflight 标量(_try_reserve_host
         # write_inflight=False),_snapshot_hosts(gate_inflight=False)也【忽略】残留 inflight。
         # 故 ddb 稳态下 inflight 标量对调度完全无害,无需 drain。曾在 review4 加过一次性 drain
@@ -350,10 +346,8 @@ def poll_inflight() -> Dict[str, Any]:
                 for tid in reported:
                     _mark_running(tid, instance_id, command_id)
             else:
-                # 老脚本无 tenants 报告 → claim 反查降级 promote。#412 review2 #6:反查
                 # 现在会抛;成功路径 VM 真起了,反查失败就跳过降级 promote(host-agent 5s
                 # 自愈仍会 promote),不阻断下方 inflight 清理。
-                # #412 review3 #2:一个 command_id 跨多 host,降级 promote 必须【按 host_id 收窄】
                 # ——否则会把落在【别台 host】、命令还在跑的租户提前 promote、清其令牌,毁其失败回滚。
                 try:
                     for t in _query_batch_tenants(command_id):
@@ -363,7 +357,6 @@ def poll_inflight() -> Dict[str, Any]:
                     print(f"[poller] success-path batch scan {instance_id} failed "
                           f"(host-agent will promote): {e}")
             # 清 host inflight 标记(不回滚容量:VM 真起了)。
-            # #315 guard(codex A_NEEDS_GUARD):去掉 host 级 inflight 门后,一台 host 可同时有
             # 多条并发在途命令,dispatch_inflight/dispatch_ssm_cid 是标量 last-write-wins。清理
             # 必须带 CAS 条件"当前值仍是本 poller 观测到的那条"(dispatch_inflight=:cid AND
             # dispatch_ssm_cid=:sc),否则本 poller 读到旧命令、处理期间新命令已覆盖标记,无条件
@@ -389,7 +382,6 @@ def poll_inflight() -> Dict[str, Any]:
             _cleanup_manifest_best_effort(command_id, instance_id)
             stats["success"] += 1
         elif status in ("Failed", "TimedOut", "Cancelled"):
-            # #412(codex review #1)—— 一个 command_id 可跨多台 host(dispatch_batch 一次
             # invocation 给多台 host 各发一条命令、共用同一 command_id)。本 poller 迭代只处理
             # 【本 host(instance_id)】这条 SSM 命令的终态,故必须把 batch 收窄到 host_id==本 host
             # 的租户——否则会错误释放/重投别台 host 上还在跑的租户,扣错 host 账本、毁其放置。
@@ -399,13 +391,11 @@ def poll_inflight() -> Dict[str, Any]:
                     if t.get("host_id") == instance_id
                 ]
             except Exception as e:  # noqa: BLE001
-                # #412(codex review2 #6)—— 反查失败:不能当 batch 空(那会误清 inflight、
                 # 搁浅残留预留)。保留 inflight + 跳过本 host,下轮 poll 重试反查。
                 print(f"[poller] batch scan {instance_id} cmd={command_id} failed, "
                       f"retain inflight, retry next poll: {e}")
                 stats["still_running"] += 1
                 continue
-            # #412(review7 #1 + review8 #1)—— 命令级 Failed/TimedOut/Cancelled ≠ 每个 VM 都没起。
             # 安全规则:**只释放 launch-all v2 报告【明确列为 failed】的租户**;launched/skipped 的
             # promote;其余(报告没提到的 unknown / 老脚本无报告 / TimedOut/Cancelled 根本没解析
             # stdout)一律【既不释放也不 promote,保留 creating + 令牌】,交 _reap_stuck_creating
@@ -459,7 +449,6 @@ def poll_inflight() -> Dict[str, Any]:
                     continue
                 if ds._release_reservation(t["id"], instance_id, rid, v, m) == ds.RELEASE_RETRY:
                     # 瞬时失败:令牌可能仍占容量。本轮【不动】该租户的 claim/inflight/retry
-                    # (codex review2 #3:_bump_retry 会清 claim → 下轮 poll 反查不到、令牌搁浅、
                     # 最终误 requires_intervention 逃出 reaper 覆盖)。保留 claim+inflight,靠下轮
                     # poll 重新反查同一 command_id 再释放(令牌仍在 → 幂等消费一次)。
                     all_settled = False
@@ -473,7 +462,6 @@ def poll_inflight() -> Dict[str, Any]:
             for t in settled:
                 new_retries = _bump_retry(t["id"], command_id)
                 if new_retries < 0:
-                    # #412 review9 #3:claim 已被【新一轮 dispatch】接管 → 本租户已归新命令,
                     # 旧 poller 不再计 retry/重投它(否则会踩新预留)。跳过。
                     continue
                 if new_retries > clients.DISPATCH_RETRY_BUDGET:

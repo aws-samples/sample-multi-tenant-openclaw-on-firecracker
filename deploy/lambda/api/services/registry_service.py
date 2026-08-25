@@ -10,7 +10,10 @@ DDB 表 `openclaw-param-registry`(env PARAM_REGISTRY_TABLE):
 回滚 = 只移指针。读路径单次 Query 全分区,内存里按指针选中快照,不做长缓存。
 """
 
+import hashlib
+import json
 import os
+import re
 
 from boto3.dynamodb.conditions import Key
 
@@ -51,7 +54,6 @@ SHIPPED_DEFAULT_ENTRIES = {
     # sensitive=false:baseUrl 是端点地址不是密钥,明文注入(校验层对非敏感 config 值
     #   放行明文,不强求 base64/enc:v1: — 否则 http://host:4000/v1 会被 base64 门拒)。
     # 空值 → empty_fallback=LITELLM_HOST_DEFAULT:host 回退平台全局 LITELLM_HOST
-    #   (兼容不自带网关的租户,行为与现状一致)。#198 R15(ae758f86)误删致复发,补回。
     "llm_base_url": {
         "param_class": "config",
         "injection_target": "models.providers.litellm.baseUrl",
@@ -83,6 +85,20 @@ SHIPPED_DEFAULT_ENTRIES = {
         "sensitive": True,
         "required": False,
     },
+}
+
+# allow-list: passing it never authorizes a config.  The target OpenClaw binary
+# remains the authoritative validator in launch-vm.sh's pre-rebuild probe.
+FORBIDDEN_BY_PIN = {
+    "2026.2.26": {
+        "agents.defaults.heartbeat.isolatedSession",
+        "agents.defaults.heartbeat.lightContext",
+        "agents.defaults.compaction.midTurnPrecheck",
+        "agents.defaults.compaction.maxActiveTranscriptBytes",
+        "plugins.entries.sentinel-guard.hooks.allowConversationAccess",
+    },
+    "2026.6.11": set(),
+    "2026.7.1-2": set(),
 }
 
 
@@ -157,7 +173,6 @@ def ensure_named_seeded(config_template):
     指针"时补种,让"console 存模板"="可用模板"。entries 复用 SHIPPED_DEFAULT_ENTRIES
     (凭据注入路径通用);要非标 entries 仍可 admin POST /registry/{tpl} 覆盖。
     幂等 + 并发撞车吞 TransactionCanceledException,与 ensure_default_seeded 同。
-    #198 R15(ae758f86)误删致复发,补回。
     """
     items = _query_all(config_template)
     if any(i["sk"] == "current" for i in items):
@@ -204,6 +219,140 @@ def load_current_snapshot(config_template):
     return version, snap["entries"]
 
 
+def load_snapshot(config_template, version=None):
+    """#429 读取指定不可变快照;version=None 时解析 current。
+
+    返回 ``(version, entries, metadata)``。metadata 只含快照发布时可取得的 body
+    证据;reapply 仍会在受理期 HEAD S3 绑定【当前】VersionId,因为模板上传与 registry
+    publish 是两条独立链路。default body 烤在镜像里,没有 S3 metadata。
+    """
+    items = _query_all(config_template)
+    if version is None:
+        current = next((i for i in items if i["sk"] == "current"), None)
+        if current is None:
+            if config_template == DEFAULT_TEMPLATE:
+                ensure_default_seeded()
+            else:
+                ensure_named_seeded(config_template)
+            items = _query_all(config_template)
+            current = next((i for i in items if i["sk"] == "current"), None)
+        if current is None:
+            raise LookupError(f"registry: no current pointer for {config_template}")
+        version = int(current["current_version"])
+    else:
+        if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+            raise ValueError("config_template_version must be a positive integer")
+    snap = next((i for i in items if i["sk"] == f"snapshot#{version}"), None)
+    if snap is None:
+        raise LookupError(
+            f"registry: missing snapshot#{version} for {config_template}"
+        )
+    metadata = {
+        key: snap.get(key, "")
+        for key in ("body_version_id", "body_etag", "body_sha256")
+        if snap.get(key)
+    }
+    return int(version), snap["entries"], metadata
+
+
+def _template_body_key(config_template):
+    return f"templates/openclaw/{config_template}/openclaw.json"
+
+
+def _head_named_template(config_template):
+    bucket = os.environ.get("ASSETS_BUCKET", "")
+    if not bucket:
+        raise LookupError("registry: ASSETS_BUCKET is not configured")
+    response = clients.s3.head_object(
+        Bucket=bucket,
+        Key=_template_body_key(config_template),
+    )
+    version_id = str(response.get("VersionId") or "")
+    if not version_id or version_id == "null":
+        raise LookupError(
+            f"registry: template body for {config_template} has no S3 VersionId"
+        )
+    return bucket, version_id, str(response.get("ETag") or "").strip('"')
+
+
+def load_template_body(config_template, expected_version_id=None):
+    """#429 绑定并读取模板 body。
+
+    named: HEAD 取得当前 VersionId,随后用 VersionId GET,保证预筛/探针/提交指向同一
+    字节。若 worker 带 expected_version_id,仍 HEAD 检查当前对象未漂移后再按该版本读。
+    default:body 来自目标镜像 data-template,控制面只返回 host-baked sentinel。
+    """
+    if config_template == DEFAULT_TEMPLATE:
+        return None, {
+            "host_baked": True,
+            "body_version_id": "",
+            "body_sha256": "",
+            "body_etag": "",
+        }
+    bucket, current_version_id, etag = _head_named_template(config_template)
+    if expected_version_id and current_version_id != expected_version_id:
+        raise LookupError(
+            f"registry: template body VersionId changed for {config_template}"
+        )
+    version_id = expected_version_id or current_version_id
+    response = clients.s3.get_object(
+        Bucket=bucket,
+        Key=_template_body_key(config_template),
+        VersionId=version_id,
+    )
+    raw = response["Body"].read()
+    if not isinstance(raw, bytes):
+        raw = bytes(raw)
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"registry: template body for {config_template} is not valid UTF-8 JSON"
+        ) from exc
+    if not isinstance(body, dict):
+        raise ValueError(
+            f"registry: template body for {config_template} must be a JSON object"
+        )
+    return body, {
+        "host_baked": False,
+        "body_version_id": version_id,
+        "body_sha256": hashlib.sha256(raw).hexdigest(),
+        "body_etag": etag,
+    }
+
+
+def forbidden_paths_for_version(openclaw_version):
+    """Return the fast-reject denylist, or None when the version is unclassified."""
+    version = str(openclaw_version or "").strip()
+    exact = FORBIDDEN_BY_PIN.get(version)
+    if exact is not None:
+        return set(exact)
+    match = re.fullmatch(r"2026\.(\d+)\.(\d+)(?:-\d+)?", version)
+    if not match:
+        return None
+    month, patch = (int(part) for part in match.groups())
+    if (month, patch) >= (6, 11):
+        return set()
+    return None
+
+
+def find_forbidden_paths(body, forbidden):
+    """Return full dotted paths present in body that match the denylist."""
+    hits = []
+
+    def walk(node, prefix=""):
+        if not isinstance(node, dict):
+            return
+        for key, value in node.items():
+            dotted = f"{prefix}.{key}" if prefix else str(key)
+            if dotted in forbidden:
+                hits.append(dotted)
+            walk(value, dotted)
+
+    walk(body)
+    return hits
+
+
 def publish_snapshot(config_template, entries):
     """追加 snapshot#<version+1> 并原子推进 current 指针,返回新 version。
 
@@ -223,6 +372,19 @@ def publish_snapshot(config_template, entries):
         "created_at": _now(),
         "entries": entries,
     }
+    # reapply binding (template upload and registry publish remain decoupled).
+    if config_template != DEFAULT_TEMPLATE and os.environ.get("ASSETS_BUCKET"):
+        try:
+            _body, body_binding = load_template_body(config_template)
+            snapshot_item.update(
+                {
+                    key: body_binding[key]
+                    for key in ("body_version_id", "body_etag", "body_sha256")
+                    if body_binding.get(key)
+                }
+            )
+        except Exception:  # noqa: BLE001 — preserve existing publish availability
+            pass
     if current:
         pointer_leg = {
             "Update": {

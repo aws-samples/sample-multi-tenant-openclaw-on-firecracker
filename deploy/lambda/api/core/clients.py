@@ -4,15 +4,62 @@
 
 从 handler.py 机械搬迁,逐字不变:boto3 client / DDB 表句柄 / env 常量 /
 条件建的 sqs client。其它 core 域 `from core.clients import ssm, tenants_table, ...`。
-按 design.md 层间契约:本层是最底叶子,只 import stdlib + boto3,不 import 仓内任何东西。
+按 design.md 层间契约:本层是最底叶子,只 import stdlib + boto3/botocore,不 import 仓内任何东西。
 facade:handler.py re-export 全部符号,旧 patch/调用路径全程有效。
 """
 
 import json
 import os
 import boto3
+from botocore.config import Config as _BotoConfig
 
-ssm = boto3.client("ssm")
+# ── #565 G1-a:同步 invoke backup Lambda 专用的 botocore 配置(单一定义点)────────
+#
+# **为什么必须显式给**:三处同步备份调用点原先用裸 `boto3.client("lambda")`,吃 botocore
+# 默认 `read_timeout=60`。而 backup 侧的真实上界是 **~305s** —— `backup/handler.py` 的
+# `_ssm_run` 墙钟 = `sleep(5)` + `(300 // 3)` 轮 × `sleep(3)`,且 `backup-data.sh` 自己
+# 写着「控制面给本脚本的预算是 300s」。于是任何超过 60s 的备份都会在【backup 侧仍在预算
+# 内】时被调用侧掐掉,而那次备份**会继续跑完并写 S3** → 调用侧按 fail-closed 判失败并回滚
+# → 上层看到失败、底层其实备成功了。这正是 #565 G1-a 要判的那条。
+#
+# **read_timeout 取值口径**(#565 G1 重算过一次,原值 330 已不够):
+#
+#   read_timeout = backup 侧 SSM 墙钟预算 300s
+#                + 最后一次 get_command_invocation 自身的最坏耗时 ~71s
+#                + 余量 ~49s
+#                = 420s        (仍 < 两侧 Lambda 自身的 900s 外壳,不冲突)
+#
+# 那个 71s 是**算出来的**:#573 给两个 ssm client 都加了
+# `retries={"max_attempts": 8, "mode": "adaptive"}`(防 SendCommand 节流毒 DLQ,那件事本身
+# 是对的),于是单次调用被节流时最坏要等 7 次重试的指数退避。botocore `ExponentialBackoff`
+# 的 `_MAX_BACKOFF=20`、基数 2 → `1+2+4+8+16+20+20 = 71s`(本机 botocore 1.43.66 逐项
+# 实测 `delay_amount` 确认)。adaptive 的客户端 token-bucket 限速还在这之上,所以 420 是
+# 「够用」而不是「上界证明」—— 真正的硬上界是 900s 外壳。
+#
+# **原值 330 为什么不够**:它按「backup 侧上界 = 305s」算,而那个 305 来自
+# `sleep(5) + (300//3) 轮 × sleep(3)` —— **轮数**上限。#573 之后一轮可能 74s,那个算式就
+# 不再是上界。本轮把两处 `_ssm_run`(`backup/handler.py` 与 `core/ssm_dispatch.py`)改成
+# 真实墙钟 deadline,`timeout` 才重新成为可算的预算,这个 420 才有意义。
+#
+# 注:这个数只保证「不比 backup 侧先放弃」,**不代表业务死线** —— 客户给 suspend/restore 的
+# 180s 档比它还小,那个矛盾归 #565 G1/G2 判决(本轮把它量成数、写进文档,不擅自改死线)。
+#
+# **retries 刻意取 0(只试一次)**,理由是重试比白等更坏:第二次 invoke 会撞
+# `backup-data.sh` 的 per-tenant flock(`flock -w 30` → `exit 1`),于是 SSM Failed →
+# backup 返回一个【成功的 HTTP 响应】携带 `success=False` → botocore 见到成功响应即停止
+# 重试 → 调用侧在约 100s 拿到一个**错误的权威失败**,比真相到达得更快。重试把「不确定」
+# 变成了「错误的确定」,而 fail-closed 会据此回滚一次本可成功的备份。
+# 取 0 而不是 1:本机 botocore 1.43.66 实测真实尝试次数 —— `0 → 1 次`、`1 → 2 次`、
+# `mode=standard + 1 → 2 次`、裸 client → **5 次**(≈ 5×60s + 退避 ≈ 311s 白等)。
+BACKUP_SYNC_INVOKE_CONFIG = _BotoConfig(
+    connect_timeout=10,
+    read_timeout=420,
+    retries={"max_attempts": 0},
+)
+
+ssm = boto3.client(
+    "ssm", config=_BotoConfig(retries={"max_attempts": 8, "mode": "adaptive"})
+)
 
 s3 = boto3.client("s3")
 
@@ -157,6 +204,11 @@ FAMILY_ORDER = tuple(
 MEM_SAFETY_FLOOR_RATIO = float(os.environ.get("MEM_SAFETY_FLOOR_RATIO", 0.0))
 
 MEM_CHECK_TTL_SEC = int(os.environ.get("MEM_CHECK_TTL_SEC", 300))
+
+# #549 — host 心跳(last_seen)新鲜度门 TTL(秒)。last_seen 超期的 host 不再被选中放新租户
+# 只在此处读默认,不接 stack/config —— 同步(_find_host)与队列(_snapshot_hosts)两条路径
+# 共享同一 core.clients,默认一致就不会对"哪台算陈旧"产生 config 漂移。
+HOST_SEEN_STALE_SEC = int(os.environ.get("HOST_SEEN_STALE_SEC", 600))
 
 VM_DEFAULT_VCPU = int(os.environ.get("VM_DEFAULT_VCPU", 2))
 
@@ -314,6 +366,19 @@ DISPATCH_UPGRADE_GRACE_SEC = int(
 # (ApproximateReceiveCount >= 此值)直接收敛 requires_intervention(loud),不让宽限掩盖卡死。
 DISPATCH_MAX_RECEIVE_COUNT = int(
     os.environ.get("DISPATCH_MAX_RECEIVE_COUNT", "3") or "3"
+)
+
+# #564 G6 —— lifecycle 队列的 maxReceiveCount,由 CDK 从队列 RedrivePolicy 的**同一个值**
+# 注入(`lambdas.py` 的 `_LIFECYCLE_MAX_RECEIVE`)。消费侧靠它判断"这是不是最后一次投递":
+# 最后一次失败之后消息就进 DLQ,而**进 DLQ 之前必须先把租户回写成终态** —— 不然 DLQ 里那条
+# 消息成了唯一记录,租户永久停在 suspending/restoring/deleting,而客户只看到一个非终态。
+#
+# 默认 5 与 CDK 当前值一致,但**默认值不是真相** —— 它只是 env 缺失时的兜底(本地测试、
+# 或队列没开时压根走不到消费侧)。真相在 CDK,漂移由 `tests/test_564_g6g7_dlq_backup.py`
+# 的一条断言机械比对(正则从 `lambdas.py` 抓 `_LIFECYCLE_MAX_RECEIVE` 的字面值)。
+# 形态照上面 dispatch 那条(#522)—— 同一条"投递耗尽即收敛"的思路,只是换了队列。
+LIFECYCLE_MAX_RECEIVE_COUNT = int(
+    os.environ.get("LIFECYCLE_MAX_RECEIVE_COUNT", "5") or "5"
 )
 
 # 认领标记的死锁回收阈值:claim 打上后消费中途炸批,消息重投时旧 claim 超过

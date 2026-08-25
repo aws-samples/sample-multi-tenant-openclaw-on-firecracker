@@ -250,17 +250,44 @@ def host_guard(tenant_id, operation_id, fence_epoch):
         "Item.lifecycle_fence_epoch.N,Item.active_lifecycle_until.N]\" "
         "--output text 2>/dev/null"
     )
-    return (
+    # ⑯ 整段必须包成【一个复合命令】(codex 独立复审第十轮)。
+    #
+    # 调用方一律把它拼进 `&&` 链,例如
+    #   f"{self_heal} && {guard} && /home/ubuntu/delete-vm.sh ..."
+    # 而本段是多条 `;` 分隔的语句,第一条是 `_LF=$(...) || _LF=""`。不分组时 shell 按
+    # 等优先级从左到右结合,于是那一行实际变成:
+    #   (self_heal && _LF=$(...)) || _LF=""
+    # self_heal 失败 → `&&` 短路 → 整个表达式假 → `|| _LF=""` 执行并【成功返回 0】→
+    # 后面 `;` 分隔的语句照常跑下去。也就是说**前置命令的失败被这段吞掉了**:
+    # 自愈装载失败、甚至 stop-vm.sh 失败,都可能不再阻断后续的破坏性动作。
+    # 对 suspend 而言后果是"删了活 VM 的盘却报 suspended"。
+    #
+    # 这是既有形态(delete/rebuild/reset/migrate 的拼法都一样),我第九轮把 suspend 也接
+    # 上去时把它一起继承了。改在【源头】而不是各调用点:`{ ...; }` 让整段成为单个复合
+    # 命令,退出码取最后一条语句,`&&`/`||` 于是与整段结合 —— 每个调用点都随之变正确,
+    # 不必逐处加括号(那种改法漏一处就等于没改)。
+    body = (
         f'_LF=$({read_cmd}) || _LF=""; '
         f'if [ -z "$_LF" ]; then _LF=$({read_cmd}) || _LF=""; fi; '
         '[ -n "$_LF" ] || { echo "LIFECYCLE_FENCE_READ_FAILED" >&2; exit 78; }; '
         '_LF_OWNER=$(printf "%s" "$_LF" | cut -f1); '
         '_LF_EPOCH=$(printf "%s" "$_LF" | cut -f2); '
         '_LF_UNTIL=$(printf "%s" "$_LF" | cut -f3); '
+        #
+        # 三种情形都退 79,退出码一列没变;变的只是哨兵串,而哨兵串决定调用方要不要重投:
+        # owner/epoch 不符 = 另一个【活着的】op 持有租约,它会把活做完 → 不该重投;
+        # 租约过期 = 【没有】owner → 必须有人重投。原来 owner 判在前,于是「过期【且】
+        # owner 还是别人」这一档打出 LIFECYCLE_SUPERSEDED,而那个 owner 的租约本身也已
+        # 过期、不会再动 —— host 级批量删除据此不重投,租户就永久钉在 deleting
+        #
+        # 对既有 9 条在役路径【行为逐字不变】:它们只看零/非零,而每一档的退出码都还是 79。
+        # 与 host 侧 deploy/userdata/lib/lifecycle-guard.sh 同步重排,两份实现的
+        # equivalence 门(tests/test_241_..._adversarial.py)据此仍然成立。
+        '[ -n "$_LF_UNTIL" ] && [ "$_LF_UNTIL" -gt "$(date +%s)" ] || '
+        '{ echo "LIFECYCLE_FENCE_EXPIRED" >&2; exit 79; }; '
         f'[ "$_LF_OWNER" = {q(operation_id)} ] || '
         '{ echo "LIFECYCLE_SUPERSEDED owner=$_LF_OWNER" >&2; exit 79; }; '
         f'[ "$_LF_EPOCH" = {q(str(int(fence_epoch)))} ] || '
-        '{ echo "LIFECYCLE_SUPERSEDED epoch=$_LF_EPOCH" >&2; exit 79; }; '
-        '[ -n "$_LF_UNTIL" ] && [ "$_LF_UNTIL" -gt "$(date +%s)" ] || '
-        '{ echo "LIFECYCLE_FENCE_EXPIRED" >&2; exit 79; }'
+        '{ echo "LIFECYCLE_SUPERSEDED epoch=$_LF_EPOCH" >&2; exit 79; }'
     )
+    return f"{{ {body}; }}"

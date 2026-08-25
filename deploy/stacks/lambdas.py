@@ -2,9 +2,12 @@
 # SPDX-License-Identifier: MIT-0
 
 import json as _json
+import sys as _sys
+from pathlib import Path as _Path
 
 import aws_cdk as cdk
 from aws_cdk import (
+    aws_cloudwatch as cloudwatch,
     aws_dynamodb as dynamodb,
     aws_lambda as _lambda,
     aws_apigateway as apigw,
@@ -15,6 +18,7 @@ from aws_cdk import (
     aws_sns as sns,
     aws_wafv2 as wafv2,
     aws_sqs as sqs,
+    aws_ssm as ssm,
     aws_secretsmanager as secretsmanager,
     aws_lambda_event_sources as lambda_event_sources,
     BundlingOptions,
@@ -25,6 +29,13 @@ from aws_cdk import (
 )
 
 from stacks._helpers import _build_vpc, _sam_build_image_for_host, _read_pyproject_version
+
+# #564 G5 —— 死线口径模块(env 名与七档操作的单一真相)。import 真模块而不是在 CDK 里
+# 复制一份字符串拼接:两边各拼一次就会出现「注入了 A、代码读 B」这种静默失效。
+# 同款做法与理由见 `scripts/checks/create-deadline-config.py:65`。
+# 它是纯函数 + 零 boto3,synth 期 import 无副作用(导入期那两条 assert 只校验算术)。
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[1] / "lambda" / "api"))
+import core.create_deadline as _create_deadline  # noqa: E402
 
 
 def build_lambdas(self, ctx):
@@ -195,6 +206,25 @@ def build_lambdas(self, ctx):
     _lifecycle_q_enabled = bool(
         CFG.get("scaler", {}).get("lifecycle_queue_enabled", False)
     )
+    # #564 G6 —— maxReceiveCount 的**单一来源**。
+    #
+    # 消费侧要知道"这是不是最后一次投递"(最后一次失败后消息就进 DLQ,而进 DLQ 之前必须先
+    # 把租户回写成终态,否则 DLQ 里那条消息就是唯一记录、租户永远卡在中间态)。原来这个 5
+    # 在本文件里手写了**三处**且互不同源:队列的 `max_receive_count`、上面 :237 的注释、
+    # 下面 :260 告警文案里的 "after 5 receives"。再让消费侧抄第四份,就是让「backstop 提前
+    # 误终态 / 静默进 DLQ」这两个方向的漂移都变成必然 —— dispatch 侧
+    # (`dispatch_infra.py:188-191`)的注释逐字记了同一件事,它的处置是把值存进一个变量再
+    # 分发到队列与消费侧 env。这里照同一形态办。
+    #
+    # **为什么不额外加一个 `config.yml` 键**(dispatch 侧那条链是从 config 起的):这个数没有
+    # 任何"每部署不同"的需求,加一个没人要求可调的键属于投机性灵活度;而 plan 的要求是
+    # 「消费侧不许硬写 5」,CDK 已经拥有这个值(它建 RedrivePolicy 用的就是它),所以 CDK
+    # 就是那个单一来源。将来真需要 per-deployment 可调,从 CFG 读一行即可。
+    #
+    # 也**不在运行时读队列的 RedrivePolicy**:那是在热路径上加一次 `get_queue_attributes`,
+    # 等于给每批消息加一次可被节流的 AWS 调用 —— #573 刚为同类事故打过补丁。
+    _LIFECYCLE_MAX_RECEIVE = 5
+
     lifecycle_dlq = None
     lifecycle_queue = None
     if _lifecycle_q_enabled:
@@ -216,6 +246,76 @@ def build_lambdas(self, ctx):
             content_based_deduplication=True,
             retention_period=Duration.days(14),
         )
+        #
+        # 这个资源【此前不存在】,但 deploy/stacks/alarms.py 有三处注释声称它在本文件里
+        # (`:7` / `:16-17` / `:182`),`:259` 还用 `self.node.try_find_child("LifecycleDlqAlarm")`
+        # 去给它挂 SNS action —— 找不到就被 `isinstance` 检查静默跳过。于是 lifecycle
+        # (2026-08-12)实查确认了这个缺口。
+        #
+        # construct id 必须【逐字】是 "LifecycleDlqAlarm"(不是 LifecycleDLQAlarm)——
+        # alarms.py:259 按这个字符串查找,拼写不一致等于这个告警继续没人挂 topic。
+        # 形态与 dispatch 侧对称(dispatch_infra.py:386 DispatchDlqAlarm):
+        # Maximum > 0 / 1 个周期 / 缺数据点不算触发。
+        cloudwatch.Alarm(
+            self,
+            "LifecycleDlqAlarm",
+            alarm_name="openclaw-lifecycle-dlq-not-empty",
+            metric=lifecycle_dlq.metric_approximate_number_of_messages_visible(
+                period=Duration.minutes(1),
+                statistic="Maximum",
+            ),
+            threshold=0,
+            evaluation_periods=1,
+            comparison_operator=(
+                cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD
+            ),
+            treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+            # **CloudWatch 硬约束:`AlarmDescription` ≤ 1024 字符。**
+            # 这条上限**不由 CDK synth 校验**,是 CloudWatch API 在部署时才拒 —— 所以
+            # `cdk synth`、`mechanical-gate`、`pytest-highrisk` 会全绿而 `cdk deploy` 必炸
+            # (真机实撞:2026-08-24 us-west-2,本描述 1117 字符 → UPDATE_FAILED →
+            # 整个栈 UPDATE_ROLLBACK_COMPLETE,`gitlab/bb` 一度部署不动)。
+            # 判据因此下移到源码断言(`tests/test_532_dlq_alarm_locatable.py` 的
+            # `test_alarm_description_fits_cloudwatch_limit`):它按 AST 算出拼接后的真实
+            # 长度,不依赖 aws-cdk-lib 装没装 —— synth 那条断言是 `importorskip`,在没装
+            # CDK 的 CI 上会被 skip,拿它守这条上限等于没守。
+            #
+            # 完整排障步骤不属于这个字段:1024 字符装不下一份 runbook。这里只留
+            # 「谁在自动收敛 / 谁需要人 / 从哪个查询开始」,细节走 GET /tenants/{id} 与
+            # api Lambda 日志的 `delete-reconciler:` 前缀。
+            alarm_description=(
+                "openclaw-lifecycle-dlq has a message — the lifecycle consumer gave "
+                f"up after {_LIFECYCLE_MAX_RECEIVE} receives; a tenant's "
+                "suspend/restore/delete/rebuild never completed. "
+                # #532 —— 原文写的是「…and **nothing else will retry it**」。delete 那一支
+                # 从 #532 起不成立:services/delete_reconciler 定时扫「deleting +
+                # delete_retryable + claim/租约都已过期」并重新入队,有界。告警若还说
+                # 「没人会重试」,运维会按「必须人工介入」去处置一件系统正在自动收敛的事 ——
+                # 那正是本仓反复踩的「文案声称了系统不做的事」。
+                #
+                # 同时补上 AC 要求的**可定位信息**:告警本身是队列深度指标,带不了
+                # tenant/op/error,所以这里点名「去哪儿查」。那些字段都在租户行上,而
+                # GET /tenants/{id} 返回整行(只剔 _TENANT_SECRET_FIELDS),故控制台/API 直接可见。
+                "DELETE is auto-reconciled: services/delete_reconciler re-enqueues "
+                "status=deleting AND delete_retryable=true rows once both the delete "
+                "claim and the lifecycle lease expire. It is bounded and sets "
+                "delete_redrive_exhausted when it gives up — that flag, not this "
+                "alarm, is when a human is required. "
+                "suspend/restore/rebuild have NO reconciler and DO need a human. "
+                # Codex 独立复审 blocker-3:原文只给了 GET /tenants/{id} —— 那**预设你已经
+                # 知道是哪个租户**,而告警是队列深度指标,恰恰不告诉你租户是谁。所以必须先给
+                # 一个**能找出候选租户**的入口。`status` 是受支持的 query 字段且走 gsi_status
+                # (tenant_query_service.py:17/21),所以下面这条是真能跑的,不是示意。
+                "This alarm cannot name a tenant, so START with "
+                "GET /tenants?status=deleting — the stuck ones have "
+                "delete_retryable=true. Then GET /tenants/{id} for "
+                "delete_fail_reason, delete_fail_at, delete_redrive_attempts, "
+                "delete_redrive_exhausted, delete_intent. Cross-check the api Lambda "
+                "logs for the 'delete-reconciler:' prefix (tenant, op_id, attempt, "
+                "intent) and the consumer's logs; a stuck suspending/restoring also "
+                "raises OpenClaw/Lifecycle LifecycleStuckMarked."
+            ),
+        )
         lifecycle_queue = sqs.Queue(
             self,
             "LifecycleQueue",
@@ -230,7 +330,7 @@ def build_lambdas(self, ctx):
             # (沿用仓库 "timeout+60s" 惯例)。非重动作处理完即删,不受影响。
             visibility_timeout=Duration.seconds(960),
             dead_letter_queue=sqs.DeadLetterQueue(
-                max_receive_count=5, queue=lifecycle_dlq
+                max_receive_count=_LIFECYCLE_MAX_RECEIVE, queue=lifecycle_dlq
             ),
         )
 
@@ -324,6 +424,65 @@ def build_lambdas(self, ctx):
     if backup_bucket is not None:
         _api_env["BACKUP_BUCKET"] = backup_bucket.bucket_name
 
+    # #564 G5 —— 七档生命周期死线注入 api / lifecycle-consumer(两者共用 `_api_env`)。
+    #
+    # 客户明文:「需要可以参数化,**改 Lambda env 即可修改每个 lifecycle 配置**」。此前
+    # create 的 180 是 `create_deadline.py` 的 Python 常量,另外六个操作压根没有死线。
+    #
+    # **env 名从模块的 `env_name_for()` 取,不在这里另拼字符串** —— 两边各拼一次就会出现
+    # 「CDK 注入了 A、代码读 B」这种静默失效(注入了没人读的 env,而读的那个永远走默认值)。
+    # import 真模块的先例在 `scripts/checks/create-deadline-config.py:65`,那里的注释写得
+    # 更直白:「import 真模块,它改了这里自动跟着改」。
+    #
+    # 值的来源是 `config.yml` 的 `lifecycle.deadline_sec`(同源,见该段注释);缺段/缺项时
+    # **不注入那一档**,运行时回落到模块里同样那份客户表格值 —— 存量部署的 synth 因此只多出
+    # config 里真的写了的那些 key,不会凭空多七个。
+    #
+    # 插入位置必须在下面 `api_fn` 的 `environment=dict(_api_env)` 之【前】:那两处 `dict()`
+    # 是快照,而 `CREATE_VIA_QUEUE` 就是在两次快照之间加的 —— 所以只有 consumer 拿到它。
+    # 加在这里两个 Lambda 才都有。
+    _dl_cfg = (CFG.get("lifecycle") or {}).get("deadline_sec") or {}
+    for _dl_action in _create_deadline.DEADLINE_ACTIONS:
+        if _dl_action in _dl_cfg:
+            _api_env[_create_deadline.env_name_for(_dl_action)] = str(
+                int(_dl_cfg[_dl_action])
+            )
+
+    # #564 G5 —— 死线值的**运行时载体**:SSM Parameter Store。与上面的 env 同源、同一段
+    # config(`lifecycle.deadline_sec`),缺项就两个载体都不建/不注入。
+    #
+    # **为什么 env 不够、必须再加一个载体**:客户要的是「改配置即生效」,而真机实测证明改
+    # Lambda env 做不到 —— 流量走 `live` 别名 → 已发布版本,而**已发布版本的 env 是冻结的**
+    # (实测:改 `$LATEST` 的 `DEFAULT_NO_JWT_ROLE`,等 75s,请求仍按旧版本的值判权)。
+    # 那是一个**看不见的失败**:运维以为改了,线上跑的是另一个数。
+    # 参数则立即生效,运维用 `aws ssm put-parameter --overwrite` 直接改、不等 stack update ——
+    # 与 `dispatch_infra.py` 的 andon 急停参数逐字同款的理由。
+    #
+    # 建参数时给默认值(照 andon 那条:"防首启读空被憋死"),运行时读不到就回落 env/代码默认。
+    # **参数名从 `param_name_for()` 取,不在这里另拼字符串** —— 与上面 env 名同一条理由:
+    # 两边各拼一次就会出现「CDK 建了 A、运行时读 B」,参数建好了没人读、而读的那个永远
+    # ParameterNotFound → 一路静默回落默认。
+    #
+    # 下次 `cdk deploy` 会把手改的值覆盖回 config —— 那是刻意的(config 才是长期真相),
+    # 漂移由 `create-deadline-config.py --live` 的复检兜。
+    for _dl_action in _create_deadline.DEADLINE_ACTIONS:
+        if _dl_action not in _dl_cfg:
+            continue
+        ssm.StringParameter(
+            self,
+            f"LifecycleDeadlineSec{_dl_action.capitalize()}",
+            parameter_name=_create_deadline.param_name_for(_dl_action),
+            string_value=str(int(_dl_cfg[_dl_action])),
+            description=(
+                f"openclaw lifecycle deadline for '{_dl_action}' in seconds. "
+                "Edit with `aws ssm put-parameter --overwrite` for an immediate "
+                "effect (no redeploy). Read by api/lifecycle-consumer via "
+                "core/deadline_config.py with a 60s in-process cache; an illegal "
+                "value fails the request loudly instead of silently falling back. "
+                "cdk deploy resets it to config.yml lifecycle.deadline_sec."
+            ),
+        )
+
     api_fn = _lambda.Function(
         self,
         "ApiHandler",
@@ -362,6 +521,28 @@ def build_lambdas(self, ctx):
         timeout=Duration.seconds(900),
         memory_size=2048,
         environment=dict(_api_env),
+        # #564 G6 ② —— 异步调用的失败出口。**这个函数会自调用**(`InvocationType="Event"`,
+        # 六处:rebuild worker、host/fleet/rolling-upgrade 的后台任务、手动备份派发),而在
+        # 这之前它**没有任何** DLQ / on-failure destination —— 异步 worker 里抛出的未处理
+        # 异常在 AWS 重试耗尽后**无声消失**,没有一处能观测到。#565 的现状小节逐字记了这个
+        # 缺口(「通道 C/D 的失败无声消失」),而它同时是 #564 G6 的第二半。
+        #
+        # **只开 DLQ,不动 `retry_attempts` / `max_event_age`**(与 plan 的括号里那句不同,
+        # 理由如下):
+        #   · `retry_attempts` 的默认 2 次是**承重的**:`handler.py` 自己的注释写着
+        #     「异步 Lambda 调用对函数抛错自动重试 2 次 → 重试 = 同 job 第二个 worker」,
+        #     而 rebuild 的幂等恢复(op_id + 生命周期围栏 + host 账本)正是建立在"重试会
+        #     resume 同一次 rebuild"上。改这个数会改掉那条设计的前提,不在本 issue 范围。
+        #   · `max_event_age` 会一次作用到**全部六处**自调用,而它们各有各的时间假设
+        #     (rolling upgrade 的后台任务与一次 rebuild 不是同一个量级)。挑一个数套所有,
+        #     是我从 #564 的原文里推不出来的改动;而"陈旧事件不该执行"这件事 G3 已经用
+        #     消费前的死线检查解决了(过期的 rebuild 不执行)。
+        #
+        # 顺带记一个**既有**的版本偏斜(不是本次引入,只报告):自调用走的是
+        # `os.environ["AWS_LAMBDA_FUNCTION_NAME"]`——**不带 qualifier**,即 `$LATEST`;
+        # 而 API GW 与 SQS 事件源只认 `live` 别名指向的已发布版本。部署期间"API 走版本 N、
+        # 异步 worker 走 $LATEST"是可能的。DLQ 挂在函数上,对 `$LATEST` 的调用同样生效。
+        dead_letter_queue_enabled=True,
     )
     pagination_secret = secretsmanager.Secret(
         self,
@@ -487,6 +668,26 @@ def build_lambdas(self, ctx):
             resources=["*"],
         )
     )
+    # #564 G5 —— 读七档死线参数。**资源必须精确到这个前缀,绝不能宽到 `/openclaw/*`。**
+    #
+    # AWS 文档(GetParametersByPath)明文:「If a user has access to a path, then the user can
+    # access all levels of that path… **Even if a user has explicitly been denied access in IAM
+    # for parameter `/a/b`, they can still call the GetParametersByPath API operation
+    # recursively for `/a` and view `/a/b`**」—— 路径权限**向下穿透,而且显式 Deny 拦不住**。
+    # 授到 `/openclaw/*` 就等于让 api role 能递归读 `/openclaw/litellm-host` 与 dispatch 的
+    # SecureString manifest 前缀。代码侧也用 `Recursive=False` 配合。
+    #
+    # api_fn 现有的参数权限在 `dispatch_infra.py:318` —— 那条收窄到 dispatch 前缀,
+    # **不覆盖**本前缀,所以这里是必要的加法而不是重复授权。
+    # lifecycle_consumer 共用 `_api_env`、读同一份参数,所以它也要(见下面它自己的授权处)。
+    _dl_param_policy = iam.PolicyStatement(
+        actions=["ssm:GetParametersByPath"],
+        resources=[
+            f"arn:aws:ssm:{self.region}:{self.account}:"
+            f"parameter{_create_deadline.PARAM_PREFIX}*"
+        ],
+    )
+    api_fn.add_to_role_policy(_dl_param_policy)
     if clawpool_cmk is not None:
         clawpool_cmk.grant_encrypt_decrypt(api_fn)
         api_fn.add_to_role_policy(
@@ -546,6 +747,11 @@ def build_lambdas(self, ctx):
         _create_via_queue = bool(CFG.get("scaler", {}).get("create_via_queue", False))
         api_fn.add_environment("CREATE_VIA_QUEUE", str(_create_via_queue).lower())
         _api_env["CREATE_VIA_QUEUE"] = str(_create_via_queue).lower()
+        # #564 G6 —— 把队列真实的 maxReceiveCount 注给消费侧,让它能判断"这是不是最后一次
+        # 投递"。**只给 consumer,不给 api_fn**:产端不需要这个数,给了就等于多一个会漂的副本。
+        # 与队列的 RedrivePolicy 同源(见 `_LIFECYCLE_MAX_RECEIVE` 的说明)—— 两处各写死会让
+        # backstop 要么提前误判终态、要么永远判不到而消息静默进 DLQ。
+        _api_env["LIFECYCLE_MAX_RECEIVE_COUNT"] = str(_LIFECYCLE_MAX_RECEIVE)
         # 给 api_fn 发队列权限用**独立 iam.Policy 资源**(非 grant_send_messages、
         # 非 add_to_role_policy)。原因:那两者都往 api role 的 DefaultPolicy 注入
         # 对 queue 的依赖,而 API GW ApiDeployment 间接依赖 api role/Lambda,queue
@@ -560,6 +766,39 @@ def build_lambdas(self, ctx):
                     # 需要它;原来只有 SendMessage → 面板 depth 静默返 null(fail-soft 吞了 AccessDenied)。
                     actions=["sqs:SendMessage", "sqs:GetQueueAttributes"],
                     resources=[lifecycle_queue.queue_arn],
+                )
+            ],
+        )
+        # ---------- #532 卡住的 delete 对账:rate(15 minutes) → api_fn ----------
+        # 消费「host 侧删除失败后保留的 `delete_retryable=true` + claim 已过期」这组行,
+        # 按落库的 `delete_intent` 重新入队。没有这一拍,消息进 DLQ(maxReceiveCount=5)
+        # 之后就没人接手 —— 即使根因已修,租户永久停在 `deleting`,只能人工再点一次删除
+        # (issue 真机实例:ap-southeast-1 两个租户,脚本补回 S3 后仍卡着)。
+        #
+        # **落在这个 if 里面是刻意的**:本对账的前提是"删除走过异步队列、可能进 DLQ"。
+        # 队列没开时 delete 同步跑完,不存在这个形态,建一条每 15 分钟空转的规则是纯浪费。
+        # 于是被 `dispatch.enabled`(出厂 false)门控,而它需要的其实只是 api Lambda 本身;
+        # 这条只跟它真正依赖的开关绑定。
+        #
+        # 15 分钟不是随手取的:`_DELETE_CLAIM_TTL_SECONDS = 900`(tenant_service),所以一行
+        # 最迟在上次尝试后 15 分钟变成"claim 已过期"= 可收敛;扫描节拍与它对齐即可,更密只会
+        # 撞 CCF 空转。× `DELETE_REDRIVE_MAX_ATTEMPTS = 10` ≈ 覆盖 2.5 小时的运维往返。
+        events.Rule(
+            self,
+            "DeleteReconcilerRule",
+            schedule=events.Schedule.rate(Duration.minutes(15)),
+            description=(
+                "#532 redrive deletes stuck in `deleting`. Fires api_fn with "
+                "{source:'delete.reconciler'} to re-enqueue rows left with "
+                "delete_retryable=true and an expired claim after the lifecycle "
+                "queue exhausted its retries into the DLQ."
+            ),
+            targets=[
+                targets.LambdaFunction(
+                    api_fn,
+                    event=events.RuleTargetInput.from_object(
+                        {"source": "delete.reconciler"}
+                    ),
                 )
             ],
         )
@@ -593,11 +832,21 @@ def build_lambdas(self, ctx):
                     ],
                 ),
             ),
-            # 360s:suspend 同步 RequestResponse invoke backup Lambda(其 timeout=900s,见
-            # backup_fn :1496)+ stop-vm(30s)+ rm(30s);restore 同步 _ssm_run launch(300s)。
-            # 360s 会把合法执行硬杀在中途、卡中间态(suspending/restoring)。提到 Lambda 上限
-            # 900s 覆盖最坏 backup 预算(与 delete 的删前备份同款同步 invoke,既有已接受模式);
-            # 队列 visibility(:232)同步提到 >900s 防重投叠加。rebuild(300s)等旧动作不受影响。
+            # 360s:suspend 同步 RequestResponse invoke backup Lambda + stop-vm(30s)+
+            # rm(30s);restore 同步 _ssm_run launch(300s)。360s 会把合法执行硬杀在中途、
+            # 卡中间态(suspending/restoring)。队列 visibility(:232)同步提到 >900s 防重投叠加。
+            # rebuild(300s)等旧动作不受影响。
+            #
+            # #565 G1-a 更正 —— 原注释写「提到 Lambda 上限 900s **覆盖最坏 backup 预算**」,
+            # 那是个错前提:同步 invoke 的实际上界从来不是被调方的 timeout,而是**调用侧的
+            # socket read_timeout**。在本 issue 之前那三处调用点用裸 client、吃 botocore
+            # 默认 60s,于是 900 这个数在同步路径上永远到不了。
+            # 两个 900s 的角色因此要分清:
+            #   · 本 consumer 的 900s 与 backup_fn 的 900s 都是**外壳上界**(进程被杀的那条线),
+            #     不是任何一段预算;
+            #   · 同步备份这一段的预算由调用侧 read_timeout 决定 —— 现为 330s,取值口径见
+            #     `core/clients.BACKUP_SYNC_INVOKE_CONFIG`。
+            # 真实业务死线(客户口径 180s/600s)仍未落地,归 #564 与 #565 G1。
             timeout=Duration.seconds(900),
             memory_size=2048,
             # 限流阀:consumer 并发上限 = SSM/host 可承受速率(削峰核心)
@@ -664,14 +913,25 @@ def build_lambdas(self, ctx):
         # 与 api_fn 的 backup_bucket.grant_read 对称补上(consumer 只读备份,写归 backup Lambda)。
         if backup_bucket is not None:
             backup_bucket.grant_read(lifecycle_consumer)
+        # #564 G5 —— consumer 复用 `_api_env` 且读同一份死线参数,所以必须和 api_fn 一样授权。
+        # AccessDenied 后静默回落默认值 —— 客户改了参数、api 侧生效了、consumer 侧没生效,
+        # 而两边跑的是同一份代码,日志上极难看出来。资源同样精确到死线前缀(穿透风险见上)。
+        lifecycle_consumer.add_to_role_policy(_dl_param_policy)
         lifecycle_queue.grant_consume_messages(lifecycle_consumer)
         # consumer emits the create-latency SLA metric on the create path.
+        # create_via_queue 时会执行完整 create_tenant,那条路径上 dispatch_service 也可能
+        # 发熔断指标(DispatchCircuitOpen),命名空间不在条件里就会被 IAM 拒。
         lifecycle_consumer.add_to_role_policy(
             iam.PolicyStatement(
                 actions=["cloudwatch:PutMetricData"],
                 resources=["*"],
                 conditions={
-                    "StringEquals": {"cloudwatch:namespace": "OpenClaw/ControlPlane"}
+                    "StringEquals": {
+                        "cloudwatch:namespace": [
+                            "OpenClaw/ControlPlane",
+                            "OpenClaw/Dispatch",
+                        ]
+                    }
                 },
             )
         )
@@ -769,12 +1029,22 @@ def build_lambdas(self, ctx):
     # add_to_role_policy 合并到这里(下方 ec2_policy 那行已删)。
     _attach_shared_policies(api_fn)
     # Phase 2 — emit the TenantCreateLatencySeconds SLA metric. PutMetricData
-    # can't be resource-scoped (no ARNs), so it's namespace-conditioned to
-    # OpenClaw/ControlPlane to keep it least-privilege.
+    # can't be resource-scoped (no ARNs), so it's namespace-conditioned to keep it
+    # least-privilege.
+    #
+    # `OpenClaw/ControlPlane`,所以任何发到 `OpenClaw/Dispatch` 的指标都被 IAM 拒:
+    #     AccessDenied ... not authorized to perform: cloudwatch:PutMetricData
+    # `DispatchCircuitOpen`(熔断信号)用的就是那个 namespace,也就是说**熔断指标一直发不出去**,
+    # 而它的 except 是 fail-safe(打日志不抛),所以这件事从未响过。
+    # 用 namespace 列表而不是放开 `*`:least-privilege 不因为多一个命名空间而放弃。
     cw_metrics_policy = iam.PolicyStatement(
         actions=["cloudwatch:PutMetricData"],
         resources=["*"],
-        conditions={"StringEquals": {"cloudwatch:namespace": "OpenClaw/ControlPlane"}},
+        conditions={
+            "StringEquals": {
+                "cloudwatch:namespace": ["OpenClaw/ControlPlane", "OpenClaw/Dispatch"]
+            }
+        },
     )
     api_fn.add_to_role_policy(cw_metrics_policy)
     # vkeys. Scoped to the configured secret (or all secrets named
@@ -826,32 +1096,58 @@ def build_lambdas(self, ctx):
     # ========== API Gateway ==========
     # VPCE 创建前移到主 API 定义之前;network_vpc.py 后续只从 ctx 读取同一 VPC。
     vpc = _build_vpc(self, CFG.get("network", {}) or {})
-    _priv_vpce_sg = ec2.SecurityGroup(
-        self,
-        "ExecuteApiVpceSg",
-        vpc=vpc,
-        description="execute-api VPCE - HTTPS 443 from within VPC only (issue 122)",
-        allow_all_outbound=False,
-    )
-    _priv_vpce_sg.add_ingress_rule(
-        ec2.Peer.ipv4(vpc.vpc_cidr_block),
-        ec2.Port.tcp(443),
-        "HTTPS from VPC CIDR to execute-api VPCE",
-    )
-    _execute_api_vpce = ec2.InterfaceVpcEndpoint(
-        self,
-        "ExecuteApiVpce",
-        vpc=vpc,
-        service=ec2.InterfaceVpcEndpointAwsService.APIGATEWAY,  # = execute-api
-        private_dns_enabled=True,
-        security_groups=[_priv_vpce_sg],
-        open=False,  # 不自动按 CIDR 放行,完全由上面 SG 控
-    )
+    _api_cfg = CFG.get("api", {}) or {}
+    # AWS 硬规则:同一 VPC 同一服务只允许一个开 private DNS 的 Interface VPCE。导入客户已有
+    # VPC 时那里常常已经有一个 execute-api 端点(别的系统在用),而这里原来是**无条件**自建 →
+    # CreateVpcEndpoint 被拒(`private-dns-enabled cannot be set because there is already a
+    # conflicting DNS domain`)→ 整栈回滚,且上游没有任何开关能让它复用。真机在 2026-08-13
+    # 首次部署时实撞过一次,只能改代码才继续。
+    # 默认 true = 保持存量行为(自建),所以既有部署不受影响。
+    _create_execute_api_vpce = bool(_api_cfg.get("create_execute_api_vpce", True))
+    _reuse_vpce_id = str(_api_cfg.get("execute_api_vpce_id", "") or "").strip()
+    if _create_execute_api_vpce:
+        _priv_vpce_sg = ec2.SecurityGroup(
+            self,
+            "ExecuteApiVpceSg",
+            vpc=vpc,
+            description="execute-api VPCE - HTTPS 443 from within VPC only (issue 122)",
+            allow_all_outbound=False,
+        )
+        _priv_vpce_sg.add_ingress_rule(
+            ec2.Peer.ipv4(vpc.vpc_cidr_block),
+            ec2.Port.tcp(443),
+            "HTTPS from VPC CIDR to execute-api VPCE",
+        )
+        _execute_api_vpce = ec2.InterfaceVpcEndpoint(
+            self,
+            "ExecuteApiVpce",
+            vpc=vpc,
+            service=ec2.InterfaceVpcEndpointAwsService.APIGATEWAY,  # = execute-api
+            private_dns_enabled=True,
+            security_groups=[_priv_vpce_sg],
+            open=False,  # 不自动按 CIDR 放行,完全由上面 SG 控
+        )
+    else:
+        # fail-loud:PRIVATE RestApi 必须绑定一个 execute-api VPCE。少了 id 而放它过去,
+        # 得到的是一个「建成了但谁都调不到」的 API —— 那比 synth 报错难查得多。
+        if not _reuse_vpce_id:
+            raise ValueError(
+                "api.create_execute_api_vpce=false 时必须同时给 api.execute_api_vpce_id "
+                "(要复用的那个 private-DNS execute-api 端点的 vpce-xxxx)。查法:"
+                "aws ec2 describe-vpc-endpoints --filters Name=vpc-id,Values=<VPC> "
+                "Name=service-name,Values=com.amazonaws.<REGION>.execute-api "
+                "--query 'VpcEndpoints[?PrivateDnsEnabled==`true`].VpcEndpointId'"
+            )
+        _execute_api_vpce = ec2.InterfaceVpcEndpoint.from_interface_vpc_endpoint_attributes(
+            self,
+            "ImportedExecuteApiVpce",
+            vpc_endpoint_id=_reuse_vpce_id,
+            port=443,
+        )
     cdk.CfnOutput(
         self, "ExecuteApiVpceId", value=_execute_api_vpce.vpc_endpoint_id
     )
 
-    _api_cfg = CFG.get("api", {}) or {}
     _vpce_allowlist = [
         str(v).strip()
         for v in (_api_cfg.get("vpce_ids") or [])
@@ -859,6 +1155,10 @@ def build_lambdas(self, ctx):
     ]
     if not _vpce_allowlist:
         _vpce_allowlist = [_execute_api_vpce.vpc_endpoint_id]
+    elif not _create_execute_api_vpce and _reuse_vpce_id not in _vpce_allowlist:
+        # #496 — 复用的端点必须在放行名单里。写了 vpce_ids 却漏掉被复用的那个,请求会从
+        # 它进来并被 aws:SourceVpce 条件拒成 403:栈是 CREATE_COMPLETE,API 却谁都调不通。
+        _vpce_allowlist = [*_vpce_allowlist, _reuse_vpce_id]
     # 调用方没有 IAM identity policy 提供 Allow,故 PRIVATE endpoint 必须由 resource
     # policy 显式 Allow,否则两侧都沉默会隐式拒绝、全部 403。安全评审结论仍成立:
     # 绝不加无条件 Allow AnyPrincipal;这里的 Allow 绑死 aws:SourceVpce 白名单,
@@ -1305,6 +1605,11 @@ def build_lambdas(self, ctx):
     fleet_power_resource = hosts_resource.add_resource("fleet-power")
     fleet_power_resource.add_method("POST", _li(), **key_required)
 
+    # #566 拆分② — fleet guest 出网防火墙运维 API:POST /hosts/egress
+    # (mode=deny|off,一次改全部或指定 host 的 OPENCLAW-EGRESS 链)。api-key admin 门。
+    egress_resource = hosts_resource.add_resource("egress")
+    egress_resource.add_method("POST", _li(), **key_required)
+
     # #517 stage 4 — submit a bounded rolling upgrade and poll its progress.
     rolling_upgrade_resource = hosts_resource.add_resource("rolling-upgrade")
     rolling_upgrade_resource.add_method("POST", _li(), **key_required)
@@ -1392,6 +1697,20 @@ def build_lambdas(self, ctx):
             tenants_table.table_arn,
         ],
     ))
+    # LifecycleStuckUnconfirmed)。真机冒烟实测:不加这条会 AccessDenied,指标发不出去
+    # → 那两个 CloudWatch 告警永远没有数据点 = 卡死仍然只能等客户报障,P6 白做。
+    # TransactWriteItems 漏加是同一类坑,注释一并留在这里。
+    # cloudwatch:PutMetricData 不支持资源级限制(只能 "*"),故用 condition 把它锁死在
+    # 本项目自己的 namespace 上,避免这个角色能往任意 namespace 写指标。
+    health_fn.add_to_role_policy(
+        iam.PolicyStatement(
+            actions=["cloudwatch:PutMetricData"],
+            resources=["*"],
+            conditions={
+                "StringEquals": {"cloudwatch:namespace": "OpenClaw/Lifecycle"}
+            },
+        )
+    )
     audit_table.grant_write_data(health_fn)
     assets_bucket.grant_read(health_fn)  # 1.3.1: list backups for failover
     if notifications_topic is not None:
@@ -1411,6 +1730,15 @@ def build_lambdas(self, ctx):
         )
     )
     _attach_ssm_policies(health_fn)  # #62 IAM 收窄:拆 SSM 多 statement
+    # 只挂 health_fn 而【不】进 _attach_ssm_policies 的共享组:那组共享给 5 个 Lambda,
+    # (起初就是那么写的,cdk diff 暴露出四个 role 的 policy 全被改动才收窄到这里)。
+    # DescribeInstanceInformation 不支持资源级 IAM,故 resources=["*"];纯只读。
+    health_fn.add_to_role_policy(
+        iam.PolicyStatement(
+            actions=["ssm:DescribeInstanceInformation"],
+            resources=["*"],
+        )
+    )
 
     events.Rule(
         self,
@@ -1565,6 +1893,13 @@ def build_lambdas(self, ctx):
             "BACKUP_INTERVAL_HOURS": str(CFG["s3"].get("backup_interval_hours", 24)),
             "BACKUP_BATCH_LIMIT": str(CFG["s3"].get("backup_batch_limit", 20)),
         },
+        # #564 G6 ② —— 通道 D(网关手动备份)的异步失败出口。手动备份走
+        # `InvocationType="Event"` 派发到本函数(`tenant_service` 的手动备份分支),此前
+        # 这个函数**没有任何** DLQ:异步 worker 里的未处理异常在 AWS 重试耗尽后无声消失,
+        # 而客户手里只有一个 202 —— 那正是 issue 零节那句「接口返回成功、实际操作没有发生,
+        # 且调用方无从察觉」。理由与 api_fn 那处相同,`retry_attempts` / `max_event_age`
+        # 同样不动(说明见 api_fn 处)。
+        dead_letter_queue_enabled=True,
     )
     tenants_table.grant_read_write_data(backup_fn)
     assets_bucket.grant_read_write(backup_fn)
@@ -1581,12 +1916,30 @@ def build_lambdas(self, ctx):
     # PRD 2.6: backup_cron 现在是"扫描节拍"而非"统一备份时间"——每次触发只备到期
     # 的一批(错峰+限并发)。配高频(如 rate(30 minutes))让全量在 INTERVAL_HOURS
     # 内滚动覆盖,避免开源版"写死统一时间全量同刻备份"。
-    events.Rule(
-        self,
-        "BackupSchedule",
-        schedule=events.Schedule.expression(CFG["s3"]["backup_cron"]),
-        targets=[targets.LambdaFunction(backup_fn)],
-    )
+    #
+    # 为什么必须二者其一而不能并存:两侧都按 last_backup_at 判到期、都调同一个
+    # backup-data.sh,同刻跑会对同一个数据盘并发起两次备份(该脚本会 Pause/Resume VM,
+    # 两个实例交错 Resume 会让另一个备到"运行中的盘"→ 备份内容不一致)。
+    #
+    # 为什么留开关而不是直接删:①灰度 —— host-agent 是运行时从 S3 拉的,滚动升级期间
+    # 老版本没有 _backup_loop,若此刻中心 schedule 已删,那些机器上的租户会完全不被备份;
+    # ②回滚 —— host 侧出问题时把这个开关打回 true 即恢复中心调度,不必回滚 CDK 全栈。
+    # 上线顺序:先铺 host-agent(全部机器都有 _backup_loop 且 /metrics 见 backup tick)
+    # → 再把 backup_central_schedule_enabled 置 false → cdk deploy。
+    # 缺键时默认 **True**(不是 False)。codex 独立复审抓出的真问题,而且是本改动里
+    # 最危险的一条:已有部署的 config.yml 里没有这个新键,若缺省为 False,他们只要
+    # `cdk deploy` 一次就会【静默停掉全部定时备份】—— 而那些机器上跑的 host-agent 是
+    # 旧版、没有 _backup_loop,于是两侧都不备份,直到某天需要恢复时才发现。
+    # 关闭中心调度必须是【显式动作】,且只在确认 host-agent 已铺完(所有机器 /metrics
+    # 都见 loop="backup")之后才做。本仓的 config.yml/.example 已显式写 false,因为
+    # 本仓的 host 会随本 MR 一起铺;外部部署保持旧行为直到他们自己决定切换。
+    if CFG["s3"].get("backup_central_schedule_enabled", True):
+        events.Rule(
+            self,
+            "BackupSchedule",
+            schedule=events.Schedule.expression(CFG["s3"]["backup_cron"]),
+            targets=[targets.LambdaFunction(backup_fn)],
+        )
 
     # 触发: audit_table DDB Stream (NEW_IMAGE)。每条审计条目 put 后 Lambda 消费
     # 事件,把 NEW_IMAGE 反 marshal 成 JSON,PutObject 到 audit_archive_bucket

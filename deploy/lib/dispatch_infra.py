@@ -375,6 +375,35 @@ class DispatchInfra(Construct):
             ],
         )
 
+        # 消费删租户时打下的 `vkey_revoke_failed` 标记,重试撤销 LiteLLM vkey。
+        # 在 bb 上那个标记【没有任何消费者】(CHANGELOG 自己记着这条),于是回收失败的
+        # 那把 key 永久留在 LiteLLM:凭据 + 预算泄漏,随 churn 累积。
+        #
+        # 为什么挂在 api_fn 而不是 health_check:只有 openclaw-api 的 env 带
+        # LITELLM_MASTER_KEY_SECRET,health_check 一个 LiteLLM 相关的都没有 —— 放那边
+        # 是一个注定空转的 reconciler。
+        #
+        # 为什么 15 分钟而不是 1 分钟:孤儿回收不紧急(标记稀疏、量小),低频省 invoke 成本;
+        # 而重试上限 10 次 × 15 分钟 ≈ 覆盖 2.5 小时的瞬时故障,够长了。
+        self.credential_reconciler_rule = events.Rule(
+            self,
+            "CredentialReconcilerRule",
+            schedule=events.Schedule.rate(Duration.minutes(15)),
+            description=(
+                "#438 reclaim orphaned LiteLLM vkeys. Fires api_fn with "
+                "{source:'credential.reconciler'} to consume vkey_revoke_failed "
+                "markers left by best-effort revoke on tenant delete."
+            ),
+            targets=[
+                targets.LambdaFunction(
+                    api_fn,
+                    event=events.RuleTargetInput.from_object(
+                        {"source": "credential.reconciler"}
+                    ),
+                )
+            ],
+        )
+
         # ---------- CloudWatch Alarm: DLQ 出现任何消息就告警 ----------
         # SPEC 隐含要求(interfaces.md L114-115 熔断 + DLQ):消费端连续失败会走 DLQ,
         # 任何一条进 DLQ 都得告警(不像 lifecycle 队列的 DLQ 有正常清理路径,dispatch
@@ -395,6 +424,79 @@ class DispatchInfra(Construct):
                 "openclaw-dispatch-dlq has a message — dispatch consumer "
                 "gave up after retries. Investigate: hosts table state, "
                 "SSM RunCommand history for the command_id, and Lambda logs."
+            ),
+        )
+
+        #
+        # 为什么是「缺席告警」而不是数值告警:要发现的是「poller 根本没跑」,而那种情况下
+        # 连数据点都不会有 —— 任何基于数值的比较都永远不会触发。所以判据必须是
+        # `treat_missing_data=BREACHING`:**没有数据 = 告警**。
+        #
+        # 为什么这件事在 #562 之后是必须的:死线执行者挂在同一个 poller 上,是「180s 内必进
+        # 终态」这个对外承诺的唯一兜底。poller 停 10 分钟,那 10 分钟里所有过死线的租户都留在
+        # creating/pending —— 承诺静默失效,而客户看到的仍然只是「还在创建中」。
+        #
+        # 为什么不是「加第二个定时器」:EventBridge rate(1 minute) 是 AWS 托管的 HA 调度器,
+        # 不是会崩的单实例。真实失效模式(规则被误禁用 / Lambda 每拍都报错 / 被限流 / 超时)
+        # 里,五分之四靠加定时器都治不了 —— 第二条规则会被同一次变更一起禁掉、第二个触发调的
+        # 是同一个坏函数。它们共同的前提是「没人知道它没跑」,所以先补可发现性。
+        # 详见 deploy/lambda/api/services/poller_heartbeat.py 的模块 docstring。
+        #
+        # 窗口取 5 分钟 / 连续 1 个周期:节拍是 1 分钟,给 4 拍的容错(单拍抖动/冷启/限流重试
+        # 都不该告警),但连续 5 分钟一次都没跑成必须响 —— 那已经是 3 个死线周期。
+        self.poller_heartbeat_alarm = cloudwatch.Alarm(
+            self,
+            "DispatchPollerHeartbeatAlarm",
+            alarm_name="openclaw-dispatch-poller-stale",
+            metric=cloudwatch.Metric(
+                namespace="OpenClaw/Dispatch",
+                metric_name="PollerHeartbeat",
+                period=Duration.minutes(5),
+                statistic="Sum",
+            ),
+            threshold=1,
+            evaluation_periods=1,
+            comparison_operator=cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
+            # ★这一行是本告警的全部意义:没有数据点 = poller 没跑 = 告警。
+            # 若写成 NOT_BREACHING(像 DLQ 那条那样),poller 完全停摆时它会一直显示 OK。
+            treat_missing_data=cloudwatch.TreatMissingData.BREACHING,
+            alarm_description=(
+                "openclaw dispatch poller has not completed a run in 5 minutes "
+                "(PollerHeartbeat missing or zero). The poller carries the #562 "
+                "create-deadline enforcement — while it is down, tenants past their "
+                "180s deadline stay in creating/pending and the terminal-state "
+                "promise silently breaks. Check: EventBridge rule "
+                "DispatchPollerRule enabled? openclaw-api errors/throttles? "
+                "Lambda timeout? See services/poller_heartbeat.py."
+            ),
+        )
+
+        # 心跳照发但 errors 持续非零 = 「跑了但没干成事」。这个状态长得和一切正常完全一样
+        # (返回值形状正常、心跳在发),只有指标能把它和正常区分开。
+        # 阈值取 0 / 连续 3 个 5 分钟周期:偶发一两个租户写失败是 #562 刻意的 fail-safe
+        # (不让单个失败中断整轮),不该告警;连续 15 分钟都在吞错才是真问题。
+        self.poller_errors_alarm = cloudwatch.Alarm(
+            self,
+            "DispatchPollerErrorsAlarm",
+            alarm_name="openclaw-dispatch-poller-swallowing-errors",
+            metric=cloudwatch.Metric(
+                namespace="OpenClaw/Dispatch",
+                metric_name="PollerErrors",
+                period=Duration.minutes(5),
+                statistic="Sum",
+            ),
+            threshold=0,
+            evaluation_periods=3,
+            comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+            # 这条【不】用 BREACHING:没数据点由上面那条陈旧告警负责,
+            # 两条都对缺席告警会在 poller 停摆时同时响两遍,噪声无收益。
+            treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+            alarm_description=(
+                "openclaw dispatch poller keeps swallowing errors (PollerErrors > 0 "
+                "for 15 minutes). It IS running, so the staleness alarm stays OK — "
+                "but per-tenant writes keep failing inside the #562 fail-safe that "
+                "deliberately does not abort the round. Check openclaw-api logs for "
+                "[#562] deadline-error and DDB throttling on openclaw-tenants."
             ),
         )
 

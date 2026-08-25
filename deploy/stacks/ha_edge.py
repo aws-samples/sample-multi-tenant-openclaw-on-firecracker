@@ -34,6 +34,7 @@ from stacks._helpers import host_golden_ami_parameter_name
 from stacks._helpers import track_default_lt_version
 from stacks.edge_bundle import BUNDLE_OBJECT_NAME as EDGE_BUNDLE_OBJECT_NAME
 from stacks.edge_bundle import build_edge_bundle
+from stacks.obs_assets import build_obs_assets
 
 
 def _valid_s3_bucket_name(bucket):
@@ -381,6 +382,19 @@ def build_ha_edge(self, ctx):
             continue
         _spec_lines.append(f"{_t} {_v} {_m}")
     init_sh = init_sh.replace("{{NOMINAL_SPECS}}", "\n".join(_spec_lines))
+    # 得知,于是非默认前缀时 host 备份传到 backups/ 而恢复去配置的前缀找(真机确认
+    # /etc/platform.env 里没有这个变量)。默认值与 Lambda 侧同源,不另设。
+    init_sh = init_sh.replace(
+        "{{BACKUP_PREFIX}}", CFG["s3"].get("backup_prefix", "backups")
+    )
+    # R7 补(codex 复审):中心 Lambda 拿到了 backup_interval_hours(lambdas.py:1709),
+    # host 侧没有 —— host-agent.py:924 读 OC_BACKUP_INTERVAL_HOURS,platform.env 里没这个
+    # 变量,于是恒回落 24h。R7 让 host 成为定时备份的唯一执行者后,config 里配的更短 RPO
+    # 会被静默忽略。默认值与 Lambda 侧同源(24),不另设第二套默认。
+    init_sh = init_sh.replace(
+        "{{OC_BACKUP_INTERVAL_HOURS}}",
+        str(CFG["s3"].get("backup_interval_hours", 24)),
+    )
     # (_collect_stranding_stats)按 allocatable = total × ratio 计算,而 allocatable
     # 是搁浅判据的分母。不渲染的话它只能拿 os.environ 默认 1.0 → m8g 实测
     # allocatable_vcpu 报 96(真值 384)、stranded_vcpu 报 0(真值 192),扩容决策会
@@ -508,6 +522,21 @@ def build_ha_edge(self, ctx):
         "{{EGRESS_ALLOWLIST_ENABLED}}",
         str(sec_cfg.get("egress_allowlist_enabled", False)).lower(),
     )
+    # #566 —— guest 出网 default-deny 白名单基线开关(取代 #542 黑名单模型;见 ADR
+    # guest-egress-default-deny-whitelist)。off=零变化(现状默认放行);deny=host 级 tap 共享链
+    # OPENCLAW-EGRESS,内网 default-deny + config-derived allow 洞(LiteLLM/DNS/SPIRE)+ 公网放行。
+    _egress_mode = str(sec_cfg.get("egress_mode", "off")).strip().lower()
+    if _egress_mode not in ("off", "deny"):
+        raise ValueError(
+            f"security.egress_mode={_egress_mode!r} 非法:只接受 off | deny(#566)"
+        )
+    init_sh = init_sh.replace("{{EGRESS_MODE}}", _egress_mode)
+    # deny_rfc1918:默认只堵本环境 VPC CIDR(EGRESS_VPC_CIDR,已渲染);true 时额外堵
+    # 全部 RFC1918(10/8+172.16/12+192.168/16)——多 VPC/对等场景更严,但可能误伤同段合法私网。
+    init_sh = init_sh.replace(
+        "{{EGRESS_DENY_RFC1918}}",
+        str(sec_cfg.get("egress_deny_rfc1918", False)).lower(),
+    )
     # #517 阶段3(G1 fail-closed)—— 只读身份盘缺失时是否拒绝启动。默认 false=既有兼容行为
     # (launch-vm.sh WARN 后照常起,回落 data 盘烤制当天的旧 md 副本);true 时盘缺失 exit 1。
     init_sh = init_sh.replace(
@@ -611,6 +640,13 @@ def build_ha_edge(self, ctx):
         destination_key_prefix=_init_key_prefix,
         prune=False,
         retain_on_delete=True,
+    )
+
+    # init-host.sh does: it is read during boot, so "somebody re-runs setup.sh" is not
+    # behind bb). The per-object metadata and the ordering edges are not incidental —
+    # see stacks/obs_assets.py for why each is required.
+    _obs_assets = build_obs_assets(
+        self, assets_bucket, Path(__file__).parent.parent.parent
     )
 
     # Ubuntu does not guarantee awscli on a clean AMI, so the bootstrap installs
@@ -1004,6 +1040,11 @@ def build_ha_edge(self, ctx):
     # Gate Host launch on the immutable object deployment instead of setup.sh's
     # post-CDK uploader, which is intentionally only for second-stage scripts.
     asg.node.add_dependency(_host_init_asset)
+    # deployment/observability/, then install-fluent-bit.sh pulls the whole host/
+    # prefix. All three run inside the lifecycle hook, where a miss is a die and a die
+    # is ABANDON, so the prefix has to be complete before the first host can launch.
+    for _obs_asset in _obs_assets:
+        asg.node.add_dependency(_obs_asset)
     # Golden-image bake is a separate, non-blocking stack (OpenClawImageStack)
     # now, so the ASG no longer depends on image readiness. On a fresh region the
     # first host may boot before the image is in S3 and churn a few minutes via
@@ -1982,6 +2023,10 @@ def build_ha_edge(self, ctx):
         # 也挡在 EdgeSetDefaultLTVersion 之后:$Default 必须先被设成本次 CDK 版本,edge 才起
         # (否则首启可能读到过期默认版本)。
         _edge_asg.node.add_dependency(_edge_set_default)
+        # deployment/observability/fluent-bit/edge/ recursively. Unlike host, edge has a
+        # baked FB_LOCAL_DIR fallback, so a miss degrades to the image's copy instead of
+        for _obs_asset in _obs_assets:
+            _edge_asg.node.add_dependency(_obs_asset)
         _edge_asg.attach_to_application_target_group(edge_tg)
         # ModifyLaunchTemplate 翻默认版本即对 edge 下次 launch 生效。CFN 写不进
         # `$Default`,故模板给数字版本(LatestVersionNumber,即本次 deploy 发布的版本),

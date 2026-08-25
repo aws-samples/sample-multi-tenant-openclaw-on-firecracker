@@ -27,6 +27,7 @@ ssm_dispatch/legacy_alb/skills/audit)+ services.lifecycle_dispatch(横向 servic
 facade 指向同一模块对象)即可全局生效。
 """
 
+import base64
 import json
 import os
 import re
@@ -39,7 +40,10 @@ from botocore.exceptions import ClientError
 
 import core.capacity as capacity
 import core.clients as clients
+import core.create_deadline as create_deadline  # #562 — 创建死线的唯一口径(纯函数)
+import core.deadline_config as deadline_config  # #564 G5 — 死线的运行时载体(SSM Parameter)
 import core.host_profile as host_profile
+import core.host_taint as host_taint  # #540 — 放置侧读污点,判定复用写侧纯函数
 import core.utils as utils
 import core.auth as auth
 import core.scheduling as scheduling
@@ -118,7 +122,6 @@ def _classify_claim_failure(err_response, cap_v, cap_m):
 def _fresh_host_state(err_response):
     """从 CCF 捎回的旧值里取出【赢家写完后的当前状态】,供重试刷新本地 host 字典。
 
-    #475 必修1 —— 只把"抢输"改成原地重试是【不够】的:重试仍然调 _reserve_slot(host),
     而里面 `expected = h["next_vm_num"]` 读的是同一个 stale 字典,于是 CAS 条件
     `next_vm_num = :expected` 必然再次不满足 —— 8 次重试确定性全废。真机实测(apse1
     2026-08-14,6 路并发单 host):只改分类时 6 路里 4 路拿到
@@ -150,9 +153,45 @@ _DNS_LABEL_RE = _CONFIG_TEMPLATE_RE
 # Restrict to 4-128 printable ASCII (codepoints 33-126): no spaces, no control
 # chars (\n \t \x00), no non-ASCII. .isascii() alone lets control chars through.
 _CLIENT_TOKEN_RE = re.compile(r"^[\x21-\x7e]{4,128}$")
+# Dots remain separators; empty/control-character/path-like segments are rejected.
+_INJECTION_TARGET_RE = re.compile(
+    r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\Z"
+)
+_HARDEN_CONFIG_TARGETS = (
+    "gateway.controlUi.dangerouslyDisableDeviceAuth",
+    "gateway.controlUi.enabled",
+    "gateway.controlUi.allowedOrigins",
+    "gateway.http.endpoints.chatCompletions",
+    "models.providers.litellm.baseUrl",
+    "models.providers.litellm.apiKey",
+)
 _DELETE_CLAIM_TTL_SECONDS = 900
+# ⑭ codex 独立复审第九轮 —— suspend 必须进这个集合。
+#
+# 在此之前 suspend 【从不取 fence】,于是两件事同时成立而互相矛盾:
+#   · suspend 的两个破坏性步骤(stop-vm、rm -rf)裸跑,没有 host_guard;
+# 于是一个只是"慢"的 suspend 可以在回滚之后才落地它的删盘 → 「row=running / 无 VM /
+#
+# 我第七、八轮试图用"等 active_lifecycle_until 过期再回滚"来挡这条,但那道门当时是
+# **空转的** —— 那个字段只由本集合里的动作写,suspend 不在里面,所以对一个 suspend
+# 卡死的租户它通常根本不存在(我的注释却声称它守着 suspend 的窗口,那是错的)。
+# 这是本轮之前我在这条路径上第五处被推翻的书面判断。
+#
+# 把 suspend 纳入 fence 后两件事一起成立:
+#   · 租户行上真的有 suspend 自己的 active_lifecycle_until,reaper 那道门于此才有意义;
+#   · 破坏性命令带上 host_guard,而 host_guard 同时校验 owner + epoch + **租约未过期**
+#     (lifecycle_fence.py:264)。所以 reaper 只在租约过期后回滚 ⟹ 任何延迟落地的
+#     suspend 命令必然撞 LIFECYCLE_FENCE_EXPIRED、exit 79,一步都不做。两者组合才闭合。
+#
+# 副作用是有意的:suspend 与其它生命周期动作之间从此互斥(并发时 409
+# LIFECYCLE_IN_FLIGHT)。suspend 本来就是生命周期动作,这正是该集合的语义。
+# 释放路径已有:外层 tenant_action 无条件调 _release_lifecycle_ctx,且只在 5xx 时保留
+# 租约 —— 恰好是这里要的(失败留租约防重投撞车,成功立刻放手)。
+#
+# **restore 不加**(有意):它的破坏性动作是在新 host 起 VM,而 reaper 对 restoring 一律
+# mark_stuck、从不回滚,所以本轮这条竞态对它不成立。没有已证实的缺陷就不动它。
 _FENCED_LIFECYCLE_ACTIONS = frozenset(
-    {"rebuild", "migrate", "reset", "delete", "restart"}
+    {"rebuild", "migrate", "reset", "delete", "restart", "suspend"}
 )
 
 # #501 — 健康位只由 health_check sweep 写(health_check/handler.py 的 vm_health/app_health
@@ -220,10 +259,302 @@ def _normalize_client_token(raw):
     return token, None
 
 
+def _extract_reapply_request(action, body):
+    """Return canonical #429 fields only for rebuild/v1 upgrade actions."""
+    if action not in ("rebuild", "upgrade") or not isinstance(body, dict):
+        return None
+    if action == "upgrade":
+        return {
+            "config_template": body.get("configTemplate"),
+            "config_template_version": body.get("configTemplateVersion"),
+            "force_reapply": body.get("forceReapply"),
+        }
+    return {
+        "config_template": body.get("config_template"),
+        "config_template_version": body.get("config_template_version"),
+        "force_reapply": body.get("force_reapply"),
+    }
+
+
+def _normalize_v1_upgrade_body(body):
+    """Map the legacy v1 camelCase upgrade body onto rebuild's snake_case body."""
+    if isinstance(body, str):
+        try:
+            parsed = json.loads(body)
+        except Exception:
+            return body
+        if not isinstance(parsed, dict):
+            return body
+        body = parsed
+    if not isinstance(body, dict):
+        return body
+    normalized = dict(body)
+    aliases = {
+        "configTemplate": "config_template",
+        "configTemplateVersion": "config_template_version",
+        "forceReapply": "force_reapply",
+    }
+    for legacy, canonical in aliases.items():
+        if legacy in normalized and canonical not in normalized:
+            normalized[canonical] = normalized[legacy]
+        normalized.pop(legacy, None)
+    return normalized
+
+
+def _reapply_requested(request):
+    if not request:
+        return False
+    return bool(
+        request.get("force_reapply") is True
+        or request.get("config_template") is not None
+        or request.get("config_template_version") is not None
+    )
+
+
+def _reapply_injection_targets(item):
+    plan = item.get("frozen_injection_plan") or {}
+    targets = list(_HARDEN_CONFIG_TARGETS)
+    if isinstance(plan, dict):
+        for entry in plan.values():
+            if isinstance(entry, dict) and entry.get("param_class") == "config":
+                targets.append(entry.get("injection_target"))
+    return targets
+
+
+def _validate_reapply_targets(item):
+    invalid = []
+    for target in _reapply_injection_targets(item):
+        if not isinstance(target, str) or not _INJECTION_TARGET_RE.fullmatch(target):
+            invalid.append(target)
+    return invalid
+
+
+def _resolve_target_openclaw_version(item, resolved):
+    """Read the selected host image's manifest without mutating host or tenant."""
+    target_snapshot = (
+        resolved.get("target_host_snapshot")
+        or resolved.get("target_snap")
+        or ""
+    )
+    if target_snapshot:
+        manifest = (
+            f"/data/firecracker-assets/versions/{target_snapshot}/manifest.json"
+        )
+    else:
+        manifest = "/data/firecracker-assets/manifest.json"
+    captured = {"stdout": "", "stderr": ""}
+    command = (
+        f"jq -er '.openclaw_version' {shlex.quote(manifest)} "
+        "2>/dev/null"
+    )
+    ok = ssm_dispatch._ssm_run(
+        item["host_id"],
+        command,
+        timeout=30,
+        on_output=lambda stdout, stderr: captured.update(
+            {"stdout": stdout, "stderr": stderr}
+        ),
+    )
+    version = (captured["stdout"] or "").strip().splitlines()
+    if not ok or not version:
+        raise LookupError(
+            "target image manifest does not expose openclaw_version"
+        )
+    return version[-1].strip()
+
+
+def _prepare_config_reapply(item, request, resolved):
+    """#429 control-plane fast pre-screen; this function performs no writes."""
+    if not _reapply_requested(request):
+        return None
+    force = request.get("force_reapply")
+    if force is not None and not isinstance(force, bool):
+        raise ValueError("force_reapply must be a boolean")
+    template = request.get("config_template")
+    if template is None or template == "":
+        template = item.get("config_template") or registry_service.DEFAULT_TEMPLATE
+    if not isinstance(template, str) or not _CONFIG_TEMPLATE_RE.fullmatch(template):
+        raise ValueError(
+            "config_template must match "
+            "^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$"
+        )
+    requested_version = request.get("config_template_version")
+    registry_version, _entries, _metadata = registry_service.load_snapshot(
+        template, requested_version
+    )
+    target_openclaw_version = _resolve_target_openclaw_version(item, resolved)
+    try:
+        body, body_binding = registry_service.load_template_body(template)
+    except ValueError as exc:
+        raise LookupError(str(exc)) from exc
+    forbidden = registry_service.forbidden_paths_for_version(
+        target_openclaw_version
+    )
+    if forbidden is None:
+        raise LookupError(
+            f"target openclaw version {target_openclaw_version!r} "
+            "has no denylist classification"
+        )
+    hits = (
+        registry_service.find_forbidden_paths(body, forbidden)
+        if body is not None
+        else []
+    )
+    invalid_targets = _validate_reapply_targets(item)
+    if hits or invalid_targets:
+        detail = []
+        if hits:
+            detail.append("forbidden keys: " + ", ".join(sorted(hits)))
+        if invalid_targets:
+            detail.append(
+                "unsafe injection_target: "
+                + ", ".join(repr(value) for value in invalid_targets)
+            )
+        raise LookupError("; ".join(detail))
+    return {
+        "config_template": template,
+        "registry_version": registry_version,
+        "target_openclaw_version": target_openclaw_version,
+        **body_binding,
+    }
+
+
+def _reapply_target_matches(item, binding):
+    if not binding:
+        return False
+    return all(
+        (
+            item.get("config_template") or registry_service.DEFAULT_TEMPLATE
+            if field == "config_template"
+            else (
+                int(item.get(item_field))
+                if field == "registry_version" and item.get(item_field) is not None
+                else (item.get(item_field) or "")
+            )
+        )
+        == binding.get(field)
+        for field, item_field in (
+            ("config_template", "config_template"),
+            ("registry_version", "config_reapply_registry_version"),
+            ("body_version_id", "config_reapply_body_version_id"),
+            ("body_sha256", "config_reapply_body_sha256"),
+        )
+    )
+
+
+def _should_stamp_reapply(rebuild_verified, binding):
+    return bool(rebuild_verified and isinstance(binding, dict) and binding)
+
+
+def _reapply_stamp_values(binding):
+    return {
+        ":cfg_tpl": binding["config_template"],
+        ":cfg_reg": int(binding["registry_version"]),
+        ":cfg_vid": binding.get("body_version_id", ""),
+        ":cfg_sha": binding.get("body_sha256", ""),
+    }
+
+
+def _reapply_env_prefix(binding):
+    raw = json.dumps(binding, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    encoded = base64.b64encode(raw).decode("ascii")
+    return f"OC_REAPPLY_CONFIG=1 OC_REAPPLY_BINDING_B64={shlex.quote(encoded)} "
+
+
+def _run_reapply_host_probe(item, binding, resolved):
+    """Run schema-only assembly/validation while the current VM is still running."""
+    target_snapshot = (
+        resolved.get("target_host_snapshot")
+        or resolved.get("target_snap")
+        or "__legacy_flat__"
+    )
+    heal = ssm_dispatch.host_script_self_heal(
+        ("launch-vm.sh",),
+        "oc:reapply-probe",
+    )
+    lib_heal = (
+        "([ -r /home/ubuntu/lib/harden-config.sh ] && "
+        "grep -q '^oc_assemble_config()' /home/ubuntu/lib/harden-config.sh) || "
+        "(. /etc/platform.env && mkdir -p /home/ubuntu/lib && "
+        "aws s3 cp "
+        "\"s3://${ASSETS_BUCKET}/deployment/scripts/lib/harden-config.sh\" "
+        "/home/ubuntu/lib/harden-config.sh "
+        "--region \"${OC_REGION:-ap-northeast-1}\" --quiet && "
+        "grep -q '^oc_assemble_config()' /home/ubuntu/lib/harden-config.sh)"
+    )
+    command = (
+        f"{heal} && {lib_heal} && {_reapply_env_prefix(binding)}"
+        f"/home/ubuntu/launch-vm.sh --pre-rebuild-probe "
+        f"{shlex.quote(str(item['id']))} "
+        f"{shlex.quote(str(item.get('vm_num', 1)))} "
+        f"{shlex.quote(str(target_snapshot))}"
+    )
+    captured = {"stdout": "", "stderr": "", "rc": None}
+    ok = ssm_dispatch._ssm_run(
+        item["host_id"],
+        command,
+        timeout=180,
+        on_result=lambda _status, rc: captured.__setitem__("rc", rc),
+        on_output=lambda stdout, stderr: captured.update(
+            {"stdout": stdout, "stderr": stderr}
+        ),
+    )
+    incompatible = any(
+        '"state":"INCOMPATIBLE"' in text or "openclaw.json 不兼容" in text
+        for text in (captured["stdout"], captured["stderr"])
+    )
+    return bool(ok), incompatible, captured
+
+
 # ——deleted 租户不被 reaper 兜底 → 容量永漏。三态让 delete 在 retry 时留 deleting 返 5xx 重投)。
 _REL_CONSUMED = "consumed"  # 本次扣了账本、清了令牌
 _REL_ALREADY = "already"    # 令牌已不在(别人消费/从没有)或下溢守卫触发 → 安全幂等
 _REL_RETRY = "retry"        # 瞬时失败(冲突/throttle/网络)→ 令牌可能仍在,必须重投再释放
+
+
+def _classify_release_cancel(e, tenant_id, tag):
+    """令牌化释放事务的失败 → 三态。**TransactItems 顺序契约:[0]=host 账本项、
+    [1]=tenant 令牌项**;调用方必须按这个次序组装事务,否则本判定会读错位次。
+
+    suspend/restore 的令牌化释放必须把【状态提交】并进 tenant 那一项(DDB 事务不允许对
+    同一 key 出现两个操作),所以它们复用不了整个事务函数,只能复用这段判定。而这段
+    判定的优先级阶梯是四轮 codex 评审收敛的结果(尤其"token-gone 优先于 host 下溢"),
+    抄一份必然漂移,且漂移方向恰好是【把瞬时失败误判成已释放】→ 令牌搁浅 → 容量永漏。
+    """
+    retryable = {"TransactionConflict", "ThrottlingError",
+                 "ProvisionedThroughputExceeded", "RequestLimitExceeded"}
+    if not isinstance(e, ClientError):
+        print(f"{tag}: token release {tenant_id} error (retry): {e}")
+        return _REL_RETRY  # 未知错误保守当可重试:宁重投也不搁浅令牌
+    # 仅 tenant 项(idx1)条件失败才算 already(令牌已被别人消费);host 项(idx0)下溢
+    # 或缺 reasons/可重试因 → retry(不当已释放,否则搁浅令牌 / delete 误 finalize)。
+    code = e.response["Error"]["Code"]
+    if code == "TransactionCanceledException":
+        reasons = e.response.get("CancellationReasons", []) or []
+
+        def _code_at(idx):
+            return reasons[idx].get("Code", "") if idx < len(reasons) else ""
+
+        host_code, tenant_code = _code_at(0), _code_at(1)
+        # CCF 优先判 ALREADY——最后一张预留双重释放时 host 下溢与 token-gone 会同时失败,
+        # token-gone 说明别人已成功扣账本,本次安全幂等,绝不能因 host 下溢误报 retry 让 delete
+        # 卡 deleting/进 DLQ。
+        if host_code in retryable or tenant_code in retryable:
+            print(f"{tag}: release {tenant_id} retryable cancel "
+                  f"{[host_code, tenant_code]}")
+            return _REL_RETRY
+        if tenant_code == "ConditionalCheckFailed":
+            return _REL_ALREADY  # 令牌已被别人消费/从没有 → 安全幂等
+        if host_code == "ConditionalCheckFailed":
+            print(f"{tag}: release {tenant_id} host underflow — retry+alarm")
+            return _REL_RETRY
+        print(f"{tag}: release {tenant_id} cancel w/o reasons — retry")
+        return _REL_RETRY
+    if code in retryable:
+        print(f"{tag}: release {tenant_id} retryable error {code}")
+        return _REL_RETRY
+    print(f"{tag}: token release {tenant_id} error (retry): {e}")
+    return _REL_RETRY  # 未知错误保守当可重试:宁重投也不搁浅令牌
 
 
 def _release_capacity_reservation(tenant_id, host_id, reservation_id, vcpu, mem_mb):
@@ -237,8 +568,6 @@ def _release_capacity_reservation(tenant_id, host_id, reservation_id, vcpu, mem_
 
     独立实现(不 import dispatch_service):delete 是 no-data-loss 关键路径,自包含避免跨
     service 依赖;事务写法与本文件 canary put(:734)同源(原生值,不预 TypeSerializer)。"""
-    retryable = {"TransactionConflict", "ThrottlingError",
-                 "ProvisionedThroughputExceeded", "RequestLimitExceeded"}
     txn_items = [
         {
             "Update": {
@@ -270,39 +599,8 @@ def _release_capacity_reservation(tenant_id, host_id, reservation_id, vcpu, mem_
     try:
         clients.hosts_table.meta.client.transact_write_items(TransactItems=txn_items)
         return _REL_CONSUMED
-    except ClientError as e:
-        # 仅 tenant 项(idx1)条件失败才算 already(令牌已被别人消费);host 项(idx0)下溢
-        # 或缺 reasons/可重试因 → retry(不当已释放,否则搁浅令牌 / delete 误 finalize)。
-        code = e.response["Error"]["Code"]
-        if code == "TransactionCanceledException":
-            reasons = e.response.get("CancellationReasons", []) or []
-
-            def _code_at(idx):
-                return reasons[idx].get("Code", "") if idx < len(reasons) else ""
-
-            host_code, tenant_code = _code_at(0), _code_at(1)
-            # CCF 优先判 ALREADY——最后一张预留双重释放时 host 下溢与 token-gone 会同时失败,
-            # token-gone 说明别人已成功扣账本,本次安全幂等,绝不能因 host 下溢误报 retry 让 delete
-            # 卡 deleting/进 DLQ。
-            if host_code in retryable or tenant_code in retryable:
-                print(f"delete_tenant #412: release {tenant_id} retryable cancel "
-                      f"{[host_code, tenant_code]}")
-                return _REL_RETRY
-            if tenant_code == "ConditionalCheckFailed":
-                return _REL_ALREADY  # 令牌已被别人消费/从没有 → 安全幂等
-            if host_code == "ConditionalCheckFailed":
-                print(f"delete_tenant #412: release {tenant_id} host underflow — retry+alarm")
-                return _REL_RETRY
-            print(f"delete_tenant #412: release {tenant_id} cancel w/o reasons — retry")
-            return _REL_RETRY
-        if code in retryable:
-            print(f"delete_tenant #412: release {tenant_id} retryable error {code}")
-            return _REL_RETRY
-        print(f"delete_tenant #412: token release {tenant_id} error (retry): {e}")
-        return _REL_RETRY  # 未知错误保守当可重试:宁重投也不搁浅令牌
-    except Exception as e:  # noqa: BLE001
-        print(f"delete_tenant #412: token release {tenant_id} error (retry): {e}")
-        return _REL_RETRY
+    except Exception as e:  # noqa: BLE001 — 判定(含"未知错误保守当 retry")在分类器里
+        return _classify_release_cancel(e, tenant_id, "delete_tenant #412")
 
 
 def _maybe_mark_idle(host_id):
@@ -575,7 +873,6 @@ def build_paired_json_b64(device):
     paired.json base64。paired.json 是 gateway 侧"已批准设备名单",首连命中即免人工
     approve(INJECTION-SPEC-2026.2.26.md,真机验证)。
 
-    #415(2.26→7.1 升级,真机实测):预铸一枚 `tokens.operator` 活跃 token。
     - 7.1(协议 v4)配对门 `listEffectivePairedDeviceRoles = 活跃tokens的role ∩ 批准role`,
       空 `tokens:{}` → effective roles 为空 → operator 被判 role-upgrade → 远程连接
       被拒(NOT_PAIRED,us-west-2 真机远程拓扑实测)。故必须在 tokens 里放一枚带
@@ -671,7 +968,6 @@ def read_gateway_token_ct(tenant_id):
 
     Returns None on: feature-off / no row. Never raises.
 
-    #353 — no TTL expiry check: the ciphertext persists for the tenant's whole
     life so rebuild/recover/restore months or years later can still read back
     the original token (an expired read → openssl fallback → token mismatch →
     JDWS can't connect). The `expires_at` field is no longer written/read; the
@@ -699,7 +995,6 @@ def read_device_identity(tenant_id):
 
     返回 dict {device_id, public_key(明文), private_key(KMS 密文), scopes} 或 None。
 
-    #353 — 去掉 device_expires_at 软过期检查:device 私钥密文随租户生命周期长存,
     让 1-2 年后 rebuild/recover 仍能回读原始设备身份,不因 TTL 过期读空 →
     paired.json 无源重注入 → NOT_PAIRED / token 不一致连不上。
     """
@@ -854,6 +1149,78 @@ def _resolve_injection_plan(
     return plan, registry_version
 
 
+def _probe_stuck_tenant_facts(host_id, tenant_id):
+    """#469 P2(codex 独立复审第六轮)—— 强制删除【当场复探】host 侧两个事实。
+
+    返回 (ok, {"vm_dir": bool, "fc_alive": bool});ok=False 表示探不到,调用方必须拒绝
+    而不是猜(与 health_check 的 _probe_host_tenant_state / _confirm_vm_stopped 同一条
+    原则:时序不替代正确性)。
+
+    为什么不能直接用租户行里 reaper 留下的 lifecycle_stuck_vm_dir / _fc_alive:那两个
+    字段是 reaper **第一次**判定时刻的快照,而且 reaper 对已标记的租户【不再复探】
+    (health_check :1127 `if t.get("lifecycle_stuck_at"): marked += 1; continue`,那是为了
+    不让已标记者烧光每轮 10 个的探测预算)。于是标记可能是几小时前的,而现场早就变了。
+    两个方向都会出事,且都踩账本红线:
+
+      · vm_dir 记的是 True、现场其实已经删了:一次只是"慢"的 suspend 在被标记之后继续
+        跑完了 rm -rf(:3571)和 _release_slot(:3584),却崩在最后那次终态 CAS 之前 ——
+        账本【已扣】而 status 仍 suspending、标记仍说盘在。强制删除据此走普通 delete →
+        【再扣一次】。_release_slot 只有下溢守卫、没有"这个租户扣过没"的互斥锚
+        (core/scheduling.py),host 上还有别的租户占容量时那一扣会成功并吃掉别人的额度。
+      · vm_dir 记的是 False、fc_alive 记的是 False,而现场 FC 其实还活着(或反之):
+        见下方快路径里的说明 —— 会把物理槽位发给一个活着的孤儿 VM。
+
+    所以分工:reaper 的标记是**准入凭据**(证明"它确实卡住了,不是正在正常执行"),
+    而**走哪条删除路径由当场复探决定**。这两件事此前被合成了一个判据。
+
+    命令与解析【与 reaper 同源】(health_check:_probe_host_tenant_state):fc_alive 的判据
+    是匹配 `--api-sock <VM_DIR>/fc.sock` 而不是拿 tenant_id 去 pgrep 整条命令行 ——
+    后者会被别的租户的路径子串命中(t-1 命中 t-10)= 跨租户误判。
+    tenant_id 经 shlex.quote 进 root shell(纵深防御)。
+    """
+    if not host_id:
+        return False, {}
+    _q_tid = shlex.quote(str(tenant_id))
+    cmd = (
+        f'_d=/data/firecracker-vms/{_q_tid}; '
+        f'if [ -d "$_d" ]; then echo VMDIR=yes; else echo VMDIR=no; fi; '
+        f'_n=0; for _p in /proc/[0-9]*; do '
+        # comm 而不是 exe 的 basename(codex 第十轮):二进制被替换/删除后
+        # `readlink /proc/<pid>/exe` 返回 `... (deleted)`,basename 判据漏判 —— 而滚动
+        # 升级换镜像正是这个场景。漏判 fc_alive 会让强制删除以为"VM 已停"而放行。
+        # comm 恒为进程名、不带后缀,截断到 15 字符("firecracker" 11 字符,安全)。
+        # 与 stop-vm.sh 的 _oc_is_firecracker 同一判据。
+        f'  [ "$(cat "$_p/comm" 2>/dev/null)" = firecracker ] || continue; '
+        f'  tr "\\0" " " < "$_p/cmdline" 2>/dev/null '
+        f'    | grep -q -- "--api-sock $_d/fc.sock" && _n=$((_n+1)); '
+        f'done; echo FC=$_n'
+    )
+    _captured = {}
+
+    def _grab(stdout, _stderr):
+        _captured["out"] = stdout or ""
+
+    ok = ssm_dispatch._ssm_run(host_id, cmd, timeout=30, on_output=_grab)
+    if not ok:
+        return False, {}
+    text = _captured.get("out", "")
+    if "VMDIR=" not in text or "FC=" not in text:
+        # 命令跑了但输出不完整(被截断/污染)→ 视作探不到,不猜(同 reaper)。
+        return False, {}
+    fc_alive = False
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("FC="):
+            try:
+                fc_alive = int(line[3:]) > 0
+            except ValueError:
+                return False, {}
+            break
+    else:
+        return False, {}
+    return True, {"vm_dir": "VMDIR=yes" in text, "fc_alive": fc_alive}
+
+
 def _phys_tap_occupied(host_id, phys_num, exclude_id=None):
     """#491 —— 实现已搬到 core.scheduling.phys_tap_occupied,供队列 dispatch 路径共用。
 
@@ -867,10 +1234,8 @@ def _phys_tap_occupied(host_id, phys_num, exclude_id=None):
 def _persist_tenant_record(item, tenant_id):
     """把租户记录落库。成功返回 None;可预期冲突返回错误响应;意外异常向上抛(调用方回滚 slot)。
 
-    #93 —— 条件写 attribute_not_exists(id):同 id 重放(重试/双提交/队列重复消费)不覆盖已存在
     租户,冲突回 409 CONFLICT。
 
-    #394 codex NB2 —— canary 租户固定了具体版本(image_snapshot_time)时,其持久化必须与全局删
     快照【线性化】:否则 delete 扫描完租户表(即使强一致,也只是时间点)之后、deleting→deleted
     之前这条 put 才落库 → 版本被删但租户已固定它 → restart 拉不回(no-data-loss)。故 canary 走
     TransactWriteItems:租户 Put + 快照 status==active 的 ConditionCheck 同一事务。delete 先把 status
@@ -919,11 +1284,52 @@ def _persist_tenant_record(item, tenant_id):
                 extra={"snapshot_time": pin},
             )
         if isinstance(e, ccf) or reasons:
+            # #562 G9 —— 409 必须带【当前 status】,否则客户端拿到它做不了任何决策。
+            # 墓碑方案(形态第 6 条:failed 是墓碑,同 client_token 重试继续 409)下有两种
+            # 完全不同的 409,而旧响应体把它们混成一个:
+            #   · status ∈ {creating, running, ...} → 「在跑,别重试」
+            #   · status == failed                 → 「墓碑,换一个 client_token 再来」
+            # 客户端分不清就只有两种坏选择:傻等一个永不复活的墓碑,或对着在跑的租户狂重试。
+            # 顺带带上 create_fail_reason(G4 的机器可读归因),让重试决策不用再查一次 API。
             return utils._err(
                 409, "CONFLICT", f"tenant '{tenant_id}' already exists",
-                extra={"id": tenant_id},
+                extra=_conflict_extra(tenant_id),
             )
         raise
+
+
+def _conflict_extra(tenant_id):
+    """#562 G9 —— 创建撞 409 时,把【当前 status】与失败归因一起给客户端。
+
+    为什么这是必须的:形态第 6 条选了墓碑(`failed` 永久保留、同 client_token 重试继续 409),
+    于是 409 有两种语义完全相反的情形,而旧响应体只给 `{"error", "id"}`,把它们混成一个:
+      · status ∈ {creating, running, stopped, ...} → 「这个租户在,别重试」
+      · status == failed                          → 「这是墓碑,换 client_token 重试」
+    分不清就只剩两种坏选择:对着永不复活的墓碑傻等,或对着在跑的租户狂重试。
+
+    **fail-open 是刻意的**:查不到 / DDB 抖动 → 只回 {"id"},不抛。这个函数在 409 的
+    返回路径上,让它把一个正确的 409 变成 500 就是纯粹的倒退 —— 客户端拿 500 会重试,
+    而 409 本来是在告诉它「别重试」。所以宁可少给一个字段,不能把状态码搞错。
+    """
+    extra = {"id": tenant_id}
+    try:
+        item = (
+            clients.tenants_table.get_item(Key={"id": tenant_id}, ConsistentRead=True)
+            .get("Item")
+            or {}
+        )
+    except Exception as e:  # noqa: BLE001 — 见 docstring:不许把 409 变 500
+        print(f"[#562] _conflict_extra get_item failed (non-fatal): {type(e).__name__}: {e}")
+        return extra
+    status = item.get("status")
+    if status:
+        extra["status"] = status
+    reason = item.get(create_deadline.ATTR_FAIL_REASON)
+    if reason:
+        extra[create_deadline.ATTR_FAIL_REASON] = reason
+    # 墓碑显式标出来:客户端不必自己维护「哪些 status 算终态」的表(那张表会漂)。
+    extra["retriable_with_new_token"] = status == "failed"
+    return extra
 
 
 def _initial_immutable_version(host, pinned_image_snapshot_time=None):
@@ -1297,6 +1703,52 @@ def create_tenant(body=None, event=None):
     )
     tenant_id = _replay_id or utils._gen_id(name, client_token, owner_id)
     now = utils._now()
+    # #562 —— 受理时刻的 epoch 与由它算出的创建死线。【只算一次】,占位租户行与 dispatch
+    # 消息体共用同一个值:两处若各算一次,受理与入队之间的耗时(铸 token/device 身份、
+    # 写 secrets)会让两个死线差出几百毫秒到数秒,于是「消费者按消息体判过期」与
+    # 「死线执行者按租户行判过期」会对同一个租户给出不同结论 —— 那正是本 issue 要消灭的
+    # 「不确定」态。now 是 ISO 串(给人看),这个是 epoch(给判定用)。
+    _accepted_epoch = int(time.time())
+    # #564 G5 —— 死线秒数走**运行时载体**(SSM Parameter → 缓存 → 回落 env/默认),
+    # 而不是 `create_deadline.deadline_at()`(那条只看 env/默认)。
+    #
+    # **为什么这一行是 G5 的成立条件**(Codex 独立复审抓出来的):没有它,参数改了也不会影响
+    # 任何真实死线,而 `GET /system/info` 却把参数值报成 "effective" —— 运维会看到一次
+    # **成功但毫无作用**的变更,那正是本门要消灭的「看不见的失败」,只是换了个方向。
+    # 计时起点仍是受理时刻(与 #562 一致),口径不变;变的只是"秒数从哪来"。
+    #
+    # raise 的口径与 env 版一致:参数值非法 → 炸(配置手误必须炸);SSM 读不到/读失败 →
+    # 回落 env/默认、不炸(瞬时故障不该把一次合法创建变 500)。
+    # #564 G2 —— consumer 重放时**继承**首次受理算出的死线,不重算。
+    #
+    # 修的是一个真实的不一致:create-via-queue 的 202(:1829)把受理时刻算出的死线
+    # **承诺给了客户**,而 consumer 重放时本函数会重新执行 `int(time.time())`,于是写进
+    # 租户行、被 `deadline_executor` 用来判死的是一个**更晚**的死线,差值正好是排队时长。
+    # 客户被告知 T1、系统按 T2 执行,而 #562 的预算表(`QUEUE_BUDGET_SEC = 180-2-128 = 50s`)
+    # 本来就是为「把排队时长算在 180s 之内」留的 —— 重算等于把那 50s 预算变成无限。
+    #
+    # 走 `event` 而不是 body:body 是**客户可控**的 POST 内容(`MSG_DEADLINE_KEY` 是
+    # `"deadline"`,没有下划线前缀,客户塞一个就能自己指定死线);`event["_deadline_epoch"]`
+    # 由 consumer 从**消息顶层**构造,与 `_op_id` 同一条不可伪造的路。
+    _inherited_dl = (event or {}).get("_deadline_epoch")
+    if _inherited_dl is not None:
+        _create_deadline_epoch = int(_inherited_dl)
+        print(
+            f"create_deadline: 继承首次受理的死线 {_create_deadline_epoch},"
+            f"距它还剩 {_create_deadline_epoch - _accepted_epoch}s"
+        )
+    else:
+        _dl_sec, _dl_src = deadline_config.effective_deadline_sec(
+            create_deadline.ACTION_CREATE
+        )
+        _create_deadline_epoch = _accepted_epoch + _dl_sec
+        if _dl_src != "ssm":
+            # 只在**没走参数**时记一行:那意味着运维以为改了参数其实没生效,或者压根没托管这一档。
+            # 走了参数是常态,不值得每次创建都刷日志。
+            print(
+                f"create_deadline: {_dl_sec}s from {_dl_src} "
+                f"(参数 {deadline_config.param_name_for(create_deadline.ACTION_CREATE)} 未生效)"
+            )
 
     # ── R16.2 在途去重:同 owner_id+tenant_user_id 只允许一个在途创建 ──
     # 仅首次 API 调用做(consumer 回放已有占位,跳过)。
@@ -1378,6 +1830,15 @@ def create_tenant(body=None, event=None):
                 "created_at": now,
                 "updated_at": now,
                 "creation_started_at": now,
+                # #562 —— 创建死线的【绝对】时间戳(epoch 秒)。三个消费者读它:
+                #   ① dispatch_service 消费前检查过期(过期即丢弃,不起 VM);
+                #   ② dispatch_service 判「注定超不过死线」→ 判死 + 触发扩容;
+                #   ③ dispatch_poller 的独立死线执行者兜底扫「creating 且已过死线」——
+                #      消费者挂掉时死线承诺必须仍兑现,而那恰恰是最需要它兑现的时候(G6)。
+                # 用绝对值而非「剩余秒数」:消息会在队列里躺任意久、会被重投多次,相对量每经
+                # 一跳都要重算,错一次整条链路口径就不一致。这里算一次,全链只读。
+                # creation_started_at 是 ISO 串(给人看),这个是 epoch(给判定用),两者并存。
+                create_deadline.ATTR_DEADLINE: _create_deadline_epoch,
                 "name": name,
                 "vcpu": int(vcpu),
                 "mem_mb": int(mem_mb),
@@ -1424,8 +1885,11 @@ def create_tenant(body=None, event=None):
                 e.response.get("Error", {}).get("Code")
                 == "ConditionalCheckFailedException"
             ):
+                # #562 G9 —— 与 _persist_tenant_record 的 409 同款:带当前 status 与归因,
+                # 客户端才能区分「在跑别重试」与「墓碑换 token」。共用一个 helper,
+                # 不在两处各拼一遍(两处漂了就等于没有这个契约)。
                 return utils._resp(
-                    409, {"error": "tenant already exists", "id": tenant_id}
+                    409, {"error": "tenant already exists", **_conflict_extra(tenant_id)}
                 )
             raise
 
@@ -1477,6 +1941,13 @@ def create_tenant(body=None, event=None):
             "action": "create",
             "tenant_id": tenant_id,
             "request_token": (body.get("client_token") or "") or f"req-{tenant_id}",
+            # #562 —— 死线随消息走(G7)。消费者【消费前】先看这个字段,过期即丢弃、
+            # 不发起任何 SSM。为什么必须在消息体里而不是只查租户行:消费者停 10 分钟后恢复
+            # 会一次性领到一大批早已被判死的消息,若每条都回查 DDB 才知道过不过期,那一波
+            # 回查本身就是限流风险;而丢弃是安全的 —— 独立死线执行者(G6)已经把它们判死了。
+            # 与占位租户行上的 ATTR_DEADLINE 是【同一个值】(见上方 _create_deadline_epoch
+            # 的注释:只算一次),所以「按消息判」与「按租户行判」永远同结论。
+            create_deadline.MSG_DEADLINE_KEY: _create_deadline_epoch,
             "params": {
                 "vcpu": int(vcpu),
                 "mem_mb": int(mem_mb),
@@ -1523,6 +1994,12 @@ def create_tenant(body=None, event=None):
                 "id": tenant_id,
                 "status": "queued",
                 "message": "create accepted; dispatching",
+                # #562 —— 死线必须出现在【每一条】202 上,不能只在部分路径上。
+                # 真机 invoke 抓出来的:队列路径(生产默认)的 202 原来不带这个字段,
+                # 而契约文档说「响应体带死线」。调用方【无从知道】自己走了哪条内部路径,
+                # 所以一个只在部分路径出现的字段等于不可用 —— 客户端要么得容忍它缺失
+                # (那它就没有约束力),要么会在缺失时崩。故四条 202 出口全部带上。
+                create_deadline.ATTR_DEADLINE: _create_deadline_epoch,
             },
         )
 
@@ -1553,7 +2030,16 @@ def create_tenant(body=None, event=None):
         if platform_id:
             queued_body["platform_id"] = platform_id
         if lifecycle_dispatch.enqueue_lifecycle(
-            "create", tenant_id, event, extra=queued_body
+            "create",
+            tenant_id,
+            event,
+            extra=queued_body,
+            # #564 G2 —— 把受理时刻算出的死线带进消息,consumer 用它做两件事:
+            # ① 消费前判过期(G3);② 重放 `create_tenant` 时**继承**它而不是重算
+            # (见 :1499 那段:重算会让客户被承诺的死线与实际执行的不一致)。
+            # 与上面两条 202 里返给客户的、以及占位租户行上的 `create_deadline`
+            # 是【同一个值】。
+            deadline_epoch=_create_deadline_epoch,
         ):
             # 在途窗口关闭:已入 FIFO 队列,释放占位锁(同上;见 inflight_dedup docstring)。
             inflight_dedup.release_inflight_lock(owner_id, tenant_user_id)
@@ -1563,6 +2049,8 @@ def create_tenant(body=None, event=None):
                     "id": tenant_id,
                     "status": "queued",
                     "message": "create accepted; provisioning asynchronously",
+                    # #562 —— 同上:死线必须出现在每一条 202 上(见上一处的完整说明)。
+                    create_deadline.ATTR_DEADLINE: _create_deadline_epoch,
                 },
             )
 
@@ -1638,6 +2126,22 @@ def create_tenant(body=None, event=None):
                         "error": f"preferred_host_id {preferred_host_id} not found or draining"
                     },
                 )
+            # #540 — 污点(cordon)机器被显式指定:409,与 draining 的 404、容量不足的 400
+            # 三者分开。分开的理由是三种情况运维要做的事完全不同 —— 404 是打错了 id 或机器
+            # 正在下线;400 是这台真的满了,换台或等腾空;409 是这台被【刻意】标了不收新租户,
+            # 你要么换台,要么先取消污点。混成一个码会让人对着满载去排查,方向就错了。
+            # 复用上面那次诊断性 get_item,不额外读。
+            if host_taint.is_tainted(existing):
+                inflight_dedup.release_inflight_lock(owner_id, tenant_user_id)
+                return utils._resp(
+                    409,
+                    {
+                        "error": f"preferred_host_id {preferred_host_id} is tainted "
+                        "(cordoned): it accepts no new tenants. Pick another host, "
+                        "or remove the taint first.",
+                        "code": "HOST_TAINTED",
+                    },
+                )
             inflight_dedup.release_inflight_lock(owner_id, tenant_user_id)
             return utils._resp(
                 400,
@@ -1663,6 +2167,11 @@ def create_tenant(body=None, event=None):
             "tags": tags,
             "created_at": now,
             "updated_at": now,
+            # #562 —— pending 路径也要落死线。这条路径最需要它:它进来就是【没有 host】,
+            # 靠 scale-out + process_poller promote,是「等容量」的典型;不落死线,
+            # 独立死线执行者(G6)扫不到它,租户就会永久停在 pending —— 而 pending 既不是
+            # running 也不是 failed,业务拿它做不了任何决策,正是本 issue 要消灭的非终态。
+            create_deadline.ATTR_DEADLINE: _create_deadline_epoch,
         }
         if owner_id:  # issue #80 — record ownership for IDOR enforcement
             item["owner_id"] = owner_id
@@ -1705,12 +2214,19 @@ def create_tenant(body=None, event=None):
         except (
             clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException
         ):
+            # #562 G9 —— 第三处 409(pending 路径)。三处共用 _conflict_extra:
+            # 少改一处就等于客户端在那条路径上仍分不清「在跑」与「墓碑」。
             return utils._err(
                 409,
                 "CONFLICT",
                 f"tenant '{tenant_id}' already exists",
-                extra={"id": tenant_id},
+                extra=_conflict_extra(tenant_id),
             )
+        # #562 —— 这一行是 _scale_out() 在全仓的【唯一】调用点(G15 核实过)。
+        # 形态第 3 条要把本路径的 201 统一成 202,顺手改动这一段时【绝不能把它删掉】:
+        # 删了之后连现存这一条扩容触发都没有,而 dispatch 队列路径(生产默认 DISPATCH_MODE=ddb)
+        # 本来就不触发扩容。#562 在 dispatch 判死路径【另外】补了触发(G14),两处并存不是重复:
+        # 这一条管「同步路径无 host」,那一条管「队列路径判死」。
         scheduling._scale_out()
         audit._publish_event(
             "tenant.created",
@@ -1726,12 +2242,20 @@ def create_tenant(body=None, event=None):
         # (consumer replay,不 acquire)在 HostReady 时 promote。释放占位锁(同其它成功
         # 路径;不释放会 409 挡同 owner+user 的第二次合法创建到 30min TTL)。
         inflight_dedup.release_inflight_lock(owner_id, tenant_user_id)
+        # #562 形态第 3 条 —— 合法请求【永远 202】。这条路径原本返 201 `pending`,
+        # 而 201 的语义是「已创建」:客户端拿到 201 会以为 VM 已经在了,实际上机队还没有
+        # host、要等 scale-out + process_pending 才 promote。202「已受理」才是实情。
+        # 三条创建出口(queued / pending / 同步 creating)现在口径一致:合法即 202,
+        # 前置校验失败仍同步 400/409(形态第 3 条的括号部分)。
+        # 死线一并给出去:客户端据它决定「什么时候可以认定这次创建没戏了」——
+        # 不暴露排队位次(那会把调度算法绑进对外契约),只暴露绝对死线时间戳。
         return utils._resp(
-            201,
+            202,
             {
                 "id": tenant_id,
                 "status": "pending",
-                "message": "scaling out, VM will be created when host is ready",
+                "message": "create accepted; scaling out, VM will be created when host is ready",
+                create_deadline.ATTR_DEADLINE: _create_deadline_epoch,
             },
         )
 
@@ -1754,7 +2278,6 @@ def create_tenant(body=None, event=None):
         Returns `(vm_num, None)` on success, else `(None, reason)` where reason is
         one of `_CLAIM_CONTENDED` / `_CLAIM_FULL`.
 
-        #475 必修1 —— 为什么必须分辨这两种失败:调用方在"真满了"时把 host 拉出候选池
         (见下方 tried_hosts 的注释,那是 2026-08-11 实测事故的修复),但在"只是抢输了
         槽位号"时把它拉黑,等于把一台【仍有余量】的 host 从池子里删掉。池里只剩一台有
         空间时,拉黑它就没有下一台 → 8 次重试只用掉 1 次就直接 503。而"池子接近装满"
@@ -1797,14 +2320,19 @@ def create_tenant(body=None, event=None):
             ":next_after": target + 1,
             ":cap_v": cap_v,
             ":cap_m": cap_m,
+            **host_taint.NOT_TAINTED_VALUES,  # #540
         }
         try:
             _kwargs = dict(
                 Key={"instance_id": h["instance_id"]},
                 UpdateExpression=_set_expr,
+                # #540 — 污点原子门。选点(_find_host)与认领之间有窗口:运维正好在这时标记。
+                # 用条件写解决而不是认领前再读一次 —— 二次读只是把窗口缩小,不消除它,而且多
+                # 一次强一致读。条件写是零额外读的原子判定。
                 ConditionExpression=(
                     "next_vm_num = :expected AND used_vcpu <= :cap_v "
-                    "AND used_mem_mb <= :cap_m AND attribute_not_exists(#ps)"
+                    "AND used_mem_mb <= :cap_m AND attribute_not_exists(#ps) "
+                    "AND " + host_taint.NOT_TAINTED_CONDITION
                 ),
                 ExpressionAttributeValues=_vals,
                 ReturnValues="UPDATED_NEW",
@@ -2018,6 +2546,10 @@ def create_tenant(body=None, event=None):
         "mem_mb": mem_mb,
         "status": "creating",
         "health_failures": 0,
+        # #562 —— 同步路径也要落死线。它虽然已经装箱、已下发 launch,但 status 仍是
+        # creating:host 侧起 VM 失败或卡住时,没有死线就没人把它推到终态(现有自愈只覆盖
+        # 部分形态)。三条创建出口都落同一个字段,死线执行者才有单一扫描判据。
+        create_deadline.ATTR_DEADLINE: _create_deadline_epoch,
         "rootfs_version": host.get("rootfs_version", ""),
         # #517 阶段1 —— 新租户继承 host 当前的 immutable_version(只读身份盘版本坐标)。
         # Canary 租户实际从固定的 versions/<snapshot>/ 挂盘,必须记录 candidate 坐标;
@@ -2242,14 +2774,21 @@ def create_tenant(body=None, event=None):
     # owner+tenant_user_id 第二次合法创建被 409 挡到 30min TTL。)
     inflight_dedup.release_inflight_lock(owner_id, tenant_user_id)
 
+    # #562 形态第 3 条 —— 第三条出口(同步路径)也统一 202。
+    # 这条路径已经下发了 launch,但租户 status 仍是 `creating` 而不是 `running`:VM 起没起来、
+    # gateway 通没通,都要等 host 侧完成。201「已创建」对它同样是过度承诺 —— 客户端据 201
+    # 直接去连数据面会撞上还没起来的 gateway。202「已受理 + 给你死线」才是实情。
+    # 与另两条出口口径一致后,客户端只需要一条规则:合法请求恒 202,拿死线轮询终态。
+    # host_id/guest_ip/host_port 仍然给 —— 它们此刻已经确定,不给等于让客户端多查一次。
     return utils._resp(
-        201,
+        202,
         {
             "id": tenant_id,
             "host_id": host["instance_id"],
             "guest_ip": guest_ip,
             "host_port": host_port,
             "status": "creating",
+            create_deadline.ATTR_DEADLINE: _create_deadline_epoch,
         },
     )
 
@@ -2271,7 +2810,13 @@ def _force_backup_sync(tenant_id):
     deleting/其它非 running 态(先于本调用),不带这个信号 backup 会 no-op 拒掉。
     """
     try:
-        lambda_client = boto3.client("lambda")
+        # #565 G1-a —— 必须显式给 Config。裸 client 吃 botocore 默认 read_timeout=60,
+        # 而 backup 侧真实上界 ~305s → 超过 60s 的备份会在 backup 侧仍在预算内时被这里
+        # 掐掉,而它继续跑完并写 S3 → 下面的 except 按 fail-closed 判失败 → 上层看到失败、
+        # 底层其实备成功了。取值与"不重试"的理由见 core/clients.BACKUP_SYNC_INVOKE_CONFIG。
+        lambda_client = boto3.client(
+            "lambda", config=clients.BACKUP_SYNC_INVOKE_CONFIG
+        )
         resp = lambda_client.invoke(
             FunctionName=os.environ.get("BACKUP_FUNCTION", "openclaw-backup"),
             InvocationType="RequestResponse",  # SYNC: data safe in S3 before rm
@@ -2328,13 +2873,54 @@ def _delete_tenant_inner(tenant_id, query_params, event=None, _lifecycle_ctx=Non
     # 【确认回收】专路。落实 ADR "suspended 删除必经确认回收"。
     # suspend/restore launch 竞争),此刻删除会与那些操作抢状态、可能留孤儿 VM(delete 先翻
     # deleted、restore 又起 VM)→ 返 409 让调用方等在途操作收敛(达稳定 suspended 或回 running)。
-    if item.get("status") in ("suspending", "restoring"):
+    #
+    # 上面这条 409 本身是对的(在途 suspend/restore 与 delete 抢状态会留孤儿 VM),但它与
+    # P1 组合出一个死局:一个因 Lambda 被杀而永久卡在 suspending/restoring 的租户,
+    # 【连删除都做不到】—— issue 原话「连删除这条兜底出口都是关着的」,只能人工改 DDB。
+    #
+    # 放行条件是【两个】,缺一不可:
+    #   ① 调用方显式带 ?force=true —— 表明这是有意识的强制操作,不是普通删除误入;
+    #   ② 该租户已被 health_check 的中间态巡检标记 lifecycle_stuck_at —— 即
+    #      **由 reaper 按 host 侧事实判定过它真的卡死了**,不是调用方自称卡死。
+    # 只有 ② 而没有 ① → 仍走正常等待(卡死不等于必须马上删);只有 ① 而没有 ② → 拒绝,
+    # 否则这个开关就成了"随时打断一个正在合法执行的 suspend"的后门(那会造出孤儿 VM,
+    # 正是上面 409 要防的)。
+    # ③ 只放行 `suspending`(codex 独立复审第四轮)。`restoring` 【不】放行:
+    #    restore 的破坏性动作是「在新 host 上预留 slot + 起 VM」(:3508 `_reserve_slot_on`),
+    #    而在 restore 定型之前,租户行里的 host_id / vm_num 仍是【旧的】。此时走普通
+    #    delete 会:
+    #      · 按旧行去扣【旧 host】的账本 —— 而那个 slot 在 suspend 时已经释放过 → 扣穿,
+    #        而 `_release_slot` 只有下溢守卫、没有「这个租户扣过没」的互斥锚(:123),
+    #        host 上还有别的租户占容量时那一扣会成功并吃掉别人的额度;
+    #      · 按旧 host_id/vm_num 下发 stop/rm → 停错 VM 或对已不存在的 VM 做无效副作用;
+    #      · 新 host 上那份预留【没人释放】→ 泄漏,且该物理槽位可能被下一个租户复用
+    #        (跨租户槽位复用,no-cross-tenant 方向)。
+    #    要安全放行 restoring,前置是「目标 host/slot 与一个幂等的 reservation 令牌已落库」
+    #    并在错误里给出明确出路 —— 而不是提供一条会腐蚀容量账本的假出口。
+    _force = query_params.get("force", "false").lower() == "true"
+    _stuck_at = item.get("lifecycle_stuck_at")
+    _forcible = item.get("status") == "suspending"
+    if item.get("status") in ("suspending", "restoring") and not (
+        _force and _stuck_at and _forcible
+    ):
+        if not _forcible:
+            _hint = (
+                "restoring cannot be force-deleted: the row still points at the OLD "
+                "host/vm while restore may already hold a reservation on the NEW host, "
+                "so a normal delete would double-decrement the old host's ledger, stop "
+                "the wrong VM and leak the new reservation. Wait for it to settle "
+                "(running or suspended), then delete"
+            )
+        elif not _stuck_at:
+            _hint = "wait for it to settle (suspended or running) before delete"
+        else:
+            _hint = "tenant is marked stuck; retry with ?force=true to delete it"
         return utils._resp(
             409,
             {
-                "error": f"tenant is {item['status']} (hibernate/restore in flight); "
-                "wait for it to settle (suspended or running) before delete",
+                "error": f"tenant is {item['status']} (hibernate/restore in flight); {_hint}",
                 "id": tenant_id,
+                **({"lifecycle_stuck_at": _stuck_at} if _stuck_at else {}),
             },
         )
 
@@ -2369,7 +2955,190 @@ def _delete_tenant_inner(tenant_id, query_params, event=None, _lifecycle_ctx=Non
         lifecycle_op_id, lifecycle_epoch
     )
 
-    if item.get("status") == "suspended":
+    #   · 稳定 suspended:slot 已在 suspend 时释放(既有语义,见下方注释);
+    #   · 强制删除一个卡在 suspending 且【盘已被回收】的租户:reaper 探到
+    #     lifecycle_stuck_vm_dir=False,说明 suspend 已跑过 rm -rf(tenant_service:3134),
+    #     而账本扣减就在其后一行(:3149 _release_slot)—— 于是账本【可能已扣】。
+    #     scheduling._release_slot(scheduling.py:123)只有下溢守卫、没有"这个租户扣过没"
+    #     的互斥锚,所以再走普通 delete 扣一次,若 host 上还有别的租户占着容量,那一扣会
+    #     故这类必须走同一条不扣账本的路。代价:若账本实际还没扣,这个 slot 会泄漏;
+    #     而扣穿别人的容量不可接受,两害取轻,与既有取舍一致。
+    #
+    #     ⚠ 这里原先写的是"需靠对账回收(可恢复)"。codex 独立复审第五轮质疑了这句,
+    #     实查后【它是一句没有兑现的承诺】,现更正:全仓**没有**容量账本对账器 ——
+    #     20 处写 used_vcpu/used_mem_mb/vm_count 全是"增量预留"或"单点定额扣减",
+    #     没有一处做重算/比对/写回;5 条 EventBridge 定时 Lambda 逐个排除;
+    #     tenant_stats 已按 host 汇总出了所需的那个数(handler.py 的 per_host_counts),
+    #     但它连 hosts 表句柄都没有,算完只写快照、从不比对。本文件 :234 与 :3203 两处
+    #     既有注释也早已写明同一件事:"deleted 租户不被 reaper 兜底 → 容量永漏"。
+    #
+    #     值得记下的不对称:health_check 的 reap_orphan_phys_slots 【是】一个真对账器
+    #     (扫租户表建在役集合 → 扫 host 行比对 → 无主就写回),而且它明确把 deleted
+    #     租户当不在役、回收其 ps_<n>。也就是说同一个 host 行上,一个已 deleted 租户的
+    #     **物理槽位会被对账回收,而它的 vcpu/mem/vm_count 不会** —— (B)类对账的模式
+    #     在本仓库存在,只是没有铺到容量三元组上。
+    #
+    #     capacity_reservation_id 那种一次性令牌)。没有它,任何"发现少扣就补一刀"的
+    #     对账器本身就会变成第二个扣穿源。这属独立高危子项,已记入 UNRESOLVED_GAPS。
+    #     本次只把承诺改成事实:这个泄漏目前**要人工重算**,没有自动兜底。
+    #
+    #     为什么仍然放行删除(而不是像 codex 建议的"账本状态未知就不许报删除成功"):
+    #     (P4 原话:卡死租户占着永不释放的槽,数量只增不减)。可人工重算的容量泄漏
+    #     比"连删都删不掉"轻,方向与本 issue 一致。
+    #
+    # 反过来,卡在 suspending 但【盘还在】(vm_dir=True)、或卡在 restoring 的租户,账本
+    # 状态是明确的(前者未扣、后者 restore 已在新 host 预留),走下面的普通 delete 路径
+    # 才正确 —— 它会停 VM、删盘、扣账本,一步不少。
+    #
+    # ⑦ codex 独立复审第六轮 —— 路径选择改用【当场复探】,不再信 reaper 留下的快照。
+    # reaper 对已标记的租户不再复探(health_check :1127,为了不烧光每轮探测预算),所以
+    # lifecycle_stuck_vm_dir 可能是几小时前的事实。两个方向都会踩账本红线,详见
+    # _probe_stuck_tenant_facts 的 docstring。分工改为:reaper 的标记是**准入凭据**
+    # (证明它确实卡住、不是正在正常执行),**走哪条路由当场复探决定**。
+    # 探不到就拒绝(502),不猜 —— 与 reaper 的"确认不了就什么都不做"同一条原则。
+    _stuck_disk_gone = False
+    _fresh_fc_alive = None
+    if item.get("status") == "suspending" and item.get("lifecycle_stuck_at"):
+        _pok, _pf = _probe_stuck_tenant_facts(item.get("host_id"), tenant_id)
+        if not _pok:
+            _mark_fail_reason(tenant_id, "delete", create_deadline.REASON_HOST_UNREACHABLE)
+            # ㉓ 只读失败必须【放掉围栏】(codex 独立复审第十九轮)。
+            #
+            # delete_tenant 的 wrapper(:2519)见 code>=500 就 hold_lifecycle_fence=True。
+            # 而这条返回是 502,于是围栏被扣住整个租期(LIFECYCLE_FENCE_LEASE_SECONDS=1800,
+            # 30 分钟)—— 而我的文案写着 "Nothing was changed; retry."。**照文案去 retry
+            # 会撞 LIFECYCLE_IN_FLIGHT,半小时内根本进不来。**
+            #
+            # 这比"文案不准"更糟:这条路正是 P2 给卡死租户留的唯一出口,一次瞬时 SSM 抖动
+            # 就把运维锁在门外 30 分钟,而租户本来就已经卡死了。
+            #
+            # 放掉是安全的,判据是【此刻还没有任何破坏性命令下发】—— 探测是纯只读的
+            # (get-item + 一条读 /proc 与 ls 的 SSM)。下面那条 stop-vm 确认失败的 502
+            # 刻意【不】放掉:那时命令已经下发且结果未知,放掉会让 restore 与在途 stop 交错。
+            if _lifecycle_ctx is not None:
+                _lifecycle_ctx["release_lifecycle_fence_on_error"] = True
+            return utils._resp(
+                502,
+                {
+                    "error": "cannot force-delete: host-side state could not be probed "
+                    "right now (host unreachable / SSM failing). The route depends on "
+                    "whether the disk was already reclaimed — the reaper's stored probe "
+                    "may be hours stale, and guessing either way corrupts the capacity "
+                    "ledger. Nothing was changed; retry.",
+                    "id": tenant_id,
+                },
+            )
+        _stuck_disk_gone = _pf["vm_dir"] is False
+        _fresh_fc_alive = _pf["fc_alive"]
+    if item.get("status") == "suspended" or _stuck_disk_gone:
+        # ⑥ codex 独立复审第五轮 —— 盘没了【不等于】VM 停了,而这条路会释放物理槽位。
+        #
+        # `_stuck_disk_gone` 只看 vm_dir=False,把 lifecycle_stuck_fc_alive 完全忽略了。
+        # reaper 的判定矩阵对 `suspending + 盘没了` 这一格,fc_alive 写的是 `*` ——
+        # 两种都放行,因为它确实两种都可能:Linux 上 rm -rf 掉目录【不会】杀死持有那些
+        # 文件描述符的 Firecracker 进程。于是有一格真实现场是「盘已删 + FC 还活着」。
+        #
+        # 这条路对那一格是错的,而且错法比"少扫一次"严重:
+        #   · 它一路走到底 CAS 成 deleted,全程【不下发任何 host 侧清理】——
+        #     依据是"suspended 租户没有 VM/盘的破坏性副作用序列",这对真 suspended
+        #     成立,但对这一格不成立:VM 还在跑;
+        #   · 然后 `release_phys_slot` 把 ps_<n> 放回去(第三轮补的,本身没错);
+        #   · 而 `phys_tap_occupied`(core/scheduling.py:195)是【扫租户表】判占用、
+        #     且明确排除 deleted 行 —— 行一翻 deleted,这个号在"发号器 ps_<n>"和
+        #     "撞号复检"两套机制里【同时】变空闲;
+        #   · 下一个租户于是被排到 n 上,launch-vm.sh 走 `ip link del` + `kill -KILL`
+        #   在被复用之前,那个孤儿 guest 还带着自己的 DNAT(host_port)在跑,而租户已被
+        #   宣告 deleted:"deleted 却还能从 host 端口连上去"本身就不该发生。
+        #
+        # 修法:**CAS 之前**同步 stop 并要回执,确认不了就 502、一个字段都不改。
+        # 「释放前先做权威停机确认,确认不了就不释放,时序不替代正确性」。
+        #
+        # 为什么放在 CAS 【之前】而不是之后:之后就已经宣告 deleted 了,stop 失败时既
+        # 收不回那句话,也只能靠"跳过 release_phys_slot"半兜底。之前失败则什么都没动,
+        # stop-vm.sh 幂等,重试完全安全。
+        # 为什么 CAS 前 stop 不会误杀一个合法活着的 VM:进这条分支要求 status 仍是
+        # suspending 且已被 reaper 按 host 事实标记为「盘已删」——这个状态下不存在合法
+        # 活 VM。若并发的 suspend 恰好跑完(→suspended),那 VM 本就该停,stop 是 no-op
+        # success,随后 CAS 会因 `#s = :cur` 而 CCF 出局返 409。若之后又被 restore 拉起,
+        # 它拿的是【新】vm_num(冷恢复重分配,:3610),而这里 stop 的是旧号,打不到它。
+        # 用 `is not False` 而不是 `is True`:探不到/未探(理论上到不了这里,因为探不到
+        # 已在上面 502 了)一律当"可能活着"处理 —— fail-closed。
+        #
+        # 第六轮起这里用的是【当场复探】的 _fresh_fc_alive,不再是租户行里 reaper 留下的
+        # lifecycle_stuck_fc_alive 快照 —— 后者可能是几小时前的(reaper 对已标记者不复探)。
+        if _stuck_disk_gone and _fresh_fc_alive is not False:
+            _sg_host = item.get("host_id")
+            _sg_vm = item.get("vm_num")
+            if not _sg_host or _sg_vm is None:
+                # #565 G3(Codex 独立复审第四轮)—— 这条**不是** host_unreachable。
+                # 条件是「租户行上缺 host_id / vm_num」= 数据不完整,重试一万次也不会让
+                # 缺失的字段出现;下面那句注释自己写着「已经需要人工介入」「运维修好行数据
+                # 后想立刻重删」。而 host_unreachable 的契约指引是「值得,隔 1–2 分钟重试」——
+                # 自动化调用方照它做就是无限重试一个永远不会自愈的状态。
+                # 上面那条(`_probe_stuck_tenant_facts` 探不到)才是真的 host_unreachable:
+                # 那是 SSM/探测失败,重试有意义。两者不能共用一个值。
+                _mark_fail_reason(tenant_id, "delete", create_deadline.REASON_SYSTEM)
+                # 与上面那条探测失败同类:【纯只读,没有任何命令下发】→ 放掉围栏。
+                # 否则这个已经需要人工介入的租户会再被自己的围栏锁住 30 分钟,
+                # 运维修好行数据后想立刻重删也进不来。
+                if _lifecycle_ctx is not None:
+                    _lifecycle_ctx["release_lifecycle_fence_on_error"] = True
+                return utils._resp(
+                    502,
+                    {
+                        "error": "cannot force-delete: the tenant may still have a live "
+                        "VM (disk gone but Firecracker reported alive) and its "
+                        "host_id/vm_num is missing, so the VM cannot be stopped. "
+                        "Releasing the slot now would let the next tenant land on a "
+                        "live VM. Escalate.",
+                        "id": tenant_id,
+                    },
+                )
+            # 自愈同 restore 回滚那处(:3745):stop-vm.sh 缺失/过期会静默无效,
+            # 而这里的返回值是【判据】,不能让一个跑不动的脚本冒充"已确认停机"。
+            #
+            # 哨兵必须是 OC_STOP_ORPHAN_NO_VMDIR 而【不是】OC_LIFECYCLE_LOCK_FD
+            # (codex 第六轮)。旧版 stop-vm.sh 在目录缺失时直接 `exit 0` 报"已停",
+            # 而这条路的触发条件恰恰就是 vm_dir=False —— 拿旧脚本来确认等于空转:
+            # 它返回成功,我们据此 CAS 成 deleted 并释放 ps_<n>,而 VM 还在跑。
+            # 用旧哨兵会让"存在但过期"的脚本通过新鲜度检查、永不被替换,那正是
+            # deploy/lambda/backup/handler.py 注释里记着的同一个教训。
+            _sg_heal = ssm_dispatch.host_script_self_heal(
+                ("stop-vm.sh",),
+                "oc:force-delete",
+                freshness=("stop-vm.sh", "OC_STOP_ORPHAN_NO_VMDIR"),
+            )
+            _sg_q_tid = shlex.quote(str(tenant_id))
+            _sg_q_vm = shlex.quote(str(int(_sg_vm)))
+            # 60s:比 health_check 那条纯确认用的 STOP_CONFIRM_TIMEOUT=20 宽裕(它有
+            # 每轮预算要防饿死,这里是单次同步请求),又远小于普通 delete 的 300
+            # (那条含 backup)。留余量是因为前置的 self-heal 可能要从 S3 拉脚本。
+            if not ssm_dispatch._ssm_run(
+                _sg_host,
+                f"{_sg_heal} && /home/ubuntu/stop-vm.sh {_sg_q_tid} {_sg_q_vm}",
+                timeout=60,
+            ):
+                _mark_fail_reason(tenant_id, "delete", create_deadline.REASON_HOST_UNREACHABLE)
+                return utils._resp(
+                    502,
+                    {
+                        # 文案必须说实话:这条【刻意扣住围栏】(与上面两条只读失败相反)。
+                        # stop-vm 已经下发且结果未知,而它没带 host_guard —— 此刻放掉围栏
+                        # 会让一次 restore 与在途的 stop 交错。所以立刻重试会撞
+                        # LIFECYCLE_IN_FLIGHT,要等租约到期。之前这里写"retry",是在承诺
+                        # 一件代码不允许的事(与 ㉒ ㉓ 同一个病)。
+                        "error": "cannot force-delete: stop-vm was NOT confirmed, so the "
+                        "VM may still be running while its disk is already gone. "
+                        "Declaring the tenant deleted would free its physical slot "
+                        "(ps_<n>) and the next tenant could be placed on top of the live "
+                        "VM. The tenant row was not changed. NOTE: the lifecycle lease is "
+                        "deliberately held here (an unconfirmed stop-vm may still land, "
+                        "and it carries no fence guard), so a retry returns "
+                        "LIFECYCLE_IN_FLIGHT until the lease expires; stop-vm itself is "
+                        "idempotent, so retrying after that is safe.",
+                        "id": tenant_id,
+                    },
+                )
         _keep = query_params.get("keep_data", "true").lower() == "true"
         _bk = item.get("restore_backup_key", "")
         # 抢闸:CAS 抢下唯一赢家,才做删 S3 备份/撤 vkey(否则并发 restore 先赢 suspended→
@@ -2382,9 +3151,15 @@ def _delete_tenant_inner(tenant_id, query_params, event=None, _lifecycle_ctx=Non
         _remove = (
             "restore_backup_key, suspended_at, suspended_from, "
             f"cognito_channel_password, {_STALE_HEALTH_FIELDS}"
+            ", lifecycle_stuck_at, lifecycle_stuck_reason, lifecycle_stuck_vm_dir"
+            ", lifecycle_stuck_fc_alive, updated_at_stuck_seen, lifecycle_prev_status"
+            ", lifecycle_rollback_deferred_until, lifecycle_probe_attempted_at"
         )
         _set = "SET #s = :d, updated_at = :t"
-        _vals = {":d": "deleted", ":cur": "suspended", ":t": utils._now()}
+        # CAS 的 :cur 必须是【本次读到的那个状态】,不能写死 "suspended" —— 强制删除走
+        # 这条路时当前状态是 suspending,写死会让条件永远 CCF、force 出口形同不存在。
+        _cur_status = item.get("status")
+        _vals = {":d": "deleted", ":cur": _cur_status, ":t": utils._now()}
         # vkey 撤销在 CAS 前做(幂等,失败则保留字段+flag);其余破坏性清理在 CAS 赢后做。
         _vkey_revoked = vkey._revoke_tenant_vkey(_vkey) if _vkey else True
         if _vkey and not _vkey_revoked:
@@ -2407,11 +3182,37 @@ def _delete_tenant_inner(tenant_id, query_params, event=None, _lifecycle_ctx=Non
             cur2 = (clients.tenants_table.get_item(Key={"id": tenant_id}, ConsistentRead=True).get("Item") or {})
             if cur2.get("status") == "deleted":
                 return utils._resp(200, {"id": tenant_id, "status": "deleted"})
+            _mark_fail_reason(tenant_id, "delete", create_deadline.REASON_PREEMPTED)
             return utils._resp(
                 409,
-                {"error": f"tenant is now {cur2.get('status')}; suspended-delete lost the race", "id": tenant_id},
+                {
+                    "error": f"tenant is now {cur2.get('status')}; "
+                    f"{_cur_status}-delete lost the race",
+                    "id": tenant_id,
+                },
             )
         # CAS 赢(已 deleted 终态),破坏性清理 best-effort(崩溃泄漏可对账,不影响 slot 账本)。
+        #
+        # 上面那段注释论证的是【容量账本】不能在这条路上扣(_release_slot 不幂等,
+        # 二次扣会吃掉别人的额度),那个结论不变。但物理槽位是**另一套机制**,
+        # 复审指出的这一半是真缺口:这条路此前完全没释放它,租户行一旦翻 deleted、
+        # 恢复元数据被 REMOVE,ps_<n> 就永久挂在一个已不存在的 owner 上 —— 该号再也
+        # 分不出去,而 reap_orphan_phys_slots 靠"owner 已不在役"回收,已 deleted 的行
+        # 仍在表里、它判不出孤儿。
+        #
+        # 为什么这里可以放心释放,而容量账本不行:release_phys_slot 带
+        # `#ps = :tid` 的 owner 条件(core/scheduling.py:239)—— **它是幂等的**,
+        # 号已被别人接手就返 False 不动。这与 _release_slot 只有下溢守卫、没有
+        # "本租户扣过没"互斥锚的情况完全不同。
+        # 判据同 :2935 的普通 delete 路径:phys_vm_num 优先,回落 vm_num
+        # (存量租户没有 phys_vm_num;迁移后 phys_vm_num 恒等原始 launch 号)。
+        _host_id = item.get("host_id")
+        _phys = item.get("phys_vm_num", item.get("vm_num"))
+        if _host_id and _phys is not None:
+            try:
+                scheduling.release_phys_slot(_host_id, _phys, tenant_id)
+            except Exception as e:  # noqa: BLE001 — best-effort,对账会重试孤儿
+                print(f"force-delete {tenant_id}: release_phys_slot failed: {e}")
         if not _keep and _bk:
             try:
                 _bucket = os.environ.get("BACKUP_BUCKET") or os.environ.get("ASSETS_BUCKET", "")
@@ -2428,9 +3229,45 @@ def _delete_tenant_inner(tenant_id, query_params, event=None, _lifecycle_ctx=Non
             item.get("name", ""),
             tenant_id,
         )
+        # ⑳ 把"这次删除没动容量账本"记进审计事件(codex 第五轮提出、第十三轮重提)。
+        #
+        # 两轮的建议都是"拒绝这条快路径直到有幂等令牌",两轮都【维持驳回】——理由见上方
+        # 但驳回一个建议不等于它指出的后果不存在:强制删除一个盘已删的卡死租户时,
+        # 账本【是否已扣】确实不可知,不扣就可能泄漏一份 vcpu/mem/vm_count,而全仓没有
+        # 对账器会发现它(第五轮实查确认)。
+        #
+        # 所以至少把它变【可见】:审计事件带上 ledger_release_skipped,并写清为什么。
+        # 于是"哪些租户可能留下了未回收的容量"是一次审计表查询,而不是靠人回忆;
+        # 也可以据此对账/告警。这比"注释里写清楚"前进一步 —— 注释只有读代码的人看得到。
+        _ledger_unknown = bool(_stuck_disk_gone)
         audit._publish_event(
             "tenant.deleted", tenant_id,
-            {"from_suspended": True, "kept_backup": _keep, "vkey_revoked": _vkey_revoked},
+            {
+                "from_suspended": True,
+                "kept_backup": _keep,
+                "vkey_revoked": _vkey_revoked,
+                # True 仅出现在"强制删除一个盘已被回收的卡死租户"这一格。稳定 suspended
+                # 的正常删除不带它(那种情形 slot 在 suspend 时已确定释放过)。
+                "ledger_release_skipped": _ledger_unknown,
+                **(
+                    {
+                        "ledger_note": (
+                            "capacity was NOT decremented: suspend had already passed "
+                            "rm -rf, so whether _release_slot ran is unknowable and "
+                            "double-decrementing would eat another tenant's quota "
+                            "(_release_slot has no per-tenant idempotency anchor). "
+                            "This may leak one tenant's vcpu/mem/vm_count on this host; "
+                            "there is no reconciler — recompute manually. See #469 "
+                            "UNRESOLVED_GAPS."
+                        ),
+                        "host_id": item.get("host_id", ""),
+                        "vcpu": item.get("vcpu", 0),
+                        "mem_mb": item.get("mem_mb", 0),
+                    }
+                    if _ledger_unknown
+                    else {}
+                ),
+            },
         )
         return utils._resp(200, {"id": tenant_id, "status": "deleted"})
 
@@ -2447,7 +3284,54 @@ def _delete_tenant_inner(tenant_id, query_params, event=None, _lifecycle_ctx=Non
         _extra = {
             "keep_data": query_params.get("keep_data"),
             "skip_backup": query_params.get("skip_backup"),
+            # ⑳ force 也必须透传(codex 独立复审第十八轮)。
+            #
+            # 上面 :2576 那道准入检查在【入队之前】跑,所以带 ?force=true 的首次调用能过、
+            # 入队返 202;而 consumer 重放时若拿不到 force,同一道检查就把它挡成 409。
+            # 409 是 4xx → consumer 明确【不重投】(见 handler.py 那句"4xx 不重试") →
+            # 消息被消费掉,删除永远不发生。
+            # 于是 P2 承诺的"卡死租户可强制删除"在 lifecycle 队列开启时【整条失效】,
+            # 而调用方看到的是 202 —— 正是本 issue 零节 S1/S2 那句"接口返回成功、
+            # 实际操作没有发生,且调用方无从察觉"。
+            # (盘已删那半走 :2920 的同步 200 快路径,不经队列,所以不受影响;
+            #  受影响的是盘还在、需要走普通 delete 的那半。)
+            "force": query_params.get("force"),
         }
+        # #564 G2 —— 受理时刻算 delete 的绝对死线,同一个值进消息体与租户行。
+        # 上面 :3105 的 `_consumer_ident not in event` 保证本块只在 API 请求路径跑,
+        # 所以这就是受理时刻;放到 consumer 里算会让死线随每次重投往后挪。
+        _accepted_epoch = int(time.time())
+        _dl_epoch, _dl_src = deadline_config.deadline_epoch_for(
+            create_deadline.ACTION_DELETE, _accepted_epoch
+        )
+        if _dl_src != "ssm":
+            print(
+                f"delete_deadline: {_dl_epoch - _accepted_epoch}s "
+                f"from {_dl_src} for {tenant_id}"
+            )
+        # 顺序:先落行、再发消息。行上没有 `delete_deadline`,`deadline_executor` 就扫不到
+        # 这一行,这次删除永远不会被判死。
+        try:
+            _write_action_deadline(tenant_id, create_deadline.ACTION_DELETE, _dl_epoch)
+        except Exception as exc:  # noqa: BLE001
+            # **发送前的失败,不能走下面那条 `ENQUEUE_STATE_UNKNOWN`**(Codex 独立复审第 1 轮)。
+            # 那条刻意扣住租约,因为 SQS 可能已经收下消息、盲目重试会起第二次删除;而这里
+            # 消息一条都没发。塞进那条路的后果是答复叫客户重试、而重试全撞 409,直到 1800s
+            # 租约过期。照仓内既有惯例用 `release_lifecycle_fence_on_error`(见 :2694-2699
+            # 的 wrapper:5xx 默认扣住,除非设了这个键)让包装器把租约放掉。
+            if _lifecycle_ctx is not None:
+                _lifecycle_ctx["release_lifecycle_fence_on_error"] = True
+            print(f"delete deadline write failed for {tenant_id}: {exc}")
+            return utils._resp(
+                503,
+                {
+                    "error": "could not record the delete deadline before dispatch; "
+                    "nothing was started - safe to retry",
+                    "code": "ENQUEUE_ANCHOR_FAILED",
+                    "id": tenant_id,
+                    "op_id": lifecycle_op_id,
+                },
+            )
         try:
             enqueued_op_id = lifecycle_dispatch.enqueue_lifecycle(
                 "delete",
@@ -2455,6 +3339,7 @@ def _delete_tenant_inner(tenant_id, query_params, event=None, _lifecycle_ctx=Non
                 event,
                 extra=_extra,
                 operation_id=lifecycle_op_id,
+                deadline_epoch=_dl_epoch,
             )
         except Exception as exc:  # noqa: BLE001
             # SQS may have accepted the message before the acknowledgement was
@@ -2494,6 +3379,30 @@ def _delete_tenant_inner(tenant_id, query_params, event=None, _lifecycle_ctx=Non
     # 停在 "deleting" 可被巡检发现重试,而不是过早标 "deleted" 把半清理的租户藏起来。
     prev_status = item.get("status")
     claim_expires_at = int(time.time()) + _DELETE_CLAIM_TTL_SECONDS
+    # #532 —— 把【本次删除的意图】与 deleting 一起原子落库。
+    #
+    # 为什么必须落:`keep_data`/`skip_backup`/`force` 只活在同步请求的 query,或入队时放进
+    # 消息 `extra` 的那份拷贝(:3121)。消息一旦进 DLQ,这三个值就**只存在于那条 DLQ 消息里** ——
+    # 靠扫 DDB 触发的收敛者(#532 的 delete_reconciler)读不到,只能落回默认值,于是一次
+    # `?keep_data=false` 的**硬删会静默变成软删**:该销毁的数据盘留下来,租户却照常进 deleted
+    # → 磁盘泄漏。方向确实是"留盘"这一侧(可事后补删,不是丢数据),但它是一次与调用方请求
+    # 不一致的**静默降级**,必须消掉,而不是靠"反正方向安全"带过。
+    #
+    # 存成一个 **map** 而不是三个字段:消费侧 handler.py:1905 只把【调用方真传过的】key 放进
+    # 重建的 query,让 delete_tenant 的默认值对缺失键生效 ⇒ 「没传」与「传了 false」是两种
+    # 不同语义。map 把 `extra` 的形状原样存下来,收敛者取出即可回喂,**零二次解析**;三个独立
+    # 字段则要靠 attribute_not_exists 逐个区分「缺失」与「false」,多三处可错点。
+    #
+    # 与 CAS 写在**同一条 update** ⇒ 零额外写,且不存在"翻了 deleting 但意图还没落"的窗口。
+    # ADR-delete-fanout-manifest-contract §5 已把"删除意图落库"这条升级路径预先论证过。
+    #
+    # 只在**首次**翻 deleting 时写(本 CAS 条件含 `#s <> :deleting`)⇒ 重投/收敛者的
+    # 二次进入不会覆盖原始意图。
+    _delete_intent = {
+        k: str((query_params or {})[k])
+        for k in ("keep_data", "skip_backup", "force")
+        if (query_params or {}).get(k) is not None
+    }
     # 判 host_id/capacity_reservation_id(codex #1:陈旧快照会漏掉 reserve-won-then-delete
     # straddle 场景里刚写上的 host_id/令牌 → delete 跳过扣减 → 泄漏)。deleting CAS 一旦赢,
     # dispatch 的 reserve 事务(条件 status=creating)必不能再提交,故此刻属性是权威终值。
@@ -2504,7 +3413,8 @@ def _delete_tenant_inner(tenant_id, query_params, event=None, _lifecycle_ctx=Non
             UpdateExpression=(
                 "SET #s = :deleting, updated_at = :t, "
                 "delete_retryable = :false, delete_prev_status = :prev, "
-                "delete_claim_expires_at_epoch = :claim_exp"
+                "delete_claim_expires_at_epoch = :claim_exp, "
+                "delete_intent = :intent"
             ),
             ConditionExpression=(
                 f"#s <> :deleted AND #s <> :deleting AND {delete_condition}"
@@ -2516,6 +3426,7 @@ def _delete_tenant_inner(tenant_id, query_params, event=None, _lifecycle_ctx=Non
                 ":false": False,
                 ":prev": prev_status,
                 ":claim_exp": claim_expires_at,
+                ":intent": _delete_intent,  # #532 见上方说明
                 ":t": utils._now(),
                 **delete_condition_values,
             },
@@ -2618,7 +3529,15 @@ def _delete_tenant_inner(tenant_id, query_params, event=None, _lifecycle_ctx=Non
                 UpdateExpression=(
                     "SET #s = :prev, updated_at = :t "
                     "REMOVE predelete_backup_at, delete_retryable, "
-                    "delete_prev_status, delete_claim_expires_at_epoch"
+                    # #532 —— 回滚到活跃态必须一并清 delete_intent。留着它,下一次删除若在
+                    # 写自己的意图【之前】崩溃(理论上不会:意图与 deleting CAS 同一条 update),
+                    # 或运维直接读这一行做判断时,会看到一次【已被放弃的】删除的意图。
+                    "delete_prev_status, delete_claim_expires_at_epoch, delete_intent, "
+                    # #532 —— reconciler 的重投计数与 exhausted 标记也必须清。
+                    # **不清 `delete_redrive_exhausted` 是一条真缺陷**:软删行可被回收复用
+                    # (#529 reclaim-soft-deleted),而扫描判据把带该标记的行排除出候选集
+                    # ⇒ 一个陈旧标记会让那个租户【以后永远不被自动收敛】。
+                    "delete_redrive_attempts, delete_redrive_exhausted"
                 ),
                 ConditionExpression=f"#s = :deleting AND {delete_condition}",
                 ExpressionAttributeNames={"#s": "status"},
@@ -2649,6 +3568,7 @@ def _delete_tenant_inner(tenant_id, query_params, event=None, _lifecycle_ctx=Non
         )
 
     if _route_cleanup_requires_host(fresh):
+        _mark_fail_reason(tenant_id, "delete", create_deadline.REASON_ROUTE_CLEANUP_BLOCKED)
         _mark_delete_retryable()
         return utils._resp(
             502,
@@ -2698,7 +3618,22 @@ def _delete_tenant_inner(tenant_id, query_params, event=None, _lifecycle_ctx=Non
         # 备份然后删盘。
         _source_absent = bool(_err) and "OC_BACKUP_SOURCE_ABSENT" in _err
         if not _ok and not _source_absent:
+            _mark_fail_reason(tenant_id, "delete", create_deadline.REASON_BACKUP_FAILED)
             _abort_restore_status()
+            # #547 兄弟路径 —— 这条 fail-closed 早退必须放掉【自己】取得的租约。
+            #
+            # 判据与 ㉓(:2801)同一条:【此刻还没有任何破坏性命令下发】。本支只做了一次
+            # 同步 invoke backup Lambda(读盘 + 写 S3),没有 stop-vm、没有 rm、没有改路由,
+            # 且 _abort_restore_status() 已把 status 从 deleting 回滚掉。
+            #
+            # 不放的后果与 #547 在 rebuild 侧修掉的那条【逐字相同】—— 两者是同一个
+            # _force_backup_sync 的两个调用者:wrapper(:2626)见 code>=500 就
+            # hold_lifecycle_fence=True,租约被扣住整个 LIFECYCLE_FENCE_LEASE_SECONDS
+            # (1800s),而下面的文案写着 "Retry" —— 照文案 retry 会撞
+            # 409 LIFECYCLE_IN_FLIGHT,半小时内根本进不来(:2795 记的"承诺一件代码不
+            # 允许的事")。放掉之后那句 Retry 才是实话,不必再改文案。
+            if _lifecycle_ctx is not None:
+                _lifecycle_ctx["release_lifecycle_fence_on_error"] = True
             return utils._resp(
                 502,
                 {
@@ -2758,6 +3693,7 @@ def _delete_tenant_inner(tenant_id, query_params, event=None, _lifecycle_ctx=Non
                 )
                 fresh["predelete_backup_at"] = marker_ts
             except Exception as e:  # noqa: BLE001
+                _mark_fail_reason(tenant_id, "delete", create_deadline.REASON_BACKUP_FAILED)
                 # marker 写不进 ⇒ 不敢做破坏性动作。此处盘【确实还在】(_source_absent
                 # 为假 ⇒ 备份刚刚成功 ⇒ 盘存在),故回滚到删除前状态是安全的:
                 # 盘与备份都完好,重投会重跑 backup 再试落 marker。
@@ -2837,6 +3773,7 @@ def _delete_tenant_inner(tenant_id, query_params, event=None, _lifecycle_ctx=Non
             f"&& {delete_host_guard}"
         )
         if not ssm_dispatch._ssm_run(host_id, _del_cmd, timeout=300):
+            _mark_fail_reason(tenant_id, "delete", create_deadline.REASON_HOST_UNREACHABLE)
             _mark_delete_retryable()
             print(
                 f"delete_tenant #469: atomic delete-vm.sh FAILED for {tenant_id} on "
@@ -2876,6 +3813,13 @@ def _delete_tenant_inner(tenant_id, query_params, event=None, _lifecycle_ctx=Non
                 # (不 _abort_restore_status 回 running——VM 已停、盘已删,回 running 会谎报已毁
                 # 租户存活)返 502,队列消费者/调用方重投;重投时仍 deleting → CCF 分支放行重试
                 # 副作用(stop/rm 幂等)+ 重跑本释放(令牌仍在 → 幂等消费一次,已消费则 already)。
+                # #565 G3(Codex 独立复审第二轮)—— **不能用 system_error**:它的已发布语义是
+                # 「不值得重试,报障」,而这条路上面那段注释明写「返 502,队列消费者/调用方
+                # 重投」。照 system_error 行事的调用方会不重投 → 租户永久停在 deleting、
+                # 令牌永久搁浅,正是这条出口 fail-closed 想避免的结局。
+                _mark_fail_reason(
+                    tenant_id, "delete", create_deadline.REASON_CAPACITY_RELEASE_PENDING
+                )
                 return utils._resp(
                     502,
                     {
@@ -2944,19 +3888,34 @@ def _delete_tenant_inner(tenant_id, query_params, event=None, _lifecycle_ctx=Non
     # per-tenant vkey but revoke failed (e.g. LiteLLM transient outage), keep the
     # field and flag it so a reconciler can retry — dropping it here would orphan
     # a live key in LiteLLM (credential + budget leak with no way to find it).
+    # (卡死的 restoring、以及卡死但盘还在的 suspending 都路由到这里),不清则标记随
+    # deleted 行残留;同 id 若被重建/或对账工具读到,会以为它还卡着。
+    # 我第一版只在 suspended/force 专路清了,是 test_p2_force_marked_restoring_* 的
+    # 断言把这半边漏洞抓出来的。REMOVE 不存在的属性是 no-op,对普通删除零影响。
+    _stuck_removes = (
+        ", lifecycle_stuck_at, lifecycle_stuck_reason, lifecycle_stuck_vm_dir"
+        ", lifecycle_stuck_fc_alive, updated_at_stuck_seen, lifecycle_prev_status"
+            ", lifecycle_rollback_deferred_until, lifecycle_probe_attempted_at"
+    )
     if item.get("litellm_vkey") and not vkey_revoked:
         update_expr = (
             "SET #s = :s, updated_at = :t, vkey_revoke_failed = :vf "
             "REMOVE cognito_channel_password, delete_retryable, "
+            # #532 —— delete_intent 与相邻这三个删除阶段字段同生命周期,终态一并清。
+            "delete_intent, delete_redrive_attempts, delete_redrive_exhausted, "
             f"delete_prev_status, delete_claim_expires_at_epoch, {_STALE_HEALTH_FIELDS}"
+            + _stuck_removes
         )
         expr_vals = {":s": "deleted", ":t": utils._now(), ":vf": True}
     else:
         update_expr = (
             "SET #s = :s, updated_at = :t "
             "REMOVE litellm_vkey, cognito_channel_password, "
+            # #532 —— 同上:与相邻三个删除阶段字段同生命周期,终态一并清。
+            "delete_intent, delete_redrive_attempts, delete_redrive_exhausted, "
             "delete_retryable, delete_prev_status, "
             f"delete_claim_expires_at_epoch, {_STALE_HEALTH_FIELDS}"
+            + _stuck_removes
         )
         expr_vals = {":s": "deleted", ":t": utils._now()}
     clients.tenants_table.update_item(
@@ -3002,29 +3961,252 @@ def _delete_tenant_inner(tenant_id, query_params, event=None, _lifecycle_ctx=Non
     return utils._resp(200, {"id": tenant_id, "status": "deleted"})
 
 
-def _cas_status(tenant_id, from_status, to_status):
+def _cas_status(tenant_id, from_status, to_status, clear_stuck=False, stash_prev=False,
+                stash_token=None):
     """#422 — CAS 翻租户 status(并发闸)。仅当当前 status == from_status 时翻到
     to_status,返回 True;CCF(已被别的 op 改)返回 False。suspend/restore 用它抢唯一
     赢家(抄 delete :2050 的 CAS 形态,但提成小工具供 suspend+restore 复用,避免各写一遍
-    闭包)。status 是 DDB 保留字,必须用 ExpressionAttributeNames 占位。"""
+    闭包)。status 是 DDB 保留字,必须用 ExpressionAttributeNames 占位。
+
+    保持原行为:抢中间态那次调用绝不能清(那时还没标记,清了也无意义;更重要的是语义上
+    "进入中间态"不该碰卡死历史)。回滚 = 租户回到活跃/稳定态,此后可能再写新数据、再发起
+    新的 suspend —— 留着陈旧标记会让 P2 的 ?force=true 对一个健康租户放行。
+    与 #412 blocker-A(_abort_restore_status 回滚必 REMOVE predelete_backup_at)同一条教训。
+
+    lifecycle_prev_status,供【卡死巡检】回滚时知道该回哪个态。
+    为什么必须记:`suspended_from` 只在 suspend 走到终态时才写(:3228),而卡在
+    `suspending` 的租户【根本没到那一步】,该字段不存在。reaper 若回退到写死的
+    "running",会把一个原本 `stopped` 的租户(suspend 允许 running/stopped 两种入口,
+    见 :3071)错误地标成 `running` —— 那是「无 VM 却 running」的谎报,正是 #268 禁止的
+    形态,而且它还会让后续 start/stop 的语义全错。
+    与 CAS 写在【同一条 update】里 → 原子:抢到中间态的那一刻这个字段就在,不存在
+    "翻了态但还没记下来源"的窗口。
+
+    update。抄的正是 stash_prev 的形态与理由:令牌必须与"进中间态"原子落库,否则存在
+    "翻了态但令牌还没写"的窗口,而收尾事务的条件是 `attr = :rid` —— 窗口内崩溃会让收尾
+    永远条件失败、租户永久卡中间态。attr 只来自本文件的字面量(调用方从不透传外部输入),
+    故直接拼进表达式;value 走占位符。
+
+    回滚(clear_stuck=True)一并 REMOVE 令牌字段、suspend 的阶段快照与 restore 的临时坐标:
+    租户回到稳定态后可能再发起一次新的 suspend/restore,留着上一轮的令牌会让新一轮的
+    `attribute_not_exists` 前置条件恒失败,或让一次迟到的释放匹配上新一轮的放置(ABA)。
+    与 #412 blocker-A(回滚必 REMOVE predelete_backup_at)同一条教训。
+    **前提**:调用方只在"这一轮已经不占任何容量"时才带 clear_stuck 回滚 —— 释放返
+    `_REL_RETRY`(令牌可能仍在、账本可能已加)时必须保持中间态,清掉令牌会把增量变成无主。"""
+    _update = "SET #s = :to, updated_at = :t"
+    _vals = {":to": to_status, ":from": from_status, ":t": utils._now()}
+    if stash_prev:
+        _update += ", lifecycle_prev_status = :lps"
+        _vals[":lps"] = from_status
+    if stash_token:
+        _tok_attr, _tok_val = stash_token
+        _update += f", {_tok_attr} = :tok"
+        _vals[":tok"] = _tok_val
+    if clear_stuck:
+        _update += (
+            " REMOVE lifecycle_stuck_at, lifecycle_stuck_reason, "
+            "lifecycle_stuck_vm_dir, lifecycle_stuck_fc_alive, updated_at_stuck_seen, "
+                "lifecycle_rollback_deferred_until, lifecycle_probe_attempted_at, "
+            "lifecycle_prev_status, suspend_release_id, suspend_backup_key, "
+            "restore_reservation_id, restore_host_id, restore_vm_num, "
+            "restore_guest_ip, restore_host_port"
+        )
     try:
         clients.tenants_table.update_item(
             Key={"id": tenant_id},
-            UpdateExpression="SET #s = :to, updated_at = :t",
+            UpdateExpression=_update,
             ConditionExpression="#s = :from",
             ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={
-                ":to": to_status,
-                ":from": from_status,
-                ":t": utils._now(),
-            },
+            ExpressionAttributeValues=_vals,
         )
         return True
     except clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException:
         return False
 
 
-def _tenant_suspend(tenant_id, item):
+def _mark_fail_reason(tenant_id, action, reason):
+    """#565 G3 —— 把机器可读的失败原因落到租户行 `<action>_fail_reason`。
+
+    **为什么需要它**:同步失败时租户行上**零痕迹**。以 suspend 为例,它的 `_rollback()`
+    只做 `_cas_status(tenant_id, "suspending", prev_status)` —— 状态回到 running/stopped,
+    而失败原因随那个 502 响应一起消失。客户没接住那次响应(请求超时、网络断、客户端崩)就
+    **永远不知道发生过什么**,轮询只看到一个 running 的租户。
+
+    这与 #562 立的标准直接冲突:「失败必须是终态**且可归因**」——「还在创建」「不确定」
+    业务拿它做不了决策。同步 5xx 只在客户接住时可归因,接不住就等于没给答复。
+
+    **三条设计判断**:
+
+    1. **取值先断言,再写库**(`assert_reason_valid`)。取值集合是对外契约、发布后不可改;
+       一个拼错的值漏出去就再也收不回来,所以让它在**开发期**炸,而不是变成客户读到的垃圾值。
+    2. **写失败只 print 不抛**。本函数全部在**已经失败的路径**上被调用,它是可观测性增强 ——
+       绝不能让一次 DDB 抖动把本该返 502 的请求变成 500(那会把"备份失败"这种可归因结果换成
+       "不知道为什么",正是 G3 要消灭的东西)。
+    3. **不动 status,也不碰 `updated_at`**。状态机归各操作自己的 CAS/回滚。delete 那条
+       尤其重要:它的 600s 只约束【给上层的答复】而实际删除不得丢弃(客户 2026-08-21),
+       所以落原因**不等于**停止删除。
+
+       `updated_at` **绝不能顺手写**(Codex 独立复审抓出的真缺陷,第一版写了)——
+       `health_check._reap_stuck_lifecycle` 拿它当「进入该中间态的时刻」算 elapsed
+       (那处注释明写:「updated_at 由 _cas_status 在翻中间态时写,所以它就是进入该中间态
+       的时刻,无需新增字段」)。缺陷链:suspend A 赢 CAS 写 updated_at=T0 → 并发的
+       suspend B 输 CAS,在这里落 preempted 顺带写 updated_at=T1 → 巡检从 T1 起算,
+       **A 的卡死被推迟 (T1-T0) 才发现**;B 只要在超时窗口内反复重试,A 就永远不被收。
+       失败时刻已经由 `<action>_fail_at` 记着,写 updated_at 不多给任何信息、只会破坏
+       另一个字段的既有语义。**引入新写入前必须查清它碰的每个字段有谁在消费。**
+
+    **语义是「最近一次该操作的失败原因」,不代表当前状态,也不会被自动清除。**
+    当前状态永远只看 `status`。伴随字段 `<action>_fail_at` 让轮询方能判断这条记录是不是
+    自己那次请求留下的(它比自己的发起时刻早 = 是旧记录)。
+
+    为什么**不**在成功路径 `REMOVE`(考虑过,放弃了):那需要在五个操作各自"本次操作真正
+    开始"的位置插清除,而 delete 根本没有这样一个位置 —— 它的 CAS 一赢就已经是 `deleted`
+    终态了,那时清任何字段都没有读者。加时间戳是同一次写里的一个字段(零额外 DDB 写),
+    信息还更多:"失败过、发生在何时"比"字段消失了"更能支撑重试决策。
+
+    **一条已知边界(Codex 独立复审第三轮指出,本 issue 范围内不修):这是无条件写,没有
+    per-attempt 世代号。** 调用点的顺序已经保证「落原因 → 改状态 → 放围栏」(见
+    `TestMarkOrdering`),所以同一次请求内部不会乱序。但跨请求仍有一个窗口:某次尝试在 host
+    侧卡很久 → 兜底巡检先把中间态回滚 → 新的同类请求开始 → 老那次才醒过来写原因,于是
+    `<action>_fail_at` 比新请求的起始时刻还新。
+    修它需要「受理即发一个操作句柄、失败写条件在该句柄上、stale 的 CCF 静默丢弃」——那是
+    #564 G7 手动备份操作句柄要建的同一套机制,牵动每个操作的受理路径,属于新设计而不是本
+    issue 的「落原因」。**不用 status 做条件**的原因也记在这里:有一批出口(delete 的 host
+    探测失败那几条)发生在进入 `deleting` **之前**,拿中间态当条件会让它们的原因直接写不进去
+    —— 那是比归属不精确更糟的回归。
+    契约文档 §1.1 的提示框把这条边界如实写给了客户,并明确「判断某一次请求的成败只看
+    `status`」。
+    """
+    create_deadline.assert_reason_valid(action, reason)
+    attr = create_deadline.fail_reason_attr(action)
+    at_attr = create_deadline.fail_at_attr(action)
+    try:
+        clients.tenants_table.update_item(
+            Key={"id": tenant_id},
+            UpdateExpression=f"SET {attr} = :r, {at_attr} = :t",
+            # **必须带 attribute_exists(id)**(Codex 独立复审第五轮抓出的真缺陷)。
+            # DDB 的 update_item 是 **upsert**:key 不存在就【新建】一行。而租户行是真的会被
+            # 删掉的 —— create 入队失败的回滚路径(:1742)调 delete_item。于是这条竞态存在:
+            #   T0 create 落库 creating → T1 入队失败,delete_item 真删行
+            #   T2 一个在飞的操作失败,在这里 upsert → **凭空造出一行只有 id +
+            #      <action>_fail_reason + <action>_fail_at 的畸形租户**(无 status、无 owner_id)
+            # 按 status 过滤,压根扫不到它,但 GET /tenants 会把它列给客户。
+            ConditionExpression="attribute_exists(id)",
+            ExpressionAttributeValues={":r": reason, ":t": utils._now()},
+        )
+    except clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException:
+        # 行已经不在了 —— 这不是"写失败",是**正确地放弃**:原因写给谁看?
+        # 与上面判断 2 同一条精神(可观测性增强绝不反噬),所以也不抛。
+        print(f"_mark_fail_reason: {tenant_id} 行已不存在,跳过落 {attr}={reason}")
+    except Exception as e:  # noqa: BLE001 — 见上方判断 2:绝不升级为 500
+        print(f"_mark_fail_reason: {tenant_id} {attr}={reason} 写入失败(不阻断): {e}")
+
+
+def _write_action_deadline(tenant_id, action, deadline_epoch):
+    """#564 G2 —— 把该操作的**绝对死线**落到租户行 `<action>_deadline`。写失败**必须抛**。
+
+    与 `_mark_fail_reason` 的失败策略**刻意相反**,这不是不一致而是两者的位置不同:
+      · `_mark_fail_reason` 在**已经失败**的路径上,是可观测性增强 —— 写失败只 print,
+        绝不能把一个本该 502 的请求变成 500。
+      · 本函数在**受理**路径上。死线没落到行上 = `deadline_executor` 扫不到这一行
+        (它的 filter 第一条就是 `attribute_exists(<action>_deadline)`)= 这次操作**永远
+        不会被判死**,卡在中间态直到有人手工干预。那正是本 issue 存在的全部理由。
+        所以宁可 5xx 让客户重试,也不受理一个无法被超时的操作 —— fail-closed。
+
+    **不写 `updated_at`**:理由与 `_mark_fail_reason` 逐字相同(见那边判断 3)——
+    `health_check._reap_stuck_lifecycle` 拿它当"进入该中间态的时刻"算 elapsed,
+    在别处顺手写会推迟另一条链的卡死发现。死线是绝对时间戳,不需要也不该借那个字段。
+
+    **`attribute_exists(id)`**:同款理由 —— DDB 的 `update_item` 是 upsert,租户行真的会被
+    删掉(create 入队失败的回滚路径调 `delete_item`),无条件写会凭空造出一行只有 id +
+    死线字段的畸形租户,而按 status 过滤的巡检扫不到它、`GET /tenants` 却会列给客户。
+    行已不存在时 **不抛**:那说明这次操作的对象没了,不是"死线写不进去",继续走原路径由
+    下游的存在性检查给出正确答复。
+    """
+    attr = create_deadline.deadline_attr(action)
+    try:
+        clients.tenants_table.update_item(
+            Key={"id": tenant_id},
+            UpdateExpression=f"SET {attr} = :d",
+            ConditionExpression="attribute_exists(id)",
+            ExpressionAttributeValues={":d": int(deadline_epoch)},
+        )
+    except clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException:
+        print(f"_write_action_deadline: {tenant_id} 行已不存在,跳过落 {attr}")
+
+
+def _suspend_finalize_txn(tenant_id, host_id, release_id, vcpu, mem_mb,
+                          backup_key, prev_status):
+    """#438 —— suspend 收尾:扣 host 账本 + 翻 suspended + 消费一次性令牌,**一个
+    TransactWriteItems**。返回 `_release_capacity_reservation` 的同款三态。
+
+    核心不变量:**令牌还在 ⟺ 账本还没扣**(两者在同一事务里,全有或全无)。于是"账本
+    动过没有"这个事实在崩溃后从 DDB 读得出来 —— 这正是 health_check/handler.py 的 #469
+    P1 说明逐字指出的、suspend 路径缺失的互斥锚(`scheduling._release_slot` 不幂等,只有
+    下溢守卫、无锚;#412 之所以能安全补扣是因为有 capacity_reservation_id)。
+
+    bb 基线的形态是两次独立写:`scheduling._release_slot`(best-effort、两个 except 只
+    print)后【无条件】翻 suspended。所以"释放确失败仍 finalize、容量永久泄漏"是代码结构
+    决定的,不是竞态 —— 合成一个事务正是把那条结构性泄漏路径消掉。
+
+    TransactItems 顺序必须是 [0]=host 账本、[1]=tenant 令牌+状态,`_classify_release_cancel`
+    按位次判三态。事务不接受对同一 key 的两个操作,所以状态提交只能并进 tenant 那一项。
+    """
+    now = utils._now()
+    txn_items = [
+        {
+            "Update": {
+                "TableName": clients.hosts_table.table_name,
+                "Key": {"instance_id": host_id},
+                "UpdateExpression": (
+                    "SET used_vcpu = used_vcpu - :v, "
+                    "used_mem_mb = used_mem_mb - :m, vm_count = vm_count - :one"
+                ),
+                "ConditionExpression": (
+                    "used_vcpu >= :v AND used_mem_mb >= :m AND vm_count >= :one"
+                ),
+                "ExpressionAttributeValues": {":v": vcpu, ":m": mem_mb, ":one": 1},
+            }
+        },
+        {
+            "Update": {
+                "TableName": clients.tenants_table.table_name,
+                "Key": {"id": tenant_id},
+                # 终态字段与 bb 基线的 finalize update 逐字一致(status/restore_backup_key/
+                # suspended_at/suspended_from/updated_at + 清卡死标记),只是多消费令牌、
+                # 多清阶段快照 suspend_backup_key。
+                # 刻意【不】REMOVE host_id/vm_num:bb 的 suspended 租户保留旧坐标,改它要
+                # 扫遍所有读 suspended 租户坐标的调用方,属独立取舍,不混进本次修复。
+                "UpdateExpression": (
+                    "SET #s = :suspended, restore_backup_key = :bk, suspended_at = :t, "
+                    "suspended_from = :prev, updated_at = :t "
+                    "REMOVE suspend_release_id, suspend_backup_key, "
+                    "lifecycle_stuck_at, lifecycle_stuck_reason, "
+                    "lifecycle_stuck_vm_dir, lifecycle_stuck_fc_alive, "
+                    "updated_at_stuck_seen, lifecycle_rollback_deferred_until, "
+                    "lifecycle_probe_attempted_at, lifecycle_prev_status"
+                ),
+                "ConditionExpression": "#s = :suspending AND suspend_release_id = :rid",
+                "ExpressionAttributeNames": {"#s": "status"},
+                "ExpressionAttributeValues": {
+                    ":suspended": "suspended",
+                    ":suspending": "suspending",
+                    ":bk": backup_key,
+                    ":prev": prev_status,
+                    ":t": now,
+                    ":rid": release_id,
+                },
+            }
+        },
+    ]
+    try:
+        clients.hosts_table.meta.client.transact_write_items(TransactItems=txn_items)
+        return _REL_CONSUMED
+    except Exception as e:  # noqa: BLE001 — 判定(含未知错误保守当 retry)在分类器里
+        return _classify_release_cancel(e, tenant_id, "suspend #438")
+
+
+def _tenant_suspend(tenant_id, item, host_guard="", _lifecycle_ctx=None):
     """#422 — 休眠一个 running/stopped 租户:无条件同步备份数据盘到 S3(fail-closed)→
     停 VM → 释放 host slot → 保留 DDB 记录与 tenant_id,翻 status=suspended,写
     restore_backup_key 供 restore 冷恢复。释放 slot 供新用户调度(休眠的核心目的)。
@@ -3032,8 +4214,56 @@ def _tenant_suspend(tenant_id, item):
     fail-closed 语义(no-data-loss 铁律,对齐 delete keep_data=false 的删前备份门):
     备份未确认成功 → 回滚状态、不停 VM、不释放 slot、不删盘、502。只有备份成功才推进破坏性
     步骤。stop-vm 失败 → 回滚 + 502(VM 未停不能标 suspended,否则账本失真)。
+
+    _lifecycle_ctx(#547 兄弟路径)—— `_tenant_action_inner` 的那份 ctx,与
+    `_delete_tenant_inner` 同款 kwarg。suspend 自 #469(⑭)起进了
+    `_FENCED_LIFECYCLE_ACTIONS`,于是 `tenant_action` 的 5xx wrapper(:5114)对本函数的
+    【每一个】502 都 hold_lifecycle_fence=True → 租约扣 1800s。本函数的 502 分两类,
+    只有前一类该放掉,分界线是 `stop-vm`(第一个破坏性命令):在它【之前】的失败可证明
+    host 侧一步未动,在它【之后】的失败结果未知、必须继续扣住(否则 restore 会与在途
+    stop 交错)。
     """
     prev_status = item.get("status")
+    #
+    # 一次 suspend 若崩在「已过备份门、令牌与备份 key 都已落库」之后,status 停在
+    # suspending。此前入口只认 running/stopped,于是重投一律 409、消息被 ack,租户永久卡在
+    # suspending:VM 已停、盘已删、数据在 S3,却既不能 restore(它只认 suspended)也不能
+    # 再 suspend。那不是容量泄漏(账本仍算着它、行也还在),而是**永久中间态** ——
+    # HIGH-RISK-CHANGES 第 3 条不变量,也正是本 issue 验收第一条要求的「崩在任意中间点,
+    # 重投/reaper 能收敛到稳定态」。
+    #
+    # 只落库不消费等于「只建桥墩不铺桥面」:`suspend_backup_key` 存在的唯一意义就是让
+    # 后来者能把剩下的步骤做完,所以消费处必须与它同一个 MR 落地。
+    #
+    # 续做的前提逐条都是【库里读出来的事实】,缺任何一条就不续做(fail-closed,退回原
+    # 409 让人工介入,绝不猜):
+    #   · status 就是 suspending(我们要续的正是这一次);
+    #   · suspend_release_id 在 —— 令牌在 ⟺ 账本还没扣(同事务契约),所以收尾仍是安全的;
+    #   · suspend_backup_key 在 —— 盘可能已删,绝不能重跑备份(那会失败或产出错对象);
+    #   · lifecycle_prev_status 是 running/stopped —— 收尾要把它写进 suspended_from,
+    if (
+        prev_status == "suspending"
+        and item.get("suspend_release_id")
+        and item.get("suspend_backup_key")
+        and item.get("lifecycle_prev_status") in ("running", "stopped")
+        and item.get("host_id")
+    ):
+        print(
+            f"suspend #438: resuming interrupted suspend for {tenant_id} "
+            f"(rid={item['suspend_release_id']})"
+        )
+        # rollback=None:上一次已过备份门,host 侧动到哪一步【不可知】,回滚成活跃态可能
+        # 破坏性步骤本身幂等(stop-vm 对已停的 VM、rm -rf 对已不存在的目录都是 no-op),
+        # 所以重跑它们是安全的,也是原注释承诺的 "kept status=suspending for re-drive"。
+        return _suspend_finish(
+            tenant_id,
+            item,
+            host_guard,
+            item["suspend_release_id"],
+            item["suspend_backup_key"],
+            item["lifecycle_prev_status"],
+            None,
+        )
     if prev_status not in ("running", "stopped"):
         return utils._resp(
             409,
@@ -3048,8 +4278,11 @@ def _tenant_suspend(tenant_id, item):
             400, {"error": "tenant has no host (still pending?)", "id": tenant_id}
         )
 
+    # 同一条理由 —— host_id 会被复用,随机令牌不会)。
+    release_id = secrets.token_hex(16)
     # 并发闸:CAS prev → suspending,单赢家。输家(并发 suspend/其他 op 已改)幂等/409。
-    if not _cas_status(tenant_id, prev_status, "suspending"):
+    if not _cas_status(tenant_id, prev_status, "suspending", stash_prev=True,
+                       stash_token=("suspend_release_id", release_id)):
         cur = (
             clients.tenants_table.get_item(
                 Key={"id": tenant_id}, ConsistentRead=True
@@ -3059,6 +4292,7 @@ def _tenant_suspend(tenant_id, item):
         cur_s = cur.get("status")
         if cur_s in ("suspending", "suspended"):
             return utils._resp(200, {"id": tenant_id, "status": cur_s})
+        _mark_fail_reason(tenant_id, "suspend", create_deadline.REASON_PREEMPTED)
         return utils._resp(
             409,
             {"error": f"tenant is {cur_s}; suspend lost the race", "id": tenant_id},
@@ -3066,11 +4300,26 @@ def _tenant_suspend(tenant_id, item):
 
     def _rollback():
         # 回滚 suspending → prev(抄 _abort_restore_status 的 CAS 形态,只回滚自己翻的态)。
-        _cas_status(tenant_id, "suspending", prev_status)
+        _cas_status(tenant_id, "suspending", prev_status, clear_stuck=True)
+
+    def _release_fence_no_host_work():
+        """#547 兄弟路径 —— 本支可证明【一步破坏性命令都没下发】,放掉自己的租约。
+
+        只允许在 `stop-vm`(下方 `_stop_ok, _stop_rc = ssm_dispatch._ssm_run`,:3985)
+        【之前】的失败分支调用。在它之后调用是错的:命令已下发且结果可能未知,放掉围栏
+        会让一次 restore/start 与在途 stop 交错(:2803 与 ㉘ 都记过这条)。
+        """
+        if _lifecycle_ctx is not None:
+            _lifecycle_ctx["release_lifecycle_fence_on_error"] = True
 
     # 1) 无条件同步备份(复用 delete 备份门的 invoke+双层解析形态,去掉 keep_data 触发条件)。
     try:
-        lambda_client = boto3.client("lambda")
+        # #565 G1-a —— 与 _force_backup_sync 同一份 Config(理由见
+        # core/clients.BACKUP_SYNC_INVOKE_CONFIG)。本函数是那条链的内联副本,
+        # 60s 截断在这里的后果是 suspend 白白回滚一次本已成功的备份。
+        lambda_client = boto3.client(
+            "lambda", config=clients.BACKUP_SYNC_INVOKE_CONFIG
+        )
         resp = lambda_client.invoke(
             FunctionName=os.environ.get("BACKUP_FUNCTION", "openclaw-backup"),
             InvocationType="RequestResponse",  # SYNC:数据落 S3 才继续破坏性步骤
@@ -3082,6 +4331,11 @@ def _tenant_suspend(tenant_id, item):
         )
         invoke_ok = resp.get("StatusCode", 500) == 200 and "FunctionError" not in resp
         payload_ok = False
+        # 必须先初始化:invoke 失败或 JSON 解析抛异常时下面两条路径都会读 result
+        # (取 vm_left_paused / 取 backup_key),而那两种情形下它原本【从未被赋值】——
+        # 读一个未绑定的名字会抛 NameError,被外层 except 吞成"backup error"并照旧回滚,
+        # 于是 ㉘ 那道守卫在最需要它的失败路径上反而不生效。
+        result = {}
         payload_err = "unparseable backup response"
         if invoke_ok:
             try:
@@ -3095,7 +4349,43 @@ def _tenant_suspend(tenant_id, item):
         else:
             payload_err = "backup invoke failed (StatusCode/FunctionError)"
         if not payload_ok:
+            # 第四个面 —— 应用该判据、把所有失败分支数一遍时自己找到的)。
+            #
+            # 备份本身不删任何东西,所以这一支的默认动作(回滚成 running/stopped)在绝大多数
+            # 失败下是对的。但有一种失败【恰恰是 resume 没成功】:那时 VM 是 Paused 的,
+            #
+            # 而 **reaper 救不了这一种**:它的 fc_alive 是进程存活检查,一个 Paused 的
+            # Firecracker 进程照样活着,所以它会得出同样的错误结论。这个事实只有
+            # backup-data.sh 知道,故由它打稳定哨兵 OC_BACKUP_VM_LEFT_PAUSED,
+            # backup Lambda 转成 vm_left_paused 回传(通道复用它已经在读的那份 stdout)。
+            #
+            # #547 兄弟路径 —— 这一支【刻意不】调 _release_fence_no_host_work():
+            # 它是本函数四个"stop-vm 之前"的 502 里唯一一个 host 侧【真的动过且没回滚】
+            # 的(VM 被留在 Paused),而且它有意保留 status=suspending 让 stuck-lifecycle
+            # 告警看得见。扣住围栏正是要挡住一次 restore/start 撞上一台冻住的 VM。
+            if isinstance(result, dict) and result.get("vm_left_paused"):
+                _mark_fail_reason(tenant_id, "suspend", create_deadline.REASON_BACKUP_FAILED)
+                return utils._resp(
+                    502,
+                    {
+                        "error": "suspend backup failed AND left the VM PAUSED (the host "
+                        "script exhausted its bounded resume retries). Rolling back to an "
+                        "active status would report a frozen tenant as live, and the reaper "
+                        "cannot detect this — its liveness probe only checks that the "
+                        "Firecracker process exists, and a paused one does. status=suspending "
+                        "is kept so it stays visible to the stuck-lifecycle alarm; resume it "
+                        "on the host (see the OC_BACKUP_VM_LEFT_PAUSED log line for the exact "
+                        "curl) or force-delete it, then retry.",
+                        "backup_error": payload_err,
+                        "vm_left_paused": True,
+                        "id": tenant_id,
+                    },
+                )
+            _mark_fail_reason(tenant_id, "suspend", create_deadline.REASON_BACKUP_FAILED)
             _rollback()
+            # 备份【确定】失败(backup Lambda 明确返 success!=True)且已回滚:host 侧
+            # 一步未动,文案又写着 "Retry" —— 必须放掉围栏,否则那句 Retry 是谎话。
+            _release_fence_no_host_work()
             return utils._resp(
                 502,
                 {
@@ -3106,7 +4396,18 @@ def _tenant_suspend(tenant_id, item):
             )
         backup_key = result.get("backup_key") or result.get("key") or ""
     except Exception as e:  # noqa: BLE001
+        _mark_fail_reason(tenant_id, "suspend", create_deadline.REASON_BACKUP_FAILED)
         _rollback()
+        # 同上:stop-vm 之前,host 侧无破坏性动作,放掉围栏让调用方真能重试。
+        #
+        # 注:这一支也是 ReadTimeout 的落点(裸 boto3.client("lambda") 吃 botocore
+        # 默认 read_timeout=60,而 backup Lambda timeout=900)。那种情况下 host 上的
+        # backup 脚本【可能仍在跑】,于是 _rollback() 的活跃态是乐观的。但那是
+        # 「模糊超时被当成确定失败」的问题,归 #565 G1-a(它要给这三处同步 invoke 显式
+        # 传 Config),不在本 issue 范围。围栏该不该放与它无关:本操作返回后不再写任何
+        # 东西,而 host 侧的并发由 backup-data.sh 自己持的 per-tenant flock 挡
+        # (oc-launch-<tid>.lock),从来不是靠这把围栏挡的。
+        _release_fence_no_host_work()
         return utils._resp(
             502,
             {"error": f"suspend backup error ({e}); aborting.", "id": tenant_id},
@@ -3122,7 +4423,10 @@ def _tenant_suspend(tenant_id, item):
     # 数据 → 新增量永久丢失。既然 backup 已回传本次真实 key,无 key 只能说明备份产物确实不存在
     # (backup 侧已对"报成功但无 key"做了 fail-closed),这里直接 fail-closed,不回退旧备份。
     if not backup_key:
+        _mark_fail_reason(tenant_id, "suspend", create_deadline.REASON_BACKUP_FAILED)
         _rollback()
+        # 同上:仍在 stop-vm 之前,已回滚,文案写着 "Retry" —— 放掉围栏。
+        _release_fence_no_host_work()
         return utils._resp(
             502,
             {
@@ -3133,6 +4437,86 @@ def _tenant_suspend(tenant_id, item):
             },
         )
 
+    # fail-closed 证明非空,而一步破坏性动作都还没下发。
+    #
+    # 为什么必须落库:收尾要把它写进 restore_backup_key(restore 唯一的恢复入口),而在
+    # bb 上这个值只存在于本次 Lambda 的【内存】里。崩在 stop-vm/rm -rf 与 finalize 之间时,
+    # 盘已删、数据在 S3,但没有任何人知道对象的 key —— 后续收敛者(重投/reaper)无从写
+    # restore_backup_key,租户要么永久卡 suspending,要么被收敛成一个查不到备份的
+    # FINDING-5 判定为"新增量永久丢失"的路径)。形态抄同路径现成的 predelete_backup_at。
+    #
+    # 写失败 → 回滚 + 502,**一步破坏性动作都不做**(fail-closed,与上面三个备份失败分支
+    # 同款:此刻 host 侧一步未动,所以放掉围栏、文案写 Retry 是诚实的)。
+    # 刻意【不写 updated_at】:它是 reaper 用来算"进中间态多久"的时钟
+    # (health_check/handler.py 读 t["updated_at"] 判 elapsed,并用它做 `updated_at = :seen`
+    # 围栏),在这里 restamp 会静默把卡死超时往后推一整轮。
+    try:
+        clients.tenants_table.update_item(
+            Key={"id": tenant_id},
+            UpdateExpression="SET suspend_backup_key = :bk",
+            ConditionExpression="#s = :suspending",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":bk": backup_key,
+                ":suspending": "suspending",
+            },
+        )
+    except Exception as e:  # noqa: BLE001 — CCF(状态被别的 op 改走)也走这里
+        # 两种失败合成一支处理:CCF 时 _rollback() 自身条件在 #s = :suspending,已被改走
+        # 则它是 no-op(不会踩别人的状态);瞬时失败时回滚生效。502 让队列重投 ——
+        # 重投读到 running/stopped 就干净重跑,读到别人写的态就在入口 409/200 收敛。
+        # #565 G3 接线:落原因必须是本分支的**第一件事**(前面任何一条抛异常,承诺的原因就
+        # 永远落不上,调用方拿到的是未分类异常而不是可归因的 502)。所以它排在 print 之前。
+        # 处置可以合并,**归因不能**:CCF 的含义是"状态被别的 op 改走"= 被抢占;其余异常
+        # 才是系统故障。`REASON_SYSTEM` 的文档明写「不许用它兜底『不知道为什么』」,
+        # 所以这里分开判,不一律 system_error。
+        _mark_fail_reason(
+            tenant_id,
+            "suspend",
+            create_deadline.REASON_PREEMPTED
+            if isinstance(
+                e,
+                clients.tenants_table.meta.client.exceptions
+                .ConditionalCheckFailedException,
+            )
+            else create_deadline.REASON_SYSTEM,
+        )
+        print(f"suspend #438: persist backup_key for {tenant_id} failed: {e}")
+        _rollback()
+        _release_fence_no_host_work()
+        return utils._resp(
+            502,
+            {
+                "error": "suspend aborted: could not persist this run's backup key "
+                "before the destructive steps; nothing was stopped or deleted. Retry.",
+                "id": tenant_id,
+            },
+        )
+
+    return _suspend_finish(
+        tenant_id, item, host_guard, release_id, backup_key, prev_status, _rollback
+    )
+
+
+def _suspend_finish(tenant_id, item, host_guard, release_id, backup_key,
+                    prev_status, rollback):
+    """#438 —— suspend 的后半段:停 VM → 删本地盘 → 归还占号 → 令牌化收尾。
+
+    从 `_tenant_suspend` **机械搬迁**出来(函数体逐字不变,只把它原先从闭包里读的
+    `host_id` / `release_id` / `backup_key` / `prev_status` / `_rollback` 变成参数)。
+    搬迁的唯一理由:`_tenant_suspend` 顶部的【重投续做支】必须跑完全同一段破坏性步骤 +
+    收尾,抄一份必然漂移 —— 这一段里 `host_guard` 的前后夹、rc=89 专属码、子 shell 语义
+    是踩过十几轮评审收敛的,复制是它最危险的处置方式。
+
+    `rollback` 是可调用或 None。None 表示**这一支绝不回滚**:重投续做时无法证明 host
+    侧一步未动(上一次已过备份门),按本文件"歧义时留中间态"的原则保持 suspending。
+    """
+    host_id = item.get("host_id")
+
+    def _rollback():
+        if rollback is not None:
+            rollback()
+
     # #520 C2:前置 S3 自愈 —— 既有 host 上的 stop-vm.sh 可能缺失或是不认
     # OC_LIFECYCLE_LOCK_FD 的旧版(后者会 15s 锁超时)。这里的失败路径与 stop-vm 本身
     # 失败一致(回滚 + 502 + 不释放 slot),所以自愈失败 exit 1 即可,语义不变。
@@ -3140,10 +4524,87 @@ def _tenant_suspend(tenant_id, item):
     _suspend_heal = ssm_dispatch.host_script_self_heal(
         ("stop-vm.sh",), "oc:suspend", freshness=("stop-vm.sh", "OC_LIFECYCLE_LOCK_FD")
     )
-    if not ssm_dispatch._ssm_run(
+    # guard 夹在破坏性动作【前后】各一次,与 delete 主路径同款(:3152/:3158 那对):
+    # 前置确认本次操作仍持租约(被抢占 exit 79 / 读不到 fence exit 78 都 fail-closed),
+    # 后置确认整个动作期间没被抢占。host_guard 为空串时退化成原行为(未走 fence 的调用方)。
+    #
+    # ⑱ 后置 guard 必须有【专属退出码】(codex 独立复审第十一轮)。
+    #
+    # 我第九轮加上后置 guard 时引入了一条新的谎报路径:破坏性动作【成功】、而后置 guard
+    # 失败(被抢占)时,整条命令 rc≠0 → 下面按"stop-vm 失败"处理 → `_rollback()` 把状态
+    # 「row 说活着、实际没有」的谎报,而且是我为了加固而【新造】出来的。
+    #
+    # 难点:前置与后置 guard 都 exit 78/79,单看 rc 分不出"动作没跑"与"动作跑完了但之后
+    # 被抢占"。所以给后置 guard 套一层 `|| exit 89`(89 全仓未占用,已 grep 确认),
+    # 于是三种情形可区分:
+    #   rc 78/79 → 前置就被挡住,破坏性动作【从未执行】→ 回滚是安全的;
+    #   rc 89    → 动作已执行、之后被抢占 → **绝不回滚**,保留 suspending 交给 reaper /
+    #              SQS 重投对账(与 delete 路径"歧义时留中间态"同一条原则:
+    #              回 running 的前提是"VM 确实还在跑",而这里恰恰不成立);
+    #   其它 rc  → 动作自身失败(stop-vm 的 rc),回滚安全。
+    #
+    # ⑲ 后置 guard 必须跑在【子 shell】里(codex 独立复审第十七轮)。
+    #
+    # 上面 ⑱ 那道 `|| exit 89` 此前【一直是空转的】,而且是我自己第十轮的修复造成的:
+    # 第十轮为了修 `&&` 结合律,把 host_guard 的返回值包成 `{ body; }`(组命令)。
+    # 组命令在【当前 shell】里执行,所以 body 里的 `exit 79` 终结的是整个 shell ——
+    # 外层的 `|| exit 89` 根本轮不到。真 shell 实测:
+    #     bash -c 'true && { { exit 79; } || exit 89; }'   → rc=79(不是 89)
+    #     bash -c 'true && { ( { exit 79; } ) || exit 89; }' → rc=89
+    # 于是"动作已执行"这个信息丢了,rc=79 落进下面"前置就被挡住 → 回滚安全"的分支,
+    # ⑱ 想关掉的那条谎报路径原封不动地还在,只是多了一段声称它已关闭的注释。
+    #
+    # 修法是把后置 guard 放进 `( )`:子 shell 里 `exit` 只终结子 shell,其退出码交给 `||`。
+    # 刻意【不改】host_guard 的源头返回值 —— 那个 `{ }` 是第十轮修 `&&` 结合律用的,
+    # 6 个调用点都靠它;这里只有后置这一处需要"让 exit 可被捕获"的语义。
+    # 外层 `{ }` 也必须留:去掉就变成 `(cmd && (guard)) || exit 89`,cmd 自身失败时
+    # 也会报成 89 —— 那是把结合律的坑换了个方向再踩一次。
+    #
+    # ⚠ 这条为什么被吞了六轮:原测试断言的是【源码里有 `|| exit 89` 这个字符串】。
+    # 字符串在,行为不在。源码级字符串断言证明不了 shell 语义,`{ }` 与 `( )` 的差别对它
+    # 完全不可见。故本轮补的是【真 shell 行为测试】(见 test_422 的 four_rc_cases)。
+    _sg_pre = f"{host_guard} && " if host_guard else ""
+    _sg_post = f" && {{ ( {host_guard} ) || exit 89; }}" if host_guard else ""
+    # 后置 guard 被抢占的专属码。取个名字而不是在两处判断里各写一个 89 —— 本函数里
+    # 两处破坏性动作(stop-vm / rm -rf)都要认它,写死两遍必然漂移。
+    # 作用域够用就放函数内:它只被这两处消费,且与上面那行 `_sg_post` 的拼装同源。
+    _SG_POST_PREEMPTED = 89
+    _stop_ok, _stop_rc = ssm_dispatch._ssm_run(
         host_id,
-        f"{_suspend_heal} && /home/ubuntu/stop-vm.sh {tenant_id} {vm_num}",
-    ):
+        f"{_suspend_heal} && {_sg_pre}/home/ubuntu/stop-vm.sh {tenant_id} {vm_num}"
+        f"{_sg_post}",
+        want_rc=True,
+    )
+    if not _stop_ok and _stop_rc == _SG_POST_PREEMPTED:
+        # 返 502 而不是 4xx:队列 consumer 只有 code>=500 才把消息留队列重投
+        # (handler.py:1651),而这条现场需要重投或 reaper 来收敛。
+        _mark_fail_reason(tenant_id, "suspend", create_deadline.REASON_PREEMPTED)
+        return utils._resp(
+            502,
+            {
+                "error": "suspend was preempted by another lifecycle operation AFTER "
+                "stop-vm already ran; the VM may already be stopped, so rolling back to "
+                "an active status would misreport a live tenant. Kept status=suspending "
+                "for the reaper / redelivery to reconcile.",
+                "id": tenant_id,
+            },
+        )
+    if not _stop_ok:
+        _mark_fail_reason(tenant_id, "suspend", create_deadline.REASON_HOST_UNREACHABLE)
+        # ⚠ 这里【故意保持 bb 基线原样】(失败即回滚),不做"只在能证明未执行时才回滚"。
+        #
+        # codex 第二十三轮在这里抓出一个真问题:「SSM 报失败」不等于「脚本没跑」——
+        # rc is None 表示压根没拿到 invocation 结果(超时/传输异常),脚本可能已经跑完只是
+        # 回执丢了;其它 rc 表示脚本确实跑了并返回非零,它可能已经杀掉 FC 只是后续某步失败。
+        # 两种情形下回滚成 running/stopped 都可能谎报,而且回成活跃态后它就从 reaper 的
+        # 视野里消失了(reaper 只扫中间态)。
+        #
+        # `if not _ssm_run(...): _rollback()`,本批次只在它前面加了 host_guard 与 rc==89 的
+        # 分支(那两样是本批次自己引入的,所以留着)。改动既有失败语义会改变现网行为
+        # (原本立刻回滚的租户变成要等一轮 reaper),那是独立的取舍,该由排期的人决定。
+        # 已单独记录,不混进这个 P0 + 命中 IaC 安全红线的分支。
+        #
+        # 判据不是"缺陷有多严重",而是"这段代码是不是本批次引入或改动的"。
         _rollback()
         return utils._resp(
             502,
@@ -3164,7 +4625,32 @@ def _tenant_suspend(tenant_id, item):
     # 回滚状态待重投(status 仍 suspending,VM 已停,重投补删幂等),不推进 suspended。
     # tenant_id 经 shlex.quote 进 root shell 防注入(纵深:虽已过 registry 正则)。
     _q_vmd = shlex.quote(f"/data/firecracker-vms/{tenant_id}")
-    if not ssm_dispatch._ssm_run(host_id, f"rm -rf {_q_vmd}"):
+    _rm_ok, _rm_rc = ssm_dispatch._ssm_run(
+        host_id, f"{_sg_pre}rm -rf {_q_vmd}{_sg_post}", want_rc=True
+    )
+    if not _rm_ok and _rm_rc == _SG_POST_PREEMPTED:
+        # 盘可能已经删了。这条比 stop-vm 那条更不能回滚 —— 回滚成活跃态而盘已毁,
+        _mark_fail_reason(tenant_id, "suspend", create_deadline.REASON_PREEMPTED)
+        return utils._resp(
+            502,
+            {
+                "error": "suspend was preempted by another lifecycle operation AFTER the "
+                "disk reclaim ran; the local disk may already be gone (data is safe in "
+                "S3), so rolling back to an active status would misreport a destroyed "
+                "tenant as live. Kept status=suspending for re-drive.",
+                "id": tenant_id,
+            },
+        )
+    if not _rm_ok:
+        _mark_fail_reason(tenant_id, "suspend", create_deadline.REASON_HOST_UNREACHABLE)
+        # ⚠ 同上,这里也【故意保持 bb 基线原样】(失败即回滚)。
+        #
+        # codex 第十九轮指出:走到这一行时 stop-vm 已经成功、VM 确实停了,而 rm 的 SSM 失败
+        # "谎报一个已毁租户存活"。而且基线那段文案写着 "Kept status=suspending for re-drive"
+        # 却在回滚,**文案与行为本来就打对台**。
+        #
+        # 本批次在这里只加了 rc==89 那一支(后置 guard 是本批次引入的),那一支留着。
+        # 已单独记录:包括"文案与行为矛盾"这一点也该在那个 issue 里一起改。
         _rollback()
         return utils._resp(
             502,
@@ -3176,43 +4662,72 @@ def _tenant_suspend(tenant_id, item):
             },
         )
 
-    # 4) 释放 host slot(归还容量记账,供新用户调度——休眠的核心目的)。
-    # _release_slot 内部带 >= guard 防负、best-effort 不抛;next_vm_num 不回退(restore 重分配)。
-    scheduling._release_slot(
-        host_id,
-        int(item.get("vcpu", 0)),
-        int(item.get("mem_mb", 0)),
-        item.get("phys_vm_num", vm_num),
-        tenant_id,
-    )
+    # 4) 归还物理占号(ps_<n>)。它【不】进下面那个事务,与 scheduling._release_slot 里
+    # "占号先还、且独立于容量释放的结果"的既有分工一致:它有自己的 owner 条件
+    # (ps_<n> = tenant_id),是一个独立的幂等单元;并进事务会让占号的归还被账本项的
+    # 下溢守卫连带取消 —— 号还被占着时 reaper 也救不了(owner 仍在役)。
+    # `is not None` 守卫保持与旧 _release_slot 内部那道守卫逐字等价(存量行可能没有 ps_*)。
+    _phys_num = item.get("phys_vm_num", vm_num)
+    if _phys_num is not None:
+        scheduling.release_phys_slot(host_id, _phys_num, tenant_id)
 
-    # 4) 终态:写 restore_backup_key + suspended_at,翻 suspended。此刻 status 仍是我们翻的
-    # suspending(单赢家持有),用 CAS 收尾防中途被改。backup_key 在上方停 VM/删盘之前已
-    try:
-        clients.tenants_table.update_item(
-            Key={"id": tenant_id},
-            UpdateExpression=(
-                "SET #s = :suspended, restore_backup_key = :bk, suspended_at = :t, "
-                "suspended_from = :prev, updated_at = :t"
-            ),
-            ConditionExpression="#s = :suspending",
-            ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={
-                ":suspended": "suspended",
-                ":suspending": "suspending",
-                ":bk": backup_key,
-                ":prev": prev_status,
-                ":t": utils._now(),
+    # 5) 终态 = 【一个事务】:扣 host 账本 + 翻 suspended + 消费令牌(见
+    # _suspend_finalize_txn)。backup_key 在停 VM/删盘之前已 fail-closed 保证非空
+    _rel = _suspend_finalize_txn(
+        tenant_id, host_id, release_id,
+        int(item.get("vcpu", 0)), int(item.get("mem_mb", 0)),
+        backup_key, prev_status,
+    )
+    print(
+        f"suspend #438: finalize tenant={tenant_id} host={host_id} "
+        f"rid={release_id} result={_rel}"
+    )
+    if _rel == _REL_RETRY:
+        # 令牌仍在 ⟹ 账本一定【没扣】(两者同事务,全有或全无)。所以保持 suspending 返
+        # 502 是安全且必须的:租户仍名义上占着自己的 slot(不是泄漏,是尚未归还),队列
+        # 重投 / reaper 可以凭令牌把它收敛掉。绝不 finalize —— 那正是 bb 基线把"释放确
+        # 失败"固化成容量永久泄漏的那一步。
+        #
+        # #565 G3 接线 —— ⚠️ **归因值是已知的近似,不是精确匹配**,如实记在这里:
+        # 语义上最准的是 `capacity_release_pending`(「破坏性动作已完成、只剩容量账本没
+        # 收敛、值得且必须重试」——与本出口逐字相符),但那个值的**已发布客户契约**写着
+        # 「只有 delete 有」,`REASONS_FOR` 也没把它放进 suspend 的封闭子集,
+        # `assert_reason_valid` 会直接拒。扩子集要改一份**面向客户的**契约文档 +
+        # 一条专门钉它 delete-only 的用例,那属于 #565/#564 的契约决策,不该由本卡单方面改。
+        # 退而用 `system_error` 的**代价被本卡自己的设计兜住了**:它给客户的建议是"报障、
+        # 不必重试",而本出口保留了令牌 ⇒ 队列重投**和** reaper 的 finalize_suspend 都能
+        # 自行收敛,不依赖客户重试。所以这里的不精确只会多一张工单,不会像 delete 那条
+        # (#565 记过的原缺陷)造成租户永久卡住 + 容量搁浅。
+        # **已上报请 #565 owner 决定是否把该值扩进 suspend 子集。**
+        _mark_fail_reason(tenant_id, "suspend", create_deadline.REASON_SYSTEM)
+        return utils._resp(
+            502,
+            {
+                "error": "suspend could not atomically release capacity (transient); "
+                "kept status=suspending with the release token intact so a re-drive "
+                "reconciles it. The VM is stopped and the backup is safe in S3. Retry.",
+                "id": tenant_id,
             },
         )
-    except clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException:
-        # 中途被别的 op 改(极罕见:suspending 是单赢家态)。VM 已停、slot 已释放、备份在 S3,
-        # 数据安全;状态非预期则 fail-loud 让运维查,不谎报成功。
+    if _rel == _REL_ALREADY:
+        # 令牌已不在:要么本次 suspend 的收尾已被另一个写手(重投)完成,要么 status 被别的
+        # op 改走。强一致读一次判幂等,不猜(与 delete 路径"歧义时读一次"同款)。
+        cur = (
+            clients.tenants_table.get_item(
+                Key={"id": tenant_id}, ConsistentRead=True
+            ).get("Item")
+            or {}
+        )
+        if cur.get("status") == "suspended":
+            return utils._resp(200, {"id": tenant_id, "status": "suspended"})
+        # `preempted`。语义上它对应的正是这里 —— 令牌没了且状态不是 suspended,说明被别的
+        # op 抢占了。所以把 #565 的调用点搬到这个等价出口,而不是二选一丢掉一边。
+        _mark_fail_reason(tenant_id, "suspend", create_deadline.REASON_PREEMPTED)
         return utils._resp(
             409,
             {
-                "error": "suspend finalize lost CAS (status changed mid-suspend); "
-                "VM stopped and backup safe in S3 — inspect tenant state.",
+                "error": "suspend finalize lost the release token (status changed "
+                "mid-suspend); VM stopped and backup safe in S3 — inspect tenant state.",
                 "id": tenant_id,
             },
         )
@@ -3222,11 +4737,35 @@ def _tenant_suspend(tenant_id, item):
     return utils._resp(200, {"id": tenant_id, "status": "suspended"})
 
 
-def _reserve_slot_on(host, vcpu, mem_mb, tenant_id):
-    """#422 — 在 host 上原子认领 vm_num + 容量(CAS)。返回认领的 vm_num,或 None(容量不足/
+def _restore_endpoint(vm_num):
+    """本次 restore 的 (guest_ip, host_port)。**唯一派生处。**
+
+    (供 reaper 转正时【照抄】而不是自己再算一遍),`_tenant_restore` 把它传给 launch-vm。
+    两处各写一遍必然漂移,而 guest_ip 漂了就是跨租户网络串号 —— `auth._guest_ip` 的
+    docstring 明写它是 /30 编址的 single source of truth,不能再多出第二个口径。"""
+    return auth._guest_ip(vm_num), clients.VM_PORT_BASE + vm_num - 1
+
+
+def _reserve_slot_on(host, vcpu, mem_mb, tenant_id, reservation_id):
+    """#422 — 在 host 上原子认领 vm_num + 容量。返回认领的 vm_num,或 None(容量不足/
     输 CAS 竞争)。与 create 路径的内层 `_reserve_slot`(:1642)、migrate 的
     `_reserve_migration_slot`(:2408)同款 CAS,为 restore 路径抽出模块级版本(本仓既有模式:
-    同款 CAS 按路径各持一份,避免跨函数闭包依赖)。next_vm_num 单调只增。"""
+    同款 CAS 按路径各持一份,避免跨函数闭包依赖)。next_vm_num 单调只增。
+
+    (`restore_reservation_id` 令牌 + `restore_host_id`/`restore_vm_num` 目标坐标)原子落库。
+
+    为什么必须同事务:bb 上目标 host/vm_num 直到最后那次 finalize 才写进租户行,窗口内行里
+    的 `host_id` 仍指 suspend 之前那台【旧】host(suspend 收尾刻意不清坐标)。于是崩在窗口
+    里时,事后收敛者面对的是 status=restoring、行里坐标指 A、真实预留在 B,而 **B 从未落库**
+    —— 既不能回滚(不知道该扣哪台的账本)、不能推进、也不能删(按旧行去删会扣穿旧 host、
+    停错 VM、泄漏新 host 的预留)。这正是 health_check/handler.py 的 #469 说明逐字记下的
+    「卡死 restoring 没有自动出口」的根因。令牌与账本增量同事务 ⟹ 令牌在 ⟺ 增量已落。
+
+    `reservation_id` 由调用方铸(它负责在撞号/回滚时释放),每次认领一枚新的:迟到的旧释放
+    匹配不上新令牌(防 ABA,同 #412 `_reservation_id`)。
+
+    TransactItems 顺序 [0]=host、[1]=tenant 是全文件契约(`_classify_release_cancel` 与下面
+    的 `_fresh_host_state` 都按位次读)。"""
     # 指定 host 直接预留,跳过它就等于在水位保护上开了个洞:账本说有余量,而该 host
     # 自报的实测 MemAvailable 已在水位以下。needed_mb 做预测准入(放置后仍须高于水位)。
     if not capacity.mem_ok(
@@ -3250,83 +4789,219 @@ def _reserve_slot_on(host, vcpu, mem_mb, tenant_id):
     )
     cap_v = capacity.allocatable(int(host["total_vcpu"]), _cpu_r) - vcpu
     cap_m = capacity.allocatable(int(host["total_mem_mb"]), _mem_r) - mem_mb
-    # CAS 后都必须把 caller 持有的 host 字典推进到最新 next_vm_num。否则成功认领已
-    # 推进 DDB、本地 expected 却停在旧值,下一轮必然 CCF；而 _release_slot 刻意不回退
+    txn_items = [
+        {
+            "Update": {
+                "TableName": clients.hosts_table.table_name,
+                "Key": {"instance_id": host["instance_id"]},
+                "UpdateExpression": (
+                    "SET used_vcpu = used_vcpu + :v, used_mem_mb = used_mem_mb + :m, "
+                    "vm_count = vm_count + :one, next_vm_num = :next_after, #ps = :tid, "
+                    "#s = :a REMOVE idle_since"
+                ),
+                "ConditionExpression": (
+                    "next_vm_num = :expected AND used_vcpu <= :cap_v "
+                    "AND used_mem_mb <= :cap_m AND attribute_not_exists(#ps) "
+                    # #540 — 污点原子门,与 create 的 _reserve_slot 同款(同一个窗口:
+                    # _restore_reserve_slot 选点后、认领前,运维可能正好标记这台)。
+                    "AND " + host_taint.NOT_TAINTED_CONDITION
+                ),
+                "ExpressionAttributeNames": {
+                    "#s": "status",
+                    "#ps": scheduling.phys_slot_attr(target),
+                },
+                "ExpressionAttributeValues": {
+                    ":v": vcpu, ":m": mem_mb, ":one": 1, ":a": "active",
+                    ":tid": tenant_id, ":expected": expected,
+                    ":next_after": target + 1, ":cap_v": cap_v, ":cap_m": cap_m,
+                    **host_taint.NOT_TAINTED_VALUES,  # #540
+                },
+                # CancellationReasons[0]["Item"],形状与单表 CAS 的 err_response["Item"]
+                # 一致,故 _fresh_host_state 逐字复用。
+                "ReturnValuesOnConditionCheckFailure": "ALL_OLD",
+            }
+        },
+        {
+            "Update": {
+                "TableName": clients.tenants_table.table_name,
+                "Key": {"id": tenant_id},
+                # 收敛者自己算;但那等于把 `auth._guest_ip` 的 /30 编址口径复制到
+                # health_check(它独立打包、不能 import api/core),而那个口径漂了就是
+                # 跨租户网络串号。落库让 reaper 的转正变成【照抄持久化值】,零派生逻辑。
+                "UpdateExpression": (
+                    "SET restore_reservation_id = :rid, restore_host_id = :rh, "
+                    "restore_vm_num = :rvn, restore_guest_ip = :rip, "
+                    "restore_host_port = :rport"
+                ),
+                # `attribute_not_exists(restore_reservation_id)` 防重投对同一租户压第二份
+                # 预留(与 dispatch `_reserve_batch_txn` 的同名守卫同源):一个租户行只能记住
+                # 一枚令牌,第二份预留就会变成无主增量。撞号循环靠"先释放再认领"腾出该属性。
+                "ConditionExpression": (
+                    "#s = :restoring AND attribute_not_exists(restore_reservation_id)"
+                ),
+                "ExpressionAttributeNames": {"#s": "status"},
+                "ExpressionAttributeValues": {
+                    ":rid": reservation_id,
+                    ":rh": host["instance_id"],
+                    ":rvn": target,
+                    ":rip": _restore_endpoint(target)[0],
+                    ":rport": _restore_endpoint(target)[1],
+                    ":restoring": "restoring",
+                },
+            }
+        },
+    ]
     try:
-        r = clients.hosts_table.update_item(
-            Key={"instance_id": host["instance_id"]},
-            UpdateExpression=(
-                "SET used_vcpu = used_vcpu + :v, used_mem_mb = used_mem_mb + :m, "
-                "vm_count = vm_count + :one, next_vm_num = :next_after, #ps = :tid, "
-                "#s = :a REMOVE idle_since"
-            ),
-            ConditionExpression=(
-                "next_vm_num = :expected AND used_vcpu <= :cap_v "
-                "AND used_mem_mb <= :cap_m AND attribute_not_exists(#ps)"
-            ),
-            ExpressionAttributeNames={
-                "#s": "status",
-                "#ps": scheduling.phys_slot_attr(target),
-            },
-            ExpressionAttributeValues={
-                ":v": vcpu, ":m": mem_mb, ":one": 1, ":a": "active",
-                ":tid": tenant_id, ":expected": expected,
-                ":next_after": target + 1, ":cap_v": cap_v, ":cap_m": cap_m,
-            },
-            ReturnValues="UPDATED_NEW",
-            ReturnValuesOnConditionCheckFailure="ALL_OLD",
-        )
-        try:
-            next_after = int(r["Attributes"]["next_vm_num"])
-            host["next_vm_num"] = next_after
-            return next_after - 1
-        except (KeyError, TypeError, ValueError):
-            host["next_vm_num"] = target + 1
-            return target
+        clients.hosts_table.meta.client.transact_write_items(TransactItems=txn_items)
     except ClientError as e:
-        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
-            host.update(_fresh_host_state(e.response))
+        if e.response["Error"]["Code"] == "TransactionCanceledException":
+            _reasons = e.response.get("CancellationReasons", []) or []
+            # 只有 host 项(idx0)带 ALL_OLD,租户项失败时这里拿到空 dict → host 字典不变,
+            # 与"抢输"同款 None 契约(调用方换机重试,最终 fail-closed 503)。
+            host.update(_fresh_host_state(_reasons[0] if _reasons else {}))
             return None
         raise
+    # 认领后都必须把 caller 持有的 host 字典推进到最新 next_vm_num。否则成功认领已
+    # 推进 DDB、本地 expected 却停在旧值,下一轮必然 CCF；而释放刻意不回退
+    # 事务不支持 ReturnValues=UPDATED_NEW,所以不再读回值 —— 但事务写进 DDB 的就是
+    # `:next_after = target + 1`,本地赋同一个表达式【按构造恒等】于库里的值,比旧的
+    # "读回来再解析、解析不了才 fallback" 更强(少一条可失败的路径)。
+    host["next_vm_num"] = target + 1
+    return target
+
+
+def _release_restore_reservation(tenant_id, host_id, reservation_id, vcpu, mem_mb,
+                                 phys_num):
+    """#438 —— 令牌化释放 restore 预留:扣 host 账本 + 清租户 `restore_*` 坐标与令牌,
+    一个 TransactWriteItems,条件 `restore_reservation_id = :rid`。返回三态。
+
+    与 `_release_capacity_reservation` 同款互斥锚,只是令牌字段与被清坐标不同:谁先消费
+    令牌谁扣一次账本,其余幂等 no-op。**刻意不带 status 守卫** —— 本函数既在保持
+    `restoring` 时调用(撞号重认领),也在回滚前调用,而 status 条件失败会被分类器读成
+    "令牌已被别人消费"(ALREADY),那是把"还占着容量"误报成"已释放",正好是要防的方向。
+
+    `ps_<n>` 与 suspend 收尾同理走独立的 `release_phys_slot`(自带 owner 条件,是独立的
+    幂等单元;并进事务会被账本项的下溢守卫连带取消 → 号泄漏且 reaper 救不了)。"""
+    txn_items = [
+        {
+            "Update": {
+                "TableName": clients.hosts_table.table_name,
+                "Key": {"instance_id": host_id},
+                "UpdateExpression": (
+                    "SET used_vcpu = used_vcpu - :v, "
+                    "used_mem_mb = used_mem_mb - :m, vm_count = vm_count - :one"
+                ),
+                "ConditionExpression": (
+                    "used_vcpu >= :v AND used_mem_mb >= :m AND vm_count >= :one"
+                ),
+                "ExpressionAttributeValues": {":v": vcpu, ":m": mem_mb, ":one": 1},
+            }
+        },
+        {
+            "Update": {
+                "TableName": clients.tenants_table.table_name,
+                "Key": {"id": tenant_id},
+                "UpdateExpression": (
+                    "REMOVE restore_reservation_id, restore_host_id, restore_vm_num, "
+                    "restore_guest_ip, restore_host_port"
+                ),
+                "ConditionExpression": "restore_reservation_id = :rid",
+                "ExpressionAttributeValues": {":rid": reservation_id},
+            }
+        },
+    ]
+    try:
+        clients.hosts_table.meta.client.transact_write_items(TransactItems=txn_items)
+        _rel = _REL_CONSUMED
+    except Exception as e:  # noqa: BLE001 — 判定(含未知错误保守当 retry)在分类器里
+        _rel = _classify_release_cancel(e, tenant_id, "restore #438")
+    if _rel != _REL_RETRY and phys_num is not None:
+        scheduling.release_phys_slot(host_id, phys_num, tenant_id)
+    return _rel
 
 
 def _restore_reserve_slot(vcpu, mem_mb, tenant_id):
-    """#422 — restore 冷恢复重取 host slot(全新 launch,与 create 同款:找 host → CAS 认领
-    vm_num → 物理 tap 撞号复检)。返回 (host, vm_num) 或 (None, resp) 失败响应。
-    冷恢复的 tap 绑新 vm_num(launch-vm.sh:661 TAP=tap-vm{VM_NUM}),故 phys_vm_num 重分配为
-    新 vm_num,不沿用原值(原值那台 host 的 slot 休眠时已释放,物理 tap 也已回收)。"""
+    """#422 — restore 冷恢复重取 host slot(全新 launch,与 create 同款:找 host → 认领
+    vm_num → 物理 tap 撞号复检)。冷恢复的 tap 绑新 vm_num(launch-vm.sh:661
+    TAP=tap-vm{VM_NUM}),故 phys_vm_num 重分配为新 vm_num,不沿用原值(原值那台 host 的
+    slot 休眠时已释放,物理 tap 也已回收)。
+
+    第三位在失败时【非 None 就意味着"这份预留仍占着容量"】,调用方据此**必须保持
+    restoring、绝不回滚**:回滚会清掉令牌而账本仍是加过的 → 那就是本 issue 要修的永久
+    容量泄漏,只是换了个触发点。"""
     host = scheduling._find_host(vcpu, mem_mb)
     if not host:
-        return None, utils._resp(503, {"error": "no host capacity for restore", "id": tenant_id})
+        _mark_fail_reason(tenant_id, "restore", create_deadline.REASON_CAPACITY)
+        return None, utils._resp(
+            503, {"error": "no host capacity for restore", "id": tenant_id}
+        ), None
     vm_num = None
+    rid = None
     for attempt in range(8):
-        claimed = _reserve_slot_on(host, vcpu, mem_mb, tenant_id)
+        _rid = secrets.token_hex(16)
+        claimed = _reserve_slot_on(host, vcpu, mem_mb, tenant_id, _rid)
         if claimed is not None:
-            vm_num = claimed
+            vm_num, rid = claimed, _rid
             break
         time.sleep(0.05 * (attempt + 1))
         host = scheduling._find_host(vcpu, mem_mb)
         if not host:
-            return None, utils._resp(503, {"error": "no host capacity (contended)", "id": tenant_id})
+            _mark_fail_reason(tenant_id, "restore", create_deadline.REASON_CAPACITY)
+            return None, utils._resp(
+                503, {"error": "no host capacity (contended)", "id": tenant_id}
+            ), None
     if vm_num is None:
-        return None, utils._resp(503, {"error": "slot allocation contended out", "id": tenant_id})
+        _mark_fail_reason(tenant_id, "restore", create_deadline.REASON_CAPACITY)
+        return None, utils._resp(
+            503, {"error": "slot allocation contended out", "id": tenant_id}
+        ), None
     # 物理 tap 撞号复检(no-cross-tenant,与 create :1722 同款):占了就丢号认领下一个。
     for _skip in range(64):
         if not _phys_tap_occupied(host["instance_id"], vm_num, exclude_id=tenant_id):
             break
-        scheduling._release_slot(
-            host["instance_id"], vcpu, mem_mb, vm_num, tenant_id
+        _rel = _release_restore_reservation(
+            tenant_id, host["instance_id"], rid, vcpu, mem_mb, vm_num
         )
-        claimed = _reserve_slot_on(host, vcpu, mem_mb, tenant_id)
+        if _rel == _REL_RETRY:
+            # 字段;这份预留可能仍在,再认领一份就等于同一租户同时持两份预留而只有一枚
+            # 令牌记得住 → 另一份永久无主(容量泄漏)。返 503 让消息重投:令牌仍在,重投
+            # 时释放是幂等的。调用方看到第三位非 None 就保持 restoring 不回滚。
+            # #565 G3 接线:与本函数其余出口同档(capacity)—— 走到这里意味着这一轮没能
+            # 拿到可用槽位。刻意**不用** capacity_release_pending:那个值的已发布契约写着
+            # 「只有 delete 会出」,且不在 restore 的封闭子集里(assert_reason_valid 会拒)。
+            _mark_fail_reason(tenant_id, "restore", create_deadline.REASON_CAPACITY)
+            return None, utils._resp(
+                503,
+                {
+                    "error": "restore reservation release hit a transient failure while "
+                    "skipping an occupied physical tap; kept the reservation and "
+                    "status=restoring for re-drive (releasing again is idempotent).",
+                    "id": tenant_id,
+                },
+            ), rid
+        _rid = secrets.token_hex(16)
+        claimed = _reserve_slot_on(host, vcpu, mem_mb, tenant_id, _rid)
         if claimed is None:
-            return None, utils._resp(503, {"error": "no free vm slot (phys tap contended)", "id": tenant_id})
-        vm_num = claimed
+            _mark_fail_reason(tenant_id, "restore", create_deadline.REASON_CAPACITY)
+            return None, utils._resp(
+                503, {"error": "no free vm slot (phys tap contended)", "id": tenant_id}
+            ), None
+        vm_num, rid = claimed, _rid
     else:
-        scheduling._release_slot(
-            host["instance_id"], vcpu, mem_mb, vm_num, tenant_id
-        )
-        return None, utils._resp(503, {"error": "unable to find free physical vm slot", "id": tenant_id})
-    return host, vm_num
+        # #565 G3(Codex 第八轮)—— 释放写的是 **hosts_table**,而落原因写 tenants_table:
+        # 两张表**可以独立被节流**,所以"清理和落原因同为 DDB 写、先后无差别"这条推理在这里
+        # 不成立。tenants 表被节流时先落原因(默认 read_timeout 60s × 4 次,最坏 ~240s)会把
+        # 剩余运行时间耗光 → 预留永久搁浅。用 try/finally:清理先跑,原因照样保证落盘。
+        try:
+            _rel = _release_restore_reservation(
+                tenant_id, host["instance_id"], rid, vcpu, mem_mb, vm_num
+            )
+        finally:
+            _mark_fail_reason(tenant_id, "restore", create_deadline.REASON_CAPACITY)
+        return None, utils._resp(
+            503, {"error": "unable to find free physical vm slot", "id": tenant_id}
+        ), (rid if _rel == _REL_RETRY else None)
+    return host, vm_num, rid
 
 
 def _tenant_restore(tenant_id, item):
@@ -3347,6 +5022,7 @@ def _tenant_restore(tenant_id, item):
         )
     backup_key = item.get("restore_backup_key") or _resolve_backup(tenant_id) or ""
     if not backup_key:
+        _mark_fail_reason(tenant_id, "restore", create_deadline.REASON_BACKUP_MISSING)
         return utils._resp(
             409,
             {
@@ -3357,7 +5033,7 @@ def _tenant_restore(tenant_id, item):
         )
 
     # 并发闸:CAS suspended → restoring,单赢家(与并发 restore/delete 互斥)。
-    if not _cas_status(tenant_id, "suspended", "restoring"):
+    if not _cas_status(tenant_id, "suspended", "restoring", stash_prev=True):
         cur = (
             clients.tenants_table.get_item(Key={"id": tenant_id}, ConsistentRead=True).get("Item")
             or {}
@@ -3365,19 +5041,23 @@ def _tenant_restore(tenant_id, item):
         cur_s = cur.get("status")
         if cur_s in ("restoring", "running"):
             return utils._resp(200, {"id": tenant_id, "status": cur_s})
+        _mark_fail_reason(tenant_id, "restore", create_deadline.REASON_PREEMPTED)
         return utils._resp(
             409, {"error": f"tenant is {cur_s}; restore lost the race", "id": tenant_id}
         )
 
     vcpu = int(item.get("vcpu", 0))
     mem_mb = int(item.get("mem_mb", 0))
-    host, vm_num_or_resp = _restore_reserve_slot(vcpu, mem_mb, tenant_id)
+    host, vm_num_or_resp, reservation_id = _restore_reserve_slot(vcpu, mem_mb, tenant_id)
     if host is None:
-        _cas_status(tenant_id, "restoring", "suspended")  # 回滚,slot 没取到无需释放
+        # 回滚会 REMOVE 令牌而账本仍是加过的 → 无主增量 = 永久容量泄漏。保持 restoring
+        # 让消息重投,重投时凭令牌幂等释放。为 None 时才是"什么都没占",可以干净回滚。
+        if reservation_id is None:
+            _cas_status(tenant_id, "restoring", "suspended", clear_stuck=True)
         return vm_num_or_resp
     vm_num = vm_num_or_resp
-    guest_ip = auth._guest_ip(vm_num)
-    host_port = clients.VM_PORT_BASE + vm_num - 1
+    # 所以「传给 launch-vm 的」与「reaper 转正时照抄的」按构造相同。
+    guest_ip, host_port = _restore_endpoint(vm_num)
 
     # 冷恢复 launch(带 RESTORE_KEY,launch-vm.sh 从 S3 下载/解密/解压/e2fsck 还原 data.ext4)。
     # 的 CommandId 就翻 running(那只证明"提交了",VM 可能没起=假成功、VM 缺失、slot 泄漏)。
@@ -3407,6 +5087,7 @@ def _tenant_restore(tenant_id, item):
     # 再推进→永久卡 restoring。返 503 让本消息留队列:可见性超时后重投,那时持锁者大概率已跑完
     # (成功→本次重投读到 running 幂等返回;失败→本次重投自己拿到锁重试),收敛有保证。
     if not launched and launch_rc == 75:
+        _mark_fail_reason(tenant_id, "restore", create_deadline.REASON_PREEMPTED)
         return utils._resp(
             503,
             {
@@ -3422,43 +5103,102 @@ def _tenant_restore(tenant_id, item):
         # #520 C2:这条清理是"释放 slot 之前必须把 VM 停掉",stop-vm.sh 缺失/过期会让它
         # 静默无效(本调用的返回值本来就不看)→ 孤儿 VM 留在 host 上而 slot 已释放,
         # 下一个租户可能被排到同一个物理号。故同样前置 S3 自愈。
-        _restore_heal = ssm_dispatch.host_script_self_heal(
-            ("stop-vm.sh",),
-            "oc:restore",
-            freshness=("stop-vm.sh", "OC_LIFECYCLE_LOCK_FD"),
-        )
-        ssm_dispatch._ssm_run(
-            host["instance_id"],
-            f"{_restore_heal} && /home/ubuntu/stop-vm.sh {tenant_id} {vm_num}",
-        )
-        scheduling._release_slot(
-            host["instance_id"], vcpu, mem_mb, vm_num, tenant_id
-        )
-        _cas_status(tenant_id, "restoring", "suspended")
+        #
+        # #565 G3(Codex 独立复审第七轮)—— **这一处、也只有这一处用 try/finally**,让落原因
+        # 排在清理【之后】而又保证一定执行。理由是量化过的:
+        #   · `ddb = boto3.resource("dynamodb")` 没配 Config → boto3 默认 read_timeout 60s
+        #     × 4 次尝试,一次 DDB 写最坏能吃掉 ~240s。DDB 不可达时先落原因就可能把 Lambda
+        #     的剩余时间耗光,而**下面这个 stop-vm 是唯一不依赖 DDB、能救回孤儿 VM 的动作**。
+        #   · 其余接线的清理全是 DDB 写 —— DDB 挂了它们和落原因一样做不成,先后无实质差别。
+        # finally 让两个目标同时成立:安全关键的清理先跑,而清理抛异常时原因照样落盘。
+        #
+        # 早返回落在 try 里 ⇒ finally 照样执行 ⇒ **那条 502 出口也是可归因的**(原因仍是
+        # host_unreachable:走到这里的根因是 launch 失败,释放失败是次生的)。
+        try:
+            _restore_heal = ssm_dispatch.host_script_self_heal(
+                ("stop-vm.sh",),
+                "oc:restore",
+                freshness=("stop-vm.sh", "OC_LIFECYCLE_LOCK_FD"),
+            )
+            ssm_dispatch._ssm_run(
+                host["instance_id"],
+                f"{_restore_heal} && /home/ubuntu/stop-vm.sh {tenant_id} {vm_num}",
+            )
+            # 令牌化释放:扣账本与清 restore_* 坐标/令牌一个事务、条件 rid 匹配,幂等。
+            _rel = _release_restore_reservation(
+                tenant_id, host["instance_id"], reservation_id, vcpu, mem_mb, vm_num
+            )
+            # 释放遇瞬时失败 ⟹ 令牌可能仍在、账本可能仍是加过的。**绝不回滚**:回滚会清掉
+            # 令牌而增量还在 → 无主增量 = 永久容量泄漏(与 delete 路径 RETRY 留 deleting
+            # 同一条原则)。此时保持 restoring,由下面那条 502 让消息重投(释放幂等)。
+            if _rel != _REL_RETRY:
+                _cas_status(tenant_id, "restoring", "suspended", clear_stuck=True)
+        finally:
+            _mark_fail_reason(
+                tenant_id, "restore", create_deadline.REASON_HOST_UNREACHABLE
+            )
+        # #565 G3 —— 这条 return 刻意放在 try/finally **之后**,而且是**一条**而不是两条
+        # 嵌在 `if` 里。原因是覆盖检查的判据:它按「同 block 内、return 之前有一条 mark」找,
+        # 且对 try/finally 只在 `return 落在 Try 之后`时才回溯 `finalbody`。
+        #   · 写在 try 体内 → 运行时照样触发 finally,但静态判成未接线;
+        #   · 嵌在 `if` 里 → return 所在 block 是 If.body,回溯不到那个 Try;
+        #   · 在 return 前再补一条 mark → 与 finally 重复写(#565 明确要避免)。
+        # 所以收敛成一条 return、只让**文案**随 _rel 变。两种情形本来都是 502,
+        # 回滚与否已在上面的 try 体内按 _rel 处置过,故运行时语义不变。
         return utils._resp(
             502,
             {
-                "error": f"restore launch failed (rc={launch_rc}); target VM stopped, "
-                "rolled back to suspended, slot released, S3 backup intact. Retry.",
+                "error": (
+                    f"restore launch failed (rc={launch_rc}) and releasing the "
+                    "capacity reservation hit a transient failure; target VM stopped "
+                    "and the S3 backup is intact, but status is kept restoring with "
+                    "the reservation token so a re-drive reconciles it instead of "
+                    "stranding the capacity. Retry."
+                    if _rel == _REL_RETRY
+                    else f"restore launch failed (rc={launch_rc}); target VM stopped, "
+                    "rolled back to suspended, slot released, S3 backup intact. Retry."
+                ),
                 "id": tenant_id,
             },
         )
 
     # 挂回原 tenant_id:更新 host/vm_num/phys_vm_num(冷恢复重分配)/guest_ip/host_port,翻 running。
     # CAS 条件 status=restoring(单赢家持有)。清 suspended_at/restore_backup_key/suspended_from。
+    # #571 — 收尾一并把 app_health 置 down + 刷新 last_health_check：restore 不重置健康位
+    # 会让「status=running && app_health=up」在数据面就绪前就为真（host-agent 下一 tick
+    # 才对账路由/探活），客户端据此发首请求落空需刷新。置 down 让就绪信号诚实且不依赖
+    # poll 时序；host-agent 下一 tick 探到 gateway 应答即写回 up（其 gate 用当轮探测值，
+    # 不受此 down 影响）。
     try:
         clients.tenants_table.update_item(
             Key={"id": tenant_id},
+            # 可能已被中间态巡检标记过;不清则健康的 running 租户永久带着 lifecycle_stuck_at,
+            # 让 P2 的 ?force=true 对它放行 → 误删。REMOVE 不存在的属性是 no-op。
+            # 已经加过,finalize 只是"转正"(与 dispatch_poller 的 promote / host-agent 的
+            # mark-running 同款,它们也只 REMOVE 令牌、不动 used_*)。
+            # 写进 host_id/vm_num 的值与 restore_host_id/restore_vm_num 同源 —— 二者由
+            # `_reserve_slot_on` 的同一个事务写下,而下面的条件把这一行钉在【那次】预留上,
+            # 所以内存值与库里的临时坐标按构造相等。
             UpdateExpression=(
                 "SET #s = :running, host_id = :h, vm_num = :vn, phys_vm_num = :vn, "
-                "guest_ip = :gip, host_port = :hp, updated_at = :t "
-                "REMOVE suspended_at, restore_backup_key, suspended_from"
+                "guest_ip = :gip, host_port = :hp, updated_at = :t, "
+                "app_health = :down, last_health_check = :t "
+                "REMOVE suspended_at, restore_backup_key, suspended_from, "
+                "restore_reservation_id, restore_host_id, restore_vm_num, "
+                "restore_guest_ip, restore_host_port, "
+                "lifecycle_stuck_at, lifecycle_stuck_reason, lifecycle_stuck_vm_dir, "
+                "lifecycle_stuck_fc_alive, updated_at_stuck_seen, lifecycle_prev_status, "
+                "lifecycle_rollback_deferred_until, lifecycle_probe_attempted_at"
             ),
-            ConditionExpression="#s = :restoring",
+            # 令牌条件是本步的核心:没有它,一次迟到的 finalize 可以把租户翻成 running 并
+            # 写上【别的一轮】预留的坐标(那一轮的账本增量随后被谁释放都算错)。
+            ConditionExpression="#s = :restoring AND restore_reservation_id = :rid",
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
                 ":running": "running",
+                ":down": "down",
                 ":restoring": "restoring",
+                ":rid": reservation_id,
                 ":h": host["instance_id"],
                 ":vn": vm_num,
                 ":gip": guest_ip,
@@ -3467,14 +5207,27 @@ def _tenant_restore(tenant_id, item):
             },
         )
     except clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException:
-        scheduling._release_slot(
-            host["instance_id"], vcpu, mem_mb, vm_num, tenant_id
-        )
+        # 状态被改走或令牌已被别人消费。释放本次预留(幂等:令牌已不在则 ALREADY no-op),
+        # 状态不动 —— 它已经不属于我们了。
+        # 同上(#565 G3,Codex 第八轮):释放写 hosts_table,落原因写 tenants_table,
+        # 两表可独立被节流 → 清理先跑,finally 兜住原因一定落盘。
+        try:
+            _rel = _release_restore_reservation(
+                tenant_id, host["instance_id"], reservation_id, vcpu, mem_mb, vm_num
+            )
+        finally:
+            _mark_fail_reason(tenant_id, "restore", create_deadline.REASON_PREEMPTED)
         return utils._resp(
-            409,
+            409 if _rel != _REL_RETRY else 502,
             {
                 "error": "restore finalize lost CAS (status changed mid-restore); "
-                "inspect tenant state.",
+                "inspect tenant state."
+                + (
+                    " Releasing this run's capacity reservation hit a transient failure; "
+                    "the token is kept so a re-drive reconciles it."
+                    if _rel == _REL_RETRY
+                    else ""
+                ),
                 "id": tenant_id,
             },
         )
@@ -3541,7 +5294,10 @@ def _reserve_migration_slot(target, vcpu, mem_mb, attempts=8, tenant_id=None):
                 ),
                 ConditionExpression=(
                     "next_vm_num = :expected AND used_vcpu <= :cap_v "
-                    "AND used_mem_mb <= :cap_m AND attribute_not_exists(#ps)"
+                    "AND used_mem_mb <= :cap_m AND attribute_not_exists(#ps) "
+                    # #540 — 污点原子门。上面 target 那次显式检查是【提前给 409】,
+                    # 这里才是原子的:检查与认领之间运维仍可能标记这台。
+                    "AND " + host_taint.NOT_TAINTED_CONDITION
                 ),
                 ExpressionAttributeNames={
                     "#ps": scheduling.phys_slot_attr(claimed_target)
@@ -3555,6 +5311,7 @@ def _reserve_migration_slot(target, vcpu, mem_mb, attempts=8, tenant_id=None):
                     ":next_after": claimed_target + 1,
                     ":cap_v": cap_v,
                     ":cap_m": cap_m,
+                    **host_taint.NOT_TAINTED_VALUES,  # #540
                 },
                 ReturnValues="UPDATED_NEW",
             )
@@ -3646,7 +5403,11 @@ def _rebuild_repin_resolve(item, repin_body):
             },
         )
     if channel == "live":
-        return {"channel": "live", "target_snap": None}
+        return {
+            "channel": "live",
+            "target_snap": None,
+            "target_host_snapshot": host_slots.get("live") or "",
+        }
     target_snap, code, msg = image_channel_mod.resolve_pinned_version(
         channel, host_slots,
         repin_body.get("expected_image_snapshot_time"),
@@ -3654,7 +5415,11 @@ def _rebuild_repin_resolve(item, repin_body):
     )
     if code:
         return utils._resp(400 if code == "VALIDATION" else 409, {"error": msg, "code": code})
-    return {"channel": "canary", "target_snap": target_snap}
+    return {
+        "channel": "canary",
+        "target_snap": target_snap,
+        "target_host_snapshot": target_snap,
+    }
 
 
 def _rebuild_repin_apply(
@@ -3694,6 +5459,15 @@ def _rebuild_repin_apply(
         )
     ok, err = _force_backup_sync(tenant_id)
     if not ok:
+        _mark_fail_reason(tenant_id, "rebuild", create_deadline.REASON_BACKUP_FAILED)
+        # #547 — fail-closed 早退必须先放掉【自己】取得的生命周期租约。
+        # 这条路径一步都没执行(真机复现:rebuild_phase/rebuild_status 全空、host 上无
+        # rebuild-vm.sh 的 SSM 记录),却把租约留在租户记录上,于是 delete/restart/reset/
+        # migrate 全被 409 LIFECYCLE_IN_FLIGHT 挡住约 30 分钟 —— 包括删不掉,只能等租约自然过期。
+        # 紧随其后的 renew_owned 失败分支【绝不能】这样做:那时租约已经属于别人,
+        # 释放它等于把别人的锁抢掉。
+        if lifecycle_op_id is not None and lifecycle_fence_epoch is not None:
+            lifecycle_fence.release(tenant_id, lifecycle_op_id, lifecycle_fence_epoch)
         return utils._resp(
             502,
             {
@@ -3710,6 +5484,7 @@ def _rebuild_repin_apply(
             tenant_id, lifecycle_op_id, lifecycle_fence_epoch
         )
     ):
+        _mark_fail_reason(tenant_id, "rebuild", create_deadline.REASON_PREEMPTED)
         return utils._resp(
             409,
             {
@@ -3732,31 +5507,44 @@ def _rebuild_repin_apply(
         )
         update_kwargs["ConditionExpression"] = condition
         update_kwargs["ExpressionAttributeValues"] = values
-    if channel == "live":
-        values = {
-            ":c": "live",
-            ":t": utils._now(),
-            **update_kwargs.pop("ExpressionAttributeValues", {}),
-        }
-        clients.tenants_table.update_item(
-            Key={"id": tenant_id},
-            UpdateExpression="SET image_channel = :c, updated_at = :t REMOVE image_snapshot_time",
-            ExpressionAttributeValues=values,
-            **update_kwargs,
-        )
-    else:
-        values = {
-            ":c": "canary",
-            ":s": target_snap,
-            ":t": utils._now(),
-            **update_kwargs.pop("ExpressionAttributeValues", {}),
-        }
-        clients.tenants_table.update_item(
-            Key={"id": tenant_id},
-            UpdateExpression="SET image_channel = :c, image_snapshot_time = :s, updated_at = :t",
-            ExpressionAttributeValues=values,
-            **update_kwargs,
-        )
+    # #565 G3(Codex 独立复审第六轮)—— 这两条写都带围栏条件,而围栏在上面 renew_owned()
+    # 之后**仍可能被抢走**(租约到期后别人 acquire 到新的 op_id/epoch)。此前 CCF 直接逃逸 →
+    # 上层变成一个**未归因的 500**,而 rebuild 在契约里声明了 preempted。
+    # 处置与 _tenant_action_inner 的 CCF 分支一致:落原因后**原样上抛**,不改既有响应行为
+    # _mark_fail_reason 的 docstring 与 TestMarkOrdering。
+    try:
+        if channel == "live":
+            values = {
+                ":c": "live",
+                ":t": utils._now(),
+                **update_kwargs.pop("ExpressionAttributeValues", {}),
+            }
+            clients.tenants_table.update_item(
+                Key={"id": tenant_id},
+                UpdateExpression=(
+                    "SET image_channel = :c, updated_at = :t REMOVE image_snapshot_time"
+                ),
+                ExpressionAttributeValues=values,
+                **update_kwargs,
+            )
+        else:
+            values = {
+                ":c": "canary",
+                ":s": target_snap,
+                ":t": utils._now(),
+                **update_kwargs.pop("ExpressionAttributeValues", {}),
+            }
+            clients.tenants_table.update_item(
+                Key={"id": tenant_id},
+                UpdateExpression=(
+                    "SET image_channel = :c, image_snapshot_time = :s, updated_at = :t"
+                ),
+                ExpressionAttributeValues=values,
+                **update_kwargs,
+            )
+    except clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException:
+        _mark_fail_reason(tenant_id, "rebuild", create_deadline.REASON_PREEMPTED)
+        raise
     return None
 
 
@@ -3773,6 +5561,24 @@ _REBUILD_PHASE_RUNNING = "running"  # consumer 已下发 SSM
 _REBUILD_PHASE_VERIFYING = "verifying"  # 回执已收,正在验采用
 # 非终态集合:处于其中任一阶段就说明上一次 rebuild 还在飞,不该再放第二次进来(见
 # tenant_action 的 REBUILD_IN_FLIGHT 闸)。
+# ── #564 G7 —— 手动备份的相位。**这里是这套取值的权威定义** ──────────────────
+#
+# 为什么不放 `core/create_deadline.py`:那里管的是"死线口径"(默认值/字段名/取值子集),
+# 而相位是**操作状态机**的一部分,与 `_REBUILD_PHASE_*` 是同一类东西,理应放在同一处。
+#
+# `deploy/lambda/backup/handler.py` 要写这几个值,但它是**另一个 Lambda**(asset 只含
+# 它自己一个文件),import 不到本模块 —— 所以那边只能写字面值,一致性由
+# `tests/test_564_g6g7_dlq_backup.py` 的一条断言逐值比对(与 rebuild 相位那条同款理由)。
+_BACKUP_PHASE_QUEUED = "queued"      # 已受理、已派发,worker 还没开始
+_BACKUP_PHASE_RUNNING = "running"    # worker 已开始备份
+_BACKUP_PHASE_SUCCEEDED = "succeeded"
+_BACKUP_PHASE_FAILED = "failed"
+# 非终态集合:处于其中任一相位就说明这次备份还在飞。死线执行者按它扫
+# (`deadline_executor._BACKUP_INFLIGHT_PHASES` 必须与它逐值一致)。
+_BACKUP_INFLIGHT_PHASES = frozenset(
+    {_BACKUP_PHASE_QUEUED, _BACKUP_PHASE_RUNNING}
+)
+
 _REBUILD_INFLIGHT_PHASES = frozenset(
     {_REBUILD_PHASE_QUEUED, _REBUILD_PHASE_RUNNING, _REBUILD_PHASE_VERIFYING}
 )
@@ -3806,6 +5612,16 @@ def _rebuild_inflight_is_stale(started_at):
     return elapsed >= _REBUILD_INFLIGHT_TIMEOUT_SECONDS
 
 
+# #523 判据 4 —— rebuild 采用证据的版本维度。
+# firecracker_version 取自 host 上 /proc/<pid>/exe --version 的输出(正在跑的那个二进制,
+# 不是磁盘上那份声称),形如 `v1.15.1`,允许 upstream 的构建后缀(`v1.15.1-dirty`)。
+# guest_kernel_sha256 是 VM 真正引导的那个 vmlinux 的内容摘要 —— 用摘要而不用 marker 里的
+# 名字,因为名字只是 provision 的声称、在 #389v2 之前的老 host 上根本没有,且抓不到
+# "同名不同字节"(CI 桶重发过同名对象)这一档。
+_FC_VERSION_RE = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9._-]*")
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+
 def _parse_host_rebuild_result(
     stdout,
     tenant_id,
@@ -3815,7 +5631,15 @@ def _parse_host_rebuild_result(
     host_id,
     vm_num,
 ):
-    """Return only an identity-bound host result from rebuild-vm.sh."""
+    """Return only an identity-bound host result from rebuild-vm.sh.
+
+    verify 路径原本零业务日志:一次真机上,部署在 S3 的旧 rebuild-vm.sh 不发
+    firecracker_version/guest_kernel_sha256,parser 恒拒 → 每次 rebuild 都静默落
+    unconfirmed,却查不到任何"为什么"——只能临时加诊断码才定位到 fc_version 分支。
+    这些 `rebuild-adopt-reject` 行让 host 脚本与 parser 的契约漂移在 CloudWatch 里
+    直接可见(host 脚本太旧/字段缺失/身份不符/inode 不合法),不必再临时插桩。
+    """
+    _tag = f"rebuild-adopt-reject op={op_id} tenant={tenant_id}"
     result = None
     for line in reversed((stdout or "").splitlines()):
         try:
@@ -3826,6 +5650,7 @@ def _parse_host_rebuild_result(
             result = candidate
             break
     if not result:
+        print(f"{_tag} reason=no_identity_bound_state_json stdout_len={len(stdout or '')}")
         return None
     expected = {
         "tenant_id": tenant_id,
@@ -3835,7 +5660,9 @@ def _parse_host_rebuild_result(
         "vm_num": int(vm_num),
         "fence_epoch": int(fence_epoch),
     }
-    if any(result.get(key) != value for key, value in expected.items()):
+    _mismatch = [k for k, v in expected.items() if result.get(k) != v]
+    if _mismatch:
+        print(f"{_tag} reason=identity_mismatch fields={_mismatch}")
         return None
     if result.get("state") != "SUCCEEDED":
         return result
@@ -3846,14 +5673,44 @@ def _parse_host_rebuild_result(
         "overlay_dev_inode",
         "overlay_fd_dev_inode",
     )
-    if any(not inode.fullmatch(str(result.get(key) or "")) for key in required_inodes):
+    _bad_inodes = [k for k in required_inodes if not inode.fullmatch(str(result.get(k) or ""))]
+    if _bad_inodes:
+        print(f"{_tag} reason=bad_or_missing_inode fields={_bad_inodes}")
         return None
     if result["overlay_dev_inode"] != result["overlay_fd_dev_inode"]:
+        print(f"{_tag} reason=overlay_inode_mismatch")
         return None
     if not str(result.get("firecracker_start_ticks") or "").isdigit():
+        print(f"{_tag} reason=firecracker_start_ticks_not_digit")
+        return None
+    # #523 判据 4 —— 版本维度。上面那组 inode 是 per-host 身份,跨 host 不可比,所以
+    # "两台 host 跑着两个不同的 FC / 两个不同的 guest kernel" 在旧证据里完全不可见:
+    # 证据齐全、照样 PASS。这两个字段让混版在 rebuild 时可见,并随
+    # image_ops.record_result(result=...) 一起进账本,运维比两台 host 即可看出分叉。
+    #
+    # 与其余字段同样【必填】:本函数的既有契约是"证据不全 = 不确认",给版本字段开
+    # optional 就等于允许一台不报版本的 host 冒充证据齐全。在役老 host 上那份没有这两个
+    # 字段的 rebuild-vm.sh 由同一条 SSM 命令里的 host_script_self_heal 先换掉
+    # (freshness sentinel = guest_kernel_sha256),所以这不是"上线即打挂在役机队"。
+    if not _FC_VERSION_RE.fullmatch(str(result.get("firecracker_version") or "")):
+        # 最常见的契约漂移:host 侧 rebuild-vm.sh 太旧、不发 #523 的 freshness sentinel
+        # (firecracker_version)。真机根因即此:S3 旧脚本 → 每次 rebuild 恒拒 → unconfirmed。
+        print(
+            f"{_tag} reason=firecracker_version_missing_or_invalid"
+            f" value={result.get('firecracker_version')!r}"
+            " (host rebuild-vm.sh may predate #523 — check deployed script version)"
+        )
+        return None
+    if not _SHA256_RE.fullmatch(str(result.get("guest_kernel_sha256") or "")):
+        print(
+            f"{_tag} reason=guest_kernel_sha256_missing_or_invalid"
+            f" value={result.get('guest_kernel_sha256')!r}"
+            " (host rebuild-vm.sh may predate #523 — check deployed script version)"
+        )
         return None
     tombstone = str(result.get("tombstone_dev_inode") or "")
     if tombstone and tombstone == result["overlay_dev_inode"]:
+        print(f"{_tag} reason=tombstone_equals_overlay_inode")
         return None
     return result
 
@@ -4072,10 +5929,46 @@ def finalize_async_rebuild_failure(
         lifecycle_fence.release(tenant_id, op_id, fence_epoch)
 
 
+def finalize_async_rebuild_success(
+    tenant_id,
+    op_id,
+    fence_epoch,
+    reapply_binding,
+):
+    """Persist one verified reapply result, then release its exact lifecycle fence."""
+    if not tenant_id or not op_id or fence_epoch is None:
+        raise ValueError("async rebuild success finalization requires full identity")
+    stamp_values = _reapply_stamp_values(reapply_binding)
+    clients.tenants_table.update_item(
+        Key={"id": tenant_id},
+        UpdateExpression=(
+            "SET config_template = :cfg_tpl, "
+            "config_reapply_registry_version = :cfg_reg, "
+            "config_reapply_body_version_id = :cfg_vid, "
+            "config_reapply_body_sha256 = :cfg_sha, updated_at = :t"
+        ),
+        ConditionExpression=(
+            "rebuild_op_id = :op AND rebuild_status = :done AND "
+            "rebuild_lifecycle_fence_epoch = :epoch AND "
+            "active_lifecycle_op_id = :op AND lifecycle_fence_epoch = :epoch"
+        ),
+        ExpressionAttributeValues={
+            **stamp_values,
+            ":t": utils._now(),
+            ":op": op_id,
+            ":done": _REBUILD_STATUS_DONE,
+            ":epoch": int(fence_epoch),
+        },
+    )
+    if not lifecycle_fence.release(tenant_id, op_id, fence_epoch):
+        raise RuntimeError(
+            f"async rebuild success fence release lost ownership for {tenant_id}/{op_id}"
+        )
+
+
 def tenant_action(tenant_id, action, body=None, event=None):
     """POST /tenants/{id}/{action} 的入口。
 
-    #456 / ADR §5.1 —— 这层薄包装只负责 client_token 幂等记录的**收尾**:把内层不论从哪个
     return 退出(tenant_action 内部有 36 个 return)的结果统一写成 result。
     为什么用包装而不是在每个 return 前加 finish():36 处逐一插入,漏一处就会让那条 idem
     记录永久停在 IN_PROGRESS —— 该客户带同一 token 的后续请求会被 409 挡死,再也发不出这个
@@ -4084,6 +5977,9 @@ def tenant_action(tenant_id, action, body=None, event=None):
     是否登记幂等由内层决定(它解析 body 才知道有没有 client_token),故内层把用到的
     (owner, token) 通过 _idem_ctx 回传给这层。
     """
+    if action == "upgrade":
+        action = "rebuild"
+        body = _normalize_v1_upgrade_body(body)
     _ctx = {}
     if (
         action in action_idem.IDEMPOTENT_ACTIONS
@@ -4142,6 +6038,17 @@ def tenant_action(tenant_id, action, body=None, event=None):
             tenant_id, action, _ctx["owner"], _ctx["token"], _state, _body
         )
     if (
+        action == "rebuild"
+        and (event or {}).get("_defer_async_rebuild_success_finalize")
+        and 200 <= int((resp or {}).get("statusCode") or 0) < 300
+    ):
+        try:
+            _success_body = json.loads((resp or {}).get("body") or "{}")
+        except Exception:  # noqa: BLE001
+            _success_body = {}
+        if _success_body.get("config_reapply") != "already_applied":
+            _ctx["hold_lifecycle_fence"] = True
+    if (
         int((resp or {}).get("statusCode") or 0) >= 500
         and not _ctx.get("release_lifecycle_fence_on_error")
     ):
@@ -4167,6 +6074,13 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
     ).get("Item")
     if not item:
         return utils._resp(404, {"error": "tenant not found"})
+    #
+    # (:5157)是 TOCTOU 的 T,终态回写才是 U。两者之间隔着最长 300s 的 SSM 往返
+    # (`_ssm_run(..., timeout=300)`),入口门对那段窗口无能为力。快照钉在门之前,于是
+    # 「我据以放行的那个状态」与「我回写时要求的那个状态」是同一个值 —— 中途被任何人
+    # 改过,CAS 就必须失败。到写点再读会随 item 的任何重读(rebuild 分支 :6252 就重读了)
+    # 一起漂,那样的"条件"只是把无条件覆盖包了一层壳。
+    _entry_status = item.get("status")
     # backup/…) on ownership. Checked once here so all branches are covered.
     denied = auth._assert_owner_or_admin(item, event or {})
     if denied is not None:
@@ -4280,6 +6194,33 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
             },
         )
 
+    # #547 建议项 —— rebuild 一直缺一道 status 前置条件。
+    #
+    # 真机复现(#547 issue 正文):对一个还在 `creating`(冷恢复未把 data.ext4 落盘)的租户
+    # 发 rebuild → 强制前置备份找不到源盘 → 按 no-data-loss 铁律拒绝继续 → 502。那个 502
+    # 本身是对的,但整条路压根不该被受理:在它之前 rebuild 已经取了生命周期租约、并发出一次
+    # 注定失败的强制备份 SSM。对照 suspend 有 running/stopped 前置、restore 有 suspended
+    # 前置,而 rebuild 只有上方那道 REBUILD_IN_FLIGHT 闸 —— 它只拦"同租户已有 rebuild
+    # 在飞",不看 status。
+    #
+    # **只补 `creating`**:issue 原文写的是「creating/restoring 直接 409」,但 `restoring`
+    # 已被上面 `_hibernate_states` 那道闸拦住(:5243),再列一遍是死代码。
+    #
+    # 位置在**任何 lifecycle_fence.acquire 之前**,所以连租约都不取 —— 这正是 issue 说的
+    # 「连那次无意义的强制备份 SSM 都省了」。
+    if action == "rebuild" and item.get("status") == "creating":
+        return utils._resp(
+            409,
+            {
+                "error": "tenant is still creating; its data disk may not be on the host "
+                "yet, so the mandatory pre-repin backup would fail and abort the rebuild. "
+                "Wait until status=running, then rebuild.",
+                "code": "REBUILD_TENANT_NOT_READY",
+                "id": tenant_id,
+                "status": "creating",
+            },
+        )
+
     # Destructive actions accept an optional object body. Rebuild additionally
     # reads image selection fields; reset reads client_token only.
     _rebuild_body = {}
@@ -4323,6 +6264,48 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
         return utils._resp(
             400, {"error": "image_channel must be a string", "code": "VALIDATION"}
         )
+    # lifecycle fencing, progress stamps, backup, and destructive host commands.
+    _reapply_binding = None
+    _rebuild_verified = False
+    _reapply_admission_resolved = None
+    if action == "rebuild":
+        _trusted_binding = (
+            _rebuild_body.get("_config_reapply")
+            if "_consumer_ident" in (event or {})
+            else None
+        )
+        if isinstance(_trusted_binding, dict):
+            _reapply_binding = dict(_trusted_binding)
+        else:
+            _reapply_request = _extract_reapply_request(action, _rebuild_body)
+            if _reapply_requested(_reapply_request):
+                _reapply_admission_resolved = _rebuild_repin_resolve(
+                    item, _rebuild_body
+                )
+                if not (
+                    isinstance(_reapply_admission_resolved, dict)
+                    and "channel" in _reapply_admission_resolved
+                ):
+                    return _reapply_admission_resolved
+                try:
+                    _reapply_binding = _prepare_config_reapply(
+                        item,
+                        _reapply_request,
+                        _reapply_admission_resolved,
+                    )
+                except ValueError as exc:
+                    return utils._resp(
+                        400,
+                        {"error": str(exc), "code": "VALIDATION"},
+                    )
+                except LookupError as exc:
+                    return utils._resp(
+                        400,
+                        {
+                            "error": f"openclaw.json 不兼容: {exc}",
+                            "code": "OPENCLAW_CONFIG_INCOMPATIBLE",
+                        },
+                    )
     # 做幂等」,而控制面此前全文零命中该字段:承诺了却没实现。
     #
     # 为什么 REBUILD_IN_FLIGHT 闸不够:那道闸只拦「上一次还在飞」。而客户重试的典型时机是
@@ -4514,6 +6497,19 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
                 _idem_ctx["hold_lifecycle_fence"] = False
             return _resolved
 
+        # #564 G2(通道 C)—— rebuild 走 Lambda 自调用而不是 SQS,但死线口径必须同一份:
+        # 受理时刻算出绝对 epoch,写进【租户行】与【事件 payload】。这里就是受理时刻 ——
+        # 本块只在 `"_consumer_ident" not in event` 时进(见 :5651 的条件),worker 重入时
+        # 走的是另一条路,不会重算。
+        _accepted_epoch = int(time.time())
+        _dl_epoch, _dl_src = deadline_config.deadline_epoch_for(
+            create_deadline.ACTION_REBUILD, _accepted_epoch
+        )
+        if _dl_src != "ssm":
+            print(
+                f"rebuild_deadline: {_dl_epoch - _accepted_epoch}s "
+                f"from {_dl_src} for {tenant_id}"
+            )
         try:
             _stamp_rebuild_progress(
                 tenant_id,
@@ -4526,6 +6522,14 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
                 fence_epoch=_dispatch_fence_epoch,
                 source_host_id=item.get("host_id"),
                 source_vm_num=int(item.get("vm_num", 1)),
+            )
+            # 与 SQS 那两条通道同一条顺序纪律:死线必须在**发起之前**落到行上,否则
+            # `deadline_executor` 扫不到这一行(它的 filter 第一条是
+            # `attribute_exists(rebuild_deadline)`),这次 rebuild 永远不会被判死。
+            # 放在这个 try 里面是刻意的:写失败会走下面那条既有分支 —— 放掉围栏 + 503
+            # 「什么都没开始,可安全重试」,那正是这一步失败时该给的答复。
+            _write_action_deadline(
+                tenant_id, create_deadline.ACTION_REBUILD, _dl_epoch
             )
         except Exception as e:  # noqa: BLE001
             lifecycle_fence.release(
@@ -4547,6 +6551,9 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
 
         ident = auth._get_caller_identity(event or {})
         worker_body = dict(_rebuild_body)
+        if _reapply_binding:
+            # Trusted producer-owned evidence; caller-supplied copies are ignored.
+            worker_body["_config_reapply"] = _reapply_binding
         if _resolved["channel"] == "canary" and _resolved.get("target_snap"):
             # Freeze the canary selected during admission. A promotion or pull
             # between HTTP 202 and worker start must fail the existing expected-
@@ -4560,6 +6567,10 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
                 "body": worker_body,
                 "_op_id": _lifecycle_op_id,
                 "_fence_epoch": _dispatch_fence_epoch,
+                # #564 G2/G3 —— 与租户行 `rebuild_deadline` 是【同一个值】(上面算的
+                # `_dl_epoch`)。键名复用 `MSG_DEADLINE_KEY`,与 SQS 两条通道同一个口径:
+                # 消费侧那段判过期的代码不必按通道分叉。
+                create_deadline.MSG_DEADLINE_KEY: _dl_epoch,
                 "_ident": {
                     "owner_id": ident.get("owner_id"),
                     "is_admin": ident.get("is_admin"),
@@ -4599,6 +6610,17 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
                 "action": "rebuild",
                 "status": "queued",
                 "op_id": _lifecycle_op_id,
+                **(
+                    {
+                        "registry_version": _reapply_binding["registry_version"],
+                        "body_version_id": _reapply_binding.get(
+                            "body_version_id", ""
+                        ),
+                        "body_sha256": _reapply_binding.get("body_sha256", ""),
+                    }
+                    if _reapply_binding
+                    else {}
+                ),
             },
         )
 
@@ -4659,6 +6681,60 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
                         "hold_lifecycle_fence": True,
                     }
                 )
+        # #564 G2 —— 受理时刻算绝对死线,同一个值写进【消息体】与【租户行】。
+        # 计时起点在这里而不是 consumer 里:上面 :5838 那个 `_consumer_ident not in event`
+        # 的闸保证本块只在 API 请求路径跑,所以这就是真正的受理时刻;放到 consumer 里算
+        # 会让死线随每次重投往后挪,超时机制等于不存在。
+        #
+        # **只对死线词汇表里的动作算**:`_async_actions` 有八个,而 `DEADLINE_ACTIONS`
+        # 只有七档 —— start/stop/pause/resume/reset **不在**其中,对它们调
+        # `deadline_epoch_for()` 会 raise。那五个动作没有客户承诺的死线,不该被硬塞一个。
+        _accepted_epoch = int(time.time())
+        _dl_epoch = None
+        if action in create_deadline.DEADLINE_ACTIONS:
+            _dl_epoch, _dl_src = deadline_config.deadline_epoch_for(
+                action, _accepted_epoch
+            )
+            if _dl_src != "ssm":
+                # 只在【没走参数】时打日志:走参数是常态,每次操作都刷一行没有信息量。
+                # 反过来"本该由参数托管却回落了"是运维要知道的事(G5 验收第 4 条)。
+                print(
+                    f"{action}_deadline: {_dl_epoch - _accepted_epoch}s "
+                    f"from {_dl_src} for {tenant_id}"
+                )
+        # 死线必须在消息发出【之前】落到行上,顺序不能反:消息一发出 consumer 就可能取走并
+        # 推进状态,而 `deadline_executor` 的 filter 第一条是
+        # `attribute_exists(<action>_deadline)` —— 行上没有它,这次操作永远不会被判死。
+        if _dl_epoch is not None:
+            try:
+                _write_action_deadline(tenant_id, action, _dl_epoch)
+            except Exception as e:  # noqa: BLE001
+                # **这是发送前的失败,不能落到下面那条 `ENQUEUE_STATE_UNKNOWN`**
+                # (Codex 独立复审第 1 轮抓出的真缺陷)。那条是为**发送后的不确定**设计的:
+                # SQS 可能已经收下消息,所以它刻意**扣住租约**,防盲目重试起第二次操作。
+                # 而这里消息一条都没发出、host 侧一步未动。把它塞进那条路的后果是:答复叫
+                # 客户重试,而每次重试都撞 409 `LIFECYCLE_IN_FLIGHT`,直到 1800s 租约自然
+                # 过期 —— 一次写库抖动把租户锁死半小时,比它想解决的问题更糟。
+                # 正确处置:放掉刚取的那把租约,给一个"什么都没开始、可安全重试"的 503
+                # (与 rebuild 那条同款语义,复用同一个 code)。
+                if _queue_fence_epoch is not None:
+                    lifecycle_fence.release(
+                        tenant_id, _lifecycle_op_id, _queue_fence_epoch
+                    )
+                    if _idem_ctx is not None:
+                        _idem_ctx["hold_lifecycle_fence"] = False
+                        _idem_ctx["release_lifecycle_fence_on_error"] = True
+                print(f"{action} deadline write failed for {tenant_id}: {e}")
+                return utils._resp(
+                    503,
+                    {
+                        "error": "could not record the deadline before dispatch; "
+                        "nothing was started - safe to retry",
+                        "code": "ENQUEUE_ANCHOR_FAILED",
+                        "id": tenant_id,
+                        "op_id": _lifecycle_op_id,
+                    },
+                )
         try:
             _enq_op_id = lifecycle_dispatch.enqueue_lifecycle(
                 action,
@@ -4670,6 +6746,7 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
                     else None
                 ),
                 operation_id=_lifecycle_op_id,
+                deadline_epoch=_dl_epoch,
             )
         except Exception as e:  # noqa: BLE001
             print(f"lifecycle enqueue failed for {tenant_id}/{action}: {e}")
@@ -4705,9 +6782,29 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
     _lifecycle_fence_epoch = None
     _lifecycle_host_guard = ""
     if action in _FENCED_LIFECYCLE_ACTIONS:
-        _lifecycle_fence_epoch, _fence_reason = lifecycle_fence.acquire(
-            tenant_id, _lifecycle_op_id, action
+        _expected_fence_epoch = (
+            (event or {}).get("_fence_epoch")
+            if action == "rebuild" and "_consumer_ident" in (event or {})
+            else None
         )
+        if _expected_fence_epoch is not None:
+            _expected_fence_epoch = int(_expected_fence_epoch)
+            if lifecycle_fence.renew_owned(
+                tenant_id, _lifecycle_op_id, _expected_fence_epoch
+            ):
+                _lifecycle_fence_epoch, _fence_reason = (
+                    _expected_fence_epoch,
+                    None,
+                )
+            else:
+                _lifecycle_fence_epoch, _fence_reason = (
+                    None,
+                    "the async rebuild no longer owns its admitted lifecycle fence",
+                )
+        else:
+            _lifecycle_fence_epoch, _fence_reason = lifecycle_fence.acquire(
+                tenant_id, _lifecycle_op_id, action
+            )
         if _lifecycle_fence_epoch is None:
             return utils._resp(
                 409,
@@ -4824,6 +6921,18 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
         if target.get("status") in ("draining", "deleted"):
             return utils._resp(
                 409, {"error": f"target host {target_host_id} is {target['status']}"}
+            )
+        # #540 — 显式 target 撞污点(cordon)机器一律 409,与上面 draining/deleted 并列。
+        # allow_upgrading 豁免。把租户搬【上】一台正在腾空的机器,方向本身就是反的。
+        if host_taint.is_tainted(target):
+            return utils._resp(
+                409,
+                {
+                    "error": f"target host {target_host_id} is tainted (cordoned): "
+                    "it accepts no new tenants. Migrating onto a host being drained "
+                    "is the wrong direction.",
+                    "code": "HOST_TAINTED",
+                },
             )
 
         # Capacity check — same allocatable formula as _find_host().
@@ -5038,7 +7147,28 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
         if dnat_cmd:
             full_cmd += f" && {dnat_cmd}"
         full_cmd += f" && {_lifecycle_host_guard}"
-        if not ssm_dispatch._ssm_run(item["host_id"], full_cmd, timeout=300):
+        # #565 G3(Codex 独立复审第八轮)—— **要看 rc,不能一律记成 host_unreachable。**
+        # 这条组命令前后都夹着 `_lifecycle_host_guard`,而那个 guard 的退出码在本仓已有成熟语义
+        # (论证见 :4067-4082):
+        #   · **79** = 租约被抢占(LIFECYCLE_FENCE_EXPIRED)→ 被别的操作抢先
+        #   · **75** = launch-vm.sh 的 flock 争用(并发/重投的 launch 正持锁)→ 同样是被抢先
+        #   · **78** = host **读不到** DDB 里的 fence → 那是**控制面故障,不是被抢占**
+        # 只有 75/79 归 preempted。契约给 preempted 的指引是「**可立刻重试**」,而 78 若也归它,
+        # 就会在一次 DDB 故障里指示所有调用方立刻重试 —— **放大控制面故障、还盖住真实原因**
+        # (第九轮 Codex 纠正的;我第八轮把 78 一起塞进去了)。78 保持 host_unreachable:
+        # 它的指引是「隔 1–2 分钟」,正好是等控制面恢复该做的事。
+        # 判据与第四轮那条同款:**分类依据是"重试有没有用、该多快重试",不是"错在哪一层"。**
+        _restart_ok, _restart_rc = ssm_dispatch._ssm_run(
+            item["host_id"], full_cmd, timeout=300, want_rc=True
+        )
+        if not _restart_ok:
+            _mark_fail_reason(
+                tenant_id,
+                "restart",
+                create_deadline.REASON_PREEMPTED
+                if _restart_rc in (75, 79)
+                else create_deadline.REASON_HOST_UNREACHABLE,
+            )
             return utils._resp(
                 502,
                 {
@@ -5053,21 +7183,22 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
         guest_ip = item.get("guest_ip", "")
         host_port = item.get("host_port", "")
         stop_cmd = f"/home/ubuntu/stop-vm.sh {tenant_id} {vm_num}"
-        # Remove DNAT rule
-        dnat_del = (
-            _dnat_remove_all_cmd(host_port, guest_ip)
-            if guest_ip and host_port
-            else ""
-        )
+        # #548 — stop 绝不回收端口/DNAT。这里【曾经】把一条 iptables -D PREROUTING 删除循环
+        # 拼在 stop-vm.sh 后面,那正好打破了整个端口模型赖以成立的不变量
+        # (route_ops.py:438 release_port_and_dnat 的 R2.3:"only DELETE reclaims, STOP never does"):
+        #   ① stop 删掉 DNAT → ② 端口位图由活规则重建(rebuild_bitmap_from_iptables)于是认为该端口空闲
+        #   → ③ 下一个租户 promote 拿到同一端口 → ④ 停机租户 DDB 里 host_port 没变
+        #   → ⑤ 它再 start 时 _dnat_add_idempotent_cmd 把规则加回来 → 同 dport 两条 DNAT 并存。
+        # PREROUTING 按首条匹配,于是一个租户公布的端点会把流量投进另一个租户的 VM;
+        # 而 route_ops.list_dnat_rules() 返回 dict 会把重复端口静默折叠(且报的是后一条,
+        # 与内核生效的首条相反),连冲突都看不见。真机已复现(#548)。
+        # 端口/DNAT 的回收只在 delete 路径做;suspend 另有自己的摘除(它同时释放 slot)。
         _stop_heal = ssm_dispatch.host_script_self_heal(
             ("stop-vm.sh",),
             "oc:stop",
             freshness=("stop-vm.sh", "OC_LIFECYCLE_LOCK_FD"),
         )
         full_cmd = f"{_stop_heal} && {stop_cmd}"
-        if dnat_del:
-            # Keep cleanup best-effort without letting it mask stop-vm failure.
-            full_cmd += f" && ({dnat_del} || true)"
         if not ssm_dispatch._ssm_run(item["host_id"], full_cmd):
             return utils._resp(
                 502,
@@ -5196,6 +7327,57 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
             return _resolved
         _repin_channel = _resolved["channel"]
         _repin_snapshot = _resolved.get("target_snap")
+        if _reapply_binding:
+            current_channel = (
+                item.get("image_channel") or image_channel_mod.DEFAULT_CHANNEL
+            )
+            current_snapshot = (
+                (item.get("image_snapshot_time") or "").strip() or None
+            )
+            if (
+                _reapply_target_matches(item, _reapply_binding)
+                and current_channel == _repin_channel
+                and current_snapshot == _repin_snapshot
+            ):
+                return utils._resp(
+                    200,
+                    {
+                        "id": tenant_id,
+                        "status": item.get("status") or "running",
+                        "rebuild_status": _REBUILD_STATUS_DONE,
+                        "config_reapply": "already_applied",
+                        "registry_version": _reapply_binding["registry_version"],
+                        "body_version_id": _reapply_binding.get(
+                            "body_version_id", ""
+                        ),
+                        "body_sha256": _reapply_binding.get("body_sha256", ""),
+                    },
+                )
+            _probe_ok, _probe_incompatible, _probe_result = (
+                _run_reapply_host_probe(item, _reapply_binding, _resolved)
+            )
+            if not _probe_ok:
+                if _idem_ctx is not None:
+                    _idem_ctx["release_lifecycle_fence_on_error"] = True
+                if _probe_incompatible:
+                    return utils._resp(
+                        409,
+                        {
+                            "error": "openclaw.json 不兼容",
+                            "code": "OPENCLAW_CONFIG_INCOMPATIBLE",
+                            "id": tenant_id,
+                        },
+                    )
+                return utils._resp(
+                    503,
+                    {
+                        "error": "openclaw.json compatibility probe failed before "
+                        "the destructive rebuild; tenant was not modified",
+                        "code": "REAPPLY_PROBE_FAILED",
+                        "id": tenant_id,
+                        "probe_rc": _probe_result.get("rc"),
+                    },
+                )
         _applied = _rebuild_repin_apply(
             tenant_id,
             item,
@@ -5285,6 +7467,9 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
             f"{q(str(_rb_op_id))} {q(str(_lifecycle_fence_epoch))} "
             f"{q(_rb_attempt_id)} {q(str(item['host_id']))} -- {launch_cmd}"
         )
+        _reapply_command_env = (
+            _reapply_env_prefix(_reapply_binding) if _reapply_binding else ""
+        )
         # #520 C2:同 reset —— rebuild-vm.sh 在既有 host 上可能不存在。客户 apse1 打
         # restorepatch 时正是靠人工 scp 补装到在役 3 台才让 rebuild 可用,那是把正确性
         # 寄托在人工步骤上;这里改成控制面自己兜底。同 reset 成对自愈 stop-vm.sh:
@@ -5295,7 +7480,25 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
             "oc:rebuild",
             freshness=("stop-vm.sh", "OC_LIFECYCLE_LOCK_FD"),
         )
-        full_cmd = f"{_rebuild_heal} && {_lifecycle_host_guard} && {rebuild_cmd}"
+        # #523 判据 4 —— 第二个"存在但过期"判据。控制面现在【要求】采用证据带
+        # firecracker_version / guest_kernel_sha256(见 _parse_host_rebuild_result),而在役
+        # host 上那份 rebuild-vm.sh 是它开机时装的旧版,不会写这两个字段 → 每次 rebuild 都
+        # 会被判成 unconfirmed。这不是可以用文档"必须成对部署"糊过去的,那是把正确性寄托在
+        # 人工步骤上(host_script_self_heal 的 docstring 写的就是这条)。
+        # 为什么是第二段而不是把 freshness 改成收多对:helper 的 freshness 是单对语义,
+        # 另外十个调用点都按单对写。为了 rebuild 一条路径去改共用 helper 的签名会波及
+        # suspend / restore / reset / delete / restart / stop / start / resize / migrate ——
+        # 违反最小正确改动。两段各自独立判定、串在同一条 SSM 命令里,幸福路径的代价是
+        # 一次 `[ -x ]` 加一次 grep。
+        _rebuild_version_heal = ssm_dispatch.host_script_self_heal(
+            ("rebuild-vm.sh",),
+            "oc:rebuild",
+            freshness=("rebuild-vm.sh", "guest_kernel_sha256"),
+        )
+        full_cmd = (
+            f"{_rebuild_heal} && {_rebuild_version_heal} && "
+            f"{_lifecycle_host_guard} && {_reapply_command_env}{rebuild_cmd}"
+        )
         if dnat_cmd:
             full_cmd += f" && {dnat_cmd}"
         full_cmd += f" && {_lifecycle_host_guard}"
@@ -5395,22 +7598,116 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
     elif action == "suspend":
         # (备份数据盘到 S3 + 停 VM + 释放 slot,保留 DDB 记录与 tenant_id;恢复走 restore)。
         # 独立同步分支(不落底部通用 update):有 fail-closed 备份+回滚语义,与 backup/migrate 同类。
-        return _tenant_suspend(tenant_id, item)
+        # host_guard 必须传下去(codex 第九轮):suspend 的 stop-vm 与 rm -rf 是裸跑的,
+        # 而 reaper 会在 1200s 后回滚卡住的 suspending —— 延迟落地的命令会在回滚之后
+        # 才删盘。guard 同时校验 owner+epoch+租约未过期,配上 reaper「租约过期才回滚」
+        # 就闭合了。见 _FENCED_LIFECYCLE_ACTIONS 上方的说明。
+        # _lifecycle_ctx 必须传下去(#547 兄弟路径):suspend 的 "stop-vm 之前" 失败分支
+        # 要靠它把 release_lifecycle_fence_on_error 写回本 ctx,否则 `tenant_action` 的
+        # 5xx wrapper(:5114)对那些 502 一律扣住租约 1800s,而它们的文案写着 Retry。
+        return _tenant_suspend(
+            tenant_id,
+            item,
+            host_guard=_lifecycle_host_guard,
+            _lifecycle_ctx=_idem_ctx,
+        )
     elif action == "restore":
         # 重取 host+vm_num+slot、挂回原记录。走 create 同款冷恢复链(_resolve_backup +
         # launch-vm RESTORE_KEY),但不新建租户。
         return _tenant_restore(tenant_id, item)
     elif action == "backup":
+        # ── #564 G7 —— 网关手动备份的**可轮询句柄**与状态字段 ────────────────────
+        #
+        # 在这之前这条出口返 `202 {"status":"started"}` 就结束了:**没有 op_id、没有任何
+        # 状态字段**。客户拿着那个 202 无从知道备份成不成功 —— 而客户口径给它的死线是 600s。
+        # 那正是 issue 零节那句「接口返回成功、实际操作没有发生,且调用方无从察觉」。
+        #
+        # 字段形状(与 #565 G6 同一套,两个 issue 明文要求"别各出一套"):
+        #   backup_op_id     本次操作的句柄,回在 202 里,后续轮询靠它对上"是哪一次"
+        #   backup_phase     queued → running → succeeded / failed
+        #   backup_deadline  绝对死线 epoch(G2 的口径),由死线执行者扫
+        #   backup_fail_reason / backup_fail_at   封闭取值 + 时刻(#565 G3 已建好字段)
+        #
+        # **只用一个 `backup_phase`,不学 rebuild 的两字段**:rebuild 需要
+        # `rebuild_status` 额外表达"确认了没"(回执可能丢),而备份要么写进了 S3 要么没有,
+        # 没有那个第三态,所以一个字段就够。
+        _bk_op_id = secrets.token_hex(16)
+        _accepted_epoch = int(time.time())
+        _bk_dl, _bk_dl_src = deadline_config.deadline_epoch_for(
+            create_deadline.ACTION_BACKUP, _accepted_epoch
+        )
+        if _bk_dl_src != "ssm":
+            print(
+                f"backup_deadline: {_bk_dl - _accepted_epoch}s "
+                f"from {_bk_dl_src} for {tenant_id}"
+            )
+        # **契约性写入必须在派发之前落库** —— 与 `enqueue_lifecycle` 的 `before_send` 同一条
+        # 纪律,而且这里更硬:派发一出去,backup Lambda 可能立刻把 phase 推到 `running`,
+        # 生产者随后再写就会把它**倒退回 `queued`**(进度倒退);更糟的是若那次写入失败,
+        # 客户已经拿到 202 和句柄,却在记录里找不到这个 op —— 202 承诺了可轮询。
+        # 写失败即 5xx、**不派发**:宁可让调用方重试,也不发出一次无法被轮询的备份。
+        try:
+            clients.tenants_table.update_item(
+                Key={"id": tenant_id},
+                UpdateExpression=(
+                    "SET backup_op_id = :op, backup_phase = :ph, "
+                    f"{create_deadline.deadline_attr(create_deadline.ACTION_BACKUP)}"
+                    " = :dl, backup_started_at = :t "
+                    # 上一次备份的失败痕迹在新一次受理时清掉:留着会让轮询方把旧原因
+                    # 读成本次的结果。时刻字段一并清,两者必须同时存在或同时不存在。
+                    f"REMOVE {create_deadline.fail_reason_attr(create_deadline.ACTION_BACKUP)}, "
+                    f"{create_deadline.fail_at_attr(create_deadline.ACTION_BACKUP)}"
+                ),
+                # `attribute_exists(id)` 防 upsert 造畸形行(理由见 `_write_action_deadline`)。
+                ConditionExpression="attribute_exists(id)",
+                ExpressionAttributeValues={
+                    ":op": _bk_op_id,
+                    ":ph": _BACKUP_PHASE_QUEUED,
+                    ":dl": _bk_dl,
+                    ":t": utils._now(),
+                },
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"backup handle anchor failed for {tenant_id}: {e}")
+            return utils._resp(
+                503,
+                {
+                    "error": "could not record the backup operation before dispatch; "
+                    "nothing was started - safe to retry",
+                    "code": "ENQUEUE_ANCHOR_FAILED",
+                    "id": tenant_id,
+                    "op_id": _bk_op_id,
+                },
+            )
         # Async invoke Backup Lambda with single tenant
         lambda_client = boto3.client("lambda")
         lambda_client.invoke(
             FunctionName=os.environ.get("BACKUP_FUNCTION", "openclaw-backup"),
             InvocationType="Event",  # async, returns immediately
-            Payload=json.dumps({"tenant_id": tenant_id}).encode(),
+            # `backup_op_id` 是**手动备份的判别符**:backup Lambda 只在收到它时才写
+            # phase。删前备份与 suspend 备份走同一个函数但不带它 —— 它们的失败由各自的
+            # fail-closed 路径处置,而**系统定时备份的错峰语义不许被顺手改**(客户表格明文
+            # 只要"网关手动备份")。
+            Payload=json.dumps(
+                {"tenant_id": tenant_id, "backup_op_id": _bk_op_id}
+            ).encode(),
         )
-        audit._publish_event("tenant.backup_started", tenant_id, {})
+        audit._publish_event(
+            "tenant.backup_started", tenant_id, {"backup_op_id": _bk_op_id}
+        )
         return utils._resp(
-            202, {"id": tenant_id, "action": "backup", "status": "started"}
+            202,
+            {
+                "id": tenant_id,
+                "action": "backup",
+                # `status` 保持 "started" 不动 —— 已发布字段,客户可能在读。新字段是加法。
+                "status": "started",
+                "backup_op_id": _bk_op_id,
+                "backup_phase": _BACKUP_PHASE_QUEUED,
+                create_deadline.deadline_attr(
+                    create_deadline.ACTION_BACKUP
+                ): _bk_dl,
+            },
         )
     elif action == "access":
         # Explicit tenant authorization (P0): owner/admin grants or revokes
@@ -5615,6 +7912,14 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
         if _rb_final_op_id:
             update_expr += ", rebuild_op_id = :rbo"
             expr_values[":rbo"] = _rb_final_op_id
+        if _should_stamp_reapply(_rebuild_verified, _reapply_binding):
+            update_expr += (
+                ", config_template = :cfg_tpl"
+                ", config_reapply_registry_version = :cfg_reg"
+                ", config_reapply_body_version_id = :cfg_vid"
+                ", config_reapply_body_sha256 = :cfg_sha"
+            )
+            expr_values.update(_reapply_stamp_values(_reapply_binding))
 
     if _remove_attrs:
         update_expr += " REMOVE " + ", ".join(_remove_attrs)
@@ -5630,9 +7935,62 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
         )
         _final_update["ConditionExpression"] = _cond
         _final_update["ExpressionAttributeValues"].update(_fence_vals)
-    clients.tenants_table.update_item(
-        **_final_update
-    )
+    else:
+        # 不再无条件覆盖」—— 这里是 tenant_action 唯一的终态回写点,而条件此前**只对
+        # fenced action 注入**。非 fenced 的 `stop/start/pause/resume` 走到这里是零条件写。
+        #
+        # 为什么围栏条件不能替代这一条:fenced action 的条件是
+        # `lifecycle_fence.condition()` 派生的「围栏还归我这个 op_id / epoch」,与租户
+        # status 无关;而这四个动作压根不取围栏(不在 `_FENCED_LIFECYCLE_ACTIONS` 里),
+        # 于是既没有围栏、也没有状态条件,是完全裸的覆盖写。
+        #
+        #   T1 start 发 launch-vm SSM,最长等 300s
+        #   T2 期间 DELETE 到达 → CAS 翻 status=deleting → delete-vm.sh 排队
+        #   T3 start 的 SSM 回来,零条件写 `status=running`  ← 已删租户被复活
+        # 加 CAS 后 T3 打 CCF、status 保持 deleting,delete 继续收敛;host 侧那个被
+        # start 起来的 VM 由 delete-vm.sh 的 stop+rm 清掉 —— 收敛方向正确。
+        _final_update["ConditionExpression"] = "#s = :expected_prev"
+        _final_update["ExpressionAttributeValues"][":expected_prev"] = _entry_status
+    try:
+        clients.tenants_table.update_item(
+            **_final_update
+        )
+    except clients.tenants_table.meta.client.exceptions.ConditionalCheckFailedException:
+        # #565 G3(Codex 独立复审抓出的缺口)—— 无论下面走 raise 还是 409,这一条都是
+        # 「本次操作执行期间被别的操作抢先」,正是 preempted 的定义。restart 此前**只有**
+        # host_unreachable 一个出口,于是它在契约里声明的 preempted **没有任何产出点** ——
+        # 而契约文档明写「只声明代码里真有出口的值,偏大是撒谎」。
+        # 放在分支判断【之前】:raise 那一支照旧上抛(围栏处置不在本 issue 范围),这里只补
+        # 一条可观测记录,不改任何调用方契约。
+        #
+        # **闸必须查「该 action 的子集里有没有 preempted」,不能只查「action 有没有契约」。**
+        # 这里的 `action` 是**运行时变量**(start/stop/restart/reset/backup/migrate…),而
+        # `_mark_fail_reason` 的取值断言是刻意 raise 的(硬编码调用点写错要在开发期炸)。
+        # 两者相撞:`backup` 有契约但它的子集**不含** preempted(手动备份不与别的操作抢状态),
+        # 只查前者就会让 assert 抛出 ValueError,把一次 CCF 变成 500 —— 正好是 G3 要消灭的
+        # 「不知道为什么」。migrate/reset 压根没有契约,同一道闸一并挡住。
+        if create_deadline.REASON_PREEMPTED in create_deadline.REASONS_FOR.get(action, ()):
+            _mark_fail_reason(tenant_id, action, create_deadline.REASON_PREEMPTED)
+        if action in _FENCED_LIFECYCLE_ACTIONS:
+            # 语义与调用方契约),保持原行为:继续上抛。
+            raise
+        # 409 与同族的 LIFECYCLE_IN_FLIGHT/LIFECYCLE_SUPERSEDED 一致:调用方重读状态
+        # 后自行决定是否重发。host 侧本次动作可能已生效(SSM 已跑),但那是【可收敛】的:
+        # 抢赢的那个操作(delete/suspend/rebuild…)自己会把 VM 带到它要的形态。
+        return utils._resp(
+            409,
+            {
+                "error": (
+                    f"tenant state changed while {action} was running "
+                    f"(expected {_entry_status!r}); the write was refused so the "
+                    "concurrent operation can converge. Re-read the tenant, then "
+                    "decide whether to retry."
+                ),
+                "code": "TENANT_STATE_CHANGED",
+                "id": tenant_id,
+                "expected_status": _entry_status,
+            },
+        )
     # Map action verbs to lifecycle event names so consumers can filter.
     _action_to_event = {
         "stop": "tenant.stopped",
@@ -5684,6 +8042,18 @@ def _tenant_action_inner(tenant_id, action, body=None, event=None, _idem_ctx=Non
                     ),
                 }
                 if action == "rebuild"
+                else {}
+            ),
+            **(
+                {
+                    "registry_version": _reapply_binding["registry_version"],
+                    "body_version_id": _reapply_binding.get(
+                        "body_version_id", ""
+                    ),
+                    "body_sha256": _reapply_binding.get("body_sha256", ""),
+                }
+                if action == "rebuild"
+                and _should_stamp_reapply(_rebuild_verified, _reapply_binding)
                 else {}
             ),
         },
@@ -5741,7 +8111,6 @@ def _resolve_backup(src_tenant_id, timestamp=None):
     """Return the S3 key of a backup, or empty string if not found.
     If timestamp is given, look up that exact backup. Otherwise return the most recent.
 
-    #199 fix — 两处桶/后缀 bug 导致备份存在却 resolve 不到(客户 restore/迁移拿不到
     数据):
       • bucket: backups 写在 BACKUP_BUCKET(WORM+CMK 专用桶,见 backup-data.sh:16
         `${BACKUP_BUCKET:-${ASSETS_BUCKET}}`),但这里原读 ASSETS_BUCKET → 永远 list
@@ -5753,18 +8122,87 @@ def _resolve_backup(src_tenant_id, timestamp=None):
     """
     bucket = os.environ.get("BACKUP_BUCKET") or os.environ.get("ASSETS_BUCKET", "")
     prefix = os.environ.get("BACKUP_PREFIX", "backups")
-    resp = clients.s3.list_objects_v2(
-        Bucket=bucket, Prefix=f"{prefix}/{src_tenant_id}/"
-    )
+    # ㉛ 必须【翻完整个前缀】(codex 独立复审第二十五轮)。
+    #
+    # 原来只取第一页(list_objects_v2 上限 1000 个 key)。两个后果,第二个更隐蔽:
+    #   · S3 按【字典序】返回,而对象名是 ISO 时间戳 → **最新的备份排在最后**。
+    #     一个租户攒够 1000 个 key(约 500 次备份;R7 是 24h 一次,且备份桶 Object Lock
+    #     COMPLIANCE 让它们删不掉)之后,第一页里全是最旧的,"选最新"就恒选不到真正的最新;
+    #   · 配对判据会【误杀】:`.enc` 在第一页、它的 `.key` 落到第二页时,_decryptable 判它
+    #     是孤儿并跳过 —— 于是一个完全可用的恢复点被当成不可解,而这正是那道过滤要防的事
+    #     的反面(它本该只挡真孤儿)。
+    #
+    # ⚠ 分页循环就是本分支开局修掉的那个 `_ssm_ping_map` 死循环形态:`resp.get(...)` 在
+    # MagicMock 上恒返回真值 → while 永不退出、吃光内存。所以这里【硬上限】而不是只靠
+    # IsTruncated 为假退出;超限 fail-loud(打日志 + 用已取到的部分继续,而不是静默截断)。
+    _MAX_PAGES = 50  # 50 × 1000 = 5 万个 key,远超任何真实租户的备份数
+    _all = []
+    _tok = None
+    for _page in range(_MAX_PAGES):
+        _kw = {"Bucket": bucket, "Prefix": f"{prefix}/{src_tenant_id}/"}
+        if _tok:
+            _kw["ContinuationToken"] = _tok
+        resp = clients.s3.list_objects_v2(**_kw)
+        _all.extend(resp.get("Contents") or [])
+        if not resp.get("IsTruncated"):
+            break
+        _tok = resp.get("NextContinuationToken")
+        if not _tok:
+            break
+    else:
+        print(
+            f"_resolve_backup {src_tenant_id}: stopped after {_MAX_PAGES} list pages "
+            f"({len(_all)} keys); selection may miss newer backups — investigate the "
+            "backup retention/lifecycle policy for this prefix"
+        )
     # 只认数据对象(.gz / .gz.enc),排除 .key(envelope 数据密钥,非数据本体)。
-    objs = [o for o in resp.get("Contents", []) if not o["Key"].endswith(".key")]
+    objs = [o for o in _all if not o["Key"].endswith(".key")]
+    # ⑪ codex 独立复审第七轮 —— 加密备份必须有【配对的 .key】才算可选。
+    #
+    # `.enc` 与 `.key` 是两次独立上传。backup-data.sh 本轮已改成"先传 .key、最后传 .enc"
+    # (让 .enc 成为完整发布的完成标记),但那只保证【今后】不再产生孤儿 .enc;
+    # 改之前那个顺序留下的孤儿(.key 上传失败而 .enc 已落地)还在桶里,而 Object Lock
+    # 让它删不掉。选到一个解不开的 .enc 会把更早那个【可用】恢复点盖住,恢复时才发现
+    # 解不开 —— 那时已经无路可退,属 no-data-loss。
+    # 故解析侧也过一道:候选是 .enc 的,必须存在同名 .key。非加密的 .gz 不受影响
+    # (它没有也不需要 .key)。
+    _key_objs = {o["Key"] for o in _all if o["Key"].endswith(".key")}
+
+    def _decryptable(o):
+        k = o["Key"]
+        if not k.endswith(".enc"):
+            return True
+        _paired = k[: -len(".enc")] + ".key"
+        if _paired in _key_objs:
+            return True
+        print(
+            f"_resolve_backup {src_tenant_id}: skipping {k} — no matching .key "
+            f"({_paired}); an undecryptable .enc must not shadow an older usable backup"
+        )
+        return False
+
+    objs = [o for o in objs if _decryptable(o)]
     if not objs:
         return ""
     if timestamp:
         base = f"{prefix}/{src_tenant_id}/{timestamp}.gz"
-        # 精确匹配 <ts>.gz 或加密态 <ts>.gz.enc(不含 .key)。
+        # 旧格式:精确匹配 <ts>.gz 或加密态 <ts>.gz.enc(不含 .key)。
         match = [o for o in objs if o["Key"] == base or o["Key"] == f"{base}.enc"]
-        return match[0]["Key"] if match else ""
+        if match:
+            return match[0]["Key"]
+        # 新格式(codex 复审补):R7 给 key 加了 run id 防同秒两次备份撞 key ——
+        # backup-data.sh:50 现在写的是 `<ts>-<pid>-<ns>.gz`。上面的精确匹配对它恒不命中,
+        # 于是【按 timestamp 恢复新备份必 404】,含控制台走的那条路。这里补上前缀匹配,
+        # 同一秒可能有多份(这正是加 run id 的原因),取 LastModified 最新的那份。
+        _pfx = f"{prefix}/{src_tenant_id}/{timestamp}-"
+        run_id_match = [
+            o for o in objs
+            if o["Key"].startswith(_pfx)
+            and (o["Key"].endswith(".gz") or o["Key"].endswith(".gz.enc"))
+        ]
+        if run_id_match:
+            return max(run_id_match, key=lambda o: o["LastModified"])["Key"]
+        return ""
     # Latest = highest LastModified
     return max(objs, key=lambda o: o["LastModified"])["Key"]
 

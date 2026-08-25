@@ -22,10 +22,12 @@
 #
 # 前置:
 #   - 调用者身份需能 RunInstances / CreateImage / CreateTags / PutParameter
-#   - assets_bucket 目前【只是变量】:模板把 OC_ASSETS_BUCKET 注进 provisioner 环境,
-#     但 provision-host.sh 从不读它。FC 二进制无条件从 github.com 拉(该脚本 :132),
-#     既没有 S3 优先路径也没有"回落" —— 公网源是唯一的源(#435 未落地)。
-#     deployment/binaries/firecracker/<ver>/ 前缀要等 #435 落地才有人读。
+#   - assets_bucket 现在【真的有人读】:模板把它注进 provisioner 环境(OC_ASSETS_BUCKET),
+#     provision-host.sh 的 _fc_s3_uri() 优先按它拼 deployment/binaries/firecracker/<ver>/
+#     取 FC 二进制(#435),取回后还要过 _fc_expected_sha() 的强制摘要校验才安装。
+#   - iam_instance_profile 是【必填】:bake 阶段模板固定注入 OC_FC_REQUIRE_S3=1,S3 取不到
+#     即中止构建(不回落 github)。留空 = 无角色 = AccessDenied = 构建红。这是刻意的 ——
+#     回落会让「零 github 请求」验收永远通过,把假绿换成明确失败更有用。
 
 packer {
   required_version = ">= 1.9.0"
@@ -46,16 +48,20 @@ variable "region" {
   description = "构建与发布 AMI 的 region"
 }
 
-variable "arch" {
-  type        = string
-  default     = "arm64"
-  description = "arm64 | amd64 —— 决定 parent AMI 与构建机型"
-  # error_message 必须英文整句(大写开头、句号结尾)—— Packer 自己校验这条格式。
-  validation {
-    condition     = contains(["arm64", "amd64"], var.arch)
-    error_message = "The arch variable must be either arm64 or amd64."
-  }
-}
+# ★ arch 不再是变量(#537 简化)。host AMI 只出 arm64:
+#   - config.yml.example:26-27 写明「生产基线=arm64(Graviton metal 原生 KVM)」;
+#   - host.instance_types 的四个机型 r8g.metal-24xl / r7g.metal / m8g.metal-24xl /
+#     m7g.metal 全是 Graviton,没有一个 x86 机型(#430 的优先级顺序同样是这四个);
+#   - config.yml 的约束原文:「所有成员须与 host.arch 同架构(AMI 是按架构的,x86 与
+#     arm64 不能混)」—— 也就是说混池本来就不允许跨架构。
+# 保留一个 amd64 分支的代价是:每次改模板都要想它、pkrvars 里多一个客户会填错的字段、
+# 而 amd64 那条路在这套部署里【从来没有消费者】(实测 2026-08-12 造过一个 amd64 AMI,
+# 至今零使用)。真要支持 x86 host 时,重新加回一个变量比维护一条没人走的分支便宜。
+#
+# Image Builder 侧(host_image.py:209)仍按 config 的 host.arch 二选一 —— 那是另一套
+# 工具的既有行为,本 issue 不动它;assert-parity.sh 比对 parent AMI 时按 arm64 对齐。
+# 取值见下方 locals 的 arch;parent AMI 的 SSM 路径直接写死在 data 块里(packer 的
+# data 源在 locals 之前求值,引用不了 local.*)。
 
 variable "recipe_version" {
   type        = string
@@ -71,27 +77,25 @@ variable "assets_bucket" {
   type        = string
   description = <<-EOT
     openclaw-assets-<account><gsuffix>。
-    #435 未落地:本变量【当前没有消费者】。模板把它注进 provisioner 环境
-    (OC_ASSETS_BUCKET),但 provision-host.sh 从不读它,FC 二进制无条件从 github.com 拉。
-    #435 落地后,脚本才会从 deployment/binaries/firecracker/ 取件,那时构建实例的
-    instance profile 需有该前缀的 s3:GetObject。
+    #435 起本变量【有了消费者】:模板把它注进 provisioner 环境(OC_ASSETS_BUCKET),
+    provision-host.sh 的 _fc_s3_uri() 优先按它拼 deployment/binaries/firecracker/ 取件,
+    读不到才回落 github.com。构建实例的 instance profile 需有该前缀的 s3:GetObject,
+    否则 AccessDenied → 回落。
   EOT
-  # 模板里 assets_bucket 是占位符 openclaw-assets-<ACCOUNT_ID>。这条校验仍然要留:
-  # 占位符是"客户没配完"的信号,在 validate 阶段拦住比起了构建实例再说更省事。
-  # 但别照旧注释理解失败时机 —— 原注释写"要等到 provision 第 3 步从 S3 拉 Firecracker
-  # 时才失败",而当前脚本压根不从 S3 取件(#435 未落地),带着占位符 build
-  # 会一路成功并产出镜像。也就是说这条 validation 现在拦的是配置卫生,不是构建必然失败。
+  # 模板里 assets_bucket 是占位符 openclaw-assets-<ACCOUNT_ID>。这条校验要留:
+  # 占位符是"客户没配完"的信号,在 validate 阶段拦住比起了构建实例再说更省事 —— 尽管
+  # bake 现在带 OC_FC_REQUIRE_S3=1,占位符桶名会在 provision 第 3 节 die(构建照样红),
+  # 但那要先起一台机、跑完 apt 与 awscli 才炸,白烧几分钟。validate 阶段拦更便宜。
   validation {
     condition     = !can(regex("<[A-Z_]+>", var.assets_bucket))
     error_message = "The assets_bucket variable still contains a placeholder. Replace <ACCOUNT_ID> with the 12-digit deployment account id."
   }
 }
 
-variable "instance_type" {
-  type        = string
-  default     = ""
-  description = "留空 = 按 arch 选 c7g.large / c7i.large。构建实例是一次性的,不用 metal"
-}
+# instance_type 也不再是变量(#537 简化):arch 固定成 arm64 之后,「按 arch 选
+# c7g.large / c7i.large」这个分支只剩一个分支。构建实例是一次性的、跑一遍 provision
+# 就终止,机型没有调优空间 —— 留一个变量只是多一个客户可以填错的字段。
+# 值与 host_image.py:369 的默认同源。
 
 variable "root_volume_gb" {
   type        = number
@@ -104,11 +108,11 @@ variable "iam_instance_profile" {
   default     = ""
   description = <<-EOT
     构建实例的 instance profile 名。留空则构建实例上没有角色。
-    #435 未落地:FC 取件当前【不需要】这个角色 —— provision-host.sh 无条件从
-    github.com 拉,不读 assets_bucket。实跑证据:留空在 us-west-2 构建退出 0,
-    第 3 步 `firecracker v1.15.1 installed`。
-    等 #435 落地(脚本改成读 deployment/binaries/firecracker/ 前缀)之后,
-    生产构建才必须给这个角色。给 SSM 权限仍便于排障。
+    #435 起【必填,留空构建会失败】:provision-host.sh 先从 deployment/binaries/firecracker/
+    前缀取 FC 二进制,所以这个角色需要该前缀的 s3:GetObject;而 bake 阶段模板固定注入
+    OC_FC_REQUIRE_S3=1,S3 取不到即 die 而不回落 github。留空 = AccessDenied = 构建红。
+    默认值保持留空只为让 packer validate 免配即可跑(validate 不起构建实例)。
+    给 SSM 权限仍便于排障。
   EOT
 }
 
@@ -133,32 +137,94 @@ variable "gsuffix" {
   description = "多环境后缀,与 CDK 的 _gsuffix 同值;拼进 AMI 名与 SSM 参数名"
 }
 
-# ── 客户自定义扩展 ───────────────────────────────────────────────────────────
+# ── 可追溯性坐标(由 build-golden-ami.sh 注入,不要手填)──────────────────────
+# 这六个变量没有默认值 —— 缺任一个 packer 就拒绝跑。这是刻意的:#537 V-3 要求 AMI tag
+# 与 manifest 各带齐八项坐标,缺一项该 AMI 就不可晋级、不可切指针。给默认值会让
+# 「直接 packer build」产出一个坐标不全的 AMI,而那种 AMI 的存在本身就是 US-6
+# (查某台 host 跑的是哪个变更集)做不成的原因。
+#
+# 注入方 deploy/packer/build-golden-ami.sh 在构建【之前】解析它们并跑 V-1 门。
+# packer 自己没有 git 概念,这些值只能由外部算出后传进来。
 
-variable "custom_script" {
+variable "git_commit" {
   type        = string
-  default     = ""
   description = <<-EOT
-    客户自定义脚本的本地路径(相对本目录或绝对路径)。留空则跳过该阶段。
+    本次构建对应的 git commit SHA。工作树 dirty 时带 `-dirty` 后缀,且 promotable=false。
+    这是 US-6「某台在役 host 跑的是哪个变更集」的唯一锚点。
+  EOT
+  # error_message 必须英文整句(大写开头、句号结尾)—— Packer 自己校验这条格式。
+  validation {
+    condition     = length(var.git_commit) >= 7
+    error_message = "The git_commit variable must be a resolved commit SHA; run deploy/packer/build-golden-ami.sh instead of calling packer directly."
+  }
+}
 
-    执行时机:在 provision-host.sh 之后、两条 validate 断言之前,以 root 运行一次。
-    这个位置是被约束死的,不是任选的:
-      - 不能放在 provision 之前 —— 组件(firecracker/awscli/ADOT)还没装,脚本无从依赖;
-      - 不能放在断言之后 —— 断言正是用来兜住自定义脚本引入的身份泄漏的,放后面就失去防线;
-      - scrub 在 provision-host.sh 内部(§7)已经跑完,所以自定义脚本【写入的任何
-        per-host 状态都不会再被清理】,会原样进镜像并被整个机队共享。
-
-    因此自定义脚本必须只做与机器无关的事:装包、放配置模板、加监控 agent、调内核参数。
-    不得生成主机密钥、写 /etc/platform.env、留凭据或留下 cloud-init 实例态 ——
-    下一阶段的断言会检出这些并让构建失败(fail-closed,不会产出带泄漏的 AMI)。
+variable "packer_template_sha" {
+  type        = string
+  description = <<-EOT
+    host-golden.pkr.hcl 自身的 sha256。为什么单独记:模板变了而 provision-host.sh 没变时
+    provision_sha256 察觉不到,而模板决定了步骤集合、顺序与注入的环境变量 —— 那同样改变
+    产出。V-6 靠它发现「上一级验的模板和这一级用的不是同一份」。
   EOT
 }
 
-variable "custom_script_env" {
+variable "hooks_sha" {
+  type        = string
+  description = <<-EOT
+    客户 hook 集合的摘要(逐个 "sha256  basename" 再取一次摘要)。空目录是空串的 sha256,
+    一个固定值,不是空字段 —— V-6 要比它相等,缺字段无法参与比较。
+
+    构建侧(build-golden-ami.sh 用 bash find)与构建实例侧(assert-image.sh 重算镜像里
+    实际执行过的那批)各算一次并比对。两侧独立计算才能发现「上传的和执行的不是同一批」。
+  EOT
+}
+
+variable "env" {
+  type        = string
+  description = <<-EOT
+    目标环境。写进 AMI 的 Env tag,切指针前会校验它与要切的环境相符 —— 这是防止把测试
+    环境的 AMI 切进生产的那道断言(#537 V-5)。
+  EOT
+  validation {
+    condition     = contains(["test", "staging", "prod"], var.env)
+    error_message = "The env variable must be test, staging, or prod."
+  }
+}
+
+variable "built_at" {
+  type        = string
+  description = <<-EOT
+    构建发起时刻(UTC ISO8601)。由 build-golden-ami.sh 生成而不是用 packer 的
+    {{isotime}}:V-3 要回读 tag 并与 manifest 比对成【相等】,而 AMI 转 available 要
+    11 分钟,两边各取一次时间必然差出去,那条断言就做不成。一个来源,两处引用。
+  EOT
+}
+
+variable "promotable" {
+  type        = string
+  default     = "true"
+  description = <<-EOT
+    "true" | "false"。工作树 dirty 时为 false —— 该 AMI 可以本地验证,但不可晋级:
+    它对应的「变更集」在 git 里不存在,V-6 的同源比对无从进行。
+    只进 manifest 不进 tag:tag 是给运行期查询的事实,而"能不能晋级"是流程判定,
+    晋级门读 manifest。
+  EOT
+}
+
+# ── 客户自定义扩展:固定 hook 目录(#537 D5)──────────────────────────────────
+# 取代 #477 的单文件 custom_script。为什么换:单文件下客户要加第二个步骤只能改那一个
+# 文件或改 HCL —— 前者把互不相关的步骤揉进一份脚本,后者正是 D5 要禁的「改主流程」。
+# 目录 + 字典序让每个步骤是独立文件,加删互不影响,而主流程文件被改动时 V-1 门直接拒绝。
+#
+# 目录路径是固定的(deploy/packer/hooks/),不做成变量:可配置的扩展点位置意味着
+# 「主流程文件摘要」这道门要跟着变量走,而那正是 D5 想钉死的东西。
+
+variable "hook_env" {
   type        = map(string)
   default     = {}
   description = <<-EOT
-    传给自定义脚本的环境变量。用于把参数从 pkrvars 传进去,而不是让客户改脚本本体。
+    传给每个 hook 的环境变量。用于把参数从 pkrvars 传进去,而不是让客户把参数硬编码
+    进脚本。
 
     不要经由此处传密钥:值会出现在构建日志里。运行期密钥应由 host 的 instance profile
     在启动时从 Secrets Manager / SSM Parameter Store(SecureString)获取。
@@ -232,18 +298,21 @@ variable "ssh_interface" {
 # "function ssm not defined")。数据源在 validate 阶段就会真去读 SSM,所以
 # validate 本身也验证了调用者有 ssm:GetParameter 且路径存在。
 data "amazon-parameterstore" "ubuntu_ami" {
-  name   = var.arch == "arm64" ? "/aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id" : "/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id"
+  name   = "/aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id"
   region = var.region
 }
 
 locals {
 
-  # 构建机型:与 host_image.py:369 的默认同源。构建是一次性动作,不需要 metal。
-  build_instance = var.instance_type != "" ? var.instance_type : (
-    var.arch == "arm64" ? "c7g.large" : "c7i.large"
-  )
+  # host AMI 只出 arm64(理由见文件上方 arch 那段注释)。写成 local 而不是变量:
+  # 它不是给人调的旋钮,是这套部署的事实 —— 四个 host 机型全是 Graviton。
+  arch = "arm64"
 
-  ami_name = "openclaw-host-${var.recipe_version}-${var.arch}${var.gsuffix}-{{timestamp}}"
+  # 构建机型:与 host_image.py:369 的 arm64 默认同源。构建是一次性动作,不需要 metal,
+  # 也没有调优空间,所以不留变量。
+  build_instance = "c7g.large"
+
+  ami_name = "openclaw-host-${var.recipe_version}-${local.arch}${var.gsuffix}-{{timestamp}}"
 
   # 脚本在构建实例上的落点。与 Image Builder component 的 S3Download destination 一致
   # (/opt/openclaw/...),因为 validate 阶段的 AssertProvisionIsIdempotent 会按这个
@@ -251,15 +320,22 @@ locals {
   provision_dst = "/opt/openclaw/provision-host.sh"
   fb_dst        = "/opt/openclaw/install-fluent-bit.sh"
 
-  # 自定义脚本落在 /opt/openclaw/custom/ 而不是 /tmp:留在镜像里可审计
-  # (起一台 host 就能看到这批镜像装了什么客户内容),/tmp 在部分环境会被开机清空。
-  custom_dst = "/opt/openclaw/custom/customize.sh"
-  assert_dst = "/opt/openclaw/assert-image.sh"
+  # hook 目录与 runner 落在 /opt/openclaw/custom/ 而不是 /tmp:留在镜像里可审计
+  # (起一台 host 就能 ls 出这批镜像装了什么客户内容),/tmp 在部分环境会被开机清空。
+  # hooks-manifest 是 run-hooks.sh 生成的执行记录,与 hooks 目录同级。
+  hooks_dst        = "/opt/openclaw/custom/hooks"
+  hooks_runner_dst = "/opt/openclaw/custom/run-hooks.sh"
+  hooks_manifest   = "/opt/openclaw/custom/hooks-manifest"
+  assert_dst       = "/opt/openclaw/assert-image.sh"
 
-  # 空字符串在 packer 的 provisioner 里不能作为 "跳过" 的开关(file provisioner 会
-  # 直接报 source 不存在),所以用 count 惯用法:only/except 无法表达条件,
-  # dynamic block 在 provisioner 上不可用 —— 用 shell 内部判断反而更简单可读。
-  has_custom = var.custom_script != ""
+  # 本地 hook 集合。fileset 返回的是相对 hooks/ 的路径,只收 *.sh —— 与
+  # build-golden-ami.sh 的 `find -maxdepth 1 -type f -name '*.sh'` 和 run-hooks.sh 的
+  # 同款 find 三处对齐。三处用三种实现(HCL fileset / bash find / bash find)是刻意的:
+  # 数量不一致就说明某一处的枚举语义漂了,V-3 会拿 hooks_count 对账并报红。
+  #
+  # 不用 **/*.sh:hook 是平铺一层。递归会把客户放在子目录里的辅助脚本也算成 hook,
+  # 而 run-hooks.sh 用 -maxdepth 1 不会执行它们 —— 那种不一致正是对账要抓的。
+  hook_files = fileset("${path.root}/hooks", "*.sh")
 }
 
 # ── source ───────────────────────────────────────────────────────────────────
@@ -279,7 +355,14 @@ source "amazon-ebs" "host" {
   # are not supported"(实测 2026-08-12,em-dash 触发 400)。这一步在 AMI 已经造好
   # 之后才调用,所以失败时的表现是"AMI 存在但 build 报错、manifest 与 SSM 分发均未执行"
   # —— 看起来像收尾卡住,其实是描述里一个字符。用连字符,不用破折号。
-  ami_description = "OpenClaw host golden AMI (recipe ${var.recipe_version}, ${var.arch}) - Firecracker + jailer + awscli + ADOT + Fluent Bit baked; boot path installs nothing"
+  #
+  # #523 判据 5:原文写 "boot path installs nothing",与事实不符 —— init-host.sh 在
+  # LOGGING_ENABLED=true 时【无条件】从 S3 拉 install-fluent-bit.sh(S3 miss 即 exit 1),
+  # 还要拉 oc-guest-log-reader.py、rootfs manifest.json 与全部生命周期脚本。真正成立的
+  # 那一半是「组件零安装」:fluent-bit installer 在已装的镜像上 no-op,provision 整段跳过。
+  # 写成事实,否则下一个人会按「零下载」去排查启动失败,方向就错了 —— 客户那两次 canary
+  # ABANDON 恰好发生在「AMI 已经有、启动仍跑 S3 那份」这条路上(#520 A21)。
+  ami_description = "OpenClaw host golden AMI (recipe ${var.recipe_version}, ${local.arch}) - Firecracker + jailer + awscli + ADOT + Fluent Bit baked; boot path installs no components, but still pulls config, lifecycle scripts and rootfs from S3"
 
   iam_instance_profile = var.iam_instance_profile
 
@@ -313,14 +396,28 @@ source "amazon-ebs" "host" {
   # 租户 microVM 的 IMDS 是 DROP 的(ha_edge SG),这里管的是 host 自身。
   imds_support = "v2.0"
 
+  # #537 V-3:八项坐标(GitCommit / PackerTemplateSha / ProvisionSha256 / RecipeVersion /
+  # Arch / Env / BuiltAt / HooksSha)必须齐,缺任一项该 AMI 不可晋级、不可切指针。
+  # build-golden-ami.sh 在构建后回读这些 tag 并逐项与注入值比对 —— 只查"在不在"不够,
+  # tag 存在但写着上一次构建的 SHA 会让 V-6 的同源比对拿错值去比。
+  #
+  # 全部值必须是 ASCII。EC2 的 ModifyImageAttribute 拒非 ASCII(实测 2026-08-12,
+  # em-dash 触发 400),而 tag 与 description 走同一条约束。
   tags = {
     Name            = "openclaw-host-golden${var.gsuffix}"
     Project         = "openclaw"
     Role            = "metal-host"
     RecipeVersion   = var.recipe_version
-    Arch            = var.arch
+    Arch            = local.arch
     BuiltBy         = "packer"
     ProvisionSource = "deploy/userdata/provision-host.sh"
+
+    GitCommit         = var.git_commit
+    PackerTemplateSha = var.packer_template_sha
+    ProvisionSha256   = sha256(file("${path.root}/../userdata/provision-host.sh"))
+    HooksSha          = var.hooks_sha
+    Env               = var.env
+    BuiltAt           = var.built_at
   }
   # 构建实例自身也打标,便于在 EC2 控制台区分"这是一台一次性构建实例,不是 host"。
   run_tags = {
@@ -379,6 +476,11 @@ build {
       "OC_PROVISION_RECIPE_VERSION=${var.recipe_version}",
       "OC_PROVISION_FLUENT_BIT_INSTALLER=${local.fb_dst}",
       "OC_ASSETS_BUCKET=${var.assets_bucket}",
+      # #435 —— bake 必须 fail-closed:S3 取不到 FC 就【中止构建】,不许回落 github。
+      # 不加这条的话,iam_instance_profile 留空 → AccessDenied → 回落 → 镜像照样烤成、
+      # validate 照样过,而那台镜像请求过 github.com,「零 github 请求」验收成了假绿。
+      # 代价是 iam_instance_profile 从"建议填"变成"不填就构建失败" —— 这正是想要的。
+      "OC_FC_REQUIRE_S3=1",
       "AWS_REGION=${var.region}",
     ]
     # -E 传环境变量给 root。expect_disconnect=false:provision 不重启机器。
@@ -388,37 +490,55 @@ build {
     timeout = "20m"
   }
 
-  # 3) 客户自定义阶段。这里的位置不是任选的,三个边界把它夹死在这一格:
-  #    - provision 之后:组件(firecracker/awscli/ADOT/Fluent Bit)已装好,自定义脚本
-  #      才有东西可依赖;
-  #    - scrub 之后(scrub 在 provision-host.sh §7 内部):所以自定义脚本写入的任何
+  # 3) 客户自定义阶段 —— 固定 hook 目录,按字典序执行(#537 D5,取代单文件 custom_script)。
+  #    这里的位置不是任选的,三个边界把它夹死在这一格:
+  #    - provision 之后:组件(firecracker/awscli/ADOT/Fluent Bit)已装好,hook 才有
+  #      东西可依赖;
+  #    - scrub 之后(scrub 在 provision-host.sh §7 内部):所以 hook 写入的任何
   #      per-host 状态【不会再被清理】,会原样进镜像并被整个机队共享 —— 这正是下一
   #      条断言存在的理由;
-  #    - 断言之前:断言是自定义脚本的防线。放到断言之后,客户脚本留下的主机密钥、
+  #    - 断言之前:断言是 hook 的唯一防线。放到断言之后,hook 留下的主机密钥、
   #      platform.env、cloud-init 实例态就没人检出了,fail-closed 属性会失效。
+  #    ADR §6 把「hook 挪到断言之后」记为已知失效模式(构建仍绿而防线失效);
+  #    build-golden-ami.sh 的 V-1.5 与 assert-parity.sh 第 9 项各按行号复核一次。
   #
-  #    custom_script 留空时执行 customize.sh.default(无操作)。用无操作默认值而不是
-  #    条件分支:packer 的 provisioner 不支持 dynamic block,only/except 只能选 source,
-  #    而 file provisioner 拿到空路径会直接报错。同一条代码路径比两套分支可靠。
+  #    空目录不需要特殊分支:run-hooks.sh 自己在没有 *.sh 时打印一行并 exit 0。
+  #    这比 #477 的「留空则执行 customize.sh.default」更简单 —— 少一个只为绕开
+  #    「file provisioner 拿到空路径会报错」而存在的占位文件。
   provisioner "file" {
-    source      = var.custom_script != "" ? "${path.root}/${var.custom_script}" : "${path.root}/customize.sh.default"
-    destination = "/tmp/customize.sh"
+    # 传目录要带尾斜杠。不带时 packer 把 hooks/ 整个目录【放进】destination 里
+    # (变成 /tmp/oc-hooks/hooks/*.sh);带尾斜杠才是"把目录内容拷进去"。
+    # 目录不存在会直接报错,所以 hooks/ 里有入库的 README.md 与 *.sh.example 兜底,
+    # 客户 clone 后目录必然存在。
+    source      = "${path.root}/hooks/"
+    destination = "/tmp/oc-hooks"
+  }
+  provisioner "file" {
+    source      = "${path.root}/run-hooks.sh"
+    destination = "/tmp/run-hooks.sh"
   }
   provisioner "shell" {
     inline = [
-      "sudo install -d -m 0755 /opt/openclaw/custom",
-      "sudo install -o root -g root -m 0755 /tmp/customize.sh ${local.custom_dst}",
-      "rm -f /tmp/customize.sh",
+      "sudo install -d -m 0755 /opt/openclaw/custom ${local.hooks_dst}",
+      # 只搬 *.sh。README.md 与 *.sh.example 是仓库文档,搬进镜像只会让
+      # `ls /opt/openclaw/custom/hooks/` 的输出里混进"看着像 hook 其实不执行"的文件,
+      # 而那正是排查"我的 hook 为什么没跑"时最容易看错的地方。
+      # 用 find -exec 而不是 `cp /tmp/oc-hooks/*.sh`:后者在无匹配时 glob 不展开,
+      # cp 会报 "cannot stat '*.sh'" 并让整个 provisioner 红 —— 空 hook 目录是合法状态。
+      "sudo find /tmp/oc-hooks -maxdepth 1 -type f -name '*.sh' -exec install -o root -g root -m 0755 {} ${local.hooks_dst}/ ';'",
+      "sudo install -o root -g root -m 0755 /tmp/run-hooks.sh ${local.hooks_runner_dst}",
+      "rm -rf /tmp/oc-hooks /tmp/run-hooks.sh",
     ]
   }
   provisioner "shell" {
-    # 客户参数经 environment_vars 传入,避免客户改脚本本体。密钥不走这里 ——
+    # 客户参数经 environment_vars 传入,避免客户把参数硬编码进脚本。密钥不走这里 ——
     # 值会出现在构建日志中。
-    environment_vars = [for k, v in var.custom_script_env : "${k}=${v}"]
+    environment_vars = [for k, v in var.hook_env : "${k}=${v}"]
     # -E 传环境变量给 root。与 provision 同样的调用形式,便于客户对照。
-    inline = ["sudo -E bash ${local.custom_dst}"]
-    # 比 provision 的 20m 更宽:客户可能装大体积企业软件包。构建实例是一次性的,
-    # 超时的代价只是这次构建失败,不像 lifecycle hook 那样会触发换机。
+    inline = ["sudo -E bash ${local.hooks_runner_dst} ${local.hooks_dst}"]
+    # 比 provision 的 20m 更宽:客户可能装大体积企业软件包,而这里是【全部 hook 合计】
+    # 的上限。构建实例是一次性的,超时的代价只是这次构建失败,不像 lifecycle hook
+    # 那样会触发换机。
     timeout = "30m"
   }
 
@@ -427,7 +547,18 @@ build {
   #    必须在 scrub 之后 —— 既验组件齐全,也验身份已擦净。检查项都在 assert-image.sh 里,
   #    与下一步的重跑断言共用同一份:加一项检查,两个时机自动都有。
   provisioner "shell" {
-    inline = ["sudo bash ${local.assert_dst} post-provision"]
+    # hook 对账的期望值走环境变量传进断言脚本。为什么在【构建实例上】比而不是在本地:
+    # 本地算两次不算独立验证 —— file provisioner 少传一个文件、find 的 glob 语义在两处
+    # 漂了、客户在 packer 起来之后又往 hooks/ 丢了一个文件,这些都只有拿"镜像里实际
+    # 存在并执行过的那批"去比才能发现。构建侧算(bash find)与镜像侧重算(assert-image.sh)
+    # 是两个独立实现,这才是 V-3 那条对账的意义。
+    environment_vars = [
+      "OC_EXPECT_HOOKS_SHA=${var.hooks_sha}",
+      "OC_EXPECT_HOOKS_COUNT=${length(local.hook_files)}",
+      "OC_HOOKS_DIR=${local.hooks_dst}",
+      "OC_HOOKS_MANIFEST=${local.hooks_manifest}",
+    ]
+    inline = ["sudo -E bash ${local.assert_dst} post-provision"]
   }
 
 
@@ -446,6 +577,13 @@ build {
       "OC_PROVISION_FLUENT_BIT_INSTALLER=${local.fb_dst}",
       "OC_ASSETS_BUCKET=${var.assets_bucket}",
       "AWS_REGION=${var.region}",
+      # post-rerun 阶段也要能重算 hook 摘要 —— 断言脚本两个阶段共用同一份代码,
+      # 少传这几个会让 post-rerun 走进"期望值为空"的分支。那个分支必须 fail 而不是
+      # 跳过(见 assert-image.sh 里的处理),否则重跑阶段的 hook 断言会静默消失。
+      "OC_EXPECT_HOOKS_SHA=${var.hooks_sha}",
+      "OC_EXPECT_HOOKS_COUNT=${length(local.hook_files)}",
+      "OC_HOOKS_DIR=${local.hooks_dst}",
+      "OC_HOOKS_MANIFEST=${local.hooks_manifest}",
     ]
     # dash 不认 pipefail,不显式给 bash 这段就跑不到。
     inline_shebang = "/usr/bin/env bash"
@@ -456,7 +594,9 @@ build {
       after="$(sudo sha256sum /etc/openclaw/.ami-provisioned | cut -d' ' -f1)"
       # 重跑后跑完整断言:组件集合、SSM agent、跨租户红线、SSH host key、cloud-init 态
       # 全部重验。第 4 步验的是"provision 装对了",这一步验的是"重跑没把它弄坏"。
-      sudo bash ${local.assert_dst} post-rerun
+      # -E 是必须的:OC_EXPECT_HOOKS_* 走环境变量传进来,不带 -E 时 sudo 会清掉它们,
+      # 断言脚本就看不到期望值(#537 起 hook 对账依赖它们)。
+      sudo -E bash ${local.assert_dst} post-rerun
       # provisioned_at 是时间戳,marker 合法地会变;组件集合不能变,上一行已断言。
       echo "provision is idempotent (marker before=$before after=$after; timestamp differs by design)"
     IDEMPOTENT
@@ -466,13 +606,30 @@ build {
 
 
   # 6) 落 manifest:AMI id / region / 构建时间,供 CI 与 assert_parity 对账。
+  #
+  #    manifest 与 AMI tag 承载同一批坐标但服务不同链路:tag 跟着镜像走,切指针门
+  #    (V-5)读它;manifest 能归档、能跨环境传,晋级门(V-6)读它。少一边就有一条链路
+  #    读不到坐标,所以 build-golden-ami.sh 的 V-3 两边都查。
   post-processor "manifest" {
     output     = "${path.root}/manifest.json"
     strip_path = true
     custom_data = {
       recipe_version = var.recipe_version
-      arch           = var.arch
+      arch           = local.arch
       built_by       = "packer"
+
+      # #537 V-3 的可追溯性坐标。git_commit 带 -dirty 后缀时 promotable=false ——
+      # 晋级门读这两个字段就能拒绝一个"本地试出来的"镜像,不必再去问 git。
+      git_commit          = var.git_commit
+      packer_template_sha = var.packer_template_sha
+      hooks_sha           = var.hooks_sha
+      env                 = var.env
+      built_at            = var.built_at
+      promotable          = var.promotable
+      # HCL 的 fileset 枚举出的 hook 数。build-golden-ami.sh 用 bash find 独立枚举一次
+      # 并与这个值对账 —— 两种实现的 glob 语义漂了就会不等。字符串化是因为 custom_data
+      # 只接受 map(string)。
+      hooks_count = "${length(local.hook_files)}"
       # provision-host.sh 的内容摘要 —— 两套工具执行同一份脚本时,这个值必须相同。
       # 是 assert_parity 的锚点。
       provision_sha256 = sha256(file("${path.root}/../userdata/provision-host.sh"))

@@ -173,20 +173,44 @@ fi
 # validate 断言是唯一的防线。若把自定义阶段挪到断言之后,客户脚本留下的主机密钥、
 # platform.env、SSH host key 就没人检出,fail-closed 属性失效而【构建仍然显示成功】——
 # 这是最危险的一类回归:没有报错,只是防线没了。按行号定序,不依赖人工审查。
-# 必须定位【执行】自定义脚本的那一行,不是 locals 里的路径定义 —— locals 恒在文件
-# 前部,拿它比行号会让门永远绿。实测:第一版取 'custom/customize.sh' 首次出现,
-# 命中的是 locals 的 custom_dst 定义,把整个 provisioner 块搬到断言之后也不报警。
-_custom_line="$(grep -n 'bash ${local.custom_dst}' "$PKR" | head -1 | cut -d: -f1)"
+# 必须定位【执行】hook 的那一行,不是 locals 里的路径定义 —— locals 恒在文件前部,
+# 拿它比行号会让门永远绿。实测:第一版取 'custom/customize.sh' 首次出现,命中的是
+# locals 的 custom_dst 定义,把整个 provisioner 块搬到断言之后也不报警。
+#
+# #537 D5 起扩展点是 hooks 目录 + run-hooks.sh(取代单文件 custom_script),所以定位的是
+# hooks_runner_dst 的调用行。
+_hooks_line="$(grep -n 'bash ${local.hooks_runner_dst}' "$PKR" | tail -1 | cut -d: -f1)"
+# provision 也纳入定序:hook 被挪到 provision【之前】时组件还没装好,hook 无从依赖
+# 它们 —— 而那种错位单看 hook < assert 是发现不了的。
+_provision_line="$(grep -n 'sudo -E bash ${local.provision_dst}' "$PKR" | head -1 | cut -d: -f1)"
 # 断言主体已搬到 assert-image.sh,HCL 里剩的是调用行。定序要比的是【调用点】。
 _assert_line="$(grep -n 'assert_dst} post-provision' "$PKR" | head -1 | cut -d: -f1)"
-if [ -z "$_custom_line" ]; then
-  _bad "找不到客户自定义阶段 —— host-golden.pkr.hcl 应包含 custom/customize.sh"
+if [ -z "$_hooks_line" ]; then
+  _bad "找不到 hook 阶段 —— host-golden.pkr.hcl 应含 bash \${local.hooks_runner_dst} 的调用行"
+elif [ -z "$_provision_line" ]; then
+  _bad "找不到 provision 阶段 —— 无法校验 hook 的相对位置"
 elif [ -z "$_assert_line" ]; then
-  _bad "找不到零下载断言 —— 无法校验自定义阶段的相对位置"
-elif [ "$_custom_line" -lt "$_assert_line" ]; then
-  _ok "客户自定义阶段在 validate 断言之前(行 $_custom_line < $_assert_line)"
+  _bad "找不到零下载断言 —— 无法校验 hook 阶段的相对位置"
+elif [ "$_provision_line" -lt "$_hooks_line" ] && [ "$_hooks_line" -lt "$_assert_line" ]; then
+  _ok "hook 阶段夹在 provision 与 validate 断言之间(行 $_provision_line < $_hooks_line < $_assert_line)"
 else
-  _bad "客户自定义阶段($_custom_line)排在 validate 断言($_assert_line)之后 —— 自定义脚本引入的身份泄漏将无人检出"
+  _bad "hook 阶段位置错误(provision=$_provision_line hooks=$_hooks_line assert=$_assert_line)—— 排在断言之后则 hook 引入的身份泄漏无人检出;排在 provision 之前则组件尚未装好"
+fi
+
+# ── 9b. hook 对账的期望值必须在两个阶段都注入 ──────────────────────────────────
+# 构建侧算的 HooksSha 经环境变量传进断言脚本,由它从镜像里实际存在的那批重算后比对。
+# 漏传的表现是断言脚本走进"期望值缺失"分支 —— 那个分支是 FAIL 而不是跳过(静默跳过
+# 等于悄悄丢掉整条对账),所以构建会红,但红在一条看不出根因的消息上。这里提前拦。
+#
+# sudo 必须带 -E:不带时 sudo 会清掉这些环境变量。实测本模板第一版的 post-rerun 正是
+# `sudo bash`(漏了 -E),期望值传不进去。
+_expect_sha_count="$(grep -c 'OC_EXPECT_HOOKS_SHA=' "$PKR")"
+if [ "$_expect_sha_count" -eq 2 ] &&
+  grep -q 'sudo -E bash ${local.assert_dst} post-provision' "$PKR" &&
+  grep -q 'sudo -E bash ${local.assert_dst} post-rerun' "$PKR"; then
+  _ok "hook 对账期望值在两个阶段都注入,且都用 sudo -E"
+else
+  _bad "hook 对账期望值注入不全(OC_EXPECT_HOOKS_SHA 出现 $_expect_sha_count 次,应为 2)或 sudo 缺 -E —— 期望值传不进断言脚本"
 fi
 
 # ── 10. 自定义阶段引入的泄漏面都有对应断言 ───────────────────────────────────
@@ -224,20 +248,23 @@ else
   _bad "SSM 回读不是限时轮询 —— aws:ec2:image 校验异步,单次立即回读会把合法发布误判为失败"
 fi
 
-# ── 11. customize.sh.{default,example} 也要过静态检查 ──────────────────────────
-# scripts/checks/shell.sh 只收 .sh 后缀,这两个文件的后缀是 .default / .example,
-# 于是永久逃过仓库的 shell 门。而 customize.sh.example 正是客户照着改的模板 ——
-# 它里面的写法会被复制进客户的生产构建。在这里补上。
-for _f in "$ROOT/deploy/packer/customize.sh.default" "$ROOT/deploy/packer/customize.sh.example"; do
-  _n="$(basename "$_f")"
-  if [ ! -f "$_f" ]; then
-    _bad "缺 $_n —— custom_script 留空时 file provisioner 会因源不存在而失败"
-    continue
-  fi
-  if ! bash -n "$_f" 2>/dev/null; then
-    _bad "$_n 语法错(bash -n 不过)"
-    continue
-  fi
+# ── 11. hook 模板也要过静态检查 ───────────────────────────────────────────────
+# scripts/checks/shell.sh 只收 .sh 后缀,而 hook 模板的后缀是 .sh.example,于是永久
+# 逃过仓库的 shell 门 —— 偏偏它正是客户照着改的那一份,里面的写法会被复制进客户的
+# 生产构建。在这里补上。
+#
+# #537 D5 起单文件 customize.sh.{default,example} 已被 hooks/ 目录取代:
+#   - customize.sh.default(无操作占位)不再需要 —— run-hooks.sh 自己在没有 *.sh 时
+#     打印一行并 exit 0,不必为"file provisioner 拿到空路径会报错"留一个占位文件;
+#   - customize.sh.example → hooks/50-example.sh.example。
+# 只有一份模板,所以不用循环(单元素的 `for _f in "..."` 会被 shellcheck 判 SC2066)。
+_f="$ROOT/deploy/packer/hooks/50-example.sh.example"
+_n="$(basename "$_f")"
+if [ ! -f "$_f" ]; then
+  _bad "缺 $_n —— 客户没有可照抄的 hook 模板"
+elif ! bash -n "$_f" 2>/dev/null; then
+  _bad "$_n 语法错(bash -n 不过)"
+else
   # -S info 而不是 warning:实测 warning 门槛太松,连 `cd /nonexistent`(SC2164)都不报,
   # 那样这条门就只是个装饰。info 级会抓到未加引号的变量展开等真会伤到客户的写法。
   # 模板里确实需要豁免的单条(如 SC1091 找不到 /etc/os-release)用行内 disable 注明理由。
@@ -250,7 +277,7 @@ for _f in "$ROOT/deploy/packer/customize.sh.default" "$ROOT/deploy/packer/custom
   else
     _ok "$_n 过 bash -n(shellcheck 未装,跳过更严的检查)"
   fi
-done
+fi
 
 echo
 if [ "$fail" = 0 ]; then

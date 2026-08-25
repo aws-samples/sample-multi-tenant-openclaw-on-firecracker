@@ -1,8 +1,8 @@
 # 使用 Packer 构建 host golden AMI — 操作手册
 
-> **⚠️ 尚未可交付。** §3（预置 Firecracker 二进制）与 §1.8 中的 S3 权限依赖 issue #435
-> 落地，在其合并前这两处配置不起作用，本文档"启动过程不访问任何第三方源"的表述也不成立。
-> 交付前请先确认 #435 已合并，并删除本提示。详见 `README.md` 的前置依赖一节。
+> **§3（预置 Firecracker 二进制）与 §2.2 的 IAM instance profile 是必做项，跳过会让构建失败。**
+> `provision-host.sh` 从你自己的 S3 桶取 Firecracker/jailer，且 bake 阶段强制要求 S3
+> （不回落 github.com），取回后还要过摘要校验。三项前置见 `README.md` 开头的表格。
 
 适用对象：自行运维 ClawPool 的客户。操作流程为：配置网络参数 → 执行构建命令 →
 更新 LaunchTemplate 的 AMI id。全部操作在客户自有账号内完成，无需联系我们。
@@ -380,18 +380,20 @@ Packer 将在等待 SSH 阶段持续阻塞直至超时。
 `AmazonSSMManagedInstanceCore` 策略，且子网需能访问 SSM 端点（通过 NAT 或
 VPC Endpoint）。
 
-### §2.2 构建实例的 IAM instance profile（**当前非必填**，#435 未落地）
+### §2.2 构建实例的 IAM instance profile（**生产构建必填**）
 
 ```hcl
 iam_instance_profile = "openclaw-packer-builder"
 ```
 
-> **当前版本留空即可**：FC 取件不读 assets 存储桶（见 §3 的状态说明）。
-> 留空构建实测退出 0；现在授予这条策略不会改变镜像内容，只会多一份用不上的权限。
-> #435 落地后本项才成为必填。
+> **留空构建会失败。** `provision-host.sh` 先从 assets 存储桶取 Firecracker（见 §3），
+> 而模板给 bake 阶段固定注入 `OC_FC_REQUIRE_S3=1`，所以 S3 取不到时 provision **直接
+> 中止**，不回落 github.com。构建实例没有该权限 = AccessDenied = 构建红。
+> 这是刻意的：若允许回落，「零 github 请求」这项验收就永远通过、掩盖真实依赖。
+> 走对了的判据是构建日志里的 `firecracker <ver> tarball from S3: s3://…`
+> 与 `tarball sha256 verified: …`。
 
-#435 落地后构建实例需读取客户 assets 存储桶内的 Firecracker 二进制（见 §3）。
-届时创建最小权限角色：
+构建实例需读取客户 assets 存储桶内的 Firecracker 二进制（见 §3）。创建最小权限角色：
 
 ```bash
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
@@ -447,46 +449,52 @@ grep assets_bucket deploy/packer/my.pkrvars.hcl
 
 ---
 
-## §3 预置 Firecracker 二进制（**本节描述目标状态，当前尚未生效**）
+## §3 预置 Firecracker 二进制（**构建前必做**）
 
-> **本节当前不需要执行，执行了也不会改变镜像内容（#435 未落地）。**
-> 本仓当前版本的 `provision-host.sh:132` **无条件从 github.com** 拉取 Firecracker + jailer，
-> 脚本里没有任何读取 S3 的代码路径（全文不出现 `ASSETS_BUCKET`）。
-> 实跑证据：`iam_instance_profile` 留空在 `us-west-2` 构建**退出 0**，
-> 第 3 步打出 `[oc:provision] firecracker v1.15.1 installed`。
-> 也就是说 **当前每一次构建产出的镜像都请求过 github.com**。
-> 本节保留下来是因为它描述的是 #435 的目标状态；该 issue 落地后再按本节执行。
+> **前缀里没有制品，构建会失败。** `provision-host.sh` 的 `_fc_s3_uri()` 先从
+> `s3://<assets_bucket>/deployment/binaries/firecracker/<ver>/` 取 Firecracker + jailer
+> （桶名取自模板注入的 `OC_ASSETS_BUCKET`，没有该变量时按 IMDS 的 accountId+region 自解析）。
+> bake 阶段模板固定注入 `OC_FC_REQUIRE_S3=1`，所以取不到时 provision **直接中止**，
+> 不回落 github.com。取回后还要过一道**摘要校验**（见下），不匹配同样拒绝安装。
 
-设计原因（#435 的立项理由，仍然成立）：10 万规模的 scale-out 会导致所有 host 同时访问
+设计原因（#435 的立项理由）：10 万规模的 scale-out 会导致所有 host 同时访问
 GitHub releases CDN 并触发其速率限制，tarball 返回 429，host 无法安装 Firecracker，
 lifecycle hook 超时后 ASG 判定 ABANDON 并替换实例，而替换实例访问同一受限源 ——
-该循环不收敛。因此目标状态是启动路径上不保留任何第三方源，且**不实现 GitHub 回落**：
-若存在回落，"GitHub 不可达时 host 仍可正常启动"这项验收将永远通过、无法暴露真实依赖。
+该循环不收敛。
 
-#435 落地后，构建阶段执行的是同一个脚本，届时构建前该 S3 前缀必须已包含所需制品。两种方式：
+**关于回落的取舍（如实记录）：** 立项理由主张**不实现回落**，论证是对的 —— 只要回落
+无条件存在，"GitHub 不可达时 host 仍可正常启动"这项验收就永远通过，真实依赖被掩盖。
+但直接去掉回落会打死没有 S3 可读的路径（plain Ubuntu AMI 的 boot 路径、本地开发、跨账号
+试跑），而且 `setup.sh` 的镜像步骤结构上只能发生在 `cdk deploy` 建好存储桶**之后**
+（桶名来自 stack output），所以首次部署过程中起来的那批 host 必然遇到"制品还没上传"——
+回落正是这个窗口的兜底（把上传搬进 CDK 是 #265 的架构工作，不在本 issue 内）。
 
-### 方案 A：执行镜像同步脚本（推荐）
+因此最终形态是**分路径**的，而不是一个全局开关：
 
-> **该脚本在本仓当前版本中不存在**（#435 未落地）：
-> `engineering/tooling/operations/deployment/mirror-firecracker.sh` 未随本版本发布，
-> 照抄会得到 `No such file or directory`。#435 落地时随其一并提供。
+| 路径 | `OC_FC_REQUIRE_S3` | 行为 |
+|---|---|---|
+| bake（Packer / Image Builder） | 模板**固定注入 `=1`** | S3 取不到 → 构建中止。零下载镜像的验收必须 fail-closed |
+| boot（plain AMI 上跑 configure） | 默认关 | S3 取不到 → 大声 `WARN … falling back to github.com` 后回落，机器仍能起来 |
 
-```bash
-engineering/tooling/operations/deployment/mirror-firecracker.sh <region> [aws-profile]
-```
+两条路径**都**做摘要校验，所以"回落"最坏也只是换了下载来源，装进去的字节仍被钉死。
 
-该脚本从 `deploy/userdata/provision-host.sh` 解析版本号与摘要（不重复硬编码 —— 两处
-各维护一份必然产生漂移），默认同步**脚本中已声明摘要的全部架构**，逐个校验摘要后上传。
+构建阶段执行的是同一个脚本，所以构建前该 S3 前缀必须已包含所需制品。两种方式：
 
-```bash
-# 预演模式：仅输出将执行的操作，不实际上传
-OC_DRY_RUN=1 engineering/tooling/operations/deployment/mirror-firecracker.sh ap-southeast-1
+### 方案 A：随 `setup.sh` 自动完成（走完整部署流程时）
 
-# 显式收窄至单一架构（默认同步全部架构，通常无需指定）
-OC_ARCHES="aarch64" engineering/tooling/operations/deployment/mirror-firecracker.sh ap-southeast-1
-```
+镜像步骤内置在部署脚本里，**没有单独的 mirror 脚本可调**：`setup.sh` 上传 observability
+配置之后，会为 `aarch64` 与 `x86_64` 两个架构各同步一份 Firecracker tarball 到
+`deployment/binaries/firecracker/<ver>/`。
 
-该脚本幂等：S3 中已存在且摘要一致的制品将被跳过，可随时重复执行。
+行为要点：
+
+- **部署机打一次 GitHub** —— 这就是 #435 把 N 次收敛成 1 次的那 1 次；
+- **两个架构都传**：少一个 = 那类机器回落 github；
+- **幂等**：目标 key 已存在即跳过（按 key 存在判定，**不比对摘要**），重跑不重复下载；
+- 上传前 `tar -tzf` 验完整性，sha256 写入对象 metadata 便于日后对账；
+- 任一架构失败则 `setup.sh` **退出 1**，不静默通过。
+
+只烤 AMI、不跑 `setup.sh` 的环境请用方案 B。
 
 执行后验证：
 
@@ -494,7 +502,7 @@ OC_ARCHES="aarch64" engineering/tooling/operations/deployment/mirror-firecracker
 aws s3 ls "s3://openclaw-assets-${ACCOUNT}/deployment/binaries/firecracker/" --recursive
 ```
 
-### 方案 B：手工上传（脚本无法执行的环境）
+### 方案 B：手工上传（只烤镜像、不跑 `setup.sh` 的环境）
 
 ```bash
 V=v1.15.1                        # 需与 provision-host.sh 的 FC_VER 一致
@@ -516,12 +524,17 @@ aws s3 cp /tmp/fc.tgz \
 
 版本号必须与 `deploy/userdata/provision-host.sh` 顶部的 `FC_VER` 一致。
 
-> **以下两点是 #435 的目标行为，当前版本不成立**（#435 未落地）：
-> · "摘要不匹配时构建将在第 3 步失败并拒绝安装" —— 当前脚本**对 FC tarball 不做任何摘要
->   校验**，且 `provision-host.sh` 里**没有 `FC_SHA256_*` 这个变量**（只有 `FC_VER`）。
-> · "报告 S3 miss，不会静默回落至公网源" —— 当前公网源是**唯一**的源，不存在 S3 取件，
->   也就无所谓回落。
-> 上传制品不会被读取；架构不匹配也不会在第 3 步报 S3 miss。
+> **摘要校验现在是强制的（#435）。** 上面那句 `sumcheck` 只是你自己上传前的自查；
+> 真正管事的是 `provision-host.sh` 里 `_fc_expected_sha()` 钉死的摘要 —— 取回 tarball 后
+> **解包与安装之前**强制比对，不匹配就 `die`，**S3 与 github 两个来源都验**。
+>
+> 为什么这条必须有：host role 对 assets 存储桶是 read-write，也就是任何一台被攻陷的 host
+> 都能覆盖这个 tarball；把取源从 github 换成自家桶，如果不同时钉住内容，就等于把
+> "别人改不了你装什么"变成了"改得了"。所以：
+>
+> · 你上传的字节必须与钉死的摘要**逐字一致**，否则每台 host 都会在安装前 `die`；
+> · 想升级 `FC_VER`，必须先在 `_fc_expected_sha()` 里补上新版本的摘要 ——
+>   查不到摘要即拒绝安装（fail-closed），不会"先装了再说"。
 
 **注意**：存储桶名必须与 `assets_bucket` 参数一致。脚本内的对象前缀
 `deployment/binaries/firecracker` 为硬编码值，仅存储桶名可配置。
@@ -561,7 +574,7 @@ custom_script_env = {
 1. 上传 provision-host.sh 与 install-fluent-bit.sh
 2. 执行 provision-host.sh（安装组件 → scrub 清除实例身份 → 写入 marker）
 3. 执行自定义脚本          ← 此处
-4. 零下载检查（断言）
+4. 组件零安装检查（断言）
 5. 幂等检查（断言）
 6. 生成 AMI
 ```
@@ -667,11 +680,16 @@ aws ec2 describe-snapshots --snapshot-ids <构建日志中的 snapshot id> \
 
 构建过程包含两轮自检，任一轮失败则不产出 AMI：
 
-1. **零下载检查** —— 验证 `firecracker`、`jailer`、`aws` 位于 PATH，Fluent Bit 位于
+1. **组件零安装检查** —— 验证 `firecracker`、`jailer`、`aws` 位于 PATH，Fluent Bit 位于
    `/opt/fluent-bit/bin`，guest kernel 与 marker 均存在，ADOT 已安装；同时验证
    `host_vm_key`、`platform.env`、SSH host key、cloud-init 实例状态**均已清除**
    （镜像由整个机队共享，任何实例身份信息残留将成为机队级共享身份）
 2. **幂等检查** —— 重复执行一次 provision，确认不会重复安装任何组件
+
+> 该检查证明的是**组件零安装**，不是「启动零下载」。golden host 开机时仍会从 S3 拉取
+> 配置与脚本（`install-fluent-bit.sh`、`oc-guest-log-reader.py`、rootfs `manifest.json`
+> 与全部生命周期脚本），拉不到即 `exit 1`。排查启动失败时请按这个事实定位，不要假设
+> 开机路径不访问 S3。
 
 ### 常见故障
 

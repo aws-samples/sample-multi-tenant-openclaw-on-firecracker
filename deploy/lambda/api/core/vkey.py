@@ -11,6 +11,7 @@ facade:handler.py re-export 全部符号,旧 handler.<sym> patch/调用路径全
 
 import json
 import os
+import urllib.error  # #438 —— 显式导入:HTTPError 的分支判据不靠 urllib.request 的副作用导入
 import urllib.request
 
 import boto3
@@ -117,7 +118,21 @@ def _revoke_tenant_vkey(vkey):
     Without this the per-tenant key lingers in LiteLLM after the tenant is gone —
     a credential + budget leak that accumulates over churn. Non-fatal (delete
     proceeds even if revoke fails; we log) and best-effort. Returns True on
-    confirmed revoke, False otherwise."""
+    confirmed revoke, False otherwise.
+
+
+    改动前一个 `except Exception: return False` 把两者混成一件事,于是 `vkey_revoke_failed`
+    标记的消费者(#438 的 reconciler)**无法收敛**:一把早已被撤销的 key 会被一直重试到
+    上限、然后打一条假告警。这不是顺手优化,是 reconciler 能收敛的前提。
+
+    判据刻意只认 **404**,不认整个 4xx:
+      · 404 = LiteLLM 明确答复「没有这把 key」⇒ 回收目标已达成,返 True 让调用方清字段。
+      · **401/403 绝不能当成已撤销** —— 那是「master key 配错/无权」,key 很可能还活着。
+        判成 True 会让 delete 路径把 `litellm_vkey` 字段删掉,于是那把活 key 再也找不回来
+        (凭据永久泄漏),正是本条要防的方向。
+      · 其余 4xx(如 400)语义不明,保守当失败:代价是多重试几轮 + 一条告警,
+        而反向的代价是丢掉一把活凭据。fail-closed 往安全那侧倒。
+    """
     if not vkey:
         return False
     mk = _get_litellm_master_key()
@@ -136,6 +151,13 @@ def _revoke_tenant_vkey(vkey):
         with urllib.request.urlopen(req, timeout=15) as r:
             r.read()
             return True
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            print("litellm: vkey already absent (404) — treating as revoked")
+            return True
+        # don't leak the key value into logs (mask)
+        print(f"litellm: vkey revoke failed for [REDACTED vkey]: HTTP {e.code}")
+        return False
     except Exception as e:
         # don't leak the key value into logs (mask)
         print(f"litellm: vkey revoke failed for [REDACTED vkey]: {e}")

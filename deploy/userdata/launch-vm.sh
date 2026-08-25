@@ -319,9 +319,308 @@ fan_out_main() {
   fi
   return 0
 }
+
+# single-VM launch body, so it cannot acquire launch locks, stop the VM, touch
+# the tenant overlay, or enter the live tenant disk mount window.
+_oc_pre_rebuild_probe() (
+  local _pr_tenant="${1:?missing tenant_id}"
+  local _pr_vm_num="${2:?missing vm_num}"
+  local _pr_snapshot="${3:-__legacy_flat__}"
+  local _pr_assets="${OC_ASSET_ROOT:-/data/firecracker-assets}"
+  local _pr_work _pr_root_mnt _pr_lower_mnt _pr_overlay_mnt _pr_tpl_mnt _pr_stage
+  local _pr_rootfs _pr_data_tpl _pr_binding _pr_template _pr_current
+  local _pr_creds _pr_plan _pr_scheme _pr_owner _pr_version _pr_vid _pr_sha
+  local _pr_raw _pr_plan_raw _pr_guest_ip _pr_port="" _pr_rc=1
+  local _pr_path_kind _pr_path_b64 _pr_path _pr_parent
+
+  [ -f /etc/platform.env ] && source /etc/platform.env
+  if [ -z "${OC_REAPPLY_BINDING_B64:-}" ]; then
+    echo '{"state":"INCOMPATIBLE","reason":"missing reapply binding"}'
+    echo "openclaw.json 不兼容" >&2
+    return 1
+  fi
+  _pr_binding="$(printf '%s' "${OC_REAPPLY_BINDING_B64}" | base64 -d 2>/dev/null || true)"
+  if ! printf '%s' "${_pr_binding}" | jq -e 'type == "object"' >/dev/null 2>&1; then
+    echo '{"state":"INCOMPATIBLE","reason":"invalid reapply binding"}'
+    echo "openclaw.json 不兼容" >&2
+    return 1
+  fi
+
+  if [ "${_pr_snapshot}" = "__legacy_flat__" ] || [ -z "${_pr_snapshot}" ]; then
+    _pr_rootfs="${_pr_assets}/openclaw-rootfs.ext4"
+    _pr_data_tpl="${_pr_assets}/openclaw-data-template.ext4"
+  else
+    _pr_rootfs="${_pr_assets}/versions/${_pr_snapshot}/openclaw-rootfs.ext4"
+    _pr_data_tpl="${_pr_assets}/versions/${_pr_snapshot}/openclaw-data-template.ext4"
+  fi
+  if [ ! -s "${_pr_rootfs}" ] || [ ! -s "${_pr_data_tpl}" ]; then
+    echo '{"state":"INCOMPATIBLE","reason":"target image not pulled"}'
+    echo "openclaw.json 不兼容" >&2
+    return 1
+  fi
+
+  _pr_work="$(mktemp -d "/tmp/oc-reapply-probe-${_pr_tenant}.XXXXXX")"
+  _pr_root_mnt="${_pr_work}/root"
+  _pr_lower_mnt="${_pr_work}/lower"
+  _pr_overlay_mnt="${_pr_work}/overlay"
+  _pr_tpl_mnt="${_pr_work}/template"
+  _pr_stage="${_pr_work}/stage"
+  mkdir -p \
+    "${_pr_root_mnt}" "${_pr_lower_mnt}" "${_pr_overlay_mnt}" \
+    "${_pr_tpl_mnt}" "${_pr_stage}"
+  _pr_template="${_pr_work}/template.json"
+  _pr_current="${_pr_work}/current.json"
+  _pr_creds="${_pr_work}/credentials.json"
+
+  _oc_probe_cleanup() {
+    # briefly keep the overlay busy. Kill it hard, kill any mount users, then LAZY-unmount
+    # (detaches even if busy) so cleanup never fails and never masks the validation result.
+    if [ -n "${_pr_port}" ]; then
+      pkill -f "openclaw gateway.*--port ${_pr_port}" 2>/dev/null || true
+      sleep 1
+      pkill -9 -f "openclaw gateway.*--port ${_pr_port}" 2>/dev/null || true
+    fi
+    sudo fuser -km "${_pr_root_mnt}" 2>/dev/null || true
+    mountpoint -q "${_pr_root_mnt}/tmp" 2>/dev/null && sudo umount -l "${_pr_root_mnt}/tmp" 2>/dev/null || true
+    mountpoint -q "${_pr_root_mnt}/proc" 2>/dev/null && sudo umount -l "${_pr_root_mnt}/proc" 2>/dev/null || true
+    mountpoint -q "${_pr_root_mnt}/dev" 2>/dev/null && sudo umount -Rl "${_pr_root_mnt}/dev" 2>/dev/null || true
+    mountpoint -q "${_pr_root_mnt}" 2>/dev/null && sudo umount -l "${_pr_root_mnt}" 2>/dev/null || true
+    mountpoint -q "${_pr_overlay_mnt}" 2>/dev/null && sudo umount -l "${_pr_overlay_mnt}" 2>/dev/null || true
+    mountpoint -q "${_pr_lower_mnt}" 2>/dev/null && sudo umount -l "${_pr_lower_mnt}" 2>/dev/null || true
+    mountpoint -q "${_pr_tpl_mnt}" 2>/dev/null && sudo umount -l "${_pr_tpl_mnt}" 2>/dev/null || true
+    rm -rf "${_pr_work}" 2>/dev/null || true
+  }
+  trap _oc_probe_cleanup EXIT
+
+  # PULL:the selected image pair must already be present; mount target rootfs RO
+  # as the overlay lowerdir so validation-only writes never reach the image.
+  sudo mount -o ro,noload "${_pr_rootfs}" "${_pr_lower_mnt}"
+  sudo mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs "${_pr_overlay_mnt}"
+  sudo mkdir -p "${_pr_overlay_mnt}/upper" "${_pr_overlay_mnt}/work"
+  if ! sudo mount -t overlay overlay \
+      -o "lowerdir=${_pr_lower_mnt},upperdir=${_pr_overlay_mnt}/upper,workdir=${_pr_overlay_mnt}/work" \
+      "${_pr_root_mnt}"; then
+    echo '{"state":"PROBE_FAILED","reason":"validation writable layer unavailable"}'
+    return 1
+  fi
+
+  _pr_vid="$(printf '%s' "${_pr_binding}" | jq -r '.body_version_id // ""')"
+  _pr_sha="$(printf '%s' "${_pr_binding}" | jq -r '.body_sha256 // ""')"
+  _pr_version="$(printf '%s' "${_pr_binding}" | jq -r '.target_openclaw_version // ""')"
+  if [ "$(printf '%s' "${_pr_binding}" | jq -r '.host_baked // false')" = "true" ]; then
+    sudo mount -o ro,noload "${_pr_data_tpl}" "${_pr_tpl_mnt}"
+    sudo cp "${_pr_tpl_mnt}/.openclaw/openclaw.json" "${_pr_template}"
+  else
+    _pr_name="$(printf '%s' "${_pr_binding}" | jq -r '.config_template // ""')"
+    if [ -z "${ASSETS_BUCKET:-}" ] || [ -z "${_pr_name}" ] || [ -z "${_pr_vid}" ]; then
+      echo '{"state":"INCOMPATIBLE","reason":"named template binding incomplete"}'
+      echo "openclaw.json 不兼容" >&2
+      return 1
+    fi
+    aws s3api get-object \
+      --bucket "${ASSETS_BUCKET}" \
+      --key "templates/openclaw/${_pr_name}/openclaw.json" \
+      --version-id "${_pr_vid}" \
+      "${_pr_template}" \
+      --region "${OC_REGION:-ap-northeast-1}" >/dev/null
+    if [ -n "${_pr_sha}" ] &&
+       [ "$(sha256sum "${_pr_template}" | cut -d' ' -f1)" != "${_pr_sha}" ]; then
+      echo '{"state":"INCOMPATIBLE","reason":"template body hash mismatch"}'
+      echo "openclaw.json 不兼容" >&2
+      return 1
+    fi
+  fi
+
+  jq -n \
+    --arg token "__OC_SCHEMA_GATEWAY_TOKEN__" \
+    --arg vkey "__OC_SCHEMA_LITELLM_VKEY__" \
+    '{gateway_token:$token,litellm_vkey:$vkey}' > "${_pr_creds}"
+
+  if ! _pr_raw="$(aws dynamodb get-item \
+      --table-name "${TENANTS_TABLE:-openclaw-tenants}" \
+      --key "{\"id\":{\"S\":\"${_pr_tenant}\"}}" \
+      --projection-expression 'frozen_injection_plan, owner_id, scheme, guest_ip' \
+      --consistent-read \
+      --region "${OC_REGION:-ap-northeast-1}" \
+      --output json 2>/dev/null)"; then
+    echo '{"state":"INCOMPATIBLE","reason":"cannot read frozen injection plan"}'
+    echo "openclaw.json 不兼容" >&2
+    return 1
+  fi
+  _pr_owner="$(printf '%s' "${_pr_raw}" | jq -r '.Item.owner_id.S // ""')"
+  _pr_scheme="$(printf '%s' "${_pr_raw}" | jq -r '.Item.scheme.S // "kms-cmk"')"
+  _pr_guest_ip="$(printf '%s' "${_pr_raw}" | jq -r '.Item.guest_ip.S // ""')"
+  # Reapply currently requires a running tenant whose guest is SSH-reachable.
+  # TODO: for a stopped tenant, read the merge-base config from its data disk.
+  if [ -z "${_pr_guest_ip}" ] || [ ! -f /etc/openclaw/host_vm_key ]; then
+    echo '{"state":"PROBE_FAILED","reason":"running guest config is unreadable"}'
+    return 1
+  fi
+  if ! timeout 20 ssh \
+      -i /etc/openclaw/host_vm_key \
+      -o StrictHostKeyChecking=no \
+      -o UserKnownHostsFile=/dev/null \
+      -o ConnectTimeout=5 \
+      -o LogLevel=ERROR \
+      -o BatchMode=yes \
+      "agent@${_pr_guest_ip}" \
+      'cat /home/agent/.openclaw/openclaw.json' 2>/dev/null \
+    | jq \
+        --arg token "__OC_SCHEMA_GATEWAY_TOKEN__" \
+        --arg vkey "__OC_SCHEMA_LITELLM_VKEY__" '
+          setpath(["gateway", "auth", "token"]; $token)
+          | setpath(["models", "providers", "litellm", "apiKey"]; $vkey)
+        ' > "${_pr_current}"; then
+    echo '{"state":"PROBE_FAILED","reason":"running guest config read failed"}'
+    return 1
+  fi
+  _pr_plan_raw="$(printf '%s' "${_pr_raw}" | jq -c '.Item.frozen_injection_plan.M // empty' 2>/dev/null || true)"
+  _pr_plan=""
+  if [ -n "${_pr_plan_raw}" ] && [ "${_pr_plan_raw}" != "null" ]; then
+    _pr_plan="$(printf '%s' "${_pr_raw}" | jq -c '
+      [.Item.frozen_injection_plan.M | to_entries[] |
+       {(.key): {
+         param_class: .value.M.param_class.S,
+         injection_target: .value.M.injection_target.S,
+         sensitive: (.value.M.sensitive.BOOL // false),
+         mode: .value.M.mode.S,
+         value_ref: (.value.M.value_ref.S // ""),
+         empty_fallback: (.value.M.empty_fallback.S // "")
+       }}] | add // {}' 2>/dev/null || true)"
+  fi
+
+  if [ -r /home/ubuntu/lib/harden-config.sh ]; then
+    # shellcheck disable=SC1091
+    . /home/ubuntu/lib/harden-config.sh
+  else
+    echo '{"state":"INCOMPATIBLE","reason":"harden-config library missing"}'
+    echo "openclaw.json 不兼容" >&2
+    return 1
+  fi
+  _pr_baseurl="$(oc_normalize_litellm_baseurl "${LITELLM_HOST:-}")"
+  if ! oc_assemble_config \
+      "${_pr_current}" "${_pr_template}" "${_pr_stage}/openclaw.json" \
+      "${_pr_plan}" "$(cat "${_pr_creds}")" "${_pr_scheme}" "${_pr_owner}" \
+      "${OC_REGION:-ap-northeast-1}" "${CLOUDFRONT_ORIGIN:-}" "${_pr_baseurl}" \
+      "__OC_SCHEMA_LITELLM_VKEY__" "0" "${CLAWPOOL_RSA_CMK_ARN:-}"; then
+    echo '{"state":"INCOMPATIBLE","reason":"assembly failed"}'
+    echo "openclaw.json 不兼容" >&2
+    return 1
+  fi
+
+  _oc_probe_collect_paths() {
+    jq -r '
+      [
+        (.plugins.load.paths[]? | {kind:"dir", path:.}),
+        (.mcpServers // {} | .[]? | .command? | {kind:"parent", path:.}),
+        (.mcpServers // {} | .[]? | .args[]? | {kind:"dir", path:.}),
+        (.mcp.servers // {} | .[]? | .command? | {kind:"parent", path:.}),
+        (.mcp.servers // {} | .[]? | .args[]? | {kind:"dir", path:.}),
+        (paths(strings) as $p
+          | ($p | map(select(type == "string") | ascii_downcase)) as $keys
+          | select(
+              ($keys | any(test("hook|skill")))
+              and ($keys | any(test("^(path|paths|dir|dirs|directory|directories)$")))
+            )
+          | {kind:"dir", path:getpath($p)}),
+        (paths(strings) as $p
+          | ($p | map(select(type == "string") | ascii_downcase)) as $keys
+          | select(
+              ($keys | any(. == "tls"))
+              and ($keys | any(test("^(certpath|keypath)$")))
+            )
+          | {kind:"file", path:getpath($p)}),
+        (paths(strings) as $p
+          | ($p | map(select(type == "string") | ascii_downcase)) as $keys
+          | select(
+              ($keys | any(test("^state(dir|directory|path)$")))
+              or (
+                ($keys | any(. == "state"))
+                and ($keys | any(test("^(path|dir|directory)$")))
+              )
+            )
+          | {kind:"dir", path:getpath($p)})
+      ]
+      | map(select(
+          (.path | type) == "string"
+          and (.path | startswith("/"))
+          and .path != "/"
+        ))
+      | unique_by([.kind, .path])[]
+      | [.kind, (.path | @base64)]
+      | @tsv
+    ' "$1"
+  }
+
+  sudo chroot "${_pr_root_mnt}" /bin/mkdir -p -- /tmp /tmp/state /tmp/home
+  sudo chroot "${_pr_root_mnt}" /bin/chmod 1777 /tmp
+  sudo cp "${_pr_stage}/openclaw.json" "${_pr_root_mnt}/tmp/openclaw.json"
+  if ! _oc_probe_collect_paths "${_pr_stage}/openclaw.json" > "${_pr_work}/paths.tsv"; then
+    echo '{"state":"PROBE_FAILED","reason":"validation path preparation failed"}'
+    return 1
+  fi
+  while IFS=$'\t' read -r _pr_path_kind _pr_path_b64; do
+    [ -n "${_pr_path_b64}" ] || continue
+    _pr_path="$(printf '%s' "${_pr_path_b64}" | base64 -d)"
+    case "${_pr_path_kind}" in
+      dir)
+        sudo chroot "${_pr_root_mnt}" /bin/mkdir -p -- "${_pr_path}"
+        ;;
+      parent|file)
+        _pr_parent="${_pr_path%/*}"
+        [ -n "${_pr_parent}" ] || _pr_parent="/"
+        sudo chroot "${_pr_root_mnt}" /bin/mkdir -p -- "${_pr_parent}"
+        if [ "${_pr_path_kind}" = "file" ]; then
+          sudo chroot "${_pr_root_mnt}" /usr/bin/touch -- "${_pr_path}"
+        fi
+        ;;
+    esac
+  done < "${_pr_work}/paths.tsv"
+
+  sudo mount -t proc proc "${_pr_root_mnt}/proc"
+  sudo mount --rbind /dev "${_pr_root_mnt}/dev"
+  if [ "${_pr_version}" = "2026.2.26" ]; then
+    _pr_port=$((24000 + (($$ + _pr_vm_num) % 12000)))
+    while ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${_pr_port}$"; do
+      _pr_port=$((_pr_port + 1))
+    done
+    set +e
+    timeout --signal=TERM --kill-after=2s 8s \
+      sudo chroot "${_pr_root_mnt}" /bin/sh -c \
+      "OPENCLAW_CONFIG_PATH=/tmp/openclaw.json OPENCLAW_STATE_DIR=/tmp/state HOME=/tmp/home TMPDIR=/tmp openclaw gateway --allow-unconfigured --port ${_pr_port}" \
+      >/dev/null 2>"${_pr_work}/validator.err"
+    _pr_rc=$?
+    set -e
+    [ "${_pr_rc}" -eq 124 ] && _pr_rc=0
+  else
+    set +e
+    sudo chroot "${_pr_root_mnt}" /bin/sh -c \
+      'OPENCLAW_CONFIG_PATH=/tmp/openclaw.json OPENCLAW_STATE_DIR=/tmp/state HOME=/tmp/home TMPDIR=/tmp openclaw config validate' \
+      >/dev/null 2>"${_pr_work}/validator.err"
+    _pr_rc=$?
+    set -e
+  fi
+  if [ "${_pr_rc}" -ne 0 ]; then
+    printf '{"state":"INCOMPATIBLE","reason":"target validator rejected config","rc":%s}\n' "${_pr_rc}"
+    echo "openclaw.json 不兼容" >&2
+    return 1
+  fi
+  printf '{"state":"COMPATIBLE","tenant_id":"%s","registry_version":%s,"body_version_id":"%s","body_sha256":"%s"}\n' \
+    "${_pr_tenant}" \
+    "$(printf '%s' "${_pr_binding}" | jq -r '.registry_version')" \
+    "${_pr_vid}" "${_pr_sha}"
+  return 0
+)
+# OC_REAPPLY_PROBE_END
+
 case "${1:-}" in
   --manifest|--from-ddb)
     fan_out_main "$@"
+    exit $?
+    ;;
+  --pre-rebuild-probe)
+    shift
+    _oc_pre_rebuild_probe "$@"
     exit $?
     ;;
 esac
@@ -971,12 +1270,26 @@ if [ "${NEEDS_INIT}" = "true" ]; then
       _pipe_rc="${PIPESTATUS[0]}" _tar_rc="${PIPESTATUS[1]}"
       set -e
       # 解出的内容必须【只有】data.ext4 这一个普通文件,否则连临时目录一起丢掉。
+      # `-h`(是否符号链接)这一条是 codex 独立复审抓出、我本地实测复现的真漏洞:
+      # 成员名叫 data.ext4 的【符号链接】能通过上面的清单白名单(tar -tf 只显示
+      # "data.ext4"),而 `[ -f ]` 会【跟随链接】判定为真 —— 目标存在时直接放行,
+      # `find ! -name data.ext4` 也不报警(名字确实是 data.ext4)。
+      # 后果:下面的 mv 把这个链接搬进 VM 目录,随后的 e2fsck / 挂载 / 写入全部落到
+      # 链接指向的路径 —— 归档由调用方提供,指向别的租户盘就是跨租户写。
+      # 实测(本地复现):目标可解析时 `[ -f ]` 返回真、find 无输出,两道守卫都被绕过。
+      # 故必须先用 `-h` 显式拒掉链接,再要求它是普通文件。
+      # 硬链接同理但更隐蔽:`-h` 不认它、`-f` 认它是普通文件、find 也不报警,而 mv
+      # 之后写入会落到被链接的那个 inode。判据是 link count —— tar 解到【新建的空
+      # 目录】里,正常成员的 nlink 必为 1;>1 说明这个 inode 在别处也有名字。
+      # 本地实测:硬链接情形下 nlink=2,而三道原守卫全部放行。
+      _nlink="$(stat -c%h "${_XD}/data.ext4" 2>/dev/null || echo 0)"
       _xtra="$(find "${_XD}" -mindepth 1 ! -name data.ext4 2>/dev/null | head -3)"
       if [ "${_pipe_rc:-1}" -ne 0 ] || [ "${_tar_rc:-1}" -ne 0 ] ||
+         [ -h "${_XD}/data.ext4" ] || [ "${_nlink}" != "1" ] ||
          [ ! -f "${_XD}/data.ext4" ] || [ -n "${_xtra}" ]; then
         rm -rf "${_XD}"
         rm -f "${_GZ}" ${DATA_VOL}
-        log "FATAL(#199): restore tar 解包失败(pigz rc=${_pipe_rc} tar rc=${_tar_rc} extra='${_xtra}';截断/损坏/成员非预期)— 拒起,不留半个盘"
+        log "FATAL(#199): restore tar 解包失败(pigz rc=${_pipe_rc} tar rc=${_tar_rc} extra='${_xtra}' nlink=${_nlink};截断/损坏/成员非预期/符号或硬链接)— 拒起,不留半个盘"
         exit 1
       fi
       # 同一文件系统内 mv = rename,保留稀疏性(不会物化空洞)。
@@ -1183,6 +1496,94 @@ fi
 # Configure openclaw.json
 OC_JSON="${MOUNT_TMP}/.openclaw/openclaw.json"
 if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
+  # OC_REAPPLY_COMMIT_BEGIN
+  # so this is the first safe point to read disk-only credentials.
+  _OC_REAPPLY_ASSEMBLED=0
+  if [ "${OC_REAPPLY_CONFIG:-}" = "1" ]; then
+    _RA_BINDING="$(printf '%s' "${OC_REAPPLY_BINDING_B64:-}" | base64 -d 2>/dev/null || true)"
+    if ! printf '%s' "${_RA_BINDING}" | jq -e 'type == "object"' >/dev/null 2>&1; then
+      log "FATAL(#429): invalid reapply binding"
+      exit 1
+    fi
+    _RA_TEMPLATE="$(printf '%s' "${_RA_BINDING}" | jq -r '.config_template // "default"')"
+    _RA_VERSION_ID="$(printf '%s' "${_RA_BINDING}" | jq -r '.body_version_id // ""')"
+    _RA_SHA="$(printf '%s' "${_RA_BINDING}" | jq -r '.body_sha256 // ""')"
+    _RA_DIR="$(mktemp -d "/tmp/oc-reapply-commit-${TENANT_ID}.XXXXXX")"
+    _RA_BODY="${_RA_DIR}/template.json"
+    _RA_OUTPUT="${OC_JSON}.reapply.$$"
+    _RA_TPL_MNT="${_RA_DIR}/template-mount"
+    mkdir -p "${_RA_TPL_MNT}"
+    if [ "$(printf '%s' "${_RA_BINDING}" | jq -r '.host_baked // false')" = "true" ]; then
+      if ! sudo mount -o ro,noload "${DATA_TPL}" "${_RA_TPL_MNT}"; then
+        log "FATAL(#429): cannot read host-baked target template"
+        rm -rf "${_RA_DIR}"
+        exit 1
+      fi
+      if ! sudo cp "${_RA_TPL_MNT}/.openclaw/openclaw.json" "${_RA_BODY}"; then
+        sudo umount "${_RA_TPL_MNT}" 2>/dev/null || true
+        rm -rf "${_RA_DIR}"
+        log "FATAL(#429): host-baked openclaw.json missing"
+        exit 1
+      fi
+      sudo umount "${_RA_TPL_MNT}" 2>/dev/null || {
+        rm -rf "${_RA_DIR}"
+        log "FATAL(#429): target template mount cleanup failed"
+        exit 1
+      }
+    else
+      if [ -z "${ASSETS_BUCKET:-}" ] || [ -z "${_RA_VERSION_ID}" ]; then
+        rm -rf "${_RA_DIR}"
+        log "FATAL(#429): named template binding incomplete"
+        exit 1
+      fi
+      if ! aws s3api get-object \
+          --bucket "${ASSETS_BUCKET}" \
+          --key "templates/openclaw/${_RA_TEMPLATE}/openclaw.json" \
+          --version-id "${_RA_VERSION_ID}" \
+          "${_RA_BODY}" \
+          --region "${OC_REGION:-ap-northeast-1}" >/dev/null; then
+        rm -rf "${_RA_DIR}"
+        log "FATAL(#429): exact template body download failed"
+        exit 1
+      fi
+      if [ -n "${_RA_SHA}" ] &&
+         [ "$(sha256sum "${_RA_BODY}" | cut -d' ' -f1)" != "${_RA_SHA}" ]; then
+        rm -rf "${_RA_DIR}"
+        log "FATAL(#429): exact template body hash mismatch"
+        exit 1
+      fi
+    fi
+
+    _RA_TOKEN="$(jq -r '.gateway.auth.token // ""' "${OC_JSON}" 2>/dev/null || true)"
+    _RA_VKEY="$(jq -r '.models.providers.litellm.apiKey // ""' "${OC_JSON}" 2>/dev/null || true)"
+    _RA_CREDS="$(jq -nc --arg token "${_RA_TOKEN}" --arg vkey "${_RA_VKEY}" \
+      '{gateway_token:$token,litellm_vkey:$vkey}')"
+    _RA_BASEURL="$(oc_normalize_litellm_baseurl "${LITELLM_HOST:-}")"
+    if ! oc_assemble_config \
+        "${OC_JSON}" "${_RA_BODY}" "${_RA_OUTPUT}" \
+        "${_FP_PURE:-}" "${_RA_CREDS}" "${_FP_SCHEME:-kms-cmk}" \
+        "${_CRED_OWNER:-}" "${OC_REGION:-ap-northeast-1}" \
+        "${CLOUDFRONT_ORIGIN:-}" "${_RA_BASEURL}" \
+        "${LITELLM_SHARED_VKEY:-}" "${CHAT_EP_ENABLED}" \
+        "${CLAWPOOL_RSA_CMK_ARN:-}"; then
+      rm -f "${_RA_OUTPUT}"
+      rm -rf "${_RA_DIR}"
+      log "FATAL(#429): final openclaw.json assembly failed"
+      exit 1
+    fi
+    chmod 600 "${_RA_OUTPUT}"
+    sudo chown 1000:1000 "${_RA_OUTPUT}"
+    mv -f "${_RA_OUTPUT}" "${OC_JSON}"
+    # Keep the normal wake convergence from selecting the shared key later.
+    [ -z "${_RA_VKEY}" ] || LITELLM_VKEY="${_RA_VKEY}"
+    _OC_REAPPLY_ASSEMBLED=1
+    rm -rf "${_RA_DIR}"
+    log "config template '${_RA_TEMPLATE}' re-applied (registry=$(printf '%s' "${_RA_BINDING}" | jq -r '.registry_version'))"
+    unset _RA_BINDING _RA_TEMPLATE _RA_VERSION_ID _RA_SHA _RA_DIR _RA_BODY
+    unset _RA_OUTPUT _RA_TPL_MNT _RA_TOKEN _RA_VKEY _RA_CREDS _RA_BASEURL
+  fi
+  # OC_REAPPLY_COMMIT_END
+
   # ─────────────────────────────────────────────────────────────────────
   # ONE-TIME 生成(NEW_DATA 才跑):config template 首次下载、gateway token 首铸、
   # channel_secret 首次落盘、Cognito 注入、per-tenant vkey 首次注入。这些是"一次
@@ -1350,7 +1751,9 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
     log "WARN: 无 LITELLM_VKEY 也无 LITELLM_SHARED_VKEY(SSM 也空)— apiKey 保留占位符,LLM 调用会 401。设 SSM /openclaw/litellm-shared-vkey(setup.sh 或手工 aws ssm put-parameter)。"
   fi
 
-  if oc_harden_config "${OC_JSON}" "${CF_ORIGIN}" "${LITELLM_BASEURL}" "${_APIKEY}" "${CHAT_EP_ENABLED}"; then
+  if [ "${_OC_REAPPLY_ASSEMBLED:-0}" = "1" ]; then
+    log "harden-config: already applied by shared #429 assembler"
+  elif oc_harden_config "${OC_JSON}" "${CF_ORIGIN}" "${LITELLM_BASEURL}" "${_APIKEY}" "${CHAT_EP_ENABLED}"; then
     # Task 8.3: frozen plan config-class dot-path 覆盖(新契约)
     if [ -n "${_FP_PURE:-}" ]; then
       if ! oc_inject_config_from_plan "${OC_JSON}" "${_FP_PURE}" "${_FP_SCHEME}" "${_CRED_OWNER}" "${OC_REGION:-ap-northeast-1}" "${LITELLM_SHARED_VKEY:-}" "${CLAWPOOL_RSA_CMK_ARN:-}"; then
@@ -1385,7 +1788,7 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
   # 仅在 INJECTED_* 非空时写(老租户/无 pre-minted → 空 → 不动,保留盘上现值,零漂移;
   # gateway token 的 openssl rand 首铸仍只在 NEW_DATA 块,这里绝不用随机值覆盖)。
   # ─────────────────────────────────────────────────────────────────────
-  if [ -n "${INJECTED_GATEWAY_TOKEN_CT}" ]; then
+  if [ "${OC_REAPPLY_CONFIG:-}" != "1" ] && [ -n "${INJECTED_GATEWAY_TOKEN_CT}" ]; then
     _GW_TOKEN_RI="$(printf '%s' "${INJECTED_GATEWAY_TOKEN_CT}" | base64 -d 2>/dev/null \
       | aws kms decrypt \
           --ciphertext-blob fileb:///dev/stdin \
@@ -1797,6 +2200,23 @@ sudo iptables -C FORWARD -i ${TAP} -d 169.254.169.253 -j DROP 2>/dev/null || \
 TENANT_SUPERNET="${SUBNET_PREFIX:-10.0}.0.0/16"
 sudo iptables -C FORWARD -i ${TAP} -d ${TENANT_SUPERNET} -j DROP 2>/dev/null || \
   sudo iptables -I FORWARD 1 -i ${TAP} -d ${TENANT_SUPERNET} -j DROP
+# ── SECURITY (#528 F1: block guest → internal route-table Redis) ──
+# The guest egresses via the host's MASQUERADE (HOST_IFACE below), so at the SG
+# layer its packets are indistinguishable from the host's — a guest can reach the
+# route-table Valkey/Redis on :6379 (transit_encryption/auth_token both off,
+# ha_edge.py) and KEYS/SET the tenant→host route map, hijacking or blackholing
+# other tenants' traffic. The tenant-supernet DROP above does NOT cover Redis: it
+# lives in the VPC CIDR (EGRESS_VPC_CIDR), not SUBNET_PREFIX/16. Drop guest→VPC
+# :6379 here (guest-originated, -i ${TAP}) BEFORE the ACCEPT. This is guest-origin
+# only: the edge→gateway data-plane packet arrives DNAT'd on ${HOST_IFACE} (not
+# ${TAP}) and its return rides the conntrack ESTABLISHED ACCEPT below, so tenant
+# routing is untouched. EGRESS_VPC_CIDR is rendered into /etc/platform.env by
+if [ -n "${EGRESS_VPC_CIDR:-}" ]; then
+  sudo iptables -C FORWARD -i ${TAP} -d ${EGRESS_VPC_CIDR} -p tcp --dport 6379 -j DROP 2>/dev/null || \
+    sudo iptables -I FORWARD 1 -i ${TAP} -d ${EGRESS_VPC_CIDR} -p tcp --dport 6379 -j DROP
+else
+  log "WARN(#528 F1): EGRESS_VPC_CIDR empty in platform.env — guest→Redis :6379 DROP skipped; guest can reach internal Redis unauthenticated"
+fi
 # ── SECURITY (management-plane isolation): block guest → host services ──
 # The guest's default route points at its tap's host IP (HOST_TAP_IP), and the
 # host runs control-plane services bound to 0.0.0.0: host-agent metrics/control

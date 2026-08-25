@@ -122,6 +122,62 @@ CF_EN=$(cfg cloudfront.enabled)
 grep -q '^alb\.internal=' "$CFGDUMP" && _pass "alb.internal 已显式声明" \
   || _block "config 缺 alb.internal(#423 起必须显式写,缺键 synth 直接 raise,ha_edge.py:alb.internal 缺键 raise ValueError)"
 
+# `CFG = yaml.safe_load(config.yml)`,不做默认值合并,所以被【直接下标】的键缺一个就是
+# cdk synth KeyError —— 客户要等到 synth 才炸,而这些判据是纯 config 解析、零 AWS 调用,
+# 完全可以提前到部署前一行报错。判据形状照抄下面 asg.min_capacity 那条(case ''|*[!0-9]*)。
+while IFS='|' read -r CFG_KEY CFG_SITE; do
+  CFG_VAL=$(cfg "$CFG_KEY")
+  case "$CFG_VAL" in
+    ''|*[!0-9]*) _block "$CFG_KEY 缺失或非整数(${CFG_VAL:-空})— CDK 直接下标 CFG[\"${CFG_KEY%%.*}\"][\"${CFG_KEY#*.}\"]($CFG_SITE),缺键 synth 就 KeyError";;
+  esac
+done <<'EOF'
+host.root_volume_gb|deploy/stacks/ha_edge.py:832
+host.data_volume_gb|deploy/stacks/ha_edge.py:847
+host.reserved_vcpu|deploy/stacks/ha_edge.py:324
+host.reserved_mem_mb|deploy/stacks/ha_edge.py:325
+vm.default_vcpu|deploy/stacks/lambdas.py:330
+vm.default_mem_mb|deploy/stacks/lambdas.py:331
+vm.data_disk_mb|deploy/stacks/lambdas.py:332
+vm.gateway_port_base|deploy/stacks/lambdas.py:333
+asg.max_capacity|deploy/stacks/ha_edge.py:1047
+scaler.interval_minutes|deploy/stacks/lambdas.py:1780
+scaler.idle_timeout_minutes|deploy/stacks/lambdas.py:1726
+health_check.interval_minutes|deploy/stacks/lambdas.py:1648
+EOF
+# subnet_prefix 是【点分字符串】("172.16"),不是整数 —— 拿上面那条整数判据去查它,会把每一份
+# 合法 config 都报成 BLOCK。这里只查非空。消费点两处都是字符串拼接:ha_edge.py:423 的
+# init_sh.replace("{{SUBNET_PREFIX}}", ...) 与 lambdas.py:334 的 env 注入。
+[ -z "$(cfg vm.subnet_prefix)" ] && _block "vm.subnet_prefix 缺失或为空 — CDK 直接下标 CFG[\"vm\"][\"subnet_prefix\"](ha_edge.py:423 / lambdas.py:334),缺键 synth 就 KeyError(注意它是点分字符串如 \"172.16\",不是整数)"
+
+# AZ failover 依赖 multi_az(config.yml.example:497 明写)。为什么判据是「不等于 False」而不是
+# 「等于 True」:代码侧默认是【开】—— lambdas.py:1565 `bool(az_failover_cfg.get("enabled", True))`,
+# 且 az_failover 整段缺失时 hc_cfg.get("az_failover", {}) 得 {},照样落到那个 True。所以
+# 「没写」== 「开着」,只有显式 false 才是关。
+# 为什么是 WARN 不是 BLOCK:它不让 synth 失败也不让栈回滚,失效方式是运行态空转 ——
+# failover 触发时去找「其他健康 AZ」而根本没有别的 AZ。BLOCK 会拦掉合法的单 AZ 开发部署。
+if [ "$(cfg health_check.az_failover.enabled)" != "False" ] && [ "$(cfg multi_az.enabled)" != "True" ]; then
+  _warn "health_check.az_failover 生效中(缺键即默认开,lambdas.py:1565 get(\"enabled\",True))但 multi_az.enabled≠true — 单 AZ 下 failover 无处可迁,运行态空转(config.yml.example:497 明写此依赖)。二选一:multi_az.enabled 设 true,或显式写 health_check.az_failover.enabled: false"
+fi
+# 配了证书 = 开 443 listener;此时 bff_ingress_cidrs 空 = SG 一条入站规则都没有(auth.py:690-694
+# 从这个键建入站),等于建了墙不开洞。WARN 不 BLOCK,与本文件 :189-190 同一口径:那一类
+# 「建得出来但到不了」已在真机证伪过不是 CREATE 失败,记 BLOCK 会拦掉合法部署。
+[ -n "$(cfg console_auth.bff_certificate_arn)" ] && [ -z "$BFF_CIDR" ] \
+  && _warn "console_auth.bff_certificate_arn 已配置但 bff_ingress_cidrs 为空 — 443 listener 会建出来但 SG 无任何入站规则,控制台打不开(config.yml.example:606 要求成对配置;auth.py:690-694 从该键建入站)"
+# 理由写在 ha_edge.py:1350-1354 与 config.yml.example:283-286 —— 隐式派生会让 api.mode 的
+# 改动静默翻转 ALB 的公网/内网形态。所以这里只提醒人去确认,不改任何值。
+[ "$APIMODE_PRIV" = 1 ] && [ "$(cfg alb.internal)" = "False" ] \
+  && _warn "api.mode=$API_MODE(私有)但 alb.internal=false —— 私有 API 挂公网 ALB。#423 起【不再】从 api.mode 派生 alb.internal(隐式派生会让 api.mode 的改动静默翻转 ALB 形态,ha_edge.py:1350-1354),本门也不替你改,请显式确认这就是你要的形态"
+# 安全默认被关:一律 WARN。受限测试账号关 flow_logs 省成本是合法意图(config.yml.example:565
+# 原文),BLOCK 会造出假阳挡住正常部署。键【缺失】不判 —— protect_stateful_resources 缺省
+# 是按 region 回落的另一条语义(config.yml.example:622),不是「关掉了」。
+while IFS='|' read -r SECURITY_KEY SECURITY_NOTE; do
+  [ "$(cfg "$SECURITY_KEY")" = "False" ] && _warn "$SECURITY_KEY=false — $SECURITY_NOTE"
+done <<'EOF'
+flow_logs.enabled|关闭 CIS 3.8 网络审计轨迹,仅受限测试账号省成本时考虑(config.yml.example:564-566)
+dynamodb.point_in_time_recovery|关闭控制面表 PITR 安全默认(config.yml.example:629)
+deploy.protect_stateful_resources|有状态资源将 DESTROY + auto-delete;生产应为 true(config.yml.example:618-626,示例本身默认 false)
+EOF
+
 # 启动 → 拉不到镜像 → lifecycle hook ABANDON → ASG 反复换机。栈已存在时是增量,不判。
 # 主栈状态:必须区分「确实不存在」与「查不出来」。后者若被当成"不存在",会让下面的
 # SSM/残骸判定把【在役】资源报成残留并建议删除 —— 那是不可恢复的破坏性误导。
@@ -165,6 +221,18 @@ case "$HOOK_TO" in
        _warn "asg.lifecycle_hook_timeout=$HOOK_TO <2700(形态:mode=$MODE / ${HOST_IT_EARLY:-未设})— 硬性证据只覆盖 imported+metal,这里不拦;但冷启慢的机型仍可能 ABANDON,建议抬到 2700 以上"
      fi;;
 esac
+
+# replace → 丢审计历史。所以判据【必须】按主栈状态分流,和本文件 :147-152 的 min_capacity
+# 同一形状:栈已存在 = 增量,开它就是丢历史 → BLOCK;栈不存在 = 全新 account 首次部署,
+# 那正是唯一被支持的开启时机 → 放行。ORCH_STATE=unknown 时不在这里再报一遍 ——
+# 上面 :137 已经为「状态查不出来」记了 BLOCK,重复报只是噪音。
+while IFS='|' read -r AUDIT_KEY AUDIT_NOTE; do
+  [ "$ORCH_STATE" = present ] && [ "$(cfg "$AUDIT_KEY")" = "True" ] \
+    && _block "$AUDIT_KEY=true 只能在全新 account 首次部署时开启 — 存量 RETAIN audit 表会被强制替换并丢失审计历史($AUDIT_NOTE)"
+done <<'EOF'
+audit.cmk_encryption|config.yml.example:637-640
+audit.worm_archive_enabled|config.yml.example:641-646
+EOF
 
 # console_auth.user_pool_id 不能手填:auth.py 会走 legacy 分支建【不带账号后缀】的裸前缀
 # Cognito 域 → 域前缀全局唯一撞名 → 整栈 UPDATE_ROLLBACK(#479 B10 真机复现)。

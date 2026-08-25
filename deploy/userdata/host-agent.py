@@ -6,9 +6,12 @@
 Replaces per-tenant SSM health checks. Runs as systemd service on each host.
 """
 
+import fcntl
 import json
 import os
 import random
+import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -17,6 +20,12 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import boto3
 from botocore.config import Config as BotoConfig
+from botocore.exceptions import (
+    ClientError,
+    CredentialRetrievalError,
+    NoCredentialsError,
+    PartialCredentialsError,
+)
 
 # P2b (2026-07-08): route_ops lives in the same userdata directory. Add it to
 # sys.path so the tenant-route helpers (port bitmap / DNAT / Redis writer /
@@ -90,7 +99,6 @@ def _render_metrics_text(
     Always emits HELP/TYPE headers (even with zero samples) so that scrapers
     that validate metadata don't choke on a quiet host.
 
-    #387: port_stats/agent_stats are OPTIONAL dict snapshots taken by the
     caller (do_GET) from already-initialized singletons/state. This function
     MUST NOT touch _get_port_bitmap() or any lazy-init singleton — rendering
     a metrics page must never mutate global routing state. When port_stats
@@ -220,6 +228,32 @@ def _render_metrics_text(
                 "openclaw_route_ensure_failures_total"
                 f" {int(agent_stats['route_ensure_failures'])}"
             )
+        _bss = agent_stats.get("backup_script_stale")
+        if _bss is not None:
+            out.append(
+                "# HELP openclaw_backup_script_stale 1 if the local backup-data.sh"
+                " is missing or stale, so the host-local backup sweep is REFUSING"
+                " to run. The refusal is fail-closed (a stale script produces"
+                " corrupt/unfindable restore points) but it means this host is"
+                " taking NO local backups — and if the central schedule is also"
+                " disabled, no backups at all. The backup loop's own heartbeat"
+                " stays healthy, so this is the only signal (#469 R7)"
+            )
+            out.append("# TYPE openclaw_backup_script_stale gauge")
+            out.append(f"openclaw_backup_script_stale {int(_bss)}")
+        _vlp = agent_stats.get("backup_vm_left_paused")
+        if _vlp is not None:
+            out.append(
+                "# HELP openclaw_backup_vm_left_paused 1 if a host-local backup left a"
+                " tenant VM PAUSED (bounded resume retries exhausted, or the script was"
+                " SIGKILLed before its EXIT trap finished). The tenant row still says"
+                " running and the health check CANNOT tell the difference — a paused"
+                " Firecracker process is still alive — so this metric is the only signal"
+                " that a customer guest is frozen. The backup loop's own heartbeat stays"
+                " healthy too. Needs a manual resume or a lifecycle op (#469)"
+            )
+            out.append("# TYPE openclaw_backup_vm_left_paused gauge")
+            out.append(f"openclaw_backup_vm_left_paused {int(_vlp)}")
         ssm = agent_stats.get("ssm_agent_up")
         if ssm is not None:
             out.append(
@@ -232,6 +266,31 @@ def _render_metrics_text(
             )
             out.append("# TYPE openclaw_host_ssm_agent_up gauge")
             out.append(f"openclaw_host_ssm_agent_up {1 if ssm else 0}")
+        # 这条答"它在但收不动命令"。判据锚点见 _probe_ssm_buffer_full 的注释。
+        buf = agent_stats.get("ssm_buffer_full")
+        if buf is not None:
+            out.append(
+                "# HELP openclaw_host_ssm_buffer_full 1 if the local SSM agent log"
+                " shows the MDS interactor waiting on a full worker buffer"
+                " (mdsinteractor.go: 'till the buffer is free'), else 0. Early-warning"
+                " only: after the aggregated-dispatch change each host sees <=1-2"
+                " concurrent commands, far from the 5-worker+5-buffer ceiling."
+            )
+            out.append("# TYPE openclaw_host_ssm_buffer_full gauge")
+            out.append(f"openclaw_host_ssm_buffer_full {1 if buf else 0}")
+        drift = agent_stats.get("route_drift")
+        if drift:
+            out.append(
+                "# HELP openclaw_host_route_drift three-set reconciliation drift"
+                " counts. foreign_vm is the cross-host split signal: this host holds"
+                " the VM while the ledger attributes the tenant elsewhere."
+            )
+            out.append("# TYPE openclaw_host_route_drift gauge")
+            for _k in ("orphan_dnat", "missing_dnat", "ghost_descriptor", "foreign_vm"):
+                out.append(
+                    f'openclaw_host_route_drift{{kind="{_k}"}} '
+                    f"{int(drift.get(_k) or 0)}"
+                )
     return "\n".join(out) + "\n"
 
 
@@ -244,6 +303,10 @@ BALLOON_MIN_GUEST_AVAILABLE_MB = int(
 
 # DynamoDB client (region auto-detected from instance metadata)
 _ddb = None
+_cred_lock = threading.Lock()
+_consecutive_cred_failures = 0
+# #549 — 连续凭据失败达到该数就 sys.exit(1),让 systemd Restart=always 重建整个进程
+_CRED_FAILURE_EXIT_THRESHOLD = int(os.environ.get("AGENT_CRED_FAIL_EXIT_THRESHOLD", "12"))
 _status = {}
 _lock = threading.Lock()
 
@@ -254,6 +317,8 @@ _agent_metrics = {
     "loop_last_tick": {},  # loop_name -> unix epoch of last completed pass
     "route_ensure_failures": 0,  # counter: skip-promote route failures
     # "build_sha" set once in main(); "ssm_agent_up" set by poll loop probe.
+    #      "route_drift" 由 _report_route_drift 设。两者都不预置键 —— 未探测过时
+    #      /metrics 里对应序列缺席,而不是谎报 0(与 port_stats=None 同一范式)。
 }
 
 
@@ -467,12 +532,75 @@ def _resolve_region():
 def _get_ddb():
     global _ddb
     if _ddb is None:
-        _ddb = boto3.resource(
+        # #549 — 用全新 Session(而非 boto3.resource 走的默认 session)重跑凭据链:
+        # botocore 在 create_client 时一次性把凭据绑到 signer,启动瞬间 IMDS 抖动会把
+        # 该 client 永久绑成"无凭据"。_reset_ddb_clients() 置 None 后,这里以新 session 重建
+        # 才能真正逃出坏凭据,与 _get_disk_ddb/_get_backup_ddb 同款。
+        _ddb = boto3.Session().resource(
             "dynamodb",
             region_name=_resolve_region(),
             config=BotoConfig(retries={"max_attempts": 2}),
         )
     return _ddb
+
+
+def _is_credential_error(exc) -> bool:
+    """凭据类异常:client 在创建瞬间把 credentials 绑到 signer,若那一刻 IMDS 抖动解析为
+    None,则该 client 之后每次请求都 NoCredentialsError,IMDS 事后恢复也没用。这类异常必须
+    让缓存的 resource 失效重建(用全新 Session 重跑凭据链),否则进程永久失效。"""
+    if isinstance(exc, (NoCredentialsError, CredentialRetrievalError, PartialCredentialsError)):
+        return True
+    if isinstance(exc, ClientError):
+        code = (getattr(exc, "response", None) or {}).get("Error", {}).get("Code", "")
+        return code in (
+            "ExpiredToken",
+            "ExpiredTokenException",
+            "RequestExpired",
+            "RequestExpiredException",
+        )
+    return False
+
+
+def _reset_ddb_clients() -> None:
+    """凭据失败后废弃所有缓存的 DDB resource,下次取用时以全新 Session 重建。"""
+    global _ddb, _disk_ddb, _backup_ddb
+    with _cred_lock:
+        _ddb = None
+        _disk_ddb = None
+        _backup_ddb = None
+
+
+def _note_ddb_ok() -> None:
+    """一次 DDB 调用成功即清零连续凭据失败计数(自愈成功)。"""
+    global _consecutive_cred_failures
+    with _cred_lock:
+        _consecutive_cred_failures = 0
+
+
+def _handle_ddb_exc(exc, label: str) -> None:
+    """统一处理 DDB 调用异常:打印(non-fatal)保留原日志文案;若是凭据类异常则废弃缓存
+    client 触发重建并累计连续失败;连续超阈值则 sys.exit(1) 让 systemd Restart=always 接管。"""
+    global _consecutive_cred_failures
+    print(f"{label} (non-fatal): {exc}")
+    if not _is_credential_error(exc):
+        return
+    _reset_ddb_clients()
+    with _cred_lock:
+        _consecutive_cred_failures += 1
+        n = _consecutive_cred_failures
+    if n == 1:
+        print(
+            f"{label}: credential error — invalidated cached DDB clients; "
+            "will rebuild with a fresh boto3 session on the next tick (#549)"
+        )
+    if n >= _CRED_FAILURE_EXIT_THRESHOLD:
+        print(
+            f"host-agent: {n} consecutive credential failures >= "
+            f"{_CRED_FAILURE_EXIT_THRESHOLD}; exiting so systemd Restart=always rebuilds "
+            "the process (tenant VMs survive: KillMode=process, #323/#435) (#549)"
+        )
+        sys.stdout.flush()
+        sys.exit(1)
 
 
 _recovering = set()  # Track VMs being recovered to avoid duplicate launches
@@ -522,7 +650,6 @@ def _launch_argv(*args):
 def _recover_vm(tenant_id, cfg):
     """Launch VM that has vm.json but no running Firecracker process.
 
-    #315 修 _recovering 永久泄漏(真机 28/300 卡 creating 根因):旧版只在 Popen 抛异常时
     discard,起 VM 子进程失败(flock-skip rc75 / START 后被杀 / 半成品)【不抛异常】→
     _recovering 永留 → 下个 probe `if tid in _recovering: return` 永久跳过 → recover 只试
     一次、失败即永久卡(host-agent.py 的 discard 只在 fc_running=True 才走到)。
@@ -857,6 +984,116 @@ def _get_disk_ddb():
     return _disk_ddb
 
 
+# 为什么必须下沉(算数,不是偏好):中心方案是 EventBridge rate(30 minutes) → 一个
+# Lambda 每次备 BACKUP_BATCH_LIMIT(20)个,即 40 个/小时、24 小时上限 960 个。而目标
+# 是 10 万租户每 24h 全量一次 —— 差约 104 倍;连 1000 个租户都要 25h > 24h 间隔。
+# 下沉后每台机器只管自己的租户、并发天然按机器打散:按 ADR 真机实测(单备份最坏 22s、
+# 本地并发 2),一台 380 租户最坏 1.2h/轮、1000 租户 3.1h/轮,都远小于 24h。
+#
+# 范围(只做 R7 字面要求,不扩):本线程只接【定时全量】这一路。手动/删前/迁移前的
+# 单租户即时备份仍走 openclaw-backup Lambda 的 tenant_id 入口(tenant_service 的
+# 删前 fail-closed 依赖它同步返回成败),本改动不碰那条路。
+# 备份任务状态机、间隔在线改、单租户跨机搬迁属 ADR-tenant-backup-host-local-scheduling
+# 的 F1 剩余部分与 F2/F3,该 ADR 仍是 Proposed(未经客户 sign-off),不在本次范围。
+_BACKUP_LOOP_ENABLED = os.environ.get("OC_BACKUP_LOOP", "1") not in ("0", "false", "")
+# tick 60s:间隔是小时级,tick 只决定"到期后多久被发现",60s 足够且不空转打 DDB。
+_BACKUP_TICK_SEC = int(os.environ.get("OC_BACKUP_TICK_SEC", "60"))
+_BACKUP_INTERVAL_HOURS = float(os.environ.get("OC_BACKUP_INTERVAL_HOURS", "24"))
+# 本轮【串行】备,不开本地并发。算数够用:单备份最坏 22s(ADR §2.4 真机),一台 1000
+# 租户串行也只要 6.1h/轮 ≪ 24h 间隔;而 ADR 同一处实测"一个 pigz 就能吃满 16 核",
+# 并发只是互相抢 CPU,与 R7"不抢客户 CPU"的要求相反。需要并发时再加,不预留空参数。
+# R7 明确要求"备份前识别当前 CPU 负载,有大量用户占用 CPU 时不抢 CPU 做备份"。
+# 判据用 1 分钟 loadavg / 核数:>0.7 即认为用户负载已高,本轮整体让路(不是逐个跳过 ——
+# 逐个跳过会在高负载下反复起 pigz 又退,依然抢 CPU)。备份晚几十分钟无所谓(间隔 24h),
+# 抢了客户的 CPU 是真问题。
+_BACKUP_LOAD_CEILING = float(os.environ.get("OC_BACKUP_LOAD_CEILING", "0.7"))
+# 让路必须有【上界】(codex 独立复审第三轮)。原实现只要负载持续高于阈值就无限期跳过,
+# 一台长期繁忙的 host 会永远不备份 —— 而中心调度关掉后没有第二个执行者兜底,于是
+# 24 小时的备份保证被静默违反。我此前在证据里写"备份晚几十分钟无所谓(间隔 24h)"
+# 是对的,但没上界的让路不是"晚几十分钟",是"永远不备"。
+#
+# 判据用【最久没备的那个租户已经过期多久】,而不是"让路了几轮":前者直接对应要守的
+# SLA(24h),后者与 SLA 无关(tick 变了含义就变)。超过硬上限就不再让路,改用
+# nice/ionice 降优先级跑 —— 抢一点 CPU 也比丢掉备份保证强,而降优先级让这个代价可控。
+_BACKUP_MAX_DEFER_HOURS = float(os.environ.get("OC_BACKUP_MAX_DEFER_HOURS", "6"))
+# 软到期阈值(codex 独立复审第六轮)。让路预算必须【从 interval 里切出来】而不是叠在
+# 它之上,否则最坏年龄 = interval + MAX_DEFER = 30h,而配置明写「至少每 24h」
+# (config.yml.example:189)。软到期开始尝试、硬期限(= interval)必须跑,最坏年龄 =
+# interval。clamp 到 (0, interval]:MAX_DEFER 被配成 ≥ interval 时不能把阈值压到 0 或负
+# (那会变成每 tick 都备),取一个下界 = interval 的一半,并保持"软 ≤ 硬"。
+# MAX_DEFER=0 → 软硬重合,退回单一阈值、完全不让路。
+def _backup_soft_interval_hours(tenant_count=0):
+    """软到期阈值(小时)。随【本机租户数】自适应 —— codex 独立复审第十二轮。
+
+    让路预算必须从 interval 里切出来(第六轮),但切多少不能是定值:排空是【串行】的,
+    队列越长需要的提前量越大。ADR 的规模基准是「一台 host 最多 1000 个租户(用户确认)」,
+    按单租户最坏 22s 算,满载排空 6.1h —— 若软到期固定在 interval-6h=18h,而插队点又被
+    压在 interval-3h=21h(我第九轮夹了半个预算),队尾会到 27h,而配置写的是「至少每 24h」。
+    **那是在受支持密度下承诺就不成立**,不是"容量规划"能解释掉的。
+
+    所以提前量取 max(让路预算, 满载排空估算):
+      · 租户少 → 由让路预算主导(默认 6h),行为与第六轮一致;
+      · 租户多 → 由排空估算主导,自动提早开始尝试,保证整条队列在 interval 内备完。
+
+    下界仍夹在 interval/2:排空估算超过它意味着这台机器的密度已经超出串行方案的能力,
+    再往前挪只会把节拍压到不可接受(备份次数翻倍)。那种情形的解法是开本地并发或降
+    interval —— 属容量规划,已记入 UNRESOLVED_GAPS。用 22s(最坏值)而不是典型秒级:
+    低估提前量会漏备,高估只是多备几次(ADR 的 ~1h/轮 用的是典型值,这里刻意保守)。
+
+    tenant_count=0(调用方还不知道租户数)时退化成"只由让路预算决定",即第六轮的行为。
+    """
+    _lead = _BACKUP_MAX_DEFER_HOURS
+    if tenant_count > 0:
+        _lead = max(_lead, tenant_count * _BACKUP_PER_TENANT_ESTIMATE_SEC / 3600.0)
+    return max(_BACKUP_INTERVAL_HOURS / 2.0, _BACKUP_INTERVAL_HOURS - _lead)
+
+
+# 兼容既有引用与测试:默认(不看租户数)的软阈值。
+_BACKUP_SOFT_INTERVAL_HOURS = _backup_soft_interval_hours()
+# 单租户备份耗时估值,只用来算"整条队列还要多久排空"(codex 第九轮)。
+# 22s = ADR §2.4 的真机实测【最坏值】(8G 盘含加密+上传),与 :927 那段算数同源 ——
+# 那里用它推出"380 租户 2.3h/轮、1000 租户 6.1h/轮"。取最坏值而不是均值:低估排空时间
+# 会让队尾租户超出 interval,而那正是这个估值要防的事;高估只是早一点开始插队。
+_BACKUP_PER_TENANT_ESTIMATE_SEC = float(
+    os.environ.get("OC_BACKUP_PER_TENANT_ESTIMATE_SEC", "22")
+)
+# 降优先级跑的 nice 值。19 = 最低优先级:只吃别人不要的 CPU 时间片。
+_BACKUP_NICE = os.environ.get("OC_BACKUP_NICE", "19")
+# 单个租户备份的墙钟上限。实测最坏 ~22s(8G 盘含加密+上传),300s 留足余量;超时即放弃
+# 该租户本轮(不写 last_backup_at → 下轮自然重试),不让一个卡住的备份占死信号量。
+_BACKUP_PER_TENANT_TIMEOUT = int(os.environ.get("OC_BACKUP_TIMEOUT_SEC", "300"))
+# 超时后先 SIGTERM 给 backup-data.sh 的 EXIT trap 留出清理时间(它要 rm 临时文件 +
+# 把 Paused 的 VM Resume 回来),这段时间过完仍不退才 SIGKILL。
+#
+# ㉕ 这个值必须【大于 cleanup 的有界最坏耗时】(codex 独立复审第二十一轮)。
+#
+# 原值 15s,注释写着"cleanup 只有一次本地 rm 与一次 unix-socket curl,都是秒级"。
+# 那句话在 backup-data.sh 的 ㉑(resume 改成有界重试)之前是真的,㉑ 把它变成了假话:
+# 现在 cleanup 会重试 5 次、间隔 1+2+3+4 秒,每次 curl 上限 5s ——
+#     最坏 = 5 × 5s(curl) + (1+2+3+4)s(退避) = 35s
+# 15s 的宽限期会在 Resume 还没做完时就 SIGKILL,**客户 VM 永久留在 Paused**,
+# 正是 ㉑ 本身要消灭的后果。抬到 60s,留 25s 余量;仍远小于 _BACKUP_PER_TENANT_TIMEOUT=300。
+#
+# 这两个数字分处 bash 与 Python、无法共享常量,所以加了一道 parity 测试把它们锁在一起
+# (tests/test_469_r7_host_backup_loop_adversarial.py::TestResumeBudgetFitsInTheTermGrace):
+# 谁改一边忘了另一边,那条就红。这与仓里 host-pin-parity 挡内核 pin 漂移是同一个手法。
+_BACKUP_TERM_GRACE_SEC = int(os.environ.get("OC_BACKUP_TERM_GRACE_SEC", "60"))
+_backup_ddb = None
+_BACKUP_DDB_CFG = BotoConfig(
+    connect_timeout=3, read_timeout=10, retries={"total_max_attempts": 3}
+)
+
+
+def _get_backup_ddb():
+    """备份线程专属 DDB resource(独立 Session;boto3 resource 非线程安全,同 #340)。"""
+    global _backup_ddb
+    if _backup_ddb is None:
+        _backup_ddb = boto3.Session().resource(
+            "dynamodb", region_name=_resolve_region(), config=_BACKUP_DDB_CFG
+        )
+    return _backup_ddb
+
+
 def _data_disk_free_mb():
     """#340 — host /data 物理剩余可用空间(MB),给 dispatch 的磁盘软门用。
 
@@ -943,6 +1180,41 @@ def _read_image_slots():
         return None
 
 
+# 所以它天然是"这个进程是不是换了一个"的判据:随心跳上报,控制面比对上轮值,变了就是
+# agent 重启过。为什么需要它:ping 通 + gateway 200 在"崩了又被拉起、内存态全丢"时照样绿,
+# 那种假活只有靠"进程换代"才看得出来。
+_AGENT_STARTED_AT = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+# 答不了"它在但收不动命令"。判据锚点来自 ADR-controlplane-sqs-batch-dispatch.md:74:
+# buffer 满每 10s 重试,源码 mdsinteractor.go:522-536,日志行是
+# "Will wake up every 10 seconds till the buffer is free"。
+# 按 ADR Q3 的结论,聚合下发落地后每 host 同时 ≤1-2 条命令、已远离该区间,所以这是
+# 【早期预警】信号,不是当前主故障源 —— 别把它当主解用。
+_SSM_AGENT_LOG = "/var/log/amazon/ssm/amazon-ssm-agent.log"
+_SSM_BUFFER_FULL_MARK = "till the buffer is free"
+
+
+def _probe_ssm_buffer_full() -> None:
+    """扫 SSM agent 日志尾部找 buffer-full 标记,结果缓存进 _agent_metrics。
+
+    只读日志尾部(最后 64KB):日志会长到几十 MB,整读会在每个 poll 周期烧掉 IO。
+    读不到文件 / 读失败一律记 False 而不是 None —— 这是预警信号,不是门,不该因为
+    日志轮转就把 host 判病。
+    """
+    hit = False
+    try:
+        with open(_SSM_AGENT_LOG, "rb") as fh:
+            try:
+                fh.seek(-65536, os.SEEK_END)
+            except OSError:
+                fh.seek(0)  # 文件比 64KB 小
+            hit = _SSM_BUFFER_FULL_MARK in fh.read().decode("utf-8", "replace")
+    except Exception:
+        hit = False
+    with _lock:
+        _agent_metrics["ssm_buffer_full"] = hit
+
+
 def _write_host_heartbeat():
     """Update host liveness and continuously reconcile the slots.json DDB mirror.
 
@@ -975,21 +1247,51 @@ def _write_host_heartbeat():
             values.update(
                 {":mt": _mem_total, ":ma": _mem_avail, ":mts": int(time.time())}
             )
+        # 重启过。恒写是刻意的 —— 条件写会让"从没上报过"和"上报过但没变"混在一起,而前者
+        # 恰恰是刚重启完那一轮。
+        expression += ", agent_started_at = :ast"
+        values[":ast"] = _AGENT_STARTED_AT
+        # ssm_buffer_full 只进 /metrics,控制面两个都看不见,也就没法做跨 host 汇总。
+        with _lock:
+            _buf_full = _agent_metrics.get("ssm_buffer_full")
+            _drift = dict(_agent_metrics.get("route_drift") or {})
+        if _buf_full is not None:
+            expression += ", ssm_buffer_full = :sbf"
+            values[":sbf"] = bool(_buf_full)
+        if _drift:
+            # 在别台。单机视角只看得见这一半,控制面汇总各 host 的这一半才拼出全貌。
+            expression += (
+                ", drift_ghost_descriptor = :dgd, drift_foreign_vm = :dfv, "
+                "drift_check_ts_epoch = :dts"
+            )
+            values.update(
+                {
+                    ":dgd": int(_drift.get("ghost_descriptor") or 0),
+                    ":dfv": int(_drift.get("foreign_vm") or 0),
+                    ":dts": int(time.time()),
+                }
+            )
         table.update_item(
             Key={"instance_id": INSTANCE_ID},
             UpdateExpression=expression,
             ExpressionAttributeValues=values,
         )
+        _note_ddb_ok()
     except Exception as e:
         # Heartbeat failures must never crash the poll loop.
-        print(f"host heartbeat failed (non-fatal): {e}")
+        _handle_ddb_exc(e, "host heartbeat failed")
 
 
-def _refresh_health(table, tid, info, now, metrics):
+def _refresh_health(table, tid, info, now, metrics, host_port=None):
     """Health-refresh write for a tenant NOT promoted this tick (already
     running, still creating with the gateway not up yet, or down).
 
-    #237 — beyond the health fields, reconcile `guest_ip` to the data-plane
+    `host_port` (#526): pass the value `_ensure_route` just returned so the
+    record's advertised port is reconciled to the live bitmap/DNAT truth — same
+    reasoning as guest_ip below. Pass None from the call site that never ran
+    `_ensure_route` (health-only refresh for a down VM): writing an empty value
+    would wipe the previous truth.
+
     truth carried up from the local vm.json. A control-plane↔data-plane drift
     (DDB records a guest_ip the host never actually booted — e.g. DDB .30 while
     the host launched .26) otherwise festers as a ghost forever: the promote
@@ -1055,6 +1357,31 @@ def _refresh_health(table, tid, info, now, metrics):
         # 同进同退,否则会出现新版本配旧启动时刻的错配组合。
         expr += ", observed_boot_at = :oba"
         vals[":oba"] = info.get("observed_boot_at") or ""
+    # 病史:restore 由控制面用 legacy 公式 VM_PORT_BASE + vm_num - 1 算 host_port 并直接
+    # 翻 running,而那个端口族【从未落到 iptables】(ssm_dispatch 的 "never consumed by
+    # Edge" 注释,同段还明确 "Keep host_port in the record for the live bitmap route")。
+    # 真值只在本机 bitmap 分配器手里(route_ops.ensure_port_and_dnat)。create 路径靠
+    # promote 覆盖,restore 收尾直接翻 running → promote 的 `#s = :c` 闸门再也命中不了,
+    # DDB 永久停在 legacy 值:edge 拿它转发到一个本机不存在的端口 → 客户不可达,而
+    # vm_health/app_health 全绿(真机实测 DDB 21643 / Redis+iptables 10785,25 个在役租户)。
+    #
+    # 为什么修在这里而不是 restore 里:restore 是同步 API,受 API GW 集成超时 29s 硬限
+    # (实测该路径 Lambda Duration p90 18.7s / p99 44.4s 已贴墙),再插两次 SSM 往返
+    # (各 ~3.7s)会把更多调用推过线 —— 修在控制面反而制造 504。而本函数每 tick 都跑、
+    # host_port 已在上游 _ensure_route 算好,顺带写回零额外成本,约一个 tick 内自动收敛,
+    # 且存量错值一并自愈。
+    #
+    # 只在有值时写(同下方 observed_image_snapshot_time 的取舍):调用方在"未跑
+    # _ensure_route"的分支传 None,写空会把上一次的真值抹掉。
+    #
+    # 两道守卫已够,不需新增(见本函数 docstring):
+    #   · attribute_exists(id) — 不复活已删租户
+    #   · host_id = :self      — 迁移 drain 窗口里源 host 上残留的 VM 不能覆写
+    #     migration 刚 repoint 到 target 的记录(migration commit 在同一条 SET 里把
+    #     host_id 切到 target,故源 host 的 :self 不匹配 → 干净 CCF)
+    if host_port is not None:
+        expr += ", host_port = :hp"
+        vals[":hp"] = int(host_port)
     names = None
     if metrics is not None:
         expr += ", #m = :m"  # `metrics` is a DDB reserved keyword — alias via #m.
@@ -1245,7 +1572,13 @@ def _write_ddb(results):
                     # running (normal — just refresh), deleted / migrated away, OR
                     # 【绝不复活】。回落 guarded refresh(attribute_exists(id) + host_id);
                     # 已释放租户 host_id 没了 → refresh 的 host_id 守卫也 CCF → 干净 no-op。
-                    _refresh_health(table, tid, info, now, metrics)
+                    #
+                    # #526 —— 这条分支正是【已 running 的租户每 tick 走的路】,而 host_port
+                    # 已由上方 _ensure_route 算出真值。restore 过的租户 DDB 里存的是控制面
+                    # legacy 公式的产物(从未落到 iptables),在此顺带对账回真值:漂移一个 tick
+                    # 内自动收敛,存量错值也一并自愈。promote 那条 `#s = :c` 闸门永远命中不到
+                    # 它们,所以必须在这条回落路径上修。
+                    _refresh_health(table, tid, info, now, metrics, host_port=host_port)
             else:
                 # Not promoted this tick (still creating w/ gateway not up, or a
                 # health-only refresh for a down VM). Reconcile + guard in the
@@ -1738,18 +2071,49 @@ _PURGE_PREFIX = ".purge-"  # 平级 tombstone: /data/firecracker-vms/.purge-<tid
 _disk_gc_cursor = (
     ""  # 轮转游标:上轮处理到的最后一个 tombstone 名,下轮从它之后起(防饥饿)
 )
+#
+# 撤回理由(Codex 独立复审 CHANGES_NEEDED,判定成立):tombstone 上**没有记它是为哪一次
+# delete 铸的**,所以一张过期的旧票会被当成对【当前】这次删除的授权。失败链:
+#   ① 一次 keep_data=false 的 delete 落了票,随后 rm 被中断【或整条 delete 回滚】——
+#      而回滚路径**不清票**(delete-vm.sh 只在第 ④ 步 rm 成功后才 `rm -f` 票);
+#   ② 租户继续存活(或被 rebuild),盘上那张票一直留着;
+#   ③ 后来客户用 keep_data=true 软删它 —— 软删【同样经过 deleting】
+#      (tenant_service.py:3144 的 deleting CAS 没有 keep_data 条件);
+#   ④ 老化判据于是全部满足 → 删掉一份客户明确要求保留的数据盘。no-data-loss 违规。
+# `delete-vm.sh:158` 的注释早就点出过这张残留票的危险(「租户后续若被软删重建…GC 会凭这张
+# 陈旧票删掉本该保留的盘」);当时读到了却把它当成"接管有价值(销毁过期票)"的论据,没看出
+# 接管本身也在**使用**那张过期票。
+#
+# 四种零 schema 的补救都试过,没有一个严密:
+#   · 比对 `active_lifecycle_op_id` —— delete 回滚会释放围栏,基准随之消失;
+#   · 比对 `created_at` 世代 —— 上述链里 created_at 没变,挡不住;
+#   · 要求 `vm.json` 不存在 —— delete-vm.sh 第 ② 步**无条件**删 vm.json,只覆盖一半;
+#   · 比对 tombstone mtime 与 VM_DIR mtime —— `rm -rf` 中断会改目录 mtime,判据反向。
+# 结论:tombstone 不是 purge intent token 的等价物,它缺了 token 的核心性质 ——
+# (双侧持久化 + 精确匹配),那要碰 delete 主路径与一个持久字段,属 issue 自己写明的
+# 人工红线大改。故 DoD-b 留作未兑现,不在此处用一个不严密的判据充数。
+#
+# preserved`(断言「status=deleting must not be reclaimed」)。当时那个老化接管是加在
+# `elif` 分支上,而那条既有测试用的是**新鲜票**,所以它没红 —— 于是被误读成"不冲突"。
+# **既有护栏没红 ≠ 没违反它守的契约**;它只覆盖了新鲜票那一档。
+#
+# 双门此刻同样会误删软删盘 —— 软删走完也是 deleted。撤回只是不再扩大那个窗口。
 
 
 def _gc_orphan_vm_dirs():
-    """回收 delete 侧 rm -rf 漏删的 VM 目录(兜底 GC)。双门确认,绝不误删有效数据:
+    """回收 delete 侧 rm -rf 漏删的 VM 目录(兜底 GC)。多门确认,绝不误删有效数据:
 
-    判据(两条都满足才删):
+    判据:
       ① 存在平级 tombstone `.purge-<tid>` —— 控制面 delete(keep_data=false)在 rm -rf 前
          写的"该数据盘应销毁"持久信号,放【VM 目录外】故 rm -rf <tid> 中断也不丢(codex:
          标记在被删目录内会随半删消失)。keep_data=true 软删不写 tombstone → 保盘。
-      ② DDB 强一致读该租户 status=deleted —— 确认删除【已完成】。deleting(备份/停机前、
-         可回滚 running)、记录不存在(同 id 重建的最终一致空窗口,误删新盘)一律【不删】
-         (codex 复审:只认明确 deleted,强一致读避开重建竞态)。
+      ②' #339 目标② —— 抢到 per-tenant flock(`oc-launch-<tid>.lock`,与 launch-vm.sh /
+         delete-vm.sh / backup-data.sh 同一把)。抢不到 = 有人正在动这个租户,跳过。
+         必须在门② 之【前】:否则读与 rm 之间仍是裸窗口。
+      ② 持锁后 DDB 强一致读该租户 status=deleted —— 确认删除【已完成】。deleting(备份/
+         停机前、可回滚 running)、记录不存在(同 id 重建的最终一致空窗口,误删新盘)一律
+         【不删】(codex 复审:只认明确 deleted,强一致读避开重建竞态)。
+         `deleting` 的老化接管试过又撤回了,理由见上方 #339 那段长注释。
     删成功后清 tombstone。任一查询/删除异常 → 跳过(no-data-loss:绝不因不确定而删)。
     每轮回收上限,余量下一轮继续。
     """
@@ -1792,25 +2156,43 @@ def _gc_orphan_vm_dirs():
             print(f"disk-gc: unsafe tid from tombstone {name!r} — skip")
             continue
         tomb = os.path.join(VM_DIR, name)
-        # 门②:强一致读,只认明确 deleted。异常/deleting/记录不存在 → 跳过(不删)。
-        try:
-            item = table.get_item(
-                Key={"id": tid},
-                ConsistentRead=True,
-                ProjectionExpression="#s",
-                ExpressionAttributeNames={"#s": "status"},
-            ).get("Item")
-        except Exception as e:
-            print(f"disk-gc: DDB get {tid} failed (skip): {e}")
+        #
+        # 顺序是这条护栏的全部:此前门② 的读与 `rm -rf` 之间是裸窗口,同 id 重建的租户在
+        # 当时只在控制面侧堵了入口 —— tenant_service.py:5157 拒绝 deleted/deleting 的
+        # mutating action。那道门管不到 host 侧的 launch 重投)。加锁后:
+        #   · launch-vm.sh:403 / delete-vm.sh:69 / backup-data.sh 与这里争同一把 inode
+        #     advisory 锁 → 抢到即证明此刻没有任何一方在动这个租户的盘;
+        #   · 抢到锁之后才读的 status,到 rm 为止不可能再被 host 侧改。
+        # `wait_sec=0` 纯非阻塞:GC 是 60s 一轮的巡检线程,一点也不需要等 —— 抢不到就是
+        # 就是为了不阻塞 host heartbeat)。
+        _gc_lock_fd = _acquire_tenant_lock(tid, wait_sec=0, who="disk-gc")
+        if _gc_lock_fd is None:
             continue
-        if not item or item.get("status") != "deleted":
-            continue
         try:
-            subprocess.run(["rm", "-rf", vm_path], check=True, timeout=30)
-            os.remove(tomb)  # 删净后清 tombstone(下轮不再扫);删失败留着下轮重试
-            reclaimed += 1
-        except Exception as e:
-            print(f"disk-gc: rm -rf {vm_path} failed: {e}")
+            # 门②:强一致读。异常/记录不存在 → 跳过(不删)。
+            try:
+                item = table.get_item(
+                    Key={"id": tid},
+                    ConsistentRead=True,
+                    ProjectionExpression="#s",
+                    ExpressionAttributeNames={"#s": "status"},
+                ).get("Item")
+            except Exception as e:
+                print(f"disk-gc: DDB get {tid} failed (skip): {e}")
+                continue
+            # 只认明确 deleted。`deleting`(可回滚)、记录不存在(同 id 重建的最终一致空
+            if not item or item.get("status") != "deleted":
+                continue
+            try:
+                subprocess.run(["rm", "-rf", vm_path], check=True, timeout=30)
+                os.remove(tomb)  # 删净后清 tombstone(下轮不再扫);删失败留着下轮重试
+                reclaimed += 1
+            except Exception as e:
+                print(f"disk-gc: rm -rf {vm_path} failed: {e}")
+        finally:
+            # 关 fd 即释放 flock。必须在 finally:上面任一 continue/异常若漏掉这一步,
+            # 这把锁会被 GC 线程一直持着,把该租户的 launch/delete/backup 全部锁死。
+            os.close(_gc_lock_fd)
     if reclaimed:
         print(f"disk-gc: reclaimed {reclaimed} purged-tenant VM dir(s) from {VM_DIR}")
     return reclaimed
@@ -1826,6 +2208,564 @@ def _disk_gc_loop():
             print(f"disk-gc loop error (non-fatal): {e}")
         _agent_loop_tick("disk_gc")  # #387 self-stamped
         time.sleep(_DISK_GC_INTERVAL_SEC)
+
+
+def _backup_now_iso():
+    """UTC ISO8601,与中心 Lambda 写 last_backup_at 的格式一致(backup/handler.py:176
+    `datetime.now(timezone.utc).isoformat()`)。两侧必须同格式 —— 到期判断要能解析对方
+    写的值,否则切换期间会被当成"解析不了"而每轮重备。"""
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
+
+
+#
+# backup-data.sh 的 EXIT trap 在有界 resume 全部用尽时打这个串。它是【机器判据】,
+# 与 backup Lambda(deploy/lambda/backup/handler.py)认的是同一个串 —— 三跳都靠它对齐,
+# 没有共享常量,所以有一道 parity 测试盯着(tests/test_469_r7...::TestVmLeftPausedSentinel)。
+_BACKUP_VM_LEFT_PAUSED_SENTINEL = "OC_BACKUP_VM_LEFT_PAUSED"
+
+
+def _backup_left_vm_paused(out, err):
+    """脚本输出里是否出现「VM 被留在 Paused」哨兵。两个流都看 —— log() 写 stdout,
+    但 SIGTERM 打断时缓冲的去向不确定,只看一个流会漏。"""
+    return _BACKUP_VM_LEFT_PAUSED_SENTINEL in ((out or "") + (err or ""))
+
+
+def _note_vm_left_paused(tid, why):
+    """fail-loud + 置一个【持久指标】。
+
+    为什么必须有指标而不只是日志:租户行仍然是 running,而健康检查分不出 Paused 与
+    Running(一个 Paused 的 Firecracker 进程照样活着)。**没有这个指标,一个冻住的客户 VM
+    在系统里就是完全不可见的** —— 这正是 #469 零节 S1/S2 说的那类失效。
+    备份循环自己的心跳照常健康,所以它也救不了。
+
+    与 backup_script_stale 同款:置在 _agent_metrics 里,由 _render_metrics_text 渲染成
+    openclaw_backup_vm_left_paused 供抓取与告警。不在这里尝试自己 resume —— 那需要
+    per-tenant 锁(此刻脚本刚被杀,锁的归属不确定),盲发 Resume 会和下一轮备份或一次
+    迁移交错。信号交给运维/下一轮扫描,动作留给持锁的一方。
+    """
+    print(
+        f"backup: {tid} FATAL — the VM was NOT confirmed resumed ({why}). "
+        "The tenant row still says running while the guest is frozen; health checks "
+        "cannot tell the difference. Resume it on the host or force a lifecycle op. "
+        f"(metric: openclaw_backup_vm_left_paused)"
+    )
+    _agent_metrics["backup_vm_left_paused"] = 1
+
+
+def _cpu_load_ratio():
+    """1 分钟 loadavg / 核数。读不到返 None(判定侧当"不确定",按放行处理)。
+
+    为什么用 1 分钟而不是 5/15 分钟:要的是"此刻用户在不在用 CPU",15 分钟均值会让
+    刚结束的高负载继续压着备份、也会让刚开始的高负载被稀释掉。
+    为什么除以核数:loadavg 是绝对可运行队列长度,96 核机器 load=8 其实很闲。
+    """
+    try:
+        with open("/proc/loadavg") as fh:
+            one_min = float(fh.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+    cores = os.cpu_count() or 1
+    return one_min / cores
+
+
+def _backup_due(last_backup_at, now_epoch, interval_hours):
+    """纯函数:该租户是否到期该备份。
+
+    从未备份过 → 立即到期。解析不了时间戳 → 也当到期(宁可多备一次,不漏备:
+    漏备会让 RPO 静默失效,多备只是多花一次秒级操作)。
+    """
+    if not last_backup_at:
+        return True
+    try:
+        from datetime import datetime, timezone
+
+        dt = datetime.fromisoformat(str(last_backup_at).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return True
+    return (now_epoch - dt.timestamp()) >= interval_hours * 3600
+
+
+# backup-data.sh 的路径与新鲜度哨兵。
+#
+# 哨兵与 **backup Lambda 的自愈判据同源**(deploy/lambda/backup/handler.py:112-118 的
+# 双 grep:oc_flush_guest + OC_BACKUP_SOURCE_ABSENT),再加 R7 自己的 _RUN_ID:
+#   · oc_flush_guest          —— 缺它 = 旧版无 guest flush = 备份丢未落盘的客户数据
+#   · OC_BACKUP_SOURCE_ABSENT —— 机器可判的「源盘不在」哨兵
+#   · _RUN_ID                 —— R7 为「同秒两次备份不撞 key」加的,同时蕴含 per-tenant
+#                                flock 与读 BACKUP_PREFIX 那批改动
+# 两处判据必须同源:各写一套会漂移 —— 那个 Lambda 的注释里记着同类教训(用
+# OC_BACKUP_SOURCE_ABSENT 单独当判据会让自愈分支永远跳过,新版永不被拉取,
+# 「线上修复静默不生效」反复踩)。
+# 判据形态承控制面 ssm_dispatch.host_script_self_heal 的 freshness:「存在」不够,
+# 还要「认得新语义」。
+_BACKUP_SCRIPT = "/home/ubuntu/backup-data.sh"
+_BACKUP_SCRIPT_SENTINELS = ("oc_flush_guest", "OC_BACKUP_SOURCE_ABSENT", "_RUN_ID")
+
+
+def _backup_script_is_current():
+    """backup-data.sh 在位【且】认得 R7 新语义吗?拿不准一律返 False(fail-closed)。
+
+    为什么必须查(codex 独立复审第二轮):`init-host.sh` 只在【开机时】从
+    `s3://$ASSETS_BUCKET/deployment/scripts/` 装这些脚本 —— 既有机器不会重跑它。而 R7
+    把 host 变成定时备份的唯一执行者、中心调度一关,就【没有任何路径】能自愈这个脚本。
+    旧脚本缺 per-tenant flock、缺 guest flush、不读 BACKUP_PREFIX、key 不带 run id,
+    却照样 `exit 0` → 上游把 last_backup_at 往前推,于是持续产出「损坏或找不到」的恢复点。
+    本分支的证据里就实测到过:真机只换了 host-agent.py,那台 host 上的 backup-data.sh
+    仍是旧版(lock=0)。
+
+    只读不改:发现过期就拒绝备份并 fail-loud,【不】在这里自动从 S3 装载 —— 装载会写
+    /home/ubuntu 下的可执行文件,那是 init-host.sh 与部署流程的职责边界;agent 自己去
+    改它等于两个写手抢同一个文件(本轮验证第一次就因误动该路径而回滚过)。
+    """
+    if not os.path.isfile(_BACKUP_SCRIPT) or not os.access(_BACKUP_SCRIPT, os.X_OK):
+        print(f"backup: SKIP whole round — {_BACKUP_SCRIPT} 缺失或不可执行")
+        return False
+    try:
+        with open(_BACKUP_SCRIPT, encoding="utf-8", errors="replace") as fh:
+            body = fh.read()
+    except OSError as e:
+        print(f"backup: SKIP whole round — 读不出 {_BACKUP_SCRIPT}: {e}")
+        return False
+    missing = [s for s in _BACKUP_SCRIPT_SENTINELS if s not in body]
+    if missing:
+        print(
+            f"backup: SKIP whole round — {_BACKUP_SCRIPT} 是旧版(缺 {', '.join(missing)});"
+            "它没有 per-tenant flock / guest flush / BACKUP_PREFIX / 唯一 key,跑它会产出"
+            "损坏或找不到的恢复点而 last_backup_at 照样推进。需随 setup.sh 把 "
+            "deployment/scripts/ 推到本机后才恢复备份。"
+        )
+        return False
+    return True
+
+
+# per-tenant 生命周期锁的路径,与 backup-data.sh:89 / launch/stop/delete/migrate 同一把
+# inode advisory 锁。不新开一把:备份要与那些动作互斥,不只与另一次备份互斥。
+_LIFECYCLE_LOCK_DIR = "/run/lock"
+# -w 30 的同款预算:备份可重投(下轮再来),短暂让位给正在跑的 launch/restore 是对的。
+_BACKUP_LOCK_WAIT_SEC = int(os.environ.get("OC_BACKUP_LOCK_WAIT_SEC", "30"))
+
+
+def _acquire_tenant_lock(tid, wait_sec=None, who="backup"):
+    """取 per-tenant 生命周期锁,返回已持锁的 fd;取不到返 None。
+
+    per-tenant flock」),而它打出 `backup: …锁被占用` 会误导排障。默认值保持 "backup",
+    既有调用点行为逐字节不变。
+
+    为什么锁要在 agent 侧取(codex 独立复审第二/三轮,连点两轮):
+    此前所有权与 status 的检查在 sweep 里做,而 flock 在 backup-data.sh 内部才取 ——
+    两者之间存在窗口。迁移若恰在此间完成,源 host 会用【旧盘】产出一个更新的 S3 对象:
+    最终那次 `host_id = :self` 的 CAS 只挡住 last_backup_at 更新,**S3 对象已经落地
+    且是最新的**,将来恢复选到它就是拿陈旧数据覆盖在役租户。
+    修法只能是「先持锁、再持锁复读校验、然后把 fd 传给脚本」——检查与动作之间不留窗口。
+
+    非阻塞轮询而不是 flock(LOCK_EX) 死等:agent 是单线程 tick 循环,死等会让整个
+    host-agent(健康探测/路由维护/GC)停摆。轮询到超时就放手,下轮再来。
+    """
+    if wait_sec is None:
+        wait_sec = _BACKUP_LOCK_WAIT_SEC
+    path = os.path.join(_LIFECYCLE_LOCK_DIR, f"oc-launch-{tid}.lock")
+    try:
+        os.makedirs(_LIFECYCLE_LOCK_DIR, exist_ok=True)
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError as e:
+        print(f"{who}: {tid} 打不开生命周期锁 {path}: {e}")
+        return None
+    deadline = time.time() + wait_sec
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except OSError:
+            if time.time() >= deadline:
+                os.close(fd)
+                print(
+                    f"{who}: {tid} 生命周期锁被占用 >{wait_sec}s"
+                    "(并发 launch/stop/delete/migrate)— 本轮跳过,下轮再来"
+                )
+                return None
+            time.sleep(1)
+
+
+def _tenant_still_ours(table, tid):
+    """持锁期间强一致复读:仍是 running 且仍归本机?
+
+    与 sweep 里那次读的区别是【ConsistentRead + 在锁内】—— sweep 那次是最终一致读、
+    且读完就放手了。迁移 commit 会在同一条 SET 里切 host_id,持锁复读能看到真相。
+    """
+    try:
+        item = table.get_item(Key={"id": tid}, ConsistentRead=True).get("Item")
+    except Exception as e:  # noqa: BLE001 — 读不到就不备,宁可漏一轮
+        print(f"backup: {tid} 持锁复读失败: {e}")
+        return False
+    if not item or item.get("status") != "running":
+        print(f"backup: {tid} 持锁复读发现 status={item.get('status') if item else None} — 跳过")
+        return False
+    if not INSTANCE_ID or item.get("host_id") != INSTANCE_ID:
+        print(
+            f"backup: {tid} 持锁复读发现 host_id={item.get('host_id')} != {INSTANCE_ID}"
+            " —— 迁移已在检查与取锁之间完成,拒绝上传陈旧盘"
+        )
+        return False
+    return True
+
+
+def _backup_one_tenant(tid, nice=False, table=None):
+    """备份单个租户:直接调 host 本地的 backup-data.sh(单租户原子操作,契约不变)。
+
+    成功才写 last_backup_at —— 它同时是"到期判断"的依据,失败不写则下轮自然重试,
+    这就是重试机制本身,不需要另建状态。写失败(DDB 抖)也不算成功:宁可下轮重备,
+    也不能让 last_backup_at 缺失却以为备过了。
+
+    脚本自己 source /etc/platform.env 拿桶名与 CMK(见 backup-data.sh:16-18),故这里
+    不传参 —— 不从 Python 侧拼桶名,避免两处配置漂移。
+    """
+    # ── 先持锁,再持锁复读校验,然后把 fd 传下去(codex 连点两轮的迁移窗口竞态)──────
+    # 顺序不可换:检查与动作之间不留窗口。取不到锁就本轮跳过(可重投,下轮再来)。
+    _lock_fd = _acquire_tenant_lock(tid)
+    if _lock_fd is None:
+        return False
+    try:
+        if table is not None and not _tenant_still_ours(table, tid):
+            return False
+        return _run_backup_script(tid, nice=nice, lock_fd=_lock_fd)
+    finally:
+        # 释放:close 会一并释放 flock(锁绑在打开文件描述上)。
+        try:
+            os.close(_lock_fd)
+        except OSError:
+            pass
+
+
+def _run_backup_script(tid, nice=False, lock_fd=None):
+    """真正起 backup-data.sh。lock_fd 非 None 时以 OC_LIFECYCLE_LOCK_FD 继承给它 ——
+    脚本据此复用同一把锁而不是重新 open(backup-data.sh:90;flock 绑在打开文件描述上,
+    新 open 出来的描述不受继承锁保护,会自己阻塞到超时)。
+    """
+    # 超时【不能】用 subprocess.run(timeout=) —— codex 独立复审抓出的真问题:
+    # 它超时后发 SIGKILL,而 backup-data.sh 靠 `trap cleanup EXIT`(:39)在退出时把
+    # 被 Pause 的客户 VM 重新 Resumed(:36)。SIGKILL 不触发 trap → 一次慢备份就把
+    # 客户 VM 永久留在 Paused 状态,那是客户直接可见的故障,比备份失败严重得多。
+    # 正确做法:先 SIGTERM 让 trap 跑完清理,等一小段,仍不退才 SIGKILL 兜底。
+    # 用 start_new_session 起独立进程组,信号发给整组 —— 否则 pigz/openssl/aws 这些
+    # 子进程收不到,shell 退出了它们还在写盘。
+    try:
+        # nice=True 时用 nice/ionice 降优先级(只在"已超硬上限、不能再让路"那轮)。
+        # ionice -c3 = idle 级 IO:只在磁盘空闲时读写,不与客户的 IO 竞争。
+        # 两个命令都可能不存在(最小化镜像),故做存在性回落 —— 降不了优先级也要备,
+        # 丢备份比抢一点 CPU 严重。
+        _cmd = ["/home/ubuntu/backup-data.sh", tid]
+        if nice:
+            if shutil.which("ionice"):
+                _cmd = ["ionice", "-c3"] + _cmd
+            if shutil.which("nice"):
+                _cmd = ["nice", "-n", _BACKUP_NICE] + _cmd
+        # 把持有的锁 fd 继承给脚本:pass_fds 关掉该 fd 的 close-on-exec,
+        # OC_LIFECYCLE_LOCK_FD 告诉脚本复用哪个号(backup-data.sh:90 的既有契约,
+        # delete-vm.sh 也是这么把锁传给 stop-vm.sh 的)。
+        _env = dict(os.environ)
+        _pass = ()
+        if lock_fd is not None:
+            _env["OC_LIFECYCLE_LOCK_FD"] = str(lock_fd)
+            _pass = (lock_fd,)
+        proc = subprocess.Popen(
+            _cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+            env=_env,
+            pass_fds=_pass,
+        )
+    except Exception as e:  # noqa: BLE001 — 一个租户失败绝不能让整个循环崩
+        print(f"backup: {tid} failed to spawn: {e}")
+        return False
+    try:
+        out, err = proc.communicate(timeout=_BACKUP_PER_TENANT_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        print(
+            f"backup: {tid} timed out after {_BACKUP_PER_TENANT_TIMEOUT}s; "
+            "sending SIGTERM so the script's EXIT trap can resume the VM"
+        )
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError) as e:
+            print(f"backup: {tid} SIGTERM failed: {e}")
+        try:
+            # 给 trap 留时间。**注意这里不能再写"cleanup 只做 rm + 一次 curl,秒级够了"**
+            # —— 那句话在 backup-data.sh 的 resume 改成有界重试之后就不成立了,
+            # _BACKUP_TERM_GRACE_SEC 的定义处(㉕)已按最坏 35s 抬到 60s 并加了 parity 测试。
+            out, err = proc.communicate(timeout=_BACKUP_TERM_GRACE_SEC)
+            # ㉙ 【不能无条件宣布"VM resumed"】(codex 独立复审第二十四轮)。
+            #
+            # 这里原来无条件打 "(cleanup ran, VM resumed)"。但 cleanup 的 resume 是【有界
+            # 重试】,用尽仍可能失败 —— 那时它打哨兵 OC_BACKUP_VM_LEFT_PAUSED,而这行日志
+            # 却在宣布成功。租户行仍是 running,健康检查也分不出来(一个 Paused 的
+            # Firecracker 进程照样活着),于是这是一次【静默的客户中断】。
+            #
+            # 这是同一条判断的第五个面:前四面在 Lambda 那条路(rc==89 / rm 失败 /
+            # stop 失败 / 备份失败留 Paused),这一面在 R7 自驱路 —— **我上一轮加了哨兵,
+            # 却只把它接进了 backup Lambda,没接进 host-agent。只建了桥墩没铺桥面。**
+            _left_paused = _backup_left_vm_paused(out, err)
+            if _left_paused:
+                _note_vm_left_paused(tid, "SIGTERM cleanup exhausted its resume retries")
+            else:
+                print(f"backup: {tid} exited after SIGTERM (cleanup ran, VM resumed)")
+        except subprocess.TimeoutExpired:
+            print(f"backup: {tid} ignored SIGTERM, escalating to SIGKILL")
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            out, err = proc.communicate()
+            # SIGKILL 之后 EXIT trap 【没能跑完】,所以 VM 大概率还停着。这里不装作知道
+            # 确切状态,而是按"未确认已恢复"处理 —— 与上面那支同一个信号,让它可被告警。
+            # 原来这里只在日志里说一句 "VM may stay paused" 就 return 了:那等于承认有个
+            # 冻住的客户 VM,然后什么都不做。
+            _note_vm_left_paused(tid, "SIGKILL after SIGTERM was ignored; the EXIT trap "
+                                      "never finished, so the VM was not confirmed resumed")
+        return False
+    except Exception as e:  # noqa: BLE001
+        print(f"backup: {tid} wait failed: {e}")
+        return False
+    if proc.returncode != 0:
+        tail = (err or out or "").strip()[-200:]
+        print(f"backup: {tid} rc={proc.returncode} {tail!r}")
+        # ㉙ 正常退出但非零 —— 同样要看哨兵。脚本在 resume 用尽重试时【就是】非零退出
+        #    (backup-data.sh 的主路径 `if ! oc_resume_vm; then ... exit 1`),所以这条路
+        #    恰恰是"VM 被留在 Paused"最常见的到达方式,不能只打一行 rc= 就算完。
+        if _backup_left_vm_paused(out, err):
+            _note_vm_left_paused(tid, f"script exited rc={proc.returncode} with the VM "
+                                      "still paused")
+        return False
+    try:
+        _get_backup_ddb().Table(TENANTS_TABLE).update_item(
+            Key={"id": tid},
+            UpdateExpression="SET last_backup_at = :t",
+            ExpressionAttributeValues={":t": _backup_now_iso(), ":self": INSTANCE_ID},
+            # 三重条件,每一条都对应一个真实的坏结果:
+            #  · attribute_exists(id) —— 租户可能在这次备份期间被删掉,无条件写会
+            #    upsert 出一个只有 id + last_backup_at 的僵尸行;
+            #  · host_id = :self —— 备份【开始时】归本机不代表【结束时】还归本机
+            #    (迁移就发生在这几十秒内)。若已迁走,这次备的是旧盘,更不该把
+            #    last_backup_at 刷新 —— 那会让新 owner 机以为刚备过而跳过它;
+            #  · 条件不满足时抛 CCF → 本函数返 False → 不计入 done、下轮重来。
+            ConditionExpression="attribute_exists(id) AND host_id = :self",
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"backup: {tid} done but last_backup_at write failed: {e}")
+        return False
+    return True
+
+
+def _backup_sweep(now_epoch=None):
+    """扫本机租户,备到期的那些。返回 (backed_up, skipped_load, due_total)。
+
+    与中心 Lambda 的关键差别:租户来源是 os.listdir(VM_DIR) —— 本机盘上真实存在的,
+    不是全表 scan 再筛 host_id。所以天然只管自己这台,并发按机器打散,且不受 DDB
+    scan 规模影响(10 万租户全表 scan 是中心方案追不上的原因之一)。
+    """
+    if now_epoch is None:
+        now_epoch = time.time()
+    if not TENANTS_TABLE:
+        return 0, 0, 0
+    # 脚本过期就整轮不备(codex 复审第二轮)。放在扫租户【之前】:判据与租户无关,
+    # 早退能省掉整轮 DDB 读;更重要的是这条是 fail-closed —— 宁可不备并 fail-loud,
+    # 也不能让旧脚本产出损坏/找不到的恢复点却把 last_backup_at 往前推。
+    if not _backup_script_is_current():
+        # ⑨ codex 独立复审第六轮 —— fail-closed 必须【可见】,否则就是静默停摆。
+        #
+        # 上面那句"宁可不备并 fail-loud"此前是【假的】:这里只 `return 0, 0, 0`,
+        # 一行日志都没有;而调用方 _backup_loop 随后照常 _agent_loop_tick("backup")
+        # 打健康心跳。叠上 config.yml.example 默认关掉中心调度(上线顺序要求置 false),
+        # 一台脚本没换的既有 host 就是:**两侧都不备份,而所有信号都是绿的**。
+        # 这不是"安全的默认",这是把 no-data-loss 的失效藏起来。
+        #
+        # 所以:① 打一条 grep 得到的 fail-loud 日志;② 记状态并从 /metrics 暴露
+        # openclaw_backup_script_stale,让它可被告警。不自装脚本 —— 自装等于让 host
+        # 自己决定拉哪个版本,而脚本投递归 setup.sh/init-host.sh(那条缺口本身由
+        # tests/test_script_manifest.py 在红,已记入 UNRESOLVED_GAPS)。
+        _agent_metrics["backup_script_stale"] = 1
+        print(
+            "backup: REFUSING to run — /home/ubuntu/backup-data.sh is missing or "
+            "stale (does not contain all required sentinels). NO local backups are "
+            "happening on this host. If the central backup schedule is also disabled "
+            "(s3.backup_central_schedule_enabled=false), this host has NO backup "
+            "mechanism at all. Fix: push the current backup-data.sh to "
+            "s3://$ASSETS_BUCKET/deployment/scripts/ and install it on the host."
+        )
+        return 0, 0, 0
+    _agent_metrics["backup_script_stale"] = 0
+    try:
+        tids = sorted(os.listdir(VM_DIR))
+    except FileNotFoundError:
+        return 0, 0, 0
+    table = _get_backup_ddb().Table(TENANTS_TABLE)
+    # 自适应软到期(codex 第十二轮):用 len(tids) —— 本机租户数,是"这一轮最多要排空多少个"
+    # 的上界,且在读 DDB 【之前】就已知。拿它算提前量,保证整条队列能在 interval 内备完。
+    _soft_h = _backup_soft_interval_hours(len(tids))
+    due = []
+    for tid in tids:
+        if tid.startswith("."):  # tombstone(.purge-<tid>)等非租户目录
+            continue
+        try:
+            item = table.get_item(Key={"id": tid}).get("Item")
+        except Exception as e:  # noqa: BLE001 — 查不到就跳过,下轮再来
+            print(f"backup: read {tid} failed: {e}")
+            continue
+        # 只备在役租户。停机/删除中的盘可能不一致,中心 Lambda 同款守卫
+        # (backup/handler.py:35 只备 running);删前备份走 Lambda 的 pre_delete 入口。
+        if not item or item.get("status") != "running":
+            continue
+        # **本机盘上有目录 ≠ 这个租户归本机**(codex 独立复审抓出的真问题)。
+        # 租户迁走后源机的 VM 目录可能仍在(disk-gc 只清有 tombstone 的),此时两台机器
+        # 的 listdir 都能看到它。若源机照备,它会用【旧盘】产出一个更新的 S3 对象、
+        # 并把 last_backup_at 刷成现在 —— 恢复时选到它就是拿陈旧数据覆盖在役租户,
+        # 而且真正的 owner 机反而因为"刚备过"被判未到期而跳过。
+        # 判据用本仓既有形态:host_id = :self(同 :1131 的 promote 闸)。
+        # INSTANCE_ID 为空(env 未注入)时【不备】——宁可不备也不误备别人的盘。
+        if not INSTANCE_ID or item.get("host_id") != INSTANCE_ID:
+            continue
+        # ⑧ codex 独立复审第六轮 —— 让路窗口必须从间隔里【切出来】,不能加在后面。
+        #
+        # 此前:到期阈值 = interval(24h),而 _forced 要 overdue_h > MAX_DEFER(6h),
+        # 即负载持续偏高时备份年龄最坏到 **30h** —— 而两处配置都明写「每租户至少每 24h
+        # 备一次」(config.yml.example:189 / samples/config-sg-prod.yaml:288)。那是承诺,
+        # 不是节拍,30h 就是静默违反 RPO。
+        #
+        # 改成:软到期 = interval - MAX_DEFER(默认 18h)开始【尝试】,硬期限 = interval
+        # (24h)必须跑。这样"给客户让 CPU"的预算是从 24h 里切出来的,而不是叠在它之上;
+        # 每个 tick 都有机会撞上一个不忙的瞬间,撞不上就在 24h 那一刻降 nice 插队。
+        # 最坏年龄 = interval,与承诺一致。
+        #
+        # 代价诚实标注:空闲 host 上的实际节拍因此变成 interval - MAX_DEFER(默认 18h
+        # 而非 24h),备份次数与 S3 写入约 +33%。要恢复"正好 24h、不让路",把
+        # OC_BACKUP_MAX_DEFER_HOURS 设为 0 —— 那时软硬期限重合,行为退回单一阈值。
+        # 这个取舍的方向由 no-data-loss 定:多备一次只是花钱,晚备一次是丢数据窗口。
+        if _backup_due(item.get("last_backup_at"), now_epoch, _soft_h):
+            due.append((item.get("last_backup_at") or "", tid))
+    # 最久没备的先备:一轮跑不完时,下轮优先级自然正确(不会让同几个反复被备)。
+    due.sort()
+
+    # R7 的 CPU 让路,**带上界**(codex 独立复审第三轮)。
+    # 顺序是有意的:先扫出 due(只 listdir + 每租户一次 get_item,毫秒级、无压缩无 IO,
+    # 不构成"抢 CPU"),再判负载 —— 因为要判"最久没备的已经过期多久",不扫就不知道。
+    # 真正吃 CPU 的是 pigz,它仍被下面的判据挡着。
+    #
+    # 无上界的让路 = 一台长期繁忙的 host 永远不备份,而中心调度关掉后没有第二个执行者
+    # 兜底 → 24h 备份保证被静默违反。故超过硬上限就不再让路,改用 nice 降优先级跑:
+    # 抢一点别人不要的时间片,比丢掉备份保证强得多。
+    # 没有到期租户时用 -inf 而不是 0.0:0.0 现在的含义是"正好到硬期限",会让 _forced
+    # 在空列表上成立(codex 第六轮改了 _forced 的判据后 0.0 不再是中性值)。
+    overdue_h = float("-inf")
+    if due:
+        _oldest_ts = due[0][0]
+        if not _oldest_ts:
+            overdue_h = float("inf")  # 从未备份过 —— 按最紧急处理
+        else:
+            try:
+                from datetime import datetime, timezone
+
+                _dt = datetime.fromisoformat(str(_oldest_ts).replace("Z", "+00:00"))
+                if _dt.tzinfo is None:
+                    _dt = _dt.replace(tzinfo=timezone.utc)
+                # 【可以为负】(codex 第六轮):现在 due 是按软阈值挑的,所以一个"软到期
+                # 但还没到硬期限"的租户 overdue_h 是负数,绝对值就是它距硬期限还剩多久。
+                # 此前这里 max(0.0, ...) 夹到 0,而 _forced 判的是 `> MAX_DEFER`,夹与不夹
+                # 都不影响那个判据;现在 _forced 判 `>= 0`,再夹就会让每个软到期租户都被
+                # 当成"已到硬期限"→ 让路功能整个失效。
+                overdue_h = (
+                    now_epoch - _dt.timestamp()
+                ) / 3600.0 - _BACKUP_INTERVAL_HOURS
+            except (ValueError, TypeError):
+                overdue_h = float("inf")  # 解析不了按最紧急(同 _backup_due 的取向)
+
+    load = _cpu_load_ratio()
+    _busy = load is not None and load > _BACKUP_LOAD_CEILING
+    # 硬期限就是配置的 interval(codex 第六轮)。overdue_h 是相对 interval 算的,所以
+    # "已达硬期限" ⟺ overdue_h >= 0。此前这里要求 overdue_h > MAX_DEFER,等于把让路预算
+    # 叠在 interval 之上 → 最坏 30h。现在预算在软到期那侧切出来了,这里只认硬期限。
+    # ⑮ codex 独立复审第九轮 —— 硬期限必须【为排空留出时间】。
+    #
+    # 第六轮把窗口从 interval 之外挪进了 interval 之内(软到期 18h / 硬期限 24h),但
+    # `_forced` 判的是"最老那个到 24h 了没"。而本轮是【串行】备的:一台 380 租户的 host
+    # 排空一轮约 2.3h(单备份最坏 22s,ADR §2.4 真机)。于是最老那个在 24h 整点被插队时,
+    # 队尾那个可能已经 23.9h,等它被备到时是 26h+ —— 对【它】而言 24h 承诺仍被违反。
+    #
+    # 修法:把预计排空时间从硬期限里减掉 —— 队列越长就越早开始插队,让整条队列在期限内
+    # 备完。判据用 len(due) × 单租户实测值,而不是新引一个配置项:那个数已经有真机来源,
+    # 再加一个旋钮只会多一处要维护的假设。
+    # 排空提前量的上界 = 【本轮实际的】软到期窗口(codex 第十二轮修正)。
+    #
+    # 我第九轮把它夹在窗口的【一半】,理由是"夹满整个窗口时,刚软到期那一刻边界相等即
+    # 成立 → 从软到期起一直插队,CPU 让路彻底失效"。那个理由**是错的取舍**:如果队列
+    # 确实需要整个窗口才排得完,那么"从软到期起就一直跑"正是唯一能守住 interval 的做法 ——
+    # 让路在那种密度下本来就没有余量可让。拿硬保证(RPO / no-data-loss)去换软保证
+    # (CPU 礼貌),方向反了。
+    #
+    # 现在窗口本身随租户数自适应(见 _backup_soft_interval_hours),所以夹满窗口是自洽的:
+    #   租户少 → 窗口 6h、排空 <6h → 仍有余量让路;
+    #   租户多 → 窗口 = 排空所需 → 从软到期起持续跑,恰好在 interval 前备完。
+    # 剩余风险(已记入 UNRESOLVED_GAPS):排空估算超过 interval/2 时窗口被下界夹住,
+    # 队尾仍可能超期 —— 那是密度超出串行方案能力,解法是开本地并发或降 interval。
+    _drain_h = min(
+        len(due) * _BACKUP_PER_TENANT_ESTIMATE_SEC / 3600.0,
+        _BACKUP_INTERVAL_HOURS - _soft_h,
+    )
+    _forced = _busy and overdue_h >= -_drain_h
+    if _busy and not _forced:
+        print(
+            f"backup: host load {load:.2f} > {_BACKUP_LOAD_CEILING} "
+            f"(1min loadavg / {os.cpu_count()} cores), yielding CPU to tenants "
+            f"this round (oldest tenant is soft-due but still "
+            f"{-overdue_h - _drain_h:.1f}h before the forcing point: "
+            f"{_BACKUP_INTERVAL_HOURS}h deadline minus {_drain_h:.1f}h estimated "
+            f"drain for {len(due)} due tenant(s))"
+        )
+        return 0, len(tids), len(due)
+    if _forced:
+        # 这条日志是运维的关键信号:host 长期繁忙到备份被迫降优先级插队。
+        print(
+            f"backup: oldest tenant reached the forcing point "
+            f"({_BACKUP_INTERVAL_HOURS}h deadline minus {_drain_h:.1f}h estimated "
+            f"drain for {len(due)} due tenant(s); overdue {overdue_h:.1f}h) "
+            f"while load {load:.2f} > "
+            f"{_BACKUP_LOAD_CEILING} — running at nice {_BACKUP_NICE} instead of "
+            "deferring again (the backup guarantee outranks CPU politeness)"
+        )
+    done = 0
+    for _, tid in due:
+        # 每个租户备完重新看负载:一轮可能跑很久(1000 租户 3.1h),期间客户负载起来了
+        # 就得让路,不能凭进入循环那一刻的判断跑到底。
+        load = _cpu_load_ratio()
+        # 中途涨负载就停 —— 但 _forced 那轮不停:那一轮本来就是因为已经超了硬上限才
+        # 插队跑的,再被负载打断就又回到"永远不备"。降优先级已经把代价控住了。
+        if not _forced and load is not None and load > _BACKUP_LOAD_CEILING:
+            print(f"backup: load rose to {load:.2f} mid-sweep, stopping after {done}")
+            break
+        if _backup_one_tenant(tid, nice=_forced, table=table):
+            done += 1
+    if due:
+        print(f"backup: {done}/{len(due)} tenant(s) backed up (interval={_BACKUP_INTERVAL_HOURS}h)")
+    return done, 0, len(due)
+
+
+def _backup_loop():
+    """#469 R7 — 独立单例线程跑本机定时备份。
+
+    与 disk-gc/disk-report 同款隔离理由:一轮 sweep 可能跑很久(1000 租户最坏 3.1h),
+    绝不能塞进 poll 心跳 —— 那会让 host 被判 stale 而触发重启。
+    """
+    while True:
+        try:
+            _backup_sweep()
+        except Exception as e:  # noqa: BLE001 — 绝不让备份线程崩掉
+            print(f"backup loop error (non-fatal): {e}")
+        _agent_loop_tick("backup")  # #387 self-stamped
+        time.sleep(_BACKUP_TICK_SEC)
 
 
 def _reap_orphan_firecrackers():
@@ -2218,7 +3158,6 @@ def _flag_requires_intervention(tenant_id):
     """Budget exhausted: tenants.status=requires_intervention (no reset). Only
     from creating/failed to avoid clobbering a subsequent recovery.
 
-    #315(codex review7 P2)返回 assignment 应写的终态字符串,让 assignment 与 tenant 状态一致:
     - 写成功 → "failed":tenant 刚翻 requires_intervention,assignment 标 failed 匹配。
     - CCF → 回读 tenant 真实状态定夺(不再一律当 failed,否则健康线程已 promote running 时会留下
       tenant=running / assignment=failed 矛盾):
@@ -2563,15 +3502,36 @@ def _report_route_drift() -> dict[str, int]:
     a stale row could shadow a live tenant of the same port). A follow-up
     audited PR will wire remediation on top of this signal.
 
-    Returns a summary {orphan_dnat, missing_dnat, ghost_descriptor} for
-    logging + tests. Missing table names / IMDS quietly return zeros.
+    Returns a summary {orphan_dnat, missing_dnat, ghost_descriptor, foreign_vm,
+    checked} for logging + tests.
+
+      · 字段整组缺席      = 这台从没跑过对账(循环未启动 / agent 版本旧)
+      · checked=0 + 全零  = 跑了但没跑完(表名/IMDS 缺、iptables 列举失败、DDB scan 失败)
+      · checked=1 + 计数  = 真实测量值
+    此前所有早退路径都直接返回 empty 而【不写缓存】,于是"探测失败"和"从没探测过"在心跳里
+    长得一模一样,排障分不出来 —— 与"缺席=未探测过而非谎报 0"的原则自相矛盾。真机实测
+    (2026-08-19,新扩空机;主机坐标见 engineering/evidence/ 下本 issue 的证据记录)就是这么
+    暴露出来的。
     """
-    empty = {"orphan_dnat": 0, "missing_dnat": 0, "ghost_descriptor": 0}
+    empty = {
+        "orphan_dnat": 0,
+        "missing_dnat": 0,
+        "ghost_descriptor": 0,
+        "foreign_vm": 0,
+        "checked": 0,
+    }
+
+    def _cache(summary):
+        """任何退出路径都把结果缓存给心跳 —— 包括没跑完的那些(checked=0)。"""
+        with _lock:
+            _agent_metrics["route_drift"] = dict(summary)
+        return summary
+
     if not TENANTS_TABLE or not INSTANCE_ID:
-        return empty
+        return _cache(empty)
     host_ip = _get_host_private_ip()
     if not host_ip:
-        return empty
+        return _cache(empty)
     try:
         vm_dir_tids: set[str] = set()
         try:
@@ -2582,7 +3542,7 @@ def _report_route_drift() -> dict[str, int]:
             dnat_rules = route_ops.list_dnat_rules()
         except Exception as e:
             print(f"route_drift: iptables list failed (skip): {e}")
-            return empty
+            return _cache(empty)
         # Only descriptors that name THIS host contribute to the diff. Full
         # table scan is fine — this runs every 60s and each host owns ≤400
         # rows, so the "host_private_ip = :ip" filter kicks in on the DDB
@@ -2605,20 +3565,53 @@ def _report_route_drift() -> dict[str, int]:
                     }
         except Exception as e:
             print(f"route_drift: DDB scan failed (skip): {e}")
-            return empty
+            return _cache(empty)
         diff = route_ops.reconcile_drift(vm_dir_tids, ddb_desc, dnat_rules)
         summary = {k: len(v) for k, v in diff.items()}
+        # 上面那三个信号都建立在"账本说这个租户在本机"之上(scan 用 host_private_ip=本机 过滤),
+        # 所以它们发现不了最危险的那种分裂:【本机真有这个租户的 VM,而账本说它在别台】。
+        # 那正是"同一份快照恢复出两个 VM"的可观测形态,而单机视角只看得见这一半 —— 控制面
+        # 汇总各 host 的这一半才拼出全貌(汇总在 health_check 侧)。
+        # 成本与异常量成正比而不是与机队规模成正比:正常情况下 candidates 为空,一次 get_item
+        # 都不发;只有真出现归属不一致时才逐个查那几个。
+        foreign = []
+        for tid in sorted(vm_dir_tids - set(ddb_desc)):
+            try:
+                row = table.get_item(
+                    Key={"id": tid},
+                    ProjectionExpression="id, host_id, host_private_ip, #s",
+                    ExpressionAttributeNames={"#s": "status"},
+                ).get("Item")
+            except Exception as e:
+                print(f"route_drift: foreign 探测读 {tid} 失败(跳过): {e}")
+                continue
+            if not row:
+                continue  # 表里没这行 —— 属于孤儿目录,不是归属分裂,别混进 foreign
+            if (row.get("status") or "") in ("deleted", "deleting"):
+                continue  # 正在删/已删,本机残留目录是清理滞后,不是双跑
+            other_host = row.get("host_id") or ""
+            other_ip = row.get("host_private_ip") or ""
+            if (other_host and other_host != INSTANCE_ID) or (
+                other_ip and other_ip != host_ip
+            ):
+                foreign.append(tid)
+        summary["foreign_vm"] = len(foreign)
         if any(summary.values()):
             print(
                 f"route_drift: orphan_dnat={summary['orphan_dnat']} "
                 f"missing_dnat={summary['missing_dnat']} "
-                f"ghost_descriptor={summary['ghost_descriptor']}"
+                f"ghost_descriptor={summary['ghost_descriptor']} "
+                f"foreign_vm={summary['foreign_vm']}"
+                + (f" foreign_tids={foreign[:5]}" if foreign else "")
             )
-        return summary
+        # 跑完整一轮才算 checked=1;缓存给心跳上报(此前只 print,控制面看不见,
+        # 也就无法跨 host 汇总)。
+        summary["checked"] = 1
+        return _cache(summary)
     except Exception as e:
         # Never let drift-reporting kill the housekeeping loop.
         print(f"route_drift error (non-fatal): {e}")
-        return empty
+        return _cache(empty)
 
 
 def _housekeeping_loop():
@@ -2641,6 +3634,126 @@ def _housekeeping_loop():
         time.sleep(DISPATCH_HOUSEKEEPING_SEC)
 
 
+# #566 拆分② — egress_mode reconcile:控制面 API(POST /hosts/egress)把期望态写进本机
+# host 行的 egress_mode 字段;host-agent 每轮 poll 读它并把 OPENCLAW-EGRESS 链收敛到期望态。
+# 这是「扛 host 重建/重启」的持久化支点:纯 SSM live-apply 在重启后丢失,靠这里从 DDB 收敛回来。
+# 只在 mode 变化时动 iptables(幂等 scratch-swap);apply 派生 LLM 洞与 init-host/API 同口径。
+_egress_applied_mode = None
+_EGRESS_CHAIN_SH = "/home/ubuntu/oc-egress-chain.sh"
+
+
+def _derive_egress_env():
+    """读 /etc/platform.env,派生 oc-egress-chain.sh 需要的 env(与 init-host.sh 同口径)。"""
+    import ipaddress
+    import socket
+    from urllib.parse import urlparse
+
+    env = {}
+    try:
+        with open("/etc/platform.env") as fh:
+            for line in fh:
+                line = line.strip()
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.split("=", 1)
+                    env[k] = v.strip().strip('"')
+    except OSError:
+        return None
+    vpc = env.get("EGRESS_VPC_CIDR", "")
+    if not vpc:
+        return None
+    raw = env.get("LITELLM_HOST", "")
+    u = urlparse(raw if "://" in raw else "//" + raw, scheme="")
+    host = u.hostname or ""
+    port = u.port
+    scheme = (u.scheme or "").lower()
+    if not port:
+        port = 443 if scheme == "https" else (80 if scheme == "http" else 4000)
+    ip = ""
+    try:
+        ip = socket.gethostbyname(host) if host else ""
+    except OSError:
+        ip = ""
+    in_vpc = False
+    try:
+        in_vpc = bool(ip) and ipaddress.ip_address(ip) in ipaddress.ip_network(vpc, strict=False)
+    except ValueError:
+        in_vpc = False
+    return {
+        "VPC_CIDR": vpc,
+        "LITELLM_HOST": ip if in_vpc else "",  # 公网网关不开内网洞,靠公网 RETURN
+        "LITELLM_PORT": str(port),
+        "SPIRE_SERVER": env.get("SPIRE_SERVER_IP", ""),
+        "TAP_IFACE": "tap+",
+        "DENY_RFC1918": "false",
+    }
+
+
+def _egress_chain_present():
+    """OPENCLAW-EGRESS 链是否已在内核(state-based reconcile 的实测判据)。"""
+    try:
+        return (
+            subprocess.run(
+                ["iptables", "-S", "OPENCLAW-EGRESS"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            ).returncode
+            == 0
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _reconcile_egress():
+    """state-based reconcile:把 OPENCLAW-EGRESS 的【实际】状态收敛到 DDB 期望态。
+
+    自愈 reboot(链随机器丢)与带外移除:desired=deny 但链缺→装;desired=off 但链在→拆;
+    已收敛则不动内核(不每轮重复 apply)。这是「扛 host 重建」的持久化支点。
+    """
+    global _egress_applied_mode
+    if not HOSTS_TABLE or not INSTANCE_ID:
+        return
+    if not os.path.exists(_EGRESS_CHAIN_SH):
+        return  # 脚本未下发(egress 从未开过)→ 无需 reconcile
+    try:
+        item = (
+            _get_ddb().Table(HOSTS_TABLE).get_item(Key={"instance_id": INSTANCE_ID})
+        ).get("Item")
+    except Exception as e:  # noqa: BLE001 — reconcile 失败绝不影响 poll
+        print(f"egress reconcile read failed (non-fatal): {e}")
+        return
+    desired = (item or {}).get("egress_mode", "off")
+    if desired not in ("off", "deny"):
+        return
+    present = _egress_chain_present()
+    need_apply = desired == "deny" and not present
+    need_teardown = desired == "off" and present
+    if not need_apply and not need_teardown:
+        _egress_applied_mode = desired  # 已收敛
+        return
+    try:
+        if need_apply:
+            extra = _derive_egress_env()
+            if not extra:
+                print("egress reconcile: cannot derive env (missing platform.env/VPC) — skip")
+                return
+            run_env = dict(os.environ)
+            run_env.update(extra)
+            if (item or {}).get("egress_deny_rfc1918") is True:
+                run_env["DENY_RFC1918"] = "true"
+            # #566 follow-up — 连同运维经 API 加的额外放行洞一起收敛(重启/重建后不丢端口)。
+            run_env["EGRESS_EXTRA_ALLOW"] = str((item or {}).get("egress_extra_allow", "") or "")
+            subprocess.run(["bash", _EGRESS_CHAIN_SH, "apply"], env=run_env, timeout=60, check=False)
+        else:
+            run_env = dict(os.environ)
+            run_env.update({"VPC_CIDR": "10.0.0.0/8", "TAP_IFACE": "tap+"})
+            subprocess.run(["bash", _EGRESS_CHAIN_SH, "teardown"], env=run_env, timeout=60, check=False)
+        _egress_applied_mode = desired
+        print(f"egress reconcile: converged to egress_mode={desired} (was drift: apply={need_apply} teardown={need_teardown})")
+    except Exception as e:  # noqa: BLE001
+        print(f"egress reconcile apply failed (non-fatal): {e}")
+
+
 def _poll_loop():
     while True:
         try:
@@ -2658,6 +3771,8 @@ def _poll_loop():
             _write_ddb(results)
             _adjust_balloons(results)
             _probe_ssm_agent()  # #387: cached here, never at scrape time
+            _probe_ssm_buffer_full()  # #52 D: 同上,缓存在 poll 里,不在 scrape 时读日志
+            _reconcile_egress()  # #566 拆分②:把 egress_mode 期望态收敛到本机(扛重建)
         except Exception as e:
             print(f"poll error: {e}")
         _agent_loop_tick("poll")  # #387: self-stamped (period=POLL_INTERVAL)
@@ -2677,6 +3792,13 @@ class Handler(BaseHTTPRequestHandler):
                     ],
                     "build_sha": _agent_metrics.get("build_sha"),
                     "ssm_agent_up": _agent_metrics.get("ssm_agent_up"),
+                    "ssm_buffer_full": _agent_metrics.get("ssm_buffer_full"),
+                    "route_drift": dict(_agent_metrics.get("route_drift") or {}),
+                    # scrape 只读;未跑过 sweep 时键缺席而不是谎报 0。
+                    "backup_script_stale": _agent_metrics.get("backup_script_stale"),
+                    # 而不是谎报 0;发生过就一直是 1(**刻意不自动清零**:一个冻住的客户 VM
+                    # 不会自己好,清零等于让告警自己消失,而问题还在)。
+                    "backup_vm_left_paused": _agent_metrics.get("backup_vm_left_paused"),
                 }
             # through _get_port_bitmap() here would lazily rebuild from
             # iptables (mutating global state) on a host that never allocated
@@ -2767,6 +3889,16 @@ def main():
     # letting dispatch fail-open safely on stale reads instead of mis-blocking).
     dr = threading.Thread(target=_disk_report_loop, daemon=True)
     dr.start()
+    # 数学上追不上(每 30min 备 20 个 = 24h 上限 960 个);本机自驱按机器打散,一台 1000
+    # 租户串行也只需 ~6h/轮。独立线程的理由同 disk-gc:一轮可能跑数小时,绝不能进 poll
+    # 心跳(会被判 host stale 触发重启)。OC_BACKUP_LOOP=0 可关(灰度/回滚开关)。
+    if _BACKUP_LOOP_ENABLED and TENANTS_TABLE:
+        print(
+            f"openclaw-agent backup loop: tick={_BACKUP_TICK_SEC}s "
+            f"interval={_BACKUP_INTERVAL_HOURS}h load_ceiling={_BACKUP_LOAD_CEILING}"
+        )
+        bk = threading.Thread(target=_backup_loop, daemon=True)
+        bk.start()
     # Pull-mode dispatch reconciler (二期 SPEC/specs/sqs-dispatch/interfaces.md).
     # Only starts when ASSIGNMENTS_TABLE is injected via systemd (dispatch.enabled
     # && dispatch.mode=pull in config.yml). One extra daemon thread; no impact

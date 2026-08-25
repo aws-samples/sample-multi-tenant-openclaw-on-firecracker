@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# customize.sh.example — 客户自定义构建步骤的模板。
 #
-# 用法:复制本文件另存(例如 customize.sh),按需修改,并在 pkrvars 中声明:
-#   custom_script     = "customize.sh"
-#   custom_script_env = { COMPANY_APT_MIRROR = "https://apt.example.internal" }
+# 用法:复制本文件到本目录、去掉 .example 后缀、加执行位,然后正常构建:
+#   cp deploy/packer/hooks/50-example.sh.example deploy/packer/hooks/50-install-agent.sh
+#   chmod +x deploy/packer/hooks/50-install-agent.sh
 #
-# 执行时机:provision-host.sh 之后、两条 validate 断言之前,以 root 执行一次。
-# 此时 firecracker / jailer / awscli / ADOT collector / Fluent Bit 均已安装完成。
+# 本目录的 *.sh 按【文件名字典序】逐个执行。用两位数字前缀控制顺序,中间留空档
+# (10- / 50- / 80-)。参数从 pkrvars 的 hook_env 传进来,不要硬编码进脚本。
+# 完整规则见 hooks/README.md。
+#
+# 执行时机:provision-host.sh 之后、两条 validate 断言之前,以 root 执行。
+# 此时 firecracker / jailer / awscli / ADOT collector / Fluent Bit 均已装好。
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # 允许做什么(与具体机器无关的内容,可安全地被整个机队共享)
@@ -25,16 +28,16 @@
 #   ✗ 触发 cloud-init 重新初始化,或在 /var/lib/cloud/instances 下留内容
 #   ✗ 启动会在构建阶段注册到外部系统的服务(该注册记录会被整个机队复用)
 #
-# scrub 阶段(provision-host.sh §7)在本脚本【之前】已执行完毕,因此本脚本写入的
-# 内容不会再被清理,会原样进入镜像。上述任一项都会被随后的 validate 断言检出并
-# 使构建失败 —— 这是有意的 fail-closed 设计,不会产出携带泄漏的 AMI。
+# scrub 阶段(provision-host.sh §7)在 hook 之前已执行完毕,因此 hook 写入的内容
+# 不会再被清理,会原样进入镜像。上述任一项都会被随后的 validate 断言检出并使构建
+# 失败 —— 这是有意的 fail-closed 设计,不会产出携带泄漏的 AMI。
 #
 # 运行期才需要的密钥:交由 host 的 instance profile 在启动时从 Secrets Manager 或
 # SSM Parameter Store(SecureString)获取,不要预置于镜像。
 
 set -euo pipefail
 
-log() { echo "[oc:customize] $*"; }
+log() { echo "[oc:hook:50-example] $*"; }
 
 # shellcheck disable=SC1091  # /etc/os-release 只在构建实例上存在,静态检查看不到它
 log "start: $(uname -m) / $(. /etc/os-release && echo "$PRETTY_NAME")"
@@ -65,7 +68,7 @@ log "start: $(uname -m) / $(. /etc/os-release && echo "$PRETTY_NAME")"
 # fs.file-max = 2097152
 # CONF
 
-# ── 示例 4:使用 custom_script_env 传入的参数 ────────────────────────────────
+# ── 示例 4:使用 hook_env 传入的参数 ─────────────────────────────────────────
 # if [ -n "${COMPANY_APT_MIRROR:-}" ]; then
 #   log "using apt mirror: ${COMPANY_APT_MIRROR}"
 #   echo "deb ${COMPANY_APT_MIRROR} noble main" > /etc/apt/sources.list.d/company.list

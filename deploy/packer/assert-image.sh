@@ -42,10 +42,20 @@ FP_FILE=/opt/openclaw/.image-fingerprint
 fail=0
 _bad() { echo "$1"; fail=1; }
 
-# ── 零下载判据 ───────────────────────────────────────────────────────────────
-# golden host 必须能在【零下载】的前提下起到 running。下面每个缺失项 = boot path
-# 要补做的一次下载,所以在这里一次性断言,而不是等 lifecycle hook 已经在计时的
-# host 上才发现。
+# ── 组件零安装判据 ───────────────────────────────────────────────────────────
+# #523 判据 5:这里原本写的目标是「golden host 必须能在【零下载】的前提下起到
+# running」,那个目标**不成立**,而且从来没成立过 —— init-host.sh 在
+# LOGGING_ENABLED=true 时【无条件】从 S3 拉 install-fluent-bit.sh(S3 miss 即
+# `exit 1`),后面还要拉 oc-guest-log-reader.py、rootfs manifest.json、以及 step4 的
+# 全部生命周期脚本。把目标写成做不到的样子有实际代价:下一个人会按「零下载」去排查
+# 启动失败,而客户那两次 canary ABANDON 恰好发生在「AMI 已经有、启动仍跑 S3 那份」
+# 这条路上(根因是 S3 上的旧 installer 用交互式 gpg,#520 A21 实例①)。
+#
+# 真正成立、也真正值钱的判据是**组件零安装**:下面每个缺失项 = boot path 要补做的
+# 一次【安装】(apt / dpkg / 解包),那才是不可靠的部分(错架构 awscli、FC tgz 404、
+# aarch64 vmlinux 404 各自 ABANDON 过一台 metal)。所以在这里一次性断言,而不是等
+# lifecycle hook 已经在计时的 host 上才发现。配置与脚本仍从 S3 拉,那条路由
+# init-host.sh 自己的 fail-loud 兜(拉不到即 exit 1),不在本脚本的判据里。
 for b in aws firecracker jailer; do
   command -v "$b" >/dev/null 2>&1 || _bad "MISSING binary: $b"
 done
@@ -70,10 +80,65 @@ dpkg -s aws-otel-collector >/dev/null 2>&1 || _bad "MISSING pkg: aws-otel-collec
 systemctl list-unit-files 'snap.amazon-ssm-agent.*' 'amazon-ssm-agent.*' 2>/dev/null |
   grep -q 'ssm-agent' || _bad "MISSING: amazon-ssm-agent unit not present in image"
 
-# 自定义阶段的产物本身要可审计:镜像里必须留着实际执行过的那份脚本,这样起一台
-# host 就能核对这批镜像装了什么客户内容。
-[ -s /opt/openclaw/custom/customize.sh ] ||
-  _bad "MISSING file: /opt/openclaw/custom/customize.sh"
+# ── 客户 hook 的可审计性与两侧对账(#537 D5 / V-3)────────────────────────────
+# 自定义阶段的产物要可审计:镜像里必须留着实际执行过的那批脚本与一份执行记录,这样起
+# 一台 host 就能核对这批镜像装了什么客户内容(US-2 / US-6 的可见结果)。
+#
+# 更要紧的是【对账】:构建侧(build-golden-ami.sh 用 bash find)算出 HooksSha 并经
+# packer 注进 OC_EXPECT_HOOKS_SHA,这里从【镜像里实际存在的那批】重算一次再比。两侧
+# 独立算才能发现 file provisioner 少传了文件、两处 glob 语义漂了、或客户在 packer
+# 起来之后又往 hooks/ 里丢了东西 —— 本地算两次都察觉不到这三种。
+HOOKS_DIR="${OC_HOOKS_DIR:-/opt/openclaw/custom/hooks}"
+HOOKS_MANIFEST="${OC_HOOKS_MANIFEST:-/opt/openclaw/custom/hooks-manifest}"
+
+# 期望值缺失必须 FAIL,不能跳过比对。静默跳过等于悄悄丢掉整条对账断言 —— 而"环境变量
+# 没传进来"恰好是最容易发生的那种回归(改 provisioner 时漏一行、sudo 少个 -E)。
+if [ -z "${OC_EXPECT_HOOKS_SHA:-}" ] || [ -z "${OC_EXPECT_HOOKS_COUNT:-}" ]; then
+  _bad "MISSING OC_EXPECT_HOOKS_SHA / OC_EXPECT_HOOKS_COUNT — hook 对账无从进行(provisioner 少传环境变量,或 sudo 缺 -E)"
+else
+  [ -d "$HOOKS_DIR" ] || _bad "MISSING dir: $HOOKS_DIR"
+  [ -s "$HOOKS_MANIFEST" ] || _bad "MISSING file: $HOOKS_MANIFEST — run-hooks.sh 没跑过,或跑在本断言之后"
+
+  if [ -d "$HOOKS_DIR" ]; then
+    # 与 build-golden-ami.sh 和 run-hooks.sh 同款枚举:find -maxdepth 1 -type f
+    # -name '*.sh' | sort。摘要口径也必须逐字相同("<sha256>  <basename>" 逐行,
+    # 再对整串取一次)—— 口径差一个空格,两侧就永远不等,那会把这条门变成恒红,
+    # 同样没用。
+    _hook_lines=""
+    _hook_n=0
+    while IFS= read -r _h; do
+      [ -n "$_h" ] || continue
+      _hook_n=$((_hook_n + 1))
+      _hook_lines="${_hook_lines}$(sha256sum "$_h" | cut -d' ' -f1)  $(basename "$_h")"$'\n'
+    done < <(find "$HOOKS_DIR" -maxdepth 1 -type f -name '*.sh' -print 2>/dev/null | sort)
+
+    _hook_sha="$(printf '%s' "$_hook_lines" | sha256sum | cut -d' ' -f1)"
+
+    if [ "$_hook_n" != "$OC_EXPECT_HOOKS_COUNT" ]; then
+      _bad "HOOK COUNT MISMATCH: 镜像里有 $_hook_n 个,构建侧枚举 $OC_EXPECT_HOOKS_COUNT 个"
+    fi
+    if [ "$_hook_sha" != "$OC_EXPECT_HOOKS_SHA" ]; then
+      _bad "HOOK SHA MISMATCH: 镜像里重算 $_hook_sha,构建侧注入 $OC_EXPECT_HOOKS_SHA —— 上传的和执行的不是同一批"
+    fi
+    if [ "$_hook_n" = "$OC_EXPECT_HOOKS_COUNT" ] && [ "$_hook_sha" = "$OC_EXPECT_HOOKS_SHA" ]; then
+      echo "hooks reconciled: $_hook_n hook(s), sha=$_hook_sha"
+    fi
+
+    # 执行记录里的条数必须与目录里的一致。目录有 3 个而 manifest 只记了 2 条 = 第 3 个
+    # 没被执行(run-hooks.sh 在它之前就失败了,而 set -e 本该让构建红)—— 这条是那种
+    # "构建红了但被谁吞掉"情况的兜底。
+    if [ -s "$HOOKS_MANIFEST" ]; then
+      # 用 awk 数而不是 `grep -c ... || echo 0`:grep -c 在无匹配时【输出 0 但退出码 1】,
+      # 于是 `|| echo 0` 的分支也会执行,变量拿到的是两行 "0\n0" —— 与 "0" 不等,这条
+      # 断言在 hook 目录为空(最常见的情况)时恒假红。实测 2026-08-21 第一次真机构建
+      # 正是死在这里,而 bash -n 与 packer validate 都抓不到它。
+      # awk 总是退出码 0 且只输出一个数(END 里 n+0 把未初始化的 n 变成 0)。
+      _ran="$(awk '/^[0-9a-f]{64}  /{n++} END{print n+0}' "$HOOKS_MANIFEST")"
+      [ "$_ran" = "$_hook_n" ] ||
+        _bad "HOOK RUN MISMATCH: 目录里 $_hook_n 个,hooks-manifest 只记录了 $_ran 个执行成功"
+    fi
+  fi
+fi
 
 
 # ── 跨租户红线 ───────────────────────────────────────────────────────────────

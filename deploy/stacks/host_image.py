@@ -122,6 +122,11 @@ phases:
               export OC_PROVISION_BAKE=1
               export OC_PROVISION_RECIPE_VERSION='{recipe_version}'
               export OC_PROVISION_FLUENT_BIT_INSTALLER=/opt/openclaw/install-fluent-bit.sh
+              # bake 路径必须 fail-closed。烤镜像的整个理由是启动路径零下载,所以
+              # 「S3 拿不到就回落 github」在这里是假绿:镜像照样烤出来、validate 照样过,
+              # 而那台镜像其实请求过 github.com。构建实例有该前缀的 s3:GetObject(见本文件
+              # build_role 的授权),所以这里取不到就是真出问题,该 Abort 而不是降级。
+              export OC_FC_REQUIRE_S3=1
               bash /opt/openclaw/provision-host.sh
   - name: validate
     steps:
@@ -285,8 +290,21 @@ class OpenClawHostImageStack(cdk.Stack):
         # ── Build-instance profile ────────────────────────────────────────────────────
         # The instance that runs the component. Needs to read its own component and, via
         # SSM agent, be driven by Image Builder. It does NOT need the host's runtime
-        # permissions (DynamoDB, assets bucket, …) — provision touches none of them, and
-        # granting them would put control-plane access on a throwaway build box.
+        # permissions (DynamoDB, the assets bucket at large, …) — granting them would put
+        # control-plane access on a throwaway build box.
+        #
+        # 一处【有意的例外】,并把上面那句「provision touches none of them」改准:
+        # provision 现在要从 assets 桶读一个对象(Firecracker/jailer 的 tgz),因为取源从
+        # github.com 的 releases 改成了自家 S3(10W 规模并发启 host 会撞 GitHub rate limit)。
+        # 所以 bake 实例也需要读那一个前缀,否则 bake 会 AccessDenied → 回落 github,
+        # 而 golden AMI 的验收第 2 条恰恰要求「bake 过程零 github.com 请求」。
+        # 授权按最小面给,不违背上面那条原则:
+        #   · 只 s3:GetObject,不给 ListBucket(aws s3 cp 单个 key 不需要它);
+        #   · 账号钉死为本栈账号,区域后缀用 * 兼容 openclaw-assets-<acct>[-<region>];
+        #   · 前缀锁死在 deployment/binaries/firecracker/,拿不到脚本、镜像清单或任何
+        #     控制面对象。
+        # 这与「不给 throwaway build box 控制面访问权」是一致的 —— 它拿到的是一个公开发行版
+        # 二进制的自家副本,不是控制面数据。
         build_role = iam.Role(
             self,
             "HostImageBuildRole",
@@ -304,6 +322,16 @@ class OpenClawHostImageStack(cdk.Stack):
         # S3Download 用构建实例角色读两个脚本资产(仅这两个对象;不给宽泛 S3)。
         provision_asset.grant_read(build_role)
         fluent_bit_asset.grant_read(build_role)
+        # bake 期读 Firecracker/jailer 的自家副本(理由与边界见上方注释)。
+        build_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3:GetObject"],
+                resources=[
+                    f"arn:aws:s3:::openclaw-assets-{self.account}*"
+                    "/deployment/binaries/firecracker/*"
+                ],
+            )
+        )
         build_profile = iam.InstanceProfile(
             self, "HostImageBuildProfile", role=build_role
         )

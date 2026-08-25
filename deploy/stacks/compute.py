@@ -41,21 +41,43 @@ def build_compute(self, ctx):
         ],
     )
     assets_bucket.grant_read_write(host_role)
+    #
+    # 为什么必须显式 Deny:上面那条 grant_read_write 让每台 host 对整个 assets 桶可写。
+    # 本 issue 把 FC 取源从 github 换成了这个桶,于是一台失陷的 host 能改写后续【全机队】
+    # 安装的二进制。provision-host.sh 已对字节强制校验摘要,所以投毒装不进去 —— 但那把
+    # 攻击面从"投毒"变成了"拒绝服务":失陷 host 传一个假包(metadata 也设成匹配值,让
+    # setup.sh 的跳过判据不去修复),新起的 host 就全部死在摘要校验 → lifecycle hook
+    # 那种不收敛循环,只是换了触发路径。
+    #
+    # 显式 Deny 优先于任何 Allow,所以这条与上面的 grant_read_write 共存即可,不必改动那条
+    # (它是否整体过宽是另一个问题:影响面还包括 observability 配置与 backup 脚本,先于本
+    # issue 存在,值得单开 issue 收窄,不在此处扩大改动面)。
+    # 只 Deny 写与删,GetObject 不受影响 —— host 仍要从这里取 FC 二进制。
+    host_role.add_to_policy(
+        iam.PolicyStatement(
+            effect=iam.Effect.DENY,
+            actions=[
+                "s3:PutObject",
+                "s3:PutObjectAcl",
+                "s3:PutObjectTagging",
+                "s3:DeleteObject",
+                "s3:DeleteObjectVersion",
+            ],
+            resources=[f"{assets_bucket.bucket_arn}/deployment/binaries/*"],
+        )
+    )
     backup_bucket.grant_read_write(host_role)  # backup-data.sh 写备份/恢复读
     backup_cmk.grant_encrypt_decrypt(host_role)  # CMK 解密只授备份执行者
-    # #152/#118 — host decrypts platform-injected credential ciphertext at VM
     # launch. Decrypt only (host never encrypts; upstream does). The
     # EncryptionContext (owner_id) is enforced by the caller in launch-vm.sh;
     # a stricter key-policy condition can be layered later if needed.
     if clawpool_cmk is not None:
         clawpool_cmk.grant_decrypt(host_role)
-    # #149 asymmetric-v1 — host decrypts RSA-OAEP env-cred ciphertext at VM launch
     # (cred-inject.sh, no EncryptionContext: KMS asymmetric doesn't support it).
     if clawpool_rsa_cmk is not None:
         clawpool_rsa_cmk.grant_decrypt(host_role)
     hosts_table.grant_read_write_data(host_role)
     tenants_table.grant_read_write_data(host_role)  # host-agent writes health status
-    # #290 DDB fallback:dispatch/recovery 路径位置参 12/13 空时,launch-vm.sh 以 host
     # instance-role get-item openclaw-tenant-secrets 读 gateway_token_ct/device_paired_b64
     # (fail-closed:读失败即拒起)。缺此 grant → AccessDenied → 纯 CDK one-shot 部署的
     # host 每次 fallback 都拒起、租户卡 creating(新加坡靠手工 inline policy 顶着)。只读:
@@ -106,8 +128,6 @@ def build_compute(self, ctx):
             cfg=_dispatch_cfg,
             api_fn=api_fn,
             host_role=host_role,
-            # #331/#327 — host 级冷启动并发槽数【单一来源】= vm.host_launch_slots(与 ha_edge.py
-            # 注入 host 侧 OC_HOST_LAUNCH_SLOTS 同读一处,避免 dispatch/vm 两处配置漂移,codex #4)。
             # 传原值不裸 int()(非数字会炸 synth);dispatch_infra 内 try/except 校验回落 30,与 ha_edge
             # 同款 fail-safe。
             host_launch_slots=(CFG.get("vm", {}) or {}).get("host_launch_slots", 30),
@@ -120,7 +140,6 @@ def build_compute(self, ctx):
             if getattr(self, "_lifecycle_consumer", None) is not None:
                 self._lifecycle_consumer.add_environment(_k, _v)
 
-    # ========== Amazon Managed Prometheus + Grafana (issue #4) ==========
     # Host-agent exposes /metrics on :8899 (same listener as /health);
     # an ADOT collector on each host remote-writes to AMP using SigV4.
     # AMG reads from AMP for dashboards. (NOTE: 1.2.5 fixed a wiring
@@ -197,7 +216,6 @@ def build_compute(self, ctx):
         api_fn.add_environment("AMP_REMOTE_WRITE_URL", amp_remote_write_url)
         api_fn.add_environment("GRAFANA_WORKSPACE_URL", grafana_url)
 
-    # #234 — /system/info metrics.enabled must reflect the real switch
     # (config metrics.enabled), not just the AMP path. The self-hosted
     # Prometheus/Grafana backend (use_managed=false, built in litellm.py) never
     # set AMP_REMOTE_WRITE_URL, so the console showed "monitoring off" while the
@@ -213,7 +231,6 @@ def build_compute(self, ctx):
             "managed" if metrics_cfg.get("use_managed", False) else "self-hosted",
         )
 
-    # ========== Security monitoring: GuardDuty + SNS feed (10h-goal #20) ==========
     # The Wazuh-style monitoring data platform aggregates three sources:
     #   1. in-guest auditd + FIM (openclaw-fim.sh, baked in build-rootfs;
     #      reverse-shell + sensitive-file-modify rules already fire) — these
@@ -284,7 +301,6 @@ def build_compute(self, ctx):
             gd_rule.add_target(targets.SnsTopic(notifications_topic))
         cdk.CfnOutput(self, "GuardDutyDetectorId", value=gd_detector.ref)
 
-    # ========== Inspector2 host/ECR vulnerability scanning (issue #27) ==========
     # Amazon Inspector v2 is an account-level toggle (no L2 CDK construct
     # today — aws_inspectorv2 only exposes L1s for filters/CIS scans, not
     # for enabling the service itself). Path: config-gated AwsCustomResource

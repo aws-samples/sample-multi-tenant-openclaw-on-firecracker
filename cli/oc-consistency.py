@@ -479,6 +479,7 @@ def attribute(gw: str, s3: str, host_states: dict[str, str]) -> tuple[str, str]:
     readable = {i: s for i, s in host_states.items() if s not in ("UNREADABLE",)}
     if not readable:
         return "INCONCLUSIVE", "no machine answered for this file"
+    unread = sorted(i for i, s in host_states.items() if s == "UNREADABLE")
     hosts_ok = all(s == gw for s in readable.values())
     s3_ok = s3 == gw
     spread = " hosts-disagree=yes" if len(set(readable.values())) > 1 else ""
@@ -486,6 +487,15 @@ def attribute(gw: str, s3: str, host_states: dict[str, str]) -> tuple[str, str]:
         return "DRIFT", ("s3-object-missing (the next machine to boot cannot fetch it)"
                          + ("" if hosts_ok else "; existing hosts also differ"))
     if s3_ok and hosts_ok:
+        if unread:
+            # #557 ruling C: the answered hosts all agree, but a host that should carry
+            # this file did not answer. Post-#556 the main legitimate source of a per-file
+            # UNREADABLE (the file being absent under the deployed config) is already caught
+            # earlier as NOT_APPLICABLE, so a remaining UNREADABLE is closer to a missing
+            # point than to noise. Keep the "answered hosts agree" fact, but do not let it
+            # read as a clean OK: name the silent machine(s) and let main() fold this into
+            # the run-level INCONCLUSIVE exit.
+            return "OK_PARTIAL", f"answered hosts agree; not read on {unread}"
         return "OK", ""
     if s3_ok:
         return "DRIFT", f"only-existing-hosts-off{spread}"
@@ -928,9 +938,10 @@ def report_controlplane(fn_rows, pkg, esm, oas, compared, findings, not_judged,
         for field, sides in (got or {}).get("diffs", {}).items():
             print(f"      {field}: live={sides['live']!r} baseline={sides['baseline']!r}")
     for row in (esm_compared or []):
-        # 判「mapping 键是否存在」,不能靠 .get("mapping", {}) 的默认空 dict:那样任何没有
-        # mapping 键的 DRIFT 行(例如只有 batch_size 漂移)也会取到 live=None,于是同一对
-        # ESM 既报 DRIFT 又被谎报成「基线里有、线上没有」。us-east-1 实测复现过。
+        # 判「mapping 这个键在不在」,不能写成 .get("mapping", {}) 再取 live:默认空 dict 让
+        # 任何【没有 mapping 键】的 DRIFT 行也取到 None,于是一次 batch_size 漂移会同时印出
+        # DRIFT 和「recorded in the baseline, absent live」,读起来就是这条映射被删了。
+        # us-east-1 2026-08-20 真机复现:改一个 batch_size,同一对 ESM 两条结论互相矛盾。
         mapping_diff = row["diffs"].get("mapping")
         if row["verdict"] == "DRIFT" and mapping_diff is not None and mapping_diff.get("live") is None:
             print(f"  MISSING {row['pair'][0].split(':')[-1]} <- {row['pair'][1].split(':')[-1]}  "
@@ -1070,7 +1081,15 @@ class _Parser(argparse.ArgumentParser):
 def parse_args(argv):
     p = _Parser(description="Compare the data plane against a gateway release.")
     p.add_argument("--region", required=True)
-    p.add_argument("--gateway-dir", required=True, help="local checkout of the gateway branch")
+    p.add_argument("--gateway-dir", required=True,
+                   help="local checkout of the gateway branch, and it MUST be the exact tree "
+                        "the environment under test was deployed from. The comparison is a raw "
+                        "byte digest, and the publish scrub (#560) guarantees the internal bb "
+                        "tree and the public gateway tree differ by whole-line internal "
+                        "issue-ref comments. Pointing this at a gateway checkout while the fleet "
+                        "was deployed from bb (or the reverse) reports an expected comment-only "
+                        "difference that is not a real drift; a DRIFT here first means 'wrong "
+                        "tree passed', not 'wrong fleet'.")
     p.add_argument("--scope", default="dataplane", choices=["dataplane", "controlplane"])
     p.add_argument("--profile")
     p.add_argument("--assets-bucket", required=True,
@@ -1079,6 +1098,13 @@ def parse_args(argv):
                         "guess reads another deployment's objects without erroring")
     p.add_argument("--host-asg", default="openclaw-hosts-asg")
     p.add_argument("--seed", help="reproducible sampling; defaults to the instance-id list")
+    p.add_argument("--instance-ids",
+                   help="data plane: comma-separated instance ids; check exactly these instead of "
+                        "sampling the tag. It exists so "
+                        "the discriminating-power check can be run at all: proving the command goes "
+                        "red when a managed script changes means changing one, and that is not "
+                        "something to do on a host carrying tenants. A named run cannot speak for the "
+                        "fleet, so the sampling quota is not applied and the report says so.")
     # control plane (items 12-14). The data-plane run does not read these.
     p.add_argument("--fn-prefix", default="openclaw",
                    help="control plane: which functions belong to this deployment")
@@ -1095,6 +1121,14 @@ def parse_args(argv):
     args = p.parse_args(argv)
     if args.scope == "controlplane" and args.baseline and args.write_baseline:
         p.error("--baseline and --write-baseline are opposite directions; pick one")
+    if args.instance_ids is not None and not [
+            i for i in args.instance_ids.split(",") if i.strip()]:
+        # `--instance-ids "$UNSET_VAR"` used to fall through to full-fleet enumeration with sampling:
+        # the run would contact tenant-carrying hosts nobody asked for, and a discriminating-power
+        # check aimed at a scratch machine would come back clean because it never looked at it
+        # (cross-model review finding). An empty list is a usage error, not "no override".
+        p.error("--instance-ids was given but contains no instance id; refusing to fall back to "
+                "enumerating the fleet, which is not what this invocation asked for")
     return args
 
 
@@ -1115,10 +1149,15 @@ def main(argv=None) -> int:
     try:
         gateway = pathlib.Path(args.gateway_dir).expanduser().resolve()
         files, unresolved = managed_files(gateway)
-        latest, findings, lt_id = effective_lt_version(
-            args.profile, args.region, args.host_asg
-        )
-        variables = boot_vars(args.profile, args.region, lt_id, latest)
+        if args.instance_ids is not None:
+            # A named run is not making a statement about what the next machine boots, so the launch
+            # template is not needed and its absence is not a tool error.
+            latest, findings, lt_id, variables = "n/a", [], None, {}
+        else:
+            latest, findings, lt_id = effective_lt_version(
+                args.profile, args.region, args.host_asg
+            )
+            variables = boot_vars(args.profile, args.region, lt_id, latest)
         findings += unresolved
         for f in files:
             guard = f.get("guard")
@@ -1127,8 +1166,23 @@ def main(argv=None) -> int:
                     f"{f['rel']}: boot-time variable {guard['var']} did not resolve; "
                     "compared without applying its init-host guard"
                 )
-        hosts = metal_hosts(args.profile, args.region)
-        foreign = [h for h in hosts if h["project"] != "openclaw"]
+        if args.instance_ids is not None:
+            named = [i.strip() for i in args.instance_ids.split(",") if i.strip()]
+            hosts = [{"id": i, "role": "host", "launched": None, "project": "openclaw",
+                      "lt_version": None} for i in named]
+            # Guards come from ONE launch-template version, resolved from the ASG. A named instance
+            # need not belong to it, so applying them would mark a file not-applicable on a machine
+            # that legitimately has it. Nothing resolves, every row is compared, and the reason is
+            # printed rather than left for the reader to infer.
+            variables = {}
+            findings.append(
+                f"scope: {len(named)} explicitly named instance(s); the Role=metal-host tag was NOT "
+                "enumerated and init-host guards were NOT applied, so this run says nothing about "
+                "the rest of the fleet")
+            foreign = []
+        else:
+            hosts = metal_hosts(args.profile, args.region)
+            foreign = [h for h in hosts if h["project"] != "openclaw"]
         for h in foreign:
             findings.append(f"{h['id']} carries Role=metal-host but Project={h['project']!r}; "
                             "excluded — this tool does not send SSM to another fleet")
@@ -1148,9 +1202,14 @@ def main(argv=None) -> int:
             for f in findings:
                 print(f"  - {f}", file=sys.stderr)
             return EXIT_INCONCLUSIVE
-        sample, note = pick_sample(hosts, latest, args.seed)
+        if args.instance_ids is not None:
+            sample = [{**h, "group": "named"} for h in hosts]
+            note = (f"{len(sample)} named instance(s); no sampling, no launch-template grouping — "
+                    "this run is about these machines only")
+        else:
+            sample, note = pick_sample(hosts, latest, args.seed)
         in_latest = [i for i in sample if i["group"] == "latest-lt"]
-        if len(in_latest) < LATEST_LAYER_MIN:
+        if args.instance_ids is None and len(in_latest) < LATEST_LAYER_MIN:
             report([], sample, note, findings)
             print(f"\nINCONCLUSIVE: {len(in_latest)} machine(s) on launch-template version "
                   f"{latest}, need {LATEST_LAYER_MIN}. Roll a refresh first: a sample without "
@@ -1190,7 +1249,7 @@ def main(argv=None) -> int:
                   "init-host guards are false in the effective launch template.")
         if (probe_errors or unresolved or not probes
                 or not compared
-                or any(r["verdict"] == "INCONCLUSIVE" for r in compared)):
+                or any(r["verdict"] in ("INCONCLUSIVE", "OK_PARTIAL") for r in compared)):
             print("\nINCONCLUSIVE: at least one of the three points could not be read.",
                   file=sys.stderr)
             return EXIT_INCONCLUSIVE

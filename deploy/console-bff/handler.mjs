@@ -25,7 +25,6 @@ const API_PREFIX = "/capi"; // 前端调 /capi/tenants → 控制面 /tenants
 const COGNITO_DOMAIN = process.env.COGNITO_DOMAIN || "";
 const COGNITO_CLIENT_ID = process.env.COGNITO_CLIENT_ID || "";
 const LOGOUT_URI = process.env.BFF_LOGOUT_URI || "/";
-// #229 观测配置只读端点:S3 前缀 + 允许拉的对象白名单(路径穿越/任意 key 拒)。
 const OBS_ASSETS_BUCKET = process.env.OBS_ASSETS_BUCKET || "";
 const OBS_S3_PREFIX = "deployment/observability/";
 const OBS_ALLOWED_KEYS = new Set([
@@ -71,7 +70,6 @@ const MIME = {
 
 // 动态 config.js:同源相对路径 /capi,零 key。前端 app.core.js 读 OC_DEFAULT_API_URL
 // 作为 apiUrl、OC_DEFAULT_API_KEY 作为 x-api-key 头 —— 这里把 key 置空,url 指向 BFF。
-// #217 — ALB 的 x-amzn-oidc-data(走 OIDC userInfo)【不含】cognito:groups(实测 keys 只有
 // sub/email/username/exp/iss)。故用 token 里的 username 调 Cognito AdminListGroupsForUser
 // 查真实组 → 角色。USER_POOL_ID 由 CDK 注入 env;查失败/无 pool → 安全默认 viewer。
 async function roleForUser(username) {
@@ -92,7 +90,6 @@ async function roleForUser(username) {
 }
 
 async function dynamicConfigJs(headers) {
-  // #217 — 真实角色:ALB token 不带 groups,用其中的 username 查 Cognito 组(见 roleForUser)。
   // 经 window.OC_ROLE 暴露给前端,让 canWrite() 在 BFF 架构下拿到真角色。
   const ident = parseOidcIdentity(headers);
   const role = await roleForUser(ident.username);
@@ -135,7 +132,6 @@ async function serveStatic(urlPath, headers) {
     rel = "/index.html";
   }
   if (rel === "/config.js") {
-    // #217 — config.js 带 window.OC_ROLE(用 token username 查 Cognito 组得真实角色)
     return textResp(200, await dynamicConfigJs(headers), MIME[".js"]);
   }
   const ext = extname(rel);
@@ -172,6 +168,28 @@ export function buildForwardQuery(qs) {
   return params.toString();
 }
 
+// ── 控制面授权头:默认 x-api-key;CTRL_API_AUTH_MODE=iam 时用 execute-api SigV4 ──
+// (#572)IAM 模式用 BFF 自身 execution role 的临时凭据签名,供控制面 API Gateway 开启
+// IAM 鉴权后无缝适配(BFF 不再依赖 x-api-key)。默认 apikey = 现状零回归。signer 惰性
+// 加载(SDK 仅 IAM 模式才拉);__setSigner 供单测注入,避免真装 SDK。
+let _signRequest = null;
+export function __setSigner(fn) { _signRequest = fn; }
+async function loadSigner() {
+  if (!_signRequest) {
+    const mod = await import("./sigv4-client.mjs");
+    _signRequest = mod.signRequest;
+  }
+  return _signRequest;
+}
+async function ctrlAuthHeaders(url, method, body) {
+  const base = { "content-type": "application/json" };
+  if ((process.env.CTRL_API_AUTH_MODE || "apikey").toLowerCase() === "iam") {
+    const sign = await loadSigner();
+    return await sign({ url, method, body, headers: base });
+  }
+  return { ...base, "x-api-key": CTRL_KEY };
+}
+
 async function proxyControlPlane(event, subPath) {
   const qs = event.queryStringParameters || {};
   const query = buildForwardQuery(qs);
@@ -187,7 +205,7 @@ async function proxyControlPlane(event, subPath) {
 
   const res = await fetch(url, {
     method,
-    headers: { "x-api-key": CTRL_KEY, "content-type": "application/json" },
+    headers: await ctrlAuthHeaders(url, method, body),
     body,
   });
   const text = await res.text();
@@ -200,7 +218,6 @@ async function proxyControlPlane(event, subPath) {
   };
 }
 
-// ── #229 obs-config 只读端点 ─────────────────────────────────────────────────
 // GET /capi/obs-config          → 列所有观测配置对象 + 版本 metadata
 // GET /capi/obs-config?key=<w>  → 拉指定对象全文 + 版本 metadata(w 必须在白名单)
 // PUT /capi/obs-config          → 501 未实现:改配置=写 S3,涉及 IAM 写权限(安全红线)+
@@ -287,7 +304,6 @@ export function maskParams(params) {
   return out;
 }
 
-// #217 — 从 ALB 注入的 x-amzn-oidc-data(Cognito 登录后的已验证身份)解出 sub/email +
 // 角色。角色 = cognito:groups 里最高权限(admin>operator>viewer),没组 → viewer。
 // 前端拿不到这个 header(它在 ALB→BFF 之间),故 BFF 解出来经动态 config.js 暴露给前端,
 // 让 console 按真实角色隐藏写操作入口(canWrite 门控在 BFF 架构下才能生效)。
@@ -372,7 +388,6 @@ export function __setXray(fake) {
   _xray = fake;
 }
 
-// #266 — Lazy loaders for the per-tenant log viewer adapters (CloudWatch Logs
 // Insights + AOS). Same pattern as X-Ray: SDK loads only when the route is hit,
 // tests inject fakes via __setLogDeps() so nothing pulls the SDK.
 let _logDeps = null;
@@ -477,7 +492,6 @@ async function putSystemDefault(key, value) {
     Value: value,
     Type: meta.secure ? "SecureString" : "String",
     Overwrite: true,
-    // #264 — 不显式指定 KeyId:SecureString 走 SSM 默认 aws/ssm 托管 key(与
     // litellm-shared-vkey 现有加密方式一致,真机实测)。原来硬编码 alias/clawpool-general
     // 是不存在的 alias(真机 NotFoundException)→ 写 secure 默认值必 KMS 失败。BFF role
     // 的 kms 权限用 ViaService 限定 ssm,与此一致。
@@ -564,7 +578,6 @@ export async function handler(event) {
     }
     if (path === API_PREFIX || path.startsWith(API_PREFIX + "/")) {
       const subPath = path.slice(API_PREFIX.length) || "/";
-      // #221: /capi/traces* is served locally by the trace viewer routes,
       // not proxied to the control-plane API GW. xray client loads lazily so
       // unit tests can inject a fake via handler.__setXray().
       if (subPath === "/traces" || subPath.startsWith("/traces/")) {
@@ -573,7 +586,6 @@ export async function handler(event) {
         emitAudit(event, identity, resp, startMs);
         return resp;
       }
-      // #266: /capi/logs served locally — per-tenant Lambda(CloudWatch)+ vm/host
       // (AOS)log viewer. Adapters load lazily; tests inject via __setLogDeps().
       if (subPath === "/logs") {
         const deps = await loadLogDeps();

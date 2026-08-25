@@ -124,7 +124,14 @@ EC2 user-data has a 16 KB limit, so `init-host.sh` is no longer embedded. CDK pu
 
 Key points of host bootstrap:
 
-- **Firecracker version is pinned to v1.15.1** (overridable through the `FC_VERSION` environment variable), because latest may lack a CI-validated guest kernel.
+- **Firecracker version is pinned to v1.15.1**, because latest may lack a CI-validated guest kernel.
+  Since #435, **setting `FC_VERSION` alone is no longer enough to change the version**: the binary
+  now comes from your own S3 bucket and the tarball's pinned sha256 is verified before install, so
+  a version with no pinned digest fails closed (`die`) rather than installing an unverified binary.
+  To move versions, edit `deploy/userdata/provision-host.sh` — bump `FC_VER` **and** add the
+  matching per-arch digest to `_fc_expected_sha()` — then re-run `setup.sh` to mirror the new
+  version to S3. (`setup.sh` parses the version out of that script and refuses a conflicting
+  `FC_VERSION`, so it can never mirror a version the fleet does not want and report success.)
 - **Shared skills sync every 5 minutes via cron**: `*/5 * * * * root aws s3 sync s3://<bucket>/skills/ /data/shared-skills/`.
 - **Per-host SSH key**: each host generates an ed25519 key pair once, keeps the private key in `/etc/openclaw/host_vm_key`, and injects the public key into each microVM's data disk under `.ssh/authorized_keys`. Each microVM trusts only its own host's key.
 - **Lifecycle hook protection**: `init-host.sh` binds an EXIT trap, returning CONTINUE on success and ABANDON on failure, to prevent a broken host from stalling the ASG; if DDB registration fails after 10 retries, it exits with ABANDON.

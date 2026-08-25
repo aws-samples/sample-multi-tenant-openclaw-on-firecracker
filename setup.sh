@@ -410,6 +410,154 @@ else
   echo "⚠️  scripts/preflight-check.sh 不存在,跳过部署前配置门(#489)—— checkout 不完整?" >&2
 fi
 
+# ── host init 必需脚本清单(单一真相)─────────────────────────────────────────
+# 定义提到 `cdk deploy` 之【前】,因为下面那道 #532 AC7 的门要用它,而复核(见文件后半
+# 「上传后 fail-loud 校验」)用的是同一个变量 —— 清单只能有一份,两份必然漂。
+#
+# #532(Codex 独立复审 blocker-4)—— 清单从这里的内联字符串**移到文件**
+# `deploy/userdata/required-scripts.list`。原因:它原先只存在于本文件,而**标准部署通道**
+# `engineering/deploy/clawpool-deploy.sh` 用的是「桶里 .sh/.py 计数 ≥ 8」这种阈值判据 ——
+# 22 个必需脚本、门在 8 就放行,缺 14 个都能绿。真机实证:`delete-all-vms.sh` 与
+# `lib/lifecycle-guard.sh` 此刻在桶里 404,而那道计数门是绿的。移成文件后两条部署路径
+# 读同一份,不可能漂。
+# 读法:剥注释与空行;`.list` 不匹配 s3 sync 的 --include(*.sh/*.py/*.yaml/*.service),
+# 所以它自己不会被上传到桶里。
+_REQUIRED_SCRIPTS_FILE="$SCRIPT_DIR/deploy/userdata/required-scripts.list"
+[ -f "$_REQUIRED_SCRIPTS_FILE" ] || {
+  echo "FATAL: 缺 $_REQUIRED_SCRIPTS_FILE —— host 脚本发布门的清单是单一真相," >&2
+  echo "  没有它就无法判断桶里齐不齐;拒绝在无清单的状态下部署(#532 AC7)。" >&2
+  exit 1
+}
+# `|| true`:本文件是 `set -e`,清单全是注释时 grep 返 1 会让脚本**静默**死在这一行,
+# 那就轮不到下面那句说明原因了。让它落空,由下面的自证门报话。
+_REQUIRED_SCRIPTS="$(grep -vE '^[[:space:]]*(#|$)' "$_REQUIRED_SCRIPTS_FILE" | tr '\n' ' ' || true)"
+# 判别力自证:清单被读空(路径错/文件被清)时这道门会在空集合上恒真 = 等于没有门。
+_REQUIRED_SCRIPTS_N=$(printf '%s' "$_REQUIRED_SCRIPTS" | wc -w | tr -d ' ')
+[ "${_REQUIRED_SCRIPTS_N:-0}" -ge 10 ] || {
+  echo "FATAL: 从 $_REQUIRED_SCRIPTS_FILE 只读到 $_REQUIRED_SCRIPTS_N 个条目(期望 ≥10)" >&2
+  echo "  —— 清单读空/读残时本门在空集合上恒真,拒绝放行(#532 AC7)。" >&2
+  exit 1
+}
+
+# ── #532 AC7:deploy 前的 host 脚本发布门 ────────────────────────────────────
+#
+# AC7 原文:「部署检查在 required script 缺失时 fail loud,**禁止形成「控制面已上线、
+# 恢复脚本不存在」的窗口**」。
+#
+# 那个窗口是 #532 生产事故的根因之一(Root cause 第 1 条)。ap-southeast-1 2026-08-18 的
+# 一手证据:两个租户卡在 `deleting`,SSM 回执逐字是
+#     [oc:delete] host 脚本缺失/过期,从 S3 自愈装载
+#     [oc:delete] FATAL 拉取 delete-vm.sh 失败
+# —— 桶里当时**没有** `delete-vm.sh`,所以连 `host_script_self_heal` 也救不了;
+# 脚本直到 08:17:10Z 才补进 S3,而那两个租户已经耗尽主队列重投进了 DLQ。
+#
+# **为什么原有的那道门不够**:它在下面 `cdk deploy` 之【后】(先 deploy → 取桶名 → 上传
+# → 复核)。桶名只能从栈输出取,所以上传本身没法前移;但「控制面已经上线、而桶里缺脚本」
+# 这个状态是可以**在 deploy 之前就判掉**的 —— 只要栈已经存在。
+#
+# 判据分两种情形:
+#   · **栈已存在**(= 增量部署,正是事故那个场景):桶里必须已有全部 required 脚本,
+#     否则停在 deploy 之前 —— 新控制面不上线,不会去引用一个不存在的脚本;
+#   · **栈不存在**(首次部署):跳过。此时没有控制面在跑、也没有租户,窗口不存在。
+#
+# **缺脚本的处置方式是这道门自己把缺的补上**(见下面那段),不是绕过它重跑 ——
+# 重跑仍然是 deploy 在前、上传在后,补救本身就会重建这个窗口(Codex 独立复审指出)。
+# 逃生舱 `OC_SKIP_PREDEPLOY_SCRIPT_GATE=1` 保留,是为了防「一道判错的门把部署彻底锁死」,
+# 不是缺脚本的补救路径;用它就等于这一次自愿接受 AC7 那个窗口。
+if [ "${OC_SKIP_PREDEPLOY_SCRIPT_GATE:-}" = "1" ]; then
+  echo "⚠️  OC_SKIP_PREDEPLOY_SCRIPT_GATE=1:跳过 deploy 前的 host 脚本发布门(#532 AC7)" >&2
+  echo "⚠️  这一次自愿接受「控制面已上线、恢复脚本可能不在桶里」的窗口;缺脚本的正常处置是" >&2
+  echo "⚠️  让本门自己把缺的补上(把开关去掉重跑),不是绕过它。" >&2
+else
+  # #532:把「栈确实不存在」与「查不动」分开。原写法是 `2>/dev/null || true` ——
+  # 吞掉全部错误,于是 AccessDenied / 凭据过期 / 限流 / 网络故障都退化成空串、被下面
+  # 当成「首次部署」而**静默跳过这道门**,这条部署路径整个 fail-open
+  # (Codex 独立复审在本 MR 上指出)。把「读不到」当成「不存在」是本仓明令禁止的假判定。
+  # 只有 CloudFormation 明确回 "does not exist" 才算首次部署;其余一律 fail-closed。
+  _pre_bucket=$(aws cloudformation describe-stacks --stack-name OpenClawOrchestrator \
+    --query 'Stacks[0].Outputs[?OutputKey==`AssetsBucket`].OutputValue' --output text \
+    "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" 2>&1) && _pre_rc=0 || _pre_rc=$?
+  if [ "$_pre_rc" -ne 0 ]; then
+    case "$_pre_bucket" in
+      *"does not exist"*) _pre_bucket="" ;;   # 栈确实不存在 = 首次部署
+      *)
+        echo "FATAL: deploy 前脚本门:查 OpenClawOrchestrator 失败,判不出桶里齐不齐" >&2
+        echo "  拒绝放行(不把「读不到」当成「不存在」)。原始错误:$_pre_bucket" >&2
+        exit 1 ;;
+    esac
+  elif [ "$_pre_bucket" = "None" ]; then
+    # 栈在、但没有 AssetsBucket 输出:那不是首次部署,而是判不出 ⇒ 同样 fail-closed。
+    echo "FATAL: deploy 前脚本门:栈存在但没有 AssetsBucket 输出,判不出桶里齐不齐,拒绝放行" >&2
+    exit 1
+  fi
+  if [ -z "$_pre_bucket" ]; then
+    echo "· deploy 前脚本门:栈确实不存在(首次部署)—— 跳过。此时没有控制面在跑,无窗口。"
+  else
+    _pre_uploaded=$(aws s3 ls "s3://${_pre_bucket}/deployment/scripts/" --recursive \
+      "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" 2>&1) \
+      || { echo "FATAL: deploy 前脚本门:列桶 s3://${_pre_bucket}/deployment/scripts/ 失败,拒绝放行(不猜)" >&2
+           echo "  原始错误:$_pre_uploaded" >&2; exit 1; }
+    _pre_uploaded=$(printf '%s\n' "$_pre_uploaded" | awk '{print $NF}')
+    _pre_missing=""
+    for _s in $_REQUIRED_SCRIPTS; do
+      # #532:`-x` 整行精确匹配。原来是 `-qF`(子串),桶里一个 `route_ops.py.bak` 之类的
+      # 邻居就能把这道门骗过去说「在桶里」,而 host 拉真键时照样 404 —— 那是 AC7 明文
+      # 要禁的失效方式,不是无关的洁癖。
+      # #532:用 here-string,**不要** `printf … | grep -q`。本文件是 `set -o pipefail`,
+      # 而 `grep -q` 命中即退出 ⇒ 上游收 SIGPIPE、管道退出码 141 ⇒ 明明在桶里的对象被判
+      # 成「缺失」。列表小时不触发,桶里对象一多就会 —— 一个只在规模上暴露的假判定。
+      grep -qxF "deployment/scripts/$_s" <<<"$_pre_uploaded" \
+        || _pre_missing="$_pre_missing $_s"
+    done
+    # #532:缺了就**在这里把缺的那几个补上、再复核**,而不是叫人绕过这道门重跑。
+    # 原来那句补救写的是「OC_SKIP_PREDEPLOY_SCRIPT_GATE=1 bash setup.sh …」—— 可那一次
+    # 重跑仍然是 deploy 在前、上传在后,**补救本身重建了这个窗口**。发版新增一个 required
+    # 脚本时,那个脚本本来就还不在桶里,于是每次发版都会走上这条重建窗口的路
+    # (Codex 独立复审在本 MR 上指出;`clawpool-deploy.sh` 那条路径已按同样形状修过)。
+    # 只补缺的那几个、不在这里跑全量同步:全量会把本次所有改过的 host 脚本提前发布,而控制面
+    # 还没上线;cdk deploy 随后若失败就是一次部分发布。全量同步仍在 deploy 之后(见文件后半)。
+    if [ -n "$_pre_missing" ]; then
+      echo "· deploy 前脚本门:桶里缺$_pre_missing —— 只补这几个,再复核(不让控制面先上线)"
+      for _s in $_pre_missing; do
+        [ -f "$SCRIPT_DIR/deploy/userdata/$_s" ] || {
+          echo "FATAL: 清单里的 $_s 在仓内不存在(deploy/userdata/$_s)—— 清单与源码漂了" >&2
+          echo "  推也推不上去;先修 $_REQUIRED_SCRIPTS_FILE 或补上源码文件。" >&2
+          exit 1; }
+        aws s3 cp "$SCRIPT_DIR/deploy/userdata/$_s" \
+          "s3://${_pre_bucket}/deployment/scripts/$_s" \
+          "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" >/dev/null || {
+          echo "FATAL: deploy 前脚本门:上传 $_s 失败,拒绝放行" >&2; exit 1; }
+      done
+      _pre_uploaded=$(aws s3 ls "s3://${_pre_bucket}/deployment/scripts/" --recursive \
+        "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" 2>&1) \
+        || { echo "FATAL: deploy 前脚本门:补齐后列桶失败,拒绝放行(不猜)" >&2
+             echo "  原始错误:$_pre_uploaded" >&2; exit 1; }
+      _pre_uploaded=$(printf '%s\n' "$_pre_uploaded" | awk '{print $NF}')
+      _pre_missing=""
+      for _s in $_REQUIRED_SCRIPTS; do
+        grep -qxF "deployment/scripts/$_s" <<<"$_pre_uploaded" \
+          || _pre_missing="$_pre_missing $_s"
+      done
+    fi
+    if [ -n "$_pre_missing" ]; then
+      echo "" >&2
+      echo "⛔ deploy 前脚本门(#532 AC7):补齐之后桶 s3://${_pre_bucket}/deployment/scripts/" >&2
+      echo "   仍缺这些 required host 脚本:$_pre_missing" >&2
+      echo "" >&2
+      echo "   已在 cdk deploy 之【前】中止 —— 不让新控制面上线去引用一个不存在的脚本。" >&2
+      echo "   那正是 #532 的根因:租户会卡在 deleting,连 host_script_self_heal 也救不了" >&2
+      echo "   (它的来源对象本身不存在),而主队列重投耗尽后消息进 DLQ、无人接管。" >&2
+      echo "" >&2
+      echo "   逐个 cp 都推不上去,说明是真问题:查仓内是否真有这些文件、写桶权限," >&2
+      echo "   以及 deploy 之后那次全量同步的 --include/--exclude 是否会把它们挡掉。" >&2
+      echo "   清单在 $_REQUIRED_SCRIPTS_FILE。" >&2
+      exit 1
+    fi
+    echo "✓ deploy 前脚本门:桶里已有全部 $(echo $_REQUIRED_SCRIPTS | wc -w | tr -d ' ') 个 required host 脚本"
+  fi
+fi
+echo ""
+
 # stack 选择符的裸 cdk deploy 会报 "specify which stacks ... or --all" 并退出。
 # --all 按 add_dependency 拓扑序先 Orchestrator(建桶)后 OpenClawImage(烤镜像)。
 PATH=".venv/bin:$PATH" scripts/deploy-cdk.sh "$REGION" "$PROFILE" \
@@ -444,48 +592,157 @@ echo "✓ Scripts uploaded; existing hosts will pick them up via init-host.sh re
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/adot-config.yaml" "s3://${BUCKET}/deployment/scripts/adot-config.yaml" \
   "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 
-# ADOT + Fluent Bit 配置额外上传到 deployment/observability/ 独立前缀,
-# 带 sha256 / 上传时间 / git commit 元数据(供 BFF 只读端点回显版本)。
-# 启动时从这个前缀拉,拉不到回退镜像内烤的兜底版(见 init-host.sh /
-# install-edge.sh 的 fail-closed 逻辑)。下发新版 = 重跑本上传段;
-_OBS_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-_OBS_COMMIT="$(git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-# 跨平台 sha256:Linux(bastion/AL2023)只有 sha256sum,macOS 只有 shasum。之前硬用 shasum
-# 在 AL2023 上 `command not found`,叠加 `set -euo pipefail` 让 setup.sh 恰好卡在第一个
-# _obs_upload,后续 launch-vm/stop-vm/harden-config 全没上传 → host init fail-loud fast-ABANDON
-# (2026-07-17 新加坡 8 连 ABANDON 真根因,非 hook 超时)。挑存在的那个;两个都没有 fail-loud
-# 中止(codex 重审3:别静默上传空 sha 摘要降低证据完整性,宁停不吞)。
+# deployment/observability/ 的 10 个对象现在由 deploy/stacks/obs_assets.py 的
+# BucketDeployment 随上面第 416 行的 cdk deploy 一起投放,并被 Host/Edge ASG 用
+# add_dependency 挡在启动之前。原因:这个前缀是**开机时读**的,靠"记得重跑 setup.sh
+# promote 到本前缀 → 下次开机自动回退)、#531(前缀比 bb 落后一天,护栏命中 0)。
+# 顺带修掉一个不对称:下面 _REQUIRED_SCRIPTS 的桶内复核只覆盖 deployment/scripts/,
+# 观测前缀从来没有门 —— 所以"漏传"在那半边是响的、在这半边一直是静默的。
+#
+# 判据用 sha256 而不是"对象存在":元数据里的 sha256 是 CDK 按**本次 checkout 的字节**
+# 算的,与仓库文件现算的摘要相等,才证明机队开机拉到的就是这份代码。缺对象、摘要不等、
+# 元数据没写上,三种都停 —— 这三种都会让 host 起坏或静默跑旧配置。
 _sha256() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}';
   elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}';
   else echo "FATAL: 无 sha256sum/shasum,装一个再部署(证据摘要不可空)" >&2; return 1; fi
 }
-_obs_upload() {
-  local src="$1" key="$2"
-  local sha; sha=$(_sha256 "$src") || return 1
-  if ! echo "$sha" | grep -qiE '^[0-9a-f]{64}$'; then
-    echo "FATAL: sha256($src) 格式非法: '$sha'(期望 64 hex)" >&2; return 1
+# key(相对 deployment/observability/)=仓库源文件。清单的权威副本在
+# deploy/stacks/obs_assets.py 的 OBS_ASSETS;tests/test_265_obs_assets_bucketdeployment.py
+# 断言两边逐条相等,所以这里改漏一条会在 CI 红,而不是等到真机。
+_OBS_PAIRS="adot/adot-config.yaml=deploy/userdata/adot-config.yaml
+fluent-bit/install-fluent-bit.sh=deploy/edge/fluent-bit/install-fluent-bit.sh
+fluent-bit/edge/parsers.conf=deploy/edge/fluent-bit/edge/parsers.conf
+fluent-bit/edge/extract_trace_root.lua=deploy/edge/fluent-bit/edge/extract_trace_root.lua
+fluent-bit/edge/add_timestamp.lua=deploy/edge/fluent-bit/edge/add_timestamp.lua
+fluent-bit/edge/fluent-bit.conf=deploy/edge/fluent-bit/edge/fluent-bit.conf
+fluent-bit/host/parsers.conf=deploy/edge/fluent-bit/host/parsers.conf
+fluent-bit/host/extract_tenant_id.lua=deploy/edge/fluent-bit/host/extract_tenant_id.lua
+fluent-bit/host/add_timestamp.lua=deploy/edge/fluent-bit/host/add_timestamp.lua
+fluent-bit/host/fluent-bit.conf=deploy/edge/fluent-bit/host/fluent-bit.conf"
+_OBS_BAD=""
+_OBS_OK=0
+for _pair in $_OBS_PAIRS; do
+  _k="${_pair%%=*}"; _src="${_pair#*=}"
+  _want=$(_sha256 "$SCRIPT_DIR/$_src") || { _OBS_BAD="$_OBS_BAD $_k(本地摘要算不出)"; continue; }
+  _got=$(aws s3api head-object --bucket "$BUCKET" --key "deployment/observability/$_k" \
+    "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" \
+    --query 'Metadata.sha256' --output text 2>/dev/null || echo ABSENT)
+  if [ "$_got" = "$_want" ]; then
+    _OBS_OK=$((_OBS_OK + 1))
+  else
+    _OBS_BAD="$_OBS_BAD $_k(S3=$(printf %.12s "$_got") 仓库=$(printf %.12s "$_want"))"
   fi
-  aws s3 cp "$src" "s3://${BUCKET}/${key}" \
-    "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet \
-    --metadata "sha256=${sha},uploaded-at=${_OBS_TS},git-commit=${_OBS_COMMIT}"
+done
+if [ -n "$_OBS_BAD" ]; then
+  echo "FATAL: deployment/observability/ 与本次 checkout 不一致(host 会起坏或静默跑旧观测配置):$_OBS_BAD" >&2
+  echo "  这些对象由 CDK 的 BucketDeployment 投放(deploy/stacks/obs_assets.py),不由本脚本上传。" >&2
+  echo "  查:上面第 416 行的 cdk deploy 是否真跑过、Obs* 自定义资源是否 CREATE/UPDATE_COMPLETE。" >&2
+  exit 1
+fi
+echo "✓ 复核 deployment/observability/ 与本次 checkout 逐字节一致($_OBS_OK/10,CDK 投放)"
+
+# 为什么在这里做:10W 规模并发启 host 时每台都打一次 github.com 的 releases,撞 GitHub
+# rate limit → bootstrap 失败 → lifecycle hook ABANDON → ASG 替换循环。把「打 GitHub」
+# 从【每台 host 一次】收敛成【部署机一次】,机队全部从 S3 拉
+# (provision-host.sh 第 3 节的 _fc_s3_uri 按同一 key 布局取)。
+#
+# 两个架构都传:host 机队目前是 arm64 metal(m7g/m8g/r7g/r8g → aarch64),但 plain-AMI 路径
+# 也可能跑在 x86_64 上。少传一个架构 = 那类机器静默回落 GitHub,正是本 issue 要消除的路。
+# 幂等:已存在且摘要相同就跳过(重跑 setup.sh 不重复下载 ~10MB)。
+# 版本号【从 provision-host.sh 解析】,不在这里各持一份。
+# 为什么不写 "${FC_VERSION:-v1.15.1}":那样部署机的 FC_VERSION 只影响镜像哪个版本,
+# 而 host / Packer / Image Builder 拿不到这个变量,仍按脚本里的 FC_VER 取件 —— 于是
+# `FC_VERSION=v1.16.0 ./setup.sh` 会把 v1.16.0 传上去、报成功,机队却仍要 v1.15.1:
+# boot 路径静默回落 github,bake 路径(强制 S3)直接构建失败。典型的假成功。
+# 唯一源就选 host 真正执行的那个脚本 —— 而且升版本本来就必须编辑它(钉死摘要也在那里)。
+_FC_VER_MIRROR="$(sed -n 's/^FC_VER="\${FC_VERSION:-\(v[0-9][0-9.]*\)}".*/\1/p' \
+  "$SCRIPT_DIR/deploy/userdata/provision-host.sh" | head -1)"
+if [ -z "$_FC_VER_MIRROR" ]; then
+  echo "FATAL: 解析不出 provision-host.sh 的 FC_VER —— 该行写法变了?不猜版本,现在停。" >&2
+  exit 1
+fi
+if [ -n "${FC_VERSION:-}" ] && [ "${FC_VERSION}" != "$_FC_VER_MIRROR" ]; then
+  echo "FATAL: FC_VERSION=${FC_VERSION} 与 provision-host.sh 的 FC_VER=${_FC_VER_MIRROR} 不一致。" >&2
+  echo "  改版本请编辑 provision-host.sh(同时补上该版本的钉死 sha256),而不是只在部署机设环境变量" >&2
+  echo "  —— 后者只会镜像一个机队不要的版本并谎报成功。" >&2
+  exit 1
+fi
+# 摘要固定,与 provision-host.sh 的 _fc_expected_sha() 【逐字同表】——
+# tests/test_435_fc_binary_from_s3.py 有断言钉住两处一致。
+# 这一侧校验的意义:别把一个被劫持/被换过的 GitHub 发布物镜像进自家桶,那等于亲手把污染源
+# 搬到机队门口。键带版本号 → 改 _FC_VER_MIRROR 而不更新摘要就查不到 → 拒绝上传(fail-closed)。
+_fc_expected_sha() {  # $1=arch;输出 64 位十六进制或空
+  case "${_FC_VER_MIRROR}:$1" in
+    v1.15.1:aarch64) printf '00654ac1e702a22744121ea9f10a4f792ebd7c3a744cba587dfac9fcb79b41a5' ;;
+    v1.15.1:x86_64)  printf 'd4a32ab2322d887ca1bc4a4e7afa9cc35393e6362dfc2b3becb389d362e4275a' ;;
+    *) return 0 ;;
+  esac
 }
-_obs_upload "$SCRIPT_DIR/deploy/userdata/adot-config.yaml"                  "deployment/observability/adot/adot-config.yaml"
-# Shared installer (edge + host pull this same script).
-_obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/install-fluent-bit.sh"      "deployment/observability/fluent-bit/install-fluent-bit.sh"
-# 每个角色:先传 fluent-bit.conf 依赖的 parsers/lua,最后才传 conf 自己。一台 host 在
-# 两次上传之间开机会拉到「conf 已是新版、它引用的 filter 脚本还没上去」的组合 →
-# install-fluent-bit.sh 校验缺脚本直接 die → ASG ABANDON。conf 放最后,这个窗口里
-# edge role config.
-_obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/edge/parsers.conf"           "deployment/observability/fluent-bit/edge/parsers.conf"
-_obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/edge/extract_trace_root.lua" "deployment/observability/fluent-bit/edge/extract_trace_root.lua"
-_obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/edge/add_timestamp.lua"      "deployment/observability/fluent-bit/edge/add_timestamp.lua"
-_obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/edge/fluent-bit.conf"        "deployment/observability/fluent-bit/edge/fluent-bit.conf"
-_obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/host/parsers.conf"           "deployment/observability/fluent-bit/host/parsers.conf"
-_obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/host/extract_tenant_id.lua"  "deployment/observability/fluent-bit/host/extract_tenant_id.lua"
-_obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/host/add_timestamp.lua"       "deployment/observability/fluent-bit/host/add_timestamp.lua"
-_obs_upload "$SCRIPT_DIR/deploy/edge/fluent-bit/host/fluent-bit.conf"        "deployment/observability/fluent-bit/host/fluent-bit.conf"
-echo "✓ Observability configs uploaded to s3://${BUCKET}/deployment/observability/ (commit=${_OBS_COMMIT})"
+_fc_mirror() {
+  local arch="$1"
+  local name="firecracker-${_FC_VER_MIRROR}-${arch}.tgz"
+  local key="deployment/binaries/firecracker/${_FC_VER_MIRROR}/${name}"
+  # 先取本(版本, 架构)钉死的摘要 —— 跳过判据要用它。
+  local want; want=$(_fc_expected_sha "$arch")
+  [ -n "$want" ] || { echo "  ✗ ${_FC_VER_MIRROR}/${arch} 没有钉死的 sha256 —— 升版本请先在 _fc_expected_sha 里补上,拒绝镜像未核对的制品" >&2; return 1; }
+  # 幂等跳过的判据是【对象记录的 sha256 == 钉死值】,而不是"key 存在"。
+  # 只判存在会留下一个洞:对象损坏或被覆盖后,mirror 永远跳过 → 永远不自愈,而 setup 报成功;
+  # 于是 boot 路径静默回落 github,bake 路径(强制 S3)直接构建失败。所以不匹配就重传覆盖。
+  # 【这不是安全控制】:metadata 由能写该对象的人自己写,攻击者会把它设成匹配值。安全控制在
+  # host 侧 —— provision-host.sh 安装前对【真实字节】强制校验(_fc_expected_sha)。
+  # 这里管的是运维正确性:让 mirror 能自愈,并且不谎报就绪。
+  # fc-version/mirrored-at/arch,真机 head-object 实测),它恰好也记了 sha256 且与钉死值一致。
+  local _existing_sha
+  _existing_sha=$(aws s3api head-object --bucket "$BUCKET" --key "$key" \
+    "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" \
+    --query 'Metadata.sha256' --output text 2>/dev/null) || _existing_sha=""
+  if [ "$_existing_sha" = "$want" ]; then
+    echo "  ✓ ${name} 已在 S3 且记录摘要与钉死值一致,跳过(sha256=${want:0:12}…)"
+    return 0
+  fi
+  if [ -n "$_existing_sha" ] && [ "$_existing_sha" != "None" ]; then
+    echo "  ⚠ ${name} 已在 S3 但记录摘要与钉死值不符(记录 ${_existing_sha:0:12}…,期望 ${want:0:12}…)—— 重新下载并覆盖" >&2
+  fi
+  local tmp; tmp="$(mktemp -d)"
+  # 部署机这一次是允许打 GitHub 的 —— 它就是本 issue 要把 N 次收敛成 1 次的那 1 次。
+  if ! curl -fsSL --connect-timeout 10 --max-time 300 \
+       -o "${tmp}/${name}" \
+       "https://github.com/firecracker-microvm/firecracker/releases/download/${_FC_VER_MIRROR}/${name}"; then
+    echo "  ✗ 从 GitHub 下载 ${name} 失败" >&2
+    mv "$tmp" "${TMPDIR:-/tmp}/oc435-failed-$$" 2>/dev/null || true
+    return 1
+  fi
+  # 的 BucketDeployment 投放并自带 metadata,这里是 deployment/scripts/ 侧的同款做法)。
+  local sha; sha=$(_sha256 "${tmp}/${name}") || { echo "  ✗ sha256 计算失败" >&2; return 1; }
+  echo "$sha" | grep -qiE '^[0-9a-f]{64}$' || { echo "  ✗ sha256 格式非法: '$sha'" >&2; return 1; }
+  # 与钉死的摘要比对(want 已在函数开头取好)。格式合法 ≠ 内容正确 —— 只验格式的话,
+  # 一个被换过的发布物照样通过。
+  [ "$sha" = "$want" ] || { echo "  ✗ ${name} sha256 不匹配:实得 ${sha},期望 ${want} —— 拒绝上传" >&2; return 1; }
+  # tar 完整性先验一遍,别把坏包传上去让 380 台 host 一起 tar 失败。
+  tar -tzf "${tmp}/${name}" >/dev/null 2>&1 || { echo "  ✗ ${name} 不是合法 tgz" >&2; return 1; }
+  aws s3 cp "${tmp}/${name}" "s3://${BUCKET}/${key}" \
+    "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet \
+    --metadata "sha256=${sha},uploaded-at=${_OBS_TS},git-commit=${_OBS_COMMIT}" \
+    || { echo "  ✗ 上传 ${name} 失败" >&2; return 1; }
+  echo "  ✓ ${name} → s3://${BUCKET}/${key} (sha256=${sha:0:12}…)"
+  rm -rf "$tmp"
+}
+_fc_mirror_failed=0
+for _arch in aarch64 x86_64; do
+  _fc_mirror "$_arch" || _fc_mirror_failed=1
+done
+if [ "$_fc_mirror_failed" -ne 0 ]; then
+  # 【故意不在这里 exit】。第一版就是在这里 exit 1,那是把严重性排序搞反了:本段下面还要上传
+  # launch-vm.sh / lib/harden-config.sh / lib/cred-inject.sh 等 host init 必需脚本 —— 缺
+  # harden-config.sh 的后果是「launch-vm.sh 每次启动 exit 1,一台都起不来」(见下方各条注释),
+  # 比「FC 回落 github」严重得多。也就是说 GitHub 抖一下就能让部署在关键脚本落地前中止,
+  # 反而制造更大的故障。
+  # 所以只记账,等必需脚本上传【并校验】完再 exit(见下方 _fc_mirror_failed 的最终判定)。
+  echo "⚠ #435 Firecracker mirror 未全部就绪 —— 先把 host init 必需脚本传完再报错" >&2
+else
+  echo "✓ Firecracker ${_FC_VER_MIRROR} binaries mirrored to s3://${BUCKET}/deployment/binaries/firecracker/"
+fi
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/backup-data.sh" "s3://${BUCKET}/deployment/scripts/backup-data.sh" \
   "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/launch-vm.sh" "s3://${BUCKET}/deployment/scripts/launch-vm.sh" \
@@ -494,6 +751,15 @@ aws s3 cp "$SCRIPT_DIR/deploy/userdata/launch-vm.sh" "s3://${BUCKET}/deployment/
 # 后执行,config security.egress_allowlist_enabled 默认 false 时脚本自身跳过。缺它 →
 # init-host WARN 跳过(host-agent 仍起),egress 退回现状放行(非致命)。
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/setup-egress-allowlist.sh" "s3://${BUCKET}/deployment/scripts/setup-egress-allowlist.sh" \
+  "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
+# oc-egress-chain.sh + oc-egress-sim.py(#566)— guest 出网 default-deny 白名单基线。
+# sim 是唯一权威规则序(--emit-rules),chain 脚本据此原子换入 host 级 tap 共享链
+# OPENCLAW-EGRESS。init-host.sh 在 egress_mode=deny 时拉到 /home/ubuntu/ 后 apply;
+# egress_mode=off(默认)时 init-host 跳过(host 零变化,非致命)。两个必须同时在桶,
+# chain 脚本 SPEC_SCRIPT 指向同目录 oc-egress-sim.py,缺 sim → apply die。
+aws s3 cp "$SCRIPT_DIR/deploy/userdata/oc-egress-chain.sh" "s3://${BUCKET}/deployment/scripts/oc-egress-chain.sh" \
+  "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
+aws s3 cp "$SCRIPT_DIR/deploy/userdata/oc-egress-sim.py" "s3://${BUCKET}/deployment/scripts/oc-egress-sim.py" \
   "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 # 收敛库(每次启动跑,不管 fresh/wake)。同 host-agent.py / launch-vm.sh 的下发
 # 契约:setup.sh 上传到 S3,init-host.sh 拉到 /home/ubuntu/lib/。缺它 →
@@ -504,6 +770,22 @@ aws s3 cp "$SCRIPT_DIR/deploy/userdata/lib/harden-config.sh" "s3://${BUCKET}/dep
 # credentials 时才 source;缺它则该 VM fail-loud 中止(不静默注入空凭据)。
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/lib/cred-inject.sh" "s3://${BUCKET}/deployment/scripts/lib/cred-inject.sh" \
   "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
+# spire-kit/(#516)— init-host.sh step4c 在 SSM /openclaw/spire-kit/enabled=true 时逐个拉
+# 这四个键。这里必须逐个上传:整目录 sync 只存在于内部部署脚本里,而 setup.sh 是对外唯一
+# delete-vm.sh 那个坑。开机拉不到时 step4c 是 fail-open(host 照常服务、落
+# spire-kit.install-failed 标记),所以症状不是起不来而是这台 host 静默没装上 broker。
+# 【故意不在这里 exit】同 _fc_mirror_failed 的理由:本段下面还要传 launch-vm.sh /
+# lib/harden-config.sh 等 host init 必需脚本,缺它们是「一台都起不来」。spire-kit 是可选组件
+# (SSM 开关默认关、开机 fail-open),让它的一次瞬时上传失败在必需脚本落地前中止部署,是把
+# 严重性排序搞反 —— 反而制造半部署状态。所以只记账,最末统一判定(搜 _spire_kit_upload_failed)。
+_spire_kit_upload_failed=0
+for _spire_f in spire-kit-setup.sh install.sh spire-join-broker.py spire-join-broker.service; do
+  aws s3 cp "$SCRIPT_DIR/deploy/userdata/spire-kit/${_spire_f}" \
+    "s3://${BUCKET}/deployment/scripts/spire-kit/${_spire_f}" \
+    "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet \
+    || { echo "⚠ spire-kit/${_spire_f} 上传失败 —— 先把 host init 必需脚本传完再报错" >&2
+         _spire_kit_upload_failed=1; }
+done
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/stop-vm.sh" "s3://${BUCKET}/deployment/scripts/stop-vm.sh" \
   "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 # launch + runtime FD evidence. Referenced by the rebuild control path.
@@ -530,6 +812,15 @@ aws s3 cp "$SCRIPT_DIR/deploy/userdata/start-all-vms.sh" "s3://${BUCKET}/deploym
   "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/stop-all-vms.sh" "s3://${BUCKET}/deployment/scripts/stop-all-vms.sh" \
   "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
+# SSM 并发 = host 数而非租户数)。与 start/stop-all-vms.sh 同一模式,但清单驱动:
+# 只删 manifest 里指定的那批租户,不按目录删。
+# 上传必须先于任何会调它的控制面上线 —— #532 的根因就是"控制面已上线、脚本不在桶里"。
+aws s3 cp "$SCRIPT_DIR/deploy/userdata/delete-all-vms.sh" "s3://${BUCKET}/deployment/scripts/delete-all-vms.sh" \
+  "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
+# delete-all-vms.sh 对清单里【每个】租户在破坏性动作前后各调一次;缺它 = 无围栏
+# 的批量 rm -rf,故与 lib/harden-config.sh / lib/cred-inject.sh 同档进桶 + 进清单。
+aws s3 cp "$SCRIPT_DIR/deploy/userdata/lib/lifecycle-guard.sh" "s3://${BUCKET}/deployment/scripts/lib/lifecycle-guard.sh" \
+  "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 
 # ── 上传后 fail-loud 校验(根治「源码在但没进桶」这一类反复踩的 bug:route_ops.py /
 #    → crashloop → lifecycle ABANDON 换机器死循环,顺路径测不出来,只有真部署才炸)。
@@ -538,12 +829,25 @@ aws s3 cp "$SCRIPT_DIR/deploy/userdata/stop-all-vms.sh" "s3://${BUCKET}/deployme
 #    保留逐个 cp(每条带 why),这里独立维护一份「host init 必需脚本」清单,传完直接查桶——
 #    缺任一个立即停,别把「某脚本静默没传」的软 bug 拖成「host 永远起不来」的硬 bug。
 #    也兜住上面 `|| true` 吞错、SSM 后台跑到一半被砍这类 set -e 抓不到的漏传。
-_REQUIRED_SCRIPTS="host-agent.py route_ops.py oc-guest-log-reader.py launch-vm.sh stop-vm.sh rebuild-vm.sh reset-vm.sh delete-vm.sh backup-data.sh clone-data.sh migrate-vm.sh resize-disk.sh start-all-vms.sh stop-all-vms.sh setup-egress-allowlist.sh adot-config.yaml lib/harden-config.sh lib/cred-inject.sh"
+# #532 AC7 —— 清单的定义已提到 `cdk deploy` 之前(搜 `_REQUIRED_SCRIPTS=`),因为那里新增了
+# 一道 deploy 前的门要用它。这里**复用同一个变量**:清单只能有一份,两份必然漂 ——
+# 而漂的表现正是这道门要防的那件事(某个脚本没进桶,却以为查过了)。
+# #532:列桶失败要与「列到了但缺」分开报。原写法 `2>/dev/null` 吞错 —— 判定方向仍是
+# fail-closed(列不出 ⇒ 全判缺 ⇒ exit 1),但报出来的原因会是「脚本没进 S3」,把人引去查
+# s3 cp,而真因是权限/网络。同上面那道 deploy 前门一条纪律:不把「读不到」说成「不存在」。
 _UPLOADED=$(aws s3 ls "s3://${BUCKET}/deployment/scripts/" --recursive \
-  "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" 2>/dev/null | awk '{print $NF}')
+  "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" 2>&1) \
+  || { echo "FATAL: 列桶 s3://${BUCKET}/deployment/scripts/ 失败,判不出必需脚本齐不齐,现在停" >&2
+       echo "  原始错误:$_UPLOADED" >&2; exit 1; }
+_UPLOADED=$(printf '%s\n' "$_UPLOADED" | awk '{print $NF}')
 _MISSING=""
 for _s in $_REQUIRED_SCRIPTS; do
-  echo "$_UPLOADED" | grep -qF "deployment/scripts/$_s" || _MISSING="$_MISSING $_s"
+  # #532:`-x` 整行精确匹配(与上面那道 deploy 前门同一条理由)。子串匹配下桶里一个
+  # `route_ops.py.bak` 之类的邻居就能把门骗绿,而 host 拉真键时照样 404。
+  # #532:here-string,不要 `printf … | grep -q`(pipefail + grep -q 提前退出 = 141,
+  # 在桶里的对象被判成缺失)。这一处的方向更坏:它会**误拦一次合法部署**。
+  grep -qxF "deployment/scripts/$_s" <<<"$_UPLOADED" \
+    || _MISSING="$_MISSING $_s"
 done
 if [ -n "$_MISSING" ]; then
   echo "FATAL: host init 必需脚本没进 S3(host 会 crashloop-ABANDON):$_MISSING" >&2
@@ -551,6 +855,14 @@ if [ -n "$_MISSING" ]; then
   exit 1
 fi
 echo "✓ 校验 host init 必需脚本全部在桶($(echo $_REQUIRED_SCRIPTS | wc -w) 个)"
+
+# 演进过程记在这里,因为这条顺序被改了两次、每次都是为同一个道理:
+#   v1 紧跟 mirror 循环 exit → 一次 GitHub 抖动就让部署停在 launch-vm.sh / harden-config.sh
+#      落地之前,把「FC 回落 github」这个可恢复问题换成「host 永远起不来」;
+#   v2 挪到本处(必需脚本查桶校验之后)→ 好一些,但后面还有 LiteLLM/监控资产、SSM 参数、
+#      部署输出与 console 配置,提前退出仍然留下半部署状态;
+#   v3(当前)推到脚本最末 → 该做的全做完,再以非零退出如实报告 mirror 没就绪。
+# 早退没有任何好处:mirror 缺件不影响后续步骤,而后续步骤缺了都会各自制造故障。
 
 # 聚合 SSM 命令现调 `launch-vm.sh --manifest|--from-ddb ...`(见 dispatch_service.py),
 # 不再单独上传 launch-all-vms.sh。launch-vm.sh 的上传在上方(第 415 行)。
@@ -739,4 +1051,28 @@ else
   if [ -z "${CUSTOM_DOMAIN:-}" ]; then
     echo "  ⚠️  Single-domain mode — for production, see README §Multi-Domain Setup"
   fi
+fi
+
+# 部署该做的全部做完了,现在才如实报告 mirror 是否就绪。放这里而不是紧跟 mirror 循环的理由
+# 见上方 _fc_mirror_failed 处的注释:早退会把一个可恢复问题(FC 回落 github)换成更严重的
+# 半部署状态(缺 launch-vm.sh / harden-config.sh / LiteLLM 配置 / SSM 参数 / console 配置)。
+# 但仍必须非零退出:mirror 缺件时机队会回落 github,10W 规模照样撞墙,而 bake 路径(强制 S3)
+# 会直接构建失败 —— 那种情况下把部署报成绿的就是假绿。
+if [ "$_fc_mirror_failed" -ne 0 ]; then
+  echo "" >&2
+  echo "FATAL: #435 Firecracker mirror 未全部就绪 —— 机队会回落 github.com,拒绝静默通过" >&2
+  echo "  上面所有部署步骤均已执行完毕(必需脚本已查桶确认),所以现有机队不受影响。" >&2
+  echo "  补齐 mirror 后重跑本脚本即可 —— mirror 步骤幂等,不会重复上传已就绪的对象。" >&2
+  exit 1
+fi
+
+# ── #580 spire-kit 分发的最终判定(同上,刻意放在最末)──────────────────────────────────
+# 可选组件,所以上传失败不在当场中止(理由见上方 _spire_kit_upload_failed 处)。但仍必须非零
+# 退出:开机 step4c 拉不到时是 fail-open —— host 照常服务、只落 spire-kit.install-failed 标记,
+if [ "${_spire_kit_upload_failed:-0}" -ne 0 ]; then
+  echo "" >&2
+  echo "FATAL: #580 spire-kit 四个开机键未全部上传 —— 开启 spire-kit 的 host 会静默没装上 broker" >&2
+  echo "  上面所有部署步骤均已执行完毕(必需脚本已查桶确认),所以现有机队不受影响。" >&2
+  echo "  重跑本脚本即可 —— s3 cp 幂等。若 spire-kit 本就不用,把 SSM /openclaw/spire-kit/enabled 留空。" >&2
+  exit 1
 fi

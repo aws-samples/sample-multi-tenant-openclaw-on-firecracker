@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# assert-parity.sh — 断言 Packer 与 EC2 Image Builder 产出的是【同一份】镜像内容。
+#
+# 为什么需要这个:两套构建工具并存的唯一风险是漂移 —— 一侧变更配方而另一侧未同步,
+# 于是 golden host 的行为取决于"该实例由哪套工具构建"。该不确定性的风险高于工具选型本身。
+#
+# 本脚本不比 AMI 的块设备(其内容会因时间戳与日志而不同),而是比【决定内容的输入】:
+#   1. 两侧执行的是同一个 provision-host.sh(内容摘要相同)
+#   2. 两侧执行的是同一个 install-fluent-bit.sh
+#   3. 两边的 recipe_version 一致
+#   4. 两边的 EBS/IMDS/parent-AMI 参数一致
+#   5. Packer 侧复刻了 Image Builder 的两条 validate 断言(按名字查)
+#
+# 用法: deploy/packer/assert-parity.sh
+# 退出码: 0=一致, 1=有漂移(逐条打印), 2=前置缺失
+
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+PKR="$ROOT/deploy/packer/host-golden.pkr.hcl"
+VARS="$ROOT/deploy/packer/apse1.pkrvars.hcl"
+IB="$ROOT/deploy/stacks/host_image.py"
+# 镜像断言脚本。检查项从 HCL 内联搬到这里,是为了让 provision 之后与 provision 重跑
+# 之后共用同一份 —— 两处各维护一份内联必然漂移(实测 2026-08-13:幂等阶段只重查了 2 个
+# 命令和 2 个泄漏路径,漏掉 Fluent Bit / vmlinux / ADOT / SSH host key / cloud-init 态)。
+ASSERT_SH="$ROOT/deploy/packer/assert-image.sh"
+CFG="$ROOT/config.yml"
+
+for f in "$PKR" "$VARS" "$IB" "$ASSERT_SH"; do
+  [ -f "$f" ] || { echo "GATE_FAIL: 缺少文件 $f" >&2; exit 2; }
+done
+
+fail=0
+_ok()   { printf '  ok   %s\n' "$1"; }
+_bad()  { printf '  DRIFT %s\n' "$1" >&2; fail=1; }
+
+echo "== packer / Image Builder 一致性 =="
+
+# ── 1+2. 两侧执行同一份脚本 ────────────────────────────────────────────────────
+# Image Builder 通过 CDK Asset 传输 deploy/userdata/provision-host.sh 与
+# deploy/edge/fluent-bit/install-fluent-bit.sh(host_image.py 的 S3Download);
+# Packer 通过 file provisioner 传输同两个文件。所以"同一份"= HCL 里引用的相对路径
+# 指向同两个文件。摘要在 packer 的 manifest custom_data 里落痕,这里比路径。
+for pair in \
+  "provision-host.sh:../userdata/provision-host.sh" \
+  "install-fluent-bit.sh:../edge/fluent-bit/install-fluent-bit.sh"
+do
+  name="${pair%%:*}"; rel="${pair#*:}"
+  if grep -q -- "$rel" "$PKR"; then
+    _ok "packer 引用仓库源 $name"
+  else
+    _bad "packer 未引用 $rel —— 可能已改为内联重写(必然与 Image Builder 产生漂移)"
+  fi
+  # Image Builder 侧:host_image.py 须将同一个文件作为 asset 引入
+  if grep -qE "\"$name\"|/ \"$(basename "$name")\"|$(basename "$name" .sh)" "$IB"; then
+    _ok "Image Builder 引用同一个 $name"
+  else
+    _bad "host_image.py 中未找到 $name 的引用"
+  fi
+done
+
+# ── 3. recipe_version 一致 ───────────────────────────────────────────────────
+# Image Builder 的源是 config.yml host.golden_ami.recipe_version;
+# Packer 的源是 apse1.pkrvars.hcl 的 recipe_version。两者必须同值,否则同一批
+# 机器上会出现两种 marker.recipe_version,无法在机队中区分各实例的配方版本。
+_cfg_ver=""
+if [ -f "$CFG" ]; then
+  _cfg_ver="$(python3 - "$CFG" <<'PY' 2>/dev/null
+import sys, yaml
+c = yaml.safe_load(open(sys.argv[1])) or {}
+print(((c.get("host") or {}).get("golden_ami") or {}).get("recipe_version", ""))
+PY
+)"
+fi
+# 只取双引号内的值。不要用 `s/.*=\s*"(...)"/` —— packer fmt 会把等号对齐成
+# `recipe_version = "1.0.0"`(等号前后多空格),BSD sed 不将 \s* 识别为空白,
+# 导致将整行误判为"值"(实测结果:匹配到 'recipe_version = "1.0.0"' 而非 '1.0.0')。
+_pkr_ver="$(grep -E '^[[:space:]]*recipe_version[[:space:]]*=' "$VARS" | head -1 | sed -E 's/^[^"]*"([^"]*)".*$/\1/')"
+if [ -z "$_cfg_ver" ]; then
+  echo "  skip config.yml 无 recipe_version(gitignored 本地文件?)—— 无法比对"
+elif [ "$_cfg_ver" = "$_pkr_ver" ]; then
+  _ok "recipe_version 一致 ($_pkr_ver)"
+else
+  _bad "recipe_version 漂移: config.yml=$_cfg_ver vs pkrvars=$_pkr_ver"
+fi
+
+# ── 4. recipe 参数一致 ───────────────────────────────────────────────────────
+# 逐项对应 host_image.py 的 CfnImageRecipe / CfnInfrastructureConfiguration。
+# 这些值决定产出镜像的形状,不一致就不是"同一份镜像"。
+_chk() {  # $1=说明 $2=packer 里必须出现的串 $3=host_image.py 里必须出现的串
+  local what="$1" p="$2" i="$3"
+  if grep -q -- "$p" "$PKR" && grep -q -- "$i" "$IB"; then
+    _ok "$what"
+  else
+    grep -q -- "$p" "$PKR" || _bad "$what —— packer 侧缺 '$p'"
+    grep -q -- "$i" "$IB"  || _bad "$what —— Image Builder 侧缺 '$i'"
+  fi
+}
+_chk "root 卷 gp3"          'volume_type           = "gp3"'  'volume_type="gp3"'
+_chk "root 卷加密"           'encrypted             = true'   'encrypted=True'
+_chk "IMDSv2 强制"           'http_tokens                 = "required"' 'http_tokens="required"'
+_chk "IMDS hop limit 1"      'http_put_response_hop_limit = 1' 'http_put_response_hop_limit=1'
+_chk "parent AMI 走 SSM 指针" 'canonical/ubuntu/server/24.04'  'canonical/ubuntu/server/24.04'
+_chk "bake 模式打开 scrub"    'OC_PROVISION_BAKE=1'            'OC_PROVISION_BAKE'
+
+# ── 5. Packer 复刻了两条 validate 断言 ───────────────────────────────────────
+# Image Builder 的 validate 阶段是它原生提供的能力;Packer 没有对应概念,必须显式写。
+# 遗漏则产出的镜像未经过"零下载"和"身份已擦净"。
+# 断言主体在 assert-image.sh;HCL 只负责在两个时机各调一次。所以分开查:
+# 内容项查脚本,调用点查 HCL。
+for probe in \
+  "零下载断言:golden AMI validated" \
+  "身份泄漏断言:LEAK" \
+  "cloud-init 态断言:cloud-init instance state" \
+  "SSM agent 保留断言:amazon-ssm-agent" \
+  "SSH host key 断言:LEAK: SSH host keys"
+do
+  what="${probe%%:*}"; needle="${probe#*:}"
+  if grep -q -- "$needle" "$ASSERT_SH"; then
+    _ok "$what 已复刻"
+  else
+    _bad "$what 缺失 —— Image Builder 的 validate 阶段有,packer 没有"
+  fi
+done
+if grep -q 'provision is idempotent' "$PKR"; then
+  _ok "幂等断言 已复刻"
+else
+  _bad "幂等断言缺失 —— 重跑 provision 后没有证明组件集合不变"
+fi
+
+# ── 6. SSM 分发(Image Builder 原生提供、packer 必须自己做)────────────────────────
+if grep -q 'ssm put-parameter' "$PKR"; then
+  _ok "AMI id 发布到 SSM(对应 Image Builder 的 distribution)"
+else
+  _bad "packer 未发布 SSM 参数 —— ha_edge 的 resolve:ssm 读不到新镜像"
+fi
+
+# ── 7. 每个用 pipefail 的 inline 块都显式给了 bash shebang ────────────────────
+# 实测 2026-08-12 的真 bug:packer inline 的默认 shebang 是 `/bin/sh -e`,Ubuntu 的
+# /bin/sh 是 dash,dash 没有 pipefail → "Illegal option -o pipefail" → 整个
+# provisioner 立即退出,断言主体完全未执行。而 `packer validate` 不执行脚本,无法检出,
+# 于是"验证通过"和"断言真的跑了"是两件事。本项检查将其转为静态可检出。
+_pipefail_blocks="$(grep -c 'set -euo pipefail' "$PKR")"
+_bash_shebangs="$(grep -c 'inline_shebang' "$PKR")"
+if [ "$_pipefail_blocks" -eq 0 ]; then
+  _ok "无 pipefail inline 块(无需 shebang)"
+elif [ "$_bash_shebangs" -ge "$_pipefail_blocks" ]; then
+  _ok "pipefail inline 块均声明 bash shebang ($_bash_shebangs 个声明 / $_pipefail_blocks 个块)"
+else
+  _bad "有 $_pipefail_blocks 个 pipefail 块但只有 $_bash_shebangs 个 inline_shebang —— dash 拒绝 pipefail 并静默跳过断言主体"
+fi
+
+# ── 8. 送进 AWS API 的字符串必须是纯 ASCII ───────────────────────────────────
+# 实测 2026-08-12:ami_description 里一个 em-dash 让 ModifyImageAttribute 报
+# 400 "Character sets beyond ASCII are not supported"。这一步在 AMI 生成之后
+# 才调用,所以失败表现是"AMI 存在、build 报错、manifest 与 SSM 分发均未执行" ——
+# 排查方向易被误导至收尾逻辑,而实际原因是一个字符。
+# 只查会进 API 的字段(ami_name / ami_description / 标签值);HCL 的 description
+# 为面向使用者的变量说明,不进 API,中文合法。
+_nonascii="$(grep -nE '^[[:space:]]*(ami_name|ami_description)[[:space:]]*=' "$PKR" \
+  | LC_ALL=C grep -n '[^ -~]' || true)"
+if [ -z "$_nonascii" ]; then
+  _ok "ami_name / ami_description 纯 ASCII"
+else
+  _bad "AMI 字段含非 ASCII —— EC2 ModifyImageAttribute 会 400: $_nonascii"
+fi
+
+# ── 9. 客户自定义阶段必须排在 validate 断言【之前】────────────────────────────
+# 自定义脚本执行在 scrub 之后,因此它写入的任何 per-host 状态都不会再被清理。
+# validate 断言是唯一的防线。若把自定义阶段挪到断言之后,客户脚本留下的主机密钥、
+# platform.env、SSH host key 就没人检出,fail-closed 属性失效而【构建仍然显示成功】——
+# 这是最危险的一类回归:没有报错,只是防线没了。按行号定序,不依赖人工审查。
+# 必须定位【执行】hook 的那一行,不是 locals 里的路径定义 —— locals 恒在文件前部,
+# 拿它比行号会让门永远绿。实测:第一版取 'custom/customize.sh' 首次出现,命中的是
+# locals 的 custom_dst 定义,把整个 provisioner 块搬到断言之后也不报警。
+#
+# #537 D5 起扩展点是 hooks 目录 + run-hooks.sh(取代单文件 custom_script),所以定位的是
+# hooks_runner_dst 的调用行。
+_hooks_line="$(grep -n 'bash ${local.hooks_runner_dst}' "$PKR" | tail -1 | cut -d: -f1)"
+# provision 也纳入定序:hook 被挪到 provision【之前】时组件还没装好,hook 无从依赖
+# 它们 —— 而那种错位单看 hook < assert 是发现不了的。
+_provision_line="$(grep -n 'sudo -E bash ${local.provision_dst}' "$PKR" | head -1 | cut -d: -f1)"
+# 断言主体已搬到 assert-image.sh,HCL 里剩的是调用行。定序要比的是【调用点】。
+_assert_line="$(grep -n 'assert_dst} post-provision' "$PKR" | head -1 | cut -d: -f1)"
+if [ -z "$_hooks_line" ]; then
+  _bad "找不到 hook 阶段 —— host-golden.pkr.hcl 应含 bash \${local.hooks_runner_dst} 的调用行"
+elif [ -z "$_provision_line" ]; then
+  _bad "找不到 provision 阶段 —— 无法校验 hook 的相对位置"
+elif [ -z "$_assert_line" ]; then
+  _bad "找不到零下载断言 —— 无法校验 hook 阶段的相对位置"
+elif [ "$_provision_line" -lt "$_hooks_line" ] && [ "$_hooks_line" -lt "$_assert_line" ]; then
+  _ok "hook 阶段夹在 provision 与 validate 断言之间(行 $_provision_line < $_hooks_line < $_assert_line)"
+else
+  _bad "hook 阶段位置错误(provision=$_provision_line hooks=$_hooks_line assert=$_assert_line)—— 排在断言之后则 hook 引入的身份泄漏无人检出;排在 provision 之前则组件尚未装好"
+fi
+
+# ── 9b. hook 对账的期望值必须在两个阶段都注入 ──────────────────────────────────
+# 构建侧算的 HooksSha 经环境变量传进断言脚本,由它从镜像里实际存在的那批重算后比对。
+# 漏传的表现是断言脚本走进"期望值缺失"分支 —— 那个分支是 FAIL 而不是跳过(静默跳过
+# 等于悄悄丢掉整条对账),所以构建会红,但红在一条看不出根因的消息上。这里提前拦。
+#
+# sudo 必须带 -E:不带时 sudo 会清掉这些环境变量。实测本模板第一版的 post-rerun 正是
+# `sudo bash`(漏了 -E),期望值传不进去。
+_expect_sha_count="$(grep -c 'OC_EXPECT_HOOKS_SHA=' "$PKR")"
+if [ "$_expect_sha_count" -eq 2 ] &&
+  grep -q 'sudo -E bash ${local.assert_dst} post-provision' "$PKR" &&
+  grep -q 'sudo -E bash ${local.assert_dst} post-rerun' "$PKR"; then
+  _ok "hook 对账期望值在两个阶段都注入,且都用 sudo -E"
+else
+  _bad "hook 对账期望值注入不全(OC_EXPECT_HOOKS_SHA 出现 $_expect_sha_count 次,应为 2)或 sudo 缺 -E —— 期望值传不进断言脚本"
+fi
+
+# ── 10. 自定义阶段引入的泄漏面都有对应断言 ───────────────────────────────────
+# 自定义脚本能重装 openssh-server 或跑 dpkg-reconfigure,两者都会重新生成 SSH host
+# key。scrub 删过它们,但在自定义阶段【之后】没有断言兜住。整个机队共享一把 host key
+# 意味着任何能起一台 host 的人都能冒充其余每一台。
+# 匹配可执行的断言体,不能只 grep 'ssh_host_' —— 上面的注释里也有这串,
+# 断言被删掉后注释仍会命中,门就永远是绿的。实测:第一版这条门验红失败,原因正是此。
+if grep -q 'LEAK: SSH host keys' "$ASSERT_SH"; then
+  _ok "SSH host key 泄漏断言存在"
+else
+  _bad "缺 SSH host key 断言 —— 自定义脚本重装 openssh-server 会让全机队共享同一把 host key"
+fi
+
+# ── 10b. provision 之后与重跑之后必须调【同一份】断言 ─────────────────────────
+# 实测 2026-08-13 的真缺陷:两个时机各维护一份内联断言,幂等阶段只重查了 2 个命令和
+# 2 个泄漏路径,漏掉 Fluent Bit / vmlinux / ADOT / SSM agent / SSH host key /
+# cloud-init 态。于是"重跑把这些重装了一遍"这类回归恰好落在盲区 —— 而幂等断言存在的
+# 意义就是发现它。现在两处都调 assert-image.sh,本项检查它没有被改回内联。
+_post_provision="$(grep -c 'assert_dst} post-provision' "$PKR")"
+_post_rerun="$(grep -c 'assert_dst} post-rerun' "$PKR")"
+if [ "$_post_provision" -ge 1 ] && [ "$_post_rerun" -ge 1 ]; then
+  _ok "两个时机都调共享断言脚本(post-provision + post-rerun)"
+else
+  _bad "断言未在两个时机都调 assert-image.sh(post-provision=$_post_provision post-rerun=$_post_rerun) —— 重跑后的覆盖会与首次不一致,幂等断言变成抽查"
+fi
+
+# ── 10c. SSM 发布后的回读必须限时轮询,不能只读一次 ────────────────────────────
+# aws:ec2:image 的校验是异步的(实测 2026-08-13:put-parameter 无论值好坏都返回 0)。
+# 只读一次会把"校验尚未完成"误判成发布失败 —— 假红;完全不读会把被丢弃的坏版本当成
+# 发布成功 —— 假绿。两个方向都要防,所以必须是【有上限的轮询】。
+if grep -q 'seq 1 30' "$PKR" && grep -q 'did not take effect within' "$PKR"; then
+  _ok "SSM 回读为限时轮询(而非单次读或不读)"
+else
+  _bad "SSM 回读不是限时轮询 —— aws:ec2:image 校验异步,单次立即回读会把合法发布误判为失败"
+fi
+
+# ── 11. hook 模板也要过静态检查 ───────────────────────────────────────────────
+# scripts/checks/shell.sh 只收 .sh 后缀,而 hook 模板的后缀是 .sh.example,于是永久
+# 逃过仓库的 shell 门 —— 偏偏它正是客户照着改的那一份,里面的写法会被复制进客户的
+# 生产构建。在这里补上。
+#
+# #537 D5 起单文件 customize.sh.{default,example} 已被 hooks/ 目录取代:
+#   - customize.sh.default(无操作占位)不再需要 —— run-hooks.sh 自己在没有 *.sh 时
+#     打印一行并 exit 0,不必为"file provisioner 拿到空路径会报错"留一个占位文件;
+#   - customize.sh.example → hooks/50-example.sh.example。
+# 只有一份模板,所以不用循环(单元素的 `for _f in "..."` 会被 shellcheck 判 SC2066)。
+_f="$ROOT/deploy/packer/hooks/50-example.sh.example"
+_n="$(basename "$_f")"
+if [ ! -f "$_f" ]; then
+  _bad "缺 $_n —— 客户没有可照抄的 hook 模板"
+elif ! bash -n "$_f" 2>/dev/null; then
+  _bad "$_n 语法错(bash -n 不过)"
+else
+  # -S info 而不是 warning:实测 warning 门槛太松,连 `cd /nonexistent`(SC2164)都不报,
+  # 那样这条门就只是个装饰。info 级会抓到未加引号的变量展开等真会伤到客户的写法。
+  # 模板里确实需要豁免的单条(如 SC1091 找不到 /etc/os-release)用行内 disable 注明理由。
+  if command -v shellcheck >/dev/null 2>&1; then
+    if shellcheck -s bash -S info "$_f" >/dev/null 2>&1; then
+      _ok "$_n 过 bash -n 与 shellcheck"
+    else
+      _bad "$_n shellcheck 有 info 及以上: $(shellcheck -s bash -S info "$_f" 2>&1 | grep -oE 'SC[0-9]+' | sort -u | tr '\n' ' ')"
+    fi
+  else
+    _ok "$_n 过 bash -n(shellcheck 未装,跳过更严的检查)"
+  fi
+fi
+
+echo
+if [ "$fail" = 0 ]; then
+  echo "✓ 一致:两套工具的输入与断言等价"
+  exit 0
+fi
+echo "⛔ 检出漂移(见上 DRIFT 行)。修复方式:让 packer 侧与 host_image.py / config.yml 同源," >&2
+echo '  不应依赖「两侧各修改一次」—— 该做法正是双轨维护失效的根源。' >&2
+exit 1

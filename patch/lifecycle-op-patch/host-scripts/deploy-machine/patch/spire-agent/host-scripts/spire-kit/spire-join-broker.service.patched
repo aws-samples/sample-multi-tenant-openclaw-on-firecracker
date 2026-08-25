@@ -1,0 +1,29 @@
+[Unit]
+Description=SPIRE join-token broker (spire-kit, per-microVM identity over the /30 tap link)
+Documentation=file:///opt/spire-kit/README.md
+After=network-online.target spire-kit-netguard.service
+Wants=network-online.target spire-kit-netguard.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/spire-kit/broker.env
+ExecStart=/usr/bin/python3 /usr/local/bin/spire-join-broker.py
+Restart=always
+RestartSec=5
+# 只读 vm.json + 写自己的台账;不需要额外权限,但要 root 读 /proc 下各 tap 的 rp_filter
+# 并绑 <1024 以外端口(默认 8877)。保持 root 但收紧文件系统面。
+User=root
+StateDirectory=spire-kit
+ProtectSystem=strict
+ReadWritePaths=/var/lib/spire-kit
+ProtectHome=read-only
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

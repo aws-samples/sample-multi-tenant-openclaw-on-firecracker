@@ -1,0 +1,37 @@
+# spire-agent 配置模板 —— 由 spire-bootstrap.sh 在每次开机时渲染。
+# server 坐标 / trust domain 全部来自 broker 的响应,guest 里【零硬编码】:
+# 换 region、换 SPIRE 集群、换 trust domain 都只改 host 侧 broker 配置,不动镜像。
+agent {
+    data_dir = "{{DATA_DIR}}"
+    log_level = "INFO"
+    log_file = "{{LOG_FILE}}"
+    server_address = "{{SERVER_ADDRESS}}"
+    server_port = "{{SERVER_PORT}}"
+    socket_path = "{{SOCKET_PATH}}"
+    trust_domain = "{{TRUST_DOMAIN}}"
+
+    # insecure_bootstrap:agent 不预置 server 的 CA bundle,首次连接信任 server 提供的
+    # bundle。本底座下这是**已知的退化点**(与上游参考 agent.conf 一致):真正的收紧办法
+    # 是把 trust bundle 一起烤进 kit(bundle 是公开材料,不是密钥),届时改成
+    # `trust_bundle_path = <kit>/bundle.crt` 并删掉本行(别在模板注释里写占位符语法:
+    # bootstrap 的"残留占位符"门会把注释里的也算成未渲染)。
+    insecure_bootstrap = true
+}
+
+plugins {
+    # memory 而不是 disk:agent 私钥不落【租户可写、租户可 SSH 读】的数据盘。
+    # 代价是 agent 重启必须重新 attest —— 这正是 broker 允许每次开机换几枚新 token 的原因。
+    KeyManager "memory" {
+        plugin_data {}
+    }
+
+    NodeAttestor "join_token" {
+        plugin_data {}
+    }
+
+    # workload 侧按 uid 判定:OpenClaw gateway 以 uid 1000(agent)跑,
+    # 与 registrar 建的 workload entry selector `unix:uid:1000` 对齐。
+    WorkloadAttestor "unix" {
+        plugin_data {}
+    }
+}

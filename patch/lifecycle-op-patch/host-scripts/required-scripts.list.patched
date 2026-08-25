@@ -1,0 +1,44 @@
+# host init 必需脚本清单 —— **单一真相**(#532 AC7)
+#
+# 谁读它:
+#   · setup.sh          —— deploy 前的发布门 + 上传后复核(两处都读本文件)
+#   · engineering/deploy/clawpool-deploy.sh —— 标准部署通道 upload 段的复核
+#
+# 为什么必须只有一份:`setup.sh` 自己的注释早就写着「清单只能有一份,两份必然漂 ——
+# 而漂的表现正是这道门要防的那件事(某个脚本没进桶,却以为查过了)」。#532 的复审
+# (Codex blocker-4)证明了另一半:清单只在 setup.sh 里,而**标准部署通道**
+# clawpool-deploy.sh 用的是「桶里 .sh/.py 计数 ≥ 8」这种阈值判据 —— 22 个必需脚本,
+# 门却在 8 就放行,所以缺 14 个都能绿。
+#
+# 真机证据(us-west-2, 2026-08-23):`deployment/scripts/delete-all-vms.sh` 与
+# `deployment/scripts/lib/lifecycle-guard.sh` 两个 required 脚本在桶里 404
+# (#241 的 !804 合并后没人重跑上传),而计数门当时是绿的。
+#
+# 路径相对 `s3://<assets>/deployment/scripts/`(= 仓内 `deploy/userdata/`)。
+# 加脚本时:先确认 init-host.sh 或某条 SSM 命令真的会拉它,再加进来 —— 本清单是
+# 「不在桶里就必须停止部署」的东西,不是「所有 host 脚本」的目录。
+#
+# 空行与 # 开头的行被忽略。
+host-agent.py
+route_ops.py
+oc-guest-log-reader.py
+sync-shared-skills.py
+launch-vm.sh
+stop-vm.sh
+rebuild-vm.sh
+reset-vm.sh
+delete-vm.sh
+delete-all-vms.sh
+backup-data.sh
+clone-data.sh
+migrate-vm.sh
+resize-disk.sh
+start-all-vms.sh
+stop-all-vms.sh
+setup-egress-allowlist.sh
+oc-egress-chain.sh
+oc-egress-sim.py
+adot-config.yaml
+lib/harden-config.sh
+lib/cred-inject.sh
+lib/lifecycle-guard.sh

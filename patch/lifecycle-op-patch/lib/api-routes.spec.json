@@ -1,0 +1,203 @@
+{
+  "version": 1,
+  "target": {
+    "stack": "OpenClawOrchestrator",
+    "rest_api_logical_id": "Api9C0D1E2F",
+    "template_method_logical_id": "ApihostsPOST8966FA1D",
+    "stage": "v1"
+  },
+  "template": {
+    "path": "/hosts",
+    "method": "POST"
+  },
+  "routes": [
+    {
+      "path": "/hosts/egress",
+      "resource_change": "A",
+      "methods": [
+        {
+          "method": "GET",
+          "change": "A"
+        },
+        {
+          "method": "POST",
+          "change": "A"
+        }
+      ],
+      "cors": {
+        "change": "A",
+        "allow_origin": "*",
+        "allow_headers": [
+          "Content-Type",
+          "x-api-key",
+          "Authorization",
+          "If-Match",
+          "Idempotency-Key"
+        ],
+        "allow_methods": [
+          "OPTIONS",
+          "GET",
+          "PUT",
+          "POST",
+          "DELETE",
+          "PATCH",
+          "HEAD"
+        ]
+      }
+    },
+    {
+      "path": "/hosts/egress/chain",
+      "resource_change": "A",
+      "methods": [
+        {
+          "method": "GET",
+          "change": "A"
+        }
+      ],
+      "cors": {
+        "change": "A",
+        "allow_origin": "*",
+        "allow_headers": [
+          "Content-Type",
+          "x-api-key",
+          "Authorization",
+          "If-Match",
+          "Idempotency-Key"
+        ],
+        "allow_methods": [
+          "OPTIONS",
+          "GET",
+          "PUT",
+          "POST",
+          "DELETE",
+          "PATCH",
+          "HEAD"
+        ]
+      }
+    },
+    {
+      "path": "/hosts/egress/revisions",
+      "resource_change": "A",
+      "methods": [
+        {
+          "method": "DELETE",
+          "change": "A"
+        },
+        {
+          "method": "GET",
+          "change": "A"
+        }
+      ],
+      "cors": {
+        "change": "A",
+        "allow_origin": "*",
+        "allow_headers": [
+          "Content-Type",
+          "x-api-key",
+          "Authorization",
+          "If-Match",
+          "Idempotency-Key"
+        ],
+        "allow_methods": [
+          "OPTIONS",
+          "GET",
+          "PUT",
+          "POST",
+          "DELETE",
+          "PATCH",
+          "HEAD"
+        ]
+      }
+    },
+    {
+      "path": "/hosts/egress/rollback",
+      "resource_change": "A",
+      "methods": [
+        {
+          "method": "POST",
+          "change": "A"
+        }
+      ],
+      "cors": {
+        "change": "A",
+        "allow_origin": "*",
+        "allow_headers": [
+          "Content-Type",
+          "x-api-key",
+          "Authorization",
+          "If-Match",
+          "Idempotency-Key"
+        ],
+        "allow_methods": [
+          "OPTIONS",
+          "GET",
+          "PUT",
+          "POST",
+          "DELETE",
+          "PATCH",
+          "HEAD"
+        ]
+      }
+    },
+    {
+      "path": "/system/queues",
+      "resource_change": "A",
+      "methods": [
+        {
+          "method": "GET",
+          "change": "A"
+        }
+      ],
+      "cors": {
+        "change": "A",
+        "allow_origin": "*",
+        "allow_headers": [
+          "Content-Type",
+          "x-api-key",
+          "Authorization",
+          "If-Match",
+          "Idempotency-Key"
+        ],
+        "allow_methods": [
+          "OPTIONS",
+          "GET",
+          "PUT",
+          "POST",
+          "DELETE",
+          "PATCH",
+          "HEAD"
+        ]
+      }
+    },
+    {
+      "path": "/users/{tenant_user_id}/upgrade",
+      "resource_change": "A",
+      "methods": [
+        {
+          "method": "POST",
+          "change": "A"
+        }
+      ],
+      "cors": {
+        "change": "A",
+        "allow_origin": "*",
+        "allow_headers": [
+          "Content-Type",
+          "x-api-key",
+          "Authorization",
+          "If-Match",
+          "Idempotency-Key"
+        ],
+        "allow_methods": [
+          "OPTIONS",
+          "GET",
+          "PUT",
+          "POST",
+          "DELETE",
+          "PATCH",
+          "HEAD"
+        ]
+      }
+    }
+  ]
+}

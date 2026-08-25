@@ -1,0 +1,11 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadLifecycleDeadlineParameters",
+      "Effect": "Allow",
+      "Action": "ssm:GetParametersByPath",
+      "Resource": "arn:aws:ssm:*:*:parameter/openclaw/lifecycle/deadline-sec/*"
+    }
+  ]
+}

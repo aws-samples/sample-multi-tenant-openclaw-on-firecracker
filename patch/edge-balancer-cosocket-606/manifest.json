@@ -2,7 +2,7 @@
   "id": "edge-balancer-cosocket-606",
   "title": "edge balancer_by_lua* 阶段禁用 cosocket：上游重投由构造决定不可用，触发 retry 的租户 WSS 全部 502",
   "base_sha": "e57e9eaea1154caa6020dca6735af92af2fe9185",
-  "patch_sha": "PENDING_COMMIT",
+  "patch_sha": "58bd07de4f603cb803fbc72dade14bde6921e811",
   "status": "MANUAL_REVIEW",
   "severity": "P0",
   "upstream_issue": "#606（fail-closed 语义见 #628，坐标回收风险见 #605）",

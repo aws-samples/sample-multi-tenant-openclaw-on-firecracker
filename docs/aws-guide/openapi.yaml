@@ -44,6 +44,30 @@ components:
         code:
           type: string
       additionalProperties: true
+    SharedSkillSync:
+      type: object
+      description: Host propagation dispatch summary. Accepted means SSM returned command ids, not that every host has completed the sync; the five-minute cron remains the fallback.
+      required: [status, hosts]
+      properties:
+        status:
+          type: string
+          enum: [accepted, partial, dispatch_failed, no_active_hosts]
+        hosts:
+          type: integer
+          minimum: 0
+          description: Active/idle hosts selected.
+        accepted_hosts:
+          type: integer
+          minimum: 0
+          description: Hosts included in SSM batches that returned a command id.
+        command_ids:
+          type: array
+          items:
+            type: string
+          description: One command id per accepted batch of at most 50 hosts.
+        command_id:
+          type: string
+          description: Convenience alias present when exactly one batch was accepted.
     TenantRecord:
       type: object
       description: |
@@ -565,7 +589,6 @@ paths:
                   enum: [live, canary]
                   default: live
                   description: >-
-                    #394 — which image slot this tenant boots from. Absent/`live` (default) =
                     byte-identical legacy behavior (boots the host''s live slot; version is NOT
                     pinned — restart re-resolves the current live pointer). `canary` boots the
                     host''s canary slot to validate a candidate; it REQUIRES preferred_host_id
@@ -578,13 +601,11 @@ paths:
                 expected_image_snapshot_time:
                   type: string
                   description: >-
-                    #394 — for image_channel=canary: the candidate version the caller read from
                     the pull job result. Admission verifies the host canary still matches this
                     (TOCTOU guard); mismatch → 409 CANARY_CHANGED.
                 expected_image_generation:
                   type: integer
                   description: >-
-                    #394 — optional slots generation guard for canary admission. Only used at
                     create time; the tenant is pinned to a concrete version, so later host
                     generation changes (e.g. promote) do not invalidate it.
                 platform_id:
@@ -1080,6 +1101,7 @@ paths:
               - start
               - reset
               - rebuild
+              - upgrade
               - pause
               - resume
               - backup
@@ -1165,6 +1187,12 @@ paths:
                         - expected_image_snapshot_time
                     - required:
                         - expected_image_generation
+                    - required:
+                        - config_template
+                    - required:
+                        - config_template_version
+                    - required:
+                        - force_reapply
                   description: |
                     Request fields for destructive reset/rebuild operations. reset accepts
                     client_token only. Rebuild also accepts image selection and TOCTOU
@@ -1198,6 +1226,52 @@ paths:
                     expected_image_generation:
                       type: integer
                       description: Optional TOCTOU guard on the host slot generation.
+                    config_template:
+                      type: string
+                      pattern: '^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$'
+                      description: |
+                        Optional rebuild-only target template. Supplying this field
+                        requests config reapply even when force_reapply is omitted.
+                        Omitted means the tenant's current template.
+                    config_template_version:
+                      type: integer
+                      minimum: 1
+                      description: |
+                        Optional immutable Parameter_Registry snapshot version. Omitted
+                        resolves the template's current pointer. This is not an
+                        expected_* optimistic-concurrency guard.
+                    force_reapply:
+                      type: boolean
+                      default: false
+                      description: |
+                        Optional rebuild-only switch. false/omitted with neither template
+                        field preserves the historical byte-for-byte rebuild path. true
+                        performs control-plane pre-screen and host-side authoritative
+                        validation before backup or destructive VM changes.
+                - title: upgrade-v1-reapply
+                  type: object
+                  additionalProperties: false
+                  anyOf:
+                    - required:
+                        - configTemplate
+                    - required:
+                        - configTemplateVersion
+                    - required:
+                        - forceReapply
+                  description: |
+                    Legacy v1 upgrade action aliases for the rebuild config-reapply
+                    fields. All fields are optional; this variant applies only when at
+                    least one camelCase reapply field is present.
+                  properties:
+                    configTemplate:
+                      type: string
+                      pattern: '^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$'
+                    configTemplateVersion:
+                      type: integer
+                      minimum: 1
+                    forceReapply:
+                      type: boolean
+                      default: false
                 - title: lifecycle-or-empty
                   type: object
                   additionalProperties: false
@@ -1297,6 +1371,24 @@ paths:
                       op_id:
                         type: string
                         description: Identifier of the queued lifecycle operation.
+                      reapply_requested:
+                        type: boolean
+                        description: >-
+                          #579 Bug3 — present and true only when the deploy recognized and
+                          accepted a config reapply request (config_template/version/
+                          force_reapply). Absent on a plain rebuild or an older deploy that
+                          silently ignores the fields, letting the caller tell "reapply
+                          accepted" from "silently dropped".
+                      registry_version:
+                        type: integer
+                        description: Bound registry snapshot for config reapply.
+                      body_version_id:
+                        type: string
+                        description: Bound S3 VersionId; empty for host-baked default.
+                      body_sha256:
+                        type: string
+                        pattern: '^[0-9a-f]{64}$|^$'
+                        description: Bound template body digest; empty for host-baked default.
                     x-source: deploy/lambda/api/services/tenant_service.py:1219
                   - type: object
                     title: backup-started
@@ -1379,7 +1471,9 @@ paths:
             client_token is still active.
             Slot failures occur before backup, channel update, or VM mutation and never
             fall back to the other channel.
-            #413 lifecycle fence: LIFECYCLE_SUPERSEDED when the operation no longer owns the tenant epoch/source host; OPERATION_ID_REUSED when the op_id ledger belongs to another operation.
+            OPENCLAW_CONFIG_INCOMPATIBLE is returned before enqueue for a fast
+            pre-screen rejection, or by the async worker before backup/stop/overlay
+            mutation when the target OpenClaw validator rejects the assembled config.
           content:
             application/json:
               schema:
@@ -1399,6 +1493,7 @@ paths:
                       - IDEMPOTENT_OPERATION_IN_PROGRESS
                       - LIFECYCLE_SUPERSEDED
                       - OPERATION_ID_REUSED
+                      - OPENCLAW_CONFIG_INCOMPATIBLE
           x-source: deploy/lambda/api/services/tenant_service.py:1290
         '502':
           description: |
@@ -1446,6 +1541,7 @@ paths:
                       - REBUILD_ATTEMPT_BUSY
                       - ENQUEUE_ANCHOR_FAILED
                       - ENQUEUE_STATE_UNKNOWN
+                      - REAPPLY_PROBE_FAILED
                   id:
                     type: string
                   op_id:
@@ -2294,7 +2390,6 @@ paths:
                     image_slots:
                       type: object
                       description: >-
-                        #394 — control-plane mirror of the host''s slots.json (source of truth is
                         the file on the host). Present once a canary has been pulled to this host;
                         absent on hosts still on the legacy flat layout. Ops/console read it to see
                         which candidate is staged.
@@ -2306,12 +2401,12 @@ paths:
                       x-source: deploy/lambda/api/services/host_service.py:1373
                     cpu_overcommit_ratio:
                       type: number
-                      description: Injected at read time from env CPU_OVERCOMMIT_RATIO (float, default 1.0). JSON number, not string.
-                      x-source: deploy/lambda/api/services/host_service.py:38
+                      description: '#462 — injected at read time as THIS host''s effective ratio: the host.overcommit_by_family override for its instance-type family, else env CPU_OVERCOMMIT_RATIO (float, default 1.0). Resolved by core/host_profile.ratios — the same pure function the placement call sites use — so the reported number matches what the scheduler actually applies. A host whose instance_type is missing, or whose family has no override, reports the global default. JSON number, not string.'
+                      x-source: deploy/lambda/api/services/host_service.py:58
                     mem_overcommit_ratio:
                       type: number
-                      description: Injected at read time from env MEM_OVERCOMMIT_RATIO (float, default 1.0). JSON number, not string.
-                      x-source: deploy/lambda/api/services/host_service.py:39
+                      description: '#462 — injected at read time as THIS host''s effective ratio: the host.overcommit_by_family override for its instance-type family, else env MEM_OVERCOMMIT_RATIO (float, default 1.0). Same resolution as cpu_overcommit_ratio. JSON number, not string.'
+                      x-source: deploy/lambda/api/services/host_service.py:59
                     last_seen:
                       type:
                         - string
@@ -2605,7 +2700,6 @@ paths:
       operationId: pullImage
       summary: 把指定版本快照装到单台宿主机(异步)
       description: >-
-        #309/#333 — Install a specific version snapshot onto ONE host. Reads the snapshot from the
         version-snapshots DDB table, selects exactly the disks named by that snapshot's manifest.json
         (rootfs / data-template / immutable) plus manifest.json itself (ignores other versions' disks
         in the snapshot — deterministic), fetches each by its exact S3 VersionId, verifies ETag, then
@@ -2675,7 +2769,6 @@ paths:
                   status:
                     type: string
                     description: >-
-                      #394 — for slot=live this is `upgrading`; for slot=canary the host status
                       is NOT changed, so this echoes the host''s current real status (e.g.
                       active/idle).
                   job_id:
@@ -2767,7 +2860,6 @@ paths:
       operationId: promoteCanary
       summary: 把该 host 的 canary 槽提升为 live(同步,#394)
       description: >-
-        #394 — Synchronously promote the host''s canary slot to live. Only rewrites the small
         slots.json pointer (no disk move), so it returns 200 in seconds — no async job. CAS is on
         snapshot_time only: the caller must pass the expected_canary_snapshot_time it verified; if
         the current canary snapshot_time differs, returns 409 CANARY_CHANGED and writes nothing
@@ -2844,7 +2936,6 @@ paths:
       operationId: hostImageSlots
       summary: 读该 host 磁盘上真实的镜像状态(#394 debug 视图)
       description: >-
-        #394 — Read the REAL on-disk image state of one EC2 host via SSM: its actual
         slots.json (live/canary/previous_live/generation) plus the installed version dirs
         under /data/firecracker-assets/versions/. This is the authoritative counterpart to
         the possibly-stale DDB image_slots mirror returned by GET /hosts — the response also
@@ -2896,7 +2987,6 @@ paths:
       operationId: reclaimImages
       summary: 回收该 host 上无人引用的版本目录(手动 prune,释放盘,#394)
       description: >-
-        #394 — Manual disk prune. Deletes every versions/<snapshot>/ directory on the host that is
         NOT in the protected keep-set. The keep-set is computed server-side (the host cannot see DDB
         tenant pins) as {live, canary, previous_live} ∪ {every snapshot_time still pinned by a
         non-deleted tenant on this host}, and passed to the host as an explicit allowlist — the host
@@ -2957,7 +3047,6 @@ paths:
       operationId: pullImageProgress
       summary: 查询单台宿主机 pull-image 进度(SageMaker ProcessingJob 风格)
       description: >-
-        #309/#333 — Poll the progress of a pull-image job on ONE host. Reads the host's pull_command_id
         from DDB, then SSM-tails /tmp/<job_id>.txt on the host: the last line decides the tri-state, and
         the most recent ERROR:<CODE> line becomes the failure detail. Returns SageMaker ProcessingJob-style
         JSON. If a terminal error was persisted to DDB (last_pull_error) but the progress file can't be
@@ -2977,7 +3066,6 @@ paths:
           schema:
             type: string
           description: >-
-            #394 — exact pull-job lookup. New clients SHOULD always pass it. Unknown job_id or a
             job that belongs to a different host → 404 JOB_NOT_FOUND (never silently falls back
             to "this host''s latest"). Absent (compat window) → the host''s most recent job, else
             the legacy host.pull_command_id path. When the persisted job is already terminal, the
@@ -3058,7 +3146,8 @@ paths:
                       - 'null'
                     description: >-
                       Present only when Failed. One of DOWNLOAD_FAILED / ETAG_MISMATCH / MANIFEST_MISMATCH /
-                      UNZIP_FAILED / INSTALL_MV_FAILED / OWNERSHIP_CHECK_FAILED / UNKNOWN (see _PULL_ERROR_CODES).
+                      UNZIP_FAILED / INSTALL_MV_FAILED / OWNERSHIP_CHECK_FAILED /
+                      POST_COMMIT_FENCED / UNKNOWN (see _PULL_ERROR_CODES).
                   FailureReason:
                     type: string
                     description: Present only when Failed. Detail from the progress file's ERROR line, or DDB last_pull_error.
@@ -3135,7 +3224,6 @@ paths:
       operationId: copyFileFromS3
       summary: 从 S3 拷贝单个文件到宿主机指定位置(同步)
       description: >-
-        #309/#334 — Copy ONE file from S3 to a specific path on ONE host (synchronous; single-file copy is
         seconds). For updating host scripts only — the target must be under /opt/openclaw/ (.py host-agent
         service) or /home/ubuntu/ (.sh + lib/*); the image-disk dir /data/firecracker-assets/ is off-limits
         (that's pull-image's job). Landed file is chown ubuntu:ubuntu + chmod 755 (host-agent runs as
@@ -3287,51 +3375,76 @@ paths:
     post:
       operationId: refreshRootfs
       summary: 把当前黄金镜像预热到所有活跃/空闲宿主机
-      description: 'Reads manifest.json from S3, then dispatches ONE SSM RunShellScript command to every active/idle host. Fire-and-forget: the API returns as soon as SSM accepts the command. On each host the command serializes with image pulls, verifies the manifest is still the dispatched version, stages rootfs/data-template/optional immutable through temporary files, then writes rootfs_version and immutable_version to the host row only after disk completion. If the manifest omits immutable, the successful host commit removes both the stale flat disk and immutable_version. No request body.'
+      description: 'Legacy flat-layout compatibility endpoint. Reads manifest.json from S3 and asks SSM to stage rootfs/data-template/optional immutable on every active/idle host. A 202 proves only that SSM returned a command id; poll SSM for execution completion. Slotted hosts are rejected with 409 and must use pull-image/promote-canary, because writing flat paths cannot atomically update their active version directory and slots.json. The host command serializes with image pulls, verifies the manifest has not changed since dispatch, stages through temporary files, and commits rootfs_version/immutable_version only after all disk work succeeds. No request body.'
       x-source: deploy/lambda/api/services/host_service.py:321
       x-rbac: operator
       responses:
         '200':
-          description: Refresh dispatched, or no active hosts to refresh.
+          description: No active/idle hosts to refresh.
           content:
             application/json:
               schema:
-                oneOf:
-                  - type: object
-                    description: Dispatched.
-                    properties:
-                      message:
-                        type: string
-                        enum:
-                          - refresh started
-                      version:
-                        type: string
-                        description: Manifest version being staged.
-                      immutable_version:
-                        type: string
-                        description: Target immutable version (same as version), or an empty string when the manifest omits the immutable disk. This reports dispatch intent, not per-host completion.
-                      hosts:
-                        type: array
-                        items:
-                          type: string
-                        description: Instance ids the SSM command was sent to.
-                    x-source: deploy/lambda/api/services/host_service.py:395
-                  - type: object
-                    description: No active/idle hosts.
-                    properties:
-                      message:
-                        type: string
-                        enum:
-                          - no active hosts
-                      updated:
-                        type: integer
-                        enum:
-                          - 0
-                    x-source: deploy/lambda/api/services/host_service.py:339
+                type: object
+                required: [message, updated]
+                properties:
+                  message:
+                    type: string
+                    enum: [no active hosts]
+                  updated:
+                    type: integer
+                    enum: [0]
+                x-source: deploy/lambda/api/services/host_service.py:1014
+        '202':
+          description: SSM accepted the legacy flat-layout refresh command. This is dispatch evidence, not host completion evidence.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [message, status, command_id, version, immutable_version, hosts]
+                properties:
+                  message:
+                    type: string
+                    enum: [refresh accepted]
+                  status:
+                    type: string
+                    enum: [accepted]
+                  command_id:
+                    type: string
+                    description: SSM command id to poll for per-host terminal results.
+                  version:
+                    type: string
+                    description: Manifest version requested.
+                  immutable_version:
+                    type: string
+                    description: Target immutable version, or an empty string when the manifest omits the immutable disk.
+                  hosts:
+                    type: array
+                    items:
+                      type: string
+                    description: Instance ids included in the SSM dispatch.
+                x-source: deploy/lambda/api/services/host_service.py:1124
         '403':
           description: RBAC denied (operator+ required when RBAC_ENABLED).
+        '409':
+          description: At least one selected host uses the slotted image layout; no SSM command was sent.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, code, hosts]
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum: [INCOMPATIBLE_HOST_LAYOUT]
+                  hosts:
+                    type: array
+                    items:
+                      type: string
+                x-source: deploy/lambda/api/services/host_service.py:1017
         '500':
-          description: manifest.json not found in S3, or SSM send_command failed.
+          description: manifest.json not found in S3, host enumeration failed, or SSM send_command raised.
           content:
             application/json:
               schema:
@@ -3340,6 +3453,20 @@ paths:
                   error:
                     type: string
                 x-source: deploy/lambda/api/services/host_service.py:325
+        '502':
+          description: SSM returned without a command id, so dispatch acceptance cannot be confirmed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, code]
+                properties:
+                  error:
+                    type: string
+                  code:
+                    type: string
+                    enum: [DISPATCH_UNCONFIRMED]
+                x-source: deploy/lambda/api/services/host_service.py:1116
       tags:
         - 主机与镜像
   /hosts/rootfs-version:
@@ -3576,7 +3703,7 @@ paths:
     get:
       operationId: getRootfsDrift
       summary: 哪些租户还没升到当前镜像版本
-      description: 'Rolling-upgrade companion. Pages the whole tenants table (non-deleted) and buckets each tenant by comparing its rootfs_version to the current manifest version. #517 stage 2 adds a parallel immutable (read-only identity disk) dimension in the same scan. Pure read.'
+      description: 'Rolling-upgrade companion. #534 — baseline is PER-HOST: each non-deleted tenant is bucketed by comparing its rootfs_version to ITS HOST''s rootfs_version (which equals that host''s image_slots.live label), NOT the global manifest.version (a per-host canary promote does not move the global manifest). #517 adds a parallel immutable dimension, also per-host. Response carries baseline="per-host-live"; current_version still returns the global manifest.version for reference. Pure read.'
       x-source: deploy/lambda/api/services/host_service.py:587
       x-rbac: viewer
       responses:
@@ -3852,7 +3979,6 @@ paths:
       operationId: deleteImageSnapshot
       summary: 软删除一条镜像快照记录(#394,引用保护)
       description: >-
-        #394 — Soft-delete a global image snapshot record. Symmetric with
         POST /create-image-snapshot: takes snapshot_time in the JSON body (not a colon-bearing
         ISO timestamp in the path). Marks the version-snapshots row status=deleted + deleted_at
         (does NOT physically remove the DDB row, S3 deployment/ objects, or hosts' local version
@@ -3916,7 +4042,6 @@ paths:
       operationId: createImageSnapshot
       summary: 给 assets 桶打一个版本快照(等价 snapshot-version.sh)
       description: >-
-        #376. Take a version snapshot of the assets bucket: scans the S3 `deployment/` prefix for ALL
         current-version objects (rootfs image + scripts + edge + litellm + monitoring), records each
         object's {path, s3_version_id, etag}, and writes one row to DynamoDB openclaw-version-snapshots
         (primary key snapshot_time, format %Y-%m-%dT%H:%M:%SZ — matches the regex pull-image enforces, so
@@ -4018,7 +4143,6 @@ paths:
       operationId: listImageVersions
       summary: 列出黄金镜像的各版本快照(供选择时间点 pull)
       description: >-
-        #337(原 #217 GET /snapshots,改名避免与 /images 列镜像文件混淆)。Read-only listing of the
         version-snapshots table metadata (snapshot_time + label + file_count) so the console can let an
         operator pick which point-in-time snapshot to pull onto a host (pairs with
         POST /hosts/{id}/pull-image?snapshot_time=). Sorted by snapshot_time descending (newest first).
@@ -4067,7 +4191,13 @@ paths:
     get:
       operationId: getSystemInfo
       summary: 控制台用的功能开关与配置快照
-      description: Read-only snapshot of env-derived stack configuration so the console Settings tab can render feature state without an out-of-band copy of config.yml. All values come from Lambda environment variables wired in deploy/stacks/lambdas.py.
+      description: >-
+        Read-only snapshot of stack configuration so the console Settings tab can render
+        feature state without an out-of-band copy of config.yml. Most values come from Lambda
+        environment variables wired in deploy/stacks/lambdas.py; the `lifecycle` section is the
+        exception — it reports the *effective* lifecycle deadlines, which are read at runtime
+        from SSM Parameter Store (`/openclaw/lifecycle/deadline-sec/<action>`) with an env/code
+        fallback, and each entry carries the `source` it actually came from (#564 G5).
       x-source: deploy/lambda/api/handler.py:688
       x-rbac: viewer
       responses:
@@ -4174,6 +4304,73 @@ paths:
                       vm_default_mem_mb:
                         type: integer
                         description: default 4096.
+                  lifecycle:
+                    type: object
+                    description: >-
+                      #564 G5 — effective per-action lifecycle deadlines. Unlike every other
+                      section here, these are NOT read from Lambda env: they come from SSM
+                      Parameter Store at runtime (60s in-process cache), so an operator can
+                      change one with `aws ssm put-parameter --overwrite` and see it take
+                      effect without a redeploy. Changing the Lambda env does NOT work for
+                      this — traffic runs on the `live` alias, and a published version's env
+                      is frozen. Each entry therefore reports where its value actually came
+                      from, which is what makes "the change took effect" verifiable.
+                    properties:
+                      deadline_sec:
+                        description: >-
+                          Per-action effective deadline. null when the snapshot could not be
+                          read (this endpoint is fail-soft: a config problem must not turn a
+                          read-only diagnostic into a 500) — `error` then carries the reason.
+                        type:
+                          - object
+                          - 'null'
+                        additionalProperties:
+                          type: object
+                          properties:
+                            value:
+                              type: integer
+                              description: Effective deadline in seconds.
+                            source:
+                              type: string
+                              enum: [ssm, ssm-stale, env-or-default]
+                              description: >-
+                                `ssm` = value from Parameter Store; `ssm-stale` = the read
+                                failed and this is the last value seen; `env-or-default` = no
+                                parameter for this action, fell back to
+                                LIFECYCLE_DEADLINE_SEC_<ACTION> or the code default.
+                      param_prefix:
+                        type: string
+                        description: SSM path prefix these values are read from.
+                      error:
+                        type: string
+                        description: Present only when deadline_sec is null.
+                    x-source: deploy/lambda/api/handler.py:_lifecycle_deadline_snapshot
+                  capabilities:
+                    type: object
+                    description: >-
+                      #579 Bug3 — deploy capability/identity so clients and a deployment gate
+                      can detect control-plane version drift that would otherwise silently
+                      ignore high-impact request fields. config_reapply=true means this build
+                      carries the #429 reapply implementation; an older deploy (e.g. apse1
+                      deployed version 91) lacks this block or reports it false, so a client
+                      must not send reapply fields and expect adoption. function_version comes
+                      from the Lambda runtime, letting a deploy gate check the live alias
+                      against the expected bb SHA.
+                    properties:
+                      config_reapply:
+                        type: boolean
+                        description: True when this build supports rebuild config reapply (#429).
+                      function_version:
+                        type:
+                          - string
+                          - 'null'
+                        description: Lambda runtime AWS_LAMBDA_FUNCTION_VERSION, for drift checks.
+                      deploy_sha:
+                        type:
+                          - string
+                          - 'null'
+                        description: env DEPLOY_SHA when wired; null otherwise.
+                    x-source: deploy/lambda/api/handler.py:system_info
                 x-source: deploy/lambda/api/handler.py:696
         '403':
           description: RBAC denied (viewer required when RBAC_ENABLED).
@@ -5042,7 +5239,7 @@ paths:
     put:
       operationId: updateSkill
       summary: 创建/替换技能的 SKILL.md
-      description: 'Uploads the markdown to s3://$ASSETS_BUCKET/skills/{name}/SKILL.md. Content must be valid UTF-8, at most 262144 bytes (256 KiB), and contain at least one non-empty top-level "# Title" line. The per-host S3 cron sync picks the file up within ~5 min; new VMs receive it at launch. NOTE: over-size content returns 400, not 413. Requires `x-api-key`; mutation is audit-logged via the api Lambda.'
+      description: 'Uploads the markdown to s3://$ASSETS_BUCKET/skills/{name}/SKILL.md with SHA-256 metadata, then dispatches the version-aware host syncer through SSM in batches of at most 50 hosts. The five-minute per-host cron is the fallback. The syncer compares S3 VersionId/ETag, verifies content before atomic replacement, and propagates delete markers; a same-size replacement is therefore not skipped. Running microVMs adopt the updated shared skill after their next restart/rebuild. Content must be valid UTF-8, at most 262144 bytes (256 KiB), and contain at least one non-empty top-level "# Title" line. NOTE: over-size content returns 400, not 413. Requires `x-api-key`; mutation is audit-logged via the api Lambda.'
       tags:
         - 技能与模板
       x-source: deploy/lambda/api/routes/skills_groups.py:147
@@ -5082,6 +5279,10 @@ paths:
                   - name
                   - size
                   - created
+                  - version_id
+                  - etag
+                  - sha256
+                  - sync
                 properties:
                   name:
                     type: string
@@ -5091,6 +5292,18 @@ paths:
                   created:
                     type: boolean
                     description: true when the skill did not previously exist.
+                  version_id:
+                    type: [string, 'null']
+                    description: S3 object VersionId, or null when bucket versioning is unavailable.
+                  etag:
+                    type: [string, 'null']
+                    description: S3 ETag without surrounding quotes.
+                  sha256:
+                    type: string
+                    pattern: ^[0-9a-f]{64}$
+                    description: SHA-256 of the stored UTF-8 bytes.
+                  sync:
+                    $ref: '#/components/schemas/SharedSkillSync'
         '201':
           description: New skill created.
           content:
@@ -5101,6 +5314,10 @@ paths:
                   - name
                   - size
                   - created
+                  - version_id
+                  - etag
+                  - sha256
+                  - sync
                 properties:
                   name:
                     type: string
@@ -5110,6 +5327,18 @@ paths:
                   created:
                     type: boolean
                     description: true when the skill did not previously exist.
+                  version_id:
+                    type: [string, 'null']
+                    description: S3 object VersionId, or null when bucket versioning is unavailable.
+                  etag:
+                    type: [string, 'null']
+                    description: S3 ETag without surrounding quotes.
+                  sha256:
+                    type: string
+                    pattern: ^[0-9a-f]{64}$
+                    description: SHA-256 of the stored UTF-8 bytes.
+                  sync:
+                    $ref: '#/components/schemas/SharedSkillSync'
         '400':
           description: Invalid skill name, invalid JSON body, missing/empty content, content exceeds 262144 bytes, or no top-level '# Title' heading.
           x-source: deploy/lambda/api/routes/skills_groups.py:158-180
@@ -5162,7 +5391,7 @@ paths:
     delete:
       operationId: deleteSkill
       summary: 删除技能(整个 S3 前缀)
-      description: Removes skills/{name}/ recursively — SKILL.md plus any auxiliary files — via paginated list + batch delete (1000 keys per call). Returns 404 when the prefix is already empty (so a second delete of the same skill is 404, not 200). Requires `x-api-key`; audit-logged via the api Lambda.
+      description: Removes skills/{name}/ recursively — SKILL.md plus any auxiliary files — via paginated list + batch delete (1000 keys per call), then dispatches the same version-aware host syncer so latest S3 delete markers remove host copies. The five-minute cron remains the fallback. Returns 404 when the prefix is already empty (so a second delete of the same skill is 404, not 200). Requires `x-api-key`; audit-logged via the api Lambda.
       tags:
         - 技能与模板
       x-source: deploy/lambda/api/routes/skills_groups.py:208
@@ -5187,12 +5416,15 @@ paths:
                 required:
                   - name
                   - deleted
+                  - sync
                 properties:
                   name:
                     type: string
                   deleted:
                     type: integer
                     description: Number of S3 objects removed.
+                  sync:
+                    $ref: '#/components/schemas/SharedSkillSync'
         '400':
           description: Skill name fails the regex.
           content:

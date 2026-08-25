@@ -41,5 +41,6 @@ function app() {
     window.ocTraces,
     window.ocLogs,
     window.ocRsa,
+    window.ocEgress,
   );
 }

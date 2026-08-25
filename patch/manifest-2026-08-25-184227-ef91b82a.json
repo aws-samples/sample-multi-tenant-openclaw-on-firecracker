@@ -1,0 +1,674 @@
+{
+  "synced_at": "2026-08-25 18:42:27 UTC+08:00",
+  "base_sha": "8628cac93dff750c6d1f5f8d0bb8791e99696005",
+  "source_commit": "ef91b82a2b052fe986391583a53848b569dd3ca6",
+  "commit_count": 119,
+  "file_count": 63,
+  "summary": "Sync the bb increment 8628cac9..ef91b82a to the public gateway branch. Sync-LOG only (which customer-facing files reached gateway + the issues behind them); the applyable patch kit is NOT built yet (folded_into pending).",
+  "issues_synced_note": "Index back to the issue tracker for whoever builds the patch kit: before assembling the kit, walk each issue and confirm it's covered. `title` is a ≤20-char gist only — open the issue for the full problem/fix/test. Lists only issues that touched a released file this sync.",
+  "issues_synced": [
+    {
+      "id": "#241",
+      "type": "feat",
+      "title": "host 侧 manifest 契约改造"
+    },
+    {
+      "id": "#429",
+      "type": "fix",
+      "title": "close config reapply…"
+    },
+    {
+      "id": "#494",
+      "type": "fix",
+      "title": "close rebuild durabi…"
+    },
+    {
+      "id": "#522",
+      "type": "fix",
+      "title": "bound silent LLM sta…"
+    },
+    {
+      "id": "#562",
+      "type": "fix",
+      "title": "七个生命周期操作的时间预算达标与终态语义"
+    },
+    {
+      "id": "#564",
+      "type": "fix",
+      "title": "七个生命周期操作的时间预算达标与终态语义"
+    },
+    {
+      "id": "#565",
+      "type": "fix",
+      "title": "七个生命周期操作的时间预算达标与终态语义"
+    },
+    {
+      "id": "#568",
+      "type": "feat",
+      "title": "publish 硬门补 customer…"
+    },
+    {
+      "id": "#575",
+      "type": "feat",
+      "title": "LiteLLM egress CIDR+…"
+    },
+    {
+      "id": "#577",
+      "type": "feat",
+      "title": "[FEATURE] egress fle…"
+    },
+    {
+      "id": "#579",
+      "type": "fix",
+      "title": "/system/info 暴露 reap…"
+    },
+    {
+      "id": "#592",
+      "type": "fix",
+      "title": "health_check 收敛 runn…"
+    },
+    {
+      "id": "#593",
+      "type": "fix",
+      "title": "软删租户从 gsi_rootfs_ver…"
+    },
+    {
+      "id": "#595",
+      "type": "fix",
+      "title": "带外删除后 in-flight 操作不复…"
+    },
+    {
+      "id": "#597",
+      "type": "fix",
+      "title": "自愈复验失败的诊断同时写 stderr"
+    },
+    {
+      "id": "#601",
+      "type": "feat",
+      "title": "fix"
+    },
+    {
+      "id": "#604",
+      "type": "fix",
+      "title": "start 补齐死线与终态兜底,死线词汇…"
+    },
+    {
+      "id": "#605",
+      "type": "feat",
+      "title": "数据面路由不回收"
+    },
+    {
+      "id": "#607",
+      "type": "docs",
+      "title": "pull-image 错误码表区分 Jo…"
+    },
+    {
+      "id": "#608",
+      "type": "fix",
+      "title": "guest 不可达时 stop 从永久拒…"
+    },
+    {
+      "id": "#610",
+      "type": "fix",
+      "title": "DELETE /hosts/{insta…"
+    },
+    {
+      "id": "#618",
+      "type": "feat",
+      "title": "edge 热路径读集群级 reader…"
+    },
+    {
+      "id": "#621",
+      "type": "fix",
+      "title": "GSI 查询路径补页扫描,不再返回空页却…"
+    }
+  ],
+  "needs_config_on_apply": [
+    {
+      "file": "config.yml.example",
+      "param": "edge_read_from_replica",
+      "change": "new",
+      "value": "false"
+    },
+    {
+      "file": "config.yml.example",
+      "param": "start",
+      "change": "new",
+      "value": "180      # #604 后续项;与 restart 同档"
+    },
+    {
+      "file": "config.yml.example",
+      "param": "egress_llm_cidr",
+      "change": "new",
+      "value": "\"\""
+    }
+  ],
+  "updated_files": {
+    "cdk-stack (cdk deploy OR hand-apply)": [
+      {
+        "path": "deploy/stacks/alarms.py",
+        "status": "modified",
+        "issues": [
+          "#618"
+        ]
+      },
+      {
+        "path": "deploy/stacks/compute.py",
+        "status": "modified",
+        "issues": [
+          "#577"
+        ]
+      },
+      {
+        "path": "deploy/stacks/ha_edge.py",
+        "status": "modified",
+        "issues": [
+          "#575",
+          "#577",
+          "#618"
+        ]
+      },
+      {
+        "path": "deploy/stacks/lambdas.py",
+        "status": "modified",
+        "issues": [
+          "#429",
+          "#522",
+          "#562",
+          "#564",
+          "#565",
+          "#577",
+          "#604"
+        ]
+      }
+    ],
+    "console (static assets, S3 sync)": [
+      {
+        "path": "deploy/console-bff/web/index.html",
+        "status": "modified",
+        "issues": [
+          "#577"
+        ]
+      },
+      {
+        "path": "deploy/console-bff/web/js/app.egress.js",
+        "status": "added",
+        "issues": [
+          "#577"
+        ]
+      },
+      {
+        "path": "deploy/console-bff/web/js/app.js",
+        "status": "modified",
+        "issues": [
+          "#577"
+        ]
+      },
+      {
+        "path": "deploy/console-bff/web/style.css",
+        "status": "modified",
+        "issues": [
+          "#577"
+        ]
+      }
+    ],
+    "docs": [
+      {
+        "path": "docs/api/pull-image-api.md",
+        "status": "modified",
+        "issues": [
+          "#494",
+          "#607"
+        ]
+      },
+      {
+        "path": "docs/aws-guide-en/09-api-integration.md",
+        "status": "modified",
+        "issues": [
+          "#579"
+        ]
+      },
+      {
+        "path": "docs/aws-guide-en/11-ops-maintenance.md",
+        "status": "modified",
+        "issues": [
+          "#618"
+        ]
+      },
+      {
+        "path": "docs/aws-guide-en/13-data-plane-redesign.md",
+        "status": "modified",
+        "issues": [
+          "#618"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/09-api-integration.md",
+        "status": "modified",
+        "issues": [
+          "#579"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/11-ops-maintenance.md",
+        "status": "modified",
+        "issues": [
+          "#618"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/19-config-parameter-baseline.md",
+        "status": "modified",
+        "issues": [
+          "#593"
+        ]
+      },
+      {
+        "path": "docs/aws-guide/openapi.yaml",
+        "status": "modified",
+        "issues": [
+          "#494",
+          "#579"
+        ]
+      }
+    ],
+    "edge (OpenResty / Fluent Bit host config)": [
+      {
+        "path": "deploy/edge/install-edge.sh",
+        "status": "modified",
+        "issues": [
+          "#618"
+        ]
+      },
+      {
+        "path": "deploy/edge/lib/backend.lua",
+        "status": "modified",
+        "issues": [
+          "#618"
+        ]
+      },
+      {
+        "path": "deploy/edge/lib/balancer.lua",
+        "status": "modified",
+        "issues": [
+          "#522",
+          "#618"
+        ]
+      },
+      {
+        "path": "deploy/edge/nginx.conf",
+        "status": "modified",
+        "issues": [
+          "#618"
+        ]
+      },
+      {
+        "path": "deploy/edge/route.lua",
+        "status": "modified",
+        "issues": [
+          "#618"
+        ]
+      },
+      {
+        "path": "deploy/edge/test/balancer_failover_adversarial_spec.lua",
+        "status": "modified",
+        "issues": [
+          "#618"
+        ]
+      },
+      {
+        "path": "deploy/edge/test/balancer_spec.lua",
+        "status": "modified",
+        "issues": [
+          "#522",
+          "#618"
+        ]
+      },
+      {
+        "path": "deploy/edge/test/route_reader_isolation_spec.lua",
+        "status": "added",
+        "issues": [
+          "#618"
+        ]
+      },
+      {
+        "path": "deploy/edge/test/spec_helper.lua",
+        "status": "modified",
+        "issues": [
+          "#522",
+          "#618"
+        ]
+      }
+    ],
+    "host-scripts (S3-pulled / baked into rootfs)": [
+      {
+        "path": "deploy/userdata/delete-all-vms.sh",
+        "status": "modified",
+        "issues": [
+          "#241"
+        ]
+      },
+      {
+        "path": "deploy/userdata/host-agent.py",
+        "status": "modified",
+        "issues": [
+          "#575",
+          "#577",
+          "#579",
+          "#605"
+        ]
+      },
+      {
+        "path": "deploy/userdata/init-host.sh",
+        "status": "modified",
+        "issues": [
+          "#562",
+          "#564",
+          "#565",
+          "#575",
+          "#579"
+        ]
+      },
+      {
+        "path": "deploy/userdata/launch-vm.sh",
+        "status": "modified",
+        "issues": [
+          "#577"
+        ]
+      },
+      {
+        "path": "deploy/userdata/lib/harden-config.sh",
+        "status": "modified",
+        "issues": [
+          "#429",
+          "#522"
+        ]
+      },
+      {
+        "path": "deploy/userdata/lib/lifecycle-guard.sh",
+        "status": "modified",
+        "issues": [
+          "#241"
+        ]
+      },
+      {
+        "path": "deploy/userdata/migrate-vm.sh",
+        "status": "modified",
+        "issues": [
+          "#577"
+        ]
+      },
+      {
+        "path": "deploy/userdata/oc-egress-chain.sh",
+        "status": "modified",
+        "issues": [
+          "#575",
+          "#577"
+        ]
+      },
+      {
+        "path": "deploy/userdata/oc-egress-sim.py",
+        "status": "modified",
+        "issues": [
+          "#575",
+          "#577"
+        ]
+      },
+      {
+        "path": "deploy/userdata/required-scripts.list",
+        "status": "modified",
+        "issues": [
+          "#579"
+        ]
+      },
+      {
+        "path": "deploy/userdata/route_ops.py",
+        "status": "modified",
+        "issues": [
+          "#605"
+        ]
+      },
+      {
+        "path": "deploy/userdata/spire-kit/guest/agent.conf.tmpl",
+        "status": "modified",
+        "issues": [
+          "#568"
+        ]
+      },
+      {
+        "path": "deploy/userdata/spire-kit/spire-join-broker.py",
+        "status": "modified",
+        "issues": [
+          "#568"
+        ]
+      },
+      {
+        "path": "deploy/userdata/stop-vm.sh",
+        "status": "modified",
+        "issues": [
+          "#494",
+          "#608"
+        ]
+      },
+      {
+        "path": "deploy/userdata/sync-shared-skills.py",
+        "status": "added",
+        "issues": [
+          "#579"
+        ]
+      }
+    ],
+    "lambda (update-function-code only)": [
+      {
+        "path": "deploy/lambda/api/core/clients.py",
+        "status": "modified",
+        "issues": [
+          "#562",
+          "#564",
+          "#565"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/create_deadline.py",
+        "status": "modified",
+        "issues": [
+          "#562",
+          "#564",
+          "#565",
+          "#604"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/ssm_dispatch.py",
+        "status": "modified",
+        "issues": [
+          "#562",
+          "#564",
+          "#565",
+          "#597",
+          "#604"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/handler.py",
+        "status": "modified",
+        "issues": [
+          "#429",
+          "#522",
+          "#562",
+          "#564",
+          "#565",
+          "#577",
+          "#579",
+          "#595",
+          "#601",
+          "#604"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/routes/skills_groups.py",
+        "status": "modified",
+        "issues": [
+          "#579"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/deadline_executor.py",
+        "status": "modified",
+        "issues": [
+          "#604"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/egress_admin_service.py",
+        "status": "modified",
+        "issues": [
+          "#575",
+          "#577"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/host_service.py",
+        "status": "modified",
+        "issues": [
+          "#494",
+          "#579",
+          "#593",
+          "#610"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/image_slot_service.py",
+        "status": "modified",
+        "issues": [
+          "#494"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/rolling_upgrade_service.py",
+        "status": "modified",
+        "issues": [
+          "#579"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/tenant_query_service.py",
+        "status": "modified",
+        "issues": [
+          "#621"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/tenant_service.py",
+        "status": "modified",
+        "issues": [
+          "#429",
+          "#494",
+          "#562",
+          "#564",
+          "#565",
+          "#579",
+          "#593",
+          "#595",
+          "#604",
+          "#608"
+        ]
+      },
+      {
+        "path": "deploy/lambda/backup/handler.py",
+        "status": "modified",
+        "issues": [
+          "#562",
+          "#564",
+          "#565"
+        ]
+      },
+      {
+        "path": "deploy/lambda/health_check/handler.py",
+        "status": "modified",
+        "issues": [
+          "#494",
+          "#592",
+          "#593",
+          "#605"
+        ]
+      },
+      {
+        "path": "deploy/lambda/scaler/handler.py",
+        "status": "modified",
+        "issues": [
+          "#593"
+        ]
+      }
+    ],
+    "root / other": [
+      {
+        "path": "build-rootfs.sh",
+        "status": "modified",
+        "issues": [
+          "#494"
+        ]
+      },
+      {
+        "path": "config.yml.example",
+        "status": "modified",
+        "issues": [
+          "#562",
+          "#564",
+          "#565",
+          "#575",
+          "#604",
+          "#618"
+        ]
+      },
+      {
+        "path": "setup.sh",
+        "status": "modified",
+        "issues": [
+          "#579"
+        ]
+      }
+    ],
+    "scripts": [
+      {
+        "path": "scripts/build-rootfs-on-ec2.sh",
+        "status": "modified",
+        "issues": [
+          "#579"
+        ]
+      },
+      {
+        "path": "scripts/checks/create-deadline-config.py",
+        "status": "modified",
+        "issues": [
+          "#562",
+          "#564",
+          "#565",
+          "#604"
+        ]
+      },
+      {
+        "path": "scripts/checks/oc-version-compat-sim.sh",
+        "status": "added",
+        "issues": [
+          "#429"
+        ]
+      },
+      {
+        "path": "scripts/lib/patch-openclaw-transcript-durability.mjs",
+        "status": "added",
+        "issues": [
+          "#494"
+        ]
+      },
+      {
+        "path": "scripts/tenant-rootfs-query-backfill.py",
+        "status": "added",
+        "issues": [
+          "#593"
+        ]
+      }
+    ]
+  },
+  "folded_into": "(pending) — no patch kit built for this sync yet; a later kit should cite this manifest as source-of-record and set base_sha/patch_sha. cdk deploy is FORBIDDEN on hand-modified live deployments — the kit must ship *.patched host scripts + the full lambda tree + AWS CLI for stack changes, same shape as patch/315-concurrent-dispatch-rollup/."
+}

@@ -46,6 +46,9 @@ _DEFAULTS = {
     "ddb_throttle_threshold": 0,
     "ddb_throttle_evaluation_periods": 1,
     "ddb_throttle_period_minutes": 5,
+    "redis_replication_lag_threshold_seconds": 5,
+    "redis_replication_lag_evaluation_periods": 5,
+    "redis_replication_lag_period_minutes": 1,
 }
 
 
@@ -247,6 +250,49 @@ def build_alarms(self, ctx):
                     f"DynamoDB {table.table_name} throttled requests > "
                     f"{ddb_threshold} — provisioned capacity or partition hot "
                     f"key (R9.1 Business_Alarm_Set)."
+                ),
+            )
+        )
+
+    # ── Redis replicas: edge 路由新鲜度上界 ───────────────────────────────
+    # ReplicationLag 的有效维度是每个副本节点 CacheClusterId，不是
+    # ReplicationGroupId。ha_edge.py 从 CFN 的只读 endpoint 列表提取节点 id。
+    redis_lag_eval = int(
+        _cfg(alarms_cfg, "redis_replication_lag_evaluation_periods")
+    )
+    for index, cache_cluster_id in enumerate(
+        getattr(ctx, "redis_replica_cluster_ids", [])
+    ):
+        _add_action(
+            cloudwatch.Alarm(
+                self,
+                f"RedisReplicationLagReplica{index + 1}Alarm",
+                alarm_name=(
+                    "openclaw-edge-replica-route-freshness-upper-bound-"
+                    f"{index + 1}"
+                ),
+                metric=cloudwatch.Metric(
+                    namespace="AWS/ElastiCache",
+                    metric_name="ReplicationLag",
+                    dimensions_map={"CacheClusterId": cache_cluster_id},
+                    period=Duration.minutes(
+                        _cfg(alarms_cfg, "redis_replication_lag_period_minutes")
+                    ),
+                    statistic="Maximum",
+                ),
+                threshold=float(
+                    _cfg(alarms_cfg, "redis_replication_lag_threshold_seconds")
+                ),
+                evaluation_periods=redis_lag_eval,
+                datapoints_to_alarm=redis_lag_eval,
+                comparison_operator=(
+                    cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD
+                ),
+                treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+                alarm_description=(
+                    "保护 edge 读副本时的路由新鲜度上界；ReplicationLag 超阈值"
+                    "意味着“复制延迟 + POS_TTL_SEC”可能吃掉 "
+                    "PORT_QUARANTINE_SECONDS 的余量。"
                 ),
             )
         )

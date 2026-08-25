@@ -1015,7 +1015,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--registry-ttl", type=float, default=float(env("SPIRE_KIT_REGISTRY_TTL", "5")))
     p.add_argument("--state-file", default=env("SPIRE_KIT_STATE_FILE", DEFAULT_STATE_FILE))
     # 默认 3 而不是 1:agent 崩溃后 systemd 重启要重新 attest,而 join token 是一次性的
-    # (SPIRE server 侧强制单次使用)。上游 ByAI 文档把这条列成"需告警"的未解项;这里用
+    # (SPIRE server 侧强制单次使用)。上游参考文档把这条列成"需告警"的未解项;这里用
     # "每次开机最多换 3 枚新 token"给崩溃恢复留窗口。多发的是**新** token 而非重放,
     # 且都只映射到该租户自己的 SPIFFE ID,不构成越权面;台账逐次留痕可审计。
     p.add_argument("--max-issues-per-boot", type=int, default=int(env("SPIRE_KIT_MAX_ISSUES", "3")))

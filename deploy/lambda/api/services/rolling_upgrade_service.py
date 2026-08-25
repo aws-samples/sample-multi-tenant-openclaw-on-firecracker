@@ -8,6 +8,7 @@ import os
 import re
 import time
 import uuid
+from datetime import datetime, timezone
 
 import boto3
 from botocore.exceptions import ClientError
@@ -29,9 +30,14 @@ _WORKER_BUDGET_SEC = float(os.environ.get("ROLLING_UPGRADE_WORKER_BUDGET_SEC", "
 _WORKER_LEASE_SEC = max(
     960, int(os.environ.get("ROLLING_UPGRADE_WORKER_LEASE_SEC", "960"))
 )
+_HOST_SLOT_EVIDENCE_MAX_AGE_SEC = int(
+    os.environ.get("ROLLING_UPGRADE_HOST_SLOT_EVIDENCE_MAX_AGE_SEC", "120")
+)
 _SUBMIT_LOCK_SEC = 30
 _SUBMIT_LOCK_ID = "__rolling_upgrade_submit_lock__"
 _MAX_JOB_BYTES = 350_000  # leave headroom below DynamoDB's 400 KiB item limit
+_MAX_PROGRESS_ERROR_CHARS = 256
+_MAX_PROGRESS_CODE_CHARS = 128
 _REQUEST_FIELDS = {
     "scope",
     "action",
@@ -91,7 +97,93 @@ def _scope_parts(body):
     return None, None
 
 
-def _resolve_targets(body, ident):
+def _snapshot_artifacts(snapshot_time):
+    if clients.version_snapshots_table is None:
+        raise ValueError("version snapshot ledger is not configured")
+    snapshot = clients.version_snapshots_table.get_item(
+        Key={"snapshot_time": snapshot_time}, ConsistentRead=True
+    ).get("Item")
+    if not snapshot or snapshot.get("status") in {"deleting", "deleted"}:
+        raise ValueError(f"snapshot is unavailable: {snapshot_time}")
+    files = snapshot.get("files") or []
+    if isinstance(files, str):
+        try:
+            files = json.loads(files)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"snapshot files ledger is invalid: {snapshot_time}"
+            ) from exc
+    if not isinstance(files, list) or any(
+        not isinstance(item, dict) for item in files
+    ):
+        raise ValueError(f"snapshot files ledger is invalid: {snapshot_time}")
+    manifest_entry = next(
+        (
+            item
+            for item in files
+            if item.get("path") == "deployment/rootfs/manifest.json"
+        ),
+        None,
+    )
+    if not manifest_entry:
+        raise ValueError(f"snapshot has no rootfs manifest: {snapshot_time}")
+    kwargs = {
+        "Bucket": os.environ.get("ASSETS_BUCKET", ""),
+        "Key": manifest_entry["path"],
+    }
+    manifest_version_id = manifest_entry.get("s3_version_id")
+    if manifest_version_id:
+        kwargs["VersionId"] = manifest_version_id
+    manifest = json.loads(clients.s3.get_object(**kwargs)["Body"].read().decode())
+    artifacts = {}
+    for kind, field in (("rootfs", "rootfs"), ("immutable", "immutable")):
+        filename = manifest.get(field)
+        if not filename:
+            continue
+        path = f"deployment/rootfs/{filename}"
+        entry = next((item for item in files if item.get("path") == path), None)
+        if not entry or not entry.get("s3_version_id") or not entry.get("etag"):
+            raise ValueError(
+                f"snapshot lacks immutable S3 identity for {kind}: {snapshot_time}"
+            )
+        artifacts[kind] = {
+            "s3_version_id": str(entry["s3_version_id"]),
+            "etag": str(entry["etag"]).strip('"'),
+        }
+    if "rootfs" not in artifacts:
+        raise ValueError(f"snapshot has no rootfs artifact: {snapshot_time}")
+    return artifacts
+
+
+def _host_target(host, expected=None):
+    host_id = host.get("instance_id") or ""
+    if host.get("status") not in {"active", "idle"}:
+        raise ValueError(f"host is not ready for rolling work: {host_id}")
+    rootfs = host.get("rootfs_version") or ""
+    if not rootfs:
+        raise ValueError(f"host has no committed rootfs version: {host_id}")
+    if expected is not None and rootfs != expected:
+        raise ValueError(f"host {host_id} live version is {rootfs}, not {expected}")
+    slots = host.get("image_slots")
+    if not isinstance(slots, dict) or not slots.get("live"):
+        raise ValueError(f"host has no committed live slot: {host_id}")
+    try:
+        generation = int(slots.get("generation"))
+        synced_at = int(host.get("image_slots_synced_at_epoch") or 0)
+    except (TypeError, ValueError):
+        raise ValueError(f"host slot evidence is invalid: {host_id}") from None
+    if generation < 0 or int(time.time()) - synced_at > _HOST_SLOT_EVIDENCE_MAX_AGE_SEC:
+        raise ValueError(f"host slot evidence is stale: {host_id}")
+    return {
+        "host_id": host_id,
+        "rootfs_version": rootfs,
+        "immutable_version": host.get("immutable_version") or "",
+        "image_snapshot_time": str(slots["live"]),
+        "image_generation": generation,
+    }
+
+
+def _resolve_targets(body, ident, requested_at=None):
     kind, value = _scope_parts(body)
     if kind is None:
         return None, _err(
@@ -154,6 +246,8 @@ def _resolve_targets(body, ident):
         return None, _err(
             400, "VALIDATION", "target_version must be a non-empty string"
         )
+    snapshot_cache = {}
+    requested_at = requested_at or _now()
     for tenant in tenants:
         host_id = tenant.get("host_id")
         if not host_id:
@@ -167,24 +261,39 @@ def _resolve_targets(body, ident):
                 Key={"instance_id": host_id}, ConsistentRead=True
             ).get("Item")
         host = hosts[host_id] or {}
-        rootfs = host.get("rootfs_version") or ""
-        if not rootfs:
+        try:
+            frozen = _host_target(host, expected=expected)
+        except ValueError as exc:
             return None, _err(
                 409,
-                "CONFLICT",
-                f"host has no committed rootfs version: {host_id}",
-            )
-        if expected is not None and rootfs != expected:
-            return None, _err(
-                409,
-                "CONFLICT",
-                f"host {host_id} live version is {rootfs}, not {expected}",
+                "TARGET_NOT_READY",
+                str(exc),
                 {"host_id": host_id},
             )
+        pinned = tenant.get("image_snapshot_time") or ""
+        if pinned:
+            return None, _err(
+                409,
+                "PINNED_TENANT",
+                f"tenant {tenant['id']} is pinned to {pinned}; rolling "
+                "restart/rebuild cannot change a pinned image without an explicit repin",
+            )
+        snapshot_time = frozen["image_snapshot_time"]
+        if snapshot_time not in snapshot_cache:
+            try:
+                snapshot_cache[snapshot_time] = _snapshot_artifacts(snapshot_time)
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                return None, _err(
+                    409,
+                    "TARGET_EVIDENCE_UNAVAILABLE",
+                    str(exc),
+                    {"host_id": host_id, "snapshot_time": snapshot_time},
+                )
         targets[tenant["id"]] = {
-            "host_id": host_id,
-            "rootfs_version": rootfs,
-            "immutable_version": host.get("immutable_version") or "",
+            **frozen,
+            "artifacts": snapshot_cache[snapshot_time],
+            "requested_at": requested_at,
+            "baseline_observed_boot_at": tenant.get("observed_boot_at") or "",
         }
     return (kind, [item["id"] for item in tenants], targets), None
 
@@ -219,6 +328,35 @@ def _request_fingerprint(scope, action, batch_size, max_failures, target_version
         separators=(",", ":"),
     )
     return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _bounded_text(value, limit):
+    text = str(value or "")
+    return text[:limit]
+
+
+def _job_payload_bytes(item):
+    return len(json.dumps(item, separators=(",", ":")).encode())
+
+
+def _projected_failure_bytes(item):
+    """Upper-bound the largest single-item progress shape we persist."""
+    projected = dict(item)
+    projected["pending_ids"] = []
+    projected["succeeded"] = []
+    projected["failed"] = [
+        {
+            "id": tenant_id,
+            "error": "e" * _MAX_PROGRESS_ERROR_CHARS,
+            "code": "c" * _MAX_PROGRESS_CODE_CHARS,
+            "http_status": 599,
+        }
+        for tenant_id in item.get("target_ids", [])
+    ]
+    projected["current_batch"] = list(
+        item.get("target_ids", [])[: int(item.get("batch_size", 1))]
+    )
+    return _job_payload_bytes(projected)
 
 
 def _conditional_failed(exc):
@@ -422,7 +560,7 @@ def submit_rolling_upgrade(body=None, event=None):
                 },
             )
         try:
-            resolved, error = _resolve_targets(body, ident)
+            resolved, error = _resolve_targets(body, ident, requested_at=now)
         except Exception as exc:
             print(f"[rolling-upgrade] target resolution failed: {exc}")
             return _err(
@@ -466,12 +604,15 @@ def submit_rolling_upgrade(body=None, event=None):
             "actor_platform_scope": ident.get("platform_scope"),
             "request_fingerprint": request_fingerprint,
         }
-        if len(json.dumps(item, separators=(",", ":")).encode()) > _MAX_JOB_BYTES:
+        if (
+            max(_job_payload_bytes(item), _projected_failure_bytes(item))
+            > _MAX_JOB_BYTES
+        ):
             return _err(
                 400,
                 "VALIDATION",
-                "rolling-upgrade job state exceeds the DynamoDB item size safety "
-                "limit; submit a narrower scope",
+                "rolling-upgrade job state could exceed the DynamoDB item size "
+                "safety limit; submit a narrower scope",
             )
         clients.batch_jobs_table.put_item(
             Item=item, ConditionExpression="attribute_not_exists(job_id)"
@@ -530,15 +671,86 @@ def _tenant(tenant_id):
     ).get("Item")
 
 
+def _iso_epoch(value):
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
 def _converged(item, target):
-    if not item or item.get("status") == "deleted":
+    if not item or item.get("status") != "running":
         return False
     if item.get("host_id") != target.get("host_id"):
         return False
     if item.get("rootfs_version") != target.get("rootfs_version"):
         return False
     immutable = target.get("immutable_version") or ""
-    return not immutable or item.get("immutable_version") == immutable
+    if immutable and item.get("immutable_version") != immutable:
+        return False
+    snapshot = target.get("image_snapshot_time") or ""
+    if not snapshot or item.get("observed_image_snapshot_time") != snapshot:
+        return False
+    if item.get("observed_mounted_rootfs_snapshot_time") != snapshot:
+        return False
+    artifacts = target.get("artifacts") or {}
+    if "immutable" in artifacts and (
+        item.get("observed_mounted_immutable_snapshot_time") != snapshot
+    ):
+        return False
+    boot = _iso_epoch(item.get("observed_boot_at"))
+    requested = _iso_epoch(target.get("requested_at"))
+    baseline = _iso_epoch(target.get("baseline_observed_boot_at"))
+    if boot is None or requested is None or boot < requested:
+        return False
+    return baseline is None or boot > baseline
+
+
+def _host_target_ready(target):
+    host_id = target.get("host_id") or ""
+    try:
+        host = clients.hosts_table.get_item(
+            Key={"instance_id": host_id}, ConsistentRead=True
+        ).get("Item")
+        current = _host_target(host or {})
+    except Exception as exc:
+        return False, str(exc)
+    for key in (
+        "rootfs_version",
+        "immutable_version",
+        "image_snapshot_time",
+        "image_generation",
+    ):
+        if current.get(key) != target.get(key):
+            return False, f"host target changed after submission: {key}"
+    return True, ""
+
+
+def _ensure_host_mount_observer(host_id):
+    """Upgrade the host observer before relying on FD-backed mount evidence."""
+    command = r"""
+set -eu
+agent=/opt/openclaw/host-agent.py
+if ! grep -q observed_mounted_rootfs_snapshot_time "$agent" 2>/dev/null; then
+  [ -r /etc/platform.env ]
+  set -a
+  . /etc/platform.env
+  set +a
+  [ -n "${ASSETS_BUCKET:-}" ]
+  tmp=$(mktemp /opt/openclaw/.host-agent.py.XXXXXX)
+  aws s3 cp "s3://${ASSETS_BUCKET}/deployment/scripts/host-agent.py" "$tmp" --no-progress
+  python3 -m py_compile "$tmp"
+  install -o root -g root -m 0755 "$tmp" "$agent"
+  rm -f "$tmp"
+  systemctl restart host-agent
+fi
+""".strip()
+    return bool(tenant_service.ssm_dispatch._ssm_run(host_id, command, timeout=120))
 
 
 def _append_unique(results, entry):
@@ -686,7 +898,12 @@ def run_rolling_job(job_id):
         if _converged(_tenant(tenant_id), targets.get(tenant_id, {})):
             _append_unique(
                 succeeded,
-                {"id": tenant_id, "action": job["action"], "converged": True},
+                {
+                    "id": tenant_id,
+                    "action": job["action"],
+                    "converged": True,
+                    "recovered_after_retry": True,
+                },
             )
         else:
             still_pending.append(tenant_id)
@@ -713,7 +930,33 @@ def run_rolling_job(job_id):
     dispatched = []
     batch_failures = []
     base_event = _synthetic_event(job)
+    observer_ready = {}
     for tenant_id in batch:
+        ready, reason = _host_target_ready(targets.get(tenant_id, {}))
+        if not ready:
+            batch_failures.append(
+                {
+                    "id": tenant_id,
+                    "error": _bounded_text(
+                        reason or "host target is not ready",
+                        _MAX_PROGRESS_ERROR_CHARS,
+                    ),
+                    "code": "HOST_TARGET_NOT_READY",
+                }
+            )
+            continue
+        host_id = targets[tenant_id]["host_id"]
+        if host_id not in observer_ready:
+            observer_ready[host_id] = _ensure_host_mount_observer(host_id)
+        if not observer_ready[host_id]:
+            batch_failures.append(
+                {
+                    "id": tenant_id,
+                    "error": "host mount observer could not be upgraded",
+                    "code": "HOST_OBSERVER_NOT_READY",
+                }
+            )
+            continue
         event = dict(base_event)
         event["_op_id"] = _tenant_operation_id(job_id, tenant_id, job["action"])
         try:
@@ -723,7 +966,9 @@ def run_rolling_job(job_id):
                 response_body = json.loads(result.get("body") or "{}")
             except (AttributeError, TypeError, ValueError):
                 response_body = {}
-            error_code = response_body.get("code")
+            error_code = _bounded_text(
+                response_body.get("code"), _MAX_PROGRESS_CODE_CHARS
+            )
             if code >= 400:
                 if error_code in _POLLABLE_TENANT_CODES:
                     dispatched.append(tenant_id)

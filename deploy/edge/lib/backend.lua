@@ -227,7 +227,12 @@ local function put_positive(shared, tid, desc)
     end
 end
 
-local function put_negative(shared, tid)
+-- #618 — clean miss 只有来自 primary 时才是权威“不存在”。reader 可能正处于
+-- 复制滞后、重同步或数据集尚未补齐，此时只能写短负缓存挡扫描器，不能删除
+-- L2 blob/fresh marker 这份 fail-static 底料。代价是 #497 已识别的风险在
+-- 非权威路径上部分回归：若租户确已删除，旧 blob 以后可能被 fail-static 供出；
+-- 这是用该风险换取副本异常时不主动摧毁在役租户故障兜底的刻意权衡。
+local function put_negative(shared, tid, authoritative)
     if L1_CACHE then L1_CACHE:set(tid, NEG_SENTINEL, NEG_TTL_SEC) end
     if shared then
         shared:set(neg_key(tid), "1", NEG_TTL_SEC)
@@ -238,8 +243,10 @@ local function put_negative(shared, tid)
         -- serve the deleted tenant's old host:port, which by then may belong to
         -- ANOTHER tenant's VM. The negative's own 2s TTL is not a substitute: the
         -- blob outlives it by up to L2_TTL_SEC.
-        shared:delete(l2_key(tid))
-        shared:delete(fresh_key(tid))
+        if authoritative then
+            shared:delete(l2_key(tid))
+            shared:delete(fresh_key(tid))
+        end
     end
 end
 
@@ -292,7 +299,7 @@ end
 -- that would overwrite a newer route and re-arm its freshness marker, i.e. exactly
 -- the stale/cross-tenant routing this issue removes. The lock-timeout path
 -- therefore never reaches here; it answers from the cache alone.
-local function try_redis(shared, tid, redis_host, redis_port)
+local function try_redis(shared, tid, redis_host, redis_port, authoritative)
     -- #497 — the lock holder ALWAYS probes Redis, never backs off on the failure
     -- evidence. A backoff would suppress re-reads, so for as long as the evidence lived
     -- we would keep serving an aged blob (up to L2_TTL_SEC old, its host:port possibly
@@ -333,7 +340,7 @@ local function try_redis(shared, tid, redis_host, redis_port)
     if shared then shared:delete(err_key(tid)) end
     if raw == nil then
         -- Clean miss: unknown tenant.
-        put_negative(shared, tid)
+        put_negative(shared, tid, authoritative)
         return nil, _M.SOURCE_NEG, nil
     end
     local desc, perr = parse_value(raw)
@@ -398,7 +405,10 @@ end
       - tid:    validated tenant id string
       - redis_host, redis_port: nginx.conf-configured endpoint
 --]]
-function _M.lookup_backend(shared, tid, redis_host, redis_port)
+-- #618 — 末位第 5 参数 authoritative 表示本次 Redis clean miss 是否来自
+-- primary；省略时默认 true，保证所有旧调用方与开关关闭形态保持原行为。
+function _M.lookup_backend(shared, tid, redis_host, redis_port, authoritative)
+    if authoritative == nil then authoritative = true end
     -- L1: worker-local hot path.
     local desc, is_neg = l1_get(tid)
     if desc ~= nil then return desc, _M.SOURCE_L1, nil end
@@ -431,7 +441,8 @@ function _M.lookup_backend(shared, tid, redis_host, redis_port)
         -- i.e. NO request can be locked; if these lookups also refused to write, the
         -- cache would never fill and the whole fleet would sit on Redis. In that
         -- degraded mode a filled cache is worth more than write ordering.
-        return _M._finish_lookup(shared, tid, redis_host, redis_port)
+        return _M._finish_lookup(
+            shared, tid, redis_host, redis_port, authoritative)
     end
 
     -- #497 — sampled BEFORE the wait: answer_without_redis only accepts a failure
@@ -467,15 +478,17 @@ function _M.lookup_backend(shared, tid, redis_host, redis_port)
     end
 
     local out_desc, out_source, out_status =
-        _M._finish_lookup(shared, tid, redis_host, redis_port)
+        _M._finish_lookup(
+            shared, tid, redis_host, redis_port, authoritative)
     pcall(lock.unlock, lock)
     return out_desc, out_source, out_status
 end
 
 -- _finish_lookup: separated so the "lock creation failed" fast path can
 -- reuse the exact same fail-static logic without duplicating branches.
-function _M._finish_lookup(shared, tid, redis_host, redis_port)
-    local desc, source, rerr = try_redis(shared, tid, redis_host, redis_port)
+function _M._finish_lookup(shared, tid, redis_host, redis_port, authoritative)
+    local desc, source, rerr = try_redis(
+        shared, tid, redis_host, redis_port, authoritative)
     if source == _M.SOURCE_L3 then
         return desc, source, nil
     end

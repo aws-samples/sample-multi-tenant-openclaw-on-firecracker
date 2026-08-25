@@ -79,13 +79,38 @@ REDIS_HOST="${ENGINE_REDIS_ENDPOINT%:*}"
 REDIS_PORT="${ENGINE_REDIS_ENDPOINT##*:}"
 [[ "$REDIS_HOST" != "$REDIS_PORT" ]] || die "ENGINE_REDIS_ENDPOINT missing :port"
 
+READER_HOST="$REDIS_HOST"
+READER_PORT="$REDIS_PORT"
+# AWS_REGION 在本脚本里是可选项(见下方 fluent-bit 段的 ${AWS_REGION:-...}),
+# 而脚本开头是 set -euo pipefail —— 裸写 "$AWS_REGION" 会在未设时直接 unbound
+# variable 退出,把 edge 拉不起来,正好是本段刻意要避免的失败。留空则 aws CLI
+# 自己报错、走下面的 WARN 回落。
+if ! READER_ENDPOINT="$(aws ssm get-parameter \
+    --name /openclaw/engine/redis/reader-endpoint \
+    --query 'Parameter.Value' \
+    --output text \
+    --region "${AWS_REGION:-}" 2>/dev/null)"; then
+    log "WARN: failed to read Redis reader endpoint from SSM; falling back to primary"
+elif [[ -z "$READER_ENDPOINT" || "$READER_ENDPOINT" == "None" ]]; then
+    log "WARN: Redis reader endpoint from SSM is empty; falling back to primary"
+else
+    _reader_host="${READER_ENDPOINT%:*}"
+    _reader_port="${READER_ENDPOINT##*:}"
+    if [[ -z "$_reader_host" || -z "$_reader_port" || "$_reader_host" == "$_reader_port" ]]; then
+        log "WARN: Redis reader endpoint missing host:port; falling back to primary"
+    else
+        READER_HOST="$_reader_host"
+        READER_PORT="$_reader_port"
+    fi
+fi
+
 ARCH="$(uname -m)"
 case "$ARCH" in
     aarch64|arm64) ARCH_DEB=arm64 ;;
     x86_64|amd64)  ARCH_DEB=amd64 ;;
     *) die "unsupported arch: $ARCH" ;;
 esac
-log "arch=$ARCH deb-arch=$ARCH_DEB listen=$LISTEN_PORT redis=$REDIS_HOST:$REDIS_PORT"
+log "arch=$ARCH deb-arch=$ARCH_DEB listen=$LISTEN_PORT redis=$REDIS_HOST:$REDIS_PORT reader=$READER_HOST:$READER_PORT"
 
 # ── 1. Read this host's private IPv4 from IMDS ───────────────────────────
 imds_token() {
@@ -158,12 +183,14 @@ install -m 0644 "$SRC_DIR"/lib/*.lua "$LUALIB/lib/"
 # ── 4. Render nginx.conf template into /usr/local/openresty/nginx/conf ───
 CONF_DIR=/usr/local/openresty/nginx/conf
 mkdir -p "$CONF_DIR"
-# envsubst replaces ONLY the three placeholders we templated — nothing else.
+# envsubst 只替换模板里显式列出的五个占位符,其余 $ 变量保持原样。
 export ENGINE_REDIS_HOST="$REDIS_HOST"
 export ENGINE_REDIS_PORT="$REDIS_PORT"
+export ENGINE_REDIS_READER_HOST="$READER_HOST"
+export ENGINE_REDIS_READER_PORT="$READER_PORT"
 export EDGE_SELF_IP="$SELF_IP"
 # shellcheck disable=SC2016  # envsubst takes the variable list literally
-envsubst '$ENGINE_REDIS_HOST $ENGINE_REDIS_PORT $EDGE_SELF_IP' \
+envsubst '$ENGINE_REDIS_HOST $ENGINE_REDIS_PORT $ENGINE_REDIS_READER_HOST $ENGINE_REDIS_READER_PORT $EDGE_SELF_IP' \
     < "$SRC_DIR/nginx.conf" > "$CONF_DIR/nginx.conf"
 
 # ── 5. Kernel / socket tuning (03-TEST-PLAN §8) ──────────────────────────
@@ -192,7 +219,7 @@ sysctl -p /etc/sysctl.d/99-openclaw-edge.conf >/dev/null || \
 # ── 6. systemd unit ──────────────────────────────────────────────────────
 # The Environment= lines feed route.lua's warmup_probe(), which needs to
 # know the endpoint at init_worker phase (before any request runs, so
-# ngx.var.edge_redis_host isn't available yet). Kept in sync with the
+# ngx.var.edge_redis_reader_host isn't available yet). Kept in sync with the
 # same values baked into nginx.conf's server-block $edge_redis_* vars.
 cat > /etc/systemd/system/claw-edge.service <<UNIT
 [Unit]
@@ -205,6 +232,8 @@ Type=forking
 PIDFile=/usr/local/openresty/nginx/logs/nginx.pid
 Environment=ENGINE_REDIS_HOST_HINT=${REDIS_HOST}
 Environment=ENGINE_REDIS_PORT_HINT=${REDIS_PORT}
+Environment=ENGINE_REDIS_READER_HOST_HINT=${READER_HOST}
+Environment=ENGINE_REDIS_READER_PORT_HINT=${READER_PORT}
 ExecStartPre=/usr/local/openresty/nginx/sbin/nginx -t -c $CONF_DIR/nginx.conf
 ExecStart=/usr/local/openresty/nginx/sbin/nginx -c $CONF_DIR/nginx.conf
 ExecReload=/usr/local/openresty/nginx/sbin/nginx -s reload
@@ -278,4 +307,4 @@ if command -v curl >/dev/null 2>&1; then
     done
 fi
 
-log "DONE: claw-edge active on :$LISTEN_PORT; self_ip=$SELF_IP; redis=$REDIS_HOST:$REDIS_PORT"
+log "DONE: claw-edge active on :$LISTEN_PORT; self_ip=$SELF_IP; redis=$REDIS_HOST:$REDIS_PORT; reader=$READER_HOST:$READER_PORT"

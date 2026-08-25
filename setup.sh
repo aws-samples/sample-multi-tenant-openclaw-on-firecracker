@@ -580,6 +580,8 @@ aws s3 cp "$SCRIPT_DIR/deploy/userdata/route_ops.py" "s3://${BUCKET}/deployment/
 # 漏传 → reader service 拉不起来(同 route_ops.py 的"源码在但清单漏"类)。
 aws s3 cp "$SCRIPT_DIR/deploy/userdata/oc-guest-log-reader.py" "s3://${BUCKET}/deployment/scripts/oc-guest-log-reader.py" \
   "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
+aws s3 cp "$SCRIPT_DIR/deploy/userdata/sync-shared-skills.py" "s3://${BUCKET}/deployment/scripts/sync-shared-skills.py" \
+  "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" --quiet
 
 # Re-deploy is a no-op if nothing changed but it forces ASG hosts to retry
 # pulling scripts now that S3 has them — guards against the race where the

@@ -2233,6 +2233,14 @@ for _port in 8899 9090 22 9100; do
   sudo iptables -C INPUT -i ${TAP} -p tcp --dport ${_port} -j DROP 2>/dev/null || \
     sudo iptables -I INPUT 1 -i ${TAP} -p tcp --dport ${_port} -j DROP
 done
+# 同一批端口在 FORWARD 里也挡:上面的 INPUT 只保护 guest 所在的那一台 host,打机队里
+# 别的 host 走 FORWARD。刻意不带 -d(目的地是任何地方的这些端口),与 egress 模式解耦。
+# 清单与上面的 INPUT 循环、migrate-vm.sh、oc-egress-sim.py 同源,改一处同步三处。
+# 理由与实测见 ADR-603-guest-redline-ports-forward-drop.md。
+for _port in 8899 9090 22 9100; do
+  sudo iptables -C FORWARD -i ${TAP} -p tcp --dport ${_port} -j DROP 2>/dev/null || \
+    sudo iptables -I FORWARD 1 -i ${TAP} -p tcp --dport ${_port} -j DROP
+done
 # NOTE: the IMDS DROP lives ONLY in the FORWARD chain (above). The nat table
 # is for address translation, not filtering — nft rejects `-j DROP` in
 # nat/PREROUTING ("the use of DROP is therefore inhibited"), which under

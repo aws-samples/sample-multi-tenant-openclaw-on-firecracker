@@ -944,3 +944,125 @@ tr:hover td {
 ::-webkit-scrollbar-corner {
   background: var(--panel);
 }
+
+/* ===== #577/#594 Egress whitelist page ===== */
+/* 只加 eg- 前缀的新类,不改既有选择器。颜色一律走 :root 的主题变量 ——
+   console 是【深色】主题,写死 #fff 面板会让继承来的浅色正文变成白底浅字(实测过:
+   i-ok / fleet / deny 那几列会糊得看不清)。 */
+.eg-head { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+.eg-polling { font-size: 12px; color: var(--cyan); }
+.eg-panel { border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px;
+  margin-bottom: 14px; background: var(--panel); color: var(--text); }
+.eg-panel-title { font-weight: 700; margin-bottom: 8px; color: var(--text); }
+.eg-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 8px 18px; }
+.eg-k { display: inline-block; min-width: 170px; color: var(--gray); font-size: 12px; }
+.eg-v { font-weight: 600; font-size: 13px; color: var(--text); }
+.eg-ok { color: #59ba48; }
+.eg-warn { color: var(--cyan); }
+.eg-bad-t { color: #ff7a6b; font-weight: 700; }
+.eg-note { font-size: 12px; color: var(--gray); margin-top: 8px; line-height: 1.6; }
+.eg-danger-note { color: #ff9e91; }
+.eg-alert { border-radius: 5px; padding: 9px 12px; margin-bottom: 10px; font-size: 13px; line-height: 1.6; }
+.eg-bad { background: #3a1714; border: 1px solid var(--red); color: #ffd9d3; }
+.eg-warnbox { background: #3a2a10; border: 1px solid var(--brand2); color: #ffe6c7; }
+.eg-info { background: #16304d; border: 1px solid var(--aws-link); color: #d6e8fb; }
+.eg-table { width: 100%; border-collapse: collapse; font-size: 13px; color: var(--text); }
+.eg-table th, .eg-table td { text-align: left; padding: 5px 8px;
+  border-bottom: 1px solid var(--border); vertical-align: middle; }
+.eg-table th { color: var(--gray); font-weight: 600; font-size: 12px; }
+.eg-in-port { width: 74px; }
+.eg-in-dst { width: 190px; }
+.eg-in-typed { width: 150px; margin-left: 6px; }
+.eg-hole-check { font-size: 12px; }
+.eg-state { padding: 1px 7px; border-radius: 9px; font-size: 12px; font-weight: 600; }
+.eg-state-ok { background: #12351a; color: #7ed97a; }
+.eg-state-pending { background: #3a2a10; color: #ffc65c; }
+.eg-state-exempt { background: #2b2350; color: #c3b0ff; }
+.eg-state-bad { background: #3a1714; color: #ff9e91; }
+.eg-state-unknown { background: #22313f; color: var(--gray); }
+.eg-reason, .eg-why { color: var(--gray); font-size: 12px; }
+.eg-row { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 8px 0; color: var(--text); }
+.eg-preview td { font-family: "JetBrains Mono", ui-monospace, Menlo, monospace; font-size: 12px; }
+.eg-modal-bg { position: fixed; inset: 0; background: rgba(6, 12, 20, .72); display: flex;
+  align-items: center; justify-content: center; z-index: 900; }
+.eg-modal { background: var(--panel); color: var(--text); border: 1px solid var(--border);
+  border-radius: 8px; padding: 18px 20px; max-width: 620px; width: 92%; }
+.eg-modal-title { font-weight: 700; font-size: 15px; margin-bottom: 10px; }
+.eg-modal-line { font-size: 13px; line-height: 1.7; margin-bottom: 7px; }
+.eg-typed { margin: 12px 0; font-size: 13px; }
+.eg-modal-btns { display: flex; gap: 10px; justify-content: flex-end; margin-top: 14px; }
+@media (max-width: 640px) {
+  .eg-grid { grid-template-columns: 1fr; }
+  .eg-in-dst { width: 128px; }
+  .eg-in-port { width: 62px; }
+  .eg-table th, .eg-table td { padding: 4px 5px; font-size: 12px; }
+  .eg-k { min-width: 0; margin-right: 8px; }
+  /* 窄屏让表格【自己】横向滚,而不是把整页顶宽 —— 实测 390px 下预览表会溢出 140px,
+     整页横向滚会让左侧的告警区跟着跑掉。 */
+  .eg-table { display: block; overflow-x: auto; }
+  .eg-panel { overflow-x: hidden; }
+}
+
+/* ===== #577/#594 egress:发送前 diff / 最终参数 / 内核回读(本轮新增) ===== */
+/* diff 用颜色区分"新增/删除/保留",因为期望态是全量替换 —— 少一行多一行都必须肉眼可见。 */
+.eg-diff {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border, #2b3a4f);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.02);
+}
+.eg-diff-title {
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 6px;
+  color: var(--gray, #8b9bb0);
+}
+.eg-diff-add,
+.eg-diff-del,
+.eg-diff-keep {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.7;
+  white-space: pre;
+}
+.eg-diff-add { color: #4bb96a; }
+.eg-diff-del { color: #e0625c; }
+.eg-diff-keep { color: var(--gray, #8b9bb0); }
+/* 最终发出去的请求。运维签字签的是这段文本,不是页面上的开关状态 —— 所以它可选中、可复制。 */
+.eg-payload {
+  margin: 6px 0 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border, #2b3a4f);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.35);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 260px;
+  overflow: auto;
+  user-select: text;
+}
+.eg-mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+/* ===== #603 egress:①/④ 的读数格 —— 值比标签长时不要在词中间折行 ===== */
+/* 原来 .eg-k 占死 170px、值挤在剩下的 70px 里,"✗ 机队跑着多份策略""2026-08-25T03:11:44Z"
+   这类值就会被拦腰折断。这几格改成标签在上、值在下,列宽也放宽一档。 */
+.eg-panel .eg-grid { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+.eg-panel .eg-grid > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.eg-panel .eg-grid .eg-k { min-width: 0; }
+.eg-panel .eg-grid .eg-v {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+}

@@ -5,6 +5,17 @@
 TENANT_ID="${1:?Usage: stop-vm.sh <tenant_id> <vm_num>}"
 VM_NUM="${2:?Usage: stop-vm.sh <tenant_id> <vm_num>}"
 VM_DIR="/data/firecracker-vms/${TENANT_ID}"
+HOST_VM_KEY="${OC_HOST_VM_KEY:-/etc/openclaw/host_vm_key}"
+OC_STOP_FLUSH_MODE="${OC_STOP_FLUSH_MODE:-prefer}"
+
+# SHORT*2 + EXTENDED 必须 >= 20(#608 前的基线单次窗口,保证本改动不降低持久性),
+# 且给 suspend 的 30s 窗口留出 TERM/KILL 与 require 回滚的余量。这里取 24。
+# 不要为了让总链路塞进 30s 而把这个数往下压 —— 总链路超 30s 是既有条件
+# (基线最坏 42s),另有卡处理。
+STOP_FLUSH_SHORT_SEC=3
+STOP_FLUSH_EXTENDED_SEC=18
+STOP_SSH_CONNECT_SEC=3
+
 log() { echo "[oc:stop] $(date +%H:%M:%S) $*"; }
 log "stopping ${TENANT_ID} vm${VM_NUM}..."
 
@@ -36,6 +47,12 @@ else
 fi
 STOP_INTENT_PUBLISHED=0
 LEGACY_FIRECRACKER_TERMINATED=0
+GUEST_FLUSHED=0
+
+# Freshness sentinel used by control-plane self-heal. A host script without this
+# marker may terminate a live guest without first proving its page cache reached
+# data.ext4.
+OC_STOP_GUEST_FLUSH_REQUIRED=1
 
 publish_stop_intent() {
   if [ ! -d "${VM_DIR}" ]; then
@@ -86,6 +103,93 @@ _oc_is_our_fc() {
   esac
 }
 
+flush_guest_before_stop() {
+  [ "${GUEST_FLUSHED}" -eq 0 ] || return 0
+
+  local proc guest_ip="" vm_alive=0 flush_rc=255 flush_reason="unreachable"
+  local flush_attempts=0
+  for proc in /proc/[0-9]*; do
+    if _oc_is_our_fc "${proc##*/}"; then
+      vm_alive=1
+      break
+    fi
+  done
+  # A stopped/non-existent VM has no recoverable page cache. Do not turn an
+  # idempotent retry into a permanent failure just because SSH is unavailable.
+  [ "${vm_alive}" -eq 1 ] || return 0
+
+  guest_ip="$(python3 -c \
+    "import json; print(json.load(open('${VM_DIR}/vm.json')).get('guest_ip',''))" \
+    2>/dev/null || true)"
+  if [ -n "${guest_ip}" ] && [ -f "${HOST_VM_KEY}" ]; then
+    timeout "${STOP_FLUSH_SHORT_SEC}" ssh -i "${HOST_VM_KEY}" \
+       -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+       -o ConnectTimeout="${STOP_SSH_CONNECT_SEC}" -o LogLevel=ERROR -o BatchMode=yes \
+       "agent@${guest_ip}" 'sync' >/dev/null 2>&1
+    flush_rc=$?
+    flush_attempts=$((flush_attempts + 1))
+
+    if [ "${flush_rc}" -eq 0 ]; then
+      GUEST_FLUSHED=1
+      log "guest filesystem sync acknowledged before stop (${guest_ip})"
+      return 0
+    fi
+
+    # ssh=255 是端口不通、认证失败、连接拒绝等 SSH 层失败,说明 guest 当前不可达;
+    # 只给一次同样 3 秒的快速重试覆盖瞬时忙,不把无意义等待拉成长窗口。其它非零
+    # 同样没有可靠的 sync ACK,按不可达处理但不额外扩张尝试次数。
+    if [ "${flush_rc}" -eq 255 ]; then
+      timeout "${STOP_FLUSH_SHORT_SEC}" ssh -i "${HOST_VM_KEY}" \
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout="${STOP_SSH_CONNECT_SEC}" -o LogLevel=ERROR -o BatchMode=yes \
+        "agent@${guest_ip}" 'sync' >/dev/null 2>&1
+      flush_rc=$?
+      flush_attempts=$((flush_attempts + 1))
+      if [ "${flush_rc}" -eq 0 ]; then
+        GUEST_FLUSHED=1
+        log "guest filesystem sync acknowledged before stop (${guest_ip})"
+        return 0
+      fi
+    fi
+
+    if [ "${flush_rc}" -eq 124 ]; then
+      # timeout=124 与 255 必须分流:124 表示 sync 已进入可等待阶段但没在 3 秒短窗
+      # 内 ACK,guest 活着且可能正在刷大量脏页,才值得升级到唯一一次 18 秒长窗。
+      # 第二次已从 255 变成 124 时也按这份新证据升级;总 SSH 次数仍硬封顶为 3 次。
+      flush_reason="sync-timeout"
+      timeout "${STOP_FLUSH_EXTENDED_SEC}" ssh -i "${HOST_VM_KEY}" \
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout="${STOP_SSH_CONNECT_SEC}" -o LogLevel=ERROR -o BatchMode=yes \
+        "agent@${guest_ip}" 'sync' >/dev/null 2>&1
+      flush_rc=$?
+      flush_attempts=$((flush_attempts + 1))
+      if [ "${flush_rc}" -eq 0 ]; then
+        GUEST_FLUSHED=1
+        log "guest filesystem sync acknowledged before stop (${guest_ip})"
+        return 0
+      fi
+      [ "${flush_rc}" -eq 124 ] || flush_reason="unreachable"
+    fi
+  fi
+
+  if [ "${OC_STOP_FLUSH_MODE}" = "require" ]; then
+    # The VM is still alive, so its dirty pages are recoverable. Keep it running
+    # and let the caller retry instead of converting a transient SSH failure into
+    # permanent transcript/data loss.
+    if [ "${STOP_INTENT_PUBLISHED}" -eq 1 ]; then
+      rm -f "${VM_DIR}/.stopped" || true
+      STOP_INTENT_PUBLISHED=0
+    fi
+    log "FATAL: OC_STOP_GUEST_FLUSH_FAILED VM alive but guest sync did not ACK (${guest_ip:-no-ip}); refusing TERM/KILL"
+    return 1
+  fi
+
+  # prefer 下绝不能撤回 .stopped:host-agent 把“vm.json + 无进程 + 无 .stopped”
+  # 当成崩溃并自动拉起。这里接下来正要 TERM/KILL,撤标记会把刚停掉的 VM 立即复活。
+  log "WARN: OC_STOP_GUEST_FLUSH_UNACKED reason=${flush_reason} attempts=${flush_attempts} (${guest_ip:-no-ip}); proceeding with TERM/KILL after bounded flush attempts"
+  return 0
+}
+
 # Before this MR, Firecracker inherited fd9 from launch-vm.sh and retained the
 # lifecycle flock for its entire lifetime. A script-only rollout therefore
 # deadlocks every stop of an already-running VM. Identify that legacy state by
@@ -126,6 +230,7 @@ if ! flock -w 2 9; then
     if ! publish_stop_intent; then
       log "VM directory absent; terminating orphaned legacy Firecracker"
     fi
+    flush_guest_before_stop || exit 1
     log "legacy Firecracker inherited lifecycle lock; migrating pid(s): ${LEGACY_FIRECRACKER_PIDS[*]}"
     curl -sf --max-time 2 --unix-socket "${VM_DIR}/fc.sock" -X PUT http://localhost/actions \
       -H 'Content-Type: application/json' -d '{"action_type":"SendCtrlAltDel"}' 2>/dev/null || true
@@ -237,6 +342,10 @@ else
   log "orphaned Firecracker terminated and confirmed gone for ${TENANT_ID}"
   exit 0
 fi
+
+# A successful return from this point is allowed to destroy guest page cache.
+# Require a sync ACK first whenever the target Firecracker is still alive.
+flush_guest_before_stop || exit 1
 
 # 1) Graceful shutdown attempt via Firecracker action API (SendCtrlAltDel).
 #    Best-effort — if Firecracker is mid-init the API socket may not be

@@ -53,6 +53,15 @@ def build_compute(self, ctx):
     # (它是否整体过宽是另一个问题:影响面还包括 observability 配置与 backup 脚本,先于本
     # issue 存在,值得单开 issue 收窄,不在此处扩大改动面)。
     # 只 Deny 写与删,GetObject 不受影响 —— host 仍要从这里取 FC 二进制。
+    #
+    # #603 G3(AWS Security Agent CODE_INJECTION,2026-08-25 已确证并在 live 上实测)——
+    # 作用域从 deployment/binaries/* 扩到 deployment/*。原来只挡二进制,但 host 同样会把
+    # deployment/scripts/ 下的脚本【下载后以 root 执行且不校验摘要】:
+    #   init-host.sh 的 required-scripts 循环、host-agent.py 的 egress reconcile
+    #   (aws s3 cp .../deployment/scripts/oc-egress-chain.sh 然后直接 bash)。
+    # 而 host role 对 assets 桶有 s3:PutObject /*,于是一台被拿下的 host 改一个脚本
+    # = 机队级 root RCE(每台 host 下一轮 reconcile 就会取到被改的那份)。
+    # host 侧对该前缀只有下载、从不上传,所以扩这条 Deny 不影响任何合法路径。
     host_role.add_to_policy(
         iam.PolicyStatement(
             effect=iam.Effect.DENY,
@@ -60,10 +69,11 @@ def build_compute(self, ctx):
                 "s3:PutObject",
                 "s3:PutObjectAcl",
                 "s3:PutObjectTagging",
+                "s3:PutObjectVersionTagging",
                 "s3:DeleteObject",
                 "s3:DeleteObjectVersion",
             ],
-            resources=[f"{assets_bucket.bucket_arn}/deployment/binaries/*"],
+            resources=[f"{assets_bucket.bucket_arn}/deployment/*"],
         )
     )
     backup_bucket.grant_read_write(host_role)  # backup-data.sh 写备份/恢复读
@@ -77,6 +87,66 @@ def build_compute(self, ctx):
     if clawpool_rsa_cmk is not None:
         clawpool_rsa_cmk.grant_decrypt(host_role)
     hosts_table.grant_read_write_data(host_role)
+    # #577 G1 —— host 不得改写"机队级策略是否适用于我"的字段。
+    #
+    # egress_pinned 是 k8s node taint 的镜像:它决定 fleet 单例与 targets=all 的下发能否
+    # 覆盖这台机器。而 pin 的两个强制点(host-agent 的策略选择短路、_ON_HOST 的自检)都在
+    # host 侧读同一个属性,所以一旦 host 能写它,被控制的对象就能对控制面下发投永久否决票。
+    # k8s 在完全同形的问题上是硬拒的,理由一字不差:
+    #   plugin/pkg/admission/noderestriction/admission.go:594-598
+    #   "Don't allow a node to update its own taints. This would allow a node to remove or
+    #    modify its taints in a way that would let it steer disallowed workloads to itself."
+    #
+    # 为什么用【显式 Deny 单个属性】而不是 allowlist:host-agent 对本表有 12 个 update_item
+    # 调用点、十几个合法属性(avail_disk_mb / egress_applied_* / running_ts / fail_reason …),
+    # 用 allowlist 漏一个就会让机队上报静默失败。Deny 只咬 egress_pinned,碰不到其余属性;
+    # 且请求上下文里没有 dynamodb:Attributes 时 ForAnyValue 判 false,不会误伤。
+    #
+    # 为什么不用 dynamodb:LeadingKeys 做"只能改自己那行":host 共用一个 instance role,
+    # 会话上没有 InstanceId 维度的 principal tag,${aws:PrincipalTag/…} 变量无从取值。
+    # 真正的"每台只能改自己"要么靠会话标签,要么把 pin 移出本表 —— 那是更大的改动,
+    # 见 issue(本条只关掉"host 能改自己 pin"这一个具体能力)。
+    host_role.add_to_policy(
+        iam.PolicyStatement(
+            effect=iam.Effect.DENY,
+            actions=[
+                "dynamodb:UpdateItem",
+                "dynamodb:PutItem",
+                "dynamodb:BatchWriteItem",
+            ],
+            resources=[hosts_table.table_arn],
+            conditions={
+                "ForAnyValue:StringEquals": {
+                    "dynamodb:Attributes": ["egress_pinned"]
+                }
+            },
+        )
+    )
+    # #603 G2(AWS Security Agent PRIVILEGE_ESCALATION,2026-08-25 已确证并在 live 上实测)——
+    # 上面那条 Deny 只在请求【携带 egress_pinned 属性】时命中,所以
+    #     UpdateItem Key={instance_id: "__fleet_egress_policy__"} SET egress_mode = "off"
+    # 完全不受它约束:一台被拿下的 host 就能写 fleet 单例,把全机队的 guest 默认拒绝链
+    # 在下一轮 15s reconcile 里拆掉,而且是持久化的期望态(新建 host 也会继承)。
+    # 按 LeadingKeys 精确 Deny 那一个 key 的写 —— 不影响 host 写自己那行(心跳/健康)。
+    # 前提已核:host-agent 对该 key 只有 get_item(host-agent.py 的 _reconcile_egress),
+    # 写它的是控制面 _write_fleet_policy,跑的是 API role 不是 host role。
+    host_role.add_to_policy(
+        iam.PolicyStatement(
+            effect=iam.Effect.DENY,
+            actions=[
+                "dynamodb:UpdateItem",
+                "dynamodb:PutItem",
+                "dynamodb:DeleteItem",
+                "dynamodb:BatchWriteItem",
+            ],
+            resources=[hosts_table.table_arn],
+            conditions={
+                "ForAllValues:StringEquals": {
+                    "dynamodb:LeadingKeys": ["__fleet_egress_policy__"]
+                }
+            },
+        )
+    )
     tenants_table.grant_read_write_data(host_role)  # host-agent writes health status
     # instance-role get-item openclaw-tenant-secrets 读 gateway_token_ct/device_paired_b64
     # (fail-closed:读失败即拒起)。缺此 grant → AccessDenied → 纯 CDK one-shot 部署的

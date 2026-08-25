@@ -330,7 +330,10 @@ def _update_tenant_status(tenant_id, status, expected_prev=None):
     # 问题降级成一次无副作用的空转,下一轮 sweep 自然收敛。
     expr = "SET #s = :s, updated_at = :t"
     if status == "deleted":
-        expr += " REMOVE vm_health, app_health, last_health_check"
+        # #593 —— 软删同样要清 q_rootfs_version(gsi_rootfs_version 的投影键)。TTL 删只翻 status
+        # 不清它,软删租户就永久留在该 GSI 分区,污染 GET /tenants?rootfs_version= 查询(与 stats
+        # 对不上)。与 tenant_service 的 _STALE_ON_DELETE_FIELDS 同一条清理,只是这里不共享常量。
+        expr += " REMOVE vm_health, app_health, last_health_check, q_rootfs_version"
     kwargs = {
         "Key": {"id": tenant_id},
         "UpdateExpression": expr,

@@ -37,6 +37,18 @@ from stacks._helpers import _build_vpc, _sam_build_image_for_host, _read_pyproje
 _sys.path.insert(0, str(_Path(__file__).resolve().parents[1] / "lambda" / "api"))
 import core.create_deadline as _create_deadline  # noqa: E402
 
+# #565 G5 —— host 侧 SSM agent 的单机命令 worker 上限。**这是 host 上的事实,不是本栈的
+# 选择**:真值由 `deploy/userdata/init-host.sh` step1c 写进
+# `/etc/amazon/ssm/amazon-ssm-agent.json` 的 `Mds.CommandWorkersLimit`。两个数分处 shell
+# 与 Python、共享不了常量,所以 `tests/test_565_g5_agent_worker_parity.py` 双向钉着它们相等。
+#
+# **为什么要在 CDK 侧留一份副本**:Codex 独立复审 2026-08-25 指出,原先那条 parity 只比
+# 「代码默认值 ≤ worker 上限」,而部署真正用的是 `config.yml` 里的值 —— 在那里写 30 既不会
+# 让测试红也不会让 synth 红,于是 ESM 会送 30 个并发进 20 个 worker 的 host,请求堆在 agent
+# 前面排队,**而排队时间算在客户死线里**(表现成「到点判失败」而不是「变慢」)。
+# 下面那条 `_lc_max_conc > _HOST_SSM_COMMAND_WORKERS` 的 fail-loud 把这条路也堵上。
+_HOST_SSM_COMMAND_WORKERS = 20
+
 
 def build_lambdas(self, ctx):
     """Build lambdas resources (mechanical transplant from stack.py, issue #87)."""
@@ -113,9 +125,17 @@ def build_lambdas(self, ctx):
         resources=[_ec2_instance_arn_wildcard],
         conditions=_host_tag_conditions,
     )
-    # SSM GetCommandInvocation(只读)— 不支持资源级 IAM,保留 *
+    # SSM 只读回读 — 两个 action 都不支持资源级 IAM,保留 *
+    #
+    # ListCommandInvocations 此前没授:于是 _collect()(egress_admin_service / fleet_power
+    # 等 wait=true 路径共用的逐机回收器)每一轮 list 都 AccessDenied,而它那里是裸
+    # `except: continue` → 安静地轮询到 deadline、返回空列表。调用方看到的是
+    # "没有任何 invocation 结果",与"命令确实没跑"不可区分。#603 在新加坡真机上撞出
+    # (GET /hosts/egress/chain 每次返 INCONCLUSIVE),定位靠的是手工重放 SSM + 逐条扫
+    # role 的 inline/managed 策略(溢出到 managed 的 grant 只扫 inline 会漏)。
+    # 授予后 wait=true 才真的能拿到逐机 apply_exit / rules_sha256。
     ssm_readonly_policy = iam.PolicyStatement(
-        actions=["ssm:GetCommandInvocation"],
+        actions=["ssm:GetCommandInvocation", "ssm:ListCommandInvocations"],
         resources=["*"],
     )
     # 组合出兼容旧接口的 ssm_policy(变成 3 条 statement 的元组用法不方便,
@@ -851,9 +871,21 @@ def build_lambdas(self, ctx):
             memory_size=2048,
             # 限流阀:consumer 并发上限 = SSM/host 可承受速率(削峰核心)
             reserved_concurrent_executions=_consumer_reserved,
-            # 同 api 配置(共享 _api_env);consumer 不入队故不给 LIFECYCLE_QUEUE_URL。
+            # 同 api 配置(共享 _api_env)。
             # Cognito pool/client id 在下方 Cognito 段对两个 Lambda 都 add_environment。
             environment=dict(_api_env),
+        )
+        # #604 —— consumer 也需要 LIFECYCLE_QUEUE_URL。原注释写的是"consumer 不入队故不给",
+        # 那个前提现在不成立:consumer 要对**自己刚消费的那条消息**调
+        # `sqs:ChangeMessageVisibility`,把良性 flock-skip 的重投退避从队列默认的 960s 缩到
+        # 秒级(否则该消息占住 per-tenant FIFO 组头 16 分钟,同租户后续生命周期操作全撞 409
+        # LIFECYCLE_IN_FLIGHT —— 三次真机复现)。改可见性不是入队,仍然不给 SendMessage。
+        #
+        # **必须显式声明的另一个理由**:验收环境的 consumer 上这个 env 其实
+        # 已经存在,是历史漂移;靠漂移工作意味着下一次 `cdk deploy` 会把它删掉,而代码里
+        # `if not LIFECYCLE_QUEUE_URL: return` 是静默 no-op —— 修复会无声失效,且不红不告警。
+        lifecycle_consumer.add_environment(
+            "LIFECYCLE_QUEUE_URL", lifecycle_queue.queue_url
         )
         # so it must see CLAWPOOL_CMK_ARN too or the queued-create path would
         # reject valid injections. Gated identically (only when feature on).
@@ -983,10 +1015,25 @@ def build_lambdas(self, ctx):
         # (见下方 _lifecycle_consumer 引用)。存引用供 Cognito 段使用。
         self._lifecycle_consumer = lifecycle_consumer
         # 不加就是"consumer 按活跃 MessageGroup 数任意并发"(30 个不同租户 delete →
-        # 最高 30 并发砸向少数 host),撞 SSM 单 host CommandWorkersLimit=5、饿死
+        # 最高 30 并发砸向少数 host),撞 SSM 单 host 的 CommandWorkersLimit、饿死
         # launch-vm/start/stop。aws-cdk-lib 2.x 的 SqsEventSource 不直接暴露
         # ScalingConfig kwarg(见 dispatch_infra.py:253),用 add_event_source_mapping
         # + add_property_override 落 CFN 属性(与 dispatch ESM 同款,验证过的做法)。
+        #
+        # ⚠ **#565 G5 更正:上面那句原写着「撞 CommandWorkersLimit=5」,容易被读成
+        # 「所以这个并发不能提」。顾虑是真的,结论是错的 —— 正确表述是【两侧必须成对提】。**
+        # 而那次绑死的是**控制面 API**(QPS 20 → 约 30 次 SendCommand/s → 89 次
+        # ThrottlingException、502 占 89.5%),此时 host 侧 worker 多少都不影响结果。
+        # 用户 2026-08-25 在真机上直接探测(不压控制面速率、每档有 agent 重启时间戳为证):
+        # 默认 5 下发 12 条严格分 3 批每批 5;**20/10 得 20 同时执行**;50/25 得 50 ——
+        # **host 侧线性生效**。所以那个 5 不是天花板,是**没配过**的默认值。
+        #
+        # 现在 host 侧由 `deploy/userdata/init-host.sh` 的 step1c 写成 **20**(buffer 10),
+        # 而这条耦合两头都有闸:`tests/test_565_g5_agent_worker_parity.py` 钉住
+        # `_HOST_SSM_COMMAND_WORKERS`(见文件顶部)与那个 shell 里的值相等,下面的 fail-loud
+        # 钉住**部署真正用的** `config.yml` 值不超过它。**只提一侧即红。**
+        # 提之前先读那个文件里写的第三道墙:SendCommand 服务端限流实测约 6.6 rps,
+        # 且**不能自助提额** —— 提过某个点之后失败只是从"agent 排队"换成"控制面被限流"。
         _lc_max_conc = int(CFG.get("scaler", {}).get("lifecycle_max_concurrency", 10))
         # AWS 硬下限 2,上限 1000;且 reserved ≥ max_concurrency(否则部署行为异常)。
         # fail-loud 比 synth 过、CFN 报错或线上限流失效更好定位。
@@ -1000,6 +1047,17 @@ def build_lambdas(self, ctx):
                 f"scaler.lifecycle_max_concurrency={_lc_max_conc} exceeds "
                 f"lifecycle_consumer_concurrency={_consumer_reserved}; reserved must be "
                 ">= max_concurrency (AWS hard constraint) or the ESM can't scale to it."
+            )
+        # #565 G5 —— 与 host 侧 SSM worker 上限成对。超了不会报错、只会**静默变慢再到点判死**
+        # (多出来的并发堆在 agent 前面排队,而排队时间算在客户死线里),所以在 synth 期 fail-loud。
+        # 一条动作里若将来并发下发多条 SSM 命令,这个 1:1 对齐就不够了 —— 那时要按条数折算。
+        if _lc_max_conc > _HOST_SSM_COMMAND_WORKERS:
+            raise ValueError(
+                f"scaler.lifecycle_max_concurrency={_lc_max_conc} exceeds host-side SSM "
+                f"agent Mds.CommandWorkersLimit={_HOST_SSM_COMMAND_WORKERS} "
+                "(deploy/userdata/init-host.sh step1c). Raise BOTH or neither: the extra "
+                "concurrency would just queue in front of the agent, and queueing time is "
+                "charged against the customer deadline."
             )
         _lc_esm = lifecycle_consumer.add_event_source_mapping(
             "LifecycleQueueEsm",
@@ -1579,6 +1637,8 @@ def build_lambdas(self, ctx):
     user_summary_resource.add_method("GET", _li(), **key_required)
     user_action_resource = user_resource.add_resource("action")
     user_action_resource.add_method("POST", _li(), **key_required)
+    user_upgrade_resource = user_resource.add_resource("upgrade")
+    user_upgrade_resource.add_method("POST", _li(), **key_required)
 
     # Go-live A1 — POST /external/authz: the external backend pushes the
     # authoritative user↔tenant mapping. Auth is an HMAC signature verified
@@ -1607,8 +1667,24 @@ def build_lambdas(self, ctx):
 
     # #566 拆分② — fleet guest 出网防火墙运维 API:POST /hosts/egress
     # (mode=deny|off,一次改全部或指定 host 的 OPENCLAW-EGRESS 链)。api-key admin 门。
+    #
+    # 这一组路由【必须在这里声明】。handler.py 的路由表不会自动变成 API GW 资源 ——
+    # 漏声明的表现是真实 curl 拿到 "Missing Authentication Token"(= 路由不存在),
+    # 而所有直调 handler 的单测照样全绿(见 tests/test_apigw_routes.py 的开篇说明)。
     egress_resource = hosts_resource.add_resource("egress")
     egress_resource.add_method("POST", _li(), **key_required)
+    # #577 只读收敛报告(支持 limit / instance_ids 定点查询)。
+    egress_resource.add_method("GET", _li(), **key_required)
+    # #603 命名版本 + 逐台回滚 + 当前生效链从内核回读。
+    egress_revisions_resource = egress_resource.add_resource("revisions")
+    egress_revisions_resource.add_method("GET", _li(), **key_required)
+    # 删版本记录 = 销毁可回滚历史,所以服务端另有一道 confirm=="DELETE" 的门;
+    # 这里只负责让路由存在(漏声明的表现是 curl 拿 Missing Authentication Token)。
+    egress_revisions_resource.add_method("DELETE", _li(), **key_required)
+    egress_chain_resource = egress_resource.add_resource("chain")
+    egress_chain_resource.add_method("GET", _li(), **key_required)
+    egress_rollback_resource = egress_resource.add_resource("rollback")
+    egress_rollback_resource.add_method("POST", _li(), **key_required)
 
     # #517 stage 4 — submit a bounded rolling upgrade and poll its progress.
     rolling_upgrade_resource = hosts_resource.add_resource("rolling-upgrade")
@@ -1631,6 +1707,8 @@ def build_lambdas(self, ctx):
     system_resource = api.root.add_resource("system")
     system_info_resource = system_resource.add_resource("info")
     system_info_resource.add_method("GET", _li(), **key_required)
+    system_queues_resource = system_resource.add_resource("queues")
+    system_queues_resource.add_method("GET", _li(), **key_required)
 
     # /audit-log — already created earlier in the routes, but the
     # resource needs to exist on the REST API; declare it here once.

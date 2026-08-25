@@ -275,7 +275,7 @@ curl -s -H "x-api-key: $KEY" "{BASE}/images"
 > **使用方法。** `POST .../taint` 标记(带 `reason`)→ `GET /hosts` 看 `is_tainted:true` → 此后新 create/restore 自动避开该宿主 → 完成运维后 `DELETE .../taint` 清除。
 >
 > **部署前提(重要)。** 放置排除属读侧(#540)。**该行为只在部署了 #540 读侧代码的环境生效**:若某环境只部署了写侧(#539),标记 API 仍返 `200` 且 `is_tainted=true`,但调度器**不会排除**——新租户仍会落到污点宿主。依赖 cordon 前,先确认执行放置的那个 Lambda(create 路径:`openclaw-api` 与队列消费者)的部署包里 `core/scheduling.py` 含 `host_taint.is_tainted` 排除、`core/dispatch/binpack.py` 含 `taint_ok` 门;仅凭标记返 200 不能对运维或客户宣告"cordon 已生效"。
-**`POST {BASE}/hosts/refresh-rootfs`** — 从 `manifest.json` 把最新 rootfs + 数据模板 + 只读盘经 SSM 下发到所有活跃/空闲宿主(RBAC operator+),异步更新各宿主 `rootfs_version`(#517 起同时提交 `immutable_version`,宿主侧经 `pull.lock` 串行、`.tmp→mv` 后才写坐标,Lambda 侧兜底同写)。无 body。返 `{message:"refresh started",version,immutable_version,hosts:[...]}`。
+**`POST {BASE}/hosts/refresh-rootfs`** — 仅用于 legacy flat-layout 宿主:从 `manifest.json` 把最新 rootfs + 数据模板 + 只读盘经 SSM 下发到所有活跃/空闲宿主(RBAC operator+),宿主侧经 `pull.lock` 串行、`.tmp→mv` 后才写 `rootfs_version/immutable_version`。无 body。无宿主时返 `200 {message:"no active hosts",updated:0}`;SSM 返回 command id 时返 `202 {message:"refresh accepted",status:"accepted",command_id,version,immutable_version,hosts:[...]}`,这只证明已受理,须用 `command_id` 查 SSM 终态;任一宿主已有 `image_slots` 时整批 fail-closed,返 `409 INCOMPATIBLE_HOST_LAYOUT`,应改用 `pull-image` + `promote-canary`;SSM 未返回 command id 时返 `502 DISPATCH_UNCONFIRMED`。
 **`POST {BASE}/hosts/fleet-power`** — **全舰队启停**:跨所有活跃宿主经宿主本地 fan-out 一次性启/停其上每个 microVM(1 分钟舰队启停目标)。body `{action:"start|stop"}`。**admin 专属**(路由层要 operator,函数内再校验 admin,双层防御)。返 `202 {action,hosts,command_id,reconciled,status:"dispatched"}`,并自动对稳态租户做状态对账(start:stopped→running;stop:running→stopped),不触及过渡态。
 
 ### 3.6 分组与技能(控制台运维)
@@ -292,10 +292,10 @@ curl -s -H "x-api-key: $KEY" "{BASE}/skills"
 ```
 
 **`GET {BASE}/skills/{name}`** — 读技能 `SKILL.md` 内容(viewer+):`{name,content,size,last_modified}`,不存在 `404`。
-**`PUT {BASE}/skills/{name}`** — 写/建技能(operator+):body `{content}`,须 UTF-8、≤256KB、含至少一条顶级 `# 标题`;返 `200`(已存在)或 `201`(新建);超限 `413`,格式不符 `400`。
-**`DELETE {BASE}/skills/{name}`** — 删技能(operator+):返 `{name,deleted:<删除文件数>}`。
+**`PUT {BASE}/skills/{name}`** — 写/建 shared skill(operator+):body `{content}`,须 UTF-8、≤256KB、含至少一条顶级 `# 标题`;返 `200`(已存在)或 `201`(新建),body 为 `{name,size,created,version_id,etag,sha256,sync}`。S3 写入 SHA-256 metadata 后,API 立即按最多 50 台/批经 SSM 下发 version-aware 同步器;`sync.status:"accepted"`只表示 SSM 批次拿到 command id,不是所有 host 已完成。超限或格式不符均返 `400`。
+**`DELETE {BASE}/skills/{name}`** — 删 shared skill(operator+):返 `{name,deleted:<删除文件数>,sync}`;同步器读取 S3 最新 delete marker 并删除 host 副本。
 
-> **Note** 技能名限小写字母 + 数字 + 连字符,非法名返 `400`。技能改动落到镜像制品层,随下次镜像重建 / refresh-rootfs 生效,不热改运行中 VM(呼应架构铁律"改镜像重建、不热改活 VM")。
+> **Note** 技能名限小写字母 + 数字 + 连字符,非法名返 `400`。Host 同步以 S3 `VersionId/ETag` 判新旧,所以同尺寸替换也会更新;下载校验成功后才原子替换,失败不会覆盖旧文件或推进状态。PUT/DELETE 的 SSM 是立即传播路径,每 5 分钟 cron 是补偿路径。运行中的 microVM 不热改,在下一次 restart/rebuild 时采用 host 上的新 shared skill。immutable skill、`AGENTS.md` 与 persona 仍须重烤 immutable disk 并走镜像升级。
 
 ### 3.7 AgentCore(只读,config-gated)
 

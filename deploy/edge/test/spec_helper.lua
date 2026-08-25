@@ -29,7 +29,10 @@ local ngx_log_capture = {}
 
 local ngx_stub = {
     null = setmetatable({}, { __tostring = function() return "ngx.null" end }),
-    var  = {},
+    var  = {
+        edge_redis_reader_host = "",
+        edge_redis_reader_port = "",
+    },
     ctx  = {},
     header = {},
     status = 200,
@@ -97,8 +100,16 @@ local function new_fake_redis_module(ngx_ref)
         local client = {}
         client._closed = false
         function client.set_timeouts(_c) end
-        function client.connect(_c)
+        function client.connect(_c, host, port)
             local cfg = ngx_ref._fake_redis or {}
+            client._host = host
+            client._port = port
+            local connects = ngx_ref._fake_redis_connects
+            if not connects then
+                connects = {}
+                ngx_ref._fake_redis_connects = connects
+            end
+            connects[#connects + 1] = host
             if cfg.mode == "error" then
                 return nil, cfg.err or "connect refused"
             end
@@ -106,6 +117,10 @@ local function new_fake_redis_module(ngx_ref)
         end
         function client.get(_c, _key)
             local cfg = ngx_ref._fake_redis or {}
+            local by_host_value = cfg.by_host and cfg.by_host[client._host]
+            if by_host_value ~= nil then
+                return by_host_value
+            end
             if cfg.mode == "get_error" then
                 return nil, cfg.err or "connection reset"
             end
@@ -170,12 +185,26 @@ package.loaded["ngx.balancer"] = {
     _last_peer = nil,
     _last_failure = nil,  -- {state="failed", code=502} to simulate retry tick
     _more_tries = 0,
+    _timeouts = nil,
+    _set_timeouts_error = nil,
     set_current_peer = function(host, port)
         package.loaded["ngx.balancer"]._last_peer = { host = host, port = port }
         return true, nil
     end,
     set_more_tries = function(n)
         package.loaded["ngx.balancer"]._more_tries = n
+        return true, nil
+    end,
+    set_timeouts = function(connect_timeout, send_timeout, read_timeout)
+        local mod = package.loaded["ngx.balancer"]
+        mod._timeouts = {
+            connect = connect_timeout,
+            send = send_timeout,
+            read = read_timeout,
+        }
+        if mod._set_timeouts_error then
+            return false, mod._set_timeouts_error
+        end
         return true, nil
     end,
     get_last_failure = function()
@@ -202,14 +231,22 @@ M.log_capture = ngx_log_capture
 M.new_fake_shared_dict = new_fake_shared_dict
 M.new_fake_redis_module = function() return new_fake_redis_module(ngx_stub) end
 M.new_fake_lock_module = new_fake_lock_module
+M.fake_redis_connects = function() return ngx_stub._fake_redis_connects end
 M.reset_ngx = function()
-    ngx_stub.var, ngx_stub.ctx, ngx_stub.header = {}, {}, {}
+    ngx_stub.var = {
+        edge_redis_reader_host = "",
+        edge_redis_reader_port = "",
+    }
+    ngx_stub.ctx, ngx_stub.header = {}, {}
     ngx_stub.status = 200
     ngx_stub._fake_redis = nil
+    ngx_stub._fake_redis_connects = {}
     while ngx_log_capture[1] do table.remove(ngx_log_capture) end
     package.loaded["ngx.balancer"]._last_peer = nil
     package.loaded["ngx.balancer"]._last_failure = nil
     package.loaded["ngx.balancer"]._more_tries = 0
+    package.loaded["ngx.balancer"]._timeouts = nil
+    package.loaded["ngx.balancer"]._set_timeouts_error = nil
     -- Reset shared dicts to a fresh table so tests are isolated.
     ngx_stub.shared = setmetatable({}, getmetatable(ngx_stub.shared))
 end

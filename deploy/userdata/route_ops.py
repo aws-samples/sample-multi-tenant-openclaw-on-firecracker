@@ -17,7 +17,10 @@ concern, small enough to reason about. host-agent.py wires it in at promotion.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import fcntl
+import ipaddress
 import json
 import os
 import re
@@ -458,6 +461,41 @@ def release_port_and_dnat(bitmap: PortBitmap, host_port: int, guest_ip: str) -> 
 
 # ─── Redis route writer (contract §1, §8) ───────────────────────
 ROUTE_KEY_PREFIX = "route:"
+# 租户号形状白名单。这些串是从 Redis 的 key 里读出来的 —— 谁能写 Redis 就能控制它们,
+# 而它们接下来要作为参数进 root shell(经 SSM 下发)。shlex.quote 已经在控制面侧做了
+# 转义,这里是纵深防御的第二道:形状不对的一律不删、计入 failed,而不是「尽力删一下」。
+_TENANT_ID_SHAPE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
+ROUTE_INVENTORY_DEFAULT_COUNT = 200
+ROUTE_INVENTORY_MAX_COUNT = 500
+ROUTE_INVENTORY_OUTPUT_BUDGET_BYTES = 20000
+ROUTE_INVENTORY_MAX_VALUE_BYTES = 4096
+_REDIS_CURSOR_MAX = (1 << 64) - 1
+COMPARE_AND_DELETE_LUA = """local current = redis.call('GET', KEYS[1])
+if not current then
+    return 0
+end
+if current == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return -1"""
+
+
+def _redis_cursor_text(value) -> str:
+    if isinstance(value, bytes):
+        value = value.decode("ascii")
+    text = str(value)
+    if not text or not text.isdigit():
+        raise ValueError(f"invalid Redis cursor {text!r}")
+    number = int(text)
+    if number > _REDIS_CURSOR_MAX:
+        raise ValueError(f"Redis cursor out of range {text!r}")
+    return str(number)
+
+
+def _bounded_b64(raw: bytes, limit: int = 96) -> str:
+    token = base64.b64encode(raw).decode("ascii")
+    return token if len(token) <= limit else token[:limit]
 
 
 def route_value(host_private_ip: str, host_port: int, guest_ip: str) -> str:
@@ -509,8 +547,8 @@ class RedisRouteWriter:
         self._hc = health_check_interval
         self._max_retries = max_retries
         # Test seam: caller passes a zero-arg callable that returns a
-        # redis-like object exposing .set(k,v) and .delete(k). Production
-        # leaves this None and gets a real redis.Redis lazily.
+        # redis-like object exposing the operations used by the selected path.
+        # Production leaves this None and gets a real redis.Redis lazily.
         self._client_factory = client_factory
         self._client = None
         self._client_lock = threading.Lock()
@@ -583,6 +621,170 @@ class RedisRouteWriter:
             self._reset_client()
             return False
 
+    def del_route_count(self, tenant_id: str) -> int | None:
+        """Return Redis DEL's truthful count, or None when deletion failed."""
+        key = ROUTE_KEY_PREFIX + tenant_id
+        try:
+            return int(self._get_client().delete(key))
+        except Exception as e:
+            print(f"redis del_route_count {tenant_id} failed: {e}")
+            self._reset_client()
+            return None
+
+    def compare_and_delete_route(
+        self, tenant_id: str, expected_bytes: bytes
+    ) -> str:
+        """Atomically delete only the exact inventoried route value."""
+        key = ROUTE_KEY_PREFIX + tenant_id
+        try:
+            result = int(
+                self._get_client().eval(
+                    COMPARE_AND_DELETE_LUA,
+                    1,
+                    key,
+                    expected_bytes,
+                )
+            )
+        except Exception as e:
+            print(f"redis compare_and_delete {tenant_id} failed: {e}")
+            self._reset_client()
+            return "failed"
+        if result == 1:
+            return "deleted"
+        if result == 0:
+            return "absent"
+        if result == -1:
+            return "changed"
+        print(
+            f"redis compare_and_delete {tenant_id} returned unexpected result "
+            f"{result}"
+        )
+        return "failed"
+
+    def ping(self) -> bool:
+        """Prove the connection before anyone reads a count off a SCAN.
+
+        Without this, a Redis that cannot be reached is indistinguishable from a
+        Redis that legitimately holds zero routes: both surface as an empty
+        inventory, and the control plane would read "no orphans" off a probe that
+        was never wired up. Fail-loud here so the caller reports INCONCLUSIVE.
+        """
+        try:
+            return bool(self._get_client().ping())
+        except Exception as e:
+            print(f"redis ping failed: {e}")
+            self._reset_client()
+            return False
+
+    def scan_routes(self, cursor="0", count=ROUTE_INVENTORY_DEFAULT_COUNT) -> dict:
+        """Read one SCAN page and account for every returned key."""
+        input_cursor = _redis_cursor_text(cursor)
+        count = max(1, min(int(count), ROUTE_INVENTORY_MAX_COUNT))
+        routes = []
+        skipped = []
+        try:
+            client = self._get_client()
+            next_cursor, keys = client.scan(
+                cursor=int(input_cursor),
+                match=f"{ROUTE_KEY_PREFIX}*",
+                count=count,
+            )
+        except Exception as e:
+            self._reset_client()
+            raise RuntimeError(f"Redis route scan failed: {e}") from e
+
+        for raw_key in keys:
+            key_bytes = (
+                raw_key if isinstance(raw_key, bytes) else str(raw_key).encode("utf-8")
+            )
+            try:
+                key = key_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                skipped.append(
+                    {
+                        "key_b64": _bounded_b64(key_bytes),
+                        "reason": "bad_key_utf8",
+                    }
+                )
+                continue
+            if not key.startswith(ROUTE_KEY_PREFIX):
+                skipped.append(
+                    {
+                        "key_b64": _bounded_b64(key_bytes),
+                        "reason": "bad_key_prefix",
+                    }
+                )
+                continue
+            tenant_id = key[len(ROUTE_KEY_PREFIX) :]
+            if not _TENANT_ID_SHAPE.fullmatch(tenant_id):
+                skipped.append(
+                    {
+                        "key_b64": _bounded_b64(key_bytes),
+                        "reason": "bad_key_shape",
+                    }
+                )
+                continue
+            try:
+                raw_value = client.get(raw_key)
+            except Exception as e:
+                self._reset_client()
+                raise RuntimeError(f"Redis route GET failed for {key}: {e}") from e
+            if raw_value is None:
+                skipped.append(
+                    {"tenant": tenant_id, "reason": "absent_after_scan"}
+                )
+                continue
+            value_bytes = (
+                raw_value
+                if isinstance(raw_value, bytes)
+                else str(raw_value).encode("utf-8")
+            )
+            if len(value_bytes) > ROUTE_INVENTORY_MAX_VALUE_BYTES:
+                skipped.append(
+                    {"tenant": tenant_id, "reason": "value_too_large"}
+                )
+                continue
+            try:
+                value = json.loads(value_bytes)
+                if not isinstance(value, dict):
+                    raise ValueError("value_not_object")
+                host = value["host"]
+                guest_ip = value["guest_ip"]
+                if not isinstance(host, str) or not isinstance(guest_ip, str):
+                    raise ValueError("route_string_field_invalid")
+                host = str(ipaddress.IPv4Address(host))
+                guest_ip = str(ipaddress.IPv4Address(guest_ip))
+                port = int(value["port"])
+                updated_at = int(value["updated_at"])
+            except (KeyError, TypeError, ValueError, UnicodeDecodeError):
+                skipped.append(
+                    {"tenant": tenant_id, "reason": "bad_route_value"}
+                )
+                continue
+            routes.append(
+                {
+                    "tenant": tenant_id,
+                    "host": host,
+                    "port": port,
+                    "guest_ip": guest_ip,
+                    "updated_at": updated_at,
+                    "expected_b64": base64.b64encode(value_bytes).decode("ascii"),
+                }
+            )
+        try:
+            normalized_next = _redis_cursor_text(next_cursor)
+        except (UnicodeDecodeError, ValueError) as e:
+            self._reset_client()
+            raise RuntimeError(f"Redis route scan returned bad cursor: {e}") from e
+        return {
+            "cursor": input_cursor,
+            "next_cursor": normalized_next,
+            "count": count,
+            "scanned": len(keys),
+            "routes": routes,
+            "skipped": skipped,
+        }
+
 
 # ─── Drift reconciliation (contract §3 `_probe_all` diff) ───────
 def reconcile_drift(
@@ -642,7 +844,8 @@ def reconcile_drift(
 # 控制面 Lambda 不在 VPC 内、无 Redis 客户端也无 host 位图。以下三条命令让控制面
 # 在 delete/迁移完成时发一条 SSM 到对应 host 上调本 CLI,由 host 侧权威地维护
 # 路由(§4 DDB 描述符 / §1 Redis / §3 DNAT 位图)。
-#   del-route <tid>                         — 只删 Redis route: 键(#134,delete 收尾)
+#   del-route <tid> <expected_b64> [...]    — 原子比对清点值后删 Redis route: 键
+#   list-routes [cursor] [count]            — 分页 SCAN Redis route: 键供控制面对账
 #   ready-route <tid>                       — R6 阶段1 建:target 侧读本地 vm.json 拿
 #                                             guest_ip → alloc 端口 + 写 DNAT,**不碰 Redis**;
 #                                             STDOUT `OK <host_port> <guest_ip>` 供探活+commit。
@@ -809,6 +1012,19 @@ def _cli_delete_route(
             "refusing partial cleanup"
         )
         return 1
+
+    writer = _cli_redis_writer()
+    if writer is None:
+        print(
+            f"delete-route {tenant_id}: no ENGINE_REDIS_ENDPOINT; "
+            "refusing partial cleanup"
+        )
+        return 1
+    deleted_count = writer.del_route_count(tenant_id)
+    if deleted_count is None:
+        print(f"delete-route {tenant_id}: Redis DEL failed")
+        return 1
+
     try:
         if guest_ip and host_port > 0:
             if PORT_RANGE_LOW <= host_port <= PORT_RANGE_HIGH:
@@ -823,21 +1039,150 @@ def _cli_delete_route(
         print(f"delete-route {tenant_id}: DNAT release failed: {exc}")
         return 1
 
-    writer = _cli_redis_writer()
-    if writer is None:
-        print(
-            f"delete-route {tenant_id}: no ENGINE_REDIS_ENDPOINT; "
-            "refusing partial cleanup"
-        )
-        return 1
-    if not writer.del_route(tenant_id):
-        print(f"delete-route {tenant_id}: Redis DEL failed")
-        return 1
     print(
         f"OK deleted route tenant={tenant_id} port={host_port} "
         f"legacy_port={legacy_port} guest={guest_ip}"
     )
     return 0
+
+
+def _cli_del_routes(argv: list[str]) -> int:
+    """Compare-and-delete `<tenant> <expected_b64>` pairs."""
+    if not argv or len(argv) % 2:
+        print("OC_ROUTE_ERROR reason=bad_del_route_argv")
+        return 1
+
+    pairs = []
+    rejected = []
+    for index in range(0, len(argv), 2):
+        tenant_id = argv[index]
+        token = argv[index + 1]
+        if not _TENANT_ID_SHAPE.fullmatch(tenant_id):
+            rejected.append(tenant_id)
+            continue
+        try:
+            expected_bytes = base64.b64decode(token.encode("ascii"), validate=True)
+        except (UnicodeEncodeError, binascii.Error, ValueError):
+            rejected.append(tenant_id)
+            continue
+        if not expected_bytes:
+            rejected.append(tenant_id)
+            continue
+        pairs.append((tenant_id, expected_bytes))
+
+    for tenant_id in rejected:
+        print(f"OC_ROUTE_OP op=del tenant={tenant_id} result=rejected_shape")
+
+    writer = _cli_redis_writer()
+    if writer is None:
+        for tenant_id, _expected_bytes in pairs:
+            print(
+                f"OC_ROUTE_OP op=del tenant={tenant_id} result=unconfigured"
+            )
+        return 1
+
+    failed = bool(rejected)
+    for tenant_id, expected_bytes in pairs:
+        result = writer.compare_and_delete_route(tenant_id, expected_bytes)
+        print(f"OC_ROUTE_OP op=del tenant={tenant_id} result={result}")
+        if result == "failed":
+            failed = True
+    return 1 if failed else 0
+
+
+def _route_inventory_lines(page) -> list[str]:
+    lines = [
+        "OC_ROUTE_PAGE "
+        f"cursor={page['cursor']} next_cursor={page['next_cursor']} "
+        f"count={page['count']}"
+    ]
+    for route in page["routes"]:
+        lines.append(
+            "OC_ROUTE_ITEM "
+            f"tenant={route['tenant']} host={route['host']} "
+            f"port={route['port']} guest_ip={route['guest_ip']} "
+            f"updated_at={route['updated_at']} "
+            f"expected_b64={route['expected_b64']}"
+        )
+    for skipped in page["skipped"]:
+        identity = (
+            f"tenant={skipped['tenant']}"
+            if skipped.get("tenant")
+            else f"key_b64={skipped.get('key_b64', '')}"
+        )
+        lines.append(
+            f"OC_ROUTE_SKIPPED {identity} reason={skipped['reason']}"
+        )
+    lines.append(
+        f"OC_ROUTE_TOTAL n={len(page['routes'])} "
+        f"skipped={len(page['skipped'])} scanned={page['scanned']}"
+    )
+    return lines
+
+
+def _serialized_output_bytes(lines: list[str]) -> int:
+    return sum(len(line.encode("utf-8")) + 1 for line in lines)
+
+
+def _cli_list_routes(
+    cursor="0", count=ROUTE_INVENTORY_DEFAULT_COUNT
+) -> int:
+    """Print one sealed, byte-bounded Redis route inventory page."""
+    try:
+        cursor = _redis_cursor_text(cursor)
+        count = max(1, min(int(count), ROUTE_INVENTORY_MAX_COUNT))
+    except (TypeError, ValueError, UnicodeDecodeError):
+        print("OC_ROUTE_ERROR reason=bad_cursor_or_count")
+        return 1
+    writer = _cli_redis_writer()
+    if writer is None:
+        print("OC_ROUTE_ERROR reason=unconfigured")
+        return 1
+    # PING 自证必须在 SCAN 之前:连不上的 Redis 和「真的零条 route」在输出上一模一样,
+    # 都是空清单。少了这一步,控制面会把一次连接失败读成「没有残留」并据此收工。
+    if not writer.ping():
+        print("OC_ROUTE_ERROR reason=ping_failed")
+        return 1
+
+    attempt_count = count
+    while True:
+        try:
+            page = writer.scan_routes(cursor=cursor, count=attempt_count)
+        except Exception as e:
+            reason = " ".join(str(e).split())
+            print(f"OC_ROUTE_ERROR reason={reason}")
+            return 1
+        lines = _route_inventory_lines(page)
+        if _serialized_output_bytes(lines) <= ROUTE_INVENTORY_OUTPUT_BUDGET_BYTES:
+            for line in lines:
+                print(line)
+            return 0
+        if attempt_count > 1:
+            attempt_count = max(1, attempt_count // 2)
+            continue
+
+        # Redis SCAN may return multiple keys even for COUNT 1. Advancing the
+        # returned cursor without accounting for them would silently lose keys
+        # from this pass, while retrying forever would wedge the reconciler.
+        # Emit one bounded, explicit skip record covering the entire returned
+        # batch and let the next full pass retry those keys.
+        fallback = [
+            "OC_ROUTE_PAGE "
+            f"cursor={page['cursor']} next_cursor={page['next_cursor']} count=1",
+            "OC_ROUTE_SKIPPED_BATCH "
+            f"n={page['scanned']} reason=page_over_budget_at_count_1",
+            f"OC_ROUTE_TOTAL n=0 skipped={page['scanned']} "
+            f"scanned={page['scanned']}",
+        ]
+        if (
+            _serialized_output_bytes(fallback)
+            > ROUTE_INVENTORY_OUTPUT_BUDGET_BYTES
+        ):
+            print("OC_ROUTE_ERROR reason=min_count_fallback_over_budget")
+            return 1
+        for line in fallback:
+            print(line)
+        return 0
 
 
 if __name__ == "__main__":
@@ -846,14 +1191,16 @@ if __name__ == "__main__":
     _cmd = sys.argv[1] if len(sys.argv) >= 2 else ""
 
     if _cmd == "del-route" and len(sys.argv) >= 3:
-        _tid = sys.argv[2]
-        _w = _cli_redis_writer()
-        if _w is None:
-            print("del-route: no ENGINE_REDIS_ENDPOINT — skip (Redis 未接线)")
-            sys.exit(0)
-        ok = _w.del_route(_tid)
-        print(f"del-route {_tid}: {'ok' if ok else 'degraded(fail-open)'}")
-        sys.exit(0)
+        sys.exit(_cli_del_routes(sys.argv[2:]))
+
+    if _cmd == "list-routes" and 2 <= len(sys.argv) <= 4:
+        _cursor = sys.argv[2] if len(sys.argv) >= 3 else "0"
+        _count = (
+            sys.argv[3]
+            if len(sys.argv) >= 4
+            else ROUTE_INVENTORY_DEFAULT_COUNT
+        )
+        sys.exit(_cli_list_routes(_cursor, _count))
 
     if _cmd == "ready-route" and len(sys.argv) >= 3:
         sys.exit(_cli_ready_route(sys.argv[2]))
@@ -877,7 +1224,9 @@ if __name__ == "__main__":
         )
 
     print(
-        "usage: route_ops.py del-route <tid>\n"
+        "usage: route_ops.py del-route <tid> <expected_b64> "
+        "[<tid> <expected_b64> ...]\n"
+        "       route_ops.py list-routes [<cursor> [<count>]]\n"
         "       route_ops.py ready-route <tid>\n"
         "       route_ops.py commit-route <tid> <host_ip> <host_port> <guest_ip>\n"
         "       route_ops.py ensure-route <tid> <host_ip>\n"

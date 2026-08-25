@@ -10,6 +10,40 @@
 两端都在公开仓可解析,所以下面每条校验命令你都能自己跑通(spire-agent 那版 kit 记的两个 SHA 只存在于
 构建机本地,客户跑不了 —— 从这一版起修掉了)。
 
+## 前置依赖:先施加 `edge-balancer-cosocket-606`,否则 edge 数据面带 P0 缺陷
+
+**本 kit 不修 edge 的 `balancer_by_lua*` cosocket 缺陷(#606),而且携带的 edge 制品本身是缺陷版。**
+
+两个原因叠加:
+
+- `deploy/edge/lib/*.lua` 在本 kit 里属 **`deploy-other` 层** —— `apply_cli` 只
+  `install` 到 `$REPO_ROOT`,**不下发在役 edge**。edge 是独立数据面 ASG、bundle 由
+  LaunchTemplate 钉 sha,控制面 API 与本 kit 的任何步骤都碰不到它
+- 本 kit 的 `patch_sha`(`c9fd494f`)**早于** #606 的修复,所以 `artifacts` 里那几个
+  edge lua 是修复前的版本。即使有人手工把它们推到在役 edge,推上去的也是缺陷版
+
+缺陷形态:`balancer.lua` 在 `balancer_by_lua*` 阶段经 `backend.lookup_backend` →
+`redis_client.get_route` → `resty.redis:new()` 重查 Redis,而 OpenResty 在该阶段
+**禁用 cosocket API**。每次需要选 upstream 都抛
+`API disabled in the context of balancer_by_lua*`,upstream 选取失败。
+
+后果:**任何需要新建 WSS 连接的租户全部 502**。已建立的长连接不受影响,所以症状表现为
+「只有部分租户连不上」——最容易被误判成租户个体问题或 Redis route 数据错误,
+从而把排查方向带到完全错误的地方(实测曾误判为 route stale、guest 出网策略拦截、
+openresty 进程停止三个方向,全部排除后才定位到本缺陷)。
+
+处置:**先施加 `patch/edge-balancer-cosocket-606`**,它的 `apply_cli` 真的下发到在役
+edge(S3 放制品 → SSM 写 `lualib` 与 `/opt/openclaw-edge` 两处落点 → reload)。
+两个 kit 之间没有代码依赖,顺序可换,但**都要做**。
+
+排查这一层时的两个陷阱,先知道能省很多时间:
+
+- **`nginx -t` 不加载 lua 模块** —— `-t` 通过不代表 lua 能载入。加载与运行失败只出现在
+  journald 与 `error.log`
+- **`systemctl is-active` 可能报 inactive 而进程其实在跑** —— 若 openresty 不经 systemd
+  启动(由 `install-edge.sh` 直接拉起 nginx binary),service 状态不反映真实进程。
+  判断存活要看 `ps` 与端口监听,不要只看 `systemctl`
+
 ## 先读四条会静默毁掉本次交付的事实
 
 **① 死线有【两个】载体,两个都必须落,漏掉 env 会让租户写路径全 5xx。**

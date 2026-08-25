@@ -162,23 +162,28 @@ function _M.on_rewrite()
     local shared = get_shared()
     if not shared then return ngx.exit(503) end
 
+    local primary_host = ngx.var.edge_redis_host
+    local primary_port_str = ngx.var.edge_redis_port
     local redis_host = ngx.var.edge_redis_reader_host
     local redis_port_str = ngx.var.edge_redis_reader_port
     if not redis_host or redis_host == ""
         or not redis_port_str or redis_port_str == "" then
-        redis_host = ngx.var.edge_redis_host
-        redis_port_str = ngx.var.edge_redis_port
+        redis_host = primary_host
+        redis_port_str = primary_port_str
     end
     local redis_port = tonumber(redis_port_str) or 6379
+    local primary_port = tonumber(primary_port_str) or 6379
     if not redis_host or redis_host == "" then
         ngx.log(ngx.ERR, "edge_redis_reader_host and fallback ",
             "edge_redis_host are not set in nginx.conf")
         return ngx.exit(503)
     end
-    local authoritative = redis_host == ngx.var.edge_redis_host
+    local authoritative = redis_host == primary_host
+        and redis_port_str == primary_port_str
 
     local desc, source, err_status = backend_mod.lookup_backend(
-        shared, tid, redis_host, redis_port, authoritative)
+        shared, tid, redis_host, redis_port, authoritative,
+        primary_host, primary_port)
     if err_status then
         return ngx.exit(err_status)
     end

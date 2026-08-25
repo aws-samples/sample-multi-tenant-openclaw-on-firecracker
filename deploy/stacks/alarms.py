@@ -254,21 +254,21 @@ def build_alarms(self, ctx):
             )
         )
 
-    # ── Redis replicas: edge 路由新鲜度上界 ───────────────────────────────
-    # ReplicationLag 的有效维度是每个副本节点 CacheClusterId，不是
-    # ReplicationGroupId。ha_edge.py 从 CFN 的只读 endpoint 列表提取节点 id。
+    # ── Redis 全节点: edge 路由新鲜度上界 ────────────────────────────────
+    # ReplicationLag 的有效维度仍是每个节点的 CacheClusterId，不能用
+    # ReplicationGroupId 替代。全部节点都出数，ha_edge.py 由 group id 加序号构造。
     redis_lag_eval = int(
         _cfg(alarms_cfg, "redis_replication_lag_evaluation_periods")
     )
     for index, cache_cluster_id in enumerate(
-        getattr(ctx, "redis_replica_cluster_ids", [])
+        getattr(ctx, "redis_node_cluster_ids", [])
     ):
         _add_action(
             cloudwatch.Alarm(
                 self,
-                f"RedisReplicationLagReplica{index + 1}Alarm",
+                f"RedisReplicationLagNode{index + 1}Alarm",
                 alarm_name=(
-                    "openclaw-edge-replica-route-freshness-upper-bound-"
+                    "openclaw-edge-node-route-freshness-upper-bound-"
                     f"{index + 1}"
                 ),
                 metric=cloudwatch.Metric(
@@ -290,8 +290,9 @@ def build_alarms(self, ctx):
                 ),
                 treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
                 alarm_description=(
-                    "保护 edge 读副本时的路由新鲜度上界；ReplicationLag 超阈值"
-                    "意味着“复制延迟 + POS_TTL_SEC”可能吃掉 "
+                    "仅在 edge_read_from_replica 打开时创建，覆盖复制组内每个节点；"
+                    "当前 primary 正常出数且通常接近 0，角色互换后不会失明。"
+                    "ReplicationLag 超阈值意味着“复制延迟 + POS_TTL_SEC”可能吃掉 "
                     "PORT_QUARANTINE_SECONDS 的余量。"
                 ),
             )

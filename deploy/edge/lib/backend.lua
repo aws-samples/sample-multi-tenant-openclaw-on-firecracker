@@ -66,20 +66,8 @@ local POS_TTL_SEC     = 5
 -- INTERFACE-CONTRACT and the header comment above.
 local L2_TTL_SEC      = 60
 local NEG_TTL_SEC     = 2
--- #497 — how long an observed Redis failure for ONE tenant's key counts as evidence
--- that its route cannot be re-read. It does two jobs: authorise a lock-timeout waiter
--- to fall back to that tenant's aged entry (answer_without_redis), and back the lock
--- holder off the doomed connection (try_redis).
---
--- Deliberately much SHORTER than POS_TTL_SEC. The evidence suppresses re-reads, so
--- after Redis recovers we keep serving an aged blob — which may be up to L2_TTL_SEC
--- old and whose host:port may already belong to another tenant's VM — for as long as
--- this window lasts. Keeping it well inside the freshness budget bounds that exposure;
--- a persistent outage is unaffected because every holder attempt re-observes the error
--- and refreshes the marker, so it stays present for the whole outage regardless of how
--- short the TTL is. The trade was reviewed both ways across four cross-model rounds
--- (add the backoff / drop it); this bounds it instead of picking a side.
-local ERR_TTL_SEC     = 0.5
+-- ERR_TTL_SEC belongs to this group but is declared just below LOCK_TIMEOUT_SEC,
+-- because #625 derives it from that wait instead of restating a number.
 -- Small jitter on positive TTL avoids herd expiry across workers.
 -- #497 — DOWNWARD only. It used to be ±0.5s, so an L1 entry could live 5.5s while the
 -- L2 freshness marker expired at exactly POS_TTL_SEC — making the switch window this
@@ -90,26 +78,53 @@ local function pos_ttl_jitter()
 end
 
 -- Max time waiting behind another worker. #497 — must EXCEED the holder's WARM Redis
--- budget (300ms) plus scheduling margin. It used to be a flat 0.2s, i.e. shorter than
--- the holder could possibly take to fail: at the start of an outage every waiter gave
--- up before the holder published its failure evidence, so they all 503'd instead of
--- falling back to fail-static. A waiter has nothing useful to do on its own now
--- (answer_without_redis never touches Redis), so waiting out the holder is strictly
--- better than giving up early. Derived, not hardcoded, so retuning the Redis timeouts
--- cannot silently reintroduce the gap.
+-- budget plus scheduling margin. #625 makes the worst holder path two sequential reads
+-- (reader GET + one primary verification), so the warm budget is now 600ms. The derived
+-- wait rises from 0.4s to 0.7s under contention; that is the price of restoring an
+-- authoritative answer. A waiter still has nothing useful to do on its own
+-- (answer_without_redis never touches Redis), so waiting out the holder remains better
+-- than giving up early and returning 503. Derived, not hardcoded, so retuning the Redis
+-- timeouts cannot silently reintroduce the gap.
 --
 -- It deliberately does NOT cover a cold DNS resolution (redis_client.COLD_CEILING_MS,
 -- seconds). Blocking a request for that long to spare it a 503 would trade a bounded
 -- blip for worker starvation across the fleet — the wrong direction. Residual: when a
 -- holder is stuck in DNS, this tenant's waiters get the bounded 503 window described in
 -- answer_without_redis until the holder finally publishes its outcome.
-local LOCK_TIMEOUT_SEC = (redis_client.WARM_BUDGET_MS + 100) / 1000  -- 0.4s
--- Lease, NOT a wait: sized against the COLD ceiling so the lock cannot expire while its
--- holder is still legitimately working. With a shorter lease a DNS-stalled holder loses
--- the lock, a second worker enters, and the two writes can land out of order — the
--- stale/cross-tenant routing this issue removes. Nobody blocks for this long: waiters
--- give up after LOCK_TIMEOUT_SEC and answer from the cache.
-local LOCK_EXPTIME_SEC = (redis_client.COLD_CEILING_MS + 700) / 1000  -- 4s
+local LOCK_TIMEOUT_SEC = (
+    redis_client.WARM_BUDGET_MS * redis_client.MAX_SEQUENTIAL_READS + 100
+) / 1000  -- 0.7s
+-- Lease, NOT a wait: #625 sizes it against two sequential COLD ceilings because the
+-- reader miss may be followed by one primary verification. With a shorter lease a
+-- DNS-stalled holder can lose the lock during its second legal read, a second worker
+-- enters, and the two writes can land out of order — the stale/cross-tenant routing
+-- this issue removes. Nobody blocks for 7.3s: waiters still give up after the derived
+-- 0.7s LOCK_TIMEOUT_SEC and answer from the cache.
+local LOCK_EXPTIME_SEC = (
+    redis_client.COLD_CEILING_MS * redis_client.MAX_SEQUENTIAL_READS + 700
+) / 1000  -- 7.3s
+
+-- #497 — how long an observed Redis failure for ONE tenant's key counts as evidence
+-- that its route cannot be re-read. It does two jobs: authorise a lock-timeout waiter
+-- to fall back to that tenant's aged entry (answer_without_redis), and back the lock
+-- holder off the doomed connection (try_redis).
+--
+-- The first job is why it is DERIVED from LOCK_TIMEOUT_SEC rather than written down:
+-- the evidence has to still be there when the waiter gives up, otherwise the waiter
+-- finds nothing, refuses the aged entry and returns 503 — the bug #497 removed. #625
+-- lengthened the wait to 0.7s; a hardcoded TTL would have silently stopped covering it.
+-- The +0.1s is scheduling margin, matching the pre-#625 pair (0.4s wait / 0.5s TTL).
+--
+-- Deliberately much SHORTER than POS_TTL_SEC. The evidence suppresses re-reads, so
+-- after Redis recovers we keep serving an aged blob — which may be up to L2_TTL_SEC
+-- old and whose host:port may already belong to another tenant's VM — for as long as
+-- this window lasts. Keeping it well inside the freshness budget bounds that exposure;
+-- a persistent outage is unaffected because every holder attempt re-observes the error
+-- and refreshes the marker, so it stays present for the whole outage regardless of how
+-- short the TTL is. The trade was reviewed both ways across four cross-model rounds
+-- (add the backoff / drop it); this bounds it instead of picking a side.
+-- Both bounds are asserted in backend_freshness_crosstenant_spec.lua.
+local ERR_TTL_SEC = LOCK_TIMEOUT_SEC + 0.1  -- 0.8s
 
 -- Worker-local cache created at init_worker time via _M.init_worker().
 -- Capacity 4000 handles a hot subset of ~10w tenants per worker generously.
@@ -232,6 +247,8 @@ end
 -- L2 blob/fresh marker 这份 fail-static 底料。代价是 #497 已识别的风险在
 -- 非权威路径上部分回归：若租户确已删除，旧 blob 以后可能被 fail-static 供出；
 -- 这是用该风险换取副本异常时不主动摧毁在役租户故障兜底的刻意权衡。
+-- #625 — 上述非权威折衷只保留给没有底料或没有 primary 复核通道的兼容路径；
+-- 有存活 blob 时先复核 primary，再由权威结果决定是否删除底料。
 local function put_negative(shared, tid, authoritative)
     if L1_CACHE then L1_CACHE:set(tid, NEG_SENTINEL, NEG_TTL_SEC) end
     if shared then
@@ -289,6 +306,30 @@ local function l2_get(shared, tid, allow_stale)
     return desc, false
 end
 
+local function verify_reader_miss(
+    shared, tid, key, primary_host, primary_port
+)
+    if primary_host == nil or primary_port == nil then
+        return nil, false, nil
+    end
+    local blob = shared and shared:get(l2_key(tid)) or nil
+    if utils.is_blank(blob) then
+        return nil, false, nil
+    end
+
+    -- #625 — blob 证明租户近期存在过，reader miss 与它矛盾；只向 primary
+    -- 复核一次，不递归、不重试。
+    local raw, err = redis_client.get_route(primary_host, primary_port, key)
+    if err then
+        -- 与首次 Redis 读取失败保持同一失败世代语义，供等待者和 fail-static 使用。
+        local gen = shared:incr(err_key(tid), 1, 0) or 1
+        shared:set(err_key(tid), gen, ERR_TTL_SEC)
+        return nil, false, err
+    end
+    shared:delete(err_key(tid))
+    return raw, true, nil
+end
+
 -- try_redis: single-flighted L3 read + parse. Returns (desc, source, err).
 -- source is SOURCE_L3 (fresh from Redis), SOURCE_NEG (Redis said miss),
 -- SOURCE_STATIC (transport error, caller must serve L2 stale).
@@ -299,7 +340,10 @@ end
 -- that would overwrite a newer route and re-arm its freshness marker, i.e. exactly
 -- the stale/cross-tenant routing this issue removes. The lock-timeout path
 -- therefore never reaches here; it answers from the cache alone.
-local function try_redis(shared, tid, redis_host, redis_port, authoritative)
+local function try_redis(
+    shared, tid, redis_host, redis_port, authoritative,
+    primary_host, primary_port
+)
     -- #497 — the lock holder ALWAYS probes Redis, never backs off on the failure
     -- evidence. A backoff would suppress re-reads, so for as long as the evidence lived
     -- we would keep serving an aged blob (up to L2_TTL_SEC old, its host:port possibly
@@ -338,6 +382,14 @@ local function try_redis(shared, tid, redis_host, redis_port, authoritative)
     -- happened inside its own wait — is bounded by one lock wait and is the honest
     -- state: the last completed information said Redis was failing.
     if shared then shared:delete(err_key(tid)) end
+    if raw == nil and not authoritative then
+        local verify_err
+        raw, authoritative, verify_err = verify_reader_miss(
+            shared, tid, key, primary_host, primary_port)
+        if verify_err then
+            return nil, _M.SOURCE_STATIC, verify_err
+        end
+    end
     if raw == nil then
         -- Clean miss: unknown tenant.
         put_negative(shared, tid, authoritative)
@@ -405,9 +457,13 @@ end
       - tid:    validated tenant id string
       - redis_host, redis_port: nginx.conf-configured endpoint
 --]]
--- #618 — 末位第 5 参数 authoritative 表示本次 Redis clean miss 是否来自
+-- #618 — 第 5 参数 authoritative 表示本次 Redis clean miss 是否来自
 -- primary；省略时默认 true，保证所有旧调用方与开关关闭形态保持原行为。
-function _M.lookup_backend(shared, tid, redis_host, redis_port, authoritative)
+-- #625 — 第 6/7 参数是 primary endpoint，仅供有 L2 blob 的 reader miss 复核。
+function _M.lookup_backend(
+    shared, tid, redis_host, redis_port, authoritative,
+    primary_host, primary_port
+)
     if authoritative == nil then authoritative = true end
     -- L1: worker-local hot path.
     local desc, is_neg = l1_get(tid)
@@ -442,7 +498,8 @@ function _M.lookup_backend(shared, tid, redis_host, redis_port, authoritative)
         -- cache would never fill and the whole fleet would sit on Redis. In that
         -- degraded mode a filled cache is worth more than write ordering.
         return _M._finish_lookup(
-            shared, tid, redis_host, redis_port, authoritative)
+            shared, tid, redis_host, redis_port, authoritative,
+            primary_host, primary_port)
     end
 
     -- #497 — sampled BEFORE the wait: answer_without_redis only accepts a failure
@@ -479,16 +536,22 @@ function _M.lookup_backend(shared, tid, redis_host, redis_port, authoritative)
 
     local out_desc, out_source, out_status =
         _M._finish_lookup(
-            shared, tid, redis_host, redis_port, authoritative)
+            shared, tid, redis_host, redis_port, authoritative,
+            primary_host, primary_port)
     pcall(lock.unlock, lock)
     return out_desc, out_source, out_status
 end
 
 -- _finish_lookup: separated so the "lock creation failed" fast path can
 -- reuse the exact same fail-static logic without duplicating branches.
-function _M._finish_lookup(shared, tid, redis_host, redis_port, authoritative)
+function _M._finish_lookup(
+    shared, tid, redis_host, redis_port, authoritative,
+    primary_host, primary_port
+)
+    if authoritative == nil then authoritative = true end
     local desc, source, rerr = try_redis(
-        shared, tid, redis_host, redis_port, authoritative)
+        shared, tid, redis_host, redis_port, authoritative,
+        primary_host, primary_port)
     if source == _M.SOURCE_L3 then
         return desc, source, nil
     end

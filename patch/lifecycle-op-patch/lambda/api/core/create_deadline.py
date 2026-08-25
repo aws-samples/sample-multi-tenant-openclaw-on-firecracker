@@ -671,7 +671,7 @@ def deadline_at(accepted_epoch: int) -> int:
     return deadline_at_for(ACTION_CREATE, accepted_epoch)
 
 
-# ── #565 G3 —— 另外七个根因类型,把词汇表补齐到覆盖八个操作 ────────────────────
+# ── #565 G3 —— 另外五个根因类型,把词汇表补齐到覆盖八个操作 ────────────────────
 #
 # **上面 create 那三个一个字节没动。** 它们已经作为 `create_fail_reason` 的封闭取值发布过
 # (`create-3min-deadline-contract.md` §1.2),而 `create` 的子集恰好就是 {那三个} —— 所以这里
@@ -723,13 +723,6 @@ rebuild `:4677`(`LIFECYCLE_SUPERSEDED`)、delete `:2974`。
 容量类是**跟别的租户**争资源。两者动作建议都是重试,但重试的期望不同 —— 前者要先重读状态,
 后者要等容量。"""
 
-REASON_TENANT_NOT_STARTABLE = "tenant_not_startable"
-"""start/restart 执行时租户已经是 `failed` 或 `requires_intervention`,当前状态不可起。
-
-这既覆盖 API 受理时就看到坏状态的同步 409,也覆盖已返 202、consumer 执行前状态才恶化的
-窗口。`failed` 是墓碑,客户必须换 `client_token` 重建;`requires_intervention` 必须先
-`stop` 回到 `stopped`,再 `start`。原样重试 start/restart 不会自行收敛。"""
-
 REASON_ROUTE_CLEANUP_BLOCKED = "route_cleanup_blocked"
 """路由/DNAT/端口位图/Redis 路由清理受阻 —— 只有 delete 会出(`:3304`)。
 
@@ -780,14 +773,12 @@ REASONS_FOR = {
     ACTION_RESTART: (
         REASON_HOST_UNREACHABLE,
         REASON_PREEMPTED,
-        REASON_TENANT_NOT_STARTABLE,
         REASON_DEADLINE_EXCEEDED,
         REASON_SYSTEM,
     ),
     ACTION_START: (
         REASON_HOST_UNREACHABLE,   # start 分支的 502 出口
         REASON_PREEMPTED,          # rc==75 的 flock-skip(#604)
-        REASON_TENANT_NOT_STARTABLE,
         REASON_DEADLINE_EXCEEDED,  # 到点被 #564 兜底判死
         REASON_SYSTEM,
     ),
@@ -841,9 +832,8 @@ ALL_FAIL_REASONS = (
     REASON_PREEMPTED,
     REASON_ROUTE_CLEANUP_BLOCKED,
     REASON_SYSTEM,
-    REASON_TENANT_NOT_STARTABLE,
 )
-"""词汇表全集(十个值)。给校验器、文档生成与测试用;**不要**拿它当某个操作的取值集合 ——
+"""词汇表全集(九个值)。给校验器、文档生成与测试用;**不要**拿它当某个操作的取值集合 ——
 那会让客户以为 restart 可能返回 `backup_missing`。
 
 **为什么这里显式列举,而不是 `{r for rs in REASONS_FOR.values() for r in rs}`。**

@@ -816,7 +816,7 @@ def _force_relaunch_vm(tenant_id, cfg):
         f"for {_NET_DEAD_THRESHOLD} polls — rebuilding network"
     )
     try:
-        stop = subprocess.run(
+        subprocess.run(
             _launch_argv(
                 "bash", "/home/ubuntu/stop-vm.sh", str(tenant_id), str(vm_num)
             ),
@@ -824,18 +824,6 @@ def _force_relaunch_vm(tenant_id, cfg):
             stderr=subprocess.DEVNULL,
             timeout=30,
         )
-        # #617 项二:这里以前丢掉 returncode,stop-vm.sh 失败也照样 relaunch ——
-        # 而 stop 失败恰恰意味着老 Firecracker 可能还活着,再起一个就是同一租户两个 VM。
-        # stop-vm.sh 对已停 VM 是幂等 no-op success,所以非零一定是真失败,不是"本来就停了"。
-        # 诊断已由 _launch_argv 的 systemd-cat 进 journald,这里只需给出可检索的指针。
-        if stop.returncode != 0:
-            print(
-                f"force-relaunch {tenant_id}: stop-vm.sh rc={stop.returncode} — "
-                "refusing to relaunch while the old Firecracker may still be alive; "
-                "see `journalctl -t claw-launch`"
-            )
-            _recovering.discard(tenant_id)
-            return
         subprocess.Popen(
             _launch_argv(
                 "bash",

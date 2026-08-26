@@ -1,7 +1,7 @@
 -- deploy/edge/test/backend_spec.lua
 --
 -- lookup_backend — three-tier cache + fail-static coverage per
--- the test plan "route.lua lookup_backend" row.
+-- 03-TEST-PLAN §2 "route.lua lookup_backend" row.
 
 local helper = require "spec_helper"
 local backend = require "edge.lib.backend"

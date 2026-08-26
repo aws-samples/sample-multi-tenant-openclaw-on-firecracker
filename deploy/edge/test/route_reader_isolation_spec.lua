@@ -343,3 +343,119 @@ describe("#618 route reader isolation", function()
         assert.is_not_nil(shared:get("n:" .. tid))
     end)
 end)
+
+-- #639：readiness 门本身的对抗面。#618 的门只有在「坐标真的到了 warmup_probe
+-- 手上」时才成立，而坐标通道断过一次（systemd Environment= 被 nginx 抹掉），
+-- 那次断裂让 warmup_probe 走「无坐标」分支直接 mark_ready()，于是每台从未连上
+-- Redis 的 edge 都报 healthy、被 ALB 拉进轮转、对所有租户返 404/5xx。
+-- 这里钉的是：拿不到坐标就不许 ready，且探针必须打 reader 而不是写节点。
+local hints = require "edge.lib.hints"
+
+describe("#639 warmup readiness fail-closed", function()
+    local real_get = hints.get
+
+    local function ready()
+        return ngx.shared.edge_ready:get("ready")
+    end
+
+    local function logged(needle)
+        for _, line in ipairs(helper.log_capture) do
+            if line:find(needle, 1, true) then return true end
+        end
+        return false
+    end
+
+    before_each(function()
+        helper.reset_ngx()
+        hints.get = real_get
+        redis_client._set_redis_module(helper.new_fake_redis_module())
+        ngx._fake_redis = { mode = "hit", value = desc_json("10.0.5.5", 10055) }
+    end)
+
+    after_each(function()
+        hints.get = real_get
+    end)
+
+    -- 这条就是 #639 的回归：把 fail-closed 分支改回 mark_ready() 立刻变红。
+    it("坐标全缺时拒绝 ready 且一次 Redis 都不连", function()
+        hints.set({
+            primary_host = "${ENGINE_REDIS_HOST}",      -- 未经 envsubst 渲染
+            reader_host  = "${ENGINE_REDIS_READER_HOST}",
+        })
+
+        route._warmup_probe()
+
+        assert.is_nil(ready())
+        assert.are.equal(0, #helper.fake_redis_connects())
+        assert.is_true(logged("refusing to mark ready without a probe"))
+    end)
+
+    -- 防 nginx.conf 整段 init_by_lua_block 丢失（get() 返回 nil）时 `or {}`
+    -- 这道保护被删掉：那会变成 index nil 崩在 init_worker 里，而不是 fail-closed。
+    it("nginx.conf 缺 init_by_lua_block 时同样拒绝 ready 而不是崩", function()
+        hints.get = function() return nil end
+
+        assert.has_no.errors(function() route._warmup_probe() end)
+
+        assert.is_nil(ready())
+        assert.are.equal(0, #helper.fake_redis_connects())
+    end)
+
+    -- 防 warmup 把读探针打到写节点：reader 在时热路径必须是 reader。
+    it("reader 在时先探 reader，再单独探 primary", function()
+        hints.set({
+            primary_host = "primary.redis.local", primary_port = "6379",
+            reader_host  = "reader.redis.local",  reader_port  = "6380",
+        })
+
+        route._warmup_probe()
+
+        local connects = helper.fake_redis_connects()
+        assert.are.equal(1, ready())
+        assert.are.equal(2, #connects)
+        assert.are.equal("reader.redis.local", connects[1])
+        assert.are.equal("primary.redis.local", connects[2])
+    end)
+
+    -- 滚动升级形态（只有 primary）：必须能 ready，且不许把同一个节点探两次。
+    it("只有 primary 时回落 primary 且不重复探测", function()
+        hints.set({ primary_host = "primary.redis.local", primary_port = "6380" })
+
+        route._warmup_probe()
+
+        local connects = helper.fake_redis_connects()
+        assert.are.equal(1, ready())
+        assert.are.equal(1, #connects)
+        assert.are.equal("primary.redis.local", connects[1])
+    end)
+
+    -- timer.at 失败时探针一次都不会跑（连 15 次兜底那条路都进不去），
+    -- 所以这里标 ready 等于把从未探测过的 worker 放进轮转 —— 与 #639 同类。
+    it("timer.at 失败时保持 unready 而不是无探针标 ready", function()
+        hints.set({ primary_host = "primary.redis.local", primary_port = "6379" })
+        local real_timer = ngx.timer
+        ngx.timer = { at = function() error("no timer slots", 0) end }
+
+        local ok, err = pcall(route.on_init_worker)
+        ngx.timer = real_timer
+
+        assert.is_true(ok, tostring(err))
+        assert.is_nil(ready())
+        assert.are.equal(0, #helper.fake_redis_connects())
+        assert.is_true(logged("staying unready (no probe will ever run)"))
+    end)
+
+    -- 坐标齐全但 Redis 连不上：门必须真的挡住（集成 ARM W 的单测面）。
+    it("坐标齐全但探测失败时不得 ready", function()
+        hints.set({
+            primary_host = "primary.redis.local", primary_port = "6379",
+            reader_host  = "reader.redis.local",  reader_port  = "6380",
+        })
+        ngx._fake_redis = { mode = "error", err = "connection refused" }
+
+        route._warmup_probe()
+
+        assert.is_nil(ready())
+        assert.is_true(logged("edge warmup probe via reader coordinate"))
+    end)
+end)

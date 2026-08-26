@@ -217,10 +217,15 @@ sysctl -p /etc/sysctl.d/99-openclaw-edge.conf >/dev/null || \
     log "WARN: sysctl reload emitted warnings (nf_conntrack may need module load)"
 
 # ── 6. systemd unit ──────────────────────────────────────────────────────
-# The Environment= lines feed route.lua's warmup_probe(), which needs to
-# know the endpoint at init_worker phase (before any request runs, so
-# ngx.var.edge_redis_reader_host isn't available yet). Kept in sync with the
-# same values baked into nginx.conf's server-block $edge_redis_* vars.
+# NO Environment=ENGINE_REDIS_*_HINT lines here on purpose (#639). They used to
+# be here to feed route.lua's warmup_probe(), which needs the endpoint at
+# init_worker phase (ngx.var isn't available yet) — but nginx wipes the worker
+# environment except TZ unless each name is declared with the `env` directive,
+# and nginx.conf declared none. So that channel never worked: os.getenv returned
+# nil, the probe marked the instance ready WITHOUT reaching Redis, and #618's
+# readiness gate was permanently fail-open. The coordinates now travel through
+# nginx.conf's init_by_lua_block, rendered by the SAME envsubst call above that
+# renders $edge_redis_* — one channel instead of two that must agree.
 cat > /etc/systemd/system/claw-edge.service <<UNIT
 [Unit]
 Description=OpenClaw Pool edge (OpenResty)
@@ -230,10 +235,6 @@ Wants=network-online.target
 [Service]
 Type=forking
 PIDFile=/usr/local/openresty/nginx/logs/nginx.pid
-Environment=ENGINE_REDIS_HOST_HINT=${REDIS_HOST}
-Environment=ENGINE_REDIS_PORT_HINT=${REDIS_PORT}
-Environment=ENGINE_REDIS_READER_HOST_HINT=${READER_HOST}
-Environment=ENGINE_REDIS_READER_PORT_HINT=${READER_PORT}
 ExecStartPre=/usr/local/openresty/nginx/sbin/nginx -t -c $CONF_DIR/nginx.conf
 ExecStart=/usr/local/openresty/nginx/sbin/nginx -c $CONF_DIR/nginx.conf
 ExecReload=/usr/local/openresty/nginx/sbin/nginx -s reload

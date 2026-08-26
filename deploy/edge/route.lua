@@ -14,6 +14,7 @@ local tenant_mod   = require "edge.lib.tenant"
 local backend_mod  = require "edge.lib.backend"
 local balancer_mod = require "edge.lib.balancer"
 local redis_client = require "edge.lib.redis_client"
+local hints_mod    = require "edge.lib.hints"
 
 local _M = { _VERSION = "0.02" }
 
@@ -26,20 +27,19 @@ local function mark_ready()
 end
 
 local function probe_primary_if_distinct(hot_host, hot_port)
-    local host = os.getenv("ENGINE_REDIS_HOST_HINT")
-    local port_str = os.getenv("ENGINE_REDIS_PORT_HINT")
-    if not host or host == "" then
-        ngx.log(ngx.ERR, "edge warmup: ENGINE_REDIS_HOST_HINT/",
-            "ENGINE_REDIS_PORT_HINT unavailable; primary probe skipped; ",
+    local coords = hints_mod.get() or {}
+    local host = coords.primary_host
+    if not host then
+        ngx.log(ngx.ERR, "edge warmup: primary Redis coordinate absent from ",
+            "nginx.conf's init_by_lua_block; primary probe skipped; ",
             "failover retry will fail")
         return
     end
-    local port = tonumber(port_str) or 6379
+    local port = coords.primary_port or 6379
     if host == hot_host and port == hot_port then return end
     local _, err = redis_client.get_route(host, port, "route:__warmup__")
     if err then
-        ngx.log(ngx.ERR, "edge warmup primary probe via ENGINE_REDIS_HOST_HINT/",
-            "ENGINE_REDIS_PORT_HINT failed: ", tostring(err),
+        ngx.log(ngx.ERR, "edge warmup primary probe failed: ", tostring(err),
             "; failover retry will fail")
     end
 end
@@ -51,36 +51,34 @@ end
 -- #618：这里的 failure 只指热路径 endpoint；primary 探测失败仅报错，
 -- 不撤销 reader 已经建立的 readiness。
 local function warmup_probe()
-    local reader_host = os.getenv("ENGINE_REDIS_READER_HOST_HINT")
-    local reader_port_str = os.getenv("ENGINE_REDIS_READER_PORT_HINT")
-    local host = reader_host
-    local port_str = reader_port_str
-    local hint_names =
-        "ENGINE_REDIS_READER_HOST_HINT/ENGINE_REDIS_READER_PORT_HINT"
-    -- init_worker 阶段拿不到 ngx.var,优先读 reader hint;旧 unit 或 reader
-    -- hint 缺失时回落 primary hint,保持滚动升级兼容。
-    if not host or host == "" or not port_str or port_str == "" then
-        host = os.getenv("ENGINE_REDIS_HOST_HINT")
-        port_str = os.getenv("ENGINE_REDIS_PORT_HINT")
-        hint_names = "ENGINE_REDIS_HOST_HINT/ENGINE_REDIS_PORT_HINT"
+    -- init_worker 阶段拿不到 ngx.var,坐标来自 nginx.conf 的 init_by_lua_block
+    -- (见 edge.lib.hints 的注释:走 env 那条通道被 nginx 抹掉,#639)。
+    -- 优先 reader,缺失时回落 primary,保持滚动升级兼容。
+    local coords = hints_mod.get() or {}
+    local host, port = coords.reader_host, coords.reader_port
+    local which = "reader"
+    if not host then
+        host, port = coords.primary_host, coords.primary_port
+        which = "primary"
     end
-    local port = tonumber(port_str) or 6379
-    if not host or host == "" then
-        -- Best-effort: without endpoint info we still must eventually flip
-        -- ready so that /healthz doesn't stay 503 forever in tests or
-        -- misconfigured deploys. Log loudly.
-        ngx.log(ngx.WARN, "edge warmup: ENGINE_REDIS_READER_HOST_HINT/",
-            "ENGINE_REDIS_READER_PORT_HINT and ENGINE_REDIS_HOST_HINT/",
-            "ENGINE_REDIS_PORT_HINT unavailable; ",
-            "marking ready without probe (misconfig?)")
-        mark_ready()
+    if not host then
+        -- FAIL CLOSED (#639). This branch used to call mark_ready(): a broken
+        -- coordinate channel therefore produced a healthy /healthz on an
+        -- instance that had never reached Redis, ASG/ALB rotated traffic into
+        -- it, and every tenant got 404/5xx — exactly what #618's gate exists to
+        -- prevent. A missing coordinate cannot heal by retrying, so say it at
+        -- ERROR and stay out of rotation. on_init_worker's own give-up path
+        -- still stops a permanently unhealthy box in dev.
+        ngx.log(ngx.ERR, "edge warmup: no Redis coordinate from nginx.conf's ",
+            "init_by_lua_block (reader and primary both absent); refusing to ",
+            "mark ready without a probe")
         return
     end
+    port = port or 6379
     local _, err = redis_client.get_route(host, port, "route:__warmup__")
     if err then
-        ngx.log(ngx.WARN, "edge warmup probe via ", hint_names,
-            " failed: ", tostring(err),
-            "; will retry")
+        ngx.log(ngx.WARN, "edge warmup probe via ", which, " coordinate",
+            " failed: ", tostring(err), "; will retry")
     else
         mark_ready()
         ngx.log(ngx.NOTICE, "edge warmup ok; healthz now 200")
@@ -128,9 +126,15 @@ function _M.on_init_worker()
     end
     local ok_t, terr = pcall(ngx.timer.at, 0, tick)
     if not ok_t then
+        -- FAIL CLOSED (#639). No timer means the probe never runs *at all* —
+        -- not even the give-up path above — so marking ready here puts a
+        -- never-probed worker into rotation: the same defect class this issue
+        -- fixed, just triggered by a broken timer instead of a broken
+        -- coordinate channel. Stay unready; ELB pulls the box and ASG replaces
+        -- it. timer.at failing is uncorrelated with Redis health, so this
+        -- cannot mask a real outage as "no capacity".
         ngx.log(ngx.ERR, "edge warmup: timer.at failed: ", tostring(terr),
-            "; flipping ready without probe")
-        mark_ready()
+            "; staying unready (no probe will ever run)")
     end
 end
 
@@ -250,5 +254,8 @@ end
 
 -- Exposed for tests to force-ready without a real probe.
 _M._mark_ready = mark_ready
+-- Exposed so the readiness gate itself is testable: on_init_worker only ever
+-- reaches warmup_probe through an ngx.timer, which plain busted cannot drive.
+_M._warmup_probe = warmup_probe
 
 return _M

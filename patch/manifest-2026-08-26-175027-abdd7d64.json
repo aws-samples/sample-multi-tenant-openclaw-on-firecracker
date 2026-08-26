@@ -1,0 +1,307 @@
+{
+  "synced_at": "2026-08-26 17:50:27 UTC+08:00",
+  "base_sha": "179a6aeab9ef329cda0ba720f936dffc6f862030",
+  "source_commit": "abdd7d64e689f076f499271f4ac353a9c9effa24",
+  "commit_count": 40,
+  "file_count": 26,
+  "summary": "Sync the bb increment 179a6aea..abdd7d64 to the public gateway branch. Sync-LOG only (which customer-facing files reached gateway + the issues behind them); the applyable patch kit is NOT built yet (folded_into pending).",
+  "issues_synced_note": "Index back to the issue tracker for whoever builds the patch kit: before assembling the kit, walk each issue and confirm it's covered. `title` is a ≤20-char gist only — open the issue for the full problem/fix/test. Lists only issues that touched a released file this sync.",
+  "issues_synced": [
+    {
+      "id": "#606",
+      "type": "fix",
+      "title": "edge 上游重投由构造决定不可用"
+    },
+    {
+      "id": "#609",
+      "type": "feat",
+      "title": "GET /users/{id}/tena…"
+    },
+    {
+      "id": "#615",
+      "type": "feat",
+      "title": "POST /recipient-key/…"
+    },
+    {
+      "id": "#622",
+      "type": "fix",
+      "title": "P1 reconcile 期望态缺失时保…"
+    },
+    {
+      "id": "#626",
+      "type": "fix",
+      "title": "[控制面] suspend/rebuil…"
+    },
+    {
+      "id": "#627",
+      "type": "test",
+      "title": "把在役查询 GSI 与 config 期…"
+    },
+    {
+      "id": "#630",
+      "type": "feat",
+      "title": "fix"
+    },
+    {
+      "id": "#631",
+      "type": "fix",
+      "title": "[控制面] egress allow[]…"
+    },
+    {
+      "id": "#632",
+      "type": "fix",
+      "title": "[控制面] WAF 限速与 API Ga…"
+    },
+    {
+      "id": "#633",
+      "type": "feat",
+      "title": "[edge][P0] balancer_…"
+    },
+    {
+      "id": "#639",
+      "type": "fix",
+      "title": "edge Redis 坐标改走 init…"
+    },
+    {
+      "id": "#642",
+      "type": "feat",
+      "title": "[SECURITY] 租户 allowe…"
+    }
+  ],
+  "needs_config_on_apply": [
+    {
+      "file": "config.yml.example",
+      "param": "rate_limit_per_ip",
+      "change": "changed",
+      "value": "1000          # 每来源 IP 在 evaluation window 内的请求数上限"
+    },
+    {
+      "file": "config.yml.example",
+      "param": "evaluation_window_sec",
+      "change": "new",
+      "value": "300       # 仅允许 60/120/300/600;默认 300;是折算 req/s 的分母"
+    },
+    {
+      "file": "config.yml.example",
+      "param": "logging_enabled",
+      "change": "new",
+      "value": "true            # WAF 开启时默认记 BLOCK 日志(会产生 CloudWatch Logs 费用)"
+    },
+    {
+      "file": "config.yml.example",
+      "param": "log_group_name",
+      "change": "new",
+      "value": "\"aws-waf-logs-openclaw-api\"  # AWS 硬规则:必须以 aws-waf-logs- 开头"
+    },
+    {
+      "file": "deploy/stacks/lambdas.py",
+      "param": "DDB-TTL / RemovalPolicy",
+      "change": "state-change (apply out-of-band on live tables — a template edit alone won't)"
+    }
+  ],
+  "updated_files": {
+    "cdk-stack (cdk deploy OR hand-apply)": [
+      {
+        "path": "deploy/stacks/lambdas.py",
+        "status": "modified",
+        "issues": [
+          "#630",
+          "#632"
+        ]
+      }
+    ],
+    "edge (OpenResty / Fluent Bit host config)": [
+      {
+        "path": "deploy/edge/install-edge.sh",
+        "status": "modified",
+        "issues": [
+          "#639"
+        ]
+      },
+      {
+        "path": "deploy/edge/lib/backend.lua",
+        "status": "modified",
+        "issues": [
+          "#606"
+        ]
+      },
+      {
+        "path": "deploy/edge/lib/balancer.lua",
+        "status": "modified",
+        "issues": [
+          "#606"
+        ]
+      },
+      {
+        "path": "deploy/edge/lib/hints.lua",
+        "status": "added",
+        "issues": [
+          "#639"
+        ]
+      },
+      {
+        "path": "deploy/edge/nginx.conf",
+        "status": "modified",
+        "issues": [
+          "#606",
+          "#633",
+          "#639"
+        ]
+      },
+      {
+        "path": "deploy/edge/route.lua",
+        "status": "modified",
+        "issues": [
+          "#606",
+          "#639"
+        ]
+      },
+      {
+        "path": "deploy/edge/test/balancer_failover_adversarial_spec.lua",
+        "status": "modified",
+        "issues": [
+          "#606"
+        ]
+      },
+      {
+        "path": "deploy/edge/test/balancer_spec.lua",
+        "status": "modified",
+        "issues": [
+          "#606"
+        ]
+      },
+      {
+        "path": "deploy/edge/test/hints_spec.lua",
+        "status": "added",
+        "issues": [
+          "#639"
+        ]
+      },
+      {
+        "path": "deploy/edge/test/integration/balancer_phase_integration.sh",
+        "status": "added",
+        "issues": [
+          "#633",
+          "#639"
+        ]
+      },
+      {
+        "path": "deploy/edge/test/integration/run_local_docker.sh",
+        "status": "added",
+        "issues": [
+          "#633"
+        ]
+      },
+      {
+        "path": "deploy/edge/test/route_reader_isolation_spec.lua",
+        "status": "modified",
+        "issues": [
+          "#639"
+        ]
+      },
+      {
+        "path": "deploy/edge/test/run_smoke_failover_adversarial.lua",
+        "status": "modified",
+        "issues": [
+          "#633"
+        ]
+      },
+      {
+        "path": "deploy/edge/test/spec_helper.lua",
+        "status": "modified",
+        "issues": [
+          "#606"
+        ]
+      }
+    ],
+    "host-scripts (S3-pulled / baked into rootfs)": [
+      {
+        "path": "deploy/userdata/host-agent.py",
+        "status": "modified",
+        "issues": [
+          "#622"
+        ]
+      },
+      {
+        "path": "deploy/userdata/lib/harden-config.sh",
+        "status": "modified",
+        "issues": [
+          "#642"
+        ]
+      },
+      {
+        "path": "deploy/userdata/stop-vm.sh",
+        "status": "modified",
+        "issues": [
+          "#626"
+        ]
+      }
+    ],
+    "lambda (update-function-code only)": [
+      {
+        "path": "deploy/lambda/api/core/create_deadline.py",
+        "status": "modified",
+        "issues": [
+          "#626",
+          "#630"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/ssm_dispatch.py",
+        "status": "modified",
+        "issues": [
+          "#626"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/handler.py",
+        "status": "modified",
+        "issues": [
+          "#609",
+          "#615"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/egress_admin_service.py",
+        "status": "modified",
+        "issues": [
+          "#631"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/fleet_service.py",
+        "status": "modified",
+        "issues": [
+          "#609"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/recipient_key_service.py",
+        "status": "modified",
+        "issues": [
+          "#615"
+        ]
+      }
+    ],
+    "root / other": [
+      {
+        "path": "config.yml.example",
+        "status": "modified",
+        "issues": [
+          "#627",
+          "#632"
+        ]
+      }
+    ],
+    "scripts": [
+      {
+        "path": "scripts/checks/create-deadline-config.py",
+        "status": "modified",
+        "issues": [
+          "#630"
+        ]
+      }
+    ]
+  },
+  "folded_into": "(pending) — no patch kit built for this sync yet; a later kit should cite this manifest as source-of-record and set base_sha/patch_sha. cdk deploy is FORBIDDEN on hand-modified live deployments — the kit must ship *.patched host scripts + the full lambda tree + AWS CLI for stack changes, same shape as patch/315-concurrent-dispatch-rollup/."
+}

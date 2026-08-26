@@ -557,11 +557,15 @@ def lambda_handler(event, context):
         if method in ("POST", "PUT", "DELETE"):
             _audit_write(method, resource, path_params, event, result)
         return result
-    except Exception as e:
+    except Exception:
         import traceback
 
+        # #609 —— 兜底 except 不再回显 str(e)。这里接的是**未预期**异常,原文常带内部
+        # 坐标(真机上出现过 botocore 的 "The table does not have the specified index:
+        # gsi_tenant_user",把表结构告诉了调用方)。原文进 CloudWatch,调用方只拿到一个
+        # 稳定的错误码;可预期的失败应该在各自的 handler 里转成带语义的 4xx/503。
         traceback.print_exc()
-        return _resp(500, {"error": str(e)})
+        return _err(500, "INTERNAL", "internal error")
 
 
 # ========== Tenant Operations ==========
@@ -1805,9 +1809,15 @@ def list_user_tenants(tenant_user_id, query_params=None, event=None):
         return err
     # 的 is_admin 分支不看 scope 就放行,这里在查询结果层补隔离)。
     _scope = _get_caller_identity(event or {}).get("platform_scope")
-    items, new_token = _query_user_tenants(
-        tenant_user_id, limit=limit, next_token=next_token, platform_scope=_scope
-    )
+    try:
+        items, new_token = _query_user_tenants(
+            tenant_user_id, limit=limit, next_token=next_token, platform_scope=_scope
+        )
+    except _TenantUserIndexUnavailable:
+        # #609 —— 索引未部署是可预期状态,不是故障:结构化 503,不回显索引名/表结构。
+        return _err(
+            503, "UNAVAILABLE", "per-user fleet index is not active"
+        )
     # Strip server-side secrets before returning — gsi_tenant_user is
     # ProjectionType.ALL so items carry channel_secret / litellm_vkey /
     # gateway_token / cognito_channel_password. GET /tenants (:398) and
@@ -1837,12 +1847,19 @@ def user_summary(tenant_user_id, event=None):
     next_token = None
     pages = 0
     while True:
-        items, next_token = _query_user_tenants(
-            tenant_user_id,
-            limit=_USER_PAGE_MAX,
-            next_token=next_token,
-            platform_scope=_scope,
-        )
+        try:
+            items, next_token = _query_user_tenants(
+                tenant_user_id,
+                limit=_USER_PAGE_MAX,
+                next_token=next_token,
+                platform_scope=_scope,
+            )
+        except _TenantUserIndexUnavailable:
+            # #609 —— 同 list_user_tenants:索引未部署 → 结构化 503。放在循环里是因为
+            # 第一页就会抛,后续页不可能走到;写在这里比在循环外包一层更贴调用点。
+            return _err(
+                503, "UNAVAILABLE", "per-user fleet index is not active"
+            )
         for it in items:
             st = it.get("status", "unknown")
             by_status[st] = by_status.get(st, 0) + 1
@@ -1884,12 +1901,19 @@ def user_action(tenant_user_id, body=None, event=None):
     _scope = _get_caller_identity(event or {}).get("platform_scope")  # #108 IDOR fix
     target_ids, next_token, pages = [], None, 0
     while True:
-        items, next_token = _query_user_tenants(
-            tenant_user_id,
-            limit=_USER_PAGE_MAX,
-            next_token=next_token,
-            platform_scope=_scope,
-        )
+        try:
+            items, next_token = _query_user_tenants(
+                tenant_user_id,
+                limit=_USER_PAGE_MAX,
+                next_token=next_token,
+                platform_scope=_scope,
+            )
+        except _TenantUserIndexUnavailable:
+            # #609 —— 第三个走同一 GSI 的入口。索引未部署时同样只能是结构化 503;
+            # fail closed 在这里尤其重要:此时一个 VM 都还没启停,不存在部分执行。
+            return _err(
+                503, "UNAVAILABLE", "per-user fleet index is not active"
+            )
         target_ids.extend(it["id"] for it in items if it.get("id"))
         pages += 1
         if not next_token or pages >= 50:
@@ -2752,6 +2776,9 @@ list_edge_metrics = _edge_admin.list_edge_metrics
 
 _authorize_user_scope = _fleet_service._authorize_user_scope
 _query_user_tenants = _fleet_service._query_user_tenants
+# #609 —— gsi_tenant_user 未部署时 _query_user_tenants 抛这个,两个 per-user fleet
+# 端点转成结构化 503 而不是让它冒到兜底 except 变成 500 + DDB 原文回显。
+_TenantUserIndexUnavailable = _fleet_service.TenantUserIndexUnavailable
 fleet_power = _fleet_service.fleet_power
 
 # #566 拆分② — fleet guest 出网防火墙运维 API(POST /hosts/egress)。
@@ -3035,7 +3062,69 @@ def _disable_recipient_key(event):
     # requestContext.authorizer.role is never populated in this stack, no custom authorizer)
     if not _get_caller_identity(event or {}).get("is_admin"):
         return _err(403, "ACCESS_DENIED", "recipient key disable requires admin role")
-    from services.recipient_key_service import disable_current
+    import json as _json
 
-    result = disable_current()
+    # #615 —— admin 门之后原先零校验:一个 `{"__invalid__": true}` 就把平台级收件密钥
+    # 关掉(usw2 真机实测返 200 并真的置 enabled=false)。这里补前置校验并 fail closed:
+    # 任何被拒的请求都不许已经动过 durable state。
+    #
+    # 兼容性(API-DESIGN-REVIEW 仓库不变量「新增字段必须可选、省略时保持旧行为」):
+    # key_id 是**可选**的。仓内唯一调用方 deploy/console-bff/web/js/app.rsa.js 的
+    # disableRsaKey() 不传 body;core/auth.py 的 _RBAC_SKIP 注释又把"持 key 的运维
+    # 脚本"列为预期调用方,仓外很可能有同样不传 body 的客户脚本。把 key_id 做成必填
+    # 会当场弄坏这两类调用方,所以空 body 必须继续成功。
+    raw = event.get("body") if event else None
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if raw:
+            try:
+                body = _json.loads(raw)
+            except (ValueError, TypeError):
+                return _err(400, "VALIDATION", "body must be valid JSON")
+        else:
+            body = {}
+    else:
+        body = raw if raw is not None else {}
+    # 合法 JSON 标量/数组("5"、"[1]")也能过 json.loads,但 body.get 会抛 → 先挡成 400
+    # (与 host_service.create_image_snapshot 同款)。
+    if not isinstance(body, dict):
+        return _err(400, "VALIDATION", "body must be a JSON object")
+    unknown = sorted(set(body) - {"key_id"})
+    if unknown:
+        return _err(
+            400,
+            "VALIDATION",
+            "unknown field(s) in body: %s; only 'key_id' is accepted"
+            % ", ".join(unknown),
+        )
+
+    from services import recipient_key_service as _rk
+
+    # 传了 key_id 就必须指向当前那把。校验**不在这里做** —— 它作为条件写的一部分下沉到
+    # disable_current,由 DynamoDB 在同一次 update_item 里判。原因(#615 独立 review 指出):
+    # 在 handler 里先 get_current_key() 比对、再调 disable_current(),中间隔着一次网络往返,
+    # 而 disable_current 自己还会重新解析 current —— 期间若有人 register 了新 key(轮换),
+    # 那次写就落在**新**那把上而调用方拿到 200,客户以为禁的是旧 key,实际把刚上线的新 key
+    # 关了,全平台凭据获取随即中断。检查与动作必须原子。
+    requested = body.get("key_id")
+    if requested is not None and (not isinstance(requested, str) or not requested):
+        return _err(400, "VALIDATION", "body.key_id must be a non-empty string")
+
+    try:
+        result = _rk.disable_current(expected_key_id=requested)
+    except _rk.RecipientKeyChanged:
+        return _err(
+            409,
+            "CONFLICT",
+            "key_id does not match the current recipient key; "
+            "re-read GET /recipient-key and retry",
+        )
+    if requested is not None and result is None:
+        # 传了 key_id 却没有 current key:无从匹配,不能当成"匹配成功"放行。
+        return _err(
+            409,
+            "CONFLICT",
+            "no current recipient key to disable; "
+            "re-read GET /recipient-key and retry",
+        )
     return _resp(200, {"disabled": True, "key": result})

@@ -9,9 +9,10 @@ HOST_VM_KEY="${OC_HOST_VM_KEY:-/etc/openclaw/host_vm_key}"
 OC_STOP_FLUSH_MODE="${OC_STOP_FLUSH_MODE:-prefer}"
 
 # SHORT*2 + EXTENDED 必须 >= 20(#608 前的基线单次窗口,保证本改动不降低持久性),
-# 且给 suspend 的 30s 窗口留出 TERM/KILL 与 require 回滚的余量。这里取 24。
-# 不要为了让总链路塞进 30s 而把这个数往下压 —— 总链路超 30s 是既有条件
-# (基线最坏 42s),另有卡处理。
+# 且给 suspend 的 SSM 窗口留出 TERM/KILL 与 require 回滚的余量。这里取 24。
+# 不要为了让总链路塞进控制面窗口而把这个数往下压 —— #608 后基线最坏 46s(42s 是 #608 前
+# 单次 20s flush 窗口的值)。#626 把预算侧抬到 50s(suspend)/66s(rebuild)与之对齐,
+# 见 create_deadline.STOP_VM_WORST_SEC;要改这里的等待,先改那边的派生常量与 parity 测试。
 STOP_FLUSH_SHORT_SEC=3
 STOP_FLUSH_EXTENDED_SEC=18
 STOP_SSH_CONNECT_SEC=3

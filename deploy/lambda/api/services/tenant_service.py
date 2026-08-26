@@ -5153,6 +5153,102 @@ def _release_restore_reservation(tenant_id, host_id, reservation_id, vcpu, mem_m
     return _rel
 
 
+def _reclaim_stale_restore_reservation(tenant_id, item):
+    """#659 —— failed 重入的前置清场。返回 None = 干净(或无需清场);返回 resp = 保持
+    restoring 原样返回,重投时幂等重跑。
+
+    上一次被死线围栏判死的 restore 可能留下两样东西:
+      · **仍占账本的预留令牌**(`restore_reservation_id`)—— 围栏刻意保留令牌(#412 防双扣
+        语义),而孤儿令牌 reaper 只扫 `capacity_reservation_id`、deadline_executor 不释放、
+        reaper 矩阵只处理 `status=restoring` —— 三个"别人会管"都不成立,它就是永久泄漏。
+      · **一台没人记账的 VM**(围栏 vs finalize 竞态):launch 已成功、finalize 的 CAS
+        (`#s=restoring AND rid`)输给先到的围栏,CCF 分支只释放预留、不停 VM。
+
+    为什么这一步是**硬前提**而不是加固:`_reserve_slot_on` 的租户项条件是
+    `attribute_not_exists(restore_reservation_id)` —— 残留令牌不清,重入的新预留必然 CCF。
+
+    顺序照 #520 C2(**释放 slot 之前必须把 VM 停掉**):先 stop-vm 再释放。反过来的话,
+    释放让号可被复用,而那台竞态 VM 还活着 —— 下一个租户可能被排进同一个物理号(串号)。
+
+    stop-vm 的墙钟额度取 `exec_step_sec(suspend, "stop-vm")`(#626 实测对齐的 50s),
+    不写字面量。代价如实说明:重入路径的执行段最坏是 50s(清场)+ 120s(launch),超出
+    restore 档 120s 的名义执行段 —— 死线可能在中途到点、被再次判死回 failed。**收敛性
+    仍然成立**:清场是幂等的,已清掉的部分下次重入直接跳过,每次重试都有净进展。
+    """
+    rid = item.get("restore_reservation_id")
+    if not rid:
+        return None
+    rh = (item.get("restore_host_id") or "").strip()
+    rvn = item.get("restore_vm_num")
+    if not rh or rvn is None:
+        # 令牌与坐标由 `_reserve_slot_on` 的同一个事务写入,按构造同在。缺坐标 = 行被手改
+        # 过或出现了未知写者 —— fail-closed 不猜:停错 VM(串号方向)比多等一轮糟得多。
+        # 归因 system_error(已发布语义:出现即缺陷、报障)—— 这确实是缺陷,不是可自愈的
+        # 瞬时态,所以刻意用 502 而不是 503 的"等重投"口吻。
+        _mark_fail_reason(tenant_id, "restore", create_deadline.REASON_SYSTEM)
+        return utils._resp(
+            502,
+            {
+                "error": "stale restore reservation token exists but its coordinates "
+                "are missing; refusing to guess which VM to stop. Inspect the tenant "
+                "row (this state is unreachable by construction).",
+                "id": tenant_id,
+            },
+        )
+    host_row = clients.hosts_table.get_item(Key={"instance_id": rh}).get("Item")
+    if host_row is not None:
+        # host 还在 → 那台竞态 VM 可能还活着,必须**确认停掉**才能释放(#520 C2)。
+        # 与 launch 失败清理块同款自愈前缀;stop-vm.sh 本身幂等(VM 不在即 no-op)。
+        _heal = ssm_dispatch.host_script_self_heal(
+            ("stop-vm.sh",),
+            "oc:restore",
+            freshness=("stop-vm.sh", "OC_STOP_GUEST_FLUSH_REQUIRED"),
+        )
+        _stopped = ssm_dispatch._ssm_run(
+            rh,
+            f"{_heal} && /home/ubuntu/stop-vm.sh {tenant_id} {rvn}",
+            timeout=create_deadline.exec_step_sec(
+                create_deadline.ACTION_SUSPEND, "stop-vm"
+            ),
+        )
+        if not _stopped:
+            # 与 launch 失败路径同一归因(host_unreachable):SSM 到不了或脚本失败。
+            # 503 保持 restoring 让消息重投 —— 本函数幂等,重投时从头再试。
+            _mark_fail_reason(
+                tenant_id, "restore", create_deadline.REASON_HOST_UNREACHABLE
+            )
+            return utils._resp(
+                503,
+                {
+                    "error": "could not confirm the stale restore target VM is "
+                    "stopped; kept restoring (with the old reservation) for "
+                    "re-drive — releasing before stopping could reassign the "
+                    "physical slot under a live VM.",
+                    "id": tenant_id,
+                },
+            )
+    # host 行已不存在 → 实例已 terminate,VM 不可能活着,直接释放。
+    # (释放事务里 host 项的下溢守卫对不存在的行条件不成立 → 分类器判 ALREADY,安全幂等。)
+    _rel = _release_restore_reservation(
+        tenant_id, rh, rid, int(item.get("vcpu", 0)), int(item.get("mem_mb", 0)), rvn
+    )
+    if _rel == _REL_RETRY:
+        # 瞬时失败,令牌可能仍在 → 绝不往下走预留(一租户行只记得住一枚令牌)。归因取
+        # capacity,与 `_restore_reserve_slot` 撞号循环里同形态的 RETRY 出口同一口径
+        # (「这一轮没能拿到可用槽位」);host_unreachable 不对(这是 DDB 侧的瞬时失败)。
+        _mark_fail_reason(tenant_id, "restore", create_deadline.REASON_CAPACITY)
+        return utils._resp(
+            503,
+            {
+                "error": "releasing the stale restore reservation hit a transient "
+                "failure; kept restoring (token retained) for re-drive — releasing "
+                "again is idempotent.",
+                "id": tenant_id,
+            },
+        )
+    return None
+
+
 def _restore_reserve_slot(vcpu, mem_mb, tenant_id):
     """#422 — restore 冷恢复重取 host slot(全新 launch,与 create 同款:找 host → 认领
     vm_num → 物理 tap 撞号复检)。冷恢复的 tap 绑新 vm_num(launch-vm.sh:661
@@ -5244,12 +5340,39 @@ def _tenant_restore(tenant_id, item):
 
     fail-closed:launch(带 RESTORE_KEY)失败 → 回滚 restoring→suspended、释放刚取的 slot、
     不删 S3 备份、502。只有 launch 成功才翻 running。restore_backup_key 从 suspend 时写入的
-    租户记录读(_tenant_suspend 落库)。"""
-    if item.get("status") != "suspended":
+    租户记录读(_tenant_suspend 落库)。
+
+    #659 —— `failed` 是**受控**合法入口,仅限「从休眠链路掉进 failed」的行。
+    此前 failed 是吸收态:死线围栏把超死线的 restore 判成 `status=failed`(排队超时时打中的
+    甚至是健康的 `suspended`,围栏常规档没有状态白名单),而本函数只认 suspended → 再 restore
+    永远 409;suspend 只认 running/stopped;start/restart 撞 #624 墓碑门;rebuild 走
+    `_launch_vm_wake_cmd` 不带 RESTORE_KEY = 起空盘。数据在 S3(围栏只 SET 不 REMOVE,
+    `restore_backup_key` 还在行上)但常规 API 永远取不回。放行后客户重发一次 restore 即自愈,
+    与契约里 `deadline_exceeded_in_flight` 的「可重试报障」语义对齐。
+
+    **守卫 `suspended_at`,一个都不能少**:它区分「failed 但没有 VM」(可以重入)与
+    「failed 但 VM 可能还活着」(重入 = 起第二份 = 同租户双活)。逐条论证:
+      · restore 链路掉进 failed 的行必带它 —— suspend 收尾写入,只有 restore finalize 与
+        reaper promote(同一 REMOVE 清单)会清,围栏不清;
+      · suspend 中途被判死(VM 活着)的行**没有**它 —— 那次 suspend 没走到 finalize;
+      · create 失败的 failed 没有它,且下面 `backup_missing` 那道门双保险。"""
+    _entry = item.get("status")
+    _restorable = _entry == "suspended" or (
+        _entry == "failed" and item.get("suspended_at")
+    )
+    if not _restorable:
+        _hint = (
+            # failed 而无 suspended_at:要么从没休眠成功过(create/suspend 链路的失败,VM 或
+            # 其残骸可能还在 host 上),要么行被手改过。指向 rebuild 是 #624 的既有口径。
+            " To recover a failed tenant that was never suspended, rebuild it."
+            if _entry == "failed"
+            else ""
+        )
         return utils._resp(
             409,
             {
-                "error": f"can only restore a suspended tenant (current: {item.get('status')})",
+                "error": "can only restore a suspended tenant (or a failed one that "
+                f"was suspended before); current: {_entry}.{_hint}",
                 "id": tenant_id,
             },
         )
@@ -5265,8 +5388,12 @@ def _tenant_restore(tenant_id, item):
             },
         )
 
-    # 并发闸:CAS suspended → restoring,单赢家(与并发 restore/delete 互斥)。
-    if not _cas_status(tenant_id, "suspended", "restoring", stash_prev=True):
+    # 并发闸:CAS <入口态> → restoring,单赢家(与并发 restore/delete 互斥)。
+    # #659 —— from 用**实际读到的入口态**(suspended 或 failed),不写死 "suspended":
+    # failed 重入走同一道闸,两个并发重入同样只有一个赢家。失败回滚(T3/T4 与 launch 失败
+    # 路径)仍是既有字面量 "suspended" —— 那正是要的:重入一旦走到回滚,failed 就被洗回
+    # suspended,下次重试连本档守卫都不再需要。
+    if not _cas_status(tenant_id, _entry, "restoring", stash_prev=True):
         cur = (
             clients.tenants_table.get_item(Key={"id": tenant_id}, ConsistentRead=True).get("Item")
             or {}
@@ -5286,6 +5413,15 @@ def _tenant_restore(tenant_id, item):
         return utils._resp(
             409, {"error": f"tenant is {cur_s}; restore lost the race", "id": tenant_id}
         )
+
+    # #659 —— failed 重入的前置清场(**硬前提,不是加固**):上一次被围栏判死的 restore 可能
+    # 留下仍占账本的令牌与一台没人记账的 VM。不清则下面 `_reserve_slot_on` 的租户项条件
+    # `attribute_not_exists(restore_reservation_id)` 必然 CCF,重入压根走不通。
+    # 位置在 CAS 赢之后:此刻本次操作独占 restoring,清场与旧的迟到释放者(带旧 rid)互斥于
+    # 令牌锚,幂等。返回非 None = 清不动,保持 restoring 原样返回(重投时幂等重跑)。
+    _stale = _reclaim_stale_restore_reservation(tenant_id, item)
+    if _stale is not None:
+        return _stale
 
     vcpu = int(item.get("vcpu", 0))
     mem_mb = int(item.get("mem_mb", 0))

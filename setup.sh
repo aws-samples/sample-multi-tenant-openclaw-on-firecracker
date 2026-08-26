@@ -1012,11 +1012,74 @@ fi
 
 # 写 CloudFront 域到 SSM,供 init-host.sh 运行时拉(解 CloudFront 晚于 LaunchTemplate 的
 # CDK 循环依赖)。租户 gateway allowedOrigins 用它,不硬编码旧账号域。
+_CONTROL_UI_EXTRA_ORIGINS=$(python3 - <<'PY' 2>/dev/null || echo "__OC_EXTRA_ORIGINS_UNAVAILABLE__"
+import pathlib
+
+try:
+    import yaml
+
+    config = yaml.safe_load(pathlib.Path("config.yml").read_text()) or {}
+    values = (config.get("control_ui", {}) or {}).get("extra_allowed_origins", [])
+    if values is None:
+        values = []
+    if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+        print("__OC_EXTRA_ORIGINS_UNAVAILABLE__")
+    else:
+        print(",".join(values))
+except Exception:
+    print("__OC_EXTRA_ORIGINS_UNAVAILABLE__")
+PY
+)
+if [ "${_CONTROL_UI_EXTRA_ORIGINS}" = "__OC_EXTRA_ORIGINS_UNAVAILABLE__" ]; then
+  _CONTROL_UI_EXTRA_ORIGINS=""
+fi
+
+_CF_ALLOWED_VALUES=()
+_CF_HAS_WILDCARD=0
+_cf_add_allowed_origin() {
+  local _candidate="$1" _seen
+  _candidate="${_candidate#"${_candidate%%[![:space:]]*}"}"
+  _candidate="${_candidate%"${_candidate##*[![:space:]]}"}"
+  [ -n "${_candidate}" ] || return 0
+  for _seen in "${_CF_ALLOWED_VALUES[@]+"${_CF_ALLOWED_VALUES[@]}"}"; do
+    [ "${_seen}" = "${_candidate}" ] && return 0
+  done
+  _CF_ALLOWED_VALUES+=("${_candidate}")
+  # 必须写成 if 且以 return 0 收尾:setup.sh 跑在 set -euo pipefail 下,若末尾是
+  # `[ x = "*" ] && _CF_HAS_WILDCARD=1`,非通配符时整个 && 列表返回 1 → 函数返回 1 →
+  # 调用点被 set -e 打断,部署会在第一个正常 origin 上直接死掉。
+  if [ "${_candidate}" = "*" ]; then
+    _CF_HAS_WILDCARD=1
+  fi
+  return 0
+}
+_cf_add_allowed_origin "${DASHBOARD_BASE:-}"
+_cf_add_allowed_origin "${CONSOLE_BASE:-}"
+if [ -n "${_CONTROL_UI_EXTRA_ORIGINS}" ]; then
+  IFS=',' read -r -a _CF_EXTRA_VALUES <<< "${_CONTROL_UI_EXTRA_ORIGINS}"
+  for _cf_extra in "${_CF_EXTRA_VALUES[@]+"${_CF_EXTRA_VALUES[@]}"}"; do
+    _cf_add_allowed_origin "${_cf_extra}"
+  done
+fi
+_CF_ALLOWED_ORIGINS=""
+if [ "${#_CF_ALLOWED_VALUES[@]}" -gt 0 ]; then
+  _CF_ALLOWED_ORIGINS="$(IFS=,; printf '%s' "${_CF_ALLOWED_VALUES[*]}")"
+fi
+
 CF_ORIGIN_VAL="${DASHBOARD_BASE:-${CONSOLE_BASE:-}}"
 if [ -n "$CF_ORIGIN_VAL" ]; then
+  # 旧版 init-host.sh 只读 legacy 参数；必须继续写同一个单值,不能改成多值。
   aws ssm put-parameter --name /openclaw/cloudfront-origin --type String \
     --value "$CF_ORIGIN_VAL" --overwrite "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" >/dev/null 2>&1
   echo "✓ SSM /openclaw/cloudfront-origin = ${CF_ORIGIN_VAL}"
+fi
+if [ -n "${_CF_ALLOWED_ORIGINS}" ]; then
+  if [ "${_CF_HAS_WILDCARD}" -eq 1 ]; then
+    echo "⚠  /openclaw/control-ui-allowed-origins contains '*': Origin checking will be effectively disabled for every tenant in this deployment." >&2
+  fi
+  aws ssm put-parameter --name /openclaw/control-ui-allowed-origins --type String \
+    --value "${_CF_ALLOWED_ORIGINS}" --overwrite "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --region "$REGION" >/dev/null 2>&1
+  echo "✓ SSM /openclaw/control-ui-allowed-origins = ${_CF_ALLOWED_ORIGINS}"
 fi
 
 # WI-002 — publish the channel machine-user app client id to SSM so the metal

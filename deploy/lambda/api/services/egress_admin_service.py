@@ -49,10 +49,6 @@ _DATASTORE_REDLINE_PORTS = frozenset(
     {3306, 5432, 9200, 9300, 11211, 27017}
 )
 _EXTRA_ALLOW_REDLINE_PORTS = _INTERNAL_REDLINE_PORTS | _DATASTORE_REDLINE_PORTS
-_SPIRE_SERVER_SSM_PARAMETER = os.environ.get(
-    "SPIRE_SERVER_SSM_PARAMETER",
-    "/openclaw/spire-kit/spire-server-address",
-)
 
 
 def _is_dispatchable_host_id(instance_id):
@@ -78,35 +74,6 @@ def _summarize_rules_sha256(values):
     if len(reported) > 1:
         return None, "hosts disagree"
     return next(iter(reported)), "reported hosts agree"
-
-
-def _resolve_spire_server_ip():
-    """从控制面 config/SSM 解析 SPIRE server IPv4;不可判定时返回 None。"""
-    import ipaddress as _ip
-    import socket as _socket
-
-    raw = (
-        os.environ.get("SPIRE_SERVER_IP", "").strip()
-        or os.environ.get("SPIRE_SERVER_ADDRESS", "").strip()
-    )
-    if not raw:
-        try:
-            raw = str(
-                clients.ssm.get_parameter(Name=_SPIRE_SERVER_SSM_PARAMETER)
-                ["Parameter"]["Value"]
-            ).strip()
-        except Exception:  # noqa: BLE001 — 8081 admission 必须 fail-closed
-            return None
-    if not raw:
-        return None
-    try:
-        address = _ip.ip_address(raw)
-    except ValueError:
-        try:
-            address = _ip.ip_address(_socket.gethostbyname(raw))
-        except (OSError, ValueError):
-            return None
-    return str(address) if address.version == 4 else None
 
 
 # 绝对下限:env 只能把作用域【收紧】,不能放宽到比 /24 更宽。
@@ -177,14 +144,12 @@ def _build_extra_allow(allow):
         return "", None
     if not isinstance(allow, list):
         return "", "allow must be a list of {proto,dport,dst}"
-    # 作用域参数与环境网段解析一次即可,放在循环里会让多条 allow 重复解析;
-    # SPIRE server 解析只在真的出现 8081 时做,并缓存,避免每条 allow 各打一次 SSM。
+    # 作用域参数与环境网段解析一次即可,放在循环里会让多条 allow 重复解析。
     try:
         min_prefix = _extra_allow_min_prefix()
         redline_networks = _extra_allow_redline_networks()
     except ValueError as error:
         return "", str(error)
-    spire_server = None
     toks = []
     for i, e in enumerate(allow):
         if not isinstance(e, dict):
@@ -214,19 +179,6 @@ def _build_extra_allow(allow):
             return "", f"allow[{i}] must not open IMDS ({_IMDS})"
         if dport in _EXTRA_ALLOW_REDLINE_PORTS:
             return "", f"allow[{i}].dport {dport} is an egress red-line port"
-        if dport == 8081:
-            if spire_server is None:
-                spire_server_ip = _resolve_spire_server_ip()
-                if spire_server_ip is None:
-                    return "", (
-                        f"allow[{i}].dport 8081 denied: SPIRE server IP is unavailable"
-                    )
-                spire_server = _ip.ip_network(f"{spire_server_ip}/32")
-            if net != spire_server:
-                return "", (
-                    f"allow[{i}].dport 8081 is limited to SPIRE server "
-                    f"{spire_server}"
-                )
         if net.prefixlen < min_prefix:
             return "", (
                 f"allow[{i}].dst prefix /{net.prefixlen} is broader than "

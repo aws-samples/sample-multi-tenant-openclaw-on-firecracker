@@ -774,6 +774,15 @@ cloudfront:
   custom_domain: ""                # 例: claw.aws.xin，留空则使用默认 *.cloudfront.net
   acm_cert_arn: ""                 # us-east-1 ACM 证书 ARN (CloudFront 必须 us-east-1)
 
+# ========== Tenant control UI Origin 白名单 (可选) ==========
+# 额外允许访问 tenant control UI 的 Origin 列表；本部署自己的 dashboard/console URL
+# 会自动加入,不需要在这里重复。最终值发布到 /openclaw/control-ui-allowed-origins,
+# 并在每个 tenant 的每次启动时成为完整 allowed set(whole-array replacement,不是 append)。
+# 在这里放 `*` 会 fleet-wide 关闭 Origin checking。
+# control_ui:
+#   extra_allowed_origins:
+#     - "https://operator.invalid"
+
 # ========== Lifecycle Notifications (可选, SNS) ==========
 # 启用后, API Lambda 在 tenant 创建/删除/启停等事件时 publish 到 SNS topic
 # 操作员可订阅该 topic (Email, SQS, Lambda, HTTPS) 实现实时通知

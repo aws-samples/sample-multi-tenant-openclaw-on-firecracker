@@ -5133,8 +5133,8 @@ paths:
                         maximum: 65535
                         description: |-
                           必须是 JSON 整数。字符串 `"443"` 与布尔值都 400(#631 修复后)。
-                          红线端口(平台内部/数据存储端口)一律拒;8081 只允许精确等于 SPIRE
-                          server 的 /32。
+                          红线端口(平台内部/数据存储端口)一律拒;8081 与其它非红线端口同
+                          路,不再要求精确等于某个 SPIRE server /32(#660)。
                       dst:
                         type: string
                         description: |-
@@ -5190,8 +5190,8 @@ paths:
             `mode` 缺失/非字符串/枚举外;`pinned` 提供但非布尔;`targets` 不是 `"all"` 也
             不是非空字符串数组(裸字符串 / dict / null / [] / 含空串的数组);
             `pinned=true` 与 `targets="all"` 并用;`allow` 非数组或某项非对象;
-            `allow[i].proto` 非 tcp|udp;`allow[i].dport` 非整数或越界或命中红线端口或
-            8081 非 SPIRE /32;`allow[i].dst` 缺失 / 非 IP-CIDR / 非 IPv4 / 覆盖 IMDS /
+            `allow[i].proto` 非 tcp|udp;`allow[i].dport` 非整数或越界或命中红线端口
+            (8081 不在红线内,#660 起走通用护栏);`allow[i].dst` 缺失 / 非 IP-CIDR / 非 IPv4 / 覆盖 IMDS /
             前缀过宽 / 等于或包含 VPC_CIDR 与 TENANT_SUPERNET;`revision_name` 超 48 字符 /
             含非 `[A-Za-z0-9._-]` 字符 / 以 `__` 开头。`revision_name` 空串**不是** 400 ——
             它与省略同义,走自动取名(`egress_admin_service.py:779`)。

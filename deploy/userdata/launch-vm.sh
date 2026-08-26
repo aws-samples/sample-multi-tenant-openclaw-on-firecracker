@@ -498,6 +498,7 @@ _oc_pre_rebuild_probe() (
     return 1
   fi
   _pr_baseurl="$(oc_normalize_litellm_baseurl "${LITELLM_HOST:-}")"
+  # 探针的 origin-policy.json 只是 staging 产物,会随 staging 目录刻意丢弃；它只做兼容性检查,不收敛 live tenant,绝不复制到数据盘。
   if ! oc_assemble_config \
       "${_pr_current}" "${_pr_template}" "${_pr_stage}/openclaw.json" \
       "${_pr_plan}" "$(cat "${_pr_creds}")" "${_pr_scheme}" "${_pr_owner}" \
@@ -1586,6 +1587,23 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
     chmod 600 "${_RA_OUTPUT}"
     sudo chown 1000:1000 "${_RA_OUTPUT}"
     mv -f "${_RA_OUTPUT}" "${OC_JSON}"
+    _RA_OUTPUT_DIR="$(dirname -- "${_RA_OUTPUT}")"
+    _RA_OC_DIR="$(dirname -- "${OC_JSON}")"
+    _RA_MARKER_SRC="${_RA_OUTPUT_DIR}/origin-policy.json"
+    _RA_MARKER_DST="${_RA_OC_DIR}/origin-policy.json"
+    # oc_assemble_config 把 marker 写在其收敛文件旁；本路径收敛的是 scratch 文件,故 commit 必须把它带到数据盘,否则下方 rm -rf 会静默丢掉 degraded origin 的唯一记录。
+    # marker 只含 Origin 字符串与启动时分类、无凭据,故用 0644 让 operator / guest 检查可读。
+    if [ "${_RA_OUTPUT_DIR}" != "${_RA_OC_DIR}" ]; then
+      if [ ! -f "${_RA_MARKER_SRC}" ]; then
+        log "WARN(#642): origin policy marker absent at ${_RA_MARKER_SRC}; continuing without marker relocation"
+      elif chmod 0644 "${_RA_MARKER_SRC}" 2>/dev/null \
+        && sudo chown 1000:1000 "${_RA_MARKER_SRC}" 2>/dev/null \
+        && mv -f "${_RA_MARKER_SRC}" "${_RA_MARKER_DST}"; then
+        :
+      else
+        log "WARN(#642): origin policy marker relocation failed ${_RA_MARKER_SRC} -> ${_RA_MARKER_DST}; continuing"
+      fi
+    fi
     # Keep the normal wake convergence from selecting the shared key later.
     [ -z "${_RA_VKEY}" ] || LITELLM_VKEY="${_RA_VKEY}"
     _OC_REAPPLY_ASSEMBLED=1
@@ -1593,6 +1611,7 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
     log "config template '${_RA_TEMPLATE}' re-applied (registry=$(printf '%s' "${_RA_BINDING}" | jq -r '.registry_version'))"
     unset _RA_BINDING _RA_TEMPLATE _RA_VERSION_ID _RA_SHA _RA_DIR _RA_BODY
     unset _RA_OUTPUT _RA_TPL_MNT _RA_TOKEN _RA_VKEY _RA_CREDS _RA_BASEURL
+    unset _RA_OUTPUT_DIR _RA_OC_DIR _RA_MARKER_SRC _RA_MARKER_DST
   fi
   # OC_REAPPLY_COMMIT_END
 
@@ -1701,11 +1720,12 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
 
   # ─────────────────────────────────────────────────────────────────────
   #   • dangerouslyDisableDeviceAuth 无条件 del(secure default)
-  #   • allowedOrigins → 当前 CloudFront origin(SSM 拉最新)
+  #   • allowedOrigins → 当前 fleet origin 列表(SSM 拉最新,可为逗号分隔多值)
   #   • baseUrl → 当前 LiteLLM host(堡垒机重建 IP 会变)
   #   • chatCompletions 三态(1/0/空)
   #   • apiKey 仅在显式非空时改写(唤醒空参绝不覆盖数据盘上的 per-tenant vkey)
   # 老版本把这块塞在 NEW_DATA-only 分支里,唤醒路径完全跳过 → 唤醒即漂移。
+  # origin 空值仍保留盘上值,但会写可查询 degraded marker,不再静默跳过。
   # 详细语义见 lib/harden-config.sh 的 oc_harden_config 注释。
   # ─────────────────────────────────────────────────────────────────────
   CF_ORIGIN="${CLOUDFRONT_ORIGIN:-}"
@@ -1774,7 +1794,7 @@ if [ -f "${OC_JSON}" ] && command -v jq &>/dev/null; then
       fi
     fi
     # 日志一行看清幂等段执行了什么(帮排查唤醒漂移)
-    _log_origin="${CF_ORIGIN:-<unset,skipped>}"
+    _log_origin="${CF_ORIGIN:-<unset,degraded-marker-written>}"
     _log_url="${LITELLM_BASEURL:-<unset,skipped>}"
     _log_chat="${CHAT_EP_ENABLED:-<unset,no-op>}"
     _log_key=""

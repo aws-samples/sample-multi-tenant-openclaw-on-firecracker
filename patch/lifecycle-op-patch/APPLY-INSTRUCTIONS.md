@@ -578,6 +578,16 @@ else aws s3 rm "s3://$ASSETS_BUCKET/$KEY" --region "$REGION"; fi
 
 ## Step 5 — 未来机器的源与启动模板
 
+本 kit 的启动模板变更**止于 `promote`**:它只把 ASG 指向新的启动模板版本,**不做机队换机**。
+host 的 ASG 终止钩子只有 120s,一次把整组机器换掉会硬杀在役 microVM,直接影响租户;而且这种
+按启动模板变更全量替换的爆炸半径是整个机队。在役机器的修复走前面几个 Step 的热修路径,不靠换机。
+
+`lib/apply-lt.sh verify` 在第一台自然新增的 host 出现之前**必然 FAIL**,这是**预期**,不是缺陷。
+等第一台自然新增的 host 起来之后再跑它,它会写出 verified 回执。连带后果是:下一个 kit 在
+`OC_REQUIRE_VERIFIED_PULL=1` 下跑 `pull` 会 fail-closed,因为当前还没有 verified 回执。解开办法是
+等第一台自然新增的 host 出现后补跑 `lib/apply-lt.sh verify`;在那之前若必须继续,由操作者显式承担
+风险,不设默认绕过。**本 kit 不给任何换机配方。**
+
 先把 `host-scripts/` 推到 `deployment/scripts/`(临时键 → 校验 → 提升;留旧 version id 备回滚)。
 `init-host.sh` 是**烤进启动模板**的,单独处理:
 
@@ -594,25 +604,26 @@ sha256sum "$HOME/.oc-apply-lt/$ASG.init-host.sh" | cut -c1-64 > lt-edit-done.txt
 # 确认无误后再继续:
 lib/apply-lt.sh push "$ASG" "$REGION"
 lib/apply-lt.sh promote "$ASG" "$REGION"
-lib/apply-lt.sh refresh "$ASG" "$REGION"
 lib/apply-lt.sh verify "$ASG" "$REGION"
 ```
 
 **`pull` 与 `push` 之间必须停下来人工改**,而且这个闸落在 `lt-edit-done.txt` 里存的**编辑后摘要**上:
 重跑 `apply_cli` 时摘要相符就跳过 `pull`(可恢复续跑),不符或缺失就只做 `pull` 并以退出码 10 停下 ——
 **这样重跑绝不会用 `pull` 覆盖掉已经做好的人工编辑**。
-**不要把闸写成 shell 注释** —— `#` 之后的内容会被整条吃掉,`push`/`promote`/`refresh` 一条都不会跑。
+**不要把闸写成 shell 注释** —— `#` 之后的内容会被整条吃掉,`push`/`promote` 两条都不会跑。
 `push` 只读 `push` 只读
 `$HOME/.oc-apply-lt/$ASG.init-host.sh`,不读任何别的临时文件。对照
 `launch-template/init-host.sh.patched` 与已渲染那份的差异,**只改本次变更的那几段**,
 不要整文件替换(整替会把 CDK 已替换好的约 31 个值换回占位符)。
-`promote` 之后还要 **`refresh`** 才会滚在役机队,`verify` 是最后的读回确认。
-**`pull` 会覆盖唯一的回滚锚点** —— 在 `refresh` 成功且 `verify` 通过之前不要重复 `pull`。
+`promote` 是本步的**终态** —— 它只把 ASG 指向新的启动模板版本,**不动在役机器**;在役机器的修复
+由前面几个 Step 的热修路径负责,本 kit **不换机**。`verify` 是读回确认。
+**`pull` 会覆盖唯一的回滚锚点** —— 在 `promote` 成功且 `verify` 通过之前不要重复 `pull`。
 
 上面那条 `grep -c` **必须为 0**。`init-host.sh` 是 `ha_edge.py` 在 synth 时读入、替换约 31 个占位符后
 烤进 UserData 的,所以**必须在【已渲染】的那份上改,不能拿仓库里的模板直接烤** —— 直接烤会让新
-host 带着字面 `{{...}}` 起不来。新的启动模板版本**不会**自动更新在役 ASG(它钉的是具体版本),要按 `apply-lt.sh` 的受控
-instance-refresh 路径滚。验证只起**一台**新 host,盯三个信号:解码后的 UserData 没有 `{{`、
+host 带着字面 `{{...}}` 起不来。新的启动模板版本**不会**自动更新在役 ASG(它钉的是具体版本),
+而且本 kit **不去滚在役机队** —— 新版本只对之后**自然新增**的 host 生效(扩容、健康检查替换、
+AZ 重平衡)。那三个信号留给**第一台自然新增的 host**去读:解码后的 UserData 没有 `{{`、
 它注册进 hosts 表、ASG 生命周期是 CONTINUE 而不是 Heartbeat-Timeout。
 
 ## Step 6 — 逐个 fix 的可证伪验证

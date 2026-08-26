@@ -1823,6 +1823,21 @@ def build_ha_edge(self, ctx):
             ],
         )
         assets_bucket.grant_read(_edge_role)
+        # #625:install-edge.sh 把 Redis reader endpoint 的采用形态发成自定义指标
+        # (OpenClaw/Edge 的 RedisReaderEndpointFallback)。少了这条授权,SSM 读失败后
+        # 静默回落 primary 就只剩安装日志里一行 WARN,而那行不进任何采集通道,
+        # "部分箱子读 reader、部分回落 primary"的半收敛机队在机器外没有信号。
+        # PutMetricData 不支持资源级授权(必须 "*"),用 cloudwatch:namespace 条件把它
+        # 收窄到本 namespace,拿不到往别的 namespace 写数的能力。
+        _edge_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["cloudwatch:PutMetricData"],
+                resources=["*"],
+                conditions={
+                    "StringEquals": {"cloudwatch:namespace": "OpenClaw/Edge"},
+                },
+            )
+        )
         if _edge_user_hook is not None:
             _edge_role.add_to_policy(
                 iam.PolicyStatement(

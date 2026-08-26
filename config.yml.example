@@ -450,17 +450,27 @@ scaler:
   add_gsi_tenant_user: false
   # Scale query indexes are cumulative rollout gates. Enable and deploy exactly
   # one new gate at a time because DynamoDB permits one GSI create per update.
+  # 这四个键描述的是「这张表上应当存在什么查询 GSI」的期望态,不是「本次 deploy
+  # 要新建什么」。若在役表已存在这些 GSI(例如为解除验收阻塞,曾用
+  # `aws dynamodb update-table` 逐个手工创建),对应键必须同步改成 true。
+  # 否则 scripts/deploy-cdk.sh 的预检会把 false/缺键读成「要删除这些索引」,以退出码 1
+  # fail-closed 中止;真机索引不会被删,但 `cdk deploy` 一次都不会执行,整栈 deploy 被拦。
+  # #627 实撞:2026-08-25 us-west-2 的 openclaw-tenants 四个查询 GSI 全 ACTIVE,
+  # config 却缺这四个键,预检报 `config would remove existing tenant-query GSIs: ...`。
   # Before every deploy run:
   # uv run --with boto3 --with pyyaml python
   #   scripts/checks/tenant-query-rollout.py --region <region>
   add_gsi_tenant_host: false
   add_gsi_tenant_status: false
+  # #627 —— add_gsi_tenant_rootfs 改成 true 时,必须同时把下面的
+  # tenant_query.rootfs_backfill_complete 设成 true(前提是 backfill 真的做完了),
+  # 否则预检换成另一条报错继续 fail-closed。预检报错本身会点出这五个键。
   add_gsi_tenant_rootfs: false
 
 tenant_query:
   # Enable only after all four tenant query GSIs report ACTIVE.
   enabled: false
-  # Set only after tenant_rootfs_query_backfill.py --dry-run and apply complete.
+  # Set only after scripts/tenant-rootfs-query-backfill.py --dry-run and apply complete.
   rootfs_backfill_complete: false
 
 tenant_stats:
@@ -558,7 +568,21 @@ health_check:
 # ========== API Gateway 限流 (usage plan throttle) ==========
 # api-key 维度的限流(operator 批量操作走它;自助用户走 Cognito 不走此 plan)。
 # 旧默认 rate10/burst20 是规模化硬天花板:300 并发 POST /tenants 实测 173/300 撞 429。
-# 上线峰值(每秒千级 lifecycle)须清过此值。per-IP 防护是下面 WAF 的 rate rule,与此正交。
+# 上线峰值(每秒千级 lifecycle)须清过此值。API Gateway 与 WAF 两层限流并不正交:
+# 单客户端真实上限=min(api.throttle_rate_limit,
+# waf.rate_limit_per_ip / waf.evaluation_window_sec)。
+#
+# | 键 | 值 | 折算 |
+# | --- | --- | --- |
+# | `api.throttle_rate_limit` | 500 | 500 req/s 稳态 |
+# | `api.throttle_burst_limit` | 1000 | 1000 瞬时 |
+# | `waf.rate_limit_per_ip` / `waf.evaluation_window_sec` | 1000 / 300 | **3.33 req/s(单来源 IP)** |
+#
+# 批量供给要么分散来源 IP、要么调高 rate_limit_per_ip。控制面的调用方(operator 脚本、
+# 批量供给作业、CI)通常是一台机器一个 IP;默认值下要做到「每秒千级 lifecycle」,
+# 至少需要 300 个不同来源 IP。
+# POST /batch/tenants 的 _BATCH_VALID_ACTIONS={"stop","start","delete","backup"},
+# 没有 create;批量供给摊不掉请求数,N 个租户就是 N 个请求,会正面撞这条 per-IP 限流。
 api:
   throttle_rate_limit: 500          # 稳态 req/s(account 级 steady-state)
   throttle_burst_limit: 1000        # 瞬时 burst 上限(令牌桶容量)
@@ -602,7 +626,10 @@ api:
 # ========== AWS WAF (可选, 关联到 API Gateway) ==========
 waf:
   enabled: false                   # 启用后保护 API Gateway 免受常见攻击
-  rate_limit_per_ip: 1000          # 每 IP 5 分钟内的请求数上限 (超过则 block)
+  rate_limit_per_ip: 1000          # 每来源 IP 在 evaluation window 内的请求数上限
+  evaluation_window_sec: 300       # 仅允许 60/120/300/600;默认 300;是折算 req/s 的分母
+  logging_enabled: true            # WAF 开启时默认记 BLOCK 日志(会产生 CloudWatch Logs 费用)
+  log_group_name: "aws-waf-logs-openclaw-api"  # AWS 硬规则:必须以 aws-waf-logs- 开头
   managed_rules:                   # AWS 托管规则集 (下面这些之外, stack.py 总会再
     - AWSManagedRulesCommonRuleSet # 自动加 SQLiRuleSet + AmazonIpReputationList
     - AWSManagedRulesKnownBadInputsRuleSet  # 作为不可被裁掉的安全底线)
@@ -746,6 +773,15 @@ cloudfront:
   # ----- 单域名模式（legacy 兼容） -----
   custom_domain: ""                # 例: claw.aws.xin，留空则使用默认 *.cloudfront.net
   acm_cert_arn: ""                 # us-east-1 ACM 证书 ARN (CloudFront 必须 us-east-1)
+
+# ========== Tenant control UI Origin 白名单 (可选) ==========
+# 额外允许访问 tenant control UI 的 Origin 列表；本部署自己的 dashboard/console URL
+# 会自动加入,不需要在这里重复。最终值发布到 /openclaw/control-ui-allowed-origins,
+# 并在每个 tenant 的每次启动时成为完整 allowed set(whole-array replacement,不是 append)。
+# 在这里放 `*` 会 fleet-wide 关闭 Origin checking。
+# control_ui:
+#   extra_allowed_origins:
+#     - "https://operator.invalid"
 
 # ========== Lifecycle Notifications (可选, SNS) ==========
 # 启用后, API Lambda 在 tenant 创建/删除/启停等事件时 publish 到 SNS topic

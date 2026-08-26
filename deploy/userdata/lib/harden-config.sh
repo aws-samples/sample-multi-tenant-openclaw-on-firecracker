@@ -24,7 +24,15 @@
 # 每次启动都跑的幂等收敛(挂盘窗口内):
 #   • 无条件 del(.gateway.controlUi.dangerouslyDisableDeviceAuth)——secure default,
 #     万一被谁塞回去也清掉,不假设"NEW_DATA 时清过就够"
-#   • allowedOrigins:origin 非空才写(不误清空数据盘上正确的 origins)
+#   • allowedOrigins:origin 非空才写(不误清空数据盘上正确的 origins)。origin 可为逗号分隔
+#     列表,由 jq 拆分、去首尾空白、丢空项并去重。注意这是【整数组替换】,不是追加 ——
+#     传进来的列表决定了该租户全部能连的 Origin。四种结局都出日志并写 origin-policy.json:
+#     收窄到具体值列表 / 收窄成含通配符的列表(= 校验实际关闭) /
+#     空值跳过且盘上缺失、空或含通配符(= degraded) /
+#     空值跳过且盘上是非空无通配符列表(= 正确保留)。
+#     空值仍不写 allowedOrigins,避免误清数据盘上的正确值；但不再沉默,可查询 marker 会记录
+#     source 是否存在、请求值、实际值与 degraded 状态。后三种在"没报错"这件事上和第一种
+#     完全一样,所以必须靠日志与 marker 区分,否则失配要等租户下次启动才发作,且现场归因不到这里。
 #   • chatCompletions 三态:
 #       "1"/"true"/"yes"/"on"    → enabled = true(per-tenant 开)
 #       "0"/"false"/"no"/"off"   → del(chatCompletions)(secure default)
@@ -47,13 +55,50 @@ oc_harden_config() {
   __hc_origin="$2"
   __hc_baseurl="$3"
   __hc_vkey="$4"
-  __hc_chat="$5"
+  __hc_chat="${5:-}"
   __hc_llm_timeout=55
 
   # 文件不存在或没 jq:跳过。openclaw.json 缺席时启动路径本就已经跑不到这里
   # (调用点先 [ -f OC_JSON ] 判过),这里保护性 return 只是给测试用。
   [ -f "${__hc_oc}" ] || return 0
   command -v jq >/dev/null 2>&1 || return 0
+
+  # 先用 jq 读取盘上 allowedOrigins 并解析 origin 列表。读取失败/非 JSON 时 fail-loud,
+  # 不能把不可读文件猜成"盘上无通配符";拆分也留在 jq 内,不让 shell 做任何 word splitting。
+  if ! __hc_origin_meta="$(jq -ce --arg origin "${__hc_origin}" '
+      if type != "object" then
+        error("openclaw config root must be an object")
+      else
+        ($origin
+         | split(",")
+         # 刻意用 \s 而不是等价的 POSIX 空白字符类:后者的字面量会在本文件里引入一对
+         # 相邻右方括号,被 tests/test_launch_vm_ipv6_and_wake.py 那条「本文件不许出现
+         # bash-only 双方括号测试」的守卫当成 bashism 报红(它按字面量扫,连注释也算,
+         # 所以这段注释里也不写那对字面量)。Oniguruma 下 \s 与该字符类对空白集合完全
+         # 等价,已用真 jq 实测同结果(含「不裁中间换行」这条)。
+         | map(gsub("^\\s+|\\s+$"; ""))
+         | map(select(length > 0))
+         # 不能用 unique:它会排序,破坏 producer 声明的首次出现顺序。
+         | reduce .[] as $o ([]; if (index($o)) then . else . + [$o] end)) as $requested
+        | (.gateway.controlUi.allowedOrigins? // null) as $disk_raw
+        | (if ($disk_raw | type) == "array" then $disk_raw else [] end) as $disk
+        | {
+            requested: $requested,
+            disk: $disk,
+            disk_restricted: (
+              ($disk | length) > 0
+              and (($disk | index("*")) == null)
+            )
+          }
+      end
+    ' "${__hc_oc}" 2>/dev/null)"; then
+    echo "[oc:harden] jq failed on ${__hc_oc} — leaving original untouched" >&2
+    return 1
+  fi
+  __hc_requested="$(printf '%s' "${__hc_origin_meta}" | jq -c '.requested')"
+  __hc_requested_count="$(printf '%s' "${__hc_origin_meta}" | jq -r '.requested | length')"
+  __hc_requested_wildcard="$(printf '%s' "${__hc_origin_meta}" | jq -r '.requested | index("*") != null')"
+  __hc_disk_restricted="$(printf '%s' "${__hc_origin_meta}" | jq -r '.disk_restricted')"
 
   # 分段拼 jq 程序——每段独立、幂等、只碰自己的键,不误动无关字段。
   # 起手 `.` 是 identity(拿到原 JSON 不变),后面每个 `|` 是纯变换。
@@ -64,8 +109,49 @@ oc_harden_config() {
   # 与 dangerouslyDisableDeviceAuth 同段(每次唤醒都收敛,不假设 NEW_DATA 时清过就够)。
   __hc_prog="${__hc_prog} | .gateway.controlUi.enabled = false"
 
-  if [ -n "${__hc_origin}" ]; then
-    __hc_prog="${__hc_prog} | .gateway.controlUi.allowedOrigins = [\$origin]"
+  # allowedOrigins 是【整数组替换】而不是追加:这是声明过的单写者收敛规则,传入列表
+  # 决定收敛后的完整集合。单值兼容等价于旧式 `.gateway.controlUi.allowedOrigins = [$origin]`。
+  # 四条分支都必须出日志。这一步失配的症状是 guest 内 gateway 回
+  # "Rejected: origin not allowed / exit=INVALID_REQUEST",而且要等租户【下次启动】才发作
+  # —— 现场只看得到"某个租户连不上",看不出是这里改的,更看不出这个值从哪来。
+  # 日志与 marker 是归因锚点:四种结局(收窄成功/收窄成通配符/空值保留不安全盘值/
+  # 空值保留安全盘值)在配置上截然不同,而在"没报错"这件事上完全一样。
+  if [ "${__hc_requested_count}" -gt 0 ] && [ "${__hc_requested_wildcard}" = "true" ]; then
+    # 通配符会让收窄"成功"但收窄到没有限制。这条必须与下面的成功分支分开报:
+    # 写成 narrowed 会被读成收窄生效,而实际是 Origin 校验被关掉了 —— 业务能通,
+    # 但那是不设防状态,不是配置正确。
+    __hc_state="wildcard"
+    __hc_degraded=true
+    __hc_source_present=true
+    __hc_prog="${__hc_prog} | .gateway.controlUi.allowedOrigins = \$origins"
+    echo "[oc:harden] WARN: allowedOrigins set to wildcard ['*'] —" \
+      "the Origin check is effectively DISABLED for this tenant; any origin may connect;" \
+      "requested origins=${__hc_requested}" >&2
+  elif [ "${__hc_requested_count}" -gt 0 ]; then
+    __hc_state="narrowed"
+    __hc_degraded=false
+    __hc_source_present=true
+    __hc_prog="${__hc_prog} | .gateway.controlUi.allowedOrigins = \$origins"
+    echo "[oc:harden] allowedOrigins narrowed to ${__hc_requested}" \
+      "— clients sending any other Origin will be rejected" >&2
+  else
+    # 刻意的 fail-safe(见上文注释):空值不写,不误清数据盘上已有的正确 origins。
+    # 但沉默的代价是租户可能停留在 config 模板默认值 ["*"],即 Origin 校验实际关闭。
+    __hc_source_present=false
+    if [ "${__hc_disk_restricted}" = "true" ]; then
+      __hc_state="absent_disk_preserved"
+      __hc_degraded=false
+      echo "[oc:harden] WARN: origin arg empty — skipping allowedOrigins narrowing;" \
+        "tenant keeps whatever is on disk (a template default of [\"*\"] means the" \
+        "Origin check is effectively OFF); state=absent_disk_preserved," \
+        "on-disk restriction preserved" >&2
+    else
+      __hc_state="absent_disk_wildcard"
+      __hc_degraded=true
+      echo "[oc:harden] WARN: origin arg empty — skipping allowedOrigins narrowing;" \
+        "tenant keeps whatever is on disk (a template default of [\"*\"] means the" \
+        "Origin check is effectively OFF); state=absent_disk_wildcard" >&2
+    fi
   fi
 
   case "${__hc_chat}" in
@@ -90,7 +176,7 @@ oc_harden_config() {
 
   __hc_tmp="${__hc_oc}.harden.$$"
   # jq 失败 / 输出空:不 clobber,报错返 1。绝不静默把好文件覆盖成空。
-  if ! jq --arg origin "${__hc_origin}" \
+  if ! jq --argjson origins "${__hc_requested}" \
           --arg baseurl "${__hc_baseurl}" \
           --arg vkey "${__hc_vkey}" \
           --argjson llm_timeout "${__hc_llm_timeout}" \
@@ -105,6 +191,50 @@ oc_harden_config() {
     return 1
   fi
   mv "${__hc_tmp}" "${__hc_oc}"
+
+  case "${__hc_oc}" in
+    */*) __hc_dir="${__hc_oc%/*}" ;;
+    *) __hc_dir="." ;;
+  esac
+  __hc_marker="${__hc_dir}/origin-policy.json"
+  __hc_marker_tmp="${__hc_marker}.tmp.$$"
+  # marker 是可观测性产物,故仅 best-effort:因报告文件写失败而阻断租户启动,
+  # 会把一个 reporting gap 换成真实 outage；openclaw.json 收敛结果仍是本函数返回码真相源。
+  if __hc_effective="$(jq -ce '
+        (.gateway.controlUi.allowedOrigins? // null) as $raw
+        | if ($raw | type) == "array" then $raw else [] end
+      ' "${__hc_oc}" 2>/dev/null)" \
+      && __hc_at="$(date -u +%FT%TZ 2>/dev/null)" \
+      && jq -n \
+        --arg state "${__hc_state}" \
+        --argjson degraded "${__hc_degraded}" \
+        --argjson source_param_present "${__hc_source_present}" \
+        --argjson requested_origins "${__hc_requested}" \
+        --argjson effective_origins "${__hc_effective}" \
+        --arg at "${__hc_at}" '
+          {
+            schema: 1,
+            state: $state,
+            degraded: $degraded,
+            origin_check_effective: (
+              ($effective_origins | length) > 0
+              and (($effective_origins | index("*")) == null)
+            ),
+            source_param_present: $source_param_present,
+            requested_origins: $requested_origins,
+            effective_origins: $effective_origins,
+            at: $at
+          }
+        ' > "${__hc_marker_tmp}" 2>/dev/null \
+      && [ -s "${__hc_marker_tmp}" ] \
+      && [ ! -d "${__hc_marker}" ] \
+      && mv "${__hc_marker_tmp}" "${__hc_marker}" 2>/dev/null; then
+    echo "[oc:harden] origin policy marker ${__hc_marker} state=${__hc_state}" >&2
+  else
+    rm -f "${__hc_marker_tmp}"
+    echo "[oc:harden] WARN: origin policy marker write failed at ${__hc_marker}" \
+      "state=${__hc_state}; openclaw.json convergence remains successful" >&2
+  fi
   return 0
 }
 

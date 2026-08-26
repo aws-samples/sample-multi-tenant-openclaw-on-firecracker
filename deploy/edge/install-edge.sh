@@ -81,28 +81,153 @@ REDIS_PORT="${ENGINE_REDIS_ENDPOINT##*:}"
 
 READER_HOST="$REDIS_HOST"
 READER_PORT="$REDIS_PORT"
-# AWS_REGION 在本脚本里是可选项(见下方 fluent-bit 段的 ${AWS_REGION:-...}),
-# 而脚本开头是 set -euo pipefail —— 裸写 "$AWS_REGION" 会在未设时直接 unbound
-# variable 退出,把 edge 拉不起来,正好是本段刻意要避免的失败。留空则 aws CLI
-# 自己报错、走下面的 WARN 回落。
-if ! READER_ENDPOINT="$(aws ssm get-parameter \
-    --name /openclaw/engine/redis/reader-endpoint \
-    --query 'Parameter.Value' \
-    --output text \
-    --region "${AWS_REGION:-}" 2>/dev/null)"; then
-    log "WARN: failed to read Redis reader endpoint from SSM; falling back to primary"
+
+# #625 —— reader endpoint 的采用形态必须离开这台机器。三种 SSM 失败(调用失败 /
+# 空值 / 缺 :port)此前都只往安装日志写一行 WARN 就回落 primary,而安装日志不进
+# 任何采集通道:edge 的 Fluent Bit 只采 journald 里 SYSLOG_IDENTIFIER=claw_edge
+# 的记录(那是 nginx access log),而且它在本段之后才装、配的又是 Read_From_Tail
+# On —— 本段写的任何东西它都读不到。结果是"部分箱子读 reader、部分箱子回落
+# primary"这种半收敛机队在机器外面没有任何信号:开关翻开后 primary 仍在承担一部
+# 分本该分流走的读,而容量判断照着"全机队已分流"走。
+#
+# 发一个 namespace 受限的自定义指标补上这个信号。发送失败只 WARN 不 die:缺可观测
+# 比 edge 拉不起来轻,而这一段刻意要避免的失败正是"把 edge 拉挂"。
+#
+# 已知坑(不靠不做来规避,写在这里):定向 promotion 只推代码不同步 IAM,所以走定向
+# promotion 部署本改动时必须手工把 EdgeRole 的 cloudwatch:PutMetricData 一起同步。
+# 少了它每台都只写 WARN、指标恒缺、告警按 notBreaching 恒不响 —— 外部表现与"没装
+# 这个改动"完全一致,只能靠读本行 WARN 区分。
+# 这个指标是"回落台数的下界",不是精确值,原因写在这里而不是靠沉默:三档回落里
+# 只有 empty / malformed 一定发得出去(网络是通的,只是 SSM 参数值不对);
+# ssm_error 那一档,如果根因是本机出不了网(NAT/VPC endpoint/SG),那么紧接着的
+# PutMetricData 会同源失败,这台的数据点就丢了。下面的有限重试只能兜住瞬时抖动
+# (DNS、限流),兜不住持续断网。所以告警只能作单向解读:响了一定有箱子回落;
+# 没响不等于全机队都分流了。持续断网那一档的检测归 #606(edge readiness 与
+# primary/控制面可达性解耦,目前无指标无告警),本 MR 不在这里假装解决。
+EDGE_METRIC_NAMESPACE="OpenClaw/Edge"
+EDGE_METRIC_PUT_ATTEMPTS=3
+EDGE_METRIC_PUT_BACKOFF_SEC=2
+
+# 单次 aws 调用的网络预算。CLI v2 的默认值是 connect 60s / read 60s(aws-cli
+# 2.34.30 的 `aws ... help` 原文),重试用 standard 模式、默认 3 次总尝试
+# (退避上限 20s,见 cli-configure-retries)。于是一次打到黑洞端点的调用
+# (缺 NAT / 缺 VPC endpoint / SG 拦出网,SYN 被丢而不是被拒)最坏能耗 ~180s;
+# 乘上下面 3 轮外层重试是 ~540s,远超 edge 的 health_check_grace_period=300s ——
+# "补一个观测信号"就变成"被 ASG 换机",故障形态换了但没修好。这里把单次调用钉在
+# ~10s 并关掉 CLI 自己的重试(改由下面两个外层有界重试接手)。
+#
+# AWS_MAX_ATTEMPTS=1 是【总尝试次数】而不是重试次数:官方原文
+# (cli-configure-retries「Max attempts」)是 "the initial call counts toward the
+# value that you provide",所以 1 = 打一次、零重试。关掉 CLI 的重试必须同时给
+# 两个调用各自补一层外层重试,否则一次 DNS 抖动或限流就把这台机器永久钉在
+# primary —— 那正是本次要修的失效形态,只是换了触发源。
+# AWS_MAX_ATTEMPTS 只作命令级前缀,不 export:第 8 段的 fluent-bit 安装要从 S3
+# 拉大文件,那条链路需要 CLI 的默认重试,不能被这里的收紧连带影响。
+#
+# 总预算:SSM 3 次 × ~10s + 2 次 2s 退避 ≈ 34s,PutMetricData 同形 ≈ 34s,
+# 合计 ≤ ~68s,仍远小于 300s 宽限期。
+EDGE_AWS_BUDGET_ARGS=(--cli-connect-timeout 5 --cli-read-timeout 5)
+EDGE_AWS_MAX_ATTEMPTS=1
+EDGE_SSM_GET_ATTEMPTS=3
+EDGE_SSM_GET_BACKOFF_SEC=2
+
+# 空的 AWS_REGION 必须【unset】,不是"不传 --region"就够了。实测
+# (aws-cli 2.34.30):导出 AWS_REGION="" 时 CLI 把区域解析成空串、来源报 env
+# (解析链是 ['AWS_REGION','AWS_DEFAULT_REGION']),压过 profile/config/IMDS,
+# 直接报 `Invalid endpoint: https://sts..amazonaws.com`。也就是说光是不传参数,
+# 环境里那个空值仍然赢过 IMDS,调用照样必然失败 —— 而在下面那段里"调用失败"
+# 表现成静默回落 primary,正是本次要修的失效形态。CDK 的 edge userdata 导出的是
+# 真区域(ha_edge.py 那行 `AWS_REGION="{self.region}"`),但手工/救援执行时可能
+# 继承到空值。空则 unset,让 CLI 自己走 config/IMDS。unset 不影响第 8 段的
+# `${AWS_REGION:-ap-southeast-1}`:`:-` 对"未设"与"空值"取同一个默认。
+for _region_var in AWS_REGION AWS_DEFAULT_REGION; do
+    if [[ -z "${!_region_var:-}" ]]; then
+        unset "$_region_var"
+    fi
+done
+
+# 区域已知就显式传,不依赖 IMDS 能不能读到。
+# 注意不能写 `[[ -n ... ]] && arr=(...)`:条件为假时整行返回 1,在
+# set -e 下会直接把 edge 拉挂。
+AWS_REGION_ARGS=()
+if [[ -n "${AWS_REGION:-}" ]]; then
+    AWS_REGION_ARGS=(--region "$AWS_REGION")
+fi
+
+emit_reader_endpoint_metric() {
+    # $1: 0=采用了 SSM 的 reader endpoint / 1=回落 primary
+    # $2: 回落原因,取值来自本脚本的固定白名单(none/ssm_error/empty/malformed)
+    local fallback="$1" reason="$2" payload attempt
+    # 两个数据点一次发完:无维度那条给告警用(Sum>0 = 至少一台回落),带 Reason 维度
+    # 那条给排查用 —— 回落原因决定处置(缺 IAM 权限 vs SSM 参数本身畸形)。正常档
+    # 也发 0,所以"指标有 0 数据点"与"指标完全缺失"可区分,后者是通道自己坏了。
+    payload="$(printf '[{"MetricName":"RedisReaderEndpointFallback","Value":%s,"Unit":"Count"},{"MetricName":"RedisReaderEndpointFallback","Dimensions":[{"Name":"Reason","Value":"%s"}],"Value":%s,"Unit":"Count"}]' \
+        "$fallback" "$reason" "$fallback")"
+    for ((attempt = 1; attempt <= EDGE_METRIC_PUT_ATTEMPTS; attempt++)); do
+        if AWS_MAX_ATTEMPTS="$EDGE_AWS_MAX_ATTEMPTS" aws cloudwatch put-metric-data \
+            --namespace "$EDGE_METRIC_NAMESPACE" \
+            --metric-data "$payload" \
+            "${EDGE_AWS_BUDGET_ARGS[@]}" \
+            "${AWS_REGION_ARGS[@]+"${AWS_REGION_ARGS[@]}"}" >/dev/null 2>&1; then
+            return 0
+        fi
+        # 最后一次失败不再 sleep:那几秒纯粹是拖长 edge 的启动时间,而这条链路
+        # 已经确定拿不到信号了。写成 if 而不是 `[[ ]] && sleep`:后者在最后一轮
+        # 返回 1,是循环体的最后一条命令,set -e 会就地把 edge 拉挂。
+        if [[ "$attempt" -lt "$EDGE_METRIC_PUT_ATTEMPTS" ]]; then
+            sleep "$EDGE_METRIC_PUT_BACKOFF_SEC"
+        fi
+    done
+    log "WARN: failed to publish ${EDGE_METRIC_NAMESPACE}/RedisReaderEndpointFallback=${fallback} reason=${reason} after ${EDGE_METRIC_PUT_ATTEMPTS} attempts; fleet convergence stays invisible outside this instance"
+}
+
+fetch_reader_endpoint() {
+    # 只对【调用失败】重试。空值 / 缺 :port 不是瞬时故障:SSM 参数值本身不对,再读
+    # N 次还是同一个值,重试纯粹白花 edge 的启动时间,所以那两档由调用方判、不重试。
+    #
+    # 结果写全局 READER_ENDPOINT 而不是 echo 出去让调用方做命令替换:命令替换会起子
+    # shell,退避次数和重试轮数留在子 shell 里,外面既看不到也测不到。
+    local attempt
+    for ((attempt = 1; attempt <= EDGE_SSM_GET_ATTEMPTS; attempt++)); do
+        if READER_ENDPOINT="$(AWS_MAX_ATTEMPTS="$EDGE_AWS_MAX_ATTEMPTS" aws ssm get-parameter \
+            --name /openclaw/engine/redis/reader-endpoint \
+            --query 'Parameter.Value' \
+            --output text \
+            "${EDGE_AWS_BUDGET_ARGS[@]}" \
+            "${AWS_REGION_ARGS[@]+"${AWS_REGION_ARGS[@]}"}" 2>/dev/null)"; then
+            return 0
+        fi
+        # 与 emit_reader_endpoint_metric 同款:最后一次失败不再退避,且写成 if 而不是
+        # `[[ ]] && sleep` —— 后者在最后一轮返回 1,作为循环体最后一条命令会被 set -e
+        # 当成脚本失败,直接把 edge 拉挂。
+        if [[ "$attempt" -lt "$EDGE_SSM_GET_ATTEMPTS" ]]; then
+            sleep "$EDGE_SSM_GET_BACKOFF_SEC"
+        fi
+    done
+    return 1
+}
+
+_reader_fallback=1
+_reader_fallback_reason=ssm_error
+if ! fetch_reader_endpoint; then
+    log "WARN: failed to read Redis reader endpoint from SSM after ${EDGE_SSM_GET_ATTEMPTS} attempts; falling back to primary"
 elif [[ -z "$READER_ENDPOINT" || "$READER_ENDPOINT" == "None" ]]; then
+    _reader_fallback_reason=empty
     log "WARN: Redis reader endpoint from SSM is empty; falling back to primary"
 else
     _reader_host="${READER_ENDPOINT%:*}"
     _reader_port="${READER_ENDPOINT##*:}"
     if [[ -z "$_reader_host" || -z "$_reader_port" || "$_reader_host" == "$_reader_port" ]]; then
+        _reader_fallback_reason=malformed
         log "WARN: Redis reader endpoint missing host:port; falling back to primary"
     else
         READER_HOST="$_reader_host"
         READER_PORT="$_reader_port"
+        _reader_fallback=0
+        _reader_fallback_reason=none
     fi
 fi
+emit_reader_endpoint_metric "$_reader_fallback" "$_reader_fallback_reason"
 
 ARCH="$(uname -m)"
 case "$ARCH" in

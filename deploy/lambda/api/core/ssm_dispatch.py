@@ -297,15 +297,19 @@ def host_script_self_heal(scripts, tag, freshness=None):
         # source 失败就让整段非零退出、走调用方的失败路径。
         "if [ -r /etc/platform.env ]; then set -a; . /etc/platform.env; set +a; fi; "
         '_B="${ASSETS_BUCKET:-}"; '
-        f"[ -n \"$_B\" ] || {{ echo '[{tag}] FATAL 读不到 ASSETS_BUCKET'; exit 1; }}; "
+        f'[ -n "$_B" ] || {{ _oc_msg="[{tag}] FATAL 读不到 ASSETS_BUCKET"; '
+        'echo "$_oc_msg"; echo "$_oc_msg" >&2; exit 1; }; '
         f"for f in {name_list}; do "
         'aws s3 cp "s3://$_B/deployment/scripts/$f" "/tmp/oc-heal-$f" '
         "--no-progress >/dev/null 2>&1 || "
-        f'{{ echo "[{tag}] FATAL 拉取 $f 失败"; exit 1; }}; '
+        f'{{ _oc_msg="[{tag}] FATAL 拉取 $f 失败"; '
+        'echo "$_oc_msg"; echo "$_oc_msg" >&2; exit 1; }; '
         'bash -n "/tmp/oc-heal-$f" || '
-        f'{{ echo "[{tag}] FATAL $f 语法错误,拒绝安装"; exit 1; }}; '
+        f'{{ _oc_msg="[{tag}] FATAL $f 语法错误,拒绝安装"; '
+        'echo "$_oc_msg"; echo "$_oc_msg" >&2; exit 1; }; '
         f'install -o root -g root -m 755 "/tmp/oc-heal-$f" "{_HOST_SCRIPT_DIR}/$f" || '
-        f'{{ echo "[{tag}] FATAL 安装 $f 失败"; exit 1; }}; '
+        f'{{ _oc_msg="[{tag}] FATAL 安装 $f 失败"; '
+        'echo "$_oc_msg"; echo "$_oc_msg" >&2; exit 1; }; '
         "done; "
         f"{post_install_verify}"
         f"echo '[{tag}] 自愈装载完成'; "

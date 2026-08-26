@@ -195,8 +195,9 @@ _ENV_PREFIX = "LIFECYCLE_DEADLINE_SEC_"
 #
 # ## 执行段的分步预算 —— 这是本段的单一真相源
 #
-# 每一步的数都从 `FACT-BASELINE` 的实测值起算,系数写在行内。**`_WORST_EXEC_SEC` 与各处
-# `_ssm_run(timeout=…)` 都从这里取,不另写数字** —— 那正是本仓反复处置的「同一公式散在 8 处」。
+# 每一步的数都从 `FACT-BASELINE` 的实测值或脚本自己的有界等待之和起算,依据写在行内。
+# **`_WORST_EXEC_SEC` 与各处 `_ssm_run(timeout=…)` 都从这里取,不另写数字** —— 那正是
+# 本仓反复处置的「同一公式散在 8 处」。
 BACKUP_TERM_GRACE_SEC = 60
 """同步备份被 `timeout` TERM 掉之后,留给 `backup-data.sh` 的 EXIT trap 把 VM 从 Paused
 恢复回 running 的宽限期。
@@ -214,12 +215,33 @@ BACKUP_TERM_GRACE_SEC = 60
 自己好」。所以任何含同步备份的档,它的 backup 步预算都必须 **> 60**。
 """
 
+STOP_VM_LOCK_CONTENTION_SEC = 17  # stop-vm.sh:230 flock -w 2 + :266 flock -w 15
+STOP_VM_FLUSH_WORST_SEC = 24  # :15 SHORT × 2 + :16 EXTENDED,SSH 次数硬封顶 3
+STOP_VM_TERMINATE_SEC = 5  # :361 curl 2 + :364 sleep 2 + :371 sleep 1
+STOP_VM_WORST_SEC = (
+    STOP_VM_LOCK_CONTENTION_SEC
+    + STOP_VM_FLUSH_WORST_SEC
+    + STOP_VM_TERMINATE_SEC
+)
+"""`stop-vm.sh` 的最坏墙钟下界:17s 锁竞争(`:230 flock -w 2` + `:266 flock -w 15`)
++ 24s guest flush(`:15 SHORT × 2` + `:16 EXTENDED`,SSH 次数硬封顶 3)
++ 5s 停机(`:361 curl --max-time 2` + `:364 sleep 2` + `:371 sleep 1`)。
+
+这些数的**唯一真相在 `deploy/userdata/stop-vm.sh`**;这里是控制面预算需要的抄本,由
+`tests/test_626_stop_budget_covers_stop_vm_worst_adversarial.py` 逐项解析脚本并锁住 parity。
+
+预算若低于 `STOP_VM_WORST_SEC`,控制面会先按死线判失败而 SSM 仍在跑,最终 VM 实际被停、
+控制面却记成失败 —— 正是 #617 那一类状态不一致。**不许靠压缩 `flock -w` 让这个最坏值
+变小**:#608 第一轮这样改过并被打回,会重新打开 #469 那一类生命周期并发问题。
+"""
+
 _EXEC_STEPS: Dict[str, Any] = {
     # create 不动:128s 已由 `EXEC_BUDGET_SEC` 从 batch/slots/per-vm 论证过(#562)。
     ACTION_CREATE: (("dispatch-ssm", EXEC_BUDGET_SEC),),
     # suspend = 无条件同步备份 + stop-vm。备份实测 6.6s/9.5MB → 90s(13.6×,给大盘留量);
-    # stop-vm 实测 6.0s → 30s(5×,也正是它现在的默认值,不必改)。
-    ACTION_SUSPEND: (("backup", 90), ("stop-vm", 30)),
+    # stop-vm 的下界不能按 6.0s 典型值取倍数:flock -w / timeout 都是设计上会走到的
+    # 有界路径,不是异常。50 = STOP_VM_WORST_SEC(46) + 4s 余量。
+    ACTION_SUSPEND: (("backup", 90), ("stop-vm", 50)),
     # restore = 冷恢复 launch(sync=True)。实测恢复 16s → 120s(7.5×);它含 S3 下载+解密+
     # 解压+e2fsck,是八档里单步最重的一个,所以系数比 stop-vm 那种纯本地操作低。
     ACTION_RESTORE: (("launch-vm", 120),),
@@ -249,16 +271,19 @@ _EXEC_STEPS: Dict[str, Any] = {
     #
     # `rebuild-vm.sh` = stop-vm + overlay 提交 + launch-vm;overlay 提交是
     # `mv "${OVERLAY}" "${TOMBSTONE}"`(`deploy/userdata/rebuild-vm.sh:319`)—— 同文件系统
-    # **重命名,O(1)**,不随盘大小涨。可从已测分量推:6.0 + ~0 + 6.48 ≈ 12.5s → 30s(2.4×)。
+    # **重命名,O(1)**,不随盘大小涨。预算下界不能按 6.0s 典型 stop 值取倍数:
+    # flock -w / timeout 都是设计上会走到的有界路径,不是异常。
+    # 66 = STOP_VM_WORST_SEC(46) + O(1) rename + 20s(launch 实测 6.48s 的 3×)。
     # 备份必须先拿够 90(它装不下比 90 更小的数,见上面那段:60 宽限是硬的),
-    # 剩下的 30 才是 rebuild-vm 的。**第一版分成 55+65 是错的** —— 55 装不下 60s 宽限,
+    # rebuild-vm 再拿 66。**第一版分成 55+65 是错的** —— 55 装不下 60s 宽限,
     # 于是那一步的墙钟上界压根界不住,预算又变回纸面的。
     #
-    # **rebuild 是八档里最紧的一个**:同一个备份在 suspend 那档有 90s,在这里只有 55s ——
-    # 因为备份之后还有一整个 relaunch 要做,而死线是同一个 180s。后果如实写进契约文档:
+    # **rebuild 的 queue 只有 24s,是八档里最紧的一个**:同一个 180s 死线里必须先给
+    # backup 90s、再给 rebuild-vm 66s;把异步重试余量压到 24s 是本轮对齐最坏等待的代价。
+    # 后果如实写进契约文档:
     # 一个能 suspend 成功的大盘租户,可能 rebuild 失败。**这不是取舍失误,是 180s 装不下
     # 两个数据相关步骤这件事本身**;要它更宽只能抬死线或把备份异步化(都不在本轮范围)。
-    ACTION_REBUILD: (("backup", 90), ("rebuild-vm", 30)),
+    ACTION_REBUILD: (("backup", 90), ("rebuild-vm", 66)),
     # delete = 同步备份 + host 原子删除。备份同 suspend 取 90;host 删除实测注销 12.2s →
     # 120s(10×)。600s 档给了排队段 390s 的余量,是八档里最宽裕的。
     ACTION_DELETE: (("backup", 90), ("host-delete", 120)),
@@ -313,11 +338,11 @@ def intake_sec(action: str) -> int:
 
 _QUEUE_SEC: Dict[str, int] = {
     ACTION_CREATE: QUEUE_BUDGET_SEC,   # 50,#562 已论证
-    ACTION_SUSPEND: 60,
+    ACTION_SUSPEND: 40,
     ACTION_RESTORE: 60,
     ACTION_RESTART: 105,               # stop+launch 75s,剩余 105s 给排队
     ACTION_START: 120,                 # 恒等式约束:0 + 120 + 60 = 180,必须显式写值
-    ACTION_REBUILD: 60,                # 通道 C:这一段是「留给 AWS 异步重试的余量」
+    ACTION_REBUILD: 24,                # 通道 C:这一段是「留给 AWS 异步重试的余量」
     ACTION_BACKUP: 300,                # 通道 D:同上
     ACTION_DELETE: 390,                # 600s 档,八档里最宽裕
 }
@@ -534,6 +559,22 @@ def worst_exec_sec_for(action: str) -> Optional[int]:
     if str(action).strip().lower() not in _DEFAULT_DEADLINE_SEC:
         raise ValueError(f"未知的死线操作 {action!r}")
     return _WORST_EXEC_SEC[str(action).strip().lower()]
+
+
+def default_deadline_sec_for(action: str) -> int:
+    """该操作的**权威默认**死线秒数(客户表格最终版的值),不看 env 也不看参数。
+
+    专门给 **CDK synth / 校验器** 用:它们要注入或核对"config 没写那一档时该是多少",
+    而 `deadline_sec_for()` 在 Lambda 里对缺 env 的那一档是 raise 的,拿不到这个值。
+    这是唯一的公开读法 —— 调用方**不要另抄一份表**,否则会出现「CDK 注入 180、
+    代码认 600」这种查不出来的静默分叉(与 `env_name_for()` 同一条理由)。
+    """
+    key = str(action).strip().lower()
+    if key not in _DEFAULT_DEADLINE_SEC:
+        raise ValueError(
+            f"未知的死线操作 {action!r};合法值: {', '.join(DEADLINE_ACTIONS)}"
+        )
+    return int(_DEFAULT_DEADLINE_SEC[key])
 
 
 def parse_deadline_sec(action: str, raw: Any, source: str) -> int:

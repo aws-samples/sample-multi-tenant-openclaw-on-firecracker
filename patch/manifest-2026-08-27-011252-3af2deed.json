@@ -1,0 +1,94 @@
+{
+  "synced_at": "2026-08-27 01:12:52 UTC+08:00",
+  "base_sha": "1df0bbfec01c185c221685ea2850df682a23e545",
+  "source_commit": "3af2deedf289b0d4732e1f8ce1474a49eafeea1a",
+  "commit_count": 10,
+  "file_count": 8,
+  "summary": "Sync the bb increment 1df0bbfe..3af2deed to the public gateway branch. Sync-LOG only (which customer-facing files reached gateway + the issues behind them); the applyable patch kit is NOT built yet (folded_into pending).",
+  "issues_synced_note": "Index back to the issue tracker for whoever builds the patch kit: before assembling the kit, walk each issue and confirm it's covered. `title` is a ≤20-char gist only — open the issue for the full problem/fix/test. Lists only issues that touched a released file this sync.",
+  "issues_synced": [
+    {
+      "id": "#642",
+      "type": "feat",
+      "title": "[SECURITY] 租户 allowe…"
+    },
+    {
+      "id": "#659",
+      "type": "fix",
+      "title": "[BUG][控制面] restore 超…"
+    },
+    {
+      "id": "#660",
+      "type": "fix",
+      "title": "[BUG] egress allow 的…"
+    }
+  ],
+  "needs_config_on_apply": "none detected (no config.yml key / systemd directive / DDB-TTL change in this sync)",
+  "updated_files": {
+    "docs": [
+      {
+        "path": "docs/aws-guide/openapi.yaml",
+        "status": "modified",
+        "issues": [
+          "#660"
+        ]
+      }
+    ],
+    "host-scripts (S3-pulled / baked into rootfs)": [
+      {
+        "path": "deploy/userdata/init-host.sh",
+        "status": "modified",
+        "issues": [
+          "#642"
+        ]
+      },
+      {
+        "path": "deploy/userdata/launch-vm.sh",
+        "status": "modified",
+        "issues": [
+          "#642"
+        ]
+      },
+      {
+        "path": "deploy/userdata/lib/harden-config.sh",
+        "status": "modified",
+        "issues": [
+          "#642"
+        ]
+      }
+    ],
+    "lambda (update-function-code only)": [
+      {
+        "path": "deploy/lambda/api/services/egress_admin_service.py",
+        "status": "modified",
+        "issues": [
+          "#660"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/tenant_service.py",
+        "status": "modified",
+        "issues": [
+          "#659"
+        ]
+      }
+    ],
+    "root / other": [
+      {
+        "path": "config.yml.example",
+        "status": "modified",
+        "issues": [
+          "#642"
+        ]
+      },
+      {
+        "path": "setup.sh",
+        "status": "modified",
+        "issues": [
+          "#642"
+        ]
+      }
+    ]
+  },
+  "folded_into": "(pending) — no patch kit built for this sync yet; a later kit should cite this manifest as source-of-record and set base_sha/patch_sha. cdk deploy is FORBIDDEN on hand-modified live deployments — the kit must ship *.patched host scripts + the full lambda tree + AWS CLI for stack changes, same shape as patch/315-concurrent-dispatch-rollup/."
+}

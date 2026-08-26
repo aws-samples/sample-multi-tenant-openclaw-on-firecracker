@@ -71,7 +71,7 @@ components:
     TenantRecord:
       type: object
       description: |
-        A tenant record as returned by GET /tenants and GET /tenants/{id}. Secret fields (channel_secret, litellm_vkey, cognito_channel_password, gateway_token) are ALWAYS stripped by _redact_tenant before response. Numeric fields (vcpu/mem_mb/vm_num) are STRING-typed (DynamoDB N-as-S). Field set verified against a live ap-southeast-1 response (2026-07-07).
+        A tenant record as returned by GET /tenants and GET /tenants/{id}. Secret fields (channel_secret, litellm_vkey, cognito_channel_password, gateway_token) are ALWAYS stripped by _redact_tenant before response. Field set verified against a live ap-southeast-1 response (2026-07-07).
       x-source: deploy/lambda/api/services/tenant_service.py:84 (_TENANT_SECRET_FIELDS redaction)
       properties:
         id:
@@ -96,14 +96,12 @@ components:
         uuid:
           type: string
         vcpu:
-          type: string
-          description: String-typed integer.
+          type: integer
         mem_mb:
-          type: string
-          description: String-typed integer.
+          type: integer
         vm_num:
           type:
-            - string
+            - integer
             - 'null'
           description: Per-host VM slot number.
         host_id:
@@ -113,7 +111,7 @@ components:
           description: Instance id of the placing host; null while queued/pending.
         host_port:
           type:
-            - string
+            - integer
             - 'null'
         guest_ip:
           type:
@@ -140,7 +138,6 @@ components:
             - 'null'
         health_failures:
           type:
-            - string
             - integer
             - 'null'
         last_health_check:
@@ -182,7 +179,6 @@ components:
             - 'null'
         dispatch_retries:
           type:
-            - string
             - integer
             - 'null'
         rebuild_op_id:
@@ -247,7 +243,7 @@ components:
     HostRecord:
       type: object
       description: |
-        A Firecracker host record from GET /hosts. Capacity numbers are STRING-typed. Field set verified against a live ap-southeast-1 response (2026-07-07).
+        A Firecracker host record from GET /hosts. Field set verified against a live ap-southeast-1 response (2026-07-07).
       x-source: deploy/lambda/api/services/host_service.py:26
       properties:
         instance_id:
@@ -260,17 +256,17 @@ components:
         private_ip:
           type: string
         total_vcpu:
-          type: string
+          type: integer
         used_vcpu:
-          type: string
+          type: integer
         total_mem_mb:
-          type: string
+          type: integer
         used_mem_mb:
-          type: string
+          type: integer
         vm_count:
-          type: string
+          type: integer
         next_vm_num:
-          type: string
+          type: integer
         rootfs_version:
           type: string
         immutable_version:
@@ -305,6 +301,828 @@ components:
           type:
             - string
             - 'null'
+    FleetEgressRevision:
+      description: |-
+        一次 egress 变更落下的回滚锚点摘要(写路径的响应里返回这个形状)。两种形状互斥:
+        版本写成功给完整摘要;只有 break-glass(`mode=off`)在版本写连续失败后仍继续下发,
+        那一路返回退化形状 `{name: null, error}` —— 五个摘要字段一个都没有,所以不能用
+        「required 全给上、name 允许 null」来表达,那会把真实响应判成不合规
+        (`egress_admin_service.py:850`)。
+      oneOf:
+        - $ref: '#/components/schemas/FleetEgressRevisionRecorded'
+        - $ref: '#/components/schemas/FleetEgressRevisionWriteFailed'
+      x-source: deploy/lambda/api/services/egress_admin_service.py:831
+    FleetEgressRevisionWriteFailed:
+      type: object
+      description: |-
+        break-glass 专属退化形状:版本表连续写失败,但熔断必须继续,所以只回报「没落下锚点」
+        与失败原因。**这次变更没有回滚锚点**,事后只能靠 GET /hosts/egress 的期望态自证。
+      required:
+        - name
+        - error
+      properties:
+        name:
+          type: 'null'
+          description: 恒为 null —— 没有版本名可给。
+        error:
+          type: string
+          description: 最后一次写失败的异常串。
+      x-source: deploy/lambda/api/services/egress_admin_service.py:850
+    FleetEgressRevisionRecorded:
+      type: object
+      description: 版本已落库的完整摘要。
+      required:
+        - name
+        - auto_named
+        - scope
+        - hosts_recorded
+        - kind
+        - before_incomplete
+      properties:
+        name:
+          type: string
+          description: 版本名(DDB 主键去掉内部前缀后的部分)。
+        auto_named:
+          type: boolean
+          description: true = 名字由服务端自动取(v<N>);false = 调用方显式指定。
+        scope:
+          type: string
+          enum:
+            - all
+            - targeted
+        hosts_recorded:
+          type: integer
+          minimum: 0
+          description: before 里记下的 host 条数(不含 __fleet__ 快照)。
+        kind:
+          type: string
+          enum:
+            - apply
+            - rollback
+        before_incomplete:
+          type: boolean
+          description: |-
+            true = 记录时读不到改动前的期望态(只有 break-glass 会这样)。这样的版本**不能**
+            用于回滚,POST /hosts/egress/rollback 会对它返 409。
+      x-source: deploy/lambda/api/services/egress_admin_service.py:831
+    FleetEgressHostResult:
+      type: object
+      description: wait=true 时从 SSM 回收的逐机结果。
+      properties:
+        instance_id:
+          type: string
+        ssm_status:
+          type: string
+          description: SSM invocation 状态(Success / Failed / TimedOut / Cancelled / Undeliverable / Terminated)。
+        apply_exit:
+          type:
+            - integer
+            - 'null'
+          description: host 上 apply/teardown 脚本的退出码;null = 输出里没解析到。
+        rules_sha256:
+          type:
+            - string
+            - 'null'
+          description: 该 host 上 `iptables -S OPENCLAW-EGRESS` 的 sha256。跨机不相等是合法的(见 GET /hosts/egress 说明)。
+        pinned_skip:
+          type: boolean
+          description: 这台因 egress_pinned 被本次全机队下发跳过。
+        pin_check:
+          type:
+            - string
+            - 'null'
+          description: '`unavailable` 表示 host 侧无法确认 pin 状态 —— 它会把 wait=true 的整体结果压成 207。'
+        command_id:
+          type: string
+          description: 仅 rollback 的逐机结果带此字段(回滚按分组下发,多条 command)。
+      x-source: deploy/lambda/api/services/egress_admin_service.py:1279
+    FleetEgressNoHosts:
+      type: object
+      description: wait=false 且枚举出 0 台可下发 host —— 期望态可能已写,但没有任何 SSM 下发。
+      properties:
+        mode:
+          type: string
+          enum:
+            - deny
+            - 'off'
+        hosts:
+          type: integer
+          enum:
+            - 0
+        revision:
+          $ref: '#/components/schemas/FleetEgressRevision'
+        pin_enforced:
+          type: boolean
+        pinned_torn_down:
+          type: array
+          items:
+            type: string
+        pinned_skipped:
+          type: array
+          items:
+            type: string
+        unpinned_count:
+          type: integer
+        unpin_failed:
+          type:
+            - array
+            - 'null'
+          items:
+            type: string
+        extra_allow_cleared:
+          type:
+            - object
+            - 'null'
+          description: 省略 allow 而当前期望态确有放行洞时,列出被本次清空的洞(键 = instance_id 或 __fleet_egress_policy__)。
+        desired_state_incomplete:
+          type: boolean
+        message:
+          type: string
+          enum:
+            - no active hosts
+      x-source: deploy/lambda/api/services/egress_admin_service.py:1537
+    FleetEgressDispatched:
+      type: object
+      description: wait=false 的 202 —— 期望态已写、SSM 已下发,收敛异步发生。
+      required:
+        - mode
+        - command_id
+        - host_count
+        - desired_state_scope
+        - targeting
+      properties:
+        mode:
+          type: string
+          enum:
+            - deny
+            - 'off'
+        revision:
+          $ref: '#/components/schemas/FleetEgressRevision'
+        command_id:
+          type: string
+          description: 这一次扇出的 SSM CommandId。
+        host_count:
+          type: integer
+          minimum: 0
+          description: 本次纳入的 host 数。全机队走 tag 扇出时它是枚举到的数量,不是 SSM 实际命中数。
+        desired_state_written:
+          type: integer
+          description: 逐台写成功的 host 行数。targets="all" 时按设计恒为 0(只写 fleet 单例)。
+        desired_state_incomplete:
+          type: boolean
+          description: |-
+            仅定向路径可能为 true(desired_written != host_count)。为 true 时未写到的 host
+            会被下一轮 host-agent reconcile 把链改回去,message 里也会带 WARNING。
+        desired_state_scope:
+          type: string
+          enum:
+            - fleet-singleton
+            - per-instance
+        pin_enforced:
+          type: boolean
+          description: 仅 targets="all" 且 mode!=off 时为 true —— 熔断必须穿透 pin,所以 off 不强制 pin。
+        pinned_torn_down:
+          type: array
+          items:
+            type: string
+          description: 本次实际被拆链的 pinned 机器(仅熔断路径非空)。
+        pinned_skipped:
+          type: array
+          items:
+            type: string
+          description: 本次被 pin 豁免而跳过的机器(pin_enforced=false 时恒为空)。
+        unpinned_count:
+          type: integer
+        unpin_failed:
+          type:
+            - array
+            - 'null'
+          items:
+            type: string
+        extra_allow:
+          type:
+            - string
+            - 'null'
+          description: 本次写入的放行洞编码串(`proto:dport:cidr` 以逗号连接);无洞时 null。
+        extra_allow_cleared:
+          type:
+            - object
+            - 'null'
+        targeting:
+          type: string
+          enum:
+            - tag:Role
+            - instance-ids
+          description: '`tag:Role` = 按 host 标签扇出(无 50 上限,含未来新机);`instance-ids` = 显式列表(≤50)。'
+        message:
+          type: string
+      x-source: deploy/lambda/api/services/egress_admin_service.py:1597
+    FleetEgressWaitResult:
+      type: object
+      description: wait=true 的结果(全绿 200,任一项失败 207)。
+      required:
+        - ok
+        - mode
+        - command_id
+        - hosts
+        - consistent
+      properties:
+        ok:
+          type: boolean
+          description: 全部 host apply_exit=0 且 ssm_status=Success 且没有 pin 检查不可用。
+        mode:
+          type: string
+          enum:
+            - deny
+            - 'off'
+        revision:
+          $ref: '#/components/schemas/FleetEgressRevision'
+        command_id:
+          type: string
+        host_count:
+          type: integer
+          description: 这里是**回收到结果的**host 数(不是枚举数)。
+        desired_state_written:
+          type: integer
+        desired_state_incomplete:
+          type: boolean
+        desired_state_scope:
+          type: string
+          enum:
+            - fleet-singleton
+            - per-instance
+        pin_enforced:
+          type: boolean
+        pinned_torn_down:
+          type: array
+          items:
+            type: string
+        pinned_skipped:
+          type: array
+          items:
+            type: string
+        unpinned_count:
+          type: integer
+        unpin_failed:
+          type:
+            - array
+            - 'null'
+          items:
+            type: string
+        pin_check_unavailable:
+          type: array
+          items:
+            type: string
+          description: host 侧无法确认 pin 状态的机器。非空即把整体压成 207 —— 缺证据不算通过。
+        extra_allow:
+          type:
+            - string
+            - 'null'
+        extra_allow_cleared:
+          type:
+            - object
+            - 'null'
+        consistent:
+          type: boolean
+          description: |-
+            = ok 且 rules_sha256 非 null。**没有任何真实指纹不算"一致"** —— 缺失证据不会被
+            包装成没有问题。
+        rules_sha256:
+          type:
+            - string
+            - 'null'
+          description: 全机指纹唯一时给出该值,否则 null。仅供取证,跨机不等不代表未收敛。
+        rules_sha256_reason:
+          type:
+            - string
+            - 'null'
+          description: rules_sha256 为 null 的原因(无样本 / 多个不同值)。
+        hosts:
+          type: array
+          items:
+            $ref: '#/components/schemas/FleetEgressHostResult'
+        message:
+          type: string
+      x-source: deploy/lambda/api/services/egress_admin_service.py:1639
+    FleetEgressStatus:
+      type: object
+      description: GET /hosts/egress 的机队收敛报告(实测顶层键)。
+      required:
+        - desired
+        - total
+        - converged
+        - fully_converged
+        - fleet_uniform
+        - pinned_count
+        - pinned_malformed_count
+        - rules_sha256
+        - rules_sha256_reason
+        - fingerprint_groups
+        - hosts
+        - hosts_returned
+        - hosts_truncated
+        - limit
+        - instance_ids_filter
+        - outliers
+      properties:
+        desired:
+          type: object
+          description: fleet 单例期望态;从未设置过时是 `{"mode":null,"source":"per-host"}`。
+          properties:
+            mode:
+              type:
+                - string
+                - 'null'
+              enum:
+                - deny
+                - 'off'
+                - null
+            policy_version:
+              type:
+                - integer
+                - 'null'
+              description: |-
+                单例的毫秒时间戳版本。写进 DDB 是 `int`
+                (`egress_admin_service.py:571`、`:588`),resource API 读回是 `Decimal`,
+                #637 起响应边界走 `_json_default`(`core/utils.py:556`)把整值 `Decimal`
+                转成 `int`,所以线上那串 JSON 里它是**数字** `1787591853330` ——
+                #637 之前那版 `default=str` 会把它变成字符串,契约按当前实现写。
+                null = 单例行存在但这个字段缺失(`fleet_policy.get("policy_version")`,
+                `:1050`)。host 行没有这个字段,它们上报 ISO 串 egress_desired_at,两者不可互比。
+            deny_rfc1918:
+              type: boolean
+            extra_allow:
+              type: string
+            updated_at:
+              type: string
+            source:
+              type: string
+              enum:
+                - fleet
+                - per-host
+        total:
+          type: integer
+          minimum: 0
+          description: active/idle host 总数(过滤掉内部行与脏键后)。不受 limit / instance_ids 影响。
+        converged:
+          type: integer
+          minimum: 0
+          description: 已收敛的 host 数。判据 = mode 一致 + policy_version 一致 + 无 reconcile 错误,不含指纹。
+        fully_converged:
+          type: boolean
+          description: total>0 且 converged==total。
+        fleet_uniform:
+          type: boolean
+          description: 无 pinned、无 pinned_malformed 且 outliers 为空。pinned 机器即使自身已收敛也会让它变 false。
+        pinned_count:
+          type: integer
+          minimum: 0
+        pinned_malformed_count:
+          type: integer
+          minimum: 0
+          description: egress_pinned 存在但既不是 true 也不是 false 的 host 数(这些机器判为未收敛)。
+        rules_sha256:
+          type:
+            - string
+            - 'null'
+        rules_sha256_reason:
+          type:
+            - string
+            - 'null'
+        fingerprint_groups:
+          type: object
+          description: |-
+            指纹 → instance_id 列表。**信息性分组,不参与收敛判定**:LiteLLM 走 internal ALB
+            时各 host 合法解析到不同 A 记录,规则文本不同 → sha 天然不同。未上报的机器归到
+            `(not reported)` 这一组。
+          additionalProperties:
+            type: array
+            items:
+              type: string
+        hosts:
+          type: array
+          description: 逐机报告(受 instance_ids 与 limit 影响)。
+          items:
+            type: object
+            required:
+              - instance_id
+              - applied_mode
+              - applied_version
+              - applied_sha256
+              - applied_at
+              - reconcile_error
+              - pinned
+              - pinned_malformed
+              - policy_source
+              - desired_mode
+              - desired_deny_rfc1918
+              - desired_extra_allow
+              - converged
+            properties:
+              instance_id:
+                type: string
+              applied_mode:
+                type: string
+                description: host-agent 上报的已应用 mode;从未上报时是空串。
+              applied_version:
+                type: string
+                description: 上报的版本(单例是毫秒整数的字符串,走 host 行的是 ISO 时间串)。
+              applied_sha256:
+                type: string
+              applied_at:
+                type: string
+              reconcile_error:
+                type: string
+              pinned:
+                type: boolean
+              pinned_malformed:
+                type: boolean
+              policy_source:
+                type: string
+                description: host-agent 判定的胜出来源(fleet / host)。
+              desired_mode:
+                type:
+                  - string
+                  - 'null'
+                description: |-
+                  **这台自己那行**的期望态 mode。null = 这行没有期望态(跟 fleet 走)。
+                  portal 的"指定机器"表单必须用它做初值 —— 拿 fleet 单例的值去填一台走 host
+                  行的机器,提交就会把它自己的放行规则整套换掉。
+              desired_deny_rfc1918:
+                type:
+                  - boolean
+                  - 'null'
+              desired_extra_allow:
+                type:
+                  - string
+                  - 'null'
+                description: null = 这行没有期望态;空串 = 有期望态且明确没有放行规则。两者不可合并。
+              converged:
+                type: boolean
+        hosts_returned:
+          type: integer
+          minimum: 0
+        hosts_truncated:
+          type: boolean
+          description: 仅在给了 limit 且筛选后条数超过 limit 时为 true。
+        limit:
+          type:
+            - integer
+            - 'null'
+          description: 回显本次 limit;未给则 null。
+        instance_ids_filter:
+          type:
+            - array
+            - 'null'
+          items:
+            type: string
+          description: 回显去重后的筛选列表;未给则 null。
+        instance_ids_not_found:
+          type: array
+          items:
+            type: string
+          description: 仅在给了 instance_ids 时出现 —— 筛选列表里不在 active/idle host 集合内的 id。
+        outliers:
+          type: array
+          description: |-
+            非均一项。reason ∈ pinned_malformed / pinned_exempt / targeted_desired_state /
+            never_reported / fleet_policy_not_set / _classify_host 给出的具体不一致原因。
+          items:
+            type: object
+            properties:
+              instance_id:
+                type: string
+              reason:
+                type: string
+        message:
+          type: string
+          description: 仅在 fleet 单例从未设置过时出现。
+          enum:
+            - fleet policy has never been set
+      x-source: deploy/lambda/api/services/egress_admin_service.py:1198
+    FleetEgressRevisionList:
+      type: object
+      description: GET /hosts/egress/revisions 的响应(实测顶层键)。
+      required:
+        - revisions
+        - revisions_returned
+        - revisions_truncated
+        - limit
+        - total
+        - next_auto_name
+        - message
+      properties:
+        revisions:
+          type: array
+          description: 按 created_at 倒序(新的在前),受 limit 截断。
+          items:
+            type: object
+            required:
+              - name
+              - created_at
+              - author
+              - scope
+              - targets
+              - spec
+              - before
+              - before_incomplete
+            properties:
+              name:
+                type: string
+              created_at:
+                type: string
+              author:
+                type: string
+                description: 记录时调用者的身份标识(sub / user_id / caller)。
+              scope:
+                type: string
+                enum:
+                  - all
+                  - targeted
+              targets:
+                type: array
+                items:
+                  type: string
+              spec:
+                type: object
+                description: 这次变更**要写成**什么(kind / mode / deny_rfc1918 / extra_allow / pinned)。rollback 的 mode 记作字符串 `rollback`。
+              before:
+                type: object
+                description: |-
+                  改动前的期望态,**按 host 存**(键 = instance_id;全机队或显式恢复单例时额外
+                  含 `__fleet__`)。每项含 source(host/fleet/none/unknown)、mode、
+                  deny_rfc1918、extra_allow、pinned。source=unknown 表示当时读不到,回滚会拒。
+                additionalProperties:
+                  type: object
+              before_incomplete:
+                type: boolean
+              before_incomplete_raw_type:
+                type:
+                  - string
+                  - 'null'
+                description: before_incomplete 的原始类型名,供回滚被拒时诊断。
+        revisions_returned:
+          type: integer
+          minimum: 0
+        revisions_truncated:
+          type: boolean
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 200
+        total:
+          type: integer
+          minimum: 0
+          description: 全量版本数,不受 limit 影响。
+        next_auto_name:
+          type: string
+          description: 下一个自动版本名,按**全量**版本推(不按本页)。
+        message:
+          type: string
+      x-source: deploy/lambda/api/services/egress_admin_service.py:882
+    FleetEgressChain:
+      type: object
+      description: |-
+        GET /hosts/egress/chain 的内核证据。verdict=INCONCLUSIVE 时只有
+        instance_id/source/read_at/verdict/error 五个键,其余字段一律缺席。
+      required:
+        - instance_id
+        - source
+        - read_at
+        - verdict
+      properties:
+        instance_id:
+          type: string
+        source:
+          type: string
+          enum:
+            - kernel
+        read_at:
+          type: string
+        verdict:
+          type: string
+          enum:
+            - EFFECTIVE
+            - SHORT_CIRCUITED
+            - NOT_EFFECTIVE
+            - INCONCLUSIVE
+        error:
+          type: string
+          description: 仅 INCONCLUSIVE 时出现 —— 下发失败 / 未达终态 / 输出不完整的原因。
+        chain_present:
+          type: boolean
+        rules_sha256:
+          type: string
+          description: 链无规则时是空串(不返回空串的 sha,那会让"链不存在"看着像有真指纹)。
+        forward_jumps:
+          type: integer
+          description: FORWARD 里指向 OPENCLAW-EGRESS 的跳转数(含 -new/-old 残留链,判定另用 fwd_jump_pos 收紧)。
+        rules:
+          type: array
+          items:
+            type: string
+          description: '`iptables -S OPENCLAW-EGRESS` 的原文。'
+        per_tap_sample:
+          type: array
+          items:
+            type: string
+          description: per-tap 规则样本(最多 30 条 DROP + 10 条兜底 ACCEPT)。
+        precede_sample:
+          type: array
+          items:
+            type: string
+          description: 排在跳转之前的不安全规则样本(最多 5 条),SHORT_CIRCUITED 的证据。
+        short_circuit_reason:
+          type: string
+          description: 仅 SHORT_CIRCUITED 时出现。
+        layers:
+          type: object
+          description: |-
+            三层各自的计数,**刻意不合成一个健康数** —— 合起来会让"只有一半在守"看着像全都
+            在守(真机实测过一台 FORWARD 侧红线 DROP=0、INPUT 侧=218)。
+          properties:
+            fwd_tap_total:
+              type: integer
+            fwd_tap_drop:
+              type: integer
+            fwd_tap_accept:
+              type: integer
+            fwd_tap_imds_drop:
+              type: integer
+            fwd_tap_redline_drop:
+              type: integer
+            in_tap_total:
+              type: integer
+            in_tap_drop:
+              type: integer
+            in_8899:
+              type: integer
+            in_9090:
+              type: integer
+            in_9100:
+              type: integer
+            in_22:
+              type: integer
+            tap_devices:
+              type: integer
+            fwd_jump_pos:
+              type: integer
+              description: 跳转在 FORWARD 里的位置;0 = 没有指向在役链的跳转。
+            fwd_anchor_pos:
+              type: integer
+              description: conntrack RELATED,ESTABLISHED 锚点位置。
+            fwd_preceding_accepts:
+              type: integer
+              description: |-
+                跳转前的不安全规则数。`0` = 评估过且没有;`-1` = **未能评估**(没找到跳转,
+                fail-closed)。两者是不同事实,禁止合并。
+      x-source: deploy/lambda/api/services/egress_admin_service.py:2265
+    FleetEgressRollbackResult:
+      type: object
+      description: POST /hosts/egress/rollback 的响应(202/207 与 wait=true 的 200/207 同一形状,后者多 ok 与 hosts)。
+      required:
+        - revision
+        - dispatches
+        - dispatch_count
+        - failed_dispatches
+        - host_count
+        - desired_state_written
+        - desired_state_failed
+        - not_in_revision
+        - rejected_targets
+        - malformed_recorded_state
+        - restored_as
+        - durability
+        - desired_state_incomplete
+        - fleet_singleton_restored
+        - fleet_singleton_not_restored
+        - message
+      properties:
+        revision:
+          type: string
+          description: 回滚到的版本名(请求里那个)。
+        rollback_revision:
+          $ref: '#/components/schemas/FleetEgressRevision'
+        dispatches:
+          type: array
+          description: 成功下发的分组(按 mode/deny_rfc1918/extra_allow 分组,每 50 台一批)。
+          items:
+            type: object
+            properties:
+              command_id:
+                type: string
+              mode:
+                type: string
+              deny_rfc1918:
+                type: boolean
+              extra_allow:
+                type: string
+              instance_ids:
+                type: array
+                items:
+                  type: string
+              count:
+                type: integer
+        dispatch_count:
+          type: integer
+          minimum: 0
+        failed_dispatches:
+          type: array
+          description: 下发失败的分组(同上形状,额外带 error)。非空 → 207。
+          items:
+            type: object
+        host_count:
+          type: integer
+          minimum: 0
+        desired_state_written:
+          type: integer
+          minimum: 0
+        desired_state_failed:
+          type: array
+          items:
+            type: string
+          description: 期望态写失败的 host。**它们不会被下发** —— 不制造注定被下一轮 reconcile 撤销的内核窗口。
+        not_in_revision:
+          type: array
+          items:
+            type: string
+          description: 请求点名了但该版本没记录过的 host。
+        rejected_targets:
+          type: array
+          items:
+            type: string
+          description: 形状不像可下发 instance id 的键(既拦请求里的脏值,也拦记录里的伪键)。
+        malformed_recorded_state:
+          type: array
+          description: 记录里 extra_allow 形状损坏的条目(跳过不回滚)。
+          items:
+            type: object
+            properties:
+              instance_id:
+                type: string
+              field:
+                type: string
+        restored_as:
+          type: object
+          description: |-
+            来源变化说明。`host-row-from-unset` = 当时压根没有期望态,现按 off 写成显式 host
+            行;`host-row` = 当时跟 fleet 走,现把历史值恢复成 host 行。
+          additionalProperties:
+            type: string
+        durability:
+          type: object
+          description: |-
+            回滚能不能扛住下一次全机队发布。判据源头是 host-agent 的 _egress_policy_source,
+            **由 egress_pinned 决定,不是由"有没有显式 host 行"决定**。
+          required:
+            - survives_fleet_all_except_off
+            - overridden_by_next_fleet_all
+            - fleet_off_overrides_pinned
+          properties:
+            survives_fleet_all_except_off:
+              type: array
+              items:
+                type: string
+              description: 已 pin,因此能扛住除熔断以外的全机队发布。
+            overridden_by_next_fleet_all:
+              type: array
+              items:
+                type: string
+              description: 未 pin,下一次 targets="all" 发布就会覆盖它们。
+            fleet_off_overrides_pinned:
+              type: boolean
+              enum:
+                - true
+              description: 恒 true —— mode=off 是单向语义,穿透 pin。
+        desired_state_incomplete:
+          type: boolean
+        fleet_singleton_restored:
+          description: |-
+            false = 没恢复单例;true = 按快照写回了单例;字符串 `"cleared"` = 快照记的是
+            "从未设置过",于是清空了单例。这是本接口唯一允许的 bool|string 扩展。
+          oneOf:
+            - type: boolean
+            - type: string
+              enum:
+                - cleared
+        fleet_singleton_not_restored:
+          type: boolean
+          description: 版本里有 __fleet__ 快照但本次没带 restore_fleet_singleton —— 新建/重建的 host 仍会收敛到当前单例值。
+        wait_warning:
+          type: string
+          description: 仅 wait=true 且分组数 >1 时出现:顺序轮询可能超 29s 窗口,那里的 504 不代表回滚失败。
+        ok:
+          type: boolean
+          description: 仅 wait=true 时出现。
+        hosts:
+          type: array
+          description: 仅 wait=true 时出现。
+          items:
+            $ref: '#/components/schemas/FleetEgressHostResult'
+        message:
+          type: string
+          description: 会把 desired-state 缺口、durability 提示与"未恢复单例"三类后果显式拼进来。
+      x-source: deploy/lambda/api/services/egress_admin_service.py:2111
 security:
   - apiKey: []
 paths:
@@ -385,9 +1203,14 @@ paths:
                         type:
                           - string
                           - 'null'
-                        description: Cursor for the next page; null when exhausted.
+                        description: |
+                          Cursor for the next page; null when there is genuinely no next page. A page shorter than ?limit (including an empty one) carries a token ONLY when scan_budget_exhausted is true — otherwise a short page means the end of the table (#601).
                       count:
                         type: integer
+                      scan_budget_exhausted:
+                        type: boolean
+                        description: |
+                          Present and true ONLY when this request hit its per-request scan budget before filling ?limit rows (#601). The table is scanned with a filter that drops soft-deleted and half-written rows, and DynamoDB applies that filter AFTER its own Limit, so on a table where most rows are filtered out a single request can return few or zero rows while matches still exist further on. When this flag is true the returned page is NOT the end of the data: keep following next_token. Absent means the short/empty page is final. Clients written before #601 keep working — they see the same {tenants, next_token, count} and the cursor always advances, so following it terminates.
           x-source: deploy/lambda/api/handler.py:400
         '400':
           description: Bad limit / next_token / platform_id / purchase_status filter.
@@ -972,6 +1795,119 @@ paths:
                         type: array
                         items:
                           type: string
+                  create_deadline:
+                    type: integer
+                    description: >-
+                      #562/#565 G6 — absolute epoch seconds for the in-flight create. The
+                      seven deadline actions each have their own field; the response returns
+                      the tenant row as-is (secrets stripped), so a field is present only if
+                      that action has been accepted at least once. Full semantics:
+                      engineering/customer-requirements/lifecycle-deadline-contract.md
+                      sections 3.1b and 3.1e.
+                  suspend_deadline:
+                    type: integer
+                    description: '#565 G6 — as create_deadline, for suspend.'
+                  restore_deadline:
+                    type: integer
+                    description: '#565 G6 — as create_deadline, for restore.'
+                  restart_deadline:
+                    type: integer
+                    description: '#565 G6 — as create_deadline, for restart.'
+                  rebuild_deadline:
+                    type: integer
+                    description: '#565 G6 — as create_deadline, for rebuild.'
+                  delete_deadline:
+                    type: integer
+                    description: '#565 G6 — as create_deadline, for delete.'
+                  backup_deadline:
+                    type: integer
+                    description: '#565 G6 — gateway MANUAL backup only (see backup_op_id).'
+                  create_fail_reason:
+                    type: string
+                    description: >-
+                      #565 G3 — closed value set, per action. Branch on this, never on the
+                      human-readable error text. Each action declares only the subset it can
+                      actually produce (contract section 1.3). It records the MOST RECENT
+                      failure of that action and is never auto-cleared, so it does not
+                      describe current state — read status for that.
+                  suspend_fail_reason:
+                    type: string
+                    description: '#565 G3 — as create_fail_reason, for suspend.'
+                  restore_fail_reason:
+                    type: string
+                    description: '#565 G3 — as create_fail_reason, for restore.'
+                  restart_fail_reason:
+                    type: string
+                    description: '#565 G3 — as create_fail_reason, for restart.'
+                  start_fail_reason:
+                    type: string
+                    description: '#565 G3 — as create_fail_reason, for start.'
+                  rebuild_fail_reason:
+                    type: string
+                    description: '#565 G3 — as create_fail_reason, for rebuild.'
+                  delete_fail_reason:
+                    type: string
+                    description: '#565 G3 — as create_fail_reason, for delete.'
+                  backup_fail_reason:
+                    type: string
+                    description: '#565 G3 — manual backup only.'
+                  create_fail_at:
+                    type: string
+                    description: >-
+                      ISO8601. Written in the SAME update as the matching reason, for all
+                      seven actions. Compare it with your own request time to tell "this is
+                      the previous attempt's record" from "this is mine" — with the known
+                      limit stated in contract section 1.1.
+                  suspend_fail_at:
+                    type: string
+                  restore_fail_at:
+                    type: string
+                  restart_fail_at:
+                    type: string
+                  rebuild_fail_at:
+                    type: string
+                  delete_fail_at:
+                    type: string
+                  backup_fail_at:
+                    type: string
+                  delete_reported_failed_at:
+                    type: integer
+                    description: >-
+                      #565 G2 — epoch seconds. Present ONLY while a delete is still running
+                      after we already reported it as timed out. status stays deleting on
+                      purpose: the 600s deadline bounds the ANSWER, not the delete. Do NOT
+                      recreate under the same name while you see this. It is cleared when the
+                      delete finishes (status flips to deleted) or is rolled back, so the
+                      invariant is "present implies a delete is in flight and was reported
+                      failed" (contract section 3.1b).
+                  deadline_enforced_at:
+                    type: integer
+                    description: >-
+                      Epoch seconds at which the deadline enforcer acted on this row. Operator
+                      diagnostics; not part of the polling contract.
+                  backup_op_id:
+                    type: string
+                    description: >-
+                      #564 G7 — handle for the most recent gateway MANUAL backup. Compare it
+                      with the one you got from the 202 BEFORE trusting backup_phase.
+                  backup_phase:
+                    type: string
+                    enum:
+                      - queued
+                      - running
+                      - succeeded
+                      - failed
+                    description: >-
+                      #564 G7 — manual-backup state machine. A backup failure NEVER flips the
+                      tenant status; the tenant may be serving normally.
+                  backup_started_at:
+                    type: string
+                    description: ISO8601 acceptance time of the manual backup.
+                  backup_phase_at:
+                    type: string
+                    description: >-
+                      ISO8601 of the last backup_phase transition. Use it to tell "still
+                      moving" from "stuck" while phase sits at running.
         '403':
           description: Caller is not the owner (and not admin/API-key), or outside platform scope.
           content:
@@ -1037,6 +1973,43 @@ paths:
                     enum:
                       - deleted
                       - deleting
+                  delete_deadline:
+                    type: integer
+                    description: >-
+                      #565 G6 — absolute epoch seconds by which the caller gets a terminal
+                      answer about this delete. Present only on the status=deleting shape
+                      (another delete owns the operation); a terminal status=deleted answer
+                      carries none because nothing is in flight. Absent (not null) when the
+                      row predates the field — read the tenant row instead. See
+                      engineering/customer-requirements/lifecycle-deadline-contract.md
+                      section 3.1e.
+        '202':
+          description: |
+            #565 G6 — delete accepted (status queued, with op_id), or another delete already
+            owns this tenant (status deleting). Both were returned before this was declared;
+            the schema is being written down, not newly introduced. The 600s deadline bounds
+            only the ANSWER — the delete itself is never dropped and keeps retrying until it
+            succeeds (customer requirement 2026-08-21; see the contract's section 3.1b).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  status:
+                    type: string
+                    enum:
+                      - queued
+                      - deleting
+                  op_id:
+                    type: string
+                    description: Present on the accepted (status queued) shape.
+                  delete_deadline:
+                    type: integer
+                    description: >-
+                      #565 G6 — absolute epoch seconds; same value as the tenant row's
+                      delete_deadline and as the queued message's deadline.
         '403':
           description: Not the owner / outside platform scope.
           content:
@@ -1389,7 +2362,33 @@ paths:
                         type: string
                         pattern: '^[0-9a-f]{64}$|^$'
                         description: Bound template body digest; empty for host-baked default.
-                    x-source: deploy/lambda/api/services/tenant_service.py:1219
+                      suspend_deadline:
+                        type: integer
+                        description: >-
+                          #565 G6 — absolute epoch seconds by which this suspend must reach a
+                          terminal state. Present only when action=suspend. Same value as the
+                          tenant row's suspend_deadline. See
+                          engineering/customer-requirements/lifecycle-deadline-contract.md
+                          section 3.1e.
+                      restore_deadline:
+                        type: integer
+                        description: >-
+                          #565 G6 — as suspend_deadline, for action=restore.
+                      restart_deadline:
+                        type: integer
+                        description: >-
+                          #565 G6 — as suspend_deadline, for action=restart.
+                      rebuild_deadline:
+                        type: integer
+                        description: >-
+                          #565 G6 — as suspend_deadline, for action=rebuild.
+                      delete_deadline:
+                        type: integer
+                        description: >-
+                          #565 G6 — as suspend_deadline, for the delete path. Note the seven
+                          deadline actions each carry only their own field; start/stop/pause/
+                          resume/reset carry none because they have no customer deadline.
+                    x-source: deploy/lambda/api/services/tenant_service.py:7165
                   - type: object
                     title: backup-started
                     properties:
@@ -1401,7 +2400,28 @@ paths:
                       status:
                         type: string
                         const: started
-                    x-source: deploy/lambda/api/services/tenant_service.py:1569
+                      backup_op_id:
+                        type: string
+                        description: >-
+                          #564 G7 — pollable handle for THIS manual backup. Compare it with
+                          the tenant row's backup_op_id before trusting backup_phase; a
+                          mismatch means the row already describes a different backup.
+                      backup_phase:
+                        type: string
+                        enum:
+                          - queued
+                          - running
+                          - succeeded
+                          - failed
+                        description: >-
+                          #564 G7 — manual-backup state machine. Only gateway manual backups
+                          carry it; scheduled/pre-delete/pre-suspend backups do not.
+                      backup_deadline:
+                        type: integer
+                        description: >-
+                          #565 G6 — absolute epoch seconds; still queued/running at that
+                          point means the system marks backup_phase=failed.
+                    x-source: deploy/lambda/api/services/tenant_service.py:8140
                   - type: object
                     title: migrating
                     properties:
@@ -1937,7 +2957,7 @@ paths:
       operationId: listUserTenants
       summary: 列出某平台用户名下所有租户(索引/分页)
       description: |
-        GSI-backed (gsi_tenant_user) paginated listing of every node attributed to a tenant_user_id — never a full table scan. Soft-deleted tenants are excluded. Authorization: admin / api-key callers may target any user; a federated Cognito user may only list their own fleet (identity-keyed, independent of the RBAC_ENABLED flag, #60). Requires the gsi_tenant_user index (config switch scaler.add_gsi_tenant_user; deploys without it fail this route with 500). Requires API Gateway x-api-key.
+        GSI-backed (gsi_tenant_user) paginated listing of every node attributed to a tenant_user_id — never a full table scan. Soft-deleted tenants are excluded. Authorization: admin / api-key callers may target any user; a federated Cognito user may only list their own fleet (identity-keyed, independent of the RBAC_ENABLED flag, #60). Requires the gsi_tenant_user index (config switch scaler.add_gsi_tenant_user; deploys without it answer 503 UNAVAILABLE, structured and without echoing the index name — #609). Requires API Gateway x-api-key.
       x-source: deploy/lambda/api/handler.py:1139
       x-rbac: viewer+owner-gated
       parameters:
@@ -2046,6 +3066,25 @@ paths:
                     type: string
                     example: 'forbidden: not authorized for this user''s fleet'
                 x-source: deploy/lambda/api/services/fleet_service.py:35-56
+        '503':
+          description: |
+            The per-user fleet index (gsi_tenant_user) is not deployed. Structured, retryable,
+            and carries no internal detail: the DynamoDB index name and table shape are never
+            echoed to the caller (#609). Enable it with the config switch
+            scaler.add_gsi_tenant_user and redeploy.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: per-user fleet index is not active
+                  code:
+                    type: string
+                    enum:
+                      - UNAVAILABLE
+          x-source: deploy/lambda/api/services/fleet_service.py TenantUserIndexUnavailable
       tags:
         - 按用户管理舰队
   /users/{tenant_user_id}/summary:
@@ -2094,8 +3133,88 @@ paths:
                   error:
                     type: string
                 x-source: deploy/lambda/api/services/fleet_service.py:35-56
+        '503':
+          description: |
+            The per-user fleet index (gsi_tenant_user) is not deployed. Structured, retryable,
+            and carries no internal detail: the DynamoDB index name and table shape are never
+            echoed to the caller (#609). Enable it with the config switch
+            scaler.add_gsi_tenant_user and redeploy.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: per-user fleet index is not active
+                  code:
+                    type: string
+                    enum:
+                      - UNAVAILABLE
+          x-source: deploy/lambda/api/services/fleet_service.py TenantUserIndexUnavailable
       tags:
         - 按用户管理舰队
+  /users/{tenant_user_id}/upgrade:
+    post:
+      operationId: upgradeOpenclawUserV1
+      summary: v1 兼容入口，升级单个租户并可重应用配置
+      description: |
+        Legacy v1 compatibility route. The path value is the tenant id, despite
+        the historical users prefix. It delegates to the same administrator-only
+        rebuild flow as POST /tenants/{id}/upgrade and preserves its fencing,
+        idempotency, preflight, and asynchronous progress semantics.
+      x-source: deploy/lambda/api/handler.py
+      x-rbac: admin
+      parameters:
+        - name: tenant_user_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Historical name for the target tenant id.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                tenantID:
+                  type: string
+                  description: Legacy redundant tenant id field; the path is authoritative.
+                imageChannel:
+                  type: string
+                  enum:
+                    - live
+                    - canary
+                requestId:
+                  type: string
+                  minLength: 4
+                  maxLength: 128
+                  description: Legacy caller idempotency token.
+                configTemplate:
+                  type: string
+                  pattern: '^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$'
+                configTemplateVersion:
+                  type: integer
+                  minimum: 1
+                forceReapply:
+                  type: boolean
+                  default: false
+      responses:
+        '200':
+          description: The exact target was already applied; no rebuild was queued.
+        '202':
+          description: Rebuild and optional config reapply accepted.
+        '400':
+          description: Invalid or incompatible request.
+        '403':
+          description: Upgrade requires administrator role.
+        '404':
+          description: Tenant not found.
+      tags:
+        - 租户生命周期
   /users/{tenant_user_id}/action:
     post:
       operationId: userAction
@@ -2184,6 +3303,25 @@ paths:
                   error:
                     type: string
                 x-source: deploy/lambda/api/core/auth.py:592-608, deploy/lambda/api/services/fleet_service.py:35-56
+        '503':
+          description: |
+            The per-user fleet index (gsi_tenant_user) is not deployed. Structured, retryable,
+            and carries no internal detail: the DynamoDB index name and table shape are never
+            echoed to the caller (#609). Enable it with the config switch
+            scaler.add_gsi_tenant_user and redeploy.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: per-user fleet index is not active
+                  code:
+                    type: string
+                    enum:
+                      - UNAVAILABLE
+          x-source: deploy/lambda/api/services/fleet_service.py TenantUserIndexUnavailable
       tags:
         - 按用户管理舰队
   /backups:
@@ -2355,25 +3493,25 @@ paths:
                       description: Lifecycle state. "deleted" rows are filtered out of this endpoint.
                       x-source: deploy/lambda/api/services/host_service.py:132
                     total_vcpu:
-                      type: string
-                      description: Schedulable vCPU (instance vCPU minus HOST_RESERVED_VCPU, default 1). DynamoDB Decimal serialized as string.
+                      type: integer
+                      description: Schedulable vCPU (instance vCPU minus HOST_RESERVED_VCPU, default 1).
                       x-source: deploy/lambda/api/services/host_service.py:126
                     total_mem_mb:
-                      type: string
-                      description: Schedulable memory MiB (advertised RAM minus HOST_RESERVED_MEM, default 2048). Serialized as string.
+                      type: integer
+                      description: Schedulable memory MiB (advertised RAM minus HOST_RESERVED_MEM, default 2048).
                       x-source: deploy/lambda/api/services/host_service.py:127
                     used_vcpu:
-                      type: string
-                      description: Currently allocated vCPU. Serialized as string.
+                      type: integer
+                      description: Currently allocated vCPU.
                     used_mem_mb:
-                      type: string
-                      description: Currently allocated memory MiB. Serialized as string.
+                      type: integer
+                      description: Currently allocated memory MiB.
                     vm_count:
-                      type: string
-                      description: Number of microVMs on this host. Serialized as string.
+                      type: integer
+                      description: Number of microVMs on this host.
                     next_vm_num:
-                      type: string
-                      description: Next per-host VM slot number (CAS-allocated). Serialized as string.
+                      type: integer
+                      description: Next per-host VM slot number (CAS-allocated).
                       x-source: deploy/lambda/api/services/host_service.py:131
                     idle_since:
                       type: string
@@ -3892,6 +5030,757 @@ paths:
                   error:
                     type: string
                 x-source: deploy/lambda/api/services/fleet_service.py:183
+      tags:
+        - 主机与镜像
+  /hosts/egress:
+    post:
+      operationId: fleetEgressApply
+      summary: 下发 guest 出网防火墙期望态(全机队或定向,最高爆炸半径)
+      description: |-
+        写 guest egress 期望态并 live-apply。期望态落 DDB(targets="all" 写 fleet 单例;
+        定向写逐台 host 行),再用一条 SSM send_command 扇出 OPENCLAW-EGRESS 链的 apply/teardown。
+
+        爆炸半径守卫(实现里的关键安全规则,改动前先读这两条):
+        1. `targets` 只接受 `"all"` 或**非空字符串数组**。漏方括号的
+           `{"targets":"i-0abc"}`、`null`、`{}`、`[]` 一律 400 —— 不按 truthiness 推
+           "全机队",因为那会把一次定向意图变成对全部 host 的 teardown。
+        2. `pinned=true` 与 `targets="all"` 互斥(400):把每台 host 都钉住会让后续全机队
+           更新永久失效。
+
+        期望态是**全量替换**而非增量:省略 `allow` 会把当前额外放行洞清空,响应用
+        `extra_allow_cleared` 把这次删掉的洞显式列出来。`mode=off` 是 break-glass 单向
+        语义 —— 它穿透 `egress_pinned`,且在 DDB 读/版本写失败时仍继续下发(其余路径 fail-closed
+        返 503,期望态与内核均未改动,重试安全)。
+
+        每次调用都先落一条命名版本(回滚锚点),再写期望态、再下发;记不下锚点就不下发。
+      x-source: deploy/lambda/api/services/egress_admin_service.py:1348
+      x-rbac: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - mode
+              properties:
+                mode:
+                  type: string
+                  enum:
+                    - deny
+                    - 'off'
+                  description: |-
+                    必填。`deny` = 默认拒绝 + 白名单;`off` = 拆链(break-glass)。
+                    大小写与首尾空格不敏感(strip().lower());非字符串或枚举外的值 400。
+                  x-source: deploy/lambda/api/services/egress_admin_service.py:1365
+                targets:
+                  description: |-
+                    `"all"`(默认)或非空 instance id 字符串数组。其余形状一律 400,见
+                    description 里的爆炸半径守卫 1。
+                  default: all
+                  oneOf:
+                    - type: string
+                      enum:
+                        - all
+                    - type: array
+                      minItems: 1
+                      items:
+                        type: string
+                        minLength: 1
+                  x-source: deploy/lambda/api/services/egress_admin_service.py:1389
+                deny_rfc1918:
+                  type: boolean
+                  default: false
+                  description: 额外拒绝 guest 到 RFC1918 私网的出网。按 bool() 强转,非布尔值不报错。
+                  x-source: deploy/lambda/api/services/egress_admin_service.py:1372
+                pinned:
+                  type: boolean
+                  description: |-
+                    提供时必须严格是 `true`/`false`(identity 校验,`"true"`/1 一律 400)。
+                    `true` = 把这几台钉成"只听自己那行 host policy",后续 `targets="all"`
+                    不再覆盖它们(`mode=off` 仍穿透);`false` = 批量摘掉 pin。
+                    与 `targets="all"` 同时给 `true` → 400。省略 = 不动 pin 状态。
+                  x-source: deploy/lambda/api/services/egress_admin_service.py:1370
+                wait:
+                  type: boolean
+                  default: false
+                  description: |-
+                    `false`(默认)立即返 202 + command_id;`true` 在 API Gateway 的 29s 硬窗口内
+                    轮询所有 host 到终态并返回逐机 apply_exit + rules_sha256。实测约 9 台起
+                    `wait=true` 必 504,所以它只供小机队/验收取证。
+                  x-source: deploy/lambda/api/services/egress_admin_service.py:1377
+                allow:
+                  type: array
+                  description: |-
+                    额外放行洞,**全量替换**语义(仅 `mode=deny` 有意义)。省略 = 清空当前洞
+                    并在响应里报 extra_allow_cleared。LiteLLM 的洞由每台 host 从自己的
+                    /etc/platform.env 派生,不经本字段。
+                  items:
+                    type: object
+                    required:
+                      - proto
+                      - dport
+                      - dst
+                    properties:
+                      proto:
+                        type: string
+                        enum:
+                          - tcp
+                          - udp
+                      dport:
+                        type: integer
+                        minimum: 1
+                        maximum: 65535
+                        description: |-
+                          必须是 JSON 整数。字符串 `"443"` 与布尔值都 400(#631 修复后)。
+                          红线端口(平台内部/数据存储端口)一律拒;8081 与其它非红线端口同
+                          路,不再要求精确等于某个 SPIRE server /32(#660)。
+                      dst:
+                        type: string
+                        description: |-
+                          必填 IPv4 IP/CIDR。IPv6 拒(链是 IPv4-only);覆盖 IMDS
+                          169.254.169.254 拒;前缀比 EGRESS_EXTRA_ALLOW_MIN_PREFIX(默认且
+                          最低 /24)更宽拒;等于或包含 VPC_CIDR / TENANT_SUPERNET 拒。
+                        example: 10.20.30.0/24
+                  x-source: deploy/lambda/api/services/egress_admin_service.py:169
+                revision_name:
+                  type: string
+                  pattern: '^\s*$|^\s*[A-Za-z0-9._-]{1,48}\s*$'
+                  description: |-
+                    回滚锚点的名字。省略/空串/纯空白 = 自动取 `v<N>`(只按 `v<纯数字>` 递推,
+                    运维自起的名字不参与编号)。给了名字则先 `strip()` 再判:1-48 字符、只含
+                    `[A-Za-z0-9._-]`、不得以 `__` 开头(内部行保留前缀);重名 409。
+                  x-source: deploy/lambda/api/services/egress_admin_service.py:667
+      responses:
+        '200':
+          description: |-
+            两种情形:①`wait=false` 且枚举出 0 台可下发 host(什么都没发);
+            ②`wait=true` 且逐机全部 apply_exit=0 / ssm_status=Success / pin 检查可用。
+
+            ②的判定**只覆盖窗口内回收到的 invocation**:超时前没回来的机器不算失败、也不
+            补位,所以 `host_count`(= 回收到的条数)可能小于你的目标台数,而 `ok` 仍是 true
+            (`egress_admin_service.py:1626`)。调用方要判"每台都做了",必须自己比
+            `host_count` 与目标台数,或改用 GET /hosts/egress 的收敛报告。
+            POST /hosts/egress/rollback 在这一点上更严(它额外要求
+            `len(hosts) == expected_results`,`:2153`)—— 这个不对称是现状,#636 不改行为。
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/FleetEgressNoHosts'
+                  - $ref: '#/components/schemas/FleetEgressWaitResult'
+              x-source: deploy/lambda/api/services/egress_admin_service.py:1536
+        '202':
+          description: '`wait=false`:期望态已写、SSM 已下发,收敛由 host-agent 上报(轮询 GET /hosts/egress)。'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FleetEgressDispatched'
+              x-source: deploy/lambda/api/services/egress_admin_service.py:1597
+        '207':
+          description: '`wait=true` 且至少一台 apply_exit≠0 / ssm_status≠Success / pin 检查不可用。'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FleetEgressWaitResult'
+              x-source: deploy/lambda/api/services/egress_admin_service.py:1639
+        '400':
+          description: |-
+            入参校验失败。判据(逐条实测):
+            `mode` 缺失/非字符串/枚举外;`pinned` 提供但非布尔;`targets` 不是 `"all"` 也
+            不是非空字符串数组(裸字符串 / dict / null / [] / 含空串的数组);
+            `pinned=true` 与 `targets="all"` 并用;`allow` 非数组或某项非对象;
+            `allow[i].proto` 非 tcp|udp;`allow[i].dport` 非整数或越界或命中红线端口
+            (8081 不在红线内,#660 起走通用护栏);`allow[i].dst` 缺失 / 非 IP-CIDR / 非 IPv4 / 覆盖 IMDS /
+            前缀过宽 / 等于或包含 VPC_CIDR 与 TENANT_SUPERNET;`revision_name` 超 48 字符 /
+            含非 `[A-Za-z0-9._-]` 字符 / 以 `__` 开头。`revision_name` 空串**不是** 400 ——
+            它与省略同义,走自动取名(`egress_admin_service.py:779`)。
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: targets must be "all" or a non-empty list of instance id strings
+                  got:
+                    type: string
+                    description: 仅 targets 形状错误时返回 —— 收到的原始值(截断 64 字符)或其类型名。
+                  next_auto_name:
+                    type: string
+                    description: 仅 revision_name 非法时返回,给出当前可用的自动名。
+                x-source: deploy/lambda/api/services/egress_admin_service.py:1388
+        '403':
+          description: 调用者身份不是 admin(handler 内 identity 门),或前置 RBAC 路由门按 role 拒绝。
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: 'forbidden: fleet egress admin requires admin'
+                  required:
+                    type: string
+                    enum:
+                      - admin
+                x-source: deploy/lambda/api/services/egress_admin_service.py:1360
+        '409':
+          description: 显式给的 revision_name 已存在。版本名是回滚的唯一坐标,不允许覆写历史。
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: 'revision name already exists: v3'
+                  hint:
+                    type: string
+                  next_auto_name:
+                    type: string
+                x-source: deploy/lambda/api/services/egress_admin_service.py:787
+        '502':
+          description: |-
+            SSM send_command 抛错。期望态**已经写了**,而这一跳的下发结果**未知** —— 异常可能
+            发生在 AWS 已受理命令之后(`egress_admin_service.py:1343` 是裸 except,拿不到
+            command id 也就无从判别)。别把它当"内核没动"直接重试:先用 GET /hosts/egress
+            看收敛、必要时 GET /hosts/egress/chain 回读内核,再决定重发。
+            重发本身是安全的(apply 幂等),但会多落一条回滚锚点。
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: 'failed to dispatch fleet-egress: ...'
+                x-source: deploy/lambda/api/services/egress_admin_service.py:1593
+        '503':
+          description: |-
+            fail-closed:改动前的期望态读不到、版本列举失败或版本写入失败 —— 记不下可信的
+            回滚点就不下发。期望态与内核均未改动,重试是安全的。`mode=off` 这条 break-glass
+            不走本分支(它继续下发,并把读不到的机器记成 source=unknown)。
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  hint:
+                    type: string
+                x-source: deploy/lambda/api/services/egress_admin_service.py:1457
+      tags:
+        - 主机与镜像
+    get:
+      operationId: fleetEgressStatus
+      summary: 只读:guest 出网防火墙的机队收敛报告
+      description: |-
+        比对 fleet 单例(或逐台 host 行)期望态与 host-agent 上报的已应用态。
+        收敛判据 = mode 一致 + policy_version 一致 + 无 reconcile 错误,**刻意不含指纹**:
+        LiteLLM 走 internal ALB 时各 host 合法解析到不同 A 记录 → 规则文本不同 → `iptables -S`
+        的 sha256 天然不同,把跨机 sha 相等当判据会把正常收敛的机队整队报成未收敛。
+        指纹只按分组呈现(`fingerprint_groups`),正确用途是同一台机器与自己上一次比。
+
+        pinned 机器即使已按自己的期望态收敛,也始终计入 `outliers`(reason=pinned_exempt)
+        并让 `fleet_uniform=false` —— 机队非均一是事实,不是错误。
+      x-source: deploy/lambda/api/services/egress_admin_service.py:1010
+      x-rbac: admin
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+          description: 只截断 `hosts` 数组;`total`/`converged`/`outliers` 始终按全量算。省略 = 不截断。
+          x-source: deploy/lambda/api/services/egress_admin_service.py:1019
+        - name: instance_ids
+          in: query
+          required: false
+          schema:
+            type: string
+          description: |-
+            逗号分隔的 instance id,只筛 `hosts` 数组。给了这个参数时响应额外带
+            `instance_ids_not_found`。空串或只有分隔符 → 400。
+          example: i-0aaa,i-0bbb
+          x-source: deploy/lambda/api/services/egress_admin_service.py:1029
+      responses:
+        '200':
+          description: 收敛报告。fleet 单例从未设置过时 `desired.mode=null`、`desired.source="per-host"` 并带 `message`。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FleetEgressStatus'
+              x-source: deploy/lambda/api/services/egress_admin_service.py:1198
+        '400':
+          description: '`limit` 非整数或不在 1-500;`instance_ids` 非字符串或不含任何 id。'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: limit must be an integer between 1 and 500
+                x-source: deploy/lambda/api/services/egress_admin_service.py:1025
+        '403':
+          description: 调用者身份不是 admin,或前置 RBAC 路由门拒绝。
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: 'forbidden: fleet egress admin requires admin'
+                  required:
+                    type: string
+                    enum:
+                      - admin
+                x-source: deploy/lambda/api/services/egress_admin_service.py:1014
+      tags:
+        - 主机与镜像
+  /hosts/egress/revisions:
+    get:
+      operationId: fleetEgressRevisions
+      summary: 只读:列出 egress 回滚版本(新的在前)
+      description: |-
+        每次 POST /hosts/egress 与 POST /hosts/egress/rollback 都会落一条版本,里面按 host
+        存着改动前的期望态(`before`)。回滚 = 把某个版本的 `before` 重新下发给指定机器,
+        所以可以只回滚其中几台。`next_auto_name` 按**全量**版本推,不受 `limit` 影响。
+      x-source: deploy/lambda/api/services/egress_admin_service.py:860
+      x-rbac: admin
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+          description: 只截断 `revisions` 数组;`total` 与 `next_auto_name` 始终按全量算。
+          x-source: deploy/lambda/api/services/egress_admin_service.py:868
+      responses:
+        '200':
+          description: 版本列表。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FleetEgressRevisionList'
+              x-source: deploy/lambda/api/services/egress_admin_service.py:882
+        '400':
+          description: '`limit` 非整数或不在 1-200。'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: limit must be an integer between 1 and 200
+                x-source: deploy/lambda/api/services/egress_admin_service.py:872
+        '403':
+          description: 调用者身份不是 admin,或前置 RBAC 路由门拒绝。
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: 'forbidden: fleet egress admin requires admin'
+                  required:
+                    type: string
+                    enum:
+                      - admin
+                x-source: deploy/lambda/api/services/egress_admin_service.py:864
+      tags:
+        - 主机与镜像
+    delete:
+      operationId: fleetEgressRevisionsDelete
+      summary: 逐个点名删除 egress 回滚版本(需 confirm)
+      description: |-
+        删除不可逆(删掉的是回滚锚点),所以①必须带 `confirm:"DELETE"`;②整批名字先全部
+        校验通过才开始删 —— 不会先删合法项再报告同批里有非法名。
+        单条删除用条件写入区分"不存在"(计入 `not_found`,不算失败)与真实写失败(整体 503)。
+        本路由用 DELETE + requestBody(OpenAPI 3.1 允许);名字放 body 而非 query,是为了
+        一次删多个并让 `confirm` 与名单同源。
+      x-source: deploy/lambda/api/services/egress_admin_service.py:912
+      x-rbac: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - revisions
+                - confirm
+              properties:
+                revisions:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: string
+                    minLength: 1
+                  description: 非空版本名数组。每个名字过与写入同一套字符集校验;批内去重。
+                confirm:
+                  type: string
+                  enum:
+                    - DELETE
+                  description: 必须**恰好**是字符串 `DELETE`,其它值(含小写)一律 400。
+                  x-source: deploy/lambda/api/services/egress_admin_service.py:940
+      responses:
+        '200':
+          description: 删除完成(`not_found` 非空也算成功:目标已经不在)。
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - deleted
+                  - not_found
+                  - remaining_total
+                  - message
+                properties:
+                  deleted:
+                    type: array
+                    items:
+                      type: string
+                  not_found:
+                    type: array
+                    items:
+                      type: string
+                    description: 条件写入判定为不存在的名字。
+                  remaining_total:
+                    type: integer
+                    minimum: 0
+                    description: 删除后重新列举得到的剩余版本总数。
+                  message:
+                    type: string
+                x-source: deploy/lambda/api/services/egress_admin_service.py:996
+        '400':
+          description: |-
+            body 不是 JSON 对象;`revisions` 不是非空字符串数组;`confirm` 不等于 `"DELETE"`;
+            或批内有名字不合法(此时返回 `invalid` 且**一个都没删**)。
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: confirm must be exactly "DELETE"
+                  invalid:
+                    type: array
+                    items:
+                      type: string
+                    description: 仅批内有非法名字时返回。
+                x-source: deploy/lambda/api/services/egress_admin_service.py:952
+        '403':
+          description: 调用者身份不是 admin,或前置 RBAC 路由门拒绝。
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: 'forbidden: fleet egress admin requires admin'
+                  required:
+                    type: string
+                    enum:
+                      - admin
+                x-source: deploy/lambda/api/services/egress_admin_service.py:916
+        '503':
+          description: |-
+            某条删除真实写失败,或删除已发生但剩余数读不到。两种情形都带上已删除与未找到的
+            名单,不伪造成功读数。
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  deleted:
+                    type: array
+                    items:
+                      type: string
+                  not_found:
+                    type: array
+                    items:
+                      type: string
+                x-source: deploy/lambda/api/services/egress_admin_service.py:975
+      tags:
+        - 主机与镜像
+  /hosts/egress/chain:
+    get:
+      operationId: fleetEgressChain
+      summary: 只读:从单台 host 内核回读 OPENCLAW-EGRESS 链的真实证据
+      description: |-
+        不读 DDB,用一条只读 SSM 命令在指定 host 上回读 iptables,分三层报计数
+        (FORWARD 的 per-tap 层、INPUT 的红线端口层、tap 设备数),并判定 `verdict`。
+
+        判定分三种真实结论,刻意不合并:
+        - `EFFECTIVE` —— 链在、有指向在役链的 FORWARD 跳转、指纹非空,且跳转前没有会改变
+          guest 流量控制流的不安全规则。
+        - `SHORT_CIRCUITED` —— 链齐备但跳转前有不安全规则(只豁免严格 RELATED,ESTABLISHED
+          锚点与 DROP/REJECT/LOG),包可能进不了这条链;重新 apply 不一定能修。
+        - `NOT_EFFECTIVE` —— 链/跳转/规则缺失。
+        - `INCONCLUSIVE` —— **没读到**(实例离线、SSM 未达终态、输出被截断)。它与"链被拆了"
+          是两件事,所以单独一种;此时响应只有 instance_id/source/read_at/verdict/error。
+
+        读不到一律返回 **HTTP 200 + verdict=INCONCLUSIVE**,不返 5xx —— 5xx 与"链没装"
+        在调用方看来不可区分,而这正是本接口要分开的两件事。内部轮询预算 18s,严格小于
+        API Gateway 的 29s 窗口。
+      x-source: deploy/lambda/api/services/egress_admin_service.py:2282
+      x-rbac: admin
+      parameters:
+        - name: instance_id
+          in: query
+          required: true
+          schema:
+            type: string
+            pattern: '^i-'
+          description: 必填,且必须以 `i-` 开头。缺失/空/形状不对 → 400。
+          example: i-0abc123def4567890
+          x-source: deploy/lambda/api/services/egress_admin_service.py:2290
+      responses:
+        '200':
+          description: |-
+            内核证据(四种 verdict 都走 200)。`INCONCLUSIVE` 时只有
+            instance_id/source/read_at/verdict/error 五个键。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FleetEgressChain'
+              x-source: deploy/lambda/api/services/egress_admin_service.py:2545
+        '400':
+          description: '`instance_id` 缺失、非字符串、空串或不以 `i-` 开头。'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: instance_id is required and must start with 'i-'
+                x-source: deploy/lambda/api/services/egress_admin_service.py:2296
+        '403':
+          description: 调用者身份不是 admin,或前置 RBAC 路由门拒绝。
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: 'forbidden: fleet egress admin requires admin'
+                  required:
+                    type: string
+                    enum:
+                      - admin
+                x-source: deploy/lambda/api/services/egress_admin_service.py:2286
+      tags:
+        - 主机与镜像
+  /hosts/egress/rollback:
+    post:
+      operationId: fleetEgressRollback
+      summary: 按命名版本里的逐机 before 恢复 egress 期望态并重新下发
+      description: |-
+        取某个版本记录里按 host 存的 `before`,逐台写回期望态并按(mode, deny_rfc1918,
+        extra_allow)分组下发(每组一条 SSM 命令,每 50 台一批)。回滚本身也会再落一条版本
+        (`rollback_revision`),所以可以回滚回滚。
+
+        必知的三条:
+        1. `targets` **必填**,想回滚全部记录过的 host 要显式传 `"all"` —— 与 POST
+           /hosts/egress 同一套形状守卫和措辞。
+        2. 回滚的**持久性由 `egress_pinned` 决定**,不是由"已有显式 host 行"决定。
+           未 pin 的机器在下一次 `targets="all"` 发布刷新 fleet 单例 updated_at 后会被
+           覆盖;`fleet off` 仍穿透 pinned。响应用 `durability` 把两类机器分开列出。
+        3. 只回滚 host 行**不动 fleet 单例**:新建/重建的 host 仍会收敛到当前单例值。
+           要一并回滚必须显式 `restore_fleet_singleton=true`;没带时响应用
+           `fleet_singleton_not_restored=true` 明示。
+
+        break-glass 熔断记下的版本(`before_incomplete=true`)不是可用锚点 → 409。
+        期望态写失败的 host **不下发**,避免制造注定被下一轮 reconcile 撤销的内核窗口。
+      x-source: deploy/lambda/api/services/egress_admin_service.py:1687
+      x-rbac: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - revision
+                - targets
+              properties:
+                revision:
+                  type: string
+                  minLength: 1
+                  description: 必填。要回滚到的版本名;不存在 → 404(带 known_revisions 前 20 条)。
+                  x-source: deploy/lambda/api/services/egress_admin_service.py:1737
+                targets:
+                  description: |-
+                    **必填**(不像 POST /hosts/egress 那样默认 all)。`"all"` = 该版本记录过的
+                    全部 host;数组 = 只回滚这几台(不在版本里的进 `not_in_revision`,
+                    形状不像 instance id 的进 `rejected_targets`)。
+                  oneOf:
+                    - type: string
+                      enum:
+                        - all
+                    - type: array
+                      minItems: 1
+                      items:
+                        type: string
+                        minLength: 1
+                  x-source: deploy/lambda/api/services/egress_admin_service.py:1713
+                restore_fleet_singleton:
+                  type: boolean
+                  default: false
+                  description: |-
+                    提供时必须严格是布尔。`true` 时把版本里的 `__fleet__` 快照写回 fleet 单例;
+                    快照记的是"从未设置过"则清空单例,此时 `fleet_singleton_restored` 返字符串
+                    `"cleared"`(本接口唯一允许的 bool|string 扩展)。版本里没有 `__fleet__`
+                    快照却传 true → 400。
+                  x-source: deploy/lambda/api/services/egress_admin_service.py:1726
+                revision_name:
+                  type: string
+                  pattern: '^\s*$|^\s*[A-Za-z0-9._-]{1,48}\s*$'
+                  description: 这次回滚自身要落的版本名;规则同 POST /hosts/egress。省略/空串/纯空白则自动取 `v<N>`。
+                wait:
+                  type: boolean
+                  default: false
+                  description: |-
+                    `true` 时逐组顺序轮询 SSM。组数 >1 时响应带 `wait_warning`:顺序轮询可能
+                    超过 API Gateway 的 29s 窗口,那里的 504 **不代表回滚失败**,改轮询
+                    GET /hosts/egress。
+                  x-source: deploy/lambda/api/services/egress_admin_service.py:2132
+      responses:
+        '200':
+          description: |-
+            `wait=true`、全部分组下发成功、回收条数等于期望条数,且逐机 apply_exit=0 与
+            ssm_status=Success(`egress_admin_service.py:2153`)。
+            注意状态码**不看期望态写入**:`desired_state_failed` 非空时这里仍是 200/202 ——
+            那些机器的内核这一跳回去了,但期望态没回去,下一轮 host-agent reconcile 会把它们
+            拉回当前单例。持久性只能读 `desired_state_failed` / `desired_state_incomplete` /
+            `durability` 三个字段判(`:2118`)。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FleetEgressRollbackResult'
+              x-source: deploy/lambda/api/services/egress_admin_service.py:2165
+        '202':
+          description: |-
+            `wait=false` 且全部分组下发成功(`failed_dispatches` 为空)。同 200:
+            `desired_state_failed` 非空也照给 202,持久性另读那几个字段。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FleetEgressRollbackResult'
+              x-source: deploy/lambda/api/services/egress_admin_service.py:2140
+        '207':
+          description: 有分组下发失败(`failed_dispatches` 非空),或 `wait=true` 时有 host 未成功。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FleetEgressRollbackResult'
+              x-source: deploy/lambda/api/services/egress_admin_service.py:2140
+        '400':
+          description: |-
+            body 不是 JSON 对象;`targets` 缺失(必填)或形状不是 `"all"`/非空字符串数组;
+            `restore_fleet_singleton` 非布尔;`revision` 缺失或非字符串;
+            `restore_fleet_singleton=true` 但该版本没有 fleet 单例快照;`revision_name` 非法。
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: targets is required on rollback; pass "all" explicitly to roll back every recorded host
+                  got:
+                    type: string
+                    description: 仅 targets 形状错误时返回。
+                x-source: deploy/lambda/api/services/egress_admin_service.py:1701
+        '403':
+          description: 调用者身份不是 admin,或前置 RBAC 路由门拒绝。
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: 'forbidden: fleet egress admin requires admin'
+                  required:
+                    type: string
+                    enum:
+                      - admin
+                x-source: deploy/lambda/api/services/egress_admin_service.py:1691
+        '404':
+          description: 版本名不存在。
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: 'revision not found: ''v9'''
+                  known_revisions:
+                    type: array
+                    items:
+                      type: string
+                    description: 现有版本名的前 20 个(按 created_at 倒序)。
+                x-source: deploy/lambda/api/services/egress_admin_service.py:1762
+        '409':
+          description: |-
+            版本存在但不可用作回滚锚点:`before_incomplete=true`(记录时读不到改动前期望态的
+            break-glass 熔断);`before` 里没有任何可用 host 条目;记录里的 mode/source 非法;
+            或全部条目的 extra_allow 形状损坏。
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  hint:
+                    type: string
+                  before_incomplete_raw_type:
+                    type: string
+                  not_in_revision:
+                    type: array
+                    items:
+                      type: string
+                  rejected_targets:
+                    type: array
+                    items:
+                      type: string
+                  malformed_recorded_state:
+                    type: array
+                    items:
+                      type: object
+                x-source: deploy/lambda/api/services/egress_admin_service.py:1776
+        '503':
+          description: fail-closed:读不到历史版本、读不到当前期望态,或落不下这次回滚的版本记录。未写期望态、未下发。
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  hint:
+                    type: string
+                x-source: deploy/lambda/api/services/egress_admin_service.py:1746
       tags:
         - 主机与镜像
   /images:

@@ -393,14 +393,62 @@ MEM_OVERCOMMIT_RATIO={{MEM_OVERCOMMIT_RATIO}}
 OVERCOMMIT_BY_FAMILY={{OVERCOMMIT_BY_FAMILY}}
 ENVEOF
 
-# CLOUDFRONT_ORIGIN:CloudFront 分发域在 CDK 里晚于 LaunchTemplate 创建(循环依赖),
-# 无法在 userdata 模板渲染期拿到。改为运行时从 SSM Parameter 拉(setup.sh 部署后写入
-# /openclaw/cloudfront-origin)。launch-vm.sh:239 读此值设租户 gateway allowedOrigins,
-# 避免硬编码旧账号 CloudFront 域。拉不到则留空(launch-vm 有 fallback,但应保证 SSM 已写)。
-CF_ORIGIN=$(aws ssm get-parameter --name /openclaw/cloudfront-origin --region ${REGION} \
+# CLOUDFRONT_ORIGIN:allowedOrigins 事实源在 CDK 里晚于 LaunchTemplate 创建(循环依赖),
+# 无法在 userdata 模板渲染期拿到。运行时先拉 canonical
+# /openclaw/control-ui-allowed-origins(逗号分隔多值),空或 None 时兼容回落到旧参数
+# /openclaw/cloudfront-origin。launch-vm.sh 读此值设租户 gateway allowedOrigins,
+# 避免硬编码部署域。两者都拉不到则留空,由 harden-config 保留盘值并写 degraded marker。
+_CF_ORIGIN_PRIMARY=$(aws ssm get-parameter --name /openclaw/control-ui-allowed-origins --region ${REGION} \
   --query "Parameter.Value" --output text 2>/dev/null || echo "")
+if [ -n "${_CF_ORIGIN_PRIMARY}" ] && [ "${_CF_ORIGIN_PRIMARY}" != "None" ]; then
+  CF_ORIGIN="${_CF_ORIGIN_PRIMARY}"
+  _CF_ORIGIN_SOURCE="/openclaw/control-ui-allowed-origins"
+else
+  CF_ORIGIN=$(aws ssm get-parameter --name /openclaw/cloudfront-origin --region ${REGION} \
+    --query "Parameter.Value" --output text 2>/dev/null || echo "")
+  if [ -n "${CF_ORIGIN}" ] && [ "${CF_ORIGIN}" != "None" ]; then
+    _CF_ORIGIN_SOURCE="/openclaw/cloudfront-origin"
+  else
+    CF_ORIGIN=""
+    _CF_ORIGIN_SOURCE="<both-empty>"
+  fi
+fi
+# env key 名刻意不改:旧 launch-vm.sh 与黄金镜像都读取 CLOUDFRONT_ORIGIN。
 echo "CLOUDFRONT_ORIGIN=${CF_ORIGIN}" >> /etc/platform.env
-log "CLOUDFRONT_ORIGIN from SSM: ${CF_ORIGIN:-<empty, set /openclaw/cloudfront-origin>}"
+if [ "${_CF_ORIGIN_SOURCE}" = "<both-empty>" ]; then
+  log "CLOUDFRONT_ORIGIN from SSM: both /openclaw/control-ui-allowed-origins and /openclaw/cloudfront-origin empty; value=<empty>"
+else
+  log "CLOUDFRONT_ORIGIN from SSM ${_CF_ORIGIN_SOURCE}: ${CF_ORIGIN}"
+fi
+if [ "${CF_ORIGIN}" = "*" ]; then
+  log "WARN: CLOUDFRONT_ORIGIN='*' — Origin checking will be effectively disabled fleet-wide for every tenant on this host"
+else
+  _CF_ORIGIN_REST="${CF_ORIGIN}"
+  _CF_ORIGIN_LIST_HAS_WILDCARD=0
+  while :; do
+    case "${_CF_ORIGIN_REST}" in
+      *,*)
+        _CF_ORIGIN_ITEM="${_CF_ORIGIN_REST%%,*}"
+        _CF_ORIGIN_REST="${_CF_ORIGIN_REST#*,}"
+        ;;
+      *)
+        _CF_ORIGIN_ITEM="${_CF_ORIGIN_REST}"
+        _CF_ORIGIN_REST=""
+        ;;
+    esac
+    _CF_ORIGIN_ITEM="$(printf '%s' "${_CF_ORIGIN_ITEM}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    if [ "${_CF_ORIGIN_ITEM}" = "*" ]; then
+      _CF_ORIGIN_LIST_HAS_WILDCARD=1
+      break
+    fi
+    [ -n "${_CF_ORIGIN_REST}" ] || break
+  done
+  if [ "${_CF_ORIGIN_LIST_HAS_WILDCARD}" -eq 1 ]; then
+    log "WARN: CLOUDFRONT_ORIGIN contains '*' in resolved value '${CF_ORIGIN}' — Origin checking will be effectively disabled fleet-wide for every tenant on this host"
+  fi
+  unset _CF_ORIGIN_REST _CF_ORIGIN_ITEM _CF_ORIGIN_LIST_HAS_WILDCARD
+fi
+unset _CF_ORIGIN_PRIMARY _CF_ORIGIN_SOURCE
 
 # LITELLM_HOST:LiteLLM 网关地址(堡垒机 docker litellm:4000)。部署环境相关(堡垒机内网 IP
 # 跨账号/重建会变),不能烤死在黄金镜像(镜像 baseUrl 的 __LITELLM_HOST__ 烤时默认 127.0.0.1

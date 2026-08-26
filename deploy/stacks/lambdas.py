@@ -15,6 +15,7 @@ from aws_cdk import (
     aws_events as events,
     aws_events_targets as targets,
     aws_iam as iam,
+    aws_logs as logs,
     aws_sns as sns,
     aws_wafv2 as wafv2,
     aws_sqs as sqs,
@@ -454,22 +455,65 @@ def build_lambdas(self, ctx):
     # import 真模块的先例在 `scripts/checks/create-deadline-config.py:65`,那里的注释写得
     # 更直白:「import 真模块,它改了这里自动跟着改」。
     #
-    # 值的来源是 `config.yml` 的 `lifecycle.deadline_sec`(同源,见该段注释);缺段/缺项时
-    # **不注入那一档**,运行时回落到模块里同样那份客户表格值 —— 存量部署的 synth 因此只多出
-    # config 里真的写了的那些 key,不会凭空多七个。
+    # 值的来源是 `config.yml` 的 `lifecycle.deadline_sec`(同源,见该段注释);**缺段/缺项时
+    # 补模块里那份客户表格值**,八档一个不缺。
+    #
+    # ⚠ 这里原来写的是「缺项就不注入那一档,运行时回落到模块里同样那份客户表格值」——
+    # **那个假设在 Lambda 里不成立**,2026-08-26 apse1 全新部署实测推翻:
+    #   · `create_deadline._require_env()` 以 `AWS_LAMBDA_FUNCTION_NAME` 为判据,在 Lambda 里
+    #     恒为 True,于是 `deadline_sec_for()` 对**缺 env 的那一档直接 raise**,压根不回落;
+    #   · `handler.py:14` → `services.tenant_query_service` → `services.tenant_service:43`
+    #     是**模块导入期**就 import 本模块,`assert_deadline_config_sane()` 又在导入期遍历八档,
+    #     所以不是"走到写路径才炸",而是冷启动即 `Runtime.ExitError`,**每一条路由都 502**
+    #     (含 `GET /system/info`)。
+    # 而仓内除 `config.yml.example` 外的三份 config(含 `clawpool-deploy.sh all-imported`
+    # 复制的 `engineering/deploy/testbed-config/config.sg-testbed.yaml`)都没有这一段 ——
+    # 于是"按 runbook 走的全新部署"必然拿到一个全 502 的控制面。补齐是这条链上唯一
+    # 不削弱 G5 的修法:fail-closed 仍然只在**真的配错**时开火,而不是在"没写这段"时自锁。
     #
     # 插入位置必须在下面 `api_fn` 的 `environment=dict(_api_env)` 之【前】:那两处 `dict()`
     # 是快照,而 `CREATE_VIA_QUEUE` 就是在两次快照之间加的 —— 所以只有 consumer 拿到它。
     # 加在这里两个 Lambda 才都有。
     _dl_cfg = (CFG.get("lifecycle") or {}).get("deadline_sec") or {}
-    for _dl_action in _create_deadline.DEADLINE_ACTIONS:
-        if _dl_action in _dl_cfg:
-            _api_env[_create_deadline.env_name_for(_dl_action)] = str(
-                int(_dl_cfg[_dl_action])
-            )
 
-    # #564 G5 —— 死线值的**运行时载体**:SSM Parameter Store。与上面的 env 同源、同一段
-    # config(`lifecycle.deadline_sec`),缺项就两个载体都不建/不注入。
+    def _deadline_sec_for_deploy(action: str) -> int:
+        """该档要注入的秒数:config 写了就用 config,没写用模块的权威默认。
+
+        默认值取 `create_deadline.default_deadline_sec_for()`,不在这里另抄一份表 ——
+        与 env 名/参数名同一条理由:两边各抄一次就会出现「CDK 注入 180、代码认 600」。
+
+        config 里的值**在 synth 期就判死**,不做 `int()` 宽容转换。宽容转换会把
+        「配错」变成三种更难查的形态,而它们的终点与本次修的缺陷是同一个:
+          · `-1` / `0` → env 注入成 `"-1"`,`assert_deadline_config_sane()` 在 Lambda
+            **导入期** raise → 每条路由 502(而 `cdk deploy` 报成功);
+          · `180.5` → `int()` 静默截断成 180,线上跑的是另一个数、没人知道;
+          · `True` → `int(True) == 1`,一秒死线,每个 lifecycle 操作恒超时。
+        在 synth 期抛比在冷启动期抛便宜三个数量级:前者 `cdk deploy` 当场停,后者要先
+        部完、再全 502、再翻 awslambdaric 被 latin-1 遮蔽过的日志。
+        """
+        if action not in _dl_cfg:
+            return int(_create_deadline.default_deadline_sec_for(action))
+        raw = _dl_cfg[action]
+        # bool 先排:它是 int 的子类,不先判就会被下面那条放过去。
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+            raise ValueError(
+                f"config.yml lifecycle.deadline_sec.{action}={raw!r} is not a "
+                f"positive integer; it would be injected as "
+                f"{_create_deadline.env_name_for(action)} and make every route 502 "
+                f"at cold start (or silently truncate). Fix config.yml or remove the "
+                f"key to take the built-in default "
+                f"({_create_deadline.default_deadline_sec_for(action)}s)."
+            )
+        return int(raw)
+
+    for _dl_action in _create_deadline.DEADLINE_ACTIONS:
+        _api_env[_create_deadline.env_name_for(_dl_action)] = str(
+            _deadline_sec_for_deploy(_dl_action)
+        )
+
+    # #564 G5 —— 死线值的**运行时载体**:SSM Parameter Store。与上面的 env 同源于同一段
+    # config(`lifecycle.deadline_sec`),而 config 缺项时两边都用 `create_deadline` 的
+    # **模块权威默认值**补齐(#630),所以八档恒全覆盖、不存在只建一半的形态。
     #
     # **为什么 env 不够、必须再加一个载体**:客户要的是「改配置即生效」,而真机实测证明改
     # Lambda env 做不到 —— 流量走 `live` 别名 → 已发布版本,而**已发布版本的 env 是冻结的**
@@ -485,14 +529,14 @@ def build_lambdas(self, ctx):
     #
     # 下次 `cdk deploy` 会把手改的值覆盖回 config —— 那是刻意的(config 才是长期真相),
     # 漂移由 `create-deadline-config.py --live` 的复检兜。
+    # 两个载体必须**同时**覆盖八档:只建 config 里写了的那些,会让没写的那档 env 可改而
+    # 参数不可改,`/system/info` 报的 `source` 也跟着分叉 —— 与上面同一个缺陷类。
     for _dl_action in _create_deadline.DEADLINE_ACTIONS:
-        if _dl_action not in _dl_cfg:
-            continue
         ssm.StringParameter(
             self,
             f"LifecycleDeadlineSec{_dl_action.capitalize()}",
             parameter_name=_create_deadline.param_name_for(_dl_action),
-            string_value=str(int(_dl_cfg[_dl_action])),
+            string_value=str(_deadline_sec_for_deploy(_dl_action)),
             description=(
                 f"openclaw lifecycle deadline for '{_dl_action}' in seconds. "
                 "Edit with `aws ssm put-parameter --overwrite` for an immediate "
@@ -1364,6 +1408,34 @@ def build_lambdas(self, ctx):
     waf_cfg = CFG.get("waf", {}) or {}
     if waf_cfg.get("enabled", False):
         rate_limit = int(waf_cfg.get("rate_limit_per_ip", 1000))
+        evaluation_window_sec = int(waf_cfg.get("evaluation_window_sec", 300))
+        if evaluation_window_sec not in (60, 120, 300, 600):
+            raise ValueError(
+                "waf.evaluation_window_sec must be one of "
+                f"{{60, 120, 300, 600}}, got {evaluation_window_sec!r}"
+            )
+        if not 10 <= rate_limit <= 2000000000:
+            raise ValueError(
+                "waf.rate_limit_per_ip must be in [10, 2000000000], "
+                f"got {rate_limit!r}"
+            )
+
+        _waf_per_ip_rps = rate_limit / evaluation_window_sec
+        _api_throttle_rate_limit = int(
+            (CFG.get("api", {}) or {}).get("throttle_rate_limit", 100)
+        )
+        # 这里只警告、不 raise:仓内现有配置本来就是 500 vs 1000/300。若改成硬失败,
+        # 每次照 runbook 部署都会被阻断,把可诊断性缺陷升级成部署阻塞。这条门只负责
+        # 让两层限流的矛盾在 synth 输出可见,安全姿态仍由运维明确取舍。
+        if _waf_per_ip_rps < _api_throttle_rate_limit:
+            print(
+                "[#632 waf.rate_limit] WARNING: "
+                f"waf.rate_limit_per_ip={rate_limit} / "
+                f"waf.evaluation_window_sec={evaluation_window_sec} = "
+                f"{_waf_per_ip_rps:.2f} req/s, "
+                f"api.throttle_rate_limit={_api_throttle_rate_limit} req/s; "
+                "单来源 IP 的真实上限是这两者取小。"
+            )
         # 两条 baseline,作为不可被 config.yml 静默裁掉的安全底线(同 IMDS 加固
         # 的显式不可回退姿态)。SQLi→OWASP A03 注入;IpReputation→A06/A10 已知
         # 恶意 IP。dict.fromkeys 对 config∪baseline 去重保序(WebACL 重复规则名
@@ -1388,6 +1460,9 @@ def build_lambdas(self, ctx):
                     rate_based_statement=wafv2.CfnWebACL.RateBasedStatementProperty(
                         limit=rate_limit,
                         aggregate_key_type="IP",
+                        # 显式 300 与 AWS 隐式默认同值,运行时行为不变;只是把 req/s
+                        # 折算分母写进代码和模板。AWS 只允许 60/120/300/600。
+                        evaluation_window_sec=evaluation_window_sec,
                     ),
                 ),
                 visibility_config=wafv2.CfnWebACL.VisibilityConfigProperty(
@@ -1449,12 +1524,89 @@ def build_lambdas(self, ctx):
                 api.deployment_stage.stage_name,
             ],
         )
-        wafv2.CfnWebACLAssociation(
+        web_acl_association = wafv2.CfnWebACLAssociation(
             self,
             "ApiWebACLAssociation",
             resource_arn=stage_arn,
             web_acl_arn=web_acl.attr_arn,
         )
+        web_acl_association.add_dependency(web_acl)
+
+        if waf_cfg.get("logging_enabled", True):
+            _waf_log_group_name = str(
+                waf_cfg.get("log_group_name", "aws-waf-logs-openclaw-api")
+            ).strip()
+            if not _waf_log_group_name.startswith("aws-waf-logs-"):
+                raise ValueError(
+                    "waf.log_group_name must start with 'aws-waf-logs-', "
+                    f"got {_waf_log_group_name!r}"
+                )
+
+            waf_log_group = logs.LogGroup(
+                self,
+                "ApiWafLogGroup",
+                log_group_name=_waf_log_group_name,
+                retention=logs.RetentionDays.THREE_MONTHS,
+                removal_policy=RemovalPolicy.DESTROY,
+            )
+            waf_logging = wafv2.CfnLoggingConfiguration(
+                self,
+                "ApiWafLoggingConfiguration",
+                resource_arn=web_acl.attr_arn,
+                log_destination_configs=[waf_log_group.log_group_arn],
+                # issue 只要求至少留下 BLOCK 证据;千级 lifecycle 下全量 KEEP
+                # 只会放大 CloudWatch Logs 成本,默认丢弃非 BLOCK。
+                #
+                # **`LoggingFilter` 必须写成 PascalCase 的裸 dict**:CDK 的
+                # `LoggingFilterProperty` 对 `AWS::WAFv2::LoggingConfiguration` 不做 key
+                # 大小写转换,会渲染成 `defaultBehavior` / `filters[].behavior`,而 CFN
+                # 只认 `DefaultBehavior` / `Filters[].Behavior`
+                # (见 aws-resource-wafv2-loggingconfiguration.html 的官方示例)。
+                # 后果不是 synth 报错而是**部署期静默不生效**,所以 tests/test_waf.py
+                # 逐键断言 PascalCase。
+                logging_filter={
+                    "DefaultBehavior": "DROP",
+                    "Filters": [
+                        {
+                            "Behavior": "KEEP",
+                            "Requirement": "MEETS_ANY",
+                            "Conditions": [
+                                {"ActionCondition": {"Action": "BLOCK"}}
+                            ],
+                        }
+                    ],
+                },
+                # x-api-key 是凭据,绝不能进入 WAF 日志;即使只保留 BLOCK 也必须脱敏。
+                #
+                # `authorization` 同样必须脱敏,而且漏了它比漏 x-api-key 更糟:WAF 日志
+                # 的 `httpRequest.headers` 是**全表**(logging-fields.html:"headers —
+                # The list of headers"),而本文件 CORS 放行了 `Authorization`(见上文
+                # allow_headers),控制台 BFF 走 Cognito JWT、`CTRL_API_AUTH_MODE=iam`
+                # 走 SigV4,两者都把凭据放在这个头里。只 redact x-api-key 的话,每条被
+                # BLOCK 的请求都会把可重放的 bearer token 完整写进 CloudWatch Logs ——
+                # 那正是这段代码新建出来的日志沉淀点,等于亲手造了一个凭据泄漏面。
+                # `RedactedFields` 只接受 UriPath / QueryString / SingleHeader / Method
+                # 四种,上限 100 项(API_LoggingConfiguration.html),两项都合法。
+                #
+                # 外层用 `FieldToMatchProperty`(它会把 `single_header` 正确渲染成
+                # `SingleHeader`),内层的 `{"Name": ...}` 必须是裸 dict:
+                # `SingleHeaderProperty(name=…)` 会渲染成小写 `name`,CFN 不认 → redact
+                # 静默失效 → api key 进日志。反过来整个元素写成裸 dict 也不行:jsii 会
+                # 按 `FieldToMatchProperty` 的字段名过滤,`SingleHeader` 不是合法 kwarg,
+                # 整项被抹成 `{}`。两种错法都不报错,只有断言能抓住。
+                #
+                # 头名必须小写:WAF 匹配 header 名前先全部转小写,写 `Authorization`
+                # 会匹配不上、redact 静默失效(与 x-api-key 同一条规则)。
+                redacted_fields=[
+                    wafv2.CfnLoggingConfiguration.FieldToMatchProperty(
+                        single_header={"Name": "x-api-key"}
+                    ),
+                    wafv2.CfnLoggingConfiguration.FieldToMatchProperty(
+                        single_header={"Name": "authorization"}
+                    ),
+                ],
+            )
+            waf_logging.add_dependency(web_acl)
 
     key_required = {"api_key_required": True}
     # authorizer to every keyed method so requestContext.authorizer.platform_id

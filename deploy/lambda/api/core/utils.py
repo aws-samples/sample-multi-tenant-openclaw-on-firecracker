@@ -12,19 +12,18 @@ import hashlib
 import json
 import re
 import time
+from decimal import Decimal
 
 
 def _gen_id(name, client_token="", owner_id=""):
     """Generate tenant id: name-xxxx (4 char hash).
 
-    #93 / api-design-review C1 — idempotency. Without a client_token the hash seed
     is time.time() (a fresh id every call, legacy behavior preserved). WITH a
     client_token the seed is deterministic → the SAME id every time, so a retried
     POST with the same token collides on the conditional put (attribute_not_exists
     (id)) and returns 409 instead of opening a second VM (EC2 ClientToken
     semantics). client_token is optional (C3) so SDK auto-generation isn't forced.
 
-    #95 adversarial C-002 (idempotency-key-as-decoration): on the idempotent path
     the WHOLE id — prefix included — must be name-independent. If `name` appeared
     anywhere in the id (even as a cosmetic prefix), the same client_token with a
     different name would produce a different primary key and slip past
@@ -118,11 +117,9 @@ def _validate_security(sec):
     return clean, None
 
 
-# #118/#116 — credential injection (in-transit encrypted). Distinct from
 # `security` (that is at-rest storage config). Env var names per POSIX + the
 # dotenv the host writes to the read-only creds disk (see launch-vm.sh).
 _ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
-# #118 安全评审 MEDIUM 修复:一条注入凭据最终落成 guest 的 dotenv NAME=value 行,
 # OpenClaw 原生 dotenv loader 灌进 process.env,agent 的 exec 子进程继承。有些 env
 # NAME 会在解释器/shell 启动早期执行代码 —— 在 in-guest 护栏(sentinel/acl-guard)加载
 # 前就跑,等于预护栏 RCE。cred-inject.sh 的 value 侧已花力气拒控制字符防同一 NODE_OPTIONS
@@ -213,7 +210,6 @@ def _validate_injected_credentials(raw, configured_cmk_arn=""):
         ct = it.get("ciphertext")
         if not isinstance(name, str) or not _ENV_NAME_RE.match(name):
             return None, "item.name must match ^[A-Z_][A-Z0-9_]*$ (POSIX env var name)"
-        # #118 安全评审 MEDIUM:拒会在业务代码/护栏加载前执行代码的危险 env 名
         # (NODE_OPTIONS/LD_PRELOAD/BASH_ENV 等),否则等于 guest 预护栏 RCE 面。
         if name in _DANGEROUS_ENV_NAMES or any(
             name.startswith(p) for p in _DANGEROUS_ENV_PREFIXES
@@ -253,7 +249,6 @@ def _normalize_injected_parameters(body):
     params = body.get("injected_parameters")
     if params is not None:
         return params
-    # #149 目标态别名:env_injected_credentials {scheme, items:{<field>:<enc:v1: 值>}}
     # 已是新形态,直接当 injected_parameters;若同时带 claw_injected_credentials.llm_key
     # 则并入 items(llm_key 是 registry 的 config-class field,空值走 empty_fallback)。
     env_inj = body.get("env_injected_credentials")
@@ -300,17 +295,13 @@ _TAG_MAX_VALUE_LEN = 100
 _TAG_MAX_COUNT = 20
 _NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$")
 
-# #106/#108 — external-platform id validator. Shared by core.auth
 # (_platform_id_from_claims) and the tenant CRUD/query paths (list_tenants
 # ?platform_id filter, create_tenant body override, tenant_access_grant).
 # Kept here in core.utils (with the other validation regexes) so it has a
-# single home usable by both the auth leaf and the tenant service (#132 T1.1).
 # \Z 而非 $:$ 在 re.match 下也匹配「末尾换行前」,`"plat\n"` 会被 $ 放行(尾换行绕过
-# 校验)。\Z 只匹配绝对末尾。#106 起 platform_id 除 /tenantmatch(#97)外还落租户记录 +
 # 供 ?platform_id 筛选,尾换行绕过会让「能落库却筛不回」,故收紧为 \Z(纯加固,合法值行为不变)。
 _PLATFORM_ID_RE = re.compile(r"^[a-zA-Z0-9._-]{1,128}\Z")
 
-# #143 — validators for the api-key create-on-behalf attribution override.
 # owner_id must be a Cognito sub: a user-pool sub is always a UUID (native and
 # federated alike), and every owner check downstream compares owner_id == sub,
 # so anything else could never match a caller — reject at the edge. \Z (not $)
@@ -532,7 +523,6 @@ def _parse_next_token(token):
 
     Absent → (None, None) (first page). Present but not a valid opaque cursor
     (bad base64, non-JSON, or a JSON value that isn't an object) → 400 VALIDATION.
-    #95 adversarial D-06/07/10/11: a tampered/garbage next_token used to silently
     reset to page 1, which traps a paging client in an infinite first-page loop
     and masks cursor corruption. AWS API standard D3: an opaque token must be
     rejected, not reinterpreted. A structurally valid but foreign cursor (D-08/09)
@@ -546,6 +536,22 @@ def _parse_next_token(token):
     return key, None
 
 
+# #637 —— boto3.resource 读回的 DDB N 是 Decimal,响应边界不能沿用 default=str 把数字
+# 全变成 JSON 字符串。转换纪律对齐 core/host_taint.py::_epoch_or_none:整值 Decimal 才转
+# int,非整值保留为 float、绝不静默截断。bool 不会冒充整数是因为 json.dumps 原生序列化
+# bool、default= 钩子根本收不到它 —— 改动本函数时不要把 bool 纳入数值分支。序列化器不能像该函数一样
+# 省略拿不准的键,因此非有限 Decimal 保留字符串:若转 float,json.dumps 会输出裸
+# NaN/Infinity(不是合法 JSON、严格解析器会失败);字符串虽不漂亮,但可解析且保留存储损坏事实。
+def _json_default(value):
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            return str(value)
+        if value == value.to_integral_value():
+            return int(value)
+        return float(value)
+    return str(value)
+
+
 def _resp(code, body, headers=None):
     h = {
         "Content-Type": "application/json",
@@ -557,7 +563,7 @@ def _resp(code, body, headers=None):
     return {
         "statusCode": code,
         "headers": h,
-        "body": json.dumps(body, default=str),
+        "body": json.dumps(body, default=_json_default),
     }
 
 

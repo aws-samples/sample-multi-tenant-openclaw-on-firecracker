@@ -9,10 +9,11 @@
 # 的缺陷在单测里全绿通过,只有真机才炸(usw2 2026-08-24 实测 500)。
 # 本脚本起真 OpenResty + 真 Redis,让阶段限制自己说话。
 #
-# 判别性设计(两条臂,缺一不可):
+# 判别性设计(三条数据面臂,缺一不可):
 #   ARM A = 仓库当前代码       → 期望:无 `API disabled`,失败对端得 503,换 route 后恢复 200
 #   ARM B = 注入 pre-#606 形状 → 期望:**必须**出现 `API disabled` 且客户拿 500
-# ARM B 是这个探针的自证:少了它,"没看到 API disabled"可能只是因为重投分支从没跑到。
+#   ARM C = 注入 pre-#628 形状 → 期望:复用失败坐标,访问日志出现两个相同 upstream
+# ARM B/C 是这个探针的自证:少了它们,"没看到缺陷"可能只是因为重投分支从没跑到。
 #
 # 上游契约:lua-resty-core/lib/ngx/balancer.md 要求把需要 cosocket 的解析(例:DNS)
 # 放在 `access_by_lua*` 等更早阶段、经 `ngx.ctx` 传进 balancer;lua-nginx-module
@@ -26,7 +27,8 @@
 #   · 本机 mac: bash deploy/edge/test/integration/run_local_docker.sh(起容器后调本脚本)
 #
 # 需要:openresty 可执行、bash、awk、envsubst(gettext)、可达的 Redis。
-# 退出码:0 = 两条臂都符合期望;1 = 有断言失败;2 = 环境不满足(SKIP)。
+# 退出码:0 = 三条数据面臂与 readiness 负向臂都符合期望;1 = 有断言失败;
+# 2 = 环境不满足(SKIP)。
 #
 # 安全:本脚本会把 lua 模块写进 /usr/local/openresty/lualib/edge/ 并起临时
 # openresty 实例,只应在一次性容器/CI job 里跑。检测到 claw-edge.service 就拒绝,
@@ -41,6 +43,7 @@ REDIS_PORT="${REDIS_PORT:-6379}"
 EDGE_PORT="${EDGE_PORT:-8080}"
 PEER_PORT="${PEER_PORT:-10000}"
 DEAD_PORT="${DEAD_PORT:-10099}"
+BLACKHOLE_PORT="${BLACKHOLE_PORT:-10098}"
 LUALIB="/usr/local/openresty/lualib"
 OPENRESTY="${OPENRESTY:-}"
 
@@ -55,13 +58,25 @@ check() { # check <name> <exit-code> <detail>
 }
 
 WORK=""
-stop_instance() { # stop_instance <edge|peer> —— 只停指定实例。两条臂之间只重启 edge,
+stop_instance() { # stop_instance <edge|peer> —— 只停指定实例并【等它真的退出】。
                   # 活对端必须一直在(早期版本连 peer 一起停,T2 就永远连不上)。
+                  # 早期版本 kill -QUIT 之后只 sleep 1 就往下走:ARM B 的 worker 在
+                  # balancer 阶段抛错后优雅退出要超过 1s,下一条臂 bind 9145 撞
+                  # "Address in use",被报成"OpenResty 起不来"这种误导性的红。所以
+                  # 轮询到进程真的消失,超时再降级成快速退出,最后才 KILL。
     [ -n "$WORK" ] || return 0
-    if [ -f "$WORK/$1/logs/nginx.pid" ]; then
-        kill -QUIT "$(cat "$WORK/$1/logs/nginx.pid")" 2>/dev/null
-        sleep 1
-    fi
+    local pidfile="$WORK/$1/logs/nginx.pid" pid sig
+    [ -f "$pidfile" ] || return 0
+    pid="$(cat "$pidfile" 2>/dev/null)"
+    [ -n "$pid" ] || return 0
+    for sig in QUIT TERM KILL; do
+        kill "-$sig" "$pid" 2>/dev/null
+        for _ in $(seq 1 10); do
+            kill -0 "$pid" 2>/dev/null || return 0
+            sleep 1
+        done
+    done
+    return 0
 }
 # shellcheck disable=SC2329  # 由下面的 trap 调用
 cleanup() {
@@ -128,8 +143,13 @@ set_route() { # set_route <tid> <host> <port>
 #   1. error_log  syslog: → 文件
 #   2. access_log syslog: → 文件
 #   3. worker_processes auto → 1
+#   4. proxy_read_timeout 3600s → ${EDGE_READ_TIMEOUT:-25}s:出口 2 需要读超时在
+#      探针预算内触发;T1/T2/ARM B/ARM W 都不经过读超时,行为不受影响。
+#      25s 不是随手取的:T3 里 R1 必须一直挂在黑洞上,直到 R2 真的把活对端写进
+#      路由缓存 L2(R2 最多重试 3 次,最晚约 t+17s 收敛,见 T3 那段注释),而黑洞
+#      fixture 只 hold 30s,所以这个值必须落在 (17, 30) 里。
 # 占位符按 install-edge.sh 的同一份 envsubst 列表替换。其余字节保持原样,
-# 下面用 diff 断言"没有第 4 类偏离"。
+# 下面用 diff 断言"没有第 5 类偏离"。
 render_conf() { # render_conf [redis-host] [redis-port] —— 默认用真 Redis 坐标;
                 # #639 的负向臂传一个死端口,证明探不到 Redis 时 /healthz 不翻 200。
     # shellcheck disable=SC2016  # envsubst 的白名单参数必须是字面量,不能展开
@@ -142,7 +162,8 @@ render_conf() { # render_conf [redis-host] [redis-port] —— 默认用真 Redi
     | sed \
         -e "s#^error_log syslog:.*#error_log $WORK/edge-error.log notice;#" \
         -e "s#^\( *\)access_log syslog:.*#\1access_log $WORK/edge-access.log edge_access;#" \
-        -e 's#^worker_processes  *auto;#worker_processes 1;#'
+        -e 's#^worker_processes  *auto;#worker_processes 1;#' \
+        -e "s#^\( *\)proxy_read_timeout  *3600s;#\1proxy_read_timeout ${EDGE_READ_TIMEOUT:-25}s;#"
 }
 render_conf >"$WORK/nginx.conf"
 
@@ -152,8 +173,8 @@ diff "$EDGE_DIR/nginx.conf" "$WORK/nginx.conf" | grep '^[<>]' | sed 's/^/    /'
 # 交给 edge.lib.hints 的四个坐标(#639)。后者渲染后的行不含 edge_redis 字样,所以键名要
 # 逐个列进白名单 —— 列的是这四个确定的键,不是放宽成任意行,其它偏离照旧判红。
 UNEXPECTED="$(diff "$EDGE_DIR/nginx.conf" "$WORK/nginx.conf" | grep '^[<>]' \
-    | grep -vcE 'error_log|access_log|worker_processes|ENGINE_REDIS|EDGE_SELF_IP|edge_redis|edge_self_ip|primary_host|primary_port|reader_host|reader_port')"
-check "渲染只含声明过的 3 类偏离 + 5 个占位符(server 块 + init_by_lua_block 两处)" \
+    | grep -vcE 'error_log|access_log|worker_processes|proxy_read_timeout|ENGINE_REDIS|EDGE_SELF_IP|edge_redis|edge_self_ip|primary_host|primary_port|reader_host|reader_port')"
+check "渲染只含声明过的 4 类偏离 + 5 个占位符(server 块 + init_by_lua_block 两处)" \
     "$([ "$UNEXPECTED" = "0" ] && echo 0 || echo 1)" "意外差异行=$UNEXPECTED"
 
 # ── 活对端:返回可判别 body,用来证明重投真的换到了新 peer ─────────────────
@@ -167,6 +188,10 @@ http {
     server {
         listen $PEER_PORT;
         location / { default_type text/plain; return 200 "LIVE-PEER-OK\n"; }
+    }
+    server {
+        listen $BLACKHOLE_PORT;
+        location / { content_by_lua_block { ngx.sleep(30) } }
     }
 }
 PEERCONF
@@ -186,9 +211,19 @@ sleep 1
 peer_probe
 check "活对端 127.0.0.1:$PEER_PORT 自证可达(返回 LIVE-PEER-OK)" $?
 
+blackhole_probe() {
+    exec 6<>"/dev/tcp/127.0.0.1/$BLACKHOLE_PORT" 2>/dev/null || return 1
+    printf 'GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' >&6
+    local line rc
+    IFS= read -r -t 5 line <&6
+    rc=$?
+    exec 6<&- 2>/dev/null; exec 6>&- 2>/dev/null
+    [ "$rc" -ne 0 ]
+}
+
 
 # ── ARM B:把 pre-#606 的形状放回 _retry_refresh_desc(只改这一个函数体) ──
-cat >"$WORK/inject.lua" <<'INJECT'
+cat >"$WORK/inject-B.lua" <<'INJECT'
 function _M._retry_refresh_desc(ctx, state, code)
     local tid = ctx.tenant_id
     if not tid then return false end
@@ -208,19 +243,48 @@ function _M._retry_refresh_desc(ctx, state, code)
 end
 INJECT
 
-deploy_lua() { # deploy_lua <arm: A|B>
+# ── ARM C:把 pre-#628 的"复用旧坐标"形状放回 _retry_refresh_desc ───────
+cat >"$WORK/inject-C.lua" <<'INJECT'
+function _M._retry_refresh_desc(ctx, state, code)
+    local tid = ctx.tenant_id
+    if not tid then return false end
+    ngx.log(ngx.WARN, "balancer retry for tenant ", tid,
+        " (upstream failed state=", tostring(state), " code=", tostring(code),
+        "); ARM-C injected pre-#628 shape: reuse old desc when no different peer")
+    local backend = require "edge.lib.backend"
+    local shared = ngx.shared.route_cache
+    local cached = backend.peek_cached(shared, tid)
+    if cached and not same_peer(cached, ctx.route_desc) then
+        ctx.route_desc = cached
+        ctx.route_source = backend.SOURCE_L2
+        return true
+    end
+    backend.mark_retry_stale(shared, tid)
+    -- pre-#628:保留旧 desc,让 set_current_peer 再撞一次同一个坐标。
+    -- 50311a01 原版返回 nil;当前调用方把 nil 当 false 并 fail-closed,所以这里必须返回 true。
+    return true
+end
+INJECT
+
+deploy_lua() { # deploy_lua <arm: A|B|C>
+    local arm="$1" inject="$WORK/inject-$1.lua" marker
     rm -rf "$LUALIB/edge"
     mkdir -p "$LUALIB/edge/lib"
     cp "$EDGE_DIR"/lib/*.lua "$LUALIB/edge/lib/"
     cp "$EDGE_DIR/route.lua" "$LUALIB/edge/"
-    [ "$1" = "B" ] || return 0
+    [ -f "$inject" ] || return 0
+    case "$arm" in
+        B) marker='ARM-B injected pre-#606 shape' ;;
+        C) marker='ARM-C injected pre-#628 shape' ;;
+        *) return 1 ;;
+    esac
     awk 'FNR==NR { inj = inj $0 ORS; next }
          /^function _M\._retry_refresh_desc/ { printf "%s", inj; skip = 1; next }
          skip && /^end$/ { skip = 0; next }
          skip { next }
-         { print }' "$WORK/inject.lua" "$EDGE_DIR/lib/balancer.lua" \
+         { print }' "$inject" "$EDGE_DIR/lib/balancer.lua" \
         >"$LUALIB/edge/lib/balancer.lua"
-    grep -q 'ARM-B injected pre-#606 shape' "$LUALIB/edge/lib/balancer.lua"
+    grep -qF "$marker" "$LUALIB/edge/lib/balancer.lua"
 }
 
 start_edge() { # start_edge [conf] —— 起 edge 并等 /healthz=200
@@ -239,8 +303,8 @@ start_edge() { # start_edge [conf] —— 起 edge 并等 /healthz=200
 }
 
 # 只用 bash 内建 /dev/tcp 说 HTTP,避免依赖 curl/wget(openresty:alpine 不带 curl)。
-http_req() { # http_req <path> <ws?> → 原始响应
-    local path="$1" ws="${2:-}"
+http_req() { # http_req <path> <ws?> [read-timeout] → 原始响应
+    local path="$1" ws="${2:-}" read_timeout="${3:-8}"
     exec 4<>"/dev/tcp/127.0.0.1/$EDGE_PORT" 2>/dev/null || return 1
     { printf 'GET %s HTTP/1.1\r\n' "$path"
       printf 'Host: 127.0.0.1:%s\r\n' "$EDGE_PORT"
@@ -257,27 +321,49 @@ http_req() { # http_req <path> <ws?> → 原始响应
       printf '\r\n'
     } >&4
     local line
-    while IFS= read -r -t 8 line <&4; do printf '%s\n' "${line%$'\r'}"; done
+    while IFS= read -r -t "$read_timeout" line <&4; do printf '%s\n' "${line%$'\r'}"; done
     exec 4<&- 2>/dev/null; exec 4>&- 2>/dev/null
 }
 http_code() { http_req "$1" "${2:-}" | head -1 | awk '{print $2}'; }
-ws_req() {  # ws_req <tid> → "<code> <body-last-line>"
-    local raw; raw="$(http_req "/ws/$1" ws)"
+ws_req() {  # ws_req <tid> [read-timeout] → "<code> <body-last-line>"
+    local raw; raw="$(http_req "/ws/$1" ws "${2:-8}")"
     printf '%s %s' "$(printf '%s' "$raw" | head -1 | awk '{print $2}')" \
         "$(printf '%s' "$raw" | grep -c 'LIVE-PEER-OK')"
 }
 errlog() { cat "$WORK/edge-error.log" 2>/dev/null; }
+wait_errlog() { # wait_errlog <固定串> [秒数] —— 【等】一条证据出现在 error.log,返回 0/1。
+                # 为什么不能一次性 grep:warmup 探测是 route.lua 里 2s 一跳的异步
+                # timer,实测第一条失败日志落在 nginx 启动后约 4s(09:42:36 起、
+                # 09:42:40 才出第一条)。一次性采样会在负载高的机器上采在写入之前,
+                # 而同一条断言的 detail(tail -2)在几微秒后才取,于是打印出
+                # 【自相矛盾的红】:FAIL 的详情里明明就有要 grep 的那句话。
+                # 2026-08-26 本机实测撞过一次(PASS=45 FAIL=1),同一份代码重跑即
+                # PASS=46 FAIL=0 —— 观察窗口必须长于重试节拍,否则这条断言既能假红
+                # 也能在真缺陷下假绿(日志永远不出现和"还没出现"分不开)。
+                # 直接 grep 文件而不是 cat|grep:少一层管道,顺带避开 pipefail 下
+                # grep -q 早退把 SIGPIPE 算进管道状态的那类坑。
+    local pat="$1" secs="${2:-15}" _i
+    for _i in $(seq 1 "$secs"); do
+        grep -qF "$pat" "$WORK/edge-error.log" 2>/dev/null && return 0
+        sleep 1
+    done
+    return 1
+}
 
-run_arm() { # run_arm <A|B>
+run_arm() { # run_arm <A|B|C>
     local arm="$1"
     local tid="t-probe-$arm-$RANDOM"
     echo
     echo "== ARM $arm =="
     stop_instance edge
     if ! deploy_lua "$arm"; then
-        check "ARM $arm: lua 部署(ARM B 注入生效)" 1 "注入后找不到标记"; return
+        check "ARM $arm: lua 部署(该 arm 注入标记生效)" 1 "注入后找不到标记"; return
     fi
-    check "ARM $arm: lua 部署到 $LUALIB/edge(ARM B 注入已生效)" 0
+    if [ -f "$WORK/inject-$arm.lua" ]; then
+        check "ARM $arm: lua 部署到 $LUALIB/edge(该 arm 注入标记已核对)" 0
+    else
+        check "ARM $arm: lua 部署到 $LUALIB/edge(仓库当前代码)" 0
+    fi
     if ! start_edge; then
         check "ARM $arm: OpenResty 起来且 /healthz=200" 1 "$(errlog | tail -3)"; return
     fi
@@ -286,7 +372,7 @@ run_arm() { # run_arm <A|B>
     # 坐标通道一断,warmup_probe 会不探测就标 ready —— /healthz 200、只有一行日志、
     # 没有指标,#618 的 readiness 门就此形同虚设,而新起的实例会带着空缓存接流量。
     check "ARM $arm: /healthz=200 是探到 Redis 换来的(warmup ok 出现)" \
-        "$(errlog | grep -qF 'edge warmup ok; healthz now 200' && echo 0 || echo 1)" \
+        "$(wait_errlog 'edge warmup ok; healthz now 200' 5 && echo 0 || echo 1)" \
         "error.log 里没有 'edge warmup ok'"
     check "ARM $arm: warmup 没有走「无坐标直接标 ready」分支" \
         "$(errlog | grep -qF 'refusing to mark ready without a probe' && echo 1 || echo 0)" \
@@ -299,13 +385,89 @@ run_arm() { # run_arm <A|B>
 
     # T1:route 指向死端口 → 上游 connect refused → 必进重投分支
     set_route "$tid" "127.0.0.1" "$DEAD_PORT"
+    : >"$WORK/edge-access.log"
     local r1 c1; r1="$(ws_req "$tid")"; c1="${r1% *}"
-    echo "  T1 route→死端口($DEAD_PORT): http=$c1"
+    sleep 1
+    local t1_access t1_lines t1_upstream
+    t1_access="$(cat "$WORK/edge-access.log" 2>/dev/null)"
+    t1_lines="$(wc -l <"$WORK/edge-access.log" | tr -d ' ')"
+    t1_upstream="$(printf '%s\n' "$t1_access" \
+        | sed -n 's/.*"upstream_addr":"\([^"]*\)".*/\1/p')"
+    echo "  T1 route→死端口($DEAD_PORT): http=$c1 ua=[$t1_upstream]"
 
     # T2:route 换成活对端(模拟 rebuild/restore 完成)→ 下一次请求应恢复
     set_route "$tid" "127.0.0.1" "$PEER_PORT"
     local r2 c2 hit2; r2="$(ws_req "$tid")"; c2="${r2% *}"; hit2="${r2##* }"
     echo "  T2 route→活对端($PEER_PORT): http=$c2 live-peer-marker=$hit2"
+
+    if [ "$arm" = "A" ]; then
+        local tid3="$tid-t3"
+        blackhole_probe
+        check "ARM A T3-1: 黑洞对端 127.0.0.1:$BLACKHOLE_PORT 自证(5s 内无状态行)" $?
+
+        set_route "$tid3" "127.0.0.1" "$BLACKHOLE_PORT"
+        : >"$WORK/edge-access.log"
+        local t3_disabled_before t3_r1_pid
+        t3_disabled_before="$(errlog | grep -c 'API disabled in the context of balancer_by_lua')"
+        ( ws_req "$tid3" 35 >"$WORK/t3-r1.out" ) &
+        t3_r1_pid=$!
+        sleep 7
+        set_route "$tid3" "127.0.0.1" "$PEER_PORT"
+
+        # R2 要做的事是"重读 Redis 并把活对端写进路由缓存 L2",可它自己也可能仍落在
+        # L1 / `f:` 新鲜标记的窗口里被服务旧值(两者 TTL 都以 POS_TTL_SEC=5s 为上限,
+        # 且【从 R1 的 rewrite 起算】——而 R1 是后台子进程,起跑时刻不可观测)。
+        # 2026-08-26 本机实测撞过一次:R2 被服务了黑洞坐标,8s 内读不到状态行(空
+        # http),它把黑洞又写回 L2,于是 R1 的重投看不到不同 peer、走出口 1 拿 503,
+        # 三条断言连锁变红(PASS=43 FAIL=3),同一份代码重跑即 PASS=46 FAIL=0。
+        # 所以这里不赌单次 sleep 的余量,循环到 R2 真的重读了 Redis 为止:每次
+        # 客户端读窗口 3s(200 的状态行是立刻到的,黑洞则等满 3s),最多 3 次、
+        # 最晚约 t+17s 收敛,仍早于 R1 的上游读超时(EDGE_READ_TIMEOUT=25s)。
+        local t3_r2 t3_c2 t3_hit2 t3_tries=0
+        while [ "$t3_tries" -lt 3 ]; do
+            t3_tries=$((t3_tries + 1))
+            t3_r2="$(ws_req "$tid3" 3)"; t3_c2="${t3_r2% *}"; t3_hit2="${t3_r2##* }"
+            [ "$t3_c2" = "200" ] && [ "${t3_hit2:-0}" -ge 1 ] && break
+            sleep 1
+        done
+        check "ARM A T3 准备: R2 重读 Redis 后到达活对端(第 $t3_tries/3 次)" \
+            "$([ "$t3_c2" = "200" ] && [ "${t3_hit2:-0}" -ge 1 ] && echo 0 || echo 1)" \
+            "R2 http=$t3_c2 marker=${t3_hit2:-0}"
+        wait "$t3_r1_pid"
+        sleep 1
+
+        local t3_r1 t3_c1 t3_hit1 t3_access
+        local t3_disabled_after t3_disabled
+        t3_r1="$(cat "$WORK/t3-r1.out" 2>/dev/null)"
+        t3_c1="${t3_r1% *}"; t3_hit1="${t3_r1##* }"
+        t3_access="$(cat "$WORK/edge-access.log" 2>/dev/null)"
+        t3_disabled_after="$(errlog | grep -c 'API disabled in the context of balancer_by_lua')"
+        t3_disabled=$((t3_disabled_after - t3_disabled_before))
+        # 照 T1 的先例把实测值打出来:T3 断言里最容易红的是"R2 到底连到了谁",
+        # 只报期望值的话红了只能靠重跑猜。
+        echo "  T3 R1=$t3_c1/marker=${t3_hit1:-0} R2=$t3_c2/marker=${t3_hit2:-0}(第 $t3_tries/3 次) ua=[$(printf '%s\n' "$t3_access" \
+            | sed -n 's/.*"upstream_addr":"\([^"]*\)".*/\1/p' | tr '\n' '|')]"
+
+        check "ARM A T3-2: R1 读超时后采纳不同 peer 并返回 LIVE-PEER-OK" \
+            "$([ "$t3_c1" = "200" ] && [ "${t3_hit1:-0}" -ge 1 ] && echo 0 || echo 1)" \
+            "R1 http=$t3_c1 marker=${t3_hit1:-0}"
+        check "ARM A T3-3: R1 upstream_addr 是黑洞后接活对端的两个不同地址" \
+            "$(printf '%s\n' "$t3_access" \
+                | grep -cF "\"upstream_addr\":\"127.0.0.1:$BLACKHOLE_PORT, 127.0.0.1:$PEER_PORT\"" \
+                | awk '{print ($1 == 1) ? 0 : 1}')" \
+            "expect=127.0.0.1:$BLACKHOLE_PORT, 127.0.0.1:$PEER_PORT"
+        check "ARM A T3-4: 出口 2 窗口内零 cosocket(无 API disabled)" \
+            "$([ "$t3_disabled" -eq 0 ] && echo 0 || echo 1)" "n_disabled=$t3_disabled"
+        # 反空转:R2 自己那条行必须在,且 upstream_addr 恰好只有活对端一个地址。
+        # 这里【不】断言总行数:R2 若重试过,失败的那几次仍挂在黑洞上,要等各自的
+        # 25s 上游读超时才落 access_log,落的时刻在本段采样之后,总行数因此不确定。
+        # 断"至少一行 ua 恰为活对端"比数行数更强也更稳:0 行照旧判红。
+        check "ARM A T3-5: access_log 里有 R2 自己那条(ua 恰为活对端,反空转)" \
+            "$(printf '%s\n' "$t3_access" \
+                | grep -cF "\"upstream_addr\":\"127.0.0.1:$PEER_PORT\"" \
+                | awk '{print ($1 >= 1) ? 0 : 1}')" \
+            "expect≥1 行 ua=127.0.0.1:$PEER_PORT"
+    fi
 
     local log n_disabled n_retry
     log="$(errlog)"
@@ -324,20 +486,54 @@ run_arm() { # run_arm <A|B>
         "$([ -n "$n_get" ] && [ "$n_get" -ge 1 ] && echo 0 || echo 1)" \
         "cmdstat_get:calls=${n_get:-0}"
 
-    if [ "$arm" = "A" ]; then
-        check "ARM A: balancer 阶段零 cosocket(无 API disabled)" \
-            "$([ "$n_disabled" -eq 0 ] && echo 0 || echo 1)" "n_disabled=$n_disabled"
-        check "ARM A: 无可用不同 peer 时客户拿 503 而不是 500(#628 fail-closed + fixup_status)" \
-            "$([ "$c1" = "503" ] && echo 0 || echo 1)" "T1 http=$c1"
-        check "ARM A: route 换新后一次请求内恢复到新 peer(重投提示在 rewrite 阶段兑现)" \
-            "$([ "$c2" = "200" ] && [ "$hit2" -ge 1 ] && echo 0 || echo 1)" \
-            "T2 http=$c2 marker=$hit2"
-    else
-        check "ARM B: 注入 pre-#606 形状后**必须**出现 API disabled(证明本探针能判别该缺陷)" \
-            "$([ "$n_disabled" -ge 1 ] && echo 0 || echo 1)" "n_disabled=$n_disabled"
-        check "ARM B: 该缺陷下客户拿 500(balancer 阶段抛错,状态码传不出去)" \
-            "$([ "$c1" = "500" ] && echo 0 || echo 1)" "T1 http=$c1"
-    fi
+    case "$arm" in
+        A)
+            check "ARM A: balancer 阶段零 cosocket(无 API disabled)" \
+                "$([ "$n_disabled" -eq 0 ] && echo 0 || echo 1)" "n_disabled=$n_disabled"
+            check "ARM A: T1 access_log 截断窗口恰有一行(0 行不得假绿)" \
+                "$([ "$t1_lines" = "1" ] && echo 0 || echo 1)" "lines=$t1_lines"
+            # nginx 的 $upstream_addr 用 ", " 连接同一次 upstream 里换过的 peer,用
+            # " : " 表示一段【始终没分配到 peer】的 upstream state。#628 修好之后实测值
+            # 是 "127.0.0.1:<dead> : ":第一次连接落在死坐标,重投那一格因为 balancer
+            # 阶段 ngx.exit 而从来没拿到坐标 —— 这比"只有一个地址"更强,直接证明第二次
+            # 连接没有发生。所以断言写成结构判据(前缀 + 只出现一个地址 + 无 ", "),
+            # 不逐字相等,免得挂在 nginx 拼出来的末尾空格上。
+            local t1_n_addr t1_rc=1
+            t1_n_addr="$(printf '%s' "$t1_upstream" | grep -o '127\.0\.0\.1:' | wc -l | tr -d ' ')"
+            case "$t1_upstream" in
+                "127.0.0.1:$DEAD_PORT"*)
+                    case "$t1_upstream" in
+                        *", "*) ;;
+                        *) [ "$t1_n_addr" = "1" ] && t1_rc=0 ;;
+                    esac ;;
+            esac
+            check "ARM A: T1 upstream_addr 只有失败坐标且没有第二次连接" "$t1_rc" \
+                "got=[$t1_upstream] n_addr=$t1_n_addr"
+            check "ARM A: 无可用不同 peer 时客户拿 503 而不是 500(#628 fail-closed + fixup_status)" \
+                "$([ "$c1" = "503" ] && echo 0 || echo 1)" "T1 http=$c1"
+            check "ARM A: route 换新后一次请求内恢复到新 peer(重投提示在 rewrite 阶段兑现)" \
+                "$([ "$c2" = "200" ] && [ "$hit2" -ge 1 ] && echo 0 || echo 1)" \
+                "T2 http=$c2 marker=$hit2"
+            ;;
+        B)
+            check "ARM B: 注入 pre-#606 形状后**必须**出现 API disabled(证明本探针能判别该缺陷)" \
+                "$([ "$n_disabled" -ge 1 ] && echo 0 || echo 1)" "n_disabled=$n_disabled"
+            check "ARM B: 该缺陷下客户拿 500(balancer 阶段抛错,状态码传不出去)" \
+                "$([ "$c1" = "500" ] && echo 0 || echo 1)" "T1 http=$c1"
+            ;;
+        C)
+            check "ARM C: 注入 pre-#628 形状后客户拿 502(复用失败坐标)" \
+                "$([ "$c1" = "502" ] && echo 0 || echo 1)" "T1 http=$c1"
+            check "ARM C: T1 upstream_addr 是两个完全相同的失败坐标" \
+                "$([ "$t1_upstream" = "127.0.0.1:$DEAD_PORT, 127.0.0.1:$DEAD_PORT" ] \
+                    && echo 0 || echo 1)" "got=$t1_upstream"
+            check "ARM C: 坐标复用路径零 cosocket(无 API disabled)" \
+                "$([ "$n_disabled" -eq 0 ] && echo 0 || echo 1)" "n_disabled=$n_disabled"
+            check "ARM C: route 换新后仍恢复到活对端(变异只改重投出口)" \
+                "$([ "$c2" = "200" ] && [ "$hit2" -ge 1 ] && echo 0 || echo 1)" \
+                "T2 http=$c2 marker=$hit2"
+            ;;
+    esac
     printf '%s\n' "$log" | grep -E 'API disabled|balancer retry|failed to run balancer' \
         | tail -4 | sed 's/^/      | /'
 }
@@ -370,8 +566,10 @@ run_arm_warmup_negative() {
     done
     check "ARM W: Redis 不可达时 /healthz 不返 200(readiness 门真的挡住)" \
         "$seen_200" "8s 窗口内 /healthz 已经是 200(got=$code)"
+    # 20s 远大于 2s 的重试节拍,也大于实测的首条日志延迟(约 4s);15 次后
+    # (约 30s)才走 fail-open 兜底,所以这个窗口不会把 give-up 那条误当证据。
     check "ARM W: 探测失败被记下来(不是静默)" \
-        "$(errlog | grep -qF 'edge warmup probe via' && echo 0 || echo 1)" \
+        "$(wait_errlog 'edge warmup probe via' 20 && echo 0 || echo 1)" \
         "$(errlog | tail -2)"
     stop_instance edge
 }
@@ -392,6 +590,7 @@ check "静态: nginx.conf 的 init_by_lua_block 带齐四个坐标占位符" \
 
 run_arm A
 run_arm B
+run_arm C
 run_arm_warmup_negative
 
 echo

@@ -1,246 +1,394 @@
 {
   "id": "edge-balancer-cosocket-606",
-  "title": "edge balancer_by_lua* 阶段禁用 cosocket：上游重投由构造决定不可用，触发 retry 的租户 WSS 全部 502",
   "base_sha": "e57e9eaea1154caa6020dca6735af92af2fe9185",
   "patch_sha": "58bd07de4f603cb803fbc72dade14bde6921e811",
   "status": "MANUAL_REVIEW",
-  "severity": "P0",
-  "upstream_issue": "#606（fail-closed 语义见 #628，坐标回收风险见 #605）",
-  "layer_summary": {
-    "E-edge": 4
+  "excludes": [],
+  "cloudformation": {
+    "status": "NOT_APPLICABLE",
+    "reason": "本 patch 的 range 内没有任何 CDK 源变更(deploy/stacks 与 deploy/*.py 都没动),改的是 edge 数据面的 openresty 配置与 lua 模块,不经 CloudFormation。edge 机队本身由 LaunchTemplate 钉 bundle,是否需要动 LT 由 verify-606-new-instance-inheritance 那条判定门回答",
+    "provenance": null,
+    "stacks": []
   },
-  "delivery_contract": "edge 是独立数据面 ASG，bundle 由 LaunchTemplate 钉 sha。本 kit 的 apply_cli 【真的下发到在役 edge】：S3 放制品 → SSM 写 lualib 与 /opt 两处落点 → reload。这与 lifecycle-op-patch 的 deploy-other 层不同 —— 那一层只 cp 到 $REPO_ROOT，打完在役不生效。施加本 kit 前请先读 APPLY-INSTRUCTIONS.md 的「交付层」一节。",
-  "atomicity": "四个文件必须整套下发后再 reload 一次，不要逐文件 reload。balancer.lua 调用 backend.peek_cached / mark_retry_stale / SOURCE_L2（本次在 backend.lua 新增），route.lua 提供 on_header_filter，nginx.conf 提供 header_filter_by_lua_block。缺任一文件即 attempt to call a nil value，或 fail-closed 的 503 被 nginx 显示为 500。",
-  "kit_files": {
-    "APPLY-INSTRUCTIONS.md": "da89a2c9aa0f412c05f613fdf502f329725760bbeb55c7394443859543978854",
-    "artifacts/balancer.lua": "847f8210c73fc6ca7b01ee9def4fbe8b01f7fad06af022ea7ff565b39fecc76f",
-    "artifacts/route.lua": "591ef0b6d9c4175fb3bc162e36cc26940e1d558656258bad5bb4059a57836ca8",
-    "artifacts/nginx.conf": "d5b5eac1d78058b7d454a53da26984e0ad13b10e3b7b822d098167c73b727ce0",
-    "artifacts/backend.lua": "830e73aa3a491d93bfee169d40b18ef76a84ea0d366e597670c37345107fe396"
-  },
+  "kit_files": {},
   "paths": {
-    "deploy/edge/lib/balancer.lua": {
-      "layer": "E-edge",
-      "artifact": "artifacts/balancer.lua",
-      "patch_sha256": "847f8210c73fc6ca7b01ee9def4fbe8b01f7fad06af022ea7ff565b39fecc76f",
-      "live_target": "/usr/local/openresty/lualib/edge/lib/balancer.lua",
-      "bootstrap_source": "/opt/openclaw-edge/lib/balancer.lua",
-      "operations": [
-        {
-          "class": "AUTO_CLI",
-          "order": 10,
-          "stage": "1-upload",
-          "apply_cli": "aws s3 cp artifacts/balancer.lua \"s3://$ASSETS_BUCKET/deployment/edge-606/balancer.lua\" --region \"$REGION\" --only-show-errors",
-          "verify_cli": "test \"$(aws s3api head-object --bucket \"$ASSETS_BUCKET\" --key deployment/edge-606/balancer.lua --region \"$REGION\" --query ContentLength --output text)\" -gt 0",
-          "rollback_cli": "aws s3api delete-object --bucket \"$ASSETS_BUCKET\" --key deployment/edge-606/balancer.lua --region \"$REGION\"",
-          "note": "只把制品放到 S3 新前缀 deployment/edge-606/，不覆盖任何现有 bundle 对象。零在役影响、完全可逆。"
-        },
-        {
-          "class": "AUTO_CLI",
-          "order": 20,
-          "stage": "2-deploy-live",
-          "apply_steps": [
-            "[ -f /usr/local/openresty/lualib/edge/lib/balancer.lua.pre-606 ] || cp -p /usr/local/openresty/lualib/edge/lib/balancer.lua /usr/local/openresty/lualib/edge/lib/balancer.lua.pre-606",
-            "[ -f /opt/openclaw-edge/lib/balancer.lua.pre-606 ] || cp -p /opt/openclaw-edge/lib/balancer.lua /opt/openclaw-edge/lib/balancer.lua.pre-606",
-            "aws s3 cp s3://$B/deployment/edge-606/balancer.lua /tmp/balancer.lua.new --region $R --quiet",
-            "echo '847f8210c73fc6ca7b01ee9def4fbe8b01f7fad06af022ea7ff565b39fecc76f  /tmp/balancer.lua.new' | sha256sum -c -",
-            "install -m 0644 /tmp/balancer.lua.new /usr/local/openresty/lualib/edge/lib/balancer.lua",
-            "[ -d /opt/openclaw-edge/lib ] && install -m 0644 /tmp/balancer.lua.new /opt/openclaw-edge/lib/balancer.lua || true",
-            "rm -f /tmp/balancer.lua.new"
-          ],
-          "verify_cli": "sha256sum /usr/local/openresty/lualib/edge/lib/balancer.lua /opt/openclaw-edge/lib/balancer.lua",
-          "verify_expect": "两处均为 847f8210c73fc6ca7b01ee9def4fbe8b01f7fad06af022ea7ff565b39fecc76f",
-          "rollback_steps": [
-            "cp -p /usr/local/openresty/lualib/edge/lib/balancer.lua.pre-606 /usr/local/openresty/lualib/edge/lib/balancer.lua",
-            "cp -p /opt/openclaw-edge/lib/balancer.lua.pre-606 /opt/openclaw-edge/lib/balancer.lua",
-            "openresty -s reload"
-          ],
-          "note": "lualib 是 openresty 运行时加载路径，/opt/openclaw-edge 是 bootstrap 源。只改前者会在实例重启或重新 bootstrap 后丢失修复，所以两处都必须写。备份锚点 .pre-606 只建一次。"
-        }
-      ]
-    },
     "deploy/edge/lib/backend.lua": {
-      "layer": "E-edge",
-      "artifact": "artifacts/backend.lua",
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/edge/lib/backend.lua",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "9693c407bbae7aa9ce49b5368a638bda58d6f6ffbba51c4dc7b953fd26b23e36",
       "patch_sha256": "830e73aa3a491d93bfee169d40b18ef76a84ea0d366e597670c37345107fe396",
-      "live_target": "/usr/local/openresty/lualib/edge/lib/backend.lua",
-      "bootstrap_source": "/opt/openclaw-edge/lib/backend.lua",
       "operations": [
         {
+          "resource": "s3://$ASSETS_BUCKET/deployment/edge-606/backend.lua,以及在役 edge 每台的 /usr/local/openresty/lualib/edge/lib/backend.lua(openresty 运行时加载路径)与 /opt/openclaw-edge/lib/backend.lua(bootstrap 源)两处落点,mode 0644。**本步骤刻意不 reload** —— openresty 的 lua_code_cache 让已启动的 worker 继续用已 require 的旧模块,所以文件落盘但未 reload 时在役行为完全不变;这正是本 kit 的原子性保证:部分安装是安全的,风险只在 reload 那一刻兑现,所以守卫落在 nginx.conf 上那条 reload 操作里。两处都必须写 —— 只改 lualib 会在实例重启或重新 bootstrap 之后丢失修复。备份锚点 .pre-606 只建一次,重跑不覆盖(否则第二次会把已打好的内容记成「原状」)",
           "class": "AUTO_CLI",
-          "order": 10,
-          "stage": "1-upload",
-          "apply_cli": "aws s3 cp artifacts/backend.lua \"s3://$ASSETS_BUCKET/deployment/edge-606/backend.lua\" --region \"$REGION\" --only-show-errors",
-          "verify_cli": "test \"$(aws s3api head-object --bucket \"$ASSETS_BUCKET\" --key deployment/edge-606/backend.lua --region \"$REGION\" --query ContentLength --output text)\" -gt 0",
-          "rollback_cli": "aws s3api delete-object --bucket \"$ASSETS_BUCKET\" --key deployment/edge-606/backend.lua --region \"$REGION\"",
-          "note": "只把制品放到 S3 新前缀 deployment/edge-606/，不覆盖任何现有 bundle 对象。零在役影响、完全可逆。"
-        },
-        {
-          "class": "AUTO_CLI",
-          "order": 20,
-          "stage": "2-deploy-live",
-          "apply_steps": [
-            "[ -f /usr/local/openresty/lualib/edge/lib/backend.lua.pre-606 ] || cp -p /usr/local/openresty/lualib/edge/lib/backend.lua /usr/local/openresty/lualib/edge/lib/backend.lua.pre-606",
-            "[ -f /opt/openclaw-edge/lib/backend.lua.pre-606 ] || cp -p /opt/openclaw-edge/lib/backend.lua /opt/openclaw-edge/lib/backend.lua.pre-606",
-            "aws s3 cp s3://$B/deployment/edge-606/backend.lua /tmp/backend.lua.new --region $R --quiet",
-            "echo '830e73aa3a491d93bfee169d40b18ef76a84ea0d366e597670c37345107fe396  /tmp/backend.lua.new' | sha256sum -c -",
-            "install -m 0644 /tmp/backend.lua.new /usr/local/openresty/lualib/edge/lib/backend.lua",
-            "[ -d /opt/openclaw-edge/lib ] && install -m 0644 /tmp/backend.lua.new /opt/openclaw-edge/lib/backend.lua || true",
-            "rm -f /tmp/backend.lua.new"
-          ],
-          "verify_cli": "sha256sum /usr/local/openresty/lualib/edge/lib/backend.lua /opt/openclaw-edge/lib/backend.lua",
-          "verify_expect": "两处均为 830e73aa3a491d93bfee169d40b18ef76a84ea0d366e597670c37345107fe396",
-          "rollback_steps": [
-            "cp -p /usr/local/openresty/lualib/edge/lib/backend.lua.pre-606 /usr/local/openresty/lualib/edge/lib/backend.lua",
-            "cp -p /opt/openclaw-edge/lib/backend.lua.pre-606 /opt/openclaw-edge/lib/backend.lua",
-            "openresty -s reload"
-          ],
-          "note": "lualib 是 openresty 运行时加载路径，/opt/openclaw-edge 是 bootstrap 源。只改前者会在实例重启或重新 bootstrap 后丢失修复，所以两处都必须写。备份锚点 .pre-606 只建一次。"
+          "apply_cli": "aws s3 cp host-scripts/edge/lib/backend.lua \"s3://$ASSETS_BUCKET/deployment/edge-606/backend.lua\" --region \"$REGION\" --only-show-errors && B=\"$ASSETS_BUCKET\" && R=\"$REGION\" && jq -n '{commands: [\"set -e\", \"[ -f /usr/local/openresty/lualib/edge/lib/backend.lua.pre-606 ] || cp -p /usr/local/openresty/lualib/edge/lib/backend.lua /usr/local/openresty/lualib/edge/lib/backend.lua.pre-606\", \"if [ -f /opt/openclaw-edge/lib/backend.lua ]; then [ -f /opt/openclaw-edge/lib/backend.lua.pre-606 ] || cp -p /opt/openclaw-edge/lib/backend.lua /opt/openclaw-edge/lib/backend.lua.pre-606; else [ -f /opt/openclaw-edge/lib/backend.lua.pre-606.absent ] || : > /opt/openclaw-edge/lib/backend.lua.pre-606.absent; fi\", \"aws s3 cp \\\"s3://$B/deployment/edge-606/backend.lua\\\" /tmp/oc-606-backend-lua --region \\\"$R\\\" --quiet\", \"echo \\\"830e73aa3a491d93bfee169d40b18ef76a84ea0d366e597670c37345107fe396  /tmp/oc-606-backend-lua\\\" | sha256sum -c -\", \"install -m 0644 /tmp/oc-606-backend-lua /usr/local/openresty/lualib/edge/lib/backend.lua\", \"install -m 0644 -D /tmp/oc-606-backend-lua /opt/openclaw-edge/lib/backend.lua\", \"rm -f /tmp/oc-606-backend-lua\"]}' > /tmp/oc-edge-backend-lua.json && CID=$(aws ssm send-command --document-name AWS-RunShellScript --instance-ids $EDGE_IDS --region \"$REGION\" --parameters file:///tmp/oc-edge-backend-lua.json --query Command.CommandId --output text) && for i in $EDGE_IDS; do aws ssm wait command-executed --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\"; ST=$(aws ssm get-command-invocation --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\" --query Status --output text); [ \"$ST\" = Success ] || { echo \"edge $i: $ST\" >&2; exit 1; }; done",
+          "verify_cli": "jq -n '{commands: [\"set -e\", \"echo \\\"830e73aa3a491d93bfee169d40b18ef76a84ea0d366e597670c37345107fe396  /usr/local/openresty/lualib/edge/lib/backend.lua\\\" | sha256sum -c -\", \"echo \\\"830e73aa3a491d93bfee169d40b18ef76a84ea0d366e597670c37345107fe396  /opt/openclaw-edge/lib/backend.lua\\\" | sha256sum -c -\"]}' > /tmp/oc-edge-backend-lua-v.json && CID=$(aws ssm send-command --document-name AWS-RunShellScript --instance-ids $EDGE_IDS --region \"$REGION\" --parameters file:///tmp/oc-edge-backend-lua-v.json --query Command.CommandId --output text) && for i in $EDGE_IDS; do aws ssm wait command-executed --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\"; ST=$(aws ssm get-command-invocation --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\" --query Status --output text); [ \"$ST\" = Success ] || { echo \"edge $i: $ST\" >&2; exit 1; }; done",
+          "rollback_cli": "jq -n '{commands: [\"set -e\", \"echo \\\"830e73aa3a491d93bfee169d40b18ef76a84ea0d366e597670c37345107fe396  /usr/local/openresty/lualib/edge/lib/backend.lua\\\" | sha256sum -c - || { echo \\\"PREFLIGHT /usr/local/openresty/lualib/edge/lib/backend.lua \\u5df2\\u4e0d\\u662f\\u672c patch \\u88c5\\u4e0a\\u53bb\\u7684\\u5185\\u5bb9\\\" >&2; exit 1; }\"]}' > /tmp/oc-edge-backend-lua-pre.json && CID=$(aws ssm send-command --document-name AWS-RunShellScript --instance-ids $EDGE_IDS --region \"$REGION\" --parameters file:///tmp/oc-edge-backend-lua-pre.json --query Command.CommandId --output text) && for i in $EDGE_IDS; do aws ssm wait command-executed --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\"; ST=$(aws ssm get-command-invocation --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\" --query Status --output text); [ \"$ST\" = Success ] || { echo \"edge $i: $ST\" >&2; exit 1; }; done && jq -n '{commands: [\"set -e\", \"cp -p /usr/local/openresty/lualib/edge/lib/backend.lua.pre-606 /usr/local/openresty/lualib/edge/lib/backend.lua\", \"if [ -f /opt/openclaw-edge/lib/backend.lua.pre-606 ]; then cp -p /opt/openclaw-edge/lib/backend.lua.pre-606 /opt/openclaw-edge/lib/backend.lua; elif [ -f /opt/openclaw-edge/lib/backend.lua.pre-606.absent ]; then rm -f /opt/openclaw-edge/lib/backend.lua; fi\"]}' > /tmp/oc-edge-backend-lua-rb.json && CID=$(aws ssm send-command --document-name AWS-RunShellScript --instance-ids $EDGE_IDS --region \"$REGION\" --parameters file:///tmp/oc-edge-backend-lua-rb.json --query Command.CommandId --output text) && for i in $EDGE_IDS; do aws ssm wait command-executed --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\"; ST=$(aws ssm get-command-invocation --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\" --query Status --output text); [ \"$ST\" = Success ] || { echo \"edge $i: $ST\" >&2; exit 1; }; done",
+          "finalize_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
         }
+      ],
+      "fix_ids": [
+        "fix-606-balancer-no-cosocket"
       ]
     },
-    "deploy/edge/route.lua": {
-      "layer": "E-edge",
-      "artifact": "artifacts/route.lua",
-      "patch_sha256": "591ef0b6d9c4175fb3bc162e36cc26940e1d558656258bad5bb4059a57836ca8",
-      "live_target": "/usr/local/openresty/lualib/edge/route.lua",
-      "bootstrap_source": "/opt/openclaw-edge/route.lua",
+    "deploy/edge/lib/balancer.lua": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/edge/lib/balancer.lua",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "80b33d94522fed0e3ff1ca040bd32ad9b2817f3d6f49d056d3b97a9e70c6a1b1",
+      "patch_sha256": "847f8210c73fc6ca7b01ee9def4fbe8b01f7fad06af022ea7ff565b39fecc76f",
       "operations": [
         {
+          "resource": "s3://$ASSETS_BUCKET/deployment/edge-606/balancer.lua,以及在役 edge 每台的 /usr/local/openresty/lualib/edge/lib/balancer.lua(openresty 运行时加载路径)与 /opt/openclaw-edge/lib/balancer.lua(bootstrap 源)两处落点,mode 0644。**本步骤刻意不 reload** —— openresty 的 lua_code_cache 让已启动的 worker 继续用已 require 的旧模块,所以文件落盘但未 reload 时在役行为完全不变;这正是本 kit 的原子性保证:部分安装是安全的,风险只在 reload 那一刻兑现,所以守卫落在 nginx.conf 上那条 reload 操作里。两处都必须写 —— 只改 lualib 会在实例重启或重新 bootstrap 之后丢失修复。备份锚点 .pre-606 只建一次,重跑不覆盖(否则第二次会把已打好的内容记成「原状」)",
           "class": "AUTO_CLI",
-          "order": 10,
-          "stage": "1-upload",
-          "apply_cli": "aws s3 cp artifacts/route.lua \"s3://$ASSETS_BUCKET/deployment/edge-606/route.lua\" --region \"$REGION\" --only-show-errors",
-          "verify_cli": "test \"$(aws s3api head-object --bucket \"$ASSETS_BUCKET\" --key deployment/edge-606/route.lua --region \"$REGION\" --query ContentLength --output text)\" -gt 0",
-          "rollback_cli": "aws s3api delete-object --bucket \"$ASSETS_BUCKET\" --key deployment/edge-606/route.lua --region \"$REGION\"",
-          "note": "只把制品放到 S3 新前缀 deployment/edge-606/，不覆盖任何现有 bundle 对象。零在役影响、完全可逆。"
-        },
-        {
-          "class": "AUTO_CLI",
-          "order": 20,
-          "stage": "2-deploy-live",
-          "apply_steps": [
-            "[ -f /usr/local/openresty/lualib/edge/route.lua.pre-606 ] || cp -p /usr/local/openresty/lualib/edge/route.lua /usr/local/openresty/lualib/edge/route.lua.pre-606",
-            "[ -f /opt/openclaw-edge/route.lua.pre-606 ] || cp -p /opt/openclaw-edge/route.lua /opt/openclaw-edge/route.lua.pre-606",
-            "aws s3 cp s3://$B/deployment/edge-606/route.lua /tmp/route.lua.new --region $R --quiet",
-            "echo '591ef0b6d9c4175fb3bc162e36cc26940e1d558656258bad5bb4059a57836ca8  /tmp/route.lua.new' | sha256sum -c -",
-            "install -m 0644 /tmp/route.lua.new /usr/local/openresty/lualib/edge/route.lua",
-            "[ -d /opt/openclaw-edge ] && install -m 0644 /tmp/route.lua.new /opt/openclaw-edge/route.lua || true",
-            "rm -f /tmp/route.lua.new"
-          ],
-          "verify_cli": "sha256sum /usr/local/openresty/lualib/edge/route.lua /opt/openclaw-edge/route.lua",
-          "verify_expect": "两处均为 591ef0b6d9c4175fb3bc162e36cc26940e1d558656258bad5bb4059a57836ca8",
-          "rollback_steps": [
-            "cp -p /usr/local/openresty/lualib/edge/route.lua.pre-606 /usr/local/openresty/lualib/edge/route.lua",
-            "cp -p /opt/openclaw-edge/route.lua.pre-606 /opt/openclaw-edge/route.lua",
-            "openresty -s reload"
-          ],
-          "note": "lualib 是 openresty 运行时加载路径，/opt/openclaw-edge 是 bootstrap 源。只改前者会在实例重启或重新 bootstrap 后丢失修复，所以两处都必须写。备份锚点 .pre-606 只建一次。"
+          "apply_cli": "aws s3 cp host-scripts/edge/lib/balancer.lua \"s3://$ASSETS_BUCKET/deployment/edge-606/balancer.lua\" --region \"$REGION\" --only-show-errors && B=\"$ASSETS_BUCKET\" && R=\"$REGION\" && jq -n '{commands: [\"set -e\", \"[ -f /usr/local/openresty/lualib/edge/lib/balancer.lua.pre-606 ] || cp -p /usr/local/openresty/lualib/edge/lib/balancer.lua /usr/local/openresty/lualib/edge/lib/balancer.lua.pre-606\", \"if [ -f /opt/openclaw-edge/lib/balancer.lua ]; then [ -f /opt/openclaw-edge/lib/balancer.lua.pre-606 ] || cp -p /opt/openclaw-edge/lib/balancer.lua /opt/openclaw-edge/lib/balancer.lua.pre-606; else [ -f /opt/openclaw-edge/lib/balancer.lua.pre-606.absent ] || : > /opt/openclaw-edge/lib/balancer.lua.pre-606.absent; fi\", \"aws s3 cp \\\"s3://$B/deployment/edge-606/balancer.lua\\\" /tmp/oc-606-balancer-lua --region \\\"$R\\\" --quiet\", \"echo \\\"847f8210c73fc6ca7b01ee9def4fbe8b01f7fad06af022ea7ff565b39fecc76f  /tmp/oc-606-balancer-lua\\\" | sha256sum -c -\", \"install -m 0644 /tmp/oc-606-balancer-lua /usr/local/openresty/lualib/edge/lib/balancer.lua\", \"install -m 0644 -D /tmp/oc-606-balancer-lua /opt/openclaw-edge/lib/balancer.lua\", \"rm -f /tmp/oc-606-balancer-lua\"]}' > /tmp/oc-edge-balancer-lua.json && CID=$(aws ssm send-command --document-name AWS-RunShellScript --instance-ids $EDGE_IDS --region \"$REGION\" --parameters file:///tmp/oc-edge-balancer-lua.json --query Command.CommandId --output text) && for i in $EDGE_IDS; do aws ssm wait command-executed --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\"; ST=$(aws ssm get-command-invocation --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\" --query Status --output text); [ \"$ST\" = Success ] || { echo \"edge $i: $ST\" >&2; exit 1; }; done",
+          "verify_cli": "jq -n '{commands: [\"set -e\", \"echo \\\"847f8210c73fc6ca7b01ee9def4fbe8b01f7fad06af022ea7ff565b39fecc76f  /usr/local/openresty/lualib/edge/lib/balancer.lua\\\" | sha256sum -c -\", \"echo \\\"847f8210c73fc6ca7b01ee9def4fbe8b01f7fad06af022ea7ff565b39fecc76f  /opt/openclaw-edge/lib/balancer.lua\\\" | sha256sum -c -\"]}' > /tmp/oc-edge-balancer-lua-v.json && CID=$(aws ssm send-command --document-name AWS-RunShellScript --instance-ids $EDGE_IDS --region \"$REGION\" --parameters file:///tmp/oc-edge-balancer-lua-v.json --query Command.CommandId --output text) && for i in $EDGE_IDS; do aws ssm wait command-executed --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\"; ST=$(aws ssm get-command-invocation --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\" --query Status --output text); [ \"$ST\" = Success ] || { echo \"edge $i: $ST\" >&2; exit 1; }; done",
+          "rollback_cli": "jq -n '{commands: [\"set -e\", \"echo \\\"847f8210c73fc6ca7b01ee9def4fbe8b01f7fad06af022ea7ff565b39fecc76f  /usr/local/openresty/lualib/edge/lib/balancer.lua\\\" | sha256sum -c - || { echo \\\"PREFLIGHT /usr/local/openresty/lualib/edge/lib/balancer.lua \\u5df2\\u4e0d\\u662f\\u672c patch \\u88c5\\u4e0a\\u53bb\\u7684\\u5185\\u5bb9\\\" >&2; exit 1; }\"]}' > /tmp/oc-edge-balancer-lua-pre.json && CID=$(aws ssm send-command --document-name AWS-RunShellScript --instance-ids $EDGE_IDS --region \"$REGION\" --parameters file:///tmp/oc-edge-balancer-lua-pre.json --query Command.CommandId --output text) && for i in $EDGE_IDS; do aws ssm wait command-executed --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\"; ST=$(aws ssm get-command-invocation --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\" --query Status --output text); [ \"$ST\" = Success ] || { echo \"edge $i: $ST\" >&2; exit 1; }; done && jq -n '{commands: [\"set -e\", \"cp -p /usr/local/openresty/lualib/edge/lib/balancer.lua.pre-606 /usr/local/openresty/lualib/edge/lib/balancer.lua\", \"if [ -f /opt/openclaw-edge/lib/balancer.lua.pre-606 ]; then cp -p /opt/openclaw-edge/lib/balancer.lua.pre-606 /opt/openclaw-edge/lib/balancer.lua; elif [ -f /opt/openclaw-edge/lib/balancer.lua.pre-606.absent ]; then rm -f /opt/openclaw-edge/lib/balancer.lua; fi\"]}' > /tmp/oc-edge-balancer-lua-rb.json && CID=$(aws ssm send-command --document-name AWS-RunShellScript --instance-ids $EDGE_IDS --region \"$REGION\" --parameters file:///tmp/oc-edge-balancer-lua-rb.json --query Command.CommandId --output text) && for i in $EDGE_IDS; do aws ssm wait command-executed --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\"; ST=$(aws ssm get-command-invocation --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\" --query Status --output text); [ \"$ST\" = Success ] || { echo \"edge $i: $ST\" >&2; exit 1; }; done",
+          "finalize_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
         }
+      ],
+      "fix_ids": [
+        "fix-606-balancer-no-cosocket"
       ]
     },
     "deploy/edge/nginx.conf": {
-      "layer": "E-edge",
-      "artifact": "artifacts/nginx.conf",
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/edge/nginx.conf",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "c3d488418d5ddbb90453d5ead8a5afc1e6338c99852c3f0e68a1b5e3c5c3557e",
       "patch_sha256": "d5b5eac1d78058b7d454a53da26984e0ad13b10e3b7b822d098167c73b727ce0",
-      "live_target": "/usr/local/openresty/nginx/conf/nginx.conf",
-      "bootstrap_source": "/opt/openclaw-edge/nginx.conf",
       "operations": [
         {
+          "resource": "s3://$ASSETS_BUCKET/deployment/edge-606/nginx.conf,以及在役 edge 每台的 /usr/local/openresty/nginx/conf/nginx.conf(openresty 运行时加载路径)与 /opt/openclaw-edge/nginx.conf(bootstrap 源)两处落点,mode 0644。**本步骤刻意不 reload** —— openresty 的 lua_code_cache 让已启动的 worker 继续用已 require 的旧模块,所以文件落盘但未 reload 时在役行为完全不变;这正是本 kit 的原子性保证:部分安装是安全的,风险只在 reload 那一刻兑现,所以守卫落在 nginx.conf 上那条 reload 操作里。两处都必须写 —— 只改 lualib 会在实例重启或重新 bootstrap 之后丢失修复。备份锚点 .pre-606 只建一次,重跑不覆盖(否则第二次会把已打好的内容记成「原状」)",
           "class": "AUTO_CLI",
-          "order": 10,
-          "stage": "1-upload",
-          "apply_cli": "aws s3 cp artifacts/nginx.conf \"s3://$ASSETS_BUCKET/deployment/edge-606/nginx.conf\" --region \"$REGION\" --only-show-errors",
-          "verify_cli": "test \"$(aws s3api head-object --bucket \"$ASSETS_BUCKET\" --key deployment/edge-606/nginx.conf --region \"$REGION\" --query ContentLength --output text)\" -gt 0",
-          "rollback_cli": "aws s3api delete-object --bucket \"$ASSETS_BUCKET\" --key deployment/edge-606/nginx.conf --region \"$REGION\"",
-          "note": "只把制品放到 S3 新前缀 deployment/edge-606/，不覆盖任何现有 bundle 对象。零在役影响、完全可逆。"
+          "apply_cli": "aws s3 cp host-scripts/edge/nginx.conf \"s3://$ASSETS_BUCKET/deployment/edge-606/nginx.conf\" --region \"$REGION\" --only-show-errors && B=\"$ASSETS_BUCKET\" && R=\"$REGION\" && jq -n '{commands: [\"set -e\", \"[ -f /usr/local/openresty/nginx/conf/nginx.conf.pre-606 ] || cp -p /usr/local/openresty/nginx/conf/nginx.conf /usr/local/openresty/nginx/conf/nginx.conf.pre-606\", \"if [ -f /opt/openclaw-edge/nginx.conf ]; then [ -f /opt/openclaw-edge/nginx.conf.pre-606 ] || cp -p /opt/openclaw-edge/nginx.conf /opt/openclaw-edge/nginx.conf.pre-606; else [ -f /opt/openclaw-edge/nginx.conf.pre-606.absent ] || : > /opt/openclaw-edge/nginx.conf.pre-606.absent; fi\", \"aws s3 cp \\\"s3://$B/deployment/edge-606/nginx.conf\\\" /tmp/oc-606-nginx-conf --region \\\"$R\\\" --quiet\", \"echo \\\"d5b5eac1d78058b7d454a53da26984e0ad13b10e3b7b822d098167c73b727ce0  /tmp/oc-606-nginx-conf\\\" | sha256sum -c -\", \"install -m 0644 /tmp/oc-606-nginx-conf /usr/local/openresty/nginx/conf/nginx.conf\", \"install -m 0644 -D /tmp/oc-606-nginx-conf /opt/openclaw-edge/nginx.conf\", \"rm -f /tmp/oc-606-nginx-conf\"]}' > /tmp/oc-edge-nginx-conf.json && CID=$(aws ssm send-command --document-name AWS-RunShellScript --instance-ids $EDGE_IDS --region \"$REGION\" --parameters file:///tmp/oc-edge-nginx-conf.json --query Command.CommandId --output text) && for i in $EDGE_IDS; do aws ssm wait command-executed --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\"; ST=$(aws ssm get-command-invocation --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\" --query Status --output text); [ \"$ST\" = Success ] || { echo \"edge $i: $ST\" >&2; exit 1; }; done",
+          "verify_cli": "jq -n '{commands: [\"set -e\", \"echo \\\"d5b5eac1d78058b7d454a53da26984e0ad13b10e3b7b822d098167c73b727ce0  /usr/local/openresty/nginx/conf/nginx.conf\\\" | sha256sum -c -\", \"echo \\\"d5b5eac1d78058b7d454a53da26984e0ad13b10e3b7b822d098167c73b727ce0  /opt/openclaw-edge/nginx.conf\\\" | sha256sum -c -\"]}' > /tmp/oc-edge-nginx-conf-v.json && CID=$(aws ssm send-command --document-name AWS-RunShellScript --instance-ids $EDGE_IDS --region \"$REGION\" --parameters file:///tmp/oc-edge-nginx-conf-v.json --query Command.CommandId --output text) && for i in $EDGE_IDS; do aws ssm wait command-executed --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\"; ST=$(aws ssm get-command-invocation --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\" --query Status --output text); [ \"$ST\" = Success ] || { echo \"edge $i: $ST\" >&2; exit 1; }; done",
+          "rollback_cli": "jq -n '{commands: [\"set -e\", \"echo \\\"d5b5eac1d78058b7d454a53da26984e0ad13b10e3b7b822d098167c73b727ce0  /usr/local/openresty/nginx/conf/nginx.conf\\\" | sha256sum -c - || { echo \\\"PREFLIGHT /usr/local/openresty/nginx/conf/nginx.conf \\u5df2\\u4e0d\\u662f\\u672c patch \\u88c5\\u4e0a\\u53bb\\u7684\\u5185\\u5bb9\\\" >&2; exit 1; }\"]}' > /tmp/oc-edge-nginx-conf-pre.json && CID=$(aws ssm send-command --document-name AWS-RunShellScript --instance-ids $EDGE_IDS --region \"$REGION\" --parameters file:///tmp/oc-edge-nginx-conf-pre.json --query Command.CommandId --output text) && for i in $EDGE_IDS; do aws ssm wait command-executed --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\"; ST=$(aws ssm get-command-invocation --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\" --query Status --output text); [ \"$ST\" = Success ] || { echo \"edge $i: $ST\" >&2; exit 1; }; done && jq -n '{commands: [\"set -e\", \"cp -p /usr/local/openresty/nginx/conf/nginx.conf.pre-606 /usr/local/openresty/nginx/conf/nginx.conf\", \"if [ -f /opt/openclaw-edge/nginx.conf.pre-606 ]; then cp -p /opt/openclaw-edge/nginx.conf.pre-606 /opt/openclaw-edge/nginx.conf; elif [ -f /opt/openclaw-edge/nginx.conf.pre-606.absent ]; then rm -f /opt/openclaw-edge/nginx.conf; fi\"]}' > /tmp/oc-edge-nginx-conf-rb.json && CID=$(aws ssm send-command --document-name AWS-RunShellScript --instance-ids $EDGE_IDS --region \"$REGION\" --parameters file:///tmp/oc-edge-nginx-conf-rb.json --query Command.CommandId --output text) && for i in $EDGE_IDS; do aws ssm wait command-executed --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\"; ST=$(aws ssm get-command-invocation --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\" --query Status --output text); [ \"$ST\" = Success ] || { echo \"edge $i: $ST\" >&2; exit 1; }; done",
+          "finalize_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
         },
         {
-          "class": "AUTO_CLI",
-          "order": 20,
-          "stage": "2-deploy-live",
-          "apply_steps": [
-            "[ -f /usr/local/openresty/nginx/conf/nginx.conf.pre-606 ] || cp -p /usr/local/openresty/nginx/conf/nginx.conf /usr/local/openresty/nginx/conf/nginx.conf.pre-606",
-            "[ -f /opt/openclaw-edge/nginx.conf.pre-606 ] || cp -p /opt/openclaw-edge/nginx.conf /opt/openclaw-edge/nginx.conf.pre-606",
-            "aws s3 cp s3://$B/deployment/edge-606/nginx.conf /tmp/nginx.conf.new --region $R --quiet",
-            "echo 'd5b5eac1d78058b7d454a53da26984e0ad13b10e3b7b822d098167c73b727ce0  /tmp/nginx.conf.new' | sha256sum -c -",
-            "install -m 0644 /tmp/nginx.conf.new /usr/local/openresty/nginx/conf/nginx.conf",
-            "[ -d /opt/openclaw-edge ] && install -m 0644 /tmp/nginx.conf.new /opt/openclaw-edge/nginx.conf || true",
-            "rm -f /tmp/nginx.conf.new"
-          ],
-          "verify_cli": "sha256sum /usr/local/openresty/nginx/conf/nginx.conf /opt/openclaw-edge/nginx.conf",
-          "verify_expect": "两处均为 d5b5eac1d78058b7d454a53da26984e0ad13b10e3b7b822d098167c73b727ce0",
-          "rollback_steps": [
-            "cp -p /usr/local/openresty/nginx/conf/nginx.conf.pre-606 /usr/local/openresty/nginx/conf/nginx.conf",
-            "cp -p /opt/openclaw-edge/nginx.conf.pre-606 /opt/openclaw-edge/nginx.conf",
-            "openresty -s reload"
-          ],
-          "note": "lualib 是 openresty 运行时加载路径，/opt/openclaw-edge 是 bootstrap 源。只改前者会在实例重启或重新 bootstrap 后丢失修复，所以两处都必须写。备份锚点 .pre-606 只建一次。"
+          "resource": "在役 edge 机队 openresty worker 的一次性 reload(全机队数据面动作,必须人工复核后执行)。**reload 前逐台断言四个文件的 sha256 全部就位** —— 四个文件是一整套:balancer.lua 调 backend.lua 本次新增的 peek_cached / mark_retry_stale / SOURCE_L2,route.lua 提供 on_header_filter,nginx.conf 提供 header_filter_by_lua_block。缺任一个,reload 之后立刻 attempt to call a nil value,或者 fail-closed 的 503 被 nginx 显示成 500。所以这条不是「顺序上的嘱咐」而是机械门:四个装齐才允许翻。reload 后立刻回读 journald —— lua 的载入与运行失败只出现在 journald 与 error.log,`openresty -t` 不加载 lua 模块,它的绿证明不了 lua 能载入",
+          "class": "MANUAL_CLI_REVIEW",
+          "apply_cli": "jq -n '{commands: [\"set -e\", \"echo \\\"830e73aa3a491d93bfee169d40b18ef76a84ea0d366e597670c37345107fe396  /usr/local/openresty/lualib/edge/lib/backend.lua\\\" | sha256sum -c -\", \"echo \\\"847f8210c73fc6ca7b01ee9def4fbe8b01f7fad06af022ea7ff565b39fecc76f  /usr/local/openresty/lualib/edge/lib/balancer.lua\\\" | sha256sum -c -\", \"echo \\\"d5b5eac1d78058b7d454a53da26984e0ad13b10e3b7b822d098167c73b727ce0  /usr/local/openresty/nginx/conf/nginx.conf\\\" | sha256sum -c -\", \"echo \\\"591ef0b6d9c4175fb3bc162e36cc26940e1d558656258bad5bb4059a57836ca8  /usr/local/openresty/lualib/edge/route.lua\\\" | sha256sum -c -\", \"openresty -t\", \"openresty -s reload\", \"sleep 5\", \"if journalctl -u openresty --no-pager --since '-2min' | grep -q 'API disabled in the context of balancer_by_lua'; then echo 'reload \\u540e\\u4ecd\\u51fa\\u73b0 API disabled' >&2; exit 1; fi\"]}' > /tmp/oc-edge-reload.json && CID=$(aws ssm send-command --document-name AWS-RunShellScript --instance-ids $EDGE_IDS --region \"$REGION\" --parameters file:///tmp/oc-edge-reload.json --query Command.CommandId --output text) && for i in $EDGE_IDS; do aws ssm wait command-executed --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\"; ST=$(aws ssm get-command-invocation --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\" --query Status --output text); [ \"$ST\" = Success ] || { echo \"edge $i: $ST\" >&2; exit 1; }; done",
+          "verify_cli": "jq -n '{commands: [\"set -e\", \"if journalctl -u openresty --no-pager --since '-10min' | grep -q 'API disabled in the context of balancer_by_lua'; then echo 'still seeing API disabled' >&2; exit 1; fi\", \"code=$(curl -s -o /dev/null -w \\\"%{http_code}\\\" http://127.0.0.1:8080/healthz || echo 000)\", \"[ \\\"$code\\\" = 200 ] || { echo \\\"healthz=$code\\\" >&2; exit 1; }\"]}' > /tmp/oc-edge-reload-v.json && CID=$(aws ssm send-command --document-name AWS-RunShellScript --instance-ids $EDGE_IDS --region \"$REGION\" --parameters file:///tmp/oc-edge-reload-v.json --query Command.CommandId --output text) && for i in $EDGE_IDS; do aws ssm wait command-executed --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\"; ST=$(aws ssm get-command-invocation --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\" --query Status --output text); [ \"$ST\" = Success ] || { echo \"edge $i: $ST\" >&2; exit 1; }; done",
+          "rollback_cli": "jq -n '{commands: [\"set -e\", \"openresty -t\", \"openresty -s reload\"]}' > /tmp/oc-edge-reload-rb.json && CID=$(aws ssm send-command --document-name AWS-RunShellScript --instance-ids $EDGE_IDS --region \"$REGION\" --parameters file:///tmp/oc-edge-reload-rb.json --query Command.CommandId --output text) && for i in $EDGE_IDS; do aws ssm wait command-executed --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\"; ST=$(aws ssm get-command-invocation --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\" --query Status --output text); [ \"$ST\" = Success ] || { echo \"edge $i: $ST\" >&2; exit 1; }; done",
+          "finalize_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        },
+        {
+          "resource": "新实例是否继承本修复的判定门 —— **只读调查,不改任何资源**,但不回答它本 kit 就只止住了当前实例的血,ASG 扩容或换机起来的新 edge 仍带缺陷。edge 是独立数据面 ASG,bundle 由 LaunchTemplate 钉。要回答的是:LaunchTemplate 的 userdata 拉 edge bundle 时有没有 sha256 校验?**无校验** → 可以直接更新现有 bundle 对象让新实例继承(先记下旧 VersionId 作回滚锚点,S3 versioning 让字节替换可逆);**有校验** → 改 bundle 内容后 sha 不匹配、新实例起不来,必须 S3 与 LaunchTemplate 同步改,属换机级操作要单独排期。把结论写成 VERDICT: pinned 或 VERDICT: unpinned 存进回执文件,verify 只认这两个词之一",
+          "class": "MANUAL_CLI_REVIEW",
+          "apply_cli": "aws ec2 describe-launch-template-versions --launch-template-name \"$EDGE_LT_NAME\" --versions \"$EDGE_LT_VERSION\" --region \"$REGION\" --query \"LaunchTemplateVersions[0].LaunchTemplateData.UserData\" --output text | base64 -d > edge-lt-userdata.txt && grep -nE \"sha256|checksum|digest\" edge-lt-userdata.txt > edge-bundle-sha-gate.txt || echo \"no sha256/checksum/digest hit in userdata\" > edge-bundle-sha-gate.txt ; echo \"在 edge-bundle-sha-gate.txt 末尾人工写一行 VERDICT: pinned 或 VERDICT: unpinned\" >&2",
+          "verify_cli": "test -s edge-bundle-sha-gate.txt && grep -qE \"^VERDICT: (pinned|unpinned)$\" edge-bundle-sha-gate.txt",
+          "rollback_cli": null,
+          "finalize_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
         }
+      ],
+      "fix_ids": [
+        "fix-606-balancer-no-cosocket"
+      ]
+    },
+    "deploy/edge/route.lua": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/edge/route.lua",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "d7729f93bf4e1101961471857ead81ec5dc0b968e1664a64c3add6ab08df5926",
+      "patch_sha256": "591ef0b6d9c4175fb3bc162e36cc26940e1d558656258bad5bb4059a57836ca8",
+      "operations": [
+        {
+          "resource": "s3://$ASSETS_BUCKET/deployment/edge-606/route.lua,以及在役 edge 每台的 /usr/local/openresty/lualib/edge/route.lua(openresty 运行时加载路径)与 /opt/openclaw-edge/route.lua(bootstrap 源)两处落点,mode 0644。**本步骤刻意不 reload** —— openresty 的 lua_code_cache 让已启动的 worker 继续用已 require 的旧模块,所以文件落盘但未 reload 时在役行为完全不变;这正是本 kit 的原子性保证:部分安装是安全的,风险只在 reload 那一刻兑现,所以守卫落在 nginx.conf 上那条 reload 操作里。两处都必须写 —— 只改 lualib 会在实例重启或重新 bootstrap 之后丢失修复。备份锚点 .pre-606 只建一次,重跑不覆盖(否则第二次会把已打好的内容记成「原状」)",
+          "class": "AUTO_CLI",
+          "apply_cli": "aws s3 cp host-scripts/edge/route.lua \"s3://$ASSETS_BUCKET/deployment/edge-606/route.lua\" --region \"$REGION\" --only-show-errors && B=\"$ASSETS_BUCKET\" && R=\"$REGION\" && jq -n '{commands: [\"set -e\", \"[ -f /usr/local/openresty/lualib/edge/route.lua.pre-606 ] || cp -p /usr/local/openresty/lualib/edge/route.lua /usr/local/openresty/lualib/edge/route.lua.pre-606\", \"if [ -f /opt/openclaw-edge/route.lua ]; then [ -f /opt/openclaw-edge/route.lua.pre-606 ] || cp -p /opt/openclaw-edge/route.lua /opt/openclaw-edge/route.lua.pre-606; else [ -f /opt/openclaw-edge/route.lua.pre-606.absent ] || : > /opt/openclaw-edge/route.lua.pre-606.absent; fi\", \"aws s3 cp \\\"s3://$B/deployment/edge-606/route.lua\\\" /tmp/oc-606-route-lua --region \\\"$R\\\" --quiet\", \"echo \\\"591ef0b6d9c4175fb3bc162e36cc26940e1d558656258bad5bb4059a57836ca8  /tmp/oc-606-route-lua\\\" | sha256sum -c -\", \"install -m 0644 /tmp/oc-606-route-lua /usr/local/openresty/lualib/edge/route.lua\", \"install -m 0644 -D /tmp/oc-606-route-lua /opt/openclaw-edge/route.lua\", \"rm -f /tmp/oc-606-route-lua\"]}' > /tmp/oc-edge-route-lua.json && CID=$(aws ssm send-command --document-name AWS-RunShellScript --instance-ids $EDGE_IDS --region \"$REGION\" --parameters file:///tmp/oc-edge-route-lua.json --query Command.CommandId --output text) && for i in $EDGE_IDS; do aws ssm wait command-executed --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\"; ST=$(aws ssm get-command-invocation --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\" --query Status --output text); [ \"$ST\" = Success ] || { echo \"edge $i: $ST\" >&2; exit 1; }; done",
+          "verify_cli": "jq -n '{commands: [\"set -e\", \"echo \\\"591ef0b6d9c4175fb3bc162e36cc26940e1d558656258bad5bb4059a57836ca8  /usr/local/openresty/lualib/edge/route.lua\\\" | sha256sum -c -\", \"echo \\\"591ef0b6d9c4175fb3bc162e36cc26940e1d558656258bad5bb4059a57836ca8  /opt/openclaw-edge/route.lua\\\" | sha256sum -c -\"]}' > /tmp/oc-edge-route-lua-v.json && CID=$(aws ssm send-command --document-name AWS-RunShellScript --instance-ids $EDGE_IDS --region \"$REGION\" --parameters file:///tmp/oc-edge-route-lua-v.json --query Command.CommandId --output text) && for i in $EDGE_IDS; do aws ssm wait command-executed --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\"; ST=$(aws ssm get-command-invocation --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\" --query Status --output text); [ \"$ST\" = Success ] || { echo \"edge $i: $ST\" >&2; exit 1; }; done",
+          "rollback_cli": "jq -n '{commands: [\"set -e\", \"echo \\\"591ef0b6d9c4175fb3bc162e36cc26940e1d558656258bad5bb4059a57836ca8  /usr/local/openresty/lualib/edge/route.lua\\\" | sha256sum -c - || { echo \\\"PREFLIGHT /usr/local/openresty/lualib/edge/route.lua \\u5df2\\u4e0d\\u662f\\u672c patch \\u88c5\\u4e0a\\u53bb\\u7684\\u5185\\u5bb9\\\" >&2; exit 1; }\"]}' > /tmp/oc-edge-route-lua-pre.json && CID=$(aws ssm send-command --document-name AWS-RunShellScript --instance-ids $EDGE_IDS --region \"$REGION\" --parameters file:///tmp/oc-edge-route-lua-pre.json --query Command.CommandId --output text) && for i in $EDGE_IDS; do aws ssm wait command-executed --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\"; ST=$(aws ssm get-command-invocation --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\" --query Status --output text); [ \"$ST\" = Success ] || { echo \"edge $i: $ST\" >&2; exit 1; }; done && jq -n '{commands: [\"set -e\", \"cp -p /usr/local/openresty/lualib/edge/route.lua.pre-606 /usr/local/openresty/lualib/edge/route.lua\", \"if [ -f /opt/openclaw-edge/route.lua.pre-606 ]; then cp -p /opt/openclaw-edge/route.lua.pre-606 /opt/openclaw-edge/route.lua; elif [ -f /opt/openclaw-edge/route.lua.pre-606.absent ]; then rm -f /opt/openclaw-edge/route.lua; fi\"]}' > /tmp/oc-edge-route-lua-rb.json && CID=$(aws ssm send-command --document-name AWS-RunShellScript --instance-ids $EDGE_IDS --region \"$REGION\" --parameters file:///tmp/oc-edge-route-lua-rb.json --query Command.CommandId --output text) && for i in $EDGE_IDS; do aws ssm wait command-executed --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\"; ST=$(aws ssm get-command-invocation --command-id \"$CID\" --instance-id \"$i\" --region \"$REGION\" --query Status --output text); [ \"$ST\" = Success ] || { echo \"edge $i: $ST\" >&2; exit 1; }; done",
+          "finalize_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "fix-606-balancer-no-cosocket"
+      ]
+    },
+    "patch/edge-balancer-cosocket-606/APPLY-INSTRUCTIONS.md": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "da89a2c9aa0f412c05f613fdf502f329725760bbeb55c7394443859543978854",
+      "operations": [
+        {
+          "resource": "inert-metadata:patch/edge-balancer-cosocket-606/APPLY-INSTRUCTIONS.md(公开树携带的说明文档,不落到任何在役资源)",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git show $PATCH_SHA:patch/edge-balancer-cosocket-606/APPLY-INSTRUCTIONS.md >/dev/null  # 仅证明该路径在锚定树上存在",
+          "rollback_cli": null,
+          "finalize_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/edge-balancer-cosocket-606/artifacts/backend.lua": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/edge/lib/backend.lua",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "830e73aa3a491d93bfee169d40b18ef76a84ea0d366e597670c37345107fe396",
+      "operations": [
+        {
+          "resource": "客户仓库副本里的 patch/edge-balancer-cosocket-606/artifacts/backend.lua(mode 0644)。这是**本 kit 自己的记账文件** —— 修复提交 58bd07de 把 4 个 edge 产品文件与 kit 目录放进了同一个提交,所以 base..patch 的 range 必然把 kit 目录也框进来,而 patch/ 不在允许排除的前缀里。施加它只更新仓库副本,**不触碰任何在役资源**;不保留仓库克隆的客户可以跳过这一条。等本 patch 重新锚定到一次 publish 提交(publish 流不写 patch/),这几条就会自然离开 range",
+          "class": "AUTO_CLI",
+          "apply_cli": "if [ -f \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/backend.lua\" ]; then test \"$(sha256sum \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/backend.lua\" | cut -c1-64)\" = \"830e73aa3a491d93bfee169d40b18ef76a84ea0d366e597670c37345107fe396\" || { echo \"patch/edge-balancer-cosocket-606/artifacts/backend.lua 在你的副本里内容与本 kit 记录不同 —— 拒绝覆盖,请人工判断\" >&2; exit 1; } ; else mkdir -p \"$(dirname \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/backend.lua\")\" && : > \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/backend.lua.pre-606.absent\" && install -m 0644 -D host-scripts/edge/lib/backend.lua \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/backend.lua\"; fi",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/backend.lua\" | cut -c1-64)\" = \"830e73aa3a491d93bfee169d40b18ef76a84ea0d366e597670c37345107fe396\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/backend.lua\" | cut -c1-64)\" = \"830e73aa3a491d93bfee169d40b18ef76a84ea0d366e597670c37345107fe396\" && if [ -f \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/backend.lua.pre-606\" ]; then cp -p \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/backend.lua.pre-606\" \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/backend.lua\"; else rm -f \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/backend.lua\"; fi",
+          "finalize_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "fix-606-kit-bookkeeping"
+      ]
+    },
+    "patch/edge-balancer-cosocket-606/artifacts/balancer.lua": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/edge/lib/balancer.lua",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "847f8210c73fc6ca7b01ee9def4fbe8b01f7fad06af022ea7ff565b39fecc76f",
+      "operations": [
+        {
+          "resource": "客户仓库副本里的 patch/edge-balancer-cosocket-606/artifacts/balancer.lua(mode 0644)。这是**本 kit 自己的记账文件** —— 修复提交 58bd07de 把 4 个 edge 产品文件与 kit 目录放进了同一个提交,所以 base..patch 的 range 必然把 kit 目录也框进来,而 patch/ 不在允许排除的前缀里。施加它只更新仓库副本,**不触碰任何在役资源**;不保留仓库克隆的客户可以跳过这一条。等本 patch 重新锚定到一次 publish 提交(publish 流不写 patch/),这几条就会自然离开 range",
+          "class": "AUTO_CLI",
+          "apply_cli": "if [ -f \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/balancer.lua\" ]; then test \"$(sha256sum \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/balancer.lua\" | cut -c1-64)\" = \"847f8210c73fc6ca7b01ee9def4fbe8b01f7fad06af022ea7ff565b39fecc76f\" || { echo \"patch/edge-balancer-cosocket-606/artifacts/balancer.lua 在你的副本里内容与本 kit 记录不同 —— 拒绝覆盖,请人工判断\" >&2; exit 1; } ; else mkdir -p \"$(dirname \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/balancer.lua\")\" && : > \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/balancer.lua.pre-606.absent\" && install -m 0644 -D host-scripts/edge/lib/balancer.lua \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/balancer.lua\"; fi",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/balancer.lua\" | cut -c1-64)\" = \"847f8210c73fc6ca7b01ee9def4fbe8b01f7fad06af022ea7ff565b39fecc76f\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/balancer.lua\" | cut -c1-64)\" = \"847f8210c73fc6ca7b01ee9def4fbe8b01f7fad06af022ea7ff565b39fecc76f\" && if [ -f \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/balancer.lua.pre-606\" ]; then cp -p \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/balancer.lua.pre-606\" \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/balancer.lua\"; else rm -f \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/balancer.lua\"; fi",
+          "finalize_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "fix-606-kit-bookkeeping"
+      ]
+    },
+    "patch/edge-balancer-cosocket-606/artifacts/nginx.conf": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/edge/nginx.conf",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "d5b5eac1d78058b7d454a53da26984e0ad13b10e3b7b822d098167c73b727ce0",
+      "operations": [
+        {
+          "resource": "客户仓库副本里的 patch/edge-balancer-cosocket-606/artifacts/nginx.conf(mode 0644)。这是**本 kit 自己的记账文件** —— 修复提交 58bd07de 把 4 个 edge 产品文件与 kit 目录放进了同一个提交,所以 base..patch 的 range 必然把 kit 目录也框进来,而 patch/ 不在允许排除的前缀里。施加它只更新仓库副本,**不触碰任何在役资源**;不保留仓库克隆的客户可以跳过这一条。等本 patch 重新锚定到一次 publish 提交(publish 流不写 patch/),这几条就会自然离开 range",
+          "class": "AUTO_CLI",
+          "apply_cli": "if [ -f \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/nginx.conf\" ]; then test \"$(sha256sum \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/nginx.conf\" | cut -c1-64)\" = \"d5b5eac1d78058b7d454a53da26984e0ad13b10e3b7b822d098167c73b727ce0\" || { echo \"patch/edge-balancer-cosocket-606/artifacts/nginx.conf 在你的副本里内容与本 kit 记录不同 —— 拒绝覆盖,请人工判断\" >&2; exit 1; } ; else mkdir -p \"$(dirname \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/nginx.conf\")\" && : > \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/nginx.conf.pre-606.absent\" && install -m 0644 -D host-scripts/edge/nginx.conf \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/nginx.conf\"; fi",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/nginx.conf\" | cut -c1-64)\" = \"d5b5eac1d78058b7d454a53da26984e0ad13b10e3b7b822d098167c73b727ce0\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/nginx.conf\" | cut -c1-64)\" = \"d5b5eac1d78058b7d454a53da26984e0ad13b10e3b7b822d098167c73b727ce0\" && if [ -f \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/nginx.conf.pre-606\" ]; then cp -p \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/nginx.conf.pre-606\" \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/nginx.conf\"; else rm -f \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/nginx.conf\"; fi",
+          "finalize_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "fix-606-kit-bookkeeping"
+      ]
+    },
+    "patch/edge-balancer-cosocket-606/artifacts/route.lua": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/edge/route.lua",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "591ef0b6d9c4175fb3bc162e36cc26940e1d558656258bad5bb4059a57836ca8",
+      "operations": [
+        {
+          "resource": "客户仓库副本里的 patch/edge-balancer-cosocket-606/artifacts/route.lua(mode 0644)。这是**本 kit 自己的记账文件** —— 修复提交 58bd07de 把 4 个 edge 产品文件与 kit 目录放进了同一个提交,所以 base..patch 的 range 必然把 kit 目录也框进来,而 patch/ 不在允许排除的前缀里。施加它只更新仓库副本,**不触碰任何在役资源**;不保留仓库克隆的客户可以跳过这一条。等本 patch 重新锚定到一次 publish 提交(publish 流不写 patch/),这几条就会自然离开 range",
+          "class": "AUTO_CLI",
+          "apply_cli": "if [ -f \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/route.lua\" ]; then test \"$(sha256sum \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/route.lua\" | cut -c1-64)\" = \"591ef0b6d9c4175fb3bc162e36cc26940e1d558656258bad5bb4059a57836ca8\" || { echo \"patch/edge-balancer-cosocket-606/artifacts/route.lua 在你的副本里内容与本 kit 记录不同 —— 拒绝覆盖,请人工判断\" >&2; exit 1; } ; else mkdir -p \"$(dirname \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/route.lua\")\" && : > \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/route.lua.pre-606.absent\" && install -m 0644 -D host-scripts/edge/route.lua \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/route.lua\"; fi",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/route.lua\" | cut -c1-64)\" = \"591ef0b6d9c4175fb3bc162e36cc26940e1d558656258bad5bb4059a57836ca8\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/route.lua\" | cut -c1-64)\" = \"591ef0b6d9c4175fb3bc162e36cc26940e1d558656258bad5bb4059a57836ca8\" && if [ -f \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/route.lua.pre-606\" ]; then cp -p \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/route.lua.pre-606\" \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/route.lua\"; else rm -f \"$REPO_ROOT/patch/edge-balancer-cosocket-606/artifacts/route.lua\"; fi",
+          "finalize_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "fix-606-kit-bookkeeping"
+      ]
+    },
+    "patch/edge-balancer-cosocket-606/manifest.json": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/deploy-machine/patch/edge-balancer-cosocket-606/manifest.json",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "5fd47bb5976e38de9e3bb21578133a9022276818f477c0467a184d17086394a0",
+      "operations": [
+        {
+          "resource": "客户仓库副本里的 patch/edge-balancer-cosocket-606/manifest.json(mode 0644)。这是**本 kit 自己的记账文件** —— 修复提交 58bd07de 把 4 个 edge 产品文件与 kit 目录放进了同一个提交,所以 base..patch 的 range 必然把 kit 目录也框进来,而 patch/ 不在允许排除的前缀里。施加它只更新仓库副本,**不触碰任何在役资源**;不保留仓库克隆的客户可以跳过这一条。等本 patch 重新锚定到一次 publish 提交(publish 流不写 patch/),这几条就会自然离开 range",
+          "class": "AUTO_CLI",
+          "apply_cli": "if [ -f \"$REPO_ROOT/patch/edge-balancer-cosocket-606/manifest.json\" ]; then test \"$(sha256sum \"$REPO_ROOT/patch/edge-balancer-cosocket-606/manifest.json\" | cut -c1-64)\" = \"5fd47bb5976e38de9e3bb21578133a9022276818f477c0467a184d17086394a0\" || { echo \"patch/edge-balancer-cosocket-606/manifest.json 在你的副本里内容与本 kit 记录不同 —— 拒绝覆盖,请人工判断\" >&2; exit 1; } ; else mkdir -p \"$(dirname \"$REPO_ROOT/patch/edge-balancer-cosocket-606/manifest.json\")\" && : > \"$REPO_ROOT/patch/edge-balancer-cosocket-606/manifest.json.pre-606.absent\" && install -m 0644 -D host-scripts/deploy-machine/patch/edge-balancer-cosocket-606/manifest.json \"$REPO_ROOT/patch/edge-balancer-cosocket-606/manifest.json\"; fi",
+          "verify_cli": "test \"$(sha256sum \"$REPO_ROOT/patch/edge-balancer-cosocket-606/manifest.json\" | cut -c1-64)\" = \"5fd47bb5976e38de9e3bb21578133a9022276818f477c0467a184d17086394a0\"",
+          "rollback_cli": "test \"$(sha256sum \"$REPO_ROOT/patch/edge-balancer-cosocket-606/manifest.json\" | cut -c1-64)\" = \"5fd47bb5976e38de9e3bb21578133a9022276818f477c0467a184d17086394a0\" && if [ -f \"$REPO_ROOT/patch/edge-balancer-cosocket-606/manifest.json.pre-606\" ]; then cp -p \"$REPO_ROOT/patch/edge-balancer-cosocket-606/manifest.json.pre-606\" \"$REPO_ROOT/patch/edge-balancer-cosocket-606/manifest.json\"; else rm -f \"$REPO_ROOT/patch/edge-balancer-cosocket-606/manifest.json\"; fi",
+          "finalize_cli": null,
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "fix-606-kit-bookkeeping"
       ]
     }
   },
   "fixes": [
     {
       "id": "fix-606-balancer-no-cosocket",
-      "summary": "balancer_by_lua* 阶段不再重读 Redis：改为只读 shared_dict 找一个与失败 peer 不同的 desc；找不到则撤销 fresh 标记并 fail closed 返 503，绝不重用已知失败的旧 desc",
-      "root_cause": "OpenResty 在 balancer_by_lua* 上下文中禁用 cosocket API（shared_dict 允许，cosocket 不允许）。原实现经 route.on_balancer → balancer.balancer_pick → backend.lookup_backend → redis_client.get_route → resty.redis:new() 在该阶段重查 Redis，每次 retry 必抛 'API disabled in the context of balancer_by_lua*'，upstream 选取失败。",
-      "trigger": "租户被重建、恢复或迁移后，Redis 中 route 已更新为新 host:port，但 edge 的 L1 缓存仍持有指向旧 host 的 descriptor。首次连接打到旧 host 得 RST → 触发 balancer retry → 撞 API disabled → 502。首连即命中有效 desc 的租户不进 retry 分支，所以故障表现为「部分租户断」而不是全量断，容易被误判成租户个体问题。",
-      "security_note": "不重用失败 desc 是硬要求，不是优化：那个 host:port 坐标可能已被回收并重新分配给另一个在役租户，重投会成功连上别人的 VM，造成跨租户误路由。",
-      "self_healing": "去掉 balancer 阶段的非法重查后，route 变更由 L1 缓存 TTL 自然过期驱动 —— 下一次请求在 rewrite 阶段（cosocket 合法）读 Redis 拿到新 desc，收敛窗口等于 L1 TTL。不需要在 balancer 内做任何补偿。",
-      "artifacts": [
-        "backend.lua",
-        "balancer.lua",
-        "nginx.conf",
-        "route.lua"
+      "summary": "balancer_by_lua* 阶段不再重查 Redis:改为只读 shared_dict 找一个与失败 peer 不同的 desc,找不到就撤销 fresh 标记并 fail closed 返 503,绝不重用已知失败的旧 desc。不重用是**硬要求不是优化** —— 那个 host:port 坐标可能已被回收并重新分配给另一个在役租户,重投会成功连上别人的 VM,变成跨租户误路由。根因:OpenResty 在 balancer_by_lua* 上下文禁用 cosocket(shared_dict 读允许),而原实现经 route.on_balancer → balancer_pick → backend.lookup_backend → redis_client.get_route → resty.redis:new() 在该阶段重查 Redis,每次 retry 必抛 API disabled,upstream 选取失败。这不是设计缺陷,是实现违背了 nginx.conf 注释里写明的同一份契约(balancer 阶段 no shared_dict writes, no cosockets)。修复后 route 变更由 L1 缓存 TTL 自然过期驱动,下一次请求在 rewrite 阶段重新取 desc",
+      "paths": [
+        "deploy/edge/lib/backend.lua",
+        "deploy/edge/lib/balancer.lua",
+        "deploy/edge/nginx.conf",
+        "deploy/edge/route.lua"
       ],
-      "live_effect": true
+      "applies_when": "任何环境都生效,无开关。触发面是租户被重建/恢复/迁移后 edge 的 L1 缓存仍指向旧 host:首连打到旧 host 得 RST → 触发 balancer retry → 撞 API disabled → 502。首连即命中有效 desc 的租户不进 retry 分支,所以故障表现为「部分租户断」而不是全量断,很容易被误判成租户个体问题或 Redis route 数据错误",
+      "params_changed": [],
+      "verification_ids": [
+        "verify-606-no-api-disabled",
+        "verify-606-both-landing-spots",
+        "verify-606-retry-path-selfheal",
+        "verify-606-fail-closed-no-reuse",
+        "verify-606-new-instance-inheritance"
+      ]
+    },
+    {
+      "id": "fix-606-kit-bookkeeping",
+      "summary": "同步 kit 自身的记账文件到客户的仓库副本。修复提交把 4 个 edge 产品文件与 kit 目录放在同一个提交里,所以它们落在 base..patch 的 range 内;这一组只更新仓库副本,不触碰任何在役资源",
+      "paths": [
+        "patch/edge-balancer-cosocket-606/artifacts/backend.lua",
+        "patch/edge-balancer-cosocket-606/artifacts/balancer.lua",
+        "patch/edge-balancer-cosocket-606/artifacts/nginx.conf",
+        "patch/edge-balancer-cosocket-606/artifacts/route.lua",
+        "patch/edge-balancer-cosocket-606/manifest.json"
+      ],
+      "applies_when": "仅在客户保留了本仓库克隆时有意义;不影响在役环境的任何行为",
+      "params_changed": [],
+      "verification_ids": [
+        "verify-606-repo-copy-digests"
+      ]
     }
   ],
   "verifications": [
     {
-      "id": "verify-no-api-disabled",
-      "class": "AUTO",
-      "cmd": "journalctl -u openresty --no-pager --since '-10min' | grep -c 'API disabled in the context of balancer_by_lua' || true",
-      "expect": "0",
-      "note": "nginx -t 不加载 lua 模块 —— -t 通过不代表 lua 能载入。lua 的加载与运行失败只出现在 journald 与 error.log。"
+      "id": "verify-606-no-api-disabled",
+      "fix_id": "fix-606-balancer-no-cosocket",
+      "phase": "A-readonly",
+      "action": "逐台 edge 读 journald:journalctl -u openresty --since '-10min' 里 'API disabled in the context of balancer_by_lua' 的条数",
+      "observable": "该字符串在最近 10 分钟内的出现次数",
+      "pass_when": "每台都是 0 条",
+      "fail_when": "任一台仍有该报错(说明四个文件没装齐,或 reload 没生效)",
+      "timeout_s": 300,
+      "cleanup": "只读,无需清理"
     },
     {
-      "id": "verify-two-targets-sha",
-      "class": "AUTO",
-      "cmd": "sha256sum <live_target> <bootstrap_source>",
-      "expect": "两处均等于该文件的 patch_sha256",
-      "note": "只改 lualib 会在实例重启或重新 bootstrap 后丢失修复"
+      "id": "verify-606-both-landing-spots",
+      "fix_id": "fix-606-balancer-no-cosocket",
+      "phase": "A-readonly",
+      "action": "逐台 edge 对四个文件的两处落点(lualib 运行时路径与 /opt bootstrap 源)各算一次 sha256,与 manifest 里该文件的 patch_sha256 比对",
+      "observable": "八次比对的结果(四个文件 × 两处落点)",
+      "pass_when": "八处全部等于 manifest 记录的摘要",
+      "fail_when": "有任一处不符。只有 lualib 对而 /opt 不对是典型形态 —— 那样实例重启或重新 bootstrap 之后修复会丢",
+      "timeout_s": 600,
+      "cleanup": "只读,无需清理"
     },
     {
-      "id": "verify-retry-path-selfheal",
-      "class": "MANUAL_CLI_REVIEW",
-      "cmd": "让某个租户的 route desc 指向不可达 host（例如先记录其 host:port，再让该 VM 停止），从外部发起 WSS，断言 L1 TTL 内的下一次请求连到新 peer，且 error.log 无 API disabled",
-      "expect": "自愈成功，无 API disabled",
-      "note": "【必做】正常请求不进 retry 分支 —— 只验正常请求等于完全没验这个 fix。这是唯一能证明修复生效的探针。"
+      "id": "verify-606-retry-path-selfheal",
+      "fix_id": "fix-606-balancer-no-cosocket",
+      "phase": "B-lifecycle",
+      "action": "【必做】让某个租户的 route desc 指向不可达的 host:先记下它的 host:port,再让那台 VM 停止;然后从**外部真实发起** WSS 连接,观察是否在 L1 TTL 内被投到新 peer 上",
+      "observable": "WSS 握手结果(101 与 connect.challenge)、实际命中的后端,以及 journald 里有无 API disabled",
+      "pass_when": "在 L1 TTL 内的下一次请求连到新 peer,握手 101,全程无 API disabled",
+      "fail_when": "502/超时,或出现 API disabled,或被投回那个已知失败的旧 peer",
+      "timeout_s": 900,
+      "cleanup": "把停掉的 VM 恢复,删除测试用的租户"
     },
     {
-      "id": "verify-fail-closed-503",
-      "class": "MANUAL_CLI_REVIEW",
-      "cmd": "构造共享缓存中不存在任何不同 peer 的场景，断言客户端拿 503 而非 500，且日志中无重用失败 peer 的痕迹",
-      "expect": "503，且未重用失败 peer",
-      "note": "503 而非 500 依赖 nginx.conf 的 header_filter_by_lua_block —— 拿到 500 说明 nginx.conf 没有下发成功。"
-    }
-  ],
-  "manual_review_items": [
-    {
-      "id": "s3-bundle-sha-gate",
-      "question": "LaunchTemplate userdata 拉 edge bundle 时有没有 sha256 校验？",
-      "how_to_check": "aws ec2 describe-launch-template-versions 取 userdata，base64 解码后查找 sha256sum -c 之类的断言",
-      "why": "无校验 → 可直接更新现有 bundle 对象让新实例也继承修复（先记下旧 VersionId 作回滚锚点，S3 versioning 使字节替换可逆）；有校验 → 改 bundle 内容后 sha 不匹配、新实例起不来，必须 S3 与 LaunchTemplate 同步改，属换机级操作，单独排期",
-      "blocking": "决定新实例是否继承修复。不解决则本 kit 只止血在役实例，任何扩容、健康检查替换或 AZ 重平衡起来的新 edge 都会带回原缺陷"
+      "id": "verify-606-fail-closed-no-reuse",
+      "fix_id": "fix-606-balancer-no-cosocket",
+      "phase": "B-lifecycle",
+      "action": "构造 shared_dict 里找不到任何与失败 peer 不同的 desc 的状态,再发起一次请求;同时记录失败 peer 的 host:port,确认响应里没有把请求投到它上面",
+      "observable": "HTTP 状态码,以及该请求最终有没有到达那个已知失败的 peer",
+      "pass_when": "fail closed 返 503,且**没有**重用已知失败的 desc",
+      "fail_when": "返回 200 且落到了失败 peer —— 那个坐标可能已被回收给另一个在役租户,这就是跨租户误路由",
+      "timeout_s": 900,
+      "cleanup": "恢复被构造的缓存状态(或等 L1 TTL 自然过期)"
     },
     {
-      "id": "live-version-drift",
-      "question": "在役 edge lua 与本 kit 的 base 版本偏离多少？",
-      "how_to_check": "对比在役文件与 kit 制品的 sha256；另可从 error.log 报出的行号反推",
-      "why": "整文件替换会带入 base 与在役之间的全部差异。若在役文件被手工改过，替换会覆盖那些改动",
-      "blocking": "替换前需确认这 4 个文件在役版本没有本 kit 之外的人为修改"
+      "id": "verify-606-new-instance-inheritance",
+      "fix_id": "fix-606-balancer-no-cosocket",
+      "phase": "A-readonly",
+      "action": "读 LaunchTemplate 的 userdata,判定它拉 edge bundle 时有没有 sha256 校验,并把结论写成一行 VERDICT 存进 edge-bundle-sha-gate.txt",
+      "observable": "回执文件里的 VERDICT 行",
+      "pass_when": "回执存在且写明 VERDICT: pinned 或 VERDICT: unpinned",
+      "fail_when": "回执缺失或没有结论 —— 这条不闭,新实例是否继承修复就是未知,本 kit 只止住了当前实例的血",
+      "timeout_s": 300,
+      "cleanup": "只读,无需清理"
+    },
+    {
+      "id": "verify-606-repo-copy-digests",
+      "fix_id": "fix-606-kit-bookkeeping",
+      "phase": "A-readonly",
+      "action": "对客户仓库副本里这一组记账文件逐个算 sha256,与 manifest 记录的 patch_sha256 比对",
+      "observable": "每个文件的比对结果",
+      "pass_when": "全部相符",
+      "fail_when": "有任一个不符或缺失",
+      "timeout_s": 300,
+      "cleanup": "只读,无需清理"
     }
   ]
 }

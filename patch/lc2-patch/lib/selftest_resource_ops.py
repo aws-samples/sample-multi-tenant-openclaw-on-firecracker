@@ -273,7 +273,11 @@ def test_lambda_code_configures_before_publishing(mod) -> None:
     # assertion and reaches the environment write — call ORDER is what is under test here.
     import zipfile
     zp = Path(tempfile.mkdtemp()) / "overlay.zip"
-    lam = HERE.parent / "lambda"
+    # Rooted at lambda/api, NOT lambda/: the live package starts at `handler.py`, so a zip built from
+    # `lambda/` carries an `api/` prefix that exists in no real package. This fake used to be built
+    # the wrong way, which is exactly why an operation that could never run on a real account passed
+    # its own self-test. See group [14].
+    lam = HERE.parent / "lambda" / "api"
     with zipfile.ZipFile(zp, "w") as z:
         for f in (sorted(lam.rglob("*")) if lam.is_dir() else []):
             if f.is_file():
@@ -470,6 +474,201 @@ def test_no_partial_codebuild_source_write(mod) -> None:
         check(is_prose, f"line {i} mentions the partial form only in prose: {stripped[:70]}")
     check("_saved_source(" in src, "rollback builds the source from the recorded complete block")
 
+
+# ---------------------------------------------------------------------------------------------
+# [14] Real-machine 2026-08-27: the overlay assertion enumerated one directory level too high.
+# The live openclaw-api package starts at `handler.py`; the kit lays a function out as
+# `lambda/<function-dir>/<path-in-package>`, so `lambda/api` maps onto the zip root and `lambda`
+# yields an `api/` prefix that exists in no real package. Nothing exercised this function before,
+# which is why an operation that could never run anywhere shipped.
+def test_overlay_root_is_the_function_dir(mod) -> None:
+    import zipfile
+    root = mod.Path("lambda")
+    if not root.is_dir():
+        check(False, "[14] the kit ships no lambda/ directory")
+        return
+    resolved = mod._overlay_source_root("api")
+    check(resolved == root / "api",
+          f"[14] the overlay root is the function dir (got {resolved})")
+    shipped = sorted(str(f.relative_to(resolved)) for f in resolved.rglob("*") if f.is_file())
+    check(shipped and not any(r.startswith("api/") for r in shipped),
+          f"[14] shipped paths are package-relative, not api/-prefixed (got {shipped[:3]})")
+
+    # A zip laid out like the real package passes.
+    good = mod.Path(mod.tempfile.mkdtemp()) / "good.zip"
+    with zipfile.ZipFile(good, "w") as z:
+        for rel in shipped:
+            z.writestr(rel, (resolved / rel).read_bytes())
+        z.writestr("core/auth.py", b"# a live file the kit does not ship\n")
+    try:
+        mod._assert_overlay_carries_shipped_sources(good, "api")
+        check(True, "[14] a package-shaped overlay zip is accepted")
+    except mod.Fail as exc:
+        check(False, f"[14] a package-shaped overlay zip was rejected: {exc}")
+
+    # The layout the old code demanded must now be REJECTED, with the layout error named rather
+    # than reported as a list of missing files.
+    bad = mod.Path(mod.tempfile.mkdtemp()) / "bad.zip"
+    with zipfile.ZipFile(bad, "w") as z:
+        for rel in shipped:
+            z.writestr(f"api/{rel}", (resolved / rel).read_bytes())
+    try:
+        mod._assert_overlay_carries_shipped_sources(bad, "api")
+        check(False, "[14] an api/-prefixed zip was accepted; the root regression is back")
+    except mod.Fail as exc:
+        check("does not look like" in str(exc),
+              f"[14] the rejection names the layout problem, not just missing files ({exc})")
+
+    # Byte-tampering one shipped file must still fail — the point of the assertion is unchanged.
+    tampered = mod.Path(mod.tempfile.mkdtemp()) / "tampered.zip"
+    with zipfile.ZipFile(tampered, "w") as z:
+        for i, rel in enumerate(shipped):
+            data = (resolved / rel).read_bytes()
+            z.writestr(rel, data + b"\n# tampered\n" if i == 0 else data)
+    try:
+        mod._assert_overlay_carries_shipped_sources(tampered, "api")
+        check(False, "[14] a tampered overlay zip was accepted")
+    except mod.Fail as exc:
+        check("differing" in str(exc), f"[14] tampering is still caught ({str(exc)[:60]})")
+
+
+# ---------------------------------------------------------------------------------------------
+# [15] Real-machine 2026-08-27: `_assets_tag_delta` demanded exactly one cr-owned tag added and one
+# removed. This range moves two — the edge bundle and the host bootstrap are both content-addressed.
+# apply, verify AND rollback all died reading the closure, in every environment.
+def test_tag_delta_pairs_on_the_deployment_hash(mod) -> None:
+    parts = mod._cr_owned_parts(
+        "aws-cdk:cr-owned:deployment/bootstrap/edge/" + "a" * 64 + ":c199ba0a")
+    check(parts == ("deployment/bootstrap/edge/" + "a" * 64, "c199ba0a"),
+          f"[15] a cr-owned key splits on the LAST colon, not the first (got {parts})")
+    check(mod._cr_owned_parts("aws:cloudformation:stack-name") is None,
+          "[15] a non-cr-owned tag is not parsed as one")
+
+    try:
+        add, rem = mod._assets_tag_delta()
+    except mod.Fail as exc:
+        check(False, f"[15] the delta still refuses on this kit's own closure: {exc}")
+        return
+    want_prefix = mod._edge_prefix().rstrip("/")
+    check(mod._cr_owned_parts(add)[0].rstrip("/") == want_prefix,
+          f"[15] the added tag belongs to the edge bundle prefix (got {add[:70]})")
+    check(mod._cr_owned_parts(add)[1] == mod._cr_owned_parts(rem)[1],
+          "[15] added and removed carry the SAME deployment hash, which is what makes them a pair")
+    check("bootstrap/host" not in add and "bootstrap/host" not in rem,
+          "[15] the host bootstrap tag is left to the operation that owns it")
+
+
+# ---------------------------------------------------------------------------------------------
+# [16] Real-machine 2026-08-27: `_obs_prefix` required the three observability deployments to share
+# one prefix. They are nested by design (`fluent-bit`, `…/edge`, `…/host`), so all three modes died.
+def test_obs_prefixes_are_nested(mod) -> None:
+    try:
+        root, per = mod._obs_prefixes()
+    except mod.Fail as exc:
+        check(False, f"[16] the obs prefixes still refuse on this kit's own closure: {exc}")
+        return
+    check(len(per) == 3, f"[16] all three observability deployments are covered (got {len(per)})")
+    check(all(p == root or p.startswith(root + "/") for p in per.values()),
+          f"[16] every prefix is the root or nested under it (root={root}, per={sorted(per.values())})")
+    check(len(set(per.values())) == 3,
+          "[16] they are genuinely DIFFERENT prefixes, which is what the old check rejected")
+
+    payload = mod._local_payload(mod.Path("host-scripts/edge/fluent-bit"))
+    try:
+        mod._assert_obs_payload_reaches_every_prefix(root, per, payload)
+        check(True, "[16] the shipped payload reaches all three prefixes")
+    except mod.Fail as exc:
+        check(False, f"[16] the shipped payload does not reach every prefix: {exc}")
+
+    # A payload that writes nothing into one deployment's directory must be refused — the old check
+    # could not see this even when it passed, which is the "verified but not delivered" hole.
+    thin = {k: v for k, v in payload.items() if "/" not in k}
+    if thin and len(thin) < len(payload):
+        try:
+            mod._assert_obs_payload_reaches_every_prefix(root, per, thin)
+            check(False, "[16] a payload that misses a nested prefix was accepted")
+        except mod.Fail as exc:
+            check("writes nothing there" in str(exc),
+                  f"[16] a payload missing a nested prefix is refused ({str(exc)[:60]})")
+
+
+# ---------------------------------------------------------------------------------------------
+# [17] Real-machine 2026-08-27: the alarm gate read a boolean switch that exists in neither the
+# closure (10 SSM parameters) nor a real account (20), and `verify` returned PASS for alarms that had
+# never been created while the edge was still reading the replica.
+def test_alarm_premise_comes_from_the_closure(mod) -> None:
+    try:
+        param = mod._edge_redis_coord_param()
+    except mod.Fail as exc:
+        check(False, f"[17] the coordinate parameter cannot be resolved from the closure: {exc}")
+        return
+    check(param.endswith("/reader-endpoint"),
+          f"[17] the premise reads the parameter the edge actually uses (got {param})")
+    src = mod.Path("lib/oc_resource_ops.py").read_text()
+    check("EDGE_READ_REPLICA_PARAM" not in src.split("def _edge_redis_coord_param")[0]
+          or 'env("EDGE_READ_REPLICA_PARAM")' not in src,
+          "[17] no code path still requires the non-existent boolean switch")
+    body = src.split("def op_cw_drop_lag")[1].split("def ")[0]
+    verify_part = body.split('if mode == "verify"')[1].split('if mode == "rollback"')[0]
+    check("_replica_read_premise" in verify_part,
+          "[17] verify asserts the premise, not only the absence of the alarms")
+
+
+# ---------------------------------------------------------------------------------------------
+# [18] Real-machine 2026-08-27: the gate's SSM probe was a `commands=…` shorthand string carrying
+# double quotes, so it failed CLI argument validation before reaching SSM — that stage had never run.
+# And the probe output parser split on `=`, which left the field NAME inside the value for
+# nginx.conf's whitespace-separated shape, so even a converged edge would be rejected.
+def test_ssm_probe_payload_and_parsing(mod) -> None:
+    import base64 as _b64
+    import json as _json
+    src = mod.Path("lib/oc_resource_ops.py").read_text()
+    seg = src.split("_probe_sh = (")[1].split("for iid in asg_ids:")[0]
+    ns = {"base64": _b64, "json": _json}
+    exec("_probe_sh = (" + seg.replace("\n    ", "\n"), ns)   # noqa: S102 — this module's own source
+    probe = ns["probe"]
+    parsed = _json.loads(probe)
+    check(list(parsed) == ["commands"] and len(parsed["commands"]) == 1,
+          "[18] --parameters is JSON, so the CLI's shorthand parser is not involved")
+    cmd = parsed["commands"][0]
+    check('"' not in cmd and "," not in cmd,
+          f"[18] the transported command carries no quote or comma ({cmd[:40]}…)")
+    decoded = _b64.b64decode(cmd.split()[1]).decode()
+    check('"' in decoded and "nginx.conf" in decoded,
+          "[18] the decoded script does carry the literal quotes it needs")
+
+    def extract(line):
+        return line.split()[-1].split("=", 1)[-1].strip().strip(chr(34)).strip()
+    host = "opr1.example.cache.amazonaws.com"
+    check(extract(f"redis_host  {host}") == host,
+          "[18] the whitespace-separated nginx.conf shape yields the host, not the field name")
+    check(extract(f"ENGINE_REDIS_HOST={host}") == host,
+          "[18] the key=value env shape also yields the host")
+    check(extract(f"reader_host  {host}") == extract(f"redis_host  {host}"),
+          "[18] a CONVERGED edge (both coordinates on the primary) now compares equal")
+
+
+# ---------------------------------------------------------------------------------------------
+# [19] Real-machine 2026-08-27: the two checks after the CodeBuild transaction reverted only the
+# project Source, leaving the uploaded asset object and the widened role policy behind with nothing
+# in the receipt. And the OLD asset ARN was looked up by the closure's key, which no real environment
+# holds — a CDK asset key is the content hash of the synth that produced it.
+def test_codebuild_post_transaction_and_old_arn(mod) -> None:
+    src = mod.Path("lib/oc_resource_ops.py").read_text()
+    body = src.split("def op_codebuild")[1].split("\ndef ")[0]
+    tail = body.split("    got = live_loc()")[-1]
+    check(tail.count("txn.unwind()") >= 2,
+          "[19] both post-transaction failures unwind the whole transaction")
+    check("update-project" not in tail.split("role_allows_key()")[0]
+          or "txn.unwind()" in tail.split("role_allows_key()")[0],
+          "[19] neither post-transaction path hand-reverts only the Source")
+
+    grant = src.split("def _grant_new_asset_arn")[1].split("\ndef ")[0]
+    check("zips" in grant and "len(zips) != 1" in grant,
+          "[19] the old ARN falls back to the single asset zip the LIVE policy carries")
+    check("content hash of the synth" in grant,
+          "[19] the reason the closure's key cannot be used is recorded where the fallback is")
+
 def main() -> int:
     closure = Path(sys.argv[1]) if len(sys.argv) > 1 else HERE.parent / "resources/cloudformation"
     if not closure.is_dir():
@@ -493,6 +692,13 @@ def main() -> int:
     test_each_state_fact_has_its_own_slot(mod)
     test_entry_points_agree_on_the_diff_argument(mod)
     test_no_partial_codebuild_source_write(mod)
+
+    test_overlay_root_is_the_function_dir(mod)
+    test_tag_delta_pairs_on_the_deployment_hash(mod)
+    test_obs_prefixes_are_nested(mod)
+    test_alarm_premise_comes_from_the_closure(mod)
+    test_ssm_probe_payload_and_parsing(mod)
+    test_codebuild_post_transaction_and_old_arn(mod)
 
     print(f"\nassertions={ASSERTIONS} failures={len(FAILURES)}")
     if not ASSERTIONS:

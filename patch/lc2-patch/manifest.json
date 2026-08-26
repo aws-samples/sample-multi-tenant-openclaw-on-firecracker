@@ -79,7 +79,7 @@
       "sha256": "5e78605dab728afe1c7a6cfad96a410cd24c8bf76da4c869f61387f2661a6799"
     },
     "lib/apply-resource-ops.sh": {
-      "sha256": "fb1cca7ae06192f01c681b6fa1f61edc73d4a8e6a47708e5cd5a9a6c09df9210"
+      "sha256": "fda61cc1765b373b416f762f0fd5f09a8a9d9cbbcaa93a09102766cd1f3bff25"
     },
     "lib/discover-env.sh": {
       "sha256": "a97ad92dce6dcf6d5d6a4b329cf1f02f7d32b03bf2ea1cad785f90ec59f3069b"
@@ -91,10 +91,10 @@
       "sha256": "240c14d26aa6668567f6c2bbaf8ca2d884f27532735873382317317633402779"
     },
     "lib/oc_resource_ops.py": {
-      "sha256": "6c03d526bac7c303eaa0525368c71a5a0dc8dec9e8e6564fe1fbd8335760dfd2"
+      "sha256": "8f9661d3b5d4cd55a2c644c784aa85133ec355fb0587be59c9232672582d9861"
     },
     "lib/selftest_resource_ops.py": {
-      "sha256": "f98c86f6d11a33fdd5386fe6e60248a44305971b2bc0f2c739d586d15458e515"
+      "sha256": "34082c83f70f12b5ea6d675b6e0267f6faf474e0c2d55e8a66e948d2d5381d97"
     }
   },
   "paths": {
@@ -7138,10 +7138,10 @@
     {
       "id": "v-618-alarm-set-matches-switch",
       "phase": "A-readonly",
-      "action": "set -o pipefail; SW=$(aws ssm get-parameter --name \"$EDGE_READ_REPLICA_PARAM\" --query Parameter.Value --output text 2>/dev/null || echo unknown); LAG=$(aws cloudwatch describe-alarms --alarm-names openclaw-edge-replica-route-freshness-upper-bound-1 openclaw-edge-replica-route-freshness-upper-bound-2 --query \"length(MetricAlarms)\" --output text); FB=$(aws cloudwatch describe-alarms --alarm-names openclaw-edge-redis-reader-endpoint-fallback --query \"length(MetricAlarms)\" --output text); echo \"switch=$SW lag_alarms=$LAG fallback_alarms=$FB\"; test \"$SW\" != \"unknown\" || { echo \"cannot read the switch; inconclusive\"; exit 1; }; case \"$SW\" in true|True|TRUE) test \"$LAG\" -eq 2 && test \"$FB\" -eq 1 || { echo \"FAIL: switch=$SW needs both lag alarms (got $LAG/2) and the fallback alarm (got $FB/1)\"; exit 1; } ;; *) test \"$LAG\" -eq 0 && test \"$FB\" -eq 0 || { echo \"FAIL: switch=$SW must leave no lag/fallback alarms (got $LAG/$FB)\"; exit 1; } ;; esac",
-      "observable": "the live switch value alongside the count of both alarm families, selected by their EXACT names (openclaw-edge-replica-route-freshness-upper-bound-1/-2 and openclaw-edge-redis-reader-endpoint-fallback) rather than a name prefix",
-      "pass_when": "switch true => BOTH named lag alarms (2) and the fallback alarm (1) exist; switch false => zero of each",
-      "fail_when": "the switch is true but either family is absent (a half-converged fleet would be invisible), or the switch is false but lag alarms still exist (they watch a metric that equals the primary)",
+      "action": "set -o pipefail; PARAM=$(python3 -c \"import json,sys;t=json.load(open(\\\"resources/cloudformation/OpenClawOrchestrator.patch.json\\\"))[\\\"Resources\\\"];print([r[\\\"Properties\\\"][\\\"Name\\\"] for r in t.values() if r[\\\"Type\\\"]==\\\"AWS::SSM::Parameter\\\" and str(r[\\\"Properties\\\"].get(\\\"Name\\\",\\\"\\\")).endswith(\\\"/reader-endpoint\\\")][0])\"); COORD=$(aws ssm get-parameter --name \"$PARAM\" --query Parameter.Value --output text 2>/dev/null || echo unknown); PRIM=$(aws elasticache describe-replication-groups --replication-group-id \"$REDIS_REPLICATION_GROUP_ID\" --query \"ReplicationGroups[0].NodeGroups[0].PrimaryEndpoint.[Address,Port]\" --output text | tr \"\\t\" \":\"); LAG=$(aws cloudwatch describe-alarms --alarm-names openclaw-edge-replica-route-freshness-upper-bound-1 openclaw-edge-replica-route-freshness-upper-bound-2 --query \"length(MetricAlarms)\" --output text); FB=$(aws cloudwatch describe-alarms --alarm-names openclaw-edge-redis-reader-endpoint-fallback --query \"length(MetricAlarms)\" --output text); echo \"param=$PARAM coord=$COORD primary=$PRIM lag_alarms=$LAG fallback_alarms=$FB\"; test \"$COORD\" != \"unknown\" || { echo \"cannot read the coordinate; inconclusive\"; exit 1; }; if [ \"$COORD\" = \"$PRIM\" ]; then test \"$LAG\" -eq 0 && test \"$FB\" -eq 0 || { echo \"FAIL: the coordinate is the primary, so no lag/fallback alarm may remain (got $LAG/$FB)\"; exit 1; }; else test \"$LAG\" -eq 2 && test \"$FB\" -eq 1 || { echo \"FAIL: the coordinate is NOT the primary ($COORD), so the edge reads a replica and both lag alarms (got $LAG/2) plus the fallback alarm (got $FB/1) must exist\"; exit 1; }; fi",
+      "observable": "the parameter the edge reads for its Redis coordinate, that replication group's primary endpoint, and the count of the two replica-lag alarms plus the reader-endpoint fallback alarm",
+      "pass_when": "the coordinate equals the primary endpoint AND no lag or fallback alarm exists; or the coordinate is not the primary AND both lag alarms plus the fallback alarm exist",
+      "fail_when": "the coordinate cannot be read (inconclusive); the coordinate is the primary but a lag or fallback alarm remains; or the coordinate still points at the reader while the alarms are absent — that last case is the one an absence-only check reported as a pass while the edge was reading a replica",
       "timeout_s": 120,
       "cleanup": null,
       "fix_id": "#618"

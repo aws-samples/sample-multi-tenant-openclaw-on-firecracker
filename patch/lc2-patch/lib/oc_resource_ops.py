@@ -426,18 +426,61 @@ def _zip_codesha(zip_path: Path) -> str:
     return base64.b64encode(hashlib.sha256(zip_path.read_bytes()).digest()).decode()
 
 
-def _assert_overlay_carries_shipped_sources(zip_path: Path) -> None:
-    """The overlay zip is built by the operator, so it is not trustworthy on its own. Assert that
-    every first-party file this kit ships under lambda/ is present in the zip with the SAME bytes.
-    Without this the operation would happily install an arbitrary zip and then assert only that
-    its own digest matched itself."""
-    import zipfile
+def _overlay_source_root(fn_dir: str = "api") -> Path:
+    """The directory in this kit whose contents map ONTO the zip root.
+
+    A function is laid out as `lambda/<function-dir>/<path-inside-the-package>`: the manifest maps
+    `deploy/lambda/api/handler.py` -> `lambda/api/handler.py`, and CDK bundles `deploy/lambda/api/`
+    AS the package root, so the live package starts at `handler.py`, not `api/handler.py`.
+    Enumerating from `lambda/` instead of `lambda/<function-dir>/` prefixes every path with a
+    directory that exists in no real package, and the assertion below can then never pass.
+    """
     root = Path("lambda")
+    if not root.is_dir():
+        raise Fail("the kit ships no lambda/ directory; refusing to install an unverified zip")
+    dirs = sorted(d.name for d in root.iterdir() if d.is_dir())
+    override = os.environ.get("OVERLAY_SOURCE_DIR", "").strip()
+    if override:
+        if override not in dirs:
+            raise Fail(f"OVERLAY_SOURCE_DIR={override} is not a directory under lambda/ "
+                       f"(this kit ships {dirs})")
+        return root / override
+    if fn_dir in dirs:
+        return root / fn_dir
+    if len(dirs) == 1:
+        return root / dirs[0]
+    raise Fail(
+        f"cannot tell which lambda/ directory belongs to this function: the kit ships {dirs} and "
+        f"none is named {fn_dir!r}. Set OVERLAY_SOURCE_DIR to the one whose contents sit at the "
+        "root of this function's package."
+    )
+
+
+def _assert_overlay_carries_shipped_sources(zip_path: Path, fn_dir: str = "api") -> None:
+    """The overlay zip is built by the operator, so it is not trustworthy on its own. Assert that
+    every first-party file this kit ships for THIS function is present in the zip with the SAME
+    bytes. Without this the operation would happily install an arbitrary zip and then assert only
+    that its own digest matched itself."""
+    import zipfile
+    root = _overlay_source_root(fn_dir)
     shipped = {str(f.relative_to(root)): sha256_file(f) for f in sorted(root.rglob("*")) if f.is_file()}
     if not shipped:
-        raise Fail("the kit ships no lambda/ sources; refusing to install an unverified zip")
+        raise Fail(f"the kit ships no sources under {root}; refusing to install an unverified zip")
     with zipfile.ZipFile(zip_path) as z:
         names = set(z.namelist())
+        # Prove the zip is this function's package BEFORE reporting per-file misses. A bare
+        # "missing=[…]" list cannot distinguish "the operator built the wrong zip" from "the kit is
+        # enumerating from the wrong root", and the second is a defect in the kit that a real
+        # environment would otherwise surface as an operator error.
+        anchors = [r for r in shipped if "/" not in r]
+        if anchors and not any(a in names for a in anchors):
+            raise Fail(
+                f"the overlay zip does not look like {root.name}'s package: none of its root-level "
+                f"files {sorted(anchors)[:5]} is at the zip root. The zip's own root holds "
+                f"{sorted(n for n in names if '/' not in n)[:8]}. Either the zip was built from the "
+                f"wrong directory, or {root} is not the directory whose contents map onto this "
+                "package's root (set OVERLAY_SOURCE_DIR)."
+            )
         missing, differing = [], []
         for rel, want in shipped.items():
             if rel not in names:
@@ -447,8 +490,9 @@ def _assert_overlay_carries_shipped_sources(zip_path: Path) -> None:
                 differing.append(rel)
     if missing or differing:
         raise Fail(f"overlay zip does not carry this kit's sources: missing={missing[:5]} "
-                   f"differing={differing[:5]} (of {len(shipped)} shipped files)")
-    log(f"asserted the overlay zip carries all {len(shipped)} shipped lambda/ files byte-for-byte")
+                   f"differing={differing[:5]} (of {len(shipped)} shipped files under {root})")
+    log(f"asserted the overlay zip carries all {len(shipped)} files this kit ships under {root}, "
+        "byte-for-byte")
 
 
 def _wait_updated() -> None:
@@ -870,14 +914,66 @@ def _edge_prefix() -> str:
     return pref
 
 
+def _cr_owned_parts(key: str) -> tuple[str, str] | None:
+    """Split `aws-cdk:cr-owned:<prefix>:<deployment-hash>` into (prefix, hash).
+
+    The prefix itself contains `/` and, for a content-addressed deployment, a sha256 — so the
+    deployment hash is the part after the LAST colon, not a naive split.
+    """
+    marker = "aws-cdk:cr-owned:"
+    if not key.startswith(marker):
+        return None
+    rest = key[len(marker):]
+    if ":" not in rest:
+        return None
+    prefix, _, dep_hash = rest.rpartition(":")
+    if not prefix or not dep_hash:
+        return None
+    return prefix, dep_hash
+
+
 def _assets_tag_delta() -> tuple[str, str]:
+    """(added, removed) for THIS operation's deployment only.
+
+    A cut can move more than one cr-owned tag: the edge bundle and the host bootstrap script are
+    both content-addressed, so each has its own tag and each moves independently. The host one
+    belongs to `host-init-bootstrap`, which owns that resource and is MANUAL_CLI_REVIEW; claiming it
+    here would make two operations write the same tag.
+
+    Pair on the CDK deployment hash — stable for a given BucketDeployment across synths — so
+    "this deployment's content moved" is exactly "same hash, different prefix".
+    """
     b = {t["Key"]: t["Value"] for t in base_props(ORCH, "Assets560B5C73").get("Tags", [])}
     p = {t["Key"]: t["Value"] for t in expected_props(ORCH, "Assets560B5C73").get("Tags", [])}
-    added = [k for k in p if k not in b]
-    removed = [k for k in b if k not in p]
-    if len(added) != 1 or len(removed) != 1:
-        raise Fail(f"expected exactly one tag added and one removed; got +{added} -{removed}")
-    return added[0], removed[0]
+    want_prefix = _edge_prefix().rstrip("/")
+
+    added_all = [k for k in p if k not in b]
+    removed_all = [k for k in b if k not in p]
+
+    mine_added = [k for k in added_all
+                  if (pt := _cr_owned_parts(k)) and pt[0].rstrip("/") == want_prefix]
+    if len(mine_added) != 1:
+        raise Fail(
+            f"expected exactly one cr-owned tag for the edge bundle prefix {want_prefix}; the "
+            f"closure adds {sorted(added_all)}. Without exactly one, this operation cannot tell "
+            "which tag marks the prefix it writes."
+        )
+    add_key = mine_added[0]
+    dep_hash = _cr_owned_parts(add_key)[1]
+
+    mine_removed = [k for k in removed_all
+                    if (pt := _cr_owned_parts(k)) and pt[1] == dep_hash]
+    if len(mine_removed) != 1:
+        raise Fail(
+            f"expected exactly one superseded cr-owned tag with deployment hash {dep_hash}; the "
+            f"closure removes {sorted(removed_all)}. Leaving the wrong one behind would make two "
+            "prefixes look owned by the same deployment."
+        )
+    others = sorted(set(added_all) - {add_key})
+    if others:
+        log(f"the closure also moves {len(others)} cr-owned tag(s) owned by other operations "
+            f"(not touched here): {[k[:64] for k in others]}")
+    return add_key, mine_removed[0]
 
 
 def _assets_tag_value(key: str) -> str:
@@ -1055,21 +1151,54 @@ OBS_IDS = ["ObsFbInstallerCustomResourceB2298A62",
            "ObsFbHostConfCustomResource27F6488F"]
 
 
-def _obs_prefix() -> str:
-    """Read the destination prefix out of the closure rather than trusting an env override.
-    A wrong prefix would upload to a path nothing reads and still pass a naive check."""
-    prefixes = set()
+def _obs_prefixes() -> tuple[str, dict]:
+    """(upload_root, {logical_id: prefix}) read out of the closure, never from an env override.
+
+    The three observability deployments do NOT share a prefix, and requiring that made this
+    operation unrunnable. They are NESTED — `…/fluent-bit`, `…/fluent-bit/edge`,
+    `…/fluent-bit/host` — and the kit's payload mirrors that nesting, so one recursive upload rooted
+    at the shortest prefix lands every file where its own deployment expects it.
+
+    What must hold is the nesting itself: if any prefix sat outside the root, a single recursive
+    upload would write to a path nothing reads while still passing a naive existence check.
+    """
+    per = {}
     for lid in OBS_IDS:
         pr = expected_props(ORCH, lid).get("DestinationBucketKeyPrefix")
-        if isinstance(pr, str) and pr:
-            prefixes.add(pr.rstrip("/"))
-    if len(prefixes) == 1:
-        return prefixes.pop()
-    if not prefixes:
-        raise Fail("no DestinationBucketKeyPrefix in the closure for the observability "
-                   "deployments; refusing to guess where they belong")
-    raise Fail(f"the observability deployments target different prefixes {sorted(prefixes)}; "
-               "this operation cannot cover them as one unit")
+        if not isinstance(pr, str) or not pr:
+            raise Fail(f"{lid} has no literal DestinationBucketKeyPrefix in the closure; refusing "
+                       "to guess where its files belong")
+        per[lid] = pr.rstrip("/")
+    root = min(per.values(), key=len)
+    outside = {lid: pr for lid, pr in per.items() if pr != root and not pr.startswith(root + "/")}
+    if outside:
+        raise Fail(
+            f"these observability deployments target prefixes outside {root}: {outside}. One "
+            "recursive upload cannot cover them, and uploading anyway would write where nothing "
+            "reads."
+        )
+    return root, per
+
+
+def _assert_obs_payload_reaches_every_prefix(root: str, per: dict, payload: dict) -> None:
+    """Every deployment's prefix must receive at least one file from this payload.
+
+    The old check could pass while a deployment's directory got nothing: it only compared prefixes to
+    each other and never to the files being uploaded. A `host/` deployment left unwritten is exactly
+    the "verified but not delivered" outcome the kit is supposed to make impossible.
+    """
+    keys = {f"{root}/{rel}" for rel in payload}
+    for lid, pr in sorted(per.items()):
+        hit = [k for k in keys if k == pr or k.startswith(pr + "/")]
+        # A nested prefix's files also match its parent, so the parent is satisfied by anything;
+        # what matters is that no prefix is empty.
+        if not hit:
+            raise Fail(
+                f"{lid} deploys to {pr} but this payload writes nothing there. The payload's keys "
+                f"are {sorted(keys)[:6]}. Uploading would leave that deployment's directory stale "
+                "while every other check passed."
+            )
+    log(f"asserted the payload reaches all {len(per)} observability prefixes under {root}")
 
 
 def _restore_obs_versions(bucket: str, saved: dict) -> None:
@@ -1112,12 +1241,11 @@ def _restore_obs_versions(bucket: str, saved: dict) -> None:
 
 def op_s3_obs(mode: str) -> None:
     bucket = env("ASSETS_BUCKET")
-    prefix = _obs_prefix()
+    prefix, per_prefix = _obs_prefixes()
     payload = _local_payload(Path("host-scripts/edge/fluent-bit"))
     if not payload:
         raise Fail("host-scripts/edge/fluent-bit is empty")
-    for lid in OBS_IDS:
-        expected_props(ORCH, lid)   # fail closed if the closure does not carry it
+    _assert_obs_payload_reaches_every_prefix(prefix, per_prefix, payload)
 
     if mode == "verify":
         _assert_s3_payload(bucket, prefix, payload)
@@ -1265,23 +1393,46 @@ def _grant_new_asset_arn(role: str, txn: "Txn") -> tuple[bool, str, dict]:
     gone, added = _closure_asset_arn_suffixes()
     name, doc = _build_role_policy(role)
     prior = json.loads(json.dumps(doc))
-    # By key, for the same reason: the live ARN's bucket differs from the closure's placeholder.
-    st = (_statement_with_arn(doc, gone.rsplit("/", 1)[-1])
-          or _statement_with_arn(doc, added.rsplit("/", 1)[-1]))
+    new_key_only = added.rsplit("/", 1)[-1]
+    closure_old_key = gone.rsplit("/", 1)[-1]
+
+    # Prefer the closure's own keys, so an environment that WAS deployed from this exact synth is
+    # matched precisely.
+    st = _statement_with_arn(doc, closure_old_key) or _statement_with_arn(doc, new_key_only)
+    old_key = closure_old_key
     if st is None:
-        raise Fail(f"neither the old nor the new asset key appears in {name}; the live policy does "
-                   "not match the closure, so this operation will not edit it")
+        # The closure's asset keys are content hashes of what THIS synth bundled; a real environment
+        # synthesizes from its own config and therefore holds a third key. Fall back to the one asset
+        # ARN this policy actually carries — `_build_role_policy` has already narrowed to the single
+        # policy that references an asset zip. More than one is genuinely ambiguous and still refuses.
+        zips = []
+        for cand in doc.get("Statement", []):
+            r = cand.get("Resource")
+            for item in (r if isinstance(r, list) else [r]):
+                if isinstance(item, str) and item.endswith(".zip"):
+                    zips.append((cand, item))
+        if len(zips) != 1:
+            raise Fail(
+                f"{name} carries {len(zips)} asset-zip resources and none matches the closure's "
+                f"keys ({closure_old_key[:16]}… / {new_key_only[:16]}…); refusing to guess which "
+                "grant to widen. Name the correct one by hand."
+            )
+        st, live_arn = zips[0]
+        old_key = live_arn.rsplit("/", 1)[-1]
+        log(f"{name} grants {old_key} — neither side of the closure, because a CDK asset key is the "
+            f"content hash of the synth that produced it and this environment synthesized its own. "
+            f"Taking the OLD arn from the live policy and only the NEW key from the closure.")
+
     res = st["Resource"]
     if isinstance(res, str):
         res = [res]
-    old_key, new_key_only = gone.rsplit("/", 1)[-1], added.rsplit("/", 1)[-1]
     old_full = next((r for r in res if old_key in r), None)
     new_full = next((r for r in res if new_key_only in r), None)
     if new_full is not None:
         log(f"{name} already grants the new asset key; nothing to write")
         return False, name, prior
     if old_full is None:
-        raise Fail(f"{name} carries neither key as a literal ARN; refusing to synthesize one")
+        raise Fail(f"{name} does not carry {old_key} as a literal ARN; refusing to synthesize one")
     # Derive the new ARN from the LIVE one by swapping only the key, so the account and bucket in the
     # resulting ARN are this environment's, not the closure's placeholders.
     res.append(old_full.replace(old_key, new_key_only))
@@ -1613,20 +1764,26 @@ def op_codebuild(mode: str) -> None:
         log(f"FAILED after mutating the project or the asset: {exc}")
         txn.unwind()
         raise
+    # These two checks sit AFTER the try block, but they can still fail — and when they do, three
+    # things were already mutated: the asset object was uploaded, the build role's policy may have
+    # been widened, and the project's Source was repointed. Reverting only the Source (what this used
+    # to do) left the object and the widened grant behind with nothing in the receipt recording them.
+    # Route both through the same transaction, which undoes all three in reverse order and raises if
+    # an undo fails.
     got = live_loc()
     if got != want_loc:
-        saved = load_state("codebuild")
-        aws("codebuild", "update-project", "--name", project,
-            "--source", json.dumps(_saved_source(saved)))
-        raise Fail(f"source readback {got} != {want_loc}; reverted")
+        log(f"source readback {got} != {want_loc}; unwinding everything this attempt did")
+        txn.unwind()
+        raise Fail(f"source readback {got} != {want_loc}; the upload, the role grant and the "
+                   "project source were all unwound")
     if not role_allows_key():
-        saved = load_state("codebuild")
-        aws("codebuild", "update-project", "--name", project,
-            "--source", json.dumps(_saved_source(saved)))
+        log("the build role cannot read the new asset key; unwinding everything this attempt did")
+        txn.unwind()
         raise Fail(
             "the build role cannot read the new asset key, so the project would fail its next "
-            "build. Reverted the source. Widen the role's S3 read to the new key first — the "
-            f"closure changes {role_lid} for exactly this reason."
+            "build. The upload, the role grant and the project source were all unwound. Widen the "
+            f"role's S3 read to the new key first — the closure changes {role_lid} for exactly "
+            "this reason."
         )
     receipt("GoldenImageBuilderCEF13562", f"source {load_state('codebuild')['before']} -> {got}")
     # The closure's only change to this policy is one Resource ARN: the old asset key becomes the
@@ -1662,20 +1819,69 @@ def _alarms_to_delete() -> list[str]:
     return sorted(names)
 
 
+def _edge_redis_coord_param() -> str:
+    """The name of the SSM parameter the edge actually reads for its Redis lookup coordinate.
+
+    Read from the closure, not from an operator-supplied env var. The previous gate asked for
+    `EDGE_READ_REPLICA_PARAM`, a boolean switch that exists in neither the closure (10 parameters)
+    nor a real account (20) — so it could only be satisfied by inventing a parameter, which makes a
+    fail-closed gate meaningless.
+    """
+    hits = []
+    for lid, r in template(ORCH, "patch").items():
+        if r.get("Type") != "AWS::SSM::Parameter":
+            continue
+        name = r["Properties"].get("Name")
+        if isinstance(name, str) and name.rstrip("/").endswith("/reader-endpoint"):
+            hits.append(name)
+    if len(hits) != 1:
+        raise Fail(f"expected exactly one reader-endpoint parameter in the closure, found {hits}; "
+                   "refusing to guess which coordinate the edge reads")
+    return hits[0]
+
+
+def _replica_read_premise() -> tuple[bool, str]:
+    """(edge_reads_only_the_primary, human-readable evidence).
+
+    The premise for removing the replica-lag alarms is that the edge no longer reads a replica. The
+    closure states that by pointing its reader-endpoint parameter at `RouteRedis.PrimaryEndPoint`;
+    the live check is therefore "does the value the edge actually reads resolve to this replication
+    group's PRIMARY endpoint".
+    """
+    param = _edge_redis_coord_param()
+    live = aws("ssm", "get-parameter", "--name", param, "--query", "Parameter.Value",
+               "--output", "text", allow_missing=True)
+    if live is None:
+        raise Fail(f"{param} does not exist; refusing to reason about replica reads on an unknown "
+                   "configuration")
+    ng = (aws("elasticache", "describe-replication-groups", "--replication-group-id",
+              env("REDIS_REPLICATION_GROUP_ID"), "--query", "ReplicationGroups[0].NodeGroups[0]",
+              "--output", "json", parse_json=True) or {})
+    prim, rdr = ng.get("PrimaryEndpoint") or {}, ng.get("ReaderEndpoint") or {}
+    if not prim.get("Address"):
+        raise Fail("the replication group reports no primary endpoint; this gate fails closed")
+    want = f"{prim['Address']}:{prim.get('Port')}"
+    reader = f"{rdr.get('Address')}:{rdr.get('Port')}" if rdr.get("Address") else None
+    got = str(live).strip()
+    if got == want:
+        return True, f"{param}={got} is the PRIMARY endpoint"
+    if reader and got == reader:
+        return False, (f"{param}={got} is the READER endpoint, so the edge is still reading a "
+                       f"replica (primary would be {want})")
+    return False, (f"{param}={got} is neither this group's primary ({want}) nor its reader "
+                   f"({reader}); the topology is not one this check can clear")
+
+
 def _gate_no_replica_reads() -> None:
-    param = env("EDGE_READ_REPLICA_PARAM")
-    sw = aws("ssm", "get-parameter", "--name", param, "--query", "Parameter.Value",
-             "--output", "text", allow_missing=True)
-    if sw is None:
-        raise Fail(f"cannot read {param}; refusing to delete an alarm on an unknown configuration")
-    norm = str(sw).strip().lower()
-    if norm != "false":
+    ok, why = _replica_read_premise()
+    if not ok:
         raise Fail(
-            f"{param}={sw!r}. This gate only proceeds on an EXPLICIT 'false'. Anything else — "
-            "'true', an empty value, a typo, a JSON blob — means the configuration is not known "
-            "to be replica-free, and these alarms may still be watching a real replica."
+            f"the edge is not known to be replica-free: {why}. These alarms watch replication lag on "
+            "a replica the edge reads on its lookup hot path, so deleting them would remove the only "
+            "signal for a real risk. The closure removes them only because it also points that "
+            "coordinate at the primary — converge the coordinate first, then re-run."
         )
-    log(f"switch {param}={sw} (explicit false)")
+    log(f"premise holds: {why}")
 
     members = aws("elasticache", "describe-replication-groups",
                   "--replication-group-id", env("REDIS_REPLICATION_GROUP_ID"),
@@ -1703,9 +1909,21 @@ def _gate_no_replica_reads() -> None:
     # Read the coordinates the running edge is CONFIGURED with, not an install log. The install
     # log records what one past boot decided; a box reloaded since then can be serving different
     # coordinates, and a rotated log makes the check silently return nothing.
-    probe = ("commands=grep -hoE \"(reader|redis)_(host|port)[^\\\"]*\\\"[^\\\"]+\\\"\" "
-             "/usr/local/openresty/nginx/conf/nginx.conf | tr -d \\\" | tail -8; "
-             "echo ---; grep -hoE \"ENGINE_REDIS[A-Z_]*=[^ ]+\" /etc/claw-edge.env 2>/dev/null | tail -8")
+    # The probe crosses three parsers (the CLI, SSM's document substitution, the remote shell) and it
+    # needs literal double quotes to read nginx.conf. Sent as a `commands=…` shorthand string it
+    # failed CLI argument validation outright — that parser splits on `,` and cannot carry a quote —
+    # so this stage never ran. Single-quote the patterns, then transport the script base64-encoded
+    # inside a JSON `--parameters` value: the base64 alphabet has no comma, quote or space, so no
+    # layer in between has to preserve quoting.
+    _probe_sh = (
+        "grep -hoE '(reader|redis)_(host|port)[^\"]*\"[^\"]+\"' "
+        "/usr/local/openresty/nginx/conf/nginx.conf | tr -d '\"' | tail -8; "
+        "echo ---; "
+        "grep -hoE 'ENGINE_REDIS[A-Z_]*=[^ ]+' /etc/claw-edge.env 2>/dev/null | tail -8"
+    )
+    probe = json.dumps({"commands": [
+        "echo " + base64.b64encode(_probe_sh.encode()).decode() + " | base64 -d | sh"
+    ]})
     for iid in asg_ids:
         cid = aws("ssm", "send-command", "--instance-ids", iid,
                   "--document-name", "AWS-RunShellScript",
@@ -1730,7 +1948,14 @@ def _gate_no_replica_reads() -> None:
         for line in text.splitlines():
             for role in ("reader", "redis", "primary"):
                 if f"{role}_host" in line or f"{role.upper()}_HOST" in line:
-                    val = line.split("=", 1)[-1].strip().strip(chr(34)).strip()
+                    # Two shapes reach here and only one has an `=`: nginx.conf writes
+                    # `redis_host  "host"` (whitespace-separated, quotes already stripped by the
+                    # probe) while claw-edge.env writes `ENGINE_REDIS_HOST=host`. Splitting on `=`
+                    # alone left the field NAME inside the value for the nginx.conf shape
+                    # (`primary=redis_host  opr1a…`), which makes the comparison below reject even an
+                    # edge that HAS converged to the primary — fail-closed, but permanently
+                    # unapplyable. Take the last whitespace token first, then strip any `key=`.
+                    val = line.split()[-1].split("=", 1)[-1].strip().strip(chr(34)).strip()
                     if val:
                         hosts.setdefault("reader" if role == "reader" else "primary", val)
         reader, primary = hosts.get("reader"), hosts.get("primary")
@@ -1814,7 +2039,17 @@ def op_cw_drop_lag(mode: str) -> None:
                    "--query", "MetricAlarms[].AlarmName", "--output", "json", parse_json=True) or []
         if live:
             raise Fail(f"these alarms still exist: {live}")
-        log("asserted both named alarms are absent")
+        # Absence alone is not the applied state. On a real account these alarms were absent because
+        # they had never been created, while the edge was still reading the replica — the opposite of
+        # applied, reported as PASS. The premise the closure relies on has to hold too.
+        ok, why = _replica_read_premise()
+        if not ok:
+            raise Fail(
+                f"both alarms are absent, but that is not this operation's applied state: {why}. "
+                "Alarms that were never created look identical to alarms this kit deleted. Reporting "
+                "PASS here would call an unconverged configuration a verified one."
+            )
+        log(f"asserted both named alarms are absent AND the premise holds: {why}")
         return
 
     if mode == "rollback":

@@ -37,7 +37,8 @@
 #   lambda-api-alias              OPENCLAW_API_FN OPENCLAW_API_ALIAS
 #   codebuild-golden-image        GOLDEN_IMAGE_PROJECT GOLDEN_IMAGE_ROLE_ARN
 #                                 CDK_ASSETS_BUCKET REPO_SOURCE_ZIP
-#   cw-drop-replication-lag-...   EDGE_READ_REPLICA_PARAM REDIS_REPLICATION_GROUP_ID EDGE_ASG
+#   cw-drop-replication-lag-...   REDIS_REPLICATION_GROUP_ID EDGE_ASG
+#     (the reader-endpoint parameter name comes from the closure, not from the environment)
 set -euo pipefail
 
 usage() {

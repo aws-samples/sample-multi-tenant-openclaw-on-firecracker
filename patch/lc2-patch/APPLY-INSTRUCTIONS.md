@@ -220,22 +220,80 @@ bash lib/apply-resource-ops.sh s3-obs-assets  apply  resources/cloudformation "$
 ```
 
 **2c. Lambda (layer C-lambda) — overlay, do not prebuild a zip.** This function carries arm64
-native wheels; a zip you build freezes your dependency versions onto this environment. Download
-the live package, delete only the first-party source directories, overlay `lambda/api`, re-zip:
+native wheels; a zip you build freezes your dependency versions onto this environment. Reuse the
+live package and replace **only the individual files this kit ships**.
+
+Do **not** delete `core/` or `services/` and overlay `lambda/api` on top. Measured against a live
+package: `core/` holds 34 files and this kit ships 4 of them; `services/` holds 24 and the kit ships
+4. Deleting either directory drops 50 files including `core/__init__.py` and `core/auth.py`, and the
+function then fails at import — worse than the bug being patched.
+
+Build it file-by-file, and prove the entry set did not change:
 
 ```bash
-aws lambda update-function-code --function-name "$OPENCLAW_API_FN" \
-  --zip-file fileb:///tmp/openclaw-api-overlay.zip --publish
-aws lambda wait function-updated --function-name "$OPENCLAW_API_FN"
-aws lambda invoke --function-name "$OPENCLAW_API_FN" \
-  --payload '{"rawPath":"/__oc_probe__","requestContext":{"http":{"method":"GET"}}}' \
-  --cli-binary-format raw-in-base64-out /tmp/oc-probe.json --query FunctionError --output text
+KIT=$PWD
+python3 - "$KIT" /tmp/live.zip /tmp/openclaw-api-overlay.zip <<'PY'
+import hashlib, sys, zipfile
+from pathlib import Path
+kit = Path(sys.argv[1]) / "lambda" / "api"
+shipped = {str(f.relative_to(kit)): f for f in sorted(kit.rglob("*")) if f.is_file()}
+zin = zipfile.ZipFile(sys.argv[2]); names = [i.filename for i in zin.infolist()]
+absent = [r for r in shipped if r not in names]
+if absent:
+    sys.exit(f"FAIL: kit files not present in the live package: {absent}")
+with zipfile.ZipFile(sys.argv[3], "w", zipfile.ZIP_DEFLATED) as zo:
+    for i in zin.infolist():
+        data = shipped[i.filename].read_bytes() if i.filename in shipped else zin.read(i)
+        ni = zipfile.ZipInfo(i.filename, date_time=i.date_time)
+        ni.external_attr, ni.compress_type = i.external_attr, zipfile.ZIP_DEFLATED
+        zo.writestr(ni, data)
+zc = zipfile.ZipFile(sys.argv[3]); got = [i.filename for i in zc.infolist()]
+if got != names:
+    sys.exit(f"FAIL: entry set changed {len(names)} -> {len(got)}")
+differ = [n for n in names
+          if hashlib.sha256(zin.read(n)).hexdigest() != hashlib.sha256(zc.read(n)).hexdigest()]
+extra = sorted(set(differ) - set(shipped))
+if extra:
+    sys.exit(f"FAIL: entries differ that the kit does not ship: {extra[:8]}")
+print(f"{len(got)} entries unchanged; {len(differ)} differ, all shipped by this kit")
+PY
 ```
 
-The verdict is `FunctionError` = `None`, **not** a 200 body: on a private API a synthetic path
-returns 404 by routing, which is expected. Then move the alias — and move **both** paths: the
-API Gateway invokes the alias while the dispatch event-source mapping binds `$LATEST`, so
-flipping only the alias leaves dispatch on the old code.
+`/tmp/live.zip` is the package downloaded in APPLY step 1; confirm it hashes to the live
+`CodeSha256` before using it, or you are patching a stale package.
+
+Note which shipped files come out byte-identical to live — that means the change is already deployed
+and is a fact worth recording, not a failure.
+
+Then back the live package up to a **versioned** key and let the operation drive the change. It
+publishes the version **last**, so the immutable version carries the code *and* the eight deadline
+values; publishing with the code (`update-function-code --publish`) snapshots a version before the
+environment is written, and the alias would then point at a version whose configuration omits them.
+
+```bash
+export OVERLAY_ZIP=/tmp/openclaw-api-overlay.zip
+export BACKUP_S3_BUCKET=<a versioned bucket>  BACKUP_S3_KEY=patch-backups/$OC_RUN_ID/openclaw-api-live.zip
+aws s3 cp /tmp/live.zip "s3://$BACKUP_S3_BUCKET/$BACKUP_S3_KEY" --region "$AWS_REGION"
+
+bash lib/apply-resource-ops.sh lambda-api-code  apply  resources/cloudformation "$AWS_REGION"
+bash lib/apply-resource-ops.sh lambda-api-code  verify resources/cloudformation "$AWS_REGION"
+bash lib/apply-resource-ops.sh lambda-api-alias apply  resources/cloudformation "$AWS_REGION"
+bash lib/apply-resource-ops.sh lambda-api-alias verify resources/cloudformation "$AWS_REGION"
+```
+
+The operation refuses without that backup, and it downloads and hashes the object to prove it holds
+the code running *now* — a stale object at that key would otherwise overwrite the one recoverable
+copy during an unwind. The bucket must have versioning enabled; the restore pins a version id,
+because a key is mutable.
+
+The invoke verdict is `FunctionError` = `None`, **not** a 200 body: on a private API a synthetic path
+returns 404 by routing, which is expected.
+
+Both paths move, and neither alone reverts both: the API Gateway invokes the alias while the dispatch
+event-source mapping binds `$LATEST`. Rollback is `lambda-api-alias rollback` **then**
+`lambda-api-code rollback`. The version that apply published stays behind — a Lambda version is
+immutable and nothing else points at it, so it is inert, but a rollback does **not** return the
+version list to its pre-apply length.
 
 ## Step 3 — Fix the future-machine source
 
@@ -352,19 +410,65 @@ mapping binds `$LATEST`.
 
 The two remaining operations need a decision, so run them separately and read their gates:
 
+**`REPO_SOURCE_ZIP` is a repository archive you build**, not something the kit ships. The operation
+asserts three markers (`setup.sh`, `build-rootfs.sh`, `deploy/app.py`) and requires every file the kit
+ships under `host-scripts/deploy-machine/` to be present byte-for-byte, so build it from your checkout
+of this commit with the kit's patched files laid over it:
+
 ```bash
+python3 - . "$REPO_SOURCE_ZIP" <<'PY'
+import sys, zipfile
+from pathlib import Path
+kit = Path(sys.argv[1]); out = sys.argv[2]
+patched = {str(f.relative_to(kit / "host-scripts" / "deploy-machine")): f
+           for f in sorted((kit / "host-scripts" / "deploy-machine").rglob("*")) if f.is_file()}
+repo = Path.cwd()          # your checkout of this commit
+with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+    for rel, src in patched.items():
+        z.writestr(rel, src.read_bytes())
+    for f in sorted(repo.rglob("*")):
+        rel = str(f.relative_to(repo))
+        if f.is_file() and rel not in patched and not rel.startswith((".git/", "patch/")):
+            z.writestr(rel, f.read_bytes())
+print("built", out)
+PY
+```
+
+Resolve the build role through CloudFormation, never by name: an account with stacks in several
+regions holds several roles with the same logical id, and the first name match may be another
+region's.
+
+```bash
+export GOLDEN_IMAGE_ROLE_NAME=$(aws cloudformation describe-stack-resource \
+  --stack-name OpenClawImage --logical-resource-id GoldenImageBuildRole8D4C1F76 \
+  --region "$AWS_REGION" --query 'StackResourceDetail.PhysicalResourceId' --output text)
+export GOLDEN_IMAGE_ROLE_ARN="arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):role/$GOLDEN_IMAGE_ROLE_NAME"
+
 # only where this environment rebuilds the guest rootfs from this repository.
-# needs GOLDEN_IMAGE_PROJECT, GOLDEN_IMAGE_ROLE_ARN, CDK_ASSETS_BUCKET, REPO_SOURCE_ZIP.
-# after repointing the project it asserts the build role can read the NEW key, and reverts the
-# source if it cannot — otherwise the next build fails on a permission it never had.
+# needs GOLDEN_IMAGE_PROJECT, GOLDEN_IMAGE_ROLE_NAME, GOLDEN_IMAGE_ROLE_ARN, CDK_ASSETS_BUCKET,
+# REPO_SOURCE_ZIP. After repointing the project it asserts the build role can read the NEW key and
+# unwinds ALL THREE changes (upload, role grant, project source) if it cannot — otherwise the next
+# build fails on a permission it never had.
+#
+# The closure's asset KEY is authoritative for the new grant, but the OLD one is taken from the live
+# policy: a CDK asset key is the content hash of the synth that produced it, so a real environment
+# holds a third key that matches neither side of the closure. The bucket likewise comes from your
+# account and is asserted against it.
 bash lib/apply-resource-ops.sh codebuild-golden-image apply resources/cloudformation "$AWS_REGION"
 
-# DELETES two live alarms. Needs EDGE_READ_REPLICA_PARAM, REDIS_REPLICATION_GROUP_ID, EDGE_ASG.
-# The gate reads the switch, enumerates the replication group, takes the InService edge set from
-# the ASG itself, and asks EVERY one of those instances over SSM whether its effective reader
-# host equals its primary. It aborts on a true switch, an unreadable switch, an empty InService
-# set, a supplied instance list that does not match the ASG, or any box that resolves its reader
-# to something other than the primary.
+# DELETES two live alarms. Needs REDIS_REPLICATION_GROUP_ID and EDGE_ASG. The parameter the edge
+# reads for its Redis coordinate comes from the closure, not from your environment.
+#
+# The gate has three stages, all fail-closed. First the premise: the parameter the edge actually
+# reads must resolve to this replication group's PRIMARY endpoint — that is what the closure declares
+# and it is the only reason removing replica-lag alarms is safe. Then it enumerates the replication
+# group. Then it takes the InService edge set from the ASG itself and asks EVERY one of those
+# instances over SSM whether its configured reader host equals its primary. It aborts if the
+# coordinate still resolves to the reader, on an empty InService set, on a supplied instance list
+# that does not match the ASG, or on any box still pointed at a replica.
+#
+# `verify` checks the same premise. "Both alarms are absent" alone is not this operation's applied
+# state: alarms that were never created look identical to alarms this kit deleted.
 bash lib/apply-resource-ops.sh cw-drop-replication-lag-alarms apply resources/cloudformation "$AWS_REGION"
 ```
 

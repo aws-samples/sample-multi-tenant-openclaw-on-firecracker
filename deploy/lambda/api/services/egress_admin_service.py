@@ -192,9 +192,10 @@ def _build_extra_allow(allow):
         proto = str(e.get("proto", "")).strip().lower()
         if proto not in ("tcp", "udp"):
             return "", f"allow[{i}].proto must be tcp|udp"
-        try:
-            dport = int(e.get("dport"))
-        except (TypeError, ValueError):
+        dport = e.get("dport")
+        if not (
+            isinstance(dport, int) and not isinstance(dport, bool)
+        ):
             return "", f"allow[{i}].dport must be an integer"
         if not 1 <= dport <= 65535:
             return "", f"allow[{i}].dport out of range"

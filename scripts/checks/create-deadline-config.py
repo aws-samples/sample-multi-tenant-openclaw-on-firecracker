@@ -476,33 +476,43 @@ def _check_deadline_config_parity(cfg: Dict[str, Any]) -> List[str]:
 
     G5 第 1 条:两边不同源时,「客户手改线上 env」与「我方 `cdk deploy`」会互相覆盖,
     而覆盖是静默的。这里只判**仓内两个来源**是否一致(线上漂移由 `--live` 那条查):
-      · config 少写某档 → 报告(那一档不会被注入 env,运行时走代码默认。不是错误,
-        但必须让人看见 —— 否则"改 env 即可"对那一档是假的:CDK 压根没注入它);
+      · config 少写某档 → **不判错**,只打印。#630 起 `lambdas.py` 无条件注入八档
+        (config 写了用 config 的值,没写用 `create_deadline.default_deadline_sec_for()`
+        的权威默认),并同步建齐八个 SSM 参数。所以「没写」= 用默认值,不等于「没注入」,
+        「改 env 即可」对没写的那几档同样成立;
+      · config 写了但值不是正整数 → **判错**。CDK 会把它 `int()` 后注入,
+        `True`/`180.5`/`"abc"`/`-1` 这几种要么在 synth 期炸、要么静默改成别的数字,
+        要么让 `assert_deadline_config_sane()` 在 Lambda **导入期** raise → 全路由 502
+        (#630 的原始故障形态);
       · config 与代码默认不等 → **不报错**。config 是权威(客户可以调),代码默认只是
-        env 缺失时的回落。这里把差异**打印出来**,让部署者确认那是有意调的。
+        config 没写时 CDK 注入的那个数。这里把差异**打印出来**,让部署者确认那是有意调的。
+
+    历史:本函数原来把「缺段/缺档」判成违反,理由是「那几档不会被注入 env」。#630 在
+    apse1 真机上证明那句话的因果反了 —— 缺 env 不是「回落到默认」而是导入期 raise,
+    修法是让 CDK 补齐而不是让每份 config 各抄一遍默认表。CDK 补齐之后,原来那条违反
+    连同它的文案都成了假话,故改为打印。
     """
     out: List[str] = []
     dl = (cfg.get("lifecycle") or {}).get("deadline_sec") or {}
-    if not dl:
-        return [
-            "[repo] config.yml 缺 `lifecycle.deadline_sec` 段 —— 七档死线一个都不会被注入"
-            " Lambda env,客户要求的「改 env 即可修改每个 lifecycle 配置」对本部署不成立"
-            "(运行时会回落到代码默认值,值相同但改不了)"
-        ]
     missing = [a for a in cdl.DEADLINE_ACTIONS if a not in dl]
     if missing:
-        out.append(
-            f"[repo] config.yml 的 lifecycle.deadline_sec 缺档: {', '.join(missing)}"
-            " —— 这几档不会被注入 env(运行时走代码默认),对它们「改 env 即可」是假的"
+        print(
+            f"  · config.yml 的 lifecycle.deadline_sec 未写: {', '.join(missing)}"
+            f" —— CDK(#630 起)按 create_deadline 的权威默认把这几档注入 env 并建 SSM 参数,"
+            f"「改 env 即可」仍成立;只有想改**默认值本身**才需要在 config 里写。"
         )
     for act in cdl.DEADLINE_ACTIONS:
-        if act in dl:
-            try:
-                _ = int(dl[act])
-            except (TypeError, ValueError):
-                out.append(
-                    f"[repo] lifecycle.deadline_sec.{act}={dl[act]!r} 不是整数"
-                )
+        if act not in dl:
+            continue
+        val = dl[act]
+        # bool 是 int 的子类,`int(True)` == 1 —— 不排掉它,`create: true` 会静默变成 1s。
+        if isinstance(val, bool) or not isinstance(val, int) or val <= 0:
+            out.append(
+                f"[repo] lifecycle.deadline_sec.{act}={val!r} 不是正整数 —— CDK 会把它"
+                f"注入 LIFECYCLE_DEADLINE_SEC_{act.upper()},非整数在 synth 期就炸,"
+                f"小数被静默截断,≤0 让 assert_deadline_config_sane() 在 Lambda 导入期"
+                f"raise → 每条路由 502(#630)"
+            )
     return out
 
 
@@ -755,15 +765,28 @@ def _selfcheck() -> int:
     # 它们的签名与上面那批不同(一个接 config dict、一个读 env),所以单独跑,
     # 不硬塞进 cases 的 (dict, fn) 形态。
     _full_dl = {a: cdl._DEFAULT_DEADLINE_SEC[a] for a in cdl.DEADLINE_ACTIONS}
+    # 值本身写坏 → 必须报。#630 起 CDK 会把 config 里的值注入 env,所以这几种坏值不再是
+    # 「纸面配置」而是能把 Lambda 打成导入期 raise / 静默换数字的真实输入。
     for name, broken_cfg in (
-        ("config 整段缺 lifecycle.deadline_sec", {}),
         (
-            "config 缺档(只写了 create)",
-            {"lifecycle": {"deadline_sec": {"create": 180}}},
+            "config 的死线不是整数(suspend='abc')",
+            {"lifecycle": {"deadline_sec": dict(_full_dl, suspend="abc")}},
         ),
         (
-            "config 的死线不是整数",
-            {"lifecycle": {"deadline_sec": dict(_full_dl, suspend="abc")}},
+            "config 的死线是负数(suspend=-1)",
+            {"lifecycle": {"deadline_sec": dict(_full_dl, suspend=-1)}},
+        ),
+        (
+            "config 的死线是 0(suspend=0)",
+            {"lifecycle": {"deadline_sec": dict(_full_dl, suspend=0)}},
+        ),
+        (
+            "config 的死线是小数(suspend=180.5,会被静默截断成 180)",
+            {"lifecycle": {"deadline_sec": dict(_full_dl, suspend=180.5)}},
+        ),
+        (
+            "config 的死线是 bool(suspend=True,int(True)==1)",
+            {"lifecycle": {"deadline_sec": dict(_full_dl, suspend=True)}},
         ),
     ):
         got = _check_deadline_config_parity(broken_cfg)
@@ -773,12 +796,22 @@ def _selfcheck() -> int:
         else:
             print(f"  ✓ {name}: 报出 {len(got)} 条")
 
-    # 正向:七档齐全且是整数 → 不该报。
-    if _check_deadline_config_parity({"lifecycle": {"deadline_sec": _full_dl}}):
-        print("  ✗ 七档齐全的 config 被误报")
-        bad += 1
-    else:
-        print("  ✓ 七档齐全的 config 不报(不是恒红)")
+    # 正向三种都不该报:八档齐全、整段缺、只写一档。
+    # 后两种是 #630 修完之后的正确判词 —— CDK 会用权威默认补齐并建齐 SSM 参数,
+    # 判成违反等于让 mechanical-gate 拒绝一份 CDK 已经处理好的 config(而且理由是假的)。
+    for name, ok_cfg in (
+        ("八档齐全的 config", {"lifecycle": {"deadline_sec": _full_dl}}),
+        ("整段缺 lifecycle.deadline_sec(CDK 补齐八档)", {}),
+        (
+            "只写了 create 的 config(其余七档 CDK 补默认)",
+            {"lifecycle": {"deadline_sec": {"create": 180}}},
+        ),
+    ):
+        if _check_deadline_config_parity(ok_cfg):
+            print(f"  ✗ {name} 被误报 —— #630 之后这不是违反")
+            bad += 1
+        else:
+            print(f"  ✓ {name} 不报(不是恒红)")
 
     # per-action 死线下界:把 create 调到 100(< 最坏执行 128)必须报。
     # 这条改的是 env 而不是 dict —— 因为下界约束的输入本来就是 env(客户改的那个地方)。

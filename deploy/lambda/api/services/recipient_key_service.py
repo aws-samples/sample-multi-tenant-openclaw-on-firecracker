@@ -154,17 +154,41 @@ def register_key(public_key_pem, source="caller"):
     return item
 
 
-def disable_current():
-    """把当前版本行标 enabled=False。返回更新后的版本行;无 current 返回 None。"""
+class RecipientKeyChanged(RuntimeError):
+    """调用方指定的 key_id 已不是当前那把 —— 期间发生过轮换。
+
+    #615 —— 让"校验 key_id"与"禁用"成为一次原子操作。调用方先 GET 拿 key_id、再 POST
+    disable,这两步之间可能有人 register 了新 key(轮换 = 新建 version#N+1 并推进 current
+    指针)。如果只在读到的 current 上比对一次再无条件写,那次写落在**新**那把上,调用方却
+    收到 200 —— 客户以为禁掉的是旧 key,实际禁掉的是刚上线的新 key,整个平台的凭据获取
+    随即中断。所以 expected_key_id 必须进条件写,由 DynamoDB 保证"比对与写"不可分割。
+    """
+
+
+def disable_current(expected_key_id=None):
+    """把当前版本行标 enabled=False。返回更新后的版本行;无 current 返回 None。
+
+    expected_key_id 非 None 时,只有该行的 key_id 仍等于它才落写;不等则抛
+    RecipientKeyChanged(不写任何东西)。这条件是**在同一次 update_item 里**判的,
+    所以它挡得住 get 与 update 之间的轮换 —— 见 RecipientKeyChanged 的说明。
+    """
     current = get_current_key()
     if not current:
         return None
-    resp = recipient_keys_table.update_item(
-        Key={"scope": SCOPE, "sk": current["sk"]},
-        UpdateExpression="SET enabled = :f",
-        ExpressionAttributeValues={":f": False},
-        ReturnValues="ALL_NEW",
-    )
+    kwargs = {
+        "Key": {"scope": SCOPE, "sk": current["sk"]},
+        "UpdateExpression": "SET enabled = :f",
+        "ExpressionAttributeValues": {":f": False},
+        "ReturnValues": "ALL_NEW",
+    }
+    if expected_key_id is not None:
+        kwargs["ConditionExpression"] = "key_id = :kid"
+        kwargs["ExpressionAttributeValues"][":kid"] = expected_key_id
+    ccf = recipient_keys_table.meta.client.exceptions.ConditionalCheckFailedException
+    try:
+        resp = recipient_keys_table.update_item(**kwargs)
+    except ccf as exc:
+        raise RecipientKeyChanged(expected_key_id) from exc
     return resp.get("Attributes")
 
 

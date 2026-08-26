@@ -49,6 +49,12 @@ _DEFAULTS = {
     "redis_replication_lag_threshold_seconds": 5,
     "redis_replication_lag_evaluation_periods": 5,
     "redis_replication_lag_period_minutes": 1,
+    # #625 edge reader endpoint 回落。安装期一次性指标,>0 即"至少一台没分流到
+    # reader",没有"正常抖动"可言,所以阈值 0 / 单周期即报;5 分钟窗口给同批起的
+    # 实例留出把数据点都送到的时间。
+    "edge_reader_fallback_threshold": 0,
+    "edge_reader_fallback_evaluation_periods": 1,
+    "edge_reader_fallback_period_minutes": 5,
 }
 
 
@@ -294,6 +300,63 @@ def build_alarms(self, ctx):
                     "当前 primary 正常出数且通常接近 0，角色互换后不会失明。"
                     "ReplicationLag 超阈值意味着“复制延迟 + POS_TTL_SEC”可能吃掉 "
                     "PORT_QUARANTINE_SECONDS 的余量。"
+                ),
+            )
+        )
+
+    # ── edge reader endpoint 回落: 机队半收敛 ────────────────────────────
+    # #625 —— install-edge.sh 读 /openclaw/engine/redis/reader-endpoint 失败(调用失败 /
+    # 空值 / 缺 :port)时静默回落 primary,机队会停在"一部分箱子读 reader、一部分读
+    # primary"的半收敛态,而 primary 的读负载看起来像"已经分流完"。每台 edge 在安装期
+    # 发一次 RedisReaderEndpointFallback:采用 SSM 值发 0、三种回落各发 1,所以 Sum>0
+    # 就是"至少一台没分流到 reader"。
+    #
+    # 判据是两条【同时】成立,比隔壁 ReplicationLag 那组多一条:
+    #   * ctx.edge_role 存在 ⟺ edge.enabled=true,即真的有实例会发这个指标;
+    #   * redis_node_cluster_ids 非空 ⟺ ha_edge.py 的 `edge_read_from_replica and
+    #     num_replicas > 0`,也就是 reader SSM 参数真的与 primary 不同的那一档。
+    # 开关关或零副本时 reader 参数与 primary 逐字相等,"回落"没有任何后果,不建告警。
+    #
+    # NOT_BREACHING 是有意的:指标完全缺失既可能是机队还没起,也可能是 PutMetricData
+    # 被拒(定向 promotion 不推 IAM 时会这样),两者都不该在这条告警上表现成 ALARM ——
+    # 它只回答"有没有箱子回落"。指标是安装期一次性发的,所以这条告警会在下一个窗口
+    # 自己 OK 回去;它响过一次就要查,不要等它持续。
+    if (
+        getattr(ctx, "edge_role", None) is not None
+        and getattr(ctx, "redis_node_cluster_ids", [])
+    ):
+        _reader_fallback_eval = int(
+            _cfg(alarms_cfg, "edge_reader_fallback_evaluation_periods")
+        )
+        _add_action(
+            cloudwatch.Alarm(
+                self,
+                "EdgeRedisReaderFallbackAlarm",
+                alarm_name="openclaw-edge-redis-reader-endpoint-fallback",
+                metric=cloudwatch.Metric(
+                    namespace="OpenClaw/Edge",
+                    metric_name="RedisReaderEndpointFallback",
+                    period=Duration.minutes(
+                        _cfg(alarms_cfg, "edge_reader_fallback_period_minutes")
+                    ),
+                    statistic="Sum",
+                ),
+                threshold=float(
+                    _cfg(alarms_cfg, "edge_reader_fallback_threshold")
+                ),
+                evaluation_periods=_reader_fallback_eval,
+                datapoints_to_alarm=_reader_fallback_eval,
+                comparison_operator=(
+                    cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD
+                ),
+                treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+                alarm_description=(
+                    "至少一台 edge 在安装期没能采用 SSM 的 Redis reader endpoint、"
+                    "回落到了 primary,机队处于半收敛态:那台箱子的路由读没有分流,"
+                    "primary 的读负载比容量模型预期的高。按 Reason 维度"
+                    "(ssm_error/empty/malformed)区分是权限/网络问题还是 SSM 参数值"
+                    "本身畸形,再看该实例的 install-edge 日志。指标是安装期一次性"
+                    "发出的,本告警会自行恢复 —— 响过即需排查。"
                 ),
             )
         )

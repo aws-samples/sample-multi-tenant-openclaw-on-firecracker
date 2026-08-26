@@ -4256,6 +4256,27 @@ def _reconcile_egress():
         host_item.get("egress_pinned")
     )
 
+    # #612 P1 fail-open fix — policy_source=="none" 表示 fleet 单例与 host 行都【没有】
+    # egress_mode(期望态整个缺失:单例被删/被恢复到不存在之前、host 行的 egress_mode 被
+    # REMOVE、TTL/表恢复丢行……)。DDB get_item 读到空 Item 是【成功返回 {}】而非异常,
+    # 所以上面的读异常兜底不触发。若此时把它塌缩成 desired="off",一台带活 deny 链的机器
+    # 会被判 teardown → 单行删除即让全机队【静默 fail-open 到无出网过滤】,还上报
+    # applied_mode=off 为成功。期望态缺失 ≠ 显式熔断 off:前者应【保链】(fail-closed),
+    # 只有 source∈{fleet,host} 且显式 mode=="off" 才是真正的 break-glass 拆链。
+    # _snapshot_before 早已把「读不到」映射成 source="unknown" 防回滚误写,这里对齐同一口径。
+    # 与本轮 61bbf6d4 的 FORWARD precedence 假收敛守卫正交:那条修「链在但 jump 缺失/被短路」,
+    # 这条修「期望态整个缺失却拆掉活链」,两条互不覆盖。
+    if policy_source == "none":
+        if _egress_chain_present():
+            print(
+                "egress reconcile: desired-state absent (policy_source=none) but a live "
+                "chain is present — leaving it intact (fail-closed; NOT tearing down)"
+            )
+        _write_egress_reconcile_status(
+            table, "none", policy_source, pinned_invalid
+        )
+        return
+
     desired = policy.get("egress_mode", "off")
     desired_version = policy.get("policy_version")
     if desired_version is None:

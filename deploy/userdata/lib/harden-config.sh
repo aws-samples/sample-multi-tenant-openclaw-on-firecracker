@@ -24,7 +24,11 @@
 # 每次启动都跑的幂等收敛(挂盘窗口内):
 #   • 无条件 del(.gateway.controlUi.dangerouslyDisableDeviceAuth)——secure default,
 #     万一被谁塞回去也清掉,不假设"NEW_DATA 时清过就够"
-#   • allowedOrigins:origin 非空才写(不误清空数据盘上正确的 origins)
+#   • allowedOrigins:origin 非空才写(不误清空数据盘上正确的 origins)。注意这是【整数组
+#     替换】,不是追加 —— 传进来的那一个值决定了该租户唯一能连的 Origin。三种结局都出日志:
+#     收窄到具体值 / 收窄成通配符(= 校验实际关闭) / 空值跳过(= 保留盘上现值,可能也是通配符)。
+#     后两种在"没报错"这件事上和第一种完全一样,所以必须靠日志区分,否则失配要等租户
+#     下次启动才发作,且现场归因不到这里。
 #   • chatCompletions 三态:
 #       "1"/"true"/"yes"/"on"    → enabled = true(per-tenant 开)
 #       "0"/"false"/"no"/"off"   → del(chatCompletions)(secure default)
@@ -64,8 +68,29 @@ oc_harden_config() {
   # 与 dangerouslyDisableDeviceAuth 同段(每次唤醒都收敛,不假设 NEW_DATA 时清过就够)。
   __hc_prog="${__hc_prog} | .gateway.controlUi.enabled = false"
 
-  if [ -n "${__hc_origin}" ]; then
+  # allowedOrigins 是【整数组替换】而不是追加:收窄后只有 ${__hc_origin} 这一个值能连。
+  # 三条分支都必须出日志。这一步失配的症状是 guest 内 gateway 回
+  # "Rejected: origin not allowed / exit=INVALID_REQUEST",而且要等租户【下次启动】才发作
+  # —— 现场只看得到"某个租户连不上",看不出是这里改的,更看不出这个值从哪来。
+  # 日志是唯一的归因锚点:三种结局(收窄成功/收窄成通配符/根本没收窄)在配置上截然不同,
+  # 而在"没报错"这件事上完全一样。
+  if [ "${__hc_origin}" = "*" ]; then
+    # 通配符会让收窄"成功"但收窄到没有限制。这条必须与下面的成功分支分开报:
+    # 写成 narrowed 会被读成收窄生效,而实际是 Origin 校验被关掉了 —— 业务能通,
+    # 但那是不设防状态,不是配置正确。
     __hc_prog="${__hc_prog} | .gateway.controlUi.allowedOrigins = [\$origin]"
+    echo "[oc:harden] WARN: allowedOrigins set to wildcard ['*'] —" \
+      "the Origin check is effectively DISABLED for this tenant; any origin may connect" >&2
+  elif [ -n "${__hc_origin}" ]; then
+    __hc_prog="${__hc_prog} | .gateway.controlUi.allowedOrigins = [\$origin]"
+    echo "[oc:harden] allowedOrigins narrowed to ['${__hc_origin}']" \
+      "— clients sending any other Origin will be rejected" >&2
+  else
+    # 刻意的 fail-safe(见上文注释):空值不写,不误清数据盘上已有的正确 origins。
+    # 但沉默的代价是租户可能停留在 config 模板默认值 ["*"],即 Origin 校验实际关闭。
+    echo "[oc:harden] WARN: origin arg empty — skipping allowedOrigins narrowing;" \
+      "tenant keeps whatever is on disk (a template default of [\"*\"] means the" \
+      "Origin check is effectively OFF)" >&2
   fi
 
   case "${__hc_chat}" in

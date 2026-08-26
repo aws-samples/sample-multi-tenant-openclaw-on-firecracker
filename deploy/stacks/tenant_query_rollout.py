@@ -64,7 +64,12 @@ def validate_live_rollout(cfg, indexes, table_exists=True):
         # 运营看不出根因是部署机那份 config 的 scaler 段落后于在役表(缺三个 add_gsi_* 键),
         # 为定位多花两轮部署。GSI_GATES 本来就是 (gate_key, index_name),信息现成。
         _gate_of = {index_name: gate for gate, index_name in GSI_GATES}
-        _keys = sorted(f"scaler.{_gate_of[i]}" for i in removed if i in _gate_of)
+        _keys = [f"scaler.{_gate_of[i]}" for i in removed if i in _gate_of]
+        if "gsi_rootfs_version" in removed:
+            # #627 —— 只报 scaler 键不够:把 add_gsi_tenant_rootfs 翻成 true 会激活
+            # validate_tenant_query_config 的 backfill 前置门,运营照做后仍然 exit=1。
+            _keys.append("tenant_query.rootfs_backfill_complete")
+        _keys = sorted(_keys)
         raise ValueError(
             "config would remove existing tenant-query GSIs: "
             + ", ".join(sorted(removed))

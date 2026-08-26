@@ -58,6 +58,33 @@ def _authorize_user_scope(tenant_user_id, event):
     return _resp(403, {"error": "forbidden: not authorized for this user's fleet"})
 
 
+class TenantUserIndexUnavailable(RuntimeError):
+    """gsi_tenant_user 还没部署时抛出——这是可预期的部署状态,不是故障。
+
+    #609 —— 该 GSI 由 config 开关 `scaler.add_gsi_tenant_user` 单独一次 deploy 才
+    加(DynamoDB 一次 update 只能加 1 个 GSI,见 deploy/stacks/storage.py 的分步注释),
+    现网 openclaw-tenants 上只有 gsi_owner。缺它时 Query 在 DDB 侧被拒,botocore 的
+    ValidationException 原文里带内部索引名和表结构信息;直接冒到 lambda_handler 的
+    兜底 except 就变成 500 + 回显。抛本异常让调用方转成结构化 503 UNAVAILABLE,
+    语义与 tenant_query_service 里那些走同一 GSI 家族的端点一致。
+
+    只对"缺索引"这一种 ValidationException 降级。别的 ClientError(限流、条件失败、
+    其它参数错)必须原样冒泡——把它们也说成 UNAVAILABLE 会把真故障伪装成"功能未启用"。
+    """
+
+
+def _is_missing_index_error(exc):
+    """判断一个 ClientError 是否为"表上没有这个索引"。
+
+    只认 ValidationException + message 里的 "does not have the specified index"。
+    不按 message 里的索引名匹配,因为那是 DDB 的措辞,不该被复刻成判据的一部分。
+    """
+    err = (getattr(exc, "response", None) or {}).get("Error") or {}
+    if err.get("Code") != "ValidationException":
+        return False
+    return "does not have the specified index" in (err.get("Message") or "")
+
+
 def _query_user_tenants(
     tenant_user_id, limit=None, next_token=None, platform_scope=None
 ):
@@ -65,6 +92,8 @@ def _query_user_tenants(
 
     Returns (items, next_token). Soft-deleted tenants are filtered out. Paginates
     via the gsi_tenant_user index; the cursor is opaque to callers.
+
+    Raises TenantUserIndexUnavailable when gsi_tenant_user is not deployed (#609).
 
     只保留同 platform 的 tenant——与 list_tenants(handler.py:272)、_resolve_filter
     (fleet_service:456)同款 scope-first 结果过滤。否则 platform-scoped API key(解析成
@@ -82,7 +111,14 @@ def _query_user_tenants(
     start_key = _decode_next_token(next_token)
     if start_key:
         kwargs["ExclusiveStartKey"] = start_key
-    out = clients.tenants_table.query(**kwargs)
+    try:
+        out = clients.tenants_table.query(**kwargs)
+    except ClientError as exc:
+        if _is_missing_index_error(exc):
+            # 不把 exc 的原文带进异常消息:它会被上层放进响应体。原文由 handler 的
+            # traceback 打进 CloudWatch。
+            raise TenantUserIndexUnavailable(GSI_TENANT_USER) from exc
+        raise
     items = out.get("Items", []) or []
     if platform_scope is not None:
         items = [it for it in items if it.get("platform_id") == platform_scope]

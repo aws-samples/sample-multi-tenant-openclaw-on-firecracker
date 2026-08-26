@@ -588,6 +588,15 @@ host 的 ASG 终止钩子只有 120s,一次把整组机器换掉会硬杀在役 
 等第一台自然新增的 host 出现后补跑 `lib/apply-lt.sh verify`;在那之前若必须继续,由操作者显式承担
 风险,不设默认绕过。**本 kit 不给任何换机配方。**
 
+`lib/apply-lt.sh` 这个脚本本身**不改**,所以它的 `refresh` 子命令实现仍然随 kit 发出去,下面的用法串
+里也还列着。本 kit 任何一步都不调用它,也**不要**手工调用。校验器的两道机械闸只 lint `manifest.json`
+和本文件,**不 lint `lib/` 下的脚本** —— 这条禁令靠人守,闸拦不住。
+
+`rollback` 只把 ASG 指回上一个启动模板版本,但它有一个条件分支要先知道:如果那时已经存在**自然新增**
+的新版本 host,它会对**这些 host(且仅这些)**发起一次 instance-refresh(`MinHealthyPercentage=100`,
+先起新机再停旧机),被换掉的那台上的在役 microVM 同样只有 120s 终止钩子。在第一台自然新增的 host
+出现之前,这个计数是 0,`rollback` 不换机。要完全避开这个分支,就在自然新增的 host 出现之前回滚。
+
 先把 `host-scripts/` 推到 `deployment/scripts/`(临时键 → 校验 → 提升;留旧 version id 备回滚)。
 `init-host.sh` 是**烤进启动模板**的,单独处理:
 

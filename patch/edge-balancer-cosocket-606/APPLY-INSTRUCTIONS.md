@@ -1,64 +1,89 @@
 # edge-balancer-cosocket-606 — apply by reading, no CloudFormation redeploy
 
-> 本 kit 把 edge 数据面同步到内部源的同一版本:**Redis 坐标改走单通道**(修掉 readiness 门恒
-> fail-open —— `/healthz` 在从未验证 Redis 可达的情况下就翻 200)、**balancer 阶段的真实相位探针**
-> (补上原来那批用假 redis 模块的单测覆盖不到的那一层),外加租户标识与工具模块、日志转发配置、
-> 安装脚本的收敛。`balancer_by_lua*` 的 cosocket 修复本身在更早一批已经进入公开树,本 kit 不重复交付。
+> This kit brings the edge data plane to the same revision as the internal source. Two changes
+> carry the weight. The Redis coordinates now travel through a single channel established at
+> init, which closes a readiness gate that was permanently fail-open — `/healthz` could answer
+> 200 without Redis ever having been reached. And the balancer-phase restriction now has a probe
+> that runs in the real phase under a real OpenResty, which is the layer a stubbed unit test
+> cannot reach. The tenant identifier and utility modules, the log forwarding configuration and
+> the installer are brought along so the tree is consistent rather than partly updated. The
+> `balancer_by_lua*` cosocket fix itself reached the public tree in an earlier batch; this kit
+> does not re-deliver it.
 
-`status: MANUAL_REVIEW`。本 kit 有 3 个 `MANUAL_CLI_REVIEW` 操作,必须逐个人工复核后才动手。
-**任何步骤都不要运行触发 CloudFormation 栈更新的命令。**
+`status: MANUAL_REVIEW`. Three operations are `MANUAL_CLI_REVIEW` and must each be reviewed by a
+human before you run them. **Do not run anything that triggers a CloudFormation stack update.**
 
 - `base_sha` = `fae91796206da1d2961d1c5537285278bc0a80f8`
 - `patch_sha` = `9e399b7b834822ce02d7dd8f21a0491a9638f113`
 
-range 内只有 `deploy/edge/**` 的 19 个文件,没有别的层被卷进来。两端都在公开仓可解析。
+The range contains 19 files, all under `deploy/edge/**` — no other layer is pulled in. Both
+anchors resolve in the public repository, so every check below is one you can run yourself.
 
-## 先读四条会静默毁掉本次交付的事实
+## Four facts that will silently ruin this delivery
 
-**① `nginx.conf` 是模板,不能逐字节装到在役路径。**
-`install-edge.sh` 用 `envsubst` 渲染五个占位符 —— `ENGINE_REDIS_HOST`、`ENGINE_REDIS_PORT`、
-`ENGINE_REDIS_READER_HOST`、`ENGINE_REDIS_READER_PORT`、`EDGE_SELF_IP`,其中 **`EDGE_SELF_IP`
-每台不同**,所以不存在一份能通用的预渲染制品。把裸模板装上去,在役配置里就会留下字面
-`${ENGINE_REDIS_HOST}`,而本次修复恰恰是把坐标写进 `init_by_lua_block` —— 占位符没渲染,
-坐标就是字符串,等于修复没生效。
+**① `nginx.conf` is a template. Do not copy it to the live path.**
+The installer renders five placeholders through `envsubst` — `ENGINE_REDIS_HOST`,
+`ENGINE_REDIS_PORT`, `ENGINE_REDIS_READER_HOST`, `ENGINE_REDIS_READER_PORT` and
+`EDGE_SELF_IP` — and **`EDGE_SELF_IP` differs per instance**, so no single pre-rendered artifact
+can be correct for a fleet. Install the raw template and the running configuration keeps a
+literal `${ENGINE_REDIS_HOST}`. Since the change being delivered is precisely that the
+coordinates now live inside an init block, an unrendered placeholder means the coordinate is a
+string and the fix does nothing — while every digest check still passes.
 
-本 kit 因此在**每台上重新渲染**:四个 Redis 坐标取自在役 `claw-edge.service` 的 `Environment`
-(那四行 `ENGINE_REDIS_*_HINT` 正是本次修复要删掉的,所以在役旧 unit 上仍在),`EDGE_SELF_IP`
-取自 IMDS;渲染后**断言零残留占位符**、且结果里有 `init_by_lua_block`,才允许安装。任何一步取不到
-值就 fail loud,不猜。存进 bundle 源的是**未渲染的模板**,因为下次 bootstrap 由 `install-edge.sh`
-自己渲染。
+This kit therefore **renders per host, from the same sources the installer uses**. The primary
+coordinate comes from `ENGINE_REDIS_ENDPOINT` in `/etc/environment` (written there by the launch
+template's user data) and is split into host and port the same way. The reader coordinate is read
+from the SSM parameter `/openclaw/engine/redis/reader-endpoint`, and **falls back to the primary
+when that parameter is absent, empty or malformed** — which is exactly what the installer does.
+`EDGE_SELF_IP` comes from instance metadata. After rendering, the operation **asserts that no
+placeholder remains** and that the result contains the init block, and only then installs. If any
+value cannot be read it fails loudly rather than guessing. The **unrendered template** is what
+goes to the bundle directory, because a later bootstrap renders it itself.
 
-**② 文件装完之后才 reload,而且只 reload 一次 —— 守卫是机械的,不是嘱咐。**
-`lua_code_cache` 让已启动的 worker 继续用已 `require` 的旧模块,所以文件落盘但未 reload 时
-**在役行为完全不变**。这就是原子性保证:部分安装是安全的,风险只在 reload 那一刻兑现。因此
-reload 操作会**逐台断言本 kit 装的每一个在役文件都就位**(4 个 lua 的 sha256 + 在役 `nginx.conf`
-零残留占位符且含 `init_by_lua_block`)才允许翻。缺任一个,reload 之后立刻
-`attempt to call a nil value`,或者坐标变字面量、warmup 又退回无坐标分支。
+> It deliberately does **not** read the four `ENGINE_REDIS_*_HINT` values from
+> `claw-edge.service`. Measured on a real fleet: an older bundle generation writes only
+> `HOST` and `PORT`, with no reader pair, so requiring four would make this kit unusable on that
+> generation. `ENGINE_REDIS_ENDPOINT` is present in every generation.
 
-**③ 新实例继承不了本次修复 —— 这不是待查的问题,是代码里已经定死的事实。**
-CDK 把整棵 edge 树打成**一个摘要寻址对象** `deployment/bootstrap/edge/<sha256>/edge-bundle.tar.gz.b64`,
-而 LaunchTemplate 的 userdata 里**内联了同一个 sha256 并真的执行 `sha256sum -c`**,校验通过才解到
-`/opt/openclaw-edge/<sha256>/`。所以:
+**② Files land first; the reload happens once, and the guard is mechanical rather than advisory.**
+The module cache keeps already-started workers on the modules they have already required, so a
+file on disk that has not been reloaded **changes nothing about live behaviour**. That is the
+atomicity guarantee: a partial install is safe, and the risk exists only at the reload. The reload
+operation therefore **asserts, on every host, that every file this kit installs is in place** —
+the four Lua digests, plus the live `nginx.conf` having no residual placeholder and containing the
+init block — before it will proceed. Miss one and the reload produces an immediate
+`attempt to call a nil value`, or a coordinate that is a literal string and a warmup that falls
+back to its no-coordinate branch.
 
-- 换 S3 对象的字节**不可能**让新实例继承 —— 摘要不匹配,新实例直接起不来
-- 要让新实例带上修复,只有出**新的 bundle 版本 + 新的 LaunchTemplate 版本**,那是部署级动作
-- 本 kit 只止在役实例的血。任何扩容、健康检查换机、AZ 重平衡起来的新 edge 仍带缺陷
+**③ New instances will not inherit this fix. That is not an open question; it is settled in code.**
+The whole edge tree is packed into a **single digest-addressed object**,
+`deployment/bootstrap/edge/<sha256>/edge-bundle.tar.gz.b64`, and the launch template's user data
+**inlines that same sha256 and runs `sha256sum -c` against it** before unpacking to
+`/opt/openclaw-edge/<sha256>/`. So:
 
-Step 5 是一个**决定门**:现在就走部署级动作,还是先只止在役的血、把出版本单独排期。它要求你写下
-结论,不允许沉默跳过。
+- Replacing the bytes of that object **cannot** make new instances inherit anything — the digest
+  would not match and the instance would refuse to start
+- Inheriting the fix requires a **new bundle version and a new launch template version**, which is
+  a deployment-level action
+- This kit stops the bleeding on the live fleet only. Any scale-out, health-check replacement or
+  availability-zone rebalance brings up an edge that still carries the defect
 
-**④ 有 4 个文件只进 bundle 源,不改在役行为。**
-`install-edge.sh` 与三个 `fluent-bit/` 配置装到 bundle 目录后,在役 openresty 与在役 fluent-bit
-**行为不变** —— 前者只在 bootstrap 时执行,后者继续用它当前的配置。而且按第 ③ 条,写 bundle 目录
-**也不会**让新实例继承;它只对「有人在这台上重跑 `install-edge.sh`」这一种情况有意义,
-userdata 再跑一次会用原始 bundle 覆盖回去。要让在役 fluent-bit 立即换配置是另一件事,
-爆炸半径与验证方式都不同,不在本 kit 范围内。
+Step 5 is a **decision gate** for exactly this, and it will not accept silence.
 
-## Step 0 — 环境、edge 实例集合、基线核对
+**④ Four files go only to the bundle directory and change no live behaviour.**
+`install-edge.sh` and the three `fluent-bit/` configurations land in the bundle directory, after
+which the running OpenResty and the running fluent-bit **behave exactly as before** — the first is
+executed only at bootstrap, the second keeps using its current configuration. And per fact ③,
+writing the bundle directory does **not** make new instances inherit either; it matters only if
+someone re-runs `install-edge.sh` on that host, and a further user-data run overwrites it with the
+original bundle content. Reconfiguring the running fluent-bit is a different task with a different
+blast radius and its own verification, and is out of scope here.
+
+## Step 0 — environment, edge instances, baseline
 
 ```bash
-: "${REGION:?先 export REGION}"
-: "${ASSETS_BUCKET:?先 export ASSETS_BUCKET}"
+: "${REGION:?export REGION first}"
+: "${ASSETS_BUCKET:?export ASSETS_BUCKET first}"
 : "${EDGE_ASG:=openclaw-edge-asg}"
 export REPO_ROOT="${REPO_ROOT:-$PWD}"
 
@@ -67,11 +92,11 @@ EDGE_IDS="$(aws autoscaling describe-auto-scaling-groups --region "$REGION" \
   --query 'AutoScalingGroups[0].Instances[?LifecycleState==`InService`].InstanceId' \
   --output text)"
 export EDGE_IDS
-test -n "$EDGE_IDS" || { echo "没取到 InService 的 edge 实例" >&2; exit 1; }
-echo "edge 实例: $EDGE_IDS"
+test -n "$EDGE_IDS" || { echo "no InService edge instances found" >&2; exit 1; }
+echo "edge instances: $EDGE_IDS"
 ```
 
-Step 5 还需要 LaunchTemplate 的坐标:
+Step 5 also needs the launch template coordinates:
 
 ```bash
 EDGE_LT_NAME="$(aws autoscaling describe-auto-scaling-groups --region "$REGION" \
@@ -82,121 +107,149 @@ test "$EDGE_LT_NAME" != None || EDGE_LT_NAME="$(aws autoscaling describe-auto-sc
   --region "$REGION" --auto-scaling-group-names "$EDGE_ASG" \
   --query 'AutoScalingGroups[0].LaunchTemplate.LaunchTemplateName' --output text)"
 export EDGE_LT_NAME EDGE_LT_VERSION="${EDGE_LT_VERSION:-\$Latest}"
-echo "LT: $EDGE_LT_NAME @ $EDGE_LT_VERSION"
+echo "launch template: $EDGE_LT_NAME @ $EDGE_LT_VERSION"
 ```
 
-**基线核对**:先确认每台的 bundle 目录能被发现、在役文件当前是什么。bundle 目录是
-`/opt/openclaw-edge/<bundle-sha256>/`,**每个版本一个独立目录**,所以本 kit 的每条命令都在目标机上
-现场发现它,发现不到就拒绝执行 —— 不要在任何地方写死 `/opt/openclaw-edge/lib` 这类路径。
+**Baseline.** Confirm the bundle directory can be discovered on each host and record what the live
+files are now. The bundle unpacks to `/opt/openclaw-edge/<bundle-sha256>/`, **one directory per
+version**, so every command in this kit discovers it on the target host and refuses to run if it
+cannot. Do not hardcode a path like `/opt/openclaw-edge/lib` anywhere.
 
-## Step 1 — 制品上传到 S3(零在役影响,完全可逆)
+If a live file's digest already equals the `patch_sha256` recorded in `manifest.json`, that host
+already has that file — skip it rather than reinstalling.
 
-19 个路径各自 `operations[0].apply_cli` 的前半段:把制品放到**新前缀 `deployment/edge-606/`**,
-不覆盖任何现有 bundle 对象。回滚就是删对象。
+## Step 1 — upload artifacts to S3 (no live effect, fully reversible)
 
-## Step 2 — 4 个在役 lua 装到两处落点(不 reload)
+The first half of each path's `operations[0].apply_cli`. Artifacts go to the **new prefix
+`deployment/edge-606/`** and overwrite no existing bundle object. Rolling back is deleting them.
 
-`lib/hints.lua`、`lib/tenant.lua`、`lib/utils.lua`、`route.lua`。每个都装到
-`/usr/local/openresty/lualib/edge/...`(运行时加载路径)与发现出来的 bundle 目录两处。
-备份锚点 `.pre-606` 只建一次(文件原本不存在时记 `.absent`),重跑不覆盖 —— 覆盖了备份就是已修补
-内容,回滚从此无效。
+## Step 2 — install the four live Lua files to both landing spots (no reload)
 
-## Step 3 — `nginx.conf` 每台重新渲染后安装(`MANUAL_CLI_REVIEW`)
+`lib/hints.lua`, `lib/tenant.lua`, `lib/utils.lua`, `route.lua`. Each goes to
+`/usr/local/openresty/lualib/edge/...` (the runtime load path) and to the discovered bundle
+directory. The `.pre-606` backup anchor is created **once** — with a `.absent` marker when the file
+did not exist — and a rerun does not overwrite it. Overwrite the anchor and the backup becomes the
+already-patched content, which makes rollback useless.
 
-见开头第 ① 条。这一条是本 kit 唯一会改在役配置文件内容的操作,复核时请确认三件事:
-坐标来源(在役 unit)、`EDGE_SELF_IP` 是每台自己的、以及渲染后零残留占位符的断言在安装之前。
+## Step 3 — render and install `nginx.conf` per host (`MANUAL_CLI_REVIEW`)
 
-## Step 4 — 一次性 reload(自守卫,`MANUAL_CLI_REVIEW`)
+See fact ①. This is the only operation that changes the content of a live configuration file.
+When reviewing it, confirm three things: where the coordinates come from, that `EDGE_SELF_IP` is
+each host's own, and that the zero-residual-placeholder assertion sits **before** the install.
 
-`deploy/edge/nginx.conf` 上那条 reload 操作。它先逐台断言四个 lua 的 sha256 与在役 conf 的两项
-判据,再 `openresty -t`、`openresty -s reload`,然后回读 journald **两个**信号:
+## Step 4 — one guarded reload (`MANUAL_CLI_REVIEW`)
 
-- 不再有 `API disabled in the context of balancer_by_lua`
-- 不再有 `marking ready without probe`
+The reload operation on `deploy/edge/nginx.conf`. It asserts the four Lua digests and the two
+conditions on the live configuration, then runs `openresty -t` and `openresty -s reload`, then
+reads journald back for **two** signals:
 
-`openresty -t` 可以先跑,但它**不加载 lua 模块** —— 通过不代表 lua 能载入。lua 的加载与运行失败
-只出现在 journald 与 `error.log`。
+- no more `API disabled in the context of balancer_by_lua`
+- no more `marking ready without probe`
 
-## Step 5 — 新实例继承的决定门(`MANUAL_CLI_REVIEW`,只读)
+You can run `openresty -t` first, but it **does not load Lua modules** — passing it does not show
+that Lua can load. Lua load and runtime failures appear only in journald and `error.log`.
 
-读 LT userdata,确认它拉的是摘要寻址 bundle 且真的做 `sha256sum -c`(这是第 ③ 条的现场证据),
-然后**人工**在 `edge-inherit-gate.txt` 末尾写一行结论,`verify` 只认这两个之一:
+**One consequence worth planning for.** Before this fix the readiness gate was fail-open, so
+`/healthz` answered 200 whether or not Redis was reachable. After it, a host that cannot reach
+Redis reports itself unready. If the target group health check is what keeps instances in service,
+an environment with unreachable Redis will now cycle instances instead of serving quietly broken
+ones. Confirm Redis reachability before the reload; that change in behaviour is the point of the
+fix, not a regression.
 
-- `DECISION: live-only` — 先只止在役的血,出新 bundle/LT 版本单独排期。**代价是从现在起到出版本
-  之间,任何新起的 edge 都带缺陷**,请把这条写进值班交接
-- `DECISION: reroll-bundle` — 现在就走部署级动作。那超出本 kit 范围,按部署流程另行执行
+## Step 5 — the new-instance decision gate (`MANUAL_CLI_REVIEW`, read-only)
 
-## Step 6 — 4 个只进 bundle 源的文件
+Read the launch template user data and confirm for yourself that it fetches a digest-addressed
+bundle and runs `sha256sum -c` — that is the on-the-spot evidence for fact ③. Then write one line
+of conclusion at the end of `edge-inherit-gate.txt`. Verification accepts only these two:
 
-`install-edge.sh` 与三个 `fluent-bit/` 配置。见开头第 ④ 条:**不改在役行为**。
+- `DECISION: live-only` — stop the bleeding on the live fleet, schedule the new bundle and launch
+  template version separately. **The cost is that between now and that version, every edge that
+  comes up carries the defect** — put that in the on-call handover
+- `DECISION: reroll-bundle` — do the deployment-level action now. That is outside this kit; follow
+  the deployment process
 
-## Step 7 — 10 个测试资产进仓库副本(可跳过)
+## Step 6 — the four bundle-source-only files
 
-只更新仓库副本,不触碰在役资源。其中
-`deploy/edge/test/integration/balancer_phase_integration.sh` 在**真实 openresty、真实
-`balancer_by_lua*` 阶段**下断言不得发起 cosocket —— 这正是原缺陷当年能通过每一道检查的那个缺口
-(假 redis 模块模拟不出上下文限制,`openresty -t` 也不触发运行时相位错误)。不保留仓库克隆的客户
-可以整组跳过;它的 `apply_cli` 是「缺则装、在则断言」,内容与记录不同就拒绝覆盖。
+`install-edge.sh` and the three `fluent-bit/` configurations. See fact ④: **no live effect.**
 
-## 验证
+## Step 7 — ten test assets to the repository copy (skippable)
 
-`manifest.json` 的 `verifications[]` 有 8 条,按 `phase` 分三批:
+These update a repository copy only and touch no live resource. Among them,
+`deploy/edge/test/integration/balancer_phase_integration.sh` asserts, in the **real
+`balancer_by_lua*` phase under a real OpenResty**, that no cosocket is opened — which is the gap
+the original defect walked through (a stubbed Redis module cannot reproduce a context restriction,
+and `openresty -t` does not trigger a runtime phase error either). Skip the whole group if you do
+not keep a clone of the repository. Their `apply_cli` installs only when absent and otherwise
+asserts the digest, refusing to overwrite content that differs from what this kit recorded.
 
-- **Phase A-readonly(只读,6 条)**:`verify-639-no-marking-ready-without-probe`、
-  `verify-639-conf-rendered-and-init-block`、`verify-606-no-api-disabled`、
-  `verify-606-live-and-bundle-digests`、`verify-edge-new-instance-decision`、
+## Verification
+
+`manifest.json` carries 8 verifications in three phases:
+
+- **Phase A-readonly (6)**: `verify-639-no-marking-ready-without-probe`,
+  `verify-639-conf-rendered-and-init-block`, `verify-606-no-api-disabled`,
+  `verify-606-live-and-bundle-digests`, `verify-edge-new-instance-decision`,
   `verify-edge-bundle-source-digests`
-- **Phase B-lifecycle(走真实产品入口,1 条,核心)**:`verify-606-retry-path-selfheal`
-- **Phase B-optional(1 条)**:`verify-633-probe-fails-when-cosocket-reintroduced`
+- **Phase B-lifecycle (1, the core one)**: `verify-606-retry-path-selfheal`
+- **Phase B-optional (1)**: `verify-633-probe-fails-when-cosocket-reintroduced`
 
-**正常请求不进 retry 分支。** 所以「WSS 能连上」「对话正常」这类验证**完全没有验到那个 fix**。
-`verify-606-retry-path-selfheal` 是唯一能证明它生效的探针:让某个租户的 route descriptor 指向
-不可达的 host(先记下 `host:port`,再让那台 VM 停止),从**外部真实发起** WSS,断言 L1 TTL 内的
-下一次请求连到新 peer 且无 `API disabled`。
+**A normal request never enters the retry branch.** So "the WebSocket connects" and "conversation
+works" verify nothing about that fix. `verify-606-retry-path-selfheal` is the only probe that shows
+it working: point a tenant's route descriptor at an unreachable host (record its `host:port`, then
+stop that VM), drive a **real WebSocket from outside**, and assert that the next request within the
+level-one cache TTL reaches a new peer with no `API disabled`.
 
-`verify-633-probe-fails-when-cosocket-reintroduced` 用的是反证:原样跑绿之后,**故意**在 balancer
-阶段加一次 cosocket 调用,探针必须**变红**。注入后仍绿,说明这个探针和它要取代的假绿单测一样判不动。
+`verify-633-probe-fails-when-cosocket-reintroduced` works by contradiction: after the probe passes
+as shipped, **deliberately** add a cosocket call in the balancer phase and the probe must go **red**.
+Still green after the injection means this probe judges no better than the stubbed test it replaces.
 
-## 陷阱清单
+## Traps
 
-| 陷阱 | 说明 |
+| Trap | Why |
 |---|---|
-| **把 `nginx.conf` 当普通文件装** | 它是模板,五个占位符必须渲染,其中 `EDGE_SELF_IP` 每台不同 |
-| **写死 `/opt/openclaw-edge/lib`** | bundle 解到 `/opt/openclaw-edge/<bundle-sha256>/`,每版一个目录,必须现场发现 |
-| **以为写了 bundle 源新实例就继承** | 新实例拉的是摘要寻址的 S3 bundle,userdata 内联 sha 校验;换字节它起不来 |
-| **`openresty -t` 通过不代表 lua 能载入** | `-t` 不加载 lua 模块。失败只出现在 journald 与 `error.log` |
-| **只改 `lualib` 不改 bundle 目录** | 有人重跑 `install-edge.sh` 时会被原始 bundle 内容覆盖回去 |
-| **只验正常请求等于没验** | 正常请求不进 retry 分支,验不到那个 fix。必须主动触发 retry |
-| **靠 `/healthz` 判 edge 健康** | 本次修的就是「healthy 这个信号不可信」。修复前它在从未探过 Redis 时也返 200 |
-| **备份锚点被重跑覆盖** | `.pre-606` 若在第二次施加时被覆盖,备份内容就是已修补版,回滚从此无效 |
-| **回滚到更早的 bundle 无效** | 缺陷自 2026-07-21 起就在。回滚到更早版本 = 重新引入同一缺陷 |
+| **Treating `nginx.conf` as an ordinary file** | It is a template; five placeholders must be rendered and `EDGE_SELF_IP` differs per instance |
+| **Hardcoding `/opt/openclaw-edge/lib`** | The bundle unpacks to `/opt/openclaw-edge/<bundle-sha256>/`, one directory per version; discover it on the host |
+| **Expecting new instances to inherit from a bundle-directory write** | New instances fetch a digest-addressed object whose hash the launch template verifies; replacing bytes makes them refuse to start |
+| **Reading the four `*_HINT` values from the unit** | An older bundle generation writes only two of them; derive from `ENGINE_REDIS_ENDPOINT` instead |
+| **Trusting `openresty -t`** | It does not load Lua modules. Failures appear only in journald and `error.log` |
+| **Changing `lualib` but not the bundle directory** | A later `install-edge.sh` run restores the original bundle content |
+| **Verifying only a normal request** | A normal request never enters the retry branch, so it cannot verify that fix |
+| **Judging edge health by `/healthz`** | What this fixes is that the healthy signal was not trustworthy: before the fix it answered 200 without ever probing Redis |
+| **Letting a rerun overwrite the backup anchor** | `.pre-606` would then hold the patched content and rollback would restore nothing |
+| **Rolling back to an earlier bundle** | The defect has been present since 2026-07-21; an earlier version reintroduces it |
 
-## 回滚
+## Rollback
 
-每个路径各自的 `rollback_cli` 都先**预检**(断言在役内容仍是本 patch 装上去的那份,否则拒绝动手),
-再从 `.pre-606` 还原(原本不存在的按 `.absent` 删除)。四个 lua 与 `nginx.conf` 都还原完之后,用
-reload 操作的 `rollback_cli` 做一次 reload 让还原生效。
+Every path's `rollback_cli` **preflights first** — it asserts the live content is still what this
+patch installed and refuses to act otherwise — then restores from `.pre-606`, removing the file
+where a `.absent` marker says it did not exist. After the four Lua files and `nginx.conf` are
+restored, run the reload operation's `rollback_cli` once to make the restore take effect.
 
-Step 1 的回滚:删掉 `s3://$ASSETS_BUCKET/deployment/edge-606/` 下的对象。
+Rolling back Step 1 means deleting the objects under
+`s3://$ASSETS_BUCKET/deployment/edge-606/`.
 
-**注意**:回滚意味着 readiness 门重新恒 fail-open(`/healthz` 又会在没探过 Redis 时返 200)。
-只在下发本身出问题(lua 载入失败、`openresty -t` 不过、reload 后起不来)时回滚。
+**Note:** rolling back returns the readiness gate to permanently fail-open — `/healthz` will again
+answer 200 without having probed Redis. Roll back only when the delivery itself is the problem
+(Lua fails to load, `openresty -t` fails, the process does not come back after a reload).
 
-## 本 kit 不修什么
+## What this kit does not fix
 
-- **`controlUi.allowedOrigins` 的 origin 白名单**。那是 guest 内 openclaw gateway 的校验,
-  取值来自 host 开机固化的 `platform.env`,与 edge 无关,改的是 host provisioning
-- **Redis route 键的回收**。route 键不会被自动回收,恢复租户靠新写入覆盖
-- **guest 出网策略(egress)**。与本缺陷无因果关系
-- **新实例继承**。见第 ③ 条,需要新的 bundle 与 LaunchTemplate 版本
+- **The `controlUi.allowedOrigins` whitelist.** That check lives in the gateway inside the guest,
+  and its value comes from `platform.env` frozen at host boot. It is unrelated to the edge and is a
+  host provisioning change
+- **Reclaiming Redis route keys.** Route keys are not reclaimed automatically; restoring a tenant
+  relies on a new write overwriting them
+- **Guest egress policy.** No causal relationship with this defect
+- **New-instance inheritance.** See fact ③ — that needs a new bundle and launch template version
 
-## 溯源与测试覆盖
+## Provenance and test coverage
 
-| 项 | 值 |
+| Item | Value |
 |---|---|
-| 内部源提交 | 逐字节取自内部源的一个提交,文件 mode 同源 |
-| range | `deploy/edge/**` 19 个文件,无其它层 |
-| 真实相位探针 | `deploy/edge/test/integration/balancer_phase_integration.sh`(随 Step 7 交付) |
+| Internal source | Copied byte-for-byte from one internal commit, file modes taken from the same tree |
+| Range | 19 files under `deploy/edge/**`, no other layer |
+| Real-phase probe | `deploy/edge/test/integration/balancer_phase_integration.sh`, delivered in Step 7 |
 
-上一版本的说明里写着「集成测试尚未纳入覆盖面」——**这一版已经纳入**,并且用注入反证的方式给了
-可证伪的验收标准(`verify-633-probe-fails-when-cosocket-reintroduced`)。
+An earlier revision of these instructions said the integration test was not yet in the kit's
+coverage. **It now is**, with a falsifiable standard — reintroduce a cosocket call in the balancer
+phase and the probe must go red.

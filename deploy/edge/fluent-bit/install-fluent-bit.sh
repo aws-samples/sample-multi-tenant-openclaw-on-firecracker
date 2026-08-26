@@ -7,10 +7,12 @@
 # *config* (what to tail, which stream) lives per-role in S3 under
 # deployment/observability/fluent-bit/<role>/ and is pulled at runtime — so
 # changing the collection target = edit S3 config + roll fresh instances,
+# no AMI rebake (铁律#3: cold-inject on boot, no hot patching).
 #
 # Contract (env set by caller):
 #   FB_ROLE               edge | host — selects S3 subprefix + local fallback dir
 #   LOGGING_ENABLED       true|false (default true); false = skip entirely
+#   FB_INSTALL_ONLY       1 = stop after the package install, write no config (#389 v2).
 #                         Golden-image bake needs the package but MUST NOT bake the
 #                         config: it carries per-deployment Firehose stream names, and
 #                         an AMI is shared by the whole fleet. Boot then renders the
@@ -54,6 +56,7 @@ fb_installed() {
 if ! fb_installed; then
     ARCH_DEB="amd64"; [[ "$(uname -m)" == "aarch64" || "$(uname -m)" == "arm64" ]] && ARCH_DEB="arm64"
     if grep -qi ubuntu /etc/os-release 2>/dev/null; then
+        # #440 — keyring 已存在时 gpg 会弹 "File exists. Overwrite?";cloud-init
         # modules:final 无 /dev/tty → rc=2 → init-host 非零 → ASG ABANDON,且每次
         # boot 复现不收敛。真机实测 --batch --no-tty 无效(仍 rc=2,错误变 "dearmoring
         # failed: File exists"),只有 --yes 才覆盖既有 keyring。
@@ -65,6 +68,7 @@ if ! fb_installed; then
         apt-get update -qq
         apt-get install -y -qq fluent-bit
     elif grep -qi 'amazon linux' /etc/os-release 2>/dev/null; then
+        # #219 (真机 AL2023 2026-07-14): baseurl 不带 /$basearch/ —— Fluent Bit
         # 的 AL repo 不按 basearch 分子目录, 带上会 404 装不上。
         cat > /etc/yum.repos.d/fluent-bit.repo <<'FBREPO'
 [fluent-bit]
@@ -81,6 +85,7 @@ FBREPO
 fi
 
 if [[ "${FB_INSTALL_ONLY:-0}" == "1" ]]; then
+    # #389 v2: package installed, nothing configured or started. Deliberately before the
     # config pull so a bake needs neither ASSETS_BUCKET nor network S3 access, and cannot
     # accidentally capture another deployment's stream names into a shared image.
     log "FB_INSTALL_ONLY=1; package installed, skipping config + enable (bake mode)"
@@ -128,14 +133,18 @@ if [[ "$_fb_pulled" -gt 0 && -f "$_fb_stage/fluent-bit.conf" ]]; then
     # into two paths and install a file under a truncated name.
     _fb_source_dir="$_fb_stage"
     log "pulled ${_fb_pulled} object(s) for role=${FB_ROLE} from s3://${ASSETS_BUCKET}/${_s3_prefix}/"
+    # #458 —— 把【拉到的是哪个版本】记下来。这是本轮唯一能把"静默起坏"变成"可检测"的东西。
     #
     # 为什么不是加 FB_LOCAL_DIR:下面那个 elif 只在【拉到 0 个对象】或【拉到的里面没有
+    # fluent-bit.conf】时才触发。而 #458 的实际失败是 S3 上有一份【旧但合法】的配置 → 拉取
     # 成功 → 装上旧配置 → 本地兜底【永远不会触发】。baked fallback 只覆盖"缺失",不覆盖
+    # "过期",对 #458 这个失败模式无效 —— issue 的建议第 7 条在这一点上不成立。
     #
     # setup.sh 的 _obs_upload 本来就给每个对象打了 sha256= 与 git-commit= 元数据,所以
     # "这台机器开机时装的是哪个 commit 的配置"一直是可知的,只是从没被记下来。记下来之后:
     #   · 开机日志里直接可见:grep fb-config-version /var/log/openclaw-init.log
     #   · 与 oc-consistency 的机队对账口径一致,能把"S3 stale"归因到具体 commit
+    #   · #458 那台 8/7 起的 host 若有这行,当场就能看出它装的是 353 之前的版本
     #
     # head-object 失败(权限/旧对象无元数据/网络)一律不影响安装:这是可观测性,不是准入门。
     # 故 `|| echo` 兜底而不是 die —— 与本函数其余部分"S3 miss 才 fail-loud"的分工一致。
@@ -215,6 +224,7 @@ fi
 
 # Every Lua script the config references must be on disk before we start.
 # A stale S3 role prefix that still ships fluent-bit.conf but not its filters is
+# exactly the #265 failure mode, and the dry-run below reports only "failed"
 # without naming the file — the class of message that sent past investigations
 # to Firehose and the host instead of to the asset prefix. Relative script paths
 # resolve against the config dir (host style); absolute ones are used as-is

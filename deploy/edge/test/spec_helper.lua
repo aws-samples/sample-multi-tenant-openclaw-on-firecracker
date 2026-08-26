@@ -36,6 +36,7 @@ local ngx_stub = {
     ctx  = {},
     header = {},
     status = 200,
+    _phase = "rewrite",
     ERR = 4, WARN = 5, NOTICE = 6, INFO = 7, DEBUG = 8,
     -- ngx.now returns fractional seconds since epoch.
     now  = function() return os.time() end,
@@ -97,6 +98,9 @@ end
 local function new_fake_redis_module(ngx_ref)
     local mod = {}
     function mod.new(_self)
+        if ngx_ref._phase == "balancer" then
+            error("API disabled in the context of balancer_by_lua*", 2)
+        end
         local client = {}
         client._closed = false
         function client.set_timeouts(_c) end
@@ -232,6 +236,7 @@ M.new_fake_shared_dict = new_fake_shared_dict
 M.new_fake_redis_module = function() return new_fake_redis_module(ngx_stub) end
 M.new_fake_lock_module = new_fake_lock_module
 M.fake_redis_connects = function() return ngx_stub._fake_redis_connects end
+M.set_phase = function(name) ngx_stub._phase = name end
 M.reset_ngx = function()
     ngx_stub.var = {
         edge_redis_reader_host = "",
@@ -239,6 +244,7 @@ M.reset_ngx = function()
     }
     ngx_stub.ctx, ngx_stub.header = {}, {}
     ngx_stub.status = 200
+    ngx_stub._phase = "rewrite"
     ngx_stub._fake_redis = nil
     ngx_stub._fake_redis_connects = {}
     while ngx_log_capture[1] do table.remove(ngx_log_capture) end

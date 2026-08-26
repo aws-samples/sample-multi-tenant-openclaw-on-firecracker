@@ -1,6 +1,6 @@
 -- deploy/edge/test/tenant_spec.lua
 --
--- extract_tenant_id — adversarial coverage matrix per the test plan.
+-- extract_tenant_id — adversarial coverage matrix per 03-TEST-PLAN.
 
 local helper = require "spec_helper"
 local tenant = require "edge.lib.tenant"

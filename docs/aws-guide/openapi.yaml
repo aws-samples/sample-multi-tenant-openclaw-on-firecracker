@@ -519,7 +519,7 @@ components:
       x-source: deploy/lambda/api/services/egress_admin_service.py:1597
     FleetEgressWaitResult:
       type: object
-      description: wait=true 的结果(全绿 200,任一项失败 207)。
+      description: wait=true 的结果(全绿 200,任一项失败或定向目标回收不全 207)。
       required:
         - ok
         - mode
@@ -529,7 +529,7 @@ components:
       properties:
         ok:
           type: boolean
-          description: 全部 host apply_exit=0 且 ssm_status=Success 且没有 pin 检查不可用。
+          description: 全部回收到的 host apply_exit=0 且 ssm_status=Success、没有 pin 检查不可用,且(定向路径)所有目标都回收到了结果。
         mode:
           type: string
           enum:
@@ -542,6 +542,27 @@ components:
         host_count:
           type: integer
           description: 这里是**回收到结果的**host 数(不是枚举数)。
+        expected_host_count:
+          type: integer
+          description: |-
+            本次下发的目标台数。`targets=[...]` 定向时 = 调用方给的 id 个数;`targets="all"`
+            时 = 服务端 DDB 枚举出的 active/idle host 数(那是一份快照,可能含已终止或
+            SSM 不受管的机器,也可能漏掉刚注册的新机)。与 `host_count` 一起看即可对账。
+        missing_hosts:
+          type:
+            - array
+            - 'null'
+          items:
+            type: string
+          description: |-
+            定向路径上**没有回收到 invocation** 的目标 instance id(升序)。它们的链状态未知 ——
+            既不是成功也不是失败,只是这次窗口内没回来。`targets="all"` 时为 `null`:全量的
+            期望集合是服务端枚举出来的快照,拿它算差集会把已终止的机器报成"缺失",所以不报。
+        collection_incomplete:
+          type: boolean
+          description: |-
+            定向路径上是否有目标没回收到结果(等价于 `missing_hosts` 非空)。为真时整体压成 207。
+            `targets="all"` 恒为 false —— 全量不做数量判定(见 `missing_hosts` 的说明)。
         desired_state_written:
           type: integer
         desired_state_incomplete:
@@ -5155,35 +5176,39 @@ paths:
         '200':
           description: |-
             两种情形:①`wait=false` 且枚举出 0 台可下发 host(什么都没发);
-            ②`wait=true` 且逐机全部 apply_exit=0 / ssm_status=Success / pin 检查可用。
+            ②`wait=true` 且逐机全部 apply_exit=0 / ssm_status=Success / pin 检查可用,
+            **且定向路径上每个目标都回收到了结果**。
 
-            ②的判定**只覆盖窗口内回收到的 invocation**:超时前没回来的机器不算失败、也不
-            补位,所以 `host_count`(= 回收到的条数)可能小于你的目标台数,而 `ok` 仍是 true
-            (`egress_admin_service.py:1626`)。调用方要判"每台都做了",必须自己比
-            `host_count` 与目标台数,或改用 GET /hosts/egress 的收敛报告。
-            POST /hosts/egress/rollback 在这一点上更严(它额外要求
-            `len(hosts) == expected_results`,`:2153`)—— 这个不对称是现状,#636 不改行为。
+            `targets=[...]` 定向时,窗口内没回来的目标会被列进 `missing_hosts` 并把整体压成
+            207(#657) —— 调用方对自己给的那份 id 列表负责,所以少一台就不算成功。
+            `targets="all"` 全量不做数量判定:期望集合是服务端 DDB 枚举出的快照(可能含已终止
+            或 SSM 不受管的机器,也可能漏掉刚注册的新机),拿它当"应该回几台"会恒判失败。
+            全量要对账就自己比 `expected_host_count` 与 `host_count`,或用 GET /hosts/egress
+            的收敛报告。
           content:
             application/json:
               schema:
                 oneOf:
                   - $ref: '#/components/schemas/FleetEgressNoHosts'
                   - $ref: '#/components/schemas/FleetEgressWaitResult'
-              x-source: deploy/lambda/api/services/egress_admin_service.py:1536
+              x-source: deploy/lambda/api/services/egress_admin_service.py:1490
         '202':
           description: '`wait=false`:期望态已写、SSM 已下发,收敛由 host-agent 上报(轮询 GET /hosts/egress)。'
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/FleetEgressDispatched'
-              x-source: deploy/lambda/api/services/egress_admin_service.py:1597
+              x-source: deploy/lambda/api/services/egress_admin_service.py:1550
         '207':
-          description: '`wait=true` 且至少一台 apply_exit≠0 / ssm_status≠Success / pin 检查不可用。'
+          description: |-
+            `wait=true` 且出现下列任一情形:至少一台 apply_exit≠0 / ssm_status≠Success /
+            pin 检查不可用;或定向路径(`targets=[...]`)上有目标在窗口内没回收到 invocation
+            (`collection_incomplete=true`,缺哪几台见 `missing_hosts`,#657)。
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/FleetEgressWaitResult'
-              x-source: deploy/lambda/api/services/egress_admin_service.py:1639
+              x-source: deploy/lambda/api/services/egress_admin_service.py:1611
         '400':
           description: |-
             入参校验失败。判据(逐条实测):

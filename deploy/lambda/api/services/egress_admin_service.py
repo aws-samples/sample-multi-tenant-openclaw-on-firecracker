@@ -1574,6 +1574,18 @@ def fleet_egress(body=None, event=None):
         )
 
     hosts = _collect(command_id, timeout, expected_count=len(instance_ids))
+    expected_host_count = len(instance_ids)
+    if is_all:
+        # 全量的 DDB 枚举只是一份快照:可能含已终止或 SSM 不受管的机器,也可能漏掉刚注册
+        # 但会被 tag 扇出命中的新机。拿它判"应该回几台"会制造恒 207,所以只报数字不算差集。
+        missing_hosts = None
+        collection_incomplete = False
+    else:
+        collected_ids = {str(h.get("instance_id")) for h in hosts}
+        missing_hosts = sorted(
+            str(iid) for iid in instance_ids if str(iid) not in collected_ids
+        )
+        collection_incomplete = bool(missing_hosts)
     rules_sha256, rules_sha256_reason = _summarize_rules_sha256(
         h.get("rules_sha256") for h in hosts if not h.get("pinned_skip")
     )
@@ -1585,9 +1597,16 @@ def fleet_egress(body=None, event=None):
         for h in hosts
         if h.get("pin_check") == "unavailable"
     )
-    all_ok = command_ok and not pin_check_unavailable
+    all_ok = command_ok and not pin_check_unavailable and not collection_incomplete
     # 没有任何真实指纹不是“一致”;缺失证据不能被包装成没有问题。
     consistent = all_ok and rules_sha256 is not None
+    collection_warning = ""
+    if collection_incomplete:
+        collection_warning = (
+            f"; WARNING {len(missing_hosts)} of {expected_host_count} targeted hosts "
+            f"returned no invocation within the {timeout}s window — their chain state "
+            "is unknown"
+        )
     return _resp(
         200 if all_ok else 207,
         {
@@ -1596,6 +1615,9 @@ def fleet_egress(body=None, event=None):
             "revision": revision,
             "command_id": command_id,
             "host_count": len(hosts),
+            "expected_host_count": expected_host_count,
+            "missing_hosts": missing_hosts,
+            "collection_incomplete": collection_incomplete,
             "desired_state_written": desired_written,
             "desired_state_incomplete": desired_state_incomplete,
             "desired_state_scope": "fleet-singleton" if is_all else "per-instance",
@@ -1603,7 +1625,7 @@ def fleet_egress(body=None, event=None):
             "pinned_torn_down": [] if pin_enforced else pinned_hosts,
             "pinned_skipped": pinned_skipped,
             "unpinned_count": unpinned_count,
-                "unpin_failed": unpin_failed or None,
+            "unpin_failed": unpin_failed or None,
             "pin_check_unavailable": pin_check_unavailable,
             "extra_allow": extra_allow or None,
             "extra_allow_cleared": extra_allow_cleared or None,
@@ -1613,7 +1635,7 @@ def fleet_egress(body=None, event=None):
             "hosts": hosts,
             "message": (
                 "apply completed" if all_ok else "apply completed with errors"
-            ) + desired_state_warning,
+            ) + collection_warning + desired_state_warning,
         },
     )
 

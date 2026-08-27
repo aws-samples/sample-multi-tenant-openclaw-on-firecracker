@@ -131,11 +131,26 @@ def check_a3(ctx):
     tokens = _unreplaced_tokens(rendered.decode("utf-8", "replace"))
     source_path = ctx.get("lt_bootstrap.source_path", "deploy/userdata/init-host.sh")
     try:
-        gateway_sha = _sha(ctx.git_bytes(ctx.gateway_ref, source_path))
+        gateway = ctx.git_bytes(ctx.gateway_ref, source_path)
+        gateway_sha = _sha(gateway)
+        source_tokens = sorted(set(re.findall(
+            r"\{\{[A-Za-z0-9_]+\}\}", gateway.decode("utf-8", "replace"))))
     except (OSError, RuntimeError):
+        gateway = None
         gateway_sha = None
+        source_tokens = []
     rendered_sha = _sha(rendered)
-    source_match = rendered_sha == gateway_sha if gateway_sha else None
+    if gateway is None:
+        source_comparable = {"comparable": False, "reason": "gateway source was unreadable"}
+    elif source_tokens:
+        source_comparable = {
+            "comparable": False,
+            "reason": "gateway source contains template tokens: %s" % ", ".join(source_tokens),
+        }
+    else:
+        source_comparable = {"comparable": True, "reason": None}
+    source_match = (
+        rendered_sha == gateway_sha if source_comparable["comparable"] else None)
     failures = ([] if numeric else ["floating version"]) + tokens
     if source_match is False:
         failures.append("user data differs from gateway source")
@@ -144,7 +159,8 @@ def check_a3(ctx):
         "A3", verdict, "Pinned version, rendered tokens, and source bytes were compared.",
         {"inspected": len(versions), "version": version, "numeric": numeric,
          "tokens": tokens, "rendered_sha256": rendered_sha,
-         "gateway_sha256": gateway_sha, "source_match": source_match},
+         "gateway_sha256": gateway_sha, "source_comparable": source_comparable,
+         "source_match": source_match},
         failures, "Pin a numeric version and render user data from the gateway source.",
     )
 

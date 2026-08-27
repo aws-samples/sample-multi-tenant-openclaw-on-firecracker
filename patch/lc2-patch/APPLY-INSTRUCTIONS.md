@@ -414,12 +414,34 @@ in. Two of these four are sent to `AWS-RunShellScript` as the **bare command pat
 interpreter prefix**, so they need the executable bit; the other two are invoked through an
 explicit interpreter, which ignores it.
 
+**The four targets are not under one directory.** `init-host.sh` is what actually builds a host, and
+it splits them by extension: shell scripts land under `/home/ubuntu/`, Python lands under
+`/opt/openclaw/`. Do not assume a common prefix — an earlier revision of this table put
+`host-agent.py` under `/home/ubuntu/`, and every command in this step then pointed at a path that
+does not exist on a real host.
+
 | artifact | target | mode | why |
 | --- | --- | --- | --- |
-| `host-scripts/launch-vm.sh.patched` | `/home/ubuntu/launch-vm.sh` | **0755** | executed bare — `core/ssm_dispatch.py:71` and `:156` build the command as `f"/home/ubuntu/launch-vm.sh {tenant_id} …"`, and `services/tenant_service.py` does the same |
-| `host-scripts/stop-vm.sh.patched` | `/home/ubuntu/stop-vm.sh` | **0755** | executed bare from `services/dispatch_poller.py` |
-| `host-scripts/host-agent.py.patched` | `/home/ubuntu/host-agent.py` | 0644 | run as `python3 host-agent.py`; a long-lived service, restarted below |
-| `host-scripts/lib/harden-config.sh.patched` | `/home/ubuntu/lib/harden-config.sh` | 0644 | sourced / run as `bash lib/harden-config.sh` |
+| `host-scripts/launch-vm.sh.patched` | `/home/ubuntu/launch-vm.sh` | **0755** | executed bare — `core/ssm_dispatch.py:71` and `:156` build the command as `f"/home/ubuntu/launch-vm.sh {tenant_id} …"`, and `services/tenant_service.py` does the same. `init-host.sh:855` |
+| `host-scripts/stop-vm.sh.patched` | `/home/ubuntu/stop-vm.sh` | **0755** | executed bare from `services/dispatch_poller.py`. `init-host.sh:867` |
+| `host-scripts/host-agent.py.patched` | **`/opt/openclaw/host-agent.py`** | 0644 | run by systemd as `/usr/bin/python3 /opt/openclaw/host-agent.py`; a long-lived service, restarted below. `init-host.sh:599` |
+| `host-scripts/lib/harden-config.sh.patched` | `/home/ubuntu/lib/harden-config.sh` | 0644 | run as `bash lib/harden-config.sh`. `init-host.sh:861` |
+
+**Confirm the path and the unit on the host before you write anything**, rather than trusting this
+table. A wrong path fails loudly, which is survivable; a wrong **unit name** does not — the journal
+check below would match nothing and read as clean:
+
+```bash
+systemctl show -p FragmentPath -p ExecStart -p MainPID --value host-agent.service
+ls -l /opt/openclaw/host-agent.py /home/ubuntu/launch-vm.sh /home/ubuntu/stop-vm.sh
+```
+
+**`route_ops.py` is a same-directory dependency this kit does not ship.** `host-agent.py:27` does
+`import route_ops` and `sys.path` gets `__file__`'s directory, so the two must live together in
+`/opt/openclaw/` and must be version-compatible — `init-host.sh:601` says so explicitly. This kit
+replaces `host-agent.py` and leaves `route_ops.py` at whatever the host already has. Before
+restarting the service, check that the new `host-agent.py` needs nothing from `route_ops.py` that the
+resident copy lacks; the journal check below is what catches it if it does, as an import error.
 
 **Why this matters more than it looks.** S3 carries no unix permission bit, so the mode is
 whatever the host-side install sets — the umask default is 0644. A previous run of a sibling kit
@@ -436,23 +458,31 @@ re-read per invocation and need no restart. Per host:
 
 ```bash
 set -o pipefail
-for f in host-agent.py stop-vm.sh launch-vm.sh lib/harden-config.sh; do
-  sha256sum "/home/ubuntu/$f"          # compare each against the manifest patch_sha256
+# Per-file paths, because the four targets are NOT under one directory.
+for t in /opt/openclaw/host-agent.py /home/ubuntu/stop-vm.sh /home/ubuntu/launch-vm.sh \
+         /home/ubuntu/lib/harden-config.sh; do
+  test -f "$t" || { echo "FATAL $t does not exist on this host — confirm the real layout before writing"; exit 1; }
+  sha256sum "$t"                       # compare each against the manifest patch_sha256
 done
 # The two bare-executed scripts must carry the bit. Assert it on the host, per host — a hash match
 # says nothing about mode, and this is the check the fleet-wide restore outage would have failed.
-for f in launch-vm.sh stop-vm.sh; do
-  chmod 0755 "/home/ubuntu/$f"
-  test -x "/home/ubuntu/$f" || { echo "FATAL $f is not executable: restore would return rc=126"; exit 1; }
-  stat -c '%a %n' "/home/ubuntu/$f"    # must print 755
+for t in /home/ubuntu/launch-vm.sh /home/ubuntu/stop-vm.sh; do
+  chmod 0755 "$t"
+  test -x "$t" || { echo "FATAL $t is not executable: restore would return rc=126"; exit 1; }
+  stat -c '%a %n' "$t"                 # must print 755
 done
-systemctl restart host-agent            # or the unit name this host actually uses
-systemctl is-active host-agent          # must print active
+# Resolve the unit from the host, do not assume it. An empty MainPID means the name is wrong, and
+# every journal check after that would match nothing and look clean.
+UNIT=host-agent.service
+systemctl show -p FragmentPath -p ExecStart --value "$UNIT" || { echo "FATAL unit $UNIT not found"; exit 1; }
+systemctl restart "$UNIT"
+systemctl is-active "$UNIT"             # must print active
+pid=$(systemctl show -p MainPID --value "$UNIT")
+test "${pid:-0}" -gt 0 || { echo "FATAL no MainPID for $UNIT — the unit name is wrong, not the service"; exit 1; }
 # prove the RUNNING process is the new code, not just that the file on disk changed:
-pid=$(systemctl show -p MainPID --value host-agent)
-sha256sum "/proc/$pid/cwd/host-agent.py" 2>/dev/null || \
-  ls -l "/proc/$pid/exe" "/proc/$pid/cmdline"
-journalctl -u host-agent --since '-2 min' --no-pager | tail -20   # no import error, no crash loop
+tr '\0' ' ' < "/proc/$pid/cmdline"; echo
+sha256sum /opt/openclaw/host-agent.py
+journalctl -u "$UNIT" --since '-2 min' --no-pager | tail -20   # no import error, no crash loop
 ```
 
 If `is-active` is not `active`, or the log shows a restart loop, roll that host back from its own
@@ -586,8 +616,136 @@ version list to its pre-apply length.
 
 ## Step 3 — Fix the future-machine source
 
-Upload each replaced host script to a temporary key, verify it, promote it into
-`deployment/scripts/`, and keep the previous S3 version id for rollback.
+Step 2 fixed the machines that are running. This step fixes what a machine launched *tomorrow*
+downloads. They are separate channels and doing only the first leaves the fleet split: on a real
+apply, 21 hot-fixed hosts ran the new `host-agent.py` while `deployment/scripts/host-agent.py` still
+held the pre-patch bytes, so the next replacement host booted the old code and nothing reported a
+failure.
+
+### Step 3a — The host runtime scripts in `deployment/scripts/`
+
+`init-host.sh` downloads these at boot from `s3://$ASSETS_BUCKET/deployment/scripts/`. This kit
+replaces seven of them. There is no `apply-resource-ops.sh` operation for this prefix, so the
+commands are here, and they carry the same anchor discipline the operations use: record the version
+that is live *before* overwriting it, or a rollback has nothing to return to.
+
+**Prerequisite — versioning.** Without it the pre-write bytes are unrecoverable, so this refuses to
+run rather than take an unrollbackable write:
+
+```bash
+aws s3api get-bucket-versioning --bucket "$ASSETS_BUCKET" --region "$AWS_REGION" \
+  --query Status --output text     # must print Enabled
+```
+
+**The seven objects and their kit artifacts.** Verify each artifact against `manifest.json`
+`patch_sha256` first — uploading an artifact you have not hashed is how a mis-packaged kit reaches a
+fleet:
+
+| `deployment/scripts/` key | kit artifact |
+| --- | --- |
+| `host-agent.py` | `host-scripts/host-agent.py.patched` |
+| `launch-vm.sh` | `host-scripts/launch-vm.sh.patched` |
+| `stop-vm.sh` | `host-scripts/stop-vm.sh.patched` |
+| `lib/harden-config.sh` | `host-scripts/lib/harden-config.sh.patched` |
+| `lib/cred-inject.sh` | `host-scripts/lib/cred-inject.sh` |
+| `route_ops.py` | `host-scripts/route_ops.py` |
+| `oc-egress-sim.py` | `host-scripts/oc-egress-sim.py` |
+
+```bash
+set -o pipefail
+test -n "$ASSETS_BUCKET" && test -n "$AWS_REGION" || { echo "FATAL set ASSETS_BUCKET and AWS_REGION"; exit 1; }
+mkdir -p ./step3a
+: > ./step3a/anchors.tsv
+
+promote() {   # promote <key> <local artifact>
+  local key="$1" src="$2"
+  test -f "$src" || { echo "FATAL missing artifact $src"; return 1; }
+
+  # 1. the anchor, BEFORE any write. ABSENT is a legitimate anchor (rollback = delete).
+  local prev
+  prev="$(aws s3api head-object --bucket "$ASSETS_BUCKET" --key "deployment/scripts/$key" \
+            --region "$AWS_REGION" --query VersionId --output text 2>/dev/null || echo ABSENT)"
+  test -n "$prev" || { echo "FATAL empty VersionId for $key — refusing to write blind"; return 1; }
+  printf '%s\t%s\n' "$key" "$prev" >> ./step3a/anchors.tsv
+
+  # 2. is it already current? Then skip it — this makes a re-run of the whole kit a no-op.
+  local want live
+  want="$(sha256sum "$src" | cut -d' ' -f1)"
+  live="$(aws s3api get-object --bucket "$ASSETS_BUCKET" --key "deployment/scripts/$key" \
+            --region "$AWS_REGION" /dev/stdout 2>/dev/null | sha256sum | cut -d' ' -f1)"
+  if [ "$live" = "$want" ]; then echo "skip  $key already at $want"; return 0; fi
+
+  # 3. stage to a temp key and prove the upload arrived intact before touching the real key.
+  aws s3 cp "$src" "s3://$ASSETS_BUCKET/deployment/scripts/.staging/$key" \
+    --region "$AWS_REGION" --only-show-errors
+  local staged
+  staged="$(aws s3api get-object --bucket "$ASSETS_BUCKET" \
+              --key "deployment/scripts/.staging/$key" --region "$AWS_REGION" /dev/stdout \
+            | sha256sum | cut -d' ' -f1)"
+  test "$staged" = "$want" || { echo "FATAL staged copy of $key hashes $staged, want $want"; return 1; }
+
+  # 4. promote, then read the REAL key back. A copy that reported success is not a copy that landed.
+  aws s3api copy-object --bucket "$ASSETS_BUCKET" --key "deployment/scripts/$key" \
+    --copy-source "$ASSETS_BUCKET/deployment/scripts/.staging/$key" \
+    --region "$AWS_REGION" --output text --query CopyObjectResult.ETag > /dev/null
+  local after
+  after="$(aws s3api get-object --bucket "$ASSETS_BUCKET" --key "deployment/scripts/$key" \
+             --region "$AWS_REGION" /dev/stdout | sha256sum | cut -d' ' -f1)"
+  test "$after" = "$want" || { echo "FATAL $key reads back $after, want $want"; return 1; }
+  echo "ok    $key -> $want (rollback anchor $prev)"
+}
+
+promote host-agent.py            host-scripts/host-agent.py.patched
+promote launch-vm.sh             host-scripts/launch-vm.sh.patched
+promote stop-vm.sh               host-scripts/stop-vm.sh.patched
+promote lib/harden-config.sh     host-scripts/lib/harden-config.sh.patched
+promote lib/cred-inject.sh       host-scripts/lib/cred-inject.sh
+promote route_ops.py             host-scripts/route_ops.py
+promote oc-egress-sim.py         host-scripts/oc-egress-sim.py
+
+aws s3 rm "s3://$ASSETS_BUCKET/deployment/scripts/.staging/" --recursive \
+  --region "$AWS_REGION" --only-show-errors
+cat ./step3a/anchors.tsv
+```
+
+**The executable bit is not part of this step, and that is correct.** S3 stores no unix mode, so the
+bit cannot travel with the object. `init-host.sh:857` and `:869` `chmod +x` `launch-vm.sh` and
+`stop-vm.sh` after downloading them, and `:866` does the same for `lib/harden-config.sh` and
+`lib/cred-inject.sh` — a future host sets its own modes. The manual `chmod 0755` in Step 2b exists
+only because hot-copying onto a *running* host bypasses that code path.
+
+**Verify — as a new machine, not as a bucket read.** Reading the key back proves the upload; it does
+not prove a booting host consumes it. Launch one replacement host and check it against a sibling:
+
+```bash
+# On a NEWLY launched host (after it registers in openclaw-hosts):
+sha256sum /opt/openclaw/host-agent.py /home/ubuntu/launch-vm.sh /home/ubuntu/stop-vm.sh \
+          /home/ubuntu/lib/harden-config.sh /home/ubuntu/lib/cred-inject.sh \
+          /opt/openclaw/route_ops.py
+# Every value must equal this kit's patch_sha256 for that path AND equal what a Step-2b host reports.
+# A difference between a new host and a hot-fixed host is this step having silently not taken effect.
+```
+
+**Rollback.** Per key, restore the exact version recorded in `./step3a/anchors.tsv`:
+
+```bash
+while IFS=$'\t' read -r key prev; do
+  if [ "$prev" = "ABSENT" ]; then
+    aws s3api delete-object --bucket "$ASSETS_BUCKET" --key "deployment/scripts/$key" \
+      --region "$AWS_REGION"
+  else
+    aws s3api copy-object --bucket "$ASSETS_BUCKET" --key "deployment/scripts/$key" \
+      --copy-source "$ASSETS_BUCKET/deployment/scripts/$key?versionId=$prev" \
+      --region "$AWS_REGION" --output text --query CopyObjectResult.ETag > /dev/null
+  fi
+  echo "restored $key to $prev"
+done < ./step3a/anchors.tsv
+```
+
+Rolling this back alone re-splits the fleet in the other direction: future hosts return to the old
+code while the Step 2b hosts keep the new. Roll Step 2b back too, or accept the split knowingly.
+
+### Step 3c — The edge Launch Template
 
 The **edge Launch Template** is `MANUAL_CLI_REVIEW`. A new LT version alone does not update the
 running ASG: it pins a specific version and only new instances use a new one. `pull` is what

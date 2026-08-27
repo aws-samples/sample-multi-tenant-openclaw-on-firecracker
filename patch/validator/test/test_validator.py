@@ -4,13 +4,16 @@ import io
 import json
 import re
 import sys
+import pathlib
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from checks import CHECKS  # noqa: E402
+from checks import CHECKS
+from checks.kitproof import check_d8, check_d9
+from lib.context import normalize_manifest  # noqa: E402
 from lib import awsread  # noqa: E402
 SCRIPT_BYTES = b"#!/bin/sh\nprintf ok\n"
 SCRIPT_HASH = hashlib.sha256(SCRIPT_BYTES).hexdigest()
@@ -442,6 +445,178 @@ for _check_id, _mutant_name in MUTANTS:
     setattr(ValidatorTests, "test_" + _check_id.lower(), _case(_check_id, False))
     setattr(ValidatorTests, "test_%s_mutant_%s" %
             (_check_id.lower(), _mutant_name), _case(_check_id, True))
+
+
+class _TinyCtx:
+    """The smallest context D8/D9 read: a repo, a kit payload, a manifest, an injected observation."""
+
+    def __init__(self, root, manifest=None, env=None, offline=True):
+        self.repo = pathlib.Path(root)
+        self.kit = self.repo / "kit"
+        self.offline = offline
+        self.manifest = manifest or {"paths": {}}
+        self.env = env or {}
+        self.aws = StubAws()
+
+    def get(self, dotted, default=None):
+        node = self.env
+        for part in dotted.split("."):
+            if not isinstance(node, dict) or part not in node:
+                return default
+            node = node[part]
+        return node
+
+    def manifest_entries(self):
+        return normalize_manifest(self.manifest)
+
+
+def _write(path, body=""):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body)
+
+
+class DanglingReferenceTests(unittest.TestCase):
+    """D8 — a companion a shipped file names must itself be shipped."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        # A repository that HAS the companions. A reference the repository cannot satisfy is a
+        # machine-provided file, not a packaging miss, so the repository copy is what makes the
+        # reference actionable.
+        for role in ("host", "edge"):
+            _write(self.root / "deploy/edge/fluent-bit" / role / "add_timestamp.lua", "-- filter\n")
+            _write(self.root / "deploy/edge/fluent-bit" / role / "parsers.conf", "[PARSER]\n")
+        _write(self.root / "deploy/userdata/route_ops.py", "PORT_RANGE_LOW = 1\n")
+        _write(self.root / "deploy/userdata/host-agent.service", "[Unit]\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _kit(self, *, host_filter=True, edge_filter=True, route_ops=True):
+        kit = self.root / "kit"
+        # The host conf names its filter bare; the edge conf names the runtime path. Both shapes are
+        # real and they resolve differently, which is why both are here.
+        _write(kit / "host-scripts/edge/fluent-bit/host/fluent-bit.conf",
+               "[FILTER]\n    Name lua\n    script add_timestamp.lua\n"
+               "    Parsers_File parsers.conf\n")
+        _write(kit / "host-scripts/edge/fluent-bit/edge/fluent-bit.conf",
+               "[FILTER]\n    Name lua\n    script /etc/fluent-bit/add_timestamp.lua\n"
+               "    Parsers_File /etc/fluent-bit/parsers.conf\n")
+        for role, present in (("host", host_filter), ("edge", edge_filter)):
+            _write(kit / "host-scripts/edge/fluent-bit" / role / "parsers.conf", "[PARSER]\n")
+            if present:
+                _write(kit / "host-scripts/edge/fluent-bit" / role / "add_timestamp.lua", "-- f\n")
+        _write(kit / "host-scripts/host-agent.py.patched",
+               "import os\nimport json\nimport route_ops\n")
+        if route_ops:
+            _write(kit / "host-scripts/route_ops.py", "PORT_RANGE_LOW = 1\n")
+        return kit
+
+    def _run(self, **kwargs):
+        self._kit(**kwargs)
+        return check_d8(_TinyCtx(self.root))
+
+    def test_complete_payload_passes(self):
+        row = self._run()
+        self.assertEqual(row.verdict, "PASS")
+        self.assertEqual(row.readings["dangling"], {})
+
+    def test_missing_bare_named_filter_fails(self):
+        row = self._run(host_filter=False)
+        self.assertEqual(row.verdict, "FAIL")
+        self.assertIn("add_timestamp.lua", row.readings["dangling"])
+
+    def test_missing_absolute_named_filter_fails(self):
+        # The mutant that survived two revisions: the edge conf names /etc/fluent-bit/…, and matching
+        # the basename anywhere let the HOST copy answer for the missing edge one.
+        row = self._run(edge_filter=False)
+        self.assertEqual(row.verdict, "FAIL")
+        self.assertTrue([k for k in row.readings["dangling"] if "add_timestamp.lua" in k])
+
+    def test_missing_imported_module_fails(self):
+        row = self._run(route_ops=False)
+        self.assertEqual(row.verdict, "FAIL")
+        self.assertIn("route_ops.py", row.readings["dangling"])
+
+    def test_stdlib_imports_are_not_companions(self):
+        row = self._run()
+        self.assertEqual(row.verdict, "PASS")   # `import os` / `import json` must not be reported
+
+    def test_unit_dependency_name_is_not_a_missing_file(self):
+        # `After=…host-agent.service` is a unit systemd resolves itself. Reporting it made a correct
+        # payload read as broken, and a check that cries wolf gets switched off.
+        kit = self._kit()
+        _write(kit / "launch-template/init-host.sh.patched",
+               "cat > /etc/systemd/system/x.service <<EOF\n"
+               "After=network.target host-agent.service\nEOF\n"
+               "systemctl is-active host-agent.service\n")
+        row = check_d8(_TinyCtx(self.root))
+        self.assertEqual(row.verdict, "PASS")
+
+    def test_self_fetched_companion_need_not_be_co_located(self):
+        # init-host.sh downloads the unit into /opt/openclaw/spire-kit/, so the payload mirrors the
+        # delivery layout, not the referencing file's directory.
+        kit = self._kit()
+        _write(self.root / "deploy/userdata/spire-kit/spire-join-broker.service", "[Unit]\n")
+        _write(kit / "launch-template/init-host.sh.patched",
+               'for _f in install.sh spire-join-broker.service; do\n'
+               '  aws s3 cp s3://$B/deployment/scripts/spire-kit/${_f} $D/${_f}\n'
+               'done\n')
+        _write(kit / "host-scripts/spire-kit/spire-join-broker.service", "[Unit]\n")
+        row = check_d8(_TinyCtx(self.root))
+        self.assertEqual(row.verdict, "PASS")
+        kit_unit = kit / "host-scripts/spire-kit/spire-join-broker.service"
+        kit_unit.unlink()
+        self.assertEqual(check_d8(_TinyCtx(self.root)).verdict, "FAIL")
+
+
+class FutureMachineSourceTests(unittest.TestCase):
+    """D9 — what a new machine downloads must match what the running machines were fixed to."""
+
+    KEY = "deployment/scripts/host-agent.py"
+    WANT = "a" * 64
+    OLD = "b" * 64
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        _write(self.root / "deploy/userdata/init-host.sh",
+               "aws s3 cp s3://$B/deployment/scripts/host-agent.py /opt/openclaw/host-agent.py\n")
+        _write(self.root / "setup.sh",
+               "aws s3 cp x s3://$B/deployment/scripts/oc-egress-sim.py\n")
+        self.manifest = {"paths": {
+            "deploy/userdata/host-agent.py": {"artifact": "host-agent.py.patched",
+                                              "patch_sha256": self.WANT},
+        }}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, live=None):
+        env = {"live_files": live} if live is not None else {}
+        return check_d9(_TinyCtx(self.root, manifest=self.manifest, env=env))
+
+    def test_matching_object_passes(self):
+        self.assertEqual(self._run({self.KEY: self.WANT}).verdict, "PASS")
+
+    def test_stale_object_fails(self):
+        # The real shape: 21 hosts hot-fixed, the prefix a new host reads still at pre-patch bytes.
+        row = self._run({self.KEY: self.OLD})
+        self.assertEqual(row.verdict, "FAIL")
+        self.assertEqual(row.readings["stale"], [self.KEY])
+
+    def test_no_observation_refuses_rather_than_passes(self):
+        self.assertEqual(self._run().verdict, "INCONCLUSIVE")
+
+    def test_discovery_reads_setup_sh_too(self):
+        # Reading only init-host.sh silently shrank the check by one object. A check that covers less
+        # than the step it guards is the failure this group exists to catch.
+        self.manifest["paths"]["deploy/userdata/oc-egress-sim.py"] = {
+            "artifact": "oc-egress-sim.py", "patch_sha256": self.WANT}
+        row = self._run({self.KEY: self.WANT,
+                         "deployment/scripts/oc-egress-sim.py": self.WANT})
+        self.assertEqual(row.readings["inspected"], 2)
 
 
 if __name__ == "__main__":

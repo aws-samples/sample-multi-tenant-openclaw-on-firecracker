@@ -1,0 +1,230 @@
+{
+  "id": "egress-207-patch",
+  "base_sha": "a57a292a1edc8a91b24a2a906baeac4c255429bf",
+  "patch_sha": "d5f0d0e42008449080d0c7db417d9b0a6f073d9c",
+  "status": "READY",
+  "excludes": [],
+  "cloudformation": {
+    "status": "NOT_APPLICABLE",
+    "reason": "no CDK source path changed in this diff",
+    "provenance": null,
+    "stacks": []
+  },
+  "kit_files": {
+    "lib/apply-egress-207.sh": {
+      "sha256": "721ccd80e1377de035562244fbd629ab7d329c07fdb9069b201b2d0475da4f5d"
+    },
+    "lib/apply_egress_207.py": {
+      "sha256": "d85906cf0cde891c76d138e433c584287b6c1db9c8a383e3e09eb130595befb8"
+    },
+    "lib/selftest_egress_207.py": {
+      "sha256": "94b0892cf0697f612ea2b3f1b3c57aa35c6a2060b36bb44648bc234598c94e42"
+    }
+  },
+  "paths": {
+    "deploy/edge/test/integration/balancer_phase_integration.sh": {
+      "change": "M",
+      "layer": "deploy-other",
+      "artifact": "host-scripts/edge/test/integration/balancer_phase_integration.sh",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "4712792ad15bc16974b8479e9c33d44541c82c1694a731ec1b64e8be1ef88d0e",
+      "patch_sha256": "37a68079676aa3559c99f24c9a50eea134cc77233e06a9a01183577fa6404f6d",
+      "operations": [
+        {
+          "resource": "the edge bundle object in S3 under the prefix the edge ASG's launch template serves",
+          "class": "AUTO_CLI",
+          "apply_cli": "OC_RUN_ID=\"$OC_RUN_ID\" ASSETS_BUCKET=\"$ASSETS_BUCKET\" EDGE_ASG=\"$EDGE_ASG\" bash lib/apply-egress-207.sh edge-bundle apply \"$AWS_REGION\"",
+          "verify_cli": "OC_RUN_ID=\"$OC_RUN_ID\" ASSETS_BUCKET=\"$ASSETS_BUCKET\" EDGE_ASG=\"$EDGE_ASG\" bash lib/apply-egress-207.sh edge-bundle verify \"$AWS_REGION\"",
+          "rollback_cli": "OC_RUN_ID=\"$OC_RUN_ID\" ASSETS_BUCKET=\"$ASSETS_BUCKET\" EDGE_ASG=\"$EDGE_ASG\" bash lib/apply-egress-207.sh edge-bundle rollback \"$AWS_REGION\"",
+          "artifact_refs": [
+            "lib/apply-egress-207.sh",
+            "lib/apply_egress_207.py"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": [],
+          "blast_radius": "LIVE_FLEET"
+        }
+      ],
+      "fix_ids": [
+        "f-658-placeholder-gate-deterministic"
+      ]
+    },
+    "deploy/lambda/api/services/egress_admin_service.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/services/egress_admin_service.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "8c45cb9f456fa0f4aedc647c49e8f2d4f01d9a1135501fe39736e90176b17385",
+      "patch_sha256": "526f7493b707ff5573063b5c083c518f01147466e4ee44e438b216f60a4e1be7",
+      "operations": [
+        {
+          "resource": "openclaw-api (Lambda function, $LATEST + the alias the API invokes)",
+          "class": "AUTO_CLI",
+          "apply_cli": "OC_RUN_ID=\"$OC_RUN_ID\" OPENCLAW_API_FN=\"$OPENCLAW_API_FN\" OPENCLAW_API_ALIAS=\"$OPENCLAW_API_ALIAS\" BACKUP_S3_BUCKET=\"$BACKUP_S3_BUCKET\" BACKUP_S3_KEY=\"$BACKUP_S3_KEY\" bash lib/apply-egress-207.sh lambda-api-code apply \"$AWS_REGION\"",
+          "verify_cli": "OC_RUN_ID=\"$OC_RUN_ID\" OPENCLAW_API_FN=\"$OPENCLAW_API_FN\" bash lib/apply-egress-207.sh lambda-api-code verify \"$AWS_REGION\"",
+          "rollback_cli": "OC_RUN_ID=\"$OC_RUN_ID\" OPENCLAW_API_FN=\"$OPENCLAW_API_FN\" OPENCLAW_API_ALIAS=\"$OPENCLAW_API_ALIAS\" bash lib/apply-egress-207.sh lambda-api-code rollback \"$AWS_REGION\"",
+          "artifact_refs": [
+            "lib/apply-egress-207.sh",
+            "lib/apply_egress_207.py"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": [],
+          "blast_radius": "LIVE_FLEET"
+        }
+      ],
+      "fix_ids": [
+        "f-657-partial-reclaim-207"
+      ]
+    },
+    "docs/aws-guide/openapi.yaml": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "b0b6fb8eb0f3d53ff25853801e2ff96b45f4bddcacea2ab125fb5e952755bf1d",
+      "patch_sha256": "0179ac980c2951b81fa2969fcb88c5f99d53d1181524eb4f81bafa55a3447598",
+      "operations": [
+        {
+          "resource": "doc:docs/aws-guide/openapi.yaml",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git log -1 --format=%H -- docs/aws-guide/openapi.yaml",
+          "rollback_cli": "git checkout -- docs/aws-guide/openapi.yaml",
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "f-657-partial-reclaim-207"
+      ]
+    },
+    "patch/manifest-2026-08-27-052845-d681b0a0.json": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "71b58797163f8b30afc942df2b1e170f9a29d4a41e32bbb6cce780839517e154",
+      "operations": [
+        {
+          "resource": "doc:patch/manifest-2026-08-27-052845-d681b0a0.json",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git log -1 --format=%H -- patch/manifest-2026-08-27-052845-d681b0a0.json",
+          "rollback_cli": "git checkout -- patch/manifest-2026-08-27-052845-d681b0a0.json",
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    },
+    "patch/push-marker-2026-08-27-052845-d681b0a0.md": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "21ec5922b60003b21cbc1764f5e02771b62ce60d0a75915b41fac2c2f7e9d468",
+      "operations": [
+        {
+          "resource": "doc:patch/push-marker-2026-08-27-052845-d681b0a0.md",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git log -1 --format=%H -- patch/push-marker-2026-08-27-052845-d681b0a0.md",
+          "rollback_cli": "git checkout -- patch/push-marker-2026-08-27-052845-d681b0a0.md",
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": []
+    }
+  },
+  "fixes": [
+    {
+      "id": "f-657-partial-reclaim-207",
+      "summary": "POST /hosts/egress with wait=true answered 200 and ok=true even when the reclaim had not completed on every targeted host, so a caller could not distinguish a complete convergence from a partial one — and the verdict did not come from the same place the rollback path used, so the two could disagree about the same fleet. A partial collection now answers 207 with expected_host_count, missing_hosts and collection_incomplete, and the message carries a WARNING naming how many hosts returned no invocation inside the timeout. The all-hosts form deliberately reports counts WITHOUT a difference set: its DynamoDB enumeration is a snapshot that can include terminated or unmanaged machines and can miss a newly registered one the tag fan-out reaches, so a difference set there would manufacture a permanent 207.",
+      "paths": [
+        "deploy/lambda/api/services/egress_admin_service.py",
+        "docs/aws-guide/openapi.yaml"
+      ],
+      "applies_when": "the deployed openclaw-api package's services/egress_admin_service.py does not hash to this kit's copy. Read the package back and compare — a response-shape probe cannot tell an unapplied function from one whose reclaim happened to be complete.",
+      "params_changed": [],
+      "verification_ids": [
+        "v-657-partial-reclaim-207",
+        "v-657-complete-reclaim-still-200"
+      ]
+    },
+    {
+      "id": "f-658-placeholder-gate-deterministic",
+      "summary": "The edge gate's init_by_lua_block placeholder check was flaky: the same nginx.conf was graded 3/4 and 4/4 across four bb jobs on 2026-08-26, so it could both block an unrelated change and pass when it should have failed. Two causes, both removed: the `awk window | grep -qF` pipeline raced under `set -o pipefail` (grep exits on the first match, awk's next write gets EPIPE and dies non-zero, pipefail fails the whole pipeline and the `&&` skips the count), and the block boundary was guessed from a four-space closing brace, which a nested Lua table closes early. It is now one awk process with brace-pair counting, with three self-checking arms pinning repeatability, block awareness, and that a genuinely missing placeholder still fails.",
+      "paths": [
+        "deploy/edge/test/integration/balancer_phase_integration.sh"
+      ],
+      "applies_when": "the object under the served edge bundle prefix does not hash to this kit's copy. This file is read only when the integration suite runs, never on a request path, so there is no running-process state to reconcile.",
+      "params_changed": [],
+      "verification_ids": [
+        "v-658-gate-is-repeatable",
+        "v-658-bundle-object-matches"
+      ]
+    }
+  ],
+  "verifications": [
+    {
+      "id": "v-657-partial-reclaim-207",
+      "fix_id": "f-657-partial-reclaim-207",
+      "phase": "B-lifecycle",
+      "action": "set -o pipefail\n# EGRESS_TARGET must be an instance carrying BOTH tags the function's SendCommand grant requires:\n# Project=openclaw and Role=metal-host. Anything else returns 502 AccessDenied before this branch runs.\n: \"${EGRESS_TARGET:?set EGRESS_TARGET to a metal-host instance id (tags Project=openclaw, Role=metal-host)}\"\n: \"${OPENCLAW_API_FN:?}\"\nD=$(mktemp -d)\n# The handler accepts an API Gateway proxy v1 event; a rawPath/requestContext.http payload is refused\n# with UNSUPPORTED_EVENT_SHAPE (which is itself proof the function is alive).\npython3 - \"$EGRESS_TARGET\" > \"$D/payload.json\" <<'PY'\nimport json, sys\nprint(json.dumps({\n    \"httpMethod\": \"POST\", \"resource\": \"/hosts/egress\", \"path\": \"/hosts/egress\",\n    \"headers\": {\"content-type\": \"application/json\"},\n    \"requestContext\": {\"identity\": {\"sourceIp\": \"127.0.0.1\"}, \"requestId\": \"oc-v657\"},\n    \"body\": json.dumps({\"mode\": \"off\", \"targets\": [sys.argv[1]], \"wait\": True}),\n}))\nPY\n# --cli-read-timeout 0: with wait=true the handler polls for EGRESS_APPLY_TIMEOUT seconds (default\n# 90), which exceeds the CLI's 60s default and would otherwise fail as a read timeout that looks\n# like a broken function.\nERR=$(aws lambda invoke --function-name \"$OPENCLAW_API_FN\" --region \"$AWS_REGION\" \\\n  --cli-read-timeout 0 --cli-connect-timeout 10 \\\n  --cli-binary-format raw-in-base64-out --payload \"file://$D/payload.json\" \\\n  \"$D/resp.json\" --query FunctionError --output text)\ntest \"$ERR\" = \"None\" || { echo \"FAIL: invoke reported FunctionError=$ERR\"; exit 1; }\npython3 - \"$D/resp.json\" <<'PY'\nimport json, sys\nr = json.load(open(sys.argv[1]))\ncode = r.get(\"statusCode\")\ntry:\n    b = json.loads(r.get(\"body\") or \"{}\")\nexcept Exception:\n    b = {}\nmsg = str(b.get(\"message\") or \"\")\nprint(\"statusCode=\", code, \"ok=\", b.get(\"ok\"),\n      \"expected_host_count=\", b.get(\"expected_host_count\"),\n      \"collection_incomplete=\", b.get(\"collection_incomplete\"),\n      \"missing_hosts=\", b.get(\"missing_hosts\"))\nprint(\"message=\", msg[:200])\nbad = []\nif code == 502:\n    bad.append(f\"502 — the request never reached the branch under test: {b.get('error')}\")\nelif code == 400:\n    bad.append(f\"400 — the payload was refused: {b.get('error')}\")\nelse:\n    # The three fields are what this fix adds. They must be PRESENT, whatever the collection outcome\n    # of this particular run was. Asserting a specific statusCode transition would be wrong: the\n    # pre-fix code already answered 207 when the command itself failed.\n    for k in (\"expected_host_count\", \"collection_incomplete\", \"missing_hosts\"):\n        if k not in b:\n            bad.append(f\"the response does not carry {k}; this operation is NOT applied\")\n    if b.get(\"expected_host_count\") != 1:\n        bad.append(f\"expected_host_count is {b.get('expected_host_count')!r}, expected 1 for one target\")\n    # When the collection really was incomplete, the attribution must be complete too.\n    if b.get(\"collection_incomplete\") is True:\n        if code != 207:\n            bad.append(f\"collection_incomplete is True but statusCode is {code}, expected 207\")\n        if b.get(\"ok\") is not False:\n            bad.append(f\"ok is {b.get('ok')!r} on an incomplete collection, expected False\")\n        if not b.get(\"missing_hosts\"):\n            bad.append(\"collection_incomplete is True but missing_hosts is empty\")\n        if \"WARNING\" not in msg:\n            bad.append(\"collection_incomplete is True but the message carries no WARNING\")\n    else:\n        print(\"NOTE: the collection completed on this run, so the partial-reclaim attribution was \"\n              \"not exercised end to end. The three fields were still asserted present.\")\nif bad:\n    print(\"FAIL:\", \"; \".join(bad)); sys.exit(1)\nprint(\"PASS\")\nPY",
+      "observable": "the statusCode and body of POST /hosts/egress (API Gateway proxy v1 event, body {mode, targets, wait}) invoked with one metal-host target and wait=true",
+      "pass_when": "the response carries expected_host_count, collection_incomplete and missing_hosts, with expected_host_count equal to the number of targets. When collection_incomplete is True the statusCode must be 207, ok must be False, missing_hosts must name the hosts that did not answer, and the message must carry a WARNING.",
+      "fail_when": "any of the three fields is absent — that is what an unapplied function looks like — or collection_incomplete is True while the statusCode is not 207 or missing_hosts is empty. A 502 or 400 is also a failure of the check itself: the request never reached the branch, so it measured nothing. Note that asserting a 200->207 transition would be WRONG: the pre-fix code already answered 207 when the SSM command failed outright; what the fix adds is attribution.",
+      "timeout_s": 300
+    },
+    {
+      "id": "v-657-complete-reclaim-still-200",
+      "fix_id": "f-657-partial-reclaim-207",
+      "phase": "A-readonly",
+      "action": "set -o pipefail; python3 - <<'PY'\n# The all-hosts form must NOT gain a difference set: its DynamoDB enumeration is a\n# snapshot, so subtracting it from the collected set would make 207 permanent.\nimport re,sys\nsrc=open(\"lambda/api/services/egress_admin_service.py\").read()\nblk=src.split(\"hosts = _collect(command_id, timeout, expected_count=len(instance_ids))\")[1][:1200]\nbad=[]\nif \"if is_all:\" not in blk: bad.append(\"the is_all branch is gone\")\nseg=blk.split(\"if is_all:\")[1].split(\"else:\")[0]\nif \"missing_hosts = None\" not in seg: bad.append(\"is_all still computes a difference set\")\nif \"collection_incomplete = False\" not in seg: bad.append(\"is_all can report incomplete\")\nels=blk.split(\"else:\")[1][:400]\nif \"collected_ids\" not in els: bad.append(\"the explicit form no longer diffs\")\nif bad: print(\"FAIL:\", \"; \".join(bad)); sys.exit(1)\nprint(\"PASS: is_all reports counts only; the explicit form diffs\")\nPY",
+      "observable": "the branch in the shipped service that decides whether a difference set is computed",
+      "pass_when": "the all-hosts form sets missing_hosts to None and collection_incomplete to False, and only the explicit-instance form computes collected_ids",
+      "fail_when": "the all-hosts form computes a difference set, which would make 207 permanent on any fleet whose DynamoDB snapshot disagrees with the tag fan-out",
+      "timeout_s": 60
+    },
+    {
+      "id": "v-658-gate-is-repeatable",
+      "fix_id": "f-658-placeholder-gate-deterministic",
+      "phase": "A-readonly",
+      "action": "set -o pipefail; D=$(mktemp -d); printf '%s\\n' \"http {\" \"  init_by_lua_block {\" \\\n  \"    local t = { a = 1 }\" \\\n  \"    local h = \\\"\\${ENGINE_REDIS_HOST}\\\"\" \\\n  \"    local p = \\\"\\${ENGINE_REDIS_PORT}\\\"\" \\\n  \"    local rh = \\\"\\${ENGINE_REDIS_READER_HOST}\\\"\" \\\n  \"    local rp = \\\"\\${ENGINE_REDIS_READER_PORT}\\\"\" \\\n  \"  }\" \"}\" > \"$D/nginx.conf\"; sed -n '/^count_hint_placeholders()/,/^}/p' host-scripts/edge/test/integration/balancer_phase_integration.sh > \"$D/fn.sh\"; test -s \"$D/fn.sh\" || { echo \"FAIL: count_hint_placeholders() not found in the shipped script\"; exit 1; }; RES=\"\"; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do N=$(bash -c \"set -uo pipefail; . \\\"$D/fn.sh\\\"; count_hint_placeholders \\\"$D/nginx.conf\\\"\"); RES=\"$RES $N\"; done; echo \"20 runs:$RES\"; UNIQ=$(echo $RES | tr \" \" \"\\n\" | sort -u | tr \"\\n\" \",\"); test \"$UNIQ\" = \"4,\" || { echo \"FAIL: not repeatable or not 4/4 — distinct results: $UNIQ\"; exit 1; }; printf '%s\\n' \"http {\" \"  init_by_lua_block {\" \"    local t = { a = 1 }\" \"  }\" \"}\" > \"$D/none.conf\"; Z=$(bash -c \"set -uo pipefail; . \\\"$D/fn.sh\\\"; count_hint_placeholders \\\"$D/none.conf\\\"\"); test \"$Z\" = \"0\" || { echo \"FAIL: a conf with no placeholder graded $Z, expected 0\"; exit 1; }; printf '%s\\n' \"http {\" \"  # init_by_lua_block mentioned in a comment\" \\\n  \"  set \\$x \\\"\\${ENGINE_REDIS_HOST}\\\";\" \"}\" > \"$D/outside.conf\"; O=$(bash -c \"set -uo pipefail; . \\\"$D/fn.sh\\\"; count_hint_placeholders \\\"$D/outside.conf\\\"\"); test \"$O\" = \"0\" || { echo \"FAIL: a placeholder OUTSIDE the block graded $O, expected 0\"; exit 1; }; echo \"PASS: 20/20 identical at 4, 0 when absent, 0 when outside the block\"",
+      "observable": "count_hint_placeholders() from the shipped script, run 20 times on one input, plus one input with no placeholder and one where the placeholder sits outside the block",
+      "pass_when": "all 20 runs return the same value (4) on a conf whose block nests a Lua table, 0 when no placeholder is present, and 0 when the placeholder is outside the block",
+      "fail_when": "the 20 runs return more than one distinct value — the flakiness this fix removes — or the nested Lua table causes an undercount, or an out-of-block placeholder is counted",
+      "timeout_s": 120
+    },
+    {
+      "id": "v-658-bundle-object-matches",
+      "fix_id": "f-658-placeholder-gate-deterministic",
+      "phase": "A-readonly",
+      "action": "set -o pipefail; OC_RUN_ID=\"${OC_RUN_ID:?}\" ASSETS_BUCKET=\"${ASSETS_BUCKET:?}\" EDGE_ASG=\"${EDGE_ASG:?}\" bash lib/apply-egress-207.sh edge-bundle verify \"$AWS_REGION\"",
+      "observable": "the sha256 of the object under the edge bundle prefix the ASG's launch template actually serves, compared to the sha256 this kit's manifest records",
+      "pass_when": "the served object is byte-identical to this kit's copy",
+      "fail_when": "the object is absent, or hashes to anything else — including the previous version, which is what an unapplied kit looks like",
+      "timeout_s": 120
+    }
+  ]
+}

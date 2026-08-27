@@ -1,0 +1,52 @@
+{
+  "synced_at": "2026-08-27 08:51:41 UTC+08:00",
+  "base_sha": "3af2deedf289b0d4732e1f8ce1474a49eafeea1a",
+  "source_commit": "8f86347bc8f06b207c74107745717d2757b49588",
+  "commit_count": 26,
+  "file_count": 3,
+  "summary": "Sync the bb increment 3af2deed..8f86347b to the public gateway branch. Sync-LOG only (which customer-facing files reached gateway + the issues behind them); the applyable patch kit is NOT built yet (folded_into pending).",
+  "issues_synced_note": "Index back to the issue tracker for whoever builds the patch kit: before assembling the kit, walk each issue and confirm it's covered. `title` is a ≤20-char gist only — open the issue for the full problem/fix/test. Lists only issues that touched a released file this sync.",
+  "issues_synced": [
+    {
+      "id": "#657",
+      "type": "feat",
+      "title": "[BUG] POST /hosts/eg…"
+    },
+    {
+      "id": "#658",
+      "type": "fix",
+      "title": "[BUG] p2-edge-gate 的…"
+    }
+  ],
+  "needs_config_on_apply": "none detected (no config.yml key / systemd directive / DDB-TTL change in this sync)",
+  "updated_files": {
+    "docs": [
+      {
+        "path": "docs/aws-guide/openapi.yaml",
+        "status": "modified",
+        "issues": [
+          "#657"
+        ]
+      }
+    ],
+    "edge (OpenResty / Fluent Bit host config)": [
+      {
+        "path": "deploy/edge/test/integration/balancer_phase_integration.sh",
+        "status": "modified",
+        "issues": [
+          "#658"
+        ]
+      }
+    ],
+    "lambda (update-function-code only)": [
+      {
+        "path": "deploy/lambda/api/services/egress_admin_service.py",
+        "status": "modified",
+        "issues": [
+          "#657"
+        ]
+      }
+    ]
+  },
+  "folded_into": "(pending) — no patch kit built for this sync yet; a later kit should cite this manifest as source-of-record and set base_sha/patch_sha. cdk deploy is FORBIDDEN on hand-modified live deployments — the kit must ship *.patched host scripts + the full lambda tree + AWS CLI for stack changes, same shape as patch/315-concurrent-dispatch-rollup/."
+}

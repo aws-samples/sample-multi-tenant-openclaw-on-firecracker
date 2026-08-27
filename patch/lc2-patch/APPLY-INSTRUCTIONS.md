@@ -408,16 +408,27 @@ the effective decision by reading it back, and only then writes its receipt line
 is a deliberate no-op that exits 0 with an explanation — removing this grant re-blinds fleet
 convergence.
 
-**2b. Host scripts (layer B-s3).** Mode is **0644**, not 0755 — these run as
-`bash stop-vm.sh` / `python3 host-agent.py`, and they travel through S3, which carries no unix
-permission bit, so a `+x` set before upload is neither stored nor propagated.
+**2b. Host scripts (layer B-s3). The mode is not uniform, and getting it wrong took a fleet's
+restore path down.** The rule is **how the control plane invokes the file**, not what layer it is
+in. Two of these four are sent to `AWS-RunShellScript` as the **bare command path with no
+interpreter prefix**, so they need the executable bit; the other two are invoked through an
+explicit interpreter, which ignores it.
 
-| artifact | target |
-| --- | --- |
-| `host-scripts/host-agent.py.patched` | `/home/ubuntu/host-agent.py` |
-| `host-scripts/stop-vm.sh.patched` | `/home/ubuntu/stop-vm.sh` |
-| `host-scripts/launch-vm.sh.patched` | `/home/ubuntu/launch-vm.sh` |
-| `host-scripts/lib/harden-config.sh.patched` | `/home/ubuntu/lib/harden-config.sh` |
+| artifact | target | mode | why |
+| --- | --- | --- | --- |
+| `host-scripts/launch-vm.sh.patched` | `/home/ubuntu/launch-vm.sh` | **0755** | executed bare — `core/ssm_dispatch.py:71` and `:156` build the command as `f"/home/ubuntu/launch-vm.sh {tenant_id} …"`, and `services/tenant_service.py` does the same |
+| `host-scripts/stop-vm.sh.patched` | `/home/ubuntu/stop-vm.sh` | **0755** | executed bare from `services/dispatch_poller.py` |
+| `host-scripts/host-agent.py.patched` | `/home/ubuntu/host-agent.py` | 0644 | run as `python3 host-agent.py`; a long-lived service, restarted below |
+| `host-scripts/lib/harden-config.sh.patched` | `/home/ubuntu/lib/harden-config.sh` | 0644 | sourced / run as `bash lib/harden-config.sh` |
+
+**Why this matters more than it looks.** S3 carries no unix permission bit, so the mode is
+whatever the host-side install sets — the umask default is 0644. A previous run of a sibling kit
+installed `launch-vm.sh` at 0644 on a 15-host fleet: every file was in place, every sha256 matched
+the manifest, every assertion passed, and **every tenant restore failed** with
+`restore_fail_reason=host_unreachable`, because the SSM invocation came back `rc=126`
+`Permission denied`. Nothing in a hash check can see that. `init-host.sh` does `chmod +x` at boot,
+so a *replacement* host self-heals and a hot-patched host does not — which is why the check below
+is `test -x`, on the running host, rather than a comparison against the manifest.
 
 Copying the file is not applying it: `host-agent.py` runs as a long-lived service, so the old
 code stays resident until it restarts. `stop-vm.sh`, `launch-vm.sh` and `harden-config.sh` are
@@ -427,6 +438,13 @@ re-read per invocation and need no restart. Per host:
 set -o pipefail
 for f in host-agent.py stop-vm.sh launch-vm.sh lib/harden-config.sh; do
   sha256sum "/home/ubuntu/$f"          # compare each against the manifest patch_sha256
+done
+# The two bare-executed scripts must carry the bit. Assert it on the host, per host — a hash match
+# says nothing about mode, and this is the check the fleet-wide restore outage would have failed.
+for f in launch-vm.sh stop-vm.sh; do
+  chmod 0755 "/home/ubuntu/$f"
+  test -x "/home/ubuntu/$f" || { echo "FATAL $f is not executable: restore would return rc=126"; exit 1; }
+  stat -c '%a %n' "/home/ubuntu/$f"    # must print 755
 done
 systemctl restart host-agent            # or the unit name this host actually uses
 systemctl is-active host-agent          # must print active
@@ -919,3 +937,45 @@ done
 `keep_data=true` is the default and is a soft delete — the disk stays. Poll each id to `deleted`,
 then confirm over SSM that `/data/firecracker-vms/<exact-id>` is gone with no orphan Firecracker
 process. Confirm the real-tenant count is identical before and after.
+
+## Step 8 — The pre-launch validator, and it is the last thing you run
+
+`patch/validator/` is generic — it belongs to no kit, and every patch ends here. It answers a
+question none of the earlier steps can: **does the environment now actually match what this kit
+promised, and is there anything in the repository that is green everywhere and still broken?**
+
+It is read-only. It never invokes the function, never writes a parameter, never touches the fleet.
+The host readings it takes go through `AWS-RunShellScript` with `sha256sum` / `stat` /
+`systemctl is-active` / `journalctl` payloads only.
+
+```bash
+patch/validator/oc-prelaunch-validate \
+  --kit patch/lc2-patch \
+  --environment-json ./environment.json \
+  --region "$AWS_REGION" \
+  --target-vms 100000 \
+  --report "prelaunch-$OC_RUN_ID.json"
+```
+
+Exit codes are three-valued on purpose: `0` everything passed, `1` at least one FAIL, `2`
+INCONCLUSIVE with no FAIL. `2` is not a pass — it means a check could not see what it needed, and
+"could not see" and "saw something wrong" call for different next actions. Run it with `--offline`
+first if you have no credentials yet; that subset needs none.
+
+**Read the readings, not just the verdicts.** Every finding prints the values it actually observed.
+Three things to expect on a first run:
+
+- A `DIVERGED` env row is not automatically a defect. The baseline is the default declared in the
+  gateway source, and a deliberate tuning shows up as divergence. The tool states both values and
+  leaves the judgement to you.
+- `UNVERIFIED` on a mode or hash check usually means the live half was unreachable, not that the
+  declared half is wrong.
+- The known-false-red list in `patch/validator/README.md` exists so a red there does not trigger a
+  rollback. `apply-api-routes verify`'s CORS FATAL, `oc-consistency`'s handful of DRIFT rows, the
+  `{{ }}` gate matching a comment, and a `grep -c` that exits 1 on zero matches have each caused a
+  wasted round or a near-miss rollback before.
+
+What it caught on its own first run against this kit, which is the reason it exists: `launch-vm.sh`
+and `stop-vm.sh` are sent to `AWS-RunShellScript` as bare command paths, so they need mode 0755 —
+and this document previously told you to install every host script at 0644. Every hash matched,
+every assertion passed, and a fleet's tenant restore would have returned `rc=126`.

@@ -1,0 +1,65 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DispatchAndonRead",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParameter"
+      ],
+      "Resource": "arn:aws:ssm:__REGION__:__ACCOUNT_ID__:parameter__DISPATCH_PARAM_PREFIX__/config"
+    },
+    {
+      "Sid": "DispatchManifestPartsWrite",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:PutParameter",
+        "ssm:DeleteParameter"
+      ],
+      "Resource": "arn:aws:ssm:__REGION__:__ACCOUNT_ID__:parameter__DISPATCH_PARAM_PREFIX__/manifests/*"
+    },
+    {
+      "Sid": "DispatchManifestPartsEncrypt",
+      "Effect": "Allow",
+      "Action": [
+        "kms:Encrypt"
+      ],
+      "Resource": "__SSM_KMS_KEY_ARN__",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "ssm.__REGION__.amazonaws.com"
+        }
+      }
+    },
+    {
+      "Sid": "DeviceIdentityEnvelope",
+      "Effect": "Allow",
+      "Action": [
+        "kms:Encrypt",
+        "kms:Decrypt"
+      ],
+      "Resource": "__CLAWPOOL_CMK_ARN__"
+    },
+    {
+      "Sid": "AsymmetricV1PublicKeyRead",
+      "Effect": "Allow",
+      "Action": [
+        "kms:GetPublicKey"
+      ],
+      "Resource": "__CLAWPOOL_RSA_CMK_ARN__"
+    },
+    {
+      "Sid": "QueueDepthReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:GetQueueAttributes"
+      ],
+      "Resource": [
+        "__DISPATCH_QUEUE_ARN__",
+        "__DISPATCH_DLQ_ARN__",
+        "__LIFECYCLE_QUEUE_ARN__",
+        "__LIFECYCLE_DLQ_ARN__"
+      ]
+    }
+  ]
+}

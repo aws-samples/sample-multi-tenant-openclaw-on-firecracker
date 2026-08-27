@@ -84,6 +84,7 @@ def build_lambdas(self, ctx):
 
     # ========== Lambda Shared Policy ==========
     #
+    # Issue #62(档 B,人工评审):IAM 收窄。原来 SendCommand /
     # TerminateInstances / Describe* 全通配 resources=["*"],跟审计
     # baseline 冲突(WI-E/M-7)。收窄按爆炸半径切三块:
     #
@@ -185,6 +186,7 @@ def build_lambdas(self, ctx):
         for _st in ec2_policy_statements:
             fn.add_to_role_policy(_st)
 
+    # ========== SNS Lifecycle Notifications (issue #13, optional) ==========
     notif_cfg = CFG.get("notifications", {}) or {}
     notifications_topic = None
     notifications_topic_arn = ""
@@ -267,10 +269,12 @@ def build_lambdas(self, ctx):
             content_based_deduplication=True,
             retention_period=Duration.days(14),
         )
+        # #469 P6 —— lifecycle DLQ 的非空告警。
         #
         # 这个资源【此前不存在】,但 deploy/stacks/alarms.py 有三处注释声称它在本文件里
         # (`:7` / `:16-17` / `:182`),`:259` 还用 `self.node.try_find_child("LifecycleDlqAlarm")`
         # 去给它挂 SNS action —— 找不到就被 `isinstance` 检查静默跳过。于是 lifecycle
+        # consumer 重投 5 次进 DLQ 后【没有任何人知道】,只能等客户报障。issue #469 的评论
         # (2026-08-12)实查确认了这个缺口。
         #
         # construct id 必须【逐字】是 "LifecycleDlqAlarm"(不是 LifecycleDLQAlarm)——
@@ -346,7 +350,9 @@ def build_lambdas(self, ctx):
             # producer; content_based_deduplication=True is a safety net for
             # any future producer that forgets to pass one.
             content_based_deduplication=True,
+            # #411/6.4 — 可见性超时必须【严格大于】consumer Lambda timeout,否则 Lambda
             # 超时那一刻消息刚好重新可见、而远端 SSM 可能仍在跑 → 重投与在途操作叠加
+            # (codex round5#231)。#422 codex round2 #6 — consumer timeout 提到 900s(覆盖
             # suspend 同步 backup 900s 预算),visibility 同步提到 960s = 900s + 60s 余量
             # (沿用仓库 "timeout+60s" 惯例)。非重动作处理完即删,不受影响。
             visibility_timeout=Duration.seconds(960),
@@ -381,6 +387,7 @@ def build_lambdas(self, ctx):
         "HOST_RESERVED_MEM": str(CFG["host"]["reserved_mem_mb"]),
         "CPU_OVERCOMMIT_RATIO": str(CFG["host"].get("cpu_overcommit_ratio", 1.0)),
         "MEM_OVERCOMMIT_RATIO": str(CFG["host"].get("mem_overcommit_ratio", 1.0)),
+        # #430 异构混池 — per-family 超卖比覆盖(JSON)、四级亲和排序、物理内存软门。
         # 全部空/关默认 → 逐字节回落既有行为(回退开关,不需回滚代码)。
         "OVERCOMMIT_BY_FAMILY": _json.dumps(
             CFG["host"].get("overcommit_by_family") or {}, separators=(",", ":")
@@ -438,8 +445,10 @@ def build_lambdas(self, ctx):
     }
     if tenant_stats_enabled:
         _api_env["TENANT_STATS_TABLE"] = tenant_stats_table.table_name
+    # #368/#422 — api Lambda(及复用 _api_env 的 lifecycle consumer)恢复/备份列表读桶
     # (_resolve_backup / list_backups / list_all_backups)读 `BACKUP_BUCKET or ASSETS_BUCKET`;
     # 此前只有 backup Lambda 拿到 BACKUP_BUCKET(见 :1481),api Lambda 缺 → 永远回退 assets 桶
+    # → 恢复必 404、备份清单永远空(#368 RPO 兜底断裂)。备份写在 WORM+CMK 的专用桶,读也必须
     # 指向它。backup_bucket 可能未建(getattr None),判空 fail-safe(不建桶的部署不注入,读侧
     # 仍回退 assets,与旧行为一致)。IAM 读权限在下方 grant(:523 附近)。
     if backup_bucket is not None:
@@ -578,6 +587,7 @@ def build_lambdas(self, ctx):
                 ],
             ),
         ),
+        # #217 §10.3 — 900s(Lambda 硬上限 15min)让 pull-image 金丝雀同步链跑完:
         # 装 live(SSM 等)→ 起金丝雀 → poll 到 running → 晋级/回滚,需数分钟。APIGW
         # 集成 29s 会早早回 504,但 Lambda 后台跑完整链(浏览器靠 console 轮询看
         # upgrading→金丝雀→active)。timeout 是上限,普通请求仍秒回,不影响别的路由;
@@ -623,6 +633,7 @@ def build_lambdas(self, ctx):
         "PAGINATION_AES_KEY",
         pagination_secret.secret_value_from_json("key").unsafe_unwrap(),
     )
+    # ── Lambda Version + Alias "live" (#149) ──────────────────────────────
     # 目标拓扑: API GW → alias "live" → Version N
     # 每次部署自动发新 Version,alias "live" 始终指向最新。日后回滚只需
     # update-alias 指回旧 Version,无需 CodeDeploy。API GW 和 SQS event source
@@ -640,18 +651,24 @@ def build_lambdas(self, ctx):
     hosts_table.grant_read_write_data(api_fn)
     groups_table.grant_read_write_data(api_fn)
     version_snapshots_table.grant_read_data(api_fn)  # #217 V2 — pull-image 只读快照
+    # #376 — create_image_snapshot 落新快照:只加 PutItem(最小权限,不给 Delete/Update)。
     version_snapshots_table.grant(api_fn, "dynamodb:PutItem")
+    # #394 — delete_image_snapshot 是【软删】(status=deleted 标记),用 UpdateItem 打标而非
     # 物删,故加 UpdateItem。不给 DeleteItem(软删不物理删,记录留档可审计/可恢复)。
     version_snapshots_table.grant(api_fn, "dynamodb:UpdateItem")
+    # #394 step1 — pull Job 记录:api_fn 建/读/推进 Job(含两个 GSI 的 Query)。
     # 不给 DeleteItem:Job 记录由 TTL(expires_at)回收,控制面无删除路径。
     image_jobs_table.grant_read_write_data(api_fn)
+    # #394 — 两处 TransactWriteItems 都要显式授权(否则条件在测试里对、生产 AccessDenied):
     #  · Pull admission:snapshot ConditionCheck + Job Put(→ 每次 pull 都 JOB_RECORD_UNAVAILABLE);
     #  · codex NB2 canary 租户固定:snapshot ConditionCheck + tenant Put(→ canary 建租户 AccessDenied)。
     # 真机实测教训:除 TransactWriteItems 外还必须显式给 **ConditionCheckItem** —— 事务里的
     # ConditionCheck 项按【被检查表】单独鉴权,缺它报
     # "not authorized to perform: dynamodb:ConditionCheckItem on .../openclaw-version-snapshots"。
     # resources 覆盖三张表:version-snapshots(被 ConditionCheck)+ image-jobs + tenants(被 Put)。
+    # #412 — 新增 hosts 表:dispatch reserve(_reserve_batch_txn)+ 令牌释放(_release_reservation
     # / poller)都用 TransactWriteItems 原子写 hosts+tenants;grant_read_write_data 不含
+    # TransactWriteItems,漏加会运行时 AccessDenied(与上面 #394 同类坑,moto/mock 测不出)。
     api_fn.add_to_role_policy(iam.PolicyStatement(
         actions=["dynamodb:TransactWriteItems", "dynamodb:ConditionCheckItem"],
         resources=[
@@ -691,22 +708,27 @@ def build_lambdas(self, ctx):
             schedule=events.Schedule.rate(Duration.minutes(1)),
             targets=[targets.LambdaFunction(tenant_stats_fn)],
         )
+    # #152/#118 — the ClawPool credential-injection CMK ARN. Added ONLY when the
     # feature is on so synth stays byte-identical when off (no key on the env).
     # The API uses it as the real gate: it rejects injected_credentials whose
     # kms_key_arn != this ARN (and rejects any injection when this is empty).
     if clawpool_cmk is not None:
         api_fn.add_environment("CLAWPOOL_CMK_ARN", clawpool_cmk.key_arn)
+    # #149 asymmetric-v1 — api Lambda serves the RSA CMK PUBLIC key to callers via
     # GET /clawpool-rsa-public-key so they can locally OAEP-encrypt env creds. It
     # only needs GetPublicKey (never Decrypt — private key stays in KMS, host decrypts).
     if clawpool_rsa_cmk is not None:
         api_fn.add_environment("CLAWPOOL_RSA_CMK_ARN", clawpool_rsa_cmk.key_arn)
         clawpool_rsa_cmk.grant(api_fn, "kms:GetPublicKey")
+    # Issue #17 — api Lambda writes audits and reads them back via GET /audit-log
     audit_table.grant_read_write_data(api_fn)
     # PRD #54 — async batch jobs: read/write the job ledger, and self-invoke
     # asynchronously to run the worker (same function, routed by a marker in
     # the event payload — no separate Lambda to keep the blast radius small).
     batch_jobs_table.grant_read_write_data(api_fn)
+    # #97 档A — /tenantmatch only reads the IdP map (least privilege: read-only).
     tenant_idp_table.grant_read_data(api_fn)
+    # #187 P1 / #149 出站 — control-plane mints the per-tenant gateway token +
     # device identity ciphertext (SPEC/11-ENGINE-TRANSFORM · INTERFACE-CONTRACT §5).
     # Lambda needs:
     #   • r/w on the secrets table (put on mint, get on reveal, delete on cleanup);
@@ -720,10 +742,13 @@ def build_lambdas(self, ctx):
     #   • create/read the bootstrap recipient private-key secret (first-call
     #     keypair generation in ensure_bootstrap_key).
     # Host role separately has kms:Decrypt for the SSM position-12 injection path
+    # (unchanged, added with #118). The consumer Lambda below runs create only
     # (never GET /credentials), so it keeps encrypt-only.
     tenant_secrets_table.grant_read_write_data(api_fn)
     param_registry_table.grant_read_write_data(api_fn)
     recipient_keys_table.grant_read_write_data(api_fn)
+    # #264 — GET /admin/edge/instances(edge_admin.py:48 查 edge TG 健康)需要它;
+    # 原来 role 有一堆 #187 前遗留的 elbv2 写权却独缺这个读权,target_health 静默返 null
     # (edge_admin.py 注释自标 "P5 后追加 elbv2:DescribeTarget* IAM")。Describe 类不支持
     # 资源级 → Resource=*。
     api_fn.add_to_role_policy(
@@ -760,6 +785,7 @@ def build_lambdas(self, ctx):
                 resources=["*"],
             )
         )
+    # #149 出站 bootstrap — ensure_bootstrap_key 首调生成 recipient keypair,私钥
     # 存 Secrets Manager 固定名字(运维 get-secret-value 线下交调用方)。删除权
     # (purge_bootstrap_private_key)故意不给:强删是运维手动动作,不留给 API 面。
     api_fn.add_to_role_policy(
@@ -795,6 +821,7 @@ def build_lambdas(self, ctx):
         ],
     )
     assets_bucket.grant_read(api_fn)
+    # #368/#422 — api Lambda 读备份专用桶(恢复下载 restore_backup_key + 备份清单)。此前
     # 只 backup_bucket.grant_read_write(backup_fn)(:1492),api_fn 对 backups 桶零权限 →
     # 即使 BACKUP_BUCKET env 指对了,IAM 也拒读 → 恢复 404。grant_read 只读(恢复不写备份桶,
     # 写由 backup Lambda 负责);判空与 env 注入对称。
@@ -827,6 +854,7 @@ def build_lambdas(self, ctx):
             roles=[api_fn.role],
             statements=[
                 iam.PolicyStatement(
+                    # #264 — GetQueueAttributes: GET /system/queues(handler.py:757 读队列深度)
                     # 需要它;原来只有 SendMessage → 面板 depth 静默返 null(fail-soft 吞了 AccessDenied)。
                     actions=["sqs:SendMessage", "sqs:GetQueueAttributes"],
                     resources=[lifecycle_queue.queue_arn],
@@ -841,6 +869,7 @@ def build_lambdas(self, ctx):
         #
         # **落在这个 if 里面是刻意的**:本对账的前提是"删除走过异步队列、可能进 DLQ"。
         # 队列没开时 delete 同步跑完,不存在这个形态,建一条每 15 分钟空转的规则是纯浪费。
+        # 与 #438 的 CredentialReconcilerRule 形成对照 —— 那条建在 `DispatchInfra` 里,
         # 于是被 `dispatch.enabled`(出厂 false)门控,而它需要的其实只是 api Lambda 本身;
         # 这条只跟它真正依赖的开关绑定。
         #
@@ -896,6 +925,8 @@ def build_lambdas(self, ctx):
                     ],
                 ),
             ),
+            # #411/6.4 — consumer 必须活到能看完最慢的同步动作。
+            # #422 codex round2 #6 — suspend/restore 走 consumer 同步执行,最坏链路远超原
             # 360s:suspend 同步 RequestResponse invoke backup Lambda + stop-vm(30s)+
             # rm(30s);restore 同步 _ssm_run launch(300s)。360s 会把合法执行硬杀在中途、
             # 卡中间态(suspending/restoring)。队列 visibility(:232)同步提到 >900s 防重投叠加。
@@ -931,6 +962,7 @@ def build_lambdas(self, ctx):
         lifecycle_consumer.add_environment(
             "LIFECYCLE_QUEUE_URL", lifecycle_queue.queue_url
         )
+        # #152/#118 — consumer runs the SAME create_tenant handler (queue replay),
         # so it must see CLAWPOOL_CMK_ARN too or the queued-create path would
         # reject valid injections. Gated identically (only when feature on).
         if clawpool_cmk is not None:
@@ -941,18 +973,23 @@ def build_lambdas(self, ctx):
         groups_table.grant_read_write_data(lifecycle_consumer)
         audit_table.grant_read_write_data(lifecycle_consumer)
         batch_jobs_table.grant_read_write_data(lifecycle_consumer)
+        # #413 P1/P2 — rebuild attempts/results share the image-ops ledger.
         image_jobs_table.grant_read_write_data(lifecycle_consumer)
+        # #187 P1 — consumer replays create_tenant which now mints gateway token.
         # Same grants as api_fn (secrets table r/w + CMK encrypt + GenerateRandom).
         # **No kms:Decrypt** — API side never decrypts (INTERFACE-CONTRACT §5,
         # ciphertext is folded into GET responses verbatim; caller decrypts).
         tenant_secrets_table.grant_read_write_data(lifecycle_consumer)
+        # #264 — consumer replay 走 config_template / injected_parameters /
         # env_injected_credentials 分支时(tenant_service.py:751/806)调
         # registry_service.load_current_snapshot → param-registry 表 Query,补种
         # 时还 PutItem/transact_write。api_fn 有此 grant(:382)但 consumer 漏,
         # 带模板/凭据注入的租户 replay 时 AccessDenied → 穿窄 except → 重试进
         # DLQ → 永久卡 creating/queued(默认可达:lifecycle_queue+create_via_queue 均默认开)。
         param_registry_table.grant_read_write_data(lifecycle_consumer)
+        # #394 codex NB2 —— consumer replay 走 create_tenant 的 canary 分支时,
         # _persist_tenant_record 用 TransactWriteItems(snapshot ConditionCheck + tenant Put)
+        # 把"租户固定版本"与"删快照"线性化。与上面 #264 同一类漏授权:api_fn 给了(:359)但
         # consumer 漏 → 真机实测 AccessDeniedException(ConditionCheckItem on version-snapshots)
         # → 穿 except → 消息重试进 DLQ → canary 租户永远建不出来(202 queued 后凭空消失)。
         # 需要:snapshot 表读(resolve/校验)+ 事务两个 action 覆盖被检查表与被写表。
@@ -965,6 +1002,7 @@ def build_lambdas(self, ctx):
                     tenants_table.table_arn,
                 ],
             ))
+        # #412 — 队列化 delete 在 lifecycle_consumer 里跑,dispatch 预留的租户走令牌化释放
         # (_release_capacity_reservation:TransactWriteItems 扣 hosts + 清 tenants 令牌)。
         # 与 snapshot 事务分开、无条件授权(hosts+tenants),漏加则 delete 消费令牌时 AccessDenied。
         lifecycle_consumer.add_to_role_policy(iam.PolicyStatement(
@@ -984,17 +1022,20 @@ def build_lambdas(self, ctx):
             )
         assets_bucket.grant_read(lifecycle_consumer)
         assets_bucket.grant_put(lifecycle_consumer)
+        # #422 codex-blocker — suspend/restore 走 _async_actions 由 consumer 异步执行,
         # consumer 复用 _api_env(含 BACKUP_BUCKET)但缺 IAM grant → _resolve_backup 读备份桶
         # AccessDenied → suspend 停 VM/释放 slot 后消息重试、409 被 ack → 租户永久卡 suspending。
         # 与 api_fn 的 backup_bucket.grant_read 对称补上(consumer 只读备份,写归 backup Lambda)。
         if backup_bucket is not None:
             backup_bucket.grant_read(lifecycle_consumer)
         # #564 G5 —— consumer 复用 `_api_env` 且读同一份死线参数,所以必须和 api_fn 一样授权。
+        # 这条与上面 #422 那个 blocker 是同一种形态:**复用了 env 却漏了 IAM**,表现是运行时
         # AccessDenied 后静默回落默认值 —— 客户改了参数、api 侧生效了、consumer 侧没生效,
         # 而两边跑的是同一份代码,日志上极难看出来。资源同样精确到死线前缀(穿透风险见上)。
         lifecycle_consumer.add_to_role_policy(_dl_param_policy)
         lifecycle_queue.grant_consume_messages(lifecycle_consumer)
         # consumer emits the create-latency SLA metric on the create path.
+        # #432 —— namespace 条件同 api_fn 一并加上 OpenClaw/Dispatch:consumer 走
         # create_via_queue 时会执行完整 create_tenant,那条路径上 dispatch_service 也可能
         # 发熔断指标(DispatchCircuitOpen),命名空间不在条件里就会被 IAM 拒。
         lifecycle_consumer.add_to_role_policy(
@@ -1017,6 +1058,7 @@ def build_lambdas(self, ctx):
         # 这些,导致 consumer 消费 create 消息时 AccessDenied(ssm:SendCommand /
         # elasticloadbalancing:CreateTargetGroup),租户永远卡 creating、消息进 DLQ。
         # 注释一直写"consumer 同 api 权限"但代码没落实,现补齐。
+        # 注:#62 IAM 收窄后 ssm_policy/ec2_policy 拆成多条 statement,
         # 用 _attach_shared_policies 一次挂上,不再 add_to_role_policy 单条。
         _attach_shared_policies(lifecycle_consumer)
         lifecycle_consumer.add_to_role_policy(
@@ -1048,6 +1090,7 @@ def build_lambdas(self, ctx):
             )
         )
         assets_bucket.grant_delete(lifecycle_consumer)
+        # #264 — consumer replay create/delete 时 audit._publish_event 发 SNS
         # (core/audit.py:42,tenant_service.py:1705/1997/2581)。api_fn(:599)有
         # grant_publish 但 consumer 漏 → notifications.enabled=true 时 queued 租户
         # 的生命周期通知被 audit.py:51 静默吞("SNS publish failed"),订阅方看到
@@ -1058,6 +1101,7 @@ def build_lambdas(self, ctx):
         # add_environment 的 key,在 Cognito 段对 api_fn 和本 consumer 都加
         # (见下方 _lifecycle_consumer 引用)。存引用供 Cognito 段使用。
         self._lifecycle_consumer = lifecycle_consumer
+        # #263 — ESM ScalingConfig.MaximumConcurrency 限流阀:治批删削峰的核心。
         # 不加就是"consumer 按活跃 MessageGroup 数任意并发"(30 个不同租户 delete →
         # 最高 30 并发砸向少数 host),撞 SSM 单 host 的 CommandWorkersLimit、饿死
         # launch-vm/start/stop。aws-cdk-lib 2.x 的 SqsEventSource 不直接暴露
@@ -1066,6 +1110,7 @@ def build_lambdas(self, ctx):
         #
         # ⚠ **#565 G5 更正:上面那句原写着「撞 CommandWorkersLimit=5」,容易被读成
         # 「所以这个并发不能提」。顾虑是真的,结论是错的 —— 正确表述是【两侧必须成对提】。**
+        # 我自己先掉进过这个坑:把 #469 的「host 侧 20→50 无改善」当成"host 侧提了没用",
         # 而那次绑死的是**控制面 API**(QPS 20 → 约 30 次 SendCommand/s → 89 次
         # ThrottlingException、502 占 89.5%),此时 host 侧 worker 多少都不影响结果。
         # 用户 2026-08-25 在真机上直接探测(不压控制面速率、每档有 agent 重启时间戳为证):
@@ -1106,6 +1151,7 @@ def build_lambdas(self, ctx):
         _lc_esm = lifecycle_consumer.add_event_source_mapping(
             "LifecycleQueueEsm",
             event_source_arn=lifecycle_queue.queue_arn,
+            # #411/6.4 codex(round3) — batch_size=1(原 10)。原来一个 invocation 串行处理
             # 10 条:两个各 ~300s 的 rebuild 就超过 consumer 360s 硬超时,invocation 被杀 →
             # 已完成的前几条副作用在重投时重放;且 503 后继续处理同组后续消息 = FIFO 组内
             # 乱序(rebuild 失败被后到的 stop/start 越过)。每次只取 1 条:单条最长 = rebuild
@@ -1121,12 +1167,15 @@ def build_lambdas(self, ctx):
                 "ScalingConfig", {"MaximumConcurrency": _lc_max_conc}
             )
         cdk.CfnOutput(self, "LifecycleQueueUrl", value=lifecycle_queue.queue_url)
+    # 1.4.1 (#63) — Console skills CRUD: api Lambda writes SKILL.md
     # via PUT /skills/{name} and removes the skills/{name}/ prefix
     # via DELETE /skills/{name}.
     assets_bucket.grant_put(api_fn)
     assets_bucket.grant_delete(api_fn)
+    # Issue #13 — allow publishing tenant lifecycle events
     if notifications_topic is not None:
         notifications_topic.grant_publish(api_fn)
+    # #62 IAM 收窄:ssm_policy + ec2_policy 各拆成多条 statement,
     # 用 _attach_shared_policies 一次挂上。原 ssm_policy/ec2_policy 两次
     # add_to_role_policy 合并到这里(下方 ec2_policy 那行已删)。
     _attach_shared_policies(api_fn)
@@ -1134,8 +1183,10 @@ def build_lambdas(self, ctx):
     # can't be resource-scoped (no ARNs), so it's namespace-conditioned to keep it
     # least-privilege.
     #
+    # #432 —— 加上 `OpenClaw/Dispatch`。**这是真机抓出来的**:条件只写了
     # `OpenClaw/ControlPlane`,所以任何发到 `OpenClaw/Dispatch` 的指标都被 IAM 拒:
     #     AccessDenied ... not authorized to perform: cloudwatch:PutMetricData
+    # 影响不止 #432 的 poller 心跳 —— `dispatch_service._emit_circuit_open()` 发的
     # `DispatchCircuitOpen`(熔断信号)用的就是那个 namespace,也就是说**熔断指标一直发不出去**,
     # 而它的 except 是 fail-safe(打日志不抛),所以这件事从未响过。
     # 用 namespace 列表而不是放开 `*`:least-privilege 不因为多一个命名空间而放弃。
@@ -1149,6 +1200,7 @@ def build_lambdas(self, ctx):
         },
     )
     api_fn.add_to_role_policy(cw_metrics_policy)
+    # task #15 — read the LiteLLM master key secret to mint per-tenant
     # vkeys. Scoped to the configured secret (or all secrets named
     # openclaw-litellm-* if config gives a name prefix). Only granted when
     # billing is configured.
@@ -1174,6 +1226,7 @@ def build_lambdas(self, ctx):
                 ],
             )
         )
+    # #62 IAM 收窄:ec2_policy 已经由 _attach_shared_policies(api_fn) 挂上,
     # 这里删掉旧的单条 add(ssm_policy + ec2_policy 两次调用合并成一次
     # _attach_shared_policies)。
     api_fn.add_to_role_policy(
@@ -1196,9 +1249,11 @@ def build_lambdas(self, ctx):
     )
 
     # ========== API Gateway ==========
+    # #423 解法 A:主 API 必须在本 build 函数内拿到 execute-api VPCE,故把 VPC 与
     # VPCE 创建前移到主 API 定义之前;network_vpc.py 后续只从 ctx 读取同一 VPC。
     vpc = _build_vpc(self, CFG.get("network", {}) or {})
     _api_cfg = CFG.get("api", {}) or {}
+    # #496 — 复用开关,形状照 logging.aos.create_secretsmanager_vpce(#309)。
     # AWS 硬规则:同一 VPC 同一服务只允许一个开 private DNS 的 Interface VPCE。导入客户已有
     # VPC 时那里常常已经有一个 execute-api 端点(别的系统在用),而这里原来是**无条件**自建 →
     # CreateVpcEndpoint 被拒(`private-dns-enabled cannot be set because there is already a
@@ -1261,6 +1316,7 @@ def build_lambdas(self, ctx):
         # #496 — 复用的端点必须在放行名单里。写了 vpce_ids 却漏掉被复用的那个,请求会从
         # 它进来并被 aws:SourceVpce 条件拒成 403:栈是 CREATE_COMPLETE,API 却谁都调不通。
         _vpce_allowlist = [*_vpce_allowlist, _reuse_vpce_id]
+    # #423 — 主 API method 是 AuthorizationType=NONE(x-api-key 应用层门),匿名
     # 调用方没有 IAM identity policy 提供 Allow,故 PRIVATE endpoint 必须由 resource
     # policy 显式 Allow,否则两侧都沉默会隐式拒绝、全部 403。安全评审结论仍成立:
     # 绝不加无条件 Allow AnyPrincipal;这里的 Allow 绑死 aws:SourceVpce 白名单,
@@ -1296,6 +1352,7 @@ def build_lambdas(self, ctx):
         default_cors_preflight_options=apigw.CorsOptions(
             allow_origins=apigw.Cors.ALL_ORIGINS,
             allow_methods=apigw.Cors.ALL_METHODS,
+            # #394 — If-Match(cleanup-canary 的 CAS)、Idempotency-Key(promote/
             # cleanup 的幂等键)是浏览器眼中的自定义请求头,不在 allow-headers 里就会被 CORS
             # 预检拦掉 → 请求根本到不了 Lambda(前端只看到 "discard failed",Lambda 无日志)。
             allow_headers=[
@@ -1327,6 +1384,7 @@ def build_lambdas(self, ctx):
     )
     plan.add_api_key(api_key)
 
+    # ========== #108 per-platform scoped API keys (config-gated, default off) ==========
     # Closes the god-key IDOR: one openclaw-admin-key today grants full-fleet
     # access, so handing it to any third-party platform leaks every platform's
     # tenants. When `api.platform_keys` is configured, each listed platform
@@ -1405,6 +1463,7 @@ def build_lambdas(self, ctx):
             )
             _pplan.add_api_key(_pkey)
 
+    # ========== WAF (issue #7, optional) ==========
     waf_cfg = CFG.get("waf", {}) or {}
     if waf_cfg.get("enabled", False):
         rate_limit = int(waf_cfg.get("rate_limit_per_ip", 1000))
@@ -1436,6 +1495,7 @@ def build_lambdas(self, ctx):
                 f"api.throttle_rate_limit={_api_throttle_rate_limit} req/s; "
                 "单来源 IP 的真实上限是这两者取小。"
             )
+        # 安全加固(task #25):无论 config 怎么配,代码侧总加 SQLi + IP 信誉
         # 两条 baseline,作为不可被 config.yml 静默裁掉的安全底线(同 IMDS 加固
         # 的显式不可回退姿态)。SQLi→OWASP A03 注入;IpReputation→A06/A10 已知
         # 恶意 IP。dict.fromkeys 对 config∪baseline 去重保序(WebACL 重复规则名
@@ -1609,6 +1669,7 @@ def build_lambdas(self, ctx):
             waf_logging.add_dependency(web_acl)
 
     key_required = {"api_key_required": True}
+    # #108 — when per-platform keys are configured, attach the REQUEST
     # authorizer to every keyed method so requestContext.authorizer.platform_id
     # reaches the handler. Off by default → key_required stays exactly as before
     # (backward-compatible single-key deploy). CORS preflight (OPTIONS) is added
@@ -1631,6 +1692,7 @@ def build_lambdas(self, ctx):
     # CDK does not auto-add per-method permissions for an imported
     # IFunction (it assumes it doesn't own it), so the policy stays at a
     # single statement regardless of how many routes we add.
+    # #149 — API GW invoke permission 给 alias（不再直接指 function）
     _apigw_source_arn = Fn.join(
         "",
         [
@@ -1702,10 +1764,12 @@ def build_lambdas(self, ctx):
     recipient_key_disable_resource = recipient_key_resource.add_resource("disable")
     recipient_key_disable_resource.add_method("POST", _li(), **key_required)
 
+    # #149 asymmetric-v1 — serve the RSA CMK PUBLIC key so callers can locally
     # OAEP-encrypt env creds before POST /tenants (env_injected_credentials).
     rsa_pubkey_resource = api.root.add_resource("clawpool-rsa-public-key")
     rsa_pubkey_resource.add_method("GET", _li(), **key_required)
 
+    # #389 v2 块5 — bootstrap 版本切换(admin-only,handler 内 identity 门)。
     #   GET  /bootstrap/versions   列 host+edge 可切换版本 + 各 fleet 当前启动摘要
     #   POST /bootstrap/promote    切到某个已存在的 S3 bootstrap 版本(传 sha256,不传脚本内容)
     bootstrap_resource = api.root.add_resource("bootstrap")
@@ -1723,20 +1787,28 @@ def build_lambdas(self, ctx):
     taint_resource = host_resource.add_resource("taint")
     taint_resource.add_method("POST", _li(), **key_required)
     taint_resource.add_method("DELETE", _li(), **key_required)
+    # #309 V1 — POST /hosts/{instance_id}/pull-image?snapshot_time=<ISO>: 照 DDB 快照按
     # 精确 VersionId 拉 deployment/rootfs/(镜像三盘+manifest),校验 etag 后 copy+unzip 装 live。
     # 只作用一台 host。Admin op (x-api-key)。
     pull_image_resource = host_resource.add_resource("pull-image")
     pull_image_resource.add_method("POST", _li(), **key_required)
+    # #309 — GET /hosts/{instance_id}/pull-image-progress:tail host 上 /tmp/<job_id>.txt。
     pull_image_progress_resource = host_resource.add_resource("pull-image-progress")
     pull_image_progress_resource.add_method("GET", _li(), **key_required)
+    # #309 — POST /hosts/{instance_id}/copy-file-from-s3:单文件 S3→EC2(目标限资产目录白名单)。
     copy_file_resource = host_resource.add_resource("copy-file-from-s3")
     copy_file_resource.add_method("POST", _li(), **key_required)
+    # #394 step5 — 同步槽位操作(admin-only,handler 内 identity 门):只改 host 上 slots.json
     # 一个小文件,不搬盘,故走同步 200(不需要 progress 轮询)。
     promote_canary_resource = host_resource.add_resource("promote-canary")
     promote_canary_resource.add_method("POST", _li(), **key_required)
+    # #394 —— 无 rollback-image 路由:回滚 = pull 老版到 live(pull-image,快路径秒级翻指针)。
+    # #394 — POST /hosts/{instance_id}/reclaim-images:回收无人引用的版本目录(手动 prune)。
     reclaim_images_resource = host_resource.add_resource("reclaim-images")
     reclaim_images_resource.add_method("POST", _li(), **key_required)
+    # #394 — GET /hosts/{instance_id}/image-slots:真机实读 host 磁盘镜像状态(slots.json +
     # versions/),DDB 镜像的权威对照。viewer 可读(handler 内不额外 admin 门,只读)。
+    # #394 —— 无 DELETE image-slots/canary(cleanup-canary 已移除,精简 API):放弃 canary 靠下次
     # pull 覆盖 / promote 清空,不再提供显式清指针接口。
     image_slots_resource = host_resource.add_resource("image-slots")
     image_slots_resource.add_method("GET", _li(), **key_required)
@@ -1744,23 +1816,28 @@ def build_lambdas(self, ctx):
     backups_resource = api.root.add_resource("backups")
     backups_resource.add_method("GET", _li(), **key_required)
 
+    # 10h-goal #19 — GET /images: golden-image inventory + live manifest.
     # (per-tenant data snapshot reuses GET /tenants/{id}/{action} action=data)
     images_resource = api.root.add_resource("images")
     images_resource.add_method("GET", _li(), **key_required)
+    # #394 — POST /delete-image-snapshot: 软删一条快照记录(引用保护 → 409 IMAGE_VERSION_IN_USE)。
     # body {snapshot_time},与 create-image-snapshot 对称(不用 path 带冒号的 ISO 时间)。
     # 只标 status=deleted,不动 S3 镜像文件。operator+。
     delete_snapshot_resource = api.root.add_resource("delete-image-snapshot")
     delete_snapshot_resource.add_method("POST", _li(), **key_required)
 
+    # #337(原#217 /snapshots)— GET /list_image_versions: 列镜像版本快照(time+label+count),
     # console 选 snapshot_time 拉。改名避免与 /images(列镜像文件)混淆。
     snapshots_resource = api.root.add_resource("list_image_versions")
     snapshots_resource.add_method("GET", _li(), **key_required)
 
+    # #376 — POST /create-image-snapshot: 打一个版本快照(等价 snapshot-version.sh):
     # 扫 deployment/ 全量对象 → 写 openclaw-version-snapshots 表。operator+(不在 _VIEWER_OK)。
     # 路径用连字符(与 pull-image/copy-file-from-s3/refresh-rootfs 等一致)。
     create_snapshot_resource = api.root.add_resource("create-image-snapshot")
     create_snapshot_resource.add_method("POST", _li(), **key_required)
 
+    # 1.4.0 (#62) — Groups CRUD endpoints
     groups_resource = api.root.add_resource("groups")
     groups_resource.add_method("GET", _li(), **key_required)
     groups_resource.add_method("POST", _li(), **key_required)
@@ -1770,6 +1847,7 @@ def build_lambdas(self, ctx):
     group_skill_resource = group_skills_resource.add_resource("{skill}")
     group_skill_resource.add_method("DELETE", _li(), **key_required)
 
+    # Issue #23 — batch operations: POST /batch/tenants
     batch_resource = api.root.add_resource("batch")
     batch_tenants_resource = batch_resource.add_resource("tenants")
     batch_tenants_resource.add_method("POST", _li(), **key_required)
@@ -1778,6 +1856,7 @@ def build_lambdas(self, ctx):
     batch_job_resource = batch_jobs_resource.add_resource("{job_id}")
     batch_job_resource.add_method("GET", _li(), **key_required)
 
+    # PRD #50-58 — control-plane scale-out: per-tenant-user fleet management.
     #   GET  /users/{tenant_user_id}/tenants   indexed, paginated fleet list
     #   GET  /users/{tenant_user_id}/summary   node count + per-status buckets
     #   POST /users/{tenant_user_id}/action    bulk start/stop the user's fleet
@@ -1837,6 +1916,10 @@ def build_lambdas(self, ctx):
     egress_chain_resource.add_method("GET", _li(), **key_required)
     egress_rollback_resource = egress_resource.add_resource("rollback")
     egress_rollback_resource.add_method("POST", _li(), **key_required)
+    # #668 —— POST /hosts/egress/allow/validate(只读 dry-run,同 admin 门与 API key)
+    egress_allow_resource = egress_resource.add_resource("allow")
+    egress_allow_validate_resource = egress_allow_resource.add_resource("validate")
+    egress_allow_validate_resource.add_method("POST", _li(), **key_required)
 
     # #517 stage 4 — submit a bounded rolling upgrade and poll its progress.
     rolling_upgrade_resource = hosts_resource.add_resource("rolling-upgrade")
@@ -1908,6 +1991,7 @@ def build_lambdas(self, ctx):
             "BACKUP_PREFIX": CFG["s3"]["backup_prefix"],
         },
     )
+    # #199 同类缺陷第三处:failover 的 path-A 要 list 备份,而备份写在 BACKUP_BUCKET
     # (backup-data.sh:16 `${BACKUP_BUCKET:-${ASSETS_BUCKET}}`)。不注入 → handler 侧回退
     # 到 assets 桶 → 永远 list 空 → 每个租户都被 no-backup 拒绝,AZ failover 实质不可用。
     # 判空 fail-safe 与 api_fn(:331)同款:不建备份桶的部署不注入,读侧自然回退 assets。
@@ -1918,6 +2002,7 @@ def build_lambdas(self, ctx):
         backup_bucket.grant_read(health_fn)
     tenants_table.grant_read_write_data(health_fn)
     hosts_table.grant_read_write_data(health_fn)
+    # #412 — reaper 对带 capacity_reservation_id 的卡 creating 租户走令牌化释放
     # (creating→failed + 扣 hosts 账本 + 清令牌一个 TransactWriteItems)。
     # grant_read_write_data 不含 TransactWriteItems,漏加则 reaper 释放时 AccessDenied。
     health_fn.add_to_role_policy(iam.PolicyStatement(
@@ -1927,8 +2012,10 @@ def build_lambdas(self, ctx):
             tenants_table.table_arn,
         ],
     ))
+    # #469 P6 —— 中间态卡死指标(OpenClaw/Lifecycle 的 LifecycleStuckMarked /
     # LifecycleStuckUnconfirmed)。真机冒烟实测:不加这条会 AccessDenied,指标发不出去
     # → 那两个 CloudWatch 告警永远没有数据点 = 卡死仍然只能等客户报障,P6 白做。
+    # 这类漏授权【单测看不见】(单测把 cloudwatch client mock 掉了),与上面 #412 那条
     # TransactWriteItems 漏加是同一类坑,注释一并留在这里。
     # cloudwatch:PutMetricData 不支持资源级限制(只能 "*"),故用 condition 把它锁死在
     # 本项目自己的 namespace 上,避免这个角色能往任意 namespace 写指标。
@@ -1960,7 +2047,9 @@ def build_lambdas(self, ctx):
         )
     )
     _attach_ssm_policies(health_fn)  # #62 IAM 收窄:拆 SSM 多 statement
+    # #52 —— 心跳失效降级的第二重判据:SSM 侧还看不看得见这台 host。
     # 只挂 health_fn 而【不】进 _attach_ssm_policies 的共享组:那组共享给 5 个 Lambda,
+    # 塞进去等于顺手给 ApiHandler/Scaler/Backup 都开机队清单读权限,与 #62 收窄方向相反
     # (起初就是那么写的,cdk diff 暴露出四个 role 的 policy 全被改动才收窄到这里)。
     # DescribeInstanceInformation 不支持资源级 IAM,故 resources=["*"];纯只读。
     health_fn.add_to_role_policy(
@@ -1991,17 +2080,20 @@ def build_lambdas(self, ctx):
         memory_size=2048,
         environment={
             "ASSETS_BUCKET": assets_bucket.bucket_name,
+            # 1.4.0 (#62) — needed for ?tenant=... per-tenant scope filtering
             "TENANTS_TABLE": tenants_table.table_name,
             "GROUPS_TABLE": groups_table.table_name,
         },
     )
     assets_bucket.grant_read(skills_fn)
+    # 1.4.0 (#62) — read-only access to compute effective skill sets
     tenants_table.grant_read_data(skills_fn)
     groups_table.grant_read_data(skills_fn)
     skills_resource = api.root.add_resource("skills")
     skills_resource.add_method(
         "GET", apigw.LambdaIntegration(skills_fn), **key_required
     )
+    # 1.4.1 (#63) — per-skill CRUD goes through api Lambda (reuses RBAC + audit log)
     skill_resource = skills_resource.add_resource("{name}")
     skill_resource.add_method("GET", _li(), **key_required)
     skill_resource.add_method("PUT", _li(), **key_required)
@@ -2050,6 +2142,7 @@ def build_lambdas(self, ctx):
             "TENANTS_TABLE": tenants_table.table_name,
             "ASG_NAME": "openclaw-hosts-asg",
             "IDLE_TIMEOUT_MINUTES": str(CFG["scaler"]["idle_timeout_minutes"]),
+            # task #21 — seamless rolling image refresh (gated OFF until verified)
             "IMAGE_REFRESH_ENABLED": str(
                 CFG.get("scaler", {}).get("image_refresh_enabled", False)
             ).lower(),
@@ -2062,6 +2155,7 @@ def build_lambdas(self, ctx):
             "ASSETS_BUCKET": assets_bucket.bucket_name,
             "ROOTFS_PREFIX": CFG["s3"]["rootfs_prefix"],
             "BACKUP_PREFIX": CFG["s3"]["backup_prefix"],
+            # 10h-goal #17 — reserve-capacity warm pool (gated OFF until verified)
             "RESERVE_ENABLED": str(
                 CFG.get("scaler", {}).get("reserve_enabled", False)
             ).lower(),
@@ -2076,15 +2170,19 @@ def build_lambdas(self, ctx):
         },
     )
     hosts_table.grant_read_write_data(scaler_fn)
+    # Issue #15 — TTL processing reads tenants and updates status (stop/delete)
     tenants_table.grant_read_write_data(scaler_fn)
+    # #62 IAM 收窄:SSM 拆多 statement;stop-vm.sh 走 SSM SendCommand,
     # instance ARN 带 Project=openclaw/Role=metal-host 条件。
     _attach_ssm_policies(scaler_fn)
+    # task #21 — read rootfs manifest (current golden version) for refresh
     assets_bucket.grant_read(scaler_fn)
     scaler_fn.add_to_role_policy(
         iam.PolicyStatement(
             actions=[
                 "autoscaling:DescribeAutoScalingGroups",
                 "autoscaling:TerminateInstanceInAutoScalingGroup",
+                # #264 — 两个躲在默认关开关后的缺失,一开就 AccessDenied:
                 # SetDesiredCapacity: _ensure_reserve_capacity(handler.py:192,RESERVE_ENABLED=true 预留扩容)
                 # DescribeAutoScalingInstances: _lifecycle_terminating(handler.py:330,IDLE_RECLAIM_ENABLED=true 防双扣 desired)
                 "autoscaling:SetDesiredCapacity",
@@ -2137,6 +2235,8 @@ def build_lambdas(self, ctx):
     backup_cmk.grant_encrypt_decrypt(backup_fn)  # CMK 解密权限只授备份执行者
     _attach_ssm_policies(backup_fn)  # #62 IAM 收窄:拆 SSM 多 statement
     backup_fn.grant_invoke(api_fn)  # API Lambda async invokes Backup Lambda
+    # #263 — 走 FIFO 队列的删除由 lifecycle_consumer 执行 delete_tenant,keep_data=false
+    # 时它同步 invoke backup Lambda 做删前备份(铁律#4 不可逆操作前先保护)。consumer role
     # 缺 lambda:InvokeFunction → invoke AccessDenied → delete fail-closed 返 5xx → 消息卡
     # FIFO 无限重试、租户永久删不掉。真机实证(ap-southeast-1,2026-07-15):开
     # lifecycle_queue_enabled 后单删返 202 但消息卡 NotVisible、租户始终 running。
@@ -2147,6 +2247,7 @@ def build_lambdas(self, ctx):
     # 的一批(错峰+限并发)。配高频(如 rate(30 minutes))让全量在 INTERVAL_HOURS
     # 内滚动覆盖,避免开源版"写死统一时间全量同刻备份"。
     #
+    # #469 R7 —— 定时全量已下沉到 host-agent 的 _backup_loop,本中心 schedule 默认【关】。
     # 为什么必须二者其一而不能并存:两侧都按 last_backup_at 判到期、都调同一个
     # backup-data.sh,同刻跑会对同一个数据盘并发起两次备份(该脚本会 Pause/Resume VM,
     # 两个实例交错 Resume 会让另一个备到"运行中的盘"→ 备份内容不一致)。
@@ -2171,6 +2272,7 @@ def build_lambdas(self, ctx):
             targets=[targets.LambdaFunction(backup_fn)],
         )
 
+    # ========== #32 Audit archive Lambda (DDB Stream → WORM bucket) ==========
     # 触发: audit_table DDB Stream (NEW_IMAGE)。每条审计条目 put 后 Lambda 消费
     # 事件,把 NEW_IMAGE 反 marshal 成 JSON,PutObject 到 audit_archive_bucket
     # 分区路径 `<prefix>/<owner_id>/<yyyy>/<mm>/<dd>/<id>.json`。retention 靠

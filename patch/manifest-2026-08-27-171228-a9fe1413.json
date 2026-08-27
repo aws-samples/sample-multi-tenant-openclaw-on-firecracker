@@ -1,0 +1,111 @@
+{
+  "synced_at": "2026-08-27 17:12:28 UTC+08:00",
+  "base_sha": "8f86347bc8f06b207c74107745717d2757b49588",
+  "source_commit": "a9fe14135d1b7ecac1c2db8188af0fd19384d219",
+  "commit_count": 12,
+  "file_count": 10,
+  "summary": "Sync the bb increment 8f86347b..a9fe1413 to the public gateway branch. Sync-LOG only (which customer-facing files reached gateway + the issues behind them); the applyable patch kit is NOT built yet (folded_into pending).",
+  "issues_synced_note": "Index back to the issue tracker for whoever builds the patch kit: before assembling the kit, walk each issue and confirm it's covered. `title` is a ≤20-char gist only — open the issue for the full problem/fix/test. Lists only issues that touched a released file this sync.",
+  "issues_synced": [
+    {
+      "id": "#643",
+      "type": "fix",
+      "title": "edge readiness 门删掉最后…"
+    },
+    {
+      "id": "#661",
+      "type": "fix",
+      "title": "[BUG][控制面] create bu…"
+    },
+    {
+      "id": "#663",
+      "type": "fix",
+      "title": "排队判死不改写 status"
+    },
+    {
+      "id": "#671",
+      "type": "feat",
+      "title": "[BUG][控制面] 创建吞吐天花板约…"
+    }
+  ],
+  "needs_config_on_apply": "none detected (no config.yml key / systemd directive / DDB-TTL change in this sync)",
+  "updated_files": {
+    "edge (OpenResty / Fluent Bit host config)": [
+      {
+        "path": "deploy/edge/route.lua",
+        "status": "modified",
+        "issues": [
+          "#643"
+        ]
+      },
+      {
+        "path": "deploy/edge/test/integration/balancer_phase_integration.sh",
+        "status": "modified",
+        "issues": [
+          "#643"
+        ]
+      },
+      {
+        "path": "deploy/edge/test/route_reader_isolation_spec.lua",
+        "status": "modified",
+        "issues": [
+          "#643"
+        ]
+      }
+    ],
+    "lambda (update-function-code only)": [
+      {
+        "path": "deploy/lambda/api/core/clients.py",
+        "status": "modified",
+        "issues": [
+          "#661"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/create_deadline.py",
+        "status": "modified",
+        "issues": [
+          "#663"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/dispatch/binpack.py",
+        "status": "modified",
+        "issues": [
+          "#661"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/core/scheduling.py",
+        "status": "modified",
+        "issues": [
+          "#661",
+          "#671"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/handler.py",
+        "status": "modified",
+        "issues": [
+          "#663"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/deadline_executor.py",
+        "status": "modified",
+        "issues": [
+          "#663"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/dispatch_service.py",
+        "status": "modified",
+        "issues": [
+          "#661",
+          "#671"
+        ]
+      }
+    ]
+  },
+  "folded_into": "(pending) — no patch kit built for this sync yet; a later kit should cite this manifest as source-of-record and set base_sha/patch_sha. cdk deploy is FORBIDDEN on hand-modified live deployments — the kit must ship *.patched host scripts + the full lambda tree + AWS CLI for stack changes, same shape as patch/315-concurrent-dispatch-rollup/."
+}

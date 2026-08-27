@@ -76,17 +76,31 @@ def _summarize_rules_sha256(values):
     return next(iter(reported)), "reported hosts agree"
 
 
-# 绝对下限:env 只能把作用域【收紧】,不能放宽到比 /24 更宽。
-# 为什么需要它而不是只靠 VPC_CIDR 比对 —— 真机读数(us-west-2 `openclaw-api`,82 项 env)
+# 放行洞的作用域下界分两个数,别把它们看成一个:
+#
+# 为什么必须有一个不依赖环境坐标的下界 —— 真机读数(us-west-2 `openclaw-api`,82 项 env)
 # 里【没有】 VPC_CIDR / EGRESS_VPC_CIDR,只有 VPC_ID 与 VM_SUBNET_PREFIX。VPC 网段在控制面
-# 不可判定,所以「dst 不得覆盖 VPC_CIDR」这条只能在注入了该 env 的环境生效。若把硬下限只
-# 建在它上面,`EGRESS_EXTRA_ALLOW_MIN_PREFIX=16` 就能让一条 /16 整网段洞通过 admission。
-# 绝对下限不依赖任何环境坐标,任何环境都拦得住整网段洞。
-_ABSOLUTE_MIN_PREFIX = 24
+# 不可判定,所以「dst 不得覆盖 VPC_CIDR」这条只能在注入了该 env 的环境生效。若把唯一的
+# 下界建在它上面,缺该 env 的环境里作用域就完全没有机械阻挡。
+#
+# env 未设时的默认值。#668 放宽 admission 只降【绝对下界】,这个默认值不动 ——
+# 既有调用方的行为逐字节不变,放宽必须由运维显式设 env,不是静默生效。
+_DEFAULT_MIN_PREFIX = 24
+# env 的取值下界:EGRESS_EXTRA_ALLOW_MIN_PREFIX 只能落在 [_ABSOLUTE_MIN_PREFIX, 32]。
+# #668 把它从 24 降到 16 —— /16 以内的整网段洞由调用方自己承担风险(ADR 第 12 节)。
+# 为什么保留一个下界而不是取消:/8 这种量级的洞会吞掉 host 侧语义探针的全部取样空间,
+# 让「红线端口 + 探针」这套护栏一起退化,而比 /16 更宽的洞没有任何已知运维场景。
+# 与 host 侧 oc-egress-sim.py::_ABSOLUTE_MIN_PREFIX_EXTRA_ALLOW 同值同源
+# (test_594 有同源断言);那边平台配置 LiteLLM CIDR 仍守各自的 /24。
+_ABSOLUTE_MIN_PREFIX = 16
+# dry-run 一次最多判多少条:有界操作,免得一次 POST 一万条把 Lambda 时间耗在纯计算上。
+_VALIDATE_MAX_ENTRIES = 64
 
 
 def _extra_allow_min_prefix():
-    raw = os.environ.get("EGRESS_EXTRA_ALLOW_MIN_PREFIX", "24").strip()
+    raw = os.environ.get(
+        "EGRESS_EXTRA_ALLOW_MIN_PREFIX", str(_DEFAULT_MIN_PREFIX)
+    ).strip()
     try:
         prefix = int(raw)
     except ValueError as error:
@@ -133,13 +147,105 @@ def _extra_allow_redline_networks():
     return tuple(networks)
 
 
+def _admit_allow_entry(entry, index, min_prefix, redline_networks):
+    """判定单条 allow[i]。返回 (token, error, criterion)。
+
+    token 是编码后的 `proto:dport:cidr`(判过才有),error 是给调用方的错误串
+    (与 #594/#631/#636 已断言的措辞逐字节相同),criterion 是机器可读的判据名。
+    """
+    import ipaddress as _ip
+
+    if not isinstance(entry, dict):
+        return None, f"allow[{index}] must be an object", "entry_not_object"
+    proto = str(entry.get("proto", "")).strip().lower()
+    if proto not in ("tcp", "udp"):
+        return (
+            None,
+            f"allow[{index}].proto must be tcp|udp",
+            "proto_not_tcp_udp",
+        )
+    dport = entry.get("dport")
+    if not (
+        isinstance(dport, int) and not isinstance(dport, bool)
+    ):
+        return (
+            None,
+            f"allow[{index}].dport must be an integer",
+            "dport_not_integer",
+        )
+    if not 1 <= dport <= 65535:
+        return (
+            None,
+            f"allow[{index}].dport out of range",
+            "dport_out_of_range",
+        )
+    dst = str(entry.get("dst", "")).strip()
+    if not dst:
+        return (
+            None,
+            f"allow[{index}].dst is required (IP/CIDR)",
+            "dst_required",
+        )
+    try:
+        net = _ip.ip_network(dst, strict=False)
+    except ValueError:
+        return (
+            None,
+            f"allow[{index}].dst must be IP/CIDR",
+            "dst_not_ip_cidr",
+        )
+    # HIGH fix — 链是 IPv4-only iptables;放过 IPv6 dst 会让 host 侧 apply 失败、整链换入
+    # 中止,且毒 token 被 DDB 持久化 → reconcile 永久卡 / fresh-host 静默 fail-open。拒 IPv6。
+    if net.version != 4:
+        return (
+            None,
+            f"allow[{index}].dst must be IPv4 (chain is IPv4-only)",
+            "dst_not_ipv4",
+        )
+    if _ip.ip_address(_IMDS) in net:
+        return (
+            None,
+            f"allow[{index}] must not open IMDS ({_IMDS})",
+            "dst_covers_imds",
+        )
+    if dport in _EXTRA_ALLOW_REDLINE_PORTS:
+        return (
+            None,
+            f"allow[{index}].dport {dport} is an egress red-line port",
+            "dport_redline",
+        )
+    if net.prefixlen < min_prefix:
+        return (
+            None,
+            (
+                f"allow[{index}].dst prefix /{net.prefixlen} is broader than "
+                f"EGRESS_EXTRA_ALLOW_MIN_PREFIX /{min_prefix}"
+            ),
+            "dst_prefix_too_broad",
+        )
+    for name, protected in redline_networks:
+        if net == protected or net.supernet_of(protected):
+            return (
+                None,
+                (
+                    f"allow[{index}].dst must not equal or contain {name} "
+                    f"{protected}"
+                ),
+                "dst_covers_protected_network",
+            )
+    return f"{proto}:{dport}:{net}", None, None
+
+
 def _build_extra_allow(allow):
     """把 API 的 allow=[{proto,dport,dst}] 校验并编码成 EGRESS_EXTRA_ALLOW 串。
 
     护栏:proto∈tcp/udp;dport 1-65535;dst 必填且为 IP/CIDR(拒绝无目的地放行);
     拒绝对 IMDS 开洞。返回 (str, error)。
+
+    逐条判定在 `_admit_allow_entry`(与 dry-run 端点同一份实现)。这里保持【首错短路】:
+    调用方拿到的 400 只报第一条,与 #660 那批真机反验用例的错误串一致;dry-run 那边
+    才逐条全判。
     """
-    import ipaddress as _ip
     if allow is None:
         return "", None
     if not isinstance(allow, list):
@@ -152,46 +258,195 @@ def _build_extra_allow(allow):
         return "", str(error)
     toks = []
     for i, e in enumerate(allow):
-        if not isinstance(e, dict):
-            return "", f"allow[{i}] must be an object"
-        proto = str(e.get("proto", "")).strip().lower()
-        if proto not in ("tcp", "udp"):
-            return "", f"allow[{i}].proto must be tcp|udp"
-        dport = e.get("dport")
-        if not (
-            isinstance(dport, int) and not isinstance(dport, bool)
-        ):
-            return "", f"allow[{i}].dport must be an integer"
-        if not 1 <= dport <= 65535:
-            return "", f"allow[{i}].dport out of range"
-        dst = str(e.get("dst", "")).strip()
-        if not dst:
-            return "", f"allow[{i}].dst is required (IP/CIDR)"
-        try:
-            net = _ip.ip_network(dst, strict=False)
-        except ValueError:
-            return "", f"allow[{i}].dst must be IP/CIDR"
-        # HIGH fix — 链是 IPv4-only iptables;放过 IPv6 dst 会让 host 侧 apply 失败、整链换入
-        # 中止,且毒 token 被 DDB 持久化 → reconcile 永久卡 / fresh-host 静默 fail-open。拒 IPv6。
-        if net.version != 4:
-            return "", f"allow[{i}].dst must be IPv4 (chain is IPv4-only)"
-        if _ip.ip_address(_IMDS) in net:
-            return "", f"allow[{i}] must not open IMDS ({_IMDS})"
-        if dport in _EXTRA_ALLOW_REDLINE_PORTS:
-            return "", f"allow[{i}].dport {dport} is an egress red-line port"
-        if net.prefixlen < min_prefix:
-            return "", (
-                f"allow[{i}].dst prefix /{net.prefixlen} is broader than "
-                f"EGRESS_EXTRA_ALLOW_MIN_PREFIX /{min_prefix}"
-            )
-        for name, protected in redline_networks:
-            if net == protected or net.supernet_of(protected):
-                return "", (
-                    f"allow[{i}].dst must not equal or contain {name} "
-                    f"{protected}"
-                )
-        toks.append(f"{proto}:{dport}:{net}")
+        token, error, _criterion = _admit_allow_entry(
+            e, i, min_prefix, redline_networks
+        )
+        if error:
+            return "", error
+        toks.append(token)
     return ",".join(toks), None
+
+
+def _summarize_allow_scope(encoded_extra_allow, min_prefix):
+    """把这次放行洞的量级显式化;空串表示无洞。"""
+    import ipaddress as _ip
+
+    if not encoded_extra_allow:
+        return None
+    entries = []
+    total_addresses = 0
+    for token in encoded_extra_allow.split(","):
+        _proto, _dport, dst = token.split(":", 2)
+        network = _ip.ip_network(dst, strict=False)
+        addresses = network.num_addresses
+        entries.append(
+            {
+                "rule": token,
+                "prefix": network.prefixlen,
+                "addresses": addresses,
+            }
+        )
+        total_addresses += addresses
+    entries.sort(key=lambda item: item["prefix"])
+    widest_prefix = entries[0]["prefix"]
+    return {
+        "entries": entries,
+        "widest_prefix": widest_prefix,
+        "total_addresses": total_addresses,
+        "below_default_floor": widest_prefix < _DEFAULT_MIN_PREFIX,
+        "min_prefix": min_prefix,
+    }
+
+
+def fleet_egress_allow_validate(body=None, event=None):
+    """POST /hosts/egress/allow/validate — 只读 dry-run:逐条给出判定与当前阈值。
+
+    与 POST /hosts/egress 的 admission 同源,但逐条全判不短路,且绝不写 DDB、
+    不发 SSM、不落 revision。权限与 POST /hosts/egress 同门(admin)。
+    """
+    import ipaddress as _ip
+
+    ident = auth._get_caller_identity(event or {})
+    if not ident.get("is_admin"):
+        return _resp(
+            403,
+            {
+                "error": "forbidden: fleet egress admin requires admin",
+                "required": "admin",
+            },
+        )
+    try:
+        body = json.loads(body) if isinstance(body, str) else (body or {})
+    except (TypeError, ValueError):
+        return _resp(400, {"error": "body must be a JSON object"})
+    if not isinstance(body, dict):
+        return _resp(400, {"error": "body must be a JSON object"})
+
+    allow = body.get("allow")
+    if allow is None:
+        return _resp(
+            400,
+            {"error": "allow is required (a list of {proto,dport,dst})"},
+        )
+    if not isinstance(allow, list):
+        return _resp(
+            400, {"error": "allow must be a list of {proto,dport,dst}"}
+        )
+    if len(allow) > _VALIDATE_MAX_ENTRIES:
+        return _resp(
+            400,
+            {
+                "error": (
+                    f"allow must contain at most {_VALIDATE_MAX_ENTRIES} entries"
+                ),
+                "got": len(allow),
+            },
+        )
+    try:
+        min_prefix = _extra_allow_min_prefix()
+        redline_networks = _extra_allow_redline_networks()
+    except ValueError as error:
+        # 环境配置本身非法时不能装作能判 —— 与 POST 路径同源地报 400。
+        return _resp(400, {"error": str(error)})
+
+    protected_networks = {
+        name: str(network) for name, network in redline_networks
+    }
+    results = []
+    accepted_tokens = []
+    warnings = []
+    for index, entry in enumerate(allow):
+        token, error, criterion = _admit_allow_entry(
+            entry, index, min_prefix, redline_networks
+        )
+        if error:
+            results.append(
+                {
+                    "index": index,
+                    "verdict": "reject",
+                    "rule": None,
+                    "criterion": criterion,
+                    "error": error,
+                    "prefix": None,
+                }
+            )
+            continue
+        accepted_tokens.append(token)
+        network = _ip.ip_network(token.split(":", 2)[2], strict=False)
+        prefix = network.prefixlen
+        results.append(
+            {
+                "index": index,
+                "verdict": "accept",
+                "rule": token,
+                "criterion": None,
+                "error": None,
+                "prefix": prefix,
+            }
+        )
+        if prefix < _DEFAULT_MIN_PREFIX:
+            warnings.append(
+                f"allow[{index}] opens /{prefix} ({network.num_addresses} addresses); "
+                "wider than the /24 default floor — the caller owns this blast "
+                "radius (#668)"
+            )
+        if prefix <= _ABSOLUTE_MIN_PREFIX:
+            warnings.append(
+                f"allow[{index}] /{prefix} may cover an entire VPC; oc-egress-sim's "
+                "semantic probe needs one in-VPC address left outside every hole and "
+                "fails closed when the holes consume that probe space, so host-side "
+                "apply can exit non-zero while the desired state is already "
+                "persisted. The host then reports 'redline reachable: allow holes "
+                "cover the entire VPC_CIDR' — grep that string on the host to "
+                "confirm (ADR-egress-allow-hole-redline §10)"
+            )
+    if not protected_networks:
+        warnings.append(
+            "neither VPC_CIDR/EGRESS_VPC_CIDR nor TENANT_SUPERNET is configured "
+            "in this environment, so the equal-or-contains check cannot run here; "
+            "only the prefix floor and the red-line port set constrain scope"
+        )
+
+    accepted_count = len(accepted_tokens)
+    rejected_count = len(allow) - accepted_count
+    all_accepted = rejected_count == 0
+    encoded_extra_allow = ",".join(accepted_tokens) if all_accepted else ""
+    return _resp(
+        200,
+        {
+            "verdict": "accept" if all_accepted else "reject",
+            "allow_count": len(allow),
+            "accepted_count": accepted_count,
+            "rejected_count": rejected_count,
+            "results": results,
+            "criteria": {
+                "min_prefix": min_prefix,
+                "default_min_prefix": _DEFAULT_MIN_PREFIX,
+                "absolute_min_prefix": _ABSOLUTE_MIN_PREFIX,
+                "min_prefix_env": os.environ.get(
+                    "EGRESS_EXTRA_ALLOW_MIN_PREFIX"
+                ),
+                "ipv4_only": True,
+                "imds": _IMDS,
+                "redline_ports": sorted(_EXTRA_ALLOW_REDLINE_PORTS),
+                "protected_networks": protected_networks,
+                "proto": ["tcp", "udp"],
+                "dport_range": [1, 65535],
+            },
+            "encoded_extra_allow": encoded_extra_allow,
+            "extra_allow_scope": (
+                _summarize_allow_scope(encoded_extra_allow, min_prefix)
+                if all_accepted
+                else None
+            ),
+            "warnings": warnings,
+            "side_effects": "none",
+            "message": (
+                "dry-run only: this endpoint never writes desired state, never "
+                "dispatches SSM, and never records a revision"
+            ),
+        },
+    )
 
 # 在每台 host 上跑的一段(读该 host 真实 /etc/platform.env 派生 LiteLLM allow 洞 + apply/
 # teardown + 回读 OPENCLAW-EGRESS 的 sha256 供逐机一致性核对)。__MODE__ /
@@ -1313,6 +1568,11 @@ def fleet_egress(body=None, event=None):
     Admin-only(最高爆炸半径:动全机队网络隔离)。wait=true 时轮询到终态并返回逐机
     apply_exit + rules_sha256 + consistent(默认 true,给验收取证);wait=false 走
     fire-and-forget 只返 command_id(生产大机队用,避免撑爆 29s API-GW 窗口)。
+
+    allow 的作用域下界由 EGRESS_EXTRA_ALLOW_MIN_PREFIX 决定(默认 /24,最宽 /16,#668)。
+    比默认更宽的洞会被放行,但响应体的 extra_allow_scope 显式回报这次开了多宽 ——
+    风险由调用方承担,API 不让它只能从一个 202 里推。下发前想先看判定走
+    POST /hosts/egress/allow/validate(只读 dry-run)。
     """
     ident = auth._get_caller_identity(event or {})
     if not ident.get("is_admin"):
@@ -1381,6 +1641,18 @@ def fleet_egress(body=None, event=None):
     extra_allow, err = _build_extra_allow(body.get("allow"))
     if err:
         return _resp(400, {"error": err})
+    extra_allow_scope = (
+        _summarize_allow_scope(extra_allow, _extra_allow_min_prefix())
+        if extra_allow
+        else None
+    )
+    extra_allow_scope_warning = ""
+    if extra_allow_scope and extra_allow_scope["below_default_floor"]:
+        extra_allow_scope_warning = (
+            "; NOTE this publish opened an allow hole wider than the /24 default "
+            f"floor (widest /{extra_allow_scope['widest_prefix']}); the caller "
+            "owns that blast radius (#668)"
+        )
     # 按【本次实际会写哪一层】去读旧值,不能一律读单例:
     #   is_all  → 写的是单例,读单例(且必须在 _write_fleet_policy 之前读,否则读到新值、
     #             提示恒空,是个假绿);
@@ -1572,10 +1844,12 @@ def fleet_egress(body=None, event=None):
                 "unpin_failed": unpin_failed or None,
                 "extra_allow": extra_allow or None,
                 "extra_allow_cleared": extra_allow_cleared or None,
+                "extra_allow_scope": extra_allow_scope or None,
                 "targeting": "tag:Role" if is_all else "instance-ids",
                 "message": (
                     "dispatched; poll get-command-invocation or GET /hosts for convergence"
                     + desired_state_warning
+                    + extra_allow_scope_warning
                 ),
             },
         )
@@ -1636,13 +1910,14 @@ def fleet_egress(body=None, event=None):
             "pin_check_unavailable": pin_check_unavailable,
             "extra_allow": extra_allow or None,
             "extra_allow_cleared": extra_allow_cleared or None,
+            "extra_allow_scope": extra_allow_scope or None,
             "consistent": consistent,
             "rules_sha256": rules_sha256,
             "rules_sha256_reason": rules_sha256_reason,
             "hosts": hosts,
             "message": (
                 "apply completed" if all_ok else "apply completed with errors"
-            ) + collection_warning + desired_state_warning,
+            ) + collection_warning + desired_state_warning + extra_allow_scope_warning,
         },
     )
 

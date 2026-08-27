@@ -3,9 +3,10 @@
 `manifest.json` is the single source of truth. When this document and the manifest disagree
 about a hash, a path or a logical id, the manifest wins.
 
-- range: gateway `c9fd494ff4a76929f205f52464047a9185c7c49a` → `f4c1dedcc09d3ee78a55d9bad89a27cf22694bd2`
+- range: gateway `c9fd494ff4a76929f205f52464047a9185c7c49a` → the head of this branch, which
+  carries bb through `3c4494e8` (the #668 egress increment)
 - the base is the `patch_sha` of `patch/lifecycle-op-patch`, i.e. **the revision this
-  environment is actually on**. 234 paths, 26 fixes, 42 verifications.
+  environment is actually on**. 303 paths, 32 fixes, 52 verifications.
 - this is the **only** kit to apply for that hop. It is one hop, not a chain:
   `lifecycle-op-patch` → `lc2-patch`.
 - `status: MANUAL_REVIEW`. Every operation that owns a synthesized CloudFormation resource is
@@ -44,10 +45,265 @@ folded in here so an operator is never offered overlapping upgrades for one hop:
 | `patch/egress-207-patch` | `POST /hosts/egress` `wait=true` answering 200 on an incomplete collection | fix `#657`, same `egress_admin_service.py` bytes |
 | `patch/auto-8f86347b` | the same increment plus the SSM `TimeoutSeconds` lower bound | fix `#657` (`params_changed` records the derived value) |
 
-Their directories were deleted rather than their merges reverted: reverting would also have
-undone the product content they carried and dropped the `bb-baseline:` anchors their markers
-record, which the next publish reads to compute its increment. The product content and both
-markers stay in place.
+Their directories were deleted rather than their merges reverted, for two reasons. Reverting
+would also have undone the product content those merges carried. And a revert does not remove a
+`bb-baseline:` anchor — the anchor lives in a commit **message**, and the publish tool scans
+messages backwards from the tip, so the reverted commit's anchor survives and keeps asserting that
+a withdrawn increment was published. The next publish would then compute its increment from that
+stranded anchor and skip the withdrawn range entirely. Deleting the directories leaves the product
+content and both markers intact and the anchor chain honest.
+
+## Permissions — read this before Step 0
+
+Two separate questions live here, and conflating them is how a hot-patched Lambda starts throwing
+`AccessDenied` in production. **(A) What permission does this kit's code change require?** and
+**(B) what does this kit's code call that a stock deployment never granted?**
+
+### A. Permission changes this range introduces: exactly one, and it is already in the kit
+
+Both CloudFormation closures the kit ships (`resources/cloudformation/*.base.json` versus
+`*.patch.json`) were compared statement by statement across every `AWS::IAM::Role`, `Policy`,
+`ManagedPolicy`, `RolePolicy` and `InstanceProfile`, normalising each statement so a reordering does
+not read as a change. Two resources differ, and only one of them is a permission:
+
+| Resource | Difference | What it is |
+| --- | --- | --- |
+| `OpenClawOrchestrator` / `EdgeRoleDefaultPolicy` | gains `cloudwatch:PutMetricData`, `Resource: "*"`, conditioned on `cloudwatch:namespace` equals `OpenClaw/Edge` | the real new grant — `#625`. Shipped as `iam/edge-putmetricdata.json`, byte-equal to the statement the closure adds. Step 4 applies it. |
+| `OpenClawImage` / `GoldenImageBuildRoleDefaultPolicy` | the S3 asset object ARN in an existing `s3:GetObject*/GetBucket*/List*` statement moves to a different `.zip` key | **not** a permission change. It is the same three actions on the same bucket; only the content-addressed asset key rotated. Step 4's golden-image operation re-points it and asserts the build role can read the new key. |
+
+So: **the only permission the code in this range newly needs is `cloudwatch:PutMetricData` on the
+edge role, scoped to the `OpenClaw/Edge` namespace, and it is already packaged.** Nothing else in
+this hop widens a policy.
+
+### B. Six calls in the shipped code that a stock deployment does not grant
+
+The closure diff above cannot answer this. An ungranted call produces no policy statement, so it
+leaves no trace in a template comparison — it only shows up at runtime as `AccessDenied`. Every one
+of the 14 Python files this kit ships was therefore walked with `ast`, keyed on the **method** name
+rather than the handle (`ssm.put_parameter` and `_ssm_adaptive().get_parameter` are the same API, and
+a handle-keyed scan silently misses the second — as an earlier pass of this analysis did), and each
+action checked against **all four** policies attached to `ApiHandlerServiceRole` (`DefaultPolicy`,
+`OverflowPolicy`, `OverflowPolicy2`, `ApiSelfInvokePolicy`, plus the one managed policy,
+`AWSLambdaBasicExecutionRole`) — a CDK policy overflow splits grants across several documents, and
+reading only the default one hides most of them. **26 distinct actions, 20 granted, 6 not**, worst
+first:
+
+| Action | Call site in the shipped kit | What happens on a stock deployment |
+| --- | --- | --- |
+| `ssm:GetParameter` | `services/dispatch_service.py:103`, in `_check_andon()` | **all dispatch stops.** This read is deliberately fail-**closed**: `except Exception: return True, f"andon-read-failed: …"`, and `True` means the emergency stop is engaged. So `AccessDenied` here does not degrade dispatch, it halts it — and the reason string names a read failure, not a permission, which is what makes it hard to recognise. The closure's only `ssm:GetParametersByPath` grant is scoped to `parameter/openclaw/lifecycle/deadline-sec/*`; this read is `/openclaw/dispatch/config`, a different prefix **and** a different action. |
+| `ssm:PutParameter` | `services/dispatch_service.py:1081`, in `_put_manifest_parts()` | **fatal for the dispatch in flight.** The call is not wrapped, so `AccessDenied` propagates and the batch that was writing its manifest parts fails. |
+| `kms:Encrypt` | `services/tenant_service.py:925`, in `mint_device_identity()`, through `core.kms_envelope.encrypt()` → `kms.encrypt(KeyId=CLAWPOOL_CMK_ARN)` | **device identity cannot be minted.** Note the callee is `core/kms_envelope.py`, which this kit does **not** ship — but the caller is shipped, so applying the kit makes shipped code depend on this grant. |
+| `kms:GetPublicKey` | `handler.py:3009`, in `_get_clawpool_rsa_public_key()` | **502 on that endpoint only,** and only where `security.clawpool_cmk_enabled` is on — the handler already returns `502 UPSTREAM "kms:GetPublicKey failed"`, so the failure is at least legible. With the feature off the code returns 404 before reaching KMS. |
+| `ssm:DeleteParameter` | `services/dispatch_service.py:1099`, in `_delete_manifest_parts()` | **silent leak.** The exception is caught and logged `non-fatal`, so every dispatch leaves its `SecureString` manifest parts behind for good: unbounded parameter growth, and tenant material retained past the run that needed it. |
+| `sqs:GetQueueAttributes` | `handler.py:1220`, in `_queue_depth()` | **cosmetic.** `_queue_depth` is fail-soft by construction — on any error it returns `None` rather than 500 — so the four queue-depth fields in the system-info response read `null` and nothing else changes. |
+
+**All six are pre-existing, not introduced by this kit.** Each call was re-run against the same file
+at `base_sha`: every one is present there with a byte-identical call expression, only at a different
+line (for instance `put_parameter` L987→L1081, `get_queue_attributes` L1209→L1220). This kit does
+not create the gap and does not require you to close it. It is written down because applying the kit
+does not fix it either, and a reader who saw only section A would conclude the permission surface is
+complete.
+
+**What this analysis does not cover, so you do not over-read it.** It is *action*-level. The closure
+grants DynamoDB and KMS per resource ARN, so an action marked granted here can still be denied on
+the specific resource the code touches. A live example from this same role: `kms:Decrypt` counts as
+granted above, but the only statement carrying it is scoped to the **backup** CMK, while
+`kms_envelope.decrypt()` decrypts under `CLAWPOOL_CMK_ARN` — a different key. Action-level coverage
+is a floor, not a proof. The simulator command below is the thing that answers for your account,
+because it evaluates policies rather than reading intent out of a repository.
+
+### Where to add them, if you choose to
+
+Attach to the **API handler's execution role** — the role behind the function this kit's `C-lambda`
+operation updates, `ApiHandlerServiceRole` in the closure. `iam/api-handler-dispatch-manifest-and-queue-depth.json`
+is the policy document, carrying ten `__TOKEN__` values you resolve against your own environment:
+
+`environment.json` does not carry the role or the queue coordinates, so derive them from the one
+thing it does confirm — `lambda_link.function`, the function the API actually invokes. Every value
+below comes from the live function's own configuration, which is why this works on an environment
+whose resource names do not match the repository's:
+
+```bash
+FN=$(python3 -c 'import json;print(json.load(open("environment.json"))["lambda_link"]["function"])')
+CFG=$(aws lambda get-function-configuration --region us-west-2 --function-name "$FN")
+ROLE_ARN=$(printf '%s' "$CFG" | python3 -c 'import json,sys;print(json.load(sys.stdin)["Role"])')
+ROLE=${ROLE_ARN##*/}
+echo "function=$FN role=$ROLE"
+
+# READ-ONLY: ask your own account which of the three are actually denied.
+# Never assume from this document — run the simulator against the live role.
+aws iam simulate-principal-policy --region us-west-2 \
+  --policy-source-arn "$ROLE_ARN" \
+  --action-names ssm:GetParameter ssm:PutParameter ssm:DeleteParameter \
+                 sqs:GetQueueAttributes kms:Encrypt kms:GetPublicKey \
+                 ssm:SendCommand ssm:GetCommandInvocation ssm:ListCommandInvocations \
+  --query 'EvaluationResults[].[EvalActionName,EvalDecision]' --output text
+```
+
+Read the output this way:
+
+- `ssm:SendCommand`, `ssm:GetCommandInvocation` and `ssm:ListCommandInvocations` **are** in the
+  closure. If any of those three comes back denied, that is **deployment drift on your side**, not
+  a gap in this repository — stop and reconcile the role before touching anything else.
+- `kms:Encrypt` is there because `_put_manifest_parts` writes `Type="SecureString"` and passes no
+  `KeyId`, so the default `alias/aws/ssm` key is used. Per the Parameter Store documentation, a
+  **standard** `SecureString` write requires `kms:Encrypt` on that key (an **advanced**-tier write
+  would require `kms:GenerateDataKey` instead), and the default `aws/ssm` key has no editable key
+  policy, so the identity policy is the only place to grant it. If your account replaced the
+  default with a customer-managed key, substitute that key's ARN.
+- The three actions in the table are the decision. Granting them is a **widening of a production
+  role**, so it is deliberately not automated here: no `lib/` script applies this file. If you want
+  it, substitute the tokens and attach it by hand, and record the pre-change policy set first.
+
+Every token is resolved from the live function's environment, not from this repository's names. The
+four queue URLs are read off the function's own configuration and turned into ARNs by SQS itself,
+so a renamed queue resolves correctly and a queue this deployment does not have fails closed rather
+than being guessed:
+
+```bash
+# derive each value from the live function, then substitute. $CFG is from the block above.
+PREFIX=$(printf '%s' "$CFG" | python3 -c 'import json,sys
+env=(json.load(sys.stdin).get("Environment") or {}).get("Variables") or {}
+print(env.get("DISPATCH_PARAM_PREFIX","/openclaw/dispatch"))')
+KMS_ARN=$(aws kms describe-key --region us-west-2 --key-id alias/aws/ssm \
+  --query KeyMetadata.Arn --output text)
+# The two clawpool CMKs come off the function's own configuration. An empty value means the
+# feature is off in this deployment, and its statement is dropped rather than left as a token.
+: > clawpool-cmks.pairs
+for v in CLAWPOOL_CMK_ARN CLAWPOOL_RSA_CMK_ARN; do
+  arn=$(printf '%s' "$CFG" | python3 -c "import json,sys
+env=(json.load(sys.stdin).get('Environment') or {}).get('Variables') or {}
+print(env.get('$v',''))")
+  printf '%s\t%s\n' "$v" "$arn" | tee -a clawpool-cmks.pairs
+done
+: > queue-arns.pairs
+for v in DISPATCH_QUEUE_URL DISPATCH_DLQ_URL LIFECYCLE_QUEUE_URL LIFECYCLE_DLQ_URL; do
+  url=$(printf '%s' "$CFG" | python3 -c "import json,sys
+env=(json.load(sys.stdin).get('Environment') or {}).get('Variables') or {}
+print(env.get('$v',''))")
+  if [ -z "$url" ]; then echo "STOP: the live function has no $v"; continue; fi
+  arn=$(aws sqs get-queue-attributes --region us-west-2 --queue-url "$url" \
+        --attribute-names QueueArn --query Attributes.QueueArn --output text)
+  printf '%s\t%s\n' "$v" "$arn" | tee -a queue-arns.pairs
+done
+python3 -c 'import json,sys
+print(json.dumps(dict(l.rstrip("\n").split("\t",1) for l in open("queue-arns.pairs") if l.strip()), indent=2))' \
+  > queue-arns.json
+cat queue-arns.json
+```
+
+`queue-arns.json` is what the substitution below reads. Check it lists all four before continuing:
+a queue missing here becomes a token with no value, and the next step refuses rather than emitting a
+policy that would attach cleanly and then deny every call it was supposed to allow.
+
+```bash
+python3 - "$PREFIX" "$KMS_ARN" <<'PY'
+import json, subprocess, sys
+prefix, kms_arn = sys.argv[1], sys.argv[2]
+env = json.load(open("environment.json"))
+arns = json.load(open("queue-arns.json"))     # {"DISPATCH_QUEUE_URL": "arn:...", ...} from above
+doc = open("iam/api-handler-dispatch-manifest-and-queue-depth.json").read()
+cmks = dict(l.rstrip("\n").split("\t", 1) for l in open("clawpool-cmks.pairs") if l.strip())
+subs = {
+    "__REGION__": env["region"],
+    "__ACCOUNT_ID__": env["account"],
+    "__DISPATCH_PARAM_PREFIX__": prefix,
+    "__SSM_KMS_KEY_ARN__": kms_arn,
+    "__CLAWPOOL_CMK_ARN__": cmks.get("CLAWPOOL_CMK_ARN"),
+    "__CLAWPOOL_RSA_CMK_ARN__": cmks.get("CLAWPOOL_RSA_CMK_ARN"),
+    "__DISPATCH_QUEUE_ARN__": arns.get("DISPATCH_QUEUE_URL"),
+    "__DISPATCH_DLQ_ARN__": arns.get("DISPATCH_DLQ_URL"),
+    "__LIFECYCLE_QUEUE_ARN__": arns.get("LIFECYCLE_QUEUE_URL"),
+    "__LIFECYCLE_DLQ_ARN__": arns.get("LIFECYCLE_DLQ_URL"),
+}
+body = json.loads(doc)
+# A CMK this deployment does not have means that feature is off: drop the statement outright
+# rather than emitting a token or widening it to a wildcard.
+for token, sid in [("__CLAWPOOL_CMK_ARN__", "DeviceIdentityEnvelope"),
+                   ("__CLAWPOOL_RSA_CMK_ARN__", "AsymmetricV1PublicKeyRead")]:
+    if not subs.get(token):
+        body["Statement"] = [s for s in body["Statement"] if s["Sid"] != sid]
+        print(f"dropped {sid}: this deployment sets no {token.strip('_')}")
+        subs.pop(token)
+doc = json.dumps(body, indent=2)
+for token, value in subs.items():
+    if token in doc and not value:
+        raise SystemExit(f"refusing to emit a half-substituted policy: {token} has no value")
+    doc = doc.replace(token, value)
+if "__" in doc:
+    raise SystemExit("refusing to emit a policy that still carries a token")
+body = json.loads(doc)                        # must parse
+assert not any("__" in json.dumps(s) for s in body["Statement"])
+open("/tmp/oc-api-handler-extra.json", "w").write(doc)
+print(doc)
+PY
+# snapshot what is there BEFORE adding anything
+aws iam list-role-policies --region us-west-2 --role-name "$ROLE" \
+  > "role-inline-before.$OC_RUN_ID.json"
+aws iam list-attached-role-policies --region us-west-2 --role-name "$ROLE" \
+  > "role-managed-before.$OC_RUN_ID.json"
+# then, only if you decided to close the gap:
+aws iam put-role-policy --region us-west-2 --role-name "$ROLE" \
+  --policy-name OpenClawDispatchManifestAndQueueDepth \
+  --policy-document file:///tmp/oc-api-handler-extra.json
+```
+
+Rollback is `aws iam delete-role-policy --role-name "$ROLE" --policy-name
+OpenClawDispatchManifestAndQueueDepth`, and it is a true rollback only because the snapshot above
+proves the inline policy did not exist before. One caution when you verify: an IAM change shows up
+in `simulate-principal-policy` immediately but the data plane can lag it by minutes, so a call that
+still fails right after the grant is not evidence the grant is wrong. The only judge is a real call
+from the function.
+
+`v-permissions-live-role-covers-every-call` in `manifest.json` runs exactly the simulator command
+above and names each call site and the scope to add. It is a `B-lifecycle` check because it needs
+the live role; it is read-only and it does not grant anything.
+
+## #668 — the egress allow relaxation and the new dry-run endpoint
+
+This kit carries bb's #668 increment. Two things change, and they are deliberately independent.
+
+**The scope floor relaxes, the default does not.** `_ABSOLUTE_MIN_PREFIX` moves from `24` to `16` in
+`egress_admin_service.py`, and `_ABSOLUTE_MIN_PREFIX_EXTRA_ALLOW` moves the same way in
+`oc-egress-sim.py`. `_DEFAULT_MIN_PREFIX` stays `24`, so **with no environment variable set the
+admitted scope is exactly what it was** — verified by running the shipped
+`_extra_allow_min_prefix()`: no env yields `/24`, an explicit `EGRESS_EXTRA_ALLOW_MIN_PREFIX=16`
+yields `/16`, and `EGRESS_EXTRA_ALLOW_MIN_PREFIX=8` is clamped back to `/16`. Widening is an operator
+action, never a side effect of applying this kit.
+
+Both files ship together on purpose. The host-side floor and the control-plane floor are asserted
+equal by the internal test suite; shipping only the control-plane half would let the API admit a
+`/16` that the host then refuses, so the rule set the ledger records would not be the rule set in
+force. `v-668-host-and-controlplane-floors-agree` reads both constants out of the shipped bytes and
+compares them.
+
+**The new endpoint is `POST /hosts/egress/allow/validate`, and it is read-only.** It returns the
+admission verdict for a rule set — including a machine-readable `criterion` per entry — without
+applying anything, bounded to `_VALIDATE_MAX_ENTRIES = 64` per request.
+`v-668-validate-is-read-only` proves the property structurally: it walks every validate-named
+function in the shipped service and fails if any of them calls `put_parameter`, `put_item`,
+`update_item`, `send_command`, `put_object` or any other mutation, and it also fails if the entry
+bound is declared but never referenced.
+
+**The route needs an API Gateway change, and that is the one step here you must review.** `#668`
+adds two resources (`allow`, then `validate` beneath it) and one `POST` method. The operation is
+`MANUAL_CLI_REVIEW` and driven by `lib/apply-api-routes.sh`:
+
+```bash
+bash lib/apply-api-routes.sh add --path /hosts/egress/allow/validate --method POST \
+  --api-key-required --lambda "$OPENCLAW_API_FN" --rest-api-id "$REST_API_ID" --stage "$STAGE"
+aws apigateway get-resources --rest-api-id "$REST_API_ID" --region us-west-2 \
+  --query "items[?path=='/hosts/egress/allow/validate']" --output json
+```
+
+Two things about that step. A route that exists but has not been deployed answers **403 Missing
+Authentication Token**, which reads like an authentication failure and is not one — it means the
+stage has not been republished. And the Deployment republishes the **whole** stage, so it carries
+every other pending resource change with it; look at what else is pending before you create it.
+Rollback is the matching `lib/apply-api-routes.sh remove`.
+
+No new permission is required for either half: the handler that serves the dry-run reads the same
+config it already read, and the API key requirement is the existing `key_required` shape.
 
 ## Step 0 — Discover the environment, then prove the kit is authentic
 
@@ -239,8 +495,8 @@ native wheels; a zip you build freezes your dependency versions onto this enviro
 live package and replace **only the individual files this kit ships**.
 
 Do **not** delete `core/` or `services/` and overlay `lambda/api` on top. Measured against a live
-package: `core/` holds 34 files and this kit ships 4 of them; `services/` holds 24 and the kit ships
-4. Deleting either directory drops 50 files including `core/__init__.py` and `core/auth.py`, and the
+package: `core/` holds 34 files and this kit ships 7 of them; `services/` holds 24 and the kit ships
+6. Deleting either directory drops 45 files including `core/__init__.py` and `core/auth.py`, and the
 function then fails at import — worse than the bug being patched.
 
 Build it file-by-file, and prove the entry set did not change:
@@ -554,8 +810,39 @@ at promote and issues no instance refresh — so a hot-fixed live host still cov
 
 ## Step 6 — Verification
 
-`manifest.json` `verifications[]` carries all 42 checks with exact `action`, `observable`,
-`pass_when` and `fail_when`: 30 read-only, 7 lifecycle, 5 optional. Run every read-only check.
+`manifest.json` `verifications[]` carries all 52 checks with exact `action`, `observable`,
+`pass_when` and `fail_when`: 30 read-only, 17 lifecycle, 5 optional. Run every read-only check.
+
+**Every check is read-only.** None writes to the product. The ones that reach a host do it with
+`ssm send-command` running `iptables -S`, a metrics `curl`, or `journalctl | grep` — reads, and
+the SSM invocation record is unavoidable because there is no read-only API for host inspection.
+The checks that import a shipped module set `sys.dont_write_bytecode`, so running them leaves no
+`__pycache__` inside the kit — which matters, because a stray one makes the apply driver report
+a file the manifest never declared. Several checks write scratch under `/tmp`; nothing in the
+kit, the fleet or the control plane is modified.
+
+Measured off-machine on this kit: **28 of the 30 read-only checks pass with no AWS credentials
+and no live environment**, and the 17 lifecycle checks are the ones that need the environment —
+they are labelled that way precisely so a red without it is read as "the environment is absent",
+not "the assertion failed".
+
+### The one read-only check that is red on purpose
+
+`v-636-openapi-covers-live-egress` fails, and it is telling the truth rather than misfiring:
+
+```
+declared ['/hosts/egress', '/hosts/egress/chain', '/hosts/egress/revisions',
+          '/hosts/egress/rollback']
+missing  ['/hosts/egress/allow', '/hosts/egress/revoke', '/hosts/egress/convergence',
+          '/hosts/egress/rollout', '/hosts/egress/fleet']
+```
+
+`docs/aws-guide/openapi.yaml` documents four egress paths plus the new
+`/hosts/egress/allow/validate`, while the service answers five more. That is a documentation gap
+in the published spec, not a defect this kit introduces or can close: writing the spec is #636's
+own subject. It is left red rather than relaxed, because a check quietly widened to accept the gap
+would then never notice the next missing route. Treat those five as undocumented-but-live when
+you integrate against the API.
 
 Two of the new checks are worth reading before you run them. `v-657-partial-collection-attribution`
 is a **source-level pin**, not a live call: it asserts the shipped `fleet_egress` body carries the
@@ -569,7 +856,7 @@ Four of the new checks are worth reading before you run them.
 `v-657-ssm-timeout-lower-bound` compiles **only** `_dispatch_apply` out of the shipped bytes and
 calls it with a recording stub in place of `clients.ssm`, so the six `EGRESS_APPLY_TIMEOUT` values
 are read out of the function body rather than recomputed by the check. Importing the module is not
-an option and must not be made one: the kit ships 4 of `core/`'s 34 files by design, so the import
+an option and must not be made one: the kit ships 7 of `core/`'s 34 files by design, so the import
 chain would reach modules it correctly does not carry.
 
 `v-657-partial-collection-attribution` does the same for `fleet_egress` and drives three collection

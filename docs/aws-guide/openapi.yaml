@@ -508,6 +508,34 @@ components:
           type:
             - object
             - 'null'
+        extra_allow_scope:
+          type:
+            - object
+            - 'null'
+          description: |-
+            本次放行洞的作用域回报(#668)。无洞时 null。`widest_prefix` 是最宽那条的
+            前缀长度，`below_default_floor=true` 表示至少有一条比 /24 默认下界更宽 ——
+            那时 message 里也会带一句 NOTE。这个字段只报事实，不改变任何状态码。
+          properties:
+            entries:
+              type: array
+              items:
+                type: object
+                properties:
+                  rule:
+                    type: string
+                  prefix:
+                    type: integer
+                  addresses:
+                    type: integer
+            widest_prefix:
+              type: integer
+            total_addresses:
+              type: integer
+            below_default_floor:
+              type: boolean
+            min_prefix:
+              type: integer
         targeting:
           type: string
           enum:
@@ -603,6 +631,34 @@ components:
           type:
             - object
             - 'null'
+        extra_allow_scope:
+          type:
+            - object
+            - 'null'
+          description: |-
+            本次放行洞的作用域回报(#668)。无洞时 null。`widest_prefix` 是最宽那条的
+            前缀长度，`below_default_floor=true` 表示至少有一条比 /24 默认下界更宽 ——
+            那时 message 里也会带一句 NOTE。这个字段只报事实，不改变任何状态码。
+          properties:
+            entries:
+              type: array
+              items:
+                type: object
+                properties:
+                  rule:
+                    type: string
+                  prefix:
+                    type: integer
+                  addresses:
+                    type: integer
+            widest_prefix:
+              type: integer
+            total_addresses:
+              type: integer
+            below_default_floor:
+              type: boolean
+            min_prefix:
+              type: integer
         consistent:
           type: boolean
           description: |-
@@ -625,6 +681,164 @@ components:
         message:
           type: string
       x-source: deploy/lambda/api/services/egress_admin_service.py:1639
+    FleetEgressAllowValidateResult:
+      type: object
+      description: POST /hosts/egress/allow/validate 的只读逐条 admission 结果。
+      required:
+        - verdict
+        - allow_count
+        - accepted_count
+        - rejected_count
+        - results
+        - criteria
+        - encoded_extra_allow
+        - warnings
+        - side_effects
+        - message
+      properties:
+        verdict:
+          type: string
+          enum:
+            - accept
+            - reject
+        allow_count:
+          type: integer
+          minimum: 0
+          maximum: 64
+        accepted_count:
+          type: integer
+          minimum: 0
+        rejected_count:
+          type: integer
+          minimum: 0
+        results:
+          type: array
+          items:
+            type: object
+            properties:
+              index:
+                type: integer
+                minimum: 0
+              verdict:
+                type: string
+                enum:
+                  - accept
+                  - reject
+              rule:
+                type:
+                  - string
+                  - 'null'
+                description: accept 时为编码后的 `proto:dport:cidr`;reject 时 null。
+              criterion:
+                type:
+                  - string
+                  - 'null'
+                enum:
+                  - entry_not_object
+                  - proto_not_tcp_udp
+                  - dport_not_integer
+                  - dport_out_of_range
+                  - dst_required
+                  - dst_not_ip_cidr
+                  - dst_not_ipv4
+                  - dst_covers_imds
+                  - dport_redline
+                  - dst_prefix_too_broad
+                  - dst_covers_protected_network
+                  - null
+                description: reject 的首个命中判据;accept 时 null。
+              error:
+                type:
+                  - string
+                  - 'null'
+                description: 与 POST /hosts/egress 首错 400 同源的原始错误串;accept 时 null。
+              prefix:
+                type:
+                  - integer
+                  - 'null'
+                description: accept 条目的 IPv4 前缀长度;reject 时 null。
+        criteria:
+          type: object
+          description: 本次判定实际使用的环境阈值与固定护栏。
+          properties:
+            min_prefix:
+              type: integer
+            default_min_prefix:
+              type: integer
+            absolute_min_prefix:
+              type: integer
+            min_prefix_env:
+              type:
+                - string
+                - 'null'
+              description: EGRESS_EXTRA_ALLOW_MIN_PREFIX 的原始 env 值;未设时 null。
+            ipv4_only:
+              type: boolean
+            imds:
+              type: string
+            redline_ports:
+              type: array
+              items:
+                type: integer
+            protected_networks:
+              type: object
+              additionalProperties:
+                type: string
+              description: 真正配置到当前环境的 VPC_CIDR / TENANT_SUPERNET;可能为空对象。
+            proto:
+              type: array
+              items:
+                type: string
+                enum:
+                  - tcp
+                  - udp
+            dport_range:
+              type: array
+              minItems: 2
+              maxItems: 2
+              items:
+                type: integer
+        encoded_extra_allow:
+          type: string
+          description: 全部条目 accept 时的完整编码串;任一 reject 时为空串。
+        extra_allow_scope:
+          type:
+            - object
+            - 'null'
+          description: 全部条目 accept 时的作用域量级;无洞或任一 reject 时 null。
+          properties:
+            entries:
+              type: array
+              items:
+                type: object
+                properties:
+                  rule:
+                    type: string
+                  prefix:
+                    type: integer
+                  addresses:
+                    type: integer
+            widest_prefix:
+              type: integer
+            total_addresses:
+              type: integer
+            below_default_floor:
+              type: boolean
+            min_prefix:
+              type: integer
+        warnings:
+          type: array
+          items:
+            type: string
+          description: 宽于默认 /24、可能覆盖整个 VPC、或缺少受保护网络坐标时的事实提示。
+        side_effects:
+          type: string
+          enum:
+            - none
+        message:
+          type: string
+          enum:
+            - 'dry-run only: this endpoint never writes desired state, never dispatches SSM, and never records a revision'
     FleetEgressStatus:
       type: object
       description: GET /hosts/egress 的机队收敛报告(实测顶层键)。
@@ -1433,6 +1647,7 @@ paths:
                   enum: [live, canary]
                   default: live
                   description: >-
+                    #394 — which image slot this tenant boots from. Absent/`live` (default) =
                     byte-identical legacy behavior (boots the host''s live slot; version is NOT
                     pinned — restart re-resolves the current live pointer). `canary` boots the
                     host''s canary slot to validate a candidate; it REQUIRES preferred_host_id
@@ -1445,11 +1660,13 @@ paths:
                 expected_image_snapshot_time:
                   type: string
                   description: >-
+                    #394 — for image_channel=canary: the candidate version the caller read from
                     the pull job result. Admission verifies the host canary still matches this
                     (TOCTOU guard); mismatch → 409 CANARY_CHANGED.
                 expected_image_generation:
                   type: integer
                   description: >-
+                    #394 — optional slots generation guard for canary admission. Only used at
                     create time; the tenant is pinned to a concrete version, so later host
                     generation changes (e.g. promote) do not invalidate it.
                 platform_id:
@@ -2515,6 +2732,7 @@ paths:
             OPENCLAW_CONFIG_INCOMPATIBLE is returned before enqueue for a fast
             pre-screen rejection, or by the async worker before backup/stop/overlay
             mutation when the target OpenClaw validator rejects the assembled config.
+            #413 lifecycle fence: LIFECYCLE_SUPERSEDED when the operation no longer owns the tenant epoch/source host; OPERATION_ID_REUSED when the op_id ledger belongs to another operation.
           content:
             application/json:
               schema:
@@ -3549,6 +3767,7 @@ paths:
                     image_slots:
                       type: object
                       description: >-
+                        #394 — control-plane mirror of the host''s slots.json (source of truth is
                         the file on the host). Present once a canary has been pulled to this host;
                         absent on hosts still on the legacy flat layout. Ops/console read it to see
                         which candidate is staged.
@@ -3859,6 +4078,7 @@ paths:
       operationId: pullImage
       summary: 把指定版本快照装到单台宿主机(异步)
       description: >-
+        #309/#333 — Install a specific version snapshot onto ONE host. Reads the snapshot from the
         version-snapshots DDB table, selects exactly the disks named by that snapshot's manifest.json
         (rootfs / data-template / immutable) plus manifest.json itself (ignores other versions' disks
         in the snapshot — deterministic), fetches each by its exact S3 VersionId, verifies ETag, then
@@ -3928,6 +4148,7 @@ paths:
                   status:
                     type: string
                     description: >-
+                      #394 — for slot=live this is `upgrading`; for slot=canary the host status
                       is NOT changed, so this echoes the host''s current real status (e.g.
                       active/idle).
                   job_id:
@@ -4019,6 +4240,7 @@ paths:
       operationId: promoteCanary
       summary: 把该 host 的 canary 槽提升为 live(同步,#394)
       description: >-
+        #394 — Synchronously promote the host''s canary slot to live. Only rewrites the small
         slots.json pointer (no disk move), so it returns 200 in seconds — no async job. CAS is on
         snapshot_time only: the caller must pass the expected_canary_snapshot_time it verified; if
         the current canary snapshot_time differs, returns 409 CANARY_CHANGED and writes nothing
@@ -4087,6 +4309,7 @@ paths:
           description: OPERATION_STATUS_UNKNOWN (write not confirmed; retry with same Idempotency-Key).
       tags:
         - 主机与镜像
+  # #394 —— rollback-image 已移除:回滚 = pull 老版到 live(POST /hosts/{id}/pull-image?slot=live)。
   # pull 有快路径:目标版本目录已 .complete(装齐)时跳过下载/解压,直接翻 slots.live 指针(秒级);
   # 半装目录(下载中断/盘满,无 .complete)判不完整 → 正常重下自愈。这与 Lambda alias / K8s revision
   # 的"选定一个已保留版本重指指针"模型一致,不再需要独立的 live↔previous_live swap 操作。
@@ -4095,6 +4318,7 @@ paths:
       operationId: hostImageSlots
       summary: 读该 host 磁盘上真实的镜像状态(#394 debug 视图)
       description: >-
+        #394 — Read the REAL on-disk image state of one EC2 host via SSM: its actual
         slots.json (live/canary/previous_live/generation) plus the installed version dirs
         under /data/firecracker-assets/versions/. This is the authoritative counterpart to
         the possibly-stale DDB image_slots mirror returned by GET /hosts — the response also
@@ -4139,6 +4363,7 @@ paths:
           description: Could not read from host via SSM — offline/unreachable (code DEPENDENCY_UNAVAILABLE).
       tags:
         - 主机与镜像
+  # #394 —— DELETE /hosts/{instance_id}/image-slots/canary (cleanupCanary) 已移除,精简 API。
   # 放弃未提升的 canary 无需显式清指针:下次 `pull-image?slot=canary` 覆盖该槽,promote 成功也会
   # 清空它;磁盘回收由 reclaim-images 承担(保护 {live,canary,previous_live}∪租户固定版本)。
   /hosts/{instance_id}/reclaim-images:
@@ -4146,6 +4371,7 @@ paths:
       operationId: reclaimImages
       summary: 回收该 host 上无人引用的版本目录(手动 prune,释放盘,#394)
       description: >-
+        #394 — Manual disk prune. Deletes every versions/<snapshot>/ directory on the host that is
         NOT in the protected keep-set. The keep-set is computed server-side (the host cannot see DDB
         tenant pins) as {live, canary, previous_live} ∪ {every snapshot_time still pinned by a
         non-deleted tenant on this host}, and passed to the host as an explicit allowlist — the host
@@ -4206,6 +4432,7 @@ paths:
       operationId: pullImageProgress
       summary: 查询单台宿主机 pull-image 进度(SageMaker ProcessingJob 风格)
       description: >-
+        #309/#333 — Poll the progress of a pull-image job on ONE host. Reads the host's pull_command_id
         from DDB, then SSM-tails /tmp/<job_id>.txt on the host: the last line decides the tri-state, and
         the most recent ERROR:<CODE> line becomes the failure detail. Returns SageMaker ProcessingJob-style
         JSON. If a terminal error was persisted to DDB (last_pull_error) but the progress file can't be
@@ -4225,6 +4452,7 @@ paths:
           schema:
             type: string
           description: >-
+            #394 — exact pull-job lookup. New clients SHOULD always pass it. Unknown job_id or a
             job that belongs to a different host → 404 JOB_NOT_FOUND (never silently falls back
             to "this host''s latest"). Absent (compat window) → the host''s most recent job, else
             the legacy host.pull_command_id path. When the persisted job is already terminal, the
@@ -4383,6 +4611,7 @@ paths:
       operationId: copyFileFromS3
       summary: 从 S3 拷贝单个文件到宿主机指定位置(同步)
       description: >-
+        #309/#334 — Copy ONE file from S3 to a specific path on ONE host (synchronous; single-file copy is
         seconds). For updating host scripts only — the target must be under /opt/openclaw/ (.py host-agent
         service) or /home/ubuntu/ (.sh + lib/*); the image-disk dir /data/firecracker-assets/ is off-limits
         (that's pull-image's job). Landed file is chown ubuntu:ubuntu + chmod 755 (host-agent runs as
@@ -5074,6 +5303,11 @@ paths:
         返 503,期望态与内核均未改动,重试安全)。
 
         每次调用都先落一条命名版本(回滚锚点),再写期望态、再下发;记不下锚点就不下发。
+
+        `allow[]` 的作用域下界由 `EGRESS_EXTRA_ALLOW_MIN_PREFIX` 决定(默认 /24，最宽 /16)。
+        比默认更宽的洞会被放行，但响应体的 `extra_allow_scope` 会显式回报这次开了多宽
+        (#668) —— 风险由调用方承担。想在下发前先看判定，用
+        POST /hosts/egress/allow/validate(只读 dry-run)。
       x-source: deploy/lambda/api/services/egress_admin_service.py:1348
       x-rbac: admin
       requestBody:
@@ -5160,8 +5394,10 @@ paths:
                         type: string
                         description: |-
                           必填 IPv4 IP/CIDR。IPv6 拒(链是 IPv4-only);覆盖 IMDS
-                          169.254.169.254 拒;前缀比 EGRESS_EXTRA_ALLOW_MIN_PREFIX(默认且
-                          最低 /24)更宽拒;等于或包含 VPC_CIDR / TENANT_SUPERNET 拒。
+                          169.254.169.254 拒;前缀比 EGRESS_EXTRA_ALLOW_MIN_PREFIX 更宽拒 ——
+                          该 env 默认 /24，可放宽到最宽 /16(#668)，也可收紧到 /32；写得比
+                          /16 更宽会被绝对下界压回 /16;等于或包含 VPC_CIDR /
+                          TENANT_SUPERNET 拒。
                         example: 10.20.30.0/24
                   x-source: deploy/lambda/api/services/egress_admin_service.py:169
                 revision_name:
@@ -5217,7 +5453,8 @@ paths:
             `pinned=true` 与 `targets="all"` 并用;`allow` 非数组或某项非对象;
             `allow[i].proto` 非 tcp|udp;`allow[i].dport` 非整数或越界或命中红线端口
             (8081 不在红线内,#660 起走通用护栏);`allow[i].dst` 缺失 / 非 IP-CIDR / 非 IPv4 / 覆盖 IMDS /
-            前缀过宽 / 等于或包含 VPC_CIDR 与 TENANT_SUPERNET;`revision_name` 超 48 字符 /
+            前缀过宽(下界 = env，绝对下界 /16) / 等于或包含 VPC_CIDR 与 TENANT_SUPERNET;
+            `revision_name` 超 48 字符 /
             含非 `[A-Za-z0-9._-]` 字符 / 以 `__` 开头。`revision_name` 空串**不是** 400 ——
             它与省略同义,走自动取名(`egress_admin_service.py:779`)。
           content:
@@ -5808,6 +6045,100 @@ paths:
                 x-source: deploy/lambda/api/services/egress_admin_service.py:1746
       tags:
         - 主机与镜像
+  /hosts/egress/allow/validate:
+    post:
+      operationId: fleetEgressAllowValidate
+      summary: 只读 dry-run:逐条判定 allow 并回显当前阈值
+      description: |-
+        只读、幂等的 allow admission dry-run。逐条返回 accept/reject、机器可读 criterion、
+        当前前缀下界与受保护网络坐标;不写 DDB、不发 SSM、不落 revision。
+
+        判定与 POST /hosts/egress 共用同一个 admission 实现。单条输入同时命中多个判据时
+        只报顺序中的第一条,错误串与 POST 的首个 400 完全同源;不同条目之间不短路。
+      x-source: deploy/lambda/api/services/egress_admin_service.py:301
+      x-rbac: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - allow
+              properties:
+                allow:
+                  type: array
+                  maxItems: 64
+                  items:
+                    type: object
+                    required:
+                      - proto
+                      - dport
+                      - dst
+                    properties:
+                      proto:
+                        type: string
+                        enum:
+                          - tcp
+                          - udp
+                      dport:
+                        type: integer
+                        minimum: 1
+                        maximum: 65535
+                        description: |-
+                          必须是 JSON 整数。字符串 `"443"` 与布尔值都 400(#631 修复后)。
+                          红线端口(平台内部/数据存储端口)一律拒;8081 与其它非红线端口同
+                          路,不再要求精确等于某个 SPIRE server /32(#660)。
+                      dst:
+                        type: string
+                        description: |-
+                          必填 IPv4 IP/CIDR。IPv6 拒(链是 IPv4-only);覆盖 IMDS
+                          169.254.169.254 拒;前缀比 EGRESS_EXTRA_ALLOW_MIN_PREFIX 更宽拒 ——
+                          该 env 默认 /24，可放宽到最宽 /16(#668)，也可收紧到 /32；写得比
+                          /16 更宽会被绝对下界压回 /16;等于或包含 VPC_CIDR /
+                          TENANT_SUPERNET 拒。
+                        example: 10.20.30.0/24
+      responses:
+        '200':
+          description: 所有条目的逐条判定、当前阈值、编码结果与作用域回报。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FleetEgressAllowValidateResult'
+        '400':
+          description: |-
+            入参或环境配置非法。代码原始错误串:
+            `body must be a JSON object`;
+            `allow is required (a list of {proto,dport,dst})`;
+            `allow must be a list of {proto,dport,dst}`;
+            `allow must contain at most 64 entries`;
+            `EGRESS_EXTRA_ALLOW_MIN_PREFIX must be an integer between 0 and 32`。
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  got:
+                    type: integer
+                    description: 仅 allow 超过 64 条时返回实际条数。
+        '403':
+          description: 调用者身份不是 admin,或前置 RBAC 路由门拒绝。
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: 'forbidden: fleet egress admin requires admin'
+                  required:
+                    type: string
+                    enum:
+                      - admin
+      tags:
+        - 主机与镜像
   /images:
     get:
       operationId: listImages
@@ -5893,6 +6224,7 @@ paths:
       operationId: deleteImageSnapshot
       summary: 软删除一条镜像快照记录(#394,引用保护)
       description: >-
+        #394 — Soft-delete a global image snapshot record. Symmetric with
         POST /create-image-snapshot: takes snapshot_time in the JSON body (not a colon-bearing
         ISO timestamp in the path). Marks the version-snapshots row status=deleted + deleted_at
         (does NOT physically remove the DDB row, S3 deployment/ objects, or hosts' local version
@@ -5956,6 +6288,7 @@ paths:
       operationId: createImageSnapshot
       summary: 给 assets 桶打一个版本快照(等价 snapshot-version.sh)
       description: >-
+        #376. Take a version snapshot of the assets bucket: scans the S3 `deployment/` prefix for ALL
         current-version objects (rootfs image + scripts + edge + litellm + monitoring), records each
         object's {path, s3_version_id, etag}, and writes one row to DynamoDB openclaw-version-snapshots
         (primary key snapshot_time, format %Y-%m-%dT%H:%M:%SZ — matches the regex pull-image enforces, so
@@ -6057,6 +6390,7 @@ paths:
       operationId: listImageVersions
       summary: 列出黄金镜像的各版本快照(供选择时间点 pull)
       description: >-
+        #337(原 #217 GET /snapshots,改名避免与 /images 列镜像文件混淆)。Read-only listing of the
         version-snapshots table metadata (snapshot_time + label + file_count) so the console can let an
         operator pick which point-in-time snapshot to pull onto a host (pairs with
         POST /hosts/{id}/pull-image?snapshot_time=). Sorted by snapshot_time descending (newest first).

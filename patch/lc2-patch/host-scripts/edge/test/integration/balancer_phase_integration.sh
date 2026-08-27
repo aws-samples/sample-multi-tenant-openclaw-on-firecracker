@@ -580,13 +580,83 @@ run_arm_warmup_negative() {
 n_getenv="$(grep -c 'os%.getenv("ENGINE_REDIS' "$EDGE_DIR/route.lua" || true)"
 check "静态: route.lua 不再用 os.getenv 读 Redis 坐标(nginx 会抹掉 env)" \
     "$([ "$n_getenv" = "0" ] && echo 0 || echo 1)" "命中=$n_getenv"
-n_hints=0
-for ph in ENGINE_REDIS_HOST ENGINE_REDIS_PORT ENGINE_REDIS_READER_HOST ENGINE_REDIS_READER_PORT; do
-    awk '/init_by_lua_block/{f=1} f&&/^    }/{f=0} f' "$EDGE_DIR/nginx.conf" \
-        | grep -qF "\${$ph}" && n_hints=$((n_hints + 1))
-done
+#
+# #658:占位符这条断言此前是 flaky —— 同一份 nginx.conf(blob d92490b9)在 2026-08-26
+# 的四个 bb job 里给出两种结论:27974877 与 27975616 判「命中=3/4」FAIL,27975951 与
+# 27976450 判 4/4 PASS。它既能随机拦下与改动无关的 MR,也能在真该红时随机判绿。
+# 判定逻辑因此抽成 count_hint_placeholders(),并配三条自证臂锁住它的性质:
+#   可重复(同一输入判定恒定)、能识块(块外出现不算)、真缺占位符必须判红。
+# 实现要点(两处都是 flaky 的来源,一起去掉):
+#   1. 不再 `awk 窗口 | grep -qF`。脚本全局 `set -uo pipefail`,`grep -q` 命中即退出,
+#      awk 的后续写入拿到 EPIPE 后以非零码死掉,pipefail 于是把整个管道判成失败,
+#      `&&` 不加计数 —— 该占位符被漏计。是否发生取决于 grep 退出与 awk 下一次写入
+#      的先后,所以同一份文件会给出不同结论(runner 实测 40 轮里出现 3 和 4 两种)。
+#      改成单个 awk 进程算完,没有管道,退出码只有它自己的。
+#   2. 块边界不再按 /^    }/ 猜缩进,改成花括号配对计数:块内只要出现一行缩进恰好
+#      四格的闭合花括号(嵌套 Lua 表就会),旧写法立刻收窗,后面的占位符全数不到。
+count_hint_placeholders() { # count_hint_placeholders <nginx.conf> → 命中数(0-4)
+    awk '
+        BEGIN {
+            split("ENGINE_REDIS_HOST ENGINE_REDIS_PORT ENGINE_REDIS_READER_HOST ENGINE_REDIS_READER_PORT", nm, " ")
+            for (i = 1; i <= 4; i++) want[i] = "${" nm[i] "}"
+        }
+        {
+            line = $0
+            if (!inblk) {
+                if (line ~ /^[ \t]*#/) next                      # 注释里提到指令名不算开块
+                if (index(line, "init_by_lua_block") == 0) next
+                inblk = 1; depth = 0
+            }
+            for (i = 1; i <= 4; i++) if (index(line, want[i])) seen[i] = 1
+            opens = gsub(/\{/, "{")                              # 替换成自身:只取计数,不改内容
+            closes = gsub(/\}/, "}")
+            depth += opens - closes
+            if (depth <= 0) inblk = 0
+        }
+        END { n = 0; for (i = 1; i <= 4; i++) if (i in seen) n++; printf "%d", n }
+    ' "$1"
+}
+n_hints="$(count_hint_placeholders "$EDGE_DIR/nginx.conf")"
 check "静态: nginx.conf 的 init_by_lua_block 带齐四个坐标占位符" \
     "$([ "$n_hints" = "4" ] && echo 0 || echo 1)" "命中=$n_hints/4"
+
+# 自证臂 1(可重复):同一份文件连判 N 轮,命中数必须只出现一个取值。
+# 这条才是 #658 的回归 —— 单次判定看不出 flaky,只有重复判定的取值集合能。
+HINT_ROUNDS="${OC_EDGE_HINT_ROUNDS:-40}"
+: >"$WORK/hint-rounds.txt"
+for _i in $(seq 1 "$HINT_ROUNDS"); do
+    printf '%s\n' "$(count_hint_placeholders "$EDGE_DIR/nginx.conf")" >>"$WORK/hint-rounds.txt"
+done
+hint_set="$(sort -u "$WORK/hint-rounds.txt" | tr '\n' ' ')"
+check "自证: 占位符判定可重复($HINT_ROUNDS 轮取值集合只有一个元素,#658)" \
+    "$([ "$(sort -u "$WORK/hint-rounds.txt" | wc -l | tr -d ' ')" = "1" ] && echo 0 || echo 1)" \
+    "$HINT_ROUNDS 轮观测到的命中数集合=[$hint_set]"
+
+# 自证臂 2(能识块):把整块摘掉、只把四个占位符留在块外,必须判 0。
+# 少了这条,判定退化成全文 grep 也能一直绿,而通道其实已经断了。
+sed '/init_by_lua_block/,/^    }/d' "$EDGE_DIR/nginx.conf" >"$WORK/hint-outside.conf"
+# shellcheck disable=SC2016  # 占位符要的就是字面量,不能展开
+printf '# ${ENGINE_REDIS_HOST} ${ENGINE_REDIS_PORT} ${ENGINE_REDIS_READER_HOST} ${ENGINE_REDIS_READER_PORT}\n' \
+    >>"$WORK/hint-outside.conf"
+n_outside="$(count_hint_placeholders "$WORK/hint-outside.conf")"
+check "自证: 占位符只出现在 init_by_lua_block 之外时判 0(不许退化成全文 grep)" \
+    "$([ "$n_outside" = "0" ] && echo 0 || echo 1)" "命中=$n_outside/4,期望 0"
+
+# 自证臂 3(块内嵌套花括号):块内插入一对配平的嵌套花括号,其中闭合行的缩进恰好四格。
+# 旧实现按 /^    }/ 关窗,会在这里提前收窗、把后面的占位符全数不到(判 0);块界定
+# 按花括号配对计数才能仍判 4。这份 fixture 只喂给静态计数,不喂 openresty。
+awk '{ print }
+     !ins && index($0, "init_by_lua_block") { print "        local _probe = {"; print "    }"; ins = 1 }' \
+    "$EDGE_DIR/nginx.conf" >"$WORK/hint-nested.conf"
+n_nested="$(count_hint_placeholders "$WORK/hint-nested.conf")"
+check "自证: 块内出现缩进四格的嵌套闭合花括号时仍判 4(不靠缩进猜块边界)" \
+    "$([ "$n_nested" = "4" ] && echo 0 || echo 1)" "命中=$n_nested/4,期望 4"
+
+# 反向臂:真抠掉一个坐标占位符必须判红 —— 一条改动前后都通过的断言不算判据。
+sed '/reader_port  *= /d' "$EDGE_DIR/nginx.conf" >"$WORK/hint-missing.conf"
+n_missing="$(count_hint_placeholders "$WORK/hint-missing.conf")"
+check "反向: 抠掉一个坐标占位符后必须判不齐(证明这条门不是恒绿)" \
+    "$([ "$n_missing" = "3" ] && echo 0 || echo 1)" "命中=$n_missing/4,期望 3"
 
 run_arm A
 run_arm B

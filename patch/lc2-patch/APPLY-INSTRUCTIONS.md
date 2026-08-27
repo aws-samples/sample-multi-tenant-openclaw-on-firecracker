@@ -3,9 +3,11 @@
 `manifest.json` is the single source of truth. When this document and the manifest disagree
 about a hash, a path or a logical id, the manifest wins.
 
-- range: gateway `c9fd494ff4a76929f205f52464047a9185c7c49a` → `10e38efc18073279a9e74eee4ce371e3dfa08edd`
+- range: gateway `c9fd494ff4a76929f205f52464047a9185c7c49a` → `f4c1dedcc09d3ee78a55d9bad89a27cf22694bd2`
 - the base is the `patch_sha` of `patch/lifecycle-op-patch`, i.e. **the revision this
-  environment is actually on**. 228 paths, 22 fixes, 29 verifications.
+  environment is actually on**. 234 paths, 26 fixes, 42 verifications.
+- this is the **only** kit to apply for that hop. It is one hop, not a chain:
+  `lifecycle-op-patch` → `lc2-patch`.
 - `status: MANUAL_REVIEW`. Every operation that owns a synthesized CloudFormation resource is
   `MANUAL_CLI_REVIEW` by design — read why in step 4 before you approve anything.
 - No step here updates a CloudFormation stack.
@@ -33,6 +35,19 @@ can never tell you whether the fix worked.
 travels with them because `backend.lua` computes `LOCK_TIMEOUT_SEC` from
 `redis_client.MAX_SEQUENTIAL_READS` **at module load time** — a newer `backend.lua` beside an
 older `redis_client.lua` fails to load the module. There is no separate prerequisite to run.
+
+Two kits that briefly existed for slices of this same range are **gone from the gateway tree**,
+folded in here so an operator is never offered overlapping upgrades for one hop:
+
+| removed kit | what it covered | where it lives now |
+| --- | --- | --- |
+| `patch/egress-207-patch` | `POST /hosts/egress` `wait=true` answering 200 on an incomplete collection | fix `#657`, same `egress_admin_service.py` bytes |
+| `patch/auto-8f86347b` | the same increment plus the SSM `TimeoutSeconds` lower bound | fix `#657` (`params_changed` records the derived value) |
+
+Their directories were deleted rather than their merges reverted: reverting would also have
+undone the product content they carried and dropped the `bb-baseline:` anchors their markers
+record, which the next publish reads to compute its increment. The product content and both
+markers stay in place.
 
 ## Step 0 — Discover the environment, then prove the kit is authentic
 
@@ -539,8 +554,39 @@ at promote and issues no instance refresh — so a hot-fixed live host still cov
 
 ## Step 6 — Verification
 
-`manifest.json` `verifications[]` carries all 36 checks with exact `action`, `observable`,
-`pass_when` and `fail_when`: 25 read-only, 6 lifecycle, 5 optional. Run every read-only check.
+`manifest.json` `verifications[]` carries all 42 checks with exact `action`, `observable`,
+`pass_when` and `fail_when`: 30 read-only, 7 lifecycle, 5 optional. Run every read-only check.
+
+Two of the new checks are worth reading before you run them. `v-657-partial-collection-attribution`
+is a **source-level pin**, not a live call: it asserts the shipped `fleet_egress` body carries the
+207 decision, the three attribution fields and the `targets="all"` exemption. It cannot prove the
+endpoint's runtime answer, and its `fail_when` says so. `v-658-placeholder-count-is-repeatable` runs
+the shipped counter 40 times on one unchanged `nginx.conf` and asserts the **set** of verdicts has a
+single element — a single run cannot observe the flakiness that check exists for.
+
+Four of the new checks are worth reading before you run them.
+
+`v-657-ssm-timeout-lower-bound` compiles **only** `_dispatch_apply` out of the shipped bytes and
+calls it with a recording stub in place of `clients.ssm`, so the six `EGRESS_APPLY_TIMEOUT` values
+are read out of the function body rather than recomputed by the check. Importing the module is not
+an option and must not be made one: the kit ships 4 of `core/`'s 34 files by design, so the import
+chain would reach modules it correctly does not carry.
+
+`v-657-partial-collection-attribution` does the same for `fleet_egress` and drives three collection
+outcomes: a targeted call that came back short must answer **207** with the missing id named, the
+same call complete must answer **200**, and `targets="all"` with a DDB snapshot larger than what
+answered must still answer 200 — a set difference there would manufacture a permanent 207.
+
+`v-657-deployed-package-carries-the-clamp` downloads the package the live function is actually
+running and asserts its `services/egress_admin_service.py` is **byte-identical** to the artifact this
+kit ships, which is what carries the measured six-value result over to the deployment. It does not
+prove the endpoint's response for an `EGRESS_APPLY_TIMEOUT` at or below 19; inducing that would mean
+setting an illegal timeout on a running control plane.
+
+`v-658-block-boundary-is-brace-paired` covers #658's **second** root cause. The repeatability check
+alone passes even with the old indentation-guessed boundary restored, so this one asserts the counter
+contains no pipe at all and still counts 4 on a fixture whose nested closing brace sits at exactly
+four spaces.
 
 Three of the optional five never pass by design — they exist so a gap is counted instead of hidden:
 `v-659-failed-entry-not-exercised` (reaching `status=failed` needs the deadline fence to fire

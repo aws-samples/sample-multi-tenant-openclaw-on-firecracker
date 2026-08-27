@@ -1,7 +1,7 @@
 {
   "id": "lc2-patch",
   "base_sha": "c9fd494ff4a76929f205f52464047a9185c7c49a",
-  "patch_sha": "a57a292a1edc8a91b24a2a906baeac4c255429bf",
+  "patch_sha": "f4c1dedcc09d3ee78a55d9bad89a27cf22694bd2",
   "status": "MANUAL_REVIEW",
   "excludes": [],
   "cloudformation": {
@@ -20,15 +20,15 @@
         "source_tree": "e3bde83cd47872f5f777d37b0d3e8a84f1e12b45",
         "assembly_index": {
           "artifact": "resources/cloudformation/base.assembly-index.json",
-          "sha256": "8d249634490d5f021bb0c03d8b06f53e19357113e9e2db2577451f577c014b49"
+          "sha256": "d32358a3485dcb2d275b506ae22fbdd29ec7400ef20ccafe0d00ff1f2280b31d"
         }
       },
       "patch": {
-        "source_sha": "a57a292a1edc8a91b24a2a906baeac4c255429bf",
-        "source_tree": "8e2cfe80b3edc39c35e3120a485e5e567560cda1",
+        "source_sha": "f4c1dedcc09d3ee78a55d9bad89a27cf22694bd2",
+        "source_tree": "77a84d8fb36a33dd08bd494f78cfef74ee1e014e",
         "assembly_index": {
           "artifact": "resources/cloudformation/patch.assembly-index.json",
-          "sha256": "4d9d252cb3cab6663af6cb41b2afd4fae703ba2cfe275cfc6fd73fbf1c664d5f"
+          "sha256": "ca547faf157ab92f67db8a64d63717fbe573e6122c9eed40a5933244b9ff08ca"
         }
       }
     },
@@ -54,7 +54,7 @@
         },
         "patch_template": {
           "artifact": "resources/cloudformation/OpenClawImage.patch.json",
-          "sha256": "f8b1718db1166dc5b4d8e5e1251d5b0f78c6973c4ac5532c59c194e2c60a26ff"
+          "sha256": "21d20c0e7b231e1d66b95d3593f4fae507c7814c9487ecb67d28499db5667ffa"
         }
       },
       {
@@ -62,11 +62,11 @@
         "name": "OpenClawOrchestrator",
         "base_template": {
           "artifact": "resources/cloudformation/OpenClawOrchestrator.base.json",
-          "sha256": "8ac9836023744f94b5ee3dd432f35ffdaf64a72d53115041d2fb3a6d472249c2"
+          "sha256": "0e6b907c915f2eb2017fbab4b7a417daecb3ebe10ace8fadd21ad7a5999a0802"
         },
         "patch_template": {
           "artifact": "resources/cloudformation/OpenClawOrchestrator.patch.json",
-          "sha256": "493ff1e3d67d0dc47da9fa82a61a1c1fe15f29340e4d88ed232f3cae1cbd83da"
+          "sha256": "cb4c50aee3d4bde7e6949a61b13fdd62c378133a23fc44b7377e3a189c225fd6"
         }
       }
     ]
@@ -527,7 +527,7 @@
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
       "base_sha256": null,
-      "patch_sha256": "4712792ad15bc16974b8479e9c33d44541c82c1694a731ec1b64e8be1ef88d0e",
+      "patch_sha256": "37a68079676aa3559c99f24c9a50eea134cc77233e06a9a01183577fa6404f6d",
       "operations": [
         {
           "resource": "file:deploy/edge/test/integration/balancer_phase_integration.sh",
@@ -543,7 +543,8 @@
       "fix_ids": [
         "#628",
         "#633",
-        "#639"
+        "#639",
+        "#658"
       ]
     },
     "deploy/edge/test/integration/run_local_docker.sh": {
@@ -799,7 +800,7 @@
       "artifact_status": "SHIPPED",
       "artifact_disposition": null,
       "base_sha256": "aff632766c49f9ded23960d0646f1eb4539501269c997b41832407f3840bd6c4",
-      "patch_sha256": "8c45cb9f456fa0f4aedc647c49e8f2d4f01d9a1135501fe39736e90176b17385",
+      "patch_sha256": "ad8b6cf1e2d79847428c87f5469b658ea2c61f559aa58facdf10d7db3eca24e1",
       "operations": [
         {
           "resource": "file:deploy/lambda/api/services/egress_admin_service.py",
@@ -814,7 +815,8 @@
       ],
       "fix_ids": [
         "#631",
-        "#660"
+        "#660",
+        "#657"
       ]
     },
     "deploy/lambda/api/services/fleet_service.py": {
@@ -1096,13 +1098,13 @@
           "resource_refs": [
             {
               "stack": "OpenClawOrchestrator",
-              "logical_id": "ApiHandlerCurrentVersion5C7F0A60f2f83106cf7f461019e031c393284f2e",
+              "logical_id": "ApiHandlerCurrentVersion5C7F0A60ab056a2320a4c19aaebe418097c34767",
               "resource_type": "AWS::Lambda::Version",
               "change": "A"
             },
             {
               "stack": "OpenClawOrchestrator",
-              "logical_id": "ApiHandlerCurrentVersion5C7F0A60157c3ffc4c2e2258e3e95530ae9f2022",
+              "logical_id": "ApiHandlerCurrentVersion5C7F0A60c40d5772acd39b7384c931a73ff1645b",
               "resource_type": "AWS::Lambda::Version",
               "change": "D"
             },
@@ -1364,7 +1366,7 @@
         "evidence": "path-derived-meta"
       },
       "base_sha256": "1d593c4fbc3c7eef4099d08696be98a39a712f89f3d349c9f9c1ffd6bc89a94c",
-      "patch_sha256": "b0b6fb8eb0f3d53ff25853801e2ff96b45f4bddcacea2ab125fb5e952755bf1d",
+      "patch_sha256": "0179ac980c2951b81fa2969fcb88c5f99d53d1181524eb4f81bafa55a3447598",
       "operations": [
         {
           "resource": "doc:docs/aws-guide/openapi.yaml",
@@ -1379,7 +1381,8 @@
       ],
       "fix_ids": [
         "#636",
-        "#660"
+        "#660",
+        "#657"
       ]
     },
     "patch/edge-balancer-cosocket-606/APPLY-INSTRUCTIONS.md": {
@@ -6350,6 +6353,33 @@
         "kit-sync"
       ]
     },
+    "patch/manifest-2026-08-27-082839-8f86347b.json": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "20d58b47b8c4d89f2514def3f35bd1f1dc4d6f94c8ad6b5e84bba564c5641a01",
+      "operations": [
+        {
+          "resource": "doc:patch/manifest-2026-08-27-082839-8f86347b.json",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git log -1 --format=%H -- patch/manifest-2026-08-27-082839-8f86347b.json",
+          "rollback_cli": "git checkout -- patch/manifest-2026-08-27-082839-8f86347b.json",
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "kit-sync"
+      ]
+    },
     "patch/push-marker-2026-08-25-220623-179a6aea.md": {
       "change": "A",
       "layer": "meta",
@@ -6422,6 +6452,33 @@
           "apply_cli": null,
           "verify_cli": "git log -1 --format=%H -- patch/push-marker-2026-08-27-011252-3af2deed.md",
           "rollback_cli": "git checkout -- patch/push-marker-2026-08-27-011252-3af2deed.md",
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "kit-sync"
+      ]
+    },
+    "patch/push-marker-2026-08-27-082839-8f86347b.md": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "7dce72ed3d87d200e08e2a6bfb6ecaf2d4dfcbff7eea522b7597a73e38fbb87a",
+      "operations": [
+        {
+          "resource": "doc:patch/push-marker-2026-08-27-082839-8f86347b.md",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git log -1 --format=%H -- patch/push-marker-2026-08-27-082839-8f86347b.md",
+          "rollback_cli": "git checkout -- patch/push-marker-2026-08-27-082839-8f86347b.md",
           "artifact_refs": [],
           "rollback_policy": "NONE",
           "resource_refs": []
@@ -6863,6 +6920,43 @@
       ]
     },
     {
+      "id": "#657",
+      "summary": "Two defects on `POST /hosts/egress` with `wait=true`, both in the same dispatch path. (a) An incomplete collection still answered 200 with ok=true. `_collect` only reports invocations that came back inside the window; a targeted host that never answered was neither counted as a failure nor back-filled, so `host_count` could be smaller than the number of targets while `ok` stayed true — and the rollback side already treated the same situation as a failure, so the two paths disagreed about the same fleet. The targeted path now computes the missing set, reports `expected_host_count` / `missing_hosts` / `collection_incomplete`, folds it into `ok`, and answers 207. `targets=\"all\"` deliberately does NOT do this: its expected set is a DDB snapshot that can contain terminated or SSM-unmanaged hosts and can miss a just-registered host the tag fan-out will still hit, so a set difference there would manufacture a permanent 207 — it reports the count only. (b) `TimeoutSeconds=timeout + 10` could derive an illegal SSM parameter. SSM's minimum is 30 and boto rejects anything smaller at the parameter-validation layer, before the call leaves the process; `timeout` comes from `EGRESS_APPLY_TIMEOUT`, which an operator may set to any value, so any setting at or below 19 made every `POST /hosts/egress` return 502 — the endpoint was entirely unavailable, not merely degraded. Clamped at the dispatch site with `max(30, timeout + 10)`.",
+      "paths": [
+        "deploy/lambda/api/services/egress_admin_service.py",
+        "docs/aws-guide/openapi.yaml"
+      ],
+      "applies_when": "always",
+      "params_changed": [
+        {
+          "name": "SSM SendCommand TimeoutSeconds derived by _dispatch_apply for the egress chain",
+          "layer": "C-lambda",
+          "old_default": "timeout + 10, i.e. 100s at the shipped EGRESS_APPLY_TIMEOUT default of 90",
+          "new_default": "max(30, timeout + 10), i.e. still 100s at the shipped default of 90",
+          "runtime_impact": "On a default deployment nothing changes: EGRESS_APPLY_TIMEOUT defaults to 90, so both expressions yield 100. The clamp only bites when an operator lowers EGRESS_APPLY_TIMEOUT to 19 or less, where the old expression produced a value below SSM's minimum of 30 and boto refused the call — every POST /hosts/egress answered 502. After the clamp the same setting keeps a short collection budget (that is a legitimate operational choice) while the SSM delivery deadline stays legal, so the endpoint answers instead of failing. The clamp is at the dispatch site rather than inside _apply_timeout() on purpose: the two numbers mean different things — timeout is our own collection budget, whose real ceiling is the API Gateway 29s window, whereas TimeoutSeconds is the deadline after which SSM abandons delivery. Raising the collection budget to satisfy SSM would silently change how long the caller waits."
+        }
+      ],
+      "verification_ids": [
+        "v-657-ssm-timeout-lower-bound",
+        "v-657-partial-collection-attribution",
+        "v-657-deployed-package-carries-the-clamp"
+      ]
+    },
+    {
+      "id": "#658",
+      "summary": "The edge integration gate's `init_by_lua_block` placeholder check was flaky: the same nginx.conf was judged 3/4 (FAIL) and 4/4 (PASS) by different runs, so it could block an unrelated change at random and pass at random when it should have failed. Two independent causes, both removed. First, the check was `awk <window> | grep -qF`; under the script's `set -uo pipefail`, `grep -q` exits on its first match, awk's next write gets EPIPE and dies non-zero, pipefail then fails the whole pipeline and the `&&` never incremented the counter — so whether a placeholder was counted depended on the race between grep exiting and awk writing again. The count is now done inside a single awk process, with no pipe. Second, the block boundary was guessed from indentation (`/^    }/`), so any nested Lua table whose closing brace happened to sit at four spaces closed the window early and all later placeholders went uncounted; the boundary is now brace-pair counting. The logic is extracted into `count_hint_placeholders()` and locked by three self-proving arms plus a negative arm: repeatable across rounds, block-aware (placeholders outside the block count 0), nesting-proof, and genuinely red when a coordinate placeholder is actually removed.",
+      "paths": [
+        "deploy/edge/test/integration/balancer_phase_integration.sh"
+      ],
+      "applies_when": "always",
+      "params_changed": [],
+      "verification_ids": [
+        "v-658-placeholder-count-is-repeatable",
+        "v-658-placeholder-count-still-red-when-missing",
+        "v-658-block-boundary-is-brace-paired"
+      ]
+    },
+    {
       "id": "kit-sync",
       "summary": "Repo-copy synchronisation only: the public tree's copies of previously published patch kits and their per-sync manifests are brought to the same revision. Applying this touches no live AWS resource — it updates files in the operator's checkout so the next kit is cut from a tree matching what was published.",
       "paths": [
@@ -7057,9 +7151,11 @@
         "patch/manifest-2026-08-25-220623-179a6aea.json",
         "patch/manifest-2026-08-26-220659-1df0bbfe.json",
         "patch/manifest-2026-08-27-011252-3af2deed.json",
+        "patch/manifest-2026-08-27-082839-8f86347b.json",
         "patch/push-marker-2026-08-25-220623-179a6aea.md",
         "patch/push-marker-2026-08-26-220659-1df0bbfe.md",
-        "patch/push-marker-2026-08-27-011252-3af2deed.md"
+        "patch/push-marker-2026-08-27-011252-3af2deed.md",
+        "patch/push-marker-2026-08-27-082839-8f86347b.md"
       ],
       "applies_when": "always",
       "params_changed": [],
@@ -7453,6 +7549,72 @@
       "timeout_s": 30,
       "cleanup": null,
       "fix_id": "#660"
+    },
+    {
+      "id": "v-657-ssm-timeout-lower-bound",
+      "phase": "A-readonly",
+      "action": "set -o pipefail; python3 - <<'OCEOF'\nimport ast, pathlib, sys, types\n\nsrc = pathlib.Path('lambda/api/services/egress_admin_service.py').read_text()\ntree = ast.parse(src)\nfn = next((n for n in ast.walk(tree)\n           if isinstance(n, ast.FunctionDef) and n.name == '_dispatch_apply'), None)\nif fn is None:\n    print('FAIL the shipped module has no _dispatch_apply'); sys.exit(1)\n\n# Compile ONLY that function. Importing the module is not an option and must not be made\n# one: the kit ships 4 of core/'s 34 files on purpose (the overlay reuses the live\n# package's deps), so the import chain would reach modules it correctly does not carry.\nclass Recorder:\n    def __init__(self):\n        self.kwargs = None\n    def send_command(self, **kwargs):\n        self.kwargs = kwargs\n        return {'Command': {'CommandId': 'c-verification-stub'}}\n\nrec = Recorder()\nbudget = {'t': 90}\nns = {\n    '__builtins__': __builtins__,\n    'base64': __import__('base64'),\n    'clients': types.SimpleNamespace(ssm=rec),\n    '_ON_HOST': '__MODE__ __ENFORCE_PIN__ __DENY_RFC1918__ __REGION__ __EXTRA_ALLOW__',\n    '_REGION': 'us-east-1',\n    'HOST_TAG_ROLE': 'metal-host',\n    '_apply_timeout': lambda: budget['t'],\n}\nexec(compile(ast.Module(body=[fn], type_ignores=[]), 'shipped', 'exec'), ns)\ndispatch = ns['_dispatch_apply']\n\nproblems = []\nfor t, want in ((1, 30), (5, 30), (19, 30), (20, 30), (21, 31), (90, 100)):\n    budget['t'] = t\n    rec.kwargs = None\n    cid, err = dispatch('off', False, '', False, ['i-0verification'], False)\n    if rec.kwargs is None:\n        problems.append('EGRESS_APPLY_TIMEOUT=%d: send_command was never called '\n                        '(cid=%r err=%r) — the check observed nothing' % (t, cid, err))\n        continue\n    got = rec.kwargs.get('TimeoutSeconds')\n    if got != want:\n        problems.append('EGRESS_APPLY_TIMEOUT=%d: the shipped body passed '\n                        'TimeoutSeconds=%r, expected %d' % (t, got, want))\n    b = rec.kwargs.get('Parameters', {}).get('executionTimeout')\n    if b != [str(t)]:\n        problems.append('EGRESS_APPLY_TIMEOUT=%d: executionTimeout=%r, expected [%r] — '\n                        'clamping the SSM delivery deadline must not move the on-host '\n                        'execution timeout' % (t, b, str(t)))\nprint('six EGRESS_APPLY_TIMEOUT values dispatched through the shipped _dispatch_apply body')\nif problems:\n    print('FAIL')\n    for p in problems:\n        print('  -', p)\n    sys.exit(1)\nprint('PASS the shipped body passes TimeoutSeconds 30/30/30/30/31/100 for '\n      'EGRESS_APPLY_TIMEOUT 1/5/19/20/21/90, and executionTimeout keeps the raw value')\nOCEOF",
+      "observable": "the SendCommand kwargs the shipped _dispatch_apply body actually passes, captured by a recording stub in place of clients.ssm: TimeoutSeconds (the delivery deadline) and the aws:runShellScript executionTimeout parameter (the on-host execution timeout)",
+      "pass_when": "TimeoutSeconds is exactly 30/30/30/30/31/100 for EGRESS_APPLY_TIMEOUT 1/5/19/20/21/90, and the aws:runShellScript executionTimeout parameter still carries the raw value for each",
+      "fail_when": "any value below SSM's minimum of 30 reaches TimeoutSeconds — that is the 502 this fix removes. Falsified in both directions before shipping: deleting the clamp makes the shipped body pass 11/15/29 for 1/5/19, and hardcoding max(30, 999) makes it pass 999, which is why the table is read out of the function body instead of recomputed here. executionTimeout moving also fails: that parameter is the aws:runShellScript plugin's ON-HOST execution timeout, a different number from SendCommand's TimeoutSeconds (the deadline before the command starts, minimum 30) and from the caller's own wait budget (the same `timeout` value passed separately to _collect). Clamping the delivery deadline must not move the other two. send_command never being called also fails — a check that observed nothing proves nothing",
+      "timeout_s": 120,
+      "cleanup": null,
+      "fix_id": "#657"
+    },
+    {
+      "id": "v-657-partial-collection-attribution",
+      "phase": "A-readonly",
+      "action": "set -o pipefail; python3 - <<'OCEOF'\nimport ast, json, pathlib, sys\n\nSRC = pathlib.Path('lambda/api/services/egress_admin_service.py').read_text()\nFN = next(n for n in ast.walk(ast.parse(SRC))\n          if isinstance(n, ast.FunctionDef) and n.name == 'fleet_egress')\n\n\ndef build(collected_ids, enumerated):\n    captured = {}\n\n    def _resp(status, body):\n        captured['status'] = status\n        captured['body'] = body\n        return {'statusCode': status, 'body': json.dumps(body, default=str)}\n\n    def _collect(command_id, timeout, expected_count=None):\n        captured['collect_timeout'] = timeout\n        return [{'instance_id': i, 'apply_exit': 0, 'ssm_status': 'Success',\n                 'pin_check': 'ok', 'rules_sha256': 'deadbeef', 'pinned_skip': False}\n                for i in collected_ids]\n\n    # Shapes taken from the real definitions, not guessed: _enumerate_hosts returns ids or\n    # (ids, rows); _read_host_rows_strict returns rows; _remove_egress_pins returns a\n    # 3-tuple; _record_revision returns (revision, error); _write_desired_state a count.\n    ns = {\n        '__builtins__': __builtins__,\n        'json': json,\n        'auth': type('A', (), {'_get_caller_identity':\n                               staticmethod(lambda ev: {'is_admin': True})})(),\n        'VALID_MODES': {'deny', 'off'},\n        '_apply_timeout': lambda: 90,\n        '_build_extra_allow': lambda spec: ('', None),\n        '_collect': _collect,\n        '_resp': _resp,\n        '_dispatch_apply': lambda *a, **k: ('c-stub', None),\n        '_enumerate_hosts': (lambda targets, include_rows=False:\n                             ((list(targets) if isinstance(targets, list) and targets\n                               else list(enumerated)), [])\n                             if include_rows else\n                             (list(targets) if isinstance(targets, list) and targets\n                              else list(enumerated))),\n        '_read_fleet_policy': lambda *a, **k: {},\n        '_read_host_rows_strict': lambda ids, *a, **k: [{'instance_id': i} for i in ids],\n        '_record_revision': lambda *a, **k: (1, None),\n        '_remove_egress_pins': lambda *a, **k: (0, [], 0),\n        '_summarize_rules_sha256': lambda vals: ('deadbeef', None),\n        '_write_desired_state': lambda ids, *a, **k: len(list(ids)),\n        '_write_fleet_policy': lambda *a, **k: None,\n        'e': None,\n    }\n    exec(compile(ast.Module(body=[FN], type_ignores=[]), 'shipped', 'exec'), ns)\n    return ns['fleet_egress'], captured\n\n\nproblems = []\n\n\ndef case(label, body, collected, enumerated, want_status, want_incomplete, want_missing):\n    fn, cap = build(collected, enumerated)\n    try:\n        fn(body=body)\n    except Exception as exc:\n        problems.append('%s: fleet_egress raised %s: %s'\n                        % (label, type(exc).__name__, exc))\n        return\n    b = cap.get('body') or {}\n    print('  %s: status=%s collection_incomplete=%s missing_hosts=%s ok=%s '\n          'host_count=%s expected_host_count=%s'\n          % (label, cap.get('status'), b.get('collection_incomplete'),\n             b.get('missing_hosts'), b.get('ok'), b.get('host_count'),\n             b.get('expected_host_count')))\n    if cap.get('status') != want_status:\n        problems.append('%s: status %s, want %s' % (label, cap.get('status'), want_status))\n    if b.get('collection_incomplete') != want_incomplete:\n        problems.append('%s: collection_incomplete %r, want %r'\n                        % (label, b.get('collection_incomplete'), want_incomplete))\n    if b.get('missing_hosts') != want_missing:\n        problems.append('%s: missing_hosts %r, want %r'\n                        % (label, b.get('missing_hosts'), want_missing))\n\n\ncase('targeted, one of two never answered',\n     {'mode': 'off', 'targets': ['i-aaa', 'i-bbb'], 'wait': True},\n     ['i-aaa'], ['i-aaa', 'i-bbb'], 207, True, ['i-bbb'])\ncase('targeted, both answered',\n     {'mode': 'off', 'targets': ['i-aaa', 'i-bbb'], 'wait': True},\n     ['i-aaa', 'i-bbb'], ['i-aaa', 'i-bbb'], 200, False, [])\ncase('targets=all, snapshot larger than what answered',\n     {'mode': 'off', 'targets': 'all', 'wait': True},\n     ['i-aaa'], ['i-aaa', 'i-bbb'], 200, False, None)\n\nif problems:\n    print('FAIL')\n    for p in problems:\n        print('  -', p)\n    sys.exit(1)\nprint('PASS targeted partial -> 207 with the missing set named; targeted complete -> 200; '\n      'targets=all never downgrades on collection count')\nOCEOF",
+      "observable": "the status code and response body the shipped fleet_egress body actually returns for three collection outcomes, with its 17 collaborators stubbed and _resp capturing what it answered",
+      "pass_when": "a targeted call whose collection came back short answers 207 with ok=false, collection_incomplete=true and the missing instance id named; the same call complete answers 200; and targets=\"all\" with a DDB snapshot larger than what answered still answers 200 with missing_hosts=null",
+      "fail_when": "the partial case answers 200 — that is the defect: the rollback path already judged the same fleet a failure, so the two disagreed. Falsified before shipping: restoring the pre-fix `all_ok` makes that case answer 200 and this check reports `status 200, want 207`. The third case fails if a set difference is applied to the fleet path, which would manufacture a permanent 207 out of a DDB snapshot that can contain terminated hosts. What this does NOT prove is the live endpoint's answer: producing a real missed window means making a targeted host miss it on a running control plane",
+      "timeout_s": 120,
+      "cleanup": null,
+      "fix_id": "#657"
+    },
+    {
+      "id": "v-657-deployed-package-carries-the-clamp",
+      "phase": "B-lifecycle",
+      "action": "set -o pipefail\n: \"${OPENCLAW_API_FN:?set OPENCLAW_API_FN to the control-plane function name}\"\n: \"${AWS_REGION:?set AWS_REGION}\"\nW=\"$(mktemp -d)\"\nURL=\"$(aws lambda get-function --function-name \"$OPENCLAW_API_FN\" --region \"$AWS_REGION\" \\\n        --query 'Code.Location' --output text)\"\ncurl -sS -o \"$W/live.zip\" \"$URL\" || { echo 'FAIL could not download the deployed package'; exit 1; }\nT=\"$(aws lambda get-function-configuration --function-name \"$OPENCLAW_API_FN\" \\\n      --region \"$AWS_REGION\" \\\n      --query 'Environment.Variables.EGRESS_APPLY_TIMEOUT' --output text)\"\npython3 - \"$W/live.zip\" \"$T\" <<'OCEOF'\nimport hashlib, json, pathlib, sys, zipfile\nzip_path, raw = sys.argv[1], sys.argv[2]\nt = 90 if raw in ('None', '') else int(raw)\nrel = 'services/egress_admin_service.py'\nart = 'lambda/api/services/egress_admin_service.py'\nwant = json.load(open('manifest.json'))['paths'][\n    'deploy/lambda/api/services/egress_admin_service.py']['patch_sha256']\nlocal = hashlib.sha256(pathlib.Path(art).read_bytes()).hexdigest()\nif local != want:\n    print('FAIL the kit is mis-packaged: %s hashes to %s but the manifest records %s'\n          % (art, local[:16], want[:16]))\n    sys.exit(1)\nwith zipfile.ZipFile(zip_path) as z:\n    if rel not in z.namelist():\n        print('FAIL the deployed package has no ' + rel); sys.exit(1)\n    got = hashlib.sha256(z.read(rel)).hexdigest()\nprint('deployed %s sha256=%s' % (rel, got[:16]))\nprint('kit artifact sha256=%s (manifest patch_sha256)' % local[:16])\nprint('deployed EGRESS_APPLY_TIMEOUT=%d%s'\n      % (t, ' (env unset, module default)' if raw in ('None', '') else ''))\nif got != local:\n    print('FAIL the deployed bytes are NOT this kit\\'s artifact, so the six-value result')\n    print('     measured on the kit does not transfer to this deployment.')\n    sys.exit(1)\nif t + 10 < 30:\n    print('NOTE the clamp is load-bearing on THIS deployment: without it this setting')\n    print('     would derive %d, which boto refuses' % (t + 10))\nprint('PASS the deployed bytes are byte-identical to the artifact this kit ships, so')\nprint('     v-657-ssm-timeout-lower-bound\\'s measured 30/30/30/30/31/100 applies to')\nprint('     the code actually running')\nOCEOF",
+      "observable": "sha256 of services/egress_admin_service.py inside the package the live function is running, compared to the sha256 of the artifact this kit ships (and to the manifest's own patch_sha256 for that path), plus that function's EGRESS_APPLY_TIMEOUT",
+      "pass_when": "the deployed file is byte-identical to the kit's artifact, which is itself byte-identical to what the manifest records",
+      "fail_when": "the deployed bytes differ from the kit's artifact — then nothing measured on the kit transfers to the deployment, including the clamp. Byte equality is asserted instead of pattern-matching the expression: a check that only looked for a `max(30, ...)` prefix would pass on max(30, 999) or max(30, timeout - 10). Falsified: the pre-apply live package on 795938553855/us-west-2 carries `timeout + 10`, a different file, so this check is red before apply and green after. Read-only — it downloads the package and reads one configuration",
+      "timeout_s": 300,
+      "cleanup": null,
+      "fix_id": "#657"
+    },
+    {
+      "id": "v-658-placeholder-count-is-repeatable",
+      "phase": "A-readonly",
+      "action": "set -uo pipefail\nS=host-scripts/edge/test/integration/balancer_phase_integration.sh\ntest -f \"$S\" || { echo \"FAIL missing $S\"; exit 1; }\nFN=\"$(mktemp)\"\nawk '/^count_hint_placeholders\\(\\)/{f=1} f{print} f&&/^}/{exit}' \"$S\" > \"$FN\"\ngrep -q 'count_hint_placeholders' \"$FN\" || { echo 'FAIL could not extract the counter'; exit 1; }\n# shellcheck disable=SC1090\n. \"$FN\"\nCONF=host-scripts/edge/nginx.conf\ntest -f \"$CONF\" || { echo \"FAIL missing $CONF\"; exit 1; }\nROUNDS=\"${OC_EDGE_HINT_ROUNDS:-40}\"\nOUT=\"$(mktemp)\"\ni=0\nwhile [ \"$i\" -lt \"$ROUNDS\" ]; do\n    printf '%s\\n' \"$(count_hint_placeholders \"$CONF\")\" >> \"$OUT\"\n    i=$((i + 1))\ndone\nSET=\"$(sort -u \"$OUT\" | tr '\\n' ' ')\"\nN=\"$(sort -u \"$OUT\" | wc -l | tr -d ' ')\"\necho \"$ROUNDS rounds on the shipped nginx.conf -> value set [$SET]\"\nif [ \"$N\" != \"1\" ]; then\n    echo \"FAIL the same file produced $N different verdicts — still flaky\"; exit 1\nfi\nif [ \"$(sort -u \"$OUT\")\" != \"4\" ]; then\n    echo \"FAIL the single verdict is $(sort -u \"$OUT\"), expected 4\"; exit 1\nfi\necho 'PASS the counter is repeatable and finds all four coordinate placeholders'\n",
+      "observable": "the set of verdicts the shipped counter produces over N repeated runs on one unchanged nginx.conf — a single run cannot observe flakiness, only the value set can",
+      "pass_when": "the value set has exactly one element and that element is 4",
+      "fail_when": "more than one distinct verdict appears (the pipefail/EPIPE race or the indentation-guessed block boundary is back), or the single verdict is not 4",
+      "timeout_s": 180,
+      "cleanup": null,
+      "fix_id": "#658"
+    },
+    {
+      "id": "v-658-placeholder-count-still-red-when-missing",
+      "phase": "A-readonly",
+      "action": "set -uo pipefail\nS=host-scripts/edge/test/integration/balancer_phase_integration.sh\ntest -f \"$S\" || { echo \"FAIL missing $S\"; exit 1; }\nFN=\"$(mktemp)\"\nawk '/^count_hint_placeholders\\(\\)/{f=1} f{print} f&&/^}/{exit}' \"$S\" > \"$FN\"\ngrep -q 'count_hint_placeholders' \"$FN\" || { echo 'FAIL could not extract the counter'; exit 1; }\n# shellcheck disable=SC1090\n. \"$FN\"\nCONF=host-scripts/edge/nginx.conf\nW=\"$(mktemp -d)\"\nsed '/reader_port  *= /d' \"$CONF\" > \"$W/missing.conf\"\nN_MISSING=\"$(count_hint_placeholders \"$W/missing.conf\")\"\nsed '/init_by_lua_block/,/^    }/d' \"$CONF\" > \"$W/outside.conf\"\n# shellcheck disable=SC2016\nprintf '# ${ENGINE_REDIS_HOST} ${ENGINE_REDIS_PORT} ${ENGINE_REDIS_READER_HOST} ${ENGINE_REDIS_READER_PORT}\\n' >> \"$W/outside.conf\"\nN_OUTSIDE=\"$(count_hint_placeholders \"$W/outside.conf\")\"\necho \"placeholder removed -> $N_MISSING/4 (want 3); placeholders only outside the block -> $N_OUTSIDE/4 (want 0)\"\nrc=0\n[ \"$N_MISSING\" = \"3\" ] || { echo 'FAIL removing a coordinate placeholder did not turn it red'; rc=1; }\n[ \"$N_OUTSIDE\" = \"0\" ] || { echo 'FAIL it counted placeholders outside init_by_lua_block'; rc=1; }\n[ \"$rc\" = \"0\" ] && echo 'PASS the counter is red when a placeholder is gone and block-aware'\nexit \"$rc\"\n",
+      "observable": "the counter's verdict on two deliberately broken copies of the shipped nginx.conf",
+      "pass_when": "the missing-placeholder copy counts 3 and the outside-the-block copy counts 0",
+      "fail_when": "either arm passes when it should not — a gate that stays green after the thing it guards is removed is not a gate. Operates on temporary copies; the shipped file is not modified",
+      "timeout_s": 120,
+      "cleanup": null,
+      "fix_id": "#658"
+    },
+    {
+      "id": "v-658-block-boundary-is-brace-paired",
+      "phase": "A-readonly",
+      "action": "set -uo pipefail\nS=host-scripts/edge/test/integration/balancer_phase_integration.sh\ntest -f \"$S\" || { echo \"FAIL missing $S\"; exit 1; }\nFN=\"$(mktemp)\"\nawk '/^count_hint_placeholders\\(\\)/{f=1} f{print} f&&/^}/{exit}' \"$S\" > \"$FN\"\ngrep -q 'count_hint_placeholders' \"$FN\" || { echo 'FAIL could not extract the counter'; exit 1; }\n# shellcheck disable=SC1090\n. \"$FN\"\nCONF=host-scripts/edge/nginx.conf\ntest -f \"$CONF\" || { echo \"FAIL missing $CONF\"; exit 1; }\nrc=0\n# root cause 1 — the pipe. `grep -q` exits on its first match, awk's next write gets EPIPE\n# and dies non-zero, and pipefail then fails the whole pipeline so the counter never\n# increments. The only durable fix is that no pipe exists at all.\nif grep -qE 'grep[^|]*-q|\\|' \"$FN\"; then\n  echo 'FAIL the shipped counter still contains a pipe or a grep -q:'\n  grep -nE 'grep[^|]*-q|\\|' \"$FN\" | sed 's/^/    /'\n  rc=1\nelse\n  echo 'ok the counter is a single awk process — no pipe, so no EPIPE to mis-attribute'\nfi\n# root cause 2 — the boundary. Insert a balanced nested brace pair whose CLOSING line is\n# indented exactly four spaces. The old /^    }/ boundary closes the window there and\n# counts 0; brace-pair counting still counts 4.\nW=\"$(mktemp -d)\"\nawk '{ print }\n     !ins && index($0, \"init_by_lua_block\") { print \"        local _probe = {\"; print \"    }\"; ins = 1 }' \\\n    \"$CONF\" > \"$W/nested.conf\"\nN_NESTED=\"$(count_hint_placeholders \"$W/nested.conf\")\"\necho \"nested four-space closing brace inside the block -> $N_NESTED/4 (want 4)\"\n[ \"$N_NESTED\" = \"4\" ] || { echo 'FAIL the boundary is still guessed from indentation'; rc=1; }\ngrep -q 'local _probe = {' \"$W/nested.conf\" || { echo 'FAIL the fixture was not built'; rc=1; }\n[ \"$rc\" = \"0\" ] && echo 'PASS both #658 root causes are closed: no pipe, and the block '\\\n'boundary survives a nested four-space closing brace'\nexit \"$rc\"\n",
+      "observable": "the shipped counter's own text (does a pipe remain?) and its verdict on a copy of the shipped nginx.conf carrying a nested brace pair whose closing line sits at four spaces",
+      "pass_when": "the counter contains no pipe and still counts 4 on the nested fixture",
+      "fail_when": "a pipe is back — the pipefail/EPIPE race returns — or the nested fixture counts anything other than 4, which means the block boundary is again guessed from indentation. This is the arm that covers #658's SECOND root cause; the repeatability check alone passes even with the old indentation boundary restored. Falsified against a copy carrying the pre-fix counter: it reports the pipe and counts 0/4. Operates on a temporary copy",
+      "timeout_s": 120,
+      "cleanup": null,
+      "fix_id": "#658"
     },
     {
       "id": "v-kit-sync-hashes",

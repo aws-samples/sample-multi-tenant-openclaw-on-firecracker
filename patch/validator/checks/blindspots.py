@@ -1,8 +1,8 @@
 import ast
-import re
 from pathlib import Path
 
 from lib.awsread import AwsReadError, AwsUnavailable
+from lib.comparison import compare_alias_versions
 from lib.result import finding
 
 
@@ -54,23 +54,20 @@ def check_e1(ctx):
     if not aliases:
         aliases = [{"alias": "serving", "version": key}
                    for key in versions if key != "$LATEST"]
-    rows, failures = [], []
     latest = versions.get("$LATEST")
-    for alias in aliases:
-        config = versions.get(alias["version"])
-        differences = [key for key in ("code_sha256", "environment", "dead_letter", "layers")
-                       if latest and config and latest.get(key) != config.get(key)]
-        if differences:
-            failures.append("%s differs in %s" % (alias["alias"], ",".join(differences)))
-        rows.append({"alias": alias["alias"], "version": alias["version"],
-                     "latest": latest, "published": config,
-                     "differences": differences})
-    if not rows:
-        return _missing("E1", "Lambda aliases", "no alias versions")
+    rows, failures, comparable_pairs = compare_alias_versions(latest, aliases, versions)
+    if not comparable_pairs:
+        reason = ("no alias versions were available" if not rows
+                  else "no alias pairs were comparable")
+        result = _missing(
+            "E1", "Lambda aliases",
+            "no divergence could be observed because %s" % reason)
+        result.readings.update({"aliases": rows, "comparable_pairs": comparable_pairs})
+        return result
     return finding(
         "E1", "FAIL" if failures else "PASS",
         "Alias versions and latest configuration were compared beyond code bytes.",
-        {"inspected": len(rows), "aliases": rows,
+        {"inspected": len(rows), "comparable_pairs": comparable_pairs, "aliases": rows,
          "api_serves": ctx.get("lambda_link.serving_qualifier"),
          "sqs_serves": ctx.get("lambda_link.dispatch_sqs_esm_binds")},
         failures, "Publish the intended configuration and move every serving qualifier together.",

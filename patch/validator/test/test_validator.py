@@ -337,6 +337,44 @@ class ValidatorTests(unittest.TestCase):
         self.assertTrue(covered, "the overlap must still be reported, just not as removable")
         self.assertEqual("newer-kit", covered[0]["covered_by"])
 
+    def test_e1_missing_latest_is_inconclusive(self):
+        ctx = FakeContext(self.tmp.name, None)
+        ctx.env["lambda_versions"] = {"3": {"CodeSha256": "PUBLISHED_SHA"}}
+        row = CHECKS["E1"][1](ctx)
+        self.assertEqual("INCONCLUSIVE", row.verdict)
+        self.assertEqual(0, row.readings["comparable_pairs"])
+        self.assertFalse(row.readings["aliases"][0]["comparable"])
+        self.assertIn("$LATEST", row.readings["aliases"][0]["not_comparable_reason"])
+
+    def test_e1_comparable_divergence_still_fails(self):
+        ctx = FakeContext(self.tmp.name, "E1")
+        row = CHECKS["E1"][1](ctx)
+        self.assertEqual("FAIL", row.verdict)
+        self.assertEqual(1, row.readings["comparable_pairs"])
+
+    def test_a3_templated_source_skips_byte_comparison(self):
+        ctx = FakeContext(self.tmp.name, None)
+        ctx.env["asg"]["lt_version_pinned"] = "$Default"
+        source = ctx.repo / "deploy/userdata/launch-vm.sh"
+        source.write_text("#!/bin/sh\nprintf '{{VALUE}}'\n")
+        row = CHECKS["A3"][1](ctx)
+        self.assertEqual("FAIL", row.verdict)
+        self.assertIn("floating version", row.evidence)
+        self.assertNotIn("user data differs from gateway source", row.evidence)
+        self.assertIsNone(row.readings["source_match"])
+        self.assertFalse(row.readings["source_comparable"]["comparable"])
+        self.assertIn("template tokens", row.readings["source_comparable"]["reason"])
+
+    def test_a3_token_free_source_mismatch_still_fails(self):
+        ctx = FakeContext(self.tmp.name, None)
+        source = ctx.repo / "deploy/userdata/launch-vm.sh"
+        source.write_text("#!/bin/sh\nprintf changed\n")
+        row = CHECKS["A3"][1](ctx)
+        self.assertEqual("FAIL", row.verdict)
+        self.assertIn("user data differs from gateway source", row.evidence)
+        self.assertTrue(row.readings["source_comparable"]["comparable"])
+        self.assertIsNone(row.readings["source_comparable"]["reason"])
+
     def test_e10(self):
         self.good("E10")
     def test_e10_mutant_annotations(self):

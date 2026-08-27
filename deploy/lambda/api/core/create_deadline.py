@@ -764,6 +764,13 @@ rebuild `:4677`(`LIFECYCLE_SUPERSEDED`)、delete `:2974`。
 容量类是**跟别的租户**争资源。两者动作建议都是重试,但重试的期望不同 —— 前者要先重读状态,
 后者要等容量。"""
 
+REASON_DEADLINE_QUEUED = "deadline_exceeded_queued"
+"""已受理但直到死线也没排到执行槽,一步真实执行都没发生,status 保持原值。
+
+它与 `deadline_exceeded_in_flight` 是契约级区分,不是日志细分:后者已经发起真实执行但没
+跑完,VM 状态不确定,客户必须先查状态再决定;前者没有任何真实副作用,客户可直接重试。
+客户会按这个值分支,所以不能把两者合并。"""
+
 REASON_TENANT_NOT_STARTABLE = "tenant_not_startable"
 """start/restart 执行时租户已经是 `failed` 或 `requires_intervention`,当前状态不可起。
 
@@ -807,6 +814,7 @@ REASONS_FOR = {
         REASON_BACKUP_FAILED,
         REASON_HOST_UNREACHABLE,
         REASON_PREEMPTED,
+        REASON_DEADLINE_QUEUED,  # #663 排队死:一步未执行,status 不变,直接重试
         REASON_DEADLINE_EXCEEDED,
         REASON_SYSTEM,
     ),
@@ -815,6 +823,7 @@ REASONS_FOR = {
         REASON_BACKUP_MISSING,
         REASON_HOST_UNREACHABLE,
         REASON_PREEMPTED,
+        REASON_DEADLINE_QUEUED,  # #663 排队死:一步未执行,status 不变,直接重试
         REASON_DEADLINE_EXCEEDED,
         REASON_SYSTEM,
     ),
@@ -877,6 +886,7 @@ ALL_FAIL_REASONS = (
     REASON_BACKUP_MISSING,
     REASON_CAPACITY,
     REASON_CAPACITY_RELEASE_PENDING,
+    REASON_DEADLINE_QUEUED,
     REASON_DEADLINE_EXCEEDED,
     REASON_HOST_UNREACHABLE,
     REASON_PREEMPTED,
@@ -884,7 +894,7 @@ ALL_FAIL_REASONS = (
     REASON_SYSTEM,
     REASON_TENANT_NOT_STARTABLE,
 )
-"""词汇表全集(十个值)。给校验器、文档生成与测试用;**不要**拿它当某个操作的取值集合 ——
+"""词汇表全集(十一个值)。给校验器、文档生成与测试用;**不要**拿它当某个操作的取值集合 ——
 那会让客户以为 restart 可能返回 `backup_missing`。
 
 **为什么这里显式列举,而不是 `{r for rs in REASONS_FOR.values() for r in rs}`。**

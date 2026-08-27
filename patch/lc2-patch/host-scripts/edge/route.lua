@@ -87,14 +87,26 @@ local function warmup_probe()
     probe_primary_if_distinct(host, port)
 end
 
+-- #643 — warmup 重试节奏。前 15 次 2s(覆盖正常冷启动),之后 10s 封顶并【永不放弃】:
+-- 原来第 15 次会 mark_ready() fail-open,Redis 真故障时 /healthz 约 30s 后翻 200,
+-- 实例进 ALB 轮转而每个租户在 lookup 拿 503。ALB 在全 target unhealthy 时本来就会
+-- fail-open 照发流量,所以保持 unready 不会让入口消失,只是不再谎报 healthy。
+local WARMUP_FAST_ATTEMPTS = 15
+local WARMUP_FAST_DELAY_SEC = 2
+local WARMUP_SLOW_DELAY_SEC = 10
+local function warmup_retry_delay(attempts)
+    if attempts < WARMUP_FAST_ATTEMPTS then return WARMUP_FAST_DELAY_SEC end
+    return WARMUP_SLOW_DELAY_SEC
+end
+
 --[[
     on_init_worker: fills the per-worker lrucache. Called from
     init_worker_by_lua_file in nginx.conf. Any failure is fatal to route
     fidelity but not to Nginx booting — logged at ERROR.
 
     Only worker 0 schedules the warmup probe so we don't hammer Redis with
-    N-worker probes at boot. Every retry runs on a 2s timer up to 30s;
-    after that we mark ready to avoid never-healthy loops in dev.
+    N-worker probes at boot. Retries run every 2s for the first 15 attempts,
+    then every 10s until Redis is reachable and the worker can mark ready.
 --]]
 function _M.on_init_worker()
     -- Distribute math.random state across workers so ttl jitter is truly
@@ -106,8 +118,8 @@ function _M.on_init_worker()
     end
 
     if ngx.worker.id() ~= 0 then return end
-    -- Kick off async warmup: try every 2s, cap at 15 attempts (30s total),
-    -- then flip ready regardless so we don't hang out of rotation forever.
+    -- Kick off async warmup: every 2s for the first 15 attempts (~30s), then
+    -- every 10s, forever. We never flip ready without a successful probe (#643).
     local attempts = 0
     local function tick(premature)
         if premature then return end
@@ -115,14 +127,23 @@ function _M.on_init_worker()
         warmup_probe()
         local flag = ngx.shared.edge_ready
         if flag and flag:get("ready") == 1 then return end
-        if attempts >= 15 then
-            ngx.log(ngx.WARN, "edge warmup: giving up after 15 attempts, ",
-                "marking ready (fail-open in dev, real Redis outage will ",
-                "surface as 503 from lookup)")
-            mark_ready()
-            return
+        if attempts == WARMUP_FAST_ATTEMPTS then
+            -- 只在跨过快节奏边界时说一次,避免每 10s 刷一条。
+            ngx.log(ngx.ERR, "edge warmup: still no Redis after ",
+                WARMUP_FAST_ATTEMPTS, " attempts; staying UNREADY (#643 ",
+                "fail-closed) and retrying every ", WARMUP_SLOW_DELAY_SEC,
+                "s; /healthz flips 200 as soon as one probe succeeds")
         end
-        ngx.timer.at(2, tick)
+        local ok_next, terr_next =
+            ngx.timer.at(warmup_retry_delay(attempts), tick)
+        if not ok_next then
+            -- #643 —— 兜底 mark_ready 删掉之后,这条链断了就没有第二次机会:worker
+            -- 永久 unready 且再也不探测。原来有 fail-open 兜底时断链的后果被掩盖,
+            -- 现在必须说出来,否则又变成 #643 要治的那个"没人知道"。
+            ngx.log(ngx.ERR, "edge warmup: failed to schedule next probe: ",
+                tostring(terr_next), "; staying unready and no further probe ",
+                "will run (ELB pulls the box, ASG replaces it)")
+        end
     end
     local ok_t, terr = pcall(ngx.timer.at, 0, tick)
     if not ok_t then
@@ -257,5 +278,8 @@ _M._mark_ready = mark_ready
 -- Exposed so the readiness gate itself is testable: on_init_worker only ever
 -- reaches warmup_probe through an ngx.timer, which plain busted cannot drive.
 _M._warmup_probe = warmup_probe
+-- #643 — 退避节奏是可测的纯函数;tick 本身是 on_init_worker 的 local 闭包,
+-- busted 驱动不到,所以门的"永不放弃"语义只能从这里回归。
+_M._warmup_retry_delay = warmup_retry_delay
 
 return _M

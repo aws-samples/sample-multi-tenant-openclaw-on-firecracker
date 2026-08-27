@@ -556,21 +556,45 @@ run_arm_warmup_negative() {
         return
     fi
     check "ARM W: OpenResty 起得来(坐标坏不该让 nginx 起不来)" 0
-    # 观察 8 秒:warmup 的重试间隔是 2s,15 次后才 fail-open 兜底(30s),
-    # 所以 8 秒窗口内 200 只可能来自「不探测直接标 ready」。
+    # 观察 40 秒:覆盖原先约 30s 后 fail-open 的边界,证明 Redis 持续不可达时
+    # readiness 门不会再因重试次数耗尽而谎报 healthy。
     local seen_200=0 code
-    for _ in $(seq 1 8); do
+    for _ in $(seq 1 40); do
         code="$(http_code "/healthz")"
         [ "$code" = "200" ] && { seen_200=1; break; }
         sleep 1
     done
     check "ARM W: Redis 不可达时 /healthz 不返 200(readiness 门真的挡住)" \
-        "$seen_200" "8s 窗口内 /healthz 已经是 200(got=$code)"
-    # 20s 远大于 2s 的重试节拍,也大于实测的首条日志延迟(约 4s);15 次后
-    # (约 30s)才走 fail-open 兜底,所以这个窗口不会把 give-up 那条误当证据。
+        "$seen_200" "40s 窗口内 /healthz 已经是 200(got=$code)"
+    # 20s 远大于 2s 的重试节拍,也大于实测的首条日志延迟(约 4s)。#643 之后已经没有
+    # give-up 那条日志了(兜底删了),这里等的是每轮探测失败自己那条。
     check "ARM W: 探测失败被记下来(不是静默)" \
         "$(wait_errlog 'edge warmup probe via' 20 && echo 0 || echo 1)" \
         "$(errlog | tail -2)"
+    stop_instance edge
+    # 坐标换回真 Redis 后【重启】的实例必须能放行 —— 证明上面那 40s 的红不是"门坏成
+    # 永不放行",而是坐标真的不可达。
+    #
+    # 这条【不是】"同一个 worker 等到 Redis 恢复后自愈":坐标是 envsubst 渲染进
+    # nginx.conf 的静态值,不重启改不了,所以在本脚本的能力边界内测不到那件事(要控制
+    # $REDIS_HOST 自身的生死,而本脚本只连它)。不重启自愈由 route.lua 的
+    # `_warmup_retry_delay` 单测(#643 块)加真机手工探针覆盖,见 MR 的 Not-run 一节。
+    deploy_lua A || { check "ARM W: 坐标恢复后 lua 部署" 1 "部署失败"; return; }
+    render_conf >"$WORK/nginx-recovered.conf"
+    : >"$WORK/edge-error.log"
+    if ! "$OPENRESTY" -p "$WORK/edge" -c "$WORK/nginx-recovered.conf"; then
+        check "ARM W: 坐标恢复后 edge 重启" 1 "$(errlog | tail -3)"
+        return
+    fi
+    local recovered_200=0
+    for _ in $(seq 1 20); do
+        code="$(http_code "/healthz")"
+        [ "$code" = "200" ] && { recovered_200=1; break; }
+        sleep 1
+    done
+    check "ARM W: 坐标换回真 Redis 并重启后 /healthz 20s 内放行(门不是永不放行)" \
+        "$([ "$recovered_200" -eq 1 ] && echo 0 || echo 1)" \
+        "20s 窗口内 /healthz 未翻 200(got=$code)"
     stop_instance edge
 }
 

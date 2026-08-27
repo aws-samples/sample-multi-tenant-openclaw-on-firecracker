@@ -459,3 +459,27 @@ describe("#639 warmup readiness fail-closed", function()
         assert.is_true(logged("edge warmup probe via reader coordinate"))
     end)
 end)
+
+-- #643 — 兜底 fail-open 被删掉之后,门必须"永不放弃"。tick 是 on_init_worker 里的
+-- local 闭包,busted 驱动不到,所以这里回归它唯一被抽出来的策略函数。
+describe("#643 warmup retry never gives up", function()
+    it("keeps a 2s cadence through the first 15 attempts", function()
+        for attempts = 1, 14 do
+            assert.are.equal(2, route._warmup_retry_delay(attempts))
+        end
+    end)
+
+    it("backs off to 10s from attempt 15 onward and never returns nil", function()
+        assert.are.equal(10, route._warmup_retry_delay(15))
+        assert.are.equal(10, route._warmup_retry_delay(16))
+        assert.are.equal(10, route._warmup_retry_delay(100))
+    end)
+
+    it("never returns a falsy delay for any attempt up to 10000", function()
+        for attempts = 1, 10000 do
+            local delay = route._warmup_retry_delay(attempts)
+            assert.are.equal("number", type(delay))
+            assert.is_true(delay > 0)
+        end
+    end)
+end)

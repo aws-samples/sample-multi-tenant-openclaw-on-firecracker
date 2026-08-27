@@ -1,0 +1,58 @@
+{
+  "synced_at": "2026-08-27 18:25:27 UTC+08:00",
+  "base_sha": "a9fe14135d1b7ecac1c2db8188af0fd19384d219",
+  "source_commit": "3c4494e875acbc7a5626042786fdf1a78ad4e207",
+  "commit_count": 2,
+  "file_count": 14,
+  "summary": "Sync the bb increment a9fe1413..3c4494e8 to the public gateway: #668 relaxes the egress allow admission floor to /16 while leaving the default at /24, and adds the read-only dry-run endpoint POST /hosts/egress/allow/validate.",
+  "issues_synced_note": "Index back to the issue tracker for whoever builds the patch kit. One issue in this increment.",
+  "issues_synced": [
+    "#668"
+  ],
+  "needs_config_on_apply": "EGRESS_EXTRA_ALLOW_MIN_PREFIX is optional and unchanged by default (/24). Setting it below 24 is what activates the relaxed floor, so no config change is required to apply this sync.",
+  "updated_files": {
+    "product": [
+      "deploy/edge/route.lua",
+      "deploy/edge/test/integration/balancer_phase_integration.sh",
+      "deploy/edge/test/route_reader_isolation_spec.lua",
+      "deploy/lambda/api/core/clients.py",
+      "deploy/lambda/api/core/create_deadline.py",
+      "deploy/lambda/api/core/dispatch/binpack.py",
+      "deploy/lambda/api/core/scheduling.py",
+      "deploy/lambda/api/handler.py",
+      "deploy/lambda/api/services/deadline_executor.py",
+      "deploy/lambda/api/services/dispatch_service.py",
+      "deploy/lambda/api/services/egress_admin_service.py",
+      "deploy/stacks/lambdas.py",
+      "deploy/userdata/oc-egress-sim.py",
+      "docs/aws-guide/openapi.yaml"
+    ],
+    "gateway_only": [
+      "patch/lc2-patch/APPLY-INSTRUCTIONS.md",
+      "patch/lc2-patch/host-scripts/edge/route.lua",
+      "patch/lc2-patch/host-scripts/edge/test/integration/balancer_phase_integration.sh",
+      "patch/lc2-patch/host-scripts/edge/test/route_reader_isolation_spec.lua",
+      "patch/lc2-patch/host-scripts/oc-egress-sim.py",
+      "patch/lc2-patch/iam/api-handler-dispatch-manifest-and-queue-depth.json",
+      "patch/lc2-patch/lambda/api/core/clients.py",
+      "patch/lc2-patch/lambda/api/core/create_deadline.py",
+      "patch/lc2-patch/lambda/api/core/dispatch/binpack.py",
+      "patch/lc2-patch/lambda/api/core/scheduling.py",
+      "patch/lc2-patch/lambda/api/handler.py",
+      "patch/lc2-patch/lambda/api/services/deadline_executor.py",
+      "patch/lc2-patch/lambda/api/services/dispatch_service.py",
+      "patch/lc2-patch/lambda/api/services/egress_admin_service.py",
+      "patch/lc2-patch/lib/apply-api-routes.py",
+      "patch/lc2-patch/lib/apply-api-routes.sh",
+      "patch/lc2-patch/manifest.json",
+      "patch/lc2-patch/resources/cloudformation/OpenClawImage.patch.json",
+      "patch/lc2-patch/resources/cloudformation/OpenClawOrchestrator.base.json",
+      "patch/lc2-patch/resources/cloudformation/OpenClawOrchestrator.patch.json",
+      "patch/lc2-patch/resources/cloudformation/base.assembly-index.json",
+      "patch/lc2-patch/resources/cloudformation/patch.assembly-index.json",
+      "patch/manifest-2026-08-27-171228-a9fe1413.json",
+      "patch/push-marker-2026-08-27-171228-a9fe1413.md"
+    ]
+  },
+  "folded_into": "patch/lc2-patch"
+}

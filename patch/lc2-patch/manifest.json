@@ -1,7 +1,7 @@
 {
   "id": "lc2-patch",
   "base_sha": "c9fd494ff4a76929f205f52464047a9185c7c49a",
-  "patch_sha": "1b56839c0dd6e0288144ea77cf43122460709a58",
+  "patch_sha": "979a9cb7e925212e4e3151582b90daf1e8b30a82",
   "status": "MANUAL_REVIEW",
   "excludes": [
     "patch/lc2-patch/host-scripts/oc-egress-sim.py",
@@ -1375,7 +1375,7 @@
       "patch_sha256": "9c8a568cdab3146f31e32bbcb624eba7ed40f920209dafe490fe9b0c537dc565",
       "operations": [
         {
-          "resource": "file:deploy/userdata/host-agent.py",
+          "resource": "file:deploy/userdata/host-agent.py mode 0644",
           "class": "AUTO_CLI",
           "apply_cli": null,
           "verify_cli": "sha256sum <target copy of host-agent.py>",
@@ -1424,10 +1424,10 @@
       "patch_sha256": "46a8571012a8d615f52e646318c85d5e7a6ea3f0787dcb661a717fd37385f928",
       "operations": [
         {
-          "resource": "file:deploy/userdata/launch-vm.sh",
+          "resource": "file:deploy/userdata/launch-vm.sh mode 0755",
           "class": "AUTO_CLI",
           "apply_cli": null,
-          "verify_cli": "sha256sum <target copy of launch-vm.sh>",
+          "verify_cli": "test -x \"/home/ubuntu/launch-vm.sh\" && stat -c \"%a %n\" \"/home/ubuntu/launch-vm.sh\"",
           "rollback_cli": "restore the per-host backup taken in APPLY step 1",
           "artifact_refs": [],
           "rollback_policy": "RESTORE",
@@ -1450,7 +1450,7 @@
       "patch_sha256": "b25bb683e565b1c5ccf1963013e56a078ae0c6a05ce05c0fb3f4f8e7245307c7",
       "operations": [
         {
-          "resource": "file:deploy/userdata/lib/harden-config.sh",
+          "resource": "file:deploy/userdata/lib/harden-config.sh mode 0644",
           "class": "AUTO_CLI",
           "apply_cli": null,
           "verify_cli": "sha256sum <target copy of harden-config.sh>",
@@ -1474,10 +1474,10 @@
       "patch_sha256": "87caf5112d400613e9d8c7b2920aea254523bbc5f697664cb32743e879704fd8",
       "operations": [
         {
-          "resource": "file:deploy/userdata/stop-vm.sh",
+          "resource": "file:deploy/userdata/stop-vm.sh mode 0755",
           "class": "AUTO_CLI",
           "apply_cli": null,
-          "verify_cli": "sha256sum <target copy of stop-vm.sh>",
+          "verify_cli": "test -x \"/home/ubuntu/stop-vm.sh\" && stat -c \"%a %n\" \"/home/ubuntu/stop-vm.sh\"",
           "rollback_cli": "restore the per-host backup taken in APPLY step 1",
           "artifact_refs": [],
           "rollback_policy": "RESTORE",
@@ -8409,9 +8409,9 @@
         {
           "resource": "s3:deployment/scripts/oc-egress-sim.py",
           "class": "AUTO_CLI",
-          "apply_cli": "aws s3 cp host-scripts/oc-egress-sim.py \"s3://$ASSETS_BUCKET/deployment/scripts/oc-egress-sim.py\" --region \"$AWS_REGION\"",
+          "apply_cli": "KEY=deployment/scripts/oc-egress-sim.py; PRE_VERSION_ID=\"$(aws s3api head-object --bucket \"$ASSETS_BUCKET\" --key \"$KEY\" --region \"$AWS_REGION\" --query VersionId --output text 2>/dev/null || echo ABSENT)\"; echo \"prev VersionId: $PRE_VERSION_ID\" | tee \"s3-anchor-oc-egress-sim.$OC_RUN_ID.txt\"; test -n \"$PRE_VERSION_ID\" || { echo \"refusing to write without a recorded anchor\"; exit 1; }; aws s3 cp host-scripts/oc-egress-sim.py \"s3://$ASSETS_BUCKET/$KEY\" --region \"$AWS_REGION\"",
           "verify_cli": "aws s3api head-object --bucket \"$ASSETS_BUCKET\" --key \"deployment/scripts/oc-egress-sim.py\" --region \"$AWS_REGION\"",
-          "rollback_cli": "aws s3api copy-object --bucket \"$ASSETS_BUCKET\" --key \"deployment/scripts/oc-egress-sim.py\" --copy-source \"$ASSETS_BUCKET/deployment/scripts/oc-egress-sim.py?versionId=$PRE_VERSION_ID\" --region \"$AWS_REGION\"",
+          "rollback_cli": "KEY=deployment/scripts/oc-egress-sim.py; PRE_VERSION_ID=\"$(cut -d\" \" -f3 \"s3-anchor-oc-egress-sim.$OC_RUN_ID.txt\")\"; if [ \"$PRE_VERSION_ID\" = \"ABSENT\" ]; then aws s3api delete-object --bucket \"$ASSETS_BUCKET\" --key \"$KEY\" --region \"$AWS_REGION\"; else aws s3api copy-object --bucket \"$ASSETS_BUCKET\" --key \"$KEY\" --copy-source \"$ASSETS_BUCKET/$KEY?versionId=$PRE_VERSION_ID\" --region \"$AWS_REGION\"; fi",
           "artifact_refs": [
             "host-scripts/oc-egress-sim.py"
           ],
@@ -9188,7 +9188,6 @@
     {
       "id": "#668",
       "summary": "Egress allow admission: the absolute scope floor relaxes from /24 to /16, and a read-only dry-run endpoint POST /hosts/egress/allow/validate is added so a caller can see the admission verdict for a rule set without applying anything. The DEFAULT does not move: EGRESS_EXTRA_ALLOW_MIN_PREFIX still defaults to /24, so an existing caller's behaviour is byte-identical and widening requires an operator to set the env explicitly. The floor stays at /16 rather than being removed because a hole wider than that swallows the whole sampling space of the host-side semantic probe, which would silently degrade the probe and the red-line port guard together. The host-side oc-egress-sim.py floor moves to the same value from the same reasoning, and test_594 asserts the two are equal — which is why both files ship here rather than only the control-plane one.",
-      "layer": "C-lambda",
       "params_changed": [
         {
           "name": "_ABSOLUTE_MIN_PREFIX (egress_admin_service.py) and _ABSOLUTE_MIN_PREFIX_EXTRA_ALLOW (oc-egress-sim.py)",

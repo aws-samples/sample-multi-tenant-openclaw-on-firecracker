@@ -8423,6 +8423,289 @@
       "fix_ids": [
         "#668"
       ]
+    },
+    "deploy/edge/fluent-bit/host/add_timestamp.lua": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/edge/fluent-bit/host/add_timestamp.lua",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "56463a146aeffca83e186740e15ac6625b085071ec6558c6ed199125a1178828",
+      "fix_ids": [
+        "kit-companion-closure"
+      ],
+      "operations": [
+        {
+          "resource": "s3:deployment/observability/fluent-bit/host/add_timestamp.lua",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "aws s3api head-object --bucket \"$ASSETS_BUCKET\" --key \"deployment/observability/fluent-bit/host/add_timestamp.lua\" --region \"$AWS_REGION\" --query ContentLength --output text",
+          "rollback_cli": "bash lib/apply-resource-ops.sh s3-obs-assets rollback resources/cloudformation \"$AWS_REGION\"",
+          "artifact_refs": [
+            "host-scripts/edge/fluent-bit/host/add_timestamp.lua"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": [],
+          "carried_by": "s3-obs-assets",
+          "why_no_apply_cli": "`s3-obs-assets` already owns this prefix and uploads its payload directory recursively, taking the pre-write version anchor for every key it touches. A second per-file `aws s3 cp` here would be an uncoordinated writer against that operation's rollback anchor. The fix for this path is that the file is now present in the payload directory, so the existing operation carries it."
+        }
+      ]
+    },
+    "deploy/edge/fluent-bit/host/extract_tenant_id.lua": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/edge/fluent-bit/host/extract_tenant_id.lua",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "f97f32cd89f342a04f24318f6517404f3126c577c954d068c28c1458c3257fca",
+      "fix_ids": [
+        "kit-companion-closure"
+      ],
+      "operations": [
+        {
+          "resource": "s3:deployment/observability/fluent-bit/host/extract_tenant_id.lua",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "aws s3api head-object --bucket \"$ASSETS_BUCKET\" --key \"deployment/observability/fluent-bit/host/extract_tenant_id.lua\" --region \"$AWS_REGION\" --query ContentLength --output text",
+          "rollback_cli": "bash lib/apply-resource-ops.sh s3-obs-assets rollback resources/cloudformation \"$AWS_REGION\"",
+          "artifact_refs": [
+            "host-scripts/edge/fluent-bit/host/extract_tenant_id.lua"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": [],
+          "carried_by": "s3-obs-assets",
+          "why_no_apply_cli": "`s3-obs-assets` already owns this prefix and uploads its payload directory recursively, taking the pre-write version anchor for every key it touches. A second per-file `aws s3 cp` here would be an uncoordinated writer against that operation's rollback anchor. The fix for this path is that the file is now present in the payload directory, so the existing operation carries it."
+        }
+      ]
+    },
+    "deploy/edge/fluent-bit/host/parsers.conf": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/edge/fluent-bit/host/parsers.conf",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "cf0f11ff6fcb9b4ca13d0da5b7256920ef6b81785312bd122d656cc873175d0b",
+      "fix_ids": [
+        "kit-companion-closure"
+      ],
+      "operations": [
+        {
+          "resource": "s3:deployment/observability/fluent-bit/host/parsers.conf",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "aws s3api head-object --bucket \"$ASSETS_BUCKET\" --key \"deployment/observability/fluent-bit/host/parsers.conf\" --region \"$AWS_REGION\" --query ContentLength --output text",
+          "rollback_cli": "bash lib/apply-resource-ops.sh s3-obs-assets rollback resources/cloudformation \"$AWS_REGION\"",
+          "artifact_refs": [
+            "host-scripts/edge/fluent-bit/host/parsers.conf"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": [],
+          "carried_by": "s3-obs-assets",
+          "why_no_apply_cli": "`s3-obs-assets` already owns this prefix and uploads its payload directory recursively, taking the pre-write version anchor for every key it touches. A second per-file `aws s3 cp` here would be an uncoordinated writer against that operation's rollback anchor. The fix for this path is that the file is now present in the payload directory, so the existing operation carries it."
+        }
+      ]
+    },
+    "deploy/edge/fluent-bit/edge/add_timestamp.lua": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/edge/fluent-bit/edge/add_timestamp.lua",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "20b1c11550966ad4bece93dc929be988d711959edd886d157a5366bd7de1f9e6",
+      "fix_ids": [
+        "kit-companion-closure"
+      ],
+      "operations": [
+        {
+          "resource": "s3:deployment/observability/fluent-bit/edge/add_timestamp.lua",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "aws s3api head-object --bucket \"$ASSETS_BUCKET\" --key \"deployment/observability/fluent-bit/edge/add_timestamp.lua\" --region \"$AWS_REGION\" --query ContentLength --output text",
+          "rollback_cli": "bash lib/apply-resource-ops.sh s3-obs-assets rollback resources/cloudformation \"$AWS_REGION\"",
+          "artifact_refs": [
+            "host-scripts/edge/fluent-bit/edge/add_timestamp.lua"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": [],
+          "carried_by": "s3-obs-assets",
+          "why_no_apply_cli": "`s3-obs-assets` already owns this prefix and uploads its payload directory recursively, taking the pre-write version anchor for every key it touches. A second per-file `aws s3 cp` here would be an uncoordinated writer against that operation's rollback anchor. The fix for this path is that the file is now present in the payload directory, so the existing operation carries it."
+        }
+      ]
+    },
+    "deploy/edge/fluent-bit/edge/extract_trace_root.lua": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/edge/fluent-bit/edge/extract_trace_root.lua",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "638394ac30ca1f3413940e999b42f130b8fc8170a0580b4e79ddde63f2e42cd1",
+      "fix_ids": [
+        "kit-companion-closure"
+      ],
+      "operations": [
+        {
+          "resource": "s3:deployment/observability/fluent-bit/edge/extract_trace_root.lua",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "aws s3api head-object --bucket \"$ASSETS_BUCKET\" --key \"deployment/observability/fluent-bit/edge/extract_trace_root.lua\" --region \"$AWS_REGION\" --query ContentLength --output text",
+          "rollback_cli": "bash lib/apply-resource-ops.sh s3-obs-assets rollback resources/cloudformation \"$AWS_REGION\"",
+          "artifact_refs": [
+            "host-scripts/edge/fluent-bit/edge/extract_trace_root.lua"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": [],
+          "carried_by": "s3-obs-assets",
+          "why_no_apply_cli": "`s3-obs-assets` already owns this prefix and uploads its payload directory recursively, taking the pre-write version anchor for every key it touches. A second per-file `aws s3 cp` here would be an uncoordinated writer against that operation's rollback anchor. The fix for this path is that the file is now present in the payload directory, so the existing operation carries it."
+        }
+      ]
+    },
+    "deploy/edge/fluent-bit/edge/parsers.conf": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/edge/fluent-bit/edge/parsers.conf",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "01b44b7a8a2ca2b79c092ef4981e7781545267958114e6ad0075ac74998b8946",
+      "fix_ids": [
+        "kit-companion-closure"
+      ],
+      "operations": [
+        {
+          "resource": "s3:deployment/observability/fluent-bit/edge/parsers.conf",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "aws s3api head-object --bucket \"$ASSETS_BUCKET\" --key \"deployment/observability/fluent-bit/edge/parsers.conf\" --region \"$AWS_REGION\" --query ContentLength --output text",
+          "rollback_cli": "bash lib/apply-resource-ops.sh s3-obs-assets rollback resources/cloudformation \"$AWS_REGION\"",
+          "artifact_refs": [
+            "host-scripts/edge/fluent-bit/edge/parsers.conf"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": [],
+          "carried_by": "s3-obs-assets",
+          "why_no_apply_cli": "`s3-obs-assets` already owns this prefix and uploads its payload directory recursively, taking the pre-write version anchor for every key it touches. A second per-file `aws s3 cp` here would be an uncoordinated writer against that operation's rollback anchor. The fix for this path is that the file is now present in the payload directory, so the existing operation carries it."
+        }
+      ]
+    },
+    "deploy/userdata/route_ops.py": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/route_ops.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "0a394dc59a6cd3d4521f33af4d5e57b8cf6edfbc3e8458583952222195022825",
+      "fix_ids": [
+        "kit-companion-closure"
+      ],
+      "operations": [
+        {
+          "resource": "file:deploy/userdata/route_ops.py mode 0644",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum /opt/openclaw/route_ops.py   # must equal this entry's patch_sha256",
+          "rollback_cli": "restore the per-host backup taken in APPLY step 1",
+          "artifact_refs": [
+            "host-scripts/route_ops.py"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": [],
+          "target": "/opt/openclaw/route_ops.py",
+          "target_authority": "init-host.sh:604",
+          "why_it_must_travel": "host-agent.py imports it with sys.path set to its own directory. init-host.sh's own comment records what its absence does: host-agent ModuleNotFoundError crashloop, host-side data plane down, observed at NRestarts 225+ on a real host."
+        }
+      ]
+    },
+    "deploy/edge/openresty-pubkey.gpg": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/edge/openresty-pubkey.gpg",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "fc40f82ba62260bd4a7837fb9c38d7997d57f17797d4cb5d9e40f28226aa7b14",
+      "fix_ids": [
+        "kit-companion-closure"
+      ],
+      "operations": [
+        {
+          "resource": "s3:deployment/bootstrap/edge/<closure sha256>/openresty-pubkey.gpg",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "bash lib/apply-resource-ops.sh s3-edge-bundle verify resources/cloudformation \"$AWS_REGION\"",
+          "rollback_cli": "bash lib/apply-resource-ops.sh s3-edge-bundle rollback resources/cloudformation \"$AWS_REGION\"",
+          "artifact_refs": [
+            "host-scripts/edge/openresty-pubkey.gpg"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": [],
+          "carried_by": "s3-edge-bundle",
+          "why_no_apply_cli": "`s3-edge-bundle` already owns this prefix and uploads its payload directory recursively, taking the pre-write version anchor for every key it touches. A second per-file `aws s3 cp` here would be an uncoordinated writer against that operation's rollback anchor. The fix for this path is that the file is now present in the payload directory, so the existing operation carries it."
+        }
+      ]
+    },
+    "deploy/userdata/spire-kit/spire-join-broker.service": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/spire-kit/spire-join-broker.service",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "14ba6bd4819a8ecdfc9e77d96af9eed9232ab746f9cc6b5b0c9176efb75f3787",
+      "fix_ids": [
+        "kit-companion-closure"
+      ],
+      "operations": [
+        {
+          "resource": "file:deploy/userdata/spire-kit/spire-join-broker.service mode 0644",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum /opt/openclaw/spire-kit/spire-join-broker.service   # must equal this entry's patch_sha256",
+          "rollback_cli": "restore the per-host backup taken in APPLY step 1",
+          "artifact_refs": [
+            "host-scripts/spire-kit/spire-join-broker.service"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": [],
+          "target": "/opt/openclaw/spire-kit/spire-join-broker.service",
+          "target_authority": "init-host.sh:948",
+          "why_it_must_travel": "spire-kit/install.sh:384 installs it to /etc/systemd/system and :392 enables it by name. The component is SSM-gated and fail-open, so a missing unit is silent: the host boots without the broker and only the spire-kit.install-failed marker records it."
+        }
+      ]
+    },
+    "deploy/userdata/lib/cred-inject.sh": {
+      "change": "A",
+      "layer": "B-s3",
+      "artifact": "host-scripts/lib/cred-inject.sh",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "13bbeb81fe96de6d786f29317d4728c183562e1e1d6d4d23afacc9b42f036f2c",
+      "fix_ids": [
+        "kit-companion-closure"
+      ],
+      "operations": [
+        {
+          "resource": "file:deploy/userdata/lib/cred-inject.sh mode 0755",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum /home/ubuntu/lib/cred-inject.sh   # must equal this entry's patch_sha256",
+          "rollback_cli": "restore the per-host backup taken in APPLY step 1",
+          "artifact_refs": [
+            "host-scripts/lib/cred-inject.sh"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": [],
+          "target": "/home/ubuntu/lib/cred-inject.sh",
+          "target_authority": "init-host.sh:864-866",
+          "why_it_must_travel": "sourced by launch-vm.sh:1458 when a tenant has injected_credentials; init-host.sh chmod +x it. launch-vm.sh fails loud rather than injecting empty credentials, so a missing copy blocks those tenants' VMs from starting."
+        }
+      ]
     }
   },
   "fixes": [

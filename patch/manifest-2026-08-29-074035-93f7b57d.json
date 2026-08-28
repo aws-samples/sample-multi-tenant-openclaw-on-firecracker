@@ -1,0 +1,73 @@
+{
+  "synced_at": "2026-08-29 07:40:35 UTC+08:00",
+  "base_sha": "3c4494e875acbc7a5626042786fdf1a78ad4e207",
+  "source_commit": "93f7b57dd7c4b85cf10ecfffc7c1c4ad32335691",
+  "commit_count": 6,
+  "file_count": 6,
+  "summary": "Sync the bb increment 3c4494e8..93f7b57d to the public gateway branch. Sync-LOG only (which customer-facing files reached gateway + the issues behind them); the applyable patch kit is NOT built yet (folded_into pending).",
+  "issues_synced_note": "Index back to the issue tracker for whoever builds the patch kit: before assembling the kit, walk each issue and confirm it's covered. `title` is a ≤20-char gist only — open the issue for the full problem/fix/test. Lists only issues that touched a released file this sync.",
+  "issues_synced": [
+    {
+      "id": "#668",
+      "type": "fix",
+      "title": "dry-run 逐条报环境缺失判据"
+    },
+    {
+      "id": "#679",
+      "type": "fix",
+      "title": "Codex 实现评审六修复跟进"
+    }
+  ],
+  "needs_config_on_apply": "none detected (no config.yml key / systemd directive / DDB-TTL change in this sync)",
+  "updated_files": {
+    "cdk-stack (cdk deploy OR hand-apply)": [
+      {
+        "path": "deploy/stacks/lambdas.py",
+        "status": "modified",
+        "issues": [
+          "#679"
+        ]
+      }
+    ],
+    "docs": [
+      {
+        "path": "docs/aws-guide/openapi.yaml",
+        "status": "modified",
+        "issues": [
+          "#668"
+        ]
+      }
+    ],
+    "lambda (update-function-code only)": [
+      {
+        "path": "deploy/lambda/api/services/deadline_executor.py",
+        "status": "modified",
+        "issues": [
+          "#679"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/egress_admin_service.py",
+        "status": "modified",
+        "issues": [
+          "#668"
+        ]
+      },
+      {
+        "path": "deploy/lambda/api/services/tenant_service.py",
+        "status": "modified",
+        "issues": [
+          "#679"
+        ]
+      },
+      {
+        "path": "deploy/lambda/health_check/handler.py",
+        "status": "modified",
+        "issues": [
+          "#679"
+        ]
+      }
+    ]
+  },
+  "folded_into": "(pending) — no patch kit built for this sync yet; a later kit should cite this manifest as source-of-record and set base_sha/patch_sha. cdk deploy is FORBIDDEN on hand-modified live deployments — the kit must ship *.patched host scripts + the full lambda tree + AWS CLI for stack changes, same shape as patch/315-concurrent-dispatch-rollup/."
+}

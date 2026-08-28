@@ -37,6 +37,7 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
+# #432 —— 让 `import ddb_scan` 在两种加载方式下都成立。
 #
 # Lambda 运行时:本包目录(deploy/lambda/health_check/ 或 scaler/)就是部署根,`import ddb_scan`
 # 天然可解析。但测试用 `importlib.util.spec_from_file_location(name, ".../handler.py")` 按
@@ -59,8 +60,11 @@ ssm = boto3.client(
 sns = boto3.client("sns")
 s3 = boto3.client("s3")
 elbv2 = boto3.client("elbv2")
+# #469 P6 —— 卡死中间态的自定义指标(供 alarm 订阅)。与上面几个 client 同列在模块级:
 # 冷启动一次、单测直接替 handler.cloudwatch 注入 mock(与本文件其它 client 同款做法)。
 cloudwatch = boto3.client("cloudwatch")
+# #679 —— 补偿矩阵「host 亡」档的 EC2 权威确认(hosts 表行只是线索,不是判据)。
+ec2 = boto3.client("ec2")
 tenants_table = ddb.Table(os.environ["TENANTS_TABLE"])
 hosts_table = ddb.Table(os.environ["HOSTS_TABLE"])
 
@@ -106,11 +110,13 @@ CREATING_GATEWAY_CRASH_RESTARTS = int(
     os.environ.get("CREATING_GATEWAY_CRASH_RESTARTS", "3")
 )
 
+# #469 P1/P3 —— 生命周期中间态(suspending/restoring)的卡死判定时限。
 #
 # 为什么需要:suspend/restore 用 CAS 抢单赢家中间态(tenant_service.py:3023 / :3301),
 # 正常路径有回滚(:3040 / :3317),但回滚【只在 Lambda 还活着、能执行到那几行时才发生】。
 # Lambda 被杀(consumer 超时/OOM/部署中断/SSM 长时无响应)→ 状态永久停在中间态。dispatch
 # 侧有 stale 回收(DISPATCH_CLAIM_STALE_SEC),生命周期中间态此前【没有任何等价机制】。
+# 后果不止单租户卡住:#469 P4 —— 若 per-host 闸门按"进行中操作数"计数,卡死槽位永不释放,
 # 5 次卡死后整台 host(约 380 个租户)的生命周期操作全部停止受理;而 P2 使卡死租户连
 # delete 都被拒,卡死数量只增不减。
 #
@@ -136,16 +142,20 @@ AZ_UNHEALTHY_THRESHOLD_MINUTES = int(
     os.environ.get("AZ_UNHEALTHY_THRESHOLD_MINUTES", "10")
 )
 AZ_COOLDOWN_MINUTES = int(os.environ.get("AZ_COOLDOWN_MINUTES", "30"))
+# #52 A —— 单台心跳失效降级。阈值默认沿用 AZ failover 的"多久没听到就算不健康",因为问的
 # 是同一个物理问题(这台机器还在报心跳吗),不为同一件事再开一个语义重复的旋钮;要单独调
+# 用这个 env 覆盖。2026-08-10 apse1 实证(#52 第 2 条评论):一行 status=active 而 last_seen
 # 已陈旧 1 小时的僵尸账本,让调度把新租户派到一台 stopped 的 host,租户卡 creating 16m50s。
 # 当时无任何机制降级它 —— 心跳只被 AZ 级 failover 读(要整个 AZ 全挂才触发),调度只看 status。
 STALE_HOST_DEMOTE_MINUTES = int(
     os.environ.get("STALE_HOST_DEMOTE_MINUTES", str(AZ_UNHEALTHY_THRESHOLD_MINUTES))
 )
+# 杀手开关。降级改 status,直接影响调度选点,故留一键停;但默认开——它是 #52 要修的那条
 # P0 停滞的正解,默认关等于没修。
 STALE_HOST_DEMOTE_ENABLED = (
     os.environ.get("STALE_HOST_DEMOTE_ENABLED", "true").lower() == "true"
 )
+# #592 —— 租户级 stale 收敛。#52 的 demote_stale_hosts 只降 host(调度层排除),其上已经
 # running 的租户一个都不动;而主扫描对 stale 租户只写 vm_health/app_health,status 全程不碰;
 # 唯一自愈 _restart_host_agent 要求该 host【全部】租户同时 stale(原文 "Some tenants still
 # healthy → agent is alive, individual VM issue");_ORPHAN_REAP_STATUSES 又只含
@@ -187,6 +197,7 @@ _stale_probe_budget = {"n": 0, "spent": 0.0, "ctx": None}
 # 默认留 15 分钟的大余量，避免把仍在健康推进的迁移误判成悬挂并抽走它正在使用的号。
 FAILOVER_STUCK_MINUTES = int(os.environ.get("FAILOVER_STUCK_MINUTES", "15"))
 ASSETS_BUCKET = os.environ.get("ASSETS_BUCKET", "")
+# #199 同类缺陷的第三个副本(前两个在 api / lifecycle-consumer,已修):备份不在 assets 桶。
 # backup-data.sh:16 `BUCKET="${2:-${BACKUP_BUCKET:-${ASSETS_BUCKET}}}"` —— host 上注入了
 # BACKUP_BUCKET(WORM+CMK 专用桶)时备份就写在那儿,只读 ASSETS_BUCKET 会永远 list 空,
 # 于是每个租户都命中 no-backup 拒绝 = AZ failover 实质不可用。回退 ASSETS_BUCKET 是为了
@@ -210,6 +221,7 @@ def lambda_handler(event, context):
     _stale_probe_budget["n"] = 0
     _stale_probe_budget["spent"] = 0.0
     _stale_probe_budget["ctx"] = context
+    # #432 —— 必须翻页。这是健康检查的【主输入】:漏掉 1MB 之后的页 = 那批 running 租户
     # 永远不被健康检查,坏了也没人发现。openclaw-tenants 实测 6790 行 / 2.83MB,
     # 已超 1MB 近三倍 —— 这一处现在就在漏。
     tenants = ddb_scan.scan_all(
@@ -235,6 +247,7 @@ def lambda_handler(event, context):
                 if elapsed < STALE_SECONDS:
                     continue
             except Exception as e:
+                # #218: bad timestamp shape → fall through to stale (safe
                 # default) but leave a trail so we can spot ISO drift.
                 print(f"stale-check: bad last_check for {tid}: {last_check!r} ({e})")
 
@@ -291,9 +304,11 @@ def lambda_handler(event, context):
         # Never let ledger reaping take down the watchdog.
         print(f"reap error (non-fatal): {e}")
 
+    # ------- #469 P1/P3 —— 生命周期中间态卡死收口(suspending/restoring)-------
     # 放在 creating-reaper 之后:两者都要 scan tenants,但本 sweep 还要发同步 SSM 探 host,
     # 故受 _LIFECYCLE_STUCK_MAX_PER_SWEEP 限额,不与后面的 orphan/failover/迁移 争预算。
     # 三个计数都要打:unconfirmed 非零意味着"有租户卡着但连状态都确认不了",那是比卡死
+    # 本身更需要人介入的信号(#469 P6 + 计划里的风险 2),绝不能静默。
     try:
         _lc_rb, _lc_marked, _lc_unconf = _reap_stuck_lifecycle(now)
         if _lc_rb or _lc_marked or _lc_unconf:
@@ -306,6 +321,7 @@ def lambda_handler(event, context):
         # 与其它 sweep 同约定:巡检永远不该拖垮 watchdog。
         print(f"lifecycle-stuck error (non-fatal): {e}")
 
+    # ------- #412(codex review2 #4)—— 令牌孤儿清扫(requires_intervention)-------
     # dispatch 失败超预算的租户被 poller 转 requires_intervention(非 creating),逃出上面
     # 只扫 creating 的 reaper。若它仍带 capacity_reservation_id,那份容量就永久搁浅。此扫把
     # 【requires_intervention 且仍持令牌】的租户令牌化释放(扣 host + 删令牌一个事务),兜底
@@ -337,6 +353,7 @@ def lambda_handler(event, context):
     except Exception as e:
         print(f"reap failover-recovering error (non-fatal): {e}")
 
+    # ------- #52 A 心跳失效降级 -------
     # 放在 AZ failover 之前:两者读同一个心跳判据,先把单台僵尸降下去,AZ 判定看到的
     # 就是更接近真相的机队视图。非致命 —— 降级失败不该让整个 watchdog 停摆。
     try:
@@ -364,6 +381,7 @@ def lambda_handler(event, context):
             print(f"az_failover error (non-fatal): {e}")
 
 
+    # ------- In-flight live-migration sweep (1.4.4, issue #64) -------
     # POST /tenants/{id}/migrate is async: it fires the snapshot SSM command,
     # marks the tenant `migrating` with the async context, and returns 202
     # (API Gateway caps a synchronous request at 29s, far less than a multi-GB
@@ -429,6 +447,7 @@ MIGRATION_DRAIN_SECONDS = int(os.environ.get("MIGRATION_DRAIN_SECONDS", "5"))
 # 都带 host_guard(guard 会校验租约未过期,过期即 exit 79 什么都不做)。但 Codex 指出
 # 租约过期【不证明没有在途命令】:一条 stop 命令可能在过期前一瞬通过了它的前置 guard,
 # 随后才真正执行 —— 而 reaper 此刻探到 VM 还活着、把行回滚成活跃态,那条命令接着把 VM
+# 停掉,于是「status=running 而无 VM」(#268)。
 #
 # 这个窗口【无法在当前架构下完全关闭】:per-tenant flock 在 host 上,而 reaper 的回滚是
 # Lambda 里的一次 DDB 写,锁跨不过去。要全关需把回滚本身下沉到 host(在锁内做探测+决策),
@@ -449,6 +468,7 @@ LIFECYCLE_FENCE_LEASE_SECONDS = int(
 )
 
 
+# #412 blocker-B(codex CHANGES_NEEDED #3)——每次 Lambda invocation 里 reaper 做的同步
 # stop-confirm 有上限。每条 stop-vm 阻塞至多 STOP_CONFIRM_TIMEOUT 秒;若不设上限,数台不可达
 # host 上的卡住租户会串行耗光整个 invocation(默认 180s),把后面的 orphan 清扫 / AZ failover /
 # 迁移 sweep 全饿死。超预算则本轮不再 confirm(返 False = 不释放,留下轮再试),不是错误。
@@ -659,6 +679,7 @@ def _confirm_vm_stopped(host_id, tenant_id, vm_num):
 #
 # 三条必须遵守的约束,全部落在下面代码里:
 #   1. 只比【具体版本值】,不比「变了没有」。只看「变了」会把普通 restart/recovery 误判成
+#      升级成功 —— #413 立项时 codex round5/6/7 反复抓出的 false-skip 形态。
 #   2. 路 2 只能【确认成功】,不能【判定失败】。launch-vm 写 vm.json 是 best-effort,且记的
 #      是「启动时打算用哪个版本」而非「进程真挂着哪个 rootfs」。宽松方向安全,严格方向误杀。
 #   3. 迟到的确认必须【条件写】,绝不 restamp。所有更新都绑 rebuild_op_id 仍是当次那个,
@@ -860,6 +881,7 @@ def _reconcile_unconfirmed_rebuilds(now):
             else:
                 cond += " AND attribute_not_exists(active_lifecycle_op_id)"
             vals[":fe"] = int(fence_epoch)
+        # #429 follow-up —— reconciler 既然拥有 rebuild 的收敛,就必须把 async worker
         # 持有的 lifecycle fence 也一并释放。reapply 的 worker 在 rebuild_status=unconfirmed
         # (host adoption 回执没在 300s 窗内回来,但 host 其实成功)之后【继续持有】fence,
         # 指望 finalize_async_rebuild_success 来释放;而那个 finalize 的 ConditionExpression
@@ -1018,8 +1040,11 @@ def _reap_stuck_creating(now):
         vcpu = int(t.get("vcpu", 1) or 1)
         mem_mb = int(t.get("mem_mb", 2048) or 2048)
         rid = t.get("capacity_reservation_id")
+        # #412 — dispatch 预留的租户带 capacity_reservation_id 令牌。令牌是跨 delete/poller/批
         # 回滚的互斥锚(防 ABA 双扣):谁先消费令牌谁扣一次,其余幂等。释放事务条件双锚:tenant 侧
         # status=failed AND capacity_reservation_id=:rid,host 侧下溢守卫。令牌缺失(同步 create
+        # 租户卡 creating)→ 走下面旧的 fence + guarded decrement(那条路无令牌、无 #412 泄漏)。
+        # NB(codex #3 原来的"flip+release 一个事务"已被 blocker-B 拆成 fence→stop→release 三步:
         # fence 保留令牌,release 前崩溃 → failed+令牌由 _reap_orphan_reservations 兜底,故不留无主增量)。
         _terminal_status = "requires_intervention" if crash_reason else "failed"
         _reaped_reason = (
@@ -1033,6 +1058,7 @@ def _reap_stuck_creating(now):
                 "requires_intervention_reason = :r"
             )
         if rid and host_id:
+            # #412 blocker-B(codex CHANGES_NEEDED #2)——顺序必须是【先围栏 → 再停 → 后释放】:
             # ① 原子把 creating→failed(条件 status=creating AND token=rid),【保留】令牌+放置。
             #    一个并发 promote(creating→running,条件也锁 creating)与本 flip 互斥:promote
             #    已赢则本 flip CCF → 跳过,【绝不 stop 那个刚起来的活 VM】;本 flip 赢则该行进 failed
@@ -1118,7 +1144,10 @@ def _reap_stuck_creating(now):
             print(f"reap: {tid} on {host_id} token-release (elapsed={int(elapsed)}s)")
             continue
 
+        # 非令牌(pre-#412 sync-create)租户:保持 bb 原行为——fence flip creating→failed
         # (条件 creating,promote 赢则 CCF 跳过)后 guarded 释放 slot,不 stop-confirm。这条路
+        # 无令牌、无 orphan-reaper 兜底,若在此加"停不了就不释放"会永久漏 slot;且 #412 的
+        # overcommit 修复本就聚焦令牌路径,这里不扩范围(codex #2 的 stop-before-fence 隐患
         # 仅存在于上面令牌分支,已改为 fence→stop→release)。
         # A crash-loop tenant is known to have a live VM. Without a reservation
         # token there is no idempotent release anchor, so preserve placement and
@@ -1165,6 +1194,7 @@ def _reap_stuck_creating(now):
                 },
             )
         except Exception as e:
+            # #218: expected race (status already flipped) or throttle —
             # keep skipping but leave a trail so we can distinguish the
             # two in journalctl if reap stops making progress.
             print(f"reap-skip {tid}: conditional update failed ({e})")
@@ -1196,6 +1226,7 @@ def _reap_stuck_creating(now):
     return reaped
 
 
+# ═════════ #469 P1/P3 — 生命周期中间态卡死收口 ═════════
 #
 # 覆盖 suspending / restoring。设计上【只做安全的事】:标记 + 回滚(仅在证明安全时)+ 告警,
 # **绝不碰容量账本**。原因是实查结论,不是保守偏好:
@@ -1205,14 +1236,17 @@ def _reap_stuck_creating(now):
 #     读不出"卡在哪一步"。判据只能来自 host 侧事实。
 #   · 账本扣减在 :3149 `scheduling._release_slot`,而它【不幂等】(scheduling.py:123 只有
 #     下溢守卫、无互斥锚)。若 reaper 也去扣,会与原 Lambda 恢复后的扣减【双扣】——
+#     那是账本红线的反方向(欠记账 → 超卖)。#412 之所以能安全补扣,是因为它有
 #     capacity_reservation_id 这个一次性令牌做互斥锚;suspend 路径【没有】这个锚。
 #
 # 于是分工:reaper 负责"把卡死变成可见 + 可操作",容量收敛交给 P2 的强制出口。要让
+# "盘已删时账本自动收敛"也做到,需给 suspend 加一次性锚(形态同 #412 令牌 / delete 的
 # predelete_backup_at),那要改 suspend 的破坏性路径,风险高一个量级 → 独立子项。
 #
 # 三种现场按 host 侧事实区分(见 _lifecycle_stuck_verdict 的判定矩阵)。
 
 
+# ── #438 —— 令牌化释放的三态判定(**与 api 侧那份是刻意的双份**)────────────────
 #
 # 权威实现在 `deploy/lambda/api/services/tenant_service.py::_classify_release_cancel`。
 # health_check 独立打包、**不能 import api/core**(见本文件 reap_orphan_phys_slots 的同一条
@@ -1420,6 +1454,7 @@ def _lifecycle_stuck_verdict(status, probe, has_token=False):
     return "mark_stuck", "restore did not complete"
 
 
+# #438 —— 卡死标记 + 令牌 + 阶段快照的清理清单,**三个写手共用一份**。
 #
 # 它在本文件里出现在三处(reaper 回滚、finalize_suspend、promote_restore),三处必须
 # 逐字一致:少清一个字段就留下一条陈旧事实,而这些字段全都是下游判据的输入 ——
@@ -1433,8 +1468,255 @@ _STUCK_AND_TOKEN_REMOVES = (
     "updated_at_stuck_seen, lifecycle_rollback_deferred_until, "
     "lifecycle_probe_attempted_at, suspend_release_id, suspend_backup_key, "
     "restore_reservation_id, restore_host_id, restore_vm_num, "
-    "restore_guest_ip, restore_host_port"
+    # #679 —— 归位动作(rollback / finalize / promote)一并清掉围栏的判死记录:它是执行链
+    # 刹车与本文件补偿矩阵的触发标记,归位后残留会让下一轮同类操作的刹车误判(常规档无
+    # 世代锚,死线值恰好重合时分不开轮次)。受理路径(_write_action_deadline)另有一道
+    # REMOVE 双保险。
+    "restore_guest_ip, restore_host_port, deadline_enforced_at"
 )
+
+# ── #679 —— 围栏判死后的补偿归位(suspend 链) ─────────────────────────────────
+#
+# 围栏的 suspend 在飞档已退为记录者(不翻 failed,只落 reason + deadline_enforced_at),
+# 归位由本矩阵完成,客户端轮询永远拿到可行动状态。归位者唯一:带 enforced 记录的行
+# **只**走这里,不走旧 stuck 矩阵(双归位者会在 host 副作用层互相打脸)。
+#
+# 静默期:围栏落记录起,执行链的显式刹车(tenant_service._deadline_brake_engaged)保证
+# 不再发出任何新命令;已在飞的最后一条受 SSM executionTimeout 界住(suspend 各步 ≤120s)。
+# 所以 enforced_at + 150s 之后,host 侧不再有那次操作的活动,归位不会被迟到命令打脸。
+# **不依赖 1800s 生命周期租约**(那套等待是给"无 enforced 的 stuck 行"的旧路径用的)。
+_ENFORCED_QUIET_SEC = int(os.environ.get("ENFORCED_QUIET_SEC", "150"))
+
+#: #679 —— 补偿矩阵每拍独立小限额。health Lambda 自身 timeout 仅 ~180s(:177 的教训),
+#: 而本矩阵的续做档一行要 probe(≤20s)+ 一条收盘命令(≤30s);2 行/拍最坏 ~110s,
+#: 给旧 stuck 路径和其余 sweep 段留出余量。积压靠 5 分钟一拍摊薄,窗口承诺按 backlog 顺延。
+_ENFORCED_MAX_PER_SWEEP = int(os.environ.get("ENFORCED_MAX_PER_SWEEP", "2"))
+
+#: #679 —— host 亡档的新终态。与 api 侧 tenant_service 的字面量是刻意的双份
+#: (本文件不能 import api/core,先例见 _REL_* 三态);两侧一致由
+#: tests/test_679_suspend_failed_chain_adversarial.py 的 parity 断言钉住。
+_SUSPEND_FAILED_STATUS = "suspend_failed"
+
+
+def _host_is_dead(host_id):
+    """「host 亡」的权威判定。返回 True 仅当 EC2 说这台实例 terminated/不存在。
+
+    hosts 表行 deleted/缺失**只是线索不是判据**:行可能被误删/误标而机器还活着,凭它写
+    suspend_failed 会把带活 VM 的租户标成终态(#268 谎报)。判定顺序:
+      1. hosts 行仍 active → 机器在册,不算亡(SSM 探不到走"不动"档);
+      2. 行 deleted/缺失 → EC2 describe 复核:instance 不存在(InvalidInstanceID.NotFound)
+         或 state ∈ (terminated, shutting-down) 才算亡;
+      3. EC2 查询失败/机器 running → False(fail-safe:确认不了就不归位)。
+    """
+    if not host_id:
+        return False
+    try:
+        row = hosts_table.get_item(Key={"instance_id": host_id}).get("Item")
+    except Exception as e:  # noqa: BLE001 — 读不到就当"没确认",fail-safe
+        print(f"#679 host-dead-check {host_id}: hosts row read failed: {e}")
+        return False
+    if row and row.get("status") != "deleted":
+        return False
+    try:
+        resp = ec2.describe_instances(InstanceIds=[host_id])
+        states = [
+            i.get("State", {}).get("Name")
+            for r in resp.get("Reservations", [])
+            for i in r.get("Instances", [])
+        ]
+        return bool(states) and all(
+            s in ("terminated", "shutting-down") for s in states
+        )
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "InvalidInstanceID.NotFound":
+            return True
+        print(f"#679 host-dead-check {host_id}: describe failed: {e}")
+        return False
+    except Exception as e:  # noqa: BLE001
+        print(f"#679 host-dead-check {host_id}: describe failed: {e}")
+        return False
+
+
+def _enforced_suspend_verdict(probe_ok, probe, host_dead, prev, has_token,
+                              has_backup_key):
+    """#679 补偿矩阵的判定(纯函数,可被单测穷举 —— 抄 _lifecycle_stuck_verdict 形态)。
+
+    返回 (action, reason),action ∈ {"revert", "finalize", "resume_reclaim",
+    "suspend_failed", "hold", "mark"}:
+
+    | 探测 | 动作 |
+    | --- | --- |
+    | host 亡(EC2 权威) | suspend_failed(按 has_backup_key 分档只影响 reason 文案,终态同) |
+    | 探测不可达(host 在) | hold —— 不动,下拍(#679 明确排除此档的出口) |
+    | fc 活 ∧ prev=running | revert —— 回正 running(数据/VM 都没动过) |
+    | fc 活 ∧ prev=stopped | mark —— 矛盾信号(stopped 入口的 VM 不该在跑),不归位 |
+    | fc 活 ∧ 无 vm_dir | mark —— 矛盾信号(进程在目录没),不归位 |
+    | fc 死 ∧ 无 vm_dir ∧ 令牌在 | finalize —— 走既有 _finalize_stuck_suspend(迟到成功) |
+    | fc 死 ∧ vm_dir ∧ 令牌在 | resume_reclaim —— 续做收盘后 finalize;失败每拍重试 |
+    | 其余(令牌缺等) | mark —— 前置不齐,只标记+告警 |
+    """
+    if host_dead:
+        return "suspend_failed", (
+            "host is gone (EC2-confirmed); backup exists — client may restore "
+            "(data rolls back to the backup instant) or delete"
+            if has_backup_key
+            else "host died before the suspend backup completed — data is not "
+            "recoverable; delete is the only exit"
+        )
+    if not probe_ok:
+        return "hold", "host unreachable over SSM — cannot confirm VM state, retry next sweep"
+    vm_dir = bool(probe.get("vm_dir"))
+    fc_alive = bool(probe.get("fc_alive"))
+    if fc_alive and not vm_dir:
+        return "mark", "contradictory probe: firecracker alive but VM dir gone"
+    if fc_alive:
+        if prev == "running":
+            return "revert", "VM still alive — suspend never reached its destructive step"
+        return "mark", (
+            f"contradictory probe: VM alive but lifecycle_prev_status={prev!r} "
+            "(a stopped tenant's VM must not be running)"
+        )
+    if not has_token:
+        return "mark", "VM gone but the release token is missing — cannot converge safely"
+    if vm_dir:
+        return "resume_reclaim", "VM stopped but disk not reclaimed — resuming reclaim"
+    return "finalize", "VM stopped and disk reclaimed — finalizing the late suspend"
+
+
+def _mark_enforced_stuck(t, now, reason, probe):
+    """#679 矩阵的 mark 档:与旧路径的内联 mark **同一形态**(status+updated_at 双锚、
+    `if_not_exists` 只记首次、结构化探测事实)—— `lifecycle_stuck_at` 是 P2 强制出口的
+    准入凭据,两条路径的标记语义必须逐字一致,否则 force-delete 的门就开歪了。"""
+    try:
+        tenants_table.update_item(
+            Key={"id": t.get("id")},
+            UpdateExpression=(
+                "SET lifecycle_stuck_at = if_not_exists(lifecycle_stuck_at, :t), "
+                "lifecycle_stuck_reason = :r, updated_at_stuck_seen = :t, "
+                "lifecycle_stuck_vm_dir = :vd, lifecycle_stuck_fc_alive = :fa"
+            ),
+            ConditionExpression="#s = :cur AND updated_at = :seen",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":cur": t.get("status"),
+                ":seen": t.get("updated_at"),
+                ":t": now.isoformat(),
+                ":r": f"#679: {reason}",
+                ":vd": bool(probe.get("vm_dir")),
+                ":fa": bool(probe.get("fc_alive")),
+            },
+        )
+        _publish_stuck_event(t.get("id"), t.get("status"), reason, 0, probe)
+        return True
+    except Exception as e:  # noqa: BLE001 — CCF/抖动都只记日志,下拍重来
+        print(f"#679 mark {t.get('id')}: failed ({e})")
+        return False
+
+
+def _settle_enforced_suspend(t, now):
+    """执行 #679 补偿矩阵的一行。返回处置标签(调用方计数用)。
+
+    所有条件写都带**死线锚**(`suspend_deadline = :dl`,围栏判死时锚过同一个值):
+    行上死线变了 = 已是另一轮操作,CCF 出局 —— 与围栏/_fence_row 同一条纪律。
+    """
+    tid = t.get("id")
+    dl = t.get("suspend_deadline")
+    prev = t.get("lifecycle_prev_status")
+    host_id = t.get("host_id", "")
+    host_dead = _host_is_dead(host_id)
+    if host_dead:
+        probe_ok, probe = False, {}
+    else:
+        probe_ok, probe = _probe_host_tenant_state(host_id, tid)
+    action, reason = _enforced_suspend_verdict(
+        probe_ok, probe, host_dead, prev,
+        has_token=bool(t.get("suspend_release_id")),
+        has_backup_key=bool(t.get("suspend_backup_key")),
+    )
+    print(f"#679 settle {tid}: action={action} ({reason})")
+
+    if action == "hold":
+        return "hold"
+    if action == "mark":
+        _mark_enforced_stuck(t, now, reason, probe)
+        return "mark"
+    if action == "finalize":
+        return "settled" if _finalize_stuck_suspend(t, now) else "mark"
+    if action == "resume_reclaim":
+        # 续做收盘:stop-vm(幂等,VM 已死则 no-op)+ rm(与 suspend 链删的是同一目录)。
+        # 失败不设上限 —— 每拍重试 + 日志;成功后同拍 finalize。裸命令不带 host_guard:
+        # 静默期已保证原执行者停手,唯一并发是下一拍的自己(幂等)。
+        vm_num = int(t.get("vm_num", 1) or 1)
+        _q_tid = shlex.quote(str(tid))
+        ok, _out = _ssm_run_capture(
+            host_id,
+            f"/home/ubuntu/stop-vm.sh {_q_tid} {vm_num} || true; "
+            f"rm -rf /data/firecracker-vms/{_q_tid}",
+            timeout=30,
+        )
+        if not ok:
+            return "hold"
+        return "settled" if _finalize_stuck_suspend(t, now) else "mark"
+    if action == "suspend_failed":
+        # 原语 B:**只动 tenant 项**的条件写。host 已亡,账本行随之无意义,既有
+        # _finalize_stuck_suspend 的双表事务在这里会整体取消(host 项条件引用不存在的
+        # 属性),不能复用 —— Codex 对抗评审 #4。
+        # REMOVE 清单**手写**,刻意不含 suspend_backup_key(有备份档 restore 靠它取数,
+        # _STUCK_AND_TOKEN_REMOVES 会把它清掉);含 _STALE_HEALTH_FIELDS(#501 教训:
+        # 进终态必须清健康位,否则留下 status=suspend_failed + vm_health=up 的谎报行)。
+        # 令牌(suspend_release_id)在此 REMOVE = 消费:host 亡后它守护的账本已不存在,
+        # 落 suspend_failed 前令牌必须已消费或 host 已亡 —— 这里两者同时成立。
+        try:
+            tenants_table.update_item(
+                Key={"id": tid},
+                UpdateExpression=(
+                    "SET #s = :sf, updated_at = :t, lifecycle_stuck_reason = :r "
+                    "REMOVE suspend_release_id, lifecycle_prev_status, "
+                    "lifecycle_stuck_at, lifecycle_stuck_vm_dir, "
+                    "lifecycle_stuck_fc_alive, updated_at_stuck_seen, "
+                    "lifecycle_rollback_deferred_until, lifecycle_probe_attempted_at, "
+                    "deadline_enforced_at, vm_health, app_health, last_health_check"
+                ),
+                ConditionExpression="#s = :suspending AND suspend_deadline = :dl",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={
+                    ":sf": _SUSPEND_FAILED_STATUS,
+                    ":suspending": "suspending",
+                    ":dl": dl,
+                    ":t": now.isoformat(),
+                    ":r": f"#679: {reason}",
+                },
+            )
+            return "settled"
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                print(f"#679 settle {tid}: suspend_failed write raced — row moved on")
+                return "hold"
+            raise
+    # action == "revert"
+    try:
+        tenants_table.update_item(
+            Key={"id": tid},
+            UpdateExpression=(
+                "SET #s = :prev, updated_at = :t, lifecycle_stuck_reason = :r "
+                "REMOVE lifecycle_prev_status, " + _STUCK_AND_TOKEN_REMOVES
+            ),
+            ConditionExpression="#s = :suspending AND suspend_deadline = :dl",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":prev": prev,
+                ":suspending": "suspending",
+                ":dl": dl,
+                ":t": now.isoformat(),
+                ":r": "#679: reverted — deadline fenced before any destructive step",
+            },
+        )
+        return "settled"
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            print(f"#679 settle {tid}: revert raced — row moved on")
+            return "hold"
+        raise
 
 
 def _finalize_stuck_suspend(t, now):
@@ -1673,9 +1955,40 @@ def _reap_stuck_lifecycle(now):
             f"timeout={LIFECYCLE_STUCK_TIMEOUT_SECONDS}s"
         )
     processed = 0
+    _enforced_done = 0  # #679 —— 补偿矩阵的独立小限额计数
     for t in stuck:
         tid = t.get("id")
         status = t.get("status")
+        # ── #679 —— 围栏判死过的 suspending 行走补偿矩阵,**不走**下面的旧 stuck 路径 ──
+        # 归位者唯一:旧路径的 rollback/finalize 与补偿矩阵在 host 副作用层会互相打脸
+        # (Codex 对抗评审 #6)。它有自己的静默期(enforced+150s),不受 1200s stuck 阈值
+        # 约束 —— 那个阈值防的是"误判仍在合法执行的操作",而 enforced 行的执行者已被
+        # 显式刹车停手。restoring+enforced 在 MR1 不存在(restore 围栏仍翻 failed),
+        # 出现即升级窗口残留,放行走旧路径按 stuck 处理,无害。
+        _enforced = t.get("deadline_enforced_at")
+        if _enforced is not None and status == "suspending":
+            try:
+                _quiet_left = (
+                    int(_enforced) + _ENFORCED_QUIET_SEC - int(now.timestamp())
+                )
+            except (TypeError, ValueError):
+                print(f"#679 settle-skip {tid}: bad deadline_enforced_at {_enforced!r}")
+                continue
+            if _quiet_left > 0:
+                # 静默期内不动(迟到命令可能还在飞),也不占探测预算(零 SSM)。
+                continue
+            if _enforced_done >= _ENFORCED_MAX_PER_SWEEP:
+                unconfirmed += 1
+                continue
+            _enforced_done += 1
+            _out = _settle_enforced_suspend(t, now)
+            if _out == "settled":
+                rolled_back += 1
+            elif _out == "mark":
+                marked += 1
+            else:  # hold(探测不可达 / 写输给并发) —— 下拍重试,计入不可确认
+                unconfirmed += 1
+            continue
         # updated_at 由 _cas_status(tenant_service.py:2984)在翻中间态时写,所以它就是
         # "进入该中间态的时刻",无需新增字段。缺失/不可解析 → 不猜,跳过(与 reap 同)。
         dt = _parse_iso(t.get("updated_at"))
@@ -1701,8 +2014,10 @@ def _reap_stuck_lifecycle(now):
             continue
         processed += 1
 
+        # #438 —— 探测目标修正。`restoring` 的 VM 是在【新】host 上起的,而租户行里的
         # host_id 直到收尾才更新,窗口内它仍指 suspend 之前那台旧机。改动前这里一律用
         # host_id,所以对 restoring 是【探错地方】—— 本函数原 docstring 自己标注过这条,
+        # 当时无法修是因为"新 host 是谁从未落库"。#438 第一轮把它落成 restore_host_id 之后
         # 才修得了。旧行没有该字段 → 回落 host_id,行为与改动前一致。
         host_id = t.get("restore_host_id") or t.get("host_id", "")
         ok, probe = _probe_host_tenant_state(host_id, tid)
@@ -1731,6 +2046,7 @@ def _reap_stuck_lifecycle(now):
             )
             continue
 
+        # #438 —— 有令牌才允许那两个消费令牌的收敛出口。令牌按中间态取对应的那一个:
         # 拿错字段会让一个 suspending 行走上 restore 的判定分支。
         _tok = (
             t.get("suspend_release_id") if status == "suspending"
@@ -1744,10 +2060,13 @@ def _reap_stuck_lifecycle(now):
         # suspend 走到终态时才写,卡在 suspending 的租户根本没到那一步、该字段不存在;
         # 而 suspend 允许从 running 【或 stopped】进入(tenant_service:3071)。写死
         # "running" 会把一个原本 stopped 的租户标成 running —— 「无 VM 却 running」的
+        # 谎报(#268 禁止的形态),还会让后续 start/stop 的语义全错。
         # 猜一个状态比留着卡死更糟:留着有标记、有告警、有 P2 出口;猜错则悄无声息地
         # 把租户置于一个它从未处于过的状态。
+        # #438 —— 两个令牌化收敛出口。放在租约门【之前】是有意的:它们只写 DDB、一条 host
         # 命令都不发,互斥完全由令牌完成(与原 Lambda 的收尾同一个 rid 条件,谁先到谁赢),
         # 所以不存在租约门要挡的那条"延迟命令在写之后才落地"的时序。理由详见
+        # `_lifecycle_stuck_verdict` 的 #438 段。
         # 失败(前提不全 / 事务未应用)→ 退化成 mark_stuck 走下面的老路,绝不静默跳过。
         if action in ("finalize_suspend", "promote_restore"):
             _done = (
@@ -1775,6 +2094,7 @@ def _reap_stuck_lifecycle(now):
         # LIFECYCLE_FENCE_LEASE_SECONDS 默认 1800s。中间那 600 秒里,本 sweep 认为它
         # "卡死了"并把行回滚成 prev(活跃态),而原来那次操作【仍持有效租约】,完全可以
         # 继续往下走 → VM 被停、盘被删,而它自己收尾的 CAS 因 status 已改而 CCF 失败 ——
+        # 最终留下「row=running / 无 VM / 无盘」,正是 #268 禁止的谎报形态。
         #
         # 本函数 docstring 里"suspend 的三个破坏性动作一个都没成功落地过"那句,只对
         # 【观测那一刻】成立,不保证未来 —— 这是那句话缺的一半。
@@ -1868,13 +2188,16 @@ def _reap_stuck_lifecycle(now):
             try:
                 tenants_table.update_item(
                     Key={"id": tid},
+                    # 回滚到活跃态必须【一并清掉】所有卡死标记 —— 与 #412 blocker-A 同一条
                     # 教训(_abort_restore_status 回滚时 REMOVE predelete_backup_at):标记只
                     # 对"本次卡死"有效,租户回到活跃态后可能再写新数据、再发起新的 suspend;
                     # 留着陈旧标记会让 P2 的 ?force=true 对一个【健康】租户放行 → 误删。
+                    # #438 —— REMOVE 清单必须一并清掉令牌与 suspend 的阶段快照。
                     # **不清 `suspend_backup_key` 是一条 no-data-loss 缺陷**:它是回滚到
                     # 活跃态后【残留】的,而 api 侧的重投续做支恰好以「status=suspending
                     # + 令牌 + 阶段快照」为准入。于是下一轮 suspend 若在写自己的快照之前
                     # 崩溃,续做会读到【上一轮】的 backup_key,把 restore_backup_key 指向
+                    # 一个旧时间点的对象 → 那一轮之间新写的数据永久丢失(#422 FINDING-5
                     # 判定过的同一条形态)。REMOVE 不存在的属性是 no-op,故对存量零影响。
                     UpdateExpression=(
                         "SET #s = :prev, updated_at = :t, lifecycle_stuck_reason = :r "
@@ -2039,15 +2362,21 @@ def _emit_stuck_metric(marked, unconfirmed):
         print(f"lifecycle-stuck: metric emit failed (non-fatal): {e}")
 
 
+# #412 —— 逃出 creating-only reaper 的【终态但仍持令牌】的 tenant 状态。两者都非 creating,
 # _reap_stuck_creating 扫不到;若仍带 capacity_reservation_id,那份容量永久搁浅:
+#   - requires_intervention:dispatch 失败超预算转此(review2 #4)。
 #   - deleting:delete 的令牌释放遇瞬时失败返 502 留 deleting,而 delete replay 若在到达释放前
+#     的某步(如 backup 重跑打已删目录)反复失败,令牌永不释放(review8 #2)。deleting 是终态
 #     意图(VM 正被拆),释放其容量恒安全。
 # requires_intervention:终态失败,VM 非活跃语义,令牌可【立即】回收(reserve 已提交、无论
 # VM 起没起都不再重试)。**deleting 不在此列**(codex review9 #1 + review10 #1):deleting 的 VM
 # 可能【还活着】(delete 先翻 deleting 再 backup+stop-vm,释放在 stop 成功之后),单靠 age 证明
 # 不了 stop-vm 已跑——一个在 stop 前崩溃的 delete 会被误 reap 掉活 VM 的容量/放置(欠记账红线)。
 # deleting 的令牌搁浅已由 delete 自身的重投兜底(队列 502 replay 带 _consumer_ident 重跑释放;
+# 同步无队列路径 review7 #2 也会对仍持令牌的 deleting 恢复释放),无需在此再兜一道有风险的。
+# 真正安全的 deleting 回收需 host 侧 "stop-vm 已跑/vm.json 已删" 持久标记 → 归 follow-up #420。
 #
+# #412 blocker-B(codex CHANGES_NEEDED #2)—— 追加 "failed":_reap_stuck_creating 现按
 # 【先围栏(creating→failed 保留令牌)→ stop-confirm → 释放】三步做,避免 stop 掉一个刚 promote
 # 成 running 的活 VM。若 stop 本轮未确认,行会停在【failed 且仍带令牌】,creating-reaper 再也扫
 # 不到它。此处把 failed 纳入孤儿兜底:下轮同样 stop-confirm 后释放。安全性:写出【failed + 令牌】
@@ -2091,6 +2420,7 @@ def _reap_orphan_reservations(now=None):
                     continue
                 vcpu = int(t.get("vcpu", 1) or 1)
                 mem_mb = int(t.get("mem_mb", 2048) or 2048)
+                # #412 blocker-B:释放令牌/扣账前先确认 VM 已停(requires_intervention 的 VM
                 # 可能仍在跑,launch-vm.sh 失败后会留活 FC)。未确认 → 本轮跳过,下轮再试。
                 if not _confirm_vm_stopped(host_id, tid, t.get("vm_num", 1)):
                     continue
@@ -3208,6 +3538,7 @@ def _advance_migration(tenant, now):
                 )
                 return
         except Exception as e:
+            # #218: bad migration_started_at → skip watchdog (safer than
             # rollback on garbled input) but surface the drift.
             print(
                 f"migration watchdog {tenant.get('id')}: bad started_at "
@@ -3417,6 +3748,7 @@ def _advance_migration(tenant, now):
             return
 
         # 赢家专属:减 SOURCE 计数 + stop 源 VM + release-route 源(硬伤③/R5)。
+        # #172 — 只减 SOURCE;TARGET 的 slot 在 migrate 发起时已 CAS 占用,绝不再动。
         vcpu = int(tenant.get("vcpu", 0))
         mem_mb = int(tenant.get("mem_mb", 0))
         old_vm_num = int(tenant.get("migration_old_vm_num", tenant.get("vm_num", 1)))
@@ -3452,6 +3784,7 @@ def _advance_migration(tenant, now):
                     timeout=60,
                 )
             except Exception as e:
+                # #218: source side cleanup is best-effort (source may be
                 # unreachable); note it so we know why tap/nginx residue
                 # occasionally survives migration.
                 print(
@@ -3596,6 +3929,7 @@ def _restart_host_agent(host_id, now):
                 )
                 return False
         except Exception as e:
+            # #218: bad agent_restart_at → let the restart proceed (no
             # cooldown enforced) but surface the timestamp corruption.
             print(
                 f"restart {host_id}: bad agent_restart_at {last_restart!r} "
@@ -3625,6 +3959,7 @@ def _restart_host_agent(host_id, now):
 
 
 # =====================================================================
+# #52 A —— 单台心跳失效降级。2026-08-10 apse1 那行僵尸 active 账本的正解。
 # =====================================================================
 
 
@@ -3846,6 +4181,7 @@ def should_reclaim_stale_tenant(tenant, host, now, threshold_sec):
     if host.get("status") == "deleted":
         return "reclaim"
     # `draining` 有两条来源,只有一条算失联证据,所以不能只看 status:
+    #   · demote_stale_hosts(#52)的「心跳陈旧 且 SSM 也看不见」双门 —— 必带 stale_demoted_at
     #   · POST /hosts/{id}/drain(host_service.py)运维主动回收 —— 只写 status,
     #     机器和其上的 VM 此刻都还活着(terminate 是随后异步发生的)
     # 把后者也当失联就会跳过探针、直接降级一个 VM 还在跑的租户。
@@ -4406,6 +4742,7 @@ def _check_and_handle_az_failover(now, tenants):
     }
 
     # 1) Load all hosts.
+    # #432 —— 必须翻页。这一处连 FilterExpression 都没有,是【裸全表 Scan】,
     # 所以 1MB 上限完全按全表字节数算(实测 39 行里 33 行是 deleted,全都被扫)。
     # 漏页的后果在这里最重:AZ 健康是拿 host 集合算的 ——
     #   · 少看见一批健康 host → 误判该 AZ 故障 → 触发【全量迁移】;
@@ -5175,6 +5512,7 @@ def _failover_tenant_to_host(tenant, target_host, source_az, now):
                 },
             )
         except Exception as e:
+            # #218: DDB flip to failover_blocked failed — the AZ_FAILOVER_NO_BACKUP
             # audit is already emitted above, but if the status write disappears
             # silently, later sweeps re-attempt failover forever. Surface it.
             print(
@@ -5199,6 +5537,7 @@ def _failover_tenant_to_host(tenant, target_host, source_az, now):
                     ),
                 )
             except Exception as e:
+                # #218: SNS best-effort — audit event captures the same signal,
                 # but silence made "alert never fired" indistinguishable from
                 # "alert fired and was ignored". Log so we can tell.
                 print(
@@ -5246,6 +5585,7 @@ def _failover_tenant_to_host(tenant, target_host, source_az, now):
         #                   <chat_endpoint_enabled> <cognito_b64>
         #    config_template can be empty string ""; restore_backup_key
         #    is an S3 key (no s3:// prefix), e.g. backups/<tid>/<ts>.gz.
+        # #41 — failover 是 wake 场景(从 backup 恢复到 target host),必须穿透
         # chat_endpoint_enabled 到 launch-vm 幂等段(第 10 位);位 7/8/9/11 空占位
         # (数据盘从 backup 恢复,首铸字段随备份带回来,不重铸)。老版本只填 6 位。
         # #排雷 D2 — 所有早返回门已过,现在原子占 target host 的 vm_num + 记账(CAS)。
@@ -5387,6 +5727,7 @@ def _failover_tenant_to_host(tenant, target_host, source_az, now):
         #    #排雷 D2 — target host 的 next_vm_num/used_*/vm_count 记账已在
         #    _reserve_target_vm_num 的 CAS 里原子完成(launch 前),这里**只翻 tenant 记录**,
         #    绝不再无条件 SET next_vm_num=target+1(那会覆盖并发 create 的递增 → 串号,
+        #    与 #172 defect B 同源)。只减/加 host 计数的活全归 CAS 占槽 + source 侧回收。
         tenants_table.update_item(
             Key={"id": tenant_id},
             # #491(review3)—— 必须同时写 phys_vm_num。它是【物理 tap 号的权威】,撞号守卫
@@ -5470,6 +5811,7 @@ def _failover_tenant_to_host(tenant, target_host, source_az, now):
                 },
             )
         except Exception as e:
+            # #218: same class as the no-backup path — audit still fires
             # below, but a silent status miss means the next sweep keeps
             # retrying failover on a tenant that's already broken.
             print(f"az-failover {tenant_id}: mark {new_status} failed (non-fatal): {e}")

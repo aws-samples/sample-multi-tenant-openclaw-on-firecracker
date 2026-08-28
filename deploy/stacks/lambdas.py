@@ -186,7 +186,6 @@ def build_lambdas(self, ctx):
         for _st in ec2_policy_statements:
             fn.add_to_role_policy(_st)
 
-    # ========== SNS Lifecycle Notifications (issue #13, optional) ==========
     notif_cfg = CFG.get("notifications", {}) or {}
     notifications_topic = None
     notifications_topic_arn = ""
@@ -651,7 +650,6 @@ def build_lambdas(self, ctx):
     hosts_table.grant_read_write_data(api_fn)
     groups_table.grant_read_write_data(api_fn)
     version_snapshots_table.grant_read_data(api_fn)  # #217 V2 — pull-image 只读快照
-    # #376 — create_image_snapshot 落新快照:只加 PutItem(最小权限,不给 Delete/Update)。
     version_snapshots_table.grant(api_fn, "dynamodb:PutItem")
     # #394 — delete_image_snapshot 是【软删】(status=deleted 标记),用 UpdateItem 打标而非
     # 物删,故加 UpdateItem。不给 DeleteItem(软删不物理删,记录留档可审计/可恢复)。
@@ -720,13 +718,11 @@ def build_lambdas(self, ctx):
     if clawpool_rsa_cmk is not None:
         api_fn.add_environment("CLAWPOOL_RSA_CMK_ARN", clawpool_rsa_cmk.key_arn)
         clawpool_rsa_cmk.grant(api_fn, "kms:GetPublicKey")
-    # Issue #17 — api Lambda writes audits and reads them back via GET /audit-log
     audit_table.grant_read_write_data(api_fn)
     # PRD #54 — async batch jobs: read/write the job ledger, and self-invoke
     # asynchronously to run the worker (same function, routed by a marker in
     # the event payload — no separate Lambda to keep the blast radius small).
     batch_jobs_table.grant_read_write_data(api_fn)
-    # #97 档A — /tenantmatch only reads the IdP map (least privilege: read-only).
     tenant_idp_table.grant_read_data(api_fn)
     # #187 P1 / #149 出站 — control-plane mints the per-tenant gateway token +
     # device identity ciphertext (SPEC/11-ENGINE-TRANSFORM · INTERFACE-CONTRACT §5).
@@ -973,7 +969,6 @@ def build_lambdas(self, ctx):
         groups_table.grant_read_write_data(lifecycle_consumer)
         audit_table.grant_read_write_data(lifecycle_consumer)
         batch_jobs_table.grant_read_write_data(lifecycle_consumer)
-        # #413 P1/P2 — rebuild attempts/results share the image-ops ledger.
         image_jobs_table.grant_read_write_data(lifecycle_consumer)
         # #187 P1 — consumer replays create_tenant which now mints gateway token.
         # Same grants as api_fn (secrets table r/w + CMK encrypt + GenerateRandom).
@@ -1172,7 +1167,6 @@ def build_lambdas(self, ctx):
     # via DELETE /skills/{name}.
     assets_bucket.grant_put(api_fn)
     assets_bucket.grant_delete(api_fn)
-    # Issue #13 — allow publishing tenant lifecycle events
     if notifications_topic is not None:
         notifications_topic.grant_publish(api_fn)
     # #62 IAM 收窄:ssm_policy + ec2_policy 各拆成多条 statement,
@@ -1463,7 +1457,6 @@ def build_lambdas(self, ctx):
             )
             _pplan.add_api_key(_pkey)
 
-    # ========== WAF (issue #7, optional) ==========
     waf_cfg = CFG.get("waf", {}) or {}
     if waf_cfg.get("enabled", False):
         rate_limit = int(waf_cfg.get("rate_limit_per_ip", 1000))
@@ -1792,10 +1785,8 @@ def build_lambdas(self, ctx):
     # 只作用一台 host。Admin op (x-api-key)。
     pull_image_resource = host_resource.add_resource("pull-image")
     pull_image_resource.add_method("POST", _li(), **key_required)
-    # #309 — GET /hosts/{instance_id}/pull-image-progress:tail host 上 /tmp/<job_id>.txt。
     pull_image_progress_resource = host_resource.add_resource("pull-image-progress")
     pull_image_progress_resource.add_method("GET", _li(), **key_required)
-    # #309 — POST /hosts/{instance_id}/copy-file-from-s3:单文件 S3→EC2(目标限资产目录白名单)。
     copy_file_resource = host_resource.add_resource("copy-file-from-s3")
     copy_file_resource.add_method("POST", _li(), **key_required)
     # #394 step5 — 同步槽位操作(admin-only,handler 内 identity 门):只改 host 上 slots.json
@@ -1837,7 +1828,6 @@ def build_lambdas(self, ctx):
     create_snapshot_resource = api.root.add_resource("create-image-snapshot")
     create_snapshot_resource.add_method("POST", _li(), **key_required)
 
-    # 1.4.0 (#62) — Groups CRUD endpoints
     groups_resource = api.root.add_resource("groups")
     groups_resource.add_method("GET", _li(), **key_required)
     groups_resource.add_method("POST", _li(), **key_required)
@@ -1847,7 +1837,6 @@ def build_lambdas(self, ctx):
     group_skill_resource = group_skills_resource.add_resource("{skill}")
     group_skill_resource.add_method("DELETE", _li(), **key_required)
 
-    # Issue #23 — batch operations: POST /batch/tenants
     batch_resource = api.root.add_resource("batch")
     batch_tenants_resource = batch_resource.add_resource("tenants")
     batch_tenants_resource.add_method("POST", _li(), **key_required)
@@ -2058,6 +2047,16 @@ def build_lambdas(self, ctx):
             resources=["*"],
         )
     )
+    # #679 —— 补偿矩阵的「host 亡」档需要 EC2 权威确认(hosts 表行 deleted/缺失只是线索:
+    # 行可能被误删而机器还活着,凭它就写 suspend_failed 会把有活 VM 的租户标成终态 ——
+    # #268 的谎报形态)。只挂 health_fn、不进共享组,理由与上一条 DescribeInstanceInformation
+    # 逐字相同;Describe* 不支持资源级 IAM,resources=["*"],纯只读。
+    health_fn.add_to_role_policy(
+        iam.PolicyStatement(
+            actions=["ec2:DescribeInstances"],
+            resources=["*"],
+        )
+    )
 
     events.Rule(
         self,
@@ -2080,20 +2079,17 @@ def build_lambdas(self, ctx):
         memory_size=2048,
         environment={
             "ASSETS_BUCKET": assets_bucket.bucket_name,
-            # 1.4.0 (#62) — needed for ?tenant=... per-tenant scope filtering
             "TENANTS_TABLE": tenants_table.table_name,
             "GROUPS_TABLE": groups_table.table_name,
         },
     )
     assets_bucket.grant_read(skills_fn)
-    # 1.4.0 (#62) — read-only access to compute effective skill sets
     tenants_table.grant_read_data(skills_fn)
     groups_table.grant_read_data(skills_fn)
     skills_resource = api.root.add_resource("skills")
     skills_resource.add_method(
         "GET", apigw.LambdaIntegration(skills_fn), **key_required
     )
-    # 1.4.1 (#63) — per-skill CRUD goes through api Lambda (reuses RBAC + audit log)
     skill_resource = skills_resource.add_resource("{name}")
     skill_resource.add_method("GET", _li(), **key_required)
     skill_resource.add_method("PUT", _li(), **key_required)
@@ -2142,7 +2138,6 @@ def build_lambdas(self, ctx):
             "TENANTS_TABLE": tenants_table.table_name,
             "ASG_NAME": "openclaw-hosts-asg",
             "IDLE_TIMEOUT_MINUTES": str(CFG["scaler"]["idle_timeout_minutes"]),
-            # task #21 — seamless rolling image refresh (gated OFF until verified)
             "IMAGE_REFRESH_ENABLED": str(
                 CFG.get("scaler", {}).get("image_refresh_enabled", False)
             ).lower(),
@@ -2155,7 +2150,6 @@ def build_lambdas(self, ctx):
             "ASSETS_BUCKET": assets_bucket.bucket_name,
             "ROOTFS_PREFIX": CFG["s3"]["rootfs_prefix"],
             "BACKUP_PREFIX": CFG["s3"]["backup_prefix"],
-            # 10h-goal #17 — reserve-capacity warm pool (gated OFF until verified)
             "RESERVE_ENABLED": str(
                 CFG.get("scaler", {}).get("reserve_enabled", False)
             ).lower(),
@@ -2170,12 +2164,10 @@ def build_lambdas(self, ctx):
         },
     )
     hosts_table.grant_read_write_data(scaler_fn)
-    # Issue #15 — TTL processing reads tenants and updates status (stop/delete)
     tenants_table.grant_read_write_data(scaler_fn)
     # #62 IAM 收窄:SSM 拆多 statement;stop-vm.sh 走 SSM SendCommand,
     # instance ARN 带 Project=openclaw/Role=metal-host 条件。
     _attach_ssm_policies(scaler_fn)
-    # task #21 — read rootfs manifest (current golden version) for refresh
     assets_bucket.grant_read(scaler_fn)
     scaler_fn.add_to_role_policy(
         iam.PolicyStatement(

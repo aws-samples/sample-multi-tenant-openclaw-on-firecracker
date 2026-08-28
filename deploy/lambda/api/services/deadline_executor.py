@@ -89,6 +89,7 @@ import core.scheduling as scheduling
 #
 # rebuild 也不在这里:它的在飞态**不是 status 值**,是 `rebuild_phase ∈
 # {queued,running,verifying}`(`tenant_service._REBUILD_INFLIGHT_PHASES`),
+# 所以它走下面单独一条 scan 分支。理由与 #309 那条一样:`status` 有四个消费方
 # (scaler 的 `_REFRESH_SKIP_STATUS`、`gsi_status` 查询、客户已在用的契约字段),
 # 为 rebuild 加一个 status 枚举值要同步改每一处,漏一处就是静默错误。
 _STATUS_ACTION: Dict[str, str] = {
@@ -145,6 +146,7 @@ _NO_INTERMEDIATE_STATUS = (
 #
 # 为什么不进 `status`:`status` 有四个消费方(scaler 的 `_REFRESH_SKIP_STATUS`、`gsi_status`
 # 查询键、客户已在用的契约字段),为它们各加一个枚举值要同步改每一处,漏一处就是静默错误
+# (`tenant_service` 的 #309 注释逐字论证过)。
 #
 # **`backup` 只翻 `backup_phase`,绝不翻 `status`**:一次备份失败不代表这个租户失败 ——
 # 它可能正在正常服务。把 `status` 翻成 `failed` 会让 scaler 与控制台把一个健康租户当故障。
@@ -434,13 +436,41 @@ def _fence_failed(
             s for s, a in _STATUS_ACTION.items() if a == action
         )
         if status in _intermediates:
-            update = (
-                f"SET #s = :failed, {reason_attr} = :reason, "
-                f"{create_deadline.fail_at_attr(action)} = :iso, "
-                "updated_at = :iso, deadline_enforced_at = :now"
-            )
-            condition = f"#s = :expected AND {dl_attr} = :dl"
-            names = {"#s": "status"}
+            if action == create_deadline.ACTION_SUSPEND:
+                # #679 —— suspend 在飞档退为**记录者**:不再翻 `status=failed`,只落
+                # 原因 + 时刻 + `deadline_enforced_at`。归位交给 reaper 的补偿矩阵
+                # (health_check `_reap_stuck_lifecycle` 的 enforced 分支):VM 还活着 →
+                # 回正 `lifecycle_prev_status`;可收敛 → finalize 成 suspended(迟到成功);
+                # host 亡 → `suspend_failed`(按备份分两档,判断权交客户端)。
+                #
+                # 为什么敢拿掉"翻 failed":那个翻转此前是执行链的**隐式刹车**(后续锚
+                # suspending 的条件写会 CCF 中止)。#679 换成了**显式刹车** ——
+                # `_suspend_finish` 在发 stop-vm 之前强一致读本字段,判死即停手
+                # (tenant_service `_deadline_brake_engaged`)。围栏落下本字段起执行者
+                # 不再发出任何新命令;已在飞的最后一条命令受 SSM executionTimeout 界住
+                # (≤120s),所以 reaper 只在 `enforced_at + 150s` 静默期之后归位,
+                # 不会被迟到命令打脸。
+                #
+                # `restore` 在飞档**刻意保持翻 failed**(下面 else):它的补偿链归 #679
+                # 的 MR2,围栏变更必须与对应归位链同一发布单元 —— 先改围栏会造出
+                # "restoring 无人归位"的真空(Codex 对抗评审 #2)。
+                update = (
+                    f"SET {reason_attr} = :reason, "
+                    f"{create_deadline.fail_at_attr(action)} = :iso, "
+                    "deadline_enforced_at = :now"
+                )
+                # 锚 status=suspending + 死线:行已被执行者合法翻走(收尾成功/回滚)时
+                # CCF → raced,不写 —— 与本函数其余分支同一条"晚到的判决不覆盖新事实"。
+                condition = f"#s = :expected AND {dl_attr} = :dl"
+                names = {"#s": "status"}
+            else:
+                update = (
+                    f"SET #s = :failed, {reason_attr} = :reason, "
+                    f"{create_deadline.fail_at_attr(action)} = :iso, "
+                    "updated_at = :iso, deadline_enforced_at = :now"
+                )
+                condition = f"#s = :expected AND {dl_attr} = :dl"
+                names = {"#s": "status"}
         elif status in _ENTRY_STATUSES.get(action, ()):
             # #663 —— 这次还没进中间态,与 #604 start「永远没有中间态」同理:把健康租户
             # 标 failed 比不判死更糟。status 锚仍必须保留,写入前若 CAS 进中间态就让 CCF

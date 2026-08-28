@@ -10,7 +10,11 @@
 两端都在公开仓可解析,所以下面每条校验命令你都能自己跑通(spire-agent 那版 kit 记的两个 SHA 只存在于
 构建机本地,客户跑不了 —— 从这一版起修掉了)。
 
-## 前置依赖:先施加 `edge-balancer-cosocket-606`,否则 edge 数据面带 P0 缺陷
+**`base_sha` 是一个前置假设,不只是一个区间端点。** 它是公开仓 2026-08-20 的状态,本 kit 假定
+你的环境**已经处于那个版本**。它不覆盖 `81f3b884` 之前的任何变更 —— 如果你的环境比它更旧,
+先确认要补哪些更早的 kit,再回到本文。
+
+## 施加顺序:本 kit → `lc2-patch`。#606 的 edge 修复由 `lc2-patch` 交付,不是本 kit
 
 **本 kit 不修 edge 的 `balancer_by_lua*` cosocket 缺陷(#606),而且携带的 edge 制品本身是缺陷版。**
 
@@ -32,9 +36,26 @@
 从而把排查方向带到完全错误的地方(实测曾误判为 route stale、guest 出网策略拦截、
 openresty 进程停止三个方向,全部排除后才定位到本缺陷)。
 
-处置:**先施加 `patch/edge-balancer-cosocket-606`**,它的 `apply_cli` 真的下发到在役
-edge(S3 放制品 → SSM 写 `lualib` 与 `/opt/openclaw-edge` 两处落点 → reload)。
-两个 kit 之间没有代码依赖,顺序可换,但**都要做**。
+处置:**施加完本 kit 之后接着施加 `patch/lc2-patch`**,#606 的修复由它交付 —— 它携带的
+`deploy/edge/lib/balancer.lua` 是修复后的版本,并在自己的 APPLY-INSTRUCTIONS 里给出在役 edge 的
+逐台安装步骤:把 `route.lua`、`lib/balancer.lua`、`lib/backend.lua`、`lib/redis_client.lua`
+装到 `/usr/local/openresty/lualib/edge`、`nginx.conf` 装到
+`/usr/local/openresty/nginx/conf/nginx.conf`,**先核这 5 个文件的 sha256 与 manifest 的
+`patch_sha256` 逐一相等**,再 `nginx -t`,最后 `systemctl reload claw-edge`。
+`lc2-patch` 的 `base_sha` 等于本 kit 的 `patch_sha`,所以两者是一条**不能颠倒**的链。
+
+> **早期版本的这一节要求先施加 `patch/edge-balancer-cosocket-606`,那个 kit 已经并入
+> `lc2-patch`、目录已从仓库移除,不要再去找它。** 同样已并入 `lc2-patch` 并移除目录的还有
+> `patch/egress-207-patch` 与 `patch/auto-8f86347b`。
+>
+> 另外要更正那条旧指引本身的一个事实错误:`edge-balancer-cosocket-606` 的 19 个 path 里
+> **没有** `deploy/edge/lib/balancer.lua`(它 ship 的是 `route.lua`、`nginx.conf`、
+> `lib/hints.lua`、`lib/tenant.lua`、`lib/utils.lua`、`install-edge.sh`、三个 fluent-bit
+> 配置与一批测试),所以「先打那个 kit 才能修掉 #606」从来就不成立 —— 真正交付
+> `balancer.lua` 修复版的一直只有 `lc2-patch`。
+
+**本 kit 施加完成、`lc2-patch` 尚未施加的那段窗口里,edge 数据面仍带 #606 缺陷。** 如果你的
+环境正在服务租户,请把两个 kit 安排在同一个维护窗口内连续施加,不要在中间停留。
 
 排查这一层时的两个陷阱,先知道能省很多时间:
 
@@ -43,6 +64,27 @@ edge(S3 放制品 → SSM 写 `lualib` 与 `/opt/openclaw-edge` 两处落点 →
 - **`systemctl is-active` 可能报 inactive 而进程其实在跑** —— 若 openresty 不经 systemd
   启动(由 `install-edge.sh` 直接拉起 nginx binary),service 状态不反映真实进程。
   判断存活要看 `ps` 与端口监听,不要只看 `systemctl`
+
+## 动手前先跑一次 validator,并对照它的预期基线
+
+```sh
+patch/validator/oc-prelaunch-validate \
+  --kit patch/lifecycle-op-patch --gateway-ref origin/gateway \
+  --offline --report ./prelaunch-lifecycle-op-patch.json
+```
+
+**这一步会报 7 条 `FAIL`、1 条 `INCONCLUSIVE`,退出码 `1` —— 那是本 kit 的既有状态,
+不是你搞坏了什么。** 逐条归因与两个 kit 的完整对照表在
+`patch/validator/README.md` 的「Recorded `--offline` baselines」一节。用法只有一条:
+**把你跑出来的每一行和表里本 kit 那一列比对**。
+
+- 每一行都对上 → kit 处于交付状态,继续往下读,**不要再去查那些 FAIL**
+- 有任何一行比基线更差(PASS 变 FAIL、或多出新的 id)→ **停下**,那个差值来自你的树或你的
+  调用方式,不是 kit
+- 有任何一行比基线更好 → 也值得看一眼,通常是 `--gateway-ref` 指到了别的 ref
+
+`--offline` 不读任何在役状态,所以 `A1` / `D5` / `E2` 在这个模式下没有判别力,只是记录在案。
+拿到客户环境的 `environment.json` 与只读凭据之后再跑一次完整模式,那一次才有 live 判据。
 
 ## 先读四条会静默毁掉本次交付的事实
 

@@ -107,3 +107,86 @@ rollback reasons:
 
 An E10 annotation must be correlated with independent byte, configuration, or
 runtime evidence before deciding to roll back.
+
+## Recorded `--offline` baselines
+
+**Why this section exists.** A first-time operator runs `--offline` against a
+shipped kit, sees seven `FAIL` rows, and has no way to tell "this kit has always
+reported that" from "I broke something". Without a baseline the honest reaction is
+to stop and escalate, which is exactly the delay this tool was meant to remove.
+The two tables below are what the shipped kits actually report, so a run can be
+compared instead of interpreted.
+
+**Scope and limits.** These were recorded with `--offline` only, against
+`--gateway-ref origin/gateway`, with no `--environment-json` and no AWS
+credentials. `--offline` supplies no live readings, so `A1`, `D5` and `E2` have no
+discriminating power here — they are recorded for completeness, not as evidence.
+Re-record after any publish that changes a kit; a baseline is only meaningful
+against a stated gateway ref.
+
+Recorded against gateway `88c8c42d` (`patch/lc2-patch` at `patch_sha`
+`979a9cb7`, `patch/lifecycle-op-patch` at `patch_sha` `c9fd494f`).
+
+| ID | `lifecycle-op-patch` | `lc2-patch` |
+| --- | --- | --- |
+| A1 | FAIL | UNVERIFIED |
+| D1 | PASS | PASS |
+| D2 | PASS | PASS |
+| D3 | FAIL | PASS |
+| D4 | PASS | PASS |
+| D5 | FAIL | UNVERIFIED |
+| D6 | FAIL | PASS |
+| D7 | FAIL | FAIL |
+| E2 | INCONCLUSIVE | INCONCLUSIVE |
+| E7 | FAIL | FAIL |
+| E8 | FAIL | FAIL |
+| E10 | PASS | PASS |
+
+Both kits exit `1` in this mode, because exit `1` means "at least one FAIL" and
+says nothing about whether the FAIL is new.
+
+### How to use it
+
+Run the tool, then diff your rows against the column for your kit.
+
+- **Every row matches** — the kit is in its shipped state. Proceed with APPLY.
+  Do not spend time on the FAIL rows below; they are explained here.
+- **Any row is worse than the baseline** (PASS→FAIL, or a new id appears) — stop.
+  That delta is about your tree or your invocation, not about the kit.
+- **Any row is better than the baseline** — also worth a look, usually it means
+  you pointed `--gateway-ref` at a different ref than the one recorded above.
+
+### Why each non-PASS row is expected
+
+Rows shared by both kits are properties of the source tree, not of kit packaging,
+so no amount of repackaging moves them:
+
+- **D7** — `lib/apply-cfn-resources.sh` uses `mapfile`, which is bash 4+. The
+  rule is correct, but the script already guards it: it checks `BASH_VERSION` up
+  front and aborts with `FATAL: bash <version> is too old; this needs bash 4+
+  (mapfile).` So on macOS (bash 3.2) the operator gets a named cause rather than
+  `mapfile: command not found` at exit 127. Run that script under bash 4+.
+- **E7** — the fail-closed exception literals in
+  `deploy/lambda/api/core/create_deadline.py` and `core/deadline_config.py` are
+  Chinese, so they are not ASCII-safe. Note this is the *source* of the message;
+  the reporting *transport* that used to fail on those bytes was fixed under
+  `#655`, which is in both kits.
+- **E8** — the rule wants every host-table scan to exclude synthetic ids. Some
+  call sites already do (`services/fleet_service.py` matches the exclusion
+  shape); others in the same group do not (`core/scheduling.py` does not), and the
+  group is reported as one row.
+
+Rows that are FAIL only on `lifecycle-op-patch` reflect that it is the older kit
+in the chain, not a defect introduced by it:
+
+- **D3** — the check pairs the newest publish marker with the manifest log by
+  filename slug. That kit's `patch_sha` is `c9fd494f`, and the markers under
+  `patch/` have since rotated well past it (newest slug is `3c4494e8`), so no
+  marker names its commit any more.
+- **D6** — its S3 writes predate the convention of reading and recording the
+  previous `VersionId` as a rollback anchor.
+- **A1** and **D5** are `FAIL` here and `UNVERIFIED` on `lc2-patch`: this kit
+  declares critical files whose bytes the offline comparison can resolve on one
+  side only, and three `B-s3` scripts (`launch-vm.sh`, `stop-vm.sh`,
+  `migrate-vm.sh`) carry no `mode` in the manifest. Neither is decidable without
+  live readings — see the scope note above.

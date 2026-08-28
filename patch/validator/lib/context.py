@@ -6,10 +6,25 @@ from pathlib import Path
 
 from lib.awsread import AwsReader
 from lib import srcdefaults
+from lib.discover import discover
 
 
 HASH_KEYS = ("patch_sha256", "patch_hash", "sha256")
 MODE_RE = re.compile(r"(?:install\s+-m\s+|mode\s+)(0?[0-7]{3,4})")
+DISCOVERY_ENV_KEYS = {
+    "assets_bucket": ("assets_bucket", "s3.assets_bucket"),
+    "buckets": ("buckets",),
+    "host_asg": ("host_asg", "asg.name"),
+    "edge_asg": ("edge_asg",),
+    "host_lt": ("host_lt", "asg.lt_id"),
+    "edge_lt": ("edge_lt",),
+    "lambda_functions": ("lambda_functions",),
+    "lambda_logical_to_physical": ("lambda_logical_to_physical",),
+    "rest_api_id": ("rest_api_id", "control_plane_api.id"),
+    "tables": ("tables",),
+    "redis_group": ("redis_group",),
+    "logging_enabled": ("logging_enabled", "logging.enabled"),
+}
 
 
 class ContextError(ValueError):
@@ -88,11 +103,13 @@ class ValidationContext:
         self.region = args.region
         self.target_vms = args.target_vms
         self.offline = args.offline
+        self.stack_names = list(getattr(args, "stack", None) or [])
         self.manifest = _load_json(self.kit / "manifest.json")
         self.env = _load_json(args.environment_json, required=False)
         self.aws = aws or AwsReader(region=self.region)
         self._defaults = None
         self._manifests = None
+        self._discovered = None
 
     def get(self, dotted, default=None):
         value = self.env
@@ -106,6 +123,38 @@ class ValidationContext:
         if self._defaults is None:
             self._defaults = srcdefaults.collect(self.repo)
         return self._defaults
+
+    def discovered(self):
+        if self._discovered is not None:
+            return self._discovered
+        data = discover(
+            self.aws, self.region, self.stack_names or None)
+        unresolved = list(data.get("unresolved") or [])
+        sources = dict(data.get("sources") or {})
+        classifications = dict(data.get("classifications") or {})
+        for coordinate, keys in DISCOVERY_ENV_KEYS.items():
+            supplied = None
+            supplied_key = None
+            for key in keys:
+                value = self.get(key)
+                if value is not None:
+                    supplied = value
+                    supplied_key = key
+                    break
+            if supplied_key is None:
+                continue
+            data[coordinate] = supplied
+            sources[coordinate] = "environment-json"
+            classifications.pop(coordinate, None)
+            unresolved = [
+                item for item in unresolved
+                if item.get("coordinate") != coordinate
+            ]
+        data["sources"] = sources
+        data["classifications"] = classifications
+        data["unresolved"] = unresolved
+        self._discovered = data
+        return data
 
     def manifest_entries(self):
         return normalize_manifest(self.manifest)
@@ -159,6 +208,7 @@ def add_arguments(parser):
     parser.add_argument("--gateway-ref", default="origin/gateway")
     parser.add_argument("--environment-json")
     parser.add_argument("--region")
+    parser.add_argument("--stack", action="append")
     parser.add_argument("--target-vms", type=int)
     parser.add_argument("--report", required=True)
     parser.add_argument("--group")

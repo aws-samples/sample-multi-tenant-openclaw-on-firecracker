@@ -26,9 +26,9 @@ def _parser():
 
 def _groups(raw):
     if not raw:
-        return {"A", "B", "C", "D", "E"}
+        return {"A", "B", "C", "D", "E", "F", "G"}
     groups = {item.strip().upper() for item in raw.split(",") if item.strip()}
-    invalid = groups.difference({"A", "B", "C", "D", "E"})
+    invalid = groups.difference({"A", "B", "C", "D", "E", "F", "G"})
     if invalid:
         raise ContextError("unknown groups: %s" % ",".join(sorted(invalid)))
     return groups

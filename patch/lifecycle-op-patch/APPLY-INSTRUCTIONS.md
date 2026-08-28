@@ -65,6 +65,27 @@ openresty 进程停止三个方向,全部排除后才定位到本缺陷)。
   启动(由 `install-edge.sh` 直接拉起 nginx binary),service 状态不反映真实进程。
   判断存活要看 `ps` 与端口监听,不要只看 `systemctl`
 
+## 动手前先跑一次 validator,并对照它的预期基线
+
+```sh
+patch/validator/oc-prelaunch-validate \
+  --kit patch/lifecycle-op-patch --gateway-ref origin/gateway \
+  --offline --report ./prelaunch-lifecycle-op-patch.json
+```
+
+**这一步会报 7 条 `FAIL`、1 条 `INCONCLUSIVE`,退出码 `1` —— 那是本 kit 的既有状态,
+不是你搞坏了什么。** 逐条归因与两个 kit 的完整对照表在
+`patch/validator/README.md` 的「Recorded `--offline` baselines」一节。用法只有一条:
+**把你跑出来的每一行和表里本 kit 那一列比对**。
+
+- 每一行都对上 → kit 处于交付状态,继续往下读,**不要再去查那些 FAIL**
+- 有任何一行比基线更差(PASS 变 FAIL、或多出新的 id)→ **停下**,那个差值来自你的树或你的
+  调用方式,不是 kit
+- 有任何一行比基线更好 → 也值得看一眼,通常是 `--gateway-ref` 指到了别的 ref
+
+`--offline` 不读任何在役状态,所以 `A1` / `D5` / `E2` 在这个模式下没有判别力,只是记录在案。
+拿到客户环境的 `environment.json` 与只读凭据之后再跑一次完整模式,那一次才有 live 判据。
+
 ## 先读四条会静默毁掉本次交付的事实
 
 **① 死线有【两个】载体,两个都必须落,漏掉 env 会让租户写路径全 5xx。**

@@ -75,7 +75,7 @@
   },
   "kit_files": {
     "lib/apply-resource-ops.sh": {
-      "sha256": "c57668f2bfdbdc7a4bfa283ad3e560933df58d30aca55b510511e81ad99769a5"
+      "sha256": "12bee8b5e3c7bffd754d267e1ba0a7f77fc1929424d65e4fc288cfe2d434ed06"
     },
     "lib/discover-env.sh": {
       "sha256": "a97ad92dce6dcf6d5d6a4b329cf1f02f7d32b03bf2ea1cad785f90ec59f3069b"
@@ -974,11 +974,36 @@
               "change": "M"
             }
           ]
+        },
+        {
+          "resource": "lambda:SETS two dispatch knobs as environment variables on BOTH openclaw-api and openclaw-lifecycle-consumer, lowering the ssm:SendCommand call rate. Neither knob is injected by the stack in this range, so the effective value is the code default in core/clients.py (6 and 0.5) and those two lines already honour an env override, so no code changes. The live map is read back and MERGED, never replaced: update-function-configuration takes a COMPLETE Variables map, so passing only these two keys deletes every other variable the function holds, and this op refuses to write when the readback is empty. Both functions must change or the two sides run different values. It owns no synthesized resource ref because the knobs are an operational parameter change rather than part of this diff range, and it needs review for exactly that reason.",
+          "class": "MANUAL_CLI_REVIEW",
+          "apply_cli": "lib/apply-resource-ops.sh lambda-env-spread-and-floor apply",
+          "verify_cli": "lib/apply-resource-ops.sh lambda-env-spread-and-floor verify",
+          "rollback_cli": "lib/apply-resource-ops.sh lambda-env-spread-and-floor rollback",
+          "artifact_refs": [
+            "lib/apply-resource-ops.sh"
+          ],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        },
+        {
+          "resource": "apigateway:READ-ONLY identification of the control-plane API by observed traffic rather than by name, then reads its resource policy and prints what a call that policy would admit, including how SigV4 methods are actually signed on this tree. Changes nothing. It exists because a name match can select a stale or rehearsal API, which makes every later probe test the wrong system and read as 'the fix is not live', and because a 403 alone does not distinguish wrong API from wrong auth from an excluded source.",
+          "class": "MANUAL_CLI_REVIEW",
+          "apply_cli": "lib/apply-resource-ops.sh apigw-identify-live plan",
+          "verify_cli": "lib/apply-resource-ops.sh apigw-identify-live verify",
+          "rollback_cli": "lib/apply-resource-ops.sh apigw-identify-live rollback",
+          "artifact_refs": [
+            "lib/apply-resource-ops.sh"
+          ],
+          "rollback_policy": "RETAIN",
+          "resource_refs": []
         }
       ],
       "fix_ids": [
         "#680-fence-lease-ssm",
-        "#679-host-dead-authoritative"
+        "#679-host-dead-authoritative",
+        "689-ssm-sendcommand-rate"
       ]
     },
     "docs/aws-guide/openapi.yaml": {
@@ -1148,6 +1173,34 @@
       "verification_ids": [
         "V10"
       ]
+    },
+    {
+      "id": "689-ssm-sendcommand-rate",
+      "summary": "Lower the ssm:SendCommand call rate on the create path: SPREAD_MAX_HOSTS_PER_BATCH 6 -> 3 and HOST_SELECTION_SCORE_FLOOR 0.5 -> 0.25, as environment variables on both openclaw-api and openclaw-lifecycle-consumer. One SendCommand goes out per host in a batch, so capping the spread at 3 hosts halves the calls per batch while each call carries proportionally more tenants. The score floor narrows the weighted-random spread so placement concentrates, which is what keeps a batch inside the lower host cap.",
+      "paths": [
+        "deploy/stacks/lambdas.py"
+      ],
+      "applies_when": "when this deployment is hitting ssm:SendCommand throttling on create bursts. This is an operational tuning step, independent of the code in this range: applying it needs no other fix here, and skipping it leaves every other fix intact.",
+      "params_changed": [
+        {
+          "name": "SPREAD_MAX_HOSTS_PER_BATCH (Lambda env on both functions)",
+          "layer": "C-lambda",
+          "old_default": "6 (code default in core/clients.py; not injected by the stack in this range)",
+          "new_default": "3",
+          "runtime_impact": "Halves the SendCommand calls a create batch issues, because there is one call per host. The same tenants land on fewer hosts, so each host takes proportionally more of them. Known cost: placement concentrates, so one host's cold-start queue gets longer — the host-side launch-slot flock means the tail VMs of a batch start later, and a tail approaching the SSM executionTimeout risks the 'false tail timeout rolls back a live VM' shape. Judge a batch by the MAX end-to-end time to running, not the mean. Future hosts are unaffected: no Launch Template or userdata change."
+        },
+        {
+          "name": "HOST_SELECTION_SCORE_FLOOR (Lambda env on both functions)",
+          "layer": "C-lambda",
+          "old_default": "0.5 (code default in core/clients.py; not injected by the stack in this range)",
+          "new_default": "0.25",
+          "runtime_impact": "Lower floor on the weighted-random host score, so a low-scoring host is less likely to be chosen and placement concentrates further. It does not itself change the number of commands; it is what keeps a batch inside the narrower host cap above, and it carries the same concentration cost."
+        }
+      ],
+      "verification_ids": [
+        "V11",
+        "V12"
+      ]
     }
   ],
   "verifications": [
@@ -1260,6 +1313,28 @@
       "fail_when": "zero tests collected or every test skipped (a green exit that proves nothing), or a channel silently absent from the table rather than reported NOT JUDGED",
       "timeout_s": 900,
       "cleanup": "none (read-only)"
+    },
+    {
+      "id": "V11",
+      "fix_id": "689-ssm-sendcommand-rate",
+      "phase": "A-readonly",
+      "action": "lib/apply-resource-ops.sh lambda-env-spread-and-floor verify — reads the consumer's env first, then reads the env of the VERSION the api function's live alias actually serves.",
+      "observable": "the two variables on each side, read from the version that serves traffic",
+      "pass_when": "both functions report SPREAD_MAX_HOSTS_PER_BATCH=3 and HOST_SELECTION_SCORE_FLOOR=0.25",
+      "fail_when": "the api side reports None or the old value while the consumer reports 3 and 0.25. That is the frozen-environment trap rather than a missed command: the api serves traffic through a published version whose environment is a snapshot, and update-function-configuration writes only $LATEST. Either publish a version and move the alias, or accept that the knobs are consumer-side only — and state which. Also fail if any OTHER variable disappeared from either function, which means a whole-map replacement happened instead of a merge.",
+      "timeout_s": 120,
+      "cleanup": "none (read-only)"
+    },
+    {
+      "id": "V12",
+      "fix_id": "689-ssm-sendcommand-rate",
+      "phase": "B-optional",
+      "action": "Run one create burst the same size as a pre-change baseline run, then count ssm:SendCommand events for it in CloudTrail and record the MAX end-to-end time to running.",
+      "observable": "SendCommand count per batch, and the slowest tenant's time to running",
+      "pass_when": "the per-batch SendCommand count drops to at most 3 from 6, and every tenant still reaches running",
+      "fail_when": "any tenant stalls in creating past the boot window, or the slowest tenant's time to running crosses the SSM executionTimeout — that is the concentration cost landing, and it is why the judgement is the max rather than the mean. Note SendCommand throttling is visible only in CloudTrail; scanning application logs for it returns zero, and that zero is not evidence.",
+      "timeout_s": 1800,
+      "cleanup": "delete the burst tenants by their exact recorded ids, never a prefix glob"
     }
   ]
 }

@@ -329,9 +329,259 @@ codebuild-goldenimage-asset-drift)
   esac
   ;;
 
+apigw-identify-live)
+  # READ-ONLY. Pick the control-plane API by OBSERVED TRAFFIC, never by name, then read its
+  # resource policy and print what a call that policy would actually admit looks like.
+  #
+  # Why traffic and not a name: an account commonly holds several REST APIs with plausible
+  # names (an old one, a redeployed one, a copy from a rehearsal). A name match that picks the
+  # wrong one makes every later probe test the wrong system and read as "the fix is not live".
+  # A 403 is equally ambiguous on its own -- wrong API, wrong auth, or a resource policy that
+  # excludes your source -- which is why this op prints the policy instead of guessing.
+  case "$MODE" in
+  plan | verify)
+    mkdir -p "$STATE_DIR"
+    end="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    start="$(python3 -c 'import datetime;print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
+    echo "REST APIs in this account/region, ranked by request count over the last 7 days:"
+    aws apigateway get-rest-apis --query 'items[].[id,name]' --output text |
+      while read -r api_id api_name; do
+        [ -n "$api_id" ] || continue
+        count="$(aws cloudwatch get-metric-statistics --namespace AWS/ApiGateway \
+          --metric-name Count --dimensions "Name=ApiName,Value=$api_name" \
+          --start-time "$start" --end-time "$end" --period 604800 --statistics Sum \
+          --query 'Datapoints[0].Sum' --output text 2>/dev/null)"
+        [ "$count" = "None" ] || [ -z "$count" ] && count=0
+        printf '  requests=%-12s id=%s  name=%s\n' "$count" "$api_id" "$api_name"
+      done | sort -t= -k2 -rn | tee "$STATE_DIR/api-traffic.txt"
+    echo
+    echo "A zero-request API is not necessarily wrong (a private control plane can be idle),"
+    echo "but an API with traffic that you were NOT going to target is a red flag -- reconcile"
+    echo "before continuing."
+    echo
+    configured="$(env_field api_id optional || true)"
+    if [ -z "${configured:-}" ]; then
+      echo "environment.json carries no api_id. Take the URL your deployed client configuration"
+      echo "actually uses (PRIVATE_API_URL / CTRL_API_BASE), extract its api id, and record it"
+      echo "as api_id -- do not adopt the top row of the table above on its own."
+      exit 0
+    fi
+    echo "Resource policy of the configured API ($configured):"
+    aws apigateway get-rest-api --rest-api-id "$configured" \
+      --query 'policy' --output text | tee "$STATE_DIR/resource-policy.raw" |
+      python3 -c '
+import json, sys
+raw = sys.stdin.read().strip()
+if not raw or raw == "None":
+    print("  NO resource policy. For a private API that means the VPC endpoint policy and IAM")
+    print("  are the only controls; for a regional/edge API it means the API is open to anyone")
+    print("  who can reach it and holds a valid key.")
+    raise SystemExit(0)
+try:
+    pol = json.loads(raw.replace("\\\\", ""))
+except Exception as exc:
+    print("  could not parse the policy (%s); printed raw above" % exc)
+    raise SystemExit(0)
+for st in pol.get("Statement", []):
+    eff = st.get("Effect")
+    cond = st.get("Condition") or {}
+    print("  %s %s" % (eff, st.get("Action")))
+    for op, kv in cond.items():
+        for key, val in kv.items():
+            print("      %s %s = %s" % (op, key, val))
+print()
+print("  Build the probe call from those conditions, in this order:")
+print("   1. aws:SourceVpce  -> you must call from inside that VPC endpoint. curl from a")
+print("      bastion in the VPC; a call from your laptop returns 403 no matter what auth you")
+print("      hold, and that 403 says nothing about the fix.")
+print("   2. aws:SourceIp    -> the call must originate from that range.")
+print("   3. aws:PrincipalArn / execute-api:* -> sign with SigV4 as that principal.")
+print("   4. If the API also requires an API key, send x-api-key as well; a missing key is a")
+print("      403 that looks identical to a policy denial.")
+'
+    echo
+    echo "SigV4 (AWS_IAM) methods — how to sign, on THIS tree:"
+    bff="$KIT_DIR/../../deploy/console-bff/sigv4-client.mjs"
+    if [ -f "$bff" ]; then
+      echo "  The console BFF signs control-plane calls with SignatureV4 imported from"
+      grep -m1 'from "@' "$bff" | sed 's/^/    /'
+      echo "  and its own header says the module is NOT bundled: on nodejs20.x the runtime"
+      echo "  already provides it (verified on a real function, node v20.20.2). So the check is"
+      echo "  'does an import succeed on the target runtime', not 'is a package installed here':"
+      echo
+      echo "    aws lambda invoke --function-name <the bff function> \\"
+      echo "      --payload '{\"probe\":\"sigv4\"}' /dev/null --query FunctionError   # want None"
+      echo
+      echo "  If you are signing by hand from a shell instead, use the CLI's own signer:"
+      echo "    awscurl / aws --cli-binary-format, or 'aws apigateway test-invoke-method' for a"
+      echo "    read-only method — do not hand-roll a signature."
+    else
+      echo "  deploy/console-bff/sigv4-client.mjs is not in this checkout; skip this block."
+    fi
+    echo
+    echo "  Three things do NOT hold on the public gateway tree, so do not run them as a gate:"
+    echo "   - deploy/console-bff has no package.json, so 'npm ci --omit=dev' has nothing to do."
+    echo "   - the import is @aws-sdk/signature-v4, NOT @smithy/signature-v4, so a"
+    echo "     'test -d node_modules/@smithy/signature-v4' gate fails on a healthy tree."
+    echo "   - deploy/cdk-cli does not exist here, so a pinned-cdk-version gate cannot run."
+    echo "     This kit never updates a stack, so the CDK version is not on its critical path;"
+    echo "     if you need the synth provenance it is already bound in"
+    echo "     resources/cloudformation/*.assembly-index.json."
+    ;;
+  apply | rollback)
+    note "read-only op — nothing to apply or roll back. Use: plan (or verify)."
+    ;;
+  esac
+  ;;
+
+lambda-env-spread-and-floor)
+  # Lower the ssm:SendCommand call rate: SPREAD_MAX_HOSTS_PER_BATCH 6 -> 3 and
+  # HOST_SELECTION_SCORE_FLOOR 0.5 -> 0.25 on BOTH the api function and the lifecycle
+  # consumer. Neither knob is injected by the stack today, so the effective value is the code
+  # default in core/clients.py; this op sets it as an environment variable, which those two
+  # lines already honour, so no code changes.
+  #
+  # TWO THINGS THAT SILENTLY LOSE THIS CHANGE:
+  #
+  #  1. Replacing the whole Variables map. update-function-configuration --environment takes a
+  #     COMPLETE map and replaces it; passing only these two keys deletes every other variable
+  #     the function has (dozens: table names, bucket names, deadline knobs). This op reads the
+  #     live map back and merges, and refuses to write if the readback looks empty.
+  #  2. Forgetting that the api function serves traffic through its `live` alias, i.e. through
+  #     a PUBLISHED VERSION whose environment is a frozen snapshot. update-function-configuration
+  #     only touches $LATEST, which serves nothing. So on the api side this op publishes a
+  #     version and moves the alias; on the consumer side it does not, because the SQS event
+  #     source mapping binds $LATEST and the new value is live the moment it is written.
+  #     Doing only one of the two functions leaves api and consumer on different values.
+  KEY1=SPREAD_MAX_HOSTS_PER_BATCH
+  VAL1=3
+  KEY2=HOST_SELECTION_SCORE_FLOOR
+  VAL2=0.25
+
+  env_set_one() {
+    local fn="$1" alias_name="$2"
+    mkdir -p "$STATE_DIR"
+    local before="$STATE_DIR/env-before-$fn.json"
+    aws lambda get-function-configuration --function-name "$fn" \
+      --query Environment.Variables --output json >"$before"
+    local n
+    n="$(python3 -c 'import json,sys;print(len(json.load(open(sys.argv[1])) or {}))' "$before")"
+    [ "$n" -gt 0 ] ||
+      die "read back 0 variables for $fn — writing now would wipe its environment; investigate before retrying"
+    note "$fn currently has $n variable(s); merging 2 keys into that map (never replacing it)"
+    local merged="$STATE_DIR/env-merged-$fn.json"
+    OC_K1="$KEY1" OC_V1="$VAL1" OC_K2="$KEY2" OC_V2="$VAL2" \
+      python3 - "$before" "$merged" <<'PY'
+import json, os, sys
+cur = json.load(open(sys.argv[1])) or {}
+cur[os.environ["OC_K1"]] = os.environ["OC_V1"]
+cur[os.environ["OC_K2"]] = os.environ["OC_V2"]
+json.dump({"Variables": cur}, open(sys.argv[2], "w"), indent=1, sort_keys=True)
+print("  merged map has %d variable(s)" % len(cur))
+PY
+    aws lambda update-function-configuration --function-name "$fn" \
+      --environment "file://$merged" --query 'Environment.Variables.[SPREAD_MAX_HOSTS_PER_BATCH,HOST_SELECTION_SCORE_FLOOR]' \
+      --output text
+    aws lambda wait function-updated --function-name "$fn"
+    if [ -n "$alias_name" ]; then
+      aws lambda get-alias --function-name "$fn" --name "$alias_name" \
+        --query FunctionVersion --output text >"$STATE_DIR/alias-before-$fn.txt"
+      local newver
+      newver="$(aws lambda publish-version --function-name "$fn" --query Version --output text)"
+      aws lambda update-alias --function-name "$fn" --name "$alias_name" \
+        --function-version "$newver" >/dev/null
+      note "$fn: published version $newver and moved alias $alias_name onto it"
+      note "(without this the api keeps serving the frozen env of the previous version)"
+    else
+      note "$fn: no alias — the event source mapping binds \$LATEST, so this is already live"
+    fi
+  }
+
+  env_verify_one() {
+    local fn="$1" alias_name="$2" target="$fn"
+    # Read the version that actually serves, not $LATEST.
+    if [ -n "$alias_name" ]; then
+      local ver
+      ver="$(aws lambda get-alias --function-name "$fn" --name "$alias_name" \
+        --query FunctionVersion --output text)"
+      target="$fn:$ver"
+      note "$fn serves version $ver through alias $alias_name — reading THAT version's env"
+    fi
+    local got1 got2
+    got1="$(aws lambda get-function-configuration --function-name "$target" \
+      --query "Environment.Variables.$KEY1" --output text)"
+    got2="$(aws lambda get-function-configuration --function-name "$target" \
+      --query "Environment.Variables.$KEY2" --output text)"
+    [ "$got1" = "$VAL1" ] || die "$target has $KEY1=$got1, want $VAL1 (None means the served version predates the change)"
+    [ "$got2" = "$VAL2" ] || die "$target has $KEY2=$got2, want $VAL2"
+    note "$target: $KEY1=$got1 $KEY2=$got2"
+  }
+
+  # The two function names are fixed in this product, so they are defaults rather than probes.
+  # environment.json may override them if a deployment renamed either function.
+  api_fn="$(env_field api_function optional || true)"
+  api_fn="${api_fn:-openclaw-api}"
+  consumer_fn="$(env_field consumer_function optional || true)"
+  consumer_fn="${consumer_fn:-openclaw-lifecycle-consumer}"
+  # Moving the alias is NOT done by default: it republishes the api function's code as well as
+  # its environment, which is a bigger change than a knob edit. Set OC_PUBLISH_API_ALIAS=1 to
+  # opt in. Either way `verify` reads the version the alias actually serves, so if you skip it
+  # you SEE that the api side did not take the new value rather than assuming it did.
+  api_alias=""
+  [ "${OC_PUBLISH_API_ALIAS:-0}" = "1" ] && api_alias=live
+  case "$MODE" in
+  plan)
+    note "api=$api_fn  consumer=$consumer_fn"
+    note "$KEY1: code default 6 -> $VAL1   $KEY2: code default 0.5 -> $VAL2"
+    note "effect: a batch spreads over at most $VAL1 hosts instead of 6, and there is one"
+    note "SendCommand per host — so at most $VAL1 calls per batch instead of 6, with each call"
+    note "carrying proportionally more tenants."
+    note "neither knob is injected by the stack today, so the current effective value is the"
+    note "code default in core/clients.py — this op is the first thing to set them."
+    if [ -n "$api_alias" ]; then
+      note "OC_PUBLISH_API_ALIAS=1 — will publish a version and move alias 'live' on $api_fn"
+    else
+      note "alias move is OFF (default). The api function's \$LATEST will carry the new value"
+      note "while alias 'live' keeps serving the frozen env of its published version. verify"
+      note "will report that as a failure on the api side; that report is the point."
+    fi
+    ;;
+  apply)
+    env_set_one "$api_fn" "$api_alias"
+    env_set_one "$consumer_fn" ""
+    ;;
+  verify)
+    # Deliberately verify the consumer FIRST: it is the side that takes effect immediately, so
+    # a failure there is unambiguous. The api side is checked against the version its alias
+    # serves, which is what exposes the frozen-env trap.
+    env_verify_one "$consumer_fn" ""
+    env_verify_one "$api_fn" live
+    note "both sides agree — a batch now spreads over at most $VAL1 hosts, i.e. at most $VAL1"
+    note "SendCommand calls per batch instead of 6."
+    ;;
+  rollback)
+    for fn in "$api_fn" ${consumer_fn:-}; do
+      b="$STATE_DIR/env-before-$fn.json"
+      [ -s "$b" ] || die "no pre-change env for $fn — refusing to guess its variable map"
+      python3 -c 'import json,sys;json.dump({"Variables":json.load(open(sys.argv[1]))},open(sys.argv[2],"w"))' \
+        "$b" "$STATE_DIR/env-restore-$fn.json"
+      aws lambda update-function-configuration --function-name "$fn" \
+        --environment "file://$STATE_DIR/env-restore-$fn.json" --query LastUpdateStatus --output text
+      aws lambda wait function-updated --function-name "$fn"
+      if [ -s "$STATE_DIR/alias-before-$fn.txt" ]; then
+        aws lambda update-alias --function-name "$fn" --name live \
+          --function-version "$(cat "$STATE_DIR/alias-before-$fn.txt")" >/dev/null
+        note "$fn alias live restored to $(cat "$STATE_DIR/alias-before-$fn.txt")"
+      fi
+      note "$fn environment restored from the pre-change readback"
+    done
+    ;;
+  esac
+  ;;
+
 *)
   echo "unknown op: $OP" >&2
-  echo "ops: ssm-fence-lease-param iam-api-fence-param-read iam-health-describe-instances lambda-api-code lambda-health-code codebuild-goldenimage-asset-drift" >&2
+  echo "ops: apigw-identify-live ssm-fence-lease-param iam-api-fence-param-read iam-health-describe-instances lambda-api-code lambda-health-code lambda-env-spread-and-floor codebuild-goldenimage-asset-drift" >&2
   exit 2
   ;;
 esac

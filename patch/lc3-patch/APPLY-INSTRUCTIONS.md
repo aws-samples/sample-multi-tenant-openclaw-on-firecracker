@@ -21,6 +21,8 @@ Successor to `patch/lc2-patch`. It packages the source range
 | Egress dry run | `egress_admin_service.py` | `POST /hosts/egress/allow/validate` reports each unavailable protected-network criterion separately |
 | Pre-launch validator (**optional**, see the end of Step 6) | `lib/validator/**` (19 files) | Read-only operator tool: 11 data-plane delivery channels + control-plane drift, PASS / FAIL / NOT JUDGED per channel. Supersedes the `patch/validator` copy: the same 20 filenames, with three files carrying fixes that copy does not have (a load-bearing `re.MULTILINE`, a content-addressed test fixture, and a `__pycache__` exclusion that stops a false red on the second run). |
 
+| SSM SendCommand rate (**optional tuning**, Step 4.4) | Lambda environment on `openclaw-api` + `openclaw-lifecycle-consumer` | `SPREAD_MAX_HOSTS_PER_BATCH` 6 -> 3 and `HOST_SELECTION_SCORE_FLOOR` 0.5 -> 0.25, halving the SendCommand calls per create batch. Configuration only, no code change. |
+
 Three CloudFormation resources change, all in Step 4: one new SSM parameter and three IAM
 role-policy additions (two `ssm:GetParameter`, one `ec2:DescribeInstances`).
 
@@ -39,6 +41,43 @@ export ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 bash lib/discover-env.sh > environment.json
 python3 -c "import json;d=json.load(open('environment.json'));print(json.dumps(d,indent=2))" | head -60
 ```
+
+### 0.1 — Identify the API by traffic, not by name, and learn what its policy admits
+
+Do this before any probe that calls the API. An account commonly holds several REST APIs with
+plausible names — an old one, a redeployed one, a copy from a rehearsal. Picking the wrong one
+makes every later check test the wrong system and read as "the fix is not live".
+
+```bash
+lib/apply-resource-ops.sh apigw-identify-live plan
+```
+
+It is read-only. It ranks every REST API by request count over the last 7 days, then — for the
+`api_id` your `environment.json` records — prints the resource policy statement by statement and
+tells you what a call that policy would admit has to look like.
+
+Two things to take from its output:
+
+- **A zero-request API is not automatically wrong** (a private control plane can be idle), but an
+  API *with* traffic that you were not going to target is a red flag. Reconcile before continuing.
+- **Take the api id from the URL your deployed client configuration actually uses**
+  (`PRIVATE_API_URL` / `CTRL_API_BASE`), not from the top row of the table. The table is how you
+  falsify a wrong choice, not how you make the choice.
+
+A `403` on its own tells you nothing: it is the same answer for the wrong API, for wrong auth, and
+for a source the resource policy excludes. That is why the op prints the policy — build the probe
+call from its conditions (`aws:SourceVpce` means you must call from inside that VPC endpoint, so a
+call from a laptop is 403 no matter what credentials you hold).
+
+The op also prints how SigV4 (`AWS_IAM`) methods are signed **on this tree**: the console BFF
+imports `SignatureV4` from `@aws-sdk/signature-v4` and its own header records that the module is
+not bundled because the `nodejs20.x` runtime already provides it. So the check is "does the import
+succeed on the target runtime", not "is a package installed locally". Three gates that circulate
+for this do **not** hold here and will fail on a healthy tree: `deploy/console-bff` has no
+`package.json`, the import is `@aws-sdk/signature-v4` and not `@smithy/signature-v4`, and
+`deploy/cdk-cli` does not exist on this branch. This kit never updates a stack, so no CDK version
+is on its critical path; the synth provenance is already bound in
+`resources/cloudformation/*.assembly-index.json`.
 
 Read the CONFIRM block it prints and stop unless the account, region and API identity are the
 ones you intend to change. An API identity of `null` means the probe could not prove a live
@@ -289,6 +328,70 @@ parameter if this call created it (the code then falls back to the same `240` de
 
 Raising this value is safe. Lowering it below `210` is refused at runtime, so a hand-edit
 below the floor silently does not take effect — the effective lease stays `240`.
+
+### 4.4 — Lower the SSM SendCommand call rate (optional tuning, `MANUAL_CLI_REVIEW`)
+
+Apply this when the deployment is hitting `ssm:SendCommand` throttling on create bursts. It is
+independent of every other fix here: skipping it leaves the rest intact.
+
+Set `SPREAD_MAX_HOSTS_PER_BATCH=3` and `HOST_SELECTION_SCORE_FLOOR=0.25` on **both**
+`openclaw-api` and `openclaw-lifecycle-consumer`. One `SendCommand` goes out per host in a batch,
+so capping the spread at 3 hosts takes a batch from 6 calls to 3, with each call carrying
+proportionally more tenants. Neither knob is injected by the stack in this range — `core/clients.py`
+reads them from the environment with code defaults `6` and `0.5`, so this is a pure configuration
+change with no code change.
+
+```bash
+lib/apply-resource-ops.sh lambda-env-spread-and-floor plan
+lib/apply-resource-ops.sh lambda-env-spread-and-floor apply
+lib/apply-resource-ops.sh lambda-env-spread-and-floor verify
+```
+
+The equivalent by hand, which is what the op runs:
+
+```bash
+REGION="ap-southeast-1"   # replace with this deployment's region
+PROFILE="default"         # replace with the profile that reaches it
+
+for FN in openclaw-api openclaw-lifecycle-consumer; do
+  aws lambda get-function-configuration --profile $PROFILE --region $REGION \
+    --function-name $FN --query 'Environment.Variables' --output json > /tmp/$FN.env.json
+  python3 -c "
+import json; p='/tmp/$FN.env.json'; d=json.load(open(p))
+d['SPREAD_MAX_HOSTS_PER_BATCH']='3'; d['HOST_SELECTION_SCORE_FLOOR']='0.25'
+json.dump({'Variables': d}, open(p,'w'))"
+  aws lambda update-function-configuration --profile $PROFILE --region $REGION \
+    --function-name $FN --environment file:///tmp/$FN.env.json \
+    --query 'Environment.Variables.{S:SPREAD_MAX_HOSTS_PER_BATCH,F:HOST_SELECTION_SCORE_FLOOR}'
+done
+```
+
+**Read the existing `Variables` back and merge — never pass a partial map.**
+`update-function-configuration --environment` replaces the map wholesale, so sending only these
+two keys deletes every other variable the function holds (table names, bucket names, the deadline
+knobs). The loop above reads first and merges for exactly that reason; the shipped op additionally
+refuses to write when the readback comes back empty.
+
+**Both functions, or neither.** Doing only one leaves the api side and the consumer side running
+different values. The consumer is the primary executor of async lifecycle work, so an api-only
+change is the shape where the setting appears applied and is not.
+
+**One thing the by-hand loop does not cover.** `openclaw-api` serves traffic through its `live`
+alias, i.e. through a published version whose environment is a frozen snapshot;
+`update-function-configuration` writes `$LATEST`, which serves nothing. The consumer is different:
+its event source mapping binds `$LATEST`, so its new value is live the moment it is written. So
+after the loop above, the consumer has the new values and the api does not.
+
+`verify` reads the version the alias actually serves and will report that as a failure on the api
+side — that report is the point, not a bug. Two honest ways forward, pick one and say which:
+
+- accept consumer-side-only (the consumer is where the async create path runs), or
+- re-run apply with `OC_PUBLISH_API_ALIAS=1`, which publishes a version and moves the alias.
+  Note this republishes the api function's **code** along with its environment, so do it after
+  Step 2 has landed and been verified, never before.
+
+Rollback restores each function's pre-change variable map from the readback this op saved, and
+restores the alias if it moved. It refuses to run without that saved state.
 
 ## Step 5 — Fresh-machine validation: not required
 

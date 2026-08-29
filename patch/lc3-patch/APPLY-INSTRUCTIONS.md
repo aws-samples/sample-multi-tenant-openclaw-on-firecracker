@@ -11,6 +11,14 @@ Successor to `patch/lc2-patch`. It packages the source range
 - No step here updates a CloudFormation stack. This deployment has manual changes layered on
   top of its original one, and a stack update would overwrite them.
 
+> **The `lib/apply-resource-ops.sh` helper has NOT passed an independent reliability gate.**
+> Two rounds of adversarial review scored it 2.0/10 then 3.0/10 against a bar of 6.5, with four
+> classes of critical defect still open. Treat it as a **reference implementation that shows the
+> intended sequence**, and drive the change from the by-hand commands in each step, which are
+> written to be read and approved one at a time. `plan` and the read-only ops are safe to run.
+> What is still wrong with it is listed under "Known defects in the helper" at the end of this
+> document — read that before deciding to run `apply` from it.
+
 ## What this kit changes, in one screen
 
 | Area | Files | Effect |
@@ -490,3 +498,70 @@ This kit was generated from the git range above. At the time of packaging:
   repository's own mechanical checks, and a `cdk synth` of the reviewed tree).
 
 Treat every command here as a proposal to read and approve, not as a tested script.
+
+## Known defects in the helper (`lib/apply-resource-ops.sh`)
+
+Two rounds of independent adversarial review. Round one found eight defects, all fixed. Round two
+found the following, none of them fixed yet. The score went 2.0/10 to 3.0/10 against a bar of 6.5,
+so the helper is a reference implementation, not a production tool. Every item below is a reason to
+run the by-hand commands instead of `apply`.
+
+**State handling**
+
+1. `STATE_DIR` is keyed only by the op name — not by account, region or ARN. Point
+   `environment.json` at a different environment and a rollback can write account A's backup into
+   account B's same-named resource.
+2. There is a completion marker but no *start* marker. A half-failed apply (api succeeded,
+   consumer failed) writes no marker, so a re-run overwrites the original backup and pre-state —
+   exactly the rollback point you need.
+3. `rollback` preflight only checks that files are non-empty. It does not validate the ZIP, the
+   JSON, or the alias state before its first write.
+
+**Coordinates**
+
+4. The environment-knob op still falls back to the literal names `openclaw-api` and
+   `openclaw-lifecycle-consumer` when the coordinate is missing, instead of refusing.
+5. The IAM op modifies the api role *before* it refuses a missing consumer role, so it can leave
+   the two sides asymmetric.
+6. `lambda-api-code rollback` accepts a missing consumer coordinate and rolls back the api only.
+
+**Lambda concurrency and publishing**
+
+7. `update-function-code` reads the function `RevisionId` but never passes it, so a concurrent
+   change is silently overwritten.
+8. `publish-version` pins `--code-sha256` but not the revision, and no `update-alias` passes an
+   alias revision.
+9. `PublishVersion` freezes the function's *entire* configuration, not just its code. Comparing
+   only `CodeSha256` does not prove runtime, layers, timeout, role or VPC config match the version
+   the alias currently serves.
+10. The alias is read as a single version and its `RoutingConfig` is ignored. Under a weighted
+    alias, `verify` can pass while part of the traffic still runs the old version.
+
+**Rollback correctness**
+
+11. The IAM op never deletes a policy it newly created, and does not refuse when its saved state is
+    missing.
+12. If the SSM op merely *adopted* an existing parameter, rollback still overwrites whatever value
+    is there now — including a newer one set deliberately after the apply.
+13. The environment rollback forces the old, complete map over the current revision, which deletes
+    any variable legitimately added since the apply. It should restore or remove only the two keys
+    it changed.
+
+**False passes**
+
+14. The environment `verify` compares only the *count* of variables, not the key names, and skips
+    the preservation check entirely when no baseline exists.
+15. `codebuild batch-get-projects` returns HTTP 200 with a `projectsNotFound` list for a project
+    that does not exist; the op does not check that list, so a missing project can compare equal.
+16. The IAM `verify` relies on the policy simulator alone. AWS documents that simulated results can
+    differ from the real environment, and the data plane lags the simulator by minutes.
+17. If the API Gateway resource policy fails to parse, the op prints a note and exits 0.
+
+**Error handling**
+
+18. Optional coordinate reads use `|| true`, which swallows genuine errors; any `publish-version`
+    failure is treated as "nothing changed"; a CloudWatch failure lets `verify` continue.
+
+One thing round two confirmed as correct: the first environment apply does read the complete map,
+stops on an empty or malformed readback, and passes `RevisionId` to prevent a racing overwrite. The
+gap is that `verify` and `rollback` do not hold themselves to the same standard.

@@ -2,6 +2,7 @@ import base64
 import hashlib
 import io
 import json
+import os
 import re
 import sys
 import pathlib
@@ -422,6 +423,54 @@ class ValidatorTests(unittest.TestCase):
         self.assertFalse(any(item in text for item in forbidden))
         calls = set(re.findall(r'\.call\([^,]+,\s*["\']([a-z_0-9]+)', text))
         self.assertTrue(calls.issubset(awsread.READ_ONLY_ALLOWLIST))
+    def test_no_duplicate_validator_copy_in_repo(self):
+        """仓库只能有一份 validator。
+
+        这条守卫来自一次真实的分叉:仓库里同时存在过 `patch/validator/` 与 `cli/validator/`,
+        而**旧那份完全没有 F/G 两组** —— 没有 `checks/channels.py`、没有 `checks/controlplane.py`、
+        没有 `lib/discover.py`、没有 `test/test_channels.py`,也就是 11 条数据面通道与控制面漂移
+        检查一条都不在。两份并存时,改动落到哪一份取决于人当时打开了哪个目录;而缺 F/G 的那份
+        跑出来照样是一片绿。
+
+        判据刻意**不是**「`patch/validator/` 不存在」:那只挡住这一个具体路径,换个目录名就又漂了。
+        判据是「整个仓库里 `oc-prelaunch-validate` 这个入口恰好只有一个,且它在 `cli/validator/`」。
+        包搬家也要红 —— 那时必须同步改这条守卫和所有引用,而不是让引用悄悄变成死链。
+        """
+        repo = Path(__file__).resolve().parents[3]
+        # `parents[3]` 只有在包位于 `<repo>/cli/validator/test/` 时才等于仓库根。包一搬家它就会
+        # 指到仓库**外面**,于是下面的 os.walk 会去遍历一棵任意大的树(实测搬到仓库根之后这条用例
+        # 从 0.02s 变成 13.8s,走的是仓库的父目录)。所以先证明推导出的根真的是本仓库,让「包搬了」
+        # 快速失败在这里,而不是表现成一次莫名其妙的慢。
+        self.assertTrue(
+            (repo / "deploy").is_dir() and (repo / "patch").is_dir(),
+            "%s 不像本仓库的根 —— `parents[3]` 的假设是包位于 <repo>/cli/validator/test/,"
+            "包一旦搬家这个推导就会指到仓库外面。搬家时请同步修正这条守卫。" % repo)
+        excluded = {".git", "__pycache__", ".venv", ".pytest_cache",
+                    "node_modules", "cdk.out"}
+        found = []
+        for root, dirnames, filenames in os.walk(repo):
+            dirnames[:] = [name for name in dirnames if name not in excluded]
+            if "oc-prelaunch-validate" in filenames:
+                found.append(Path(root) / "oc-prelaunch-validate")
+
+        relative = sorted(path.relative_to(repo) for path in found)
+        paths = "\n".join(path.as_posix() for path in relative) or "(none)"
+        self.assertEqual(
+            1, len(found),
+            "Expected exactly one validator entry point in the repository; "
+            "delete duplicate copies or restore cli/validator/oc-prelaunch-validate. "
+            "Found:\n%s" % paths)
+        entry_point = found[0]
+        self.assertEqual(
+            "validator", entry_point.parent.name,
+            "The sole validator entry point must remain under cli/validator; "
+            "update this guard and every repository reference if the package moves. "
+            "Found:\n%s" % paths)
+        self.assertEqual(
+            "cli", entry_point.parent.parent.name,
+            "The sole validator entry point must remain under cli/validator; "
+            "update this guard and every repository reference if the package moves. "
+            "Found:\n%s" % paths)
     def test_read_only_contract_scan_reaches_every_module(self):
         """守住上面两条扫描的分母:排除清单只该挡生成物,不该挡源码。
 

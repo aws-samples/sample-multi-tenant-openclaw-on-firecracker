@@ -7,7 +7,7 @@ changing the kit, fleet, or control plane.
 ## Usage
 
 ```sh
-patch/validator/oc-prelaunch-validate \
+cli/validator/oc-prelaunch-validate \
   --kit patch/KIT_PLACEHOLDER \
   --gateway-ref origin/gateway \
   --environment-json ./environment.json \

@@ -74,6 +74,9 @@
     ]
   },
   "kit_files": {
+    "lib/apply-resource-ops.sh": {
+      "sha256": "c57668f2bfdbdc7a4bfa283ad3e560933df58d30aca55b510511e81ad99769a5"
+    },
     "lib/discover-env.sh": {
       "sha256": "a97ad92dce6dcf6d5d6a4b329cf1f02f7d32b03bf2ea1cad785f90ec59f3069b"
     },
@@ -831,10 +834,12 @@
         {
           "resource": "ssm:CREATES the lifecycle fence lease parameter /openclaw/lifecycle/fence-lease-sec with value 240. apply is guarded by a prior get-parameter so a re-run is an idempotent adopt rather than an overwrite of a value the operator raised on purpose. The value is refused below 210 at runtime (210 = the delete action's exec_sec budget), so a hand-edit under the floor silently does not take effect and the effective lease stays at the 240 default.",
           "class": "AUTO_CLI",
-          "apply_cli": "aws ssm get-parameter --name /openclaw/lifecycle/fence-lease-sec --region \"$AWS_REGION\" --query Parameter.Value --output text > /tmp/lc3-lease-before 2>/dev/null || aws ssm put-parameter --region \"$AWS_REGION\" --name /openclaw/lifecycle/fence-lease-sec --type String --value 240 --description \"openclaw lifecycle fence lease in seconds; effective immediately, no stack update; read by the api and lifecycle-consumer functions with a 60s cache; lower bound 210s\"",
-          "verify_cli": "test \"$(aws ssm get-parameter --name /openclaw/lifecycle/fence-lease-sec --region \"$AWS_REGION\" --query Parameter.Value --output text)\" -ge 210",
-          "rollback_cli": "if [ -s /tmp/lc3-lease-before ]; then aws ssm put-parameter --overwrite --region \"$AWS_REGION\" --name /openclaw/lifecycle/fence-lease-sec --type String --value \"$(cat /tmp/lc3-lease-before)\"; else aws ssm delete-parameter --region \"$AWS_REGION\" --name /openclaw/lifecycle/fence-lease-sec; fi",
-          "artifact_refs": [],
+          "apply_cli": "lib/apply-resource-ops.sh ssm-fence-lease-param apply",
+          "verify_cli": "lib/apply-resource-ops.sh ssm-fence-lease-param verify",
+          "rollback_cli": "lib/apply-resource-ops.sh ssm-fence-lease-param rollback",
+          "artifact_refs": [
+            "lib/apply-resource-ops.sh"
+          ],
           "rollback_policy": "RESTORE",
           "resource_refs": [
             {
@@ -848,10 +853,12 @@
         {
           "resource": "iam:ADDS ssm:GetParameter on the fence-lease parameter to the control-plane API role. In the synthesized closure this grant lands in the role's OVERFLOW managed policy, not its default policy, and the overflow split also relocates the pre-existing ec2:DescribeLaunchTemplateVersions statement from overflow policy 1 to overflow policy 2 — a repackaging with no change in effective permissions. So both overflow policies show as modified while exactly one permission is new. On a live deployment the operator adds a small inline policy instead of reproducing the split, and must not remove ec2:DescribeLaunchTemplateVersions from wherever it currently sits. If this deployment also runs a lifecycle-consumer function, the same grant belongs on ITS role too: the consumer is the primary executor of async lifecycle actions, and the reference configuration used for this closure has the queue path off, so no consumer resource appears here.",
           "class": "AUTO_CLI",
-          "apply_cli": "sed -e \"s/REGION/$AWS_REGION/\" -e \"s/ACCOUNT/$ACCOUNT/\" iam/lifecycle-fence-lease-param-read.json > /tmp/lc3-fence-param.json && aws iam put-role-policy --role-name \"$API_ROLE\" --policy-name lc3-lifecycle-fence-lease-param-read --policy-document file:///tmp/lc3-fence-param.json",
-          "verify_cli": "aws iam simulate-principal-policy --policy-source-arn \"arn:aws:iam::$ACCOUNT:role/$API_ROLE\" --action-names ssm:GetParameter --resource-arns \"arn:aws:ssm:$AWS_REGION:$ACCOUNT:parameter/openclaw/lifecycle/fence-lease-sec\" --query 'EvaluationResults[0].EvalDecision' --output text | grep -x allowed",
-          "rollback_cli": "RETAIN — do not remove. The grant is read-only and rolled-back code still reads the parameter; removing it turns a working fallback into an AccessDenied on every call. If it must go: aws iam delete-role-policy --role-name \"$API_ROLE\" --policy-name lc3-lifecycle-fence-lease-param-read",
-          "artifact_refs": [],
+          "apply_cli": "lib/apply-resource-ops.sh iam-api-fence-param-read apply",
+          "verify_cli": "lib/apply-resource-ops.sh iam-api-fence-param-read verify",
+          "rollback_cli": "lib/apply-resource-ops.sh iam-api-fence-param-read rollback",
+          "artifact_refs": [
+            "lib/apply-resource-ops.sh"
+          ],
           "rollback_policy": "RETAIN",
           "resource_refs": [
             {
@@ -871,10 +878,12 @@
         {
           "resource": "iam:ADDS ec2:DescribeInstances (resource \"*\", the only form EC2 Describe supports) to the health-check role, so host death is confirmed against EC2 instead of inferred from a missing or deleted hosts-table row. Without it the reaper falls back to the table clue and can write a terminal state for a tenant whose VM is still running.",
           "class": "AUTO_CLI",
-          "apply_cli": "aws iam put-role-policy --role-name \"$HEALTH_ROLE\" --policy-name lc3-health-describe-instances --policy-document file://iam/health-describe-instances.json",
-          "verify_cli": "aws iam simulate-principal-policy --policy-source-arn \"arn:aws:iam::$ACCOUNT:role/$HEALTH_ROLE\" --action-names ec2:DescribeInstances --resource-arns '*' --query 'EvaluationResults[0].EvalDecision' --output text | grep -x allowed",
-          "rollback_cli": "RETAIN — read-only, and the rolled-back handler tolerates its absence only by falling back to the weaker clue. If it must go: aws iam delete-role-policy --role-name \"$HEALTH_ROLE\" --policy-name lc3-health-describe-instances",
-          "artifact_refs": [],
+          "apply_cli": "lib/apply-resource-ops.sh iam-health-describe-instances apply",
+          "verify_cli": "lib/apply-resource-ops.sh iam-health-describe-instances verify",
+          "rollback_cli": "lib/apply-resource-ops.sh iam-health-describe-instances rollback",
+          "artifact_refs": [
+            "lib/apply-resource-ops.sh"
+          ],
           "rollback_policy": "RETAIN",
           "resource_refs": [
             {
@@ -888,10 +897,12 @@
         {
           "resource": "lambda:REPLACES the control-plane API function's code with the seven patched api files overlaid onto the live package, then publishes a version and moves the live alias. The synthesized closure shows the function, its alias and a new CurrentVersion logical id replacing the old one — all three are consequences of one code change, applied by APPLY Step 2. Rollback must cover BOTH the alias and $LATEST, because an SQS event source mapping binds $LATEST and flipping the alias alone leaves that path on new code. If this deployment runs a separate lifecycle-consumer function on the same api source tree, apply the identical overlay to it.",
           "class": "AUTO_CLI",
-          "apply_cli": "see APPLY-INSTRUCTIONS.md Step 2 — per-file overlay onto the downloaded live package, then aws lambda update-function-code --function-name \"$API_FN\" --zip-file fileb://lc3-$API_FN.zip, aws lambda wait function-updated, invoke-verify on FunctionError, then aws lambda update-alias --name live",
-          "verify_cli": "aws lambda invoke --function-name \"$API_FN\" --region \"$AWS_REGION\" --payload '{\"httpMethod\":\"GET\",\"path\":\"/ping\"}' --cli-binary-format raw-in-base64-out /dev/null --query FunctionError --output text | grep -x None",
-          "rollback_cli": "aws lambda update-alias --function-name \"$API_FN\" --name live --function-version \"$(cat backup-$API_FN.alias-version)\" && aws lambda update-function-code --function-name \"$API_FN\" --zip-file fileb://backup-$API_FN.zip",
-          "artifact_refs": [],
+          "apply_cli": "lib/apply-resource-ops.sh lambda-api-code apply",
+          "verify_cli": "lib/apply-resource-ops.sh lambda-api-code verify",
+          "rollback_cli": "lib/apply-resource-ops.sh lambda-api-code rollback",
+          "artifact_refs": [
+            "lib/apply-resource-ops.sh"
+          ],
           "rollback_policy": "RESTORE",
           "resource_refs": [
             {
@@ -923,10 +934,12 @@
         {
           "resource": "lambda:REPLACES the health-check function's handler.py with the patched file overlaid onto its live package. This function has no alias in the closure, so the code update is the whole operation.",
           "class": "AUTO_CLI",
-          "apply_cli": "see APPLY-INSTRUCTIONS.md Step 2 with SRC=lambda/health_check — overlay, then aws lambda update-function-code --function-name \"$HEALTH_FN\" --zip-file fileb://lc3-$HEALTH_FN.zip, then aws lambda wait function-updated",
-          "verify_cli": "aws lambda get-function --function-name \"$HEALTH_FN\" --region \"$AWS_REGION\" --query Configuration.CodeSha256 --output text  # must differ from the value recorded in Step 1",
-          "rollback_cli": "aws lambda update-function-code --function-name \"$HEALTH_FN\" --zip-file fileb://backup-$HEALTH_FN.zip",
-          "artifact_refs": [],
+          "apply_cli": "lib/apply-resource-ops.sh lambda-health-code apply",
+          "verify_cli": "lib/apply-resource-ops.sh lambda-health-code verify",
+          "rollback_cli": "lib/apply-resource-ops.sh lambda-health-code rollback",
+          "artifact_refs": [
+            "lib/apply-resource-ops.sh"
+          ],
           "rollback_policy": "RESTORE",
           "resource_refs": [
             {
@@ -940,10 +953,12 @@
         {
           "resource": "codebuild:the golden-image builder's source asset key moves from de2cc691a5c30dee024444f00a470cfebe32a8ea4bc2be196bd7386e55815155.zip to 3e8b29f5ddb53439740caa24bdb2704798112ec86f43b0c28d8f0826990a3309.zip, and the build role's read grant follows that key. The ONLY difference in both resources is that object key: the builder packages the repository tree, and this range changed files inside it. Nothing about the running system depends on it, and there is no safe CLI that re-points a CodeBuild source at an asset this kit does not upload. It is listed here rather than hidden so the operator knows the next golden-image bake must take its source from the patched tree; that bake, not this kit, is where the new key comes into existence. Requires operator review precisely because the correct action is to do nothing now.",
           "class": "MANUAL_CLI_REVIEW",
-          "apply_cli": "NO-OP on the running system. Confirm by reading: aws codebuild batch-get-projects --names \"$GOLDEN_IMAGE_PROJECT\" --region \"$AWS_REGION\" --query 'projects[0].source.location' --output text — it still points at the pre-patch asset, which is correct until a new bake uploads one.",
-          "verify_cli": "aws codebuild batch-get-projects --names \"$GOLDEN_IMAGE_PROJECT\" --region \"$AWS_REGION\" --query 'projects[0].source.location' --output text  # unchanged by this kit; recorded so a later bake can be attributed",
-          "rollback_cli": "RETAIN — nothing was changed, so there is nothing to roll back.",
-          "artifact_refs": [],
+          "apply_cli": "lib/apply-resource-ops.sh codebuild-goldenimage-asset-drift apply",
+          "verify_cli": "lib/apply-resource-ops.sh codebuild-goldenimage-asset-drift verify",
+          "rollback_cli": "lib/apply-resource-ops.sh codebuild-goldenimage-asset-drift rollback",
+          "artifact_refs": [
+            "lib/apply-resource-ops.sh"
+          ],
           "rollback_policy": "RETAIN",
           "resource_refs": [
             {

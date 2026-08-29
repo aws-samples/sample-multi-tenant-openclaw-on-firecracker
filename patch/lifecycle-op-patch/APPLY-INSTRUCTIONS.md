@@ -68,14 +68,14 @@ openresty 进程停止三个方向,全部排除后才定位到本缺陷)。
 ## 动手前先跑一次 validator,并对照它的预期基线
 
 ```sh
-patch/validator/oc-prelaunch-validate \
+cli/validator/oc-prelaunch-validate \
   --kit patch/lifecycle-op-patch --gateway-ref origin/gateway \
   --offline --report ./prelaunch-lifecycle-op-patch.json
 ```
 
 **这一步会报 7 条 `FAIL`、1 条 `INCONCLUSIVE`,退出码 `1` —— 那是本 kit 的既有状态,
 不是你搞坏了什么。** 逐条归因与两个 kit 的完整对照表在
-`patch/validator/README.md` 的「Recorded `--offline` baselines」一节。用法只有一条:
+`cli/validator/README.md` 的「Recorded `--offline` baselines」一节。用法只有一条:
 **把你跑出来的每一行和表里本 kit 那一列比对**。
 
 - 每一行都对上 → kit 处于交付状态,继续往下读,**不要再去查那些 FAIL**

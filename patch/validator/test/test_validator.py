@@ -402,7 +402,7 @@ class ValidatorTests(unittest.TestCase):
                          if p.is_file())
         forbidden = ["invoke" + "_function", "invoke" + "_async"]
         self.assertFalse(any(item in text for item in forbidden))
-        calls = set(re.findall(r'\.call\([^,]+,\s*["\']([a-z_]+)', text))
+        calls = set(re.findall(r'\.call\([^,]+,\s*["\']([a-z_0-9]+)', text))
         self.assertTrue(calls.issubset(awsread.READ_ONLY_ALLOWLIST))
     def test_coordinate_self_guard(self):
         root = Path(__file__).resolve().parents[1]

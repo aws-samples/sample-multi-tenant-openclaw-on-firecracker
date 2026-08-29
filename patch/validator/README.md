@@ -12,6 +12,7 @@ patch/validator/oc-prelaunch-validate \
   --gateway-ref origin/gateway \
   --environment-json ./environment.json \
   --region REGION_PLACEHOLDER \
+  --stack OpenClawOrchestrator \
   --target-vms TARGET_PLACEHOLDER \
   --report ./prelaunch-report.json
 ```
@@ -19,6 +20,8 @@ patch/validator/oc-prelaunch-validate \
 Use `--group A,C` to select groups. `--offline` runs source and kit checks that
 do not require AWS credentials. A missing optional `boto3` installation causes
 AWS-dependent checks to report `INCONCLUSIVE`; it does not crash the tool.
+`--stack` overrides the default CloudFormation stack candidates and may be
+repeated.
 
 Exit status:
 
@@ -30,9 +33,23 @@ The tool writes only the requested report file. AWS access is restricted in
 `lib/awsread.py`; Function execution and unapproved SSM payloads are rejected
 before a client call is made.
 
+## Account-independent discovery
+
+The validator discovers buckets, launch templates, ASGs, Lambda functions,
+REST APIs, tables, and Redis coordinates from CloudFormation at run time. The
+default stack candidates are `OpenClawOrchestrator`, `OpenClawImage`, and
+`OpenClawHostImage`; repeated `--stack` arguments replace that list.
+Host/edge resources are classified from `LogicalResourceId` first and use a
+named `PhysicalResourceId` only as a fallback; affected findings record the
+decision as `classified_by`.
+`environment.json` remains an optional override, and each affected finding
+records whether a coordinate came from `environment-json` or `discovered`.
+Unresolved coordinates remain explicit and make dependent checks
+`INCONCLUSIVE`.
+
 ## Environment observations
 
-The discovery output provides account-specific coordinates. Checks also accept
+Self-discovery provides account-specific coordinates. Checks also accept
 additional read-only observations under these optional keys:
 
 - `live_files`: repository path to observed `sha256`, `mode`, and `executable`.
@@ -82,6 +99,21 @@ pass.
 | E8 | Every host-table scan excludes synthetic identifiers. | Singleton control rows can be treated as fleet hosts. |
 | E9 | Read-only residue observations report no test tenant, VM directory, process, host-file injection, or tunnel. | Test state remains in the target environment. |
 | E10 | Known false-red shapes are explicitly annotated and never used alone as rollback evidence. | No failure verdict is produced by this annotation check. |
+| F1 | Sampled host AMI markers agree on recipe, Firecracker version, guest kernel, and architecture, with a live source pin. | Golden-AMI provenance is missing or split across the fleet. |
+| F2 | The host ASG uses `$Default` or a numeric LT version; the effective version names an existing immutable bootstrap object with no active template token, and running instances on other versions reference the same bootstrap SHA. | Host bootstrap can float through `$Latest`, reference missing bytes, carry unresolved rendering, or differ from a running instance's bootstrap. |
+| F3 | Every required managed script matches gateway bytes, its S3 object, and its parsed host landing path. | A required script is missing or differs at a delivery hop. |
+| F4 | Observability assets match gateway, S3, and enabled host/edge landings; disabled logging expects host absence. | Logging assets are stale, incomplete, or deployed contrary to the feature gate. |
+| F5 | Guest image manifest fields match S3 and decompressed disk digests agree across hosts. | Hosts can launch different image generations or disk bytes. |
+| F6 | Running and baked guest-kernel digests agree across hosts and marker kernel names converge. | The fleet is split across guest kernels. |
+| F7 | The deterministic edge bundle digest matches the edge ASG's effective `$Default` or numeric LT version, S3 object, and installed edge-version directory. | The edge tier is floating through `$Latest` or running or bootstrapping a different bundle. |
+| F8 | Mirrored Firecracker archives match live source pins and installed Firecracker/jailer digests agree across hosts. | A mirror object or installed binary has diverged. |
+| F9 | The `skills/` object set and current VersionIds equal every host's exact-version sync record. | Shared skills are stale, divergent, or unrecorded. |
+| F10 | Sampled hosts agree on both SSM worker limits and agent version; no source-side expected value is claimed. | Host OS/agent configuration is internally inconsistent. |
+| F11 | Rendered environment key sets and truncated value digests agree except for `INSTANCE_ID`; enabled Fluent Bit configs agree by digest. | Rendered per-host artifacts differ, without exposing their values. |
+| G1 | Every CloudFormation-declared Lambda resolves via `get_function_configuration`. | A declared function was deleted out of band. |
+| G2 | Lambda members that have the same relative path in gateway source match by SHA-256, package-only members are neutral, bytecode is ignored, and alias-served code hashes match `$LATEST`. | A source-backed Lambda member or its serving alias diverged from gateway state. |
+| G3 | Every source `add_method` route exists in the deployed OAS export with matching API-key and authorization shape. | A route or its authorization was removed or changed out of band. |
+| G4 | Every F3/F4/F7/F8 core S3 key exists and matches its source digest; current VersionIds are recorded when enabled. | A core delivery object was deleted or replaced. |
 
 ## C1 limitations
 
@@ -109,6 +141,8 @@ An E10 annotation must be correlated with independent byte, configuration, or
 runtime evidence before deciding to roll back.
 
 ## Recorded `--offline` baselines
+
+F/G rows are not part of the recorded baselines below yet.
 
 **Why this section exists.** A first-time operator runs `--offline` against a
 shipped kit, sees seven `FAIL` rows, and has no way to tell "this kit has always

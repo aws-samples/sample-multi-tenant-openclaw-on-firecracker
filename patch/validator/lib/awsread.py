@@ -23,10 +23,18 @@ ALLOWED_EXACT = {
     "send_command",
 }
 READ_ONLY_ALLOWLIST = set(ALLOWED_EXACT).union({
+    "describe_auto_scaling_groups", "describe_instance_information",
+    "describe_instances", "describe_stacks",
     "get_export", "get_function", "get_function_configuration",
-    "get_metric_statistics", "get_parameters_by_path",
+    "get_bucket_versioning", "get_command_invocation",
+    "get_metric_statistics", "get_parameter", "get_parameters_by_path",
+    "get_stages",
     "get_queue_attributes", "list_aliases", "list_event_source_mappings",
-    "list_functions", "describe_alarms", "describe_launch_template_versions",
+    # Prefix-based validation already permits this; keep it explicit for the
+    # validator-wide method inventory asserted by the unit tests.
+    "list_functions", "list_object_versions", "list_objects_v2",
+    "list_stack_resources", "describe_alarms",
+    "describe_launch_templates", "describe_launch_template_versions",
     "describe_table",
 })
 SSM_COMMAND_PREFIXES = (

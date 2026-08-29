@@ -75,7 +75,7 @@
   },
   "kit_files": {
     "lib/apply-resource-ops.sh": {
-      "sha256": "12bee8b5e3c7bffd754d267e1ba0a7f77fc1929424d65e4fc288cfe2d434ed06"
+      "sha256": "12f34a08e8eb1656e89d6b09e9f6eebd7b68b74a2e26e246964aad77d15373fc"
     },
     "lib/discover-env.sh": {
       "sha256": "a97ad92dce6dcf6d5d6a4b329cf1f02f7d32b03bf2ea1cad785f90ec59f3069b"
@@ -832,8 +832,8 @@
       "patch_sha256": "36ed93564d482789b9231ff66fd750204c7a01033f79fe3d3c06f43f0395a549",
       "operations": [
         {
-          "resource": "ssm:CREATES the lifecycle fence lease parameter /openclaw/lifecycle/fence-lease-sec with value 240. apply is guarded by a prior get-parameter so a re-run is an idempotent adopt rather than an overwrite of a value the operator raised on purpose. The value is refused below 210 at runtime (210 = the delete action's exec_sec budget), so a hand-edit under the floor silently does not take effect and the effective lease stays at the 240 default.",
-          "class": "AUTO_CLI",
+          "resource": "MANUAL REVIEW REQUIRED — the shipped helper has not passed an independent reliability gate (2.0 then 3.0 out of 10 against a bar of 6.5, four classes of critical defect open; see 'Known defects in the helper' in APPLY-INSTRUCTIONS.md). Drive this operation from the by-hand commands in APPLY rather than from the helper's apply mode. ssm:CREATES the lifecycle fence lease parameter /openclaw/lifecycle/fence-lease-sec with value 240. apply is guarded by a prior get-parameter so a re-run is an idempotent adopt rather than an overwrite of a value the operator raised on purpose. The value is refused below 210 at runtime (210 = the delete action's exec_sec budget), so a hand-edit under the floor silently does not take effect and the effective lease stays at the 240 default.",
+          "class": "MANUAL_CLI_REVIEW",
           "apply_cli": "lib/apply-resource-ops.sh ssm-fence-lease-param apply",
           "verify_cli": "lib/apply-resource-ops.sh ssm-fence-lease-param verify",
           "rollback_cli": "lib/apply-resource-ops.sh ssm-fence-lease-param rollback",
@@ -851,8 +851,8 @@
           ]
         },
         {
-          "resource": "iam:ADDS ssm:GetParameter on the fence-lease parameter to the control-plane API role. In the synthesized closure this grant lands in the role's OVERFLOW managed policy, not its default policy, and the overflow split also relocates the pre-existing ec2:DescribeLaunchTemplateVersions statement from overflow policy 1 to overflow policy 2 — a repackaging with no change in effective permissions. So both overflow policies show as modified while exactly one permission is new. On a live deployment the operator adds a small inline policy instead of reproducing the split, and must not remove ec2:DescribeLaunchTemplateVersions from wherever it currently sits. If this deployment also runs a lifecycle-consumer function, the same grant belongs on ITS role too: the consumer is the primary executor of async lifecycle actions, and the reference configuration used for this closure has the queue path off, so no consumer resource appears here.",
-          "class": "AUTO_CLI",
+          "resource": "MANUAL REVIEW REQUIRED — the shipped helper has not passed an independent reliability gate (2.0 then 3.0 out of 10 against a bar of 6.5, four classes of critical defect open; see 'Known defects in the helper' in APPLY-INSTRUCTIONS.md). Drive this operation from the by-hand commands in APPLY rather than from the helper's apply mode. iam:ADDS ssm:GetParameter on the fence-lease parameter to the control-plane API role. In the synthesized closure this grant lands in the role's OVERFLOW managed policy, not its default policy, and the overflow split also relocates the pre-existing ec2:DescribeLaunchTemplateVersions statement from overflow policy 1 to overflow policy 2 — a repackaging with no change in effective permissions. So both overflow policies show as modified while exactly one permission is new. On a live deployment the operator adds a small inline policy instead of reproducing the split, and must not remove ec2:DescribeLaunchTemplateVersions from wherever it currently sits. If this deployment also runs a lifecycle-consumer function, the same grant belongs on ITS role too: the consumer is the primary executor of async lifecycle actions, and the reference configuration used for this closure has the queue path off, so no consumer resource appears here.",
+          "class": "MANUAL_CLI_REVIEW",
           "apply_cli": "lib/apply-resource-ops.sh iam-api-fence-param-read apply",
           "verify_cli": "lib/apply-resource-ops.sh iam-api-fence-param-read verify",
           "rollback_cli": "lib/apply-resource-ops.sh iam-api-fence-param-read rollback",
@@ -876,8 +876,8 @@
           ]
         },
         {
-          "resource": "iam:ADDS ec2:DescribeInstances (resource \"*\", the only form EC2 Describe supports) to the health-check role, so host death is confirmed against EC2 instead of inferred from a missing or deleted hosts-table row. Without it the reaper falls back to the table clue and can write a terminal state for a tenant whose VM is still running.",
-          "class": "AUTO_CLI",
+          "resource": "MANUAL REVIEW REQUIRED — the shipped helper has not passed an independent reliability gate (2.0 then 3.0 out of 10 against a bar of 6.5, four classes of critical defect open; see 'Known defects in the helper' in APPLY-INSTRUCTIONS.md). Drive this operation from the by-hand commands in APPLY rather than from the helper's apply mode. iam:ADDS ec2:DescribeInstances (resource \"*\", the only form EC2 Describe supports) to the health-check role, so host death is confirmed against EC2 instead of inferred from a missing or deleted hosts-table row. Without it the reaper falls back to the table clue and can write a terminal state for a tenant whose VM is still running.",
+          "class": "MANUAL_CLI_REVIEW",
           "apply_cli": "lib/apply-resource-ops.sh iam-health-describe-instances apply",
           "verify_cli": "lib/apply-resource-ops.sh iam-health-describe-instances verify",
           "rollback_cli": "lib/apply-resource-ops.sh iam-health-describe-instances rollback",
@@ -895,8 +895,8 @@
           ]
         },
         {
-          "resource": "lambda:REPLACES the control-plane API function's code with the seven patched api files overlaid onto the live package, then publishes a version and moves the live alias. The synthesized closure shows the function, its alias and a new CurrentVersion logical id replacing the old one — all three are consequences of one code change, applied by APPLY Step 2. Rollback must cover BOTH the alias and $LATEST, because an SQS event source mapping binds $LATEST and flipping the alias alone leaves that path on new code. If this deployment runs a separate lifecycle-consumer function on the same api source tree, apply the identical overlay to it.",
-          "class": "AUTO_CLI",
+          "resource": "MANUAL REVIEW REQUIRED — the shipped helper has not passed an independent reliability gate (2.0 then 3.0 out of 10 against a bar of 6.5, four classes of critical defect open; see 'Known defects in the helper' in APPLY-INSTRUCTIONS.md). Drive this operation from the by-hand commands in APPLY rather than from the helper's apply mode. lambda:REPLACES the control-plane API function's code with the seven patched api files overlaid onto the live package, then publishes a version and moves the live alias. The synthesized closure shows the function, its alias and a new CurrentVersion logical id replacing the old one — all three are consequences of one code change, applied by APPLY Step 2. Rollback must cover BOTH the alias and $LATEST, because an SQS event source mapping binds $LATEST and flipping the alias alone leaves that path on new code. If this deployment runs a separate lifecycle-consumer function on the same api source tree, apply the identical overlay to it.",
+          "class": "MANUAL_CLI_REVIEW",
           "apply_cli": "lib/apply-resource-ops.sh lambda-api-code apply",
           "verify_cli": "lib/apply-resource-ops.sh lambda-api-code verify",
           "rollback_cli": "lib/apply-resource-ops.sh lambda-api-code rollback",
@@ -932,8 +932,8 @@
           ]
         },
         {
-          "resource": "lambda:REPLACES the health-check function's handler.py with the patched file overlaid onto its live package. This function has no alias in the closure, so the code update is the whole operation.",
-          "class": "AUTO_CLI",
+          "resource": "MANUAL REVIEW REQUIRED — the shipped helper has not passed an independent reliability gate (2.0 then 3.0 out of 10 against a bar of 6.5, four classes of critical defect open; see 'Known defects in the helper' in APPLY-INSTRUCTIONS.md). Drive this operation from the by-hand commands in APPLY rather than from the helper's apply mode. lambda:REPLACES the health-check function's handler.py with the patched file overlaid onto its live package. This function has no alias in the closure, so the code update is the whole operation.",
+          "class": "MANUAL_CLI_REVIEW",
           "apply_cli": "lib/apply-resource-ops.sh lambda-health-code apply",
           "verify_cli": "lib/apply-resource-ops.sh lambda-health-code verify",
           "rollback_cli": "lib/apply-resource-ops.sh lambda-health-code rollback",

@@ -19,7 +19,7 @@ Successor to `patch/lc2-patch`. It packages the source range
 | Retry idempotency | `lifecycle_fence.py`, `tenant_service.py` | `client_token` covers `restart` and `delete`; a same-token re-entry answers `202` with `retry_after_sec` and dispatches nothing; a real conflict answers `409` with `retry_after_sec` |
 | Lifecycle failure states | `tenant_service.py`, `deadline_executor.py`, `health_check/handler.py`, `host_service.py` | `suspend_failed` split by whether a backup exists; `restore` has no failed terminal state; host death confirmed against EC2, not inferred from a missing table row |
 | Egress dry run | `egress_admin_service.py` | `POST /hosts/egress/allow/validate` reports each unavailable protected-network criterion separately |
-| Pre-launch validator | `lib/validator/**` (19 files) | Read-only operator tool: 11 data-plane delivery channels + control-plane drift, PASS / FAIL / NOT JUDGED per channel |
+| Pre-launch validator (**optional**, see the end of Step 6) | `lib/validator/**` (19 files) | Read-only operator tool: 11 data-plane delivery channels + control-plane drift, PASS / FAIL / NOT JUDGED per channel. Supersedes the `patch/validator` copy: the same 20 filenames, with three files carrying fixes that copy does not have (a load-bearing `re.MULTILINE`, a content-addressed test fixture, and a `__pycache__` exclusion that stops a false red on the second run). |
 
 Three CloudFormation resources change, all in Step 4: one new SSM parameter and three IAM
 role-policy additions (two `ssm:GetParameter`, one `ec2:DescribeInstances`).
@@ -191,11 +191,40 @@ S3 at boot. There is no future-machine divergence to close.
 
 ## Step 4 — The CloudFormation resources, as by-hand CLI
 
-Three resources change. Order matters: the two permission grants and the parameter must exist
-**before** the code that reads them, or you convert a soft bug into a silent fallback.
+**Run these through the shipped helper, not by hand.** `lib/apply-resource-ops.sh` is the one
+executable path for every resource this kit owns, so every executor runs identical code:
 
-`REGION` and `ACCOUNT` below come from `environment.json`. Substitute them into the shipped
-policy documents; do not leave the placeholder text in a policy you put.
+```bash
+lib/apply-resource-ops.sh <op> plan       # read-only: prints the coordinates it resolved
+lib/apply-resource-ops.sh <op> apply      # precheck -> backup -> apply
+lib/apply-resource-ops.sh <op> verify     # falsifiable readback
+lib/apply-resource-ops.sh <op> rollback   # refuses to run without this run's saved state
+```
+
+The six ops, in the order they must run:
+
+| # | op | class | rollback |
+| - | -- | ----- | -------- |
+| 1 | `iam-api-fence-param-read` | `AUTO_CLI` | `RETAIN` |
+| 2 | `iam-health-describe-instances` | `AUTO_CLI` | `RETAIN` |
+| 3 | `ssm-fence-lease-param` | `AUTO_CLI` | `RESTORE` |
+| 4 | `lambda-api-code` | `AUTO_CLI` | `RESTORE` (alias **and** `$LATEST`) |
+| 5 | `lambda-health-code` | `AUTO_CLI` | `RESTORE` |
+| 6 | `codebuild-goldenimage-asset-drift` | `MANUAL_CLI_REVIEW` | `RETAIN` (nothing is changed) |
+
+Ops 1–3 come before 4–5 deliberately: the grants and the parameter must exist **before** the
+code that reads them, or you convert a soft bug into a silent fallback. Every op reads its
+coordinates from `environment.json` and **hard-stops on a missing one** rather than defaulting
+— the failure mode of a guessed function or role name is "the command succeeded against the
+wrong resource".
+
+If your deployment runs a lifecycle consumer, make sure `environment.json` carries
+`consumer_role` and `consumer_function`. Op 1 and op 4 then cover it automatically; without
+those fields they print a warning and cover the API side only, which is the shape where the api
+honours the new lease value and the consumer silently does not.
+
+The rest of this section documents what each op actually does, so you can read before
+approving. `REGION` and `ACCOUNT` come from `environment.json`; the helper substitutes them.
 
 ### 4.1 `ssm:GetParameter` for the API and consumer roles — `AUTO_CLI`, `rollback_policy: RETAIN`
 

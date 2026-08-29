@@ -19,7 +19,6 @@ from checks.channels import (  # noqa: E402
     SKILL_STATE_PATH,
     SSM_AGENT_CONFIG_PATH,
     _edge_bundle,
-    _landing_paths,
     _obs_assets,
     _obs_landing,
     _sha,

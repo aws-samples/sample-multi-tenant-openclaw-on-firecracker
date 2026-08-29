@@ -1098,7 +1098,7 @@ process. Confirm the real-tenant count is identical before and after.
 
 ## Step 8 — The pre-launch validator, and it is the last thing you run
 
-`patch/validator/` is generic — it belongs to no kit, and every patch ends here. It answers a
+`cli/validator/` is generic — it belongs to no kit, and every patch ends here. It answers a
 question none of the earlier steps can: **does the environment now actually match what this kit
 promised, and is there anything in the repository that is green everywhere and still broken?**
 
@@ -1107,7 +1107,7 @@ The host readings it takes go through `AWS-RunShellScript` with `sha256sum` / `s
 `systemctl is-active` / `journalctl` payloads only.
 
 ```bash
-patch/validator/oc-prelaunch-validate \
+cli/validator/oc-prelaunch-validate \
   --kit patch/lc2-patch \
   --environment-json ./environment.json \
   --region "$AWS_REGION" \
@@ -1128,7 +1128,7 @@ Three things to expect on a first run:
   leaves the judgement to you.
 - `UNVERIFIED` on a mode or hash check usually means the live half was unreachable, not that the
   declared half is wrong.
-- The known-false-red list in `patch/validator/README.md` exists so a red there does not trigger a
+- The known-false-red list in `cli/validator/README.md` exists so a red there does not trigger a
   rollback. `apply-api-routes verify`'s CORS FATAL, `oc-consistency`'s handful of DRIFT rows, the
   `{{ }}` gate matching a comment, and a `grep -c` that exits 1 on zero matches have each caused a
   wasted round or a near-miss rollback before.

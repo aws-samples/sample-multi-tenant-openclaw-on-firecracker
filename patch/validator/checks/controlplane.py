@@ -5,7 +5,6 @@ import re
 import zipfile
 
 from checks.channels import (
-    _body_bytes,
     _coordinate,
     _gateway_bytes,
     _missing,

@@ -830,7 +830,14 @@ components:
           type: array
           items:
             type: string
-          description: 宽于默认 /24、可能覆盖整个 VPC、或缺少受保护网络坐标时的事实提示。
+          description: |-
+            事实提示,不改变 verdict。三类:①某条洞宽于默认 /24;②某条洞 ≤ /16 可能覆盖
+            整个 VPC —— 那时 host 侧语义探针会 fail-closed 而期望态已落 DDB,host 报
+            `redline reachable: allow holes cover the entire VPC_CIDR`;③某条受保护网络
+            判据在本环境【不可用】。第三类逐条报而不是只在两条都缺时报一句:真机
+            us-west-2 `openclaw-api` 的 env 里没有 VPC_CIDR/EGRESS_VPC_CIDR 但有
+            VM_SUBNET_PREFIX(TENANT_SUPERNET 由它派生),所以"dst 不得覆盖 VPC_CIDR"那条
+            恒不生效 —— 那恰好是绝对前缀下界存在的理由,运维必须被告知。
         side_effects:
           type: string
           enum:

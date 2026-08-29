@@ -1,0 +1,29 @@
+{
+  "synced_at": "2026-08-29 13:08:51 UTC+08:00",
+  "base_sha": "b66fc1f55f6f459fdbdfd2542ebf7b0c694c50ad",
+  "source_commit": "69fe079462c0aabe2af4f5e9f0cb93330892a37f",
+  "commit_count": 2,
+  "file_count": 1,
+  "summary": "Sync the bb increment b66fc1f5..69fe0794 to the public gateway branch. Sync-LOG only (which customer-facing files reached gateway + the issues behind them); the applyable patch kit is NOT built yet (folded_into pending).",
+  "issues_synced_note": "Index back to the issue tracker for whoever builds the patch kit: before assembling the kit, walk each issue and confirm it's covered. `title` is a ≤20-char gist only — open the issue for the full problem/fix/test. Lists only issues that touched a released file this sync.",
+  "issues_synced": [
+    {
+      "id": "#689",
+      "type": "feat",
+      "title": "[FEATURE][控制面] 降 SSM…"
+    }
+  ],
+  "needs_config_on_apply": "none detected (no config.yml key / systemd directive / DDB-TTL change in this sync)",
+  "updated_files": {
+    "cdk-stack (cdk deploy OR hand-apply)": [
+      {
+        "path": "deploy/stacks/lambdas.py",
+        "status": "modified",
+        "issues": [
+          "#689"
+        ]
+      }
+    ]
+  },
+  "folded_into": "(pending) — no patch kit built for this sync yet; a later kit should cite this manifest as source-of-record and set base_sha/patch_sha. cdk deploy is FORBIDDEN on hand-modified live deployments — the kit must ship *.patched host scripts + the full lambda tree + AWS CLI for stack changes, same shape as patch/315-concurrent-dispatch-rollup/."
+}

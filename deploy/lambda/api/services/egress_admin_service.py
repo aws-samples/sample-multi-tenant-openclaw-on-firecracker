@@ -400,11 +400,24 @@ def fleet_egress_allow_validate(body=None, event=None):
                 "cover the entire VPC_CIDR' — grep that string on the host to "
                 "confirm (ADR-egress-allow-hole-redline §10)"
             )
-    if not protected_networks:
+    # 逐条报「哪条判据在本环境不可用」,而不是只在两条都缺时报一句。
+    # 真机实测(us-west-2 openclaw-api,83 项 env):没有 VPC_CIDR/EGRESS_VPC_CIDR,但有
+    # VM_SUBNET_PREFIX,于是 TENANT_SUPERNET 是【派生出来的】而 VPC_CIDR 那条判据恒不生效。
+    # 只在 protected_networks 全空时才 warn 的写法,在真机上永远不会触发 —— 而"覆盖 VPC
+    # 网段那条拦不住"恰好是运维最该知道的一件事,也正是绝对前缀下界存在的理由。
+    if "VPC_CIDR" not in protected_networks:
         warnings.append(
-            "neither VPC_CIDR/EGRESS_VPC_CIDR nor TENANT_SUPERNET is configured "
-            "in this environment, so the equal-or-contains check cannot run here; "
-            "only the prefix floor and the red-line port set constrain scope"
+            "VPC_CIDR/EGRESS_VPC_CIDR is not configured in this environment, so the "
+            "'dst must not equal or contain VPC_CIDR' check cannot run here — a hole "
+            "that covers the whole VPC will pass admission and be caught only by the "
+            "host-side semantic probe. The absolute prefix floor "
+            f"(/{_ABSOLUTE_MIN_PREFIX}) is what constrains scope here"
+        )
+    if "TENANT_SUPERNET" not in protected_networks:
+        warnings.append(
+            "TENANT_SUPERNET is not configured and could not be derived from "
+            "VM_SUBNET_PREFIX, so the cross-tenant 'dst must not equal or contain "
+            "TENANT_SUPERNET' check cannot run here"
         )
 
     accepted_count = len(accepted_tokens)

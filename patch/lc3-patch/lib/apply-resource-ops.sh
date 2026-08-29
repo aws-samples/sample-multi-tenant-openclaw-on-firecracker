@@ -489,7 +489,11 @@ PY
   }
 
   env_verify_one() {
-    local fn="$1" alias_name="$2" target="$fn"
+    # Two statements on purpose. Names declared in ONE `local` are not visible to each other,
+    # so `local fn="$1" target="$fn"` reads an unset fn and `set -u` kills the run with
+    # "fn: unbound variable". This is not a bash 3.2 quirk — 5.x behaves the same.
+    local fn="$1" alias_name="$2"
+    local target="$fn"
     if [ -n "$alias_name" ]; then
       local ver
       ver="$(aws lambda get-alias --region "$REGION" --function-name "$fn" --name "$alias_name" \

@@ -1,0 +1,1250 @@
+{
+  "id": "lc3-patch",
+  "base_sha": "979a9cb7e925212e4e3151582b90daf1e8b30a82",
+  "patch_sha": "f3b510de6aa9532852a677de36d4afbd8a5c330b",
+  "status": "MANUAL_REVIEW",
+  "excludes": [
+    "patch/**"
+  ],
+  "cloudformation": {
+    "status": "CAPTURED",
+    "reason": null,
+    "provenance": {
+      "synth_argv": [
+        "bash",
+        "-c",
+        "set -e\necho aW1wb3J0IHlhbWwsIHBhdGhsaWIsIHN5cwpjID0geWFtbC5zYWZlX2xvYWQocGF0aGxpYi5QYXRoKCJjb25maWcueW1sLmV4YW1wbGUiKS5yZWFkX3RleHQoKSkKY1sibmV0d29yayJdWyJtb2RlIl0gPSAiZGVmYXVsdF92cGMiCmFzc2VydCBjWyJyZWRpcyJdWyJlbmFibGVkIl0gaXMgVHJ1ZSwgInJlZGlzLmVuYWJsZWQgbXVzdCBiZSB0cnVlIgphc3NlcnQgImVuYWJsZWQiIGluIGNbImVkZ2UiXSwgImVkZ2UuZW5hYmxlZCBrZXkgbWlzc2luZyDigJQgY29uZmlnIHNoYXBlIGNoYW5nZWQiCmNbImVkZ2UiXVsiZW5hYmxlZCJdID0gVHJ1ZQpwYXRobGliLlBhdGgoImNvbmZpZy55bWwiKS53cml0ZV90ZXh0KHlhbWwuc2FmZV9kdW1wKGMsIHNvcnRfa2V5cz1GYWxzZSwgYWxsb3dfdW5pY29kZT1UcnVlKSkK | base64 -d > /tmp/oc-synth-cfg.py\nuv run --with pyyaml python3 /tmp/oc-synth-cfg.py\nCDK_CONTEXT_JSON='{\"aws:cdk:bundling-stacks\": []}' CDK_DEFAULT_ACCOUNT=123456789012 CDK_DEFAULT_REGION=us-east-1 OC_OBS_GIT_COMMIT=closure OC_OBS_UPLOADED_AT=1970-01-01T00:00:00Z CDK_OUTDIR=\"$1\" uv run --frozen python3 deploy/app.py",
+        "--all",
+        "{output}"
+      ],
+      "base": {
+        "source_sha": "979a9cb7e925212e4e3151582b90daf1e8b30a82",
+        "source_tree": "3743964aaccac6e84f00e8bf306161eeda0e6347",
+        "assembly_index": {
+          "artifact": "resources/cloudformation/base.assembly-index.json",
+          "sha256": "433a10578a29351dd19129b42ccd38127a05b8a6595a295870875f88c6395a96"
+        }
+      },
+      "patch": {
+        "source_sha": "f3b510de6aa9532852a677de36d4afbd8a5c330b",
+        "source_tree": "5f1d3f9a788495824ed1bd4e27e43836ba81bcaa",
+        "assembly_index": {
+          "artifact": "resources/cloudformation/patch.assembly-index.json",
+          "sha256": "6c86bb05f1069a3c685e7a2b0efef44308071e1634508d9d60d3306c4efb4ff4"
+        }
+      }
+    },
+    "stacks": [
+      {
+        "artifact_id": "OpenClawHostImage",
+        "name": "OpenClawHostImage",
+        "base_template": {
+          "artifact": "resources/cloudformation/OpenClawHostImage.base.json",
+          "sha256": "168a38e27dd6f21776b1ad49e527958b5dc37f9ab76a8465a5bbd3c275e37abc"
+        },
+        "patch_template": {
+          "artifact": "resources/cloudformation/OpenClawHostImage.patch.json",
+          "sha256": "168a38e27dd6f21776b1ad49e527958b5dc37f9ab76a8465a5bbd3c275e37abc"
+        }
+      },
+      {
+        "artifact_id": "OpenClawImage",
+        "name": "OpenClawImage",
+        "base_template": {
+          "artifact": "resources/cloudformation/OpenClawImage.base.json",
+          "sha256": "64ea2d1ce3ed0cbc8e73ed0b21f618c0a3c0109bfd0e189f314f86e844957466"
+        },
+        "patch_template": {
+          "artifact": "resources/cloudformation/OpenClawImage.patch.json",
+          "sha256": "2c38c813788f19ff95da569310f056a88b1a20c52469ea68f7bc34d211fcd150"
+        }
+      },
+      {
+        "artifact_id": "OpenClawOrchestrator",
+        "name": "OpenClawOrchestrator",
+        "base_template": {
+          "artifact": "resources/cloudformation/OpenClawOrchestrator.base.json",
+          "sha256": "75f54a4f755d4554dede17fc1bab450108494d30746e02543aa0780d6c8cacfc"
+        },
+        "patch_template": {
+          "artifact": "resources/cloudformation/OpenClawOrchestrator.patch.json",
+          "sha256": "d74aedb4ff4c753eb15ae31b56ba855211d0fb4101aabeed3d3bf8c149d4b3b8"
+        }
+      }
+    ]
+  },
+  "kit_files": {
+    "lib/discover-env.sh": {
+      "sha256": "a97ad92dce6dcf6d5d6a4b329cf1f02f7d32b03bf2ea1cad785f90ec59f3069b"
+    },
+    "lib/validator/checks/__init__.py": {
+      "sha256": "b9b8e4e7284bda052e1a1743fcaeea80df91883fa77921d67300f2ea98fb0290"
+    },
+    "lib/validator/checks/blindspots.py": {
+      "sha256": "75299ae33c09fb4d24da669424b1e59e98b963b6174e091e4b11177815549f46"
+    },
+    "lib/validator/checks/channels.py": {
+      "sha256": "6352c1c5d54425a5675fada99f95da8786cacfee3db0741c51a2a389b7d37848"
+    },
+    "lib/validator/checks/consistency.py": {
+      "sha256": "a67b70a8c4cf6ecdbe07b9c85ca6c3e24830803f879dd763731c54e2cf980acb"
+    },
+    "lib/validator/checks/controlplane.py": {
+      "sha256": "afaeda212b203f9237dd5b88ec1a9537676388e0337d2545cf5406b60ade128b"
+    },
+    "lib/validator/checks/kitproof.py": {
+      "sha256": "b83e5ea464984d9b741b417aa1539421491dba242dff53ba58c5392cdbdb87f8"
+    },
+    "lib/validator/checks/permissions.py": {
+      "sha256": "e4abbc390dccada39d5dd6e43650421bcec4dc7bdca6458fc64444b179df5f0a"
+    },
+    "lib/validator/checks/scale.py": {
+      "sha256": "b57c2abd33c2ca5f00bd42c2bba3e721794f084db17608d3c27b9b1f5407f505"
+    },
+    "lib/validator/lib/__init__.py": {
+      "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+    },
+    "lib/validator/lib/awsread.py": {
+      "sha256": "55cb9030ddd6006236bfb8bff25b59ea78e36b99e3ced97aa82b8d5201e8ec1c"
+    },
+    "lib/validator/lib/comparison.py": {
+      "sha256": "178fc63b314ad767c29eaa09703d9f01aeb996d7aa2f409e8781d16b3603047f"
+    },
+    "lib/validator/lib/context.py": {
+      "sha256": "51dbed94a2b26f6249d2036cf6f5c3e242b773ef1aabf82812fabecde26fcc44"
+    },
+    "lib/validator/lib/discover.py": {
+      "sha256": "fbd9407958fb23afe21ee1766e00996ae6aa398bc7348e372fede815077f730e"
+    },
+    "lib/validator/lib/result.py": {
+      "sha256": "970eb2a6aa9c8092a79c870c15cdfd7ad8a908f7341b6f63ae1d4531119827c0"
+    },
+    "lib/validator/lib/srcdefaults.py": {
+      "sha256": "dc5c3e412ca82e11cf663c939d6e1029c061c41edbe0fda8a211565e26b2a0ce"
+    },
+    "lib/validator/oc-prelaunch-validate": {
+      "sha256": "f90d4966e3ed312552f6f1f289b98501f89389423168e49b8fefdaa267208152"
+    },
+    "lib/validator/test/__init__.py": {
+      "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+    },
+    "lib/validator/test/test_channels.py": {
+      "sha256": "bdf685e41da8cf61c0c0787c5fa3d4800500e9d4c038748dec5c68b2fb3a8b8b"
+    },
+    "lib/validator/test/test_validator.py": {
+      "sha256": "bf745c533d19c3cfe2c14b085c52019b3b5d4d9698a8c295a7647873212a2ece"
+    }
+  },
+  "paths": {
+    "cli/validator/README.md": {
+      "change": "A",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": null,
+      "patch_sha256": "db69c74b7fd87e744fbc6ceeb85cf4363088d88047bec5d9c4aa85b081b28d25",
+      "operations": [
+        {
+          "resource": "doc:cli/validator/README.md",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git log -1 --format=%H -- cli/validator/README.md",
+          "rollback_cli": "git checkout -- cli/validator/README.md",
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "cli-validator-prelaunch"
+      ]
+    },
+    "cli/validator/checks/__init__.py": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "lib/validator/checks/__init__.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "b9b8e4e7284bda052e1a1743fcaeea80df91883fa77921d67300f2ea98fb0290",
+      "operations": [
+        {
+          "resource": "file:cli/validator/checks/__init__.py",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum <target copy of __init__.py>",
+          "rollback_cli": "restore the backup taken in APPLY step 1",
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "cli-validator-prelaunch"
+      ]
+    },
+    "cli/validator/checks/blindspots.py": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "lib/validator/checks/blindspots.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "75299ae33c09fb4d24da669424b1e59e98b963b6174e091e4b11177815549f46",
+      "operations": [
+        {
+          "resource": "file:cli/validator/checks/blindspots.py",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum <target copy of blindspots.py>",
+          "rollback_cli": "restore the backup taken in APPLY step 1",
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "cli-validator-prelaunch"
+      ]
+    },
+    "cli/validator/checks/channels.py": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "lib/validator/checks/channels.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "6352c1c5d54425a5675fada99f95da8786cacfee3db0741c51a2a389b7d37848",
+      "operations": [
+        {
+          "resource": "file:cli/validator/checks/channels.py",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum <target copy of channels.py>",
+          "rollback_cli": "restore the backup taken in APPLY step 1",
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "cli-validator-prelaunch"
+      ]
+    },
+    "cli/validator/checks/consistency.py": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "lib/validator/checks/consistency.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "a67b70a8c4cf6ecdbe07b9c85ca6c3e24830803f879dd763731c54e2cf980acb",
+      "operations": [
+        {
+          "resource": "file:cli/validator/checks/consistency.py",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum <target copy of consistency.py>",
+          "rollback_cli": "restore the backup taken in APPLY step 1",
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "cli-validator-prelaunch"
+      ]
+    },
+    "cli/validator/checks/controlplane.py": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "lib/validator/checks/controlplane.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "afaeda212b203f9237dd5b88ec1a9537676388e0337d2545cf5406b60ade128b",
+      "operations": [
+        {
+          "resource": "file:cli/validator/checks/controlplane.py",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum <target copy of controlplane.py>",
+          "rollback_cli": "restore the backup taken in APPLY step 1",
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "cli-validator-prelaunch"
+      ]
+    },
+    "cli/validator/checks/kitproof.py": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "lib/validator/checks/kitproof.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "b83e5ea464984d9b741b417aa1539421491dba242dff53ba58c5392cdbdb87f8",
+      "operations": [
+        {
+          "resource": "file:cli/validator/checks/kitproof.py",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum <target copy of kitproof.py>",
+          "rollback_cli": "restore the backup taken in APPLY step 1",
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "cli-validator-prelaunch"
+      ]
+    },
+    "cli/validator/checks/permissions.py": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "lib/validator/checks/permissions.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "e4abbc390dccada39d5dd6e43650421bcec4dc7bdca6458fc64444b179df5f0a",
+      "operations": [
+        {
+          "resource": "file:cli/validator/checks/permissions.py",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum <target copy of permissions.py>",
+          "rollback_cli": "restore the backup taken in APPLY step 1",
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "cli-validator-prelaunch"
+      ]
+    },
+    "cli/validator/checks/scale.py": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "lib/validator/checks/scale.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "b57c2abd33c2ca5f00bd42c2bba3e721794f084db17608d3c27b9b1f5407f505",
+      "operations": [
+        {
+          "resource": "file:cli/validator/checks/scale.py",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum <target copy of scale.py>",
+          "rollback_cli": "restore the backup taken in APPLY step 1",
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "cli-validator-prelaunch"
+      ]
+    },
+    "cli/validator/lib/__init__.py": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "lib/validator/lib/__init__.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+      "operations": [
+        {
+          "resource": "file:cli/validator/lib/__init__.py",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum <target copy of __init__.py>",
+          "rollback_cli": "restore the backup taken in APPLY step 1",
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "cli-validator-prelaunch"
+      ]
+    },
+    "cli/validator/lib/awsread.py": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "lib/validator/lib/awsread.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "55cb9030ddd6006236bfb8bff25b59ea78e36b99e3ced97aa82b8d5201e8ec1c",
+      "operations": [
+        {
+          "resource": "file:cli/validator/lib/awsread.py",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum <target copy of awsread.py>",
+          "rollback_cli": "restore the backup taken in APPLY step 1",
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "cli-validator-prelaunch"
+      ]
+    },
+    "cli/validator/lib/comparison.py": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "lib/validator/lib/comparison.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "178fc63b314ad767c29eaa09703d9f01aeb996d7aa2f409e8781d16b3603047f",
+      "operations": [
+        {
+          "resource": "file:cli/validator/lib/comparison.py",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum <target copy of comparison.py>",
+          "rollback_cli": "restore the backup taken in APPLY step 1",
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "cli-validator-prelaunch"
+      ]
+    },
+    "cli/validator/lib/context.py": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "lib/validator/lib/context.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "51dbed94a2b26f6249d2036cf6f5c3e242b773ef1aabf82812fabecde26fcc44",
+      "operations": [
+        {
+          "resource": "file:cli/validator/lib/context.py",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum <target copy of context.py>",
+          "rollback_cli": "restore the backup taken in APPLY step 1",
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "cli-validator-prelaunch"
+      ]
+    },
+    "cli/validator/lib/discover.py": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "lib/validator/lib/discover.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "fbd9407958fb23afe21ee1766e00996ae6aa398bc7348e372fede815077f730e",
+      "operations": [
+        {
+          "resource": "file:cli/validator/lib/discover.py",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum <target copy of discover.py>",
+          "rollback_cli": "restore the backup taken in APPLY step 1",
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "cli-validator-prelaunch"
+      ]
+    },
+    "cli/validator/lib/result.py": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "lib/validator/lib/result.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "970eb2a6aa9c8092a79c870c15cdfd7ad8a908f7341b6f63ae1d4531119827c0",
+      "operations": [
+        {
+          "resource": "file:cli/validator/lib/result.py",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum <target copy of result.py>",
+          "rollback_cli": "restore the backup taken in APPLY step 1",
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "cli-validator-prelaunch"
+      ]
+    },
+    "cli/validator/lib/srcdefaults.py": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "lib/validator/lib/srcdefaults.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "dc5c3e412ca82e11cf663c939d6e1029c061c41edbe0fda8a211565e26b2a0ce",
+      "operations": [
+        {
+          "resource": "file:cli/validator/lib/srcdefaults.py",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum <target copy of srcdefaults.py>",
+          "rollback_cli": "restore the backup taken in APPLY step 1",
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "cli-validator-prelaunch"
+      ]
+    },
+    "cli/validator/oc-prelaunch-validate": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "lib/validator/oc-prelaunch-validate",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "f90d4966e3ed312552f6f1f289b98501f89389423168e49b8fefdaa267208152",
+      "operations": [
+        {
+          "resource": "file:cli/validator/oc-prelaunch-validate",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum <target copy of oc-prelaunch-validate>",
+          "rollback_cli": "restore the backup taken in APPLY step 1",
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "cli-validator-prelaunch"
+      ]
+    },
+    "cli/validator/test/__init__.py": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "lib/validator/test/__init__.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+      "operations": [
+        {
+          "resource": "file:cli/validator/test/__init__.py",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum <target copy of __init__.py>",
+          "rollback_cli": "restore the backup taken in APPLY step 1",
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "cli-validator-prelaunch"
+      ]
+    },
+    "cli/validator/test/test_channels.py": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "lib/validator/test/test_channels.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "bdf685e41da8cf61c0c0787c5fa3d4800500e9d4c038748dec5c68b2fb3a8b8b",
+      "operations": [
+        {
+          "resource": "file:cli/validator/test/test_channels.py",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum <target copy of test_channels.py>",
+          "rollback_cli": "restore the backup taken in APPLY step 1",
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "cli-validator-prelaunch"
+      ]
+    },
+    "cli/validator/test/test_validator.py": {
+      "change": "A",
+      "layer": "deploy-other",
+      "artifact": "lib/validator/test/test_validator.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "bf745c533d19c3cfe2c14b085c52019b3b5d4d9698a8c295a7647873212a2ece",
+      "operations": [
+        {
+          "resource": "file:cli/validator/test/test_validator.py",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum <target copy of test_validator.py>",
+          "rollback_cli": "restore the backup taken in APPLY step 1",
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "cli-validator-prelaunch"
+      ]
+    },
+    "deploy/lambda/api/core/create_deadline.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/core/create_deadline.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "707b4a261918e325e72531c947c38d0bd44dc28af7798cd6b6c3824b2878c544",
+      "patch_sha256": "076ea7080209ecff6199c1a0d5db0e90f7407b6e3c70685451201cd8af786db1",
+      "operations": [
+        {
+          "resource": "file:deploy/lambda/api/core/create_deadline.py",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum <target copy of create_deadline.py>",
+          "rollback_cli": "restore the backup taken in APPLY step 1",
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#680-fence-lease-ssm"
+      ]
+    },
+    "deploy/lambda/api/core/fence_config.py": {
+      "change": "A",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/core/fence_config.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": null,
+      "patch_sha256": "145e14d53526d3e158ada61d9834de48e4d6805bed7b0a9181818f22e928679c",
+      "operations": [
+        {
+          "resource": "file:deploy/lambda/api/core/fence_config.py",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum <target copy of fence_config.py>",
+          "rollback_cli": "restore the backup taken in APPLY step 1",
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#680-fence-lease-ssm"
+      ]
+    },
+    "deploy/lambda/api/core/lifecycle_fence.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/core/lifecycle_fence.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "b42058b1039e20675a9ec6c868789515b43311898856b5265108ececa991a1f1",
+      "patch_sha256": "4e66e09b6b7ce64eb59151f55f3d7a9bed198d653cc5d2ec3c272522a859b93e",
+      "operations": [
+        {
+          "resource": "file:deploy/lambda/api/core/lifecycle_fence.py",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum <target copy of lifecycle_fence.py>",
+          "rollback_cli": "restore the backup taken in APPLY step 1",
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#680-fence-lease-ssm",
+        "#680-client-token-reentry"
+      ]
+    },
+    "deploy/lambda/api/services/deadline_executor.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/services/deadline_executor.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "0824c94ecee9a78bf4c4249357678c401770f5ad2dbafadfdb39daaed50ab580",
+      "patch_sha256": "6b1ce0b48d729f67666338675af2f234d4e315be3019d14dd7eb446e9402506e",
+      "operations": [
+        {
+          "resource": "file:deploy/lambda/api/services/deadline_executor.py",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum <target copy of deadline_executor.py>",
+          "rollback_cli": "restore the backup taken in APPLY step 1",
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#679-restore-no-failed-terminal"
+      ]
+    },
+    "deploy/lambda/api/services/egress_admin_service.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/services/egress_admin_service.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "2bf3bf4a5e831f63bae21e8c744fdcb5a848045671c81c3585ac5c27d42c5bce",
+      "patch_sha256": "8d6fd45d7290a5f9595837d231d0ca04e8de741287f92e34b4fdf70032c8a923",
+      "operations": [
+        {
+          "resource": "file:deploy/lambda/api/services/egress_admin_service.py",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum <target copy of egress_admin_service.py>",
+          "rollback_cli": "restore the backup taken in APPLY step 1",
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "egress-allow-validate-per-criterion"
+      ]
+    },
+    "deploy/lambda/api/services/host_service.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/services/host_service.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "9538f52f9a892dc24492f9ab97cb51716076494d760d05304dff1c8145a6b131",
+      "patch_sha256": "54ca08ef710a784124e9d3e55f9dfef7d80b77c46fb4e7c50324600f49bc07f1",
+      "operations": [
+        {
+          "resource": "file:deploy/lambda/api/services/host_service.py",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum <target copy of host_service.py>",
+          "rollback_cli": "restore the backup taken in APPLY step 1",
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#679-host-dead-authoritative"
+      ]
+    },
+    "deploy/lambda/api/services/tenant_service.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/services/tenant_service.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "540c0091d2bcd724391f9d2f726a7bb8774e5abbe6e876e69560bdaaadf21713",
+      "patch_sha256": "5dc44a5ac66458e131f24c33c5d8e45679053c7e954d898c810dc83b402adff3",
+      "operations": [
+        {
+          "resource": "file:deploy/lambda/api/services/tenant_service.py",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum <target copy of tenant_service.py>",
+          "rollback_cli": "restore the backup taken in APPLY step 1",
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#680-client-token-reentry",
+        "#679-suspend-failed-split",
+        "#679-restore-no-failed-terminal"
+      ]
+    },
+    "deploy/lambda/health_check/handler.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/health_check/handler.py",
+      "artifact_status": "SHIPPED",
+      "artifact_disposition": null,
+      "base_sha256": "42bc0819082107466b1632984afdd79c5fe1af345de78633c5354b42f1a50ec3",
+      "patch_sha256": "0582d3414d69cea570d803df8457b7e36dc0e3e53e7f7472915ff34a362598c9",
+      "operations": [
+        {
+          "resource": "file:deploy/lambda/health_check/handler.py",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum <target copy of handler.py>",
+          "rollback_cli": "restore the backup taken in APPLY step 1",
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "#679-suspend-failed-split",
+        "#679-restore-no-failed-terminal",
+        "#679-host-dead-authoritative"
+      ]
+    },
+    "deploy/stacks/lambdas.py": {
+      "change": "M",
+      "layer": "D-cdk",
+      "artifact": null,
+      "artifact_status": "OPERATION_ONLY",
+      "artifact_disposition": {
+        "kind": "RESOURCE_OPERATIONS",
+        "evidence": "cloudformation-resource-closure"
+      },
+      "base_sha256": "da18c9db0862cd9151f59cb1b3591f0962b394633723db284ac3b44e7d4418a7",
+      "patch_sha256": "36ed93564d482789b9231ff66fd750204c7a01033f79fe3d3c06f43f0395a549",
+      "operations": [
+        {
+          "resource": "ssm:CREATES the lifecycle fence lease parameter /openclaw/lifecycle/fence-lease-sec with value 240. apply is guarded by a prior get-parameter so a re-run is an idempotent adopt rather than an overwrite of a value the operator raised on purpose. The value is refused below 210 at runtime (210 = the delete action's exec_sec budget), so a hand-edit under the floor silently does not take effect and the effective lease stays at the 240 default.",
+          "class": "AUTO_CLI",
+          "apply_cli": "aws ssm get-parameter --name /openclaw/lifecycle/fence-lease-sec --region \"$AWS_REGION\" --query Parameter.Value --output text > /tmp/lc3-lease-before 2>/dev/null || aws ssm put-parameter --region \"$AWS_REGION\" --name /openclaw/lifecycle/fence-lease-sec --type String --value 240 --description \"openclaw lifecycle fence lease in seconds; effective immediately, no stack update; read by the api and lifecycle-consumer functions with a 60s cache; lower bound 210s\"",
+          "verify_cli": "test \"$(aws ssm get-parameter --name /openclaw/lifecycle/fence-lease-sec --region \"$AWS_REGION\" --query Parameter.Value --output text)\" -ge 210",
+          "rollback_cli": "if [ -s /tmp/lc3-lease-before ]; then aws ssm put-parameter --overwrite --region \"$AWS_REGION\" --name /openclaw/lifecycle/fence-lease-sec --type String --value \"$(cat /tmp/lc3-lease-before)\"; else aws ssm delete-parameter --region \"$AWS_REGION\" --name /openclaw/lifecycle/fence-lease-sec; fi",
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": [
+            {
+              "stack": "OpenClawOrchestrator",
+              "logical_id": "LifecycleFenceLeaseSecE0451360",
+              "resource_type": "AWS::SSM::Parameter",
+              "change": "A"
+            }
+          ]
+        },
+        {
+          "resource": "iam:ADDS ssm:GetParameter on the fence-lease parameter to the control-plane API role. In the synthesized closure this grant lands in the role's OVERFLOW managed policy, not its default policy, and the overflow split also relocates the pre-existing ec2:DescribeLaunchTemplateVersions statement from overflow policy 1 to overflow policy 2 — a repackaging with no change in effective permissions. So both overflow policies show as modified while exactly one permission is new. On a live deployment the operator adds a small inline policy instead of reproducing the split, and must not remove ec2:DescribeLaunchTemplateVersions from wherever it currently sits. If this deployment also runs a lifecycle-consumer function, the same grant belongs on ITS role too: the consumer is the primary executor of async lifecycle actions, and the reference configuration used for this closure has the queue path off, so no consumer resource appears here.",
+          "class": "AUTO_CLI",
+          "apply_cli": "sed -e \"s/REGION/$AWS_REGION/\" -e \"s/ACCOUNT/$ACCOUNT/\" iam/lifecycle-fence-lease-param-read.json > /tmp/lc3-fence-param.json && aws iam put-role-policy --role-name \"$API_ROLE\" --policy-name lc3-lifecycle-fence-lease-param-read --policy-document file:///tmp/lc3-fence-param.json",
+          "verify_cli": "aws iam simulate-principal-policy --policy-source-arn \"arn:aws:iam::$ACCOUNT:role/$API_ROLE\" --action-names ssm:GetParameter --resource-arns \"arn:aws:ssm:$AWS_REGION:$ACCOUNT:parameter/openclaw/lifecycle/fence-lease-sec\" --query 'EvaluationResults[0].EvalDecision' --output text | grep -x allowed",
+          "rollback_cli": "RETAIN — do not remove. The grant is read-only and rolled-back code still reads the parameter; removing it turns a working fallback into an AccessDenied on every call. If it must go: aws iam delete-role-policy --role-name \"$API_ROLE\" --policy-name lc3-lifecycle-fence-lease-param-read",
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": [
+            {
+              "stack": "OpenClawOrchestrator",
+              "logical_id": "ApiHandlerServiceRoleOverflowPolicy147BA3B1F",
+              "resource_type": "AWS::IAM::ManagedPolicy",
+              "change": "M"
+            },
+            {
+              "stack": "OpenClawOrchestrator",
+              "logical_id": "ApiHandlerServiceRoleOverflowPolicy2251AABE8",
+              "resource_type": "AWS::IAM::ManagedPolicy",
+              "change": "M"
+            }
+          ]
+        },
+        {
+          "resource": "iam:ADDS ec2:DescribeInstances (resource \"*\", the only form EC2 Describe supports) to the health-check role, so host death is confirmed against EC2 instead of inferred from a missing or deleted hosts-table row. Without it the reaper falls back to the table clue and can write a terminal state for a tenant whose VM is still running.",
+          "class": "AUTO_CLI",
+          "apply_cli": "aws iam put-role-policy --role-name \"$HEALTH_ROLE\" --policy-name lc3-health-describe-instances --policy-document file://iam/health-describe-instances.json",
+          "verify_cli": "aws iam simulate-principal-policy --policy-source-arn \"arn:aws:iam::$ACCOUNT:role/$HEALTH_ROLE\" --action-names ec2:DescribeInstances --resource-arns '*' --query 'EvaluationResults[0].EvalDecision' --output text | grep -x allowed",
+          "rollback_cli": "RETAIN — read-only, and the rolled-back handler tolerates its absence only by falling back to the weaker clue. If it must go: aws iam delete-role-policy --role-name \"$HEALTH_ROLE\" --policy-name lc3-health-describe-instances",
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": [
+            {
+              "stack": "OpenClawOrchestrator",
+              "logical_id": "HealthCheckServiceRoleDefaultPolicyAE8FE253",
+              "resource_type": "AWS::IAM::Policy",
+              "change": "M"
+            }
+          ]
+        },
+        {
+          "resource": "lambda:REPLACES the control-plane API function's code with the seven patched api files overlaid onto the live package, then publishes a version and moves the live alias. The synthesized closure shows the function, its alias and a new CurrentVersion logical id replacing the old one — all three are consequences of one code change, applied by APPLY Step 2. Rollback must cover BOTH the alias and $LATEST, because an SQS event source mapping binds $LATEST and flipping the alias alone leaves that path on new code. If this deployment runs a separate lifecycle-consumer function on the same api source tree, apply the identical overlay to it.",
+          "class": "AUTO_CLI",
+          "apply_cli": "see APPLY-INSTRUCTIONS.md Step 2 — per-file overlay onto the downloaded live package, then aws lambda update-function-code --function-name \"$API_FN\" --zip-file fileb://lc3-$API_FN.zip, aws lambda wait function-updated, invoke-verify on FunctionError, then aws lambda update-alias --name live",
+          "verify_cli": "aws lambda invoke --function-name \"$API_FN\" --region \"$AWS_REGION\" --payload '{\"httpMethod\":\"GET\",\"path\":\"/ping\"}' --cli-binary-format raw-in-base64-out /dev/null --query FunctionError --output text | grep -x None",
+          "rollback_cli": "aws lambda update-alias --function-name \"$API_FN\" --name live --function-version \"$(cat backup-$API_FN.alias-version)\" && aws lambda update-function-code --function-name \"$API_FN\" --zip-file fileb://backup-$API_FN.zip",
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": [
+            {
+              "stack": "OpenClawOrchestrator",
+              "logical_id": "ApiHandler5E7490E8",
+              "resource_type": "AWS::Lambda::Function",
+              "change": "M"
+            },
+            {
+              "stack": "OpenClawOrchestrator",
+              "logical_id": "ApiHandlerLive539BAFFE",
+              "resource_type": "AWS::Lambda::Alias",
+              "change": "M"
+            },
+            {
+              "stack": "OpenClawOrchestrator",
+              "logical_id": "ApiHandlerCurrentVersion5C7F0A604e726c722ea5f64d229d15165fdbe5c8",
+              "resource_type": "AWS::Lambda::Version",
+              "change": "A"
+            },
+            {
+              "stack": "OpenClawOrchestrator",
+              "logical_id": "ApiHandlerCurrentVersion5C7F0A6036aa9f4cdb930457a6f8b7fba329ba9b",
+              "resource_type": "AWS::Lambda::Version",
+              "change": "D"
+            }
+          ]
+        },
+        {
+          "resource": "lambda:REPLACES the health-check function's handler.py with the patched file overlaid onto its live package. This function has no alias in the closure, so the code update is the whole operation.",
+          "class": "AUTO_CLI",
+          "apply_cli": "see APPLY-INSTRUCTIONS.md Step 2 with SRC=lambda/health_check — overlay, then aws lambda update-function-code --function-name \"$HEALTH_FN\" --zip-file fileb://lc3-$HEALTH_FN.zip, then aws lambda wait function-updated",
+          "verify_cli": "aws lambda get-function --function-name \"$HEALTH_FN\" --region \"$AWS_REGION\" --query Configuration.CodeSha256 --output text  # must differ from the value recorded in Step 1",
+          "rollback_cli": "aws lambda update-function-code --function-name \"$HEALTH_FN\" --zip-file fileb://backup-$HEALTH_FN.zip",
+          "artifact_refs": [],
+          "rollback_policy": "RESTORE",
+          "resource_refs": [
+            {
+              "stack": "OpenClawOrchestrator",
+              "logical_id": "HealthCheckA1C381C7",
+              "resource_type": "AWS::Lambda::Function",
+              "change": "M"
+            }
+          ]
+        },
+        {
+          "resource": "codebuild:the golden-image builder's source asset key moves from de2cc691a5c30dee024444f00a470cfebe32a8ea4bc2be196bd7386e55815155.zip to 3e8b29f5ddb53439740caa24bdb2704798112ec86f43b0c28d8f0826990a3309.zip, and the build role's read grant follows that key. The ONLY difference in both resources is that object key: the builder packages the repository tree, and this range changed files inside it. Nothing about the running system depends on it, and there is no safe CLI that re-points a CodeBuild source at an asset this kit does not upload. It is listed here rather than hidden so the operator knows the next golden-image bake must take its source from the patched tree; that bake, not this kit, is where the new key comes into existence. Requires operator review precisely because the correct action is to do nothing now.",
+          "class": "MANUAL_CLI_REVIEW",
+          "apply_cli": "NO-OP on the running system. Confirm by reading: aws codebuild batch-get-projects --names \"$GOLDEN_IMAGE_PROJECT\" --region \"$AWS_REGION\" --query 'projects[0].source.location' --output text — it still points at the pre-patch asset, which is correct until a new bake uploads one.",
+          "verify_cli": "aws codebuild batch-get-projects --names \"$GOLDEN_IMAGE_PROJECT\" --region \"$AWS_REGION\" --query 'projects[0].source.location' --output text  # unchanged by this kit; recorded so a later bake can be attributed",
+          "rollback_cli": "RETAIN — nothing was changed, so there is nothing to roll back.",
+          "artifact_refs": [],
+          "rollback_policy": "RETAIN",
+          "resource_refs": [
+            {
+              "stack": "OpenClawImage",
+              "logical_id": "GoldenImageBuildRoleDefaultPolicy94E47D88",
+              "resource_type": "AWS::IAM::Policy",
+              "change": "M"
+            },
+            {
+              "stack": "OpenClawImage",
+              "logical_id": "GoldenImageBuilderCEF13562",
+              "resource_type": "AWS::CodeBuild::Project",
+              "change": "M"
+            }
+          ]
+        }
+      ],
+      "fix_ids": [
+        "#680-fence-lease-ssm",
+        "#679-host-dead-authoritative"
+      ]
+    },
+    "docs/aws-guide/openapi.yaml": {
+      "change": "M",
+      "layer": "meta",
+      "artifact": null,
+      "artifact_status": "NOT_APPLICABLE",
+      "artifact_disposition": {
+        "kind": "INERT_METADATA",
+        "evidence": "path-derived-meta"
+      },
+      "base_sha256": "8998e2cf432083aad860adf105acb6be51f24a1cc530a1169dd5c86af68cb30f",
+      "patch_sha256": "dc1a8579297d9eba08318ae8c19bb5bd0eb61a611bc637ea6ff274f6bdd67356",
+      "operations": [
+        {
+          "resource": "doc:docs/aws-guide/openapi.yaml",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "git log -1 --format=%H -- docs/aws-guide/openapi.yaml",
+          "rollback_cli": "git checkout -- docs/aws-guide/openapi.yaml",
+          "artifact_refs": [],
+          "rollback_policy": "NONE",
+          "resource_refs": []
+        }
+      ],
+      "fix_ids": [
+        "egress-allow-validate-per-criterion"
+      ]
+    }
+  },
+  "fixes": [
+    {
+      "id": "#680-fence-lease-ssm",
+      "summary": "The lifecycle fence lease stops being a frozen Lambda env value and becomes SSM parameter /openclaw/lifecycle/fence-lease-sec (default 240s, hard floor 210s = the delete action's exec_sec budget), read per call with a 60s in-process cache. Before this, LIFECYCLE_FENCE_LEASE_SECONDS was baked at 1800s into a published Lambda version, so editing it had no effect on live traffic at all.",
+      "paths": [
+        "deploy/lambda/api/core/create_deadline.py",
+        "deploy/lambda/api/core/fence_config.py",
+        "deploy/lambda/api/core/lifecycle_fence.py",
+        "deploy/stacks/lambdas.py"
+      ],
+      "applies_when": "always for this kit: the api and lifecycle-consumer functions both read the new parameter, and both roles need ssm:GetParameter on it",
+      "params_changed": [
+        {
+          "name": "lifecycle fence lease seconds (SSM parameter /openclaw/lifecycle/fence-lease-sec)",
+          "layer": "D-cdk",
+          "old_default": "1800 (env LIFECYCLE_FENCE_LEASE_SECONDS, frozen on the published version)",
+          "new_default": "240 (create_deadline.FENCE_LEASE_DEFAULT_SEC), refuses any value below 210",
+          "runtime_impact": "A tenant whose lifecycle operation dies mid-flight is now re-takeable after 240s instead of 1800s, so a crashed worker no longer parks the tenant for half an hour. The floor exists because a lease shorter than a real operation gets that operation killed by its own host_guard (exit 79): for restart that leaves the VM stopped while status still reads running, and for delete the guard fires after delete-vm.sh so the VM and data disk are already gone. Raising the value is safe; lowering it below 210 is refused at synth and at runtime. Future hosts are unaffected (no LT or userdata change). Steady-state SSM read cost is about 0.8 TPS against a 40 TPS shared quota."
+        }
+      ],
+      "verification_ids": [
+        "V1",
+        "V2",
+        "V3"
+      ]
+    },
+    {
+      "id": "#680-client-token-reentry",
+      "summary": "client_token now derives a stable operation id for restart and delete, so re-entering with the same token reports progress as 202 with retry_after_sec instead of dispatching the destructive command a second time. A genuine conflict answers 409 carrying retry_after_sec, and acquire(allow_reentry=False) closes the non-atomic check-then-act window where two concurrent requests sharing one client_token could both obtain the same valid epoch and both dispatch.",
+      "paths": [
+        "deploy/lambda/api/core/lifecycle_fence.py",
+        "deploy/lambda/api/services/tenant_service.py"
+      ],
+      "applies_when": "always for this kit",
+      "params_changed": [],
+      "verification_ids": [
+        "V4",
+        "V5"
+      ]
+    },
+    {
+      "id": "#679-suspend-failed-split",
+      "summary": "A new suspend_failed state is split by whether a usable backup exists, so an operator can tell 'retry the suspend' from 'the data is safe, retry the restore'. delete from suspend_failed takes a no-ledger path (the host is gone, there is nothing to detach and the token was already returned), and the half that holds suspend_backup_key is allowed to restore.",
+      "paths": [
+        "deploy/lambda/api/services/tenant_service.py",
+        "deploy/lambda/health_check/handler.py"
+      ],
+      "applies_when": "always for this kit",
+      "params_changed": [],
+      "verification_ids": [
+        "V6"
+      ]
+    },
+    {
+      "id": "#679-restore-no-failed-terminal",
+      "summary": "restore has no failed terminal state. A pre-launch brake stops a doomed restore before it boots a VM, the deadline executor demotes the in-flight suspend/restore case to a recorder instead of flipping status to failed, and the reaper carries a restore compensation tier that releases a stuck reservation.",
+      "paths": [
+        "deploy/lambda/api/services/deadline_executor.py",
+        "deploy/lambda/api/services/tenant_service.py",
+        "deploy/lambda/health_check/handler.py"
+      ],
+      "applies_when": "always for this kit",
+      "params_changed": [
+        {
+          "name": "ENFORCED_QUIET_SEC (health_check env, code default)",
+          "layer": "C-lambda",
+          "old_default": "did not exist before this patch",
+          "new_default": "150 (env-overridable)",
+          "runtime_impact": "How long a fence-enforced tenant must stay quiet before the reaper settles it. Too low re-settles a tenant whose command is still in flight; the kit ships the code default and adds no Lambda env, so the effective value is 150s unless the operator sets the env deliberately."
+        },
+        {
+          "name": "ENFORCED_MAX_PER_SWEEP (health_check env, code default)",
+          "layer": "C-lambda",
+          "old_default": "did not exist before this patch",
+          "new_default": "2 (env-overridable)",
+          "runtime_impact": "Caps how many enforced tenants one reaper sweep settles, bounding the blast radius of a wrong verdict to two tenants per sweep. Raising it speeds convergence and widens that radius."
+        }
+      ],
+      "verification_ids": [
+        "V7"
+      ]
+    },
+    {
+      "id": "#679-host-dead-authoritative",
+      "summary": "Host death is confirmed against EC2 rather than inferred from a missing or deleted hosts-table row, because a row can be wrongly deleted while the machine is still alive — writing suspend_failed on that clue alone would mark a tenant with a live VM as terminal. The host termination cleaner now yields to a tenant that can still be recovered instead of reclaiming it, and a failed evacuation backup no longer counts as 'safe to reclaim'.",
+      "paths": [
+        "deploy/lambda/api/services/host_service.py",
+        "deploy/lambda/health_check/handler.py",
+        "deploy/stacks/lambdas.py"
+      ],
+      "applies_when": "always for this kit",
+      "params_changed": [],
+      "verification_ids": [
+        "V8"
+      ]
+    },
+    {
+      "id": "egress-allow-validate-per-criterion",
+      "summary": "POST /hosts/egress/allow/validate reports each unavailable protected-network criterion on its own line instead of one warning that only fired when every coordinate was missing. In an environment that derives TENANT_SUPERNET from VM_SUBNET_PREFIX but has no VPC_CIDR, the old warning could never appear, while 'the check that stops a hole covering the whole VPC is not running here' is exactly what the operator needs to know.",
+      "paths": [
+        "deploy/lambda/api/services/egress_admin_service.py",
+        "docs/aws-guide/openapi.yaml"
+      ],
+      "applies_when": "always for this kit",
+      "params_changed": [],
+      "verification_ids": [
+        "V9"
+      ]
+    },
+    {
+      "id": "cli-validator-prelaunch",
+      "summary": "The pre-launch validator ships as a first-class operator tool: it checks all 11 data-plane delivery channels plus control-plane drift and reports PASS / FAIL / NOT JUDGED per channel rather than one aggregate verdict. It reads live state only; it never writes. PR #229 added the channel and control-plane coverage and PR #234 dropped two unused imports and pointed the kits at this path.",
+      "paths": [
+        "cli/validator/README.md",
+        "cli/validator/checks/__init__.py",
+        "cli/validator/checks/blindspots.py",
+        "cli/validator/checks/channels.py",
+        "cli/validator/checks/consistency.py",
+        "cli/validator/checks/controlplane.py",
+        "cli/validator/checks/kitproof.py",
+        "cli/validator/checks/permissions.py",
+        "cli/validator/checks/scale.py",
+        "cli/validator/lib/__init__.py",
+        "cli/validator/lib/awsread.py",
+        "cli/validator/lib/comparison.py",
+        "cli/validator/lib/context.py",
+        "cli/validator/lib/discover.py",
+        "cli/validator/lib/result.py",
+        "cli/validator/lib/srcdefaults.py",
+        "cli/validator/oc-prelaunch-validate",
+        "cli/validator/test/__init__.py",
+        "cli/validator/test/test_channels.py",
+        "cli/validator/test/test_validator.py"
+      ],
+      "applies_when": "OPTIONAL — the operator decides. The 19 files are staged under lib/validator/ and run on the operator host with read-only credentials; they are not deployed to AWS and no other fix in this kit depends on them. Skipping the tool leaves every other fix fully applied.",
+      "params_changed": [],
+      "verification_ids": [
+        "V10"
+      ]
+    }
+  ],
+  "verifications": [
+    {
+      "id": "V1",
+      "fix_id": "#680-fence-lease-ssm",
+      "phase": "A-readonly",
+      "action": "aws ssm get-parameter --name /openclaw/lifecycle/fence-lease-sec --region $AWS_REGION --query Parameter.Value --output text",
+      "observable": "the parameter value",
+      "pass_when": "an integer >= 210 is returned (240 unless the operator raised it)",
+      "fail_when": "ParameterNotFound (the AUTO_CLI put-parameter step was skipped) or a value below 210 (a hand-edit below the floor; fence_config rejects it at runtime and falls back to 240, so the operator's intent silently does not apply)",
+      "timeout_s": 30,
+      "cleanup": "none (read-only)"
+    },
+    {
+      "id": "V2",
+      "fix_id": "#680-fence-lease-ssm",
+      "phase": "A-readonly",
+      "action": "aws iam simulate-principal-policy --policy-source-arn <api role arn> --action-names ssm:GetParameter --resource-arns arn:aws:ssm:$AWS_REGION:$ACCOUNT:parameter/openclaw/lifecycle/fence-lease-sec ; repeat for the lifecycle-consumer role",
+      "observable": "EvalDecision per role",
+      "pass_when": "allowed for BOTH the api role and the lifecycle-consumer role",
+      "fail_when": "implicitDeny on either role. The consumer is the primary executor of async lifecycle actions, so a missing grant there produces the worst shape: api reads the parameter while consumer silently falls back to the code default, and the two diverge the moment an operator edits the value. Note the IAM data plane can lag the simulator by minutes — re-run rather than trusting a single result.",
+      "timeout_s": 60,
+      "cleanup": "none (read-only)"
+    },
+    {
+      "id": "V3",
+      "fix_id": "#680-fence-lease-ssm",
+      "phase": "B-lifecycle",
+      "action": "Run one real POST /tenants/{id}/suspend, then read the api and lifecycle-consumer CloudWatch log groups for the fence_config source line emitted on that request id.",
+      "observable": "the effective lease value and its source as logged by fence_config",
+      "pass_when": "the logged effective value equals the SSM value from V1 with source=ssm",
+      "fail_when": "source=default or source=env, or an effective value of 1800 — the function is still running pre-patch bytes, or the alias was never flipped. Judge this from the log line, NOT from the tenant row's active_lifecycle_until: the production consumer renews that field while you are reading it, so the DDB value is not a stable measurement of the configured lease.",
+      "timeout_s": 600,
+      "cleanup": "resume the tenant, or delete it if it was created for this check"
+    },
+    {
+      "id": "V4",
+      "fix_id": "#680-client-token-reentry",
+      "phase": "B-lifecycle",
+      "action": "Send DELETE /tenants/{id} twice with the identical client_token, the second call while the first is still in flight; capture both HTTP statuses and bodies, then count the SSM SendCommand invocations for that tenant in CloudTrail.",
+      "observable": "the two HTTP responses and the SendCommand count",
+      "pass_when": "both calls answer 202, the second body carries retry_after_sec, and exactly ONE SendCommand was issued for the tenant",
+      "fail_when": "two SendCommand invocations (re-entry dispatched a second destructive command and the two can interleave around the unlocked sleep 2 window), or the second call answers 409 (the stable-op-id derivation from client_token is not active)",
+      "timeout_s": 900,
+      "cleanup": "the tenant is deleted by the action under test; confirm it reached deleted"
+    },
+    {
+      "id": "V5",
+      "fix_id": "#680-client-token-reentry",
+      "phase": "B-lifecycle",
+      "action": "While one lifecycle action holds the lease, send a DIFFERENT action for the same tenant with a different client_token and read the error body.",
+      "observable": "the 409 body",
+      "pass_when": "HTTP 409 whose body contains an integer retry_after_sec > 0",
+      "fail_when": "409 without retry_after_sec (pre-patch bytes), or 202 (the fence is not holding at all, which is a far worse finding than a missing field)",
+      "timeout_s": 300,
+      "cleanup": "let the in-flight action finish, then delete the tenant"
+    },
+    {
+      "id": "V6",
+      "fix_id": "#679-suspend-failed-split",
+      "phase": "B-optional",
+      "action": "Drive a tenant into suspend_failed by terminating its host mid-suspend, then read the tenant row and attempt the exit the row advertises: restore when suspend_backup_key is present, delete when it is not.",
+      "observable": "tenant status, suspend_backup_key presence, and the exit's outcome",
+      "pass_when": "status is suspend_failed, and the advertised exit succeeds: restore returns the tenant to running with its data disk intact, or delete reaches deleted without touching the capacity ledger a second time",
+      "fail_when": "the tenant has no exit (both restore and delete refuse), or delete double-debits the ledger, or restore is offered while suspend_backup_key is absent",
+      "timeout_s": 1800,
+      "cleanup": "delete the tenant by its exact id; confirm the real-tenant count is unchanged"
+    },
+    {
+      "id": "V7",
+      "fix_id": "#679-restore-no-failed-terminal",
+      "phase": "B-optional",
+      "action": "Force a restore past its deadline (a host that cannot serve it), then watch the tenant row and the reaper log across at least two sweeps.",
+      "observable": "tenant status transitions and the reaper's compensation decision",
+      "pass_when": "the tenant never lands on a restore_failed terminal state, the pre-launch brake stops it before a VM boots, and the reaper releases the stuck reservation",
+      "fail_when": "a VM boots for a doomed restore, or the reservation stays held after two sweeps, or status flips to failed. Watch for longer than one sweep interval — a window shorter than the retry cadence proves nothing.",
+      "timeout_s": 1800,
+      "cleanup": "delete the tenant by its exact id"
+    },
+    {
+      "id": "V8",
+      "fix_id": "#679-host-dead-authoritative",
+      "phase": "A-readonly",
+      "action": "aws iam simulate-principal-policy --policy-source-arn <health role arn> --action-names ec2:DescribeInstances --resource-arns '*'",
+      "observable": "EvalDecision",
+      "pass_when": "allowed",
+      "fail_when": "implicitDeny — _host_is_dead cannot reach EC2, so the reaper falls back to the hosts-table clue and can write suspend_failed for a tenant whose VM is still running",
+      "timeout_s": 60,
+      "cleanup": "none (read-only)"
+    },
+    {
+      "id": "V9",
+      "fix_id": "egress-allow-validate-per-criterion",
+      "phase": "A-readonly",
+      "action": "POST /hosts/egress/allow/validate with a /16 destination, in an environment whose api function has no VPC_CIDR/EGRESS_VPC_CIDR env, and read warnings[]",
+      "observable": "the warnings array",
+      "pass_when": "a warning naming VPC_CIDR/EGRESS_VPC_CIDR appears on its own, independent of whether TENANT_SUPERNET is configured",
+      "fail_when": "the single combined 'neither VPC_CIDR ... nor TENANT_SUPERNET' wording appears, or warnings is empty — pre-patch bytes, where the warning could not fire in an environment that derives TENANT_SUPERNET",
+      "timeout_s": 60,
+      "cleanup": "none — validate is a dry run and writes nothing"
+    },
+    {
+      "id": "V10",
+      "fix_id": "cli-validator-prelaunch",
+      "phase": "B-optional",
+      "action": "OPTIONAL, and last — run it only if you want an independent pre-launch sweep. Nothing in this kit depends on it. Offline first: python3 -m pytest lib/validator/test -q  (no AWS access needed). Then, if you choose to point it at the environment: lib/validator/oc-prelaunch-validate with read-only credentials.",
+      "observable": "the pytest summary and the per-channel verdict table",
+      "pass_when": "If you run it: pytest reports a non-zero passed count with zero failures, and the tool prints a verdict for each of the 11 delivery channels plus the control-plane drift check. Declining to run it is a valid outcome and does not block this kit.",
+      "fail_when": "zero tests collected or every test skipped (a green exit that proves nothing), or a channel silently absent from the table rather than reported NOT JUDGED",
+      "timeout_s": 900,
+      "cleanup": "none (read-only)"
+    }
+  ]
+}

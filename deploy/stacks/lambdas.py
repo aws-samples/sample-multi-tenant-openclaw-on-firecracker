@@ -386,6 +386,34 @@ def build_lambdas(self, ctx):
         "HOST_RESERVED_MEM": str(CFG["host"]["reserved_mem_mb"]),
         "CPU_OVERCOMMIT_RATIO": str(CFG["host"].get("cpu_overcommit_ratio", 1.0)),
         "MEM_OVERCOMMIT_RATIO": str(CFG["host"].get("mem_overcommit_ratio", 1.0)),
+        # #689 —— 降 `ssm:SendCommand` 调用率。两个值都是 #661 引入且**本来就支持 env 覆盖**
+        # (`core/clients.py` 里 `os.environ.get(..., "6")` / `(..., "0.5")`),所以这里只是把
+        # 这套部署的生效值显式钉下来,不动任何逻辑。
+        #
+        # `SPREAD_MAX_HOSTS_PER_BATCH` 限定一批 create 最多铺到几台 host,而**每台 host 一条
+        # SendCommand** —— 6 → 3 就是每批的命令条数减半。同一批租户改铺 3 台后,每台承接的
+        # 租户数随之翻倍(具体几个取决于批内租户数,不是固定值)。
+        # `HOST_SELECTION_SCORE_FLOOR` 是加权随机的分数下限:0.5 → 0.25 让低分 host 被选中的
+        # 概率更低,落点更集中,配合上面那条收窄铺开面。它不直接决定命令条数。
+        #
+        # **刻意不改 `core/clients.py` 的代码默认值**:那两个默认(6 / 0.5)是 #661 论证过的,
+        # 且 `tests/test_661_reserve_contention_adversarial.py` 有 `== 6` / `== 0.5` 的断言钉着。
+        # 要改的是「这套部署的生效值」,两者不该混;走 env 则那些断言保持绿,回退也只是改配置。
+        #
+        # 走 `CFG` 而不是写死:与相邻的 `AFFINITY_ENABLED` 同款形态,允许按环境覆盖;缺配时的
+        # 默认就是本 issue 的目标值,所以不新增 config 必填键。
+        #
+        # ⚠ 已知代价:落点更集中 → 单 host 冷启动排队更长。host 侧有 `OC_HOST_LAUNCH_SLOTS`
+        # (默认 30)的跨进程 flock 槽闸,一批压到一台上时尾部 VM 起得更晚;逼近 SSM
+        # `executionTimeout` 会踩「尾部假超时 → 回滚活 VM → 账本分叉」那类失败(见
+        # `DISPATCH_HOST_LAUNCH_CONCURRENCY` 处的说明)。验收看这一批端到端到 running 的
+        # **max**,不只看均值。
+        "SPREAD_MAX_HOSTS_PER_BATCH": str(
+            (CFG.get("scheduling", {}) or {}).get("spread_max_hosts_per_batch", 3)
+        ),
+        "HOST_SELECTION_SCORE_FLOOR": str(
+            (CFG.get("scheduling", {}) or {}).get("host_selection_score_floor", 0.25)
+        ),
         # #430 异构混池 — per-family 超卖比覆盖(JSON)、四级亲和排序、物理内存软门。
         # 全部空/关默认 → 逐字节回落既有行为(回退开关,不需回滚代码)。
         "OVERCOMMIT_BY_FAMILY": _json.dumps(

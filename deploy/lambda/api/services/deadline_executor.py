@@ -89,6 +89,7 @@ import core.scheduling as scheduling
 #
 # rebuild 也不在这里:它的在飞态**不是 status 值**,是 `rebuild_phase ∈
 # {queued,running,verifying}`(`tenant_service._REBUILD_INFLIGHT_PHASES`),
+# 所以它走下面单独一条 scan 分支。理由与 #309 那条一样:`status` 有四个消费方
 # (scaler 的 `_REFRESH_SKIP_STATUS`、`gsi_status` 查询、客户已在用的契约字段),
 # 为 rebuild 加一个 status 枚举值要同步改每一处,漏一处就是静默错误。
 _STATUS_ACTION: Dict[str, str] = {
@@ -145,6 +146,7 @@ _NO_INTERMEDIATE_STATUS = (
 #
 # 为什么不进 `status`:`status` 有四个消费方(scaler 的 `_REFRESH_SKIP_STATUS`、`gsi_status`
 # 查询键、客户已在用的契约字段),为它们各加一个枚举值要同步改每一处,漏一处就是静默错误
+# (`tenant_service` 的 #309 注释逐字论证过)。
 #
 # **`backup` 只翻 `backup_phase`,绝不翻 `status`**:一次备份失败不代表这个租户失败 ——
 # 它可能正在正常服务。把 `status` 翻成 `failed` 会让 scaler 与控制台把一个健康租户当故障。
@@ -434,13 +436,76 @@ def _fence_failed(
             s for s, a in _STATUS_ACTION.items() if a == action
         )
         if status in _intermediates:
-            update = (
-                f"SET #s = :failed, {reason_attr} = :reason, "
-                f"{create_deadline.fail_at_attr(action)} = :iso, "
-                "updated_at = :iso, deadline_enforced_at = :now"
-            )
-            condition = f"#s = :expected AND {dl_attr} = :dl"
-            names = {"#s": "status"}
+            if action in (
+                create_deadline.ACTION_SUSPEND, create_deadline.ACTION_RESTORE
+            ):
+                # #679 —— suspend/restore 在飞档退为**记录者**:不再翻 `status=failed`,
+                # 只落原因 + 时刻 + `deadline_enforced_at`。归位交给 reaper 的补偿矩阵
+                # (health_check `_reap_stuck_lifecycle` 的 enforced 分支):
+                #   suspend 档:VM 活 → 回正 `lifecycle_prev_status`;可收敛 → finalize
+                #   成 suspended(迟到成功);host 亡 → `suspend_failed`(按备份分两档)。
+                #   restore 档(MR2):VM 活+令牌在 → promote 成 running(迟到成功);
+                #   host 亡 / 确认无 VM → 释放预留 + 打回 `suspended`(数据在 S3 备份里
+                #   原封未动)。restore 从此**没有失败终态** —— 终局只有 running/suspended。
+                #
+                # 为什么敢拿掉"翻 failed":那个翻转此前是执行链的**隐式刹车**(后续锚
+                # 中间态的条件写会 CCF 中止)。#679 换成了**显式刹车** ——
+                # `_suspend_finish` 在发 stop-vm 之前、`_tenant_restore` 在发 launch-vm
+                # 之前强一致读本字段,判死即停手(tenant_service
+                # `_deadline_brake_engaged`)。围栏落下本字段起执行者不再发出任何新命令;
+                # 已在飞的最后一条命令受 SSM executionTimeout 界住(≤120s),所以 reaper
+                # 只在 `enforced_at + 150s` 静默期之后归位,不会被迟到命令打脸。
+                if deadline is not None:
+                    update = (
+                        f"SET {reason_attr} = :reason, "
+                        f"{create_deadline.fail_at_attr(action)} = :iso, "
+                        # `deadline_enforced_for` 是轮次锚(Codex 实现评审 #1):执行者的
+                        # 刹车只认「for == 自己手里的 deadline」;执行者与围栏赛跑、执行者
+                        # 赢下收尾时留下的残留记录(for 属旧轮)对新一轮自动无效。
+                        "deadline_enforced_at = :now, deadline_enforced_for = :dl"
+                    )
+                    # 锚 status=中间态 + 死线:行已被执行者合法翻走(收尾成功/回滚)时
+                    # CCF → raced,不写 —— 「晚到的判决不覆盖新事实」。
+                    #
+                    # 第三段锚是**同轮幂等**(2026-08-29 真机验收抓出的缺陷):judge 每拍
+                    # 都会重扫「中间态 + 过期死线」的行,没有这段锚,本 update 每拍
+                    # restamp `deadline_enforced_at = :now` —— 补偿矩阵的静默期
+                    # (enforced+150s)被滚动重置,**永远等不满**,归位永不发生(真机两行
+                    # 卡死 20+ 分钟实证)。形态照 delete 档的
+                    # attribute_not_exists(delete_reported_failed_at)(「同一次操作在
+                    # 多轮里只回报一次」),但必须按**轮次**分道而不是全局一次:执行者
+                    # 赢下收尾留下的残留记录(for 属旧轮)不能挡住新一轮的首次记录 ——
+                    # for <> :dl 时放行覆盖,for == :dl(本轮已记录)才跳过。
+                    condition = (
+                        f"#s = :expected AND {dl_attr} = :dl AND ("
+                        "attribute_not_exists(deadline_enforced_at) OR "
+                        "deadline_enforced_for <> :dl)"
+                    )
+                else:
+                    # G6 老消息(行上/消息里都没有死线,投递预算耗尽触发):没有轮次可
+                    # 锚,enforced_for 写不了(:dl 是 None,塞进表达式即 ValidationError)。
+                    # 幂等锚退化为全局一次(attribute_not_exists);刹车对「无死线消息撞
+                    # 判死记录」本就 fail-closed(_deadline_brake_engaged 的老消息分支),
+                    # 语义闭合。条件里刻意没有 `{dl_attr} = :dl` 片段,下方 G6 的通用摘锚
+                    # 对本形态是 no-op。
+                    update = (
+                        f"SET {reason_attr} = :reason, "
+                        f"{create_deadline.fail_at_attr(action)} = :iso, "
+                        "deadline_enforced_at = :now"
+                    )
+                    condition = (
+                        "#s = :expected AND "
+                        "attribute_not_exists(deadline_enforced_at)"
+                    )
+                names = {"#s": "status"}
+            else:
+                update = (
+                    f"SET #s = :failed, {reason_attr} = :reason, "
+                    f"{create_deadline.fail_at_attr(action)} = :iso, "
+                    "updated_at = :iso, deadline_enforced_at = :now"
+                )
+                condition = f"#s = :expected AND {dl_attr} = :dl"
+                names = {"#s": "status"}
         elif status in _ENTRY_STATUSES.get(action, ()):
             # #663 —— 这次还没进中间态,与 #604 start「永远没有中间态」同理:把健康租户
             # 标 failed 比不判死更糟。status 锚仍必须保留,写入前若 CAS 进中间态就让 CCF
@@ -529,7 +594,10 @@ def _fence_failed(
         print(
             f"[#564] deadline-enforced {tid}: action={action} from={expected} "
             f"reason={reason} deadline={deadline} now={now_epoch} "
-            f"late_by={int(now_epoch) - int(deadline)}s"
+            # deadline=None(G6 老消息,预算耗尽触发)没有 late_by 可算 —— int(None)
+            # 会让一次已经成功的条件写在打日志时抛 TypeError,把 fenced 变成 error。
+            + (f"late_by={int(now_epoch) - int(deadline)}s"
+               if deadline is not None else "late_by=n/a(no deadline)")
             + (
                 " (delete 继续进行,只回报失败)"
                 if action == create_deadline.ACTION_DELETE

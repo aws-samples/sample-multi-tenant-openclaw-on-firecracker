@@ -186,7 +186,6 @@ def build_lambdas(self, ctx):
         for _st in ec2_policy_statements:
             fn.add_to_role_policy(_st)
 
-    # ========== SNS Lifecycle Notifications (issue #13, optional) ==========
     notif_cfg = CFG.get("notifications", {}) or {}
     notifications_topic = None
     notifications_topic_arn = ""
@@ -484,6 +483,38 @@ def build_lambdas(self, ctx):
     # 是快照,而 `CREATE_VIA_QUEUE` 就是在两次快照之间加的 —— 所以只有 consumer 拿到它。
     # 加在这里两个 Lambda 才都有。
     _dl_cfg = (CFG.get("lifecycle") or {}).get("deadline_sec") or {}
+    _fence_lease_cfg = (CFG.get("lifecycle") or {}).get("fence_lease_sec")
+
+    def _fence_lease_sec_for_deploy() -> int:
+        """#680 —— 要注入的租约秒数:config 写了就用它,没写用 `fence_config` 的权威默认。
+
+        与 `_deadline_sec_for_deploy` 逐条同款纪律:**synth 期就判死,不做宽容转换**。
+        宽容转换在这里的后果更直接 —— 租约值偏小不是"变慢",是**每次操作都在执行中途被
+        自己的租约过期斩断**(host_guard 判 epoch/owner 不符 → exit 79;对 restart 而言
+        就是 stop 已跑、launch 被拦,VM 停着而 status 还是 running)。
+
+        下界 60 与运行时那份是**同一个来源**(`fence_config.MIN_LEASE_SECONDS`),不在这里
+        另写一个数字 —— 两处各写一份就会出现「synth 放行、运行时拒绝」的静默分叉。
+        """
+        _default = int(_create_deadline.FENCE_LEASE_DEFAULT_SEC)
+        if _fence_lease_cfg is None:
+            return _default
+        raw = _fence_lease_cfg
+        # bool 先排:它是 int 的子类,`True` 会变成 1 秒租约。
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise ValueError(
+                f"config.yml lifecycle.fence_lease_sec={raw!r} is not an integer"
+            )
+        if raw < int(_create_deadline.FENCE_LEASE_MIN_SEC):
+            raise ValueError(
+                f"config.yml lifecycle.fence_lease_sec={raw} is below the hard "
+                f"lower bound {_create_deadline.FENCE_LEASE_MIN_SEC}s. Measured "
+                "lease_hold upper bound is 46.53s (6.3GB suspend, "
+                "ap-southeast-1, #680); a lease shorter than a real operation "
+                "gets that operation killed mid-flight by its own host_guard."
+            )
+        return raw
+
 
     def _deadline_sec_for_deploy(action: str) -> int:
         """该档要注入的秒数:config 写了就用 config,没写用模块的权威默认。
@@ -555,6 +586,32 @@ def build_lambdas(self, ctx):
                 "cdk deploy resets it to config.yml lifecycle.deadline_sec."
             ),
         )
+
+    # #680 —— 生命周期**租约**秒数的参数。与上面八档死线同一条理由(env 在 published
+    # version 上是冻结的,改 `$LATEST` 完全不生效 —— 本轮真机实测:给 `$LATEST` 加一个探针
+    # env,live 指向的 version 98 的 env 一个字没变)。
+    #
+    # **独立参数、不并进 deadline-sec 前缀**:那个前缀的语义是「每个动作的死线」,
+    # 由 `deadline_config._fetch_all()` 用 by-path 整段取回并对不认识的名字一律跳过;
+    # 租约不是「某个动作的死线」而是所有 fenced 动作共用的一个值。塞进去会同时污染语义与
+    # 那段在役读路径。配额算术见 `core/fence_config.py` 的模块 docstring(合计约 2.1 TPS,
+    # 池 40 TPS)。
+    ssm.StringParameter(
+        self,
+        "LifecycleFenceLeaseSec",
+        parameter_name=_create_deadline.FENCE_LEASE_PARAM_NAME,
+        string_value=str(_fence_lease_sec_for_deploy()),
+        description=(
+            "openclaw lifecycle fence lease in seconds (#680). Edit with "
+            "`aws ssm put-parameter --overwrite` for an immediate effect (no "
+            "redeploy). Read by api/lifecycle-consumer via core/fence_config.py "
+            "with a 60s in-process cache. Lower bound is 60s: measured lease_hold "
+            "upper bound is 46.53s (6.3GB suspend, ap-southeast-1), and a lease "
+            "shorter than a real operation gets that operation killed mid-flight "
+            "by its own host_guard. cdk deploy resets it to "
+            "config.yml lifecycle.fence_lease_sec."
+        ),
+    )
 
     api_fn = _lambda.Function(
         self,
@@ -651,7 +708,6 @@ def build_lambdas(self, ctx):
     hosts_table.grant_read_write_data(api_fn)
     groups_table.grant_read_write_data(api_fn)
     version_snapshots_table.grant_read_data(api_fn)  # #217 V2 — pull-image 只读快照
-    # #376 — create_image_snapshot 落新快照:只加 PutItem(最小权限,不给 Delete/Update)。
     version_snapshots_table.grant(api_fn, "dynamodb:PutItem")
     # #394 — delete_image_snapshot 是【软删】(status=deleted 标记),用 UpdateItem 打标而非
     # 物删,故加 UpdateItem。不给 DeleteItem(软删不物理删,记录留档可审计/可恢复)。
@@ -720,13 +776,11 @@ def build_lambdas(self, ctx):
     if clawpool_rsa_cmk is not None:
         api_fn.add_environment("CLAWPOOL_RSA_CMK_ARN", clawpool_rsa_cmk.key_arn)
         clawpool_rsa_cmk.grant(api_fn, "kms:GetPublicKey")
-    # Issue #17 — api Lambda writes audits and reads them back via GET /audit-log
     audit_table.grant_read_write_data(api_fn)
     # PRD #54 — async batch jobs: read/write the job ledger, and self-invoke
     # asynchronously to run the worker (same function, routed by a marker in
     # the event payload — no separate Lambda to keep the blast radius small).
     batch_jobs_table.grant_read_write_data(api_fn)
-    # #97 档A — /tenantmatch only reads the IdP map (least privilege: read-only).
     tenant_idp_table.grant_read_data(api_fn)
     # #187 P1 / #149 出站 — control-plane mints the per-tenant gateway token +
     # device identity ciphertext (SPEC/11-ENGINE-TRANSFORM · INTERFACE-CONTRACT §5).
@@ -777,6 +831,17 @@ def build_lambdas(self, ctx):
         ],
     )
     api_fn.add_to_role_policy(_dl_param_policy)
+    # #680 —— 租约参数用 `GetParameter` 单读(只有一个参数,by-path 在这里没有优势),
+    # 所以 action 与上面那条不同,必须单独授权。少了它,`fence_config` 每次都吃
+    # AccessDenied → 回落默认 → 运维改参数永远不生效,而日志里只有一行回落提示。
+    _fence_param_policy = iam.PolicyStatement(
+        actions=["ssm:GetParameter"],
+        resources=[
+            f"arn:aws:ssm:{self.region}:{self.account}:"
+            f"parameter{_create_deadline.FENCE_LEASE_PARAM_NAME}"
+        ],
+    )
+    api_fn.add_to_role_policy(_fence_param_policy)
     if clawpool_cmk is not None:
         clawpool_cmk.grant_encrypt_decrypt(api_fn)
         api_fn.add_to_role_policy(
@@ -973,7 +1038,6 @@ def build_lambdas(self, ctx):
         groups_table.grant_read_write_data(lifecycle_consumer)
         audit_table.grant_read_write_data(lifecycle_consumer)
         batch_jobs_table.grant_read_write_data(lifecycle_consumer)
-        # #413 P1/P2 — rebuild attempts/results share the image-ops ledger.
         image_jobs_table.grant_read_write_data(lifecycle_consumer)
         # #187 P1 — consumer replays create_tenant which now mints gateway token.
         # Same grants as api_fn (secrets table r/w + CMK encrypt + GenerateRandom).
@@ -1033,6 +1097,11 @@ def build_lambdas(self, ctx):
         # AccessDenied 后静默回落默认值 —— 客户改了参数、api 侧生效了、consumer 侧没生效,
         # 而两边跑的是同一份代码,日志上极难看出来。资源同样精确到死线前缀(穿透风险见上)。
         lifecycle_consumer.add_to_role_policy(_dl_param_policy)
+        # #680 —— consumer 是异步 lifecycle 动作的**主要执行者**(suspend/restore/
+        # restart/delete 都在它里面取租约),所以它比 api_fn 更需要这条。少了它
+        # 会得到最坏的一种形态:api 侧按参数取 120s 租约、consumer 侧回落 120s
+        # 默认(恰好同值所以看不出来),而运维一改参数两边立刻分叉。
+        lifecycle_consumer.add_to_role_policy(_fence_param_policy)
         lifecycle_queue.grant_consume_messages(lifecycle_consumer)
         # consumer emits the create-latency SLA metric on the create path.
         # #432 —— namespace 条件同 api_fn 一并加上 OpenClaw/Dispatch:consumer 走
@@ -1172,7 +1241,6 @@ def build_lambdas(self, ctx):
     # via DELETE /skills/{name}.
     assets_bucket.grant_put(api_fn)
     assets_bucket.grant_delete(api_fn)
-    # Issue #13 — allow publishing tenant lifecycle events
     if notifications_topic is not None:
         notifications_topic.grant_publish(api_fn)
     # #62 IAM 收窄:ssm_policy + ec2_policy 各拆成多条 statement,
@@ -1463,7 +1531,6 @@ def build_lambdas(self, ctx):
             )
             _pplan.add_api_key(_pkey)
 
-    # ========== WAF (issue #7, optional) ==========
     waf_cfg = CFG.get("waf", {}) or {}
     if waf_cfg.get("enabled", False):
         rate_limit = int(waf_cfg.get("rate_limit_per_ip", 1000))
@@ -1792,10 +1859,8 @@ def build_lambdas(self, ctx):
     # 只作用一台 host。Admin op (x-api-key)。
     pull_image_resource = host_resource.add_resource("pull-image")
     pull_image_resource.add_method("POST", _li(), **key_required)
-    # #309 — GET /hosts/{instance_id}/pull-image-progress:tail host 上 /tmp/<job_id>.txt。
     pull_image_progress_resource = host_resource.add_resource("pull-image-progress")
     pull_image_progress_resource.add_method("GET", _li(), **key_required)
-    # #309 — POST /hosts/{instance_id}/copy-file-from-s3:单文件 S3→EC2(目标限资产目录白名单)。
     copy_file_resource = host_resource.add_resource("copy-file-from-s3")
     copy_file_resource.add_method("POST", _li(), **key_required)
     # #394 step5 — 同步槽位操作(admin-only,handler 内 identity 门):只改 host 上 slots.json
@@ -1837,7 +1902,6 @@ def build_lambdas(self, ctx):
     create_snapshot_resource = api.root.add_resource("create-image-snapshot")
     create_snapshot_resource.add_method("POST", _li(), **key_required)
 
-    # 1.4.0 (#62) — Groups CRUD endpoints
     groups_resource = api.root.add_resource("groups")
     groups_resource.add_method("GET", _li(), **key_required)
     groups_resource.add_method("POST", _li(), **key_required)
@@ -1847,7 +1911,6 @@ def build_lambdas(self, ctx):
     group_skill_resource = group_skills_resource.add_resource("{skill}")
     group_skill_resource.add_method("DELETE", _li(), **key_required)
 
-    # Issue #23 — batch operations: POST /batch/tenants
     batch_resource = api.root.add_resource("batch")
     batch_tenants_resource = batch_resource.add_resource("tenants")
     batch_tenants_resource.add_method("POST", _li(), **key_required)
@@ -2058,6 +2121,16 @@ def build_lambdas(self, ctx):
             resources=["*"],
         )
     )
+    # #679 —— 补偿矩阵的「host 亡」档需要 EC2 权威确认(hosts 表行 deleted/缺失只是线索:
+    # 行可能被误删而机器还活着,凭它就写 suspend_failed 会把有活 VM 的租户标成终态 ——
+    # #268 的谎报形态)。只挂 health_fn、不进共享组,理由与上一条 DescribeInstanceInformation
+    # 逐字相同;Describe* 不支持资源级 IAM,resources=["*"],纯只读。
+    health_fn.add_to_role_policy(
+        iam.PolicyStatement(
+            actions=["ec2:DescribeInstances"],
+            resources=["*"],
+        )
+    )
 
     events.Rule(
         self,
@@ -2080,20 +2153,17 @@ def build_lambdas(self, ctx):
         memory_size=2048,
         environment={
             "ASSETS_BUCKET": assets_bucket.bucket_name,
-            # 1.4.0 (#62) — needed for ?tenant=... per-tenant scope filtering
             "TENANTS_TABLE": tenants_table.table_name,
             "GROUPS_TABLE": groups_table.table_name,
         },
     )
     assets_bucket.grant_read(skills_fn)
-    # 1.4.0 (#62) — read-only access to compute effective skill sets
     tenants_table.grant_read_data(skills_fn)
     groups_table.grant_read_data(skills_fn)
     skills_resource = api.root.add_resource("skills")
     skills_resource.add_method(
         "GET", apigw.LambdaIntegration(skills_fn), **key_required
     )
-    # 1.4.1 (#63) — per-skill CRUD goes through api Lambda (reuses RBAC + audit log)
     skill_resource = skills_resource.add_resource("{name}")
     skill_resource.add_method("GET", _li(), **key_required)
     skill_resource.add_method("PUT", _li(), **key_required)
@@ -2142,7 +2212,6 @@ def build_lambdas(self, ctx):
             "TENANTS_TABLE": tenants_table.table_name,
             "ASG_NAME": "openclaw-hosts-asg",
             "IDLE_TIMEOUT_MINUTES": str(CFG["scaler"]["idle_timeout_minutes"]),
-            # task #21 — seamless rolling image refresh (gated OFF until verified)
             "IMAGE_REFRESH_ENABLED": str(
                 CFG.get("scaler", {}).get("image_refresh_enabled", False)
             ).lower(),
@@ -2155,7 +2224,6 @@ def build_lambdas(self, ctx):
             "ASSETS_BUCKET": assets_bucket.bucket_name,
             "ROOTFS_PREFIX": CFG["s3"]["rootfs_prefix"],
             "BACKUP_PREFIX": CFG["s3"]["backup_prefix"],
-            # 10h-goal #17 — reserve-capacity warm pool (gated OFF until verified)
             "RESERVE_ENABLED": str(
                 CFG.get("scaler", {}).get("reserve_enabled", False)
             ).lower(),
@@ -2170,12 +2238,10 @@ def build_lambdas(self, ctx):
         },
     )
     hosts_table.grant_read_write_data(scaler_fn)
-    # Issue #15 — TTL processing reads tenants and updates status (stop/delete)
     tenants_table.grant_read_write_data(scaler_fn)
     # #62 IAM 收窄:SSM 拆多 statement;stop-vm.sh 走 SSM SendCommand,
     # instance ARN 带 Project=openclaw/Role=metal-host 条件。
     _attach_ssm_policies(scaler_fn)
-    # task #21 — read rootfs manifest (current golden version) for refresh
     assets_bucket.grant_read(scaler_fn)
     scaler_fn.add_to_role_policy(
         iam.PolicyStatement(

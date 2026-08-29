@@ -47,6 +47,7 @@ def _public_hosts(items):
     # must not appear in user-facing host lists.
     items = [h for h in items if not str(h.get("instance_id", "")).startswith("__")]
     for item in items:
+        # #462 —— 每台报【它自己机型的生效比例】,不是全局默认值。原先无条件盖全局值:
         # 一旦某个 family 有覆盖(overcommit_by_family),GET /hosts(无参 / 分页 /
         # ip 过滤三种形态都经这里)就对那批机器报【错的数】,而调度侧的放置调用点早已走
         # host_profile.ratios。运维拿 API 的读数去核对"这台还能放多少",算出来的与调度器
@@ -221,11 +222,13 @@ def _upsert_host_row(
     """
     item = {
         "instance_id": instance_id,
+        # #430 — 机型落库,供调度侧四级亲和排序(r8g>r7g>m8g>m7g)。instance_type
         # 上面已从 describe_instances 取到(只用于查内存),这里一并持久化;缺失回落
         # "unknown"(DDB 的 S 不接受空串),排序侧对未知 family 落表尾。
         "instance_type": instance_type or "unknown",
         "private_ip": private_ip,
         "az": az,
+        # #430 — 按【标称规格】注册,与 init-host.sh 的自注册路径同口径。
         # 这两个值本来就是标称的:CoreCount×ThreadsPerCore 与
         # describe_instance_types 的 MemoryInfo.SizeInMiB 都是广告值。此前又扣
         # HOST_RESERVED_*,于是同一台机器走 API 注册比走 init-host.sh 少一截容量,
@@ -325,12 +328,16 @@ def register_host(body):
     # advertised RAM; we fall back to a heuristic only if the API errors.
     mem_total = _resolve_instance_memory_mb(ec2, instance_type)
 
+    # #470/#26 (defensive) — POST /hosts is the API register path, SEPARATE from
     # init-host.sh, which self-registers via a direct DDB put and already stamps
     # rootfs_version from the manifest it pulled. This API path left the field
     # unset, so a host registered here carried no version for tenants to inherit.
     # Stamp it from the live S3 manifest (same source as GET /hosts/rootfs-version)
+    # as a defensive complement. NOTE: bug #26's actual fix for the default
+    # queued-create path is dispatch_service's reserve txn (#411/6.2, already in
     # bb); this only covers hosts registered through the API. Omit on unknown/empty
     # rather than writing "" — DDB rejects empty S and an empty value would falsely
+    # claim "no version" (matches the #343/#304 non-empty-only rule).
     _boot_manifest = _get_manifest() or {}
     rootfs_version = _boot_manifest.get("version", "")
     # #517 阶段1 —— 同源(manifest.version)派生 immutable_version,但只在 manifest 点名了
@@ -340,6 +347,7 @@ def register_host(body):
         rootfs_version if _boot_manifest.get("immutable") else ""
     )
     # #491 — 写入走重入安全的 upsert(条件 put + CCF 分支只刷静态字段、if_not_exists 补账本)。
+    # 与 #470 的合流:rootfs_version 作为静态字段一并传下去,由 upsert 决定首启写入还是重入刷新。
     _upsert_host_row(
         instance_id,
         instance_type,
@@ -354,6 +362,7 @@ def register_host(body):
 
 
 def deregister_host(instance_id):
+    # #394(ADR §6.4)—— 正被镜像操作独占的 host 不得直接下线:pull/promote 写到一半被
     # terminate 会留下"控制面以为装好了、机器已不存在"的不可对账状态。持有【有效】lease
     # 时拒绝(过期 lease 不拦:那台机器上的操作早已死掉,不该永久挡住运维回收)。
     lease = image_lease.read(instance_id)
@@ -464,6 +473,7 @@ def _backup_tenant_for_evacuation(tenant):
     tid = tenant["id"]
     try:
         # #565 G1-a —— 第三处同步备份站点。issue 的分析表只点了 delete 与 suspend 两处,
+        # 但验收判据 #2 是全仓口径(「rg 证明不再有裸 boto3.client("lambda") 做长同步
         # invoke」),所以这里同样要显式给 Config。取值与"不重试"的理由见
         # core/clients.BACKUP_SYNC_INVOKE_CONFIG。
         lambda_client = boto3.client(
@@ -512,10 +522,32 @@ def _write_terminated_tenant_state(tenant, ok, backup_key, err):
         )
         print(f"cleanup_terminated_host: tenant {tid} queued from {backup_key}")
         return True
+    # #679(2026-08-29 真机验收抓出,no-data-loss)—— 「本次急救备份失败」不等于
+    # 「数据不可恢复」:suspend 链的租户盘是**按语义**被回收的(stop→backup→rm),行上
+    # 留有完好的 S3 备份指针。两类租户绝不能在这里删:
+    #   · 行上有 `suspend_backup_key`(suspend 阶段快照)或 `restore_backup_key`
+    #     (suspended 的数据指针)—— 数据在 S3 原封未动,删除 = 把数据完好的租户判死。
+    #     真机实证:形态③的租户(真备份完成后拼回 suspending)被本分支误删,而它的
+    #     备份可整只恢复。suspended 租户行仍带 host_id,host 缩容时同样会被扫进来 ——
+    #     同一判据一并救下。
+    #   · 行上有 `deadline_enforced_at`(围栏判死过)—— #679 补偿矩阵是它唯一的归位者
+    #     (host 亡档 → 原语 B → `suspend_failed` 按备份分两档,消费令牌、保数据指针),
+    #     这里抢跑会把矩阵承诺的可行动终态变成粗暴的 deleted。
+    # 让位不是不管:suspending+enforced 由矩阵在 150s 静默期后归位;无 enforced 的
+    # 卡死行走旧 stuck 路径(mark → P2 force 出口)。
+    _snap = tenant.get("suspend_backup_key") or tenant.get("restore_backup_key")
+    if _snap or tenant.get("deadline_enforced_at") is not None:
+        print(
+            f"cleanup_terminated_host: tenant {tid} keeps its recoverable snapshot "
+            f"(snap={bool(_snap)} enforced={tenant.get('deadline_enforced_at') is not None}); "
+            "NOT deleting — yielding to the reaper compensation matrix / stuck path"
+        )
+        return False
     print(
         f"CRITICAL cleanup_terminated_host: tenant {tid} backup unusable ({err}); "
         "marking deleted to avoid a false recovery onto a blank disk"
     )
+    # #187 转型:legacy_alb rule 已下线,两级路由无需再摘 per-tenant rule。
     # #501 — host 终止撤租户也是终态写入点:健康位由 health_check sweep 写而 sweep 只扫
     # running,不清就永久停在删除前的 up,已删租户伪装成健康在役租户误导排障。
     # #593 —— 同理清 q_rootfs_version(gsi_rootfs_version 投影键):不清则该软删租户永久留在
@@ -630,6 +662,7 @@ def cleanup_terminated_host(event):
     print(f"cleanup_terminated_host: {instance_id}")
 
     # terminating host 的数据盘会随实例销毁；逐租户备份，避免例行 refresh 删除活租户。
+    # #432 —— 必须翻页。这是【本次审计里后果最重的一处】:host 被 terminate 时靠它找出
     # 还在那台上的租户去疏散。漏掉 1MB 之后的页 = 那些租户被【静默留在一台已终止的机器上】
     # —— 账本里它们还指着 host_id,而机器没了。这属于 no-data-loss 面,不是性能问题。
     # openclaw-tenants 实测 6790 行 / 2.83MB,已经【超过】1MB 近三倍 —— 也就是说这一处
@@ -657,6 +690,7 @@ def cleanup_terminated_host(event):
 
 
     # Delete host
+    # #447 —— status 与容量账本必须同一写归零:拆成两次会短暂出现 deleted 仍被计数,
     # 且第二次写可独立失败。next_vm_num 刻意保留单调值,它是物理 tap 防复用的权威,
     # 清零会让仍可能被引用的 tap 号重新发出。
     hosts_table.update_item(
@@ -842,6 +876,7 @@ def _select_pull_files(bucket, files):
     if manifest_entry is None:
         return [], "snapshot has no manifest.json under deployment/rootfs/", "", ""
     # 读快照的 manifest(精确 VersionId),拿它点名的 3 个盘文件名。
+    # #333(codex round-final)"null" 是【真实 VersionId】,不是"无版本"哨兵:versioning 开启前
     # 上传的对象,其 VersionId 字面就是 "null",要拿【那一版】必须显式传 VersionId="null";省略
     # 会读【最新版】(可能是后来 re-upload 的新版)→ manifest(版本选择器)与盘下载路径(line 885
     # 一律传 "null")读到不同版本,装错版本。故只在【真的没记 version_id】(空/None)时才省略;
@@ -854,6 +889,7 @@ def _select_pull_files(bucket, files):
         manifest = json.loads(s3.get_object(**get_kw)["Body"].read().decode())
     except Exception as e:
         return [], f"cannot read snapshot manifest.json: {e}", "", ""
+    # #333 — kind 从 manifest 的【字段名】派生(唯一真相源),不再从文件名正则猜:
     # manifest 每个 field(rootfs/data_template/immutable)→ value(该盘的源文件名)。
     # 给选中的盘打 f["disk_kind"],下游装/备份/进度全读它,文件名不再被强制 openclaw-<kind>- 格式。
     # 但文件名会被插进下发到 host 的 shell(日志/_perr),故必须校验安全字符集(防 codex review
@@ -888,6 +924,7 @@ def _select_pull_files(bucket, files):
     missing = set(named) - picked
     if missing:
         return [], f"manifest names disks absent from snapshot: {sorted(missing)}", "", ""
+    # #343 — 返回 manifest 的 version(权威:本函数是读 manifest 的唯一处),供 pull 成功后
     # 写进 host.rootfs_version。rootfs_version 语义 = 这台 host 装的 rootfs 盘版本,故:
     #   · manifest 点名了 rootfs 盘 → 本次装了新 rootfs,【必须】有合法非空版本号才写(codex
     #     review:缺失/null/非字符串则装了新 rootfs 却谎报旧版本 = 原 bug,fail-loud 拒装,
@@ -989,6 +1026,7 @@ def refresh_rootfs():
     region = os.environ.get("AWS_REGION", "ap-northeast-1")
     version = manifest["version"]
 
+    # #432 —— 必须翻页。漏掉后页的 host 就是「刷镜像少刷了一批」,而返回值里的 updated
     # 计数照样是成功的样子 —— 静默漏刷比报错更难查。
     # 注:这里刻意保持返回 list(而不是生成器),因为下一行就是 `if not hosts:` ——
     # 生成器恒为真,那条「没有 active host」的分支会永远进不去(见 core/ddb_scan.py 的说明)。
@@ -1123,6 +1161,7 @@ fi
     )
 
 
+# #309 V1 — pull_image 只拉 deployment/rootfs/ 前缀:镜像三盘
 # (openclaw-{rootfs,data-template,immutable}-<VER>.ext4.gz)+ manifest.json 版本指针。
 # 快照【记录】整个 deployment/(全记不漏),但 pull_image 拉到 host 时【只拉镜像盘那类】。
 # deployment/scripts/(host-agent/route_ops/launch-vm 等)由 init-host.sh 开机各自 aws s3 cp
@@ -1130,10 +1169,12 @@ fi
 # deployment/{edge,litellm,monitoring}/ 是别组件的部署物,同样不灌 microVM host。
 _HOST_PULL_PREFIXES = ("deployment/rootfs/",)
 
+# #333 — manifest 点名的盘文件名(value)会被下发到 host 的 shell 引用(即使已 shell-quote,
 # 仍加一道字符集白名单做纵深防御:安全域宁可两道)。只允许文件名常见安全字符
 # [A-Za-z0-9._-],挡 shell 元字符/路径分隔符;不合格拒绝整个快照(fail-loud,不装 live)。
 _SAFE_DISK_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
+# #217 V2 — snapshot_time 主键格式 = snapshot-version.sh 生成的 ISO8601 UTC
 # (YYYY-MM-DDTHH:MM:SSZ)。API 侧先校验格式:非法 → 400(参数错),合法但 DB 无 → 404
 # (快照不存在)。别让乱输入默默查 DB 走成 404,误导调用方"快照不存在"(owner 2026-07-14)。
 _SNAPSHOT_TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
@@ -1144,13 +1185,16 @@ _SNAPSHOT_TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 _IMAGE_SLOTS_MIRROR_MAX_AGE_S = int(os.environ.get("IMAGE_SLOTS_MIRROR_MAX_AGE_S", "120"))
 _DELETE_GATE_STALE_S = int(os.environ.get("IMAGE_SNAPSHOT_DELETE_STALE_S", "300"))
 
+# #376 — create_image_snapshot 的 label 是 API 调用方可控输入(shell 脚本从 manifest 读,
 # 但 API 直接收任意文本)。label 会进 console 显示 + 日志,故白名单校验:长度 ≤128 + 只允许
 # 文件名常见安全字符 [A-Za-z0-9._-],挡 shell 元字符/空格(纵深防御,不裸存未净化的值)。
 _SNAPSHOT_LABEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}\Z")
 
+# #217 V2 — 镜像盘文件名 → 盘类型(build-rootfs.sh:1134-1136 命名):
 # openclaw-{rootfs,data-template,immutable}-<VER>.ext4.gz。snapshot pull 要按此识别
 # 出镜像盘,拉下来解压成 launch-vm 认的【扁平】名 openclaw-<kind>.ext4;非镜像(脚本)
 # 直接落原路径不解压。
+# #309 — manifest.json 里镜像字段名(build-rootfs 产出;live 实测:
 # {"version","rootfs","data_template","immutable"})。盘 kind → manifest 字段:
 # rootfs→rootfs,data-template→data_template(下划线),immutable→immutable。
 _MANIFEST_DISK_FIELD = {
@@ -1212,9 +1256,11 @@ def _disk_kind_of(f):
     return f.get("disk_kind") if isinstance(f, dict) else None
 
 
+# #217 V2 — live 资产根:launch-vm.sh:205-210 直接 mount 的位置。snapshot pull 校验
 # 通过后把镜像装到这里的扁平名 openclaw-<kind>.ext4 → launch-vm 不用改就能起新版。
 _LIVE = "/data/firecracker-assets"
 
+# #309 owner 2026-07-20 — pull 暂存/解压区:先把 .gz 下载到这里、就地解压成 .ext4,
 # 全部完成后再 mv 到 _LIVE 的置顶位置。就在 _LIVE 目录下(同一 /data/firecracker-assets)
 # → mv 铁定同盘原子 rename(瞬间、不占双份空间、sparse 保留)。固定名 target(不按
 # snapshot_time 分,每轮覆盖)。
@@ -1248,6 +1294,7 @@ def _verify_lines(bucket, region, path, version_id, etag):
     q = shlex.quote
     b, r, k, v = q(bucket), q(region), q(path), q(version_id)
     dst = f'"$ARCH"/{q(path.rsplit("/", 1)[-1])}'
+    # #333 防注入(codex review):path/version_id 也走 shell 变量(K/V),不把它们直接插进
     # 双引号 echo/_perr —— 否则含 $()/反引号的 S3 key 在双引号内会被 shell 展开/执行(host 权限)。
     # KEY=... 用 q() 单引号包死,后续引用 "$KEY" 是纯数据。WANT 同理(带引号的 etag)。
     # 失败点各写 ERROR:<CODE>:DOWNLOAD_FAILED(拉不下)/ETAG_MISMATCH(内容不符),exit1 不装 live。
@@ -1266,6 +1313,7 @@ def _verify_lines(bucket, region, path, version_id, etag):
     ]
 
 
+# #333 owner 2026-07-21 — phase2 拆成【两个循环】:先全部 _stage_lines(解压/准备到 target
 # 暂存区,live 完全不碰),全部 stage 成功后,再第二个循环 _commit_lines(逐个 mv/cp 到 live)。
 # 为什么拆:交错"解一个装一个"会在中途失败时留混版 live(前几个新盘 + 后几个旧盘);拆开后,
 # 任一盘解压失败 → live 一个字节没动(no-data-loss)。commit 段全是极快的同盘 rename,窗口极小。
@@ -1303,6 +1351,7 @@ def _stage_lines(f):
             f'|| {{ _perr "UNZIP_FAILED pigz decompress failed for $BASE"; exit 1; }}',
             f'[ -s {staged} ] '
             f'|| {{ _perr "UNZIP_FAILED decompressed $BASE is empty (disk full?)"; exit 1; }}',
+            # #333(对齐 bb refresh-rootfs 省盘)解压成功后立刻删 .gz 源 —— 否则暂存区里 .gz +
             # 解压后的 .ext4 同时占盘(拆两循环后所有盘的 .gz+.ext4 会全堆着,峰值占盘更糟)。
             f"rm -f {src}",
         ]
@@ -1348,6 +1397,7 @@ def _commit_lines(f, snapshot_time=None):
             f'|| {{ _perr "INSTALL_MV_FAILED mv $BASE to {dest_disk} failed"; exit 1; }}',
         ]
     dest, is_service = _script_live_dest(path)
+    # #394 —— manifest.json 随三盘一起进版本目录(版本目录要自洽:盘 + 它的 manifest 同处
     # 一目录,才能事后核对"这套盘是哪版")。扁平 live 位的 manifest.json 由 promote 时另写。
     if snapshot_time and dest is not None and path.endswith("rootfs/manifest.json"):
         dest = image_slots.manifest_path(snapshot_time)
@@ -1431,6 +1481,7 @@ def _slots_commit_lines(slot, snapshot_time, hosts_table, region, instance_id, j
     写坏/失败一律 _perr + exit 1,绝不留半个指针。
     """
     q = shlex.quote
+    # #394/#493 —— 同一 python 进程先条件续租、rename+fsync,再强一致复核 owner/expiry。
     # 续租后冻结超过窗口仍可能被接管,所以 rename 后复核是 correctness gate;worker 全程
     # 持 pull.lock,失权时优先恢复旧指针,随后让当前 owner 继续提交。job_id/region 为空
     # (扁平兼容路径)时不走版本 lease,保持既有行为。
@@ -1532,6 +1583,7 @@ def _slots_commit_lines(slot, snapshot_time, hosts_table, region, instance_id, j
         f') || {{ _perr "SLOTS_WRITE_FAILED could not update slots.json ({slot}) — see COMMIT_FENCED if lease lost"; exit 1; }}',
         '_p "slots.json updated: $SLOTS_NEW"',
     ]
+    # #394 —— host 侧把【最终 slots.json】原样回写 DDB hosts.image_slots(消除控制面镜像
     # 与 host 真值漂移:之前只由 Lambda 增量 patch canary,live/generation/previous_live 都
     # 会对不上,导致 promote 误报 CANARY_CHANGED、UI 显示 live=null)。host 角色有 hosts
     # 表 UpdateItem 权(心跳在用)。用 python3 把 SLOTS_NEW(纯 JSON)转成 DDB M 格式写入。
@@ -1683,8 +1735,10 @@ def _snapshot_pull_script(
     # 定义成 shell 函数(_reset_fail/_reset_ok),让 update-item 里 JSON 的单引号活在
     # 函数体内,而不是塞进 trap 的单引号串——否则 JSON 的 '{"S":..}' 会闭合 trap 的引号,
     # shell 把 `{S:` 当 trap 参数 → "bad trap" 脚本首行就崩(真机踩过,993b2330 Failed)。
+    # #333(codex round9)owner-conditional 复位:带 job_id,只当前 owner 才复位(防 DDB 模糊重试
     # 在新 job CAS 后覆盖回旧状态)。脚本走到复位处已过 fence(status==upgrading + owner==job),故
     # 条件通常满足;真被新 job 抢占时 CCF(被 `|| true` 吞,不误覆盖)。
+    # #394 —— canary pull 全程不碰 host.status / host.snapshot_time:
     #  · 没置过 upgrading,"复位"会凭空把别人的维护门解除;
     #  · host.snapshot_time 语义是"本机 live 版本",canary 装好并没换 live,写了就是谎报。
     # 故 canary 的两个 reset 函数体降级成 `:`(shell no-op),脚本骨架、fence、marker、
@@ -1705,12 +1759,15 @@ def _snapshot_pull_script(
     lines = [
         "set -eu",
         f"JOB=/tmp/{q(job_id)}.txt",
+        # #309 owner 2026-07-20 — 下载+解压落 _STAGE(/data/firecracker-assets/snapshots/target),
         # 全部装完 mv 到 _LIVE(同盘原子 rename)。log 仍在 /tmp/<job_id>.txt(不变)。
         f"ARCH={_STAGE}",
+        # #333(codex round7)持久化完成标记:装完 live 后写本 job_id 到该文件(先于 _reset_ok)。
         # 若 _reset_ok 的 DDB 写因 `|| true` 静默失败(status 没复位、owner 没变),延迟重复 worker
         # 会通过 status==upgrading+owner fence → 本会重装 live(踩幂等/no-data-loss)。fence 后加
         # 一道 marker 检查:marker==本 job → 本 job 已装完,绝不重装,只补跑 _reset_ok 修 DDB 后让位。
         f"DONE_MARKER={_LIVE}/.pull-last-done",
+        # #338 — 每行进度 fan-out 到两个 sink:①/tmp/<job>.txt(progress API tail 用)②journald tag
         # claw-launch(host Fluent Bit 已在收 SYSLOG_IDENTIFIER=claw-launch → claw-logs-host 索引,与
         # host-agent/launch-vm 生命周期日志同一条路,零 FB 配置改动)。msg 只算一次。systemd-cat 兜底
         # `|| true`:极端情况(无 systemd)不 break progress 主功能。日志带 job_id 便于 OpenSearch 按字段查。
@@ -1726,6 +1783,7 @@ def _snapshot_pull_script(
         f"_reset_ok() {{ {reset_ok}; }}",
         "INSTALLING=0",
         "LOCKED=0",  # 是否已抢到 flock + 确认 job owner。=1 才拥有 $ARCH/status,trap 才写终态/复位。
+        # #333 并发正确性(owner + codex review 5 轮):异步 Lambda 是 at-least-once 投递【且超时
         # 不可吞】→ 同一个 job 可能有第二个 worker 并发跑(入口 CAS 只挡不同 pull,挡不住同 job
         # 重投)。故 host 侧必须:① host 级固定 flock(不带 job_id,否则不同 job 各拿一把不互斥)
         # ② job fencing:抢锁后强一致读 DDB pull_command_id 校验 == 本 job_id(非 owner 让位)。
@@ -1735,16 +1793,19 @@ def _snapshot_pull_script(
         # 不复位 → 卡 upgrading。trap 仅 LOCKED=1(winner)才写终态:rc!=0 且无具体 ERROR(HAS_ERR=0)
         # 补 UNKNOWN(否则覆盖真错码);写 FAIL;INSTALLING=0(没动 live)才 rm 暂存 + 复位 prev
         # (动了 live 留 upgrading 给 ops,不自动还原/复位)。loser(LOCKED=0)只 echo stderr,trap 静默。
+        # #333(codex round9/11)trap:INSTALLING=1(phase2 已动 live)失败时把 marker 升级成 "failed"
         # (best-effort,便于运维读状态)。但【真正的重装防线是进 phase2 前就落的 installing marker】
         # (见 phase2)——盘满/掉电/SIGKILL 会让 trap 写不成,重复 worker 靠 installing marker(非 done)
         # 就拒绝重装。INSTALLING=0(live 未碰)仍 rm 暂存 + 复位 prev。marker 原子写(tmp+mv)。
         f'trap \'rc=$?; if [ "$rc" != 0 ] && [ "$LOCKED" = 1 ]; then [ "$HAS_ERR" = 0 ] && _p "ERROR:UNKNOWN unexpected exit rc=$rc - see SSM stderr"; _p "FAIL"; if [ "$INSTALLING" = 0 ]; then rm -rf "$ARCH"; _reset_fail; else printf "%s" {q(job_id)}:failed > "$DONE_MARKER".tmp && mv "$DONE_MARKER".tmp "$DONE_MARKER"; fi; fi\' EXIT',
+        # ① host 级固定锁(pull.lock,不带 job_id)。#333(codex round6)用【阻塞】等锁 -w 而非
         # -n 直接失败:成功路径在锁内复位 active(见文末),此后新 pull 可 CAS active→upgrading 并
         # fire 后继 worker——若后继用 -n 会抢锁失败退出不复位 → 卡 upgrading(round3 老 bug)。改
         # 阻塞等:持锁 worker 完成(含复位)释锁后,后继拿到锁再走 fence 重校验。真held 超时 → 让位。
         f'exec 9>{_LIVE}/pull.lock',
         'flock -w 120 9 || { echo "[pull] LOCK_HELD another pull worker holds the lock >120s; abort" >&2; exit 1; }',
         # ② fence:强一致读 DDB【status + pull_command_id】,必须 status==upgrading 且 owner==本 job。
+        # #333(codex round6)光校 owner 不够:pull_command_id 成功后【保留】(progress 靠它读
         # Completed),故已完成 job 的延迟重复 worker owner 仍匹配 → 若不校 status 会在 host 已回
         # active 时重装 live(踩 no-cross-tenant/no-data-loss)。加 status==upgrading 关死:只有 host
         # 确实还在本轮 upgrading 才继续。--consistent-read 避免最终一致误杀刚写的 job。
@@ -1759,6 +1820,7 @@ def _snapshot_pull_script(
         f'--query "[Item.status.S, Item.pull_command_id.S]" --output text 2>/dev/null) || FENCE=""; fi',
         'if [ -z "$FENCE" ]; then echo "[pull] OWNERSHIP_CHECK_FAILED cannot read host state from DDB; abort" >&2; exit 1; fi',
         'ST=$(printf "%s" "$FENCE" | cut -f1); OWNER=$(printf "%s" "$FENCE" | cut -f2)',
+        # #394 —— canary pull 不置 upgrading,故这道 status 门只对 live pull 生效;canary 的
         # 陈旧 worker 由控制面 image lease + fence_epoch 拦(ADR §4.8),不靠 host.status。
         # owner 门对两者都保留(pull_command_id 只在 live 路径写,canary 用 lease owner,
         # 故 canary 也跳过 owner 门 —— 见下面 CANARY_FENCE 注释)。
@@ -1776,6 +1838,7 @@ def _snapshot_pull_script(
         f'if [ "$LEASE_OWNER" != {q(job_id)} ]; then echo "[pull] STALE_JOB lease owner=$LEASE_OWNER job={job_id}; superseded, abort" >&2; exit 1; fi',
         'if [ -z "$LEASE_UNTIL" ] || [ "$LEASE_UNTIL" -le "$(date +%s)" ]; then echo "[pull] STALE_JOB lease expired; abort" >&2; exit 1; fi',
         "LOCKED=1",  # 抢到锁 + 确认 upgrading + owner → 自此拥有 $ARCH/status 所有权,trap 可写终态/清理/复位
+        # #333(codex round7/9)幂等重装防线:marker 记 "<job_id>:<state>"(done/failed)。若 marker
         # 的 job==本 job,说明本 job 的上一个 worker 已【终结】(装完 or phase2 已动 live 后失败),
         # 延迟重复 worker 【绝不】重装(否则重复解压覆盖 / 在半写坏 live 上再装,踩幂等/no-data-loss):
         #   · done   → 上一 worker 装成功(只是 _reset_ok DDB 写 `|| true` 静默失败没复位)→ 补
@@ -1785,6 +1848,7 @@ def _snapshot_pull_script(
         'MJOB=""; MSTATE=""',
         'if [ -f "$DONE_MARKER" ]; then MRAW=$(cat "$DONE_MARKER" 2>/dev/null); '
         'MJOB=${MRAW%%:*}; MSTATE=${MRAW#*:}; fi',
+        # #333(codex round11)marker job==本 job:按 state 决定,但【只有 done 才 exit 0】,其它
         # (installing/failed/任何非 done)一律【拒绝重装 + exit 1】。因为 installing marker 是在
         # 【触碰 live 之前】就持久化的(见 phase2),故只要看到本 job 的 marker 非 done,就说明上一个
         # worker 【已经或即将】动 live(可能被 SIGKILL/掉电/盘满打断,live 半写坏)—— 绝不能重装:
@@ -1800,6 +1864,7 @@ def _snapshot_pull_script(
         f'exec 9>&-; LOCKED=0; '
         f'echo "[pull] job={job_id} prior worker did not finish (marker=$MSTATE); host stays upgrading" >&2; exit 1; fi; fi',
     ]
+    # #394 快路径 —— slot 模式下,若目标版本目录【已完整装好】(.complete 标记在 + 三盘非空),
     # 跳过下载/解压,直接翻 slots 指针(秒级)。这让"回滚 = pull 老版到 live"零下载:老版目录
     # 已在盘上(promote/上次 pull 装的,reclaim 之前一直保留)→ 只翻指针。半装目录(下载一半盘满、
     # 无 .complete)判不完整 → 落到下面正常重下自愈(fail-safe,绝不翻半盘)。兼容扁平路径(slot=None)
@@ -1839,12 +1904,15 @@ def _snapshot_pull_script(
         # 每个文件下载前写一条进度(下载 = get-object by version-id,同时校 etag)。
         lines.append(f'_p "phase1 [{i}/{n}]: downloading + verifying {base}"')
         lines.extend(_verify_lines(bucket, region, f["path"], vid, f.get("etag", "")))
+    # #309 phase1.5 — 校验 manifest.json 版本指针与拉下来的盘文件名一致(仍在
     # INSTALLING=0,不一致 exit1 → trap 复位 status→prev,live 未碰)。
     lines.extend(_manifest_consistency_lines(host_files))
+    # #333 owner 2026-07-20 — 去掉装 live 前的 backup(原是 V2 自动还原源,但 V2 #313 已作废):
     # backup 占 ~18GB 峰值且现无用途。装 live 失败 → 让他 fail(host 留 upgrading,运维介入),
     # 不做自动还原。省空间 + 缓解盘满。
     lines.append('_p "phase1 OK: installing to live (no backup)"')
     lines.append('echo "[pull] phase1 OK — install to live (no backup)"')
+    # #333 owner 2026-07-21 — phase2 拆两个循环:① stage(全部解压/准备到 target 暂存区,live 完全
     # 不碰,INSTALLING 仍 0,失败可安全复位)② commit(全部 stage 成功后,逐个 mv/cp 到 live)。
     # 好处:任一盘解压失败,live 一个字节没动(no-data-loss);commit 段全是极快的同盘 rename。
     # ── 循环① stage:解压/准备到暂存区(live 未碰)──
@@ -1860,20 +1928,24 @@ def _snapshot_pull_script(
     lines.append('echo "[pull] phase2a OK — commit staged to live"')
     # 从这里起动了 live:失败不再复位 active(trap 靠 INSTALLING 判断)。
     lines.append("INSTALLING=1")
+    # #333(codex round11)【触碰 live 之前】就持久化 "<job>:installing" marker(原子 tmp+mv)。
     # 关键:phase2 失败标记不能只靠 EXIT trap —— 盘满/掉电/SIGKILL(正是预期失败场景)会让 trap
     # 写不成 marker,延迟重复 worker 就会在半装的 live 上重装。故进 commit、动第一个盘【之前】先落
     # installing marker;成功后替换成 done(见文末)。重复 worker 见任何非 done 一律拒绝重装。
     lines.append(f'printf "%s" {q(job_id)}:installing > "$DONE_MARKER".tmp && mv "$DONE_MARKER".tmp "$DONE_MARKER"')
     # ── 循环② commit:逐个 mv/cp 暂存区 → 目标位置(同盘原子 rename,极快)──
+    # #394 —— slot 模式(slot 非空)装进不可变版本目录 versions/<snapshot_time>/;
     # 兼容模式(slot 为空)保持历史扁平 live 位。
     dest_desc = f"version dir {snapshot_time}" if slot else "live"
     for i, f in enumerate(host_files, 1):
         base = f["path"].rsplit("/", 1)[-1]
         lines.append(f'_p "phase2b [{i}/{n}]: committing {base} to {dest_desc}"')
         lines.extend(_commit_lines(f, snapshot_time if slot else None))
+    # #394 —— 版本目录装好后,最后一步才改 slots.json 指针(唯一提交点)。指针改成功之前,
     # 任何 VM 的启动版本都没变:装 canary 完全不影响存量 live;装 live 失败也不会让存量
     # 租户拿到半套盘(ADR §4.1"提交点只有一个小文件 rename")。
     if slot:
+        # #394 —— 三盘 + manifest 全部 commit 进版本目录后,【最后】原子写 .complete 完整标记
         # (先于翻指针)。它是"这套版本目录已装齐"的唯一信号,快路径据它判断"本地已完整→秒级
         # 翻指针"。半装目录(装到一半盘满/掉电)没有标记 → 下次 pull 快路径不认它、走重下自愈。
         version_disks = [
@@ -1882,6 +1954,7 @@ def _snapshot_pull_script(
         ]
         lines.append('_p "phase2b.9: writing .complete marker (version dir fully installed)"')
         lines.extend(image_slots.write_complete_marker_lines(snapshot_time, version_disks))
+        # #394 self-heal —— canary 装完、写 canary 指针【之前】,先把旧扁平 live 迁进版本目录
         # 并解析 slots.live(仅当 live 未解析且有已知的扁平 live 版本时)。否则 promote 会产出
         # previous_live=null 的半状态(前端 undefined),rollback 无锚点。幂等,已迁则跳过。
         if slot == image_slots.SLOT_CANARY and flat_live_snapshot_time:
@@ -1893,11 +1966,13 @@ def _snapshot_pull_script(
         {"snapshot_time": snapshot_time, "staged_dir": _STAGE, "file_count": n}
     )
     lines.append(f"printf '%s' {q(setting)} > {_LIVE}/setting.json")
+    # #333(codex round7/9)装完 live 立刻写持久化完成标记 "<job_id>:done",【先于】_reset_ok。即便
     # _reset_ok 的 DDB 写 `|| true` 静默失败(status 没复位),延迟重复 worker 过 fence 后会在
     # LOCKED=1 处读到 marker job==本 job(done)→ 不重装,只补 _reset_ok 修 DDB(见 fence 后那段)。原子写。
     lines.append(f'printf "%s" {q(job_id)}:done > "$DONE_MARKER".tmp && mv "$DONE_MARKER".tmp "$DONE_MARKER"')
     # 装完 live 即成功 → 写终态 SUCCESS + 复位 active,【都在持锁内】(LOCKED=1 保护),最后才释锁。
     lines.append('_p "SUCCESS"')  # 终态先落(progress tail 判完成),持锁时写
+    # #333(codex round6)复位 active 必须在【持锁内】、释锁【之前】:fence 校 status==upgrading,
     # 若先释锁再复位,会留一个"已释锁但仍 upgrading+owner 匹配"的窗口 —— 延迟重复 worker 拿到锁
     # 后 fence 通过(status 还是 upgrading)→ 在 host 即将 active 时重装 live。改为锁内复位:复位
     # →active 后任何后继 worker 拿锁再读 status=active → STALE_JOB 让位。round3 的"新 pull 抢不到
@@ -1922,6 +1997,7 @@ def list_image_versions(query_params=None):
     if version_snapshots_table is None:
         return _err(503, "NOT_CONFIGURED", "VERSION_SNAPSHOTS_TABLE not configured")
     show_deleted = str((query_params or {}).get("show_deleted", "")).lower() == "true"
+    # #394 P2-1 —— 翻页到底:快照表 >1MB 时只读第一页会静默漏掉后续版本(目录 API 漏列 =
     # 运维选不到那些版本去 pull/回滚)。删除保护扫描已翻页,目录查询同样必须翻。
     items = []
     _kw = {}
@@ -2019,6 +2095,7 @@ def _snapshot_still_referenced(snapshot_time):
         kwargs["ExclusiveStartKey"] = lek
     if pinned_ids:
         return True, f"tenants still pin it: {pinned_ids[:10]}"
+    # 3) #394 P1-3(盲点 B)—— 在飞 pull:已受理但版本尚未提交进 slots 的 Job。若此刻删,
     # 那个 worker 会把已下架版本装进 live/canary(no-data-loss)。任何非终态 Job 命中即拒删。
     # codex B2 —— 再加 SUCCEEDED grace:刚提交成功但 mirror 回写失败的窗口内(≤ mirror 最大
     # 陈旧时间),mirror 尚未反映新指针,slots 扫描看不到 → 用 Job 兜底,等下轮心跳同步真值。
@@ -2107,6 +2184,7 @@ def delete_image_snapshot(body):
 
     original_had_status = "status" in existing
     original_status = existing.get("status", "active")
+    # #394(codex B1)每次进入 DELETING 都盖一个唯一 owner token,后续【所有】状态转移(终态
     # deleted / 引用存在回滚)都条件在【本 token】上。否则仅凭 #s=deleting 做条件:A 置 DELETING
     # 后卡死→B 超时接管(恢复 active→自己再置 DELETING+重扫)→A 复活时它的 finalize 条件
     # #s=deleting 又成立(B 刚置的),A 会拿【自己的陈旧扫描结果】把版本 finalize 成 deleted,
@@ -2337,6 +2415,7 @@ def _set_host_upgrading(instance_id, job_id):
 def _pull_by_snapshot(instance_id, snapshot_time, slot=None, idempotency_key=None):
     """#217 V2 — read the snapshot from DDB, SSM-fetch host files by exact VersionId."""
     # 格式先行:非法 snapshot_time → 400(别拿去查 DB 走成 404 误导调用方)。
+    # #336 — 统一错误信封 {error, code}(与 404/409 一致,客户按 code 判)。
     if not _SNAPSHOT_TIME_RE.match(snapshot_time):
         return _err(
             400, "VALIDATION",
@@ -2358,11 +2437,14 @@ def _pull_by_snapshot(instance_id, snapshot_time, slot=None, idempotency_key=Non
         files = json.loads(item.get("files", "[]"))
     except (ValueError, TypeError):
         files = []
+    # #317 版本选择:只装 manifest.json 点名的 3 个盘 + manifest 本身(忽略快照里其它版本
+    # 的盘,防非确定覆盖)。#309:scripts 由 init-host 开机各自拉、edge/litellm/monitoring
     # 不灌 microVM host。选择失败(无 manifest/点名盘缺失)→ fail-loud,不装。
     host_files, sel_err, _, _ = _select_pull_files(bucket, files)
     if sel_err:
         return _err(409, "CONFLICT", f"snapshot {snapshot_time}: {sel_err}")
 
+    # #394 —— canary pull 前置守卫 canary==live(读 DDB 镜像 hosts.image_slots;准入前的建议性
     # 校验,镜像滞后最坏是漏判后落到幂等 pull,无害):目标版本已是该 host 的 live → 没有可验证
     # 的东西(在同一镜像上建"金丝雀"租户是无意义操作)→ 409 CANARY_EQUALS_LIVE,提示 pull 一个
     # 【不同】的候选版本。
@@ -2383,11 +2465,13 @@ def _pull_by_snapshot(instance_id, snapshot_time, slot=None, idempotency_key=Non
                 f"validate — pull a different candidate to the canary slot",
             )
 
+    # #394 P2-1 —— Idempotency-Key 重放:带同 key 的重试在【抢闸之前】先查原 Job,命中即回原
     # job_id(202),绝不再抢 lease / 再置 upgrading / 再起一次真 pull(否则前一任务结束后会创建
     # 第二个真实 pull,且重试可能吃 409)。key 缺失 → 跳过,退化成旧"每次真跑"语义。
     if idempotency_key:
         prior = image_jobs.find_by_idempotency_key(instance_id, idempotency_key)
         if prior:
+            # #394 P2-1 —— 同 key 必须对应同请求体,否则报 409 IDEMPOTENCY_KEY_REUSED(调用方
             # bug:拿装 A-live 的 key 去请求 B-canary,不能返回旧 A-live job 让它误以为受理了)。
             # 比较规范化指纹:(snapshot_time, slot)。一致才重放原 job。
             prior_slot = prior.get("target_slot", "live")
@@ -2407,9 +2491,12 @@ def _pull_by_snapshot(instance_id, snapshot_time, slot=None, idempotency_key=Non
                 "replayed": True,
             })
 
+    # #309 —— job_id 在【同步路径】生成(SSM CommandId 要 dispatch 后才有、脚本无法自知它,
+    # 故用自生成 id 命名进度文件 /tmp/<job_id>.txt)。#333(codex round8)先生成 job_id,再在
     # _set_host_upgrading 的【同一条原子 UpdateItem】里连 pull_command_id 一起写(见该函数注释:
     # 消除 CAS 与写 owner 分两步的窗口)。pull_image_progress 据 pull_command_id tail 进度文件。
     job_id = f"pull-{uuid.uuid4().hex[:16]}"
+    # #394 P1-2 —— 准入闸:【两种 pull 都先抢 image lease】,再按槽位处理 status。
     #  · image lease 是"同一 host 同时只跑一个镜像操作"的统一互斥(ADR §4.8 规则 1):
     #    抢到它,promote/cleanup/reclaim 全被 409 挡(它们也走同一把 lease)。原先只有 canary
     #    抢 lease、live pull 只靠 status upgrading 门 → live pull 与 promote/cleanup/reclaim
@@ -2432,7 +2519,9 @@ def _pull_by_snapshot(instance_id, snapshot_time, slot=None, idempotency_key=Non
             image_lease.release(instance_id, job_id)
             return err
 
+    # #394 step1(ADR §4.4)—— 落一条持久化 Job(state=QUEUED)。放在准入闸【之后】:闸是
     # 真正的入口,没抢到就不该留 Job 记录(否则 409 也会攒一堆 QUEUED 垃圾)。
+    # #394 P1-2 —— 区分两种 create 失败:
     #  · 表未配置(is_enabled=False):Job 功能整体关闭,progress 回退 /tmp,返 202 无妨(旧行为);
     #  · 表已启用但写失败(fresh uuid 不可能撞 dup → 只能是 DDB 超时/限流/权限):此时若照常
     #    dispatch,progress 精确查会 404 JOB_NOT_FOUND、canary 又无 /tmp 回退 → 从 202 起就不可观测,
@@ -2452,6 +2541,7 @@ def _pull_by_snapshot(instance_id, snapshot_time, slot=None, idempotency_key=Non
             "admission released, retry shortly",
         )
 
+    # #217 fix(504) —— stage + 校验 + 备份 + copy/unzip 装 live 需【数分钟】,远超 APIGW REST
     # 29s 硬上限 → 客户端必吃 504。故 CAS 置 upgrading 后【异步自调用】跑长链,立即回 202;
     # console 轮询 pull_image_progress(tail /tmp/<job_id>.txt)看进度,不依赖本响应。
     try:
@@ -2472,6 +2562,7 @@ def _pull_by_snapshot(instance_id, snapshot_time, slot=None, idempotency_key=Non
             f"pull-image worker dispatch failed: {e}",
             job_id,
         )
+        # #394 P1-2 —— 两种 pull 都持 lease,都要还(否则该 host 镜像操作被占死到 lease
         # 自然过期,期间 promote/cleanup/reclaim 全被 409 挡)。live 额外复位 status。
         if slot != image_slots.SLOT_CANARY:
             _reset_host_status(instance_id, prev_status)
@@ -2522,10 +2613,12 @@ def _run_pull_pipeline_impl(instance_id, snapshot_time, prev_status, job_id, slo
     CAS 置 upgrading。金丝雀已移除(owner 2026-07-17),V1 失败不自动 restore(留 V2)。
     job_id 由 pull_image(sync)生成并存进 host DDB 项(pull_command_id),脚本据它把进度写
     /tmp/<job_id>.txt,pull_image_progress tail 之。幂等:重放装同版无害(固定名覆盖同内容)。"""
+    # #333(codex round8)下发前失败的统一收尾:先 job-conditional 记 last_pull_error(否则 worker
     # 正常 return、不触发 handler 兜底、进度文件又不存在 → progress 永报 InProgress),再复位回 prev
     # (live 未碰,安全)。所有下发【前】的早退路径都走它,不漏记错误。
     def _fail_before_dispatch(reason):
         _record_pull_error(instance_id, reason, job_id)
+        # #394 —— canary pull 从未改 host.status,所以【不能】在这里"复位":那会把一台正被
         # 别的操作置为 upgrading 的 host 写回 active(凭空解除维护门)。canary 的收尾是还
         # lease(由外层 finally 保证),status 一字不动。
         if slot != image_slots.SLOT_CANARY:
@@ -2549,6 +2642,8 @@ def _run_pull_pipeline_impl(instance_id, snapshot_time, prev_status, job_id, slo
             files = json.loads(item.get("files", "[]"))
         except (ValueError, TypeError):
             files = []
+        # #317 版本选择:只装 manifest.json 点名的盘(见 _select_pull_files)。
+        # #343 rootfs_version:同一处返回 manifest 的 version,pull 成功后写进 host。
         host_files, sel_err, rootfs_version, immutable_version = _select_pull_files(
             bucket, files
         )
@@ -2556,6 +2651,7 @@ def _run_pull_pipeline_impl(instance_id, snapshot_time, prev_status, job_id, slo
             _fail_before_dispatch(f"snapshot {snapshot_time}: {sel_err}")
             return {"statusCode": 409, "body": f"snapshot {snapshot_time}: {sel_err}"}
         hosts_table_name = os.environ.get("HOSTS_TABLE", "")
+        # #394 self-heal —— canary pull 时,若该 host 的 slots.live 还没解析(旧扁平布局),
         # 用 host 记录里的扁平 live 版本(host.snapshot_time,pull-image 成功时写的)迁进
         # 版本目录。只在 canary + host 已有 image_slots.live 为空 + 有扁平 snapshot_time 时传;
         # 否则传 None(self-heal 段不生成)。读 host 记录:强一致,拿最新状态。
@@ -2584,6 +2680,7 @@ def _run_pull_pipeline_impl(instance_id, snapshot_time, prev_status, job_id, slo
         return _resp(500, {"error": "pull-image SSM dispatch failed"})
     if not ok:
         reason = (tail or "")[-400:]
+        # #333(codex round7/8)loser 让位不是真失败:同 job 的第二个 worker(等锁 flock -w 超时 /
         # status 已非 upgrading / STALE_JOB)会 exit1 → SSM 判 Failed → 这里 ok=False。它与 winner
         # 同 job_id,若照记 last_pull_error(job-conditional 会通过)→ 把仍在跑的 winner 误报 Failed。
         # 故 LOCK_HELD/STALE_JOB(【已证实】另有 worker 持锁/占有本 job)识别为让位:不写
@@ -2594,6 +2691,7 @@ def _run_pull_pipeline_impl(instance_id, snapshot_time, prev_status, job_id, slo
                 {"message": "pull worker yielded to concurrent owner (no-op)",
                  "command_id": cmd_id, "detail": reason},
             )
+        # #333(codex round8)OWNERSHIP_CHECK_FAILED 不是"证实的 loser"——它是 fence 读 DDB 失败、
         # 无法判定所有权(可能就是唯一合法 worker)。它发生在 LOCKED=1 【之前】(live 未碰),故按
         # 【真失败】处理:job-conditional 记错误 + 复位回 prev(别卡 upgrading、progress 别永 InProgress)。
         if "OWNERSHIP_CHECK_FAILED" in (tail or ""):
@@ -2637,6 +2735,7 @@ def _run_pull_pipeline_impl(instance_id, snapshot_time, prev_status, job_id, slo
                     "detail": reason,
                 },
             )
+        # #309 V1 —— 脚本【跑了】但失败(真失败)。status 由脚本 trap 按阶段自决(靠 INSTALLING):
         #   · phase1 拉/校验 阶段失败(INSTALLING=0)→ 脚本 trap rm 暂存 + 复位 status→prev;
         #   · phase2 装 live 失败(INSTALLING=1,unzip 坏)→ 脚本 trap 不复位,host 留 upgrading。
         # 故 Lambda【绝不】兜底复位 active:phase2 坏了复位 = 谎报 active 盖住半写坏的 live,让
@@ -2650,6 +2749,7 @@ def _run_pull_pipeline_impl(instance_id, snapshot_time, prev_status, job_id, slo
 
     # 成功:脚本已 _reset_ok 自管收尾(survives Lambda 死);Lambda 再 _finalize_success 兜一次
     # (防脚本 host 侧 aws cli 的 `|| true` 静默失败),两条幂等同值,保证 DDB 终态反映真实。
+    # #394 —— canary 成功【不】走 _finalize_success:那个函数条件写 status==upgrading 并把
     # host.snapshot_time 改成本次版本。而 host.snapshot_time 的语义是"这台 host 的 live 版本",
     # canary 装好并不改变 live —— 写了就等于谎报该 host 已在跑候选版本(存量 live 租户其实
     # 还在旧版)。canary 的成功事实由 slots.json 的 canary 指针 + 持久化 Job result 表达。
@@ -2658,6 +2758,7 @@ def _run_pull_pipeline_impl(instance_id, snapshot_time, prev_status, job_id, slo
             job_id, "SUCCEEDED", phase="done", progress_percent=100,
             result={"snapshot_time": snapshot_time, "slot": image_slots.SLOT_CANARY},
         )
+        # #394 —— 把 canary 槽镜像到 host 记录(控制面副本,供 create-tenant 准入读取)。
         # 真值仍是 host 上的 slots.json(ADR §4.2);这里只是控制面读得到的一份投影,
         # 故 best-effort:写失败不影响 pull 结果(create-tenant 拿不到会 CANARY_NOT_READY
         # 让调用方重试,不会误起 live —— fail-closed 方向)。
@@ -2706,6 +2807,7 @@ def _reset_host_status(instance_id, status, job_id=None):
         print(f"[pull] WARN reset status for {instance_id}→{status} failed: {e}")
 
 
+# #309 — SSM poll 间隔(_ssm_wait 用)。金丝雀已移除(owner 2026-07-17),原
 # _CANARY_POLL_EVERY_S 更名 _SSM_POLL_EVERY_S(它一直也被 _ssm_wait 用,与金丝雀无关)。
 _SSM_POLL_EVERY_S = 10
 
@@ -2775,6 +2877,7 @@ def _record_pull_error(instance_id, reason, job_id=None):
         print(f"[pull] record error {instance_id} host-row skipped (not owner / canary); job still marked FAILED (job={job_id})")
     except Exception as e:
         print(f"[pull] WARN record error {instance_id} failed: {e}")
+    # #394 step1/P1-3 —— 失败【始终】落到持久化 Job(state=FAILED)。这正是"worker 早退 / host
     # 重启 /tmp 丢了仍能判终态"的来源(ADR §7)。旁路 fail-open,不抛。
     image_jobs.record_transition(
         job_id, "FAILED", phase="failed", error={"reason": (reason or "")[:400]}
@@ -2795,6 +2898,8 @@ def _finalize_success(
     但 SSM 已返回成功时,该 Job 自身的 SUCCEEDED 终态仍必须写入:正常路径中 host 脚本会先执行
     _reset_ok 把 status 复位,使 Lambda 的幂等兜底 CAS 触发 CCF。若因此提前 return,成功 Job
     会永久停在 QUEUED。
+    #309:脚本内 _reset_ok 已自管复位(survives Lambda 死);本函数是 Lambda 侧再兜一次。
+    #343(codex review):脚本侧 _reset_ok 写 rootfs_version 的 aws cli 若 `|| true` 静默失败,
     Lambda 兜底也必须写 rootfs_version,否则 status/snapshot 恢复了、版本字段仍停旧值(原 bug 重现)。
     故成功且版本号非空时,这条兜底 update 也补 rootfs_version(与脚本侧同值,幂等)。"""
     ccf = hosts_table.meta.client.exceptions.ConditionalCheckFailedException
@@ -2827,6 +2932,7 @@ def _finalize_success(
         )
     except Exception as e:
         print(f"[pull] WARN finalize {instance_id} failed: {e}")
+    # #394 step1 —— 成功终态落持久化 Job,result 带上 promote/建 canary 租户要用的版本信息
     # (ADR §4.4 "pull 成功后 result 提供版本信息")。本步 target_slot 恒 live。
     image_jobs.record_transition(
         job_id, "SUCCEEDED", phase="done", progress_percent=100,
@@ -2932,6 +3038,8 @@ def _idempotency_key_from_headers(headers):
     return None
 
 
+# #309 — copy-file 目标位置白名单根:只允许写 firecracker 资产目录,挡任意路径覆盖(越权)。
+# copy-file 是给 host 脚本(deployment/scripts/,#309 从 pull_image 移出的 14 个文件)
 # 更新用的,不碰镜像盘。目标只能落 init-host.sh 装脚本的两处 live 根(_script_live_dest):
 # · /opt/openclaw/ —— 常驻 host-agent 的 .py service;· /home/ubuntu/ —— .sh + lib/*。
 # 镜像盘目录 /data/firecracker-assets/ 不在此列(那是 pull_image 的活,不给手动 copy 覆盖)。
@@ -3006,17 +3114,23 @@ def copy_file_from_s3(instance_id, body):
     rel = target[len(root):]  # root 带尾 /,所以 rel 是根下的纯相对路径
     region = os.environ.get("AWS_REGION", "ap-northeast-1")
     q = shlex.quote
+    # #335 — 整段 host 侧写入交给 core/copy_file_helper.py:逐组件 O_NOFOLLOW + 目录 fd,
+    # 把 #334 那版 shell 的 TOCTOU 从"窗口做窄"变成"结构上不存在"。为什么 shell 版关不掉:
     # readlink -f 产出的是【路径字符串】,mkdir/cp/chown/mv 每一步都重新解析一遍,check 与
     # use 之间没有东西把二者钉在同一个 inode 上(最宽的窗口跨越 aws s3 cp 的整个 S3 往返)。
     # helper 的机制与理由见该文件的模块 docstring;它不落 host 磁盘,每次由本函数现下发。
     #
+    # #334 属主:SSM 以 root 跑,落地即 root:root,故 helper 用 fchown 设成 ubuntu:ubuntu
     # (与 pull-image _install_lines 对 .sh 的 chown 一致)。注意这【不是】因为 host-agent
+    # 以 ubuntu 跑 —— host-agent.service 没有 User=,它是 root(#334 原注释此处事实有误);
     # /opt/openclaw 也是 root:root(init-host.sh:428 只 mkdir 不 chown)。chown 的真实理由
     # 是与 /home/ubuntu/*.sh 既有属主一致(init-host.sh:685-739),让 ubuntu 能自查/替换脚本。
     #
+    # #334(codex round8)防注入:s3_uri/target/root 全走环境变量(q() 单引号包死),
     # 绝不把用户原文插进双引号 echo —— 否则含 $()/反引号的值会在 root SSM 里被执行。
     # 参数走 env 而不是 argv:host 上任何人 `ps` 都看不到 s3_uri/目标。
     script = "\n".join([
+        # #334(codex round11)显式 POSIX sh:AWS-RunShellScript 在 Ubuntu 默认由 /bin/sh(dash)跑。
         # 全程 POSIX 语法(export VAR=value + quoted heredoc,无数组、无 bashism)。
         "set -eu",
         f"export OC_COPY_ROOT={q(root.rstrip('/'))}",
@@ -3032,6 +3146,7 @@ def copy_file_from_s3(instance_id, body):
         _COPY_FILE_HELPER_EOF,
     ])
     cmd_id, ok2, tail = _ssm_wait(instance_id, script, timeout=300)
+    # #334 owner 2026-07-21 — 返回【两者合并】:失败走仓库标准 _err(字段 error+code,与 create_tenant/
     # pull_image 入口一致),同时 body 额外带 ProcessingJobStatus 让调用方【只看 JSON】就能 parse
     # 成败(不必依赖 HTTP 码——有些客户端遇非 2xx 直接抛错拿不到 body)。copy 是同步的,故直接终态:
     #   · 成功 → 200 + ProcessingJobStatus:Completed + ExitCode:0 + target/s3_uri。
@@ -3185,12 +3300,14 @@ def pull_image_progress(instance_id, query_params=None):
                 "message": "no pull-image job for this host",
             },
         )
+    # #394 step1 —— Job 已是终态就直接回,不必再 SSM 探 host 进度文件:host 重启 /tmp 丢了
     # 也能给出正确终态(ADR §7 "Host 重启导致 /tmp 丢失"),同时省一次 SSM 往返。
     if job and job.get("state") in image_jobs.TERMINAL_STATES:
         return _resp(200, _progress_from_job(base, job))
     q = shlex.quote
     jf = f"/tmp/{q(str(job_id))}.txt"
     # 一次 SSM 取三样:① 文件在不在(__EXISTS__)② 末行(判三态)③ 最近一条 ERROR:<CODE> 行。
+    # #394 —— 显式区分"文件不存在"与"文件空":worker 刚起还没写、或 host 重启 /tmp 丢了,
     # 都会让 tail 回空;单看空行分不清是"没建"还是"在建"。加一行 [ -f ] 探测,Lambda 据此
     # 在响应里透出 progress_file_missing,但【不因此报错】(fresh/in-flight job 文件本就可能暂缺)。
     script = (
@@ -3204,11 +3321,13 @@ def pull_image_progress(instance_id, query_params=None):
     # 也视作"进度不可用"。两者都进 progress_file_missing,交由下方 reconciler 用 host 真值对账。
     file_missing = (not ok) or ("__EXISTS__no" in (tail or ""))
     job_status = _pull_status_from_line(last_line)
+    # #333(codex round4/5)终态持久化优先:worker 早退(SSM 未下发/进度文件没建)时,进度文件
     # 判不出终态(永远 InProgress),但 Lambda 侧 _record_pull_error 把失败写进了 DDB last_pull_error。
     # 故 DDB last_pull_error 有值 → 覆盖为 Failed(以持久化终态为准,不让 worker 早退永卡 InProgress)。
     ddb_err = item.get("last_pull_error")
     if job_status != "Completed" and ddb_err:
         job_status = "Failed"
+    # #394 reconciler:非终态 Job + progress 文件丢失/终态写失败时，从持久真值收敛。
     # live 以 host.status + snapshot_time 为证据；canary 以 lease 已结束且 slots mirror
     # 在 Job 入队后完成过同步为证据。后者由 pull commit 和 host-agent 心跳共同维护，避免
     # 把 canary 正在执行期间的旧指针误判为失败。所有推断终态必须先成功写回 Job；写失败
@@ -3320,6 +3439,7 @@ def pull_image_progress(instance_id, query_params=None):
     return _resp(200, out)
 
 
+# #309 owner 2026-07-20 — pull-image 可返回的失败码(winner worker 各失败点 _perr "<CODE> ..."
 # 写进度文件,pull_image_progress 提取成 ErrorCode + FailureReason)。枚举清楚便于 UI/运维按码处置。
 # 并发防护两层:① Lambda 侧 _set_host_upgrading 原子 CAS 在入口挡(一台 host 同时只一个 pull);
 # ② host 侧 flock + job-fencing 兜住 async Lambda at-least-once 重投(同一 job 起第二个 worker)。

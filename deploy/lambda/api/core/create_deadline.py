@@ -105,6 +105,7 @@ ALL_REASONS = (REASON_CAPACITY, REASON_DEADLINE_EXCEEDED, REASON_SYSTEM)
 # #564 G1 —— per-action 死线口径:八个操作的单一真相
 # ═══════════════════════════════════════════════════════════════════════════
 #
+# 为什么把它放进本模块而不是新开一个:#430 的教训(见模块 docstring)在这里翻倍 ——
 # 八个操作 × 四条通道,散开写就是 32 个漂移点。本模块已经是 create 那条通道的口径来源、
 # 且已有四个消费者;把另外七个操作接到同一份里,`rg` 才能证明"无第二处硬写秒数"
 # (issue 验收第 1 条)。
@@ -495,6 +496,105 @@ def env_name_for(action: str) -> str:
         )
     return _ENV_PREFIX + key.upper()
 
+
+FENCE_LEASE_PARAM_NAME = "/openclaw/lifecycle/fence-lease-sec"
+"""生命周期**租约**秒数在 SSM Parameter Store 里的参数全名(#680 的运行时载体)。
+
+**为什么这个名字放在本模块**,而实现在 `core/fence_config.py`:与下面 `PARAM_PREFIX` 完全
+同一条理由 —— `deploy/stacks/lambdas.py` 建 `StringParameter` 时要用参数名,而 **CDK synth
+期碰不了 boto3**,它已经在 import 本模块取 `env_name_for()`。名字属于「口径」,读取实现才
+属于载体层。两处各拼一份字符串就会出现「CDK 建了 A、运行时读 B」:参数建好了没人读,
+而读的那个永远 `ParameterNotFound` 一路回落默认,日志上完全看不出来。
+
+**它刻意不在 `PARAM_PREFIX` 之下**:那个前缀的语义是「每个动作的死线秒数」,由
+`deadline_config._fetch_all()` 用 `GetParametersByPath` + `Recursive=False` 整段取回,
+并且对不在 `DEADLINE_ACTIONS` 里的名字一律跳过。租约不是「某个动作的死线」,是所有
+fenced 动作**共用的一个值**;塞进那个前缀会同时污染两件事:语义,以及那段在役读路径。
+放同级、独立读,见 `fence_config` 模块 docstring 里的配额算术。
+"""
+
+FENCE_LEASE_DEFAULT_SEC = 240
+"""生命周期租约的**权威默认秒数**(#680:此前是 1800)。
+
+放在这个零 boto3 的模块里,与 `FENCE_LEASE_PARAM_NAME` 同一条理由:`deploy/stacks/lambdas.py`
+在 **synth 期**要用它给 SSM 参数填默认值,而 synth 期碰不了 boto3(`core/fence_config.py`
+import `core.clients`)。读取实现留在 `fence_config`,**默认值只有这一份**。
+
+1800 的后果不是"锁得久一点":客户带 requestId 重试会连吃 409 直到租约自然过期,而客户方的
+容忍是 120s。降下来之后「什么时候能安全重做」由租约过期自己回答 —— 过期后的 `acquire`
+走新 owner 接管分支并把 `lifecycle_fence_epoch` +1,旧命令的 `host_guard` 随即判 epoch
+不符而 `exit 79` 自杀。
+
+## 为什么是 240(这个数换过两次,两次的理由都写下来)
+
+**约束是「租约必须 ≥ 该动作执行段的墙钟预算 `exec_sec`」**,不是「≥ 实测 lease_hold」,也
+不是「≥ 死线」。三个版本的取值与被推翻的理由:
+
+| 版本 | 取值 | 依据 | 为什么被推翻 |
+| ---- | ---- | ---- | ------------ |
+| 初版 | 120 | 实测 lease_hold 上界 46.53s 的 2.6 倍 | 实测值不是上界,只说明典型负载没跑满预算 |
+| 二版 | 240 | 「≥ 死线」,五档都是 180s → 180+60 | 死线含**排队段**,而租约只在执行段被持有;且它答不了 `delete` 那档(600s 死线) |
+| 现版 | 240 | **≥ `FENCE_LEASE_MIN_SEC`(=210,`delete` 的 `exec_sec`)** | — |
+
+取值没变,理由变了。死线 = 摄入 + 排队 + 执行,而租约是在 `_ssm_run` 真正跑的那一段被持有
+的,所以要覆盖的是 `exec_sec` 而非死线。这条也顺带解释了 `delete`:它死线 600s,但执行段只
+有 210s(排队段 390s 是八档里最宽裕的),240 覆盖得住 —— 二版那个「240 短于 delete 死线,靠
+软删实测 7.18s 兜」的说法是把两件事混了。
+
+240 = 210(最长 fenced 执行段)+ 30(缓冲),与 2026-08-28 会议的取法一致(会议原话:「将 1800
+秒锁定时间调整为略大于业务侧轮询超时时间,如 180 秒 + 30 秒缓冲」——会上说的 180 是死线口径,
+换成执行段口径后基数变 210,缓冲仍取 30)。
+
+**客户等待不再由租约长度决定**,这是 #680 的关键变化:客户带同一 `client_token` 重试会立刻
+拿到 `202 + retry_after_sec`(不必等租约过期),所以把租约放到 240 不会让客户多等 —— 它只
+影响「真正重做」的时机。因此「配短一点让客户早点能重做」这个动机在 #680 之后基本消失,而
+`FENCE_LEASE_MIN_SEC` 会把低于 210 的取值一律拒掉:**这个参数的用途是往上调**(超大盘租户
+的备份可能吃满 90s 预算),不是往下调。
+
+per-action 分档(每个动作按自己的 `exec_sec` 取租约)是更彻底的解,留待后续:全局单值必须按
+最长的那档取,于是 restart(执行段仅 75s)也跟着拿 240s 租约。这只影响「过期后才能真正重做」
+的时机,不影响客户重试拿 202,所以本轮不做。
+"""
+
+_FENCE_LEASE_COVERED_ACTIONS = (
+    ACTION_SUSPEND,
+    ACTION_RESTART,
+    ACTION_REBUILD,
+    ACTION_DELETE,
+)
+"""取生命周期租约的动作 ∩ 有执行段预算的动作。
+
+`_FENCED_LIFECYCLE_ACTIONS`(`services/tenant_service.py`)是
+`{rebuild, migrate, reset, delete, restart, suspend}`;`migrate`/`reset` 已废弃且本就不在
+`_EXEC_STEPS` 里,所以交集就是这四个。`restore`/`start` 不走租约,`create`/`backup` 不是
+fenced 动作 —— 都不参与下界推导。
+"""
+
+FENCE_LEASE_MIN_SEC = max(exec_sec(_a) for _a in _FENCE_LEASE_COVERED_ACTIONS)
+"""租约秒数的**硬下界**。低于它一律拒绝(synth 期与运行时共用这一个数)。
+
+**从 `_EXEC_STEPS` 推导,不写字面量** —— 与本模块「八档都有权威值且全部从 `_EXEC_STEPS`
+推导」同一条纪律:下界抄成常量,`_EXEC_STEPS` 一改就静默失配。当前取值 = `delete` 的执行段
+总额 **210s**(备份 90 + host 删除 120),它是四个 fenced 动作里最大的
+(suspend 140、restart 75、rebuild 156)。
+
+## 为什么下界是「执行段预算」而不是实测 lease_hold
+
+初版取 60,依据是实测 lease_hold 上界 46.53s(6.3GB suspend)。**那个依据是错的**:实测值
+只说明典型负载下没跑满预算,它不是上界。真正的上界是 `exec_sec` —— 那是每一步
+`_ssm_run(timeout=…)` 的墙钟额度之和,即一次执行**合法在飞**的最长时间。租约短于它,一个
+完全合法、还没超预算的操作会被自己的租约过期打断:`host_guard` 判 owner/epoch 不符 →
+`exit 79`。
+
+`delete` 那档最要紧,因为它的后置 guard 夹在 `delete-vm.sh` **之后**
+(`services/tenant_service.py` 的 `f"… && {delete_host_guard}"`):VM 与数据盘已经删掉,后置
+guard 才因租约过期 `exit 79` → SSM `rc=79` → 控制面认为 delete 失败 → 租户卡在 `deleting`
+且资源已不可恢复。
+
+实测佐证(ap-southeast-1,2026-08-28,#680 门 5):`delete ?keep_data=false` 在数据盘塞满
+6GB 不可压缩数据时,单次执行持有租约 **69.55s**(两次 6GB 备份:预备份 27.0s + 删前静止盘
+备份 36s)。69.55s 已经超过初版下界 60,而 `exec_sec` 给的 210s 才是真正装得下最坏情况的数。
+"""
 
 PARAM_PREFIX = "/openclaw/lifecycle/deadline-sec/"
 """八档死线在 SSM Parameter Store 里的公共前缀(#564 G5 的运行时载体)。
@@ -1115,6 +1215,25 @@ def assert_budget_consistent() -> None:
         )
 
 
+def assert_fence_lease_sane() -> None:
+    """租约默认值必须装得下最长 fenced 执行段。导入期跑一次,写坏了立刻炸。
+
+    没有这条,`_EXEC_STEPS` 里给某个 fenced 动作加一步预算(比如 delete 的备份从 90 抬到 150)
+    就会让 `FENCE_LEASE_MIN_SEC` 自动涨到默认值之上,而默认值不会跟着动 —— 于是每一次不带
+    SSM 参数的部署都在用一个**低于自己下界**的租约,而那种失败看起来像 host 故障。
+    """
+    if FENCE_LEASE_DEFAULT_SEC < FENCE_LEASE_MIN_SEC:
+        worst = max(
+            _FENCE_LEASE_COVERED_ACTIONS, key=lambda _a: exec_sec(_a)
+        )
+        raise ValueError(
+            f"FENCE_LEASE_DEFAULT_SEC={FENCE_LEASE_DEFAULT_SEC} 低于硬下界 "
+            f"{FENCE_LEASE_MIN_SEC}(= {worst} 的执行段预算) —— 默认租约装不下最长的 "
+            "fenced 动作,该动作会在执行中途被自己的租约过期斩断(host_guard exit 79)"
+        )
+
+
 assert_budget_consistent()
 assert_deadline_config_sane()  # #564 G5 —— 八档死线的下界约束,同款导入期 fail-closed
 assert_all_budgets_consistent()  # #565 G1 —— 八档的三段预算之和必须恰好等于各自死线
+assert_fence_lease_sane()  # #680 —— 默认租约 ≥ 最长 fenced 执行段,同款导入期 fail-closed

@@ -18,6 +18,7 @@ overcommit/quota 常量**全部**走 `clients.X` 属性访问,不用 from-import
 本模块不持有任何 clients 符号的独立绑定,测试重绑 `clients.X` 即全局生效。
 """
 
+import os
 import random
 import time
 
@@ -283,11 +284,17 @@ def _host_claimed_slots(host_item, exclude_ids=None):
 
 
 def phys_occupied_pairs(host_ids):
-    """一次 tenants scan 返回多个 host 的 {(owner_id, phys_num)} 占用映射。
+    """一次读取返回多个 host 的 {(owner_id, phys_num)} 占用映射。
 
     host_ids 中每个 id 都必有键。owner_id 让 dispatch 在预取后按各 host 自己的
-    batch_ids 排除本批租户；扫描或任一 host 强一致读失败时返回 None，调用方必须
-    fail-closed。
+    batch_ids 排除本批租户；索引/扫描或任一 host 强一致读失败时返回 None，
+    调用方必须 fail-closed。
+
+    TENANT_QUERY_ENABLED=true 时，驻留租户走 gsi_host Query，迁入租户走
+    gsi_status Query，避免热路径强一致扫描整张 tenants 表。该开关只会在查询索引
+    全部就绪后启用。GSI 只提供最终一致提示；真正的新占号仍由下方 hosts 表强一致
+    读取的 ps_*、reserve 条件写和调用方的 tap 复检兜底。索引查询未启用时保留原
+    Scan 行为，兼容默认部署。
     """
     requested = list(dict.fromkeys(host_ids))
     occupied = {host_id: set() for host_id in requested}
@@ -296,42 +303,99 @@ def phys_occupied_pairs(host_ids):
         return occupied
     _SCAN_STATS["calls"] += 1
     try:
-        scan_kwargs = {
-            "FilterExpression": "#s <> :d",
-            "ExpressionAttributeNames": {"#s": "status"},
-            "ExpressionAttributeValues": {":d": "deleted"},
-            # 内存里同时判 resident 与 migration_target,故投影保留 host/status 字段。
-            "ProjectionExpression": (
-                "id, host_id, migration_target, vm_num, phys_vm_num, #s"
-            ),
-            "ConsistentRead": True,
-        }
-        start_key = None
-        while True:
-            kwargs = dict(scan_kwargs)
-            if start_key:
-                kwargs["ExclusiveStartKey"] = start_key
-            resp = clients.tenants_table.scan(**kwargs)
-            _SCAN_STATS["pages"] += 1
-            for item in resp.get("Items", []):
-                phys = item.get("phys_vm_num", item.get("vm_num"))
-                try:
-                    phys_num = int(phys)
-                except (TypeError, ValueError):
-                    continue
-                pair = (item.get("id"), phys_num)
-                host_id = item.get("host_id")
-                if host_id in occupied:
-                    occupied[host_id].add(pair)
-                migration_target = item.get("migration_target")
-                if (
-                    migration_target in occupied
-                    and item.get("status") == "migrating"
-                ):
-                    occupied[migration_target].add(pair)
-            start_key = resp.get("LastEvaluatedKey")
-            if not start_key:
-                break
+        use_indexes = (
+            os.environ.get("TENANT_QUERY_ENABLED", "false").lower() == "true"
+        )
+        if use_indexes:
+            for host_id in requested:
+                start_key = None
+                while True:
+                    kwargs = {
+                        "IndexName": "gsi_host",
+                        "KeyConditionExpression": "host_id = :h",
+                        "FilterExpression": "#s <> :d",
+                        "ExpressionAttributeNames": {"#s": "status"},
+                        "ExpressionAttributeValues": {":h": host_id, ":d": "deleted"},
+                        "ProjectionExpression": "id, host_id, vm_num, phys_vm_num, #s",
+                    }
+                    if start_key:
+                        kwargs["ExclusiveStartKey"] = start_key
+                    resp = clients.tenants_table.query(**kwargs)
+                    _SCAN_STATS["pages"] += 1
+                    for item in resp.get("Items", []):
+                        phys = item.get("phys_vm_num", item.get("vm_num"))
+                        try:
+                            occupied[host_id].add((item.get("id"), int(phys)))
+                        except (TypeError, ValueError):
+                            continue
+                    start_key = resp.get("LastEvaluatedKey")
+                    if not start_key:
+                        break
+
+            start_key = None
+            while True:
+                kwargs = {
+                    "IndexName": "gsi_status",
+                    "KeyConditionExpression": "#s = :m",
+                    "ExpressionAttributeNames": {"#s": "status"},
+                    "ExpressionAttributeValues": {":m": "migrating"},
+                    "ProjectionExpression": (
+                        "id, migration_target, vm_num, phys_vm_num, #s"
+                    ),
+                }
+                if start_key:
+                    kwargs["ExclusiveStartKey"] = start_key
+                resp = clients.tenants_table.query(**kwargs)
+                _SCAN_STATS["pages"] += 1
+                for item in resp.get("Items", []):
+                    migration_target = item.get("migration_target")
+                    if migration_target not in occupied:
+                        continue
+                    phys = item.get("phys_vm_num", item.get("vm_num"))
+                    try:
+                        occupied[migration_target].add((item.get("id"), int(phys)))
+                    except (TypeError, ValueError):
+                        continue
+                start_key = resp.get("LastEvaluatedKey")
+                if not start_key:
+                    break
+        else:
+            scan_kwargs = {
+                "FilterExpression": "#s <> :d",
+                "ExpressionAttributeNames": {"#s": "status"},
+                "ExpressionAttributeValues": {":d": "deleted"},
+                # 内存里同时判 resident 与 migration_target,故投影保留 host/status 字段。
+                "ProjectionExpression": (
+                    "id, host_id, migration_target, vm_num, phys_vm_num, #s"
+                ),
+                "ConsistentRead": True,
+            }
+            start_key = None
+            while True:
+                kwargs = dict(scan_kwargs)
+                if start_key:
+                    kwargs["ExclusiveStartKey"] = start_key
+                resp = clients.tenants_table.scan(**kwargs)
+                _SCAN_STATS["pages"] += 1
+                for item in resp.get("Items", []):
+                    phys = item.get("phys_vm_num", item.get("vm_num"))
+                    try:
+                        phys_num = int(phys)
+                    except (TypeError, ValueError):
+                        continue
+                    pair = (item.get("id"), phys_num)
+                    host_id = item.get("host_id")
+                    if host_id in occupied:
+                        occupied[host_id].add(pair)
+                    migration_target = item.get("migration_target")
+                    if (
+                        migration_target in occupied
+                        and item.get("status") == "migrating"
+                    ):
+                        occupied[migration_target].add(pair)
+                start_key = resp.get("LastEvaluatedKey")
+                if not start_key:
+                    break
 
         for host_id in requested:
             host_item = (

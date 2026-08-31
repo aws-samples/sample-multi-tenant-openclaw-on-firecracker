@@ -28,6 +28,7 @@ Successor to `patch/lc2-patch`. It packages the source range
 | Lifecycle failure states | `tenant_service.py`, `deadline_executor.py`, `health_check/handler.py`, `host_service.py` | `suspend_failed` split by whether a backup exists; `restore` has no failed terminal state; host death confirmed against EC2, not inferred from a missing table row |
 | Egress dry run | `egress_admin_service.py` | `POST /hosts/egress/allow/validate` reports each unavailable protected-network criterion separately |
 | Pre-launch validator (**optional**, see the end of Step 6) | `lib/validator/**` (19 files) | Read-only operator tool: 11 data-plane delivery channels + control-plane drift, PASS / FAIL / NOT JUDGED per channel. Supersedes the `patch/validator` copy: the same 20 filenames, with three files carrying fixes that copy does not have (a load-bearing `re.MULTILINE`, a content-addressed test fixture, and a `__pycache__` exclusion that stops a false red on the second run). |
+| Restore occupancy GSI (**optional addendum**) | `addenda/restore-gsi/` | Replaces the hot-path full-table tenant Scan with bounded `gsi_host`/`gsi_status` Queries while preserving the strong host `ps_*` safety union and the original Scan fallback. The addendum has its own base/patch manifest; read its instructions before use. |
 
 | SSM SendCommand rate (**optional tuning**, Step 4.4) | Lambda environment on `openclaw-api` + `openclaw-lifecycle-consumer` | `SPREAD_MAX_HOSTS_PER_BATCH` 6 -> 3 and `HOST_SELECTION_SCORE_FLOOR` 0.5 -> 0.25, halving the SendCommand calls per create batch. Configuration only, no code change. |
 
@@ -37,6 +38,10 @@ role-policy additions (two `ssm:GetParameter`, one `ec2:DescribeInstances`).
 **Nothing in this range touches the Launch Template, host userdata, or any S3-delivered host
 script.** Steps 3 and 5 are therefore explicitly no-ops — you do not need to roll the host
 fleet or launch a fresh host to accept this kit.
+
+The restore occupancy optimization is not part of the parent source range above. It is shipped
+as an independently versioned addendum under `addenda/restore-gsi/` so this historical kit's
+manifest and CloudFormation provenance remain immutable.
 
 ## Step 0 — Discover the environment, then prove the kit is authentic
 

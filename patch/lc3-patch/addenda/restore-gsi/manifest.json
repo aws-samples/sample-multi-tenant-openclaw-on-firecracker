@@ -1,0 +1,55 @@
+{
+  "id": "lc3-restore-gsi-addendum",
+  "parent_kit": "lc3-patch",
+  "base_sha": "176f20fc58b04cd14fc286b35d7c8565f3c20b9b",
+  "patch_sha": "f95dc105f15e74f5c248d9ff0a73e5f46b5fbf9c",
+  "status": "MANUAL_REVIEW",
+  "paths": {
+    "deploy/lambda/api/core/scheduling.py": {
+      "change": "M",
+      "layer": "C-lambda",
+      "artifact": "lambda/api/core/scheduling.py",
+      "artifact_status": "SHIPPED",
+      "base_sha256": "56136b37010affe86e65181b506ec350f6aa3f01061dc5870da30a178aab63df",
+      "patch_sha256": "ba6c9286faa1b3e80872dea384baf70fb1ec15526bf7b7d70bb38120af768b61",
+      "operations": [
+        {
+          "resource": "file:deploy/lambda/api/core/scheduling.py",
+          "class": "AUTO_CLI",
+          "apply_cli": null,
+          "verify_cli": "sha256sum <target package>/core/scheduling.py",
+          "rollback_cli": "restore the Lambda ZIP backed up before applying this addendum",
+          "rollback_policy": "RESTORE"
+        }
+      ],
+      "fix_ids": [
+        "restore-occupancy-gsi-query"
+      ]
+    }
+  },
+  "validation": {
+    "environment": "795938553855/ap-southeast-1",
+    "table_rows": 75684,
+    "baseline_scan": {
+      "seconds": 37.152,
+      "pages": 439,
+      "rcu": 112856
+    },
+    "restore_before": {
+      "accepted": 75,
+      "observed_seconds": 366.325,
+      "running": 2,
+      "restoring": 18,
+      "suspended": 55
+    },
+    "restore_after": {
+      "accepted": 75,
+      "running": 75,
+      "new_failures": 0,
+      "all_complete_seconds": 49.945,
+      "p50_seconds": 36.616,
+      "p90_seconds": 36.616,
+      "p99_seconds": 46.457
+    }
+  }
+}

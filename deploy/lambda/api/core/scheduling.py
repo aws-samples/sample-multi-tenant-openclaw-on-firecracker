@@ -236,16 +236,27 @@ MAX_ATOMIC_SLOT_CLAIM = 120
 # reserve 重试环里的 next_free_phys_run、同步 create 的 phys_tap_occupied、restore),
 # 穿参要改四条链的签名。Lambda 执行模型保证同一 container 内 invocation 串行(不并发),
 # 而 dispatch_batch 在入口处归零,所以一次 invocation 读到的就是它自己的账。
-_SCAN_STATS = {"calls": 0, "pages": 0}
+_SCAN_STATS = {"calls": 0, "pages": 0, "query_pages": 0}
 
 
 def reset_scan_stats():
     _SCAN_STATS["calls"] = 0
     _SCAN_STATS["pages"] = 0
+    _SCAN_STATS["query_pages"] = 0
 
 
 def get_scan_stats():
     return dict(_SCAN_STATS)
+
+
+def _tenant_query_enabled():
+    """索引查询开关。默认 false → 保留原全表 Scan,兼容未创建可选 GSI 的部署。
+
+    仅当 gsi_host+gsi_status 都已 deploy 且 backfill 完成(ACTIVE)后才允许翻 true,
+    否则查询会 ResourceNotFoundException 或漏读回填中的行 → fail-closed。开关与索引
+    实存解耦,是有意的灰度/回滚 lever,但翻开前的索引就绪由 runbook 保证。
+    """
+    return os.environ.get("TENANT_QUERY_ENABLED", "false").lower() == "true"
 
 
 def phys_slot_attr(num):
@@ -287,87 +298,90 @@ def phys_occupied_pairs(host_ids):
     """一次读取返回多个 host 的 {(owner_id, phys_num)} 占用映射。
 
     host_ids 中每个 id 都必有键。owner_id 让 dispatch 在预取后按各 host 自己的
-    batch_ids 排除本批租户；索引/扫描或任一 host 强一致读失败时返回 None，
-    调用方必须 fail-closed。
+    batch_ids 排除本批租户；索引/扫描或任一 host 强一致读失败时返回 None，调用方
+    必须 fail-closed。
 
-    TENANT_QUERY_ENABLED=true 时，驻留租户走 gsi_host Query，迁入租户走
-    gsi_status Query，避免热路径强一致扫描整张 tenants 表。该开关只会在查询索引
-    全部就绪后启用。GSI 只提供最终一致提示；真正的新占号仍由下方 hosts 表强一致
-    读取的 ps_*、reserve 条件写和调用方的 tap 复检兜底。索引查询未启用时保留原
-    Scan 行为，兼容默认部署。
+    TENANT_QUERY_ENABLED=true 时走 gsi_host/gsi_status 定向 Query(见 _tenant_query_
+    enabled),避免热路径强一致扫全表(75k 行/次 ~11 万 RCU/~43s,并发下打爆 on-demand
+    表节流);默认 false 保留原全表强一致 Scan,兼容未创建这两个可选 GSI 的部署。
+
+    【读一致性边界(评审要点)】GSI 只提供最终一致,新占号的权威门是 reserve 事务的
+    原子条件写(next_vm_num=:expected CAS + attribute_not_exists(ps_<n>))+ 下方 host
+    侧 ps_* 强一致读。但【存量租户可能没有 ps_*】,其物理 tap 只记在 tenants 行里 ——
+    对这类租户,若 GSI 回填未完成/漏读,预留前预取与预留后复检读的是同一份过期索引,
+    可能漏过物理 tap 冲突且无 ps_* 兜底。故翻开开关前必须(runbook)保证:两个 GSI 已
+    ACTIVE 且 backfill 完成,且每个在役物理槽 ∈ (ACTIVE GSI ∪ ps_*)。
     """
     requested = list(dict.fromkeys(host_ids))
     occupied = {host_id: set() for host_id in requested}
     if not requested:
-        # #671 —— 空 host 集没有真正发起 scan,故不计 calls/pages。
+        # #671 —— 空 host 集没有真正发起读取,故不计 calls/pages。
         return occupied
     _SCAN_STATS["calls"] += 1
     try:
-        use_indexes = (
-            os.environ.get("TENANT_QUERY_ENABLED", "false").lower() == "true"
-        )
-        if use_indexes:
-            for host_id in requested:
+        # resident 与 migration_target 两个分桶逐字复用同一份 _absorb,Query/Scan 两条
+        # 路径共享,避免逻辑分叉(GPT PR #241 三处内联重复 → 改分桶要同步 3 处)。
+        proj = "id, host_id, migration_target, vm_num, phys_vm_num, #s"
+
+        def _absorb(item):
+            phys = item.get("phys_vm_num", item.get("vm_num"))
+            try:
+                phys_num = int(phys)
+            except (TypeError, ValueError):
+                return
+            pair = (item.get("id"), phys_num)
+            host_id = item.get("host_id")
+            if host_id in occupied:
+                occupied[host_id].add(pair)
+            migration_target = item.get("migration_target")
+            if migration_target in occupied and item.get("status") == "migrating":
+                occupied[migration_target].add(pair)
+
+        if _tenant_query_enabled():
+            # 定向 Query 路径。query_pages 单独计数,不污染 phys_scan_pages 指标(Scan 页)。
+            def _query_all(**kw):
                 start_key = None
                 while True:
-                    kwargs = {
-                        "IndexName": "gsi_host",
-                        "KeyConditionExpression": "host_id = :h",
-                        "FilterExpression": "#s <> :d",
-                        "ExpressionAttributeNames": {"#s": "status"},
-                        "ExpressionAttributeValues": {":h": host_id, ":d": "deleted"},
-                        "ProjectionExpression": "id, host_id, vm_num, phys_vm_num, #s",
-                    }
                     if start_key:
-                        kwargs["ExclusiveStartKey"] = start_key
-                    resp = clients.tenants_table.query(**kwargs)
-                    _SCAN_STATS["pages"] += 1
+                        kw = {**kw, "ExclusiveStartKey": start_key}
+                    resp = clients.tenants_table.query(**kw)
+                    _SCAN_STATS["query_pages"] += 1
                     for item in resp.get("Items", []):
-                        phys = item.get("phys_vm_num", item.get("vm_num"))
-                        try:
-                            occupied[host_id].add((item.get("id"), int(phys)))
-                        except (TypeError, ValueError):
-                            continue
+                        _absorb(item)
                     start_key = resp.get("LastEvaluatedKey")
                     if not start_key:
                         break
 
-            start_key = None
-            while True:
-                kwargs = {
-                    "IndexName": "gsi_status",
-                    "KeyConditionExpression": "#s = :m",
-                    "ExpressionAttributeNames": {"#s": "status"},
-                    "ExpressionAttributeValues": {":m": "migrating"},
-                    "ProjectionExpression": (
-                        "id, migration_target, vm_num, phys_vm_num, #s"
-                    ),
-                }
-                if start_key:
-                    kwargs["ExclusiveStartKey"] = start_key
-                resp = clients.tenants_table.query(**kwargs)
-                _SCAN_STATS["pages"] += 1
-                for item in resp.get("Items", []):
-                    migration_target = item.get("migration_target")
-                    if migration_target not in occupied:
-                        continue
-                    phys = item.get("phys_vm_num", item.get("vm_num"))
-                    try:
-                        occupied[migration_target].add((item.get("id"), int(phys)))
-                    except (TypeError, ValueError):
-                        continue
-                start_key = resp.get("LastEvaluatedKey")
-                if not start_key:
-                    break
+            # ① 驻留各请求 host 的租户:按 host 定向 Query gsi_host。status 不是 gsi_host 的
+            #    主键,故可用 FilterExpression 排除 deleted。
+            for host_id in requested:
+                _query_all(
+                    IndexName="gsi_host",
+                    KeyConditionExpression="host_id = :h",
+                    FilterExpression="#s <> :d",
+                    ExpressionAttributeNames={"#s": "status"},
+                    ExpressionAttributeValues={":d": "deleted", ":h": host_id},
+                    ProjectionExpression=proj,
+                )
+            # ② 正在迁入某请求 host 的租户:Query gsi_status(status=migrating)后内存筛
+            #    migration_target(_absorb 里判)。migrating 是低频瞬态小集合。
+            #    【关键】status 是 gsi_status 的分区键,DynamoDB 禁止 FilterExpression 引用
+            #    被查索引的主键,故这里【不能】加 #s<>deleted;且 migrating 天然非 deleted,
+            #    该过滤本就多余。#s 仍用于 KeyCondition 与投影。
+            _query_all(
+                IndexName="gsi_status",
+                KeyConditionExpression="#s = :m",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={":m": "migrating"},
+                ProjectionExpression=proj,
+            )
         else:
+            # 默认路径:原全表强一致 Scan(逐字保留旧行为,含 ConsistentRead)。
             scan_kwargs = {
                 "FilterExpression": "#s <> :d",
                 "ExpressionAttributeNames": {"#s": "status"},
                 "ExpressionAttributeValues": {":d": "deleted"},
-                # 内存里同时判 resident 与 migration_target,故投影保留 host/status 字段。
-                "ProjectionExpression": (
-                    "id, host_id, migration_target, vm_num, phys_vm_num, #s"
-                ),
+                "ProjectionExpression": proj,
                 "ConsistentRead": True,
             }
             start_key = None
@@ -378,21 +392,7 @@ def phys_occupied_pairs(host_ids):
                 resp = clients.tenants_table.scan(**kwargs)
                 _SCAN_STATS["pages"] += 1
                 for item in resp.get("Items", []):
-                    phys = item.get("phys_vm_num", item.get("vm_num"))
-                    try:
-                        phys_num = int(phys)
-                    except (TypeError, ValueError):
-                        continue
-                    pair = (item.get("id"), phys_num)
-                    host_id = item.get("host_id")
-                    if host_id in occupied:
-                        occupied[host_id].add(pair)
-                    migration_target = item.get("migration_target")
-                    if (
-                        migration_target in occupied
-                        and item.get("status") == "migrating"
-                    ):
-                        occupied[migration_target].add(pair)
+                    _absorb(item)
                 start_key = resp.get("LastEvaluatedKey")
                 if not start_key:
                     break

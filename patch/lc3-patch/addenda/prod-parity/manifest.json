@@ -1,0 +1,91 @@
+{
+ "id": "lc3-prod-parity-addendum",
+ "parent_kit": "lc3-patch",
+ "base_sha": "3f120cd342740156623eea585d5290e66e7b8058",
+ "patch_sha": "gateway PR #242 (branch parity/prod-defaults-20260903)",
+ "status": "MANUAL_REVIEW",
+ "purpose": "Bring any environment that applied lc3-patch to the 2026-09-03 production baseline (H1 H3 H4 H5 H6 H7) and prove it with lib/verify-prod-parity.sh (adds H10 H14 read-only checks).",
+ "paths": {
+  "deploy/lambda/api/core/create_deadline.py": {
+   "change": "M",
+   "layer": "C-lambda",
+   "artifact": "lambda/api/core/create_deadline.py",
+   "artifact_status": "SHIPPED",
+   "base_sha256": "076ea7080209ecff6199c1a0d5db0e90f7407b6e3c70685451201cd8af786db1",
+   "patch_sha256": "980b49d2436c7f342adee83360bde2fadb02ed74f30e2293035fc18628e42f43",
+   "operations": [
+    {
+     "resource": "file:deploy/lambda/api/core/create_deadline.py",
+     "class": "AUTO_CLI",
+     "apply_cli": null,
+     "verify_cli": "sha256sum <target package>/core/create_deadline.py",
+     "rollback_cli": "restore the Lambda ZIP backed up before applying this addendum",
+     "rollback_policy": "RESTORE"
+    }
+   ],
+   "fix_ids": [
+    "H1-exec-budgets-prod-parity"
+   ]
+  }
+ },
+ "config_changes": [
+  {
+   "carrier": "lambda_env",
+   "target": "openclaw-api,openclaw-lifecycle-consumer",
+   "key": "HOST_SELECTION_SCORE_FLOOR",
+   "before": "0.25 (parent kit op lambda-env-spread-and-floor)",
+   "after": "0.39",
+   "reason": "H4: 0.25 concentrated cold restores on few hosts in the 2026-08-31 load test"
+  },
+  {
+   "carrier": "ssm",
+   "target": "/openclaw/lifecycle/deadline-sec/{suspend,restore,restart,start,rebuild}",
+   "key": "Value",
+   "before": "180",
+   "after": "235",
+   "reason": "H3: 180 could not hold queue + exec at 10-15 tps; raised via SSM on 2026-08-29"
+  },
+  {
+   "carrier": "esm",
+   "target": "openclaw-lifecycle.fifo -> openclaw-lifecycle-consumer",
+   "key": "ScalingConfig.MaximumConcurrency",
+   "before": "20",
+   "after": "75",
+   "reason": "H5"
+  },
+  {
+   "carrier": "lambda_config",
+   "target": "openclaw-lifecycle-consumer",
+   "key": "ReservedConcurrentExecutions",
+   "before": "unset",
+   "after": "75",
+   "reason": "H5"
+  },
+  {
+   "carrier": "esm",
+   "target": "openclaw-dispatch -> openclaw-api",
+   "key": "ScalingConfig.MaximumConcurrency",
+   "before": "10",
+   "after": "25",
+   "reason": "H5"
+  },
+  {
+   "carrier": "ssm",
+   "target": "/openclaw/control-ui-allowed-origins,/openclaw/cloudfront-origin",
+   "key": "Value",
+   "before": "deployment dashboard origin",
+   "after": "*",
+   "reason": "H7: operator decision, disables Origin checking fleet-wide"
+  }
+ ],
+ "not_changed_by_this_addendum": [
+  "TENANT_QUERY_ENABLED and the four tenant-query GSIs (H4/H6): use addenda/restore-gsi first; this addendum only verifies them",
+  "LIFECYCLE_DEADLINE_SEC_* env (production runs 180 with SSM 235; a fresh PR #242 deployment injects 235; both accepted)",
+  "host scripts (H10) and ASG mix (H14): verified, never written"
+ ],
+ "kit_files": {
+  "lib/verify-prod-parity.sh": {},
+  "lib/selftest.sh": {},
+  "baseline.json": {}
+ }
+}

@@ -1,0 +1,142 @@
+{
+ "baseline_id": "prod-2026-09-03",
+ "source": "read-only forensic capture of the production control plane, 2026-09-03; values cross-checked against gateway PR #242",
+ "functions": {
+  "api": "openclaw-api",
+  "consumer": "openclaw-lifecycle-consumer"
+ },
+ "lambda_code": {
+  "core/create_deadline.py": {
+   "sha256": "980b49d2436c7f342adee83360bde2fadb02ed74f30e2293035fc18628e42f43",
+   "note": "H1: _EXEC_STEPS suspend (backup 60, stop-vm 46) / restore (launch-vm 60) / rebuild (backup 60, rebuild-vm 66); _QUEUE_SEC suspend 74 / restore 120 / rebuild 54; deadline table stays 180"
+  }
+ },
+ "lambda_env": {
+  "exact": {
+   "HOST_SELECTION_SCORE_FLOOR": {
+    "value": "0.39",
+    "kind": "float"
+   },
+   "SPREAD_MAX_HOSTS_PER_BATCH": {
+    "value": "3"
+   },
+   "TENANT_QUERY_ENABLED": {
+    "value": "true",
+    "kind": "bool"
+   },
+   "DISPATCH_MODE": {
+    "value": "ddb"
+   },
+   "CREATE_VIA_QUEUE": {
+    "value": "false",
+    "kind": "bool"
+   },
+   "CPU_OVERCOMMIT_RATIO": {
+    "value": "6.0",
+    "kind": "float"
+   },
+   "MEM_OVERCOMMIT_RATIO": {
+    "value": "2.0",
+    "kind": "float"
+   }
+  },
+  "deadline_env_allowed": {
+   "LIFECYCLE_DEADLINE_SEC_SUSPEND": [
+    "180",
+    "235"
+   ],
+   "LIFECYCLE_DEADLINE_SEC_RESTORE": [
+    "180",
+    "235"
+   ],
+   "LIFECYCLE_DEADLINE_SEC_RESTART": [
+    "180",
+    "235"
+   ],
+   "LIFECYCLE_DEADLINE_SEC_START": [
+    "180",
+    "235"
+   ],
+   "LIFECYCLE_DEADLINE_SEC_REBUILD": [
+    "180",
+    "235"
+   ],
+   "LIFECYCLE_DEADLINE_SEC_CREATE": [
+    "180"
+   ],
+   "LIFECYCLE_DEADLINE_SEC_BACKUP": [
+    "600"
+   ],
+   "LIFECYCLE_DEADLINE_SEC_DELETE": [
+    "600"
+   ]
+  }
+ },
+ "ssm": {
+  "exact": {
+   "/openclaw/lifecycle/deadline-sec/create": "180",
+   "/openclaw/lifecycle/deadline-sec/suspend": "235",
+   "/openclaw/lifecycle/deadline-sec/restore": "235",
+   "/openclaw/lifecycle/deadline-sec/restart": "235",
+   "/openclaw/lifecycle/deadline-sec/start": "235",
+   "/openclaw/lifecycle/deadline-sec/rebuild": "235",
+   "/openclaw/lifecycle/deadline-sec/backup": "600",
+   "/openclaw/lifecycle/deadline-sec/delete": "600",
+   "/openclaw/lifecycle/fence-lease-sec": "240"
+  },
+  "origins_contain_wildcard": [
+   "/openclaw/control-ui-allowed-origins",
+   "/openclaw/cloudfront-origin"
+  ]
+ },
+ "esm": {
+  ":openclaw-dispatch": {
+   "BatchSize": 30,
+   "Window": 2,
+   "MaximumConcurrency": 25,
+   "State": "Enabled"
+  },
+  ":openclaw-lifecycle.fifo": {
+   "BatchSize": 1,
+   "Window": 0,
+   "MaximumConcurrency": 75,
+   "State": "Enabled"
+  }
+ },
+ "reserved_concurrency": {
+  "consumer": 75
+ },
+ "dynamodb": {
+  "openclaw-tenants": {
+   "gsi": [
+    "gsi_owner",
+    "gsi_tenant_user",
+    "gsi_host",
+    "gsi_status",
+    "gsi_rootfs_version"
+   ],
+   "gsi_key_attributes": {
+    "gsi_tenant_user": "tenant_user_id",
+    "gsi_host": "host_id",
+    "gsi_status": "status",
+    "gsi_rootfs_version": "q_rootfs_version"
+   }
+  }
+ },
+ "host_scripts": [
+  "launch-vm.sh",
+  "stop-vm.sh",
+  "backup-data.sh",
+  "host-agent.py",
+  "route_ops.py",
+  "migrate-vm.sh"
+ ],
+ "asg": {
+  "instance_types": [
+   "r8g.metal-24xl",
+   "m8g.metal-24xl",
+   "r7g.metal",
+   "m7g.metal"
+  ]
+ }
+}

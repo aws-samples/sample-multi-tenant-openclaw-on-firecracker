@@ -43,6 +43,17 @@ The restore occupancy optimization is not part of the parent source range above.
 as an independently versioned addendum under `addenda/restore-gsi/` so this historical kit's
 manifest and CloudFormation provenance remain immutable.
 
+> **Required before you call any lc3 environment done — `addenda/prod-parity/`.**
+> This kit alone does **not** land the production baseline of 2026-09-03: it ships an older
+> `core/create_deadline.py` (exec budgets 90/50/120) and sets `HOST_SELECTION_SCORE_FLOOR=0.25`,
+> while production runs 60/46/60 and 0.39, SSM deadlines 235, lifecycle ESM 75 / dispatch ESM
+> 25, five tenant GSIs and wildcard origins. `addenda/prod-parity/APPLY-INSTRUCTIONS.md` applies
+> those deltas (each declared in its `manifest.json` → `config_changes`) and
+> `addenda/prod-parity/lib/verify-prod-parity.sh` is the **read-only final check** (H1 H3 H4 H5
+> H6 H7 H10 H14) that must print `RESULT: PASS` for every environment that applied this kit.
+> Run that check again after every later kit: it is the cross-check that a future patch did not
+> overwrite these values. The same baseline is what gateway PR #242 puts in `config.yml.example`.
+
 ## Step 0 — Discover the environment, then prove the kit is authentic
 
 Run the read-only probe first. Everything downstream reads its output rather than a

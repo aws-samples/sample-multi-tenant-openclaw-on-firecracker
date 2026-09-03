@@ -158,7 +158,7 @@
 | `dispatch.batching_window_seconds` | 攒批窗口 | `2` | 无此键(`f77ecf4e`) | 未设 | `2` | `AWS` 标准队列支持 window ≤300s(FIFO 不支持);2s 窗口在 100/s 下攒 200 条 |
 | `dispatch.max_batch_size` | 单次 invoke 装箱租户数 | `30` | 无此键(`f77ecf4e`) | `30` | `30` | 等于 `DISPATCH_HOST_LAUNCH_CONCURRENCY`,一批一轮(代码缺省 `500`) |
 | `dispatch.dlq_max_receive_count` | DLQ maxReceiveCount | `3` | 无此键 | 未设 | `3` | 一进 DLQ 即告警 `openclaw-dispatch-dlq-not-empty` |
-| `lifecycle.deadline_sec.{suspend,restore,restart,start,rebuild}` | 五档生命周期总死线 | `235` | `180` | `235` | `235` | 2026-08-29 起生产生效;代码缺省仍 `180`,SSM 参数是运行时载体,deploy 会按 config 重置(不填即冲回 180) |
+| `lifecycle.deadline_sec.{suspend,restore,restart,start,rebuild}` | 五档生命周期总死线 | 不写(env `180` / SSM `235`) | `180` | 代码 `180` · env `180` · SSM `235` | 不写 | 2026-08-29 生产用 SSM 把五档抬到 `235`,Lambda 代码与 env 仍 `180`(运行时 SSM 优先);`lambdas.py` 在 config 缺项时把 SSM 建成 `235`、env 注入 `180`,与生产三层一致。写了 config 会同时覆盖 env 与 SSM |
 | — | SSM managed nodes 配额 | 非 config 键 | — | — | 约 300 台 < `2400`/region | `AWS` 默认 managed nodes 2400/region,约 300 台有 8 倍余量 |
 
 ## 19.7 控制面 · 查询、健康与数据保护
@@ -312,13 +312,7 @@ tenant_query:
   # add_gsi_tenant_rootfs=true requires tenant_query.rootfs_backfill_complete=true
   rootfs_backfill_complete: true
 
-lifecycle:
-  deadline_sec:
-    suspend: 235
-    restore: 235
-    restart: 235
-    start: 235
-    rebuild: 235
+# lifecycle.deadline_sec 五档不要写:不写即得生产三层状态(env 180 / SSM 235),见 19.6
 
 tenant_stats:
   enabled: true
@@ -441,5 +435,5 @@ profile 只写「场景决定项 + CDK 硬必填键」,不复制本章的调优�
 - SSM `SendCommand` 速率没有自助配额项,需要通过 AWS Support 申请。
 - 八档死线以 SSM 参数为运行时载体;`cdk deploy` 会按 config 值重置参数。
 - `lifecycle_max_concurrency=75` 对 host worker 20 是运维取舍;超出部分在 agent 前排队并计入死线。
-- 上游代码改动只有两处:`core/create_deadline.py` 的六个执行/排队预算字面量(与生产 Lambda 代码逐字节一致)和 `lambdas.py` 把并发闸从 raise 改为 WARNING。其余生产基线全部由 `config.yml.example` 携带,CDK 代码缺省值未动;不复制示例配置直接部署,行为仍是旧缺省。
+- 上游代码改动只有两处:`core/create_deadline.py` 的六个执行/排队预算字面量(整文件与生产 Lambda 逐字节一致)和 `lambdas.py`(并发闸 raise → WARNING;SSM 死线参数在 config 缺项时用部署基线 235,env 仍注入模块默认 180)。其余生产基线由 `config.yml.example` 携带,CDK 代码缺省值未动;不复制示例配置直接部署,死线三层仍与生产一致,但队列、dispatch、GSI 等仍是旧缺省。
 - 迁移提示:`config.yml.example` 把四个 GSI 门与 `tenant_query.enabled` 全写成 `true`。已有表照此部署仍受 DynamoDB 一次 update 只能加 1 个 GSI 的限制:先逐个开 `add_gsi_tenant_*`、等 ACTIVE,最后再开 `tenant_query.enabled`;任一 GSI 门为 `false` 时 `tenant_query.enabled` 必须同为 `false`,否则 synth 以「requires all four cumulative GSI gates」拒绝。

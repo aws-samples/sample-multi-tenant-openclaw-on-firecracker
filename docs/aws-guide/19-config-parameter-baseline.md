@@ -158,7 +158,7 @@
 | `dispatch.batching_window_seconds` | 攒批窗口 | `2` | 无此键(`f77ecf4e`) | 未设 | `2` | `AWS` 标准队列支持 window ≤300s(FIFO 不支持);2s 窗口在 100/s 下攒 200 条 |
 | `dispatch.max_batch_size` | 单次 invoke 装箱租户数 | `30` | 无此键(`f77ecf4e`) | `30` | `30` | 等于 `DISPATCH_HOST_LAUNCH_CONCURRENCY`,一批一轮(代码缺省 `500`) |
 | `dispatch.dlq_max_receive_count` | DLQ maxReceiveCount | `3` | 无此键 | 未设 | `3` | 一进 DLQ 即告警 `openclaw-dispatch-dlq-not-empty` |
-| `lifecycle.deadline_sec.{suspend,restore,restart,start,rebuild}` | 五档生命周期总死线 | 不写(env `180` / SSM `235`) | `180` | 代码 `180` · env `180` · SSM `235` | 不写 | 2026-08-29 生产用 SSM 把五档抬到 `235`,Lambda 代码与 env 仍 `180`(运行时 SSM 优先);`lambdas.py` 在 config 缺项时把 SSM 建成 `235`、env 注入 `180`,与生产三层一致。写了 config 会同时覆盖 env 与 SSM |
+| `lifecycle.deadline_sec.{suspend,restore,restart,start,rebuild}` | 五档生命周期总死线 | `235` | `180` | SSM `235`(env/代码表 `180`) | `235` | 2026-08-29 生产用 SSM 把五档抬到 `235`;示例配置显式写 `235`,CDK 同时注入 env 与 SSM。Lambda 代码里的表仍是 `180`(与生产 Lambda 逐字节一致);config 不写这五个键会按代码表把 SSM 重置回 `180`,所以不要删 |
 | — | SSM managed nodes 配额 | 非 config 键 | — | — | 约 300 台 < `2400`/region | `AWS` 默认 managed nodes 2400/region,约 300 台有 8 倍余量 |
 
 ## 19.7 控制面 · 查询、健康与数据保护
@@ -312,7 +312,13 @@ tenant_query:
   # add_gsi_tenant_rootfs=true requires tenant_query.rootfs_backfill_complete=true
   rootfs_backfill_complete: true
 
-# lifecycle.deadline_sec 五档不要写:不写即得生产三层状态(env 180 / SSM 235),见 19.6
+lifecycle:
+  deadline_sec:
+    suspend: 235                     # 不写会按代码表重置 SSM 回 180
+    restore: 235
+    restart: 235
+    start: 235
+    rebuild: 235
 
 tenant_stats:
   enabled: true
@@ -429,11 +435,31 @@ profile 只写「场景决定项 + CDK 硬必填键」,不复制本章的调优�
 | 部署后必配项与责任划分 | [15 交付边界](15-delivery-boundary-and-responsibility.md) |
 | 场景 profile 的口径与边界 | `samples/profiles/README.md` |
 
-## 19.12 生产基线（2026-09）与账号级配额（非 config 键）
+## 19.12 上生产前建议调整的参数(2026-09 基线:为什么这样改)
+
+下面这些值来自一套 300 台以上 host、持续 10–15 tps suspend/restore 压测后的生产运行态。`config.yml.example`
+已经按这些值给出;本节逐项说明**从什么改到什么、为什么这样更合理、什么情况下可以不改**。
+
+三条原则:
+
+1. **Lambda 代码与已部署版本逐字节一致。** 仓内 `core/create_deadline.py` 只同步了六个执行/排队预算字面量,死线表仍是 180;差异一律由配置承载,经 CDK 注入 env / SSM / ESM / GSI。
+2. **config 是权威。** `lifecycle.deadline_sec` 写了就同时进 env 与 SSM 参数;**不写会按代码表(180)重置 SSM**。所以示例里五档 235 必须保留,想改就改这里再 deploy,或直接改 SSM 立即生效。
+3. **CDK 代码缺省没动。** 不复制示例配置直接部署,得到的仍是旧缺省(队列关、dispatch 关、GSI 不建、死线 180)。
+
+| # | 参数 | 改动 | 为什么这样更合理 | 什么时候可以不改 |
+| --- | --- | --- | --- | --- |
+| 1 | `lifecycle.deadline_sec.{suspend,restore,restart,start,rebuild}` | `180` → **`235`** | 这五档都要先排队等消费槽再执行。持续 10–15 tps 时,180 s 装不下「排队 + 执行」,表现为**控制面到点判失败而 host 侧实际成功**(最难排查的形态)。235 在同样的执行预算下给排队段多留 55 s;create 仍 180(客户业务契约),backup/delete 仍 600 | 单 host 或并发个位数的 demo 环境;但保留 235 没有代价 |
+| 2 | `core/create_deadline.py` `_EXEC_STEPS`(代码,已随 PR 落地) | backup `90→60`、stop-vm `50→46`、restore launch `120→60`、rebuild backup `90→60` | 实测典型值 休眠 6 s / 唤醒 3.7 s / 备份 6.6 s,90–120 s 的执行预算吃掉 180 s 死线的一半以上,排队段只剩 40/60/24 s。缩到实测上界附近后,排队段变成 74/120/54 s。已知取舍:backup 60 等于 host 侧 TERM 宽限 60,`backup/handler.py` 会回落到 300 s 默认并打 `[#565]` 日志 —— 控制面记 60、host 实际上界 300 | 不需要配置;想改回去就改代码并重跑三段恒等式断言 |
+| 3 | `scaler.lifecycle_queue_enabled` / `lifecycle_consumer_concurrency` / `lifecycle_max_concurrency` | `false→true` / `50→75` / 不写(10)→**`75`** | 同步直驱路径 40 并发就有 11 个永久卡 creating,大规模必须走 FIFO 队列。有队列后 consumer 并发决定吞吐:10–15 tps 持续 suspend/restore 要 ≥75 才能在死线内消费完(20 → 50 → 75 是逐步压出来的)。前提是 host 侧 SSM agent `Mds.CommandWorkersLimit` 已提到 20(`init-host.sh` step1c)。75 对 20 多出的并发会在 agent 前排队并计入死线,这是**接受的取舍**,synth 只告警 | 不想承担排队就把两者一起设 20;单 host 环境设 5–10 |
+| 4 | `dispatch.enabled` / `mode` / `esm_max_concurrency` / `max_batch_size` | `false→true` / `push→ddb` / `10→25` / `500→30` | 批量建租户必须走装箱队列。`push` 载体受 PutParameter 约 3 TPS 与 24 KB 参数区限制,`ddb` 让 PutParameter 退出热路径。ESM 25 是建租户吞吐不够时逐步提上去的值。batch 30 等于单 host launch 并发(`DISPATCH_HOST_LAUNCH_CONCURRENCY`),一批一轮;超过 30 会让 SSM executionTimeout 跳一整轮,执行段被静默突破(见 § 19.1) | 只做单租户 demo 可以关;开了就用 `ddb`,不要回 `push` |
+| 5 | `scheduling.host_selection_score_floor` / `spread_max_hosts_per_batch` | `0.25→0.39` / 显式写 `3` | 0.25 时加权随机把冷恢复集中到少数高分 host,形成单机热点;0.39 抬高低分 host 的权重,让落点更扁平。spread 3 限制每批 SendCommand 扇出,与 SSM 速率上限配套 | host 数少于 10 台时两者影响都很小 |
+| 6 | `scaler.add_gsi_tenant_{user,host,status,rootfs}` / `tenant_query.enabled` / `rootfs_backfill_complete` | 全 `false` → 全 **`true`** | 占用与状态查询在几百台 host、万级租户下是全表 Scan,读峰值到 157k RRU/s 撞上表级默认 40k 上限(`RequestLimitExceeded` → API 500)。GSI Query 让读量回到与结果集成比例。新表一次建齐;**已有表一次只能加一个 GSI**:逐个开 `add_gsi_tenant_*`、等 ACTIVE,最后开 `tenant_query.enabled`;任一门为 `false` 时 `tenant_query.enabled` 必须同为 `false`,否则 synth 拒绝 | 千级租户以下 Scan 也够;但 GSI 建好没有运行时代价 |
+| 7 | `host.cpu_overcommit_ratio` / `mem_overcommit_ratio` | `4.0→6.0` / `1.0→2.0` | 目标 380 租户/台(1 vCPU / 2 GB)需要内存记账 2.0(384 GB 装 374 个 2 GB);这是生产在跑的值。风险:`#352` 实测物理内存剩 0 G,物理层只靠 `scheduling.mem_safety_floor_ratio` 兜底 | 含 M 系混池、或对 OOM 敏感的环境用 `4.0 / 1.0` |
+| 8 | `control_ui.extra_allowed_origins` | 注释态 → **`["*"]`** | tenant control UI 的 Origin 白名单是部署时的固定入口;前端入口变更(自有域名、多入口)会整机队被拦,生产因此关闭校验 | 入口固定就写具体域名,不要 `*` |
+
+账号级配额(不在 config 里,生产前一起提):
 
 - DynamoDB 表级读吞吐配额 `L-CF0CBE56` 默认 40,000 RRU/s;restore 突发会撞此上限,生产已提到 300,000。
 - SSM `SendCommand` 速率没有自助配额项,需要通过 AWS Support 申请。
-- 八档死线以 SSM 参数为运行时载体;`cdk deploy` 会按 config 值重置参数。
-- `lifecycle_max_concurrency=75` 对 host worker 20 是运维取舍;超出部分在 agent 前排队并计入死线。
-- 上游代码改动只有两处:`core/create_deadline.py` 的六个执行/排队预算字面量(整文件与生产 Lambda 逐字节一致)和 `lambdas.py`(并发闸 raise → WARNING;SSM 死线参数在 config 缺项时用部署基线 235,env 仍注入模块默认 180)。其余生产基线由 `config.yml.example` 携带,CDK 代码缺省值未动;不复制示例配置直接部署,死线三层仍与生产一致,但队列、dispatch、GSI 等仍是旧缺省。
-- 迁移提示:`config.yml.example` 把四个 GSI 门与 `tenant_query.enabled` 全写成 `true`。已有表照此部署仍受 DynamoDB 一次 update 只能加 1 个 GSI 的限制:先逐个开 `add_gsi_tenant_*`、等 ACTIVE,最后再开 `tenant_query.enabled`;任一 GSI 门为 `false` 时 `tenant_query.enabled` 必须同为 `false`,否则 synth 以「requires all four cumulative GSI gates」拒绝。
+
+与 `lambdas.py` 的一处代码配合:`lifecycle_max_concurrency` 超过 host worker 上限时,synth 从 `raise` 改为 `WARNING`。原来的 fail-loud 让第 3 项无法部署;现在把取舍打进 synth 输出,由部署者决定是否承担排队。

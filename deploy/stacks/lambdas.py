@@ -581,14 +581,8 @@ def build_lambdas(self, ctx):
         )
 
     # #564 G5 —— 死线值的**运行时载体**:SSM Parameter Store。与上面的 env 同源于同一段
-    # config(`lifecycle.deadline_sec`);config 缺项时 env 用 `create_deadline` 的**模块权威
-    # 默认值**补齐(#630),SSM 用下面的部署基线(五档 235,其余同模块默认),八档恒全覆盖。
-    #
-    # **部署基线为什么单独给 SSM 一份**:2026-08-29 生产运维用 `put-parameter --overwrite` 把
-    # suspend/restore/restart/start/rebuild 五档的参数从 180 抬到 235,而 Lambda 代码里的客户
-    # 表格与注入的 env 仍是 180(运行时 SSM > env > 代码默认,见 core/deadline_config.py)。
-    # 要让不带 `lifecycle.deadline_sec` 的部署得到与生产一致的三层状态(代码 180 / env 180 /
-    # SSM 235),SSM 在 config 缺项时不能回到模块默认。config 写了则 env 与 SSM 都用 config 的值。
+    # config(`lifecycle.deadline_sec`),而 config 缺项时两边都用 `create_deadline` 的
+    # **模块权威默认值**补齐(#630),所以八档恒全覆盖、不存在只建一半的形态。
     #
     # **为什么 env 不够、必须再加一个载体**:客户要的是「改配置即生效」,而真机实测证明改
     # Lambda env 做不到 —— 流量走 `live` 别名 → 已发布版本,而**已发布版本的 env 是冻结的**
@@ -606,34 +600,19 @@ def build_lambdas(self, ctx):
     # 漂移由 `create-deadline-config.py --live` 的复检兜。
     # 两个载体必须**同时**覆盖八档:只建 config 里写了的那些,会让没写的那档 env 可改而
     # 参数不可改,`/system/info` 报的 `source` 也跟着分叉 —— 与上面同一个缺陷类。
-    _SSM_DEADLINE_BASELINE_SEC = {
-        _create_deadline.ACTION_SUSPEND: 235,
-        _create_deadline.ACTION_RESTORE: 235,
-        _create_deadline.ACTION_RESTART: 235,
-        _create_deadline.ACTION_START: 235,
-        _create_deadline.ACTION_REBUILD: 235,
-    }
-
-    def _ssm_deadline_sec_for_deploy(action: str) -> int:
-        """SSM 参数的初值:config 写了就用 config(与 env 同值),没写用部署基线,再回模块默认。"""
-        if action in _dl_cfg:
-            return _deadline_sec_for_deploy(action)
-        return int(_SSM_DEADLINE_BASELINE_SEC.get(action, _deadline_sec_for_deploy(action)))
-
     for _dl_action in _create_deadline.DEADLINE_ACTIONS:
         ssm.StringParameter(
             self,
             f"LifecycleDeadlineSec{_dl_action.capitalize()}",
             parameter_name=_create_deadline.param_name_for(_dl_action),
-            string_value=str(_ssm_deadline_sec_for_deploy(_dl_action)),
+            string_value=str(_deadline_sec_for_deploy(_dl_action)),
             description=(
                 f"openclaw lifecycle deadline for '{_dl_action}' in seconds. "
                 "Edit with `aws ssm put-parameter --overwrite` for an immediate "
                 "effect (no redeploy). Read by api/lifecycle-consumer via "
                 "core/deadline_config.py with a 60s in-process cache; an illegal "
                 "value fails the request loudly instead of silently falling back. "
-                "cdk deploy resets it to config.yml lifecycle.deadline_sec (or the deploy "
-                "baseline when the key is unset)."
+                "cdk deploy resets it to config.yml lifecycle.deadline_sec."
             ),
         )
 

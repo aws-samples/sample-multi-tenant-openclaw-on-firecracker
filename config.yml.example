@@ -539,10 +539,14 @@ dispatch:
 lifecycle:
   deadline_sec:
     create: 180     # #562 已落地;本轮把它从 Python 常量迁到 env(客户要求"每个"都能改)
-    # suspend / restore / restart / start / rebuild 五档**不要在这里写**。生产基线是
-    # 代码 180 / env 180 / SSM 235(2026-08-29 运维用 put-parameter 把五档抬到 235,运行时
-    # SSM 优先)。不填时 CDK 注入 env 180 并把 SSM 参数建成 235,与生产三层逐项一致;
-    # 在这里写任何值都会同时覆盖 env 与 SSM 两处(写 235 → env 也变 235;写 180 → SSM 冲回 180)。
+    # 五档 235 = 2026-08-29 起的生产基线(运维经 SSM 抬上去的值)。这一段是权威:CDK 把它
+    # 同时注入 env 与 SSM 参数;要改就改这里再 deploy,或改 SSM 立即生效。**不要删掉这五行**:
+    # 不写会回到 Lambda 代码里的表(180,与生产 Lambda 逐字节一致,故意不动),deploy 会把 SSM 冲回 180。
+    suspend: 235
+    restore: 235
+    restart: 235
+    start: 235
+    rebuild: 235
     backup: 600     # **网关手动备份**;系统定时备份有自己的错峰语义,不受此约束
     delete: 600     # 只约束「给上层的答复」;实际删除不得丢弃,必须继续重试到成功
 
